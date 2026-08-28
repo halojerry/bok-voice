@@ -18,3 +18,4 @@ data/uploads/
 data/models/
 *.sqlite
 *.db
+*.tsbuildinfo

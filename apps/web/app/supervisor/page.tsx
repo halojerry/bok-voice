@@ -1,11 +1,13 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { api } from "@/lib/api";
 
 export default function SupervisorPage() {
   const [calls, setCalls] = useState<Record<string, unknown>[]>([]);
   const [err, setErr] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   async function refresh() {
     try {
@@ -23,9 +25,11 @@ export default function SupervisorPage() {
 
   async function send(action: (id: string) => Promise<unknown>, id: string) {
     setErr(null);
+    setNotice(null);
     try {
       await action(id);
       await refresh();
+      setNotice("操作已执行。");
     } catch (e) {
       setErr(String(e));
     }
@@ -42,6 +46,7 @@ export default function SupervisorPage() {
       </div>
 
       {err && <p className="mb-4 text-sm text-red-300">{err}</p>}
+      {notice && <p className="mb-4 text-sm text-emerald-400">{notice}</p>}
 
       <section className="card">
         <div className="mb-3 flex items-center justify-between">
@@ -64,6 +69,12 @@ export default function SupervisorPage() {
                   </span>
                 </div>
                 <div className="mt-3 flex flex-wrap gap-2">
+                  <Link
+                    className="btn-ghost text-xs"
+                    href={`/calls/${String(c.id ?? c.call_id)}`}
+                  >
+                    进入会话
+                  </Link>
                   <button className="btn-ghost text-xs" onClick={() => send(api.supervisorJoin, String(c.id ?? c.call_id))}>监听</button>
                   <button className="btn-ghost text-xs" onClick={() => send(api.supervisorPause, String(c.id ?? c.call_id))}>暂停 AI</button>
                   <button className="btn-ghost text-xs" onClick={() => send(api.supervisorTakeover, String(c.id ?? c.call_id))}>接管</button>

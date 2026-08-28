@@ -22,7 +22,7 @@ await page.waitForSelector('button:has-text("接通")', { state: "visible", time
 await page.getByRole("button", { name: "接通" }).click();
 
 await page.waitForFunction(
-  () => document.body.innerText.includes("实时转写"),
+  () => document.body.innerText.includes("等待对话"),
   { timeout: 30000 },
 );
 
@@ -37,7 +37,7 @@ console.log("ROOM_JOINED", roomName);
 await page.waitForTimeout(WAIT_MS);
 await page.getByRole("button", { name: "挂断" }).click();
 await page.waitForFunction(
-  () => !document.body.innerText.includes("实时转写"),
+  () => !document.body.innerText.includes("等待对话"),
   { timeout: 10000 },
 );
 

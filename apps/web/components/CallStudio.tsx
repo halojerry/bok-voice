@@ -6,6 +6,7 @@ import {
   RoomAudioRenderer,
   VoiceAssistantControlBar,
   BarVisualizer,
+  StartAudio,
   useVoiceAssistant,
   useTranscriptions,
 } from "@livekit/components-react";
@@ -36,37 +37,51 @@ function AgentStateLabel({ state }: { state: string }) {
  * (mic/track controls) and useTranscriptions (live user + agent transcriptions).
  */
 function LiveAgentPanel() {
-  const { state, audioTrack } = useVoiceAssistant();
+  const { state, audioTrack, agent } = useVoiceAssistant();
   const transcriptions = useTranscriptions();
-  const recent = useMemo(() => transcriptions.slice(-12).reverse(), [transcriptions]);
+  const agentIdentity = agent?.identity ?? "agent";
+  const recent = useMemo(() => transcriptions.slice(-16).reverse(), [transcriptions]);
 
   return (
-    <div className="flex flex-1 flex-col">
-      <div className="flex flex-1 flex-col items-center justify-center gap-6">
-        <AgentStateLabel state={state} />
-        <div className="h-40 w-72">
-          <BarVisualizer state={state} track={audioTrack} barCount={36} />
-        </div>
-        <RoomAudioRenderer />
-        <VoiceAssistantControlBar />
-      </div>
-      <div className="mt-6 border-t border-[var(--card-border)] pt-4">
-        <span className="label mb-2 block">实时转写</span>
-        <div className="flex h-40 flex-col gap-2 overflow-y-auto">
-          {recent.length === 0 && (
-            <p className="text-xs text-[var(--muted)]">暂无转写（等待对话）</p>
-          )}
-          {recent.map((t, i) => {
-            const identity = t.participantInfo?.identity ?? "";
-            const text = String(t.text ?? "");
-            return (
-              <div key={`${identity}-${i}`} className="rounded-lg bg-white/5 px-3 py-2 text-sm">
-                <span className="text-[var(--muted)]">{identity}</span>
-                <span className="ml-2">{text}</span>
+    <div className="flex h-full flex-1 flex-col">
+      {/* Transcript timeline (official-style chat bubbles) */}
+      <div className="flex flex-1 flex-col gap-3 overflow-y-auto px-1 py-2">
+        {recent.length === 0 && (
+          <div className="flex flex-1 items-center justify-center text-sm text-[var(--muted)]">
+            等待对话…
+          </div>
+        )}
+        {recent.map((t, i) => {
+          const identity = t.participantInfo?.identity ?? "";
+          const text = String(t.text ?? "");
+          const isAgent = identity === agentIdentity;
+          return (
+            <div key={`${identity}-${i}`} className={`flex ${isAgent ? "justify-start" : "justify-end"}`}>
+              <div
+                className={`max-w-[80%] rounded-2xl px-3 py-2 text-sm ${
+                  isAgent ? "bg-[var(--accent)] text-black" : "bg-white/10 text-[var(--foreground)]"
+                }`}
+              >
+                {text}
               </div>
-            );
-          })}
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Central visualizer + state */}
+      <div className="flex flex-col items-center gap-3 py-4">
+        <AgentStateLabel state={state} />
+        <div className="h-24 w-64">
+          <BarVisualizer state={state} track={audioTrack} barCount={32} />
         </div>
+      </div>
+
+      {/* Audio renderer + autoplay unlock + control bar */}
+      <div className="flex items-center justify-center gap-3 border-t border-[var(--card-border)] py-3">
+        <RoomAudioRenderer />
+        <StartAudio label="点击开启声音" />
+        <VoiceAssistantControlBar />
       </div>
     </div>
   );

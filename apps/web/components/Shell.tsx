@@ -6,7 +6,8 @@ import { usePathname } from "next/navigation";
 const NAV = [
   { href: "/", label: "总览", icon: "◉" },
   { href: "/objects", label: "对象", icon: "👤" },
-  { href: "/calls/new", label: "通话", icon: "📞" },
+  { href: "/calls", label: "会话", icon: "📞" },
+  { href: "/calls/new", label: "新建通话", icon: "➕" },
   { href: "/knowledge", label: "知识库", icon: "📚" },
   { href: "/personas", label: "人设", icon: "🎙️" },
   { href: "/supervisor", label: "主管台", icon: "🗂️" },
