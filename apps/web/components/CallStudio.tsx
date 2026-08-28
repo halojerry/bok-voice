@@ -59,7 +59,7 @@ function LiveAgentPanel() {
             <div key={`${identity}-${i}`} className={`flex ${isAgent ? "justify-start" : "justify-end"}`}>
               <div
                 className={`max-w-[80%] rounded-2xl px-3 py-2 text-sm ${
-                  isAgent ? "bg-[var(--accent)] text-black" : "bg-white/10 text-[var(--foreground)]"
+                  isAgent ? "bg-[var(--accent)] text-[var(--accent-ink)]" : "bg-white/10 text-[var(--foreground)]"
                 }`}
               >
                 {text}

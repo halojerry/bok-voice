@@ -16,9 +16,9 @@ export default function SettingsPage() {
 
   return (
     <div>
-      <div className="mb-6">
-        <h1 className="text-xl font-semibold">设置</h1>
-        <p className="mt-1 text-sm text-[var(--muted)]">账号 · Provider · 成本策略 · 合规</p>
+      <div className="mb-8">
+        <h1 className="page-title">设置</h1>
+        <p className="page-sub">账号 · Provider · 成本策略 · 合规</p>
       </div>
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">

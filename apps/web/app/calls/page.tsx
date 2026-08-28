@@ -41,10 +41,10 @@ export default function CallsPage() {
 
   return (
     <div>
-      <div className="mb-6 flex items-start justify-between">
+      <div className="mb-8 flex items-start justify-between">
         <div>
-          <h1 className="text-xl font-semibold">通话会话</h1>
-          <p className="mt-1 text-sm text-[var(--muted)]">进入历史/活跃会话，或发起新会话</p>
+          <h1 className="page-title">通话会话</h1>
+          <p className="page-sub">进入历史/活跃会话，或发起新会话</p>
         </div>
         <Link href="/calls/new" className="btn-primary">
           + 新建通话

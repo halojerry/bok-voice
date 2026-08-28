@@ -37,9 +37,9 @@ export default function PersonasPage() {
 
   return (
     <div>
-      <div className="mb-6">
-        <h1 className="text-xl font-semibold">AI 人设</h1>
-        <p className="mt-1 text-sm text-[var(--muted)]">我方身份 · 代表公司 · 说话风格 · 参考音频</p>
+      <div className="mb-8">
+        <h1 className="page-title">AI 人设</h1>
+        <p className="page-sub">我方身份 · 代表公司 · 说话风格 · 参考音频</p>
       </div>
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_340px]">

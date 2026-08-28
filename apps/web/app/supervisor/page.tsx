@@ -37,10 +37,10 @@ export default function SupervisorPage() {
 
   return (
     <div>
-      <div className="mb-6 flex items-start justify-between">
+      <div className="mb-8 flex items-start justify-between">
         <div>
-          <h1 className="text-xl font-semibold">主管台</h1>
-          <p className="mt-1 text-sm text-[var(--muted)]">进房旁听 · 暂停 AI · 接管 · 转人工</p>
+          <h1 className="page-title">主管台</h1>
+          <p className="page-sub">进房旁听 · 暂停 AI · 接管 · 转人工</p>
         </div>
         <button className="btn-ghost" onClick={refresh}>刷新</button>
       </div>

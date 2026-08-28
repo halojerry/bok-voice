@@ -1,9 +1,9 @@
 export default function ReportsPage() {
   return (
     <div>
-      <div className="mb-6">
-        <h1 className="text-xl font-semibold">报表</h1>
-        <p className="mt-1 text-sm text-[var(--muted)]">用量 · 成本 · 质量分 · 每段 Provider 明细</p>
+      <div className="mb-8">
+        <h1 className="page-title">报表</h1>
+        <p className="page-sub">用量 · 成本 · 质量分 · 每段 Provider 明细</p>
       </div>
 
       <div className="grid grid-cols-2 gap-4 md:grid-cols-4">

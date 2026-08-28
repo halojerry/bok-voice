@@ -36,9 +36,9 @@ export default function KnowledgePage() {
 
   return (
     <div>
-      <div className="mb-6">
-        <h1 className="text-xl font-semibold">知识库</h1>
-        <p className="mt-1 text-sm text-[var(--muted)]">账号知识库 · Markdown 事实源 · 全局洞察（管理员）</p>
+      <div className="mb-8">
+        <h1 className="page-title">知识库</h1>
+        <p className="page-sub">账号知识库 · Markdown 事实源 · 全局洞察（管理员）</p>
       </div>
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_340px]">

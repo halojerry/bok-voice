@@ -47,10 +47,10 @@ export default function ObjectsPage() {
 
   return (
     <div>
-      <div className="mb-6 flex items-start justify-between">
+      <div className="mb-8 flex items-start justify-between">
         <div>
-          <h1 className="text-xl font-semibold">对象管理</h1>
-          <p className="mt-1 text-sm text-[var(--muted)]">AI 对话对方档案 · 建档 / 表格导入 / 历史主题</p>
+          <h1 className="page-title">对象管理</h1>
+          <p className="page-sub">AI 对话对方档案 · 建档 / 表格导入 / 历史主题</p>
         </div>
         <button className="btn-primary" onClick={() => { setErr(null); setErr("表格导入待接入：可先支持 .xlsx/.csv 批量建档。"); }}>
           表格导入

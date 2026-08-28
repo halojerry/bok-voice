@@ -3,9 +3,9 @@ export default async function CallPage({ params }: { params: Promise<{ id: strin
   const { id } = await params;
   return (
     <main>
-      <div className="mb-6">
-        <h1 className="text-xl font-semibold">通话详情</h1>
-        <p className="mt-1 text-sm text-[var(--muted)]">会话 {id}</p>
+      <div className="mb-8">
+        <h1 className="page-title">通话详情</h1>
+        <p className="page-sub">会话 {id}</p>
       </div>
       <CallStudio callId={id} />
     </main>

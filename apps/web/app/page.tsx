@@ -22,9 +22,9 @@ export default function DashboardPage() {
 
   return (
     <div>
-      <div className="mb-6">
-        <h1 className="text-xl font-semibold">总览</h1>
-        <p className="mt-1 text-sm text-[var(--muted)]">多账号客服语音助手 · 实时状态</p>
+      <div className="mb-8">
+        <h1 className="page-title">总览</h1>
+        <p className="page-sub">多账号客服语音助手 · 实时状态</p>
       </div>
 
       <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-6">
