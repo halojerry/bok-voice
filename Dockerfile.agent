@@ -1,0 +1,18 @@
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+
+# Layer 1: install dependencies (cached unless pyproject/core change)
+COPY packages/core /app/packages/core
+COPY apps/agent/pyproject.toml /app/apps/agent/pyproject.toml
+RUN mkdir -p /app/apps/agent/agent_runtime && touch /app/apps/agent/agent_runtime/__init__.py
+
+RUN pip install --no-cache-dir \
+    -e /app/packages/core \
+    -e "/app/apps/agent[livekit]"
+
+# Layer 2: copy the real runtime source (editable install points at the dir)
+COPY apps/agent/agent_runtime /app/apps/agent/agent_runtime
+
+CMD ["python", "-m", "agent_runtime.main", "start"]

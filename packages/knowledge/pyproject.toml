@@ -1,0 +1,13 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bok-voice-knowledge"
+version = "0.1.0"
+description = "Bok Voice knowledge service: MarkdownSource, VectorStore, KnowledgeService"
+requires-python = ">=3.11"
+dependencies = ["bok-voice-core"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["bok_voice_knowledge"]

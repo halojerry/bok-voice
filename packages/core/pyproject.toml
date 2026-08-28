@@ -1,0 +1,12 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bok-voice-core"
+version = "0.1.0"
+description = "Bok Voice domain models and provider protocols"
+requires-python = ">=3.11"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bok_voice_core"]

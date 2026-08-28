@@ -1,0 +1,13 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bok-voice-business-db"
+version = "0.1.0"
+description = "Bok Voice business database layer (SQLAlchemy + Postgres/pgvector ready)"
+requires-python = ">=3.11"
+dependencies = ["sqlalchemy>=2.0,<3", "pgvector>=0.3,<1", "bok-voice-core"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["bok_voice_business_db"]

@@ -1,0 +1,284 @@
+from __future__ import annotations
+
+import json
+import uuid
+from typing import Any
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from bok_voice_core.providers import BusinessRepository
+from bok_voice_core.types import (
+    CallMode,
+    CallSession,
+    CallStatus,
+    ObjectProfile,
+    PersonaProfile,
+    SessionManifest,
+    TurnEvent,
+)
+
+from . import models
+
+
+def _uuid() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+class SqlAlchemyBusinessRepository:
+    """Concrete BusinessRepository backed by SQLAlchemy (Postgres/SQLite)."""
+
+    def __init__(self, session: Session):
+        self.session = session
+
+    # ---- calls ----
+
+    def create_call(self, manifest: SessionManifest) -> dict:
+        call = models.CallSession(
+            id=manifest.session_id or _uuid(),
+            account_id=manifest.account_id,
+            object_id=manifest.object_id,
+            persona_id=manifest.persona_id,
+            mode=manifest.mode.value if isinstance(manifest.mode, CallMode) else str(manifest.mode),
+            direction=manifest.direction,
+            language=manifest.language,
+            status=CallStatus.RINGING.value,
+        )
+        self.session.add(call)
+        self.session.commit()
+        return self._call_to_dict(call)
+
+    def get_call(self, call_id: str) -> dict | None:
+        call = self.session.get(models.CallSession, call_id)
+        return self._call_to_dict(call) if call else None
+
+    def update_call(self, call_id: str, **fields) -> dict | None:
+        row = self.session.get(models.CallSession, call_id)
+        if not row:
+            return None
+        for key, value in fields.items():
+            if hasattr(row, key):
+                setattr(row, key, value)
+        self.session.commit()
+        return self._call_to_dict(row)
+
+    def list_calls(self, account_id: str, status: str = "") -> list[dict]:
+        stmt = select(models.CallSession)
+        if account_id:
+            stmt = stmt.filter_by(account_id=account_id)
+        if status:
+            stmt = stmt.filter_by(status=status)
+        return [self._call_to_dict(c) for c in self.session.scalars(stmt)]
+
+    def create_turn(self, turn: TurnEvent) -> dict:
+        row = models.Turn(
+            id=f"{turn.call_id}:{turn.turn_id}",
+            call_id=turn.call_id,
+            turn_id=turn.turn_id,
+            role=turn.role,
+            transcript=turn.transcript,
+            emotion=turn.emotion,
+            provider=turn.provider,
+            latency_ms=turn.latency_ms,
+        )
+        self.session.add(row)
+        self.session.commit()
+        return {"id": row.id}
+
+    def get_turns(self, call_id: str) -> list[TurnEvent]:
+        stmt = select(models.Turn).filter_by(call_id=call_id).order_by(models.Turn.created_at)
+        rows = self.session.scalars(stmt)
+        return [
+            TurnEvent(
+                trace_id=call_id,
+                call_id=row.call_id,
+                turn_id=row.turn_id,
+                role=row.role,
+                transcript=row.transcript,
+                emotion=row.emotion,
+                provider=row.provider,
+                latency_ms=row.latency_ms,
+            )
+            for row in rows
+        ]
+
+    def get_settlement(self, call_id: str) -> dict | None:
+        row = self.session.get(models.Settlement, call_id)
+        if not row:
+            return None
+        return {
+            "call_id": row.call_id,
+            "status": row.status,
+            "metrics": json.loads(row.metrics_json or "{}"),
+            "transcript_doc_path": row.transcript_doc_path,
+            "settlement_doc_path": row.settlement_doc_path,
+            "new_topics": json.loads(row.new_topics_json or "[]"),
+            "global_insight_id": row.global_insight_id,
+            "error": row.error,
+        }
+
+    def append_settlement(self, call_id: str, result: dict) -> dict:
+        row = self.session.get(models.Settlement, call_id)
+        if row is None:
+            row = models.Settlement(id=call_id, call_id=call_id)
+            self.session.add(row)
+        row.status = result.get("status", row.status)
+        row.metrics_json = json.dumps(result.get("metrics", {}), ensure_ascii=False)
+        row.transcript_doc_path = result.get("transcript_doc_path", row.transcript_doc_path)
+        row.settlement_doc_path = result.get("settlement_doc_path", row.settlement_doc_path)
+        row.new_topics_json = json.dumps(result.get("new_topics", []), ensure_ascii=False)
+        row.global_insight_id = result.get("global_insight_id", row.global_insight_id)
+        row.error = result.get("error", row.error)
+        self.session.commit()
+        return {"call_id": call_id, "status": row.status}
+
+    # ---- objects / personas ----
+
+    def list_objects(self, account_id: str) -> list[dict]:
+        stmt = select(models.ObjectProfile).filter_by(account_id=account_id)
+        return [self._to_dict(o) for o in self.session.scalars(stmt)]
+
+    def create_object(self, account_id: str, data: dict) -> dict:
+        obj = models.ObjectProfile(
+            id=data.get("id") or _uuid(),
+            account_id=account_id,
+            display_name=data.get("display_name", ""),
+            role_template=data.get("role_template", "customer"),
+            language=data.get("language", "zh"),
+            background=data.get("background", ""),
+            phone=data.get("phone", ""),
+            status=data.get("status", "active"),
+        )
+        self.session.add(obj)
+        self.session.commit()
+        return self._to_dict(obj)
+
+    def get_object(self, object_id: str) -> dict | None:
+        obj = self.session.get(models.ObjectProfile, object_id)
+        return self._to_dict(obj) if obj else None
+
+    def create_persona(self, data: dict) -> dict:
+        persona = models.PersonaProfile(
+            id=data.get("id") or _uuid(),
+            account_id=data.get("account_id", ""),
+            name=data.get("name", ""),
+            company=data.get("company", ""),
+            tone=data.get("tone", ""),
+            language=data.get("language", "zh"),
+            reference_audio=data.get("reference_audio", ""),
+        )
+        self.session.add(persona)
+        self.session.commit()
+        return self._to_dict(persona)
+
+    def get_persona(self, persona_id: str) -> dict | None:
+        persona = self.session.get(models.PersonaProfile, persona_id)
+        return self._to_dict(persona) if persona else None
+
+    def list_personas(self, account_id: str = "") -> list[dict]:
+        stmt = select(models.PersonaProfile)
+        if account_id:
+            stmt = stmt.filter_by(account_id=account_id)
+        return [self._to_dict(p) for p in self.session.scalars(stmt)]
+
+    @staticmethod
+    def _call_to_dict(call: models.CallSession) -> dict:
+        return {c.name: getattr(call, c.name) for c in models.CallSession.__table__.columns}
+
+    @staticmethod
+    def _to_dict(obj: Any) -> dict:
+        return {c.name: getattr(obj, c.name) for c in obj.__table__.columns}
+
+
+class InMemoryBusinessRepository:
+    """Test double implementing BusinessRepository without a database."""
+
+    def __init__(self) -> None:
+        self.calls: dict[str, dict] = {}
+        self.turns: dict[str, list[TurnEvent]] = {}
+        self.settlements: dict[str, dict] = {}
+        self.objects: dict[str, dict] = {}
+        self.personas: dict[str, dict] = {}
+
+    def create_call(self, manifest: SessionManifest) -> dict:
+        call_id = manifest.session_id or _uuid()
+        self.calls[call_id] = {
+            "id": call_id,
+            "account_id": manifest.account_id,
+            "object_id": manifest.object_id,
+            "persona_id": manifest.persona_id,
+            "mode": manifest.mode.value if isinstance(manifest.mode, CallMode) else str(manifest.mode),
+            "status": CallStatus.RINGING.value,
+        }
+        return self.calls[call_id]
+
+    def get_call(self, call_id: str) -> dict | None:
+        return self.calls.get(call_id)
+
+    def update_call(self, call_id: str, **fields) -> dict | None:
+        if call_id not in self.calls:
+            return None
+        self.calls[call_id].update(fields)
+        return self.calls[call_id]
+
+    def list_calls(self, account_id: str, status: str = "") -> list[dict]:
+        return [
+            c for c in self.calls.values()
+            if (not account_id or c["account_id"] == account_id) and (not status or c["status"] == status)
+        ]
+
+    def create_turn(self, turn: TurnEvent) -> dict:
+        self.turns.setdefault(turn.call_id, []).append(turn)
+        return {"id": f"{turn.call_id}:{turn.turn_id}"}
+
+    def get_turns(self, call_id: str) -> list[TurnEvent]:
+        return list(self.turns.get(call_id, []))
+
+    def get_settlement(self, call_id: str) -> dict | None:
+        return self.settlements.get(call_id)
+
+    def append_settlement(self, call_id: str, result: dict) -> dict:
+        self.settlements[call_id] = result
+        return {"call_id": call_id, "status": result.get("status")}
+
+    def list_objects(self, account_id: str) -> list[dict]:
+        return [o for o in self.objects.values() if o["account_id"] == account_id]
+
+    def create_object(self, account_id: str, data: dict) -> dict:
+        obj = ObjectProfile(
+            id=data.get("id") or _uuid(),
+            account_id=account_id,
+            display_name=data.get("display_name", ""),
+            role_template=data.get("role_template", "customer"),
+            language=data.get("language", "zh"),
+            background=data.get("background", ""),
+            phone=data.get("phone", ""),
+            status=data.get("status", "active"),
+        ).__dict__
+        self.objects[obj["id"]] = obj
+        return obj
+
+    def create_persona(self, data: dict) -> dict:
+        persona = PersonaProfile(
+            id=data.get("id") or _uuid(),
+            account_id=data.get("account_id", ""),
+            name=data.get("name", ""),
+            company=data.get("company", ""),
+            tone=data.get("tone", ""),
+            language=data.get("language", "zh"),
+            reference_audio=data.get("reference_audio", ""),
+        ).__dict__
+        self.personas[persona["id"]] = persona
+        return persona
+
+    def get_object(self, object_id: str) -> dict | None:
+        return self.objects.get(object_id)
+
+    def get_persona(self, persona_id: str) -> dict | None:
+        return self.personas.get(persona_id)
+
+    def list_personas(self, account_id: str = "") -> list[dict]:
+        return [
+            p for p in self.personas.values()
+            if not account_id or p.get("account_id", "") == account_id
+        ]

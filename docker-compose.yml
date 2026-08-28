@@ -1,0 +1,86 @@
+services:
+  livekit:
+    image: livekit/livekit-server:latest
+    command: --config /etc/livekit.yaml
+    ports:
+      - "7880:7880"
+      - "7881:7881/udp"
+      - "7882:7882/udp"
+    volumes:
+      - ./services/livekit-server/livekit.yaml:/etc/livekit.yaml:ro
+    environment:
+      LIVEKIT_KEYS: "devkey: devsecret"
+      LOG_LEVEL: info
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: bok
+      POSTGRES_PASSWORD: bok
+      POSTGRES_DB: bok_voice
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    profiles: ["production"]
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+
+  control-plane:
+    build:
+      context: .
+      dockerfile: Dockerfile.control-plane
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://bok:bok@postgres:5432/bok_voice
+      VAULT_ROOT: /app/data/vault
+      LIVEKIT_URL: ws://localhost:7880
+      LIVEKIT_API_KEY: devkey
+      LIVEKIT_API_SECRET: devsecret
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - livekit
+    volumes:
+      - vault-data:/app/data/vault
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    environment:
+      NEXT_PUBLIC_CONTROL_PLANE_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - control-plane
+
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    env_file:
+      - .env
+    environment:
+      LIVEKIT_URL: ws://livekit:7880
+      LIVEKIT_API_KEY: devkey
+      LIVEKIT_API_SECRET: devsecret
+      CONTROL_PLANE_URL: http://control-plane:8000
+      DATABASE_URL: postgresql+psycopg://bok:bok@postgres:5432/bok_voice
+      # Local sherpa SenseVoice model dir (mounted from the repo data/models).
+      SHERPA_MODEL_DIR: /app/data/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue
+    depends_on:
+      - livekit
+      - control-plane
+    volumes:
+      - ./data/models:/app/data/models:ro
+
+volumes:
+  pgdata:
+  vault-data:

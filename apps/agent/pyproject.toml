@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bok-voice-agent"
+version = "0.1.0"
+description = "Bok Voice LiveKit Agent"
+requires-python = ">=3.11"
+dependencies = [
+  "bok-voice-core",
+]
+
+[project.optional-dependencies]
+livekit = [
+  "livekit-agents>=1.7,<2",
+  # Local offline SenseVoice ASR via sherpa-onnx (zh/en/ja/ko/yue).
+  "sherpa-onnx>=1.13,<2",
+  # Volcano (火山) streaming TTS uses a WebSocket binary protocol.
+  "websockets>=13,<15",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["agent_runtime"]
