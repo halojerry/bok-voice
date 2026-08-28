@@ -55,14 +55,14 @@
 ## 关键的已验证链路
 
 - [x] sherpa SenseVoice（含粤）本地 + 容器内转写通过
-- [x] DeepSeek 流式调用、火山 TTS 鉴权收到 PCM（需按控制台参数校准 `voice_type`/`cluster`）
+- [x] DeepSeek 流式调用、火山 TTS V3 单向流式收到真实 PCM（`volc_v3_protocol.py` + 单元测试）
 - [x] `FAKE_VAD→FAKE_STT_FINAL→LLM→TTS_PUSH` 确定性语音闭环
 - [x] Agent 事件接线：`conversation_item_added` 落 user/assistant（唯一来源，去重），`close` 自动结算
 
 ## 尚未完成（下一里程碑）
 
 - [ ] 用真实麦克风/真实音频源做 WebRTC 真人回环验证（Silero VAD + sherpa + DeepSeek + 火山出声）
-- [ ] 火山 TTS 按官方 V1 参数校准 + 确认流式帧聚合
+- [x] 火山 TTS 从 V1 迁移到 V3（单向流式：`StartConnection` 无需握手，直接发一帧 `FullClientRequest` 收到 PCM；`X-Api-App-Id`/`X-Api-Access-Key`/`X-Api-Resource-Id`/`X-Api-Request-Id` 鉴权）
 - [ ] Agent `entrypoint` 收尾：显式 `session.end()` / `finally`，消除 `did not exit in time` 告警
 - [ ] 本地 VAD 低延迟优化（Silero CPU 较慢，考虑 GPU/降采样/分段）
 - [ ] 全局洞察蒸馏 + 对象历史主题合并

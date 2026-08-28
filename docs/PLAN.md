@@ -16,7 +16,7 @@
 ## M3 — 五层编排 + Provider 降级 [部分完成]
 
 - `AgentSession` 接线：VAD + STT(`StreamAdapter` 包 sherpa) + LLM + TTS。
-- ASR：sherpa SenseVoice（含粤）；LLM：DeepSeek（优先）/ Ollama / ScriptedLLM（CI）；TTS：火山流式（可降级 beep）。
+- ASR：sherpa SenseVoice（含粤）；LLM：DeepSeek（优先）/ Ollama / ScriptedLLM（CI）；TTS：火山 V3 单向流式（可降级 beep）。
 - `ContextInjector` 从 `ControlPlaneClient` 拉对象/人设/知识 → 注入指令（只注入结构化对象卡/人设/产品片段，不含原始历史正文）。
 - `ScriptedLLM`：确定性路径按「注入知识命中 `EXPECT_KW` → 输出指定话术」。
 - `SessionManifest` + `ProviderRegistry`（降级状态机为骨架）。

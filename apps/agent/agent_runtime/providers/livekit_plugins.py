@@ -332,7 +332,8 @@ class _SherpaSTTStream(stt.RecognizeStream):
 class VolcanoTTS(tts.TTS):
     """Volcengine (火山) small-model WebSocket streaming TTS.
 
-    Uses the official V1 binary protocol:  ``wss://openspeech.bytedance.com/api/v1/tts/ws_binary``.
+    Uses the official V3 unidirectional streaming protocol:
+    ``wss://openspeech.bytedance.com/api/v3/tts/unidirectional/stream``.
     If credentials are missing or the upstream call fails, it degrades to a short beep so the
     voice pipeline (VAD -> STT -> LLM -> TTS -> playout) can be validated offline.
     """
@@ -361,16 +362,6 @@ class _VolcanoTTSStream(tts.ChunkedStream):
         self._tts_ = tts_
 
     async def _run(self, output_emitter):
-        import os
-        import json
-        import asyncio
-        import struct
-        import uuid
-
-        import websockets
-
-        app_id = os.environ.get("VOLC_APP_ID", "")
-        token = os.environ.get("VOLC_ACCESS_TOKEN", "")
         output_emitter.initialize(
             request_id="volcano-tts",
             sample_rate=self._tts_.sample_rate,
@@ -378,53 +369,75 @@ class _VolcanoTTSStream(tts.ChunkedStream):
             mime_type="audio/pcm",
             stream=False,
         )
+        import os
+
+        app_id = os.environ.get("VOLC_APP_ID", "")
+        token = os.environ.get("VOLC_ACCESS_TOKEN", "")
         if not app_id or not token:
             await self._emit_beep(output_emitter)
             return
 
         try:
-            uri = "wss://openspeech.bytedance.com/api/v1/tts/ws_binary"
+            import asyncio
+            import json
+            import uuid
+
+            import websockets
+
+            from .volc_v3_protocol import EventType, MsgType, MsgTypeFlagBits, Message, receive_message
+
+            resource_id = os.environ.get("VOLC_RESOURCE_ID", "seed-tts-2.0")
+            speaker = os.environ.get("VOLC_SPEAKER", "zh_female_vv_uranus_bigtts")
+            language = os.environ.get("VOLC_LANGUAGE", "")
+            dialect = os.environ.get("VOLC_DIALECT", "")
+
+            req_params: dict = {
+                "text": self._text,
+                "speaker": speaker,
+                "audio_params": {"format": "pcm", "sample_rate": self._tts_.sample_rate},
+                "speech_rate": int(os.environ.get("VOLC_SPEECH_RATE", "0")),
+                "loudness_rate": int(os.environ.get("VOLC_LOUDNESS_RATE", "0")),
+            }
+            if language:
+                req_params["explicit_language"] = language
+            if dialect:
+                req_params["explicit_dialect"] = dialect
+
+            uri = "wss://openspeech.bytedance.com/api/v3/tts/unidirectional/stream"
+            addr = os.environ.get("VOLC_TTS_ENDPOINT", uri)  # 允许测试/降级时覆盖端点
             ws = await websockets.connect(
-                uri,
-                additional_headers={"Authorization": f"Bearer; {token}"},
-                open_timeout=10,
-            )
-            header = bytes([0x11, 0x10, 0x00, 0x00])
-            body = json.dumps(
-                {
-                    "app": {"appid": app_id, "token": token, "cluster": "volcano_tts"},
-                    "user": {"uid": "bok-voice"},
-                    "audio": {
-                        "voice_type": "BV001_streaming",
-                        "encoding": "pcm",
-                        "speed_ratio": 1.0,
-                        "rate": 24000,
-                        "volume_ratio": 1.0,
-                        "pitch_ratio": 1.0,
-                    },
-                    "request": {
-                        "reqid": str(uuid.uuid4()),
-                        "text": self._text,
-                        "operation": "submit",
-                    },
+                addr,
+                additional_headers={
+                    "X-Api-App-Id": app_id,
+                    "X-Api-Access-Key": token,
+                    "X-Api-Resource-Id": resource_id,
+                    "X-Api-Request-Id": str(uuid.uuid4()),
                 },
+                open_timeout=15,
+                max_size=20_000_000,
+            )
+            # 单向流式：一帧 FullClientRequest（无事件号 flag），携带 user + req_params。
+            body = json.dumps(
+                {"user": {"uid": "bok-voice"}, "req_params": req_params},
                 ensure_ascii=False,
             ).encode("utf-8")
-            await ws.send(header + struct.pack(">I", len(body)) + body)
+            frame = Message(type=MsgType.FullClientRequest, flag=MsgTypeFlagBits.NoSeq, payload=body)
+            await ws.send(frame.marshal())
+
             while True:
-                msg = await asyncio.wait_for(ws.recv(), timeout=10)
-                if msg and isinstance(msg, (bytes, bytearray)):
-                    payload = self._strip_binary_header(bytes(msg))
-                    if payload[:1] == b"{":
-                        break
-                    if payload:
-                        output_emitter.push(payload)
-                else:
+                msg = await asyncio.wait_for(receive_message(ws), timeout=30)
+                if msg.type == MsgType.Error:
                     break
-            output_emitter.flush()
+                if msg.type == MsgType.AudioOnlyServer or msg.event == EventType.TTSResponse:
+                    if msg.payload:
+                        output_emitter.push(msg.payload)
+                if msg.event in (EventType.SessionFinished, EventType.ConnectionFinished):
+                    break
             await ws.close()
         except Exception:
             await self._emit_beep(output_emitter)
+        finally:
+            output_emitter.flush()
 
     async def _emit_beep(self, output_emitter):
         import math
@@ -437,10 +450,3 @@ class _VolcanoTTSStream(tts.ChunkedStream):
             pcm += v.to_bytes(2, "little", signed=True)
         output_emitter.push(bytes(pcm))
         output_emitter.flush()
-
-    def _strip_binary_header(self, packet: bytes) -> bytes:
-        # V1 audio-only header: 1 byte flags + 3 bytes payload length (big-endian).
-        if len(packet) < 4:
-            return b""
-        payload_len = int.from_bytes(packet[1:4], "big")
-        return packet[4 : 4 + payload_len]

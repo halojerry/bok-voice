@@ -21,6 +21,6 @@
 - ISSUE 7：录音合规与保留期、删除/被遗忘。
 - ISSUE 8：20–50 路并发压测与容量告警。
 - ISSUE 9：真实 sherpa / GPT-SoVITS / 火山 / 讯飞 / Ollama 适配器接入与基准。
-- ISSUE 10：火山 TTS 按官方参数校准（`voice_type`/`cluster`、V1 帧聚合）。
+- ISSUE 10：火山 TTS V3 参数校准（`seed-tts-2.0` 音色 + `explicit_language`/`explicit_dialect`，覆盖越南语/粤语；双向流式 `StartConnection→StartSession→TaskRequest` 待按需开启）。
 - ISSUE 11：Agent `entrypoint` 生命周期收尾（`session.end()`/`finally`，消除 `did not exit in time` 告警）。
 - ISSUE 12：CI（lint + pytest + next build + browser e2e）。
