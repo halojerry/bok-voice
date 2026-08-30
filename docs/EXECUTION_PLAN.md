@@ -102,6 +102,8 @@
 - [x] B1：provider 单测全绿（EnergyVAD / Qwen3-ASR / Qwen3-TTS / Ollama 翻译）
 - [x] B2：ws 集成测试全绿 + worker `ws://:8790` 可连 + `/translate` 页面可渲染（麦克风/播放需真机人工验收）
 - [x] B3：多通道 demo（mock/`--real`）+ metrics JSONL 落盘
+- [x] B4（追加）：真实链路集成验证 `services/realtime-translation/scripts/real-ws-test.mjs` → `B_LINE_REAL_WS PASSED`（测试音频 → EnergyVAD → Qwen3-ASR → Ollama 翻译 → Qwen3-TTS → subtitle/audio/metrics 事件；zh→en、yue→zh 双语对）；`tools/browser-e2e/translate-page.mjs` → 页面渲染 + `WS OPEN` + 无报错
+- [x] A3-final：Docker 化（agent/web/control-plane 新镜像）完整三语 E2E `TRILINGUAL_E2E 3/3 PASSED` 留档
 - [x] C1–C3：compose sidecar profile + README + B 线 README + .env.example 已更新；提交待 A3 收尾
 - [x] C4：Docker 镜像离线重建（镜像源限流绕过）：`scripts/rebuild_images_offline.sh` + Dockerfile `ARG BASE_IMAGE`；三镜像重建后 `docker compose up -d --force-recreate` 恢复容器化，zh E2E 1/1 PASSED，悬空镜像清理完成
 

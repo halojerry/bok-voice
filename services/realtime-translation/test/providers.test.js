@@ -110,7 +110,8 @@ test("OllamaTranslator posts translation request and returns content", async () 
     assert.equal(out, "Hello.");
     assert.equal(body.stream, false);
     assert.equal(body.think, false);
-    assert.match(body.messages.at(-1).content, /Target language: en/);
+    assert.match(body.messages.at(-1).content, /Target language: English/);
+    assert.match(body.messages.at(-1).content, /Source language: Chinese \(Simplified\)/);
   } finally {
     server.close();
   }

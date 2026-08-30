@@ -14,9 +14,17 @@ const SYSTEM = `You are a professional simultaneous-interpretation engine.
 Translate the user's text from the source language to the target language.
 Rules:
 - Output ONLY the translation, no explanations, no quotes, no extra text.
+- Output ONLY in the target language, never in the source language.
 - Keep names, numbers, and technical terms where sensible.
 - Preserve the original tone (casual/courteous).
 - If the source is already in the target language, return it unchanged.`;
+
+const LANG_NAME = {
+  zh: "Chinese (Simplified)",
+  yue: "Cantonese",
+  en: "English",
+  auto: "auto",
+};
 
 export class OllamaTranslator {
   constructor(opts = {}) {
@@ -25,6 +33,8 @@ export class OllamaTranslator {
   }
 
   async translate(text, sourceLang, targetLang) {
+    const src = LANG_NAME[String(sourceLang || "").toLowerCase()] || sourceLang || "auto";
+    const tgt = LANG_NAME[String(targetLang || "").toLowerCase()] || targetLang || "auto";
     const res = await fetch(`${this.baseUrl}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -34,7 +44,7 @@ export class OllamaTranslator {
           { role: "system", content: SYSTEM },
           {
             role: "user",
-            content: `Source language: ${sourceLang}\nTarget language: ${targetLang}\nText: ${text}`,
+            content: `Source language: ${src}\nTarget language: ${tgt}\nText: ${text}`,
           },
         ],
         stream: false,
