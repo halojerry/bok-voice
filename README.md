@@ -39,6 +39,14 @@ tests/                # Python 测试
 docker compose up -d --build
 ```
 
+如果第三方镜像源限流导致 `--build` 拉不到基础镜像，用离线重建脚本（从现有镜像派生本地
+`python:3.12-slim` / `node:22-alpine` 基础镜像，再走标准 Dockerfile 构建；pip/PyPI 需可达）：
+
+```bash
+./scripts/rebuild_images_offline.sh
+docker compose up -d --force-recreate agent web control-plane
+```
+
 默认监听：
 
 - Web：`http://localhost:3000`

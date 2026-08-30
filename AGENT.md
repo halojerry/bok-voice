@@ -151,4 +151,4 @@
   - Silero VAD `max_buffered_speech` 调至 15s（env 可改），假音频补前后静音。
 - 🟡 供应商插件化（Phase 5，已评估/暂缓）：社区 `livekit-plugins-volcengine` 依赖 `livekit-agents<1.7`，与本项目 1.7.1 冲突，**暂不替换**自研 VolcanoTTS（Path B 已让 mood 生效，不依赖它）；MiniMax 官方插件（`livekit-plugins-minimax-ai`）、阿里社区插件（`livekit-plugins-aliyun`）按需再接；智谱 GLM-Realtime 自研包装（照 livekit-plugins-openai 模板）留作专项。
 - ⏳ 未来：Tailwind v4 → `AgentSessionView_01`/`AgentChatTranscript`（官方聊天组件 v4-only）；SIP（livekit/sip）；硬件（Portal/ESP32）；`reports`/`settings` 真实数据。
-- ⚠️ 已知环境问题：Docker 镜像源（轩辕镜像）限流 403，`docker compose build agent/web` 暂无法重建；Mac 开发机用宿主机 `.venv312` 直接跑 `python -m agent_runtime.main start`（editable 安装，代码即时生效）+ `scripts/start_sidecars.sh`。镜像源恢复后需重建 agent/web 镜像并恢复 `docker compose up -d agent`。
+- ✅ 已解决（2026-08-30）：`scripts/rebuild_images_offline.sh` 从现有镜像派生本地基础镜像后离线重建 agent/web/control-plane，Docker 化全链路恢复；`docker compose up -d --force-recreate agent web control-plane` 后 zh E2E 1/1 PASSED。Dockerfile 增加 `ARG BASE_IMAGE` 支持离线构建。镜像源正常时仍可直接 `docker compose up -d --build`。

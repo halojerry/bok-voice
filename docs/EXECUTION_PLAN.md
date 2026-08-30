@@ -103,6 +103,7 @@
 - [x] B2：ws 集成测试全绿 + worker `ws://:8790` 可连 + `/translate` 页面可渲染（麦克风/播放需真机人工验收）
 - [x] B3：多通道 demo（mock/`--real`）+ metrics JSONL 落盘
 - [x] C1–C3：compose sidecar profile + README + B 线 README + .env.example 已更新；提交待 A3 收尾
+- [x] C4：Docker 镜像离线重建（镜像源限流绕过）：`scripts/rebuild_images_offline.sh` + Dockerfile `ARG BASE_IMAGE`；三镜像重建后 `docker compose up -d --force-recreate` 恢复容器化，zh E2E 1/1 PASSED，悬空镜像清理完成
 
 ## 4. 执行过程发现的问题（追加）
 
