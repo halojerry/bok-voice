@@ -83,6 +83,8 @@ services:
       QWEN3_TTS_BASE_URL: http://host.docker.internal:8788
       OLLAMA_BASE_URL: http://host.docker.internal:11434/v1
       OLLAMA_MODEL: huihui_ai/qwen3.5-abliterated:9b
+      MLX_LLM_BASE_URL: http://host.docker.internal:1235/v1
+      MLX_LLM_MODEL: /Users/halo/.lmstudio/models/huihui-ai/Huihui-Qwen3.5-9B-abliterated-mlx-4bit
     depends_on:
       - livekit
       - control-plane

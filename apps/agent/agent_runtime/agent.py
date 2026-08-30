@@ -17,11 +17,27 @@ from .control_plane import ControlPlaneClient
 
 # 剥掉进 TTS 那一路的 <expr/> 标签（防被念出来）；转录那一路框架会自动剥离并发布 mood。
 _EXPR_TAG_RE = re.compile(r"<expr\b[^>]*?/>|<[^>]+>")
+_EXPR_PARTIAL_RE = re.compile(r"<expr\b[^>]*$")
 
 
 async def _strip_expr_markup(text):
+    carry = ""
     async for chunk in text:
-        yield _EXPR_TAG_RE.sub("", chunk)
+        combined = carry + chunk
+        out = _EXPR_TAG_RE.sub("", combined)
+        # A tag split across stream chunks has no closing ">" yet: hold the
+        # trailing "<expr ..." fragment until the next chunk completes it.
+        m = _EXPR_PARTIAL_RE.search(out)
+        if m and out[m.start() :].startswith("<expr"):
+            carry = out[m.start() :]
+            out = out[: m.start()]
+        else:
+            carry = ""
+        if out:
+            yield out
+    # Drop any dangling partial tag at the end of the stream.
+    if carry:
+        yield ""
 
 
 def _parse_voice_map(raw) -> dict:
@@ -56,7 +72,7 @@ def build_dummy_manifest(*, session_id: str, account_id: str, object_id: str, pe
         object_id=object_id,
         persona_id=persona_id,
         mode=CallMode(mode),
-        providers={"vad": "silero", "asr": "qwen3_asr", "llm": "ollama", "tts": "qwen3_tts"},
+        providers={"vad": "silero", "asr": "qwen3_asr", "llm": "mlx", "tts": "qwen3_tts"},
     )
     return manifest.__dict__
 
@@ -88,13 +104,18 @@ def _instructions(
                 parts.append(f"- {text}")
     if history:
         parts.append(f"上次聊到：{history}")
-    parts.append("回复语言规则：用户说普通话就用普通话回复，说粤语就用粤语回复，说英语就用英语回复。")
+    parts.append(
+        "回复语言必须与用户使用的语言严格一致："
+        "用户说普通话就只用标准普通话回复（严禁使用任何粤语口语用字）；"
+        "用户说粤语就用地道粤语口语回复（使用如：唔、冇、嘅、哋、佢、喺、嚟、啲、咁、係、唔該、"
+        "倾偈、而家、睇嚟、啱啱）；用户说英语就用英语回复。"
+    )
     return "\n".join(parts)
 
 
 async def entrypoint(ctx):
     """LiveKit Agent job entrypoint (must be module-level for pickling)."""
-    from livekit.agents import Agent, AgentSession, inference, stt
+    from livekit.agents import Agent, AgentSession, TurnHandlingOptions, inference, stt
     from .providers.livekit_plugins import DeepSeekLLM, ExprAwareLLM, OllamaLLM
 
     room_name = ctx.room.name
@@ -224,6 +245,14 @@ async def entrypoint(ctx):
                 base_url=os.environ.get("OLLAMA_BASE_URL", "http://host.docker.internal:11434/v1"),
                 model=os.environ.get("OLLAMA_MODEL", "huihui_ai/qwen3.5-abliterated:9b"),
             )
+    elif llm_provider_name in ("mlx", "local_openai", "lmstudio"):
+        from .providers.livekit_plugins import MlxLlmLLM
+
+        llm_provider = MlxLlmLLM(
+            base_url=llm_cfg.get("base_url")
+            or os.environ.get("MLX_LLM_BASE_URL", "http://host.docker.internal:1235/v1"),
+            model=llm_cfg.get("model") or os.environ.get("MLX_LLM_MODEL", None),
+        )
     elif llm_provider_name == "ollama":
         llm_provider = OllamaLLM(
             base_url=llm_cfg.get("base_url") or os.environ.get("OLLAMA_BASE_URL", "http://host.docker.internal:11434/v1"),
@@ -246,6 +275,28 @@ async def entrypoint(ctx):
         stt=stt_provider,
         llm=llm_provider,
         tts=tts_provider,
+        # 官方低延迟调参（docs.livekit.io/agents/logic/turns/tuning）：
+        # - dynamic endpointing：按会话停顿统计自适应，min 0.35s 加速切句
+        # - preemptive_tts：在轮次确认前就开跑 LLM->TTS，代价是打断时浪费算力
+        # - interruption 保持自适应（无模型时自动回退 VAD），min_duration 收紧到 0.35s
+        turn_handling=TurnHandlingOptions(
+            endpointing={
+                "mode": "dynamic",
+                "min_delay": float(os.environ.get("ENDPOINT_MIN_DELAY", "0.35")),
+                "max_delay": float(os.environ.get("ENDPOINT_MAX_DELAY", "2.0")),
+            },
+            preemptive_generation={
+                "enabled": True,
+                "preemptive_tts": os.environ.get("PREEMPTIVE_TTS", "1") == "1",
+                "max_speech_duration": 10.0,
+                "max_retries": 3,
+            },
+            interruption={
+                "enabled": True,
+                "min_duration": 0.35,
+                "min_words": 0,
+            },
+        ),
         # 默认 ["filter_markdown","filter_emoji"] 会被整体替换，故带上内置两项；
         # 追加的自定义 transform 把 <expr/> 从进 TTS 的文本里剥掉（转录路径保留，框架发布 mood）。
         tts_text_transforms=["filter_markdown", "filter_emoji", _strip_expr_markup],
@@ -272,6 +323,7 @@ async def entrypoint(ctx):
     # AgentSession 内部已注册 job shutdown callback（自动 aclose），
     # 这里不能提前 close，否则会话在接通后立刻被销毁。
     await session.start(agent=agent, room=ctx.room)
+
     await session.generate_reply(instructions="请问有什么可以帮您？")
 
 

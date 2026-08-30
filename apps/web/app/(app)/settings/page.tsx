@@ -8,14 +8,14 @@ type ProviderKind = "asr" | "llm" | "tts" | "vad";
 
 const PROVIDER_OPTIONS: Record<ProviderKind, string[]> = {
   asr: ["qwen3_asr", "sherpa_sensevoice", "fake"],
-  llm: ["ollama", "deepseek", "fake"],
+  llm: ["mlx", "ollama", "deepseek", "fake"],
   tts: ["qwen3_tts", "fake"],
   vad: ["silero", "fake"],
 };
 
 const EMPTY_FORM = {
   asr: { provider: "qwen3_asr", model: "Qwen/Qwen3-ASR-0.6B", base_url: "http://127.0.0.1:8787", backend: "transformers", language: "zh" },
-  llm: { provider: "ollama", model: "huihui_ai/qwen3.5-abliterated:9b", base_url: "http://host.docker.internal:11434/v1", api_key: "ollama" },
+  llm: { provider: "mlx", model: "huihui-qwen3.5-9b-abliterated-mlx", base_url: "http://host.docker.internal:1235/v1", api_key: "mlx" },
   tts: { provider: "qwen3_tts", model: "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", base_url: "http://127.0.0.1:8788", speaker: "", speaker_zh: "", speaker_yue: "", speaker_en: "", instruct: "", sample_rate: 24000 },
   vad: { provider: "silero", model: "", sensitivity: 0.5 },
   policy: "offline_first",

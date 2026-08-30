@@ -43,6 +43,31 @@ def _wav_from_pcm16(pcm: bytes) -> tuple[np.ndarray, int]:
     return samples, SAMPLE_RATE
 
 
+def _fallback_language(text: str) -> str:
+    """Qwen3-ASR's raw output sometimes omits the `language ...<asr_text>`
+    metadata tag (observed on CPU), leaving the language field empty. Fall
+    back to a character-set heuristic so the agent's LanguageState can still
+    pick the right TTS voice/language. Cantonese text is Han-dominant, so it
+    resolves to Chinese, which Qwen3-TTS maps to yue correctly."""
+    if not text:
+        return ""
+    # Conservative Cantonese-specific characters (avoid common Mandarin
+    # particles like 呢/啦/嘛 which would misclassify zh text).
+    cantonese_markers = set(
+        "冇唔嘅係哋佢喺嚟啲嗰喎㗎冚瞓攞揾搵嘥咗乜嘢咩"
+        "傾偈倾偈倾下傾下唔該而家依家啱啱咁睇嚟睇来同我哋"
+    )
+    if any(ch in cantonese_markers for ch in text):
+        return "Cantonese"
+    han = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    latin = sum(1 for ch in text if ch.isascii() and ch.isalpha())
+    if han >= latin and han > 0:
+        return "Chinese"
+    if latin > 0:
+        return "English"
+    return ""
+
+
 class ASRService:
     def __init__(self) -> None:
         self._model: Any | None = None
@@ -53,6 +78,11 @@ class ASRService:
         if os.environ.get("QWEN3_ASR_DISABLE_LOAD") == "1":
             return
         try:
+            if BACKEND == "mlx":
+                from mlx_audio.stt.utils import load as mlx_load
+
+                self._model = mlx_load(MODEL_PATH)
+                return
             import torch
             from qwen_asr import Qwen3ASRModel
 
@@ -78,6 +108,9 @@ class ASRService:
 
     @staticmethod
     def _resolve_device() -> str:
+        override = os.environ.get("QWEN3_ASR_DEVICE", "").strip().lower()
+        if override in {"cpu", "cuda", "mps"}:
+            return override
         import torch
 
         if torch.cuda.is_available():
@@ -124,11 +157,17 @@ class ASRService:
                 session["vllm_state"] = state
             self._model.streaming_transcribe(_resample(wav, sr, SAMPLE_RATE), state)
             session["text"] = getattr(state, "text", "") or ""
-            session["language"] = getattr(state, "language", "") or ""
+            session["language"] = getattr(state, "language", "") or _fallback_language(session["text"])
+            return {
+                "text": session["text"],
+                "language": session["language"],
+                "partial": True,
+            }
+        # transformers backend: batch transcribe at finish(); chunks just buffer.
         return {
             "text": session["text"],
             "language": session["language"],
-            "partial": BACKEND == "vllm",
+            "partial": False,
         }
 
     def finish(self, session_id: str) -> dict[str, str | bool]:
@@ -141,9 +180,13 @@ class ASRService:
             state = session["vllm_state"]
             if state is not None:
                 self._model.finish_streaming_transcribe(state)
+                text = getattr(state, "text", "") or ""
+                language = getattr(state, "language", "") or ""
+                if not language:
+                    language = _fallback_language(text)
                 return {
-                    "text": getattr(state, "text", "") or "",
-                    "language": getattr(state, "language", "") or "",
+                    "text": text,
+                    "language": language,
                     "partial": False,
                 }
 
@@ -151,6 +194,24 @@ class ASRService:
         wav, sr = _wav_from_pcm16(pcm)
         if wav.size == 0:
             return {"text": "", "language": "", "partial": False}
+        if BACKEND == "mlx":
+            out = self._model.generate(
+                _resample(wav, sr, SAMPLE_RATE),
+                language=None,
+                max_tokens=int(os.environ.get("QWEN3_ASR_MAX_TOKENS", "256")),
+            )
+            text = getattr(out, "text", "") or ""
+            langs = getattr(out, "language", None) or []
+            language = ""
+            if isinstance(langs, list) and langs:
+                language = str(langs[0] or "")
+            if not language:
+                language = _fallback_language(text)
+            return {
+                "text": text,
+                "language": language,
+                "partial": False,
+            }
         result = self._model.transcribe(
             audio=(_resample(wav, sr, SAMPLE_RATE), SAMPLE_RATE),
             language=None,
@@ -158,9 +219,13 @@ class ASRService:
         if not result:
             return {"text": "", "language": "", "partial": False}
         first = result[0]
+        text = getattr(first, "text", "") or ""
+        language = getattr(first, "language", "") or ""
+        if not language:
+            language = _fallback_language(text)
         return {
-            "text": getattr(first, "text", "") or "",
-            "language": getattr(first, "language", "") or "",
+            "text": text,
+            "language": language,
             "partial": False,
         }
 

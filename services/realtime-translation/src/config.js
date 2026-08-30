@@ -9,8 +9,8 @@ const DEFAULTS = {
   asr: { provider: "qwen3_asr", base_url: "http://127.0.0.1:8787", sample_rate: 16000 },
   translator: {
     provider: "ollama",
-    base_url: "http://127.0.0.1:11434",
-    model: "huihui_ai/qwen3.5-abliterated:9b",
+    base_url: "http://127.0.0.1:1235/v1",
+    model: "/Users/halo/.lmstudio/models/huihui-ai/Huihui-Qwen3.5-9B-abliterated-mlx-4bit",
     think: false,
   },
   tts: { provider: "qwen3_tts", base_url: "http://127.0.0.1:8788", sample_rate: 24000 },

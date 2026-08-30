@@ -75,6 +75,36 @@ class DeepSeekLLM(OpenAICompatLLM):
         super().__init__(api_key=api_key, model=model, base_url=base_url)
 
 
+class MlxLlmLLM(OpenAICompatLLM):
+    """Local MLX LLM served by our own mlx_lm OpenAI-compatible server.
+
+    Serves the same huihui Qwen3.5 9B weights via `python -m mlx_lm server`
+    with `--chat-template-args '{"enable_thinking":false}'`, which avoids the
+    LM Studio engine bug that forces thinking mode on Qwen3.5 models. Warm
+    replies are ~1s vs 4.5s+ when thinking is stuck on.
+    """
+
+    provider = "mlx"
+    model = "local"
+
+    def __init__(
+        self,
+        api_key="mlx",
+        model=None,
+        base_url="http://host.docker.internal:1235/v1",
+    ):
+        super().__init__(
+            api_key=api_key,
+            model=model
+            or os.environ.get(
+                "MLX_LLM_MODEL",
+                "/Users/halo/.lmstudio/models/huihui-ai/Huihui-Qwen3.5-9B-abliterated-mlx-4bit",
+            ),
+            base_url=base_url
+            or os.environ.get("MLX_LLM_BASE_URL", "http://host.docker.internal:1235/v1"),
+        )
+
+
 class OllamaLLM(llm.LLM):
     """Local Ollama via the native /api/chat endpoint.
 
@@ -195,17 +225,17 @@ class _OpenAICompatStream:
             async def _run(self):
                 print("OLLAMA_REQUEST_START", flush=True)
                 try:
-                    async with plugin._client.chat.completions.create(
+                    stream = await plugin._client.chat.completions.create(
                         model=plugin._model,
                         messages=messages,
                         stream=True,
                         max_tokens=max_tokens,
-                    ) as stream:
-                        async for chunk in stream:
-                            if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                                print("OLLAMA_REPLY_CHUNK", len(chunk.choices[0].delta.content), flush=True)
-                                delta = llm.ChoiceDelta(content=chunk.choices[0].delta.content, role="assistant")
-                                self._event_ch.send_nowait(llm.ChatChunk(id=getattr(chunk, "id", "stream"), delta=delta))
+                    )
+                    async for chunk in stream:
+                        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                            print("OLLAMA_REPLY_CHUNK", len(chunk.choices[0].delta.content), flush=True)
+                            delta = llm.ChoiceDelta(content=chunk.choices[0].delta.content, role="assistant")
+                            self._event_ch.send_nowait(llm.ChatChunk(id=getattr(chunk, "id", "stream"), delta=delta))
                 except asyncio.CancelledError:
                     raise
 
@@ -685,13 +715,6 @@ class _Qwen3TTSStream(tts.ChunkedStream):
         self._tts_ = tts_
 
     async def _run(self, output_emitter):
-        output_emitter.initialize(
-            request_id="qwen3-tts",
-            sample_rate=self._tts_.sample_rate,
-            num_channels=self._tts_.num_channels,
-            mime_type="audio/pcm",
-            stream=False,
-        )
         try:
             last_exc: Exception | None = None
             for attempt in range(3):
@@ -706,11 +729,42 @@ class _Qwen3TTSStream(tts.ChunkedStream):
                                 "instruct": self._tts_._instruct,
                                 "sample_rate": self._tts_.sample_rate,
                                 "response_format": "pcm",
+                                "streaming": True,
+                                "chunk_ms": 200,
                             },
                         )
                         resp.raise_for_status()
-                        output_emitter.push(resp.content)
-                        print("QWEN3_TTS_BYTES", len(resp.content), flush=True)
+                        # Stream the PCM body into 200ms frames. The sidecar
+                        # streams with non_streaming_mode=False (Qwen3-TTS
+                        # Dual-Track fast path), and pushing frames here lets
+                        # LiveKit start playback/barge-in handling as soon as
+                        # the first frames are available instead of one blob.
+                        pcm_total = 0
+                        frame_bytes = (
+                            self._tts_.sample_rate // 5
+                        ) * 2  # 200ms, 16-bit mono
+                        buf = bytearray()
+                        output_emitter.initialize(
+                            request_id="qwen3-tts",
+                            sample_rate=self._tts_.sample_rate,
+                            num_channels=self._tts_.num_channels,
+                            mime_type="audio/pcm",
+                            stream=True,
+                        )
+                        output_emitter.start_segment(segment_id="qwen3-tts")
+                        async for data in resp.aiter_bytes():
+                            buf.extend(data)
+                            while len(buf) >= frame_bytes:
+                                output_emitter.push(bytes(buf[:frame_bytes]))
+                                output_emitter.flush()
+                                del buf[:frame_bytes]
+                                pcm_total += frame_bytes
+                        if buf:
+                            output_emitter.push(bytes(buf))
+                            output_emitter.flush()
+                            pcm_total += len(buf)
+                        output_emitter.end_segment()
+                        print("QWEN3_TTS_BYTES", pcm_total, flush=True)
                         return
                 except Exception as exc:  # noqa: BLE001 - retry transient gateway failures
                     last_exc = exc

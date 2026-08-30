@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import io
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 try:
     import soundfile as sf
@@ -33,6 +36,9 @@ DEFAULT_CLONE_MODEL = os.environ.get(
     "QWEN3_TTS_CLONE_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 )
 SAMPLE_RATE = int(os.environ.get("QWEN3_TTS_SAMPLE_RATE", "24000"))
+MAX_REF_SECONDS = float(os.environ.get("QWEN3_TTS_MAX_REF_SECONDS", "10"))
+REF_TARGET_SECONDS = float(os.environ.get("QWEN3_TTS_REF_TARGET_SECONDS", "8"))
+BACKEND = os.environ.get("QWEN3_TTS_BACKEND", "transformers").lower()
 
 app = FastAPI(title="Bok Qwen3-TTS Sidecar")
 
@@ -64,11 +70,17 @@ class TTSService:
         if os.environ.get("QWEN3_TTS_DISABLE_LOAD") == "1":
             return
         try:
+            if BACKEND == "mlx":
+                from mlx_audio.tts.utils import load_model as mlx_load_model
+
+                self._preset_model = mlx_load_model(DEFAULT_PRESET_MODEL)
+                self._clone_model = mlx_load_model(DEFAULT_CLONE_MODEL)
+                return
             import torch
             from qwen_tts import Qwen3TTSModel
 
             device = self._resolve_device()
-            dtype = torch.bfloat16 if device == "cuda" else torch.float32
+            dtype = torch.bfloat16 if device in ("cuda", "mps") else torch.float32
             attn = "flash_attention_2" if device == "cuda" else "sdpa"
             self._preset_model = Qwen3TTSModel.from_pretrained(
                 DEFAULT_PRESET_MODEL,
@@ -76,10 +88,16 @@ class TTSService:
                 dtype=dtype,
                 attn_implementation=attn,
             )
+            # Clone model loads eagerly on the main thread at startup
+            # (lazy loading from uvicorn's threadpool segfaults on MPS) and
+            # uses float32 on MPS: bf16 breaks the Base/ICL clone generation
+            # (runs to max_new_tokens without emitting EOS -> minutes of
+            # garbage audio). Preset stays bf16 for low latency.
+            clone_dtype = torch.float32 if device == "mps" else dtype
             self._clone_model = Qwen3TTSModel.from_pretrained(
                 DEFAULT_CLONE_MODEL,
                 device_map=device,
-                dtype=dtype,
+                dtype=clone_dtype,
                 attn_implementation=attn,
             )
         except Exception as exc:  # pragma: no cover - model download/load can fail
@@ -136,16 +154,23 @@ class TTSService:
         suffix = Path(file.filename or "reference.wav").suffix or ".wav"
         safe = hashlib.sha1(voice_id.encode("utf-8")).hexdigest()[:12]
         target = DATA_DIR / f"{safe}{suffix}"
-        target.write_bytes(await file.read())
+        raw = await file.read()
         try:
-            prompt = self._clone_model.create_voice_clone_prompt(
-                ref_audio=str(target),
-                ref_text=ref_text,
-            )
-            self._clone_prompts[voice_id] = prompt
-        except Exception as exc:
-            target.unlink(missing_ok=True)
-            raise HTTPException(status_code=400, detail=f"voice clone failed: {exc}") from exc
+            target.write_bytes(_trim_reference_audio(raw, suffix))
+        except Exception:
+            # Fall back to the original upload if trimming fails (e.g. an
+            # unusual codec soundfile can't decode).
+            target.write_bytes(raw)
+        if BACKEND != "mlx":
+            try:
+                prompt = self._clone_model.create_voice_clone_prompt(
+                    ref_audio=str(target),
+                    ref_text=ref_text,
+                )
+                self._clone_prompts[voice_id] = prompt
+            except Exception as exc:
+                target.unlink(missing_ok=True)
+                raise HTTPException(status_code=400, detail=f"voice clone failed: {exc}") from exc
         self._registry[voice_id] = {
             "voice_id": voice_id,
             "ref_audio": str(target),
@@ -163,16 +188,53 @@ class TTSService:
         voice: str = "",
         instruct: str = "",
         sample_rate: int = SAMPLE_RATE,
+        streaming: bool = True,
+        max_new_tokens: int | None = None,
+        do_sample: bool | None = None,
+        temperature: float | None = None,
+        top_k: int | None = None,
     ) -> bytes:
         self.ensure_loaded()
         if not text:
             return b""
+        if BACKEND == "mlx":
+            return self._synthesize_mlx(
+                text=text,
+                language=language,
+                voice=voice,
+                instruct=instruct,
+                sample_rate=sample_rate,
+                streaming=streaming,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+            )
+        mem_before = _mps_mem()
+        t_start = time.perf_counter()
+        gen_kwargs = {}
+        if max_new_tokens is not None:
+            gen_kwargs["max_new_tokens"] = max_new_tokens
+        else:
+            # Package default is 4096 (≈341s of 12Hz codec audio); a runaway
+            # generation stalls MPS for minutes. 512 tokens ≈ 42s audio cap,
+            # far beyond any single customer-service sentence.
+            gen_kwargs["max_new_tokens"] = int(
+                os.environ.get("QWEN3_TTS_MAX_NEW_TOKENS", "512")
+            )
+        if do_sample is not None:
+            gen_kwargs["do_sample"] = do_sample
+        if temperature is not None:
+            gen_kwargs["temperature"] = temperature
+        if top_k is not None:
+            gen_kwargs["top_k"] = top_k
         if voice in self._registry or voice in self._clone_prompts:
             language = self._normalize_language(self._clone_model, language)
             wavs, sr = self._synthesize_clone(
                 text=text,
                 language=language,
                 voice=voice,
+                streaming=streaming,
+                **gen_kwargs,
             )
         else:
             language = self._normalize_language(self._preset_model, language)
@@ -182,6 +244,8 @@ class TTSService:
                 language=language or "Auto",
                 speaker=speaker,
                 instruct=instruct,
+                non_streaming_mode=not streaming,
+                **gen_kwargs,
             )
         if isinstance(wavs, list):
             wav = np.asarray(wavs[0], dtype=np.float32)
@@ -190,7 +254,75 @@ class TTSService:
         if wav.ndim > 1:
             wav = wav.mean(axis=-1)
         wav = self._resample(wav, sr, sample_rate)
-        return self._to_pcm16(wav)
+        pcm = self._to_pcm16(wav)
+        mem_after = _mps_mem()
+        _release_mps_cache()
+        print(
+            "QWEN3_TTS_SYNTH",
+            f"text={len(text)} stream={streaming}",
+            f"audio={len(pcm)/2/sample_rate:.2f}s",
+            f"time={time.perf_counter()-t_start:.2f}s",
+            f"mps_before={mem_before[0]:.0f}MB",
+            f"mps_after={mem_after[0]:.0f}MB",
+            f"mps_driver={mem_after[1]:.0f}MB",
+            flush=True,
+        )
+        return pcm
+
+    def synthesize_chunks(
+        self,
+        *,
+        text: str,
+        language: str,
+        voice: str = "",
+        instruct: str = "",
+        sample_rate: int = SAMPLE_RATE,
+        chunk_ms: int = 200,
+        max_new_tokens: int | None = None,
+        do_sample: bool | None = None,
+        temperature: float | None = None,
+        top_k: int | None = None,
+    ):
+        """Streaming synthesis: yields (is_first, pcm_frame) as frames become
+        available. The qwen_tts package currently simulates streaming (fast
+        generation, complete text input), so frames are produced as the full
+        waveform is generated; the endpoint stays chunked so clients can start
+        playback as soon as synthesis completes instead of waiting for the
+        whole response body.
+        """
+        self.ensure_loaded()
+        if not text:
+            return
+        if BACKEND == "mlx":
+            yield from self._synthesize_mlx_stream(
+                text=text,
+                language=language,
+                voice=voice,
+                instruct=instruct,
+                sample_rate=sample_rate,
+                chunk_ms=chunk_ms,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+            )
+            return
+        pcm = self.synthesize(
+            text=text,
+            language=language,
+            voice=voice,
+            instruct=instruct,
+            sample_rate=sample_rate,
+            streaming=True,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_k=top_k,
+        )
+        frame_bytes = int(sample_rate * chunk_ms / 1000) * 2  # 16-bit mono
+        first = True
+        for i in range(0, len(pcm), frame_bytes):
+            yield first, pcm[i : i + frame_bytes]
+            first = False
 
     @staticmethod
     def _normalize_language(model: Any, language: str) -> str:
@@ -218,7 +350,9 @@ class TTSService:
             return "chinese"
         return "Auto"
 
-    def _synthesize_clone(self, *, text: str, language: str, voice: str) -> tuple[Any, int]:
+    def _synthesize_clone(
+        self, *, text: str, language: str, voice: str, streaming: bool = True, **gen_kwargs
+    ) -> tuple[Any, int]:
         prompt = self._clone_prompts.get(voice)
         if prompt is None:
             meta = self._registry[voice]
@@ -231,7 +365,142 @@ class TTSService:
             text=text,
             language=language or "Auto",
             voice_clone_prompt=prompt,
+            non_streaming_mode=not streaming,
+            **gen_kwargs,
         )
+
+    def _mlx_generate(
+        self,
+        *,
+        text: str,
+        language: str,
+        voice: str,
+        instruct: str,
+        stream: bool,
+        streaming_interval: float = 0.5,
+        max_tokens: int,
+        temperature: float | None,
+        top_k: int | None,
+    ):
+        """Yield (model, generator) for the preset or clone MLX path."""
+        gen_kwargs: dict[str, Any] = {
+            "max_tokens": max_tokens,
+            "stream": stream,
+            "streaming_interval": streaming_interval,
+        }
+        if temperature is not None:
+            gen_kwargs["temperature"] = temperature
+        if top_k is not None:
+            gen_kwargs["top_k"] = top_k
+        if voice in self._registry:
+            meta = self._registry[voice]
+            lang = self._normalize_language(self._clone_model, language)
+            yield self._clone_model, self._clone_model.generate(
+                text=text,
+                ref_audio=meta["ref_audio"],
+                ref_text=meta["ref_text"],
+                lang_code=lang or "auto",
+                **gen_kwargs,
+            )
+            return
+        lang = self._normalize_language(self._preset_model, language)
+        speaker = voice or os.environ.get("QWEN3_TTS_DEFAULT_SPEAKER", "Vivian")
+        yield self._preset_model, self._preset_model.generate_custom_voice(
+            text=text,
+            speaker=speaker,
+            language=lang or "auto",
+            instruct=instruct,
+            **gen_kwargs,
+        )
+
+    def _synthesize_mlx(
+        self,
+        *,
+        text: str,
+        language: str,
+        voice: str,
+        instruct: str,
+        sample_rate: int,
+        streaming: bool,
+        max_new_tokens: int | None,
+        temperature: float | None,
+        top_k: int | None,
+    ) -> bytes:
+        del streaming  # non-streaming full generation
+        max_tokens = int(
+            max_new_tokens
+            if max_new_tokens is not None
+            else os.environ.get("QWEN3_TTS_MAX_NEW_TOKENS", "512")
+        )
+        for model, gen in self._mlx_generate(
+            text=text,
+            language=language,
+            voice=voice,
+            instruct=instruct,
+            stream=False,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_k=top_k,
+        ):
+            results = list(gen)
+            wavs = [
+                np.asarray(r.audio, dtype=np.float32)
+                for r in results
+                if getattr(r, "audio", None) is not None
+            ]
+            if not wavs:
+                return b""
+            wav = np.concatenate(wavs) if len(wavs) > 1 else wavs[0]
+            if wav.ndim > 1:
+                wav = wav.mean(axis=-1)
+            return self._to_pcm16(self._resample(wav, model.sample_rate, sample_rate))
+        return b""
+
+    def _synthesize_mlx_stream(
+        self,
+        *,
+        text: str,
+        language: str,
+        voice: str,
+        instruct: str,
+        sample_rate: int,
+        chunk_ms: int,
+        max_new_tokens: int | None,
+        temperature: float | None,
+        top_k: int | None,
+    ):
+        max_tokens = int(
+            max_new_tokens
+            if max_new_tokens is not None
+            else os.environ.get("QWEN3_TTS_MAX_NEW_TOKENS", "512")
+        )
+        interval = max(0.2, chunk_ms / 1000.0)
+        frame_bytes = int(sample_rate * chunk_ms / 1000) * 2
+        first = True
+        for model, gen in self._mlx_generate(
+            text=text,
+            language=language,
+            voice=voice,
+            instruct=instruct,
+            stream=True,
+            streaming_interval=interval,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_k=top_k,
+        ):
+            for result in gen:
+                chunk = getattr(result, "audio", None)
+                if chunk is None:
+                    continue
+                chunk = np.asarray(chunk, dtype=np.float32)
+                if chunk.ndim > 1:
+                    chunk = chunk.mean(axis=-1)
+                pcm = self._to_pcm16(
+                    self._resample(chunk, model.sample_rate, sample_rate)
+                )
+                for i in range(0, len(pcm), frame_bytes):
+                    yield first, pcm[i : i + frame_bytes]
+                    first = False
 
     @staticmethod
     def _resample(wav: np.ndarray, sr: int, target_sr: int) -> np.ndarray:
@@ -251,6 +520,72 @@ class TTSService:
         return (wav * 32767.0).astype(np.int16).tobytes()
 
 
+def _mps_mem() -> tuple[float, float]:
+    """Return (current_allocated_mb, driver_allocated_mb) for MPS, or (0, 0)."""
+    try:
+        import torch
+
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            return (
+                torch.mps.current_allocated_memory() / 1024 / 1024,
+                torch.mps.driver_allocated_memory() / 1024 / 1024,
+            )
+    except Exception:
+        pass
+    return 0.0, 0.0
+
+
+def _release_mps_cache() -> None:
+    """Return cached MPS tensors (KV cache, intermediates) to the driver so
+    repeated requests cannot accumulate unified-memory pressure."""
+    try:
+        import torch
+
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    except Exception:
+        pass
+
+
+def _trim_reference_audio(raw: bytes, suffix: str) -> bytes:
+    """Limit a voice-clone reference clip to REF_TARGET_SECONDS.
+
+    A long reference (e.g. a 138s test wav) produces an oversized ref_code
+    that overflows the ICL context: generation degenerates into a repetition
+    loop that never emits EOS, burning CPU/MPS for minutes and exhausting
+    memory. Keep the loudest middle segment so the cloned timbre is preserved
+    without the context blowup.
+    """
+    if sf is None or librosa is None:
+        return raw
+    try:
+        wav, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=False)
+    except Exception:
+        return raw
+    if wav.ndim > 1:
+        wav = wav.mean(axis=-1)
+    if wav.shape[0] / sr <= MAX_REF_SECONDS:
+        return raw
+    # Keep a window centered on the loudest RMS region.
+    total = wav.shape[0]
+    target_n = int(sr * REF_TARGET_SECONDS)
+    win = int(sr * 0.5)
+    rms = []
+    for start in range(0, total - win, win):
+        seg = wav[start : start + win]
+        rms.append((float(np.sqrt(np.mean(seg**2))), start))
+    if not rms:
+        start = 0
+    else:
+        _, best = max(rms, key=lambda x: x[0])
+        start = max(0, min(best + win // 2 - target_n // 2, total - target_n))
+    seg = wav[start : start + target_n]
+    if len(seg) < target_n:
+        seg = np.pad(seg, (0, target_n - len(seg)))
+    out = io.BytesIO()
+    sf.write(out, seg, sr, format="WAV", subtype="PCM_16")
+    return out.getvalue()
+
 service = TTSService()
 
 
@@ -263,7 +598,9 @@ def _startup() -> None:
 def health() -> dict:
     return {
         "ok": True,
-        "model_ready": service._preset_model is not None and service._clone_model is not None,
+        "backend": BACKEND,
+        "model_ready": service._preset_model is not None,
+        "clone_model_ready": service._clone_model is not None,
         "load_error": service._load_error,
     }
 
@@ -300,15 +637,61 @@ async def audio_speech(payload: dict[str, Any]) -> Response:
     voice = str(payload.get("voice") or "")
     instruct = str(payload.get("instruct") or "")
     sample_rate = int(payload.get("sample_rate") or SAMPLE_RATE)
+    streaming = bool(payload.get("streaming", True))
+    chunk_ms = int(payload.get("chunk_ms") or 200)
+    max_new_tokens = payload.get("max_new_tokens")
+    do_sample = payload.get("do_sample")
+    temperature = payload.get("temperature")
+    top_k = payload.get("top_k")
+
+    if streaming:
+        def _gen():
+            # Sync generator: Starlette iterates it in a threadpool so the
+            # blocking model inference never stalls the event loop.
+            yield from (
+                frame
+                for _, frame in service.synthesize_chunks(
+                    text=text,
+                    language=language,
+                    voice=voice,
+                    instruct=instruct,
+                    sample_rate=sample_rate,
+                    chunk_ms=chunk_ms,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=do_sample,
+                    temperature=temperature,
+                    top_k=top_k,
+                )
+            )
+
+        return StreamingResponse(
+            _gen(),
+            media_type="audio/pcm",
+            headers={
+                "X-Sample-Rate": str(sample_rate),
+                "X-Streaming": "true",
+                "X-Chunk-Ms": str(chunk_ms),
+                "Cache-Control": "no-cache",
+            },
+        )
+
     pcm = service.synthesize(
         text=text,
         language=language,
         voice=voice,
         instruct=instruct,
         sample_rate=sample_rate,
+        streaming=False,
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        temperature=temperature,
+        top_k=top_k,
     )
     return Response(
         content=pcm,
         media_type="audio/pcm",
-        headers={"X-Sample-Rate": str(sample_rate)},
+        headers={
+            "X-Sample-Rate": str(sample_rate),
+            "X-Streaming": "false",
+        },
     )

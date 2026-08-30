@@ -1,9 +1,12 @@
-// Translation provider via the local Ollama native /api/chat endpoint.
-// Uses think=false + a bounded num_predict (same reasoning as the A-line fix).
+// Translation provider for the local LLM. Supports two transports:
+//  - OpenAI-compatible /v1/chat/completions (our bundled mlx_lm server, port 1235)
+//  - Ollama native /api/chat (base_url without /v1)
+// The mlx_lm server runs with enable_thinking=false, so replies are ~1s and
+// content-only (same reasoning as the A-line fix).
 
 const DEFAULT_OPTS = {
-  baseUrl: "http://127.0.0.1:11434",
-  model: "huihui_ai/qwen3.5-abliterated:9b",
+  baseUrl: "http://127.0.0.1:1235/v1",
+  model: "/Users/halo/.lmstudio/models/huihui-ai/Huihui-Qwen3.5-9B-abliterated-mlx-4bit",
   think: false,
   numPredict: 512,
   temperature: 0.2,
@@ -29,37 +32,58 @@ const LANG_NAME = {
 export class OllamaTranslator {
   constructor(opts = {}) {
     this.opts = { ...DEFAULT_OPTS, ...opts };
-    this.baseUrl = this.opts.baseUrl.replace(/\/$/, "").replace(/\/v1$/, "");
+    this.baseUrl = this.opts.baseUrl.replace(/\/$/, "");
+    this.openaiCompat = /\/v1$/.test(this.baseUrl);
   }
 
   async translate(text, sourceLang, targetLang) {
     const src = LANG_NAME[String(sourceLang || "").toLowerCase()] || sourceLang || "auto";
     const tgt = LANG_NAME[String(targetLang || "").toLowerCase()] || targetLang || "auto";
-    const res = await fetch(`${this.baseUrl}/api/chat`, {
+    const url = this.openaiCompat
+      ? `${this.baseUrl}/chat/completions`
+      : `${this.baseUrl}/api/chat`;
+    const body = this.openaiCompat
+      ? {
+          model: this.opts.model,
+          messages: [
+            { role: "system", content: SYSTEM },
+            {
+              role: "user",
+              content: `Source language: ${src}\nTarget language: ${tgt}\nText: ${text}`,
+            },
+          ],
+          max_tokens: this.opts.numPredict,
+          temperature: this.opts.temperature,
+          stream: false,
+        }
+      : {
+          model: this.opts.model,
+          messages: [
+            { role: "system", content: SYSTEM },
+            {
+              role: "user",
+              content: `Source language: ${src}\nTarget language: ${tgt}\nText: ${text}`,
+            },
+          ],
+          stream: false,
+          think: this.opts.think,
+          options: { num_predict: this.opts.numPredict, temperature: this.opts.temperature },
+        };
+    const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: this.opts.model,
-        messages: [
-          { role: "system", content: SYSTEM },
-          {
-            role: "user",
-            content: `Source language: ${src}\nTarget language: ${tgt}\nText: ${text}`,
-          },
-        ],
-        stream: false,
-        think: this.opts.think,
-        options: { num_predict: this.opts.numPredict, temperature: this.opts.temperature },
-      }),
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(this.opts.timeoutMs),
     });
     if (!res.ok) {
       const detail = await res.text().catch(() => "");
-      throw new Error(`Ollama HTTP ${res.status}: ${detail.slice(0, 200)}`);
+      throw new Error(`Translator HTTP ${res.status}: ${detail.slice(0, 200)}`);
     }
     const data = await res.json();
-    const out = String((data.message || {}).content || "").trim();
-    if (!out) throw new Error("Ollama returned empty translation");
+    const out = this.openaiCompat
+      ? String((data.choices?.[0]?.message || {}).content || "").trim()
+      : String((data.message || {}).content || "").trim();
+    if (!out) throw new Error("Translator returned empty translation");
     return out;
   }
 }

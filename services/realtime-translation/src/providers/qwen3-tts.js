@@ -28,6 +28,8 @@ export class Qwen3TTSProvider {
         input: text,
         language: targetLang || "Auto",
         sample_rate: this.opts.sampleRate,
+        streaming: true,
+        chunk_ms: this.opts.chunkMs,
       }),
       signal: AbortSignal.timeout(this.opts.timeoutMs),
     });
