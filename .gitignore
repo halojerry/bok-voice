@@ -16,6 +16,14 @@ build/
 data/vault/
 data/uploads/
 data/models/
+data/smoke-out/
+data/sidecar-*.log
+data/sidecar-*.pid
+data/*.log
+data/translation-metrics.jsonl
+services/*/data/
 *.sqlite
 *.db
 *.tsbuildinfo
+apps/web/AGENTS.md
+apps/web/CLAUDE.md

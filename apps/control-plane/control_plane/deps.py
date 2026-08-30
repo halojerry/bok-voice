@@ -38,3 +38,12 @@ def build_repository(engine: Engine | None = None):
         return SqlAlchemyBusinessRepository(session)
     # Default: in-memory repo so the server runs without Postgres for dev/tests.
     return InMemoryBusinessRepository()
+
+
+def build_session_factory(engine: Engine | None = None):
+    """SQL 路径返回 sessionmaker 工厂（每请求独立 Session，避免共享 Session 并发踩踏）。"""
+    if engine is None:
+        return None
+    from sqlalchemy.orm import sessionmaker
+
+    return sessionmaker(bind=engine, expire_on_commit=False, future=True)

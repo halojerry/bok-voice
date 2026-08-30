@@ -25,6 +25,11 @@ class ControlPlaneClient:
         r.raise_for_status()
         return r.json()
 
+    async def get_settings(self) -> dict:
+        r = await self._client.get("/api/settings", params={"internal": "1"})
+        r.raise_for_status()
+        return r.json()
+
     async def search_knowledge(self, query: str, account_id: str, limit: int = 5) -> list[dict]:
         r = await self._client.get(
             "/api/knowledge/search",

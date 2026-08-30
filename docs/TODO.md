@@ -68,3 +68,16 @@
 - [ ] 全局洞察蒸馏 + 对象历史主题合并
 - [ ] 主管台 whisper（私语）
 - [ ] 20–50 路并发压测 + 容量告警
+
+## 2026-08-30 新里程碑（Qwen3-ASR/TTS + B 线同传）
+
+- [x] Qwen3-ASR sidecar（transformers/MPS 本地 + vLLM Docker 路径）`scripts/start_sidecars.sh` / `stop_sidecars.sh` / `smoke_sidecars.py` 全绿
+- [x] Qwen3-TTS sidecar：预置音色 + 三语言克隆 + 试听（设置/人设页）
+- [x] A 线三语 E2E `TRILINGUAL_E2E 3/3 PASSED`（zh/yue/en 转写 + 回复 + 语言跟随）
+- [x] Ollama 原生 `/api/chat` + `think:false`（修复 9B thinking 慢/空回复）
+- [x] control-plane 每请求独立 Session + turn 幂等（修复并发 500）
+- [x] B 线 worker（ws://:8790）：`TranslationChannel` + `PlaybackScheduler`（金喜同传字段）+ 真实 Qwen3-ASR/Ollama/Qwen3-TTS providers + WebSocket 协议 + metrics JSONL
+- [x] B 线 Web 面板 `/translate`（多通道、双字幕、调度指标、WebAudio 播放）
+- [ ] Windows/WSL2 真机验证（vLLM ASR + TTS 容器）——脚本/镜像已就绪，待 Windows 环境
+- [ ] B 线真机麦克风听感验收（页面已可连 worker，需人工说话验证）
+- [ ] `system-audio-helper`（桌面系统音频采集）——只留接口，未实现

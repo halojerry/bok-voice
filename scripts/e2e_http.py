@@ -60,9 +60,9 @@ def main() -> None:
 
         join = client.post(f"/api/supervisor/{call_id}/join").json()
         assert join["role"] == "supervisor", join
-        assert client.post(f"/api/supervisor/{call_id}/pause-agent").json()["status"] == "ok"
-        assert client.post(f"/api/supervisor/{call_id}/takeover").json()["status"] == "ok"
-        assert client.post(f"/api/supervisor/{call_id}/transfer").json()["status"] == "ok"
+        assert client.post(f"/api/supervisor/{call_id}/pause-agent").json()["status"] == "paused"
+        assert client.post(f"/api/supervisor/{call_id}/takeover").json()["status"] == "paused"
+        assert client.post(f"/api/supervisor/{call_id}/transfer").json()["status"] == "ended"
         print("supervisor commands ok")
 
         active = client.get("/api/supervisor/active-calls").json()

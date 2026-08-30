@@ -24,6 +24,12 @@ class DefaultKnowledgeService:
     async def search(self, query: str, account_id: str, limit: int = 5) -> list[dict]:
         return await self.vector.search(query, account_id, limit)
 
+    async def list(self, account_id: str) -> list[dict]:
+        return await self.vector.list(account_id)
+
+    async def delete(self, account_id: str, ids: list[str]) -> int:
+        return await self.vector.delete(account_id, ids)
+
     async def context(self, task: str, account_id: str, limit: int = 5) -> ContextBundle:
         snippets = await self.vector.search(task, account_id, limit)
         return self.assembler.assemble(

@@ -18,6 +18,8 @@ livekit = [
   "sherpa-onnx>=1.13,<2",
   # Volcano (火山) streaming TTS uses a WebSocket binary protocol.
   "websockets>=13,<15",
+  # Local Qwen3 ASR/TTS sidecars are called over HTTP.
+  "httpx>=0.27,<1",
 ]
 
 [tool.hatch.build.targets.wheel]

@@ -43,6 +43,15 @@ class ImportRequest(BaseModel):
     content: str
 
 
+class UpdateObjectRequest(BaseModel):
+    display_name: str = ""
+    role_template: str = "customer"
+    language: str = "zh"
+    background: str = ""
+    phone: str = ""
+    status: str = "active"
+
+
 class PersonaRequest(BaseModel):
     account_id: str = ""
     name: str = ""
@@ -50,6 +59,43 @@ class PersonaRequest(BaseModel):
     tone: str = ""
     language: str = "zh"
     reference_audio: str = ""
+
+
+class UpdatePersonaRequest(BaseModel):
+    account_id: str = ""
+    name: str = ""
+    company: str = ""
+    tone: str = ""
+    language: str = "zh"
+    reference_audio: str = ""
+
+
+class ProviderSettings(BaseModel):
+    provider: str = ""
+    model: str = ""
+    base_url: str = ""
+    backend: str = ""
+    api_key: str = ""
+    endpoint: str = ""
+    language: str = ""
+    speaker: str = ""
+    speaker_zh: str = ""
+    speaker_yue: str = ""
+    speaker_en: str = ""
+    instruct: str = ""
+    resource_id: str = ""
+    app_id: str = ""
+    access_token: str = ""
+    sensitivity: float = 0.5
+    sample_rate: int = 24000
+
+
+class SettingsRequest(BaseModel):
+    asr: ProviderSettings = ProviderSettings()
+    llm: ProviderSettings = ProviderSettings()
+    tts: ProviderSettings = ProviderSettings()
+    vad: ProviderSettings = ProviderSettings()
+    policy: str = "offline_first"
 
 
 class SupervisorCommand(BaseModel):

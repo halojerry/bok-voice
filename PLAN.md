@@ -26,7 +26,7 @@
 │                                                                │
 │  [transport.input] → SileroVAD → FunASR(SenseVoice)            │
 │        → 上下文装配(情绪 + 记忆 + 人格) → LLM(流式)              │
-│        → 情绪标签提取 → Kokoro/CosyVoice TTS → transport.output │
+│        → 情绪标签提取 → Qwen3-TTS sidecar → transport.output │
 │                                                                │
 │  进程内: Silero VAD · FunASR(SenseVoice) · Kokoro TTS · 情绪词库 │
 │  网络:  DeepSeek/Qwen(HTTPS) 或 Ollama-abliterated(loopback)     │
@@ -60,7 +60,7 @@
 | VAD | Silero | — | ✅ `SileroVADAnalyzer` |
 | ASR | SenseVoice(`iic/SenseVoiceSmall`) | 云端 paraformer | ✅ `FunASRSTTService` |
 | LLM | DeepSeek | Qwen / Ollama-abliterated | ✅ `DeepSeekLLMService`/`QwenLLMService`/`OllamaLLMService` |
-| TTS | **Kokoro(本地,原生)** | CosyVoice/GPT-SoVITS(自定义,情绪音色)/豆包 | ✅ Kokoro 原生;CosyVoice 需自写 |
+| TTS | **Qwen3-TTS(本地 sidecar)** | 豆包(云端) | ✅ 本地克隆/预置/指令控制 |
 | Embedding | 不开(MVP) | bge-m3(本地) | — |
 | 记忆 | Bok | — | 自写 HTTP client |
 | 情绪(输入) | SenseVoice 标签 + 词库 | Hume(云,备选) | 部分(需自写提取) |
@@ -69,14 +69,14 @@
 
 **三个关键修正(相对早期 DESIGN.md,已用源码核实)**
 1. **pipecat 原生覆盖了几乎整条链路**,MVP 无需运行 xiaozhi。xiaozhi 的角色降为"**未来硬件协议参考**"(其 VAD/ASR/LLM/TTS provider 代码不再需要,pipecat 有更好的原生实现)。
-2. pipecat 的 `fish` = **Fish Audio 云 TTS(需 key)**,不是开源 fish-speech。本地 TTS 原生默认改用 **Kokoro**(kokoro-onnx,本地、快、中文可用);**CosyVoice / GPT-SoVITS / fish-speech 本地版需自写 `TTSService`**,作为 M3 情绪音色再上。
+2. pipecat 的 `fish` = **Fish Audio 云 TTS(需 key)**,不是开源 fish-speech。本地 TTS 统一改为 **Qwen3-TTS sidecar**;情绪/音色通过参考音频克隆与 instruct 控制。
 3. pipecat 的 `FunASRSTTService` 调 `rich_transcription_postprocess` 会**剥离 SenseVoice 的 `<|HAPPY|>` 情绪标签**,所以"输入情绪"需在 postprocess 前截取标签(自写一个轻量包装)。
 
 ---
 
 ## 4. 各项目如何最优复用(明确边界)
 
-- **pipecat**:编排框架 + 60+ 原生服务。我们**只写 4 个自定义件**:① Bok 记忆 processor,② 情绪提取(输入标签 + 词库 + 输出标签),③ 人格卡加载,④ (M3)CosyVoice 情绪 TTS service。
+- **pipecat**:编排框架 + 60+ 原生服务。我们**只写 4 个自定义件**:① Bok 记忆 processor,② 情绪提取(输入标签 + 词库 + 输出标签),③ 人格卡加载,④ Qwen3-TTS sidecar。
 - **Bok**:记忆/成长/知识库,原样作为独立服务,**不改动其代码**。仅通过 `/v1/context`、`/v1/person/context`、`/v1/search`、`/v1/conversations/observe`、`/v1/memory/capture`、`/v1/import/markdown`、`/v1/web-clips` 接入。
 - **voice-ui-kit**:前端 UI,用 `ConsoleTemplate` 起步,后续换自定义组件;接入 `smallwebrtc` transport。
 - **expression-trainer**:复用①`data/emotion-lexicon.json`/`tiered-lexicon.json`(情绪词库,注意大连理工数据源授权,必要时换精简自建词表)②人格/Prompt 编辑器的交互范式。
@@ -99,7 +99,7 @@
 ### M3 — 情绪闭环(验证情感/语气/共情)
 - 输入情绪:SenseVoice 标签(自定义提取)+ 词库匹配 → 注入 LLM 上下文。
 - 输出情绪:人格卡要求 LLM 输出 `[emotion:xxx]` → 提取 → 前端 avatar(自定义 RTVI 事件)。
-- 情绪 TTS(可选):自写 CosyVoice/GPT-SoVITS service,按情绪选参考音色(哭/笑)。
+- 情绪 TTS(可选):自写 Qwen3-TTS service,按情绪选参考音色。
 - **验收**:情绪识别打标测试通过;输出标签稳定(失败回退 happy);共情回复自然。
 
 ### M4 — 实时语音翻译(第二产品线)
@@ -122,7 +122,7 @@
 - **模型切换配置**(`config.json`,api_key 用 `env:` 引用不落盘):
   ```json
   {"llm":{"provider":"deepseek|ollama","base_url":"...","model":"...","api_key":"env:DS_KEY"},
-   "tts":{"provider":"kokoro|cosyvoice|doubao","voice":"..."},
+   "tts":{"provider":"qwen3_tts|doubao","voice":"..."},
    "emotion":{"enabled":true,"lexicon":"local"},
    "persona":{"card":"02-Projects/Bok-Voice/persona.md"},
    "memory":{"bok_url":"http://127.0.0.1:8771","vault":"./vault"}}
@@ -144,7 +144,7 @@ voice-assistant/
 │   ├── providers/
 │   │   ├── bok_memory.py  # Bok HTTP client + 上下文装配 processor
 │   │   ├── emotion.py     # SenseVoice 标签提取 + 词库 + 输出标签提取
-│   │   └── tts_cosyvoice.py  # (M3) 自定义情绪 TTS
+│   │   └── tts_qwen3.py  # Qwen3-TTS sidecar
 │   └── persona.py         # 人格卡加载
 ├── web/                   # voice-ui-kit 前端 (React, pnpm)
 └── bok/                   # Bok 独立 checkout(或 submodule,不改动)
@@ -165,7 +165,7 @@ voice-assistant/
 
 - **假设**:目标平台 macOS 优先(当前开发机),Windows 后置;Python 用 `uv`、前端用 `pnpm`。
 - **SenseVoice 情绪标签被 pipecat 剥离** → 需自写提取(计划内已定)。
-- **Kokoro 中文情感表现弱于 CosyVoice** → 默认 Kokoro 跑通,情绪音色 M3 换 CosyVoice 自定义 service。
+- **Qwen3-TTS 中文情感与三语言音色克隆更符合客服场景** → 默认 Qwen3-TTS sidecar 跑通。
 - **abliterated 模型**可能轻微损能力 + 合规责任在用户侧 → 默认仍 DeepSeek,abliterated 为"本地+不拒绝"档。
 - **expression-trainer 词库**基于大连理工本体库,商用前确认授权 → 可换自建精简词表。
 - **SmallWebRTC 在 Tauri/浏览器环境**的麦克风权限与回声消除需 M1 验证。

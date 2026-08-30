@@ -63,7 +63,7 @@
 | VAD | Silero（本地） | — | 复用 xiaozhi `vad/silero.py` 思路 |
 | ASR | SenseVoice（本地，Apache-2.0） | 云端 paraformer | 中文最优，**自带情绪标签** |
 | LLM | DeepSeek（云端） | 本地 abliterated / Qwen | OpenAI-compatible 一行切换 |
-| TTS | CosyVoice / fish-speech（本地） | 豆包（极致音色） | 主要负责朗读，支持情绪音色 |
+| TTS | Qwen3-TTS（本地 sidecar） | 豆包（云端极致音色） | 主要负责朗读，支持三语言音色克隆与指令控制 |
 | Embedding | bge-m3（本地 Ollama） | 不开 | Bok 语义检索增强，MVP 可关 |
 | 情绪（输入） | SenseVoice 标签 + expression-trainer 词库 | — | 双保险 |
 | 情绪（输出） | LLM `[emotion:xxx]` / emoji 标签 | — | 复用 xiaozhi `get_emotion` 机制 |
@@ -106,7 +106,7 @@
     "api_key": "env:DS_KEY"
   },
   "asr": { "provider": "sensevoice_local", "lang": "zh" },
-  "tts": { "provider": "cosyvoice_local", "voice": "温暖女声", "emotion": true },
+  "tts": { "provider": "qwen3_tts", "voice": "{\"zh\":\"\",\"yue\":\"\",\"en\":\"\"}", "instruct": "" },
   "emotion": { "enabled": true, "lexicon": "local", "sensevoice": true },
   "persona": { "card": "02-Projects/Bok-Voice/persona.md" },
   "memory": { "bok_url": "http://127.0.0.1:8771" },
@@ -135,7 +135,7 @@
 2. pipeline 用确定性规则提取（不额外调 LLM）。
 3. 提取结果同时：
    - 驱动前端 avatar/表情；
-   - 传给支持情绪的 TTS（CosyVoice instruct / fish-speech / GPT-SoVITS 参考音频）控制哭/笑等音色。
+   - 传给支持情绪的 TTS（Qwen3-TTS instruct / 参考音频克隆）控制语气与音色。
 
 > 情绪标签是"约定"而非"魔法"：依赖人设 prompt 训练 LLM 稳定输出，需要一轮 prompt 调优。
 
@@ -211,7 +211,7 @@ voice-assistant/
 │   ├── providers/
 │   │   ├── llm.py            # OpenAI-compatible 适配
 │   │   ├── asr.py            # SenseVoice STT service
-│   │   ├── tts.py            # CosyVoice / fish-speech / 豆包
+│   │   ├── tts.py            # Qwen3-TTS sidecar / 豆包
 │   │   ├── emotion.py        # 输入情绪（词库）+ 输出情绪（标签提取）
 │   │   └── memory.py         # Bok HTTP client
 │   └── persona.py            # 人格卡加载

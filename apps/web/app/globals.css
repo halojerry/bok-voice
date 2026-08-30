@@ -2,19 +2,30 @@
 @tailwind components;
 @tailwind utilities;
 
-/* LiveKit 品牌视觉：深青底 + 亮青强调 + mono 小字形。取自官方页面 token
-   （#012A32 / #1FD5F9 / #999999），统一全站视觉语言。 */
+/* LiveKit 品牌视觉：近黑底 + 亮青强调 + 中性灰 mono 眉标。取自官方页面 token
+   （#070707 / #1FD5F9 / #999999），统一全站视觉语言（舞台主页与工作台页同源）。 */
 :root {
-  --background: #012a32;
+  --background: #070707;
   --foreground: #eef7f7;
-  --muted: #9fb9b6;
-  --card: #06333c;
-  --card-soft: rgba(255, 255, 255, 0.06);
-  --card-border: #15545f;
+  --muted: #999999;
+  --card: #0d0e0e;
+  --card-soft: rgba(255, 255, 255, 0.05);
+  --card-border: rgba(255, 255, 255, 0.08);
   --accent: #1fd5f9;
   --accent-soft: rgba(31, 213, 249, 0.15);
   --accent-ink: #01191c;
   --danger: #ff6b6b;
+
+  /* 官方 LiveKit「舞台」token：近黑底 + 亮青强调 + 中性灰眉标 */
+  --stage-bg: #070707;
+  --stage-bg-2: #012a32;
+  --stage-panel: rgba(255, 255, 255, 0.03);
+  --stage-panel-2: rgba(255, 255, 255, 0.05);
+  --stage-border: rgba(28, 213, 249, 0.14);
+  --stage-border-soft: rgba(255, 255, 255, 0.08);
+  --stage-muted: #999999;
+  --stage-value: #1fd5f9;
+  --stage-value-dim: rgba(31, 213, 249, 0.45);
 }
 
 * {
@@ -33,27 +44,27 @@ body {
 }
 
 @layer components {
-  /* 面板卡片：圆角 + 微妙边框 + teal 面板 */
+  /* 面板卡片：细边 + 小圆角 + 近黑面板（对齐官方 agents 页 bg-bg1 面板语言） */
   .card {
-    @apply rounded-2xl border border-[var(--card-border)] bg-[var(--card)] p-5;
+    @apply rounded-lg border border-[var(--card-border)] bg-[var(--card)] p-4;
   }
 
   /* 半透明软面板（列表/标签块） */
   .soft {
-    @apply rounded-xl bg-[var(--card-soft)];
+    @apply rounded-lg bg-[var(--card-soft)];
   }
 
-  /* LiveKit 式 mono 小字眉标（大写、宽字距） */
+  /* LiveKit 式 mono 眉标（大写、宽字距、中性灰） */
   .eyebrow,
   .label {
     font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
       "Liberation Mono", monospace;
-    @apply text-xs font-bold uppercase tracking-[0.2em] text-[var(--muted)];
+    @apply text-[10px] font-bold uppercase tracking-[0.16em] text-[var(--muted)];
   }
 
-  /* 页面大标题：Light 字重 + 收紧字距（复刻官方 Hero 排版语言） */
+  /* 页面大标题：Light 字重 + 收紧字距 */
   .page-title {
-    @apply text-3xl font-light tracking-tight text-[var(--foreground)];
+    @apply text-2xl font-light tracking-tight text-[var(--foreground)];
   }
   .page-sub {
     @apply mt-1.5 text-sm text-[var(--muted)];
@@ -63,28 +74,85 @@ body {
     color: var(--muted);
   }
 
+  /* 按钮：官方 rounded(4px) + h-7 + text-xs semibold */
   .btn {
-    @apply inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm font-medium transition;
+    @apply inline-flex items-center justify-center gap-2 whitespace-nowrap rounded text-xs font-semibold transition;
   }
-
-  /* 主按钮：亮青药丸 + 深色墨字 */
   .btn-primary {
-    @apply btn bg-[var(--accent)] text-[var(--accent-ink)] hover:brightness-95;
+    @apply btn h-7 px-3 bg-[var(--accent)] text-[var(--accent-ink)] hover:bg-[#4adcfa];
   }
-
-  /* 次按钮：teal 描边药丸 */
   .btn-ghost {
-    @apply btn border border-[var(--card-border)] bg-transparent text-[var(--foreground)] hover:bg-[var(--card)];
+    @apply btn h-7 px-3 border border-[var(--card-border)] bg-transparent text-[var(--foreground)] hover:bg-[var(--card)];
   }
 
-  /* 输入框 */
+  /* 输入框 / 下拉：细边 + 小圆角 + 近黑底 */
   .input {
-    @apply w-full rounded-xl border border-[var(--card-border)] bg-[var(--background)] px-3 py-2 text-sm text-[var(--foreground)] outline-none placeholder:text-[var(--muted)] focus:border-[var(--accent)];
+    @apply w-full rounded-lg border border-[var(--card-border)] bg-[var(--background)] px-3 py-1.5 text-sm text-[var(--foreground)] outline-none placeholder:text-[var(--muted)] focus:border-[var(--accent)];
+  }
+  .select {
+    @apply rounded-lg border border-[var(--card-border)] bg-[var(--background)] px-3 py-1.5 text-sm text-[var(--foreground)] outline-none focus:border-[var(--accent)];
   }
 
   /* 状态小圆点 */
   .dot {
     @apply inline-block h-2 w-2 rounded-full;
+  }
+
+  /* 官方 AgentAudioVisualizerGrid 单元格底光（Tailwind v3 下替代 v4 的 bg-current/10） */
+  .lk-grid-cell-base {
+    background-color: color-mix(in srgb, currentColor 10%, transparent);
+  }
+
+  /* —— LiveKit 舞台（对齐官方 agents 页主题与元素）—— */
+  /* 全幅近黑舞台底：径向微光 + 深青渗透 */
+  .stage-shell {
+    background:
+      radial-gradient(60% 55% at 50% 40%, rgba(31, 213, 249, 0.12), transparent 72%),
+      radial-gradient(120% 90% at 50% 0%, var(--stage-bg-2), transparent 60%),
+      var(--stage-bg);
+    color: var(--foreground);
+  }
+
+  /* 遥测列容器：bg-bg1 微抬升面板（官方）；内部用细分隔线而非外框 */
+  .stage-col {
+    @apply flex w-full flex-col rounded bg-[var(--card)];
+  }
+  .stage-col-inner {
+    @apply flex min-h-0 flex-col;
+  }
+
+  /* 分区标题：text-fg0 亮色，mono 大写，text-xs bold（官方 text-mono-caps） */
+  .stage-title {
+    @apply pb-2 font-mono text-xs font-bold uppercase tracking-[0.16em] text-[var(--foreground)];
+  }
+  /* 分区分隔线 */
+  .stage-sep {
+    @apply flex flex-col border-t border-[var(--card-border)] py-4 pr-3 first:border-t-0 first:pt-0 first:pb-2;
+  }
+
+  /* 「灰色标签 → 青色值」遥测行（官方 text-xxs mono bold uppercase） */
+  .stage-row {
+    @apply flex w-full items-baseline justify-between gap-4 pb-1;
+  }
+  .stage-key {
+    @apply font-mono text-[10px] font-bold uppercase tracking-[0.12em] text-[var(--stage-muted)];
+  }
+  .stage-value {
+    @apply font-mono text-[10px] font-bold uppercase tracking-[0.12em] text-[var(--stage-value)];
+  }
+  .stage-glow {
+    text-shadow: 0 0 14px rgba(31, 213, 249, 0.35);
+  }
+
+  /* 主/次舞台按钮：官方 rounded（4px）+ h-7 + text-xs semibold */
+  .stage-btn {
+    @apply inline-flex items-center justify-center gap-2 whitespace-nowrap rounded text-xs font-semibold transition;
+  }
+  .stage-btn-primary {
+    @apply stage-btn h-7 px-3 bg-[var(--stage-value)] text-[#01191c] hover:bg-[#4adcfa];
+  }
+  .stage-btn-ghost {
+    @apply stage-btn h-7 px-3 border border-[var(--card-border)] bg-[var(--card)] text-[var(--foreground)] hover:border-[#2c2d2d] hover:bg-[#141515];
   }
 }
 

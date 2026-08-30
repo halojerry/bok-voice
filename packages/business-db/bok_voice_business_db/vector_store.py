@@ -77,6 +77,12 @@ class SqlVectorStore:
         self.session.commit()
         return removed
 
+    async def list(self, account_id: str) -> list[dict]:
+        rows = self.session.scalars(
+            select(vector_models.KnowledgeChunk).filter_by(account_id=account_id)
+        ).all()
+        return [self._to_dict(r) for r in rows]
+
     @staticmethod
     def _to_dict(row: vector_models.KnowledgeChunk) -> dict:
         return {

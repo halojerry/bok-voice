@@ -2,9 +2,29 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
+from dataclasses import dataclass
 
+import httpx
 from livekit.agents import APIConnectOptions, llm, stt, tts, vad
+
+
+@dataclass
+class LanguageState:
+    """Shared between ASR and TTS so replies use the language the user spoke."""
+
+    lang: str = "zh"
+
+    def update(self, lang: str | None) -> None:
+        key = (lang or "").strip().lower()
+        if key in {"chinese", "zh", "mandarin"}:
+            self.lang = "zh"
+        elif key in {"cantonese", "yue"}:
+            self.lang = "yue"
+        elif key in {"english", "en"}:
+            self.lang = "en"
 
 
 class OpenAICompatLLM(llm.LLM):
@@ -17,20 +37,34 @@ class OpenAICompatLLM(llm.LLM):
         super().__init__()
         self._model = model
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self._max_tokens = int(os.environ.get("LLM_MAX_TOKENS", "256"))
 
     def chat(self, *, chat_ctx, tools=None, conn_options=None, parallel_tool_calls=None, tool_choice=None, extra_kwargs=None):
-        messages = []
-        for item in getattr(chat_ctx, "items", []):
-            if isinstance(item, llm.ChatMessage):
-                content = getattr(item, "content", "")
-                if isinstance(content, str):
-                    text = content
-                else:
-                    text = "".join(getattr(c, "text", "") for c in content)
-                messages.append({"role": item.role, "content": text})
-        if not messages:
-            messages = [{"role": "system", "content": "你是 Bok Voice 客服助手。"}]
-        return _OpenAICompatStream(self, chat_ctx, messages, conn_options or APIConnectOptions())._real
+        messages = _chat_messages(chat_ctx)
+        return _OpenAICompatStream(
+            self, chat_ctx, messages, conn_options or APIConnectOptions(), self._max_tokens
+        )._real
+
+
+def _chat_messages(chat_ctx) -> list[dict]:
+    messages = []
+    for item in getattr(chat_ctx, "items", []):
+        if isinstance(item, llm.ChatMessage):
+            content = getattr(item, "content", "")
+            if isinstance(content, str):
+                text = content
+            else:
+                # content 里文本部分是纯 str（ChatContent = str | ImageContent | AudioContent），
+                # 之前用 getattr(c,"text") 会把用户文本全部丢成空串，导致 LLM 听不见用户。
+                parts = [
+                    c if isinstance(c, str) else (getattr(c, "text", "") or "")
+                    for c in content
+                ]
+                text = "\n".join(parts)
+            messages.append({"role": item.role, "content": text})
+    if not messages:
+        messages = [{"role": "system", "content": "你是 Bok Voice 客服助手。"}]
+    return messages
 
 
 class DeepSeekLLM(OpenAICompatLLM):
@@ -41,12 +75,75 @@ class DeepSeekLLM(OpenAICompatLLM):
         super().__init__(api_key=api_key, model=model, base_url=base_url)
 
 
-class OllamaLLM(OpenAICompatLLM):
+class OllamaLLM(llm.LLM):
+    """Local Ollama via the native /api/chat endpoint.
+
+    Qwen3.x models default to thinking mode: every reply spends the token
+    budget on `reasoning` (which OpenAI-compat surfaces in a separate field),
+    leaving the actual answer empty and taking minutes per turn. The native
+    endpoint accepts `"think": false`, which makes replies fast and content-only.
+    """
+
     provider = "ollama"
     model = "huihui_ai/qwen3.5-abliterated:9b"
 
     def __init__(self, base_url="http://host.docker.internal:11434/v1", model="huihui_ai/qwen3.5-abliterated:9b", api_key="ollama"):
-        super().__init__(api_key=api_key, model=model, base_url=base_url)
+        super().__init__()
+        self._base_url = str(base_url or "").rstrip("/")
+        if self._base_url.endswith("/v1"):
+            self._base_url = self._base_url[:-3]
+        self.model = model
+        self._think = os.environ.get("OLLAMA_THINK", "0") == "1"
+        self._max_tokens = int(os.environ.get("LLM_MAX_TOKENS", "256"))
+
+    def chat(self, *, chat_ctx, tools=None, conn_options=None, parallel_tool_calls=None, tool_choice=None, extra_kwargs=None):
+        messages = _chat_messages(chat_ctx)
+        return _OllamaNativeStream(self, chat_ctx, messages, conn_options or APIConnectOptions())._real
+
+
+class _OllamaNativeStream:
+    def __init__(self, plugin, chat_ctx, messages, conn_options):
+        class _Stream(llm.LLMStream):
+            async def _run(self):
+                print("OLLAMA_REQUEST_START", flush=True)
+                try:
+                    async with httpx.AsyncClient(timeout=180) as client:
+                        async with client.stream(
+                            "POST",
+                            f"{plugin._base_url}/api/chat",
+                            json={
+                                "model": plugin.model,
+                                "messages": messages,
+                                "stream": True,
+                                "think": plugin._think,
+                                "options": {"num_predict": plugin._max_tokens},
+                            },
+                        ) as resp:
+                            resp.raise_for_status()
+                            async for line in resp.aiter_lines():
+                                if not line.strip():
+                                    continue
+                                try:
+                                    obj = json.loads(line)
+                                except json.JSONDecodeError:
+                                    continue
+                                content = (obj.get("message") or {}).get("content") or ""
+                                if content:
+                                    print("OLLAMA_REPLY_CHUNK", len(content), flush=True)
+                                    self._event_ch.send_nowait(
+                                        llm.ChatChunk(
+                                            id=str(obj.get("model", "ollama")),
+                                            delta=llm.ChoiceDelta(content=content, role="assistant"),
+                                        )
+                                    )
+                except asyncio.CancelledError:
+                    # 会话关闭时取消流式响应；不吞异常，让框架正常收尾。
+                    raise
+
+        self._real = _Stream(llm=plugin, chat_ctx=chat_ctx, tools=[], conn_options=conn_options)
+
+    def __aiter__(self):
+        return self._real
 
 
 class ScriptedLLM(llm.LLM):
@@ -93,25 +190,82 @@ class _ScriptedLLMStream:
 
 
 class _OpenAICompatStream:
-    def __init__(self, plugin, chat_ctx, messages, conn_options):
+    def __init__(self, plugin, chat_ctx, messages, conn_options, max_tokens=256):
         class _Stream(llm.LLMStream):
             async def _run(self):
                 print("OLLAMA_REQUEST_START", flush=True)
-                stream = await plugin._client.chat.completions.create(
-                    model=plugin._model,
-                    messages=messages,
-                    stream=True,
-                )
-                async for chunk in stream:
-                    if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                        print("OLLAMA_REPLY_CHUNK", len(chunk.choices[0].delta.content), flush=True)
-                        delta = llm.ChoiceDelta(content=chunk.choices[0].delta.content, role="assistant")
-                        self._event_ch.send_nowait(llm.ChatChunk(id=getattr(chunk, "id", "stream"), delta=delta))
+                try:
+                    async with plugin._client.chat.completions.create(
+                        model=plugin._model,
+                        messages=messages,
+                        stream=True,
+                        max_tokens=max_tokens,
+                    ) as stream:
+                        async for chunk in stream:
+                            if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                                print("OLLAMA_REPLY_CHUNK", len(chunk.choices[0].delta.content), flush=True)
+                                delta = llm.ChoiceDelta(content=chunk.choices[0].delta.content, role="assistant")
+                                self._event_ch.send_nowait(llm.ChatChunk(id=getattr(chunk, "id", "stream"), delta=delta))
+                except asyncio.CancelledError:
+                    raise
 
         self._real = _Stream(llm=plugin, chat_ctx=chat_ctx, tools=[], conn_options=conn_options)
 
     def __aiter__(self):
         return self._real
+
+
+class _ExprPrependStream(llm.LLMStream):
+    """在真实 LLM 流之前先发一个 <expr type="expression" label="..."/> 标记块。"""
+
+    def __init__(self, plugin, inner: "llm.LLMStream", tag: str):
+        super().__init__(llm=plugin, chat_ctx=llm.ChatContext(), tools=[], conn_options=APIConnectOptions())
+        self._inner = inner
+        self._tag = tag
+
+    async def _run(self):
+        self._event_ch.send_nowait(
+            llm.ChatChunk(id="expr-tag", delta=llm.ChoiceDelta(content=self._tag, role="assistant"))
+        )
+        async for ev in self._inner:
+            self._event_ch.send_nowait(ev)
+
+
+class ExprAwareLLM(llm.LLM):
+    """确定性 mood 通道（Path B 的兜底保障，见 AGENT.md §3）。
+
+    官方 expressive 依赖 LLM 输出里的 <expr type="expression" label="英文mood"/> 标记，
+    真实模型未必遵守指令。本包装器在每次 assistant 回复前强制前置一个标记——
+    情绪取对话中最后一条 user 消息的文本分类（EmotionProcessor，11 类英文 label）。
+    - 转录管线（TranscriptForwarder）会无条件剥离该标记并发布 lk.expression → 前端 mood；
+    - 进 TTS 的一路由 agent.py 的 tts_text_transforms 剥掉，保证不被朗读。
+    """
+
+    provider = "expr-aware"
+
+    def __init__(self, inner: llm.LLM):
+        super().__init__()
+        self._inner = inner
+        from ..plugins.emotion import EmotionProcessor
+
+        self._emotion = EmotionProcessor()
+
+    def chat(self, *, chat_ctx, tools=None, conn_options=None, parallel_tool_calls=None, tool_choice=None, extra_kwargs=None):
+        last_user = ""
+        for item in reversed(getattr(chat_ctx, "items", []) or []):
+            if getattr(item, "role", None) == "user":
+                last_user = getattr(item, "text_content", None) or ""
+                break
+        tag = f'<expr type="expression" label="{self._emotion.classify(last_user)}"/>'
+        inner = self._inner.chat(
+            chat_ctx=chat_ctx,
+            tools=tools,
+            conn_options=conn_options,
+            parallel_tool_calls=parallel_tool_calls,
+            tool_choice=tool_choice,
+            extra_kwargs=extra_kwargs,
+        )
+        return _ExprPrependStream(self, inner, tag)
 
 
 class FakeLiveKitVAD(vad.VAD):
@@ -244,7 +398,7 @@ class SherpaSenseVoiceSTT(stt.STT):
     model = "sherpa-sense-voice"
     provider = "sherpa-onnx"
 
-    def __init__(self, model_dir=None):
+    def __init__(self, model_dir=None, language_state: LanguageState | None = None):
         import os
 
         import sherpa_onnx
@@ -271,6 +425,11 @@ class SherpaSenseVoiceSTT(stt.STT):
                 chat_context=False,
             )
         )
+        # SenseVoice 情绪标签（<|HAPPY|> 等）在 _decode_pcm 里被解析后记录在此，
+        # 供上下文装配/情绪分析使用（文本本身保持干净）。
+        self.last_emotion: str | None = None
+        self.last_language: str = "zh"
+        self._language_state = language_state or LanguageState()
 
     def stream(self, *, language=None, conn_options=None):
         return _SherpaSTTStream(self, conn_options or APIConnectOptions())
@@ -279,11 +438,12 @@ class SherpaSenseVoiceSTT(stt.STT):
         # Batch contract consumed by `stt.StreamAdapter` at VAD END_OF_SPEECH. Must return a
         # `SpeechEvent`, not a plain string (the old code returned a str, which the adapter
         # then tried to treat as an event and blew up in production).
-        text = _SherpaSTTStream(self, conn_options or APIConnectOptions())._recognize_buffer(buffer)
+        text, lang = _SherpaSTTStream(self, conn_options or APIConnectOptions())._recognize_buffer(buffer)
+        self._language_state.update(lang)
         return stt.SpeechEvent(
             type=stt.SpeechEventType.FINAL_TRANSCRIPT,
             request_id="",
-            alternatives=[stt.SpeechData(language="zh", text=text)] if text else [],
+            alternatives=[stt.SpeechData(language=self._language_state.lang, text=text)] if text else [],
         )
 
 
@@ -296,9 +456,15 @@ class _SherpaSTTStream(stt.RecognizeStream):
     async def _run(self):
         async for item in self._input_ch:
             if isinstance(item, self._FlushSentinel):
-                text = self._recognize_frames()
+                text, lang = self._recognize_frames()
                 if text:
-                    self._event_ch.send_nowait(stt.SpeechEvent(type=stt.SpeechEventType.FINAL_TRANSCRIPT, alternatives=[stt.SpeechData(language="zh", text=text)]))
+                    self._stt_._language_state.update(lang)
+                    self._event_ch.send_nowait(
+                        stt.SpeechEvent(
+                            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                            alternatives=[stt.SpeechData(language=self._stt_._language_state.lang, text=text)],
+                        )
+                    )
                 self._frames = []
             else:
                 self._frames.append(item)
@@ -318,15 +484,30 @@ class _SherpaSTTStream(stt.RecognizeStream):
 
         samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
         if samples.size == 0:
-            return ""
+            return "", ""
         s = self._stt_._recognizer.create_stream()
         s.accept_waveform(sample_rate, samples)
         self._stt_._recognizer.decode_stream(s)
         text = s.result.text or ""
-        # strip SenseVoice rich tags like <|zh|> <|HAPPY|>
+        # SenseVoice 富标签：剥离语言/事件标签（<|zh|>、<|nospeech|>…），
+        # 但保留情绪标签信息（<|HAPPY|> 等）——不再像旧版那样一刀切洗掉。
         import re
 
-        return re.sub(r"<\|[^|]*\|>", "", text).strip()
+        _EMOTION_TAGS = {
+            "HAPPY", "SAD", "ANGRY", "NEUTRAL", "FEARFUL", "DISGUSTED", "SURPRISED", "EMO_UNKNOWN",
+        }
+        _tag_re = re.compile(r"<\|([^|]*)\|>")
+
+        def _repl(m: "re.Match[str]") -> str:
+            tag = m.group(1).strip().upper()
+            if tag in _EMOTION_TAGS:
+                self._stt_.last_emotion = tag.lower()
+            if tag in {"ZH", "EN", "YUE"}:
+                self._stt_.last_language = {"ZH": "zh", "EN": "en", "YUE": "yue"}[tag]
+            return ""  # 所有标签都不进入显示文本
+
+        clean = _tag_re.sub(_repl, text).strip()
+        return clean, self._stt_.last_language
 
 
 class VolcanoTTS(tts.TTS):
@@ -374,6 +555,7 @@ class _VolcanoTTSStream(tts.ChunkedStream):
         app_id = os.environ.get("VOLC_APP_ID", "")
         token = os.environ.get("VOLC_ACCESS_TOKEN", "")
         if not app_id or not token:
+            print("VOLC_TTS_MISSING_CREDENTIALS", flush=True)
             await self._emit_beep(output_emitter)
             return
 
@@ -424,17 +606,21 @@ class _VolcanoTTSStream(tts.ChunkedStream):
             frame = Message(type=MsgType.FullClientRequest, flag=MsgTypeFlagBits.NoSeq, payload=body)
             await ws.send(frame.marshal())
 
+            audio_bytes = 0
             while True:
                 msg = await asyncio.wait_for(receive_message(ws), timeout=30)
                 if msg.type == MsgType.Error:
                     break
                 if msg.type == MsgType.AudioOnlyServer or msg.event == EventType.TTSResponse:
                     if msg.payload:
+                        audio_bytes += len(msg.payload)
                         output_emitter.push(msg.payload)
                 if msg.event in (EventType.SessionFinished, EventType.ConnectionFinished):
                     break
             await ws.close()
-        except Exception:
+            print("VOLC_TTS_AUDIO_BYTES", audio_bytes, flush=True)
+        except Exception as exc:
+            print("VOLC_TTS_ERROR", repr(exc), flush=True)
             await self._emit_beep(output_emitter)
         finally:
             output_emitter.flush()
@@ -450,3 +636,226 @@ class _VolcanoTTSStream(tts.ChunkedStream):
             pcm += v.to_bytes(2, "little", signed=True)
         output_emitter.push(bytes(pcm))
         output_emitter.flush()
+
+
+class Qwen3TTSTTS(tts.TTS):
+    """LiveKit TTS adapter for the local Qwen3-TTS sidecar."""
+
+    model = "qwen3-tts"
+    provider = "qwen3-tts"
+
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:8788",
+        voice: str | dict = "",
+        language_state: LanguageState | None = None,
+        instruct: str = "",
+        sample_rate: int = 24000,
+    ):
+        super().__init__(
+            capabilities=tts.TTSCapabilities(streaming=False, aligned_transcript=False),
+            sample_rate=sample_rate,
+            num_channels=1,
+        )
+        self._base_url = base_url.rstrip("/")
+        self._voice = voice
+        self._language_state = language_state or LanguageState()
+        self._instruct = instruct
+
+    def synthesize(self, text, *, conn_options=None):
+        return _Qwen3TTSStream(self, text, conn_options or APIConnectOptions())
+
+    def _resolve_voice(self) -> str:
+        if isinstance(self._voice, dict):
+            return str(self._voice.get(self._language_state.lang) or self._voice.get("zh") or "")
+        raw = str(self._voice or "")
+        if raw.startswith("{"):
+            try:
+                mapping = json.loads(raw)
+                return str(mapping.get(self._language_state.lang) or mapping.get("zh") or "")
+            except Exception:
+                return raw
+        return raw
+
+
+class _Qwen3TTSStream(tts.ChunkedStream):
+    def __init__(self, tts_, text, conn_options):
+        super().__init__(tts=tts_, input_text=text, conn_options=conn_options)
+        self._text = text
+        self._tts_ = tts_
+
+    async def _run(self, output_emitter):
+        output_emitter.initialize(
+            request_id="qwen3-tts",
+            sample_rate=self._tts_.sample_rate,
+            num_channels=self._tts_.num_channels,
+            mime_type="audio/pcm",
+            stream=False,
+        )
+        try:
+            last_exc: Exception | None = None
+            for attempt in range(3):
+                try:
+                    async with httpx.AsyncClient(timeout=120) as client:
+                        resp = await client.post(
+                            f"{self._tts_._base_url}/v1/audio/speech",
+                            json={
+                                "input": self._text,
+                                "voice": self._tts_._resolve_voice(),
+                                "language": self._tts_._language_state.lang,
+                                "instruct": self._tts_._instruct,
+                                "sample_rate": self._tts_.sample_rate,
+                                "response_format": "pcm",
+                            },
+                        )
+                        resp.raise_for_status()
+                        output_emitter.push(resp.content)
+                        print("QWEN3_TTS_BYTES", len(resp.content), flush=True)
+                        return
+                except Exception as exc:  # noqa: BLE001 - retry transient gateway failures
+                    last_exc = exc
+                    print("QWEN3_TTS_RETRY", attempt + 1, repr(exc), flush=True)
+                    await asyncio.sleep(0.5 * (attempt + 1))
+            if not asyncio.current_task().cancelling():
+                print("QWEN3_TTS_ERROR", repr(last_exc), flush=True)
+                await self._emit_beep(output_emitter)
+        except asyncio.CancelledError:
+            # 会话关闭/打断时不播放故障蜂鸣，直接收尾。
+            raise
+        except Exception as exc:
+            print("QWEN3_TTS_FATAL", repr(exc), flush=True)
+            await self._emit_beep(output_emitter)
+        finally:
+            output_emitter.flush()
+
+    async def _emit_beep(self, output_emitter):
+        import math
+
+        sr = self._tts_.sample_rate
+        n = int(sr * 0.4)
+        pcm = bytearray()
+        for i in range(n):
+            v = int(12000 * math.sin(2 * math.pi * 440 * i / sr))
+            pcm += v.to_bytes(2, "little", signed=True)
+        output_emitter.push(bytes(pcm))
+        output_emitter.flush()
+
+
+class Qwen3ASRSTT(stt.STT):
+    """LiveKit STT adapter for the local Qwen3-ASR sidecar."""
+
+    model = "qwen3-asr"
+    provider = "qwen3-asr"
+
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:8787",
+        language_state: LanguageState | None = None,
+    ):
+        super().__init__(
+            capabilities=stt.STTCapabilities(
+                streaming=False,
+                interim_results=False,
+                diarization=False,
+                aligned_transcript=False,
+                offline_recognize=True,
+                keyterms=False,
+                chat_context=False,
+            )
+        )
+        self._base_url = base_url.rstrip("/")
+        self._language_state = language_state or LanguageState()
+
+    def stream(self, *, language=None, conn_options=None):
+        return _Qwen3ASRStream(self, conn_options or APIConnectOptions())
+
+    async def _recognize_impl(self, buffer, *, language=None, conn_options=None):
+        text, lang = await _Qwen3ASRStream(
+            self, conn_options or APIConnectOptions()
+        )._recognize_buffer(buffer)
+        if text:
+            self._language_state.update(lang)
+            return stt.SpeechEvent(
+                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                request_id="",
+                alternatives=[stt.SpeechData(language=self._language_state.lang, text=text)],
+            )
+        return stt.SpeechEvent(type=stt.SpeechEventType.FINAL_TRANSCRIPT, request_id="", alternatives=[])
+
+
+class _Qwen3ASRStream(stt.RecognizeStream):
+    def __init__(self, stt_, conn_options):
+        super().__init__(stt=stt_, conn_options=conn_options, sample_rate=16000)
+        self._stt_ = stt_
+        self._frames = []
+
+    async def _run(self):
+        try:
+            async for item in self._input_ch:
+                if isinstance(item, self._FlushSentinel):
+                    try:
+                        text, lang = await self._recognize_frames()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        text, lang = "", ""
+                    if text:
+                        self._stt_._language_state.update(lang)
+                        self._event_ch.send_nowait(
+                            stt.SpeechEvent(
+                                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                                alternatives=[stt.SpeechData(language=self._stt_._language_state.lang, text=text)],
+                            )
+                        )
+                    self._frames = []
+                else:
+                    self._frames.append(item)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._frames = []
+
+    async def _recognize_buffer(self, buffer):
+        data = getattr(buffer, "data", b"")
+        pcm = bytes(data)
+        return await self._post_audio(pcm)
+
+    async def _recognize_frames(self):
+        pcm = b"".join(getattr(f, "data", b"") for f in self._frames)
+        return await self._post_audio(pcm)
+
+    async def _post_audio(self, pcm: bytes):
+        if not pcm:
+            return "", ""
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    start = await client.post(f"{self._stt_._base_url}/api/start")
+                    start.raise_for_status()
+                    session_id = start.json()["session_id"]
+                    for i in range(0, len(pcm), 3200):
+                        await client.post(
+                            f"{self._stt_._base_url}/api/chunk",
+                            params={"session_id": session_id},
+                            content=pcm[i : i + 3200],
+                            headers={"Content-Type": "application/octet-stream"},
+                        )
+                    final = await client.post(
+                        f"{self._stt_._base_url}/api/finish",
+                        params={"session_id": session_id},
+                    )
+                    final.raise_for_status()
+                    data = final.json()
+                    text = str(data.get("text") or "")
+                    lang = str(data.get("language") or "")
+                    print("QWEN3_ASR_TEXT", repr(text[:120]), lang, flush=True)
+                    return text, lang
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - retry transient gateway failures
+                last_exc = exc
+                print("QWEN3_ASR_RETRY", attempt + 1, repr(exc), flush=True)
+                await asyncio.sleep(0.5 * (attempt + 1))
+        print("QWEN3_ASR_ERROR", repr(last_exc), flush=True)
+        return "", ""

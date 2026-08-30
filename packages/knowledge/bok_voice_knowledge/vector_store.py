@@ -41,6 +41,9 @@ class InMemoryVectorStore:
                 removed += 1
         return removed
 
+    async def list(self, account_id: str) -> list[dict]:
+        return [item for item in self._items.values() if item.get("account_id") == account_id]
+
 
 class SqlVectorStore:
     """Postgres/pgvector implementation placeholder.
@@ -57,3 +60,6 @@ class SqlVectorStore:
 
     async def delete(self, account_id: str, ids: list[str]) -> int:
         raise NotImplementedError("pgvector delete not wired in this skeleton")
+
+    async def list(self, account_id: str) -> list[dict]:
+        raise NotImplementedError("pgvector list not wired in this skeleton")

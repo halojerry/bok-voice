@@ -42,6 +42,8 @@ services:
       LIVEKIT_URL: ws://localhost:7880
       LIVEKIT_API_KEY: devkey
       LIVEKIT_API_SECRET: devsecret
+      QWEN3_ASR_BASE_URL: http://host.docker.internal:8787
+      QWEN3_TTS_BASE_URL: http://host.docker.internal:8788
     ports:
       - "8000:8000"
     depends_on:
@@ -49,6 +51,8 @@ services:
       - livekit
     volumes:
       - vault-data:/app/data/vault
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
   web:
     build:
@@ -75,11 +79,54 @@ services:
       DATABASE_URL: postgresql+psycopg://bok:bok@postgres:5432/bok_voice
       # Local sherpa SenseVoice model dir (mounted from the repo data/models).
       SHERPA_MODEL_DIR: /app/data/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue
+      QWEN3_ASR_BASE_URL: http://host.docker.internal:8787
+      QWEN3_TTS_BASE_URL: http://host.docker.internal:8788
+      OLLAMA_BASE_URL: http://host.docker.internal:11434/v1
+      OLLAMA_MODEL: huihui_ai/qwen3.5-abliterated:9b
     depends_on:
       - livekit
       - control-plane
     volumes:
       - ./data/models:/app/data/models:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # 可选：Qwen3-ASR / Qwen3-TTS sidecar 容器（Linux/Windows 生产路径）。
+  # macOS 开发机默认用宿主机脚本 ./scripts/start_sidecars.sh（模型在宿主机更快）。
+  # 启用：docker compose --profile sidecars up -d --build
+  qwen3-asr:
+    profiles: ["sidecars"]
+    build:
+      context: ./services/qwen3-asr-sidecar
+      dockerfile: Dockerfile.asr
+    ports:
+      - "8787:8787"
+    environment:
+      QWEN3_ASR_BACKEND: vllm
+      QWEN3_ASR_MODEL: /models/qwen3-asr-1.7b
+      QWEN3_ASR_GPU_UTIL: "0.7"
+    volumes:
+      - ./data/models:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  qwen3-tts:
+    profiles: ["sidecars"]
+    build:
+      context: ./services/qwen3-tts-sidecar
+      dockerfile: Dockerfile.tts
+    ports:
+      - "8788:8788"
+    environment:
+      QWEN3_TTS_PRESET_MODEL: /models/qwen3-tts-1.7b-customvoice
+      QWEN3_TTS_CLONE_MODEL: /models/qwen3-tts-1.7b-base
+    volumes:
+      - ./data/models:/models:ro
 
 volumes:
   pgdata:

@@ -15,6 +15,8 @@ dependencies = [
   "livekit-api>=1.2,<2",
   "uvicorn[standard]>=0.29",
   "pydantic>=2.6",
+  "python-multipart>=0.0.9",
+  "httpx>=0.27,<1",
   "psycopg[binary]>=3.1",
   "sqlalchemy>=2.0,<3",
 ]

@@ -109,6 +109,17 @@ class GlobalInsight(Base):
     status: Mapped[str] = mapped_column(String(32), default="active")
 
 
+class GlobalSetting(Base):
+    __tablename__ = "global_settings"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default="global")
+    asr_json: Mapped[str] = mapped_column(Text, default="{}")
+    llm_json: Mapped[str] = mapped_column(Text, default="{}")
+    tts_json: Mapped[str] = mapped_column(Text, default="{}")
+    vad_json: Mapped[str] = mapped_column(Text, default="{}")
+    policy: Mapped[str] = mapped_column(String(64), default="offline_first")
+    updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
+
+
 class UsageRecord(Base):
     __tablename__ = "usage_records"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)

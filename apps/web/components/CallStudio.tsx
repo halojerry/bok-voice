@@ -1,25 +1,32 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  LiveKitRoom,
-  RoomAudioRenderer,
-  VoiceAssistantControlBar,
-  BarVisualizer,
   StartAudio,
-  useVoiceAssistant,
+  VoiceAssistantControlBar,
+  useAgent,
+  useAgentExpression,
+  useAudioPlayback,
+  useSession,
   useTranscriptions,
 } from "@livekit/components-react";
+import { RoomEvent, TokenSource } from "livekit-client";
 import { api } from "@/lib/api";
+import { AgentSessionProvider } from "@/components/agents-ui/agent-session-provider";
+import { VoiceAgentInterface } from "@/components/VoiceAgentInterface";
+import { useAccount } from "@/components/account-context";
 
 function AgentStateLabel({ state }: { state: string }) {
   const map: Record<string, { label: string; color: string }> = {
+    idle: { label: "待机", color: "bg-neutral-500" },
+    "pre-connect-buffering": { label: "预连接缓冲", color: "bg-amber-400" },
     connecting: { label: "连接中", color: "bg-neutral-400" },
     initializing: { label: "初始化", color: "bg-amber-400" },
     listening: { label: "聆听中", color: "bg-emerald-400" },
     thinking: { label: "思考中", color: "bg-sky-400" },
     speaking: { label: "说话中", color: "bg-fuchsia-400" },
     disconnected: { label: "已断开", color: "bg-neutral-600" },
+    failed: { label: "失败", color: "bg-red-500" },
   };
   const item = map[state] ?? map.connecting;
   return (
@@ -31,23 +38,23 @@ function AgentStateLabel({ state }: { state: string }) {
 }
 
 /**
- * Official LiveKit voice-assistant panel, rendered as a child of <LiveKitRoom>.
- * Uses the canonical @livekit/components-react pieces: BarVisualizer (waveform +
- * state transitions), RoomAudioRenderer (assistant audio), VoiceAssistantControlBar
- * (mic/track controls) and useTranscriptions (live user + agent transcriptions).
+ * 官方 Agents UI 会话面板：AgentAudioVisualizerGrid（情绪驱动颜色）+ 官方控制条。
+ * 转写暂用 useTranscriptions 自绘（视觉已对齐官方；官方 AgentChatTranscript 需 Tailwind v4，见 AGENT.md）。
  */
 function LiveAgentPanel() {
-  const { state, audioTrack, agent } = useVoiceAssistant();
+  const { state, microphoneTrack, identity } = useAgent();
+  const { mood } = useAgentExpression();
   const transcriptions = useTranscriptions();
-  const agentIdentity = agent?.identity ?? "agent";
+  const agentIdentity = identity ?? "agent";
   const recent = useMemo(() => transcriptions.slice(-16).reverse(), [transcriptions]);
+  const agentState = state ?? "connecting";
 
   return (
     <div className="flex h-full flex-1 flex-col">
-      {/* Transcript timeline (official-style chat bubbles) */}
-      <div className="flex flex-1 flex-col gap-3 overflow-y-auto px-1 py-2">
+      {/* 转写时间线（官方风格：mono、按说话者着色） */}
+      <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-1 py-2">
         {recent.length === 0 && (
-          <div className="flex flex-1 items-center justify-center text-sm text-[var(--muted)]">
+          <div className="flex flex-1 items-center justify-center font-mono text-[10px] font-bold uppercase tracking-[0.16em] text-[var(--stage-muted)]">
             等待对话…
           </div>
         )}
@@ -58,10 +65,13 @@ function LiveAgentPanel() {
           return (
             <div key={`${identity}-${i}`} className={`flex ${isAgent ? "justify-start" : "justify-end"}`}>
               <div
-                className={`max-w-[80%] rounded-2xl px-3 py-2 text-sm ${
-                  isAgent ? "bg-[var(--accent)] text-[var(--accent-ink)]" : "bg-white/10 text-[var(--foreground)]"
+                className={`max-w-[80%] rounded-lg px-3 py-2 font-mono text-[11px] leading-relaxed ${
+                  isAgent
+                    ? "bg-[var(--accent)] text-[var(--accent-ink)]"
+                    : "bg-white/10 text-[var(--foreground)]"
                 }`}
               >
+                <span className="mr-1.5 font-bold uppercase">{isAgent ? "AGENT" : "YOU"}</span>
                 {text}
               </div>
             </div>
@@ -69,17 +79,20 @@ function LiveAgentPanel() {
         })}
       </div>
 
-      {/* Central visualizer + state */}
+      {/* 中央：官方点阵可视化（mood 驱动色） */}
       <div className="flex flex-col items-center gap-3 py-4">
-        <AgentStateLabel state={state} />
-        <div className="h-24 w-64">
-          <BarVisualizer state={state} track={audioTrack} barCount={32} />
-        </div>
+        <AgentStateLabel state={agentState} />
+      <VoiceAgentInterface
+          size="md"
+          state={agentState}
+          mood={mood}
+          audioTrack={microphoneTrack}
+          showMoodLabel
+        />
       </div>
 
-      {/* Audio renderer + autoplay unlock + control bar */}
+      {/* 控制条（AgentSessionProvider 已内置音频渲染） */}
       <div className="flex items-center justify-center gap-3 border-t border-[var(--card-border)] py-3">
-        <RoomAudioRenderer />
         <StartAudio label="点击开启声音" />
         <VoiceAssistantControlBar />
       </div>
@@ -87,12 +100,22 @@ function LiveAgentPanel() {
   );
 }
 
-const ACCOUNT = "acc-001";
+/** 未接通空态：官方点阵（connecting 演示态）替代手绘 canvas */
+function IdleStage() {
+  return (
+    <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
+      <VoiceAgentInterface state="connecting" size="md" />
+      <p className="stage-value stage-glow mt-2">Live Agent</p>
+      <p className="text-sm text-[var(--foreground)]">点击「接通」开始与 AI 助手对话</p>
+      <p className="text-xs text-[var(--muted)]">浏览器将请求麦克风权限</p>
+    </div>
+  );
+}
 
 const PROVIDER_NOTE: [string, string][] = [
-  ["ASR", "sherpa（本地）"],
-  ["LLM", "DeepSeek"],
-  ["TTS", "火山流式"],
+  ["ASR", "Qwen3-ASR"],
+  ["LLM", "Ollama"],
+  ["TTS", "Qwen3-TTS"],
   ["VAD", "Silero"],
 ];
 
@@ -101,7 +124,9 @@ function str(v: unknown, fallback = "-") {
 }
 
 export function CallStudio({ callId = "" }: { callId?: string }) {
+  const { accountId: ACCOUNT } = useAccount();
   const [stateCallId, setStateCallId] = useState(callId);
+  const callIdRef = useRef(callId);
   const [objects, setObjects] = useState<Record<string, unknown>[]>([]);
   const [personas, setPersonas] = useState<Record<string, unknown>[]>([]);
   const [objId, setObjId] = useState("");
@@ -110,9 +135,24 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
   const [persona, setPersona] = useState<Record<string, unknown> | null>(null);
   const [mode, setMode] = useState<"simulation" | "live">("simulation");
   const [settlement, setSettlement] = useState<Record<string, unknown> | null>(null);
-  const [creds, setCreds] = useState<{ url?: string; token?: string; roomName?: string }>({});
   const [error, setError] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
+
+  // 官方会话：TokenSource.custom 直连 control-plane，只做键名映射（serverUrl/participantToken）。
+  const tokenSource = useMemo(
+    () =>
+      TokenSource.custom(async () => {
+        const id = callIdRef.current;
+        if (!id) throw new Error("no call id");
+        const res = await api.token({ account_id: ACCOUNT, call_id: id });
+        return { serverUrl: res.url, participantToken: res.token };
+      }),
+    [],
+  );
+  const session = useSession(tokenSource);
+  const { canPlayAudio, startAudio } = useAudioPlayback(session.room);
+
+  const roomConnected = Boolean(stateCallId) && !connecting;
 
   // Load selectable objects + personas and default to the first.
   useEffect(() => {
@@ -130,6 +170,7 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
   useEffect(() => {
     if (!callId) return;
     setStateCallId(callId);
+    callIdRef.current = callId;
     api
       .getCall(callId)
       .then((c) => {
@@ -151,7 +192,6 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
   }, [personaId]);
 
   // Load settlement only for an existing call view (e.g. /calls/[id]).
-  // For a brand-new call we wait until hangup, then settle + refresh below.
   useEffect(() => {
     if (!callId) return;
     api
@@ -176,33 +216,46 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
         });
         id = String(created.id);
         setStateCallId(id);
+        callIdRef.current = id;
       }
-      const res = await api.token({ account_id: ACCOUNT, call_id: id });
-      setCreds({ url: res.url, token: res.token, roomName: res.roomName });
+      setConnecting(false);
+      session
+        .start({ tracks: { microphone: { enabled: true } } })
+        .then(() => {
+          if (!canPlayAudio) startAudio().catch(() => {});
+        })
+        .catch((e) => {
+          console.error("connect failed", e);
+          setError("接通失败：请检查 Control Plane 是否运行，且已选择对象与人设。");
+          setConnecting(false);
+        });
     } catch (e) {
       console.error("connect failed", e);
       setError("接通失败：请检查 Control Plane 是否运行，且已选择对象与人设。");
-    } finally {
       setConnecting(false);
     }
   }
 
   async function leave() {
-    // Hang up, then auto-settle (idempotent) and refresh the settlement panel.
+    // 先断开官方会话，再挂断 + 结算（业务流保留）。
+    try {
+      await session.end();
+    } catch {
+      /* ignore */
+    }
     if (stateCallId) {
       try {
         await api.hangup(stateCallId);
-        await api.settle(stateCallId);
         const s = await api.getSettlement(stateCallId);
         setSettlement(s);
       } catch (e) {
         console.warn("settle failed", e);
       }
     }
-    setCreds({});
+    setStateCallId("");
+    callIdRef.current = "";
   }
 
-  const roomConnected = !!creds.token;
   const metrics = (settlement?.metrics ?? {}) as Record<string, unknown>;
 
   return (
@@ -213,7 +266,7 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
           <span className="label">对象档案</span>
           {!stateCallId && (
             <select
-              className="rounded-lg border border-[var(--card-border)] bg-transparent px-2 py-1 text-xs outline-none"
+              className="select px-2 py-1 text-xs"
               value={mode}
               onChange={(e) => setMode(e.target.value as "simulation" | "live")}
             >
@@ -225,11 +278,7 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
 
         {!stateCallId && (
           <>
-            <select
-              className="w-full rounded-xl border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none"
-              value={objId}
-              onChange={(e) => setObjId(e.target.value)}
-            >
+            <select className="select" value={objId} onChange={(e) => setObjId(e.target.value)}>
               {objects.length === 0 && <option value="">请先建档对象</option>}
               {objects.map((o) => (
                 <option key={String(o.id)} value={String(o.id)}>
@@ -238,7 +287,7 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
               ))}
             </select>
             <select
-              className="w-full rounded-xl border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none"
+              className="select"
               value={personaId}
               onChange={(e) => setPersonaId(e.target.value)}
             >
@@ -259,16 +308,16 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
           </p>
         )}
         {object?.background && (
-          <p className="rounded-xl bg-white/5 p-3 text-sm text-[var(--muted)]">{String(object.background)}</p>
+          <p className="rounded-lg bg-white/5 p-3 text-sm text-[var(--muted)]">{String(object.background)}</p>
         )}
 
-        <div className="rounded-xl bg-white/5 p-3 text-sm">
+        <div className="rounded-lg bg-white/5 p-3 text-sm">
           <span className="label mb-1 block">历史主题</span>
           <p className="text-[var(--muted)]">
             {Array.isArray(settlement?.new_topics) && settlement.new_topics.length ? "已沉淀（见右侧结算）" : "暂无（挂断后自动沉淀）"}
           </p>
         </div>
-        <div className="rounded-xl bg-white/5 p-3 text-sm">
+        <div className="rounded-lg bg-white/5 p-3 text-sm">
           <span className="label mb-1 block">我方人设</span>
           {persona ? (
             <>
@@ -281,16 +330,16 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
             <p className="text-[var(--muted)]">默认人设未配置</p>
           )}
         </div>
-        <div className="mt-auto rounded-xl border border-dashed border-[var(--card-border)] p-3 text-xs text-[var(--muted)]">
+        <div className="mt-auto rounded-lg border border-dashed border-[var(--card-border)] p-3 text-xs text-[var(--muted)]">
           对象档案与知识库由当前账号注入，挂断后自动沉淀到该账号。
         </div>
       </section>
 
-      {/* 中：官方 LiveKit 通话台 */}
+      {/* 中：官方 LiveKit 会话台（AgentSessionProvider + 官方可视化） */}
       <section className="card flex min-h-[520px] flex-col">
         <div className="mb-4 flex items-center justify-between">
           <div className="text-xs text-[var(--muted)]">
-            {creds.roomName ?? (stateCallId ? `会话 ${stateCallId}` : "新建会话")}
+            {stateCallId ? `会话 ${stateCallId}` : "新建会话"}
           </div>
           <div className="flex gap-2">
             {!roomConnected ? (
@@ -312,17 +361,9 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
           </p>
         )}
 
-        {roomConnected ? (
-          <LiveKitRoom serverUrl={creds.url} token={creds.token} audio connect>
-            <LiveAgentPanel />
-          </LiveKitRoom>
-        ) : (
-          <div className="flex flex-1 flex-col items-center justify-center text-center">
-            <div className="flex h-24 w-24 items-center justify-center rounded-full border border-[var(--card-border)] text-3xl">📞</div>
-            <p className="mt-4 text-sm text-[var(--muted)]">点击「接通」开始与 AI 助手对话</p>
-            <p className="mt-1 text-xs text-[var(--muted)]">浏览器将请求麦克风权限</p>
-          </div>
-        )}
+        <AgentSessionProvider session={session} volume={1} muted={false}>
+          {roomConnected ? <LiveAgentPanel /> : <IdleStage />}
+        </AgentSessionProvider>
       </section>
 
       {/* 右：实时分析 / Provider / 结算 */}
@@ -336,14 +377,14 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
               ["犹豫词", str(metrics.hesitation_ratio, "—")],
               ["平均轮次", metrics.avg_turn_seconds ? `${metrics.avg_turn_seconds}s` : "—"],
             ].map(([k, v]) => (
-              <div key={k} className="rounded-xl bg-white/5 p-3">
+              <div key={k} className="rounded-lg bg-white/5 p-3">
                 <p className="text-xs text-[var(--muted)]">{k}</p>
                 <p className="mt-1 text-lg font-semibold">{v}</p>
               </div>
             ))}
           </div>
         </div>
-        <div className="rounded-xl bg-white/5 p-3">
+        <div className="rounded-lg bg-white/5 p-3">
           <span className="label">Provider（会话清单锁定）</span>
           <div className="mt-2 space-y-1 text-sm">
             {PROVIDER_NOTE.map(([k, v]) => (
@@ -354,7 +395,7 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
             ))}
           </div>
         </div>
-        <div className="rounded-xl bg-white/5 p-3 text-sm">
+        <div className="rounded-lg bg-white/5 p-3 text-sm">
           <span className="label mb-1 block">结算</span>
           {settlement ? (
             <>

@@ -5,6 +5,7 @@ import uuid
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from bok_voice_core.providers import BusinessRepository
@@ -81,9 +82,18 @@ class SqlAlchemyBusinessRepository:
             provider=turn.provider,
             latency_ms=turn.latency_ms,
         )
-        self.session.add(row)
-        self.session.commit()
-        return {"id": row.id}
+        try:
+            self.session.add(row)
+            self.session.commit()
+            return {"id": row.id}
+        except IntegrityError:
+            # 并发 add_turn 可能算出相同 turn_id（t0/t1...）；幂等返回已存在行，
+            # 并回滚坏事务，避免后续请求全部 500。
+            self.session.rollback()
+            existing = self.session.get(models.Turn, row.id)
+            if existing is not None:
+                return {"id": existing.id, "duplicate": True}
+            raise
 
     def get_turns(self, call_id: str) -> list[TurnEvent]:
         stmt = select(models.Turn).filter_by(call_id=call_id).order_by(models.Turn.created_at)
@@ -157,6 +167,25 @@ class SqlAlchemyBusinessRepository:
         obj = self.session.get(models.ObjectProfile, object_id)
         return self._to_dict(obj) if obj else None
 
+    def update_object(self, object_id: str, data: dict) -> dict | None:
+        obj = self.session.get(models.ObjectProfile, object_id)
+        if not obj:
+            return None
+        allowed = {"display_name", "role_template", "language", "background", "phone", "status"}
+        for key, value in data.items():
+            if key in allowed and hasattr(obj, key):
+                setattr(obj, key, value)
+        self.session.commit()
+        return self._to_dict(obj)
+
+    def delete_object(self, object_id: str) -> bool:
+        obj = self.session.get(models.ObjectProfile, object_id)
+        if not obj:
+            return False
+        self.session.delete(obj)
+        self.session.commit()
+        return True
+
     def create_persona(self, data: dict) -> dict:
         persona = models.PersonaProfile(
             id=data.get("id") or _uuid(),
@@ -171,6 +200,25 @@ class SqlAlchemyBusinessRepository:
         self.session.commit()
         return self._to_dict(persona)
 
+    def update_persona(self, persona_id: str, data: dict) -> dict | None:
+        persona = self.session.get(models.PersonaProfile, persona_id)
+        if not persona:
+            return None
+        allowed = {"account_id", "name", "company", "tone", "language", "reference_audio"}
+        for key, value in data.items():
+            if key in allowed and hasattr(persona, key):
+                setattr(persona, key, value)
+        self.session.commit()
+        return self._to_dict(persona)
+
+    def delete_persona(self, persona_id: str) -> bool:
+        persona = self.session.get(models.PersonaProfile, persona_id)
+        if not persona:
+            return False
+        self.session.delete(persona)
+        self.session.commit()
+        return True
+
     def get_persona(self, persona_id: str) -> dict | None:
         persona = self.session.get(models.PersonaProfile, persona_id)
         return self._to_dict(persona) if persona else None
@@ -180,6 +228,52 @@ class SqlAlchemyBusinessRepository:
         if account_id:
             stmt = stmt.filter_by(account_id=account_id)
         return [self._to_dict(p) for p in self.session.scalars(stmt)]
+
+    def get_settings(self) -> dict:
+        row = self.session.get(models.GlobalSetting, "global")
+        if not row:
+            return self.default_settings()
+        return {
+            "asr": json.loads(row.asr_json or "{}"),
+            "llm": json.loads(row.llm_json or "{}"),
+            "tts": json.loads(row.tts_json or "{}"),
+            "vad": json.loads(row.vad_json or "{}"),
+            "policy": row.policy,
+        }
+
+    def save_settings(self, settings: dict) -> dict:
+        row = self.session.get(models.GlobalSetting, "global")
+        if row is None:
+            row = models.GlobalSetting(id="global")
+            self.session.add(row)
+        row.asr_json = json.dumps(settings.get("asr", {}), ensure_ascii=False)
+        row.llm_json = json.dumps(settings.get("llm", {}), ensure_ascii=False)
+        row.tts_json = json.dumps(settings.get("tts", {}), ensure_ascii=False)
+        row.vad_json = json.dumps(settings.get("vad", {}), ensure_ascii=False)
+        row.policy = settings.get("policy", row.policy or "offline_first")
+        self.session.commit()
+        return self.get_settings()
+
+    @staticmethod
+    def default_settings() -> dict:
+        return {
+            "asr": {
+                "provider": "qwen3_asr",
+                "model": "Qwen/Qwen3-ASR-0.6B",
+                "base_url": "http://127.0.0.1:8787",
+                "backend": "transformers",
+                "language": "zh",
+            },
+            "llm": {"provider": "ollama", "model": "huihui_ai/qwen3.5-abliterated:9b"},
+            "tts": {
+                "provider": "qwen3_tts",
+                "model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+                "base_url": "http://127.0.0.1:8788",
+                "sample_rate": 24000,
+            },
+            "vad": {"provider": "silero", "model": "silero"},
+            "policy": "offline_first",
+        }
 
     @staticmethod
     def _call_to_dict(call: models.CallSession) -> dict:
@@ -199,6 +293,7 @@ class InMemoryBusinessRepository:
         self.settlements: dict[str, dict] = {}
         self.objects: dict[str, dict] = {}
         self.personas: dict[str, dict] = {}
+        self.settings: dict = SqlAlchemyBusinessRepository.default_settings()
 
     def create_call(self, manifest: SessionManifest) -> dict:
         call_id = manifest.session_id or _uuid()
@@ -258,6 +353,15 @@ class InMemoryBusinessRepository:
         self.objects[obj["id"]] = obj
         return obj
 
+    def update_object(self, object_id: str, data: dict) -> dict | None:
+        if object_id not in self.objects:
+            return None
+        self.objects[object_id].update({k: v for k, v in data.items() if k in {"display_name", "role_template", "language", "background", "phone", "status"}})
+        return self.objects[object_id]
+
+    def delete_object(self, object_id: str) -> bool:
+        return self.objects.pop(object_id, None) is not None
+
     def create_persona(self, data: dict) -> dict:
         persona = PersonaProfile(
             id=data.get("id") or _uuid(),
@@ -271,6 +375,15 @@ class InMemoryBusinessRepository:
         self.personas[persona["id"]] = persona
         return persona
 
+    def update_persona(self, persona_id: str, data: dict) -> dict | None:
+        if persona_id not in self.personas:
+            return None
+        self.personas[persona_id].update({k: v for k, v in data.items() if k in {"account_id", "name", "company", "tone", "language", "reference_audio"}})
+        return self.personas[persona_id]
+
+    def delete_persona(self, persona_id: str) -> bool:
+        return self.personas.pop(persona_id, None) is not None
+
     def get_object(self, object_id: str) -> dict | None:
         return self.objects.get(object_id)
 
@@ -282,3 +395,16 @@ class InMemoryBusinessRepository:
             p for p in self.personas.values()
             if not account_id or p.get("account_id", "") == account_id
         ]
+
+    def get_settings(self) -> dict:
+        return self.settings
+
+    def save_settings(self, settings: dict) -> dict:
+        self.settings = {
+            "asr": settings.get("asr", {}),
+            "llm": settings.get("llm", {}),
+            "tts": settings.get("tts", {}),
+            "vad": settings.get("vad", {}),
+            "policy": settings.get("policy", "offline_first"),
+        }
+        return self.settings

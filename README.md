@@ -65,6 +65,33 @@ cd tools/browser-e2e && npm install && npx playwright install chromium && node e
 
 当前已验证：所有服务在 Docker 内运行、Python 测试通过、HTTP 端到端通过、Agent Worker 注册到本地 LiveKit、浏览器进房触发 Agent 派发。真实语音内容（STT/LLM/TTS）仍依赖 Provider Key/本地模型，为下一里程碑。
 
+## 语音模型 sidecar（Qwen3-ASR / Qwen3-TTS）
+
+Agent 的 ASR 与 TTS 走两个本地 HTTP sidecar（macOS 开发机直接跑在宿主机；Windows 生产用 WSL2 + vLLM，见 `services/qwen3-asr-sidecar/docker-compose.qwen3-asr.yml`）。
+
+```bash
+# 首次：建 venv 并安装依赖（模型权重已放在 data/models/）
+services/qwen3-asr-sidecar/setup-macos.sh
+services/qwen3-tts-sidecar/setup-macos.sh
+
+# 启动（幂等，模型加载 1–5 分钟）
+./scripts/start_sidecars.sh
+
+# 验证：三语言转写 + 预置/克隆合成 + 克隆粤语音色回灌
+./scripts/smoke_sidecars.py
+
+# 停止
+./scripts/stop_sidecars.sh
+```
+
+端口：ASR `8787`、TTS `8788`。Control Plane 的 `/api/asr/health`、`/api/tts/health` 与设置/人设页的「克隆/试听」都通过这两个 sidecar 工作。
+
+三语浏览器 E2E（普通话/粤语/英语，注入假麦克风音频）：
+
+```bash
+cd tools/browser-e2e && node trilingual.mjs   # 期望 TRILINGUAL_E2E 3/3 PASSED
+```
+
 ## 状态
 
 当前为可运行、可测试的工程骨架：接口、领域模型、repository、control-plane、LiveKit agent 骨架、Web 基座均以 Fake/占位实现保证无 Key 可跑。真实 sherpa / GPT-SoVITS / 火山 / 讯飞 / DeepSeek / Ollama 分别通过对应 Provider 适配器接入。

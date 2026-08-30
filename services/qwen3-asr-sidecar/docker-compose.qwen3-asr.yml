@@ -1,0 +1,18 @@
+services:
+  qwen3-asr:
+    build:
+      context: .
+      dockerfile: Dockerfile.asr
+    ports:
+      - "8787:8787"
+    environment:
+      QWEN3_ASR_BACKEND: vllm
+      QWEN3_ASR_MODEL: Qwen/Qwen3-ASR-1.7B
+      QWEN3_ASR_GPU_UTIL: "0.7"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
