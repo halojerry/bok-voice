@@ -156,7 +156,14 @@ export default function TranslatePage() {
       send({ type: "audio", channelId, pcm: btoa(bin), sampleRate: ctx.sampleRate });
     };
     source.connect(node);
-    node.connect(ctx.destination);
+    // WebAudio only pulls (processes) a ScriptProcessor if its output is fed
+    // back to the destination. Route it through a zero-gain node so capture
+    // keeps running without piping the microphone back into the speakers —
+    // the previous direct `node.connect(ctx.destination)` caused echo/feedback.
+    const mute = ctx.createGain();
+    mute.gain.value = 0;
+    node.connect(mute);
+    mute.connect(ctx.destination);
     micRef.current = source;
   }
 
