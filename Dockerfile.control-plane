@@ -7,12 +7,14 @@ WORKDIR /app
 COPY packages/core /app/packages/core
 COPY packages/business-db /app/packages/business-db
 COPY packages/knowledge /app/packages/knowledge
+COPY packages/observability /app/packages/observability
 COPY apps/control-plane /app/apps/control-plane
 
 RUN pip install --no-cache-dir \
     -e /app/packages/core \
     -e /app/packages/business-db \
     -e /app/packages/knowledge \
+    -e /app/packages/observability \
     -e /app/apps/control-plane
 
 RUN mkdir -p /app/data/vault
