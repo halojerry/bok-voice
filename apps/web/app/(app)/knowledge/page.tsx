@@ -3,8 +3,10 @@
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
+import { useAccount } from "@/components/account-context";
 
 export default function KnowledgePage() {
+  const { accountId } = useAccount();
   const [q, setQ] = useState("");
   const [results, setResults] = useState<Record<string, unknown>[]>([]);
   const [docs, setDocs] = useState<Record<string, unknown>[]>([]);
@@ -16,7 +18,7 @@ export default function KnowledgePage() {
   async function refreshDocs() {
     setLoading(true);
     try {
-      const data = await api.listKnowledge();
+      const data = await api.listKnowledge(accountId);
       setDocs(Array.isArray(data) ? data : []);
       setErr(null);
     } catch (e) {
@@ -28,14 +30,14 @@ export default function KnowledgePage() {
 
   useEffect(() => {
     refreshDocs();
-  }, []);
+  }, [accountId]);
 
   async function search() {
     if (!q.trim()) return;
-    setErr(null);
-    try {
-      const data = await api.searchKnowledge(q);
-      setResults(Array.isArray(data) ? data : []);
+      setErr(null);
+      try {
+        const data = await api.searchKnowledge(q, accountId);
+        setResults(Array.isArray(data) ? data : []);
     } catch (e) {
       setErr(String(e));
     }
@@ -46,7 +48,7 @@ export default function KnowledgePage() {
     setErr(null);
     setOk(false);
     try {
-      await api.importKnowledge({ account_id: "acc-001", path: `manual-${Date.now()}.md`, content });
+      await api.importKnowledge({ account_id: accountId, path: `manual-${Date.now()}.md`, content });
       setContent("");
       setOk(true);
       await refreshDocs();
@@ -58,7 +60,7 @@ export default function KnowledgePage() {
   async function remove(id: string) {
     if (!window.confirm("确认删除该知识片段？")) return;
     try {
-      await api.deleteKnowledge(id);
+      await api.deleteKnowledge(id, accountId);
       await refreshDocs();
     } catch (e) {
       setErr(String(e));

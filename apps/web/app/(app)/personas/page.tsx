@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
+import { useAccount } from "@/components/account-context";
 
 const EMPTY = { name: "", company: "", tone: "", language: "zh", reference_audio: "" };
 const LANGS = [
@@ -22,6 +23,7 @@ function parseVoiceMap(raw: unknown): Record<string, string> {
 }
 
 export default function PersonasPage() {
+  const { accountId } = useAccount();
   const [rows, setRows] = useState<Record<string, unknown>[]>([]);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState(EMPTY);
@@ -59,8 +61,8 @@ export default function PersonasPage() {
     setOk(false);
     try {
       const payload = { ...form, reference_audio: JSON.stringify(voiceMap) };
-      if (editingId) await api.updatePersona(editingId, { ...payload, account_id: "acc-001" });
-      else await api.createPersona({ ...payload, account_id: "acc-001" });
+      if (editingId) await api.updatePersona(editingId, { ...payload, account_id: accountId });
+      else await api.createPersona({ ...payload, account_id: accountId });
       setForm(EMPTY);
       setEditingId(null);
       setVoiceMap({});

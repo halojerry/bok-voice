@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "@/lib/api";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
+import { useAccount } from "@/components/account-context";
 
 interface ObjectRow {
   id: string;
@@ -22,6 +23,7 @@ const EMPTY_FORM = {
 };
 
 export default function ObjectsPage() {
+  const { accountId } = useAccount();
   const [rows, setRows] = useState<Record<string, unknown>[]>([]);
   const [q, setQ] = useState("");
   const [form, setForm] = useState(EMPTY_FORM);
@@ -32,7 +34,7 @@ export default function ObjectsPage() {
   async function refresh() {
     setLoading(true);
     try {
-      const data = await api.listObjects();
+      const data = await api.listObjects(accountId);
       setRows(Array.isArray(data) ? data : []);
       setErr(null);
     } catch (e) {
@@ -44,7 +46,7 @@ export default function ObjectsPage() {
 
   useEffect(() => {
     refresh();
-  }, []);
+  }, [accountId]);
 
   const filtered = useMemo(() => {
     const query = q.trim().toLowerCase();
@@ -59,7 +61,7 @@ export default function ObjectsPage() {
     setErr(null);
     try {
       if (editingId) await api.updateObject(editingId, form);
-      else await api.createObject(form);
+      else await api.createObject(form, accountId);
       setForm(EMPTY_FORM);
       setEditingId(null);
       await refresh();

@@ -18,6 +18,14 @@ from .control_plane import ControlPlaneClient
 # 剥掉进 TTS 那一路的 <expr/> 标签（防被念出来）；转录那一路框架会自动剥离并发布 mood。
 _EXPR_TAG_RE = re.compile(r"<expr\b[^>]*?/>|<[^>]+>")
 _EXPR_PARTIAL_RE = re.compile(r"<expr\b[^>]*$")
+# Sync cleaner for the *recorded* transcript path: strip the internal <expr/>
+# emotion tag (open/closed/self-closing, including a dangling open fragment)
+# so the persisted transcript is clean customer-facing copy.
+_EXPR_SYNC_RE = re.compile(r"<expr\b[^>]*?/>|<expr\b[^>]*>|</expr>|<expr\b[^>]*$")
+
+
+def _clean_transcript(text: str) -> str:
+    return _EXPR_SYNC_RE.sub("", text).strip()
 
 
 async def _strip_expr_markup(text):
@@ -311,7 +319,7 @@ async def entrypoint(ctx):
         text = getattr(item, "text_content", None) or getattr(item, "raw_text_content", "") or ""
         if not text:
             return
-        asyncio.create_task(cp.add_turn(call_id, role, text))
+        asyncio.create_task(cp.add_turn(call_id, role, _clean_transcript(text)))
 
     def _on_close(ev):
         asyncio.create_task(cp.settle(call_id))
