@@ -349,7 +349,27 @@ def settle(call_id: str) -> dict:
         mode=CallMode(call.get("mode", "simulation")),
     )
     result = app.state.settlement.build_result(session, turns)
-    return _repo().append_settlement(call_id, result)
+    # 总结/沉淀：用本机 LLM 生成总结正文 + 新话题 + 全局洞察（失败回退纯指标）。
+    try:
+        from .summarize import Summarizer
+
+        settings = _repo().get_settings()
+        summ = Summarizer().build(turns, call, settings)
+        if summ.get("summary"):
+            result["summary"] = summ["summary"]
+        else:
+            result["summary"] = ""
+        result["new_topics"] = summ.get("new_topics", [])
+        insight = summ.get("insight")
+        if insight:
+            saved = _repo().append_global_insight({**insight, "kind": "insight"})
+            result["global_insight_id"] = saved.get("id", "")
+        if result.get("new_topics"):
+            _repo().append_object_topics(call["object_id"], call["account_id"], result["new_topics"])
+    except Exception as exc:  # pragma: no cover - summarizer must not break settle
+        print(f"[settle] summarizer failed: {exc!r}", flush=True)
+    _repo().append_settlement(call_id, result)
+    return _repo().get_settlement(call_id) or result
 
 
 @app.get("/api/objects")

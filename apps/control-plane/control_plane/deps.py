@@ -21,6 +21,7 @@ def build_engine() -> Engine | None:
 
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE object_profiles ADD COLUMN IF NOT EXISTS template_id VARCHAR(64) DEFAULT ''"))
+                conn.execute(text("ALTER TABLE settlements ADD COLUMN IF NOT EXISTS summary TEXT"))
         except Exception as exc:  # pragma: no cover - sqlite / duplicate column
             print(f"[deps] object_profiles.template_id migration skipped: {exc}")
         # pgvector: create the extension + knowledge_chunks table (best-effort SQLite-safe).

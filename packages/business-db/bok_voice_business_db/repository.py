@@ -121,6 +121,7 @@ class SqlAlchemyBusinessRepository:
             "call_id": row.call_id,
             "status": row.status,
             "metrics": json.loads(row.metrics_json or "{}"),
+            "summary": row.summary,
             "transcript_doc_path": row.transcript_doc_path,
             "settlement_doc_path": row.settlement_doc_path,
             "new_topics": json.loads(row.new_topics_json or "[]"),
@@ -135,6 +136,7 @@ class SqlAlchemyBusinessRepository:
             self.session.add(row)
         row.status = result.get("status", row.status)
         row.metrics_json = json.dumps(result.get("metrics", {}), ensure_ascii=False)
+        row.summary = result.get("summary", row.summary or "")
         row.transcript_doc_path = result.get("transcript_doc_path", row.transcript_doc_path)
         row.settlement_doc_path = result.get("settlement_doc_path", row.settlement_doc_path)
         row.new_topics_json = json.dumps(result.get("new_topics", []), ensure_ascii=False)
@@ -274,6 +276,44 @@ class SqlAlchemyBusinessRepository:
         self.session.commit()
         return True
 
+    def list_object_topics(self, object_id: str) -> list[dict]:
+        stmt = select(models.ObjectTopic).filter_by(object_id=object_id)
+        return [self._to_dict(t) for t in self.session.scalars(stmt)]
+
+    def append_object_topics(self, object_id: str, account_id: str, topics: list[dict]) -> dict:
+        created = 0
+        for t in topics:
+            topic = models.ObjectTopic(
+                id=_uuid(),
+                object_id=object_id,
+                account_id=account_id,
+                topic=t.get("topic", ""),
+                summary=t.get("summary", ""),
+            )
+            self.session.add(topic)
+            created += 1
+        self.session.commit()
+        return {"count": created}
+
+    def list_global_insights(self, kind: str = "") -> list[dict]:
+        stmt = select(models.GlobalInsight)
+        if kind:
+            stmt = stmt.filter_by(kind=kind)
+        return [self._to_dict(g) for g in self.session.scalars(stmt)]
+
+    def append_global_insight(self, insight: dict) -> dict:
+        row = models.GlobalInsight(
+            id=_uuid(),
+            kind=insight.get("kind", "insight"),
+            statement=insight.get("statement", ""),
+            confidence=float(insight.get("confidence", 0.0)),
+            language=insight.get("language", "zh"),
+            status=insight.get("status", "active"),
+        )
+        self.session.add(row)
+        self.session.commit()
+        return self._to_dict(row)
+
     def get_settings(self) -> dict:
         row = self.session.get(models.GlobalSetting, "global")
         if not row:
@@ -339,6 +379,8 @@ class InMemoryBusinessRepository:
         self.objects: dict[str, dict] = {}
         self.personas: dict[str, dict] = {}
         self.templates: dict[str, dict] = {}
+        self.object_topics: dict[str, list[dict]] = {}
+        self.global_insights: list[dict] = []
         self.settings: dict = SqlAlchemyBusinessRepository.default_settings()
 
     def create_call(self, manifest: SessionManifest) -> dict:
@@ -472,6 +514,37 @@ class InMemoryBusinessRepository:
 
     def delete_template(self, template_id: str) -> bool:
         return self.templates.pop(template_id, None) is not None
+
+    def list_object_topics(self, object_id: str) -> list[dict]:
+        return [t for t in self.object_topics.get(object_id, [])]
+
+    def append_object_topics(self, object_id: str, account_id: str, topics: list[dict]) -> dict:
+        key = object_id
+        self.object_topics.setdefault(key, [])
+        for t in topics:
+            self.object_topics[key].append({
+                "id": _uuid(),
+                "object_id": object_id,
+                "account_id": account_id,
+                "topic": t.get("topic", ""),
+                "summary": t.get("summary", ""),
+            })
+        return {"count": len(topics)}
+
+    def list_global_insights(self, kind: str = "") -> list[dict]:
+        return [g for g in self.global_insights if not kind or g.get("kind") == kind]
+
+    def append_global_insight(self, insight: dict) -> dict:
+        row = {
+            "id": _uuid(),
+            "kind": insight.get("kind", "insight"),
+            "statement": insight.get("statement", ""),
+            "confidence": float(insight.get("confidence", 0.0)),
+            "language": insight.get("language", "zh"),
+            "status": insight.get("status", "active"),
+        }
+        self.global_insights.append(row)
+        return row
 
     def get_settings(self) -> dict:
         return self.settings

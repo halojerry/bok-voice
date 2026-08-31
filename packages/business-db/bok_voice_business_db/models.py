@@ -106,6 +106,7 @@ class Settlement(Base):
     call_id: Mapped[str] = mapped_column(String(64), index=True)
     status: Mapped[str] = mapped_column(String(32), default="pending")
     metrics_json: Mapped[str] = mapped_column(Text, default="{}")
+    summary: Mapped[str] = mapped_column(Text, default="")
     transcript_doc_path: Mapped[str] = mapped_column(String(512), default="")
     settlement_doc_path: Mapped[str] = mapped_column(String(512), default="")
     new_topics_json: Mapped[str] = mapped_column(Text, default="[]")

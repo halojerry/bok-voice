@@ -29,6 +29,7 @@ def test_control_plane_flow():
         client.post(f"/api/calls/{call_id}/turns", params={"role": "user", "transcript": "嗯 然后 优惠", "emotion": "neutral"})
         settled = client.post(f"/api/calls/{call_id}/settle").json()
         assert settled["status"] == "done"
+        assert "summary" in settled  # settle 结果应携带总结正文（无 LLM 时回退纯指标摘要）
 
 
 def test_settings_object_persona_knowledge_and_reports():
