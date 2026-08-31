@@ -91,12 +91,14 @@ def _instructions(
     object_card: dict | None,
     snippets: list[dict],
     history: str = "",
+    template: dict | None = None,
 ) -> str:
     parts: list[str] = []
     if persona:
         name = persona.get("name") or "Bok Voice"
         company = persona.get("company") or ""
-        tone = persona.get("tone") or ""
+        # 对象绑定的话术模板可覆盖人设语气（tone_override 优先）。
+        tone = (template or {}).get("tone_override") or persona.get("tone") or ""
         style = f"说话风格：{tone}。" if tone else ""
         parts.append(f"你是{name}，代表{company}。{style}".replace("。。", "。"))
     if object_card:
@@ -104,6 +106,20 @@ def _instructions(
         role = object_card.get("role_template") or "客户"
         lang = object_card.get("language") or "中文"
         parts.append(f"当前对话对象：{display}（{role}，语言 {lang}）。")
+    if template:
+        tpl_name = template.get("name") or ""
+        tpl_lines: list[str] = []
+        if template.get("opening"):
+            tpl_lines.append(f"开场白：{template.get('opening')}")
+        if template.get("core"):
+            tpl_lines.append(f"核心话术：{template.get('core')}")
+        if template.get("objection"):
+            tpl_lines.append(f"异议应对：{template.get('objection')}")
+        if template.get("closing"):
+            tpl_lines.append(f"收尾话术：{template.get('closing')}")
+        if tpl_lines:
+            prefix = f"对话模板「{tpl_name}」：" if tpl_name else "对话模板："
+            parts.append(prefix + "；".join(tpl_lines) + "。严格按模板组织回应。")
     if snippets:
         parts.append("以下是产品资料：")
         for s in snippets[:5]:
@@ -135,6 +151,7 @@ async def entrypoint(ctx):
     call: dict | None = None
     persona: dict | None = None
     object_card: dict | None = None
+    template: dict | None = None
     snippets: list[dict] = []
     try:
         call = await cp.get_call(call_id)
@@ -143,6 +160,9 @@ async def entrypoint(ctx):
         persona_id = call.get("persona_id", "")
         if object_id:
             object_card = await cp.get_object(object_id)
+            template_id = (object_card or {}).get("template_id", "")
+            if template_id:
+                template = await cp.get_template(template_id)
         if persona_id:
             persona = await cp.get_persona(persona_id)
         query = (object_card or {}).get("background") or "产品介绍"
@@ -150,7 +170,12 @@ async def entrypoint(ctx):
     except Exception as e:
         print(f"[agent] context resolve failed ({room_name}): {e}", flush=True)
 
-    instructions = _instructions(persona=persona, object_card=object_card, snippets=snippets)
+    instructions = _instructions(
+        persona=persona,
+        object_card=object_card,
+        snippets=snippets,
+        template=template,
+    )
 
     # 全局 Provider 设置优先；读取失败或未配置时回退到环境变量。
     settings: dict = {}

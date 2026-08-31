@@ -15,6 +15,14 @@ def build_engine() -> Engine | None:
         from bok_voice_business_db import models
 
         models.create_all(engine)
+        # create_all 不会给已存在的表加列 —— 幂等补上对象卡的模板绑定列。
+        try:
+            from sqlalchemy import text
+
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE object_profiles ADD COLUMN IF NOT EXISTS template_id VARCHAR(64) DEFAULT ''"))
+        except Exception as exc:  # pragma: no cover - sqlite / duplicate column
+            print(f"[deps] object_profiles.template_id migration skipped: {exc}")
         # pgvector: create the extension + knowledge_chunks table (best-effort SQLite-safe).
         try:
             from sqlalchemy import text

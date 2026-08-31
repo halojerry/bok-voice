@@ -13,6 +13,7 @@ from bok_voice_core.types import (
     CallMode,
     CallSession,
     CallStatus,
+    ConversationTemplate,
     ObjectProfile,
     PersonaProfile,
     SessionManifest,
@@ -157,6 +158,7 @@ class SqlAlchemyBusinessRepository:
             language=data.get("language", "zh"),
             background=data.get("background", ""),
             phone=data.get("phone", ""),
+            template_id=data.get("template_id", ""),
             status=data.get("status", "active"),
         )
         self.session.add(obj)
@@ -171,7 +173,7 @@ class SqlAlchemyBusinessRepository:
         obj = self.session.get(models.ObjectProfile, object_id)
         if not obj:
             return None
-        allowed = {"display_name", "role_template", "language", "background", "phone", "status"}
+        allowed = {"display_name", "role_template", "language", "background", "phone", "template_id", "status"}
         for key, value in data.items():
             if key in allowed and hasattr(obj, key):
                 setattr(obj, key, value)
@@ -228,6 +230,49 @@ class SqlAlchemyBusinessRepository:
         if account_id:
             stmt = stmt.filter_by(account_id=account_id)
         return [self._to_dict(p) for p in self.session.scalars(stmt)]
+
+    def list_templates(self, account_id: str) -> list[dict]:
+        stmt = select(models.ConversationTemplate).filter_by(account_id=account_id)
+        return [self._to_dict(t) for t in self.session.scalars(stmt)]
+
+    def create_template(self, data: dict) -> dict:
+        tpl = models.ConversationTemplate(
+            id=data.get("id") or _uuid(),
+            account_id=data.get("account_id", ""),
+            name=data.get("name", ""),
+            opening=data.get("opening", ""),
+            core=data.get("core", ""),
+            objection=data.get("objection", ""),
+            closing=data.get("closing", ""),
+            tone_override=data.get("tone_override", ""),
+            language=data.get("language", "zh"),
+        )
+        self.session.add(tpl)
+        self.session.commit()
+        return self._to_dict(tpl)
+
+    def get_template(self, template_id: str) -> dict | None:
+        tpl = self.session.get(models.ConversationTemplate, template_id)
+        return self._to_dict(tpl) if tpl else None
+
+    def update_template(self, template_id: str, data: dict) -> dict | None:
+        tpl = self.session.get(models.ConversationTemplate, template_id)
+        if not tpl:
+            return None
+        allowed = {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language"}
+        for key, value in data.items():
+            if key in allowed and hasattr(tpl, key):
+                setattr(tpl, key, value)
+        self.session.commit()
+        return self._to_dict(tpl)
+
+    def delete_template(self, template_id: str) -> bool:
+        tpl = self.session.get(models.ConversationTemplate, template_id)
+        if not tpl:
+            return False
+        self.session.delete(tpl)
+        self.session.commit()
+        return True
 
     def get_settings(self) -> dict:
         row = self.session.get(models.GlobalSetting, "global")
@@ -293,6 +338,7 @@ class InMemoryBusinessRepository:
         self.settlements: dict[str, dict] = {}
         self.objects: dict[str, dict] = {}
         self.personas: dict[str, dict] = {}
+        self.templates: dict[str, dict] = {}
         self.settings: dict = SqlAlchemyBusinessRepository.default_settings()
 
     def create_call(self, manifest: SessionManifest) -> dict:
@@ -348,6 +394,7 @@ class InMemoryBusinessRepository:
             language=data.get("language", "zh"),
             background=data.get("background", ""),
             phone=data.get("phone", ""),
+            template_id=data.get("template_id", ""),
             status=data.get("status", "active"),
         ).__dict__
         self.objects[obj["id"]] = obj
@@ -356,7 +403,7 @@ class InMemoryBusinessRepository:
     def update_object(self, object_id: str, data: dict) -> dict | None:
         if object_id not in self.objects:
             return None
-        self.objects[object_id].update({k: v for k, v in data.items() if k in {"display_name", "role_template", "language", "background", "phone", "status"}})
+        self.objects[object_id].update({k: v for k, v in data.items() if k in {"display_name", "role_template", "language", "background", "phone", "template_id", "status"}})
         return self.objects[object_id]
 
     def delete_object(self, object_id: str) -> bool:
@@ -395,6 +442,36 @@ class InMemoryBusinessRepository:
             p for p in self.personas.values()
             if not account_id or p.get("account_id", "") == account_id
         ]
+
+    def list_templates(self, account_id: str) -> list[dict]:
+        return [t for t in self.templates.values() if t.get("account_id", "") == account_id]
+
+    def create_template(self, data: dict) -> dict:
+        tpl = ConversationTemplate(
+            id=data.get("id") or _uuid(),
+            account_id=data.get("account_id", ""),
+            name=data.get("name", ""),
+            opening=data.get("opening", ""),
+            core=data.get("core", ""),
+            objection=data.get("objection", ""),
+            closing=data.get("closing", ""),
+            tone_override=data.get("tone_override", ""),
+            language=data.get("language", "zh"),
+        ).__dict__
+        self.templates[tpl["id"]] = tpl
+        return tpl
+
+    def get_template(self, template_id: str) -> dict | None:
+        return self.templates.get(template_id)
+
+    def update_template(self, template_id: str, data: dict) -> dict | None:
+        if template_id not in self.templates:
+            return None
+        self.templates[template_id].update({k: v for k, v in data.items() if k in {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language"}})
+        return self.templates[template_id]
+
+    def delete_template(self, template_id: str) -> bool:
+        return self.templates.pop(template_id, None) is not None
 
     def get_settings(self) -> dict:
         return self.settings

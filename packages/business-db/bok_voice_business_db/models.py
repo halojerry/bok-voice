@@ -41,7 +41,22 @@ class ObjectProfile(Base):
     language: Mapped[str] = mapped_column(String(16), default="zh")
     background: Mapped[str] = mapped_column(Text, default="")
     phone: Mapped[str] = mapped_column(String(64), default="")
+    template_id: Mapped[str] = mapped_column(String(64), default="")
     status: Mapped[str] = mapped_column(String(32), default="active")
+
+
+class ConversationTemplate(Base):
+    __tablename__ = "conversation_templates"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(64), index=True)
+    name: Mapped[str] = mapped_column(String(255), default="")
+    opening: Mapped[str] = mapped_column(Text, default="")
+    core: Mapped[str] = mapped_column(Text, default="")
+    objection: Mapped[str] = mapped_column(Text, default="")
+    closing: Mapped[str] = mapped_column(Text, default="")
+    tone_override: Mapped[str] = mapped_column(String(255), default="")
+    language: Mapped[str] = mapped_column(String(16), default="zh")
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
 class ObjectTopic(Base):

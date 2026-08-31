@@ -35,6 +35,7 @@ class CreateObjectRequest(BaseModel):
     language: str = "zh"
     background: str = ""
     phone: str = ""
+    template_id: str = ""
 
 
 class ImportRequest(BaseModel):
@@ -49,7 +50,30 @@ class UpdateObjectRequest(BaseModel):
     language: str = "zh"
     background: str = ""
     phone: str = ""
+    template_id: str = ""
     status: str = "active"
+
+
+class TemplateRequest(BaseModel):
+    account_id: str = ""
+    name: str = ""
+    opening: str = ""
+    core: str = ""
+    objection: str = ""
+    closing: str = ""
+    tone_override: str = ""
+    language: str = "zh"
+
+
+class UpdateTemplateRequest(BaseModel):
+    account_id: str = ""
+    name: str = ""
+    opening: str = ""
+    core: str = ""
+    objection: str = ""
+    closing: str = ""
+    tone_override: str = ""
+    language: str = "zh"
 
 
 class PersonaRequest(BaseModel):

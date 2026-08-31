@@ -29,6 +29,8 @@ from .schemas import (
     CreateObjectRequest,
     ImportRequest,
     PersonaRequest,
+    TemplateRequest,
+    UpdateTemplateRequest,
     UpdateObjectRequest,
     UpdatePersonaRequest,
     SettingsRequest,
@@ -446,6 +448,39 @@ def delete_persona(persona_id: str) -> dict:
     if not _repo().delete_persona(persona_id):
         raise HTTPException(404, "persona not found")
     return {"persona_id": persona_id, "deleted": True}
+
+
+@app.get("/api/templates")
+def list_templates(account_id: str = "acc-001") -> list[dict]:
+    return _repo().list_templates(account_id)
+
+
+@app.get("/api/templates/{template_id}")
+def get_template(template_id: str) -> dict:
+    tpl = _repo().get_template(template_id)
+    if not tpl:
+        raise HTTPException(404, "template not found")
+    return tpl
+
+
+@app.post("/api/templates")
+def create_template(req: TemplateRequest) -> dict:
+    return _repo().create_template(req.model_dump())
+
+
+@app.put("/api/templates/{template_id}")
+def update_template(template_id: str, req: UpdateTemplateRequest) -> dict:
+    tpl = _repo().update_template(template_id, req.model_dump())
+    if not tpl:
+        raise HTTPException(404, "template not found")
+    return tpl
+
+
+@app.delete("/api/templates/{template_id}")
+def delete_template(template_id: str) -> dict:
+    if not _repo().delete_template(template_id):
+        raise HTTPException(404, "template not found")
+    return {"template_id": template_id, "deleted": True}
 
 
 @app.get("/api/supervisor/active-calls")

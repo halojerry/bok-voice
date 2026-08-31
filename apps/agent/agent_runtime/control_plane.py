@@ -25,6 +25,13 @@ class ControlPlaneClient:
         r.raise_for_status()
         return r.json()
 
+    async def get_template(self, template_id: str) -> dict:
+        r = await self._client.get(f"/api/templates/{template_id}")
+        if r.status_code == 404:
+            return {}
+        r.raise_for_status()
+        return r.json()
+
     async def get_settings(self) -> dict:
         r = await self._client.get("/api/settings", params={"internal": "1"})
         r.raise_for_status()

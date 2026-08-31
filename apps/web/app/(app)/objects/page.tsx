@@ -12,6 +12,7 @@ interface ObjectRow {
   language: string;
   background: string;
   phone: string;
+  template_id: string;
 }
 
 const EMPTY_FORM = {
@@ -20,6 +21,7 @@ const EMPTY_FORM = {
   language: "vi",
   background: "",
   phone: "",
+  template_id: "",
 };
 
 export default function ObjectsPage() {
@@ -30,6 +32,7 @@ export default function ObjectsPage() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [templates, setTemplates] = useState<Record<string, unknown>[]>([]);
 
   async function refresh() {
     setLoading(true);
@@ -46,6 +49,7 @@ export default function ObjectsPage() {
 
   useEffect(() => {
     refresh();
+    api.listTemplates(accountId).then(setTemplates).catch(() => {});
   }, [accountId]);
 
   const filtered = useMemo(() => {
@@ -88,6 +92,7 @@ export default function ObjectsPage() {
       language: row.language,
       background: row.background,
       phone: row.phone,
+      template_id: row.template_id ?? "",
     });
   }
 
@@ -185,6 +190,19 @@ export default function ObjectsPage() {
               value={form.background}
               onChange={(e) => setForm({ ...form, background: e.target.value })}
             />
+            <label className="block">
+              <span className="text-xs text-[var(--stage-muted)]">绑定话术模板</span>
+              <select
+                className="mt-1 w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none"
+                value={form.template_id}
+                onChange={(e) => setForm({ ...form, template_id: e.target.value })}
+              >
+                <option value="">不绑定</option>
+                {templates.map((t) => (
+                  <option key={String(t.id)} value={String(t.id)}>{String(t.name ?? t.id)}</option>
+                ))}
+              </select>
+            </label>
             <button className="btn-primary w-full" onClick={save}>
               {editingId ? "保存修改" : "建档"}
             </button>

@@ -74,4 +74,10 @@ export const api = {
   reportsSummary: () => request<Record<string, unknown>>("/api/reports/summary"),
   reportsCalls: () => request<Record<string, unknown>[]>("/api/reports/calls"),
   reportsUsage: () => request<Record<string, unknown>>("/api/reports/usage"),
+  listTemplates: (accountId = "acc-001") => request<Record<string, unknown>[]>(`/api/templates?account_id=${accountId}`),
+  getTemplate: (id: string) => request<Record<string, unknown>>(`/api/templates/${id}`),
+  createTemplate: (body: unknown) => request<Record<string, unknown>>("/api/templates", { method: "POST", body: JSON.stringify(body) }),
+  updateTemplate: (id: string, body: unknown) =>
+    request<Record<string, unknown>>(`/api/templates/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  deleteTemplate: (id: string) => request<Record<string, unknown>>(`/api/templates/${id}`, { method: "DELETE" }),
 };

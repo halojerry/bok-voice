@@ -93,7 +93,21 @@ class ObjectProfile:
     language: str = "zh"
     background: str = ""
     phone: str = ""
+    template_id: str = ""
     status: str = "active"
+
+
+@dataclass
+class ConversationTemplate:
+    id: str
+    account_id: str
+    name: str = ""
+    opening: str = ""
+    core: str = ""
+    objection: str = ""
+    closing: str = ""
+    tone_override: str = ""
+    language: str = "zh"
 
 
 @dataclass

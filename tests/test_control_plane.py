@@ -68,6 +68,36 @@ def test_settings_object_persona_knowledge_and_reports():
         docs = client.get("/api/knowledge", params={"account_id": "acc-001"}).json()
         assert any(d["path"].endswith("p.md") for d in docs)
 
+
+def test_conversation_template_crud_and_object_binding():
+    with TestClient(app) as client:
+        tpl = client.post(
+            "/api/templates",
+            json={
+                "account_id": "acc-001",
+                "name": "采购异议",
+                "opening": "您好，很高兴为您服务。",
+                "core": "我们支持越南语与粤语实时通话。",
+                "objection": "价格方面我们可以给出阶梯报价。",
+                "closing": "感谢您的咨询，再见。",
+                "language": "zh",
+            },
+        ).json()
+        tpl_id = tpl["id"]
+        assert client.get("/api/templates", params={"account_id": "acc-001"}).json()[0]["id"] == tpl_id
+        assert client.put(f"/api/templates/{tpl_id}", json={"name": "采购异议V2"}).json()["name"] == "采购异议V2"
+
+        obj = client.post(
+            "/api/objects",
+            params={"account_id": "acc-001"},
+            json={"display_name": "Nguyen", "template_id": tpl_id},
+        ).json()
+        assert obj["template_id"] == tpl_id
+        assert client.get(f"/api/objects/{obj['id']}").json()["template_id"] == tpl_id
+
+        assert client.delete(f"/api/templates/{tpl_id}").json()["deleted"] is True
+        assert client.get("/api/templates", params={"account_id": "acc-001"}).json() == []
+
         report = client.get("/api/reports/summary", params={"account_id": "acc-001"}).json()
         assert isinstance(report["total_calls"], int)
 
