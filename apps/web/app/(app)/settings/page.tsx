@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "@/lib/api";
 import { ErrorState, LoadingState } from "@/components/app-shell";
+import DesktopStatus from "@/components/desktop-status";
 
 type ProviderKind = "asr" | "llm" | "tts" | "vad";
 
@@ -143,6 +144,9 @@ export default function SettingsPage() {
             {ok && <span className="text-sm text-emerald-400">已保存。</span>}
             {err && <ErrorState message={err} />}
             {health && <span className="text-sm text-[var(--muted)]">{health}</span>}
+          </div>
+          <div className="lg:col-span-2">
+            <DesktopStatus />
           </div>
         </div>
       )}
