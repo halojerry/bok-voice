@@ -124,3 +124,15 @@ def test_audit_trail_records_and_queries():
         # Filtering by template id returns the same row.
         by_obj = client.get("/api/audit", params={"action": "template.create", "account_id": "acc-001"}).json()
         assert any(r["subject_id"] == tpl["id"] for r in by_obj)
+
+
+def test_setup_status_reports_model_readiness():
+    with TestClient(app) as client:
+        resp = client.get("/api/setup")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "ready" in body
+        assert isinstance(body.get("models"), list)
+        # In CI/dev the endpoint returns a structured shape even if models absent.
+        for m in body["models"]:
+            assert set(["name", "repo", "present", "required"]).issubset(m.keys())

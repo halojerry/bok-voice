@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import sys
 import uuid
 import wave
 from pathlib import Path
@@ -634,6 +635,49 @@ def list_audit(account_id: str = "", action: str = "", call_id: str = "", limit:
     if hasattr(repo, "list_audit_events"):
         return repo.list_audit_events(account_id=account_id, action=action, call_id=call_id, limit=limit)
     return []
+
+
+@app.get("/api/setup")
+def setup_status() -> dict:
+    """Report first-run model readiness for the desktop setup wizard."""
+    try:
+        import subprocess
+
+        root = Path(os.environ.get("BOK_ROOT", "."))
+        out = subprocess.run(
+            [sys.executable, str(root / "tools" / "bok.py"), "setup", "status"],
+            capture_output=True,
+            text=True,
+            cwd=str(root),
+        )
+        return _parse_setup(out.stdout)
+    except Exception as exc:
+        return {"ready": False, "models": [], "error": str(exc)}
+
+
+@app.post("/api/setup/download")
+def setup_download() -> dict:
+    """Trigger model download (best-effort; UI polls /api/setup for progress)."""
+    try:
+        import subprocess
+
+        root = Path(os.environ.get("BOK_ROOT", "."))
+        subprocess.Popen(
+            [sys.executable, str(root / "tools" / "bok.py"), "setup", "download"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=str(root),
+        )
+        return {"started": True}
+    except Exception as exc:
+        return {"started": False, "error": str(exc)}
+
+
+def _parse_setup(stdout: str) -> dict:
+    try:
+        return json.loads(stdout)
+    except Exception:
+        return {"ready": False, "models": [], "error": "unable to parse setup status"}
 
 
 @app.post("/api/supervisor/{call_id}/join")

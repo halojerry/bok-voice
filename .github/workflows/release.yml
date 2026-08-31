@@ -30,6 +30,10 @@ jobs:
         with:
           node-version: "22"
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -52,6 +56,10 @@ jobs:
       - name: Build release (script)
         shell: bash
         run: bash scripts/build_release.sh
+
+      - name: Build bundled runtime (venv/Node/LiveKit)
+        shell: bash
+        run: bash scripts/build_runtime.sh
 
       - name: Setup Tauri dependencies (Linux/macOS)
         if: runner.os == 'macOS'

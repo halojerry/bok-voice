@@ -91,6 +91,31 @@ fn python() -> String {
     }
 }
 
+/// Prefer a bundled runtime venv (packaged app), then the repo venv, then the
+/// system python. This lets a self-contained build run without any system
+/// Python installed.
+fn bundled_python(root: &PathBuf) -> String {
+    let candidates: Vec<PathBuf> = if cfg!(target_os = "windows") {
+        vec![
+            root.join("runtime/.venv/Scripts/python.exe"),
+            root.join(".venv312/Scripts/python.exe"),
+            root.join(".venv/Scripts/python.exe"),
+        ]
+    } else {
+        vec![
+            root.join("runtime/.venv/bin/python"),
+            root.join(".venv312/bin/python"),
+            root.join(".venv/bin/python"),
+        ]
+    };
+    for c in candidates {
+        if c.exists() {
+            return c.to_string_lossy().to_string();
+        }
+    }
+    python()
+}
+
 /// Spawn `python tools/bok.py <subcommand>` detached, streaming output to
 /// `app-data/logs/bok-<cmd>.log`. Returns the child pid.
 fn spawn_bok(_app: &AppHandle, root: &PathBuf, cmd_name: &str) -> Result<Child, String> {
@@ -98,18 +123,7 @@ fn spawn_bok(_app: &AppHandle, root: &PathBuf, cmd_name: &str) -> Result<Child, 
     if !bok.exists() {
         return Err(format!("bok launcher missing: {}", bok.display()));
     }
-    // Use the repo venv python if present; otherwise the system python3.
-    let use_py = if cfg!(target_os = "windows") {
-        if root.join(".venv312/Scripts/python.exe").exists() {
-            root.join(".venv312/Scripts/python.exe").to_string_lossy().to_string()
-        } else {
-            python()
-        }
-    } else if root.join(".venv312/bin/python").exists() {
-        root.join(".venv312/bin/python").to_string_lossy().to_string()
-    } else {
-        python()
-    };
+    let use_py = bundled_python(root);
     let log_dir = app_data_dir().join("logs");
     std::fs::create_dir_all(&log_dir).map_err(|e| e.to_string())?;
     let log_path = log_dir.join(format!("bok-{}.log", cmd_name));
@@ -123,6 +137,7 @@ fn spawn_bok(_app: &AppHandle, root: &PathBuf, cmd_name: &str) -> Result<Child, 
         .arg(cmd_name)
         .current_dir(root)
         .env("BOK_ROOT", root)
+        .env("BOK_PACKAGED", "1")
         .stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
         .stderr(Stdio::from(log))
         .spawn()
@@ -216,10 +231,62 @@ fn manifest(app: AppHandle) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
+fn run_bok_json(app: &AppHandle, args: &[&str]) -> Result<String, String> {
+    let root = resolve_root(app);
+    let use_py = bundled_python(&root);
+    let mut cmd = Command::new(&use_py);
+    cmd.arg(root.join("tools/bok.py"))
+        .args(args)
+        .current_dir(&root)
+        .env("BOK_ROOT", &root)
+        .env("BOK_PACKAGED", "0");
+    let out = cmd.output().map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+#[tauri::command]
+fn setup_status(app: AppHandle) -> Result<String, String> {
+    run_bok_json(&app, &["setup", "status"])
+}
+
+#[tauri::command]
+fn setup_download(app: AppHandle) -> Result<String, String> {
+    // download can be slow; run as a detached child and return quickly. The
+    // front-end polls setup_status to reflect progress.
+    let root = resolve_root(&app);
+    let use_py = bundled_python(&root);
+    let log_dir = app_data_dir().join("logs");
+    std::fs::create_dir_all(&log_dir).map_err(|e| e.to_string())?;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("bok-setup.log"))
+        .map_err(|e| e.to_string())?;
+    Command::new(&use_py)
+        .arg(root.join("tools/bok.py"))
+        .args(["setup", "download"])
+        .current_dir(&root)
+        .env("BOK_ROOT", &root)
+        .env("BOK_PACKAGED", "0")
+        .stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok("started".to_string())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState { bok: Mutex::new(None) })
-        .invoke_handler(tauri::generate_handler![health, start, stop, open_logs, manifest])
+        .invoke_handler(tauri::generate_handler![
+            health,
+            start,
+            stop,
+            open_logs,
+            manifest,
+            setup_status,
+            setup_download
+        ])
         .setup(|app| {
             let root = resolve_root(app.handle());
             let _ = spawn_bok(app.handle(), &root, "serve");

@@ -1,4 +1,5 @@
 /node_modules/
+/runtime/
 /src-tauri/target/
 /src-tauri/gen/
 /src-tauri/icons/*.icns

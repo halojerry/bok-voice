@@ -3,23 +3,22 @@
   "productName": "BokVoice",
   "version": "0.1.0",
   "identifier": "com.bokvoice.desktop",
-  "build": {
+    "build": {
     "beforeDevCommand": "",
     "devUrl": "http://localhost:3000",
     "beforeBuildCommand": "",
-    "frontendDist": "../dist"
+    "frontendDist": "../../apps/web/out"
   },
   "app": {
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Bok Voice",
+        "title": "Bok Voice 客服助手",
         "width": 1280,
         "height": 840,
         "minWidth": 960,
         "minHeight": 640,
-        "resizable": true,
-        "url": "http://localhost:3000"
+        "resizable": true
       }
     ],
     "security": {
@@ -31,7 +30,7 @@
     "targets": "all",
     "category": "Business",
     "shortDescription": "Bok Voice 客服语音助手",
-    "longDescription": "本地优先、可审计的实时客服语音助手与同声传译工作台。",
+    "longDescription": "本地优先、可审计的实时语音客服与同声传译工作台。",
     "icon": [
       "icons/icon.png",
       "icons/icon.icns",
@@ -51,7 +50,22 @@
         "language": "zh-CN"
       }
     },
-    "resources": [],
+    "resources": [
+      "../../apps/agent",
+      "../../apps/control-plane",
+      "../../packages/core",
+      "../../packages/business-db",
+      "../../packages/knowledge",
+      "../../packages/observability",
+      "../../services/qwen3-asr-sidecar",
+      "../../services/qwen3-tts-sidecar",
+      "../../services/llm-mlx",
+      "../../services/realtime-translation",
+      "../runtime",
+      "../../tools/bok.py",
+      "../../scripts/start_sidecars.sh",
+      "../../scripts/stop_sidecars.sh"
+    ],
     "externalBin": [],
     "createUpdaterArtifacts": false
   },

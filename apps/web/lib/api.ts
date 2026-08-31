@@ -84,4 +84,23 @@ export const api = {
     request<Record<string, unknown>[]>(
       `/api/audit?account_id=${encodeURIComponent(accountId)}&action=${encodeURIComponent(action)}&call_id=${encodeURIComponent(callId)}`,
     ),
+  setupStatus: () => request<SetupStatus>("/api/setup"),
+  setupDownload: () => fetch(`${CONTROL_PLANE_URL}/api/setup/download`, { method: "POST" }).then(async (res) => {
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    return res.json() as Promise<{ started: boolean }>;
+  }),
+};
+
+export type SetupModelStatus = {
+  name: string;
+  repo: string;
+  present: boolean;
+  required: boolean;
+  size_bytes?: number;
+};
+
+export type SetupStatus = {
+  ready: boolean;
+  models: SetupModelStatus[];
+  error?: string;
 };
