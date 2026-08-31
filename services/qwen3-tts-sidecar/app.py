@@ -6,6 +6,7 @@ import io
 import json
 import os
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,8 @@ class TTSService:
         self._preset_model: Any | None = None
         self._clone_model: Any | None = None
         self._clone_prompts: dict[str, Any] = {}
+        self._speaker_emb_cache: dict[str, Any] = {}
+        self._gen_lock = threading.RLock()
         self._registry: dict[str, dict[str, str]] = self._load_registry()
         self._load_error: str | None = None
 
@@ -75,6 +78,15 @@ class TTSService:
 
                 self._preset_model = mlx_load_model(DEFAULT_PRESET_MODEL)
                 self._clone_model = mlx_load_model(DEFAULT_CLONE_MODEL)
+                self._install_speaker_embedding_cache()
+                if os.environ.get("QWEN3_TTS_WARMUP", "1") == "1":
+                    # Synchronous, on the main thread during startup: MLX is
+                    # thread-safe, but audioread's CoreAudio backend used by
+                    # mlx_audio.load_audio segfaults when called from a
+                    # background thread (observed: warmup thread killed the
+                    # whole process after the sox fallback warning). Startup
+                    # blocks anyway, so warm inline is both safe and free.
+                    self._warmup()
                 return
             import torch
             from qwen_tts import Qwen3TTSModel
@@ -102,6 +114,103 @@ class TTSService:
             )
         except Exception as exc:  # pragma: no cover - model download/load can fail
             self._load_error = repr(exc)
+
+    def _install_speaker_embedding_cache(self) -> None:
+        """Cache per-reference-audio speaker embeddings on the MLX clone model.
+
+        The Base model re-runs the speech-tokenizer encoder over the reference
+        audio on every synthesis. Registered voices use a fixed file, so the
+        encoder output is identical every request. Caching by waveform bytes
+        turns the per-request 100-300ms encoder + mel pass into a dict lookup.
+        """
+        model = self._clone_model
+        if model is None or not hasattr(model, "extract_speaker_embedding"):
+            return
+        orig = model.extract_speaker_embedding
+
+        def cached(audio, *args, **kwargs):
+            key: str | None = None
+            try:
+                arr = np.asarray(audio, dtype=np.float32)
+                key = hashlib.sha1(np.ascontiguousarray(arr).tobytes()).hexdigest()
+                hit = self._speaker_emb_cache.get(key)
+                if hit is not None:
+                    return hit
+            except Exception:
+                key = None
+            emb = orig(audio, *args, **kwargs)
+            if key is not None:
+                self._speaker_emb_cache[key] = emb
+            return emb
+
+        model.extract_speaker_embedding = cached  # type: ignore[method-assign]
+
+    def _warmup(self) -> None:
+        """Absorb MLX first-call compilation + allocation so the first real
+        synthesis is as fast as steady state. Runs synchronously right after
+        load, before the server accepts requests.
+        """
+        if BACKEND != "mlx":
+            return
+        try:
+            t0 = time.perf_counter()
+            with self._gen_lock:
+                list(
+                    self._synthesize_mlx_stream(
+                        text="嗯",
+                        language="zh",
+                        voice="Vivian",
+                        instruct="",
+                        sample_rate=SAMPLE_RATE,
+                        chunk_ms=200,
+                        max_new_tokens=64,
+                        temperature=None,
+                        top_k=None,
+                    )
+                )
+                # Pre-compute speaker embeddings for registered clone voices so
+                # the first clone request after boot skips the encoder. Must go
+                # through the same loader as request-time synthesis so the
+                # waveform-hash cache key matches.
+                if self._clone_model is not None and getattr(
+                    self._clone_model, "speaker_encoder", None
+                ) is not None:
+                    for meta in self._registry.values():
+                        try:
+                            ref = meta.get("ref_audio")
+                            if ref and Path(ref).exists():
+                                self._clone_model.extract_speaker_embedding(
+                                    self._load_ref_audio_mx(ref)
+                                )
+                        except Exception:
+                            continue
+            print(
+                "QWEN3_TTS_WARMUP",
+                f"done={time.perf_counter()-t0:.2f}s",
+                f"voices_cached={len(self._speaker_emb_cache)}",
+                flush=True,
+            )
+        except Exception as exc:  # pragma: no cover - warmup must never block boot
+            print("QWEN3_TTS_WARMUP_ERR", repr(exc), flush=True)
+
+    @staticmethod
+    def _load_ref_audio_mx(path: str) -> Any:
+        """Load a clone reference audio as a 24kHz float32 MLX array.
+
+        Uses soundfile (libsndfile) + librosa resampling instead of
+        mlx_audio.load_audio, whose audioread probe prints a confusing
+        sox-missing warning and uses CoreAudio backends. Keeping the loader
+        identical between warmup and request-time synthesis makes the
+        speaker-embedding cache (keyed by waveform bytes) hit reliably.
+        """
+        import mlx.core as mx
+
+        if sf is None:
+            raise RuntimeError("soundfile not installed")
+        wav, sr = sf.read(path, dtype="float32", always_2d=False)
+        if sr != SAMPLE_RATE:
+            wav = TTSService._resample(np.asarray(wav, dtype=np.float32), sr, SAMPLE_RATE)
+        return mx.array(np.asarray(wav, dtype=np.float32))
 
     @staticmethod
     def _resolve_device() -> str:
@@ -397,7 +506,7 @@ class TTSService:
             lang = self._normalize_language(self._clone_model, language)
             yield self._clone_model, self._clone_model.generate(
                 text=text,
-                ref_audio=meta["ref_audio"],
+                ref_audio=self._load_ref_audio_mx(meta["ref_audio"]),
                 ref_text=meta["ref_text"],
                 lang_code=lang or "auto",
                 **gen_kwargs,
@@ -432,29 +541,32 @@ class TTSService:
             if max_new_tokens is not None
             else os.environ.get("QWEN3_TTS_MAX_NEW_TOKENS", "512")
         )
-        for model, gen in self._mlx_generate(
-            text=text,
-            language=language,
-            voice=voice,
-            instruct=instruct,
-            stream=False,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_k=top_k,
-        ):
-            results = list(gen)
-            wavs = [
-                np.asarray(r.audio, dtype=np.float32)
-                for r in results
-                if getattr(r, "audio", None) is not None
-            ]
-            if not wavs:
-                return b""
-            wav = np.concatenate(wavs) if len(wavs) > 1 else wavs[0]
-            if wav.ndim > 1:
-                wav = wav.mean(axis=-1)
-            return self._to_pcm16(self._resample(wav, model.sample_rate, sample_rate))
-        return b""
+        with self._gen_lock:
+            for model, gen in self._mlx_generate(
+                text=text,
+                language=language,
+                voice=voice,
+                instruct=instruct,
+                stream=False,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_k=top_k,
+            ):
+                results = list(gen)
+                wavs = [
+                    np.asarray(r.audio, dtype=np.float32)
+                    for r in results
+                    if getattr(r, "audio", None) is not None
+                ]
+                if not wavs:
+                    return b""
+                wav = np.concatenate(wavs) if len(wavs) > 1 else wavs[0]
+                if wav.ndim > 1:
+                    wav = wav.mean(axis=-1)
+                return self._to_pcm16(
+                    self._resample(wav, model.sample_rate, sample_rate)
+                )
+            return b""
 
     def _synthesize_mlx_stream(
         self,
@@ -474,33 +586,41 @@ class TTSService:
             if max_new_tokens is not None
             else os.environ.get("QWEN3_TTS_MAX_NEW_TOKENS", "512")
         )
-        interval = max(0.2, chunk_ms / 1000.0)
+        # Yield cadence for the model's streaming decoder. Independent of the
+        # HTTP frame size: 0.1s ≈ one 12Hz codec token per yield, so the first
+        # audio packet leaves the sidecar after a single decode step instead of
+        # waiting for two (the old 0.2s floor).
+        interval = max(
+            0.05,
+            float(os.environ.get("QWEN3_TTS_STREAM_INTERVAL", "0.1")),
+        )
         frame_bytes = int(sample_rate * chunk_ms / 1000) * 2
         first = True
-        for model, gen in self._mlx_generate(
-            text=text,
-            language=language,
-            voice=voice,
-            instruct=instruct,
-            stream=True,
-            streaming_interval=interval,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_k=top_k,
-        ):
-            for result in gen:
-                chunk = getattr(result, "audio", None)
-                if chunk is None:
-                    continue
-                chunk = np.asarray(chunk, dtype=np.float32)
-                if chunk.ndim > 1:
-                    chunk = chunk.mean(axis=-1)
-                pcm = self._to_pcm16(
-                    self._resample(chunk, model.sample_rate, sample_rate)
-                )
-                for i in range(0, len(pcm), frame_bytes):
-                    yield first, pcm[i : i + frame_bytes]
-                    first = False
+        with self._gen_lock:
+            for model, gen in self._mlx_generate(
+                text=text,
+                language=language,
+                voice=voice,
+                instruct=instruct,
+                stream=True,
+                streaming_interval=interval,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_k=top_k,
+            ):
+                for result in gen:
+                    chunk = getattr(result, "audio", None)
+                    if chunk is None:
+                        continue
+                    chunk = np.asarray(chunk, dtype=np.float32)
+                    if chunk.ndim > 1:
+                        chunk = chunk.mean(axis=-1)
+                    pcm = self._to_pcm16(
+                        self._resample(chunk, model.sample_rate, sample_rate)
+                    )
+                    for i in range(0, len(pcm), frame_bytes):
+                        yield first, pcm[i : i + frame_bytes]
+                        first = False
 
     @staticmethod
     def _resample(wav: np.ndarray, sr: int, target_sr: int) -> np.ndarray:

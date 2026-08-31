@@ -744,6 +744,7 @@ class _Qwen3TTSStream(tts.ChunkedStream):
                             self._tts_.sample_rate // 5
                         ) * 2  # 200ms, 16-bit mono
                         buf = bytearray()
+                        first_audio = False
                         output_emitter.initialize(
                             request_id="qwen3-tts",
                             sample_rate=self._tts_.sample_rate,
@@ -754,6 +755,18 @@ class _Qwen3TTSStream(tts.ChunkedStream):
                         output_emitter.start_segment(segment_id="qwen3-tts")
                         async for data in resp.aiter_bytes():
                             buf.extend(data)
+                            # Push the first partial frame as soon as ~40ms is
+                            # available instead of waiting for a full 200ms
+                            # buffer: the sidecar streams ~83ms model chunks
+                            # (QWEN3_TTS_STREAM_INTERVAL=0.1), so this shaves
+                            # ~150ms off the time-to-first-audio without
+                            # changing steady-state frame size.
+                            if not first_audio and len(buf) >= frame_bytes // 5:
+                                output_emitter.push(bytes(buf))
+                                output_emitter.flush()
+                                pcm_total += len(buf)
+                                buf.clear()
+                                first_audio = True
                             while len(buf) >= frame_bytes:
                                 output_emitter.push(bytes(buf[:frame_bytes]))
                                 output_emitter.flush()
