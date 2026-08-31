@@ -59,7 +59,6 @@
       "../../packages/observability",
       "../../services/qwen3-asr-sidecar",
       "../../services/qwen3-tts-sidecar",
-      "../../services/llm-mlx",
       "../../services/realtime-translation",
       "../runtime",
       "../../tools/bok.py",
