@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Package
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: mac
+            artifact: dmg
+          - os: windows-latest
+            target: windows
+            artifact: msi
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            desktop/src-tauri/target
+          key: ${{ runner.os }}-tauri-${{ hashFiles('desktop/src-tauri/Cargo.lock') }}
+
+      - name: Build release (script)
+        run: bash scripts/build_release.sh
+
+      - name: Setup Tauri dependencies (Linux/macOS)
+        if: runner.os == 'macOS'
+        run: echo "macOS Tauri deps are preinstalled on macOS runners"
+
+      - name: Install Tauri CLI
+        run: cd desktop && npm install
+
+      - name: Derive platform icons
+        run: cd desktop && npx tauri icon src-tauri/icons/icon.png
+
+      - name: Build desktop app
+        run: cd desktop && npx tauri build
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bok-voice-${{ matrix.target }}
+          path: |
+            desktop/src-tauri/target/release/bundle/**/*.${{ matrix.artifact }}
+            models.sha256.json
+
+  manifest:
+    name: Manifest + image
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Generate model manifest
+        run: python tools/bok.py manifest > models.sha256.json
+      - name: Upload manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-manifest
+          path: models.sha256.json
+      - name: Build docker images
+        run: docker compose build agent control-plane web
+
