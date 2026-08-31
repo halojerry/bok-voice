@@ -339,6 +339,44 @@ class SqlAlchemyBusinessRepository:
         self.session.commit()
         return self.get_settings()
 
+    # ---- audit trail ----
+
+    def append_audit(self, event: dict) -> dict:
+        row = models.AuditEventRecord(
+            id=event.get("event_id", _uuid()),
+            ts=event.get("ts", ""),
+            action=event.get("action", ""),
+            subject_type=event.get("subject_type", ""),
+            subject_id=event.get("subject_id", ""),
+            actor=event.get("actor", ""),
+            outcome=event.get("outcome", "ok"),
+            detail_json=json.dumps(event.get("detail", {}), ensure_ascii=False),
+            request_id=event.get("request_id", ""),
+            call_id=event.get("call_id", ""),
+            account_id=event.get("account_id", ""),
+            object_id=event.get("object_id", ""),
+            persona_id=event.get("persona_id", ""),
+        )
+        self.session.add(row)
+        self.session.commit()
+        return {"id": row.id, "action": row.action}
+
+    def list_audit_events(self, *, account_id: str = "", action: str = "", call_id: str = "", limit: int = 200) -> list[dict]:
+        stmt = select(models.AuditEventRecord)
+        if account_id:
+            stmt = stmt.filter_by(account_id=account_id)
+        if action:
+            stmt = stmt.filter_by(action=action)
+        if call_id:
+            stmt = stmt.filter_by(call_id=call_id)
+        stmt = stmt.order_by(models.AuditEventRecord.ts.desc()).limit(limit)
+        out = []
+        for row in self.session.scalars(stmt):
+            item = {c.name: getattr(row, c.name) for c in models.AuditEventRecord.__table__.columns}
+            item["detail"] = json.loads(item.pop("detail_json", "{}"))
+            out.append(item)
+        return out
+
     @staticmethod
     def default_settings() -> dict:
         return {
@@ -381,6 +419,7 @@ class InMemoryBusinessRepository:
         self.templates: dict[str, dict] = {}
         self.object_topics: dict[str, list[dict]] = {}
         self.global_insights: list[dict] = []
+        self.audit_events: list[dict] = []
         self.settings: dict = SqlAlchemyBusinessRepository.default_settings()
 
     def create_call(self, manifest: SessionManifest) -> dict:
@@ -558,3 +597,17 @@ class InMemoryBusinessRepository:
             "policy": settings.get("policy", "offline_first"),
         }
         return self.settings
+
+    def append_audit(self, event: dict) -> dict:
+        self.audit_events.insert(0, event)
+        return {"id": event.get("event_id", _uuid()), "action": event.get("action", "")}
+
+    def list_audit_events(self, *, account_id: str = "", action: str = "", call_id: str = "", limit: int = 200) -> list[dict]:
+        items = self.audit_events
+        if account_id:
+            items = [e for e in items if e.get("account_id") == account_id]
+        if action:
+            items = [e for e in items if e.get("action") == action]
+        if call_id:
+            items = [e for e in items if e.get("call_id") == call_id]
+        return items[:limit]

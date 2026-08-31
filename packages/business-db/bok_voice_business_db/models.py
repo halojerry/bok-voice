@@ -136,6 +136,30 @@ class GlobalSetting(Base):
     updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
 
 
+class AuditEventRecord(Base):
+    """Append-only business audit trail, mirrored from the JSONL sink.
+
+    Keeps a queryable copy of every audited action (voice clone, settle,
+    template/object/persona edits, settings save, knowledge import…) so the
+    UI / reports can render a traceable history without scraping log files.
+    """
+
+    __tablename__ = "audit_events"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    ts: Mapped[str] = mapped_column(String(40), index=True)
+    action: Mapped[str] = mapped_column(String(64), index=True)
+    subject_type: Mapped[str] = mapped_column(String(64), default="")
+    subject_id: Mapped[str] = mapped_column(String(128), default="")
+    actor: Mapped[str] = mapped_column(String(128), default="")
+    outcome: Mapped[str] = mapped_column(String(32), default="ok")
+    detail_json: Mapped[str] = mapped_column(Text, default="{}")
+    request_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    call_id: Mapped[str] = mapped_column(String(64), default="")
+    account_id: Mapped[str] = mapped_column(String(64), default="")
+    object_id: Mapped[str] = mapped_column(String(64), default="")
+    persona_id: Mapped[str] = mapped_column(String(64), default="")
+
+
 class UsageRecord(Base):
     __tablename__ = "usage_records"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)

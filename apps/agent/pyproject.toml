@@ -9,6 +9,7 @@ description = "Bok Voice LiveKit Agent"
 requires-python = ">=3.11"
 dependencies = [
   "bok-voice-core",
+  "bok-voice-obs",
 ]
 
 [project.optional-dependencies]

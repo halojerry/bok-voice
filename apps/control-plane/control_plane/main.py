@@ -6,6 +6,7 @@ import json
 import os
 import uuid
 import wave
+from pathlib import Path
 
 import httpx
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
@@ -22,6 +23,10 @@ from bok_voice_knowledge.knowledge import DefaultKnowledgeService
 from bok_voice_knowledge.markdown_source import LocalMarkdownSource
 from bok_voice_knowledge.vector_store import InMemoryVectorStore
 from bok_voice_business_db.vector_store import SqlVectorStore
+from bok_voice_obs.audit import AuditEvent, AuditStore, audit_store
+from bok_voice_obs.context import get_correlation
+from bok_voice_obs.logging import configure_logging, get_logger
+from bok_voice_obs.middleware import CorrelationMiddleware
 
 from .deps import build_engine, build_repository, build_session_factory
 from .schemas import (
@@ -46,6 +51,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(CorrelationMiddleware)
+
+control_log = get_logger("control-plane", component="control-plane", service="control-plane")
 
 
 def _repo() -> BusinessRepository:
@@ -73,6 +81,7 @@ def _qwen3_asr_url() -> str:
 
 @app.on_event("startup")
 def _startup() -> None:
+    configure_logging(level=os.environ.get("BOK_LOG_LEVEL", "INFO"))
     engine = build_engine()
     app.state.repo = build_repository(engine)
     app.state.session_factory = build_session_factory(engine)
@@ -93,6 +102,40 @@ def _startup() -> None:
         vector=vector,
     )
     app.state.settlement = SettlementTrigger()
+    # Mirror every JSONL audit event into the repository (SQL or in-memory) so
+    # /api/audit is queryable without scraping the file sink.
+
+    def _audit_tap(event):
+        try:
+            repo = _repo()
+            if hasattr(repo, "append_audit"):
+                repo.append_audit(event.to_dict())
+        except Exception as exc:  # pragma: no cover - audit tap must not break the hot path
+            control_log.warning("audit_db_tap_failed", extra={"event": "audit.tap.error", "data": {"error": str(exc)}})
+
+    audit_store(AuditStore(directory=_audit_dir(), tap=_audit_tap))
+
+
+def _audit_dir():
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+    else:
+        base = Path(os.environ.get("HOME", ".")) / "Library" / "Application Support"
+    return base / "BokVoice" / "audit"
+
+
+def _audit(action: str, *, subject_type: str = "", subject_id: str = "", outcome: str = "ok", account_id: str = "", detail: dict | None = None) -> dict:
+    """Emit an audit event (JSONL + optional DB copy) from a request context."""
+    detail = detail or {}
+    event = audit_store().emit(
+        action=action,
+        subject_type=subject_type,
+        subject_id=subject_id,
+        outcome=outcome,
+        account_id=account_id,
+        detail=detail,
+    )
+    return event.to_dict()
 
 
 @app.get("/health")
@@ -130,6 +173,7 @@ def put_settings(req: SettingsRequest) -> dict:
         new_values[kind] = new
     raw = new_values
     saved = _repo().save_settings(raw)
+    _audit("settings.save", subject_type="global_settings", subject_id="global", detail={"llm_provider": raw.get("llm", {}).get("provider", "")})
     masked = {k: _mask_secrets(v) for k, v in saved.items() if k != "policy"}
     masked["policy"] = saved.get("policy", "offline_first")
     return masked
@@ -210,8 +254,22 @@ async def tts_register_voice(
                 data=data,
             )
             resp.raise_for_status()
-            return resp.json()
+            body = resp.json()
+            _audit(
+                "voice.clone",
+                subject_type="tts_voice",
+                subject_id=voice_id,
+                detail={"language": language, "ref_text_len": len(ref_text), "voice_id": voice_id},
+            )
+            return body
     except Exception as exc:
+        _audit(
+            "voice.clone",
+            subject_type="tts_voice",
+            subject_id=voice_id,
+            outcome="error",
+            detail={"language": language, "error": str(exc)},
+        )
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
@@ -369,6 +427,12 @@ def settle(call_id: str) -> dict:
     except Exception as exc:  # pragma: no cover - summarizer must not break settle
         print(f"[settle] summarizer failed: {exc!r}", flush=True)
     _repo().append_settlement(call_id, result)
+    _audit(
+        "settle.create",
+        subject_type="call",
+        subject_id=call_id,
+        detail={"status": result.get("status", ""), "turns": len(turns), "has_summary": bool(result.get("summary"))},
+    )
     return _repo().get_settlement(call_id) or result
 
 
@@ -387,21 +451,27 @@ def get_object(object_id: str) -> dict:
 
 @app.post("/api/objects")
 def create_object(account_id: str, req: CreateObjectRequest) -> dict:
-    return _repo().create_object(account_id, req.model_dump())
+    obj = _repo().create_object(account_id, req.model_dump())
+    _audit("object.create", subject_type="object", subject_id=obj.get("id", ""), account_id=account_id, detail={"display_name": obj.get("display_name", "")})
+    return obj
 
 
 @app.patch("/api/objects/{object_id}")
 def update_object(object_id: str, req: UpdateObjectRequest) -> dict:
+    existing = _repo().get_object(object_id)
     obj = _repo().update_object(object_id, req.model_dump())
     if not obj:
         raise HTTPException(404, "object not found")
+    _audit("object.update", subject_type="object", subject_id=object_id, account_id=(existing or {}).get("account_id", ""), detail={"display_name": obj.get("display_name", "")})
     return obj
 
 
 @app.delete("/api/objects/{object_id}")
 def delete_object(object_id: str) -> dict:
+    existing = _repo().get_object(object_id)
     if not _repo().delete_object(object_id):
         raise HTTPException(404, "object not found")
+    _audit("object.delete", subject_type="object", subject_id=object_id, account_id=(existing or {}).get("account_id", ""))
     return {"object_id": object_id, "deleted": True}
 
 
@@ -429,7 +499,9 @@ async def delete_knowledge(knowledge_id: str, account_id: str = "acc-001") -> di
 
 @app.post("/api/knowledge/import")
 async def import_knowledge(req: ImportRequest) -> dict:
-    return await app.state.knowledge.import_document(req.account_id, req.path, req.content)
+    result = await app.state.knowledge.import_document(req.account_id, req.path, req.content)
+    _audit("knowledge.import", subject_type="knowledge", subject_id=req.path or "", detail={"account_id": req.account_id, "content_len": len(req.content)})
+    return result
 
 
 @app.get("/api/personas")
@@ -447,14 +519,18 @@ def get_persona(persona_id: str) -> dict:
 
 @app.post("/api/personas")
 def create_persona(req: PersonaRequest) -> dict:
-    return _repo().create_persona(req.model_dump())
+    persona = _repo().create_persona(req.model_dump())
+    _audit("persona.create", subject_type="persona", subject_id=persona.get("id", ""), account_id=persona.get("account_id", ""), detail={"name": persona.get("name", "")})
+    return persona
 
 
 @app.put("/api/personas/{persona_id}")
 def update_persona(persona_id: str, req: UpdatePersonaRequest) -> dict:
+    existing = _repo().get_persona(persona_id)
     persona = _repo().update_persona(persona_id, req.model_dump())
     if not persona:
         raise HTTPException(404, "persona not found")
+    _audit("persona.update", subject_type="persona", subject_id=persona_id, account_id=(existing or {}).get("account_id", ""), detail={"name": persona.get("name", "")})
     return persona
 
 
@@ -465,8 +541,10 @@ def upsert_persona(req: PersonaRequest) -> dict:
 
 @app.delete("/api/personas/{persona_id}")
 def delete_persona(persona_id: str) -> dict:
+    existing = _repo().get_persona(persona_id)
     if not _repo().delete_persona(persona_id):
         raise HTTPException(404, "persona not found")
+    _audit("persona.delete", subject_type="persona", subject_id=persona_id, account_id=(existing or {}).get("account_id", ""))
     return {"persona_id": persona_id, "deleted": True}
 
 
@@ -485,7 +563,9 @@ def get_template(template_id: str) -> dict:
 
 @app.post("/api/templates")
 def create_template(req: TemplateRequest) -> dict:
-    return _repo().create_template(req.model_dump())
+    tpl = _repo().create_template(req.model_dump())
+    _audit("template.create", subject_type="template", subject_id=tpl.get("id", ""), account_id=tpl.get("account_id", ""), detail={"name": tpl.get("name", "")})
+    return tpl
 
 
 @app.put("/api/templates/{template_id}")
@@ -493,13 +573,16 @@ def update_template(template_id: str, req: UpdateTemplateRequest) -> dict:
     tpl = _repo().update_template(template_id, req.model_dump())
     if not tpl:
         raise HTTPException(404, "template not found")
+    _audit("template.update", subject_type="template", subject_id=template_id, account_id=tpl.get("account_id", ""), detail={"name": tpl.get("name", "")})
     return tpl
 
 
 @app.delete("/api/templates/{template_id}")
 def delete_template(template_id: str) -> dict:
+    tpl = _repo().get_template(template_id)
     if not _repo().delete_template(template_id):
         raise HTTPException(404, "template not found")
+    _audit("template.delete", subject_type="template", subject_id=template_id, account_id=(tpl or {}).get("account_id", ""))
     return {"template_id": template_id, "deleted": True}
 
 
@@ -543,6 +626,14 @@ def reports_usage(account_id: str = "acc-001") -> dict:
         "tts_calls": len(calls),
         "vad_calls": len(calls),
     }
+
+
+@app.get("/api/audit")
+def list_audit(account_id: str = "", action: str = "", call_id: str = "", limit: int = 200) -> list[dict]:
+    repo = _repo()
+    if hasattr(repo, "list_audit_events"):
+        return repo.list_audit_events(account_id=account_id, action=action, call_id=call_id, limit=limit)
+    return []
 
 
 @app.post("/api/supervisor/{call_id}/join")

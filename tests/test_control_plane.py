@@ -109,3 +109,18 @@ def test_sidecar_health_routes_exist():
         tts = client.get("/api/tts/health")
         assert asr.status_code in {200, 503}
         assert tts.status_code in {200, 503}
+
+
+def test_audit_trail_records_and_queries():
+    with TestClient(app) as client:
+        # A template create is an audited action -> it should land in /api/audit.
+        tpl = client.post(
+            "/api/templates",
+            json={"account_id": "acc-001", "name": "审计模板", "opening": "您好", "core": "介绍"},
+        ).json()
+        rows = client.get("/api/audit", params={"action": "template.create"}).json()
+        assert any(r["subject_id"] == tpl["id"] for r in rows)
+        assert rows[0]["request_id"]  # correlation id is propagated
+        # Filtering by template id returns the same row.
+        by_obj = client.get("/api/audit", params={"action": "template.create", "account_id": "acc-001"}).json()
+        assert any(r["subject_id"] == tpl["id"] for r in by_obj)

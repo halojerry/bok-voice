@@ -15,6 +15,21 @@ from .plugins.settlement import SettlementTrigger
 from .providers.registry import build_provider_registry
 from .control_plane import ControlPlaneClient
 
+try:
+    from bok_voice_obs.logging import configure_logging, get_logger
+    from bok_voice_obs.context import set_correlation, Correlation
+
+    configure_logging(level=os.environ.get("BOK_LOG_LEVEL", "INFO"))
+    agent_log = get_logger("agent", component="agent", service="agent")
+except Exception:  # pragma: no cover - observability must never break the agent
+    agent_log = None
+
+
+def _agent_log(event: str, **data):
+    if agent_log:
+        agent_log.info(event, extra={"event": event, "component": "agent", "data": data})
+
+
 # 剥掉进 TTS 那一路的 <expr/> 标签（防被念出来）；转录那一路框架会自动剥离并发布 mood。
 _EXPR_TAG_RE = re.compile(r"<expr\b[^>]*?/>|<[^>]+>")
 _EXPR_PARTIAL_RE = re.compile(r"<expr\b[^>]*$")
@@ -151,6 +166,12 @@ async def entrypoint(ctx):
     try:
         call = await cp.get_call(call_id)
         account_id = call.get("account_id", "acc-001")
+        if agent_log:
+            try:
+                set_correlation(Correlation(request_id=call_id, call_id=call_id, account_id=account_id))
+            except Exception:
+                pass
+            _agent_log("agent.call.context", call_id=call_id, account_id=account_id)
         context_state = ContextState(account_id=account_id)
         object_id = call.get("object_id", "")
         persona_id = call.get("persona_id", "")

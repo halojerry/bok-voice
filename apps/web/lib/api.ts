@@ -80,4 +80,8 @@ export const api = {
   updateTemplate: (id: string, body: unknown) =>
     request<Record<string, unknown>>(`/api/templates/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteTemplate: (id: string) => request<Record<string, unknown>>(`/api/templates/${id}`, { method: "DELETE" }),
+  listAudit: (accountId = "", action = "", callId = "") =>
+    request<Record<string, unknown>[]>(
+      `/api/audit?account_id=${encodeURIComponent(accountId)}&action=${encodeURIComponent(action)}&call_id=${encodeURIComponent(callId)}`,
+    ),
 };

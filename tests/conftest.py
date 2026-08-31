@@ -8,6 +8,7 @@ for part in (
     "packages/core",
     "packages/business-db",
     "packages/knowledge",
+    "packages/observability",
     "apps/control-plane",
     "apps/agent",
 ):

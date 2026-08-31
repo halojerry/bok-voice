@@ -13,6 +13,7 @@ const NAV = [
   { href: "/translate", label: "同传" },
   { href: "/supervisor", label: "主管台" },
   { href: "/reports", label: "报表" },
+  { href: "/audit", label: "审计" },
   { href: "/settings", label: "设置" },
 ];
 
