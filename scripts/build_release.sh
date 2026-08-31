@@ -14,7 +14,7 @@ npm run build
 popd >/dev/null
 
 echo "==> [2/5] python tests"
-python -m pytest -q
+python -m pytest -q tests/
 
 echo "==> [3/5] node tests (realtime-translation)"
 pushd services/realtime-translation >/dev/null

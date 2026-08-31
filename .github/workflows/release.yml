@@ -42,7 +42,15 @@ jobs:
             desktop/src-tauri/target
           key: ${{ runner.os }}-tauri-${{ hashFiles('desktop/src-tauri/Cargo.lock') }}
 
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -e packages/core -e packages/business-db -e packages/knowledge -e packages/observability
+          pip install -e "apps/control-plane" -e "apps/agent[livekit]"
+
       - name: Build release (script)
+        shell: bash
         run: bash scripts/build_release.sh
 
       - name: Setup Tauri dependencies (Linux/macOS)
@@ -84,4 +92,3 @@ jobs:
           path: models.sha256.json
       - name: Build docker images
         run: docker compose build agent control-plane web
-
