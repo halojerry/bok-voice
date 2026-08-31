@@ -33,6 +33,21 @@ SENTIMENT_LEXICON: dict[str, list[str]] = {
     "calm": ["平静", "好的", "没问题", "请放心", "可以"],
 }
 
+# 官方 mood → Qwen3-TTS CustomVoice instruct（语音语气）。未命中回落空串。
+MOOD_INSTRUCT: dict[str, str] = {
+    "excited": "语气兴奋、热情，语速稍快",
+    "happy": "语气欢快、亲切，带笑意",
+    "playful": "语气俏皮、轻松，略带调侃",
+    "curious": "语气好奇、关注，略带疑问感",
+    "surprised": "语气惊讶、上扬",
+    "hopeful": "语气乐观、温暖，充满希望",
+    "empathetic": "语气体贴、柔和，饱含理解与安抚",
+    "sad": "语气低沉、克制，带着歉意",
+    "angry": "语气坚定、郑重，先安抚再表达立场",
+    "anxious": "语气温和、稳定，放慢节奏安抚",
+    "calm": "语气平静、自然，字正腔圆",
+}
+
 
 @dataclass
 class EmotionProcessor:
@@ -49,3 +64,13 @@ class EmotionProcessor:
         """把任意 label 规整到官方 AgentMood 11 枚举；未识别回落 calm。"""
         key = (label or "").strip().lower()
         return key if key in MOODS else "calm"
+
+
+@dataclass
+class EmotionState:
+    """共享的当前情绪状态：LLM 侧写入，TTS 侧读取合成动态语气。"""
+
+    mood: str = "calm"
+
+    def instruct_for_mood(self) -> str:
+        return MOOD_INSTRUCT.get(self.mood, "")

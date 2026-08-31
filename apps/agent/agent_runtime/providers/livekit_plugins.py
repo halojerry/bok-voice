@@ -261,6 +261,88 @@ class _ExprPrependStream(llm.LLMStream):
             self._event_ch.send_nowait(ev)
 
 
+class ContextState:
+    """Shared per-call context memory: per-turn knowledge + running summary.
+
+    Populated asynchronously by the agent's turn listener; read synchronously
+    by ``ContextAwareLLM`` to inject a compact, progressive-disclosure system
+    message (top-K snippets + bounded conversation summary) each turn.
+    """
+
+    def __init__(self, account_id: str = "", max_snippets: int = 3, max_summary_chars: int = 800):
+        self.account_id = account_id
+        self._max_snippets = max_snippets
+        self._max_summary_chars = max_summary_chars
+        self._snippets: list[str] = []
+        self._summary_lines: list[str] = []
+
+    def set_knowledge(self, snippets: list[dict]) -> None:
+        seen: set[str] = set()
+        out: list[str] = []
+        for s in snippets or []:
+            text = str(s.get("text", "") or "").strip()
+            if text and text not in seen:
+                seen.add(text)
+                out.append(text)
+            if len(out) >= self._max_snippets:
+                break
+        self._snippets = out
+
+    def add_summary(self, role: str, text: str, max_char: int = 200) -> None:
+        line = f"{role}: {str(text)[:max_char]}"
+        self._summary_lines.append(line)
+        joined = "\n".join(self._summary_lines)
+        while len(joined) > self._max_summary_chars and len(self._summary_lines) > 1:
+            self._summary_lines.pop(0)
+            joined = "\n".join(self._summary_lines)
+
+    def render_system_message(self) -> str:
+        parts: list[str] = []
+        if self._snippets:
+            parts.append("【实时检索到的资料】\n" + "\n".join(f"- {s}" for s in self._snippets))
+        if self._summary_lines:
+            parts.append("【本通对话记忆】\n" + "\n".join(self._summary_lines[-8:]))
+        return "\n\n".join(parts)
+
+
+class ContextAwareLLM(llm.LLM):
+    """Injects progressive-disclosure knowledge + bounded conversation memory
+    as a system message before every LLM call, keeping the prompt short.
+    """
+
+    provider = "context-aware"
+
+    def __init__(self, inner: llm.LLM, context_state: ContextState | None = None):
+        super().__init__()
+        self._inner = inner
+        self._ctx = context_state
+
+    def chat(
+        self,
+        *,
+        chat_ctx,
+        tools=None,
+        conn_options=None,
+        parallel_tool_calls=None,
+        tool_choice=None,
+        extra_kwargs=None,
+    ):
+        if self._ctx is not None:
+            msg = self._ctx.render_system_message()
+            if msg:
+                copy = chat_ctx.copy()
+                copy.add_message(role="system", content=msg)
+                chat_ctx = copy
+        return self._inner.chat(
+            chat_ctx=chat_ctx,
+            tools=tools,
+            conn_options=conn_options,
+            parallel_tool_calls=parallel_tool_calls,
+            tool_choice=tool_choice,
+            extra_kwargs=extra_kwargs,
+        )
+
+
 class ExprAwareLLM(llm.LLM):
     """确定性 mood 通道（Path B 的兜底保障，见 AGENT.md §3）。
 
@@ -273,12 +355,13 @@ class ExprAwareLLM(llm.LLM):
 
     provider = "expr-aware"
 
-    def __init__(self, inner: llm.LLM):
+    def __init__(self, inner: llm.LLM, emotion_state=None):
         super().__init__()
         self._inner = inner
         from ..plugins.emotion import EmotionProcessor
 
         self._emotion = EmotionProcessor()
+        self._emotion_state = emotion_state
 
     def chat(self, *, chat_ctx, tools=None, conn_options=None, parallel_tool_calls=None, tool_choice=None, extra_kwargs=None):
         last_user = ""
@@ -286,7 +369,10 @@ class ExprAwareLLM(llm.LLM):
             if getattr(item, "role", None) == "user":
                 last_user = getattr(item, "text_content", None) or ""
                 break
-        tag = f'<expr type="expression" label="{self._emotion.classify(last_user)}"/>'
+        mood = self._emotion.classify(last_user)
+        if self._emotion_state is not None:
+            self._emotion_state.mood = mood
+        tag = f'<expr type="expression" label="{mood}"/>'
         inner = self._inner.chat(
             chat_ctx=chat_ctx,
             tools=tools,
@@ -680,6 +766,7 @@ class Qwen3TTSTTS(tts.TTS):
         voice: str | dict = "",
         language_state: LanguageState | None = None,
         instruct: str = "",
+        emotion_state=None,
         sample_rate: int = 24000,
     ):
         super().__init__(
@@ -691,6 +778,12 @@ class Qwen3TTSTTS(tts.TTS):
         self._voice = voice
         self._language_state = language_state or LanguageState()
         self._instruct = instruct
+        self._emotion_state = emotion_state
+
+    def _resolve_instruct(self) -> str:
+        # 把当前情绪映射为动态语气指令，与静态 instruct 一起传给 CustomVoice。
+        parts = [p for p in (self._instruct, (self._emotion_state.instruct_for_mood() if self._emotion_state else "")) if p]
+        return "；".join(parts)
 
     def synthesize(self, text, *, conn_options=None):
         return _Qwen3TTSStream(self, text, conn_options or APIConnectOptions())
@@ -726,7 +819,7 @@ class _Qwen3TTSStream(tts.ChunkedStream):
                                 "input": self._text,
                                 "voice": self._tts_._resolve_voice(),
                                 "language": self._tts_._language_state.lang,
-                                "instruct": self._tts_._instruct,
+                                "instruct": self._tts_._resolve_instruct(),
                                 "sample_rate": self._tts_.sample_rate,
                                 "response_format": "pcm",
                                 "streaming": True,

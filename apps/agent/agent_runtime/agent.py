@@ -120,12 +120,6 @@ def _instructions(
         if tpl_lines:
             prefix = f"对话模板「{tpl_name}」：" if tpl_name else "对话模板："
             parts.append(prefix + "；".join(tpl_lines) + "。严格按模板组织回应。")
-    if snippets:
-        parts.append("以下是产品资料：")
-        for s in snippets[:5]:
-            text = s.get("text", "")
-            if text:
-                parts.append(f"- {text}")
     if history:
         parts.append(f"上次聊到：{history}")
     parts.append(
@@ -153,9 +147,11 @@ async def entrypoint(ctx):
     object_card: dict | None = None
     template: dict | None = None
     snippets: list[dict] = []
+    context_state = ContextState(account_id="acc-001")
     try:
         call = await cp.get_call(call_id)
         account_id = call.get("account_id", "acc-001")
+        context_state = ContextState(account_id=account_id)
         object_id = call.get("object_id", "")
         persona_id = call.get("persona_id", "")
         if object_id:
@@ -167,13 +163,14 @@ async def entrypoint(ctx):
             persona = await cp.get_persona(persona_id)
         query = (object_card or {}).get("background") or "产品介绍"
         snippets = await cp.search_knowledge(query, account_id, 5)
+        # 初始上下文：接通时按对象背景预载少量知识；后续每轮按用户问题实时覆盖。
+        context_state.set_knowledge(snippets)
     except Exception as e:
         print(f"[agent] context resolve failed ({room_name}): {e}", flush=True)
 
     instructions = _instructions(
         persona=persona,
         object_card=object_card,
-        snippets=snippets,
         template=template,
     )
 
@@ -197,12 +194,17 @@ async def entrypoint(ctx):
         OllamaLLM,
         Qwen3ASRSTT,
         Qwen3TTSTTS,
+        ContextAwareLLM,
+        ContextState,
         ScriptedLLM,
         SherpaSenseVoiceSTT,
         VolcanoTTS,
     )
 
     language_state = LanguageState()
+    from ..plugins.emotion import EmotionState
+
+    emotion_state = EmotionState()
     use_fake = os.environ.get("USE_FAKE_MEDIA") == "1"
 
     if use_fake:
@@ -252,6 +254,7 @@ async def entrypoint(ctx):
                 voice=voice_map,
                 language_state=language_state,
                 instruct=tts_cfg.get("instruct") or "",
+                emotion_state=emotion_state,
                 sample_rate=int(tts_cfg.get("sample_rate") or 24000),
             )
         else:
@@ -301,7 +304,10 @@ async def entrypoint(ctx):
 
     # 确定性 mood 通道：无论模型是否遵守「吐 <expr> 标签」的指令，
     # ExprAwareLLM 都会在每次回复前强制前置标签，保证转录发布 lk.expression。
-    llm_provider = ExprAwareLLM(llm_provider)
+    llm_provider = ContextAwareLLM(
+        ExprAwareLLM(llm_provider, emotion_state=emotion_state),
+        context_state=context_state,
+    )
 
     session = AgentSession(
         vad=vad_provider,
@@ -346,10 +352,30 @@ async def entrypoint(ctx):
             return
         asyncio.create_task(cp.add_turn(call_id, role, _clean_transcript(text)))
 
+    async def _async_update_context(role, text):
+        # 渐进披露：每轮按用户当前问题实时检索，覆盖初始知识，并维护整场对话摘要。
+        try:
+            if role == "user":
+                hits = await cp.search_knowledge(text, context_state.account_id, 5)
+                context_state.set_knowledge(hits)
+            context_state.add_summary(role, _clean_transcript(text))
+        except Exception as exc:  # pragma: no cover - context must not break turns
+            print(f"[agent] context update failed: {exc!r}", flush=True)
+
+    def _on_item_for_context(ev):
+        item = getattr(ev, "item", None)
+        role = getattr(item, "role", None)
+        if role not in ("user", "assistant"):
+            return
+        text = getattr(item, "text_content", None) or getattr(item, "raw_text_content", "") or ""
+        if text:
+            asyncio.create_task(_async_update_context(role, text))
+
     def _on_close(ev):
         asyncio.create_task(cp.settle(call_id))
 
     session.on("conversation_item_added", _on_conversation_item)
+    session.on("conversation_item_added", _on_item_for_context)
     session.on("close", _on_close)
 
     agent = Agent(instructions=instructions or "你是 Bok Voice 客服助手。")
