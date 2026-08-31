@@ -38,7 +38,7 @@ function AgentStateLabel({ state }: { state: string }) {
 }
 
 /**
- * 官方 Agents UI 会话面板：AgentAudioVisualizerGrid（情绪驱动颜色）+ 官方控制条。
+ * 官方 Agents UI 会话面板：LiveKit Aura 可视化（情绪驱动颜色）+ 官方控制条。
  * 转写暂用 useTranscriptions 自绘（视觉已对齐官方；官方 AgentChatTranscript 需 Tailwind v4，见 AGENT.md）。
  */
 function LiveAgentPanel() {
@@ -48,20 +48,32 @@ function LiveAgentPanel() {
   const agentIdentity = identity ?? "agent";
   const recent = useMemo(() => transcriptions.slice(-16).reverse(), [transcriptions]);
   const agentState = state ?? "connecting";
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    scrollRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [recent]);
+  const speaking = agentState === "speaking";
 
   return (
     <div className="flex h-full flex-1 flex-col">
       {/* 转写时间线（官方风格：mono、按说话者着色） */}
-      <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-1 py-2">
+      <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-1 py-2">
         {recent.length === 0 && (
           <div className="flex flex-1 items-center justify-center font-mono text-[10px] font-bold uppercase tracking-[0.16em] text-[var(--stage-muted)]">
             等待对话…
+          </div>
+        )}
+        {speaking && recent.length > 0 && (
+          <div className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.14em] text-[var(--stage-value)]">
+            <span className="h-1.5 w-1.5 rounded-full bg-[var(--stage-value)] animate-pulse" />
+            AI 说话中
           </div>
         )}
         {recent.map((t, i) => {
           const identity = t.participantInfo?.identity ?? "";
           const text = String(t.text ?? "");
           const isAgent = identity === agentIdentity;
+          const ts = t.streamInfo?.timestamp ? new Date(t.streamInfo.timestamp).toLocaleTimeString([], { hour12: false }) : "";
           return (
             <div key={`${identity}-${i}`} className={`flex ${isAgent ? "justify-start" : "justify-end"}`}>
               <div
@@ -72,12 +84,14 @@ function LiveAgentPanel() {
                 }`}
               >
                 <span className="mr-1.5 font-bold uppercase">{isAgent ? "AGENT" : "YOU"}</span>
+                {ts && <span className="ml-1 mr-1 opacity-60">{ts}</span>}
                 {text}
               </div>
             </div>
           );
         })}
       </div>
+      <div ref={scrollRef} />
 
       {/* 中央：官方点阵可视化（mood 驱动色） */}
       <div className="flex flex-col items-center gap-3 py-4">

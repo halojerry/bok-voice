@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * 官方 Agent 可视化接口：官方 AgentAudioVisualizerGrid（shader 点阵，官方 agents 页同款）
+ * 官方 Agent 可视化接口：LiveKit Aura 可视化（shader 点阵，官方 agents 页同款，vendored 版）
  * + 情绪驱动颜色（useMoodColor）+ 可选的情绪文案叠层。
  * mood 为 null 时用中性色 #1FD5F9。
  */

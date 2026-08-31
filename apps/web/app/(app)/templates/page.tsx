@@ -117,7 +117,7 @@ export default function TemplatesPage() {
                       <div className="min-w-0">
                         <p className="font-medium">{String(row.name ?? "-")}</p>
                         <p className="mt-1 text-xs text-[var(--muted)]">
-                          {LANGS.find((l) => l[0] === String(row.language ?? "zh"))?.[1] ?? row.language}
+                          {LANGS.find((l) => l[0] === String(row.language ?? "zh"))?.[1] ?? String(row.language ?? "zh")}
                           {String(row.tone_override ?? "") && ` · 语气 ${String(row.tone_override)}`}
                         </p>
                       </div>
