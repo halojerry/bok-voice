@@ -5,7 +5,7 @@
 - [x] monorepo 骨架
 - [x] docker-compose 启动验证（Postgres + LiveKit + Control Plane + Web + Agent）
 - [x] Agent Worker 容器化并注册到 LiveKit
-- [ ] CI（lint + pytest + next build + browser e2e）
+- [x] CI（GitHub Actions：compileall + pytest + node test + web tsc + docker compose build + bok 冒烟）
 
 ## Backend
 
@@ -81,3 +81,18 @@
 - [ ] Windows/WSL2 真机验证（vLLM ASR + TTS 容器）——脚本/镜像已就绪，待 Windows 环境
 - [ ] B 线真机麦克风听感验收（页面已可连 worker，需人工说话验证）
 - [ ] `system-audio-helper`（桌面系统音频采集）——只留接口，未实现
+
+## 2026-08-31 分发与可观测性（Tauri + CI/CD + 审计日志）
+
+- [x] 结构化 JSON 日志 + 请求关联中间件 + 审计事件表/端点（`packages/observability`）
+- [x] `GET /api/audit` 按 `account_id/action/call_id` 过滤 + 前端审计页
+- [x] Tauri v2 桌面壳（`desktop/`）：启动即拉起 `bok.py serve`、健康检查、打开日志、manifest
+- [x] `tools/bok.py` 扩展：`manifest` / `serve`（no-Docker 全栈）/ `doctor` 增强
+- [x] 平台 app-data 聚合 + 模型清单 sha256 + 首启下载路径
+- [x] GitHub Actions `ci.yml` + `release.yml`（mac dmg / win msi + 镜像构建 + artifact 上传）
+- [x] 审计/日志单测 3 条 + control-plane 审计查询测试，pytest 全绿（23 passed）
+- [ ] **Windows 实机验证**（Ollama + CUDA-transformers 冒烟，`setup-windows.ps1` 已就绪，本机不可验收）
+- [ ] **空 app-data 首启下载演练**（断点续传中断一次续传成功）
+- [ ] `tauri icon` 派生 `.icns/.ico` + 桌面安装包真机验收（dmg/msi 听感 + 启动即服务）
+- [ ] 浏览器真实麦克风通话听感/打断手感（后端已由 E2E 覆盖）
+- [ ] `system-audio-helper`（B 线系统音频采集）

@@ -7,6 +7,8 @@ __pycache__/
 node_modules/
 .next/
 dist/
+!desktop/dist/
+!desktop/dist/index.html
 build/
 *.egg-info/
 .env

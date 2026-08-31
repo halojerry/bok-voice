@@ -103,3 +103,18 @@ cd tools/browser-e2e && node trilingual.mjs   # 期望 TRILINGUAL_E2E 3/3 PASSED
 ## 状态
 
 当前为可运行、可测试的工程骨架：接口、领域模型、repository、control-plane、LiveKit agent 骨架、Web 基座均以 Fake/占位实现保证无 Key 可跑。真实 sherpa / GPT-SoVITS / 火山 / 讯飞 / DeepSeek / Ollama 分别通过对应 Provider 适配器接入。
+
+## 桌面分发（Tauri）+ 可审计日志
+
+- **Tauri 桌壳** (`desktop/`)：打开应用即拉起本机服务 `python tools/bok.py serve`（no-Docker 全栈），
+  主窗口指向 `http://localhost:3000`；健康检查 / 打开日志 / 模型清单通过 `health/start/stop/open_logs/manifest` 命令暴露。
+- **app-data 集中**：mac `~/Library/Application Support/BokVoice`，win `%LOCALAPPDATA%\BokVoice`；
+  模型首启下载（`bok.py download`）落 `app-data/models`，不进入仓库。
+- **结构化日志 + 审计**：`packages/observability` 提供 JSONL 日志（含
+  `request_id/call_id/account_id/object_id` 关联字段）、请求关联中间件、只追加审计事件；
+  业务操作（语音克隆/结算/话术/对象/人设/知识导入/设置）自动落 `app-data/audit/YYYY-MM-DD.jsonl`
+  并同步 `audit_events` 表，`GET /api/audit` 可查询，前端「审计」页可浏览。
+- **CI/CD** (`.github/workflows`)：`ci.yml` 跑 pytest/node/tsc/docker/bok/rust；
+  `release.yml` 在 tag `v*` 构建 mac `dmg` + win `msi`，并输出 `models.sha256.json` 模型清单。
+
+桌面壳本地开发与打包步骤见 `desktop/README.md`。

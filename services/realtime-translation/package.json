@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test",
+    "test": "node --test \"test/*.test.js\"",
+    "test:real": "node scripts/real-ws-test.mjs",
     "start": "node server.mjs",
     "demo": "node demo.mjs"
   },

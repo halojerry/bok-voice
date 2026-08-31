@@ -1,0 +1,64 @@
+# Bok Voice 桌面壳（Tauri）
+
+把本地优先的 Bok 客服语音助手 + 同声传译做成一套可分发的桌面应用：
+用户安装后打开应用即拉起本机服务，无需手配模型/端口/环境变量。
+
+## 它做什么
+
+- 启动一次 `python tools/bok.py serve`，幂等拉起 `control-plane(:8000)`、
+  `web(:3000)`、`asr(:8787)`、`tts(:8788)`、`llm(:1235)`、`b-line(:8790)`，
+  及可选的 `livekit(:7880)`。
+- 主窗口指向 `http://localhost:3000`（网页工作台），服务未就绪时显示启动页并自动跳转。
+- 通过 `@tauri-apps/api` 桥接把服务健康、日志目录、模型清单暴露给前端。
+- 模型首启下载走 `tools/bok.py download`，全部落在平台级 `app-data` 目录；
+  macOS `~/Library/Application Support/BokVoice`，Windows `%LOCALAPPDATA%\BokVoice`。
+
+## 本机开发
+
+```bash
+# 1. 生成图标（仅一次）
+python3 desktop/scripts/gen_icon.py
+
+# 2. 安装 Tauri CLI
+cd desktop && npm install
+
+# 3. 派生 icns/ico（CI 也会做）
+cd desktop && npm run icons
+
+# 4. 开发（自动启动 web dev）
+#    先单独起好 web：cd apps/web && npm run dev
+cd desktop && npm run dev
+```
+
+真机验证（打包 dmg）：
+
+```bash
+cd desktop && npm run build
+# 产物: desktop/src-tauri/target/release/bundle/dmg/BokVoice_0.1.0_*.dmg
+```
+
+## 目录结构
+
+```text
+desktop/
+  package.json          # tauri CLI 入口
+  src/bridge.ts         # 前端调 Tauri 命令的桥
+  src-tauri/
+    Cargo.toml
+    tauri.conf.json
+    src/main.rs
+    src/lib.rs          # 服务编排 / 健康检查 / 打开日志 / manifest
+    icons/
+    capabilities/default.json
+  dist/index.html       # 兜底启动页（窗口未指向 web 时）
+```
+
+## 可审计性
+
+- 所有服务日志为结构化 JSONL：`app-data/logs/app.jsonl`（按组件滚动、含
+  `request_id/call_id/account_id/object_id` 关联字段）。
+- 业务审计写入 `app-data/audit/YYYY-MM-DD.jsonl`（只追加），并在有数据库时同步
+  到 `audit_events` 表，可通过 `/api/audit` 查询。
+
+> 注意：`desktop` 是“壳 + 编排”，真实模型权重由 `bok.py download` 拉取，
+> 不作为仓库内容（≈13GB）。
