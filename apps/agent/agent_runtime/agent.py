@@ -89,7 +89,7 @@ def _instructions(
     *,
     persona: dict | None,
     object_card: dict | None,
-    snippets: list[dict],
+    snippets: list[dict] | None = None,
     history: str = "",
     template: dict | None = None,
 ) -> str:
@@ -134,7 +134,7 @@ def _instructions(
 async def entrypoint(ctx):
     """LiveKit Agent job entrypoint (must be module-level for pickling)."""
     from livekit.agents import Agent, AgentSession, TurnHandlingOptions, inference, stt
-    from .providers.livekit_plugins import DeepSeekLLM, ExprAwareLLM, OllamaLLM
+    from .providers.livekit_plugins import ContextState, DeepSeekLLM, ExprAwareLLM, OllamaLLM
 
     room_name = ctx.room.name
     call_id = os.environ.get("AGENT_CALL_ID") or room_name
@@ -202,7 +202,7 @@ async def entrypoint(ctx):
     )
 
     language_state = LanguageState()
-    from ..plugins.emotion import EmotionState
+    from .plugins.emotion import EmotionState
 
     emotion_state = EmotionState()
     use_fake = os.environ.get("USE_FAKE_MEDIA") == "1"
