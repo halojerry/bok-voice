@@ -38,11 +38,37 @@ fn is_up(port: u16) -> bool {
     TcpStream::connect_timeout(&format!("127.0.0.1:{}", port).parse().unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap()), Duration::from_millis(600)).is_ok()
 }
 
+/// Recursively walk a directory (bounded depth) to locate a relative path such
+/// as `tools/bok.py` or `runtime/.venv/bin/python`. Tauri v2 maps `../` resource
+/// paths to nested `_up_` directories (each `..` becomes one `_up_`), so a repo
+/// checkout's `../../` resources land under e.g. `_up_/_up_/tools/bok.py`.
+fn find_in_bundle(root: &PathBuf, rel: &str, depth: usize) -> Option<PathBuf> {
+    if depth == 0 {
+        return None;
+    }
+    let direct = root.join(rel);
+    if direct.exists() {
+        return Some(direct);
+    }
+    for entry in std::fs::read_dir(root).ok()? {
+        if let Ok(entry) = entry {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = find_in_bundle(&path, rel, depth - 1) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Resolve the repository root that contains `tools/bok.py`.
-///
+/// 
 /// Order:
 ///   1. BOK_ROOT env var (CI / forked dev)
-///   2. Tauri resource dir (packaged app, resources assigned to bundle)
+///   2. Tauri resource dir (packaged app); searches nested `_up_` dirs because
+///      Tauri v2 collapses `../` resource paths into `_up_` directories.
 ///   3. `desktop/src-tauri` parent.paren two levels up in a dev clone
 fn resolve_root(app: &AppHandle) -> PathBuf {
     if let Ok(v) = std::env::var("BOK_ROOT") {
@@ -52,12 +78,11 @@ fn resolve_root(app: &AppHandle) -> PathBuf {
         }
     }
     if let Ok(res) = app.path().resource_dir() {
-        let p = res.join("desktop");
-        if p.join("tools/bok.py").exists() {
-            return p.parent().map(|x| x.to_path_buf()).unwrap_or(p);
-        }
-        if res.join("tools/bok.py").exists() {
-            return res;
+        // Search the whole resource tree (usually a couple of `_up_` levels).
+        if let Some(bok) = find_in_bundle(&res, "tools/bok.py", 6) {
+            if let Some(parent) = bok.parent() {
+                return parent.to_path_buf();
+            }
         }
     }
     // Dev build: CARGO_MANIFEST_DIR is `desktop/src-tauri`; the repo root is
@@ -95,22 +120,31 @@ fn python() -> String {
 /// system python. This lets a self-contained build run without any system
 /// Python installed.
 fn bundled_python(root: &PathBuf) -> String {
-    let candidates: Vec<PathBuf> = if cfg!(target_os = "windows") {
-        vec![
-            root.join("runtime/.venv/Scripts/python.exe"),
-            root.join(".venv312/Scripts/python.exe"),
-            root.join(".venv/Scripts/python.exe"),
-        ]
-    } else {
-        vec![
-            root.join("runtime/.venv/bin/python"),
-            root.join(".venv312/bin/python"),
-            root.join(".venv/bin/python"),
-        ]
-    };
-    for c in candidates {
-        if c.exists() {
-            return c.to_string_lossy().to_string();
+    // The bundled runtime may sit one or more `_up_` levels above the
+    // `tools/bok.py` parent (Tauri flattens `../` into `_up_`). Walk root and its
+    // ancestors to find a `runtime/.venv` python.
+    let mut ancestors = vec![root.clone()];
+    let mut cur = root.clone();
+    for _ in 0..4 {
+        if let Some(parent) = cur.parent() {
+            ancestors.push(parent.to_path_buf());
+            cur = parent.to_path_buf();
+        }
+    }
+    for dir in &ancestors {
+        let py = if cfg!(target_os = "windows") {
+            dir.join("runtime/.venv/Scripts/python.exe")
+        } else {
+            dir.join("runtime/.venv/bin/python")
+        };
+        if py.exists() {
+            return py.to_string_lossy().to_string();
+        }
+        for candidate in [".venv312/bin/python", ".venv/bin/python"] {
+            let c = dir.join(candidate);
+            if c.exists() {
+                return c.to_string_lossy().to_string();
+            }
         }
     }
     python()

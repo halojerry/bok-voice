@@ -36,6 +36,26 @@ def is_packaged() -> bool:
     return os.environ.get("BOK_PACKAGED") == "1"
 
 
+def runtime_root() -> Path:
+    """Locate the bundled runtime dir (venv/node/livekit).
+
+    Tauri v2 collapses `../` resource paths into `_up_` directories. `tools/`,
+    `services/`, `packages/` live at ``<res>/_up_/_up_/`` (2 levels of `..`),
+    while `runtime/` sits at ``<res>/_up_/runtime`` (1 level of `..`). So the
+    runtime is one level above the code root; search ROOT and its ancestors.
+    """
+    cur = ROOT
+    for _ in range(5):
+        cand = cur / "runtime"
+        if (cand / ".venv").exists() or (cand / "livekit-server").exists() or (cand / "livekit-server.exe").exists():
+            return cand
+        parent = cur.parent
+        if parent == cur:
+            break
+        cur = parent
+    return ROOT / "runtime"
+
+
 def app_data_dir() -> Path:
     if os.name == "nt":
         base = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
@@ -78,12 +98,12 @@ def sidecar_python(name: str) -> Path:
     """
     if os.name == "nt":
         cands = [
-            ROOT / "runtime" / ".venv" / "Scripts" / "python.exe",
+            runtime_root() / ".venv" / "Scripts" / "python.exe",
             ROOT / "services" / name / ".venv" / "Scripts" / "python.exe",
         ]
     else:
         cands = [
-            ROOT / "runtime" / ".venv" / "bin" / "python",
+            runtime_root() / ".venv" / "bin" / "python",
             ROOT / "services" / name / ".venv" / "bin" / "python",
         ]
     for c in cands:
@@ -102,14 +122,14 @@ def repo_python() -> Path:
     """Pick a Python interpreter that can import control_plane + obs packages."""
     if os.name == "nt":
         candidates = [
-            ROOT / "runtime" / ".venv" / "Scripts" / "python.exe",
+            runtime_root() / ".venv" / "Scripts" / "python.exe",
             ROOT / ".venv312" / "Scripts" / "python.exe",
             ROOT / ".venv" / "Scripts" / "python.exe",
             Path(sys.executable),
         ]
     else:
         candidates = [
-            ROOT / "runtime" / ".venv" / "bin" / "python",
+            runtime_root() / ".venv" / "bin" / "python",
             ROOT / ".venv312" / "bin" / "python",
             ROOT / ".venv" / "bin" / "python",
             Path(sys.executable),
@@ -123,11 +143,11 @@ def repo_python() -> Path:
 def bundled_node() -> str | None:
     """Return a bundled Node binary if present (packaged app), else None."""
     if os.name == "nt":
-        cand = ROOT / "runtime" / "node" / "node.exe"
-        cand2 = ROOT / "runtime" / "node.exe"
+        cand = runtime_root() / "node" / "node.exe"
+        cand2 = runtime_root() / "node.exe"
     else:
-        cand = ROOT / "runtime" / "node" / "bin" / "node"
-        cand2 = ROOT / "runtime" / "bin" / "node"
+        cand = runtime_root() / "node" / "bin" / "node"
+        cand2 = runtime_root() / "bin" / "node"
     for c in (cand, cand2):
         if c.exists():
             return str(c)
@@ -136,7 +156,7 @@ def bundled_node() -> str | None:
 
 def bundled_node_modules() -> Path | None:
     """Return the bundled B-line node_modules dir, if present."""
-    for c in (ROOT / "runtime" / "bline-node_modules", ROOT / "services" / "realtime-translation" / "node_modules"):
+    for c in (runtime_root() / "bline-node_modules", ROOT / "services" / "realtime-translation" / "node_modules"):
         if c.exists():
             return c
     return None
@@ -466,9 +486,9 @@ def cmd_serve() -> int:
 def _embedded_livekit() -> Path | None:
     """Return the embedded LiveKit server binary in a packaged app, if any."""
     if os.name == "nt":
-        cand = ROOT / "runtime" / "livekit-server.exe"
+        cand = runtime_root() / "livekit-server.exe"
     else:
-        cand = ROOT / "runtime" / "livekit-server"
+        cand = runtime_root() / "livekit-server"
     return cand if cand.exists() else None
 
 
