@@ -59,9 +59,12 @@ RUNTIME_PY="$STD_PY"
 if [ ! -x "$STD_PY" ]; then
   echo "==> [runtime] fetching python-build-standalone …"
   PY_VERSION="20260825"
+  # python-build-standalone assets use `aarch64`, not `arm64`.
+  PY_ARCH="$ARCH"
+  [ "$PY_ARCH" = "arm64" ] && PY_ARCH=aarch64
   case "$OS" in
-    mac) PY_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PY_VERSION}/cpython-3.12.14%2B${PY_VERSION}-${ARCH}-apple-darwin-install_only.tar.gz" ;;
-    linux) PY_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PY_VERSION}/cpython-3.12.14%2B${PY_VERSION}-${ARCH}-unknown-linux-gnu-install_only.tar.gz" ;;
+    mac) PY_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PY_VERSION}/cpython-3.12.14%2B${PY_VERSION}-${PY_ARCH}-apple-darwin-install_only.tar.gz" ;;
+    linux) PY_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PY_VERSION}/cpython-3.12.14%2B${PY_VERSION}-${PY_ARCH}-unknown-linux-gnu-install_only.tar.gz" ;;
     win) PY_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PY_VERSION}/cpython-3.12.14%2B${PY_VERSION}-x86_64-pc-windows-msvc-install_only.tar.gz" ;;
   esac
   echo "    resolved: $PY_URL"
