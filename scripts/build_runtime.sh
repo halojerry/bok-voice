@@ -19,6 +19,13 @@ mkdir -p "$RUNTIME"
 PY_STANDALONE="$RUNTIME/python"
 VENV="$RUNTIME/.venv"
 
+# Use the standalone CPython directly as the runtime (no venv). A venv created
+# from it records an absolute `pyvenv.cfg home` that breaks when the bundle is
+# moved/installed on another machine. The standalone interpreter is fully
+# relocatable (stdlib lives in ./lib/python3.12) and packages install into its
+# own site-packages. This is the reliable self-contained runtime.
+RUNTIME_PY="$PY_STANDALONE/bin/python3"
+
 # --- Python ---------------------------------------------------------------
 # Prefer a relocatable standalone CPython. This is the only way a bundled venv
 # works on a machine without a system Python (no absolute /opt/hostedtoolcache).
@@ -74,30 +81,24 @@ if ! "$BASE_PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1
   exit 1
 fi
 
-echo "==> [runtime] creating relocatable venv ($BASE_PY) …"
-if [ ! -d "$VENV" ]; then
-  "$BASE_PY" -m venv --copies "$VENV"
-fi
-VENV_PY="$VENV/bin/python"
-[ -x "$VENV_PY" ] || VENV_PY="$VENV/Scripts/python.exe"
-
-"$VENV_PY" -m pip install --upgrade pip
+echo "==> [runtime] installing deps into standalone python ($RUNTIME_PY) …"
+"$RUNTIME_PY" -m pip install --upgrade pip
 echo "==> [runtime] installing control-plane + sidecar deps …"
-"$VENV_PY" -m pip install --no-cache-dir \
+"$RUNTIME_PY" -m pip install --no-cache-dir \
   -e packages/core -e packages/business-db -e packages/knowledge -e packages/observability \
   -e apps/control-plane -e "apps/agent[livekit]"
 # Sidecar deps (ASR/TTS use fastapi+uvicorn+numpy etc. which are already pulled,
 # but install their requirements to be safe for the platforms that need them).
 for name in qwen3-asr-sidecar qwen3-tts-sidecar; do
   if [ -f "services/$name/requirements.txt" ]; then
-    "$VENV_PY" -m pip install --no-cache-dir -r "services/$name/requirements.txt" || \
+    "$RUNTIME_PY" -m pip install --no-cache-dir -r "services/$name/requirements.txt" || \
       echo "    (warn) $name requirements install had issues; continuing"
   fi
 done
 # Pin transformers last so a single coherent version wins (ASR/Qwen-TTS both
 # import fine across 4.57.3/4.57.6; a deterministic pin silences the resolver
 # conflict and keeps the bundled venv reproducible).
-"$VENV_PY" -m pip install --no-cache-dir "transformers==4.57.6" || \
+"$RUNTIME_PY" -m pip install --no-cache-dir "transformers==4.57.6" || \
   echo "    (warn) transformers pin had issues; continuing"
 
 # --- Node (B-line worker) --------------------------------------------------

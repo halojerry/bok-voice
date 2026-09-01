@@ -47,7 +47,13 @@ def runtime_root() -> Path:
     cur = ROOT
     for _ in range(5):
         cand = cur / "runtime"
-        if (cand / ".venv").exists() or (cand / "livekit-server").exists() or (cand / "livekit-server.exe").exists():
+        if (
+            (cand / "python" / "bin" / "python3").exists()
+            or (cand / "python" / "python.exe").exists()
+            or (cand / ".venv").exists()
+            or (cand / "livekit-server").exists()
+            or (cand / "livekit-server.exe").exists()
+        ):
             return cand
         parent = cur.parent
         if parent == cur:
@@ -98,12 +104,12 @@ def sidecar_python(name: str) -> Path:
     """
     if os.name == "nt":
         cands = [
-            runtime_root() / ".venv" / "Scripts" / "python.exe",
+            runtime_root() / "python" / "python.exe",
             ROOT / "services" / name / ".venv" / "Scripts" / "python.exe",
         ]
     else:
         cands = [
-            runtime_root() / ".venv" / "bin" / "python",
+            runtime_root() / "python" / "bin" / "python3",
             ROOT / "services" / name / ".venv" / "bin" / "python",
         ]
     for c in cands:
@@ -122,14 +128,14 @@ def repo_python() -> Path:
     """Pick a Python interpreter that can import control_plane + obs packages."""
     if os.name == "nt":
         candidates = [
-            runtime_root() / ".venv" / "Scripts" / "python.exe",
+            runtime_root() / "python" / "python.exe",
             ROOT / ".venv312" / "Scripts" / "python.exe",
             ROOT / ".venv" / "Scripts" / "python.exe",
             Path(sys.executable),
         ]
     else:
         candidates = [
-            runtime_root() / ".venv" / "bin" / "python",
+            runtime_root() / "python" / "bin" / "python3",
             ROOT / ".venv312" / "bin" / "python",
             ROOT / ".venv" / "bin" / "python",
             Path(sys.executable),

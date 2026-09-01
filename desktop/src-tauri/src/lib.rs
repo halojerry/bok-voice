@@ -133,12 +133,21 @@ fn bundled_python(root: &PathBuf) -> String {
     }
     for dir in &ancestors {
         let py = if cfg!(target_os = "windows") {
+            dir.join("runtime/python/python.exe")
+        } else {
+            dir.join("runtime/python/bin/python3")
+        };
+        if py.exists() {
+            return py.to_string_lossy().to_string();
+        }
+        // Fallback to the older venv layout (for backend/tests that still build it).
+        let venv_py = if cfg!(target_os = "windows") {
             dir.join("runtime/.venv/Scripts/python.exe")
         } else {
             dir.join("runtime/.venv/bin/python")
         };
-        if py.exists() {
-            return py.to_string_lossy().to_string();
+        if venv_py.exists() {
+            return venv_py.to_string_lossy().to_string();
         }
         for candidate in [".venv312/bin/python", ".venv/bin/python"] {
             let c = dir.join(candidate);
