@@ -60,6 +60,7 @@
       "../../services/qwen3-asr-sidecar",
       "../../services/qwen3-tts-sidecar",
       "../../services/realtime-translation",
+      "../../services/livekit-server",
       "../runtime",
       "../../tools/bok.py",
       "../../runtime-manifest.json"

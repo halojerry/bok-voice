@@ -80,8 +80,11 @@ fn resolve_root(app: &AppHandle) -> PathBuf {
     if let Ok(res) = app.path().resource_dir() {
         // Search the whole resource tree (usually a couple of `_up_` levels).
         if let Some(bok) = find_in_bundle(&res, "tools/bok.py", 6) {
-            if let Some(parent) = bok.parent() {
-                return parent.to_path_buf();
+            // bok.py lives at <root>/tools/bok.py -> root is two levels up.
+            if let Some(tools) = bok.parent() {
+                if let Some(root) = tools.parent() {
+                    return root.to_path_buf();
+                }
             }
         }
     }
