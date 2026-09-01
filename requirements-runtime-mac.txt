@@ -16,4 +16,5 @@ hf_transfer>=0.1
 mlx==0.32.2
 mlx-audio==0.5.0
 mlx-lm==0.31.3
-transformers==4.57.6
+# transformers 由 mlx-audio(>=5.14.0)/mlx-lm(>=5.0.0) 解析，不手动钉版本。
+sentencepiece>=0.2

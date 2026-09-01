@@ -378,7 +378,8 @@ def cmd_download() -> int:
         kwargs: dict = {}
         if key == "windows" and name == "llm":
             kwargs["allow_patterns"] = WINDOWS_LLM_GGUF_PATTERNS
-        snapshot_download(repo_id=repo, local_dir=str(target), resume_download=True, **kwargs)
+        # hf_hub 1.x 自动断点续传，无需显式 resume_download。
+        snapshot_download(repo_id=repo, local_dir=str(target), **kwargs)
         print(f"  [ok]   {name} downloaded")
     return 0
 

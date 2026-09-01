@@ -90,6 +90,12 @@ if [ "$OS" = "win" ]; then
 fi
 # shellcheck disable=SC2086
 "$RUNTIME_PY" -m pip install --no-cache-dir $EXTRA_INDEX -r "$REQ"
+if [ "$OS" = "win" ]; then
+  # qwen-asr pins transformers==4.57.6 (matches the file); qwen-tts pins
+  # 4.57.3, so install it with --no-deps to break the unresolvable conflict.
+  "$RUNTIME_PY" -m pip install --no-cache-dir $EXTRA_INDEX "qwen-asr>=0.0.6"
+  "$RUNTIME_PY" -m pip install --no-cache-dir --no-deps $EXTRA_INDEX "qwen-tts>=0.1.1"
+fi
 # Non-editable project installs (no CI-absolute .pth files; bundled source is
 # also reachable via PYTHONPATH).
 "$RUNTIME_PY" -m pip install --no-cache-dir \
