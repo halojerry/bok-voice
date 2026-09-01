@@ -92,6 +92,7 @@ jobs:
         run: cd desktop && npx tauri icon src-tauri/icons/icon.png
 
       - name: Build desktop app
+        shell: bash
         run: |
           cd desktop
           if [ "$RUNNER_OS" = "Windows" ]; then

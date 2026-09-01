@@ -57,11 +57,13 @@ if [ "$mode" = "--doctor" ]; then
   echo "==> run bundled doctor"
   RES="$APP/Contents/Resources"
   PY=$(find "$RES" -path '*/runtime/python/bin/python3' 2>/dev/null | head -1)
-  CODE_ROOT=$(dirname "$(find "$RES" -path '*/tools/bok.py' 2>/dev/null | head -1)")
-  check "code root found" test -n "$CODE_ROOT"
+  BOK_PATH=$(find "$RES" -path '*/tools/bok.py' 2>/dev/null | head -1)
+  TOOLS_DIR=$(dirname "$BOK_PATH")
+  REPO_ROOT=$(dirname "$TOOLS_DIR")
+  check "code root found" test -n "$REPO_ROOT"
   check "bundle python found" test -n "$PY"
-  if [ -n "$PY" ] && [ -n "$CODE_ROOT" ]; then
-    BOK_PACKAGED=1 BOK_ROOT="$CODE_ROOT" BOK_RESOURCE_DIR="$RES" "$PY" "$CODE_ROOT/tools/bok.py" doctor || FAIL=1
+  if [ -n "$PY" ] && [ -n "$REPO_ROOT" ]; then
+    BOK_PACKAGED=1 BOK_ROOT="$REPO_ROOT" BOK_RESOURCE_DIR="$RES" "$PY" "$BOK_PATH" doctor || FAIL=1
   else
     FAIL=1
   fi
