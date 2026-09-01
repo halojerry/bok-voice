@@ -97,7 +97,12 @@ jobs:
             # MSI bundling of the large self-contained runtime.
             npx tauri build --bundles nsis
           else
-            npx tauri build --bundles dmg
+            # Bundle as a macOS .app only. `create-dmg` (bundle_dmg.sh) fails on
+            # the macos runner for the large self-contained runtime (hdiutil mount
+            # round-trip times out on GB-scale images); the .app is enough and we
+            # zip it for distribution.
+            npx tauri build --bundles app
+            zip -r -y "BokVoice-mac.zip" "src-tauri/target/release/bundle/macos/BokVoice.app" >/dev/null
           fi
 
       - name: Upload artifacts
@@ -106,6 +111,7 @@ jobs:
           name: bok-voice-${{ matrix.target }}
           path: |
             desktop/src-tauri/target/release/bundle/**/*
+            desktop/BokVoice-mac.zip
             models.sha256.json
 
   manifest:
@@ -154,7 +160,7 @@ jobs:
           gh release delete "${TAG}" --yes 2>/dev/null || true
           # Collect installers + manifest.
           ASSETS=()
-          for f in $(find release-assets -type f \( -name '*.dmg' -o -name '*.exe' -o -name '*.msi' -o -name 'models.sha256.json' \)); do
+          for f in $(find release-assets -type f \( -name '*.dmg' -o -name '*.exe' -o -name '*.msi' -o -name '*.zip' -o -name 'models.sha256.json' \)); do
             ASSETS+=("$f")
           done
           gh release create "${TAG}" \
