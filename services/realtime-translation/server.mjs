@@ -26,7 +26,7 @@ import { EnergyVAD } from "./src/providers/energy-vad.js";
 import { MockASR, MockTranslator, MockTTS } from "./src/providers/mock.js";
 import { Qwen3ASRProvider } from "./src/providers/qwen3-asr.js";
 import { Qwen3TTSProvider } from "./src/providers/qwen3-tts.js";
-import { OllamaTranslator } from "./src/providers/ollama.js";
+import { LocalOpenAITranslator } from "./src/providers/local-openai.js";
 import { DashScopeTranslator } from "./src/providers/dashscope.js";
 
 function send(ws, obj) {
@@ -39,13 +39,12 @@ function buildTranslator(provider, config) {
     try {
       return new DashScopeTranslator();
     } catch (err) {
-      console.warn("[worker] DashScope unavailable, falling back to Ollama:", err.message);
+      console.warn("[worker] DashScope unavailable, falling back to local LLM:", err.message);
     }
   }
-  return new OllamaTranslator({
+  return new LocalOpenAITranslator({
     baseUrl: t.base_url,
     model: t.model,
-    think: Boolean(t.think),
   });
 }
 

@@ -12,22 +12,16 @@ foreach ($name in @("qwen3-asr-sidecar", "qwen3-tts-sidecar")) {
   if (-not (Test-Path $venvPy)) {
     python -m venv (Join-Path $Root "services\$name\.venv")
     & $venvPy -m pip install --upgrade pip
-    & $venvPy -m pip install -r (Join-Path $Root "services\$name\requirements.txt")
+    & $venvPy -m pip install --extra-index-url https://download.pytorch.org/whl/cu124 -r (Join-Path $Root "requirements-runtime-win.txt")
   }
 }
 
 Write-Host "[bok] installing web + realtime-translation deps …"
 Push-Location (Join-Path $Root "apps\web")
-npm install
+npm ci
 Pop-Location
 Push-Location (Join-Path $Root "services\realtime-translation")
-npm install
+npm ci
 Pop-Location
 
-# ollama is the LLM backend on Windows.
-if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
-  Write-Warning "[bok] ollama not on PATH — install from https://ollama.com/download/windows"
-}
-
 Write-Host "[bok] Windows setup complete. Next: python tools/bok.py download"
-

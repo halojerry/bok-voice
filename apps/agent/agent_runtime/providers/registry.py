@@ -12,7 +12,7 @@ def build_provider_registry() -> ProviderRegistry:
     registry.register("asr", "sherpa", FakeASR())
     registry.register("asr", "iflytek", FakeASR())
     registry.register("asr", "volcano", FakeASR())
-    registry.register("llm", "ollama", FakeLLM())
+    registry.register("llm", "local_openai", FakeLLM())
     registry.register("llm", "deepseek", FakeLLM())
     registry.register("asr", "qwen3_asr", FakeASR())
     registry.register("tts", "qwen3_tts", FakeTTS())

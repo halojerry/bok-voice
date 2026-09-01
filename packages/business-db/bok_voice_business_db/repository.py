@@ -387,7 +387,9 @@ class SqlAlchemyBusinessRepository:
                 "backend": "transformers",
                 "language": "zh",
             },
-            "llm": {"provider": "ollama", "model": "huihui_ai/qwen3.5-abliterated:9b"},
+            # Packaged/dev default: local OpenAI-compatible LLM on :1235
+            # (mlx_lm on macOS, llama-server on Windows). Zero-Ollama.
+            "llm": {"provider": "local_openai", "model": "local", "base_url": "http://127.0.0.1:1235/v1"},
             "tts": {
                 "provider": "qwen3_tts",
                 "model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",

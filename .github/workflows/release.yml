@@ -8,20 +8,25 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Package
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: macos-14
             target: mac
-            artifact: dmg
+            artifact: mac
           - os: windows-latest
             target: windows
-            artifact: msi
+            artifact: exe
     steps:
       - uses: actions/checkout@v4
 
@@ -32,6 +37,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
 
       - uses: actions/setup-go@v5
         with:
@@ -49,42 +56,37 @@ jobs:
             desktop/src-tauri/target
           key: ${{ runner.os }}-tauri-${{ hashFiles('desktop/src-tauri/Cargo.lock') }}
 
-      # 复用上一轮构建好的运行时光（venv/Node/LiveKit）与依赖缓存，
-      # 避免每个平台从零下载 ~1.8GB 依赖（这是之前 Windows 打包慢的主因）。
       - name: Cache bundled runtime + dependency caches
         uses: actions/cache@v4
         with:
           path: |
             desktop/runtime
+            desktop/src-tauri/binaries
             ~/.cache/pip
             services/realtime-translation/node_modules
             ~/.cache/go-build
             ~/go/pkg/mod
-          # v2: bust the cache so the relocatable-standalone-python runtime is
-          # rebuilt (previous cached venv used a non-relocatable framework Python).
-          key: ${{ runner.os }}-runtime-v2-${{ hashFiles('packages/**/pyproject.toml','apps/**/pyproject.toml','services/*/requirements.txt','services/realtime-translation/package-lock.json') }}
+          key: ${{ runner.os }}-runtime-v3-${{ hashFiles('requirements-runtime-*.txt','packages/**/pyproject.toml','apps/**/pyproject.toml','services/realtime-translation/package-lock.json') }}
 
-      - name: Install Python deps
+      - name: Install Python deps (runner, for tests/manifest)
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
           pip install -e packages/core -e packages/business-db -e packages/knowledge -e packages/observability
           pip install -e "apps/control-plane" -e "apps/agent[livekit]"
 
-      - name: Build release (script)
+      - name: Build release assets (web export + icons + manifest; tests already ran in CI)
         shell: bash
+        env:
+          SKIP_TESTS: "1"
         run: bash scripts/build_release.sh
 
-      - name: Build bundled runtime (venv/Node/LiveKit)
+      - name: Build bundled runtime (Python/Node/LiveKit/llama)
         shell: bash
         run: bash scripts/build_runtime.sh
 
-      - name: Setup Tauri dependencies (Linux/macOS)
-        if: runner.os == 'macOS'
-        run: echo "macOS Tauri deps are preinstalled on macOS runners"
-
       - name: Install Tauri CLI
-        run: cd desktop && npm install
+        run: cd desktop && npm ci
 
       - name: Derive platform icons
         run: cd desktop && npx tauri icon src-tauri/icons/icon.png
@@ -93,17 +95,30 @@ jobs:
         run: |
           cd desktop
           if [ "$RUNNER_OS" = "Windows" ]; then
-            # NSIS installers (.exe) are faster than WiX MSI and avoid the slow
-            # MSI bundling of the large self-contained runtime.
             npx tauri build --bundles nsis
           else
-            # Bundle as a macOS .app only. `create-dmg` (bundle_dmg.sh) fails on
-            # the macos runner for the large self-contained runtime (hdiutil mount
-            # round-trip times out on GB-scale images); the .app is enough and we
-            # zip it for distribution.
             npx tauri build --bundles app
             zip -r -y "BokVoice-mac.zip" "src-tauri/target/release/bundle/macos/BokVoice.app" >/dev/null
           fi
+
+      - name: Verify bundle (staging)
+        shell: bash
+        run: bash scripts/verify_bundle.sh --staging
+
+      - name: Verify built app + bundled doctor (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          bash scripts/verify_bundle.sh --app desktop/src-tauri/target/release/bundle/macos/BokVoice.app
+          bash scripts/verify_bundle.sh --doctor desktop/src-tauri/target/release/bundle/macos/BokVoice.app
+
+      - name: Verify Windows artifacts (llama-server CUDA + NSIS)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          ls -la desktop/runtime/llama/ | head -20
+          desktop/runtime/llama/llama-server.exe --version
+          test -f desktop/src-tauri/target/release/bundle/nsis/*.exe && echo "NSIS exe present"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -113,11 +128,13 @@ jobs:
             desktop/src-tauri/target/release/bundle/**/*
             desktop/BokVoice-mac.zip
             models.sha256.json
+          retention-days: 7
 
   manifest:
-    name: Manifest + image
+    name: Manifest
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -130,13 +147,13 @@ jobs:
         with:
           name: model-manifest
           path: models.sha256.json
-      - name: Build docker images
-        run: docker compose build agent control-plane web
+          retention-days: 7
 
   publish:
     name: Publish GitHub Release
     needs: [build, manifest]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:
@@ -152,19 +169,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Tag name (strip leading 'v' for display)
           TAG="${GITHUB_REF_NAME}"
           VERSION="${TAG#v}"
           echo "==> creating release for tag ${TAG} (version ${VERSION})"
-          # Delete existing release if re-running (artifact regeneration).
           gh release delete "${TAG}" --yes 2>/dev/null || true
-          # Collect installers + manifest.
           ASSETS=()
           for f in $(find release-assets -type f \( -name '*.dmg' -o -name '*.exe' -o -name '*.msi' -o -name '*.zip' -o -name 'models.sha256.json' \)); do
             ASSETS+=("$f")
           done
           gh release create "${TAG}" \
             --title "Bok Voice ${VERSION}" \
-            --notes "自包含桌面发行：内嵌前端/运行时/Go 编译 livekit-server；模型首启下载。" \
+            --notes "自包含桌面发行：内嵌前端/运行时/二进制；模型首启下载；零 Ollama/零 Docker。" \
             "${ASSETS[@]}"
           echo "==> release created"

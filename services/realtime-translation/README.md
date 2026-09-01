@@ -7,15 +7,15 @@ TTS 流 / 播放队列），调度模型对齐“金喜同传”的 `PlaybackChu
 
 ## 运行
 
-前置：Qwen3-ASR `:8787` 与 Qwen3-TTS `:8788` sidecar 已启动
-（仓库根目录 `./scripts/start_sidecars.sh`），Ollama 可用（本地翻译）。
+前置：Qwen3-ASR `:8787`、Qwen3-TTS `:8788` 与本地 LLM `:1235`（OpenAI 兼容）
+已启动（统一入口：仓库根目录 `python tools/bok.py serve`）。
 
 ```bash
 npm install          # 需要 ws（离线缓存亦可）
 npm test             # 单元 + WebSocket 集成测试
 npm run start        # 启动 worker，ws://localhost:8790
 node demo.mjs        # 多通道 mock 演示（backlog/chase/drop）
-node demo.mjs --real # 真实 Qwen3-ASR + Ollama + Qwen3-TTS 演示
+node demo.mjs --real # 真实 Qwen3-ASR + 本地 LLM + Qwen3-TTS 演示
 ```
 
 Web 面板：`http://localhost:3000/translate`（顶栏「同传」），
@@ -34,5 +34,5 @@ Web 面板：`http://localhost:3000/translate`（顶栏「同传」），
 
 ## 配置
 
-`config.json`：asr / translator(ollama|dashscope) / tts / server。
-DashScope 翻译需 `DASHSCOPE_API_KEY`，缺失时 worker 自动回退 Ollama。
+`config.json`：asr / translator(local_openai|dashscope) / tts / server。
+DashScope 翻译需 `DASHSCOPE_API_KEY`，缺失时 worker 自动回退本地 LLM。

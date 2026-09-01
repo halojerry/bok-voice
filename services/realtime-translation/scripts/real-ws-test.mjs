@@ -1,6 +1,6 @@
 // B 线真实链路集成验证（需 sidecar 8787/8788 + worker 8790 已启动）：
 //   测试音频 → WS audio 分块 → EnergyVAD 切句 → Qwen3-ASR →
-//   Ollama 翻译 → Qwen3-TTS → subtitle/audio 事件 + metrics JSONL
+//   本地 LLM 翻译（OpenAI 兼容 :1235）→ Qwen3-TTS → subtitle/audio 事件 + metrics JSONL
 // 运行：node scripts/real-ws-test.mjs
 
 import { readFileSync, existsSync, statSync } from "node:fs";
@@ -10,7 +10,7 @@ import WebSocket from "ws";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const WS_URL = process.env.WS_URL || "ws://127.0.0.1:8790";
-const AUDIO_DIR = resolve(ROOT, "data/test-audio");
+const AUDIO_DIR = resolve(ROOT, "tests/fixtures/audio");
 const METRICS_FILE = resolve(ROOT, "data/translation-metrics.jsonl");
 const CHANNELS = [
   { id: "real-zh-en", sourceLang: "zh", targetLang: "en", file: "zh.wav" },

@@ -34,7 +34,7 @@ def ms(t0: float) -> str:
 
 
 def measure_asr(client: httpx.Client) -> None:
-    pcm = read_wav_pcm(ROOT / "data/test-audio/zh.wav")
+    pcm = read_wav_pcm(ROOT / "tests/fixtures/audio/zh.wav")
     t0 = time.perf_counter()
     s = client.post(f"{ASR}/api/start", timeout=30).json()["session_id"]
     for i in range(0, len(pcm), 3200):

@@ -1,0 +1,20 @@
+{
+  "version": "0.1.0",
+  "zero_ollama": true,
+  "runtime": {
+    "python": { "min_version": "3.12", "source": "python-build-standalone 20260825" },
+    "node": { "version": "22.23.2", "role": "B-line worker" },
+    "livekit": { "version": "v1.13.6", "source": "win/linux: official zip; mac: Homebrew or source" },
+    "llama_cuda": { "tag": "b10733", "cuda": "12.4", "platform": "windows", "note": "NVIDIA driver >= 550, VRAM >= 8GB; no CPU fallback" },
+    "python_deps_mac": "requirements-runtime-mac.txt",
+    "python_deps_win": "requirements-runtime-win.txt"
+  },
+  "external_bin": ["livekit-server", "node"],
+  "ports": { "control_plane": 8000, "web": 3000, "asr": 8787, "tts": 8788, "llm": 1235, "b_line": 8790, "livekit": 7880 },
+  "defaults": {
+    "llm": { "provider": "local_openai", "base_url": "http://127.0.0.1:1235/v1" },
+    "bind": "127.0.0.1",
+    "db": "sqlite:///<app-data>/bok_voice.db",
+    "vault": "<app-data>/vault"
+  }
+}

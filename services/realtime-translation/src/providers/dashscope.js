@@ -1,6 +1,6 @@
 // Qwen-MT via Alibaba DashScope (cloud fallback translator for the B line).
 // Requires DASHSCOPE_API_KEY; when absent the worker server falls back to
-// the local Ollama translator.
+// the local OpenAI-compatible translator.
 
 const DEFAULT_OPTS = {
   apiKey: process.env.DASHSCOPE_API_KEY || "",

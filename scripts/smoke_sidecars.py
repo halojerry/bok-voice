@@ -25,7 +25,7 @@ import httpx
 ROOT = Path(__file__).resolve().parents[1]
 ASR = "http://127.0.0.1:8787"
 TTS = "http://127.0.0.1:8788"
-AUDIO_DIR = ROOT / "data" / "test-audio"
+AUDIO_DIR = ROOT / "tests" / "fixtures" / "audio"
 OUT_DIR = ROOT / "data" / "smoke-out"
 
 

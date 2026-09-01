@@ -76,12 +76,10 @@ class DeepSeekLLM(OpenAICompatLLM):
 
 
 class MlxLlmLLM(OpenAICompatLLM):
-    """Local MLX LLM served by our own mlx_lm OpenAI-compatible server.
+    """Local OpenAI-compatible LLM (mlx_lm on macOS, llama-server on Windows).
 
-    Serves the same huihui Qwen3.5 9B weights via `python -m mlx_lm server`
-    with `--chat-template-args '{"enable_thinking":false}'`, which avoids the
-    LM Studio engine bug that forces thinking mode on Qwen3.5 models. Warm
-    replies are ~1s vs 4.5s+ when thinking is stuck on.
+    Both servers expose /v1 on 127.0.0.1:1235 and run with thinking disabled
+    (enable_thinking=false), so replies are fast and content-only.
     """
 
     provider = "mlx"
@@ -91,89 +89,14 @@ class MlxLlmLLM(OpenAICompatLLM):
         self,
         api_key="mlx",
         model=None,
-        base_url="http://host.docker.internal:1235/v1",
+        base_url="http://127.0.0.1:1235/v1",
     ):
         super().__init__(
             api_key=api_key,
-            model=model
-            or os.environ.get(
-                "MLX_LLM_MODEL",
-                "/Users/halo/.lmstudio/models/huihui-ai/Huihui-Qwen3.5-9B-abliterated-mlx-4bit",
-            ),
+            model=model or os.environ.get("MLX_LLM_MODEL", "local"),
             base_url=base_url
-            or os.environ.get("MLX_LLM_BASE_URL", "http://host.docker.internal:1235/v1"),
+            or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
         )
-
-
-class OllamaLLM(llm.LLM):
-    """Local Ollama via the native /api/chat endpoint.
-
-    Qwen3.x models default to thinking mode: every reply spends the token
-    budget on `reasoning` (which OpenAI-compat surfaces in a separate field),
-    leaving the actual answer empty and taking minutes per turn. The native
-    endpoint accepts `"think": false`, which makes replies fast and content-only.
-    """
-
-    provider = "ollama"
-    model = "huihui_ai/qwen3.5-abliterated:9b"
-
-    def __init__(self, base_url="http://host.docker.internal:11434/v1", model="huihui_ai/qwen3.5-abliterated:9b", api_key="ollama"):
-        super().__init__()
-        self._base_url = str(base_url or "").rstrip("/")
-        if self._base_url.endswith("/v1"):
-            self._base_url = self._base_url[:-3]
-        self.model = model
-        self._think = os.environ.get("OLLAMA_THINK", "0") == "1"
-        self._max_tokens = int(os.environ.get("LLM_MAX_TOKENS", "256"))
-
-    def chat(self, *, chat_ctx, tools=None, conn_options=None, parallel_tool_calls=None, tool_choice=None, extra_kwargs=None):
-        messages = _chat_messages(chat_ctx)
-        return _OllamaNativeStream(self, chat_ctx, messages, conn_options or APIConnectOptions())._real
-
-
-class _OllamaNativeStream:
-    def __init__(self, plugin, chat_ctx, messages, conn_options):
-        class _Stream(llm.LLMStream):
-            async def _run(self):
-                print("OLLAMA_REQUEST_START", flush=True)
-                try:
-                    async with httpx.AsyncClient(timeout=180) as client:
-                        async with client.stream(
-                            "POST",
-                            f"{plugin._base_url}/api/chat",
-                            json={
-                                "model": plugin.model,
-                                "messages": messages,
-                                "stream": True,
-                                "think": plugin._think,
-                                "options": {"num_predict": plugin._max_tokens},
-                            },
-                        ) as resp:
-                            resp.raise_for_status()
-                            async for line in resp.aiter_lines():
-                                if not line.strip():
-                                    continue
-                                try:
-                                    obj = json.loads(line)
-                                except json.JSONDecodeError:
-                                    continue
-                                content = (obj.get("message") or {}).get("content") or ""
-                                if content:
-                                    print("OLLAMA_REPLY_CHUNK", len(content), flush=True)
-                                    self._event_ch.send_nowait(
-                                        llm.ChatChunk(
-                                            id=str(obj.get("model", "ollama")),
-                                            delta=llm.ChoiceDelta(content=content, role="assistant"),
-                                        )
-                                    )
-                except asyncio.CancelledError:
-                    # 会话关闭时取消流式响应；不吞异常，让框架正常收尾。
-                    raise
-
-        self._real = _Stream(llm=plugin, chat_ctx=chat_ctx, tools=[], conn_options=conn_options)
-
-    def __aiter__(self):
-        return self._real
 
 
 class ScriptedLLM(llm.LLM):
@@ -223,7 +146,7 @@ class _OpenAICompatStream:
     def __init__(self, plugin, chat_ctx, messages, conn_options, max_tokens=256):
         class _Stream(llm.LLMStream):
             async def _run(self):
-                print("OLLAMA_REQUEST_START", flush=True)
+                print("LLM_REQUEST_START", flush=True)
                 try:
                     stream = await plugin._client.chat.completions.create(
                         model=plugin._model,
@@ -233,7 +156,7 @@ class _OpenAICompatStream:
                     )
                     async for chunk in stream:
                         if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                            print("OLLAMA_REPLY_CHUNK", len(chunk.choices[0].delta.content), flush=True)
+                            print("LLM_REPLY_CHUNK", len(chunk.choices[0].delta.content), flush=True)
                             delta = llm.ChoiceDelta(content=chunk.choices[0].delta.content, role="assistant")
                             self._event_ch.send_nowait(llm.ChatChunk(id=getattr(chunk, "id", "stream"), delta=delta))
                 except asyncio.CancelledError:

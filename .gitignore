@@ -9,6 +9,8 @@ node_modules/
 apps/web/out/
 release-artifacts/
 dist/
+desktop/runtime/
+desktop/src-tauri/binaries/
 !desktop/dist/
 !desktop/dist/index.html
 build/

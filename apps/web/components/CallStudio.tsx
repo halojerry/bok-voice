@@ -128,7 +128,7 @@ function IdleStage() {
 
 const PROVIDER_NOTE: [string, string][] = [
   ["ASR", "Qwen3-ASR"],
-  ["LLM", "Ollama"],
+  ["LLM", "本地 LLM"],
   ["TTS", "Qwen3-TTS"],
   ["VAD", "Silero"],
 ];

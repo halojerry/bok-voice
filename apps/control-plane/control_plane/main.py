@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
@@ -91,7 +92,7 @@ def _startup() -> None:
     app.state.lk_url = os.environ.get("LIVEKIT_URL", "ws://localhost:7880")
     vault = os.environ.get("VAULT_ROOT", "./data/vault")
     embedder = CharHashEmbedding(384)
-    if engine is not None:
+    if engine is not None and getattr(engine.dialect, "name", "") != "sqlite":
         from sqlalchemy.orm import sessionmaker
 
         session_factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
@@ -102,6 +103,12 @@ def _startup() -> None:
         markdown=LocalMarkdownSource(vault),
         vector=vector,
     )
+    if isinstance(vector, InMemoryVectorStore):
+        # SQLite 路径：业务数据落盘，知识向量启动时从 vault 重建（幂等）。
+        try:
+            asyncio.get_event_loop().create_task(_rebuild_in_memory_knowledge(vector, vault))
+        except Exception as exc:  # pragma: no cover
+            control_log.warning("knowledge_rebuild_failed", extra={"data": {"error": str(exc)}})
     app.state.settlement = SettlementTrigger()
     # Mirror every JSONL audit event into the repository (SQL or in-memory) so
     # /api/audit is queryable without scraping the file sink.
@@ -115,6 +122,30 @@ def _startup() -> None:
             control_log.warning("audit_db_tap_failed", extra={"event": "audit.tap.error", "data": {"error": str(exc)}})
 
     audit_store(AuditStore(directory=_audit_dir(), tap=_audit_tap))
+
+
+async def _rebuild_in_memory_knowledge(vector: InMemoryVectorStore, vault_root: str) -> None:
+    """Rebuild the in-memory knowledge index from vault markdown files.
+
+    Deterministic path-based ids keep the index idempotent across restarts.
+    """
+    root = Path(vault_root)
+    if not root.exists():
+        return
+    for md in sorted(root.rglob("*.md")):
+        rel = md.relative_to(root).as_posix()
+        parts = rel.split("/")
+        if len(parts) < 4 or parts[0] != "accounts" or parts[2] != "knowledge":
+            continue
+        account_id = parts[1]
+        try:
+            content = md.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        await vector.upsert(
+            [{"id": f"md:{rel}", "text": content, "path": "/".join(parts[3:]), "source": "vault"}],
+            account_id,
+        )
 
 
 def _audit_dir():

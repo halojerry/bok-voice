@@ -1,47 +1,68 @@
 #!/usr/bin/env bash
-# build_livekit.sh — produce a native `livekit-server` into desktop/runtime/.
+# build_livekit.sh — produce the native livekit-server binary into the Tauri
+# externalBin staging dir (src-tauri/binaries/<name>-<target-triple>).
 #
-# LiveKit publish no macOS release binary (only linux/windows tarballs), so a
-# self-contained macOS build must compile the server from source with Go. On
-# Windows/Linux we can usually reuse the official release asset, but building
-# from source is the single reliable cross-platform path, so this script
-# compiles for the current runner everywhere.
-#
-# Requires `go` on PATH (add `actions/setup-go` before calling this in CI).
+# Windows/Linux: official release zip.
+# macOS: no official binary is published, so prefer the Homebrew bottle and
+# fall back to compiling from source with Go.
 set -euo pipefail
 
+OS="${1:-}"
+TRIPLE="${2:-}"
+BINARIES="${3:-}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-RUNTIME="$ROOT/desktop/runtime"
 LK_VERSION="${LIVEKIT_VERSION:-v1.13.6}"
-LK_OUT="$RUNTIME/livekit-server"
-LK_OUT_WIN="$RUNTIME/livekit-server.exe"
 
-mkdir -p "$RUNTIME"
-
-compile_from_source() {
-  echo "==> [livekit] compiling livekit-server $LK_VERSION from source …"
-  command -v go >/dev/null 2>&1 || { echo "    (warn) go not found on PATH; skipping source build" >&2; return 1; }
-  echo "    go: $(go version)"
-
-  SRC="${TMPDIR:-/tmp}/livekit-src-$LK_VERSION"
-  python3 -c "import shutil,sys; shutil.rmtree(sys.argv[1], ignore_errors=True)" "$SRC" 2>/dev/null || true
-
-  git clone --depth 1 --branch "$LK_VERSION" https://github.com/livekit/livekit.git "$SRC" || {
-    echo "    (warn) git clone livekit failed" >&2; return 1;
-  }
-
-  (cd "$SRC" && go build -o "$LK_OUT" ./cmd/server) || {
-    echo "    (warn) go build livekit failed" >&2; return 1;
-  }
-  chmod +x "$LK_OUT" 2>/dev/null || true
-  python3 -c "import shutil,sys; shutil.rmtree(sys.argv[1], ignore_errors=True)" "$SRC" 2>/dev/null || true
-  echo "    livekit-server: $LK_OUT ($(ls -lh "$LK_OUT" | awk '{print $5}'))"
-}
-
-if [ ! -x "$LK_OUT" ]; then
-  compile_from_source || {
-    echo "    (warn) source build unavailable/失败 — app will run B-line only"
-  }
-else
-  echo "==> [livekit] livekit-server already present"
+if [ -z "$OS" ] || [ -z "$TRIPLE" ] || [ -z "$BINARIES" ]; then
+  echo "usage: build_livekit.sh <mac|win|linux> <target-triple> <binaries-dir>" >&2
+  exit 1
 fi
+mkdir -p "$BINARIES"
+
+case "$OS" in
+  win)
+    OUT="$BINARIES/livekit-server-${TRIPLE}.exe"
+    if [ ! -x "$OUT" ]; then
+      echo "==> [livekit] downloading official Windows binary $LK_VERSION"
+      curl -fsSL "https://github.com/livekit/livekit/releases/download/${LK_VERSION}/livekit_${LK_VERSION#v}_windows_amd64.zip" -o "$ROOT/desktop/runtime/lk.zip"
+      (cd "$ROOT/desktop/runtime" && unzip -qo lk.zip && rm -f lk.zip)
+      find "$ROOT/desktop/runtime" -iname "livekit-server.exe" -exec cp {} "$OUT" \;
+      chmod +x "$OUT"
+    fi
+    echo "    livekit-server: $OUT ($(ls -lh "$OUT" | awk '{print $5}'))"
+    ;;
+  mac)
+    OUT="$BINARIES/livekit-server-${TRIPLE}"
+    if [ ! -x "$OUT" ]; then
+      if command -v brew >/dev/null 2>&1 && brew install livekit >/dev/null 2>&1; then
+        echo "==> [livekit] using Homebrew bottle $LK_VERSION"
+        LK_BIN="$(command -v livekit-server)"
+        cp "$LK_BIN" "$OUT"
+      else
+        echo "==> [livekit] Homebrew unavailable — compiling from source"
+        SRC="${TMPDIR:-/tmp}/livekit-src-$LK_VERSION"
+        rm -rf "$SRC"
+        git clone --depth 1 --branch "$LK_VERSION" https://github.com/livekit/livekit.git "$SRC"
+        (cd "$SRC" && go build -o "$OUT" ./cmd/server)
+        rm -rf "$SRC"
+      fi
+      chmod +x "$OUT"
+    fi
+    echo "    livekit-server: $OUT ($(ls -lh "$OUT" | awk '{print $5}'))"
+    ;;
+  linux)
+    OUT="$BINARIES/livekit-server-${TRIPLE}"
+    if [ ! -x "$OUT" ]; then
+      echo "==> [livekit] downloading official Linux binary $LK_VERSION"
+      curl -fsSL "https://github.com/livekit/livekit/releases/download/${LK_VERSION}/livekit_${LK_VERSION#v}_linux_amd64.tar.gz" -o "$ROOT/desktop/runtime/lk.tar.gz"
+      (cd "$ROOT/desktop/runtime" && tar -xzf lk.tar.gz && rm -f lk.tar.gz)
+      find "$ROOT/desktop/runtime" -iname "livekit-server" -exec cp {} "$OUT" \;
+      chmod +x "$OUT"
+    fi
+    echo "    livekit-server: $OUT ($(ls -lh "$OUT" | awk '{print $5}'))"
+    ;;
+  *)
+    echo "ERROR: unsupported OS $OS" >&2
+    exit 1
+    ;;
+esac

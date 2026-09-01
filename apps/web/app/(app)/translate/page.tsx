@@ -24,7 +24,7 @@ type Channel = {
   id: string;
   sourceLang: string;
   targetLang: string;
-  provider: "ollama" | "dashscope";
+  provider: "local_openai" | "dashscope";
   running: boolean;
   subtitles: Subtitle[];
   metrics: Metrics | null;
@@ -36,7 +36,7 @@ let channelSeq = 0;
 export default function TranslatePage() {
   const [wsState, setWsState] = useState<"connecting" | "open" | "closed">("connecting");
   const [channels, setChannels] = useState<Channel[]>([]);
-  const [form, setForm] = useState({ sourceLang: "zh", targetLang: "en", provider: "ollama" as Channel["provider"] });
+  const [form, setForm] = useState({ sourceLang: "zh", targetLang: "en", provider: "local_openai" as Channel["provider"] });
   const wsRef = useRef<WebSocket | null>(null);
   const micRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -224,7 +224,7 @@ export default function TranslatePage() {
         <label className="text-sm">
           <span className="block text-xs text-[var(--stage-muted)]">翻译引擎</span>
           <select className="mt-1 rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm" value={form.provider} onChange={(e) => setForm({ ...form, provider: e.target.value as Channel["provider"] })}>
-            <option value="ollama">本地 Ollama</option>
+            <option value="local_openai">本地 LLM</option>
             <option value="dashscope">DashScope Qwen-MT</option>
           </select>
         </label>

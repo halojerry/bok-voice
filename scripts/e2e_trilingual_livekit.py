@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 LIVEKIT_URL = "ws://127.0.0.1:7880"
 LIVEKIT_KEY = "devkey"
 LIVEKIT_SECRET = "devsecret"
-AUDIO_DIR = ROOT / "data" / "test-audio"
+AUDIO_DIR = ROOT / "tests" / "fixtures" / "audio"
 
 _ALL_CASES = [
     {"lang": "zh", "file": "zh.wav", "expect_lang": "Chinese"},

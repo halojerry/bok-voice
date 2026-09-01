@@ -1,0 +1,21 @@
+# Windows bundled runtime deps (NVIDIA CUDA path).
+# ASR keeps Qwen3-ASR (transformers + torch cu124); LLM is llama.cpp (binary,
+# not a pip package). Torch is installed from the pytorch cu124 index by
+# build_runtime.sh (extra-index-url).
+fastapi>=0.110,<1
+uvicorn[standard]>=0.29,<1
+python-multipart>=0.0.9
+numpy>=1.26,<3
+soundfile>=0.12
+librosa>=0.10
+httpx>=0.27,<1
+pydantic>=2.6
+sqlalchemy>=2.0,<3
+huggingface_hub>=0.26
+hf_transfer>=0.1
+transformers==4.57.6
+accelerate>=1.0
+qwen-asr>=0.0.6
+qwen-tts>=0.1.1
+torch>=2.5
+torchaudio>=2.5

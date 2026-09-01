@@ -5,7 +5,7 @@ import http from "node:http";
 import { EnergyVAD } from "../src/providers/energy-vad.js";
 import { Qwen3ASRProvider } from "../src/providers/qwen3-asr.js";
 import { Qwen3TTSProvider } from "../src/providers/qwen3-tts.js";
-import { OllamaTranslator } from "../src/providers/ollama.js";
+import { LocalOpenAITranslator } from "../src/providers/local-openai.js";
 
 function sinePcm(seconds, sampleRate = 16000, freq = 440, amp = 0.3) {
   const n = Math.round(seconds * sampleRate);
@@ -91,25 +91,27 @@ test("Qwen3TTSProvider slices PCM into chunks with durationMs and final", async 
   }
 });
 
-test("OllamaTranslator posts translation request and returns content", async () => {
+test("LocalOpenAITranslator posts /v1/chat/completions and returns content", async () => {
   let body = null;
+  let seenUrl = "";
   const server = http.createServer((req, res) => {
+    seenUrl = req.url;
     let raw = "";
     req.on("data", (d) => (raw += d));
     req.on("end", () => {
       body = JSON.parse(raw);
       res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify({ message: { role: "assistant", content: "Hello." } }));
+      res.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: "Hello." } }] }));
     });
   });
   await new Promise((resolve) => server.listen(0, resolve));
   const port = server.address().port;
   try {
-    const tr = new OllamaTranslator({ baseUrl: `http://127.0.0.1:${port}` });
+    const tr = new LocalOpenAITranslator({ baseUrl: `http://127.0.0.1:${port}` });
     const out = await tr.translate("你好。", "zh", "en");
     assert.equal(out, "Hello.");
     assert.equal(body.stream, false);
-    assert.equal(body.think, false);
+    assert.match(seenUrl, /\/v1\/chat\/completions$/);
     assert.match(body.messages.at(-1).content, /Target language: English/);
     assert.match(body.messages.at(-1).content, /Source language: Chinese \(Simplified\)/);
   } finally {

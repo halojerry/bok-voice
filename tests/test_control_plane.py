@@ -40,7 +40,7 @@ def test_settings_object_persona_knowledge_and_reports():
             "/api/settings",
             json={
                 "asr": {"provider": "sherpa_sensevoice", "model": "sensevoice"},
-                "llm": {"provider": "ollama", "model": "qwen", "api_key": "ollama"},
+                "llm": {"provider": "local_openai", "model": "local", "api_key": "mlx"},
                 "tts": {"provider": "volcano_streaming", "access_token": "secret"},
                 "vad": {"provider": "silero"},
                 "policy": "offline_first",

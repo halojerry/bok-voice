@@ -4,7 +4,7 @@ import { TranslationChannel } from "./src/channel.js";
 import { loadConfig } from "./src/config.js";
 import { EnergyVAD } from "./src/providers/energy-vad.js";
 import { MockASR, MockTranslator, MockTTS } from "./src/providers/mock.js";
-import { OllamaTranslator } from "./src/providers/ollama.js";
+import { LocalOpenAITranslator } from "./src/providers/local-openai.js";
 import { Qwen3ASRProvider } from "./src/providers/qwen3-asr.js";
 import { Qwen3TTSProvider } from "./src/providers/qwen3-tts.js";
 
@@ -32,7 +32,7 @@ async function main() {
         ? new Qwen3ASRProvider({ baseUrl: config.asr.base_url, sampleRate: config.asr.sample_rate, vad: new EnergyVAD({ sampleRate: config.asr.sample_rate }) })
         : new MockASR(),
       translator: useReal
-        ? new OllamaTranslator({ baseUrl: config.translator.base_url, model: config.translator.model, think: config.translator.think })
+        ? new LocalOpenAITranslator({ baseUrl: config.translator.base_url, model: config.translator.model })
         : new MockTranslator(),
       tts: useReal ? new Qwen3TTSProvider({ baseUrl: config.tts.base_url, sampleRate: config.tts.sample_rate }) : new MockTTS(),
       maxQueueMs: 4000,
@@ -45,7 +45,7 @@ async function main() {
         ? new Qwen3ASRProvider({ baseUrl: config.asr.base_url, sampleRate: config.asr.sample_rate, vad: new EnergyVAD({ sampleRate: config.asr.sample_rate }) })
         : new MockASR(),
       translator: useReal
-        ? new OllamaTranslator({ baseUrl: config.translator.base_url, model: config.translator.model, think: config.translator.think })
+        ? new LocalOpenAITranslator({ baseUrl: config.translator.base_url, model: config.translator.model })
         : new MockTranslator(),
       tts: useReal ? new Qwen3TTSProvider({ baseUrl: config.tts.base_url, sampleRate: config.tts.sample_rate }) : new MockTTS(),
       maxQueueMs: 4000,

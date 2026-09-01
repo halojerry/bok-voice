@@ -149,7 +149,7 @@ def _instructions(
 async def entrypoint(ctx):
     """LiveKit Agent job entrypoint (must be module-level for pickling)."""
     from livekit.agents import Agent, AgentSession, TurnHandlingOptions, inference, stt
-    from .providers.livekit_plugins import ContextState, DeepSeekLLM, ExprAwareLLM, OllamaLLM
+    from .providers.livekit_plugins import ContextState, DeepSeekLLM, ExprAwareLLM
 
     room_name = ctx.room.name
     call_id = os.environ.get("AGENT_CALL_ID") or room_name
@@ -212,7 +212,6 @@ async def entrypoint(ctx):
         FakeLiveKitTTS,
         FakeLiveKitVAD,
         LanguageState,
-        OllamaLLM,
         Qwen3ASRSTT,
         Qwen3TTSTTS,
         ContextAwareLLM,
@@ -283,7 +282,7 @@ async def entrypoint(ctx):
                 sample_rate=int(tts_cfg.get("sample_rate") or 24000),
             )
 
-    llm_provider_name = llm_cfg.get("provider") or "ollama"
+    llm_provider_name = llm_cfg.get("provider") or "local_openai"
     if os.environ.get("SCRIPTED_LLM") == "1":
         llm_provider = ScriptedLLM(
             expect_kw=os.environ.get("SCRIPTED_LLM_EXPECT_KW", ""),
@@ -298,23 +297,17 @@ async def entrypoint(ctx):
                 base_url=llm_cfg.get("base_url") or os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
             )
         else:
-            llm_provider = OllamaLLM(
-                base_url=os.environ.get("OLLAMA_BASE_URL", "http://host.docker.internal:11434/v1"),
-                model=os.environ.get("OLLAMA_MODEL", "huihui_ai/qwen3.5-abliterated:9b"),
+            llm_provider = MlxLlmLLM(
+                base_url=os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
+                model=os.environ.get("MLX_LLM_MODEL", "local"),
             )
     elif llm_provider_name in ("mlx", "local_openai", "lmstudio"):
         from .providers.livekit_plugins import MlxLlmLLM
 
         llm_provider = MlxLlmLLM(
             base_url=llm_cfg.get("base_url")
-            or os.environ.get("MLX_LLM_BASE_URL", "http://host.docker.internal:1235/v1"),
-            model=llm_cfg.get("model") or os.environ.get("MLX_LLM_MODEL", None),
-        )
-    elif llm_provider_name == "ollama":
-        llm_provider = OllamaLLM(
-            base_url=llm_cfg.get("base_url") or os.environ.get("OLLAMA_BASE_URL", "http://host.docker.internal:11434/v1"),
-            model=llm_cfg.get("model") or os.environ.get("OLLAMA_MODEL", "huihui_ai/qwen3.5-abliterated:9b"),
-            api_key=llm_cfg.get("api_key") or "ollama",
+            or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
+            model=llm_cfg.get("model") or os.environ.get("MLX_LLM_MODEL", "local"),
         )
     elif llm_provider_name == "fake":
         from .providers.livekit_plugins import ScriptedLLM

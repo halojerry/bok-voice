@@ -62,10 +62,12 @@
       "../../services/realtime-translation",
       "../runtime",
       "../../tools/bok.py",
-      "../../scripts/start_sidecars.sh",
-      "../../scripts/stop_sidecars.sh"
+      "../../runtime-manifest.json"
     ],
-    "externalBin": [],
+    "externalBin": [
+      "binaries/livekit-server",
+      "binaries/node"
+    ],
     "createUpdaterArtifacts": false
   },
   "plugins": {

@@ -20,21 +20,23 @@
 python3 desktop/scripts/gen_icon.py
 
 # 2. 安装 Tauri CLI
-cd desktop && npm install
+cd desktop && npm ci
 
 # 3. 派生 icns/ico（CI 也会做）
 cd desktop && npm run icons
 
-# 4. 开发（自动启动 web dev）
-#    先单独起好 web：cd apps/web && npm run dev
+# 4. 开发：先起后端全栈（无 Docker）
+python tools/bok.py serve
+#    再起 web dev：cd apps/web && npm run dev
 cd desktop && npm run dev
 ```
 
-真机验证（打包 dmg）：
+打包（CI 出包；本机仅做编译自检）：
 
 ```bash
-cd desktop && npm run build
-# 产物: desktop/src-tauri/target/release/bundle/dmg/BokVoice_0.1.0_*.dmg
+bash scripts/stub_external_bin.sh   # cargo 编译占位（真实二进制由 build_runtime.sh 提供）
+cd desktop/src-tauri && cargo test && cargo check
+# 真实 release：push tag v* -> GitHub Actions 产出 mac zip + Windows exe
 ```
 
 ## 目录结构

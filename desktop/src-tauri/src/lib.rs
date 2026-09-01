@@ -161,7 +161,7 @@ fn bundled_python(root: &PathBuf) -> String {
 
 /// Spawn `python tools/bok.py <subcommand>` detached, streaming output to
 /// `app-data/logs/bok-<cmd>.log`. Returns the child pid.
-fn spawn_bok(_app: &AppHandle, root: &PathBuf, cmd_name: &str) -> Result<Child, String> {
+fn spawn_bok(app: &AppHandle, root: &PathBuf, cmd_name: &str) -> Result<Child, String> {
     let bok = root.join("tools/bok.py");
     if !bok.exists() {
         return Err(format!("bok launcher missing: {}", bok.display()));
@@ -175,16 +175,18 @@ fn spawn_bok(_app: &AppHandle, root: &PathBuf, cmd_name: &str) -> Result<Child, 
         .append(true)
         .open(&log_path)
         .map_err(|e| e.to_string())?;
-    let child = Command::new(&use_py)
-        .arg(&bok)
+    let mut cmd = Command::new(&use_py);
+    cmd.arg(&bok)
         .arg(cmd_name)
         .current_dir(root)
         .env("BOK_ROOT", root)
         .env("BOK_PACKAGED", "1")
         .stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
-        .stderr(Stdio::from(log))
-        .spawn()
-        .map_err(|e| e.to_string())?;
+        .stderr(Stdio::from(log));
+    if let Ok(res) = app.path().resource_dir() {
+        cmd.env("BOK_RESOURCE_DIR", res);
+    }
+    let child = cmd.spawn().map_err(|e| e.to_string())?;
     Ok(child)
 }
 
@@ -265,7 +267,7 @@ fn open_logs(_app: AppHandle) -> Result<String, String> {
 #[tauri::command]
 fn manifest(app: AppHandle) -> Result<String, String> {
     let root = resolve_root(&app);
-    let out = Command::new(python())
+    let out = Command::new(bundled_python(&root))
         .arg(root.join("tools/bok.py"))
         .arg("manifest")
         .current_dir(&root)
@@ -282,7 +284,7 @@ fn run_bok_json(app: &AppHandle, args: &[&str]) -> Result<String, String> {
         .args(args)
         .current_dir(&root)
         .env("BOK_ROOT", &root)
-        .env("BOK_PACKAGED", "0");
+        .env("BOK_PACKAGED", "1");
     let out = cmd.output().map_err(|e| e.to_string())?;
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
@@ -310,7 +312,7 @@ fn setup_download(app: AppHandle) -> Result<String, String> {
         .args(["setup", "download"])
         .current_dir(&root)
         .env("BOK_ROOT", &root)
-        .env("BOK_PACKAGED", "0")
+        .env("BOK_PACKAGED", "1")
         .stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
         .stderr(Stdio::from(log))
         .spawn()
