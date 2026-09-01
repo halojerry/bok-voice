@@ -89,7 +89,7 @@ def _startup() -> None:
     app.state.session_factory = build_session_factory(engine)
     app.state.lk_key = os.environ.get("LIVEKIT_API_KEY", "")
     app.state.lk_secret = os.environ.get("LIVEKIT_API_SECRET", "")
-    app.state.lk_url = os.environ.get("LIVEKIT_URL", "ws://localhost:7880")
+    app.state.lk_url = os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880")
     vault = os.environ.get("VAULT_ROOT", "./data/vault")
     embedder = CharHashEmbedding(384)
     if engine is not None and getattr(engine.dialect, "name", "") != "sqlite":

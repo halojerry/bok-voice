@@ -597,7 +597,7 @@ def cmd_serve() -> int:
         agent_env: dict[str, str] = {
             "PYTHONPATH": _repo_pythonpath(),
             "BOK_SERVICE": "agent",
-            "LIVEKIT_URL": os.environ.get("LIVEKIT_URL", "ws://localhost:7880"),
+            "LIVEKIT_URL": os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880"),
             "LIVEKIT_API_KEY": os.environ.get("LIVEKIT_API_KEY", "devkey"),
             "LIVEKIT_API_SECRET": os.environ.get("LIVEKIT_API_SECRET", "devsecret"),
             "CONTROL_PLANE_URL": os.environ.get("CONTROL_PLANE_URL", "http://localhost:8000"),
@@ -626,7 +626,13 @@ def cmd_down() -> int:
     for pidfile in run_dir.glob("*.pid"):
         try:
             pid = int(pidfile.read_text().strip())
-            os.kill(pid, signal.SIGTERM)
+            # _start_proc 以 start_new_session=True 启动（会话组长）；按进程组
+            # 终止可连 livekit-agents worker 的 multiprocessing 子进程一起清掉，
+            # 避免子进程残留占用 8081 导致下次 agent 启动失败。
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                os.kill(pid, signal.SIGTERM)
             print(f"[down] stopped {pidfile.stem} (pid {pid})")
         except Exception:
             continue
