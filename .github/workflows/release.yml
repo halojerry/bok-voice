@@ -128,8 +128,8 @@ jobs:
         with:
           name: bok-voice-${{ matrix.target }}
           path: |
-            desktop/src-tauri/target/release/bundle/**/*
             desktop/BokVoice-mac.zip
+            desktop/src-tauri/target/release/bundle/msi/*.msi
             models.sha256.json
           retention-days: 7
 
