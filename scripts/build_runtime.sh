@@ -24,36 +24,26 @@ VENV="$RUNTIME/.venv"
 # works on a machine without a system Python (no absolute /opt/hostedtoolcache).
 if [ ! -x "$PY_STANDALONE/bin/python3" ]; then
   echo "==> [runtime] fetching python-build-standalone …"
-  # Resolve the latest install_only cpython-3.12 asset for the current OS/arch
-  # via the GitHub releases API (avoids hardcoding a build tag that may not exist).
+  # Use a pinned, known-good install_only cpython-3.12 build. Dynamic GitHub
+  # release-API resolution proved flaky in CI (resolved:<none>), so we hardcode
+  # the per-platform asset URLs. These are verified reachable.
   ARCH="$(uname -m)"            # aarch64 / x86_64
-  # python-build-standalone uses "aarch64" for Apple Silicon's "arm64".
   if [ "$ARCH" = "arm64" ]; then ARCH="aarch64"; fi
-  OS_NAME="unknown-linux-gnu"
   case "$(uname -s)" in
-    Darwin) OS_NAME="apple-darwin" ;;
-    Linux)  OS_NAME="unknown-linux-gnu" ;;
-    MINGW64*|MSYS*) OS_NAME="pc-windows-msvc" ;;
+    Darwin)
+      URL="https://github.com/astral-sh/python-build-standalone/releases/download/20260825/cpython-3.12.14%2B20260825-${ARCH}-apple-darwin-install_only.tar.gz"
+      ;;
+    Linux)
+      URL="https://github.com/astral-sh/python-build-standalone/releases/download/20260825/cpython-3.12.14%2B20260825-${ARCH}-unknown-linux-gnu-install_only.tar.gz"
+      ;;
+    MINGW64*|MSYS*)
+      URL="https://github.com/astral-sh/python-build-standalone/releases/download/20260825/cpython-3.12.14%2B20260825-x86_64-pc-windows-msvc-install_only.tar.gz"
+      ;;
+    *)
+      echo "ERROR: unsupported OS for standalone python: $(uname -s)" >&2
+      exit 1
+      ;;
   esac
-  TARGET="${ARCH}-${OS_NAME}"
-  export PB_TARGET="${TARGET}"
-  RESOLVE_PY="$RUNTIME/resolve_python.py"
-  cat > "$RESOLVE_PY" <<'PY'
-import json, os, sys
-target = os.environ.get("PB_TARGET", "")
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-for a in d.get("assets", []):
-    u = a.get("browser_download_url", "")
-    if target in u and "cpython-3.12" in u and "install_only" in u and "stripped" not in u and "debug" not in u:
-        print(u)
-        break
-PY
-  URL="$(curl -fsSL "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest" 2>/dev/null \
-    | python3 "$RESOLVE_PY" || true)"
-  python3 -c "import os,sys; os.remove(sys.argv[1]) if os.path.exists(sys.argv[1]) else None" "$RESOLVE_PY" 2>/dev/null || true
   echo "    resolved: ${URL:-<none>}"
   if [ -z "$URL" ] || ! curl -fsSL "$URL" -o "$RUNTIME/python.tar.gz"; then
     echo "ERROR: python-build-standalone download failed (no relocatable CPython); aborting." >&2
