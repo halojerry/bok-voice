@@ -5,6 +5,9 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Package
@@ -121,3 +124,39 @@ jobs:
           path: models.sha256.json
       - name: Build docker images
         run: docker compose build agent control-plane web
+
+  publish:
+    name: Publish GitHub Release
+    needs: [build, manifest]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: List downloaded assets
+        run: find release-assets -type f | sed 's#release-assets/##' | sort
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Tag name (strip leading 'v' for display)
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          echo "==> creating release for tag ${TAG} (version ${VERSION})"
+          # Delete existing release if re-running (artifact regeneration).
+          gh release delete "${TAG}" --yes 2>/dev/null || true
+          # Collect installers + manifest.
+          ASSETS=()
+          for f in $(find release-assets -type f \( -name '*.dmg' -o -name '*.exe' -o -name '*.msi' -o -name 'models.sha256.json' \)); do
+            ASSETS+=("$f")
+          done
+          gh release create "${TAG}" \
+            --title "Bok Voice ${VERSION}" \
+            --notes "自包含桌面发行：内嵌前端/运行时/Go 编译 livekit-server；模型首启下载。" \
+            "${ASSETS[@]}"
+          echo "==> release created"
