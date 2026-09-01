@@ -37,8 +37,8 @@ if [ ! -x "$PY_STANDALONE/bin/python3" ]; then
   esac
   TARGET="${ARCH}-${OS_NAME}"
   export PB_TARGET="${TARGET}"
-  URL="$(curl -fsSL "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest" 2>/dev/null \
-    | python3 -c '
+  RESOLVE_PY="$RUNTIME/resolve_python.py"
+  cat > "$RESOLVE_PY" <<'PY'
 import json, os, sys
 target = os.environ.get("PB_TARGET", "")
 try:
@@ -47,10 +47,13 @@ except Exception:
     sys.exit(0)
 for a in d.get("assets", []):
     u = a.get("browser_download_url", "")
-    # Prefer non-stripped, non-debug install_only builds for the target arch/OS.
     if target in u and "cpython-3.12" in u and "install_only" in u and "stripped" not in u and "debug" not in u:
-        print(u); break
-' || true)"
+        print(u)
+        break
+PY
+  URL="$(curl -fsSL "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest" 2>/dev/null \
+    | python3 "$RESOLVE_PY" || true)"
+  python3 -c "import os,sys; os.remove(sys.argv[1]) if os.path.exists(sys.argv[1]) else None" "$RESOLVE_PY" 2>/dev/null || true
   echo "    resolved: ${URL:-<none>}"
   if [ -z "$URL" ] || ! curl -fsSL "$URL" -o "$RUNTIME/python.tar.gz"; then
     echo "ERROR: python-build-standalone download failed (no relocatable CPython); aborting." >&2
