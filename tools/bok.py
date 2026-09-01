@@ -209,10 +209,14 @@ def setup_models() -> list[dict]:
     key = "windows" if os.name == "nt" else "mac"
     out: list[dict] = []
     for name, repo in MODELS[key].items():
-        if not repo or name == "llm_ollama":
-            # llm_ollama is pulled via ollama CLI, not snapshot_download.
-            if name == "llm_ollama":
-                out.append({"name": name, "repo": repo, "present": _ollama_present(repo), "required": True})
+        # A platform may leave a slot empty (e.g. mac uses mlx_lm, no Ollama).
+        # Empty repo => not required, so it never blocks readiness.
+        if not repo:
+            out.append({"name": name, "repo": "", "present": True, "required": False})
+            continue
+        if name == "llm_ollama":
+            # Ollama is pulled via the ollama CLI, not snapshot_download.
+            out.append({"name": name, "repo": repo, "present": _ollama_present(repo), "required": True})
             continue
         target = model_dir(repo)
         present = target.exists() and any(target.iterdir())
@@ -244,7 +248,7 @@ def _ollama_present(repo: str) -> bool:
 
 
 def _all_models_present() -> bool:
-    return all(m["present"] for m in setup_models())
+    return all(m["present"] for m in setup_models() if m["required"])
 
 
 def _dir_sha256(path: Path) -> str:
