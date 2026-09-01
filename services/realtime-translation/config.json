@@ -7,7 +7,7 @@
   "translator": {
     "provider": "local_openai",
     "base_url": "http://127.0.0.1:1235/v1",
-    "model": "local"
+    "model": ""
   },
   "tts": {
     "provider": "qwen3_tts",

@@ -10,7 +10,7 @@ const DEFAULTS = {
   translator: {
     provider: "local_openai",
     base_url: "http://127.0.0.1:1235/v1",
-    model: "local",
+    model: "",
   },
   tts: { provider: "qwen3_tts", base_url: "http://127.0.0.1:8788", sample_rate: 24000 },
   server: { host: "127.0.0.1", port: 8790, metrics_file: "" },

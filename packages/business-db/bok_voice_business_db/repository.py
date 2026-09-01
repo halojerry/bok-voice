@@ -389,7 +389,7 @@ class SqlAlchemyBusinessRepository:
             },
             # Packaged/dev default: local OpenAI-compatible LLM on :1235
             # (mlx_lm on macOS, llama-server on Windows). Zero-Ollama.
-            "llm": {"provider": "local_openai", "model": "local", "base_url": "http://127.0.0.1:1235/v1"},
+            "llm": {"provider": "local_openai", "model": "", "base_url": "http://127.0.0.1:1235/v1"},
             "tts": {
                 "provider": "qwen3_tts",
                 "model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",

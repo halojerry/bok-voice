@@ -91,9 +91,13 @@ class MlxLlmLLM(OpenAICompatLLM):
         model=None,
         base_url="http://127.0.0.1:1235/v1",
     ):
+        # mlx_lm server requires the real model path in requests; "local" is
+        # only a last-resort placeholder when no env/settings provide one.
+        if model in (None, "", "local"):
+            model = os.environ.get("MLX_LLM_MODEL") or "local"
         super().__init__(
             api_key=api_key,
-            model=model or os.environ.get("MLX_LLM_MODEL", "local"),
+            model=model,
             base_url=base_url
             or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
         )

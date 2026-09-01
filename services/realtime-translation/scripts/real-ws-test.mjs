@@ -4,6 +4,7 @@
 // 运行：node scripts/real-ws-test.mjs
 
 import { readFileSync, existsSync, statSync } from "node:fs";
+import os from "node:os";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
@@ -11,7 +12,11 @@ import WebSocket from "ws";
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const WS_URL = process.env.WS_URL || "ws://127.0.0.1:8790";
 const AUDIO_DIR = resolve(ROOT, "tests/fixtures/audio");
-const METRICS_FILE = resolve(ROOT, "data/translation-metrics.jsonl");
+// 打包/统一编排后指标写入 app-data（bundle 只读），测试跟随同一路径。
+const APP_DATA = process.env.LOCALAPPDATA
+  ? resolve(process.env.LOCALAPPDATA, "BokVoice")
+  : resolve(os.homedir(), "Library", "Application Support", "BokVoice");
+const METRICS_FILE = resolve(APP_DATA, "translation-metrics.jsonl");
 const CHANNELS = [
   { id: "real-zh-en", sourceLang: "zh", targetLang: "en", file: "zh.wav" },
   { id: "real-yue-zh", sourceLang: "yue", targetLang: "zh", file: "yue.wav" },

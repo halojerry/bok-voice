@@ -418,14 +418,17 @@ def _bline_config_path() -> Path:
     return app_data_dir() / "bline.json"
 
 
-def write_bline_config() -> Path:
+def write_bline_config(current: dict[str, str] | None = None) -> Path:
     """Write a fully-resolved B-line config into app-data (bundle stays read-only)."""
+    if current is None:
+        current = MODELS["mac"] if is_mac() else MODELS["windows"]
     cfg = {
         "asr": {"provider": "qwen3_asr", "base_url": "http://127.0.0.1:8787", "sample_rate": 16000},
         "translator": {
             "provider": "local_openai",
             "base_url": "http://127.0.0.1:1235/v1",
-            "model": "local",
+            # mlx_lm server 要求请求里的 model 是真实模型路径，不能用 "local"。
+            "model": model_path(current, "llm"),
         },
         "tts": {"provider": "qwen3_tts", "base_url": "http://127.0.0.1:8788", "sample_rate": 24000},
         "server": {
@@ -514,7 +517,7 @@ def cmd_up() -> int:
     _start_llm(current, run_dir, log_dir)
 
     # B-line worker (Node, OpenAI-compatible translator on :1235).
-    bline_cfg = write_bline_config()
+    bline_cfg = write_bline_config(current)
     if not healthy(8790):
         _start_proc(
             [node(), str(ROOT / "services" / "realtime-translation" / "server.mjs")],
@@ -599,6 +602,7 @@ def cmd_serve() -> int:
             "LIVEKIT_API_SECRET": os.environ.get("LIVEKIT_API_SECRET", "devsecret"),
             "CONTROL_PLANE_URL": os.environ.get("CONTROL_PLANE_URL", "http://localhost:8000"),
             "MLX_LLM_BASE_URL": os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
+            "MLX_LLM_MODEL": model_path(MODELS["mac"] if is_mac() else MODELS["windows"], "llm"),
         }
         _start_proc([str(py), "-m", "agent_runtime.main"], run_dir / "agent.pid", log_dir / "agent.log", env=agent_env)
 

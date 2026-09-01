@@ -7,7 +7,7 @@
 
 const DEFAULT_OPTS = {
   baseUrl: "http://127.0.0.1:1235/v1",
-  model: "local",
+  model: "",
   numPredict: 512,
   temperature: 0.2,
   timeoutMs: 60000,
@@ -32,6 +32,10 @@ const LANG_NAME = {
 export class LocalOpenAITranslator {
   constructor(opts = {}) {
     this.opts = { ...DEFAULT_OPTS, ...opts };
+    // mlx_lm server 要求真实模型路径；空值回退到环境变量。
+    if (!this.opts.model || this.opts.model === "local") {
+      this.opts.model = process.env.MLX_LLM_MODEL || "local";
+    }
     this.baseUrl = this.opts.baseUrl.replace(/\/+$/, "");
     this.chatUrl = this.baseUrl.endsWith("/v1")
       ? `${this.baseUrl}/chat/completions`

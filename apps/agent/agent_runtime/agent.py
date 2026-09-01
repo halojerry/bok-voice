@@ -307,7 +307,7 @@ async def entrypoint(ctx):
         llm_provider = MlxLlmLLM(
             base_url=llm_cfg.get("base_url")
             or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
-            model=llm_cfg.get("model") or os.environ.get("MLX_LLM_MODEL", "local"),
+            model=llm_cfg.get("model") or os.environ.get("MLX_LLM_MODEL", ""),
         )
     elif llm_provider_name == "fake":
         from .providers.livekit_plugins import ScriptedLLM
