@@ -173,7 +173,7 @@ def repo_python() -> Path:
 
 
 def bundled_node() -> str | None:
-    """Bundled Node binary (externalBin resource dir or runtime dir), else None."""
+    """Bundled Node binary (externalBin: Resources or Contents/MacOS; runtime dir)."""
     res = os.environ.get("BOK_RESOURCE_DIR", "")
     if os.name == "nt":
         cands = [
@@ -182,8 +182,10 @@ def bundled_node() -> str | None:
             runtime_root() / "node.exe",
         ]
     else:
+        macos = Path(res).parent / "MacOS" / "node" if res else None
         cands = [
             Path(res) / "node" if res else None,
+            macos,
             runtime_root() / "node" / "bin" / "node",
             runtime_root() / "bin" / "node",
         ]
@@ -222,12 +224,13 @@ def bundled_llama() -> Path | None:
 
 
 def _embedded_livekit() -> Path | None:
-    """Embedded LiveKit server binary (externalBin resource dir or runtime)."""
+    """Embedded LiveKit server binary (externalBin Resources/MacOS or runtime)."""
     res = os.environ.get("BOK_RESOURCE_DIR", "")
     if os.name == "nt":
         cands = [Path(res) / "livekit-server.exe" if res else None, runtime_root() / "livekit-server.exe"]
     else:
-        cands = [Path(res) / "livekit-server" if res else None, runtime_root() / "livekit-server"]
+        macos = Path(res).parent / "MacOS" / "livekit-server" if res else None
+        cands = [Path(res) / "livekit-server" if res else None, macos, runtime_root() / "livekit-server"]
     for c in cands:
         if c and c.exists():
             return c

@@ -45,8 +45,17 @@ if [ "$mode" = "--app" ]; then
   check "resources dir" test -d "$RES"
   PY=$(find "$RES" -path '*/runtime/python/bin/python3' -o -path '*/runtime/python/python.exe' 2>/dev/null | head -1)
   check "bundled python present" test -n "$PY"
-  check "externalBin livekit-server" find "$RES" -maxdepth 2 -name 'livekit-server*' | grep -q .
-  check "externalBin node" find "$RES" -maxdepth 2 -name 'node*' | grep -q .
+  MACOS="$APP/Contents/MacOS"
+  if find "$RES" "$MACOS" -maxdepth 2 \( -name 'livekit-server*' \) 2>/dev/null | grep -q .; then
+    note "ok   externalBin livekit-server"
+  else
+    note "FAIL externalBin livekit-server"; FAIL=1
+  fi
+  if find "$RES" "$MACOS" -maxdepth 2 \( -name 'node*' \) 2>/dev/null | grep -q .; then
+    note "ok   externalBin node"
+  else
+    note "FAIL externalBin node"; FAIL=1
+  fi
   SIZE_MB=$(du -sm "$APP" | awk '{print $1}')
   note "app size: ${SIZE_MB}MB"
   if [ "$SIZE_MB" -gt 1330 ]; then note "FAIL size gate (>1330MB)"; FAIL=1; else note "ok   size gate <=1330MB"; fi

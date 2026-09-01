@@ -96,7 +96,9 @@ jobs:
         run: |
           cd desktop
           if [ "$RUNNER_OS" = "Windows" ]; then
-            npx tauri build --bundles nsis
+            # NSIS (makensis 32-bit) 无法处理 >2GB payload（torch+llama cudart），
+            # 改用 WiX MSI（支持多 CAB 的大体积安装包）。
+            npx tauri build --bundles msi
           else
             npx tauri build --bundles app
             zip -r -y "BokVoice-mac.zip" "src-tauri/target/release/bundle/macos/BokVoice.app" >/dev/null
@@ -113,13 +115,13 @@ jobs:
           bash scripts/verify_bundle.sh --app desktop/src-tauri/target/release/bundle/macos/BokVoice.app
           bash scripts/verify_bundle.sh --doctor desktop/src-tauri/target/release/bundle/macos/BokVoice.app
 
-      - name: Verify Windows artifacts (llama-server CUDA + NSIS)
+      - name: Verify Windows artifacts (llama-server CUDA + MSI)
         if: runner.os == 'Windows'
         shell: bash
         run: |
           ls -la desktop/runtime/llama/ | head -20
           desktop/runtime/llama/llama-server.exe --version
-          test -f desktop/src-tauri/target/release/bundle/nsis/*.exe && echo "NSIS exe present"
+          test -f desktop/src-tauri/target/release/bundle/msi/*.msi && echo "MSI present"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
