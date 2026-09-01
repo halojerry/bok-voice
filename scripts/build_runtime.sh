@@ -24,12 +24,20 @@ VENV="$RUNTIME/.venv"
 # moved/installed on another machine. The standalone interpreter is fully
 # relocatable (stdlib lives in ./lib/python3.12) and packages install into its
 # own site-packages. This is the reliable self-contained runtime.
-RUNTIME_PY="$PY_STANDALONE/bin/python3"
+
+# Standalone python lives at bin/python3 on Unix-like builds and python.exe at
+# the install root on Windows builds.
+if [ "$(uname -s)" = "MINGW64_NT-" ] || [ "$(uname -s)" = "MSYS_NT-" ]; then
+  STD_PY="$PY_STANDALONE/python.exe"
+else
+  STD_PY="$PY_STANDALONE/bin/python3"
+fi
+RUNTIME_PY="$STD_PY"
 
 # --- Python ---------------------------------------------------------------
 # Prefer a relocatable standalone CPython. This is the only way a bundled venv
 # works on a machine without a system Python (no absolute /opt/hostedtoolcache).
-if [ ! -x "$PY_STANDALONE/bin/python3" ]; then
+if [ ! -x "$STD_PY" ]; then
   echo "==> [runtime] fetching python-build-standalone …"
   # Use a pinned, known-good install_only cpython-3.12 build. Dynamic GitHub
   # release-API resolution proved flaky in CI (resolved:<none>), so we hardcode
@@ -59,7 +67,7 @@ if [ ! -x "$PY_STANDALONE/bin/python3" ]; then
   mkdir -p "$PY_STANDALONE"
   tar -xzf "$RUNTIME/python.tar.gz" -C "$PY_STANDALONE" --strip-components=1
   python3 -c "import os,sys; os.remove(sys.argv[1]) if os.path.exists(sys.argv[1]) else None" "$RUNTIME/python.tar.gz" 2>/dev/null || true
-  echo "    standalone python ready: $PY_STANDALONE/bin/python3"
+  echo "    standalone python ready: $STD_PY"
 fi
 
 # A relocatable standalone CPython is REQUIRED. A venv created from the system
@@ -67,10 +75,10 @@ fi
 # paths and breaks when the bundle is moved to another machine. So we must use
 # the standalone interpreter, and KEEP it in the bundle (runtime/python).
 BASE_PY="$(command -v python3)"
-if [ -x "$PY_STANDALONE/bin/python3" ]; then
-  BASE_PY="$PY_STANDALONE/bin/python3"
+if [ -x "$STD_PY" ]; then
+  BASE_PY="$STD_PY"
 else
-  echo "ERROR: no relocatable standalone python at $PY_STANDALONE/bin/python3" >&2
+  echo "ERROR: no relocatable standalone python at $STD_PY" >&2
   exit 1
 fi
 
