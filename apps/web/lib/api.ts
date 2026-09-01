@@ -1,4 +1,5 @@
-export const CONTROL_PLANE_URL = process.env.NEXT_PUBLIC_CONTROL_PLANE_URL ?? "http://localhost:8000";
+// 服务只绑 127.0.0.1；避免 localhost 优先解析 ::1 导致 fetch 失败。
+export const CONTROL_PLANE_URL = process.env.NEXT_PUBLIC_CONTROL_PLANE_URL ?? "http://127.0.0.1:8000";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${CONTROL_PLANE_URL}${path}`, {

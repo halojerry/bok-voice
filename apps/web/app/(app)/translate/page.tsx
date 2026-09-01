@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-const WS_URL = process.env.NEXT_PUBLIC_TRANSLATION_WS_URL || "ws://localhost:8790";
+const WS_URL = process.env.NEXT_PUBLIC_TRANSLATION_WS_URL || "ws://127.0.0.1:8790";
 const LANGS = [
   { code: "zh", label: "普通话" },
   { code: "yue", label: "粤语" },

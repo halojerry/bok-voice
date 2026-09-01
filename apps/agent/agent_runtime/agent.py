@@ -402,6 +402,11 @@ async def entrypoint(ctx):
 
 def run_agent() -> None:
     """Start the LiveKit Agent worker (imports are lazy so tests need no livekit)."""
+    import sys
+
     from livekit.agents import WorkerOptions, cli
 
+    # livekit-agents 1.7.x 的 cli.run_app 需要显式子命令（start）。
+    if len(sys.argv) == 1:
+        sys.argv.append("start")
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
