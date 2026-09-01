@@ -60,7 +60,9 @@ jobs:
             services/realtime-translation/node_modules
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: ${{ runner.os }}-runtime-${{ hashFiles('packages/**/pyproject.toml','apps/**/pyproject.toml','services/*/requirements.txt','services/realtime-translation/package-lock.json') }}
+          # v2: bust the cache so the relocatable-standalone-python runtime is
+          # rebuilt (previous cached venv used a non-relocatable framework Python).
+          key: ${{ runner.os }}-runtime-v2-${{ hashFiles('packages/**/pyproject.toml','apps/**/pyproject.toml','services/*/requirements.txt','services/realtime-translation/package-lock.json') }}
 
       - name: Install Python deps
         run: |

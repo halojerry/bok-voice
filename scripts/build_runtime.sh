@@ -52,20 +52,26 @@ for a in d.get("assets", []):
         print(u); break
 ' || true)"
   echo "    resolved: ${URL:-<none>}"
-  if [ -n "$URL" ] && curl -fsSL "$URL" -o "$RUNTIME/python.tar.gz"; then
-    mkdir -p "$PY_STANDALONE"
-    tar -xzf "$RUNTIME/python.tar.gz" -C "$PY_STANDALONE" --strip-components=1
-    python3 -c "import os,sys; os.remove(sys.argv[1]) if os.path.exists(sys.argv[1]) else None" "$RUNTIME/python.tar.gz" 2>/dev/null || true
-    echo "    standalone python ready: $PY_STANDALONE/bin/python3"
-  else
-    echo "    standalone download failed — falling back to system python venv (dev path)"
-    PY_STANDALONE=""
+  if [ -z "$URL" ] || ! curl -fsSL "$URL" -o "$RUNTIME/python.tar.gz"; then
+    echo "ERROR: python-build-standalone download failed (no relocatable CPython); aborting." >&2
+    exit 1
   fi
+  mkdir -p "$PY_STANDALONE"
+  tar -xzf "$RUNTIME/python.tar.gz" -C "$PY_STANDALONE" --strip-components=1
+  python3 -c "import os,sys; os.remove(sys.argv[1]) if os.path.exists(sys.argv[1]) else None" "$RUNTIME/python.tar.gz" 2>/dev/null || true
+  echo "    standalone python ready: $PY_STANDALONE/bin/python3"
 fi
 
+# A relocatable standalone CPython is REQUIRED. A venv created from the system
+# framework Python (e.g. /Library/Frameworks/Python.framework) records absolute
+# paths and breaks when the bundle is moved to another machine. So we must use
+# the standalone interpreter, and KEEP it in the bundle (runtime/python).
 BASE_PY="$(command -v python3)"
 if [ -x "$PY_STANDALONE/bin/python3" ]; then
   BASE_PY="$PY_STANDALONE/bin/python3"
+else
+  echo "ERROR: no relocatable standalone python at $PY_STANDALONE/bin/python3" >&2
+  exit 1
 fi
 
 # The project requires Python >= 3.11; refuse to build a runtime on an older
@@ -77,7 +83,7 @@ fi
 
 echo "==> [runtime] creating relocatable venv ($BASE_PY) …"
 if [ ! -d "$VENV" ]; then
-  "$BASE_PY" -m venv "$VENV"
+  "$BASE_PY" -m venv --copies "$VENV"
 fi
 VENV_PY="$VENV/bin/python"
 [ -x "$VENV_PY" ] || VENV_PY="$VENV/Scripts/python.exe"
