@@ -110,6 +110,11 @@ class ProviderSettings(BaseModel):
     resource_id: str = ""
     app_id: str = ""
     access_token: str = ""
+    # VAD / 打断（agent 运行时会读取这些值；sensitivity 仅为兼容保留，UI 不再暴露）
+    max_buffered_speech: float = 15.0
+    min_speech_duration: float = 0.15
+    min_silence_duration: float = 0.35
+    interruption: bool = True
     sensitivity: float = 0.5
     sample_rate: int = 24000
 

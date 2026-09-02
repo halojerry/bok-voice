@@ -380,23 +380,32 @@ class SqlAlchemyBusinessRepository:
     @staticmethod
     def default_settings() -> dict:
         return {
+            # ASR：agent 只消费 provider/base_url；model/backend/language 是误导性死配置，不再下发。
             "asr": {
                 "provider": "qwen3_asr",
-                "model": "Qwen/Qwen3-ASR-0.6B",
                 "base_url": "http://127.0.0.1:8787",
-                "backend": "transformers",
-                "language": "zh",
             },
             # Packaged/dev default: local OpenAI-compatible LLM on :1235
             # (mlx_lm on macOS, llama-server on Windows). Zero-Ollama.
             "llm": {"provider": "local_openai", "model": "", "base_url": "http://127.0.0.1:1235/v1"},
+            # TTS：provider= qwen3_tts | volcano_streaming | fake；音色按语言 speaker_zh/yue/en（persona 绑定音色优先）。
             "tts": {
                 "provider": "qwen3_tts",
-                "model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
                 "base_url": "http://127.0.0.1:8788",
+                "speaker_zh": "",
+                "speaker_yue": "",
+                "speaker_en": "",
+                "instruct": "",
                 "sample_rate": 24000,
             },
-            "vad": {"provider": "silero", "model": "silero"},
+            # VAD/打断：agent 运行时会读取（不再走环境变量），interruption 控制打断开关。
+            "vad": {
+                "provider": "silero",
+                "max_buffered_speech": 15.0,
+                "min_speech_duration": 0.15,
+                "min_silence_duration": 0.35,
+                "interruption": True,
+            },
             "policy": "offline_first",
         }
 

@@ -7,6 +7,9 @@ const DEFAULT_OPTS = {
   sampleRate: 24000,
   chunkMs: 100,
   timeoutMs: 120000,
+  // 按目标语言选择克隆/预设音色（与 A 线一致）：zh/yue/en -> voice_id。
+  // Qwen3-TTS 无粤语 preset，粤语必须用粤语参考音频克隆的 voice（如 acceptance-yue）。
+  voices: {},
 };
 
 function durationMsFor(pcm, sampleRate) {
@@ -21,11 +24,16 @@ export class Qwen3TTSProvider {
 
   async synthesize(text, targetLang) {
     if (!text) return [];
+    const voices = this.opts.voices || {};
+    const langKey = String(targetLang || "").toLowerCase();
+    // 目标语言优先；无对应 voice 时回退 zh/默认（保持现状不崩）。
+    const voice = voices[langKey] || voices.zh || "";
     const res = await fetch(`${this.baseUrl}/v1/audio/speech`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         input: text,
+        voice,
         language: targetLang || "Auto",
         sample_rate: this.opts.sampleRate,
         streaming: true,

@@ -48,7 +48,7 @@ function buildTranslator(provider, config) {
   });
 }
 
-export function createWorker(config, { metricsSink = appendMetrics } = {}) {
+export function createWorker(config, { metricsSink = appendMetrics, ttsVoices = {} } = {}) {
   const channels = new Map(); // channelId -> { channel, ws, timer }
 
   function openChannel(ws, msg) {
@@ -75,7 +75,7 @@ export function createWorker(config, { metricsSink = appendMetrics } = {}) {
             vad: new EnergyVAD({ sampleRate: asrCfg.sample_rate || 16000 }),
           }),
       translator: useMock ? new MockTranslator() : buildTranslator(msg.translatorProvider, config),
-      tts: useMock ? new MockTTS() : new Qwen3TTSProvider({ baseUrl: ttsCfg.base_url, sampleRate: ttsCfg.sample_rate || 24000 }),
+      tts: useMock ? new MockTTS() : new Qwen3TTSProvider({ baseUrl: ttsCfg.base_url, sampleRate: ttsCfg.sample_rate || 24000, voices: ttsVoices }),
       events: emitter,
     });
 
@@ -172,9 +172,29 @@ export function createWorker(config, { metricsSink = appendMetrics } = {}) {
   return wss;
 }
 
+// 从 control-plane 拉取 TTS 三语言音色（speaker_zh/yue/en），让 B 线合成时按目标语言
+// 选粤语克隆/预设音色（否则默认普通话 Vivian 念粤语会「夹生」）。失败降级空 map（不崩）。
+// control-plane 固定本机 127.0.0.1:8000（A/B 线同栈）。
+async function loadTtsVoices(config) {
+  const cp = config.controlPlaneUrl || "http://127.0.0.1:8000";
+  try {
+    const r = await fetch(`${cp}/api/settings?internal=1`, { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const s = await r.json();
+    const t = s.tts || {};
+    const voices = { zh: t.speaker_zh || "", yue: t.speaker_yue || "", en: t.speaker_en || "" };
+    console.log("[worker] tts voices (from control-plane):", JSON.stringify(voices));
+    return voices;
+  } catch (err) {
+    console.warn("[worker] loadTtsVoices failed (voice fallback to default):", err?.message || err);
+    return {};
+  }
+}
+
 // 直接运行时监听；被测试 import 时不自动起服务。
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   const config = loadConfig();
-  createWorker(config);
+  const voices = await loadTtsVoices(config);
+  createWorker(config, { ttsVoices: voices });
   console.log(`[worker] realtime translation listening on ws://${config.server.host}:${config.server.port}`);
 }

@@ -85,6 +85,16 @@
 | LLM 默认 | `provider=local_openai` + `http://127.0.0.1:1235/v1` | A/B 线共用本地 LLM |
 | 服务绑定 | 127.0.0.1 | 仅本机可访问 |
 
+### 设置（`/api/settings`，Agent 运行时会真实消费）
+
+- `asr.provider`：`qwen3_asr`（本地 sidecar）/ `sherpa_sensevoice` / `fake`（仅测试）。
+- `llm.provider`：`local_openai`/`mlx`（本地）/ `deepseek`（云端，缺 `api_key` 显式告警并回退本地）/ `fake`。
+- `tts.provider`：`qwen3_tts` / `volcano_streaming`（需 `VOLC_*` 环境变量）/ `fake`（静音测试音，非火山 beep）。
+  音色兜底按语言 `speaker_zh/yue/en`；persona 绑定 `reference_audio` 优先。
+- `vad`：`provider` + `max_buffered_speech` / `min_speech_duration` / `min_silence_duration` / `interruption`
+  —— 直接构造 `inference.VAD` 与打断开关（环境变量 `VAD_*` 仅作部署覆盖）。
+- `policy`：`offline_first`/`cloud_first`；建通话（`POST /api/calls`）时写入 manifest。
+
 ## 6. 故障排查
 
 1. `python tools/bok.py status` — 七项端口 UP/DOWN

@@ -775,6 +775,9 @@ class _Qwen3TTSStream(tts.ChunkedStream):
         self._tts_ = tts_
 
     async def _run(self, output_emitter):
+        # emitter 是否已 initialize：未收到响应就被打断/挂断时 emitter 从未启动，
+        # 此时 flush 会抛 "AudioEmitter isn't started"（误报 TTS 断链）。只在已启动后收尾。
+        started = False
         try:
             last_exc: Exception | None = None
             for attempt in range(3):
@@ -812,6 +815,7 @@ class _Qwen3TTSStream(tts.ChunkedStream):
                             mime_type="audio/pcm",
                             stream=True,
                         )
+                        started = True
                         output_emitter.start_segment(segment_id="qwen3-tts")
                         async for data in resp.aiter_bytes():
                             buf.extend(data)
@@ -853,7 +857,11 @@ class _Qwen3TTSStream(tts.ChunkedStream):
             print("QWEN3_TTS_FATAL", repr(exc), flush=True)
             await self._emit_beep(output_emitter)
         finally:
-            output_emitter.flush()
+            if started:
+                try:
+                    output_emitter.flush()
+                except Exception:  # pragma: no cover - 收尾失败不影响主流程
+                    pass
 
     async def _emit_beep(self, output_emitter):
         import math

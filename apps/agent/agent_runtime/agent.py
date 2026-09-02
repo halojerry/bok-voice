@@ -75,6 +75,54 @@ def _parse_voice_map(raw) -> dict:
     return {"zh": str(raw or "")}
 
 
+_LANG_LABELS = {"zh": "普通话/中文", "yue": "粤语", "en": "英语"}
+
+
+def _normalize_lang(raw, default: str = "") -> str:
+    """把对象/人设里的语言值归一为 zh/yue/en。vi 等未支持语言回落到 default。"""
+    key = (raw or "").strip().lower()
+    mapping = {
+        "zh": "zh", "chinese": "zh", "mandarin": "zh", "普通话": "zh", "中文": "zh",
+        "yue": "yue", "cantonese": "yue", "粤": "yue", "粤语": "yue", "广东话": "yue",
+        "en": "en", "english": "en", "英语": "en",
+        "vi": "", "vietnamese": "", "auto": "", "": "",
+    }
+    return mapping.get(key, key if key in {"zh", "yue", "en"} else default)
+
+
+def _build_default_voice_map(tts_cfg: dict) -> dict:
+    """组每语言兜底音色（persona 未绑定 reference_audio 时使用）。
+
+    返回 {zh|yue|en: voice_id}；只包含已配置的语言。Qwen3TTSTTS 解析时
+    当前语言缺省会回落到 zh，因此只配 speaker_zh 也能让粤语/英语轮次出声。
+    """
+    single = tts_cfg.get("speaker") or ""
+    mapping: dict[str, str] = {}
+    zh = tts_cfg.get("speaker_zh") or single
+    if zh:
+        mapping["zh"] = zh
+    yue = tts_cfg.get("speaker_yue")
+    if yue:
+        mapping["yue"] = yue
+    en = tts_cfg.get("speaker_en")
+    if en:
+        mapping["en"] = en
+    return mapping
+
+
+def _vad_float(cfg: dict, key: str, env_name: str, default: str) -> float:
+    """VAD 时长参数：agent 侧显式环境变量优先（部署覆盖），否则用设置页值。"""
+    raw = os.environ.get(env_name)
+    if raw is None or raw == "":
+        raw = cfg.get(key)
+    if raw is None or raw == "":
+        raw = default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):  # pragma: no cover - 配置错误按默认值兜底
+        return float(default)
+
+
 def _sidecar_base_url(cfg_base: str, env_name: str, default: str) -> str:
     """Prefer the container-facing env URL over a browser-local loopback config.
 
@@ -112,10 +160,13 @@ def _instructions(
     if persona:
         name = persona.get("name") or "Bok Voice"
         company = persona.get("company") or ""
+        # 人设语言 = AI 的母语基调：默认用该语言，但客户明确说其它语言时仍跟随客户。
+        persona_lang = _normalize_lang(persona.get("language"))
+        lang_note = f"你以{_LANG_LABELS.get(persona_lang, persona_lang)}为母语。" if persona_lang else ""
         # 对象绑定的话术模板可覆盖人设语气（tone_override 优先）。
         tone = (template or {}).get("tone_override") or persona.get("tone") or ""
         style = f"说话风格：{tone}。" if tone else ""
-        parts.append(f"你是{name}，代表{company}。{style}".replace("。。", "。"))
+        parts.append(f"你是{name}，代表{company}。{lang_note}{style}".replace("。。", "。"))
     if object_card:
         display = object_card.get("display_name") or ""
         role = object_card.get("role_template") or "客户"
@@ -142,6 +193,7 @@ def _instructions(
         "用户说普通话就只用标准普通话回复（严禁使用任何粤语口语用字）；"
         "用户说粤语就用地道粤语口语回复（使用如：唔、冇、嘅、哋、佢、喺、嚟、啲、咁、係、唔該、"
         "倾偈、而家、睇嚟、啱啱）；用户说英语就用英语回复。"
+        "在尚未确定客户语言（如开场）或客户语言不明时，使用你（客服）的母语。"
         "直接以该语言回应，不要解释你正在使用什么语言，不要添加任何注释或括号说明。"
     )
     return "\n".join(parts)
@@ -149,12 +201,12 @@ def _instructions(
 
 async def entrypoint(ctx):
     """LiveKit Agent job entrypoint (must be module-level for pickling)."""
-    from livekit.agents import Agent, AgentSession, TurnHandlingOptions, inference, stt
+    from livekit.agents import Agent, AgentSession, StopResponse, TurnHandlingOptions, inference, stt
     from .providers.livekit_plugins import ContextState, DeepSeekLLM, ExprAwareLLM
 
     room_name = ctx.room.name
     call_id = os.environ.get("AGENT_CALL_ID") or room_name
-    cp_base = os.environ.get("CONTROL_PLANE_URL") or "http://control-plane:8000"
+    cp_base = os.environ.get("CONTROL_PLANE_URL") or "http://127.0.0.1:8000"
     cp = ControlPlaneClient(cp_base)
 
     # Resolve business context (call -> object -> persona -> knowledge) for injection.
@@ -213,6 +265,7 @@ async def entrypoint(ctx):
         FakeLiveKitTTS,
         FakeLiveKitVAD,
         LanguageState,
+        MlxLlmLLM,
         Qwen3ASRSTT,
         Qwen3TTSTTS,
         ContextAwareLLM,
@@ -223,26 +276,34 @@ async def entrypoint(ctx):
     )
 
     language_state = LanguageState()
+    # 开场语言 = 人设(AI)语言优先（用户在人设里选了普通话/粤语/英文，就是期望 AI 用它说话）；
+    # 未设置时回落到对象(客户)语言；再退回普通话。之后每轮由 ASR 检出的客户语言覆盖。
+    greet_lang = _normalize_lang((persona or {}).get("language")) or _normalize_lang((object_card or {}).get("language")) or "zh"
+    language_state.lang = greet_lang
     from .plugins.emotion import EmotionState
 
     emotion_state = EmotionState()
     use_fake = os.environ.get("USE_FAKE_MEDIA") == "1"
 
-    if use_fake:
+    # ---- VAD：设置页 vad.provider / 时长 / 打断开关；环境变量仅作部署覆盖 ----
+    vad_provider_name = (vad_cfg.get("provider") or "silero").lower()
+    if use_fake or vad_provider_name in ("fake", "fake_vad"):
         vad_provider = FakeLiveKitVAD()
-        stt_provider = FakeLiveKitSTT()
-        tts_provider = FakeLiveKitTTS()
     else:
         vad_provider = inference.VAD(
-            # 默认 60s 的 max_buffered_speech 会在无静音假音频/连续说话时
-            # 一直缓冲不切句，最终把 worker 拖到「process is unresponsive」。
-            max_buffered_speech=float(os.environ.get("VAD_MAX_BUFFERED_SPEECH", "15")),
-            min_speech_duration=float(os.environ.get("VAD_MIN_SPEECH_DURATION", "0.15")),
-            min_silence_duration=float(os.environ.get("VAD_MIN_SILENCE_DURATION", "0.35")),
+            max_buffered_speech=_vad_float(vad_cfg, "max_buffered_speech", "VAD_MAX_BUFFERED_SPEECH", "15"),
+            min_speech_duration=_vad_float(vad_cfg, "min_speech_duration", "VAD_MIN_SPEECH_DURATION", "0.15"),
+            min_silence_duration=_vad_float(vad_cfg, "min_silence_duration", "VAD_MIN_SILENCE_DURATION", "0.35"),
         )
+    interruption_enabled = bool(vad_cfg.get("interruption", True)) if vad_provider_name != "fake" else True
+
+    # ---- ASR：设置页 asr.provider（qwen3_asr / sherpa_sensevoice / fake）----
+    asr_provider_name = (asr_cfg.get("provider") or "qwen3_asr").lower()
+    if use_fake or asr_provider_name in ("fake", "fake_stt"):
+        stt_provider = FakeLiveKitSTT()
+    else:
         # 只有显式选择 sherpa 才走 sherpa-onnx；未知/缺失/历史值一律回退 sidecar
         # （Qwen3-ASR），避免配置写错导致 agent 崩溃（sherpa 模型不再随包）。
-        asr_provider_name = (asr_cfg.get("provider") or "qwen3_asr").lower()
         use_sherpa = asr_provider_name in {"sherpa", "sherpa_sensevoice"}
         stt_provider = stt.StreamAdapter(
             stt=(
@@ -260,29 +321,37 @@ async def entrypoint(ctx):
             vad=vad_provider,
         )
 
-        tts_provider_name = tts_cfg.get("provider") or "qwen3_tts"
-        if tts_provider_name == "qwen3_tts":
-            voice_map = _parse_voice_map(
-                (persona or {}).get("reference_audio")
-                or tts_cfg.get("speaker")
-                or tts_cfg.get("speaker_zh")
-            )
-            tts_provider = Qwen3TTSTTS(
-                base_url=_sidecar_base_url(
-                    tts_cfg.get("base_url") or "",
-                    "QWEN3_TTS_BASE_URL",
-                    "http://127.0.0.1:8788",
-                ),
-                voice=voice_map,
-                language_state=language_state,
-                instruct=tts_cfg.get("instruct") or "",
-                emotion_state=emotion_state,
-                sample_rate=int(tts_cfg.get("sample_rate") or 24000),
-            )
+    # ---- TTS：设置页 tts.provider（qwen3_tts / volcano_streaming / fake）----
+    tts_provider_name = (tts_cfg.get("provider") or "qwen3_tts").lower()
+    if use_fake or tts_provider_name in ("fake", "fake_tts"):
+        # fake = 静音测试音（FakeLiveKitTTS）；绝不落入 Volcano 的 beep 分支。
+        tts_provider = FakeLiveKitTTS()
+    elif tts_provider_name in ("volcano", "volcano_streaming"):
+        tts_provider = VolcanoTTS(
+            sample_rate=int(tts_cfg.get("sample_rate") or 24000),
+        )
+    else:
+        if tts_provider_name not in ("", "qwen3_tts"):
+            print(f"[agent] unknown tts provider {tts_provider_name!r}, fallback qwen3_tts", flush=True)
+        persona_voice = (persona or {}).get("reference_audio") or ""
+        if persona_voice:
+            # persona 绑定的分语言音色优先（老格式单字符串 → {zh: ...}）。
+            voice_map = _parse_voice_map(persona_voice)
         else:
-            tts_provider = VolcanoTTS(
-                sample_rate=int(tts_cfg.get("sample_rate") or 24000),
-            )
+            # 兜底：设置页 speaker_zh/yue/en 组每语言音色。
+            voice_map = _build_default_voice_map(tts_cfg)
+        tts_provider = Qwen3TTSTTS(
+            base_url=_sidecar_base_url(
+                tts_cfg.get("base_url") or "",
+                "QWEN3_TTS_BASE_URL",
+                "http://127.0.0.1:8788",
+            ),
+            voice=voice_map,
+            language_state=language_state,
+            instruct=tts_cfg.get("instruct") or "",
+            emotion_state=emotion_state,
+            sample_rate=int(tts_cfg.get("sample_rate") or 24000),
+        )
 
     llm_provider_name = llm_cfg.get("provider") or "local_openai"
     if os.environ.get("SCRIPTED_LLM") == "1":
@@ -299,13 +368,14 @@ async def entrypoint(ctx):
                 base_url=llm_cfg.get("base_url") or os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
             )
         else:
+            # 云端 provider 缺 key：显式告警并回退本地，不再静默发生。
+            _agent_log("llm.deepseek.no_api_key", fallback="mlx")
+            print("[agent] deepseek selected but DEEPSEEK_API_KEY missing — falling back to local MLX LLM", flush=True)
             llm_provider = MlxLlmLLM(
                 base_url=os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
                 model=os.environ.get("MLX_LLM_MODEL", "local"),
             )
     elif llm_provider_name in ("mlx", "local_openai", "lmstudio"):
-        from .providers.livekit_plugins import MlxLlmLLM
-
         llm_provider = MlxLlmLLM(
             base_url=llm_cfg.get("base_url")
             or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
@@ -350,7 +420,7 @@ async def entrypoint(ctx):
                 "max_retries": 3,
             },
             interruption={
-                "enabled": True,
+                "enabled": interruption_enabled,
                 "min_duration": 0.35,
                 "min_words": 0,
             },
