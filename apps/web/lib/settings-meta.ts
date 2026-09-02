@@ -24,6 +24,8 @@ export interface FieldMeta {
   max?: number;
   step?: number;
   options?: ProviderOption[];
+  /** 音色类字段：设置页可一键试听当前选中音色。 */
+  preview?: boolean;
 }
 
 export interface ProviderMeta {
@@ -59,24 +61,34 @@ export const SETTING_CARDS: ProviderMeta[] = [
       { value: "fake", label: "Fake（仅测试）", hint: "固定脚本回复。" },
     ],
     fields: [
-      { key: "model", label: "模型名", type: "text", hint: "本地可不填（走环境变量）；deepseek 填如 deepseek-chat。", placeholder: "deepseek-chat" },
-      { key: "base_url", label: "服务地址", type: "text", placeholder: "http://127.0.0.1:1235/v1" },
+      { key: "model", label: "模型名", type: "text", hint: "本地默认走环境变量注入的真实模型路径，可留空；deepseek 填如 deepseek-chat。", placeholder: "deepseek-chat" },
+      { key: "base_url", label: "服务地址", type: "text", hint: "本地可留空（启动器已注入 http://127.0.0.1:1235/v1）；deepseek 填 https://api.deepseek.com/v1。", placeholder: "http://127.0.0.1:1235/v1" },
       { key: "api_key", label: "API Key", type: "secret", hint: "仅 deepseek 需要；已保存的 Key 不会回显。", placeholder: "sk-…" },
     ],
   },
   {
     kind: "tts",
     title: "TTS 语音合成",
-    desc: "把 AI 回复念出来。qwen3_tts 走本地 sidecar；volcano 走火山引擎（需 VOLC_* 环境变量）；fake 出静音测试音。",
+    desc: "把 AI 回复念出来。qwen3_tts 走本地 sidecar；volcano 走火山引擎；minimax 走 MiniMax 云端（粤语地道、情感自然）；fake 出静音测试音。",
     providers: [
       { value: "qwen3_tts", label: "Qwen3-TTS（本地）" },
       { value: "volcano_streaming", label: "火山引擎（云端）", hint: "凭据读 VOLC_APP_ID / VOLC_ACCESS_TOKEN 环境变量。" },
+      { value: "minimax", label: "MiniMax（云端）", hint: "凭据读 MINIMAX_API_KEY；国内 api.minimax.cn / 海外 api.minimax.chat（MINIMAX_REGION=cn/intl，或 MINIMAX_BASE_URL 显式覆盖）。" },
       { value: "fake", label: "Fake（仅测试）", hint: "静音测试音，无模型也可跑通链路。" },
     ],
     fields: [
       { key: "base_url", label: "服务地址", type: "text", hint: "Qwen3-TTS sidecar 地址；agent 运行时会优先读 QWEN3_TTS_BASE_URL。", placeholder: "http://127.0.0.1:8788" },
-      { key: "speaker_zh", label: "普通话音色", type: "text", hint: "persona 未绑音色时的默认音色。", placeholder: "如 zhiyan_meet_feminine" },
-      { key: "speaker_yue", label: "粤语音色", type: "text", hint: "客户切粤语时使用；留空则沿用普通话音色。" },
+      { key: "speaker_zh", label: "普通话音色", type: "text", preview: true, hint: "persona 未绑音色时的默认音色；MiniMax 如 zhiyan_meet_feminine。", placeholder: "如 zhiyan_meet_feminine" },
+      { key: "speaker_yue", label: "粤语音色", type: "select", preview: true, hint: "客户切粤语时使用。MiniMax 粤语音色（实测可用）；选「跟随普通话」则粤语轮用普通话音色。", options: [
+        { value: "", label: "跟随普通话（不单独设粤语）" },
+        { value: "Cantonese_Male_news_anchor_vv2", label: "男主播 news_anchor_vv2" },
+        { value: "Cantonese_ProfessionalHost（F)", label: "专业女主持（F）" },
+        { value: "Cantonese_ProfessionalHost（M)", label: "专业男主持（M）" },
+        { value: "Cantonese_GentleLady", label: "温柔女声 GentleLady" },
+        { value: "Cantonese_PlayfulMan", label: "活泼男声 PlayfulMan" },
+        { value: "Cantonese_CuteGirl", label: "可爱女孩 CuteGirl" },
+        { value: "Cantonese_KindWoman", label: "善良女声 KindWoman" },
+      ] },
       { key: "speaker_en", label: "英语音色", type: "text", hint: "客户切英语时使用；留空则沿用普通话音色。" },
       { key: "instruct", label: "语气指令（可选）", type: "text", hint: "附加到每次合成的情绪指令之前。", placeholder: "如：温和、耐心" },
       { key: "sample_rate", label: "采样率", type: "number", hint: "输出 PCM 采样率，通常保持 24000。", min: 8000, max: 48000, step: 1000 },

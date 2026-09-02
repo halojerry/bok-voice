@@ -8,15 +8,17 @@ export default function ReportsPage() {
   const [summary, setSummary] = useState<Record<string, unknown> | null>(null);
   const [calls, setCalls] = useState<Record<string, unknown>[]>([]);
   const [usage, setUsage] = useState<Record<string, unknown> | null>(null);
+  const [insights, setInsights] = useState<Record<string, unknown>[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
-    Promise.all([api.reportsSummary(), api.reportsCalls(), api.reportsUsage()])
-      .then(([s, c, u]) => {
+    Promise.all([api.reportsSummary(), api.reportsCalls(), api.reportsUsage(), api.listGlobalInsights()])
+      .then(([s, c, u, i]) => {
         setSummary(s as Record<string, unknown>);
         setCalls(Array.isArray(c) ? c : []);
         setUsage(u as Record<string, unknown>);
+        setInsights(Array.isArray(i) ? i : []);
         setErr(null);
       })
       .catch((e) => setErr(String(e)))
@@ -93,6 +95,26 @@ export default function ReportsPage() {
               </div>
             </section>
           </div>
+
+          <section className="card mt-6">
+            <span className="label">全局洞察</span>
+            <p className="mt-1 text-xs text-[var(--muted)]">由每场挂断结算自动蒸馏（本机 LLM），反映对象群共性的观察。结算过的通话越多越有价值。</p>
+            {insights.length === 0 ? (
+              <p className="mt-3 text-sm text-[var(--muted)]">暂无洞察。完成几场通话并挂断结算后会自动沉淀到这里。</p>
+            ) : (
+              <div className="mt-3 space-y-2">
+                {insights.map((ins, i) => (
+                  <div key={String(ins.id ?? i)} className="rounded-lg bg-white/5 p-3 text-sm">
+                    <p>{String(ins.statement ?? "")}</p>
+                    <p className="mt-1 text-xs text-[var(--muted)]">
+                      置信度 {String(ins.confidence ?? "-")} · {String(ins.language ?? "zh")}
+                      {ins.created_at ? ` · ${String(ins.created_at).slice(0, 19)}` : ""}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
         </>
       )}
     </div>

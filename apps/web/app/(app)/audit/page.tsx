@@ -5,7 +5,7 @@ import { api } from "@/lib/api";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
 
 type AuditRow = {
-  event_id: string;
+  id: string;
   ts: string;
   action: string;
   subject_type: string;
@@ -105,8 +105,8 @@ export default function AuditPage() {
               </tr>
             </thead>
             <tbody>
-              {rows.map((r) => (
-                <tr key={r.event_id} className="border-b border-[var(--card-border)] last:border-0">
+              {rows.map((r, i) => (
+                <tr key={r.id ?? i} className="border-b border-[var(--card-border)] last:border-0">
                   <td className="px-4 py-2 font-mono text-xs">{r.ts}</td>
                   <td className="px-4 py-2 font-mono text-xs text-[var(--accent)]">{r.action}</td>
                   <td className="px-4 py-2 text-xs">{r.subject_type}:<span className="font-mono">{r.subject_id}</span></td>

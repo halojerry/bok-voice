@@ -16,12 +16,13 @@ export const api = {
   ttsHealth: () => request<Record<string, unknown>>("/api/tts/health"),
   listTtsSpeakers: () => request<string[]>("/api/tts/speakers"),
   listTtsVoices: () => request<Record<string, unknown>[]>("/api/tts/voices"),
+  deleteTtsVoice: (voiceId: string) => request<Record<string, unknown>>(`/api/tts/voices/${encodeURIComponent(voiceId)}`, { method: "DELETE" }),
   registerTtsVoice: (body: FormData) =>
     fetch(`${CONTROL_PLANE_URL}/api/tts/voices`, { method: "POST", body }).then(async (res) => {
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
       return res.json() as Promise<Record<string, unknown>>;
     }),
-  previewTts: async (body: { text: string; voice?: string; language?: string; instruct?: string; sample_rate?: number }) => {
+  previewTts: async (body: { text: string; voice?: string; language?: string; instruct?: string; sample_rate?: number; provider?: string }) => {
     const res = await fetch(`${CONTROL_PLANE_URL}/api/tts/preview`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -38,6 +39,9 @@ export const api = {
   listCalls: (accountId = "acc-001", status = "") =>
     request<Record<string, unknown>[]>(`/api/calls?account_id=${accountId}&status=${status}`),
   getCall: (id: string) => request<Record<string, unknown>>(`/api/calls/${id}`),
+  deleteCall: (id: string) => request<Record<string, unknown>>(`/api/calls/${id}`, { method: "DELETE" }),
+  clearEndedCalls: (accountId = "acc-001") =>
+    request<Record<string, unknown>>(`/api/calls?account_id=${accountId}`, { method: "DELETE" }),
   hangup: (id: string) => request<Record<string, unknown>>(`/api/calls/${id}/hangup`, { method: "POST" }),
   settle: (id: string) => request<Record<string, unknown>>(`/api/calls/${id}/settle`, { method: "POST" }),
   searchKnowledge: (query: string, accountId = "acc-001") =>
@@ -45,6 +49,8 @@ export const api = {
   listObjects: (accountId = "acc-001") =>
     request<Record<string, unknown>[]>(`/api/objects?account_id=${accountId}`),
   getObject: (id: string) => request<Record<string, unknown>>(`/api/objects/${id}`),
+  getObjectTopics: (id: string) => request<Record<string, unknown>[]>(`/api/objects/${id}/topics`),
+  listGlobalInsights: () => request<Record<string, unknown>[]>("/api/insights"),
   createObject: (body: unknown, accountId = "acc-001") =>
     request<Record<string, unknown>>(`/api/objects?account_id=${accountId}`, { method: "POST", body: JSON.stringify(body) }),
   updateObject: (id: string, body: unknown) =>
@@ -55,7 +61,8 @@ export const api = {
     request<Record<string, unknown>>(`/api/objects/import?account_id=${accountId}`, { method: "POST", body: JSON.stringify(body) }),
   listKnowledge: (accountId = "acc-001") => request<Record<string, unknown>[]>(`/api/knowledge?account_id=${accountId}`),
   deleteKnowledge: (id: string, accountId = "acc-001") =>
-    request<Record<string, unknown>>(`/api/knowledge/${id}?account_id=${accountId}`, { method: "DELETE" }),
+    // id 形如 md:accounts/...（含斜杠），必须走 query 参数：放 path 会被路由层 404。
+    request<Record<string, unknown>>(`/api/knowledge?knowledge_id=${encodeURIComponent(id)}&account_id=${accountId}`, { method: "DELETE" }),
   importKnowledge: (body: { account_id: string; path?: string; content: string }) =>
     request<Record<string, unknown>>("/api/knowledge/import", { method: "POST", body: JSON.stringify(body) }),
   listPersonas: () => request<Record<string, unknown>[]>("/api/personas"),

@@ -110,6 +110,25 @@ export async function applyOutputDevice(deviceId: string): Promise<void> {
   }
 }
 
+/**
+ * 浏览器里真正切换扬声器输出：把 room 的远端音频元素路由到目标设备。
+ * livekit 的 Room.switchActiveDevice("audiooutput") 在 Chromium 会调用
+ * setSinkId；Safari/WKWebView 不支持 setSinkId，会抛错，由调用方静默忽略。
+ * 需要 room 已连接（发布音频后）才有效，因此接通后再调用最可靠。
+ */
+export async function switchWebOutputDevice(room: { switchActiveDevice: (kind: string, id: string, exact?: boolean) => Promise<boolean> }, deviceId: string): Promise<boolean> {
+  if (!deviceId || !room || typeof room.switchActiveDevice !== "function") return false;
+  if (!webCanSwitchOutput()) return false;
+  try {
+    await room.switchActiveDevice("audiooutput", deviceId, false);
+    saveOutputDevice(deviceId);
+    return true;
+  } catch (e) {
+    console.warn("switch web audiooutput failed", e);
+    return false;
+  }
+}
+
 /** Chromium 浏览器才支持网页 setSinkId（livekit 对 Safari/WKWebView 内核禁用了输出切换）。 */
 export function webCanSwitchOutput(): boolean {
   if (typeof document === "undefined") return false;

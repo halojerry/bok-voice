@@ -23,6 +23,30 @@ export default function CallsPage() {
   const [objects, setObjects] = useState<Record<string, unknown>[]>([]);
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [clearing, setClearing] = useState(false);
+
+  async function removeOne(id: string) {
+    if (!window.confirm("确认删除该通话记录？（转写与结算一并删除）")) return;
+    try {
+      await api.deleteCall(id);
+      setRows((prev) => prev.filter((r) => String(r.id ?? r.call_id) !== id));
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
+
+  async function clearEnded() {
+    if (!window.confirm("确认清空所有已结束的通话历史？此操作不可恢复。")) return;
+    setClearing(true);
+    try {
+      await api.clearEndedCalls(accountId);
+      setRows((prev) => prev.filter((r) => String(r.status ?? "") !== "ended"));
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setClearing(false);
+    }
+  }
 
   useEffect(() => {
     setLoading(true);
@@ -48,9 +72,18 @@ export default function CallsPage() {
           <h1 className="page-title">通话会话</h1>
           <p className="page-sub">进入历史/活跃会话，或发起新会话</p>
         </div>
-        <Link href="/calls/new" className="btn-primary">
-          + 新建通话
-        </Link>
+        <div className="flex items-center gap-2">
+          <button
+            className="btn-ghost text-xs text-[var(--muted)]"
+            onClick={clearEnded}
+            disabled={clearing}
+          >
+            {clearing ? "清理中…" : "清空已结束历史"}
+          </button>
+          <Link href="/calls/new" className="btn-primary">
+            + 新建通话
+          </Link>
+        </div>
       </div>
 
       {err && <p className="mb-4 text-sm text-red-300">{err}</p>}
@@ -66,27 +99,35 @@ export default function CallsPage() {
             const status = String(c.status ?? "idle");
             const [label, color] = STATUS[status] ?? [status, "bg-neutral-500"];
             return (
-              <Link
+              <div
                 key={id}
-                href={`/calls/${id}`}
-                className="flex items-center justify-between rounded-lg bg-white/5 px-4 py-3 transition hover:bg-white/10"
+                className="flex items-center justify-between gap-2 rounded-lg bg-white/5 px-2 py-1 transition hover:bg-white/10"
               >
-                <div className="min-w-0">
-                  <p className="truncate font-medium">{objectName(c.object_id)}</p>
-                  <p className="mt-1 text-xs text-[var(--muted)]">
-                    {modeLabel(String(c.mode ?? "simulation"))} · {String(c.language ?? "-")} ·{" "}
-                    {String(c.created_at ?? "").slice(0, 19).replace("T", " ")}
-                  </p>
-                  <p className="mt-1 truncate text-xs text-[var(--muted)]">{id}</p>
-                </div>
-                <div className="flex shrink-0 items-center gap-3">
-                  <span className="inline-flex items-center gap-1.5 text-xs text-[var(--muted)]">
-                    <span className={`h-2 w-2 rounded-full ${color}`} />
-                    {label}
-                  </span>
-                  <span className="text-[var(--accent)]">进入 →</span>
-                </div>
-              </Link>
+                <Link href={`/calls/${id}`} className="flex min-w-0 flex-1 items-center justify-between gap-3 px-2 py-2">
+                  <div className="min-w-0">
+                    <p className="truncate font-medium">{objectName(c.object_id)}</p>
+                    <p className="mt-1 text-xs text-[var(--muted)]">
+                      {modeLabel(String(c.mode ?? "simulation"))} · {String(c.language ?? "-")} ·{" "}
+                      {String(c.created_at ?? "").slice(0, 19).replace("T", " ")}
+                    </p>
+                    <p className="mt-1 truncate text-xs text-[var(--muted)]">{id}</p>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-3">
+                    <span className="inline-flex items-center gap-1.5 text-xs text-[var(--muted)]">
+                      <span className={`h-2 w-2 rounded-full ${color}`} />
+                      {label}
+                    </span>
+                    <span className="text-[var(--accent)]">进入 →</span>
+                  </div>
+                </Link>
+                <button
+                  className="btn-ghost shrink-0 text-xs text-red-300/80 hover:text-red-300"
+                  onClick={() => removeOne(id)}
+                  title="删除该通话记录"
+                >
+                  删除
+                </button>
+              </div>
             );
           })}
         </div>

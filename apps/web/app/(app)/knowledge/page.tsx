@@ -5,6 +5,16 @@ import { api } from "@/lib/api";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
 
+/** 「一键填入示例」：一段可直接导入的示例知识（三语产品介绍）。 */
+const SAMPLE_MD = `# Bok Voice 产品知识（示例）
+
+Bok Voice 是一套本地优先的 AI 语音客服系统，可在电脑上离线运行。
+
+- 支持语言：普通话、粤语、英语三语对话，本地自动识别客户语言。
+- 本地部署：ASR / LLM / TTS 全部走本机模型，数据不出本机。
+- 适用场景：客服训练、真实外呼/接听的坐席工作台、主管实时旁听与接管。
+- 计费：无需按分钟付费，一次购买本地运行。`;
+
 export default function KnowledgePage() {
   const { accountId } = useAccount();
   const [q, setQ] = useState("");
@@ -132,8 +142,30 @@ export default function KnowledgePage() {
               value={content}
               onChange={(e) => setContent(e.target.value)}
             />
-            <button className="btn-primary mt-3 w-full" onClick={importMd}>导入知识库</button>
+            <div className="mt-3 flex gap-2">
+              <button className="btn-primary flex-1" onClick={importMd}>导入知识库</button>
+              <button
+                className="btn-ghost"
+                onClick={() => {
+                  setContent(SAMPLE_MD);
+                  setErr(null);
+                }}
+              >
+                填入示例
+              </button>
+            </div>
             {ok && <p className="mt-2 text-sm text-emerald-400">导入成功。</p>}
+          </div>
+
+          <div className="card">
+            <span className="label">知识库如何落盘与使用</span>
+            <ul className="mt-2 space-y-2 text-xs leading-relaxed text-[var(--muted)]">
+              <li>· 导入内容会整篇落盘为 Markdown：<span className="text-[var(--foreground)]">账户数据目录/vault/accounts/{`{账号}`}/knowledge/…</span>，同时建立检索引擎索引。</li>
+              <li>· 每场通话 Agent 会按客户问题自动检索该账号知识，把命中的片段（约 3–5 条）随 system 指令注入大模型，作为回答依据。</li>
+              <li>· 在这里「检索」可实时看到哪些知识会被命中；删除某条会同步清理 vault 文件与索引。</li>
+              <li>· 挂断结算后，通话转写与结算文档也会落盘到 <span className="text-[var(--foreground)]">…/objects/{`{对象}`}/calls/{`{通话}`}/transcript.md 与 settlement.md</span>。</li>
+              <li>· 当前检索为本地字符匹配（离线、无需额外模型）；语义向量检索为后续增强项。</li>
+            </ul>
           </div>
         </section>
       </div>

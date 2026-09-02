@@ -2,7 +2,6 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  MediaDeviceMenu,
   StartAudio,
   VoiceAssistantControlBar,
   useAgent,
@@ -11,10 +10,10 @@ import {
   useSession,
   useTranscriptions,
 } from "@livekit/components-react";
-import { RoomEvent, TokenSource, type Room } from "livekit-client";
+import { TokenSource, Track, type Room } from "livekit-client";
 import { api } from "@/lib/api";
 import { describeConnectError, friendlyErrorText, useControlPlaneReady } from "@/lib/api-ready";
-import { applyOutputDevice, listAudioDevicesOf, savedMicDevice, savedOutputDevice, webCanSwitchOutput, isTauriShell, type AudioDeviceInfo } from "@/lib/audio";
+import { applyOutputDevice, listAudioDevicesOf, requestMicPermission, saveMicDevice, savedMicDevice, savedOutputDevice, switchWebOutputDevice, webCanSwitchOutput, isTauriShell, type AudioDeviceInfo } from "@/lib/audio";
 import { AgentSessionProvider } from "@/components/agents-ui/agent-session-provider";
 import { VoiceAgentInterface } from "@/components/VoiceAgentInterface";
 import { useAccount } from "@/components/account-context";
@@ -56,15 +55,24 @@ function LiveAgentPanel({ room }: { room: Room | null }) {
     scrollRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [recent]);
   const speaking = agentState === "speaking";
-  const outputCanSwitch = isTauriShell() || webCanSwitchOutput();
-  const [outputDevices, setOutputDevices] = useState<AudioDeviceInfo[]>([]);
-  useEffect(() => {
-    if (outputCanSwitch) listAudioDevicesOf("output").then(setOutputDevices).catch(() => {});
-  }, [outputCanSwitch]);
+
+  // 实时分析：基于本通转写实时统计（非挂断后结算值）。
+  const liveStats = useMemo(() => {
+    const texts = transcriptions
+      .map((t) => String(t.text ?? ""))
+      .filter(Boolean);
+    if (texts.length === 0) return null;
+    const all = texts.join(" ");
+    const turnCount = texts.length;
+    const density = Math.round(all.length / Math.max(1, turnCount));
+    const fillers = (all.match(/嗯|啊|那个|就是|咁|啦|uh|um/gi) ?? []).length;
+    const hedges = (all.match(/可能|大概|应该|我觉得|我諗/gi) ?? []).length;
+    return { turnCount, density, fillers, hedges };
+  }, [transcriptions]);
 
   return (
-    <div className="flex h-full flex-1 flex-col">
-      {/* 转写时间线（官方风格：mono、按说话者着色） */}
+    <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden">
+      {/* 转写时间线（官方风格：mono、按说话者着色）；超高时内部滚动，不撑高页面 */}
       <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-1 py-2">
         {recent.length === 0 && (
           <div className="flex flex-1 items-center justify-center font-mono text-[10px] font-bold uppercase tracking-[0.16em] text-[var(--stage-muted)]">
@@ -113,63 +121,243 @@ function LiveAgentPanel({ room }: { room: Room | null }) {
         />
       </div>
 
-      {/* 控制条（AgentSessionProvider 已内置音频渲染）+ 设备切换 */}
+      {/* 实时分析（基于本通转写实时统计） */}
+      {liveStats && (
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-[var(--card-border)] px-2 py-1.5 text-[10px] text-[var(--muted)]">
+          <span>轮次 <b className="text-[var(--foreground)]">{liveStats.turnCount}</b></span>
+          <span>均每轮字数 <b className="text-[var(--foreground)]">{liveStats.density}</b></span>
+          <span>填充词 <b className="text-[var(--foreground)]">{liveStats.fillers}</b></span>
+          <span>犹豫词 <b className="text-[var(--foreground)]">{liveStats.hedges}</b></span>
+        </div>
+      )}
+
+      {/* 控制条（AgentSessionProvider 已内置音频渲染）；设备切换已移到右侧「音频设备」卡片 */}
       <div className="flex flex-col items-center gap-2 border-t border-[var(--card-border)] py-3">
         <div className="flex items-center justify-center gap-3">
           <StartAudio label="点击开启声音" />
           <VoiceAssistantControlBar />
         </div>
-        {room && (
-          <div className="flex items-center justify-center gap-3 text-xs text-[var(--muted)]">
-            <span className="inline-flex items-center gap-1.5">
-              <span className="opacity-70">麦克风</span>
-              <MediaDeviceMenu
-                kind="audioinput"
-                requestPermissions
-                initialSelection={savedMicDevice() || undefined}
-                onActiveDeviceChange={(_kind, deviceId) => {
-                  if (deviceId) {
-                    try {
-                      localStorage.setItem("bok.audio.mic", deviceId);
-                    } catch {
-                      /* ignore */
-                    }
-                    void room.switchActiveDevice("audioinput", deviceId).catch((e) => console.warn("mic switch failed", e));
-                  }
-                }}
-              />
-            </span>
-            {outputCanSwitch ? (
-              <span className="inline-flex items-center gap-1.5">
-                <span className="opacity-70">扬声器</span>
-                <select
-                  className="rounded-lg border border-[var(--card-border)] bg-transparent px-2 py-1 text-xs outline-none focus:border-[var(--accent)]"
-                  value={savedOutputDevice()}
-                  onChange={(e) => {
-                    const id = e.target.value;
-                    try {
-                      localStorage.setItem("bok.audio.out", id);
-                    } catch {
-                      /* ignore */
-                    }
-                    void applyOutputDevice(id);
-                  }}
-                >
-                  <option value="" disabled>
-                    跟随系统
-                  </option>
-                  {outputDevices.map((d) => (
-                    <option key={d.id} value={d.id}>
-                      {d.name}
-                    </option>
-                  ))}
-                </select>
-              </span>
-            ) : (
-              <span className="opacity-70">扬声器跟随系统默认</span>
-            )}
+      </div>
+    </div>
+  );
+}
+
+/** 麦克风实时波形：分析本地发布的 mic track，确认声音真的在采集/上行。 */
+function MicLevelMeter({ room }: { room: Room | null }) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [active, setActive] = useState(false);
+  const [error, setError] = useState("");
+  const [level, setLevel] = useState(0); // 0-100 峰值
+  const [trackInfo, setTrackInfo] = useState("");
+
+  useEffect(() => {
+    if (!room) return;
+    let raf = 0;
+    let analyser: AnalyserNode | null = null;
+    let data: Uint8Array<ArrayBuffer> | null = null;
+    let ctx: AudioContext | null = null;
+
+    const grab = () => {
+      const pub = room.localParticipant.getTrackPublication(Track.Source.Microphone);
+      const mt = pub?.track as { mediaStreamTrack?: MediaStreamTrack } | undefined;
+      const mst = mt?.mediaStreamTrack;
+      if (!mst || mst.readyState !== "live") {
+        setActive(false);
+        setTrackInfo("无 live 麦克风 track(未发布/被拒)");
+        return;
+      }
+      setTrackInfo(`${mst.label || "麦克风"} · ${mst.readyState} · ${mst.getSettings?.().deviceId ? "deviceId 已定" : "deviceId 未定"}`);
+      try {
+        const AC = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+        if (!AC) return;
+        ctx = new AC();
+        const src = ctx.createMediaStreamSource(new MediaStream([mst]));
+        analyser = ctx.createAnalyser();
+        analyser.fftSize = 512;
+        src.connect(analyser);
+        data = new Uint8Array(new ArrayBuffer(analyser.frequencyBinCount));
+        setActive(true);
+        setError("");
+      } catch (e) {
+        setError(String(e));
+      }
+    };
+
+    const draw = () => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const g = canvas.getContext("2d");
+      if (!g) return;
+      const W = canvas.width, H = canvas.height;
+      g.clearRect(0, 0, W, H);
+      g.fillStyle = "rgba(255,255,255,0.04)";
+      g.fillRect(0, 0, W, H);
+      if (analyser && data) {
+        analyser.getByteTimeDomainData(data);
+        // RMS → 电平(0-100)
+        let sum = 0;
+        for (let i = 0; i < data.length; i++) {
+          const v = (data[i] - 128) / 128;
+          sum += v * v;
+        }
+        const rms = Math.sqrt(sum / data.length);
+        setLevel(Math.min(100, Math.round(rms * 220)));
+        g.strokeStyle = "var(--accent, #22d3ee)";
+        g.lineWidth = 2;
+        g.beginPath();
+        for (let i = 0; i < data.length; i++) {
+          const x = (i / data.length) * W;
+          const y = (data[i] / 255) * H;
+          i === 0 ? g.moveTo(x, y) : g.lineTo(x, y);
+        }
+        g.stroke();
+      }
+      raf = requestAnimationFrame(draw);
+    };
+
+    // room 连接后本地 mic track 才出现：轮询一小段等 track 就绪。
+    const tryStart = () => {
+      grab();
+      if (!analyser) {
+        setTimeout(tryStart, 300);
+        return;
+      }
+      draw();
+    };
+    tryStart();
+
+    const onTrack = () => { grab(); if (analyser) draw(); };
+    room.localParticipant.on("trackPublished", onTrack);
+    return () => {
+      cancelAnimationFrame(raf);
+      room.localParticipant.off("trackPublished", onTrack);
+      if (ctx) void ctx.close().catch(() => {});
+    };
+  }, [room]);
+
+  return (
+    <div className="mt-2">
+      <div className="flex items-center justify-between">
+        <span className="text-[10px] text-[var(--muted)]">麦克风输入波形</span>
+        <span className={`text-[10px] ${active ? "text-emerald-400" : "text-[var(--muted)]"}`}>
+          {active ? `● 采集中 ${level > 3 ? `音量 ${level}` : "(静音)"}` : error ? "无法分析" : "未采集"}
+        </span>
+      </div>
+      <canvas ref={canvasRef} width={260} height={40} className="mt-1 w-full rounded bg-black/20" />
+      {trackInfo && <p className="mt-0.5 truncate text-[9px] text-[var(--muted)]" title={trackInfo}>{trackInfo}</p>}
+      {error && <p className="mt-1 text-[10px] text-red-300">{error}</p>}
+    </div>
+  );
+}
+
+/** 音频设备卡片：麦克风(Web enumerate) + 扬声器(桌面 CoreAudio / 浏览器 setSinkId)。 */
+function AudioDevicesCard({ room }: { room: Room | null }) {
+  const [micDevices, setMicDevices] = useState<AudioDeviceInfo[]>([]);
+  const [micId, setMicId] = useState("");
+  const [micNote, setMicNote] = useState("");
+  const [outputDevices, setOutputDevices] = useState<AudioDeviceInfo[]>([]);
+  // 扬声器可用性与已存值都放 state，挂载后再读(避免 SSR 读 localStorage 造成 Hydration 不匹配)
+  const [outputCanSwitch, setOutputCanSwitch] = useState(false);
+  const [outId, setOutId] = useState("");
+  useEffect(() => {
+    setOutputCanSwitch(isTauriShell() || webCanSwitchOutput());
+    setOutId(savedOutputDevice());
+  }, []);
+
+  const refreshMic = async () => {
+    const mics = await listAudioDevicesOf("input").catch(() => []);
+    setMicDevices(mics);
+    const savedMic = savedMicDevice();
+    const next = savedMic && mics.some((m) => m.id === savedMic)
+      ? savedMic
+      : mics.find((m) => m.is_default)?.id ?? mics[0]?.id ?? "";
+    setMicId(next);
+    if (next) saveMicDevice(next);
+    if (next && next !== savedMic && room) {
+      room.switchActiveDevice("audioinput", next, false).catch(() => {});
+    }
+  };
+  useEffect(() => {
+    if (room) refreshMic();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [room]);
+  useEffect(() => {
+    if (outputCanSwitch) listAudioDevicesOf("output").then(setOutputDevices).catch(() => {});
+  }, [outputCanSwitch]);
+
+  const changeOutput = async (id: string) => {
+    if (!id) return;
+    setOutId(id);
+    try {
+      localStorage.setItem("bok.audio.out", id);
+    } catch {
+      /* ignore */
+    }
+    if (isTauriShell()) {
+      await applyOutputDevice(id);
+    } else if (room) {
+      await switchWebOutputDevice(room, id);
+    }
+  };
+
+  return (
+    <div className="rounded-lg bg-white/5 p-3">
+      <span className="label mb-2 block">音频设备</span>
+      <div className="space-y-2 text-xs">
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-[var(--muted)]">麦克风</span>
+          <div className="flex min-w-0 items-center gap-1">
+            <select
+              className="max-w-[150px] rounded-lg border border-[var(--card-border)] bg-transparent px-2 py-1 text-xs outline-none focus:border-[var(--accent)]"
+              value={micId}
+              onChange={(e) => {
+                const id = e.target.value;
+                if (!id) return;
+                setMicId(id);
+                saveMicDevice(id);
+                void room?.switchActiveDevice("audioinput", id, false).catch(() => {});
+              }}
+            >
+              {micDevices.length === 0 && <option value="">未检测到麦克风</option>}
+              {micDevices.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.name}
+                  {m.is_default ? "（默认）" : ""}
+                </option>
+              ))}
+            </select>
+            <button
+              className="rounded-lg border border-[var(--card-border)] px-2 py-1 opacity-70 hover:opacity-100"
+              onClick={async () => {
+                const ok = await requestMicPermission();
+                setMicNote(ok ? "" : "麦克风权限被拒绝。请在 系统设置 › 隐私与安全性 › 麦克风 中允许本应用。");
+                await refreshMic();
+              }}
+            >
+              刷新
+            </button>
           </div>
-        )}
+        </div>
+        {micDevices.length === 0 && micNote && <p className="text-red-300">{micNote}</p>}
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-[var(--muted)]">扬声器</span>
+          {outputCanSwitch ? (
+            <select
+              className="max-w-[150px] rounded-lg border border-[var(--card-border)] bg-transparent px-2 py-1 text-xs outline-none focus:border-[var(--accent)]"
+              value={outId}
+              onChange={(e) => { void changeOutput(e.target.value); }}
+            >
+              <option value="" disabled>跟随系统</option>
+              {outputDevices.map((d) => (
+                <option key={d.id} value={d.id}>{d.name}</option>
+              ))}
+            </select>
+          ) : (
+            <span className="opacity-70">跟随系统默认</span>
+          )}
+        </div>
+        {!room && <p className="text-[var(--muted)]">接通后可用</p>}
+        <MicLevelMeter room={room} />
       </div>
     </div>
   );
@@ -187,15 +375,36 @@ function IdleStage() {
   );
 }
 
-const PROVIDER_NOTE: [string, string][] = [
-  ["ASR", "Qwen3-ASR"],
-  ["LLM", "本地 LLM"],
-  ["TTS", "Qwen3-TTS"],
-  ["VAD", "Silero"],
+const PROVIDER_FIELDS: [string, string][] = [
+  ["asr", "ASR"],
+  ["llm", "LLM"],
+  ["tts", "TTS"],
+  ["vad", "VAD"],
 ];
 
 function str(v: unknown, fallback = "-") {
   return v === undefined || v === null || v === "" ? fallback : String(v);
+}
+
+/** provider value → 中文名(供 Provider 卡与设置一致展示)。 */
+const PROVIDER_LABELS: Record<string, string> = {
+  qwen3_tts: "Qwen3-TTS（本地）",
+  minimax: "MiniMax（云端）",
+  minimax_streaming: "MiniMax（云端）",
+  volcano_streaming: "火山引擎（云端）",
+  volcano: "火山引擎（云端）",
+  qwen3_asr: "Qwen3-ASR",
+  sherpa_sensevoice: "SenseVoice",
+  local_openai: "本地 LLM",
+  mlx: "本地 MLX",
+  deepseek: "DeepSeek",
+  silero: "Silero",
+  fake: "Fake",
+};
+
+function providerLabel(kind: string, settings: Record<string, unknown> | null): string {
+  const raw = (settings?.[kind] as { provider?: string } | undefined)?.provider ?? "";
+  return PROVIDER_LABELS[raw] ?? (raw || "—");
 }
 
 export function CallStudio({ callId = "" }: { callId?: string }) {
@@ -210,6 +419,8 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
   const [persona, setPersona] = useState<Record<string, unknown> | null>(null);
   const [mode, setMode] = useState<"simulation" | "live">("simulation");
   const [settlement, setSettlement] = useState<Record<string, unknown> | null>(null);
+  const [objectTopics, setObjectTopics] = useState<Record<string, unknown>[]>([]);
+  const [settings, setSettings] = useState<Record<string, unknown> | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
   // 服务就绪自愈：桌面壳异步拉起整栈，首次加载失败后在 Control Plane 就绪时自动重拉。
@@ -255,6 +466,13 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cp.attempt, ACCOUNT]);
 
+  // 拉取全局设置：右栏 Provider 卡显示实际生效的 provider(而非硬编码)。
+  useEffect(() => {
+    let cancelled = false;
+    api.getSettings().then((s) => { if (!cancelled) setSettings(s); }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [cp.attempt]);
+
   // For an existing call (e.g. /calls/[id]), hydrate everything from the server.
   useEffect(() => {
     if (!callId) return;
@@ -274,6 +492,8 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
   useEffect(() => {
     if (!objId) return;
     api.getObject(objId).then(setObject).catch(() => {});
+    // 该对象历史沉淀主题（结算时 Summarizer 蒸馏写入），用于左栏展示。
+    api.getObjectTopics(objId).then(setObjectTopics).catch(() => {});
   }, [objId]);
   useEffect(() => {
     if (!personaId) return;
@@ -314,13 +534,29 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
       setConnecting(false);
       phase = "join-session";
       // 应用用户选择的音频设备：麦克风先设默认采集设备（session.start 开麦时会采用），
-      // 扬声器在桌面壳切系统默认输出。
+      // 扬声器：桌面壳切系统默认输出；浏览器经 livekit setSinkId。
       const micDeviceId = savedMicDevice();
       const outputDeviceId = savedOutputDevice();
       // 非 exact：设备不存在/已插拔时回退默认，避免采集失败（exact 会 reject）。
       if (micDeviceId) await session.room.switchActiveDevice("audioinput", micDeviceId, false).catch(() => {});
-      if (outputDeviceId) await applyOutputDevice(outputDeviceId).catch(() => {});
+      if (outputDeviceId) {
+        if (isTauriShell()) await applyOutputDevice(outputDeviceId).catch(() => {});
+        else if (webCanSwitchOutput()) await switchWebOutputDevice(session.room, outputDeviceId).catch(() => {});
+      }
       await session.start({ tracks: { microphone: { enabled: true } } });
+      // 确保本地麦克风真正发布：session.start 的 tracks 选项在部分 livekit 版本不生效，
+      // 显式 setMicrophoneEnabled 才可靠（否则 agent 收不到用户声音 → 对话"没输入"）。
+      try {
+        const pub = await session.room.localParticipant.setMicrophoneEnabled(true);
+        if (!pub) {
+          console.warn("mic publish returned no track — 检查浏览器麦克风权限");
+        }
+      } catch (e) {
+        console.warn("enable microphone failed", e);
+        setError("无法开启麦克风：请检查浏览器地址栏的麦克风权限是否允许。");
+        setConnecting(false);
+        return;
+      }
       if (!canPlayAudio) startAudio().catch(() => {});
     } catch (e) {
       console.error("connect failed", e);
@@ -349,12 +585,10 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
     callIdRef.current = "";
   }
 
-  const metrics = (settlement?.metrics ?? {}) as Record<string, unknown>;
-
   return (
-    <div className="grid grid-cols-[280px_1fr_300px] gap-6">
+    <div className="grid grid-cols-[280px_1fr_300px] gap-6 lg:h-[calc(100vh-7.5rem)]">
       {/* 左：对象档案 / 人设 */}
-      <section className="card flex flex-col gap-4">
+      <section className="card flex min-h-0 flex-col gap-4 overflow-y-auto">
         <div className="flex items-center justify-between">
           <span className="label">对象档案</span>
           {!stateCallId && (
@@ -406,9 +640,18 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
 
         <div className="rounded-lg bg-white/5 p-3 text-sm">
           <span className="label mb-1 block">历史主题</span>
-          <p className="text-[var(--muted)]">
-            {Array.isArray(settlement?.new_topics) && settlement.new_topics.length ? "已沉淀（见右侧结算）" : "暂无（挂断后自动沉淀）"}
-          </p>
+          {objectTopics.length === 0 ? (
+            <p className="text-[var(--muted)]">暂无（挂断结算后自动沉淀）</p>
+          ) : (
+            <ul className="space-y-1.5">
+              {objectTopics.slice(-5).map((t) => (
+                <li key={String(t.id ?? t.topic ?? "")} className="text-[var(--muted)]">
+                  <span className="text-[var(--foreground)]">{str(t.topic)}</span>
+                  {str(t.summary) ? ` — ${str(t.summary)}` : ""}
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
         <div className="rounded-lg bg-white/5 p-3 text-sm">
           <span className="label mb-1 block">我方人设</span>
@@ -429,7 +672,7 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
       </section>
 
       {/* 中：官方 LiveKit 会话台（AgentSessionProvider + 官方可视化） */}
-      <section className="card flex min-h-[520px] flex-col">
+      <section className="card flex min-h-0 flex-col">
         <div className="mb-4 flex items-center justify-between">
           <div className="text-xs text-[var(--muted)]">
             {stateCallId ? `会话 ${stateCallId}` : "新建会话"}
@@ -459,40 +702,27 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
           </p>
         )}
 
-        <AgentSessionProvider session={session} volume={1} muted={false}>
-          {roomConnected ? <LiveAgentPanel room={session.room} /> : <IdleStage />}
-        </AgentSessionProvider>
+        <div className="flex min-h-0 flex-1 flex-col">
+          <AgentSessionProvider session={session} volume={1} muted={false}>
+            {roomConnected ? <LiveAgentPanel room={session.room} /> : <IdleStage />}
+          </AgentSessionProvider>
+        </div>
       </section>
 
-      {/* 右：实时分析 / Provider / 结算 */}
-      <section className="card flex flex-col gap-4">
-        <div>
-          <span className="label">实时分析</span>
-          <div className="mt-2 grid grid-cols-2 gap-2">
-            {[
-              ["表达密度", str(metrics.speech_density, "—")],
-              ["填充词", str(metrics.filler_ratio, "—")],
-              ["犹豫词", str(metrics.hesitation_ratio, "—")],
-              ["平均轮次", metrics.avg_turn_seconds ? `${metrics.avg_turn_seconds}s` : "—"],
-            ].map(([k, v]) => (
-              <div key={k} className="rounded-lg bg-white/5 p-3">
-                <p className="text-xs text-[var(--muted)]">{k}</p>
-                <p className="mt-1 text-lg font-semibold">{v}</p>
-              </div>
-            ))}
-          </div>
-        </div>
+      {/* 右：Provider / 音频 / 结算 */}
+      <section className="card flex min-h-0 flex-col gap-4 overflow-y-auto">
         <div className="rounded-lg bg-white/5 p-3">
           <span className="label">Provider（会话清单锁定）</span>
           <div className="mt-2 space-y-1 text-sm">
-            {PROVIDER_NOTE.map(([k, v]) => (
-              <p key={k} className="flex justify-between">
-                <span className="text-[var(--muted)]">{k}</span>
-                <span>{v}</span>
+            {PROVIDER_FIELDS.map(([kind, label]) => (
+              <p key={kind} className="flex justify-between">
+                <span className="text-[var(--muted)]">{label}</span>
+                <span>{providerLabel(kind, settings)}</span>
               </p>
             ))}
           </div>
         </div>
+        <AudioDevicesCard room={session.room} />
         <div className="rounded-lg bg-white/5 p-3 text-sm">
           <span className="label mb-1 block">结算</span>
           {settlement ? (
@@ -501,6 +731,21 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
                 <span className="text-[var(--muted)]">状态</span>
                 <span className="text-emerald-400">{str(settlement.status)}</span>
               </p>
+              {str(settlement.summary) && (
+                <p className="mt-2 border-t border-[var(--card-border)] pt-2 text-xs leading-relaxed text-[var(--muted)]">
+                  {str(settlement.summary)}
+                </p>
+              )}
+              {Array.isArray(settlement.new_topics) && settlement.new_topics.length > 0 && (
+                <div className="mt-2 border-t border-[var(--card-border)] pt-2">
+                  <span className="label mb-1 block">本轮新沉淀话题</span>
+                  <ul className="space-y-1 text-xs text-[var(--muted)]">
+                    {(settlement.new_topics as Record<string, unknown>[]).map((t, i) => (
+                      <li key={i}>{str(t.topic)}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
               <p className="mt-1 break-all text-xs text-[var(--muted)]">通话文档：{str(settlement.transcript_doc_path)}</p>
               <p className="mt-1 break-all text-xs text-[var(--muted)]">结算文档：{str(settlement.settlement_doc_path)}</p>
             </>

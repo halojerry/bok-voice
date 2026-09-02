@@ -1,17 +1,101 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
 import { startRecording, type RecorderHandle } from "@/lib/recorder";
 
-const EMPTY = { name: "", company: "", tone: "", language: "zh", reference_audio: "" };
+const EMPTY = { name: "", company: "", tone: "", language: "zh", reference_audio: "", tts_provider: "" };
 const LANGS = [
   ["zh", "普通话"],
   ["yue", "粤语"],
   ["en", "English"],
 ] as const;
+
+/** 试听合成文案：随当前语言给出含人设称呼的一句话。 */
+function previewTextFor(lang: (typeof LANGS)[number][0], name: string): string {
+  const n = name.trim() || "Bok 客服";
+  switch (lang) {
+    case "yue":
+      return `你好，我係${n}，請問有咩可以幫到你？`;
+    case "en":
+      return `Hello, this is ${n}. How can I help you today?`;
+    default:
+      return `你好，我是${n}，请问有什么可以帮您？`;
+  }
+}
+
+/** MiniMax 云端音色：粤语 7 个（实测可用）+ 常用中文/英语。引擎=MiniMax 时音色池。 */
+const MINIMAX_VOICES: Record<string, { label: string; lang: string }> = {
+  // 粤语
+  Cantonese_Male_news_anchor_vv2: { label: "男主播 news_anchor_vv2", lang: "yue" },
+  "Cantonese_ProfessionalHost（F)": { label: "专业女主持（F）", lang: "yue" },
+  "Cantonese_ProfessionalHost（M)": { label: "专业男主持（M）", lang: "yue" },
+  Cantonese_GentleLady: { label: "温柔女声", lang: "yue" },
+  Cantonese_PlayfulMan: { label: "活泼男声", lang: "yue" },
+  Cantonese_CuteGirl: { label: "可爱女孩", lang: "yue" },
+  Cantonese_KindWoman: { label: "善良女声", lang: "yue" },
+  // 中文普通话
+  "male-qn-qingse": { label: "青涩青年男声", lang: "zh" },
+  "male-qn-jingying": { label: "精英青年男声", lang: "zh" },
+  "female-shaonv": { label: "少女音", lang: "zh" },
+  "female-yujie": { label: "御姐音", lang: "zh" },
+  "Chinese (Mandarin)_News_Anchor": { label: "新闻女声", lang: "zh" },
+  // 英语
+  male_english_speaker: { label: "英文男声", lang: "en" },
+  female_english_speaker: { label: "英文女声", lang: "en" },
+};
+
+/** MiniMax 按语言可选的音色（只含与当前语言匹配的 + 常用的）。 */
+function minimaxVoiceOptionsFor(lang: string) {
+  return Object.entries(MINIMAX_VOICES)
+    .filter(([, v]) => v.lang === lang)
+    .map(([id, v]) => ({ id, label: v.label }));
+}
+
+/** 本地 Qwen3 预置音色的中文名（音译，便于识别；预置为多语模型，非克隆）。 */
+const PRESET_VOICE_CN: Record<string, string> = {
+  serena: "塞蕾娜",
+  vivian: "薇薇安",
+  uncle_fu: "傅叔叔",
+  ryan: "瑞安",
+  aiden: "艾登",
+  ono_anna: "小野安娜",
+  sohee: "素希",
+  eric: "埃里克",
+  dylan: "迪伦",
+};
+
+const LANG_LABEL: Record<string, string> = { zh: "普通话", yue: "粤语", en: "英语" };
+
+/** 音色下拉选项：预置音色 + 已克隆 voice（后者标 [克隆]，带其注册语言）。 */
+interface VoiceOption {
+  id: string;
+  cloned: boolean;
+  lang?: string;
+}
+
+function voiceLabel(vo: VoiceOption): string {
+  if (vo.cloned) {
+    const langTag = vo.lang ? LANG_LABEL[vo.lang] ?? vo.lang : "";
+    return `${vo.id}（克隆${langTag ? " · " + langTag : ""}）`;
+  }
+  return `${PRESET_VOICE_CN[vo.id] ?? vo.id}（预置音色）`;
+}
+
+/** 给某语言推荐一个音色：已绑定的 > 语言匹配的克隆 > 第一个预置。 */
+function suggestVoiceFor(
+  lang: string,
+  voiceMap: Record<string, string>,
+  clonedVoices: VoiceOption[],
+  speakers: string[],
+): string {
+  if (voiceMap?.[lang]) return voiceMap[lang];
+  const match = clonedVoices.find((c) => c.lang === lang);
+  if (match) return match.id;
+  return speakers?.[0] ?? "";
+}
 
 function parseVoiceMap(raw: unknown): Record<string, string> {
   if (typeof raw !== "string" || !raw.trim().startsWith("{")) return {};
@@ -37,12 +121,19 @@ export default function PersonasPage() {
   const [voiceMap, setVoiceMap] = useState<Record<string, string>>({});
   const [previewUrl, setPreviewUrl] = useState("");
   const [speakers, setSpeakers] = useState<string[]>([]);
+  // 已克隆 voice（来自 /api/tts/voices，注册在 TTS sidecar 的 voice_registry）
+  const [clonedVoices, setClonedVoices] = useState<VoiceOption[]>([]);
   // 录音克隆：直接对麦克风说话生成参考音频，无需本地上传文件。
   const [recording, setRecording] = useState(false);
   const [recSec, setRecSec] = useState(0);
   const [recBlobUrl, setRecBlobUrl] = useState("");
   const recRef = useRef<RecorderHandle | null>(null);
   const recTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // 人设选的是云端引擎（MiniMax/火山）：音色区切换到云端音色选择，隐藏本地克隆。
+  const engineIsCloud = ["minimax", "minimax_streaming", "volcano_streaming"].includes(
+    String(form.tts_provider ?? "").trim().toLowerCase(),
+  );
 
   async function refresh() {
     setLoading(true);
@@ -60,7 +151,56 @@ export default function PersonasPage() {
   useEffect(() => {
     refresh();
     api.listTtsSpeakers().then(setSpeakers).catch(() => {});
+    api
+      .listTtsVoices()
+      .then((voices) =>
+        setClonedVoices(
+          Array.isArray(voices)
+            ? voices
+                .map((v) => ({ id: String(v.voice_id ?? ""), cloned: true, lang: String(v.language ?? "").toLowerCase() || undefined }))
+                .filter((v) => v.id)
+            : [],
+        ),
+      )
+      .catch(() => {});
   }, []);
+
+  /** 当前语言音色下拉选项（预置 + 已克隆，去重）。 */
+  const voiceOptions = useMemo<VoiceOption[]>(() => {
+    const seen = new Set<string>();
+    const out: VoiceOption[] = [];
+    for (const s of speakers) {
+      if (s && !seen.has(s)) {
+        seen.add(s);
+        out.push({ id: s, cloned: false });
+      }
+    }
+    for (const c of clonedVoices) {
+      if (c.id && !seen.has(c.id)) {
+        seen.add(c.id);
+        out.push(c);
+      }
+    }
+    return out;
+  }, [speakers, clonedVoices]);
+
+  // 下拉排序：与当前语言匹配的克隆音色排最前（切到「粤语」时粤语克隆在最上面），其余克隆、预置在后。
+  const orderedVoiceOptions = useMemo(() => {
+    const matching = voiceOptions.filter((v) => v.cloned && v.lang === activeLang);
+    const rest = voiceOptions.filter((v) => !(v.cloned && v.lang === activeLang));
+    return [...matching, ...rest];
+  }, [voiceOptions, activeLang]);
+
+  // 切语言时若该语言还没绑音色，自动给一个推荐（语言匹配的克隆优先，否则第一个预置），
+  // 让「试听已选音色」立刻能放出声；可再手动改下拉。
+  useEffect(() => {
+    setVoiceMap((prev) => {
+      if (prev[activeLang]) return prev;
+      const rec = suggestVoiceFor(activeLang, prev, clonedVoices, speakers);
+      if (!rec) return prev;
+      return { ...prev, [activeLang]: rec };
+    });
+  }, [activeLang, clonedVoices, speakers]);
 
   async function save() {
     if (!form.name.trim()) {
@@ -106,6 +246,7 @@ export default function PersonasPage() {
       tone: String(row.tone ?? ""),
       language: String(row.language ?? "zh"),
       reference_audio: String(row.reference_audio ?? ""),
+      tts_provider: String(row.tts_provider ?? ""),
     });
     setVoiceMap(parseVoiceMap(row.reference_audio));
     setRefText("");
@@ -180,6 +321,10 @@ export default function PersonasPage() {
       const result = await api.registerTtsVoice(body);
       const voiceId = String(result.voice_id ?? "");
       setVoiceMap((prev) => ({ ...prev, [activeLang]: voiceId }));
+      // 新克隆立即可见（不用等下次刷新 voices），并带上其语言，方便按语言推荐/排序。
+      setClonedVoices((prev) =>
+        prev.some((v) => v.id === voiceId) ? prev : [...prev, { id: voiceId, cloned: true, lang: activeLang }],
+      );
       clearRecording();
       setOk(true);
     } catch (e) {
@@ -188,17 +333,19 @@ export default function PersonasPage() {
   }
 
   async function previewVoice() {
-    const voice = voiceMap[activeLang];
+    const voice = voiceMap[activeLang] || (engineIsCloud ? "" : suggestVoiceFor(activeLang, voiceMap, clonedVoices, speakers));
     if (!voice) {
-      setErr("当前语言还没有绑定音色");
+      setErr(engineIsCloud ? "请先为当前语言选择一个音色。" : "暂无可用音色，请先克隆一个音色（录音/上传参考音频）。");
       return;
     }
     setErr(null);
     try {
       const blob = await api.previewTts({
-        text: "你好，我是 Bok 客服助手，请问有什么可以帮您？",
+        text: previewTextFor(activeLang, form.name),
         voice,
         language: activeLang,
+        // 云端引擎时带 provider，让 /api/tts/preview 走 MiniMax/火山而不是本地 Qwen3。
+        ...(engineIsCloud ? { provider: String(form.tts_provider ?? "") } : {}),
       });
       if (previewUrl) URL.revokeObjectURL(previewUrl);
       setPreviewUrl(URL.createObjectURL(blob));
@@ -230,7 +377,7 @@ export default function PersonasPage() {
                     <div className="min-w-0">
                       <p className="font-medium">{String(row.name ?? "-")}</p>
                       <p className="mt-1 text-xs text-[var(--muted)]">
-                        {String(row.company ?? "")} · {String(row.language ?? "zh")}
+                        {String(row.company ?? "")} · AI语言：{LANG_LABEL[String(row.language ?? "zh")] ?? String(row.language ?? "zh")}
                       </p>
                       {String(row.tone ?? "") && <p className="mt-1 line-clamp-3 text-sm text-[var(--muted)]">{String(row.tone)}</p>}
                     </div>
@@ -265,8 +412,49 @@ export default function PersonasPage() {
             onChange={(e) => setForm({ ...form, tone: e.target.value })}
             placeholder="专业、温和、简洁；适当使用敬语…"
           />
+          <div className="rounded-lg border border-[var(--card-border)] p-3">
+            <span className="label mb-1 block">AI 使用语言</span>
+            <p className="mb-2 text-[11px] text-[var(--muted)]">
+              决定 AI 用什么语言开口（开场白）与默认表达；客户说其它语言时仍会跟随客户切换。
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {LANGS.map(([lang, label]) => (
+                <button
+                  key={lang}
+                  className={`btn-ghost text-xs ${form.language === lang ? "!border-[var(--accent)]" : ""}`}
+                  onClick={() => setForm({ ...form, language: lang })}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="rounded-lg border border-[var(--card-border)] p-3">
+            <span className="label mb-1 block">语音引擎</span>
+            <p className="mb-2 text-[11px] text-[var(--muted)]">
+              决定该人设通话用哪套 TTS：本地 Qwen3（可用下方克隆音色）或云端 MiniMax/火山
+              （用全局设置里的云端音色）。留空 = 跟随全局设置。
+            </p>
+            <select
+              className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+              value={form.tts_provider ?? ""}
+              onChange={(e) => setForm({ ...form, tts_provider: e.target.value })}
+            >
+              <option value="">跟随全局设置</option>
+              <option value="qwen3_tts">本地 Qwen3-TTS（可用克隆音色）</option>
+              <option value="minimax">MiniMax（云端 · 粤语地道/情感自然）</option>
+              <option value="volcano_streaming">火山引擎（云端）</option>
+            </select>
+            {(form.tts_provider === "minimax" || form.tts_provider === "volcano_streaming") && (
+              <p className="mt-2 text-[11px] text-[var(--accent)]">
+                云端引擎：下方克隆/音色绑定不生效，实际用全局设置的普通话音色/粤语音色（如 MiniMax
+                Cantonese_Male_news_anchor_vv2）。
+              </p>
+            )}
+          </div>
           <div className="space-y-2">
-            <div className="flex gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs text-[var(--stage-muted)]">为该语言选音色：</span>
               {LANGS.map(([lang, label]) => (
                 <button
                   key={lang}
@@ -277,22 +465,55 @@ export default function PersonasPage() {
                 </button>
               ))}
             </div>
+            <p className="text-[11px] text-[var(--muted)]">
+              {engineIsCloud
+                ? `当前「${LANG_LABEL[activeLang] ?? activeLang}」：从下方 MiniMax 音色中选择（粤语/普通话/英语分开配）。`
+                : `当前「${LANG_LABEL[activeLang] ?? activeLang}」音色：没绑时自动推荐${activeLang === "yue" ? "粤语克隆" : "该语言克隆"}${activeLang !== "yue" ? "" : "；要讲粤语请用「粤语参考音频克隆」的音色，普通话音色读粤语会带普通话音"}`}
+            </p>
+            {engineIsCloud ? (
+              <>
+                <select
+                  className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+                  value={voiceMap[activeLang] ?? ""}
+                  onChange={(e) => setVoiceMap((prev) => ({ ...prev, [activeLang]: e.target.value }))}
+                >
+                  <option value="">选择 MiniMax {LANG_LABEL[activeLang] ?? activeLang}音色</option>
+                  {minimaxVoiceOptionsFor(activeLang).map((vo) => (
+                    <option key={vo.id} value={vo.id}>
+                      {vo.label}
+                    </option>
+                  ))}
+                  {voiceMap[activeLang] && !minimaxVoiceOptionsFor(activeLang).some((vo) => vo.id === voiceMap[activeLang]) && (
+                    <option value={voiceMap[activeLang]}>自定义：{voiceMap[activeLang]}</option>
+                  )}
+                </select>
+                <div className="flex gap-2">
+                  <button className="btn-ghost w-full" onClick={previewVoice}>试听已选音色</button>
+                </div>
+                {previewUrl && <audio controls autoPlay src={previewUrl} className="mt-2 w-full" />}
+              </>
+            ) : (
+              <>
             <select
               className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
               value={voiceMap[activeLang] ?? ""}
               onChange={(e) => setVoiceMap((prev) => ({ ...prev, [activeLang]: e.target.value }))}
             >
-              <option value="">选择预置音色 / 已克隆 voice_id</option>
-              {speakers.map((speaker) => (
-                <option key={speaker} value={speaker}>{speaker}</option>
+              <option value="">选择音色（预置 / 已克隆）</option>
+              {orderedVoiceOptions.map((vo) => (
+                <option key={vo.id} value={vo.id}>
+                  {voiceLabel(vo)}
+                </option>
               ))}
-              {Object.keys(voiceMap).length > 0 && <option value={voiceMap[activeLang] ?? ""}>{voiceMap[activeLang] ?? ""}</option>}
+              {voiceMap[activeLang] && !orderedVoiceOptions.some((vo) => vo.id === voiceMap[activeLang]) && (
+                <option value={voiceMap[activeLang]}>{voiceMap[activeLang]}（克隆）</option>
+              )}
             </select>
             <input
               className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
               value={refText}
               onChange={(e) => setRefText(e.target.value)}
-              placeholder="参考音频对应的文字（录音/上传都要填），例如：你好，我係小博，有咩可以幫到你？"
+              placeholder={activeLang === "yue" ? "参考音频对应的文字（录音/上传都要填），例如：你好，我係小博，有咩可以幫到你？" : "参考音频对应的文字（录音/上传都要填）"}
             />
             {/* 录音克隆：直接对麦克风说一段话作为该语言的参考音色 */}
             <div className="rounded-lg border border-[var(--card-border)] p-2">
@@ -326,11 +547,78 @@ export default function PersonasPage() {
                 setRecBlobUrl("");
               }}
             />
+            <p className="rounded-lg bg-white/5 p-2 text-[11px] leading-relaxed text-[var(--muted)]">
+              克隆出来的音色会讲什么语言/口音，由你录的参考音频决定：想让 AI 讲<b className="text-[var(--foreground)]">粤语</b>，就对着麦用粤语说一段参考语料（如上方的粤语示例）；用普通话参考音频克隆出的音色，读粤语文字也会带普通话音。克隆会存为独立音色，可随时回来试听。
+            </p>
             <div className="flex gap-2">
               <button className="btn-ghost w-full" onClick={registerVoice} disabled={recording}>克隆并保存音色</button>
               <button className="btn-ghost w-full" onClick={previewVoice}>试听已选音色</button>
             </div>
-            {previewUrl && <audio controls src={previewUrl} className="mt-2 w-full" />}
+            {previewUrl && <audio controls autoPlay src={previewUrl} className="mt-2 w-full" />}
+            {clonedVoices.length > 0 && (
+              <div className="rounded-lg border border-[var(--card-border)] p-2">
+                <span className="text-xs text-[var(--stage-muted)]">已克隆音色</span>
+                <ul className="mt-1.5 space-y-1">
+                  {clonedVoices.map((cv) => (
+                    <li key={cv.id} className="flex items-center justify-between gap-2 text-xs">
+                      <span className="truncate text-[var(--foreground)]">
+                        {cv.id}
+                        {cv.lang ? `（${LANG_LABEL[cv.lang] ?? cv.lang}）` : ""}
+                      </span>
+                      <div className="flex shrink-0 gap-1">
+                        <button
+                          className="text-[var(--muted)] hover:text-[var(--accent)]"
+                          onClick={async () => {
+                            // 试听该克隆：临时切到对应语言标签并绑定，再试听。
+                            if (cv.lang && ["zh", "yue", "en"].includes(cv.lang)) {
+                              setActiveLang(cv.lang as "zh" | "yue" | "en");
+                            }
+                            setVoiceMap((prev) => ({ ...prev, [cv.lang && ["zh", "yue", "en"].includes(cv.lang) ? cv.lang : "zh"]: cv.id }));
+                            setErr(null);
+                            try {
+                              const lang = cv.lang && ["zh", "yue", "en"].includes(cv.lang) ? cv.lang : "zh";
+                              const blob = await api.previewTts({
+                                text: previewTextFor(lang as "zh" | "yue" | "en", form.name),
+                                voice: cv.id,
+                                language: lang,
+                              });
+                              if (previewUrl) URL.revokeObjectURL(previewUrl);
+                              setPreviewUrl(URL.createObjectURL(blob));
+                            } catch (e) {
+                              setErr(String(e));
+                            }
+                          }}
+                        >
+                          试听
+                        </button>
+                        <button
+                          className="text-red-300 hover:text-red-200"
+                          onClick={async () => {
+                            if (!window.confirm(`确认删除克隆音色「${cv.id}」？\n已绑定该音色的人设会自动改为不绑定。`)) return;
+                            setErr(null);
+                            try {
+                              await api.deleteTtsVoice(cv.id);
+                              setClonedVoices((prev) => prev.filter((v) => v.id !== cv.id));
+                              setVoiceMap((prev) => {
+                                const next = { ...prev };
+                                for (const k of Object.keys(next)) if (next[k] === cv.id) delete next[k];
+                                return next;
+                              });
+                            } catch (e) {
+                              setErr(`删除失败：${String(e)}`);
+                            }
+                          }}
+                        >
+                          删除
+                        </button>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+              </>
+            )}
           </div>
           <button className="btn-primary w-full" onClick={save}>
             {editingId ? "保存修改" : "新建人设"}

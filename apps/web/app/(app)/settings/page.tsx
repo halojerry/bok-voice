@@ -58,6 +58,11 @@ function FieldInput({
             {o.label}
           </option>
         ))}
+        {raw && !options.some((o) => o.value === raw) && (
+          <option key={`custom-${raw}`} value={raw}>
+            自定义：{raw}
+          </option>
+        )}
       </select>
     );
   }
@@ -111,10 +116,54 @@ function ProviderCard({
             <span className="text-xs text-[var(--stage-muted)]">{field.label}</span>
             <FieldInput field={field} value={value[field.key]} onChange={(v) => onChange({ ...value, [field.key]: v })} />
             {field.hint && <p className="mt-1 text-xs text-[var(--muted)]">{field.hint}</p>}
+            {field.preview && kind === "tts" && (
+              <VoicePreview provider={provider} fieldKey={field.key} voice={String(value[field.key] ?? "")} />
+            )}
           </label>
         ))}
       </div>
     </section>
+  );
+}
+
+/** 音色字段的「试听」按钮：调 /api/tts/preview 播放当前选中音色。 */
+function VoicePreview({ provider, fieldKey, voice }: { provider: string; fieldKey: string; voice: string }) {
+  const [url, setUrl] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  if (!voice) return null;
+  async function play() {
+    if (!voice) return;
+    setBusy(true);
+    setErr("");
+    try {
+      const lang = fieldKey === "speaker_yue" ? "yue" : fieldKey === "speaker_en" ? "en" : "zh";
+      const text =
+        lang === "yue"
+          ? "你好，我係想問下件貨而家到咗邊度？"
+          : lang === "en"
+            ? "Hello, I'd like to ask about your delivery."
+            : "你好，我想了解一下你们的产品和服务。";
+      const blob = await api.previewTts({ provider, text, voice, language: lang, sample_rate: 24000 });
+      if (url) URL.revokeObjectURL(url);
+      const u = URL.createObjectURL(blob);
+      setUrl(u);
+      const el = new Audio(u);
+      el.play().catch(() => {});
+    } catch (e) {
+      setErr(friendlyErrorText(String(e)));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="mt-1 flex items-center gap-2">
+      <button className="btn-ghost px-2 py-0.5 text-[11px]" onClick={play} disabled={busy}>
+        {busy ? "合成中…" : url ? "试听已选音色" : "试听"}
+      </button>
+      {url && <audio controls src={url} className="h-6 w-44" />}
+      {err && <span className="text-[11px] text-red-300">{err}</span>}
+    </div>
   );
 }
 
