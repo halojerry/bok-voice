@@ -35,3 +35,4 @@ services/*/data/
 apps/web/AGENTS.md
 apps/web/CLAUDE.md
 runtime
+tests/fixtures/audio/e2e_multi/
