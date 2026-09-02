@@ -174,25 +174,39 @@ def _instructions(
         parts.append(f"当前对话对象：{display}（{role}，语言 {lang}）。")
     if template:
         tpl_name = template.get("name") or ""
-        tpl_lines: list[str] = []
-        if template.get("opening"):
-            tpl_lines.append(f"开场白：{template.get('opening')}")
-        if template.get("core"):
-            tpl_lines.append(f"核心话术：{template.get('core')}")
-        if template.get("objection"):
-            tpl_lines.append(f"异议应对：{template.get('objection')}")
-        if template.get("closing"):
-            tpl_lines.append(f"收尾话术：{template.get('closing')}")
-        if tpl_lines:
-            prefix = f"对话模板「{tpl_name}」：" if tpl_name else "对话模板："
-            parts.append(prefix + "；".join(tpl_lines) + "。严格按模板组织回应。")
+        # 分步话术(steps_json)由 flow 控制器按轮注入(flow_overview + 当前步),
+        # 这里不再整段塞进 system,避免 LLM 把整份话术当逐字稿念。
+        steps_json = str(template.get("steps_json") or "")
+        has_steps = bool(steps_json.strip())
+        if not has_steps:
+            # 无分步时的兼容:四段仅作"参考要点",明确不照读。
+            tpl_lines: list[str] = []
+            if template.get("opening"):
+                tpl_lines.append(f"开场参考:{template.get('opening')}")
+            if template.get("core"):
+                tpl_lines.append(f"核心要点:{template.get('core')}")
+            if template.get("objection"):
+                tpl_lines.append(f"异议应对参考:{template.get('objection')}")
+            if template.get("closing"):
+                tpl_lines.append(f"收尾参考:{template.get('closing')}")
+            if tpl_lines:
+                prefix = f"对话模板「{tpl_name}」参考(勿照读):" if tpl_name else "对话参考(勿照读):"
+                parts.append(prefix + "；".join(tpl_lines))
     if history:
         parts.append(f"上次聊到：{history}")
     parts.append(
-        "回复语言必须与用户使用的语言严格一致："
-        "用户说普通话就只用标准普通话回复（严禁使用任何粤语口语用字）；"
-        "用户说粤语就用地道粤语口语回复（使用如：唔、冇、嘅、哋、佢、喺、嚟、啲、咁、係、唔該、"
-        "倾偈、而家、睇嚟、啱啱）；用户说英语就用英语回复。"
+        # 分寸：专业、克制、可信的客服；表达自然但不油滑、不闲聊套近乎。
+        "角色基调：你是一名专业、可信赖的客服。语气沉稳、礼貌、就事论事，"
+        "聚焦帮对方解决问题；不要自称「老朋友」、不要刻意套近乎、不要用「呀/啦/哦」等过度的口语尾音，"
+        "也不要像机器人念稿或堆客套（避免「您好，很高兴为您服务」这类模板开场）。"
+        "用简短自然的口语句子，一句说清一个重点，说完自然停顿等对方；"
+        "不要长篇大论、不要列 1.2.3. 条、不要加书名号/星号/表情符号、不要自我解释。"
+    )
+    parts.append(
+        "回复语言必须与用户使用的语言一致："
+        "用户说普通话就用自然口语普通话（可用「嗯、好、那、其实、你看」这类口语词，别用书面语/播音腔）；"
+        "用户说粤语就整段用地道粤语口语（唔、冇、嘅、哋、佢、喺、嚟、啲、咁、係、唔該、倾偈、而家、睇下、啱啱，"
+        "语气参考：「明白，等我帮你睇下呢单先」），绝不写普通话或书面语；用户说英语就用英语口语。"
         "在尚未确定客户语言（如开场）或客户语言不明时，使用你（客服）的母语。"
         "直接以该语言回应，不要解释你正在使用什么语言，不要添加任何注释或括号说明。"
     )
@@ -242,11 +256,26 @@ async def entrypoint(ctx):
     except Exception as e:
         print(f"[agent] context resolve failed ({room_name}): {e}", flush=True)
 
+    # 对话流程控制器:载入模板分步 + 对象变量;由它按轮注入"当前步",逐步推进。
+    from .flow import FlowController, facts_line
+
+    flow_ctrl = FlowController.from_template(template, object_card)
+    if flow_ctrl.has_steps:
+        context_state.set_flow(flow_ctrl.flow_overview(), flow_ctrl.current_step_text())
+        print(f"[agent] flow loaded {len(flow_ctrl.steps)} steps (call {room_name})", flush=True)
+    else:
+        # 无分步模板:对象事实仍注入(变量在四段参考里也可用)。
+        context_state.set_flow("", "")
+
     instructions = _instructions(
         persona=persona,
         object_card=object_card,
         template=template,
     )
+    # 对象已知事实(姓名/单号/物流公司)注入基础 system——facts 让 LLM 回复时引用。
+    if object_card:
+        parts_tail = instructions + "\n\n" + facts_line(object_card)
+        instructions = parts_tail
 
     # 全局 Provider 设置优先；读取失败或未配置时回退到环境变量。
     settings: dict = {}
@@ -265,6 +294,7 @@ async def entrypoint(ctx):
         FakeLiveKitTTS,
         FakeLiveKitVAD,
         LanguageState,
+        MiniMaxTTS,
         MlxLlmLLM,
         Qwen3ASRSTT,
         Qwen3TTSTTS,
@@ -321,13 +351,46 @@ async def entrypoint(ctx):
             vad=vad_provider,
         )
 
-    # ---- TTS：设置页 tts.provider（qwen3_tts / volcano_streaming / fake）----
-    tts_provider_name = (tts_cfg.get("provider") or "qwen3_tts").lower()
+    # ---- TTS：人设可指定引擎（persona.tts_provider），留空跟随全局 tts.provider。
+    # 引擎决定音色池：qwen3_tts 用本地克隆（persona.reference_audio 是本地克隆 ID）；
+    # minimax/volcano 是云端，用全局 speaker_zh/yue/en（云端音色 ID），绝不能把本地
+    # 克隆 ID 发给云端。fake 出静音测试音。
+    global_tts_provider = (tts_cfg.get("provider") or "qwen3_tts").lower()
+    persona_tts_provider = ((persona or {}).get("tts_provider") or "").strip().lower()
+    tts_provider_name = persona_tts_provider or global_tts_provider
+    if persona_tts_provider:
+        print(f"[agent] persona tts_provider={persona_tts_provider!r} overrides global {global_tts_provider!r}", flush=True)
     if use_fake or tts_provider_name in ("fake", "fake_tts"):
         # fake = 静音测试音（FakeLiveKitTTS）；绝不落入 Volcano 的 beep 分支。
         tts_provider = FakeLiveKitTTS()
     elif tts_provider_name in ("volcano", "volcano_streaming"):
         tts_provider = VolcanoTTS(
+            sample_rate=int(tts_cfg.get("sample_rate") or 24000),
+        )
+    elif tts_provider_name in ("minimax", "minimax_streaming"):
+        # 云端 MiniMax：voice 是人设绑定的 reference_audio（{lang: MiniMax voice_id}，
+        # 人设页在 MiniMax 引擎下选的就是 MiniMax 音色）优先；未绑则回落全局
+        # speaker_zh/yue/en。注意：人设若绑的是本地 Qwen3 克隆 ID（agent-60852 等）
+        # 不会被 MiniMax 接受——人设页已按引擎区分音色池，避免这种情况。
+        # 兜底防御：过滤掉本地 Qwen3 音色（预设 9 个 + 克隆 agent-*/acceptance-*），
+        # 否则发给 MiniMax 会 2054 voice not exist，整轮无声。
+        persona_voice = (persona or {}).get("reference_audio") or ""
+        raw_map = _parse_voice_map(persona_voice) if persona_voice else _build_default_voice_map(tts_cfg)
+        _LOCAL_QWEN3 = {
+            "serena", "vivian", "uncle_fu", "ryan", "aiden", "ono_anna", "sohee", "eric", "dylan",
+        }
+        voice_map = {}
+        for lang, vid in raw_map.items():
+            if not vid:
+                continue
+            base = str(vid).strip().lower()
+            if base in _LOCAL_QWEN3 or base.startswith(("agent-", "acceptance-")):
+                print(f"[agent] minimax skip local qwen3 voice {vid!r} for {lang}", flush=True)
+                continue
+            voice_map[lang] = vid
+        tts_provider = MiniMaxTTS(
+            voice=voice_map,
+            language_state=language_state,
             sample_rate=int(tts_cfg.get("sample_rate") or 24000),
         )
     else:
@@ -506,6 +569,16 @@ async def entrypoint(ctx):
                 context_state.set_user_language(language_state.lang)
             except Exception:  # pragma: no cover - 语言注入失败不致命
                 pass
+            # 流程推进:读用户最新话,判定是否进入下一步,更新"当前步"约束注入。
+            if flow_ctrl.has_steps and not flow_ctrl.done:
+                try:
+                    user_text = ""
+                    nm = getattr(new_message, "text_content", None) or ""
+                    user_text = str(nm or "")
+                    flow_ctrl.on_user_turn(user_text)
+                    context_state.set_flow_current(flow_ctrl.current_step_text())
+                except Exception:  # pragma: no cover - 流程推进失败不阻断回复
+                    pass
             if self.paused:
                 chat_ctx = getattr(self, "chat_ctx", None)
                 if chat_ctx is not None and new_message is not None:

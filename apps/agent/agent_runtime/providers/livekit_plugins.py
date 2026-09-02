@@ -10,21 +10,105 @@ from dataclasses import dataclass
 import httpx
 from livekit.agents import APIConnectOptions, llm, stt, tts, vad
 
+# 粤语特征字/词：Qwen3-ASR 对粤语偶发判成 Chinese（语言标签不稳），
+# 若文本命中这些地道粤语用字则按粤语处理，避免 LLM 被误判成普通话后回普。
+# 只用「普通话里基本不出现」的粤语专用字/词；普粤共用字（下、咁、系等）不作为特征。
+_CANTONESE_CHARS = set(
+    "冇嘅哋佢喺嚟啲嗰喎㗎冚瞓攞揾搵嘥乜嘢咩啫哂啩嗌"
+    "唔係咗睇俾畀掂啱唞冧聽"
+)
+_CANTONESE_WORDS = (
+    "唔該", "唔系", "唔係", "唔好", "唔使", "唔知", "唔想", "唔會", "唔同",
+    "唔緊要", "傾偈", "而家", "依家", "啱啱", "睇下", "睇睇",
+    "嗰陣時", "邊度", "幾時", "點解", "唔該晒",
+    "係咪", "係呀", "係嘅", "好嘅", "係唔係", "唔係呀", "冇問題", "冇所謂",
+    "搞掂", "聽日", "聽講", "喺邊", "點樣", "幾多錢", "幾好", "咁樣",
+)
+# 普通话句子的功能字（对应粤语：嘅/咗/呢/嗰/乜/冇/嗎…）：普通话转写里高频、
+# 而地道粤语口语转写几乎不用。整句长度 + 功能字双重命中才判「强普通话」。
+_MANDARIN_MARKERS = ("的", "了", "这", "那", "什", "么", "说", "没", "给", "们", "您")
+
+# 中文对话里常被整词借用的英语感叹词：出现它们不代表用户切到英语。
+_EN_ACKS = {"ok", "okay", "yes", "yeah", "yep", "no", "nope", "hi", "hey", "hello", "bye", "thx"}
+
+
+def _looks_cantonese(text: str) -> bool:
+    t = text or ""
+    if any(ch in _CANTONESE_CHARS for ch in t):
+        return True
+    return any(w in t for w in _CANTONESE_WORDS)
+
+
+def _looks_mandarin(text: str) -> bool:
+    """普通话书面/口语特征：功能字命中 2+ 个，或整句够长（≥8 字）无粤语特征。"""
+    t = text or ""
+    hits = sum(1 for ch in _MANDARIN_MARKERS if ch in t)
+    return len(t) >= 8 or hits >= 2
+
+
+def _looks_english(text: str) -> bool:
+    """文本含实质性英文单词（剔除 ok/yes 等借用感叹词）才算英语强证据。"""
+    words: list[str] = []
+    cur: list[str] = []
+    for ch in (text or ""):
+        if ch.isascii() and ch.isalpha():
+            cur.append(ch.lower())
+        else:
+            if cur:
+                words.append("".join(cur))
+                cur = []
+    if cur:
+        words.append("".join(cur))
+    return any(w not in _EN_ACKS for w in words)
+
+
+def _classify_spoken_language(lang: str, text: str) -> tuple[str, bool]:
+    """归一语言标签并给出「强证据」判断。
+
+    返回 (lang, strong)：strong=True 表示该判定有可靠证据（粤语特征字/词、
+    明确的 yue 标签、实质性英文、够长的普通话句子）；strong=False 表示标签
+    模糊（普通话/英文标签 + 短句或借用词）——这种轮次不应把说话人语言拉走。
+    """
+    key = (lang or "").strip().lower()
+    if key in {"yue", "cantonese"}:
+        return "yue", True
+    if key in {"en", "english"}:
+        if _looks_english(text):
+            return "en", True
+        return "en", False
+    if key in {"zh", "chinese", "mandarin"}:
+        # 判普通话但文本明显是粤语 → 纠偏（整词命中，避免普粤共用字误伤）。
+        if _looks_cantonese(text):
+            return "yue", True
+        if _looks_mandarin(text):
+            return "zh", True
+        # 短句（好/嗯/係 之类）两种语言都可能：不构成强证据，交给滞后逻辑。
+        return "zh", False
+    return "zh", False
+
+
+def _normalize_asr_language(lang: str, text: str) -> str:
+    """ASR 语言标签归一 + 粤语特征纠偏（供 SpeechData/日志使用，不丢强证据信息）。"""
+    norm, _ = _classify_spoken_language(lang, text)
+    return norm
+
 
 @dataclass
 class LanguageState:
-    """Shared between ASR and TTS so replies use the language the user spoke."""
+    """Shared between ASR and TTS so replies use the language the user spoke.
+
+    lang 的切换带滞后：只有强证据（明确的 yue/en 标签、粤语特征字词、够长的
+    普通话句子）才允许改变当前语言；标签模糊的短轮次（好/嗯/係…）保持原语言，
+    避免 ASR 单轮误标把「粤语客户」拉成普通话、LLM 跟着回普、TTS 切音色。
+    开场语言由 agent 按人设/对象语言预置，同样受此保护。
+    """
 
     lang: str = "zh"
 
-    def update(self, lang: str | None) -> None:
-        key = (lang or "").strip().lower()
-        if key in {"chinese", "zh", "mandarin"}:
-            self.lang = "zh"
-        elif key in {"cantonese", "yue"}:
-            self.lang = "yue"
-        elif key in {"english", "en"}:
-            self.lang = "en"
+    def update(self, lang: str | None, text: str = "") -> None:
+        norm, strong = _classify_spoken_language(lang, text)
+        if strong:
+            self.lang = norm
 
 
 class OpenAICompatLLM(llm.LLM):
@@ -157,8 +241,9 @@ class _OpenAICompatStream:
                         messages=messages,
                         stream=True,
                         max_tokens=max_tokens,
-                        # 客服对话默认低温：语言跟随（粤/普/英）更稳定、少跑题。
-                        temperature=float(os.environ.get("LLM_TEMPERATURE", "0.3")),
+                        # 专业客服取中低温：过高显油滑/跑题/乱码（本地 9B 更明显），过低像念稿。
+                        # 0.4 让语气自然但稳定克制；可用 env LLM_TEMPERATURE 覆盖。
+                        temperature=float(os.environ.get("LLM_TEMPERATURE", "0.4")),
                     )
                     async for chunk in stream:
                         if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
@@ -206,6 +291,17 @@ class ContextState:
         self._summary_lines: list[str] = []
         self._user_lang: str = ""
         self._web: list[str] = []
+        self._flow_overview: str = ""
+        self._flow_current: str = ""
+
+    def set_flow(self, overview: str, current: str) -> None:
+        """设置对话流程:overview 为基础注入(全貌),current 为每轮当前步约束。"""
+        self._flow_overview = overview
+        self._flow_current = current
+
+    def set_flow_current(self, current: str) -> None:
+        """每轮更新当前步约束(flow controller 推进后调用)。"""
+        self._flow_current = current
 
     def set_web(self, results: str | list[str]) -> None:
         """注入联网检索结果（Wikipedia/DDG 摘要），随 system 消息给 LLM 参考。"""
@@ -258,13 +354,18 @@ class ContextState:
             name = names.get(self._user_lang, self._user_lang)
             if self._user_lang == "yue":
                 rule = (
-                    "用地道粤语口语回复（唔、冇、嘅、哋、佢、喺、嚟、啲、咁、係、唔該、倾偈、而家、睇嚟、啱啱），"
-                    "严格禁止使用普通话或书面语；不要解释语言选择，不要添加任何注释。"
+                    "整段要用地道粤语口语嚟讲，唔好用书面语或者普通话。"
+                    "用词要带粤语特色：唔、冇、嘅、哋、佢、喺、嚟、啲、咁、係、唔該、倾偈、而家、睇下、啱啱"
+                    "（语气参考：「明白，等我帮你睇下呢单先」「係咁嘅，我哋会尽快跟进」）。"
+                    "唔好解释你讲紧咩语言，唔好加任何注释或者括号。"
                 )
             elif self._user_lang == "en":
-                rule = "Reply in English only; do not explain or add notes."
+                rule = "Reply in natural spoken English only (like on a phone call); do not explain or add notes."
             else:
-                rule = "用标准普通话回复；不要解释语言选择，不要添加任何注释。"
+                rule = (
+                    "用自然口语的普通话回复，像打电话那样说，不要用书面语或播音腔；"
+                    "不要解释你正在使用什么语言，不要添加任何注释或括号。"
+                )
             parts.append(f"【用户语言】当前用户正在使用：{name}。{rule}")
         if self._snippets:
             parts.append("【实时检索到的资料（知识库）】\n" + "\n".join(f"- {s}" for s in self._snippets))
@@ -276,6 +377,10 @@ class ContextState:
             )
         if self._summary_lines:
             parts.append("【本通对话记忆】\n" + "\n".join(self._summary_lines[-8:]))
+        if self._flow_overview:
+            parts.append("【话术流程总览(别照读,按进度推进)】\n" + self._flow_overview)
+        if self._flow_current:
+            parts.append("【现在这一步】\n" + self._flow_current)
         return "\n\n".join(parts)
 
 
@@ -541,7 +646,7 @@ class SherpaSenseVoiceSTT(stt.STT):
         # `SpeechEvent`, not a plain string (the old code returned a str, which the adapter
         # then tried to treat as an event and blew up in production).
         text, lang = _SherpaSTTStream(self, conn_options or APIConnectOptions())._recognize_buffer(buffer)
-        self._language_state.update(lang)
+        self._language_state.update(lang, text)
         return stt.SpeechEvent(
             type=stt.SpeechEventType.FINAL_TRANSCRIPT,
             request_id="",
@@ -560,7 +665,7 @@ class _SherpaSTTStream(stt.RecognizeStream):
             if isinstance(item, self._FlushSentinel):
                 text, lang = self._recognize_frames()
                 if text:
-                    self._stt_._language_state.update(lang)
+                    self._stt_._language_state.update(lang, text)
                     self._event_ch.send_nowait(
                         stt.SpeechEvent(
                             type=stt.SpeechEventType.FINAL_TRANSCRIPT,
@@ -726,6 +831,268 @@ class _VolcanoTTSStream(tts.ChunkedStream):
             await self._emit_beep(output_emitter)
         finally:
             output_emitter.flush()
+
+    async def _emit_beep(self, output_emitter):
+        import math
+
+        sr = self._tts_.sample_rate
+        n = int(sr * 0.4)
+        pcm = bytearray()
+        for i in range(n):
+            v = int(12000 * math.sin(2 * math.pi * 440 * i / sr))
+            pcm += v.to_bytes(2, "little", signed=True)
+        output_emitter.push(bytes(pcm))
+        output_emitter.flush()
+
+
+class MiniMaxTTS(tts.TTS):
+    """LiveKit TTS adapter for MiniMax 语音合成 (T2A).
+
+    云端大模型 TTS：粤语地道（Cantonese_Male_news_anchor_vv2 等 40 语种音色），
+    情绪/自然度好。HTTP 同步接口返回 hex 编码 PCM（audio_setting.format=pcm），
+    无需转码。双端点：国内 api.minimax.cn / 海外 api.minimax.chat，
+    由 MINIMAX_BASE_URL 显式指定，缺省按 MINIMAX_REGION（cn/intl）选择。
+    """
+
+    model = "minimax-tts"
+    provider = "minimax"
+
+    _CN = "https://api.minimax.cn/v1/t2a_v2"
+    _INTL = "https://api.minimax.chat/v1/t2a_v2"
+
+    def __init__(
+        self,
+        *,
+        voice: str | dict = "",
+        language_state: LanguageState | None = None,
+        sample_rate: int = 24000,
+        api_key: str = "",
+    ):
+        super().__init__(
+            # MiniMax 通过 synthesize(ChunkedStream)内部走 WS 流式边合成边推;
+            # capabilities 保持 streaming=False,让 livekit 用 StreamAdapter 包 synthesize
+            # (voice 模式兼容)。若声明 streaming=True,voice 管线会调 stream() 走
+            # SynthesizeStream 协议,而我们未实现 → NotImplementedError(整轮无声)。
+            capabilities=tts.TTSCapabilities(streaming=False, aligned_transcript=False),
+            sample_rate=sample_rate,
+            num_channels=1,
+        )
+        self._voice = voice
+        self._language_state = language_state or LanguageState()
+        self._key = api_key
+
+    def _endpoint(self) -> str:
+        base = os.environ.get("MINIMAX_BASE_URL", "").strip()
+        if base:
+            return base.rstrip("/")
+        region = os.environ.get("MINIMAX_REGION", "cn").strip().lower()
+        return self._INTL if region in {"intl", "global", "chat"} else self._CN
+
+    def _api_key(self) -> str:
+        return self._key or os.environ.get("MINIMAX_API_KEY", "")
+
+    def _resolve_voice(self) -> str:
+        if isinstance(self._voice, dict):
+            return str(self._voice.get(self._language_state.lang) or self._voice.get("zh") or "")
+        raw = str(self._voice or "")
+        if raw.startswith("{"):
+            try:
+                mapping = json.loads(raw)
+                return str(mapping.get(self._language_state.lang) or mapping.get("zh") or "")
+            except Exception:
+                return raw
+        return raw
+
+    def synthesize(self, text, *, conn_options=None):
+        return _MiniMaxTTSStream(self, text, conn_options or APIConnectOptions())
+
+
+class _MiniMaxTTSStream(tts.ChunkedStream):
+    def __init__(self, tts_, text, conn_options):
+        super().__init__(tts=tts_, input_text=text, conn_options=conn_options)
+        self._text = text
+        self._tts_ = tts_
+
+    async def _run(self, output_emitter):
+        try:
+            key = self._tts_._api_key()
+            if not key:
+                print("MINIMAX_TTS_MISSING_CREDENTIALS", flush=True)
+                await self._emit_beep(output_emitter)
+                return
+            voice = self._tts_._resolve_voice()
+            if not voice:
+                print("MINIMAX_TTS_NO_VOICE", flush=True)
+                await self._emit_beep(output_emitter)
+                return
+            sample_rate = self._tts_.sample_rate
+            # WebSocket 流式(像电话:首包 ~380ms 边合成边推);失败/显式关闭回退 HTTP 整段。
+            if os.environ.get("MINIMAX_WS", "1") == "1":
+                ok = await self._run_ws(output_emitter, key, voice, sample_rate)
+                if ok:
+                    return
+                print("MINIMAX_TTS_WS_FALLBACK_HTTP", flush=True)
+            await self._run_http(output_emitter, key, voice, sample_rate)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print("MINIMAX_TTS_FATAL", repr(exc), flush=True)
+            try:
+                await self._emit_beep(output_emitter)
+            except Exception:  # pragma: no cover
+                pass
+
+    def _endpoint_ws(self) -> str:
+        """WebSocket 端点:国内 wss://api.minimax.cn/ws/v1/t2a_v2,海外 .chat。"""
+        base = os.environ.get("MINIMAX_WS_URL", "").strip()
+        if base:
+            return base
+        region = os.environ.get("MINIMAX_REGION", "cn").strip().lower()
+        return "wss://api.minimax.chat/ws/v1/t2a_v2" if region in {"intl", "global", "chat"} else "wss://api.minimax.cn/ws/v1/t2a_v2"
+
+    def _model(self) -> str:
+        return os.environ.get("MINIMAX_MODEL", "speech-2.8-hd")
+
+    async def _run_ws(self, output_emitter, key: str, voice: str, sample_rate: int) -> bool:
+        """MiniMax WebSocket 流式:task_start → task_continue(text) → 边收 hex 音频边推。"""
+        import ssl
+
+        import websockets
+
+        url = self._endpoint_ws()
+        try:
+            ws = await websockets.connect(
+                url,
+                additional_headers={"Authorization": f"Bearer {key}"},
+                open_timeout=10,
+                max_size=20_000_000,
+            )
+        except Exception as exc:
+            print("MINIMAX_TTS_WS_CONNECT", repr(exc), flush=True)
+            return False
+        try:
+            # 首帧通常是 connected_success
+            try:
+                await asyncio.wait_for(ws.recv(), timeout=10)
+            except Exception:
+                pass
+            start = {
+                "event": "task_start",
+                "model": self._model(),
+                "voice_setting": {
+                    "voice_id": voice,
+                    "speed": float(os.environ.get("MINIMAX_SPEED", "1")),
+                    "vol": float(os.environ.get("MINIMAX_VOL", "1")),
+                    "pitch": int(os.environ.get("MINIMAX_PITCH", "0")),
+                },
+                "audio_setting": {"sample_rate": sample_rate, "format": "pcm", "channel": 1},
+            }
+            await ws.send(json.dumps(start))
+            try:
+                resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+                if resp.get("event") != "task_started":
+                    print("MINIMAX_TTS_WS_START_FAIL", str(resp)[:200], flush=True)
+                    return False
+            except Exception as exc:
+                print("MINIMAX_TTS_WS_START", repr(exc), flush=True)
+                return False
+            await ws.send(json.dumps({"event": "task_continue", "text": self._text}))
+            pcm_total = 0
+            frame_bytes = int(sample_rate / 5) * 2  # 200ms 帧
+            buf = bytearray()
+            init_done = False
+            while True:
+                try:
+                    msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
+                except asyncio.TimeoutError:
+                    break
+                data = msg.get("data") or {}
+                audio_hex = data.get("audio") or ""
+                if audio_hex:
+                    chunk = bytes.fromhex(audio_hex)
+                    if not init_done:
+                        output_emitter.initialize(
+                            request_id="minimax-tts",
+                            sample_rate=sample_rate,
+                            num_channels=self._tts_.num_channels,
+                            mime_type="audio/pcm",
+                            stream=True,
+                        )
+                        output_emitter.start_segment(segment_id="minimax-tts")
+                        init_done = True
+                    # 攒 200ms 帧推给 livekit,让它边收边播
+                    buf.extend(chunk)
+                    while len(buf) >= frame_bytes:
+                        output_emitter.push(bytes(buf[:frame_bytes]))
+                        output_emitter.flush()
+                        del buf[:frame_bytes]
+                        pcm_total += frame_bytes
+                if msg.get("is_final"):
+                    if buf:
+                        output_emitter.push(bytes(buf))
+                        output_emitter.flush()
+                        pcm_total += len(buf)
+                    if init_done:
+                        output_emitter.end_segment()
+                    break
+            print("MINIMAX_TTS_WS_BYTES", pcm_total, flush=True)
+            return init_done  # 有推流才算成功
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print("MINIMAX_TTS_WS_ERR", repr(exc), flush=True)
+            return False
+        finally:
+            try:
+                await ws.close()
+            except Exception:  # pragma: no cover
+                pass
+
+    async def _run_http(self, output_emitter, key: str, voice: str, sample_rate: int) -> None:
+        """HTTP 整段合成(WS 不可用时的降级)。"""
+        endpoint = self._tts_._endpoint()
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                async with httpx.AsyncClient(timeout=60) as client:
+                    resp = await client.post(
+                        endpoint,
+                        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                        json={
+                            "model": self._model(),
+                            "text": self._text,
+                            "voice_setting": {
+                                "voice_id": voice,
+                                "speed": float(os.environ.get("MINIMAX_SPEED", "1")),
+                                "vol": float(os.environ.get("MINIMAX_VOL", "1")),
+                                "pitch": int(os.environ.get("MINIMAX_PITCH", "0")),
+                            },
+                            "audio_setting": {"sample_rate": sample_rate, "format": "pcm", "channel": 1},
+                        },
+                    )
+                    resp.raise_for_status()
+                    body = resp.json()
+                    data = body.get("data") or {}
+                    audio_hex = data.get("audio") or ""
+                    if not audio_hex:
+                        raise RuntimeError(f"minimax empty audio: {body.get('base_resp')}")
+                    pcm = bytes.fromhex(audio_hex)
+                    output_emitter.initialize(
+                        request_id="minimax-tts",
+                        sample_rate=sample_rate,
+                        num_channels=self._tts_.num_channels,
+                        mime_type="audio/pcm",
+                        stream=False,
+                    )
+                    output_emitter.push(pcm)
+                    print("MINIMAX_TTS_BYTES", len(pcm), flush=True)
+                    return
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                print("MINIMAX_TTS_RETRY", attempt + 1, repr(exc), flush=True)
+                await asyncio.sleep(0.5 * (attempt + 1))
+        print("MINIMAX_TTS_ERROR", repr(last_exc), flush=True)
+        await self._emit_beep(output_emitter)
 
     async def _emit_beep(self, output_emitter):
         import math
@@ -928,7 +1295,7 @@ class Qwen3ASRSTT(stt.STT):
             self, conn_options or APIConnectOptions()
         )._recognize_buffer(buffer)
         if text:
-            self._language_state.update(lang)
+            self._language_state.update(lang, text)
             return stt.SpeechEvent(
                 type=stt.SpeechEventType.FINAL_TRANSCRIPT,
                 request_id="",
@@ -954,7 +1321,7 @@ class _Qwen3ASRStream(stt.RecognizeStream):
                     except Exception:
                         text, lang = "", ""
                     if text:
-                        self._stt_._language_state.update(lang)
+                        self._stt_._language_state.update(lang, text)
                         self._event_ch.send_nowait(
                             stt.SpeechEvent(
                                 type=stt.SpeechEventType.FINAL_TRANSCRIPT,
@@ -1003,6 +1370,7 @@ class _Qwen3ASRStream(stt.RecognizeStream):
                     data = final.json()
                     text = str(data.get("text") or "")
                     lang = str(data.get("language") or "")
+                    lang = _normalize_asr_language(lang, text)
                     print("QWEN3_ASR_TEXT", repr(text[:120]), lang, flush=True)
                     return text, lang
             except asyncio.CancelledError:
