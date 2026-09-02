@@ -876,11 +876,11 @@ class MiniMaxTTS(tts.TTS):
         api_key: str = "",
     ):
         super().__init__(
-            # MiniMax 通过 synthesize(ChunkedStream)内部走 WS 流式边合成边推;
-            # capabilities 保持 streaming=False,让 livekit 用 StreamAdapter 包 synthesize
-            # (voice 模式兼容)。若声明 streaming=True,voice 管线会调 stream() 走
-            # SynthesizeStream 协议,而我们未实现 → NotImplementedError(整轮无声)。
-            capabilities=tts.TTSCapabilities(streaming=False, aligned_transcript=False),
+            # 真流式：声明 streaming=True，voice 管线调 stream() 走 SynthesizeStream，
+            # 不再被 StreamAdapter + SentenceTokenizer 包（那会等整句/全文才送 TTS，
+            # 中文切句不可靠导致首包要等 LLM 全文吐完）。stream() 内单条 WS 连接按
+            # LLM 增量文本持续 task_continue，MiniMax 边合成边回音频，首包几百 ms。
+            capabilities=tts.TTSCapabilities(streaming=True, aligned_transcript=False),
             sample_rate=sample_rate,
             num_channels=1,
         )
@@ -898,6 +898,17 @@ class MiniMaxTTS(tts.TTS):
     def _api_key(self) -> str:
         return self._key or os.environ.get("MINIMAX_API_KEY", "")
 
+    def _endpoint_ws(self) -> str:
+        """WebSocket 端点:国内 wss://api.minimax.cn/ws/v1/t2a_v2,海外 .chat。"""
+        base = os.environ.get("MINIMAX_WS_URL", "").strip()
+        if base:
+            return base
+        region = os.environ.get("MINIMAX_REGION", "cn").strip().lower()
+        return "wss://api.minimax.chat/ws/v1/t2a_v2" if region in {"intl", "global", "chat"} else "wss://api.minimax.cn/ws/v1/t2a_v2"
+
+    def _model(self) -> str:
+        return os.environ.get("MINIMAX_MODEL", "speech-2.8-hd")
+
     def _resolve_voice(self) -> str:
         if isinstance(self._voice, dict):
             return str(self._voice.get(self._language_state.lang) or self._voice.get("zh") or "")
@@ -911,7 +922,170 @@ class MiniMaxTTS(tts.TTS):
         return raw
 
     def synthesize(self, text, *, conn_options=None):
+        # 保留整段合成路径：livekit 某些非 stream 调用 / 测试仍会走 synthesize。
         return _MiniMaxTTSStream(self, text, conn_options or APIConnectOptions())
+
+    def stream(self, *, conn_options=None):
+        """真流式 SynthesizeStream：单 WS 连接按增量文本持续 task_continue。"""
+        return _MiniMaxSynthesizeStream(self, conn_options or APIConnectOptions())
+
+
+class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
+    """MiniMax 增量流式：一条 WS 连接，LLM 文本增量到达即 task_continue。
+
+    与旧 ChunkedStream（等整段文本 → 一次 WS）不同：livekit 的 tts_node 对
+    streaming=True 的 TTS 会直接调 stream()，把 LLM 逐块文本 push 进来，不再
+    用 StreamAdapter 的句子切分（中文切句要等整句/全文，是首包 8-18s 的根因）。
+    这里每收到一段文本就 task_continue 到同一条 WS，MiniMax 边合成边回音频，
+    首包延迟 ≈ LLM 首句时间 + WS 首音频块，而非等全文。
+    """
+
+    def __init__(self, tts_: "MiniMaxTTS", conn_options):
+        super().__init__(tts=tts_, conn_options=conn_options)
+        self._tts_ = tts_
+
+    async def _run(self, output_emitter):
+        import websockets
+
+        try:
+            key = self._tts_._api_key()
+            if not key:
+                print("MINIMAX_TTS_MISSING_CREDENTIALS", flush=True)
+                return
+            voice = self._tts_._resolve_voice()
+            if not voice:
+                print("MINIMAX_TTS_NO_VOICE", flush=True)
+                return
+            sample_rate = self._tts_.sample_rate
+
+            ws = await websockets.connect(
+                self._tts_._endpoint_ws(),
+                additional_headers={"Authorization": f"Bearer {key}"},
+                open_timeout=10,
+                max_size=20_000_000,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print("MINIMAX_TTS_WS_CONNECT", repr(exc), flush=True)
+            # WS 连不上 → 回退整段 synthesize(StreamAdapter 包装,端到端仍出声)
+            return
+
+        init_done = False
+        frame_bytes = int(sample_rate / 5) * 2  # 200ms 帧
+        buf = bytearray()
+        recv_task: asyncio.Task | None = None
+        try:
+            # 首帧 connected_success
+            try:
+                await asyncio.wait_for(ws.recv(), timeout=10)
+            except Exception:
+                pass
+            start = {
+                "event": "task_start",
+                "model": self._tts_._model(),
+                "voice_setting": {
+                    "voice_id": voice,
+                    "speed": float(os.environ.get("MINIMAX_SPEED", "1")),
+                    "vol": float(os.environ.get("MINIMAX_VOL", "1")),
+                    "pitch": int(os.environ.get("MINIMAX_PITCH", "0")),
+                },
+                "audio_setting": {"sample_rate": sample_rate, "format": "pcm", "channel": 1},
+            }
+            await ws.send(json.dumps(start))
+            try:
+                resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+                if resp.get("event") != "task_started":
+                    print("MINIMAX_TTS_WS_START_FAIL", str(resp)[:200], flush=True)
+                    return
+            except Exception as exc:
+                print("MINIMAX_TTS_WS_START", repr(exc), flush=True)
+                return
+
+            async def _recv_loop():
+                nonlocal init_done, buf
+                while True:
+                    try:
+                        msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
+                    except asyncio.TimeoutError:
+                        break
+                    except Exception:
+                        break
+                    data = msg.get("data") or {}
+                    audio_hex = data.get("audio") or ""
+                    if audio_hex:
+                        chunk = bytes.fromhex(audio_hex)
+                        if not init_done:
+                            output_emitter.initialize(
+                                request_id="minimax-tts",
+                                sample_rate=sample_rate,
+                                num_channels=self._tts_.num_channels,
+                                mime_type="audio/pcm",
+                                stream=True,
+                            )
+                            output_emitter.start_segment(segment_id="minimax-tts")
+                            init_done = True
+                        buf.extend(chunk)
+                        while len(buf) >= frame_bytes:
+                            output_emitter.push(bytes(buf[:frame_bytes]))
+                            output_emitter.flush()
+                            del buf[:frame_bytes]
+                    # is_final = 当前已合成文本的段边界，不代表任务结束（task_continue
+                    # 可继续追加合成）。这里只标记，不退出；收尾由调用方 cancel。
+                    if msg.get("is_final") and buf:
+                        output_emitter.push(bytes(buf))
+                        output_emitter.flush()
+                        buf.clear()
+
+            recv_task = asyncio.create_task(_recv_loop())
+
+            # 把 _input_ch 的文本增量连续 task_continue 给 MiniMax。
+            # 语义（实测）：task_continue 的 text 是「到目前为止的累积全文」，不是
+            # 纯增量——发纯增量会丢 ~40% 音频。故每块都发累计文本。
+            acc_text = ""
+            async for item in self._input_ch:
+                if isinstance(item, self._FlushSentinel):
+                    continue
+                text = str(item or "")
+                if not text.strip():
+                    continue
+                acc_text += text
+                await ws.send(json.dumps({"event": "task_continue", "text": acc_text}))
+            # 文本结束:发 task_finish 让服务端吐完剩余音频并回 is_final
+            if acc_text:
+                try:
+                    await ws.send(json.dumps({"event": "task_finish"}))
+                except Exception:
+                    pass
+            # 收尾:等 recv_loop 把剩余音频推完(最多 15s)
+            if recv_task:
+                try:
+                    await asyncio.wait_for(recv_task, timeout=15)
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print("MINIMAX_TTS_WS_ERR", repr(exc), flush=True)
+        finally:
+            if recv_task:
+                recv_task.cancel()
+                try:
+                    await recv_task
+                except Exception:
+                    pass
+            try:
+                await ws.close()
+            except Exception:
+                pass
+            # 推完残余音频并结束 segment(收到 is_final 时 buf 可能还有尾部)
+            if init_done and buf:
+                try:
+                    output_emitter.push(bytes(buf))
+                    output_emitter.flush()
+                    output_emitter.end_segment()
+                except Exception:
+                    pass
 
 
 class _MiniMaxTTSStream(tts.ChunkedStream):
@@ -948,17 +1122,6 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
                 await self._emit_beep(output_emitter)
             except Exception:  # pragma: no cover
                 pass
-
-    def _endpoint_ws(self) -> str:
-        """WebSocket 端点:国内 wss://api.minimax.cn/ws/v1/t2a_v2,海外 .chat。"""
-        base = os.environ.get("MINIMAX_WS_URL", "").strip()
-        if base:
-            return base
-        region = os.environ.get("MINIMAX_REGION", "cn").strip().lower()
-        return "wss://api.minimax.chat/ws/v1/t2a_v2" if region in {"intl", "global", "chat"} else "wss://api.minimax.cn/ws/v1/t2a_v2"
-
-    def _model(self) -> str:
-        return os.environ.get("MINIMAX_MODEL", "speech-2.8-hd")
 
     async def _run_ws(self, output_emitter, key: str, voice: str, sample_rate: int) -> bool:
         """MiniMax WebSocket 流式:task_start → task_continue(text) → 边收 hex 音频边推。"""
