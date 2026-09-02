@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any
 
@@ -35,7 +36,15 @@ class Summarizer:
             return {"summary": "", "new_topics": [], "insight": None}
         llm_cfg = settings.get("llm", {}) or {}
         base_url = (llm_cfg.get("base_url") or "").rstrip("/")
-        model = llm_cfg.get("model") or ""
+        model = (llm_cfg.get("model") or "").strip()
+        # 设置页 LLM 卡片可存空 base_url / 占位 model="local"；本机 MLX 的真实地址
+        # 由启动器经 env 注入（与 agent 的 MlxLlmLLM 同一来源）。只读 settings 会打到
+        # 空 URL / model=local → mlx_lm 404 → 蒸馏表（new_topics/insight）永不写入。
+        if not base_url or not model or model == "local":
+            env_base = os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1").rstrip("/")
+            env_model = (os.environ.get("MLX_LLM_MODEL") or "").strip()
+            if env_base and env_model:
+                base_url, model = env_base, env_model
         if not base_url or not model:
             return self._fallback(turns)
         try:

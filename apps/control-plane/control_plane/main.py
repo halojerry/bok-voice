@@ -142,7 +142,10 @@ async def _rebuild_in_memory_knowledge(vector: InMemoryVectorStore, vault_root: 
         except Exception:
             continue
         await vector.upsert(
-            [{"id": f"md:{rel}", "text": content, "path": "/".join(parts[3:]), "source": "vault"}],
+            # path 存完整 vault 相对路径（accounts/acc-001/knowledge/...），
+            # 与 import_document 的 path、delete 里 markdown.forget(path) 一致——
+            # 否则 delete 找不到 vault 文件，重启后知识从 vault 复活。
+            [{"id": f"md:{rel}", "text": content, "path": rel, "source": "vault"}],
             account_id,
         )
 
@@ -264,6 +267,46 @@ async def tts_voices() -> list[dict]:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+@app.delete("/api/tts/voices/{voice_id}")
+async def tts_delete_voice(voice_id: str) -> dict:
+    """删除已克隆音色（preset 不可删；同步清理 registry/缓存/参考音频）。"""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.delete(f"{_qwen3_tts_url()}/v1/voices/{voice_id}")
+            if resp.status_code == 404:
+                raise HTTPException(status_code=404, detail=f"clone voice not found: {voice_id}")
+            resp.raise_for_status()
+            body = resp.json()
+            # 清理引用了该音色的人设（reference_audio 是 {lang: voice_id} JSON，去掉该 voice_id 键）。
+            try:
+                for p in _repo().list_personas(""):
+                    raw = p.get("reference_audio") or ""
+                    if voice_id not in raw:
+                        continue
+                    try:
+                        mapping = json.loads(raw)
+                        if isinstance(mapping, dict):
+                            before = dict(mapping)
+                            mapping = {k: v for k, v in mapping.items() if v != voice_id}
+                            if mapping != before:
+                                _repo().update_persona(p["id"], {"reference_audio": json.dumps(mapping, ensure_ascii=False)})
+                    except Exception:
+                        continue
+            except Exception as exc:  # pragma: no cover - 引用清理失败不阻塞删除
+                print(f"[cp] clean persona refs failed: {exc!r}", flush=True)
+            _audit(
+                "voice.delete",
+                subject_type="tts_voice",
+                subject_id=voice_id,
+                detail={"voice_id": voice_id},
+            )
+            return body
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 @app.post("/api/tts/voices")
 async def tts_register_voice(
     file: UploadFile = File(...),
@@ -306,22 +349,54 @@ async def tts_register_voice(
 
 @app.post("/api/tts/preview")
 async def tts_preview(payload: dict) -> Response:
+    """试听一段 TTS。provider=qwen3_tts 走本地 sidecar；provider=minimax 走云端 MiniMax
+    （voice 是 MiniMax 音色 ID，如 Cantonese_Male_news_anchor_vv2）。返回 WAV。"""
+    provider = str(payload.get("provider") or "qwen3_tts").lower()
+    sample_rate = int(payload.get("sample_rate") or 24000)
+    text = str(payload.get("text") or "")
+    voice = str(payload.get("voice") or "")
+    language = str(payload.get("language") or "zh")
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                f"{_qwen3_tts_url()}/v1/audio/speech",
-                json={
-                    "input": payload.get("text", ""),
-                    "voice": payload.get("voice", ""),
-                    "language": payload.get("language", "Auto"),
-                    "instruct": payload.get("instruct", ""),
-                    "sample_rate": int(payload.get("sample_rate") or 24000),
-                    "response_format": "pcm",
-                },
-            )
-            resp.raise_for_status()
-            pcm = resp.content
-        sample_rate = int(payload.get("sample_rate") or 24000)
+        if provider in ("minimax", "minimax_streaming"):
+            api_key = os.environ.get("MINIMAX_API_KEY", "")
+            if not api_key:
+                raise HTTPException(status_code=503, detail="MINIMAX_API_KEY 未配置")
+            region = os.environ.get("MINIMAX_REGION", "cn").strip().lower()
+            base = os.environ.get("MINIMAX_BASE_URL", "").strip().rstrip("/")
+            if not base:
+                base = "https://api.minimax.chat/v1/t2a_v2" if region in {"intl", "global", "chat"} else "https://api.minimax.cn/v1/t2a_v2"
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(
+                    base,
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json={
+                        "model": os.environ.get("MINIMAX_MODEL", "speech-2.8-hd"),
+                        "text": text,
+                        "voice_setting": {"voice_id": voice, "speed": 1, "vol": 1, "pitch": 0},
+                        "audio_setting": {"sample_rate": sample_rate, "format": "pcm", "channel": 1},
+                    },
+                )
+                resp.raise_for_status()
+                body = resp.json()
+                audio_hex = (body.get("data") or {}).get("audio") or ""
+                if not audio_hex:
+                    raise HTTPException(status_code=502, detail=f"minimax empty: {body.get('base_resp')}")
+                pcm = bytes.fromhex(audio_hex)
+        else:
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(
+                    f"{_qwen3_tts_url()}/v1/audio/speech",
+                    json={
+                        "input": text,
+                        "voice": voice,
+                        "language": language,
+                        "instruct": payload.get("instruct", ""),
+                        "sample_rate": sample_rate,
+                        "response_format": "pcm",
+                    },
+                )
+                resp.raise_for_status()
+                pcm = resp.content
         buffer = io.BytesIO()
         with wave.open(buffer, "wb") as wav:
             wav.setnchannels(1)
@@ -329,6 +404,8 @@ async def tts_preview(payload: dict) -> Response:
             wav.setframerate(sample_rate)
             wav.writeframes(pcm)
         return Response(content=buffer.getvalue(), media_type="audio/wav")
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -412,6 +489,27 @@ def get_call(call_id: str) -> dict:
     if not call:
         raise HTTPException(404, "call not found")
     return call
+
+
+@app.delete("/api/calls/{call_id}")
+def delete_call(call_id: str) -> dict:
+    if not _repo().delete_call(call_id):
+        raise HTTPException(404, "call not found")
+    _audit("call.delete", subject_type="call", subject_id=call_id, detail={})
+    return {"deleted": True, "call_id": call_id}
+
+
+@app.delete("/api/calls")
+def clear_ended_calls(account_id: str = "acc-001") -> dict:
+    """清空该账号下已结束(ended)的通话历史。活跃/进行中的通话不删。"""
+    calls = _repo().list_calls(account_id, status=CallStatus.ENDED.value)
+    removed = 0
+    for c in calls:
+        cid = str(c.get("id") or "")
+        if cid and _repo().delete_call(cid):
+            removed += 1
+    _audit("call.clear_ended", subject_type="call", detail={"removed": removed, "account_id": account_id})
+    return {"deleted": removed}
 
 
 @app.post("/api/calls/{call_id}/hangup")
@@ -601,8 +699,10 @@ async def list_knowledge(account_id: str = "acc-001") -> list[dict]:
     return await app.state.knowledge.list(account_id)
 
 
-@app.delete("/api/knowledge/{knowledge_id}")
+@app.delete("/api/knowledge")
 async def delete_knowledge(knowledge_id: str, account_id: str = "acc-001") -> dict:
+    # id 形如 md:accounts/acc-001/knowledge/probe.md（含斜杠），放 path 参数会被
+    # Starlette 路由层以 %2F 拒掉（404）——改走 query 参数最稳。
     removed = await app.state.knowledge.delete(account_id, [knowledge_id])
     return {"deleted": removed, "knowledge_id": knowledge_id}
 
@@ -727,6 +827,18 @@ def reports_summary(account_id: str = "acc-001") -> dict:
 @app.get("/api/reports/calls")
 def reports_calls(account_id: str = "acc-001") -> list[dict]:
     return _repo().list_calls(account_id, "")
+
+
+@app.get("/api/insights")
+def list_insights() -> list[dict]:
+    """全局洞察（结算时 Summarizer 蒸馏产出，跨对象共性的观察）。"""
+    return _repo().list_global_insights(kind="insight")
+
+
+@app.get("/api/objects/{object_id}/topics")
+def list_object_topics(object_id: str) -> list[dict]:
+    """对象历史主题（结算时 Summarizer 蒸馏产出并 append 到该对象）。"""
+    return _repo().list_object_topics(object_id)
 
 
 @app.get("/api/reports/usage")

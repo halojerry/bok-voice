@@ -163,7 +163,7 @@ def test_knowledge_delete_removes_vault_file_and_does_not_resurrect(tmp_path, mo
         vault_file = tmp_path / "vault" / "accounts" / "acc-001" / "knowledge" / "del-me.md"
         assert vault_file.exists()
 
-        resp = client.delete(f"/api/knowledge/{target['id']}", params={"account_id": "acc-001"})
+        resp = client.delete("/api/knowledge", params={"knowledge_id": target["id"], "account_id": "acc-001"})
         assert resp.status_code == 200
         assert not vault_file.exists(), "删除后 vault 源文件必须被移除"
         remaining = client.get("/api/knowledge", params={"account_id": "acc-001"}).json()

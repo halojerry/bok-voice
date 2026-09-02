@@ -465,6 +465,9 @@ def write_bline_config(current: dict[str, str] | None = None) -> Path:
 def _control_plane_env(db: Path | str) -> dict[str, str]:
     """Env for the control-plane child. MUST include LiveKit credentials so
     /api/token issues a real JWT instead of the old sha256 dev fallback."""
+    # 结算摘要/蒸馏（Summarizer）用同一本机 MLX：settings 里的 llm 卡片可能是空 base_url /
+    # 占位 model="local"，真实地址由这里注入（与 agent worker L667 同源）。
+    llm_model = model_path(MODELS["mac"] if is_mac() else MODELS["windows"], "llm")
     return {
         "PYTHONPATH": _repo_pythonpath(),
         "BOK_SERVICE": "control-plane",
@@ -473,6 +476,8 @@ def _control_plane_env(db: Path | str) -> dict[str, str]:
         "LIVEKIT_URL": os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880"),
         "LIVEKIT_API_KEY": os.environ.get("LIVEKIT_API_KEY", "devkey"),
         "LIVEKIT_API_SECRET": os.environ.get("LIVEKIT_API_SECRET", "devsecret"),
+        "MLX_LLM_BASE_URL": os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
+        "MLX_LLM_MODEL": llm_model,
     }
 
 
@@ -618,6 +623,8 @@ def cmd_serve() -> int:
     log_dir.mkdir(parents=True, exist_ok=True)
 
     py = repo_python()
+    # Dev 模式用系统 node 起 Next dev（打包模式 BOK_PACKAGED=1 跳过 web:3000）。
+    node = bundled_node() or "node"
     # control-plane
     # Dev 与打包统一：业务数据 SQLite 落盘、知识 vault 在 app-data（bundle 只读）。
     db = (app_data_dir() / "bok_voice.db").as_posix()

@@ -94,6 +94,8 @@ class ObjectProfile:
     language: str = "zh"
     background: str = ""
     phone: str = ""
+    tracking_no: str = ""
+    courier: str = ""
     template_id: str = ""
     status: str = "active"
 
@@ -109,6 +111,7 @@ class ConversationTemplate:
     closing: str = ""
     tone_override: str = ""
     language: str = "zh"
+    steps_json: str = ""
 
 
 @dataclass
@@ -130,6 +133,7 @@ class PersonaProfile:
     tone: str = ""
     language: str = "zh"
     reference_audio: str = ""
+    tts_provider: str = ""
 
 
 @dataclass

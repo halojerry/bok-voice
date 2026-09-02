@@ -65,6 +65,30 @@ def build_engine() -> Engine | None:
                     "summary",
                     "summary TEXT",
                 )
+                _ensure_column(
+                    conn,
+                    "persona_profiles",
+                    "tts_provider",
+                    "tts_provider VARCHAR(32) DEFAULT ''",
+                )
+                _ensure_column(
+                    conn,
+                    "object_profiles",
+                    "tracking_no",
+                    "tracking_no VARCHAR(64) DEFAULT ''",
+                )
+                _ensure_column(
+                    conn,
+                    "object_profiles",
+                    "courier",
+                    "courier VARCHAR(64) DEFAULT ''",
+                )
+                _ensure_column(
+                    conn,
+                    "conversation_templates",
+                    "steps_json",
+                    "steps_json TEXT",
+                )
         except Exception as exc:  # pragma: no cover - sqlite / duplicate column
             print(f"[deps] idempotent column migration skipped: {exc}")
         # pgvector: create the extension + knowledge_chunks table (best-effort SQLite-safe).

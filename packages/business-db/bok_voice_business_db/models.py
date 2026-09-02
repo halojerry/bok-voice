@@ -30,6 +30,9 @@ class PersonaProfile(Base):
     tone: Mapped[str] = mapped_column(Text, default="")
     language: Mapped[str] = mapped_column(String(16), default="zh")
     reference_audio: Mapped[str] = mapped_column(String(512), default="")
+    # 人设级 TTS 引擎："" = 跟随全局设置；qwen3_tts / minimax / volcano_streaming / fake。
+    # 决定该人设通话用哪套音色（本地克隆 vs 云端 MiniMax/火山），避免克隆 ID 串引擎。
+    tts_provider: Mapped[str] = mapped_column(String(32), default="")
 
 
 class ObjectProfile(Base):
@@ -41,6 +44,9 @@ class ObjectProfile(Base):
     language: Mapped[str] = mapped_column(String(16), default="zh")
     background: Mapped[str] = mapped_column(Text, default="")
     phone: Mapped[str] = mapped_column(String(64), default="")
+    # 快递场景变量:姓名=display_name;单号/物流公司供话术变量与 LLM 引用。
+    tracking_no: Mapped[str] = mapped_column(String(64), default="")
+    courier: Mapped[str] = mapped_column(String(64), default="")
     template_id: Mapped[str] = mapped_column(String(64), default="")
     status: Mapped[str] = mapped_column(String(32), default="active")
 
@@ -56,6 +62,9 @@ class ConversationTemplate(Base):
     closing: Mapped[str] = mapped_column(Text, default="")
     tone_override: Mapped[str] = mapped_column(String(255), default="")
     language: Mapped[str] = mapped_column(String(16), default="zh")
+    # 分步话术:JSON 数组 [{"goal": "这一步要达成的目标", "ref": "参考说法(可含 {变量})"}, ...]。
+    # 由 agent 每轮按步骤推进,LLM 结合客户回复只回应当前步。opening/core 四段保留兼容。
+    steps_json: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 

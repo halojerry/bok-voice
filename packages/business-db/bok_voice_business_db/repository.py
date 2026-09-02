@@ -65,6 +65,20 @@ class SqlAlchemyBusinessRepository:
         self.session.commit()
         return self._call_to_dict(row)
 
+    def delete_call(self, call_id: str) -> bool:
+        """删除通话及连带数据(turns/settlements)。审计事件保留(只读历史)。"""
+        row = self.session.get(models.CallSession, call_id)
+        if not row:
+            return False
+        # 连带清掉该通话的转写与结算,避免孤儿行。
+        for t in self.session.scalars(select(models.Turn).filter_by(call_id=call_id)):
+            self.session.delete(t)
+        for s in self.session.scalars(select(models.Settlement).filter_by(call_id=call_id)):
+            self.session.delete(s)
+        self.session.delete(row)
+        self.session.commit()
+        return True
+
     def list_calls(self, account_id: str, status: str = "") -> list[dict]:
         stmt = select(models.CallSession)
         if account_id:
@@ -161,6 +175,8 @@ class SqlAlchemyBusinessRepository:
             language=data.get("language", "zh"),
             background=data.get("background", ""),
             phone=data.get("phone", ""),
+            tracking_no=data.get("tracking_no", ""),
+            courier=data.get("courier", ""),
             template_id=data.get("template_id", ""),
             status=data.get("status", "active"),
         )
@@ -176,7 +192,7 @@ class SqlAlchemyBusinessRepository:
         obj = self.session.get(models.ObjectProfile, object_id)
         if not obj:
             return None
-        allowed = {"display_name", "role_template", "language", "background", "phone", "template_id", "status"}
+        allowed = {"display_name", "role_template", "language", "background", "phone", "tracking_no", "courier", "template_id", "status"}
         for key, value in data.items():
             if key in allowed and hasattr(obj, key):
                 setattr(obj, key, value)
@@ -200,6 +216,7 @@ class SqlAlchemyBusinessRepository:
             tone=data.get("tone", ""),
             language=data.get("language", "zh"),
             reference_audio=data.get("reference_audio", ""),
+            tts_provider=data.get("tts_provider", ""),
         )
         self.session.add(persona)
         self.session.commit()
@@ -209,7 +226,7 @@ class SqlAlchemyBusinessRepository:
         persona = self.session.get(models.PersonaProfile, persona_id)
         if not persona:
             return None
-        allowed = {"account_id", "name", "company", "tone", "language", "reference_audio"}
+        allowed = {"account_id", "name", "company", "tone", "language", "reference_audio", "tts_provider"}
         for key, value in data.items():
             if key in allowed and hasattr(persona, key):
                 setattr(persona, key, value)
@@ -249,6 +266,7 @@ class SqlAlchemyBusinessRepository:
             closing=data.get("closing", ""),
             tone_override=data.get("tone_override", ""),
             language=data.get("language", "zh"),
+            steps_json=data.get("steps_json", ""),
         )
         self.session.add(tpl)
         self.session.commit()
@@ -262,7 +280,7 @@ class SqlAlchemyBusinessRepository:
         tpl = self.session.get(models.ConversationTemplate, template_id)
         if not tpl:
             return None
-        allowed = {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language"}
+        allowed = {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json"}
         for key, value in data.items():
             if key in allowed and hasattr(tpl, key):
                 setattr(tpl, key, value)
@@ -460,6 +478,14 @@ class InMemoryBusinessRepository:
         self.calls[call_id].update(fields)
         return self.calls[call_id]
 
+    def delete_call(self, call_id: str) -> bool:
+        if call_id not in self.calls:
+            return False
+        del self.calls[call_id]
+        self.turns.pop(call_id, None)
+        self.settlements.pop(call_id, None)
+        return True
+
     def list_calls(self, account_id: str, status: str = "") -> list[dict]:
         return [
             c for c in self.calls.values()
@@ -492,6 +518,8 @@ class InMemoryBusinessRepository:
             language=data.get("language", "zh"),
             background=data.get("background", ""),
             phone=data.get("phone", ""),
+            tracking_no=data.get("tracking_no", ""),
+            courier=data.get("courier", ""),
             template_id=data.get("template_id", ""),
             status=data.get("status", "active"),
         ).__dict__
@@ -501,7 +529,7 @@ class InMemoryBusinessRepository:
     def update_object(self, object_id: str, data: dict) -> dict | None:
         if object_id not in self.objects:
             return None
-        self.objects[object_id].update({k: v for k, v in data.items() if k in {"display_name", "role_template", "language", "background", "phone", "template_id", "status"}})
+        self.objects[object_id].update({k: v for k, v in data.items() if k in {"display_name", "role_template", "language", "background", "phone", "tracking_no", "courier", "template_id", "status"}})
         return self.objects[object_id]
 
     def delete_object(self, object_id: str) -> bool:
@@ -516,6 +544,7 @@ class InMemoryBusinessRepository:
             tone=data.get("tone", ""),
             language=data.get("language", "zh"),
             reference_audio=data.get("reference_audio", ""),
+            tts_provider=data.get("tts_provider", ""),
         ).__dict__
         self.personas[persona["id"]] = persona
         return persona
@@ -523,7 +552,7 @@ class InMemoryBusinessRepository:
     def update_persona(self, persona_id: str, data: dict) -> dict | None:
         if persona_id not in self.personas:
             return None
-        self.personas[persona_id].update({k: v for k, v in data.items() if k in {"account_id", "name", "company", "tone", "language", "reference_audio"}})
+        self.personas[persona_id].update({k: v for k, v in data.items() if k in {"account_id", "name", "company", "tone", "language", "reference_audio", "tts_provider"}})
         return self.personas[persona_id]
 
     def delete_persona(self, persona_id: str) -> bool:
@@ -555,6 +584,7 @@ class InMemoryBusinessRepository:
             closing=data.get("closing", ""),
             tone_override=data.get("tone_override", ""),
             language=data.get("language", "zh"),
+            steps_json=data.get("steps_json", ""),
         ).__dict__
         self.templates[tpl["id"]] = tpl
         return tpl
@@ -565,7 +595,7 @@ class InMemoryBusinessRepository:
     def update_template(self, template_id: str, data: dict) -> dict | None:
         if template_id not in self.templates:
             return None
-        self.templates[template_id].update({k: v for k, v in data.items() if k in {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language"}})
+        self.templates[template_id].update({k: v for k, v in data.items() if k in {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json"}})
         return self.templates[template_id]
 
     def delete_template(self, template_id: str) -> bool:

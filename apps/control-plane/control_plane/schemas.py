@@ -35,6 +35,8 @@ class CreateObjectRequest(BaseModel):
     language: str = "zh"
     background: str = ""
     phone: str = ""
+    tracking_no: str = ""
+    courier: str = ""
     template_id: str = ""
 
 
@@ -50,6 +52,8 @@ class UpdateObjectRequest(BaseModel):
     language: str = "zh"
     background: str = ""
     phone: str = ""
+    tracking_no: str = ""
+    courier: str = ""
     template_id: str = ""
     status: str = "active"
 
@@ -63,6 +67,7 @@ class TemplateRequest(BaseModel):
     closing: str = ""
     tone_override: str = ""
     language: str = "zh"
+    steps_json: str = ""
 
 
 class UpdateTemplateRequest(BaseModel):
@@ -74,6 +79,7 @@ class UpdateTemplateRequest(BaseModel):
     closing: str = ""
     tone_override: str = ""
     language: str = "zh"
+    steps_json: str = ""
 
 
 class PersonaRequest(BaseModel):
@@ -83,6 +89,7 @@ class PersonaRequest(BaseModel):
     tone: str = ""
     language: str = "zh"
     reference_audio: str = ""
+    tts_provider: str = ""
 
 
 class UpdatePersonaRequest(BaseModel):
@@ -92,6 +99,7 @@ class UpdatePersonaRequest(BaseModel):
     tone: str = ""
     language: str = "zh"
     reference_audio: str = ""
+    tts_provider: str = ""
 
 
 class ProviderSettings(BaseModel):
