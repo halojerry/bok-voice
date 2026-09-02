@@ -142,6 +142,7 @@ def _instructions(
         "用户说普通话就只用标准普通话回复（严禁使用任何粤语口语用字）；"
         "用户说粤语就用地道粤语口语回复（使用如：唔、冇、嘅、哋、佢、喺、嚟、啲、咁、係、唔該、"
         "倾偈、而家、睇嚟、啱啱）；用户说英语就用英语回复。"
+        "直接以该语言回应，不要解释你正在使用什么语言，不要添加任何注释或括号说明。"
     )
     return "\n".join(parts)
 
@@ -340,7 +341,10 @@ async def entrypoint(ctx):
                 "max_delay": float(os.environ.get("ENDPOINT_MAX_DELAY", "2.0")),
             },
             preemptive_generation={
-                "enabled": True,
+                # 默认关闭：preemptive 会在用户句确认前抢先生成，导致回复与上下文
+                # 错位（观察：粤语轮偶发回普通话问候）。关闭只损失少量首包延迟，
+                # 换取每轮回复严格基于已确认的用户输入（可用 PREEMPTIVE_GENERATION=1 开启）。
+                "enabled": os.environ.get("PREEMPTIVE_GENERATION", "0") == "1",
                 "preemptive_tts": os.environ.get("PREEMPTIVE_TTS", "1") == "1",
                 "max_speech_duration": 10.0,
                 "max_retries": 3,
@@ -384,6 +388,10 @@ async def entrypoint(ctx):
             return
         text = getattr(item, "text_content", None) or getattr(item, "raw_text_content", "") or ""
         if text:
+            if role == "user":
+                # 同步注入：用 ASR 检测到的用户语言约束本轮回回复语言。
+                # 必须在异步检索之前设置，否则 LLM 请求可能先于指令注入发出。
+                context_state.set_user_language(language_state.lang)
             asyncio.create_task(_async_update_context(role, text))
 
     def _on_close(ev):

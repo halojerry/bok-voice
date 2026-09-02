@@ -204,6 +204,19 @@ class ContextState:
         self._max_summary_chars = max_summary_chars
         self._snippets: list[str] = []
         self._summary_lines: list[str] = []
+        self._user_lang: str = ""
+
+    def set_user_language(self, lang: str | None) -> None:
+        """ASR 每轮检测到的用户语言：随 system 指令注入，约束回复语言。"""
+        key = (lang or "").strip().lower()
+        if key in {"chinese", "zh", "mandarin"}:
+            self._user_lang = "zh"
+        elif key in {"cantonese", "yue"}:
+            self._user_lang = "yue"
+        elif key in {"english", "en"}:
+            self._user_lang = "en"
+        else:
+            self._user_lang = key
 
     def set_knowledge(self, snippets: list[dict]) -> None:
         seen: set[str] = set()
@@ -227,6 +240,19 @@ class ContextState:
 
     def render_system_message(self) -> str:
         parts: list[str] = []
+        if self._user_lang:
+            names = {"zh": "普通话/中文", "yue": "粤语（广东话）", "en": "英语"}
+            name = names.get(self._user_lang, self._user_lang)
+            if self._user_lang == "yue":
+                rule = (
+                    "用地道粤语口语回复（唔、冇、嘅、哋、佢、喺、嚟、啲、咁、係、唔該、倾偈、而家、睇嚟、啱啱），"
+                    "严格禁止使用普通话或书面语；不要解释语言选择，不要添加任何注释。"
+                )
+            elif self._user_lang == "en":
+                rule = "Reply in English only; do not explain or add notes."
+            else:
+                rule = "用标准普通话回复；不要解释语言选择，不要添加任何注释。"
+            parts.append(f"【用户语言】当前用户正在使用：{name}。{rule}")
         if self._snippets:
             parts.append("【实时检索到的资料】\n" + "\n".join(f"- {s}" for s in self._snippets))
         if self._summary_lines:
@@ -260,7 +286,19 @@ class ContextAwareLLM(llm.LLM):
             msg = self._ctx.render_system_message()
             if msg:
                 copy = chat_ctx.copy()
-                copy.add_message(role="system", content=msg)
+                items = list(copy.items)
+                # 系统指令必须位于对话开头：把实时上下文（知识/记忆/用户语言）
+                # 合并进第一条 system，而不是追加在用户消息之后（后者遵从度差）。
+                if items and isinstance(items[0], llm.ChatMessage) and items[0].role == "system":
+                    head = items[0].content
+                    if isinstance(head, str):
+                        merged = f"{msg}\n\n{head}"
+                    else:
+                        merged = [msg, *head]
+                    items[0] = llm.ChatMessage(role="system", content=merged)
+                else:
+                    items.insert(0, llm.ChatMessage(role="system", content=msg))
+                copy.items = items
                 chat_ctx = copy
         return self._inner.chat(
             chat_ctx=chat_ctx,
