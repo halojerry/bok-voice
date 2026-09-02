@@ -89,6 +89,16 @@ def test_language_state_update_now_accepts_text():
     assert s.lang == "yue"
 
 
+def test_garbage_non_han_does_not_drag_language():
+    # ASR 对损坏音频可能吐出越南文/乱码 + zh 标签：不得当成"强普通话"把粤语拉走。
+    from agent_runtime.providers.livekit_plugins import LanguageState
+    s = LanguageState()
+    s.lang = "yue"
+    s.update("zh", "hổ cũng mong tổng địa thị xoa dịu, không cai sai.")
+    assert s.lang == "yue", "非汉字乱码不应把当前语言拉成普通话"
+    assert _normalize_asr_language("zh", "hổ cũng mong tổng địa thị") == "zh"
+
+
 # ---- MiniMaxTTS 配置解析(不发起真实请求) ----
 import os as _os
 

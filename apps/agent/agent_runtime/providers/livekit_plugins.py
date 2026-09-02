@@ -40,10 +40,17 @@ def _looks_cantonese(text: str) -> bool:
 
 
 def _looks_mandarin(text: str) -> bool:
-    """普通话书面/口语特征：功能字命中 2+ 个，或整句够长（≥8 字）无粤语特征。"""
+    """普通话书面/口语特征：中文字符里功能字命中 2+ 个，或整句够长（≥8 字）无粤语特征。
+
+    只统计汉字；纯拉丁/越南文等乱码不算普通话（避免 ASR 把非中英粤乱码
+    当"强普通话"证据,把整场粤语拉走)。
+    """
     t = text or ""
-    hits = sum(1 for ch in _MANDARIN_MARKERS if ch in t)
-    return len(t) >= 8 or hits >= 2
+    han = [ch for ch in t if "\u4e00" <= ch <= "\u9fff"]
+    if not han:
+        return False
+    hits = sum(1 for ch in han if ch in _MANDARIN_MARKERS)
+    return len(han) >= 8 or hits >= 2
 
 
 def _looks_english(text: str) -> bool:
