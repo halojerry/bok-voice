@@ -246,6 +246,25 @@ class TTSService:
             for voice_id, meta in self._registry.items()
         ]
 
+    def delete_voice(self, voice_id: str) -> bool:
+        """Delete a cloned voice: registry entry + clone prompt cache + ref audio.
+
+        Returns False when the voice is not a registered clone (presets are
+        built into the model and can't be deleted).
+        """
+        meta = self._registry.pop(voice_id, None)
+        if meta is None:
+            return False
+        self._clone_prompts.pop(voice_id, None)
+        self._save_registry()
+        ref = meta.get("ref_audio")
+        if ref:
+            try:
+                Path(ref).unlink(missing_ok=True)
+            except Exception:
+                pass
+        return True
+
     async def register_voice(
         self,
         *,
@@ -376,7 +395,7 @@ class TTSService:
             f"mps_driver={mem_after[1]:.0f}MB",
             flush=True,
         )
-        return pcm
+        return self._compress_pcm(pcm, sample_rate)
 
     def synthesize_chunks(
         self,
@@ -563,10 +582,26 @@ class TTSService:
                 wav = np.concatenate(wavs) if len(wavs) > 1 else wavs[0]
                 if wav.ndim > 1:
                     wav = wav.mean(axis=-1)
-                return self._to_pcm16(
-                    self._resample(wav, model.sample_rate, sample_rate)
+                return self._compress_pcm(
+                    self._to_pcm16(
+                        self._resample(wav, model.sample_rate, sample_rate)
+                    ),
+                    sample_rate,
                 )
             return b""
+
+    @staticmethod
+    def _compress_pcm(pcm: bytes, sample_rate: int) -> bytes:
+        """Clamp over-long silent runs in an already-rendered full PCM buffer."""
+        if not SILENCE_COMPRESS or not pcm:
+            return pcm
+        comp = _SilenceCompressor(sample_rate=sample_rate)
+        out = bytearray()
+        for fr in comp.push(pcm, len(pcm)):
+            out.extend(fr)
+        for fr in comp.flush(len(pcm)):
+            out.extend(fr)
+        return bytes(out)
 
     def _synthesize_mlx_stream(
         self,
@@ -596,6 +631,15 @@ class TTSService:
         )
         frame_bytes = int(sample_rate * chunk_ms / 1000) * 2
         first = True
+        # Qwen3-TTS generates unnaturally long inter-sentence pauses (0.5-1.4s
+        # of near-silence at 。！, observed on clone and preset alike). Clamp
+        # them at the byte level so multi-sentence replies don't sound choppy.
+        # Disable with QWEN3_TTS_SILENCE_COMPRESS=0 to keep raw pacing.
+        compressor = (
+            _SilenceCompressor(sample_rate=sample_rate)
+            if SILENCE_COMPRESS
+            else None
+        )
         with self._gen_lock:
             for model, gen in self._mlx_generate(
                 text=text,
@@ -618,9 +662,20 @@ class TTSService:
                     pcm = self._to_pcm16(
                         self._resample(chunk, model.sample_rate, sample_rate)
                     )
-                    for i in range(0, len(pcm), frame_bytes):
-                        yield first, pcm[i : i + frame_bytes]
+                    if compressor is None:
+                        for i in range(0, len(pcm), frame_bytes):
+                            yield first, pcm[i : i + frame_bytes]
+                            first = False
+                        continue
+                    # Feed raw model PCM through the compressor; it re-chunks
+                    # into the HTTP frame size after clamping long silences.
+                    for frame in compressor.push(pcm, frame_bytes):
+                        yield first, frame
                         first = False
+            if compressor is not None:
+                for frame in compressor.flush(frame_bytes):
+                    yield first, frame
+                    first = False
 
     @staticmethod
     def _resample(wav: np.ndarray, sr: int, target_sr: int) -> np.ndarray:
@@ -638,6 +693,83 @@ class TTSService:
     def _to_pcm16(wav: np.ndarray) -> bytes:
         wav = np.clip(wav, -1.0, 1.0)
         return (wav * 32767.0).astype(np.int16).tobytes()
+
+
+SILENCE_COMPRESS = os.environ.get("QWEN3_TTS_SILENCE_COMPRESS", "1") == "1"
+SILENCE_KEEP_SEC = float(os.environ.get("QWEN3_TTS_SILENCE_KEEP_SEC", "0.3"))
+SILENCE_FRAME_SEC = float(os.environ.get("QWEN3_TTS_SILENCE_FRAME_SEC", "0.02"))
+SILENCE_RMS = float(os.environ.get("QWEN3_TTS_SILENCE_RMS", "0.018"))
+
+
+class _SilenceCompressor:
+    """Clamp unnaturally long runs of near-silence in TTS audio.
+
+    Qwen3-TTS leaves 0.5-1.4s gaps between sentences (worse on multi-sentence
+    replies), which playback renders as choppy/stuttering audio. This streams
+    the generated PCM and caps any silent run at ``SILENCE_KEEP_SEC`` while
+    leaving speech and short natural pauses untouched.
+
+    Implementation: the raw model PCM is chopped into tiny ``SILENCE_FRAME_SEC``
+    (20ms) analysis frames. Frames below an RMS gate are buffered (not emitted).
+    When speech resumes, only the first ``SILENCE_KEEP_SEC`` of the buffered
+    silence is released; the rest (the over-long tail) is dropped. Output is
+    re-chunked into ``out_frame_bytes`` so downstream 200ms HTTP frame semantics
+    are preserved. A trailing silent run at end-of-stream is kept whole —
+    trimming it would clip the natural end-of-utterance decay.
+    """
+
+    def __init__(self, *, sample_rate: int):
+        self._frame_bytes = max(2, int(sample_rate * SILENCE_FRAME_SEC) * 2)
+        self._keep_bytes = max(self._frame_bytes, int(sample_rate * SILENCE_KEEP_SEC) * 2)
+        self._pending = bytearray()
+        self._carry = bytearray()
+
+    def push(self, pcm: bytes, out_frame_bytes: int) -> list[bytes]:
+        if pcm:
+            self._carry.extend(pcm)
+        frames = []
+        # Chop only complete frames; any remainder stays for the next call so
+        # callers may feed arbitrary chunk sizes without losing audio.
+        n = len(self._carry) - (len(self._carry) % self._frame_bytes)
+        for i in range(0, n, self._frame_bytes):
+            frames.append(bytes(self._carry[i : i + self._frame_bytes]))
+        del self._carry[:n]
+        out = bytearray()
+        for fr in frames:
+            if self._is_silence(fr):
+                self._pending.extend(fr)
+            else:
+                if self._pending:
+                    keep = self._pending[: self._keep_bytes]
+                    out.extend(keep)
+                    self._pending.clear()
+                out.extend(fr)
+        return self._chunk(out, out_frame_bytes)
+
+    def flush(self, out_frame_bytes: int) -> list[bytes]:
+        # Emit any final partial frame, then the pending (trailing) silence.
+        tail = bytearray(self._carry)
+        self._carry.clear()
+        tail.extend(self._pending)
+        self._pending.clear()
+        return self._chunk(tail, out_frame_bytes)
+
+    @staticmethod
+    def _chunk(buf: bytearray, out_frame_bytes: int) -> list[bytes]:
+        if not buf:
+            return []
+        return [
+            bytes(buf[i : i + out_frame_bytes])
+            for i in range(0, len(buf), out_frame_bytes)
+        ]
+
+    def _is_silence(self, frame: bytes) -> bool:
+        if len(frame) < 2:
+            return True
+        # RMS over 16-bit mono samples, compared to a small absolute gate.
+        a = np.frombuffer(frame, dtype="<i2").astype(np.float32)
+        rms = float(np.sqrt(np.mean(a * a)) / 32768.0)
+        return rms < SILENCE_RMS
 
 
 def _mps_mem() -> tuple[float, float]:
@@ -748,6 +880,13 @@ async def register_voice(
         ref_text=ref_text,
         language=language,
     )
+
+
+@app.delete("/v1/voices/{voice_id}")
+def delete_voice(voice_id: str) -> dict:
+    if not service.delete_voice(voice_id):
+        raise HTTPException(status_code=404, detail=f"clone voice not found: {voice_id}")
+    return {"voice_id": voice_id, "deleted": True}
 
 
 @app.post("/v1/audio/speech")

@@ -34,3 +34,4 @@ services/*/data/
 .zcode/
 apps/web/AGENTS.md
 apps/web/CLAUDE.md
+runtime
