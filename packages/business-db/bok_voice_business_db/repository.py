@@ -41,6 +41,7 @@ class SqlAlchemyBusinessRepository:
             account_id=manifest.account_id,
             object_id=manifest.object_id,
             persona_id=manifest.persona_id,
+            template_id=getattr(manifest, "template_id", "") or "",
             mode=manifest.mode.value if isinstance(manifest.mode, CallMode) else str(manifest.mode),
             direction=manifest.direction,
             language=manifest.language,
@@ -273,6 +274,10 @@ class SqlAlchemyBusinessRepository:
         if not tpl:
             return False
         self.session.delete(tpl)
+        # 同步清空引用该模板的对象卡，避免悬空引用（agent 侧 get_template 404 会静默降级）。
+        objs = self.session.scalars(select(models.ObjectProfile).filter_by(template_id=template_id)).all()
+        for obj in objs:
+            obj.template_id = ""
         self.session.commit()
         return True
 
@@ -440,6 +445,7 @@ class InMemoryBusinessRepository:
             "account_id": manifest.account_id,
             "object_id": manifest.object_id,
             "persona_id": manifest.persona_id,
+            "template_id": getattr(manifest, "template_id", "") or "",
             "mode": manifest.mode.value if isinstance(manifest.mode, CallMode) else str(manifest.mode),
             "status": CallStatus.RINGING.value,
         }
@@ -563,7 +569,13 @@ class InMemoryBusinessRepository:
         return self.templates[template_id]
 
     def delete_template(self, template_id: str) -> bool:
-        return self.templates.pop(template_id, None) is not None
+        if self.templates.pop(template_id, None) is None:
+            return False
+        # 同步清空引用该模板的对象卡，避免悬空引用。
+        for obj in self.objects.values():
+            if obj.get("template_id") == template_id:
+                obj["template_id"] = ""
+        return True
 
     def list_object_topics(self, object_id: str) -> list[dict]:
         return [t for t in self.object_topics.get(object_id, [])]

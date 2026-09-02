@@ -366,6 +366,15 @@ def token(req: TokenRequest) -> TokenResponse:
 
 @app.post("/api/calls")
 def create_call(req: CreateCallRequest) -> dict:
+    # 会话清单：读取全局策略(offline_first/cloud_first)与已配置 provider，
+    # 并把对象绑定的模板快照到 call（审计「这场用了哪版话术」）。
+    settings = _repo().get_settings()
+    policy = (settings or {}).get("policy") or "offline_first"
+    providers = _effective_providers(settings or {})
+    template_id = ""
+    if req.object_id:
+        obj = _repo().get_object(req.object_id)
+        template_id = (obj or {}).get("template_id", "") or ""
     manifest = select_session_manifest(
         session_id=f"call-{uuid.uuid4().hex[:8]}",
         account_id=req.account_id,
@@ -374,9 +383,22 @@ def create_call(req: CreateCallRequest) -> dict:
         mode=req.mode,
         direction=req.direction,
         language=req.language,
+        providers=providers,
+        policy=policy,
+        template_id=template_id,
         tts_reference_voice=req.tts_reference_voice,
     )
     return _repo().create_call(manifest)
+
+
+def _effective_providers(settings: dict) -> dict:
+    """根据全局设置推导会话锁定的 provider 清单（vad/asr/llm/tts）。"""
+    return {
+        "vad": (settings.get("vad") or {}).get("provider") or "silero",
+        "asr": (settings.get("asr") or {}).get("provider") or "qwen3_asr",
+        "llm": (settings.get("llm") or {}).get("provider") or "local_openai",
+        "tts": (settings.get("tts") or {}).get("provider") or "qwen3_tts",
+    }
 
 
 @app.get("/api/calls")
@@ -393,11 +415,34 @@ def get_call(call_id: str) -> dict:
 
 
 @app.post("/api/calls/{call_id}/hangup")
-def hangup(call_id: str) -> dict:
+async def hangup(call_id: str) -> dict:
     call = _repo().update_call(call_id, status=CallStatus.ENDED.value)
     if not call:
         raise HTTPException(404, "call not found")
-    return {"call_id": call_id, "status": call["status"]}
+    # 真正断开 LiveKit 房间：主管台/任意端挂断后 agent 与监听端都会被服务端踢出，
+    # agent 侧 on_close 触发结算。房间不存在/服务不可用时不阻塞（DB 已置 ENDED）。
+    await _disconnect_livekit_room(call_id)
+    return {"call_id": call_id, "status": call["status"], "disconnected": True}
+
+
+async def _disconnect_livekit_room(room_name: str) -> None:
+    """调用 LiveKit RoomService 删除房间（房间名 = call_id），容错。"""
+    key = getattr(app.state, "lk_key", "") or os.environ.get("LIVEKIT_API_KEY", "")
+    secret = getattr(app.state, "lk_secret", "") or os.environ.get("LIVEKIT_API_SECRET", "")
+    url = getattr(app.state, "lk_url", "") or os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880")
+    if not key or not secret or not room_name:
+        return
+    http_url = url.replace("ws://", "http://").replace("wss://", "https://").rstrip("/")
+    try:
+        import aiohttp
+
+        from livekit.api.room_service import DeleteRoomRequest, RoomService
+
+        async with aiohttp.ClientSession() as session:
+            svc = RoomService(session, http_url, key, secret)
+            await svc.delete_room(DeleteRoomRequest(room=room_name))
+    except Exception as exc:  # pragma: no cover - 房间不存在/livekit 未起都不阻塞挂断
+        print(f"[cp] livekit room delete skipped ({room_name}): {exc!r}", flush=True)
 
 
 @app.post("/api/calls/{call_id}/turns")
@@ -653,7 +698,9 @@ def delete_template(template_id: str) -> dict:
 
 @app.get("/api/supervisor/active-calls")
 def active_calls() -> list[dict]:
-    return [c for c in _repo().list_calls("", "active")] if hasattr(_repo(), "list_calls") else []
+    """主管台可见通话：进行中(active) + 已暂停(paused / 人工接管)。"""
+    calls = _repo().list_calls("", "") if hasattr(_repo(), "list_calls") else []
+    return [c for c in calls if c.get("status") in (CallStatus.ACTIVE.value, CallStatus.PAUSED.value)]
 
 
 @app.get("/api/reports/summary")
@@ -760,6 +807,15 @@ def pause_agent(call_id: str) -> dict:
     return {"call_id": call_id, "action": "pause-agent", "status": call["status"]}
 
 
+@app.post("/api/supervisor/{call_id}/resume-agent")
+def resume_agent(call_id: str) -> dict:
+    """恢复 AI 自动应答：解除人工接管并把通话置回 active（agent 轮询到后恢复）。"""
+    call = _repo().update_call(call_id, escalated_to_human=False, status=CallStatus.ACTIVE.value)
+    if not call:
+        raise HTTPException(404, "call not found")
+    return {"call_id": call_id, "action": "resume-agent", "status": call["status"]}
+
+
 @app.post("/api/supervisor/{call_id}/takeover")
 def takeover(call_id: str) -> dict:
     call = _repo().update_call(call_id, escalated_to_human=True, status=CallStatus.PAUSED.value)
@@ -769,8 +825,9 @@ def takeover(call_id: str) -> dict:
 
 
 @app.post("/api/supervisor/{call_id}/transfer")
-def transfer(call_id: str) -> dict:
+async def transfer(call_id: str) -> dict:
     call = _repo().update_call(call_id, escalated_to_human=True, disposition="transferred", status=CallStatus.ENDED.value)
     if not call:
         raise HTTPException(404, "call not found")
-    return {"call_id": call_id, "action": "transfer", "status": call["status"]}
+    await _disconnect_livekit_room(call_id)
+    return {"call_id": call_id, "action": "transfer", "status": call["status"], "disconnected": True}

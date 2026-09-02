@@ -10,6 +10,42 @@ from fastapi.testclient import TestClient
 from control_plane.main import app
 
 
+def test_idempotent_migration_adds_missing_columns(tmp_path, monkeypatch):
+    """对旧版建出的 SQLite（缺新列）启动时须自动补列，且幂等可重复。
+
+    SQLite 不支持 `ADD COLUMN IF NOT EXISTS`（曾导致迁移静默失败、建通话 500）。
+    """
+    import sqlite3
+
+    from sqlalchemy import text
+
+    db = tmp_path / "old.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        "CREATE TABLE call_sessions (id VARCHAR(64) PRIMARY KEY, account_id VARCHAR(64), object_id VARCHAR(64), persona_id VARCHAR(64), mode VARCHAR(32), status VARCHAR(32));"
+        "CREATE TABLE object_profiles (id VARCHAR(64) PRIMARY KEY, account_id VARCHAR(64), display_name VARCHAR(255));"
+        "CREATE TABLE settlements (id VARCHAR(64) PRIMARY KEY, call_id VARCHAR(64));"
+    )
+    conn.close()
+
+    from control_plane.deps import build_engine
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db}")
+    # 首启：补列
+    build_engine()
+    # 二启：幂等不报错
+    build_engine()
+
+    import sqlite3 as s3
+
+    c = s3.connect(db)
+    cols = {t: [r[1] for r in c.execute(f"PRAGMA table_info({t})")] for t in ("call_sessions", "object_profiles", "settlements")}
+    c.close()
+    assert "template_id" in cols["call_sessions"]
+    assert "template_id" in cols["object_profiles"]
+    assert "summary" in cols["settlements"]
+
+
 def test_control_plane_flow():
     with TestClient(app) as client:
         assert client.get("/health").json() == {"ok": True, "service": "bok-voice-control-plane"}
@@ -109,6 +145,28 @@ def test_settings_object_persona_knowledge_and_reports():
         assert imported["indexed"] >= 1
         docs = client.get("/api/knowledge", params={"account_id": "acc-001"}).json()
         assert any(d["path"].endswith("p.md") for d in docs)
+
+
+def test_supervisor_pause_resume_roundtrip():
+    """主管台暂停/恢复要真实改通话状态（agent 轮询到后生效）。"""
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/calls",
+            json={"account_id": "acc-001", "object_id": "obj-1", "persona_id": "p-1", "mode": "live"},
+        ).json()
+        call_id = created["id"]
+        assert created["status"] == "ringing"
+
+        paused = client.post(f"/api/supervisor/{call_id}/pause-agent").json()
+        assert paused["status"] == "paused"
+
+        takeover = client.post(f"/api/supervisor/{call_id}/takeover").json()
+        assert takeover["status"] == "paused"
+        assert client.get(f"/api/calls/{call_id}").json()["escalated_to_human"] is True
+
+        resumed = client.post(f"/api/supervisor/{call_id}/resume-agent").json()
+        assert resumed["status"] == "active"
+        assert client.get(f"/api/calls/{call_id}").json()["escalated_to_human"] is False
 
 
 def test_conversation_template_crud_and_object_binding():

@@ -75,6 +75,7 @@ class CallSession(Base):
     account_id: Mapped[str] = mapped_column(String(64), index=True)
     object_id: Mapped[str] = mapped_column(String(64), index=True)
     persona_id: Mapped[str] = mapped_column(String(64), default="")
+    template_id: Mapped[str] = mapped_column(String(64), default="")
     mode: Mapped[str] = mapped_column(String(32), default="simulation")
     direction: Mapped[str] = mapped_column(String(32), default="webrtc")
     language: Mapped[str] = mapped_column(String(16), default="zh")

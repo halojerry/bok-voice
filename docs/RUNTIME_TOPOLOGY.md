@@ -29,6 +29,15 @@
 同时：通话/转写/结算/审计 → control-plane :8000 → SQLite（对象、人设、知识、模板、设置、审计）
 ```
 
+### Supervisor（主管台）
+
+- 暂停/接管：control-plane 把通话置 `paused` 或 `escalated_to_human`；agent 的
+  `_supervisor_watch` 每 2s 轮询通话状态 → 暂停自动回复（`on_user_turn_completed`
+  抛 `StopResponse`）并 `interrupt(force)` 打断当前发言，人工接管会话。
+- 恢复：`POST /api/supervisor/{id}/resume-agent` 把状态置回 `active` 并清
+  `escalated_to_human`；agent 恢复自动回复。
+- 转人工：置 `ended` + `disposition=transferred`，agent 退出并触发结算。
+
 ### B 线（同声传译）
 
 ```text
@@ -94,6 +103,12 @@
 - `vad`：`provider` + `max_buffered_speech` / `min_speech_duration` / `min_silence_duration` / `interruption`
   —— 直接构造 `inference.VAD` 与打断开关（环境变量 `VAD_*` 仅作部署覆盖）。
 - `policy`：`offline_first`/`cloud_first`；建通话（`POST /api/calls`）时写入 manifest。
+
+### 数据快照与清理
+
+- `call_sessions.template_id`：建通话时把对象绑定的模板 id 快照到通话记录（审计"这场用了哪版话术"）。
+- 删除话术模板会同步清空引用该模板的对象卡（`object_profiles.template_id`）。
+- 删除知识文档会同时移除 vault 源文件，重启重建索引后不再"复活"。
 
 ## 6. 故障排查
 

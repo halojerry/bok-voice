@@ -58,6 +58,7 @@ class SessionManifest:
     providers: dict[str, str]
     policy: str = "offline_first"
     tts_reference_voice: str = ""
+    template_id: str = ""
 
 
 @dataclass

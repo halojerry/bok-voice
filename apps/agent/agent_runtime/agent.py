@@ -464,19 +464,102 @@ async def entrypoint(ctx):
                 context_state.set_user_language(language_state.lang)
             asyncio.create_task(_async_update_context(role, text))
 
+    # 会话关闭事件：置位后 supervisor watcher 退出、结算触发。
+    closed = asyncio.Event()
+
     def _on_close(ev):
+        closed.set()
         asyncio.create_task(cp.settle(call_id))
 
     session.on("conversation_item_added", _on_conversation_item)
     session.on("conversation_item_added", _on_item_for_context)
     session.on("close", _on_close)
 
-    agent = Agent(instructions=instructions or "你是 Bok Voice 客服助手。")
+    class PausableAgent(Agent):
+        """可被主管台暂停/接管/恢复的 Agent：暂停期间抑制自动回复，但保留转写与历史。
+
+        用 on_user_turn_completed 抛 StopResponse 跳过本轮回复（livekit 会忽略该轮），
+        同时在 chat_ctx 里保留用户消息，恢复后上下文不丢。
+        """
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.paused = False
+
+        async def on_user_turn_completed(self, turn_ctx, new_message):
+            # 同步注入用户语言：on_user_turn_completed 在自动回复生成【之前】被调用，
+            # 此时 ASR 已把 language_state 更新为本轮语言。若只挂在 conversation_item_added
+            # 事件上，会晚于 LLM 请求发出（竞态）→ 模型收不到本轮粤语指令而回普通话。
+            try:
+                context_state.set_user_language(language_state.lang)
+            except Exception:  # pragma: no cover - 语言注入失败不致命
+                pass
+            if self.paused:
+                chat_ctx = getattr(self, "chat_ctx", None)
+                if chat_ctx is not None and new_message is not None:
+                    try:
+                        chat_ctx.items.append(new_message)
+                    except Exception:  # pragma: no cover - 历史保留失败不致命
+                        pass
+                raise StopResponse()
+
+        async def on_user_turn_exceeded(self, ev):
+            if self.paused:
+                raise StopResponse()
+            await super().on_user_turn_exceeded(ev)
+
+    agent = PausableAgent(instructions=instructions or "你是 Bok Voice 客服助手。")
+
+    async def _supervisor_watch():
+        """轮询通话状态，让主管台的暂停/接管/转人工对 agent 真实生效。
+
+        - escalated 或 status=paused：暂停自动回复并打断当前发言（人工接管会话）；
+        - status 回到 active 且未 escalated：恢复自动回复；
+        - 房间关闭（closed）或通话已结束：退出轮询（结算由 _on_close 幂等触发）。
+        """
+        while not closed.is_set():
+            call = None
+            try:
+                call = await cp.get_call(call_id)
+            except Exception:
+                call = None
+            if call:
+                status = str(call.get("status") or "")
+                escalated = bool(call.get("escalated_to_human"))
+                paused = escalated or status == "paused"
+                if paused and not agent.paused:
+                    agent.paused = True
+                    print(f"[agent] supervisor paused agent ({room_name})", flush=True)
+                    try:
+                        session.interrupt(force=True)
+                    except Exception:  # pragma: no cover - 无正在播放内容时中断抛错
+                        pass
+                elif not paused and agent.paused:
+                    agent.paused = False
+                    print(f"[agent] supervisor resumed agent ({room_name})", flush=True)
+            try:
+                await asyncio.wait_for(closed.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+
+    watch_task = asyncio.create_task(_supervisor_watch())
     # AgentSession 内部已注册 job shutdown callback（自动 aclose），
     # 这里不能提前 close，否则会话在接通后立刻被销毁。
     await session.start(agent=agent, room=ctx.room)
 
-    await session.generate_reply(instructions="请问有什么可以帮您？")
+    if not agent.paused:
+        # 开场白用开场语言（对象/人设语言决定）；generate_reply 的 instructions 会
+        # 在基础指令上叠加，配合 system 里的母语设定让首句即用对的语言。
+        greetings = {"zh": "请问有什么可以帮您？", "yue": "請問有咩可以幫到你？", "en": "How can I help you?"}
+        await session.generate_reply(instructions=greetings.get(greet_lang, greetings["zh"]))
+
+    # session.start 只负责拉起流水线（返回后会话在后台运行）。保持 entrypoint
+    # 存活直到房间关闭，supervisor watcher 在此期间持续轮询；_on_close 置位
+    # closed 后退出并清理 watcher（结算由 _on_close 幂等触发）。
+    try:
+        await closed.wait()
+    finally:
+        watch_task.cancel()
 
 
 def run_agent() -> None:

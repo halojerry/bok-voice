@@ -23,15 +23,50 @@ def build_engine() -> Engine | None:
         from bok_voice_business_db import models
 
         models.create_all(engine)
-        # create_all 不会给已存在的表加列 —— 幂等补上对象卡的模板绑定列。
+        # create_all 不会给已存在的表加列 —— 幂等补上新增列。注意 SQLite 不支持
+        # `ADD COLUMN IF NOT EXISTS`（MySQL 语法，会抛错被吞），必须先查列是否存在。
         try:
             from sqlalchemy import text
 
+            def _ensure_column(conn, table: str, column: str, ddl: str) -> None:
+                dialect = engine.dialect.name
+                if dialect == "sqlite":
+                    exists = any(
+                        row[1] == column
+                        for row in conn.execute(text(f"PRAGMA table_info({table})"))
+                    )
+                else:
+                    exists = conn.execute(
+                        text(
+                            "SELECT 1 FROM information_schema.columns "
+                            "WHERE table_name = :t AND column_name = :c"
+                        ),
+                        {"t": table, "c": column},
+                    ).first() is not None
+                if not exists:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
+
             with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE object_profiles ADD COLUMN IF NOT EXISTS template_id VARCHAR(64) DEFAULT ''"))
-                conn.execute(text("ALTER TABLE settlements ADD COLUMN IF NOT EXISTS summary TEXT"))
+                _ensure_column(
+                    conn,
+                    "object_profiles",
+                    "template_id",
+                    "template_id VARCHAR(64) DEFAULT ''",
+                )
+                _ensure_column(
+                    conn,
+                    "call_sessions",
+                    "template_id",
+                    "template_id VARCHAR(64) DEFAULT ''",
+                )
+                _ensure_column(
+                    conn,
+                    "settlements",
+                    "summary",
+                    "summary TEXT",
+                )
         except Exception as exc:  # pragma: no cover - sqlite / duplicate column
-            print(f"[deps] object_profiles.template_id migration skipped: {exc}")
+            print(f"[deps] idempotent column migration skipped: {exc}")
         # pgvector: create the extension + knowledge_chunks table (best-effort SQLite-safe).
         try:
             from sqlalchemy import text

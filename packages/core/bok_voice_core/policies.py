@@ -76,6 +76,7 @@ def select_session_manifest(
     providers: dict[str, str] | None = None,
     policy: str = "offline_first",
     tts_reference_voice: str = "",
+    template_id: str = "",
 ) -> SessionManifest:
     return SessionManifest(
         session_id=session_id,
@@ -88,4 +89,5 @@ def select_session_manifest(
         providers=providers or {"vad": "livekit", "asr": "sherpa", "llm": "mlx", "tts": "gpt_sovits"},
         policy=policy,
         tts_reference_voice=tts_reference_voice,
+        template_id=template_id,
     )
