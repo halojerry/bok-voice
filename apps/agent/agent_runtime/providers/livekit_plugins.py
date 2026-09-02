@@ -1039,24 +1039,39 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
 
             recv_task = asyncio.create_task(_recv_loop())
 
-            # 把 _input_ch 的文本增量连续 task_continue 给 MiniMax。
-            # 语义（实测）：task_continue 的 text 是「到目前为止的累积全文」，不是
-            # 纯增量——发纯增量会丢 ~40% 音频。故每块都发累计文本。
-            acc_text = ""
+            # 按句增量合成:把 _input_ch 文本按句子边界(。！？!?)切句,每句 task_continue
+            # 发「该句增量」(非累积全文)。实测语义:
+            # - 发累积全文会重复合成前面句子(长回复下明显重读);
+            # - 纯逐块增量(不按句)在快速 send 下丢音频(服务端要等足文本才合成)。
+            # 按句切分 + 连续发送 = 首句到就出声(低延迟)且不重复(每句只发一次)。
+            # 音频按序回流,recv_loop 持续推给 emitter,无需句间等待。
+            _SENT_END = "。！？!?"
+            sent_buf = ""
             async for item in self._input_ch:
                 if isinstance(item, self._FlushSentinel):
                     continue
                 text = str(item or "")
                 if not text.strip():
                     continue
-                acc_text += text
-                await ws.send(json.dumps({"event": "task_continue", "text": acc_text}))
+                sent_buf += text
+                while True:
+                    idx = min(
+                        (sent_buf.find(ch) for ch in _SENT_END if sent_buf.find(ch) != -1),
+                        default=-1,
+                    )
+                    if idx == -1:
+                        break
+                    sentence = sent_buf[: idx + 1]
+                    sent_buf = sent_buf[idx + 1 :]
+                    if sentence.strip():
+                        await ws.send(json.dumps({"event": "task_continue", "text": sentence.strip()}))
+            if sent_buf.strip():
+                await ws.send(json.dumps({"event": "task_continue", "text": sent_buf.strip()}))
             # 文本结束:发 task_finish 让服务端吐完剩余音频并回 is_final
-            if acc_text:
-                try:
-                    await ws.send(json.dumps({"event": "task_finish"}))
-                except Exception:
-                    pass
+            try:
+                await ws.send(json.dumps({"event": "task_finish"}))
+            except Exception:
+                pass
             # 收尾:等 recv_loop 把剩余音频推完(最多 15s)
             if recv_task:
                 try:

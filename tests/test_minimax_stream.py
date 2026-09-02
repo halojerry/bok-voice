@@ -66,11 +66,10 @@ def test_minimax_stream_is_not_chunked_stream():
     assert not isinstance(stream, lk_tts.ChunkedStream)
 
 
-def test_minimax_accumulates_text_for_task_continue(monkeypatch):
-    """增量语义:每次 task_continue 发「累积全文」而非纯增量。
+def test_minimax_splits_sentences_for_task_continue(monkeypatch):
+    """增量语义:按句切分,每个 task_continue 发单句增量(非累积全文)。
 
-    MiniMax WS 的 task_continue.text 是到目前为止的全部文本(实测纯增量丢音频);
-    本测试用假 WS 捕获发送的 task_continue,断言 text 单调累积。
+    MiniMax WS 实测:发累积全文会重复合成前面句子;按句发增量不重复且首句即出声。
     """
     import json
 
@@ -92,7 +91,8 @@ def test_minimax_accumulates_text_for_task_continue(monkeypatch):
                 return json.dumps({"event": "connected_success"})
             if recv_count["n"] == 2:
                 return json.dumps({"event": "task_started"})
-            await asyncio.sleep(3600)  # 之后不发音频,让测试专注发送侧
+            # 之后立刻断开:结束 recv_loop,让 _run 快速收尾
+            raise Exception("fake ws closed")
 
         async def send(self, payload):
             sent.append(json.loads(payload))
@@ -116,13 +116,13 @@ def test_minimax_accumulates_text_for_task_continue(monkeypatch):
         from agent_runtime.providers.livekit_plugins import _MiniMaxSynthesizeStream
 
         s = _MiniMaxSynthesizeStream(tts, APIConnectOptions())
-        s.push_text("你好，")
-        s.push_text("我係林先生，")
+        # 跨多块输入,含两句话
+        s.push_text("你好，我係林先生。")
         s.push_text("想問下包裹幾時到？")
         s.end_input()
-        # 等 _run 消费 input_ch 并发完 3 次 task_continue
+        # 等 _run 消费 input_ch 并发出 task_continue
         for _ in range(100):
-            if len([m for m in sent if m.get("event") == "task_continue"]) >= 3:
+            if len([m for m in sent if m.get("event") == "task_continue"]) >= 2:
                 break
             await asyncio.sleep(0.05)
         s._task.cancel()  # 测试结束,取消后台任务(FakeWS.recv 挂起不拖慢)
@@ -132,13 +132,13 @@ def test_minimax_accumulates_text_for_task_continue(monkeypatch):
     continues = [m for m in sent if m.get("event") == "task_continue"]
     assert continues, "应发出 task_continue"
     texts = [m["text"] for m in continues]
-    # 累积:后一段文本包含前一段
-    for i in range(1, len(texts)):
-        assert texts[i].startswith(texts[i - 1]), f"task_continue 应累积: {texts}"
-    # 最终文本是完整拼接
-    assert texts[-1] == "你好，我係林先生，想問下包裹幾時到？"
-    # 首段不应为空/纯增量丢字
-    assert texts[0] == "你好，"
+    # 按句切分:每句单独发送,不累积
+    assert texts[0] == "你好，我係林先生。", f"首句应为完整单句: {texts}"
+    assert texts[-1] == "想問下包裹幾時到？", f"次句应为完整单句: {texts}"
+    # 不重复:没有任何 task_continue 的 text 包含前面已发过的句子
+    for i, t in enumerate(texts):
+        for prev in texts[:i]:
+            assert prev not in t, f"task_continue 不应重发前面句子: {texts}"
 
 
 def test_minimax_stream_missing_key_no_crash():
