@@ -44,3 +44,23 @@ export async function desktopManifest(): Promise<string> {
   if (!invoke) throw new Error("not running in Tauri");
   return (await invoke("manifest")) as string;
 }
+
+export interface AudioDevice {
+  id: string;
+  name: string;
+  is_default: boolean;
+}
+
+export type AudioDeviceKind = "input" | "output";
+
+/** macOS：枚举系统音频输入/输出设备（Windows/浏览器环境返回空，前端走 web 枚举）。 */
+export async function listAudioDevices(kind: AudioDeviceKind): Promise<AudioDevice[]> {
+  if (!invoke) throw new Error("not running in Tauri");
+  return (await invoke("list_audio_devices", { kind })) as AudioDevice[];
+}
+
+/** macOS：把系统默认输出切到指定设备（A 线 <audio> 与 B 线 WebAudio 都走系统输出）。 */
+export async function setSystemOutput(deviceId: string): Promise<string> {
+  if (!invoke) throw new Error("not running in Tauri");
+  return (await invoke("set_system_output", { deviceId })) as string;
+}

@@ -6,6 +6,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{AppHandle, Manager, State};
 
+mod audio;
+
 /// Shared, process-wide runtime state for the desktop shell.
 struct AppState {
     bok: Mutex<Option<Child>>,
@@ -333,7 +335,9 @@ pub fn run() {
             open_logs,
             manifest,
             setup_status,
-            setup_download
+            setup_download,
+            audio::list_audio_devices,
+            audio::set_system_output
         ])
         .setup(|app| {
             let root = resolve_root(app.handle());

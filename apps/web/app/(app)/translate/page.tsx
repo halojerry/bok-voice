@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { applyOutputDevice, savedMicDevice, savedOutputDevice } from "@/lib/audio";
 
 const WS_URL = process.env.NEXT_PUBLIC_TRANSLATION_WS_URL || "ws://127.0.0.1:8790";
 const LANGS = [
@@ -139,7 +140,14 @@ export default function TranslatePage() {
   }
 
   async function startCapture(channelId: string) {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 } });
+    // 输出跟随用户在设置里选的设备（桌面壳切系统默认输出 / Chromium setSinkId）。
+    const outId = savedOutputDevice();
+    if (outId) applyOutputDevice(outId).catch(() => {});
+    const micId = savedMicDevice();
+    const audioConstraints: MediaTrackConstraints = { channelCount: 1 };
+    // 非 exact：保存的麦克风失效/已插拔时回退系统默认，避免 getUserMedia reject。
+    if (micId) audioConstraints.deviceId = micId;
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
     const ctx = (audioCtxRef.current ||= new AudioContext({ sampleRate: 16000 }));
     const source = ctx.createMediaStreamSource(stream);
     const node = ctx.createScriptProcessor(4096, 1, 1);

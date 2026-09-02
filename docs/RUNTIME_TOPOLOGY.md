@@ -17,6 +17,18 @@
 | LiveKit server | :7880 WS/WebRTC | RTC 信令与媒体（7881/7882 RTC 端口） | 内嵌二进制 | keys → 内嵌 livekit.yaml |
 | agent worker | 进程 | A 线智能体（VAD/对话/情绪/打断） | 打包 Python | 调 8787/8788/1235/8000 |
 
+### 音频设备（设置页）
+
+- 桌面壳（macOS）通过 Tauri `list_audio_devices` / `set_system_output`（CoreAudio）
+  枚举并切换**系统默认输出设备** —— A 线远端 `<audio>` 与 B 线 WebAudio 都跟随。
+- 麦克风：macOS 打包需 `NSMicrophoneUsageDescription`（Tauri 合并
+  `desktop/src-tauri/Info.plist`）与 `com.apple.security.device.audio-input`
+  entitlements，否则 TCC 静默拒绝 → 设备列表为空。
+- 选择持久化在 localStorage（`bok.audio.mic` / `bok.audio.out`），接通/开始采集时应用。
+- **CoreAudio 注意**：CFString 属性（设备 UID/名称）由 CoreAudio 以「对象指针写入
+  outData」返回，须用 `CFStringRef*` 接收并 `CFRelease`；按字节缓冲解引用会
+  SIGSEGV（设置页打开即崩）。`cargo test` 有真机枚举回归用例。
+
 ## 2. 数据流
 
 ### A 线（客服语音助手）

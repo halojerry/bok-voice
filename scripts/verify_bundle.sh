@@ -59,6 +59,12 @@ if [ "$mode" = "--app" ]; then
   SIZE_MB=$(du -sm "$APP" | awk '{print $1}')
   note "app size: ${SIZE_MB}MB"
   if [ "$SIZE_MB" -gt 1330 ]; then note "FAIL size gate (>1330MB)"; FAIL=1; else note "ok   size gate <=1330MB"; fi
+  # Info.plist 必须声明麦克风用途，否则 macOS TCC 静默拒绝 getUserMedia。
+  if /usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' "$APP/Contents/Info.plist" >/dev/null 2>&1; then
+    note "ok   NSMicrophoneUsageDescription present"
+  else
+    note "FAIL NSMicrophoneUsageDescription missing (mic blocked by TCC)"; FAIL=1
+  fi
 fi
 
 if [ "$mode" = "--doctor" ]; then

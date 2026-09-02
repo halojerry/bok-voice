@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
+import { startRecording, type RecorderHandle } from "@/lib/recorder";
 
 const EMPTY = { name: "", company: "", tone: "", language: "zh", reference_audio: "" };
 const LANGS = [
@@ -36,6 +37,12 @@ export default function PersonasPage() {
   const [voiceMap, setVoiceMap] = useState<Record<string, string>>({});
   const [previewUrl, setPreviewUrl] = useState("");
   const [speakers, setSpeakers] = useState<string[]>([]);
+  // 录音克隆：直接对麦克风说话生成参考音频，无需本地上传文件。
+  const [recording, setRecording] = useState(false);
+  const [recSec, setRecSec] = useState(0);
+  const [recBlobUrl, setRecBlobUrl] = useState("");
+  const recRef = useRef<RecorderHandle | null>(null);
+  const recTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   async function refresh() {
     setLoading(true);
@@ -56,7 +63,11 @@ export default function PersonasPage() {
   }, []);
 
   async function save() {
-    if (!form.name.trim()) return;
+    if (!form.name.trim()) {
+      // 必须给出明确反馈：此前静默 return 会让用户以为"新建没反应"。
+      setErr("请先填写称呼（名称）再保存。");
+      return;
+    }
     setErr(null);
     setOk(false);
     try {
@@ -68,6 +79,7 @@ export default function PersonasPage() {
       setVoiceMap({});
       setRefText("");
       setRefFile(null);
+      clearRecording();
       setOk(true);
       await refresh();
     } catch (e) {
@@ -86,6 +98,7 @@ export default function PersonasPage() {
   }
 
   function edit(row: Record<string, unknown>) {
+    clearRecording();
     setEditingId(String(row.id ?? ""));
     setForm({
       name: String(row.name ?? ""),
@@ -99,9 +112,61 @@ export default function PersonasPage() {
     setRefFile(null);
   }
 
+  async function toggleRecording() {
+    setErr(null);
+    if (recording) {
+      // 停止：把录音转成 WAV 作为克隆参考音频（自动填入参考文字提示）。
+      const handle = recRef.current;
+      recRef.current = null;
+      if (recTimerRef.current) { clearInterval(recTimerRef.current); recTimerRef.current = null; }
+      setRecording(false);
+      setRecSec(0);
+      if (!handle) return;
+      try {
+        const wav = await handle.stop();
+        if (wav.size < 4096) {
+          setErr("录音太短，请至少说 1-2 秒后再试。");
+          return;
+        }
+        const file = new File([wav], `ref-${activeLang}-${Date.now()}.wav`, { type: "audio/wav" });
+        setRefFile(file);
+        if (recBlobUrl) URL.revokeObjectURL(recBlobUrl);
+        setRecBlobUrl(URL.createObjectURL(wav));
+        setOk(false);
+      } catch (e) {
+        setErr(`录音失败：${String(e)}`);
+      }
+      return;
+    }
+    // 开始录音
+    try {
+      const handle = await startRecording(30000);
+      recRef.current = handle;
+      setRecording(true);
+      setRecSec(0);
+      recTimerRef.current = setInterval(() => setRecSec((s) => s + 1), 1000);
+    } catch (e) {
+      setErr(`无法开始录音：${String(e)}。请在系统设置允许麦克风权限。`);
+    }
+  }
+
+  function clearRecording() {
+    if (recRef.current) { recRef.current.cancel(); recRef.current = null; }
+    if (recTimerRef.current) { clearInterval(recTimerRef.current); recTimerRef.current = null; }
+    setRecording(false);
+    setRecSec(0);
+    setRefFile(null);
+    if (recBlobUrl) URL.revokeObjectURL(recBlobUrl);
+    setRecBlobUrl("");
+  }
+
   async function registerVoice() {
     if (!refFile) {
-      setErr("请选择参考音频");
+      setErr("请先上传参考音频，或点「录音」说一段话作为克隆素材。");
+      return;
+    }
+    if (!refText.trim()) {
+      setErr("请填写参考音频对应的文字（方便克隆对齐）。");
       return;
     }
     setErr(null);
@@ -115,6 +180,7 @@ export default function PersonasPage() {
       const result = await api.registerTtsVoice(body);
       const voiceId = String(result.voice_id ?? "");
       setVoiceMap((prev) => ({ ...prev, [activeLang]: voiceId }));
+      clearRecording();
       setOk(true);
     } catch (e) {
       setErr(String(e));
@@ -226,16 +292,43 @@ export default function PersonasPage() {
               className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
               value={refText}
               onChange={(e) => setRefText(e.target.value)}
-              placeholder="参考音频对应的文字，例如：你好，我是 Bok 客服助手"
+              placeholder="参考音频对应的文字（录音/上传都要填），例如：你好，我係小博，有咩可以幫到你？"
             />
+            {/* 录音克隆：直接对麦克风说一段话作为该语言的参考音色 */}
+            <div className="rounded-lg border border-[var(--card-border)] p-2">
+              <div className="flex items-center gap-2">
+                <button
+                  className={`btn-ghost flex-1 text-xs ${recording ? "!text-red-300" : ""}`}
+                  onClick={toggleRecording}
+                >
+                  {recording ? `● 停止录音（${recSec}s）` : "🎙 录音（用麦克风录一段）"}
+                </button>
+                {(refFile || recBlobUrl) && (
+                  <button className="btn-ghost text-xs" onClick={clearRecording}>清除</button>
+                )}
+              </div>
+              {recording && (
+                <p className="mt-1 text-xs text-red-300">正在录音…请对着麦克风说参考语料（建议 5-10 秒，可含目标语言特征）。</p>
+              )}
+              {recBlobUrl && (
+                <div className="mt-2">
+                  <p className="text-xs text-[var(--muted)]">录音预览（将作为克隆参考音频）：</p>
+                  <audio controls src={recBlobUrl} className="mt-1 w-full" />
+                </div>
+              )}
+            </div>
             <input
               type="file"
-              accept="audio/*"
-              onChange={(e) => setRefFile(e.target.files?.[0] ?? null)}
+              accept="audio/*,.wav,.mp3,.m4a"
+              onChange={(e) => {
+                setRefFile(e.target.files?.[0] ?? null);
+                if (recBlobUrl) URL.revokeObjectURL(recBlobUrl);
+                setRecBlobUrl("");
+              }}
             />
             <div className="flex gap-2">
-              <button className="btn-ghost w-full" onClick={registerVoice}>克隆并保存</button>
-              <button className="btn-ghost w-full" onClick={previewVoice}>试听</button>
+              <button className="btn-ghost w-full" onClick={registerVoice} disabled={recording}>克隆并保存音色</button>
+              <button className="btn-ghost w-full" onClick={previewVoice}>试听已选音色</button>
             </div>
             {previewUrl && <audio controls src={previewUrl} className="mt-2 w-full" />}
           </div>
