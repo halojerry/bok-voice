@@ -147,6 +147,39 @@ def test_settings_object_persona_knowledge_and_reports():
         assert any(d["path"].endswith("p.md") for d in docs)
 
 
+def test_knowledge_delete_removes_vault_file_and_does_not_resurrect(tmp_path, monkeypatch):
+    """删除知识必须同步删除 vault 源文件——否则重启重建索引时「已删除知识复活」。"""
+    monkeypatch.setenv("VAULT_ROOT", str(tmp_path / "vault"))
+    from control_plane import main as m
+
+    with TestClient(m.app) as client:
+        imported = client.post(
+            "/api/knowledge/import",
+            json={"account_id": "acc-001", "path": "del-me.md", "content": "这段知识稍后删除"},
+        ).json()
+        assert imported["indexed"] >= 1
+        docs = client.get("/api/knowledge", params={"account_id": "acc-001"}).json()
+        target = next(d for d in docs if str(d.get("path", "")).endswith("del-me.md"))
+        vault_file = tmp_path / "vault" / "accounts" / "acc-001" / "knowledge" / "del-me.md"
+        assert vault_file.exists()
+
+        resp = client.delete(f"/api/knowledge/{target['id']}", params={"account_id": "acc-001"})
+        assert resp.status_code == 200
+        assert not vault_file.exists(), "删除后 vault 源文件必须被移除"
+        remaining = client.get("/api/knowledge", params={"account_id": "acc-001"}).json()
+        assert not any(str(d.get("path", "")).endswith("del-me.md") for d in remaining)
+
+        # 模拟进程重启时的重建：文件已删，文档不应复活。
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(m._rebuild_in_memory_knowledge(m.app.state.knowledge.vector, str(tmp_path / "vault")))
+        finally:
+            loop.close()
+        after = client.get("/api/knowledge", params={"account_id": "acc-001"}).json()
+        assert not any(str(d.get("path", "")).endswith("del-me.md") for d in after)
+
+
 def test_supervisor_pause_resume_roundtrip():
     """主管台暂停/恢复要真实改通话状态（agent 轮询到后生效）。"""
     with TestClient(app) as client:

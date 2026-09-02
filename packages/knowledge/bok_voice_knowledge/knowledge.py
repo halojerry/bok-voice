@@ -28,7 +28,33 @@ class DefaultKnowledgeService:
         return await self.vector.list(account_id)
 
     async def delete(self, account_id: str, ids: list[str]) -> int:
-        return await self.vector.delete(account_id, ids)
+        # 删除必须同时移除 vault 里的源文件，否则 SQLite/内存路径在进程重启时会
+        # 从 vault 重建索引，导致「已删除的知识复活」。只删 accounts/{acct}/knowledge/
+        # 前缀的文档；结算/转写文档（objects/.../calls）不属于知识库，不受影响。
+        all_items = await self.vector.list(account_id)
+        by_id = {str(it.get("id")): it for it in all_items}
+        targets: dict[str, dict] = {}
+        for kid in ids:
+            item = by_id.get(kid)
+            if item is None:
+                continue
+            targets[kid] = item
+            # 同一文档可能存在两种 id（导入时的随机 uuid / 重启重建的 md:rel），
+            # 按 path 一并找出，确保两边都清掉。
+            for other in all_items:
+                if other is not item and str(other.get("path", "")) == str(item.get("path", "")):
+                    targets[str(other.get("id"))] = other
+        prefix = f"accounts/{account_id}/knowledge/"
+        for item in targets.values():
+            path = str(item.get("path") or "")
+            if path.startswith(prefix):
+                try:
+                    self.markdown.forget(path)
+                except Exception:  # pragma: no cover - 文件不存在视为已删
+                    pass
+        if not targets:
+            return 0
+        return await self.vector.delete(account_id, list(targets.keys()))
 
     async def context(self, task: str, account_id: str, limit: int = 5) -> ContextBundle:
         snippets = await self.vector.search(task, account_id, limit)

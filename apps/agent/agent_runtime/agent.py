@@ -442,11 +442,23 @@ async def entrypoint(ctx):
         asyncio.create_task(cp.add_turn(call_id, role, _clean_transcript(text)))
 
     async def _async_update_context(role, text):
-        # 渐进披露：每轮按用户当前问题实时检索，覆盖初始知识，并维护整场对话摘要。
+        # 渐进披露：每轮按用户当前问题实时检索（本地知识库 + 免费联网检索），
+        # 覆盖初始知识，并维护整场对话摘要。联网失败静默降级，绝不阻塞通话。
         try:
             if role == "user":
+                from .web_search import web_search_text
+
                 hits = await cp.search_knowledge(text, context_state.account_id, 5)
                 context_state.set_knowledge(hits)
+                # 联网补充：知识库不足时给 LLM 实时事实（Wikipedia/DDG，按用户语言）。
+                # 可用 WEB_SEARCH=0 关闭（隐私/离线场景）。
+                if os.environ.get("WEB_SEARCH", "1") == "1":
+                    try:
+                        web = await web_search_text(text, language_state.lang)
+                        if web:
+                            context_state.set_web(web)
+                    except Exception as exc:  # pragma: no cover - 联网是增强
+                        print(f"[agent] web search skipped: {exc!r}", flush=True)
             context_state.add_summary(role, _clean_transcript(text))
         except Exception as exc:  # pragma: no cover - context must not break turns
             print(f"[agent] context update failed: {exc!r}", flush=True)

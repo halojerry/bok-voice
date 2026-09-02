@@ -205,6 +205,19 @@ class ContextState:
         self._snippets: list[str] = []
         self._summary_lines: list[str] = []
         self._user_lang: str = ""
+        self._web: list[str] = []
+
+    def set_web(self, results: str | list[str]) -> None:
+        """注入联网检索结果（Wikipedia/DDG 摘要），随 system 消息给 LLM 参考。"""
+        if isinstance(results, str):
+            self._web = [results] if results.strip() else []
+        elif results:
+            self._web = list(results)
+        else:
+            self._web = []
+        # 联网结果最多保留 2 条、各截断，避免撑爆上下文。
+        if len(self._web) > 2:
+            self._web = self._web[:2]
 
     def set_user_language(self, lang: str | None) -> None:
         """ASR 每轮检测到的用户语言：随 system 指令注入，约束回复语言。"""
@@ -254,7 +267,13 @@ class ContextState:
                 rule = "用标准普通话回复；不要解释语言选择，不要添加任何注释。"
             parts.append(f"【用户语言】当前用户正在使用：{name}。{rule}")
         if self._snippets:
-            parts.append("【实时检索到的资料】\n" + "\n".join(f"- {s}" for s in self._snippets))
+            parts.append("【实时检索到的资料（知识库）】\n" + "\n".join(f"- {s}" for s in self._snippets))
+        if self._web:
+            parts.append(
+                "【联网检索到的资料（来源：Wikipedia/即时答案，可能过时或不准）】\n"
+                + "\n".join(f"- {s}" for s in self._web)
+                + "\n仅当用户问题需要实时/外部事实时参考；不要编造检索里没有的细节。"
+            )
         if self._summary_lines:
             parts.append("【本通对话记忆】\n" + "\n".join(self._summary_lines[-8:]))
         return "\n\n".join(parts)
