@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  MediaDeviceMenu,
   StartAudio,
   VoiceAssistantControlBar,
   useAgent,
@@ -10,8 +11,10 @@ import {
   useSession,
   useTranscriptions,
 } from "@livekit/components-react";
-import { RoomEvent, TokenSource } from "livekit-client";
+import { RoomEvent, TokenSource, type Room } from "livekit-client";
 import { api } from "@/lib/api";
+import { describeConnectError, friendlyErrorText, useControlPlaneReady } from "@/lib/api-ready";
+import { applyOutputDevice, listAudioDevicesOf, savedMicDevice, savedOutputDevice, webCanSwitchOutput, isTauriShell, type AudioDeviceInfo } from "@/lib/audio";
 import { AgentSessionProvider } from "@/components/agents-ui/agent-session-provider";
 import { VoiceAgentInterface } from "@/components/VoiceAgentInterface";
 import { useAccount } from "@/components/account-context";
@@ -41,7 +44,7 @@ function AgentStateLabel({ state }: { state: string }) {
  * 官方 Agents UI 会话面板：LiveKit Aura 可视化（情绪驱动颜色）+ 官方控制条。
  * 转写暂用 useTranscriptions 自绘（视觉已对齐官方；官方 AgentChatTranscript 需 Tailwind v4，见 AGENT.md）。
  */
-function LiveAgentPanel() {
+function LiveAgentPanel({ room }: { room: Room | null }) {
   const { state, microphoneTrack, identity } = useAgent();
   const { mood } = useAgentExpression();
   const transcriptions = useTranscriptions();
@@ -53,6 +56,11 @@ function LiveAgentPanel() {
     scrollRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [recent]);
   const speaking = agentState === "speaking";
+  const outputCanSwitch = isTauriShell() || webCanSwitchOutput();
+  const [outputDevices, setOutputDevices] = useState<AudioDeviceInfo[]>([]);
+  useEffect(() => {
+    if (outputCanSwitch) listAudioDevicesOf("output").then(setOutputDevices).catch(() => {});
+  }, [outputCanSwitch]);
 
   return (
     <div className="flex h-full flex-1 flex-col">
@@ -105,10 +113,63 @@ function LiveAgentPanel() {
         />
       </div>
 
-      {/* 控制条（AgentSessionProvider 已内置音频渲染） */}
-      <div className="flex items-center justify-center gap-3 border-t border-[var(--card-border)] py-3">
-        <StartAudio label="点击开启声音" />
-        <VoiceAssistantControlBar />
+      {/* 控制条（AgentSessionProvider 已内置音频渲染）+ 设备切换 */}
+      <div className="flex flex-col items-center gap-2 border-t border-[var(--card-border)] py-3">
+        <div className="flex items-center justify-center gap-3">
+          <StartAudio label="点击开启声音" />
+          <VoiceAssistantControlBar />
+        </div>
+        {room && (
+          <div className="flex items-center justify-center gap-3 text-xs text-[var(--muted)]">
+            <span className="inline-flex items-center gap-1.5">
+              <span className="opacity-70">麦克风</span>
+              <MediaDeviceMenu
+                kind="audioinput"
+                requestPermissions
+                initialSelection={savedMicDevice() || undefined}
+                onActiveDeviceChange={(_kind, deviceId) => {
+                  if (deviceId) {
+                    try {
+                      localStorage.setItem("bok.audio.mic", deviceId);
+                    } catch {
+                      /* ignore */
+                    }
+                    void room.switchActiveDevice("audioinput", deviceId).catch((e) => console.warn("mic switch failed", e));
+                  }
+                }}
+              />
+            </span>
+            {outputCanSwitch ? (
+              <span className="inline-flex items-center gap-1.5">
+                <span className="opacity-70">扬声器</span>
+                <select
+                  className="rounded-lg border border-[var(--card-border)] bg-transparent px-2 py-1 text-xs outline-none focus:border-[var(--accent)]"
+                  value={savedOutputDevice()}
+                  onChange={(e) => {
+                    const id = e.target.value;
+                    try {
+                      localStorage.setItem("bok.audio.out", id);
+                    } catch {
+                      /* ignore */
+                    }
+                    void applyOutputDevice(id);
+                  }}
+                >
+                  <option value="" disabled>
+                    跟随系统
+                  </option>
+                  {outputDevices.map((d) => (
+                    <option key={d.id} value={d.id}>
+                      {d.name}
+                    </option>
+                  ))}
+                </select>
+              </span>
+            ) : (
+              <span className="opacity-70">扬声器跟随系统默认</span>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -151,6 +212,9 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
   const [settlement, setSettlement] = useState<Record<string, unknown> | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
+  // 服务就绪自愈：桌面壳异步拉起整栈，首次加载失败后在 Control Plane 就绪时自动重拉。
+  const cp = useControlPlaneReady();
+  const loadAttemptRef = useRef(-1);
 
   // 官方会话：TokenSource.custom 直连 control-plane，只做键名映射（serverUrl/participantToken）。
   const tokenSource = useMemo(
@@ -168,17 +232,28 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
 
   const roomConnected = Boolean(stateCallId) && !connecting;
 
-  // Load selectable objects + personas and default to the first.
+  // Load selectable objects + personas and default to the first. Runs on mount and
+  // again on each Control Plane offline→ready transition (desktop cold start), so
+  // the "接通" button never stays dead behind a one-shot network error.
   useEffect(() => {
+    if (loadAttemptRef.current === cp.attempt) return;
+    loadAttemptRef.current = cp.attempt;
+    let cancelled = false;
     Promise.all([api.listObjects(ACCOUNT), api.listPersonas()])
       .then(([objs, pers]) => {
+        if (cancelled) return;
         if (Array.isArray(objs)) setObjects(objs);
         if (Array.isArray(pers)) setPersonas(pers);
         if (objs?.length) setObjId(String(objs[0].id));
         if (pers?.length) setPersonaId(String(pers[0].id));
+        setError(null);
       })
-      .catch((e) => setError(String(e)));
-  }, []);
+      .catch((e) => {
+        if (!cancelled) setError(friendlyErrorText(String(e)));
+      });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cp.attempt, ACCOUNT]);
 
   // For an existing call (e.g. /calls/[id]), hydrate everything from the server.
   useEffect(() => {
@@ -192,7 +267,7 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
         if (c.persona_id) setPersonaId(String(c.persona_id));
         if (c.mode) setMode(c.mode as "simulation" | "live");
       })
-      .catch((e) => setError(String(e)));
+      .catch((e) => setError(friendlyErrorText(String(e))));
   }, [callId]);
 
   // Fetch object / persona when selected or resolved from a call.
@@ -217,35 +292,39 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
   async function connect() {
     setError(null);
     setConnecting(true);
+    let phase: "create-call" | "join-session" = "create-call";
     try {
       let id = stateCallId;
       if (!id) {
+        // 会话默认语言：人设语言优先（AI 该用什么语言与客户沟通，是用户对人设的明确设定），
+        // 其次对象(客户)语言，最后普通话。此前恒取对象语言且对象默认 "vi" 会导致语言失效。
+        const callLang = String(persona?.language || object?.language || "zh");
         const created = await api.createCall({
           account_id: ACCOUNT,
           object_id: objId,
           persona_id: personaId,
           mode,
           direction: "webrtc",
-          language: object?.language ?? "zh",
+          language: callLang,
         });
         id = String(created.id);
         setStateCallId(id);
         callIdRef.current = id;
       }
       setConnecting(false);
-      session
-        .start({ tracks: { microphone: { enabled: true } } })
-        .then(() => {
-          if (!canPlayAudio) startAudio().catch(() => {});
-        })
-        .catch((e) => {
-          console.error("connect failed", e);
-          setError("接通失败：请检查 Control Plane 是否运行，且已选择对象与人设。");
-          setConnecting(false);
-        });
+      phase = "join-session";
+      // 应用用户选择的音频设备：麦克风先设默认采集设备（session.start 开麦时会采用），
+      // 扬声器在桌面壳切系统默认输出。
+      const micDeviceId = savedMicDevice();
+      const outputDeviceId = savedOutputDevice();
+      // 非 exact：设备不存在/已插拔时回退默认，避免采集失败（exact 会 reject）。
+      if (micDeviceId) await session.room.switchActiveDevice("audioinput", micDeviceId, false).catch(() => {});
+      if (outputDeviceId) await applyOutputDevice(outputDeviceId).catch(() => {});
+      await session.start({ tracks: { microphone: { enabled: true } } });
+      if (!canPlayAudio) startAudio().catch(() => {});
     } catch (e) {
       console.error("connect failed", e);
-      setError("接通失败：请检查 Control Plane 是否运行，且已选择对象与人设。");
+      setError(describeConnectError(e, phase));
       setConnecting(false);
     }
   }
@@ -369,6 +448,11 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
         </div>
 
         {error && <p className="rounded-lg bg-red-500/10 p-3 text-sm text-red-300">{error}</p>}
+        {!error && !cp.ready && (
+          <p className="rounded-lg bg-white/5 p-3 text-sm text-[var(--muted)]">
+            本地服务启动中…（Control Plane / ASR / TTS），就绪后会自动加载对象与人设，请稍候。
+          </p>
+        )}
         {!stateCallId && objects.length === 0 && (
           <p className="mb-3 rounded-lg bg-white/5 p-3 text-sm text-[var(--muted)]">
             请先在「对象」页建档一个对象，再回到这里接通。
@@ -376,7 +460,7 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
         )}
 
         <AgentSessionProvider session={session} volume={1} muted={false}>
-          {roomConnected ? <LiveAgentPanel /> : <IdleStage />}
+          {roomConnected ? <LiveAgentPanel room={session.room} /> : <IdleStage />}
         </AgentSessionProvider>
       </section>
 

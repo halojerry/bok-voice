@@ -1,10 +1,11 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { api } from "@/lib/api";
 import { AppShell, ErrorState, LoadingState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
+import { friendlyErrorText, useControlPlaneReady } from "@/lib/api-ready";
 
 export function DashboardPage() {
   return (
@@ -16,27 +17,41 @@ export function DashboardPage() {
 
 function DashboardContent() {
   const { accountId, health } = useAccount();
+  const cp = useControlPlaneReady();
   const [summary, setSummary] = useState<Record<string, unknown> | null>(null);
   const [objects, setObjects] = useState<Record<string, unknown>[]>([]);
   const [calls, setCalls] = useState<Record<string, unknown>[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
+  const loadAttemptRef = useRef(-1);
 
   useEffect(() => {
+    // 冷启动自愈：每次 Control Plane 离线→就绪转换时自动重拉一次。
+    if (loadAttemptRef.current === cp.attempt) return;
+    loadAttemptRef.current = cp.attempt;
+    let cancelled = false;
+    setLoading(true);
     Promise.all([
       api.reportsSummary(),
       api.listObjects(accountId),
       api.listCalls(accountId, ""),
     ])
       .then(([s, o, c]) => {
+        if (cancelled) return;
         setSummary(s as Record<string, unknown>);
         setObjects(Array.isArray(o) ? o : []);
         setCalls(Array.isArray(c) ? c : []);
         setErr(null);
       })
-      .catch((e) => setErr(String(e)))
-      .finally(() => setLoading(false));
-  }, [accountId]);
+      .catch((e) => {
+        if (!cancelled) setErr(friendlyErrorText(String(e)));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accountId, cp.attempt]);
 
   const cards: [string, string][] = [
     ["活跃通话", String(summary?.active_calls ?? "—")],

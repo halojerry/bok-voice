@@ -41,6 +41,16 @@
 同时：通话/转写/结算/审计 → control-plane :8000 → SQLite（对象、人设、知识、模板、设置、审计）
 ```
 
+> **前端就绪自愈**：桌面壳异步拉起整栈服务，WebView 先于服务就绪加载。前端
+> `lib/api-ready.ts` 的 `useControlPlaneReady` 轮询 `/health`，Control Plane 就绪后
+> 自动重拉对象/人设等数据；`TypeError: Load failed` 不再直接上屏，而是映射为
+> 中文提示「本地服务启动中/无法连接」。
+>
+> **URL 归一**：前端 API 基址、B 线 WS、LiveKit、agent 的 CONTROL_PLANE_URL 一律
+> 默认 `127.0.0.1`（服务只绑 IPv4；避免 macOS localhost 优先解析 ::1 导致
+> fetch 恒定失败）。构建/打包（verify_bundle.sh）会校验 `out/` 不含
+> `http://localhost:8000`。
+
 ### Supervisor（主管台）
 
 - 暂停/接管：control-plane 把通话置 `paused` 或 `escalated_to_human`；agent 的

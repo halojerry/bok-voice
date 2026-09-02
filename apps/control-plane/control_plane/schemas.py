@@ -14,7 +14,7 @@ class TokenRequest(BaseModel):
 
 
 class TokenResponse(BaseModel):
-    url: str = "ws://localhost:7880"
+    url: str = "ws://127.0.0.1:7880"
     token: str = ""
     roomName: str = ""
 

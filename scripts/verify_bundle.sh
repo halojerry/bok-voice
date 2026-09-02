@@ -59,6 +59,15 @@ if [ "$mode" = "--app" ]; then
   SIZE_MB=$(du -sm "$APP" | awk '{print $1}')
   note "app size: ${SIZE_MB}MB"
   if [ "$SIZE_MB" -gt 1330 ]; then note "FAIL size gate (>1330MB)"; FAIL=1; else note "ok   size gate <=1330MB"; fi
+  # 防回归：静态导出烘焙的 API 基址必须绑 127.0.0.1（localhost 优先解析 ::1 会让
+  # 打包客户端恒定 TypeError: Load failed）。Tauri v2 把 frontendDist(out/) 嵌入
+  # 二进制，因此检查构建输入 apps/web/out 与二进制内的烘焙串。
+  OUT_DIR="$ROOT/apps/web/out"
+  if grep -rIl --include='*.js' 'http://localhost:8000' "$OUT_DIR" 2>/dev/null | grep -q .; then
+    note "FAIL baked API base http://localhost:8000 (out/)"; FAIL=1
+  else
+    note "ok   out/ 无 localhost:8000 烘焙"
+  fi
   # Info.plist 必须声明麦克风用途，否则 macOS TCC 静默拒绝 getUserMedia。
   if /usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' "$APP/Contents/Info.plist" >/dev/null 2>&1; then
     note "ok   NSMicrophoneUsageDescription present"

@@ -11,6 +11,23 @@ const LANGS = [
   ["en", "English"],
 ] as const;
 
+/** 模板四段字段的中文标签（数据库里以 opening/core/objection/closing 存储）。 */
+const FIELD_LABELS = {
+  opening: "开场白",
+  core: "核心话术",
+  objection: "异议应对",
+  closing: "收尾话术",
+} as const;
+
+const FIELD_PLACEHOLDERS = {
+  opening: "如：您好，我是…，今天联系您是想…",
+  core: "产品卖点 / 需要传达的核心信息…",
+  objection: "客户可能的顾虑与应对话术…",
+  closing: "如：好的，那就不打扰您了，再见。",
+} as const;
+
+const TEMPLATE_FIELDS = ["opening", "core", "objection", "closing"] as const;
+
 const EMPTY = {
   name: "",
   opening: "",
@@ -127,9 +144,9 @@ export default function TemplatesPage() {
                       </div>
                     </div>
                     <div className="mt-2 grid grid-cols-2 gap-2 text-xs">
-                      {(["opening", "core", "objection", "closing"] as const).map((k) => (
+                      {TEMPLATE_FIELDS.map((k) => (
                         <div key={k}>
-                          <span className="label">{k}</span>
+                          <span className="label">{FIELD_LABELS[k]}</span>
                           <p className="mt-0.5 line-clamp-3 text-[var(--muted)]">{String(row[k] ?? "")}</p>
                         </div>
                       ))}
@@ -149,14 +166,14 @@ export default function TemplatesPage() {
             onChange={(e) => setForm({ ...form, name: e.target.value })}
             placeholder="模板名，例如：越南采购商常见异议"
           />
-          {(["opening", "core", "objection", "closing"] as const).map((k) => (
+          {TEMPLATE_FIELDS.map((k) => (
             <label key={k} className="block">
-              <span className="text-xs text-[var(--stage-muted)]">{k}</span>
+              <span className="text-xs text-[var(--stage-muted)]">{FIELD_LABELS[k]}</span>
               <textarea
                 className={`mt-1 h-20 ${textarea}`}
                 value={form[k]}
                 onChange={(e) => setForm({ ...form, [k]: e.target.value })}
-                placeholder={k}
+                placeholder={FIELD_PLACEHOLDERS[k]}
               />
             </label>
           ))}

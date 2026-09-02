@@ -8,7 +8,7 @@
 - 启动一次 `python tools/bok.py serve`，幂等拉起 `control-plane(:8000)`、
   `web(:3000)`、`asr(:8787)`、`tts(:8788)`、`llm(:1235)`、`b-line(:8790)`，
   及可选的 `livekit(:7880)`。
-- 主窗口指向 `http://localhost:3000`（网页工作台），服务未就绪时显示启动页并自动跳转。
+- 主窗口指向 `http://127.0.0.1:3000`（dev 网页工作台；打包版直接内嵌静态产物 `apps/web/out`，经 `tauri://localhost` 加载），服务未就绪时显示启动页并自动跳转。
 - 通过 `@tauri-apps/api` 桥接把服务健康、日志目录、模型清单暴露给前端。
 - 模型首启下载走 `tools/bok.py download`，全部落在平台级 `app-data` 目录；
   macOS `~/Library/Application Support/BokVoice`，Windows `%LOCALAPPDATA%\BokVoice`。

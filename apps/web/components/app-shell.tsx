@@ -2,6 +2,7 @@
 
 import { AccountProvider, useAccount } from "@/components/account-context";
 import { StageHeader } from "@/components/StageHeader";
+import { friendlyErrorText } from "@/lib/api-ready";
 
 function StatusBadge() {
   const { health, settingsLoading, settings } = useAccount();
@@ -36,5 +37,9 @@ export function EmptyState({ label = "暂无数据" }: { label?: string }) {
 }
 
 export function ErrorState({ message }: { message: string }) {
-  return <p className="text-sm text-red-300">{message}</p>;
+  return (
+    <p className="rounded-lg bg-red-500/10 p-3 text-sm text-red-300">
+      {friendlyErrorText(message)}
+    </p>
+  );
 }

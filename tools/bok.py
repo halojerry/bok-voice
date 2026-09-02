@@ -629,13 +629,15 @@ def cmd_serve() -> int:
             log_dir / "control-plane.log",
             env=cp_env,
         )
-    # Dev mode: Next server on :3000 (packaged serves static UI from Tauri).
+    # Dev mode: Next dev server on :3000 (packaged serves static UI from Tauri).
+    # next.config.mjs 是 output:"export"，`next start` 无法服务 export 产物，
+    # 必须用 `next dev`（export 只在 build 阶段生效）。
     if not is_packaged() and not healthy(3000):
         _start_proc(
-            [node(), str(_repo_web_modules() / "next" / "dist" / "bin" / "next"), "start", "-H", "127.0.0.1", "-p", "3000"],
+            [str(node), str(_repo_web_modules() / "next" / "dist" / "bin" / "next"), "dev", "-H", "127.0.0.1", "-p", "3000"],
             run_dir / "web.pid",
             log_dir / "web.log",
-            env={"NEXT_PUBLIC_CONTROL_PLANE_URL": os.environ.get("CONTROL_PLANE_URL", "http://localhost:8000")},
+            env={"NEXT_PUBLIC_CONTROL_PLANE_URL": os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")},
             cwd=str(ROOT / "apps" / "web"),
         )
 
@@ -660,7 +662,7 @@ def cmd_serve() -> int:
             "LIVEKIT_URL": os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880"),
             "LIVEKIT_API_KEY": os.environ.get("LIVEKIT_API_KEY", "devkey"),
             "LIVEKIT_API_SECRET": os.environ.get("LIVEKIT_API_SECRET", "devsecret"),
-            "CONTROL_PLANE_URL": os.environ.get("CONTROL_PLANE_URL", "http://localhost:8000"),
+            "CONTROL_PLANE_URL": os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000"),
             "MLX_LLM_BASE_URL": os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
             "MLX_LLM_MODEL": model_path(MODELS["mac"] if is_mac() else MODELS["windows"], "llm"),
         }

@@ -1,7 +1,8 @@
 "use client";
 
-import { createContext, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/lib/api";
+import { useControlPlaneReady } from "@/lib/api-ready";
 
 type Settings = Record<string, unknown> | null;
 
@@ -20,6 +21,8 @@ export function AccountProvider({ children }: { children: React.ReactNode }) {
   const [settings, setSettings] = useState<Settings>(null);
   const [settingsLoading, setSettingsLoading] = useState(true);
   const [health, setHealth] = useState<boolean | null>(null);
+  const { attempt } = useControlPlaneReady();
+  const lastAttemptRef = useRef(-1);
 
   async function refreshSettings() {
     setSettingsLoading(true);
@@ -34,9 +37,17 @@ export function AccountProvider({ children }: { children: React.ReactNode }) {
   }
 
   useEffect(() => {
+    // 首次加载 + Control Plane 每次离线→就绪转换时自动重试一次。
+    if (lastAttemptRef.current === attempt) return;
+    lastAttemptRef.current = attempt;
+    let cancelled = false;
     refreshSettings();
-    api.health().then((res) => setHealth(Boolean(res.ok))).catch(() => setHealth(false));
-  }, []);
+    api.health()
+      .then((res) => { if (!cancelled) setHealth(Boolean(res.ok)); })
+      .catch(() => { if (!cancelled) setHealth(false); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [attempt]);
 
   const value = useMemo(
     () => ({ accountId, settings, settingsLoading, health, refreshSettings }),
