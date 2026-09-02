@@ -26,6 +26,8 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 
@@ -384,6 +386,9 @@ def cmd_download() -> int:
         # hf_hub 1.x 自动断点续传，无需显式 resume_download。
         snapshot_download(repo_id=repo, local_dir=str(target), **kwargs)
         print(f"  [ok]   {name} downloaded")
+    # hf_transfer 只用于下载加速；下载完成后摘掉，避免泄漏到 sidecar/LLM 进程，
+    # 防止模型加载阶段偶发阻塞（观察：TTS 首启卡死与 HF_HUB_ENABLE_HF_TRANSFER 同现）。
+    os.environ.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
     return 0
 
 
@@ -406,12 +411,26 @@ def cmd_status() -> int:
 def _start_proc(args: list[str], pidfile: Path, logfile: Path, env: dict | None = None, cwd: str | Path | None = None) -> int:
     pidfile.parent.mkdir(parents=True, exist_ok=True)
     merged = dict(os.environ)
+    # 子进程日志实时可见（写到文件时 stdout 默认块缓冲，会吞掉关键启动日志）。
+    merged.setdefault("PYTHONUNBUFFERED", "1")
     if env:
         merged.update(env)
     with logfile.open("ab") as log:
         proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, env=merged, start_new_session=True, cwd=str(cwd) if cwd else None)
     pidfile.write_text(str(proc.pid))
     return proc.pid
+
+
+def _stop_pidfile(pidfile: Path) -> None:
+    """Terminate the process group recorded in a run/*.pid file, if alive."""
+    try:
+        pid = int(pidfile.read_text().strip())
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            os.kill(pid, signal.SIGTERM)
+    except Exception:
+        pass
 
 
 def _bline_config_path() -> Path:
@@ -441,6 +460,20 @@ def write_bline_config(current: dict[str, str] | None = None) -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
     return p
+
+
+def _control_plane_env(db: Path | str) -> dict[str, str]:
+    """Env for the control-plane child. MUST include LiveKit credentials so
+    /api/token issues a real JWT instead of the old sha256 dev fallback."""
+    return {
+        "PYTHONPATH": _repo_pythonpath(),
+        "BOK_SERVICE": "control-plane",
+        "DATABASE_URL": f"sqlite:///{Path(db).as_posix()}",
+        "VAULT_ROOT": str(app_data_dir() / "vault"),
+        "LIVEKIT_URL": os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880"),
+        "LIVEKIT_API_KEY": os.environ.get("LIVEKIT_API_KEY", "devkey"),
+        "LIVEKIT_API_SECRET": os.environ.get("LIVEKIT_API_SECRET", "devsecret"),
+    }
 
 
 def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
@@ -506,12 +539,19 @@ def cmd_up() -> int:
                  "QWEN3_ASR_DEVICE": "cuda" if (_cuda() and not is_mac()) else "cpu"},
         )
     if not healthy(8788):
+        # 清残留：serve 重试可能叠加多个卡死的 TTS 进程，先按 pidfile 收掉。
+        _stop_pidfile(run_dir / "tts.pid")
         _start_proc(
             [str(tts_py), "-m", "uvicorn", "app:app", "--app-dir", "services/qwen3-tts-sidecar",
              "--host", "127.0.0.1", "--port", "8788"],
             run_dir / "tts.pid", log_dir / "tts.log",
             env={"QWEN3_TTS_PRESET_MODEL": tts_preset, "QWEN3_TTS_CLONE_MODEL": tts_clone,
-                 "QWEN3_TTS_BACKEND": tts_backend},
+                 "QWEN3_TTS_BACKEND": tts_backend,
+                 # 语音克隆注册数据（voice_registry + 参考音频）落 app-data，bundle 只读/可升级。
+                 "QWEN3_TTS_DATA_DIR": str(app_data_dir() / "tts-data"),
+                 # 打包模式跳过 warmup：首启偶发卡死在参考音频读取/冷编译，
+                 # 跳过只损失首包 1-2s，换取启动不被阻塞（开发模式保留 warmup）。
+                 "QWEN3_TTS_WARMUP": "0" if is_packaged() else os.environ.get("QWEN3_TTS_WARMUP", "1")},
         )
 
     _start_llm(current, run_dir, log_dir)
@@ -526,11 +566,36 @@ def cmd_up() -> int:
         )
 
     print("[bok] waiting for services…")
-    for _ in range(60):
+    for _ in range(180):
         if all(healthy(p) for p in (8787, 8788, 8790, 1235)):
             print("[bok] ready: asr=8787 tts=8788 llm=1235 b-line=8790")
             return 0
         time.sleep(1)
+    # TTS 首启偶发卡死在 MLX 模型加载/暖机（观察：与 LLM/ASR 同启时概率出现，
+    # 单独重启几乎必然成功）。兜底：停掉后单独再拉起一次，再等 120s。
+    if not healthy(8788):
+        print("[bok] tts not healthy — restarting once (alone)", flush=True)
+        _stop_pidfile(run_dir / "tts.pid")
+        tts_py = sidecar_python("qwen3-tts-sidecar")
+        tts_preset = model_path(MODELS["mac"] if is_mac() else MODELS["windows"], "tts_preset")
+        tts_clone = model_path(MODELS["mac"] if is_mac() else MODELS["windows"], "tts_clone")
+        tts_backend = "mlx" if is_mac() else "transformers"
+        _start_proc(
+            [str(tts_py), "-m", "uvicorn", "app:app", "--app-dir", "services/qwen3-tts-sidecar",
+             "--host", "127.0.0.1", "--port", "8788"],
+            run_dir / "tts.pid", log_dir / "tts.log",
+            env={"QWEN3_TTS_PRESET_MODEL": tts_preset, "QWEN3_TTS_CLONE_MODEL": tts_clone,
+                 "QWEN3_TTS_BACKEND": tts_backend,
+                 "QWEN3_TTS_DATA_DIR": str(app_data_dir() / "tts-data"),
+                 "QWEN3_TTS_WARMUP": "0" if is_packaged() else os.environ.get("QWEN3_TTS_WARMUP", "1")},
+        )
+        for _ in range(120):
+            if healthy(8788):
+                break
+            time.sleep(1)
+    if all(healthy(p) for p in (8787, 8788, 8790, 1235)):
+        print("[bok] ready (after tts restart): asr=8787 tts=8788 llm=1235 b-line=8790")
+        return 0
     print("[bok] timeout waiting for services (see app-data/logs)", file=sys.stderr)
     return 1
 
@@ -556,12 +621,7 @@ def cmd_serve() -> int:
     # control-plane
     # Dev 与打包统一：业务数据 SQLite 落盘、知识 vault 在 app-data（bundle 只读）。
     db = (app_data_dir() / "bok_voice.db").as_posix()
-    cp_env: dict[str, str] = {
-        "PYTHONPATH": _repo_pythonpath(),
-        "BOK_SERVICE": "control-plane",
-        "DATABASE_URL": f"sqlite:///{db}",
-        "VAULT_ROOT": str(app_data_dir() / "vault"),
-    }
+    cp_env: dict[str, str] = _control_plane_env(db)
     if not healthy(8000):
         _start_proc(
             [str(py), "-m", "uvicorn", "control_plane.main:app", "--host", "127.0.0.1", "--port", "8000"],
@@ -747,6 +807,36 @@ def cmd_doctor() -> int:
 
     for name, port in (("control-plane", 8000), ("asr", 8787), ("tts", 8788), ("llm", 1235), ("b-line", 8790), ("livekit", 7880)):
         print(f"  port {port:<5} ({name}): {'UP' if healthy(port) else 'DOWN'}")
+
+    # /api/token 必须是真 JWT（三段式）；否则 A 线 UI 永远“接通失败”。
+    if healthy(8000):
+        try:
+            body = json.dumps({"account_id": "acc-001"}).encode()
+            req = urllib.request.Request(
+                "http://127.0.0.1:8000/api/token",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                payload = json.loads(resp.read().decode())
+            tok = str(payload.get("token") or "")
+            if tok.count(".") == 2:
+                print("token endpoint: ok (real JWT)")
+            else:
+                msg = "token endpoint 返回的不是三段式 JWT（疑似旧 sha256 兜底）"
+                fails.append(msg)
+                print(f"token endpoint: FAIL ({msg})")
+        except urllib.error.HTTPError as exc:
+            msg = f"token endpoint HTTP {exc.code}（LiveKit 凭据缺失或服务异常）"
+            fails.append(msg)
+            print(f"token endpoint: FAIL ({msg})")
+        except Exception as exc:
+            msg = f"token endpoint 不可达: {exc}"
+            fails.append(msg)
+            print(f"token endpoint: FAIL ({msg})")
+    else:
+        print("token endpoint: skipped (control-plane down)")
 
     if packaged and fails:
         print("\nPACKAGED DOCTOR FAILED:")

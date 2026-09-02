@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import io
 import json
 import os
@@ -339,22 +338,22 @@ def token(req: TokenRequest) -> TokenResponse:
     room = req.call_id or f"call-{uuid.uuid4().hex[:8]}"
     key = getattr(app.state, "lk_key", "") or os.environ.get("LIVEKIT_API_KEY", "")
     secret = getattr(app.state, "lk_secret", "") or os.environ.get("LIVEKIT_API_SECRET", "")
-    url = getattr(app.state, "lk_url", "") or os.environ.get("LIVEKIT_URL", "ws://localhost:7880")
-    if key and secret:
-        import datetime
-        from livekit import api
+    url = getattr(app.state, "lk_url", "") or os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880")
+    if not key or not secret:
+        # 必须走真实 JWT：旧 sha256 兜底会让前端 decodeTokenPayload 抛错、
+        # LiveKit 服务器 401，A 线永远接不通。缺凭据时显式失败，不静默回退。
+        raise HTTPException(status_code=503, detail="LiveKit credentials not configured")
+    import datetime
+    from livekit import api
 
-        at = (
-            api.AccessToken(key, secret)
-            .with_identity(f"operator-{req.account_id}-{room}")
-            .with_name("Bok Voice Operator")
-            .with_grants(api.VideoGrants(room_join=True, room=room, can_publish=True, can_subscribe=True, can_publish_data=True))
-            .with_ttl(datetime.timedelta(seconds=3600))
-        )
-        token = at.to_jwt()
-    else:
-        # Dev fallback (no LiveKit keys configured): keep tests reproducible.
-        token = hashlib.sha256(f"{req.account_id}:{room}".encode()).hexdigest()
+    at = (
+        api.AccessToken(key, secret)
+        .with_identity(f"operator-{req.account_id}-{room}")
+        .with_name("Bok Voice Operator")
+        .with_grants(api.VideoGrants(room_join=True, room=room, can_publish=True, can_subscribe=True, can_publish_data=True))
+        .with_ttl(datetime.timedelta(seconds=3600))
+    )
+    token = at.to_jwt()
     # When the operator connects an existing call, flip it to ACTIVE so the supervisor
     # "active calls" view reflects the real live room.
     if req.call_id:
@@ -420,6 +419,39 @@ def get_turns(call_id: str) -> list[dict]:
     return [turn.__dict__ for turn in _repo().get_turns(call_id)]
 
 
+def _write_settlement_docs(call: dict, turns: list[dict], result: dict) -> None:
+    """把通话转写与结算文档真实落盘到 vault（与 settlement 声明的 doc path 一致）。
+    路径：accounts/{account}/objects/{object}/calls/{call}/transcript.md(.settlement.md)。
+    失败只告警，不阻塞结算主流程。"""
+    account_id = call.get("account_id") or "acc-001"
+    object_id = call.get("object_id") or "unknown"
+    call_id = call.get("id") or ""
+    base = f"accounts/{account_id}/objects/{object_id}/calls/{call_id}"
+    lines: list[str] = [f"# 通话转写 {call_id}", ""]
+    for t in turns:
+        if not isinstance(t, dict):
+            t = t.__dict__ if hasattr(t, "__dict__") else {}
+        role = t.get("role", "user")
+        text = (t.get("transcript") or t.get("text") or "").strip()
+        lines += [f"## {role}", text, ""]
+    transcript_md = "\n".join(lines).strip() + "\n"
+
+    settle_lines: list[str] = ["# 通话结算", "", f"- call_id: {call_id}", f"- status: {result.get('status', '')}", ""]
+    if result.get("summary"):
+        settle_lines += ["## 摘要", str(result["summary"]), ""]
+    if result.get("metrics"):
+        settle_lines += ["## 指标", "```json", json.dumps(result.get("metrics"), ensure_ascii=False, indent=2), "```", ""]
+    settlement_md = "\n".join(settle_lines).strip() + "\n"
+    try:
+        markdown = getattr(app.state, "knowledge", None)
+        if markdown is None:
+            return
+        markdown.markdown.write(f"{base}/transcript.md", transcript_md)
+        markdown.markdown.write(f"{base}/settlement.md", settlement_md)
+    except Exception as exc:  # pragma: no cover - doc write must not break settle
+        print(f"[settle] doc write failed: {exc!r}", flush=True)
+
+
 @app.post("/api/calls/{call_id}/settle")
 def settle(call_id: str) -> dict:
     existing = _repo().get_settlement(call_id)
@@ -458,6 +490,7 @@ def settle(call_id: str) -> dict:
             _repo().append_object_topics(call["object_id"], call["account_id"], result["new_topics"])
     except Exception as exc:  # pragma: no cover - summarizer must not break settle
         print(f"[settle] summarizer failed: {exc!r}", flush=True)
+    _write_settlement_docs(call, turns, result)
     _repo().append_settlement(call_id, result)
     _audit(
         "settle.create",

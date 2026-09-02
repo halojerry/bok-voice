@@ -3,7 +3,7 @@ import os
 os.environ.setdefault("DATABASE_URL", "")  # force in-memory repo for tests
 os.environ.setdefault("LIVEKIT_API_KEY", "devkey")
 os.environ.setdefault("LIVEKIT_API_SECRET", "devsecret")
-os.environ.setdefault("LIVEKIT_URL", "ws://localhost:7880")
+os.environ.setdefault("LIVEKIT_URL", "ws://127.0.0.1:7880")
 
 from fastapi.testclient import TestClient
 
@@ -20,7 +20,7 @@ def test_control_plane_flow():
         claims = jwt.decode(token["token"], options={"verify_signature": False})
         assert claims["video"]["room"] == token["roomName"]
         assert claims["video"]["roomJoin"] is True
-        assert token["url"] == "ws://localhost:7880"
+        assert token["url"] == "ws://127.0.0.1:7880"
         created = client.post(
             "/api/calls",
             json={"account_id": "acc-001", "object_id": "obj-1", "persona_id": "p-1", "mode": "simulation"},
@@ -30,6 +30,47 @@ def test_control_plane_flow():
         settled = client.post(f"/api/calls/{call_id}/settle").json()
         assert settled["status"] == "done"
         assert "summary" in settled  # settle 结果应携带总结正文（无 LLM 时回退纯指标摘要）
+
+
+def test_token_requires_livekit_credentials(monkeypatch):
+    """缺少 LiveKit 凭据时必须显式 503，绝不能回退 sha256 假 token。"""
+    from control_plane import main as m
+
+    monkeypatch.delenv("LIVEKIT_API_KEY", raising=False)
+    monkeypatch.delenv("LIVEKIT_API_SECRET", raising=False)
+    old_key = m.app.state.lk_key
+    old_secret = m.app.state.lk_secret
+    m.app.state.lk_key = ""
+    m.app.state.lk_secret = ""
+    try:
+        with TestClient(m.app) as client:
+            resp = client.post("/api/token", json={"account_id": "acc-001"})
+            assert resp.status_code == 503
+            assert "credentials" in resp.json()["detail"].lower()
+    finally:
+        m.app.state.lk_key = old_key
+        m.app.state.lk_secret = old_secret
+
+
+def test_settle_writes_transcript_docs(tmp_path, monkeypatch):
+    """结算必须把 transcript.md / settlement.md 真实落盘到 vault（按对象/通话留存）。"""
+    monkeypatch.setenv("VAULT_ROOT", str(tmp_path / "vault"))
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/calls",
+            json={"account_id": "acc-001", "object_id": "obj-1", "persona_id": "p-1", "mode": "simulation"},
+        ).json()
+        call_id = created["id"]
+        client.post(f"/api/calls/{call_id}/turns", params={"role": "user", "transcript": "你好，我想了解套餐"}).json()
+        settled = client.post(f"/api/calls/{call_id}/settle").json()
+        assert settled["status"] == "done"
+        base = tmp_path / "vault" / "accounts" / "acc-001" / "objects" / "obj-1" / "calls" / call_id
+        transcript = base / "transcript.md"
+        settlement = base / "settlement.md"
+        assert transcript.exists()
+        assert settlement.exists()
+        assert "你好，我想了解套餐" in transcript.read_text(encoding="utf-8")
+        assert "通话结算" in settlement.read_text(encoding="utf-8")
 
 
 def test_settings_object_persona_knowledge_and_reports():

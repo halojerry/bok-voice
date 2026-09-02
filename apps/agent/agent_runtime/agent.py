@@ -239,24 +239,25 @@ async def entrypoint(ctx):
             min_speech_duration=float(os.environ.get("VAD_MIN_SPEECH_DURATION", "0.15")),
             min_silence_duration=float(os.environ.get("VAD_MIN_SILENCE_DURATION", "0.35")),
         )
-        asr_provider_name = asr_cfg.get("provider") or "qwen3_asr"
-        if asr_provider_name == "qwen3_asr":
-            stt_provider = stt.StreamAdapter(
-                stt=Qwen3ASRSTT(
+        # 只有显式选择 sherpa 才走 sherpa-onnx；未知/缺失/历史值一律回退 sidecar
+        # （Qwen3-ASR），避免配置写错导致 agent 崩溃（sherpa 模型不再随包）。
+        asr_provider_name = (asr_cfg.get("provider") or "qwen3_asr").lower()
+        use_sherpa = asr_provider_name in {"sherpa", "sherpa_sensevoice"}
+        stt_provider = stt.StreamAdapter(
+            stt=(
+                SherpaSenseVoiceSTT(language_state=language_state)
+                if use_sherpa
+                else Qwen3ASRSTT(
                     base_url=_sidecar_base_url(
                         asr_cfg.get("base_url") or "",
                         "QWEN3_ASR_BASE_URL",
                         "http://127.0.0.1:8787",
                     ),
                     language_state=language_state,
-                ),
-                vad=vad_provider,
-            )
-        else:
-            stt_provider = stt.StreamAdapter(
-                stt=SherpaSenseVoiceSTT(language_state=language_state),
-                vad=vad_provider,
-            )
+                )
+            ),
+            vad=vad_provider,
+        )
 
         tts_provider_name = tts_cfg.get("provider") or "qwen3_tts"
         if tts_provider_name == "qwen3_tts":

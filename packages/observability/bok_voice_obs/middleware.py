@@ -45,16 +45,15 @@ class CorrelationMiddleware(BaseHTTPMiddleware):
         )
         set_correlation(corr)
         start = time.perf_counter()
+        response: Response | None = None
         try:
             response = await call_next(request)
-        finally:
+        except Exception:
             duration_ms = (time.perf_counter() - start) * 1000
-            if "x-request-id" not in response.headers:
-                response.headers["x-request-id"] = request_id
             data = {
                 "method": request.method,
                 "path": request.url.path,
-                "status": response.status_code,
+                "status": 500,
                 "duration_ms": round(duration_ms, 2),
             }
             log.info(
@@ -62,4 +61,19 @@ class CorrelationMiddleware(BaseHTTPMiddleware):
                 extra={"event": "http.request", "component": "http", "data": data},
             )
             clear_correlation()
+            raise
+        duration_ms = (time.perf_counter() - start) * 1000
+        if "x-request-id" not in response.headers:
+            response.headers["x-request-id"] = request_id
+        data = {
+            "method": request.method,
+            "path": request.url.path,
+            "status": response.status_code,
+            "duration_ms": round(duration_ms, 2),
+        }
+        log.info(
+            "http_request",
+            extra={"event": "http.request", "component": "http", "data": data},
+        )
+        clear_correlation()
         return response

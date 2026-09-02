@@ -77,7 +77,11 @@
 |---|---|---|
 | `DATABASE_URL` | `sqlite:///<app-data>/bok_voice.db` | 业务数据持久化 |
 | `VAULT_ROOT` | `<app-data>/vault` | 知识库 markdown 落盘 |
+| `LIVEKIT_URL` | `ws://127.0.0.1:7880` | control-plane 签 token 时下发的服务器地址 |
+| `LIVEKIT_API_KEY` | `devkey` | control-plane `/api/token` 签发真实 JWT（缺失会 503） |
+| `LIVEKIT_API_SECRET` | `devsecret` | 同上；与 livekit.yaml `keys` 一致 |
 | `BOK_BLINE_CONFIG` | `<app-data>/bline.json` | B 线通道配置（ASR/TTS/翻译/指标路径） |
+| `QWEN3_TTS_DATA_DIR` | `<app-data>/tts-data` | TTS 语音克隆注册数据（registry + 参考音频），bundle 只读/可升级 |
 | LLM 默认 | `provider=local_openai` + `http://127.0.0.1:1235/v1` | A/B 线共用本地 LLM |
 | 服务绑定 | 127.0.0.1 | 仅本机可访问 |
 

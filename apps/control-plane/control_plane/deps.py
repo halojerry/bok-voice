@@ -11,7 +11,15 @@ from bok_voice_business_db.repository import InMemoryBusinessRepository, SqlAlch
 def build_engine() -> Engine | None:
     url = os.environ.get("DATABASE_URL", "")
     if url:
-        engine = create_engine(url, future=True)
+        kwargs: dict = {"future": True}
+        if url.startswith("sqlite"):
+            # 本地单机 SQLite：不要连接池（QueuePool 会在并发下耗尽并 30s 超时）。
+            # 每请求独立连接，短事务 + busy timeout，天然规避“pool overflow”类故障。
+            from sqlalchemy.pool import NullPool
+
+            kwargs["poolclass"] = NullPool
+            kwargs["connect_args"] = {"timeout": 30, "check_same_thread": False}
+        engine = create_engine(url, **kwargs)
         from bok_voice_business_db import models
 
         models.create_all(engine)

@@ -23,6 +23,8 @@
 
 数据全部落在本机 app-data（`~/Library/Application Support/BokVoice` 或
 `%LOCALAPPDATA%\BokVoice`）：SQLite 业务库、模型、知识库 vault、日志、审计。
+通话转写/摘要/结算文档按对象留存（SQLite + vault markdown）；
+**已知边界（v0.1）**：通话原始录音音频文件不落盘，仅留存转写文本。
 
 ## 开发（一条命令，无 Docker）
 

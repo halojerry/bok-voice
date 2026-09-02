@@ -157,6 +157,11 @@ else
   echo "    npm missing — node_modules will be resolved from repo (dev path)"
 fi
 
+echo "==> [runtime] pruning bytecode caches (__pycache__ / *.pyc) …"
+find "$RUNTIME" -name "__pycache__" -type d -prune -exec rm -rf {} +
+find "$RUNTIME" \( -name "*.pyc" -o -name "*.pyo" \) -delete
+find "$BINARIES" -name "__pycache__" -type d -prune -exec rm -rf {} + 2>/dev/null || true
+
 echo "==> [runtime] done. runtime/ ="
 du -sh "$RUNTIME" 2>/dev/null || true
 echo "==> [runtime] externalBin/ ="

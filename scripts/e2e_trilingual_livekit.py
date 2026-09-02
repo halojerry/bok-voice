@@ -1,17 +1,20 @@
-"""A 线三语 E2E：真实 LiveKit 房间 + 宿主机 sidecar（ASR/TTS）+ Docker agent。
+"""A 线三语 E2E：真实 LiveKit 房间 + 宿主机 sidecar（ASR/TTS）+ agent。
 
 流程：
   1) 连接 LiveKit，加入房间
   2) 依次推送 zh/yue/en 测试音频（16k PCM）
   3) 收集 agent 回复音频轨道
   4) 用 sidecar ASR 转写回复音频，断言语言标签正确
-运行：.venv312/bin/python scripts/e2e_trilingual_livekit.py
+凭据：默认走真实 control-plane /api/token（与前端 UI 同一条链路）；
+      设 E2E_SELF_TOKEN=1 才用脚本自签 token（仅用于无 control-plane 的调试）。
+运行：<runtime-python> scripts/e2e_trilingual_livekit.py
 """
 
 from __future__ import annotations
 
 import asyncio
 import math
+import os
 import struct
 import time
 import wave
@@ -24,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 LIVEKIT_URL = "ws://127.0.0.1:7880"
 LIVEKIT_KEY = "devkey"
 LIVEKIT_SECRET = "devsecret"
+CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
 AUDIO_DIR = ROOT / "tests" / "fixtures" / "audio"
 
 _ALL_CASES = [
@@ -31,9 +35,6 @@ _ALL_CASES = [
     {"lang": "yue", "file": "yue.wav", "expect_lang": "Cantonese"},
     {"lang": "en", "file": "en.wav", "expect_lang": "English"},
 ]
-
-import os
-
 CASES = [
     c
     for c in _ALL_CASES
@@ -201,16 +202,62 @@ def asr_language(pcm16: bytes) -> tuple[str, str]:
 
 
 async def main() -> None:
-    token_api = api.AccessToken(LIVEKIT_KEY, LIVEKIT_SECRET)
-    room_name = f"e2e-trilingual-{int(time.time())}"
-    token = token_api.with_identity("e2e-driver").with_name("E2E").with_grants(
-        api.VideoGrants(room_join=True, room=room_name)
-    ).to_jwt()
+    # 与 UI 同一条链路：先建真实通话（对象/人设/语言），再用 call id 作为房间名，
+    # 这样 agent 能解析到上下文与语言指令（否则 context 404，回复语言不跟随）。
+    lang = os.environ.get("E2E_ONLY") or "zh"
+    obj = httpx.post(
+        f"{CONTROL_PLANE_URL}/api/objects?account_id=acc-001",
+        json={
+            "display_name": f"E2E-{lang}-{int(time.time())}",
+            "role_template": "buyer",
+            "language": lang,
+            "background": "e2e fixture",
+        },
+        timeout=10,
+    ).json()
+    persona = httpx.post(
+        f"{CONTROL_PLANE_URL}/api/personas?account_id=acc-001",
+        json={"name": "E2E客服", "language": lang, "tone": "礼貌专业"},
+        timeout=10,
+    ).json()
+    call = httpx.post(
+        f"{CONTROL_PLANE_URL}/api/calls",
+        json={
+            "account_id": "acc-001",
+            "object_id": obj["id"],
+            "persona_id": persona["id"],
+            "mode": "live",
+            "direction": "webrtc",
+            "language": lang,
+        },
+        timeout=10,
+    ).json()
+    room_name = call["id"]
+    if os.environ.get("E2E_SELF_TOKEN"):
+        token_api = api.AccessToken(LIVEKIT_KEY, LIVEKIT_SECRET)
+        token = token_api.with_identity("e2e-driver").with_name("E2E").with_grants(
+            api.VideoGrants(room_join=True, room=room_name)
+        ).to_jwt()
+        server_url = LIVEKIT_URL
+        print("[e2e] token: SELF-SIGNED (E2E_SELF_TOKEN=1)", flush=True)
+    else:
+        resp = httpx.post(
+            f"{CONTROL_PLANE_URL}/api/token",
+            json={"account_id": "acc-001", "call_id": room_name},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        server_url = data["url"]
+        token = data["token"]
+        if token.count(".") != 2:
+            raise SystemExit(f"[e2e] /api/token 返回的不是真 JWT: {token[:24]}…（LiveKit 凭据未注入）")
+        print(f"[e2e] token: via control-plane /api/token (url={server_url})", flush=True)
 
     results = []
     room = rtc.Room()
     try:
-        await room.connect(LIVEKIT_URL, token)
+        await room.connect(server_url, token)
         print(f"joined {room_name}", flush=True)
         audio_source = rtc.AudioSource(sample_rate=16000, num_channels=1)
         src = rtc.LocalAudioTrack.create_audio_track("e2e-src", audio_source)
@@ -228,6 +275,10 @@ async def main() -> None:
             await asyncio.sleep(1)
     finally:
         await room.disconnect()
+        try:
+            httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{room_name}/hangup", timeout=10)
+        except Exception:
+            pass
 
     passed = 0
     for r in results:

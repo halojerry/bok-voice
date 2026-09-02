@@ -157,6 +157,8 @@ class _OpenAICompatStream:
                         messages=messages,
                         stream=True,
                         max_tokens=max_tokens,
+                        # 客服对话默认低温：语言跟随（粤/普/英）更稳定、少跑题。
+                        temperature=float(os.environ.get("LLM_TEMPERATURE", "0.3")),
                     )
                     async for chunk in stream:
                         if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
