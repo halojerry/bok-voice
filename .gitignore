@@ -31,5 +31,6 @@ services/*/data/
 *.sqlite
 *.db
 *.tsbuildinfo
+.zcode/
 apps/web/AGENTS.md
 apps/web/CLAUDE.md
