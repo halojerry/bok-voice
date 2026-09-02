@@ -458,6 +458,37 @@ async def entrypoint(ctx):
         context_state=context_state,
     )
 
+    # 后台预热:首包延迟里冷启动(模型 KV 分配/首次 token 生成)占大头,
+    # 发一个极短请求让 MLX warm up;不阻塞 job 启动,失败静默。
+    if os.environ.get("LLM_WARMUP", "1") == "1":
+        try:
+            llm_base = (
+                (llm_cfg.get("base_url") or "")
+                or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1")
+            ).rstrip("/")
+            llm_model = llm_cfg.get("model") or os.environ.get("MLX_LLM_MODEL", "")
+
+            async def _llm_warmup():
+                import httpx
+
+                try:
+                    async with httpx.AsyncClient(timeout=10) as c:
+                        await c.post(
+                            f"{llm_base}/chat/completions",
+                            json={
+                                "model": llm_model,
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "max_tokens": 1,
+                            },
+                        )
+                    print("[agent] llm warmup done", flush=True)
+                except Exception as exc:  # pragma: no cover - warmup 失败不致命
+                    print(f"[agent] llm warmup skipped: {exc!r}", flush=True)
+
+            asyncio.create_task(_llm_warmup())
+        except Exception:  # pragma: no cover
+            pass
+
     session = AgentSession(
         vad=vad_provider,
         stt=stt_provider,

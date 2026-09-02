@@ -429,6 +429,11 @@ class ContextAwareLLM(llm.LLM):
                     items[0] = llm.ChatMessage(role="system", content=merged)
                 else:
                     items.insert(0, llm.ChatMessage(role="system", content=msg))
+                # 截断历史:保留最近 N 轮(默认 4 对),更早的靠「本通对话记忆」摘要兜底。
+                # 每轮全量历史会让 prefill 随轮次线性变慢(实测 12 轮 TTFT 2.4s);
+                # 截断让上下文有上界,TTFT 稳定。
+                max_turns = int(os.environ.get("LLM_HISTORY_TURNS", "4"))
+                items = _truncate_chat_items(items, max_turns=max_turns)
                 copy.items = items
                 chat_ctx = copy
         return self._inner.chat(
@@ -439,6 +444,29 @@ class ContextAwareLLM(llm.LLM):
             tool_choice=tool_choice,
             extra_kwargs=extra_kwargs,
         )
+
+
+def _truncate_chat_items(items: list, max_turns: int = 4) -> list:
+    """保留开头 system(s) + 最近 max_turns 轮(user/assistant 对)。
+
+    livekit 的 chat_ctx 累积整通历史;旧轮信息由 ContextState 的「本通对话记忆」
+    摘要承担,这里只把原始对话剪到最近几轮,控制 prefill token 上界。
+    """
+    if max_turns <= 0:
+        return items
+    # 分离 system(前部)与对话(后部)
+    split = 0
+    for i, it in enumerate(items):
+        if getattr(it, "role", "") == "system":
+            split = i + 1
+        else:
+            break
+    system_part = items[:split]
+    dialog = items[split:]
+    if len(dialog) <= max_turns * 2:
+        return items
+    # 保留最近 max_turns 对(2*max_turns 条),截断更早的
+    return system_part + dialog[-(max_turns * 2) :]
 
 
 class ExprAwareLLM(llm.LLM):

@@ -149,3 +149,41 @@ def test_minimax_stream_missing_key_no_crash():
 
     stream = asyncio.run(_make())
     assert stream is not None
+
+
+def test_truncate_chat_items_keeps_recent_turns():
+    from agent_runtime.providers.livekit_plugins import _truncate_chat_items
+
+    from livekit.agents import llm as lk_llm
+
+    def msg(role, txt):
+        return lk_llm.ChatMessage(role=role, content=[txt])
+
+    items = [msg("system", "你是客服"), msg("system", "【知识】规则")]
+    for i in range(12):  # 12 轮 user+assistant
+        items.append(msg("user", f"客户{i}"))
+        items.append(msg("assistant", f"回复{i}"))
+    out = _truncate_chat_items(items, max_turns=4)
+    roles = [getattr(m, "role", "") for m in out]
+    # 开头 system 全保留
+    assert roles[0] == "system" and roles[1] == "system"
+    # 对话只剩最近 4 对(8 条)
+    dialog = roles[2:]
+    assert dialog == ["user", "assistant"] * 4, f"应保留最近4对: {dialog}"
+    # 最近一轮在
+    assert out[-1].content == ["回复11"]
+    assert out[-2].content == ["客户11"]
+    # 最早轮被截掉
+    assert not any(getattr(m, "content", "") == ["客户0"] for m in out)
+
+
+def test_truncate_chat_items_short_untouched():
+    from agent_runtime.providers.livekit_plugins import _truncate_chat_items
+
+    from livekit.agents import llm as lk_llm
+
+    items = [lk_llm.ChatMessage(role="system", content=["s"]),
+             lk_llm.ChatMessage(role="user", content=["u"]),
+             lk_llm.ChatMessage(role="assistant", content=["a"])]
+    out = _truncate_chat_items(items, max_turns=4)
+    assert len(out) == 3
