@@ -389,27 +389,6 @@ function str(v: unknown, fallback = "-") {
   return v === undefined || v === null || v === "" ? fallback : String(v);
 }
 
-/** provider value → 中文名(供 Provider 卡与设置一致展示)。 */
-const PROVIDER_LABELS: Record<string, string> = {
-  qwen3_tts: "Qwen3-TTS（本地）",
-  minimax: "MiniMax（云端）",
-  minimax_streaming: "MiniMax（云端）",
-  volcano_streaming: "火山引擎（云端）",
-  volcano: "火山引擎（云端）",
-  qwen3_asr: "Qwen3-ASR",
-  sherpa_sensevoice: "SenseVoice",
-  local_openai: "本地 LLM",
-  mlx: "本地 MLX",
-  deepseek: "DeepSeek",
-  silero: "Silero",
-  fake: "Fake",
-};
-
-function providerLabel(kind: string, settings: Record<string, unknown> | null): string {
-  const raw = (settings?.[kind] as { provider?: string } | undefined)?.provider ?? "";
-  return PROVIDER_LABELS[raw] ?? (raw || "—");
-}
-
 export function CallStudio({ callId = "" }: { callId?: string }) {
   const { accountId: ACCOUNT } = useAccount();
   const [stateCallId, setStateCallId] = useState(callId);
@@ -451,6 +430,49 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
   // 主管操作（暂停/接管/转人工）状态；挂断走 leave()。
   const [superviseMsg, setSuperviseMsg] = useState("");
   const [superviseBusy, setSuperviseBusy] = useState(false);
+  // WhatsApp 對接通知:開住工作台期間 poll call 狀態,offered/captured → 面板內橫幅。
+  const [waStatus, setWaStatus] = useState("");
+  const [waNum, setWaNum] = useState("");
+  const [waHandling, setWaHandling] = useState(false);
+
+  // WhatsApp 對接:開住工作台時 3s poll call 狀態(offered/captured→面板橫幅;handled→收起)。
+  useEffect(() => {
+    if (!stateCallId) return;
+    let stopped = false;
+    const load = async () => {
+      try {
+        const c = (await api.getCall(stateCallId)) as Record<string, unknown> & {
+          whatsapp_status?: string;
+          customer_whatsapp?: string;
+        };
+        if (stopped) return;
+        setWaStatus(String(c.whatsapp_status ?? ""));
+        setWaNum(String(c.customer_whatsapp ?? ""));
+      } catch {
+        /* control-plane 一時唔得就等下輪 */
+      }
+    };
+    load();
+    const t = setInterval(load, 3000);
+    return () => {
+      stopped = true;
+      clearInterval(t);
+    };
+  }, [stateCallId]);
+
+  async function markWaHandled() {
+    const id = callIdRef.current;
+    if (!id) return;
+    setWaHandling(true);
+    try {
+      await api.markWhatsappHandled(id);
+      setWaStatus("handled");
+    } catch (e) {
+      setSuperviseMsg(friendlyErrorText(String(e)));
+    } finally {
+      setWaHandling(false);
+    }
+  }
 
   async function supervisorAct(kind: "pause" | "resume" | "takeover" | "transfer") {
     const id = callIdRef.current;
@@ -560,6 +582,17 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
         id = String(created.id);
         setStateCallId(id);
         callIdRef.current = id;
+      } else {
+        // Join 已结束嘅 call:LiveKit room 已清,簽咗 token 去 join 會 401
+        // (前端會誤報「令牌校驗失敗」)。直接攔截,叫用戶開新通話。
+        const cur = (await api.getCall(id).catch(() => null)) as
+          | (Record<string, unknown> & { status?: string })
+          | null;
+        if (cur && String(cur.status ?? "") === "ended") {
+          setConnecting(false);
+          setError("该通话已结束（房间已关闭），无法重新接通。请返回列表发起新通话。");
+          return;
+        }
       }
       setConnecting(false);
       phase = "join-session";
@@ -753,6 +786,47 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
           </p>
         )}
 
+        {/* WhatsApp 對接橫幅:客戶俾咗號碼/應承加 → 面板內提示,唔影響 AI 通話 */}
+        {(waStatus === "captured" || waStatus === "offered") && (
+          <div className="wa-flash mb-3 rounded-lg border border-[var(--accent)] bg-[var(--card)] p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="min-w-0">
+                <p className="text-xs font-semibold text-[var(--accent)]">
+                  📱 WhatsApp 待对接
+                  <span className="ml-2 rounded bg-[var(--accent)]/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider">
+                    {waStatus === "captured" ? "已拿到号码" : "客户已应承加"}
+                  </span>
+                </p>
+                {waStatus === "captured" && waNum ? (
+                  <p className="mt-1 font-mono text-lg tracking-wider">{waNum}</p>
+                ) : (
+                  <p className="mt-1 text-xs text-[var(--muted)]">客户应承咗加专员,等紧佢俾号码 / 由专员主动联系。</p>
+                )}
+              </div>
+              <div className="flex shrink-0 gap-2">
+                {waStatus === "captured" && waNum && (
+                  <button
+                    className="btn-ghost text-xs"
+                    onClick={async () => {
+                      try {
+                        await navigator.clipboard.writeText(waNum);
+                        setSuperviseMsg("号码已复制");
+                      } catch {
+                        /* clipboard 失敗靜默 */
+                      }
+                    }}
+                  >
+                    复制号码
+                  </button>
+                )}
+                <button className="btn-primary text-xs" disabled={waHandling} onClick={markWaHandled}>
+                  {waHandling ? "标记中…" : "标记已对接"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         <div className="flex min-h-0 flex-1 flex-col">
           <AgentSessionProvider session={session} volume={1} muted={false}>
             {roomConnected ? <LiveAgentPanel room={session.room} /> : <IdleStage />}
@@ -775,9 +849,6 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
               </p>
             ))}
           </div>
-          <p className="mt-2 border-t border-[var(--card-border)] pt-1.5 text-[10px] text-[var(--muted)]">
-            引擎：{PROVIDER_FIELDS.map(([kind]) => providerLabel(kind, settings)).filter(Boolean).join(" · ") || "读取中…"}
-          </p>
         </div>
         <AudioDevicesCard room={session.room} />
         <div className="rounded-lg bg-white/5 p-3 text-sm">

@@ -114,8 +114,13 @@ export function describeConnectError(err: unknown, phase: "create-call" | "join-
   if (raw.includes("503")) {
     return "Control Plane 未能签发通话令牌（缺少 LiveKit 凭据或仍在启动）。请查看服务日志后重试。";
   }
-  if (raw.includes("401") || /token|jwt|decode/i.test(raw)) {
+  // 真「token 校驗失敗」= LiveKit 明確拒簽名(403 / invalid signature / bad token);
+  // 一般 join 唔存在 room 都會 401,唔好當憑據錯。
+  if (/invalid signature|invalid token|token.*(invalid|expired|signature)|bad.*token|403/i.test(raw)) {
     return "LiveKit 令牌校验失败，请确认 LIVEKIT_API_KEY/SECRET 已正确注入。";
+  }
+  if (raw.includes("401")) {
+    return "无法加入该通话房间（可能已结束或不存在）。请返回列表确认通话状态后重试。";
   }
   return `接通失败：${raw}`;
 }

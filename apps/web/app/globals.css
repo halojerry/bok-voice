@@ -161,3 +161,19 @@ body {
     color: var(--accent);
   }
 }
+
+/* WhatsApp 對接通知爆閃:call 行 / 橫幅 邊框+底色閃,醒目但唔刺眼(AI 通話唔受影響)。 */
+@keyframes wa-flash-kf {
+  0%,
+  100% {
+    box-shadow: 0 0 0 1px rgba(31, 213, 249, 0.15), 0 0 0 rgba(31, 213, 249, 0);
+    background-color: rgba(31, 213, 249, 0.06);
+  }
+  50% {
+    box-shadow: 0 0 0 1px var(--accent), 0 0 18px rgba(31, 213, 249, 0.45);
+    background-color: rgba(31, 213, 249, 0.16);
+  }
+}
+.wa-flash {
+  animation: wa-flash-kf 1.6s ease-in-out infinite;
+}

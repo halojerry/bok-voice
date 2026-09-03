@@ -5,14 +5,13 @@ import { StageHeader } from "@/components/StageHeader";
 import { friendlyErrorText } from "@/lib/api-ready";
 
 function StatusBadge() {
-  const { health, settingsLoading, settings } = useAccount();
+  const { health, settingsLoading } = useAccount();
   if (settingsLoading) return <span className="font-mono">loading</span>;
   if (health === false) return <span className="text-xs text-red-300">控制面离线</span>;
-  const asr = settings && typeof settings.asr === "object" ? (settings.asr as Record<string, unknown>).provider : "—";
   return (
     <span className="hidden items-center gap-2 text-xs text-[var(--stage-muted)] sm:inline-flex">
       <span className="h-2 w-2 rounded-full bg-[var(--stage-value)]" />
-      <span className="font-mono">ASR {String(asr ?? "—")} · v0.1.0</span>
+      <span className="font-mono">v0.1.0</span>
     </span>
   );
 }

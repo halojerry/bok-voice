@@ -70,5 +70,12 @@ class ControlPlaneClient:
         r.raise_for_status()
         return r.json()
 
+    async def report_whatsapp(self, call_id: str, number: str = "") -> None:
+        """上報偵測到客戶俾 WhatsApp。number 有值=captured,空=offered。fire-and-forget。"""
+        await self._client.post(
+            f"/api/calls/{call_id}/whatsapp",
+            json={"number": number},
+        )
+
     async def aclose(self) -> None:
         await self._client.aclose()

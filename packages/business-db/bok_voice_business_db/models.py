@@ -95,6 +95,10 @@ class CallSession(Base):
     disposition: Mapped[str] = mapped_column(String(64), default="")
     escalated_to_human: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(String(32), default="idle")
+    # WhatsApp 對接狀態:""(未提供) / offered(客戶應承加專員,未俾號碼) /
+    # captured(客戶讀出咗自己號碼) / handled(專員已標記對接)。customer_whatsapp 存號碼。
+    whatsapp_status: Mapped[str] = mapped_column(String(16), default="")
+    customer_whatsapp: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 

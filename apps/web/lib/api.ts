@@ -92,6 +92,8 @@ export const api = {
   supervisorResume: (id: string) => request<Record<string, unknown>>(`/api/supervisor/${id}/resume-agent`, { method: "POST" }),
   supervisorTakeover: (id: string) => request<Record<string, unknown>>(`/api/supervisor/${id}/takeover`, { method: "POST" }),
   supervisorTransfer: (id: string) => request<Record<string, unknown>>(`/api/supervisor/${id}/transfer`, { method: "POST" }),
+  markWhatsappHandled: (id: string, handled = true) =>
+    request<Record<string, unknown>>(`/api/calls/${id}/whatsapp/handled`, { method: "POST", body: JSON.stringify({ handled }) }),
   reportsSummary: () => request<Record<string, unknown>>("/api/reports/summary"),
   reportsCalls: () => request<Record<string, unknown>[]>("/api/reports/calls"),
   reportsUsage: () => request<Record<string, unknown>>("/api/reports/usage"),
