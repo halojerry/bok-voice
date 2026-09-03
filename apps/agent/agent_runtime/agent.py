@@ -38,6 +38,27 @@ _EXPR_PARTIAL_RE = re.compile(r"<expr\b[^>]*$")
 # so the persisted transcript is clean customer-facing copy.
 _EXPR_SYNC_RE = re.compile(r"<expr\b[^>]*?/>|<expr\b[^>]*>|</expr>|<expr\b[^>]*$")
 
+# 4B/Qwen3 偶发把对话模板收尾 token <|im_end|> 当文字输出——转录同 TTS 都唔可以留低。
+# _EXPR_TAG_RE 只剥「有 > 收尾」嘅 tag,<|im_end|> 冇 >,会漏,所以专门补剥。
+_EOS_TOKEN_RE = re.compile(r"<\|/?im_(?:start|end)\|>|<\|endoftext\|>", re.IGNORECASE)
+_EOS_TOKENS = ("<|im_end|>", "<|im_start|>", "<|endoftext|>")
+
+
+def _strip_eos_tokens(text: str) -> str:
+    return _EOS_TOKEN_RE.sub("", text or "")
+
+
+def _trailing_eos_partial(text: str) -> str:
+    """text 尾部若系某个 EOS token 被 stream 切开嘅真前缀,留低等下个 chunk 凑齐再剥。"""
+    low = (text or "").lower()
+    best = ""
+    for tok in _EOS_TOKENS:
+        t = tok.lower()
+        for cut in range(1, len(t)):
+            if cut > len(best) and low.endswith(t[:cut]):
+                best = tok[:cut]
+    return best
+
 # MiniMax 支持的拟声标签(2.8-hd/turbo):这些是让它发声效的,不能剥。
 # 其余舞台/动作括号提示(（稍作聽筒聲）（笑）(sigh) (pause) 等)会被 TTS 照念,剥掉。
 _MINIMAX_VOCAL_TAGS = {"laughs", "chuckle", "coughs", "breath", "sighs", "humming"}
@@ -66,6 +87,7 @@ def _strip_stage_dirs(text: str) -> str:
 
 
 def _clean_transcript(text: str) -> str:
+    text = _strip_eos_tokens(text)
     return _EXPR_SYNC_RE.sub("", text).strip()
 
 
@@ -77,22 +99,58 @@ async def _strip_expr_markup(text):
         # 舞台/动作括号提示（如（稍作聽筒聲））也会被 TTS 念出来，一并剥掉；
         # 但放行 MiniMax 拟声标签 (sighs)/(laughs) 等，让它可以转成声效。
         out = _strip_stage_dirs(out)
+        # Qwen3 偶发把 <|im_end|> 当文字输出,剥走以免被 TTS 念出来。
+        out = _strip_eos_tokens(out)
         # A tag split across stream chunks has no closing ">" yet: hold the
-        # trailing "<expr ..." fragment until the next chunk completes it.
+        # trailing "<expr ..." fragment (or half an <|im_end|>) until the next
+        # chunk completes it.
         m = _EXPR_PARTIAL_RE.search(out)
+        held = ""
         if m and out[m.start() :].startswith("<expr"):
-            carry = out[m.start() :]
+            held = out[m.start() :]
             out = out[: m.start()]
         else:
-            carry = ""
+            frag = _trailing_eos_partial(out)
+            if frag:
+                held = frag
+                out = out[: -len(frag)]
         if out:
             yield out
+        carry = held
     # Drop any dangling partial tag at the end of the stream.
     if carry:
         yield ""
 
 
+async def _llm_judge(base_url: str, model: str, messages: list) -> str:
+    """流程推进判定器:对本地 MLX LLM 发一个 max_tokens 极短请求,取回一个字。失败返空(唔推进)。"""
+    if not base_url or not model:
+        return ""
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            r = await c.post(
+                f"{base_url}/chat/completions",
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "max_tokens": 8,
+                    "temperature": 0,
+                    # 本地 MLX 對話模板會 append <|im_end|>,停喺呢度,回應淨係 verdict 字。
+                    "stop": ["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
+                },
+            )
+            if r.status_code == 200:
+                data = r.json()
+                return str((data.get("choices") or [{}])[0].get("message", {}).get("content") or "")
+    except Exception as exc:  # pragma: no cover - 判定失败唔推进,唔阻断通话
+        print(f"[flow] llm judge failed: {exc!r}", flush=True)
+    return ""
+
+
 def _parse_voice_map(raw) -> dict:
+    # 旧数据 map 键 yue 由 _collapse_voice_map 归一;新写入一律 cantonese。
     if isinstance(raw, dict):
         return raw
     if isinstance(raw, str) and raw.strip().startswith("{"):
@@ -291,7 +349,7 @@ def _instructions(
 async def entrypoint(ctx):
     """LiveKit Agent job entrypoint (must be module-level for pickling)."""
     from livekit.agents import Agent, AgentSession, StopResponse, TurnHandlingOptions, inference, stt
-    from .providers.livekit_plugins import ContextState, DeepSeekLLM, ExprAwareLLM
+    from .providers.livekit_plugins import ContextState, DeepSeekLLM, ExprAwareLLM, lecture_guard
 
     room_name = ctx.room.name
     call_id = os.environ.get("AGENT_CALL_ID") or room_name
@@ -393,7 +451,11 @@ async def entrypoint(ctx):
     greet_lang = _normalize_lang((persona or {}).get("language")) or _normalize_lang((object_card or {}).get("language")) or "zh"
     language_state.lang = greet_lang
     # 粤语客服锚定：LLM 默认始终用锚语言（greet_lang），只有客户连续多轮明显讲其它语言才跟随。
-    _lang_sticky: dict = {"sticky": greet_lang if greet_lang in {"zh", "yue", "en"} else "zh", "streak": 0}
+    _lang_sticky: dict = {"sticky": greet_lang if greet_lang in {"zh", "cantonese", "en"} else "zh", "streak": 0}
+    # 已上報嘅 WhatsApp 狀態(captured=已報號碼, offered=已報應承加),避免每 call 重複 spam。
+    _wa_reported: set[str] = set()
+    # 背景 flow judge 防疊:記錄而家 judge 緊邊一步(-1=冇)。推進唔可以同時兩個 judge。
+    _judge_inflight: dict = {"step": -1}
     from .plugins.emotion import EmotionState
 
     emotion_state = EmotionState()
@@ -684,6 +746,45 @@ async def entrypoint(ctx):
     session.on("conversation_item_added", _on_item_for_context)
     session.on("close", _on_close)
 
+    async def _background_flow_judge(step_at: int, utt: str) -> None:
+        """背景跑 LLM 推進判定:唔好喺開聲前同步等(會每輪拖慢),判定完喺下一輪先生效。
+
+        唔會 double-advance:只喺 flow 仲喺 judge 嗰步(step_at)時先落 advance。
+        """
+        try:
+            from .flow import build_judge_messages, parse_judge_output
+
+            jbase = (
+                (llm_cfg.get("base_url") or "")
+                or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1")
+            ).rstrip("/")
+            jmodel = llm_cfg.get("model") or os.environ.get("MLX_LLM_MODEL", "")
+            if not jbase or not jmodel:
+                return
+            goal, ref = flow_ctrl.current_goal_ref()
+            msgs = build_judge_messages(
+                current_index=flow_ctrl.current + 1,
+                total=len(flow_ctrl.steps),
+                overview_lines=flow_ctrl.overview_goal_lines(),
+                goal=goal,
+                ref=ref,
+                next_goal=flow_ctrl.next_goal(),
+                user_text=utt,
+                facts=flow_ctrl.vars_map,
+            )
+            jv = parse_judge_output(await _llm_judge(jbase, jmodel, msgs))
+            if flow_ctrl.current == step_at and flow_ctrl.has_steps and not flow_ctrl.done:
+                if jv == CONFIRM:
+                    flow_ctrl.advance()
+                    context_state.set_flow_current(flow_ctrl.current_step_text())
+                    print(f"[flow] judge(bg)=confirm step={flow_ctrl.current + 1} (call {room_name})", flush=True)
+                else:
+                    print(f"[flow] judge(bg)={jv} step={step_at + 1} (call {room_name})", flush=True)
+        except Exception as exc:  # pragma: no cover - 背景判定失敗唔影響回覆
+            print(f"[flow] judge(bg) failed: {exc!r} (call {room_name})", flush=True)
+        finally:
+            _judge_inflight["step"] = -1
+
     class PausableAgent(Agent):
         """可被主管台暂停/接管/恢复的 Agent：暂停期间抑制自动回复，但保留转写与历史。
 
@@ -715,13 +816,70 @@ async def entrypoint(ctx):
                 context_state.set_user_language(reply_lang)
             except Exception:  # pragma: no cover - 语言注入失败不致命
                 pass
+            # WhatsApp 对接触发:喺 flow 推进【前】偵測(step context 係舊步/當前步,offered 先啱);
+            # 客戶俾號碼(captured)照推下一步;應承加但未俾號碼(offered)→ 唔自動跳,等 AI 叫佢俾號碼。
+            _wa_signal: tuple | None = None
+            try:
+                user_text = ""
+                nm = getattr(new_message, "text_content", None) or ""
+                user_text = str(nm or "")
+                if flow_ctrl.has_steps:
+                    _g, _r = flow_ctrl.current_goal_ref()
+                    _wa_signal = detect_whatsapp_signal(
+                        user_text, step_goal=_g, step_ref=_r, facts=flow_ctrl.vars_map
+                    )
+                    if _wa_signal:
+                        _kind, _num = _wa_signal
+                        if _kind == "captured_implicit":
+                            # WhatsApp 綁定呢個來電/號碼:號喺系統度,攞對象電話上報 captured。
+                            # 對象冇電話 → 上報 offered(操作台見「待對接」);兩種都照推進,唔死鎖。
+                            _phone = str((object_card or {}).get("phone") or "").strip()
+                            _num = _phone
+                            _key = f"implicit:{_phone or '-'}"
+                        else:
+                            _key = _num or "offered"
+                        if _key not in _wa_reported:
+                            _wa_reported.add(_key)
+                            asyncio.create_task(cp.report_whatsapp(call_id, _num))
+                            print(f"[whatsapp] {_kind} num={_num or '-'} (call {room_name})", flush=True)
+            except Exception:  # pragma: no cover - WhatsApp 偵測失敗唔阻斷
+                pass
             # 流程推进:读用户最新话,判定是否进入下一步,更新"当前步"约束注入。
             if flow_ctrl.has_steps and not flow_ctrl.done:
                 try:
-                    user_text = ""
-                    nm = getattr(new_message, "text_content", None) or ""
-                    user_text = str(nm or "")
-                    flow_ctrl.on_user_turn(user_text)
+                    from .flow import should_auto_advance
+
+                    verdict = flow_ctrl.rule_verdict(user_text)
+                    _g2, _r2 = flow_ctrl.current_goal_ref()
+                    # 規則級必定推進 override(開場步客已回應 / 核實步答到平台):
+                    # 唔靠 LLM judge,防止卡死(offered 應承加嗰輪除外——要等客俾號碼)。
+                    _wa_blocks = _wa_signal is not None and _wa_signal[0] == "offered"
+                    _auto = (not _wa_blocks) and should_auto_advance(
+                        current=flow_ctrl.current,
+                        goal=_g2,
+                        ref=_r2,
+                        user_text=user_text,
+                        verdict=verdict,
+                        # 兼要攞WhatsApp嘅核實步:要客戶俾咗號碼/應承先推
+                        wa=(_wa_signal[0] if _wa_signal else None),
+                    )
+                    if _auto:
+                        flow_ctrl.advance()
+                        print(f"[flow] rule=auto step={flow_ctrl.current + 1} (call {room_name})", flush=True)
+                    elif verdict == CONFIRM:
+                        # offered(應承加但未俾號碼)→ 唔推,停喺辦理步叫佢俾號碼(captured 先推)。
+                        if _wa_signal and _wa_signal[0] == "offered":
+                            pass
+                        else:
+                            flow_ctrl.advance()
+                            print(f"[flow] rule=confirm step={flow_ctrl.current + 1} (call {room_name})", flush=True)
+                    elif verdict in (UNCLEAR, QUESTION) and os.environ.get("FLOW_LLM_ADVANCE", "1") == "1":
+                        # 模糊轮(客答唔記得/問後續/開放式回答)→ 背景跑 LLM 判定(唔同步等,
+                        # 唔好為咗推進令每輪開聲慢幾秒);判定完若仲喺同一歩就推進,下一輪先生效。
+                        _step_at = flow_ctrl.current
+                        if _judge_inflight["step"] != _step_at:
+                            _judge_inflight["step"] = _step_at
+                            asyncio.create_task(_background_flow_judge(_step_at, user_text))
                     context_state.set_flow_current(flow_ctrl.current_step_text())
                 except Exception:  # pragma: no cover - 流程推进失败不阻断回复
                     pass
