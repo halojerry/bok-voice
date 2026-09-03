@@ -84,7 +84,9 @@ MODELS: dict[str, dict[str, str]] = {
         "asr": "aufklarer/Qwen3-ASR-1.7B-MLX-8bit",
         "tts_preset": "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit",
         "tts_clone": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
-        "llm": "huihui-ai/Huihui-Qwen3.5-9B-abliterated-mlx-4bit",
+        # 客服 LLM 用 4B 关思考:话术化场景速度优先(一轮 ~1s,约为 9B 一半),
+        # 港式粤语/夹英文/数字读法实测达标。更重任务(蒸馏/知识分析)另走大模型。
+        "llm": "avan-ag/Qwen3.5-4B-Uncensored-MLX-4bit",
     },
     "windows": {
         "asr": "Qwen/Qwen3-ASR-1.7B",
