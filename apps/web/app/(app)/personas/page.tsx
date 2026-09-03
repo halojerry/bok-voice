@@ -5,7 +5,7 @@ import { api } from "@/lib/api";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
 import { startRecording, type RecorderHandle } from "@/lib/recorder";
-import { allMinimaxVoiceOptions } from "@/lib/minimax-voices";
+import { allMinimaxVoiceOptions, previewLangForVoice } from "@/lib/minimax-voices";
 
 const EMPTY = { name: "", company: "", tone: "", language: "zh", reference_audio: "", tts_provider: "" };
 const LANGS = [
@@ -109,6 +109,8 @@ export default function PersonasPage() {
   // 云端单音色（全场同声）选择：与人设主语言解耦，一个人设一把声。
   const [cloudVoice, setCloudVoice] = useState("");
   const [previewUrl, setPreviewUrl] = useState("");
+  // 云端试听语言：默认跟随音色（Cantonese_* 默认粤语），可切到普/英听同一声。
+  const [cloudPreviewLang, setCloudPreviewLang] = useState<"zh" | "yue" | "en" | "">("");
   const [speakers, setSpeakers] = useState<string[]>([]);
   // 已克隆 voice（来自 /api/tts/voices，注册在 TTS sidecar 的 voice_registry）
   const [clonedVoices, setClonedVoices] = useState<VoiceOption[]>([]);
@@ -337,7 +339,6 @@ export default function PersonasPage() {
   }
 
   async function previewVoice() {
-    const lang = activeLang;
     if (engineIsCloud) {
       if (!cloudVoice) {
         setErr("请先选择一个人设音色（整场同声）。");
@@ -345,6 +346,9 @@ export default function PersonasPage() {
       }
       setErr(null);
       try {
+        // 试听语言默认跟随音色（Cantonese_* → 粤语文本），用户可手动切普/英听同一声，
+        // 避免「粤语音色念普通话文字 → 广式普通话」。
+        const lang = (cloudPreviewLang || previewLangForVoice(cloudVoice)) as "zh" | "yue" | "en";
         const blob = await api.previewTts({
           text: previewTextFor(lang, form.name),
           voice: cloudVoice,
@@ -358,6 +362,7 @@ export default function PersonasPage() {
       }
       return;
     }
+    const lang = activeLang;
     const voice = voiceMap[lang] || suggestVoiceFor(lang, voiceMap, clonedVoices, speakers);
     if (!voice) {
       setErr("暂无可用音色，请先克隆一个音色（录音/上传参考音频）。");
@@ -485,7 +490,7 @@ export default function PersonasPage() {
                 <select
                   className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
                   value={cloudVoice}
-                  onChange={(e) => setCloudVoice(e.target.value)}
+                  onChange={(e) => { setCloudVoice(e.target.value); setCloudPreviewLang(""); setPreviewUrl(""); }}
                 >
                   <option value="">选择 MiniMax 音色…</option>
                   {allMinimaxVoiceOptions().map((opt) => (
@@ -497,8 +502,22 @@ export default function PersonasPage() {
                     <option value={cloudVoice}>自定义：{cloudVoice}</option>
                   )}
                 </select>
-                <div className="flex gap-2">
-                  <button className="btn-ghost w-full" onClick={previewVoice}>试听已选音色</button>
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] text-[var(--muted)]">试听语言：</span>
+                  {([["yue", "粤"], ["zh", "普"], ["en", "英"]] as const).map(([lv, lb]) => {
+                    const cur = cloudPreviewLang || previewLangForVoice(cloudVoice);
+                    return (
+                      <button
+                        key={lv}
+                        className={`btn-ghost px-1.5 py-0 text-[11px] ${cur === lv ? "!border-[var(--accent)]" : ""}`}
+                        onClick={() => { setCloudPreviewLang(lv); setPreviewUrl(""); }}
+                      >
+                        {lb}
+                      </button>
+                    );
+                  })}
+                  <span className="ml-auto" />
+                  <button className="btn-ghost w-auto px-2 text-xs" onClick={previewVoice}>试听</button>
                 </div>
                 {previewUrl && <audio controls autoPlay src={previewUrl} className="mt-2 w-full" />}
               </>

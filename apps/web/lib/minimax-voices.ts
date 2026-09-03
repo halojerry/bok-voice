@@ -71,3 +71,16 @@ export function allMinimaxVoiceOptions() {
     label: `${MINIMAX_VOICE_LANG_LABEL[v.lang]} · ${v.label}`,
   }));
 }
+
+/**
+ * 试听用哪种语言/文本：按音色 ID 判定，而不是按字段标签。
+ * 粤语音色（Cantonese_*）即使被设成「整场同声」，试听也该用粤语示例文本，
+ * 否则 MiniMax 会用粤语音色念普通话文字 → 广式普通话。
+ * 返回 "yue" | "en" | "zh"。
+ */
+export function previewLangForVoice(voice: string): "yue" | "en" | "zh" {
+  const v = String(voice || "");
+  if (/^Cantonese_/i.test(v)) return "yue";
+  if (/^male_english_speaker|^female_english_speaker|_english_/i.test(v)) return "en";
+  return "zh";
+}

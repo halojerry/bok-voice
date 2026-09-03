@@ -5,6 +5,7 @@ import { api } from "@/lib/api";
 import { ErrorState, LoadingState } from "@/components/app-shell";
 import DesktopStatus from "@/components/desktop-status";
 import { SETTING_CARDS, POLICY_META, DEFAULT_PROVIDER, type ProviderKind, type FieldMeta } from "@/lib/settings-meta";
+import { previewLangForVoice } from "@/lib/minimax-voices";
 import {
   applyOutputDevice,
   isTauriShell,
@@ -156,10 +157,13 @@ function VoicePreview({ provider, fieldKey, voice }: { provider: string; fieldKe
     setBusy(true);
     setErr("");
     try {
-      const lang = fieldKey === "speaker_yue" ? "yue" : fieldKey === "speaker_en" ? "en" : "zh";
+      // 云端音色：试听语言按音色 ID 判定（Cantonese_*→粤语示例），否则粤语音色会被用来
+      // 念普通话文字 → 广式普通话。本地 Qwen3（serena/vivian…）仍是多语本地音色，按字段语言。
+      const isCloud = provider === "minimax" || provider === "minimax_streaming" || provider === "volcano_streaming";
+      const lang = isCloud ? previewLangForVoice(voice) : fieldKey === "speaker_yue" ? "yue" : fieldKey === "speaker_en" ? "en" : "zh";
       const text =
         lang === "yue"
-          ? "你好，我係想問下件貨而家到咗邊度？"
+          ? "你好，我係想問下件貨而家到咗邊度？唔該幫我 check 下 status 呀。"
           : lang === "en"
             ? "Hello, I'd like to ask about your delivery."
             : "你好，我想了解一下你们的产品和服务。";
