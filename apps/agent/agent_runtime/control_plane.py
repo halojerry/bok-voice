@@ -71,11 +71,16 @@ class ControlPlaneClient:
         return r.json()
 
     async def report_whatsapp(self, call_id: str, number: str = "") -> None:
-        """上報偵測到客戶俾 WhatsApp。number 有值=captured,空=offered。fire-and-forget。"""
-        await self._client.post(
+        """上報偵測到客戶俾 WhatsApp。number 有值=captured,空=offered。fire-and-forget。
+
+        raise_for_status 俾 caller 知失敗(清 key 等下次偵測補報)——server 幂等,
+        重複 POST 唔會造成重複爆閃。
+        """
+        r = await self._client.post(
             f"/api/calls/{call_id}/whatsapp",
             json={"number": number},
         )
+        r.raise_for_status()
 
     async def aclose(self) -> None:
         await self._client.aclose()

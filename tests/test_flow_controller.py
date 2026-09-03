@@ -328,6 +328,24 @@ def test_detect_whatsapp_captured_prefers_context_not_single_number():
     assert detect_whatsapp_signal("我個單號係 一二三四五六七八九零", step_goal=WA_GOAL, step_ref=WA_REF, facts=F) is None
 
 
+def test_detect_whatsapp_give_number_cue():
+    """「俾個號你」都係俾號語境——唔淨係靠 whatsapp/微信/號碼字眼。
+
+    防回歸:「俾個號」得個「號」字(冇「碼」)、又唔喺要 WhatsApp 步度(例如賠償步
+    客主動俾號)→ 舊 code `"俾.*號" in t` 係字面子串永唔中 → 俾號都當冇俾 → 漏 captured。
+    """
+    from agent_runtime.flow import detect_whatsapp_signal
+    # 非 WhatsApp 步(賠償步)客主動「俾個號你」+ 報號 → 當 WhatsApp 號(captured)
+    assert detect_whatsapp_signal(
+        "咁我俾個號你啦, 68681234", step_goal="說明賠償標準", step_ref="一賠二"
+    ) == ("captured", "68681234")
+    assert detect_whatsapp_signal(
+        "你加我啦,我俾你個號 98526633", step_goal="說明賠償標準", step_ref="一賠二"
+    ) == ("captured", "98526633")
+    # 冇俾號語境淨係報號 → 唔當(保持舊行為)
+    assert detect_whatsapp_signal("我電話 13800000000", step_goal="說明賠償標準", step_ref="一賠二") is None
+
+
 def test_should_auto_advance_whatsapp_captured_implicit():
     """captured_implicit(綁定來電)同 captured 一樣放行推進;offered/None 停留。"""
     from agent_runtime.flow import should_auto_advance

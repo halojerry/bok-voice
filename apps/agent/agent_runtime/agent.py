@@ -756,6 +756,13 @@ async def entrypoint(ctx):
         # 绑了分步话术(has_steps)的封闭流程默认跳过检索——单对象只上话术，
         # 减少每轮 prefill；开放咨询(无模板)才 RAG。CONTEXT_RAG=1 强制开。
         try:
+            if role == "assistant":
+                # 与 _on_conversation_item 同守则:教学/发音课程唔落对话记忆——转录落咗罐頭,
+                # 記憶都唔可以留原稿,否则下次摘要/回复会引用一段从未播出嘅内容。
+                text = lecture_guard(
+                    text,
+                    language_state.lang if language_state.lang in ("zh", "cantonese", "yue") else None,
+                )
             if role == "user" and _context_rag_enabled(flow_ctrl.has_steps if flow_ctrl else False):
                 from .web_search import web_search_text
 
@@ -856,8 +863,10 @@ async def entrypoint(ctx):
                 # 语言锚定（粤语客服始终讲粤语）：默认用锚语言(greet_lang)回复，只有
                 # 客户连续多轮明显讲其它语言才跟随。计算出的回复语言写回 language_state，
                 # 供 LLM 指令/联网语言使用；TTS 音色已固定不受影响。
+                # 注意：唔好喺 call 前把 sticky 重置成 cur——sticky/streak 係跨轮状态，
+                # 重置咗就永遠得 1 輪、客户講一句普通話即切（連續 threshold 輪先跟嘅
+                # hysteresis 根本唔會生效）。保留上一輪 sticky 傳入,由函數累加 streak。
                 cur = language_state.lang
-                _lang_sticky["sticky"], _lang_sticky["streak"] = cur, _lang_sticky.get("streak", 0)
                 reply_lang, _lang_sticky["sticky"], _lang_sticky["streak"] = _sticky_reply_language(
                     greet_lang if greet_lang in {"zh", "cantonese", "en"} else "zh",
                     cur,
@@ -892,7 +901,17 @@ async def entrypoint(ctx):
                             _key = _num or "offered"
                         if _key not in _wa_reported:
                             _wa_reported.add(_key)
-                            asyncio.create_task(cp.report_whatsapp(call_id, _num))
+
+                            async def _report():
+                                try:
+                                    await cp.report_whatsapp(call_id, _num)
+                                except Exception as exc:  # pragma: no cover
+                                    # 上报失败唔好永久丢:清 key,後續輪再偵測到會補報
+                                    # (server 幂等,重複 POST 唔會造成重複爆閃)。
+                                    _wa_reported.discard(_key)
+                                    print(f"[whatsapp] report failed, will retry on next signal: {exc!r} (call {room_name})", flush=True)
+
+                            asyncio.create_task(_report())
                             print(f"[whatsapp] {_kind} num={_num or '-'} (call {room_name})", flush=True)
             except Exception:  # pragma: no cover - WhatsApp 偵測失敗唔阻斷
                 pass

@@ -210,6 +210,8 @@ _WHATSAPP_DECLINE = re.compile(r"(冇whatsapp|冇用whatsapp|無whatsapp|唔用w
     r"唔方便加|冇得加|無得加|唔識加|唔加|唔想加|冇電話|無電話)", re.IGNORECASE)
 # offered 两路:①明確叫加(你加我/我加/加咗/搵我/發俾我);②纯短应承(成句好短,唔係答其他内容)。
 _WHATSAPP_ADD_VERB = re.compile(r"(你(哋|地)?加我|加我|我加咗|我加|加咗|加啦|加喇|搵我|你(哋|地)?發俾我|發俾我|快啲加|嚟加)", re.IGNORECASE)
+# 俾號語境:「我俾個號你 / 俾號碼你」→ 唔好淨靠 號碼/号码 字眼(「俾個號」冇「碼」都會走漏)。
+_WHATSAPP_GIVE_NUM_RE = re.compile(r"俾.{0,6}[號号]")
 _WHATSAPP_ACK_WORDS = ("好呀", "好丫", "好既", "好嘅", "好阿", "可以", "冇問題", "沒問題", "没问题", "無問題", "都得", "得呀", "嗯", "好", "得", "ok", "okay", "嗯嗯", "好呀好呀", "可以可以", "好嘅好嘅")
 # 句子提及其他话题(单号/电话/自己身份/地址/订单)→ 唔係应承加,唔触发 offered
 _WHATSAPP_TOPIC_MARK = re.compile(r"(單號|单号|號碼|号码|電話|电话|地址|訂單|订单|貨件|货件|貨|件野|我係|我是|包裹|速遞|物流)", re.IGNORECASE)
@@ -331,7 +333,7 @@ def detect_whatsapp_signal(
     in_wa_step = _looks_like_whatsapp_step(step_goal, step_ref)
     low = t.lower()
     # WhatsApp 語境:句中明確講 whatsapp/微信/俾號/加我 → 出現嘅號碼優先當客戶俾嘅號。
-    wa_ctx = ("whatsapp" in low) or ("微信" in t) or ("俾.*號" in t) or ("号碼" in t) or ("号码" in t) or ("加我" in t)
+    wa_ctx = ("whatsapp" in low) or ("微信" in t) or bool(_WHATSAPP_GIVE_NUM_RE.search(t)) or ("号碼" in t) or ("号码" in t) or ("加我" in t)
     runs = _valid_digit_runs(norm)
     caller_bound = in_wa_step and _WHATSAPP_CALLER_BOUND.search(t)
     if runs:

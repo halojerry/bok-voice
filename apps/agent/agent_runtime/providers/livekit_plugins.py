@@ -1214,6 +1214,18 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
         # 教学形拦截已触发过就唔再重复播罐头(同段后续课程句静默丢弃)。
         self._lecture_fired = False
 
+    async def _emit_beep(self, output_emitter):
+        import math
+
+        sr = self._tts_.sample_rate
+        n = int(sr * 0.4)
+        pcm = bytearray()
+        for i in range(n):
+            v = int(12000 * math.sin(2 * math.pi * 440 * i / sr))
+            pcm += v.to_bytes(2, "little", signed=True)
+        output_emitter.push(bytes(pcm))
+        output_emitter.flush()
+
     async def _run(self, output_emitter):
         import websockets
 
@@ -1221,10 +1233,12 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
             key = self._tts_._api_key()
             if not key:
                 print("MINIMAX_TTS_MISSING_CREDENTIALS", flush=True)
+                await self._emit_beep(output_emitter)
                 return
             voice = self._tts_._resolve_voice()
             if not voice:
                 print("MINIMAX_TTS_NO_VOICE", flush=True)
+                await self._emit_beep(output_emitter)
                 return
             print(f"MINIMAX_TTS_VOICE {voice} lang={self._tts_._language_state.lang}", flush=True)
             sample_rate = self._tts_.sample_rate
@@ -1238,8 +1252,14 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            # 连唔到 WS 冇音频可推(livekit 会 APIError no audio frames → 静音吞回复)。
+            # 呢个 streaming 路径唔像 ChunkedStream 咁有 HTTP 回退——播一声 beep
+            # 令客户知 AI 有反应过,至少唔係无差别静音。
             print("MINIMAX_TTS_WS_CONNECT", repr(exc), flush=True)
-            # WS 连不上 → 回退整段 synthesize(StreamAdapter 包装,端到端仍出声)
+            try:
+                await self._emit_beep(output_emitter)
+            except Exception:  # pragma: no cover
+                pass
             return
 
         init_done = False
@@ -1270,9 +1290,17 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                 resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
                 if resp.get("event") != "task_started":
                     print("MINIMAX_TTS_WS_START_FAIL", str(resp)[:200], flush=True)
+                    try:
+                        await self._emit_beep(output_emitter)
+                    except Exception:  # pragma: no cover
+                        pass
                     return
             except Exception as exc:
                 print("MINIMAX_TTS_WS_START", repr(exc), flush=True)
+                try:
+                    await self._emit_beep(output_emitter)
+                except Exception:  # pragma: no cover
+                    pass
                 return
 
             async def _recv_loop():
