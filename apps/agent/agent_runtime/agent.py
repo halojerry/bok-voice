@@ -562,14 +562,16 @@ async def entrypoint(ctx):
         # - interruption 保持自适应（无模型时自动回退 VAD），min_duration 收紧到 0.35s
         turn_handling=TurnHandlingOptions(
             endpointing={
+                # dynamic 自适应，min 0.35s 加速切句；max 收紧到 1.2s——
+                # 以前 max 2.0s 会在客户停顿/句子间隙空等最多 2 秒，很"没通话感"。
                 "mode": "dynamic",
                 "min_delay": float(os.environ.get("ENDPOINT_MIN_DELAY", "0.35")),
-                "max_delay": float(os.environ.get("ENDPOINT_MAX_DELAY", "2.0")),
+                "max_delay": float(os.environ.get("ENDPOINT_MAX_DELAY", "1.2")),
             },
             preemptive_generation={
-                # 默认关闭：preemptive 会在用户句确认前抢先生成，导致回复与上下文
-                # 错位（观察：粤语轮偶发回普通话问候）。关闭只损失少量首包延迟，
-                # 换取每轮回复严格基于已确认的用户输入（可用 PREEMPTIVE_GENERATION=1 开启）。
+                # 预生成依赖 ASR 的 interim/preflight 提前量，而 Qwen3-ASR 是离线式
+                # (用户整句说完 VAD flush 才出 FINAL_TRANSCRIPT、无 interim)，开了也没有
+                # 提前量可抢。保持关闭避免无谓占用。真提速靠缩短 endpointing + 回复变短。
                 "enabled": os.environ.get("PREEMPTIVE_GENERATION", "0") == "1",
                 "preemptive_tts": os.environ.get("PREEMPTIVE_TTS", "1") == "1",
                 "max_speech_duration": 10.0,

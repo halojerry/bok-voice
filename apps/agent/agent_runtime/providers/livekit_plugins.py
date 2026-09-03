@@ -128,7 +128,7 @@ class OpenAICompatLLM(llm.LLM):
         super().__init__()
         self._model = model
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-        self._max_tokens = int(os.environ.get("LLM_MAX_TOKENS", "256"))
+        self._max_tokens = int(os.environ.get("LLM_MAX_TOKENS", "160"))
 
     def chat(self, *, chat_ctx, tools=None, conn_options=None, parallel_tool_calls=None, tool_choice=None, extra_kwargs=None):
         messages = _chat_messages(chat_ctx)
@@ -381,6 +381,13 @@ class ContextState:
                     "不要解释你正在使用什么语言，不要添加任何注释或括号。"
                 )
             parts.append(f"【用户语言】当前用户正在使用：{name}。{rule}")
+        # 语音通话的节奏约束：客服回复要短、口语、像打电话——一次只推进一件事，
+        # 说太长会把客户堵住、也拖慢每轮。这是"通话感"的关键。
+        parts.append(
+            "【回复节奏】这是语音通话，一次回复要简短口语，像真人打电话：最多 2~3 句，"
+            "每句尽量短（一句话 20 字内更佳），不要一次把所有信息/方案/步骤都讲完；"
+            "讲完当前要点就停下把话交回客户，等客户回应再继续下一步。"
+        )
         # 客服应答准则：永不主动说"不知道/查不到"，知识不够时用客服话术兜住。
         # 这是客服与聊天机器人的本质区别——客户要的是被接住，不是被拒绝。
         parts.append(
