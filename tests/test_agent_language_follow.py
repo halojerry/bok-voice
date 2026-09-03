@@ -178,3 +178,28 @@ def test_zh_rule_has_no_hk_style():
     ctx.set_user_language("zh")
     text = ctx.render_system_message()
     assert "港式" not in text
+
+
+# ---- 粤语客服语言锚定：始终讲粤语，仅连续多轮才跟随客户切语言 ----
+def test_sticky_yue_agent_single_mandarin_turn_stays_yue():
+    from agent_runtime.agent import _sticky_reply_language
+    # 锚 yue；客户单轮普通话 → 仍回 yue(streak 记 1)。
+    rl, sticky, streak = _sticky_reply_language("yue", "zh", "yue", 0)
+    assert rl == "yue" and sticky == "yue" and streak == 1
+    # 下一轮仍是普通话 → 跟随切 zh。
+    rl, sticky, streak = _sticky_reply_language("yue", "zh", sticky, streak)
+    assert rl == "zh" and sticky == "zh"
+
+
+def test_sticky_yue_back_to_yue_resets():
+    from agent_runtime.agent import _sticky_reply_language
+    # 已切到 zh，客户回粤语 → 立刻回锚 yue。
+    rl, sticky, streak = _sticky_reply_language("yue", "yue", "zh", 0)
+    assert rl == "yue" and sticky == "yue" and streak == 0
+
+
+def test_sticky_no_anchor_follows_asr():
+    from agent_runtime.agent import _sticky_reply_language
+    # 无有效锚(空) → 退化为跟随 ASR。
+    rl, sticky, streak = _sticky_reply_language("", "zh", "", 0)
+    assert rl == "zh"

@@ -107,6 +107,33 @@ def _collapse_voice_map(raw_map: dict, persona_lang: str) -> dict:
 _LANG_LABELS = {"zh": "普通话/中文", "yue": "粤语", "en": "英语"}
 
 
+def _sticky_reply_language(anchor: str, asr_lang: str, cur_sticky: str, cur_streak: int, threshold: int = 2) -> tuple[str, str, int]:
+    """粤语客服「始终讲粤语」的语言锚定规则。
+
+    - anchor：客服锚定语言（人设/对象语言，如 yue）。LLM 默认始终用它回复。
+    - 只有 ASR 连续 threshold 轮判为同一【非锚】语言（且都是强证据才进得来）才跟随切换；
+    - 一旦某轮回到锚语言，立刻回锚、清计数；
+    - 已切走后客户又讲第三种语言，也回锚（粤语客服优先讲粤语，不跨语言乱跳）。
+    返回 (reply_lang, new_sticky, new_streak)。
+    """
+    if anchor not in {"zh", "yue", "en"}:
+        # 无有效锚定（未知/缺失）：直接跟随 ASR，退化为旧行为。
+        return asr_lang, asr_lang, 0
+    if asr_lang == anchor:
+        return anchor, anchor, 0
+    if asr_lang not in {"zh", "yue", "en"}:
+        return cur_sticky, cur_sticky, cur_streak
+    if cur_sticky == anchor:
+        # 仍在锚语言上，连续看到非锚轮。
+        if cur_streak + 1 >= threshold:
+            return asr_lang, asr_lang, 0  # 客户确实切语言了（连续多轮），跟随。
+        return anchor, anchor, cur_streak + 1
+    # 已切到某非锚语言；若客户仍讲同一非锚语言 → 保持；换回锚/第三种 → 回锚。
+    if asr_lang == cur_sticky:
+        return cur_sticky, cur_sticky, 0
+    return anchor, anchor, 0
+
+
 def _normalize_lang(raw, default: str = "") -> str:
     """把对象/人设里的语言值归一为 zh/yue/en。vi 等未支持语言回落到 default。"""
     key = (raw or "").strip().lower()
@@ -335,6 +362,8 @@ async def entrypoint(ctx):
     # 未设置时回落到对象(客户)语言；再退回普通话。之后每轮由 ASR 检出的客户语言覆盖。
     greet_lang = _normalize_lang((persona or {}).get("language")) or _normalize_lang((object_card or {}).get("language")) or "zh"
     language_state.lang = greet_lang
+    # 粤语客服锚定：LLM 默认始终用锚语言（greet_lang），只有客户连续多轮明显讲其它语言才跟随。
+    _lang_sticky: dict = {"sticky": greet_lang if greet_lang in {"zh", "yue", "en"} else "zh", "streak": 0}
     from .plugins.emotion import EmotionState
 
     emotion_state = EmotionState()
@@ -598,9 +627,9 @@ async def entrypoint(ctx):
         text = getattr(item, "text_content", None) or getattr(item, "raw_text_content", "") or ""
         if text:
             if role == "user":
-                # 同步注入：用 ASR 检测到的用户语言约束本轮回回复语言。
-                # 必须在异步检索之前设置，否则 LLM 请求可能先于指令注入发出。
-                context_state.set_user_language(language_state.lang)
+                # 只触发异步检索；回复语言由 on_user_turn_completed 锚定后统一注入，
+                # 避免这里读到 ASR 原始 lang 抢先注入造成竞态。
+                pass
             asyncio.create_task(_async_update_context(role, text))
 
     # 会话关闭事件：置位后 supervisor watcher 退出、结算触发。
@@ -630,7 +659,19 @@ async def entrypoint(ctx):
             # 此时 ASR 已把 language_state 更新为本轮语言。若只挂在 conversation_item_added
             # 事件上，会晚于 LLM 请求发出（竞态）→ 模型收不到本轮粤语指令而回普通话。
             try:
-                context_state.set_user_language(language_state.lang)
+                # 语言锚定（粤语客服始终讲粤语）：默认用锚语言(greet_lang)回复，只有
+                # 客户连续多轮明显讲其它语言才跟随。计算出的回复语言写回 language_state，
+                # 供 LLM 指令/联网语言使用；TTS 音色已固定不受影响。
+                cur = language_state.lang
+                _lang_sticky["sticky"], _lang_sticky["streak"] = cur, _lang_sticky.get("streak", 0)
+                reply_lang, _lang_sticky["sticky"], _lang_sticky["streak"] = _sticky_reply_language(
+                    greet_lang if greet_lang in {"zh", "yue", "en"} else "zh",
+                    cur,
+                    _lang_sticky["sticky"],
+                    _lang_sticky["streak"],
+                )
+                language_state.lang = reply_lang
+                context_state.set_user_language(reply_lang)
             except Exception:  # pragma: no cover - 语言注入失败不致命
                 pass
             # 流程推进:读用户最新话,判定是否进入下一步,更新"当前步"约束注入。

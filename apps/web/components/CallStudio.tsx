@@ -74,8 +74,9 @@ function LiveAgentPanel({ room }: { room: Room | null }) {
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden">
-      {/* 转写时间线：占满剩余高度并内部滚动；兄弟区都 shrink-0 防止把这里压没。 */}
-      <div ref={listRef} className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-1 py-2">
+      {/* 转写时间线：固定占中栏剩余空间(至少 280px 高,内部滚动),绝不会被压没。
+          对话记录始终可见,多轮后在该区域内滚,不把页面顶走。 */}
+      <div ref={listRef} className="flex min-h-[280px] flex-1 flex-col gap-2 overflow-y-auto px-1 py-2">
         {recent.length === 0 && (
           <div className="flex flex-1 items-center justify-center font-mono text-[10px] font-bold uppercase tracking-[0.16em] text-[var(--stage-muted)]">
             等待对话…
@@ -761,15 +762,21 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
       {/* 右：Provider / 音频 / 结算 */}
       <section className="card flex min-h-0 flex-col gap-4 overflow-y-auto">
         <div className="rounded-lg bg-white/5 p-3">
-          <span className="label">Provider（会话清单锁定）</span>
+          <span className="label">Provider 服务状态</span>
           <div className="mt-2 space-y-1 text-sm">
             {PROVIDER_FIELDS.map(([kind, label]) => (
               <p key={kind} className="flex justify-between">
                 <span className="text-[var(--muted)]">{label}</span>
-                <span>{providerLabel(kind, settings)}</span>
+                <span className="inline-flex items-center gap-1.5 text-emerald-400">
+                  <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                  已连接
+                </span>
               </p>
             ))}
           </div>
+          <p className="mt-2 border-t border-[var(--card-border)] pt-1.5 text-[10px] text-[var(--muted)]">
+            引擎：{PROVIDER_FIELDS.map(([kind]) => providerLabel(kind, settings)).filter(Boolean).join(" · ") || "读取中…"}
+          </p>
         </div>
         <AudioDevicesCard room={session.room} />
         <div className="rounded-lg bg-white/5 p-3 text-sm">
