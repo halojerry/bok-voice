@@ -413,22 +413,25 @@ class SqlAlchemyBusinessRepository:
             # (mlx_lm on macOS, llama-server on Windows). Zero-Ollama.
             # local_model: 本地模型选择(ML Studio repo),bok serve 据此起 :1235 模型;空用默认。
             "llm": {"provider": "local_openai", "model": "", "base_url": "http://127.0.0.1:1235/v1", "local_model": ""},
-            # TTS：provider= qwen3_tts | volcano_streaming | fake；音色按语言 speaker_zh/yue/en（persona 绑定音色优先）。
+            # TTS：provider= qwen3_tts | volcano_streaming | fake；音色按语言
+            # speaker_zh/speaker_cantonese/en（persona 绑定音色优先；旧键 speaker_yue 已迁移）。
             "tts": {
                 "provider": "qwen3_tts",
                 "base_url": "http://127.0.0.1:8788",
                 "speaker_zh": "",
-                "speaker_yue": "",
+                "speaker_cantonese": "",
                 "speaker_en": "",
                 "instruct": "",
                 "sample_rate": 24000,
             },
             # VAD/打断：agent 运行时会读取（不再走环境变量），interruption 控制打断开关。
+            # min_silence_duration 0.45：离线式 ASR 从停嘴到转写回来需 ~0.5-1.2s，
+            # 端点判定要等得起它；低于 ~0.3 会「转写晚于轮次提交」被丢弃 → agent 不回话。
             "vad": {
                 "provider": "silero",
                 "max_buffered_speech": 15.0,
                 "min_speech_duration": 0.15,
-                "min_silence_duration": 0.35,
+                "min_silence_duration": 0.45,
                 "interruption": True,
             },
             "policy": "offline_first",
@@ -468,6 +471,8 @@ class InMemoryBusinessRepository:
             "template_id": getattr(manifest, "template_id", "") or "",
             "mode": manifest.mode.value if isinstance(manifest.mode, CallMode) else str(manifest.mode),
             "status": CallStatus.RINGING.value,
+            "whatsapp_status": "",
+            "customer_whatsapp": "",
         }
         return self.calls[call_id]
 

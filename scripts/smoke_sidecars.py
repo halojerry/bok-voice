@@ -88,7 +88,7 @@ def main() -> None:
         preset_texts = [
             ("zh", "你好，欢迎致电博克，请问有什么可以帮您？", "Vivian"),
             ("en", "Hello, welcome to Bok. How can I help you today?", "Vivian"),
-            ("yue", "你好，歡迎致電博克，請問有咩可以幫到你？", "Vivian"),
+            ("cantonese", "你好，歡迎致電博克，請問有咩可以幫到你？", "Vivian"),
         ]
         tts_results = {}
         for lang, text, speaker in preset_texts:
@@ -115,14 +115,14 @@ def main() -> None:
         ref_text = asr_results["yue.wav"][0]
         assert_step("yue ref transcript available", bool(ref_text), ref_text)
         files = {"file": ("yue.wav", ref.read_bytes(), "audio/wav")}
-        data = {"voice_id": "yue-clone-1", "ref_text": ref_text, "language": "yue"}
+        data = {"voice_id": "yue-clone-1", "ref_text": ref_text, "language": "cantonese"}
         reg = client.post(f"{TTS}/v1/voices/register", files=files, data=data)
         reg.raise_for_status()
         reg_json = reg.json()
         assert_step("voice clone registered", reg_json.get("voice_id") == "yue-clone-1", reg_json)
 
         clone_texts = [
-            ("yue", "你好，歡迎致電博克，我哋支持粵語實時通話。"),
+            ("cantonese", "你好，歡迎致電博克，我哋支持粵語實時通話。"),
             ("zh", "你好，欢迎致电博克，我们支持粤语实时通话。"),
             ("en", "Hello, this is Bok. We support realtime Cantonese calls."),
         ]
@@ -142,7 +142,7 @@ def main() -> None:
         #    yue must come back Cantonese (ICL-driven accent); en must stay English.
         #    zh is intentionally skipped: a Cantonese-cloned voice reading Mandarin
         #    text is expected to keep the Cantonese accent and ASR tags it Cantonese.
-        clone_lang_expect = {"yue": "Cantonese", "en": "English"}
+        clone_lang_expect = {"cantonese": "Cantonese", "en": "English"}
         for lang, wav_path in clone_results.items():
             if lang not in clone_lang_expect:
                 print(f"    clone-{lang} -> (language-tag assert skipped by design)")

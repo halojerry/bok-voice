@@ -172,7 +172,7 @@ export function createWorker(config, { metricsSink = appendMetrics, ttsVoices = 
   return wss;
 }
 
-// 从 control-plane 拉取 TTS 三语言音色（speaker_zh/yue/en），让 B 线合成时按目标语言
+// 从 control-plane 拉取 TTS 三语言音色（speaker_zh/speaker_cantonese/en），让 B 线合成时按目标语言
 // 选粤语克隆/预设音色（否则默认普通话 Vivian 念粤语会「夹生」）。失败降级空 map（不崩）。
 // control-plane 固定本机 127.0.0.1:8000（A/B 线同栈）。
 async function loadTtsVoices(config) {
@@ -182,7 +182,8 @@ async function loadTtsVoices(config) {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const s = await r.json();
     const t = s.tts || {};
-    const voices = { zh: t.speaker_zh || "", yue: t.speaker_yue || "", en: t.speaker_en || "" };
+    // speaker_cantonese 为新键；speaker_yue 兼容旧数据（DB 迁移后只剩新键）。
+    const voices = { zh: t.speaker_zh || "", yue: t.speaker_cantonese || t.speaker_yue || "", en: t.speaker_en || "" };
     console.log("[worker] tts voices (from control-plane):", JSON.stringify(voices));
     return voices;
   } catch (err) {

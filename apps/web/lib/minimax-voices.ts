@@ -9,7 +9,7 @@
  * 全角括号等特殊字符的 voice_id（如 Cantonese_ProfessionalHost（F)）会 2054 voice-not-exist。
  */
 
-export type MinimaxVoiceLang = "yue" | "zh" | "en";
+export type MinimaxVoiceLang = "cantonese" | "zh" | "en";
 
 export interface MinimaxVoiceEntry {
   id: string;
@@ -17,7 +17,7 @@ export interface MinimaxVoiceEntry {
   lang: MinimaxVoiceLang;
 }
 
-const YUE: Array<[string, string]> = [
+const CANTONESE: Array<[string, string]> = [
   // 用户补充的 5 个主播/记者系（已逐个试听 200）
   ["Cantonese_crisp_news_anchor_vv2", "清脆新闻主播"],
   ["Cantonese_crisp_reporter_vv2", "清脆记者"],
@@ -48,13 +48,13 @@ const EN: Array<[string, string]> = [
 ];
 
 export const MINIMAX_VOICE_ENTRIES: MinimaxVoiceEntry[] = [
-  ...YUE.map(([id, label]) => ({ id, label, lang: "yue" as const })),
+  ...CANTONESE.map(([id, label]) => ({ id, label, lang: "cantonese" as const })),
   ...ZH.map(([id, label]) => ({ id, label, lang: "zh" as const })),
   ...EN.map(([id, label]) => ({ id, label, lang: "en" as const })),
 ];
 
 export const MINIMAX_VOICE_LANG_LABEL: Record<MinimaxVoiceLang, string> = {
-  yue: "粤语",
+  cantonese: "粤语",
   zh: "普通话",
   en: "英语",
 };
@@ -76,11 +76,11 @@ export function allMinimaxVoiceOptions() {
  * 试听用哪种语言/文本：按音色 ID 判定，而不是按字段标签。
  * 粤语音色（Cantonese_*）即使被设成「整场同声」，试听也该用粤语示例文本，
  * 否则 MiniMax 会用粤语音色念普通话文字 → 广式普通话。
- * 返回 "yue" | "en" | "zh"。
+ * 返回 "cantonese" | "en" | "zh"。
  */
-export function previewLangForVoice(voice: string): "yue" | "en" | "zh" {
+export function previewLangForVoice(voice: string): MinimaxVoiceLang {
   const v = String(voice || "");
-  if (/^Cantonese_/i.test(v)) return "yue";
+  if (/^Cantonese_/i.test(v)) return "cantonese";
   if (/^male_english_speaker|^female_english_speaker|_english_/i.test(v)) return "en";
   return "zh";
 }

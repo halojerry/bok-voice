@@ -22,7 +22,7 @@ cd services/realtime-translation && npm ci && npm test   # B-line Node tests
 cd desktop/src-tauri && cargo test      # Rust shell tests
 python tools/bok.py serve               # start the full local stack
 python tools/bok.py status | down | doctor --packaged
-E2E_ONLY=yue .venv312/bin/python scripts/e2e_trilingual_livekit.py  # A-line E2E
+E2E_ONLY=cantonese .venv312/bin/python scripts/e2e_trilingual_livekit.py  # A-line E2E
 cd apps/web && npm run build            # static web export
 cd desktop && npx tauri build --bundles app   # macOS bundle
 ```
