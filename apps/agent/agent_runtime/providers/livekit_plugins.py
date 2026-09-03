@@ -248,9 +248,9 @@ class _OpenAICompatStream:
                         messages=messages,
                         stream=True,
                         max_tokens=max_tokens,
-                        # 专业客服取中低温：过高显油滑/跑题/乱码（本地 9B 更明显），过低像念稿。
-                        # 0.4 让语气自然但稳定克制；可用 env LLM_TEMPERATURE 覆盖。
-                        temperature=float(os.environ.get("LLM_TEMPERATURE", "0.4")),
+                        # 专业客服取中低温：过高显油滑/跑题/乱码，过低像念稿。4B 更小更易
+                        # 飘/复读，0.35 让语气稳定克制（可用 env LLM_TEMPERATURE 覆盖）。
+                        temperature=float(os.environ.get("LLM_TEMPERATURE", "0.35")),
                     )
                     async for chunk in stream:
                         if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
