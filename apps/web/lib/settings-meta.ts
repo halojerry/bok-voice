@@ -10,6 +10,13 @@ import { minimaxVoiceOptionsFor } from "@/lib/minimax-voices";
 export type ProviderKind = "asr" | "llm" | "tts" | "vad";
 export type FieldType = "text" | "number" | "select" | "secret";
 
+/** 本机已装的本地 LLM(ML Studio repo)。切换存 settings.llm.local_model,重启本地服务生效。 */
+export const LOCAL_LLM_MODELS: ProviderOption[] = [
+  { value: "avan-ag/Qwen3.5-4B-Uncensored-MLX-4bit", label: "Qwen3.5 4B（当前默认，快）" },
+  { value: "lmstudio-community/Qwen3.5-2B-MLX-4bit", label: "Qwen3.5 2B（最快，质量弱）" },
+  { value: "huihui-ai/Huihui-Qwen3.5-9B-abliterated-mlx-4bit", label: "Qwen3.5 9B（最稳，较慢）" },
+];
+
 export interface ProviderOption {
   value: string;
   label: string;
@@ -30,6 +37,8 @@ export interface FieldMeta {
   preview?: boolean;
   /** 高级字段：默认收进折叠区，避免干扰主配置（用于旧的分语言音色兼容）。 */
   advanced?: boolean;
+  /** 仅这些 provider(值)显示该字段；缺省=所有 provider 显示。 */
+  providers?: string[];
 }
 
 export interface ProviderMeta {
@@ -65,9 +74,10 @@ export const SETTING_CARDS: ProviderMeta[] = [
       { value: "fake", label: "Fake（仅测试）", hint: "固定脚本回复。" },
     ],
     fields: [
-      { key: "model", label: "模型名", type: "text", hint: "本地默认走环境变量注入的真实模型路径，可留空；deepseek 填如 deepseek-chat。", placeholder: "deepseek-chat" },
-      { key: "base_url", label: "服务地址", type: "text", hint: "本地可留空（启动器已注入 http://127.0.0.1:1235/v1）；deepseek 填 https://api.deepseek.com/v1。", placeholder: "http://127.0.0.1:1235/v1" },
-      { key: "api_key", label: "API Key", type: "secret", hint: "仅 deepseek 需要；已保存的 Key 不会回显。", placeholder: "sk-…" },
+      { key: "local_model", label: "本地模型", type: "select", providers: ["local_openai", "mlx"], hint: "选择本机要用的 LLM（:1235 起哪个模型）。保存后需重启本地服务（bok serve）生效；重启后 agent/蒸馏都用它。", options: LOCAL_LLM_MODELS },
+      { key: "model", label: "模型名", type: "text", hint: "deepseek 填如 deepseek-chat；本地可留空（实际模型由上面「本地模型」决定）。", placeholder: "deepseek-chat" },
+      { key: "base_url", label: "服务地址", type: "text", providers: ["deepseek"], hint: "本地由启动器注入；deepseek 填 https://api.deepseek.com/v1。", placeholder: "http://127.0.0.1:1235/v1" },
+      { key: "api_key", label: "API Key", type: "secret", providers: ["deepseek"], hint: "仅 deepseek 需要；已保存的 Key 不会回显。", placeholder: "sk-…" },
     ],
   },
   {

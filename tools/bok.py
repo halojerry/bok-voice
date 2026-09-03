@@ -130,6 +130,39 @@ def model_path(current: dict[str, str], name: str) -> str:
     return repo
 
 
+def _settings_llm_local_model() -> str:
+    """读设置页存的本地 LLM 模型(settings.llm.local_model);失败/空回退 ""。
+
+    bok serve 决定 :1235 起哪个模型时优先用用户选定的模型;控制面/agent 注入的
+    MLX_LLM_MODEL 与 Summarizer 用同一本机模型,必须保持一致。DB 不存在/损坏
+    时静默回退默认,不让启动器因设置问题崩。
+    """
+    try:
+        import sqlite3
+
+        db_path = app_data_dir() / "bok_voice.db"
+        if not db_path.exists():
+            return ""
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+        try:
+            row = con.execute(
+                "SELECT llm_json FROM global_settings WHERE id='global'"
+            ).fetchone()
+            if not row or not row[0]:
+                return ""
+            return str((json.loads(row[0]) or {}).get("local_model") or "").strip()
+        finally:
+            con.close()
+    except Exception:
+        return ""
+
+
+def resolve_llm_repo(current: dict[str, str]) -> str:
+    """选定要启动/注入的本地 LLM repo:设置页 local_model 优先,空用默认 current."""
+    override = _settings_llm_local_model()
+    return override or (current.get("llm") or "")
+
+
 def sidecar_python(name: str) -> Path:
     """Bundled runtime python, else the repo venv for that service."""
     if os.name == "nt":
@@ -449,7 +482,7 @@ def write_bline_config(current: dict[str, str] | None = None) -> Path:
             "provider": "local_openai",
             "base_url": "http://127.0.0.1:1235/v1",
             # mlx_lm server 要求请求里的 model 是真实模型路径，不能用 "local"。
-            "model": model_path(current, "llm"),
+            "model": model_path({**current, "llm": resolve_llm_repo(current)}, "llm"),
         },
         "tts": {"provider": "qwen3_tts", "base_url": "http://127.0.0.1:8788", "sample_rate": 24000},
         "server": {
@@ -469,7 +502,8 @@ def _control_plane_env(db: Path | str) -> dict[str, str]:
     /api/token issues a real JWT instead of the old sha256 dev fallback."""
     # 结算摘要/蒸馏（Summarizer）用同一本机 MLX：settings 里的 llm 卡片可能是空 base_url /
     # 占位 model="local"，真实地址由这里注入（与 agent worker L667 同源）。
-    llm_model = model_path(MODELS["mac"] if is_mac() else MODELS["windows"], "llm")
+    _cur = MODELS["mac"] if is_mac() else MODELS["windows"]
+    llm_model = model_path({**_cur, "llm": resolve_llm_repo(_cur)}, "llm")
     return {
         "PYTHONPATH": _repo_pythonpath(),
         "BOK_SERVICE": "control-plane",
@@ -486,7 +520,7 @@ def _control_plane_env(db: Path | str) -> dict[str, str]:
 def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
     if healthy(1235):
         return
-    llm_model = model_path(current, "llm")
+    llm_model = model_path({**current, "llm": resolve_llm_repo(current)}, "llm")
     if is_mac():
         llm_py = sidecar_python("llm-mlx")
         _start_proc(
@@ -665,6 +699,7 @@ def cmd_serve() -> int:
 
     # Agent worker registers to the embedded/local LiveKit server.
     if healthy(7880):
+        _cur = MODELS["mac"] if is_mac() else MODELS["windows"]
         agent_env: dict[str, str] = {
             "PYTHONPATH": _repo_pythonpath(),
             "BOK_SERVICE": "agent",
@@ -673,7 +708,7 @@ def cmd_serve() -> int:
             "LIVEKIT_API_SECRET": os.environ.get("LIVEKIT_API_SECRET", "devsecret"),
             "CONTROL_PLANE_URL": os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000"),
             "MLX_LLM_BASE_URL": os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
-            "MLX_LLM_MODEL": model_path(MODELS["mac"] if is_mac() else MODELS["windows"], "llm"),
+            "MLX_LLM_MODEL": model_path({**_cur, "llm": resolve_llm_repo(_cur)}, "llm"),
         }
         _start_proc([str(py), "-m", "agent_runtime.main"], run_dir / "agent.pid", log_dir / "agent.log", env=agent_env)
 

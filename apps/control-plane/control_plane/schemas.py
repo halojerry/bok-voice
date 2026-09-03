@@ -120,6 +120,10 @@ class ProviderSettings(BaseModel):
     resource_id: str = ""
     app_id: str = ""
     access_token: str = ""
+    # 本地 LLM 模型选择(ML Studio repo,如 avan-ag/Qwen3.5-4B-Uncensored-MLX-4bit):
+    # 由 bok serve 读取,决定 :1235 起哪个模型;空则用 bok 默认。model 字段是请求体里的
+    # 模型名,cloud 用;本地模型切换存这里,避免与 mlx 需要的全路径模型名冲突。
+    local_model: str = ""
     # VAD / 打断（agent 运行时会读取这些值；sensitivity = Silero 激活阈值 0~1，
     # 越高越抗噪，越低越灵敏，agent 侧传给 inference.VAD activation_threshold）
     max_buffered_speech: float = 15.0

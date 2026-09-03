@@ -24,7 +24,7 @@ type ProviderForm = Record<string, unknown> & { provider?: string };
 
 const EMPTY_FORM: Record<ProviderKind, ProviderForm> & { policy: string } = {
   asr: { provider: DEFAULT_PROVIDER.asr },
-  llm: { provider: DEFAULT_PROVIDER.llm },
+  llm: { provider: DEFAULT_PROVIDER.llm, local_model: "" },
   tts: { provider: DEFAULT_PROVIDER.tts, speaker: "", sample_rate: 24000 },
   vad: { provider: DEFAULT_PROVIDER.vad, max_buffered_speech: 15, min_speech_duration: 0.4, min_silence_duration: 0.45, sensitivity: 0.75, interruption: true },
   policy: "offline_first",
@@ -112,7 +112,12 @@ function ProviderCard({
           </select>
           {providerMeta?.hint && <p className="mt-1 text-xs text-[var(--muted)]">{providerMeta.hint}</p>}
         </div>
-        {meta.fields.filter((f) => !f.advanced).map((field) => (
+        {kind === "llm" && (provider === "local_openai" || provider === "mlx") && value.local_model ? (
+          <p className="rounded-lg bg-white/5 p-2 text-[11px] text-[var(--muted)]">
+            本地模型切换需<b className="text-[var(--foreground)]">重启本地服务</b>生效（`bok serve` 或点「本机桌面服务」重启）；重启后通话与蒸馏都用所选模型。
+          </p>
+        ) : null}
+        {meta.fields.filter((f) => !f.advanced && (!f.providers || f.providers.includes(provider))).map((field) => (
           <label key={field.key} className="block">
             <span className="text-xs text-[var(--stage-muted)]">{field.label}</span>
             <FieldInput field={field} value={value[field.key]} onChange={(v) => onChange({ ...value, [field.key]: v })} />
@@ -128,7 +133,7 @@ function ProviderCard({
               高级（旧按语言分音色，仅兼容旧数据）
             </summary>
             <div className="mt-2 space-y-2">
-              {meta.fields.filter((f) => f.advanced).map((field) => (
+              {meta.fields.filter((f) => f.advanced && (!f.providers || f.providers.includes(provider))).map((field) => (
                 <label key={field.key} className="block">
                   <span className="text-xs text-[var(--stage-muted)]">{field.label}</span>
                   <FieldInput field={field} value={value[field.key]} onChange={(v) => onChange({ ...value, [field.key]: v })} />
