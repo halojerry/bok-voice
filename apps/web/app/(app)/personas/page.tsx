@@ -5,6 +5,7 @@ import { api } from "@/lib/api";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
 import { startRecording, type RecorderHandle } from "@/lib/recorder";
+import { allMinimaxVoiceOptions } from "@/lib/minimax-voices";
 
 const EMPTY = { name: "", company: "", tone: "", language: "zh", reference_audio: "", tts_provider: "" };
 const LANGS = [
@@ -18,40 +19,12 @@ function previewTextFor(lang: (typeof LANGS)[number][0], name: string): string {
   const n = name.trim() || "Bok 客服";
   switch (lang) {
     case "yue":
-      return `你好，我係${n}，請問有咩可以幫到你？`;
+      return `你好，我係${n}，唔該想問下件貨而家到咗未？可以幫我 check 下 status 嘛？`;
     case "en":
       return `Hello, this is ${n}. How can I help you today?`;
     default:
       return `你好，我是${n}，请问有什么可以帮您？`;
   }
-}
-
-/** MiniMax 云端音色：粤语 7 个（实测可用）+ 常用中文/英语。引擎=MiniMax 时音色池。 */
-const MINIMAX_VOICES: Record<string, { label: string; lang: string }> = {
-  // 粤语
-  Cantonese_Male_news_anchor_vv2: { label: "男主播 news_anchor_vv2", lang: "yue" },
-  "Cantonese_ProfessionalHost（F)": { label: "专业女主持（F）", lang: "yue" },
-  "Cantonese_ProfessionalHost（M)": { label: "专业男主持（M）", lang: "yue" },
-  Cantonese_GentleLady: { label: "温柔女声", lang: "yue" },
-  Cantonese_PlayfulMan: { label: "活泼男声", lang: "yue" },
-  Cantonese_CuteGirl: { label: "可爱女孩", lang: "yue" },
-  Cantonese_KindWoman: { label: "善良女声", lang: "yue" },
-  // 中文普通话
-  "male-qn-qingse": { label: "青涩青年男声", lang: "zh" },
-  "male-qn-jingying": { label: "精英青年男声", lang: "zh" },
-  "female-shaonv": { label: "少女音", lang: "zh" },
-  "female-yujie": { label: "御姐音", lang: "zh" },
-  "Chinese (Mandarin)_News_Anchor": { label: "新闻女声", lang: "zh" },
-  // 英语
-  male_english_speaker: { label: "英文男声", lang: "en" },
-  female_english_speaker: { label: "英文女声", lang: "en" },
-};
-
-/** MiniMax 按语言可选的音色（只含与当前语言匹配的 + 常用的）。 */
-function minimaxVoiceOptionsFor(lang: string) {
-  return Object.entries(MINIMAX_VOICES)
-    .filter(([, v]) => v.lang === lang)
-    .map(([id, v]) => ({ id, label: v.label }));
 }
 
 /** 本地 Qwen3 预置音色的中文名（音译，便于识别；预置为多语模型，非克隆）。 */
@@ -107,6 +80,20 @@ function parseVoiceMap(raw: unknown): Record<string, string> {
   }
 }
 
+/** 从语音映射选「整场主音色」：优先人设主语言，缺则 zh→yue→首个非空（与 agent 收敛同规则）。 */
+function primaryVoiceFor(lang: string, voiceMap: Record<string, string>): string {
+  const keys = [lang, "zh", "yue", "en"];
+  for (const k of keys) {
+    if (voiceMap[k]) return voiceMap[k];
+  }
+  return Object.values(voiceMap)[0] ?? "";
+}
+
+/** 云端单音色保存时写回 reference_audio（沿用 {zh,yue,en} 兼容结构，全场同声）。 */
+function voiceMapForOneVoice(v: string): Record<string, string> {
+  return v ? { zh: v, yue: v, en: v } : {};
+}
+
 export default function PersonasPage() {
   const { accountId } = useAccount();
   const [rows, setRows] = useState<Record<string, unknown>[]>([]);
@@ -119,6 +106,8 @@ export default function PersonasPage() {
   const [refText, setRefText] = useState("");
   const [refFile, setRefFile] = useState<File | null>(null);
   const [voiceMap, setVoiceMap] = useState<Record<string, string>>({});
+  // 云端单音色（全场同声）选择：与人设主语言解耦，一个人设一把声。
+  const [cloudVoice, setCloudVoice] = useState("");
   const [previewUrl, setPreviewUrl] = useState("");
   const [speakers, setSpeakers] = useState<string[]>([]);
   // 已克隆 voice（来自 /api/tts/voices，注册在 TTS sidecar 的 voice_registry）
@@ -134,6 +123,14 @@ export default function PersonasPage() {
   const engineIsCloud = ["minimax", "minimax_streaming", "volcano_streaming"].includes(
     String(form.tts_provider ?? "").trim().toLowerCase(),
   );
+
+  // 引擎或人设主语言切换时，把云端当前音色初始化为语音映射里的主音色（旧分语言数据收敛成单音色）。
+  useEffect(() => {
+    if (!engineIsCloud) return;
+    const prim = primaryVoiceFor(form.language, voiceMap);
+    setCloudVoice((prev) => (prev && !prim ? prev : prim));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [engineIsCloud, form.language]);
 
   async function refresh() {
     setLoading(true);
@@ -211,12 +208,16 @@ export default function PersonasPage() {
     setErr(null);
     setOk(false);
     try {
-      const payload = { ...form, reference_audio: JSON.stringify(voiceMap) };
+      // 云端引擎：整场固定一个音色（不随客户语言换声）。reference_audio 存三键同值，
+      // 兼容 agent 按 {zh,yue,en} 读 map 的旧路径；本地 Qwen3 仍存分语言 voiceMap。
+      const finalMap = engineIsCloud ? voiceMapForOneVoice(cloudVoice) : voiceMap;
+      const payload = { ...form, reference_audio: JSON.stringify(finalMap) };
       if (editingId) await api.updatePersona(editingId, { ...payload, account_id: accountId });
       else await api.createPersona({ ...payload, account_id: accountId });
       setForm(EMPTY);
       setEditingId(null);
       setVoiceMap({});
+      setCloudVoice("");
       setRefText("");
       setRefFile(null);
       clearRecording();
@@ -240,15 +241,18 @@ export default function PersonasPage() {
   function edit(row: Record<string, unknown>) {
     clearRecording();
     setEditingId(String(row.id ?? ""));
+    const lang = String(row.language ?? "zh");
     setForm({
       name: String(row.name ?? ""),
       company: String(row.company ?? ""),
       tone: String(row.tone ?? ""),
-      language: String(row.language ?? "zh"),
+      language: lang,
       reference_audio: String(row.reference_audio ?? ""),
       tts_provider: String(row.tts_provider ?? ""),
     });
-    setVoiceMap(parseVoiceMap(row.reference_audio));
+    const map = parseVoiceMap(row.reference_audio);
+    setVoiceMap(map);
+    setCloudVoice(primaryVoiceFor(lang, map));
     setRefText("");
     setRefFile(null);
   }
@@ -333,19 +337,38 @@ export default function PersonasPage() {
   }
 
   async function previewVoice() {
-    const voice = voiceMap[activeLang] || (engineIsCloud ? "" : suggestVoiceFor(activeLang, voiceMap, clonedVoices, speakers));
+    const lang = activeLang;
+    if (engineIsCloud) {
+      if (!cloudVoice) {
+        setErr("请先选择一个人设音色（整场同声）。");
+        return;
+      }
+      setErr(null);
+      try {
+        const blob = await api.previewTts({
+          text: previewTextFor(lang, form.name),
+          voice: cloudVoice,
+          language: lang,
+          provider: String(form.tts_provider ?? ""),
+        });
+        if (previewUrl) URL.revokeObjectURL(previewUrl);
+        setPreviewUrl(URL.createObjectURL(blob));
+      } catch (e) {
+        setErr(String(e));
+      }
+      return;
+    }
+    const voice = voiceMap[lang] || suggestVoiceFor(lang, voiceMap, clonedVoices, speakers);
     if (!voice) {
-      setErr(engineIsCloud ? "请先为当前语言选择一个音色。" : "暂无可用音色，请先克隆一个音色（录音/上传参考音频）。");
+      setErr("暂无可用音色，请先克隆一个音色（录音/上传参考音频）。");
       return;
     }
     setErr(null);
     try {
       const blob = await api.previewTts({
-        text: previewTextFor(activeLang, form.name),
+        text: previewTextFor(lang, form.name),
         voice,
-        language: activeLang,
-        // 云端引擎时带 provider，让 /api/tts/preview 走 MiniMax/火山而不是本地 Qwen3。
-        ...(engineIsCloud ? { provider: String(form.tts_provider ?? "") } : {}),
+        language: lang,
       });
       if (previewUrl) URL.revokeObjectURL(previewUrl);
       setPreviewUrl(URL.createObjectURL(blob));
@@ -432,8 +455,8 @@ export default function PersonasPage() {
           <div className="rounded-lg border border-[var(--card-border)] p-3">
             <span className="label mb-1 block">语音引擎</span>
             <p className="mb-2 text-[11px] text-[var(--muted)]">
-              决定该人设通话用哪套 TTS：本地 Qwen3（可用下方克隆音色）或云端 MiniMax/火山
-              （用全局设置里的云端音色）。留空 = 跟随全局设置。
+              决定该人设通话用哪套 TTS：本地 Qwen3（可用下方克隆音色）或云端 MiniMax
+              （可在下方为这个人设选一个固定音色，整场同声）。留空 = 跟随全局设置。
             </p>
             <select
               className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
@@ -447,44 +470,31 @@ export default function PersonasPage() {
             </select>
             {(form.tts_provider === "minimax" || form.tts_provider === "volcano_streaming") && (
               <p className="mt-2 text-[11px] text-[var(--accent)]">
-                云端引擎：下方克隆/音色绑定不生效，实际用全局设置的普通话音色/粤语音色（如 MiniMax
-                Cantonese_Male_news_anchor_vv2）。
+                云端引擎：人设绑定一个音色后，整场通话（粤/普/英）都用它发声。火山引擎目前仍用全局配置音色。
               </p>
             )}
           </div>
           <div className="space-y-2">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="text-xs text-[var(--stage-muted)]">为该语言选音色：</span>
-              {LANGS.map(([lang, label]) => (
-                <button
-                  key={lang}
-                  className={`btn-ghost text-xs ${activeLang === lang ? "!border-[var(--accent)]" : ""}`}
-                  onClick={() => setActiveLang(lang)}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-            <p className="text-[11px] text-[var(--muted)]">
-              {engineIsCloud
-                ? `当前「${LANG_LABEL[activeLang] ?? activeLang}」：从下方 MiniMax 音色中选择（粤语/普通话/英语分开配）。`
-                : `当前「${LANG_LABEL[activeLang] ?? activeLang}」音色：没绑时自动推荐${activeLang === "yue" ? "粤语克隆" : "该语言克隆"}${activeLang !== "yue" ? "" : "；要讲粤语请用「粤语参考音频克隆」的音色，普通话音色读粤语会带普通话音"}`}
-            </p>
             {engineIsCloud ? (
               <>
+                {/* 云端引擎：整场固定一个音色（不随语言换声）。 */}
+                <span className="text-xs text-[var(--stage-muted)]">AI 音色（整场同声 · 不随语言切换）</span>
+                <p className="text-[11px] text-[var(--muted)]">
+                  选一个固定音色，客户讲粤语/普通话/英文都用它回应（推荐粤语播报音色：港式服务粤/普/英都地道）。
+                </p>
                 <select
                   className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
-                  value={voiceMap[activeLang] ?? ""}
-                  onChange={(e) => setVoiceMap((prev) => ({ ...prev, [activeLang]: e.target.value }))}
+                  value={cloudVoice}
+                  onChange={(e) => setCloudVoice(e.target.value)}
                 >
-                  <option value="">选择 MiniMax {LANG_LABEL[activeLang] ?? activeLang}音色</option>
-                  {minimaxVoiceOptionsFor(activeLang).map((vo) => (
-                    <option key={vo.id} value={vo.id}>
-                      {vo.label}
+                  <option value="">选择 MiniMax 音色…</option>
+                  {allMinimaxVoiceOptions().map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
                     </option>
                   ))}
-                  {voiceMap[activeLang] && !minimaxVoiceOptionsFor(activeLang).some((vo) => vo.id === voiceMap[activeLang]) && (
-                    <option value={voiceMap[activeLang]}>自定义：{voiceMap[activeLang]}</option>
+                  {cloudVoice && !allMinimaxVoiceOptions().some((o) => o.value === cloudVoice) && (
+                    <option value={cloudVoice}>自定义：{cloudVoice}</option>
                   )}
                 </select>
                 <div className="flex gap-2">
@@ -494,6 +504,21 @@ export default function PersonasPage() {
               </>
             ) : (
               <>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-xs text-[var(--stage-muted)]">为该语言选音色：</span>
+                  {LANGS.map(([lang, label]) => (
+                    <button
+                      key={lang}
+                      className={`btn-ghost text-xs ${activeLang === lang ? "!border-[var(--accent)]" : ""}`}
+                      onClick={() => setActiveLang(lang)}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[11px] text-[var(--muted)]">
+                  {`当前「${LANG_LABEL[activeLang] ?? activeLang}」音色：没绑时自动推荐${activeLang === "yue" ? "粤语克隆" : "该语言克隆"}${activeLang !== "yue" ? "" : "；要讲粤语请用「粤语参考音频克隆」的音色，普通话音色读粤语会带普通话音"}`}
+                </p>
             <select
               className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
               value={voiceMap[activeLang] ?? ""}

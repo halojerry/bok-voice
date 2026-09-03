@@ -24,8 +24,8 @@ type ProviderForm = Record<string, unknown> & { provider?: string };
 const EMPTY_FORM: Record<ProviderKind, ProviderForm> & { policy: string } = {
   asr: { provider: DEFAULT_PROVIDER.asr },
   llm: { provider: DEFAULT_PROVIDER.llm },
-  tts: { provider: DEFAULT_PROVIDER.tts, sample_rate: 24000 },
-  vad: { provider: DEFAULT_PROVIDER.vad, max_buffered_speech: 15, min_speech_duration: 0.15, min_silence_duration: 0.35, interruption: true },
+  tts: { provider: DEFAULT_PROVIDER.tts, speaker: "", sample_rate: 24000 },
+  vad: { provider: DEFAULT_PROVIDER.vad, max_buffered_speech: 15, min_speech_duration: 0.2, min_silence_duration: 0.35, sensitivity: 0.6, interruption: true },
   policy: "offline_first",
 };
 
@@ -111,7 +111,7 @@ function ProviderCard({
           </select>
           {providerMeta?.hint && <p className="mt-1 text-xs text-[var(--muted)]">{providerMeta.hint}</p>}
         </div>
-        {meta.fields.map((field) => (
+        {meta.fields.filter((f) => !f.advanced).map((field) => (
           <label key={field.key} className="block">
             <span className="text-xs text-[var(--stage-muted)]">{field.label}</span>
             <FieldInput field={field} value={value[field.key]} onChange={(v) => onChange({ ...value, [field.key]: v })} />
@@ -121,6 +121,25 @@ function ProviderCard({
             )}
           </label>
         ))}
+        {meta.fields.some((f) => f.advanced) && (
+          <details className="rounded-lg border border-[var(--card-border)] p-2 text-sm">
+            <summary className="cursor-pointer text-xs text-[var(--muted)] hover:text-[var(--accent)]">
+              高级（旧按语言分音色，仅兼容旧数据）
+            </summary>
+            <div className="mt-2 space-y-2">
+              {meta.fields.filter((f) => f.advanced).map((field) => (
+                <label key={field.key} className="block">
+                  <span className="text-xs text-[var(--stage-muted)]">{field.label}</span>
+                  <FieldInput field={field} value={value[field.key]} onChange={(v) => onChange({ ...value, [field.key]: v })} />
+                  {field.hint && <p className="mt-1 text-xs text-[var(--muted)]">{field.hint}</p>}
+                  {field.preview && kind === "tts" && (
+                    <VoicePreview provider={provider} fieldKey={field.key} voice={String(value[field.key] ?? "")} />
+                  )}
+                </label>
+              ))}
+            </div>
+          </details>
+        )}
       </div>
     </section>
   );
