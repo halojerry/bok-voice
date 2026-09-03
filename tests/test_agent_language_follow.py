@@ -165,15 +165,16 @@ def test_yue_rule_requires_hk_style_code_mixing():
     ctx = ContextState(account_id="acc-001")
     ctx.set_user_language("yue")
     text = ctx.render_system_message()
-    assert "港式粤语" in text
+    assert "港式粵語" in text
+    assert "直接輸出繁體" in text and "唔好寫任何簡體字" in text  # 繁体直接输出
     assert "refund" in text and "check" in text  # 允许自然夹英文服务词
     assert "唔好解釋" in text or "唔好解释" in text  # 防泄漏仍保留
     # 数字要用粤语读法：单号逐字读汉字、0 读零、不用阿拉伯数字串。
     assert "七八九零" in text and "粵語數字" in text
-    # 高频普→粤词表：这个→呢個、什么→乜嘢、现在→而家 等硬性替换清单。
+    # 高频普→港式口语词表：这个→呢個、什么→乜嘢、现在→而家 等。
     assert "呢個" in text and "乜嘢" in text and "而家" in text and "點解" in text
     # 行业词：快递→速遞、包裹→集運件(香港集运业务语境),并点明不用内地讲法。
-    assert "速遞" in text and "集運件" in text and "唔好用「包裹」「快遞」" in text
+    assert "速遞" in text and "集運件" in text and "唔好用「包裹」「快遞」「貨物」" in text
 
 
 def test_zh_rule_has_no_hk_style():
@@ -182,6 +183,45 @@ def test_zh_rule_has_no_hk_style():
     ctx.set_user_language("zh")
     text = ctx.render_system_message()
     assert "港式" not in text
+
+
+# ---- MiniMax 表现力:emotion 映射 + 停顿注入 + 拟声放行 ----
+def test_mood_to_minimax_emotion_mapping():
+    from agent_runtime.plugins.emotion import EmotionState
+    # 安抚/焦虑/共情 → sad(低沉柔和);开心 → happy;愤怒 → angry;默认 calm。
+    for m, want in [("empathetic", "sad"), ("anxious", "sad"), ("happy", "happy"),
+                    ("excited", "happy"), ("angry", "angry"), ("surprised", "surprised"),
+                    ("calm", "calm"), ("whatever", "calm")]:
+        s = EmotionState(mood=m)
+        assert s.minimax_emotion() == want, m
+
+
+def test_inject_pauses_long_sentence(monkeypatch):
+    from agent_runtime.providers.livekit_plugins import _inject_pauses
+    monkeypatch.setenv("MINIMAX_PAUSE", "1")
+    monkeypatch.setenv("MINIMAX_PAUSE_SECS", "0.3")
+    # 长句(≥16 字)句末加 <#0.30#>
+    out = _inject_pauses("唔好意思林先生，我幫你 check 返個 status，件貨運輸途中唔見咗。")
+    assert "<#0.30#>" in out
+    # 短句不插
+    out2 = _inject_pauses("好，冇問題。")
+    assert "<#" not in out2
+    # 可关
+    monkeypatch.setenv("MINIMAX_PAUSE", "0")
+    assert "<#" not in _inject_pauses("唔好意思林先生，我幫你 check 返個 status，件貨運輸途中唔見咗。")
+
+
+def test_strip_stage_dirs_allows_minimax_vocal(monkeypatch):
+    from agent_runtime.agent import _strip_stage_dirs
+    # MiniMax 拟声标签保留(交给 TTS 转声效)
+    assert "(sighs)" in _strip_stage_dirs("唔好意思(sighs)，我幫你跟進。")
+    assert "(laughs)" in _strip_stage_dirs("咁搞笑(laughs)")
+    # 中文全角舞台括号剥掉
+    assert "稍作聽筒聲" not in _strip_stage_dirs("（稍作聽筒聲）唔好意思")
+    assert "笑" not in _strip_stage_dirs("（笑）我幫你")
+    # 半角舞台词剥掉、普通括注保留
+    assert "(pause)" not in _strip_stage_dirs("等我 check 下(pause)")
+    assert "(例如)" in _strip_stage_dirs("有啲情況(例如)咁")
 
 
 # ---- 粤语客服语言锚定：始终讲粤语，仅连续多轮才跟随客户切语言 ----

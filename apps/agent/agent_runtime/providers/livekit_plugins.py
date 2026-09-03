@@ -28,23 +28,50 @@ _CANTONESE_WORDS = (
 # 而地道粤语口语转写几乎不用。整句长度 + 功能字双重命中才判「强普通话」。
 _MANDARIN_MARKERS = ("的", "了", "这", "那", "什", "么", "说", "没", "给", "们", "您")
 
-# 港式粤语高频用词表（普→粤）：小模型常把"这个/什么/现在/的/了"直接写成普通话词，
-# TTS 念出来就是普通话腔。把它作为硬性替换清单喂给 LLM，按右列粤语词写。
+# 港式粤语高频用词表(普→港口语词):这里只放「普通话书面词 → 港式口语词」的用词替换,
+# 不放纯字形(简→繁)条目——字形由规则里的「直接輸出繁體」统一管,避免两件事搅在一起。
 _HK_YUE_LEXICON = (
     "这个→呢個 那个→嗰個 这些→呢啲 那些→嗰啲 "
     "这里→呢度 那里→嗰度 什么→乜嘢 怎么→點樣 为什么→點解 谁→邊個 哪里→邊度 什么时候→幾時 多少→幾多 怎么办→點算 "
     "是→係 不是→唔係 的→嘅 了→咗 在→喺 来→嚟 没有→冇 不要→唔好 不用→唔使 不可以→唔得 不知道→唔知 "
-    "现在→而家 刚刚→啱啱 马上→即刻 今天→今日 明天→聽日 昨天→尋日 一下→陣間/一吓 等一等→等陣 "
+    "现在→而家 刚刚→啱啱 马上→即刻 今天→今日 明天→聽日 昨天→尋日 等一下→等陣 没关系→唔緊要 "
     "我们→我哋 你们→你哋 他们→佢哋 他/她→佢 我的→我嘅 你的→你嘅 "
-    "你→你 我→我 他→佢 她→佢 帮→幫 会→會 个→個 这→呢 说→講 没→冇 过→過 来→嚟 时→時 间→間 "
-    "也→都 还→仲 很→好 更→更加 说→講 告诉→話俾 看→睇 听→聽 找→搵 给→俾 拿→攞 吃→食 回家→返屋企 "
-    "谢谢→唔該晒 对不起→唔好意思 没关系→唔緊要 没问题→冇問題 东西→嘢 事情→事 时候→時候 "
+    "也→都 还→仲 很→好 更→更加 告诉→話俾 看→睇 听→聽 找→搵 给→俾 拿→攞 回家→返屋企 "
+    "谢谢→唔該晒 对不起→唔好意思 没关系→唔緊要 没问题→冇問題 东西→嘢 事情→事 "
     "联系→聯絡 处理→處理/跟進 安排→安排 确认→確認 帮忙→幫手 号码→冧巴/號碼 可以吗→得唔得/可唔可以 "
     "快递→速遞 包裹→集運件 货物→貨件/集運件 转运→集運 收到→收到/收咗 "
 )
 
 # 中文对话里常被整词借用的英语感叹词：出现它们不代表用户切到英语。
 _EN_ACKS = {"ok", "okay", "yes", "yeah", "yep", "no", "nope", "hi", "hey", "hello", "bye", "thx"}
+
+
+def _inject_pauses(text: str) -> str:
+    """给要交给 MiniMax 的整段文本在句末适度加停顿标签 <#0.3#>。
+
+    只在「该句较长(≥16 字)且以 。！？!? 收尾」的句子后插,制造自然断句停顿;
+    短句/疑问反问不硬插,避免拖沓。可用 MINIMAX_PAUSE=0 关、MINIMAX_PAUSE_SECS 调时长。
+    停顿标签不能连续叠加(文档限制),此处逐句只加一个,安全。
+    """
+    if os.environ.get("MINIMAX_PAUSE", "1") != "1":
+        return text
+    if not text:
+        return text
+    try:
+        secs = float(os.environ.get("MINIMAX_PAUSE_SECS", "0.3"))
+    except ValueError:  # pragma: no cover
+        secs = 0.3
+    tag = f"<#{min(max(secs, 0.01), 1.5):.2f}#>"
+    out = []
+    buf = ""
+    for ch in text:
+        buf += ch
+        if ch in "。！？!?" and len(buf) >= 16:
+            out.append(buf + tag)
+            buf = ""
+    if buf:
+        out.append(buf)
+    return "".join(out)
 
 
 def _looks_cantonese(text: str) -> bool:
@@ -376,16 +403,16 @@ class ContextState:
             name = names.get(self._user_lang, self._user_lang)
             if self._user_lang == "yue":
                 rule = (
-                    "整段用港式粤语（香港客服腔）嚟讲，唔好用书面语、普通话，亦唔好用广州式偏书面的讲法。"
+                    "整段用港式粵語（香港客服腔）嚟講，唔好用書面語、普通話，亦唔好用廣州式偏書面嘅講法。"
+                    "直接輸出繁體中文——你寫嘅每個漢字都係繁體，唔好寫任何簡體字（簡體會令粵語語音讀錯，"
+                    "例如「幫你」要寫「幫你」唔係「帮你」，TTS 先會讀啱 nei5）。"
                     "口吻要有港味：唔該晒、唔好意思、我哋/你哋、而家、聽日、啱啱、幫你睇返、唔使擔心。"
-                    "写之前先把普通话词换成下面的粤语词，唔好照抄普通话字面："
+                    "用詞要係港式口語，唔好照抄普通話書面字面——見到下面嘅普通話詞就換成右邊嘅粵語口語："
                     + _HK_YUE_LEXICON
                     + "。"
                     "你哋係做集運/轉運業務，提到客戶嘅貨物要用「你件貨」「你個集運件」；"
                     "講行業/寄件服務用「速遞」。唔好用「包裹」「快遞」「貨物」呢啲內地/書面講法。"
-                    "全部用繁體字寫，唔好用簡體字（幫、個、會、這、沒、說、時呢啲要寫成幫、個、會、呢、冇、講、時）——"
-                    "簡體字會令粵語語音讀錯（例如「幫你」要寫「幫你」唔係「帮你」，TTS 先會讀啱 nei5）。"
-                    "可以自然夹杂英文单词/短语（check、confirm、send、email、App、online、status、refund、case、update 呢類服務同操作詞），"
+                    "可以自然夾雜英文詞/短語（check、confirm、send、email、App、online、status、refund、case、update 呢類服務同操作詞），"
                     "似香港人打電話咁講；但唔好講成句英文，亦唔好為咗夾而夾。"
                     "（語氣參考：「唔好意思，我幫你 check 返個 status，refund 一般 3–5 個工作天會到帳。」"
                     "「我 send 個 email 俾你，跟住入面嘅步驟做就 OK。」）"
@@ -948,6 +975,7 @@ class MiniMaxTTS(tts.TTS):
         language_state: LanguageState | None = None,
         sample_rate: int = 24000,
         api_key: str = "",
+        emotion_state=None,
     ):
         super().__init__(
             # 真流式：声明 streaming=True，voice 管线调 stream() 走 SynthesizeStream，
@@ -961,6 +989,21 @@ class MiniMaxTTS(tts.TTS):
         self._voice = voice
         self._language_state = language_state or LanguageState()
         self._key = api_key
+        self._emotion_state = emotion_state
+
+    def _resolve_emotion(self) -> str:
+        """当前轮 mood → MiniMax emotion（task_start 整段一个情绪）。
+
+        之前没接 emotion → 全程 calm，听感很"平"。默认开；MINIMAX_EMOTION=0 可关。
+        """
+        if os.environ.get("MINIMAX_EMOTION", "1") != "1":
+            return "calm"
+        if self._emotion_state is not None:
+            try:
+                return self._emotion_state.minimax_emotion()
+            except Exception:  # pragma: no cover - 情绪解析失败回落 calm
+                pass
+        return "calm"
 
     def _endpoint(self) -> str:
         base = os.environ.get("MINIMAX_BASE_URL", "").strip()
@@ -1065,6 +1108,7 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                     "speed": float(os.environ.get("MINIMAX_SPEED", "1")),
                     "vol": float(os.environ.get("MINIMAX_VOL", "1")),
                     "pitch": int(os.environ.get("MINIMAX_PITCH", "0")),
+                    "emotion": self._tts_._resolve_emotion(),
                 },
                 "audio_setting": {"sample_rate": sample_rate, "format": "pcm", "channel": 1},
             }
@@ -1142,7 +1186,7 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                     if sentence.strip():
                         await ws.send(json.dumps({"event": "task_continue", "text": sentence.strip()}))
             if sent_buf.strip():
-                await ws.send(json.dumps({"event": "task_continue", "text": sent_buf.strip()}))
+                await ws.send(json.dumps({"event": "task_continue", "text": _inject_pauses(sent_buf.strip())}))
             # 文本结束:发 task_finish 让服务端吐完剩余音频并回 is_final
             try:
                 await ws.send(json.dumps({"event": "task_finish"}))
@@ -1239,12 +1283,13 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
                 pass
             start = {
                 "event": "task_start",
-                "model": self._model(),
+                "model": self._tts_._model(),
                 "voice_setting": {
                     "voice_id": voice,
                     "speed": float(os.environ.get("MINIMAX_SPEED", "1")),
                     "vol": float(os.environ.get("MINIMAX_VOL", "1")),
                     "pitch": int(os.environ.get("MINIMAX_PITCH", "0")),
+                    "emotion": self._tts_._resolve_emotion(),
                 },
                 "audio_setting": {"sample_rate": sample_rate, "format": "pcm", "channel": 1},
             }
@@ -1257,7 +1302,7 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
             except Exception as exc:
                 print("MINIMAX_TTS_WS_START", repr(exc), flush=True)
                 return False
-            await ws.send(json.dumps({"event": "task_continue", "text": self._text}))
+            await ws.send(json.dumps({"event": "task_continue", "text": _inject_pauses(self._text)}))
             pcm_total = 0
             frame_bytes = int(sample_rate / 5) * 2  # 200ms 帧
             buf = bytearray()
@@ -1320,13 +1365,14 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
                         endpoint,
                         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                         json={
-                            "model": self._model(),
-                            "text": self._text,
+                            "model": self._tts_._model(),
+                            "text": _inject_pauses(self._text),
                             "voice_setting": {
                                 "voice_id": voice,
                                 "speed": float(os.environ.get("MINIMAX_SPEED", "1")),
                                 "vol": float(os.environ.get("MINIMAX_VOL", "1")),
                                 "pitch": int(os.environ.get("MINIMAX_PITCH", "0")),
+                                "emotion": self._tts_._resolve_emotion(),
                             },
                             "audio_setting": {"sample_rate": sample_rate, "format": "pcm", "channel": 1},
                         },
