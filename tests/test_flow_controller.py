@@ -87,3 +87,46 @@ def test_no_steps_no_flow():
     assert not fc.has_steps
     assert fc.current_step_text() == ""
     assert fc.flow_overview() == ""
+
+
+# ---- 旧式四段模板自动转分步(不一口气念完) ----
+LEGACY_TPL = {
+    "name": "粤语客服·产品咨询",
+    "opening": "你好请问你{姓名}咩？我哋呢边系{快递公司}快递…",
+    "core": "你嘅包裹运输途中丢失,我哋有买运费保险,会一赔二补俾你;你可以重新下单",
+    "objection": "如果你担心真假,可以加线上专员核实",
+    "closing": "好,唔该晒你,有咩问题随时搵我。拜拜!",
+}
+
+
+def test_legacy_four_sections_become_steps():
+    # 旧式四段模板无 steps_json:应转成 4 个分步,逐轮推进,而不是整段塞给 LLM 念。
+    from agent_runtime.flow import FlowController, template_to_steps
+
+    steps = template_to_steps(LEGACY_TPL)
+    assert len(steps) == 4
+    assert steps[0].goal.startswith("开场")
+    assert steps[-1].goal.startswith("收尾")
+
+    fc = FlowController.from_template(LEGACY_TPL, OBJ)
+    assert fc.has_steps
+    assert "第 1/4 步" in fc.current_step_text()
+    # 开场步的 ref 是 opening 全文
+    assert "你好请问" in fc.current_step_text()
+
+
+def test_legacy_steps_advance_one_by_one():
+    # 四段转分步后:客户确认才推进,不会一口气念完。
+    from agent_runtime.flow import FlowController
+
+    fc = FlowController.from_template(LEGACY_TPL, OBJ)
+    # 开场后:客户确认 → 才进第2步(core)
+    fc.on_user_turn("係呀,係我嘅")
+    assert fc.current == 1
+    assert "第 2/4 步" in fc.current_step_text()
+    # 第2步(core)客户再确认 → 进第3步(objection/异议)
+    fc.on_user_turn("好嘅,可以")
+    assert fc.current == 2
+    # 未确认不会跳:流程到第3步就停,不会自己讲完收尾
+    assert fc.current == 2
+    assert "收尾" not in fc.current_step_text()

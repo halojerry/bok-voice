@@ -173,25 +173,14 @@ def _instructions(
         lang = object_card.get("language") or "中文"
         parts.append(f"当前对话对象：{display}（{role}，语言 {lang}）。")
     if template:
-        tpl_name = template.get("name") or ""
-        # 分步话术(steps_json)由 flow 控制器按轮注入(flow_overview + 当前步),
+        # 模板(steps_json 或旧式四段)统一由 flow 控制器转成步骤、按轮注入,
         # 这里不再整段塞进 system,避免 LLM 把整份话术当逐字稿念。
-        steps_json = str(template.get("steps_json") or "")
-        has_steps = bool(steps_json.strip())
+        from .flow import template_to_steps
+
+        has_steps = bool(template_to_steps(template))
         if not has_steps:
-            # 无分步时的兼容:四段仅作"参考要点",明确不照读。
-            tpl_lines: list[str] = []
-            if template.get("opening"):
-                tpl_lines.append(f"开场参考:{template.get('opening')}")
-            if template.get("core"):
-                tpl_lines.append(f"核心要点:{template.get('core')}")
-            if template.get("objection"):
-                tpl_lines.append(f"异议应对参考:{template.get('objection')}")
-            if template.get("closing"):
-                tpl_lines.append(f"收尾参考:{template.get('closing')}")
-            if tpl_lines:
-                prefix = f"对话模板「{tpl_name}」参考(勿照读):" if tpl_name else "对话参考(勿照读):"
-                parts.append(prefix + "；".join(tpl_lines))
+            # 模板无任何内容(既无 steps 也无四段):退化为通用客服,不注模板。
+            parts.append(f"无特定话术模板,按专业客服方式自然应对。")
     if history:
         parts.append(f"上次聊到：{history}")
     parts.append(

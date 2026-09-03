@@ -46,6 +46,34 @@ def parse_steps(steps_json: str) -> list[FlowStep]:
     return [s for s in out if s.goal.strip() or s.ref.strip()]
 
 
+# 四段 → 步骤的 goal 标签(用于把旧式四段模板转成分步,逐步推进不念稿)
+_LEGACY_STEP_GOALS = {
+    "opening": "开场:自报家门,说明来意,向客户确认身份/包裹",
+    "core": "核心:向客户说明处理方案/关键信息,争取客户认可",
+    "objection": "异议:针对客户疑虑/拒绝,解释并稳住客户",
+    "closing": "收尾:确认客户意愿,礼貌收尾,不强推",
+}
+
+
+def template_to_steps(template: dict | None) -> list[FlowStep]:
+    """把模板转成对话步骤。
+
+    steps_json 优先(分步蓝图);若为空但有旧式四段(opening/core/objection/closing),
+    自动转成分步流程——否则四段整段塞给 LLM 会被当逐字稿一口气念完
+    (实测:开场把确认身份→一赔二→重新下单→拜拜全讲了)。
+    """
+    steps = parse_steps((template or {}).get("steps_json", ""))
+    if steps:
+        return steps
+    tpl = template or {}
+    out: list[FlowStep] = []
+    for key, goal in _LEGACY_STEP_GOALS.items():
+        text = str(tpl.get(key) or "").strip()
+        if text:
+            out.append(FlowStep(goal=goal, ref=text))
+    return out
+
+
 def object_vars(object_card: dict | None) -> dict[str, str]:
     """从对象卡提取话术变量;缺的留空(由上层标"待确认",不编造)。"""
     oc = object_card or {}
@@ -139,7 +167,8 @@ class FlowController:
 
     @classmethod
     def from_template(cls, template: dict | None, object_card: dict | None) -> "FlowController":
-        steps = parse_steps((template or {}).get("steps_json", ""))
+        # steps_json 或旧式四段都转成步骤(见 template_to_steps),保证分步推进不念稿。
+        steps = template_to_steps(template)
         fc = cls(steps=steps)
         fc.vars_map = object_vars(object_card)
         return fc
