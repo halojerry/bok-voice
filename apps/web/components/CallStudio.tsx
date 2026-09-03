@@ -48,11 +48,12 @@ function LiveAgentPanel({ room }: { room: Room | null }) {
   const { mood } = useAgentExpression();
   const transcriptions = useTranscriptions();
   const agentIdentity = identity ?? "agent";
-  const recent = useMemo(() => transcriptions.slice(-16).reverse(), [transcriptions]);
+  // 按时间正序(旧→新,最新在底部),像常规聊天一样自动滚到底看最新一条。
+  const recent = useMemo(() => transcriptions.slice(-20), [transcriptions]);
   const agentState = state ?? "connecting";
   const listRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    // 只滚转录容器到底部，不 scrollIntoView 整页——否则多轮后整个工作台被顶走/看似塌陷。
+    // 新气泡到达时滚到容器底部 = 最新消息,不被旧消息顶开。
     const el = listRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [recent]);
@@ -82,12 +83,6 @@ function LiveAgentPanel({ room }: { room: Room | null }) {
             等待对话…
           </div>
         )}
-        {speaking && recent.length > 0 && (
-          <div className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.14em] text-[var(--stage-value)]">
-            <span className="h-1.5 w-1.5 rounded-full bg-[var(--stage-value)] animate-pulse" />
-            AI 说话中
-          </div>
-        )}
         {recent.map((t, i) => {
           const identity = t.participantInfo?.identity ?? "";
           const text = String(t.text ?? "");
@@ -109,6 +104,12 @@ function LiveAgentPanel({ room }: { room: Room | null }) {
             </div>
           );
         })}
+        {speaking && recent.length > 0 && (
+          <div className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.14em] text-[var(--stage-value)]">
+            <span className="h-1.5 w-1.5 rounded-full bg-[var(--stage-value)] animate-pulse" />
+            AI 说话中
+          </div>
+        )}
       </div>
 
       {/* 中央：官方点阵可视化（mood 驱动色）；sm 尺寸并 shrink-0，把纵向空间让给转写 */}
