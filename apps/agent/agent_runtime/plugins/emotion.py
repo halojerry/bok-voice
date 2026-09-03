@@ -48,6 +48,22 @@ MOOD_INSTRUCT: dict[str, str] = {
     "calm": "语气平静、自然，字正腔圆",
 }
 
+# 官方 mood → MiniMax speech emotion（speech-2.8-hd/turbo 支持 calm/happy/sad/angry/
+# surprised/fluent…）。MiniMax 枚举比我们 11 种少，把语义相近的 mood 归拢；未命中回落 calm。
+MOOD_TO_MINIMAX: dict[str, str] = {
+    "excited": "happy",
+    "happy": "happy",
+    "hopeful": "happy",
+    "playful": "happy",
+    "curious": "calm",  # 好奇/询问用平稳，避免语气过重
+    "surprised": "surprised",
+    "empathetic": "sad",  # 体谅/安抚/致歉 → 低沉柔和
+    "anxious": "sad",  # 安抚客户焦虑 → 放慢柔和
+    "sad": "sad",
+    "angry": "angry",
+    "calm": "calm",
+}
+
 
 @dataclass
 class EmotionProcessor:
@@ -74,3 +90,7 @@ class EmotionState:
 
     def instruct_for_mood(self) -> str:
         return MOOD_INSTRUCT.get(self.mood, "")
+
+    def minimax_emotion(self) -> str:
+        """当前 mood → MiniMax emotion；未识别回落 calm。"""
+        return MOOD_TO_MINIMAX.get(self.mood, "calm")

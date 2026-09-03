@@ -38,9 +38,31 @@ _EXPR_PARTIAL_RE = re.compile(r"<expr\b[^>]*$")
 # so the persisted transcript is clean customer-facing copy.
 _EXPR_SYNC_RE = re.compile(r"<expr\b[^>]*?/>|<expr\b[^>]*>|</expr>|<expr\b[^>]*$")
 
-# 舞台/动作括号提示：模型偶尔输出（稍作聽筒聲）（笑）（停顿）这类全角括号批注，
-# TTS 会照念出来——进 TTS 前剥掉；半角括号(paren)一般是真内容(如解释)保留。
-_STAGE_PAREN_RE = re.compile(r"（[^（）]*?(?:声|音|笑|停顿|静默|沉默|稍等|清嗓|动作|背景|聽筒|铃)[^（）]*?）|\([^()]*?(?:声|笑|停顿|pause|sigh|clears throat)[^()]*?\)", re.IGNORECASE)
+# MiniMax 支持的拟声标签(2.8-hd/turbo):这些是让它发声效的,不能剥。
+# 其余舞台/动作括号提示(（稍作聽筒聲）（笑）(sigh) (pause) 等)会被 TTS 照念,剥掉。
+_MINIMAX_VOCAL_TAGS = {"laughs", "chuckle", "coughs", "breath", "sighs", "humming"}
+_STAGE_HALFWIDTH_WORDS = {"声", "笑", "停顿", "pause", "sigh", "cough", "清嗓", "动作", "背景", "沉默", "静默"}
+_STAGE_FULLWIDTH_RE = re.compile(r"（[^（）]*?(?:声|音|笑|停顿|静默|沉默|稍等|清嗓|动作|背景|聽筒|铃)[^（）]*?）")
+
+
+def _strip_stage_dirs(text: str) -> str:
+    """剥掉会照念的舞台/动作括号;放行 MiniMax 拟声标签(如 (sighs)(laughs))。
+
+    半角括号只有在「内容是舞台/动作词」时才剥,普通括注(如 (例如…))保留。
+    """
+    if not text:
+        return text
+    text = _STAGE_FULLWIDTH_RE.sub("", text)
+
+    def _repl(m: "re.Match[str]") -> str:
+        inner = m.group(1).strip().lower()
+        if inner in _MINIMAX_VOCAL_TAGS:
+            return m.group(0)  # MiniMax 会转成声效,保留
+        if any(w in inner for w in _STAGE_HALFWIDTH_WORDS):
+            return ""  # 半角舞台词剥掉,防照念
+        return m.group(0)  # 普通括注保留
+
+    return re.sub(r"\(([^()]*?)\)", _repl, text)
 
 
 def _clean_transcript(text: str) -> str:
@@ -52,8 +74,9 @@ async def _strip_expr_markup(text):
     async for chunk in text:
         combined = carry + chunk
         out = _EXPR_TAG_RE.sub("", combined)
-        # 舞台/动作括号提示（如（稍作聽筒聲））也会被 TTS 念出来，一并剥掉。
-        out = _STAGE_PAREN_RE.sub("", out)
+        # 舞台/动作括号提示（如（稍作聽筒聲））也会被 TTS 念出来，一并剥掉；
+        # 但放行 MiniMax 拟声标签 (sighs)/(laughs) 等，让它可以转成声效。
+        out = _strip_stage_dirs(out)
         # A tag split across stream chunks has no closing ">" yet: hold the
         # trailing "<expr ..." fragment until the next chunk completes it.
         m = _EXPR_PARTIAL_RE.search(out)
@@ -463,6 +486,9 @@ async def entrypoint(ctx):
             language_state=language_state,
             sample_rate=int(tts_cfg.get("sample_rate") or 24000),
             api_key=str(tts_cfg.get("api_key") or ""),
+            # 每轮 mood → MiniMax emotion(安抚/致歉低沉、愤怒郑重、开心轻快),
+            # 不然全程一个调听感很平(与 Qwen3 的 instruct_for_mood 同源)。
+            emotion_state=emotion_state,
         )
     else:
         if tts_provider_name not in ("", "qwen3_tts"):
