@@ -934,6 +934,8 @@ class MiniMaxTTS(tts.TTS):
         return self._INTL if region in {"intl", "global", "chat"} else self._CN
 
     def _api_key(self) -> str:
+        # 持久化优先：agent 构造时传入 settings 里的 tts.api_key（设置页保存，重启不丢）；
+        # env 是部署级覆盖（MINIMAX_API_KEY）。两者都空则无凭据。
         return self._key or os.environ.get("MINIMAX_API_KEY", "")
 
     def _endpoint_ws(self) -> str:

@@ -73,10 +73,11 @@ export const SETTING_CARDS: ProviderMeta[] = [
     providers: [
       { value: "qwen3_tts", label: "Qwen3-TTS（本地）" },
       { value: "volcano_streaming", label: "火山引擎（云端）", hint: "凭据读 VOLC_APP_ID / VOLC_ACCESS_TOKEN 环境变量。" },
-      { value: "minimax", label: "MiniMax（云端）", hint: "凭据读 MINIMAX_API_KEY；国内 api.minimax.cn / 海外 api.minimax.chat（MINIMAX_REGION=cn/intl，或 MINIMAX_BASE_URL 显式覆盖）。" },
+      { value: "minimax", label: "MiniMax（云端）", hint: "在下方「API Key」填入持久化凭据（保存后重启 agent 生效）；也可用环境变量 MINIMAX_API_KEY 覆盖。国内 api.minimax.cn / 海外 api.minimax.chat。" },
       { value: "fake", label: "Fake（仅测试）", hint: "静音测试音，无模型也可跑通链路。" },
     ],
     fields: [
+      { key: "api_key", label: "API Key", type: "secret", hint: "MiniMax / DeepSeek 等云端凭据，持久化保存（重启不丢）；已保存的 Key 不回显。", placeholder: "sk-…" },
       { key: "base_url", label: "服务地址", type: "text", hint: "Qwen3-TTS sidecar 地址；agent 运行时会优先读 QWEN3_TTS_BASE_URL。", placeholder: "http://127.0.0.1:8788" },
       { key: "speaker_zh", label: "普通话音色", type: "text", preview: true, hint: "persona 未绑音色时的默认音色；MiniMax 如 zhiyan_meet_feminine。", placeholder: "如 zhiyan_meet_feminine" },
       { key: "speaker_yue", label: "粤语音色", type: "select", preview: true, hint: "客户切粤语时使用。MiniMax 粤语音色（实测可用）；选「跟随普通话」则粤语轮用普通话音色。", options: [

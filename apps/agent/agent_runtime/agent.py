@@ -383,6 +383,7 @@ async def entrypoint(ctx):
             voice=voice_map,
             language_state=language_state,
             sample_rate=int(tts_cfg.get("sample_rate") or 24000),
+            api_key=str(tts_cfg.get("api_key") or ""),
         )
     else:
         if tts_provider_name not in ("", "qwen3_tts"):
