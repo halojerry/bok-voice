@@ -503,8 +503,13 @@ async def entrypoint(ctx):
         # 避免 AI 每次刚要开口就被当插话打断、多次后不再出声。
         vad_provider = inference.VAD(
             max_buffered_speech=_vad_float(vad_cfg, "max_buffered_speech", "VAD_MAX_BUFFERED_SPEECH", "15"),
-            min_speech_duration=_vad_float(vad_cfg, "min_speech_duration", "VAD_MIN_SPEECH_DURATION", "0.4"),
-            min_silence_duration=_vad_float(vad_cfg, "min_silence_duration", "VAD_MIN_SILENCE_DURATION", "0.45"),
+        # VAD 参数权衡（曾为冲低延迟把 min_silence 收到 0.30/endpointing min 收到 0.15，
+        # 实测导致「转写晚于轮次提交」被 LiveKit 丢弃、噪声/回声频繁误提交 → agent 长时间无声）：
+        # 离线式 ASR（用户整句说完 VAD flush 才出 FINAL）从停嘴到转写回来需 ~0.5-1.2s，
+        # 端点判定必须等得起它。恢复 0.45 静音门槛 + 0.35/1.2 endpointing 的可用基线；
+        # 短句不丢靠 min_speech 0.15、抗噪靠 activation_threshold(0.75)+打斷 min_duration(1.2s)。
+        min_speech_duration=_vad_float(vad_cfg, "min_speech_duration", "VAD_MIN_SPEECH_DURATION", "0.15"),
+        min_silence_duration=_vad_float(vad_cfg, "min_silence_duration", "VAD_MIN_SILENCE_DURATION", "0.45"),
             activation_threshold=_vad_float(vad_cfg, "sensitivity", "VAD_ACTIVATION_THRESHOLD", "0.75"),
         )
     interruption_enabled = bool(vad_cfg.get("interruption", True)) if vad_provider_name != "fake" else True
@@ -689,13 +694,13 @@ async def entrypoint(ctx):
         llm=llm_provider,
         tts=tts_provider,
         # 官方低延迟调参（docs.livekit.io/agents/logic/turns/tuning）：
-        # - dynamic endpointing：按会话停顿统计自适应，min 0.35s 加速切句
+        # - dynamic endpointing：min 0.35s。低于 ~0.3s 会让轮次在慢速离线 ASR 返回前
+        #   提交 → 转写被丢（"transcript arrives after turn has been committed"）→ 不回话。
+        #   max 1.2s：客户停顿未到会被 max 截断结束（不无限等）。
         # - preemptive_tts：在轮次确认前就开跑 LLM->TTS，代价是打断时浪费算力
         # - interruption 保持自适应（无模型时自动回退 VAD），min_duration 收紧到 0.35s
         turn_handling=TurnHandlingOptions(
             endpointing={
-                # dynamic 自适应，min 0.35s 加速切句；max 收紧到 1.2s——
-                # 以前 max 2.0s 会在客户停顿/句子间隙空等最多 2 秒，很"没通话感"。
                 "mode": "dynamic",
                 "min_delay": float(os.environ.get("ENDPOINT_MIN_DELAY", "0.35")),
                 "max_delay": float(os.environ.get("ENDPOINT_MAX_DELAY", "1.2")),
