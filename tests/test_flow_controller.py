@@ -139,3 +139,17 @@ def test_legacy_steps_advance_one_by_one():
     # 未确认不会跳:流程到第3步就停,不会自己讲完收尾
     assert fc.current == 2
     assert "收尾" not in fc.current_step_text()
+
+
+def test_current_step_explicit_no_leak_instruction():
+    # 当前步注入须明确区分"参考要点(内部)"与"对客户说的话",禁止复述分支指示。
+    from agent_runtime.flow import FlowController
+
+    fc = FlowController.from_template(
+        {"steps_json": '[{"goal":"确认包裹","ref":"你好{姓名}。\\n如果客户唔记得 → 提佢地址帮佢回忆"}]'},
+        OBJ,
+    )
+    txt = fc.current_step_text()
+    assert "勿念给客户" in txt
+    assert "绝不把「如果" in txt
+    assert "参考要点(内部指示" in txt

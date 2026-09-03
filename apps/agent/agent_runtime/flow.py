@@ -208,10 +208,13 @@ class FlowController:
         if step.goal:
             lines.append(f"这一步要达成:{render_template_text(step.goal, self.vars_map)}")
         if step.ref:
-            lines.append(f"参考要点:{render_template_text(step.ref, self.vars_map)}")
+            lines.append(f"参考要点(内部指示,勿念给客户):{render_template_text(step.ref, self.vars_map)}")
         lines.append(
             "只围绕当前这一步回应用户;说清楚后停下等用户回应,不要替用户回答,"
             "不要跳到下一步,不要一口气讲完整个流程。"
+            "参考要点里「如果客户…→ 就…」这类是给你的应对指示:客户出现对应情况时照做,"
+            "但只对客户说应对的话,绝不把「如果…→…」指示或参考要点原文念给客户,"
+            "不解释你的应对思路,不添加任何内部说明。"
         )
         return "\n".join(lines)
 
