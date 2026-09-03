@@ -110,6 +110,76 @@ function fillExample(form: typeof EMPTY, setForm: (f: typeof EMPTY) => void, lan
   setSteps(steps);
 }
 
+/** 解析单元格：去掉首尾空白。 */
+function cell(raw: string): string {
+  return raw.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * 从表格文本解析步骤。支持：
+ *  - TSV：每行一步，第一列=目标，第二列=参考说法（默认按 \t 分列；若没有 \t 则退化为
+ *    「目标,参考说法」整行判断）。
+ *  - CSV（带表头）：识别 目标/goal/参考/ref/参考说法 列。
+ *  - 纯 TSV 无表头：第一列当目标、第二列当参考。
+ * 返回 {steps, error}；error 非空表示解析失败。
+ */
+function parseStepsFromTable(text: string): { steps: FlowStep[]; error: string } {
+  const lines = text.split(/\r?\n/).map((l) => l.trimEnd());
+  const nonEmpty = lines.filter((l) => l.trim() !== "");
+  if (nonEmpty.length === 0) return { steps: [], error: "没有可导入的内容。" };
+  const containsTab = nonEmpty.some((l) => l.includes("\t"));
+  // CSV 解析：支持引号包裹与逗号分隔（含中文逗号，因粘贴可能来自表格软件）。
+  const rows: string[][] = nonEmpty.map((line) => {
+    if (containsTab) return line.split("\t");
+    // 尝试 CSV：处理带引号字段
+    const out: string[] = [];
+    let cur = "";
+    let inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (inQ) {
+        if (ch === '"') {
+          if (line[i + 1] === '"') { cur += '"'; i++; } else inQ = false;
+        } else cur += ch;
+      } else if (ch === '"') inQ = true;
+      else if (ch === "," || ch === "，") { out.push(cur); cur = ""; }
+      else cur += ch;
+    }
+    out.push(cur);
+    return out;
+  });
+  // 表头检测：第一行含 目标/goal/参考/ref 字样则视为表头。
+  const head = rows[0].map((h) => cell(h.toLowerCase()));
+  const isHeader = head.some((h) => ["目标", "goal", "目的", "参考", "参考说法", "ref", "话术", "说法"].includes(h));
+  const headerMap: Record<string, number> = {};
+  if (isHeader) {
+    head.forEach((h, idx) => {
+      if (["目标", "goal", "目的"].includes(h)) headerMap.goal = idx;
+      else if (["参考", "参考说法", "ref", "话术", "说法"].includes(h)) headerMap.ref = idx;
+    });
+    if (headerMap.goal === undefined) return { steps: [], error: "表头缺少「目标」列（可用：目标/goal）。" };
+    if (headerMap.ref === undefined) return { steps: [], error: "表头缺少「参考说法」列（可用：参考/ref/话术）。" };
+  }
+  const dataRows = isHeader ? rows.slice(1) : rows;
+  const steps: FlowStep[] = [];
+  for (const r of dataRows) {
+    if (!r.some((c) => c.trim() !== "")) continue;
+    let goal = "";
+    let ref = "";
+    if (isHeader) {
+      goal = cell(r[headerMap.goal] ?? "");
+      ref = cell(r[headerMap.ref] ?? "");
+    } else {
+      goal = cell(r[0] ?? "");
+      ref = cell(r[1] ?? "");
+    }
+    if (!goal && !ref) continue;
+    steps.push({ goal, ref });
+  }
+  if (steps.length === 0) return { steps: [], error: "解析后没有有效步骤（每行至少要有目标或参考说法）。" };
+  return { steps, error: "" };
+}
+
 export default function TemplatesPage() {
   const { accountId } = useAccount();
   const [rows, setRows] = useState<Record<string, unknown>[]>([]);
@@ -117,6 +187,9 @@ export default function TemplatesPage() {
   const [form, setForm] = useState(EMPTY);
   const [steps, setSteps] = useState<FlowStep[]>([]);
   const [showLegacy, setShowLegacy] = useState(false);
+  const [showTableImport, setShowTableImport] = useState(false);
+  const [tableText, setTableText] = useState("");
+  const [tableMsg, setTableMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [ok, setOk] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -188,6 +261,19 @@ export default function TemplatesPage() {
     } catch (e) {
       setErr(String(e));
     }
+  }
+
+  /** 从表格粘贴导入：解析成步骤并填充当前编辑区（可继续增删改）。 */
+  function importTable() {
+    const { steps: parsed, error } = parseStepsFromTable(tableText);
+    if (error) {
+      setTableMsg(error);
+      return;
+    }
+    setSteps((prev) => [...prev, ...parsed]);
+    setTableMsg(`已从表格导入 ${parsed.length} 步。`);
+    setShowTableImport(false);
+    setTableText("");
   }
 
   const textarea = "w-full resize-none rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]";
@@ -315,6 +401,9 @@ export default function TemplatesPage() {
               ))}
             </div>
             <div className="mt-3 flex flex-wrap gap-2">
+              <button className="btn-ghost text-xs" onClick={() => setShowTableImport((v) => !v)}>
+                {showTableImport ? "收起表格导入 ▲" : "从表格粘贴导入 ▼"}
+              </button>
               {LANGS.map(([v, l]) => (
                 <button key={v} className="btn-ghost text-xs" onClick={() => fillExample(form, setForm, v, setSteps)}>
                   填入{l}理赔示例
@@ -329,6 +418,25 @@ export default function TemplatesPage() {
                 <button className="btn-ghost px-2 py-0.5 text-xs text-[var(--muted)]" onClick={() => setSteps([])}>清空步骤</button>
               )}
             </div>
+            {showTableImport && (
+              <div className="mt-2 rounded-lg border border-dashed border-[var(--card-border)] p-2">
+                <p className="text-[11px] leading-relaxed text-[var(--muted)]">
+                  从表格（Excel/Google Sheets/CSV）粘贴：<b>每行一步</b>，第一列=目标，第二列=参考说法。
+                  支持带表头（列名：目标/参考说法）或不带表头（直接两列）。参考说法里可写
+                  <span className="text-[var(--accent)]">如果客户… → 就…</span>分支与{"{变量}"}。
+                </p>
+                <textarea
+                  className={`mt-1.5 h-24 ${textarea} text-xs`}
+                  placeholder={"目标\t参考说法\n开场确认\t你好,请问係咪{姓名}?我哋係{物流公司}…\n异议应对\t如果客户唔记得 → 提佢下单填嘅地址帮佢回忆"}
+                  value={tableText}
+                  onChange={(e) => { setTableText(e.target.value); setTableMsg(null); }}
+                />
+                <div className="mt-1.5 flex items-center gap-2">
+                  <button className="btn-primary px-3 py-1 text-xs" onClick={importTable}>导入为步骤</button>
+                  {tableMsg && <span className="text-xs text-[var(--muted)]">{tableMsg}</span>}
+                </div>
+              </div>
+            )}
           </div>
 
           {/* 旧式四段(兼容折叠):历史模板仍可编辑;新模板建议直接用分步 */}
