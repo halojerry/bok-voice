@@ -170,6 +170,8 @@ def test_yue_rule_requires_hk_style_code_mixing():
     assert "唔好解释" in text  # 防泄漏仍保留
     # 数字要用粤语读法：单号逐字读汉字、0 读零、不用阿拉伯数字串。
     assert "七八九零" in text and "粵語數字" in text
+    # 高频普→粤词表：这个→呢個、什么→乜嘢、现在→而家 等硬性替换清单。
+    assert "呢個" in text and "乜嘢" in text and "而家" in text and "點解" in text
 
 
 def test_zh_rule_has_no_hk_style():
