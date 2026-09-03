@@ -37,6 +37,7 @@ class CreateObjectRequest(BaseModel):
     phone: str = ""
     tracking_no: str = ""
     courier: str = ""
+    address: str = ""
     template_id: str = ""
 
 
@@ -54,6 +55,7 @@ class UpdateObjectRequest(BaseModel):
     phone: str = ""
     tracking_no: str = ""
     courier: str = ""
+    address: str = ""
     template_id: str = ""
     status: str = "active"
 

@@ -80,6 +80,7 @@ def object_vars(object_card: dict | None) -> dict[str, str]:
     name = str(oc.get("display_name") or "").strip()
     tracking = str(oc.get("tracking_no") or "").strip()
     courier = str(oc.get("courier") or "").strip()
+    address = str(oc.get("address") or "").strip()
     tail = tracking[-4:] if len(tracking) >= 4 else tracking
     return {
         "姓名": name,
@@ -88,6 +89,8 @@ def object_vars(object_card: dict | None) -> dict[str, str]:
         "快递尾号": tail,
         "物流公司": courier,
         "快递公司": courier,
+        "收货地址": address,
+        "地址": address,
         "电话": str(oc.get("phone") or "").strip(),
     }
 
@@ -104,12 +107,13 @@ def render_template_text(text: str, vars_map: dict[str, str]) -> str:
 
 
 def facts_line(object_card: dict | None) -> str:
-    """生成已知事实段:姓名/单号/物流公司,缺的标'待确认'。"""
+    """生成已知事实段:姓名/单号/物流公司/收货地址,缺的标'待确认'。"""
     v = object_vars(object_card)
     parts = []
     parts.append(f"姓名:{v['姓名'] or '待确认'}")
     parts.append(f"快递单号:{v['快递单号'] or '待确认'}")
     parts.append(f"物流公司:{v['物流公司'] or '待确认'}")
+    parts.append(f"收货地址:{v['收货地址'] or '待确认'}")
     return "已知客户信息:" + " ".join(parts) + "。信息缺失时向客户确认,不要编造。"
 
 

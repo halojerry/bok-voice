@@ -14,6 +14,7 @@ interface ObjectRow {
   phone: string;
   tracking_no: string;
   courier: string;
+  address: string;
   template_id: string;
 }
 
@@ -25,6 +26,7 @@ const EMPTY_FORM = {
   phone: "",
   tracking_no: "",
   courier: "",
+  address: "",
   template_id: "",
 };
 
@@ -53,6 +55,7 @@ export default function ObjectsPage() {
     const cName = colOf(["姓名", "名字", "name", "display_name"]);
     const cNo = colOf(["快递单号", "单号", "tracking_no", "tracking"]);
     const cCourier = colOf(["物流公司", "快递公司", "物流", "courier"]);
+    const cAddr = colOf(["收货地址", "地址", "address", "addr"]);
     const cPhone = colOf(["电话", "手机", "phone"]);
     const rows: Record<string, string>[] = [];
     for (const line of lines.slice(1)) {
@@ -65,6 +68,7 @@ export default function ObjectsPage() {
         language: "vi",
         tracking_no: cNo >= 0 ? cells[cNo] ?? "" : "",
         courier: cCourier >= 0 ? cells[cCourier] ?? "" : "",
+        address: cAddr >= 0 ? cells[cAddr] ?? "" : "",
         phone: cPhone >= 0 ? cells[cPhone] ?? "" : "",
       });
     }
@@ -148,6 +152,7 @@ export default function ObjectsPage() {
       phone: row.phone,
       tracking_no: row.tracking_no ?? "",
       courier: row.courier ?? "",
+      address: row.address ?? "",
       template_id: row.template_id ?? "",
     });
   }
@@ -180,11 +185,11 @@ export default function ObjectsPage() {
           {showImport && (
             <div className="mb-4 rounded-lg border border-[var(--card-border)] p-3">
               <p className="text-xs text-[var(--muted)]">
-                粘贴表格(支持 CSV/制表符,首行为表头):<b>姓名</b>、<b>快递单号</b>、<b>物流公司</b>、电话(可选)
+                粘贴表格(支持 CSV/制表符,首行为表头):<b>姓名</b>、<b>快递单号</b>、<b>物流公司</b>、<b>收货地址</b>、电话(后两列可选)
               </p>
               <textarea
                 className="mt-2 h-28 w-full resize-none rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 font-mono text-xs outline-none focus:border-[var(--accent)]"
-                placeholder={"姓名,快递单号,物流公司,电话\n张三,SF1234567890,顺丰,13800000000\n李四,YT9988776655,圆通"}
+                placeholder={"姓名,快递单号,物流公司,收货地址,电话\n张三,SF1234567890,顺丰,广东省深圳市南山区科技园路1号,13800000000\n李四,YT9988776655,圆通,广州市天河区体育西路100号"} 
                 value={importText}
                 onChange={(e) => setImportText(e.target.value)}
               />
@@ -212,6 +217,7 @@ export default function ObjectsPage() {
                         {String(r.phone ?? "") ? ` · ${String(r.phone)}` : ""}
                         {String(r.tracking_no ?? "") ? ` · 单号 ${String(r.tracking_no)}` : ""}
                         {String(r.courier ?? "") ? ` · ${String(r.courier)}` : ""}
+                        {String(r.address ?? "") ? ` · ${String(r.address)}` : ""}
                       </p>
                       {String(r.background ?? "") && (
                         <p className="mt-1 line-clamp-2 text-xs text-[var(--muted)]">{String(r.background)}</p>
@@ -278,6 +284,12 @@ export default function ObjectsPage() {
                 onChange={(e) => setForm({ ...form, courier: e.target.value })}
               />
             </div>
+            <input
+              className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+              placeholder="收货地址（可选，话术里可用 {收货地址} 引用）"
+              value={form.address}
+              onChange={(e) => setForm({ ...form, address: e.target.value })}
+            />
             <textarea
               className="h-28 w-full resize-none rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
               placeholder="背景 / 角色说明…"

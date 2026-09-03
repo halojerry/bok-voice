@@ -44,9 +44,10 @@ class ObjectProfile(Base):
     language: Mapped[str] = mapped_column(String(16), default="zh")
     background: Mapped[str] = mapped_column(Text, default="")
     phone: Mapped[str] = mapped_column(String(64), default="")
-    # 快递场景变量:姓名=display_name;单号/物流公司供话术变量与 LLM 引用。
+    # 快递场景变量:姓名=display_name;单号/物流公司/收货地址供话术变量与 LLM 引用。
     tracking_no: Mapped[str] = mapped_column(String(64), default="")
     courier: Mapped[str] = mapped_column(String(64), default="")
+    address: Mapped[str] = mapped_column(String(255), default="")
     template_id: Mapped[str] = mapped_column(String(64), default="")
     status: Mapped[str] = mapped_column(String(32), default="active")
 

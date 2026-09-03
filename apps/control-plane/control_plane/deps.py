@@ -85,6 +85,12 @@ def build_engine() -> Engine | None:
                 )
                 _ensure_column(
                     conn,
+                    "object_profiles",
+                    "address",
+                    "address VARCHAR(255) DEFAULT ''",
+                )
+                _ensure_column(
+                    conn,
                     "conversation_templates",
                     "steps_json",
                     "steps_json TEXT",

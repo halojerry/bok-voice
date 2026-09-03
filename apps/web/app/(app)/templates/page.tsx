@@ -44,7 +44,7 @@ const EMPTY = {
   language: "zh",
 };
 
-const STEPS_HINT = "可用变量:{姓名} {快递单号} {快递尾号} {物流公司}。\n参考说法是给 AI 的要点参考,不是逐字稿——AI 会结合客户原话用自己的话讲。";
+const STEPS_HINT = "可用变量:{姓名} {快递单号} {快递尾号} {物流公司} {收货地址}。\n参考说法是给 AI 的要点参考,不是逐字稿——AI 会结合客户原话用自己的话讲。";
 
 /** 把 steps 序列化/反序列化为 steps_json(存库)。 */
 function stepsToJson(steps: FlowStep[]): string {

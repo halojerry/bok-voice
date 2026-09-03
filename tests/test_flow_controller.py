@@ -20,6 +20,7 @@ OBJ = {
     "display_name": "林先生",
     "tracking_no": "SF1234567890",
     "courier": "顺丰",
+    "address": "香港湾仔活道 1 号",
     "phone": "13800000000",
 }
 
@@ -40,8 +41,16 @@ def test_missing_var_keeps_placeholder():
 def test_facts_line_marks_unknown():
     line = facts_line(OBJ)
     assert "林先生" in line and "SF1234567890" in line and "顺丰" in line
-    line2 = facts_line({"display_name": "", "tracking_no": "", "courier": ""})
+    assert "香港湾仔活道" in line  # 收货地址也在已知事实里
+    line2 = facts_line({"display_name": "", "tracking_no": "", "courier": "", "address": ""})
     assert "待确认" in line2
+
+
+def test_address_var():
+    # {收货地址}/{地址} 变量替换
+    out = render_template_text("你嘅包裹会寄去{收货地址},确认係{地址}吗?",
+                               {"收货地址": "香港湾仔活道 1 号", "地址": "香港湾仔活道 1 号"})
+    assert "香港湾仔活道" in out and "{" not in out
 
 
 def test_parse_steps_and_controller():

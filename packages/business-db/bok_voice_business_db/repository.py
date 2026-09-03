@@ -177,6 +177,7 @@ class SqlAlchemyBusinessRepository:
             phone=data.get("phone", ""),
             tracking_no=data.get("tracking_no", ""),
             courier=data.get("courier", ""),
+            address=data.get("address", ""),
             template_id=data.get("template_id", ""),
             status=data.get("status", "active"),
         )
@@ -192,7 +193,7 @@ class SqlAlchemyBusinessRepository:
         obj = self.session.get(models.ObjectProfile, object_id)
         if not obj:
             return None
-        allowed = {"display_name", "role_template", "language", "background", "phone", "tracking_no", "courier", "template_id", "status"}
+        allowed = {"display_name", "role_template", "language", "background", "phone", "tracking_no", "courier", "address", "template_id", "status"}
         for key, value in data.items():
             if key in allowed and hasattr(obj, key):
                 setattr(obj, key, value)
@@ -520,6 +521,7 @@ class InMemoryBusinessRepository:
             phone=data.get("phone", ""),
             tracking_no=data.get("tracking_no", ""),
             courier=data.get("courier", ""),
+            address=data.get("address", ""),
             template_id=data.get("template_id", ""),
             status=data.get("status", "active"),
         ).__dict__
@@ -529,7 +531,7 @@ class InMemoryBusinessRepository:
     def update_object(self, object_id: str, data: dict) -> dict | None:
         if object_id not in self.objects:
             return None
-        self.objects[object_id].update({k: v for k, v in data.items() if k in {"display_name", "role_template", "language", "background", "phone", "tracking_no", "courier", "template_id", "status"}})
+        self.objects[object_id].update({k: v for k, v in data.items() if k in {"display_name", "role_template", "language", "background", "phone", "tracking_no", "courier", "address", "template_id", "status"}})
         return self.objects[object_id]
 
     def delete_object(self, object_id: str) -> bool:
