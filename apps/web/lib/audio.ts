@@ -129,9 +129,17 @@ export async function switchWebOutputDevice(room: { switchActiveDevice: (kind: s
   }
 }
 
-/** Chromium 浏览器才支持网页 setSinkId（livekit 对 Safari/WKWebView 内核禁用了输出切换）。 */
+/** Chromium 浏览器才支持网页 setSinkId（livekit 对 Safari/WKWebView 内核禁用了输出切换）。
+ * 仅检测 setSinkId 存在会把 WKWebView/Safari 误判成可用——它们有这 API 但 livekit 内部
+ * 对远端 audio 设 sinkId 会抛 "Failed to set sink id on remote audio track"。排除非 Chrome 的
+ * WebKit(含 Tauri 桌面 WKWebView):桌面走 CoreAudio 切系统输出,不走 setSinkId。 */
 export function webCanSwitchOutput(): boolean {
-  if (typeof document === "undefined") return false;
+  if (typeof document === "undefined" || typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent || "";
+  const isWebKit = /AppleWebKit/i.test(ua);
+  const isChrome = /Chrome\//i.test(ua) && !/Edg\//i.test(ua);
+  // WKWebView / Safari:UA 含 AppleWebKit 但非 Chromium → 不支持可靠 setSinkId。
+  if (isWebKit && !isChrome) return false;
   const audio = document.createElement("audio");
   return typeof (audio as HTMLAudioElement & { setSinkId?: unknown }).setSinkId === "function";
 }
