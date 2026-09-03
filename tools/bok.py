@@ -523,9 +523,14 @@ def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
     llm_model = model_path({**current, "llm": resolve_llm_repo(current)}, "llm")
     if is_mac():
         llm_py = sidecar_python("llm-mlx")
+        # prompt-cache-size: 默认 10 槽会被 4-6 路并发会话打穿(每请求插入 system/对话/完成
+        # 多条前缀键,LRU 轮换把共享前缀挤掉)。M4 48GB 下 4k 前缀 KV 仅 ~134MB,调大纯赚,
+        # 让同人设/话术的跨会话前缀缓存命中(实测同前缀重放 1.67s→0.19s)。
+        # 16GB 机型可下调,或用 --prompt-cache-bytes 限制缓存总字节。
         _start_proc(
             [str(llm_py), "-m", "mlx_lm", "server",
              "--model", llm_model, "--host", "127.0.0.1", "--port", "1235",
+             "--prompt-cache-size", "128",
              "--chat-template-args", '{"enable_thinking":false}', "--log-level", "WARNING"],
             run_dir / "llm.pid",
             log_dir / "llm.log",
@@ -571,13 +576,16 @@ def cmd_up() -> int:
     asr_backend = "mlx" if is_mac() else "transformers"
     tts_backend = "mlx" if is_mac() else "transformers"
 
+    asr_env = {"QWEN3_ASR_MODEL": asr_model, "QWEN3_ASR_BACKEND": asr_backend}
+    if not is_mac():
+        # Windows/transformers 后端才需要 device 指定;mac mlx 分支不读该 env(MLX 默认走 Metal)。
+        asr_env["QWEN3_ASR_DEVICE"] = "cuda" if _cuda() else "cpu"
     if not healthy(8787):
         _start_proc(
             [str(asr_py), "-m", "uvicorn", "app:app", "--app-dir", "services/qwen3-asr-sidecar",
              "--host", "127.0.0.1", "--port", "8787"],
             run_dir / "asr.pid", log_dir / "asr.log",
-            env={"QWEN3_ASR_MODEL": asr_model, "QWEN3_ASR_BACKEND": asr_backend,
-                 "QWEN3_ASR_DEVICE": "cuda" if (_cuda() and not is_mac()) else "cpu"},
+            env=asr_env,
         )
     if not healthy(8788):
         # 清残留：serve 重试可能叠加多个卡死的 TTS 进程，先按 pidfile 收掉。

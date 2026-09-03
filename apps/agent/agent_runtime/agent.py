@@ -419,14 +419,21 @@ async def entrypoint(ctx):
         if persona_id:
             persona = await cp.get_persona(persona_id)
         query = (object_card or {}).get("background") or "产品介绍"
-        snippets = await cp.search_knowledge(query, account_id, 5)
-        # 初始上下文：接通时按对象背景预载少量知识；后续每轮按用户问题实时覆盖。
-        context_state.set_knowledge(snippets)
+        # 单对象绑话术的封闭流程不预载知识库(话术即上下文,避免白叠检索);
+        # 无模板/开放咨询才按对象背景预载。CONTEXT_RAG=1 强制预载。
+        from .flow import template_to_steps
+
+        _flow_has_steps = bool(template_to_steps(template))
+        if _context_rag_enabled(_flow_has_steps):
+            snippets = await cp.search_knowledge(query, account_id, 5)
+            # 初始上下文：接通时按对象背景预载少量知识；后续每轮按用户问题实时覆盖。
+            context_state.set_knowledge(snippets)
     except Exception as e:
         print(f"[agent] context resolve failed ({room_name}): {e}", flush=True)
 
     # 对话流程控制器:载入模板分步 + 对象变量;由它按轮注入"当前步",逐步推进。
     from .flow import FlowController, facts_line
+    from .flow import CONFIRM, OBJECTION, QUESTION, UNCLEAR, detect_whatsapp_signal
 
     flow_ctrl = FlowController.from_template(template, object_card)
     _log_stage("context_resolved")
@@ -737,13 +744,19 @@ async def entrypoint(ctx):
         text = getattr(item, "text_content", None) or getattr(item, "raw_text_content", "") or ""
         if not text:
             return
+        if role == "assistant":
+            # 与音频同守则:模型若输出发音/拼音教学,转录也落「请再报单号」罐頭,
+            # 唔好畀课程留喺通话记录(下次摘要又会引用返)。
+            text = lecture_guard(text, language_state.lang if language_state.lang in ("zh", "cantonese", "yue") else None)
         asyncio.create_task(cp.add_turn(call_id, role, _clean_transcript(text)))
 
     async def _async_update_context(role, text):
         # 渐进披露：每轮按用户当前问题实时检索（本地知识库 + 免费联网检索），
         # 覆盖初始知识，并维护整场对话摘要。联网失败静默降级，绝不阻塞通话。
+        # 绑了分步话术(has_steps)的封闭流程默认跳过检索——单对象只上话术，
+        # 减少每轮 prefill；开放咨询(无模板)才 RAG。CONTEXT_RAG=1 强制开。
         try:
-            if role == "user":
+            if role == "user" and _context_rag_enabled(flow_ctrl.has_steps if flow_ctrl else False):
                 from .web_search import web_search_text
 
                 hits = await cp.search_knowledge(text, context_state.account_id, 5)

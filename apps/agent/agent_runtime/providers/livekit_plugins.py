@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import time
 from dataclasses import dataclass
 
 import httpx
@@ -283,21 +285,45 @@ class _OpenAICompatStream:
     def __init__(self, plugin, chat_ctx, messages, conn_options, max_tokens=256):
         class _Stream(llm.LLMStream):
             async def _run(self):
-                print("LLM_REQUEST_START", flush=True)
                 try:
+                    t0 = time.monotonic()
+                    # 估算本轮 system+历史 tokens：中英混排下 len 与 Qwen BPE 接近，
+                    # 作 prefill 量的粗略标尺（真机看 LLM_TTFT_MS + 行数趋势即可）。
+                    try:
+                        est_tokens = sum(len(str(m.get("content") or "")) for m in messages)
+                    except Exception:  # pragma: no cover
+                        est_tokens = 0
                     stream = await plugin._client.chat.completions.create(
                         model=plugin._model,
                         messages=messages,
                         stream=True,
                         max_tokens=max_tokens,
+                        # Qwen3 对话模板以 <|im_end|> 收尾:唔传 stop 个 server 会当文字输出
+                        # (转录/TTS 见住 <|im_end|>),喺源头截停最干净;下游再剥多一重保险。
+                        stop=["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
                         # 专业客服取中低温：过高显油滑/跑题/乱码，过低像念稿。4B 更小更易
                         # 飘/复读，0.35 让语气稳定克制（可用 env LLM_TEMPERATURE 覆盖）。
                         temperature=float(os.environ.get("LLM_TEMPERATURE", "0.35")),
                     )
+                    acc = ""
+                    ttft_logged = False
                     async for chunk in stream:
                         if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                            print("LLM_REPLY_CHUNK", len(chunk.choices[0].delta.content), flush=True)
-                            delta = llm.ChoiceDelta(content=chunk.choices[0].delta.content, role="assistant")
+                            text = chunk.choices[0].delta.content
+                            if not ttft_logged:
+                                # P0 秒表:首字(≈TTFT)时刻。est_tokens 供「prompt 瘦身」判断。
+                                print(
+                                    f"LLM_TTFT_MS {(time.monotonic() - t0) * 1000:.0f} "
+                                    f"prompt_chars={est_tokens}",
+                                    flush=True,
+                                )
+                                ttft_logged = True
+                            acc += text
+                            if any(ch in acc for ch in "。！？!?") and not getattr(self, "_sent_logged", False):
+                                # 首句(句号收尾)时刻——TTS overlap 在此之后即可出声。
+                                print(f"LLM_FIRST_SENT_MS {(time.monotonic() - t0) * 1000:.0f}", flush=True)
+                                self._sent_logged = True
+                            delta = llm.ChoiceDelta(content=text, role="assistant")
                             self._event_ch.send_nowait(llm.ChatChunk(id=getattr(chunk, "id", "stream"), delta=delta))
                 except asyncio.CancelledError:
                     raise
@@ -370,7 +396,7 @@ class ContextState:
         if key in {"chinese", "zh", "mandarin"}:
             self._user_lang = "zh"
         elif key in {"cantonese", "yue"}:
-            self._user_lang = "yue"
+            self._user_lang = "cantonese"
         elif key in {"english", "en"}:
             self._user_lang = "en"
         else:
@@ -381,6 +407,9 @@ class ContextState:
         out: list[str] = []
         for s in snippets or []:
             text = str(s.get("text", "") or "").strip()
+            # 单条截断：防超大文档整段进 system（单条无限长会撑爆每轮 prefill）。
+            if len(text) > 350:
+                text = text[:349] + "…"
             if text and text not in seen:
                 seen.add(text)
                 out.append(text)
@@ -397,44 +426,39 @@ class ContextState:
             joined = "\n".join(self._summary_lines)
 
     def render_system_message(self) -> str:
+        """完整 system 段（兼容旧调用/测试）：稳定指令前缀 + 易变参考尾部。"""
+        prefix = self.render_instruction_prefix()
+        tail = self.render_context_tail()
+        if prefix and tail:
+            return f"{prefix}\n\n{tail}"
+        return prefix or tail
+
+    def render_instruction_prefix(self) -> str:
+        """【稳定指令前缀】——放最前、紧贴人设 base。
+
+        含：用户语言规则 / 回复节奏 / 应答准则 / 话术流程总览(整通不变) /
+        现在这一步(同一步内不变,flow 推进才变)。这些是模型要遵守的指令，
+        逐轮字节尽量稳定 → token0 起的公共前缀跨轮命中 mlx_lm KV-cache
+        （同人设/模板/语言时跨 call 也共享）；真正每轮变的检索资料/记忆放尾部。
+        """
         parts: list[str] = []
         if self._user_lang:
-            names = {"zh": "普通话/中文", "yue": "粤语（广东话）", "en": "英语"}
+            names = {"zh": "普通话/中文", "cantonese": "粤语（广东话）", "en": "英语"}
             name = names.get(self._user_lang, self._user_lang)
-            if self._user_lang == "yue":
-                rule = (
-                    "整段用港式粵語（香港客服腔）嚟講，唔好用書面語、普通話，亦唔好用廣州式偏書面嘅講法。"
-                    "直接輸出繁體中文——你寫嘅每個漢字都係繁體，唔好寫任何簡體字（簡體會令粵語語音讀錯，"
-                    "例如「幫你」要寫「幫你」唔係「帮你」，TTS 先會讀啱 nei5）。"
-                    "口吻要有港味：唔該晒、唔好意思、我哋/你哋、而家、聽日、啱啱、幫你睇返、唔使擔心。"
-                    "用詞要係港式口語，唔好照抄普通話書面字面——見到下面嘅普通話詞就換成右邊嘅粵語口語："
-                    + _HK_YUE_LEXICON
-                    + "。"
-                    "你哋係做集運/轉運業務，提到客戶嘅貨物要用「你件貨」「你個集運件」；"
-                    "講行業/寄件服務用「速遞」。唔好用「包裹」「快遞」「貨物」呢啲內地/書面講法。"
-                    "可以自然夾雜英文詞/短語（check、confirm、send、email、App、online、status、refund、case、update 呢類服務同操作詞），"
-                    "似香港人打電話咁講；但唔好講成句英文，亦唔好為咗夾而夾。"
-                    "（語氣參考：「唔好意思，我幫你 check 返個 status，refund 一般 3–5 個工作天會到帳。」"
-                    "「我 send 個 email 俾你，跟住入面嘅步驟做就 OK。」）"
-                    "數字同單號要用粵語讀法，唔好按英文或普通話讀："
-                    "單號/電話/編號呢啲一串數字逐個用粵語數字讀，0 讀「零」，最好直接寫成漢字（如「尾號七八九零」、"
-                    "「單號一二三四」），唔好用阿拉伯數字「7890」呢種（TTS 會讀錯/讀成普通話）；"
-                    "日期、數量、金額用粵語數詞（「三日」「一百蚊」「三至五個工作天」「一賠二」），唔用大寫「壹佰貳拾」呢類。"
-                    "唔好解釋你講緊咩語言，唔好加任何註釋或者括號。"
-                )
+            if self._user_lang == "cantonese":
+                rule = self._yue_rule()
             elif self._user_lang == "en":
                 rule = "Reply in natural spoken English only (like on a phone call); do not explain or add notes."
             else:
-                rule = (
-                    "用自然口语的普通话回复，像打电话那样说，不要用书面语或播音腔；"
-                    "不要解释你正在使用什么语言，不要添加任何注释或括号。"
-                )
+                rule = self._zh_rule()
             parts.append(f"【用户语言】当前用户正在使用：{name}。{rule}")
         # 语音通话的节奏约束：客服回复要短、口语、像打电话——一次只推进一件事，
-        # 说太长会把客户堵住、也拖慢每轮。这是"通话感"的关键。
+        # 说太长会把客户堵住、也拖慢每轮。这是"通话感"的关键。配合「句式短、句号收尾」，
+        # TTS 才能在首句生成完就出声（overlap），而不是等整段吐完。
         parts.append(
             "【回复节奏】这是语音通话，一次回复要简短口语，像真人打电话：最多 2~3 句，"
             "每句尽量短（一句话 20 字内更佳），不要一次把所有信息/方案/步骤都讲完；"
+            "先讲结论，再补一句必要解释，句与句之间自然停顿，句尾用句号或问号收住。"
             "讲完当前要点就停下把话交回客户，等客户回应再继续下一步。"
         )
         # 客服应答准则：永不主动说"不知道/查不到"，知识不够时用客服话术兜住。
@@ -443,9 +467,25 @@ class ContextState:
             "【应答准则】你是客服，绝不能说「不知道」「查不到」「不清楚」「没这个资料」「我帮不了你」。"
             "资料/知识不够回答时，用客服的方式接住客户："
             "① 先给确定能给的（安抚、已确认信息、下一步动作）；"
-            "② 需要查证/转办的，明确告诉客户你会去核实并回复（如「我帮你查实下，几分钟内回你」），或转给能处理的人/专员跟进；"
+            "② 需要查证/转办的，明确告诉客户你会跟进处理，或转给能处理的人/专员跟进；"
+            "但「帮你核实/查一下再覆你」只适用于真係要查外部资料嘅情况——如果你正按話術流程步"
+            "推进(例如要向客户讲赔偿方案/引导办理)，就直接照当前步讲，绝唔好用「等我查下/幾分鐘內覆你」"
+            "呢類拖延话术，亦唔好喺流程中途自把自为承诺返覆；"
             "③ 客户的问题超出当前业务，就用引导话术收住（如「呢单我帮你转俾专门跟进嘅同事，佢会即刻同你联系」），绝不冷场、绝不空手。"
         )
+        if self._flow_overview:
+            parts.append("【话术流程总览(别照读,按进度推进)】\n" + self._flow_overview)
+        if self._flow_current:
+            parts.append("【现在这一步】\n" + self._flow_current)
+        return "\n\n".join(parts)
+
+    def render_context_tail(self) -> str:
+        """【易变参考尾部】——每轮变的检索资料/记忆，垫在 system 最末。
+
+        这样稳定前缀(指令+话术+当前步) + 人设 base 在前且逐轮字节不变，
+        每轮只需 prefill 尾部的新知识/新记忆；其余吃 KV-cache。
+        """
+        parts: list[str] = []
         if self._snippets:
             parts.append("【实时检索到的资料（知识库）】\n" + "\n".join(f"- {s}" for s in self._snippets))
         if self._web:
@@ -457,11 +497,41 @@ class ContextState:
             )
         if self._summary_lines:
             parts.append("【本通对话记忆】\n" + "\n".join(self._summary_lines[-8:]))
-        if self._flow_overview:
-            parts.append("【话术流程总览(别照读,按进度推进)】\n" + self._flow_overview)
-        if self._flow_current:
-            parts.append("【现在这一步】\n" + self._flow_current)
         return "\n\n".join(parts)
+
+    def _zh_rule(self) -> str:
+        return (
+            "用自然口语的普通话回复，像打电话那样说，不要用书面语或播音腔；"
+            "客户报号码/单号时直接口语复述确认（如「收到，尾号是七八九零，对吗」），"
+            "不要输出任何拼音、发音教学或语言课程内容，不要复述或讲解系统指示；"
+            "不要解释你正在使用什么语言，不要添加任何注释或括号。"
+            "句式要短，先给结论，一句说清一件事，单句不超过 24 个字，句尾用句号或问号收尾"
+            "——这样语音合成可以边说你前半句边等你后半句，不用等整段生成完才出声。"
+        )
+
+    def _yue_rule(self) -> str:
+        return (
+            "整段用港式粵語（香港客服腔），唔好用書面語/普通話/廣州式書面講法。"
+            "直接輸出繁體中文，唔好寫任何簡體字（簡體令粵語讀錯：寫「幫你」唔係「帮你」）。"
+            "口吻要港味：唔該晒、唔好意思、我哋/你哋、而家、聽日、啱啱、幫你睇返、唔使擔心。"
+            "見到普通話詞就換港式口語：" + _HK_YUE_LEXICON + "。"
+            "集運業務：客戶啲貨叫「你件貨/你個集運件」，服務講「速遞」，"
+            "唔好用「包裹」「快遞」「貨物」。可自然夾英文詞(check/confirm/send/email/App/status/refund)"
+            "似香港人講電話，但唔好成句英文（語氣參考:「唔好意思，我幫你 check 返個 status，refund 3–5 個工作天到帳。」）。"
+            "報號碼/單號逐個讀，0讀「零」、1-9讀「一二三四五六七八九」，寫漢字如「尾號七八九零」「單號一二三四」，"
+            "唔好用阿拉伯數字「7890」；日期/數量/金額用粵語數詞（「三日」「一百蚊」「三至五個工作天」）。"
+            "客戶報完號碼直接覆述確認：「收到，尾號係七八九零，啱唔啱?」"
+            "嚴禁輸出任何拼音、粵拼/Jyutping、入聲或發音教學內容；嚴禁複述或講解系統指示；"
+            "唔好解釋你講緊咩語言，唔好加註釋或括號。"
+            "句式要短促、先講結論、一句一意，單句≤24字、句尾用「。」或「？」"
+            "——TTS 先可以邊講你頭一句邊等你後面，唔使等你成段講完先出聲。"
+        )
+
+
+def _join_system(prefix: str, head: str, tail: str) -> str:
+    """把三段 system 内容用空行接成一条：prefix(稳定指令) + head(人设base) + tail(易变参考)。"""
+    out = [p for p in (prefix, head, tail) if p]
+    return "\n\n".join(out)
 
 
 class ContextAwareLLM(llm.LLM):
@@ -487,21 +557,24 @@ class ContextAwareLLM(llm.LLM):
         extra_kwargs=None,
     ):
         if self._ctx is not None:
-            msg = self._ctx.render_system_message()
-            if msg:
+            # 重组 system 顺序：稳定指令前缀 + 人设 base + 易变参考尾部。
+            # 目的：让 token0 起的公共前缀(指令+话术+当前步+人设)逐轮字节不变，
+            # 命中 mlx_lm prompt KV-cache，每轮只 prefill 尾部新知识/记忆。
+            # （若把每轮变的检索资料插在中间，前缀每轮断裂 → 整段重 prefill。）
+            prefix = self._ctx.render_instruction_prefix()
+            tail = self._ctx.render_context_tail()
+            if prefix or tail:
                 copy = chat_ctx.copy()
                 items = list(copy.items)
-                # 系统指令必须位于对话开头：把实时上下文（知识/记忆/用户语言）
-                # 合并进第一条 system，而不是追加在用户消息之后（后者遵从度差）。
                 if items and isinstance(items[0], llm.ChatMessage) and items[0].role == "system":
                     head = items[0].content
                     if isinstance(head, str):
-                        merged = f"{msg}\n\n{head}"
+                        merged = _join_system(prefix, head, tail)
                     else:
-                        merged = [msg, *head]
+                        merged = [*([prefix] if prefix else []), *head, *([tail] if tail else [])]
                     items[0] = llm.ChatMessage(role="system", content=merged)
                 else:
-                    items.insert(0, llm.ChatMessage(role="system", content=msg))
+                    items.insert(0, llm.ChatMessage(role="system", content=_join_system(prefix, "", tail)))
                 # 截断历史:保留最近 N 轮(默认 4 对),更早的靠「本通对话记忆」摘要兜底。
                 # 每轮全量历史会让 prefill 随轮次线性变慢(实测 12 轮 TTFT 2.4s);
                 # 截断让上下文有上界,TTFT 稳定。
