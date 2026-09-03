@@ -38,6 +38,10 @@ _EXPR_PARTIAL_RE = re.compile(r"<expr\b[^>]*$")
 # so the persisted transcript is clean customer-facing copy.
 _EXPR_SYNC_RE = re.compile(r"<expr\b[^>]*?/>|<expr\b[^>]*>|</expr>|<expr\b[^>]*$")
 
+# 舞台/动作括号提示：模型偶尔输出（稍作聽筒聲）（笑）（停顿）这类全角括号批注，
+# TTS 会照念出来——进 TTS 前剥掉；半角括号(paren)一般是真内容(如解释)保留。
+_STAGE_PAREN_RE = re.compile(r"（[^（）]*?(?:声|音|笑|停顿|静默|沉默|稍等|清嗓|动作|背景|聽筒|铃)[^（）]*?）|\([^()]*?(?:声|笑|停顿|pause|sigh|clears throat)[^()]*?\)", re.IGNORECASE)
+
 
 def _clean_transcript(text: str) -> str:
     return _EXPR_SYNC_RE.sub("", text).strip()
@@ -48,6 +52,8 @@ async def _strip_expr_markup(text):
     async for chunk in text:
         combined = carry + chunk
         out = _EXPR_TAG_RE.sub("", combined)
+        # 舞台/动作括号提示（如（稍作聽筒聲））也会被 TTS 念出来，一并剥掉。
+        out = _STAGE_PAREN_RE.sub("", out)
         # A tag split across stream chunks has no closing ">" yet: hold the
         # trailing "<expr ..." fragment until the next chunk completes it.
         m = _EXPR_PARTIAL_RE.search(out)

@@ -50,9 +50,11 @@ function LiveAgentPanel({ room }: { room: Room | null }) {
   const agentIdentity = identity ?? "agent";
   const recent = useMemo(() => transcriptions.slice(-16).reverse(), [transcriptions]);
   const agentState = state ?? "connecting";
-  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const listRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    scrollRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    // 只滚转录容器到底部，不 scrollIntoView 整页——否则多轮后整个工作台被顶走/看似塌陷。
+    const el = listRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
   }, [recent]);
   const speaking = agentState === "speaking";
 
@@ -72,8 +74,8 @@ function LiveAgentPanel({ room }: { room: Room | null }) {
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden">
-      {/* 转写时间线（官方风格：mono、按说话者着色）；超高时内部滚动，不撑高页面 */}
-      <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-1 py-2">
+      {/* 转写时间线：占满剩余高度并内部滚动；兄弟区都 shrink-0 防止把这里压没。 */}
+      <div ref={listRef} className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-1 py-2">
         {recent.length === 0 && (
           <div className="flex flex-1 items-center justify-center font-mono text-[10px] font-bold uppercase tracking-[0.16em] text-[var(--stage-muted)]">
             等待对话…
@@ -107,13 +109,12 @@ function LiveAgentPanel({ room }: { room: Room | null }) {
           );
         })}
       </div>
-      <div ref={scrollRef} />
 
-      {/* 中央：官方点阵可视化（mood 驱动色） */}
-      <div className="flex flex-col items-center gap-3 py-4">
+      {/* 中央：官方点阵可视化（mood 驱动色）；sm 尺寸并 shrink-0，把纵向空间让给转写 */}
+      <div className="flex shrink-0 items-center justify-center gap-4 py-2">
         <AgentStateLabel state={agentState} />
-      <VoiceAgentInterface
-          size="md"
+        <VoiceAgentInterface
+          size="sm"
           state={agentState}
           mood={mood}
           audioTrack={microphoneTrack}
@@ -123,7 +124,7 @@ function LiveAgentPanel({ room }: { room: Room | null }) {
 
       {/* 实时分析（基于本通转写实时统计） */}
       {liveStats && (
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-[var(--card-border)] px-2 py-1.5 text-[10px] text-[var(--muted)]">
+        <div className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-1 border-t border-[var(--card-border)] px-2 py-1.5 text-[10px] text-[var(--muted)]">
           <span>轮次 <b className="text-[var(--foreground)]">{liveStats.turnCount}</b></span>
           <span>均每轮字数 <b className="text-[var(--foreground)]">{liveStats.density}</b></span>
           <span>填充词 <b className="text-[var(--foreground)]">{liveStats.fillers}</b></span>
@@ -132,7 +133,7 @@ function LiveAgentPanel({ room }: { room: Room | null }) {
       )}
 
       {/* 控制条（AgentSessionProvider 已内置音频渲染）；设备切换已移到右侧「音频设备」卡片 */}
-      <div className="flex flex-col items-center gap-2 border-t border-[var(--card-border)] py-3">
+      <div className="flex shrink-0 flex-col items-center gap-2 border-t border-[var(--card-border)] py-2">
         <div className="flex items-center justify-center gap-3">
           <StartAudio label="点击开启声音" />
           <VoiceAssistantControlBar />

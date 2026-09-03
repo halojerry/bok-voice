@@ -168,6 +168,8 @@ def test_yue_rule_requires_hk_style_code_mixing():
     assert "港式粤语" in text
     assert "refund" in text and "check" in text  # 允许自然夹英文服务词
     assert "唔好解释" in text  # 防泄漏仍保留
+    # 数字要用粤语读法：单号逐字读汉字、0 读零、不用阿拉伯数字串。
+    assert "七八九零" in text and "粵語數字" in text
 
 
 def test_zh_rule_has_no_hk_style():
