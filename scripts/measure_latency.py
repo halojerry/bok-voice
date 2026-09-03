@@ -19,7 +19,7 @@ TTS = os.environ.get("QWEN3_TTS_BASE_URL", "http://127.0.0.1:8788")
 LLM = os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1")
 MODEL = os.environ.get(
     "MLX_LLM_MODEL",
-    "/Users/halo/.lmstudio/models/huihui-ai/Huihui-Qwen3.5-9B-abliterated-mlx-4bit",
+    "/Users/halo/.lmstudio/models/avan-ag/Qwen3.5-4B-Uncensored-MLX-4bit",
 )
 
 
@@ -34,16 +34,19 @@ def ms(t0: float) -> str:
 
 
 def measure_asr(client: httpx.Client) -> None:
-    pcm = read_wav_pcm(ROOT / "tests/fixtures/audio/zh.wav")
-    t0 = time.perf_counter()
-    s = client.post(f"{ASR}/api/start", timeout=30).json()["session_id"]
-    for i in range(0, len(pcm), 3200):
-        client.post(
-            f"{ASR}/api/chunk", params={"session_id": s},
-            content=pcm[i : i + 3200], headers={"Content-Type": "application/octet-stream"}, timeout=30,
-        )
-    r = client.post(f"{ASR}/api/finish", params={"session_id": s}, timeout=60).json()
-    print(f"ASR 转写(3s 音频)      : {ms(t0)}   text={r.get('text','')[:30]!r}")
+    # 与 agent 同款「整包上传」契约（P0 提速后）：start(language 提示) → finish(body=PCM)。
+    # 分别测 auto 与 cantonese 提示，验证粤语转写走语言提示。
+    pcm = read_wav_pcm(ROOT / "tests/fixtures/audio/yue.wav")
+    for hint in ("", "cantonese"):
+        t0 = time.perf_counter()
+        s = client.post(
+            f"{ASR}/api/start", params={"language": hint} if hint else None, timeout=30
+        ).json()["session_id"]
+        r = client.post(
+            f"{ASR}/api/finish", params={"session_id": s}, content=pcm,
+            headers={"Content-Type": "application/octet-stream"}, timeout=60,
+        ).json()
+        print(f"ASR 转写 hint={hint or 'auto':<10}: {ms(t0)}   text={r.get('text','')[:36]!r}")
 
 
 def measure_llm(client: httpx.Client) -> None:
@@ -118,9 +121,10 @@ def main() -> None:
         measure_llm(client)
         measure_translate(client)
         measure_tts(client, "你好，欢迎致电博克，请问有什么可以帮您？", "zh", "一句 17 字")
-        measure_tts(client, "好的，请问您想了解哪一款产品呢？", "zh", "一句 15 字")
-        print("\n说明：VAD 切句=说停后约 350-500ms（Silero min_silence=0.35s+prefix）；")
-        print("A线端到端≈VAD+ASR+LLM+TTS；B线≈VAD+ASR+翻译+TTS（流式切句会交错，不严格串行）")
+        measure_tts(client, "唔該晒你今日嘅時間，我哋會跟進。", "cantonese", "粤语 15 字")
+        print("\n说明：VAD 判定说完=0.45s + endpointing min=0.35s（max 1.2s 自适应）；")
+        print("A线端到端≈VAD+ASR+LLM首句+TTS首包。注：VAD/endpointing 不能为追低延迟收太紧——")
+        print("离线式 ASR 转写需 ~0.5-1.2s，端点判定要等得起它，否则「转写晚于轮次提交」回复被丢。")
 
 
 if __name__ == "__main__":

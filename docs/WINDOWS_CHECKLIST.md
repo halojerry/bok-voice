@@ -14,7 +14,7 @@
 
 - [ ] control-plane :8000 / ASR :8787 / TTS :8788 / LLM :1235 / B-line :8790 / LiveKit :7880 全 UP
 - [ ] LLM 为 llama-server CUDA（--jinja + enable_thinking=false，回复无 reasoning、首 token 快）
-- [ ] ASR 为 Qwen3-ASR transformers+CUDA：zh/yue/en 三语转写正确（粤语：我哋支持粵語）
+- [ ] ASR 为 Qwen3-ASR transformers+CUDA：zh/cantonese/en 三语转写正确（粤语：我哋支持粵語）
 
 ## A 线
 
@@ -25,7 +25,7 @@
 
 ## B 线
 
-- [ ] zh->en、yue->zh 双通道并发，字幕/音频正常
+- [ ] zh->en、cantonese->zh 双通道并发，字幕/音频正常
 - [ ] 积压时 queueDepth/backlog 变化、丢弃生效；指标写 app-data
 
 ## 上线合规

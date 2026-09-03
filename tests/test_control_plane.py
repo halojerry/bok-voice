@@ -46,6 +46,70 @@ def test_idempotent_migration_adds_missing_columns(tmp_path, monkeypatch):
     assert "summary" in cols["settlements"]
 
 
+def test_data_migration_yue_to_cantonese(tmp_path, monkeypatch):
+    """存量 language='yue' 行 + reference_audio/global_settings 的 yue 键 → cantonese（幂等）。
+
+    字段统一：新代码只产出 cantonese；旧数据在 control-plane 启动时一次性迁移。
+    """
+    import json
+    import sqlite3
+
+    from sqlalchemy import text
+
+    db = tmp_path / "migrate.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        "CREATE TABLE persona_profiles (id VARCHAR(64) PRIMARY KEY, account_id VARCHAR(64) DEFAULT '', name VARCHAR(255) DEFAULT '', company VARCHAR(255) DEFAULT '', tone TEXT DEFAULT '', language VARCHAR(16) DEFAULT 'zh', reference_audio VARCHAR(512) DEFAULT '', tts_provider VARCHAR(32) DEFAULT '');"
+        "CREATE TABLE object_profiles (id VARCHAR(64) PRIMARY KEY, account_id VARCHAR(64) DEFAULT '', display_name VARCHAR(255) DEFAULT '', role_template VARCHAR(64) DEFAULT '', language VARCHAR(16) DEFAULT 'zh', background TEXT DEFAULT '', phone VARCHAR(64) DEFAULT '', tracking_no VARCHAR(64) DEFAULT '', courier VARCHAR(64) DEFAULT '', address VARCHAR(255) DEFAULT '', template_id VARCHAR(64) DEFAULT '', status VARCHAR(32) DEFAULT 'active');"
+        "CREATE TABLE call_sessions (id VARCHAR(64) PRIMARY KEY, account_id VARCHAR(64) DEFAULT '', object_id VARCHAR(64) DEFAULT '', persona_id VARCHAR(64) DEFAULT '', mode VARCHAR(32) DEFAULT '', status VARCHAR(32) DEFAULT '', language TEXT DEFAULT '', template_id VARCHAR(64) DEFAULT '', whatsapp_status VARCHAR(16) DEFAULT '', customer_whatsapp VARCHAR(64) DEFAULT '');"
+        "CREATE TABLE conversation_templates (id VARCHAR(64) PRIMARY KEY, account_id VARCHAR(64) DEFAULT '', name VARCHAR(255) DEFAULT '', opening TEXT DEFAULT '', core TEXT DEFAULT '', objection TEXT DEFAULT '', closing TEXT DEFAULT '', tone_override VARCHAR(255) DEFAULT '', language VARCHAR(16) DEFAULT 'zh', steps_json TEXT DEFAULT '');"
+        "CREATE TABLE global_settings (id VARCHAR(64) PRIMARY KEY, asr_json TEXT DEFAULT '{}', llm_json TEXT DEFAULT '{}', tts_json TEXT DEFAULT '{}', vad_json TEXT DEFAULT '{}', policy VARCHAR(64) DEFAULT 'offline_first');"
+    )
+    conn.execute(
+        "INSERT INTO persona_profiles (id, language, reference_audio) VALUES ('p1','yue', ?)",
+        (json.dumps({"zh": "male-qn-qingse", "yue": "Cantonese_GentleLady"}, ensure_ascii=False),),
+    )
+    conn.execute("INSERT INTO persona_profiles (id, language, reference_audio) VALUES ('p2','zh','{}')")
+    conn.execute("INSERT INTO object_profiles (id, language) VALUES ('o1','yue')")
+    conn.execute("INSERT INTO call_sessions (id, language) VALUES ('c1','yue')")
+    conn.execute("INSERT INTO conversation_templates (id, language) VALUES ('t1','yue')")
+    conn.execute(
+        "INSERT INTO global_settings (id, tts_json, vad_json) VALUES ('global', ?, ?)",
+        (
+            json.dumps({"provider": "minimax", "speaker_zh": "x", "speaker_yue": "Cantonese_crisp_news_anchor_vv2"}),
+            json.dumps({"provider": "silero", "min_silence_duration": 0.45, "min_speech_duration": 0.15}),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    from control_plane.deps import build_engine
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db}")
+    build_engine()
+    build_engine()  # 幂等：重跑不报错、不重复改写
+
+    c = sqlite3.connect(db)
+    _ids = {"persona_profiles": "p1", "object_profiles": "o1", "call_sessions": "c1", "conversation_templates": "t1"}
+    langs = {
+        t: c.execute(f"SELECT language FROM {t} WHERE id='{_ids[t]}'").fetchone()[0]
+        for t in ("persona_profiles", "object_profiles", "call_sessions", "conversation_templates")
+    }
+    assert all(v == "cantonese" for v in langs.values()), langs
+    ref = c.execute("SELECT reference_audio FROM persona_profiles WHERE id='p1'").fetchone()[0]
+    assert json.loads(ref) == {"zh": "male-qn-qingse", "cantonese": "Cantonese_GentleLady"}
+    # 未含 yue 的行/值不动（voice ID Cantonese_* 保持）。
+    ref_zh = c.execute("SELECT reference_audio FROM persona_profiles WHERE id='p2'").fetchone()[0]
+    assert json.loads(ref_zh) == {}
+    tts = json.loads(c.execute("SELECT tts_json FROM global_settings WHERE id='global'").fetchone()[0])
+    assert "speaker_yue" not in tts and tts["speaker_cantonese"] == "Cantonese_crisp_news_anchor_vv2"
+    # 迁移只改键名，不改 vad 数值（用户调过的 VAD 值不被启动迁移覆盖）。
+    vad = json.loads(c.execute("SELECT vad_json FROM global_settings WHERE id='global'").fetchone()[0])
+    assert vad["min_silence_duration"] == 0.45
+    assert vad["min_speech_duration"] == 0.15
+    c.close()
+
+
 def test_control_plane_flow():
     with TestClient(app) as client:
         assert client.get("/health").json() == {"ok": True, "service": "bok-voice-control-plane"}
@@ -200,6 +264,36 @@ def test_supervisor_pause_resume_roundtrip():
         resumed = client.post(f"/api/supervisor/{call_id}/resume-agent").json()
         assert resumed["status"] == "active"
         assert client.get(f"/api/calls/{call_id}").json()["escalated_to_human"] is False
+
+
+def test_whatsapp_capture_and_handled_roundtrip():
+    """Agent 偵測客戶 WhatsApp → offered→captured→handled,唔覆寫已知號碼。"""
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/calls",
+            json={"account_id": "acc-001", "object_id": "obj-1", "persona_id": "p-1", "mode": "simulation"},
+        ).json()
+        call_id = created["id"]
+        assert created.get("whatsapp_status", "") in ("", None)
+
+        # offered(客戶應承加,無號碼)
+        r = client.post(f"/api/calls/{call_id}/whatsapp", json={"number": ""}).json()
+        assert r["whatsapp_status"] == "offered"
+        # captured(客戶俾號碼)
+        r = client.post(f"/api/calls/{call_id}/whatsapp", json={"number": "6868123456"}).json()
+        assert r["whatsapp_status"] == "captured"
+        assert r["customer_whatsapp"] == "6868123456"
+        # captured 後空 offered 唔會降級 / 同號碼唔重寫
+        r = client.post(f"/api/calls/{call_id}/whatsapp", json={"number": ""}).json()
+        assert r["whatsapp_status"] == "captured"
+        # handled 後唔再降級(專員已對接)
+        r = client.post(f"/api/calls/{call_id}/whatsapp/handled", json={"handled": True}).json()
+        assert r["whatsapp_status"] == "handled"
+        r = client.post(f"/api/calls/{call_id}/whatsapp", json={"number": "90000000"}).json()
+        assert r["whatsapp_status"] == "handled"
+        assert r["customer_whatsapp"] == "6868123456"
+        # 404
+        assert client.post("/api/calls/nope/whatsapp", json={"number": "1"}).status_code == 404
 
 
 def test_conversation_template_crud_and_object_binding():

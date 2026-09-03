@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import time
 from dataclasses import dataclass
 
 import httpx
@@ -28,18 +30,18 @@ _CANTONESE_WORDS = (
 # 而地道粤语口语转写几乎不用。整句长度 + 功能字双重命中才判「强普通话」。
 _MANDARIN_MARKERS = ("的", "了", "这", "那", "什", "么", "说", "没", "给", "们", "您")
 
-# 港式粤语高频用词表(普→港口语词):这里只放「普通话书面词 → 港式口语词」的用词替换,
+# 港式粤语高频用词表(普→港口语词):只放「普通话书面词 → 港式口语词」的用词替换,
 # 不放纯字形(简→繁)条目——字形由规则里的「直接輸出繁體」统一管,避免两件事搅在一起。
+# 只保留客服高频词(疑问/人称/常用动词/礼貌/集运业务);低频书面词交给模型粤语能力,
+# 控制静态前缀体积(prefill 与 KV-cache 都受益)。
 _HK_YUE_LEXICON = (
-    "这个→呢個 那个→嗰個 这些→呢啲 那些→嗰啲 "
-    "这里→呢度 那里→嗰度 什么→乜嘢 怎么→點樣 为什么→點解 谁→邊個 哪里→邊度 什么时候→幾時 多少→幾多 怎么办→點算 "
-    "是→係 不是→唔係 的→嘅 了→咗 在→喺 来→嚟 没有→冇 不要→唔好 不用→唔使 不可以→唔得 不知道→唔知 "
-    "现在→而家 刚刚→啱啱 马上→即刻 今天→今日 明天→聽日 昨天→尋日 等一下→等陣 没关系→唔緊要 "
-    "我们→我哋 你们→你哋 他们→佢哋 他/她→佢 我的→我嘅 你的→你嘅 "
-    "也→都 还→仲 很→好 更→更加 告诉→話俾 看→睇 听→聽 找→搵 给→俾 拿→攞 回家→返屋企 "
-    "谢谢→唔該晒 对不起→唔好意思 没关系→唔緊要 没问题→冇問題 东西→嘢 事情→事 "
-    "联系→聯絡 处理→處理/跟進 安排→安排 确认→確認 帮忙→幫手 号码→冧巴/號碼 可以吗→得唔得/可唔可以 "
-    "快递→速遞 包裹→集運件 货物→貨件/集運件 转运→集運 收到→收到/收咗 "
+    "这个→呢個 那个→嗰個 这些→呢啲 这里→呢度 那里→嗰度 什么→乜嘢 怎么→點樣 为什么→點解 "
+    "谁→邊個 哪里→邊度 什么时候→幾時 多少→幾多 "
+    "是→係 不是→唔係 的→嘅 了→咗 在→喺 来→嚟 没有→冇 不要→唔好 不用→唔使 不知道→唔知 "
+    "现在→而家 刚刚→啱啱 今天→今日 明天→聽日 "
+    "我们→我哋 你们→你哋 他们→佢哋 告诉→話俾 看→睇 找→搵 给→俾 拿→攞 "
+    "谢谢→唔該晒 对不起→唔好意思 没问题→冇問題 "
+    "快递→速遞 包裹→集運件 联系→聯絡 确认→確認 帮忙→幫手 可以吗→得唔得/可唔可以 "
 )
 
 # 中文对话里常被整词借用的英语感叹词：出现它们不代表用户切到英语。
@@ -72,6 +74,59 @@ def _inject_pauses(text: str) -> str:
     if buf:
         out.append(buf)
     return "".join(out)
+
+
+# ---- 发音教学形输出拦截 ----
+# 弱模型(4B)对 prompt 里「数字要读成汉字」这类规则会过度字面化,自造一段
+# 「粤语用字粤拼(Jyutping)发音要点 1一jat1…10十sap6」课程并让 TTS 照念。
+# 正常客服回复永不出现这些术语/罗马拼音+调号,命中即整段替换成「请重报单号」。
+_LECTURE_TERMS = (
+    "發音要點", "发音要点", "發音教學", "发音教学", "拼音教學", "拼音教学",
+    "入聲字", "入声字", "入聲", "入声", "韻母", "韵母", "聲調", "声调",
+    "尾音收", "粵拼", "粤拼", "Jyutping", "jyutping", "JYUTPING",
+    "双唇閉合", "双唇闭合", "發音短促", "发音短促", "高升調", "高升调",
+)
+# 罗马字拼音/粤拼+声调数字:jat1、gau2、saam1、yi1 这类。不用开头的 \b,
+# 让「一jat1」这种紧贴汉字的写法也能命中;≥3 个才判「课程」,避免正常夹
+# 英文(如 version2/order3 偶发)误伤。
+_JYUTPING_TOKEN_RE = re.compile(r"[A-Za-z]{1,8}[1-6]\b")
+# 罐头的语言跟随文本里的粤语特征字(兜底);有明确会话语言时用会话语言。
+_CANTONESE_HINT_CHARS = set("嘅唔冇喺嗰咁嚟啲佢哋")
+_LECTURE_CANNED_CANTONESE = "唔好意思，頭先聽得唔係好清楚，可唔可以再講多次個單號或者訂單號碼俾我？"
+_LECTURE_CANNED_ZH = "不好意思，刚才没太听清楚，可以再把单号或订单号码说一遍吗？"
+
+
+def is_lecture_text(text: str) -> bool:
+    """整段是否「发音/拼音/声调教学」形(正常客服回复不会是)。"""
+    if not text:
+        return False
+    if any(w in text for w in _LECTURE_TERMS):
+        return True
+    return len(_JYUTPING_TOKEN_RE.findall(text)) >= 3
+
+
+def _lecture_lang(text: str) -> str:
+    if any(ch in text for ch in _CANTONESE_HINT_CHARS):
+        return "cantonese"
+    return "zh"
+
+
+def lecture_canned(lang: str | None = None) -> str:
+    # 旧数据/旧标签可能仍是 "yue"：只读别名，统一按粤语罐头处理。
+    return _LECTURE_CANNED_CANTONESE if lang in ("cantonese", "yue") else _LECTURE_CANNED_ZH
+
+
+def lecture_guard(text: str, lang: str | None = None) -> str:
+    """教学形输出 → 罐头的「请客户再报一次单号」;正常回复原样返回。
+
+    在转录落库与 TTS 合成两处都套用,保证音频同 transcript 一致——
+    唔会「录低咗段教学、播咗第二句」。
+    """
+    if not text:
+        return text
+    if not is_lecture_text(text):
+        return text
+    return lecture_canned(lang or _lecture_lang(text))
 
 
 def _looks_cantonese(text: str) -> bool:
@@ -115,12 +170,12 @@ def _classify_spoken_language(lang: str, text: str) -> tuple[str, bool]:
     """归一语言标签并给出「强证据」判断。
 
     返回 (lang, strong)：strong=True 表示该判定有可靠证据（粤语特征字/词、
-    明确的 yue 标签、实质性英文、够长的普通话句子）；strong=False 表示标签
+    明确的 cantonese/yue 标签、实质性英文、够长的普通话句子）；strong=False 表示标签
     模糊（普通话/英文标签 + 短句或借用词）——这种轮次不应把说话人语言拉走。
     """
     key = (lang or "").strip().lower()
-    if key in {"yue", "cantonese"}:
-        return "yue", True
+    if key in {"cantonese", "yue"}:
+        return "cantonese", True
     if key in {"en", "english"}:
         if _looks_english(text):
             return "en", True
@@ -128,7 +183,7 @@ def _classify_spoken_language(lang: str, text: str) -> tuple[str, bool]:
     if key in {"zh", "chinese", "mandarin"}:
         # 判普通话但文本明显是粤语 → 纠偏（整词命中，避免普粤共用字误伤）。
         if _looks_cantonese(text):
-            return "yue", True
+            return "cantonese", True
         if _looks_mandarin(text):
             return "zh", True
         # 短句（好/嗯/係 之类）两种语言都可能：不构成强证据，交给滞后逻辑。
@@ -146,7 +201,9 @@ def _normalize_asr_language(lang: str, text: str) -> str:
 class LanguageState:
     """Shared between ASR and TTS so replies use the language the user spoke.
 
-    lang 的切换带滞后：只有强证据（明确的 yue/en 标签、粤语特征字词、够长的
+    规范语言值: zh / cantonese / en（粤语统一叫 cantonese；旧数据里的 yue 在
+    入口处作只读别名归一到 cantonese，新代码永不产出 yue）。
+    lang 的切换带滞后：只有强证据（明确的 cantonese/en 标签、粤语特征字词、够长的
     普通话句子）才允许改变当前语言；标签模糊的短轮次（好/嗯/係…）保持原语言，
     避免 ASR 单轮误标把「粤语客户」拉成普通话、LLM 跟着回普、TTS 切音色。
     开场语言由 agent 按人设/对象语言预置，同样受此保护。
@@ -283,21 +340,45 @@ class _OpenAICompatStream:
     def __init__(self, plugin, chat_ctx, messages, conn_options, max_tokens=256):
         class _Stream(llm.LLMStream):
             async def _run(self):
-                print("LLM_REQUEST_START", flush=True)
                 try:
+                    t0 = time.monotonic()
+                    # 估算本轮 system+历史 tokens：中英混排下 len 与 Qwen BPE 接近，
+                    # 作 prefill 量的粗略标尺（真机看 LLM_TTFT_MS + 行数趋势即可）。
+                    try:
+                        est_tokens = sum(len(str(m.get("content") or "")) for m in messages)
+                    except Exception:  # pragma: no cover
+                        est_tokens = 0
                     stream = await plugin._client.chat.completions.create(
                         model=plugin._model,
                         messages=messages,
                         stream=True,
                         max_tokens=max_tokens,
+                        # Qwen3 对话模板以 <|im_end|> 收尾:唔传 stop 个 server 会当文字输出
+                        # (转录/TTS 见住 <|im_end|>),喺源头截停最干净;下游再剥多一重保险。
+                        stop=["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
                         # 专业客服取中低温：过高显油滑/跑题/乱码，过低像念稿。4B 更小更易
                         # 飘/复读，0.35 让语气稳定克制（可用 env LLM_TEMPERATURE 覆盖）。
                         temperature=float(os.environ.get("LLM_TEMPERATURE", "0.35")),
                     )
+                    acc = ""
+                    ttft_logged = False
                     async for chunk in stream:
                         if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                            print("LLM_REPLY_CHUNK", len(chunk.choices[0].delta.content), flush=True)
-                            delta = llm.ChoiceDelta(content=chunk.choices[0].delta.content, role="assistant")
+                            text = chunk.choices[0].delta.content
+                            if not ttft_logged:
+                                # P0 秒表:首字(≈TTFT)时刻。est_tokens 供「prompt 瘦身」判断。
+                                print(
+                                    f"LLM_TTFT_MS {(time.monotonic() - t0) * 1000:.0f} "
+                                    f"prompt_chars={est_tokens}",
+                                    flush=True,
+                                )
+                                ttft_logged = True
+                            acc += text
+                            if any(ch in acc for ch in "。！？!?") and not getattr(self, "_sent_logged", False):
+                                # 首句(句号收尾)时刻——TTS overlap 在此之后即可出声。
+                                print(f"LLM_FIRST_SENT_MS {(time.monotonic() - t0) * 1000:.0f}", flush=True)
+                                self._sent_logged = True
+                            delta = llm.ChoiceDelta(content=text, role="assistant")
                             self._event_ch.send_nowait(llm.ChatChunk(id=getattr(chunk, "id", "stream"), delta=delta))
                 except asyncio.CancelledError:
                     raise
@@ -370,7 +451,7 @@ class ContextState:
         if key in {"chinese", "zh", "mandarin"}:
             self._user_lang = "zh"
         elif key in {"cantonese", "yue"}:
-            self._user_lang = "yue"
+            self._user_lang = "cantonese"
         elif key in {"english", "en"}:
             self._user_lang = "en"
         else:
@@ -381,6 +462,9 @@ class ContextState:
         out: list[str] = []
         for s in snippets or []:
             text = str(s.get("text", "") or "").strip()
+            # 单条截断：防超大文档整段进 system（单条无限长会撑爆每轮 prefill）。
+            if len(text) > 350:
+                text = text[:349] + "…"
             if text and text not in seen:
                 seen.add(text)
                 out.append(text)
@@ -397,44 +481,39 @@ class ContextState:
             joined = "\n".join(self._summary_lines)
 
     def render_system_message(self) -> str:
+        """完整 system 段（兼容旧调用/测试）：稳定指令前缀 + 易变参考尾部。"""
+        prefix = self.render_instruction_prefix()
+        tail = self.render_context_tail()
+        if prefix and tail:
+            return f"{prefix}\n\n{tail}"
+        return prefix or tail
+
+    def render_instruction_prefix(self) -> str:
+        """【稳定指令前缀】——放最前、紧贴人设 base。
+
+        含：用户语言规则 / 回复节奏 / 应答准则 / 话术流程总览(整通不变) /
+        现在这一步(同一步内不变,flow 推进才变)。这些是模型要遵守的指令，
+        逐轮字节尽量稳定 → token0 起的公共前缀跨轮命中 mlx_lm KV-cache
+        （同人设/模板/语言时跨 call 也共享）；真正每轮变的检索资料/记忆放尾部。
+        """
         parts: list[str] = []
         if self._user_lang:
-            names = {"zh": "普通话/中文", "yue": "粤语（广东话）", "en": "英语"}
+            names = {"zh": "普通话/中文", "cantonese": "粤语（广东话）", "en": "英语"}
             name = names.get(self._user_lang, self._user_lang)
-            if self._user_lang == "yue":
-                rule = (
-                    "整段用港式粵語（香港客服腔）嚟講，唔好用書面語、普通話，亦唔好用廣州式偏書面嘅講法。"
-                    "直接輸出繁體中文——你寫嘅每個漢字都係繁體，唔好寫任何簡體字（簡體會令粵語語音讀錯，"
-                    "例如「幫你」要寫「幫你」唔係「帮你」，TTS 先會讀啱 nei5）。"
-                    "口吻要有港味：唔該晒、唔好意思、我哋/你哋、而家、聽日、啱啱、幫你睇返、唔使擔心。"
-                    "用詞要係港式口語，唔好照抄普通話書面字面——見到下面嘅普通話詞就換成右邊嘅粵語口語："
-                    + _HK_YUE_LEXICON
-                    + "。"
-                    "你哋係做集運/轉運業務，提到客戶嘅貨物要用「你件貨」「你個集運件」；"
-                    "講行業/寄件服務用「速遞」。唔好用「包裹」「快遞」「貨物」呢啲內地/書面講法。"
-                    "可以自然夾雜英文詞/短語（check、confirm、send、email、App、online、status、refund、case、update 呢類服務同操作詞），"
-                    "似香港人打電話咁講；但唔好講成句英文，亦唔好為咗夾而夾。"
-                    "（語氣參考：「唔好意思，我幫你 check 返個 status，refund 一般 3–5 個工作天會到帳。」"
-                    "「我 send 個 email 俾你，跟住入面嘅步驟做就 OK。」）"
-                    "數字同單號要用粵語讀法，唔好按英文或普通話讀："
-                    "單號/電話/編號呢啲一串數字逐個用粵語數字讀，0 讀「零」，最好直接寫成漢字（如「尾號七八九零」、"
-                    "「單號一二三四」），唔好用阿拉伯數字「7890」呢種（TTS 會讀錯/讀成普通話）；"
-                    "日期、數量、金額用粵語數詞（「三日」「一百蚊」「三至五個工作天」「一賠二」），唔用大寫「壹佰貳拾」呢類。"
-                    "唔好解釋你講緊咩語言，唔好加任何註釋或者括號。"
-                )
+            if self._user_lang == "cantonese":
+                rule = self._yue_rule()
             elif self._user_lang == "en":
                 rule = "Reply in natural spoken English only (like on a phone call); do not explain or add notes."
             else:
-                rule = (
-                    "用自然口语的普通话回复，像打电话那样说，不要用书面语或播音腔；"
-                    "不要解释你正在使用什么语言，不要添加任何注释或括号。"
-                )
+                rule = self._zh_rule()
             parts.append(f"【用户语言】当前用户正在使用：{name}。{rule}")
         # 语音通话的节奏约束：客服回复要短、口语、像打电话——一次只推进一件事，
-        # 说太长会把客户堵住、也拖慢每轮。这是"通话感"的关键。
+        # 说太长会把客户堵住、也拖慢每轮。这是"通话感"的关键。配合「句式短、句号收尾」，
+        # TTS 才能在首句生成完就出声（overlap），而不是等整段吐完。
         parts.append(
             "【回复节奏】这是语音通话，一次回复要简短口语，像真人打电话：最多 2~3 句，"
             "每句尽量短（一句话 20 字内更佳），不要一次把所有信息/方案/步骤都讲完；"
+            "先讲结论，再补一句必要解释，句与句之间自然停顿，句尾用句号或问号收住。"
             "讲完当前要点就停下把话交回客户，等客户回应再继续下一步。"
         )
         # 客服应答准则：永不主动说"不知道/查不到"，知识不够时用客服话术兜住。
@@ -443,9 +522,25 @@ class ContextState:
             "【应答准则】你是客服，绝不能说「不知道」「查不到」「不清楚」「没这个资料」「我帮不了你」。"
             "资料/知识不够回答时，用客服的方式接住客户："
             "① 先给确定能给的（安抚、已确认信息、下一步动作）；"
-            "② 需要查证/转办的，明确告诉客户你会去核实并回复（如「我帮你查实下，几分钟内回你」），或转给能处理的人/专员跟进；"
+            "② 需要查证/转办的，明确告诉客户你会跟进处理，或转给能处理的人/专员跟进；"
+            "但「帮你核实/查一下再覆你」只适用于真係要查外部资料嘅情况——如果你正按話術流程步"
+            "推进(例如要向客户讲赔偿方案/引导办理)，就直接照当前步讲，绝唔好用「等我查下/幾分鐘內覆你」"
+            "呢類拖延话术，亦唔好喺流程中途自把自为承诺返覆；"
             "③ 客户的问题超出当前业务，就用引导话术收住（如「呢单我帮你转俾专门跟进嘅同事，佢会即刻同你联系」），绝不冷场、绝不空手。"
         )
+        if self._flow_overview:
+            parts.append("【话术流程总览(别照读,按进度推进)】\n" + self._flow_overview)
+        if self._flow_current:
+            parts.append("【现在这一步】\n" + self._flow_current)
+        return "\n\n".join(parts)
+
+    def render_context_tail(self) -> str:
+        """【易变参考尾部】——每轮变的检索资料/记忆，垫在 system 最末。
+
+        这样稳定前缀(指令+话术+当前步) + 人设 base 在前且逐轮字节不变，
+        每轮只需 prefill 尾部的新知识/新记忆；其余吃 KV-cache。
+        """
+        parts: list[str] = []
         if self._snippets:
             parts.append("【实时检索到的资料（知识库）】\n" + "\n".join(f"- {s}" for s in self._snippets))
         if self._web:
@@ -457,11 +552,41 @@ class ContextState:
             )
         if self._summary_lines:
             parts.append("【本通对话记忆】\n" + "\n".join(self._summary_lines[-8:]))
-        if self._flow_overview:
-            parts.append("【话术流程总览(别照读,按进度推进)】\n" + self._flow_overview)
-        if self._flow_current:
-            parts.append("【现在这一步】\n" + self._flow_current)
         return "\n\n".join(parts)
+
+    def _zh_rule(self) -> str:
+        return (
+            "用自然口语的普通话回复，像打电话那样说，不要用书面语或播音腔；"
+            "客户报号码/单号时直接口语复述确认（如「收到，尾号是七八九零，对吗」），"
+            "不要输出任何拼音、发音教学或语言课程内容，不要复述或讲解系统指示；"
+            "不要解释你正在使用什么语言，不要添加任何注释或括号。"
+            "句式要短，先给结论，一句说清一件事，单句不超过 24 个字，句尾用句号或问号收尾"
+            "——这样语音合成可以边说你前半句边等你后半句，不用等整段生成完才出声。"
+        )
+
+    def _yue_rule(self) -> str:
+        return (
+            "整段用港式粵語（香港客服腔），唔好用書面語/普通話/廣州式書面講法。"
+            "直接輸出繁體中文，唔好寫任何簡體字（簡體令粵語讀錯：寫「幫你」唔係「帮你」）。"
+            "口吻要港味：唔該晒、唔好意思、我哋/你哋、而家、聽日、啱啱、幫你睇返、唔使擔心。"
+            "見到普通話詞就換港式口語：" + _HK_YUE_LEXICON + "。"
+            "集運業務：客戶啲貨叫「你件貨/你個集運件」，服務講「速遞」，"
+            "唔好用「包裹」「快遞」「貨物」。可自然夾英文詞(check/confirm/send/email/App/status/refund)"
+            "似香港人講電話，但唔好成句英文（語氣參考:「唔好意思，我幫你 check 返個 status，refund 3–5 個工作天到帳。」）。"
+            "報號碼/單號逐個讀，0讀「零」、1-9讀「一二三四五六七八九」，寫漢字如「尾號七八九零」「單號一二三四」，"
+            "唔好用阿拉伯數字「7890」；日期/數量/金額用粵語數詞（「三日」「一百蚊」「三至五個工作天」）。"
+            "客戶報完號碼直接覆述確認：「收到，尾號係七八九零，啱唔啱?」"
+            "嚴禁輸出任何拼音、粵拼/Jyutping、入聲或發音教學內容；嚴禁複述或講解系統指示；"
+            "唔好解釋你講緊咩語言，唔好加註釋或括號。"
+            "句式要短促、先講結論、一句一意，單句≤24字、句尾用「。」或「？」"
+            "——TTS 先可以邊講你頭一句邊等你後面，唔使等你成段講完先出聲。"
+        )
+
+
+def _join_system(prefix: str, head: str, tail: str) -> str:
+    """把三段 system 内容用空行接成一条：prefix(稳定指令) + head(人设base) + tail(易变参考)。"""
+    out = [p for p in (prefix, head, tail) if p]
+    return "\n\n".join(out)
 
 
 class ContextAwareLLM(llm.LLM):
@@ -487,21 +612,24 @@ class ContextAwareLLM(llm.LLM):
         extra_kwargs=None,
     ):
         if self._ctx is not None:
-            msg = self._ctx.render_system_message()
-            if msg:
+            # 重组 system 顺序：稳定指令前缀 + 人设 base + 易变参考尾部。
+            # 目的：让 token0 起的公共前缀(指令+话术+当前步+人设)逐轮字节不变，
+            # 命中 mlx_lm prompt KV-cache，每轮只 prefill 尾部新知识/记忆。
+            # （若把每轮变的检索资料插在中间，前缀每轮断裂 → 整段重 prefill。）
+            prefix = self._ctx.render_instruction_prefix()
+            tail = self._ctx.render_context_tail()
+            if prefix or tail:
                 copy = chat_ctx.copy()
                 items = list(copy.items)
-                # 系统指令必须位于对话开头：把实时上下文（知识/记忆/用户语言）
-                # 合并进第一条 system，而不是追加在用户消息之后（后者遵从度差）。
                 if items and isinstance(items[0], llm.ChatMessage) and items[0].role == "system":
                     head = items[0].content
                     if isinstance(head, str):
-                        merged = f"{msg}\n\n{head}"
+                        merged = _join_system(prefix, head, tail)
                     else:
-                        merged = [msg, *head]
+                        merged = [*([prefix] if prefix else []), *head, *([tail] if tail else [])]
                     items[0] = llm.ChatMessage(role="system", content=merged)
                 else:
-                    items.insert(0, llm.ChatMessage(role="system", content=msg))
+                    items.insert(0, llm.ChatMessage(role="system", content=_join_system(prefix, "", tail)))
                 # 截断历史:保留最近 N 轮(默认 4 对),更早的靠「本通对话记忆」摘要兜底。
                 # 每轮全量历史会让 prefill 随轮次线性变慢(实测 12 轮 TTFT 2.4s);
                 # 截断让上下文有上界,TTFT 稳定。
@@ -818,7 +946,8 @@ class _SherpaSTTStream(stt.RecognizeStream):
             if tag in _EMOTION_TAGS:
                 self._stt_.last_emotion = tag.lower()
             if tag in {"ZH", "EN", "YUE"}:
-                self._stt_.last_language = {"ZH": "zh", "EN": "en", "YUE": "yue"}[tag]
+                # 供应商标签 YUE 是外部字面量；内部统一归一到规范值 cantonese。
+                self._stt_.last_language = {"ZH": "zh", "EN": "en", "YUE": "cantonese"}[tag]
             return ""  # 所有标签都不进入显示文本
 
         clean = _tag_re.sub(_repl, text).strip()
@@ -967,6 +1096,18 @@ class MiniMaxTTS(tts.TTS):
 
     _CN = "https://api.minimax.cn/v1/t2a_v2"
     _INTL = "https://api.minimax.chat/v1/t2a_v2"
+    _ENDPOINT_WS_CN = "wss://api.minimax.cn/ws/v1/t2a_v2"
+    _ENDPOINT_WS_INTL = "wss://api.minimax.chat/ws/v1/t2a_v2"
+
+    def _ws_voice_setting(self, voice: str) -> dict:
+        """任务级 voice_setting（三条合成路径共用同一构造,避免漏 emotion/pitch）。"""
+        return {
+            "voice_id": voice,
+            "speed": float(os.environ.get("MINIMAX_SPEED", "1")),
+            "vol": float(os.environ.get("MINIMAX_VOL", "1")),
+            "pitch": int(os.environ.get("MINIMAX_PITCH", "0")),
+            "emotion": self._resolve_emotion(),
+        }
 
     def __init__(
         self,
@@ -1023,7 +1164,7 @@ class MiniMaxTTS(tts.TTS):
         if base:
             return base
         region = os.environ.get("MINIMAX_REGION", "cn").strip().lower()
-        return "wss://api.minimax.chat/ws/v1/t2a_v2" if region in {"intl", "global", "chat"} else "wss://api.minimax.cn/ws/v1/t2a_v2"
+        return self._ENDPOINT_WS_INTL if region in {"intl", "global", "chat"} else self._ENDPOINT_WS_CN
 
     def _model(self) -> str:
         return os.environ.get("MINIMAX_MODEL", "speech-2.8-hd")
@@ -1042,7 +1183,15 @@ class MiniMaxTTS(tts.TTS):
 
     def synthesize(self, text, *, conn_options=None):
         # 保留整段合成路径：livekit 某些非 stream 调用 / 测试仍会走 synthesize。
+        # 整段齐晒先落 stream——喺度套教学形拦截最稳(逐句流式只喺 send 前拦)。
+        text = lecture_guard(str(text), self._speech_lang())
         return _MiniMaxTTSStream(self, text, conn_options or APIConnectOptions())
+
+    def _speech_lang(self) -> str | None:
+        """罐头回应的语言:会话锚定语言(zh/cantonese)优先,其它(如 en)留 None 自动判。
+        旧数据里残留的 yue 归一到 cantonese 处理。"""
+        lang = self._language_state.lang
+        return lang if lang in ("zh", "cantonese", "yue") else None
 
     def stream(self, *, conn_options=None):
         """真流式 SynthesizeStream：单 WS 连接按增量文本持续 task_continue。"""
@@ -1062,6 +1211,20 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
     def __init__(self, tts_: "MiniMaxTTS", conn_options):
         super().__init__(tts=tts_, conn_options=conn_options)
         self._tts_ = tts_
+        # 教学形拦截已触发过就唔再重复播罐头(同段后续课程句静默丢弃)。
+        self._lecture_fired = False
+
+    async def _emit_beep(self, output_emitter):
+        import math
+
+        sr = self._tts_.sample_rate
+        n = int(sr * 0.4)
+        pcm = bytearray()
+        for i in range(n):
+            v = int(12000 * math.sin(2 * math.pi * 440 * i / sr))
+            pcm += v.to_bytes(2, "little", signed=True)
+        output_emitter.push(bytes(pcm))
+        output_emitter.flush()
 
     async def _run(self, output_emitter):
         import websockets
@@ -1070,11 +1233,14 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
             key = self._tts_._api_key()
             if not key:
                 print("MINIMAX_TTS_MISSING_CREDENTIALS", flush=True)
+                await self._emit_beep(output_emitter)
                 return
             voice = self._tts_._resolve_voice()
             if not voice:
                 print("MINIMAX_TTS_NO_VOICE", flush=True)
+                await self._emit_beep(output_emitter)
                 return
+            print(f"MINIMAX_TTS_VOICE {voice} lang={self._tts_._language_state.lang}", flush=True)
             sample_rate = self._tts_.sample_rate
 
             ws = await websockets.connect(
@@ -1086,14 +1252,21 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            # 连唔到 WS 冇音频可推(livekit 会 APIError no audio frames → 静音吞回复)。
+            # 呢个 streaming 路径唔像 ChunkedStream 咁有 HTTP 回退——播一声 beep
+            # 令客户知 AI 有反应过,至少唔係无差别静音。
             print("MINIMAX_TTS_WS_CONNECT", repr(exc), flush=True)
-            # WS 连不上 → 回退整段 synthesize(StreamAdapter 包装,端到端仍出声)
+            try:
+                await self._emit_beep(output_emitter)
+            except Exception:  # pragma: no cover
+                pass
             return
 
         init_done = False
         frame_bytes = int(sample_rate / 5) * 2  # 200ms 帧
         buf = bytearray()
         recv_task: asyncio.Task | None = None
+        t_start = time.monotonic()
         try:
             # 首帧 connected_success
             try:
@@ -1117,13 +1290,22 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                 resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
                 if resp.get("event") != "task_started":
                     print("MINIMAX_TTS_WS_START_FAIL", str(resp)[:200], flush=True)
+                    try:
+                        await self._emit_beep(output_emitter)
+                    except Exception:  # pragma: no cover
+                        pass
                     return
             except Exception as exc:
                 print("MINIMAX_TTS_WS_START", repr(exc), flush=True)
+                try:
+                    await self._emit_beep(output_emitter)
+                except Exception:  # pragma: no cover
+                    pass
                 return
 
             async def _recv_loop():
                 nonlocal init_done, buf
+                first_pushed = False
                 while True:
                     try:
                         msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
@@ -1146,6 +1328,17 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                             output_emitter.start_segment(segment_id="minimax-tts")
                             init_done = True
                         buf.extend(chunk)
+                        if not first_pushed and len(buf) >= frame_bytes // 5:
+                            # P0 首帧早推:不足 200ms 先推 ~40ms,早出声(照 Qwen3-TTS 同款)。
+                            # P0 秒表:首个音频块推送时刻(距 task_start)。
+                            print(
+                                f"TTS_FIRST_AUDIO_MS {(time.monotonic() - t_start) * 1000:.0f}",
+                                flush=True,
+                            )
+                            output_emitter.push(bytes(buf))
+                            output_emitter.flush()
+                            buf.clear()
+                            first_pushed = True
                         while len(buf) >= frame_bytes:
                             output_emitter.push(bytes(buf[:frame_bytes]))
                             output_emitter.flush()
@@ -1159,14 +1352,61 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
 
             recv_task = asyncio.create_task(_recv_loop())
 
-            # 按句增量合成:把 _input_ch 文本按句子边界(。！？!?)切句,每句 task_continue
-            # 发「该句增量」(非累积全文)。实测语义:
+            # 增量合成:文本按边界切分逐段 task_continue。实测语义:
             # - 发累积全文会重复合成前面句子(长回复下明显重读);
             # - 纯逐块增量(不按句)在快速 send 下丢音频(服务端要等足文本才合成)。
             # 按句切分 + 连续发送 = 首句到就出声(低延迟)且不重复(每句只发一次)。
+            # MINIMAX_TTS_OVERLAP=1(默认):句号之间也按「≥N 字 / 标点停顿 / ≥T ms」增量提前送,
+            # 让 MiniMax 在 LLM 整句写完前先出前半句音频;连续数字/字母串不切开(防单号腰斩读错)。
             # 音频按序回流,recv_loop 持续推给 emitter,无需句间等待。
             _SENT_END = "。！？!?"
+            _SOFT_BREAK = "，、；;：:"
             sent_buf = ""
+            sent_any = False
+            try:
+                overlap_on = os.environ.get("MINIMAX_TTS_OVERLAP", "1") == "1"
+            except Exception:  # pragma: no cover
+                overlap_on = True
+            try:
+                _overlap_chars = int(os.environ.get("MINIMAX_TTS_OVERLAP_CHARS", "12"))
+            except Exception:  # pragma: no cover
+                _overlap_chars = 12
+            try:
+                _overlap_ms = int(os.environ.get("MINIMAX_TTS_OVERLAP_MS", "300"))
+            except Exception:  # pragma: no cover
+                _overlap_ms = 300
+            _last_send = time.monotonic()
+
+            def _flushable(s: str) -> bool:
+                """overlap 增量可否送出：不能把连续的号码/数字串拦腰截断。
+
+                MiniMax 对 task_continue 会拼接增量后按整句语义合成，但把一串
+                「七八九零」切成「七八」+「九零」可能在拼接边界出现停顿/重读，
+                故遇结尾是非空格连续数字/字母的串要等它收尾再送。
+                """
+                if not s:
+                    return False
+                tail = s.rstrip("。！？!?，、；;：: \t")
+                return not (tail and (tail[-1].isdigit() or tail[-1].isalpha()))
+
+            async def _send_text(s: str) -> None:
+                nonlocal sent_any, _last_send
+                if not self._lecture_fired and is_lecture_text(s):
+                    # 开场即教学 → 播一次罐头的「请再报单号」,唔好照读课程;
+                    # 若前面已出过正常音频,课程句静默丢弃,唔追加罐头(避免二重声)。
+                    self._lecture_fired = True
+                    if not sent_any:
+                        await ws.send(
+                            json.dumps({"event": "task_continue", "text": lecture_canned(self._tts_._speech_lang())})
+                        )
+                        sent_any = True
+                    return
+                if is_lecture_text(s):
+                    return  # 已触发过,课程延续句照丢
+                await ws.send(json.dumps({"event": "task_continue", "text": s}))
+                sent_any = True
+                _last_send = time.monotonic()
+
             async for item in self._input_ch:
                 if isinstance(item, self._FlushSentinel):
                     continue
@@ -1184,9 +1424,37 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                     sentence = sent_buf[: idx + 1]
                     sent_buf = sent_buf[idx + 1 :]
                     if sentence.strip():
-                        await ws.send(json.dumps({"event": "task_continue", "text": sentence.strip()}))
+                        await _send_text(sentence.strip())
+                # overlap:句号之间的增量,满足「≥N 字且有软停顿/距上次够久」就提前送。
+                if (
+                    overlap_on
+                    and not self._lecture_fired
+                    and sent_buf.strip()
+                    and len(sent_buf.strip()) >= _overlap_chars
+                ):
+                    soft_idx = -1
+                    for ch in _SOFT_BREAK:
+                        pos = sent_buf.rfind(ch)
+                        if pos != -1:
+                            soft_idx = max(soft_idx, pos)
+                    now = time.monotonic()
+                    time_up = (now - _last_send) * 1000 >= _overlap_ms
+                    if (soft_idx != -1 and soft_idx >= len(sent_buf.strip()) // 2) or time_up:
+                        frag = sent_buf.strip()
+                        if _flushable(frag):
+                            await _send_text(frag)
+                            sent_buf = ""
+                if self._lecture_fired:
+                    sent_buf = ""  # 已触发 → 清掉未分句的课程尾部
             if sent_buf.strip():
-                await ws.send(json.dumps({"event": "task_continue", "text": _inject_pauses(sent_buf.strip())}))
+                if not self._lecture_fired and is_lecture_text(sent_buf.strip()):
+                    self._lecture_fired = True
+                    if not sent_any:
+                        await ws.send(
+                            json.dumps({"event": "task_continue", "text": lecture_canned(self._tts_._speech_lang())})
+                        )
+                elif not self._lecture_fired:
+                    await ws.send(json.dumps({"event": "task_continue", "text": _inject_pauses(sent_buf.strip())}))
             # 文本结束:发 task_finish 让服务端吐完剩余音频并回 is_final
             try:
                 await ws.send(json.dumps({"event": "task_finish"}))
@@ -1241,6 +1509,7 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
                 print("MINIMAX_TTS_NO_VOICE", flush=True)
                 await self._emit_beep(output_emitter)
                 return
+            print(f"MINIMAX_TTS_VOICE {voice} lang={self._tts_._language_state.lang}", flush=True)
             sample_rate = self._tts_.sample_rate
             # WebSocket 流式(像电话:首包 ~380ms 边合成边推);失败/显式关闭回退 HTTP 整段。
             if os.environ.get("MINIMAX_WS", "1") == "1":
@@ -1655,30 +1924,42 @@ class _Qwen3ASRStream(stt.RecognizeStream):
     async def _post_audio(self, pcm: bytes):
         if not pcm:
             return "", ""
+        t0 = time.monotonic()
+        # 语言提示:会话语言为粤语时强制告诉模型(mlx 层大小写不敏感回填 config 规范名
+        # Cantonese),避免 auto 误判成普通话;zh/en/空不传 = 交给模型 auto 检测。
+        lang_hint = ""
+        if self._stt_._language_state.lang == "cantonese":
+            lang_hint = "cantonese"
+        elif self._stt_._language_state.lang == "yue":  # 旧数据只读别名
+            lang_hint = "cantonese"
+        print(f"QWEN3_ASR_HINT {lang_hint or 'auto'} lang_state={self._stt_._language_state.lang}", flush=True)
         last_exc: Exception | None = None
         for attempt in range(3):
             try:
                 async with httpx.AsyncClient(timeout=30) as client:
-                    start = await client.post(f"{self._stt_._base_url}/api/start")
+                    params = {"session_id": ""} if lang_hint else None
+                    start = await client.post(
+                        f"{self._stt_._base_url}/api/start",
+                        params={"language": lang_hint} if lang_hint else None,
+                    )
                     start.raise_for_status()
                     session_id = start.json()["session_id"]
-                    for i in range(0, len(pcm), 3200):
-                        await client.post(
-                            f"{self._stt_._base_url}/api/chunk",
-                            params={"session_id": session_id},
-                            content=pcm[i : i + 3200],
-                            headers={"Content-Type": "application/octet-stream"},
-                        )
                     final = await client.post(
                         f"{self._stt_._base_url}/api/finish",
                         params={"session_id": session_id},
+                        content=bytes(pcm),
+                        headers={"Content-Type": "application/octet-stream"},
                     )
                     final.raise_for_status()
                     data = final.json()
                     text = str(data.get("text") or "")
                     lang = str(data.get("language") or "")
                     lang = _normalize_asr_language(lang, text)
-                    print("QWEN3_ASR_TEXT", repr(text[:120]), lang, flush=True)
+                    print(
+                        f"QWEN3_ASR_TEXT {repr(text[:120])} {lang} "
+                        f"ASR_MS={(time.monotonic() - t0) * 1000:.0f}",
+                        flush=True,
+                    )
                     return text, lang
             except asyncio.CancelledError:
                 raise

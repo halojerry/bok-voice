@@ -143,7 +143,7 @@
 - ✅ 后端 mood 链路（Phase 4，Path B）：`agent.py` 的 instructions 追加「每句开头吐 `<expr type="expression" label="英文mood"/>`」规则；`AgentSession(tts_text_transforms=[...])` 追加 `_strip_expr_markup` 从 TTS 路径剥标签（转录路径框架自动发布 `lk.expression`）；`plugins/emotion.py` 扩成官方 11 类英文 mood（中文关键词→英文 label，normalize 兜底）；`SherpaSenseVoiceSTT` 不再一刀切洗掉 `<|HAPPY|>` 情绪标签（记录到 `last_emotion`，显示文本仍干净）。
 - ✅ mood 确定性兜底 + 端到端验证：`ExprAwareLLM` 包装器强制前置 `<expr>` 标签（不依赖模型遵守指令）；真实接通实测前端 `useAgentExpression` 拿到 mood（calm），点阵颜色/文案随情绪驱动，转写干净。
 - ✅ Qwen3-ASR/TTS sidecar 全链路（Phase 6）：`scripts/start_sidecars.sh` 一键起两个 sidecar（8787/8788）；`scripts/smoke_sidecars.py` 全绿（三语 ASR + 预置/克隆 TTS + 克隆音色回灌）；设置/人设页「克隆/试听」经 control-plane 代理调用 sidecar。
-- ✅ A 线三语 E2E（Phase 7）：`tools/browser-e2e/trilingual.mjs` → `TRILINGUAL_E2E 3/3 PASSED`（zh/yue/en 各出 YOU 转写 + AGENT 回复；`LanguageState` 让回复语言随输入语言）。
+- ✅ A 线三语 E2E（Phase 7）：`tools/browser-e2e/trilingual.mjs` → `TRILINGUAL_E2E 3/3 PASSED`（zh/cantonese/en 各出 YOU 转写 + AGENT 回复；`LanguageState` 让回复语言随输入语言）。
 - ✅ 关键修复记录：
   - Ollama 改用原生 `/api/chat` + `"think": false`（OpenAI 兼容端点不支持关 thinking，9B 回复慢且内容空）；`LLM_MAX_TOKENS` 默认 256，E2E 用 160。
   - `_chat_messages` 修复：`ChatContent` 文本部分是纯 `str`，旧代码把用户文本全部丢空。

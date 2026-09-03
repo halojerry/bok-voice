@@ -38,6 +38,27 @@ _EXPR_PARTIAL_RE = re.compile(r"<expr\b[^>]*$")
 # so the persisted transcript is clean customer-facing copy.
 _EXPR_SYNC_RE = re.compile(r"<expr\b[^>]*?/>|<expr\b[^>]*>|</expr>|<expr\b[^>]*$")
 
+# 4B/Qwen3 偶发把对话模板收尾 token <|im_end|> 当文字输出——转录同 TTS 都唔可以留低。
+# _EXPR_TAG_RE 只剥「有 > 收尾」嘅 tag,<|im_end|> 冇 >,会漏,所以专门补剥。
+_EOS_TOKEN_RE = re.compile(r"<\|/?im_(?:start|end)\|>|<\|endoftext\|>", re.IGNORECASE)
+_EOS_TOKENS = ("<|im_end|>", "<|im_start|>", "<|endoftext|>")
+
+
+def _strip_eos_tokens(text: str) -> str:
+    return _EOS_TOKEN_RE.sub("", text or "")
+
+
+def _trailing_eos_partial(text: str) -> str:
+    """text 尾部若系某个 EOS token 被 stream 切开嘅真前缀,留低等下个 chunk 凑齐再剥。"""
+    low = (text or "").lower()
+    best = ""
+    for tok in _EOS_TOKENS:
+        t = tok.lower()
+        for cut in range(1, len(t)):
+            if cut > len(best) and low.endswith(t[:cut]):
+                best = tok[:cut]
+    return best
+
 # MiniMax 支持的拟声标签(2.8-hd/turbo):这些是让它发声效的,不能剥。
 # 其余舞台/动作括号提示(（稍作聽筒聲）（笑）(sigh) (pause) 等)会被 TTS 照念,剥掉。
 _MINIMAX_VOCAL_TAGS = {"laughs", "chuckle", "coughs", "breath", "sighs", "humming"}
@@ -66,6 +87,7 @@ def _strip_stage_dirs(text: str) -> str:
 
 
 def _clean_transcript(text: str) -> str:
+    text = _strip_eos_tokens(text)
     return _EXPR_SYNC_RE.sub("", text).strip()
 
 
@@ -77,22 +99,58 @@ async def _strip_expr_markup(text):
         # 舞台/动作括号提示（如（稍作聽筒聲））也会被 TTS 念出来，一并剥掉；
         # 但放行 MiniMax 拟声标签 (sighs)/(laughs) 等，让它可以转成声效。
         out = _strip_stage_dirs(out)
+        # Qwen3 偶发把 <|im_end|> 当文字输出,剥走以免被 TTS 念出来。
+        out = _strip_eos_tokens(out)
         # A tag split across stream chunks has no closing ">" yet: hold the
-        # trailing "<expr ..." fragment until the next chunk completes it.
+        # trailing "<expr ..." fragment (or half an <|im_end|>) until the next
+        # chunk completes it.
         m = _EXPR_PARTIAL_RE.search(out)
+        held = ""
         if m and out[m.start() :].startswith("<expr"):
-            carry = out[m.start() :]
+            held = out[m.start() :]
             out = out[: m.start()]
         else:
-            carry = ""
+            frag = _trailing_eos_partial(out)
+            if frag:
+                held = frag
+                out = out[: -len(frag)]
         if out:
             yield out
+        carry = held
     # Drop any dangling partial tag at the end of the stream.
     if carry:
         yield ""
 
 
+async def _llm_judge(base_url: str, model: str, messages: list) -> str:
+    """流程推进判定器:对本地 MLX LLM 发一个 max_tokens 极短请求,取回一个字。失败返空(唔推进)。"""
+    if not base_url or not model:
+        return ""
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            r = await c.post(
+                f"{base_url}/chat/completions",
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "max_tokens": 8,
+                    "temperature": 0,
+                    # 本地 MLX 對話模板會 append <|im_end|>,停喺呢度,回應淨係 verdict 字。
+                    "stop": ["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
+                },
+            )
+            if r.status_code == 200:
+                data = r.json()
+                return str((data.get("choices") or [{}])[0].get("message", {}).get("content") or "")
+    except Exception as exc:  # pragma: no cover - 判定失败唔推进,唔阻断通话
+        print(f"[flow] llm judge failed: {exc!r}", flush=True)
+    return ""
+
+
 def _parse_voice_map(raw) -> dict:
+    # 旧数据 map 键 yue 由 _collapse_voice_map 归一;新写入一律 cantonese。
     if isinstance(raw, dict):
         return raw
     if isinstance(raw, str) and raw.strip().startswith("{"):
@@ -105,46 +163,60 @@ def _parse_voice_map(raw) -> dict:
 
 
 def _collapse_voice_map(raw_map: dict, persona_lang: str) -> dict:
-    """整场同声：把 persona 的旧 {zh,yue,en} 分语言 map 收敛成单一主音色。
+    """整场同声：把 persona 的旧 {zh,cantonese,en} 分语言 map 收敛成单一主音色。
 
-    主音色取人设主语言（persona.language）对应键，缺则按 zh→yue→en→首个非空
+    主音色取人设主语言（persona.language）对应键，缺则按 zh→cantonese→en→首个非空
     取；最终统一放进 zh 键（MiniMax/Qwen3 的 _resolve_voice 语言缺省都回落 zh），
     使整场无论客户讲粤/普/英都用同一把声。回退点：若想恢复「按语言分音色」，
-    删掉本函数调用、直接传 raw_map 即可。
+    删掉本函数调用、直接传 raw_map 即可。旧数据 map 键 yue 作只读别名仍兼容。
     """
     if not raw_map:
         return {}
+    # 旧数据只读别名:键 yue → 统一按 cantonese 读(新写永远用 cantonese)。
+    norm_map = {}
+    for k, v in raw_map.items():
+        nk = "cantonese" if str(k).strip().lower() in {"yue", "cantonese"} else str(k)
+        if nk not in norm_map:
+            norm_map[nk] = v
     lang = (persona_lang or "").strip().lower()
-    if lang not in {"zh", "yue", "en"}:
+    if lang == "yue":  # 旧数据只读别名
+        lang = "cantonese"
+    if lang not in {"zh", "cantonese", "en"}:
         lang = ""
     picked = ""
-    for key in ([lang] if lang else []) + ["zh", "yue", "en"]:
-        if raw_map.get(key):
-            picked = str(raw_map[key])
+    for key in ([lang] if lang else []) + ["zh", "cantonese", "en", "yue"]:
+        if norm_map.get(key):
+            picked = str(norm_map[key])
             break
     if not picked:
-        picked = str(next((v for v in raw_map.values() if v), ""))
+        picked = str(next((v for v in norm_map.values() if v), ""))
     return {"zh": picked} if picked else {}
 
 
-_LANG_LABELS = {"zh": "普通话/中文", "yue": "粤语", "en": "英语"}
+_LANG_LABELS = {"zh": "普通话/中文", "cantonese": "粤语", "en": "英语"}
 
 
 def _sticky_reply_language(anchor: str, asr_lang: str, cur_sticky: str, cur_streak: int, threshold: int = 2) -> tuple[str, str, int]:
     """粤语客服「始终讲粤语」的语言锚定规则。
 
-    - anchor：客服锚定语言（人设/对象语言，如 yue）。LLM 默认始终用它回复。
+    - anchor：客服锚定语言（人设/对象语言，如 cantonese）。LLM 默认始终用它回复。
     - 只有 ASR 连续 threshold 轮判为同一【非锚】语言（且都是强证据才进得来）才跟随切换；
     - 一旦某轮回到锚语言，立刻回锚、清计数；
     - 已切走后客户又讲第三种语言，也回锚（粤语客服优先讲粤语，不跨语言乱跳）。
-    返回 (reply_lang, new_sticky, new_streak)。
+    返回 (reply_lang, new_sticky, new_streak)。旧数据 yue 作只读别名归一 cantonese。
     """
-    if anchor not in {"zh", "yue", "en"}:
+    if anchor == "yue":  # 旧数据只读别名
+        anchor = "cantonese"
+    if asr_lang == "yue":
+        asr_lang = "cantonese"
+    if cur_sticky == "yue":
+        cur_sticky = "cantonese"
+    if anchor not in {"zh", "cantonese", "en"}:
         # 无有效锚定（未知/缺失）：直接跟随 ASR，退化为旧行为。
         return asr_lang, asr_lang, 0
     if asr_lang == anchor:
         return anchor, anchor, 0
-    if asr_lang not in {"zh", "yue", "en"}:
+    if asr_lang not in {"zh", "cantonese", "en"}:
         return cur_sticky, cur_sticky, cur_streak
     if cur_sticky == anchor:
         # 仍在锚语言上，连续看到非锚轮。
@@ -158,24 +230,29 @@ def _sticky_reply_language(anchor: str, asr_lang: str, cur_sticky: str, cur_stre
 
 
 def _normalize_lang(raw, default: str = "") -> str:
-    """把对象/人设里的语言值归一为 zh/yue/en。vi 等未支持语言回落到 default。"""
+    """把对象/人设里的语言值归一为 zh/cantonese/en。vi 等未支持语言回落到 default。
+
+    粤语统一叫 cantonese（旧数据 yue、中文写法粤/粤语/广东话、外部 Cantonese
+    都归一到它）——字段只有一套，模型边界(ASR hint)才传得对。
+    """
     key = (raw or "").strip().lower()
     mapping = {
         "zh": "zh", "chinese": "zh", "mandarin": "zh", "普通话": "zh", "中文": "zh",
-        "yue": "yue", "cantonese": "yue", "粤": "yue", "粤语": "yue", "广东话": "yue",
+        "cantonese": "cantonese", "yue": "cantonese", "粤": "cantonese", "粤语": "cantonese", "广东话": "cantonese",
         "en": "en", "english": "en", "英语": "en",
         "vi": "", "vietnamese": "", "auto": "", "": "",
     }
-    return mapping.get(key, key if key in {"zh", "yue", "en"} else default)
+    return mapping.get(key, key if key in {"zh", "cantonese", "en"} else default)
 
 
 def _build_default_voice_map(tts_cfg: dict) -> dict:
     """组默认音色（persona 未绑定 reference_audio 时使用）。
 
     产品规则「整场同声」：若设置页配了全局单音色 speaker（云端 MiniMax 默认），
-    则 zh/yue/en 都用它（返回 {"zh": speaker}，任何语言都解析到 zh 兜底键）。
-    仅当 speaker 为空时回落旧的分语言 speaker_zh/yue/en（兼容旧数据）。
-    Qwen3TTSTTS 解析时当前语言缺省会回落到 zh，因此只配 zh 键也能让各语言出声。
+    则 zh/cantonese/en 都用它（返回 {"zh": speaker}，任何语言都解析到 zh 兜底键）。
+    仅当 speaker 为空时回落旧的分语言 speaker_zh/speaker_cantonese/en（兼容旧数据
+    speaker_yue 作只读别名）。Qwen3TTSTTS 解析时当前语言缺省会回落到 zh，
+    因此只配 zh 键也能让各语言出声。
     """
     single = (tts_cfg.get("speaker") or "").strip()
     mapping: dict[str, str] = {}
@@ -185,13 +262,24 @@ def _build_default_voice_map(tts_cfg: dict) -> dict:
     zh = tts_cfg.get("speaker_zh") or ""
     if zh:
         mapping["zh"] = zh
-    yue = tts_cfg.get("speaker_yue")
+    # 新键 speaker_cantonese 优先；旧键 speaker_yue 作只读别名（DB 迁移后只剩新键）。
+    yue = (tts_cfg.get("speaker_cantonese") or tts_cfg.get("speaker_yue") or "").strip()
     if yue:
-        mapping["yue"] = yue
-    en = tts_cfg.get("speaker_en")
+        mapping["cantonese"] = yue
+    en = tts_cfg.get("speaker_en") or ""
     if en:
         mapping["en"] = en
     return mapping
+
+
+def _context_rag_enabled(has_steps: bool) -> bool:
+    """绑了分步话术(has_steps)的封闭流程，默认不做知识库/联网检索——单对象只上话术。
+
+    开放咨询(无模板)才 RAG；CONTEXT_RAG=1 可强制模板场景也检索（逃生口）。
+    """
+    if os.environ.get("CONTEXT_RAG", "") == "1":
+        return True
+    return not has_steps
 
 
 def _vad_float(cfg: dict, key: str, env_name: str, default: str) -> float:
@@ -291,7 +379,7 @@ def _instructions(
 async def entrypoint(ctx):
     """LiveKit Agent job entrypoint (must be module-level for pickling)."""
     from livekit.agents import Agent, AgentSession, StopResponse, TurnHandlingOptions, inference, stt
-    from .providers.livekit_plugins import ContextState, DeepSeekLLM, ExprAwareLLM
+    from .providers.livekit_plugins import ContextState, DeepSeekLLM, ExprAwareLLM, lecture_guard
 
     room_name = ctx.room.name
     call_id = os.environ.get("AGENT_CALL_ID") or room_name
@@ -331,14 +419,21 @@ async def entrypoint(ctx):
         if persona_id:
             persona = await cp.get_persona(persona_id)
         query = (object_card or {}).get("background") or "产品介绍"
-        snippets = await cp.search_knowledge(query, account_id, 5)
-        # 初始上下文：接通时按对象背景预载少量知识；后续每轮按用户问题实时覆盖。
-        context_state.set_knowledge(snippets)
+        # 单对象绑话术的封闭流程不预载知识库(话术即上下文,避免白叠检索);
+        # 无模板/开放咨询才按对象背景预载。CONTEXT_RAG=1 强制预载。
+        from .flow import template_to_steps
+
+        _flow_has_steps = bool(template_to_steps(template))
+        if _context_rag_enabled(_flow_has_steps):
+            snippets = await cp.search_knowledge(query, account_id, 5)
+            # 初始上下文：接通时按对象背景预载少量知识；后续每轮按用户问题实时覆盖。
+            context_state.set_knowledge(snippets)
     except Exception as e:
         print(f"[agent] context resolve failed ({room_name}): {e}", flush=True)
 
     # 对话流程控制器:载入模板分步 + 对象变量;由它按轮注入"当前步",逐步推进。
     from .flow import FlowController, facts_line
+    from .flow import CONFIRM, OBJECTION, QUESTION, UNCLEAR, detect_whatsapp_signal
 
     flow_ctrl = FlowController.from_template(template, object_card)
     _log_stage("context_resolved")
@@ -393,7 +488,11 @@ async def entrypoint(ctx):
     greet_lang = _normalize_lang((persona or {}).get("language")) or _normalize_lang((object_card or {}).get("language")) or "zh"
     language_state.lang = greet_lang
     # 粤语客服锚定：LLM 默认始终用锚语言（greet_lang），只有客户连续多轮明显讲其它语言才跟随。
-    _lang_sticky: dict = {"sticky": greet_lang if greet_lang in {"zh", "yue", "en"} else "zh", "streak": 0}
+    _lang_sticky: dict = {"sticky": greet_lang if greet_lang in {"zh", "cantonese", "en"} else "zh", "streak": 0}
+    # 已上報嘅 WhatsApp 狀態(captured=已報號碼, offered=已報應承加),避免每 call 重複 spam。
+    _wa_reported: set[str] = set()
+    # 背景 flow judge 防疊:記錄而家 judge 緊邊一步(-1=冇)。推進唔可以同時兩個 judge。
+    _judge_inflight: dict = {"step": -1}
     from .plugins.emotion import EmotionState
 
     emotion_state = EmotionState()
@@ -411,8 +510,13 @@ async def entrypoint(ctx):
         # 避免 AI 每次刚要开口就被当插话打断、多次后不再出声。
         vad_provider = inference.VAD(
             max_buffered_speech=_vad_float(vad_cfg, "max_buffered_speech", "VAD_MAX_BUFFERED_SPEECH", "15"),
-            min_speech_duration=_vad_float(vad_cfg, "min_speech_duration", "VAD_MIN_SPEECH_DURATION", "0.4"),
-            min_silence_duration=_vad_float(vad_cfg, "min_silence_duration", "VAD_MIN_SILENCE_DURATION", "0.45"),
+        # VAD 参数权衡（曾为冲低延迟把 min_silence 收到 0.30/endpointing min 收到 0.15，
+        # 实测导致「转写晚于轮次提交」被 LiveKit 丢弃、噪声/回声频繁误提交 → agent 长时间无声）：
+        # 离线式 ASR（用户整句说完 VAD flush 才出 FINAL）从停嘴到转写回来需 ~0.5-1.2s，
+        # 端点判定必须等得起它。恢复 0.45 静音门槛 + 0.35/1.2 endpointing 的可用基线；
+        # 短句不丢靠 min_speech 0.15、抗噪靠 activation_threshold(0.75)+打斷 min_duration(1.2s)。
+        min_speech_duration=_vad_float(vad_cfg, "min_speech_duration", "VAD_MIN_SPEECH_DURATION", "0.15"),
+        min_silence_duration=_vad_float(vad_cfg, "min_silence_duration", "VAD_MIN_SILENCE_DURATION", "0.45"),
             activation_threshold=_vad_float(vad_cfg, "sensitivity", "VAD_ACTIVATION_THRESHOLD", "0.75"),
         )
     interruption_enabled = bool(vad_cfg.get("interruption", True)) if vad_provider_name != "fake" else True
@@ -443,8 +547,8 @@ async def entrypoint(ctx):
 
     # ---- TTS：人设可指定引擎（persona.tts_provider），留空跟随全局 tts.provider。
     # 引擎决定音色池：qwen3_tts 用本地克隆（persona.reference_audio 是本地克隆 ID）；
-    # minimax/volcano 是云端，用全局 speaker_zh/yue/en（云端音色 ID），绝不能把本地
-    # 克隆 ID 发给云端。fake 出静音测试音。
+    # minimax/volcano 是云端，用全局 speaker_zh/speaker_cantonese/en（云端音色 ID），
+    # 绝不能把本地克隆 ID 发给云端。fake 出静音测试音。
     global_tts_provider = (tts_cfg.get("provider") or "qwen3_tts").lower()
     persona_tts_provider = ((persona or {}).get("tts_provider") or "").strip().lower()
     tts_provider_name = persona_tts_provider or global_tts_provider
@@ -460,15 +564,19 @@ async def entrypoint(ctx):
     elif tts_provider_name in ("minimax", "minimax_streaming"):
         # 云端 MiniMax：整场同声——voice 收敛成一个主音色。
         # 人设 reference_audio（{lang: voice_id}，人设页「AI 音色(整场同声)」存的就是
-        # zh/yue/en 三键同值）优先：取人设主语言对应的音色，统一放 zh 键，无论客户讲
+        # zh/cantonese/en 三键同值）优先：取人设主语言对应的音色，统一放 zh 键，无论客户讲
         # 粤/普/英都用同一把声。未绑则回落全局 speaker（也已是单音色）/旧分语言。
         # 兜底防御：过滤本地 Qwen3 音色（预设 9 个 + 克隆 agent-*/acceptance-*），
         # 否则发给 MiniMax 会 2054 voice not exist，整轮无声。
         persona_voice = (persona or {}).get("reference_audio") or ""
         raw_map = _parse_voice_map(persona_voice) if persona_voice else _build_default_voice_map(tts_cfg)
         persona_lang = (persona or {}).get("language") or ""
-        # 收敛成单主音色（旧分语言数据也只在人设主语言那把声上发声）。
-        raw_map = _collapse_voice_map(raw_map, persona_lang) if persona_voice else raw_map
+        # 整场同声必须无条件收敛成单主音色(唔止 persona 绑 voice 嗰阵):以前全局
+        # speaker 为空会回落旧分语言 map{zh:普通话音色, cantonese:粤语音色},ASR 一旦判错
+        # 一两轮 zh 成个 call 就跳去普通话音色,粤语字读成普通话(「九」→ jiǔ)。
+        # 一律按开场锚语言(greet_lang:人设→对象→zh)取主音色,整场唔再逐轮跳。
+        anchor_lang = _normalize_lang(persona_lang) or greet_lang or "zh"
+        raw_map = _collapse_voice_map(raw_map, anchor_lang)
         _LOCAL_QWEN3 = {
             "serena", "vivian", "uncle_fu", "ryan", "aiden", "ono_anna", "sohee", "eric", "dylan",
         }
@@ -498,7 +606,7 @@ async def entrypoint(ctx):
             # persona 绑定的分语言音色优先（老格式单字符串 → {zh: ...}）。
             voice_map = _parse_voice_map(persona_voice)
         else:
-            # 兜底：设置页 speaker_zh/yue/en 组每语言音色。
+            # 兜底：设置页 speaker_zh/speaker_cantonese/en 组每语言音色。
             voice_map = _build_default_voice_map(tts_cfg)
         tts_provider = Qwen3TTSTTS(
             base_url=_sidecar_base_url(
@@ -593,13 +701,13 @@ async def entrypoint(ctx):
         llm=llm_provider,
         tts=tts_provider,
         # 官方低延迟调参（docs.livekit.io/agents/logic/turns/tuning）：
-        # - dynamic endpointing：按会话停顿统计自适应，min 0.35s 加速切句
+        # - dynamic endpointing：min 0.35s。低于 ~0.3s 会让轮次在慢速离线 ASR 返回前
+        #   提交 → 转写被丢（"transcript arrives after turn has been committed"）→ 不回话。
+        #   max 1.2s：客户停顿未到会被 max 截断结束（不无限等）。
         # - preemptive_tts：在轮次确认前就开跑 LLM->TTS，代价是打断时浪费算力
         # - interruption 保持自适应（无模型时自动回退 VAD），min_duration 收紧到 0.35s
         turn_handling=TurnHandlingOptions(
             endpointing={
-                # dynamic 自适应，min 0.35s 加速切句；max 收紧到 1.2s——
-                # 以前 max 2.0s 会在客户停顿/句子间隙空等最多 2 秒，很"没通话感"。
                 "mode": "dynamic",
                 "min_delay": float(os.environ.get("ENDPOINT_MIN_DELAY", "0.35")),
                 "max_delay": float(os.environ.get("ENDPOINT_MAX_DELAY", "1.2")),
@@ -636,13 +744,26 @@ async def entrypoint(ctx):
         text = getattr(item, "text_content", None) or getattr(item, "raw_text_content", "") or ""
         if not text:
             return
+        if role == "assistant":
+            # 与音频同守则:模型若输出发音/拼音教学,转录也落「请再报单号」罐頭,
+            # 唔好畀课程留喺通话记录(下次摘要又会引用返)。
+            text = lecture_guard(text, language_state.lang if language_state.lang in ("zh", "cantonese", "yue") else None)
         asyncio.create_task(cp.add_turn(call_id, role, _clean_transcript(text)))
 
     async def _async_update_context(role, text):
         # 渐进披露：每轮按用户当前问题实时检索（本地知识库 + 免费联网检索），
         # 覆盖初始知识，并维护整场对话摘要。联网失败静默降级，绝不阻塞通话。
+        # 绑了分步话术(has_steps)的封闭流程默认跳过检索——单对象只上话术，
+        # 减少每轮 prefill；开放咨询(无模板)才 RAG。CONTEXT_RAG=1 强制开。
         try:
-            if role == "user":
+            if role == "assistant":
+                # 与 _on_conversation_item 同守则:教学/发音课程唔落对话记忆——转录落咗罐頭,
+                # 記憶都唔可以留原稿,否则下次摘要/回复会引用一段从未播出嘅内容。
+                text = lecture_guard(
+                    text,
+                    language_state.lang if language_state.lang in ("zh", "cantonese", "yue") else None,
+                )
+            if role == "user" and _context_rag_enabled(flow_ctrl.has_steps if flow_ctrl else False):
                 from .web_search import web_search_text
 
                 hits = await cp.search_knowledge(text, context_state.account_id, 5)
@@ -684,6 +805,45 @@ async def entrypoint(ctx):
     session.on("conversation_item_added", _on_item_for_context)
     session.on("close", _on_close)
 
+    async def _background_flow_judge(step_at: int, utt: str) -> None:
+        """背景跑 LLM 推進判定:唔好喺開聲前同步等(會每輪拖慢),判定完喺下一輪先生效。
+
+        唔會 double-advance:只喺 flow 仲喺 judge 嗰步(step_at)時先落 advance。
+        """
+        try:
+            from .flow import build_judge_messages, parse_judge_output
+
+            jbase = (
+                (llm_cfg.get("base_url") or "")
+                or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1")
+            ).rstrip("/")
+            jmodel = llm_cfg.get("model") or os.environ.get("MLX_LLM_MODEL", "")
+            if not jbase or not jmodel:
+                return
+            goal, ref = flow_ctrl.current_goal_ref()
+            msgs = build_judge_messages(
+                current_index=flow_ctrl.current + 1,
+                total=len(flow_ctrl.steps),
+                overview_lines=flow_ctrl.overview_goal_lines(),
+                goal=goal,
+                ref=ref,
+                next_goal=flow_ctrl.next_goal(),
+                user_text=utt,
+                facts=flow_ctrl.vars_map,
+            )
+            jv = parse_judge_output(await _llm_judge(jbase, jmodel, msgs))
+            if flow_ctrl.current == step_at and flow_ctrl.has_steps and not flow_ctrl.done:
+                if jv == CONFIRM:
+                    flow_ctrl.advance()
+                    context_state.set_flow_current(flow_ctrl.current_step_text())
+                    print(f"[flow] judge(bg)=confirm step={flow_ctrl.current + 1} (call {room_name})", flush=True)
+                else:
+                    print(f"[flow] judge(bg)={jv} step={step_at + 1} (call {room_name})", flush=True)
+        except Exception as exc:  # pragma: no cover - 背景判定失敗唔影響回覆
+            print(f"[flow] judge(bg) failed: {exc!r} (call {room_name})", flush=True)
+        finally:
+            _judge_inflight["step"] = -1
+
     class PausableAgent(Agent):
         """可被主管台暂停/接管/恢复的 Agent：暂停期间抑制自动回复，但保留转写与历史。
 
@@ -703,10 +863,12 @@ async def entrypoint(ctx):
                 # 语言锚定（粤语客服始终讲粤语）：默认用锚语言(greet_lang)回复，只有
                 # 客户连续多轮明显讲其它语言才跟随。计算出的回复语言写回 language_state，
                 # 供 LLM 指令/联网语言使用；TTS 音色已固定不受影响。
+                # 注意：唔好喺 call 前把 sticky 重置成 cur——sticky/streak 係跨轮状态，
+                # 重置咗就永遠得 1 輪、客户講一句普通話即切（連續 threshold 輪先跟嘅
+                # hysteresis 根本唔會生效）。保留上一輪 sticky 傳入,由函數累加 streak。
                 cur = language_state.lang
-                _lang_sticky["sticky"], _lang_sticky["streak"] = cur, _lang_sticky.get("streak", 0)
                 reply_lang, _lang_sticky["sticky"], _lang_sticky["streak"] = _sticky_reply_language(
-                    greet_lang if greet_lang in {"zh", "yue", "en"} else "zh",
+                    greet_lang if greet_lang in {"zh", "cantonese", "en"} else "zh",
                     cur,
                     _lang_sticky["sticky"],
                     _lang_sticky["streak"],
@@ -715,13 +877,80 @@ async def entrypoint(ctx):
                 context_state.set_user_language(reply_lang)
             except Exception:  # pragma: no cover - 语言注入失败不致命
                 pass
+            # WhatsApp 对接触发:喺 flow 推进【前】偵測(step context 係舊步/當前步,offered 先啱);
+            # 客戶俾號碼(captured)照推下一步;應承加但未俾號碼(offered)→ 唔自動跳,等 AI 叫佢俾號碼。
+            _wa_signal: tuple | None = None
+            try:
+                user_text = ""
+                nm = getattr(new_message, "text_content", None) or ""
+                user_text = str(nm or "")
+                if flow_ctrl.has_steps:
+                    _g, _r = flow_ctrl.current_goal_ref()
+                    _wa_signal = detect_whatsapp_signal(
+                        user_text, step_goal=_g, step_ref=_r, facts=flow_ctrl.vars_map
+                    )
+                    if _wa_signal:
+                        _kind, _num = _wa_signal
+                        if _kind == "captured_implicit":
+                            # WhatsApp 綁定呢個來電/號碼:號喺系統度,攞對象電話上報 captured。
+                            # 對象冇電話 → 上報 offered(操作台見「待對接」);兩種都照推進,唔死鎖。
+                            _phone = str((object_card or {}).get("phone") or "").strip()
+                            _num = _phone
+                            _key = f"implicit:{_phone or '-'}"
+                        else:
+                            _key = _num or "offered"
+                        if _key not in _wa_reported:
+                            _wa_reported.add(_key)
+
+                            async def _report():
+                                try:
+                                    await cp.report_whatsapp(call_id, _num)
+                                except Exception as exc:  # pragma: no cover
+                                    # 上报失败唔好永久丢:清 key,後續輪再偵測到會補報
+                                    # (server 幂等,重複 POST 唔會造成重複爆閃)。
+                                    _wa_reported.discard(_key)
+                                    print(f"[whatsapp] report failed, will retry on next signal: {exc!r} (call {room_name})", flush=True)
+
+                            asyncio.create_task(_report())
+                            print(f"[whatsapp] {_kind} num={_num or '-'} (call {room_name})", flush=True)
+            except Exception:  # pragma: no cover - WhatsApp 偵測失敗唔阻斷
+                pass
             # 流程推进:读用户最新话,判定是否进入下一步,更新"当前步"约束注入。
             if flow_ctrl.has_steps and not flow_ctrl.done:
                 try:
-                    user_text = ""
-                    nm = getattr(new_message, "text_content", None) or ""
-                    user_text = str(nm or "")
-                    flow_ctrl.on_user_turn(user_text)
+                    from .flow import should_auto_advance
+
+                    verdict = flow_ctrl.rule_verdict(user_text)
+                    _g2, _r2 = flow_ctrl.current_goal_ref()
+                    # 規則級必定推進 override(開場步客已回應 / 核實步答到平台):
+                    # 唔靠 LLM judge,防止卡死(offered 應承加嗰輪除外——要等客俾號碼)。
+                    _wa_blocks = _wa_signal is not None and _wa_signal[0] == "offered"
+                    _auto = (not _wa_blocks) and should_auto_advance(
+                        current=flow_ctrl.current,
+                        goal=_g2,
+                        ref=_r2,
+                        user_text=user_text,
+                        verdict=verdict,
+                        # 兼要攞WhatsApp嘅核實步:要客戶俾咗號碼/應承先推
+                        wa=(_wa_signal[0] if _wa_signal else None),
+                    )
+                    if _auto:
+                        flow_ctrl.advance()
+                        print(f"[flow] rule=auto step={flow_ctrl.current + 1} (call {room_name})", flush=True)
+                    elif verdict == CONFIRM:
+                        # offered(應承加但未俾號碼)→ 唔推,停喺辦理步叫佢俾號碼(captured 先推)。
+                        if _wa_signal and _wa_signal[0] == "offered":
+                            pass
+                        else:
+                            flow_ctrl.advance()
+                            print(f"[flow] rule=confirm step={flow_ctrl.current + 1} (call {room_name})", flush=True)
+                    elif verdict in (UNCLEAR, QUESTION) and os.environ.get("FLOW_LLM_ADVANCE", "1") == "1":
+                        # 模糊轮(客答唔記得/問後續/開放式回答)→ 背景跑 LLM 判定(唔同步等,
+                        # 唔好為咗推進令每輪開聲慢幾秒);判定完若仲喺同一歩就推進,下一輪先生效。
+                        _step_at = flow_ctrl.current
+                        if _judge_inflight["step"] != _step_at:
+                            _judge_inflight["step"] = _step_at
+                            asyncio.create_task(_background_flow_judge(_step_at, user_text))
                     context_state.set_flow_current(flow_ctrl.current_step_text())
                 except Exception:  # pragma: no cover - 流程推进失败不阻断回复
                     pass
@@ -782,7 +1011,7 @@ async def entrypoint(ctx):
     if not agent.paused:
         # 开场白用开场语言（对象/人设语言决定）；generate_reply 的 instructions 会
         # 在基础指令上叠加，配合 system 里的母语设定让首句即用对的语言。
-        greetings = {"zh": "请问有什么可以帮您？", "yue": "請問有咩可以幫到你？", "en": "How can I help you?"}
+        greetings = {"zh": "请问有什么可以帮您？", "cantonese": "請問有咩可以幫到你？", "en": "How can I help you?"}
         await session.generate_reply(instructions=greetings.get(greet_lang, greetings["zh"]))
         _log_stage("greeting_queued")
 

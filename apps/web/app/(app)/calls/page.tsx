@@ -14,8 +14,21 @@ const STATUS: Record<string, [string, string]> = {
   failed: ["失败", "bg-red-400"],
 };
 
+const WA_PENDING = ["offered", "captured"];
+
 function modeLabel(mode: string) {
   return mode === "live" ? "真实业务" : "训练";
+}
+
+const LANG_LABEL: Record<string, string> = {
+  zh: "中文",
+  cantonese: "粤语",
+  en: "英语",
+  vi: "越南语",
+};
+
+function langLabel(lang: string): string {
+  return LANG_LABEL[String(lang ?? "")] ?? String(lang ?? "-");
 }
 
 export default function CallsPage() {
@@ -63,6 +76,23 @@ export default function CallsPage() {
       .catch((e) => setErr(String(e)))
       .finally(() => setLoading(false));
   }, [accountId]);
+
+  // 主管台橫幅撳「進入工作台」→ /calls?call=<id>:自動開嗰通工作台(靜態 export 用 query,唔使新 route)。
+  useEffect(() => {
+    const m = window.location.search.match(/[?&]call=([^&]+)/);
+    if (m) setOpenId(decodeURIComponent(m[1]));
+  }, []);
+
+  // 列表 4s 輪詢:捉 active call 嘅 WhatsApp 待對接/狀態變化(主管台同步;開咗工作台就唔 poll)。
+  useEffect(() => {
+    if (openId) return;
+    const t = setInterval(() => {
+      api.listCalls(accountId, "")
+        .then((c) => setRows(Array.isArray(c) ? c : []))
+        .catch(() => {});
+    }, 4000);
+    return () => clearInterval(t);
+  }, [accountId, openId]);
 
   function objectName(id: unknown) {
     const o = objects.find((x) => String(x.id) === String(id));
@@ -115,10 +145,16 @@ export default function CallsPage() {
               const id = String(c.id ?? c.call_id);
               const status = String(c.status ?? "idle");
               const [label, color] = STATUS[status] ?? [status, "bg-neutral-500"];
+              const live = ["active", "paused", "ringing"].includes(status);
+              const wa = String(c.whatsapp_status ?? "");
+              const waPending = live && WA_PENDING.includes(wa);
+              const waNum = String(c.customer_whatsapp ?? "");
               return (
                 <div
                   key={id}
-                  className="flex items-center justify-between gap-2 rounded-lg bg-white/5 px-2 py-1 transition hover:bg-white/10"
+                  className={`flex items-center justify-between gap-2 rounded-lg px-2 py-1 transition hover:bg-white/10 ${
+                    waPending ? "wa-flash bg-white/5" : "bg-white/5"
+                  }`}
                 >
                   <button
                     type="button"
@@ -126,9 +162,16 @@ export default function CallsPage() {
                     className="flex min-w-0 flex-1 items-center justify-between gap-3 px-2 py-2 text-left"
                   >
                     <div className="min-w-0">
-                      <p className="truncate font-medium">{objectName(c.object_id)}</p>
+                      <p className="truncate font-medium">
+                        {objectName(c.object_id)}
+                        {waPending && (
+                          <span className="ml-2 rounded bg-[var(--accent)]/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-[var(--accent)]">
+                            WhatsApp {wa === "captured" && waNum ? waNum : "待对接"}
+                          </span>
+                        )}
+                      </p>
                       <p className="mt-1 text-xs text-[var(--muted)]">
-                        {modeLabel(String(c.mode ?? "simulation"))} · {String(c.language ?? "-")} ·{" "}
+                        {modeLabel(String(c.mode ?? "simulation"))} · {langLabel(String(c.language ?? ""))} ·{" "}
                         {String(c.created_at ?? "").slice(0, 19).replace("T", " ")}
                       </p>
                       <p className="mt-1 truncate text-xs text-[var(--muted)]">{id}</p>

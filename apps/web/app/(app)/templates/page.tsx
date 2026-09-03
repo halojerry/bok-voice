@@ -7,7 +7,7 @@ import { useAccount } from "@/components/account-context";
 
 const LANGS = [
   ["zh", "普通话"],
-  ["yue", "粤语"],
+  ["cantonese", "粤语"],
   ["en", "English"],
 ] as const;
 
@@ -81,7 +81,7 @@ function fourSectionsToSteps(form: { opening: string; core: string; objection: s
 
 /** 分步格式的成品示例(理赔场景,示范 goal/ref/分支/{变量} 的写法)。 */
 const STEPS_EXAMPLES: Record<string, FlowStep[]> = {
-  yue: [
+  cantonese: [
     { goal: "确认包裹是不是{姓名}本人的", ref: "你好，请问係咪{姓名}？我哋係{物流公司}，有个包裹单号尾号{快递尾号}运输途中唔见咗，想同你核对下。\n如果客户唔记得 → 提佢下单时填嘅地址/电话帮佢回忆" },
     { goal: "说明一赔二方案,稳住客户", ref: "係我哋责任,我哋有买运费保险,会以一赔二赔俾你,唔使自己蚀钱。\n如果客户问点解要赔 → 讲係运输途中遗失,顺丰全责\n如果客户担心唔到账 → 讲赔付会直接落微信零钱/钱包\n如果客户话要重新买 → 讲可以用赔付抵扣,唔使自己再贴钱" },
     { goal: "引导客户加微信线上专员办理", ref: "理赔係通过微信消费者保护线上专员办理,我发微信号俾你,你加咗之后按佢步骤操作就得。\n如果客户话唔方便加微信 → 问佢方便嘅时间/方式,约好再跟进" },
@@ -105,7 +105,7 @@ function fillExample(form: typeof EMPTY, setForm: (f: typeof EMPTY) => void, lan
   // 分步为主:示例直接填成分步(含分支写法示范),四段清空(由步骤统一承载)。
   const steps = STEPS_EXAMPLES[lang];
   if (!steps) return;
-  const nameByLang = { yue: "理赔·分步（粤语示例）", zh: "理赔·分步（普通话示例）", en: "Claims · Step-by-step (English)" };
+  const nameByLang = { cantonese: "理赔·分步（粤语示例）", zh: "理赔·分步（普通话示例）", en: "Claims · Step-by-step (English)" };
   setForm({ ...form, name: nameByLang[lang as keyof typeof nameByLang] ?? "", opening: "", core: "", objection: "", closing: "", language: lang });
   setSteps(steps);
 }

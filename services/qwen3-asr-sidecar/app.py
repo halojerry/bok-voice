@@ -82,6 +82,12 @@ class ASRService:
                 from mlx_audio.stt.utils import load as mlx_load
 
                 self._model = mlx_load(MODEL_PATH)
+                try:
+                    import mlx.core as mx
+
+                    print(f"[qwen3-asr] loaded {MODEL_PATH} device={mx.default_device()}", flush=True)
+                except Exception:  # pragma: no cover
+                    pass
                 return
             import torch
             from qwen_asr import Qwen3ASRModel
@@ -125,12 +131,12 @@ class ASRService:
         if self._model is None:
             raise HTTPException(status_code=503, detail="model not loaded")
 
-    def start(self) -> str:
+    def start(self, language: str = "") -> str:
         session_id = uuid.uuid4().hex
         self._sessions[session_id] = {
             "chunks": bytearray(),
             "text": "",
-            "language": "",
+            "language": language,
             "partial": False,
             "created_at": time.time(),
             "vllm_state": None,
@@ -194,10 +200,11 @@ class ASRService:
         wav, sr = _wav_from_pcm16(pcm)
         if wav.size == 0:
             return {"text": "", "language": "", "partial": False}
+        hint = session.get("language") or None  # "cantonese" 等;空 = auto
         if BACKEND == "mlx":
             out = self._model.generate(
                 _resample(wav, sr, SAMPLE_RATE),
-                language=None,
+                language=hint,
                 max_tokens=int(os.environ.get("QWEN3_ASR_MAX_TOKENS", "256")),
             )
             text = getattr(out, "text", "") or ""
@@ -214,7 +221,7 @@ class ASRService:
             }
         result = self._model.transcribe(
             audio=(_resample(wav, sr, SAMPLE_RATE), SAMPLE_RATE),
-            language=None,
+            language=hint,
         )
         if not result:
             return {"text": "", "language": "", "partial": False}
@@ -250,8 +257,10 @@ def health() -> dict:
 
 
 @app.post("/api/start")
-def start() -> dict[str, str]:
-    return {"session_id": service.start()}
+async def start(language: str = "") -> dict[str, str]:
+    # language: 可选转写语言提示(如 "cantonese")。agent 在会话语言为粤语时传入,
+    # 强制模型按 Cantonese 转写(auto 检测对粤语常误判成普通话);留空 = 交给模型 auto。
+    return {"session_id": service.start(language=language.strip())}
 
 
 @app.post("/api/chunk")
@@ -261,5 +270,12 @@ async def chunk(session_id: str, request: Request) -> dict[str, str | bool]:
 
 
 @app.post("/api/finish")
-def finish(session_id: str) -> dict[str, str | bool]:
+async def finish(session_id: str, request: Request) -> dict[str, str | bool]:
+    # 兼容两种调用:①逐块 chunk 攒到会话缓冲,finish 无 body;②agent 整包上传——
+    # PCM body 直接在 finish 带过来,优先用 body(避免 2-6s 语音被拆成几十次小 HTTP)。
+    body = await request.body()
+    if body:
+        session = service._sessions.get(session_id)
+        if session is not None:
+            session["chunks"].extend(body)
     return service.finish(session_id)

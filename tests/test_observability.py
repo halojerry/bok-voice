@@ -40,7 +40,7 @@ def test_audit_store_writes_jsonl_and_respects_correlation(tmp_path: Path):
     set_correlation(Correlation(request_id="req-xyz", call_id="call-9", account_id="acc-9"))
     store = AuditStore(directory=tmp_path / "audit")
 
-    ev = store.emit(action="voice.clone", subject_type="tts_voice", subject_id="v1", detail={"lang": "yue"})
+    ev = store.emit(action="voice.clone", subject_type="tts_voice", subject_id="v1", detail={"lang": "cantonese"})
     path = tmp_path / "audit" / f"{ev.to_dict()['ts'][:10]}.jsonl"
     assert path.exists()
     payload = json.loads(path.read_text().strip())

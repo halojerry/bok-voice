@@ -261,7 +261,7 @@ export default function ObjectsPage() {
                 <option value="vi">越南语</option>
                 <option value="zh">中文</option>
                 <option value="en">英语</option>
-                <option value="yue">粤语</option>
+                <option value="cantonese">粤语</option>
               </select>
             </div>
             <input

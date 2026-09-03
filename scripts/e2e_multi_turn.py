@@ -29,7 +29,7 @@ AUDIO_DIR = ROOT / "tests" / "fixtures" / "audio"
 # 每轮：参考音频 + 期望回复语言标签
 TURNS = [
     {"lang": "zh", "file": "zh.wav", "expect": "Chinese"},
-    {"lang": "yue", "file": "yue.wav", "expect": "Cantonese"},
+    {"lang": "cantonese", "file": "yue.wav", "expect": "Cantonese"},
     {"lang": "en", "file": "en.wav", "expect": "English"},
 ]
 
@@ -189,12 +189,12 @@ async def main() -> None:
     ts = int(time.time())
     obj = httpx.post(
         f"{CONTROL_PLANE_URL}/api/objects?account_id=acc-001",
-        json={"display_name": f"多轮-{ts}", "role_template": "buyer", "language": "yue", "background": "multi-turn e2e"},
+        json={"display_name": f"多轮-{ts}", "role_template": "buyer", "language": "cantonese", "background": "multi-turn e2e"},
         timeout=10,
     ).json()
     persona = httpx.post(
         f"{CONTROL_PLANE_URL}/api/personas",
-        json={"name": "多轮客服", "language": "yue", "tone": "礼貌专业"},
+        json={"name": "多轮客服", "language": "cantonese", "tone": "礼貌专业"},
         timeout=10,
     ).json()
     call = httpx.post(
@@ -205,7 +205,7 @@ async def main() -> None:
             "persona_id": persona["id"],
             "mode": "live",
             "direction": "webrtc",
-            "language": "yue",
+            "language": "cantonese",
         },
         timeout=10,
     ).json()
@@ -235,7 +235,7 @@ async def main() -> None:
             if len(audio) > 4000:
                 lang, text = asr_language(audio)
             ok = bool(lang) and turn["expect"].lower() in lang.lower()
-            if turn["lang"] == "yue" and not ok:
+            if turn["lang"] == "cantonese" and not ok:
                 ok = cantonese_markers(text)
             if not ok or len(audio) <= 4000:
                 all_pass = False

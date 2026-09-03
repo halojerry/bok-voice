@@ -23,7 +23,7 @@ from agent_runtime.providers.livekit_plugins import MiniMaxTTS  # noqa: E402
 
 def _make_tts():
     return MiniMaxTTS(
-        voice={"zh": "male-qn-qingse", "yue": "Cantonese_Male_news_anchor_vv2"},
+        voice={"zh": "male-qn-qingse", "cantonese": "Cantonese_Male_news_anchor_vv2"},
         sample_rate=24000,
         api_key="test-key",
     )

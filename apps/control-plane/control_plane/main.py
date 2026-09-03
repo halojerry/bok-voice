@@ -42,6 +42,8 @@ from .schemas import (
     SettingsRequest,
     TokenRequest,
     TokenResponse,
+    WhatsAppCaptureRequest,
+    WhatsAppHandledRequest,
 )
 
 
@@ -550,6 +552,55 @@ async def _disconnect_livekit_room(room_name: str) -> None:
 def add_turn(call_id: str, role: str, transcript: str, emotion: str = "") -> dict:
     turn = TurnEvent(trace_id=call_id, call_id=call_id, turn_id=f"t{len(_repo().get_turns(call_id))}", role=role, transcript=transcript, emotion=emotion)
     return _repo().create_turn(turn)
+
+
+@app.post("/api/calls/{call_id}/whatsapp")
+def report_whatsapp(call_id: str, req: WhatsAppCaptureRequest) -> dict:
+    """Agent 偵測到客戶俾 WhatsApp。number 有值 → captured(客戶讀出自己號碼);
+    空 → offered(客戶應承加專員,未俾號碼)。升級規則:offered→captured 容許、
+    captured 唔覆寫、handled 後唔再降級(避免專員已對接又彈返出嚟)。
+    """
+    call = _repo().get_call(call_id)
+    if not call:
+        raise HTTPException(404, "call not found")
+    number = (req.number or "").strip()
+    cur_status = str(call.get("whatsapp_status") or "")
+    if cur_status == "handled":
+        return call
+    if cur_status == "captured":
+        # 已捉到號碼,新嘅空 offered 唔會降級;同號碼唔重寫。
+        if not number:
+            return call
+        if str(call.get("customer_whatsapp") or "") == number:
+            return call
+        # 客戶改口/補一個唔同號碼:覆寫並保留 captured。
+        fields = {"customer_whatsapp": number, "whatsapp_status": "captured"}
+    else:
+        fields = {"whatsapp_status": "captured" if number else "offered"}
+        if number:
+            fields["customer_whatsapp"] = number
+    updated = _repo().update_call(call_id, **fields) or call
+    _audit("call.whatsapp_captured", subject_type="call", subject_id=call_id,
+           account_id=call.get("account_id", "acc-001"),
+           detail={"status": fields["whatsapp_status"], "number": (number or "")[:3] + "***"})
+    return updated
+
+
+@app.post("/api/calls/{call_id}/whatsapp/handled")
+def mark_whatsapp_handled(call_id: str, req: WhatsAppHandledRequest) -> dict:
+    """專員喺操作台標記已對接 → status=handled,爆閃停止(AI 通話不受影響)。"""
+    call = _repo().get_call(call_id)
+    if not call:
+        raise HTTPException(404, "call not found")
+    if req.handled:
+        updated = _repo().update_call(call_id, whatsapp_status="handled") or call
+    else:
+        # 撤銷:回到有冇號碼嘅狀態
+        status = "captured" if str(call.get("customer_whatsapp") or "").strip() else "offered"
+        updated = _repo().update_call(call_id, whatsapp_status=status) or call
+    _audit("call.whatsapp_handled", subject_type="call", subject_id=call_id,
+           account_id=call.get("account_id", "acc-001"), detail={"handled": req.handled})
+    return updated
 
 
 @app.get("/api/calls/{call_id}/settlement")

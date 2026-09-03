@@ -5,8 +5,8 @@ from agent_runtime.web_search import _shorten_query, _wiki_domain, _trim
 
 def test_wiki_domain_maps_language():
     assert _wiki_domain("zh") == "zh.wikipedia.org"
-    assert _wiki_domain("yue") == "zh-yue.wikipedia.org"
     assert _wiki_domain("cantonese") == "zh-yue.wikipedia.org"
+    assert _wiki_domain("yue") == "zh-yue.wikipedia.org"  # 旧别名 → 外部域名不变
     assert _wiki_domain("en") == "en.wikipedia.org"
     assert _wiki_domain("") == "zh.wikipedia.org"
 

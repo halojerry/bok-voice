@@ -221,26 +221,26 @@ async def main() -> None:
     # 用 curl 没有,这里直接建模板 + 对象 + 人设(通过 API)
     tpl = httpx.post(
         f"{CONTROL_PLANE_URL}/api/templates?account_id=acc-001",
-        json={"name": f"理赔分步E2E-{ts}", "steps_json": json.dumps(steps, ensure_ascii=False), "language": "yue", "tone_override": "地道粤语口语、专业、有礼"},
+        json={"name": f"理赔分步E2E-{ts}", "steps_json": json.dumps(steps, ensure_ascii=False), "language": "cantonese", "tone_override": "地道粤语口语、专业、有礼"},
         timeout=10,
     ).json()
     obj = httpx.post(
         f"{CONTROL_PLANE_URL}/api/objects?account_id=acc-001",
-        json={"display_name": "林先生", "role_template": "buyer", "language": "yue", "background": "理赔咨询",
+        json={"display_name": "林先生", "role_template": "buyer", "language": "cantonese", "background": "理赔咨询",
               "tracking_no": "SF1234567890", "courier": "顺丰", "template_id": tpl["id"]},
         timeout=10,
     ).json()
     persona = httpx.post(
         f"{CONTROL_PLANE_URL}/api/personas",
-        json={"name": f"粤语理赔客服-{ts}", "language": "yue", "tone": "地道粤语口语、专业、有礼",
-              "reference_audio": json.dumps({"zh": "male-qn-qingse", "yue": "Cantonese_Male_news_anchor_vv2"}, ensure_ascii=False),
+        json={"name": f"粤语理赔客服-{ts}", "language": "cantonese", "tone": "地道粤语口语、专业、有礼",
+              "reference_audio": json.dumps({"zh": "male-qn-qingse", "cantonese": "Cantonese_Male_news_anchor_vv2"}, ensure_ascii=False),
               "tts_provider": "minimax"},
         timeout=10,
     ).json()
     call = httpx.post(
         f"{CONTROL_PLANE_URL}/api/calls",
         json={"account_id": "acc-001", "object_id": obj["id"], "persona_id": persona["id"],
-              "mode": "live", "direction": "webrtc", "language": "yue"},
+              "mode": "live", "direction": "webrtc", "language": "cantonese"},
         timeout=10,
     ).json()
     room_name = call["id"]

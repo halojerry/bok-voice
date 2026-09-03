@@ -32,7 +32,7 @@ AUDIO_DIR = ROOT / "tests" / "fixtures" / "audio"
 
 _ALL_CASES = [
     {"lang": "zh", "file": "zh.wav", "expect_lang": "Chinese"},
-    {"lang": "yue", "file": "yue.wav", "expect_lang": "Cantonese"},
+    {"lang": "cantonese", "file": "yue.wav", "expect_lang": "Cantonese"},
     {"lang": "en", "file": "en.wav", "expect_lang": "English"},
 ]
 CASES = [
@@ -285,9 +285,9 @@ async def main() -> None:
         lang, text = "", ""
         if r["agent_audio_bytes"] > 4000:
             lang, text = asr_language(r["agent_audio"])
-        expect = {"zh": "Chinese", "yue": "Cantonese", "en": "English"}[r["lang"]]
+        expect = {"zh": "Chinese", "cantonese": "Cantonese", "en": "English"}[r["lang"]]
         ok = bool(lang) and expect.lower() in lang.lower()
-        if r["lang"] == "yue" and not ok:
+        if r["lang"] == "cantonese" and not ok:
             # MLX ASR sometimes labels Cantonese-flavored replies as "Chinese";
             # accept when the transcribed text carries clear Cantonese markers.
             cantonese = set("冇唔嘅係哋佢喺嚟啲嗰喎㗎冚瞓攞揾搵嘥咗乜嘢咩傾偈倾偈倾下傾下唔該而家依家啱啱咁睇嚟睇来同我哋")

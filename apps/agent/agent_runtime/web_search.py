@@ -1,7 +1,7 @@
 """免费无 key 的联网检索：给本地 LLM 补充实时事实。
 
 数据源（均免费、无需 key）：
-- Wikipedia：按目标语言查百科条目（zh/yue/en 各自子域 + 摘要）。
+- Wikipedia：按目标语言查百科条目（zh/cantonese/en 各自子域 + 摘要）。
 - DuckDuckGo Instant Answer：即时答案/相关主题。
 
 返回统一格式的文本片段，注入 LLM system 上下文。任何失败都静默降级为空，
@@ -25,7 +25,7 @@ _HEADERS = {"User-Agent": "BokVoice/0.1 (local voice assistant; contact: dev@bok
 
 def _wiki_domain(lang: str) -> str:
     key = (lang or "").lower()
-    if key in {"yue", "cantonese"}:
+    if key in {"cantonese", "yue"}:  # yue = 旧数据只读别名;外部域名本身仍是 zh-yue
         return "zh-yue.wikipedia.org"
     if key == "en":
         return "en.wikipedia.org"

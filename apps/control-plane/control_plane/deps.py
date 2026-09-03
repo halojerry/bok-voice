@@ -95,8 +95,89 @@ def build_engine() -> Engine | None:
                     "steps_json",
                     "steps_json TEXT",
                 )
+                _ensure_column(
+                    conn,
+                    "call_sessions",
+                    "whatsapp_status",
+                    "whatsapp_status VARCHAR(16) DEFAULT ''",
+                )
+                _ensure_column(
+                    conn,
+                    "call_sessions",
+                    "customer_whatsapp",
+                    "customer_whatsapp VARCHAR(64) DEFAULT ''",
+                )
         except Exception as exc:  # pragma: no cover - sqlite / duplicate column
             print(f"[deps] idempotent column migration skipped: {exc}")
+
+        # ---- 数据迁移：语言值 yue → cantonese 全栈统一（幂等，SQLite/Postgres 通用）。
+        # 只读别名路径已在上游保留（_normalize_lang/_classify 读 yue 也归一 cantonese），
+        # 这里把存量行一次性落成新规范值,避免新旧两套字段并存。
+        try:
+            import json as _json
+
+            with engine.begin() as conn:
+                for _tbl in (
+                    "persona_profiles",
+                    "object_profiles",
+                    "call_sessions",
+                    "conversation_templates",
+                ):
+                    conn.execute(
+                        text(f"UPDATE {_tbl} SET language='cantonese' WHERE language='yue'")
+                    )
+                # persona reference_audio JSON 的键 yue → cantonese（值=音色 ID 不动）。
+                _rows = conn.execute(
+                    text("SELECT id, reference_audio FROM persona_profiles WHERE reference_audio LIKE '%yue%'")
+                ).fetchall()
+                for _rid, _raw in _rows:
+                    if not _raw:
+                        continue
+                    try:
+                        _m = _json.loads(_raw) if isinstance(_raw, str) else _raw
+                    except Exception:
+                        continue
+                    if not isinstance(_m, dict) or "yue" not in _m:
+                        continue
+                    if "cantonese" not in _m:
+                        _m["cantonese"] = _m.pop("yue")
+                    else:
+                        _m.pop("yue", None)
+                    conn.execute(
+                        text("UPDATE persona_profiles SET reference_audio=:v WHERE id=:id"),
+                        {"v": _json.dumps(_m, ensure_ascii=False), "id": _rid},
+                    )
+                # global_settings 四个 json 列:配置键 speaker_yue → speaker_cantonese。
+                # （不做 vad 数值改写——VAD 默认值由代码/EMPTY_FORM 统一，避免启动迁移
+                #   把用户有意调过的 vad 值覆盖掉。）
+                _scols = (
+                    "asr_json",
+                    "llm_json",
+                    "tts_json",
+                    "vad_json",
+                )
+                for _bk in _scols:
+                    _srows = conn.execute(text(f"SELECT id, {_bk} FROM global_settings")).fetchall()
+                    for _gid, _raw in _srows:
+                        if not _raw:
+                            continue
+                        try:
+                            _b = _json.loads(_raw) if isinstance(_raw, str) else _raw
+                        except Exception:
+                            continue
+                        if not isinstance(_b, dict):
+                            continue
+                        _changed = False
+                        if "speaker_yue" in _b:
+                            _b.setdefault("speaker_cantonese", _b.pop("speaker_yue"))
+                            _changed = True
+                        if _changed:
+                            conn.execute(
+                                text(f"UPDATE global_settings SET {_bk}=:v WHERE id=:id"),
+                                {"v": _json.dumps(_b, ensure_ascii=False), "id": _gid},
+                            )
+        except Exception as exc:  # pragma: no cover - 数据迁移失败不阻断启动
+            print(f"[deps] data migration (yue→cantonese) skipped: {exc}")
         # pgvector: create the extension + knowledge_chunks table (best-effort SQLite-safe).
         try:
             from sqlalchemy import text

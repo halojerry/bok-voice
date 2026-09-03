@@ -114,7 +114,7 @@ class ProviderSettings(BaseModel):
     language: str = ""
     speaker: str = ""
     speaker_zh: str = ""
-    speaker_yue: str = ""
+    speaker_cantonese: str = ""
     speaker_en: str = ""
     instruct: str = ""
     resource_id: str = ""
@@ -128,7 +128,7 @@ class ProviderSettings(BaseModel):
     # 越高越抗噪，越低越灵敏，agent 侧传给 inference.VAD activation_threshold）
     max_buffered_speech: float = 15.0
     min_speech_duration: float = 0.15
-    min_silence_duration: float = 0.35
+    min_silence_duration: float = 0.45
     interruption: bool = True
     sensitivity: float = 0.6
     sample_rate: int = 24000
@@ -144,3 +144,15 @@ class SettingsRequest(BaseModel):
 
 class SupervisorCommand(BaseModel):
     call_id: str
+
+
+class WhatsAppCaptureRequest(BaseModel):
+    """Agent 偵測到客戶俾 WhatsApp:number 有值=captured(客戶讀出號碼),空=offered(應承加專員)。"""
+
+    number: str = ""
+
+
+class WhatsAppHandledRequest(BaseModel):
+    """專員喺操作台標記已對接。"""
+
+    handled: bool = True
