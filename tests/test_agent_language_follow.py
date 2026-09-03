@@ -172,6 +172,8 @@ def test_yue_rule_requires_hk_style_code_mixing():
     assert "七八九零" in text and "粵語數字" in text
     # 高频普→粤词表：这个→呢個、什么→乜嘢、现在→而家 等硬性替换清单。
     assert "呢個" in text and "乜嘢" in text and "而家" in text and "點解" in text
+    # 行业词：快递→速遞、包裹→集運件(香港集运业务语境),并点明不用内地讲法。
+    assert "速遞" in text and "集運件" in text and "唔好用「包裹」「快遞」" in text
 
 
 def test_zh_rule_has_no_hk_style():
