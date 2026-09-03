@@ -30,18 +30,18 @@ _CANTONESE_WORDS = (
 # 而地道粤语口语转写几乎不用。整句长度 + 功能字双重命中才判「强普通话」。
 _MANDARIN_MARKERS = ("的", "了", "这", "那", "什", "么", "说", "没", "给", "们", "您")
 
-# 港式粤语高频用词表(普→港口语词):这里只放「普通话书面词 → 港式口语词」的用词替换,
+# 港式粤语高频用词表(普→港口语词):只放「普通话书面词 → 港式口语词」的用词替换,
 # 不放纯字形(简→繁)条目——字形由规则里的「直接輸出繁體」统一管,避免两件事搅在一起。
+# 只保留客服高频词(疑问/人称/常用动词/礼貌/集运业务);低频书面词交给模型粤语能力,
+# 控制静态前缀体积(prefill 与 KV-cache 都受益)。
 _HK_YUE_LEXICON = (
-    "这个→呢個 那个→嗰個 这些→呢啲 那些→嗰啲 "
-    "这里→呢度 那里→嗰度 什么→乜嘢 怎么→點樣 为什么→點解 谁→邊個 哪里→邊度 什么时候→幾時 多少→幾多 怎么办→點算 "
-    "是→係 不是→唔係 的→嘅 了→咗 在→喺 来→嚟 没有→冇 不要→唔好 不用→唔使 不可以→唔得 不知道→唔知 "
-    "现在→而家 刚刚→啱啱 马上→即刻 今天→今日 明天→聽日 昨天→尋日 等一下→等陣 没关系→唔緊要 "
-    "我们→我哋 你们→你哋 他们→佢哋 他/她→佢 我的→我嘅 你的→你嘅 "
-    "也→都 还→仲 很→好 更→更加 告诉→話俾 看→睇 听→聽 找→搵 给→俾 拿→攞 回家→返屋企 "
-    "谢谢→唔該晒 对不起→唔好意思 没关系→唔緊要 没问题→冇問題 东西→嘢 事情→事 "
-    "联系→聯絡 处理→處理/跟進 安排→安排 确认→確認 帮忙→幫手 号码→冧巴/號碼 可以吗→得唔得/可唔可以 "
-    "快递→速遞 包裹→集運件 货物→貨件/集運件 转运→集運 收到→收到/收咗 "
+    "这个→呢個 那个→嗰個 这些→呢啲 这里→呢度 那里→嗰度 什么→乜嘢 怎么→點樣 为什么→點解 "
+    "谁→邊個 哪里→邊度 什么时候→幾時 多少→幾多 "
+    "是→係 不是→唔係 的→嘅 了→咗 在→喺 来→嚟 没有→冇 不要→唔好 不用→唔使 不知道→唔知 "
+    "现在→而家 刚刚→啱啱 今天→今日 明天→聽日 "
+    "我们→我哋 你们→你哋 他们→佢哋 告诉→話俾 看→睇 找→搵 给→俾 拿→攞 "
+    "谢谢→唔該晒 对不起→唔好意思 没问题→冇問題 "
+    "快递→速遞 包裹→集運件 联系→聯絡 确认→確認 帮忙→幫手 可以吗→得唔得/可唔可以 "
 )
 
 # 中文对话里常被整词借用的英语感叹词：出现它们不代表用户切到英语。
@@ -74,6 +74,59 @@ def _inject_pauses(text: str) -> str:
     if buf:
         out.append(buf)
     return "".join(out)
+
+
+# ---- 发音教学形输出拦截 ----
+# 弱模型(4B)对 prompt 里「数字要读成汉字」这类规则会过度字面化,自造一段
+# 「粤语用字粤拼(Jyutping)发音要点 1一jat1…10十sap6」课程并让 TTS 照念。
+# 正常客服回复永不出现这些术语/罗马拼音+调号,命中即整段替换成「请重报单号」。
+_LECTURE_TERMS = (
+    "發音要點", "发音要点", "發音教學", "发音教学", "拼音教學", "拼音教学",
+    "入聲字", "入声字", "入聲", "入声", "韻母", "韵母", "聲調", "声调",
+    "尾音收", "粵拼", "粤拼", "Jyutping", "jyutping", "JYUTPING",
+    "双唇閉合", "双唇闭合", "發音短促", "发音短促", "高升調", "高升调",
+)
+# 罗马字拼音/粤拼+声调数字:jat1、gau2、saam1、yi1 这类。不用开头的 \b,
+# 让「一jat1」这种紧贴汉字的写法也能命中;≥3 个才判「课程」,避免正常夹
+# 英文(如 version2/order3 偶发)误伤。
+_JYUTPING_TOKEN_RE = re.compile(r"[A-Za-z]{1,8}[1-6]\b")
+# 罐头的语言跟随文本里的粤语特征字(兜底);有明确会话语言时用会话语言。
+_CANTONESE_HINT_CHARS = set("嘅唔冇喺嗰咁嚟啲佢哋")
+_LECTURE_CANNED_CANTONESE = "唔好意思，頭先聽得唔係好清楚，可唔可以再講多次個單號或者訂單號碼俾我？"
+_LECTURE_CANNED_ZH = "不好意思，刚才没太听清楚，可以再把单号或订单号码说一遍吗？"
+
+
+def is_lecture_text(text: str) -> bool:
+    """整段是否「发音/拼音/声调教学」形(正常客服回复不会是)。"""
+    if not text:
+        return False
+    if any(w in text for w in _LECTURE_TERMS):
+        return True
+    return len(_JYUTPING_TOKEN_RE.findall(text)) >= 3
+
+
+def _lecture_lang(text: str) -> str:
+    if any(ch in text for ch in _CANTONESE_HINT_CHARS):
+        return "cantonese"
+    return "zh"
+
+
+def lecture_canned(lang: str | None = None) -> str:
+    # 旧数据/旧标签可能仍是 "yue"：只读别名，统一按粤语罐头处理。
+    return _LECTURE_CANNED_CANTONESE if lang in ("cantonese", "yue") else _LECTURE_CANNED_ZH
+
+
+def lecture_guard(text: str, lang: str | None = None) -> str:
+    """教学形输出 → 罐头的「请客户再报一次单号」;正常回复原样返回。
+
+    在转录落库与 TTS 合成两处都套用,保证音频同 transcript 一致——
+    唔会「录低咗段教学、播咗第二句」。
+    """
+    if not text:
+        return text
+    if not is_lecture_text(text):
+        return text
+    return lecture_canned(lang or _lecture_lang(text))
 
 
 def _looks_cantonese(text: str) -> bool:
@@ -117,12 +170,12 @@ def _classify_spoken_language(lang: str, text: str) -> tuple[str, bool]:
     """归一语言标签并给出「强证据」判断。
 
     返回 (lang, strong)：strong=True 表示该判定有可靠证据（粤语特征字/词、
-    明确的 yue 标签、实质性英文、够长的普通话句子）；strong=False 表示标签
+    明确的 cantonese/yue 标签、实质性英文、够长的普通话句子）；strong=False 表示标签
     模糊（普通话/英文标签 + 短句或借用词）——这种轮次不应把说话人语言拉走。
     """
     key = (lang or "").strip().lower()
-    if key in {"yue", "cantonese"}:
-        return "yue", True
+    if key in {"cantonese", "yue"}:
+        return "cantonese", True
     if key in {"en", "english"}:
         if _looks_english(text):
             return "en", True
@@ -130,7 +183,7 @@ def _classify_spoken_language(lang: str, text: str) -> tuple[str, bool]:
     if key in {"zh", "chinese", "mandarin"}:
         # 判普通话但文本明显是粤语 → 纠偏（整词命中，避免普粤共用字误伤）。
         if _looks_cantonese(text):
-            return "yue", True
+            return "cantonese", True
         if _looks_mandarin(text):
             return "zh", True
         # 短句（好/嗯/係 之类）两种语言都可能：不构成强证据，交给滞后逻辑。
@@ -148,7 +201,9 @@ def _normalize_asr_language(lang: str, text: str) -> str:
 class LanguageState:
     """Shared between ASR and TTS so replies use the language the user spoke.
 
-    lang 的切换带滞后：只有强证据（明确的 yue/en 标签、粤语特征字词、够长的
+    规范语言值: zh / cantonese / en（粤语统一叫 cantonese；旧数据里的 yue 在
+    入口处作只读别名归一到 cantonese，新代码永不产出 yue）。
+    lang 的切换带滞后：只有强证据（明确的 cantonese/en 标签、粤语特征字词、够长的
     普通话句子）才允许改变当前语言；标签模糊的短轮次（好/嗯/係…）保持原语言，
     避免 ASR 单轮误标把「粤语客户」拉成普通话、LLM 跟着回普、TTS 切音色。
     开场语言由 agent 按人设/对象语言预置，同样受此保护。
@@ -891,7 +946,8 @@ class _SherpaSTTStream(stt.RecognizeStream):
             if tag in _EMOTION_TAGS:
                 self._stt_.last_emotion = tag.lower()
             if tag in {"ZH", "EN", "YUE"}:
-                self._stt_.last_language = {"ZH": "zh", "EN": "en", "YUE": "yue"}[tag]
+                # 供应商标签 YUE 是外部字面量；内部统一归一到规范值 cantonese。
+                self._stt_.last_language = {"ZH": "zh", "EN": "en", "YUE": "cantonese"}[tag]
             return ""  # 所有标签都不进入显示文本
 
         clean = _tag_re.sub(_repl, text).strip()
