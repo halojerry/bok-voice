@@ -1096,6 +1096,18 @@ class MiniMaxTTS(tts.TTS):
 
     _CN = "https://api.minimax.cn/v1/t2a_v2"
     _INTL = "https://api.minimax.chat/v1/t2a_v2"
+    _ENDPOINT_WS_CN = "wss://api.minimax.cn/ws/v1/t2a_v2"
+    _ENDPOINT_WS_INTL = "wss://api.minimax.chat/ws/v1/t2a_v2"
+
+    def _ws_voice_setting(self, voice: str) -> dict:
+        """任务级 voice_setting（三条合成路径共用同一构造,避免漏 emotion/pitch）。"""
+        return {
+            "voice_id": voice,
+            "speed": float(os.environ.get("MINIMAX_SPEED", "1")),
+            "vol": float(os.environ.get("MINIMAX_VOL", "1")),
+            "pitch": int(os.environ.get("MINIMAX_PITCH", "0")),
+            "emotion": self._resolve_emotion(),
+        }
 
     def __init__(
         self,
@@ -1152,7 +1164,7 @@ class MiniMaxTTS(tts.TTS):
         if base:
             return base
         region = os.environ.get("MINIMAX_REGION", "cn").strip().lower()
-        return "wss://api.minimax.chat/ws/v1/t2a_v2" if region in {"intl", "global", "chat"} else "wss://api.minimax.cn/ws/v1/t2a_v2"
+        return self._ENDPOINT_WS_INTL if region in {"intl", "global", "chat"} else self._ENDPOINT_WS_CN
 
     def _model(self) -> str:
         return os.environ.get("MINIMAX_MODEL", "speech-2.8-hd")
@@ -1171,7 +1183,15 @@ class MiniMaxTTS(tts.TTS):
 
     def synthesize(self, text, *, conn_options=None):
         # 保留整段合成路径：livekit 某些非 stream 调用 / 测试仍会走 synthesize。
+        # 整段齐晒先落 stream——喺度套教学形拦截最稳(逐句流式只喺 send 前拦)。
+        text = lecture_guard(str(text), self._speech_lang())
         return _MiniMaxTTSStream(self, text, conn_options or APIConnectOptions())
+
+    def _speech_lang(self) -> str | None:
+        """罐头回应的语言:会话锚定语言(zh/cantonese)优先,其它(如 en)留 None 自动判。
+        旧数据里残留的 yue 归一到 cantonese 处理。"""
+        lang = self._language_state.lang
+        return lang if lang in ("zh", "cantonese", "yue") else None
 
     def stream(self, *, conn_options=None):
         """真流式 SynthesizeStream：单 WS 连接按增量文本持续 task_continue。"""
@@ -1191,6 +1211,8 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
     def __init__(self, tts_: "MiniMaxTTS", conn_options):
         super().__init__(tts=tts_, conn_options=conn_options)
         self._tts_ = tts_
+        # 教学形拦截已触发过就唔再重复播罐头(同段后续课程句静默丢弃)。
+        self._lecture_fired = False
 
     async def _run(self, output_emitter):
         import websockets
@@ -1204,6 +1226,7 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
             if not voice:
                 print("MINIMAX_TTS_NO_VOICE", flush=True)
                 return
+            print(f"MINIMAX_TTS_VOICE {voice} lang={self._tts_._language_state.lang}", flush=True)
             sample_rate = self._tts_.sample_rate
 
             ws = await websockets.connect(
@@ -1223,6 +1246,7 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
         frame_bytes = int(sample_rate / 5) * 2  # 200ms 帧
         buf = bytearray()
         recv_task: asyncio.Task | None = None
+        t_start = time.monotonic()
         try:
             # 首帧 connected_success
             try:
@@ -1253,6 +1277,7 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
 
             async def _recv_loop():
                 nonlocal init_done, buf
+                first_pushed = False
                 while True:
                     try:
                         msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
@@ -1275,6 +1300,17 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                             output_emitter.start_segment(segment_id="minimax-tts")
                             init_done = True
                         buf.extend(chunk)
+                        if not first_pushed and len(buf) >= frame_bytes // 5:
+                            # P0 首帧早推:不足 200ms 先推 ~40ms,早出声(照 Qwen3-TTS 同款)。
+                            # P0 秒表:首个音频块推送时刻(距 task_start)。
+                            print(
+                                f"TTS_FIRST_AUDIO_MS {(time.monotonic() - t_start) * 1000:.0f}",
+                                flush=True,
+                            )
+                            output_emitter.push(bytes(buf))
+                            output_emitter.flush()
+                            buf.clear()
+                            first_pushed = True
                         while len(buf) >= frame_bytes:
                             output_emitter.push(bytes(buf[:frame_bytes]))
                             output_emitter.flush()
@@ -1288,14 +1324,61 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
 
             recv_task = asyncio.create_task(_recv_loop())
 
-            # 按句增量合成:把 _input_ch 文本按句子边界(。！？!?)切句,每句 task_continue
-            # 发「该句增量」(非累积全文)。实测语义:
+            # 增量合成:文本按边界切分逐段 task_continue。实测语义:
             # - 发累积全文会重复合成前面句子(长回复下明显重读);
             # - 纯逐块增量(不按句)在快速 send 下丢音频(服务端要等足文本才合成)。
             # 按句切分 + 连续发送 = 首句到就出声(低延迟)且不重复(每句只发一次)。
+            # MINIMAX_TTS_OVERLAP=1(默认):句号之间也按「≥N 字 / 标点停顿 / ≥T ms」增量提前送,
+            # 让 MiniMax 在 LLM 整句写完前先出前半句音频;连续数字/字母串不切开(防单号腰斩读错)。
             # 音频按序回流,recv_loop 持续推给 emitter,无需句间等待。
             _SENT_END = "。！？!?"
+            _SOFT_BREAK = "，、；;：:"
             sent_buf = ""
+            sent_any = False
+            try:
+                overlap_on = os.environ.get("MINIMAX_TTS_OVERLAP", "1") == "1"
+            except Exception:  # pragma: no cover
+                overlap_on = True
+            try:
+                _overlap_chars = int(os.environ.get("MINIMAX_TTS_OVERLAP_CHARS", "12"))
+            except Exception:  # pragma: no cover
+                _overlap_chars = 12
+            try:
+                _overlap_ms = int(os.environ.get("MINIMAX_TTS_OVERLAP_MS", "300"))
+            except Exception:  # pragma: no cover
+                _overlap_ms = 300
+            _last_send = time.monotonic()
+
+            def _flushable(s: str) -> bool:
+                """overlap 增量可否送出：不能把连续的号码/数字串拦腰截断。
+
+                MiniMax 对 task_continue 会拼接增量后按整句语义合成，但把一串
+                「七八九零」切成「七八」+「九零」可能在拼接边界出现停顿/重读，
+                故遇结尾是非空格连续数字/字母的串要等它收尾再送。
+                """
+                if not s:
+                    return False
+                tail = s.rstrip("。！？!?，、；;：: \t")
+                return not (tail and (tail[-1].isdigit() or tail[-1].isalpha()))
+
+            async def _send_text(s: str) -> None:
+                nonlocal sent_any, _last_send
+                if not self._lecture_fired and is_lecture_text(s):
+                    # 开场即教学 → 播一次罐头的「请再报单号」,唔好照读课程;
+                    # 若前面已出过正常音频,课程句静默丢弃,唔追加罐头(避免二重声)。
+                    self._lecture_fired = True
+                    if not sent_any:
+                        await ws.send(
+                            json.dumps({"event": "task_continue", "text": lecture_canned(self._tts_._speech_lang())})
+                        )
+                        sent_any = True
+                    return
+                if is_lecture_text(s):
+                    return  # 已触发过,课程延续句照丢
+                await ws.send(json.dumps({"event": "task_continue", "text": s}))
+                sent_any = True
+                _last_send = time.monotonic()
+
             async for item in self._input_ch:
                 if isinstance(item, self._FlushSentinel):
                     continue
@@ -1313,9 +1396,37 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                     sentence = sent_buf[: idx + 1]
                     sent_buf = sent_buf[idx + 1 :]
                     if sentence.strip():
-                        await ws.send(json.dumps({"event": "task_continue", "text": sentence.strip()}))
+                        await _send_text(sentence.strip())
+                # overlap:句号之间的增量,满足「≥N 字且有软停顿/距上次够久」就提前送。
+                if (
+                    overlap_on
+                    and not self._lecture_fired
+                    and sent_buf.strip()
+                    and len(sent_buf.strip()) >= _overlap_chars
+                ):
+                    soft_idx = -1
+                    for ch in _SOFT_BREAK:
+                        pos = sent_buf.rfind(ch)
+                        if pos != -1:
+                            soft_idx = max(soft_idx, pos)
+                    now = time.monotonic()
+                    time_up = (now - _last_send) * 1000 >= _overlap_ms
+                    if (soft_idx != -1 and soft_idx >= len(sent_buf.strip()) // 2) or time_up:
+                        frag = sent_buf.strip()
+                        if _flushable(frag):
+                            await _send_text(frag)
+                            sent_buf = ""
+                if self._lecture_fired:
+                    sent_buf = ""  # 已触发 → 清掉未分句的课程尾部
             if sent_buf.strip():
-                await ws.send(json.dumps({"event": "task_continue", "text": _inject_pauses(sent_buf.strip())}))
+                if not self._lecture_fired and is_lecture_text(sent_buf.strip()):
+                    self._lecture_fired = True
+                    if not sent_any:
+                        await ws.send(
+                            json.dumps({"event": "task_continue", "text": lecture_canned(self._tts_._speech_lang())})
+                        )
+                elif not self._lecture_fired:
+                    await ws.send(json.dumps({"event": "task_continue", "text": _inject_pauses(sent_buf.strip())}))
             # 文本结束:发 task_finish 让服务端吐完剩余音频并回 is_final
             try:
                 await ws.send(json.dumps({"event": "task_finish"}))
@@ -1370,6 +1481,7 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
                 print("MINIMAX_TTS_NO_VOICE", flush=True)
                 await self._emit_beep(output_emitter)
                 return
+            print(f"MINIMAX_TTS_VOICE {voice} lang={self._tts_._language_state.lang}", flush=True)
             sample_rate = self._tts_.sample_rate
             # WebSocket 流式(像电话:首包 ~380ms 边合成边推);失败/显式关闭回退 HTTP 整段。
             if os.environ.get("MINIMAX_WS", "1") == "1":
@@ -1784,30 +1896,42 @@ class _Qwen3ASRStream(stt.RecognizeStream):
     async def _post_audio(self, pcm: bytes):
         if not pcm:
             return "", ""
+        t0 = time.monotonic()
+        # 语言提示:会话语言为粤语时强制告诉模型(mlx 层大小写不敏感回填 config 规范名
+        # Cantonese),避免 auto 误判成普通话;zh/en/空不传 = 交给模型 auto 检测。
+        lang_hint = ""
+        if self._stt_._language_state.lang == "cantonese":
+            lang_hint = "cantonese"
+        elif self._stt_._language_state.lang == "yue":  # 旧数据只读别名
+            lang_hint = "cantonese"
+        print(f"QWEN3_ASR_HINT {lang_hint or 'auto'} lang_state={self._stt_._language_state.lang}", flush=True)
         last_exc: Exception | None = None
         for attempt in range(3):
             try:
                 async with httpx.AsyncClient(timeout=30) as client:
-                    start = await client.post(f"{self._stt_._base_url}/api/start")
+                    params = {"session_id": ""} if lang_hint else None
+                    start = await client.post(
+                        f"{self._stt_._base_url}/api/start",
+                        params={"language": lang_hint} if lang_hint else None,
+                    )
                     start.raise_for_status()
                     session_id = start.json()["session_id"]
-                    for i in range(0, len(pcm), 3200):
-                        await client.post(
-                            f"{self._stt_._base_url}/api/chunk",
-                            params={"session_id": session_id},
-                            content=pcm[i : i + 3200],
-                            headers={"Content-Type": "application/octet-stream"},
-                        )
                     final = await client.post(
                         f"{self._stt_._base_url}/api/finish",
                         params={"session_id": session_id},
+                        content=bytes(pcm),
+                        headers={"Content-Type": "application/octet-stream"},
                     )
                     final.raise_for_status()
                     data = final.json()
                     text = str(data.get("text") or "")
                     lang = str(data.get("language") or "")
                     lang = _normalize_asr_language(lang, text)
-                    print("QWEN3_ASR_TEXT", repr(text[:120]), lang, flush=True)
+                    print(
+                        f"QWEN3_ASR_TEXT {repr(text[:120])} {lang} "
+                        f"ASR_MS={(time.monotonic() - t0) * 1000:.0f}",
+                        flush=True,
+                    )
                     return text, lang
             except asyncio.CancelledError:
                 raise
