@@ -684,6 +684,13 @@ def cmd_serve() -> int:
     for _ in range(120):
         if all(healthy(p) for p in targets):
             print("[bok] desktop ready: control-plane=8000 asr=8787 tts=8788 llm=1235 b-line=8790")
+            # 非打包模式自动打开浏览器页面(可用 BOK_NO_OPEN_BROWSER=1 关闭)。
+            if not is_packaged() and os.environ.get("BOK_NO_OPEN_BROWSER", "0") != "1":
+                try:
+                    import webbrowser
+                    webbrowser.open("http://127.0.0.1:3000")
+                except Exception:  # pragma: no cover - 打开浏览器失败不影响启动
+                    pass
             return 0
         time.sleep(1)
     print("[bok] timeout waiting for desktop stack (see app-data/logs)", file=sys.stderr)
