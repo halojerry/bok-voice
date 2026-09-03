@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { api } from "@/lib/api";
 import { useAccount } from "@/components/account-context";
+import { CallStudio } from "@/components/CallStudio";
 
 const STATUS: Record<string, [string, string]> = {
   active: ["进行中", "bg-emerald-400"],
@@ -24,12 +25,15 @@ export default function CallsPage() {
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [clearing, setClearing] = useState(false);
+  // 选中的通话：同页内嵌工作台（静态导出无法为真实 call id 生成路由，改内嵌而非 /calls/[id]）。
+  const [openId, setOpenId] = useState<string | null>(null);
 
   async function removeOne(id: string) {
     if (!window.confirm("确认删除该通话记录？（转写与结算一并删除）")) return;
     try {
       await api.deleteCall(id);
       setRows((prev) => prev.filter((r) => String(r.id ?? r.call_id) !== id));
+      if (openId === id) setOpenId(null);
     } catch (e) {
       setErr(String(e));
     }
@@ -89,49 +93,67 @@ export default function CallsPage() {
       {err && <p className="mb-4 text-sm text-red-300">{err}</p>}
       {loading && <p className="text-sm text-[var(--muted)]">加载中…</p>}
 
-      <section className="card">
-        <div className="space-y-2">
-          {!loading && rows.length === 0 && (
-            <p className="text-sm text-[var(--muted)]">暂无会话，点击右上角「新建通话」开始。</p>
-          )}
-          {rows.map((c) => {
-            const id = String(c.id ?? c.call_id);
-            const status = String(c.status ?? "idle");
-            const [label, color] = STATUS[status] ?? [status, "bg-neutral-500"];
-            return (
-              <div
-                key={id}
-                className="flex items-center justify-between gap-2 rounded-lg bg-white/5 px-2 py-1 transition hover:bg-white/10"
-              >
-                <Link href={`/calls/${id}`} className="flex min-w-0 flex-1 items-center justify-between gap-3 px-2 py-2">
-                  <div className="min-w-0">
-                    <p className="truncate font-medium">{objectName(c.object_id)}</p>
-                    <p className="mt-1 text-xs text-[var(--muted)]">
-                      {modeLabel(String(c.mode ?? "simulation"))} · {String(c.language ?? "-")} ·{" "}
-                      {String(c.created_at ?? "").slice(0, 19).replace("T", " ")}
-                    </p>
-                    <p className="mt-1 truncate text-xs text-[var(--muted)]">{id}</p>
-                  </div>
-                  <div className="flex shrink-0 items-center gap-3">
-                    <span className="inline-flex items-center gap-1.5 text-xs text-[var(--muted)]">
-                      <span className={`h-2 w-2 rounded-full ${color}`} />
-                      {label}
-                    </span>
-                    <span className="text-[var(--accent)]">进入 →</span>
-                  </div>
-                </Link>
-                <button
-                  className="btn-ghost shrink-0 text-xs text-red-300/80 hover:text-red-300"
-                  onClick={() => removeOne(id)}
-                  title="删除该通话记录"
+      {openId && (
+        <section className="mb-6">
+          <div className="mb-2 flex items-center justify-between">
+            <span className="text-sm font-medium">会话工作台 · {openId}</span>
+            <button className="btn-ghost text-xs" onClick={() => setOpenId(null)}>
+              ← 返回列表
+            </button>
+          </div>
+          <CallStudio callId={openId} />
+        </section>
+      )}
+
+      {!openId && (
+        <section className="card">
+          <div className="space-y-2">
+            {!loading && rows.length === 0 && (
+              <p className="text-sm text-[var(--muted)]">暂无会话，点击右上角「新建通话」开始。</p>
+            )}
+            {rows.map((c) => {
+              const id = String(c.id ?? c.call_id);
+              const status = String(c.status ?? "idle");
+              const [label, color] = STATUS[status] ?? [status, "bg-neutral-500"];
+              return (
+                <div
+                  key={id}
+                  className="flex items-center justify-between gap-2 rounded-lg bg-white/5 px-2 py-1 transition hover:bg-white/10"
                 >
-                  删除
-                </button>
-              </div>
-            );
-          })}
-        </div>
-      </section>
+                  <button
+                    type="button"
+                    onClick={() => setOpenId(id)}
+                    className="flex min-w-0 flex-1 items-center justify-between gap-3 px-2 py-2 text-left"
+                  >
+                    <div className="min-w-0">
+                      <p className="truncate font-medium">{objectName(c.object_id)}</p>
+                      <p className="mt-1 text-xs text-[var(--muted)]">
+                        {modeLabel(String(c.mode ?? "simulation"))} · {String(c.language ?? "-")} ·{" "}
+                        {String(c.created_at ?? "").slice(0, 19).replace("T", " ")}
+                      </p>
+                      <p className="mt-1 truncate text-xs text-[var(--muted)]">{id}</p>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-3">
+                      <span className="inline-flex items-center gap-1.5 text-xs text-[var(--muted)]">
+                        <span className={`h-2 w-2 rounded-full ${color}`} />
+                        {label}
+                      </span>
+                      <span className="text-[var(--accent)]">进入 →</span>
+                    </div>
+                  </button>
+                  <button
+                    className="btn-ghost shrink-0 text-xs text-red-300/80 hover:text-red-300"
+                    onClick={() => removeOne(id)}
+                    title="删除该通话记录"
+                  >
+                    删除
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
     </div>
   );
 }

@@ -10,7 +10,7 @@ import {
   useSession,
   useTranscriptions,
 } from "@livekit/components-react";
-import { TokenSource, Track, type Room } from "livekit-client";
+import { ConnectionState, TokenSource, Track, type Room } from "livekit-client";
 import { api } from "@/lib/api";
 import { describeConnectError, friendlyErrorText, useControlPlaneReady } from "@/lib/api-ready";
 import { applyOutputDevice, listAudioDevicesOf, requestMicPermission, saveMicDevice, savedMicDevice, savedOutputDevice, switchWebOutputDevice, webCanSwitchOutput, isTauriShell, type AudioDeviceInfo } from "@/lib/audio";
@@ -441,7 +441,34 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
   const session = useSession(tokenSource);
   const { canPlayAudio, startAudio } = useAudioPlayback(session.room);
 
-  const roomConnected = Boolean(stateCallId) && !connecting;
+  // 真实连接态：以房间状态为准，而不是「callId 非空」冒充。修复了带历史通话 id
+  // 进来自动显示"已连接"、却只有一个会真挂断的按钮、无法接通的隐患。
+  const roomConnected = session.room.state === ConnectionState.Connected;
+  const isJoiningExisting = Boolean(stateCallId);
+  // 主管操作（暂停/接管/转人工）状态；挂断走 leave()。
+  const [superviseMsg, setSuperviseMsg] = useState("");
+  const [superviseBusy, setSuperviseBusy] = useState(false);
+
+  async function supervisorAct(kind: "pause" | "resume" | "takeover" | "transfer") {
+    const id = callIdRef.current;
+    if (!id) return;
+    setSuperviseBusy(true);
+    setSuperviseMsg("");
+    try {
+      const fn =
+        kind === "pause" ? api.supervisorPause
+        : kind === "resume" ? api.supervisorResume
+        : kind === "takeover" ? api.supervisorTakeover
+        : api.supervisorTransfer;
+      const r = await fn(id);
+      const status = (r as { status?: string })?.status;
+      setSuperviseMsg(`${kind === "pause" ? "已暂停" : kind === "resume" ? "已恢复" : kind === "takeover" ? "已转人工接管" : "已转人工"}${status ? `（状态：${status}）` : ""}`);
+    } catch (e) {
+      setSuperviseMsg(friendlyErrorText(String(e)));
+    } finally {
+      setSuperviseBusy(false);
+    }
+  }
 
   // Load selectable objects + personas and default to the first. Runs on mount and
   // again on each Control Plane offline→ready transition (desktop cold start), so
@@ -677,15 +704,36 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
           <div className="text-xs text-[var(--muted)]">
             {stateCallId ? `会话 ${stateCallId}` : "新建会话"}
           </div>
-          <div className="flex gap-2">
-            {!roomConnected ? (
-              <button className="btn-primary" onClick={connect} disabled={connecting || (!stateCallId && !objId)}>
-                {connecting ? "接通中…" : error ? "重试接通" : "接通"}
-              </button>
-            ) : (
-              <button className="btn-ghost" onClick={leave}>
-                挂断
-              </button>
+          <div className="flex flex-col items-end gap-2">
+            <div className="flex gap-2">
+              {!roomConnected ? (
+                <button className="btn-primary" onClick={connect} disabled={connecting || (!stateCallId && !objId)}>
+                  {connecting ? "接通中…" : error ? "重试接通" : isJoiningExisting ? "接通 / 进房" : "接通"}
+                </button>
+              ) : (
+                <button className="btn-ghost" onClick={leave}>
+                  挂断
+                </button>
+              )}
+            </div>
+            {roomConnected && isJoiningExisting && (
+              <div className="flex flex-col items-end gap-1">
+                <div className="flex gap-1.5">
+                  <button className="btn-ghost px-2 py-0.5 text-[11px]" disabled={superviseBusy} onClick={() => supervisorAct("pause")}>
+                    暂停 AI
+                  </button>
+                  <button className="btn-ghost px-2 py-0.5 text-[11px]" disabled={superviseBusy} onClick={() => supervisorAct("resume")}>
+                    恢复 AI
+                  </button>
+                  <button className="btn-ghost px-2 py-0.5 text-[11px]" disabled={superviseBusy} onClick={() => supervisorAct("takeover")}>
+                    接管
+                  </button>
+                  <button className="btn-ghost px-2 py-0.5 text-[11px]" disabled={superviseBusy} onClick={() => supervisorAct("transfer")}>
+                    转人工
+                  </button>
+                </div>
+                {superviseMsg && <span className="text-[10px] text-[var(--muted)]">{superviseMsg}</span>}
+              </div>
             )}
           </div>
         </div>

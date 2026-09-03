@@ -91,7 +91,9 @@ function DashboardContent() {
                 {calls.slice(0, 6).map((call) => (
                   <Link
                     key={String(call.id ?? call.call_id)}
-                    href={`/calls/${String(call.id ?? call.call_id)}`}
+                    // 静态导出无法为真实 call id 生成 /calls/<id> 路由：统一去 /calls 列表，
+                    // 在列表里点「进入」会内嵌工作台打开该会话。
+                    href="/calls"
                     className="flex items-center justify-between rounded-lg bg-white/5 px-4 py-3 hover:bg-white/10"
                   >
                     <div className="min-w-0">
@@ -100,7 +102,7 @@ function DashboardContent() {
                         {String(call.status ?? "-")} · {String(call.mode ?? "-")} · {String(call.language ?? "-")}
                       </p>
                     </div>
-                    <span className="text-[var(--accent)]">进入 →</span>
+                    <span className="text-[var(--accent)]">查看 →</span>
                   </Link>
                 ))}
                 {calls.length === 0 && <p className="text-sm text-[var(--muted)]">暂无会话，从「新建通话」开始。</p>}
