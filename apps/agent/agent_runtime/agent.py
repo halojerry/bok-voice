@@ -274,6 +274,12 @@ async def entrypoint(ctx):
     call_id = os.environ.get("AGENT_CALL_ID") or room_name
     cp_base = os.environ.get("CONTROL_PLANE_URL") or "http://127.0.0.1:8000"
     cp = ControlPlaneClient(cp_base)
+    import time as _t
+
+    _t0 = _t.monotonic()
+
+    def _log_stage(name: str) -> None:
+        print(f"[agent] {name} +{(_t.monotonic() - _t0) * 1000:.0f}ms ({call_id})", flush=True)
 
     # Resolve business context (call -> object -> persona -> knowledge) for injection.
     call: dict | None = None
@@ -312,6 +318,7 @@ async def entrypoint(ctx):
     from .flow import FlowController, facts_line
 
     flow_ctrl = FlowController.from_template(template, object_card)
+    _log_stage("context_resolved")
     if flow_ctrl.has_steps:
         context_state.set_flow(flow_ctrl.flow_overview(), flow_ctrl.current_step_text())
         print(f"[agent] flow loaded {len(flow_ctrl.steps)} steps (call {room_name})", flush=True)
@@ -377,11 +384,13 @@ async def entrypoint(ctx):
         # activation_threshold = Silero 判定「人声」的概率阈值(0~1)：越高越不易被
         # 环境噪声/键盘声误触发。以前没接线、用库默认 0.5，嘈杂环境一路识别。
         # 设置页 vad.sensitivity 存的就是它（0.6~0.8 抗噪，0.4~0.5 更灵敏）。
+        # 打断风暴修复后默认 0.75 + min_speech 0.4：短促噪声/底噪不足以判成"用户开口"，
+        # 避免 AI 每次刚要开口就被当插话打断、多次后不再出声。
         vad_provider = inference.VAD(
             max_buffered_speech=_vad_float(vad_cfg, "max_buffered_speech", "VAD_MAX_BUFFERED_SPEECH", "15"),
-            min_speech_duration=_vad_float(vad_cfg, "min_speech_duration", "VAD_MIN_SPEECH_DURATION", "0.2"),
-            min_silence_duration=_vad_float(vad_cfg, "min_silence_duration", "VAD_MIN_SILENCE_DURATION", "0.35"),
-            activation_threshold=_vad_float(vad_cfg, "sensitivity", "VAD_ACTIVATION_THRESHOLD", "0.6"),
+            min_speech_duration=_vad_float(vad_cfg, "min_speech_duration", "VAD_MIN_SPEECH_DURATION", "0.4"),
+            min_silence_duration=_vad_float(vad_cfg, "min_silence_duration", "VAD_MIN_SILENCE_DURATION", "0.45"),
+            activation_threshold=_vad_float(vad_cfg, "sensitivity", "VAD_ACTIVATION_THRESHOLD", "0.75"),
         )
     interruption_enabled = bool(vad_cfg.get("interruption", True)) if vad_provider_name != "fake" else True
 
@@ -550,6 +559,7 @@ async def entrypoint(ctx):
             asyncio.create_task(_llm_warmup())
         except Exception:  # pragma: no cover
             pass
+    _log_stage("providers_ready")
 
     session = AgentSession(
         vad=vad_provider,
@@ -579,7 +589,10 @@ async def entrypoint(ctx):
             },
             interruption={
                 "enabled": interruption_enabled,
-                "min_duration": 0.35,
+                # 打断至少要 1.2s 连续人声才算：用户只是连续说话/短句(0.5~1s)不会把
+                # AI 正在输出的回复反复掐断(否则 LLM 一直生成、TTS 一直被掐 → 听不到声)。
+                # 真插话(客户打断 AI 说较长一句)仍能打断。
+                "min_duration": float(os.environ.get("INTERRUPT_MIN_DURATION", "1.2")),
                 "min_words": 0,
             },
         ),
@@ -738,12 +751,14 @@ async def entrypoint(ctx):
     # AgentSession 内部已注册 job shutdown callback（自动 aclose），
     # 这里不能提前 close，否则会话在接通后立刻被销毁。
     await session.start(agent=agent, room=ctx.room)
+    _log_stage("session_started")
 
     if not agent.paused:
         # 开场白用开场语言（对象/人设语言决定）；generate_reply 的 instructions 会
         # 在基础指令上叠加，配合 system 里的母语设定让首句即用对的语言。
         greetings = {"zh": "请问有什么可以帮您？", "yue": "請問有咩可以幫到你？", "en": "How can I help you?"}
         await session.generate_reply(instructions=greetings.get(greet_lang, greetings["zh"]))
+        _log_stage("greeting_queued")
 
     # session.start 只负责拉起流水线（返回后会话在后台运行）。保持 entrypoint
     # 存活直到房间关闭，supervisor watcher 在此期间持续轮询；_on_close 置位

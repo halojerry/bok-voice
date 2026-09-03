@@ -46,6 +46,25 @@ def parse_steps(steps_json: str) -> list[FlowStep]:
     return [s for s in out if s.goal.strip() or s.ref.strip()]
 
 
+# 粤语数字逐个读法:0 读「零」;1-9 对应汉字。数字串/单号要逐个读,
+# 不要按多位数值读,所以这里做「字符级」映射(7890 → 七八九零),而非数值转换。
+_CANTONESE_DIGITS = {
+    "0": "零", "1": "一", "2": "二", "3": "三", "4": "四",
+    "5": "五", "6": "六", "7": "七", "8": "八", "9": "九",
+}
+
+
+def digits_to_cantonese(text: str) -> str:
+    """把字符串里的数字逐位转成粤语汉字(适合单号/电话/尾号逐字读)。
+
+    只转「纯数字串」或数字与字母混排里的数字部分(如 SF7890 → SF七八九零);
+    不去动汉字/其它内容。金额/日期等需按位值读的场景不适用(调用方按需用)。
+    """
+    if not text:
+        return text
+    return "".join(_CANTONESE_DIGITS.get(ch, ch) for ch in str(text))
+
+
 # 四段 → 步骤的 goal 标签(用于把旧式四段模板转成分步,逐步推进不念稿)
 _LEGACY_STEP_GOALS = {
     "opening": "开场:自报家门,说明来意,向客户确认身份/包裹",
@@ -75,23 +94,28 @@ def template_to_steps(template: dict | None) -> list[FlowStep]:
 
 
 def object_vars(object_card: dict | None) -> dict[str, str]:
-    """从对象卡提取话术变量;缺的留空(由上层标"待确认",不编造)。"""
+    """从对象卡提取话术变量;缺的留空(由上层标"待确认",不编造)。
+
+    单号/尾号/电话的数字逐位转成粤语汉字(7890 → 七八九零):无论这些文字最后
+    进 LLM 还是被直接念,都不会被 TTS 读成普通话数字/错误发音。
+    """
     oc = object_card or {}
     name = str(oc.get("display_name") or "").strip()
     tracking = str(oc.get("tracking_no") or "").strip()
     courier = str(oc.get("courier") or "").strip()
     address = str(oc.get("address") or "").strip()
     tail = tracking[-4:] if len(tracking) >= 4 else tracking
+    phone = str(oc.get("phone") or "").strip()
     return {
         "姓名": name,
         "名字": name,
-        "快递单号": tracking,
-        "快递尾号": tail,
+        "快递单号": digits_to_cantonese(tracking),
+        "快递尾号": digits_to_cantonese(tail),
         "物流公司": courier,
         "快递公司": courier,
         "收货地址": address,
         "地址": address,
-        "电话": str(oc.get("phone") or "").strip(),
+        "电话": digits_to_cantonese(phone),
     }
 
 

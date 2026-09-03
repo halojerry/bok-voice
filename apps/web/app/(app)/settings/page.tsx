@@ -26,7 +26,7 @@ const EMPTY_FORM: Record<ProviderKind, ProviderForm> & { policy: string } = {
   asr: { provider: DEFAULT_PROVIDER.asr },
   llm: { provider: DEFAULT_PROVIDER.llm },
   tts: { provider: DEFAULT_PROVIDER.tts, speaker: "", sample_rate: 24000 },
-  vad: { provider: DEFAULT_PROVIDER.vad, max_buffered_speech: 15, min_speech_duration: 0.2, min_silence_duration: 0.35, sensitivity: 0.6, interruption: true },
+  vad: { provider: DEFAULT_PROVIDER.vad, max_buffered_speech: 15, min_speech_duration: 0.4, min_silence_duration: 0.45, sensitivity: 0.75, interruption: true },
   policy: "offline_first",
 };
 

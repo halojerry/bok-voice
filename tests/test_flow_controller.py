@@ -40,10 +40,34 @@ def test_missing_var_keeps_placeholder():
 
 def test_facts_line_marks_unknown():
     line = facts_line(OBJ)
-    assert "林先生" in line and "SF1234567890" in line and "顺丰" in line
+    assert "林先生" in line and "顺丰" in line
+    # 单号数字逐位转成粤语汉字(SF1234567890 → SF一二三四五六七八九零),TTS 才能按粤语念。
+    assert "一二三四五六七八九零" in line
     assert "香港湾仔活道" in line  # 收货地址也在已知事实里
     line2 = facts_line({"display_name": "", "tracking_no": "", "courier": "", "address": ""})
     assert "待确认" in line2
+
+
+def test_digits_to_cantonese():
+    from agent_runtime.flow import digits_to_cantonese
+    # 逐位读:0 读零、7890 → 七八九零(单号/尾号/电话按位读,不按数值读)。
+    assert digits_to_cantonese("7890") == "七八九零"
+    assert digits_to_cantonese("13800000000") == "一三八零零零零零零零零"
+    # 字母混排只转数字部分。
+    assert digits_to_cantonese("SF1234567890") == "SF一二三四五六七八九零"
+    assert digits_to_cantonese("尾号7890") == "尾号七八九零"
+    # 空/无数字原样返回。
+    assert digits_to_cantonese("") == ""
+    assert digits_to_cantonese("顺丰") == "顺丰"
+
+
+def test_object_vars_converts_digits():
+    from agent_runtime.flow import object_vars
+    v = object_vars(OBJ)
+    assert v["快递单号"] == "SF一二三四五六七八九零"
+    assert v["快递尾号"] == "七八九零"  # 取后4位再转
+    assert v["电话"] == "一三八零零零零零零零零"
+    assert v["姓名"] == "林先生"
 
 
 def test_address_var():
@@ -61,7 +85,7 @@ def test_parse_steps_and_controller():
     assert fc.current == 0
     cur = fc.current_step_text()
     assert "第 1/3 步" in cur
-    assert "SF1234567890" in cur or "7890" in cur  # 变量已渲染
+    assert "SF一二三四五六七八九零" in cur  # 变量已渲染且数字已转粤语汉字
 
 
 def test_advance_only_on_confirm():

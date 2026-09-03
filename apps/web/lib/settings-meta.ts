@@ -101,10 +101,10 @@ export const SETTING_CARDS: ProviderMeta[] = [
     ],
     fields: [
       { key: "max_buffered_speech", label: "单句最长缓冲（秒）", type: "number", hint: "客户连续说话超过该时长会强制切句，避免缓冲溢出。", min: 1, max: 120, step: 0.5 },
-      { key: "sensitivity", label: "触发置信度阈值（0~1）", type: "number", hint: "判定「人声」的概率线：越高越抗噪（嘈杂环境建议 0.6~0.8），越低越灵敏（安静环境 0.4~0.5）。", min: 0.1, max: 0.95, step: 0.05 },
-      { key: "min_speech_duration", label: "最短说话时长（秒）", type: "number", hint: "短于此的杂音不当作一句话；噪声环境下可调到 0.25~0.4。", min: 0.05, max: 2, step: 0.05 },
+      { key: "sensitivity", label: "触发置信度阈值（0~1）", type: "number", hint: "判定「人声」的概率线：越高越抗噪。嘈杂/有底噪环境建议 0.7~0.8（防止 AI 被噪声反复打断后不再出声）；安静环境 0.5~0.6。", min: 0.1, max: 0.95, step: 0.05 },
+      { key: "min_speech_duration", label: "最短说话时长（秒）", type: "number", hint: "短于此的声音不算一句话；噪声/底噪环境调 0.3~0.5 可避免短促杂音误触发。", min: 0.05, max: 2, step: 0.05 },
       { key: "min_silence_duration", label: "判定结束的静音时长（秒）", type: "number", hint: "客户停顿超过该时长视为一句话说完。调小更灵敏，调大可减少误切。", min: 0.05, max: 3, step: 0.05 },
-      { key: "interruption", label: "允许打断 AI 说话", type: "select", hint: "关闭后 AI 说话期间客户无法打断（适合朗读类场景）。", options: [
+      { key: "interruption", label: "允许打断 AI 说话", type: "select", hint: "开启后客户说话可打断 AI；打断至少需约 0.5s 连续人声，短噪声不会误掐断。", options: [
         { value: "true", label: "开启" },
         { value: "false", label: "关闭" },
       ] },
