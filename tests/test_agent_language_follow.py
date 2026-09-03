@@ -124,10 +124,55 @@ def test_minimax_endpoint_region(monkeypatch):
 def test_minimax_voice_by_language():
     from agent_runtime.providers.livekit_plugins import MiniMaxTTS, LanguageState
     ls = LanguageState(); ls.lang = "yue"
-    tts = MiniMaxTTS(voice={"zh": "male-qn-qingse", "yue": "Cantonese_Male_news_anchor_vv2"}, language_state=ls)
+    # 整场同声：voice 只配 zh 键（主音色），无论当前语言态为何都解析到同一把声。
+    tts = MiniMaxTTS(voice={"zh": "Cantonese_Male_news_anchor_vv2"}, language_state=ls)
     assert tts._resolve_voice() == "Cantonese_Male_news_anchor_vv2"
     ls.lang = "zh"
-    assert tts._resolve_voice() == "male-qn-qingse"
+    assert tts._resolve_voice() == "Cantonese_Male_news_anchor_vv2"
     ls.lang = "en"
-    # en 未配 → 回落 zh
-    assert tts._resolve_voice() == "male-qn-qingse"
+    assert tts._resolve_voice() == "Cantonese_Male_news_anchor_vv2"
+
+
+# ---- 整场同声：persona 旧分语言 map 收敛成单主音色 ----
+def test_collapse_voice_map_uses_persona_language():
+    from agent_runtime.agent import _collapse_voice_map
+    # 小林:persona.language=yue,旧 {zh:男声,yue:女声} → 应取粤语女声作全场主音色。
+    m = _collapse_voice_map({"zh": "male-qn-qingse", "yue": "Cantonese_GentleLady"}, "yue")
+    assert m == {"zh": "Cantonese_GentleLady"}
+    # persona.language=zh → 取普通话男声。
+    m = _collapse_voice_map({"zh": "male-qn-qingse", "yue": "Cantonese_GentleLady"}, "zh")
+    assert m == {"zh": "male-qn-qingse"}
+    # en 未配置 / persona 语言缺失 → zh 兜底。
+    m = _collapse_voice_map({"zh": "x", "en": "y"}, "")
+    assert m == {"zh": "x"}
+    # 空 map → 空。
+    assert _collapse_voice_map({}, "yue") == {}
+
+
+def test_build_default_voice_map_single_speaker_wins():
+    from agent_runtime.agent import _build_default_voice_map
+    # 全局配了 speaker（单音色整场同声）→ 各语言都用它。
+    m = _build_default_voice_map({"speaker": "Cantonese_crisp_news_anchor_vv2", "speaker_zh": "old-zh", "speaker_yue": "old-yue"})
+    assert m == {"zh": "Cantonese_crisp_news_anchor_vv2"}
+    # 未配 speaker → 回落旧分语言。
+    m = _build_default_voice_map({"speaker": "", "speaker_zh": "zh-a", "speaker_yue": "yue-b"})
+    assert m == {"zh": "zh-a", "yue": "yue-b"}
+
+
+# ---- LLM 输出：港式自然英夹（M3） ----
+def test_yue_rule_requires_hk_style_code_mixing():
+    from agent_runtime.providers.livekit_plugins import ContextState
+    ctx = ContextState(account_id="acc-001")
+    ctx.set_user_language("yue")
+    text = ctx.render_system_message()
+    assert "港式粤语" in text
+    assert "refund" in text and "check" in text  # 允许自然夹英文服务词
+    assert "唔好解释" in text  # 防泄漏仍保留
+
+
+def test_zh_rule_has_no_hk_style():
+    from agent_runtime.providers.livekit_plugins import ContextState
+    ctx = ContextState(account_id="acc-001")
+    ctx.set_user_language("zh")
+    text = ctx.render_system_message()
+    assert "港式" not in text

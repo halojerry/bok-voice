@@ -75,6 +75,29 @@ def _parse_voice_map(raw) -> dict:
     return {"zh": str(raw or "")}
 
 
+def _collapse_voice_map(raw_map: dict, persona_lang: str) -> dict:
+    """整场同声：把 persona 的旧 {zh,yue,en} 分语言 map 收敛成单一主音色。
+
+    主音色取人设主语言（persona.language）对应键，缺则按 zh→yue→en→首个非空
+    取；最终统一放进 zh 键（MiniMax/Qwen3 的 _resolve_voice 语言缺省都回落 zh），
+    使整场无论客户讲粤/普/英都用同一把声。回退点：若想恢复「按语言分音色」，
+    删掉本函数调用、直接传 raw_map 即可。
+    """
+    if not raw_map:
+        return {}
+    lang = (persona_lang or "").strip().lower()
+    if lang not in {"zh", "yue", "en"}:
+        lang = ""
+    picked = ""
+    for key in ([lang] if lang else []) + ["zh", "yue", "en"]:
+        if raw_map.get(key):
+            picked = str(raw_map[key])
+            break
+    if not picked:
+        picked = str(next((v for v in raw_map.values() if v), ""))
+    return {"zh": picked} if picked else {}
+
+
 _LANG_LABELS = {"zh": "普通话/中文", "yue": "粤语", "en": "英语"}
 
 
@@ -91,14 +114,19 @@ def _normalize_lang(raw, default: str = "") -> str:
 
 
 def _build_default_voice_map(tts_cfg: dict) -> dict:
-    """组每语言兜底音色（persona 未绑定 reference_audio 时使用）。
+    """组默认音色（persona 未绑定 reference_audio 时使用）。
 
-    返回 {zh|yue|en: voice_id}；只包含已配置的语言。Qwen3TTSTTS 解析时
-    当前语言缺省会回落到 zh，因此只配 speaker_zh 也能让粤语/英语轮次出声。
+    产品规则「整场同声」：若设置页配了全局单音色 speaker（云端 MiniMax 默认），
+    则 zh/yue/en 都用它（返回 {"zh": speaker}，任何语言都解析到 zh 兜底键）。
+    仅当 speaker 为空时回落旧的分语言 speaker_zh/yue/en（兼容旧数据）。
+    Qwen3TTSTTS 解析时当前语言缺省会回落到 zh，因此只配 zh 键也能让各语言出声。
     """
-    single = tts_cfg.get("speaker") or ""
+    single = (tts_cfg.get("speaker") or "").strip()
     mapping: dict[str, str] = {}
-    zh = tts_cfg.get("speaker_zh") or single
+    if single:
+        mapping["zh"] = single
+        return mapping
+    zh = tts_cfg.get("speaker_zh") or ""
     if zh:
         mapping["zh"] = zh
     yue = tts_cfg.get("speaker_yue")
@@ -306,15 +334,19 @@ async def entrypoint(ctx):
     emotion_state = EmotionState()
     use_fake = os.environ.get("USE_FAKE_MEDIA") == "1"
 
-    # ---- VAD：设置页 vad.provider / 时长 / 打断开关；环境变量仅作部署覆盖 ----
+    # ---- VAD：设置页 vad.provider / 时长 / 灵敏度 / 打断开关；环境变量仅作部署覆盖 ----
     vad_provider_name = (vad_cfg.get("provider") or "silero").lower()
     if use_fake or vad_provider_name in ("fake", "fake_vad"):
         vad_provider = FakeLiveKitVAD()
     else:
+        # activation_threshold = Silero 判定「人声」的概率阈值(0~1)：越高越不易被
+        # 环境噪声/键盘声误触发。以前没接线、用库默认 0.5，嘈杂环境一路识别。
+        # 设置页 vad.sensitivity 存的就是它（0.6~0.8 抗噪，0.4~0.5 更灵敏）。
         vad_provider = inference.VAD(
             max_buffered_speech=_vad_float(vad_cfg, "max_buffered_speech", "VAD_MAX_BUFFERED_SPEECH", "15"),
-            min_speech_duration=_vad_float(vad_cfg, "min_speech_duration", "VAD_MIN_SPEECH_DURATION", "0.15"),
+            min_speech_duration=_vad_float(vad_cfg, "min_speech_duration", "VAD_MIN_SPEECH_DURATION", "0.2"),
             min_silence_duration=_vad_float(vad_cfg, "min_silence_duration", "VAD_MIN_SILENCE_DURATION", "0.35"),
+            activation_threshold=_vad_float(vad_cfg, "sensitivity", "VAD_ACTIVATION_THRESHOLD", "0.6"),
         )
     interruption_enabled = bool(vad_cfg.get("interruption", True)) if vad_provider_name != "fake" else True
 
@@ -359,14 +391,17 @@ async def entrypoint(ctx):
             sample_rate=int(tts_cfg.get("sample_rate") or 24000),
         )
     elif tts_provider_name in ("minimax", "minimax_streaming"):
-        # 云端 MiniMax：voice 是人设绑定的 reference_audio（{lang: MiniMax voice_id}，
-        # 人设页在 MiniMax 引擎下选的就是 MiniMax 音色）优先；未绑则回落全局
-        # speaker_zh/yue/en。注意：人设若绑的是本地 Qwen3 克隆 ID（agent-60852 等）
-        # 不会被 MiniMax 接受——人设页已按引擎区分音色池，避免这种情况。
-        # 兜底防御：过滤掉本地 Qwen3 音色（预设 9 个 + 克隆 agent-*/acceptance-*），
+        # 云端 MiniMax：整场同声——voice 收敛成一个主音色。
+        # 人设 reference_audio（{lang: voice_id}，人设页「AI 音色(整场同声)」存的就是
+        # zh/yue/en 三键同值）优先：取人设主语言对应的音色，统一放 zh 键，无论客户讲
+        # 粤/普/英都用同一把声。未绑则回落全局 speaker（也已是单音色）/旧分语言。
+        # 兜底防御：过滤本地 Qwen3 音色（预设 9 个 + 克隆 agent-*/acceptance-*），
         # 否则发给 MiniMax 会 2054 voice not exist，整轮无声。
         persona_voice = (persona or {}).get("reference_audio") or ""
         raw_map = _parse_voice_map(persona_voice) if persona_voice else _build_default_voice_map(tts_cfg)
+        persona_lang = (persona or {}).get("language") or ""
+        # 收敛成单主音色（旧分语言数据也只在人设主语言那把声上发声）。
+        raw_map = _collapse_voice_map(raw_map, persona_lang) if persona_voice else raw_map
         _LOCAL_QWEN3 = {
             "serena", "vivian", "uncle_fu", "ryan", "aiden", "ono_anna", "sohee", "eric", "dylan",
         }

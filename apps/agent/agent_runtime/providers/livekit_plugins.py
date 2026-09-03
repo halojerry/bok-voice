@@ -361,9 +361,12 @@ class ContextState:
             name = names.get(self._user_lang, self._user_lang)
             if self._user_lang == "yue":
                 rule = (
-                    "整段要用地道粤语口语嚟讲，唔好用书面语或者普通话。"
-                    "用词要带粤语特色：唔、冇、嘅、哋、佢、喺、嚟、啲、咁、係、唔該、倾偈、而家、睇下、啱啱"
-                    "（语气参考：「明白，等我帮你睇下呢单先」「係咁嘅，我哋会尽快跟进」）。"
+                    "整段用港式粤语（香港客服腔）嚟讲，唔好用书面语、普通话，亦唔好用广州式偏书面的讲法。"
+                    "口吻要有港味：唔該晒、唔好意思、我哋/你哋、而家、聽日、啱啱、幫你睇返、唔使擔心。"
+                    "可以自然夹杂英文单词/短语（check、confirm、send、email、App、online、status、refund、case、update 呢类服务同操作词），"
+                    "似香港人打电话咁讲；但唔好讲成句英文，亦唔好为咗夹而夹。"
+                    "（语气参考：「唔好意思，我帮你 check 返个 status，refund 一般 3–5 个工作天会到帐。」"
+                    "「我 send 个 email 俾你，跟住入面嘅步骤做就 OK。」）"
                     "唔好解释你讲紧咩语言，唔好加任何注释或者括号。"
                 )
             elif self._user_lang == "en":
