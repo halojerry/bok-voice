@@ -65,6 +65,18 @@ export function useControlPlaneReady(opts?: { intervalMs?: number; offlineAfterM
 const NETWORK_ERROR_RE = /failed to fetch|load failed|networkerror|fetch failed|typeerror/i;
 const STATUS_RE = /\b(\d{3})\b/;
 
+/**
+ * 后端 detail 已随状态码拼进 message（"503 MiniMax API Key 未配置…"）时，
+ * 直接展示真实原因；只有裸状态码/statusText 才落到通用文案。
+ */
+function splitDetail(text: string): { code: number | null; rest: string } {
+  const m = text.match(STATUS_RE);
+  if (!m) return { code: null, rest: "" };
+  const code = Number(m[1]);
+  const rest = text.slice(m.index! + m[0].length).replace(/^[:：,，\s]+/, "").trim();
+  return { code, rest };
+}
+
 /** 把 ErrorState 等页面收到的字符串错误映射成可读中文（不抛异常）。 */
 export function friendlyErrorText(raw: string): string {
   const text = String(raw ?? "").trim();
@@ -72,13 +84,16 @@ export function friendlyErrorText(raw: string): string {
   if (NETWORK_ERROR_RE.test(text)) {
     return "无法连接本地 Control Plane（127.0.0.1:8000）。请确认桌面服务已启动；若应用刚打开，请稍候几秒自动重试。";
   }
-  const m = text.match(STATUS_RE);
-  if (m) {
-    const code = Number(m[1]);
-    if (code === 503) return "Control Plane 暂时不可用（可能仍在启动，或缺少 LiveKit 凭据）。请稍后重试。";
-    if (code >= 500) return `本地服务错误（HTTP ${code}）。请到「本机桌面服务」查看日志。`;
-    if (code === 404) return "请求的资源不存在（可能已被删除）。";
-    if (code === 401 || code === 403) return "没有权限执行该操作。";
+  const { code, rest } = splitDetail(text);
+  if (code !== null) {
+    if (code === 503) {
+      // 带后端 detail 时优先展示真实原因（如缺 MiniMax key），别误导成 LiveKit。
+      if (rest && !/^service unavailable$/i.test(rest)) return `Control Plane 服务暂不可用：${rest}`;
+      return "Control Plane 暂时不可用（可能仍在启动，或缺少 LiveKit 凭据）。请稍后重试。";
+    }
+    if (code >= 500) return `本地服务错误（HTTP ${code}${rest ? `：${rest}` : ""}）。请到「本机桌面服务」查看日志。`;
+    if (code === 404) return rest || "请求的资源不存在（可能已被删除）。";
+    if (code === 401 || code === 403) return rest || "没有权限执行该操作。";
   }
   return text;
 }

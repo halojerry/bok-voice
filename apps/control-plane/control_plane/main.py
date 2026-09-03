@@ -358,9 +358,12 @@ async def tts_preview(payload: dict) -> Response:
     language = str(payload.get("language") or "zh")
     try:
         if provider in ("minimax", "minimax_streaming"):
-            api_key = os.environ.get("MINIMAX_API_KEY", "")
+            # 与 agent 一致：优先读设置库里持久化的 tts.api_key，环境变量仅作兜底，
+            # 否则「设置页已保存 Key 却在 bok serve 重启后试听 503」。
+            tts_settings = (_repo().get_settings() or {}).get("tts") or {}
+            api_key = (str(tts_settings.get("api_key") or "").strip()) or os.environ.get("MINIMAX_API_KEY", "")
             if not api_key:
-                raise HTTPException(status_code=503, detail="MINIMAX_API_KEY 未配置")
+                raise HTTPException(status_code=503, detail="MiniMax API Key 未配置：请到「设置 → TTS 语音合成」填写 API Key 并保存")
             region = os.environ.get("MINIMAX_REGION", "cn").strip().lower()
             base = os.environ.get("MINIMAX_BASE_URL", "").strip().rstrip("/")
             if not base:
@@ -595,8 +598,53 @@ def _write_settlement_docs(call: dict, turns: list[dict], result: dict) -> None:
         print(f"[settle] doc write failed: {exc!r}", flush=True)
 
 
+async def _write_distill_knowledge(call: dict, result: dict) -> dict | None:
+    """把结算蒸馏（摘要/新话题）写进【可检索】的知识库（accounts/*/knowledge/*.md）。
+
+    结算文档（transcript.md/settlement.md）在 objects/.../calls/ 下，知识索引不加载；
+    这里把同一份蒸馏落一份到 accounts/{acc}/knowledge/{object}/{call}.md 并立即 upsert，
+    使后续通话能经知识检索引用到本次沉淀。失败只告警，不阻塞结算主流程。
+    """
+    try:
+        summary = str(result.get("summary") or "").strip()
+        new_topics = result.get("new_topics") or []
+        if not summary and not new_topics:
+            return None
+        account_id = call.get("account_id") or "acc-001"
+        object_id = call.get("object_id") or "unknown"
+        call_id = call.get("id") or ""
+        lines = ["# 通话蒸馏", "", f"- call_id: {call_id}"]
+        if summary:
+            lines += ["", "## 摘要", summary]
+        if new_topics:
+            lines += ["", "## 新话题"]
+            for t in new_topics:
+                topic = str((t or {}).get("topic") or "").strip()
+                tsum = str((t or {}).get("summary") or "").strip()
+                if topic:
+                    lines.append(f"- {topic}" + (f"：{tsum}" if tsum else ""))
+        md = "\n".join(lines).strip() + "\n"
+        # import_document 内部是 write(vault 文件) + vector.upsert(立即可检索)，
+        # 与 /api/knowledge/import 同一路径；文件名按 object/{call} 组织且唯一。
+        knowledge = getattr(app.state, "knowledge", None)
+        if knowledge is None:
+            return None
+        saved = await knowledge.import_document(account_id, f"{object_id}/{call_id}.md", md)
+        _audit(
+            "knowledge.distill",
+            subject_type="call",
+            subject_id=call_id,
+            account_id=account_id,
+            detail={"path": f"accounts/{account_id}/knowledge/{object_id}/{call_id}.md", "indexed": saved.get("indexed", 0)},
+        )
+        return saved
+    except Exception as exc:  # pragma: no cover - 蒸馏入库失败不阻塞结算
+        print(f"[settle] distill to knowledge failed: {exc!r}", flush=True)
+        return None
+
+
 @app.post("/api/calls/{call_id}/settle")
-def settle(call_id: str) -> dict:
+async def settle(call_id: str) -> dict:
     existing = _repo().get_settlement(call_id)
     if existing:
         return existing
@@ -634,6 +682,8 @@ def settle(call_id: str) -> dict:
     except Exception as exc:  # pragma: no cover - summarizer must not break settle
         print(f"[settle] summarizer failed: {exc!r}", flush=True)
     _write_settlement_docs(call, turns, result)
+    # 蒸馏入库（可检索 knowledge）：自动沉淀经验，供后续通话引用。
+    await _write_distill_knowledge(call, result)
     _repo().append_settlement(call_id, result)
     _audit(
         "settle.create",

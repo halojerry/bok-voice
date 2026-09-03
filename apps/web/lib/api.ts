@@ -1,12 +1,24 @@
 // 服务只绑 127.0.0.1；避免 localhost 优先解析 ::1 导致 fetch 失败。
 export const CONTROL_PLANE_URL = process.env.NEXT_PUBLIC_CONTROL_PLANE_URL ?? "http://127.0.0.1:8000";
 
+async function toError(res: Response): Promise<Error> {
+  // 优先透传 FastAPI 的 detail（如 MiniMax API Key 未配置），失败时退回 statusText。
+  let detail = "";
+  try {
+    const body = await res.json();
+    if (body && typeof body.detail === "string") detail = body.detail;
+  } catch {
+    /* 非 JSON 响应(如网关错误页)直接忽略 */
+  }
+  return new Error(detail ? `${res.status} ${detail}` : `${res.status} ${res.statusText}`);
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${CONTROL_PLANE_URL}${path}`, {
     ...init,
     headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
   });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) throw await toError(res);
   return res.json() as Promise<T>;
 }
 
@@ -19,7 +31,7 @@ export const api = {
   deleteTtsVoice: (voiceId: string) => request<Record<string, unknown>>(`/api/tts/voices/${encodeURIComponent(voiceId)}`, { method: "DELETE" }),
   registerTtsVoice: (body: FormData) =>
     fetch(`${CONTROL_PLANE_URL}/api/tts/voices`, { method: "POST", body }).then(async (res) => {
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      if (!res.ok) throw await toError(res);
       return res.json() as Promise<Record<string, unknown>>;
     }),
   previewTts: async (body: { text: string; voice?: string; language?: string; instruct?: string; sample_rate?: number; provider?: string }) => {
@@ -28,7 +40,7 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    if (!res.ok) throw await toError(res);
     return await res.blob();
   },
   getSettings: () => request<Record<string, unknown>>("/api/settings"),
@@ -95,7 +107,7 @@ export const api = {
     ),
   setupStatus: () => request<SetupStatus>("/api/setup"),
   setupDownload: () => fetch(`${CONTROL_PLANE_URL}/api/setup/download`, { method: "POST" }).then(async (res) => {
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    if (!res.ok) throw await toError(res);
     return res.json() as Promise<{ started: boolean }>;
   }),
 };
