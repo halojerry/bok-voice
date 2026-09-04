@@ -10,7 +10,7 @@ import wave
 from pathlib import Path
 
 import httpx
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
@@ -1044,12 +1044,50 @@ def list_object_topics(object_id: str) -> list[dict]:
     return _repo().list_object_topics(object_id)
 
 
+@app.post("/api/calls/{call_id}/session-report")
+async def ingest_session_report(call_id: str, request: Request) -> dict:
+    """Agent shutdown 上报官方 SessionReport（真实逐模型 usage + 权威 chat_history 快照）。
+
+    存 call_sessions.session_report(JSON)；结算/报表优先吃这里的真数据，
+    没有上报的旧通话才回退估算口径。
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid json body")
+    row = _repo().update_call(call_id, session_report=json.dumps(payload, ensure_ascii=False, default=str))
+    if not row:
+        raise HTTPException(status_code=404, detail="call not found")
+    _audit("call.session_report", subject_type="call", subject_id=call_id, account_id=row.get("account_id", ""))
+    return {"call_id": call_id, "stored": True}
+
+
 @app.get("/api/reports/usage")
 def reports_usage(account_id: str = "acc-001") -> dict:
     calls = _repo().list_calls(account_id, "")
+    # 真实用量优先：官方 SessionReport 的逐模型 input/output tokens；
+    # 没有上报的旧通话才回退「轮次数」估算（口径见字段名后缀）。
+    llm_tokens = 0
+    estimated_calls = 0
+    for c in calls:
+        raw = c.get("session_report") or ""
+        tokens = 0
+        if raw:
+            try:
+                for u in json.loads(raw).get("usage") or []:
+                    if u.get("type") == "llm_usage":
+                        tokens += int(u.get("input_tokens") or 0) + int(u.get("output_tokens") or 0)
+            except Exception:
+                tokens = 0
+        if tokens:
+            llm_tokens += tokens
+        else:
+            estimated_calls += 1
+            llm_tokens += len(_repo().get_turns(c["id"]))
     return {
         "asr_calls": len(calls),
-        "llm_tokens": sum(len(_repo().get_turns(c["id"])) for c in calls),
+        "llm_tokens": llm_tokens,
+        "llm_tokens_estimated_calls": estimated_calls,
         "tts_calls": len(calls),
         "vad_calls": len(calls),
     }

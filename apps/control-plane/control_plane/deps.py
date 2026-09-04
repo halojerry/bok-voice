@@ -119,6 +119,12 @@ def build_engine() -> Engine | None:
                     "target_lang",
                     "target_lang VARCHAR(16) DEFAULT ''",
                 )
+                _ensure_column(
+                    conn,
+                    "call_sessions",
+                    "session_report",
+                    "session_report TEXT",
+                )
         except Exception as exc:  # pragma: no cover - sqlite / duplicate column
             print(f"[deps] idempotent column migration skipped: {exc}")
 

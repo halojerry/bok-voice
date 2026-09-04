@@ -114,7 +114,7 @@ export const SETTING_CARDS: ProviderMeta[] = [
       { key: "sensitivity", label: "触发置信度阈值（0~1）", type: "number", hint: "判定「人声」的概率线：越高越抗噪。嘈杂/有底噪环境建议 0.7~0.8（防止 AI 被噪声反复打断后不再出声）；安静环境 0.5~0.6。", min: 0.1, max: 0.95, step: 0.05 },
       { key: "min_speech_duration", label: "最短说话时长（秒）", type: "number", hint: "短于此的声音不算一句话。默认 0.15 保证「好/嗯」等短应承不丢；嘈杂环境可调 0.2~0.3 过滤短促杂音。", min: 0.05, max: 2, step: 0.05 },
       { key: "min_silence_duration", label: "判定结束的静音时长（秒）", type: "number", hint: "客户停顿超过该时长视为一句话说完。默认 0.45 匹配离线式 ASR 返回速度（调太小会让轮次在转写回来前提交、回复被丢）；环境安静可试 0.35。", min: 0.05, max: 3, step: 0.05 },
-      { key: "interruption", label: "允许打断 AI 说话", type: "select", hint: "开启后客户说话可打断 AI；打断至少需约 0.5s 连续人声，短噪声不会误掐断。", options: [
+      { key: "interruption", label: "允许打断 AI 说话", type: "select", hint: "开启后客户说话约 0.6s 即可打断 AI（真插话快速让位）；若 1 秒内发现是噪声误打断（没有真实转写），AI 会自动从暂停处继续讲完。", options: [
         { value: "true", label: "开启" },
         { value: "false", label: "关闭" },
       ] },

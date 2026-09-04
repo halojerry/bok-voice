@@ -78,6 +78,7 @@ async def entrypoint(ctx) -> None:
     from .providers.livekit_plugins import (
         LanguageState,
         MlxLlmLLM,
+        Qwen3ASRLiveSTT,
         Qwen3ASRSTT,
         Qwen3TTSTTS,
     )
@@ -148,14 +149,16 @@ async def entrypoint(ctx) -> None:
     # 普通话,英语/普通话钉定保证整场识别稳定,不吃 auto 的偶发漂移。
     asr_ls = LanguageState()
     asr_ls.lang = source_lang
-    stt_provider = lk_stt.StreamAdapter(
-        stt=Qwen3ASRSTT(
-            base_url=_sidecar(asr_cfg.get("base_url") or "", "QWEN3_ASR_BASE_URL", "http://127.0.0.1:8787"),
-            language_state=asr_ls,
-            pin_language=True,
-        ),
-        vad=vad_provider,
+    _asr_inner = Qwen3ASRSTT(
+        base_url=_sidecar(asr_cfg.get("base_url") or "", "QWEN3_ASR_BASE_URL", "http://127.0.0.1:8787"),
+        language_state=asr_ls,
+        pin_language=True,
     )
+    if os.environ.get("QWEN3_ASR_STREAM", "1") == "1":
+        # 同传更要 partial:源语音边说边出稳定前缀 → 抢跑 prefill,译文首句更早。
+        stt_provider = Qwen3ASRLiveSTT(stt_=_asr_inner, vad_=vad_provider)
+    else:
+        stt_provider = lk_stt.StreamAdapter(stt=_asr_inner, vad=vad_provider)
 
     if (llm_cfg.get("provider") or "local_openai") == "deepseek" and (
         llm_cfg.get("api_key") or os.environ.get("DEEPSEEK_API_KEY")
@@ -193,12 +196,14 @@ async def entrypoint(ctx) -> None:
         stt=stt_provider,
         llm=llm_provider,
         tts=tts_provider,
-        # 端点判定与 A 线同基线(0.35/1.2 dynamic):离线式 ASR 整句返回等得起;
-        # 同传不需要 preemptive(A 线同理由:无 interim 提前量可抢)。
+        # 端点判定与 A 线同基线(0.35/1.2 dynamic):离线式 ASR 整句返回等得起。
+        # 抢跑默认开:官方源码证实 FINAL_TRANSCRIPT 一到即触发 prefill(与端点窗口
+        # 并行),译文首句更早;preemptive_tts 关(本地 Qwen3-TTS 抢跑省不了首包,
+        # 反而误判轮次白跑)。
         turn_handling=TurnHandlingOptions(
             endpointing={"mode": "dynamic", "min_delay": 0.35, "max_delay": 1.2},
             preemptive_generation={
-                "enabled": False,
+                "enabled": True,
                 "preemptive_tts": False,
                 "max_speech_duration": 10.0,
                 "max_retries": 3,
@@ -233,8 +238,13 @@ async def entrypoint(ctx) -> None:
 
     session.on("conversation_item_added", _on_item)
 
-    # 房间断开 → settle(总结/知识蒸馏/vault,服务端幂等;失败不阻塞退出)。
+    # 房间断开 → SessionReport(真实 usage) + settle(总结/知识蒸馏/vault,服务端幂等;失败不阻塞退出)。
     async def _shutdown() -> None:
+        try:
+            report = ctx.make_session_report(session)
+            await cp.post_session_report(call_id, report.to_dict())
+        except Exception as exc:
+            print(f"[interp] session report failed: {exc!r}", flush=True)
         try:
             await cp.settle(call_id)
             print(f"[interp] settled {call_id}", flush=True)

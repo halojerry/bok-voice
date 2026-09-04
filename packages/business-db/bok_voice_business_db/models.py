@@ -103,6 +103,8 @@ class CallSession(Base):
     # interpret 会话:language=我方语言,target_lang=对方语言,object_id 通常为空。
     kind: Mapped[str] = mapped_column(String(32), default="")
     target_lang: Mapped[str] = mapped_column(String(16), default="")
+    # 官方 SessionReport JSON(agent shutdown 上报):真实逐模型 usage/权威 chat_history。
+    session_report: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 

@@ -10,7 +10,8 @@ import time
 from dataclasses import dataclass
 
 import httpx
-from livekit.agents import APIConnectOptions, llm, stt, tts, vad
+from livekit.agents import APIConnectOptions, llm, stt, tts, utils, vad
+from livekit.plugins.openai import LLM as _OpenAICompatBase
 
 # 粤语特征字/词：Qwen3-ASR 对粤语偶发判成 Chinese（语言标签不稳），
 # 若文本命中这些地道粤语用字则按粤语处理，避免 LLM 被误判成普通话后回普。
@@ -216,63 +217,16 @@ class LanguageState:
             self.lang = norm
 
 
-class OpenAICompatLLM(llm.LLM):
-    provider = "openai-compat"
-    model = ""
+class MlxLlmLLM(_OpenAICompatBase):
+    """本地 OpenAI 兼容 LLM（macOS mlx_lm / Windows llama-server，:1235，thinking 关闭）。
 
-    def __init__(self, api_key, model, base_url):
-        from openai import AsyncOpenAI
-
-        super().__init__()
-        self._model = model
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-        self._max_tokens = int(os.environ.get("LLM_MAX_TOKENS", "160"))
-
-    def chat(self, *, chat_ctx, tools=None, conn_options=None, parallel_tool_calls=None, tool_choice=None, extra_kwargs=None):
-        messages = _chat_messages(chat_ctx)
-        return _OpenAICompatStream(
-            self, chat_ctx, messages, conn_options or APIConnectOptions(), self._max_tokens
-        )._real
-
-
-def _chat_messages(chat_ctx) -> list[dict]:
-    messages = []
-    for item in getattr(chat_ctx, "items", []):
-        if isinstance(item, llm.ChatMessage):
-            content = getattr(item, "content", "")
-            if isinstance(content, str):
-                text = content
-            else:
-                # content 里文本部分是纯 str（ChatContent = str | ImageContent | AudioContent），
-                # 之前用 getattr(c,"text") 会把用户文本全部丢成空串，导致 LLM 听不见用户。
-                parts = [
-                    c if isinstance(c, str) else (getattr(c, "text", "") or "")
-                    for c in content
-                ]
-                text = "\n".join(parts)
-            messages.append({"role": item.role, "content": text})
-    if not messages:
-        messages = [{"role": "system", "content": "你是 Bok Voice 客服助手。"}]
-    return messages
-
-
-class DeepSeekLLM(OpenAICompatLLM):
-    provider = "deepseek"
-    model = "deepseek-chat"
-
-    def __init__(self, api_key, model="deepseek-chat", base_url="https://api.deepseek.com/v1"):
-        super().__init__(api_key=api_key, model=model, base_url=base_url)
-
-
-class MlxLlmLLM(OpenAICompatLLM):
-    """Local OpenAI-compatible LLM (mlx_lm on macOS, llama-server on Windows).
-
-    Both servers expose /v1 on 127.0.0.1:1235 and run with thinking disabled
-    (enable_thinking=false), so replies are fast and content-only.
+    内芯=官方 livekit-plugins-openai（兼容任意 OpenAI 端点）：白得 function tools
+    解析、APIError 重试、error 事件、TTFT/usage 官方 metrics；原先手写的流解析/
+    重试/秒表已删。stop/max_tokens 走 extra_body（本地服务吃经典参数，不吃新的
+    max_completion_tokens）；温度 LLM_TEMPERATURE 默认 0.35（4B 小模型防飘/复读）。
     """
 
     provider = "mlx"
-    model = "local"
 
     def __init__(
         self,
@@ -285,10 +239,47 @@ class MlxLlmLLM(OpenAICompatLLM):
         if model in (None, "", "local"):
             model = os.environ.get("MLX_LLM_MODEL") or "local"
         super().__init__(
-            api_key=api_key,
             model=model,
+            api_key=api_key,
             base_url=base_url
             or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
+            temperature=float(os.environ.get("LLM_TEMPERATURE", "0.35")),
+            extra_body={
+                "max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "160")),
+                # Qwen3 对话模板以 <|im_end|> 收尾:唔传 stop 个 server 会当文字输出
+                # (转录/TTS 见住 <|im_end|>),喺源头截停最干净;下游再剥多一重保险。
+                "stop": ["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
+            },
+        )
+
+    async def _prewarm_impl(self) -> None:
+        # 真实 1-token 生成：暖 mlx 模型（冷启动的 KV 分配/首 token 占首包大头）。
+        # 官方 prewarm 只验连接；AgentSession 构造时会自动调用本钩子。
+        if os.environ.get("LLM_WARMUP", "1") != "1":
+            return
+        try:
+            await self._client.chat.completions.create(
+                model=self._opts.model,
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=1,
+            )
+            print("[agent] llm warmup done", flush=True)
+        except Exception as exc:  # pragma: no cover - warmup 失败不致命
+            print(f"[agent] llm warmup skipped: {exc!r}", flush=True)
+
+
+class DeepSeekLLM(_OpenAICompatBase):
+    """DeepSeek 云端（OpenAI 兼容契约，与本地 MlxLlmLLM 同一官方内芯）。"""
+
+    provider = "deepseek"
+
+    def __init__(self, api_key="", model="deepseek-chat", base_url="https://api.deepseek.com/v1"):
+        super().__init__(
+            model=model or "deepseek-chat",
+            api_key=api_key,
+            base_url=base_url,
+            temperature=float(os.environ.get("LLM_TEMPERATURE", "0.35")),
+            extra_body={"max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "160"))},
         )
 
 
@@ -328,59 +319,6 @@ class _ScriptedLLMStream:
                         delta=llm.ChoiceDelta(content=plugin._output, role="assistant"),
                     )
                 )
-
-        self._real = _Stream(llm=plugin, chat_ctx=chat_ctx, tools=[], conn_options=conn_options)
-
-    def __aiter__(self):
-        return self._real
-
-
-class _OpenAICompatStream:
-    def __init__(self, plugin, chat_ctx, messages, conn_options, max_tokens=256):
-        class _Stream(llm.LLMStream):
-            async def _run(self):
-                try:
-                    t0 = time.monotonic()
-                    # 估算本轮 system+历史 tokens：中英混排下 len 与 Qwen BPE 接近，
-                    # 作 prefill 量的粗略标尺（真机看 LLM_TTFT_MS + 行数趋势即可）。
-                    try:
-                        est_tokens = sum(len(str(m.get("content") or "")) for m in messages)
-                    except Exception:  # pragma: no cover
-                        est_tokens = 0
-                    stream = await plugin._client.chat.completions.create(
-                        model=plugin._model,
-                        messages=messages,
-                        stream=True,
-                        max_tokens=max_tokens,
-                        # Qwen3 对话模板以 <|im_end|> 收尾:唔传 stop 个 server 会当文字输出
-                        # (转录/TTS 见住 <|im_end|>),喺源头截停最干净;下游再剥多一重保险。
-                        stop=["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
-                        # 专业客服取中低温：过高显油滑/跑题/乱码，过低像念稿。4B 更小更易
-                        # 飘/复读，0.35 让语气稳定克制（可用 env LLM_TEMPERATURE 覆盖）。
-                        temperature=float(os.environ.get("LLM_TEMPERATURE", "0.35")),
-                    )
-                    acc = ""
-                    ttft_logged = False
-                    async for chunk in stream:
-                        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                            text = chunk.choices[0].delta.content
-                            if not ttft_logged:
-                                # P0 秒表:首字(≈TTFT)时刻。est_tokens 供「prompt 瘦身」判断。
-                                print(
-                                    f"LLM_TTFT_MS {(time.monotonic() - t0) * 1000:.0f} "
-                                    f"prompt_chars={est_tokens}",
-                                    flush=True,
-                                )
-                                ttft_logged = True
-                            acc += text
-                            if any(ch in acc for ch in "。！？!?") and not getattr(self, "_sent_logged", False):
-                                # 首句(句号收尾)时刻——TTS overlap 在此之后即可出声。
-                                print(f"LLM_FIRST_SENT_MS {(time.monotonic() - t0) * 1000:.0f}", flush=True)
-                                self._sent_logged = True
-                            delta = llm.ChoiceDelta(content=text, role="assistant")
-                            self._event_ch.send_nowait(llm.ChatChunk(id=getattr(chunk, "id", "stream"), delta=delta))
-                except asyncio.CancelledError:
-                    raise
 
         self._real = _Stream(llm=plugin, chat_ctx=chat_ctx, tools=[], conn_options=conn_options)
 
@@ -1285,6 +1223,8 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                     "emotion": self._tts_._resolve_emotion(),
                 },
                 "audio_setting": {"sample_rate": sample_rate, "format": "pcm", "channel": 1},
+                # 官方参数:流式不回传聚合音频,显著降尾包体积与传输耗时。
+                "stream_options": {"exclude_aggregated_audio": True},
             }
             await ws.send(json.dumps(start))
             try:
@@ -1320,13 +1260,13 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                         chunk = bytes.fromhex(audio_hex)
                         if not init_done:
                             output_emitter.initialize(
-                                request_id="minimax-tts",
+                                request_id=utils.shortuuid(),
                                 sample_rate=sample_rate,
                                 num_channels=self._tts_.num_channels,
                                 mime_type="audio/pcm",
                                 stream=True,
                             )
-                            output_emitter.start_segment(segment_id="minimax-tts")
+                            output_emitter.start_segment(segment_id=utils.shortuuid())
                             init_done = True
                         buf.extend(chunk)
                         if not first_pushed and len(buf) >= frame_bytes // 5:
@@ -1562,6 +1502,8 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
                     "emotion": self._tts_._resolve_emotion(),
                 },
                 "audio_setting": {"sample_rate": sample_rate, "format": "pcm", "channel": 1},
+                # 官方参数:流式不回传聚合音频,显著降尾包体积与传输耗时。
+                "stream_options": {"exclude_aggregated_audio": True},
             }
             await ws.send(json.dumps(start))
             try:
@@ -1588,13 +1530,13 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
                     chunk = bytes.fromhex(audio_hex)
                     if not init_done:
                         output_emitter.initialize(
-                            request_id="minimax-tts",
+                            request_id=utils.shortuuid(),
                             sample_rate=sample_rate,
                             num_channels=self._tts_.num_channels,
                             mime_type="audio/pcm",
                             stream=True,
                         )
-                        output_emitter.start_segment(segment_id="minimax-tts")
+                        output_emitter.start_segment(segment_id=utils.shortuuid())
                         init_done = True
                     # 攒 200ms 帧推给 livekit,让它边收边播
                     buf.extend(chunk)
@@ -1655,7 +1597,7 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
                         raise RuntimeError(f"minimax empty audio: {body.get('base_resp')}")
                     pcm = bytes.fromhex(audio_hex)
                     output_emitter.initialize(
-                        request_id="minimax-tts",
+                        request_id=utils.shortuuid(),
                         sample_rate=sample_rate,
                         num_channels=self._tts_.num_channels,
                         mime_type="audio/pcm",
@@ -1985,3 +1927,233 @@ class _Qwen3ASRStream(stt.RecognizeStream):
                 await asyncio.sleep(0.5 * (attempt + 1))
         print("QWEN3_ASR_ERROR", repr(last_exc), flush=True)
         return "", ""
+
+
+def _common_prefix(a: str, b: str) -> str:
+    """两段文本的公共前缀（字符级）——滑窗 partial 的「稳定部分」判定。"""
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return a[:i]
+
+
+_ASR_PARTIAL_POST_MS = float(os.environ.get("QWEN3_ASR_CHUNK_MS", "300"))
+
+
+class _Qwen3ASRLiveStream(stt.RecognizeStream):
+    """VAD 骨架 + 滑窗 partial（官方 StreamAdapterWrapper 的 partial 增强版）。
+
+    与官方 stt.StreamAdapter 同一套 VAD 两任务骨架（START/END_OF_SPEECH 事件、
+    END 触发整句转写），增强：
+    - 说话期间每 ~300ms 把增量 PCM 喂 sidecar /api/chunk（同一流式会话），回传
+      滑窗 partial：全文 → INTERIM_TRANSCRIPT（前端实时字幕）；连续两窗一致的
+      稳定前缀 → PREFLIGHT_TRANSCRIPT（1.7 官方抢跑生成专用事件，LLM 在客户
+      停嘴前就 prefill，commit 校验通过直接复用，省 ~0.4-0.6s）。
+    - END_OF_SPEECH 用 /api/finish 补传尾段、取整句高精度转写——WhatsApp 数字
+      捕获/话术推进零降级；partial 的跳变被「稳定前缀」约束，唔会进最终稿。
+    """
+
+    def __init__(self, stt_, *, vad, conn_options):
+        super().__init__(stt=stt_, conn_options=conn_options, sample_rate=16000)
+        self._stt_ = stt_  # 内层 Qwen3ASRSTT（base_url/语言状态/钉定）
+        self._vad = vad
+        self._session_id: str | None = None
+        self._pending = bytearray()  # 尚未 POST 给 sidecar 的增量 PCM
+        self._last_partial = ""  # 上一窗全文（INTERIM 去重）
+        self._prev_partial = ""  # 稳定前缀参照窗
+        self._stable = ""  # 已发 PREFLIGHT 的最长稳定前缀
+        self._last_post = 0.0
+        self._finishing = False
+
+    async def _run(self) -> None:
+        vad_stream = self._vad.stream()
+
+        async def _forward_input() -> None:
+            """forward input to vad（与官方 StreamAdapter 一致）"""
+            async for input in self._input_ch:
+                if isinstance(input, self._FlushSentinel):
+                    vad_stream.flush()
+                    continue
+                vad_stream.push_frame(input)
+            vad_stream.end_input()
+
+        async def _recognize() -> None:
+            started = False
+            async for event in vad_stream:
+                if event.type == vad.VADEventType.START_OF_SPEECH:
+                    started = True
+                    self._event_ch.send_nowait(stt.SpeechEvent(stt.SpeechEventType.START_OF_SPEECH))
+                    await self._start_session()
+                elif event.type == vad.VADEventType.INFERENCE_DONE:
+                    if not started or self._finishing:
+                        continue
+                    for f in utils.merge_frames(event.frames):
+                        self._pending.extend(bytes(f.data))
+                    await self._maybe_partial()
+                elif event.type == vad.VADEventType.END_OF_SPEECH:
+                    if not started:
+                        continue
+                    self._finishing = True
+                    speech_end_time = time.time() - event.silence_duration - event.inference_duration
+                    self._event_ch.send_nowait(
+                        stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH, speech_end_time=speech_end_time)
+                    )
+                    text, lang = await self._finish_session()
+                    started = False
+                    self._finishing = False
+                    self._reset()
+                    if text:
+                        self._stt_._language_state.update(lang, text)
+                        self._event_ch.send_nowait(
+                            stt.SpeechEvent(
+                                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                                alternatives=[stt.SpeechData(language=self._stt_._language_state.lang, text=text)],
+                                speech_end_time=speech_end_time,
+                            )
+                        )
+
+        await asyncio.gather(_forward_input(), _recognize())
+
+    async def _start_session(self) -> None:
+        lang_hint = _asr_language_hint(self._stt_._language_state.lang, self._stt_._pin_language)
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.post(
+                    f"{self._stt_._base_url}/api/start",
+                    params={"language": lang_hint} if lang_hint else None,
+                )
+                r.raise_for_status()
+                self._session_id = r.json()["session_id"]
+        except Exception as exc:  # noqa: BLE001 - 建会话失败 → 整句路径照样可用
+            self._session_id = None
+            print(f"QWEN3_ASR_PARTIAL start failed: {exc!r}", flush=True)
+
+    async def _maybe_partial(self) -> None:
+        now = time.monotonic()
+        if not self._session_id or now - self._last_post < _ASR_PARTIAL_POST_MS:
+            return
+        if len(self._pending) < 16000 * 2 * 0.6:  # <0.6s 无转写价值
+            return
+        self._last_post = now
+        pcm = bytes(self._pending)
+        self._pending.clear()
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.post(
+                    f"{self._stt_._base_url}/api/chunk",
+                    params={"session_id": self._session_id},
+                    content=pcm,
+                    headers={"Content-Type": "application/octet-stream"},
+                )
+                r.raise_for_status()
+                data = r.json()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - partial 尽力而为,忙时/抖动静默跳过
+            return
+        text = str(data.get("text") or "")
+        if not text or text == self._last_partial:
+            return
+        lang = _normalize_asr_language(str(data.get("language") or ""), text)
+        self._last_partial = text
+        # INTERIM：滑窗全文（可能跳变，只供展示，唔进历史/唔落库）
+        self._event_ch.send_nowait(
+            stt.SpeechEvent(
+                type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
+                alternatives=[stt.SpeechData(language=lang, text=text)],
+            )
+        )
+        # 稳定前缀：与上一窗的公共前缀，≥6 字且有新增才升级 PREFLIGHT（抢跑）。
+        common = _common_prefix(self._prev_partial, text)
+        self._prev_partial = text
+        if len(common) >= 6 and len(common) > len(self._stable):
+            self._stable = common
+            self._event_ch.send_nowait(
+                stt.SpeechEvent(
+                    type=stt.SpeechEventType.PREFLIGHT_TRANSCRIPT,
+                    alternatives=[stt.SpeechData(language=lang, text=common)],
+                )
+            )
+            print(f"QWEN3_ASR_PREFLIGHT chars={len(common)}", flush=True)
+
+    async def _finish_session(self) -> tuple[str, str]:
+        sid = self._session_id
+        self._session_id = None
+        tail = bytes(self._pending)
+        self._pending.clear()
+        if not sid:
+            return "", ""
+        t0 = time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(
+                    f"{self._stt_._base_url}/api/finish",
+                    params={"session_id": sid},
+                    content=tail if tail else None,
+                    headers={"Content-Type": "application/octet-stream"} if tail else None,
+                )
+                r.raise_for_status()
+                data = r.json()
+                text = str(data.get("text") or "")
+                lang = _normalize_asr_language(str(data.get("language") or ""), text)
+                print(
+                    f"QWEN3_ASR_TEXT {repr(text[:120])} {lang} "
+                    f"ASR_MS={(time.monotonic() - t0) * 1000:.0f}(stream)",
+                    flush=True,
+                )
+                return text, lang
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            print("QWEN3_ASR_FINISH_ERROR", repr(exc), flush=True)
+            return "", ""
+
+    def _reset(self) -> None:
+        self._session_id = None
+        self._pending.clear()
+        self._last_partial = ""
+        self._prev_partial = ""
+        self._stable = ""
+        self._last_post = 0.0
+
+
+class Qwen3ASRLiveSTT(stt.STT):
+    """「VAD + 滑窗 partial」的本地 ASR 包装（Qwen3-ASR 专用，替代官方 StreamAdapter）。
+
+    recognize() 委托内层 Qwen3ASRSTT（保留官方重试/metrics）；stream() 返回带
+    INTERIM/PREFLIGHT 的实时流。能力声明 streaming=True + interim_results=True。
+    """
+
+    def __init__(self, *, stt_: Qwen3ASRSTT, vad_):
+        super().__init__(
+            capabilities=stt.STTCapabilities(
+                streaming=True,
+                interim_results=True,
+                diarization=False,
+                aligned_transcript=False,
+                offline_recognize=stt_.capabilities.offline_recognize,
+                keyterms=False,
+                chat_context=False,
+            )
+        )
+        self._vad = vad_
+        self._stt = stt_
+        stt_.on("metrics_collected", self._on_metrics_collected)
+
+    @property
+    def model(self) -> str:
+        return self._stt.model
+
+    @property
+    def provider(self) -> str:
+        return self._stt.provider
+
+    def _on_metrics_collected(self, *args, **kwargs) -> None:
+        self.emit("metrics_collected", *args, **kwargs)
+
+    async def _recognize_impl(self, buffer, *, language=None, conn_options=None):
+        return await self._stt.recognize(buffer=buffer, language=language, conn_options=conn_options)
+
+    def stream(self, *, language=None, conn_options=None):
+        return _Qwen3ASRLiveStream(self._stt, vad=self._vad, conn_options=conn_options or APIConnectOptions())

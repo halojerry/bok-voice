@@ -123,30 +123,30 @@ async def _strip_expr_markup(text):
 
 
 async def _llm_judge(base_url: str, model: str, messages: list) -> str:
-    """流程推进判定器:对本地 MLX LLM 发一个 max_tokens 极短请求,取回一个字。失败返空(唔推进)。"""
+    """流程推进判定器:对本地 MLX LLM 发一个 max_tokens 极短请求,取回一个字。失败返空(唔推进)。
+
+    参数面与主回复同源(stop/温度语义),走 openai SDK(自动重试/超时),唔再手搓 HTTP。
+    """
     if not base_url or not model:
         return ""
-    import httpx
+    from openai import AsyncOpenAI
 
     try:
-        async with httpx.AsyncClient(timeout=5) as c:
-            r = await c.post(
-                f"{base_url}/chat/completions",
-                json={
-                    "model": model,
-                    "messages": messages,
-                    "max_tokens": 8,
-                    "temperature": 0,
-                    # 本地 MLX 對話模板會 append <|im_end|>,停喺呢度,回應淨係 verdict 字。
-                    "stop": ["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
-                },
-            )
-            if r.status_code == 200:
-                data = r.json()
-                return str((data.get("choices") or [{}])[0].get("message", {}).get("content") or "")
+        client = AsyncOpenAI(api_key="mlx", base_url=base_url, timeout=5, max_retries=1)
+        r = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=8,
+            temperature=0,
+            # 本地 MLX 對話模板會 append <|im_end|>,停喺呢度,回應淨係 verdict 字。
+            stop=["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
+        )
+        if r.choices:
+            return str(r.choices[0].message.content or "")
+        return ""
     except Exception as exc:  # pragma: no cover - 判定失败唔推进,唔阻断通话
         print(f"[flow] llm judge failed: {exc!r}", flush=True)
-    return ""
+        return ""
 
 
 def _parse_voice_map(raw) -> dict:
@@ -506,6 +506,7 @@ async def entrypoint(ctx):
         LanguageState,
         MiniMaxTTS,
         MlxLlmLLM,
+        Qwen3ASRLiveSTT,
         Qwen3ASRSTT,
         Qwen3TTSTTS,
         ContextAwareLLM,
@@ -565,21 +566,25 @@ async def entrypoint(ctx):
         # 只有显式选择 sherpa 才走 sherpa-onnx；未知/缺失/历史值一律回退 sidecar
         # （Qwen3-ASR），避免配置写错导致 agent 崩溃（sherpa 模型不再随包）。
         use_sherpa = asr_provider_name in {"sherpa", "sherpa_sensevoice"}
-        stt_provider = stt.StreamAdapter(
-            stt=(
-                SherpaSenseVoiceSTT(language_state=language_state)
-                if use_sherpa
-                else Qwen3ASRSTT(
-                    base_url=_sidecar_base_url(
-                        asr_cfg.get("base_url") or "",
-                        "QWEN3_ASR_BASE_URL",
-                        "http://127.0.0.1:8787",
-                    ),
-                    language_state=language_state,
-                )
-            ),
-            vad=vad_provider,
+        _asr_inner = (
+            SherpaSenseVoiceSTT(language_state=language_state)
+            if use_sherpa
+            else Qwen3ASRSTT(
+                base_url=_sidecar_base_url(
+                    asr_cfg.get("base_url") or "",
+                    "QWEN3_ASR_BASE_URL",
+                    "http://127.0.0.1:8787",
+                ),
+                language_state=language_state,
+            )
         )
+        if not use_sherpa and os.environ.get("QWEN3_ASR_STREAM", "1") == "1":
+            # 「VAD+滑窗 partial」流式包装:说话期间出 INTERIM(实时字幕)/
+            # PREFLIGHT(抢跑 prefill) 事件;停嘴仍整句高精度转写(官方 StreamAdapter
+            # 骨架的 partial 增强版)。QWEN3_ASR_STREAM=0 回退纯离线。
+            stt_provider = Qwen3ASRLiveSTT(stt_=_asr_inner, vad_=vad_provider)
+        else:
+            stt_provider = stt.StreamAdapter(stt=_asr_inner, vad=vad_provider)
 
     # ---- TTS：人设可指定引擎（persona.tts_provider），留空跟随全局 tts.provider。
     # 引擎决定音色池：qwen3_tts 用本地克隆（persona.reference_audio 是本地克隆 ID）；
@@ -690,7 +695,14 @@ async def entrypoint(ctx):
 
         llm_provider = ScriptedLLM(output=os.environ.get("SCRIPTED_LLM_OUTPUT", "（脚本回复）"))
     else:
-        llm_provider = inference.LLM("google/gemma-4-31b-it")
+        # 未知 provider：绝不静默上云(inference.LLM=LiveKit 云推理,违反「推理本地」
+        # 隐私铁律)——回退本地 mlx 并显式告警。
+        _agent_log("llm.unknown_provider", provider=llm_provider_name, fallback="mlx")
+        print(f"[agent] unknown llm provider {llm_provider_name!r} — falling back to local MLX LLM", flush=True)
+        llm_provider = MlxLlmLLM(
+            base_url=os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
+            model=os.environ.get("MLX_LLM_MODEL", ""),
+        )
 
     # 确定性 mood 通道：无论模型是否遵守「吐 <expr> 标签」的指令，
     # ExprAwareLLM 都会在每次回复前强制前置标签，保证转录发布 lk.expression。
@@ -699,37 +711,17 @@ async def entrypoint(ctx):
         context_state=context_state,
     )
 
-    # 后台预热:首包延迟里冷启动(模型 KV 分配/首次 token 生成)占大头,
-    # 发一个极短请求让 MLX warm up;不阻塞 job 启动,失败静默。
-    if os.environ.get("LLM_WARMUP", "1") == "1":
-        try:
-            llm_base = (
-                (llm_cfg.get("base_url") or "")
-                or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1")
-            ).rstrip("/")
-            llm_model = llm_cfg.get("model") or os.environ.get("MLX_LLM_MODEL", "")
-
-            async def _llm_warmup():
-                import httpx
-
-                try:
-                    async with httpx.AsyncClient(timeout=10) as c:
-                        await c.post(
-                            f"{llm_base}/chat/completions",
-                            json={
-                                "model": llm_model,
-                                "messages": [{"role": "user", "content": "hi"}],
-                                "max_tokens": 1,
-                            },
-                        )
-                    print("[agent] llm warmup done", flush=True)
-                except Exception as exc:  # pragma: no cover - warmup 失败不致命
-                    print(f"[agent] llm warmup skipped: {exc!r}", flush=True)
-
-            asyncio.create_task(_llm_warmup())
-        except Exception:  # pragma: no cover
-            pass
+    # LLM 预热已收敛到官方机制：MlxLlmLLM._prewarm_impl（发 1-token 请求暖 mlx 模型）
+    # 由 AgentSession 构造时自动调用（LLM_WARMUP=1 开关在插件内）。
     _log_stage("providers_ready")
+    print(
+        "[agent] turn_handling: endpointing=dynamic(0.35/1.2) "
+        f"preemptive={'on' if os.environ.get('PREEMPTIVE_GENERATION', '1') == '1' else 'off'} "
+        f"preemptive_tts={'on' if os.environ.get('PREEMPTIVE_TTS', '0') == '1' else 'off'} "
+        f"interruption=min_{os.environ.get('INTERRUPT_MIN_DURATION', '0.6')}s+false_interruption_self_heal "
+        "turn_detection=default(本地 EOT v1-mini;Cantonese 未校准,阈值回退英文档)",
+        flush=True,
+    )
 
     session = AgentSession(
         vad=vad_provider,
@@ -749,21 +741,27 @@ async def entrypoint(ctx):
                 "max_delay": float(os.environ.get("ENDPOINT_MAX_DELAY", "1.2")),
             },
             preemptive_generation={
-                # 预生成依赖 ASR 的 interim/preflight 提前量，而 Qwen3-ASR 是离线式
-                # (用户整句说完 VAD flush 才出 FINAL_TRANSCRIPT、无 interim)，开了也没有
-                # 提前量可抢。保持关闭避免无谓占用。真提速靠缩短 endpointing + 回复变短。
-                "enabled": os.environ.get("PREEMPTIVE_GENERATION", "0") == "1",
-                "preemptive_tts": os.environ.get("PREEMPTIVE_TTS", "1") == "1",
+                # 官方源码证实(1.7.1 audio_recognition):FINAL_TRANSCRIPT 一到即触发
+                # 抢跑,LLM prefill 与端点判定窗口并行——唔使等 interim。默认开。
+                # 流程推进/收尾/语言切换轮由 on_user_turn_completed 落 chat_ctx 步骤
+                # 标记,触发框架快照不一致→作废旧抢跑重建,推进轮唔会错步。
+                "enabled": os.environ.get("PREEMPTIVE_GENERATION", "1") == "1",
+                # preemptive_tts 默认关:MiniMax 云 TTS 按字计费,误判轮次唔好白烧;
+                # dev 可 PREEMPTIVE_TTS=1 实验首声再提前。
+                "preemptive_tts": os.environ.get("PREEMPTIVE_TTS", "0") == "1",
                 "max_speech_duration": 10.0,
                 "max_retries": 3,
             },
             interruption={
                 "enabled": interruption_enabled,
-                # 打断至少要 1.2s 连续人声才算：用户只是连续说话/短句(0.5~1s)不会把
-                # AI 正在输出的回复反复掐断(否则 LLM 一直生成、TTS 一直被掐 → 听不到声)。
-                # 真插话(客户打断 AI 说较长一句)仍能打断。
-                "min_duration": float(os.environ.get("INTERRUPT_MIN_DURATION", "1.2")),
+                # 官方「误打断自愈」组合:低门槛(0.6s 真插话即可让位)+
+                # resume_false_interruption(打断后 1s 内无转写=噪声误打断,AI 从
+                # 暂停处自动续讲)。比旧 1.2s 高门槛硬扛更自然——高门槛连真插话
+                # 也压住,客户抢唔到话。INTERRUPT_MIN_DURATION 可回退旧值。
+                "min_duration": float(os.environ.get("INTERRUPT_MIN_DURATION", "0.6")),
                 "min_words": 0,
+                "resume_false_interruption": os.environ.get("RESUME_FALSE_INTERRUPTION", "1") == "1",
+                "false_interruption_timeout": float(os.environ.get("FALSE_INTERRUPTION_TIMEOUT", "1.0")),
             },
         ),
         # 默认 ["filter_markdown","filter_emoji"] 会被整体替换，故带上内置两项；
@@ -833,9 +831,46 @@ async def entrypoint(ctx):
     # 会话关闭事件：置位后 supervisor watcher 退出、结算触发。
     closed = asyncio.Event()
 
+    # 官方 metrics(LLM/TTS/EOU/VAD):统一落 agent.log,口径与官方文档/仪表一致。
+    # llm 行保留 LLM_TTFT_MS 旧标记(延迟调优脚本/文档沿用);tts/eou 补官方盲区。
+    def _on_metrics(ev):
+        m = getattr(ev, "metrics", None)
+        kind = getattr(m, "type", "")
+        try:
+            if kind == "llm":
+                print(
+                    f"LLM_TTFT_MS {m.ttft * 1000:.0f} (official) "
+                    f"prompt={m.prompt_tokens} gen={m.completion_tokens} tps={m.tokens_per_second:.1f}",
+                    flush=True,
+                )
+            elif kind == "tts":
+                print(f"AGENT_METRICS tts ttfb={m.ttfb * 1000:.0f}ms audio={m.audio_duration:.2f}s", flush=True)
+            elif kind == "eou":
+                print(
+                    f"AGENT_METRICS eou delay={m.end_of_utterance_delay * 1000:.0f}ms "
+                    f"transcription={m.transcription_delay * 1000:.0f}ms",
+                    flush=True,
+                )
+        except Exception:
+            pass
+
+    session.on("metrics_collected", _on_metrics)
+
     def _on_close(ev):
         closed.set()
-        asyncio.create_task(cp.settle(call_id))
+
+        async def _close():
+            # 官方 SessionReport(自部署可用):真实逐模型 usage + 权威 chat_history
+            # → CP 入库;结算/报表由「伪造 llm_tokens=轮次数」变真数据。失败唔阻结算。
+            try:
+                report = ctx.make_session_report(session)
+                await cp.post_session_report(call_id, report.to_dict())
+                print(f"[agent] session report posted (call {room_name})", flush=True)
+            except Exception as exc:  # pragma: no cover - 报表失败唔阻结算
+                print(f"[agent] session report failed: {exc!r} (call {room_name})", flush=True)
+            await cp.settle(call_id)
+
+        asyncio.create_task(_close())
 
     # 明确拒绝收尾:礼貌告别讲完(一句 TTS+余量)后主动结束通话——
     # end_call 置 ENDED 并断房,结算由 _on_close 幂等触发。
@@ -918,6 +953,18 @@ async def entrypoint(ctx):
             # 客戶真開口 → 沉默心跳計數歸零(之後再沉默先重新計 2 次)。
             _nudge_state["count"] = 0
             _disarm_silence()
+
+            # 抢跑×流程推进共存:框架喺 FINAL 到达时可能已按「旧步骤语境」抢跑生成
+            # (preemptive 先于本钩子)。凡本轮实质改变回复语境(推进/收尾/语言切换),
+            # 就向 turn_ctx 落一个步骤标记——框架的抢跑校验按 chat_ctx 快照比较,
+            # 见变化即作废旧抢跑、按新语境重建;无变化轮不落标记,白拿抢跑提速。
+            # mlx prompt cache 按最长公共前缀匹配,追加只增增量 token,唔伤 KV。
+            def _invalidate_stale_preemptive(reason: str) -> None:
+                try:
+                    turn_ctx.add_message(role="system", content=f"[流程状态] {reason}")
+                except Exception:  # pragma: no cover - 标记失败仅损失提速,不损正确性
+                    pass
+
             # 同步注入用户语言：on_user_turn_completed 在自动回复生成【之前】被调用，
             # 此时 ASR 已把 language_state 更新为本轮语言。若只挂在 conversation_item_added
             # 事件上，会晚于 LLM 请求发出（竞态）→ 模型收不到本轮粤语指令而回普通话。
@@ -929,6 +976,7 @@ async def entrypoint(ctx):
                 # 重置咗就永遠得 1 輪、客户講一句普通話即切（連續 threshold 輪先跟嘅
                 # hysteresis 根本唔會生效）。保留上一輪 sticky 傳入,由函數累加 streak。
                 cur = language_state.lang
+                _prev_reply = _lang_sticky["sticky"]
                 reply_lang, _lang_sticky["sticky"], _lang_sticky["streak"] = _sticky_reply_language(
                     greet_lang if greet_lang in {"zh", "cantonese", "en"} else "zh",
                     cur,
@@ -937,6 +985,8 @@ async def entrypoint(ctx):
                 )
                 language_state.lang = reply_lang
                 context_state.set_user_language(reply_lang)
+                if reply_lang != _prev_reply:
+                    _invalidate_stale_preemptive(f"回复语言切换 → {reply_lang}")
             except Exception:  # pragma: no cover - 语言注入失败不致命
                 pass
             # WhatsApp 对接触发:喺 flow 推进【前】偵測(step context 係舊步/當前步,offered 先啱);
@@ -989,6 +1039,7 @@ async def entrypoint(ctx):
                         # (ENDED/declined,结算由 _on_close 幂等触发)。
                         if not flow_ctrl.closing:
                             flow_ctrl.enter_closing()
+                            _invalidate_stale_preemptive("客户明确拒绝 → 收尾")
                             _schedule_call_end()
                             print(f"[flow] refuse -> closing, end scheduled (call {room_name})", flush=True)
                     elif not flow_ctrl.done and not flow_ctrl.closing:
@@ -1007,6 +1058,7 @@ async def entrypoint(ctx):
                         )
                         if _auto:
                             flow_ctrl.advance()
+                            _invalidate_stale_preemptive(f"流程推进 → 第 {flow_ctrl.current + 1} 步")
                             print(f"[flow] rule=auto step={flow_ctrl.current + 1} (call {room_name})", flush=True)
                         elif verdict == CONFIRM:
                             # offered(應承加但未俾號碼)→ 唔推,停喺辦理步叫佢俾號碼(captured 先推)。
@@ -1014,6 +1066,7 @@ async def entrypoint(ctx):
                                 pass
                             else:
                                 flow_ctrl.advance()
+                                _invalidate_stale_preemptive(f"流程推进 → 第 {flow_ctrl.current + 1} 步")
                                 print(f"[flow] rule=confirm step={flow_ctrl.current + 1} (call {room_name})", flush=True)
                         elif verdict in (UNCLEAR, QUESTION) and os.environ.get("FLOW_LLM_ADVANCE", "1") == "1":
                             # 模糊轮(客答唔記得/問後續/開放式回答)→ 背景跑 LLM 判定(唔同步等,

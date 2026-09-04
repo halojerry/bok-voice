@@ -853,6 +853,13 @@ def cmd_doctor() -> int:
                 if packaged and not ok:
                     fails.append(f"import {mod} failed")
 
+    # 本地语义端点判定(LiveKit turn-detector v1-mini):缺失时端点判定退回纯 VAD,
+    # 客户思考停顿更容易被提前截断。粤(cantonese)语无官方校准,阈值回退英文档。
+    eot_ok = _import_ok(py, "livekit_local_inference") if py.exists() else False
+    print(f"local EOT inference (turn-detector v1-mini): {'ok' if eot_ok else 'MISSING(退回纯 VAD 端点)'}")
+    if packaged and not eot_ok:
+        fails.append("livekit-local-inference missing (EOT 退回纯 VAD)")
+
     livekit = _embedded_livekit()
     print(f"livekit-server: {livekit if livekit else 'MISSING'}")
     if packaged and livekit is None:
@@ -889,7 +896,7 @@ def cmd_doctor() -> int:
     # /api/token 必须是真 JWT（三段式）；否则 A 线 UI 永远“接通失败”。
     if healthy(8000):
         try:
-            body = json.dumps({"account_id": "acc-001"}).encode()
+            body = json.dumps({"account_id": "acc-001", "room_name": "doctor-probe"}).encode()
             req = urllib.request.Request(
                 "http://127.0.0.1:8000/api/token",
                 data=body,
@@ -898,7 +905,7 @@ def cmd_doctor() -> int:
             )
             with urllib.request.urlopen(req, timeout=8) as resp:
                 payload = json.loads(resp.read().decode())
-            tok = str(payload.get("token") or "")
+            tok = str(payload.get("participantToken") or "")
             if tok.count(".") == 2:
                 print("token endpoint: ok (real JWT)")
             else:

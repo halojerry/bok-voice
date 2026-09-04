@@ -46,7 +46,9 @@ cd desktop && npx tauri build --bundles app   # macOS bundle
 - **话术分步推进**：`apps/agent/agent_runtime/flow.py` 的 `FlowController` 是唯一推进引擎（`detect_whatsapp_signal`/`should_auto_advance`/`decide_advance`/judge）。agent 每轮 `on_user_turn_completed`：语言锚定 → WhatsApp detect → rule_verdict+auto_advance → 模糊轮背景 LLM judge（fire-and-forget，`_judge_inflight` 防叠）。改动推进逻辑先读 `tests/test_flow_controller.py`。
 - **LLM system 顺序（KV-cache 关键，勿打乱）**：`ContextState.render_instruction_prefix()`（稳定指令：用户语言规则/回复节奏/应答准则/话术总览/当前步）+ 人设 base（`_instructions`+facts）在前，`render_context_tail()`（每轮变的知识/联网/记忆）垫最后 → token0 前缀逐轮字节不变，命中 mlx_lm prompt KV-cache。**不要把会变的检索段插进稳定段中间**（前缀一断整段重 prefill）。
 - **RAG 门控**：绑了分步话术（`flow_ctrl.has_steps`）的封闭流程默认**不做知识库/联网检索**（单对象只上话术），`_context_rag_enabled()` 判定；`CONTEXT_RAG=1` 强制开。
-- **VAD/endpointing 基线不可压缩**：`min_silence=0.45` / endpointing `min_delay=0.35`/`max_delay=1.2` / `min_speech=0.15`。离线式 ASR 从停嘴到转写回来需 ~0.5-1.2s，端点判定太紧会让轮次在转写返回前提交 → 回复被丢、agent 哑火（曾为此回滚）。真降延迟走 ASR 本身/流式 interim，勿压端点判定。改这三处默认值要同步 agent 环境默认 + `repository.default_settings` + web `EMPTY_FORM`。
+- **VAD/endpointing 基线不可压缩**：`min_silence=0.45` / endpointing `min_delay=0.35`/`max_delay=1.2` / `min_speech=0.15`。离线式 ASR 从停嘴到转写回来需 ~0.5-1.2s，端点判定太紧会让轮次在转写返回前提交 → 回复被丢、agent 哑火（曾为此回滚）。真降延迟走 ASR 本身/流式 partial（见下），勿压端点判定。改这三处默认值要同步 agent 环境默认 + `repository.default_settings` + web `EMPTY_FORM`。
+- **打断 = 官方误打断自愈组合**：`interruption.min_duration=0.6` + `resume_false_interruption=True` + `false_interruption_timeout=1.0`（真插话 0.6s 让位；1s 内无转写=噪声误打断，AI 自动从暂停处续讲）。旧 1.2s 高门槛已废（压住真插话）。`INTERRUPT_MIN_DURATION`/`RESUME_FALSE_INTERRUPTION`/`FALSE_INTERRUPTION_TIMEOUT` env 可回退。
+- **ASR 流式 partial + 抢跑**：sidecar mlx 后端 `QWEN3_ASR_STREAM=1`（默认）每 ~400ms 滑窗出 partial 文字，agent `Qwen3ASRLiveSTT` 发 `INTERIM_TRANSCRIPT`（字幕）+ 稳定前缀→`PREFLIGHT_TRANSCRIPT`；1.7 官方抢跑对 FINAL 也生效（`PREEMPTIVE_GENERATION` 默认 1，不依赖 interim）。停嘴仍整句高精度转写兜底（WhatsApp 捕获零降级）；`QWEN3_ASR_STREAM=0` 回退纯离线。**推进轮不错步**：`on_user_turn_completed` 在步骤推进/REFUSE/语言切换时向 turn_ctx 落步骤标记，触发框架抢跑快照失效重建。
 - **DB 迁移**在 `apps/control-plane/control_plane/deps.py` `build_engine()` 幂等段（补列 + 数据迁移），启动时自动跑；不要在别处手写迁移。
 
 ## Testing Guidelines
