@@ -63,14 +63,21 @@
   礼貌再见，随后 `POST /api/supervisor/{id}/end` 置 `ended` + `disposition=declined`
   并断房，结算由 agent `_on_close` 幂等触发。
 
-### B 线（同声传译）
+### B 线（同声传译 v2，LiveKit 双端）
 
 ```text
-页面 (WebSocket)
-  → B-line :8790 open_channel(sourceLang, targetLang)
-  → 每通道：ASR :8787 → 翻译（本地 LLM :1235 或 DashScope）→ TTS :8788
-  → 字幕 + 音频块（PlaybackChunkTrace）回流页面
-指标：队列深度/背压/丢弃 → app-data/translation-metrics.jsonl
+web /interpret 两端（me/other，各自选麦克风/扬声器）
+  → CP /api/calls(kind=interpret) + /api/token(role=me|other)
+  → LiveKit 房间（me-<room> / other-<room> + 两个 interpreter agent）
+  → interpreter(AgentSession 全托管):silero VAD → Qwen3-ASR(源语言钉死,
+    cantonese 走 hint) → 翻译 LLM(:1235,「只输出译文」) → Qwen3-TTS(目标语言音色)
+  → 译文轨 trans-<lang> 只授权对方订阅(set_track_subscription_permissions);
+    字幕 lk.transcription 全量广播(原文+译文,前端 useTranscriptions 渲染)
+  → 译文句 add_turn(原文：…\n译文：…) → 房间断开 settle → 总结/知识蒸馏/vault
+interpreter worker:bok serve 起 2 个常驻进程(interp-fwd/rev,agent_name
+bok-interp-fwd/rev 显式分发,方向语言对由 me 端 token 的 RoomAgentDispatch
+metadata 下发;无房间时空闲,job 到达才拉管线)
+旧 v1(/translate + WS :8790)冻结保留作 POC,不再迭代。
 ```
 
 ## 3. 生命周期

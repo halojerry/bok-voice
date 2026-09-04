@@ -17,7 +17,7 @@
 | `packages/observability/` | 结构化日志 + 审计 | both |
 | `services/qwen3-asr-sidecar/` | ASR HTTP sidecar :8787 | both |
 | `services/qwen3-tts-sidecar/` | TTS HTTP sidecar :8788 | both |
-| `services/realtime-translation/` | B 线同传 worker :8790（Node） | both |
+| `services/realtime-translation/` | B 线同传 worker :8790（Node,v1 已冻结留 POC） | both |
 | `services/livekit-server/` | livekit.yaml 配置 | both |
 | `desktop/` | Tauri 桌壳 + runtime 装配 | packaged |
 | `desktop/src-tauri/` | Rust shell + tauri.conf.json + externalBin | packaged |
@@ -33,7 +33,8 @@
 | 桌面打包 | `desktop/`（tauri build，CI release.yml） |
 | 模型首启下载 | `bok.py setup download` / 前端 /setup |
 | 打包自检 | `bok.py doctor --packaged` + `scripts/verify_bundle.sh` |
-| B 线同传 | 前端 /translate → ws://127.0.0.1:8790 |
+| B 线同传 v2 | 前端 /interpret → LiveKit :7880 → interp worker ×2（agent_name 显式分发） |
+| B 线同传 v1(冻结) | 前端 /translate → ws://127.0.0.1:8790 |
 | A 线通话 | 前端 /calls → LiveKit :7880 → agent worker |
 
 ## 运行时装配（packaged）

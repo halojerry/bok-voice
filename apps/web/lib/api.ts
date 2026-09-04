@@ -45,7 +45,7 @@ export const api = {
   },
   getSettings: () => request<Record<string, unknown>>("/api/settings"),
   saveSettings: (body: unknown) => request<Record<string, unknown>>("/api/settings", { method: "PUT", body: JSON.stringify(body) }),
-  token: (body: { account_id: string; object_id?: string; call_id?: string }) =>
+  token: (body: { account_id: string; object_id?: string; call_id?: string; role?: string }) =>
     request<{ url: string; token: string; roomName: string }>("/api/token", { method: "POST", body: JSON.stringify(body) }),
   createCall: (body: unknown) => request<Record<string, unknown>>("/api/calls", { method: "POST", body: JSON.stringify(body) }),
   listCalls: (accountId = "acc-001", status = "") =>
