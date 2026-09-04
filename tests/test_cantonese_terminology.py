@@ -4,6 +4,8 @@
 - deps.py / test_control_plane.py：DB 存量迁移（唯一兼容点）及其回归夹具
 - web_search.py / test_web_search.py：维基百科外部域名 zh-yue.wikipedia.org
 - livekit_plugins.py：SenseVoice 输出标签 "YUE"（模型边界，入内即归一 cantonese）
+- interpret.py / test_interpret_tts_provider.py：MiniMax language_boost 外部枚举
+  （TTS 供应商 API 真字面量，粤=普+粤标记，值经 env 单点注入）
 - test_volcano_v3.py / ARCHITECTURE.md：Volcano API dialect 枚举（外部接口字面量）
 - docs/archive/**、AGENTS.md、AGENT.md、docs/CONTRACTS.md：历史档案与政策文档
 
@@ -27,6 +29,10 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     "apps/agent/agent_runtime/web_search.py": re.compile(r"zh-yue"),
     "tests/test_web_search.py": re.compile(r"zh-yue"),
     "apps/agent/agent_runtime/providers/livekit_plugins.py": re.compile(r"YUE"),
+    # MiniMax language_boost 外部枚举(API 真字面量,粤=普+粤标记);只豁免带该
+    # 枚举值的行,语言字段本身仍一律 cantonese。
+    "apps/agent/agent_runtime/interpret.py": re.compile(r"Chinese,Yue"),
+    "tests/test_interpret_tts_provider.py": re.compile(r"Chinese,Yue"),
     "scripts/test_volcano_v3.py": None,
     "docs/ARCHITECTURE.md": re.compile(r"VOLC_DIALECT"),
     "AGENTS.md": None,

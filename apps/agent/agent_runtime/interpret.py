@@ -2,7 +2,9 @@
 
 每个方向一个 worker 进程(agent_name=bok-interp-fwd/rev,由 INTERP_DIRECTION 决定),
 复用 A 线同一套会话机制:AgentSession + silero VAD(基线参数同 A 线) +
-Qwen3-ASR(源语言钉死) + 翻译 LLM(本地 :1235,「只输出译文」) + Qwen3-TTS(目标语言音色)。
+Qwen3-ASR(源语言钉死) + 翻译 LLM(Hy-MT2 MT 小模型 :1236 逐句无状态优先,
+缺省回退主 LLM :1235 / DeepSeek 云端,「只输出译文」) + TTS(目标语言音色,
+本地 Qwen3-TTS 兜底 / settings 选 MiniMax 云端)。
 
 - 听谁:RoomInputOptions(participant_identity) —— fwd 听 me-<room>,rev 听 other-<room>。
 - 译文给谁:发布译文轨后 set_track_subscription_permissions 幂等白名单——
@@ -62,6 +64,106 @@ def _translation_instructions(src: str, tgt: str) -> str:
     return "\n".join(lines)
 
 
+def _sidecar_url(cfg_value: str, env_key: str, default: str) -> str:
+    """sidecar 地址解析:settings 值 > env > 缺省(去尾部斜杠)。"""
+    return (cfg_value or os.environ.get(env_key) or default).rstrip("/")
+
+
+def _build_llm_provider(llm_cfg: dict, target_lang: str):
+    """组装 B 线翻译 LLM:MT 小模型(:1236)优先,回退 DeepSeek 云端 / 主 LLM(:1235)。
+
+    MT 分支按官方 Hy-MT2 推荐采样收窄(setdefault 不抢用户显式 env),MlxLlmLLM
+    构造时读进 extra_body;StatelessMTLLM 负责逐句无状态模板化。回退开关 =
+    unset MT_LLM_BASE_URL,老 DeepSeek/主 LLM 路径原样保留。
+    """
+    from .providers.livekit_plugins import DeepSeekLLM, MlxLlmLLM, StatelessMTLLM
+
+    mt_base = os.environ.get("MT_LLM_BASE_URL", "").strip()
+    if mt_base:
+        # Hy-MT2 官方推荐采样:temperature 0.7 / top_p 0.6 / top_k 20 / 重复惩罚
+        # 1.05——翻译要贴原文,采样收窄防小模型自由发挥/复读。
+        os.environ.setdefault("LLM_TEMPERATURE", "0.7")
+        os.environ.setdefault("LLM_TOP_P", "0.6")
+        os.environ.setdefault("LLM_TOP_K", "20")
+        os.environ.setdefault("LLM_REPETITION_PENALTY", "1.05")
+        print(f"[interp] llm=hy-mt2 base={mt_base}", flush=True)
+        return StatelessMTLLM(
+            MlxLlmLLM(base_url=mt_base, model=os.environ.get("MT_LLM_MODEL", "")),
+            target_lang,
+        )
+
+    if (llm_cfg.get("provider") or "local_openai") == "deepseek" and (
+        llm_cfg.get("api_key") or os.environ.get("DEEPSEEK_API_KEY")
+    ):
+        return DeepSeekLLM(
+            api_key=llm_cfg.get("api_key") or os.environ.get("DEEPSEEK_API_KEY", ""),
+            model=llm_cfg.get("model") or os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
+            base_url=llm_cfg.get("base_url") or os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
+        )
+    return MlxLlmLLM(
+        base_url=llm_cfg.get("base_url") or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
+        model=llm_cfg.get("model") or os.environ.get("MLX_LLM_MODEL", ""),
+    )
+
+
+def _build_tts_provider(tts_cfg: dict, target_lang: str):
+    """组装 B 线 TTS:settings 指定 minimax → 云端 MiniMax;否则本地 Qwen3-TTS 兜底。
+
+    音色锁口音——粤语音色读普/英自然,普通话音色读粤文变广普,故按 target_lang
+    三键换音色;B 线默认 turbo 档(agent 场景 <250ms、$60/M),A 线仍 2.8-hd。
+    """
+    from .providers.livekit_plugins import LanguageState, MiniMaxTTS, Qwen3TTSTTS
+
+    tts_ls = LanguageState()
+    tts_ls.lang = target_lang
+    provider = (tts_cfg.get("provider") or "qwen3_tts").lower()
+    if provider in ("minimax", "minimax_streaming"):
+        keymap = {"zh": "speaker_zh", "cantonese": "speaker_cantonese", "en": "speaker_en"}
+        # 防御与 A 线 agent.py 同源:设置页误选本地 Qwen3 音色(预设 9 个 + 克隆
+        # agent-*/acceptance-*)发给云端 MiniMax 会 2054 voice not exist,逐句 beep。
+        local_qwen3 = {
+            "serena", "vivian", "uncle_fu", "ryan", "aiden", "ono_anna", "sohee", "eric", "dylan",
+        }
+        voice_map = {}
+        for lang, key in keymap.items():
+            vid = str(tts_cfg.get(key) or "").strip()
+            base = vid.lower()
+            if not base:
+                continue
+            if base in local_qwen3 or base.startswith(("agent-", "acceptance-")):
+                print(f"[interp] minimax skip local qwen3 voice {vid!r} for {lang}", flush=True)
+                continue
+            voice_map[lang] = vid
+        # 设置页没配/被过滤掉的分语言音色用验证过的默认(各语种母语音色,口音不串)。
+        voice_map.setdefault("zh", "Chinese (Mandarin)_News_Anchor")
+        voice_map.setdefault("cantonese", "Cantonese_crisp_news_anchor_vv2")
+        voice_map.setdefault("en", "male_english_speaker")
+        os.environ.setdefault("MINIMAX_MODEL", "speech-2.6-turbo")
+        # language_boost 锁目标语,防源语音夹词时合成语种漂移;值是 MiniMax API
+        # 的外部枚举字面量(术语门禁白名单单点),唔系语言字段命名。
+        boost_map = {"zh": "Chinese", "cantonese": "Chinese,Yue", "en": "English"}
+        boost = boost_map.get(target_lang, "")
+        if boost:
+            os.environ.setdefault("MINIMAX_LANGUAGE_BOOST", boost)
+        return MiniMaxTTS(
+            voice=voice_map,
+            language_state=tts_ls,
+            sample_rate=int(tts_cfg.get("sample_rate") or 24000),
+            api_key=str(tts_cfg.get("api_key") or ""),
+        )
+    # 本地 Qwen3-TTS 兜底(离线可用):设置页全局单音色 speaker 优先,否则分语言。
+    voice = str(tts_cfg.get("speaker") or "").strip()
+    if not voice:
+        keymap = {"zh": "speaker_zh", "cantonese": "speaker_cantonese", "en": "speaker_en"}
+        voice = str(tts_cfg.get(keymap.get(target_lang, "speaker_zh")) or "")
+    return Qwen3TTSTTS(
+        base_url=_sidecar_url(tts_cfg.get("base_url") or "", "QWEN3_TTS_BASE_URL", "http://127.0.0.1:8788"),
+        voice=voice,
+        language_state=tts_ls,
+        sample_rate=int(tts_cfg.get("sample_rate") or 24000),
+    )
+
+
 async def entrypoint(ctx) -> None:
     from livekit import rtc
     from livekit.agents import (
@@ -77,10 +179,8 @@ async def entrypoint(ctx) -> None:
     from .control_plane import ControlPlaneClient
     from .providers.livekit_plugins import (
         LanguageState,
-        MlxLlmLLM,
         Qwen3ASRLiveSTT,
         Qwen3ASRSTT,
-        Qwen3TTSTTS,
     )
 
     meta: dict = {}
@@ -123,9 +223,6 @@ async def entrypoint(ctx) -> None:
     tts_cfg = settings.get("tts", {}) or {}
     vad_cfg = settings.get("vad", {}) or {}
 
-    def _sidecar(cfg_value: str, env_key: str, default: str) -> str:
-        return (cfg_value or os.environ.get(env_key) or default).rstrip("/")
-
     def _cfg_float(key: str, env_key: str, default: str) -> float:
         env_raw = os.environ.get(env_key)
         try:
@@ -150,7 +247,7 @@ async def entrypoint(ctx) -> None:
     asr_ls = LanguageState()
     asr_ls.lang = source_lang
     _asr_inner = Qwen3ASRSTT(
-        base_url=_sidecar(asr_cfg.get("base_url") or "", "QWEN3_ASR_BASE_URL", "http://127.0.0.1:8787"),
+        base_url=_sidecar_url(asr_cfg.get("base_url") or "", "QWEN3_ASR_BASE_URL", "http://127.0.0.1:8787"),
         language_state=asr_ls,
         pin_language=True,
     )
@@ -160,36 +257,9 @@ async def entrypoint(ctx) -> None:
     else:
         stt_provider = lk_stt.StreamAdapter(stt=_asr_inner, vad=vad_provider)
 
-    if (llm_cfg.get("provider") or "local_openai") == "deepseek" and (
-        llm_cfg.get("api_key") or os.environ.get("DEEPSEEK_API_KEY")
-    ):
-        from .providers.livekit_plugins import DeepSeekLLM
-
-        llm_provider = DeepSeekLLM(
-            api_key=llm_cfg.get("api_key") or os.environ.get("DEEPSEEK_API_KEY", ""),
-            model=llm_cfg.get("model") or os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
-            base_url=llm_cfg.get("base_url") or os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
-        )
-    else:
-        llm_provider = MlxLlmLLM(
-            base_url=llm_cfg.get("base_url") or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
-            model=llm_cfg.get("model") or os.environ.get("MLX_LLM_MODEL", ""),
-        )
-
-    # 目标语言音色:设置页全局单音色 speaker 优先;否则分语言
-    # speaker_zh/speaker_cantonese/en。
-    tts_ls = LanguageState()
-    tts_ls.lang = target_lang
-    voice = str(tts_cfg.get("speaker") or "").strip()
-    if not voice:
-        keymap = {"zh": "speaker_zh", "cantonese": "speaker_cantonese", "en": "speaker_en"}
-        voice = str(tts_cfg.get(keymap.get(target_lang, "speaker_zh")) or "")
-    tts_provider = Qwen3TTSTTS(
-        base_url=_sidecar(tts_cfg.get("base_url") or "", "QWEN3_TTS_BASE_URL", "http://127.0.0.1:8788"),
-        voice=voice,
-        language_state=tts_ls,
-        sample_rate=int(tts_cfg.get("sample_rate") or 24000),
-    )
+    # 翻译 LLM 与 TTS 组装走模块级纯函数(单测直接喂 cfg,唔使起 worker)。
+    llm_provider = _build_llm_provider(llm_cfg, target_lang)
+    tts_provider = _build_tts_provider(tts_cfg, target_lang)
 
     session = AgentSession(
         vad=vad_provider,

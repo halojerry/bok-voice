@@ -238,18 +238,34 @@ class MlxLlmLLM(_OpenAICompatBase):
         # only a last-resort placeholder when no env/settings provide one.
         if model in (None, "", "local"):
             model = os.environ.get("MLX_LLM_MODEL") or "local"
+        extra_body = {
+            "max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "160")),
+            # Qwen3 对话模板以 <|im_end|> 收尾:唔传 stop 个 server 会当文字输出
+            # (转录/TTS 见住 <|im_end|>),喺源头截停最干净;下游再剥多一重保险。
+            "stop": ["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
+        }
+        # 定制采样(env 未设时不进请求,A 线默认路径零变化):B 线 MT 档要
+        # top_p/top_k/重复惩罚收窄采样,防翻译小模型自由发挥/复读。top_k 收
+        # 整数(mlx_lm server 按 int 校验),其余收浮点。
+        for key, env_key in (
+            ("top_p", "LLM_TOP_P"),
+            ("top_k", "LLM_TOP_K"),
+            ("repetition_penalty", "LLM_REPETITION_PENALTY"),
+        ):
+            raw = os.environ.get(env_key, "").strip()
+            if not raw:
+                continue
+            try:
+                extra_body[key] = int(raw) if raw.isdigit() else float(raw)
+            except ValueError:  # pragma: no cover - 配错当没配,唔炸构造
+                continue
         super().__init__(
             model=model,
             api_key=api_key,
             base_url=base_url
             or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
             temperature=float(os.environ.get("LLM_TEMPERATURE", "0.35")),
-            extra_body={
-                "max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "160")),
-                # Qwen3 对话模板以 <|im_end|> 收尾:唔传 stop 个 server 会当文字输出
-                # (转录/TTS 见住 <|im_end|>),喺源头截停最干净;下游再剥多一重保险。
-                "stop": ["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
-            },
+            extra_body=extra_body,
         )
 
     async def _prewarm_impl(self) -> None:
@@ -281,6 +297,82 @@ class DeepSeekLLM(_OpenAICompatBase):
             temperature=float(os.environ.get("LLM_TEMPERATURE", "0.35")),
             extra_body={"max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "160"))},
         )
+
+
+# Hy-MT2 官方模板的目标语名称(中文变体);未知语言值直接原样进模板。
+_MT_PROMPT_NAMES = {"zh": "中文", "cantonese": "粤语", "en": "英语"}
+
+
+def _mt_prompt(text: str, target_lang: str) -> str:
+    """官方 Hy-MT2 中文翻译模板:只要译文,不解释。"""
+    name = _MT_PROMPT_NAMES.get(target_lang, target_lang)
+    return f"将以下文本翻译为 `{name}`，注意只需要输出翻译后的结果，不要额外解释：\n\n`{text}`"
+
+
+class StatelessMTLLM(llm.LLM):
+    """逐句无状态 MT 包装(Hy-MT2 翻译小模型,B 线同传专用)。
+
+    MT 模型逐句无状态:每次调用只取进来 chat_ctx 的最后一条 user 文本,套官方
+    模板压成一条 user 消息发内芯。丢历史有两个理由——历史会污染译文(前文术语/
+    译法串味,翻译要每句独立);且无状态请求前缀恒定,prefill 不随通话增长,
+    TTFT 全场稳定(第 100 句同第 1 句快)。
+    """
+
+    def __init__(self, inner: llm.LLM, target_lang: str):
+        super().__init__()
+        self._inner = inner
+        self._target_lang = target_lang
+
+    @property
+    def model(self) -> str:
+        # model/provider 跟内芯走(usage/metrics 面板显示真实内芯,不是包装层)。
+        return str(getattr(self._inner, "model", "unknown"))
+
+    @property
+    def provider(self) -> str:
+        return str(getattr(self._inner, "provider", "unknown"))
+
+    def chat(
+        self,
+        *,
+        chat_ctx,
+        tools=None,
+        conn_options=None,
+        parallel_tool_calls=None,
+        tool_choice=None,
+        extra_kwargs=None,
+    ):
+        last_user = ""
+        for item in reversed(getattr(chat_ctx, "items", []) or []):
+            if getattr(item, "role", None) == "user":
+                last_user = str(getattr(item, "text_content", None) or "")
+                break
+        if not last_user:
+            # 异常轮次(冇 user 文本):原样透传,唔发空模板请求。
+            return self._inner.chat(
+                chat_ctx=chat_ctx,
+                tools=tools,
+                conn_options=conn_options,
+                parallel_tool_calls=parallel_tool_calls,
+                tool_choice=tool_choice,
+                extra_kwargs=extra_kwargs,
+            )
+        mt_ctx = llm.ChatContext()
+        mt_ctx.add_message(role="user", content=_mt_prompt(last_user, self._target_lang))
+        return self._inner.chat(
+            chat_ctx=mt_ctx,
+            tools=tools,
+            conn_options=conn_options,
+            parallel_tool_calls=parallel_tool_calls,
+            tool_choice=tool_choice,
+            extra_kwargs=extra_kwargs,
+        )
+
+    async def _prewarm_impl(self) -> None:
+        # 委托内芯:MT 模型同样吃 1-token 真生成的暖机收益(对齐 MlxLlmLLM)。
+        inner_prewarm = getattr(self._inner, "_prewarm_impl", None)
+        if inner_prewarm is not None:
+            await inner_prewarm()
 
 
 class ScriptedLLM(llm.LLM):
@@ -1109,6 +1201,14 @@ class MiniMaxTTS(tts.TTS):
     def _model(self) -> str:
         return os.environ.get("MINIMAX_MODEL", "speech-2.8-hd")
 
+    def _language_boost(self) -> str:
+        """目标语 language_boost(env 注入,B 线同传按 target_lang 钉死;空=不下发)。
+
+        枚举值由 interpret 侧写入 MINIMAX_LANGUAGE_BOOST,这里只透传——
+        A 线没设该 env,请求里就完全不带这个键,行为零变化。
+        """
+        return os.environ.get("MINIMAX_LANGUAGE_BOOST", "").strip()
+
     def _resolve_voice(self) -> str:
         if isinstance(self._voice, dict):
             return str(self._voice.get(self._language_state.lang) or self._voice.get("zh") or "")
@@ -1226,6 +1326,11 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                 # 官方参数:流式不回传聚合音频,显著降尾包体积与传输耗时。
                 "stream_options": {"exclude_aggregated_audio": True},
             }
+            # language_boost 锁语种(B 线同传按目标语注入 env):源语音常夹第三方
+            # 词,显式锁死防合成语种漂移;枚举值是 MiniMax API 外部字面量。
+            boost = self._tts_._language_boost()
+            if boost:
+                start["language_boost"] = boost
             await ws.send(json.dumps(start))
             try:
                 resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
@@ -1505,6 +1610,11 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
                 # 官方参数:流式不回传聚合音频,显著降尾包体积与传输耗时。
                 "stream_options": {"exclude_aggregated_audio": True},
             }
+            # language_boost 锁语种(B 线同传按目标语注入 env):源语音常夹第三方
+            # 词,显式锁死防合成语种漂移;枚举值是 MiniMax API 外部字面量。
+            boost = self._tts_._language_boost()
+            if boost:
+                start["language_boost"] = boost
             await ws.send(json.dumps(start))
             try:
                 resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
@@ -1573,21 +1683,26 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
         for attempt in range(2):
             try:
                 async with httpx.AsyncClient(timeout=60) as client:
+                    payload = {
+                        "model": self._tts_._model(),
+                        "text": _inject_pauses(self._text),
+                        "voice_setting": {
+                            "voice_id": voice,
+                            "speed": float(os.environ.get("MINIMAX_SPEED", "1")),
+                            "vol": float(os.environ.get("MINIMAX_VOL", "1")),
+                            "pitch": int(os.environ.get("MINIMAX_PITCH", "0")),
+                            "emotion": self._tts_._resolve_emotion(),
+                        },
+                        "audio_setting": {"sample_rate": sample_rate, "format": "pcm", "channel": 1},
+                    }
+                    # language_boost 与 WS 路径同源(env 注入,空则完全不带该键)。
+                    boost = self._tts_._language_boost()
+                    if boost:
+                        payload["language_boost"] = boost
                     resp = await client.post(
                         endpoint,
                         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                        json={
-                            "model": self._tts_._model(),
-                            "text": _inject_pauses(self._text),
-                            "voice_setting": {
-                                "voice_id": voice,
-                                "speed": float(os.environ.get("MINIMAX_SPEED", "1")),
-                                "vol": float(os.environ.get("MINIMAX_VOL", "1")),
-                                "pitch": int(os.environ.get("MINIMAX_PITCH", "0")),
-                                "emotion": self._tts_._resolve_emotion(),
-                            },
-                            "audio_setting": {"sample_rate": sample_rate, "format": "pcm", "channel": 1},
-                        },
+                        json=payload,
                     )
                     resp.raise_for_status()
                     body = resp.json()
