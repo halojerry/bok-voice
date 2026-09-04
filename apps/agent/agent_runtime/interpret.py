@@ -87,17 +87,23 @@ async def entrypoint(ctx) -> None:
         meta = json.loads(getattr(ctx.job, "metadata", "") or "{}")
     except Exception:
         meta = {}
-    listen_prefix = str(meta.get("listen") or "me-")
-    deliver_prefix = str(meta.get("deliver") or "other-")
+    # CP /api/token 写入精确 identity(它已知房间名);缺关键 metadata 说明分发
+    # 配置不对,无法安全选边,直接放弃本 job。
+    listen_identity = str(meta.get("listen_identity") or "").strip()
+    deliver_identity = str(meta.get("deliver_identity") or "").strip()
     source_lang = _norm_lang(str(meta.get("source_lang") or "zh"))
     target_lang = _norm_lang(str(meta.get("target_lang") or "en"))
+    if not listen_identity or not deliver_identity:
+        print(
+            f"[interp] job metadata missing listen_identity/deliver_identity: {meta!r} — abort",
+            flush=True,
+        )
+        return
 
     room = ctx.room
     room_name = room.name
     call_id = room_name  # 房间名 = call_id(CP 建会话时生成,与 A 线同约定)
-    listen_identity = f"{listen_prefix}{room_name}"
-    deliver_identity = f"{deliver_prefix}{room_name}"
-    speaker_role = "me" if listen_prefix.startswith("me") else "other"
+    speaker_role = "me" if listen_identity.startswith("me-") else "other"
 
     print(
         f"[interp] room={room_name} listen={listen_identity} deliver={deliver_identity} "

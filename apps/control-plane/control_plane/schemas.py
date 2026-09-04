@@ -12,14 +12,23 @@ class TokenRequest(BaseModel):
     object_id: str = ""
     call_id: str = ""
     # 参与者角色:operator(默认,客服操作端) / me(同传我方端,创建房间并挂 agent 分发) /
-    # other(同传对方端)。identity 分别为 operator-*/me-*/other-*。
+    # other(同传对方端) / supervisor(主管旁听)。官方契约路径(participant_identity
+    # 前缀)优先于本字段。
     role: str = "operator"
+    # ---- LiveKit 官方 TokenSource endpoint 契约(livekit_token_source.proto,
+    # snake_case 请求体)。room_name/participant_identity 提供时优先于旧字段。
+    room_name: str = ""
+    participant_identity: str = ""
+    participant_name: str = ""
+    participant_metadata: str = ""
 
 
 class TokenResponse(BaseModel):
-    url: str = "ws://127.0.0.1:7880"
-    token: str = ""
-    roomName: str = ""
+    # LiveKit 官方 TokenSourceResponse 契约字段(proto JSON camelCase——官方
+    # development token server 同款;客户端 fromJson 双向兼容 snake/camel)。
+    # TokenSource.endpoint/custom 自此直连本端点,不再需要键名映射层。
+    serverUrl: str = "ws://127.0.0.1:7880"
+    participantToken: str = ""
 
 
 class CreateCallRequest(BaseModel):

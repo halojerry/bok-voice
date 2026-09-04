@@ -16,6 +16,7 @@
 | B-line worker | :8790 WS | 同传通道：ASR→翻译→TTS 队列 / 背压 | 内嵌 Node | 指标 → app-data/translation-metrics.jsonl |
 | LiveKit server | :7880 WS/WebRTC | RTC 信令与媒体（7881/7882 RTC 端口） | 内嵌二进制 | keys → 内嵌 livekit.yaml |
 | agent worker | 进程 | A 线智能体（VAD/对话/情绪/打断） | 打包 Python | 调 8787/8788/1235/8000 |
+| interpreter worker ×2 | 进程 | B 线双 AgentSession 同传（`bok-interp-fwd/rev` 显式分发） | 打包 Python | 调 8787/8788/1235/8000 |
 
 ### 音频设备（设置页）
 
@@ -74,9 +75,13 @@ web /interpret 两端（me/other，各自选麦克风/扬声器）
   → 译文轨 trans-<lang> 只授权对方订阅(set_track_subscription_permissions);
     字幕 lk.transcription 全量广播(原文+译文,前端 useTranscriptions 渲染)
   → 译文句 add_turn(原文：…\n译文：…) → 房间断开 settle → 总结/知识蒸馏/vault
+agent worker:A 线 `agent_name="bok-voice"` 显式分发(官方推荐;隐式 dispatch 已废除,
+杜绝同传房被客服 agent 隐式抢派)。operator/supervisor token 由 CP /api/token 挂
+RoomAgentDispatch(metadata={call_id})精确派发;CP /api/token 即官方 TokenSource
+endpoint 契约({serverUrl, participantToken},201),官方 SDK 可直连。
 interpreter worker:bok serve 起 2 个常驻进程(interp-fwd/rev,agent_name
-bok-interp-fwd/rev 显式分发,方向语言对由 me 端 token 的 RoomAgentDispatch
-metadata 下发;无房间时空闲,job 到达才拉管线)
+bok-interp-fwd/rev 显式分发,方向语言对+精确 identity 由 me 端 token 的
+RoomAgentDispatch metadata 下发;无房间时空闲,job 到达才拉管线)
 旧 v1(/translate + WS :8790)冻结保留作 POC,不再迭代。
 ```
 

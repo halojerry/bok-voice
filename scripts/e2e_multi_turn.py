@@ -222,7 +222,7 @@ async def main() -> None:
     room = rtc.Room()
     all_pass = True
     try:
-        await room.connect(data["url"], data["token"])
+        await room.connect(data["serverUrl"], data["participantToken"])
         audio_source = rtc.AudioSource(sample_rate=16000, num_channels=1)
         src = rtc.LocalAudioTrack.create_audio_track("e2e-src", audio_source)
         await room.local_participant.publish_track(

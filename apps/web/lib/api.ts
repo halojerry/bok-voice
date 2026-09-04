@@ -45,8 +45,10 @@ export const api = {
   },
   getSettings: () => request<Record<string, unknown>>("/api/settings"),
   saveSettings: (body: unknown) => request<Record<string, unknown>>("/api/settings", { method: "PUT", body: JSON.stringify(body) }),
+  // 官方 TokenSourceResponse 契约({serverUrl, participantToken});TokenSource
+  // 直连本响应,无需键名映射。
   token: (body: { account_id: string; object_id?: string; call_id?: string; role?: string }) =>
-    request<{ url: string; token: string; roomName: string }>("/api/token", { method: "POST", body: JSON.stringify(body) }),
+    request<{ serverUrl: string; participantToken: string }>("/api/token", { method: "POST", body: JSON.stringify(body) }),
   createCall: (body: unknown) => request<Record<string, unknown>>("/api/calls", { method: "POST", body: JSON.stringify(body) }),
   listCalls: (accountId = "acc-001", status = "") =>
     request<Record<string, unknown>[]>(`/api/calls?account_id=${accountId}&status=${status}`),

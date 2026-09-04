@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { StartAudio, useAudioPlayback, useSession, useTranscriptions } from "@livekit/components-react";
 import { ConnectionState, TokenSource, type Room } from "livekit-client";
-import { api } from "@/lib/api";
+import { api, CONTROL_PLANE_URL } from "@/lib/api";
 import { describeConnectError, friendlyErrorText } from "@/lib/api-ready";
 import {
   applyOutputDevice,
@@ -53,18 +53,15 @@ export default function InterpretPage() {
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
 
-  // 官方会话:TokenSource.custom 直连 control-plane;role 决定 identity(me-*/other-*)。
-  const tokenSource = useMemo(
-    () =>
-      TokenSource.custom(async () => {
-        const id = callIdRef.current;
-        if (!id) throw new Error("no room id");
-        const res = await api.token({ account_id: ACCOUNT, call_id: id, role: side ?? "me" });
-        return { serverUrl: res.url, participantToken: res.token };
-      }),
-    [ACCOUNT, side],
-  );
-  const session = useSession(tokenSource);
+  // 官方 TokenSource.endpoint：直连 CP /api/token（官方契约），useSession options
+  // 驱动官方请求体（room_name / participant_identity），CP 按 identity 前缀反推
+  // 角色并挂 agent 分发。进房动作在渲染后的 effect 里（见下），options 时序安全。
+  const tokenSource = useMemo(() => TokenSource.endpoint(`${CONTROL_PLANE_URL}/api/token`), []);
+  const roomId = callId || joinRoom.trim();
+  const session = useSession(tokenSource, {
+    roomName: roomId || undefined,
+    participantIdentity: side && roomId ? `${side}-${roomId}` : undefined,
+  });
   const { canPlayAudio, startAudio } = useAudioPlayback(session.room);
   const connected = session.room.state === ConnectionState.Connected;
 

@@ -409,7 +409,13 @@ async def entrypoint(ctx):
     from .providers.livekit_plugins import ContextState, DeepSeekLLM, ExprAwareLLM, lecture_guard
 
     room_name = ctx.room.name
-    call_id = os.environ.get("AGENT_CALL_ID") or room_name
+    # call_id 来自显式分发 metadata(CP /api/token 挂 RoomAgentDispatch 时写入);
+    # 房间名与 call_id 全栈同约定,兜底相等。AGENT_CALL_ID env 旁路已废除。
+    try:
+        _job_meta = json.loads(getattr(ctx.job, "metadata", "") or "{}")
+    except Exception:
+        _job_meta = {}
+    call_id = str(_job_meta.get("call_id") or "").strip() or room_name
     cp_base = os.environ.get("CONTROL_PLANE_URL") or "http://127.0.0.1:8000"
     cp = ControlPlaneClient(cp_base)
     import time as _t
@@ -1163,4 +1169,6 @@ def run_agent() -> None:
     # livekit-agents 1.7.x 的 cli.run_app 需要显式子命令（start）。
     if len(sys.argv) == 1:
         sys.argv.append("start")
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+    # 显式分发(官方推荐):worker 只接 agent_name="bok-voice" 的 job——由 CP
+    # /api/token 挂 RoomAgentDispatch 精确派发;不再隐式接所有房间(含同传房)。
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name="bok-voice"))

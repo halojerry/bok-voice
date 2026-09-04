@@ -1,3 +1,4 @@
+import json
 import os
 
 os.environ.setdefault("DATABASE_URL", "")  # force in-memory repo for tests
@@ -113,19 +114,30 @@ def test_data_migration_yue_to_cantonese(tmp_path, monkeypatch):
 def test_control_plane_flow():
     with TestClient(app) as client:
         assert client.get("/health").json() == {"ok": True, "service": "bok-voice-control-plane"}
-        token = client.post("/api/token", json={"account_id": "acc-001"}).json()
-        assert token["roomName"]
-        import jwt
-
-        claims = jwt.decode(token["token"], options={"verify_signature": False})
-        assert claims["video"]["room"] == token["roomName"]
-        assert claims["video"]["roomJoin"] is True
-        assert token["url"] == "ws://127.0.0.1:7880"
         created = client.post(
             "/api/calls",
             json={"account_id": "acc-001", "object_id": "obj-1", "persona_id": "p-1", "mode": "simulation"},
         ).json()
         call_id = created["id"]
+        token = client.post("/api/token", json={"account_id": "acc-001", "call_id": call_id}).json()
+        # 官方 TokenSourceResponse 契约字段。
+        assert token["serverUrl"] == "ws://127.0.0.1:7880"
+        import jwt
+
+        claims = jwt.decode(token["participantToken"], options={"verify_signature": False})
+        assert claims["video"]["room"] == call_id
+        assert claims["video"]["roomJoin"] is True
+        # A 线显式分发(官方推荐):operator token 携带 bok-voice agent 分发(metadata 带 call_id)。
+        room_config = claims.get("roomConfig") or claims.get("room_config") or {}
+        agents = room_config.get("agents") or []
+        assert any((a.get("agentName") or a.get("agent_name")) == "bok-voice" for a in agents)
+        meta = json.loads(next(a for a in agents if (a.get("agentName") or a.get("agent_name")) == "bok-voice").get("metadata") or "{}")
+        assert meta["call_id"] == call_id
+        # 参与者属性带业务角色(官方 attributes 机制)。
+        attrs = claims.get("attributes") or {}
+        assert attrs.get("bok.role") == "operator"
+        # 空 room 请求显式 400,不再悄悄造随机房。
+        assert client.post("/api/token", json={"account_id": "acc-001"}).status_code == 400
         client.post(f"/api/calls/{call_id}/turns", params={"role": "user", "transcript": "嗯 然后 优惠", "emotion": "neutral"})
         settled = client.post(f"/api/calls/{call_id}/settle").json()
         assert settled["status"] == "done"
@@ -157,19 +169,20 @@ def test_interpret_session_token_roles_and_dispatch():
 
         me = client.post("/api/token", json={"account_id": "acc-001", "call_id": room, "role": "me"}).json()
         other = client.post("/api/token", json={"account_id": "acc-001", "call_id": room, "role": "other"}).json()
-        me_claims = jwt.decode(me["token"], options={"verify_signature": False})
-        other_claims = jwt.decode(other["token"], options={"verify_signature": False})
+        me_claims = jwt.decode(me["participantToken"], options={"verify_signature": False})
+        other_claims = jwt.decode(other["participantToken"], options={"verify_signature": False})
         assert me_claims["sub"] == f"me-{room}"
         assert other_claims["sub"] == f"other-{room}"
 
-        # me 端(房间创建者)token 携带 agent 分发:两方向 + 语言对 metadata。
+        # me 端(房间创建者)token 携带 agent 分发:两方向 + 精确 identity + 语言对 metadata。
         room_config = me_claims.get("roomConfig") or me_claims.get("room_config") or {}
         agents = room_config.get("agents") or []
         names = {a.get("agentName") or a.get("agent_name") for a in agents}
         assert {"bok-interp-fwd", "bok-interp-rev"} <= names
         metas = [json.loads(a.get("metadata") or "{}") for a in agents]
-        fwd = next(m for m in metas if m.get("listen") == "me-")
-        assert fwd["deliver"] == "other-" and fwd["source_lang"] == "zh" and fwd["target_lang"] == "en"
+        fwd = next(m for m in metas if m.get("listen_identity") == f"me-{room}")
+        assert fwd["deliver_identity"] == f"other-{room}"
+        assert fwd["source_lang"] == "zh" and fwd["target_lang"] == "en"
 
         # 对方端 token 不挂 agent 分发(只有首个建房者生效)。
         assert not (other_claims.get("roomConfig") or other_claims.get("room_config"))

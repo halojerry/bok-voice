@@ -248,8 +248,8 @@ async def main() -> None:
         )
         resp.raise_for_status()
         data = resp.json()
-        server_url = data["url"]
-        token = data["token"]
+        server_url = data["serverUrl"]
+        token = data["participantToken"]
         if token.count(".") != 2:
             raise SystemExit(f"[e2e] /api/token 返回的不是真 JWT: {token[:24]}…（LiveKit 凭据未注入）")
         print(f"[e2e] token: via control-plane /api/token (url={server_url})", flush=True)

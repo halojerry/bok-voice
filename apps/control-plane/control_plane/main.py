@@ -415,9 +415,15 @@ async def tts_preview(payload: dict) -> Response:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
-@app.post("/api/token", response_model=TokenResponse)
+@app.post("/api/token", response_model=TokenResponse, status_code=201)
 def token(req: TokenRequest) -> TokenResponse:
-    room = req.call_id or f"call-{uuid.uuid4().hex[:8]}"
+    """签发参与者 token——LiveKit 官方 TokenSource endpoint 契约。
+
+    请求体兼容两种形态:官方 TokenSourceRequest(snake_case: room_name /
+    participant_identity,由 TokenSource.endpoint / 任意官方 SDK 直发)与本项目
+    业务字段(call_id/role)。响应即官方 TokenSourceResponse({serverUrl,
+    participantToken}),任何按标准实现的客户端(playground/Swift/Flutter…)可直接消费。
+    """
     key = getattr(app.state, "lk_key", "") or os.environ.get("LIVEKIT_API_KEY", "")
     secret = getattr(app.state, "lk_secret", "") or os.environ.get("LIVEKIT_API_SECRET", "")
     url = getattr(app.state, "lk_url", "") or os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880")
@@ -425,53 +431,111 @@ def token(req: TokenRequest) -> TokenResponse:
         # 必须走真实 JWT：旧 sha256 兜底会让前端 decodeTokenPayload 抛错、
         # LiveKit 服务器 401，A 线永远接不通。缺凭据时显式失败，不静默回退。
         raise HTTPException(status_code=503, detail="LiveKit credentials not configured")
+    # 房间名:官方 room_name 优先,旧 call_id 兼容;房间名 == call_id 是全栈约定
+    # (agent/前端按它反查 CallSession)。不再为空请求悄悄造随机房——token 必须绑定已知通话。
+    room = (req.room_name or req.call_id or "").strip()
+    if not room:
+        raise HTTPException(status_code=400, detail="room_name (or call_id) is required")
     import datetime
     from livekit import api
 
-    # 同传(B 线 v2)双端角色:me=我方端(通常也是房间创建者),other=对方端;
-    # A 线沿用 operator。identity 前缀是 interpreter agent 判定"听谁的麦/译文给谁"的约定。
+    # 角色:官方路径(显式 participant_identity)按我方身份前缀反推;否则用业务 role 字段。
+    # 同传(B 线 v2)双端:me=我方端(通常也是房间创建者),other=对方端;
+    # A 线 operator / 主管 supervisor。前缀是 interpreter agent 判定"听谁的麦/译文给谁"的约定。
+    identity_input = (req.participant_identity or "").strip()
     role = (req.role or "operator").strip().lower()
+    if identity_input:
+        if identity_input.startswith("me-"):
+            role = "me"
+        elif identity_input.startswith("other-"):
+            role = "other"
+        elif identity_input.startswith("supervisor-"):
+            role = "supervisor"
+        else:
+            role = "operator"
     if role == "me":
-        identity, name = f"me-{room}", "Bok Interpret Me"
+        name = "Bok Interpret Me"
     elif role == "other":
-        identity, name = f"other-{room}", "Bok Interpret Other"
+        name = "Bok Interpret Other"
+    elif role == "supervisor":
+        name = "Bok Voice Supervisor"
     else:
-        identity, name = f"operator-{req.account_id}-{room}", "Bok Voice Operator"
+        name = "Bok Voice Operator"
+    identity = identity_input or (
+        f"me-{room}" if role == "me"
+        else f"other-{room}" if role == "other"
+        else f"supervisor-{room}" if role == "supervisor"
+        else f"operator-{req.account_id}-{room}"
+    )
     at = (
         api.AccessToken(key, secret)
         .with_identity(identity)
-        .with_name(name)
+        .with_name(req.participant_name or name)
         .with_grants(api.VideoGrants(room_join=True, room=room, can_publish=True, can_subscribe=True, can_publish_data=True))
         .with_ttl(datetime.timedelta(seconds=3600))
     )
+    if req.participant_metadata:
+        at = at.with_metadata(req.participant_metadata)
+    # 业务维度放 participant attributes(官方机制):agent/前端按属性判定角色,
+    # 替代对 identity 前缀的字符串嗅探;SIP 接入时同通道补 bok.* 属性。
+    at = at.with_attributes({"bok.role": role, "bok.account_id": req.account_id})
+
+    _call: dict = {}
+    try:
+        _call = _repo().get_call(room) or {}
+    except Exception:
+        _call = {}
+    kind = str(_call.get("kind") or "")
+
     # 同传房间:我方端是创建者,token 里挂 RoomConfiguration 显式分发两个方向的
     # interpreter agent(RoomAgentDispatch 只在首个参与者建房时生效,所以只挂 me 端)。
-    # metadata 携带方向与语言对,agent 侧照此锁定"听谁/译文给谁/讲哪种语言"。
-    if role == "me" and req.call_id:
-        try:
-            _call = _repo().get_call(req.call_id) or {}
-        except Exception:
-            _call = {}
-        if str(_call.get("kind") or "") == "interpret":
-            src = (_call.get("language") or "zh").strip() or "zh"
-            tgt = (_call.get("target_lang") or "en").strip() or "en"
-            from livekit.api import RoomAgentDispatch, RoomConfiguration
+    # metadata 带精确 identity(CP 已知房间名,不再让 agent 拼前缀)与语言对。
+    if kind == "interpret" and role == "me":
+        src = (_call.get("language") or "zh").strip() or "zh"
+        tgt = (_call.get("target_lang") or "en").strip() or "en"
+        from livekit.api import RoomAgentDispatch, RoomConfiguration
 
-            at = at.with_room_config(
-                RoomConfiguration(
-                    agents=[
-                        RoomAgentDispatch(
-                            agent_name="bok-interp-fwd",
-                            metadata=json.dumps({"listen": "me-", "deliver": "other-", "source_lang": src, "target_lang": tgt}),
-                        ),
-                        RoomAgentDispatch(
-                            agent_name="bok-interp-rev",
-                            metadata=json.dumps({"listen": "other-", "deliver": "me-", "source_lang": tgt, "target_lang": src}),
-                        ),
-                    ]
-                )
+        at = at.with_room_config(
+            RoomConfiguration(
+                agents=[
+                    RoomAgentDispatch(
+                        agent_name="bok-interp-fwd",
+                        metadata=json.dumps({
+                            "listen_identity": f"me-{room}",
+                            "deliver_identity": f"other-{room}",
+                            "source_lang": src,
+                            "target_lang": tgt,
+                        }),
+                    ),
+                    RoomAgentDispatch(
+                        agent_name="bok-interp-rev",
+                        metadata=json.dumps({
+                            "listen_identity": f"other-{room}",
+                            "deliver_identity": f"me-{room}",
+                            "source_lang": tgt,
+                            "target_lang": src,
+                        }),
+                    ),
+                ]
             )
-    token = at.to_jwt()
+        )
+    elif kind != "interpret" and role in ("operator", "supervisor"):
+        # A 线显式分发(官方推荐,隐式 dispatch 已废除):worker 以 agent_name="bok-voice"
+        # 注册,只有挂了本 dispatch 的房间会拉起客服 agent——顺带杜绝「同传房被
+        # A 线 agent 隐式抢派」。metadata 带 call_id,取代已删除的 AGENT_CALL_ID env 旁路。
+        from livekit.api import RoomAgentDispatch, RoomConfiguration
+
+        at = at.with_room_config(
+            RoomConfiguration(
+                agents=[
+                    RoomAgentDispatch(
+                        agent_name="bok-voice",
+                        metadata=json.dumps({"call_id": room}),
+                    ),
+                ]
+            )
+        )
+    participant_token = at.to_jwt()
     # When the operator connects an existing call, flip it to ACTIVE so the supervisor
     # "active calls" view reflects the real live room.
     if req.call_id:
@@ -479,7 +543,7 @@ def token(req: TokenRequest) -> TokenResponse:
             _repo().update_call(req.call_id, status=CallStatus.ACTIVE.value)
         except Exception:
             pass
-    return TokenResponse(token=token, roomName=room, url=url)
+    return TokenResponse(serverUrl=url, participantToken=participant_token)
 
 
 @app.post("/api/calls")
@@ -1044,10 +1108,23 @@ def _parse_setup(stdout: str) -> dict:
 
 @app.post("/api/supervisor/{call_id}/join")
 def supervisor_join(call_id: str) -> dict:
+    """主管进房:校验通话存在并直接签发 supervisor token(官方 TokenSource 契约)。
+
+    以前只回 role 不回 token(与 CONTRACTS.md「主管进房 token」自相矛盾);现在
+    与 /api/token 同一条签发链路(identity=supervisor-<room>,挂 bok.role 属性,
+    A 线 dispatch 由 token 端点统一处理)。
+    """
     call = _repo().get_call(call_id)
     if not call:
         raise HTTPException(404, "call not found")
-    return {"call_id": call_id, "status": call.get("status", "active"), "role": Role.SUPERVISOR.value}
+    issued = token(TokenRequest(call_id=call_id, role="supervisor"))
+    return {
+        "call_id": call_id,
+        "status": call.get("status", "active"),
+        "role": Role.SUPERVISOR.value,
+        "serverUrl": issued.serverUrl,
+        "participantToken": issued.participantToken,
+    }
 
 
 @app.post("/api/supervisor/{call_id}/pause-agent")
