@@ -419,3 +419,49 @@ def test_current_step_explicit_no_leak_instruction():
     assert "勿念给客户" in txt
     assert "绝不把「如果" in txt
     assert "参考要点(内部指示" in txt
+
+
+# ---- 明确拒绝 → REFUSE(一句礼貌收尾 + 主动结束通话) ----
+def test_decide_advance_refuse_family():
+    # 高频拒绝说法(旧版漏成 unclear/objection 然后无限重问):现在直接 REFUSE。
+    from agent_runtime.flow import REFUSE, decide_advance
+    assert decide_advance("唔需要喇，唔该") == REFUSE
+    assert decide_advance("唔办啦。") == REFUSE
+    assert decide_advance("我唔要。") == REFUSE
+    assert decide_advance("唔要啦。") == REFUSE
+    assert decide_advance("我拒绝你哋。") == REFUSE
+    assert decide_advance("唔好再打嚟！") == REFUSE
+    assert decide_advance("不用了谢谢") == REFUSE
+    assert decide_advance("别再打来了") == REFUSE
+    assert decide_advance("再见") == REFUSE
+    assert decide_advance("拜拜") == REFUSE
+
+
+def test_refuse_social_phrase_not_refuse():
+    # 「唔使担心/唔使客气」係社交关心/客套,唔係拒绝(防误收线)。
+    from agent_runtime.flow import REFUSE, decide_advance
+    assert decide_advance("唔使担心，我明白嘅。") != REFUSE
+    assert decide_advance("你哋唔使客气。") != REFUSE
+
+
+def test_refuse_enters_closing_and_stays():
+    # REFUSE → 收尾态:current_step_text 注入收尾话术;收尾后唔再推进/唔再按步走。
+    from agent_runtime.flow import FlowController, REFUSE
+    fc = FlowController.from_template(
+        {"steps_json": '[{"goal":"开场","ref":"r1"},{"goal":"引导办理","ref":"r2"}]'}, OBJ
+    )
+    assert fc.rule_verdict("我唔需要，唔好再打嚟。") == REFUSE
+    fc.enter_closing()
+    cur = fc.current_step_text()
+    assert "收尾" in cur and "拜拜" in cur
+    # 收尾态即使客户改口应承,都唔翻流程(真改口由人工/新通话处理)。
+    fc.on_user_turn("係我,可以㗎。")
+    assert fc.current == 0 and fc.closing
+    assert "收尾" in fc.current_step_text()
+
+
+def test_should_auto_advance_never_on_refuse():
+    # 拒绝轮任何一步都唔推进(开场步漏网拒绝尤其会误推,防回归)。
+    from agent_runtime.flow import REFUSE, should_auto_advance
+    assert should_auto_advance(current=0, goal="开场", ref="r", user_text="唔需要", verdict=REFUSE) is False
+    assert should_auto_advance(current=1, goal="引导办理", ref="r", user_text="唔需要", verdict=REFUSE) is False

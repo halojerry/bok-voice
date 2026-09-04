@@ -19,6 +19,7 @@ OBJECTION = "objection"   # 有异议/否认/不配合 → 停留本步应对
 QUESTION = "question"     # 提问/要解释 → 停留本步解答
 OFFTOPIC = "offtopic"     # 明显无关/要挂断/怀疑诈骗 → 不强推
 UNCLEAR = "unclear"       # 判断不清 → 停留,自然应对
+REFUSE = "refuse"         # 明确拒绝/告别/要收线 → 收尾态:一句礼貌再见后结束通话
 
 
 @dataclass
@@ -164,6 +165,16 @@ _QUESTION_RE = re.compile(
 # 强异议/不想继续/威胁 → objection/offtopic
 _HANGUP_RE = re.compile(r"(不用了|不需要|别再打|别打|不要打|挂|拉黑|投诉|再见|拜拜|唔使|唔使啦|"
     r"stop|don't call|leave me|bye)", re.IGNORECASE)
+# 明确拒绝/婉拒(唔需要/唔办/我唔要/拒绝…) → REFUSE:直接收尾话术+结束通话,唔停留挽留。
+# 注意社交软语「唔使担心/唔使客气」等唔算拒绝(见 _REFUSE_SOFT_GUARD_RE)。
+_REFUSE_RE = re.compile(
+    r"(唔需要|唔辦|唔办|唔好办|唔好辦|我唔要|唔要啦|唔要喇|唔要嘎|唔要咗|唔要了|不要啦|不要喇|不要了|"
+    r"唔使喇|唔使啦|唔使再打|唔好再打|唔好再嚟|唔好再來|别再打|別再打|唔好搵我|唔好煩我|唔好骚扰|"
+    r"拒绝|拒絕|收线啦|收線啦|收工啦|唔好搞我)",
+    re.IGNORECASE,
+)
+# 「唔使X」嘅社交关心/客套短语——唔係拒绝,唔好当 REFUSE(旧实测:「唔使担心」曾误判)。
+_REFUSE_SOFT_GUARD_RE = re.compile(r"唔使(担心|擔心|客气|客氣|怕|緊張|紧张|多心|挂住|掛住)")
 # 多字「强确认」:疑问句里出现都算确认(「係我,然後呢?」);单字「係/好/嗯/对/可以」
 # 喺疑问句(「係咩?」「可以點做?」)唔当确认,靠 _CONFIRM_RE 只喺非疑问句时兜底。
 _STRONG_AFFIRM_RE = re.compile(
@@ -259,7 +270,7 @@ def should_auto_advance(*, current: int, goal: str, ref: str, user_text: str, ve
       offered(應承加未俾號)則停留;淨係答到平台 → 停留喺本步,繼續叫客戶俾WhatsApp/傳截圖。
       若只係純核對平台(冇 WhatsApp 要求)→ 答到平台即過。
     """
-    if verdict == OBJECTION:
+    if verdict in (OBJECTION, REFUSE):
         return False
     if current == 0:
         # 純提問(客問「你哋邊間公司?」)要喺開場步答,唔推;其他實質回應都推。
@@ -367,9 +378,10 @@ def decide_advance(user_text: str, *, facts: dict | None = None) -> str:
     t = user_text.strip()
     if not t:
         return UNCLEAR
-    # 1) 挂断/强拒绝 → objection(停留,让 LLM 简短得体收尾/不强推)
-    if _HANGUP_RE.search(t):
-        return OBJECTION
+    # 1) 明确拒绝/告别/要收线 → REFUSE(收尾态:一句礼貌再见后结束通话)。
+    #    拒绝优先于一切(含否认/提问):「唔係我,唔好再打」主体係收线。
+    if (_REFUSE_RE.search(t) or _HANGUP_RE.search(t)) and not _REFUSE_SOFT_GUARD_RE.search(t):
+        return REFUSE
     # 2) 明确否认/不是本人 → objection(优先于确认词,避免"不是,是我…"误判)
     if _DENY_RE.search(t):
         return OBJECTION
@@ -407,6 +419,7 @@ class FlowController:
 
     steps: list[FlowStep] = field(default_factory=list)
     current: int = 0  # 0-based;== len(steps) 表示流程已走完
+    closing: bool = False  # 客户明确拒绝/告别 → 收尾态:只讲收尾话术,唔再推进
 
     @classmethod
     def from_template(cls, template: dict | None, object_card: dict | None) -> "FlowController":
@@ -430,11 +443,24 @@ class FlowController:
 
     def on_user_turn(self, user_text: str) -> None:
         """每轮用户话后调用:结合当前步决定是否推进。"""
-        if not self.has_steps or self.done:
+        if not self.has_steps or self.done or self.closing:
             return
         verdict = self.rule_verdict(user_text)
         if verdict == CONFIRM:
             self.advance()
+
+    def enter_closing(self) -> None:
+        """客户明确拒绝/告别 → 进入收尾态:之后只讲收尾话术,唔再推进/唔再按步走。"""
+        self.closing = True
+        self._just_advanced = False
+
+    def closing_text(self) -> str:
+        """收尾态注入:一句礼貌告别,唔推销、唔挽留、唔转话题、唔问问题。"""
+        return (
+            "【收尾】客户已明确拒绝/表示要结束,现在只做礼貌收尾:用客户正在讲的语言讲一句告别"
+            "(多谢+再见,例如「好嘅,唔打扰你嘞,多谢你时间,拜拜」),"
+            "一句讲完就停——绝不推销、绝不挽留、绝不问任何问题、绝不转新话题、绝不再提流程。"
+        )
 
     def rule_verdict(self, user_text: str) -> str:
         """规则判定(唔改动状态):只有"确认/认可当前步"先算可推进。"""
@@ -470,7 +496,9 @@ class FlowController:
         return g
 
     def current_step_text(self) -> str:
-        """渲染当前步(含变量替换)给本轮 system;流程完成则空。"""
+        """渲染当前步(含变量替换)给本轮 system;流程完成则空;收尾态则注入收尾话术。"""
+        if self.closing:
+            return self.closing_text()
         if not self.has_steps or self.done:
             return ""
         step = self.steps[self.current]

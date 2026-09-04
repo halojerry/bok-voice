@@ -59,6 +59,9 @@
 - 恢复：`POST /api/supervisor/{id}/resume-agent` 把状态置回 `active` 并清
   `escalated_to_human`；agent 恢复自动回复。
 - 转人工：置 `ended` + `disposition=transferred`，agent 退出并触发结算。
+- 拒绝收线：客户明确拒绝/告别（`flow.py` REFUSE 判定）→ agent 注入收尾话术讲一句
+  礼貌再见，随后 `POST /api/supervisor/{id}/end` 置 `ended` + `disposition=declined`
+  并断房，结算由 agent `_on_close` 幂等触发。
 
 ### B 线（同声传译）
 

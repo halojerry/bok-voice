@@ -433,7 +433,7 @@ async def entrypoint(ctx):
 
     # 对话流程控制器:载入模板分步 + 对象变量;由它按轮注入"当前步",逐步推进。
     from .flow import FlowController, facts_line
-    from .flow import CONFIRM, OBJECTION, QUESTION, UNCLEAR, detect_whatsapp_signal
+    from .flow import CONFIRM, OBJECTION, QUESTION, REFUSE, UNCLEAR, detect_whatsapp_signal
 
     flow_ctrl = FlowController.from_template(template, object_card)
     _log_stage("context_resolved")
@@ -801,6 +801,25 @@ async def entrypoint(ctx):
         closed.set()
         asyncio.create_task(cp.settle(call_id))
 
+    # 明确拒绝收尾:礼貌告别讲完(一句 TTS+余量)后主动结束通话——
+    # end_call 置 ENDED/declined 并断房,结算由 _on_close 幂等触发。
+    _end_scheduled = {"on": False}
+
+    def _schedule_call_end(delay: float = 14.0) -> None:
+        if _end_scheduled["on"]:
+            return
+        _end_scheduled["on"] = True
+
+        async def _end():
+            try:
+                await asyncio.sleep(delay)
+                await cp.end_call(call_id)
+                print(f"[flow] declined -> call ended by agent (call {room_name})", flush=True)
+            except Exception as exc:  # pragma: no cover - 已结束/断房失败都不致命
+                print(f"[flow] end_call skipped: {exc!r} (call {room_name})", flush=True)
+
+        asyncio.create_task(_end())
+
     session.on("conversation_item_added", _on_conversation_item)
     session.on("conversation_item_added", _on_item_for_context)
     session.on("close", _on_close)
@@ -916,41 +935,50 @@ async def entrypoint(ctx):
             except Exception:  # pragma: no cover - WhatsApp 偵測失敗唔阻斷
                 pass
             # 流程推进:读用户最新话,判定是否进入下一步,更新"当前步"约束注入。
-            if flow_ctrl.has_steps and not flow_ctrl.done:
+            if flow_ctrl.has_steps:
                 try:
                     from .flow import should_auto_advance
 
                     verdict = flow_ctrl.rule_verdict(user_text)
-                    _g2, _r2 = flow_ctrl.current_goal_ref()
-                    # 規則級必定推進 override(開場步客已回應 / 核實步答到平台):
-                    # 唔靠 LLM judge,防止卡死(offered 應承加嗰輪除外——要等客俾號碼)。
-                    _wa_blocks = _wa_signal is not None and _wa_signal[0] == "offered"
-                    _auto = (not _wa_blocks) and should_auto_advance(
-                        current=flow_ctrl.current,
-                        goal=_g2,
-                        ref=_r2,
-                        user_text=user_text,
-                        verdict=verdict,
-                        # 兼要攞WhatsApp嘅核實步:要客戶俾咗號碼/應承先推
-                        wa=(_wa_signal[0] if _wa_signal else None),
-                    )
-                    if _auto:
-                        flow_ctrl.advance()
-                        print(f"[flow] rule=auto step={flow_ctrl.current + 1} (call {room_name})", flush=True)
-                    elif verdict == CONFIRM:
-                        # offered(應承加但未俾號碼)→ 唔推,停喺辦理步叫佢俾號碼(captured 先推)。
-                        if _wa_signal and _wa_signal[0] == "offered":
-                            pass
-                        else:
+                    if verdict == REFUSE:
+                        # 客户明确拒绝/告别 → 收尾态:注入收尾话术(一句礼貌再见),
+                        # 唔推进/唔 judge/唔按步走;讲完后 _schedule_call_end 主动结束通话
+                        # (ENDED/declined,结算由 _on_close 幂等触发)。
+                        if not flow_ctrl.closing:
+                            flow_ctrl.enter_closing()
+                            _schedule_call_end()
+                            print(f"[flow] refuse -> closing, end scheduled (call {room_name})", flush=True)
+                    elif not flow_ctrl.done and not flow_ctrl.closing:
+                        _g2, _r2 = flow_ctrl.current_goal_ref()
+                        # 規則級必定推進 override(開場步客已回應 / 核實步答到平台):
+                        # 唔靠 LLM judge,防止卡死(offered 應承加嗰輪除外——要等客俾號碼)。
+                        _wa_blocks = _wa_signal is not None and _wa_signal[0] == "offered"
+                        _auto = (not _wa_blocks) and should_auto_advance(
+                            current=flow_ctrl.current,
+                            goal=_g2,
+                            ref=_r2,
+                            user_text=user_text,
+                            verdict=verdict,
+                            # 兼要攞WhatsApp嘅核實步:要客戶俾咗號碼/應承先推
+                            wa=(_wa_signal[0] if _wa_signal else None),
+                        )
+                        if _auto:
                             flow_ctrl.advance()
-                            print(f"[flow] rule=confirm step={flow_ctrl.current + 1} (call {room_name})", flush=True)
-                    elif verdict in (UNCLEAR, QUESTION) and os.environ.get("FLOW_LLM_ADVANCE", "1") == "1":
-                        # 模糊轮(客答唔記得/問後續/開放式回答)→ 背景跑 LLM 判定(唔同步等,
-                        # 唔好為咗推進令每輪開聲慢幾秒);判定完若仲喺同一歩就推進,下一輪先生效。
-                        _step_at = flow_ctrl.current
-                        if _judge_inflight["step"] != _step_at:
-                            _judge_inflight["step"] = _step_at
-                            asyncio.create_task(_background_flow_judge(_step_at, user_text))
+                            print(f"[flow] rule=auto step={flow_ctrl.current + 1} (call {room_name})", flush=True)
+                        elif verdict == CONFIRM:
+                            # offered(應承加但未俾號碼)→ 唔推,停喺辦理步叫佢俾號碼(captured 先推)。
+                            if _wa_signal and _wa_signal[0] == "offered":
+                                pass
+                            else:
+                                flow_ctrl.advance()
+                                print(f"[flow] rule=confirm step={flow_ctrl.current + 1} (call {room_name})", flush=True)
+                        elif verdict in (UNCLEAR, QUESTION) and os.environ.get("FLOW_LLM_ADVANCE", "1") == "1":
+                            # 模糊轮(客答唔記得/問後續/開放式回答)→ 背景跑 LLM 判定(唔同步等,
+                            # 唔好為咗推進令每輪開聲慢幾秒);判定完若仲喺同一歩就推進,下一輪先生效。
+                            _step_at = flow_ctrl.current
+                            if _judge_inflight["step"] != _step_at:
+                                _judge_inflight["step"] = _step_at
+                                asyncio.create_task(_background_flow_judge(_step_at, user_text))
                     context_state.set_flow_current(flow_ctrl.current_step_text())
                 except Exception:  # pragma: no cover - 流程推进失败不阻断回复
                     pass
