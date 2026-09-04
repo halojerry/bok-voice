@@ -586,6 +586,11 @@ async def entrypoint(ctx):
     # 未设置时回落到对象(客户)语言；再退回普通话。之后每轮由 ASR 检出的客户语言覆盖。
     greet_lang = _normalize_lang((persona or {}).get("language")) or _normalize_lang((object_card or {}).get("language")) or "zh"
     language_state.lang = greet_lang
+    # 开场即锚定回复语言（P4-C）：旧代码要等第一轮 on_user_turn_completed 才写入
+    # ContextState，问候语那一轮 system 里没有【用户语言】规则——首通回复无语言
+    # 约束（幻觉直接诱因），且前缀在问候→首轮之间被改写、KV-cache 整段失配。
+    # 会话开始前就按 greet_lang 渲染，前缀从第一声起字节稳定。
+    context_state.set_user_language(greet_lang)
     # 粤语客服锚定：LLM 默认始终用锚语言（greet_lang），只有客户连续多轮明显讲其它语言才跟随。
     _lang_sticky: dict = {"sticky": greet_lang if greet_lang in {"zh", "cantonese", "en"} else "zh", "streak": 0}
     # 已上報嘅 WhatsApp 狀態(captured=已報號碼, offered=已報應承加),避免每 call 重複 spam。

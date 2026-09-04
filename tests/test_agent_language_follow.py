@@ -417,3 +417,31 @@ def test_strip_eos_tokens_streaming_across_chunks():
         assert _trailing_eos_partial("正常內容<expr type=") == ""
 
     asyncio.run(_run())
+
+
+# ---- P4-C 回归:联网检索尾巴收紧(≤1 条 ×150 字)+ 前缀语言规则会话开始即稳定 ----
+def test_web_snippets_capped_to_one_short_item():
+    from agent_runtime.providers.livekit_plugins import ContextState
+    ctx = ContextState(account_id="acc-001")
+    # 旧实现保留 2 条且不截断(P4 实测尾部被 Wikipedia 撑到 500-900 token):
+    # 现在最多 1 条、单条 150 字——开放域杂音既挤尾部预算又会带偏 4B 小模型。
+    ctx.set_web(["很长的联网摘要" * 100, "第二条联网结果"])
+    tail = ctx.render_context_tail()
+    assert "第二条联网结果" not in tail
+    assert len(ctx._web) == 1 and len(ctx._web[0]) <= 150
+    assert len(tail) < 400
+    # 空结果清空尾巴。
+    ctx.set_web([])
+    assert ctx.render_context_tail().find("【联网检索到的资料") == -1
+
+
+def test_user_language_rule_stable_across_same_lang_turns():
+    from agent_runtime.providers.livekit_plugins import ContextState
+    ctx = ContextState(account_id="acc-001")
+    # 会话开始前就按 greet_lang 锚定(agent.py 修复点):问候轮与首轮 user lang
+    # 一致时前缀字节不变——旧代码首轮才首次写入语言规则,问候→首轮前缀断裂。
+    ctx.set_user_language("cantonese")
+    p1 = ctx.render_instruction_prefix()
+    ctx.set_user_language("cantonese")  # ASR 同语言轮:锚定重算但值不变
+    p2 = ctx.render_instruction_prefix()
+    assert p1 == p2

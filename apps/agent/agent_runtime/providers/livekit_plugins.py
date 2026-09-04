@@ -515,9 +515,12 @@ class ContextState:
             self._web = list(results)
         else:
             self._web = []
-        # 联网结果最多保留 2 条、各截断，避免撑爆上下文。
-        if len(self._web) > 2:
-            self._web = self._web[:2]
+        # 联网结果是最弱的参考源（开放域/wiki 杂音既挤占尾部预算又会带偏 4B 小模型
+        # ——P4-C：「有冇人？知道。」检索回 Wikipedia → 回复幻觉成普通话乱语）。
+        # 收紧到最多 1 条、单条 150 字：够给一句事实线索，唔够位带偏回复。
+        self._web = [s.strip() for s in self._web[:1] if str(s).strip()]
+        if self._web and len(self._web[0]) > 150:
+            self._web[0] = self._web[0][:149] + "…"
 
     def set_user_language(self, lang: str | None) -> None:
         """ASR 每轮检测到的用户语言：随 system 指令注入，约束回复语言。"""
@@ -1872,6 +1875,19 @@ class Qwen3TTSTTS(tts.TTS):
         return raw
 
 
+def _tts_segment_has_word_char(s: str) -> bool:
+    r"""段内有没有任何「可朗读」字符（字母/数字/汉字/其他 \w）。
+
+    纯标点/空白段（「。」「？！！」…）绝不能送 Qwen3-TTS：模型对无音节输入会
+    连环 hallucinate 4-30s 音频爆段（P4 实证 QWEN3_TTS_BYTES 983040-1530240），
+    爆段把整轮 playout 拖 20s+，下一轮回复被官方语音队列压住唔出声（P4-A 挂死根因）。
+    """
+    return _TTS_WORD_CHAR_RE.search(s) is not None
+
+
+_TTS_WORD_CHAR_RE = re.compile(r"\w")
+
+
 async def _qwen3_tts_post_frames(
     tts_: "Qwen3TTSTTS",
     text: str,
@@ -1891,6 +1907,15 @@ async def _qwen3_tts_post_frames(
     """
     last_exc: Exception | None = None
     pushed_any = False  # 本任务是否已有音频落地(半途断流后重试会重读音频)
+    # 单任务音频上限(秒):正常一段≤2-3 短句 ≤8s;TTS 对异常输入(纯标点/幻觉)
+    # 会连环合成 20-30s 爆段(P4 实证 1MB+ 级),爆段霸住 playout 会把下一轮回复
+    # 压喺官方语音队列后面(TTFT/回复延迟齐炸)。到顶即断流,唔再读剩余 body。
+    # QWEN3_TTS_MAX_TASK_AUDIO_SEC=0 可关。
+    try:
+        _cap_sec = float(os.environ.get("QWEN3_TTS_MAX_TASK_AUDIO_SEC", "15"))
+    except ValueError:  # pragma: no cover - 配错当没配
+        _cap_sec = 15.0
+    max_task_bytes = int(tts_.sample_rate * max(_cap_sec, 0.0)) * 2 if _cap_sec > 0 else 0
     for attempt in range(3):
         try:
             async with httpx.AsyncClient(timeout=120) as client:
@@ -1929,6 +1954,20 @@ async def _qwen3_tts_post_frames(
                     output_emitter.start_segment(segment_id="qwen3-tts")
                 async for data in resp.aiter_bytes():
                     buf.extend(data)
+                    # 单任务爆段护栏:音频时长到顶(默认 15s)即停读剩余 body,
+                    # 本任务判失败(有音频落地 → 上层唔重试),防 20-30s 爆段霸 playout。
+                    if max_task_bytes and pcm_total + len(buf) >= max_task_bytes:
+                        keep = max(max_task_bytes - pcm_total, 0)
+                        if keep:
+                            output_emitter.push(bytes(buf[:keep]))
+                            output_emitter.flush()
+                            del buf[:keep]
+                            pcm_total = max_task_bytes
+                            pushed_any = True
+                        print("QWEN3_TTS_TASK_CAP", pcm_total, "bytes (burst guard)", flush=True)
+                        if end_segment:
+                            output_emitter.end_segment()
+                        return False
                     # Push the first partial frame as soon as ~40ms is
                     # available instead of waiting for a full 200ms
                     # buffer: the sidecar streams ~83ms model chunks
@@ -2096,15 +2135,19 @@ class _Qwen3SynthesizeStream(tts.SynthesizeStream):
                         break
                     sentence = sent_buf[: idx + 1]
                     sent_buf = sent_buf[idx + 1 :]
-                    if sentence.strip():
-                        ok = await _qwen3_tts_post_frames(
-                            self._tts_, sentence.strip(), output_emitter, state,
-                            end_segment=False,
-                        )
-                        _last_send = time.monotonic()
-                        if not ok:
-                            broken = True
-                            break
+                    if not _tts_segment_has_word_char(sentence):
+                        # 纯标点段(P4-B 实证 input='。' / '？'):Qwen3-TTS 对无音节
+                        # 输入会 hallucinate 4-30s 爆段。直接丢弃,绝唔单独 POST
+                        # (前句已带句末标点,丢呢段零语音损失)。
+                        continue
+                    ok = await _qwen3_tts_post_frames(
+                        self._tts_, sentence.strip(), output_emitter, state,
+                        end_segment=False,
+                    )
+                    _last_send = time.monotonic()
+                    if not ok:
+                        broken = True
+                        break
                 if broken:
                     break
                 # overlap:句号之间的增量提前送(与 MiniMax 同款节奏)。
@@ -2123,7 +2166,7 @@ class _Qwen3SynthesizeStream(tts.SynthesizeStream):
                     time_up = (now - _last_send) * 1000 >= _overlap_ms
                     if (soft_idx != -1 and soft_idx >= len(sent_buf.strip()) // 2) or time_up:
                         frag = sent_buf.strip()
-                        if _flushable(frag):
+                        if _flushable(frag) and _tts_segment_has_word_char(frag):
                             ok = await _qwen3_tts_post_frames(
                                 self._tts_, frag, output_emitter, state,
                                 end_segment=False,
@@ -2133,12 +2176,15 @@ class _Qwen3SynthesizeStream(tts.SynthesizeStream):
                                 broken = True
                                 break
                             sent_buf = ""
-            if not broken and sent_buf.strip():
+            if not broken:
                 # 收尾残句:全场文本结束,把没凑够一句的尾巴合成掉。
-                await _qwen3_tts_post_frames(
-                    self._tts_, sent_buf.strip(), output_emitter, state,
-                    end_segment=False,
-                )
+                # 纯标点尾巴(唔沾正字)直接丢弃,绝唔 POST(P4-B 爆段源)。
+                final_text = sent_buf.strip()
+                if _tts_segment_has_word_char(final_text):
+                    await _qwen3_tts_post_frames(
+                        self._tts_, final_text, output_emitter, state,
+                        end_segment=False,
+                    )
         except asyncio.CancelledError:
             raise
         except Exception as exc:

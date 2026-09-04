@@ -408,3 +408,131 @@ class _RecordingEmitter:
 
     def flush(self):
         pass
+
+
+class _CountingEmitter(_RecordingEmitter):
+    """记录 push 字节数的 emitter 桩(爆段护栏测试用)。"""
+
+    def __init__(self):
+        self.bytes_pushed = 0
+        self.started = False
+
+    def initialize(self, **kwargs):
+        self.started = True
+
+    def push(self, data):
+        self.bytes_pushed += len(data)
+
+    def flush(self):
+        pass
+
+
+# ---- P4-B 回归:纯标点段绝不单独 POST(Qwen3-TTS 对纯标点 hallucinate 4-30s 爆段) ----
+
+
+def test_qwen3_stream_skips_punctuation_only_segments(monkeypatch):
+    """旧代码会把「。」单独成任务 POST(input='。' 实证)→ 现在必须丢弃。"""
+    from agent_runtime.providers.livekit_plugins import _Qwen3SynthesizeStream
+
+    posts: list[dict] = []
+    _install_fake_sidecar(monkeypatch, posts)
+
+    tts = _make_tts()
+
+    async def run():
+        from livekit.agents import APIConnectOptions
+
+        s = _Qwen3SynthesizeStream(tts, APIConnectOptions())
+        s.push_text("你好。")
+        s.push_text("。")  # 复现:句界 flush 后多出的纯标点段
+        s.push_text("我係林先生。")
+        s.push_text("？！")
+        s.end_input()
+        async for _ev in s:
+            pass
+
+    asyncio.run(asyncio.wait_for(run(), timeout=10))
+    inputs = [p["input"] for p in posts]
+    assert inputs == ["你好。", "我係林先生。"], inputs
+    for p in posts:
+        assert p["input"].strip("。！？!?，、；;：: \t"), f"纯标点任务混入: {p['input']!r}"
+
+
+def test_qwen3_stream_drops_punctuation_only_tail(monkeypatch):
+    """收尾残句只有纯标点(「。。」):整场一个任务都唔应该多发。"""
+    from agent_runtime.providers.livekit_plugins import _Qwen3SynthesizeStream
+
+    posts: list[dict] = []
+    _install_fake_sidecar(monkeypatch, posts)
+
+    tts = _make_tts()
+
+    async def run():
+        from livekit.agents import APIConnectOptions
+
+        s = _Qwen3SynthesizeStream(tts, APIConnectOptions())
+        s.push_text("好。")
+        s.push_text("。。")  # 尾部纯标点残句
+        s.end_input()
+        async for _ev in s:
+            pass
+
+    asyncio.run(asyncio.wait_for(run(), timeout=10))
+    assert [p["input"] for p in posts] == ["好。"], [p["input"] for p in posts]
+
+
+# ---- P4-A 回归:单任务爆段护栏(音频时长到顶即断流,唔再读剩余 body) ----
+
+
+def test_qwen3_post_frames_caps_burst_audio(monkeypatch):
+    """TTS 对异常输入连环合成 20-30s 爆段(P4 实测 1MB+):护栏到顶断流、唔重试。
+
+    爆段霸住 playout 会把下一轮回复压喺官方语音队列后面——en 轮「LLM 挂死」
+    嘅根因链最后一环。护栏保证单任务音频有上界。
+    """
+    import agent_runtime.providers.livekit_plugins as lk
+
+    monkeypatch.setenv("QWEN3_TTS_MAX_TASK_AUDIO_SEC", "1")  # 24000Hz*1s*2 = 48000B
+    attempts = {"n": 0}
+    sent = {"bytes": 0}
+
+    class _BurstResp:
+        def raise_for_status(self):
+            pass
+
+        async def aiter_bytes(self):
+            # 模拟 sidecar 连环 hallucinate:共 96KB(=2s)音频分 16KB 吐出。
+            while sent["bytes"] < 96000:
+                sent["bytes"] += 16000
+                yield b"\x01\x02" * 8000
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json=None):
+            attempts["n"] += 1
+            return _BurstResp()
+
+    monkeypatch.setattr(
+        lk, "httpx", SimpleNamespace(AsyncClient=lambda **kw: _FakeClient())
+    )
+
+    tts = _make_tts()  # sample_rate=24000
+    em = _CountingEmitter()
+    state = {"started": False}
+
+    async def run():
+        return await lk._qwen3_tts_post_frames(tts, "你好", em, state)
+
+    ok = asyncio.run(asyncio.wait_for(run(), timeout=10))
+    assert ok is False, "爆段护栏触发要判失败(上层 broken 停后续任务)"
+    assert attempts["n"] == 1, "护栏断流已有音频落地,绝唔重试重读"
+    cap_bytes = tts.sample_rate * 1 * 2
+    assert cap_bytes <= em.bytes_pushed <= cap_bytes + 16000, em.bytes_pushed
