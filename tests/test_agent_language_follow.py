@@ -230,13 +230,13 @@ def test_render_split_prefix_has_instructions_tail_has_reference():
     ctx.add_summary("user", "客户第一轮说了内容")
     prefix = ctx.render_instruction_prefix()
     tail = ctx.render_context_tail()
-    # 稳定指令(用户语言/节奏/准则/话术/当前步)全在前缀
-    for sec in ("【用户语言】", "【回复节奏】", "【应答准则】", "【话术流程总览", "【现在这一步】"):
+    # 稳定指令(用户语言/节奏/准则/话术总览)全在前缀;当前步已移出前缀(推进只改尾部)
+    for sec in ("【用户语言】", "【回复节奏】", "【应答准则】", "【话术流程总览"):
         assert sec in prefix, sec
-    # 易变参考(知识/联网/记忆)全在尾部
-    for sec in ("【实时检索到的资料", "【联网检索到的资料", "【本通对话记忆】"):
+    assert "【现在这一步】" not in prefix
+    # 易变参考(当前步/知识/联网/记忆)全在尾部,当前步放尾部最前
+    for sec in ("【现在这一步】", "【实时检索到的资料", "【联网检索到的资料", "【本通对话记忆】"):
         assert sec in tail, sec
-    assert "【现在这一步】" not in tail
     # 完整段 = 前缀在前 拼接 尾部
     full = ctx.render_system_message()
     assert full.startswith(prefix) and full.endswith(tail)

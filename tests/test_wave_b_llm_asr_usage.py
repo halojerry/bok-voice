@@ -40,7 +40,11 @@ def _load_sidecar_app():
 
 # ---- LLM：官方 openai 内芯 + KV-cache 包装层回归 ----
 def test_context_aware_llm_keeps_byte_stable_prefix():
-    """换官方内芯后,ContextAwareLLM 的前缀重组必须保持(指令+流程步注入,逐轮稳定)。"""
+    """换官方内芯后,ContextAwareLLM 的前缀重组必须保持,且步骤推进不动前缀。
+
+    KV-cache 不变量:前缀(指令+话术总览)整场字节不变——flow 推进只改尾部
+    (当前步在尾部最前),否则 token0 起整段重 prefill(实测卡 3-5s)。
+    """
     from livekit.agents import llm as agents_llm
 
     from agent_runtime.providers.livekit_plugins import ContextAwareLLM, ContextState
@@ -71,11 +75,33 @@ def test_context_aware_llm_keeps_byte_stable_prefix():
 
     for call in inner.calls:
         system = call[0][1]
-        # 用户语言指令(粤语客服锚定讲粤语) + 流程当前步都进了稳定前缀。
+        # 用户语言指令(粤语客服锚定讲粤语) + 流程当前步(经尾部)都进了合并 system。
         assert "粤语" in system or "cantonese" in system, system[:80]
         assert "开场确认" in system, system[:80]
     # 前缀系统段不被历史轮次污染(两轮第一段都是 system 注入)。
     assert inner.calls[0][0][0] == "system" and inner.calls[1][0][0] == "system"
+
+    # 步骤推进 → 换当前步文本,稳定前缀必须字节不变(否则 KV-cache 前缀整段断裂)。
+    prefix_before = ctx_state.render_instruction_prefix()
+    assert "【话术流程总览" in prefix_before and "【现在这一步】" not in prefix_before
+    ctx_state.set_flow_current("第 2 步：核实订单资料")
+    assert ctx_state.render_instruction_prefix() == prefix_before, \
+        "步骤推进改变了稳定指令前缀(mlx 前缀断裂 → 整段重 prefill)"
+
+    # 当前步文本落在易变尾部最前(带原【现在这一步】标签)。
+    tail = ctx_state.render_context_tail()
+    assert "【现在这一步】" in tail and "核实订单资料" in tail, tail[:120]
+    # 状态不变时尾部逐轮确定性:同状态两次渲染逐字节一致。
+    assert ctx_state.render_context_tail() == tail
+
+    # 推进后的新步经尾部进合并 system,且前缀段(【话术流程总览)仍在最前。
+    chat_ctx.add_message(role="assistant", content="好的,请提供订单号")
+    chat_ctx.add_message(role="user", content="单号一二三四")
+    llm.chat(chat_ctx=chat_ctx)
+    system3 = inner.calls[2][0][1]
+    assert "核实订单资料" in system3, system3[:120]
+    assert "话术总览" in system3
+    assert system3.index("【话术流程总览") < system3.index("【现在这一步】")
 
 
 def test_mlx_llm_uses_official_openai_core():

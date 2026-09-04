@@ -22,6 +22,8 @@ cd services/realtime-translation && npm ci && npm test   # B-line Node tests
 cd desktop/src-tauri && cargo test      # Rust shell tests
 python tools/bok.py serve               # start the full local stack
 python tools/bok.py status | down | doctor --packaged
+python tools/bok.py prod install        # generate launchd plist units (KeepAlive auto-restart)
+python tools/bok.py prod status         # official health surface (server GET / + worker :8081/worker)
 E2E_ONLY=cantonese .venv312/bin/python scripts/e2e_trilingual_livekit.py  # A-line E2E
 cd apps/web && npm run build            # static web export
 cd desktop && npx tauri build --bundles app   # macOS bundle
@@ -43,8 +45,9 @@ cd desktop && npx tauri build --bundles app   # macOS bundle
 
 ## Architecture Boundaries & Runtime Rules
 
+- **官方契约优先**：除知识库/对象/话术业务域 + 本地模型插件 + B 线双栏字幕 + Tauri 设备层外，全部对齐 LiveKit 官方栈（详见 `docs/DEV_TOOLS.md` + `AGENT.md` 决策记录）。查官方用 docs MCP `https://docs.livekit.io/mcp`（免费无 key）。**别重造官方轮子**（LLM 客户端/转写落库/崩溃补位等先查官方姿势）。
 - **话术分步推进**：`apps/agent/agent_runtime/flow.py` 的 `FlowController` 是唯一推进引擎（`detect_whatsapp_signal`/`should_auto_advance`/`decide_advance`/judge）。agent 每轮 `on_user_turn_completed`：语言锚定 → WhatsApp detect → rule_verdict+auto_advance → 模糊轮背景 LLM judge（fire-and-forget，`_judge_inflight` 防叠）。改动推进逻辑先读 `tests/test_flow_controller.py`。
-- **LLM system 顺序（KV-cache 关键，勿打乱）**：`ContextState.render_instruction_prefix()`（稳定指令：用户语言规则/回复节奏/应答准则/话术总览/当前步）+ 人设 base（`_instructions`+facts）在前，`render_context_tail()`（每轮变的知识/联网/记忆）垫最后 → token0 前缀逐轮字节不变，命中 mlx_lm prompt KV-cache。**不要把会变的检索段插进稳定段中间**（前缀一断整段重 prefill）。
+- **LLM system 顺序（KV-cache 关键，勿打乱）**：`ContextState.render_instruction_prefix()`（稳定指令：用户语言规则/回复节奏/应答准则/话术总览）+ 人设 base（`_instructions`+facts）在前，`render_context_tail()`（每轮变的当前步/知识/联网/记忆）垫最后 → token0 前缀逐轮字节不变（步骤推进只改尾部），命中 mlx_lm prompt KV-cache。**不要把会变的检索段/当前步插进稳定段中间**（前缀一断整段重 prefill）。
 - **RAG 门控**：绑了分步话术（`flow_ctrl.has_steps`）的封闭流程默认**不做知识库/联网检索**（单对象只上话术），`_context_rag_enabled()` 判定；`CONTEXT_RAG=1` 强制开。
 - **VAD/endpointing 基线不可压缩**：`min_silence=0.45` / endpointing `min_delay=0.35`/`max_delay=1.2` / `min_speech=0.15`。离线式 ASR 从停嘴到转写回来需 ~0.5-1.2s，端点判定太紧会让轮次在转写返回前提交 → 回复被丢、agent 哑火（曾为此回滚）。真降延迟走 ASR 本身/流式 partial（见下），勿压端点判定。改这三处默认值要同步 agent 环境默认 + `repository.default_settings` + web `EMPTY_FORM`。
 - **打断 = 官方误打断自愈组合**：`interruption.min_duration=0.6` + `resume_false_interruption=True` + `false_interruption_timeout=1.0`（真插话 0.6s 让位；1s 内无转写=噪声误打断，AI 自动从暂停处续讲）。旧 1.2s 高门槛已废（压住真插话）。`INTERRUPT_MIN_DURATION`/`RESUME_FALSE_INTERRUPTION`/`FALSE_INTERRUPTION_TIMEOUT` env 可回退。
@@ -55,6 +58,7 @@ cd desktop && npx tauri build --bundles app   # macOS bundle
 
 - Python: pytest `tests/test_*.py` (`test_*` functions); Node: `node --test` under `services/realtime-translation/test`.
 - 改完 Python 跑 `python -m compileall -q apps packages services tools scripts`；web 改动跑 `cd apps/web && npx tsc --noEmit && npm run build`。
+- **术语门禁**：`tests/test_cantonese_terminology.py` 是全仓测试的一部分（新增 `yue` 字面量即失败）。
 - E2E needs the running stack and local models. **Never fake-green**: A-line E2E must use the real `/api/token` (`E2E_SELF_TOKEN=1` is debug-only).
 - Merge gate: pytest, `npm test`, `cargo test`, and `scripts/verify_bundle.sh` (`--staging`, `--app`, `--doctor`, one mode per run) all green; `doctor --packaged` must report `token endpoint: ok (real JWT)`.
 

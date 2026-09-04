@@ -520,10 +520,10 @@ class ContextState:
     def render_instruction_prefix(self) -> str:
         """【稳定指令前缀】——放最前、紧贴人设 base。
 
-        含：用户语言规则 / 回复节奏 / 应答准则 / 话术流程总览(整通不变) /
-        现在这一步(同一步内不变,flow 推进才变)。这些是模型要遵守的指令，
-        逐轮字节尽量稳定 → token0 起的公共前缀跨轮命中 mlx_lm KV-cache
-        （同人设/模板/语言时跨 call 也共享）；真正每轮变的检索资料/记忆放尾部。
+        含：用户语言规则 / 回复节奏 / 应答准则 / 话术流程总览(整通不变)。
+        不变量：前缀整场字节不变（步骤推进只改尾部）→ mlx KV-cache 整场命中；
+        当前步约束已移到尾部（推进若改前缀,token0 起整段重 prefill,实测卡 3-5s）。
+        真正每轮变的当前步/检索资料/记忆都放 render_context_tail()。
         """
         parts: list[str] = []
         if self._user_lang:
@@ -559,17 +559,19 @@ class ContextState:
         )
         if self._flow_overview:
             parts.append("【话术流程总览(别照读,按进度推进)】\n" + self._flow_overview)
-        if self._flow_current:
-            parts.append("【现在这一步】\n" + self._flow_current)
         return "\n\n".join(parts)
 
     def render_context_tail(self) -> str:
-        """【易变参考尾部】——每轮变的检索资料/记忆，垫在 system 最末。
+        """【易变参考尾部】——每轮变的当前步/检索资料/记忆，垫在 system 最末。
 
-        这样稳定前缀(指令+话术+当前步) + 人设 base 在前且逐轮字节不变，
-        每轮只需 prefill 尾部的新知识/新记忆；其余吃 KV-cache。
+        前缀(稳定指令+话术总览)+人设 base 在前且整场字节不变，flow 步骤推进
+        只改这段尾部（短、逐轮重渲染）→ 前缀 KV-cache 照命中，每轮只 prefill
+        尾部增量。当前步放尾部最前，让「推进=换一小段尾部」而非动前缀。
         """
         parts: list[str] = []
+        if self._flow_current:
+            # 当前步约束(随 flow 推进而变):放尾部最前,推进只改这里、前缀字节不动。
+            parts.append("【现在这一步】\n" + self._flow_current)
         if self._snippets:
             parts.append("【实时检索到的资料（知识库）】\n" + "\n".join(f"- {s}" for s in self._snippets))
         if self._web:
@@ -645,7 +647,7 @@ class ContextAwareLLM(llm.LLM):
     ):
         if self._ctx is not None:
             # 重组 system 顺序：稳定指令前缀 + 人设 base + 易变参考尾部。
-            # 目的：让 token0 起的公共前缀(指令+话术+当前步+人设)逐轮字节不变，
+            # 目的：让 token0 起的公共前缀(指令+话术总览+人设)逐轮字节不变，当前步语境在尾部，
             # 命中 mlx_lm prompt KV-cache，每轮只 prefill 尾部新知识/记忆。
             # （若把每轮变的检索资料插在中间，前缀每轮断裂 → 整段重 prefill。）
             prefix = self._ctx.render_instruction_prefix()
