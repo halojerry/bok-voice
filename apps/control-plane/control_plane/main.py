@@ -428,13 +428,49 @@ def token(req: TokenRequest) -> TokenResponse:
     import datetime
     from livekit import api
 
+    # 同传(B 线 v2)双端角色:me=我方端(通常也是房间创建者),other=对方端;
+    # A 线沿用 operator。identity 前缀是 interpreter agent 判定"听谁的麦/译文给谁"的约定。
+    role = (req.role or "operator").strip().lower()
+    if role == "me":
+        identity, name = f"me-{room}", "Bok Interpret Me"
+    elif role == "other":
+        identity, name = f"other-{room}", "Bok Interpret Other"
+    else:
+        identity, name = f"operator-{req.account_id}-{room}", "Bok Voice Operator"
     at = (
         api.AccessToken(key, secret)
-        .with_identity(f"operator-{req.account_id}-{room}")
-        .with_name("Bok Voice Operator")
+        .with_identity(identity)
+        .with_name(name)
         .with_grants(api.VideoGrants(room_join=True, room=room, can_publish=True, can_subscribe=True, can_publish_data=True))
         .with_ttl(datetime.timedelta(seconds=3600))
     )
+    # 同传房间:我方端是创建者,token 里挂 RoomConfiguration 显式分发两个方向的
+    # interpreter agent(RoomAgentDispatch 只在首个参与者建房时生效,所以只挂 me 端)。
+    # metadata 携带方向与语言对,agent 侧照此锁定"听谁/译文给谁/讲哪种语言"。
+    if role == "me" and req.call_id:
+        try:
+            _call = _repo().get_call(req.call_id) or {}
+        except Exception:
+            _call = {}
+        if str(_call.get("kind") or "") == "interpret":
+            src = (_call.get("language") or "zh").strip() or "zh"
+            tgt = (_call.get("target_lang") or "en").strip() or "en"
+            from livekit.api import RoomAgentDispatch, RoomConfiguration
+
+            at = at.with_room_config(
+                RoomConfiguration(
+                    agents=[
+                        RoomAgentDispatch(
+                            agent_name="bok-interp-fwd",
+                            metadata=json.dumps({"listen": "me-", "deliver": "other-", "source_lang": src, "target_lang": tgt}),
+                        ),
+                        RoomAgentDispatch(
+                            agent_name="bok-interp-rev",
+                            metadata=json.dumps({"listen": "other-", "deliver": "me-", "source_lang": tgt, "target_lang": src}),
+                        ),
+                    ]
+                )
+            )
     token = at.to_jwt()
     # When the operator connects an existing call, flip it to ACTIVE so the supervisor
     # "active calls" view reflects the real live room.
@@ -469,6 +505,8 @@ def create_call(req: CreateCallRequest) -> dict:
         policy=policy,
         template_id=template_id,
         tts_reference_voice=req.tts_reference_voice,
+        kind=req.kind,
+        target_lang=req.target_lang,
     )
     return _repo().create_call(manifest)
 

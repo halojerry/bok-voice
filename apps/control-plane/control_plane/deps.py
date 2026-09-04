@@ -107,6 +107,18 @@ def build_engine() -> Engine | None:
                     "customer_whatsapp",
                     "customer_whatsapp VARCHAR(64) DEFAULT ''",
                 )
+                _ensure_column(
+                    conn,
+                    "call_sessions",
+                    "kind",
+                    "kind VARCHAR(32) DEFAULT ''",
+                )
+                _ensure_column(
+                    conn,
+                    "call_sessions",
+                    "target_lang",
+                    "target_lang VARCHAR(16) DEFAULT ''",
+                )
         except Exception as exc:  # pragma: no cover - sqlite / duplicate column
             print(f"[deps] idempotent column migration skipped: {exc}")
 

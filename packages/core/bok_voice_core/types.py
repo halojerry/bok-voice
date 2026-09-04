@@ -59,6 +59,10 @@ class SessionManifest:
     policy: str = "offline_first"
     tts_reference_voice: str = ""
     template_id: str = ""
+    # 会话种类:""=客服通话(A 线) / interpret=双端同传(B 线 v2,LiveKit 双 agent)。
+    # target_lang 只在 interpret 会话有值:language=我方语言,target_lang=对方语言。
+    kind: str = ""
+    target_lang: str = ""
 
 
 @dataclass

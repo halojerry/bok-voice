@@ -11,6 +11,9 @@ class TokenRequest(BaseModel):
     account_id: str = "acc-001"
     object_id: str = ""
     call_id: str = ""
+    # 参与者角色:operator(默认,客服操作端) / me(同传我方端,创建房间并挂 agent 分发) /
+    # other(同传对方端)。identity 分别为 operator-*/me-*/other-*。
+    role: str = "operator"
 
 
 class TokenResponse(BaseModel):
@@ -21,12 +24,16 @@ class TokenResponse(BaseModel):
 
 class CreateCallRequest(BaseModel):
     account_id: str
-    object_id: str
+    # 同传会话(kind=interpret)没有客服对象,允许空。
+    object_id: str = ""
     persona_id: str = ""
     mode: CallMode = CallMode.SIMULATION
     direction: str = "webrtc"
     language: str = "zh"
     tts_reference_voice: str = ""
+    # 会话种类:""=客服通话 / interpret=双端同传(B 线 v2)。target_lang=对方语言。
+    kind: str = ""
+    target_lang: str = ""
 
 
 class CreateObjectRequest(BaseModel):

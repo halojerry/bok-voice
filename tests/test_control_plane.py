@@ -132,6 +132,49 @@ def test_control_plane_flow():
         assert "summary" in settled  # settle 结果应携带总结正文（无 LLM 时回退纯指标摘要）
 
 
+def test_interpret_session_token_roles_and_dispatch():
+    """同传会话(kind=interpret):me/other 角色签发对应 identity;me 端 token
+    挂 RoomAgentDispatch 显式分发两个方向的 interpreter;object_id 允许为空。"""
+    with TestClient(app) as client:
+        import json
+
+        import jwt
+
+        created = client.post(
+            "/api/calls",
+            json={
+                "account_id": "acc-001",
+                "object_id": "",
+                "kind": "interpret",
+                "mode": "live",
+                "direction": "interpret",
+                "language": "zh",
+                "target_lang": "en",
+            },
+        ).json()
+        assert created["kind"] == "interpret" and created["target_lang"] == "en"
+        room = created["id"]
+
+        me = client.post("/api/token", json={"account_id": "acc-001", "call_id": room, "role": "me"}).json()
+        other = client.post("/api/token", json={"account_id": "acc-001", "call_id": room, "role": "other"}).json()
+        me_claims = jwt.decode(me["token"], options={"verify_signature": False})
+        other_claims = jwt.decode(other["token"], options={"verify_signature": False})
+        assert me_claims["sub"] == f"me-{room}"
+        assert other_claims["sub"] == f"other-{room}"
+
+        # me 端(房间创建者)token 携带 agent 分发:两方向 + 语言对 metadata。
+        room_config = me_claims.get("roomConfig") or me_claims.get("room_config") or {}
+        agents = room_config.get("agents") or []
+        names = {a.get("agentName") or a.get("agent_name") for a in agents}
+        assert {"bok-interp-fwd", "bok-interp-rev"} <= names
+        metas = [json.loads(a.get("metadata") or "{}") for a in agents]
+        fwd = next(m for m in metas if m.get("listen") == "me-")
+        assert fwd["deliver"] == "other-" and fwd["source_lang"] == "zh" and fwd["target_lang"] == "en"
+
+        # 对方端 token 不挂 agent 分发(只有首个建房者生效)。
+        assert not (other_claims.get("roomConfig") or other_claims.get("room_config"))
+
+
 def test_token_requires_livekit_credentials(monkeypatch):
     """缺少 LiveKit 凭据时必须显式 503，绝不能回退 sha256 假 token。"""
     from control_plane import main as m
