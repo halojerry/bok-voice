@@ -304,10 +304,10 @@ def _looks_like_whatsapp_step(goal: str, ref: str) -> bool:
 
 
 def _valid_digit_runs(norm: str) -> list[str]:
-    """攞 7–13 位数字串。8 位=香港手機號常態;7 位容錯 ASR 少聽一位/口誤短號
-    (真實 case:「我WhatsApp是六四三二五四三」7位曾因 <8 走漏→不爆閃、重複追問)。
-    短過7(單號尾4)唔算,長過13(成串乱码)唔算。"""
-    return [r for r in re.findall(r"[0-9]{7,13}", norm)]
+    """攞 6–13 位数字串(WhatsApp 號碼長度唔固定:香港8位/內地11位/帶區號13位;
+    6位容錯 ASR 少聽多位/口誤短號,真實 case「我WhatsApp是六四三二五四三」曾因長度走漏)。
+    短過6(單號尾4等)唔算,長過13(成串乱码)唔算;已知單號/電話另有 known-number 過濾兜底。"""
+    return [r for r in re.findall(r"[0-9]{6,13}", norm)]
 
 
 def _run_is_known_number(run: str, facts: dict | None) -> bool:
@@ -333,9 +333,10 @@ def detect_whatsapp_signal(
 ) -> tuple[str, str] | None:
     """偵測客戶係咪俾出 WhatsApp。返回 ("captured", 號碼) | ("captured_implicit", "") | ("offered", "") | None。
 
-    - captured:客戶讀出 7–13 位號碼(7位容錯 ASR 少聽一位/口誤短號),且①當前步係引導辦理
-      (問WhatsApp)或②句中明顯提 whatsapp/微信/俾號/加我;或③明確自報「我WhatsApp(就)係 XXXX」
-      (撞已知電話/單號都算)。號碼若命中已知 單號/尾號/電話 則唔當(覆述已知資料)。
+    - captured:客戶讀出 6–13 位號碼(長度唔固定:港8/內地11/帶區號13;6位容錯 ASR 少聽),
+      且①當前步係引導辦理(問WhatsApp)或②句中明顯提 whatsapp/微信/俾號/加我;或③明確自報
+      「我WhatsApp(就)係 XXXX」(撞已知電話/單號都算)。號碼若命中已知 單號/尾號/電話 則唔當
+      (覆述已知資料)。
     - captured_implicit:WhatsApp 步客戶話號碼綁定「呢個來電/呢個號碼」(號喺系統度)——
       唔使讀出 8-13 位;caller 攞對象電話上報 captured。防死鎖:唔會因號碼俾 ASR
       聽亂 / 撞單號就永遠入唔到 captured、AI 無限重複要號。

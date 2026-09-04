@@ -1094,12 +1094,12 @@ async def entrypoint(ctx):
         await session.generate_reply(instructions=greetings.get(greet_lang, greetings["zh"]))
         _log_stage("greeting_queued")
 
-    # ---- 沉默心跳(真实电话节奏):AI 講完轉回「聆聽」後 SILENCE_NUDGE_SECONDS(默認7s)
+    # ---- 沉默心跳(真实电话节奏):AI 講完轉回「聆聽」後 SILENCE_NUDGE_SECONDS(默認3.5s)
     # 客戶冇出聲 → 一句「仲喺度嗎」帶返當前步;兩次都冇回應 → 禮貌收尾並自動收線
-    # (disposition=no_response,總靜音 ~7+7+12≈26s)。客戶出聲即撤錶歸零;
+    # (disposition=no_response,總靜音 ~3.5+3.5+12≈19s)。客戶出聲即撤錶歸零;
     # 收尾態/流程走完/暫停中唔追。SILENCE_NUDGE_MAX=0 關閉。
     nudge_max = int(os.environ.get("SILENCE_NUDGE_MAX", "2"))
-    nudge_delay = float(os.environ.get("SILENCE_NUDGE_SECONDS", "7"))
+    nudge_delay = float(os.environ.get("SILENCE_NUDGE_SECONDS", "3.5"))
     _nudge_state["farewell"] = False
 
     def _disarm_silence() -> None:
