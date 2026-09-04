@@ -150,5 +150,5 @@
   - control-plane 每请求独立 SQLAlchemy Session（原来共享 Session 并发踩踏 → 全部 500）；`create_turn` 幂等（并发同 turn_id 冲突回滚返回已存在行）。
   - Silero VAD `max_buffered_speech` 调至 15s（env 可改），假音频补前后静音。
 - 🟡 供应商插件化（Phase 5，已评估/暂缓）：社区 `livekit-plugins-volcengine` 依赖 `livekit-agents<1.7`，与本项目 1.7.1 冲突，**暂不替换**自研 VolcanoTTS（Path B 已让 mood 生效，不依赖它）；MiniMax 官方插件（`livekit-plugins-minimax-ai`）、阿里社区插件（`livekit-plugins-aliyun`）按需再接；智谱 GLM-Realtime 自研包装（照 livekit-plugins-openai 模板）留作专项。
-- ⏳ 未来：Tailwind v4 → `AgentSessionView_01`/`AgentChatTranscript`（官方聊天组件 v4-only）；SIP（livekit/sip）；硬件（Portal/ESP32）；`reports`/`settings` 真实数据。
+- ⏳ 未来：Tailwind v4 → `AgentSessionView_01`/`AgentChatTranscript`（官方聊天组件 v4-only）。**已探明（2026-09-04）**：registry 依赖闭包除 `@agents-ui/*` 外还需 `@/components/ui/{button,toggle,bubble,marker,message-scroller}`（这些**不在 shadcn 主 registry**，`npx shadcn add` 会 404）——迁移 v4 时需一并自建这些 ui 原语或升级 shadcn 基础件；`AgentTrackControl` 的设备选择不覆盖 Tauri 原生输出（`lib/audio.ts` 永久自研）。SIP（livekit/sip）；硬件（Portal/ESP32）；`reports`/`settings` 真实数据。
 - ✅ 已解决（2026-08-30）：`scripts/rebuild_images_offline.sh` 从现有镜像派生本地基础镜像后离线重建 agent/web/control-plane，Docker 化全链路恢复；`docker compose up -d --force-recreate agent web control-plane` 后 zh E2E 1/1 PASSED。Dockerfile 增加 `ARG BASE_IMAGE` 支持离线构建。镜像源正常时仍可直接 `docker compose up -d --build`。

@@ -170,6 +170,8 @@ export default function InterpretPage() {
       setBusy(true);
       try {
         if (micId) await session.room.switchActiveDevice("audioinput", micId, false).catch(() => {});
+        // 连接前预缓冲：建房/agent join 需 1-2s,此时对方可能已开口,缓冲防「吃头字」。
+        await session.room.localParticipant.setMicrophoneEnabled(true, undefined, { preConnectBuffer: true }).catch(() => {});
         await session.start({ tracks: { microphone: { enabled: true } } });
         try {
           await session.room.localParticipant.setMicrophoneEnabled(true);

@@ -617,6 +617,10 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
         if (isTauriShell()) await applyOutputDevice(outputDeviceId).catch(() => {});
         else if (webCanSwitchOutput()) await switchWebOutputDevice(session.room, outputDeviceId).catch(() => {});
       }
+      // 连接前预缓冲：建房/agent join 需 1-2s，用户此时可能已开口（喂你好），
+      // preConnectBuffer 把这段采集缓冲在连接后回放给 agent，避免「接通吃头字」。
+      // （agent 侧 1.7.1 的 pre_connect_audio 默认已开。）
+      await session.room.localParticipant.setMicrophoneEnabled(true, undefined, { preConnectBuffer: true }).catch(() => {});
       await session.start({ tracks: { microphone: { enabled: true } } });
       // 确保本地麦克风真正发布：session.start 的 tracks 选项在部分 livekit 版本不生效，
       // 显式 setMicrophoneEnabled 才可靠（否则 agent 收不到用户声音 → 对话"没输入"）。
