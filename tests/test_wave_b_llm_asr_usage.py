@@ -42,8 +42,10 @@ def _load_sidecar_app():
 def test_context_aware_llm_keeps_byte_stable_prefix():
     """换官方内芯后,ContextAwareLLM 的前缀重组必须保持,且步骤推进不动前缀。
 
-    KV-cache 不变量:前缀(指令+话术总览)整场字节不变——flow 推进只改尾部
-    (当前步在尾部最前),否则 token0 起整段重 prefill(实测卡 3-5s)。
+    KV-cache 不变量(mlx_lm 0.31.3 实测):只有已缓存序列是新请求的严格前缀才复用
+    ——历史每轮在尾部增长,易变内容若在 system 里,下一轮请求即在 system 处与
+    缓存分叉(cached_tokens=0,每轮 TTFT ~2s)。故 system 只留整场静态段,
+    易变尾部(当前步/知识/记忆)拼到最后一条 user 消息,序列纯追加。
     """
     from livekit.agents import llm as agents_llm
 
@@ -75,9 +77,15 @@ def test_context_aware_llm_keeps_byte_stable_prefix():
 
     for call in inner.calls:
         system = call[0][1]
-        # 用户语言指令(粤语客服锚定讲粤语) + 流程当前步(经尾部)都进了合并 system。
+        # system 只留整场静态段:用户语言指令(粤语客服锚定)+ 话术总览进合并 system;
+        # 易变当前步【不】在 system(否则下一轮请求在 system 处与缓存分叉)。
         assert "粤语" in system or "cantonese" in system, system[:80]
-        assert "开场确认" in system, system[:80]
+        assert "话术总览" in system, system[:80]
+        assert "【现在这一步】" not in system, system[:120]
+        # 易变尾部(含当前步)拼在最后一条 user 消息上(请求副本)。
+        last_role, last_text = call[-1]
+        assert last_role == "user", last_role
+        assert "【现在这一步】" in last_text and "开场确认" in last_text, last_text[:120]
     # 前缀系统段不被历史轮次污染(两轮第一段都是 system 注入)。
     assert inner.calls[0][0][0] == "system" and inner.calls[1][0][0] == "system"
 
@@ -94,14 +102,15 @@ def test_context_aware_llm_keeps_byte_stable_prefix():
     # 状态不变时尾部逐轮确定性:同状态两次渲染逐字节一致。
     assert ctx_state.render_context_tail() == tail
 
-    # 推进后的新步经尾部进合并 system,且前缀段(【话术流程总览)仍在最前。
+    # 推进后的新步经尾部进最后一条 user 消息;system 保持静态且总览仍在。
     chat_ctx.add_message(role="assistant", content="好的,请提供订单号")
     chat_ctx.add_message(role="user", content="单号一二三四")
     llm.chat(chat_ctx=chat_ctx)
     system3 = inner.calls[2][0][1]
-    assert "核实订单资料" in system3, system3[:120]
+    assert "核实订单资料" not in system3, system3[:120]
     assert "话术总览" in system3
-    assert system3.index("【话术流程总览") < system3.index("【现在这一步】")
+    last3_role, last3_text = inner.calls[2][-1]
+    assert last3_role == "user" and "核实订单资料" in last3_text, last3_text[:120]
 
 
 def test_mlx_llm_uses_official_openai_core():

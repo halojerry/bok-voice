@@ -646,10 +646,12 @@ class ContextAwareLLM(llm.LLM):
         extra_kwargs=None,
     ):
         if self._ctx is not None:
-            # 重组 system 顺序：稳定指令前缀 + 人设 base + 易变参考尾部。
-            # 目的：让 token0 起的公共前缀(指令+话术总览+人设)逐轮字节不变，当前步语境在尾部，
-            # 命中 mlx_lm prompt KV-cache，每轮只 prefill 尾部新知识/记忆。
-            # （若把每轮变的检索资料插在中间，前缀每轮断裂 → 整段重 prefill。）
+            # KV-cache 命中规律(mlx_lm 0.31.3 LRUPromptCache 实测):只有「已缓存序列是
+            # 新请求的严格前缀」才复用——历史每轮在尾部增长,所以易变内容若放在 system
+            # 里(哪怕垫最后),下一轮请求就会在 system 处与缓存分叉 → common_prefix 再长
+            # 也不命中(cached_tokens=0,实测每轮 TTFT ~2s)。唯一可行位=把易变尾部拼到
+            # 【最后一条 user 消息】后面:序列变纯追加式,上一轮请求永远是下一轮的前缀。
+            # system 只留整场静态段(指令前缀+人设),逐轮字节不变。
             prefix = self._ctx.render_instruction_prefix()
             tail = self._ctx.render_context_tail()
             if prefix or tail:
@@ -658,12 +660,24 @@ class ContextAwareLLM(llm.LLM):
                 if items and isinstance(items[0], llm.ChatMessage) and items[0].role == "system":
                     head = items[0].content
                     if isinstance(head, str):
-                        merged = _join_system(prefix, head, tail)
+                        merged = _join_system(prefix, head, "")
                     else:
-                        merged = [*([prefix] if prefix else []), *head, *([tail] if tail else [])]
+                        merged = [*([prefix] if prefix else []), *head]
                     items[0] = llm.ChatMessage(role="system", content=merged)
                 else:
-                    items.insert(0, llm.ChatMessage(role="system", content=_join_system(prefix, "", tail)))
+                    items.insert(0, llm.ChatMessage(role="system", content=_join_system(prefix, "", "")))
+                # 易变尾部(当前步/知识/记忆)拼到最后一条 user 消息尾部(仅请求副本,
+                # 不落库——下一轮 chat_ctx 仍由框架持久历史 + 重新渲染组装)。
+                if tail:
+                    for j in range(len(items) - 1, -1, -1):
+                        if getattr(items[j], "role", "") == "user":
+                            content = items[j].content
+                            if isinstance(content, str):
+                                new_content = f"{content}\n\n{tail}" if content else tail
+                            else:
+                                new_content = [*content, tail]
+                            items[j] = llm.ChatMessage(role="user", content=new_content)
+                            break
                 # 截断历史:保留最近 N 轮(默认 4 对),更早的靠「本通对话记忆」摘要兜底。
                 # 每轮全量历史会让 prefill 随轮次线性变慢(实测 12 轮 TTFT 2.4s);
                 # 截断让上下文有上界,TTFT 稳定。
