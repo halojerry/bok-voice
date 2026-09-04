@@ -229,6 +229,28 @@ def _sticky_reply_language(anchor: str, asr_lang: str, cur_sticky: str, cur_stre
     return anchor, anchor, 0
 
 
+def _nudge_instruction(name: str, lang: str) -> str:
+    """沉默心跳的生成指令:一句亲切确认「仲喺度嗎」,带返当前步话题,唔重复长内容。"""
+    who = f"{name}，" if name else ""
+    if lang == "cantonese":
+        return (
+            f"【沉默心跳】客户已经一段时间没有出声。现在只讲一句(最多两句)简短亲切的确认，"
+            f"例如「{who}你仲喺度嗎？我哋繼續睇下呢一步」，然后自然把话题带回当前这一步等客户回应；"
+            "绝不重复之前讲过的完整内容，绝不自问自答，一句讲完就停。"
+        )
+    if lang == "en":
+        return (
+            f"【沉默心跳】The customer has been silent for a while. Say ONE short friendly check-in "
+            f"(e.g. \"{name or 'Hello'}, are you still there?\"), then gently bring the topic back to the "
+            "current step and wait. Never repeat previous content, never answer for the customer, one line only."
+        )
+    return (
+        f"【沉默心跳】客户已经一段时间没有出声。现在只讲一句(最多两句)简短亲切的确认，"
+        f"例如「{who}您还在吗？咱们继续看这一步」，然后自然把话题带回当前这一步等客户回应；"
+        "绝不重复之前讲过的完整内容，绝不自问自答，一句讲完就停。"
+    )
+
+
 def _normalize_lang(raw, default: str = "") -> str:
     """把对象/人设里的语言值归一为 zh/cantonese/en。vi 等未支持语言回落到 default。
 
@@ -493,6 +515,9 @@ async def entrypoint(ctx):
     _wa_reported: set[str] = set()
     # 背景 flow judge 防疊:記錄而家 judge 緊邊一步(-1=冇)。推進唔可以同時兩個 judge。
     _judge_inflight: dict = {"step": -1}
+    # 沉默心跳:AI 講完話客戶耐冇出聲 → 主動確認「仲喺度嗎」並帶返當前步。
+    # count 會喺客戶真開口(on_user_turn_completed)時歸零。
+    _nudge_state: dict = {"count": 0, "timer": None}
     from .plugins.emotion import EmotionState
 
     emotion_state = EmotionState()
@@ -878,6 +903,9 @@ async def entrypoint(ctx):
             self.paused = False
 
         async def on_user_turn_completed(self, turn_ctx, new_message):
+            # 客戶真開口 → 沉默心跳計數歸零(之後再沉默先重新計 2 次)。
+            _nudge_state["count"] = 0
+            _disarm_silence()
             # 同步注入用户语言：on_user_turn_completed 在自动回复生成【之前】被调用，
             # 此时 ASR 已把 language_state 更新为本轮语言。若只挂在 conversation_item_added
             # 事件上，会晚于 LLM 请求发出（竞态）→ 模型收不到本轮粤语指令而回普通话。
@@ -1045,6 +1073,59 @@ async def entrypoint(ctx):
         greetings = {"zh": "请问有什么可以帮您？", "cantonese": "請問有咩可以幫到你？", "en": "How can I help you?"}
         await session.generate_reply(instructions=greetings.get(greet_lang, greetings["zh"]))
         _log_stage("greeting_queued")
+
+    # ---- 沉默心跳:AI 講完話轉回「聆聽」後開始計時,客戶 SILENCE_NUDGE_SECONDS 秒
+    # 冇任何出聲 → 主動一句「仲喺度嗎」帶返當前步(最多 SILENCE_NUDGE_MAX 次;
+    # 客戶真開口即歸零)。收尾態/流程走完/暫停中唔追。SILENCE_NUDGE_MAX=0 關閉。
+    nudge_max = int(os.environ.get("SILENCE_NUDGE_MAX", "2"))
+    nudge_delay = float(os.environ.get("SILENCE_NUDGE_SECONDS", "15"))
+
+    def _disarm_silence() -> None:
+        if _nudge_state["timer"]:
+            _nudge_state["timer"].cancel()
+            _nudge_state["timer"] = None
+
+    def _arm_silence() -> None:
+        if closed.is_set() or nudge_max <= 0 or agent.paused:
+            return
+        if flow_ctrl.closing or (flow_ctrl.has_steps and flow_ctrl.done):
+            return  # 拒絕收尾/流程已走完:唔追
+        _disarm_silence()
+
+        async def _fire() -> None:
+            try:
+                await asyncio.sleep(nudge_delay)
+            except asyncio.CancelledError:
+                return
+            if closed.is_set() or agent.paused or flow_ctrl.closing:
+                return
+            if _nudge_state["count"] >= nudge_max:
+                return
+            _nudge_state["count"] += 1
+            name = str((object_card or {}).get("display_name") or "").strip()
+            lang = language_state.lang if language_state.lang in ("zh", "cantonese", "en") else "zh"
+            print(f"[heartbeat] silent {nudge_delay:.0f}s -> nudge {_nudge_state['count']}/{nudge_max} (call {room_name})", flush=True)
+            try:
+                await session.generate_reply(instructions=_nudge_instruction(name, lang))
+            except Exception as exc:  # pragma: no cover - 心跳失敗唔阻通話
+                print(f"[heartbeat] nudge failed: {exc!r} (call {room_name})", flush=True)
+
+        _nudge_state["timer"] = asyncio.create_task(_fire())
+
+    def _on_agent_state(ev) -> None:
+        # AI 講完轉「聆聽」→ 起錶;講話/思考中 → 撤錶。
+        if getattr(ev, "new_state", "") == "listening":
+            _arm_silence()
+        else:
+            _disarm_silence()
+
+    def _on_user_state(ev) -> None:
+        if getattr(ev, "new_state", "") == "speaking":
+            _disarm_silence()
+
+    if nudge_max > 0:
+        session.on("agent_state_changed", _on_agent_state)
+        session.on("user_state_changed", _on_user_state)
 
     # session.start 只负责拉起流水线（返回后会话在后台运行）。保持 entrypoint
     # 存活直到房间关闭，supervisor watcher 在此期间持续轮询；_on_close 置位
