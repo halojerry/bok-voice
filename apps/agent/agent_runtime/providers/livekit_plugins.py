@@ -551,7 +551,10 @@ class ContextState:
                 + "不要生硬说查不到。"
             )
         if self._summary_lines:
-            parts.append("【本通对话记忆】\n" + "\n".join(self._summary_lines[-8:]))
+            # 只带最近几轮记忆(默认 3):每轮 prefill 只吃尾部增量,行数越多 TTFT 越长;
+            # 更早的上下文由原始历史截断(LLM_HISTORY_TURNS)与当前步约束兜底。
+            keep = max(1, int(os.environ.get("REPLY_MEMORY_LINES", "3")))
+            parts.append("【本通对话记忆】\n" + "\n".join(self._summary_lines[-keep:]))
         return "\n\n".join(parts)
 
     def _zh_rule(self) -> str:

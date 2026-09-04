@@ -830,6 +830,9 @@ async def entrypoint(ctx):
         唔會 double-advance:只喺 flow 仲喺 judge 嗰步(step_at)時先落 advance。
         """
         try:
+            # 让路节流:主回复刚提交,先等一拍再喺同一 mlx server(:1235)跑 judge——
+            # judge 与主回复抢 prefill 会推高本轮 TTFT;judge 判定本来就下一轮先生效,迟几秒冇损失。
+            await asyncio.sleep(float(os.environ.get("FLOW_JUDGE_DELAY", "3")))
             from .flow import build_judge_messages, parse_judge_output
 
             jbase = (
