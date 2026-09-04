@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 
 import httpx
-from livekit.agents import APIConnectOptions, llm, stt, tts, utils, vad
+from livekit.agents import APIConnectOptions, NOT_GIVEN, llm, stt, tts, utils, vad
 from livekit.plugins.openai import LLM as _OpenAICompatBase
 
 # 粤语特征字/词：Qwen3-ASR 对粤语偶发判成 Chinese（语言标签不稳），
@@ -303,6 +303,16 @@ class DeepSeekLLM(_OpenAICompatBase):
 _MT_PROMPT_NAMES = {"zh": "中文", "cantonese": "粤语", "en": "英语"}
 
 
+def _forward_extra_kwargs(extra_kwargs):
+    """包装层向内芯透传 extra_kwargs 的统一口径:非空 dict 原样,其余一律 NOT_GIVEN。
+
+    官方 openai 内芯(1.7.1)用 is_given(extra_kwargs) 判定,而 is_given(None)=True,
+    透传 None 会在内芯 extra.update(None) 处 TypeError——框架从不传 extra_kwargs,
+    包装层默认值必须给 NOT_GIVEN(与官方 chat 签名同契约),None 绝不进内芯。
+    """
+    return extra_kwargs if extra_kwargs else NOT_GIVEN
+
+
 def _mt_prompt(text: str, target_lang: str) -> str:
     """官方 Hy-MT2 中文翻译模板:只要译文,不解释。"""
     name = _MT_PROMPT_NAMES.get(target_lang, target_lang)
@@ -340,7 +350,7 @@ class StatelessMTLLM(llm.LLM):
         conn_options=None,
         parallel_tool_calls=None,
         tool_choice=None,
-        extra_kwargs=None,
+        extra_kwargs=NOT_GIVEN,
     ):
         last_user = ""
         for item in reversed(getattr(chat_ctx, "items", []) or []):
@@ -355,7 +365,7 @@ class StatelessMTLLM(llm.LLM):
                 conn_options=conn_options,
                 parallel_tool_calls=parallel_tool_calls,
                 tool_choice=tool_choice,
-                extra_kwargs=extra_kwargs,
+                extra_kwargs=_forward_extra_kwargs(extra_kwargs),
             )
         mt_ctx = llm.ChatContext()
         mt_ctx.add_message(role="user", content=_mt_prompt(last_user, self._target_lang))
@@ -365,7 +375,7 @@ class StatelessMTLLM(llm.LLM):
             conn_options=conn_options,
             parallel_tool_calls=parallel_tool_calls,
             tool_choice=tool_choice,
-            extra_kwargs=extra_kwargs,
+            extra_kwargs=_forward_extra_kwargs(extra_kwargs),
         )
 
     async def _prewarm_impl(self) -> None:
@@ -643,7 +653,7 @@ class ContextAwareLLM(llm.LLM):
         conn_options=None,
         parallel_tool_calls=None,
         tool_choice=None,
-        extra_kwargs=None,
+        extra_kwargs=NOT_GIVEN,
     ):
         if self._ctx is not None:
             # KV-cache 命中规律(mlx_lm 0.31.3 LRUPromptCache 实测):只有「已缓存序列是
@@ -691,7 +701,7 @@ class ContextAwareLLM(llm.LLM):
             conn_options=conn_options,
             parallel_tool_calls=parallel_tool_calls,
             tool_choice=tool_choice,
-            extra_kwargs=extra_kwargs,
+            extra_kwargs=_forward_extra_kwargs(extra_kwargs),
         )
 
 
@@ -738,7 +748,7 @@ class ExprAwareLLM(llm.LLM):
         self._emotion = EmotionProcessor()
         self._emotion_state = emotion_state
 
-    def chat(self, *, chat_ctx, tools=None, conn_options=None, parallel_tool_calls=None, tool_choice=None, extra_kwargs=None):
+    def chat(self, *, chat_ctx, tools=None, conn_options=None, parallel_tool_calls=None, tool_choice=None, extra_kwargs=NOT_GIVEN):
         last_user = ""
         for item in reversed(getattr(chat_ctx, "items", []) or []):
             if getattr(item, "role", None) == "user":
@@ -754,7 +764,7 @@ class ExprAwareLLM(llm.LLM):
             conn_options=conn_options,
             parallel_tool_calls=parallel_tool_calls,
             tool_choice=tool_choice,
-            extra_kwargs=extra_kwargs,
+            extra_kwargs=_forward_extra_kwargs(extra_kwargs),
         )
         return _ExprPrependStream(self, inner, tag)
 
@@ -2119,8 +2129,9 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                 elif event.type == vad.VADEventType.INFERENCE_DONE:
                     if not started or self._finishing:
                         continue
-                    for f in utils.merge_frames(event.frames):
-                        self._pending.extend(bytes(f.data))
+                    # 1.7 utils.merge_frames=rtc.combine_audio_frames:返回【单个】
+                    # rtc.AudioFrame(不可迭代,官方 StreamAdapter 同款用法)。
+                    self._pending.extend(bytes(utils.merge_frames(event.frames).data))
                     await self._maybe_partial()
                 elif event.type == vad.VADEventType.END_OF_SPEECH:
                     if not started:

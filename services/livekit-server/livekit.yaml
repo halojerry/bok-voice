@@ -25,8 +25,6 @@ prometheus_port: 6789
 logging:
   level: info
   json: true
-  # 生产启用采样，避免高并发下日志量过大（config-sample 同款建议）
-  sampler:
-    initial: 100
-    thereafter: 10
+  # 注意:livekit-server 1.13.6 的 config.LoggingConfig 不支持 sampler 字段
+  # (加了直接 config parse error 起不来);采样留待升级支持后再启。
 
