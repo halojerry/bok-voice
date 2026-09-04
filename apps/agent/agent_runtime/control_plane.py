@@ -70,12 +70,16 @@ class ControlPlaneClient:
         r.raise_for_status()
         return r.json()
 
-    async def end_call(self, call_id: str) -> dict:
-        """AI 收尾后主动结束通话(客户明确拒绝):置 ENDED/declined 并断房。
+    async def end_call(self, call_id: str, disposition: str = "declined") -> dict:
+        """AI 收尾后主动结束通话:置 ENDED 并断房。
 
+        disposition=declined(客户拒绝,默认)| no_response(沉默心跳两次无回应)。
         失败(404 已结束/网络抖动)由 caller 打日志即可,结算另有 _on_close 幂等兜底。
         """
-        r = await self._client.post(f"/api/supervisor/{call_id}/end")
+        r = await self._client.post(
+            f"/api/supervisor/{call_id}/end",
+            params={"disposition": disposition},
+        )
         r.raise_for_status()
         return r.json()
 

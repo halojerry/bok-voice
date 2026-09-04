@@ -251,6 +251,25 @@ def _nudge_instruction(name: str, lang: str) -> str:
     )
 
 
+def _silence_farewell_instruction(name: str, lang: str) -> str:
+    """两次心跳都没回应:一句礼貌收尾(多谢+阵间再联系+再见),讲完即收线。"""
+    who = f"{name}，" if name else ""
+    if lang == "cantonese":
+        return (
+            f"【沉默收线】客户连续两次确认都没有回应。现在只讲一句简短礼貌的收尾，"
+            f"例如「{who}咁我陣間再搵你，多謝你，拜拜」，一句讲完就停，绝不多讲。"
+        )
+    if lang == "en":
+        return (
+            f"【沉默收线】The customer did not respond after two check-ins. Say ONE short polite goodbye "
+            f"(e.g. \"{name or 'Hello'}, I'll try again later. Thanks and goodbye.\"), one line only."
+        )
+    return (
+        f"【沉默收线】客户连续两次确认都没有回应。现在只讲一句简短礼貌的收尾，"
+        f"例如「{who}那我稍后再联系您，谢谢您，再见」，一句讲完就停，绝不多讲。"
+    )
+
+
 def _normalize_lang(raw, default: str = "") -> str:
     """把对象/人设里的语言值归一为 zh/cantonese/en。vi 等未支持语言回落到 default。
 
@@ -827,10 +846,11 @@ async def entrypoint(ctx):
         asyncio.create_task(cp.settle(call_id))
 
     # 明确拒绝收尾:礼貌告别讲完(一句 TTS+余量)后主动结束通话——
-    # end_call 置 ENDED/declined 并断房,结算由 _on_close 幂等触发。
+    # end_call 置 ENDED 并断房,结算由 _on_close 幂等触发。
+    # disposition: declined=客户拒绝 / no_response=静音收线(心跳两次无回应)。
     _end_scheduled = {"on": False}
 
-    def _schedule_call_end(delay: float = 14.0) -> None:
+    def _schedule_call_end(delay: float = 14.0, disposition: str = "declined") -> None:
         if _end_scheduled["on"]:
             return
         _end_scheduled["on"] = True
@@ -838,8 +858,8 @@ async def entrypoint(ctx):
         async def _end():
             try:
                 await asyncio.sleep(delay)
-                await cp.end_call(call_id)
-                print(f"[flow] declined -> call ended by agent (call {room_name})", flush=True)
+                await cp.end_call(call_id, disposition=disposition)
+                print(f"[flow] call ended by agent ({disposition}) (call {room_name})", flush=True)
             except Exception as exc:  # pragma: no cover - 已结束/断房失败都不致命
                 print(f"[flow] end_call skipped: {exc!r} (call {room_name})", flush=True)
 
@@ -1074,11 +1094,13 @@ async def entrypoint(ctx):
         await session.generate_reply(instructions=greetings.get(greet_lang, greetings["zh"]))
         _log_stage("greeting_queued")
 
-    # ---- 沉默心跳:AI 講完話轉回「聆聽」後開始計時,客戶 SILENCE_NUDGE_SECONDS 秒
-    # 冇任何出聲 → 主動一句「仲喺度嗎」帶返當前步(最多 SILENCE_NUDGE_MAX 次;
-    # 客戶真開口即歸零)。收尾態/流程走完/暫停中唔追。SILENCE_NUDGE_MAX=0 關閉。
+    # ---- 沉默心跳(真实电话节奏):AI 講完轉回「聆聽」後 SILENCE_NUDGE_SECONDS(默認7s)
+    # 客戶冇出聲 → 一句「仲喺度嗎」帶返當前步;兩次都冇回應 → 禮貌收尾並自動收線
+    # (disposition=no_response,總靜音 ~7+7+12≈26s)。客戶出聲即撤錶歸零;
+    # 收尾態/流程走完/暫停中唔追。SILENCE_NUDGE_MAX=0 關閉。
     nudge_max = int(os.environ.get("SILENCE_NUDGE_MAX", "2"))
-    nudge_delay = float(os.environ.get("SILENCE_NUDGE_SECONDS", "15"))
+    nudge_delay = float(os.environ.get("SILENCE_NUDGE_SECONDS", "7"))
+    _nudge_state["farewell"] = False
 
     def _disarm_silence() -> None:
         if _nudge_state["timer"]:
@@ -1088,6 +1110,8 @@ async def entrypoint(ctx):
     def _arm_silence() -> None:
         if closed.is_set() or nudge_max <= 0 or agent.paused:
             return
+        if _nudge_state.get("farewell"):
+            return  # 已收線,唔再追
         if flow_ctrl.closing or (flow_ctrl.has_steps and flow_ctrl.done):
             return  # 拒絕收尾/流程已走完:唔追
         _disarm_silence()
@@ -1097,13 +1121,21 @@ async def entrypoint(ctx):
                 await asyncio.sleep(nudge_delay)
             except asyncio.CancelledError:
                 return
-            if closed.is_set() or agent.paused or flow_ctrl.closing:
+            if closed.is_set() or agent.paused or flow_ctrl.closing or _nudge_state.get("farewell"):
                 return
-            if _nudge_state["count"] >= nudge_max:
-                return
-            _nudge_state["count"] += 1
             name = str((object_card or {}).get("display_name") or "").strip()
             lang = language_state.lang if language_state.lang in ("zh", "cantonese", "en") else "zh"
+            if _nudge_state["count"] >= nudge_max:
+                # 兩次確認都冇回應 → 禮貌收尾,講完(一句TTS+余量)自動收線。
+                _nudge_state["farewell"] = True
+                print(f"[heartbeat] still silent after {_nudge_state['count']} nudges -> farewell+end (call {room_name})", flush=True)
+                try:
+                    await session.generate_reply(instructions=_silence_farewell_instruction(name, lang))
+                except Exception as exc:  # pragma: no cover - 收尾失敗都照收線
+                    print(f"[heartbeat] farewell failed: {exc!r} (call {room_name})", flush=True)
+                _schedule_call_end(12.0, disposition="no_response")
+                return
+            _nudge_state["count"] += 1
             print(f"[heartbeat] silent {nudge_delay:.0f}s -> nudge {_nudge_state['count']}/{nudge_max} (call {room_name})", flush=True)
             try:
                 await session.generate_reply(instructions=_nudge_instruction(name, lang))

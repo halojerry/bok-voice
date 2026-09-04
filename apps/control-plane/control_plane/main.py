@@ -1085,13 +1085,15 @@ async def transfer(call_id: str) -> dict:
 
 
 @app.post("/api/supervisor/{call_id}/end")
-async def supervisor_end(call_id: str) -> dict:
-    """AI 收尾后主动结束通话(客户明确拒绝/告别):置 ENDED/declined 并断房。
+async def supervisor_end(call_id: str, disposition: str = "declined") -> dict:
+    """AI 收尾后主动结束通话:置 ENDED 并断房。
 
+    disposition=declined(客户明确拒绝/告别,默认)| no_response(沉默心跳两次无回应)。
     agent 讲完一句礼貌再见后调用;结算由 agent 侧 _on_close 幂等触发,这里只负责
     归档 disposition + 踢出房间。房间不存在/服务不可用不阻塞(DB 已置 ENDED)。
     """
-    call = _repo().update_call(call_id, escalated_to_human=False, disposition="declined", status=CallStatus.ENDED.value)
+    disposition = (disposition or "declined").strip()[:64] or "declined"
+    call = _repo().update_call(call_id, escalated_to_human=False, disposition=disposition, status=CallStatus.ENDED.value)
     if not call:
         raise HTTPException(404, "call not found")
     await _disconnect_livekit_room(call_id)
