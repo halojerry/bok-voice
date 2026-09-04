@@ -720,6 +720,23 @@ def cmd_serve() -> int:
         }
         _start_proc([str(py), "-m", "agent_runtime.main"], run_dir / "agent.pid", log_dir / "agent.log", env=agent_env)
 
+        # B 线同传 interpreter:每个方向一个 worker(agent_name 显式分发,
+        # 方向/语言对由 CP 在 me 端 token 的 RoomAgentDispatch metadata 下发)。
+        # worker 常驻待命,没有同传房间时零占用(不加载模型,job 到达才拉管线)。
+        for _dir, _pidname, _logname in (
+            ("fwd", "interp-fwd.pid", "interp-fwd.log"),
+            ("rev", "interp-rev.pid", "interp-rev.log"),
+        ):
+            interp_env = dict(agent_env)
+            interp_env["BOK_SERVICE"] = f"interp-{_dir}"
+            interp_env["INTERP_DIRECTION"] = _dir
+            _start_proc(
+                [str(py), "-m", "agent_runtime.interpret"],
+                run_dir / _pidname,
+                log_dir / _logname,
+                env=interp_env,
+            )
+
     print("[bok] waiting for desktop stack…")
     targets = [8000, 8787, 8788, 8790, 1235]
     if not is_packaged():
