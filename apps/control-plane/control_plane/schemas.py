@@ -128,6 +128,12 @@ class ProviderSettings(BaseModel):
     api_key: str = ""
     endpoint: str = ""
     language: str = ""
+    # 语言/音色模式（agent 运行时读取；设置以 JSON blob 存储，旧档缺键=默认值，
+    # 无需 DB 迁移）：tts.voice_mode: single=整场同声(collapse 成主音色,默认) |
+    # per_language=按语言分音色(speaker_zh/speaker_cantonese/speaker_en 逐轮切换)；
+    # asr.language_mode: auto=锚定+滞回跟随(默认) | fixed=钉死 language 指定语言。
+    voice_mode: str = "single"
+    language_mode: str = "auto"
     speaker: str = ""
     speaker_zh: str = ""
     speaker_cantonese: str = ""

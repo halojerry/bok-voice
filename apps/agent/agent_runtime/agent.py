@@ -299,6 +299,70 @@ def _build_default_voice_map(tts_cfg: dict) -> dict:
     return mapping
 
 
+def _resolve_tts_voice_mode(tts_cfg: dict) -> str:
+    """读 tts.voice_mode（缺键/非法值一律 single=今日 collapse 行为，零迁移依赖）。"""
+    mode = str((tts_cfg.get("voice_mode") or "single")).strip().lower()
+    return mode if mode == "per_language" else "single"
+
+
+# 本地 Qwen3 音色（9 预设 + agent-*/acceptance-* 克隆）：发给 MiniMax 会
+# 2054 voice not exist、整轮无声，两个模式都必须过滤。
+_MINIMAX_LOCAL_VOICES = frozenset(
+    {"serena", "vivian", "uncle_fu", "ryan", "aiden", "ono_anna", "sohee", "eric", "dylan"}
+)
+_MINIMAX_LOCAL_VOICE_PREFIXES = ("agent-", "acceptance-")
+
+
+def _filter_cloud_voice_map(raw_map: dict) -> dict:
+    """丢掉空值与本地 Qwen3 音色，云端引擎只收云端音色 ID。"""
+    voice_map: dict = {}
+    for lang, vid in raw_map.items():
+        if not vid:
+            continue
+        base = str(vid).strip().lower()
+        if base in _MINIMAX_LOCAL_VOICES or base.startswith(_MINIMAX_LOCAL_VOICE_PREFIXES):
+            print(f"[agent] minimax skip local qwen3 voice {vid!r} for {lang}", flush=True)
+            continue
+        voice_map[lang] = vid
+    return voice_map
+
+
+def _assemble_minimax_voice_map(*, persona: dict | None, tts_cfg: dict, greet_lang: str, voice_mode: str) -> dict:
+    """组 MiniMax voice map（纯函数，单测直接喂 dict，不起 worker）。
+
+    - single（默认）：整场同声——collapse 成单一主音色放 zh 键（今日行为，
+      人设主语言 → greet_lang → zh 取主音色）。
+    - per_language：保留 {zh,cantonese,en} 分语言键，MiniMaxTTS._resolve_voice
+      按滞回后的 language_state.lang 逐轮换声（设置页/人设三键异值才真正分声；
+      全局 speaker 单音色只组 zh 键，等效 single）。切换源是滞回平滑后的
+      sticky 语言，不吃 ASR 单轮误判，不会逐轮跳音色。
+    """
+    persona_voice = (persona or {}).get("reference_audio") or ""
+    raw_map = _parse_voice_map(persona_voice) if persona_voice else _build_default_voice_map(tts_cfg)
+    if voice_mode != "per_language":
+        persona_lang = (persona or {}).get("language") or ""
+        anchor_lang = _normalize_lang(persona_lang) or greet_lang or "zh"
+        raw_map = _collapse_voice_map(raw_map, anchor_lang)
+    return _filter_cloud_voice_map(raw_map)
+
+
+def _resolve_asr_language_mode(asr_cfg: dict) -> tuple[str, str]:
+    """读 asr.language_mode/language（缺键=auto，今日锚定+滞回行为零变化）。
+
+    - auto：ASR hint 跟随滞回后的 language_state（cantonese/en 钉、zh auto）。
+    - fixed：整场钉死 asr.language（cantonese/zh/en）；未配语言或值不合法 →
+      安全回落 auto（绝不哑火）。
+    返回 (mode, fixed_lang)，auto 时 fixed_lang 为空串。
+    """
+    mode = str(asr_cfg.get("language_mode") or "auto").strip().lower()
+    if mode != "fixed":
+        return "auto", ""
+    fixed_lang = _normalize_lang(asr_cfg.get("language"))
+    if not fixed_lang:
+        return "auto", ""
+    return "fixed", fixed_lang
+
+
 def _context_rag_enabled(has_steps: bool) -> bool:
     """绑了分步话术(has_steps)的封闭流程，默认不做知识库/联网检索——单对象只上话术。
 
@@ -506,6 +570,7 @@ async def entrypoint(ctx):
         LanguageState,
         MiniMaxTTS,
         MlxLlmLLM,
+        PinnedLanguageState,
         Qwen3ASRLiveSTT,
         Qwen3ASRSTT,
         Qwen3TTSTTS,
@@ -560,6 +625,16 @@ async def entrypoint(ctx):
 
     # ---- ASR：设置页 asr.provider（qwen3_asr / sherpa_sensevoice / fake）----
     asr_provider_name = (asr_cfg.get("provider") or "qwen3_asr").lower()
+    # 语言模式：auto（默认）=锚定+滞回跟随（今日行为零变化）；fixed=整场钉死
+    # asr.language（B 线同传同姿势：预置 lang + pin_language=True，per-request
+    # hint 恒下发钉定语言）。fixed 时 ASR 用专用钉定语言态（强证据/滞回都不
+    # 改写），与共享 language_state（回复/TTS 锚定滞回）解耦，互不干扰。
+    asr_mode, asr_fixed_lang = _resolve_asr_language_mode(asr_cfg)
+    if asr_mode == "fixed":
+        asr_language_state = PinnedLanguageState(lang=asr_fixed_lang)
+    else:
+        asr_language_state = language_state
+    print(f"[agent] asr language_mode={asr_mode}" + (f" fixed={asr_fixed_lang}" if asr_mode == "fixed" else ""), flush=True)
     if use_fake or asr_provider_name in ("fake", "fake_stt"):
         stt_provider = FakeLiveKitSTT()
     else:
@@ -567,7 +642,7 @@ async def entrypoint(ctx):
         # （Qwen3-ASR），避免配置写错导致 agent 崩溃（sherpa 模型不再随包）。
         use_sherpa = asr_provider_name in {"sherpa", "sherpa_sensevoice"}
         _asr_inner = (
-            SherpaSenseVoiceSTT(language_state=language_state)
+            SherpaSenseVoiceSTT(language_state=asr_language_state)
             if use_sherpa
             else Qwen3ASRSTT(
                 base_url=_sidecar_base_url(
@@ -575,7 +650,10 @@ async def entrypoint(ctx):
                     "QWEN3_ASR_BASE_URL",
                     "http://127.0.0.1:8787",
                 ),
-                language_state=language_state,
+                language_state=asr_language_state,
+                # fixed=同传式全钉（zh 也下发 Chinese，不吃 auto 漂移）；
+                # auto=今日口径（cantonese/en 钉、zh auto 容忍夹英文）。
+                pin_language=(asr_mode == "fixed"),
             )
         )
         if not use_sherpa and os.environ.get("QWEN3_ASR_STREAM", "1") == "1":
@@ -603,33 +681,17 @@ async def entrypoint(ctx):
             sample_rate=int(tts_cfg.get("sample_rate") or 24000),
         )
     elif tts_provider_name in ("minimax", "minimax_streaming"):
-        # 云端 MiniMax：整场同声——voice 收敛成一个主音色。
-        # 人设 reference_audio（{lang: voice_id}，人设页「AI 音色(整场同声)」存的就是
-        # zh/cantonese/en 三键同值）优先：取人设主语言对应的音色，统一放 zh 键，无论客户讲
-        # 粤/普/英都用同一把声。未绑则回落全局 speaker（也已是单音色）/旧分语言。
-        # 兜底防御：过滤本地 Qwen3 音色（预设 9 个 + 克隆 agent-*/acceptance-*），
-        # 否则发给 MiniMax 会 2054 voice not exist，整轮无声。
-        persona_voice = (persona or {}).get("reference_audio") or ""
-        raw_map = _parse_voice_map(persona_voice) if persona_voice else _build_default_voice_map(tts_cfg)
-        persona_lang = (persona or {}).get("language") or ""
-        # 整场同声必须无条件收敛成单主音色(唔止 persona 绑 voice 嗰阵):以前全局
-        # speaker 为空会回落旧分语言 map{zh:普通话音色, cantonese:粤语音色},ASR 一旦判错
-        # 一两轮 zh 成个 call 就跳去普通话音色,粤语字读成普通话(「九」→ jiǔ)。
-        # 一律按开场锚语言(greet_lang:人设→对象→zh)取主音色,整场唔再逐轮跳。
-        anchor_lang = _normalize_lang(persona_lang) or greet_lang or "zh"
-        raw_map = _collapse_voice_map(raw_map, anchor_lang)
-        _LOCAL_QWEN3 = {
-            "serena", "vivian", "uncle_fu", "ryan", "aiden", "ono_anna", "sohee", "eric", "dylan",
-        }
-        voice_map = {}
-        for lang, vid in raw_map.items():
-            if not vid:
-                continue
-            base = str(vid).strip().lower()
-            if base in _LOCAL_QWEN3 or base.startswith(("agent-", "acceptance-")):
-                print(f"[agent] minimax skip local qwen3 voice {vid!r} for {lang}", flush=True)
-                continue
-            voice_map[lang] = vid
+        # 云端 MiniMax：voice_mode 决定音色策略（详见 _assemble_minimax_voice_map）。
+        # - single（默认，缺键同）：整场同声——collapse 成一个主音色，无论客户讲
+        #   粤/普/英都用同一把声（今日行为）。
+        # - per_language：保留 {zh,cantonese,en} 三键，_resolve_voice 按滞回后的
+        #   language_state.lang 逐轮换声。
+        # 兜底防御（两模式同）：过滤本地 Qwen3 音色，否则 2054 voice not exist。
+        voice_mode = _resolve_tts_voice_mode(tts_cfg)
+        voice_map = _assemble_minimax_voice_map(
+            persona=persona, tts_cfg=tts_cfg, greet_lang=greet_lang, voice_mode=voice_mode
+        )
+        print(f"[agent] minimax voice_mode={voice_mode} voice_keys={sorted(voice_map)} (call {room_name})", flush=True)
         tts_provider = MiniMaxTTS(
             voice=voice_map,
             language_state=language_state,

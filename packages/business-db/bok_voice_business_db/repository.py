@@ -406,10 +406,14 @@ class SqlAlchemyBusinessRepository:
     @staticmethod
     def default_settings() -> dict:
         return {
-            # ASR：agent 只消费 provider/base_url；model/backend/language 是误导性死配置，不再下发。
+            # ASR：agent 只消费 provider/base_url；model/backend 是误导性死配置，不再下发。
+            # language 仅在 language_mode=fixed 时生效（钉死识别语言）；
+            # language_mode: auto=锚定+滞回跟随(默认) | fixed=钉死 language。
             "asr": {
                 "provider": "qwen3_asr",
                 "base_url": "http://127.0.0.1:8787",
+                "language_mode": "auto",
+                "language": "",
             },
             # Packaged/dev default: local OpenAI-compatible LLM on :1235
             # (mlx_lm on macOS, llama-server on Windows). Zero-Ollama.
@@ -417,9 +421,11 @@ class SqlAlchemyBusinessRepository:
             "llm": {"provider": "local_openai", "model": "", "base_url": "http://127.0.0.1:1235/v1", "local_model": ""},
             # TTS：provider= qwen3_tts | volcano_streaming | fake；音色按语言
             # speaker_zh/speaker_cantonese/en（persona 绑定音色优先；旧键已由启动迁移改写）。
+            # voice_mode: single=整场同声(默认,collapse 成主音色) | per_language=分语言键逐轮切换。
             "tts": {
                 "provider": "qwen3_tts",
                 "base_url": "http://127.0.0.1:8788",
+                "voice_mode": "single",
                 "speaker_zh": "",
                 "speaker_cantonese": "",
                 "speaker_en": "",

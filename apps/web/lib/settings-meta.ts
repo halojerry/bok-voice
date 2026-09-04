@@ -61,6 +61,16 @@ export const SETTING_CARDS: ProviderMeta[] = [
     ],
     fields: [
       { key: "base_url", label: "服务地址", type: "text", hint: "ASR sidecar 地址；agent 运行时会优先读环境变量 QWEN3_ASR_BASE_URL。", placeholder: "http://127.0.0.1:8787" },
+      { key: "language_mode", label: "识别语言模式", type: "select", providers: ["qwen3_asr"], hint: "自动=跟随客户语言（锚定+连续多轮才切换，推荐）；固定=整场只按下方语言识别（混杂环境误判时用）。", options: [
+        { value: "auto", label: "自动跟随（推荐）" },
+        { value: "fixed", label: "固定语言" },
+      ] },
+      { key: "language", label: "固定识别语言", type: "select", providers: ["qwen3_asr"], hint: "仅「固定语言」模式生效：整场按该语言识别，通话中不跟随切换。", options: [
+        { value: "", label: "（未设置）" },
+        { value: "cantonese", label: "粤语" },
+        { value: "zh", label: "普通话" },
+        { value: "en", label: "英语" },
+      ] },
     ],
   },
   {
@@ -93,12 +103,16 @@ export const SETTING_CARDS: ProviderMeta[] = [
     fields: [
       { key: "api_key", label: "API Key", type: "secret", hint: "MiniMax / DeepSeek 等云端凭据，持久化保存（重启不丢）；已保存的 Key 不回显。", placeholder: "sk-…" },
       { key: "base_url", label: "服务地址", type: "text", hint: "Qwen3-TTS sidecar 地址；agent 运行时会优先读 QWEN3_TTS_BASE_URL。", placeholder: "http://127.0.0.1:8788" },
-      { key: "speaker", label: "AI 默认音色（整场同声）", type: "text", preview: true, hint: "客户讲粤语/普通话/英文都用它发声（人设若单独绑定则以人设优先）。MiniMax 可直接粘贴音色 ID（推荐粤语播报音色，可到人设页列表挑）；Qwen3 填本地音色如 vivian。留空则用下方高级音色或系统默认。", placeholder: "如 Cantonese_crisp_news_anchor_vv2" },
+      { key: "voice_mode", label: "音色模式", type: "select", providers: ["minimax"], hint: "整场同声=客户讲任何语言都用同一把声（推荐）；按语言分音色=下方普通话/粤语/英语音色按客户当前语言逐轮切换。", options: [
+        { value: "single", label: "整场同声（推荐）" },
+        { value: "per_language", label: "按语言分音色" },
+      ] },
+      { key: "speaker", label: "AI 默认音色（整场同声）", type: "text", preview: true, hint: "客户讲粤语/普通话/英文都用它发声（人设若单独绑定则以人设优先）。MiniMax 可直接粘贴音色 ID（推荐粤语播报音色，可到人设页列表挑）；Qwen3 填本地音色如 vivian。留空则用下方分语言音色或系统默认。", placeholder: "如 Cantonese_crisp_news_anchor_vv2" },
       { key: "instruct", label: "语气指令（可选）", type: "text", hint: "附加到每次合成的情绪指令之前。", placeholder: "如：温和、耐心" },
       { key: "sample_rate", label: "采样率", type: "number", hint: "输出 PCM 采样率，通常保持 24000。", min: 8000, max: 48000, step: 1000 },
-      { key: "speaker_zh", label: "普通话音色（旧分语言）", type: "text", preview: true, advanced: true, hint: "旧按语言分音色已不推荐：仅当上面「默认音色」留空时回落。", placeholder: "如 zhiyan_meet_feminine" },
-      { key: "speaker_cantonese", label: "粤语音色（旧分语言）", type: "select", preview: true, advanced: true, hint: "旧按语言分音色已不推荐：仅当上面「默认音色」留空时回落。", options: [{ value: "", label: "（不单独设，跟随默认音色）" }, ...minimaxVoiceOptionsFor("cantonese")] },
-      { key: "speaker_en", label: "英语音色（旧分语言）", type: "text", preview: true, advanced: true, hint: "旧按语言分音色已不推荐：仅当上面「默认音色」留空时回落。", placeholder: "如 male_english_speaker" },
+      { key: "speaker_zh", label: "普通话音色", type: "text", preview: true, advanced: true, hint: "「按语言分音色」模式的普通话音色；「整场同声」模式下仅当默认音色留空时回落。", placeholder: "如 zhiyan_meet_feminine" },
+      { key: "speaker_cantonese", label: "粤语音色", type: "select", preview: true, advanced: true, hint: "「按语言分音色」模式的粤语音色；「整场同声」模式下仅当默认音色留空时回落。", options: [{ value: "", label: "（不单独设，跟随默认音色）" }, ...minimaxVoiceOptionsFor("cantonese")] },
+      { key: "speaker_en", label: "英语音色", type: "text", preview: true, advanced: true, hint: "「按语言分音色」模式的英语音色；「整场同声」模式下仅当默认音色留空时回落。", placeholder: "如 male_english_speaker" },
     ],
   },
   {

@@ -23,9 +23,9 @@ import { friendlyErrorText } from "@/lib/api-ready";
 type ProviderForm = Record<string, unknown> & { provider?: string };
 
 const EMPTY_FORM: Record<ProviderKind, ProviderForm> & { policy: string } = {
-  asr: { provider: DEFAULT_PROVIDER.asr },
+  asr: { provider: DEFAULT_PROVIDER.asr, language_mode: "auto", language: "" },
   llm: { provider: DEFAULT_PROVIDER.llm, local_model: "" },
-  tts: { provider: DEFAULT_PROVIDER.tts, speaker: "", sample_rate: 24000 },
+  tts: { provider: DEFAULT_PROVIDER.tts, voice_mode: "single", speaker: "", sample_rate: 24000 },
   vad: { provider: DEFAULT_PROVIDER.vad, max_buffered_speech: 15, min_speech_duration: 0.15, min_silence_duration: 0.45, sensitivity: 0.75, interruption: true },
   policy: "offline_first",
 };

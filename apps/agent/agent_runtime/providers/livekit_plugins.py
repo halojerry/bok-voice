@@ -217,6 +217,18 @@ class LanguageState:
             self.lang = norm
 
 
+class PinnedLanguageState(LanguageState):
+    """钉定语言态：lang 恒等于构造值，update 永不改写。
+
+    用于「语言钉死」场景（B 线同传源语言 / A 线设置 asr.language_mode=fixed）：
+    per-request hint 整场恒下发钉定语言，不吃 ASR 强证据漂移，也不与共享
+    language_state 的回复锚定/滞回互相干扰。
+    """
+
+    def update(self, lang: str | None, text: str = "") -> None:
+        pass
+
+
 class MlxLlmLLM(_OpenAICompatBase):
     """本地 OpenAI 兼容 LLM（macOS mlx_lm / Windows llama-server，:1235，thinking 关闭）。
 
@@ -717,10 +729,11 @@ class ContextAwareLLM(llm.LLM):
                             items[j] = llm.ChatMessage(role="user", content=new_content)
                             break
                 # 截断历史(摊销式,见 _truncate_chat_items):超过 2×N 对才剪回 N 对
-                # (默认 4 对),更早的靠「本通对话记忆」摘要兜底。每轮全量历史会让
+                # (默认 8 对),更早的靠「本通对话记忆」摘要兜底。每轮全量历史会让
                 # prefill 随轮次线性变慢(实测 12 轮 TTFT 2.4s);滞回让截断之间保持
-                # 纯追加(KV-cache 命中),上下文仍有上界。
-                max_turns = int(os.environ.get("LLM_HISTORY_TURNS", "4"))
+                # 纯追加(KV-cache 命中),上下文仍有上界。4→8:摊销后第 1-16 轮纯
+                # 追加全缓存命中,单会话记忆(客户地址/单号/诉求)留原文更久。
+                max_turns = int(os.environ.get("LLM_HISTORY_TURNS", "8"))
                 items = _truncate_chat_items(items, max_turns=max_turns)
                 copy.items = items
                 chat_ctx = copy
