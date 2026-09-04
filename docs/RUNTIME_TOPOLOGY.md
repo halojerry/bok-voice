@@ -12,11 +12,12 @@
 | control-plane | :8000 HTTP | 业务 API、知识、设置、审计、LiveKit token | 打包 Python | SQLite → app-data/bok_voice.db |
 | ASR sidecar | :8787 HTTP | 三语转写（zh/cantonese/en） | Mac=mlx_audio；Win=qwen-asr+CUDA | 模型 → app-data/models |
 | TTS sidecar | :8788 HTTP | 合成 / 克隆 / 试听 | Mac=mlx_audio；Win=qwen-tts | 模型 → app-data/models |
-| LLM | :1235 OpenAI 兼容 | A 线对话 + B 线翻译 | Mac=mlx_lm；Win=llama-server CUDA | 模型 → app-data/models |
+| LLM | :1235 OpenAI 兼容 | A 线对话（flow judge、CP 摘要同源）；B 线翻译回退 | Mac=mlx_lm；Win=llama-server CUDA | 模型 → app-data/models |
+| MT LLM（可选） | :1236 OpenAI 兼容 | B 线同传专用翻译（Hy-MT2 小模型，逐句无状态；模型缺失自动跳过 → B 线回退 :1235） | Mac=mlx_lm | 模型 → app-data/models |
 | B-line worker | :8790 WS | 同传通道：ASR→翻译→TTS 队列 / 背压 | 内嵌 Node | 指标 → app-data/translation-metrics.jsonl |
 | LiveKit server | :7880 WS/WebRTC | RTC 信令与媒体（7881/7882 RTC 端口） | 内嵌二进制 | keys → 内嵌 livekit.yaml |
 | agent worker | 进程 | A 线智能体（VAD/对话/情绪/打断） | 打包 Python | 调 8787/8788/1235/8000 |
-| interpreter worker ×2 | 进程 | B 线双 AgentSession 同传（`bok-interp-fwd/rev` 显式分发） | 打包 Python | 调 8787/8788/1235/8000 |
+| interpreter worker ×2 | 进程 | B 线双 AgentSession 同传（`bok-interp-fwd/rev` 显式分发） | 打包 Python | 调 8787/8788/1236(MT,回退 1235)/8000；TTS=MiniMax 云(或本地 8788) |
 
 ### 音频设备（设置页）
 
@@ -71,7 +72,9 @@ web /interpret 两端（me/other，各自选麦克风/扬声器）
   → CP /api/calls(kind=interpret) + /api/token(role=me|other)
   → LiveKit 房间（me-<room> / other-<room> + 两个 interpreter agent）
   → interpreter(AgentSession 全托管):silero VAD → Qwen3-ASR(源语言钉死,
-    cantonese 走 hint) → 翻译 LLM(:1235,「只输出译文」) → Qwen3-TTS(目标语言音色)
+    cantonese 走 hint) → MT 翻译模型(:1236 Hy-MT2,官方模板逐句无状态、
+    历史不累积;未部署自动回退 :1235 主 LLM) → MiniMax 云 TTS(默认 turbo 档,
+    按 target_lang 三键换音色 + language_boost;设置非 minimax 时本地 Qwen3-TTS 回退)
   → 译文轨 trans-<lang> 只授权对方订阅(set_track_subscription_permissions);
     字幕 lk.transcription 全量广播(原文+译文,前端 useTranscriptions 渲染)
   → 译文句 add_turn(原文：…\n译文：…) → 房间断开 settle → 总结/知识蒸馏/vault

@@ -36,3 +36,6 @@ apps/web/AGENTS.md
 apps/web/CLAUDE.md
 runtime
 tests/fixtures/audio/e2e_multi/
+
+# SDD plan workspace (superpowers subagent-driven development scratch)
+.superpowers/

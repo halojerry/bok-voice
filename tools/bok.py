@@ -11,7 +11,7 @@ Subcommands:
   doctor     Preflight diagnostics (structure/deps/hardware; strict when packaged).
 
 Platform split (MLX is Apple-only):
-  mac -> MLX sidecars + mlx_lm server on :1235
+  mac -> MLX sidecars + mlx_lm server on :1235 + optional MT server on :1236
   win -> transformers sidecars (CUDA torch) + llama.cpp CUDA server on :1235
 Zero-Ollama: there is no Ollama anywhere in the distribution path.
 """
@@ -87,6 +87,9 @@ MODELS: dict[str, dict[str, str]] = {
         # 客服 LLM 用 4B 关思考:话术化场景速度优先(一轮 ~1s,约为 9B 一半),
         # 港式粤语/夹英文/数字读法实测达标。更重任务(蒸馏/知识分析)另走大模型。
         "llm": "avan-ag/Qwen3.5-4B-Uncensored-MLX-4bit",
+        # B 线同传专用翻译小模型(Hy-MT2,逐句无状态 MT):与主 LLM 分进程分端口,
+        # prefill 互不挤占。可选(首启向导不门禁,缺失时 B 线回退主 LLM :1235)。
+        "mt": "mlx-community/Hy-MT2-1.8B-Abliterated-8bit",
     },
     "windows": {
         "asr": "Qwen/Qwen3-ASR-1.7B",
@@ -99,6 +102,9 @@ MODELS: dict[str, dict[str, str]] = {
 
 # Only pull the Q4_K_M GGUF (the repo also carries F16/vision variants).
 WINDOWS_LLM_GGUF_PATTERNS = ["*Q4_K_M.gguf", "README.md"]
+
+# 首启向导不门禁的模型(可选增强,缺失时对应功能自动回退:B 线 MT 回退主 LLM :1235)。
+OPTIONAL_MODELS = {"mt"}
 
 
 def platform_key() -> str:
@@ -161,6 +167,19 @@ def resolve_llm_repo(current: dict[str, str]) -> str:
     """选定要启动/注入的本地 LLM repo:设置页 local_model 优先,空用默认 current."""
     override = _settings_llm_local_model()
     return override or (current.get("llm") or "")
+
+
+def _mt_llm_model(current: dict[str, str]) -> str:
+    """B 线 MT 翻译小模型路径:MT_LLM_MODEL 显式覆盖 > MODELS 表 mt 条目;无则 ""。
+
+    与主 LLM 的解析同一套路(路径须是后端真认的模型路径);解析不出(未下载/
+    表里无 mt 条目)返回 "",启动侧跳过 :1236、interp env 侧不下发 MT_*
+    (interpret 侧回退主 LLM :1235,唔会指去死端口)。
+    """
+    override = os.environ.get("MT_LLM_MODEL", "").strip()
+    if override:
+        return override
+    return model_path(current, "mt")
 
 
 def sidecar_python(name: str) -> Path:
@@ -328,7 +347,7 @@ def cmd_manifest() -> int:
     data: dict = {
         "platform": key,
         "app_data_dir": str(app_data_dir()),
-        "ports": {"control_plane": 8000, "web": 3000, "asr": 8787, "tts": 8788, "llm": 1235, "b_line": 8790, "livekit": 7880},
+        "ports": {"control_plane": 8000, "web": 3000, "asr": 8787, "tts": 8788, "llm": 1235, "mt_llm": 1236, "b_line": 8790, "livekit": 7880},
         "models": {},
     }
     for name, repo in MODELS[key].items():
@@ -355,7 +374,7 @@ def setup_models() -> list[dict]:
             continue
         target = model_dir(repo)
         present = target.exists() and any(target.iterdir())
-        entry: dict = {"name": name, "repo": repo, "present": present, "required": True}
+        entry: dict = {"name": name, "repo": repo, "present": present, "required": name not in OPTIONAL_MODELS}
         if present:
             entry["size_bytes"] = sum(p.stat().st_size for p in target.rglob("*") if p.is_file())
         out.append(entry)
@@ -435,6 +454,7 @@ def cmd_status() -> int:
         ("asr", 8787),
         ("tts", 8788),
         ("llm", 1235),
+        ("mt-llm", 1236),
         ("b-line", 8790),
         ("livekit", 7880),
     ]
@@ -554,6 +574,32 @@ def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
     )
 
 
+def _start_mt_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> bool:
+    """B 线同传翻译 LLM(:1236,Hy-MT2 小模型):与主 LLM 分进程,prefill 互不挤占。
+
+    可选服务:模型缺失/未下载直接跳过并返回 False(等待方不收 1236,B 线
+    interpret 回退主 LLM :1235);端口已健康(serve 重试/生产档拉起)不重复起。
+    返回 True = 预期 :1236 会就绪。
+    """
+    if healthy(1236):
+        return True
+    mt_model = _mt_llm_model(current)
+    if not mt_model or not Path(mt_model).exists():
+        print(f"[bok] mt model not present, skip :1236 ({mt_model or 'unset'})", file=sys.stderr)
+        return False
+    llm_py = sidecar_python("llm-mlx")
+    # 逐句无状态 MT:请求前缀只有模板头一条,32 槽 prompt cache 足够;Hy-MT2
+    # 自带非思考对话模板,不传 --chat-template-args(主 LLM 的关思考参数不通用)。
+    _start_proc(
+        [str(llm_py), "-m", "mlx_lm", "server",
+         "--model", mt_model, "--host", "127.0.0.1", "--port", "1236",
+         "--prompt-cache-size", "32", "--log-level", "WARNING"],
+        run_dir / "mt-llm.pid",
+        log_dir / "mt-llm.log",
+    )
+    return True
+
+
 def cmd_up() -> int:
     run_dir = app_data_dir() / "run"
     log_dir = app_data_dir() / "logs"
@@ -604,6 +650,7 @@ def cmd_up() -> int:
         )
 
     _start_llm(current, run_dir, log_dir)
+    want_mt = _start_mt_llm(current, run_dir, log_dir)
 
     # B-line worker (Node, OpenAI-compatible translator on :1235).
     bline_cfg = write_bline_config(current)
@@ -615,9 +662,13 @@ def cmd_up() -> int:
         )
 
     print("[bok] waiting for services…")
+    # mt(:1236)仅在确实拉起时纳入等待;主栈四端口照旧。
+    core_ports = (8787, 8788, 8790, 1235)
+    targets = core_ports + ((1236,) if want_mt else ())
+    mt_ready_suffix = " mt=1236" if want_mt else ""
     for _ in range(180):
-        if all(healthy(p) for p in (8787, 8788, 8790, 1235)):
-            print("[bok] ready: asr=8787 tts=8788 llm=1235 b-line=8790")
+        if all(healthy(p) for p in targets):
+            print(f"[bok] ready: asr=8787 tts=8788 llm=1235 b-line=8790{mt_ready_suffix}")
             return 0
         time.sleep(1)
     # TTS 首启偶发卡死在 MLX 模型加载/暖机（观察：与 LLM/ASR 同启时概率出现，
@@ -642,8 +693,12 @@ def cmd_up() -> int:
             if healthy(8788):
                 break
             time.sleep(1)
-    if all(healthy(p) for p in (8787, 8788, 8790, 1235)):
-        print("[bok] ready (after tts restart): asr=8787 tts=8788 llm=1235 b-line=8790")
+    if all(healthy(p) for p in targets):
+        print(f"[bok] ready (after tts restart): asr=8787 tts=8788 llm=1235 b-line=8790{mt_ready_suffix}")
+        return 0
+    if want_mt and all(healthy(p) for p in core_ports) and not healthy(1236):
+        # MT 是可选增强:主栈齐而独缺 mt 不拖垮整栈(B 线 interpret 回退主 LLM)。
+        print("[bok] mt llm :1236 not ready — continue (B-line falls back to :1235)", file=sys.stderr)
         return 0
     print("[bok] timeout waiting for services (see app-data/logs)", file=sys.stderr)
     return 1
@@ -727,7 +782,7 @@ def cmd_serve() -> int:
             ("fwd", "interp-fwd.pid", "interp-fwd.log"),
             ("rev", "interp-rev.pid", "interp-rev.log"),
         ):
-            interp_env = dict(agent_env)
+            interp_env = _interp_env(agent_env)
             interp_env["BOK_SERVICE"] = f"interp-{_dir}"
             interp_env["INTERP_DIRECTION"] = _dir
             _start_proc(
@@ -739,13 +794,19 @@ def cmd_serve() -> int:
 
     print("[bok] waiting for desktop stack…")
     targets = [8000, 8787, 8788, 8790, 1235]
+    if healthy(1236):
+        # MT 翻译小模型(:1236)可选:cmd_up 拉起了才纳入等待,缺模型不算失败。
+        targets.append(1236)
     if not is_packaged():
         targets.append(3000)
     if healthy(7880):
         targets.append(7880)
     for _ in range(120):
         if all(healthy(p) for p in targets):
-            print("[bok] desktop ready: control-plane=8000 asr=8787 tts=8788 llm=1235 b-line=8790")
+            ready = "[bok] desktop ready: control-plane=8000 asr=8787 tts=8788 llm=1235 b-line=8790"
+            if 1236 in targets:
+                ready += " mt=1236"
+            print(ready)
             # 非打包模式自动打开浏览器页面(可用 BOK_NO_OPEN_BROWSER=1 关闭)。
             if not is_packaged() and os.environ.get("BOK_NO_OPEN_BROWSER", "0") != "1":
                 try:
@@ -890,7 +951,7 @@ def cmd_doctor() -> int:
             # 模型在 CI/首启前允许缺失：由 setup status 门禁管理，不阻塞 bundle 校验。
             print("  (模型权重不随包，首启向导下载；doctor 不将其视为结构失败)")
 
-    for name, port in (("control-plane", 8000), ("asr", 8787), ("tts", 8788), ("llm", 1235), ("b-line", 8790), ("livekit", 7880)):
+    for name, port in (("control-plane", 8000), ("asr", 8787), ("tts", 8788), ("llm", 1235), ("mt-llm", 1236), ("b-line", 8790), ("livekit", 7880)):
         print(f"  port {port:<5} ({name}): {'UP' if healthy(port) else 'DOWN'}")
 
     # /api/token 必须是真 JWT（三段式）；否则 A 线 UI 永远“接通失败”。
@@ -951,6 +1012,24 @@ def _agent_prod_env() -> dict[str, str]:
     }
 
 
+def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
+    """B 线 interpreter 追加 env:MT 翻译小模型(:1236,可选增强)。
+
+    MT_LLM_MODEL 必须是后端真认的模型路径(与主 LLM 同一解析);MT_* 只在
+    模型目录在盘或 :1236 已健康(与 _start_mt_llm 同判)时下发——模型缺失/
+    Windows 无 mt 条目时完全不注入,interpret 侧按 env 有无回退主 LLM
+    :1235/DeepSeek,避免 worker 指去死端口整场无声。MINIMAX_* 不在这里注入
+    ——TTS 供应商/音色由 interpret.py 按设置与方向解析。
+    """
+    env = dict(agent_env)
+    mt_model = _mt_llm_model(MODELS["mac"] if is_mac() else MODELS["windows"])
+    if (mt_model and Path(mt_model).exists()) or healthy(1236):
+        env["MT_LLM_BASE_URL"] = os.environ.get("MT_LLM_BASE_URL", "http://127.0.0.1:1236/v1")
+        if mt_model:
+            env["MT_LLM_MODEL"] = mt_model
+    return env
+
+
 def cmd_prod_install() -> int:
     """生成生产常驻单元（mac launchd plist / Windows 服务脚本），不启动。
 
@@ -972,8 +1051,8 @@ def cmd_prod_install() -> int:
             ("bok-control-plane", [str(py), "-m", "uvicorn", "control_plane.main:app", "--host", "127.0.0.1", "--port", "8000"], _control_plane_env((app_data_dir() / "bok_voice.db").as_posix()), "Bok 控制面 API"),
             ("bok-livekit", [livekit_bin, "--config", str(ROOT / "services" / "livekit-server" / "livekit.yaml")], {}, "LiveKit 信令/媒体"),
             ("bok-agent", [str(py), "-m", "agent_runtime.main"], agent_env, "A 线客服 agent worker"),
-            ("bok-interp-fwd", [str(py), "-m", "agent_runtime.interpret"], {**agent_env, "BOK_SERVICE": "interp-fwd", "INTERP_DIRECTION": "fwd"}, "B 线同传 fwd"),
-            ("bok-interp-rev", [str(py), "-m", "agent_runtime.interpret"], {**agent_env, "BOK_SERVICE": "interp-rev", "INTERP_DIRECTION": "rev"}, "B 线同传 rev"),
+            ("bok-interp-fwd", [str(py), "-m", "agent_runtime.interpret"], {**_interp_env(agent_env), "BOK_SERVICE": "interp-fwd", "INTERP_DIRECTION": "fwd"}, "B 线同传 fwd"),
+            ("bok-interp-rev", [str(py), "-m", "agent_runtime.interpret"], {**_interp_env(agent_env), "BOK_SERVICE": "interp-rev", "INTERP_DIRECTION": "rev"}, "B 线同传 rev"),
         ]
         for name, args, env, comment in units:
             label = f"com.bokvoice.{name}"
@@ -1024,6 +1103,9 @@ def cmd_prod_status() -> int:
         ("b-line", 8790, "/health"),
         ("livekit", 7880, "/"),
     ]
+    # MT 翻译小模型是可选增强:起了才纳入健康面(缺模型的环境不算 DEGRADED)。
+    if healthy(1236):
+        checks.append(("mt-llm", 1236, "/v1/models"))
     all_ok = True
     for name, port, path in checks:
         try:
