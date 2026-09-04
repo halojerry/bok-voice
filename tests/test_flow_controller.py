@@ -314,6 +314,25 @@ def test_detect_whatsapp_caller_bound_implicit():
     assert detect_whatsapp_signal("WhatsApp 就係我而家呢個電話", step_goal="說明賠償標準", step_ref="一賠二") is None
 
 
+def test_detect_whatsapp_short_number_and_announce():
+    """真實走漏案例回歸(2026-09-03 call):客戶講 7 位號 + 撞對象電話 → 雙重走漏,
+    唔爆閃、唔推進、AI 重複追問。
+
+    - 「我WhatsApp是六四三二五四三」:7 位(舊 8-13 規則走漏)且撞對象電話(舊 known-number
+      過濾走漏)→ 明確自報句式要照捕。
+    - WhatsApp 步內 7 位新號碼 → captured。
+    """
+    from agent_runtime.flow import detect_whatsapp_signal
+    F = {"姓名": "陈先生", "快递单号": "sf一二三四五六七八九零", "快递尾号": "七八九零", "电话": "六四三二五四三"}
+    # 明確自報(7位+撞已知電話)→ captured
+    assert detect_whatsapp_signal("我WhatsApp是六四三二五四三。", step_goal=WA_GOAL, step_ref=WA_REF, facts=F) == ("captured", "6432543")
+    assert detect_whatsapp_signal("我 WhatsApp 就是 68681234", step_goal=WA_GOAL, step_ref=WA_REF, facts=F) == ("captured", "68681234")
+    # WhatsApp 步內 7 位新號碼(無自報句式)→ captured(7位容錯)
+    assert detect_whatsapp_signal("我俾你,六四三二五八八", step_goal=WA_GOAL, step_ref=WA_REF, facts=F) == ("captured", "6432588")
+    # 非 WA 語境 7 位覆述已知電話 → 唔當
+    assert detect_whatsapp_signal("我個電話 6432543", step_goal="說明賠償標準", step_ref="一賠二", facts=F) is None
+
+
 def test_detect_whatsapp_captured_prefers_context_not_single_number():
     """WhatsApp 語境下客戶俾號,號碼就算撞已知單號都當 WhatsApp 號(先走 captured)。
 

@@ -223,6 +223,11 @@ _WHATSAPP_DECLINE = re.compile(r"(冇whatsapp|冇用whatsapp|無whatsapp|唔用w
 _WHATSAPP_ADD_VERB = re.compile(r"(你(哋|地)?加我|加我|我加咗|我加|加咗|加啦|加喇|搵我|你(哋|地)?發俾我|發俾我|快啲加|嚟加)", re.IGNORECASE)
 # 俾號語境:「我俾個號你 / 俾號碼你」→ 唔好淨靠 號碼/号码 字眼(「俾個號」冇「碼」都會走漏)。
 _WHATSAPP_GIVE_NUM_RE = re.compile(r"俾.{0,6}[號号]")
+# 明確自報:「我WhatsApp(就)係/是 <數字>」→ 號碼即 WhatsApp,就算撞已知電話/單號都當佢自報。
+# 系詞後必須直接跟數字(漢字/阿拉伯皆可):「WhatsApp 就是绑定…」唔算(嗰係綁定來電,交 caller_bound)。
+_WHATSAPP_NUM_ANNOUNCE_RE = re.compile(
+    r"(whatsapp|whats app|wa|微信)\s*(就?係|就是|是)\s*[0-9一二三四五六七八九零]", re.IGNORECASE
+)
 _WHATSAPP_ACK_WORDS = ("好呀", "好丫", "好既", "好嘅", "好阿", "可以", "冇問題", "沒問題", "没问题", "無問題", "都得", "得呀", "嗯", "好", "得", "ok", "okay", "嗯嗯", "好呀好呀", "可以可以", "好嘅好嘅")
 # 句子提及其他话题(单号/电话/自己身份/地址/订单)→ 唔係应承加,唔触发 offered
 _WHATSAPP_TOPIC_MARK = re.compile(r"(單號|单号|號碼|号码|電話|电话|地址|訂單|订单|貨件|货件|貨|件野|我係|我是|包裹|速遞|物流)", re.IGNORECASE)
@@ -299,8 +304,10 @@ def _looks_like_whatsapp_step(goal: str, ref: str) -> bool:
 
 
 def _valid_digit_runs(norm: str) -> list[str]:
-    """攞 8–13 位数字串(WhatsApp/手机长度)。短(單號尾4)唔算,長過13(成串乱码)唔算。"""
-    return [r for r in re.findall(r"[0-9]{8,13}", norm)]
+    """攞 7–13 位数字串。8 位=香港手機號常態;7 位容錯 ASR 少聽一位/口誤短號
+    (真實 case:「我WhatsApp是六四三二五四三」7位曾因 <8 走漏→不爆閃、重複追問)。
+    短過7(單號尾4)唔算,長過13(成串乱码)唔算。"""
+    return [r for r in re.findall(r"[0-9]{7,13}", norm)]
 
 
 def _run_is_known_number(run: str, facts: dict | None) -> bool:
@@ -326,8 +333,9 @@ def detect_whatsapp_signal(
 ) -> tuple[str, str] | None:
     """偵測客戶係咪俾出 WhatsApp。返回 ("captured", 號碼) | ("captured_implicit", "") | ("offered", "") | None。
 
-    - captured:客戶讀出 8–13 位號碼,且①當前步係引導辦理(問WhatsApp)或②句中明顯提
-      whatsapp/微信/號碼。號碼若命中已知 單號/尾號/電話 則唔當(覆述已知資料)。
+    - captured:客戶讀出 7–13 位號碼(7位容錯 ASR 少聽一位/口誤短號),且①當前步係引導辦理
+      (問WhatsApp)或②句中明顯提 whatsapp/微信/俾號/加我;或③明確自報「我WhatsApp(就)係 XXXX」
+      (撞已知電話/單號都算)。號碼若命中已知 單號/尾號/電話 則唔當(覆述已知資料)。
     - captured_implicit:WhatsApp 步客戶話號碼綁定「呢個來電/呢個號碼」(號喺系統度)——
       唔使讀出 8-13 位;caller 攞對象電話上報 captured。防死鎖:唔會因號碼俾 ASR
       聽亂 / 撞單號就永遠入唔到 captured、AI 無限重複要號。
@@ -352,6 +360,10 @@ def detect_whatsapp_signal(
         # ① 客戶俾出「唔係已知單號/尾號/電話」嘅新號碼 → captured。
         if fresh and (in_wa_step or wa_ctx):
             return ("captured", fresh[0])
+        # ①' 明確自報「我WhatsApp(就)係 XXXX」→ 號碼即 WhatsApp;撞已知電話/單號都照捕
+        #    (真實 case:「我WhatsApp是六四三二五四三」7位+撞對象電話,雙重走漏→唔爆閃、重複追問)。
+        if wa_ctx and _WHATSAPP_NUM_ANNOUNCE_RE.search(t):
+            return ("captured", runs[0])
         # ② WhatsApp 步 + 明確俾號語境(加我/俾號碼)即使撞已知單號 → 仍當佢俾嘅 WhatsApp 號。
         #    真係覆述單號(「單號係…」冇 whatsapp/加我)→ 由 caller_bound 兜,唔喺度誤判。
         if in_wa_step and wa_ctx and _WHATSAPP_ADD_VERB.search(t):
