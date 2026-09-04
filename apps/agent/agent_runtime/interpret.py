@@ -276,7 +276,9 @@ async def entrypoint(ctx) -> None:
                 "enabled": True,
                 "preemptive_tts": False,
                 "max_speech_duration": 10.0,
-                "max_retries": 3,
+                # 同 A 线:每个 PREFLIGHT 吃一次预算,烧穿后 FINAL 只 cancel 不重建
+                # → 译文从零生成。预算 8(PREEMPTIVE_MAX_RETRIES 可回退)。
+                "max_retries": int(os.environ.get("PREEMPTIVE_MAX_RETRIES", "8")),
             },
             interruption={"enabled": True, "min_duration": 1.2, "min_words": 0},
         ),

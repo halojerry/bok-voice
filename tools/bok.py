@@ -877,6 +877,101 @@ def _import_ok(py: Path, module: str) -> bool:
         return False
 
 
+def _doctor_minimax_tts(data: Path, fails: list[str]) -> None:
+    """MiniMax 音色校验探针：settings tts.provider=minimax 时，要求 api_key 非空
+    且至少一个已配音色能在 MiniMax get_voice 下解析。
+
+    - key 缺失 → 静默跳过（凭据永不入码，缺失本身唔算故障——用户可能纯用本地 TTS）。
+    - 无任何已配音色 → 记 warning（设置页漏配，通话会 beep）。
+    - get_voice 可达且列出了音色、但已配音色全部唔喺列表 → 硬 fail（确定性错配）。
+    - 网络不可达/接口异常 → 只提示，唔 fail（doctor 唔依赖外网）。
+    """
+    db = data / "bok_voice.db"
+    if not db.exists():
+        print("minimax tts voice: skipped (no settings db)")
+        return
+    import sqlite3 as _sqlite3
+
+    try:
+        conn = _sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                "SELECT tts_json FROM global_settings WHERE id='global'"
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"minimax tts voice: skipped (settings db unreadable: {exc})")
+        return
+    if not row:
+        print("minimax tts voice: skipped (settings empty)")
+        return
+    try:
+        tts = json.loads(row[0] or "{}")
+    except Exception:
+        tts = {}
+    provider = str(tts.get("provider") or "").strip().lower()
+    if provider not in ("minimax", "minimax_streaming"):
+        return  # 非 MiniMax 供应商:静默返回
+    api_key = str(tts.get("api_key") or "").strip() or os.environ.get("MINIMAX_API_KEY", "").strip()
+    if not api_key:
+        # 静默跳过:未配 key 唔係结构故障。
+        print("minimax tts voice: skipped (provider=minimax but api_key empty)")
+        return
+    voices = [str(tts.get(k) or "").strip() for k in ("speaker", "speaker_zh", "speaker_cantonese", "speaker_en")]
+    configured = [v for v in voices if v]
+    if not configured:
+        msg = "minimax tts: provider=minimax 且已配 key,但 speaker_zh/cantonese/en 全空(通话会静音)"
+        print(f"minimax tts voice: FAIL ({msg})")
+        fails.append(msg)
+        return
+    region = os.environ.get("MINIMAX_REGION", "cn").strip().lower()
+    base = os.environ.get("MINIMAX_BASE_URL", "").strip().rstrip("/")
+    if not base:
+        base = "https://api.minimax.chat/v1" if region in {"intl", "global", "chat"} else "https://api.minimax.cn/v1"
+    root = base.split("/v1/")[0]
+    try:
+        req = urllib.request.Request(
+            f"{root}/v1/get_voice",
+            data=json.dumps({"voice_type": "all"}).encode(),
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            body = json.loads(resp.read().decode())
+    except Exception as exc:
+        # 探针够唔到外网(离线 doctor/网络抖动)→ 只提示,唔当 fail。
+        print(f"minimax tts voice: warning (probe unreachable: {exc})")
+        return
+    if str((body.get("base_resp") or {}).get("status_code")) not in ("0", "None"):
+        print(f"minimax tts voice: warning (get_voice base_resp={body.get('base_resp')})")
+        return
+    found: set[str] = set()
+
+    def _collect(node) -> None:
+        if isinstance(node, dict):
+            vid = node.get("voice_id")
+            if isinstance(vid, str):
+                found.add(vid)
+            for v in node.values():
+                _collect(v)
+        elif isinstance(node, list):
+            for v in node:
+                _collect(v)
+
+    _collect(body.get("data") or {})
+    if not found:
+        print("minimax tts voice: warning (get_voice returned no voices)")
+        return
+    resolved = [v for v in configured if v in found]
+    if resolved:
+        print(f"minimax tts voice: ok ({', '.join(resolved)}; {len(found)} voices on account)")
+    else:
+        msg = f"minimax tts: 已配音色全部唔喺账号音色列表: {configured}"
+        print(f"minimax tts voice: FAIL ({msg})")
+        fails.append(msg)
+
+
 def cmd_doctor() -> int:
     """Preflight diagnostics. In packaged mode every check is a hard gate."""
     key = platform_key()
@@ -983,6 +1078,10 @@ def cmd_doctor() -> int:
             print(f"token endpoint: FAIL ({msg})")
     else:
         print("token endpoint: skipped (control-plane down)")
+
+    # MiniMax 云 TTS 探针:provider=minimax 时校验 api_key 非空 + 至少一个已配音色
+    # 能喺账号音色列表解析(key 缺失静默跳过,凭据永不入码)。
+    _doctor_minimax_tts(data, fails)
 
     if packaged and fails:
         print("\nPACKAGED DOCTOR FAILED:")

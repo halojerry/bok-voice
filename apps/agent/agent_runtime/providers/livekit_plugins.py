@@ -313,6 +313,18 @@ def _forward_extra_kwargs(extra_kwargs):
     return extra_kwargs if extra_kwargs else NOT_GIVEN
 
 
+def _bind_metrics_forward(inner: llm.LLM, outer: llm.LLM) -> None:
+    """包装层把内芯的 LLMMetrics("metrics_collected")转发到自己身上。
+
+    官方管线只在 session.llm(最外层包装)上挂监听(agent_activity.py:
+    self.llm.on("metrics_collected", ...)),而 LLMMetrics 由内芯的流监视器 emit 在
+    【创建流的对象】上(llm/llm.py:432 self._llm.emit)——包装层不转发,LLM metrics
+    永远到不了 session,agent.py 的 LLM_TTFT_MS(official) 哑火(RCA §0.3)。
+    STT 侧 Qwen3ASRLiveSTT 已同款转发;这里给 LLM 包装层统一补齐。
+    """
+    inner.on("metrics_collected", lambda *args, **kwargs: outer.emit("metrics_collected", *args, **kwargs))
+
+
 def _mt_prompt(text: str, target_lang: str) -> str:
     """官方 Hy-MT2 中文翻译模板:只要译文,不解释。"""
     name = _MT_PROMPT_NAMES.get(target_lang, target_lang)
@@ -332,6 +344,7 @@ class StatelessMTLLM(llm.LLM):
         super().__init__()
         self._inner = inner
         self._target_lang = target_lang
+        _bind_metrics_forward(inner, self)
 
     @property
     def model(self) -> str:
@@ -436,6 +449,16 @@ class _ExprPrependStream(llm.LLMStream):
         self._inner = inner
         self._tag = tag
 
+    async def _metrics_monitor_task(self, event_aiter) -> None:
+        # 官方 LLMStream 基类会为每条流跑一个 metrics 监视器,流结束时在【绑定的
+        # llm】上 emit "metrics_collected"(llm/llm.py:432)。本流只是「expr 标记块 +
+        # 透传内芯」:若照基类 emit,会得到一份 TTFT≈0 的假 LLMMetrics(expr 标记块
+        # 是首块、has_response()=True 直接掐表),且 usage 与内芯那份双计。真实
+        # LLMMetrics 由内芯(MlxLlmLLM)发出、经 _bind_metrics_forward 逐层转发,
+        # 这里只排空监视分支(tee 的另一个 peer 不排空会白积 buffer),不 emit。
+        async for _ in event_aiter:
+            pass
+
     async def _run(self):
         self._event_ch.send_nowait(
             llm.ChatChunk(id="expr-tag", delta=llm.ChoiceDelta(content=self._tag, role="assistant"))
@@ -452,7 +475,7 @@ class ContextState:
     message (top-K snippets + bounded conversation summary) each turn.
     """
 
-    def __init__(self, account_id: str = "", max_snippets: int = 3, max_summary_chars: int = 800):
+    def __init__(self, account_id: str = "", max_snippets: int = 2, max_summary_chars: int = 1200):
         self.account_id = account_id
         self._max_snippets = max_snippets
         self._max_summary_chars = max_summary_chars
@@ -502,8 +525,10 @@ class ContextState:
         for s in snippets or []:
             text = str(s.get("text", "") or "").strip()
             # 单条截断：防超大文档整段进 system（单条无限长会撑爆每轮 prefill）。
-            if len(text) > 350:
-                text = text[:349] + "…"
+            # 150 字≈尾部预算目标 ≤~120 token 的一条配额（瘦砍自 350：尾部整段
+            # 每轮重 prefill，是 TTFT 大头）。
+            if len(text) > 150:
+                text = text[:149] + "…"
             if text and text not in seen:
                 seen.add(text)
                 out.append(text)
@@ -592,9 +617,11 @@ class ContextState:
                 + "不要生硬说查不到。"
             )
         if self._summary_lines:
-            # 只带最近几轮记忆(默认 3):每轮 prefill 只吃尾部增量,行数越多 TTFT 越长;
+            # 只带最近几轮记忆(默认 6):尾部每轮 prefill 只吃增量,行数是 TTFT 杠杆;
             # 更早的上下文由原始历史截断(LLM_HISTORY_TURNS)与当前步约束兜底。
-            keep = max(1, int(os.environ.get("REPLY_MEMORY_LINES", "3")))
+            # 3→6:history 截断改摊销式后中间轮次间隔变大,多带几行摘要补上下文,
+            # 同时知识 snippet 已瘦砍(150 字×2 条),尾部总预算仍 ≤~120 token 典型。
+            keep = max(1, int(os.environ.get("REPLY_MEMORY_LINES", "6")))
             parts.append("【本通对话记忆】\n" + "\n".join(self._summary_lines[-keep:]))
         return "\n\n".join(parts)
 
@@ -644,6 +671,7 @@ class ContextAwareLLM(llm.LLM):
         super().__init__()
         self._inner = inner
         self._ctx = context_state
+        _bind_metrics_forward(inner, self)
 
     def chat(
         self,
@@ -688,9 +716,10 @@ class ContextAwareLLM(llm.LLM):
                                 new_content = [*content, tail]
                             items[j] = llm.ChatMessage(role="user", content=new_content)
                             break
-                # 截断历史:保留最近 N 轮(默认 4 对),更早的靠「本通对话记忆」摘要兜底。
-                # 每轮全量历史会让 prefill 随轮次线性变慢(实测 12 轮 TTFT 2.4s);
-                # 截断让上下文有上界,TTFT 稳定。
+                # 截断历史(摊销式,见 _truncate_chat_items):超过 2×N 对才剪回 N 对
+                # (默认 4 对),更早的靠「本通对话记忆」摘要兜底。每轮全量历史会让
+                # prefill 随轮次线性变慢(实测 12 轮 TTFT 2.4s);滞回让截断之间保持
+                # 纯追加(KV-cache 命中),上下文仍有上界。
                 max_turns = int(os.environ.get("LLM_HISTORY_TURNS", "4"))
                 items = _truncate_chat_items(items, max_turns=max_turns)
                 copy.items = items
@@ -706,10 +735,13 @@ class ContextAwareLLM(llm.LLM):
 
 
 def _truncate_chat_items(items: list, max_turns: int = 4) -> list:
-    """保留开头 system(s) + 最近 max_turns 轮(user/assistant 对)。
+    """保留开头 system(s) + 对话历史;摊销式截断（滞回）。
 
-    livekit 的 chat_ctx 累积整通历史;旧轮信息由 ContextState 的「本通对话记忆」
-    摘要承担,这里只把原始对话剪到最近几轮,控制 prefill token 上界。
+    旧实现:dialog 一超过 max_turns 对就【每轮】截到 max_turns 对——截断动了序列
+    头部,mlx KV-cache(只认严格前缀)每轮重新锚定,省下的 prefill 全赔回去。
+    现在:dialog 涨到 2×max_turns 对才动手、一次剪回 max_turns 对——之后 max_turns
+    轮内纯追加(缓存逐轮命中),每 max_turns 轮才重锚一次。更早的信息由
+    ContextState「本通对话记忆」摘要承担,剪掉不丢上下文。
     """
     if max_turns <= 0:
         return items
@@ -722,9 +754,9 @@ def _truncate_chat_items(items: list, max_turns: int = 4) -> list:
             break
     system_part = items[:split]
     dialog = items[split:]
-    if len(dialog) <= max_turns * 2:
+    # 滞回:超过 2×max_turns 对(4×max_turns 条)才截,剪回 max_turns 对。
+    if len(dialog) <= max_turns * 4:
         return items
-    # 保留最近 max_turns 对(2*max_turns 条),截断更早的
     return system_part + dialog[-(max_turns * 2) :]
 
 
@@ -747,6 +779,7 @@ class ExprAwareLLM(llm.LLM):
 
         self._emotion = EmotionProcessor()
         self._emotion_state = emotion_state
+        _bind_metrics_forward(inner, self)
 
     def chat(self, *, chat_ctx, tools=None, conn_options=None, parallel_tool_calls=None, tool_choice=None, extra_kwargs=NOT_GIVEN):
         last_user = ""
@@ -1459,7 +1492,9 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                 if not s:
                     return False
                 tail = s.rstrip("。！？!?，、；;：: \t")
-                return not (tail and (tail[-1].isdigit() or tail[-1].isalpha()))
+                # 只拦 latin/数字结尾(词/号码可能被拦腰截断)。唔可以用裸 isalpha():
+                # CJK 汉字 isalpha()==True → 中文片段全被拦,overlap 对中文全死。
+                return not (tail and tail[-1].isascii() and tail[-1].isalnum())
 
             async def _send_text(s: str) -> None:
                 nonlocal sent_any, _last_send
@@ -1783,7 +1818,13 @@ class Qwen3TTSTTS(tts.TTS):
         sample_rate: int = 24000,
     ):
         super().__init__(
-            capabilities=tts.TTSCapabilities(streaming=False, aligned_transcript=False),
+            # 真流式（对齐 MiniMaxTTS）：sidecar /v1/audio/speech 本身就按 chunk_ms
+            # 流式回 PCM（非 StreamAdapter 模拟）。声明 streaming=True 后 voice 管线
+            # 直接调 stream() 把 LLM 增量文本喂进来,不再被 StreamAdapter +
+            # blingfire SentenceTokenizer 包（那要等整句边界,中文切句不可靠,
+            # 实测多等 150-790ms 才有第一段文本可合成）。分句/增量节奏由
+            # _Qwen3SynthesizeStream 自己掌（一任务一句,POST 流式回帧）。
+            capabilities=tts.TTSCapabilities(streaming=True, aligned_transcript=False),
             sample_rate=sample_rate,
             num_channels=1,
         )
@@ -1801,6 +1842,10 @@ class Qwen3TTSTTS(tts.TTS):
     def synthesize(self, text, *, conn_options=None):
         return _Qwen3TTSStream(self, text, conn_options or APIConnectOptions())
 
+    def stream(self, *, conn_options=None):
+        """真流式 SynthesizeStream：LLM 文本增量到达,按句切任务 POST sidecar。"""
+        return _Qwen3SynthesizeStream(self, conn_options or APIConnectOptions())
+
     def _resolve_voice(self) -> str:
         if isinstance(self._voice, dict):
             return str(self._voice.get(self._language_state.lang) or self._voice.get("zh") or "")
@@ -1814,7 +1859,134 @@ class Qwen3TTSTTS(tts.TTS):
         return raw
 
 
+async def _qwen3_tts_post_frames(
+    tts_: "Qwen3TTSTTS",
+    text: str,
+    output_emitter,
+    state: dict,
+    *,
+    end_segment: bool = True,
+) -> bool:
+    """单个合成任务：POST 一段文本到 qwen3-tts sidecar,把 PCM 流切成 200ms 帧推给
+    emitter(首个 ~40ms 早推,与旧 _Qwen3TTSStream 同款节奏)。
+
+    state={"started": bool} 跨任务共享——多段流式共用同一个 emitter 初始化与
+    segment,只在首段 initialize。voice/instruct/emotion 每任务即时解析
+    (情绪变化逐段生效,等价 MiniMax 的 task_start 语义)。
+    end_segment=False 时由调用方(流式路径)在整场文本结束后统一收尾。
+    返回是否成功推出音频。
+    """
+    last_exc: Exception | None = None
+    pushed_any = False  # 本任务是否已有音频落地(半途断流后重试会重读音频)
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(
+                    f"{tts_._base_url}/v1/audio/speech",
+                    json={
+                        "input": text,
+                        "voice": tts_._resolve_voice(),
+                        "language": tts_._language_state.lang,
+                        "instruct": tts_._resolve_instruct(),
+                        "sample_rate": tts_.sample_rate,
+                        "response_format": "pcm",
+                        "streaming": True,
+                        "chunk_ms": 200,
+                    },
+                )
+                resp.raise_for_status()
+                # Stream the PCM body into 200ms frames. The sidecar
+                # streams with non_streaming_mode=False (Qwen3-TTS
+                # Dual-Track fast path), and pushing frames here lets
+                # LiveKit start playback/barge-in handling as soon as
+                # the first frames are available instead of one blob.
+                pcm_total = 0
+                frame_bytes = (tts_.sample_rate // 5) * 2  # 200ms, 16-bit mono
+                buf = bytearray()
+                first_audio = False
+                if not state["started"]:
+                    output_emitter.initialize(
+                        request_id="qwen3-tts",
+                        sample_rate=tts_.sample_rate,
+                        num_channels=tts_.num_channels,
+                        mime_type="audio/pcm",
+                        stream=True,
+                    )
+                    state["started"] = True
+                    output_emitter.start_segment(segment_id="qwen3-tts")
+                async for data in resp.aiter_bytes():
+                    buf.extend(data)
+                    # Push the first partial frame as soon as ~40ms is
+                    # available instead of waiting for a full 200ms
+                    # buffer: the sidecar streams ~83ms model chunks
+                    # (QWEN3_TTS_STREAM_INTERVAL=0.1), so this shaves
+                    # ~150ms off the time-to-first-audio without
+                    # changing steady-state frame size.
+                    if not first_audio and len(buf) >= frame_bytes // 5:
+                        output_emitter.push(bytes(buf))
+                        output_emitter.flush()
+                        pcm_total += len(buf)
+                        buf.clear()
+                        first_audio = True
+                        pushed_any = True
+                    while len(buf) >= frame_bytes:
+                        output_emitter.push(bytes(buf[:frame_bytes]))
+                        output_emitter.flush()
+                        del buf[:frame_bytes]
+                        pcm_total += frame_bytes
+                        pushed_any = True
+                if buf:
+                    output_emitter.push(bytes(buf))
+                    output_emitter.flush()
+                    pcm_total += len(buf)
+                    pushed_any = True
+                if end_segment:
+                    output_emitter.end_segment()
+                print("QWEN3_TTS_BYTES", pcm_total, flush=True)
+                return True
+        except Exception as exc:  # noqa: BLE001 - retry transient gateway failures
+            last_exc = exc
+            if pushed_any:
+                # 半途断流:本句已有音频推进 emitter,重 POST 会从 byte 0 重推同句
+                # (听感重读)。有音频落地就唔重试,交上层决定收尾姿势。
+                print("QWEN3_TTS_MIDSTREAM_ABORT", attempt + 1, repr(exc), flush=True)
+                break
+            print("QWEN3_TTS_RETRY", attempt + 1, repr(exc), flush=True)
+            await asyncio.sleep(0.5 * (attempt + 1))
+    print("QWEN3_TTS_ERROR", repr(last_exc), flush=True)
+    return False
+
+
+async def _qwen3_tts_beep(tts_, output_emitter):
+    """故障蜂鸣。真 AudioEmitter.push 喺未 initialize 时会抛
+    "AudioEmitter isn't started"（tts.py:900），上层 except:pass 静默吞掉 →
+    客户面对无差别静音。所以 beep 自己先 initialize+start_segment。
+    调用方约定：只喺「本场零音频」（state["started"]=False）时调用，唔会重初始化。
+    """
+    output_emitter.initialize(
+        request_id="qwen3-tts-beep",
+        sample_rate=tts_.sample_rate,
+        num_channels=tts_.num_channels,
+        mime_type="audio/pcm",
+        stream=True,
+    )
+    output_emitter.start_segment(segment_id="qwen3-tts-beep")
+    import math
+
+    sr = tts_.sample_rate
+    n = int(sr * 0.4)
+    pcm = bytearray()
+    for i in range(n):
+        v = int(12000 * math.sin(2 * math.pi * 440 * i / sr))
+        pcm += v.to_bytes(2, "little", signed=True)
+    output_emitter.push(bytes(pcm))
+    output_emitter.flush()
+    output_emitter.end_segment()
+
+
 class _Qwen3TTSStream(tts.ChunkedStream):
+    """整段合成（synthesize 兼容路径）：一段文本一个任务,POST 流式回帧。"""
+
     def __init__(self, tts_, text, conn_options):
         super().__init__(tts=tts_, input_text=text, conn_options=conn_options)
         self._text = text
@@ -1823,78 +1995,11 @@ class _Qwen3TTSStream(tts.ChunkedStream):
     async def _run(self, output_emitter):
         # emitter 是否已 initialize：未收到响应就被打断/挂断时 emitter 从未启动，
         # 此时 flush 会抛 "AudioEmitter isn't started"（误报 TTS 断链）。只在已启动后收尾。
-        started = False
+        state = {"started": False}
         try:
-            last_exc: Exception | None = None
-            for attempt in range(3):
-                try:
-                    async with httpx.AsyncClient(timeout=120) as client:
-                        resp = await client.post(
-                            f"{self._tts_._base_url}/v1/audio/speech",
-                            json={
-                                "input": self._text,
-                                "voice": self._tts_._resolve_voice(),
-                                "language": self._tts_._language_state.lang,
-                                "instruct": self._tts_._resolve_instruct(),
-                                "sample_rate": self._tts_.sample_rate,
-                                "response_format": "pcm",
-                                "streaming": True,
-                                "chunk_ms": 200,
-                            },
-                        )
-                        resp.raise_for_status()
-                        # Stream the PCM body into 200ms frames. The sidecar
-                        # streams with non_streaming_mode=False (Qwen3-TTS
-                        # Dual-Track fast path), and pushing frames here lets
-                        # LiveKit start playback/barge-in handling as soon as
-                        # the first frames are available instead of one blob.
-                        pcm_total = 0
-                        frame_bytes = (
-                            self._tts_.sample_rate // 5
-                        ) * 2  # 200ms, 16-bit mono
-                        buf = bytearray()
-                        first_audio = False
-                        output_emitter.initialize(
-                            request_id="qwen3-tts",
-                            sample_rate=self._tts_.sample_rate,
-                            num_channels=self._tts_.num_channels,
-                            mime_type="audio/pcm",
-                            stream=True,
-                        )
-                        started = True
-                        output_emitter.start_segment(segment_id="qwen3-tts")
-                        async for data in resp.aiter_bytes():
-                            buf.extend(data)
-                            # Push the first partial frame as soon as ~40ms is
-                            # available instead of waiting for a full 200ms
-                            # buffer: the sidecar streams ~83ms model chunks
-                            # (QWEN3_TTS_STREAM_INTERVAL=0.1), so this shaves
-                            # ~150ms off the time-to-first-audio without
-                            # changing steady-state frame size.
-                            if not first_audio and len(buf) >= frame_bytes // 5:
-                                output_emitter.push(bytes(buf))
-                                output_emitter.flush()
-                                pcm_total += len(buf)
-                                buf.clear()
-                                first_audio = True
-                            while len(buf) >= frame_bytes:
-                                output_emitter.push(bytes(buf[:frame_bytes]))
-                                output_emitter.flush()
-                                del buf[:frame_bytes]
-                                pcm_total += frame_bytes
-                        if buf:
-                            output_emitter.push(bytes(buf))
-                            output_emitter.flush()
-                            pcm_total += len(buf)
-                        output_emitter.end_segment()
-                        print("QWEN3_TTS_BYTES", pcm_total, flush=True)
-                        return
-                except Exception as exc:  # noqa: BLE001 - retry transient gateway failures
-                    last_exc = exc
-                    print("QWEN3_TTS_RETRY", attempt + 1, repr(exc), flush=True)
-                    await asyncio.sleep(0.5 * (attempt + 1))
-            if not asyncio.current_task().cancelling():
-                print("QWEN3_TTS_ERROR", repr(last_exc), flush=True)
+            ok = await _qwen3_tts_post_frames(self._tts_, self._text, output_emitter, state)
+            # beep 只畀「全场零音频」:音频已出过再失败,补 beep 会叠喺已播内容后面。
+            if not ok and not state["started"] and not asyncio.current_task().cancelling():
                 await self._emit_beep(output_emitter)
         except asyncio.CancelledError:
             # 会话关闭/打断时不播放故障蜂鸣，直接收尾。
@@ -1903,23 +2008,140 @@ class _Qwen3TTSStream(tts.ChunkedStream):
             print("QWEN3_TTS_FATAL", repr(exc), flush=True)
             await self._emit_beep(output_emitter)
         finally:
-            if started:
+            if state["started"]:
                 try:
                     output_emitter.flush()
                 except Exception:  # pragma: no cover - 收尾失败不影响主流程
                     pass
 
     async def _emit_beep(self, output_emitter):
-        import math
+        await _qwen3_tts_beep(self._tts_, output_emitter)
 
-        sr = self._tts_.sample_rate
-        n = int(sr * 0.4)
-        pcm = bytearray()
-        for i in range(n):
-            v = int(12000 * math.sin(2 * math.pi * 440 * i / sr))
-            pcm += v.to_bytes(2, "little", signed=True)
-        output_emitter.push(bytes(pcm))
-        output_emitter.flush()
+
+class _Qwen3SynthesizeStream(tts.SynthesizeStream):
+    """Qwen3-TTS 增量流式（镜像 _MiniMaxSynthesizeStream 结构）。
+
+    LLM 文本增量 push 进来后按句切任务,一任务一次 HTTP POST(与 synthesize()
+    同一端点同一 JSON),sidecar 边合成边流 PCM,这里收一段推一段。首段音频
+    在第一个句号就开推,唔再等 SentenceTokenizer 凑整句/全文。
+    - voice/instruct/emotion 每任务经 _resolve_voice/_resolve_instruct 即时解析。
+    - overlap:句号之间的增量满足「≥N 字且有软停顿/距上次够久」提前送
+      (QWEN3_TTS_OVERLAP,默认开);连续数字/字母串唔切开(防单号腰斩)。
+    - 任一任务三次重试都失败 → 置 broken 停止后续任务(唔逐句白等 3 轮);
+      全场一字未出(emitter 未启动)则补一声 beep,唔畀客户面对无差别静音。
+    """
+
+    def __init__(self, tts_: "Qwen3TTSTTS", conn_options):
+        super().__init__(tts=tts_, conn_options=conn_options)
+        self._tts_ = tts_
+
+    async def _run(self, output_emitter):
+        state = {"started": False}
+        broken = False
+        pushed_any = False
+        try:
+            _SENT_END = "。！？!?"
+            _SOFT_BREAK = "，、；;：:"
+            try:
+                overlap_on = os.environ.get("QWEN3_TTS_OVERLAP", "1") == "1"
+            except Exception:  # pragma: no cover
+                overlap_on = True
+            try:
+                _overlap_chars = int(os.environ.get("QWEN3_TTS_OVERLAP_CHARS", "12"))
+            except Exception:  # pragma: no cover
+                _overlap_chars = 12
+            try:
+                _overlap_ms = int(os.environ.get("QWEN3_TTS_OVERLAP_MS", "300"))
+            except Exception:  # pragma: no cover
+                _overlap_ms = 300
+            _last_send = time.monotonic()
+
+            def _flushable(s: str) -> bool:
+                """overlap 增量可否送出：不能把连续的号码/数字串拦腰截断。"""
+                if not s:
+                    return False
+                tail = s.rstrip("。！？!?，、；;：: \t")
+                # 只拦 latin/数字结尾(词/号码可能被拦腰截断)。唔可以用裸 isalpha():
+                # CJK 汉字 isalpha()==True → 中文片段全被拦,overlap 对中文全死。
+                return not (tail and tail[-1].isascii() and tail[-1].isalnum())
+
+            sent_buf = ""
+            async for item in self._input_ch:
+                if isinstance(item, self._FlushSentinel):
+                    continue
+                text = str(item or "")
+                if not text.strip():
+                    continue
+                pushed_any = True
+                sent_buf += text
+                while True:
+                    idx = min(
+                        (sent_buf.find(ch) for ch in _SENT_END if sent_buf.find(ch) != -1),
+                        default=-1,
+                    )
+                    if idx == -1:
+                        break
+                    sentence = sent_buf[: idx + 1]
+                    sent_buf = sent_buf[idx + 1 :]
+                    if sentence.strip():
+                        ok = await _qwen3_tts_post_frames(
+                            self._tts_, sentence.strip(), output_emitter, state,
+                            end_segment=False,
+                        )
+                        _last_send = time.monotonic()
+                        if not ok:
+                            broken = True
+                            break
+                if broken:
+                    break
+                # overlap:句号之间的增量提前送(与 MiniMax 同款节奏)。
+                if (
+                    overlap_on
+                    and not broken
+                    and sent_buf.strip()
+                    and len(sent_buf.strip()) >= _overlap_chars
+                ):
+                    soft_idx = -1
+                    for ch in _SOFT_BREAK:
+                        pos = sent_buf.rfind(ch)
+                        if pos != -1:
+                            soft_idx = max(soft_idx, pos)
+                    now = time.monotonic()
+                    time_up = (now - _last_send) * 1000 >= _overlap_ms
+                    if (soft_idx != -1 and soft_idx >= len(sent_buf.strip()) // 2) or time_up:
+                        frag = sent_buf.strip()
+                        if _flushable(frag):
+                            ok = await _qwen3_tts_post_frames(
+                                self._tts_, frag, output_emitter, state,
+                                end_segment=False,
+                            )
+                            _last_send = time.monotonic()
+                            if not ok:
+                                broken = True
+                                break
+                            sent_buf = ""
+            if not broken and sent_buf.strip():
+                # 收尾残句:全场文本结束,把没凑够一句的尾巴合成掉。
+                await _qwen3_tts_post_frames(
+                    self._tts_, sent_buf.strip(), output_emitter, state,
+                    end_segment=False,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print("QWEN3_TTS_STREAM_FATAL", repr(exc), flush=True)
+        finally:
+            if state["started"]:
+                try:
+                    output_emitter.end_segment()
+                except Exception:  # pragma: no cover - 收尾失败不影响主流程
+                    pass
+            elif pushed_any and not asyncio.current_task().cancelling():
+                # 一段音频都冇出过(sidecar 挂了):beep 一下,至少证明 AI 有反应。
+                try:
+                    await _qwen3_tts_beep(self._tts_, output_emitter)
+                except Exception:  # pragma: no cover
+                    pass
 
 
 # ASR 语言提示:值=模型 config support_languages 的规范名(mlx 层大小写不敏感匹配)。
@@ -2080,6 +2302,12 @@ def _common_prefix(a: str, b: str) -> str:
 
 
 _ASR_PARTIAL_POST_MS = float(os.environ.get("QWEN3_ASR_CHUNK_MS", "300"))
+# PREFLIGHT(抢跑)发射节流:稳定前缀比【上次发射】至少长 4 字才再发(首发仍须 ≥6 字)。
+# 每个 PREFLIGHT 事件都吃一次框架抢跑预算(on_preemptive_generation count+1,
+# max_retries 封顶;烧穿后 FINAL 到达只 cancel 不重建 → commit 从零生成,实测 +0.2-0.7s)。
+# 长句滑窗每 ~300ms 一窗、逐字增长,旧「比 _stable 长 1 字就发」会把预算在说话中途
+# 烧光;≥4 字(约一个词组)把 3s 句的发射从 3-5 次压到 1-2 次,FINAL 那拍预算必够。
+_ASR_PREFLIGHT_MIN_GROWTH_CHARS = 4
 
 
 class _Qwen3ASRLiveStream(stt.RecognizeStream):
@@ -2206,10 +2434,14 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                 alternatives=[stt.SpeechData(language=lang, text=text)],
             )
         )
-        # 稳定前缀：与上一窗的公共前缀，≥6 字且有新增才升级 PREFLIGHT（抢跑）。
+        # 稳定前缀：与上一窗的公共前缀，首发 ≥6 字；再发须比上次发射多 ≥
+        # _ASR_PREFLIGHT_MIN_GROWTH_CHARS 字（长度增长节流，保框架抢跑预算给 FINAL）。
         common = _common_prefix(self._prev_partial, text)
         self._prev_partial = text
-        if len(common) >= 6 and len(common) > len(self._stable):
+        if (
+            len(common) >= 6
+            and len(common) - len(self._stable) >= _ASR_PREFLIGHT_MIN_GROWTH_CHARS
+        ):
             self._stable = common
             self._event_ch.send_nowait(
                 stt.SpeechEvent(

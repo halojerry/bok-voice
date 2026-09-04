@@ -187,3 +187,173 @@ def test_truncate_chat_items_short_untouched():
              lk_llm.ChatMessage(role="assistant", content=["a"])]
     out = _truncate_chat_items(items, max_turns=4)
     assert len(out) == 3
+
+
+def test_truncate_chat_items_amortized_hysteresis():
+    """摊销式截断(滞回):超过 max_turns 对但未到 2×max_turns 对 → 不截(纯追加,
+    KV-cache 逐轮命中);到 2×max_turns 对才一次剪回 max_turns 对。
+
+    旧实现每轮剪到 max_turns 对,序列头部每轮都动 → mlx 缓存每轮重锚(实测
+    +1.3s/轮),截断反而比不截慢。
+    """
+    from agent_runtime.providers.livekit_plugins import _truncate_chat_items
+
+    from livekit.agents import llm as lk_llm
+
+    def msg(role, txt):
+        return lk_llm.ChatMessage(role=role, content=[txt])
+
+    def build(pairs):
+        items = [msg("system", "s")]
+        for i in range(pairs):
+            items.append(msg("user", f"客户{i}"))
+            items.append(msg("assistant", f"回复{i}"))
+        return items
+
+    # 6 对:超过 max_turns(4) 但未到 2×max_turns(8) → 原样返回(不截)
+    items6 = build(6)
+    assert _truncate_chat_items(items6, max_turns=4) is items6
+
+    # 9 对:到 2×max_turns 对 → 剪回 max_turns 对(8 条)
+    out = _truncate_chat_items(build(9), max_turns=4)
+    roles = [getattr(m, "role", "") for m in out]
+    assert roles[0] == "system"
+    assert roles[1:] == ["user", "assistant"] * 4
+    assert out[-1].content == ["回复8"]
+
+
+def test_preflight_throttled_by_prefix_growth(monkeypatch):
+    """PREFLIGHT 节流:首发 ≥6 字;再发须比上次发射多 ≥4 字。
+
+    每个 PREFLIGHT 吃一次框架抢跑预算(max_retries);旧「比 _stable 长 1 字就发」
+    会把预算在长句说话中途烧光(FINAL 到达只 cancel 不重建 → 从零生成)。
+    """
+    import types
+
+    from agent_runtime.providers import livekit_plugins as lp
+    from agent_runtime.providers.livekit_plugins import (
+        Qwen3ASRSTT,
+        _ASR_PREFLIGHT_MIN_GROWTH_CHARS,
+        _Qwen3ASRLiveStream,
+    )
+
+    class _FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"text": _FakeClient.text, "language": "cantonese"}
+
+    class _FakeClient:
+        text = ""
+
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **kw):
+            return _FakeResp()
+
+    monkeypatch.setattr(lp, "httpx", types.SimpleNamespace(AsyncClient=_FakeClient))
+
+    async def partial_with_text(stream, text):
+        stream._session_id = "sid"
+        stream._last_post = 0.0
+        stream._pending = bytearray(16000 * 2)  # ≥0.6s PCM,过门槛
+        _FakeClient.text = text
+        await stream._maybe_partial()
+
+    async def scenario():
+        stream = _Qwen3ASRLiveStream(
+            Qwen3ASRSTT(base_url="http://127.0.0.1:8787"),
+            vad=object(),
+            conn_options=lp.APIConnectOptions(),
+        )
+        try:
+            # 逐窗增长:common 前缀长度 = 0 / 2 / 4 / 8(首发) / 11(只 +3,唔发) / 12(+4,再发)
+            texts = [
+                "唔該",                      # common=""(首窗无参照)
+                "唔該幫我",                  # common=2 <6
+                "唔該幫我查下件貨",          # common=4 <6
+                "唔該幫我查下件貨幾時到",    # common=8 ≥6 且 +8 ≥4 → 首发
+                "唔該幫我查下件貨幾時到呀",  # common=11,+3 <4 → 节流不发(旧码会发)
+                "唔該幫我查下件貨幾時到呀唔該",  # common=12,+4 → 再发
+            ]
+            stables = []
+            for t in texts:
+                await partial_with_text(stream, t)
+                stables.append(stream._stable)
+            return stables
+        finally:
+            stream._event_ch.close()
+            try:
+                await asyncio.wait_for(stream._metrics_task, 1)
+            except Exception:  # noqa: BLE001 - 监视任务收尾失败不影响断言
+                pass
+
+    stables = asyncio.run(scenario())
+    # 首发在 8 字窗(≥6),第三窗(4 字)仍未发
+    assert stables[2] == "" and stables[3] == "唔該幫我查下件貨"
+    # +3 字窗被节流(_stable 不动);+4 字窗才再发——正好等于增长阈值
+    assert stables[4] == "唔該幫我查下件貨"
+    assert len(stables[5]) == len(stables[4]) + _ASR_PREFLIGHT_MIN_GROWTH_CHARS
+    assert stables[5] == "唔該幫我查下件貨幾時到呀"
+
+
+def test_minimax_overlap_flushes_cjk_fragment(monkeypatch):
+    """overlap 对 CJK 生效:≥12 字带软停顿的片段喺 end_input 前就 task_continue。
+
+    旧 _flushable 用裸 isalpha()/isdigit() 拦尾——CJK 汉字 isalpha()==True,
+    中文片段全被拦,MINIMAX_TTS_OVERLAP 对中文流量全死。
+    """
+    import json
+
+    sent: list[dict] = []
+    recv_count = {"n": 0}
+
+    class FakeWS:
+        async def recv(self):
+            recv_count["n"] += 1
+            if recv_count["n"] == 1:
+                return json.dumps({"event": "connected_success"})
+            if recv_count["n"] == 2:
+                return json.dumps({"event": "task_started"})
+            await asyncio.Event().wait()  # 挂起:等 _task.cancel 收尾
+
+        async def send(self, payload):
+            sent.append(json.loads(payload))
+
+        async def close(self):
+            pass
+
+    async def fake_connect(*a, **kw):
+        return FakeWS()
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    tts = _make_tts()
+
+    async def run():
+        from livekit.agents import APIConnectOptions
+
+        from agent_runtime.providers.livekit_plugins import _MiniMaxSynthesizeStream
+
+        s = _MiniMaxSynthesizeStream(tts, APIConnectOptions())
+        s.push_text("今日天氣好好，")  # 7 字 < 12:唔送
+        await asyncio.sleep(0.35)  # 超过默认 MINIMAX_TTS_OVERLAP_MS=300
+        s.push_text("我哋去飲茶啦")  # 凑够 13 字,软停顿喺后半 → 可送
+        for _ in range(100):
+            if [m for m in sent if m.get("event") == "task_continue"]:
+                break
+            await asyncio.sleep(0.05)
+        s._task.cancel()
+
+    asyncio.run(asyncio.wait_for(run(), timeout=10))
+    cont = [m for m in sent if m.get("event") == "task_continue"]
+    assert cont, "CJK 片段应喺 end_input 前由 overlap 提前 task_continue"
+    assert cont[0]["text"] == "今日天氣好好，我哋去飲茶啦"

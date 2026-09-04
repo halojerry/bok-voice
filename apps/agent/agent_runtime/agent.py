@@ -750,7 +750,12 @@ async def entrypoint(ctx):
                 # dev 可 PREEMPTIVE_TTS=1 实验首声再提前。
                 "preemptive_tts": os.environ.get("PREEMPTIVE_TTS", "0") == "1",
                 "max_speech_duration": 10.0,
-                "max_retries": 3,
+                # 抢跑重试预算:每个 PREFLIGHT 事件 count+1(agent_activity.py:2392),
+                # 烧穿后 FINAL 到达只 cancel 不重建 → commit 从零生成、新请求还排在
+                # 被 cancel 的 prefill 后面(实测 +0.2-0.7s)。PREFLIGHT 已节流(稳定
+                # 前缀 ≥4 字增长才发),预算 8 保证长句 FINAL 那拍抢跑必存活。
+                # PREEMPTIVE_MAX_RETRIES 可回退。
+                "max_retries": int(os.environ.get("PREEMPTIVE_MAX_RETRIES", "8")),
             },
             interruption={
                 "enabled": interruption_enabled,
@@ -833,19 +838,26 @@ async def entrypoint(ctx):
 
     # 官方 metrics(LLM/TTS/EOU/VAD):统一落 agent.log,口径与官方文档/仪表一致。
     # llm 行保留 LLM_TTFT_MS 旧标记(延迟调优脚本/文档沿用);tts/eou 补官方盲区。
+    # 1.7.1 两个坑(曾整条静默失效,RCA §0.3):
+    # ① metrics.type 字面量是 llm_metrics/tts_metrics/eou_metrics(metrics/base.py),
+    #    不是 llm/tts/eou——旧判断永远不中,事件其实一直在发(agent_activity.py:1967
+    #    转发 provider 指标、:2683 直接发 EOU);
+    # ② LLMMetrics emit 在【创建流的对象】上(llm/llm.py:432),A 线 LLM 有两层包装
+    #    (ContextAwareLLM→ExprAwareLLM→MlxLlmLLM),包装层已补 _bind_metrics_forward
+    #    转发,否则 llm 行收不到(tts/stt 无包装,本来就通)。
     def _on_metrics(ev):
         m = getattr(ev, "metrics", None)
         kind = getattr(m, "type", "")
         try:
-            if kind == "llm":
+            if kind == "llm_metrics":
                 print(
                     f"LLM_TTFT_MS {m.ttft * 1000:.0f} (official) "
                     f"prompt={m.prompt_tokens} gen={m.completion_tokens} tps={m.tokens_per_second:.1f}",
                     flush=True,
                 )
-            elif kind == "tts":
+            elif kind == "tts_metrics":
                 print(f"AGENT_METRICS tts ttfb={m.ttfb * 1000:.0f}ms audio={m.audio_duration:.2f}s", flush=True)
-            elif kind == "eou":
+            elif kind == "eou_metrics":
                 print(
                     f"AGENT_METRICS eou delay={m.end_of_utterance_delay * 1000:.0f}ms "
                     f"transcription={m.transcription_delay * 1000:.0f}ms",
