@@ -38,8 +38,8 @@ async function main() {
       maxQueueMs: 4000,
     }),
     new TranslationChannel({
-      id: "ch-yue-zh",
-      sourceLang: "yue",
+      id: "ch-cantonese-zh",
+      sourceLang: "cantonese",
       targetLang: "zh",
       asr: useReal
         ? new Qwen3ASRProvider({ baseUrl: config.asr.base_url, sampleRate: config.asr.sample_rate, vad: new EnergyVAD({ sampleRate: config.asr.sample_rate }) })

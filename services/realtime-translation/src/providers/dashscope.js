@@ -12,7 +12,7 @@ const DEFAULT_OPTS = {
 // Qwen-MT expects English full names; map our UI codes.
 const LANG_NAME = {
   zh: "Chinese",
-  yue: "Cantonese",
+  cantonese: "Cantonese",
   en: "English",
   auto: "auto",
 };

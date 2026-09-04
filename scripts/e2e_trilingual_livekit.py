@@ -2,7 +2,7 @@
 
 流程：
   1) 连接 LiveKit，加入房间
-  2) 依次推送 zh/yue/en 测试音频（16k PCM）
+  2) 依次推送 zh/cantonese/en 测试音频（16k PCM）
   3) 收集 agent 回复音频轨道
   4) 用 sidecar ASR 转写回复音频，断言语言标签正确
 凭据：默认走真实 control-plane /api/token（与前端 UI 同一条链路）；
@@ -32,7 +32,7 @@ AUDIO_DIR = ROOT / "tests" / "fixtures" / "audio"
 
 _ALL_CASES = [
     {"lang": "zh", "file": "zh.wav", "expect_lang": "Chinese"},
-    {"lang": "cantonese", "file": "yue.wav", "expect_lang": "Cantonese"},
+    {"lang": "cantonese", "file": "cantonese.wav", "expect_lang": "Cantonese"},
     {"lang": "en", "file": "en.wav", "expect_lang": "English"},
 ]
 CASES = [

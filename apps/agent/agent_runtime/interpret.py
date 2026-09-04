@@ -28,7 +28,7 @@ def _norm_lang(raw: str, default: str = "zh") -> str:
     key = (raw or "").strip().lower()
     if key in {"zh", "chinese", "mandarin", "普通话", "中文"}:
         return "zh"
-    if key in {"cantonese", "yue", "粤", "粤语", "广东话"}:  # yue 只读别名
+    if key in {"cantonese", "粤", "粤语", "广东话"}:
         return "cantonese"
     if key in {"en", "english", "英语"}:
         return "en"
@@ -168,15 +168,13 @@ async def entrypoint(ctx) -> None:
         )
 
     # 目标语言音色:设置页全局单音色 speaker 优先;否则分语言
-    # speaker_zh/speaker_cantonese/en(键 yue 只读别名)。
+    # speaker_zh/speaker_cantonese/en。
     tts_ls = LanguageState()
     tts_ls.lang = target_lang
     voice = str(tts_cfg.get("speaker") or "").strip()
     if not voice:
         keymap = {"zh": "speaker_zh", "cantonese": "speaker_cantonese", "en": "speaker_en"}
         voice = str(tts_cfg.get(keymap.get(target_lang, "speaker_zh")) or "")
-        if not voice and target_lang == "cantonese":
-            voice = str(tts_cfg.get("speaker_yue") or "")  # 旧数据只读别名
     tts_provider = Qwen3TTSTTS(
         base_url=_sidecar(tts_cfg.get("base_url") or "", "QWEN3_TTS_BASE_URL", "http://127.0.0.1:8788"),
         voice=voice,

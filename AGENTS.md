@@ -36,8 +36,9 @@ cd desktop && npx tauri build --bundles app   # macOS bundle
 
 ## Language / Terminology Rules（跨层约束）
 
-- **粤语规范值 = 小写 `cantonese`**，语言三态只有 `zh / cantonese / en`。全栈（DB、web、TS 类型、prompt 分支、`LanguageState`、voice-map 键、`speaker_cantonese`）一律用 `cantonese`，**新代码永不产出 `yue`**；旧 `yue` 仅在运行时入口（`_normalize_lang`/`_classify_spoken_language`/`_collapse_voice_map` 等）作**只读别名**归一。
-- **供应商/资源字面量不改**：MiniMax 音色 ID `Cantonese_*`、Wikipedia 域名 `zh-yue.wikipedia.org`、SenseVoice 标签 `YUE`、sherpa 模型目录 `zh-en-ja-ko-yue`、Volcano dialect `yue`、`yue.wav` 等音频文件名、克隆音色 id（`acceptance-yue`…）。
+- **粤语规范值 = 小写 `cantonese`，全时空唯一拼写**，语言三态只有 `zh / cantonese / en`。全栈（DB、web、TS 类型、prompt 分支、`LanguageState`、voice-map 键、`speaker_cantonese`）一律 `cantonese`；旧拼写已存量清零（CP 启动迁移 `deps.py build_engine()` 是唯一兼容点），运行时代码**不留任何别名分支**。
+- **防复发门禁**：`tests/test_cantonese_terminology.py` 扫描全部跟踪源文件，旧拼写只允许出现在白名单单点，新增即测试失败——字段单轨化，杜绝双轨技术债。
+- **外部系统真字面量不改（门禁白名单内）**：Wikipedia 域名 `zh-yue.wikipedia.org`、SenseVoice 输出标签 `YUE`（入内即归一 cantonese）、Volcano dialect 枚举、MiniMax 音色 ID `Cantonese_*`。音色 id 值是不透明标识符，不属语言字段。
 - ASR 会话语言为粤语时给 sidecar 传 `language=cantonese`（mlx 大小写不敏感回填模型 config 规范名 `Cantonese`），消除 auto 误判成普通话（啱唔啱→难唔难）。
 
 ## Architecture Boundaries & Runtime Rules

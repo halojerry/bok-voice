@@ -182,8 +182,7 @@ async function loadTtsVoices(config) {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const s = await r.json();
     const t = s.tts || {};
-    // speaker_cantonese 为新键；speaker_yue 兼容旧数据（DB 迁移后只剩新键）。
-    const voices = { zh: t.speaker_zh || "", yue: t.speaker_cantonese || t.speaker_yue || "", en: t.speaker_en || "" };
+    const voices = { zh: t.speaker_zh || "", cantonese: t.speaker_cantonese || "", en: t.speaker_en || "" };
     console.log("[worker] tts voices (from control-plane):", JSON.stringify(voices));
     return voices;
   } catch (err) {

@@ -123,8 +123,8 @@ def build_engine() -> Engine | None:
             print(f"[deps] idempotent column migration skipped: {exc}")
 
         # ---- 数据迁移：语言值 yue → cantonese 全栈统一（幂等，SQLite/Postgres 通用）。
-        # 只读别名路径已在上游保留（_normalize_lang/_classify 读 yue 也归一 cantonese），
-        # 这里把存量行一次性落成新规范值,避免新旧两套字段并存。
+        # 这是全仓唯一的旧值兼容点：旧库在 CP 启动时一次性落成规范值 cantonese，
+        # agent 侧不再保留任何 yue 别名分支（tests/test_cantonese_terminology.py 门禁防复发）。
         try:
             import json as _json
 

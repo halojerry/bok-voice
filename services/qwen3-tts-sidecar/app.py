@@ -456,7 +456,7 @@ class TTSService:
     def _normalize_language(model: Any, language: str) -> str:
         """Map requested language to one the model actually supports.
 
-        Qwen3-TTS does not list Cantonese/yue among its codec language ids, but
+        Qwen3-TTS does not list Cantonese among its codec language ids, but
         community-verified ICL voice cloning with a Cantonese reference audio
         produces Cantonese output when the language token is `chinese`.
         Fall back to `Auto` for any other unsupported request instead of
@@ -474,7 +474,7 @@ class TTSService:
                 supported = set()
         if supported and requested in supported:
             return language
-        if requested in {"yue", "cantonese", "cantonese_chinese"}:
+        if requested in {"cantonese", "cantonese_chinese"}:
             return "chinese"
         return "Auto"
 

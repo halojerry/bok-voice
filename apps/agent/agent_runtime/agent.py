@@ -150,7 +150,7 @@ async def _llm_judge(base_url: str, model: str, messages: list) -> str:
 
 
 def _parse_voice_map(raw) -> dict:
-    # 旧数据 map 键 yue 由 _collapse_voice_map 归一;新写入一律 cantonese。
+    # 分语言键只有 zh/cantonese/en;新写入一律 cantonese。
     if isinstance(raw, dict):
         return raw
     if isinstance(raw, str) and raw.strip().startswith("{"):
@@ -163,33 +163,26 @@ def _parse_voice_map(raw) -> dict:
 
 
 def _collapse_voice_map(raw_map: dict, persona_lang: str) -> dict:
-    """整场同声：把 persona 的旧 {zh,cantonese,en} 分语言 map 收敛成单一主音色。
+    """整场同声：把 persona 的 {zh,cantonese,en} 分语言 map 收敛成单一主音色。
 
     主音色取人设主语言（persona.language）对应键，缺则按 zh→cantonese→en→首个非空
     取；最终统一放进 zh 键（MiniMax/Qwen3 的 _resolve_voice 语言缺省都回落 zh），
     使整场无论客户讲粤/普/英都用同一把声。回退点：若想恢复「按语言分音色」，
-    删掉本函数调用、直接传 raw_map 即可。旧数据 map 键 yue 作只读别名仍兼容。
+    删掉本函数调用、直接传 raw_map 即可。语言值全时空统一 cantonese（旧值
+    已由 CP 启动迁移清零，这里不再兜别名）。
     """
     if not raw_map:
         return {}
-    # 旧数据只读别名:键 yue → 统一按 cantonese 读(新写永远用 cantonese)。
-    norm_map = {}
-    for k, v in raw_map.items():
-        nk = "cantonese" if str(k).strip().lower() in {"yue", "cantonese"} else str(k)
-        if nk not in norm_map:
-            norm_map[nk] = v
     lang = (persona_lang or "").strip().lower()
-    if lang == "yue":  # 旧数据只读别名
-        lang = "cantonese"
     if lang not in {"zh", "cantonese", "en"}:
         lang = ""
     picked = ""
-    for key in ([lang] if lang else []) + ["zh", "cantonese", "en", "yue"]:
-        if norm_map.get(key):
-            picked = str(norm_map[key])
+    for key in ([lang] if lang else []) + ["zh", "cantonese", "en"]:
+        if raw_map.get(key):
+            picked = str(raw_map[key])
             break
     if not picked:
-        picked = str(next((v for v in norm_map.values() if v), ""))
+        picked = str(next((v for v in raw_map.values() if v), ""))
     return {"zh": picked} if picked else {}
 
 
@@ -203,14 +196,8 @@ def _sticky_reply_language(anchor: str, asr_lang: str, cur_sticky: str, cur_stre
     - 只有 ASR 连续 threshold 轮判为同一【非锚】语言（且都是强证据才进得来）才跟随切换；
     - 一旦某轮回到锚语言，立刻回锚、清计数；
     - 已切走后客户又讲第三种语言，也回锚（粤语客服优先讲粤语，不跨语言乱跳）。
-    返回 (reply_lang, new_sticky, new_streak)。旧数据 yue 作只读别名归一 cantonese。
+    返回 (reply_lang, new_sticky, new_streak)。
     """
-    if anchor == "yue":  # 旧数据只读别名
-        anchor = "cantonese"
-    if asr_lang == "yue":
-        asr_lang = "cantonese"
-    if cur_sticky == "yue":
-        cur_sticky = "cantonese"
     if anchor not in {"zh", "cantonese", "en"}:
         # 无有效锚定（未知/缺失）：直接跟随 ASR，退化为旧行为。
         return asr_lang, asr_lang, 0
@@ -273,13 +260,14 @@ def _silence_farewell_instruction(name: str, lang: str) -> str:
 def _normalize_lang(raw, default: str = "") -> str:
     """把对象/人设里的语言值归一为 zh/cantonese/en。vi 等未支持语言回落到 default。
 
-    粤语统一叫 cantonese（旧数据 yue、中文写法粤/粤语/广东话、外部 Cantonese
-    都归一到它）——字段只有一套，模型边界(ASR hint)才传得对。
+    粤语统一叫 cantonese（中文写法粤/粤语/广东话、英文 Cantonese 都归一到它）
+    ——字段只有一套，模型边界(ASR hint)才传得对。旧拼写值已由 CP 启动迁移
+    清零，不再兜别名。
     """
     key = (raw or "").strip().lower()
     mapping = {
         "zh": "zh", "chinese": "zh", "mandarin": "zh", "普通话": "zh", "中文": "zh",
-        "cantonese": "cantonese", "yue": "cantonese", "粤": "cantonese", "粤语": "cantonese", "广东话": "cantonese",
+        "cantonese": "cantonese", "粤": "cantonese", "粤语": "cantonese", "广东话": "cantonese",
         "en": "en", "english": "en", "英语": "en",
         "vi": "", "vietnamese": "", "auto": "", "": "",
     }
@@ -291,9 +279,8 @@ def _build_default_voice_map(tts_cfg: dict) -> dict:
 
     产品规则「整场同声」：若设置页配了全局单音色 speaker（云端 MiniMax 默认），
     则 zh/cantonese/en 都用它（返回 {"zh": speaker}，任何语言都解析到 zh 兜底键）。
-    仅当 speaker 为空时回落旧的分语言 speaker_zh/speaker_cantonese/en（兼容旧数据
-    speaker_yue 作只读别名）。Qwen3TTSTTS 解析时当前语言缺省会回落到 zh，
-    因此只配 zh 键也能让各语言出声。
+    仅当 speaker 为空时回落分语言 speaker_zh/speaker_cantonese/en。Qwen3TTSTTS
+    解析时当前语言缺省会回落到 zh，因此只配 zh 键也能让各语言出声。
     """
     single = (tts_cfg.get("speaker") or "").strip()
     mapping: dict[str, str] = {}
@@ -303,10 +290,9 @@ def _build_default_voice_map(tts_cfg: dict) -> dict:
     zh = tts_cfg.get("speaker_zh") or ""
     if zh:
         mapping["zh"] = zh
-    # 新键 speaker_cantonese 优先；旧键 speaker_yue 作只读别名（DB 迁移后只剩新键）。
-    yue = (tts_cfg.get("speaker_cantonese") or tts_cfg.get("speaker_yue") or "").strip()
-    if yue:
-        mapping["cantonese"] = yue
+    cantonese = (tts_cfg.get("speaker_cantonese") or "").strip()
+    if cantonese:
+        mapping["cantonese"] = cantonese
     en = tts_cfg.get("speaker_en") or ""
     if en:
         mapping["en"] = en
@@ -791,7 +777,7 @@ async def entrypoint(ctx):
         if role == "assistant":
             # 与音频同守则:模型若输出发音/拼音教学,转录也落「请再报单号」罐頭,
             # 唔好畀课程留喺通话记录(下次摘要又会引用返)。
-            text = lecture_guard(text, language_state.lang if language_state.lang in ("zh", "cantonese", "yue") else None)
+            text = lecture_guard(text, language_state.lang if language_state.lang in ("zh", "cantonese") else None)
         asyncio.create_task(cp.add_turn(call_id, role, _clean_transcript(text)))
 
     async def _async_update_context(role, text):
@@ -805,7 +791,7 @@ async def entrypoint(ctx):
                 # 記憶都唔可以留原稿,否则下次摘要/回复会引用一段从未播出嘅内容。
                 text = lecture_guard(
                     text,
-                    language_state.lang if language_state.lang in ("zh", "cantonese", "yue") else None,
+                    language_state.lang if language_state.lang in ("zh", "cantonese") else None,
                 )
             if role == "user" and _context_rag_enabled(flow_ctrl.has_steps if flow_ctrl else False):
                 from .web_search import web_search_text

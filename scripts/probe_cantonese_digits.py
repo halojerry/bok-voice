@@ -3,12 +3,12 @@
 
 背景:客户报「尾号7890」,粤语客服要读出「七八九零」,但个别粤语 TTS 音色把
 孤立汉字(尤其「九」gau2)读错/读成普通话。本脚本对指定音色合成多组数字文本,
-存到 /tmp/probe_yue_digits/<voice>/ 下;若本地 Qwen3-ASR(:8787)在线,自动转写
+存到 /tmp/probe_cantonese_digits/<voice>/ 下;若本地 Qwen3-ASR(:8787)在线,自动转写
 比对比对,输出「哪把声、哪个字」啱/错表。
 
 用法(库已安装: .venv312/bin/python):
-  .venv312/bin/python scripts/probe_yue_digits.py --voice Cantonese_Male_news_anchor_vv2
-  .venv312/bin/python scripts/probe_yue_digits.py --voice Cantonese_Male_news_anchor_vv2 \
+  .venv312/bin/python scripts/probe_cantonese_digits.py --voice Cantonese_Male_news_anchor_vv2
+  .venv312/bin/python scripts/probe_cantonese_digits.py --voice Cantonese_Male_news_anchor_vv2 \
       Cantonese_crisp_news_anchor_vv2 Cantonese_GentleLady --no-asr
 
 未传 --voice:自动读设置页 DB 实际生效音色(speaker/speaker_cantonese)+ 固定 2 个后备。
@@ -46,7 +46,7 @@ _CN_HTTP = "https://api.minimax.cn/v1/t2a_v2"
 _INTL_HTTP = "https://api.minimax.chat/v1/t2a_v2"
 _CN_WS = "wss://api.minimax.cn/ws/v1/t2a_v2"
 _INTL_WS = "wss://api.minimax.chat/ws/v1/t2a_v2"
-_BACKUP_YUE = ["Cantonese_crisp_news_anchor_vv2", "Cantonese_GentleLady"]
+_BACKUP_VOICES = ["Cantonese_crisp_news_anchor_vv2", "Cantonese_GentleLady"]
 
 
 def _settings_path() -> Path:
@@ -72,8 +72,7 @@ def _db_voice_and_key(db: Path) -> tuple[str, str]:
     except Exception:
         return "", ""
     speaker = str(cfg.get("speaker") or "").strip()
-    # 新键 speaker_cantonese 优先；旧键 speaker_yue 作只读别名(DB 迁移后只剩新键)。
-    speaker_ca = str(cfg.get("speaker_cantonese") or cfg.get("speaker_yue") or "").strip()
+    speaker_ca = str(cfg.get("speaker_cantonese") or "").strip()
     return (speaker or speaker_ca or ""), str(cfg.get("api_key") or "").strip()
 
 
@@ -177,7 +176,7 @@ async def _asr_file(client, wav_path: Path) -> str:
 
 async def _probe_voice(key: str, voice: str, do_asr: bool) -> None:
     print(f"\n=== 音色: {voice} ===")
-    root = Path("/tmp/probe_yue_digits") / voice.replace("/", "_")
+    root = Path("/tmp/probe_cantonese_digits") / voice.replace("/", "_")
     root.mkdir(parents=True, exist_ok=True)
     async with __import__("httpx").AsyncClient() as client:
         for name, text in CASES:
@@ -227,7 +226,7 @@ async def main() -> None:
     seen: set[str] = set()
     ordered = [v for v in voices if not (v in seen or seen.add(v))]
     if not args.voice:
-        for v in _BACKUP_YUE:
+        for v in _BACKUP_VOICES:
             if v not in seen:
                 ordered.append(v)
                 seen.add(v)
@@ -239,7 +238,7 @@ async def main() -> None:
     t0 = time.time()
     for v in ordered:
         await _probe_voice(key, v, not args.no_asr)
-    print(f"\n耗时 {time.time() - t0:.0f}s;产物在 /tmp/probe_yue_digits/<voice>/")
+    print(f"\n耗时 {time.time() - t0:.0f}s;产物在 /tmp/probe_cantonese_digits/<voice>/")
 
 
 if __name__ == "__main__":

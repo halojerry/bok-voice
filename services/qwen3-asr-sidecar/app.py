@@ -47,8 +47,8 @@ def _fallback_language(text: str) -> str:
     """Qwen3-ASR's raw output sometimes omits the `language ...<asr_text>`
     metadata tag (observed on CPU), leaving the language field empty. Fall
     back to a character-set heuristic so the agent's LanguageState can still
-    pick the right TTS voice/language. Cantonese text is Han-dominant, so it
-    resolves to Chinese, which Qwen3-TTS maps to yue correctly."""
+    pick the right TTS voice/language. Cantonese text is detected via its
+    distinctive characters and returned as `Cantonese`."""
     if not text:
         return ""
     # Conservative Cantonese-specific characters (avoid common Mandarin

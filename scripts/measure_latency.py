@@ -36,7 +36,7 @@ def ms(t0: float) -> str:
 def measure_asr(client: httpx.Client) -> None:
     # 与 agent 同款「整包上传」契约（P0 提速后）：start(language 提示) → finish(body=PCM)。
     # 分别测 auto 与 cantonese 提示，验证粤语转写走语言提示。
-    pcm = read_wav_pcm(ROOT / "tests/fixtures/audio/yue.wav")
+    pcm = read_wav_pcm(ROOT / "tests/fixtures/audio/cantonese.wav")
     for hint in ("", "cantonese"):
         t0 = time.perf_counter()
         s = client.post(

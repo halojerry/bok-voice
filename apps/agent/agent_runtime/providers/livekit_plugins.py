@@ -34,7 +34,7 @@ _MANDARIN_MARKERS = ("的", "了", "这", "那", "什", "么", "说", "没", "�
 # 不放纯字形(简→繁)条目——字形由规则里的「直接輸出繁體」统一管,避免两件事搅在一起。
 # 只保留客服高频词(疑问/人称/常用动词/礼貌/集运业务);低频书面词交给模型粤语能力,
 # 控制静态前缀体积(prefill 与 KV-cache 都受益)。
-_HK_YUE_LEXICON = (
+_HK_CANTONESE_LEXICON = (
     "这个→呢個 那个→嗰個 这些→呢啲 这里→呢度 那里→嗰度 什么→乜嘢 怎么→點樣 为什么→點解 "
     "谁→邊個 哪里→邊度 什么时候→幾時 多少→幾多 "
     "是→係 不是→唔係 的→嘅 了→咗 在→喺 来→嚟 没有→冇 不要→唔好 不用→唔使 不知道→唔知 "
@@ -112,8 +112,7 @@ def _lecture_lang(text: str) -> str:
 
 
 def lecture_canned(lang: str | None = None) -> str:
-    # 旧数据/旧标签可能仍是 "yue"：只读别名，统一按粤语罐头处理。
-    return _LECTURE_CANNED_CANTONESE if lang in ("cantonese", "yue") else _LECTURE_CANNED_ZH
+    return _LECTURE_CANNED_CANTONESE if lang == "cantonese" else _LECTURE_CANNED_ZH
 
 
 def lecture_guard(text: str, lang: str | None = None) -> str:
@@ -170,11 +169,11 @@ def _classify_spoken_language(lang: str, text: str) -> tuple[str, bool]:
     """归一语言标签并给出「强证据」判断。
 
     返回 (lang, strong)：strong=True 表示该判定有可靠证据（粤语特征字/词、
-    明确的 cantonese/yue 标签、实质性英文、够长的普通话句子）；strong=False 表示标签
+    明确的 cantonese 标签、实质性英文、够长的普通话句子）；strong=False 表示标签
     模糊（普通话/英文标签 + 短句或借用词）——这种轮次不应把说话人语言拉走。
     """
     key = (lang or "").strip().lower()
-    if key in {"cantonese", "yue"}:
+    if key == "cantonese":
         return "cantonese", True
     if key in {"en", "english"}:
         if _looks_english(text):
@@ -201,8 +200,8 @@ def _normalize_asr_language(lang: str, text: str) -> str:
 class LanguageState:
     """Shared between ASR and TTS so replies use the language the user spoke.
 
-    规范语言值: zh / cantonese / en（粤语统一叫 cantonese；旧数据里的 yue 在
-    入口处作只读别名归一到 cantonese，新代码永不产出 yue）。
+    规范语言值: zh / cantonese / en（粤语统一叫 cantonese，全时空唯一拼写；
+    旧值已由 CP 启动迁移清零，代码不再兜别名）。
     lang 的切换带滞后：只有强证据（明确的 cantonese/en 标签、粤语特征字词、够长的
     普通话句子）才允许改变当前语言；标签模糊的短轮次（好/嗯/係…）保持原语言，
     避免 ASR 单轮误标把「粤语客户」拉成普通话、LLM 跟着回普、TTS 切音色。
@@ -450,7 +449,7 @@ class ContextState:
         key = (lang or "").strip().lower()
         if key in {"chinese", "zh", "mandarin"}:
             self._user_lang = "zh"
-        elif key in {"cantonese", "yue"}:
+        elif key == "cantonese":
             self._user_lang = "cantonese"
         elif key in {"english", "en"}:
             self._user_lang = "en"
@@ -501,7 +500,7 @@ class ContextState:
             names = {"zh": "普通话/中文", "cantonese": "粤语（广东话）", "en": "英语"}
             name = names.get(self._user_lang, self._user_lang)
             if self._user_lang == "cantonese":
-                rule = self._yue_rule()
+                rule = self._cantonese_rule()
             elif self._user_lang == "en":
                 rule = "Reply in natural spoken English only (like on a phone call); do not explain or add notes."
             else:
@@ -567,12 +566,12 @@ class ContextState:
             "——这样语音合成可以边说你前半句边等你后半句，不用等整段生成完才出声。"
         )
 
-    def _yue_rule(self) -> str:
+    def _cantonese_rule(self) -> str:
         return (
             "整段用港式粵語（香港客服腔），唔好用書面語/普通話/廣州式書面講法。"
             "直接輸出繁體中文，唔好寫任何簡體字（簡體令粵語讀錯：寫「幫你」唔係「帮你」）。"
             "口吻要港味：唔該晒、唔好意思、我哋/你哋、而家、聽日、啱啱、幫你睇返、唔使擔心。"
-            "見到普通話詞就換港式口語：" + _HK_YUE_LEXICON + "。"
+            "見到普通話詞就換港式口語：" + _HK_CANTONESE_LEXICON + "。"
             "集運業務：客戶啲貨叫「你件貨/你個集運件」，服務講「速遞」，"
             "唔好用「包裹」「快遞」「貨物」。可自然夾英文詞(check/confirm/send/email/App/status/refund)"
             "似香港人講電話，但唔好成句英文（語氣參考:「唔好意思，我幫你 check 返個 status，refund 3–5 個工作天到帳。」）。"
@@ -839,7 +838,7 @@ class _FakeTTSStream(tts.ChunkedStream):
 
 
 class SherpaSenseVoiceSTT(stt.STT):
-    """Local SenseVoice ASR via sherpa-onnx (zh/en/ja/ko/yue)."""
+    """Local SenseVoice ASR via sherpa-onnx (zh/en/ja/ko + Cantonese)."""
 
     model = "sherpa-sense-voice"
     provider = "sherpa-onnx"
@@ -849,7 +848,7 @@ class SherpaSenseVoiceSTT(stt.STT):
 
         import sherpa_onnx
 
-        model_dir = model_dir or os.environ.get("SHERPA_MODEL_DIR", "data/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue")
+        model_dir = model_dir or os.environ.get("SHERPA_MODEL_DIR", "data/models/sherpa-onnx-sense-voice")
         self._model_dir = model_dir
         self._recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
             model=os.path.join(model_dir, "model.int8.onnx"),
@@ -1191,10 +1190,9 @@ class MiniMaxTTS(tts.TTS):
         return _MiniMaxTTSStream(self, text, conn_options or APIConnectOptions())
 
     def _speech_lang(self) -> str | None:
-        """罐头回应的语言:会话锚定语言(zh/cantonese)优先,其它(如 en)留 None 自动判。
-        旧数据里残留的 yue 归一到 cantonese 处理。"""
+        """罐头回应的语言:会话锚定语言(zh/cantonese)优先,其它(如 en)留 None 自动判。"""
         lang = self._language_state.lang
-        return lang if lang in ("zh", "cantonese", "yue") else None
+        return lang if lang in ("zh", "cantonese") else None
 
     def stream(self, *, conn_options=None):
         """真流式 SynthesizeStream：单 WS 连接按增量文本持续 task_continue。"""
@@ -1844,7 +1842,7 @@ class _Qwen3TTSStream(tts.ChunkedStream):
 # ASR 语言提示:值=模型 config support_languages 的规范名(mlx 层大小写不敏感匹配)。
 # 通话模式(pin=False):cantonese 必钉(auto 会误判成普通话)、en 必钉(支持纯英语会话),
 # zh 保持 auto 容忍夹英文 code-switching;同传模式(pin=True):源语言用户选定且固定,全钉。
-_ASR_LANG_HINTS = {"cantonese": "Cantonese", "yue": "Cantonese", "en": "English", "zh": "Chinese"}
+_ASR_LANG_HINTS = {"cantonese": "Cantonese", "en": "English", "zh": "Chinese"}
 
 
 def _asr_language_hint(lang_state: str, pin: bool) -> str:

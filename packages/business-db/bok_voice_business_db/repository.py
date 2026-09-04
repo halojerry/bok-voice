@@ -416,7 +416,7 @@ class SqlAlchemyBusinessRepository:
             # local_model: 本地模型选择(ML Studio repo),bok serve 据此起 :1235 模型;空用默认。
             "llm": {"provider": "local_openai", "model": "", "base_url": "http://127.0.0.1:1235/v1", "local_model": ""},
             # TTS：provider= qwen3_tts | volcano_streaming | fake；音色按语言
-            # speaker_zh/speaker_cantonese/en（persona 绑定音色优先；旧键 speaker_yue 已迁移）。
+            # speaker_zh/speaker_cantonese/en（persona 绑定音色优先；旧键已由启动迁移改写）。
             "tts": {
                 "provider": "qwen3_tts",
                 "base_url": "http://127.0.0.1:8788",

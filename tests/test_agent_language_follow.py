@@ -12,7 +12,8 @@ from agent_runtime.providers.livekit_plugins import _normalize_asr_language  # n
 
 def test_explicit_language_tags():
     assert _normalize_asr_language("Cantonese", "有冇人知道？") == "cantonese"
-    assert _normalize_asr_language("YUE", "我哋聽日見") == "cantonese"
+    # SenseVoice 的大写供应商标签在其插件边界(_repl 标签清洗)已归一 cantonese，
+    # 不会裸传进本函数；这里只验规范标签路径。
     assert _normalize_asr_language("English", "hello there") == "en"
     assert _normalize_asr_language("Chinese", "你好") == "zh"
 
@@ -37,7 +38,6 @@ def test_asr_language_hint_call_mode():
     from agent_runtime.providers.livekit_plugins import _asr_language_hint
 
     assert _asr_language_hint("cantonese", pin=False) == "Cantonese"
-    assert _asr_language_hint("yue", pin=False) == "Cantonese"  # 旧数据只读别名
     assert _asr_language_hint("en", pin=False) == "English"
     assert _asr_language_hint("zh", pin=False) == ""
     assert _asr_language_hint("", pin=False) == ""
@@ -70,7 +70,7 @@ def _mk_state(initial: str):
     return s
 
 
-def test_hysteresis_yue_customer_short_ambiguous_utterance_keeps_yue():
+def test_hysteresis_cantonese_customer_short_ambiguous_utterance_keeps_cantonese():
     # 粤语客户回「好」「嗯」「OK」：无粤语特征、短、标签 zh——不得拉回普通话。
     s = _mk_state("cantonese")
     s.update("zh", "好")
@@ -170,8 +170,8 @@ def test_collapse_voice_map_uses_persona_language():
     assert m == {"zh": "x"}
     # 空 map → 空。
     assert _collapse_voice_map({}, "cantonese") == {}
-    # 旧数据 yue 键/值 → 只读别名仍收敛成同一把粤语音色。
-    m = _collapse_voice_map({"zh": "male-qn-qingse", "yue": "Cantonese_GentleLady"}, "yue")
+    # 未知语言键不参与收敛（旧拼写键已由 DB 迁移清零，不再兜别名）。
+    m = _collapse_voice_map({"zh": "male-qn-qingse", "cantonese": "Cantonese_GentleLady", "fr": "x"}, "cantonese")
     assert m == {"zh": "Cantonese_GentleLady"}
 
 
@@ -183,13 +183,13 @@ def test_build_default_voice_map_single_speaker_wins():
     # 未配 speaker → 回落旧分语言。
     m = _build_default_voice_map({"speaker": "", "speaker_zh": "zh-a", "speaker_cantonese": "ca-b"})
     assert m == {"zh": "zh-a", "cantonese": "ca-b"}
-    # 旧键 speaker_yue 只读别名：仍组出 cantonese 键。
-    m = _build_default_voice_map({"speaker": "", "speaker_zh": "zh-a", "speaker_yue": "yue-b"})
-    assert m == {"zh": "zh-a", "cantonese": "yue-b"}
+    # 只配 cantonese 分语言键 → 只组 cantonese 键。
+    m = _build_default_voice_map({"speaker": "", "speaker_cantonese": "ca-b"})
+    assert m == {"cantonese": "ca-b"}
 
 
 # ---- LLM 输出：港式自然英夹（M3） ----
-def test_yue_rule_requires_hk_style_code_mixing():
+def test_cantonese_rule_requires_hk_style_code_mixing():
     from agent_runtime.providers.livekit_plugins import ContextState
     ctx = ContextState(account_id="acc-001")
     ctx.set_user_language("cantonese")
@@ -355,9 +355,6 @@ def test_lecture_guard_replaces_jyutping_lesson():
     # 明确粤语 → 粤语罐头
     out2 = lecture_guard("我哋睇下發音要點：9九gau2高升調", "cantonese")
     assert out2 == "唔好意思，頭先聽得唔係好清楚，可唔可以再講多次個單號或者訂單號碼俾我？"
-    # 旧 yue 别名 → 同样落到粤语罐头
-    out3 = lecture_guard("我哋睇下發音要點：9九gau2高升調", "yue")
-    assert out3 == out2
 
 
 def test_lecture_guard_passes_normal_replies():

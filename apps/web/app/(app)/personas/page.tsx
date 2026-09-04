@@ -82,7 +82,7 @@ function parseVoiceMap(raw: unknown): Record<string, string> {
 
 /** 从语音映射选「整场主音色」：优先人设主语言，缺则 zh→cantonese→首个非空（与 agent 收敛同规则）。 */
 function primaryVoiceFor(lang: string, voiceMap: Record<string, string>): string {
-  const keys = [lang, "zh", "cantonese", "yue", "en"];
+  const keys = [lang, "zh", "cantonese", "en"];
   for (const k of keys) {
     if (voiceMap[k]) return voiceMap[k];
   }
@@ -614,13 +614,13 @@ export default function PersonasPage() {
                           className="text-[var(--muted)] hover:text-[var(--accent)]"
                           onClick={async () => {
                             // 试听该克隆：临时切到对应语言标签并绑定，再试听。
-                            if (cv.lang && ["zh", "cantonese", "yue", "en"].includes(cv.lang)) {
+                            if (cv.lang && ["zh", "cantonese", "en"].includes(cv.lang)) {
                               setActiveLang(cv.lang as "zh" | "cantonese" | "en");
                             }
-                            setVoiceMap((prev) => ({ ...prev, [cv.lang && ["zh", "cantonese", "yue", "en"].includes(cv.lang) ? (cv.lang === "yue" ? "cantonese" : cv.lang) : "zh"]: cv.id }));
+                            setVoiceMap((prev) => ({ ...prev, [cv.lang && ["zh", "cantonese", "en"].includes(cv.lang) ? cv.lang : "zh"]: cv.id }));
                             setErr(null);
                             try {
-                              const lang = cv.lang && ["zh", "cantonese", "yue", "en"].includes(cv.lang) ? (cv.lang === "yue" ? "cantonese" : cv.lang) : "zh";
+                              const lang = cv.lang && ["zh", "cantonese", "en"].includes(cv.lang) ? cv.lang : "zh";
                               const blob = await api.previewTts({
                                 text: previewTextFor(lang as "zh" | "cantonese" | "en", form.name),
                                 voice: cv.id,

@@ -29,8 +29,8 @@ def test_nudge_english():
 
 def test_farewell_three_languages():
     # 兩次心跳都冇回應 → 禮貌收線指令(多謝+陣間再搵+拜拜,一句講完就停)。
-    yue = _silence_farewell_instruction("陳先生", "cantonese")
-    assert "陣間再搵你" in yue and "拜拜" in yue
+    out = _silence_farewell_instruction("陳先生", "cantonese")
+    assert "陣間再搵你" in out and "拜拜" in out
     zh = _silence_farewell_instruction("", "zh")
     assert "稍后再联系" in zh and "再见" in zh
     en = _silence_farewell_instruction("Mr. Chan", "en")

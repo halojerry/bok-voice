@@ -128,10 +128,10 @@ metadata 下发;无房间时空闲,job 到达才拉管线)
 
 ### 设置（`/api/settings`，Agent 运行时会真实消费）
 
-- `asr.provider`：`qwen3_asr`（本地 sidecar）/ `sherpa_sensevoice` / `fake`（仅测试）。语言值统一 `zh/cantonese/en`（粤语叫 `cantonese`，不再用 `yue`）；agent 在会话语言为粤语时给 sidecar 传 `language=cantonese` 强制模型按粤语转写，避免 auto 误判成普通话。
+- `asr.provider`：`qwen3_asr`（本地 sidecar）/ `sherpa_sensevoice` / `fake`（仅测试）。语言值统一 `zh/cantonese/en`（粤语全时空唯一拼写 `cantonese`）；agent 在会话语言为粤语时给 sidecar 传 `language=cantonese` 强制模型按粤语转写，避免 auto 误判成普通话。
 - `llm.provider`：`local_openai`/`mlx`（本地）/ `deepseek`（云端，缺 `api_key` 显式告警并回退本地）/ `fake`。
 - `tts.provider`：`qwen3_tts` / `volcano_streaming`（需 `VOLC_*` 环境变量）/ `fake`（静音测试音，非火山 beep）。
-  音色兜底按语言 `speaker_zh/speaker_cantonese/en`（旧键 `speaker_yue` 已迁移为 `speaker_cantonese`）；persona 绑定 `reference_audio` 优先。
+  音色兜底按语言 `speaker_zh/speaker_cantonese/en`（旧拼写键已由启动迁移改写）；persona 绑定 `reference_audio` 优先。
 - `vad`：`provider` + `max_buffered_speech` / `min_speech_duration` / `min_silence_duration` / `interruption`
   —— 直接构造 `inference.VAD` 与打断开关（环境变量 `VAD_*` 仅作部署覆盖）。
   基线默认：`min_silence_duration=0.45`、`min_speech_duration=0.15`；endpointing `min_delay=0.35`/`max_delay=1.2`。
