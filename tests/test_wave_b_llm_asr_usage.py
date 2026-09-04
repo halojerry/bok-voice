@@ -194,3 +194,27 @@ def test_session_report_endpoint_and_real_usage():
         u = client.get("/api/reports/usage?account_id=acc-001").json()
         assert u["llm_tokens"] == 1250
         assert u["llm_tokens_estimated_calls"] == 0
+
+
+def test_livekit_webhook_redispatch_gate():
+    """webhook 崩溃补位:只对 A 线 agent(bok-voice)的 participant_left 触发重派。"""
+    from unittest.mock import patch
+
+    from fastapi.testclient import TestClient
+
+    from control_plane.main import app
+
+    with TestClient(app) as client:
+        # 非 participant_left → 忽略
+        r = client.post("/api/webhook/livekit", json={"event": "room_started", "room": {"name": "r1"}})
+        assert r.json()["handled"] is False
+        # 非我方 agent 离开 → 忽略(真人断开不重派)
+        r = client.post("/api/webhook/livekit", json={"event": "participant_left", "room": {"name": "r1"}, "participant": {"identity": "me-r1"}})
+        assert r.json()["handled"] is False
+        # bok-voice 离开 → 触发重派(用 patch 拦住真 LiveKitAPI 连接)
+        with patch("control_plane.main.os.environ.get", side_effect=lambda k, d=None: {"LIVEKIT_API_KEY": "k", "LIVEKIT_API_SECRET": "s", "LIVEKIT_URL": "ws://127.0.0.1:7880"}.get(k, d)):
+            from livekit import api as lk_api
+
+            with patch.object(lk_api, "LiveKitAPI") as mk:
+                r = client.post("/api/webhook/livekit", json={"event": "participant_left", "room": {"name": "call-x"}, "participant": {"identity": "bok-voice"}})
+        assert r.json()["handled"] is True

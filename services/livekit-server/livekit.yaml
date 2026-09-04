@@ -7,12 +7,26 @@ rtc:
   use_external_ip: false
 
 redis:
-  # 单机本地开发可不配置；生产多副本时必须
+  # 单机本地开发可不配置；生产多副本/egress/sip 时必须
   # address: redis:6379
 
 keys:
   devkey: devsecret
 
+prometheus_port: 6789
+
+# 崩溃补位 webhook(可选):agent 离开房间 → CP 自动重派(见 /api/webhook/livekit)。
+# 指向本机 CP(外网可达则填 http://<host>:8000/api/webhook/livekit;签名用下方 api_key)。
+# webhook:
+#   urls:
+#     - http://127.0.0.1:8000/api/webhook/livekit
+#   api_key: devkey
+
 logging:
   level: info
-  json: false
+  json: true
+  # 生产启用采样，避免高并发下日志量过大（config-sample 同款建议）
+  sampler:
+    initial: 100
+    thereafter: 10
+

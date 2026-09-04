@@ -1062,6 +1062,58 @@ async def ingest_session_report(call_id: str, request: Request) -> dict:
     return {"call_id": call_id, "stored": True}
 
 
+@app.post("/api/webhook/livekit")
+async def livekit_webhook(request: Request) -> dict:
+    """LiveKit webhook：agent 崩溃补位。
+
+    自部署的 LiveKit OSS 在 worker/job 进程死亡时**不会自动重派** agent
+    （restart_policy = Cloud-only，见 docs/DEV_TOOLS.md §5）。收到 participant_left
+    且 identity 是我们 agent（= agent_name：bok-voice / bok-interp-fwd / bok-interp-rev）
+    → 调 AgentDispatchService.CreateDispatch 把同名 agent 重派回房（token 内 dispatch
+    只在建房时生效，这是官方指定通路）。launchd KeepAlive 只拉起 worker 本体，本端点
+    补「房间内 agent 缺席」这一层。本端点需在 livekit.yaml 配 webhook 指向本 CP。
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid json body")
+    event = str(payload.get("event") or "")
+    room_name = str(payload.get("room", {}).get("name") or "")
+    participant = payload.get("participant") or {}
+    identity = str(participant.get("identity") or "")
+    if event != "participant_left" or not room_name:
+        return {"handled": False, "reason": "not participant_left"}
+    # A 线 agent 进房 identity = agent_name "bok-voice"(独立身份,崩溃可可靠识别)。
+    # B 线 interpreter 以 listen 身份(me-<room>/other-<room>,与真人同款)在场——
+    # participant_left 无法区分是 agent 崩溃还是真人离开,不做自动补位(房间短命,
+    # 双端可重开);且 bok-interp-* 不会以自身名字发离开事件,故只匹配 bok-voice。
+    if identity != "bok-voice":
+        return {"handled": False, "reason": "not A-line agent"}
+
+    async def _redispatch() -> None:
+        key = os.environ.get("LIVEKIT_API_KEY", "")
+        secret = os.environ.get("LIVEKIT_API_SECRET", "")
+        if not key or not secret:
+            return
+        from livekit import api
+
+        client = api.LiveKitAPI(
+            url=os.environ.get("LIVEKIT_URL", "http://127.0.0.1:7880").replace("ws://", "http://").replace("wss://", "https://"),
+            api_key=key,
+            api_secret=secret,
+        )
+        try:
+            await client.agent_dispatch.create_dispatch(room=room_name, agent_name="bok-voice")
+            _audit("agent.redispatch", subject_type="call", subject_id=room_name, detail={"agent_name": "bok-voice", "event": event})
+        except Exception as exc:  # pragma: no cover - 重派失败不致命(launchd 兜底拉起 worker)
+            print(f"[webhook] redispatch failed: {exc!r}", flush=True)
+        finally:
+            await client.aclose()
+
+    asyncio.create_task(_redispatch())
+    return {"handled": True, "redispatch": identity}
+
+
 @app.get("/api/reports/usage")
 def reports_usage(account_id: str = "acc-001") -> dict:
     calls = _repo().list_calls(account_id, "")

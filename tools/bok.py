@@ -936,11 +936,129 @@ def cmd_doctor() -> int:
     return 0
 
 
+def _agent_prod_env() -> dict[str, str]:
+    """agent/interp worker 生产环境（与 cmd_serve 同源）。"""
+    _cur = MODELS["mac"] if is_mac() else MODELS["windows"]
+    return {
+        "PYTHONPATH": _repo_pythonpath(),
+        "BOK_SERVICE": "agent",
+        "LIVEKIT_URL": os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880"),
+        "LIVEKIT_API_KEY": os.environ.get("LIVEKIT_API_KEY", "devkey"),
+        "LIVEKIT_API_SECRET": os.environ.get("LIVEKIT_API_SECRET", "devsecret"),
+        "CONTROL_PLANE_URL": os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000"),
+        "MLX_LLM_BASE_URL": os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
+        "MLX_LLM_MODEL": model_path({**_cur, "llm": resolve_llm_repo(_cur)}, "llm"),
+    }
+
+
+def cmd_prod_install() -> int:
+    """生成生产常驻单元（mac launchd plist / Windows 服务脚本），不启动。
+
+    dev 栈用 `bok.py serve`（前台 + run/*.pid）；生产档把常驻进程交给 OS 守护
+    （launchd KeepAlive=崩溃自动拉起），补上桌面形态天然缺的 watchdog。
+    首次需配 livekit.yaml 生产键（services/livekit-server/livekit.yaml）。
+    """
+    agent_env = _agent_prod_env()
+    unit_dir = app_data_dir() / "units"
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = app_data_dir() / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    if is_mac():
+        livekit_bin = str(_embedded_livekit() or "livekit-server")
+        py = repo_python()
+        # unit 定义:name → (args, 附加 env)。agent/interp 共用 agent_env。
+        units = [
+            ("bok-control-plane", [str(py), "-m", "uvicorn", "control_plane.main:app", "--host", "127.0.0.1", "--port", "8000"], _control_plane_env((app_data_dir() / "bok_voice.db").as_posix()), "Bok 控制面 API"),
+            ("bok-livekit", [livekit_bin, "--config", str(ROOT / "services" / "livekit-server" / "livekit.yaml")], {}, "LiveKit 信令/媒体"),
+            ("bok-agent", [str(py), "-m", "agent_runtime.main"], agent_env, "A 线客服 agent worker"),
+            ("bok-interp-fwd", [str(py), "-m", "agent_runtime.interpret"], {**agent_env, "BOK_SERVICE": "interp-fwd", "INTERP_DIRECTION": "fwd"}, "B 线同传 fwd"),
+            ("bok-interp-rev", [str(py), "-m", "agent_runtime.interpret"], {**agent_env, "BOK_SERVICE": "interp-rev", "INTERP_DIRECTION": "rev"}, "B 线同传 rev"),
+        ]
+        for name, args, env, comment in units:
+            label = f"com.bokvoice.{name}"
+            arg_xml = "\n".join(f"    <string>{a}</string>" for a in args)
+            env_xml = "\n".join(f"      <key>{k}</key>\n      <string>{v}</string>" for k, v in sorted(env.items()))
+            plist = (
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+                '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+                '<plist version="1.0">\n<dict>\n'
+                f"  <key>Label</key><string>{label}</string>\n"
+                "  <key>ProgramArguments</key>\n  <array>\n" + arg_xml + "\n  </array>\n"
+                f"  <key>WorkingDirectory</key><string>{ROOT}</string>\n"
+                "  <key>EnvironmentVariables</key>\n  <dict>\n" + env_xml + "\n  </dict>\n"
+                "  <key>RunAtLoad</key><true/>\n"
+                "  <key>KeepAlive</key><true/>\n"
+                f"  <key>StandardOutPath</key><string>{log_dir / (name + '.log')}</string>\n"
+                f"  <key>StandardErrorPath</key><string>{log_dir / (name + '.err.log')}</string>\n"
+                "</dict>\n</plist>\n"
+            )
+            out = unit_dir / f"{label}.plist"
+            out.write_text(plist)
+            print(f"generated {out.relative_to(app_data_dir())}  ({comment})")
+    else:
+        print("Windows 生产档：请用 NSSM 将以下进程注册为服务（本项目开发期用 `bok.py serve`）：")
+        for name, args, _env, comment in []:
+            pass
+        for name, args in (
+            ("bok-control-plane", [str(repo_python()), "-m", "uvicorn", "control_plane.main:app", "--port", "8000"]),
+            ("bok-agent", [str(repo_python()), "-m", "agent_runtime.main"]),
+        ):
+            print(f"  nssm install {name} {args[0]} {' '.join(args[1:])}")
+    print(f"\nunits 目录: {unit_dir}")
+    print("mac 装载(KeepAlive 自动拉起):  launchctl bootstrap gui/$(id -u) " + str(unit_dir) + "/*.plist")
+    print("mac 卸载:                      launchctl bootout gui/$(id -u)/com.bokvoice.bok-control-plane 等")
+    print("livekit 生产键/端口见 services/livekit-server/livekit.yaml")
+    return 0
+
+
+def cmd_prod_status() -> int:
+    """生产健康面汇总:官方健康端点(livekit GET /、worker GET :8081/worker)+ sidecar /health。"""
+    print("bok prod status:")
+    checks = [
+        ("control-plane", 8000, "/health"),
+        ("asr", 8787, "/health"),
+        ("tts", 8788, "/health"),
+        ("llm", 1235, "/v1/models"),
+        ("b-line", 8790, "/health"),
+        ("livekit", 7880, "/"),
+    ]
+    all_ok = True
+    for name, port, path in checks:
+        try:
+            r = urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=3)
+            body = r.read(200).decode()[:200]
+            ok = r.status == 200 and "Not Ready" not in body
+            print(f"  {name:<13} :{port}  {'ok' if ok else 'NON-200'}")
+            all_ok = all_ok and ok
+        except Exception as exc:
+            print(f"  {name:<13} :{port}  DOWN ({exc})")
+            all_ok = False
+    try:
+        r = urllib.request.urlopen("http://127.0.0.1:8081/worker", timeout=3)
+        data = json.loads(r.read().decode())
+        print(f"  {'agent worker':<13} ok  agent_name={data.get('agent_name')} active_jobs={data.get('active_jobs')} load={data.get('worker_load')}")
+    except Exception as exc:
+        print(f"  {'agent worker':<13} DOWN ({exc})")
+        all_ok = False
+    print("prod: OK" if all_ok else "prod: DEGRADED")
+    return 0 if all_ok else 1
+
+
+def cmd_prod(cmd: str) -> int:
+    if cmd == "install":
+        return cmd_prod_install()
+    return cmd_prod_status()
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="bok", description="Bok voice stack launcher (no Docker)")
     sub = p.add_subparsers(dest="cmd", required=True)
     for name in ("catalog", "manifest", "download", "status", "up", "serve", "down", "doctor"):
         sub.add_parser(name)
+    p_prod = sub.add_parser("prod", help="生产常驻单元与健康面")
+    p_prod.add_argument("action", nargs="?", default="status", choices=["install", "status"])
     p_setup = sub.add_parser("setup", help="First-run model readiness / download")
     p_setup.add_argument("action", nargs="?", default="status", choices=["status", "download"])
     return p.parse_args(argv)
@@ -950,6 +1068,8 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     if args.cmd == "setup":
         return cmd_setup(args.action)
+    if args.cmd == "prod":
+        return cmd_prod(args.action)
     return {"catalog": cmd_catalog, "manifest": cmd_manifest, "download": cmd_download, "status": cmd_status,
             "up": cmd_up, "serve": cmd_serve, "down": cmd_down, "doctor": cmd_doctor}[args.cmd]()
 
