@@ -1841,6 +1841,19 @@ class _Qwen3TTSStream(tts.ChunkedStream):
         output_emitter.flush()
 
 
+# ASR 语言提示:值=模型 config support_languages 的规范名(mlx 层大小写不敏感匹配)。
+# 通话模式(pin=False):cantonese 必钉(auto 会误判成普通话)、en 必钉(支持纯英语会话),
+# zh 保持 auto 容忍夹英文 code-switching;同传模式(pin=True):源语言用户选定且固定,全钉。
+_ASR_LANG_HINTS = {"cantonese": "Cantonese", "yue": "Cantonese", "en": "English", "zh": "Chinese"}
+
+
+def _asr_language_hint(lang_state: str, pin: bool) -> str:
+    hint = _ASR_LANG_HINTS.get(lang_state, "")
+    if not pin and hint == "Chinese":
+        return ""
+    return hint
+
+
 class Qwen3ASRSTT(stt.STT):
     """LiveKit STT adapter for the local Qwen3-ASR sidecar."""
 
@@ -1851,6 +1864,7 @@ class Qwen3ASRSTT(stt.STT):
         self,
         base_url: str = "http://127.0.0.1:8787",
         language_state: LanguageState | None = None,
+        pin_language: bool = False,
     ):
         super().__init__(
             capabilities=stt.STTCapabilities(
@@ -1865,6 +1879,9 @@ class Qwen3ASRSTT(stt.STT):
         )
         self._base_url = base_url.rstrip("/")
         self._language_state = language_state or LanguageState()
+        # True=语言钉死(同传:源语言是用户建房时选定的,zh/en/cantonese 都下发 hint);
+        # False=通话模式(只有 cantonese 钉防误判,zh/en 交 auto 容忍夹语 code-switching)。
+        self._pin_language = pin_language
 
     def stream(self, *, language=None, conn_options=None):
         return _Qwen3ASRStream(self, conn_options or APIConnectOptions())
@@ -1928,13 +1945,11 @@ class _Qwen3ASRStream(stt.RecognizeStream):
         if not pcm:
             return "", ""
         t0 = time.monotonic()
-        # 语言提示:会话语言为粤语时强制告诉模型(mlx 层大小写不敏感回填 config 规范名
-        # Cantonese),避免 auto 误判成普通话;zh/en/空不传 = 交给模型 auto 检测。
-        lang_hint = ""
-        if self._stt_._language_state.lang == "cantonese":
-            lang_hint = "cantonese"
-        elif self._stt_._language_state.lang == "yue":  # 旧数据只读别名
-            lang_hint = "cantonese"
+        # 语言提示:值=模型 config support_languages 的规范名(Chinese/English/Cantonese,
+        # mlx 层大小写不敏感)。通话模式只有 cantonese/en 钉——cantonese 防 auto 误判成
+        # 普通话(啱唔靈→难唔难),en 支持纯英语会话;zh 保持 auto 容忍夹英文
+        # (「我哋 check 個 status」)。同传模式源语言固定,三种全钉。
+        lang_hint = _asr_language_hint(self._stt_._language_state.lang, self._stt_._pin_language)
         print(f"QWEN3_ASR_HINT {lang_hint or 'auto'} lang_state={self._stt_._language_state.lang}", flush=True)
         last_exc: Exception | None = None
         for attempt in range(3):

@@ -138,13 +138,15 @@ async def entrypoint(ctx) -> None:
         activation_threshold=_cfg_float("sensitivity", "VAD_ACTIVATION_THRESHOLD", "0.75"),
     )
 
-    # 源语言钉死:粤语源走 language hint(修 auto 误判成普通话),zh/en 交模型 auto。
+    # 源语言钉死(用户建房时选定):zh/en/cantonese 都下发 hint——粤语防 auto 误判成
+    # 普通话,英语/普通话钉定保证整场识别稳定,不吃 auto 的偶发漂移。
     asr_ls = LanguageState()
     asr_ls.lang = source_lang
     stt_provider = lk_stt.StreamAdapter(
         stt=Qwen3ASRSTT(
             base_url=_sidecar(asr_cfg.get("base_url") or "", "QWEN3_ASR_BASE_URL", "http://127.0.0.1:8787"),
             language_state=asr_ls,
+            pin_language=True,
         ),
         vad=vad_provider,
     )

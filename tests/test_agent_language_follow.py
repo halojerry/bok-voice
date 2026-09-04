@@ -28,6 +28,29 @@ def test_mandarin_not_misclassified():
     # 普通话文本（含普粤共用字 下/好/系 等）不得被误判成粤语。
     assert _normalize_asr_language("Chinese", "你好，我想问一下你们公司的情况") == "zh"
     assert _normalize_asr_language("Chinese", "好的，那我等一下再联系你") == "zh"
+
+
+# ---- ASR 语言提示:值=模型 config support_languages 规范名(大小写不敏感回填) ----
+def test_asr_language_hint_call_mode():
+    # 通话模式:粤语钉(防 auto 误判)、英语钉(支持纯英语会话);zh 保持 auto
+    # 容忍夹英文 code-switching(「我哋 check 個 status」)。
+    from agent_runtime.providers.livekit_plugins import _asr_language_hint
+
+    assert _asr_language_hint("cantonese", pin=False) == "Cantonese"
+    assert _asr_language_hint("yue", pin=False) == "Cantonese"  # 旧数据只读别名
+    assert _asr_language_hint("en", pin=False) == "English"
+    assert _asr_language_hint("zh", pin=False) == ""
+    assert _asr_language_hint("", pin=False) == ""
+
+
+def test_asr_language_hint_pinned_mode():
+    # 同传模式:源语言是用户建房时选定的,三种全钉,不吃 auto 漂移。
+    from agent_runtime.providers.livekit_plugins import _asr_language_hint
+
+    assert _asr_language_hint("zh", pin=True) == "Chinese"
+    assert _asr_language_hint("en", pin=True) == "English"
+    assert _asr_language_hint("cantonese", pin=True) == "Cantonese"
+    assert _asr_language_hint("", pin=True) == ""
     assert _normalize_asr_language("Chinese", "请问这个系统怎么使用？") == "zh"
 
 
