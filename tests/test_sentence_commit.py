@@ -780,3 +780,19 @@ def test_partial_dedupe_window_syncs_prev(monkeypatch):
     assert ev2 == [], f"同文窗去重零事件: {ev2}"
     assert prev == last, f"dedupe 窗要同步参照窗: prev={prev!r} last={last!r}"
     assert synced_after_first == "我想查下我張單"
+
+
+def test_vad_pause_short_tail_after_commit_not_reemitted(monkeypatch):
+    """打断自噬修复：pause-commit 后 <6 字短尾（「係。」）唔补发第二条 FINAL——
+    否则新用户轮会把生成中未出声的回复 interrupt 掉（每问无答→心跳顶替）。"""
+    got, stream = _run_vad_stop(
+        monkeypatch,
+        last_partial="我想查下我張單，",
+        prev_partial="我想查下我張單，",
+        finish_text="我想查下我張單。係。",
+    )
+    assert got == [
+        ("START_OF_SPEECH", ""),
+        ("FINAL_TRANSCRIPT", "我想查下我張單"),
+        ("END_OF_SPEECH", ""),
+    ], got

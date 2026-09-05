@@ -98,7 +98,7 @@ def test_advance_only_on_confirm():
     assert fc.current == 1
     fc.on_user_turn("好，可以")  # 确认第2步 → 完成
     assert fc.done
-    assert fc.current_step_text() == ""  # 流程完成不再注入当前步
+    assert fc.current_step_text().startswith("话术流程已走完")  # 完成后注入答疑指引,唔再主动收线
 
 
 def test_deny_objection_stays():
@@ -379,7 +379,7 @@ def test_should_auto_advance_whatsapp_captured_implicit():
 def test_no_steps_no_flow():
     fc = FlowController.from_template({}, OBJ)
     assert not fc.has_steps
-    assert fc.current_step_text() == ""
+    assert fc.current_step_text().startswith("话术流程已走完")  # 完成后注入答疑指引
     assert fc.flow_overview() == ""
 
 

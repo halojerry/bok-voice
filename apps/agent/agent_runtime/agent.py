@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from typing import Optional
 
 from bok_voice_core.policies import ProviderRegistry, ProviderState, select_session_manifest
@@ -237,6 +238,22 @@ def _nudge_instruction(name: str, lang: str) -> str:
     )
 
 
+def _nudge_should_fire(now: float, last_reply_ts: float, last_user_ts: float, nudge_delay: float) -> bool:
+    """沉默心跳开火时序护栏（纯函数，单测用）。
+
+    两种窗口唔开火：
+    - AI 啱講完（< nudge_delay）：俾客戶反應時間；
+    - 客戶最後開聲新過 AI 最後講完且 < 2×delay：答案仲喺路上（生成/合成中），
+      唔好用「仲喺度嗎」頂替真答案；超 2×delay 仍無聲先允許心跳兜底
+      （答案可能失敗/被取消——2026-09-05 三会话实测「一直心跳」根因护栏）。
+    """
+    if now - last_reply_ts < nudge_delay:
+        return False
+    if last_user_ts > last_reply_ts and now - last_user_ts < nudge_delay * 2:
+        return False
+    return True
+
+
 def _silence_farewell_instruction(name: str, lang: str) -> str:
     """两次心跳都没回应:一句礼貌收尾(多谢+阵间再联系+再见),讲完即收线。"""
     who = f"{name}，" if name else ""
@@ -400,29 +417,32 @@ def _prefix_prewarm_enabled() -> bool:
     return os.environ.get("LLM_PREFIX_PREWARM", "1") == "1"
 
 
-def _build_prefix_prewarm_messages(context_state, instructions: str) -> list[dict]:
-    """组装会话首轮真实 prompt 形状的预热请求体（纯函数，单测断言标记）。
+def _build_prefix_prewarm_messages(context_state, instructions: str, greeting_text: str = "") -> list[dict]:
+    """组装 turn-1 真实 prompt 形状的预热请求体（纯函数，单测断言标记）。
 
-    与 ContextAwareLLM.chat 的合并规则同构（1.7.1 KV-cache 铁律）：
-    - system = 稳定指令前缀（render_instruction_prefix：用户语言/回复节奏/
-      应答准则/话术总览/对象档案）+ 人设 base（_instructions+facts）——即
-      turn-1 真请求 system[0] 的字节内容；
-    - 易变尾部（render_context_tail：当前步/记忆）拼喺 fake user 轮文本尾部
-      （请求副本，唔落库），与真请求的尾部拼接位一致。
-    turn-1 真请求与本请求共享「system 全段 + user 头部」token 前缀 → mlx
-    prompt cache 命中，首轮免整段 prefill（p6 实测会话首轮 cached=0，
-    TTFT 2.1-3.2s，其中 system prefill ~1.4s）。
+    2026-09-05 重设计（W0-2）：真实 turn-1 请求 =
+      [system(前缀+人设 base), assistant(开场白原文), user(首句+尾部)]——
+    旧 v1 把开场白 instructions 拼进 system（真实请求里它是 greeting 生成期的
+    独立尾 system、turn-1 没有这一条）→ 预热与 turn-1 从 system 后就分叉，
+    cached=0 全量 prefill（日志铁证：greeting cached=981/982、turn1 0/1433）。
+    现在：开场白播完后取【真实 greeting 文本】作 assistant 轮，预热与 turn-1
+    共享「system 全段 + assistant 开场白」前缀 → turn-1 只 prefill 用户那句。
+    greeting_text 为空（paused/抓取失败）时退化为 [system, user] 形状（仍命中
+    system 段）。
     """
-    from .providers.livekit_plugins import _join_system
-
     prefix = context_state.render_instruction_prefix()
     tail = context_state.render_context_tail()
-    system = _join_system(prefix, instructions or "", "")
+    # ⚠️ 必须复刻 to_provider_format 的序列化:wrapper 的 merged system 是
+    # [prefix, *base_parts] 列表,序列化按 "\n" 连接(实测逐字节 diff 定位,
+    # 旧 _join_system 用 "\n\n" 差一个换行 → 预热与 turn-1 在 system 尾分叉,
+    # cached=0 全量 prefill 白烧)。
+    system = "\n".join([prefix, instructions or ""]) if instructions else prefix
     user = f"你好。\n\n{tail}" if tail else "你好。"
-    return [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
+    msgs: list[dict] = [{"role": "system", "content": system}]
+    if greeting_text:
+        msgs.append({"role": "assistant", "content": greeting_text})
+    msgs.append({"role": "user", "content": user})
+    return msgs
 
 
 def _format_llm_metrics(m) -> str:
@@ -844,8 +864,10 @@ async def entrypoint(ctx):
     # 背景 flow judge 防疊:記錄而家 judge 緊邊一步(-1=冇)。推進唔可以同時兩個 judge。
     _judge_inflight: dict = {"step": -1}
     # 沉默心跳:AI 講完話客戶耐冇出聲 → 主動確認「仲喺度嗎」並帶返當前步。
-    # count 會喺客戶真開口(on_user_turn_completed)時歸零。
-    _nudge_state: dict = {"count": 0, "timer": None}
+    # count 會喺客戶真開口(on_user_turn_completed)時歸零。last_user_ts/last_reply_ts
+    # 記錄「客戶最後開聲」與「AI 最後講完」時刻(秒),心跳只在兩者都足夠舊先開火
+    # ——唔會喺客戶啱講完、AI 答案未出、或者 AI 啱講完幾秒內就打斷。
+    _nudge_state: dict = {"count": 0, "timer": None, "last_user_ts": 0.0, "last_reply_ts": 0.0}
     from .plugins.emotion import EmotionState
 
     emotion_state = EmotionState()
@@ -1133,16 +1155,34 @@ async def entrypoint(ctx):
     # （见下方 greeting 块），这里只定義任务体。
     if _prefix_prewarm_enabled() and isinstance(_raw_llm, MlxLlmLLM) and instructions:
 
-        async def _prefix_prewarm_task() -> None:
+        async def _prefix_prewarm_task(agent_ref) -> None:
             import time as _t2
 
             try:
-                msgs = _build_prefix_prewarm_messages(context_state, instructions)
+                # 抓真实开场白文本（生成完成即入 chat_ctx；播不打紧）——
+                # 预热形状必须含它，turn-1 才命中到 assistant 轮末。
+                greeting_text = ""
+                for _ in range(12):
+                    try:
+                        its = list(getattr(agent_ref, "chat_ctx", None).items or [])
+                    except Exception:
+                        its = []
+                    for it in reversed(its):
+                        if getattr(it, "role", "") == "assistant":
+                            greeting_text = str(
+                                getattr(it, "text_content", "") or getattr(it, "raw_text_content", "") or ""
+                            ).strip()
+                            break
+                    if greeting_text:
+                        break
+                    await asyncio.sleep(0.25)
+                msgs = _build_prefix_prewarm_messages(context_state, instructions, greeting_text)
                 _pw0 = _t2.monotonic()
                 await _raw_llm.prefix_prewarm(msgs)
                 print(
                     f"[agent] llm prefix prewarm done +{(_t2.monotonic() - _pw0) * 1000:.0f}ms "
-                    f"system_chars={len(msgs[0]['content'])} (call {room_name})",
+                    f"msgs={len(msgs)} system_chars={len(msgs[0]['content'])} "
+                    f"greeting={'yes' if greeting_text else 'no'} (call {room_name})",
                     flush=True,
                 )
             except asyncio.CancelledError:
@@ -1348,6 +1388,7 @@ async def entrypoint(ctx):
                 _set_preemptive_max_retries(int(_preemptive_env_opts["max_retries"]))
             # 客戶真開口 → 沉默心跳計數歸零(之後再沉默先重新計 2 次)。
             _nudge_state["count"] = 0
+            _nudge_state["last_user_ts"] = time.monotonic()
             _disarm_silence()
 
             # 抢跑×流程推进共存:框架喺 FINAL 到达时可能已按「旧步骤语境」抢跑生成
@@ -1409,6 +1450,8 @@ async def entrypoint(ctx):
                                     print(f"[whatsapp] report failed, will retry on next signal: {exc!r} (call {room_name})", flush=True)
 
                             asyncio.create_task(_report())
+                            if _kind == "captured_implicit" or (_num and _num != "offered"):
+                                context_state.set_whatsapp_note(_num)
                             print(f"[whatsapp] {_kind} num={_num or '-'} (call {room_name})", flush=True)
             except Exception:  # pragma: no cover - WhatsApp 偵測失敗唔阻斷
                 pass
@@ -1511,37 +1554,16 @@ async def entrypoint(ctx):
             except asyncio.TimeoutError:
                 pass
 
-    watch_task = asyncio.create_task(_supervisor_watch())
-    # AgentSession 内部已注册 job shutdown callback（自动 aclose），
-    # 这里不能提前 close，否则会话在接通后立刻被销毁。
-    await session.start(agent=agent, room=ctx.room)
-    _log_stage("session_started")
-
-    if not agent.paused:
-        # 开场白用开场语言（对象/人设语言决定）；generate_reply 的 instructions 会
-        # 在基础指令上叠加，配合 system 里的母语设定让首句即用对的语言。
-        greetings = {"zh": "请问有什么可以帮您？", "cantonese": "請問有咩可以幫到你？", "en": "How can I help you?"}
-        await session.generate_reply(instructions=greetings.get(greet_lang, greetings["zh"]))
-        _log_stage("greeting_queued")
-    # ---- 会话首轮真实前缀预热（LLM_PREFIX_PREWARM，默认 1）--------------------
-    # context_state/persona/flow 已装配完（前缀字节就此定形）、session 已建——
-    # fire-and-forget 发一个「真实 prompt 形状」的 1-token 请求：把 merged system
-    # 前缀烧进 mlx prompt cache，turn-1 真请求 cached≈system 长度，免 ~1.4s 全量
-    # prefill（p6：会话首轮 TTFT 2.1-3.2s、cached=0 是延迟台账最差档）。
-    # 触发点=开场白之后：冷启动时预热若排在 greeting prefill 前面，会把开场白
-    # TTFT 拖慢一整个 prefill（实测 7.3s vs ~2s 基线）；greeting 本身就会把
-    # system 前缀烧进 cache，预热只需在「客户开口前」补齐 [system+user 形状]
-    # 的边界——greeting playout（几秒）足够它跑完。paused（无 greeting）时立即发。
-    # 绝不阻塞会话：asyncio.create_task + 异常全吞（失败只损失预热）。
-    if _prefix_prewarm_armed:
-        asyncio.create_task(_prefix_prewarm_task())
-
-    # ---- 沉默心跳(真实电话节奏):AI 講完轉回「聆聽」後 SILENCE_NUDGE_SECONDS(默認3.5s)
+    # ---- 沉默心跳(真实电话节奏):AI 講完轉回「聆聽」後 SILENCE_NUDGE_SECONDS(默认8s)
     # 客戶冇出聲 → 一句「仲喺度嗎」帶返當前步;兩次都冇回應 → 禮貌收尾並自動收線
-    # (disposition=no_response,總靜音 ~3.5+3.5+12≈19s)。客戶出聲即撤錶歸零;
-    # 收尾態/流程走完/暫停中唔追。SILENCE_NUDGE_MAX=0 關閉。
+    # (disposition=no_response)。客戶出聲即撤錶歸零;收尾態/流程走完/暫停中唔追。
+    # SILENCE_NUDGE_MAX=0 關閉。
+    # ⚠️ 定义与注册必须先于 session.start/开场白:开场白播完的 listening 转换
+    # 发生在注册前的话,首段沉默永远收不到 arm、no_response 收线整条失效
+    # (2026-09-05 审查 P1)。依赖(session/agent/flow_ctrl/closed/...)此处均已就绪。
     nudge_max = int(os.environ.get("SILENCE_NUDGE_MAX", "2"))
-    nudge_delay = float(os.environ.get("SILENCE_NUDGE_SECONDS", "3.5"))
+    # 默认 8s:旧 3.5-4s 太激进,客戶停頓/諗嘢/答案生成中就跳心跳(實測反饋「一直心跳」)。
+    nudge_delay = float(os.environ.get("SILENCE_NUDGE_SECONDS", "8"))
     _nudge_state["farewell"] = False
 
     def _disarm_silence() -> None:
@@ -1565,6 +1587,11 @@ async def entrypoint(ctx):
                 return
             if closed.is_set() or agent.paused or flow_ctrl.closing or _nudge_state.get("farewell"):
                 return
+            now = time.monotonic()
+            last_user = float(_nudge_state.get("last_user_ts") or 0.0)
+            last_reply = float(_nudge_state.get("last_reply_ts") or 0.0)
+            if not _nudge_should_fire(now, last_reply, last_user, nudge_delay):
+                return
             name = str((object_card or {}).get("display_name") or "").strip()
             lang = language_state.lang if language_state.lang in ("zh", "cantonese", "en") else "zh"
             if _nudge_state["count"] >= nudge_max:
@@ -1587,19 +1614,50 @@ async def entrypoint(ctx):
         _nudge_state["timer"] = asyncio.create_task(_fire())
 
     def _on_agent_state(ev) -> None:
-        # AI 講完轉「聆聽」→ 起錶;講話/思考中 → 撤錶。
+        # AI 講完轉「聆聽」→ 記低 AI 最後講完時刻再起錶;講話/思考中 → 撤錶。
         if getattr(ev, "new_state", "") == "listening":
+            _nudge_state["last_reply_ts"] = time.monotonic()
             _arm_silence()
         else:
             _disarm_silence()
 
     def _on_user_state(ev) -> None:
         if getattr(ev, "new_state", "") == "speaking":
+            _nudge_state["last_user_ts"] = time.monotonic()
             _disarm_silence()
+        elif nudge_max > 0:
+            # 噪声/一句未成轮的短音同样撤表——用户停声后补 arm(防永久关心跳);
+            # _fire 的时序护栏会挡住「答案还在路上」的窗口,误 arm 无害。
+            _arm_silence()
 
     if nudge_max > 0:
         session.on("agent_state_changed", _on_agent_state)
         session.on("user_state_changed", _on_user_state)
+
+    watch_task = asyncio.create_task(_supervisor_watch())
+    # AgentSession 内部已注册 job shutdown callback（自动 aclose），
+    # 这里不能提前 close，否则会话在接通后立刻被销毁。
+    await session.start(agent=agent, room=ctx.room)
+    _log_stage("session_started")
+
+    if not agent.paused:
+        # 开场白用开场语言（对象/人设语言决定）；generate_reply 的 instructions 会
+        # 在基础指令上叠加，配合 system 里的母语设定让首句即用对的语言。
+        greetings = {"zh": "请问有什么可以帮您？", "cantonese": "請問有咩可以幫到你？", "en": "How can I help you?"}
+        await session.generate_reply(instructions=greetings.get(greet_lang, greetings["zh"]))
+        _log_stage("greeting_queued")
+    # ---- 会话首轮真实前缀预热（LLM_PREFIX_PREWARM，默认 1）--------------------
+    # context_state/persona/flow 已装配完（前缀字节就此定形）、session 已建——
+    # fire-and-forget 发一个「真实 prompt 形状」的 1-token 请求：把 merged system
+    # 前缀烧进 mlx prompt cache，turn-1 真请求 cached≈system 长度，免 ~1.4s 全量
+    # prefill（p6：会话首轮 TTFT 2.1-3.2s、cached=0 是延迟台账最差档）。
+    # 触发点=开场白之后：冷启动时预热若排在 greeting prefill 前面，会把开场白
+    # TTFT 拖慢一整个 prefill（实测 7.3s vs ~2s 基线）；greeting 本身就会把
+    # system 前缀烧进 cache，预热只需在「客户开口前」补齐 [system+user 形状]
+    # 的边界——greeting playout（几秒）足够它跑完。paused（无 greeting）时立即发。
+    # 绝不阻塞会话：asyncio.create_task + 异常全吞（失败只损失预热）。
+    if _prefix_prewarm_armed:
+        asyncio.create_task(_prefix_prewarm_task(agent))
 
     # session.start 只负责拉起流水线（返回后会话在后台运行）。保持 entrypoint
     # 存活直到房间关闭，supervisor watcher 在此期间持续轮询；_on_close 置位

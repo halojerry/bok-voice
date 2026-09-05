@@ -279,6 +279,31 @@ class MlxLlmLLM(_OpenAICompatBase):
             temperature=float(os.environ.get("LLM_TEMPERATURE", "0.35")),
             extra_body=extra_body,
         )
+        # BOK_LLM_MSG_DEBUG=1：逐请求消息指纹（sha1+长度+头尾片段），定位
+        # 「缓存锚点后即分叉」是哪条消息每轮在变（W0 诊断工具，默认关）。
+        if os.environ.get("BOK_LLM_MSG_DEBUG", "") == "1":
+            import hashlib as _hashlib
+
+            _client = self._client
+            _raw_create = _client.chat.completions.create
+
+            async def _create(**kw):
+                msgs = kw.get("messages") or []
+                tag = f"{id(kw):x}"[-6:]
+                for i, m in enumerate(msgs):
+                    c = m.get("content")
+                    text = c if isinstance(c, str) else "".join(
+                        x.get("text", "") for x in (c or []) if isinstance(x, dict)
+                    )
+                    fp = _hashlib.sha1(text.encode()).hexdigest()[:10]
+                    print(
+                        f"[llmmsg] req={tag} msg{i} role={m.get('role')} len={len(text)} "
+                        f"sha={fp} head={text[:36]!r} tail={text[-36:]!r}",
+                        flush=True,
+                    )
+                return await _raw_create(**kw)
+
+            _client.chat.completions.create = _create
 
     async def _prewarm_impl(self) -> None:
         # 真实 1-token 生成：暖 mlx 模型（冷启动的 KV 分配/首 token 占首包大头）。
@@ -528,6 +553,30 @@ class ContextState:
         # 时 tail 才渲染那两节。agent.py 装配时按自身 RAG 门控(_context_rag_enabled)
         # 置位,或直接改用 ContextState.from_env() 装配(CONTEXT_RAG=1 → True)。
         self.rag_enabled: bool = False
+        # WhatsApp 已捕获号码（注入尾部,防 LLM 复述错号——2026-09-06 实测尾号读错）
+        self._whatsapp_note: str = ""
+        # 追加式尾部账本（KV-cache 铁律 2026-09-05）：记录每个 user 消息被
+        # ContextAwareLLM 拼上的易变尾部（原文, 原文+尾部），FIFO 对应历史里的
+        # user 消息。下一轮请求把历史中的旧 user 重放成「原文+当时的尾部」——
+        # 上一轮请求因此永远是下一轮的严格前缀（此前尾部只拼在最后一条 user、
+        # 下轮即被剥掉 → 中途分叉 → 只有 system 锚点命中，对话历史每轮全量
+        # 重 prefill，实测暖轮 cached 恒=锚点、TTFT 0.7-1.3s 的主因）。
+        self._applied_tails: list[tuple[str, str]] = []
+
+    def set_whatsapp_note(self, num: str) -> None:
+        self._whatsapp_note = num or ""
+
+    def record_applied_tail(self, orig: str, final: str) -> None:
+        self._applied_tails.append((orig, final))
+
+    def applied_tails(self) -> list[tuple[str, str]]:
+        return list(self._applied_tails)
+
+    def prune_applied_tails(self, keep: int) -> None:
+        if keep < 0:
+            keep = 0
+        if len(self._applied_tails) > keep:
+            self._applied_tails = self._applied_tails[-keep:]
 
     @classmethod
     def from_env(cls, account_id: str = "") -> "ContextState":
@@ -695,6 +744,11 @@ class ContextState:
         单对象只上话术+对象档案;CONTEXT_RAG=1/开放人设由装配处置 True)。
         """
         parts: list[str] = []
+        if self._whatsapp_note:
+            parts.append(
+                "【已记录客户 WhatsApp】" + self._whatsapp_note +
+                "（复述号码必须逐位以此为准，唔好凭记忆/估）"
+            )
         if self._flow_current:
             # 当前步约束(随 flow 推进而变):放尾部最前,推进只改这里、前缀字节不动。
             parts.append("【现在这一步】\n" + self._flow_current)
@@ -779,44 +833,68 @@ class ContextAwareLLM(llm.LLM):
     ):
         if self._ctx is not None:
             # KV-cache 命中规律(mlx_lm 0.31.3 LRUPromptCache 实测):只有「已缓存序列是
-            # 新请求的严格前缀」才复用——历史每轮在尾部增长,所以易变内容若放在 system
-            # 里(哪怕垫最后),下一轮请求就会在 system 处与缓存分叉 → common_prefix 再长
-            # 也不命中(cached_tokens=0,实测每轮 TTFT ~2s)。唯一可行位=把易变尾部拼到
-            # 【最后一条 user 消息】后面:序列变纯追加式,上一轮请求永远是下一轮的前缀。
-            # system 只留整场静态段(指令前缀+人设),逐轮字节不变。
+            # 新请求的严格前缀」才复用。2026-09-05 INFO 取证推翻旧设计:尾部每轮拼进
+            # 【最后一条 user】→ 下一轮该消息变历史、尾部被剥 → 上一轮请求与新请求在
+            # 该消息处分叉 → 只有 system 锚点命中(日志 cached 恒=锚点长),对话历史
+            # 每轮全量重 prefill(暖轮 TTFT 0.7-1.3s 主因)。
+            # 新设计=跨轮纯追加:每个 user 消息首次出现时拼上「当时」的尾部,并记入
+            # ContextState._applied_tails 账本;此后每轮原样重放(原文+当时的尾部)。
+            # 上一轮请求因此永远是下一轮的严格前缀 → 每轮只 prefill 新增的那句。
+            # 尾部随消息冻结(历史里每轮看到的是当时的步骤/记忆,语义自洽);
+            # 历史截断(摊销式)整对丢消息,账本自尾对齐,重锚每 2×N 轮一次。
             prefix = self._ctx.render_instruction_prefix()
-            tail = self._ctx.render_context_tail()
-            if prefix or tail:
+            if prefix:
                 copy = chat_ctx.copy()
                 items = list(copy.items)
                 if items and isinstance(items[0], llm.ChatMessage) and items[0].role == "system":
                     head = items[0].content
                     if isinstance(head, str):
-                        merged = _join_system(prefix, head, "")
+                        merged: list = [_join_system(prefix, head, "")]
                     else:
                         merged = [*([prefix] if prefix else []), *head]
                     items[0] = llm.ChatMessage(role="system", content=merged)
                 else:
-                    items.insert(0, llm.ChatMessage(role="system", content=_join_system(prefix, "", "")))
-                # 易变尾部(当前步/知识/记忆)拼到最后一条 user 消息尾部(仅请求副本,
-                # 不落库——下一轮 chat_ctx 仍由框架持久历史 + 重新渲染组装)。
-                if tail:
-                    for j in range(len(items) - 1, -1, -1):
-                        if getattr(items[j], "role", "") == "user":
-                            content = items[j].content
-                            if isinstance(content, str):
-                                new_content = f"{content}\n\n{tail}" if content else tail
-                            else:
-                                new_content = [*content, tail]
-                            items[j] = llm.ChatMessage(role="user", content=new_content)
-                            break
-                # 截断历史(摊销式,见 _truncate_chat_items):超过 2×N 对才剪回 N 对
-                # (默认 8 对),更早的靠「本通对话记忆」摘要兜底。每轮全量历史会让
-                # prefill 随轮次线性变慢(实测 12 轮 TTFT 2.4s);滞回让截断之间保持
-                # 纯追加(KV-cache 命中),上下文仍有上界。4→8:摊销后第 1-16 轮纯
-                # 追加全缓存命中,单会话记忆(客户地址/单号/诉求)留原文更久。
+                    items.insert(0, llm.ChatMessage(role="system", content=[_join_system(prefix, "", "")]))
+                # 截断历史(摊销式,见 _truncate_chat_items):先剪后对齐,账本自尾映射。
                 max_turns = int(os.environ.get("LLM_HISTORY_TURNS", "8"))
                 items = _truncate_chat_items(items, max_turns=max_turns)
+                # 尾部重放+新消息追加(见上)。users=当前请求里的 user 消息下标(时序序)。
+                users = [i for i, it in enumerate(items) if getattr(it, "role", "") == "user"]
+                applied = self._ctx.applied_tails()
+                n_new = len(users) - len(applied)
+
+                def _text_of(it) -> str:
+                    c = getattr(it, "content", "")
+                    if isinstance(c, str):
+                        return c
+                    return "".join(x for x in (c or []) if isinstance(x, str))
+
+                def _replay(idx: int, orig: str, final: str) -> None:
+                    it = items[idx]
+                    if isinstance(it, llm.ChatMessage) and _text_of(it) == orig:
+                        items[idx] = llm.ChatMessage(role="user", content=[final])
+                    # 原文对不上(极端改写)→ 跳过该条,损失局部缓存也好过乱拼。
+
+                if n_new > 0:
+                    # 旧的 applied 对应 users 前 |applied| 条(时序一致),逐条重放;
+                    # 新增的尾部 user 从最后一条起各拼当前尾部并入账。
+                    for k, (orig, final) in enumerate(applied):
+                        _replay(users[k], orig, final)
+                    for idx in users[len(applied):]:
+                        it = items[idx]
+                        orig = _text_of(it) if isinstance(it, llm.ChatMessage) else ""
+                        tail = self._ctx.render_context_tail()
+                        final = f"{orig}\n\n{tail}" if (orig and tail) else (orig or tail)
+                        if tail:
+                            items[idx] = llm.ChatMessage(role="user", content=[final])
+                        self._ctx.record_applied_tail(orig, final)
+                elif users:
+                    # 无新消息的重放(抢跑重试等):整段原样重放,唔重写尾部,保严格前缀。
+                    tail_window = applied[-len(users):] if len(applied) >= len(users) else []
+                    offset = len(users) - len(tail_window)
+                    for k, (orig, final) in enumerate(tail_window):
+                        _replay(users[offset + k], orig, final)
+                self._ctx.prune_applied_tails(keep=len(users))
                 copy.items = items
                 chat_ctx = copy
         return self._inner.chat(
@@ -1687,9 +1765,11 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
             return json.loads(await asyncio.wait_for(a_ws.recv(), timeout=15))
 
         init_done = False
+        first_pushed = False
         frame_bytes = int(sample_rate / 5) * 2  # 200ms 帧
         buf = bytearray()
         recv_task: asyncio.Task | None = None
+        closed_ws = asyncio.Event()
         t_start = time.monotonic()
         try:
             try:
@@ -1735,8 +1815,7 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
 
         try:
             async def _recv_loop():
-                nonlocal init_done, buf
-                first_pushed = False
+                nonlocal init_done, buf, first_pushed
                 while True:
                     try:
                         msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
@@ -1793,6 +1872,49 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
 
             recv_task = asyncio.create_task(_recv_loop())
 
+            # ---- 卡死自愈（W0.5，2026-09-06）：MiniMax 偶发 task_started 后长时
+            # 无首包（实测 >8s，期间心跳顶替=「每问无答」体感）。看门狗超时未出
+            # 首包 → 断开旧 ws、重开一条并重发已发文本，一次性自愈；已出首包则
+            # 不干预。MINIMAX_FIRST_AUDIO_TIMEOUT_S 可调（默认6）。
+            stall_timeout = float(os.environ.get("MINIMAX_FIRST_AUDIO_TIMEOUT_S", "6"))
+            stalled = False
+            sent_all: list[str] = []
+            closed_ws = asyncio.Event()
+
+            async def _stall_watch() -> None:
+                nonlocal ws, stalled, recv_task, init_done, first_pushed, t_task, t_start
+                while not first_pushed:
+                    await asyncio.sleep(0.5)
+                    if closed_ws.is_set() or time.monotonic() - t_task <= stall_timeout:
+                        continue
+                    print(
+                        f"MINIMAX_TTS_STALL no_first_audio_{stall_timeout:.0f}s -> reconnect_retry",
+                        flush=True,
+                    )
+                    stalled = True
+                    try:
+                        await _minimax_ws_silent_close(ws)
+                    except Exception:  # pragma: no cover
+                        pass
+                    recv_task.cancel()
+                    ws = await websockets.connect(
+                        self._tts_._endpoint_ws(),
+                        additional_headers={"Authorization": f"Bearer {key}"},
+                        open_timeout=10,
+                        max_size=20_000_000,
+                    )
+                    await _handshake(ws)
+                    t_task = time.monotonic()
+                    t_start = t_task
+                    init_done = False
+                    first_pushed = False
+                    for s in sent_all:
+                        await ws.send(json.dumps({"event": "task_continue", "text": s}))
+                    recv_task = asyncio.create_task(_recv_loop())
+                    return
+
+            stall_task = asyncio.create_task(_stall_watch())
+
             # 增量合成:文本按边界切分逐段 task_continue。实测语义:
             # - 发累积全文会重复合成前面句子(长回复下明显重读);
             # - 纯逐块增量(不按句)在快速 send 下丢音频(服务端要等足文本才合成)。
@@ -1847,6 +1969,7 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                 if is_lecture_text(s):
                     return  # 已触发过,课程延续句照丢
                 await ws.send(json.dumps({"event": "task_continue", "text": s}))
+                sent_all.append(s)
                 sent_any = True
                 _last_send = time.monotonic()
 
@@ -3432,6 +3555,13 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                     # _committed_text 恒空，_uncommitted 原样返回 → 行为同旧。
                     committed_before = self._committed_text
                     payload = self._uncommitted(text) if (text and committed_before) else text
+                    # 短尾唔补发第二条 FINAL（打断自噬修复，2026-09-05 粤语实测）：
+                    # pause-commit 刚提交半句、回复生成中，紧跟的 <6 字短尾（「係。」）
+                    # 若再发一条 FINAL → 新用户轮把未出声的回复 interrupt 掉 → 每问
+                    # 无答、8s 后心跳顶替。短尾信息量低，丢弃（停嘴整句兜底仍在）；
+                    # ≥6 字尾句可能係真第二句，照发。
+                    if committed_before and payload and len(payload) < _ASR_SENTENCE_MIN_CHARS:
+                        payload = ""
                     started = False
                     self._finishing = False
                     self._reset()

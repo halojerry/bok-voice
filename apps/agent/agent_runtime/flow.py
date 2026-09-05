@@ -513,7 +513,12 @@ class FlowController:
         if self.closing:
             return self.closing_text()
         if not self.has_steps or self.done:
-            return ""
+            # 话术走完 ≠ 收线:继续如常答疑/跟进,主动再见只准出现在 REFUSE/
+            # 沉默收线(否则客户问「接下来怎么」会被 LLM 拜拜,实测 2026-09-06)。
+            return (
+                "话术流程已走完。唔好主动讲再见或收线；继续如常回答客户问题、"
+                "确认后续安排（专员联系/到账时间），客户有问必答，等客户自然结束。"
+            )
         step = self.steps[self.current]
         lines = [f"流程第 {self.current + 1}/{len(self.steps)} 步"]
         if self._just_advanced and self.current > 0:

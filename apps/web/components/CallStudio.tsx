@@ -124,10 +124,11 @@ function LiveAgentPanel({ room }: { room: Room | null }) {
             showMoodLabel
           />
         </div>
-        {/* 官方失败态显性化:agent/会话失败不能只显示一个「失败」点,把原因亮出来。 */}
-        {failureReasons.length > 0 && (
+        {/* 官方失败态显性化:agent/会话失败不能只显示一个「失败」点,把原因亮出来。
+            useAgent 未连接会话时 failureReasons 可能为 null——空值守卫,避免开页即崩。 */}
+        {(failureReasons?.length ?? 0) > 0 && (
           <div className="max-w-[420px] text-center text-xs text-red-500">
-            连接失败：{failureReasons.join("；")}
+            连接失败：{(failureReasons ?? []).join("；")}
           </div>
         )}
       </div>
@@ -399,12 +400,36 @@ function str(v: unknown, fallback = "-") {
 
 export function CallStudio({ callId = "" }: { callId?: string }) {
   const { accountId: ACCOUNT } = useAccount();
+  // 记住本账号上一次使用的人设/对象：新建通话默认恢复它(而非恒取列表第一个),
+  // 挂断后切新人设/对象 → 接通即用新选择,唔会悄悄回到上个对话的档案。
+  const lastKey = (kind: "persona" | "object") => `bok.call.${kind}.${ACCOUNT}`;
+  const lsGet = (k: string): string => {
+    try {
+      return typeof window !== "undefined" ? window.localStorage.getItem(k) ?? "" : "";
+    } catch {
+      return "";
+    }
+  };
+  const lsSet = (k: string, v: string) => {
+    try {
+      window.localStorage.setItem(k, v);
+    } catch {
+      /* ignore */
+    }
+  };
   const [stateCallId, setStateCallId] = useState(callId);
   const callIdRef = useRef(callId);
+  // hydrate（打开历史通话）写入的 objId/personaId 唔算「用户选择」——唔入「上次选择」账，
+  // 否则看过一眼旧通话就会污染之后新建通话的默认档案（2026-09-05 审查 P2）。
+  const suppressPersist = useRef(0);
+  const objIdRef = useRef("");
+  const personaIdRef = useRef("");
   const [objects, setObjects] = useState<Record<string, unknown>[]>([]);
   const [personas, setPersonas] = useState<Record<string, unknown>[]>([]);
   const [objId, setObjId] = useState("");
   const [personaId, setPersonaId] = useState("");
+  objIdRef.current = objId;
+  personaIdRef.current = personaId;
   const [object, setObject] = useState<Record<string, unknown> | null>(null);
   const [persona, setPersona] = useState<Record<string, unknown> | null>(null);
   const [mode, setMode] = useState<"simulation" | "live">("simulation");
@@ -445,6 +470,14 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
   const [waStatus, setWaStatus] = useState("");
   const [waNum, setWaNum] = useState("");
   const [waHandling, setWaHandling] = useState(false);
+  // 接通后「AI 初始化中」提示窗口(到点自动消失;期间面板状态灯同显)
+  const [initHintUntil, setInitHintUntil] = useState(0);
+  const [nowTick, setNowTick] = useState(0);
+  useEffect(() => {
+    if (!initHintUntil) return;
+    const t = setInterval(() => setNowTick((v) => v + 1), 500);
+    return () => clearInterval(t);
+  }, [initHintUntil > 0]);
 
   // WhatsApp 對接:開住工作台時 3s poll call 狀態(offered/captured→面板橫幅;handled→收起)。
   useEffect(() => {
@@ -512,14 +545,26 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
   useEffect(() => {
     if (loadAttemptRef.current === cp.attempt) return;
     loadAttemptRef.current = cp.attempt;
+    // 工作台模式（callId 非空）：档案由 hydrate 从服务端解析,列表默认选择唔跑——
+    // 两者异步竞态会把历史通话档案覆写成「列表首个/上次」。
+    if (callId) return;
     let cancelled = false;
     Promise.all([api.listObjects(ACCOUNT), api.listPersonas()])
       .then(([objs, pers]) => {
         if (cancelled) return;
         if (Array.isArray(objs)) setObjects(objs);
         if (Array.isArray(pers)) setPersonas(pers);
-        if (objs?.length) setObjId(String(objs[0].id));
-        if (pers?.length) setPersonaId(String(pers[0].id));
+        // 默认选「上次用的人设/对象」(存在且在列表内);否则取第一个。
+        const lastObj = lsGet(lastKey("object"));
+        const lastPers = lsGet(lastKey("persona"));
+        if (objs?.length) {
+          const picked = objs.find((o) => String(o.id) === lastObj) ? lastObj : String(objs[0].id);
+          setObjId(picked);
+        }
+        if (pers?.length) {
+          const picked = pers.find((p) => String(p.id) === lastPers) ? lastPers : String(pers[0].id);
+          setPersonaId(picked);
+        }
         setError(null);
       })
       .catch((e) => {
@@ -544,6 +589,8 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
     api
       .getCall(callId)
       .then((c) => {
+        if (c.object_id && String(c.object_id) !== objIdRef.current) suppressPersist.current += 1;
+        if (c.persona_id && String(c.persona_id) !== personaIdRef.current) suppressPersist.current += 1;
         if (c.object_id) setObjId(String(c.object_id));
         if (c.persona_id) setPersonaId(String(c.persona_id));
         if (c.mode) setMode(c.mode as "simulation" | "live");
@@ -561,6 +608,26 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
   useEffect(() => {
     if (!personaId) return;
     api.getPersona(personaId).then(setPersona).catch(() => {});
+  }, [personaId]);
+
+  // 记住每次选择：新建通话/挂断後还原到上次用的人设与对象。
+  useEffect(() => {
+    if (!objId) return;
+    if (suppressPersist.current > 0) {
+      suppressPersist.current -= 1;
+      return;
+    }
+    lsSet(lastKey("object"), objId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [objId]);
+  useEffect(() => {
+    if (!personaId) return;
+    if (suppressPersist.current > 0) {
+      suppressPersist.current -= 1;
+      return;
+    }
+    lsSet(lastKey("persona"), personaId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [personaId]);
 
   // Load settlement only for an existing call view (e.g. /calls/[id]).
@@ -622,6 +689,7 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
       // （agent 侧 1.7.1 的 pre_connect_audio 默认已开。）
       await session.room.localParticipant.setMicrophoneEnabled(true, undefined, { preConnectBuffer: true }).catch(() => {});
       await session.start({ tracks: { microphone: { enabled: true } } });
+      setInitHintUntil(Date.now() + 8000);
       // 确保本地麦克风真正发布：session.start 的 tracks 选项在部分 livekit 版本不生效，
       // 显式 setMicrophoneEnabled 才可靠（否则 agent 收不到用户声音 → 对话"没输入"）。
       try {
@@ -656,7 +724,8 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
         const s = await api.getSettlement(stateCallId);
         setSettlement(s);
       } catch (e) {
-        console.warn("settle failed", e);
+        // 未有结算(未 settle)时 /settlement 404 属预期,唔刷 console。
+        if (!String(e).includes("404")) console.warn("settle failed", e);
       }
     }
     setStateCallId("");
@@ -758,13 +827,33 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
           <div className="flex flex-col items-end gap-2">
             <div className="flex gap-2">
               {!roomConnected ? (
-                <button className="btn-primary" onClick={connect} disabled={connecting || (!stateCallId && !objId)}>
-                  {connecting ? "接通中…" : error ? "重试接通" : isJoiningExisting ? "接通 / 进房" : "接通"}
-                </button>
+                <div className="flex flex-col items-end gap-1">
+                  {!stateCallId && objId && (
+                    <p className="text-[10px] text-[var(--muted)]">
+                      接通后：{str(objects.find((o) => String(o.id) === objId)?.display_name)}{" "}
+                      · {str(personas.find((p) => String(p.id) === personaId)?.name ?? "默认人设")}
+                    </p>
+                  )}
+                  <button className="btn-primary" onClick={connect} disabled={connecting || (!stateCallId && !objId)}>
+                    {connecting ? "接通中…" : error ? "重试接通" : isJoiningExisting ? "接通 / 进房" : "接通"}
+                  </button>
+                  {connecting && (
+                    <p className="animate-pulse text-[11px] text-sky-300">
+                      正在创建会话并接通…（约几秒，随后显示「初始化中」）
+                    </p>
+                  )}
+                </div>
               ) : (
-                <button className="btn-ghost" onClick={leave}>
-                  挂断
-                </button>
+                <div className="flex items-center gap-2">
+                  {initHintUntil > 0 && Date.now() < initHintUntil && (
+                    <span className="animate-pulse text-[11px] text-sky-300" data-tick={nowTick}>
+                      AI 初始化中…
+                    </span>
+                  )}
+                  <button className="btn-ghost" onClick={leave}>
+                    挂断
+                  </button>
+                </div>
               )}
             </div>
             {roomConnected && isJoiningExisting && (
@@ -823,12 +912,23 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
                   <button
                     className="btn-ghost text-xs"
                     onClick={async () => {
+                      let ok = false;
                       try {
                         await navigator.clipboard.writeText(waNum);
-                        setSuperviseMsg("号码已复制");
+                        ok = true;
                       } catch {
-                        /* clipboard 失敗靜默 */
+                        try {
+                          const ta = document.createElement("textarea");
+                          ta.value = waNum;
+                          document.body.appendChild(ta);
+                          ta.select();
+                          ok = document.execCommand("copy");
+                          document.body.removeChild(ta);
+                        } catch {
+                          ok = false;
+                        }
                       }
+                      setSuperviseMsg(ok ? "号码已复制" : "复制失败，请手动选择复制");
                     }}
                   >
                     复制号码

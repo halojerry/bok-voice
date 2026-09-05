@@ -10,7 +10,7 @@ import wave
 from pathlib import Path
 
 import httpx
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
@@ -896,7 +896,7 @@ def delete_object(object_id: str) -> dict:
 
 
 @app.post("/api/objects/import")
-def import_objects(account_id: str, rows: list[CreateObjectRequest]) -> dict:
+def import_objects(account_id: str, rows: list[CreateObjectRequest] = Body(...)) -> dict:
     created = [_repo().create_object(account_id, row.model_dump()) for row in rows]
     return {"imported": len(created), "items": created}
 
