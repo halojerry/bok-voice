@@ -1196,6 +1196,10 @@ def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
     ——TTS 供应商/音色由 interpret.py 按设置与方向解析。
     """
     env = dict(agent_env)
+    # P2 句级提交 B 线本轮保持关：interpret.py 的 turn_handling 未切 stt（仍是
+    # EOT 默认），STT 侧句级 FINAL 会在 EOT 模式叠进停嘴整段 → 转写重复。A 线
+    # 默认开（agent.py TURN_DETECTION 默认 stt + livekit_plugins 同判）。
+    env["QWEN3_ASR_SENTENCE_COMMIT"] = "0"
     mt_model = _mt_llm_model(MODELS["mac"] if is_mac() else MODELS["windows"])
     if (mt_model and Path(mt_model).exists()) or healthy(1236):
         env["MT_LLM_BASE_URL"] = os.environ.get("MT_LLM_BASE_URL", "http://127.0.0.1:1236/v1")

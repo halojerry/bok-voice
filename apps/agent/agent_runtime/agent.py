@@ -348,6 +348,39 @@ def _marker_pause_enabled() -> bool:
     return os.environ.get("PREEMPTIVE_DISABLE_ON_MARKER", "0") == "1"
 
 
+def _turn_detection_mode_from_env() -> str:
+    """轮次判定模式，A 线默认 "stt"（P2 句级提交）。
+
+    "stt"：STT 按句发 FINAL+END_OF_SPEECH（_Qwen3ASRLiveStream 句级提交），
+    框架按句 commit 轮次（audio_recognition.py:1292-1327 官方契约），LLM+TTS
+    与客户说话重叠——speech-end→first-audio ≤1s 的唯一路径。官方字面量原样
+    透传给 AgentSession turn_detection。
+    Kill-switch：显式 TURN_DETECTION=（空串）→ 旧默认（本地 EOT 模型）；
+    TURN_DETECTION=vad/manual 等同样原样透传。STT 侧句级提交由 livekit_plugins
+    sentence_commit_enabled() 同判（同一 env 同一默认），关框架模式必连着关
+    句级 FINAL，唔会出现「EOT 模式吃句子 FINAL 叠成重复转写」。
+    """
+    return os.environ.get("TURN_DETECTION", "stt").strip()
+
+
+def _endpointing_delays_from_env() -> tuple[float, float]:
+    """endpointing (min_delay, max_delay)，env 逐项可回退。
+
+    P2 起 min 默认 0.25（官方最快配对，turn_detection="stt" 下句级 EOS 后仍要
+    等足 min_delay 才 commit——research-livekit-official.md §4）：句级提交把
+    提交锚从「VAD 静音 0.45s + ASR finish」提前到 STT 句末，误判由 VAD SOS
+    自愈（EOS 后 VAD flush，继续说话的 SOS 会取消该次 commit 并入下一句）+
+    打断 0.6s/false-interruption 1.0s 兜底，唔再靠 min_delay 硬扛。旧值
+    ENDPOINT_MIN_DELAY=0.35 可回退；TURN_DETECTION≠stt 的 kill-switch 场景
+    同用 0.25（E2E 需证明两档都无回归，见 progress P2）。max 0.6 沿用 P1 默认
+    （本地 EOT v1-mini 无 Cantonese 校准档时提交撞 max 的保底）。
+    """
+    return (
+        float(os.environ.get("ENDPOINT_MIN_DELAY", "0.25")),
+        float(os.environ.get("ENDPOINT_MAX_DELAY", "0.6")),
+    )
+
+
 def _format_llm_metrics(m) -> str:
     """官方 LLMMetrics 一行速览（延迟调优脚本沿用 LLM_TTFT_MS 前缀标记）。
 
@@ -896,30 +929,33 @@ async def entrypoint(ctx):
     # LLM 预热已收敛到官方机制：MlxLlmLLM._prewarm_impl（发 1-token 请求暖 mlx 模型）
     # 由 AgentSession 构造时自动调用（LLM_WARMUP=1 开关在插件内）。
     _log_stage("providers_ready")
-    # 轮次判定策略：默认不设 = 官方 inference EOT 模型（本地 v1-mini；Cantonese 无
-    # 校准档 → unlikely_threshold 回退英文档，停顿帧全判「唔係轮尾」，每轮提交撞
+    # 轮次判定策略：P2 起 A 线默认 "stt"（句级提交，_turn_detection_mode_from_env
+    # 文档载明 kill-switch）；唔设 key 的分支只喺显式 TURN_DETECTION= 空串时走到
+    # （= 旧默认：官方 inference EOT 模型，本地 v1-mini；Cantonese 无校准档 →
+    # unlikely_threshold 回退英文档，停顿帧全判「唔係轮尾」，每轮提交撞
     # ENDPOINT_MAX_DELAY）。TURN_DETECTION=vad 切 VAD 基准提交（1.7.1 语义：
     # commit 结构性等 STT FINAL——_run_eou_detection 对无 FINAL 轮直接 return，
     # FINAL 到达后以 trigger="stt" 补判，唔会丢转写），提交点 = max(ENDPOINT_MIN_DELAY,
     # FINAL 到达)。E2E 实测 EOU 同 max_delay=0.6 档打平（都系 FINAL 到达 bound）,
     # 但冇 EOT 模型嘅中途停顿保护,留作实验档。TURN_DETECTION=stt/manual 等官方字面量
     # 原样透传。
-    _turn_detection_mode = os.environ.get("TURN_DETECTION", "").strip()
+    _turn_detection_mode = _turn_detection_mode_from_env()
+    _endpoint_min_delay, _endpoint_max_delay = _endpointing_delays_from_env()
     turn_handling: TurnHandlingOptions = {
         # 官方低延迟调参（docs.livekit.io/agents/logic/turns/tuning）：
-        # - dynamic endpointing：min 0.35s。低于 ~0.3s 会让轮次在慢速离线 ASR 返回前
-        #   提交 → 转写被丢（"transcript arrives after turn has been committed"）→ 不回话。
-        #   max 0.6s：本地 EOT v1-mini 无 Cantonese 校准档（回退英文阈值）,停顿帧全判
-        #   「唔係轮尾」→ 提交每轮撞 max。1.2 时代 EOU 恒 1200ms；E2E 实证(2026-09-05,
-        #   真房间 + 真 /api/token,commit 结构性等 STT FINAL,零「transcript arrives
-        #   after turn has been committed」)0.6 档 EOU 614-956ms(=max(0.6, FINAL 到达),
-        #   三语 3/3 PASS)→ 0.6 为新默认。旧值 ENDPOINT_MAX_DELAY=1.2 可回退。
+        # - dynamic endpointing：min 0.25s（P2 默认，_endpointing_delays_from_env
+        #   文档载明门与回退）。max 0.6s：本地 EOT v1-mini 无 Cantonese 校准档
+        #   (回退英文阈值),停顿帧全判「唔係轮尾」→ 提交每轮撞 max。1.2 时代
+        #   EOU 恒 1200ms；E2E 实证(2026-09-05,真房间 + 真 /api/token,commit
+        #   结构性等 STT FINAL,零「transcript arrives after turn has been
+        #   committed」)0.6 档 EOU 614-956ms(=max(0.6, FINAL 到达),三语 3/3
+        #   PASS)→ 0.6 为新默认。旧值 ENDPOINT_MAX_DELAY=1.2 可回退。
         # - preemptive_tts：在轮次确认前就开跑 LLM->TTS，代价是打断时浪费算力
         # - interruption 保持自适应（无模型时自动回退 VAD），min_duration 收紧到 0.35s
         "endpointing": {
             "mode": "dynamic",
-            "min_delay": float(os.environ.get("ENDPOINT_MIN_DELAY", "0.35")),
-            "max_delay": float(os.environ.get("ENDPOINT_MAX_DELAY", "0.6")),
+            "min_delay": _endpoint_min_delay,
+            "max_delay": _endpoint_max_delay,
         },
         # 流程推进/收尾/语言切换轮由 on_user_turn_completed 落 chat_ctx 步骤
         # 标记,触发框架快照不一致→作废旧抢跑重建,推进轮唔会错步。
@@ -969,7 +1005,7 @@ async def entrypoint(ctx):
         f"max_retries={turn_handling['preemptive_generation']['max_retries']} "
         f"marker_pause={'on' if _marker_pause_on else 'off'} "
         f"interruption=min_{turn_handling['interruption']['min_duration']}s+false_interruption_self_heal "
-        f"turn_detection={_turn_detection_mode or 'default(本地 EOT v1-mini;Cantonese 未校准,阈值回退英文档)'}",
+        f"turn_detection={_turn_detection_mode or 'default(EOT v1-mini kill-switch;Cantonese 未校准,阈值回退英文档)'}",
         flush=True,
     )
 

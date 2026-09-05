@@ -142,9 +142,13 @@ RoomAgentDispatch metadata 下发;无房间时空闲,job 到达才拉管线)
   音色兜底按语言 `speaker_zh/speaker_cantonese/en`（旧拼写键已由启动迁移改写）；persona 绑定 `reference_audio` 优先。
 - `vad`：`provider` + `max_buffered_speech` / `min_speech_duration` / `min_silence_duration` / `interruption`
   —— 直接构造 `inference.VAD` 与打断开关（环境变量 `VAD_*` 仅作部署覆盖）。
-  基线默认：`min_silence_duration=0.45`、`min_speech_duration=0.15`；endpointing `min_delay=0.35`/`max_delay=1.2`。
-  （勿为追低延迟把 min_silence 收到 <0.3 / min_delay 收到 <0.3：离线式 ASR 从停嘴到转写回来需 ~0.5-1.2s，
-  端点判定太紧会让轮次在转写返回前提交 → 回复被丢、agent 不回话。）
+  基线默认（2026-09-05 句号级提交落地后）：`min_silence_duration=0.45`、`min_speech_duration=0.15`；
+  A 线 turn_detection=`stt`（STT 句末 END_OF_SPEECH 提交，句级 FINAL→EOS，说话中即提交，
+  数字串/短句/1.5s 限流保护），endpointing `min_delay=0.25`/`max_delay=0.6`。
+  （历史警戒已失效条件化：当年压端点致哑火=轮次在离线 ASR final 前提交；现提交结构性等待
+  STT FINAL 且句级路径 FINAL 即句文，三语 E2E 实证 0 丢转写。回退开关：`TURN_DETECTION=`
+  置空回 EOT 模型档 + `QWEN3_ASR_SENTENCE_COMMIT=0`（两者须一起关，否则句级 FINAL 会
+  叠进停嘴 FINAL 重复转写）；B 线 interp env 已强制 sentence-commit=0。）
 - `policy`：`offline_first`/`cloud_first`；建通话（`POST /api/calls`）时写入 manifest。
 
 ### LLM prompt 结构与多客服并发容量
