@@ -815,6 +815,12 @@ async def entrypoint(ctx):
             # 不然全程一个调听感很平(与 Qwen3 的 instruct_for_mood 同源)。
             emotion_state=emotion_state,
         )
+        # 会话开始即后台预连一条 MiniMax WS(keep-warm 池):首段合成免 TCP+TLS
+        # 握手(实测冷 ~0.65s/暖 ~0.2s)。失败静默——合成路径自会回退流内自连。
+        try:
+            tts_provider.prewarm()
+        except Exception:  # noqa: BLE001 - 预热失败零影响
+            pass
     else:
         if tts_provider_name not in ("", "qwen3_tts"):
             print(f"[agent] unknown tts provider {tts_provider_name!r}, fallback qwen3_tts", flush=True)

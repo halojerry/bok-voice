@@ -270,7 +270,9 @@ def test_preflight_throttled_by_prefix_growth(monkeypatch):
 
     async def scenario():
         stream = _Qwen3ASRLiveStream(
-            Qwen3ASRSTT(base_url="http://127.0.0.1:8787"),
+            # 锚定语言=粤语：P1.5 起 PREFLIGHT 有语言门（partial 语言≠锚定语言
+            # 不发），partial 回传 cantonese 必须与锚定一致先行到节流逻辑。
+            Qwen3ASRSTT(base_url="http://127.0.0.1:8787", language_state=lp.LanguageState(lang="cantonese")),
             vad=object(),
             conn_options=lp.APIConnectOptions(),
         )

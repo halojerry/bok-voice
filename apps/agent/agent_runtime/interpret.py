@@ -145,12 +145,18 @@ def _build_tts_provider(tts_cfg: dict, target_lang: str):
         boost = boost_map.get(target_lang, "")
         if boost:
             os.environ.setdefault("MINIMAX_LANGUAGE_BOOST", boost)
-        return MiniMaxTTS(
+        tts = MiniMaxTTS(
             voice=voice_map,
             language_state=tts_ls,
             sample_rate=int(tts_cfg.get("sample_rate") or 24000),
             api_key=str(tts_cfg.get("api_key") or ""),
         )
+        # keep-warm 预连(同 A 线):无事件循环时静默跳过,失败零影响。
+        try:
+            tts.prewarm()
+        except Exception:  # noqa: BLE001
+            pass
+        return tts
     # 本地 Qwen3-TTS 兜底(离线可用):设置页全局单音色 speaker 优先,否则分语言。
     voice = str(tts_cfg.get("speaker") or "").strip()
     if not voice:

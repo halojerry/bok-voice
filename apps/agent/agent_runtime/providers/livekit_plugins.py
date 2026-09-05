@@ -1367,9 +1367,121 @@ class MiniMaxTTS(tts.TTS):
         lang = self._language_state.lang
         return lang if lang in ("zh", "cantonese") else None
 
+    def prewarm(self) -> None:
+        """会话开始即后台预连一条 MiniMax WS（keep-warm 池，容量 1）。
+
+        官方 t2a_v2 WS 一连接一任务（task_finish 后服务端关连接），用过的连接
+        复用唔到；但 connect（TCP+TLS 握手，实测冷 ~0.65s/暖 ~0.2s）可以提前做。
+        失败静默——首段合成回退流内自连，行为同旧。
+        """
+        _minimax_pool_schedule(self._endpoint_ws(), self._api_key())
+
     def stream(self, *, conn_options=None):
         """真流式 SynthesizeStream：单 WS 连接按增量文本持续 task_continue。"""
         return _MiniMaxSynthesizeStream(self, conn_options or APIConnectOptions())
+
+
+# ---- MiniMax 热连接池（keep-warm）---------------------------------------------
+# 官方 t2a_v2 WS「一连接一任务」：task_finish 后服务端关连接（官方文档明示），
+# 用过的连接无法复用；但 connect（TCP+TLS 握手，实测冷 ~0.65s/暖 ~0.2-0.25s）
+# 可以提前做——池容量 1 放「处女连接」（只 connect、不 task_start，
+# connected_success 留喺接收缓冲由取用方握手逻辑照常收），下次合成直接取用，
+# 免整个握手段。failure-safe：取池验 key/endpoint 匹配 + TTL + open 状态，
+# 握手失败弃池全新重连一次；任何取唔到/失败都回退流内自连（旧行为）。
+# MINIMAX_WS_POOL=0 关闭（恒走流内自连）。
+_MINIMAX_POOL_WS = None  # 热连接（websockets 客户端实例）
+_MINIMAX_POOL_KEY: tuple[str, str] | None = None  # 入池时 (endpoint, api_key)
+_MINIMAX_POOL_AT = 0.0  # 入池时刻（monotonic）
+_MINIMAX_POOL_TTL_S = 240.0  # 超龄弃用（服务端对空闲连接的生命周期未文档化）
+_MINIMAX_POOL_TASK: asyncio.Task | None = None  # 补池任务（单飞）
+
+
+def _minimax_pool_enabled() -> bool:
+    return os.environ.get("MINIMAX_WS_POOL", "1") == "1"
+
+
+async def _minimax_ws_silent_close(ws) -> None:
+    try:
+        await ws.close()
+    except Exception:  # noqa: BLE001 - 收尾尽力而为
+        pass
+
+
+def _minimax_pool_discard(ws) -> None:
+    """后台弃置池连接；无事件循环时直接放手（GC 兜底回收 socket）。"""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(_minimax_ws_silent_close(ws))
+
+
+def _minimax_pool_pop(endpoint: str, key: str):
+    """取热连接；无池/参数变/超龄/已闭 → None（调用方回退全新连接）。"""
+    global _MINIMAX_POOL_WS, _MINIMAX_POOL_KEY, _MINIMAX_POOL_AT
+    ws = _MINIMAX_POOL_WS
+    pooled_key = _MINIMAX_POOL_KEY
+    pooled_at = _MINIMAX_POOL_AT
+    _MINIMAX_POOL_WS = None
+    _MINIMAX_POOL_KEY = None
+    _MINIMAX_POOL_AT = 0.0
+    if ws is None:
+        return None
+    if pooled_key != (endpoint, key) or (time.monotonic() - pooled_at) > _MINIMAX_POOL_TTL_S:
+        _minimax_pool_discard(ws)
+        return None
+    try:
+        from websockets.protocol import State
+
+        if getattr(ws, "state", State.OPEN) != State.OPEN:
+            _minimax_pool_discard(ws)
+            return None
+    except Exception:  # noqa: BLE001 - 判不了状态就信任之（握手失败另有回退）
+        pass
+    return ws
+
+
+async def _minimax_pool_replenish(endpoint: str, key: str) -> None:
+    """后台预连一条 WS 入池（容量 1）。失败静默——合成路径自会回退流内连接。"""
+    global _MINIMAX_POOL_WS, _MINIMAX_POOL_KEY, _MINIMAX_POOL_AT, _MINIMAX_POOL_TASK
+    try:
+        if _MINIMAX_POOL_WS is not None:
+            return
+        import websockets
+
+        t_conn0 = time.monotonic()
+        ws = await websockets.connect(
+            endpoint,
+            additional_headers={"Authorization": f"Bearer {key}"},
+            open_timeout=10,
+            max_size=20_000_000,
+        )
+        connect_ms = (time.monotonic() - t_conn0) * 1000
+        # connected_success 唔消费——留喺接收缓冲，取用方握手逻辑照常先收它。
+        _MINIMAX_POOL_WS = ws
+        _MINIMAX_POOL_KEY = (endpoint, key)
+        _MINIMAX_POOL_AT = time.monotonic()
+        print(f"MINIMAX_TTS_WS_POOL_PREWARM connect_ms={connect_ms:.0f}", flush=True)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 预热尽力而为
+        print(f"MINIMAX_TTS_WS_POOL_PREWARM_FAIL {exc!r}", flush=True)
+    finally:
+        _MINIMAX_POOL_TASK = None
+
+
+def _minimax_pool_schedule(endpoint: str, key: str) -> None:
+    """空闲期补池（会话开始/每次合成收尾调用）。已在补/已有池/无 key/开关关 → 跳过。"""
+    global _MINIMAX_POOL_TASK
+    if not _minimax_pool_enabled() or not key or not endpoint:
+        return
+    if _MINIMAX_POOL_TASK is not None or _MINIMAX_POOL_WS is not None:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:  # 无事件循环（调用点都喺 loop 内，理论不可达）
+        return
+    _MINIMAX_POOL_TASK = loop.create_task(_minimax_pool_replenish(endpoint, key))
 
 
 class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
@@ -1403,6 +1515,7 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
     async def _run(self, output_emitter):
         import websockets
 
+        t0 = time.monotonic()
         try:
             key = self._tts_._api_key()
             if not key:
@@ -1417,12 +1530,21 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
             print(f"MINIMAX_TTS_VOICE {voice} lang={self._tts_._language_state.lang}", flush=True)
             sample_rate = self._tts_.sample_rate
 
-            ws = await websockets.connect(
-                self._tts_._endpoint_ws(),
-                additional_headers={"Authorization": f"Bearer {key}"},
-                open_timeout=10,
-                max_size=20_000_000,
-            )
+            # 热连接池：空闲期预连的「处女连接」直接用（免 TCP+TLS 握手，实测冷
+            # ~0.65s/暖 ~0.2s）；无池/状态异常一律回退流内自连（旧行为）。
+            ws = None
+            ws_from_pool = False
+            if _minimax_pool_enabled():
+                ws = _minimax_pool_pop(self._tts_._endpoint_ws(), key)
+                ws_from_pool = ws is not None
+            if ws is None:
+                ws = await websockets.connect(
+                    self._tts_._endpoint_ws(),
+                    additional_headers={"Authorization": f"Bearer {key}"},
+                    open_timeout=10,
+                    max_size=20_000_000,
+                )
+            ws_connect_ms = 0.0 if ws_from_pool else (time.monotonic() - t0) * 1000
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1436,15 +1558,13 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                 pass
             return
 
-        init_done = False
-        frame_bytes = int(sample_rate / 5) * 2  # 200ms 帧
-        buf = bytearray()
-        recv_task: asyncio.Task | None = None
-        t_start = time.monotonic()
-        try:
-            # 首帧 connected_success
+        async def _handshake(a_ws) -> dict:
+            """connected_success（丢帧不致命，同旧语义）→ task_start → task_started。
+
+            池连接的 connected_success 已喺接收缓冲，recv 即回零延迟。
+            """
             try:
-                await asyncio.wait_for(ws.recv(), timeout=10)
+                await asyncio.wait_for(a_ws.recv(), timeout=10)
             except Exception:
                 pass
             start = {
@@ -1466,24 +1586,57 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
             boost = self._tts_._language_boost()
             if boost:
                 start["language_boost"] = boost
-            await ws.send(json.dumps(start))
+            await a_ws.send(json.dumps(start))
+            return json.loads(await asyncio.wait_for(a_ws.recv(), timeout=15))
+
+        init_done = False
+        frame_bytes = int(sample_rate / 5) * 2  # 200ms 帧
+        buf = bytearray()
+        recv_task: asyncio.Task | None = None
+        t_start = time.monotonic()
+        try:
             try:
-                resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
-                if resp.get("event") != "task_started":
-                    print("MINIMAX_TTS_WS_START_FAIL", str(resp)[:200], flush=True)
-                    try:
-                        await self._emit_beep(output_emitter)
-                    except Exception:  # pragma: no cover
-                        pass
-                    return
-            except Exception as exc:
-                print("MINIMAX_TTS_WS_START", repr(exc), flush=True)
+                resp = await _handshake(ws)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if not ws_from_pool:
+                    raise
+                # 池连接空闲期被服务端静默关闭 → 弃池，全新连接重握手一次
+                # （再失败就走下方 START 失败路径 beep，同旧行为）。
+                print("MINIMAX_TTS_WS_POOL_STALE retry_fresh", flush=True)
+                await _minimax_ws_silent_close(ws)
+                t_fresh = time.monotonic()
+                ws = await websockets.connect(
+                    self._tts_._endpoint_ws(),
+                    additional_headers={"Authorization": f"Bearer {key}"},
+                    open_timeout=10,
+                    max_size=20_000_000,
+                )
+                ws_from_pool = False
+                ws_connect_ms = (time.monotonic() - t_fresh) * 1000
+                resp = await _handshake(ws)
+            t_task = time.monotonic()
+            if resp.get("event") != "task_started":
+                print("MINIMAX_TTS_WS_START_FAIL", str(resp)[:200], flush=True)
+                await _minimax_ws_silent_close(ws)
                 try:
                     await self._emit_beep(output_emitter)
                 except Exception:  # pragma: no cover
                     pass
                 return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print("MINIMAX_TTS_WS_START", repr(exc), flush=True)
+            await _minimax_ws_silent_close(ws)
+            try:
+                await self._emit_beep(output_emitter)
+            except Exception:  # pragma: no cover
+                pass
+            return
 
+        try:
             async def _recv_loop():
                 nonlocal init_done, buf
                 first_pushed = False
@@ -1512,8 +1665,18 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                         if not first_pushed and len(buf) >= frame_bytes // 5:
                             # P0 首帧早推:不足 200ms 先推 ~40ms,早出声(照 Qwen3-TTS 同款)。
                             # P0 秒表:首个音频块推送时刻(距 task_start)。
+                            t_first = time.monotonic()
                             print(
-                                f"TTS_FIRST_AUDIO_MS {(time.monotonic() - t_start) * 1000:.0f}",
+                                f"TTS_FIRST_AUDIO_MS {(t_first - t_start) * 1000:.0f}",
+                                flush=True,
+                            )
+                            # P1.5 FIX 3 首包分解:握手段(池命中=0,已在空闲期摊销)/
+                            # task_start→首音频段/连接起全程。
+                            print(
+                                f"MINIMAX_TTS_WS_PERF pool={'hit' if ws_from_pool else 'fresh'} "
+                                f"ws_connect_ms={ws_connect_ms:.0f} "
+                                f"task_start_to_audio_ms={(t_first - t_task) * 1000:.0f} "
+                                f"total_ms={(t_first - t0) * 1000:.0f}",
                                 flush=True,
                             )
                             output_emitter.push(bytes(buf))
@@ -1658,6 +1821,8 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                 recv_task.cancel()
                 try:
                     await recv_task
+                except asyncio.CancelledError:
+                    pass  # 自己 cancel 嘅（唔係外层取消）——继续收尾，唔好吞掉收尾步骤
                 except Exception:
                     pass
             try:
@@ -1672,6 +1837,9 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                     output_emitter.end_segment()
                 except Exception:
                     pass
+            # 一连接一任务（官方 t2a_v2：task_finish 后服务端关连接）：本连接已
+            # 耗尽，后台补一条热连接给下一段合成（MINIMAX_WS_POOL=0 时不动作）。
+            _minimax_pool_schedule(self._tts_._endpoint_ws(), self._tts_._api_key())
 
 
 class _MiniMaxTTSStream(tts.ChunkedStream):
@@ -1712,25 +1880,37 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
 
     async def _run_ws(self, output_emitter, key: str, voice: str, sample_rate: int) -> bool:
         """MiniMax WebSocket 流式:task_start → task_continue(text) → 边收 hex 音频边推。"""
-        import ssl
+        import ssl  # noqa: F401 - 历史保留
 
         import websockets
 
-        url = self._endpoint_ws()
-        try:
-            ws = await websockets.connect(
-                url,
-                additional_headers={"Authorization": f"Bearer {key}"},
-                open_timeout=10,
-                max_size=20_000_000,
-            )
-        except Exception as exc:
-            print("MINIMAX_TTS_WS_CONNECT", repr(exc), flush=True)
-            return False
-        try:
-            # 首帧通常是 connected_success
+        # 修复：旧码 `self._endpoint_ws()` 喺 ChunkedStream 上 AttributeError →
+        # 恒走 MINIMAX_TTS_FATAL，连 HTTP 回退都到不了。
+        url = self._tts_._endpoint_ws()
+        t0 = time.monotonic()
+        # 热连接池（与 SynthesizeStream 路径同源）：取唔到/状态异常回退流内自连。
+        ws = None
+        ws_from_pool = False
+        if _minimax_pool_enabled():
+            ws = _minimax_pool_pop(url, key)
+            ws_from_pool = ws is not None
+        if ws is None:
             try:
-                await asyncio.wait_for(ws.recv(), timeout=10)
+                ws = await websockets.connect(
+                    url,
+                    additional_headers={"Authorization": f"Bearer {key}"},
+                    open_timeout=10,
+                    max_size=20_000_000,
+                )
+            except Exception as exc:
+                print("MINIMAX_TTS_WS_CONNECT", repr(exc), flush=True)
+                return False
+        ws_connect_ms = 0.0 if ws_from_pool else (time.monotonic() - t0) * 1000
+
+        async def _handshake(a_ws) -> dict:
+            """connected_success（丢帧不致命）→ task_start → task_started。"""
+            try:
+                await asyncio.wait_for(a_ws.recv(), timeout=10)
             except Exception:
                 pass
             start = {
@@ -1752,20 +1932,46 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
             boost = self._tts_._language_boost()
             if boost:
                 start["language_boost"] = boost
-            await ws.send(json.dumps(start))
+            await a_ws.send(json.dumps(start))
+            return json.loads(await asyncio.wait_for(a_ws.recv(), timeout=15))
+
+        try:
             try:
-                resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
-                if resp.get("event") != "task_started":
-                    print("MINIMAX_TTS_WS_START_FAIL", str(resp)[:200], flush=True)
-                    return False
-            except Exception as exc:
-                print("MINIMAX_TTS_WS_START", repr(exc), flush=True)
+                resp = await _handshake(ws)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if not ws_from_pool:
+                    raise
+                # 池连接空闲期被服务端静默关闭 → 弃池，全新连接重握手一次。
+                print("MINIMAX_TTS_WS_POOL_STALE retry_fresh", flush=True)
+                await _minimax_ws_silent_close(ws)
+                t_fresh = time.monotonic()
+                ws = await websockets.connect(
+                    url,
+                    additional_headers={"Authorization": f"Bearer {key}"},
+                    open_timeout=10,
+                    max_size=20_000_000,
+                )
+                ws_from_pool = False
+                ws_connect_ms = (time.monotonic() - t_fresh) * 1000
+                resp = await _handshake(ws)
+            t_start = time.monotonic()
+            if resp.get("event") != "task_started":
+                print("MINIMAX_TTS_WS_START_FAIL", str(resp)[:200], flush=True)
                 return False
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print("MINIMAX_TTS_WS_START", repr(exc), flush=True)
+            return False
+        try:
             await ws.send(json.dumps({"event": "task_continue", "text": _inject_pauses(self._text)}))
             pcm_total = 0
             frame_bytes = int(sample_rate / 5) * 2  # 200ms 帧
             buf = bytearray()
             init_done = False
+            first_audio_ms = -1.0
             while True:
                 try:
                     msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
@@ -1785,6 +1991,17 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
                         )
                         output_emitter.start_segment(segment_id=utils.shortuuid())
                         init_done = True
+                    # P1.5 FIX 3 首包分解：首音频块到达时刻（距 task_start/握手/全程）。
+                    if first_audio_ms < 0:
+                        t_first = time.monotonic()
+                        first_audio_ms = (t_first - t_start) * 1000
+                        print(
+                            f"MINIMAX_TTS_WS_PERF pool={'hit' if ws_from_pool else 'fresh'} "
+                            f"ws_connect_ms={ws_connect_ms:.0f} "
+                            f"task_start_to_audio_ms={first_audio_ms:.0f} "
+                            f"total_ms={(t_first - t0) * 1000:.0f}",
+                            flush=True,
+                        )
                     # 攒 200ms 帧推给 livekit,让它边收边播
                     buf.extend(chunk)
                     while len(buf) >= frame_bytes:
@@ -1812,6 +2029,8 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
                 await ws.close()
             except Exception:  # pragma: no cover
                 pass
+            # 本连接已耗尽（一连接一任务），后台补热连接给下次合成。
+            _minimax_pool_schedule(url, key)
 
     async def _run_http(self, output_emitter, key: str, voice: str, sample_rate: int) -> None:
         """HTTP 整段合成(WS 不可用时的降级)。"""
@@ -2562,8 +2781,19 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         # _ASR_PREFLIGHT_MIN_GROWTH_CHARS 字（长度增长节流，保框架抢跑预算给 FINAL）。
         common = _common_prefix(self._prev_partial, text)
         self._prev_partial = text
+        # 语言门：partial 窗检测语言 ≠ 会话锚定语言（LanguageState.lang 此刻值）→
+        # 跳过 PREFLIGHT（INTERIM 已照发，字幕不受影响）。PREFLIGHT 只喂框架
+        # 抢跑生成：语言切换轮按旧锚语言前缀投机，必被 FINAL 的语言重锚作废重建
+        # （twin 双请求并发 prefill 自伤——P5 实测 en 切换轮 TTFT 残留 4.1-4.2s）。
+        # FINAL 路径不动：WhatsApp/话术推进用 FINAL，commit 正确性零影响。
+        # QWEN3_ASR_PREFLIGHT_LANG_GATE=0 关门（永远发，回退旧行为）。
+        lang_gate_open = (
+            os.environ.get("QWEN3_ASR_PREFLIGHT_LANG_GATE", "1") == "1"
+            and lang != self._stt_._language_state.lang
+        )
         if (
-            len(common) >= 6
+            not lang_gate_open
+            and len(common) >= 6
             and len(common) - len(self._stable) >= _ASR_PREFLIGHT_MIN_GROWTH_CHARS
         ):
             self._stable = common

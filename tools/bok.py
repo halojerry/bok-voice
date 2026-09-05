@@ -517,6 +517,61 @@ def write_bline_config(current: dict[str, str] | None = None) -> Path:
     return p
 
 
+def _certifi_bundle(py: Path | None = None) -> str:
+    """定位 worker 解释器可用的 certifi CA 束；找不到返回 ""。
+
+    .venv312（homebrew python@3.12 + OpenSSL 3.6）无默认 CA 束——certifi 已装
+    但 OpenSSL 唔自动读，裸连 https://api.minimax.cn 必炸 SSLCertVerificationError
+    （P5 验收实测：MiniMax TTS 每轮全灭）。worker env 注 SSL_CERT_FILE=<cacert.pem>
+    云端 TLS 先打得通。
+
+    顺序：① 先路径探测【目标解释器】的 site-packages（env 係为子进程构建，
+    bok.py 自己的解释器未必同款）；② 回退 importlib 探当前解释器（SSL_CERT_FILE
+    只係一条普通 PEM 路径，文件在盘子进程就食得）。两者都失败 → 返回 ""，
+    调用方保持 env 原样（绝不阻塞启动）。
+    """
+    if py is not None:
+        try:
+            prefix = Path(py).resolve().parent.parent  # <venv>/bin/python → <venv>
+            pats = [prefix.glob("lib/python3*/site-packages/certifi/cacert.pem")]
+            if os.name == "nt":
+                pats.append(prefix.glob("Lib/site-packages/certifi/cacert.pem"))
+            for pat in pats:
+                for cand in sorted(pat):
+                    if cand.is_file():
+                        return str(cand)
+        except Exception:  # noqa: BLE001 - 探测失败就走 importlib 兜底
+            pass
+    try:
+        import certifi
+
+        cand = certifi.where()
+        if cand and Path(cand).is_file():
+            return str(cand)
+    except Exception:  # noqa: BLE001 - 无 certifi = 无默认束，维持现状
+        pass
+    return ""
+
+
+def _bake_ssl_cert_file(env: dict[str, str], py: Path | None = None) -> dict[str, str]:
+    """worker env 固化 SSL_CERT_FILE：仅在未设且 certifi 在盘时注入。
+
+    用户/部署显式设置的 SSL_CERT_FILE（env dict 或启动 bok 的 shell）永远优先，
+    唔覆盖；shell 有值时抄进 env dict（launchd plist 由此生成，唔会漏）。
+    找不到束就唔注入（保持旧行为，注入失败零副作用）。
+    """
+    if env.get("SSL_CERT_FILE"):
+        return env
+    shell_val = os.environ.get("SSL_CERT_FILE", "")
+    if shell_val:
+        env["SSL_CERT_FILE"] = shell_val
+        return env
+    bundle = _certifi_bundle(py)
+    if bundle:
+        env["SSL_CERT_FILE"] = bundle
+    return env
+
+
 def _control_plane_env(db: Path | str) -> dict[str, str]:
     """Env for the control-plane child. MUST include LiveKit credentials so
     /api/token issues a real JWT instead of the old sha256 dev fallback."""
@@ -524,7 +579,7 @@ def _control_plane_env(db: Path | str) -> dict[str, str]:
     # 占位 model="local"，真实地址由这里注入（与 agent worker L667 同源）。
     _cur = MODELS["mac"] if is_mac() else MODELS["windows"]
     llm_model = model_path({**_cur, "llm": resolve_llm_repo(_cur)}, "llm")
-    return {
+    env = {
         "PYTHONPATH": _repo_pythonpath(),
         "BOK_SERVICE": "control-plane",
         "DATABASE_URL": f"sqlite:///{Path(db).as_posix()}",
@@ -535,6 +590,9 @@ def _control_plane_env(db: Path | str) -> dict[str, str]:
         "MLX_LLM_BASE_URL": os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
         "MLX_LLM_MODEL": llm_model,
     }
+    # .venv312 OpenSSL 无默认 CA 束：固化 SSL_CERT_FILE（P5 遗留项；CP 的
+    # Summarizer/联网探针同食 TLS，注入失败零副作用）。
+    return _bake_ssl_cert_file(env, repo_python())
 
 
 def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
@@ -784,6 +842,9 @@ def cmd_serve() -> int:
             "MLX_LLM_BASE_URL": os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
             "MLX_LLM_MODEL": model_path({**_cur, "llm": resolve_llm_repo(_cur)}, "llm"),
         }
+        # .venv312 OpenSSL 无默认 CA 束 → MiniMax WSS 必炸；固化 SSL_CERT_FILE
+        # （与 _agent_prod_env 同源；interp 经 _interp_env 拷贝继承）。
+        _bake_ssl_cert_file(agent_env, py)
         _start_proc([str(py), "-m", "agent_runtime.main"], run_dir / "agent.pid", log_dir / "agent.log", env=agent_env)
 
         # B 线同传 interpreter:每个方向一个 worker(agent_name 显式分发,
@@ -1110,7 +1171,7 @@ def cmd_doctor() -> int:
 def _agent_prod_env() -> dict[str, str]:
     """agent/interp worker 生产环境（与 cmd_serve 同源）。"""
     _cur = MODELS["mac"] if is_mac() else MODELS["windows"]
-    return {
+    env = {
         "PYTHONPATH": _repo_pythonpath(),
         "BOK_SERVICE": "agent",
         "LIVEKIT_URL": os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880"),
@@ -1120,6 +1181,9 @@ def _agent_prod_env() -> dict[str, str]:
         "MLX_LLM_BASE_URL": os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
         "MLX_LLM_MODEL": model_path({**_cur, "llm": resolve_llm_repo(_cur)}, "llm"),
     }
+    # .venv312 OpenSSL 无默认 CA 束 → MiniMax WSS 必炸 SSLCertVerificationError；
+    # 固化 SSL_CERT_FILE（P5 遗留项），interp 经 _interp_env 的 dict 拷贝继承。
+    return _bake_ssl_cert_file(env, repo_python())
 
 
 def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
