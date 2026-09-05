@@ -20,6 +20,14 @@ export interface AudioDeviceInfo {
 const MIC_KEY = "bok.audio.mic";
 const OUT_KEY = "bok.audio.out";
 
+/** 设备选择持久化键：默认全局单组；一体台按端存（key="me"/"other" 等）。 */
+function micKey(key?: string): string {
+  return key ? `bok.audio.mic.${key}` : MIC_KEY;
+}
+function outKey(key?: string): string {
+  return key ? `bok.audio.out.${key}` : OUT_KEY;
+}
+
 export function isTauriShell(): boolean {
   return typeof window !== "undefined" && isTauri();
 }
@@ -32,17 +40,17 @@ function storage(): Storage | null {
   }
 }
 
-export function savedMicDevice(): string {
-  return storage()?.getItem(MIC_KEY) ?? "";
+export function savedMicDevice(key?: string): string {
+  return storage()?.getItem(micKey(key)) ?? "";
 }
-export function savedOutputDevice(): string {
-  return storage()?.getItem(OUT_KEY) ?? "";
+export function savedOutputDevice(key?: string): string {
+  return storage()?.getItem(outKey(key)) ?? "";
 }
-export function saveMicDevice(id: string) {
-  storage()?.setItem(MIC_KEY, id);
+export function saveMicDevice(id: string, key?: string) {
+  storage()?.setItem(micKey(key), id);
 }
-export function saveOutputDevice(id: string) {
-  storage()?.setItem(OUT_KEY, id);
+export function saveOutputDevice(id: string, key?: string) {
+  storage()?.setItem(outKey(key), id);
 }
 
 /** 请求一次麦克风权限并立即释放（用于让设备列表带 label / 触发系统授权弹窗）。 */

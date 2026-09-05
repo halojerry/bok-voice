@@ -19,6 +19,7 @@ import {
   type AudioDeviceInfo,
 } from "@/lib/audio";
 import { AgentSessionProvider } from "@/components/agents-ui/agent-session-provider";
+import InterpretConsole from "@/components/interpret-console";
 import { useAccount } from "@/components/account-context";
 
 /**
@@ -52,6 +53,8 @@ export default function InterpretPage() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
+  // 一体台模式：同机双设备组（我方/对象各一组麦+扬声器），与双端模式互斥。
+  const [consoleMode, setConsoleMode] = useState(false);
 
   // 官方 TokenSource.endpoint：直连 CP /api/token（官方契约），useSession options
   // 驱动官方请求体（room_name / participant_identity），CP 按 identity 前缀反推
@@ -162,9 +165,39 @@ export default function InterpretPage() {
     }
   }
 
+  async function startConsole() {
+    setError(null);
+    setBusy(true);
+    try {
+      const created = await api.createCall({
+        account_id: ACCOUNT,
+        object_id: "",
+        kind: "interpret",
+        mode: "live",
+        direction: "interpret",
+        language: myLang,
+        target_lang: otherLang,
+      });
+      const id = String((created as { id?: string }).id ?? "");
+      if (!id) {
+        setBusy(false);
+        setError("创建一体台会话失败。");
+        return;
+      }
+      callIdRef.current = id;
+      setCallId(id);
+      setConsoleMode(true);
+      setBusy(false);
+    } catch (e) {
+      setBusy(false);
+      setError(friendlyErrorText(String(e)));
+    }
+  }
+
   // side 决定 token role 后才 useSession 连接:进房动作放到渲染后的 effect。
+  // 一体台模式不走双端 join(同身份双连会被 LiveKit 拒),me/other 由一体台组件自理。
   useEffect(() => {
-    if (!side || !callId || connected || session.room.state === ConnectionState.Connecting) return;
+    if (consoleMode || !side || !callId || connected || session.room.state === ConnectionState.Connecting) return;
     let cancelled = false;
     (async () => {
       setBusy(true);
@@ -206,6 +239,7 @@ export default function InterpretPage() {
     setSide(null);
     setCallId("");
     callIdRef.current = "";
+    setConsoleMode(false);
   }
 
   async function toggleMic() {
@@ -218,7 +252,7 @@ export default function InterpretPage() {
     }
   }
 
-  if (!side) {
+  if (!side && !consoleMode) {
     return (
       <div className="mx-auto grid w-full max-w-5xl gap-6 md:grid-cols-2">
         <section className="card flex flex-col gap-4">
@@ -268,8 +302,36 @@ export default function InterpretPage() {
             加入后选好自己的麦克风与扬声器即可开讲。
           </p>
         </section>
+        <section className="card flex flex-col gap-4 md:col-span-2">
+          <span className="label">坐席一体台 · 同机双设备组</span>
+          <p className="text-xs leading-relaxed text-[var(--stage-muted)]">
+            我方与对象在同一台电脑前、各用一副耳机麦：一个控制台同时接入本会话两端，各自独立选
+            麦克风/扬声器（双输出独立路由），中间一条双语字幕，全程一人操作。需桌面 Chrome
+            （Chromium setSinkId 双输出）。
+          </p>
+          <button className="stage-btn-primary md:w-fit" disabled={busy} onClick={startConsole}>
+            创建一体台会话
+          </button>
+        </section>
         {error && <p className="md:col-span-2 text-sm text-red-400">{error}</p>}
       </div>
+    );
+  }
+
+  if (consoleMode && callId) {
+    return (
+      <InterpretConsole
+        account={ACCOUNT}
+        callId={callId}
+        myLang={myLang}
+        otherLang={otherLang}
+        onExit={() => {
+          setConsoleMode(false);
+          setCallId("");
+          callIdRef.current = "";
+          setError(null);
+        }}
+      />
     );
   }
 
