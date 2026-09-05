@@ -124,7 +124,10 @@ export async function switchWebOutputDevice(room: { switchActiveDevice: (kind: s
     saveOutputDevice(deviceId);
     return true;
   } catch (e) {
-    console.warn("switch web audiooutput failed", e);
+    // 已存输出设备失效(拔掉/换设备)时,每次远端音轨挂载都 setSinkId 失败刷屏。
+    // 清掉失效存档让后续音轨回系统默认,唔再反复报错。
+    console.warn("switch web audiooutput failed, 回退系统默认输出", e);
+    saveOutputDevice("");
     return false;
   }
 }
