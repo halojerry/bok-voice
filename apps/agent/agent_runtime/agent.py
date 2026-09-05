@@ -370,15 +370,54 @@ def _endpointing_delays_from_env() -> tuple[float, float]:
     等足 min_delay 才 commit——research-livekit-official.md §4）：句级提交把
     提交锚从「VAD 静音 0.45s + ASR finish」提前到 STT 句末，误判由 VAD SOS
     自愈（EOS 后 VAD flush，继续说话的 SOS 会取消该次 commit 并入下一句）+
-    打断 0.6s/false-interruption 1.0s 兜底，唔再靠 min_delay 硬扛。旧值
-    ENDPOINT_MIN_DELAY=0.35 可回退；TURN_DETECTION≠stt 的 kill-switch 场景
-    同用 0.25（E2E 需证明两档都无回归，见 progress P2）。max 0.6 沿用 P1 默认
-    （本地 EOT v1-mini 无 Cantonese 校准档时提交撞 max 的保底）。
+    打断 0.6s/false-interruption 1.0s 兜底，唔再靠 min_delay 硬扛。
+    **Kill-switch 配对（p6-budget 实证）**：TURN_DETECTION resolves ≠"stt"
+    （空串=EOT 档 / vad）时 min_delay 强制 ≥0.35（max(0.35, env 值)，无需手动
+    回调 ENDPOINT_MIN_DELAY）——0.25 档只对 stt 句级提交校准过；未校准的本地
+    EOT v1-mini（Cantonese 阈值回退英文档）配 0.25 会早提交截断粤语
+    （p6 kill-switch 臂 E2E 1/3，两败皆「eou 早提交、FINAL 截半句」）。
+    max 0.6 沿用 P1 默认（本地 EOT v1-mini 无 Cantonese 校准档时提交撞 max
+    的保底）。生效值喺 startup turn_handling 行照实打印。
     """
+    min_raw = float(os.environ.get("ENDPOINT_MIN_DELAY", "0.25"))
+    if _turn_detection_mode_from_env().strip().lower() != "stt":
+        min_delay = max(0.35, min_raw)
+    else:
+        min_delay = min_raw
     return (
-        float(os.environ.get("ENDPOINT_MIN_DELAY", "0.25")),
+        min_delay,
         float(os.environ.get("ENDPOINT_MAX_DELAY", "0.6")),
     )
+
+
+def _prefix_prewarm_enabled() -> bool:
+    """会话首轮「真实前缀预热」开关（LLM_PREFIX_PREWARM，默认 1）。"""
+    return os.environ.get("LLM_PREFIX_PREWARM", "1") == "1"
+
+
+def _build_prefix_prewarm_messages(context_state, instructions: str) -> list[dict]:
+    """组装会话首轮真实 prompt 形状的预热请求体（纯函数，单测断言标记）。
+
+    与 ContextAwareLLM.chat 的合并规则同构（1.7.1 KV-cache 铁律）：
+    - system = 稳定指令前缀（render_instruction_prefix：用户语言/回复节奏/
+      应答准则/话术总览/对象档案）+ 人设 base（_instructions+facts）——即
+      turn-1 真请求 system[0] 的字节内容；
+    - 易变尾部（render_context_tail：当前步/记忆）拼喺 fake user 轮文本尾部
+      （请求副本，唔落库），与真请求的尾部拼接位一致。
+    turn-1 真请求与本请求共享「system 全段 + user 头部」token 前缀 → mlx
+    prompt cache 命中，首轮免整段 prefill（p6 实测会话首轮 cached=0，
+    TTFT 2.1-3.2s，其中 system prefill ~1.4s）。
+    """
+    from .providers.livekit_plugins import _join_system
+
+    prefix = context_state.render_instruction_prefix()
+    tail = context_state.render_context_tail()
+    system = _join_system(prefix, instructions or "", "")
+    user = f"你好。\n\n{tail}" if tail else "你好。"
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
 
 
 def _format_llm_metrics(m) -> str:
@@ -921,6 +960,7 @@ async def entrypoint(ctx):
 
     # 确定性 mood 通道：无论模型是否遵守「吐 <expr> 标签」的指令，
     # ExprAwareLLM 都会在每次回复前强制前置标签，保证转录发布 lk.expression。
+    _raw_llm = llm_provider  # 内芯留引用：会话首轮真实前缀预热（FIX prewarm）
     llm_provider = ContextAwareLLM(
         ExprAwareLLM(llm_provider, emotion_state=emotion_state),
         context_state=context_state,
@@ -1019,6 +1059,30 @@ async def entrypoint(ctx):
         # 追加的自定义 transform 把 <expr/> 从进 TTS 的文本里剥掉（转录路径保留，框架发布 mood）。
         tts_text_transforms=["filter_markdown", "filter_emoji", _strip_expr_markup],
     )
+    # 会话首轮真实前缀预热（LLM_PREFIX_PREWARM，默认 1）——触发点在开场白之后
+    # （见下方 greeting 块），这里只定義任务体。
+    if _prefix_prewarm_enabled() and isinstance(_raw_llm, MlxLlmLLM) and instructions:
+
+        async def _prefix_prewarm_task() -> None:
+            import time as _t2
+
+            try:
+                msgs = _build_prefix_prewarm_messages(context_state, instructions)
+                _pw0 = _t2.monotonic()
+                await _raw_llm.prefix_prewarm(msgs)
+                print(
+                    f"[agent] llm prefix prewarm done +{(_t2.monotonic() - _pw0) * 1000:.0f}ms "
+                    f"system_chars={len(msgs[0]['content'])} (call {room_name})",
+                    flush=True,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 预热失败零影响，只损失首轮 cache
+                print(f"[agent] llm prefix prewarm skipped: {exc!r} (call {room_name})", flush=True)
+
+        _prefix_prewarm_armed = True
+    else:
+        _prefix_prewarm_armed = False
 
     # Persist turns + auto-settle on hangup (idempotent server side).
     def _on_conversation_item(ev):
@@ -1408,6 +1472,18 @@ async def entrypoint(ctx):
         greetings = {"zh": "请问有什么可以帮您？", "cantonese": "請問有咩可以幫到你？", "en": "How can I help you?"}
         await session.generate_reply(instructions=greetings.get(greet_lang, greetings["zh"]))
         _log_stage("greeting_queued")
+    # ---- 会话首轮真实前缀预热（LLM_PREFIX_PREWARM，默认 1）--------------------
+    # context_state/persona/flow 已装配完（前缀字节就此定形）、session 已建——
+    # fire-and-forget 发一个「真实 prompt 形状」的 1-token 请求：把 merged system
+    # 前缀烧进 mlx prompt cache，turn-1 真请求 cached≈system 长度，免 ~1.4s 全量
+    # prefill（p6：会话首轮 TTFT 2.1-3.2s、cached=0 是延迟台账最差档）。
+    # 触发点=开场白之后：冷启动时预热若排在 greeting prefill 前面，会把开场白
+    # TTFT 拖慢一整个 prefill（实测 7.3s vs ~2s 基线）；greeting 本身就会把
+    # system 前缀烧进 cache，预热只需在「客户开口前」补齐 [system+user 形状]
+    # 的边界——greeting playout（几秒）足够它跑完。paused（无 greeting）时立即发。
+    # 绝不阻塞会话：asyncio.create_task + 异常全吞（失败只损失预热）。
+    if _prefix_prewarm_armed:
+        asyncio.create_task(_prefix_prewarm_task())
 
     # ---- 沉默心跳(真实电话节奏):AI 講完轉回「聆聽」後 SILENCE_NUDGE_SECONDS(默認3.5s)
     # 客戶冇出聲 → 一句「仲喺度嗎」帶返當前步;兩次都冇回應 → 禮貌收尾並自動收線

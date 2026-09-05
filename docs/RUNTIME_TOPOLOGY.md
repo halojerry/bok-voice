@@ -148,7 +148,10 @@ RoomAgentDispatch metadata 下发;无房间时空闲,job 到达才拉管线)
   （历史警戒已失效条件化：当年压端点致哑火=轮次在离线 ASR final 前提交；现提交结构性等待
   STT FINAL 且句级路径 FINAL 即句文，三语 E2E 实证 0 丢转写。回退开关：`TURN_DETECTION=`
   置空回 EOT 模型档 + `QWEN3_ASR_SENTENCE_COMMIT=0`（两者须一起关，否则句级 FINAL 会
-  叠进停嘴 FINAL 重复转写）；B 线 interp env 已强制 sentence-commit=0。）
+  叠进停嘴 FINAL 重复转写）；**kill-switch 档 endpointing min_delay 自动回 ≥0.35**
+  （`_endpointing_delays_from_env` 强制，无需手动——未校准 EOT 配 0.25 早提交截断粤语，
+  p6 实证）；B 线 interp env 已强制 sentence-commit=0。真实音频滑窗句间只出逗号，
+  VAD 停嘴微停顿（≥0.45s）为第二句边界源（`QWEN3_ASR_SENTENCE_PAUSE_TRIGGER` 默认 1）。）
 - `policy`：`offline_first`/`cloud_first`；建通话（`POST /api/calls`）时写入 manifest。
 
 ### LLM prompt 结构与多客服并发容量

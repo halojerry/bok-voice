@@ -380,6 +380,33 @@ def test_turn_detection_gate_and_agent_defaults(monkeypatch):
     assert _endpointing_delays_from_env() == (0.35, 1.2)
 
 
+def test_endpointing_kill_switch_min_delay_floor(monkeypatch):
+    """kill-switch（TURN_DETECTION≠stt）min_delay 强制 ≥0.35（p6 实证配对）：
+
+    0.25 只对 stt 句级提交校准过；未校准 EOT v1-mini（Cantonese 阈值回退英文档）
+    配 0.25 早提交截断粤语（p6 kill-switch 臂 1/3，两败皆 eou 早提交截半句）。
+    回退自动回 0.35，无需手动调 ENDPOINT_MIN_DELAY。
+    """
+    monkeypatch.delenv("ENDPOINT_MIN_DELAY", raising=False)
+    monkeypatch.delenv("ENDPOINT_MAX_DELAY", raising=False)
+
+    # 空串（EOT kill-switch）→ 地板 0.35
+    monkeypatch.setenv("TURN_DETECTION", "")
+    assert _endpointing_delays_from_env() == (0.35, 0.6)
+    # vad 档同 Floor
+    monkeypatch.setenv("TURN_DETECTION", "vad")
+    assert _endpointing_delays_from_env() == (0.35, 0.6)
+    # 显式更高 env 值尊重 env（max，唔降）
+    monkeypatch.setenv("ENDPOINT_MIN_DELAY", "0.5")
+    assert _endpointing_delays_from_env() == (0.5, 0.6)
+    # 回 stt → 0.25 默认恢复（唔吃地板）
+    monkeypatch.setenv("TURN_DETECTION", "stt")
+    monkeypatch.delenv("ENDPOINT_MIN_DELAY", raising=False)
+    assert _endpointing_delays_from_env() == (0.25, 0.6)
+    monkeypatch.setenv("ENDPOINT_MIN_DELAY", "0.2")
+    assert _endpointing_delays_from_env() == (0.2, 0.6)
+
+
 def test_turn_detection_kill_switch_disables_emission(monkeypatch):
     """TURN_DETECTION=（空串，EOT kill-switch）→ 句边界窗零 FINAL/EOS。"""
     monkeypatch.setenv("QWEN3_ASR_SENTENCE_COMMIT", "1")
@@ -514,3 +541,242 @@ def test_vad_stop_tail_end_to_end(monkeypatch):
     # 无提交（句级门关/无边界）：整段 FINAL 行为同旧
     names = asyncio.run(scenario("", "我張單號係7890123。"))
     assert names == ["START_OF_SPEECH", "END_OF_SPEECH", "FINAL_TRANSCRIPT"], names
+
+
+# ---- VAD 微停顿句边界触发（QWEN3_ASR_SENTENCE_PAUSE_TRIGGER，默认 1）----------
+
+
+def _run_vad_stop(monkeypatch, *, last_partial: str, prev_partial: str, finish_text: str, pause_env: str | None = None):
+    """真 _run 端到端：START→EOS（fake VAD），预置 partial 状态，返回 (事件名, 文本) 序列。"""
+
+    class _FakeVADStream:
+        def __init__(self, stream_ref):
+            self._ref = stream_ref
+            self._n = 0
+
+        def flush(self):
+            pass
+
+        def end_input(self):
+            pass
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            self._n += 1
+            if self._n == 1:
+                return types.SimpleNamespace(
+                    type=lp.vad.VADEventType.START_OF_SPEECH,
+                    speech_duration=1.0,
+                    silence_duration=0.0,
+                    inference_duration=0.0,
+                    probability=1.0,
+                    speaking=True,
+                    frames=[],
+                )
+            if self._n == 2:
+                # 句间真停顿：silence_duration ≥ min_silence 0.45 → END_OF_SPEECH
+                return types.SimpleNamespace(
+                    type=lp.vad.VADEventType.END_OF_SPEECH,
+                    speech_duration=2.0,
+                    silence_duration=0.45,
+                    inference_duration=0.05,
+                    probability=0.0,
+                    speaking=False,
+                    frames=[],
+                )
+            self._ref._input_ch.close()
+            raise StopAsyncIteration
+
+    class _FakeVAD:
+        def __init__(self, stream_ref):
+            self._ref = stream_ref
+
+        def stream(self):
+            return _FakeVADStream(self._ref)
+
+    monkeypatch.delenv("QWEN3_ASR_SENTENCE_COMMIT", raising=False)
+    monkeypatch.delenv("TURN_DETECTION", raising=False)
+    monkeypatch.delenv("QWEN3_ASR_SENTENCE_PAUSE_TRIGGER", raising=False)
+    if pause_env is not None:
+        monkeypatch.setenv("QWEN3_ASR_SENTENCE_PAUSE_TRIGGER", pause_env)
+    monkeypatch.setattr(lp, "httpx", types.SimpleNamespace(AsyncClient=_FakeClient))
+    _FakeClient.finish_body = {"text": finish_text, "language": "cantonese"}
+
+    async def scenario():
+        stream = _make_stream()
+        stream._metrics_task.cancel()
+        stream._vad = _FakeVAD(stream)
+        stream._last_partial = last_partial
+        stream._prev_partial = prev_partial
+        stream._last_lang = "cantonese"
+        stream._pending = bytearray(b"\x00\x00")
+        got: list[tuple[str, str]] = []
+        try:
+            await asyncio.wait_for(stream._task, 2)
+        finally:
+            while True:
+                try:
+                    ev = stream._event_ch.recv_nowait()
+                    got.append((ev.type.name, ev.alternatives[0].text if ev.alternatives else ""))
+                except (ChanEmpty, ChanClosed):
+                    break
+            stream._event_ch.close()
+            await asyncio.gather(stream._metrics_task, return_exceptions=True)
+        return got, stream
+
+    return asyncio.run(scenario())
+
+
+def test_vad_pause_commits_stable_partial_at_stop(monkeypatch):
+    """停嘴时 partial 稳定够格 → 直接按句 FINAL（pause trigger）：
+
+    事件序 START → FINAL(停嘴句) → EOS(停嘴) → finish 整段只补未提交尾巴。
+    partial 尾部弱逗号剥掉（finish 高精度句是句号——剥了先 startswith 得准，
+    唔会触发 rfind 兜底返回整段=重复转写）。
+    """
+    got, stream = _run_vad_stop(
+        monkeypatch,
+        last_partial="我想查下我張單，",
+        prev_partial="我想查下我張單，",
+        finish_text="我想查下我張單。佢聽日到唔到㗎？",
+    )
+    assert got == [
+        ("START_OF_SPEECH", ""),
+        ("FINAL_TRANSCRIPT", "我想查下我張單"),
+        ("END_OF_SPEECH", ""),
+        ("FINAL_TRANSCRIPT", "佢聽日到唔到㗎？"),
+    ], got
+    # （_committed_text 已随停嘴 _reset 清空——pause 提交的事实由 FINAL 事件文本钉死）
+
+
+def test_vad_pause_digit_run_suppressed(monkeypatch):
+    """停嘴 partial 带数字 run（单号）→ 唔提前提交，整段留给 finish 兜底。"""
+    got, stream = _run_vad_stop(
+        monkeypatch,
+        last_partial="我張單號係7890123，",
+        prev_partial="我張單號係7890123，",
+        finish_text="我張單號係7890123。",
+    )
+    assert got == [
+        ("START_OF_SPEECH", ""),
+        ("END_OF_SPEECH", ""),
+        ("FINAL_TRANSCRIPT", "我張單號係7890123。"),
+    ], got
+    assert stream._committed_text == ""
+
+
+def test_vad_pause_unstable_or_empty_partial_no_commit(monkeypatch):
+    """partial 唔稳定（上一窗被改写）或空 → 唔提交，正常停嘴路径兜底。"""
+    # 上一窗同区间被改写（「查」→「睇」）→ prefix 稳定门拦住
+    got, stream = _run_vad_stop(
+        monkeypatch,
+        last_partial="我想查下我張單",
+        prev_partial="我想睇下我張單",
+        finish_text="我想查下我張單。",
+    )
+    assert got == [
+        ("START_OF_SPEECH", ""),
+        ("END_OF_SPEECH", ""),
+        ("FINAL_TRANSCRIPT", "我想查下我張單。"),
+    ], got
+    assert stream._committed_text == ""
+
+    # partial 空（短句没出过窗）→ 同样唔提交
+    got2, stream2 = _run_vad_stop(
+        monkeypatch,
+        last_partial="",
+        prev_partial="",
+        finish_text="係我。",
+    )
+    assert got2 == [
+        ("START_OF_SPEECH", ""),
+        ("END_OF_SPEECH", ""),
+        ("FINAL_TRANSCRIPT", "係我。"),
+    ], got2
+    assert stream2._committed_text == ""
+
+
+def test_vad_pause_env_off_punct_only(monkeypatch):
+    """QWEN3_ASR_SENTENCE_PAUSE_TRIGGER=0 → 停嘴唔做 pause 提交（punct-only）。"""
+    got, stream = _run_vad_stop(
+        monkeypatch,
+        last_partial="我想查下我張單",
+        prev_partial="我想查下我張單",
+        finish_text="我想查下我張單。",
+        pause_env="0",
+    )
+    assert got == [
+        ("START_OF_SPEECH", ""),
+        ("END_OF_SPEECH", ""),
+        ("FINAL_TRANSCRIPT", "我想查下我張單。"),
+    ], got
+    assert stream._committed_text == ""
+
+
+def test_pause_boundary_gates_unit(monkeypatch):
+    """_sentence_boundary(allow_eos=True) 逐门单测：稳定/改写/数字/短句/限速/标点优先。"""
+    _default_gates(monkeypatch)
+
+    async def scenario():
+        stream = _make_stream()
+        try:
+            # 稳定（prev 与当前同文，弱尾符差异剥平）→ 提交，坐标=text 末尾
+            s1 = stream._sentence_boundary("我想查下我張單，", "我想查下我張單", allow_eos=True)
+            # prev 是严格前缀（最后一窗补齐句尾字）→ 一样过
+            s2 = stream._sentence_boundary("我想查下我張單，", "我想查下我", allow_eos=True)
+            # prev 改写 → None
+            s3 = stream._sentence_boundary("我想查下我張單", "我想睇下我張單", allow_eos=True)
+            # 数字 run → None
+            s4 = stream._sentence_boundary("我張單號係7890123", "我張單號係7890123", allow_eos=True)
+            # <6 字 → None
+            s5 = stream._sentence_boundary("係我，", "係我，", allow_eos=True)
+            # 首窗（prev 该区间空）→ 零跨窗证据 → None
+            s6 = stream._sentence_boundary("我想查下我張單", "", allow_eos=True)
+            # 限速窗内 → None
+            stream._last_sentence_commit_at = time.monotonic()
+            s7 = stream._sentence_boundary("我想查下我張單", "我想查下我張單", allow_eos=True)
+            stream._last_sentence_commit_at = 0.0
+            # 标点边界优先：稳定强标点句走 punct 分支（返回句子+句号后坐标）
+            s8 = stream._sentence_boundary(
+                "唔該幫我查下張單。而家到咗", "唔該幫我查下張單。而家到咗", allow_eos=True
+            )
+            return s1, s2, s3, s4, s5, s6, s7, s8
+        finally:
+            await _close(stream)
+
+    s1, s2, s3, s4, s5, s6, s7, s8 = asyncio.run(scenario())
+    assert s1 == ("我想查下我張單", len("我想查下我張單，"))
+    assert s2 == ("我想查下我張單", len("我想查下我張單，"))
+    assert s3 is None
+    assert s4 is None
+    assert s5 is None
+    assert s6 is None
+    assert s7 is None
+    assert s8 == ("唔該幫我查下張單。", len("唔該幫我查下張單。"))
+
+
+def test_partial_dedupe_window_syncs_prev(monkeypatch):
+    """静音期滑窗同文（dedupe early-return）→ 参照窗同步：
+
+    唔同步的话 prev 停喺说话最后一窗，EOS 时刻 prev≠last，pause trigger 喺
+    真实停顿上永不满足（partial 静音期稳定重解同文係常态）。
+    """
+    _default_gates(monkeypatch)
+
+    async def scenario():
+        stream = _make_stream()
+        try:
+            ev1 = await _drive_window(stream, {"text": "我想查下我張單", "language": "cantonese"})
+            synced_after_first = stream._prev_partial
+            ev2 = await _drive_window(stream, {"text": "我想查下我張單", "language": "cantonese"})
+            return ev1, ev2, synced_after_first, stream._prev_partial, stream._last_partial
+        finally:
+            await _close(stream)
+
+    ev1, ev2, synced_after_first, prev, last = asyncio.run(scenario())
+    assert ev1 == ["INTERIM_TRANSCRIPT"]
+    assert ev2 == [], f"同文窗去重零事件: {ev2}"
+    assert prev == last, f"dedupe 窗要同步参照窗: prev={prev!r} last={last!r}"
+    assert synced_after_first == "我想查下我張單"

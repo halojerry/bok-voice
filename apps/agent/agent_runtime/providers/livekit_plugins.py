@@ -295,6 +295,25 @@ class MlxLlmLLM(_OpenAICompatBase):
         except Exception as exc:  # pragma: no cover - warmup 失败不致命
             print(f"[agent] llm warmup skipped: {exc!r}", flush=True)
 
+    async def prefix_prewarm(self, messages: list[dict]) -> None:
+        """真实 prompt 形状的 1-token 预热（会话首轮前，agent.py 发起）。
+
+        与 _prewarm_impl（只暖模型/连接）不同：这里喂「真实 merged system +
+        fake user 轮」，mlx_lm server 会把该前缀的 KV 留喺 prompt cache——
+        turn-1 真请求共享整段 system 前缀 → cached≈system 长度，免 ~1.4s
+        全量 prefill（会话首轮 cached=0 的专项解法）。失败由调用方吞掉。
+        冷启动竞态：预热请求会排在官方 prewarm/开场白 prefill 后面，共享
+        client 的 read=5s 会提前放弃（实测 APITimeoutError）——per-request
+        放宽 read=30s，让服务端把前缀 prefill 跑完入 cache（client 等耐些，
+        反正 fire-and-forget 唔阻塞任何人）。
+        """
+        await self._client.chat.completions.create(
+            model=self._opts.model,
+            messages=messages,
+            max_tokens=1,
+            timeout=httpx.Timeout(connect=5.0, read=30.0, write=5.0, pool=5.0),
+        )
+
 
 class DeepSeekLLM(_OpenAICompatBase):
     """DeepSeek 云端（OpenAI 兼容契约，与本地 MlxLlmLLM 同一官方内芯）。"""
@@ -2660,6 +2679,14 @@ _ASR_SENTENCE_MIN_CHARS = 6
 # 限速:两次句级提交最少间隔(「好。係。唔該。」连珠句防机关枪式连发,
 # 排队语义=剩余文本并入下一边界或 VAD 停嘴整句兜底)。
 _ASR_SENTENCE_MIN_INTERVAL_S = 1.5
+# VAD 微停顿候选句尾部的弱停顿符：滑窗 partial 说话期句尾只打逗号（p6 实测），
+# 停嘴高精度 finish 会升级成句号——提交时剥掉弱尾符，让已提交前缀与 finish
+# 整句做 startswith 匹配时唔会因「，vs。」错位（错位会触发 rfind 兜底返回
+# 整段=重复转写）。强句标点（。！？!?）唔剥——嗰个係边界本身。
+_PAUSE_TRAILING_WEAK_PUNCT = "，、；：,;…—~～ \t"
+# _uncommitted 剩余的头部位弱停顿符：同理（committed 前缀剥了弱尾符后，
+# finish 整句的「。佢聽日…」剩余唔应该带住句号开头进字幕/下一轮）。
+_UNCOMMITTED_LEADING_WEAK_PUNCT = _PAUSE_TRAILING_WEAK_PUNCT + "。！？!?"
 
 
 def sentence_commit_enabled() -> bool:
@@ -2674,6 +2701,18 @@ def sentence_commit_enabled() -> bool:
     if os.environ.get("QWEN3_ASR_SENTENCE_COMMIT", "1") != "1":
         return False
     return os.environ.get("TURN_DETECTION", "stt").strip().lower() == "stt"
+
+
+def _pause_trigger_enabled() -> bool:
+    """VAD 微停顿句边界触发（QWEN3_ASR_SENTENCE_PAUSE_TRIGGER，默认 1）。
+
+    p6 实测：mlx ASR 说话期滑窗 partial 对句间停顿只打逗号不打句号（MiniMax
+    生产夹具同样）→ 强标点门在真实音频上结构性不触发。句边界需要非标点事件源
+    ——本流内置 VAD 的 END_OF_SPEECH（≥min_silence 0.45s 真静音）就是句间停顿：
+    人打电话句间停 0.3-0.8s。只在 sentence_commit_enabled() 之上叠加（总门关
+    则全关，kill-switch 一并灭掉）。
+    """
+    return os.environ.get("QWEN3_ASR_SENTENCE_PAUSE_TRIGGER", "1") == "1"
 
 
 def _has_latin_or_digit_run(text: str, min_len: int = 2) -> bool:
@@ -2712,6 +2751,10 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
       （官方 stt 模式契约 audio_recognition.py:1292-1327），LLM+TTS 在客户仍在
       说话时就开跑——speech-end→first-audio 的唯一 ≤1s 路径。停嘴路径只补发
       未提交尾巴，已提交句子唔会随整段重复入历史。
+    - VAD 微停顿触发（_pause_trigger_enabled()，默认开）：p6 实测真实音频滑窗
+      partial 句间只出逗号、强标点门结构性不触发 → 内置 VAD END_OF_SPEECH
+      （≥0.45s 真静音=句间停顿）作为第二边界源：停嘴那刻 partial 稳定够格就
+      直接按句提交（免等 finish 往返），再走正常停嘴路径补尾巴。
     """
 
     def __init__(self, stt_, *, vad, conn_options):
@@ -2725,6 +2768,7 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         self._stable = ""  # 已发 PREFLIGHT 的最长稳定前缀（未提交剩余坐标系）
         self._last_post = 0.0
         self._finishing = False
+        self._last_lang = ""  # 最后一窗 partial 的归一语言（VAD 停嘴提交锚定用）
         # 句级提交状态（sentence_commit_enabled() 关闭时恒空/0，行为同旧）：
         self._committed_text = ""  # 已按句提交的句子拼接（FINAL 已发、框架已 commit）
         self._last_sentence = ""  # 最后提交句（finish 整段坐标失配时的回退锚）
@@ -2762,6 +2806,23 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                         continue
                     self._finishing = True
                     speech_end_time = time.time() - event.silence_duration - event.inference_duration
+                    # ---- VAD 微停顿句级提交（pause trigger，默认开）--------------
+                    # 内置 VAD END_OF_SPEECH = 本段语音后已有 ≥min_silence(0.45s)
+                    # 真静音——人打电话句间停 0.3-0.8s，这里多数就是句边界。此刻
+                    # 滑窗 partial 已带着整段静音重解过（文本齐），直接按句提交：
+                    # 框架 commit = max(停嘴+min_delay, FINAL 到达)——FINAL 免等
+                    # /api/finish 往返（~0.15-0.3s），commit 同量提前。守卫照句级
+                    # 门（≥6 字/无数字 run/跨窗稳定/1.5s 限速）；partial 空或不
+                    # 稳定 → 不提交，下面正常 finish 路径整句兜底（零行为差）。
+                    if sentence_commit_enabled() and _pause_trigger_enabled():
+                        pause_commit = self._sentence_boundary(
+                            self._last_partial, self._prev_partial, allow_eos=True
+                        )
+                        if pause_commit is not None:
+                            sentence, end_idx = pause_commit
+                            self._emit_sentence_commit(
+                                sentence, end_idx, self._last_lang, time.monotonic(), source="vad-pause"
+                            )
                     self._event_ch.send_nowait(
                         stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH, speech_end_time=speech_end_time)
                     )
@@ -2824,9 +2885,16 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         except Exception:  # noqa: BLE001 - partial 尽力而为,忙时/抖动静默跳过
             return
         text = str(data.get("text") or "")
-        if not text or text == self._last_partial:
+        if not text:
+            return
+        if text == self._last_partial:
+            # 滑窗文本没变（静音期 partial 稳定重解同文）：参照窗同步到当前窗
+            # ——VAD 微停顿提交的「跨窗稳定」门才能在静音期成立（否则 prev 停在
+            # 说话最后一窗，EOS 时刻 prev≠last，pause trigger 永不满足）。
+            self._prev_partial = self._last_partial
             return
         lang = _normalize_asr_language(str(data.get("language") or ""), text)
+        self._last_lang = lang
         prev_full = self._last_partial
         self._last_partial = text
 
@@ -2842,22 +2910,10 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
             commit = self._sentence_boundary(text, prev_full)
             if commit is not None:
                 sentence, end_idx = commit
-                self._committed_text += sentence
-                self._last_sentence = sentence
-                self._commit_idx = end_idx
-                self._stable = ""  # PREFLIGHT 换未提交坐标系，增长重新计
-                self._last_sentence_commit_at = now
-                # 语言锚定与 FINAL 路径同款：strong-evidence 判定在 LanguageState
-                # 内部，弱证据短句拉唔走会话语言。
-                self._stt_._language_state.update(lang, sentence)
-                self._event_ch.send_nowait(
-                    stt.SpeechEvent(
-                        type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                        alternatives=[stt.SpeechData(language=self._stt_._language_state.lang, text=sentence)],
-                    )
-                )
+                self._emit_sentence_commit(sentence, end_idx, lang, now, source="partial-punct")
+                # 每句事件序：FINAL(句子) → END_OF_SPEECH（框架 EOS 才置 committed
+                # + _run_eou_detection(trigger="stt")，见 _sentence_boundary 文档）。
                 self._event_ch.send_nowait(stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH))
-                print(f"QWEN3_ASR_SENTENCE_COMMIT chars={len(sentence)} {sentence!r}", flush=True)
                 self._prev_partial = text  # 参照窗照常推进（与 _last_partial 同步）
                 # 字幕续流：只发未提交剩余（框架 _audio_transcript 已含已提交句）。
                 remainder = self._uncommitted(text)
@@ -2908,7 +2964,29 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
             )
             print(f"QWEN3_ASR_PREFLIGHT chars={len(common)}", flush=True)
 
-    def _sentence_boundary(self, text: str, prev_full: str) -> tuple[str, int] | None:
+    def _emit_sentence_commit(self, sentence: str, end_idx: int, lang: str, now: float, source: str) -> None:
+        """句级提交共用出口（partial-punct / vad-pause 两个事件源同一套记账）。
+
+        记账：已提交前缀/最后句/滑窗坐标/限速时刻/PREFLIGHT 坐标系重置；语言锚定
+        与 FINAL 路径同款（strong-evidence 判定在 LanguageState 内部，弱证据短句
+        拉不走会话语言）。只发 FINAL——句末 END_OF_SPEECH 由调用方按各自契约补
+        （partial 标点路径紧随发 EOS；vad-pause 路径后面本就有停嘴 EOS，不重复发）。
+        """
+        self._committed_text += sentence
+        self._last_sentence = sentence
+        self._commit_idx = end_idx
+        self._stable = ""  # PREFLIGHT 换未提交坐标系，增长重新计
+        self._last_sentence_commit_at = now
+        self._stt_._language_state.update(lang, sentence)
+        self._event_ch.send_nowait(
+            stt.SpeechEvent(
+                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                alternatives=[stt.SpeechData(language=self._stt_._language_state.lang, text=sentence)],
+            )
+        )
+        print(f"QWEN3_ASR_SENTENCE_COMMIT source={source} chars={len(sentence)} {sentence!r}", flush=True)
+
+    def _sentence_boundary(self, text: str, prev_full: str, *, allow_eos: bool = False) -> tuple[str, int] | None:
         """滑窗全文里找下一个「可提交」强句边界；唔够格返回 None。
 
         边界=强标点（。！？!? 及连用）；ASCII 句点后跟字母/数字（3.5、e.g.）唔算
@@ -2920,6 +2998,11 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
           整句兜底，数字句永唔句级提交）；
         - 稳定性：上一窗同坐标已是同一句段（首现唔提交，防滑窗跳变 flicker）；
         - 限速：距上次提交 < _ASR_SENTENCE_MIN_INTERVAL_S 唔提交（连珠句防机关枪）。
+        allow_eos=True（VAD 微停顿触发）：标点扫描无果时，边界候选=当前滑窗文本
+        末尾（pause≥0.45s 唔使标点都係句边界）。稳定性用 prefix 级——上一窗剩余
+        係当前剩余的严格前缀（已确认部分零改写）即过：静音期通常只有一窗重解，
+        EOS 时刻最后一窗往往刚把句尾字补齐，严格相等会错过真实停顿。首窗该区间
+        为空（prev_rem 空）唔提交——零跨窗证据唔赌。
         返回 (句段文本, 边界后坐标)；数字 run 门不过时继续往后扫也只会带着同一
         run 失败 → 自然落到停嘴兜底。
         """
@@ -2953,6 +3036,16 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                 # 呢个边界唔够格（太短/数字 run/未稳定）→ 唔喺度提交，继续扫下一
                 # 个边界（短句排队累积；未稳定边界下窗自然变稳定）。
             i += 1
+        if allow_eos:
+            sentence = text[start:].rstrip(_PAUSE_TRAILING_WEAK_PUNCT)
+            prev_rem = prev_full[start:].rstrip(_PAUSE_TRAILING_WEAK_PUNCT)
+            if (
+                len(sentence) >= _ASR_SENTENCE_MIN_CHARS
+                and not _has_latin_or_digit_run(sentence)
+                and prev_rem
+                and sentence.startswith(prev_rem)
+            ):
+                return sentence, len(text)
         return None
 
     def _uncommitted(self, text: str) -> str:
@@ -2961,15 +3054,17 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         主路径 startswith（滑窗是同一会话累积解码，已稳定前缀极少改写）；改写过
         就用最后提交句 rfind 定位（容前缀改写）；再唔准（极端跳变）原样返回——
         宁可字幕/抢跑短暂冗余，都唔丢未提交尾巴（停嘴 FINAL 由同函数兜底）。
+        剩余头部的弱停顿符照例剥掉（vad-pause 提交剥了「，」尾、finish 整句以
+        「。」续写——剩余唔应该带住句号/逗号开头；只剥标点唔动正字）。
         """
         if not self._committed_text:
             return text
         if text.startswith(self._committed_text):
-            return text[len(self._committed_text):].lstrip()
+            return text[len(self._committed_text):].lstrip(_UNCOMMITTED_LEADING_WEAK_PUNCT)
         if self._last_sentence:
             pos = text.rfind(self._last_sentence)
             if pos >= 0:
-                return text[pos + len(self._last_sentence):].lstrip()
+                return text[pos + len(self._last_sentence):].lstrip(_UNCOMMITTED_LEADING_WEAK_PUNCT)
         return text
 
     async def _finish_session(self) -> tuple[str, str]:
@@ -3011,6 +3106,7 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         self._prev_partial = ""
         self._stable = ""
         self._last_post = 0.0
+        self._last_lang = ""
         # 句级提交状态随段重置（新语音段从零累计；限速时刻一并归零）。
         self._committed_text = ""
         self._last_sentence = ""
