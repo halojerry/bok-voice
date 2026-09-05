@@ -255,9 +255,8 @@ def test_qwen3_beep_initializes_emitter_before_push():
 def test_qwen3_post_frames_no_retry_after_partial_audio(monkeypatch):
     """半途断流:本句已有音频落地 → 唔重试(重 POST 会从 byte 0 重推同句=重读)。
 
-    唔使真 httpx:post() 会缓冲 body,网络级断流喺 post() 内抛(推帧之前),
-    模拟唔到「推咗一半先断」。用假 client 返多 chunk 流式响应 + emitter 喺
-    第 2 次 push 先爆,精确复现「音频已落地后下游断」= pushed_any 门要拦的姿势。
+    用假 client.stream() 返多 chunk 流式响应 + emitter 喺第 2 次 push 先爆,
+    精确复现「音频已落地后下游断」= pushed_any 门要拦的姿势。
     """
     import agent_runtime.providers.livekit_plugins as lk
 
@@ -272,6 +271,16 @@ def test_qwen3_post_frames_no_retry_after_partial_audio(monkeypatch):
             yield b"\x01\x02" * 4800  # 凑满下一帧:push#2 爆
             raise RuntimeError("mid-stream cut")
 
+    class _FakeStreamCtx:
+        def __init__(self, resp):
+            self._resp = resp
+
+        async def __aenter__(self):
+            return self._resp
+
+        async def __aexit__(self, *a):
+            return False
+
     class _FakeClient:
         def __init__(self, **kwargs):
             pass
@@ -282,9 +291,10 @@ def test_qwen3_post_frames_no_retry_after_partial_audio(monkeypatch):
         async def __aexit__(self, *a):
             return False
 
-        async def post(self, url, json=None):
+        def stream(self, method, url, json=None):
+            assert method == "POST"
             attempts["n"] += 1
-            return _FakeResp()
+            return _FakeStreamCtx(_FakeResp())
 
     monkeypatch.setattr(
         lk, "httpx", SimpleNamespace(AsyncClient=lambda **kw: _FakeClient())
@@ -337,6 +347,61 @@ def test_qwen3_post_frames_retries_when_no_audio_flowed(monkeypatch):
     ok = asyncio.run(asyncio.wait_for(run(), timeout=15))
     assert attempts["n"] == 3
     assert ok is False
+
+
+def test_qwen3_post_frames_streams_body_not_buffered(monkeypatch):
+    """必须 client.stream() 拉 body:client.post() 会整体缓冲后先返回,
+    aiter_bytes() 只读缓存——sidecar 逐块推嘅首个 ~40ms 早推变零收益。
+
+    MockTransport 返 async-generator body,记录 yield vs emitter.push 顺序:
+    真流式下首帧 push 必须发生喺 body 尚未吐完(yield 未尽)之时。
+    """
+    import agent_runtime.providers.livekit_plugins as lk
+
+    events: list[tuple] = []
+    _CHUNKS = [b"\x01\x02" * 1200] * 5  # 每块 2400B:首块即过 40ms 早推门槛
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        async def agen():
+            for i, chunk in enumerate(_CHUNKS):
+                events.append(("yield", i))
+                yield chunk
+
+        return httpx.Response(200, content=agen())
+
+    real_async_client = httpx.AsyncClient
+
+    def factory(**kwargs):
+        return real_async_client(transport=httpx.MockTransport(handler), timeout=120)
+
+    monkeypatch.setattr(lk, "httpx", SimpleNamespace(AsyncClient=factory))
+
+    class _LogEmitter(_RecordingEmitter):
+        def __init__(self):
+            self.pushes = 0
+
+        def push(self, data):
+            events.append(("push", self.pushes))
+            self.pushes += 1
+
+    tts = _make_tts()
+    em = _LogEmitter()
+
+    async def run():
+        return await lk._qwen3_tts_post_frames(tts, "你好", em, {"started": False})
+
+    ok = asyncio.run(asyncio.wait_for(run(), timeout=10))
+    assert ok is True
+    assert em.pushes >= 1
+    yields = [i for kind, i in events if kind == "yield"]
+    assert yields == list(range(len(_CHUNKS)))
+    push_positions = [idx for idx, (kind, _i) in enumerate(events) if kind == "push"]
+    assert push_positions, events
+    last_yield_idx = max(idx for idx, (kind, _i) in enumerate(events) if kind == "yield")
+    first_push_idx = push_positions[0]
+    assert first_push_idx < last_yield_idx, (
+        f"body 整体缓冲后先推帧(post 旧姿势),首帧 push 应发生喺 body 吐完之前: {events}"
+    )
 
 
 def test_qwen3_chunked_no_beep_after_audio_flowed(monkeypatch):
@@ -506,6 +571,16 @@ def test_qwen3_post_frames_caps_burst_audio(monkeypatch):
                 sent["bytes"] += 16000
                 yield b"\x01\x02" * 8000
 
+    class _BurstStreamCtx:
+        def __init__(self, resp):
+            self._resp = resp
+
+        async def __aenter__(self):
+            return self._resp
+
+        async def __aexit__(self, *a):
+            return False
+
     class _FakeClient:
         def __init__(self, **kwargs):
             pass
@@ -516,9 +591,9 @@ def test_qwen3_post_frames_caps_burst_audio(monkeypatch):
         async def __aexit__(self, *a):
             return False
 
-        async def post(self, url, json=None):
+        def stream(self, method, url, json=None):
             attempts["n"] += 1
-            return _BurstResp()
+            return _BurstStreamCtx(_BurstResp())
 
     monkeypatch.setattr(
         lk, "httpx", SimpleNamespace(AsyncClient=lambda **kw: _FakeClient())

@@ -1919,7 +1919,12 @@ async def _qwen3_tts_post_frames(
     for attempt in range(3):
         try:
             async with httpx.AsyncClient(timeout=120) as client:
-                resp = await client.post(
+                # client.stream():响应体逐块拉取。旧 client.post() 会先整体读满
+                # body 先返回(内部 read()),下面 aiter_bytes() 只是读缓存——
+                # sidecar 边合成边推嘅 ~83ms 模型块喺客户端全部积压,首个 40ms
+                # 早推变零收益。stream 模式下 aiter_bytes() 先真逐块到。
+                async with client.stream(
+                    "POST",
                     f"{tts_._base_url}/v1/audio/speech",
                     json={
                         "input": text,
@@ -1931,71 +1936,71 @@ async def _qwen3_tts_post_frames(
                         "streaming": True,
                         "chunk_ms": 200,
                     },
-                )
-                resp.raise_for_status()
-                # Stream the PCM body into 200ms frames. The sidecar
-                # streams with non_streaming_mode=False (Qwen3-TTS
-                # Dual-Track fast path), and pushing frames here lets
-                # LiveKit start playback/barge-in handling as soon as
-                # the first frames are available instead of one blob.
-                pcm_total = 0
-                frame_bytes = (tts_.sample_rate // 5) * 2  # 200ms, 16-bit mono
-                buf = bytearray()
-                first_audio = False
-                if not state["started"]:
-                    output_emitter.initialize(
-                        request_id="qwen3-tts",
-                        sample_rate=tts_.sample_rate,
-                        num_channels=tts_.num_channels,
-                        mime_type="audio/pcm",
-                        stream=True,
-                    )
-                    state["started"] = True
-                    output_emitter.start_segment(segment_id="qwen3-tts")
-                async for data in resp.aiter_bytes():
-                    buf.extend(data)
-                    # 单任务爆段护栏:音频时长到顶(默认 15s)即停读剩余 body,
-                    # 本任务判失败(有音频落地 → 上层唔重试),防 20-30s 爆段霸 playout。
-                    if max_task_bytes and pcm_total + len(buf) >= max_task_bytes:
-                        keep = max(max_task_bytes - pcm_total, 0)
-                        if keep:
-                            output_emitter.push(bytes(buf[:keep]))
+                ) as resp:
+                    resp.raise_for_status()
+                    # Stream the PCM body into 200ms frames. The sidecar
+                    # streams with non_streaming_mode=False (Qwen3-TTS
+                    # Dual-Track fast path), and pushing frames here lets
+                    # LiveKit start playback/barge-in handling as soon as
+                    # the first frames are available instead of one blob.
+                    pcm_total = 0
+                    frame_bytes = (tts_.sample_rate // 5) * 2  # 200ms, 16-bit mono
+                    buf = bytearray()
+                    first_audio = False
+                    if not state["started"]:
+                        output_emitter.initialize(
+                            request_id="qwen3-tts",
+                            sample_rate=tts_.sample_rate,
+                            num_channels=tts_.num_channels,
+                            mime_type="audio/pcm",
+                            stream=True,
+                        )
+                        state["started"] = True
+                        output_emitter.start_segment(segment_id="qwen3-tts")
+                    async for data in resp.aiter_bytes():
+                        buf.extend(data)
+                        # 单任务爆段护栏:音频时长到顶(默认 15s)即停读剩余 body,
+                        # 本任务判失败(有音频落地 → 上层唔重试),防 20-30s 爆段霸 playout。
+                        if max_task_bytes and pcm_total + len(buf) >= max_task_bytes:
+                            keep = max(max_task_bytes - pcm_total, 0)
+                            if keep:
+                                output_emitter.push(bytes(buf[:keep]))
+                                output_emitter.flush()
+                                del buf[:keep]
+                                pcm_total = max_task_bytes
+                                pushed_any = True
+                            print("QWEN3_TTS_TASK_CAP", pcm_total, "bytes (burst guard)", flush=True)
+                            if end_segment:
+                                output_emitter.end_segment()
+                            return False
+                        # Push the first partial frame as soon as ~40ms is
+                        # available instead of waiting for a full 200ms
+                        # buffer: the sidecar streams ~83ms model chunks
+                        # (QWEN3_TTS_STREAM_INTERVAL=0.1), so this shaves
+                        # ~150ms off the time-to-first-audio without
+                        # changing steady-state frame size.
+                        if not first_audio and len(buf) >= frame_bytes // 5:
+                            output_emitter.push(bytes(buf))
                             output_emitter.flush()
-                            del buf[:keep]
-                            pcm_total = max_task_bytes
+                            pcm_total += len(buf)
+                            buf.clear()
+                            first_audio = True
                             pushed_any = True
-                        print("QWEN3_TTS_TASK_CAP", pcm_total, "bytes (burst guard)", flush=True)
-                        if end_segment:
-                            output_emitter.end_segment()
-                        return False
-                    # Push the first partial frame as soon as ~40ms is
-                    # available instead of waiting for a full 200ms
-                    # buffer: the sidecar streams ~83ms model chunks
-                    # (QWEN3_TTS_STREAM_INTERVAL=0.1), so this shaves
-                    # ~150ms off the time-to-first-audio without
-                    # changing steady-state frame size.
-                    if not first_audio and len(buf) >= frame_bytes // 5:
+                        while len(buf) >= frame_bytes:
+                            output_emitter.push(bytes(buf[:frame_bytes]))
+                            output_emitter.flush()
+                            del buf[:frame_bytes]
+                            pcm_total += frame_bytes
+                            pushed_any = True
+                    if buf:
                         output_emitter.push(bytes(buf))
                         output_emitter.flush()
                         pcm_total += len(buf)
-                        buf.clear()
-                        first_audio = True
                         pushed_any = True
-                    while len(buf) >= frame_bytes:
-                        output_emitter.push(bytes(buf[:frame_bytes]))
-                        output_emitter.flush()
-                        del buf[:frame_bytes]
-                        pcm_total += frame_bytes
-                        pushed_any = True
-                if buf:
-                    output_emitter.push(bytes(buf))
-                    output_emitter.flush()
-                    pcm_total += len(buf)
-                    pushed_any = True
-                if end_segment:
-                    output_emitter.end_segment()
-                print("QWEN3_TTS_BYTES", pcm_total, flush=True)
-                return True
+                    if end_segment:
+                        output_emitter.end_segment()
+                    print("QWEN3_TTS_BYTES", pcm_total, flush=True)
+                    return True
         except Exception as exc:  # noqa: BLE001 - retry transient gateway failures
             last_exc = exc
             if pushed_any:

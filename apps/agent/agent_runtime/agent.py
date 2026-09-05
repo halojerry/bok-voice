@@ -781,12 +781,71 @@ async def entrypoint(ctx):
     # LLM 预热已收敛到官方机制：MlxLlmLLM._prewarm_impl（发 1-token 请求暖 mlx 模型）
     # 由 AgentSession 构造时自动调用（LLM_WARMUP=1 开关在插件内）。
     _log_stage("providers_ready")
+    # 轮次判定策略：默认不设 = 官方 inference EOT 模型（本地 v1-mini；Cantonese 无
+    # 校准档 → unlikely_threshold 回退英文档，停顿帧全判「唔係轮尾」，每轮提交撞
+    # ENDPOINT_MAX_DELAY）。TURN_DETECTION=vad 切 VAD 基准提交（1.7.1 语义：
+    # commit 结构性等 STT FINAL——_run_eou_detection 对无 FINAL 轮直接 return，
+    # FINAL 到达后以 trigger="stt" 补判，唔会丢转写），提交点 = max(ENDPOINT_MIN_DELAY,
+    # FINAL 到达)。E2E 实测 EOU 同 max_delay=0.6 档打平（都系 FINAL 到达 bound）,
+    # 但冇 EOT 模型嘅中途停顿保护,留作实验档。TURN_DETECTION=stt/manual 等官方字面量
+    # 原样透传。
+    _turn_detection_mode = os.environ.get("TURN_DETECTION", "").strip()
+    turn_handling: TurnHandlingOptions = {
+        # 官方低延迟调参（docs.livekit.io/agents/logic/turns/tuning）：
+        # - dynamic endpointing：min 0.35s。低于 ~0.3s 会让轮次在慢速离线 ASR 返回前
+        #   提交 → 转写被丢（"transcript arrives after turn has been committed"）→ 不回话。
+        #   max 0.6s：本地 EOT v1-mini 无 Cantonese 校准档（回退英文阈值）,停顿帧全判
+        #   「唔係轮尾」→ 提交每轮撞 max。1.2 时代 EOU 恒 1200ms；E2E 实证(2026-09-05,
+        #   真房间 + 真 /api/token,commit 结构性等 STT FINAL,零「transcript arrives
+        #   after turn has been committed」)0.6 档 EOU 614-956ms(=max(0.6, FINAL 到达),
+        #   三语 3/3 PASS)→ 0.6 为新默认。旧值 ENDPOINT_MAX_DELAY=1.2 可回退。
+        # - preemptive_tts：在轮次确认前就开跑 LLM->TTS，代价是打断时浪费算力
+        # - interruption 保持自适应（无模型时自动回退 VAD），min_duration 收紧到 0.35s
+        "endpointing": {
+            "mode": "dynamic",
+            "min_delay": float(os.environ.get("ENDPOINT_MIN_DELAY", "0.35")),
+            "max_delay": float(os.environ.get("ENDPOINT_MAX_DELAY", "0.6")),
+        },
+        "preemptive_generation": {
+            # 官方源码证实(1.7.1 audio_recognition):FINAL_TRANSCRIPT 一到即触发
+            # 抢跑,LLM prefill 与端点判定窗口并行——唔使等 interim。默认开。
+            # 流程推进/收尾/语言切换轮由 on_user_turn_completed 落 chat_ctx 步骤
+            # 标记,触发框架快照不一致→作废旧抢跑重建,推进轮唔会错步。
+            "enabled": os.environ.get("PREEMPTIVE_GENERATION", "1") == "1",
+            # preemptive_tts 默认关:MiniMax 云 TTS 按字计费,误判轮次唔好白烧;
+            # dev 可 PREEMPTIVE_TTS=1 实验首声再提前。
+            "preemptive_tts": os.environ.get("PREEMPTIVE_TTS", "0") == "1",
+            "max_speech_duration": 10.0,
+            # 抢跑重试预算:每个 PREFLIGHT 事件 count+1(agent_activity.py:2392),
+            # 烧穿后 FINAL 到达只 cancel 不重建 → commit 从零生成、新请求还排在
+            # 被 cancel 的 prefill 后面(实测 +0.2-0.7s)。PREFLIGHT 已节流(稳定
+            # 前缀 ≥4 字增长才发),预算 8 保证长句 FINAL 那拍抢跑必存活。
+            # PREEMPTIVE_MAX_RETRIES 可回退。
+            "max_retries": int(os.environ.get("PREEMPTIVE_MAX_RETRIES", "8")),
+        },
+        "interruption": {
+            "enabled": interruption_enabled,
+            # 官方「误打断自愈」组合:低门槛(0.6s 真插话即可让位)+
+            # resume_false_interruption(打断后 1s 内无转写=噪声误打断,AI 从
+            # 暂停处自动续讲)。比旧 1.2s 高门槛硬扛更自然——高门槛连真插话
+            # 也压住,客户抢唔到话。INTERRUPT_MIN_DURATION 可回退旧值。
+            "min_duration": float(os.environ.get("INTERRUPT_MIN_DURATION", "0.6")),
+            "min_words": 0,
+            "resume_false_interruption": os.environ.get("RESUME_FALSE_INTERRUPTION", "1") == "1",
+            "false_interruption_timeout": float(os.environ.get("FALSE_INTERRUPTION_TIMEOUT", "1.0")),
+        },
+    }
+    if _turn_detection_mode:
+        # 唔设 key = 今日行为(EOT 模型 auto-select),唔整 None 别名分支。
+        turn_handling["turn_detection"] = _turn_detection_mode
     print(
-        "[agent] turn_handling: endpointing=dynamic(0.35/1.2) "
-        f"preemptive={'on' if os.environ.get('PREEMPTIVE_GENERATION', '1') == '1' else 'off'} "
-        f"preemptive_tts={'on' if os.environ.get('PREEMPTIVE_TTS', '0') == '1' else 'off'} "
-        f"interruption=min_{os.environ.get('INTERRUPT_MIN_DURATION', '0.6')}s+false_interruption_self_heal "
-        "turn_detection=default(本地 EOT v1-mini;Cantonese 未校准,阈值回退英文档)",
+        "[agent] turn_handling: "
+        f"endpointing=dynamic({turn_handling['endpointing']['min_delay']}/"
+        f"{turn_handling['endpointing']['max_delay']}) "
+        f"preemptive={'on' if turn_handling['preemptive_generation']['enabled'] else 'off'} "
+        f"preemptive_tts={'on' if turn_handling['preemptive_generation']['preemptive_tts'] else 'off'} "
+        f"interruption=min_{turn_handling['interruption']['min_duration']}s+false_interruption_self_heal "
+        f"turn_detection={_turn_detection_mode or 'default(本地 EOT v1-mini;Cantonese 未校准,阈值回退英文档)'}",
         flush=True,
     )
 
@@ -795,47 +854,7 @@ async def entrypoint(ctx):
         stt=stt_provider,
         llm=llm_provider,
         tts=tts_provider,
-        # 官方低延迟调参（docs.livekit.io/agents/logic/turns/tuning）：
-        # - dynamic endpointing：min 0.35s。低于 ~0.3s 会让轮次在慢速离线 ASR 返回前
-        #   提交 → 转写被丢（"transcript arrives after turn has been committed"）→ 不回话。
-        #   max 1.2s：客户停顿未到会被 max 截断结束（不无限等）。
-        # - preemptive_tts：在轮次确认前就开跑 LLM->TTS，代价是打断时浪费算力
-        # - interruption 保持自适应（无模型时自动回退 VAD），min_duration 收紧到 0.35s
-        turn_handling=TurnHandlingOptions(
-            endpointing={
-                "mode": "dynamic",
-                "min_delay": float(os.environ.get("ENDPOINT_MIN_DELAY", "0.35")),
-                "max_delay": float(os.environ.get("ENDPOINT_MAX_DELAY", "1.2")),
-            },
-            preemptive_generation={
-                # 官方源码证实(1.7.1 audio_recognition):FINAL_TRANSCRIPT 一到即触发
-                # 抢跑,LLM prefill 与端点判定窗口并行——唔使等 interim。默认开。
-                # 流程推进/收尾/语言切换轮由 on_user_turn_completed 落 chat_ctx 步骤
-                # 标记,触发框架快照不一致→作废旧抢跑重建,推进轮唔会错步。
-                "enabled": os.environ.get("PREEMPTIVE_GENERATION", "1") == "1",
-                # preemptive_tts 默认关:MiniMax 云 TTS 按字计费,误判轮次唔好白烧;
-                # dev 可 PREEMPTIVE_TTS=1 实验首声再提前。
-                "preemptive_tts": os.environ.get("PREEMPTIVE_TTS", "0") == "1",
-                "max_speech_duration": 10.0,
-                # 抢跑重试预算:每个 PREFLIGHT 事件 count+1(agent_activity.py:2392),
-                # 烧穿后 FINAL 到达只 cancel 不重建 → commit 从零生成、新请求还排在
-                # 被 cancel 的 prefill 后面(实测 +0.2-0.7s)。PREFLIGHT 已节流(稳定
-                # 前缀 ≥4 字增长才发),预算 8 保证长句 FINAL 那拍抢跑必存活。
-                # PREEMPTIVE_MAX_RETRIES 可回退。
-                "max_retries": int(os.environ.get("PREEMPTIVE_MAX_RETRIES", "8")),
-            },
-            interruption={
-                "enabled": interruption_enabled,
-                # 官方「误打断自愈」组合:低门槛(0.6s 真插话即可让位)+
-                # resume_false_interruption(打断后 1s 内无转写=噪声误打断,AI 从
-                # 暂停处自动续讲)。比旧 1.2s 高门槛硬扛更自然——高门槛连真插话
-                # 也压住,客户抢唔到话。INTERRUPT_MIN_DURATION 可回退旧值。
-                "min_duration": float(os.environ.get("INTERRUPT_MIN_DURATION", "0.6")),
-                "min_words": 0,
-                "resume_false_interruption": os.environ.get("RESUME_FALSE_INTERRUPTION", "1") == "1",
-                "false_interruption_timeout": float(os.environ.get("FALSE_INTERRUPTION_TIMEOUT", "1.0")),
-            },
-        ),
+        turn_handling=turn_handling,
         # 默认 ["filter_markdown","filter_emoji"] 会被整体替换，故带上内置两项；
         # 追加的自定义 transform 把 <expr/> 从进 TTS 的文本里剥掉（转录路径保留，框架发布 mood）。
         tts_text_transforms=["filter_markdown", "filter_emoji", _strip_expr_markup],
