@@ -832,8 +832,10 @@ async def entrypoint(ctx):
     # 背景 flow judge 防疊:記錄而家 judge 緊邊一步(-1=冇)。推進唔可以同時兩個 judge。
     _judge_inflight: dict = {"step": -1}
     # 沉默心跳:AI 講完話客戶耐冇出聲 → 主動確認「仲喺度嗎」並帶返當前步。
-    # count 會喺客戶真開口(on_user_turn_completed)時歸零。
-    _nudge_state: dict = {"count": 0, "timer": None}
+    # count 會喺客戶真開口(on_user_turn_completed)時歸零。last_user_ts/last_reply_ts
+    # 記錄「客戶最後開聲」與「AI 最後講完」時刻(秒),心跳只在兩者都足夠舊先開火
+    # ——唔會喺客戶啱講完、AI 答案未出、或者 AI 啱講完幾秒內就打斷。
+    _nudge_state: dict = {"count": 0, "timer": None, "last_user_ts": 0.0, "last_reply_ts": 0.0}
     from .plugins.emotion import EmotionState
 
     emotion_state = EmotionState()
@@ -1336,6 +1338,7 @@ async def entrypoint(ctx):
                 _set_preemptive_max_retries(int(_preemptive_env_opts["max_retries"]))
             # 客戶真開口 → 沉默心跳計數歸零(之後再沉默先重新計 2 次)。
             _nudge_state["count"] = 0
+            _nudge_state["last_user_ts"] = time.monotonic()
             _disarm_silence()
 
             # 抢跑×流程推进共存:框架喺 FINAL 到达时可能已按「旧步骤语境」抢跑生成
@@ -1529,7 +1532,8 @@ async def entrypoint(ctx):
     # (disposition=no_response,總靜音 ~3.5+3.5+12≈19s)。客戶出聲即撤錶歸零;
     # 收尾態/流程走完/暫停中唔追。SILENCE_NUDGE_MAX=0 關閉。
     nudge_max = int(os.environ.get("SILENCE_NUDGE_MAX", "2"))
-    nudge_delay = float(os.environ.get("SILENCE_NUDGE_SECONDS", "3.5"))
+    # 默认 8s:旧 3.5-4s 太激进,客戶停頓/諗嘢/答案生成中就跳心跳(實測反饋「一直心跳」)。
+    nudge_delay = float(os.environ.get("SILENCE_NUDGE_SECONDS", "8"))
     _nudge_state["farewell"] = False
 
     def _disarm_silence() -> None:
@@ -1553,6 +1557,16 @@ async def entrypoint(ctx):
                 return
             if closed.is_set() or agent.paused or flow_ctrl.closing or _nudge_state.get("farewell"):
                 return
+            # 時序護欄(2026-09-05 三会话实测「一直心跳」根因):心跳唔可以喺
+            # 「AI 啱講完」或「客戶啱講完而 AI 答案未出」嘅窗口內開火。
+            now = time.monotonic()
+            last_user = float(_nudge_state.get("last_user_ts") or 0.0)
+            last_reply = float(_nudge_state.get("last_reply_ts") or 0.0)
+            if now - last_reply < nudge_delay:
+                return  # AI 啱講完:俾客戶反應時間
+            if last_user > last_reply and now - last_user < nudge_delay * 2:
+                return  # 客戶最後一次開聲新過 AI 最後一次講完 → 答案仲喺路上,唔跳;
+                # 超 2×delay 仍無聲先允許心跳兜底(答案可能失敗/被取消)。
             name = str((object_card or {}).get("display_name") or "").strip()
             lang = language_state.lang if language_state.lang in ("zh", "cantonese", "en") else "zh"
             if _nudge_state["count"] >= nudge_max:
@@ -1575,14 +1589,16 @@ async def entrypoint(ctx):
         _nudge_state["timer"] = asyncio.create_task(_fire())
 
     def _on_agent_state(ev) -> None:
-        # AI 講完轉「聆聽」→ 起錶;講話/思考中 → 撤錶。
+        # AI 講完轉「聆聽」→ 記低 AI 最後講完時刻再起錶;講話/思考中 → 撤錶。
         if getattr(ev, "new_state", "") == "listening":
+            _nudge_state["last_reply_ts"] = time.monotonic()
             _arm_silence()
         else:
             _disarm_silence()
 
     def _on_user_state(ev) -> None:
         if getattr(ev, "new_state", "") == "speaking":
+            _nudge_state["last_user_ts"] = time.monotonic()
             _disarm_silence()
 
     if nudge_max > 0:
