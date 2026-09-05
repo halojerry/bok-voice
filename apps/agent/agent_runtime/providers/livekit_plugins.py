@@ -279,6 +279,31 @@ class MlxLlmLLM(_OpenAICompatBase):
             temperature=float(os.environ.get("LLM_TEMPERATURE", "0.35")),
             extra_body=extra_body,
         )
+        # BOK_LLM_MSG_DEBUG=1：逐请求消息指纹（sha1+长度+头尾片段），定位
+        # 「缓存锚点后即分叉」是哪条消息每轮在变（W0 诊断工具，默认关）。
+        if os.environ.get("BOK_LLM_MSG_DEBUG", "") == "1":
+            import hashlib as _hashlib
+
+            _client = self._client
+            _raw_create = _client.chat.completions.create
+
+            async def _create(**kw):
+                msgs = kw.get("messages") or []
+                tag = f"{id(kw):x}"[-6:]
+                for i, m in enumerate(msgs):
+                    c = m.get("content")
+                    text = c if isinstance(c, str) else "".join(
+                        x.get("text", "") for x in (c or []) if isinstance(x, dict)
+                    )
+                    fp = _hashlib.sha1(text.encode()).hexdigest()[:10]
+                    print(
+                        f"[llmmsg] req={tag} msg{i} role={m.get('role')} len={len(text)} "
+                        f"sha={fp} head={text[:36]!r} tail={text[-36:]!r}",
+                        flush=True,
+                    )
+                return await _raw_create(**kw)
+
+            _client.chat.completions.create = _create
 
     async def _prewarm_impl(self) -> None:
         # 真实 1-token 生成：暖 mlx 模型（冷启动的 KV 分配/首 token 占首包大头）。

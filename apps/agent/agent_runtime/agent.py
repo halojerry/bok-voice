@@ -424,11 +424,13 @@ def _build_prefix_prewarm_messages(context_state, instructions: str, greeting_te
     greeting_text 为空（paused/抓取失败）时退化为 [system, user] 形状（仍命中
     system 段）。
     """
-    from .providers.livekit_plugins import _join_system
-
     prefix = context_state.render_instruction_prefix()
     tail = context_state.render_context_tail()
-    system = _join_system(prefix, instructions or "", "")
+    # ⚠️ 必须复刻 to_provider_format 的序列化:wrapper 的 merged system 是
+    # [prefix, *base_parts] 列表,序列化按 "\n" 连接(实测逐字节 diff 定位,
+    # 旧 _join_system 用 "\n\n" 差一个换行 → 预热与 turn-1 在 system 尾分叉,
+    # cached=0 全量 prefill 白烧)。
+    system = "\n".join([prefix, instructions or ""]) if instructions else prefix
     user = f"你好。\n\n{tail}" if tail else "你好。"
     msgs: list[dict] = [{"role": "system", "content": system}]
     if greeting_text:
