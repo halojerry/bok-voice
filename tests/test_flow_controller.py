@@ -287,6 +287,21 @@ def test_detect_whatsapp_offered_ack():
     assert detect_whatsapp_signal("嗯,好呀", step_goal=WA_GOAL, step_ref=WA_REF) == ("offered", "")
 
 
+def test_detect_whatsapp_already_captured_no_more_offered():
+    from agent_runtime.flow import detect_whatsapp_signal
+    # 已捕获过号码后:純短應承/叫加係對當前步嘅確認,唔再判 offered
+    # (offered 會鎖死確認輪唔推進,4B 就把自己上一句原樣再講一次——
+    # 2026-09-06 call-e6e5f18e 逐字重複實證)。
+    assert detect_whatsapp_signal("嗯", step_goal=WA_GOAL, step_ref=WA_REF, already_captured=True) is None
+    assert detect_whatsapp_signal("好呀，你加我啦", step_goal=WA_GOAL, step_ref=WA_REF, already_captured=True) is None
+    assert detect_whatsapp_signal("可以", step_goal=WA_GOAL, step_ref=WA_REF, already_captured=True) is None
+    # 新號碼照捕(客戶可以改口俾另一個號)。
+    assert detect_whatsapp_signal(
+        "唔好意思，啱先報錯咗，我個WhatsApp係 9852 6633",
+        step_goal=WA_GOAL, step_ref=WA_REF, already_captured=True,
+    ) == ("captured", "98526633")
+
+
 def test_detect_whatsapp_not_triggered():
     from agent_runtime.flow import detect_whatsapp_signal
     # 冇 WhatsApp / 提其他話題 / 問點加 → 唔觸發。

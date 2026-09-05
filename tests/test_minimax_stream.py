@@ -359,3 +359,69 @@ def test_minimax_overlap_flushes_cjk_fragment(monkeypatch):
     cont = [m for m in sent if m.get("event") == "task_continue"]
     assert cont, "CJK 片段应喺 end_input 前由 overlap 提前 task_continue"
     assert cont[0]["text"] == "今日天氣好好，我哋去飲茶啦"
+
+
+def test_minimax_stall_watchdog_times_from_first_text_and_resends(monkeypatch):
+    """看门狗二修(2026-09-06):计时起点=【首段文本发出】而非 task_started,
+    超时断开重连后按序重发已发文本(积压不丢)。
+
+    - 慢 LLM 轮(文本未发出)不再误触发——无 task_continue 就无计时起点;
+    - 云端收了文本却不吐音频 → 阈值到点重连,新连接收到同样的 task_continue。
+    """
+    import json
+
+    from agent_runtime.providers.livekit_plugins import _MiniMaxSynthesizeStream
+
+    monkeypatch.setenv("MINIMAX_FIRST_AUDIO_TIMEOUT_S", "1")
+    monkeypatch.setenv("MINIMAX_WS_POOL", "0")
+
+    instances: list["FakeWS"] = []
+
+    class FakeWS:
+        def __init__(self):
+            self.log: list[dict] = []
+            self._recv_step = 0
+            instances.append(self)
+
+        async def recv(self):
+            self._recv_step += 1
+            if self._recv_step == 1:
+                return json.dumps({"event": "connected_success"})
+            if self._recv_step == 2:
+                return json.dumps({"event": "task_started"})
+            await asyncio.Event().wait()  # 卡死:握手后永不吐音频,等 cancel
+
+        async def send(self, payload):
+            self.log.append(json.loads(payload))
+
+        async def close(self):
+            pass
+
+    async def fake_connect(*a, **kw):
+        return FakeWS()
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    tts = _make_tts()
+
+    async def run():
+        from livekit.agents import APIConnectOptions
+
+        s = _MiniMaxSynthesizeStream(tts, APIConnectOptions())
+        await asyncio.sleep(0.3)  # 先让首连接握手完成(计时起点仍=0,唔该触发)
+        s.push_text("你好，我係林先生。想問下包裹幾時到？")
+        s.end_input()
+        # 等看门狗重连(阈值 1s + 轮询 0.5s)且新连接收到重发
+        for _ in range(120):
+            if len(instances) >= 2 and [m for m in instances[1].log if m.get("event") == "task_continue"]:
+                break
+            await asyncio.sleep(0.05)
+        s._task.cancel()
+
+    asyncio.run(asyncio.wait_for(run(), timeout=15))
+
+    assert len(instances) >= 2, "看门狗应已重连(新连接)"
+    first_texts = [m["text"] for m in instances[0].log if m.get("event") == "task_continue"]
+    resent_texts = [m["text"] for m in instances[1].log if m.get("event") == "task_continue"]
+    assert first_texts, "首连接应已发出 task_continue(计时起点由此起算)"
+    assert resent_texts == first_texts, f"重连后应按序重发已发文本: {resent_texts} != {first_texts}"

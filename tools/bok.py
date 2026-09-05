@@ -595,9 +595,32 @@ def _control_plane_env(db: Path | str) -> dict[str, str]:
     return _bake_ssl_cert_file(env, repo_python())
 
 
+def _apply_mlx_template_fix(llm_py: Path) -> None:
+    """mlx_lm 模板生成提示边界归一(幂等,scripts/mlx_lm_template_leak_fix.py)。
+
+    模板 endfor 后注释块泄漏换行 → 生成/历史模式边界 token 不一致 → 上一轮
+    请求永远不是下一轮缓存前缀,命中坍缩回 system 锚点(2026-09-06 token 级
+    探针实证 25→48/78)。runtime site-packages 不入 git,重建后由这里重打;
+    失败零阻塞(损失跨轮命中而已)。"""
+    script = ROOT / "scripts" / "mlx_lm_template_leak_fix.py"
+    if not script.exists():
+        return
+    try:
+        subprocess.run(
+            [str(llm_py), str(script)],
+            check=False, capture_output=True, timeout=60,
+        )
+    except Exception as exc:  # noqa: BLE001 - 补丁失败零阻塞
+        print(f"[bok] mlx template fix skipped: {exc!r}", file=sys.stderr)
+
+
 def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
     if healthy(1235):
         return
+    llm_model = model_path({**current, "llm": resolve_llm_repo(current)}, "llm")
+    if is_mac():
+        llm_py = sidecar_python("llm-mlx")
+        _apply_mlx_template_fix(llm_py)
     llm_model = model_path({**current, "llm": resolve_llm_repo(current)}, "llm")
     if is_mac():
         llm_py = sidecar_python("llm-mlx")
@@ -657,6 +680,7 @@ def _start_mt_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> bool
         print(f"[bok] mt model not present, skip :1236 ({mt_model or 'unset'})", file=sys.stderr)
         return False
     llm_py = sidecar_python("llm-mlx")
+    _apply_mlx_template_fix(llm_py)
     # 逐句无状态 MT:请求前缀只有模板头一条,32 槽 prompt cache 足够;Hy-MT2
     # 自带非思考对话模板,不传 --chat-template-args(主 LLM 的关思考参数不通用)。
     _start_proc(
