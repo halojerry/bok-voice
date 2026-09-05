@@ -114,3 +114,19 @@ def test_prefix_prewarm_enabled_default_and_env_off(monkeypatch):
     assert _prefix_prewarm_enabled() is False
     monkeypatch.setenv("LLM_PREFIX_PREWARM", "1")
     assert _prefix_prewarm_enabled() is True
+
+
+def test_prefix_prewarm_turn1_shape_with_greeting():
+    """W0-2：greeting_text 提供时，预热形状=[system, assistant(开场白), user]
+    ——与真实 turn-1 请求同构（旧 v1 把 instructions 拼进 system 致分叉 cached=0）。"""
+    ctx = ContextState(account_id="acc-test")
+    ctx.set_user_language("cantonese")
+    ctx.set_flow("总览A", "当前步B")
+    msgs = _build_prefix_prewarm_messages(ctx, "你是小美。", "你好，请讲下你个单号。")
+    assert [m["role"] for m in msgs] == ["system", "assistant", "user"]
+    assert msgs[1]["content"] == "你好，请讲下你个单号。"
+    assert "你是小美" in msgs[0]["content"]
+    assert "【现在这一步】" in msgs[2]["content"]
+    # instructions(=人设 base)照旧喺 system[0]；greeting 生成期那条独立尾 system
+    # 唔会出现在 turn-1,故 assistant 轮就是开场白原文而非任何指令。
+    assert "【用户语言】" in msgs[0]["content"]

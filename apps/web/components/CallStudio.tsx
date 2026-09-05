@@ -419,10 +419,17 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
   };
   const [stateCallId, setStateCallId] = useState(callId);
   const callIdRef = useRef(callId);
+  // hydrate（打开历史通话）写入的 objId/personaId 唔算「用户选择」——唔入「上次选择」账，
+  // 否则看过一眼旧通话就会污染之后新建通话的默认档案（2026-09-05 审查 P2）。
+  const suppressPersist = useRef(0);
+  const objIdRef = useRef("");
+  const personaIdRef = useRef("");
   const [objects, setObjects] = useState<Record<string, unknown>[]>([]);
   const [personas, setPersonas] = useState<Record<string, unknown>[]>([]);
   const [objId, setObjId] = useState("");
   const [personaId, setPersonaId] = useState("");
+  objIdRef.current = objId;
+  personaIdRef.current = personaId;
   const [object, setObject] = useState<Record<string, unknown> | null>(null);
   const [persona, setPersona] = useState<Record<string, unknown> | null>(null);
   const [mode, setMode] = useState<"simulation" | "live">("simulation");
@@ -530,6 +537,9 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
   useEffect(() => {
     if (loadAttemptRef.current === cp.attempt) return;
     loadAttemptRef.current = cp.attempt;
+    // 工作台模式（callId 非空）：档案由 hydrate 从服务端解析,列表默认选择唔跑——
+    // 两者异步竞态会把历史通话档案覆写成「列表首个/上次」。
+    if (callId) return;
     let cancelled = false;
     Promise.all([api.listObjects(ACCOUNT), api.listPersonas()])
       .then(([objs, pers]) => {
@@ -571,6 +581,8 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
     api
       .getCall(callId)
       .then((c) => {
+        if (c.object_id && String(c.object_id) !== objIdRef.current) suppressPersist.current += 1;
+        if (c.persona_id && String(c.persona_id) !== personaIdRef.current) suppressPersist.current += 1;
         if (c.object_id) setObjId(String(c.object_id));
         if (c.persona_id) setPersonaId(String(c.persona_id));
         if (c.mode) setMode(c.mode as "simulation" | "live");
@@ -592,11 +604,21 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
 
   // 记住每次选择：新建通话/挂断後还原到上次用的人设与对象。
   useEffect(() => {
-    if (objId) lsSet(lastKey("object"), objId);
+    if (!objId) return;
+    if (suppressPersist.current > 0) {
+      suppressPersist.current -= 1;
+      return;
+    }
+    lsSet(lastKey("object"), objId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [objId]);
   useEffect(() => {
-    if (personaId) lsSet(lastKey("persona"), personaId);
+    if (!personaId) return;
+    if (suppressPersist.current > 0) {
+      suppressPersist.current -= 1;
+      return;
+    }
+    lsSet(lastKey("persona"), personaId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [personaId]);
 

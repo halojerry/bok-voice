@@ -35,3 +35,19 @@ def test_farewell_three_languages():
     assert "稍后再联系" in zh and "再见" in zh
     en = _silence_farewell_instruction("Mr. Chan", "en")
     assert "goodbye" in en.lower()
+
+
+def test_nudge_should_fire_guard_windows():
+    from agent_runtime.agent import _nudge_should_fire
+
+    d = 8.0
+    # 全新会话(无任何时间戳)→ 允许(等 greeting 播完的 listening 已 arm)
+    assert _nudge_should_fire(100.0, 0.0, 0.0, d)
+    # AI 啱講完 < delay → 唔跳(俾客戶反應)
+    assert not _nudge_should_fire(100.0, 97.0, 90.0, d)
+    # AI 講完夠耐、客戶久未開聲 → 跳
+    assert _nudge_should_fire(100.0, 90.0, 50.0, d)
+    # 客戶啱講完而答案未出(用戶新過回覆,<2×delay)→ 唔跳(唔好頂替真答案)
+    assert not _nudge_should_fire(100.0, 90.0, 96.0, d)
+    # 同上但超 2×delay 仍無聲 → 兜底跳(答案可能失敗)
+    assert _nudge_should_fire(100.0, 90.0, 73.0, d)
