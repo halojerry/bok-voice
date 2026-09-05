@@ -322,9 +322,15 @@ def _resolve_tts_voice_mode(tts_cfg: dict) -> str:
 
 
 # MiniMax 空 voice map 兜底音色（设置页 speaker 三键全空/全被本地过滤时）：
-# B 线 interpret.py 同源的验证过粤语主播音色。音色 ID 是不透明标识符
-#（MiniMax 云端枚举，术语门禁白名单范畴），唔属语言字段。
-_MINIMAX_DEFAULT_VOICE = "Cantonese_crisp_news_anchor_vv2"
+# 按通话语言给各自语言的地道音色（fixed-language 整通一语言 → 一通一个默认音色）；
+# 此前 zh/en 也填粤语主播，普通话语料被粤语腔念(广普),用户判为"说粤语"。三个 id
+# 均经 /api/tts/preview 实测 200。音色 ID 是不透明标识符(MiniMax 云端枚举,术语门禁
+# 白名单范畴),唔属语言字段。
+_MINIMAX_DEFAULT_VOICES: dict[str, str] = {
+    "zh": "Chinese_wenrounvxing",
+    "cantonese": "Cantonese_crisp_news_anchor_vv2",
+    "en": "English_magnetic_voiced_man",
+}
 
 
 def _preemptive_generation_opts() -> dict:
@@ -488,20 +494,26 @@ def _assemble_minimax_voice_map(*, persona: dict | None, tts_cfg: dict, greet_la
       按 language_state.lang 换声（设置页/人设三键异值才真正分声）。
       注意 A 线新政策：language_state 整通钉死在通话语言 → 分键 map 实际恒解析
       同一把声（等效 single）；三键 map 只剩 B 线/未来逐轮语言场景还有意义。
-    - 任何模式下组装结果为空（speaker 全空/全被本地过滤）都填 _MINIMAX_DEFAULT_VOICE：
-      zh+cantonese 同值双键，_resolve_voice 对缺键回落 zh，任何语言态都解析得到
-      ——MINIMAX_TTS_NO_VOICE（beep）不能再发生。
+    - 任何模式下组装结果为空（speaker 全空/全被本地过滤）都填各语言地道默认音色
+      （_MINIMAX_DEFAULT_VOICES）——zh 普通话轮用普通话音色，唔再被粤语主播念广普；
+      _resolve_voice 对缺键回落 zh，任何语言态都解析得到——MINIMAX_TTS_NO_VOICE
+      （beep）不能再发生。
     """
     persona_voice = (persona or {}).get("reference_audio") or ""
+    persona_lang = _normalize_lang((persona or {}).get("language") or "") or greet_lang or "zh"
     raw_map = _parse_voice_map(persona_voice) if persona_voice else _build_default_voice_map(tts_cfg)
     if voice_mode != "per_language":
-        persona_lang = (persona or {}).get("language") or ""
-        anchor_lang = _normalize_lang(persona_lang) or greet_lang or "zh"
-        raw_map = _collapse_voice_map(raw_map, anchor_lang)
+        raw_map = _collapse_voice_map(raw_map, persona_lang)
     voice_map = _filter_cloud_voice_map(raw_map)
     if not voice_map:
-        voice_map = {"zh": _MINIMAX_DEFAULT_VOICE, "cantonese": _MINIMAX_DEFAULT_VOICE}
-        print(f"[agent] minimax default voice={_MINIMAX_DEFAULT_VOICE}", flush=True)
+        # 无任何配置(或全被本地过滤):按语言给各自语言地道默认音色——single 整通
+        # 只取 anchor_lang 一把声;per_language 三键全给(普通话轮再唔会拿到粤语主播
+        # 念广普)。三个默认 id 均经 /api/tts/preview 实测 200。
+        if voice_mode == "per_language":
+            voice_map = dict(_MINIMAX_DEFAULT_VOICES)
+        else:
+            voice_map = {"zh": _MINIMAX_DEFAULT_VOICES.get(persona_lang) or _MINIMAX_DEFAULT_VOICES["zh"]}
+        print(f"[agent] minimax default voices={sorted(voice_map)} anchor_lang={persona_lang}", flush=True)
     return voice_map
 
 

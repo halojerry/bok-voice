@@ -110,9 +110,9 @@ export const SETTING_CARDS: ProviderMeta[] = [
       { key: "speaker", label: "AI 默认音色（整场同声）", type: "text", preview: true, hint: "客户讲粤语/普通话/英文都用它发声（人设若单独绑定则以人设优先）。MiniMax 可直接粘贴音色 ID（推荐粤语播报音色，可到人设页列表挑）；Qwen3 填本地音色如 vivian。留空则用下方分语言音色或系统默认。", placeholder: "如 Cantonese_crisp_news_anchor_vv2" },
       { key: "instruct", label: "语气指令（可选）", type: "text", hint: "附加到每次合成的情绪指令之前。", placeholder: "如：温和、耐心" },
       { key: "sample_rate", label: "采样率", type: "number", hint: "输出 PCM 采样率，通常保持 24000。", min: 8000, max: 48000, step: 1000 },
-      { key: "speaker_zh", label: "普通话音色", type: "text", preview: true, advanced: true, hint: "「按语言分音色」模式的普通话音色；「整场同声」模式下仅当默认音色留空时回落。", placeholder: "如 zhiyan_meet_feminine" },
+      { key: "speaker_zh", label: "普通话音色", type: "text", preview: true, advanced: true, hint: "「按语言分音色」模式的普通话音色；「整场同声」模式下仅当默认音色留空时回落。留空时普通话通话默认 Chinese_wenrounvxing。", placeholder: "如 Chinese_wenrounvxing" },
       { key: "speaker_cantonese", label: "粤语音色", type: "select", preview: true, advanced: true, hint: "「按语言分音色」模式的粤语音色；「整场同声」模式下仅当默认音色留空时回落。", options: [{ value: "", label: "（不单独设，跟随默认音色）" }, ...minimaxVoiceOptionsFor("cantonese")] },
-      { key: "speaker_en", label: "英语音色", type: "text", preview: true, advanced: true, hint: "「按语言分音色」模式的英语音色；「整场同声」模式下仅当默认音色留空时回落。", placeholder: "如 male_english_speaker" },
+      { key: "speaker_en", label: "英语音色", type: "text", preview: true, advanced: true, hint: "「按语言分音色」模式的英语音色；「整场同声」模式下仅当默认音色留空时回落。留空时英语通话默认 English_magnetic_voiced_man。", placeholder: "如 English_magnetic_voiced_man" },
     ],
   },
   {
