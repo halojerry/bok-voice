@@ -1935,26 +1935,47 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
 
             recv_task = asyncio.create_task(_recv_loop())
 
-            # ---- 卡死自愈（W0.5，2026-09-06）：MiniMax 偶发 task_started 后长时
-            # 无首包（实测 >8s，期间心跳顶替=「每问无答」体感）。看门狗超时未出
-            # 首包 → 断开旧 ws、重开一条并重发已发文本，一次性自愈；已出首包则
-            # 不干预。MINIMAX_FIRST_AUDIO_TIMEOUT_S 可调（默认6）。
-            stall_timeout = float(os.environ.get("MINIMAX_FIRST_AUDIO_TIMEOUT_S", "6"))
+            # ---- 卡死自愈（W0.5，2026-09-06；同日二修计时起点）：MiniMax 偶发
+            # task_started 后长时无首包（实测 >8s，期间心跳顶替=「每问无答」体感）。
+            # 看门狗从【首段文本发出】起计时——旧版从 task_started 起算,慢 LLM 轮
+            # (冷启 TTFT 2.1-3.4s+凑句 0.3-0.9s)会在云侧无故障时误触发,还对空
+            # sent_all 白重连。未出首包 → 断开旧 ws、重开一条并重发已发文本,
+            # 一次性自愈;已出首包则不干预。暖首包实测 0.25-0.5s,4s 阈值余量 >8x。
+            # MINIMAX_FIRST_AUDIO_TIMEOUT_S 可调（默认4,旧6）。
+            stall_timeout = float(os.environ.get("MINIMAX_FIRST_AUDIO_TIMEOUT_S", "4"))
             stalled = False
             sent_all: list[str] = []
             closed_ws = asyncio.Event()
+            # 重连窗口发送闸:_stall_watch 换连接期间,输入循环若继续 task_continue
+            # 会发到已闭旧 ws(或未 task_started 的新 ws)→ MINIMAX_TTS_WS_ERR 整轮
+            # 音频丢失。所有发送点在闸亮时等它清——注意必须先 is_set() 再 wait()
+            # (Event.wait() 对未 set 的事件会挂起等 set,无条件 await 会把正常轮
+            # 的首句卡到重连后,实测首包 +1.2s)。闸亮时间=重连 ~0.2-0.65s,文本
+            # 排队不丢不乱序;闸清后积压重发完,新句子按序跟进。
+            _reconnecting = asyncio.Event()
+            t_first_text = 0.0
+
+            def _note_first_send() -> None:
+                nonlocal t_first_text
+                if t_first_text == 0.0:
+                    t_first_text = time.monotonic()
 
             async def _stall_watch() -> None:
-                nonlocal ws, stalled, recv_task, init_done, first_pushed, t_task, t_start
+                nonlocal ws, stalled, recv_task, init_done, first_pushed, t_task, t_start, t_first_text
                 while not first_pushed:
                     await asyncio.sleep(0.5)
-                    if closed_ws.is_set() or time.monotonic() - t_task <= stall_timeout:
+                    if (
+                        closed_ws.is_set()
+                        or t_first_text == 0.0
+                        or time.monotonic() - t_first_text <= stall_timeout
+                    ):
                         continue
                     print(
-                        f"MINIMAX_TTS_STALL no_first_audio_{stall_timeout:.0f}s -> reconnect_retry",
+                        f"MINIMAX_TTS_STALL no_first_audio_{stall_timeout:.0f}s_after_first_text -> reconnect_retry",
                         flush=True,
                     )
                     stalled = True
+                    _reconnecting.set()
                     try:
                         await _minimax_ws_silent_close(ws)
                     except Exception:  # pragma: no cover
@@ -1973,6 +1994,8 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                     first_pushed = False
                     for s in sent_all:
                         await ws.send(json.dumps({"event": "task_continue", "text": s}))
+                    t_first_text = time.monotonic()
+                    _reconnecting.clear()
                     recv_task = asyncio.create_task(_recv_loop())
                     return
 
@@ -2024,6 +2047,9 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                     # 若前面已出过正常音频,课程句静默丢弃,唔追加罐头(避免二重声)。
                     self._lecture_fired = True
                     if not sent_any:
+                        _note_first_send()
+                        if _reconnecting.is_set():
+                            await _reconnecting.wait()
                         await ws.send(
                             json.dumps({"event": "task_continue", "text": lecture_canned(self._tts_._speech_lang())})
                         )
@@ -2031,6 +2057,9 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                     return
                 if is_lecture_text(s):
                     return  # 已触发过,课程延续句照丢
+                _note_first_send()
+                if _reconnecting.is_set():
+                    await _reconnecting.wait()
                 await ws.send(json.dumps({"event": "task_continue", "text": s}))
                 sent_all.append(s)
                 sent_any = True
@@ -2079,13 +2108,21 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                 if not self._lecture_fired and is_lecture_text(sent_buf.strip()):
                     self._lecture_fired = True
                     if not sent_any:
+                        _note_first_send()
+                        if _reconnecting.is_set():
+                            await _reconnecting.wait()
                         await ws.send(
                             json.dumps({"event": "task_continue", "text": lecture_canned(self._tts_._speech_lang())})
                         )
                 elif not self._lecture_fired:
+                    _note_first_send()
+                    if _reconnecting.is_set():
+                        await _reconnecting.wait()
                     await ws.send(json.dumps({"event": "task_continue", "text": _inject_pauses(sent_buf.strip())}))
             # 文本结束:发 task_finish 让服务端吐完剩余音频并回 is_final
             try:
+                if _reconnecting.is_set():
+                    await _reconnecting.wait()
                 await ws.send(json.dumps({"event": "task_finish"}))
             except Exception:
                 pass
