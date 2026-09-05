@@ -3463,7 +3463,10 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
 
     async def _maybe_partial(self) -> None:
         now = time.monotonic()
-        if not self._session_id or now - self._last_post < _ASR_PARTIAL_POST_MS:
+        # _ASR_PARTIAL_POST_MS 名义毫秒;monotonic() 是秒——不除 1000 会把
+        # 节流当成 300 秒,首调还依赖系统运行时长>300s(CI 新 runner 恒早退,
+        # preflight 单测空事件 flake 的根因)。除后=真正的 ≥300ms 节流。
+        if not self._session_id or now - self._last_post < _ASR_PARTIAL_POST_MS / 1000.0:
             return
         if len(self._pending) < 16000 * 2 * 0.6:  # <0.6s 无转写价值
             return
