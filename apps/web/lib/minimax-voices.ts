@@ -35,6 +35,9 @@ const CANTONESE: Array<[string, string]> = [
 ];
 
 const ZH: Array<[string, string]> = [
+  // 用户 2026-09-05 补充(已逐个试听 200)
+  ["Chinese_wenrounvxing", "温柔女声"],
+  ["Chinese_casual_guide_nv1", "休闲导游女声1"],
   ["male-qn-qingse", "青涩青年男声"],
   ["male-qn-jingying", "精英青年男声"],
   ["female-shaonv", "少女音"],
@@ -43,8 +46,14 @@ const ZH: Array<[string, string]> = [
 ];
 
 const EN: Array<[string, string]> = [
-  ["male_english_speaker", "英文男声"],
-  ["female_english_speaker", "英文女声"],
+  // 用户 2026-09-05 补充(已逐个试听 200);旧的 male/female_english_speaker
+  // 实测 2054 voice-id-not-exist,已移除。
+  ["English_magnetic_voiced_man", "磁性男声"],
+  ["English_GentleTeacher", "温柔老师"],
+  ["socialmedia_female_2_v1", "社媒女声2 v1"],
+  ["English_StressedLady", "压力女士"],
+  ["English_AnimeCharacter", "动漫角色"],
+  ["English_UpsetGirl", "生气女孩"],
 ];
 
 export const MINIMAX_VOICE_ENTRIES: MinimaxVoiceEntry[] = [
@@ -81,6 +90,6 @@ export function allMinimaxVoiceOptions() {
 export function previewLangForVoice(voice: string): MinimaxVoiceLang {
   const v = String(voice || "");
   if (/^Cantonese_/i.test(v)) return "cantonese";
-  if (/^male_english_speaker|^female_english_speaker|_english_/i.test(v)) return "en";
+  if (/^(English_|socialmedia_)/i.test(v)) return "en";
   return "zh";
 }
