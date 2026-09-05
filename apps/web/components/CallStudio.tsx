@@ -400,6 +400,23 @@ function str(v: unknown, fallback = "-") {
 
 export function CallStudio({ callId = "" }: { callId?: string }) {
   const { accountId: ACCOUNT } = useAccount();
+  // 记住本账号上一次使用的人设/对象：新建通话默认恢复它(而非恒取列表第一个),
+  // 挂断后切新人设/对象 → 接通即用新选择,唔会悄悄回到上个对话的档案。
+  const lastKey = (kind: "persona" | "object") => `bok.call.${kind}.${ACCOUNT}`;
+  const lsGet = (k: string): string => {
+    try {
+      return typeof window !== "undefined" ? window.localStorage.getItem(k) ?? "" : "";
+    } catch {
+      return "";
+    }
+  };
+  const lsSet = (k: string, v: string) => {
+    try {
+      window.localStorage.setItem(k, v);
+    } catch {
+      /* ignore */
+    }
+  };
   const [stateCallId, setStateCallId] = useState(callId);
   const callIdRef = useRef(callId);
   const [objects, setObjects] = useState<Record<string, unknown>[]>([]);
@@ -519,8 +536,17 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
         if (cancelled) return;
         if (Array.isArray(objs)) setObjects(objs);
         if (Array.isArray(pers)) setPersonas(pers);
-        if (objs?.length) setObjId(String(objs[0].id));
-        if (pers?.length) setPersonaId(String(pers[0].id));
+        // 默认选「上次用的人设/对象」(存在且在列表内);否则取第一个。
+        const lastObj = lsGet(lastKey("object"));
+        const lastPers = lsGet(lastKey("persona"));
+        if (objs?.length) {
+          const picked = objs.find((o) => String(o.id) === lastObj) ? lastObj : String(objs[0].id);
+          setObjId(picked);
+        }
+        if (pers?.length) {
+          const picked = pers.find((p) => String(p.id) === lastPers) ? lastPers : String(pers[0].id);
+          setPersonaId(picked);
+        }
         setError(null);
       })
       .catch((e) => {
@@ -562,6 +588,16 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
   useEffect(() => {
     if (!personaId) return;
     api.getPersona(personaId).then(setPersona).catch(() => {});
+  }, [personaId]);
+
+  // 记住每次选择：新建通话/挂断後还原到上次用的人设与对象。
+  useEffect(() => {
+    if (objId) lsSet(lastKey("object"), objId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [objId]);
+  useEffect(() => {
+    if (personaId) lsSet(lastKey("persona"), personaId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [personaId]);
 
   // Load settlement only for an existing call view (e.g. /calls/[id]).
@@ -759,9 +795,17 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
           <div className="flex flex-col items-end gap-2">
             <div className="flex gap-2">
               {!roomConnected ? (
-                <button className="btn-primary" onClick={connect} disabled={connecting || (!stateCallId && !objId)}>
-                  {connecting ? "接通中…" : error ? "重试接通" : isJoiningExisting ? "接通 / 进房" : "接通"}
-                </button>
+                <div className="flex flex-col items-end gap-1">
+                  {!stateCallId && objId && (
+                    <p className="text-[10px] text-[var(--muted)]">
+                      接通后：{str(objects.find((o) => String(o.id) === objId)?.display_name)}{" "}
+                      · {str(personas.find((p) => String(p.id) === personaId)?.name ?? "默认人设")}
+                    </p>
+                  )}
+                  <button className="btn-primary" onClick={connect} disabled={connecting || (!stateCallId && !objId)}>
+                    {connecting ? "接通中…" : error ? "重试接通" : isJoiningExisting ? "接通 / 进房" : "接通"}
+                  </button>
+                </div>
               ) : (
                 <button className="btn-ghost" onClick={leave}>
                   挂断
