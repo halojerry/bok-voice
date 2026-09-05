@@ -190,13 +190,12 @@ _LANG_LABELS = {"zh": "普通话/中文", "cantonese": "粤语", "en": "英语"}
 
 
 def _sticky_reply_language(anchor: str, asr_lang: str, cur_sticky: str, cur_streak: int, threshold: int = 2) -> tuple[str, str, int]:
-    """粤语客服「始终讲粤语」的语言锚定规则。
+    """[已废弃——A 线不再调用] 旧「语言锚定+滞回跟随」纯函数，仅为兼容保留。
 
-    - anchor：客服锚定语言（人设/对象语言，如 cantonese）。LLM 默认始终用它回复。
-    - 只有 ASR 连续 threshold 轮判为同一【非锚】语言（且都是强证据才进得来）才跟随切换；
-    - 一旦某轮回到锚语言，立刻回锚、清计数；
-    - 已切走后客户又讲第三种语言，也回锚（粤语客服优先讲粤语，不跨语言乱跳）。
-    返回 (reply_lang, new_sticky, new_streak)。
+    A 线新政策：每通对话语言固定（`_call_language`），会话装配时一次性钉死
+    ASR/LLM/TTS 三方语言变量，中途不切换——本函数与逐轮语言切换机制一并退役
+    （B 线同传本就按目标语钉死，从未用它）。定义暂留防外部引用断裂；
+    语义测试已从 test_agent_language_follow.py 撤下，勿再新增调用点。
     """
     if anchor not in {"zh", "cantonese", "en"}:
         # 无有效锚定（未知/缺失）：直接跟随 ASR，退化为旧行为。
@@ -466,9 +465,9 @@ def _assemble_minimax_voice_map(*, persona: dict | None, tts_cfg: dict, greet_la
     - single（默认）：整场同声——collapse 成单一主音色放 zh 键（今日行为，
       人设主语言 → greet_lang → zh 取主音色）。
     - per_language：保留 {zh,cantonese,en} 分语言键，MiniMaxTTS._resolve_voice
-      按滞回后的 language_state.lang 逐轮换声（设置页/人设三键异值才真正分声；
-      全局 speaker 单音色只组 zh 键，等效 single）。切换源是滞回平滑后的
-      sticky 语言，不吃 ASR 单轮误判，不会逐轮跳音色。
+      按 language_state.lang 换声（设置页/人设三键异值才真正分声）。
+      注意 A 线新政策：language_state 整通钉死在通话语言 → 分键 map 实际恒解析
+      同一把声（等效 single）；三键 map 只剩 B 线/未来逐轮语言场景还有意义。
     - 任何模式下组装结果为空（speaker 全空/全被本地过滤）都填 _MINIMAX_DEFAULT_VOICE：
       zh+cantonese 同值双键，_resolve_voice 对缺键回落 zh，任何语言态都解析得到
       ——MINIMAX_TTS_NO_VOICE（beep）不能再发生。
@@ -487,12 +486,13 @@ def _assemble_minimax_voice_map(*, persona: dict | None, tts_cfg: dict, greet_la
 
 
 def _resolve_asr_language_mode(asr_cfg: dict) -> tuple[str, str]:
-    """读 asr.language_mode/language（缺键=auto，今日锚定+滞回行为零变化）。
+    """读 asr.language_mode/language（缺键=auto）。
 
-    - auto：ASR hint 跟随滞回后的 language_state（cantonese/en 钉、zh auto）。
-    - fixed：整场钉死 asr.language（cantonese/zh/en）；未配语言或值不合法 →
-      安全回落 auto（绝不哑火）。
-    返回 (mode, fixed_lang)，auto 时 fixed_lang 为空串。
+    - auto：设置页没显式钉语言。A 线新语义：auto =「钉到本通对话语言」
+      （`_call_asr_pin_language` 回落 greet_lang）——滞回跟随机制已在 A 线退役。
+    - fixed：显式钉 asr.language（cantonese/zh/en）整场；未配语言或值不合法 →
+      回落 auto（=钉到本通语言，绝不哑火）。
+    返回 (mode, fixed_lang)，auto 时 fixed_lang 为空串。B 线不受影响。
     """
     mode = str(asr_cfg.get("language_mode") or "auto").strip().lower()
     if mode != "fixed":
@@ -501,6 +501,59 @@ def _resolve_asr_language_mode(asr_cfg: dict) -> tuple[str, str]:
     if not fixed_lang:
         return "auto", ""
     return "fixed", fixed_lang
+
+
+def _call_language(persona: dict | None, object_card: dict | None) -> str:
+    """每通对话的固定语言（A 线新政策，取代逐轮语言跟随）。
+
+    会话装配时一次定死、整通不切：人设(AI)语言优先（用户选了普通话/粤语/英文，
+    就是期望 AI 全程用它说话），未设置回落对象(客户)语言，再退回普通话。
+    同一解析即旧 greet_lang 逻辑；提为函数供 ASR/LLM/TTS 三方共用同一决定。
+    """
+    return (
+        _normalize_lang((persona or {}).get("language"))
+        or _normalize_lang((object_card or {}).get("language"))
+        or "zh"
+    )
+
+
+def _call_asr_pin_language(asr_cfg: dict, call_lang: str) -> str:
+    """A 线 ASR 钉定语言：设置 fixed+显式语言优先，否则钉到本通对话语言。
+
+    asr.language_mode=fixed + asr.language 有合法值 → 用显式值（部署级覆盖）；
+    其余一切情况（含 mode=auto/缺键/值不合法）→ 通话语言。A 线恒走
+    PinnedLanguageState + pin_language=True（zh 也整场下发 Chinese hint，
+    与 B 线同传同姿势）；返回值永不为空。
+    """
+    _mode, explicit = _resolve_asr_language_mode(asr_cfg)
+    return explicit or call_lang or "zh"
+
+
+# MiniMax language_boost 枚举（MiniMax API 外部字面量，术语门禁白名单范畴；
+# 与 B 线 interpret.py boost_map 同源同值）。
+_MINIMAX_BOOST_BY_LANG = {"zh": "Chinese", "cantonese": "Chinese,Yue", "en": "English"}
+
+
+def _language_boost_for(call_lang: str) -> str:
+    """通话语言 → MiniMax language_boost 枚举；未知语言返回空串（不下发）。"""
+    return _MINIMAX_BOOST_BY_LANG.get((call_lang or "").strip().lower(), "")
+
+
+def _apply_minimax_language_boost(call_lang: str) -> str:
+    """MiniMaxTTS 只从 env 读 boost（`_language_boost()` per-request 透传），
+    构造函数无 boost 参数——A 线在构造 provider 前把本通语言写入进程 env。
+
+    部署覆盖优先：env 里已有 MINIMAX_LANGUAGE_BOOST（部署显式预设，含空串=
+    有意禁用 boost）→ 本函数不动它，按通话语言注入仅在 env 缺失时发生。
+    局限：同一 worker 进程跑多个 job 时，首个 job 写入的值会留存（后续 job
+    视为「已预设」不再重设）——livekit 默认 job_process 隔离=每 job 一进程，
+    此场景不出现；注释留档。返回生效值（仅日志用）。
+    """
+    if "MINIMAX_LANGUAGE_BOOST" not in os.environ:
+        boost = _language_boost_for(call_lang)
+        if boost:
+            os.environ["MINIMAX_LANGUAGE_BOOST"] = boost
+    return os.environ.get("MINIMAX_LANGUAGE_BOOST", "")
 
 
 def _context_rag_enabled() -> bool:
@@ -748,7 +801,6 @@ async def entrypoint(ctx):
         FakeLiveKitSTT,
         FakeLiveKitTTS,
         FakeLiveKitVAD,
-        LanguageState,
         MiniMaxTTS,
         MlxLlmLLM,
         PinnedLanguageState,
@@ -762,18 +814,19 @@ async def entrypoint(ctx):
         VolcanoTTS,
     )
 
-    language_state = LanguageState()
-    # 开场语言 = 人设(AI)语言优先（用户在人设里选了普通话/粤语/英文，就是期望 AI 用它说话）；
-    # 未设置时回落到对象(客户)语言；再退回普通话。之后每轮由 ASR 检出的客户语言覆盖。
-    greet_lang = _normalize_lang((persona or {}).get("language")) or _normalize_lang((object_card or {}).get("language")) or "zh"
-    language_state.lang = greet_lang
-    # 开场即锚定回复语言（P4-C）：旧代码要等第一轮 on_user_turn_completed 才写入
-    # ContextState，问候语那一轮 system 里没有【用户语言】规则——首通回复无语言
-    # 约束（幻觉直接诱因），且前缀在问候→首轮之间被改写、KV-cache 整段失配。
-    # 会话开始前就按 greet_lang 渲染，前缀从第一声起字节稳定。
+    # 每通对话语言固定（A 线新政策）：开场语言 = 人设(AI)语言优先（用户在人设里
+    # 选了普通话/粤语/英文，就是期望 AI 全程用它说话）；未设置回落对象(客户)语言；
+    # 再退回普通话。这一决定在会话装配时钉死 ASR/LLM/TTS 三方，整通不切换。
+    greet_lang = _call_language(persona, object_card)
+    # 语言态整通钉死：PinnedLanguageState 构造后 update 永不改写——ASR 检出语言
+    # 不再回流（ASR 用独立钉定态），逐轮 sticky 跟随已删除，TTS _resolve_voice/
+    # lecture_guard/联网语言等全部整通恒为 greet_lang。
+    language_state = PinnedLanguageState(lang=greet_lang)
+    # 开场即锚定回复语言（P4-C 沿革）：会话开始前就按 greet_lang 渲染，前缀从
+    # 第一声起字节稳定。【用户语言】规则自此字节静态整通：装配时写入一次，逐轮
+    # 钩子不再 set_user_language（旧 sticky 跟随/语言切换标记全部退役）——KV-cache
+    # 前缀从第一声起到最后一次发言字节不变。
     context_state.set_user_language(greet_lang)
-    # 粤语客服锚定：LLM 默认始终用锚语言（greet_lang），只有客户连续多轮明显讲其它语言才跟随。
-    _lang_sticky: dict = {"sticky": greet_lang if greet_lang in {"zh", "cantonese", "en"} else "zh", "streak": 0}
     # 已上報嘅 WhatsApp 狀態(captured=已報號碼, offered=已報應承加),避免每 call 重複 spam。
     _wa_reported: set[str] = set()
     # 背景 flow judge 防疊:記錄而家 judge 緊邊一步(-1=冇)。推進唔可以同時兩個 judge。
@@ -811,16 +864,15 @@ async def entrypoint(ctx):
 
     # ---- ASR：设置页 asr.provider（qwen3_asr / sherpa_sensevoice / fake）----
     asr_provider_name = (asr_cfg.get("provider") or "qwen3_asr").lower()
-    # 语言模式：auto（默认）=锚定+滞回跟随（今日行为零变化）；fixed=整场钉死
-    # asr.language（B 线同传同姿势：预置 lang + pin_language=True，per-request
-    # hint 恒下发钉定语言）。fixed 时 ASR 用专用钉定语言态（强证据/滞回都不
-    # 改写），与共享 language_state（回复/TTS 锚定滞回）解耦，互不干扰。
-    asr_mode, asr_fixed_lang = _resolve_asr_language_mode(asr_cfg)
-    if asr_mode == "fixed":
-        asr_language_state = PinnedLanguageState(lang=asr_fixed_lang)
-    else:
-        asr_language_state = language_state
-    print(f"[agent] asr language_mode={asr_mode}" + (f" fixed={asr_fixed_lang}" if asr_mode == "fixed" else ""), flush=True)
+    # 语言钉定（A 线新政策）：每通对话语言固定 → ASR hint 整场钉死在通话语言
+    # （PinnedLanguageState + pin_language=True，zh 也整场下发 Chinese hint，与
+    # B 线同传同姿势）。设置 asr.language_mode=fixed + asr.language 显式值仍优先
+    # （部署级覆盖）；mode=auto 在 A 线不再意味着滞回跟随——它就是「钉到本通
+    # 语言」。ASR 钉定态与共享 language_state（TTS/LLM 恒为通话语言）解耦，
+    # 强证据/滞回都改写不了任一侧。
+    asr_pin_lang = _call_asr_pin_language(asr_cfg, greet_lang)
+    asr_language_state = PinnedLanguageState(lang=asr_pin_lang)
+    print(f"[agent] call language={greet_lang} pinned (asr hint={asr_pin_lang})", flush=True)
     if use_fake or asr_provider_name in ("fake", "fake_stt"):
         stt_provider = FakeLiveKitSTT()
     else:
@@ -837,9 +889,8 @@ async def entrypoint(ctx):
                     "http://127.0.0.1:8787",
                 ),
                 language_state=asr_language_state,
-                # fixed=同传式全钉（zh 也下发 Chinese，不吃 auto 漂移）；
-                # auto=今日口径（cantonese/en 钉、zh auto 容忍夹英文）。
-                pin_language=(asr_mode == "fixed"),
+                # A 线恒全钉（同传式）：zh 也下发 Chinese hint，不吃 auto 漂移。
+                pin_language=True,
             )
         )
         if not use_sherpa and os.environ.get("QWEN3_ASR_STREAM", "1") == "1":
@@ -870,14 +921,20 @@ async def entrypoint(ctx):
         # 云端 MiniMax：voice_mode 决定音色策略（详见 _assemble_minimax_voice_map）。
         # - single（默认，缺键同）：整场同声——collapse 成一个主音色，无论客户讲
         #   粤/普/英都用同一把声（今日行为）。
-        # - per_language：保留 {zh,cantonese,en} 三键，_resolve_voice 按滞回后的
-        #   language_state.lang 逐轮换声。
+        # - per_language：保留 {zh,cantonese,en} 三键，_resolve_voice 按
+        #   language_state.lang 换声（A 线语言整通钉死 → 实际恒同一把声）。
         # 兜底防御（两模式同）：过滤本地 Qwen3 音色，否则 2054 voice not exist。
         voice_mode = _resolve_tts_voice_mode(tts_cfg)
         voice_map = _assemble_minimax_voice_map(
             persona=persona, tts_cfg=tts_cfg, greet_lang=greet_lang, voice_mode=voice_mode
         )
         print(f"[agent] minimax voice_mode={voice_mode} voice_keys={sorted(voice_map)} (call {room_name})", flush=True)
+        # language_boost 按本通语言在构造前注入进程 env（MiniMaxTTS 只从 env 逐
+        # request 透传，构造函数无 boost 参数）：zh→Chinese、cantonese→Chinese,Yue、
+        # en→English。锁语种防合成漂移（B 线 interpret 同源姿势）；部署显式设置
+        # 优先，同进程多 job 并发覆盖的局限见 _apply_minimax_language_boost 注释。
+        _boost = _apply_minimax_language_boost(greet_lang)
+        print(f"[agent] minimax language_boost={_boost or '-'} (call {room_name})", flush=True)
         tts_provider = MiniMaxTTS(
             voice=voice_map,
             language_state=language_state,
@@ -997,8 +1054,9 @@ async def entrypoint(ctx):
             "min_delay": _endpoint_min_delay,
             "max_delay": _endpoint_max_delay,
         },
-        # 流程推进/收尾/语言切换轮由 on_user_turn_completed 落 chat_ctx 步骤
-        # 标记,触发框架快照不一致→作废旧抢跑重建,推进轮唔会错步。
+        # 流程推进/收尾轮由 on_user_turn_completed 落 chat_ctx 步骤标记
+        # (语言标记已随逐轮语言切换退役——语言整通固定,前缀零标记零改动),
+        # 触发框架快照不一致→作废旧抢跑重建,推进轮唔会错步。
         "preemptive_generation": _preemptive_generation_opts(),
         "interruption": {
             "enabled": interruption_enabled,
@@ -1281,7 +1339,7 @@ async def entrypoint(ctx):
             _disarm_silence()
 
             # 抢跑×流程推进共存:框架喺 FINAL 到达时可能已按「旧步骤语境」抢跑生成
-            # (preemptive 先于本钩子)。凡本轮实质改变回复语境(推进/收尾/语言切换),
+            # (preemptive 先于本钩子)。凡本轮实质改变回复语境(推进/收尾),
             # 就向 turn_ctx 落一个步骤标记——框架的抢跑校验按 chat_ctx 快照比较,
             # 见变化即作废旧抢跑、按新语境重建;无变化轮不落标记,白拿抢跑提速。
             # mlx prompt cache 按最长公共前缀匹配,追加只增增量 token,唔伤 KV。
@@ -1299,30 +1357,11 @@ async def entrypoint(ctx):
                     _set_preemptive_max_retries(0)
                     print(f"[agent] preemptive paused for this turn (marker: {reason})", flush=True)
 
-            # 同步注入用户语言：on_user_turn_completed 在自动回复生成【之前】被调用，
-            # 此时 ASR 已把 language_state 更新为本轮语言。若只挂在 conversation_item_added
-            # 事件上，会晚于 LLM 请求发出（竞态）→ 模型收不到本轮粤语指令而回普通话。
-            try:
-                # 语言锚定（粤语客服始终讲粤语）：默认用锚语言(greet_lang)回复，只有
-                # 客户连续多轮明显讲其它语言才跟随。计算出的回复语言写回 language_state，
-                # 供 LLM 指令/联网语言使用；TTS 音色已固定不受影响。
-                # 注意：唔好喺 call 前把 sticky 重置成 cur——sticky/streak 係跨轮状态，
-                # 重置咗就永遠得 1 輪、客户講一句普通話即切（連續 threshold 輪先跟嘅
-                # hysteresis 根本唔會生效）。保留上一輪 sticky 傳入,由函數累加 streak。
-                cur = language_state.lang
-                _prev_reply = _lang_sticky["sticky"]
-                reply_lang, _lang_sticky["sticky"], _lang_sticky["streak"] = _sticky_reply_language(
-                    greet_lang if greet_lang in {"zh", "cantonese", "en"} else "zh",
-                    cur,
-                    _lang_sticky["sticky"],
-                    _lang_sticky["streak"],
-                )
-                language_state.lang = reply_lang
-                context_state.set_user_language(reply_lang)
-                if reply_lang != _prev_reply:
-                    _invalidate_stale_preemptive(f"回复语言切换 → {reply_lang}")
-            except Exception:  # pragma: no cover - 语言注入失败不致命
-                pass
+            # 语言（A 线新政策，逐轮不处理）：每通对话语言在会话装配时已钉死——
+            # ASR 用独立 PinnedLanguageState，共享 language_state 与【用户语言】
+            # 规则恒为通话语言（装配时一次性写入）。旧逐轮 sticky 跟随/逐轮语言
+            # 注入/语言切换标记全部退役（zh→en 切换双胞胎 ~4.3-10s p95 与每轮
+            # 前缀改写的 KV-cache 失配一并消灭）；混语言输入不改回复语言。
             # WhatsApp 对接触发:喺 flow 推进【前】偵測(step context 係舊步/當前步,offered 先啱);
             # 客戶俾號碼(captured)照推下一步;應承加但未俾號碼(offered)→ 唔自動跳,等 AI 叫佢俾號碼。
             _wa_signal: tuple | None = None

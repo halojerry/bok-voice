@@ -201,10 +201,10 @@ def asr_language(pcm16: bytes) -> tuple[str, str]:
         return str(out.get("language") or ""), str(out.get("text") or "")
 
 
-async def main() -> None:
-    # 与 UI 同一条链路：先建真实通话（对象/人设/语言），再用 call id 作为房间名，
-    # 这样 agent 能解析到上下文与语言指令（否则 context 404，回复语言不跟随）。
-    lang = os.environ.get("E2E_ONLY") or "zh"
+async def _case_session(case: dict) -> dict:
+    """一案一通话：object/persona/call 全部用 case 自身语言建（每通语言固定策略下，
+    全量三语共用一通 zh 电话的旧结构已不成立——agent 会按通话语言全程回 zh）。"""
+    lang = case["lang"]
     obj = httpx.post(
         f"{CONTROL_PLANE_URL}/api/objects?account_id=acc-001",
         json={
@@ -254,31 +254,36 @@ async def main() -> None:
             raise SystemExit(f"[e2e] /api/token 返回的不是真 JWT: {token[:24]}…（LiveKit 凭据未注入）")
         print(f"[e2e] token: via control-plane /api/token (url={server_url})", flush=True)
 
-    results = []
     room = rtc.Room()
     try:
         await room.connect(server_url, token)
-        print(f"joined {room_name}", flush=True)
+        print(f"joined {room_name} (lang={lang})", flush=True)
         audio_source = rtc.AudioSource(sample_rate=16000, num_channels=1)
         src = rtc.LocalAudioTrack.create_audio_track("e2e-src", audio_source)
         await room.local_participant.publish_track(
             src,
             rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE),
         )
-        for case in CASES:
-            r = await run_case(room, audio_source, case)
-            results.append(r)
-            print(
-                f"[{case['lang']}] agent_audio={r['agent_audio_bytes']}B",
-                flush=True,
-            )
-            await asyncio.sleep(1)
+        r = await run_case(room, audio_source, case)
+        print(
+            f"[{case['lang']}] agent_audio={r['agent_audio_bytes']}B",
+            flush=True,
+        )
+        await asyncio.sleep(2)
+        return r
     finally:
         await room.disconnect()
         try:
             httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{room_name}/hangup", timeout=10)
         except Exception:
             pass
+
+
+async def main() -> None:
+    # 与 UI 同一条链路：每案独立建真实通话（对象/人设/语言=案语言），真 token 进房。
+    results = []
+    for case in CASES:
+        results.append(await _case_session(case))
 
     passed = 0
     for r in results:

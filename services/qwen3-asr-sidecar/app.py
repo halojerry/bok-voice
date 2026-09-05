@@ -128,8 +128,10 @@ def _finish_language_hint(start_lang: str | None) -> str | None:
 
     en 会话显式归一成 "English"(接受 "en"/"english" 两种写法):整句 decode 若交
     auto 检测,英语轮要多花语言判定且短轮易摇摆;显式 hint 消掉呢截。cantonese
-    原样透传(mlx 层大小写不敏感回填模型 config 规范名 Cantonese);zh/空保持
-    None=auto(容忍夹英文 code-switching,通话模式本来就唔给 zh 钉)。
+    原样透传(mlx 层大小写不敏感回填模型 config 规范名 Cantonese);zh 同样原样
+    透传(回填规范名 Chinese)——A 线每通对话语言固定(per-call fixed),zh 通话也
+    整场下发 Chinese hint,实测夹英文 code-switching 词保得住;只有完全冇 hint
+    (空)才 None=auto。
     """
     raw = str(start_lang or "").strip()
     key = raw.lower()
@@ -513,8 +515,9 @@ def health() -> dict:
 
 @app.post("/api/start")
 async def start(language: str = "") -> dict[str, str]:
-    # language: 可选转写语言提示(如 "cantonese")。agent 在会话语言为粤语时传入,
-    # 强制模型按 Cantonese 转写(auto 检测对粤语常误判成普通话);留空 = 交给模型 auto。
+    # language: 可选转写语言提示("cantonese"/"Chinese"/"English")。agent 按每通
+    # 对话钉定语言传入(A 线通话/B 线同传三语全钉),强制模型按该语言转写
+    # (cantonese 不钉会被 auto 误判成普通话);留空 = 交给模型 auto。
     return {"session_id": service.start(language=language.strip())}
 
 @app.post("/api/chunk")

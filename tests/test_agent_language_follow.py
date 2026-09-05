@@ -321,29 +321,10 @@ def test_strip_stage_dirs_allows_minimax_vocal(monkeypatch):
     assert "(例如)" in _strip_stage_dirs("有啲情況(例如)咁")
 
 
-# ---- 粤语客服语言锚定：始终讲粤语，仅连续多轮才跟随客户切语言 ----
-def test_sticky_cantonese_agent_single_mandarin_turn_stays_cantonese():
-    from agent_runtime.agent import _sticky_reply_language
-    # 锚 cantonese；客户单轮普通话 → 仍回 cantonese(streak 记 1)。
-    rl, sticky, streak = _sticky_reply_language("cantonese", "zh", "cantonese", 0)
-    assert rl == "cantonese" and sticky == "cantonese" and streak == 1
-    # 下一轮仍是普通话 → 跟随切 zh。
-    rl, sticky, streak = _sticky_reply_language("cantonese", "zh", sticky, streak)
-    assert rl == "zh" and sticky == "zh"
-
-
-def test_sticky_cantonese_back_to_cantonese_resets():
-    from agent_runtime.agent import _sticky_reply_language
-    # 已切到 zh，客户回粤语 → 立刻回锚 cantonese。
-    rl, sticky, streak = _sticky_reply_language("cantonese", "cantonese", "zh", 0)
-    assert rl == "cantonese" and sticky == "cantonese" and streak == 0
-
-
-def test_sticky_no_anchor_follows_asr():
-    from agent_runtime.agent import _sticky_reply_language
-    # 无有效锚(空) → 退化为跟随 ASR。
-    rl, sticky, streak = _sticky_reply_language("", "zh", "", 0)
-    assert rl == "zh"
+# ---- 逐轮语言跟随已退役（A 线每通对话语言固定）----
+# 旧 _sticky_reply_language 滞回跟随测试已随机制一并撤下（函数定义仅兼容保留，
+# A 线 entrypoint 不再调用）。新政策回归点见 tests/test_fixed_language_call.py：
+# 混语言输入不得切换回复语言、【用户语言】规则整通字节静态、逐轮钩子永不落语言标记。
 
 
 # ---- 发音教学形输出拦截(lecture_guard) ----
