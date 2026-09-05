@@ -330,6 +330,7 @@ def detect_whatsapp_signal(
     step_goal: str = "",
     step_ref: str = "",
     facts: dict | None = None,
+    already_captured: bool = False,
 ) -> tuple[str, str] | None:
     """偵測客戶係咪俾出 WhatsApp。返回 ("captured", 號碼) | ("captured_implicit", "") | ("offered", "") | None。
 
@@ -343,6 +344,10 @@ def detect_whatsapp_signal(
     - offered:喺引導辦理步、客戶冇俾號碼但应承加(好/可以/加咗),又冇話冇WhatsApp。
       由 caller 喺「上一步啱啱確認推入辦理步嗰輪」唔好 call 呢個 offered 分支(嗰輪客係
       應承接受,唔係應承加)──偵測放喺 flow 推進前跑、step context 係舊步,天然避開。
+    - already_captured:本通已 captured 過號碼 → 之後嘅純短應承/叫加唔再判 offered
+      (號碼已喺手,嗰啲係對當前步嘅確認;再判 offered 會令確認輪鎖死唔推進,
+      4B 就把自己上一句原樣再講一次——2026-09-06 call-e6e5f18e 實證)。新號碼/
+      綁定來電照樣 captured(客戶可以改口俾另一個號)。
     """
     t = (user_text or "").strip()
     if not t:
@@ -373,6 +378,10 @@ def detect_whatsapp_signal(
     if caller_bound:
         return ("captured_implicit", "")
     if in_wa_step and not runs:
+        if already_captured:
+            # 已捕获过号码:纯应承/叫加都係对当前步嘅确认,唔再当 offered
+            # (确认轮锁死→逐字重复根因,见 docstring);让 rule_verdict 正常推进。
+            return None
         # offered:明確叫加,或纯短应承(冇提其他話題)。
         if _WHATSAPP_ADD_VERB.search(t):
             return ("offered", "")

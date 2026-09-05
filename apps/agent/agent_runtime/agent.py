@@ -861,6 +861,9 @@ async def entrypoint(ctx):
     context_state.set_user_language(greet_lang)
     # 已上報嘅 WhatsApp 狀態(captured=已報號碼, offered=已報應承加),避免每 call 重複 spam。
     _wa_reported: set[str] = set()
+    # 本通已捕获过号码(captured/captured_implicit 任一):之後 WhatsApp 步嘅純短應承
+    # 唔再判 offered(確認輪鎖死→逐字重複根因,detect_whatsapp_signal 文檔)。
+    _wa_captured: dict = {"on": False}
     # 背景 flow judge 防疊:記錄而家 judge 緊邊一步(-1=冇)。推進唔可以同時兩個 judge。
     _judge_inflight: dict = {"step": -1}
     # 沉默心跳:AI 講完話客戶耐冇出聲 → 主動確認「仲喺度嗎」並帶返當前步。
@@ -1425,10 +1428,13 @@ async def entrypoint(ctx):
                 if flow_ctrl.has_steps:
                     _g, _r = flow_ctrl.current_goal_ref()
                     _wa_signal = detect_whatsapp_signal(
-                        user_text, step_goal=_g, step_ref=_r, facts=flow_ctrl.vars_map
+                        user_text, step_goal=_g, step_ref=_r, facts=flow_ctrl.vars_map,
+                        already_captured=_wa_captured["on"],
                     )
                     if _wa_signal:
                         _kind, _num = _wa_signal
+                        if _kind in ("captured", "captured_implicit"):
+                            _wa_captured["on"] = True
                         if _kind == "captured_implicit":
                             # WhatsApp 綁定呢個來電/號碼:號喺系統度,攞對象電話上報 captured。
                             # 對象冇電話 → 上報 offered(操作台見「待對接」);兩種都照推進,唔死鎖。
