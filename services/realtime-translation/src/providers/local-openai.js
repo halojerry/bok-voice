@@ -24,7 +24,7 @@ Rules:
 
 const LANG_NAME = {
   zh: "Chinese (Simplified)",
-  yue: "Cantonese",
+  cantonese: "Cantonese",
   en: "English",
   auto: "auto",
 };

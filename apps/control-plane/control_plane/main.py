@@ -10,7 +10,7 @@ import wave
 from pathlib import Path
 
 import httpx
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
@@ -415,9 +415,15 @@ async def tts_preview(payload: dict) -> Response:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
-@app.post("/api/token", response_model=TokenResponse)
+@app.post("/api/token", response_model=TokenResponse, status_code=201)
 def token(req: TokenRequest) -> TokenResponse:
-    room = req.call_id or f"call-{uuid.uuid4().hex[:8]}"
+    """签发参与者 token——LiveKit 官方 TokenSource endpoint 契约。
+
+    请求体兼容两种形态:官方 TokenSourceRequest(snake_case: room_name /
+    participant_identity,由 TokenSource.endpoint / 任意官方 SDK 直发)与本项目
+    业务字段(call_id/role)。响应即官方 TokenSourceResponse({serverUrl,
+    participantToken}),任何按标准实现的客户端(playground/Swift/Flutter…)可直接消费。
+    """
     key = getattr(app.state, "lk_key", "") or os.environ.get("LIVEKIT_API_KEY", "")
     secret = getattr(app.state, "lk_secret", "") or os.environ.get("LIVEKIT_API_SECRET", "")
     url = getattr(app.state, "lk_url", "") or os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880")
@@ -425,17 +431,111 @@ def token(req: TokenRequest) -> TokenResponse:
         # 必须走真实 JWT：旧 sha256 兜底会让前端 decodeTokenPayload 抛错、
         # LiveKit 服务器 401，A 线永远接不通。缺凭据时显式失败，不静默回退。
         raise HTTPException(status_code=503, detail="LiveKit credentials not configured")
+    # 房间名:官方 room_name 优先,旧 call_id 兼容;房间名 == call_id 是全栈约定
+    # (agent/前端按它反查 CallSession)。不再为空请求悄悄造随机房——token 必须绑定已知通话。
+    room = (req.room_name or req.call_id or "").strip()
+    if not room:
+        raise HTTPException(status_code=400, detail="room_name (or call_id) is required")
     import datetime
     from livekit import api
 
+    # 角色:官方路径(显式 participant_identity)按我方身份前缀反推;否则用业务 role 字段。
+    # 同传(B 线 v2)双端:me=我方端(通常也是房间创建者),other=对方端;
+    # A 线 operator / 主管 supervisor。前缀是 interpreter agent 判定"听谁的麦/译文给谁"的约定。
+    identity_input = (req.participant_identity or "").strip()
+    role = (req.role or "operator").strip().lower()
+    if identity_input:
+        if identity_input.startswith("me-"):
+            role = "me"
+        elif identity_input.startswith("other-"):
+            role = "other"
+        elif identity_input.startswith("supervisor-"):
+            role = "supervisor"
+        else:
+            role = "operator"
+    if role == "me":
+        name = "Bok Interpret Me"
+    elif role == "other":
+        name = "Bok Interpret Other"
+    elif role == "supervisor":
+        name = "Bok Voice Supervisor"
+    else:
+        name = "Bok Voice Operator"
+    identity = identity_input or (
+        f"me-{room}" if role == "me"
+        else f"other-{room}" if role == "other"
+        else f"supervisor-{room}" if role == "supervisor"
+        else f"operator-{req.account_id}-{room}"
+    )
     at = (
         api.AccessToken(key, secret)
-        .with_identity(f"operator-{req.account_id}-{room}")
-        .with_name("Bok Voice Operator")
+        .with_identity(identity)
+        .with_name(req.participant_name or name)
         .with_grants(api.VideoGrants(room_join=True, room=room, can_publish=True, can_subscribe=True, can_publish_data=True))
         .with_ttl(datetime.timedelta(seconds=3600))
     )
-    token = at.to_jwt()
+    if req.participant_metadata:
+        at = at.with_metadata(req.participant_metadata)
+    # 业务维度放 participant attributes(官方机制):agent/前端按属性判定角色,
+    # 替代对 identity 前缀的字符串嗅探;SIP 接入时同通道补 bok.* 属性。
+    at = at.with_attributes({"bok.role": role, "bok.account_id": req.account_id})
+
+    _call: dict = {}
+    try:
+        _call = _repo().get_call(room) or {}
+    except Exception:
+        _call = {}
+    kind = str(_call.get("kind") or "")
+
+    # 同传房间:我方端是创建者,token 里挂 RoomConfiguration 显式分发两个方向的
+    # interpreter agent(RoomAgentDispatch 只在首个参与者建房时生效,所以只挂 me 端)。
+    # metadata 带精确 identity(CP 已知房间名,不再让 agent 拼前缀)与语言对。
+    if kind == "interpret" and role == "me":
+        src = (_call.get("language") or "zh").strip() or "zh"
+        tgt = (_call.get("target_lang") or "en").strip() or "en"
+        from livekit.api import RoomAgentDispatch, RoomConfiguration
+
+        at = at.with_room_config(
+            RoomConfiguration(
+                agents=[
+                    RoomAgentDispatch(
+                        agent_name="bok-interp-fwd",
+                        metadata=json.dumps({
+                            "listen_identity": f"me-{room}",
+                            "deliver_identity": f"other-{room}",
+                            "source_lang": src,
+                            "target_lang": tgt,
+                        }),
+                    ),
+                    RoomAgentDispatch(
+                        agent_name="bok-interp-rev",
+                        metadata=json.dumps({
+                            "listen_identity": f"other-{room}",
+                            "deliver_identity": f"me-{room}",
+                            "source_lang": tgt,
+                            "target_lang": src,
+                        }),
+                    ),
+                ]
+            )
+        )
+    elif kind != "interpret" and role in ("operator", "supervisor"):
+        # A 线显式分发(官方推荐,隐式 dispatch 已废除):worker 以 agent_name="bok-voice"
+        # 注册,只有挂了本 dispatch 的房间会拉起客服 agent——顺带杜绝「同传房被
+        # A 线 agent 隐式抢派」。metadata 带 call_id,取代已删除的 AGENT_CALL_ID env 旁路。
+        from livekit.api import RoomAgentDispatch, RoomConfiguration
+
+        at = at.with_room_config(
+            RoomConfiguration(
+                agents=[
+                    RoomAgentDispatch(
+                        agent_name="bok-voice",
+                        metadata=json.dumps({"call_id": room}),
+                    ),
+                ]
+            )
+        )
+    participant_token = at.to_jwt()
     # When the operator connects an existing call, flip it to ACTIVE so the supervisor
     # "active calls" view reflects the real live room.
     if req.call_id:
@@ -443,7 +543,7 @@ def token(req: TokenRequest) -> TokenResponse:
             _repo().update_call(req.call_id, status=CallStatus.ACTIVE.value)
         except Exception:
             pass
-    return TokenResponse(token=token, roomName=room, url=url)
+    return TokenResponse(serverUrl=url, participantToken=participant_token)
 
 
 @app.post("/api/calls")
@@ -469,6 +569,8 @@ def create_call(req: CreateCallRequest) -> dict:
         policy=policy,
         template_id=template_id,
         tts_reference_voice=req.tts_reference_voice,
+        kind=req.kind,
+        target_lang=req.target_lang,
     )
     return _repo().create_call(manifest)
 
@@ -942,12 +1044,102 @@ def list_object_topics(object_id: str) -> list[dict]:
     return _repo().list_object_topics(object_id)
 
 
+@app.post("/api/calls/{call_id}/session-report")
+async def ingest_session_report(call_id: str, request: Request) -> dict:
+    """Agent shutdown 上报官方 SessionReport（真实逐模型 usage + 权威 chat_history 快照）。
+
+    存 call_sessions.session_report(JSON)；结算/报表优先吃这里的真数据，
+    没有上报的旧通话才回退估算口径。
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid json body")
+    row = _repo().update_call(call_id, session_report=json.dumps(payload, ensure_ascii=False, default=str))
+    if not row:
+        raise HTTPException(status_code=404, detail="call not found")
+    _audit("call.session_report", subject_type="call", subject_id=call_id, account_id=row.get("account_id", ""))
+    return {"call_id": call_id, "stored": True}
+
+
+@app.post("/api/webhook/livekit")
+async def livekit_webhook(request: Request) -> dict:
+    """LiveKit webhook：agent 崩溃补位。
+
+    自部署的 LiveKit OSS 在 worker/job 进程死亡时**不会自动重派** agent
+    （restart_policy = Cloud-only，见 docs/DEV_TOOLS.md §5）。收到 participant_left
+    且 identity 是我们 agent（= agent_name：bok-voice / bok-interp-fwd / bok-interp-rev）
+    → 调 AgentDispatchService.CreateDispatch 把同名 agent 重派回房（token 内 dispatch
+    只在建房时生效，这是官方指定通路）。launchd KeepAlive 只拉起 worker 本体，本端点
+    补「房间内 agent 缺席」这一层。本端点需在 livekit.yaml 配 webhook 指向本 CP。
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid json body")
+    event = str(payload.get("event") or "")
+    room_name = str(payload.get("room", {}).get("name") or "")
+    participant = payload.get("participant") or {}
+    identity = str(participant.get("identity") or "")
+    if event != "participant_left" or not room_name:
+        return {"handled": False, "reason": "not participant_left"}
+    # A 线 agent 进房 identity = agent_name "bok-voice"(独立身份,崩溃可可靠识别)。
+    # B 线 interpreter 以 listen 身份(me-<room>/other-<room>,与真人同款)在场——
+    # participant_left 无法区分是 agent 崩溃还是真人离开,不做自动补位(房间短命,
+    # 双端可重开);且 bok-interp-* 不会以自身名字发离开事件,故只匹配 bok-voice。
+    if identity != "bok-voice":
+        return {"handled": False, "reason": "not A-line agent"}
+
+    async def _redispatch() -> None:
+        key = os.environ.get("LIVEKIT_API_KEY", "")
+        secret = os.environ.get("LIVEKIT_API_SECRET", "")
+        if not key or not secret:
+            return
+        from livekit import api
+
+        client = api.LiveKitAPI(
+            url=os.environ.get("LIVEKIT_URL", "http://127.0.0.1:7880").replace("ws://", "http://").replace("wss://", "https://"),
+            api_key=key,
+            api_secret=secret,
+        )
+        try:
+            await client.agent_dispatch.create_dispatch(room=room_name, agent_name="bok-voice")
+            _audit("agent.redispatch", subject_type="call", subject_id=room_name, detail={"agent_name": "bok-voice", "event": event})
+        except Exception as exc:  # pragma: no cover - 重派失败不致命(launchd 兜底拉起 worker)
+            print(f"[webhook] redispatch failed: {exc!r}", flush=True)
+        finally:
+            await client.aclose()
+
+    asyncio.create_task(_redispatch())
+    return {"handled": True, "redispatch": identity}
+
+
 @app.get("/api/reports/usage")
 def reports_usage(account_id: str = "acc-001") -> dict:
     calls = _repo().list_calls(account_id, "")
+    # 真实用量优先：官方 SessionReport 的逐模型 input/output tokens；
+    # 没有上报的旧通话才回退「轮次数」估算（口径见字段名后缀）。
+    llm_tokens = 0
+    estimated_calls = 0
+    for c in calls:
+        raw = c.get("session_report") or ""
+        tokens = 0
+        if raw:
+            try:
+                for u in json.loads(raw).get("usage") or []:
+                    if u.get("type") == "llm_usage":
+                        tokens += int(u.get("input_tokens") or 0) + int(u.get("output_tokens") or 0)
+            except Exception:
+                tokens = 0
+        if tokens:
+            llm_tokens += tokens
+        else:
+            estimated_calls += 1
+            llm_tokens += len(_repo().get_turns(c["id"]))
     return {
         "asr_calls": len(calls),
-        "llm_tokens": sum(len(_repo().get_turns(c["id"])) for c in calls),
+        "llm_tokens": llm_tokens,
+        "llm_tokens_estimated_calls": estimated_calls,
         "tts_calls": len(calls),
         "vad_calls": len(calls),
     }
@@ -1006,10 +1198,23 @@ def _parse_setup(stdout: str) -> dict:
 
 @app.post("/api/supervisor/{call_id}/join")
 def supervisor_join(call_id: str) -> dict:
+    """主管进房:校验通话存在并直接签发 supervisor token(官方 TokenSource 契约)。
+
+    以前只回 role 不回 token(与 CONTRACTS.md「主管进房 token」自相矛盾);现在
+    与 /api/token 同一条签发链路(identity=supervisor-<room>,挂 bok.role 属性,
+    A 线 dispatch 由 token 端点统一处理)。
+    """
     call = _repo().get_call(call_id)
     if not call:
         raise HTTPException(404, "call not found")
-    return {"call_id": call_id, "status": call.get("status", "active"), "role": Role.SUPERVISOR.value}
+    issued = token(TokenRequest(call_id=call_id, role="supervisor"))
+    return {
+        "call_id": call_id,
+        "status": call.get("status", "active"),
+        "role": Role.SUPERVISOR.value,
+        "serverUrl": issued.serverUrl,
+        "participantToken": issued.participantToken,
+    }
 
 
 @app.post("/api/supervisor/{call_id}/pause-agent")
@@ -1044,3 +1249,19 @@ async def transfer(call_id: str) -> dict:
         raise HTTPException(404, "call not found")
     await _disconnect_livekit_room(call_id)
     return {"call_id": call_id, "action": "transfer", "status": call["status"], "disconnected": True}
+
+
+@app.post("/api/supervisor/{call_id}/end")
+async def supervisor_end(call_id: str, disposition: str = "declined") -> dict:
+    """AI 收尾后主动结束通话:置 ENDED 并断房。
+
+    disposition=declined(客户明确拒绝/告别,默认)| no_response(沉默心跳两次无回应)。
+    agent 讲完一句礼貌再见后调用;结算由 agent 侧 _on_close 幂等触发,这里只负责
+    归档 disposition + 踢出房间。房间不存在/服务不可用不阻塞(DB 已置 ENDED)。
+    """
+    disposition = (disposition or "declined").strip()[:64] or "declined"
+    call = _repo().update_call(call_id, escalated_to_human=False, disposition=disposition, status=CallStatus.ENDED.value)
+    if not call:
+        raise HTTPException(404, "call not found")
+    await _disconnect_livekit_room(call_id)
+    return {"call_id": call_id, "action": "end", "status": call["status"], "disconnected": True}

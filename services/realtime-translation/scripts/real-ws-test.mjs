@@ -19,7 +19,7 @@ const APP_DATA = process.env.LOCALAPPDATA
 const METRICS_FILE = resolve(APP_DATA, "translation-metrics.jsonl");
 const CHANNELS = [
   { id: "real-zh-en", sourceLang: "zh", targetLang: "en", file: "zh.wav" },
-  { id: "real-yue-zh", sourceLang: "yue", targetLang: "zh", file: "yue.wav" },
+  { id: "real-cantonese-zh", sourceLang: "cantonese", targetLang: "zh", file: "cantonese.wav" },
 ];
 
 function readWavPcm16(path, maxSeconds = 5) {

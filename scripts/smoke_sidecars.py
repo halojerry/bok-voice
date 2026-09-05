@@ -5,8 +5,8 @@ Requires both sidecars running:
   TTS: http://127.0.0.1:8788  (QWEN3_TTS_PRESET_MODEL/CLONE_MODEL -> local paths)
 
 Verifies:
-  1) ASR transcribes zh / yue / en test audio with expected language tags.
-  2) TTS preset synthesis works for zh / en, and yue maps to a supported language.
+  1) ASR transcribes zh / cantonese / en test audio with expected language tags.
+  2) TTS preset synthesis works for zh / en, and cantonese maps to a supported language.
   3) Voice cloning registers a Cantonese reference and synthesizes with it;
      the synthesized audio is then fed back through ASR to check the output
      language tag.
@@ -71,8 +71,8 @@ def main() -> None:
         assert_step("ASR health model_ready", asr_health.get("model_ready") is True, asr_health)
         assert_step("TTS health model_ready", tts_health.get("model_ready") is True, tts_health)
 
-        # 1) ASR zh / yue / en
-        expected_lang = {"zh.wav": "Chinese", "yue.wav": "Cantonese", "en.wav": "English"}
+        # 1) ASR zh / cantonese / en
+        expected_lang = {"zh.wav": "Chinese", "cantonese.wav": "Cantonese", "en.wav": "English"}
         asr_results = {}
         for name, want in expected_lang.items():
             path = AUDIO_DIR / name
@@ -111,15 +111,15 @@ def main() -> None:
         )
 
         # 3) voice clone registration (Cantonese reference) + synthesis
-        ref = AUDIO_DIR / "yue.wav"
-        ref_text = asr_results["yue.wav"][0]
-        assert_step("yue ref transcript available", bool(ref_text), ref_text)
-        files = {"file": ("yue.wav", ref.read_bytes(), "audio/wav")}
-        data = {"voice_id": "yue-clone-1", "ref_text": ref_text, "language": "cantonese"}
+        ref = AUDIO_DIR / "cantonese.wav"
+        ref_text = asr_results["cantonese.wav"][0]
+        assert_step("cantonese ref transcript available", bool(ref_text), ref_text)
+        files = {"file": ("cantonese.wav", ref.read_bytes(), "audio/wav")}
+        data = {"voice_id": "cantonese-clone-1", "ref_text": ref_text, "language": "cantonese"}
         reg = client.post(f"{TTS}/v1/voices/register", files=files, data=data)
         reg.raise_for_status()
         reg_json = reg.json()
-        assert_step("voice clone registered", reg_json.get("voice_id") == "yue-clone-1", reg_json)
+        assert_step("voice clone registered", reg_json.get("voice_id") == "cantonese-clone-1", reg_json)
 
         clone_texts = [
             ("cantonese", "你好，歡迎致電博克，我哋支持粵語實時通話。"),
@@ -130,7 +130,7 @@ def main() -> None:
         for lang, text in clone_texts:
             r = client.post(
                 f"{TTS}/v1/audio/speech",
-                json={"input": text, "language": lang, "voice": "yue-clone-1", "sample_rate": 24000},
+                json={"input": text, "language": lang, "voice": "cantonese-clone-1", "sample_rate": 24000},
             )
             r.raise_for_status()
             wav_path = OUT_DIR / f"clone-{lang}.wav"
@@ -139,7 +139,7 @@ def main() -> None:
             assert_step(f"TTS clone {lang} bytes>0", len(r.content) > 8000, len(r.content))
 
         # 4) feedback: transcribe the synthesized clone audio (language tag check).
-        #    yue must come back Cantonese (ICL-driven accent); en must stay English.
+        #    cantonese must come back Cantonese (ICL-driven accent); en must stay English.
         #    zh is intentionally skipped: a Cantonese-cloned voice reading Mandarin
         #    text is expected to keep the Cantonese accent and ASR tags it Cantonese.
         clone_lang_expect = {"cantonese": "Cantonese", "en": "English"}
@@ -156,7 +156,7 @@ def main() -> None:
             )
 
         voices = client.get(f"{TTS}/v1/voices").json()
-        assert_step("voice list contains clone", any(v.get("voice_id") == "yue-clone-1" for v in voices), voices)
+        assert_step("voice list contains clone", any(v.get("voice_id") == "cantonese-clone-1" for v in voices), voices)
 
     print("\nSIDECAR_SMOKE_PASSED")
 

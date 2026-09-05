@@ -99,6 +99,12 @@ class CallSession(Base):
     # captured(客戶讀出咗自己號碼) / handled(專員已標記對接)。customer_whatsapp 存號碼。
     whatsapp_status: Mapped[str] = mapped_column(String(16), default="")
     customer_whatsapp: Mapped[str] = mapped_column(String(64), default="")
+    # 会话种类:""=客服通话(A 线) / interpret=双端同传(B 线 v2)。
+    # interpret 会话:language=我方语言,target_lang=对方语言,object_id 通常为空。
+    kind: Mapped[str] = mapped_column(String(32), default="")
+    target_lang: Mapped[str] = mapped_column(String(16), default="")
+    # 官方 SessionReport JSON(agent shutdown 上报):真实逐模型 usage/权威 chat_history。
+    session_report: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 

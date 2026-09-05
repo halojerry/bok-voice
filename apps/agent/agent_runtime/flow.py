@@ -19,6 +19,7 @@ OBJECTION = "objection"   # 有异议/否认/不配合 → 停留本步应对
 QUESTION = "question"     # 提问/要解释 → 停留本步解答
 OFFTOPIC = "offtopic"     # 明显无关/要挂断/怀疑诈骗 → 不强推
 UNCLEAR = "unclear"       # 判断不清 → 停留,自然应对
+REFUSE = "refuse"         # 明确拒绝/告别/要收线 → 收尾态:一句礼貌再见后结束通话
 
 
 @dataclass
@@ -164,6 +165,16 @@ _QUESTION_RE = re.compile(
 # 强异议/不想继续/威胁 → objection/offtopic
 _HANGUP_RE = re.compile(r"(不用了|不需要|别再打|别打|不要打|挂|拉黑|投诉|再见|拜拜|唔使|唔使啦|"
     r"stop|don't call|leave me|bye)", re.IGNORECASE)
+# 明确拒绝/婉拒(唔需要/唔办/我唔要/拒绝…) → REFUSE:直接收尾话术+结束通话,唔停留挽留。
+# 注意社交软语「唔使担心/唔使客气」等唔算拒绝(见 _REFUSE_SOFT_GUARD_RE)。
+_REFUSE_RE = re.compile(
+    r"(唔需要|唔辦|唔办|唔好办|唔好辦|我唔要|唔要啦|唔要喇|唔要嘎|唔要咗|唔要了|不要啦|不要喇|不要了|"
+    r"唔使喇|唔使啦|唔使再打|唔好再打|唔好再嚟|唔好再來|别再打|別再打|唔好搵我|唔好煩我|唔好骚扰|"
+    r"拒绝|拒絕|收线啦|收線啦|收工啦|唔好搞我)",
+    re.IGNORECASE,
+)
+# 「唔使X」嘅社交关心/客套短语——唔係拒绝,唔好当 REFUSE(旧实测:「唔使担心」曾误判)。
+_REFUSE_SOFT_GUARD_RE = re.compile(r"唔使(担心|擔心|客气|客氣|怕|緊張|紧张|多心|挂住|掛住)")
 # 多字「强确认」:疑问句里出现都算确认(「係我,然後呢?」);单字「係/好/嗯/对/可以」
 # 喺疑问句(「係咩?」「可以點做?」)唔当确认,靠 _CONFIRM_RE 只喺非疑问句时兜底。
 _STRONG_AFFIRM_RE = re.compile(
@@ -212,6 +223,11 @@ _WHATSAPP_DECLINE = re.compile(r"(冇whatsapp|冇用whatsapp|無whatsapp|唔用w
 _WHATSAPP_ADD_VERB = re.compile(r"(你(哋|地)?加我|加我|我加咗|我加|加咗|加啦|加喇|搵我|你(哋|地)?發俾我|發俾我|快啲加|嚟加)", re.IGNORECASE)
 # 俾號語境:「我俾個號你 / 俾號碼你」→ 唔好淨靠 號碼/号码 字眼(「俾個號」冇「碼」都會走漏)。
 _WHATSAPP_GIVE_NUM_RE = re.compile(r"俾.{0,6}[號号]")
+# 明確自報:「我WhatsApp(就)係/是 <數字>」→ 號碼即 WhatsApp,就算撞已知電話/單號都當佢自報。
+# 系詞後必須直接跟數字(漢字/阿拉伯皆可):「WhatsApp 就是绑定…」唔算(嗰係綁定來電,交 caller_bound)。
+_WHATSAPP_NUM_ANNOUNCE_RE = re.compile(
+    r"(whatsapp|whats app|wa|微信)\s*(就?係|就是|是)\s*[0-9一二三四五六七八九零]", re.IGNORECASE
+)
 _WHATSAPP_ACK_WORDS = ("好呀", "好丫", "好既", "好嘅", "好阿", "可以", "冇問題", "沒問題", "没问题", "無問題", "都得", "得呀", "嗯", "好", "得", "ok", "okay", "嗯嗯", "好呀好呀", "可以可以", "好嘅好嘅")
 # 句子提及其他话题(单号/电话/自己身份/地址/订单)→ 唔係应承加,唔触发 offered
 _WHATSAPP_TOPIC_MARK = re.compile(r"(單號|单号|號碼|号码|電話|电话|地址|訂單|订单|貨件|货件|貨|件野|我係|我是|包裹|速遞|物流)", re.IGNORECASE)
@@ -259,7 +275,7 @@ def should_auto_advance(*, current: int, goal: str, ref: str, user_text: str, ve
       offered(應承加未俾號)則停留;淨係答到平台 → 停留喺本步,繼續叫客戶俾WhatsApp/傳截圖。
       若只係純核對平台(冇 WhatsApp 要求)→ 答到平台即過。
     """
-    if verdict == OBJECTION:
+    if verdict in (OBJECTION, REFUSE):
         return False
     if current == 0:
         # 純提問(客問「你哋邊間公司?」)要喺開場步答,唔推;其他實質回應都推。
@@ -288,8 +304,10 @@ def _looks_like_whatsapp_step(goal: str, ref: str) -> bool:
 
 
 def _valid_digit_runs(norm: str) -> list[str]:
-    """攞 8–13 位数字串(WhatsApp/手机长度)。短(單號尾4)唔算,長過13(成串乱码)唔算。"""
-    return [r for r in re.findall(r"[0-9]{8,13}", norm)]
+    """攞 6–13 位数字串(WhatsApp 號碼長度唔固定:香港8位/內地11位/帶區號13位;
+    6位容錯 ASR 少聽多位/口誤短號,真實 case「我WhatsApp是六四三二五四三」曾因長度走漏)。
+    短過6(單號尾4等)唔算,長過13(成串乱码)唔算;已知單號/電話另有 known-number 過濾兜底。"""
+    return [r for r in re.findall(r"[0-9]{6,13}", norm)]
 
 
 def _run_is_known_number(run: str, facts: dict | None) -> bool:
@@ -315,8 +333,10 @@ def detect_whatsapp_signal(
 ) -> tuple[str, str] | None:
     """偵測客戶係咪俾出 WhatsApp。返回 ("captured", 號碼) | ("captured_implicit", "") | ("offered", "") | None。
 
-    - captured:客戶讀出 8–13 位號碼,且①當前步係引導辦理(問WhatsApp)或②句中明顯提
-      whatsapp/微信/號碼。號碼若命中已知 單號/尾號/電話 則唔當(覆述已知資料)。
+    - captured:客戶讀出 6–13 位號碼(長度唔固定:港8/內地11/帶區號13;6位容錯 ASR 少聽),
+      且①當前步係引導辦理(問WhatsApp)或②句中明顯提 whatsapp/微信/俾號/加我;或③明確自報
+      「我WhatsApp(就)係 XXXX」(撞已知電話/單號都算)。號碼若命中已知 單號/尾號/電話 則唔當
+      (覆述已知資料)。
     - captured_implicit:WhatsApp 步客戶話號碼綁定「呢個來電/呢個號碼」(號喺系統度)——
       唔使讀出 8-13 位;caller 攞對象電話上報 captured。防死鎖:唔會因號碼俾 ASR
       聽亂 / 撞單號就永遠入唔到 captured、AI 無限重複要號。
@@ -341,6 +361,10 @@ def detect_whatsapp_signal(
         # ① 客戶俾出「唔係已知單號/尾號/電話」嘅新號碼 → captured。
         if fresh and (in_wa_step or wa_ctx):
             return ("captured", fresh[0])
+        # ①' 明確自報「我WhatsApp(就)係 XXXX」→ 號碼即 WhatsApp;撞已知電話/單號都照捕
+        #    (真實 case:「我WhatsApp是六四三二五四三」7位+撞對象電話,雙重走漏→唔爆閃、重複追問)。
+        if wa_ctx and _WHATSAPP_NUM_ANNOUNCE_RE.search(t):
+            return ("captured", runs[0])
         # ② WhatsApp 步 + 明確俾號語境(加我/俾號碼)即使撞已知單號 → 仍當佢俾嘅 WhatsApp 號。
         #    真係覆述單號(「單號係…」冇 whatsapp/加我)→ 由 caller_bound 兜,唔喺度誤判。
         if in_wa_step and wa_ctx and _WHATSAPP_ADD_VERB.search(t):
@@ -367,9 +391,10 @@ def decide_advance(user_text: str, *, facts: dict | None = None) -> str:
     t = user_text.strip()
     if not t:
         return UNCLEAR
-    # 1) 挂断/强拒绝 → objection(停留,让 LLM 简短得体收尾/不强推)
-    if _HANGUP_RE.search(t):
-        return OBJECTION
+    # 1) 明确拒绝/告别/要收线 → REFUSE(收尾态:一句礼貌再见后结束通话)。
+    #    拒绝优先于一切(含否认/提问):「唔係我,唔好再打」主体係收线。
+    if (_REFUSE_RE.search(t) or _HANGUP_RE.search(t)) and not _REFUSE_SOFT_GUARD_RE.search(t):
+        return REFUSE
     # 2) 明确否认/不是本人 → objection(优先于确认词,避免"不是,是我…"误判)
     if _DENY_RE.search(t):
         return OBJECTION
@@ -407,6 +432,7 @@ class FlowController:
 
     steps: list[FlowStep] = field(default_factory=list)
     current: int = 0  # 0-based;== len(steps) 表示流程已走完
+    closing: bool = False  # 客户明确拒绝/告别 → 收尾态:只讲收尾话术,唔再推进
 
     @classmethod
     def from_template(cls, template: dict | None, object_card: dict | None) -> "FlowController":
@@ -430,11 +456,24 @@ class FlowController:
 
     def on_user_turn(self, user_text: str) -> None:
         """每轮用户话后调用:结合当前步决定是否推进。"""
-        if not self.has_steps or self.done:
+        if not self.has_steps or self.done or self.closing:
             return
         verdict = self.rule_verdict(user_text)
         if verdict == CONFIRM:
             self.advance()
+
+    def enter_closing(self) -> None:
+        """客户明确拒绝/告别 → 进入收尾态:之后只讲收尾话术,唔再推进/唔再按步走。"""
+        self.closing = True
+        self._just_advanced = False
+
+    def closing_text(self) -> str:
+        """收尾态注入:一句礼貌告别,唔推销、唔挽留、唔转话题、唔问问题。"""
+        return (
+            "【收尾】客户已明确拒绝/表示要结束,现在只做礼貌收尾:用客户正在讲的语言讲一句告别"
+            "(多谢+再见,例如「好嘅,唔打扰你嘞,多谢你时间,拜拜」),"
+            "一句讲完就停——绝不推销、绝不挽留、绝不问任何问题、绝不转新话题、绝不再提流程。"
+        )
 
     def rule_verdict(self, user_text: str) -> str:
         """规则判定(唔改动状态):只有"确认/认可当前步"先算可推进。"""
@@ -470,7 +509,9 @@ class FlowController:
         return g
 
     def current_step_text(self) -> str:
-        """渲染当前步(含变量替换)给本轮 system;流程完成则空。"""
+        """渲染当前步(含变量替换)给本轮 system;流程完成则空;收尾态则注入收尾话术。"""
+        if self.closing:
+            return self.closing_text()
         if not self.has_steps or self.done:
             return ""
         step = self.steps[self.current]

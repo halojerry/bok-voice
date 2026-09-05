@@ -44,7 +44,7 @@ function AgentStateLabel({ state }: { state: string }) {
  * 转写暂用 useTranscriptions 自绘（视觉已对齐官方；官方 AgentChatTranscript 需 Tailwind v4，见 AGENT.md）。
  */
 function LiveAgentPanel({ room }: { room: Room | null }) {
-  const { state, microphoneTrack, identity } = useAgent();
+  const { state, microphoneTrack, identity, failureReasons } = useAgent();
   const { mood } = useAgentExpression();
   const transcriptions = useTranscriptions();
   const agentIdentity = identity ?? "agent";
@@ -113,15 +113,23 @@ function LiveAgentPanel({ room }: { room: Room | null }) {
       </div>
 
       {/* 中央：官方点阵可视化（mood 驱动色）；sm 尺寸并 shrink-0，把纵向空间让给转写 */}
-      <div className="flex shrink-0 items-center justify-center gap-4 py-2">
-        <AgentStateLabel state={agentState} />
-        <VoiceAgentInterface
-          size="sm"
-          state={agentState}
-          mood={mood}
-          audioTrack={microphoneTrack}
-          showMoodLabel
-        />
+      <div className="flex shrink-0 flex-col items-center justify-center gap-1 py-2">
+        <div className="flex items-center gap-4">
+          <AgentStateLabel state={agentState} />
+          <VoiceAgentInterface
+            size="sm"
+            state={agentState}
+            mood={mood}
+            audioTrack={microphoneTrack}
+            showMoodLabel
+          />
+        </div>
+        {/* 官方失败态显性化:agent/会话失败不能只显示一个「失败」点,把原因亮出来。 */}
+        {failureReasons.length > 0 && (
+          <div className="max-w-[420px] text-center text-xs text-red-500">
+            连接失败：{failureReasons.join("；")}
+          </div>
+        )}
       </div>
 
       {/* 实时分析（基于本通转写实时统计） */}
@@ -409,14 +417,17 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
   const cp = useControlPlaneReady();
   const loadAttemptRef = useRef(-1);
 
-  // 官方会话：TokenSource.custom 直连 control-plane，只做键名映射（serverUrl/participantToken）。
+  // 官方会话：CP /api/token 已说官方 TokenSource 契约({serverUrl, participantToken})，
+  // 这里直透响应体、零键名映射；TokenSource.custom 自带 exp 前缓存与自动续签。
+  // （此处不用 TokenSource.endpoint+useSession options：「新建通话」要先把刚拿到的
+  //   callId 同步进请求——useSession options 经 render 传播，时序上拿不到本轮 id，
+  //   custom 闭包读 callIdRef 恒为最新。）
   const tokenSource = useMemo(
     () =>
       TokenSource.custom(async () => {
         const id = callIdRef.current;
         if (!id) throw new Error("no call id");
-        const res = await api.token({ account_id: ACCOUNT, call_id: id });
-        return { serverUrl: res.url, participantToken: res.token };
+        return await api.token({ account_id: ACCOUNT, call_id: id });
       }),
     [],
   );
@@ -606,6 +617,10 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
         if (isTauriShell()) await applyOutputDevice(outputDeviceId).catch(() => {});
         else if (webCanSwitchOutput()) await switchWebOutputDevice(session.room, outputDeviceId).catch(() => {});
       }
+      // 连接前预缓冲：建房/agent join 需 1-2s，用户此时可能已开口（喂你好），
+      // preConnectBuffer 把这段采集缓冲在连接后回放给 agent，避免「接通吃头字」。
+      // （agent 侧 1.7.1 的 pre_connect_audio 默认已开。）
+      await session.room.localParticipant.setMicrophoneEnabled(true, undefined, { preConnectBuffer: true }).catch(() => {});
       await session.start({ tracks: { microphone: { enabled: true } } });
       // 确保本地麦克风真正发布：session.start 的 tracks 选项在部分 livekit 版本不生效，
       // 显式 setMicrophoneEnabled 才可靠（否则 agent 收不到用户声音 → 对话"没输入"）。

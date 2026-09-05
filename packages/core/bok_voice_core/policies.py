@@ -77,6 +77,8 @@ def select_session_manifest(
     policy: str = "offline_first",
     tts_reference_voice: str = "",
     template_id: str = "",
+    kind: str = "",
+    target_lang: str = "",
 ) -> SessionManifest:
     return SessionManifest(
         session_id=session_id,
@@ -90,4 +92,6 @@ def select_session_manifest(
         policy=policy,
         tts_reference_voice=tts_reference_voice,
         template_id=template_id,
+        kind=kind,
+        target_lang=target_lang,
     )

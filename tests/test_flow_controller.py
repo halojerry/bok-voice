@@ -314,6 +314,25 @@ def test_detect_whatsapp_caller_bound_implicit():
     assert detect_whatsapp_signal("WhatsApp 就係我而家呢個電話", step_goal="說明賠償標準", step_ref="一賠二") is None
 
 
+def test_detect_whatsapp_short_number_and_announce():
+    """真實走漏案例回歸(2026-09-03 call):客戶講 7 位號 + 撞對象電話 → 雙重走漏,
+    唔爆閃、唔推進、AI 重複追問。
+
+    - 「我WhatsApp是六四三二五四三」:7 位(舊 8-13 規則走漏)且撞對象電話(舊 known-number
+      過濾走漏)→ 明確自報句式要照捕。
+    - WhatsApp 步內 7 位新號碼 → captured。
+    """
+    from agent_runtime.flow import detect_whatsapp_signal
+    F = {"姓名": "陈先生", "快递单号": "sf一二三四五六七八九零", "快递尾号": "七八九零", "电话": "六四三二五四三"}
+    # 明確自報(7位+撞已知電話)→ captured
+    assert detect_whatsapp_signal("我WhatsApp是六四三二五四三。", step_goal=WA_GOAL, step_ref=WA_REF, facts=F) == ("captured", "6432543")
+    assert detect_whatsapp_signal("我 WhatsApp 就是 68681234", step_goal=WA_GOAL, step_ref=WA_REF, facts=F) == ("captured", "68681234")
+    # WhatsApp 步內 7 位新號碼(無自報句式)→ captured(7位容錯)
+    assert detect_whatsapp_signal("我俾你,六四三二五八八", step_goal=WA_GOAL, step_ref=WA_REF, facts=F) == ("captured", "6432588")
+    # 非 WA 語境 7 位覆述已知電話 → 唔當
+    assert detect_whatsapp_signal("我個電話 6432543", step_goal="說明賠償標準", step_ref="一賠二", facts=F) is None
+
+
 def test_detect_whatsapp_captured_prefers_context_not_single_number():
     """WhatsApp 語境下客戶俾號,號碼就算撞已知單號都當 WhatsApp 號(先走 captured)。
 
@@ -419,3 +438,49 @@ def test_current_step_explicit_no_leak_instruction():
     assert "勿念给客户" in txt
     assert "绝不把「如果" in txt
     assert "参考要点(内部指示" in txt
+
+
+# ---- 明确拒绝 → REFUSE(一句礼貌收尾 + 主动结束通话) ----
+def test_decide_advance_refuse_family():
+    # 高频拒绝说法(旧版漏成 unclear/objection 然后无限重问):现在直接 REFUSE。
+    from agent_runtime.flow import REFUSE, decide_advance
+    assert decide_advance("唔需要喇，唔该") == REFUSE
+    assert decide_advance("唔办啦。") == REFUSE
+    assert decide_advance("我唔要。") == REFUSE
+    assert decide_advance("唔要啦。") == REFUSE
+    assert decide_advance("我拒绝你哋。") == REFUSE
+    assert decide_advance("唔好再打嚟！") == REFUSE
+    assert decide_advance("不用了谢谢") == REFUSE
+    assert decide_advance("别再打来了") == REFUSE
+    assert decide_advance("再见") == REFUSE
+    assert decide_advance("拜拜") == REFUSE
+
+
+def test_refuse_social_phrase_not_refuse():
+    # 「唔使担心/唔使客气」係社交关心/客套,唔係拒绝(防误收线)。
+    from agent_runtime.flow import REFUSE, decide_advance
+    assert decide_advance("唔使担心，我明白嘅。") != REFUSE
+    assert decide_advance("你哋唔使客气。") != REFUSE
+
+
+def test_refuse_enters_closing_and_stays():
+    # REFUSE → 收尾态:current_step_text 注入收尾话术;收尾后唔再推进/唔再按步走。
+    from agent_runtime.flow import FlowController, REFUSE
+    fc = FlowController.from_template(
+        {"steps_json": '[{"goal":"开场","ref":"r1"},{"goal":"引导办理","ref":"r2"}]'}, OBJ
+    )
+    assert fc.rule_verdict("我唔需要，唔好再打嚟。") == REFUSE
+    fc.enter_closing()
+    cur = fc.current_step_text()
+    assert "收尾" in cur and "拜拜" in cur
+    # 收尾态即使客户改口应承,都唔翻流程(真改口由人工/新通话处理)。
+    fc.on_user_turn("係我,可以㗎。")
+    assert fc.current == 0 and fc.closing
+    assert "收尾" in fc.current_step_text()
+
+
+def test_should_auto_advance_never_on_refuse():
+    # 拒绝轮任何一步都唔推进(开场步漏网拒绝尤其会误推,防回归)。
+    from agent_runtime.flow import REFUSE, should_auto_advance
+    assert should_auto_advance(current=0, goal="开场", ref="r", user_text="唔需要", verdict=REFUSE) is False
+    assert should_auto_advance(current=1, goal="引导办理", ref="r", user_text="唔需要", verdict=REFUSE) is False

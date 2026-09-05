@@ -1,7 +1,7 @@
 """A 线多轮三语 E2E：同一场通话内连续切换 普通话→粤语→英语。
 
 验证三件事：
-  1) agent 在同一会话里逐轮跟随用户语言（zh 轮回普通话、yue 轮回粤语、en 轮回英语）;
+  1) agent 在同一会话里逐轮跟随用户语言（zh 轮回普通话、cantonese 轮回粤语、en 轮回英语）;
   2) 每轮都有 TTS 语音回复（agent_audio 非空）;
   3) 通话 turns 真实落库（数据沉淀）。
 
@@ -29,7 +29,7 @@ AUDIO_DIR = ROOT / "tests" / "fixtures" / "audio"
 # 每轮：参考音频 + 期望回复语言标签
 TURNS = [
     {"lang": "zh", "file": "zh.wav", "expect": "Chinese"},
-    {"lang": "cantonese", "file": "yue.wav", "expect": "Cantonese"},
+    {"lang": "cantonese", "file": "cantonese.wav", "expect": "Cantonese"},
     {"lang": "en", "file": "en.wav", "expect": "English"},
 ]
 
@@ -217,12 +217,12 @@ async def main() -> None:
     )
     resp.raise_for_status()
     data = resp.json()
-    print(f"[e2e] joined {room_name} (multi-turn zh→yue→en)", flush=True)
+    print(f"[e2e] joined {room_name} (multi-turn zh→cantonese→en)", flush=True)
 
     room = rtc.Room()
     all_pass = True
     try:
-        await room.connect(data["url"], data["token"])
+        await room.connect(data["serverUrl"], data["participantToken"])
         audio_source = rtc.AudioSource(sample_rate=16000, num_channels=1)
         src = rtc.LocalAudioTrack.create_audio_track("e2e-src", audio_source)
         await room.local_participant.publish_track(

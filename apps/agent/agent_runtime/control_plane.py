@@ -70,6 +70,27 @@ class ControlPlaneClient:
         r.raise_for_status()
         return r.json()
 
+    async def post_session_report(self, call_id: str, report: dict) -> None:
+        """上報官方 SessionReport(真实逐模型 usage/权威 chat_history)。settle 前调。
+
+        失败由 caller 打日志——报表缺真数据回退估算口径,唔阻结算。
+        """
+        r = await self._client.post(f"/api/calls/{call_id}/session-report", json=report)
+        r.raise_for_status()
+
+    async def end_call(self, call_id: str, disposition: str = "declined") -> dict:
+        """AI 收尾后主动结束通话:置 ENDED 并断房。
+
+        disposition=declined(客户拒绝,默认)| no_response(沉默心跳两次无回应)。
+        失败(404 已结束/网络抖动)由 caller 打日志即可,结算另有 _on_close 幂等兜底。
+        """
+        r = await self._client.post(
+            f"/api/supervisor/{call_id}/end",
+            params={"disposition": disposition},
+        )
+        r.raise_for_status()
+        return r.json()
+
     async def report_whatsapp(self, call_id: str, number: str = "") -> None:
         """上報偵測到客戶俾 WhatsApp。number 有值=captured,空=offered。fire-and-forget。
 

@@ -253,7 +253,7 @@ async def main() -> None:
     results = []
     agent_audio = bytearray()
     try:
-        await room.connect(data["url"], data["token"])
+        await room.connect(data["serverUrl"], data["participantToken"])
         audio_source = rtc.AudioSource(sample_rate=16000, num_channels=1)
         src = rtc.LocalAudioTrack.create_audio_track("e2e-src", audio_source)
         await room.local_participant.publish_track(src, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE))
@@ -276,14 +276,14 @@ async def main() -> None:
             el = time.perf_counter() - t0
             pcm = r["pcm"]
             lang, text = asr_language(pcm) if len(pcm) > 4000 else ("", "")
-            is_yue = lang.lower() in {"cantonese", "yue"} or cantonese_markers(text)
+            is_cantonese = lang.lower() == "cantonese" or cantonese_markers(text)
             ok_audio = len(pcm) > 4000
             results.append({"turn": i + 1, "label": case["label"], "elapsed": el,
                             "first_audio_ms": r["first_audio_ms"], "text": text,
-                            "lang": lang, "is_yue": is_yue, "ok_audio": ok_audio})
+                            "lang": lang, "is_cantonese": is_cantonese, "ok_audio": ok_audio})
             print(
                 f"[{i+1:02d}] {case['label']}: "
-                f"reply_audio={'OK' if ok_audio else 'EMPTY'} lang={lang!r} yue={is_yue} "
+                f"reply_audio={'OK' if ok_audio else 'EMPTY'} lang={lang!r} cantonese={is_cantonese} "
                 f"elapsed={el:.1f}s first_audio={r['first_audio_ms']}ms",
                 flush=True,
             )
@@ -300,15 +300,15 @@ async def main() -> None:
     # 汇总
     total = len(results)
     audio_ok = sum(1 for x in results if x["ok_audio"])
-    yue_ok = sum(1 for x in results if x["is_yue"])
+    cantonese_ok = sum(1 for x in results if x["is_cantonese"])
     avg_el = sum(x["elapsed"] for x in results) / max(1, total)
     print("\n==== 理赔分步·10+轮粤语 E2E 汇总 ====", flush=True)
-    print(f"轮次: {total}  有语音回复: {audio_ok}/{total}  粤语回复: {yue_ok}/{total}", flush=True)
+    print(f"轮次: {total}  有语音回复: {audio_ok}/{total}  粤语回复: {cantonese_ok}/{total}", flush=True)
     print(f"平均轮次总耗时: {avg_el:.1f}s (含客户音频播放+ASR+LLM+合成)", flush=True)
     for x in results:
-        print(f"  T{x['turn']:02d} {x['label']}: first_audio={x['first_audio_ms']}ms lang={x['lang']!r} yue={x['is_yue']} text={x['text'][:50]!r}", flush=True)
+        print(f"  T{x['turn']:02d} {x['label']}: first_audio={x['first_audio_ms']}ms lang={x['lang']!r} cantonese={x['is_cantonese']} text={x['text'][:50]!r}", flush=True)
 
-    passed = audio_ok >= total * 0.8 and yue_ok >= total * 0.8
+    passed = audio_ok >= total * 0.8 and cantonese_ok >= total * 0.8
     print("FLOW_SCENARIO_E2E", "PASSED" if passed else "FAILED", flush=True)
     return 0 if passed else 1
 

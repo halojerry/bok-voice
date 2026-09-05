@@ -12,7 +12,8 @@ from agent_runtime.providers.livekit_plugins import _normalize_asr_language  # n
 
 def test_explicit_language_tags():
     assert _normalize_asr_language("Cantonese", "有冇人知道？") == "cantonese"
-    assert _normalize_asr_language("YUE", "我哋聽日見") == "cantonese"
+    # SenseVoice 的大写供应商标签在其插件边界(_repl 标签清洗)已归一 cantonese，
+    # 不会裸传进本函数；这里只验规范标签路径。
     assert _normalize_asr_language("English", "hello there") == "en"
     assert _normalize_asr_language("Chinese", "你好") == "zh"
 
@@ -28,6 +29,28 @@ def test_mandarin_not_misclassified():
     # 普通话文本（含普粤共用字 下/好/系 等）不得被误判成粤语。
     assert _normalize_asr_language("Chinese", "你好，我想问一下你们公司的情况") == "zh"
     assert _normalize_asr_language("Chinese", "好的，那我等一下再联系你") == "zh"
+
+
+# ---- ASR 语言提示:值=模型 config support_languages 规范名(大小写不敏感回填) ----
+def test_asr_language_hint_call_mode():
+    # 通话模式:粤语钉(防 auto 误判)、英语钉(支持纯英语会话);zh 保持 auto
+    # 容忍夹英文 code-switching(「我哋 check 個 status」)。
+    from agent_runtime.providers.livekit_plugins import _asr_language_hint
+
+    assert _asr_language_hint("cantonese", pin=False) == "Cantonese"
+    assert _asr_language_hint("en", pin=False) == "English"
+    assert _asr_language_hint("zh", pin=False) == ""
+    assert _asr_language_hint("", pin=False) == ""
+
+
+def test_asr_language_hint_pinned_mode():
+    # 同传模式:源语言是用户建房时选定的,三种全钉,不吃 auto 漂移。
+    from agent_runtime.providers.livekit_plugins import _asr_language_hint
+
+    assert _asr_language_hint("zh", pin=True) == "Chinese"
+    assert _asr_language_hint("en", pin=True) == "English"
+    assert _asr_language_hint("cantonese", pin=True) == "Cantonese"
+    assert _asr_language_hint("", pin=True) == ""
     assert _normalize_asr_language("Chinese", "请问这个系统怎么使用？") == "zh"
 
 
@@ -47,7 +70,7 @@ def _mk_state(initial: str):
     return s
 
 
-def test_hysteresis_yue_customer_short_ambiguous_utterance_keeps_yue():
+def test_hysteresis_cantonese_customer_short_ambiguous_utterance_keeps_cantonese():
     # 粤语客户回「好」「嗯」「OK」：无粤语特征、短、标签 zh——不得拉回普通话。
     s = _mk_state("cantonese")
     s.update("zh", "好")
@@ -147,8 +170,8 @@ def test_collapse_voice_map_uses_persona_language():
     assert m == {"zh": "x"}
     # 空 map → 空。
     assert _collapse_voice_map({}, "cantonese") == {}
-    # 旧数据 yue 键/值 → 只读别名仍收敛成同一把粤语音色。
-    m = _collapse_voice_map({"zh": "male-qn-qingse", "yue": "Cantonese_GentleLady"}, "yue")
+    # 未知语言键不参与收敛（旧拼写键已由 DB 迁移清零，不再兜别名）。
+    m = _collapse_voice_map({"zh": "male-qn-qingse", "cantonese": "Cantonese_GentleLady", "fr": "x"}, "cantonese")
     assert m == {"zh": "Cantonese_GentleLady"}
 
 
@@ -160,13 +183,13 @@ def test_build_default_voice_map_single_speaker_wins():
     # 未配 speaker → 回落旧分语言。
     m = _build_default_voice_map({"speaker": "", "speaker_zh": "zh-a", "speaker_cantonese": "ca-b"})
     assert m == {"zh": "zh-a", "cantonese": "ca-b"}
-    # 旧键 speaker_yue 只读别名：仍组出 cantonese 键。
-    m = _build_default_voice_map({"speaker": "", "speaker_zh": "zh-a", "speaker_yue": "yue-b"})
-    assert m == {"zh": "zh-a", "cantonese": "yue-b"}
+    # 只配 cantonese 分语言键 → 只组 cantonese 键。
+    m = _build_default_voice_map({"speaker": "", "speaker_cantonese": "ca-b"})
+    assert m == {"cantonese": "ca-b"}
 
 
 # ---- LLM 输出：港式自然英夹（M3） ----
-def test_yue_rule_requires_hk_style_code_mixing():
+def test_cantonese_rule_requires_hk_style_code_mixing():
     from agent_runtime.providers.livekit_plugins import ContextState
     ctx = ContextState(account_id="acc-001")
     ctx.set_user_language("cantonese")
@@ -207,13 +230,16 @@ def test_render_split_prefix_has_instructions_tail_has_reference():
     ctx.add_summary("user", "客户第一轮说了内容")
     prefix = ctx.render_instruction_prefix()
     tail = ctx.render_context_tail()
-    # 稳定指令(用户语言/节奏/准则/话术/当前步)全在前缀
-    for sec in ("【用户语言】", "【回复节奏】", "【应答准则】", "【话术流程总览", "【现在这一步】"):
+    # 稳定指令(用户语言/节奏/准则/话术总览)全在前缀;当前步已移出前缀(推进只改尾部)
+    for sec in ("【用户语言】", "【回复节奏】", "【应答准则】", "【话术流程总览"):
         assert sec in prefix, sec
-    # 易变参考(知识/联网/记忆)全在尾部
-    for sec in ("【实时检索到的资料", "【联网检索到的资料", "【本通对话记忆】"):
+    assert "【现在这一步】" not in prefix
+    # 易变参考(当前步/记忆)在尾部,当前步放尾部最前;知识/联网节默认关
+    # (rag_enabled=False:封闭话术流程不做检索,单对象只上话术+对象档案)。
+    for sec in ("【现在这一步】", "【本通对话记忆】"):
         assert sec in tail, sec
-    assert "【现在这一步】" not in tail
+    assert "【实时检索到的资料" not in tail
+    assert "【联网检索到的资料" not in tail
     # 完整段 = 前缀在前 拼接 尾部
     full = ctx.render_system_message()
     assert full.startswith(prefix) and full.endswith(tail)
@@ -233,9 +259,10 @@ def test_render_prefix_stable_when_only_knowledge_changes():
 def test_knowledge_snippet_truncated_to_cap():
     from agent_runtime.providers.livekit_plugins import ContextState
     ctx = ContextState()
-    ctx.set_knowledge([{"text": "很长的知识条目" * 200}])  # >350 字
+    ctx.rag_enabled = True  # 渲染门默认关:开 RAG 才断言尾部截断渲染。
+    ctx.set_knowledge([{"text": "很长的知识条目" * 200}])  # >150 字
     tail = ctx.render_context_tail()
-    # 单条被截到 ~350
+    # 单条被截到 150(149 字 + …)
     assert len(tail) < 400
     assert "…" in tail
 
@@ -244,13 +271,13 @@ def test_context_rag_gate():
     from agent_runtime.agent import _context_rag_enabled
     import os as _os
     _os.environ.pop("CONTEXT_RAG", None)
-    # 绑话术(has_steps) → 默认关 RAG;无模板 → 开
-    assert _context_rag_enabled(True) is False
-    assert _context_rag_enabled(False) is True
+    # P1 起 RAG 默认全关(对象知识走【对象档案】静态前缀,话术对象只上话术),
+    # 不再按 has_steps 区分。
+    assert _context_rag_enabled() is False
     # 逃生口:CONTEXT_RAG=1 强制开
     _os.environ["CONTEXT_RAG"] = "1"
     try:
-        assert _context_rag_enabled(True) is True
+        assert _context_rag_enabled() is True
     finally:
         _os.environ.pop("CONTEXT_RAG", None)
 
@@ -294,29 +321,10 @@ def test_strip_stage_dirs_allows_minimax_vocal(monkeypatch):
     assert "(例如)" in _strip_stage_dirs("有啲情況(例如)咁")
 
 
-# ---- 粤语客服语言锚定：始终讲粤语，仅连续多轮才跟随客户切语言 ----
-def test_sticky_cantonese_agent_single_mandarin_turn_stays_cantonese():
-    from agent_runtime.agent import _sticky_reply_language
-    # 锚 cantonese；客户单轮普通话 → 仍回 cantonese(streak 记 1)。
-    rl, sticky, streak = _sticky_reply_language("cantonese", "zh", "cantonese", 0)
-    assert rl == "cantonese" and sticky == "cantonese" and streak == 1
-    # 下一轮仍是普通话 → 跟随切 zh。
-    rl, sticky, streak = _sticky_reply_language("cantonese", "zh", sticky, streak)
-    assert rl == "zh" and sticky == "zh"
-
-
-def test_sticky_cantonese_back_to_cantonese_resets():
-    from agent_runtime.agent import _sticky_reply_language
-    # 已切到 zh，客户回粤语 → 立刻回锚 cantonese。
-    rl, sticky, streak = _sticky_reply_language("cantonese", "cantonese", "zh", 0)
-    assert rl == "cantonese" and sticky == "cantonese" and streak == 0
-
-
-def test_sticky_no_anchor_follows_asr():
-    from agent_runtime.agent import _sticky_reply_language
-    # 无有效锚(空) → 退化为跟随 ASR。
-    rl, sticky, streak = _sticky_reply_language("", "zh", "", 0)
-    assert rl == "zh"
+# ---- 逐轮语言跟随已退役（A 线每通对话语言固定）----
+# 旧 _sticky_reply_language 滞回跟随测试已随机制一并撤下（函数定义仅兼容保留，
+# A 线 entrypoint 不再调用）。新政策回归点见 tests/test_fixed_language_call.py：
+# 混语言输入不得切换回复语言、【用户语言】规则整通字节静态、逐轮钩子永不落语言标记。
 
 
 # ---- 发音教学形输出拦截(lecture_guard) ----
@@ -332,9 +340,6 @@ def test_lecture_guard_replaces_jyutping_lesson():
     # 明确粤语 → 粤语罐头
     out2 = lecture_guard("我哋睇下發音要點：9九gau2高升調", "cantonese")
     assert out2 == "唔好意思，頭先聽得唔係好清楚，可唔可以再講多次個單號或者訂單號碼俾我？"
-    # 旧 yue 别名 → 同样落到粤语罐头
-    out3 = lecture_guard("我哋睇下發音要點：9九gau2高升調", "yue")
-    assert out3 == out2
 
 
 def test_lecture_guard_passes_normal_replies():
@@ -397,3 +402,32 @@ def test_strip_eos_tokens_streaming_across_chunks():
         assert _trailing_eos_partial("正常內容<expr type=") == ""
 
     asyncio.run(_run())
+
+
+# ---- P4-C 回归:联网检索尾巴收紧(≤1 条 ×150 字)+ 前缀语言规则会话开始即稳定 ----
+def test_web_snippets_capped_to_one_short_item():
+    from agent_runtime.providers.livekit_plugins import ContextState
+    ctx = ContextState(account_id="acc-001")
+    # 旧实现保留 2 条且不截断(P4 实测尾部被 Wikipedia 撑到 500-900 token):
+    # 现在最多 1 条、单条 150 字——开放域杂音既挤尾部预算又会带偏 4B 小模型。
+    ctx.rag_enabled = True  # 渲染门默认关:开 RAG 才断言尾部截断渲染。
+    ctx.set_web(["很长的联网摘要" * 100, "第二条联网结果"])
+    tail = ctx.render_context_tail()
+    assert "第二条联网结果" not in tail
+    assert len(ctx._web) == 1 and len(ctx._web[0]) <= 150
+    assert len(tail) < 400
+    # 空结果清空尾巴。
+    ctx.set_web([])
+    assert ctx.render_context_tail().find("【联网检索到的资料") == -1
+
+
+def test_user_language_rule_stable_across_same_lang_turns():
+    from agent_runtime.providers.livekit_plugins import ContextState
+    ctx = ContextState(account_id="acc-001")
+    # 会话开始前就按 greet_lang 锚定(agent.py 修复点):问候轮与首轮 user lang
+    # 一致时前缀字节不变——旧代码首轮才首次写入语言规则,问候→首轮前缀断裂。
+    ctx.set_user_language("cantonese")
+    p1 = ctx.render_instruction_prefix()
+    ctx.set_user_language("cantonese")  # ASR 同语言轮:锚定重算但值不变
+    p2 = ctx.render_instruction_prefix()
+    assert p1 == p2

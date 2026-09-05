@@ -5,6 +5,8 @@ import hashlib
 import io
 import json
 import os
+import queue
+import re
 import tempfile
 import threading
 import time
@@ -42,6 +44,16 @@ REF_TARGET_SECONDS = float(os.environ.get("QWEN3_TTS_REF_TARGET_SECONDS", "8"))
 BACKEND = os.environ.get("QWEN3_TTS_BACKEND", "transformers").lower()
 
 app = FastAPI(title="Bok Qwen3-TTS Sidecar")
+
+# 段内有没有「可朗读」字符（字母/数字/汉字等 \w）。纯标点/空白输入（「。」「？」）
+# 绝不进模型：Qwen3-TTS 对无音节 prompt 会连环 hallucinate 4-30s 音频爆段
+# （P4-B 实证），爆段霸住 GPU+playout，把下一轮回复压到几十秒后才出声。
+_WORD_CHAR_RE = re.compile(r"\w")
+
+
+def _has_word_char(text: str) -> bool:
+    return _WORD_CHAR_RE.search(text or "") is not None
+
 
 
 class TTSService:
@@ -322,9 +334,10 @@ class TTSService:
         temperature: float | None = None,
         top_k: int | None = None,
     ) -> bytes:
-        self.ensure_loaded()
-        if not text:
+        if not _has_word_char(text):
+            # 纯标点/空白：零音频短路（连模型加载都唔触发，绝不烧 GPU 合成爆段）。
             return b""
+        self.ensure_loaded()
         if BACKEND == "mlx":
             return self._synthesize_mlx(
                 text=text,
@@ -418,6 +431,10 @@ class TTSService:
         playback as soon as synthesis completes instead of waiting for the
         whole response body.
         """
+        if not _has_word_char(text):
+            # 纯标点/空白：零帧短路（连模型加载都唔触发）。agent 侧
+            # _Qwen3SynthesizeStream 已过滤，这里兜底防旧客户端/直接调用踩爆段。
+            return
         self.ensure_loaded()
         if not text:
             return
@@ -456,7 +473,7 @@ class TTSService:
     def _normalize_language(model: Any, language: str) -> str:
         """Map requested language to one the model actually supports.
 
-        Qwen3-TTS does not list Cantonese/yue among its codec language ids, but
+        Qwen3-TTS does not list Cantonese among its codec language ids, but
         community-verified ICL voice cloning with a Cantonese reference audio
         produces Cantonese output when the language token is `chinese`.
         Fall back to `Auto` for any other unsupported request instead of
@@ -474,7 +491,7 @@ class TTSService:
                 supported = set()
         if supported and requested in supported:
             return language
-        if requested in {"yue", "cantonese", "cantonese_chinese"}:
+        if requested in {"cantonese", "cantonese_chinese"}:
             return "chinese"
         return "Auto"
 
@@ -904,12 +921,23 @@ async def audio_speech(payload: dict[str, Any]) -> Response:
     top_k = payload.get("top_k")
 
     if streaming:
-        def _gen():
-            # Sync generator: Starlette iterates it in a threadpool so the
-            # blocking model inference never stalls the event loop.
-            yield from (
-                frame
-                for _, frame in service.synthesize_chunks(
+        async def _agen():
+            # 关键（P4-A 根因修复）：synthesize_chunks 内部 `with self._gen_lock`
+            # 横跨整个生成过程（每个 yield 之间都持锁）。旧实现把同步生成器直接交给
+            # Starlette——线程池逐 next() 会【跳线程】：(1) 另一线程在锁被挂起持有
+            # 时 acquire → RLock 非属主线程永远拿不到 → 请求永久卡死；(2) 客户端断开
+            # （打断/挂断时必然发生）后生成器被 GC 喺别的线程 close →
+            # "cannot release un-acquired lock"（tts.log 实证）→ 锁泄漏 → 之后所有
+            # 合成请求永久卡死 → agent 语音队列被堵死、下一轮 LLM 永远轮唔到。
+            # 修法：专职 producer 线程独占生成器生命周期——acquire/release/关闭全部
+            # 喺同一根线程内完成；consumer 经 queue 拿帧，断开时置 stop 让 producer
+            # 自己收尾（锁喺属主线程释放，绝唔泄漏）。
+            q: queue.Queue = queue.Queue(maxsize=64)
+            done: object = object()
+            stop = threading.Event()
+
+            def _produce():
+                gen = service.synthesize_chunks(
                     text=text,
                     language=language,
                     voice=voice,
@@ -921,10 +949,50 @@ async def audio_speech(payload: dict[str, Any]) -> Response:
                     temperature=temperature,
                     top_k=top_k,
                 )
-            )
+                try:
+                    for is_first, frame in gen:
+                        # 带超时阻塞 put：consumer 消失（stop 置位）时最多 0.25s 察觉。
+                        while not stop.is_set():
+                            try:
+                                q.put(frame, timeout=0.25)
+                                break
+                            except queue.Full:
+                                continue
+                        if stop.is_set():
+                            break
+                except Exception:  # pragma: no cover - 生成器内部异常照断流收尾
+                    import traceback
+
+                    traceback.print_exc()
+                finally:
+                    # 生成器（连带 _gen_lock）必须喺 producer 线程内关闭：
+                    # RLock 只有获锁线程能释放，跨线程 close 就是泄漏源。
+                    stop.set()
+                    try:
+                        gen.close()
+                    except Exception:  # pragma: no cover
+                        pass
+                    for _ in range(8):  # 尽力通知 consumer；队列满都唔好吊死本线程
+                        try:
+                            q.put(done, timeout=0.25)
+                            break
+                        except queue.Full:
+                            continue
+
+            threading.Thread(target=_produce, daemon=True, name="tts-gen").start()
+            loop = asyncio.get_running_loop()
+            try:
+                while True:
+                    item = await loop.run_in_executor(None, q.get)
+                    if item is done:
+                        break
+                    yield item
+            finally:
+                # 客户端断开/响应被取消：通知 producer 自行收尾（锁喺属主线程释放）。
+                stop.set()
 
         return StreamingResponse(
-            _gen(),
+            _agen(),
             media_type="audio/pcm",
             headers={
                 "X-Sample-Rate": str(sample_rate),

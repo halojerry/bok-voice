@@ -78,7 +78,7 @@ services:
       CONTROL_PLANE_URL: http://control-plane:8000
       DATABASE_URL: postgresql+psycopg://bok:bok@postgres:5432/bok_voice
       # Local sherpa SenseVoice model dir (mounted from the repo data/models).
-      SHERPA_MODEL_DIR: /app/data/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue
+      SHERPA_MODEL_DIR: /app/data/models/sherpa-onnx-sense-voice
       QWEN3_ASR_BASE_URL: http://host.docker.internal:8787
       QWEN3_TTS_BASE_URL: http://host.docker.internal:8788
       OLLAMA_BASE_URL: http://host.docker.internal:11434/v1

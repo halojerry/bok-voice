@@ -10,7 +10,8 @@ import time
 from dataclasses import dataclass
 
 import httpx
-from livekit.agents import APIConnectOptions, llm, stt, tts, vad
+from livekit.agents import APIConnectOptions, NOT_GIVEN, llm, stt, tts, utils, vad
+from livekit.plugins.openai import LLM as _OpenAICompatBase
 
 # 粤语特征字/词：Qwen3-ASR 对粤语偶发判成 Chinese（语言标签不稳），
 # 若文本命中这些地道粤语用字则按粤语处理，避免 LLM 被误判成普通话后回普。
@@ -34,7 +35,7 @@ _MANDARIN_MARKERS = ("的", "了", "这", "那", "什", "么", "说", "没", "�
 # 不放纯字形(简→繁)条目——字形由规则里的「直接輸出繁體」统一管,避免两件事搅在一起。
 # 只保留客服高频词(疑问/人称/常用动词/礼貌/集运业务);低频书面词交给模型粤语能力,
 # 控制静态前缀体积(prefill 与 KV-cache 都受益)。
-_HK_YUE_LEXICON = (
+_HK_CANTONESE_LEXICON = (
     "这个→呢個 那个→嗰個 这些→呢啲 这里→呢度 那里→嗰度 什么→乜嘢 怎么→點樣 为什么→點解 "
     "谁→邊個 哪里→邊度 什么时候→幾時 多少→幾多 "
     "是→係 不是→唔係 的→嘅 了→咗 在→喺 来→嚟 没有→冇 不要→唔好 不用→唔使 不知道→唔知 "
@@ -112,8 +113,7 @@ def _lecture_lang(text: str) -> str:
 
 
 def lecture_canned(lang: str | None = None) -> str:
-    # 旧数据/旧标签可能仍是 "yue"：只读别名，统一按粤语罐头处理。
-    return _LECTURE_CANNED_CANTONESE if lang in ("cantonese", "yue") else _LECTURE_CANNED_ZH
+    return _LECTURE_CANNED_CANTONESE if lang == "cantonese" else _LECTURE_CANNED_ZH
 
 
 def lecture_guard(text: str, lang: str | None = None) -> str:
@@ -170,11 +170,11 @@ def _classify_spoken_language(lang: str, text: str) -> tuple[str, bool]:
     """归一语言标签并给出「强证据」判断。
 
     返回 (lang, strong)：strong=True 表示该判定有可靠证据（粤语特征字/词、
-    明确的 cantonese/yue 标签、实质性英文、够长的普通话句子）；strong=False 表示标签
+    明确的 cantonese 标签、实质性英文、够长的普通话句子）；strong=False 表示标签
     模糊（普通话/英文标签 + 短句或借用词）——这种轮次不应把说话人语言拉走。
     """
     key = (lang or "").strip().lower()
-    if key in {"cantonese", "yue"}:
+    if key == "cantonese":
         return "cantonese", True
     if key in {"en", "english"}:
         if _looks_english(text):
@@ -201,8 +201,8 @@ def _normalize_asr_language(lang: str, text: str) -> str:
 class LanguageState:
     """Shared between ASR and TTS so replies use the language the user spoke.
 
-    规范语言值: zh / cantonese / en（粤语统一叫 cantonese；旧数据里的 yue 在
-    入口处作只读别名归一到 cantonese，新代码永不产出 yue）。
+    规范语言值: zh / cantonese / en（粤语统一叫 cantonese，全时空唯一拼写；
+    旧值已由 CP 启动迁移清零，代码不再兜别名）。
     lang 的切换带滞后：只有强证据（明确的 cantonese/en 标签、粤语特征字词、够长的
     普通话句子）才允许改变当前语言；标签模糊的短轮次（好/嗯/係…）保持原语言，
     避免 ASR 单轮误标把「粤语客户」拉成普通话、LLM 跟着回普、TTS 切音色。
@@ -217,63 +217,28 @@ class LanguageState:
             self.lang = norm
 
 
-class OpenAICompatLLM(llm.LLM):
-    provider = "openai-compat"
-    model = ""
+class PinnedLanguageState(LanguageState):
+    """钉定语言态：lang 恒等于构造值，update 永不改写。
 
-    def __init__(self, api_key, model, base_url):
-        from openai import AsyncOpenAI
+    用于「语言钉死」场景（B 线同传源语言 / A 线设置 asr.language_mode=fixed）：
+    per-request hint 整场恒下发钉定语言，不吃 ASR 强证据漂移，也不与共享
+    language_state 的回复锚定/滞回互相干扰。
+    """
 
-        super().__init__()
-        self._model = model
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-        self._max_tokens = int(os.environ.get("LLM_MAX_TOKENS", "160"))
-
-    def chat(self, *, chat_ctx, tools=None, conn_options=None, parallel_tool_calls=None, tool_choice=None, extra_kwargs=None):
-        messages = _chat_messages(chat_ctx)
-        return _OpenAICompatStream(
-            self, chat_ctx, messages, conn_options or APIConnectOptions(), self._max_tokens
-        )._real
+    def update(self, lang: str | None, text: str = "") -> None:
+        pass
 
 
-def _chat_messages(chat_ctx) -> list[dict]:
-    messages = []
-    for item in getattr(chat_ctx, "items", []):
-        if isinstance(item, llm.ChatMessage):
-            content = getattr(item, "content", "")
-            if isinstance(content, str):
-                text = content
-            else:
-                # content 里文本部分是纯 str（ChatContent = str | ImageContent | AudioContent），
-                # 之前用 getattr(c,"text") 会把用户文本全部丢成空串，导致 LLM 听不见用户。
-                parts = [
-                    c if isinstance(c, str) else (getattr(c, "text", "") or "")
-                    for c in content
-                ]
-                text = "\n".join(parts)
-            messages.append({"role": item.role, "content": text})
-    if not messages:
-        messages = [{"role": "system", "content": "你是 Bok Voice 客服助手。"}]
-    return messages
+class MlxLlmLLM(_OpenAICompatBase):
+    """本地 OpenAI 兼容 LLM（macOS mlx_lm / Windows llama-server，:1235，thinking 关闭）。
 
-
-class DeepSeekLLM(OpenAICompatLLM):
-    provider = "deepseek"
-    model = "deepseek-chat"
-
-    def __init__(self, api_key, model="deepseek-chat", base_url="https://api.deepseek.com/v1"):
-        super().__init__(api_key=api_key, model=model, base_url=base_url)
-
-
-class MlxLlmLLM(OpenAICompatLLM):
-    """Local OpenAI-compatible LLM (mlx_lm on macOS, llama-server on Windows).
-
-    Both servers expose /v1 on 127.0.0.1:1235 and run with thinking disabled
-    (enable_thinking=false), so replies are fast and content-only.
+    内芯=官方 livekit-plugins-openai（兼容任意 OpenAI 端点）：白得 function tools
+    解析、APIError 重试、error 事件、TTFT/usage 官方 metrics；原先手写的流解析/
+    重试/秒表已删。stop/max_tokens 走 extra_body（本地服务吃经典参数，不吃新的
+    max_completion_tokens）；温度 LLM_TEMPERATURE 默认 0.35（4B 小模型防飘/复读）。
     """
 
     provider = "mlx"
-    model = "local"
 
     def __init__(
         self,
@@ -285,12 +250,183 @@ class MlxLlmLLM(OpenAICompatLLM):
         # only a last-resort placeholder when no env/settings provide one.
         if model in (None, "", "local"):
             model = os.environ.get("MLX_LLM_MODEL") or "local"
+        extra_body = {
+            "max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "160")),
+            # Qwen3 对话模板以 <|im_end|> 收尾:唔传 stop 个 server 会当文字输出
+            # (转录/TTS 见住 <|im_end|>),喺源头截停最干净;下游再剥多一重保险。
+            "stop": ["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
+        }
+        # 定制采样(env 未设时不进请求,A 线默认路径零变化):B 线 MT 档要
+        # top_p/top_k/重复惩罚收窄采样,防翻译小模型自由发挥/复读。top_k 收
+        # 整数(mlx_lm server 按 int 校验),其余收浮点。
+        for key, env_key in (
+            ("top_p", "LLM_TOP_P"),
+            ("top_k", "LLM_TOP_K"),
+            ("repetition_penalty", "LLM_REPETITION_PENALTY"),
+        ):
+            raw = os.environ.get(env_key, "").strip()
+            if not raw:
+                continue
+            try:
+                extra_body[key] = int(raw) if raw.isdigit() else float(raw)
+            except ValueError:  # pragma: no cover - 配错当没配,唔炸构造
+                continue
         super().__init__(
-            api_key=api_key,
             model=model,
+            api_key=api_key,
             base_url=base_url
             or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
+            temperature=float(os.environ.get("LLM_TEMPERATURE", "0.35")),
+            extra_body=extra_body,
         )
+
+    async def _prewarm_impl(self) -> None:
+        # 真实 1-token 生成：暖 mlx 模型（冷启动的 KV 分配/首 token 占首包大头）。
+        # 官方 prewarm 只验连接；AgentSession 构造时会自动调用本钩子。
+        if os.environ.get("LLM_WARMUP", "1") != "1":
+            return
+        try:
+            await self._client.chat.completions.create(
+                model=self._opts.model,
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=1,
+            )
+            print("[agent] llm warmup done", flush=True)
+        except Exception as exc:  # pragma: no cover - warmup 失败不致命
+            print(f"[agent] llm warmup skipped: {exc!r}", flush=True)
+
+    async def prefix_prewarm(self, messages: list[dict]) -> None:
+        """真实 prompt 形状的 1-token 预热（会话首轮前，agent.py 发起）。
+
+        与 _prewarm_impl（只暖模型/连接）不同：这里喂「真实 merged system +
+        fake user 轮」，mlx_lm server 会把该前缀的 KV 留喺 prompt cache——
+        turn-1 真请求共享整段 system 前缀 → cached≈system 长度，免 ~1.4s
+        全量 prefill（会话首轮 cached=0 的专项解法）。失败由调用方吞掉。
+        冷启动竞态：预热请求会排在官方 prewarm/开场白 prefill 后面，共享
+        client 的 read=5s 会提前放弃（实测 APITimeoutError）——per-request
+        放宽 read=30s，让服务端把前缀 prefill 跑完入 cache（client 等耐些，
+        反正 fire-and-forget 唔阻塞任何人）。
+        """
+        await self._client.chat.completions.create(
+            model=self._opts.model,
+            messages=messages,
+            max_tokens=1,
+            timeout=httpx.Timeout(connect=5.0, read=30.0, write=5.0, pool=5.0),
+        )
+
+
+class DeepSeekLLM(_OpenAICompatBase):
+    """DeepSeek 云端（OpenAI 兼容契约，与本地 MlxLlmLLM 同一官方内芯）。"""
+
+    provider = "deepseek"
+
+    def __init__(self, api_key="", model="deepseek-chat", base_url="https://api.deepseek.com/v1"):
+        super().__init__(
+            model=model or "deepseek-chat",
+            api_key=api_key,
+            base_url=base_url,
+            temperature=float(os.environ.get("LLM_TEMPERATURE", "0.35")),
+            extra_body={"max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "160"))},
+        )
+
+
+# Hy-MT2 官方模板的目标语名称(中文变体);未知语言值直接原样进模板。
+_MT_PROMPT_NAMES = {"zh": "中文", "cantonese": "粤语", "en": "英语"}
+
+
+def _forward_extra_kwargs(extra_kwargs):
+    """包装层向内芯透传 extra_kwargs 的统一口径:非空 dict 原样,其余一律 NOT_GIVEN。
+
+    官方 openai 内芯(1.7.1)用 is_given(extra_kwargs) 判定,而 is_given(None)=True,
+    透传 None 会在内芯 extra.update(None) 处 TypeError——框架从不传 extra_kwargs,
+    包装层默认值必须给 NOT_GIVEN(与官方 chat 签名同契约),None 绝不进内芯。
+    """
+    return extra_kwargs if extra_kwargs else NOT_GIVEN
+
+
+def _bind_metrics_forward(inner: llm.LLM, outer: llm.LLM) -> None:
+    """包装层把内芯的 LLMMetrics("metrics_collected")转发到自己身上。
+
+    官方管线只在 session.llm(最外层包装)上挂监听(agent_activity.py:
+    self.llm.on("metrics_collected", ...)),而 LLMMetrics 由内芯的流监视器 emit 在
+    【创建流的对象】上(llm/llm.py:432 self._llm.emit)——包装层不转发,LLM metrics
+    永远到不了 session,agent.py 的 LLM_TTFT_MS(official) 哑火(RCA §0.3)。
+    STT 侧 Qwen3ASRLiveSTT 已同款转发;这里给 LLM 包装层统一补齐。
+    """
+    inner.on("metrics_collected", lambda *args, **kwargs: outer.emit("metrics_collected", *args, **kwargs))
+
+
+def _mt_prompt(text: str, target_lang: str) -> str:
+    """官方 Hy-MT2 中文翻译模板:只要译文,不解释。"""
+    name = _MT_PROMPT_NAMES.get(target_lang, target_lang)
+    return f"将以下文本翻译为 `{name}`，注意只需要输出翻译后的结果，不要额外解释：\n\n`{text}`"
+
+
+class StatelessMTLLM(llm.LLM):
+    """逐句无状态 MT 包装(Hy-MT2 翻译小模型,B 线同传专用)。
+
+    MT 模型逐句无状态:每次调用只取进来 chat_ctx 的最后一条 user 文本,套官方
+    模板压成一条 user 消息发内芯。丢历史有两个理由——历史会污染译文(前文术语/
+    译法串味,翻译要每句独立);且无状态请求前缀恒定,prefill 不随通话增长,
+    TTFT 全场稳定(第 100 句同第 1 句快)。
+    """
+
+    def __init__(self, inner: llm.LLM, target_lang: str):
+        super().__init__()
+        self._inner = inner
+        self._target_lang = target_lang
+        _bind_metrics_forward(inner, self)
+
+    @property
+    def model(self) -> str:
+        # model/provider 跟内芯走(usage/metrics 面板显示真实内芯,不是包装层)。
+        return str(getattr(self._inner, "model", "unknown"))
+
+    @property
+    def provider(self) -> str:
+        return str(getattr(self._inner, "provider", "unknown"))
+
+    def chat(
+        self,
+        *,
+        chat_ctx,
+        tools=None,
+        conn_options=None,
+        parallel_tool_calls=None,
+        tool_choice=None,
+        extra_kwargs=NOT_GIVEN,
+    ):
+        last_user = ""
+        for item in reversed(getattr(chat_ctx, "items", []) or []):
+            if getattr(item, "role", None) == "user":
+                last_user = str(getattr(item, "text_content", None) or "")
+                break
+        if not last_user:
+            # 异常轮次(冇 user 文本):原样透传,唔发空模板请求。
+            return self._inner.chat(
+                chat_ctx=chat_ctx,
+                tools=tools,
+                conn_options=conn_options,
+                parallel_tool_calls=parallel_tool_calls,
+                tool_choice=tool_choice,
+                extra_kwargs=_forward_extra_kwargs(extra_kwargs),
+            )
+        mt_ctx = llm.ChatContext()
+        mt_ctx.add_message(role="user", content=_mt_prompt(last_user, self._target_lang))
+        return self._inner.chat(
+            chat_ctx=mt_ctx,
+            tools=tools,
+            conn_options=conn_options,
+            parallel_tool_calls=parallel_tool_calls,
+            tool_choice=tool_choice,
+            extra_kwargs=_forward_extra_kwargs(extra_kwargs),
+        )
+
+    async def _prewarm_impl(self) -> None:
+        # 委托内芯:MT 模型同样吃 1-token 真生成的暖机收益(对齐 MlxLlmLLM)。
+        inner_prewarm = getattr(self._inner, "_prewarm_impl", None)
+        if inner_prewarm is not None:
+            await inner_prewarm()
 
 
 class ScriptedLLM(llm.LLM):
@@ -336,59 +472,6 @@ class _ScriptedLLMStream:
         return self._real
 
 
-class _OpenAICompatStream:
-    def __init__(self, plugin, chat_ctx, messages, conn_options, max_tokens=256):
-        class _Stream(llm.LLMStream):
-            async def _run(self):
-                try:
-                    t0 = time.monotonic()
-                    # 估算本轮 system+历史 tokens：中英混排下 len 与 Qwen BPE 接近，
-                    # 作 prefill 量的粗略标尺（真机看 LLM_TTFT_MS + 行数趋势即可）。
-                    try:
-                        est_tokens = sum(len(str(m.get("content") or "")) for m in messages)
-                    except Exception:  # pragma: no cover
-                        est_tokens = 0
-                    stream = await plugin._client.chat.completions.create(
-                        model=plugin._model,
-                        messages=messages,
-                        stream=True,
-                        max_tokens=max_tokens,
-                        # Qwen3 对话模板以 <|im_end|> 收尾:唔传 stop 个 server 会当文字输出
-                        # (转录/TTS 见住 <|im_end|>),喺源头截停最干净;下游再剥多一重保险。
-                        stop=["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
-                        # 专业客服取中低温：过高显油滑/跑题/乱码，过低像念稿。4B 更小更易
-                        # 飘/复读，0.35 让语气稳定克制（可用 env LLM_TEMPERATURE 覆盖）。
-                        temperature=float(os.environ.get("LLM_TEMPERATURE", "0.35")),
-                    )
-                    acc = ""
-                    ttft_logged = False
-                    async for chunk in stream:
-                        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                            text = chunk.choices[0].delta.content
-                            if not ttft_logged:
-                                # P0 秒表:首字(≈TTFT)时刻。est_tokens 供「prompt 瘦身」判断。
-                                print(
-                                    f"LLM_TTFT_MS {(time.monotonic() - t0) * 1000:.0f} "
-                                    f"prompt_chars={est_tokens}",
-                                    flush=True,
-                                )
-                                ttft_logged = True
-                            acc += text
-                            if any(ch in acc for ch in "。！？!?") and not getattr(self, "_sent_logged", False):
-                                # 首句(句号收尾)时刻——TTS overlap 在此之后即可出声。
-                                print(f"LLM_FIRST_SENT_MS {(time.monotonic() - t0) * 1000:.0f}", flush=True)
-                                self._sent_logged = True
-                            delta = llm.ChoiceDelta(content=text, role="assistant")
-                            self._event_ch.send_nowait(llm.ChatChunk(id=getattr(chunk, "id", "stream"), delta=delta))
-                except asyncio.CancelledError:
-                    raise
-
-        self._real = _Stream(llm=plugin, chat_ctx=chat_ctx, tools=[], conn_options=conn_options)
-
-    def __aiter__(self):
-        return self._real
-
-
 class _ExprPrependStream(llm.LLMStream):
     """在真实 LLM 流之前先发一个 <expr type="expression" label="..."/> 标记块。"""
 
@@ -397,12 +480,27 @@ class _ExprPrependStream(llm.LLMStream):
         self._inner = inner
         self._tag = tag
 
+    async def _metrics_monitor_task(self, event_aiter) -> None:
+        # 官方 LLMStream 基类会为每条流跑一个 metrics 监视器,流结束时在【绑定的
+        # llm】上 emit "metrics_collected"(llm/llm.py:432)。本流只是「expr 标记块 +
+        # 透传内芯」:若照基类 emit,会得到一份 TTFT≈0 的假 LLMMetrics(expr 标记块
+        # 是首块、has_response()=True 直接掐表),且 usage 与内芯那份双计。真实
+        # LLMMetrics 由内芯(MlxLlmLLM)发出、经 _bind_metrics_forward 逐层转发,
+        # 这里只排空监视分支(tee 的另一个 peer 不排空会白积 buffer),不 emit。
+        async for _ in event_aiter:
+            pass
+
     async def _run(self):
         self._event_ch.send_nowait(
             llm.ChatChunk(id="expr-tag", delta=llm.ChoiceDelta(content=self._tag, role="assistant"))
         )
         async for ev in self._inner:
             self._event_ch.send_nowait(ev)
+
+
+# 对象档案行边界=调用方给的显式换行(每个输入行是一个语义单元,如一行背景
+# +一行备注);绝不在句号处二次切分——多句背景若被句号切碎,第 2 行(备注)
+# 会被静默挤掉,档案失真。
 
 
 class ContextState:
@@ -413,7 +511,7 @@ class ContextState:
     message (top-K snippets + bounded conversation summary) each turn.
     """
 
-    def __init__(self, account_id: str = "", max_snippets: int = 3, max_summary_chars: int = 800):
+    def __init__(self, account_id: str = "", max_snippets: int = 2, max_summary_chars: int = 1200):
         self.account_id = account_id
         self._max_snippets = max_snippets
         self._max_summary_chars = max_summary_chars
@@ -423,6 +521,45 @@ class ContextState:
         self._web: list[str] = []
         self._flow_overview: str = ""
         self._flow_current: str = ""
+        self._object_brief: str = ""
+        # RAG 检索段渲染门(默认关):绑分步话术的封闭流程不做知识库/联网检索
+        # (单对象只上话术+对象档案),易变尾部只剩当前步+记忆,尾部预算最小化。
+        # set_knowledge/set_web 仍可照常喂数据(开放人设场景),只有 rag_enabled=True
+        # 时 tail 才渲染那两节。agent.py 装配时按自身 RAG 门控(_context_rag_enabled)
+        # 置位,或直接改用 ContextState.from_env() 装配(CONTEXT_RAG=1 → True)。
+        self.rag_enabled: bool = False
+
+    @classmethod
+    def from_env(cls, account_id: str = "") -> "ContextState":
+        """env 装配口:CONTEXT_RAG=1 → 打开知识/联网节的尾部渲染(默认关)。
+
+        与 agent.py 的取数门控 _context_rag_enabled 同一 env 开关;装配处换用
+        本口即可让「取数开」与「渲染开」永远同源,不留两套判定。
+        """
+        st = cls(account_id=account_id)
+        if os.environ.get("CONTEXT_RAG", "") == "1":
+            st.rag_enabled = True
+        return st
+
+    def set_object_brief(self, text: str) -> None:
+        """存入【对象档案】(会话装配时一次性注入,整场静态,进稳定指令前缀)。
+
+        有界:最多 2 行 × 每行 150 字。行边界=输入里的显式换行——每个输入行是
+        一个语义单元(如一行背景+一行备注),绝不在句号处二次切分(多句背景被
+        句号切碎会把第 2 行备注静默挤掉,档案失真)。单行超长硬截断(149 字 +
+        「…」)。切分/截断全部确定性:同一输入永远得到同一份档案字节,保证前缀
+        KV-cache 不因档案措辞变化而断裂。空串清档。
+        """
+        raw = str(text or "").replace("\r\n", "\n")
+        lines: list[str] = []
+        for line in raw.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            lines.append((line[:149] + "…") if len(line) > 150 else line)
+            if len(lines) >= 2:
+                break
+        self._object_brief = "\n".join(lines)
 
     def set_flow(self, overview: str, current: str) -> None:
         """设置对话流程:overview 为基础注入(全貌),current 为每轮当前步约束。"""
@@ -434,23 +571,30 @@ class ContextState:
         self._flow_current = current
 
     def set_web(self, results: str | list[str]) -> None:
-        """注入联网检索结果（Wikipedia/DDG 摘要），随 system 消息给 LLM 参考。"""
+        """注入联网检索结果（Wikipedia/DDG 摘要），随 system 消息给 LLM 参考。
+
+        注意:数据照常收(截到 1 条×150 字),但 tail 渲染受 rag_enabled 门控
+        (默认关)——CONTEXT_RAG=1/开放人设装配时置 True 才会出现在尾部。
+        """
         if isinstance(results, str):
             self._web = [results] if results.strip() else []
         elif results:
             self._web = list(results)
         else:
             self._web = []
-        # 联网结果最多保留 2 条、各截断，避免撑爆上下文。
-        if len(self._web) > 2:
-            self._web = self._web[:2]
+        # 联网结果是最弱的参考源（开放域/wiki 杂音既挤占尾部预算又会带偏 4B 小模型
+        # ——P4-C：「有冇人？知道。」检索回 Wikipedia → 回复幻觉成普通话乱语）。
+        # 收紧到最多 1 条、单条 150 字：够给一句事实线索，唔够位带偏回复。
+        self._web = [s.strip() for s in self._web[:1] if str(s).strip()]
+        if self._web and len(self._web[0]) > 150:
+            self._web[0] = self._web[0][:149] + "…"
 
     def set_user_language(self, lang: str | None) -> None:
         """ASR 每轮检测到的用户语言：随 system 指令注入，约束回复语言。"""
         key = (lang or "").strip().lower()
         if key in {"chinese", "zh", "mandarin"}:
             self._user_lang = "zh"
-        elif key in {"cantonese", "yue"}:
+        elif key == "cantonese":
             self._user_lang = "cantonese"
         elif key in {"english", "en"}:
             self._user_lang = "en"
@@ -458,13 +602,17 @@ class ContextState:
             self._user_lang = key
 
     def set_knowledge(self, snippets: list[dict]) -> None:
+        """注入知识库检索片段(单条 150 字截断)。渲染受 rag_enabled 门控(默认关),
+        CONTEXT_RAG=1 路径由装配处置 True 后重新上尾。"""
         seen: set[str] = set()
         out: list[str] = []
         for s in snippets or []:
             text = str(s.get("text", "") or "").strip()
             # 单条截断：防超大文档整段进 system（单条无限长会撑爆每轮 prefill）。
-            if len(text) > 350:
-                text = text[:349] + "…"
+            # 150 字/条是尾部预算的单条配额（瘦砍自 350）；真实尾部预算公式见
+            # render_context_tail 注释（当前步 ~321 字 + 记忆 6×200 字为主体）。
+            if len(text) > 150:
+                text = text[:149] + "…"
             if text and text not in seen:
                 seen.add(text)
                 out.append(text)
@@ -492,16 +640,17 @@ class ContextState:
         """【稳定指令前缀】——放最前、紧贴人设 base。
 
         含：用户语言规则 / 回复节奏 / 应答准则 / 话术流程总览(整通不变) /
-        现在这一步(同一步内不变,flow 推进才变)。这些是模型要遵守的指令，
-        逐轮字节尽量稳定 → token0 起的公共前缀跨轮命中 mlx_lm KV-cache
-        （同人设/模板/语言时跨 call 也共享）；真正每轮变的检索资料/记忆放尾部。
+        对象档案(set_object_brief 会话装配时一次性注入,整通不变)。
+        不变量：前缀整场字节不变（步骤推进只改尾部）→ mlx KV-cache 整场命中；
+        当前步约束已移到尾部（推进若改前缀,token0 起整段重 prefill,实测卡 3-5s）。
+        真正每轮变的当前步/检索资料/记忆都放 render_context_tail()。
         """
         parts: list[str] = []
         if self._user_lang:
             names = {"zh": "普通话/中文", "cantonese": "粤语（广东话）", "en": "英语"}
             name = names.get(self._user_lang, self._user_lang)
             if self._user_lang == "cantonese":
-                rule = self._yue_rule()
+                rule = self._cantonese_rule()
             elif self._user_lang == "en":
                 rule = "Reply in natural spoken English only (like on a phone call); do not explain or add notes."
             else:
@@ -530,20 +679,28 @@ class ContextState:
         )
         if self._flow_overview:
             parts.append("【话术流程总览(别照读,按进度推进)】\n" + self._flow_overview)
-        if self._flow_current:
-            parts.append("【现在这一步】\n" + self._flow_current)
+        # 对象档案:静态、整场不变,放总览之后(先懂流程再看客户是谁)。有界
+        # (2 行×150 字,set_object_brief 保证),前缀体积影响一次性 prefill 可忽略。
+        if self._object_brief:
+            parts.append("【对象档案】\n" + self._object_brief)
         return "\n\n".join(parts)
 
     def render_context_tail(self) -> str:
-        """【易变参考尾部】——每轮变的检索资料/记忆，垫在 system 最末。
+        """【易变参考尾部】——每轮变的当前步/检索资料/记忆，垫在 system 最末。
 
-        这样稳定前缀(指令+话术+当前步) + 人设 base 在前且逐轮字节不变，
-        每轮只需 prefill 尾部的新知识/新记忆；其余吃 KV-cache。
+        前缀(稳定指令+话术总览+对象档案)+人设 base 在前且整场字节不变，flow
+        步骤推进只改这段尾部（短、逐轮重渲染）→ 前缀 KV-cache 照命中，每轮只
+        prefill 尾部增量。当前步放尾部最前，让「推进=换一小段尾部」而非动前缀。
+        知识/联网两节仅在 rag_enabled=True 时渲染(默认关:封闭话术流程不做检索,
+        单对象只上话术+对象档案;CONTEXT_RAG=1/开放人设由装配处置 True)。
         """
         parts: list[str] = []
-        if self._snippets:
+        if self._flow_current:
+            # 当前步约束(随 flow 推进而变):放尾部最前,推进只改这里、前缀字节不动。
+            parts.append("【现在这一步】\n" + self._flow_current)
+        if self.rag_enabled and self._snippets:
             parts.append("【实时检索到的资料（知识库）】\n" + "\n".join(f"- {s}" for s in self._snippets))
-        if self._web:
+        if self.rag_enabled and self._web:
             parts.append(
                 "【联网检索到的资料（来源：Wikipedia/即时答案，可能过时或不准）】\n"
                 + "\n".join(f"- {s}" for s in self._web)
@@ -551,7 +708,15 @@ class ContextState:
                 + "不要生硬说查不到。"
             )
         if self._summary_lines:
-            parts.append("【本通对话记忆】\n" + "\n".join(self._summary_lines[-8:]))
+            # 只带最近几轮记忆(默认 6):尾部每轮 prefill 只吃增量,行数是 TTFT 杠杆;
+            # 更早的上下文由原始历史截断(LLM_HISTORY_TURNS)与当前步约束兜底。
+            # 尾部真实预算(RAG 关,默认档) = 【现在这一步】节头+当前步文本(典型
+            # ~321 字) + 【本通对话记忆】节头 + 6 行×每行 ≤201 字(≈1206 字) ≈
+            # 1.55-1.6k 字/轮逐轮重 prefill;RAG 开(rag_enabled=True)另加知识
+            # 2×~151 字 + 联网 1×~151 字 + 两个节头。旧注释「≤~120 token 典型」
+            # 是瘦砍前口径,早已失真,以此公式为准。
+            keep = max(1, int(os.environ.get("REPLY_MEMORY_LINES", "6")))
+            parts.append("【本通对话记忆】\n" + "\n".join(self._summary_lines[-keep:]))
         return "\n\n".join(parts)
 
     def _zh_rule(self) -> str:
@@ -564,12 +729,12 @@ class ContextState:
             "——这样语音合成可以边说你前半句边等你后半句，不用等整段生成完才出声。"
         )
 
-    def _yue_rule(self) -> str:
+    def _cantonese_rule(self) -> str:
         return (
             "整段用港式粵語（香港客服腔），唔好用書面語/普通話/廣州式書面講法。"
             "直接輸出繁體中文，唔好寫任何簡體字（簡體令粵語讀錯：寫「幫你」唔係「帮你」）。"
             "口吻要港味：唔該晒、唔好意思、我哋/你哋、而家、聽日、啱啱、幫你睇返、唔使擔心。"
-            "見到普通話詞就換港式口語：" + _HK_YUE_LEXICON + "。"
+            "見到普通話詞就換港式口語：" + _HK_CANTONESE_LEXICON + "。"
             "集運業務：客戶啲貨叫「你件貨/你個集運件」，服務講「速遞」，"
             "唔好用「包裹」「快遞」「貨物」。可自然夾英文詞(check/confirm/send/email/App/status/refund)"
             "似香港人講電話，但唔好成句英文（語氣參考:「唔好意思，我幫你 check 返個 status，refund 3–5 個工作天到帳。」）。"
@@ -600,6 +765,7 @@ class ContextAwareLLM(llm.LLM):
         super().__init__()
         self._inner = inner
         self._ctx = context_state
+        _bind_metrics_forward(inner, self)
 
     def chat(
         self,
@@ -609,13 +775,15 @@ class ContextAwareLLM(llm.LLM):
         conn_options=None,
         parallel_tool_calls=None,
         tool_choice=None,
-        extra_kwargs=None,
+        extra_kwargs=NOT_GIVEN,
     ):
         if self._ctx is not None:
-            # 重组 system 顺序：稳定指令前缀 + 人设 base + 易变参考尾部。
-            # 目的：让 token0 起的公共前缀(指令+话术+当前步+人设)逐轮字节不变，
-            # 命中 mlx_lm prompt KV-cache，每轮只 prefill 尾部新知识/记忆。
-            # （若把每轮变的检索资料插在中间，前缀每轮断裂 → 整段重 prefill。）
+            # KV-cache 命中规律(mlx_lm 0.31.3 LRUPromptCache 实测):只有「已缓存序列是
+            # 新请求的严格前缀」才复用——历史每轮在尾部增长,所以易变内容若放在 system
+            # 里(哪怕垫最后),下一轮请求就会在 system 处与缓存分叉 → common_prefix 再长
+            # 也不命中(cached_tokens=0,实测每轮 TTFT ~2s)。唯一可行位=把易变尾部拼到
+            # 【最后一条 user 消息】后面:序列变纯追加式,上一轮请求永远是下一轮的前缀。
+            # system 只留整场静态段(指令前缀+人设),逐轮字节不变。
             prefix = self._ctx.render_instruction_prefix()
             tail = self._ctx.render_context_tail()
             if prefix or tail:
@@ -624,16 +792,30 @@ class ContextAwareLLM(llm.LLM):
                 if items and isinstance(items[0], llm.ChatMessage) and items[0].role == "system":
                     head = items[0].content
                     if isinstance(head, str):
-                        merged = _join_system(prefix, head, tail)
+                        merged = _join_system(prefix, head, "")
                     else:
-                        merged = [*([prefix] if prefix else []), *head, *([tail] if tail else [])]
+                        merged = [*([prefix] if prefix else []), *head]
                     items[0] = llm.ChatMessage(role="system", content=merged)
                 else:
-                    items.insert(0, llm.ChatMessage(role="system", content=_join_system(prefix, "", tail)))
-                # 截断历史:保留最近 N 轮(默认 4 对),更早的靠「本通对话记忆」摘要兜底。
-                # 每轮全量历史会让 prefill 随轮次线性变慢(实测 12 轮 TTFT 2.4s);
-                # 截断让上下文有上界,TTFT 稳定。
-                max_turns = int(os.environ.get("LLM_HISTORY_TURNS", "4"))
+                    items.insert(0, llm.ChatMessage(role="system", content=_join_system(prefix, "", "")))
+                # 易变尾部(当前步/知识/记忆)拼到最后一条 user 消息尾部(仅请求副本,
+                # 不落库——下一轮 chat_ctx 仍由框架持久历史 + 重新渲染组装)。
+                if tail:
+                    for j in range(len(items) - 1, -1, -1):
+                        if getattr(items[j], "role", "") == "user":
+                            content = items[j].content
+                            if isinstance(content, str):
+                                new_content = f"{content}\n\n{tail}" if content else tail
+                            else:
+                                new_content = [*content, tail]
+                            items[j] = llm.ChatMessage(role="user", content=new_content)
+                            break
+                # 截断历史(摊销式,见 _truncate_chat_items):超过 2×N 对才剪回 N 对
+                # (默认 8 对),更早的靠「本通对话记忆」摘要兜底。每轮全量历史会让
+                # prefill 随轮次线性变慢(实测 12 轮 TTFT 2.4s);滞回让截断之间保持
+                # 纯追加(KV-cache 命中),上下文仍有上界。4→8:摊销后第 1-16 轮纯
+                # 追加全缓存命中,单会话记忆(客户地址/单号/诉求)留原文更久。
+                max_turns = int(os.environ.get("LLM_HISTORY_TURNS", "8"))
                 items = _truncate_chat_items(items, max_turns=max_turns)
                 copy.items = items
                 chat_ctx = copy
@@ -643,15 +825,18 @@ class ContextAwareLLM(llm.LLM):
             conn_options=conn_options,
             parallel_tool_calls=parallel_tool_calls,
             tool_choice=tool_choice,
-            extra_kwargs=extra_kwargs,
+            extra_kwargs=_forward_extra_kwargs(extra_kwargs),
         )
 
 
 def _truncate_chat_items(items: list, max_turns: int = 4) -> list:
-    """保留开头 system(s) + 最近 max_turns 轮(user/assistant 对)。
+    """保留开头 system(s) + 对话历史;摊销式截断（滞回）。
 
-    livekit 的 chat_ctx 累积整通历史;旧轮信息由 ContextState 的「本通对话记忆」
-    摘要承担,这里只把原始对话剪到最近几轮,控制 prefill token 上界。
+    旧实现:dialog 一超过 max_turns 对就【每轮】截到 max_turns 对——截断动了序列
+    头部,mlx KV-cache(只认严格前缀)每轮重新锚定,省下的 prefill 全赔回去。
+    现在:dialog 涨到 2×max_turns 对才动手、一次剪回 max_turns 对——之后 max_turns
+    轮内纯追加(缓存逐轮命中),每 max_turns 轮才重锚一次。更早的信息由
+    ContextState「本通对话记忆」摘要承担,剪掉不丢上下文。
     """
     if max_turns <= 0:
         return items
@@ -664,9 +849,9 @@ def _truncate_chat_items(items: list, max_turns: int = 4) -> list:
             break
     system_part = items[:split]
     dialog = items[split:]
-    if len(dialog) <= max_turns * 2:
+    # 滞回:超过 2×max_turns 对(4×max_turns 条)才截,剪回 max_turns 对。
+    if len(dialog) <= max_turns * 4:
         return items
-    # 保留最近 max_turns 对(2*max_turns 条),截断更早的
     return system_part + dialog[-(max_turns * 2) :]
 
 
@@ -689,8 +874,9 @@ class ExprAwareLLM(llm.LLM):
 
         self._emotion = EmotionProcessor()
         self._emotion_state = emotion_state
+        _bind_metrics_forward(inner, self)
 
-    def chat(self, *, chat_ctx, tools=None, conn_options=None, parallel_tool_calls=None, tool_choice=None, extra_kwargs=None):
+    def chat(self, *, chat_ctx, tools=None, conn_options=None, parallel_tool_calls=None, tool_choice=None, extra_kwargs=NOT_GIVEN):
         last_user = ""
         for item in reversed(getattr(chat_ctx, "items", []) or []):
             if getattr(item, "role", None) == "user":
@@ -706,7 +892,7 @@ class ExprAwareLLM(llm.LLM):
             conn_options=conn_options,
             parallel_tool_calls=parallel_tool_calls,
             tool_choice=tool_choice,
-            extra_kwargs=extra_kwargs,
+            extra_kwargs=_forward_extra_kwargs(extra_kwargs),
         )
         return _ExprPrependStream(self, inner, tag)
 
@@ -836,7 +1022,7 @@ class _FakeTTSStream(tts.ChunkedStream):
 
 
 class SherpaSenseVoiceSTT(stt.STT):
-    """Local SenseVoice ASR via sherpa-onnx (zh/en/ja/ko/yue)."""
+    """Local SenseVoice ASR via sherpa-onnx (zh/en/ja/ko + Cantonese)."""
 
     model = "sherpa-sense-voice"
     provider = "sherpa-onnx"
@@ -846,7 +1032,7 @@ class SherpaSenseVoiceSTT(stt.STT):
 
         import sherpa_onnx
 
-        model_dir = model_dir or os.environ.get("SHERPA_MODEL_DIR", "data/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue")
+        model_dir = model_dir or os.environ.get("SHERPA_MODEL_DIR", "data/models/sherpa-onnx-sense-voice")
         self._model_dir = model_dir
         self._recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
             model=os.path.join(model_dir, "model.int8.onnx"),
@@ -1098,6 +1284,10 @@ class MiniMaxTTS(tts.TTS):
     _INTL = "https://api.minimax.chat/v1/t2a_v2"
     _ENDPOINT_WS_CN = "wss://api.minimax.cn/ws/v1/t2a_v2"
     _ENDPOINT_WS_INTL = "wss://api.minimax.chat/ws/v1/t2a_v2"
+    # bidi 持久连接端点（官方 t2a_v2_bidi）：一连接一整个 call,task_continue 逐字喂,
+    # 服务端按句合成;打断走 task_cancel（连接保留）,唔再拆连接。
+    _ENDPOINT_WS_BIDI_CN = "wss://api.minimax.cn/ws/v1/t2a_v2_bidi"
+    _ENDPOINT_WS_BIDI_INTL = "wss://api.minimax.chat/ws/v1/t2a_v2_bidi"
 
     def _ws_voice_setting(self, voice: str) -> dict:
         """任务级 voice_setting（三条合成路径共用同一构造,避免漏 emotion/pitch）。"""
@@ -1166,8 +1356,35 @@ class MiniMaxTTS(tts.TTS):
         region = os.environ.get("MINIMAX_REGION", "cn").strip().lower()
         return self._ENDPOINT_WS_INTL if region in {"intl", "global", "chat"} else self._ENDPOINT_WS_CN
 
+    def _ws_mode(self) -> str:
+        """TTS 流式模式:classic(默认,一连接一任务) | bidi(持久连接,MINIMAX_WS_MODE=bidi 选入)。
+
+        默认 classic——现状行为零变化;live 验证后由控制器翻默认。
+        """
+        mode = os.environ.get("MINIMAX_WS_MODE", "classic").strip().lower()
+        return mode if mode in ("classic", "bidi") else "classic"
+
+    def _endpoint_ws_bidi(self) -> str:
+        """bidi WebSocket 端点:复用 classic 的 region 逻辑,路径加 _bidi 后缀。
+
+        MINIMAX_WS_URL 显式覆盖时同样补 _bidi 后缀(已是 _bidi 结尾则原样)。
+        """
+        base = os.environ.get("MINIMAX_WS_URL", "").strip()
+        if base:
+            return base if base.endswith("_bidi") else base + "_bidi"
+        region = os.environ.get("MINIMAX_REGION", "cn").strip().lower()
+        return self._ENDPOINT_WS_BIDI_INTL if region in {"intl", "global", "chat"} else self._ENDPOINT_WS_BIDI_CN
+
     def _model(self) -> str:
         return os.environ.get("MINIMAX_MODEL", "speech-2.8-hd")
+
+    def _language_boost(self) -> str:
+        """目标语 language_boost(env 注入,B 线同传按 target_lang 钉死;空=不下发)。
+
+        枚举值由 interpret 侧写入 MINIMAX_LANGUAGE_BOOST,这里只透传——
+        A 线没设该 env,请求里就完全不带这个键,行为零变化。
+        """
+        return os.environ.get("MINIMAX_LANGUAGE_BOOST", "").strip()
 
     def _resolve_voice(self) -> str:
         if isinstance(self._voice, dict):
@@ -1181,6 +1398,46 @@ class MiniMaxTTS(tts.TTS):
                 return raw
         return raw
 
+    def _bidi_params_key(self) -> tuple:
+        """bidi task_start 参数指纹：变了就重建会话(换声/换模型)。
+
+        emotion 刻意唔入指纹——佢逐轮 mood 变,拿佢当指纹会每轮拆连接,
+        bidi 省嘅就係 connect+task_start;情绪差一档係听感问题,唔係对错问题。
+        speed/vol/pitch係 env 级常量,进程内不变,一并入指纹求稳。
+        """
+        return (
+            self._model(),
+            self._resolve_voice(),
+            float(os.environ.get("MINIMAX_SPEED", "1")),
+            float(os.environ.get("MINIMAX_VOL", "1")),
+            int(os.environ.get("MINIMAX_PITCH", "0")),
+        )
+
+    def _task_start_payload(self, voice: str, sample_rate: int) -> dict:
+        """bidi task_start 载荷：参数与 classic 同源（_ws_voice_setting 一套构造）。"""
+        start = {
+            "event": "task_start",
+            "model": self._model(),
+            "voice_setting": self._ws_voice_setting(voice),
+            "audio_setting": {"sample_rate": sample_rate, "format": "pcm", "channel": 1},
+            # 官方参数:流式不回传聚合音频,显著降尾包体积与传输耗时。
+            "stream_options": {"exclude_aggregated_audio": True},
+        }
+        # language_boost 锁语种(B 线同传按目标语注入 env):源语音常夹第三方
+        # 词,显式锁死防合成语种漂移;枚举值是 MiniMax API 外部字面量。
+        boost = self._language_boost()
+        if boost:
+            start["language_boost"] = boost
+        return start
+
+    def _bidi_session(self) -> "_MiniMaxBidiSession":
+        """每实例(=每 job)一条 bidi 会话管理器:懒创建,整个 call 一条连接。"""
+        sess = getattr(self, "_bidi_sess", None)
+        if sess is None:
+            sess = _MiniMaxBidiSession(self)
+            self._bidi_sess = sess
+        return sess
+
     def synthesize(self, text, *, conn_options=None):
         # 保留整段合成路径：livekit 某些非 stream 调用 / 测试仍会走 synthesize。
         # 整段齐晒先落 stream——喺度套教学形拦截最稳(逐句流式只喺 send 前拦)。
@@ -1188,14 +1445,140 @@ class MiniMaxTTS(tts.TTS):
         return _MiniMaxTTSStream(self, text, conn_options or APIConnectOptions())
 
     def _speech_lang(self) -> str | None:
-        """罐头回应的语言:会话锚定语言(zh/cantonese)优先,其它(如 en)留 None 自动判。
-        旧数据里残留的 yue 归一到 cantonese 处理。"""
+        """罐头回应的语言:会话锚定语言(zh/cantonese)优先,其它(如 en)留 None 自动判。"""
         lang = self._language_state.lang
-        return lang if lang in ("zh", "cantonese", "yue") else None
+        return lang if lang in ("zh", "cantonese") else None
+
+    def prewarm(self) -> None:
+        """会话开始即后台预连（bidi: 预连持久会话; classic: keep-warm 池,容量 1）。
+
+        classic 官方 t2a_v2 WS 一连接一任务（task_finish 后服务端关连接），用过的连接
+        复用唔到；但 connect（TCP+TLS 握手，实测冷 ~0.65s/暖 ~0.2s）可以提前做。
+        失败静默——首段合成回退流内自连，行为同旧。
+        bidi 一条连接服务整个 call：预热 = 后台 connect+task_start，首段合成零握手段。
+        """
+        if self._ws_mode() == "bidi":
+            self._bidi_session().prewarm()
+            return
+        _minimax_pool_schedule(self._endpoint_ws(), self._api_key())
 
     def stream(self, *, conn_options=None):
-        """真流式 SynthesizeStream：单 WS 连接按增量文本持续 task_continue。"""
+        """真流式 SynthesizeStream：classic 按句 task_continue;bidi 逐字透传服务端切句。"""
+        if self._ws_mode() == "bidi":
+            return _MiniMaxBidiStream(self, conn_options or APIConnectOptions())
         return _MiniMaxSynthesizeStream(self, conn_options or APIConnectOptions())
+
+    async def aclose(self) -> None:
+        """job 收尾：bidi 模式关掉持久连接（classic 池连接由 GC/TTL 兜底,行为不变）。"""
+        if self._ws_mode() == "bidi":
+            try:
+                await self._bidi_session().aclose()
+            except Exception:  # noqa: BLE001 - 收尾尽力而为
+                pass
+        await super().aclose()
+
+
+# ---- MiniMax 热连接池（keep-warm）---------------------------------------------
+# 官方 t2a_v2 WS「一连接一任务」：task_finish 后服务端关连接（官方文档明示），
+# 用过的连接无法复用；但 connect（TCP+TLS 握手，实测冷 ~0.65s/暖 ~0.2-0.25s）
+# 可以提前做——池容量 1 放「处女连接」（只 connect、不 task_start，
+# connected_success 留喺接收缓冲由取用方握手逻辑照常收），下次合成直接取用，
+# 免整个握手段。failure-safe：取池验 key/endpoint 匹配 + TTL + open 状态，
+# 握手失败弃池全新重连一次；任何取唔到/失败都回退流内自连（旧行为）。
+# MINIMAX_WS_POOL=0 关闭（恒走流内自连）。
+_MINIMAX_POOL_WS = None  # 热连接（websockets 客户端实例）
+_MINIMAX_POOL_KEY: tuple[str, str] | None = None  # 入池时 (endpoint, api_key)
+_MINIMAX_POOL_AT = 0.0  # 入池时刻（monotonic）
+_MINIMAX_POOL_TTL_S = 240.0  # 超龄弃用（服务端对空闲连接的生命周期未文档化）
+_MINIMAX_POOL_TASK: asyncio.Task | None = None  # 补池任务（单飞）
+
+
+def _minimax_pool_enabled() -> bool:
+    return os.environ.get("MINIMAX_WS_POOL", "1") == "1"
+
+
+async def _minimax_ws_silent_close(ws) -> None:
+    try:
+        await ws.close()
+    except Exception:  # noqa: BLE001 - 收尾尽力而为
+        pass
+
+
+def _minimax_pool_discard(ws) -> None:
+    """后台弃置池连接；无事件循环时直接放手（GC 兜底回收 socket）。"""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(_minimax_ws_silent_close(ws))
+
+
+def _minimax_pool_pop(endpoint: str, key: str):
+    """取热连接；无池/参数变/超龄/已闭 → None（调用方回退全新连接）。"""
+    global _MINIMAX_POOL_WS, _MINIMAX_POOL_KEY, _MINIMAX_POOL_AT
+    ws = _MINIMAX_POOL_WS
+    pooled_key = _MINIMAX_POOL_KEY
+    pooled_at = _MINIMAX_POOL_AT
+    _MINIMAX_POOL_WS = None
+    _MINIMAX_POOL_KEY = None
+    _MINIMAX_POOL_AT = 0.0
+    if ws is None:
+        return None
+    if pooled_key != (endpoint, key) or (time.monotonic() - pooled_at) > _MINIMAX_POOL_TTL_S:
+        _minimax_pool_discard(ws)
+        return None
+    try:
+        from websockets.protocol import State
+
+        if getattr(ws, "state", State.OPEN) != State.OPEN:
+            _minimax_pool_discard(ws)
+            return None
+    except Exception:  # noqa: BLE001 - 判不了状态就信任之（握手失败另有回退）
+        pass
+    return ws
+
+
+async def _minimax_pool_replenish(endpoint: str, key: str) -> None:
+    """后台预连一条 WS 入池（容量 1）。失败静默——合成路径自会回退流内连接。"""
+    global _MINIMAX_POOL_WS, _MINIMAX_POOL_KEY, _MINIMAX_POOL_AT, _MINIMAX_POOL_TASK
+    try:
+        if _MINIMAX_POOL_WS is not None:
+            return
+        import websockets
+
+        t_conn0 = time.monotonic()
+        ws = await websockets.connect(
+            endpoint,
+            additional_headers={"Authorization": f"Bearer {key}"},
+            open_timeout=10,
+            max_size=20_000_000,
+        )
+        connect_ms = (time.monotonic() - t_conn0) * 1000
+        # connected_success 唔消费——留喺接收缓冲，取用方握手逻辑照常先收它。
+        _MINIMAX_POOL_WS = ws
+        _MINIMAX_POOL_KEY = (endpoint, key)
+        _MINIMAX_POOL_AT = time.monotonic()
+        print(f"MINIMAX_TTS_WS_POOL_PREWARM connect_ms={connect_ms:.0f}", flush=True)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 预热尽力而为
+        print(f"MINIMAX_TTS_WS_POOL_PREWARM_FAIL {exc!r}", flush=True)
+    finally:
+        _MINIMAX_POOL_TASK = None
+
+
+def _minimax_pool_schedule(endpoint: str, key: str) -> None:
+    """空闲期补池（会话开始/每次合成收尾调用）。已在补/已有池/无 key/开关关 → 跳过。"""
+    global _MINIMAX_POOL_TASK
+    if not _minimax_pool_enabled() or not key or not endpoint:
+        return
+    if _MINIMAX_POOL_TASK is not None or _MINIMAX_POOL_WS is not None:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:  # 无事件循环（调用点都喺 loop 内，理论不可达）
+        return
+    _MINIMAX_POOL_TASK = loop.create_task(_minimax_pool_replenish(endpoint, key))
 
 
 class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
@@ -1229,6 +1612,7 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
     async def _run(self, output_emitter):
         import websockets
 
+        t0 = time.monotonic()
         try:
             key = self._tts_._api_key()
             if not key:
@@ -1243,12 +1627,21 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
             print(f"MINIMAX_TTS_VOICE {voice} lang={self._tts_._language_state.lang}", flush=True)
             sample_rate = self._tts_.sample_rate
 
-            ws = await websockets.connect(
-                self._tts_._endpoint_ws(),
-                additional_headers={"Authorization": f"Bearer {key}"},
-                open_timeout=10,
-                max_size=20_000_000,
-            )
+            # 热连接池：空闲期预连的「处女连接」直接用（免 TCP+TLS 握手，实测冷
+            # ~0.65s/暖 ~0.2s）；无池/状态异常一律回退流内自连（旧行为）。
+            ws = None
+            ws_from_pool = False
+            if _minimax_pool_enabled():
+                ws = _minimax_pool_pop(self._tts_._endpoint_ws(), key)
+                ws_from_pool = ws is not None
+            if ws is None:
+                ws = await websockets.connect(
+                    self._tts_._endpoint_ws(),
+                    additional_headers={"Authorization": f"Bearer {key}"},
+                    open_timeout=10,
+                    max_size=20_000_000,
+                )
+            ws_connect_ms = 0.0 if ws_from_pool else (time.monotonic() - t0) * 1000
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1262,15 +1655,13 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                 pass
             return
 
-        init_done = False
-        frame_bytes = int(sample_rate / 5) * 2  # 200ms 帧
-        buf = bytearray()
-        recv_task: asyncio.Task | None = None
-        t_start = time.monotonic()
-        try:
-            # 首帧 connected_success
+        async def _handshake(a_ws) -> dict:
+            """connected_success（丢帧不致命，同旧语义）→ task_start → task_started。
+
+            池连接的 connected_success 已喺接收缓冲，recv 即回零延迟。
+            """
             try:
-                await asyncio.wait_for(ws.recv(), timeout=10)
+                await asyncio.wait_for(a_ws.recv(), timeout=10)
             except Exception:
                 pass
             start = {
@@ -1284,25 +1675,65 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                     "emotion": self._tts_._resolve_emotion(),
                 },
                 "audio_setting": {"sample_rate": sample_rate, "format": "pcm", "channel": 1},
+                # 官方参数:流式不回传聚合音频,显著降尾包体积与传输耗时。
+                "stream_options": {"exclude_aggregated_audio": True},
             }
-            await ws.send(json.dumps(start))
+            # language_boost 锁语种(B 线同传按目标语注入 env):源语音常夹第三方
+            # 词,显式锁死防合成语种漂移;枚举值是 MiniMax API 外部字面量。
+            boost = self._tts_._language_boost()
+            if boost:
+                start["language_boost"] = boost
+            await a_ws.send(json.dumps(start))
+            return json.loads(await asyncio.wait_for(a_ws.recv(), timeout=15))
+
+        init_done = False
+        frame_bytes = int(sample_rate / 5) * 2  # 200ms 帧
+        buf = bytearray()
+        recv_task: asyncio.Task | None = None
+        t_start = time.monotonic()
+        try:
             try:
-                resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
-                if resp.get("event") != "task_started":
-                    print("MINIMAX_TTS_WS_START_FAIL", str(resp)[:200], flush=True)
-                    try:
-                        await self._emit_beep(output_emitter)
-                    except Exception:  # pragma: no cover
-                        pass
-                    return
-            except Exception as exc:
-                print("MINIMAX_TTS_WS_START", repr(exc), flush=True)
+                resp = await _handshake(ws)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if not ws_from_pool:
+                    raise
+                # 池连接空闲期被服务端静默关闭 → 弃池，全新连接重握手一次
+                # （再失败就走下方 START 失败路径 beep，同旧行为）。
+                print("MINIMAX_TTS_WS_POOL_STALE retry_fresh", flush=True)
+                await _minimax_ws_silent_close(ws)
+                t_fresh = time.monotonic()
+                ws = await websockets.connect(
+                    self._tts_._endpoint_ws(),
+                    additional_headers={"Authorization": f"Bearer {key}"},
+                    open_timeout=10,
+                    max_size=20_000_000,
+                )
+                ws_from_pool = False
+                ws_connect_ms = (time.monotonic() - t_fresh) * 1000
+                resp = await _handshake(ws)
+            t_task = time.monotonic()
+            if resp.get("event") != "task_started":
+                print("MINIMAX_TTS_WS_START_FAIL", str(resp)[:200], flush=True)
+                await _minimax_ws_silent_close(ws)
                 try:
                     await self._emit_beep(output_emitter)
                 except Exception:  # pragma: no cover
                     pass
                 return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print("MINIMAX_TTS_WS_START", repr(exc), flush=True)
+            await _minimax_ws_silent_close(ws)
+            try:
+                await self._emit_beep(output_emitter)
+            except Exception:  # pragma: no cover
+                pass
+            return
 
+        try:
             async def _recv_loop():
                 nonlocal init_done, buf
                 first_pushed = False
@@ -1319,20 +1750,30 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                         chunk = bytes.fromhex(audio_hex)
                         if not init_done:
                             output_emitter.initialize(
-                                request_id="minimax-tts",
+                                request_id=utils.shortuuid(),
                                 sample_rate=sample_rate,
                                 num_channels=self._tts_.num_channels,
                                 mime_type="audio/pcm",
                                 stream=True,
                             )
-                            output_emitter.start_segment(segment_id="minimax-tts")
+                            output_emitter.start_segment(segment_id=utils.shortuuid())
                             init_done = True
                         buf.extend(chunk)
                         if not first_pushed and len(buf) >= frame_bytes // 5:
                             # P0 首帧早推:不足 200ms 先推 ~40ms,早出声(照 Qwen3-TTS 同款)。
                             # P0 秒表:首个音频块推送时刻(距 task_start)。
+                            t_first = time.monotonic()
                             print(
-                                f"TTS_FIRST_AUDIO_MS {(time.monotonic() - t_start) * 1000:.0f}",
+                                f"TTS_FIRST_AUDIO_MS {(t_first - t_start) * 1000:.0f}",
+                                flush=True,
+                            )
+                            # P1.5 FIX 3 首包分解:握手段(池命中=0,已在空闲期摊销)/
+                            # task_start→首音频段/连接起全程。
+                            print(
+                                f"MINIMAX_TTS_WS_PERF pool={'hit' if ws_from_pool else 'fresh'} "
+                                f"ws_connect_ms={ws_connect_ms:.0f} "
+                                f"task_start_to_audio_ms={(t_first - t_task) * 1000:.0f} "
+                                f"total_ms={(t_first - t0) * 1000:.0f}",
                                 flush=True,
                             )
                             output_emitter.push(bytes(buf))
@@ -1387,7 +1828,9 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                 if not s:
                     return False
                 tail = s.rstrip("。！？!?，、；;：: \t")
-                return not (tail and (tail[-1].isdigit() or tail[-1].isalpha()))
+                # 只拦 latin/数字结尾(词/号码可能被拦腰截断)。唔可以用裸 isalpha():
+                # CJK 汉字 isalpha()==True → 中文片段全被拦,overlap 对中文全死。
+                return not (tail and tail[-1].isascii() and tail[-1].isalnum())
 
             async def _send_text(s: str) -> None:
                 nonlocal sent_any, _last_send
@@ -1475,6 +1918,8 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                 recv_task.cancel()
                 try:
                     await recv_task
+                except asyncio.CancelledError:
+                    pass  # 自己 cancel 嘅（唔係外层取消）——继续收尾，唔好吞掉收尾步骤
                 except Exception:
                     pass
             try:
@@ -1489,6 +1934,528 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                     output_emitter.end_segment()
                 except Exception:
                     pass
+            # 一连接一任务（官方 t2a_v2：task_finish 后服务端关连接）：本连接已
+            # 耗尽，后台补一条热连接给下一段合成（MINIMAX_WS_POOL=0 时不动作）。
+            _minimax_pool_schedule(self._tts_._endpoint_ws(), self._tts_._api_key())
+
+
+# ---- MiniMax bidi 持久连接（t2a_v2_bidi,MINIMAX_WS_MODE=bidi 选入）--------------
+# 官方 bidi 语义（docs 校对）：connect → connected_success → task_start(参数同
+# classic) → task_started → task_continue{text} 可任意粒度(逐字都行),服务端
+# 累积文本、按句末标点立即合成(次级标点要够长才切/长度上限强制切/空闲兜底) →
+# sentence_start / task_continued{data.audio hex, is_final=该句音频完} /
+# sentence_end。收尾 task_flush 强制吐出无标点尾巴,回 task_flushed,会话继续;
+# 只有 call 结束才 task_finish(服务端吐完剩余后关连接)。
+# 打断 = task_cancel：服务端丢缓冲文本+停当前合成 → task_canceled,连接回到
+# task_started 态可继续 task_continue——替代 classic 的拆连接做法。
+# 服务端永不 ping;客户端要定期 ping(空闲 >120s → 2201 断连),此处 60s 一发。
+# 2205 = 软背压：稍后原样重发同一条 task_continue,唔好重连;2204 单条 >10k 字
+# 跳过;2206 重复 task_start 会关连接。一条连接一个合成会话。
+class _MiniMaxBidiSession:
+    """每 TTS 实例(=每 job)一条 bidi 连接的生命周期管理。
+
+    框架对每个 speech 串行开一条 SynthesizeStream(一通电话同一时刻只有一路
+    TTS),本类仍用 asyncio.Lock 兜底强制串行。连接懒建(或 prewarm 预建),
+    task_start 一次,之后每个流只做 task_continue/task_flush/task_cancel。
+    """
+
+    def __init__(self, tts_: "MiniMaxTTS"):
+        self._tts_ = tts_
+        self._lock = asyncio.Lock()
+        self._ws = None
+        self._params: tuple | None = None  # 运行中 task_start 的参数指纹
+        self._ping_task: asyncio.Task | None = None
+        self._prewarm_task: asyncio.Task | None = None
+        # 残留音频门禁（epoch 纪元）：连接打断后保留复用，上一流 cancel 超时
+        # （MINIMAX_TTS_BIDI_CANCEL_TIMEOUT）时服务端可能没停稳，迟到的音频会落
+        # 在同一条连接上。流在首个 task_continue 才认领 active_epoch=own_epoch；
+        # 认领前 recv_loop 收到的一切音频都是上一流的残留 → 丢弃
+        # （MINIMAX_BIDI_DROP_STALE），唔会漏进下一个流的 emitter。0=尚无认领。
+        self.active_epoch = 0
+        self._epoch_seq = 0
+        # 供 PERF 打点:ensure_ready 本次是复用还是新连
+        self.last_reused = False
+        self.last_connect_ms = 0.0
+
+    def alloc_epoch(self) -> int:
+        """为本流分配纪元号（只占号，唔认领——认领发生在首个 task_continue）。"""
+        self._epoch_seq += 1
+        return self._epoch_seq
+
+    @property
+    def lock(self) -> asyncio.Lock:
+        return self._lock
+
+    @staticmethod
+    def _ping_interval() -> float:
+        try:
+            v = float(os.environ.get("MINIMAX_BIDI_PING_S", "60"))
+        except Exception:  # pragma: no cover - 配错回默认
+            v = 60.0
+        return v if v > 0 else 0.0  # <=0 关闭自管 ping
+
+    def _alive(self) -> bool:
+        if self._ws is None:
+            return False
+        try:
+            from websockets.protocol import State
+
+            return getattr(self._ws, "state", State.OPEN) == State.OPEN
+        except Exception:  # noqa: BLE001 - 判不了状态就信任之
+            return True
+
+    async def _ping_loop(self, ws) -> None:
+        """官方:服务端永不 ping,空闲 >120s 断连 → 客户端 60s 一发 WS ping。"""
+        try:
+            while self._ws is ws:
+                interval = self._ping_interval()
+                if interval <= 0:
+                    return
+                await asyncio.sleep(interval)
+                try:
+                    # ping 帧发出即算;不 await pong 到天荒地老——
+                    # pong 静默由接收侧(读消息超时/ConnectionClosed)判死。
+                    await asyncio.wait_for(ws.ping(), timeout=10)
+                except asyncio.TimeoutError:
+                    print("MINIMAX_TTS_BIDI_PING_TIMEOUT", flush=True)
+                except Exception:
+                    return  # 连接已死,接收侧会 invalidate
+        except asyncio.CancelledError:
+            raise
+
+    def _start_ping(self, ws) -> None:
+        self._stop_ping()
+        if self._ping_interval() > 0:
+            self._ping_task = asyncio.get_running_loop().create_task(self._ping_loop(ws))
+
+    def _stop_ping(self) -> None:
+        task = self._ping_task
+        self._ping_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _connect_and_start(self, params: tuple) -> None:
+        import websockets
+
+        t0 = time.monotonic()
+        # ping_interval=None:关掉库自带 20s keepalive(它 ping_timeout 无 pong 会
+        # 主动拆线),改用本类 60s 自管 ping,符合官方「客户端负责 ping」语义。
+        ws = await websockets.connect(
+            self._tts_._endpoint_ws_bidi(),
+            additional_headers={"Authorization": f"Bearer {self._tts_._api_key()}"},
+            open_timeout=10,
+            max_size=20_000_000,
+            ping_interval=None,
+        )
+        self.last_connect_ms = (time.monotonic() - t0) * 1000
+        try:
+            # connected_success:丢帧不致命,同 classic 语义
+            await asyncio.wait_for(ws.recv(), timeout=10)
+        except Exception:
+            pass
+        voice = self._tts_._resolve_voice()
+        await ws.send(json.dumps(self._tts_._task_start_payload(voice, self._tts_.sample_rate)))
+        resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+        if resp.get("event") != "task_started":
+            try:
+                await ws.close()
+            except Exception:  # noqa: BLE001
+                pass
+            raise RuntimeError(f"MINIMAX bidi task_start failed: {str(resp)[:200]}")
+        self._ws = ws
+        self._params = params
+        self._start_ping(ws)
+
+    async def ensure_ready(self):
+        """返回可 task_continue 的连接（调用方已持 lock）。
+
+        复用条件：连接活着且参数指纹没变。参数变了（换声/换模型）→ task_finish
+        干净收旧任务再全新重连（官方 2206:重复 task_start 会关连接,唔可以偷懒复用）。
+        """
+        params = self._tts_._bidi_params_key()
+        self.last_reused = False
+        if self._alive() and self._params == params:
+            self.last_reused = True
+            return self._ws
+        if self._alive():
+            await self._graceful_finish()
+        await self._connect_and_start(params)
+        return self._ws
+
+    async def _graceful_finish(self) -> None:
+        ws = self._ws
+        if ws is not None:
+            try:
+                await asyncio.wait_for(ws.send(json.dumps({"event": "task_finish"})), timeout=2)
+            except Exception:  # noqa: BLE001 - 收尾尽力而为
+                pass
+        await self.invalidate()
+
+    async def invalidate(self) -> None:
+        """弃置当前连接（2201/异常关闭/收尾）；下个 ensure_ready 自动全新重连。"""
+        ws, self._ws = self._ws, None
+        self._params = None
+        self._stop_ping()
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def aclose(self) -> None:
+        await self.invalidate()
+
+    def prewarm(self) -> None:
+        """空闲期预连（会话开始调用）。已在连/已在补/无 key → 跳过;失败静默。"""
+        if not self._tts_._api_key() or not self._tts_._resolve_voice():
+            return
+        if self._alive() or (self._prewarm_task is not None and not self._prewarm_task.done()):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - 调用点都在 loop 内
+            return
+        self._prewarm_task = loop.create_task(self._prewarm_run())
+
+    async def _prewarm_run(self) -> None:
+        try:
+            async with self._lock:
+                if not self._alive():
+                    await self._connect_and_start(self._tts_._bidi_params_key())
+            print(
+                f"MINIMAX_TTS_BIDI_PREWARM connect_ms={self.last_connect_ms:.0f}",
+                flush=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 预热尽力而为,首段合成自会重试
+            print(f"MINIMAX_TTS_BIDI_PREWARM_FAIL {exc!r}", flush=True)
+            await self.invalidate()
+
+
+class _MiniMaxBidiStream(tts.SynthesizeStream):
+    """MiniMax bidi 持久连接流：LLM 增量逐字 task_continue,服务端负责切句合成。
+
+    与 classic `_MiniMaxSynthesizeStream` 的分别：
+    - 唔做客户端切句/_flushable——服务端累积文本按句末标点立即合成,粒度越细
+      首句越早到;经典路径的按句+overlap 逻辑全删。
+    - 收尾 task_flush（唔係 task_finish）——强制吐出无标点尾巴但连接保留,
+      下一个流(下一轮对话)零握手段直接 task_continue。
+    - 打断（框架 cancel 本流）→ task_cancel,服务端丢缓冲停合成,连接保留。
+    """
+
+    def __init__(self, tts_: "MiniMaxTTS", conn_options):
+        super().__init__(tts=tts_, conn_options=conn_options)
+        self._tts_ = tts_
+        # 教学形拦截已触发过就唔再重复播罐头(同段后续课程句静默丢弃)。
+        self._lecture_fired = False
+        self._flushed_evt = asyncio.Event()  # 收到 task_flushed
+        self._canceled_evt = asyncio.Event()  # 收到 task_canceled
+        self._resend_evt = asyncio.Event()  # 收到 2205 软背压
+        self._last_continue: str | None = None  # 2205 重发用
+
+    async def _emit_beep(self, output_emitter):
+        import math
+
+        sr = self._tts_.sample_rate
+        n = int(sr * 0.4)
+        pcm = bytearray()
+        for i in range(n):
+            v = int(12000 * math.sin(2 * math.pi * 440 * i / sr))
+            pcm += v.to_bytes(2, "little", signed=True)
+        output_emitter.push(bytes(pcm))
+        output_emitter.flush()
+
+    @staticmethod
+    def _cancel_wait_s() -> float:
+        try:
+            return float(os.environ.get("MINIMAX_BIDI_CANCEL_WAIT_S", "3"))
+        except Exception:  # pragma: no cover
+            return 3.0
+
+    async def _cancel_on_server(self, ws) -> None:
+        """打断：task_cancel 丢服务端缓冲+停当前合成;连接保留,下轮继续用。"""
+        if ws is None:
+            return
+        self._canceled_evt.clear()
+        try:
+            await asyncio.wait_for(ws.send(json.dumps({"event": "task_cancel"})), timeout=2)
+        except Exception:  # noqa: BLE001 - 连接已死:下个流 ensure_ready 自会重连
+            return
+        try:
+            await asyncio.wait_for(self._canceled_evt.wait(), timeout=self._cancel_wait_s())
+        except Exception:  # noqa: BLE001 - 等 task_canceled 超时:连接保留,残留音频
+            # 由下一流的纪元门禁兜住(active_epoch 未认领前一律丢弃,唔漏进下轮)
+            print("MINIMAX_TTS_BIDI_CANCEL_TIMEOUT", flush=True)
+
+    async def _run(self, output_emitter):
+        t0 = time.monotonic()
+        try:
+            key = self._tts_._api_key()
+            if not key:
+                print("MINIMAX_TTS_MISSING_CREDENTIALS", flush=True)
+                await self._emit_beep(output_emitter)
+                return
+            voice = self._tts_._resolve_voice()
+            if not voice:
+                print("MINIMAX_TTS_NO_VOICE", flush=True)
+                await self._emit_beep(output_emitter)
+                return
+            print(f"MINIMAX_TTS_VOICE {voice} lang={self._tts_._language_state.lang}", flush=True)
+            sample_rate = self._tts_.sample_rate
+
+            session = self._tts_._bidi_session()
+            await session.lock.acquire()
+            my_epoch = session.alloc_epoch()  # 本流纪元:首个 task_continue 时认领
+            ws = None
+            recv_task: asyncio.Task | None = None
+            resend_task: asyncio.Task | None = None
+            self._flushed_evt.clear()
+            self._canceled_evt.clear()
+            self._resend_evt.clear()
+            init_done = False
+            frame_bytes = int(sample_rate / 5) * 2  # 200ms 帧
+            buf = bytearray()
+            state = {
+                "sent_any": False,
+                "first_pushed": False,
+                "t_first_continue": 0.0,
+                "t_last_audio": 0.0,
+                "stale_msgs": 0,
+                "stale_bytes": 0,
+            }
+            t_flush = 0.0
+            try:
+                try:
+                    ws = await session.ensure_ready()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # 连唔到 WS 冇音频可推(livekit 会 APIError no audio frames →
+                    # 静音吞回复)。播一声 beep 令客户知 AI 有反应过,同 classic。
+                    print("MINIMAX_TTS_BIDI_CONNECT", repr(exc), flush=True)
+                    await self._emit_beep(output_emitter)
+                    return
+                reused = session.last_reused
+                connect_ms = session.last_connect_ms
+
+                async def _recv_loop():
+                    nonlocal init_done
+                    # flush 前给足窗口(等 LLM 流式期间服务端句子音频);
+                    # task_flushed 后转 0.5s 空闲判收——尾巴吐完即收摊。
+                    while True:
+                        timeout = 0.5 if self._flushed_evt.is_set() else 30.0
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                        except asyncio.TimeoutError:
+                            if self._flushed_evt.is_set():
+                                return  # 尾巴排干净了
+                            continue  # 还在等句子音频,继续等
+                        except Exception:
+                            # 连接死亡(2201/网络):标记死连接 + 解锁等待方
+                            await session.invalidate()
+                            self._flushed_evt.set()
+                            self._canceled_evt.set()
+                            return
+                        try:
+                            msg = json.loads(raw)
+                        except Exception:  # noqa: BLE001 - 非 JSON 心跳类,忽略
+                            continue
+                        event = msg.get("event")
+                        data = msg.get("data") or {}
+                        audio_hex = data.get("audio") or ""
+                        if audio_hex and session.active_epoch != my_epoch:
+                            # 纪元门禁:本流尚未发过 task_continue(active_epoch 还是
+                            # 上一流的)→ 连接上此刻冒出的音频全是上一流打断(cancel
+                            # 超时,服务端未停稳)的迟到残留——丢弃,绝唔喂进本轮
+                            # emitter(上一句被打断的话漏进下一轮回复 = 残留泄漏)。
+                            state["stale_msgs"] += 1
+                            state["stale_bytes"] += len(audio_hex) // 2
+                            if state["stale_msgs"] == 1:
+                                print(
+                                    f"MINIMAX_BIDI_DROP_STALE epoch={my_epoch} "
+                                    f"active_epoch={session.active_epoch}",
+                                    flush=True,
+                                )
+                            audio_hex = ""
+                        if audio_hex:
+                            chunk = bytes.fromhex(audio_hex)
+                            if not init_done:
+                                output_emitter.initialize(
+                                    request_id=utils.shortuuid(),
+                                    sample_rate=sample_rate,
+                                    num_channels=self._tts_.num_channels,
+                                    mime_type="audio/pcm",
+                                    stream=True,
+                                )
+                                output_emitter.start_segment(segment_id=utils.shortuuid())
+                                init_done = True
+                            buf.extend(chunk)
+                            state["t_last_audio"] = time.monotonic()
+                            if not state["first_pushed"] and len(buf) >= frame_bytes // 5:
+                                # P0 首帧早推:不足 200ms 先推 ~40ms,早出声(同 classic)。
+                                t_first = time.monotonic()
+                                fc = state["t_first_continue"]
+                                print(f"TTS_FIRST_AUDIO_MS {(t_first - fc) * 1000:.0f}", flush=True)
+                                print(
+                                    f"MINIMAX_TTS_BIDI_PERF reused={int(reused)} "
+                                    f"connect_ms={connect_ms:.0f} "
+                                    f"first_continue_to_audio_ms={(t_first - fc) * 1000:.0f} "
+                                    f"total_ms={(t_first - t0) * 1000:.0f}",
+                                    flush=True,
+                                )
+                                output_emitter.push(bytes(buf))
+                                output_emitter.flush()
+                                buf.clear()
+                                state["first_pushed"] = True
+                            while len(buf) >= frame_bytes:
+                                output_emitter.push(bytes(buf[:frame_bytes]))
+                                output_emitter.flush()
+                                del buf[:frame_bytes]
+                        # is_final = 当前句/当前请求音频完(bidi 喺 data 喺顶层都有得给,
+                        # 兼容两种位置)。只推清尾巴,唔退出——会话继续。
+                        if (msg.get("is_final") or data.get("is_final")) and buf:
+                            output_emitter.push(bytes(buf))
+                            output_emitter.flush()
+                            buf.clear()
+                        if event == "task_flushed":
+                            self._flushed_evt.set()
+                        elif event == "task_canceled":
+                            self._canceled_evt.set()
+                        elif event == "task_finished":
+                            return
+                        base = msg.get("base_resp") or {}
+                        status = int(base.get("status_code") or 0)
+                        if status == 2205:
+                            self._resend_evt.set()  # 软背压:重发协程稍后原样重发
+                        elif status == 2204:
+                            print("MINIMAX_TTS_BIDI_2204_TEXT_SKIPPED", flush=True)
+                        elif status in (2201, 2206):
+                            print(f"MINIMAX_TTS_BIDI_{status}", flush=True)
+                            await session.invalidate()
+                            self._flushed_evt.set()
+                            self._canceled_evt.set()
+                            return
+                        elif status not in (0,):
+                            print(f"MINIMAX_TTS_BIDI_STATUS {status} {str(base)[:120]}", flush=True)
+
+                async def _resend_loop():
+                    # 2205 软背压:稍后原样重发同一条 task_continue,唔重连。
+                    try:
+                        while True:
+                            await self._resend_evt.wait()
+                            self._resend_evt.clear()
+                            await asyncio.sleep(0.2)
+                            text = self._last_continue
+                            if text is None:
+                                continue
+                            await ws.send(json.dumps({"event": "task_continue", "text": text}))
+                            print(f"MINIMAX_TTS_BIDI_2205_RESEND chars={len(text)}", flush=True)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        return  # 连接已死,接收侧会 invalidate
+
+                recv_task = asyncio.create_task(_recv_loop())
+                resend_task = asyncio.create_task(_resend_loop())
+
+                async def _send_text(s: str) -> None:
+                    if not self._lecture_fired and is_lecture_text(s):
+                        # 开场即教学 → 播一次罐头的「请再报单号」,唔好照读课程;
+                        # 若前面已出过正常音频,课程句静默丢弃,唔追加罐头(避免二重声)。
+                        self._lecture_fired = True
+                        if not state["sent_any"]:
+                            canned = lecture_canned(self._tts_._speech_lang())
+                            self._last_continue = canned
+                            if state["t_first_continue"] == 0.0:
+                                state["t_first_continue"] = time.monotonic()
+                            await ws.send(json.dumps({"event": "task_continue", "text": canned}))
+                            state["sent_any"] = True
+                            session.active_epoch = my_epoch  # 认领纪元:此后残留门禁对本流放行
+                        return
+                    if is_lecture_text(s):
+                        return  # 已触发过,课程延续句照丢
+                    # bidi:逐块原样透传,唔切句——服务端自己按标点/长度切句合成。
+                    if state["t_first_continue"] == 0.0:
+                        state["t_first_continue"] = time.monotonic()
+                    self._last_continue = s
+                    await ws.send(json.dumps({"event": "task_continue", "text": s}))
+                    state["sent_any"] = True
+                    session.active_epoch = my_epoch  # 认领纪元:此后残留门禁对本流放行
+
+                async for item in self._input_ch:
+                    if isinstance(item, self._FlushSentinel):
+                        continue
+                    text = str(item or "")
+                    if not text.strip():
+                        continue
+                    await _send_text(text)
+
+                # 文本结束:task_flush 强制吐出无标点尾巴,会话唔结束(连接保留)。
+                try:
+                    if state["t_first_continue"] > 0.0:
+                        t_flush = time.monotonic()
+                        await ws.send(json.dumps({"event": "task_flush"}))
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    await asyncio.wait_for(self._flushed_evt.wait(), timeout=15)
+                except asyncio.TimeoutError:
+                    print("MINIMAX_TTS_BIDI_FLUSH_TIMEOUT", flush=True)
+                # 等 recv_loop 把尾巴音频排完(0.5s 空闲自动收,给 20s 上限兜底)
+                if recv_task:
+                    try:
+                        await asyncio.wait_for(asyncio.shield(recv_task), timeout=20)
+                    except asyncio.TimeoutError:
+                        pass
+                if t_flush > 0.0 and state["t_last_audio"] > 0.0:
+                    print(
+                        f"MINIMAX_TTS_BIDI_PERF flush_to_last_audio_ms="
+                        f"{(state['t_last_audio'] - t_flush) * 1000:.0f}",
+                        flush=True,
+                    )
+            except asyncio.CancelledError:
+                # 打断(barge-in):通知服务端丢弃缓冲/停合成,连接保留给下一轮。
+                try:
+                    await self._cancel_on_server(ws)
+                except Exception:  # noqa: BLE001 - 收尾尽力而为
+                    pass
+                raise
+            except Exception as exc:
+                print("MINIMAX_TTS_BIDI_ERR", repr(exc), flush=True)
+            finally:
+                for task in (resend_task, recv_task):
+                    if task:
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass  # 自己 cancel 嘅——继续收尾
+                        except Exception:
+                            pass
+                # 推完残余音频并结束 segment(同 classic 收尾)
+                if init_done and buf:
+                    try:
+                        output_emitter.push(bytes(buf))
+                        output_emitter.flush()
+                        output_emitter.end_segment()
+                    except Exception:  # noqa: BLE001
+                        pass
+                if state["stale_msgs"]:
+                    print(
+                        f"MINIMAX_BIDI_DROP_STALE_TOTAL msgs={state['stale_msgs']} "
+                        f"bytes={state['stale_bytes']}",
+                        flush=True,
+                    )
+                session.lock.release()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 外层兜底:同 classic 唔好炸框架
+            print("MINIMAX_TTS_BIDI_FATAL", repr(exc), flush=True)
+            try:
+                await self._emit_beep(output_emitter)
+            except Exception:  # pragma: no cover
+                pass
 
 
 class _MiniMaxTTSStream(tts.ChunkedStream):
@@ -1529,25 +2496,37 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
 
     async def _run_ws(self, output_emitter, key: str, voice: str, sample_rate: int) -> bool:
         """MiniMax WebSocket 流式:task_start → task_continue(text) → 边收 hex 音频边推。"""
-        import ssl
+        import ssl  # noqa: F401 - 历史保留
 
         import websockets
 
-        url = self._endpoint_ws()
-        try:
-            ws = await websockets.connect(
-                url,
-                additional_headers={"Authorization": f"Bearer {key}"},
-                open_timeout=10,
-                max_size=20_000_000,
-            )
-        except Exception as exc:
-            print("MINIMAX_TTS_WS_CONNECT", repr(exc), flush=True)
-            return False
-        try:
-            # 首帧通常是 connected_success
+        # 修复：旧码 `self._endpoint_ws()` 喺 ChunkedStream 上 AttributeError →
+        # 恒走 MINIMAX_TTS_FATAL，连 HTTP 回退都到不了。
+        url = self._tts_._endpoint_ws()
+        t0 = time.monotonic()
+        # 热连接池（与 SynthesizeStream 路径同源）：取唔到/状态异常回退流内自连。
+        ws = None
+        ws_from_pool = False
+        if _minimax_pool_enabled():
+            ws = _minimax_pool_pop(url, key)
+            ws_from_pool = ws is not None
+        if ws is None:
             try:
-                await asyncio.wait_for(ws.recv(), timeout=10)
+                ws = await websockets.connect(
+                    url,
+                    additional_headers={"Authorization": f"Bearer {key}"},
+                    open_timeout=10,
+                    max_size=20_000_000,
+                )
+            except Exception as exc:
+                print("MINIMAX_TTS_WS_CONNECT", repr(exc), flush=True)
+                return False
+        ws_connect_ms = 0.0 if ws_from_pool else (time.monotonic() - t0) * 1000
+
+        async def _handshake(a_ws) -> dict:
+            """connected_success（丢帧不致命）→ task_start → task_started。"""
+            try:
+                await asyncio.wait_for(a_ws.recv(), timeout=10)
             except Exception:
                 pass
             start = {
@@ -1561,21 +2540,54 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
                     "emotion": self._tts_._resolve_emotion(),
                 },
                 "audio_setting": {"sample_rate": sample_rate, "format": "pcm", "channel": 1},
+                # 官方参数:流式不回传聚合音频,显著降尾包体积与传输耗时。
+                "stream_options": {"exclude_aggregated_audio": True},
             }
-            await ws.send(json.dumps(start))
+            # language_boost 锁语种(B 线同传按目标语注入 env):源语音常夹第三方
+            # 词,显式锁死防合成语种漂移;枚举值是 MiniMax API 外部字面量。
+            boost = self._tts_._language_boost()
+            if boost:
+                start["language_boost"] = boost
+            await a_ws.send(json.dumps(start))
+            return json.loads(await asyncio.wait_for(a_ws.recv(), timeout=15))
+
+        try:
             try:
-                resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
-                if resp.get("event") != "task_started":
-                    print("MINIMAX_TTS_WS_START_FAIL", str(resp)[:200], flush=True)
-                    return False
-            except Exception as exc:
-                print("MINIMAX_TTS_WS_START", repr(exc), flush=True)
+                resp = await _handshake(ws)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if not ws_from_pool:
+                    raise
+                # 池连接空闲期被服务端静默关闭 → 弃池，全新连接重握手一次。
+                print("MINIMAX_TTS_WS_POOL_STALE retry_fresh", flush=True)
+                await _minimax_ws_silent_close(ws)
+                t_fresh = time.monotonic()
+                ws = await websockets.connect(
+                    url,
+                    additional_headers={"Authorization": f"Bearer {key}"},
+                    open_timeout=10,
+                    max_size=20_000_000,
+                )
+                ws_from_pool = False
+                ws_connect_ms = (time.monotonic() - t_fresh) * 1000
+                resp = await _handshake(ws)
+            t_start = time.monotonic()
+            if resp.get("event") != "task_started":
+                print("MINIMAX_TTS_WS_START_FAIL", str(resp)[:200], flush=True)
                 return False
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print("MINIMAX_TTS_WS_START", repr(exc), flush=True)
+            return False
+        try:
             await ws.send(json.dumps({"event": "task_continue", "text": _inject_pauses(self._text)}))
             pcm_total = 0
             frame_bytes = int(sample_rate / 5) * 2  # 200ms 帧
             buf = bytearray()
             init_done = False
+            first_audio_ms = -1.0
             while True:
                 try:
                     msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
@@ -1587,14 +2599,25 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
                     chunk = bytes.fromhex(audio_hex)
                     if not init_done:
                         output_emitter.initialize(
-                            request_id="minimax-tts",
+                            request_id=utils.shortuuid(),
                             sample_rate=sample_rate,
                             num_channels=self._tts_.num_channels,
                             mime_type="audio/pcm",
                             stream=True,
                         )
-                        output_emitter.start_segment(segment_id="minimax-tts")
+                        output_emitter.start_segment(segment_id=utils.shortuuid())
                         init_done = True
+                    # P1.5 FIX 3 首包分解：首音频块到达时刻（距 task_start/握手/全程）。
+                    if first_audio_ms < 0:
+                        t_first = time.monotonic()
+                        first_audio_ms = (t_first - t_start) * 1000
+                        print(
+                            f"MINIMAX_TTS_WS_PERF pool={'hit' if ws_from_pool else 'fresh'} "
+                            f"ws_connect_ms={ws_connect_ms:.0f} "
+                            f"task_start_to_audio_ms={first_audio_ms:.0f} "
+                            f"total_ms={(t_first - t0) * 1000:.0f}",
+                            flush=True,
+                        )
                     # 攒 200ms 帧推给 livekit,让它边收边播
                     buf.extend(chunk)
                     while len(buf) >= frame_bytes:
@@ -1622,6 +2645,8 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
                 await ws.close()
             except Exception:  # pragma: no cover
                 pass
+            # 本连接已耗尽（一连接一任务），后台补热连接给下次合成。
+            _minimax_pool_schedule(url, key)
 
     async def _run_http(self, output_emitter, key: str, voice: str, sample_rate: int) -> None:
         """HTTP 整段合成(WS 不可用时的降级)。"""
@@ -1630,21 +2655,26 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
         for attempt in range(2):
             try:
                 async with httpx.AsyncClient(timeout=60) as client:
+                    payload = {
+                        "model": self._tts_._model(),
+                        "text": _inject_pauses(self._text),
+                        "voice_setting": {
+                            "voice_id": voice,
+                            "speed": float(os.environ.get("MINIMAX_SPEED", "1")),
+                            "vol": float(os.environ.get("MINIMAX_VOL", "1")),
+                            "pitch": int(os.environ.get("MINIMAX_PITCH", "0")),
+                            "emotion": self._tts_._resolve_emotion(),
+                        },
+                        "audio_setting": {"sample_rate": sample_rate, "format": "pcm", "channel": 1},
+                    }
+                    # language_boost 与 WS 路径同源(env 注入,空则完全不带该键)。
+                    boost = self._tts_._language_boost()
+                    if boost:
+                        payload["language_boost"] = boost
                     resp = await client.post(
                         endpoint,
                         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                        json={
-                            "model": self._tts_._model(),
-                            "text": _inject_pauses(self._text),
-                            "voice_setting": {
-                                "voice_id": voice,
-                                "speed": float(os.environ.get("MINIMAX_SPEED", "1")),
-                                "vol": float(os.environ.get("MINIMAX_VOL", "1")),
-                                "pitch": int(os.environ.get("MINIMAX_PITCH", "0")),
-                                "emotion": self._tts_._resolve_emotion(),
-                            },
-                            "audio_setting": {"sample_rate": sample_rate, "format": "pcm", "channel": 1},
-                        },
+                        json=payload,
                     )
                     resp.raise_for_status()
                     body = resp.json()
@@ -1654,7 +2684,7 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
                         raise RuntimeError(f"minimax empty audio: {body.get('base_resp')}")
                     pcm = bytes.fromhex(audio_hex)
                     output_emitter.initialize(
-                        request_id="minimax-tts",
+                        request_id=utils.shortuuid(),
                         sample_rate=sample_rate,
                         num_channels=self._tts_.num_channels,
                         mime_type="audio/pcm",
@@ -1699,7 +2729,13 @@ class Qwen3TTSTTS(tts.TTS):
         sample_rate: int = 24000,
     ):
         super().__init__(
-            capabilities=tts.TTSCapabilities(streaming=False, aligned_transcript=False),
+            # 真流式（对齐 MiniMaxTTS）：sidecar /v1/audio/speech 本身就按 chunk_ms
+            # 流式回 PCM（非 StreamAdapter 模拟）。声明 streaming=True 后 voice 管线
+            # 直接调 stream() 把 LLM 增量文本喂进来,不再被 StreamAdapter +
+            # blingfire SentenceTokenizer 包（那要等整句边界,中文切句不可靠,
+            # 实测多等 150-790ms 才有第一段文本可合成）。分句/增量节奏由
+            # _Qwen3SynthesizeStream 自己掌（一任务一句,POST 流式回帧）。
+            capabilities=tts.TTSCapabilities(streaming=True, aligned_transcript=False),
             sample_rate=sample_rate,
             num_channels=1,
         )
@@ -1717,6 +2753,10 @@ class Qwen3TTSTTS(tts.TTS):
     def synthesize(self, text, *, conn_options=None):
         return _Qwen3TTSStream(self, text, conn_options or APIConnectOptions())
 
+    def stream(self, *, conn_options=None):
+        """真流式 SynthesizeStream：LLM 文本增量到达,按句切任务 POST sidecar。"""
+        return _Qwen3SynthesizeStream(self, conn_options or APIConnectOptions())
+
     def _resolve_voice(self) -> str:
         if isinstance(self._voice, dict):
             return str(self._voice.get(self._language_state.lang) or self._voice.get("zh") or "")
@@ -1730,7 +2770,175 @@ class Qwen3TTSTTS(tts.TTS):
         return raw
 
 
+def _tts_segment_has_word_char(s: str) -> bool:
+    r"""段内有没有任何「可朗读」字符（字母/数字/汉字/其他 \w）。
+
+    纯标点/空白段（「。」「？！！」…）绝不能送 Qwen3-TTS：模型对无音节输入会
+    连环 hallucinate 4-30s 音频爆段（P4 实证 QWEN3_TTS_BYTES 983040-1530240），
+    爆段把整轮 playout 拖 20s+，下一轮回复被官方语音队列压住唔出声（P4-A 挂死根因）。
+    """
+    return _TTS_WORD_CHAR_RE.search(s) is not None
+
+
+_TTS_WORD_CHAR_RE = re.compile(r"\w")
+
+
+async def _qwen3_tts_post_frames(
+    tts_: "Qwen3TTSTTS",
+    text: str,
+    output_emitter,
+    state: dict,
+    *,
+    end_segment: bool = True,
+) -> bool:
+    """单个合成任务：POST 一段文本到 qwen3-tts sidecar,把 PCM 流切成 200ms 帧推给
+    emitter(首个 ~40ms 早推,与旧 _Qwen3TTSStream 同款节奏)。
+
+    state={"started": bool} 跨任务共享——多段流式共用同一个 emitter 初始化与
+    segment,只在首段 initialize。voice/instruct/emotion 每任务即时解析
+    (情绪变化逐段生效,等价 MiniMax 的 task_start 语义)。
+    end_segment=False 时由调用方(流式路径)在整场文本结束后统一收尾。
+    返回是否成功推出音频。
+    """
+    last_exc: Exception | None = None
+    pushed_any = False  # 本任务是否已有音频落地(半途断流后重试会重读音频)
+    # 单任务音频上限(秒):正常一段≤2-3 短句 ≤8s;TTS 对异常输入(纯标点/幻觉)
+    # 会连环合成 20-30s 爆段(P4 实证 1MB+ 级),爆段霸住 playout 会把下一轮回复
+    # 压喺官方语音队列后面(TTFT/回复延迟齐炸)。到顶即断流,唔再读剩余 body。
+    # QWEN3_TTS_MAX_TASK_AUDIO_SEC=0 可关。
+    try:
+        _cap_sec = float(os.environ.get("QWEN3_TTS_MAX_TASK_AUDIO_SEC", "15"))
+    except ValueError:  # pragma: no cover - 配错当没配
+        _cap_sec = 15.0
+    max_task_bytes = int(tts_.sample_rate * max(_cap_sec, 0.0)) * 2 if _cap_sec > 0 else 0
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                # client.stream():响应体逐块拉取。旧 client.post() 会先整体读满
+                # body 先返回(内部 read()),下面 aiter_bytes() 只是读缓存——
+                # sidecar 边合成边推嘅 ~83ms 模型块喺客户端全部积压,首个 40ms
+                # 早推变零收益。stream 模式下 aiter_bytes() 先真逐块到。
+                async with client.stream(
+                    "POST",
+                    f"{tts_._base_url}/v1/audio/speech",
+                    json={
+                        "input": text,
+                        "voice": tts_._resolve_voice(),
+                        "language": tts_._language_state.lang,
+                        "instruct": tts_._resolve_instruct(),
+                        "sample_rate": tts_.sample_rate,
+                        "response_format": "pcm",
+                        "streaming": True,
+                        "chunk_ms": 200,
+                    },
+                ) as resp:
+                    resp.raise_for_status()
+                    # Stream the PCM body into 200ms frames. The sidecar
+                    # streams with non_streaming_mode=False (Qwen3-TTS
+                    # Dual-Track fast path), and pushing frames here lets
+                    # LiveKit start playback/barge-in handling as soon as
+                    # the first frames are available instead of one blob.
+                    pcm_total = 0
+                    frame_bytes = (tts_.sample_rate // 5) * 2  # 200ms, 16-bit mono
+                    buf = bytearray()
+                    first_audio = False
+                    if not state["started"]:
+                        output_emitter.initialize(
+                            request_id="qwen3-tts",
+                            sample_rate=tts_.sample_rate,
+                            num_channels=tts_.num_channels,
+                            mime_type="audio/pcm",
+                            stream=True,
+                        )
+                        state["started"] = True
+                        output_emitter.start_segment(segment_id="qwen3-tts")
+                    async for data in resp.aiter_bytes():
+                        buf.extend(data)
+                        # 单任务爆段护栏:音频时长到顶(默认 15s)即停读剩余 body,
+                        # 本任务判失败(有音频落地 → 上层唔重试),防 20-30s 爆段霸 playout。
+                        if max_task_bytes and pcm_total + len(buf) >= max_task_bytes:
+                            keep = max(max_task_bytes - pcm_total, 0)
+                            if keep:
+                                output_emitter.push(bytes(buf[:keep]))
+                                output_emitter.flush()
+                                del buf[:keep]
+                                pcm_total = max_task_bytes
+                                pushed_any = True
+                            print("QWEN3_TTS_TASK_CAP", pcm_total, "bytes (burst guard)", flush=True)
+                            if end_segment:
+                                output_emitter.end_segment()
+                            return False
+                        # Push the first partial frame as soon as ~40ms is
+                        # available instead of waiting for a full 200ms
+                        # buffer: the sidecar streams ~83ms model chunks
+                        # (QWEN3_TTS_STREAM_INTERVAL=0.1), so this shaves
+                        # ~150ms off the time-to-first-audio without
+                        # changing steady-state frame size.
+                        if not first_audio and len(buf) >= frame_bytes // 5:
+                            output_emitter.push(bytes(buf))
+                            output_emitter.flush()
+                            pcm_total += len(buf)
+                            buf.clear()
+                            first_audio = True
+                            pushed_any = True
+                        while len(buf) >= frame_bytes:
+                            output_emitter.push(bytes(buf[:frame_bytes]))
+                            output_emitter.flush()
+                            del buf[:frame_bytes]
+                            pcm_total += frame_bytes
+                            pushed_any = True
+                    if buf:
+                        output_emitter.push(bytes(buf))
+                        output_emitter.flush()
+                        pcm_total += len(buf)
+                        pushed_any = True
+                    if end_segment:
+                        output_emitter.end_segment()
+                    print("QWEN3_TTS_BYTES", pcm_total, flush=True)
+                    return True
+        except Exception as exc:  # noqa: BLE001 - retry transient gateway failures
+            last_exc = exc
+            if pushed_any:
+                # 半途断流:本句已有音频推进 emitter,重 POST 会从 byte 0 重推同句
+                # (听感重读)。有音频落地就唔重试,交上层决定收尾姿势。
+                print("QWEN3_TTS_MIDSTREAM_ABORT", attempt + 1, repr(exc), flush=True)
+                break
+            print("QWEN3_TTS_RETRY", attempt + 1, repr(exc), flush=True)
+            await asyncio.sleep(0.5 * (attempt + 1))
+    print("QWEN3_TTS_ERROR", repr(last_exc), flush=True)
+    return False
+
+
+async def _qwen3_tts_beep(tts_, output_emitter):
+    """故障蜂鸣。真 AudioEmitter.push 喺未 initialize 时会抛
+    "AudioEmitter isn't started"（tts.py:900），上层 except:pass 静默吞掉 →
+    客户面对无差别静音。所以 beep 自己先 initialize+start_segment。
+    调用方约定：只喺「本场零音频」（state["started"]=False）时调用，唔会重初始化。
+    """
+    output_emitter.initialize(
+        request_id="qwen3-tts-beep",
+        sample_rate=tts_.sample_rate,
+        num_channels=tts_.num_channels,
+        mime_type="audio/pcm",
+        stream=True,
+    )
+    output_emitter.start_segment(segment_id="qwen3-tts-beep")
+    import math
+
+    sr = tts_.sample_rate
+    n = int(sr * 0.4)
+    pcm = bytearray()
+    for i in range(n):
+        v = int(12000 * math.sin(2 * math.pi * 440 * i / sr))
+        pcm += v.to_bytes(2, "little", signed=True)
+    output_emitter.push(bytes(pcm))
+    output_emitter.flush()
+    output_emitter.end_segment()
+
+
 class _Qwen3TTSStream(tts.ChunkedStream):
+    """整段合成（synthesize 兼容路径）：一段文本一个任务,POST 流式回帧。"""
+
     def __init__(self, tts_, text, conn_options):
         super().__init__(tts=tts_, input_text=text, conn_options=conn_options)
         self._text = text
@@ -1739,78 +2947,11 @@ class _Qwen3TTSStream(tts.ChunkedStream):
     async def _run(self, output_emitter):
         # emitter 是否已 initialize：未收到响应就被打断/挂断时 emitter 从未启动，
         # 此时 flush 会抛 "AudioEmitter isn't started"（误报 TTS 断链）。只在已启动后收尾。
-        started = False
+        state = {"started": False}
         try:
-            last_exc: Exception | None = None
-            for attempt in range(3):
-                try:
-                    async with httpx.AsyncClient(timeout=120) as client:
-                        resp = await client.post(
-                            f"{self._tts_._base_url}/v1/audio/speech",
-                            json={
-                                "input": self._text,
-                                "voice": self._tts_._resolve_voice(),
-                                "language": self._tts_._language_state.lang,
-                                "instruct": self._tts_._resolve_instruct(),
-                                "sample_rate": self._tts_.sample_rate,
-                                "response_format": "pcm",
-                                "streaming": True,
-                                "chunk_ms": 200,
-                            },
-                        )
-                        resp.raise_for_status()
-                        # Stream the PCM body into 200ms frames. The sidecar
-                        # streams with non_streaming_mode=False (Qwen3-TTS
-                        # Dual-Track fast path), and pushing frames here lets
-                        # LiveKit start playback/barge-in handling as soon as
-                        # the first frames are available instead of one blob.
-                        pcm_total = 0
-                        frame_bytes = (
-                            self._tts_.sample_rate // 5
-                        ) * 2  # 200ms, 16-bit mono
-                        buf = bytearray()
-                        first_audio = False
-                        output_emitter.initialize(
-                            request_id="qwen3-tts",
-                            sample_rate=self._tts_.sample_rate,
-                            num_channels=self._tts_.num_channels,
-                            mime_type="audio/pcm",
-                            stream=True,
-                        )
-                        started = True
-                        output_emitter.start_segment(segment_id="qwen3-tts")
-                        async for data in resp.aiter_bytes():
-                            buf.extend(data)
-                            # Push the first partial frame as soon as ~40ms is
-                            # available instead of waiting for a full 200ms
-                            # buffer: the sidecar streams ~83ms model chunks
-                            # (QWEN3_TTS_STREAM_INTERVAL=0.1), so this shaves
-                            # ~150ms off the time-to-first-audio without
-                            # changing steady-state frame size.
-                            if not first_audio and len(buf) >= frame_bytes // 5:
-                                output_emitter.push(bytes(buf))
-                                output_emitter.flush()
-                                pcm_total += len(buf)
-                                buf.clear()
-                                first_audio = True
-                            while len(buf) >= frame_bytes:
-                                output_emitter.push(bytes(buf[:frame_bytes]))
-                                output_emitter.flush()
-                                del buf[:frame_bytes]
-                                pcm_total += frame_bytes
-                        if buf:
-                            output_emitter.push(bytes(buf))
-                            output_emitter.flush()
-                            pcm_total += len(buf)
-                        output_emitter.end_segment()
-                        print("QWEN3_TTS_BYTES", pcm_total, flush=True)
-                        return
-                except Exception as exc:  # noqa: BLE001 - retry transient gateway failures
-                    last_exc = exc
-                    print("QWEN3_TTS_RETRY", attempt + 1, repr(exc), flush=True)
-                    await asyncio.sleep(0.5 * (attempt + 1))
-            if not asyncio.current_task().cancelling():
-                print("QWEN3_TTS_ERROR", repr(last_exc), flush=True)
+            ok = await _qwen3_tts_post_frames(self._tts_, self._text, output_emitter, state)
+            # beep 只畀「全场零音频」:音频已出过再失败,补 beep 会叠喺已播内容后面。
+            if not ok and not state["started"] and not asyncio.current_task().cancelling():
                 await self._emit_beep(output_emitter)
         except asyncio.CancelledError:
             # 会话关闭/打断时不播放故障蜂鸣，直接收尾。
@@ -1819,23 +2960,162 @@ class _Qwen3TTSStream(tts.ChunkedStream):
             print("QWEN3_TTS_FATAL", repr(exc), flush=True)
             await self._emit_beep(output_emitter)
         finally:
-            if started:
+            if state["started"]:
                 try:
                     output_emitter.flush()
                 except Exception:  # pragma: no cover - 收尾失败不影响主流程
                     pass
 
     async def _emit_beep(self, output_emitter):
-        import math
+        await _qwen3_tts_beep(self._tts_, output_emitter)
 
-        sr = self._tts_.sample_rate
-        n = int(sr * 0.4)
-        pcm = bytearray()
-        for i in range(n):
-            v = int(12000 * math.sin(2 * math.pi * 440 * i / sr))
-            pcm += v.to_bytes(2, "little", signed=True)
-        output_emitter.push(bytes(pcm))
-        output_emitter.flush()
+
+class _Qwen3SynthesizeStream(tts.SynthesizeStream):
+    """Qwen3-TTS 增量流式（镜像 _MiniMaxSynthesizeStream 结构）。
+
+    LLM 文本增量 push 进来后按句切任务,一任务一次 HTTP POST(与 synthesize()
+    同一端点同一 JSON),sidecar 边合成边流 PCM,这里收一段推一段。首段音频
+    在第一个句号就开推,唔再等 SentenceTokenizer 凑整句/全文。
+    - voice/instruct/emotion 每任务经 _resolve_voice/_resolve_instruct 即时解析。
+    - overlap:句号之间的增量满足「≥N 字且有软停顿/距上次够久」提前送
+      (QWEN3_TTS_OVERLAP,默认开);连续数字/字母串唔切开(防单号腰斩)。
+    - 任一任务三次重试都失败 → 置 broken 停止后续任务(唔逐句白等 3 轮);
+      全场一字未出(emitter 未启动)则补一声 beep,唔畀客户面对无差别静音。
+    """
+
+    def __init__(self, tts_: "Qwen3TTSTTS", conn_options):
+        super().__init__(tts=tts_, conn_options=conn_options)
+        self._tts_ = tts_
+
+    async def _run(self, output_emitter):
+        state = {"started": False}
+        broken = False
+        pushed_any = False
+        try:
+            _SENT_END = "。！？!?"
+            _SOFT_BREAK = "，、；;：:"
+            try:
+                overlap_on = os.environ.get("QWEN3_TTS_OVERLAP", "1") == "1"
+            except Exception:  # pragma: no cover
+                overlap_on = True
+            try:
+                _overlap_chars = int(os.environ.get("QWEN3_TTS_OVERLAP_CHARS", "12"))
+            except Exception:  # pragma: no cover
+                _overlap_chars = 12
+            try:
+                _overlap_ms = int(os.environ.get("QWEN3_TTS_OVERLAP_MS", "300"))
+            except Exception:  # pragma: no cover
+                _overlap_ms = 300
+            _last_send = time.monotonic()
+
+            def _flushable(s: str) -> bool:
+                """overlap 增量可否送出：不能把连续的号码/数字串拦腰截断。"""
+                if not s:
+                    return False
+                tail = s.rstrip("。！？!?，、；;：: \t")
+                # 只拦 latin/数字结尾(词/号码可能被拦腰截断)。唔可以用裸 isalpha():
+                # CJK 汉字 isalpha()==True → 中文片段全被拦,overlap 对中文全死。
+                return not (tail and tail[-1].isascii() and tail[-1].isalnum())
+
+            sent_buf = ""
+            async for item in self._input_ch:
+                if isinstance(item, self._FlushSentinel):
+                    continue
+                text = str(item or "")
+                if not text.strip():
+                    continue
+                pushed_any = True
+                sent_buf += text
+                while True:
+                    idx = min(
+                        (sent_buf.find(ch) for ch in _SENT_END if sent_buf.find(ch) != -1),
+                        default=-1,
+                    )
+                    if idx == -1:
+                        break
+                    sentence = sent_buf[: idx + 1]
+                    sent_buf = sent_buf[idx + 1 :]
+                    if not _tts_segment_has_word_char(sentence):
+                        # 纯标点段(P4-B 实证 input='。' / '？'):Qwen3-TTS 对无音节
+                        # 输入会 hallucinate 4-30s 爆段。直接丢弃,绝唔单独 POST
+                        # (前句已带句末标点,丢呢段零语音损失)。
+                        continue
+                    ok = await _qwen3_tts_post_frames(
+                        self._tts_, sentence.strip(), output_emitter, state,
+                        end_segment=False,
+                    )
+                    _last_send = time.monotonic()
+                    if not ok:
+                        broken = True
+                        break
+                if broken:
+                    break
+                # overlap:句号之间的增量提前送(与 MiniMax 同款节奏)。
+                if (
+                    overlap_on
+                    and not broken
+                    and sent_buf.strip()
+                    and len(sent_buf.strip()) >= _overlap_chars
+                ):
+                    soft_idx = -1
+                    for ch in _SOFT_BREAK:
+                        pos = sent_buf.rfind(ch)
+                        if pos != -1:
+                            soft_idx = max(soft_idx, pos)
+                    now = time.monotonic()
+                    time_up = (now - _last_send) * 1000 >= _overlap_ms
+                    if (soft_idx != -1 and soft_idx >= len(sent_buf.strip()) // 2) or time_up:
+                        frag = sent_buf.strip()
+                        if _flushable(frag) and _tts_segment_has_word_char(frag):
+                            ok = await _qwen3_tts_post_frames(
+                                self._tts_, frag, output_emitter, state,
+                                end_segment=False,
+                            )
+                            _last_send = time.monotonic()
+                            if not ok:
+                                broken = True
+                                break
+                            sent_buf = ""
+            if not broken:
+                # 收尾残句:全场文本结束,把没凑够一句的尾巴合成掉。
+                # 纯标点尾巴(唔沾正字)直接丢弃,绝唔 POST(P4-B 爆段源)。
+                final_text = sent_buf.strip()
+                if _tts_segment_has_word_char(final_text):
+                    await _qwen3_tts_post_frames(
+                        self._tts_, final_text, output_emitter, state,
+                        end_segment=False,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print("QWEN3_TTS_STREAM_FATAL", repr(exc), flush=True)
+        finally:
+            if state["started"]:
+                try:
+                    output_emitter.end_segment()
+                except Exception:  # pragma: no cover - 收尾失败不影响主流程
+                    pass
+            elif pushed_any and not asyncio.current_task().cancelling():
+                # 一段音频都冇出过(sidecar 挂了):beep 一下,至少证明 AI 有反应。
+                try:
+                    await _qwen3_tts_beep(self._tts_, output_emitter)
+                except Exception:  # pragma: no cover
+                    pass
+
+
+# ASR 语言提示:值=模型 config support_languages 的规范名(mlx 层大小写不敏感匹配)。
+# 每通对话语言固定(per-call fixed):生产两处调用(agent.py 会话装配 / interpret.py
+# 同传)都 pin=True 三语全钉——zh 也整场下发 Chinese,实测夹英文 code-switching 词
+# 保得住(「check/WhatsApp/order status」原样),auto 反而把粤语混英句误判成
+# English。pin=False 只係构造缺省的旧口径逃生口(cantonese/en 钉、zh auto),生产唔走。
+_ASR_LANG_HINTS = {"cantonese": "Cantonese", "en": "English", "zh": "Chinese"}
+
+
+def _asr_language_hint(lang_state: str, pin: bool) -> str:
+    hint = _ASR_LANG_HINTS.get(lang_state, "")
+    if not pin and hint == "Chinese":
+        return ""
+    return hint
 
 
 class Qwen3ASRSTT(stt.STT):
@@ -1848,6 +3128,7 @@ class Qwen3ASRSTT(stt.STT):
         self,
         base_url: str = "http://127.0.0.1:8787",
         language_state: LanguageState | None = None,
+        pin_language: bool = False,
     ):
         super().__init__(
             capabilities=stt.STTCapabilities(
@@ -1862,6 +3143,9 @@ class Qwen3ASRSTT(stt.STT):
         )
         self._base_url = base_url.rstrip("/")
         self._language_state = language_state or LanguageState()
+        # True=语言钉死(同传:源语言是用户建房时选定的,zh/en/cantonese 都下发 hint);
+        # False=通话模式(只有 cantonese 钉防误判,zh/en 交 auto 容忍夹语 code-switching)。
+        self._pin_language = pin_language
 
     def stream(self, *, language=None, conn_options=None):
         return _Qwen3ASRStream(self, conn_options or APIConnectOptions())
@@ -1925,13 +3209,12 @@ class _Qwen3ASRStream(stt.RecognizeStream):
         if not pcm:
             return "", ""
         t0 = time.monotonic()
-        # 语言提示:会话语言为粤语时强制告诉模型(mlx 层大小写不敏感回填 config 规范名
-        # Cantonese),避免 auto 误判成普通话;zh/en/空不传 = 交给模型 auto 检测。
-        lang_hint = ""
-        if self._stt_._language_state.lang == "cantonese":
-            lang_hint = "cantonese"
-        elif self._stt_._language_state.lang == "yue":  # 旧数据只读别名
-            lang_hint = "cantonese"
+        # 语言提示:值=模型 config support_languages 的规范名(Chinese/English/Cantonese,
+        # mlx 层大小写不敏感)。每通对话语言固定(A 线通话装配时钉死、B 线同传用户
+        # 选定):生产都 pin=True 三语全钉——cantonese 防 auto 误判成普通话(啱唔靈→
+        # 难唔难),zh 下发 Chinese 夹英文词照样保得住(实测「check/WhatsApp/order
+        # status」原样,auto 反而误判 English)。pin=False 构造缺省只係逃生口。
+        lang_hint = _asr_language_hint(self._stt_._language_state.lang, self._stt_._pin_language)
         print(f"QWEN3_ASR_HINT {lang_hint or 'auto'} lang_state={self._stt_._language_state.lang}", flush=True)
         last_exc: Exception | None = None
         for attempt in range(3):
@@ -1969,3 +3252,507 @@ class _Qwen3ASRStream(stt.RecognizeStream):
                 await asyncio.sleep(0.5 * (attempt + 1))
         print("QWEN3_ASR_ERROR", repr(last_exc), flush=True)
         return "", ""
+
+
+def _common_prefix(a: str, b: str) -> str:
+    """两段文本的公共前缀（字符级）——滑窗 partial 的「稳定部分」判定。"""
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return a[:i]
+
+
+_ASR_PARTIAL_POST_MS = float(os.environ.get("QWEN3_ASR_CHUNK_MS", "300"))
+# PREFLIGHT(抢跑)发射节流:稳定前缀比【上次发射】至少长 4 字才再发(首发仍须 ≥6 字)。
+# 每个 PREFLIGHT 事件都吃一次框架抢跑预算(on_preemptive_generation count+1,
+# max_retries 封顶;烧穿后 FINAL 到达只 cancel 不重建 → commit 从零生成,实测 +0.2-0.7s)。
+# 长句滑窗每 ~300ms 一窗、逐字增长,旧「比 _stable 长 1 字就发」会把预算在说话中途
+# 烧光;≥4 字(约一个词组)把 3s 句的发射从 3-5 次压到 1-2 次,FINAL 那拍预算必够。
+_ASR_PREFLIGHT_MIN_GROWTH_CHARS = 4
+
+# ---- 句级提交(turn_detection="stt" 的 STT 侧事件源)----------------------------
+# 强句标点:全角 。！？ 与半角 !?；ASCII 句点另判(见 _sentence_boundary,3.5 唔算边界)。
+_SENTENCE_STRONG_PUNCT = "。！？!?"
+# 句子(自上个提交边界起)最少字数:短句/连珠短答(好。係。)唔够格,排队并入下一边界。
+_ASR_SENTENCE_MIN_CHARS = 6
+# 限速:两次句级提交最少间隔(「好。係。唔該。」连珠句防机关枪式连发,
+# 排队语义=剩余文本并入下一边界或 VAD 停嘴整句兜底)。
+_ASR_SENTENCE_MIN_INTERVAL_S = 1.5
+# VAD 微停顿候选句尾部的弱停顿符：滑窗 partial 说话期句尾只打逗号（p6 实测），
+# 停嘴高精度 finish 会升级成句号——提交时剥掉弱尾符，让已提交前缀与 finish
+# 整句做 startswith 匹配时唔会因「，vs。」错位（错位会触发 rfind 兜底返回
+# 整段=重复转写）。强句标点（。！？!?）唔剥——嗰个係边界本身。
+_PAUSE_TRAILING_WEAK_PUNCT = "，、；：,;…—~～ \t"
+# _uncommitted 剩余的头部位弱停顿符：同理（committed 前缀剥了弱尾符后，
+# finish 整句的「。佢聽日…」剩余唔应该带住句号开头进字幕/下一轮）。
+_UNCOMMITTED_LEADING_WEAK_PUNCT = _PAUSE_TRAILING_WEAK_PUNCT + "。！？!?"
+
+
+def sentence_commit_enabled() -> bool:
+    """句级提交总门:QWEN3_ASR_SENTENCE_COMMIT(默认 1)且框架轮次判定=stt。
+
+    TURN_DETECTION≠stt(EOT/vad kill-switch)时必须停发:非 stt 模式下框架忽略
+    STT 的 END_OF_SPEECH(audio_recognition.py:1292 分支要求 mode=="stt"),说话
+    中途的句子 FINAL 只会叠加进 _audio_transcript,与停嘴整段 FINAL 重复入历史。
+    两个 env 单点各读一行:agent.py 的 TURN_DETECTION 默认值与此处保持同源(都
+    默认 "stt"),唔共享 import(agent→providers 已是依赖方向,反向会成环)。
+    """
+    if os.environ.get("QWEN3_ASR_SENTENCE_COMMIT", "1") != "1":
+        return False
+    return os.environ.get("TURN_DETECTION", "stt").strip().lower() == "stt"
+
+
+def _pause_trigger_enabled() -> bool:
+    """VAD 微停顿句边界触发（QWEN3_ASR_SENTENCE_PAUSE_TRIGGER，默认 1）。
+
+    p6 实测：mlx ASR 说话期滑窗 partial 对句间停顿只打逗号不打句号（MiniMax
+    生产夹具同样）→ 强标点门在真实音频上结构性不触发。句边界需要非标点事件源
+    ——本流内置 VAD 的 END_OF_SPEECH（≥min_silence 0.45s 真静音）就是句间停顿：
+    人打电话句间停 0.3-0.8s。只在 sentence_commit_enabled() 之上叠加（总门关
+    则全关，kill-switch 一并灭掉）。
+    """
+    return os.environ.get("QWEN3_ASR_SENTENCE_PAUSE_TRIGGER", "1") == "1"
+
+
+def _has_latin_or_digit_run(text: str, min_len: int = 2) -> bool:
+    """句内含 ≥min_len 连续 ASCII 字母/数字 run(单号/WhatsApp 号码高危)。
+
+    与 sidecar `_has_latin_or_digit`(services/qwen3-asr-sidecar/app.py)同一家族:
+    号码/英文是转写最高危内容,句级 FINAL 一旦把半截号码当整句提交,框架按句落
+    历史 + LLM 抢答,停嘴整句兜底都救唔返。≥2 连写才拦(单个字母夹句如「A 嘅」
+    唔至于误提交号码)。
+    """
+    run = 0
+    for ch in text:
+        if ch.isascii() and ch.isalnum():
+            run += 1
+            if run >= min_len:
+                return True
+        else:
+            run = 0
+    return False
+
+
+class _Qwen3ASRLiveStream(stt.RecognizeStream):
+    """VAD 骨架 + 滑窗 partial（官方 StreamAdapterWrapper 的 partial 增强版）。
+
+    与官方 stt.StreamAdapter 同一套 VAD 两任务骨架（START/END_OF_SPEECH 事件、
+    END 触发整句转写），增强：
+    - 说话期间每 ~300ms 把增量 PCM 喂 sidecar /api/chunk（同一流式会话），回传
+      滑窗 partial：全文 → INTERIM_TRANSCRIPT（前端实时字幕）；连续两窗一致的
+      稳定前缀 → PREFLIGHT_TRANSCRIPT（1.7 官方抢跑生成专用事件，LLM 在客户
+      停嘴前就 prefill，commit 校验通过直接复用，省 ~0.4-0.6s）。
+    - END_OF_SPEECH 用 /api/finish 补传尾段、取整句高精度转写——WhatsApp 数字
+      捕获/话术推进零降级；partial 的跳变被「稳定前缀」约束，唔会进最终稿。
+    - 句级提交（sentence_commit_enabled()，turn_detection="stt" 默认开）：partial
+      稳定出现强句标点（。！？!?）且过门（≥6 字/无数字·字母连写/跨窗稳定/1.5s
+      限速）→ 按句发 FINAL_TRANSCRIPT(句子)+END_OF_SPEECH，框架按句 commit 轮次
+      （官方 stt 模式契约 audio_recognition.py:1292-1327），LLM+TTS 在客户仍在
+      说话时就开跑——speech-end→first-audio 的唯一 ≤1s 路径。停嘴路径只补发
+      未提交尾巴，已提交句子唔会随整段重复入历史。
+    - VAD 微停顿触发（_pause_trigger_enabled()，默认开）：p6 实测真实音频滑窗
+      partial 句间只出逗号、强标点门结构性不触发 → 内置 VAD END_OF_SPEECH
+      （≥0.45s 真静音=句间停顿）作为第二边界源：停嘴那刻 partial 稳定够格就
+      直接按句提交（免等 finish 往返），再走正常停嘴路径补尾巴。
+    """
+
+    def __init__(self, stt_, *, vad, conn_options):
+        super().__init__(stt=stt_, conn_options=conn_options, sample_rate=16000)
+        self._stt_ = stt_  # 内层 Qwen3ASRSTT（base_url/语言状态/钉定）
+        self._vad = vad
+        self._session_id: str | None = None
+        self._pending = bytearray()  # 尚未 POST 给 sidecar 的增量 PCM
+        self._last_partial = ""  # 上一窗全文（INTERIM 去重 + 句边界稳定性参照）
+        self._prev_partial = ""  # 稳定前缀参照窗
+        self._stable = ""  # 已发 PREFLIGHT 的最长稳定前缀（未提交剩余坐标系）
+        self._last_post = 0.0
+        self._finishing = False
+        self._last_lang = ""  # 最后一窗 partial 的归一语言（VAD 停嘴提交锚定用）
+        # 句级提交状态（sentence_commit_enabled() 关闭时恒空/0，行为同旧）：
+        self._committed_text = ""  # 已按句提交的句子拼接（FINAL 已发、框架已 commit）
+        self._last_sentence = ""  # 最后提交句（finish 整段坐标失配时的回退锚）
+        self._commit_idx = 0  # 滑窗全文坐标的已提交位置（每句边界只发一次）
+        self._last_sentence_commit_at = 0.0  # 上次句级提交时刻（monotonic，限速用）
+
+    async def _run(self) -> None:
+        vad_stream = self._vad.stream()
+
+        async def _forward_input() -> None:
+            """forward input to vad（与官方 StreamAdapter 一致）"""
+            async for input in self._input_ch:
+                if isinstance(input, self._FlushSentinel):
+                    vad_stream.flush()
+                    continue
+                vad_stream.push_frame(input)
+            vad_stream.end_input()
+
+        async def _recognize() -> None:
+            started = False
+            async for event in vad_stream:
+                if event.type == vad.VADEventType.START_OF_SPEECH:
+                    started = True
+                    self._event_ch.send_nowait(stt.SpeechEvent(stt.SpeechEventType.START_OF_SPEECH))
+                    await self._start_session()
+                elif event.type == vad.VADEventType.INFERENCE_DONE:
+                    if not started or self._finishing:
+                        continue
+                    # 1.7 utils.merge_frames=rtc.combine_audio_frames:返回【单个】
+                    # rtc.AudioFrame(不可迭代,官方 StreamAdapter 同款用法)。
+                    self._pending.extend(bytes(utils.merge_frames(event.frames).data))
+                    await self._maybe_partial()
+                elif event.type == vad.VADEventType.END_OF_SPEECH:
+                    if not started:
+                        continue
+                    self._finishing = True
+                    speech_end_time = time.time() - event.silence_duration - event.inference_duration
+                    # ---- VAD 微停顿句级提交（pause trigger，默认开）--------------
+                    # 内置 VAD END_OF_SPEECH = 本段语音后已有 ≥min_silence(0.45s)
+                    # 真静音——人打电话句间停 0.3-0.8s，这里多数就是句边界。此刻
+                    # 滑窗 partial 已带着整段静音重解过（文本齐），直接按句提交：
+                    # 框架 commit = max(停嘴+min_delay, FINAL 到达)——FINAL 免等
+                    # /api/finish 往返（~0.15-0.3s），commit 同量提前。守卫照句级
+                    # 门（≥6 字/无数字 run/跨窗稳定/1.5s 限速）；partial 空或不
+                    # 稳定 → 不提交，下面正常 finish 路径整句兜底（零行为差）。
+                    if sentence_commit_enabled() and _pause_trigger_enabled():
+                        pause_commit = self._sentence_boundary(
+                            self._last_partial, self._prev_partial, allow_eos=True
+                        )
+                        if pause_commit is not None:
+                            sentence, end_idx = pause_commit
+                            self._emit_sentence_commit(
+                                sentence, end_idx, self._last_lang, time.monotonic(), source="vad-pause"
+                            )
+                    self._event_ch.send_nowait(
+                        stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH, speech_end_time=speech_end_time)
+                    )
+                    text, lang = await self._finish_session()
+                    # 句级提交已发过的句子 FINAL（框架按句 commit 落了历史）唔可以随
+                    # 整段再发一次（重复入转写）——只补「未提交尾巴」。句级门关时
+                    # _committed_text 恒空，_uncommitted 原样返回 → 行为同旧。
+                    committed_before = self._committed_text
+                    payload = self._uncommitted(text) if (text and committed_before) else text
+                    started = False
+                    self._finishing = False
+                    self._reset()
+                    if payload:
+                        self._stt_._language_state.update(lang, payload)
+                        self._event_ch.send_nowait(
+                            stt.SpeechEvent(
+                                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                                alternatives=[stt.SpeechData(language=self._stt_._language_state.lang, text=payload)],
+                                speech_end_time=speech_end_time,
+                            )
+                        )
+
+        await asyncio.gather(_forward_input(), _recognize())
+
+    async def _start_session(self) -> None:
+        lang_hint = _asr_language_hint(self._stt_._language_state.lang, self._stt_._pin_language)
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.post(
+                    f"{self._stt_._base_url}/api/start",
+                    params={"language": lang_hint} if lang_hint else None,
+                )
+                r.raise_for_status()
+                self._session_id = r.json()["session_id"]
+        except Exception as exc:  # noqa: BLE001 - 建会话失败 → 整句路径照样可用
+            self._session_id = None
+            print(f"QWEN3_ASR_PARTIAL start failed: {exc!r}", flush=True)
+
+    async def _maybe_partial(self) -> None:
+        now = time.monotonic()
+        # _ASR_PARTIAL_POST_MS 名义毫秒;monotonic() 是秒——不除 1000 会把
+        # 节流当成 300 秒,首调还依赖系统运行时长>300s(CI 新 runner 恒早退,
+        # preflight 单测空事件 flake 的根因)。除后=真正的 ≥300ms 节流。
+        if not self._session_id or now - self._last_post < _ASR_PARTIAL_POST_MS / 1000.0:
+            return
+        if len(self._pending) < 16000 * 2 * 0.6:  # <0.6s 无转写价值
+            return
+        self._last_post = now
+        pcm = bytes(self._pending)
+        self._pending.clear()
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.post(
+                    f"{self._stt_._base_url}/api/chunk",
+                    params={"session_id": self._session_id},
+                    content=pcm,
+                    headers={"Content-Type": "application/octet-stream"},
+                )
+                r.raise_for_status()
+                data = r.json()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - partial 尽力而为,忙时/抖动静默跳过
+            return
+        text = str(data.get("text") or "")
+        if not text:
+            return
+        if text == self._last_partial:
+            # 滑窗文本没变（静音期 partial 稳定重解同文）：参照窗同步到当前窗
+            # ——VAD 微停顿提交的「跨窗稳定」门才能在静音期成立（否则 prev 停在
+            # 说话最后一窗，EOS 时刻 prev≠last，pause trigger 永不满足）。
+            self._prev_partial = self._last_partial
+            return
+        lang = _normalize_asr_language(str(data.get("language") or ""), text)
+        self._last_lang = lang
+        prev_full = self._last_partial
+        self._last_partial = text
+
+        # ---- 句级提交（turn_detection="stt"，VAD 说话中才会走到这里）----------
+        # 能进 _maybe_partial 即 VAD 仍在语音段（INFERENCE_DONE 且非 finishing）：
+        # VAD 已停的场景由 _run 的 END_OF_SPEECH 分支整句兜底，双重提交天然排除。
+        # 每句事件序：FINAL_TRANSCRIPT(句子) → END_OF_SPEECH。框架侧（官方契约
+        # audio_recognition.py:1174-1238/1292-1327）：FINAL 在 speaking 中只累计
+        # _audio_transcript + 喂抢跑；EOS 置 committed + _run_eou_detection(trigger
+        # ="stt")（endpointing min_delay 仍适用）→ 按句建轮，LLM+TTS 与客户说话
+        # 重叠。提交窗不发 PREFLIGHT（文本已权威提交，省一次投机预算）。
+        if sentence_commit_enabled():
+            commit = self._sentence_boundary(text, prev_full)
+            if commit is not None:
+                sentence, end_idx = commit
+                self._emit_sentence_commit(sentence, end_idx, lang, now, source="partial-punct")
+                # 每句事件序：FINAL(句子) → END_OF_SPEECH（框架 EOS 才置 committed
+                # + _run_eou_detection(trigger="stt")，见 _sentence_boundary 文档）。
+                self._event_ch.send_nowait(stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH))
+                self._prev_partial = text  # 参照窗照常推进（与 _last_partial 同步）
+                # 字幕续流：只发未提交剩余（框架 _audio_transcript 已含已提交句）。
+                remainder = self._uncommitted(text)
+                if remainder:
+                    self._event_ch.send_nowait(
+                        stt.SpeechEvent(
+                            type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
+                            alternatives=[stt.SpeechData(language=lang, text=remainder)],
+                        )
+                    )
+                return
+
+        # INTERIM：滑窗剩余文本（句级提交后坐标系=未提交尾巴，可能跳变，只供展示）
+        display = self._uncommitted(text)
+        if not display:
+            return
+        self._event_ch.send_nowait(
+            stt.SpeechEvent(
+                type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
+                alternatives=[stt.SpeechData(language=lang, text=display)],
+            )
+        )
+        # 稳定前缀：与上一窗【剩余】的公共前缀，首发 ≥6 字；再发须比上次发射多 ≥
+        # _ASR_PREFLIGHT_MIN_GROWTH_CHARS 字（长度增长节流，保框架抢跑预算给 FINAL）。
+        common = _common_prefix(self._uncommitted(prev_full), display)
+        self._prev_partial = text
+        # 语言门：partial 窗检测语言 ≠ 会话锚定语言（LanguageState.lang 此刻值）→
+        # 跳过 PREFLIGHT（INTERIM 已照发，字幕不受影响）。PREFLIGHT 只喂框架
+        # 抢跑生成：语言切换轮按旧锚语言前缀投机，必被 FINAL 的语言重锚作废重建
+        # （twin 双请求并发 prefill 自伤——P5 实测 en 切换轮 TTFT 残留 4.1-4.2s）。
+        # FINAL 路径不动：WhatsApp/话术推进用 FINAL，commit 正确性零影响。
+        # QWEN3_ASR_PREFLIGHT_LANG_GATE=0 关门（永远发，回退旧行为）。
+        lang_gate_open = (
+            os.environ.get("QWEN3_ASR_PREFLIGHT_LANG_GATE", "1") == "1"
+            and lang != self._stt_._language_state.lang
+        )
+        if (
+            not lang_gate_open
+            and len(common) >= 6
+            and len(common) - len(self._stable) >= _ASR_PREFLIGHT_MIN_GROWTH_CHARS
+        ):
+            self._stable = common
+            self._event_ch.send_nowait(
+                stt.SpeechEvent(
+                    type=stt.SpeechEventType.PREFLIGHT_TRANSCRIPT,
+                    alternatives=[stt.SpeechData(language=lang, text=common)],
+                )
+            )
+            print(f"QWEN3_ASR_PREFLIGHT chars={len(common)}", flush=True)
+
+    def _emit_sentence_commit(self, sentence: str, end_idx: int, lang: str, now: float, source: str) -> None:
+        """句级提交共用出口（partial-punct / vad-pause 两个事件源同一套记账）。
+
+        记账：已提交前缀/最后句/滑窗坐标/限速时刻/PREFLIGHT 坐标系重置；语言锚定
+        与 FINAL 路径同款（strong-evidence 判定在 LanguageState 内部，弱证据短句
+        拉不走会话语言）。只发 FINAL——句末 END_OF_SPEECH 由调用方按各自契约补
+        （partial 标点路径紧随发 EOS；vad-pause 路径后面本就有停嘴 EOS，不重复发）。
+        """
+        self._committed_text += sentence
+        self._last_sentence = sentence
+        self._commit_idx = end_idx
+        self._stable = ""  # PREFLIGHT 换未提交坐标系，增长重新计
+        self._last_sentence_commit_at = now
+        self._stt_._language_state.update(lang, sentence)
+        self._event_ch.send_nowait(
+            stt.SpeechEvent(
+                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                alternatives=[stt.SpeechData(language=self._stt_._language_state.lang, text=sentence)],
+            )
+        )
+        print(f"QWEN3_ASR_SENTENCE_COMMIT source={source} chars={len(sentence)} {sentence!r}", flush=True)
+
+    def _sentence_boundary(self, text: str, prev_full: str, *, allow_eos: bool = False) -> tuple[str, int] | None:
+        """滑窗全文里找下一个「可提交」强句边界；唔够格返回 None。
+
+        边界=强标点（。！？!? 及连用）；ASCII 句点后跟字母/数字（3.5、e.g.）唔算
+        边界。提交对象是【自上个提交边界起的整段】text[commit_idx:边界]——短句
+        （好。係。）唔够 6 字就排队累积，并入下一个够长的边界（或停嘴兜底）。
+        全部门（缺一不可）：
+        - 句段 ≥ _ASR_SENTENCE_MIN_CHARS 字；
+        - 句段无 ≥2 连续 ASCII 字母/数字 run（单号/WhatsApp 高危 → 整段留给停嘴
+          整句兜底，数字句永唔句级提交）；
+        - 稳定性：上一窗同坐标已是同一句段（首现唔提交，防滑窗跳变 flicker）；
+        - 限速：距上次提交 < _ASR_SENTENCE_MIN_INTERVAL_S 唔提交（连珠句防机关枪）。
+        allow_eos=True（VAD 微停顿触发）：标点扫描无果时，边界候选=当前滑窗文本
+        末尾（pause≥0.45s 唔使标点都係句边界）。稳定性用 prefix 级——上一窗剩余
+        係当前剩余的严格前缀（已确认部分零改写）即过：静音期通常只有一窗重解，
+        EOS 时刻最后一窗往往刚把句尾字补齐，严格相等会错过真实停顿。首窗该区间
+        为空（prev_rem 空）唔提交——零跨窗证据唔赌。
+        返回 (句段文本, 边界后坐标)；数字 run 门不过时继续往后扫也只会带着同一
+        run 失败 → 自然落到停嘴兜底。
+        """
+        if time.monotonic() - self._last_sentence_commit_at < _ASR_SENTENCE_MIN_INTERVAL_S:
+            return None
+        start = self._commit_idx
+        if start >= len(text):
+            return None
+        i = start
+        while i < len(text):
+            if text[i] in _SENTENCE_STRONG_PUNCT:
+                j = i + 1
+                while j < len(text) and text[j] in _SENTENCE_STRONG_PUNCT:
+                    j += 1
+                if text[i] == "." and (
+                    # 小数点/缩写点：唔系边界，跳过整段标点继续扫。窗口末尾(j==len)
+                # 无后继字符可判时,只要点前一字符是 ascii 字母数字同样视为小数/缩写——
+                # 等「.5公斤」下个窗口到齐再定边界,免得半截数字句提交。
+                    (j < len(text) and text[j].isascii() and text[j].isalnum())
+                    or (i > start and text[i - 1].isascii() and text[i - 1].isalnum())
+                ):
+                    i = j
+                    continue
+                sentence = text[start:j]
+                if (
+                    len(sentence) >= _ASR_SENTENCE_MIN_CHARS
+                    and not _has_latin_or_digit_run(sentence)
+                    and prev_full[start:j] == sentence
+                ):
+                    return sentence, j
+                # 呢个边界唔够格（太短/数字 run/未稳定）→ 唔喺度提交，继续扫下一
+                # 个边界（短句排队累积；未稳定边界下窗自然变稳定）。
+            i += 1
+        if allow_eos:
+            sentence = text[start:].rstrip(_PAUSE_TRAILING_WEAK_PUNCT)
+            prev_rem = prev_full[start:].rstrip(_PAUSE_TRAILING_WEAK_PUNCT)
+            if (
+                len(sentence) >= _ASR_SENTENCE_MIN_CHARS
+                and not _has_latin_or_digit_run(sentence)
+                and prev_rem
+                and sentence.startswith(prev_rem)
+            ):
+                return sentence, len(text)
+        return None
+
+    def _uncommitted(self, text: str) -> str:
+        """去掉已句级提交前缀后的剩余文本；坐标失配逐级回退，兜底原样返回。
+
+        主路径 startswith（滑窗是同一会话累积解码，已稳定前缀极少改写）；改写过
+        就用最后提交句 rfind 定位（容前缀改写）；再唔准（极端跳变）原样返回——
+        宁可字幕/抢跑短暂冗余，都唔丢未提交尾巴（停嘴 FINAL 由同函数兜底）。
+        剩余头部的弱停顿符照例剥掉（vad-pause 提交剥了「，」尾、finish 整句以
+        「。」续写——剩余唔应该带住句号/逗号开头；只剥标点唔动正字）。
+        """
+        if not self._committed_text:
+            return text
+        if text.startswith(self._committed_text):
+            return text[len(self._committed_text):].lstrip(_UNCOMMITTED_LEADING_WEAK_PUNCT)
+        if self._last_sentence:
+            pos = text.rfind(self._last_sentence)
+            if pos >= 0:
+                return text[pos + len(self._last_sentence):].lstrip(_UNCOMMITTED_LEADING_WEAK_PUNCT)
+        return text
+
+    async def _finish_session(self) -> tuple[str, str]:
+        sid = self._session_id
+        self._session_id = None
+        tail = bytes(self._pending)
+        self._pending.clear()
+        if not sid:
+            return "", ""
+        t0 = time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(
+                    f"{self._stt_._base_url}/api/finish",
+                    params={"session_id": sid},
+                    content=tail if tail else None,
+                    headers={"Content-Type": "application/octet-stream"} if tail else None,
+                )
+                r.raise_for_status()
+                data = r.json()
+                text = str(data.get("text") or "")
+                lang = _normalize_asr_language(str(data.get("language") or ""), text)
+                print(
+                    f"QWEN3_ASR_TEXT {repr(text[:120])} {lang} "
+                    f"ASR_MS={(time.monotonic() - t0) * 1000:.0f}(stream)",
+                    flush=True,
+                )
+                return text, lang
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            print("QWEN3_ASR_FINISH_ERROR", repr(exc), flush=True)
+            return "", ""
+
+    def _reset(self) -> None:
+        self._session_id = None
+        self._pending.clear()
+        self._last_partial = ""
+        self._prev_partial = ""
+        self._stable = ""
+        self._last_post = 0.0
+        self._last_lang = ""
+        # 句级提交状态随段重置（新语音段从零累计；限速时刻一并归零）。
+        self._committed_text = ""
+        self._last_sentence = ""
+        self._commit_idx = 0
+        self._last_sentence_commit_at = 0.0
+
+
+class Qwen3ASRLiveSTT(stt.STT):
+    """「VAD + 滑窗 partial」的本地 ASR 包装（Qwen3-ASR 专用，替代官方 StreamAdapter）。
+
+    recognize() 委托内层 Qwen3ASRSTT（保留官方重试/metrics）；stream() 返回带
+    INTERIM/PREFLIGHT 的实时流。能力声明 streaming=True + interim_results=True。
+    """
+
+    def __init__(self, *, stt_: Qwen3ASRSTT, vad_):
+        super().__init__(
+            capabilities=stt.STTCapabilities(
+                streaming=True,
+                interim_results=True,
+                diarization=False,
+                aligned_transcript=False,
+                offline_recognize=stt_.capabilities.offline_recognize,
+                keyterms=False,
+                chat_context=False,
+            )
+        )
+        self._vad = vad_
+        self._stt = stt_
+        stt_.on("metrics_collected", self._on_metrics_collected)
+
+    @property
+    def model(self) -> str:
+        return self._stt.model
+
+    @property
+    def provider(self) -> str:
+        return self._stt.provider
+
+    def _on_metrics_collected(self, *args, **kwargs) -> None:
+        self.emit("metrics_collected", *args, **kwargs)
+
+    async def _recognize_impl(self, buffer, *, language=None, conn_options=None):
+        return await self._stt.recognize(buffer=buffer, language=language, conn_options=conn_options)
+
+    def stream(self, *, language=None, conn_options=None):
+        return _Qwen3ASRLiveStream(self._stt, vad=self._vad, conn_options=conn_options or APIConnectOptions())

@@ -12,10 +12,12 @@
 | control-plane | :8000 HTTP | 业务 API、知识、设置、审计、LiveKit token | 打包 Python | SQLite → app-data/bok_voice.db |
 | ASR sidecar | :8787 HTTP | 三语转写（zh/cantonese/en） | Mac=mlx_audio；Win=qwen-asr+CUDA | 模型 → app-data/models |
 | TTS sidecar | :8788 HTTP | 合成 / 克隆 / 试听 | Mac=mlx_audio；Win=qwen-tts | 模型 → app-data/models |
-| LLM | :1235 OpenAI 兼容 | A 线对话 + B 线翻译 | Mac=mlx_lm；Win=llama-server CUDA | 模型 → app-data/models |
+| LLM | :1235 OpenAI 兼容 | A 线对话（flow judge、CP 摘要同源）；B 线翻译回退 | Mac=mlx_lm；Win=llama-server CUDA | 模型 → app-data/models |
+| MT LLM（可选） | :1236 OpenAI 兼容 | B 线同传专用翻译（Hy-MT2 小模型，逐句无状态；模型缺失自动跳过 → B 线回退 :1235） | Mac=mlx_lm | 模型 → app-data/models |
 | B-line worker | :8790 WS | 同传通道：ASR→翻译→TTS 队列 / 背压 | 内嵌 Node | 指标 → app-data/translation-metrics.jsonl |
 | LiveKit server | :7880 WS/WebRTC | RTC 信令与媒体（7881/7882 RTC 端口） | 内嵌二进制 | keys → 内嵌 livekit.yaml |
 | agent worker | 进程 | A 线智能体（VAD/对话/情绪/打断） | 打包 Python | 调 8787/8788/1235/8000 |
+| interpreter worker ×2 | 进程 | B 线双 AgentSession 同传（`bok-interp-fwd/rev` 显式分发） | 打包 Python | 调 8787/8788/1236(MT,回退 1235)/8000；TTS=MiniMax 云(或本地 8788) |
 
 ### 音频设备（设置页）
 
@@ -59,15 +61,31 @@
 - 恢复：`POST /api/supervisor/{id}/resume-agent` 把状态置回 `active` 并清
   `escalated_to_human`；agent 恢复自动回复。
 - 转人工：置 `ended` + `disposition=transferred`，agent 退出并触发结算。
+- 拒绝收线：客户明确拒绝/告别（`flow.py` REFUSE 判定）→ agent 注入收尾话术讲一句
+  礼貌再见，随后 `POST /api/supervisor/{id}/end` 置 `ended` + `disposition=declined`
+  并断房，结算由 agent `_on_close` 幂等触发。
 
-### B 线（同声传译）
+### B 线（同声传译 v2，LiveKit 双端）
 
 ```text
-页面 (WebSocket)
-  → B-line :8790 open_channel(sourceLang, targetLang)
-  → 每通道：ASR :8787 → 翻译（本地 LLM :1235 或 DashScope）→ TTS :8788
-  → 字幕 + 音频块（PlaybackChunkTrace）回流页面
-指标：队列深度/背压/丢弃 → app-data/translation-metrics.jsonl
+web /interpret 两端（me/other，各自选麦克风/扬声器）
+  → CP /api/calls(kind=interpret) + /api/token(role=me|other)
+  → LiveKit 房间（me-<room> / other-<room> + 两个 interpreter agent）
+  → interpreter(AgentSession 全托管):silero VAD → Qwen3-ASR(源语言钉死,
+    cantonese 走 hint) → MT 翻译模型(:1236 Hy-MT2,官方模板逐句无状态、
+    历史不累积;未部署自动回退 :1235 主 LLM) → MiniMax 云 TTS(默认 turbo 档,
+    按 target_lang 三键换音色 + language_boost;设置非 minimax 时本地 Qwen3-TTS 回退)
+  → 译文轨 trans-<lang> 只授权对方订阅(set_track_subscription_permissions);
+    字幕 lk.transcription 全量广播(原文+译文,前端 useTranscriptions 渲染)
+  → 译文句 add_turn(原文：…\n译文：…) → 房间断开 settle → 总结/知识蒸馏/vault
+agent worker:A 线 `agent_name="bok-voice"` 显式分发(官方推荐;隐式 dispatch 已废除,
+杜绝同传房被客服 agent 隐式抢派)。operator/supervisor token 由 CP /api/token 挂
+RoomAgentDispatch(metadata={call_id})精确派发;CP /api/token 即官方 TokenSource
+endpoint 契约({serverUrl, participantToken},201),官方 SDK 可直连。
+interpreter worker:bok serve 起 2 个常驻进程(interp-fwd/rev,agent_name
+bok-interp-fwd/rev 显式分发,方向语言对+精确 identity 由 me 端 token 的
+RoomAgentDispatch metadata 下发;无房间时空闲,job 到达才拉管线)
+旧 v1(/translate + WS :8790)冻结保留作 POC,不再迭代。
 ```
 
 ## 3. 生命周期
@@ -118,15 +136,22 @@
 
 ### 设置（`/api/settings`，Agent 运行时会真实消费）
 
-- `asr.provider`：`qwen3_asr`（本地 sidecar）/ `sherpa_sensevoice` / `fake`（仅测试）。语言值统一 `zh/cantonese/en`（粤语叫 `cantonese`，不再用 `yue`）；agent 在会话语言为粤语时给 sidecar 传 `language=cantonese` 强制模型按粤语转写，避免 auto 误判成普通话。
+- `asr.provider`：`qwen3_asr`（本地 sidecar）/ `sherpa_sensevoice` / `fake`（仅测试）。语言值统一 `zh/cantonese/en`（粤语全时空唯一拼写 `cantonese`）；agent 在会话语言为粤语时给 sidecar 传 `language=cantonese` 强制模型按粤语转写，避免 auto 误判成普通话。
 - `llm.provider`：`local_openai`/`mlx`（本地）/ `deepseek`（云端，缺 `api_key` 显式告警并回退本地）/ `fake`。
 - `tts.provider`：`qwen3_tts` / `volcano_streaming`（需 `VOLC_*` 环境变量）/ `fake`（静音测试音，非火山 beep）。
-  音色兜底按语言 `speaker_zh/speaker_cantonese/en`（旧键 `speaker_yue` 已迁移为 `speaker_cantonese`）；persona 绑定 `reference_audio` 优先。
+  音色兜底按语言 `speaker_zh/speaker_cantonese/en`（旧拼写键已由启动迁移改写）；persona 绑定 `reference_audio` 优先。
 - `vad`：`provider` + `max_buffered_speech` / `min_speech_duration` / `min_silence_duration` / `interruption`
   —— 直接构造 `inference.VAD` 与打断开关（环境变量 `VAD_*` 仅作部署覆盖）。
-  基线默认：`min_silence_duration=0.45`、`min_speech_duration=0.15`；endpointing `min_delay=0.35`/`max_delay=1.2`。
-  （勿为追低延迟把 min_silence 收到 <0.3 / min_delay 收到 <0.3：离线式 ASR 从停嘴到转写回来需 ~0.5-1.2s，
-  端点判定太紧会让轮次在转写返回前提交 → 回复被丢、agent 不回话。）
+  基线默认（2026-09-05 句号级提交落地后）：`min_silence_duration=0.45`、`min_speech_duration=0.15`；
+  A 线 turn_detection=`stt`（STT 句末 END_OF_SPEECH 提交，句级 FINAL→EOS，说话中即提交，
+  数字串/短句/1.5s 限流保护），endpointing `min_delay=0.25`/`max_delay=0.6`。
+  （历史警戒已失效条件化：当年压端点致哑火=轮次在离线 ASR final 前提交；现提交结构性等待
+  STT FINAL 且句级路径 FINAL 即句文，三语 E2E 实证 0 丢转写。回退开关：`TURN_DETECTION=`
+  置空回 EOT 模型档 + `QWEN3_ASR_SENTENCE_COMMIT=0`（两者须一起关，否则句级 FINAL 会
+  叠进停嘴 FINAL 重复转写）；**kill-switch 档 endpointing min_delay 自动回 ≥0.35**
+  （`_endpointing_delays_from_env` 强制，无需手动——未校准 EOT 配 0.25 早提交截断粤语，
+  p6 实证）；B 线 interp env 已强制 sentence-commit=0。真实音频滑窗句间只出逗号，
+  VAD 停嘴微停顿（≥0.45s）为第二句边界源（`QWEN3_ASR_SENTENCE_PAUSE_TRIGGER` 默认 1）。）
 - `policy`：`offline_first`/`cloud_first`；建通话（`POST /api/calls`）时写入 manifest。
 
 ### LLM prompt 结构与多客服并发容量

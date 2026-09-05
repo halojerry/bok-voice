@@ -25,7 +25,8 @@ _HEADERS = {"User-Agent": "BokVoice/0.1 (local voice assistant; contact: dev@bok
 
 def _wiki_domain(lang: str) -> str:
     key = (lang or "").lower()
-    if key in {"cantonese", "yue"}:  # yue = 旧数据只读别名;外部域名本身仍是 zh-yue
+    if key == "cantonese":
+        # 维基百科粤语域名的官方字面量就是 zh-yue（外部资源名，不可改）。
         return "zh-yue.wikipedia.org"
     if key == "en":
         return "en.wikipedia.org"

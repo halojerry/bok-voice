@@ -7,8 +7,8 @@ const DEFAULT_OPTS = {
   sampleRate: 24000,
   chunkMs: 100,
   timeoutMs: 120000,
-  // 按目标语言选择克隆/预设音色（与 A 线一致）：zh/yue/en -> voice_id。
-  // Qwen3-TTS 无粤语 preset，粤语必须用粤语参考音频克隆的 voice（如 acceptance-yue）。
+  // 按目标语言选择克隆/预设音色（与 A 线一致）：zh/cantonese/en -> voice_id。
+  // Qwen3-TTS 无粤语 preset，粤语必须用粤语参考音频克隆的 voice id。
   voices: {},
 };
 
