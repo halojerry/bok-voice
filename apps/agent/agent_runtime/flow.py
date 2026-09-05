@@ -390,6 +390,32 @@ def detect_whatsapp_signal(
     return None
 
 
+def extract_call_facts(user_text: str, *, facts: dict | None = None) -> list[str]:
+    """从客户话里抽可沉淀的关键事实(平台/号码)——会中记忆只增唔重问。
+
+    「忘记」的直接机制(2026-09-06 行为取证):客户早轮讲过的事实只住在
+    6 行×200 字滚动记忆+8 轮历史里,16 轮内先后蒸发,模型重新追问
+    (call-701c180b 同一句「報姓名同單號」問了三遍)。这里抽「答过就该
+    记住」的最小集:购物平台、非已知资料的号码串(命中已知 单号/尾号/电话
+    唔重复沉淀);由 agent 每轮喂 ContextState.add_call_fact(去重有界),
+    渲染进尾部【通话中客户已讲】。号码经 digits_to_cantonese 逐位转汉字
+    (TTS 安全+防 LLM 凭空改号)。
+    """
+    t = (user_text or "").strip()
+    if not t:
+        return []
+    out: list[str] = []
+    m = _PLATFORM_RE.search(t)
+    if m:
+        out.append(f"客户讲过在{m.group(1)}买")
+    norm = _digit_normalize(t)
+    for run in _valid_digit_runs(norm):
+        if _run_is_known_number(run, facts):
+            continue
+        out.append(f"客户报过号码:{digits_to_cantonese(run)}")
+    return out
+
+
 def decide_advance(user_text: str, *, facts: dict | None = None) -> str:
     """判定客户对当前这一步的反应,决定停留/推进。
 

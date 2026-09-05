@@ -800,7 +800,7 @@ async def entrypoint(ctx):
 
     # 对话流程控制器:载入模板分步 + 对象变量;由它按轮注入"当前步",逐步推进。
     from .flow import FlowController, facts_line
-    from .flow import CONFIRM, OBJECTION, QUESTION, REFUSE, UNCLEAR, detect_whatsapp_signal
+    from .flow import CONFIRM, OBJECTION, QUESTION, REFUSE, UNCLEAR, detect_whatsapp_signal, extract_call_facts
 
     flow_ctrl = FlowController.from_template(template, object_card)
     _log_stage("context_resolved")
@@ -1244,6 +1244,9 @@ async def entrypoint(ctx):
                     except Exception as exc:  # pragma: no cover - 联网是增强
                         print(f"[agent] web search skipped: {exc!r}", flush=True)
             context_state.add_summary(role, _clean_transcript(text))
+            if role == "assistant":
+                # 尾部重复锚:让模型看得见自己上一句,治原句/近原句复述(R3)。
+                context_state.set_last_reply(_clean_transcript(text))
         except Exception as exc:  # pragma: no cover - context must not break turns
             print(f"[agent] context update failed: {exc!r}", flush=True)
 
@@ -1464,6 +1467,14 @@ async def entrypoint(ctx):
                                 context_state.set_whatsapp_note(_num)
                             print(f"[whatsapp] {_kind} num={_num or '-'} (call {room_name})", flush=True)
             except Exception:  # pragma: no cover - WhatsApp 偵測失敗唔阻斷
+                pass
+            # 会中事实沉淀(R4):客户话里的平台/号码抽进尾部【通话中客户已讲】
+            # (去重有界 ≤4 条)——早轮事实唔再随滚动记忆/历史截断蒸发,
+            # 模型唔会重复问已答过的事(call-701c180b 同一问三遍实证)。
+            try:
+                for _fact in extract_call_facts(user_text, facts=flow_ctrl.vars_map):
+                    context_state.add_call_fact(_fact)
+            except Exception:  # pragma: no cover - 沉淀失败唔阻回复
                 pass
             # 流程推进:读用户最新话,判定是否进入下一步,更新"当前步"约束注入。
             if flow_ctrl.has_steps:

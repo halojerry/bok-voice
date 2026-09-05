@@ -795,9 +795,24 @@ class ContextState:
                 "【已记录客户 WhatsApp】" + self._whatsapp_note +
                 "（复述号码必须逐位以此为准，唔好凭记忆/估）"
             )
+        if self._call_facts:
+            # 会中事实沉淀(append-only 有界,add_call_fact):客户早轮讲过的
+            # 平台/号码唔随滚动记忆/历史截断蒸发,治「重复问已答过的事」。
+            parts.append(
+                "【通话中客户已讲（已确认过，唔好再问）】\n"
+                + "\n".join(f"- {s}" for s in self._call_facts)
+            )
         if self._flow_current:
             # 当前步约束(随 flow 推进而变):放尾部最前,推进只改这里、前缀字节不动。
             parts.append("【现在这一步】\n" + self._flow_current)
+        if self._last_reply:
+            # 重复锚:模型看得见自己上一句,治「原句/近原句复述」(2026-09-06
+            # 行为取证:同一确认句一字不差讲两遍)。冻结进当时 user 的尾部,
+            # 语义=「你讲呢句嗰阵嘅上一句」,自洽。
+            parts.append(
+                "【你上一句】已讲过的内容绝不原句或近原句再讲一次；"
+                "客户没有新异议就不要重复确认，停低等他说。\n「" + self._last_reply + "」"
+            )
         if self.rag_enabled and self._snippets:
             parts.append("【实时检索到的资料（知识库）】\n" + "\n".join(f"- {s}" for s in self._snippets))
         if self.rag_enabled and self._web:
