@@ -553,6 +553,8 @@ class ContextState:
         # 时 tail 才渲染那两节。agent.py 装配时按自身 RAG 门控(_context_rag_enabled)
         # 置位,或直接改用 ContextState.from_env() 装配(CONTEXT_RAG=1 → True)。
         self.rag_enabled: bool = False
+        # WhatsApp 已捕获号码（注入尾部,防 LLM 复述错号——2026-09-06 实测尾号读错）
+        self._whatsapp_note: str = ""
         # 追加式尾部账本（KV-cache 铁律 2026-09-05）：记录每个 user 消息被
         # ContextAwareLLM 拼上的易变尾部（原文, 原文+尾部），FIFO 对应历史里的
         # user 消息。下一轮请求把历史中的旧 user 重放成「原文+当时的尾部」——
@@ -560,6 +562,9 @@ class ContextState:
         # 下轮即被剥掉 → 中途分叉 → 只有 system 锚点命中，对话历史每轮全量
         # 重 prefill，实测暖轮 cached 恒=锚点、TTFT 0.7-1.3s 的主因）。
         self._applied_tails: list[tuple[str, str]] = []
+
+    def set_whatsapp_note(self, num: str) -> None:
+        self._whatsapp_note = num or ""
 
     def record_applied_tail(self, orig: str, final: str) -> None:
         self._applied_tails.append((orig, final))
@@ -739,6 +744,11 @@ class ContextState:
         单对象只上话术+对象档案;CONTEXT_RAG=1/开放人设由装配处置 True)。
         """
         parts: list[str] = []
+        if self._whatsapp_note:
+            parts.append(
+                "【已记录客户 WhatsApp】" + self._whatsapp_note +
+                "（复述号码必须逐位以此为准，唔好凭记忆/估）"
+            )
         if self._flow_current:
             # 当前步约束(随 flow 推进而变):放尾部最前,推进只改这里、前缀字节不动。
             parts.append("【现在这一步】\n" + self._flow_current)
@@ -1755,9 +1765,11 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
             return json.loads(await asyncio.wait_for(a_ws.recv(), timeout=15))
 
         init_done = False
+        first_pushed = False
         frame_bytes = int(sample_rate / 5) * 2  # 200ms 帧
         buf = bytearray()
         recv_task: asyncio.Task | None = None
+        closed_ws = asyncio.Event()
         t_start = time.monotonic()
         try:
             try:
@@ -1803,8 +1815,7 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
 
         try:
             async def _recv_loop():
-                nonlocal init_done, buf
-                first_pushed = False
+                nonlocal init_done, buf, first_pushed
                 while True:
                     try:
                         msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
@@ -1861,6 +1872,49 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
 
             recv_task = asyncio.create_task(_recv_loop())
 
+            # ---- 卡死自愈（W0.5，2026-09-06）：MiniMax 偶发 task_started 后长时
+            # 无首包（实测 >8s，期间心跳顶替=「每问无答」体感）。看门狗超时未出
+            # 首包 → 断开旧 ws、重开一条并重发已发文本，一次性自愈；已出首包则
+            # 不干预。MINIMAX_FIRST_AUDIO_TIMEOUT_S 可调（默认6）。
+            stall_timeout = float(os.environ.get("MINIMAX_FIRST_AUDIO_TIMEOUT_S", "6"))
+            stalled = False
+            sent_all: list[str] = []
+            closed_ws = asyncio.Event()
+
+            async def _stall_watch() -> None:
+                nonlocal ws, stalled, recv_task, init_done, first_pushed, t_task, t_start
+                while not first_pushed:
+                    await asyncio.sleep(0.5)
+                    if closed_ws.is_set() or time.monotonic() - t_task <= stall_timeout:
+                        continue
+                    print(
+                        f"MINIMAX_TTS_STALL no_first_audio_{stall_timeout:.0f}s -> reconnect_retry",
+                        flush=True,
+                    )
+                    stalled = True
+                    try:
+                        await _minimax_ws_silent_close(ws)
+                    except Exception:  # pragma: no cover
+                        pass
+                    recv_task.cancel()
+                    ws = await websockets.connect(
+                        self._tts_._endpoint_ws(),
+                        additional_headers={"Authorization": f"Bearer {key}"},
+                        open_timeout=10,
+                        max_size=20_000_000,
+                    )
+                    await _handshake(ws)
+                    t_task = time.monotonic()
+                    t_start = t_task
+                    init_done = False
+                    first_pushed = False
+                    for s in sent_all:
+                        await ws.send(json.dumps({"event": "task_continue", "text": s}))
+                    recv_task = asyncio.create_task(_recv_loop())
+                    return
+
+            stall_task = asyncio.create_task(_stall_watch())
+
             # 增量合成:文本按边界切分逐段 task_continue。实测语义:
             # - 发累积全文会重复合成前面句子(长回复下明显重读);
             # - 纯逐块增量(不按句)在快速 send 下丢音频(服务端要等足文本才合成)。
@@ -1915,6 +1969,7 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                 if is_lecture_text(s):
                     return  # 已触发过,课程延续句照丢
                 await ws.send(json.dumps({"event": "task_continue", "text": s}))
+                sent_all.append(s)
                 sent_any = True
                 _last_send = time.monotonic()
 

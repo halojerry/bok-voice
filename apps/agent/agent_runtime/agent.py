@@ -1438,6 +1438,8 @@ async def entrypoint(ctx):
                                     print(f"[whatsapp] report failed, will retry on next signal: {exc!r} (call {room_name})", flush=True)
 
                             asyncio.create_task(_report())
+                            if _kind == "captured_implicit" or (_num and _num != "offered"):
+                                context_state.set_whatsapp_note(_num)
                             print(f"[whatsapp] {_kind} num={_num or '-'} (call {room_name})", flush=True)
             except Exception:  # pragma: no cover - WhatsApp 偵測失敗唔阻斷
                 pass

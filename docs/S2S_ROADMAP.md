@@ -8,7 +8,7 @@ W0 KV-cache 命中率工程 + W1 打断自噬修复）；普通话/英语可在�
 
 | 模型 | 粤语 | 流式/全双工 | Mac 可跑 | 备注 |
 |---|---|---|---|---|
-| Qwen3-Omni 30B-A3B | 输入✓(yue)/**输出✗** | 流式输出；本地全双工✗ | mlx-community 4-8bit 转换存在,实时引擎不成熟 | 输出 10 语无粤语 |
+| Qwen3-Omni 30B-A3B | 粤语仅作输入/**输出✗** | 流式输出；本地全双工✗ | mlx-community 4-8bit 转换存在,实时引擎不成熟 | 输出 10 语无粤语 |
 | Qwen2.5-Omni 3B/7B | 输入✓(yue ASR WER7.3)/输出中英 | 分块输入+流式输出 | ✗(CUDA/vLLM/MNN) | |
 | MiniCPM-o 4.5 (9B) | ✗(语音对话仅中/英) | 半双工✓;4.5 全双工(≈1Hz 决策) | ✓ llama.cpp-omni(M3/M4/M5 ≥16GB;全双工 M4 Max ≥24GB) | **首选试点** |
 | GLM-4-Voice 9B | ✗(中/英) | 流式 | ✗ CUDA | |

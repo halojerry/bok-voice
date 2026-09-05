@@ -470,6 +470,14 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
   const [waStatus, setWaStatus] = useState("");
   const [waNum, setWaNum] = useState("");
   const [waHandling, setWaHandling] = useState(false);
+  // 接通后「AI 初始化中」提示窗口(到点自动消失;期间面板状态灯同显)
+  const [initHintUntil, setInitHintUntil] = useState(0);
+  const [nowTick, setNowTick] = useState(0);
+  useEffect(() => {
+    if (!initHintUntil) return;
+    const t = setInterval(() => setNowTick((v) => v + 1), 500);
+    return () => clearInterval(t);
+  }, [initHintUntil > 0]);
 
   // WhatsApp 對接:開住工作台時 3s poll call 狀態(offered/captured→面板橫幅;handled→收起)。
   useEffect(() => {
@@ -681,6 +689,7 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
       // （agent 侧 1.7.1 的 pre_connect_audio 默认已开。）
       await session.room.localParticipant.setMicrophoneEnabled(true, undefined, { preConnectBuffer: true }).catch(() => {});
       await session.start({ tracks: { microphone: { enabled: true } } });
+      setInitHintUntil(Date.now() + 8000);
       // 确保本地麦克风真正发布：session.start 的 tracks 选项在部分 livekit 版本不生效，
       // 显式 setMicrophoneEnabled 才可靠（否则 agent 收不到用户声音 → 对话"没输入"）。
       try {
@@ -835,9 +844,16 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
                   )}
                 </div>
               ) : (
-                <button className="btn-ghost" onClick={leave}>
-                  挂断
-                </button>
+                <div className="flex items-center gap-2">
+                  {initHintUntil > 0 && Date.now() < initHintUntil && (
+                    <span className="animate-pulse text-[11px] text-sky-300" data-tick={nowTick}>
+                      AI 初始化中…
+                    </span>
+                  )}
+                  <button className="btn-ghost" onClick={leave}>
+                    挂断
+                  </button>
+                </div>
               )}
             </div>
             {roomConnected && isJoiningExisting && (
@@ -896,12 +912,23 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
                   <button
                     className="btn-ghost text-xs"
                     onClick={async () => {
+                      let ok = false;
                       try {
                         await navigator.clipboard.writeText(waNum);
-                        setSuperviseMsg("号码已复制");
+                        ok = true;
                       } catch {
-                        /* clipboard 失敗靜默 */
+                        try {
+                          const ta = document.createElement("textarea");
+                          ta.value = waNum;
+                          document.body.appendChild(ta);
+                          ta.select();
+                          ok = document.execCommand("copy");
+                          document.body.removeChild(ta);
+                        } catch {
+                          ok = false;
+                        }
                       }
+                      setSuperviseMsg(ok ? "号码已复制" : "复制失败，请手动选择复制");
                     }}
                   >
                     复制号码
