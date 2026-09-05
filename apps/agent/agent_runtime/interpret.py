@@ -164,6 +164,21 @@ def _build_tts_provider(tts_cfg: dict, target_lang: str):
     )
 
 
+def _preemptive_generation_opts() -> dict:
+    """抢跑（preemptive generation）预算（单测直接喂 env 断言，唔使起 worker）。
+
+    max_retries 默认 3（P1 churn 收敛，旧 8 会把误判轮的 prefill 白烧放大）：
+    每个 PREFLIGHT 事件 count+1，烧穿后 FINAL 到达只 cancel 不重建 → 译文从零
+    生成。PREEMPTIVE_MAX_RETRIES 可回退。
+    """
+    return {
+        "enabled": True,
+        "preemptive_tts": False,
+        "max_speech_duration": 10.0,
+        "max_retries": int(os.environ.get("PREEMPTIVE_MAX_RETRIES", "3")),
+    }
+
+
 async def entrypoint(ctx) -> None:
     from livekit import rtc
     from livekit.agents import (
@@ -272,14 +287,7 @@ async def entrypoint(ctx) -> None:
         # 反而误判轮次白跑)。
         turn_handling=TurnHandlingOptions(
             endpointing={"mode": "dynamic", "min_delay": 0.35, "max_delay": 1.2},
-            preemptive_generation={
-                "enabled": True,
-                "preemptive_tts": False,
-                "max_speech_duration": 10.0,
-                # 同 A 线:每个 PREFLIGHT 吃一次预算,烧穿后 FINAL 只 cancel 不重建
-                # → 译文从零生成。预算 8(PREEMPTIVE_MAX_RETRIES 可回退)。
-                "max_retries": int(os.environ.get("PREEMPTIVE_MAX_RETRIES", "8")),
-            },
+            preemptive_generation=_preemptive_generation_opts(),
             interruption={"enabled": True, "min_duration": 1.2, "min_words": 0},
         ),
     )

@@ -305,6 +305,67 @@ def _resolve_tts_voice_mode(tts_cfg: dict) -> str:
     return mode if mode == "per_language" else "single"
 
 
+# MiniMax 空 voice map 兜底音色（设置页 speaker 三键全空/全被本地过滤时）：
+# B 线 interpret.py 同源的验证过粤语主播音色。音色 ID 是不透明标识符
+#（MiniMax 云端枚举，术语门禁白名单范畴），唔属语言字段。
+_MINIMAX_DEFAULT_VOICE = "Cantonese_crisp_news_anchor_vv2"
+
+
+def _preemptive_generation_opts() -> dict:
+    """抢跑（preemptive generation）预算，env 逐项可回退。
+
+    max_retries 默认 3（P1 churn 收敛，旧 8 会把误判轮的 prefill 白烧放大）：
+    每个 PREFLIGHT 事件 count+1（agent_activity.py:2392），烧穿后 FINAL 到达只
+    cancel 不重建 → commit 从零生成、新请求还排在被 cancel 的 prefill 后面
+    （实测 +0.2-0.7s）。标记轮暂停见 entrypoint 的 _preemptive_gate
+    （PREEMPTIVE_DISABLE_ON_MARKER）。
+    """
+    return {
+        # 官方源码证实(1.7.1 audio_recognition):FINAL_TRANSCRIPT 一到即触发
+        # 抢跑,LLM prefill 与端点判定窗口并行——唔使等 interim。默认开。
+        "enabled": os.environ.get("PREEMPTIVE_GENERATION", "1") == "1",
+        # preemptive_tts 默认关:MiniMax 云 TTS 按字计费,误判轮次唔好白烧;
+        # dev 可 PREEMPTIVE_TTS=1 实验首声再提前。
+        "preemptive_tts": os.environ.get("PREEMPTIVE_TTS", "0") == "1",
+        "max_speech_duration": 10.0,
+        "max_retries": int(os.environ.get("PREEMPTIVE_MAX_RETRIES", "3")),
+    }
+
+
+def _marker_pause_enabled() -> bool:
+    """标记轮 speculation 暂停开关（P1 fix round 1 起默认关，实验档）。
+
+    时序分析（为何默认关）——框架喺 STT FINAL/PREFLIGHT 即抢跑，先于
+    on_user_turn_completed：
+    - 标记发生轮（hook N）的 pre-FINAL 抢跑无法回溯跳过，本开关帮唔到佢
+      （commit 时由快照失效 cancel 兜底）；
+    - 下一轮（N+1）的 speculation 语境是「标记已落历史」的快照一致轮，本就
+      会在 commit 时命中复用（有效先手）；
+    - 而喺 hook(N) 置 max_retries=0、要到 hook(N+1) 开头先恢复 = 恰好压掉
+      N+1 全部有效抢跑（PREFLIGHT/FINAL 都先于 hook）→ 纯损失。
+    故默认关；机制保留（PREEMPTIVE_DISABLE_ON_MARKER=1 可开）供实验对比。
+    """
+    return os.environ.get("PREEMPTIVE_DISABLE_ON_MARKER", "0") == "1"
+
+
+def _format_llm_metrics(m) -> str:
+    """官方 LLMMetrics 一行速览（延迟调优脚本沿用 LLM_TTFT_MS 前缀标记）。
+
+    cached=prompt_cached_tokens/prompt_tokens：mlx prompt KV-cache 命中可视——
+    稳态轮 cached 接近 prompt=前缀命中；前缀断裂轮 cached=0（KV-cache 铁律
+    回归排查就睇呢个数）。字段名与 1.7.1 metrics/base.py LLMMetrics 一致。
+    """
+    prompt = int(getattr(m, "prompt_tokens", 0) or 0)
+    cached = int(getattr(m, "prompt_cached_tokens", 0) or 0)
+    ttft = float(getattr(m, "ttft", 0.0) or 0.0)
+    tps = float(getattr(m, "tokens_per_second", 0.0) or 0.0)
+    return (
+        f"LLM_TTFT_MS {ttft * 1000:.0f} (official) "
+        f"cached={cached}/{prompt} prompt={prompt} "
+        f"gen={getattr(m, 'completion_tokens', 0)} tps={tps:.1f}"
+    )
+
+
 # 本地 Qwen3 音色（9 预设 + agent-*/acceptance-* 克隆）：发给 MiniMax 会
 # 2054 voice not exist、整轮无声，两个模式都必须过滤。
 _MINIMAX_LOCAL_VOICES = frozenset(
@@ -336,6 +397,9 @@ def _assemble_minimax_voice_map(*, persona: dict | None, tts_cfg: dict, greet_la
       按滞回后的 language_state.lang 逐轮换声（设置页/人设三键异值才真正分声；
       全局 speaker 单音色只组 zh 键，等效 single）。切换源是滞回平滑后的
       sticky 语言，不吃 ASR 单轮误判，不会逐轮跳音色。
+    - 任何模式下组装结果为空（speaker 全空/全被本地过滤）都填 _MINIMAX_DEFAULT_VOICE：
+      zh+cantonese 同值双键，_resolve_voice 对缺键回落 zh，任何语言态都解析得到
+      ——MINIMAX_TTS_NO_VOICE（beep）不能再发生。
     """
     persona_voice = (persona or {}).get("reference_audio") or ""
     raw_map = _parse_voice_map(persona_voice) if persona_voice else _build_default_voice_map(tts_cfg)
@@ -343,7 +407,11 @@ def _assemble_minimax_voice_map(*, persona: dict | None, tts_cfg: dict, greet_la
         persona_lang = (persona or {}).get("language") or ""
         anchor_lang = _normalize_lang(persona_lang) or greet_lang or "zh"
         raw_map = _collapse_voice_map(raw_map, anchor_lang)
-    return _filter_cloud_voice_map(raw_map)
+    voice_map = _filter_cloud_voice_map(raw_map)
+    if not voice_map:
+        voice_map = {"zh": _MINIMAX_DEFAULT_VOICE, "cantonese": _MINIMAX_DEFAULT_VOICE}
+        print(f"[agent] minimax default voice={_MINIMAX_DEFAULT_VOICE}", flush=True)
+    return voice_map
 
 
 def _resolve_asr_language_mode(asr_cfg: dict) -> tuple[str, str]:
@@ -363,14 +431,57 @@ def _resolve_asr_language_mode(asr_cfg: dict) -> tuple[str, str]:
     return "fixed", fixed_lang
 
 
-def _context_rag_enabled(has_steps: bool) -> bool:
-    """绑了分步话术(has_steps)的封闭流程，默认不做知识库/联网检索——单对象只上话术。
-
-    开放咨询(无模板)才 RAG；CONTEXT_RAG=1 可强制模板场景也检索（逃生口）。
+def _context_rag_enabled() -> bool:
+    """知识库/联网检索总闸：P1 起默认全关——对象知识改由【对象档案】静态注入
+    （_wire_object_brief 一次装配进稳定前缀），话术对象只上话术。不再按
+    has_steps 区分（旧「无模板才 RAG」政策已废）。CONTEXT_RAG=1 强制开（逃生口）。
     """
-    if os.environ.get("CONTEXT_RAG", "") == "1":
-        return True
-    return not has_steps
+    return os.environ.get("CONTEXT_RAG", "") == "1"
+
+
+def _truncate_brief_line(text, limit: int = 150) -> str:
+    """单段压缩：折行归一 + 超长截断（150 字 ≈ 尾部/前缀预算的单段配额）。"""
+    collapsed = " ".join(str(text or "").split())
+    return collapsed if len(collapsed) <= limit else collapsed[: limit - 1] + "…"
+
+
+def _build_object_brief(object_card: dict | None) -> str:
+    """对象卡直取【对象档案】文本：background/notes 各一段、每段 ≤150 字、最多 2 段。
+
+    每个字段折叠成一个显式行（背景一行+备注一行，空字段跳过）——与
+    ContextState.set_object_brief 的行单元契约对齐：行边界=显式换行，绝不在
+    句号处二次切分（多句背景唔会切碎、备注唔会被挤掉）。P1 起知识/联网默认
+    不检索，对象知识由这段静态档案承担——一次装配、整场字节不变（进稳定
+    前缀，KV-cache 逐轮命中）。
+    """
+    card = object_card or {}
+    lines = []
+    for key in ("background", "notes"):
+        line = _truncate_brief_line(card.get(key))
+        if line:
+            lines.append(line)
+    return "\n".join(lines[:2])
+
+
+async def _wire_object_brief(cp, *, object_card, account_id: str, context_state) -> str:
+    """装配【对象档案】并注入 ContextState（会话装配时调用一次，至多 set 一次）。
+
+    资料源=对象卡 background/notes 直取；卡上无背景且 CONTEXT_RAG=1（RAG 逃生口）
+    才退回 search_knowledge 检索并压缩为 ≤2 段×150 字。
+    """
+    brief = _build_object_brief(object_card)
+    if not brief and _context_rag_enabled():
+        query = (object_card or {}).get("background") or "产品介绍"
+        try:
+            snippets = await cp.search_knowledge(query, account_id, 2)
+        except Exception as exc:  # pragma: no cover - 检索失败档案留空,不阻会话
+            print(f"[agent] object brief search failed: {exc!r}", flush=True)
+            snippets = []
+        lines = [_truncate_brief_line(str(s.get("text") or "")) for s in (snippets or [])]
+        brief = "\n".join([ln for ln in lines if ln][:2])
+    if brief:
+        context_state.set_object_brief(brief)
+    return brief
 
 
 def _vad_float(cfg: dict, key: str, env_name: str, default: str) -> float:
@@ -494,8 +605,9 @@ async def entrypoint(ctx):
     persona: dict | None = None
     object_card: dict | None = None
     template: dict | None = None
-    snippets: list[dict] = []
-    context_state = ContextState(account_id="acc-001")
+    # from_env 装配口：rag_enabled（知识/联网节的尾部渲染门）与取数门控
+    # _context_rag_enabled 同一 env 开关（CONTEXT_RAG=1 → 两边同开,永不脱钩）。
+    context_state = ContextState.from_env(account_id="acc-001")
     try:
         call = await cp.get_call(call_id)
         account_id = call.get("account_id", "acc-001")
@@ -505,7 +617,7 @@ async def entrypoint(ctx):
             except Exception:
                 pass
             _agent_log("agent.call.context", call_id=call_id, account_id=account_id)
-        context_state = ContextState(account_id=account_id)
+        context_state = ContextState.from_env(account_id=account_id)
         object_id = call.get("object_id", "")
         persona_id = call.get("persona_id", "")
         if object_id:
@@ -515,16 +627,13 @@ async def entrypoint(ctx):
                 template = await cp.get_template(template_id)
         if persona_id:
             persona = await cp.get_persona(persona_id)
-        query = (object_card or {}).get("background") or "产品介绍"
-        # 单对象绑话术的封闭流程不预载知识库(话术即上下文,避免白叠检索);
-        # 无模板/开放咨询才按对象背景预载。CONTEXT_RAG=1 强制预载。
-        from .flow import template_to_steps
-
-        _flow_has_steps = bool(template_to_steps(template))
-        if _context_rag_enabled(_flow_has_steps):
-            snippets = await cp.search_knowledge(query, account_id, 5)
-            # 初始上下文：接通时按对象背景预载少量知识；后续每轮按用户问题实时覆盖。
-            context_state.set_knowledge(snippets)
+        # 对象档案静态注入（P1）：一次装配、set_object_brief 至多一次，字节静态进
+        # 稳定前缀（KV-cache 整场命中）。资料源=对象卡 background/notes 直取；
+        # 卡上无背景且 CONTEXT_RAG=1 才退回检索。旧「search_knowledge 预载知识库」
+        # 分支随 RAG 默认关一起废除（每轮知识/联网注入见 _async_update_context 门控）。
+        await _wire_object_brief(
+            cp, object_card=object_card, account_id=account_id, context_state=context_state
+        )
     except Exception as e:
         print(f"[agent] context resolve failed ({room_name}): {e}", flush=True)
 
@@ -806,23 +915,9 @@ async def entrypoint(ctx):
             "min_delay": float(os.environ.get("ENDPOINT_MIN_DELAY", "0.35")),
             "max_delay": float(os.environ.get("ENDPOINT_MAX_DELAY", "0.6")),
         },
-        "preemptive_generation": {
-            # 官方源码证实(1.7.1 audio_recognition):FINAL_TRANSCRIPT 一到即触发
-            # 抢跑,LLM prefill 与端点判定窗口并行——唔使等 interim。默认开。
-            # 流程推进/收尾/语言切换轮由 on_user_turn_completed 落 chat_ctx 步骤
-            # 标记,触发框架快照不一致→作废旧抢跑重建,推进轮唔会错步。
-            "enabled": os.environ.get("PREEMPTIVE_GENERATION", "1") == "1",
-            # preemptive_tts 默认关:MiniMax 云 TTS 按字计费,误判轮次唔好白烧;
-            # dev 可 PREEMPTIVE_TTS=1 实验首声再提前。
-            "preemptive_tts": os.environ.get("PREEMPTIVE_TTS", "0") == "1",
-            "max_speech_duration": 10.0,
-            # 抢跑重试预算:每个 PREFLIGHT 事件 count+1(agent_activity.py:2392),
-            # 烧穿后 FINAL 到达只 cancel 不重建 → commit 从零生成、新请求还排在
-            # 被 cancel 的 prefill 后面(实测 +0.2-0.7s)。PREFLIGHT 已节流(稳定
-            # 前缀 ≥4 字增长才发),预算 8 保证长句 FINAL 那拍抢跑必存活。
-            # PREEMPTIVE_MAX_RETRIES 可回退。
-            "max_retries": int(os.environ.get("PREEMPTIVE_MAX_RETRIES", "8")),
-        },
+        # 流程推进/收尾/语言切换轮由 on_user_turn_completed 落 chat_ctx 步骤
+        # 标记,触发框架快照不一致→作废旧抢跑重建,推进轮唔会错步。
+        "preemptive_generation": _preemptive_generation_opts(),
         "interruption": {
             "enabled": interruption_enabled,
             # 官方「误打断自愈」组合:低门槛(0.6s 真插话即可让位)+
@@ -838,12 +933,35 @@ async def entrypoint(ctx):
     if _turn_detection_mode:
         # 唔设 key = 今日行为(EOT 模型 auto-select),唔整 None 别名分支。
         turn_handling["turn_detection"] = _turn_detection_mode
+    # 抢跑「标记轮暂停」实验档（PREEMPTIVE_DISABLE_ON_MARKER，默认关——时序
+    # 分析见 _marker_pause_enabled：标记轮 pre-FINAL 抢跑无法回溯、下一轮
+    # speculation 快照一致本就会命中，暂停=纯损失，故只留作 opt-in 实验）。
+    # 机制（livekit-agents 1.7.1 源码核实为 live 读取）：agent_activity.py
+    # preemptive_generation_opts 是 property，每次 speculative trigger 现场重读
+    # session.options.preemptive_generation（:535-539 merge agent 级空 dict；
+    # on_preemptive_generation :2371 每次取）——置 max_retries=0 后，count（每轮
+    # 重置 0，:2517）撞 :2389 的 0>=0 早退，后续 trigger 全跳过；下一个
+    # on_user_turn_completed 开头恢复 env 预算。
+    _preemptive_env_opts = dict(turn_handling["preemptive_generation"])
+    _preemptive_gate: dict = {"paused": False}
+    _marker_pause_on = _marker_pause_enabled()
+
+    def _set_preemptive_max_retries(value: int) -> None:
+        # AgentSessionOptions.preemptive_generation 是 property，直读 session 存储
+        # 的同一 dict（agent_session.py:310）——原地改=改生效配置，唔系快照。
+        try:
+            session.options.preemptive_generation["max_retries"] = value
+        except Exception:  # pragma: no cover - 框架结构变化仅损失提速,不损正确性
+            pass
+
     print(
         "[agent] turn_handling: "
         f"endpointing=dynamic({turn_handling['endpointing']['min_delay']}/"
         f"{turn_handling['endpointing']['max_delay']}) "
         f"preemptive={'on' if turn_handling['preemptive_generation']['enabled'] else 'off'} "
         f"preemptive_tts={'on' if turn_handling['preemptive_generation']['preemptive_tts'] else 'off'} "
+        f"max_retries={turn_handling['preemptive_generation']['max_retries']} "
+        f"marker_pause={'on' if _marker_pause_on else 'off'} "
         f"interruption=min_{turn_handling['interruption']['min_duration']}s+false_interruption_self_heal "
         f"turn_detection={_turn_detection_mode or 'default(本地 EOT v1-mini;Cantonese 未校准,阈值回退英文档)'}",
         flush=True,
@@ -876,10 +994,9 @@ async def entrypoint(ctx):
         asyncio.create_task(cp.add_turn(call_id, role, _clean_transcript(text)))
 
     async def _async_update_context(role, text):
-        # 渐进披露：每轮按用户当前问题实时检索（本地知识库 + 免费联网检索），
-        # 覆盖初始知识，并维护整场对话摘要。联网失败静默降级，绝不阻塞通话。
-        # 绑了分步话术(has_steps)的封闭流程默认跳过检索——单对象只上话术，
-        # 减少每轮 prefill；开放咨询(无模板)才 RAG。CONTEXT_RAG=1 强制开。
+        # 渐进披露：P1 起检索默认全关（对象知识走【对象档案】静态前缀，话术对象
+        # 只上话术）——每轮 RAG+联网只在 CONTEXT_RAG=1 逃生口下执行。摘要记忆
+        # 累积不受门控，每轮照常（只骑最后一条 user 消息的请求副本,唔伤前缀缓存）。
         try:
             if role == "assistant":
                 # 与 _on_conversation_item 同守则:教学/发音课程唔落对话记忆——转录落咗罐頭,
@@ -888,14 +1005,15 @@ async def entrypoint(ctx):
                     text,
                     language_state.lang if language_state.lang in ("zh", "cantonese") else None,
                 )
-            if role == "user" and _context_rag_enabled(flow_ctrl.has_steps if flow_ctrl else False):
+            if role == "user" and _context_rag_enabled():
                 from .web_search import web_search_text
 
                 hits = await cp.search_knowledge(text, context_state.account_id, 5)
                 context_state.set_knowledge(hits)
                 # 联网补充：知识库不足时给 LLM 实时事实（Wikipedia/DDG，按用户语言）。
-                # 可用 WEB_SEARCH=0 关闭（隐私/离线场景）。
-                if os.environ.get("WEB_SEARCH", "1") == "1":
+                # WEB_SEARCH 默认 0（P1：wiki/DDG 杂音既挤占尾部预算又会带偏小模型
+                # ——P4-C 实测；逃生口内要联网再显式开）。
+                if os.environ.get("WEB_SEARCH", "0") == "1":
                     try:
                         web = await web_search_text(text, language_state.lang)
                         if web:
@@ -936,11 +1054,9 @@ async def entrypoint(ctx):
         kind = getattr(m, "type", "")
         try:
             if kind == "llm_metrics":
-                print(
-                    f"LLM_TTFT_MS {m.ttft * 1000:.0f} (official) "
-                    f"prompt={m.prompt_tokens} gen={m.completion_tokens} tps={m.tokens_per_second:.1f}",
-                    flush=True,
-                )
+                # 行格式统一在 _format_llm_metrics（含 cached=prompt_cached/prompt,
+                # KV-cache 命中可视），单测直接喂鸭型 metrics 断言。
+                print(_format_llm_metrics(m), flush=True)
             elif kind == "tts_metrics":
                 print(f"AGENT_METRICS tts ttfb={m.ttfb * 1000:.0f}ms audio={m.audio_duration:.2f}s", flush=True)
             elif kind == "eou_metrics":
@@ -1048,6 +1164,12 @@ async def entrypoint(ctx):
             self.paused = False
 
         async def on_user_turn_completed(self, turn_ctx, new_message):
+            # 抢跑预算恢复（必须在语言锚定【前】）：仅在实验档 marker_pause=on 时
+            # 会有挂起的暂停要撤（默认关 → 恒跳过）。恢复放本轮开头=下一轮的
+            # FINAL 前抢跑照常生效。count 已由框架在本钩子前重置 0。
+            if _preemptive_gate["paused"]:
+                _preemptive_gate["paused"] = False
+                _set_preemptive_max_retries(int(_preemptive_env_opts["max_retries"]))
             # 客戶真開口 → 沉默心跳計數歸零(之後再沉默先重新計 2 次)。
             _nudge_state["count"] = 0
             _disarm_silence()
@@ -1062,6 +1184,14 @@ async def entrypoint(ctx):
                     turn_ctx.add_message(role="system", content=f"[流程状态] {reason}")
                 except Exception:  # pragma: no cover - 标记失败仅损失提速,不损正确性
                     pass
+                # 实验档（默认关）：本轮标记已使抢跑快照失效（框架 cancel 重建），
+                # 暂停本轮剩余 speculation。注意时序代价——下一轮 hook 开头才恢复,
+                # 下一轮的 pre-FINAL 抢跑（快照一致、本会命中）也被压掉=纯损失;
+                # 详见 _marker_pause_enabled 时序分析。
+                if _marker_pause_on and not _preemptive_gate["paused"]:
+                    _preemptive_gate["paused"] = True
+                    _set_preemptive_max_retries(0)
+                    print(f"[agent] preemptive paused for this turn (marker: {reason})", flush=True)
 
             # 同步注入用户语言：on_user_turn_completed 在自动回复生成【之前】被调用，
             # 此时 ASR 已把 language_state 更新为本轮语言。若只挂在 conversation_item_added

@@ -234,9 +234,12 @@ def test_render_split_prefix_has_instructions_tail_has_reference():
     for sec in ("【用户语言】", "【回复节奏】", "【应答准则】", "【话术流程总览"):
         assert sec in prefix, sec
     assert "【现在这一步】" not in prefix
-    # 易变参考(当前步/知识/联网/记忆)全在尾部,当前步放尾部最前
-    for sec in ("【现在这一步】", "【实时检索到的资料", "【联网检索到的资料", "【本通对话记忆】"):
+    # 易变参考(当前步/记忆)在尾部,当前步放尾部最前;知识/联网节默认关
+    # (rag_enabled=False:封闭话术流程不做检索,单对象只上话术+对象档案)。
+    for sec in ("【现在这一步】", "【本通对话记忆】"):
         assert sec in tail, sec
+    assert "【实时检索到的资料" not in tail
+    assert "【联网检索到的资料" not in tail
     # 完整段 = 前缀在前 拼接 尾部
     full = ctx.render_system_message()
     assert full.startswith(prefix) and full.endswith(tail)
@@ -256,9 +259,10 @@ def test_render_prefix_stable_when_only_knowledge_changes():
 def test_knowledge_snippet_truncated_to_cap():
     from agent_runtime.providers.livekit_plugins import ContextState
     ctx = ContextState()
-    ctx.set_knowledge([{"text": "很长的知识条目" * 200}])  # >350 字
+    ctx.rag_enabled = True  # 渲染门默认关:开 RAG 才断言尾部截断渲染。
+    ctx.set_knowledge([{"text": "很长的知识条目" * 200}])  # >150 字
     tail = ctx.render_context_tail()
-    # 单条被截到 ~350
+    # 单条被截到 150(149 字 + …)
     assert len(tail) < 400
     assert "…" in tail
 
@@ -267,13 +271,13 @@ def test_context_rag_gate():
     from agent_runtime.agent import _context_rag_enabled
     import os as _os
     _os.environ.pop("CONTEXT_RAG", None)
-    # 绑话术(has_steps) → 默认关 RAG;无模板 → 开
-    assert _context_rag_enabled(True) is False
-    assert _context_rag_enabled(False) is True
+    # P1 起 RAG 默认全关(对象知识走【对象档案】静态前缀,话术对象只上话术),
+    # 不再按 has_steps 区分。
+    assert _context_rag_enabled() is False
     # 逃生口:CONTEXT_RAG=1 强制开
     _os.environ["CONTEXT_RAG"] = "1"
     try:
-        assert _context_rag_enabled(True) is True
+        assert _context_rag_enabled() is True
     finally:
         _os.environ.pop("CONTEXT_RAG", None)
 
@@ -425,6 +429,7 @@ def test_web_snippets_capped_to_one_short_item():
     ctx = ContextState(account_id="acc-001")
     # 旧实现保留 2 条且不截断(P4 实测尾部被 Wikipedia 撑到 500-900 token):
     # 现在最多 1 条、单条 150 字——开放域杂音既挤尾部预算又会带偏 4B 小模型。
+    ctx.rag_enabled = True  # 渲染门默认关:开 RAG 才断言尾部截断渲染。
     ctx.set_web(["很长的联网摘要" * 100, "第二条联网结果"])
     tail = ctx.render_context_tail()
     assert "第二条联网结果" not in tail

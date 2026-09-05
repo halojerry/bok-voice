@@ -479,6 +479,11 @@ class _ExprPrependStream(llm.LLMStream):
             self._event_ch.send_nowait(ev)
 
 
+# 对象档案行边界=调用方给的显式换行(每个输入行是一个语义单元,如一行背景
+# +一行备注);绝不在句号处二次切分——多句背景若被句号切碎,第 2 行(备注)
+# 会被静默挤掉,档案失真。
+
+
 class ContextState:
     """Shared per-call context memory: per-turn knowledge + running summary.
 
@@ -497,6 +502,45 @@ class ContextState:
         self._web: list[str] = []
         self._flow_overview: str = ""
         self._flow_current: str = ""
+        self._object_brief: str = ""
+        # RAG 检索段渲染门(默认关):绑分步话术的封闭流程不做知识库/联网检索
+        # (单对象只上话术+对象档案),易变尾部只剩当前步+记忆,尾部预算最小化。
+        # set_knowledge/set_web 仍可照常喂数据(开放人设场景),只有 rag_enabled=True
+        # 时 tail 才渲染那两节。agent.py 装配时按自身 RAG 门控(_context_rag_enabled)
+        # 置位,或直接改用 ContextState.from_env() 装配(CONTEXT_RAG=1 → True)。
+        self.rag_enabled: bool = False
+
+    @classmethod
+    def from_env(cls, account_id: str = "") -> "ContextState":
+        """env 装配口:CONTEXT_RAG=1 → 打开知识/联网节的尾部渲染(默认关)。
+
+        与 agent.py 的取数门控 _context_rag_enabled 同一 env 开关;装配处换用
+        本口即可让「取数开」与「渲染开」永远同源,不留两套判定。
+        """
+        st = cls(account_id=account_id)
+        if os.environ.get("CONTEXT_RAG", "") == "1":
+            st.rag_enabled = True
+        return st
+
+    def set_object_brief(self, text: str) -> None:
+        """存入【对象档案】(会话装配时一次性注入,整场静态,进稳定指令前缀)。
+
+        有界:最多 2 行 × 每行 150 字。行边界=输入里的显式换行——每个输入行是
+        一个语义单元(如一行背景+一行备注),绝不在句号处二次切分(多句背景被
+        句号切碎会把第 2 行备注静默挤掉,档案失真)。单行超长硬截断(149 字 +
+        「…」)。切分/截断全部确定性:同一输入永远得到同一份档案字节,保证前缀
+        KV-cache 不因档案措辞变化而断裂。空串清档。
+        """
+        raw = str(text or "").replace("\r\n", "\n")
+        lines: list[str] = []
+        for line in raw.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            lines.append((line[:149] + "…") if len(line) > 150 else line)
+            if len(lines) >= 2:
+                break
+        self._object_brief = "\n".join(lines)
 
     def set_flow(self, overview: str, current: str) -> None:
         """设置对话流程:overview 为基础注入(全貌),current 为每轮当前步约束。"""
@@ -508,7 +552,11 @@ class ContextState:
         self._flow_current = current
 
     def set_web(self, results: str | list[str]) -> None:
-        """注入联网检索结果（Wikipedia/DDG 摘要），随 system 消息给 LLM 参考。"""
+        """注入联网检索结果（Wikipedia/DDG 摘要），随 system 消息给 LLM 参考。
+
+        注意:数据照常收(截到 1 条×150 字),但 tail 渲染受 rag_enabled 门控
+        (默认关)——CONTEXT_RAG=1/开放人设装配时置 True 才会出现在尾部。
+        """
         if isinstance(results, str):
             self._web = [results] if results.strip() else []
         elif results:
@@ -535,13 +583,15 @@ class ContextState:
             self._user_lang = key
 
     def set_knowledge(self, snippets: list[dict]) -> None:
+        """注入知识库检索片段(单条 150 字截断)。渲染受 rag_enabled 门控(默认关),
+        CONTEXT_RAG=1 路径由装配处置 True 后重新上尾。"""
         seen: set[str] = set()
         out: list[str] = []
         for s in snippets or []:
             text = str(s.get("text", "") or "").strip()
             # 单条截断：防超大文档整段进 system（单条无限长会撑爆每轮 prefill）。
-            # 150 字≈尾部预算目标 ≤~120 token 的一条配额（瘦砍自 350：尾部整段
-            # 每轮重 prefill，是 TTFT 大头）。
+            # 150 字/条是尾部预算的单条配额（瘦砍自 350）；真实尾部预算公式见
+            # render_context_tail 注释（当前步 ~321 字 + 记忆 6×200 字为主体）。
             if len(text) > 150:
                 text = text[:149] + "…"
             if text and text not in seen:
@@ -570,7 +620,8 @@ class ContextState:
     def render_instruction_prefix(self) -> str:
         """【稳定指令前缀】——放最前、紧贴人设 base。
 
-        含：用户语言规则 / 回复节奏 / 应答准则 / 话术流程总览(整通不变)。
+        含：用户语言规则 / 回复节奏 / 应答准则 / 话术流程总览(整通不变) /
+        对象档案(set_object_brief 会话装配时一次性注入,整通不变)。
         不变量：前缀整场字节不变（步骤推进只改尾部）→ mlx KV-cache 整场命中；
         当前步约束已移到尾部（推进若改前缀,token0 起整段重 prefill,实测卡 3-5s）。
         真正每轮变的当前步/检索资料/记忆都放 render_context_tail()。
@@ -609,22 +660,28 @@ class ContextState:
         )
         if self._flow_overview:
             parts.append("【话术流程总览(别照读,按进度推进)】\n" + self._flow_overview)
+        # 对象档案:静态、整场不变,放总览之后(先懂流程再看客户是谁)。有界
+        # (2 行×150 字,set_object_brief 保证),前缀体积影响一次性 prefill 可忽略。
+        if self._object_brief:
+            parts.append("【对象档案】\n" + self._object_brief)
         return "\n\n".join(parts)
 
     def render_context_tail(self) -> str:
         """【易变参考尾部】——每轮变的当前步/检索资料/记忆，垫在 system 最末。
 
-        前缀(稳定指令+话术总览)+人设 base 在前且整场字节不变，flow 步骤推进
-        只改这段尾部（短、逐轮重渲染）→ 前缀 KV-cache 照命中，每轮只 prefill
-        尾部增量。当前步放尾部最前，让「推进=换一小段尾部」而非动前缀。
+        前缀(稳定指令+话术总览+对象档案)+人设 base 在前且整场字节不变，flow
+        步骤推进只改这段尾部（短、逐轮重渲染）→ 前缀 KV-cache 照命中，每轮只
+        prefill 尾部增量。当前步放尾部最前，让「推进=换一小段尾部」而非动前缀。
+        知识/联网两节仅在 rag_enabled=True 时渲染(默认关:封闭话术流程不做检索,
+        单对象只上话术+对象档案;CONTEXT_RAG=1/开放人设由装配处置 True)。
         """
         parts: list[str] = []
         if self._flow_current:
             # 当前步约束(随 flow 推进而变):放尾部最前,推进只改这里、前缀字节不动。
             parts.append("【现在这一步】\n" + self._flow_current)
-        if self._snippets:
+        if self.rag_enabled and self._snippets:
             parts.append("【实时检索到的资料（知识库）】\n" + "\n".join(f"- {s}" for s in self._snippets))
-        if self._web:
+        if self.rag_enabled and self._web:
             parts.append(
                 "【联网检索到的资料（来源：Wikipedia/即时答案，可能过时或不准）】\n"
                 + "\n".join(f"- {s}" for s in self._web)
@@ -634,8 +691,11 @@ class ContextState:
         if self._summary_lines:
             # 只带最近几轮记忆(默认 6):尾部每轮 prefill 只吃增量,行数是 TTFT 杠杆;
             # 更早的上下文由原始历史截断(LLM_HISTORY_TURNS)与当前步约束兜底。
-            # 3→6:history 截断改摊销式后中间轮次间隔变大,多带几行摘要补上下文,
-            # 同时知识 snippet 已瘦砍(150 字×2 条),尾部总预算仍 ≤~120 token 典型。
+            # 尾部真实预算(RAG 关,默认档) = 【现在这一步】节头+当前步文本(典型
+            # ~321 字) + 【本通对话记忆】节头 + 6 行×每行 ≤201 字(≈1206 字) ≈
+            # 1.55-1.6k 字/轮逐轮重 prefill;RAG 开(rag_enabled=True)另加知识
+            # 2×~151 字 + 联网 1×~151 字 + 两个节头。旧注释「≤~120 token 典型」
+            # 是瘦砍前口径,早已失真,以此公式为准。
             keep = max(1, int(os.environ.get("REPLY_MEMORY_LINES", "6")))
             parts.append("【本通对话记忆】\n" + "\n".join(self._summary_lines[-keep:]))
         return "\n\n".join(parts)

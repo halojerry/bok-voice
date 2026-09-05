@@ -123,6 +123,21 @@ def _fallback_language(text: str) -> str:
         return "English"
     return ""
 
+def _finish_language_hint(start_lang: str | None) -> str | None:
+    """finish 整句/增量解码的语言提示(与会话 start 语言同源,唔重跑 auto-LID)。
+
+    en 会话显式归一成 "English"(接受 "en"/"english" 两种写法):整句 decode 若交
+    auto 检测,英语轮要多花语言判定且短轮易摇摆;显式 hint 消掉呢截。cantonese
+    原样透传(mlx 层大小写不敏感回填模型 config 规范名 Cantonese);zh/空保持
+    None=auto(容忍夹英文 code-switching,通话模式本来就唔给 zh 钉)。
+    """
+    raw = str(start_lang or "").strip()
+    key = raw.lower()
+    if key in {"en", "english"}:
+        return "English"
+    return raw or None
+
+
 class ASRService:
     def __init__(self) -> None:
         self._model: Any | None = None
@@ -199,6 +214,7 @@ class ASRService:
             "partial_lang": "",
             "partial_covered": None,
             "last_partial_at": 0.0,
+            "partials_done": False,
             "inf_lock": threading.Lock(),
         }
         return session_id
@@ -243,6 +259,7 @@ class ASRService:
         """滑窗 partial：说话期间每 PARTIAL_INTERVAL_MS 对累积 buffer 重推一次。
 
         - 忙时跳过：上一窗没跑完直接回上一窗结果，唔排队叠窗（GPU 串行，叠了也白排）。
+        - FINAL 后停发：finish 打了 partials_done 标记的会话直接回缓存（见 finish 注释）。
         - buffer 裁最近 ~PARTIAL_MAX_SEC：长句重算成本线性涨；超长独白的 partial
           只反映最近窗口，/api/finish 整句高精度转写兜底唔受影响。
         - 语言提示与会话一致（cantonese 等），partial 与 final 唔会各说各话。
@@ -252,6 +269,10 @@ class ASRService:
             "language": session.get("partial_lang", ""),
             "partial": True,
         }
+        # FINAL 后停发:会话已了结(finish 摘除/标记),喺途迟到的 chunk 唔再排 GPU
+        # 解码——防 FINAL 之后冒出过期 INTERIM/PREFLIGHT 抢跑事件。
+        if session.get("partials_done"):
+            return cached
         lock = session.setdefault("inf_lock", threading.Lock())
         if not lock.acquire(blocking=False):
             return cached
@@ -286,7 +307,7 @@ class ASRService:
             # len(chunks):/api/finish 的 PCM body 会在锁外追加进 chunks(端点收 body
             # 唔使锁),若记当刻长度会「多认覆盖」→ finish 见 covered==len(pcm) →
             # 尾巴被当已解码直接转正 partial → 尾段语音/号码静默丢失。
-            # 裁剪窗(>PARTIAL_MAX_SEC)只解了尾部 25s,头段从未进 partial →
+            # 裁剪窗(>PARTIAL_MAX_SEC)只解了尾部 12s,头段从未进 partial →
             # covered=None,增量路径让位整句兜底(唔得被本次赋值翻案)。
             session["partial_covered"] = None if capped else len(pcm)
             session["last_partial_at"] = now
@@ -302,7 +323,7 @@ class ASRService:
     ) -> dict[str, str | bool] | None:
         """增量 finish:新鲜 partial 已覆盖 buffer 主体时,只解码尾部小段再拼接。
 
-        partial 滑窗 ≤400ms 前刚解码过几乎同一份 buffer,finish 再整段重推是
+        partial 滑窗 ≤700ms 前刚解码过几乎同一份 buffer,finish 再整段重推是
         0.5-1.2s 的纯重复 GPU 时间。这里在 inf_lock 纪律下只解码
         partial_covered 之后的尾部(通常 ≤2-3s),FINAL = partial_text + tail_text。
         任一前提不成立 → 返回 None → 调用方整句高精度兜底:
@@ -383,6 +404,10 @@ class ASRService:
         session = self._sessions.pop(session_id, None)
         if session is None:
             raise HTTPException(status_code=404, detail="unknown session")
+        # FINAL 后停发:会话已从 _sessions 摘除(新 chunk 会 404),呢度再打标记,
+        # 让「pop 前已拿到 session 引用」的喺途 chunk 调用也停发 partial——
+        # FINAL 之后唔再有解码排 GPU,也唔会吐过期 INTERIM 抢跑事件。
+        session["partials_done"] = True
         self._ensure_loaded()
 
         if BACKEND == "vllm":
@@ -406,7 +431,9 @@ class ASRService:
         # 整句与增量两条路径都受益。
         pcm = _trim_trailing_silence(pcm)
         wav, sr = _wav_from_pcm16(pcm)
-        hint = session.get("language") or None  # "cantonese" 等;空 = auto
+        # 语言提示:由会话 start 语言归一(en/english→"English",cantonese 透传,
+        # zh/空=auto);整句与增量尾段两条 generate 路径共用同一 hint。
+        hint = _finish_language_hint(session.get("language"))
         if BACKEND == "mlx":
             # 增量 fast path:新鲜 partial 已覆盖 buffer 主体 → 只解码尾巴再拼接;
             # 任一前提不成立则回退整句高精度兜底(WhatsApp 捕获零降级)。
@@ -452,9 +479,14 @@ service = ASRService()
 # 滑窗 partial(说话期间边说边出文字):mlx 后端每 PARTIAL_INTERVAL_MS 对累积
 # buffer 重推一次。QWEN3_ASR_STREAM=0 一键回退纯离线模式(只缓冲,finish 才转写)。
 STREAM_PARTIAL = os.environ.get("QWEN3_ASR_STREAM", "1") == "1"
-PARTIAL_INTERVAL_MS = float(os.environ.get("QWEN3_ASR_PARTIAL_MS", "400"))
-# 长句重算成本随 buffer 线性涨:partial 只裁最近 ~25s;finish 整句高精度兜底不受影响。
-PARTIAL_MAX_SEC = float(os.environ.get("QWEN3_ASR_PARTIAL_MAX_SEC", "25"))
+# 400→700ms:partial 只喂字幕/抢跑前缀,滑窗每次都近乎整段重算,400ms 档说话
+# 中途就叠窗排队烧 GPU、还把 FINAL 挤到后面(增量 finish 接缝也要小等在飞窗);
+# 700ms 让每窗解码充分跑完,FINAL 到达反而更早。
+PARTIAL_INTERVAL_MS = float(os.environ.get("QWEN3_ASR_PARTIAL_MS", "700"))
+# 长句重算成本随 buffer 线性涨:partial 只裁最近 ~12s(25→12:超 12s 的独白
+# partial 解码已贴着秒级预算,再长纯烧 GPU,字幕价值为负);finish 整句高精度
+# 兜底不受影响(裁剪窗 covered=None,增量让位整句)。
+PARTIAL_MAX_SEC = float(os.environ.get("QWEN3_ASR_PARTIAL_MAX_SEC", "12"))
 # 增量 finish:partial 已覆盖 buffer 主体时只解码尾部小段再拼接(RCA-1 主刀)。
 # QWEN3_ASR_INC_FINISH=0 一键回退整句重解码;安全阀全部 env 可调。
 INC_FINISH = os.environ.get("QWEN3_ASR_INC_FINISH", "1") == "1"
