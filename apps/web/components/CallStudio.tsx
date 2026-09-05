@@ -693,7 +693,8 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
         const s = await api.getSettlement(stateCallId);
         setSettlement(s);
       } catch (e) {
-        console.warn("settle failed", e);
+        // 未有结算(未 settle)时 /settlement 404 属预期,唔刷 console。
+        if (!String(e).includes("404")) console.warn("settle failed", e);
       }
     }
     setStateCallId("");
@@ -805,6 +806,11 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
                   <button className="btn-primary" onClick={connect} disabled={connecting || (!stateCallId && !objId)}>
                     {connecting ? "接通中…" : error ? "重试接通" : isJoiningExisting ? "接通 / 进房" : "接通"}
                   </button>
+                  {connecting && (
+                    <p className="animate-pulse text-[11px] text-sky-300">
+                      正在创建会话并接通…（约几秒，随后显示「初始化中」）
+                    </p>
+                  )}
                 </div>
               ) : (
                 <button className="btn-ghost" onClick={leave}>
