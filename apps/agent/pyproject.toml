@@ -15,6 +15,8 @@ dependencies = [
 [project.optional-dependencies]
 livekit = [
   "livekit-agents>=1.7,<2",
+  # OpenAI 兼容 LLM 基类(livekit_plugins 顶层 import,未声明则 CI 收集期即炸)。
+  "livekit-plugins-openai>=1.7,<2",
   # Local offline SenseVoice ASR via sherpa-onnx (zh/en/ja/ko/yue).
   "sherpa-onnx>=1.13,<2",
   # Volcano (火山) streaming TTS uses a WebSocket binary protocol.
