@@ -5,7 +5,7 @@ import { api } from "@/lib/api";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
 import { startRecording, type RecorderHandle } from "@/lib/recorder";
-import { allMinimaxVoiceOptions, previewLangForVoice } from "@/lib/minimax-voices";
+import { MINIMAX_VOICE_ENTRIES, previewLangForVoice } from "@/lib/minimax-voices";
 
 const EMPTY = { name: "", company: "", tone: "", language: "zh", reference_audio: "", tts_provider: "" };
 const LANGS = [
@@ -125,6 +125,19 @@ export default function PersonasPage() {
   const engineIsCloud = ["minimax", "minimax_streaming", "volcano_streaming"].includes(
     String(form.tts_provider ?? "").trim().toLowerCase(),
   );
+
+  // 云端音色下拉只列与人设语言匹配的音色（英文人设只见英文音色，唔会乱）；
+  // 未知/旧語言（如 vi）唔清空照列全部；跨語言已選值保留「自定义」項、唔静默改。
+  const cloudVoiceOptions = useMemo(() => {
+    const lang = String(form.language ?? "").toLowerCase();
+    if (!["zh", "cantonese", "en"].includes(lang)) {
+      return MINIMAX_VOICE_ENTRIES.map((v) => ({ value: v.id, label: v.label }));
+    }
+    return MINIMAX_VOICE_ENTRIES.filter((v) => v.lang === lang).map((v) => ({
+      value: v.id,
+      label: v.label,
+    }));
+  }, [form.language]);
 
   // 引擎或人设主语言切换时，把云端当前音色初始化为语音映射里的主音色（旧分语言数据收敛成单音色）。
   useEffect(() => {
@@ -485,7 +498,7 @@ export default function PersonasPage() {
                 {/* 云端引擎：整场固定一个音色（不随语言换声）。 */}
                 <span className="text-xs text-[var(--stage-muted)]">AI 音色（整场同声 · 不随语言切换）</span>
                 <p className="text-[11px] text-[var(--muted)]">
-                  选一个固定音色，客户讲粤语/普通话/英文都用它回应（推荐粤语播报音色：港式服务粤/普/英都地道）。
+                  只列与当前人设语言匹配的音色（英文人设显示英文音色，对应语言显示对应音色），不会混在一起挑错。
                 </p>
                 <select
                   className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
@@ -493,13 +506,13 @@ export default function PersonasPage() {
                   onChange={(e) => { setCloudVoice(e.target.value); setCloudPreviewLang(""); setPreviewUrl(""); }}
                 >
                   <option value="">选择 MiniMax 音色…</option>
-                  {allMinimaxVoiceOptions().map((opt) => (
+                  {cloudVoiceOptions.map((opt) => (
                     <option key={opt.value} value={opt.value}>
                       {opt.label}
                     </option>
                   ))}
-                  {cloudVoice && !allMinimaxVoiceOptions().some((o) => o.value === cloudVoice) && (
-                    <option value={cloudVoice}>自定义：{cloudVoice}</option>
+                  {cloudVoice && !cloudVoiceOptions.some((o) => o.value === cloudVoice) && (
+                    <option value={cloudVoice}>已选（其他语言/自定义）：{cloudVoice}</option>
                   )}
                 </select>
                 <div className="flex items-center gap-2">
