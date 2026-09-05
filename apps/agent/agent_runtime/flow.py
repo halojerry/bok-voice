@@ -330,6 +330,7 @@ def detect_whatsapp_signal(
     step_goal: str = "",
     step_ref: str = "",
     facts: dict | None = None,
+    already_captured: bool = False,
 ) -> tuple[str, str] | None:
     """偵測客戶係咪俾出 WhatsApp。返回 ("captured", 號碼) | ("captured_implicit", "") | ("offered", "") | None。
 
@@ -343,6 +344,10 @@ def detect_whatsapp_signal(
     - offered:喺引導辦理步、客戶冇俾號碼但应承加(好/可以/加咗),又冇話冇WhatsApp。
       由 caller 喺「上一步啱啱確認推入辦理步嗰輪」唔好 call 呢個 offered 分支(嗰輪客係
       應承接受,唔係應承加)──偵測放喺 flow 推進前跑、step context 係舊步,天然避開。
+    - already_captured:本通已 captured 過號碼 → 之後嘅純短應承/叫加唔再判 offered
+      (號碼已喺手,嗰啲係對當前步嘅確認;再判 offered 會令確認輪鎖死唔推進,
+      4B 就把自己上一句原樣再講一次——2026-09-06 call-e6e5f18e 實證)。新號碼/
+      綁定來電照樣 captured(客戶可以改口俾另一個號)。
     """
     t = (user_text or "").strip()
     if not t:
@@ -373,12 +378,42 @@ def detect_whatsapp_signal(
     if caller_bound:
         return ("captured_implicit", "")
     if in_wa_step and not runs:
+        if already_captured:
+            # 已捕获过号码:纯应承/叫加都係对当前步嘅确认,唔再当 offered
+            # (确认轮锁死→逐字重复根因,见 docstring);让 rule_verdict 正常推进。
+            return None
         # offered:明確叫加,或纯短应承(冇提其他話題)。
         if _WHATSAPP_ADD_VERB.search(t):
             return ("offered", "")
         if not _WHATSAPP_TOPIC_MARK.search(t) and _is_pure_ack(t):
             return ("offered", "")
     return None
+
+
+def extract_call_facts(user_text: str, *, facts: dict | None = None) -> list[str]:
+    """从客户话里抽可沉淀的关键事实(平台/号码)——会中记忆只增唔重问。
+
+    「忘记」的直接机制(2026-09-06 行为取证):客户早轮讲过的事实只住在
+    6 行×200 字滚动记忆+8 轮历史里,16 轮内先后蒸发,模型重新追问
+    (call-701c180b 同一句「報姓名同單號」問了三遍)。这里抽「答过就该
+    记住」的最小集:购物平台、非已知资料的号码串(命中已知 单号/尾号/电话
+    唔重复沉淀);由 agent 每轮喂 ContextState.add_call_fact(去重有界),
+    渲染进尾部【通话中客户已讲】。号码经 digits_to_cantonese 逐位转汉字
+    (TTS 安全+防 LLM 凭空改号)。
+    """
+    t = (user_text or "").strip()
+    if not t:
+        return []
+    out: list[str] = []
+    m = _PLATFORM_RE.search(t)
+    if m:
+        out.append(f"客户讲过在{m.group(1)}买")
+    norm = _digit_normalize(t)
+    for run in _valid_digit_runs(norm):
+        if _run_is_known_number(run, facts):
+            continue
+        out.append(f"客户报过号码:{digits_to_cantonese(run)}")
+    return out
 
 
 def decide_advance(user_text: str, *, facts: dict | None = None) -> str:

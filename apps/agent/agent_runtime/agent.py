@@ -216,26 +216,35 @@ def _sticky_reply_language(anchor: str, asr_lang: str, cur_sticky: str, cur_stre
     return anchor, anchor, 0
 
 
-def _nudge_instruction(name: str, lang: str) -> str:
-    """沉默心跳的生成指令:一句亲切确认「仲喺度嗎」,带返当前步话题,唔重复长内容。"""
+def _nudge_line(name: str, lang: str, count: int) -> str:
+    """沉默心跳脚本直念(session.say,不加 LLM):短确认轮换骨架。
+
+    旧版走 generate_reply(instructions=...) 令 LLM 现场生成,两个代价:
+    ①临时 system 指令入请求、下一轮即被剥 → KV-cache 严格前缀断裂(每次心跳
+    其后全尾部重 prefill);②4B 照抄指令里的例句,两连发一字不差(2026-09-06
+    call-64543304 实证)。脚本直念零 TTFT(TTS 即点即播,答案卡死时即时补位)、
+    零前缀断裂、轮换不重样。
+    """
     who = f"{name}，" if name else ""
     if lang == "cantonese":
-        return (
-            f"【沉默心跳】客户已经一段时间没有出声。现在只讲一句(最多两句)简短亲切的确认，"
-            f"例如「{who}你仲喺度嗎？我哋繼續睇下呢一步」，然后自然把话题带回当前这一步等客户回应；"
-            "绝不重复之前讲过的完整内容，绝不自问自答，一句讲完就停。"
+        variants = (
+            f"{who}你仲喺度嗎？",
+            f"{who}喂，聽唔聽到我講嘢？",
+            f"{who}唔好意思，等你一陣，仲喺度嗎？",
         )
-    if lang == "en":
-        return (
-            f"【沉默心跳】The customer has been silent for a while. Say ONE short friendly check-in "
-            f"(e.g. \"{name or 'Hello'}, are you still there?\"), then gently bring the topic back to the "
-            "current step and wait. Never repeat previous content, never answer for the customer, one line only."
+    elif lang == "en":
+        variants = (
+            f"{name or 'Hello'}, are you still there?",
+            "Hello? Can you hear me?",
+            "Sorry to keep you — still there?",
         )
-    return (
-        f"【沉默心跳】客户已经一段时间没有出声。现在只讲一句(最多两句)简短亲切的确认，"
-        f"例如「{who}您还在吗？咱们继续看这一步」，然后自然把话题带回当前这一步等客户回应；"
-        "绝不重复之前讲过的完整内容，绝不自问自答，一句讲完就停。"
-    )
+    else:
+        variants = (
+            f"{who}您还在吗？",
+            f"{who}喂，能听到我说话吗？",
+            f"{who}不好意思，您还在吗？",
+        )
+    return variants[min(max(count, 0), len(variants) - 1) % len(variants)]
 
 
 def _nudge_should_fire(now: float, last_reply_ts: float, last_user_ts: float, nudge_delay: float) -> bool:
@@ -243,34 +252,29 @@ def _nudge_should_fire(now: float, last_reply_ts: float, last_user_ts: float, nu
 
     两种窗口唔开火：
     - AI 啱講完（< nudge_delay）：俾客戶反應時間；
-    - 客戶最後開聲新過 AI 最後講完且 < 2×delay：答案仲喺路上（生成/合成中），
+    - 客戶最後開聲新過 AI 最後講完且 ≤ 2×delay：答案仲喺路上（生成/合成中），
       唔好用「仲喺度嗎」頂替真答案；超 2×delay 仍無聲先允許心跳兜底
-      （答案可能失敗/被取消——2026-09-05 三会话实测「一直心跳」根因护栏）。
+      （答案可能失敗/被取消——2026-09-05 三会话实测「一直心跳」根因护栏；
+      ≤ 边界收紧系 2026-09-06 call-03a3295c:恰 16.0s 护栏失效心跳顶替真答案）。
     """
     if now - last_reply_ts < nudge_delay:
         return False
-    if last_user_ts > last_reply_ts and now - last_user_ts < nudge_delay * 2:
+    if last_user_ts > last_reply_ts and now - last_user_ts <= nudge_delay * 2:
         return False
     return True
 
 
-def _silence_farewell_instruction(name: str, lang: str) -> str:
-    """两次心跳都没回应:一句礼貌收尾(多谢+阵间再联系+再见),讲完即收线。"""
+def _farewell_line(name: str, lang: str) -> str:
+    """两次心跳都没回应:一句礼貌收尾直念(多谢+阵间再联系+再见),讲完即收线。
+
+    脚本直念同 _nudge_line:零 TTFT、零前缀断裂(收线后再无真实轮,断裂成本
+    本来就低,直念纯赚少一次 LLM 调用)。"""
     who = f"{name}，" if name else ""
     if lang == "cantonese":
-        return (
-            f"【沉默收线】客户连续两次确认都没有回应。现在只讲一句简短礼貌的收尾，"
-            f"例如「{who}咁我陣間再搵你，多謝你，拜拜」，一句讲完就停，绝不多讲。"
-        )
+        return f"{who}咁我陣間再搵你，多謝你，拜拜"
     if lang == "en":
-        return (
-            f"【沉默收线】The customer did not respond after two check-ins. Say ONE short polite goodbye "
-            f"(e.g. \"{name or 'Hello'}, I'll try again later. Thanks and goodbye.\"), one line only."
-        )
-    return (
-        f"【沉默收线】客户连续两次确认都没有回应。现在只讲一句简短礼貌的收尾，"
-        f"例如「{who}那我稍后再联系您，谢谢您，再见」，一句讲完就停，绝不多讲。"
-    )
+        return f"{name or 'Goodbye'}, I'll try again later. Thanks and goodbye."
+    return f"{who}那我稍后再联系您，谢谢您，再见"
 
 
 def _normalize_lang(raw, default: str = "") -> str:
@@ -796,7 +800,7 @@ async def entrypoint(ctx):
 
     # 对话流程控制器:载入模板分步 + 对象变量;由它按轮注入"当前步",逐步推进。
     from .flow import FlowController, facts_line
-    from .flow import CONFIRM, OBJECTION, QUESTION, REFUSE, UNCLEAR, detect_whatsapp_signal
+    from .flow import CONFIRM, OBJECTION, QUESTION, REFUSE, UNCLEAR, detect_whatsapp_signal, extract_call_facts
 
     flow_ctrl = FlowController.from_template(template, object_card)
     _log_stage("context_resolved")
@@ -861,6 +865,9 @@ async def entrypoint(ctx):
     context_state.set_user_language(greet_lang)
     # 已上報嘅 WhatsApp 狀態(captured=已報號碼, offered=已報應承加),避免每 call 重複 spam。
     _wa_reported: set[str] = set()
+    # 本通已捕获过号码(captured/captured_implicit 任一):之後 WhatsApp 步嘅純短應承
+    # 唔再判 offered(確認輪鎖死→逐字重複根因,detect_whatsapp_signal 文檔)。
+    _wa_captured: dict = {"on": False}
     # 背景 flow judge 防疊:記錄而家 judge 緊邊一步(-1=冇)。推進唔可以同時兩個 judge。
     _judge_inflight: dict = {"step": -1}
     # 沉默心跳:AI 講完話客戶耐冇出聲 → 主動確認「仲喺度嗎」並帶返當前步。
@@ -1237,6 +1244,9 @@ async def entrypoint(ctx):
                     except Exception as exc:  # pragma: no cover - 联网是增强
                         print(f"[agent] web search skipped: {exc!r}", flush=True)
             context_state.add_summary(role, _clean_transcript(text))
+            if role == "assistant":
+                # 尾部重复锚:让模型看得见自己上一句,治原句/近原句复述(R3)。
+                context_state.set_last_reply(_clean_transcript(text))
         except Exception as exc:  # pragma: no cover - context must not break turns
             print(f"[agent] context update failed: {exc!r}", flush=True)
 
@@ -1425,10 +1435,13 @@ async def entrypoint(ctx):
                 if flow_ctrl.has_steps:
                     _g, _r = flow_ctrl.current_goal_ref()
                     _wa_signal = detect_whatsapp_signal(
-                        user_text, step_goal=_g, step_ref=_r, facts=flow_ctrl.vars_map
+                        user_text, step_goal=_g, step_ref=_r, facts=flow_ctrl.vars_map,
+                        already_captured=_wa_captured["on"],
                     )
                     if _wa_signal:
                         _kind, _num = _wa_signal
+                        if _kind in ("captured", "captured_implicit"):
+                            _wa_captured["on"] = True
                         if _kind == "captured_implicit":
                             # WhatsApp 綁定呢個來電/號碼:號喺系統度,攞對象電話上報 captured。
                             # 對象冇電話 → 上報 offered(操作台見「待對接」);兩種都照推進,唔死鎖。
@@ -1454,6 +1467,14 @@ async def entrypoint(ctx):
                                 context_state.set_whatsapp_note(_num)
                             print(f"[whatsapp] {_kind} num={_num or '-'} (call {room_name})", flush=True)
             except Exception:  # pragma: no cover - WhatsApp 偵測失敗唔阻斷
+                pass
+            # 会中事实沉淀(R4):客户话里的平台/号码抽进尾部【通话中客户已讲】
+            # (去重有界 ≤4 条)——早轮事实唔再随滚动记忆/历史截断蒸发,
+            # 模型唔会重复问已答过的事(call-701c180b 同一问三遍实证)。
+            try:
+                for _fact in extract_call_facts(user_text, facts=flow_ctrl.vars_map):
+                    context_state.add_call_fact(_fact)
+            except Exception:  # pragma: no cover - 沉淀失败唔阻回复
                 pass
             # 流程推进:读用户最新话,判定是否进入下一步,更新"当前步"约束注入。
             if flow_ctrl.has_steps:
@@ -1595,11 +1616,11 @@ async def entrypoint(ctx):
             name = str((object_card or {}).get("display_name") or "").strip()
             lang = language_state.lang if language_state.lang in ("zh", "cantonese", "en") else "zh"
             if _nudge_state["count"] >= nudge_max:
-                # 兩次確認都冇回應 → 禮貌收尾,講完(一句TTS+余量)自動收線。
+                # 兩次確認都冇回應 → 禮貌收尾直念,講完(一句TTS+余量)自動收線。
                 _nudge_state["farewell"] = True
                 print(f"[heartbeat] still silent after {_nudge_state['count']} nudges -> farewell+end (call {room_name})", flush=True)
                 try:
-                    await session.generate_reply(instructions=_silence_farewell_instruction(name, lang))
+                    await session.say(_farewell_line(name, lang))
                 except Exception as exc:  # pragma: no cover - 收尾失敗都照收線
                     print(f"[heartbeat] farewell failed: {exc!r} (call {room_name})", flush=True)
                 _schedule_call_end(12.0, disposition="no_response")
@@ -1607,7 +1628,7 @@ async def entrypoint(ctx):
             _nudge_state["count"] += 1
             print(f"[heartbeat] silent {nudge_delay:.0f}s -> nudge {_nudge_state['count']}/{nudge_max} (call {room_name})", flush=True)
             try:
-                await session.generate_reply(instructions=_nudge_instruction(name, lang))
+                await session.say(_nudge_line(name, lang, _nudge_state["count"] - 1))
             except Exception as exc:  # pragma: no cover - 心跳失敗唔阻通話
                 print(f"[heartbeat] nudge failed: {exc!r} (call {room_name})", flush=True)
 
@@ -1641,10 +1662,13 @@ async def entrypoint(ctx):
     _log_stage("session_started")
 
     if not agent.paused:
-        # 开场白用开场语言（对象/人设语言决定）；generate_reply 的 instructions 会
-        # 在基础指令上叠加，配合 system 里的母语设定让首句即用对的语言。
+        # 开场白脚本直念(session.say,不加 LLM):旧 generate_reply(instructions)
+        # 的临时 system 指令下轮即剥,是会话第一个 KV-cache 前缀断裂点,且冷启
+        # TTFT 2-3.4s 全灌在开场白上。直念即点即播(纯 TTS,~100ms 出声);
+        # 文本仍入 chat_ctx(say add_to_chat_ctx 默认 True)——预热任务照抓它作
+        # assistant 轮,turn-1 前缀命中不变。
         greetings = {"zh": "请问有什么可以帮您？", "cantonese": "請問有咩可以幫到你？", "en": "How can I help you?"}
-        await session.generate_reply(instructions=greetings.get(greet_lang, greetings["zh"]))
+        await session.say(greetings.get(greet_lang, greetings["zh"]))
         _log_stage("greeting_queued")
     # ---- 会话首轮真实前缀预热（LLM_PREFIX_PREWARM，默认 1）--------------------
     # context_state/persona/flow 已装配完（前缀字节就此定形）、session 已建——
