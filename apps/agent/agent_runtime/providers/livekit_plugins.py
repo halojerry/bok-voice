@@ -556,20 +556,67 @@ class ContextState:
         # WhatsApp 已捕获号码（注入尾部,防 LLM 复述错号——2026-09-06 实测尾号读错）
         self._whatsapp_note: str = ""
         # 追加式尾部账本（KV-cache 铁律 2026-09-05）：记录每个 user 消息被
-        # ContextAwareLLM 拼上的易变尾部（原文, 原文+尾部），FIFO 对应历史里的
-        # user 消息。下一轮请求把历史中的旧 user 重放成「原文+当时的尾部」——
-        # 上一轮请求因此永远是下一轮的严格前缀（此前尾部只拼在最后一条 user、
-        # 下轮即被剥掉 → 中途分叉 → 只有 system 锚点命中，对话历史每轮全量
+        # ContextAwareLLM 拼上的易变尾部（原文, 原文+尾部, 当时 revision），FIFO
+        # 对应历史里的 user 消息。下一轮请求把历史中的旧 user 重放成「原文+当时的
+        # 尾部」——上一轮请求因此永远是下一轮的严格前缀（此前尾部只拼在最后一条
+        # user、下轮即被剥掉 → 中途分叉 → 只有 system 锚点命中，对话历史每轮全量
         # 重 prefill，实测暖轮 cached 恒=锚点、TTFT 0.7-1.3s 的主因）。
-        self._applied_tails: list[tuple[str, str]] = []
+        # revision：尾部内容实质变化计数（推进/WhatsApp 捕获）——只服务抢跑重建轮
+        # 「末条 user 尾部重渲染」判定（ContextAwareLLM.chat n_new==0 分支）。
+        self._applied_tails: list[tuple[str, str, int]] = []
+        self._revision: int = 0
+        # 会中客户已讲事实（平台/号码,append-only 有界）与 AI 上一句（重复锚）。
+        # 都渲染进尾部，治「忘记早轮信息」「原句重复复述」（2026-09-06 行为取证）。
+        self._call_facts: list[str] = []
+        self._last_reply: str = ""
+
+    @property
+    def revision(self) -> int:
+        return self._revision
 
     def set_whatsapp_note(self, num: str) -> None:
-        self._whatsapp_note = num or ""
+        v = num or ""
+        if v != self._whatsapp_note:
+            self._whatsapp_note = v
+            self._revision += 1
+
+    def set_flow_current(self, current: str) -> None:
+        """每轮更新当前步约束(flow controller 推进后调用)。
+
+        内容实质变化才 +revision:每轮同值重复 set 唔虚增;【新一步】一次性提示
+        在下一轮消失亦算变化(重建轮据此把末条 user 尾部对齐到当前版)。
+        """
+        current = current or ""
+        if current != self._flow_current:
+            self._flow_current = current
+            self._revision += 1
+
+    def add_call_fact(self, text: str, limit: int = 4) -> None:
+        """沉淀一条会中事实(去重,有界 FIFO,≤limit 条)——渲染进尾部
+        【通话中客户已讲】,治「模型重复问已答过的事」。"""
+        t = str(text or "").strip()
+        if not t or t in self._call_facts:
+            return
+        self._call_facts.append(t)
+        if len(self._call_facts) > limit:
+            self._call_facts.pop(0)
+
+    def set_last_reply(self, text: str) -> None:
+        """记录 AI 最近一句回复(截 80 字)作尾部重复锚——模型看得见自己上一句,
+        唔会原句再讲一次。空串忽略(保持上一条锚)。"""
+        t = str(text or "").strip()
+        if t:
+            self._last_reply = t[:80]
 
     def record_applied_tail(self, orig: str, final: str) -> None:
-        self._applied_tails.append((orig, final))
+        self._applied_tails.append((orig, final, self._revision))
 
-    def applied_tails(self) -> list[tuple[str, str]]:
+    def rewrite_last_applied_tail(self, orig: str, final: str) -> None:
+        """抢跑重建轮把末条 user 尾部重渲染成当前版后,同步账本(保持 FIFO 对齐)。"""
+        if self._applied_tails:
+            self._applied_tails[-1] = (orig, final, self._revision)
+
+    def applied_tails(self) -> list[tuple[str, str, int]]:
         return list(self._applied_tails)
 
     def prune_applied_tails(self, keep: int) -> None:
@@ -613,11 +660,10 @@ class ContextState:
     def set_flow(self, overview: str, current: str) -> None:
         """设置对话流程:overview 为基础注入(全貌),current 为每轮当前步约束。"""
         self._flow_overview = overview
-        self._flow_current = current
-
-    def set_flow_current(self, current: str) -> None:
-        """每轮更新当前步约束(flow controller 推进后调用)。"""
-        self._flow_current = current
+        current = current or ""
+        if current != self._flow_current:
+            self._flow_current = current
+            self._revision += 1
 
     def set_web(self, results: str | list[str]) -> None:
         """注入联网检索结果（Wikipedia/DDG 摘要），随 system 消息给 LLM 参考。
@@ -869,16 +915,18 @@ class ContextAwareLLM(llm.LLM):
                         return c
                     return "".join(x for x in (c or []) if isinstance(x, str))
 
-                def _replay(idx: int, orig: str, final: str) -> None:
+                def _replay(idx: int, orig: str, final: str) -> bool:
                     it = items[idx]
                     if isinstance(it, llm.ChatMessage) and _text_of(it) == orig:
                         items[idx] = llm.ChatMessage(role="user", content=[final])
+                        return True
                     # 原文对不上(极端改写)→ 跳过该条,损失局部缓存也好过乱拼。
+                    return False
 
                 if n_new > 0:
                     # 旧的 applied 对应 users 前 |applied| 条(时序一致),逐条重放;
                     # 新增的尾部 user 从最后一条起各拼当前尾部并入账。
-                    for k, (orig, final) in enumerate(applied):
+                    for k, (orig, final, _rev) in enumerate(applied):
                         _replay(users[k], orig, final)
                     for idx in users[len(applied):]:
                         it = items[idx]
@@ -889,11 +937,26 @@ class ContextAwareLLM(llm.LLM):
                             items[idx] = llm.ChatMessage(role="user", content=[final])
                         self._ctx.record_applied_tail(orig, final)
                 elif users:
-                    # 无新消息的重放(抢跑重试等):整段原样重放,唔重写尾部,保严格前缀。
+                    # 无新消息的重放(抢跑重试/重建):整段原样重放,保严格前缀;唯独
+                    # 尾部在最后一条 user 拼上之后已实质变化(流程推进/WhatsApp 捕获
+                    # → revision +1,随后框架按快照差异作废旧抢跑并重建)时,把末条
+                    # user 的尾部重渲染成当前版——否则重建请求仍带旧步骤语境,回复
+                    # 照旧步讲(2026-09-06 call-e6e5f18e:已推进第 4 步仍念第 3 步)。
+                    # 只改末条 user:其前序列恒定,被取代的抢跑请求已作废,无前缀
+                    # 契约;下一轮真实请求以本次重建结果为前缀,链路重新闭合。
                     tail_window = applied[-len(users):] if len(applied) >= len(users) else []
                     offset = len(users) - len(tail_window)
-                    for k, (orig, final) in enumerate(tail_window):
-                        _replay(users[offset + k], orig, final)
+                    last_replayed = False
+                    for k, (orig, final, _rev) in enumerate(tail_window):
+                        ok = _replay(users[offset + k], orig, final)
+                        if k == len(tail_window) - 1:
+                            last_replayed = ok
+                    if last_replayed and tail_window and tail_window[-1][2] < self._ctx.revision:
+                        last_orig = tail_window[-1][0]
+                        tail = self._ctx.render_context_tail()
+                        final = f"{last_orig}\n\n{tail}" if (last_orig and tail) else (last_orig or tail)
+                        items[users[-1]] = llm.ChatMessage(role="user", content=[final])
+                        self._ctx.rewrite_last_applied_tail(last_orig, final)
                 self._ctx.prune_applied_tails(keep=len(users))
                 copy.items = items
                 chat_ctx = copy
