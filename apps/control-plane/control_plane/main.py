@@ -385,7 +385,16 @@ async def tts_preview(payload: dict) -> Response:
                 body = resp.json()
                 audio_hex = (body.get("data") or {}).get("audio") or ""
                 if not audio_hex:
-                    raise HTTPException(status_code=502, detail=f"minimax empty: {body.get('base_resp')}")
+                    base_resp = body.get("base_resp") or {}
+                    code = base_resp.get("status_code")
+                    if code == 2054:
+                        # 无效音色 ID(如本地 Qwen3 克隆名/过期 id)逐句 beep 的根源;
+                        # 直接点明,唔再抛看不懂的 502 "minimax empty"。
+                        raise HTTPException(
+                            status_code=400,
+                            detail="MiniMax 音色 ID 无效（voice id not exist）：请从音色列表中选择，或核对粘贴的 ID。",
+                        )
+                    raise HTTPException(status_code=502, detail=f"minimax empty: {base_resp}")
                 pcm = bytes.fromhex(audio_hex)
         else:
             async with httpx.AsyncClient(timeout=60) as client:
