@@ -124,10 +124,11 @@ function LiveAgentPanel({ room }: { room: Room | null }) {
             showMoodLabel
           />
         </div>
-        {/* 官方失败态显性化:agent/会话失败不能只显示一个「失败」点,把原因亮出来。 */}
-        {failureReasons.length > 0 && (
+        {/* 官方失败态显性化:agent/会话失败不能只显示一个「失败」点,把原因亮出来。
+            useAgent 未连接会话时 failureReasons 可能为 null——空值守卫,避免开页即崩。 */}
+        {(failureReasons?.length ?? 0) > 0 && (
           <div className="max-w-[420px] text-center text-xs text-red-500">
-            连接失败：{failureReasons.join("；")}
+            连接失败：{(failureReasons ?? []).join("；")}
           </div>
         )}
       </div>
