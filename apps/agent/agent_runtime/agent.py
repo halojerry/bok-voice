@@ -1668,7 +1668,19 @@ async def entrypoint(ctx):
         # 文本仍入 chat_ctx(say add_to_chat_ctx 默认 True)——预热任务照抓它作
         # assistant 轮,turn-1 前缀命中不变。
         greetings = {"zh": "请问有什么可以帮您？", "cantonese": "請問有咩可以幫到你？", "en": "How can I help you?"}
-        await session.say(greetings.get(greet_lang, greetings["zh"]))
+        # 开场白=话术第 1 步 ref 首行直念(变量已替换):用户在模板里配嘅开场即所念,
+        # 改模板下一通即生效;三语模板各自第 1 步就係各语言开场(三语都引用话术)。
+        # 模板语言与通话语言唔一致、或第 1 步变量缺失(渲染后仍剩 {占位}) →
+        # 退回通用语(语言/音色一致性优先,唔会念出「请问係咪{姓名}」)。
+        opening = ""
+        if flow_ctrl.has_steps and (template or {}).get("language") == greet_lang:
+            opening = flow_ctrl.opening_text()
+        # 开场已念(模板句或通用句都算) → 标记 + 重渲染当前步尾部:首条 user 尾部
+        # 此时尚未冻结,turn-1 即带上【开场已念】提示,LLM 唔会再重复开场/问身份。
+        flow_ctrl.opening_played = True
+        await session.say(opening or greetings.get(greet_lang, greetings["zh"]))
+        if flow_ctrl.has_steps:
+            context_state.set_flow_current(flow_ctrl.current_step_text())
         _log_stage("greeting_queued")
     # ---- 会话首轮真实前缀预热（LLM_PREFIX_PREWARM，默认 1）--------------------
     # context_state/persona/flow 已装配完（前缀字节就此定形）、session 已建——

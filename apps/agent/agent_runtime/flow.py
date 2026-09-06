@@ -110,10 +110,14 @@ def object_vars(object_card: dict | None) -> dict[str, str]:
     return {
         "姓名": name,
         "名字": name,
+        "name": name,
         "快递单号": digits_to_cantonese(tracking),
         "快递尾号": digits_to_cantonese(tail),
         "物流公司": courier,
         "快递公司": courier,
+        "courier": courier,
+        # EN 模板占位用英文名:尾号保留阿拉伯数字(英文 TTS 直读,粤语汉字会读错)。
+        "tracking_tail": tail,
         "收货地址": address,
         "地址": address,
         "电话": digits_to_cantonese(phone),
@@ -468,6 +472,9 @@ class FlowController:
     steps: list[FlowStep] = field(default_factory=list)
     current: int = 0  # 0-based;== len(steps) 表示流程已走完
     closing: bool = False  # 客户明确拒绝/告别 → 收尾态:只讲收尾话术,唔再推进
+    # 开场白已直念(session.say) → current_step_text 加「勿重复开场」提示;
+    # paused 起动(冇开场白)时保持 False,LLM 自己补第 1 步。
+    opening_played: bool = False
 
     @classmethod
     def from_template(cls, template: dict | None, object_card: dict | None) -> "FlowController":
@@ -543,6 +550,23 @@ class FlowController:
         g = render_template_text(s.goal, self.vars_map) if s.goal else s.ref
         return g
 
+    def opening_text(self) -> str:
+        """开场白原文:第 1 步 ref 的首个非空行(变量已替换)——开场直念给 TTS。
+
+        步骤 ref 里「\\n如果客户…→ 就…」係畀 LLM 睇嘅分支指引,唔准念出声 →
+        只取首行。渲染后仍剩 {占位} = 变量缺失 → 返回空串(上层退通用开场白,
+        唔会念出「请问係咪{姓名}」)。冇流程返回空串。
+        """
+        if not self.has_steps:
+            return ""
+        s = self.steps[0]
+        rendered = render_template_text(s.ref or s.goal, self.vars_map)
+        for line in rendered.splitlines():
+            line = line.strip()
+            if line and not re.search(r"\{[^{}]+\}", line):
+                return line
+        return ""
+
     def current_step_text(self) -> str:
         """渲染当前步(含变量替换)给本轮 system;流程完成则空;收尾态则注入收尾话术。"""
         if self.closing:
@@ -556,6 +580,11 @@ class FlowController:
             )
         step = self.steps[self.current]
         lines = [f"流程第 {self.current + 1}/{len(self.steps)} 步"]
+        if self.current == 0 and self.opening_played:
+            lines.append(
+                "【开场已念】上一句 assistant 就係开场白原文(开场直念,已入对话史),"
+                "毋需重复开场或再问一次身份——直接听客户回应接话。"
+            )
         if self._just_advanced and self.current > 0:
             lines.append(
                 "【新一步】客户啱啱确认咗上一步，而家已经进入呢一步。"
@@ -572,7 +601,8 @@ class FlowController:
             "客户问及后续可先简短回应再把话题带回当前步。"
             "参考要点是内部指示,用自己的口语讲,绝不把原文整段念出来,也不要把方案/金额一次倒光;"
             "「如果客户…→ 就…」呢類分支只在出现对应情况时照做,绝不把「如果」指示念给客户。"
-            "不要索取电话/WhatsApp/微信等联系方式,除非当前步参考明确要你加(如引导加办理专员);"
+            "不要索取电话/WhatsApp/微信等联系方式,除非当前步参考明确要求"
+            "(如向客户索取佢嘅 WhatsApp/微信号码,由我哋专员添加);"
             "核实资料用选项式引导(「你係咪喺拼多多、淘寶定京東買㗎?」),客户答到关键资料就确认并自然过渡,不无限追问。"
         )
         if _is_identity_verification_step(step.goal, step.ref):
