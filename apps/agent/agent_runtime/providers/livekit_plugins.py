@@ -3553,6 +3553,22 @@ _ASR_SENTENCE_MIN_CHARS = 6
 # 限速:两次句级提交最少间隔(「好。係。唔該。」连珠句防机关枪式连发,
 # 排队语义=剩余文本并入下一边界或 VAD 停嘴整句兜底)。
 _ASR_SENTENCE_MIN_INTERVAL_S = 1.5
+
+
+def _pause_commit_min_chars() -> int:
+    """vad-pause 路径提交的字数下限（默认 10 > 标点路径 6）。
+
+    微停顿（≥0.45s）只证明「喘了口气」，证明唔了「一句话讲完」——6-9 字碎片
+    （「你邊個啊。」）被当整轮提交，回复 TTS 出声前就被下一碎片新轮掐死
+    （碎片提交饿死回复）。扣住后说话继续则并入下个边界、真停嘴则整句 finish
+    兜底，轮唔会丢。QWEN3_ASR_PAUSE_COMMIT_MIN_CHARS=6 回退旧行为。
+    （借鉴 KoljaB/RealtimeVoiceChat turndetect 的语义端点思想：提交前先看
+    「像唔像说完」；官方 audio turn detector v1-mini 属架构级换件，另评估。）
+    """
+    try:
+        return int(os.environ.get("QWEN3_ASR_PAUSE_COMMIT_MIN_CHARS", "10"))
+    except ValueError:
+        return 10
 # VAD 微停顿候选句尾部的弱停顿符：滑窗 partial 说话期句尾只打逗号（p6 实测），
 # 停嘴高精度 finish 会升级成句号——提交时剥掉弱尾符，让已提交前缀与 finish
 # 整句做 startswith 匹配时唔会因「，vs。」错位（错位会触发 rfind 兜底返回
@@ -3897,7 +3913,9 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         - 稳定性：上一窗同坐标已是同一句段（首现唔提交，防滑窗跳变 flicker）；
         - 限速：距上次提交 < _ASR_SENTENCE_MIN_INTERVAL_S 唔提交（连珠句防机关枪）。
         allow_eos=True（VAD 微停顿触发）：标点扫描无果时，边界候选=当前滑窗文本
-        末尾（pause≥0.45s 唔使标点都係句边界）。稳定性用 prefix 级——上一窗剩余
+        末尾（pause≥0.45s 唔使标点都係句边界）。字数门槛比标点路径高
+        （_pause_commit_min_chars，默认 10）——微停顿只证明喘气，6-9 字碎片当
+        整轮提交会被下一碎片掐掉在途回复。稳定性用 prefix 级——上一窗剩余
         係当前剩余的严格前缀（已确认部分零改写）即过：静音期通常只有一窗重解，
         EOS 时刻最后一窗往往刚把句尾字补齐，严格相等会错过真实停顿。首窗该区间
         为空（prev_rem 空）唔提交——零跨窗证据唔赌。
@@ -3938,7 +3956,7 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
             sentence = text[start:].rstrip(_PAUSE_TRAILING_WEAK_PUNCT)
             prev_rem = prev_full[start:].rstrip(_PAUSE_TRAILING_WEAK_PUNCT)
             if (
-                len(sentence) >= _ASR_SENTENCE_MIN_CHARS
+                len(sentence) >= _pause_commit_min_chars()
                 and not _has_latin_or_digit_run(sentence)
                 and prev_rem
                 and sentence.startswith(prev_rem)
