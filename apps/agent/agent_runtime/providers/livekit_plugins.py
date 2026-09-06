@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import os
 import re
 import time
+import unicodedata
 from dataclasses import dataclass
 
 import httpx
@@ -3531,6 +3533,20 @@ _PAUSE_TRAILING_WEAK_PUNCT = "，、；：,;…—~～ \t"
 # finish 整句的「。佢聽日…」剩余唔应该带住句号开头进字幕/下一轮）。
 _UNCOMMITTED_LEADING_WEAK_PUNCT = _PAUSE_TRAILING_WEAK_PUNCT + "。！？!?"
 
+# finish 整句与已提交文本「重解修正」判定阈值：去标点归一化后相似度 ≥ 此值，
+# 视作同一段话的更好转写 → 唔补发迟到 FINAL。补发会在框架 on_final_transcript
+# 里 _interrupt_by_audio_activity() 掐死生成中的回复（call-58601bba 实测：
+# 「这是我的牌」修正成「这是我的快递」补发 FINAL，gen=25 token 的回复被弃、
+# 零音频零转写、8s 后心跳顶替——「每问无答」的另一根因）。
+_ASR_REDECODE_DROP_RATIO = 0.55
+
+
+def _strip_punct_space(s: str) -> str:
+    """去标点与空白，只留正字——重解修正/续句的归一化对齐用。"""
+    return "".join(
+        ch for ch in s if not ch.isspace() and not unicodedata.category(ch).startswith("P")
+    )
+
 
 def sentence_commit_enabled() -> bool:
     """句级提交总门:QWEN3_ASR_SENTENCE_COMMIT(默认 1)且框架轮次判定=stt。
@@ -3902,11 +3918,16 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         return None
 
     def _uncommitted(self, text: str) -> str:
-        """去掉已句级提交前缀后的剩余文本；坐标失配逐级回退，兜底原样返回。
+        """去掉已句级提交前缀后的剩余文本；坐标失配逐级回退，重解修正丢弃。
 
         主路径 startswith（滑窗是同一会话累积解码，已稳定前缀极少改写）；改写过
-        就用最后提交句 rfind 定位（容前缀改写）；再唔准（极端跳变）原样返回——
-        宁可字幕/抢跑短暂冗余，都唔丢未提交尾巴（停嘴 FINAL 由同函数兜底）。
+        就用最后提交句 rfind 定位（容前缀改写）；再唔准就分「重解修正」定「真续
+        句」：归一化（去标点/空白）后 committed 係 finish 前缀 → 真续句，按归一
+        化对齐截 raw 尾（标点改写唔算新内容）；相似度 ≥_ASR_REDECODE_DROP_RATIO
+        → 同一段话的更好重解，返回 ""（唔补发）——迟到 FINAL 会喺框架
+        on_final_transcript 里 _interrupt_by_audio_activity() 掐死生成中的回复
+        （call-58601bba 实证，见 _ASR_REDECODE_DROP_RATIO 注）；极端跳变（低相
+        似）原样返回兜底旧行为。
         剩余头部的弱停顿符照例剥掉（vad-pause 提交剥了「，」尾、finish 整句以
         「。」续写——剩余唔应该带住句号/逗号开头；只剥标点唔动正字）。
         """
@@ -3918,6 +3939,26 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
             pos = text.rfind(self._last_sentence)
             if pos >= 0:
                 return text[pos + len(self._last_sentence):].lstrip(_UNCOMMITTED_LEADING_WEAK_PUNCT)
+        norm_c = _strip_punct_space(self._committed_text)
+        norm_t = _strip_punct_space(text)
+        if norm_c and norm_t.startswith(norm_c):
+            # 归一化对齐截尾：raw 里跳过标点/空白食掉 norm_c 长度的正字，剩余係真尾巴。
+            need = len(norm_c)
+            aligned_idx = -1
+            for i, ch in enumerate(text):
+                if ch.isspace() or unicodedata.category(ch).startswith("P"):
+                    continue
+                need -= 1
+                if need == 0:
+                    aligned_idx = i
+                    break
+            return text[aligned_idx + 1:].lstrip(_UNCOMMITTED_LEADING_WEAK_PUNCT) if aligned_idx >= 0 else ""
+        if difflib.SequenceMatcher(a=norm_c, b=norm_t).ratio() >= _ASR_REDECODE_DROP_RATIO:
+            print(
+                f"QWEN3_ASR_REDECODE_DROP committed={self._committed_text!r} finish={text!r}",
+                flush=True,
+            )
+            return ""
         return text
 
     async def _finish_session(self) -> tuple[str, str]:

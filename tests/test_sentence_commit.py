@@ -796,3 +796,41 @@ def test_vad_pause_short_tail_after_commit_not_reemitted(monkeypatch):
         ("FINAL_TRANSCRIPT", "我想查下我張單"),
         ("END_OF_SPEECH", ""),
     ], got
+
+
+def test_uncommitted_redecode_correction_dropped_and_continuation_kept():
+    """重解修正 vs 真续句：修正丢弃（迟到 FINAL 会掐死生成中回复，call-58601bba）、
+    续句照发、极端跳变兜底原样返回。"""
+
+    async def body():
+        stream = _make_stream()
+        try:
+            # 重解修正：vad-pause 提交「这是我的牌。」、finish 修正「这是我的快递。」
+            # ——同一段话的更好转写，唔补发（补发=迟到 FINAL → 框架
+            # on_final_transcript → _interrupt_by_audio_activity() 杀回复）。
+            stream._committed_text = "这是我的牌。"
+            stream._last_sentence = "这是我的牌。"
+            assert stream._uncommitted("这是我的快递。") == ""
+        finally:
+            await _close(stream)
+
+        stream2 = _make_stream()
+        try:
+            # 极端跳变（相似度低于阈值）→ 唔当修正，原样返回（兜底旧行为）
+            stream2._committed_text = "喂喂喂。"
+            stream2._last_sentence = "喂喂喂。"
+            assert stream2._uncommitted("这是我的快递。") == "这是我的快递。"
+        finally:
+            await _close(stream2)
+
+        stream3 = _make_stream()
+        try:
+            # 标点改写的真续句：归一化对齐截尾，≥6 字尾巴照发（真第二句）
+            stream3._committed_text = "你好。"
+            stream3._last_sentence = "你好。"
+            assert stream3._uncommitted("你好。") == ""
+            assert stream3._uncommitted("你好，请问係咪林总？") == "请问係咪林总？"
+        finally:
+            await _close(stream3)
+
+    asyncio.run(body())
