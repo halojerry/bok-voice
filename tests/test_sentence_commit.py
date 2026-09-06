@@ -823,7 +823,7 @@ def test_partial_dedupe_window_syncs_prev(monkeypatch):
 
 
 def test_vad_pause_short_tail_after_commit_not_reemitted(monkeypatch):
-    """打断自噬修复：pause-commit 后 <6 字短尾（「係。」）唔补发第二条 FINAL——
+    """打断自噬修复：pause-commit 后 <6 字纯语气短尾（「係。」）唔补发第二条 FINAL——
     否则新用户轮会把生成中未出声的回复 interrupt 掉（每问无答→心跳顶替）。"""
     got, stream = _run_vad_stop(
         monkeypatch,
@@ -836,6 +836,35 @@ def test_vad_pause_short_tail_after_commit_not_reemitted(monkeypatch):
         ("FINAL_TRANSCRIPT", "唔該你幫我查下我張單"),
         ("END_OF_SPEECH", ""),
     ], got
+
+
+def test_vad_pause_digit_short_tail_kept(monkeypatch):
+    """内容豁免（2026-09-07）：pause-commit 后停嘴补报的数字短尾（「四五七。」）
+    照发成轮——旧行为整段丢弃会吞号码；回复被新轮掐掉但新轮带真内容，AI 直接回应。"""
+    got, stream = _run_vad_stop(
+        monkeypatch,
+        last_partial="唔該你幫我查下我張單，",
+        prev_partial="唔該你幫我查下我張單，",
+        finish_text="唔該你幫我查下我張單。四五七。",
+    )
+    assert got == [
+        ("START_OF_SPEECH", ""),
+        ("FINAL_TRANSCRIPT", "唔該你幫我查下我張單"),
+        ("END_OF_SPEECH", ""),
+        ("FINAL_TRANSCRIPT", "四五七。"),
+    ], got
+
+
+def test_tail_carries_content_unit():
+    """_tail_carries_content 纯函数：数字/字母 run 与实词=True，纯语气=False。"""
+    assert lp._tail_carries_content("四五七。") is True
+    assert lp._tail_carries_content("我唔知。") is True
+    assert lp._tail_carries_content("ok sir") is True
+    assert lp._tail_carries_content("係。") is False
+    assert lp._tail_carries_content("嗯嗯。") is False
+    assert lp._tail_carries_content("好呀。") is False
+    assert lp._tail_carries_content("。") is False
+    assert lp._tail_carries_content("") is False
 
 
 def test_uncommitted_redecode_correction_dropped_and_continuation_kept():

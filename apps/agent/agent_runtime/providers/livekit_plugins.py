@@ -3682,6 +3682,24 @@ def _strip_punct_space(s: str) -> str:
     )
 
 
+# 纯应承字表：短尾逐字都落喺呢个集 → 判纯语气（唔补发）；有任何集外字 → 真内容。
+_PURE_ACK_TAIL_CHARS = frozenset("好係系是嗯哦喔啊得呀对啱啦喎喽咯嘛哈唉哎欸噢唔咩呀啦")
+
+
+def _tail_carries_content(s: str) -> bool:
+    """停嘴 <6 字短尾是否带真内容（纯函数，单测用）。
+
+    True=数字/字母 run（补报的「四五七。」、英文词）或任何纯应承字表外的实词
+    （「我唔知。」的「我」「知」）→ 短尾豁免照发成轮；False=逐字纯应承
+    （「係。」「嗯嗯。」）→ 照旧丢弃（打断自噬保护）。"""
+    t = _strip_punct_space(s)
+    if not t:
+        return False
+    if re.search(r"[0-9A-Za-z]{2,}", t):
+        return True
+    return any(ch not in _PURE_ACK_TAIL_CHARS for ch in t)
+
+
 def sentence_commit_enabled() -> bool:
     """句级提交总门:QWEN3_ASR_SENTENCE_COMMIT(默认 1)且框架轮次判定=stt。
 
@@ -3826,11 +3844,14 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                     committed_before = self._committed_text
                     payload = self._uncommitted(text) if (text and committed_before) else text
                     # 短尾唔补发第二条 FINAL（打断自噬修复，2026-09-05 粤语实测）：
-                    # pause-commit 刚提交半句、回复生成中，紧跟的 <6 字短尾（「係。」）
-                    # 若再发一条 FINAL → 新用户轮把未出声的回复 interrupt 掉 → 每问
-                    # 无答、8s 后心跳顶替。短尾信息量低，丢弃（停嘴整句兜底仍在）；
-                    # ≥6 字尾句可能係真第二句，照发。
-                    if committed_before and payload and len(payload) < _ASR_SENTENCE_MIN_CHARS:
+                    # pause-commit 刚提交半句、回复生成中，紧跟的 <6 字纯语气短尾
+                    # （「係。」「嗯。」）若再发一条 FINAL → 新用户轮把未出声的
+                    # 回复 interrupt 掉 → 每问无答、8s 后心跳顶替——纯语气词照丢
+                    # （信息量低）；**带内容的短尾豁免**（2026-09-07）：数字/字母
+                    # 串（「四五七。」补报单号）或任何实词（「我唔知。」）照发成轮
+                    # ——回复被新轮掐掉但新轮带着真内容，AI 直接回应它，好过吞掉
+                    # 号码/答复（「说两句第二句被吞→AI 不回话」的根因）。
+                    if committed_before and payload and len(payload) < _ASR_SENTENCE_MIN_CHARS and not _tail_carries_content(payload):
                         payload = ""
                     started = False
                     self._finishing = False
