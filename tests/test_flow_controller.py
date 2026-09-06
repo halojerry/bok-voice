@@ -11,6 +11,7 @@ from agent_runtime.flow import (  # noqa: E402
     FlowController,
     decide_advance,
     facts_line,
+    object_vars,
     parse_steps,
     render_template_text,
 )
@@ -499,3 +500,50 @@ def test_should_auto_advance_never_on_refuse():
     from agent_runtime.flow import REFUSE, should_auto_advance
     assert should_auto_advance(current=0, goal="开场", ref="r", user_text="唔需要", verdict=REFUSE) is False
     assert should_auto_advance(current=1, goal="引导办理", ref="r", user_text="唔需要", verdict=REFUSE) is False
+
+
+def test_opening_text_first_line_with_vars():
+    # 开场白=第 1 步 ref 首行(变量已替换);「如果客户…」分支指引係畀 LLM 睇,唔会念出声。
+    steps_json = (
+        '[{"goal":"确认身份","ref":"您好，请问是{姓名}吗？我们是{物流公司}，'
+        '有个包裹单号尾号{快递尾号}运输途中丢失了，想跟您核对一下。\\n'
+        '如果客户不记得 → 提他下单时填的地址帮他回忆"},{"goal":"说明方案","ref":"以一赔二"}]'
+    )
+    fc = FlowController.from_template({"steps_json": steps_json}, OBJ)
+    opening = fc.opening_text()
+    assert opening.startswith("您好，请问是林先生吗？")
+    assert "顺丰" in opening and "七八九零" in opening
+    assert "如果客户" not in opening and "\n" not in opening
+
+
+def test_opening_text_missing_var_returns_empty():
+    # 变量缺失(渲染后仍剩 {占位}) → 空串:上层退通用开场白,唔会念出「{姓名}」。
+    fc = FlowController.from_template(
+        {"steps_json": '[{"goal":"g","ref":"您好，请问是{姓名}吗？"}]'}, {}
+    )
+    assert fc.opening_text() == ""
+
+
+def test_opening_text_no_steps_empty():
+    assert FlowController.from_template(None, OBJ).opening_text() == ""
+
+
+def test_current_step_opening_played_note():
+    # 开场直念后:第 1 步注入「勿重复开场」提示;推进到第 2 步后提示消失;
+    # paused 起动(冇开场白,flag=False)就唔注入,LLM 自己补第 1 步。
+    fc = FlowController.from_template(
+        {"steps_json": '[{"goal":"开场","ref":"r1"},{"goal":"方案","ref":"r2"}]'}, OBJ
+    )
+    assert "开场已念" not in fc.current_step_text()
+    fc.opening_played = True
+    assert "开场已念" in fc.current_step_text()
+    fc.advance()
+    assert "开场已念" not in fc.current_step_text()
+
+
+def test_object_vars_en_aliases():
+    # EN 模板占位 {name}/{courier}/{tracking_tail}:尾号保留阿拉伯数字(英文 TTS 直读)。
+    v = object_vars(OBJ)
+    assert v["name"] == "林先生"
+    assert v["courier"] == "顺丰"
+    assert v["tracking_tail"] == "7890"
