@@ -310,12 +310,21 @@ class MlxLlmLLM(_OpenAICompatBase):
     async def _prewarm_impl(self) -> None:
         # 真实 1-token 生成：暖 mlx 模型（冷启动的 KV 分配/首 token 占首包大头）。
         # 官方 prewarm 只验连接；AgentSession 构造时会自动调用本钩子。
+        # 文本须 >11 token：mlx_lm 0.31.3 server 对 has_thinking 模型固定
+        # rfind_think_start(prompt, start=len-11)，prompt 更短时负数索引直接
+        # IndexError（包成 404 "list index out of range"）——Hy-MT2 实证，
+        # warmup 因此整年白跳。
         if os.environ.get("LLM_WARMUP", "1") != "1":
             return
         try:
             await self._client.chat.completions.create(
                 model=self._opts.model,
-                messages=[{"role": "user", "content": "hi"}],
+                messages=[
+                    {
+                        "role": "user",
+                        "content": "Hello, this is a warmup request to the local model, please ignore.",
+                    }
+                ],
                 max_tokens=1,
             )
             print("[agent] llm warmup done", flush=True)
