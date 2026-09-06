@@ -137,7 +137,10 @@ def _build_tts_provider(tts_cfg: dict, target_lang: str):
         # 设置页没配/被过滤掉的分语言音色用验证过的默认(各语种母语音色,口音不串)。
         voice_map.setdefault("zh", "Chinese (Mandarin)_News_Anchor")
         voice_map.setdefault("cantonese", "Cantonese_crisp_news_anchor_vv2")
-        voice_map.setdefault("en", "male_english_speaker")
+        # EN 默认音色 2026-09-07 换:旧 male_english_speaker 已被 MiniMax 下线
+        # （每轮 2054 voice id not exist → 目标侧整轮静音,B 线 E2E 实证）,
+        # 换成 minimax-voices.ts 里 preview 验证过的 English_magnetic_voiced_man。
+        voice_map.setdefault("en", "English_magnetic_voiced_man")
         os.environ.setdefault("MINIMAX_MODEL", "speech-2.6-turbo")
         # language_boost 锁目标语,防源语音夹词时合成语种漂移;值是 MiniMax API
         # 的外部枚举字面量(术语门禁白名单单点),唔系语言字段命名。
