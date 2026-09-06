@@ -82,6 +82,7 @@ def _make_tts():
 
 def test_pool_hit_skips_connect_and_replenishes(monkeypatch):
     """池有热连接 → 合成不再 websockets.connect；收尾后台补池成功。"""
+    monkeypatch.setenv("MINIMAX_WS_MODE", "classic")  # 池是 classic 专属机制
     hot = _FakeWS([_CONNECTED, _STARTED])
     monkeypatch.setattr(lp, "_MINIMAX_POOL_WS", hot)
     monkeypatch.setattr(lp, "_MINIMAX_POOL_KEY", (lp.MiniMaxTTS._ENDPOINT_WS_CN, "test-key"))
@@ -121,6 +122,7 @@ def test_pool_hit_skips_connect_and_replenishes(monkeypatch):
 
 def test_pool_stale_falls_back_to_fresh(monkeypatch, capsys):
     """池连接已被服务端静默关闭 → 弃池重连一次，合成照常出（failure-safe）。"""
+    monkeypatch.setenv("MINIMAX_WS_MODE", "classic")  # 池是 classic 专属机制
     stale = _FakeWS(dead=True)
     monkeypatch.setattr(lp, "_MINIMAX_POOL_WS", stale)
     monkeypatch.setattr(lp, "_MINIMAX_POOL_KEY", (lp.MiniMaxTTS._ENDPOINT_WS_CN, "test-key"))
@@ -217,6 +219,7 @@ def test_pool_pop_rejects_key_mismatch_and_ttl(monkeypatch):
 
 def test_perf_breakdown_marker(monkeypatch, capsys):
     """首包分解打点：TTS_FIRST_AUDIO_MS + MINIMAX_TTS_WS_PERF(connect/首音频/全程)。"""
+    monkeypatch.setenv("MINIMAX_WS_MODE", "classic")  # classic 流的 PERF 行
     ws = _FakeWS([_CONNECTED, _STARTED, _AUDIO])
     monkeypatch.setattr(lp, "_MINIMAX_POOL_WS", ws)
     monkeypatch.setattr(lp, "_MINIMAX_POOL_KEY", (lp.MiniMaxTTS._ENDPOINT_WS_CN, "test-key"))
