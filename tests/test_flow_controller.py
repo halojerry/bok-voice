@@ -578,3 +578,25 @@ def test_done_confirm_no_reask():
     assert "毋需再问" in cur
     fc.last_verdict = "question"
     assert "毋需再问" not in fc.current_step_text()
+
+
+# ---- WS1 总览带各步事实(2026-09-07) ----
+
+
+def test_flow_overview_includes_step_fact_lines():
+    fc = FlowController.from_template(
+        {
+            "steps_json": (
+                '[{"goal":"开场核对","ref":"您好，请问是{courier}的件吗？\\n如果客户否认→记录"},'
+                '{"goal":"理赔说明","ref":"我们有保险，会一赔二。"}]'
+            )
+        },
+        OBJ,
+    )
+    ov = fc.flow_overview()
+    # 每步带 ref 首行事实——客户问细节时模型手头有话术事实可引用
+    assert "我们有保险，会一赔二" in ov
+    # 分支指引(第二行)唔进总览
+    assert "如果客户否认" not in ov
+    # 确定性:两次渲染字节一致(KV 前缀安全)
+    assert ov == fc.flow_overview()

@@ -648,15 +648,34 @@ class FlowController:
     def flow_overview(self) -> str:
         """流程总览(注入基础 system,让 LLM 知道全貌但不照读)。
 
-        为 1.5s 延迟预算瘦身 prefill：后续步只保留「第N步:目标」一行标题/要点，
-        不再带每步参考长文（当前步全文由 current_step_text 注入）。LLM 只需知道
-        大致顺序与"下一步"方向，细节按轮给。
+        2026-09-07 恢复带各步事实：旧瘦身只留「第N步:目标」标题，客户问赔偿
+        细节/到账时间时模型手头只有当前步 ref、其它步的事实不在场——verdict
+        指引叫它「用话术事实回答」也无米炊，只能复读当前步（「只跟话术不会
+        灵活回应」主因）。现在每步带 ref 首行（该步真正要讲的内容，截 60 字），
+        +400-700 token 属每通一次 prefill（LLM_PREFIX_PREWARM 首轮预热吸收，
+        之后缓存命中）。总览装配时一次定格、整场字节不变——严格前缀安全。
         """
         if not self.has_steps:
             return ""
-        lines = [f"对话按 {len(self.steps)} 步流程推进,每步等用户确认后再进下一步:"]
-        lines += self.overview_goal_lines()
+        lines = [f"对话按 {len(self.steps)} 步流程推进,每步等用户确认后再进下一步.各步要点(可引用其中事实回答客户):"]
+        for i, s in enumerate(self.steps, 1):
+            g = render_template_text(s.goal, self.vars_map) if s.goal else s.ref
+            line = f"第{i}步:{g}"
+            fact = self._step_fact_line(s)
+            if fact:
+                line += f"——{fact}"
+            lines.append(line)
         return "\n".join(lines)
+
+    def _step_fact_line(self, s: "FlowStep") -> str:
+        """该步 ref 首个非空行(变量已渲染,分支指引「\\n如果客户…」唔算)——
+        截 60 字作总览里该步的事实摘要。"""
+        rendered = render_template_text(s.ref or "", self.vars_map)
+        for line in rendered.splitlines():
+            line = line.strip()
+            if line and not re.search(r"\{[^{}]+\}", line):
+                return line[:60]
+        return ""
 
     def overview_goal_lines(self) -> list[str]:
         """淨係「第N步:目標」嘅行,畀推進判定器當 roadmap。"""
