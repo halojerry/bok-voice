@@ -1406,7 +1406,10 @@ async def entrypoint(ctx):
             # (preemptive 先于本钩子)。凡本轮实质改变回复语境(推进/收尾),
             # 就向 turn_ctx 落一个步骤标记——框架的抢跑校验按 chat_ctx 快照比较,
             # 见变化即作废旧抢跑、按新语境重建;无变化轮不落标记,白拿抢跑提速。
-            # mlx prompt cache 按最长公共前缀匹配,追加只增增量 token,唔伤 KV。
+            # ⚠️ 标记只准留在框架侧做失效触发,绝不能进 mlx 请求流:它是本轮一次性
+            # 消息(下轮历史无此标记),进请求会令下一轮喺同一位置分叉 → cached 钉死
+            # system 锚点、每轮全量重 prefill、TTFT 随轮次 1.2s→8.5s(指纹实证
+            # call-b882cd69)。ContextAwareLLM.chat 出口统一剥离(见 livekit_plugins)。
             def _invalidate_stale_preemptive(reason: str) -> None:
                 try:
                     turn_ctx.add_message(role="system", content=f"[流程状态] {reason}")
@@ -1483,6 +1486,9 @@ async def entrypoint(ctx):
                     from .flow import should_auto_advance
 
                     verdict = flow_ctrl.rule_verdict(user_text)
+                    # verdict 进尾部:规则判定结果此前只用于推进、从不进提示词,
+                    # 客户提问/答非所问时模型冇「该怎么答」指引 → 复读当前步。
+                    flow_ctrl.last_verdict = verdict
                     if verdict == REFUSE:
                         # 客户明确拒绝/告别 → 收尾态:注入收尾话术(一句礼貌再见),
                         # 唔推进/唔 judge/唔按步走;讲完后 _schedule_call_end 主动结束通话

@@ -969,17 +969,37 @@ class ContextAwareLLM(llm.LLM):
                     tail_window = applied[-len(users):] if len(applied) >= len(users) else []
                     offset = len(users) - len(tail_window)
                     last_replayed = False
+                    last_orig = tail_window[-1][0] if tail_window else ""
                     for k, (orig, final, _rev) in enumerate(tail_window):
                         ok = _replay(users[offset + k], orig, final)
+                        if not ok and k == len(tail_window) - 1:
+                            # 转写被修正(提交文本≠账本 orig):按当前文本+当前尾部
+                            # 重冻结重锚定——跳过会令该轮连尾部都丢(回复冇步骤语境),
+                            # 且账本 orig 永远对不上、其后每轮 replay 全跳过。
+                            actual = _text_of(items[users[offset + k]])
+                            tail = self._ctx.render_context_tail()
+                            rebased = f"{actual}\n\n{tail}" if (actual and tail) else (actual or tail)
+                            items[users[offset + k]] = llm.ChatMessage(role="user", content=[rebased])
+                            last_orig = actual
+                            self._ctx.rewrite_last_applied_tail(actual, rebased)
+                            ok = True
                         if k == len(tail_window) - 1:
                             last_replayed = ok
                     if last_replayed and tail_window and tail_window[-1][2] < self._ctx.revision:
-                        last_orig = tail_window[-1][0]
                         tail = self._ctx.render_context_tail()
                         final = f"{last_orig}\n\n{tail}" if (last_orig and tail) else (last_orig or tail)
                         items[users[-1]] = llm.ChatMessage(role="user", content=[final])
                         self._ctx.rewrite_last_applied_tail(last_orig, final)
                 self._ctx.prune_applied_tails(keep=len(users))
+                # 剔除框架一次性步骤标记([流程状态] system):它只服务抢跑失效判定,
+                # 本轮在、下轮无 → 进了请求流会令下一轮喺同一位分叉,cached 钉死
+                # 锚点、每轮全量重 prefill(TTFT 1.2s→8.5s 回归根因,call-b882cd69
+                # 指纹实证)。标记在框架侧已完成任务(快照比对→作废旧抢跑)。
+                items = [
+                    it
+                    for it in items
+                    if not (getattr(it, "role", "") == "system" and str(_text_of(it)).startswith("[流程状态]"))
+                ]
                 copy.items = items
                 chat_ctx = copy
         return self._inner.chat(
