@@ -343,6 +343,14 @@ async def entrypoint(ctx) -> None:
 
     ctx.add_shutdown_callback(_shutdown)
 
+    # 官方姿势显式 connect:1.8 的 session.start 只把 ctx.connect 挂成后台任务
+    # (agent_session.py "automatically connect"),而 RoomIO 建 legacy 转写输出时
+    # 会同步访问 room.local_participant——本 worker 传了 RoomInputOptions
+    # .participant_identity 必走该路径,不先 connect 必抛 "cannot access local
+    # participant before connecting"、job 秒崩(同传零反应根因,2026-09-06)。
+    # A 线没传 participant_identity 提前 return 才侥幸不炸。
+    await ctx.connect()
+
     await session.start(
         room=room,
         agent=Agent(instructions=_translation_instructions(source_lang, target_lang)),
