@@ -903,3 +903,21 @@ def test_uncommitted_redecode_correction_dropped_and_continuation_kept():
             await _close(stream3)
 
     asyncio.run(body())
+
+
+def test_vad_pause_punct_path_fragment_also_gated(monkeypatch):
+    """碎片门必须覆盖标点分支：9 字带句号 partial（「好，我想了解一下。」）从
+    punct 扫描返回（≥6），vad-pause 调用点要再套 10 字门拦住——否则话音未落
+    提前成轮，回复被自家尾巴掐死（2026-09-07 multi_turn E2E 实证）。停嘴
+    finish 整句照达。"""
+    got, stream = _run_vad_stop(
+        monkeypatch,
+        last_partial="好，我想了解一下。",
+        prev_partial="好，我想了解一下。",
+        finish_text="好，我想了解一下。还有什么可以帮你？",
+    )
+    assert got == [
+        ("START_OF_SPEECH", ""),
+        ("END_OF_SPEECH", ""),
+        ("FINAL_TRANSCRIPT", "好，我想了解一下。还有什么可以帮你？"),
+    ], got
