@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps" / "agent"))
 
 from agent_runtime.flow import (  # noqa: E402
     FlowController,
+    _digit_runs_in,
     decide_advance,
     facts_line,
     object_vars,
@@ -640,3 +641,23 @@ def test_short_ack_on_statement_step_renders_reask_guidance():
     fc.last_verdict = v
     assert v == "unclear"
     assert "换个说法简短再引导" in fc.current_step_text()
+
+
+# ---- WS4 数字读回核对(2026-09-07) ----
+
+
+def test_digit_runs_in_extracts_normalized_runs():
+    assert _digit_runs_in("我的单号是一二三四") == ["1234"]
+    assert _digit_runs_in("尾号7890，电话98765432") == ["7890", "98765432"]
+    assert _digit_runs_in("没有数字") == []
+
+
+def test_last_digits_render_readback_guidance():
+    fc = FlowController.from_template(
+        {"steps_json": '[{"goal":"g1","ref":"r1"},{"goal":"g2","ref":"r2"}]'}, OBJ
+    )
+    fc.last_digits = ["1234"]
+    cur = fc.current_step_text()
+    assert "逐位复述核对" in cur and "1234" in cur
+    fc.last_digits = []
+    assert "逐位复述核对" not in fc.current_step_text()

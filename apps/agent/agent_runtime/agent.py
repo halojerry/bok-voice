@@ -1527,12 +1527,15 @@ async def entrypoint(ctx):
             # 流程推进:读用户最新话,判定是否进入下一步,更新"当前步"约束注入。
             if flow_ctrl.has_steps:
                 try:
-                    from .flow import should_auto_advance
+                    from .flow import should_auto_advance, _digit_runs_in
 
                     verdict = flow_ctrl.rule_verdict(user_text)
                     # verdict 进尾部:规则判定结果此前只用于推进、从不进提示词,
                     # 客户提问/答非所问时模型冇「该怎么答」指引 → 复读当前步。
                     flow_ctrl.last_verdict = verdict
+                    # 数字串进尾部:数字係 ASR 最弱项,渲染「逐位复述核对」指引,
+                    # 唔复核错号就一直错落去。
+                    flow_ctrl.last_digits = _digit_runs_in(user_text)
                     if verdict == REFUSE:
                         # 客户明确拒绝/告别 → 收尾态:注入收尾话术(一句礼貌再见),
                         # 唔推进/唔 judge/唔按步走;讲完后 _schedule_call_end 主动结束通话

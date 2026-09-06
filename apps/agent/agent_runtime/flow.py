@@ -314,6 +314,20 @@ def _valid_digit_runs(norm: str) -> list[str]:
     return [r for r in re.findall(r"[0-9]{6,13}", norm)]
 
 
+def _digit_runs_in(text: str) -> list[str]:
+    """每轮客户话里的数字串(≥4 位,汉字/英文数字词已归一成 ASCII)——读回核对指引用。
+
+    唔同 _valid_digit_runs(WhatsApp 语义,6 位起),呢度只要 4 位就算「客戶報咗數字」:
+    单号尾号常係 4 位,转写出错也最伤。逐 run 归一(唔成段归一,免得两串数字被拼成一条)。"""
+    runs = re.findall(r"[0-9一二三四五六七八九零]{4,}", str(text or ""))
+    out: list[str] = []
+    for r in runs:
+        nv = _digit_normalize(r)[:13]
+        if nv and nv not in out:
+            out.append(nv)
+    return out
+
+
 def _run_is_known_number(run: str, facts: dict | None) -> bool:
     """号码 run 命中已知 单号/尾号/电话 → 客户係覆述已知资料,唔係俾新 WhatsApp。"""
     if not facts:
@@ -493,6 +507,10 @@ class FlowController:
     # 判定、从不进提示词,客户提问/答非所问时模型冇「该怎么答」指引 → 4B 默认
     # 复读当前步。current_step_text 据此渲染对应应答指引。
     last_verdict: str = ""
+    # 最近一轮客户报出的数字串(≥4 位,已归一成 ASCII)——数字係 ASR 最弱项
+    # (同一串数字两窗两解,2026-09-07 日志实证),AI 拿到错号从不复核。
+    # current_step_text 据此渲染「逐位复述核对」指引。agent.py 钩子每轮写入。
+    last_digits: list[str] = field(default_factory=list)
 
     @classmethod
     def from_template(cls, template: dict | None, object_card: dict | None) -> "FlowController":
@@ -645,6 +663,12 @@ class FlowController:
         if verdict_line:
             lines.append(verdict_line)
             self._just_advanced = False
+        if self.last_digits:
+            digits_txt = "、".join(self.last_digits[:2])
+            lines.append(
+                f"【客户报了数字（{digits_txt}）】语音转写数字容易出错：先把数字逐位复述核对一次"
+                "（例如「三四——四四」，两位一组慢慢念），客户确认无误才继续；核对不符请客户重报。"
+            )
         if step.goal:
             lines.append(f"这一步要达成:{render_template_text(step.goal, self.vars_map)}")
         if step.ref:
