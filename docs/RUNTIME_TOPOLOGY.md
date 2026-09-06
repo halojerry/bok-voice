@@ -16,8 +16,8 @@
 | MT LLM（可选） | :1236 OpenAI 兼容 | B 线同传专用翻译（Hy-MT2 小模型，逐句无状态；模型缺失自动跳过 → B 线回退 :1235） | Mac=mlx_lm | 模型 → app-data/models |
 | B-line worker | :8790 WS | 同传通道：ASR→翻译→TTS 队列 / 背压 | 内嵌 Node | 指标 → app-data/translation-metrics.jsonl |
 | LiveKit server | :7880 WS/WebRTC | RTC 信令与媒体（7881/7882 RTC 端口） | 内嵌二进制 | keys → 内嵌 livekit.yaml |
-| agent worker | 进程 | A 线智能体（VAD/对话/情绪/打断） | 打包 Python | 调 8787/8788/1235/8000 |
-| interpreter worker ×2 | 进程 | B 线双 AgentSession 同传（`bok-interp-fwd/rev` 显式分发） | 打包 Python | 调 8787/8788/1236(MT,回退 1235)/8000；TTS=MiniMax 云(或本地 8788) |
+| agent worker | 进程（健康 :8081/worker） | A 线智能体（VAD/对话/情绪/打断） | 打包 Python | 调 8787/8788/1235/8000 |
+| interpreter worker ×2 | 进程（健康 :8082 fwd / :8083 rev） | B 线双 AgentSession 同传（`bok-interp-fwd/rev` 显式分发） | 打包 Python | 调 8787/8788/1236(MT,回退 1235)/8000；TTS=MiniMax 云(或本地 8788) |
 
 ### 音频设备（设置页）
 
@@ -84,7 +84,10 @@ RoomAgentDispatch(metadata={call_id})精确派发;CP /api/token 即官方 TokenS
 endpoint 契约({serverUrl, participantToken},201),官方 SDK 可直连。
 interpreter worker:bok serve 起 2 个常驻进程(interp-fwd/rev,agent_name
 bok-interp-fwd/rev 显式分发,方向语言对+精确 identity 由 me 端 token 的
-RoomAgentDispatch metadata 下发;无房间时空闲,job 到达才拉管线)
+RoomAgentDispatch metadata 下发;无房间时空闲,job 到达才拉管线)。
+三个 livekit-agents worker 健康端口显式分拆(A 线 8081/interp 8082·8083,
+WorkerOptions.port)——默认同为 8081 会竞态,后绑者 Errno 48 即崩
+("Agent did not join the room" 根因,2026-09-06)。
 旧 v1(/translate + WS :8790)冻结保留作 POC,不再迭代。
 ```
 

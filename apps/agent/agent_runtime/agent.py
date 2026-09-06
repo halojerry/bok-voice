@@ -1721,4 +1721,7 @@ def run_agent() -> None:
         sys.argv.append("start")
     # 显式分发(官方推荐):worker 只接 agent_name="bok-voice" 的 job——由 CP
     # /api/token 挂 RoomAgentDispatch 精确派发;不再隐式接所有房间(含同传房)。
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name="bok-voice"))
+    # port 显式钉 8081(prod status 探活 :8081/worker):A/B 线三个 worker 并存,
+    # 不分端口会同抢默认 8081,后绑者 Errno 48 即崩("Agent did not join the
+    # room" 根因,2026-09-06 实证)。
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name="bok-voice", port=8081))
