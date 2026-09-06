@@ -412,7 +412,12 @@ def run_interpreter() -> None:
     # livekit-agents 1.7.x 的 cli.run_app 需要显式子命令(start),与 A 线 run_agent 同。
     if len(sys.argv) == 1:
         sys.argv.append("start")
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name=f"bok-interp-{direction}"))
+    # 与 A 线 main(8081)并存须分端口:三 worker 同抢默认 8081,后绑者 Errno 48
+    # 即崩(A 线输掉竞态时每通通话 "Agent did not join the room")。
+    ports = {"fwd": 8082, "rev": 8083}
+    cli.run_app(
+        WorkerOptions(entrypoint_fnc=entrypoint, agent_name=f"bok-interp-{direction}", port=ports[direction])
+    )
 
 
 if __name__ == "__main__":
