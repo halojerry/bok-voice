@@ -463,8 +463,26 @@ def cmd_status() -> int:
     return 0
 
 
+def _rotate_log(logfile: Path, max_bytes: int = 50 * 1024 * 1024, keep: int = 3) -> None:
+    """stdout 日志大小轮转（>50MB 归档 .1/.2/.3,留 3 代）——dev 栈日志此前
+    无限增长,审计回溯既要留痕也要可磁盘承载（2026-09-07 审计闭环）。"""
+    try:
+        if not logfile.exists() or logfile.stat().st_size < max_bytes:
+            return
+        for i in range(keep - 1, 0, -1):
+            src = logfile.with_suffix(logfile.suffix + f".{i}")
+            dst = logfile.with_suffix(logfile.suffix + f".{i + 1}")
+            if src.exists():
+                dst.write_bytes(src.read_bytes())
+        logfile.with_suffix(logfile.suffix + ".1").write_bytes(logfile.read_bytes())
+        logfile.write_bytes(b"")
+    except Exception:
+        pass
+
+
 def _start_proc(args: list[str], pidfile: Path, logfile: Path, env: dict | None = None, cwd: str | Path | None = None) -> int:
     pidfile.parent.mkdir(parents=True, exist_ok=True)
+    _rotate_log(logfile)
     merged = dict(os.environ)
     # 子进程日志实时可见（写到文件时 stdout 默认块缓冲，会吞掉关键启动日志）。
     merged.setdefault("PYTHONUNBUFFERED", "1")
