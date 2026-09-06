@@ -547,3 +547,34 @@ def test_object_vars_en_aliases():
     assert v["name"] == "林先生"
     assert v["courier"] == "顺丰"
     assert v["tracking_tail"] == "7890"
+
+
+def test_current_step_verdict_guidance():
+    """verdict 感知指引:question/unclear/objection 各有应答指引(治复读当前步),
+    confirm 冇额外指引(由【新一步】接管)。"""
+    fc = FlowController.from_template({"steps_json": '[{"goal":"g1","ref":"r1"},{"goal":"g2","ref":"r2"}]'}, OBJ)
+    fc.last_verdict = "question"
+    cur = fc.current_step_text()
+    assert "客户在提问" in cur and "绝不重复你上一句" in cur
+    fc.last_verdict = "unclear"
+    assert "回应不明确" in fc.current_step_text()
+    fc.last_verdict = "objection"
+    assert "客户有疑虑" in fc.current_step_text()
+    fc.last_verdict = "confirm"
+    assert "客户在提问" not in fc.current_step_text()
+    # 空 verdict(会话首轮)无指引
+    fc2 = FlowController.from_template({"steps_json": '[{"goal":"g1","ref":"r1"}]'}, OBJ)
+    assert "客户在提问" not in fc2.current_step_text()
+
+
+def test_done_confirm_no_reask():
+    """话术走完 + 客户刚确认 → 注入「毋需再问已答过的事」,治 WhatsApp 号码
+    确认后逐字再问一遍(0f4df710 实证)。"""
+    fc = FlowController.from_template({"steps_json": '[{"goal":"g1","ref":"r1"}]'}, OBJ)
+    fc.advance()
+    assert fc.done
+    fc.last_verdict = "confirm"
+    cur = fc.current_step_text()
+    assert "毋需再问" in cur
+    fc.last_verdict = "question"
+    assert "毋需再问" not in fc.current_step_text()
