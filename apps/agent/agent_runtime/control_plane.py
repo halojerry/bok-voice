@@ -53,6 +53,7 @@ class ControlPlaneClient:
         emotion: str = "",
         provider: str = "",
         latency_ms: int = 0,
+        language: str = "",
     ) -> None:
         await self._client.post(
             f"/api/calls/{call_id}/turns",
@@ -62,6 +63,7 @@ class ControlPlaneClient:
                 "emotion": emotion,
                 "provider": provider,
                 "latency_ms": latency_ms,
+                "language": language,
             },
         )
 

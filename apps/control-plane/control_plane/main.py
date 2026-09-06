@@ -660,8 +660,28 @@ async def _disconnect_livekit_room(room_name: str) -> None:
 
 
 @app.post("/api/calls/{call_id}/turns")
-def add_turn(call_id: str, role: str, transcript: str, emotion: str = "") -> dict:
-    turn = TurnEvent(trace_id=call_id, call_id=call_id, turn_id=f"t{len(_repo().get_turns(call_id))}", role=role, transcript=transcript, emotion=emotion)
+def add_turn(
+    call_id: str,
+    role: str,
+    transcript: str,
+    emotion: str = "",
+    provider: str = "",
+    latency_ms: int = 0,
+    language: str = "",
+) -> dict:
+    # 2026-09-07:provider/latency_ms 此前被静默丢弃（审计缺口）——agent 侧
+    # 本来就在发,现在真落库,每轮一行可查询延迟档案。
+    turn = TurnEvent(
+        trace_id=call_id,
+        call_id=call_id,
+        turn_id=f"t{len(_repo().get_turns(call_id))}",
+        role=role,
+        transcript=transcript,
+        emotion=emotion,
+        provider=provider,
+        latency_ms=latency_ms,
+        language=language,
+    )
     return _repo().create_turn(turn)
 
 
@@ -725,6 +745,34 @@ def get_settlement(call_id: str) -> dict:
 @app.get("/api/calls/{call_id}/turns")
 def get_turns(call_id: str) -> list[dict]:
     return [turn.__dict__ for turn in _repo().get_turns(call_id)]
+
+
+@app.get("/api/calls/{call_id}/metrics")
+def get_call_metrics(call_id: str) -> dict:
+    """每通通话延迟档案:p50/p95 latency_ms + 轮数/语言分布（审计闭环 T3）。"""
+    import statistics as _stats
+
+    turns = _repo().get_turns(call_id)
+    lat = sorted(t.latency_ms for t in turns if t.latency_ms)
+
+    def _pct(q: float) -> int:
+        # 最近秩百分位:lat 升序,ceil(q*n)-1
+        if not lat:
+            return 0
+        import math as _math
+
+        return lat[max(0, _math.ceil(q * len(lat)) - 1)]
+
+    langs: dict[str, int] = {}
+    for t in turns:
+        if t.language:
+            langs[t.language] = langs.get(t.language, 0) + 1
+    return {
+        "call_id": call_id,
+        "turns": len(turns),
+        "latency_ms": {"p50": _pct(0.5), "p95": _pct(0.95), "max": lat[-1] if lat else 0, "n": len(lat)},
+        "languages": langs,
+    }
 
 
 def _write_settlement_docs(call: dict, turns: list[dict], result: dict) -> None:
@@ -824,6 +872,40 @@ async def settle(call_id: str) -> dict:
         mode=CallMode(call.get("mode", "simulation")),
     )
     result = app.state.settlement.build_result(session, turns)
+    # usage_records 落一笔（2026-09-07 审计闭环:表此前无写入者）。数据取自
+    # session_report 的真实 llm_usage(有)或轮数估算(无),重复 settle 幂等跳过
+    # ——写失败只告警不阻结算。
+    try:
+        import json as _json
+        from bok_voice_business_db.models import UsageRecord
+
+        sr_raw = call.get("session_report") or ""
+        tokens = 0
+        try:
+            tokens = int((_json.loads(sr_raw) or {}).get("llm_usage", {}).get("total_tokens") or 0)
+        except Exception:
+            tokens = 0
+        if not tokens:
+            tokens = len(turns) * 300
+        if not _repo().get_usage_record(call_id):
+            _repo().session.add(
+                UsageRecord(
+                    id=f"usage:{call_id}",
+                    account_id=call["account_id"],
+                    call_id=call_id,
+                    provider="local",
+                    kind="call",
+                    units=len(turns),
+                    tokens=tokens,
+                    audio_seconds=0.0,
+                    latency_ms=0,
+                    cost_estimate=0.0,
+                    status="ok",
+                )
+            )
+            _repo().session.commit()
+    except Exception as exc:  # pragma: no cover
+        print(f"[settle] usage_record write skipped: {exc!r}", flush=True)
     # 总结/沉淀：用本机 LLM 生成总结正文 + 新话题 + 全局洞察（失败回退纯指标）。
     try:
         from .summarize import Summarizer
