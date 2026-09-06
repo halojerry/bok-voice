@@ -596,7 +596,13 @@ def _effective_providers(settings: dict) -> dict:
 
 @app.get("/api/calls")
 def list_calls(account_id: str = "acc-001", status: str = "") -> list[dict]:
-    return _repo().list_calls(account_id, status)
+    calls = _repo().list_calls(account_id, status)
+    stats = _repo().turn_stats()
+    for c in calls:
+        st = stats.get(c.get("id") or "", {})
+        c["turn_count"] = st.get("turns", 0)
+        c["avg_latency_ms"] = st.get("avg_latency_ms", 0)
+    return calls
 
 
 @app.get("/api/calls/{call_id}")

@@ -44,34 +44,38 @@ def read_wav_pcm(path: Path, max_seconds: float = 10.0) -> bytes:
 
 
 def sample_processes() -> dict[str, dict]:
-    """按进程名聚合 RSS(KB)/线程数/fd 数。"""
+    """按进程名聚合 RSS(KB)/线程数/fd 数（macOS 兼容:ps 无 nlwp 列,线程用 ps -M）。"""
     out: dict[str, dict] = {}
     try:
         ps = subprocess.run(
-            ["ps", "-axo", "pid,rss,nlwp,command"], capture_output=True, text=True, timeout=15
+            ["ps", "-axo", "pid,rss,command"], capture_output=True, text=True, timeout=15
         ).stdout
     except Exception:
         return out
     for line in ps.splitlines()[1:]:
-        parts = line.strip().split(None, 3)
-        if len(parts) < 4:
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
             continue
-        pid, rss, nlwp, cmd = parts
+        pid, rss, cmd = parts
         tag = next((w for w in WATCH if w in cmd), None)
         if not tag:
             continue
         d = out.setdefault(tag, {"rss": 0, "threads": 0, "fds": 0, "pids": []})
         try:
             d["rss"] += int(rss)
-            d["threads"] += int(nlwp)
             d["pids"].append(pid)
         except ValueError:
             continue
     for tag, d in out.items():
         for pid in d["pids"]:
             try:
-                fds = subprocess.run(["lsof", "-p", pid], capture_output=True, text=True, timeout=20).stdout
-                d["fds"] += sum(1 for _ in fds.splitlines()) - 1
+                ml = subprocess.run(["ps", "-M", "-p", pid], capture_output=True, text=True, timeout=10).stdout
+                d["threads"] += max(0, len(ml.strip().splitlines()) - 1)
+            except Exception:
+                pass
+            try:
+                fds = subprocess.run(["lsof", "-p", pid], capture_output=True, text=True, timeout=15).stdout
+                d["fds"] += max(0, len(fds.strip().splitlines()) - 1)
             except Exception:
                 pass
     return out
