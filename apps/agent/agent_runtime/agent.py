@@ -1162,27 +1162,28 @@ async def entrypoint(ctx):
     # （见下方 greeting 块），这里只定義任务体。
     if _prefix_prewarm_enabled() and isinstance(_raw_llm, MlxLlmLLM) and instructions:
 
-        async def _prefix_prewarm_task(agent_ref) -> None:
+        async def _prefix_prewarm_task(agent_ref, greeting_text: str = "") -> None:
             import time as _t2
 
             try:
-                # 抓真实开场白文本（生成完成即入 chat_ctx；播不打紧）——
-                # 预热形状必须含它，turn-1 才命中到 assistant 轮末。
-                greeting_text = ""
-                for _ in range(12):
-                    try:
-                        its = list(getattr(agent_ref, "chat_ctx", None).items or [])
-                    except Exception:
-                        its = []
-                    for it in reversed(its):
-                        if getattr(it, "role", "") == "assistant":
-                            greeting_text = str(
-                                getattr(it, "text_content", "") or getattr(it, "raw_text_content", "") or ""
-                            ).strip()
+                # 预热形状必须含开场白 assistant 轮,turn-1 才命中到 assistant 轮末。
+                # greeting_text 由调用方直传(开场白直念文本,装配时已知);为空才
+                # 回退抓 chat_ctx 最新 assistant 轮(兼容旧路径)。
+                if not greeting_text:
+                    for _ in range(12):
+                        try:
+                            its = list(getattr(agent_ref, "chat_ctx", None).items or [])
+                        except Exception:
+                            its = []
+                        for it in reversed(its):
+                            if getattr(it, "role", "") == "assistant":
+                                greeting_text = str(
+                                    getattr(it, "text_content", "") or getattr(it, "raw_text_content", "") or ""
+                                ).strip()
+                                break
+                        if greeting_text:
                             break
-                    if greeting_text:
-                        break
-                    await asyncio.sleep(0.25)
+                        await asyncio.sleep(0.25)
                 msgs = _build_prefix_prewarm_messages(context_state, instructions, greeting_text)
                 _pw0 = _t2.monotonic()
                 await _raw_llm.prefix_prewarm(msgs)
@@ -1665,8 +1666,7 @@ async def entrypoint(ctx):
         # 开场白脚本直念(session.say,不加 LLM):旧 generate_reply(instructions)
         # 的临时 system 指令下轮即剥,是会话第一个 KV-cache 前缀断裂点,且冷启
         # TTFT 2-3.4s 全灌在开场白上。直念即点即播(纯 TTS,~100ms 出声);
-        # 文本仍入 chat_ctx(say add_to_chat_ctx 默认 True)——预热任务照抓它作
-        # assistant 轮,turn-1 前缀命中不变。
+        # 文本仍入 chat_ctx(say add_to_chat_ctx 默认 True),turn-1 前缀命中不变。
         greetings = {"zh": "请问有什么可以帮您？", "cantonese": "請問有咩可以幫到你？", "en": "How can I help you?"}
         # 开场白=话术第 1 步 ref 首行直念(变量已替换):用户在模板里配嘅开场即所念,
         # 改模板下一通即生效;三语模板各自第 1 步就係各语言开场(三语都引用话术)。
@@ -1675,25 +1675,25 @@ async def entrypoint(ctx):
         opening = ""
         if flow_ctrl.has_steps and (template or {}).get("language") == greet_lang:
             opening = flow_ctrl.opening_text()
-        # 开场已念(模板句或通用句都算) → 标记 + 重渲染当前步尾部:首条 user 尾部
-        # 此时尚未冻结,turn-1 即带上【开场已念】提示,LLM 唔会再重复开场/问身份。
+        # 开场已念(模板句或通用句都算) → 标记 + 先把【开场已念】写进尾部再起预热:
+        # 首条 user 尾部此时尚未冻结,保证预热形状 == turn-1 请求形状。
         flow_ctrl.opening_played = True
-        await session.say(opening or greetings.get(greet_lang, greetings["zh"]))
         if flow_ctrl.has_steps:
             context_state.set_flow_current(flow_ctrl.current_step_text())
-        _log_stage("greeting_queued")
-    # ---- 会话首轮真实前缀预热（LLM_PREFIX_PREWARM，默认 1）--------------------
-    # context_state/persona/flow 已装配完（前缀字节就此定形）、session 已建——
-    # fire-and-forget 发一个「真实 prompt 形状」的 1-token 请求：把 merged system
-    # 前缀烧进 mlx prompt cache，turn-1 真请求 cached≈system 长度，免 ~1.4s 全量
-    # prefill（p6：会话首轮 TTFT 2.1-3.2s、cached=0 是延迟台账最差档）。
-    # 触发点=开场白之后：冷启动时预热若排在 greeting prefill 前面，会把开场白
-    # TTFT 拖慢一整个 prefill（实测 7.3s vs ~2s 基线）；greeting 本身就会把
-    # system 前缀烧进 cache，预热只需在「客户开口前」补齐 [system+user 形状]
-    # 的边界——greeting playout（几秒）足够它跑完。paused（无 greeting）时立即发。
-    # 绝不阻塞会话：asyncio.create_task + 异常全吞（失败只损失预热）。
-    if _prefix_prewarm_armed:
-        asyncio.create_task(_prefix_prewarm_task(agent))
+        greeting_text = opening or greetings.get(greet_lang, greetings["zh"])
+        # 预热与开场白并行:开场白=纯 TTS(云 MiniMax),预热走本地 LLM prefill,
+        # 互无争抢——旧顺序 say() 要等整段念完才返回(话术开场白 7-11s),预热被
+        # 拖到最后,客户在开场白中途插话的 turn-1 只能全量 prefill(~2-4s TTFT)。
+        # paused(无开场白)分支在下方立即发(无开场白形状)。
+        if _prefix_prewarm_armed:
+            asyncio.create_task(_prefix_prewarm_task(agent, greeting_text))
+        await session.say(greeting_text)
+        # say() 返回=整段念完(playout end),唔係出声时刻——TTS 首包在 say 调用后
+        # ~0.4s 就到了(2026-09-06 打点纠偏,旧名 greeting_queued 曾误读为出声慢)。
+        _log_stage("greeting_playout_done")
+    elif _prefix_prewarm_armed:
+        # paused 起动无开场白:立即按「无开场白」形状预热(任务体回退抓 chat_ctx)。
+        asyncio.create_task(_prefix_prewarm_task(agent, ""))
 
     # session.start 只负责拉起流水线（返回后会话在后台运行）。保持 entrypoint
     # 存活直到房间关闭，supervisor watcher 在此期间持续轮询；_on_close 置位

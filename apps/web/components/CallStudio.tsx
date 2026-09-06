@@ -684,11 +684,16 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
         if (isTauriShell()) await applyOutputDevice(outputDeviceId).catch(() => {});
         else if (webCanSwitchOutput()) await switchWebOutputDevice(session.room, outputDeviceId).catch(() => {});
       }
-      // 连接前预缓冲：建房/agent join 需 1-2s，用户此时可能已开口（喂你好），
-      // preConnectBuffer 把这段采集缓冲在连接后回放给 agent，避免「接通吃头字」。
-      // （agent 侧 1.7.1 的 pre_connect_audio 默认已开。）
-      await session.room.localParticipant.setMicrophoneEnabled(true, undefined, { preConnectBuffer: true }).catch(() => {});
-      await session.start({ tracks: { microphone: { enabled: true } } });
+      // 连接前预缓冲 + 接通一步到位:麦克风采集放进 session.start 的 tracks
+      // (与 token/连房并行,gum 即刻返回,连接完成后发布落地)。旧写法先在
+      // 未连接的房间上 await setMicrophoneEnabled(preConnectBuffer)——发布要等
+      // 连接、连接又等这行返回,互相等死到 livekit 内部 ~15s 超时才放行,
+      // 即「首次接通 15.3s」根因(2026-09-06 浏览器探针实测:token 晚发 15.1s,
+      // 三通真实通话同款 15.3-15.6s;旧 preConnectBuffer 语义不变,仍在
+      // 连接完成前采集缓冲,agent 不吃头字)。
+      await session.start({
+        tracks: { microphone: { enabled: true, publishOptions: { preConnectBuffer: true } } },
+      });
       setInitHintUntil(Date.now() + 8000);
       // 确保本地麦克风真正发布：session.start 的 tracks 选项在部分 livekit 版本不生效，
       // 显式 setMicrophoneEnabled 才可靠（否则 agent 收不到用户声音 → 对话"没输入"）。
