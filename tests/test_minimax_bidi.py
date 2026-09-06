@@ -353,15 +353,16 @@ def test_param_change_rebuilds_session(monkeypatch):
 
 
 def test_mode_env_default_classic(monkeypatch):
-    """MINIMAX_WS_MODE 缺省 = classic:流类型/池路径零变化;bidi 只选入生效。"""
-    monkeypatch.setenv("MINIMAX_WS_MODE", "classic")
-    tts = _make_tts()
-    assert tts._ws_mode() == "classic"
-    assert tts._endpoint_ws() == MiniMaxTTS._ENDPOINT_WS_CN
-
+    """MINIMAX_WS_MODE 缺省 = bidi(2026-09-07 翻默认);classic 显式回退仍可用。"""
     monkeypatch.delenv("MINIMAX_WS_MODE", raising=False)
+    tts = _make_tts()
+    assert tts._ws_mode() == "bidi", "缺省必须 bidi(服务端攒句防碎裂)"
+    assert tts._endpoint_ws_bidi() == MiniMaxTTS._ENDPOINT_WS_BIDI_CN
+
+    monkeypatch.setenv("MINIMAX_WS_MODE", "classic")
     tts2 = _make_tts()
-    assert tts2._ws_mode() == "classic", "缺省必须 classic(未验证前零行为变化)"
+    assert tts2._ws_mode() == "classic", "classic 保留 env 回退"
+    assert tts2._endpoint_ws() == MiniMaxTTS._ENDPOINT_WS_CN
 
     monkeypatch.setenv("MINIMAX_WS_MODE", "bidi")
     tts3 = _make_tts()
@@ -375,8 +376,56 @@ def test_mode_env_default_classic(monkeypatch):
         monkeypatch.setenv("MINIMAX_WS_MODE", "classic")
         assert isinstance(_make_tts().stream(), lp._MiniMaxSynthesizeStream)
         monkeypatch.delenv("MINIMAX_WS_MODE", raising=False)
-        assert isinstance(_make_tts().stream(), lp._MiniMaxSynthesizeStream)
+        assert isinstance(_make_tts().stream(), lp._MiniMaxBidiStream), "缺省=bidi 流"
         monkeypatch.setenv("MINIMAX_WS_MODE", "bidi")
         assert isinstance(_make_tts().stream(), lp._MiniMaxBidiStream)
 
     asyncio.run(asyncio.wait_for(pick(), timeout=5))
+
+
+# ---- 2026-09-07 bidi 翻默认批：emotion 自动匹配 + continuous_sound 实验档 ----
+
+
+def test_emotion_auto_by_default(monkeypatch):
+    """缺省不指定 emotion:MiniMax 按文本自动匹配(官方文档建议+官方插件 None 默认)。"""
+    monkeypatch.delenv("MINIMAX_EMOTION", raising=False)
+    tts = _make_tts()
+    assert tts._resolve_emotion() is None, "缺省必须 None(自动),唔係 mood 映射"
+    setting = tts._ws_voice_setting("male-qn-qingse")
+    assert "emotion" not in setting, "自动档下 voice_setting 唔应带 emotion 键"
+    assert setting["voice_id"] == "male-qn-qingse" and setting["pitch"] == 0
+
+
+def test_emotion_map_env_restores_old_behavior(monkeypatch):
+    """MINIMAX_EMOTION=map 恢复 mood→emotion 映射旧行为;枚举值直透。"""
+    from agent_runtime.plugins.emotion import EmotionState
+
+    monkeypatch.setenv("MINIMAX_EMOTION", "map")
+    tts = _make_tts()
+    tts._emotion_state = EmotionState(mood="happy")
+    assert tts._resolve_emotion() == "happy"
+    assert "emotion" in tts._ws_voice_setting("v")
+
+    monkeypatch.setenv("MINIMAX_EMOTION", "calm")
+    assert tts._resolve_emotion() == "calm", "非 map 枚举值直透"
+
+
+def test_continuous_sound_env_injected(monkeypatch):
+    """MINIMAX_CONTINUOUS_SOUND=1 → task_start 带 continuous_sound=True;缺省完全不带键。"""
+    monkeypatch.delenv("MINIMAX_CONTINUOUS_SOUND", raising=False)
+    tts = _make_tts()
+    payload = tts._task_start_payload("male-qn-qingse", 24000)
+    assert "continuous_sound" not in payload, "缺省=官方默认(false),唔带键"
+
+    monkeypatch.setenv("MINIMAX_CONTINUOUS_SOUND", "1")
+    payload_on = tts._task_start_payload("male-qn-qingse", 24000)
+    assert payload_on.get("continuous_sound") is True
+
+
+def test_continuous_sound_in_params_key(monkeypatch):
+    """continuous_sound 入会话指纹:env 变 → 重建会话(参数不一致唔许残留)。"""
+    monkeypatch.delenv("MINIMAX_CONTINUOUS_SOUND", raising=False)
+    tts = _make_tts()
+    key_off = tts._bidi_params_key()
+    monkeypatch.setenv("MINIMAX_CONTINUOUS_SOUND", "1")
+    assert tts._bidi_params_key() != key_off, "env 开关应变指纹触发重建"

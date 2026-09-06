@@ -1487,14 +1487,21 @@ class MiniMaxTTS(tts.TTS):
     _ENDPOINT_WS_BIDI_INTL = "wss://api.minimax.chat/ws/v1/t2a_v2_bidi"
 
     def _ws_voice_setting(self, voice: str) -> dict:
-        """任务级 voice_setting（三条合成路径共用同一构造,避免漏 emotion/pitch）。"""
-        return {
+        """任务级 voice_setting（三条合成路径共用同一构造,避免漏 pitch/漂移）。
+
+        emotion 由 _resolve_emotion 决定:None(自动匹配,默认)时**整个键不下发**
+        ——MiniMax 枚举校验吃不了空串,且缺键=模型按文本自动选情绪。
+        """
+        setting: dict = {
             "voice_id": voice,
             "speed": float(os.environ.get("MINIMAX_SPEED", "1")),
             "vol": float(os.environ.get("MINIMAX_VOL", "1")),
             "pitch": int(os.environ.get("MINIMAX_PITCH", "0")),
-            "emotion": self._resolve_emotion(),
         }
+        emotion = self._resolve_emotion()
+        if emotion:
+            setting["emotion"] = emotion
+        return setting
 
     def __init__(
         self,
@@ -1519,19 +1526,25 @@ class MiniMaxTTS(tts.TTS):
         self._key = api_key
         self._emotion_state = emotion_state
 
-    def _resolve_emotion(self) -> str:
-        """当前轮 mood → MiniMax emotion（task_start 整段一个情绪）。
+    def _resolve_emotion(self) -> str | None:
+        """emotion 策略(2026-09-07 翻默认):不指定 → MiniMax 按文本自动匹配。
 
-        之前没接 emotion → 全程 calm，听感很"平"。默认开；MINIMAX_EMOTION=0 可关。
+        官方文档明示「模型会根据输入文本自动匹配合适的情绪,一般无需手动指定」,
+        LiveKit 官方 minimax 插件默认 emotion=None 同款姿势;我们旧的 mood→emotion
+        映射(task_start 显式指定)是轮间语气跳变/不自然的放大器,已废为选入档。
+        MINIMAX_EMOTION: 不设=None(自动) | map=mood 映射旧行为 | calm 等枚举值直透。
         """
-        if os.environ.get("MINIMAX_EMOTION", "1") != "1":
-            return "calm"
-        if self._emotion_state is not None:
-            try:
-                return self._emotion_state.minimax_emotion()
-            except Exception:  # pragma: no cover - 情绪解析失败回落 calm
-                pass
-        return "calm"
+        raw = os.environ.get("MINIMAX_EMOTION", "").strip().lower()
+        if not raw:
+            return None
+        if raw == "map":
+            if self._emotion_state is not None:
+                try:
+                    return self._emotion_state.minimax_emotion()
+                except Exception:  # pragma: no cover - 情绪解析失败回落自动
+                    return None
+            return None
+        return raw
 
     def _endpoint(self) -> str:
         base = os.environ.get("MINIMAX_BASE_URL", "").strip()
@@ -1554,12 +1567,15 @@ class MiniMaxTTS(tts.TTS):
         return self._ENDPOINT_WS_INTL if region in {"intl", "global", "chat"} else self._ENDPOINT_WS_CN
 
     def _ws_mode(self) -> str:
-        """TTS 流式模式:classic(默认,一连接一任务) | bidi(持久连接,MINIMAX_WS_MODE=bidi 选入)。
+        """TTS 流式模式:bidi(默认,持久连接,服务端攒句) | classic(MINIMAX_WS_MODE=classic 回退)。
 
-        默认 classic——现状行为零变化;live 验证后由控制器翻默认。
+        默认 bidi(2026-09-07 翻默认):官方文档定位 t2a_v2_bidi 就是「LLM 流式输出
+        逐 token 转语音」——服务端自动攒句防碎裂(classic 客户端攒句/overlap 半句喂
+        正是「一句话连不起来、前后语气不一」根因)、task_cancel 打断后连接可续、
+        task_flush 催尾句。classic 保留 env 一键回退。
         """
-        mode = os.environ.get("MINIMAX_WS_MODE", "classic").strip().lower()
-        return mode if mode in ("classic", "bidi") else "classic"
+        mode = os.environ.get("MINIMAX_WS_MODE", "bidi").strip().lower()
+        return mode if mode in ("classic", "bidi") else "bidi"
 
     def _endpoint_ws_bidi(self) -> str:
         """bidi WebSocket 端点:复用 classic 的 region 逻辑,路径加 _bidi 后缀。
@@ -1608,7 +1624,16 @@ class MiniMaxTTS(tts.TTS):
             float(os.environ.get("MINIMAX_SPEED", "1")),
             float(os.environ.get("MINIMAX_VOL", "1")),
             int(os.environ.get("MINIMAX_PITCH", "0")),
+            self._continuous_sound(),
         )
+
+    def _continuous_sound(self) -> bool:
+        """continuous_sound 实验档(仅 speech-2.8-hd/turbo 生效,默认关=官方默认)。
+
+        true=模型侧不切分文本连续推理,长文本韵律更自然;false=切分并发推理,
+        延迟更低。MINIMAX_CONTINUOUS_SOUND=1 选入,韵律 vs 延迟 A/B 用。
+        """
+        return os.environ.get("MINIMAX_CONTINUOUS_SOUND", "0") == "1"
 
     def _task_start_payload(self, voice: str, sample_rate: int) -> dict:
         """bidi task_start 载荷：参数与 classic 同源（_ws_voice_setting 一套构造）。"""
@@ -1625,6 +1650,10 @@ class MiniMaxTTS(tts.TTS):
         boost = self._language_boost()
         if boost:
             start["language_boost"] = boost
+        # continuous_sound 实验档(仅 2.8 生效):true=模型侧不切分连续推理,
+        # 长文本韵律更自然。默认关(官方默认 false=切分并发,延迟低)。
+        if self._continuous_sound():
+            start["continuous_sound"] = True
         return start
 
     def _bidi_session(self) -> "_MiniMaxBidiSession":
@@ -1904,13 +1933,7 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
             start = {
                 "event": "task_start",
                 "model": self._tts_._model(),
-                "voice_setting": {
-                    "voice_id": voice,
-                    "speed": float(os.environ.get("MINIMAX_SPEED", "1")),
-                    "vol": float(os.environ.get("MINIMAX_VOL", "1")),
-                    "pitch": int(os.environ.get("MINIMAX_PITCH", "0")),
-                    "emotion": self._tts_._resolve_emotion(),
-                },
+                "voice_setting": self._tts_._ws_voice_setting(voice),
                 "audio_setting": {"sample_rate": sample_rate, "format": "pcm", "channel": 1},
                 # 官方参数:流式不回传聚合音频,显著降尾包体积与传输耗时。
                 "stream_options": {"exclude_aggregated_audio": True},
@@ -2553,6 +2576,7 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                 "t_last_audio": 0.0,
                 "stale_msgs": 0,
                 "stale_bytes": 0,
+                "sentences": 0,
             }
             t_flush = 0.0
             try:
@@ -2654,6 +2678,10 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                             self._canceled_evt.set()
                         elif event == "task_finished":
                             return
+                        elif event == "sentence_end":
+                            # 服务端实际切句数(连贯性观测:整轮回复应≈句数,
+                            # 远大于句数=服务端按长度强切,查标点是否被清洗)。
+                            state["sentences"] += 1
                         base = msg.get("base_resp") or {}
                         status = int(base.get("status_code") or 0)
                         if status == 2205:
@@ -2742,6 +2770,23 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                     print(
                         f"MINIMAX_TTS_BIDI_PERF flush_to_last_audio_ms="
                         f"{(state['t_last_audio'] - t_flush) * 1000:.0f}",
+                        flush=True,
+                    )
+                # 轮级汇总:服务端切句数/打断/首包(首声=距首条 task_continue)。
+                # 验收读数:典型 2-3 短句回复 sentences 应 2-4;first_audio_ms 稳定
+                # 在数百 ms 且方差小于 classic overlap 时代。
+                if state["t_last_audio"] > 0.0 and state["t_first_continue"] > 0.0:
+                    print(
+                        f"MINIMAX_BIDI_PERF sentences={state['sentences']} "
+                        f"canceled={int(self._canceled_evt.is_set())} "
+                        f"first_audio_ms="
+                        f"{(state['t_last_audio'] - state['t_first_continue']) * 1000:.0f}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"MINIMAX_BIDI_PERF sentences=0 "
+                        f"canceled={int(self._canceled_evt.is_set())} (no audio this turn)",
                         flush=True,
                     )
             except asyncio.CancelledError:
@@ -2862,13 +2907,7 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
             start = {
                 "event": "task_start",
                 "model": self._tts_._model(),
-                "voice_setting": {
-                    "voice_id": voice,
-                    "speed": float(os.environ.get("MINIMAX_SPEED", "1")),
-                    "vol": float(os.environ.get("MINIMAX_VOL", "1")),
-                    "pitch": int(os.environ.get("MINIMAX_PITCH", "0")),
-                    "emotion": self._tts_._resolve_emotion(),
-                },
+                "voice_setting": self._tts_._ws_voice_setting(voice),
                 "audio_setting": {"sample_rate": sample_rate, "format": "pcm", "channel": 1},
                 # 官方参数:流式不回传聚合音频,显著降尾包体积与传输耗时。
                 "stream_options": {"exclude_aggregated_audio": True},
@@ -2988,13 +3027,7 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
                     payload = {
                         "model": self._tts_._model(),
                         "text": _inject_pauses(self._text),
-                        "voice_setting": {
-                            "voice_id": voice,
-                            "speed": float(os.environ.get("MINIMAX_SPEED", "1")),
-                            "vol": float(os.environ.get("MINIMAX_VOL", "1")),
-                            "pitch": int(os.environ.get("MINIMAX_PITCH", "0")),
-                            "emotion": self._tts_._resolve_emotion(),
-                        },
+                        "voice_setting": self._tts_._ws_voice_setting(voice),
                         "audio_setting": {"sample_rate": sample_rate, "format": "pcm", "channel": 1},
                     }
                     # language_boost 与 WS 路径同源(env 注入,空则完全不带该键)。
