@@ -1778,6 +1778,46 @@ def _minimax_pool_schedule(endpoint: str, key: str) -> None:
     _MINIMAX_POOL_TASK = loop.create_task(_minimax_pool_replenish(endpoint, key))
 
 
+def _trim_lead_silence(
+    pcm: bytes,
+    sample_rate: int,
+    *,
+    max_ms: int = 200,
+    fade_ms: int = 15,
+    rms_gate: int = 120,
+) -> tuple[bytes, int]:
+    """剪掉 PCM(s16le mono) 头部静音；剪过才对新的起始做 fade_ms 线性淡入。
+
+    MiniMax 首包偶带前导静音，剪掉=可闻出声更早；剪口做淡入防咔哒声
+    （RealtimeTTS base_engine 的 trim_silence_start/apply_fade_in 同款，2026-09-07
+    借鉴）。max_ms 上限防误剪气声起句（RMS 低但係真语音）；一次调用最多剪
+    max_ms，残余静音留给下次首帧检查继续剪。零静音时原样返回（字节不变，
+    零害）。返回 (处理后 pcm, 剪掉的毫秒)。
+    """
+    frame = max(1, sample_rate // 50) * 2  # 20ms 字节数(s16le mono)
+    buf = pcm
+    trimmed_ms = 0
+    while len(buf) >= frame and trimmed_ms < max_ms:
+        n = frame // 2
+        acc = 0
+        for i in range(n):
+            v = int.from_bytes(buf[i * 2 : i * 2 + 2], "little", signed=True)
+            acc += v * v
+        if (acc / n) ** 0.5 >= rms_gate:
+            break
+        buf = buf[frame:]
+        trimmed_ms += 20
+    if not trimmed_ms:
+        return pcm, 0
+    nf = max(1, sample_rate * fade_ms // 1000)
+    body = bytearray(buf)
+    for i in range(min(nf, len(body) // 2)):
+        v = int.from_bytes(body[i * 2 : i * 2 + 2], "little", signed=True)
+        v = int(v * (i + 1) / nf)
+        body[i * 2 : i * 2 + 2] = max(-32768, min(32767, v)).to_bytes(2, "little", signed=True)
+    return bytes(body), trimmed_ms
+
+
 class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
     """MiniMax 增量流式：一条 WS 连接，LLM 文本增量到达即 task_continue。
 
@@ -1958,6 +1998,17 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                             init_done = True
                         buf.extend(chunk)
                         if not first_pushed and len(buf) >= frame_bytes // 5:
+                            # 首包前导静音修剪(RealtimeTTS trim_silence_start 同款):
+                            # MiniMax 首包偶带前导静音,剪掉=可闻出声更早;剪口
+                            # fade-in 防咔哒。全静音(剪空)→ 唔推唔置位,等下一块
+                            # 再检查;每次调用最多剪 max_ms,残余静音逐次收。
+                            trimmed, trim_ms = _trim_lead_silence(bytes(buf), sample_rate)
+                            buf.clear()
+                            buf.extend(trimmed)
+                            if trim_ms:
+                                print(f"MINIMAX_TTS_LEAD_SILENCE_TRIM ms={trim_ms}", flush=True)
+                            if not buf:
+                                continue
                             # P0 首帧早推:不足 200ms 先推 ~40ms,早出声(照 Qwen3-TTS 同款)。
                             # P0 秒表:首个音频块推送时刻(距 task_start)。
                             t_first = time.monotonic()
