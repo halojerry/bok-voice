@@ -747,7 +747,9 @@ class ContextState:
             if self._user_lang == "cantonese":
                 rule = self._cantonese_rule()
             elif self._user_lang == "en":
-                rule = "Reply in natural spoken English only (like on a phone call); do not explain or add notes."
+                rule = ("Reply in natural spoken English only (like on a phone call); "
+                        "do not mix in any Chinese words (Mandarin or Cantonese); "
+                        "do not explain or add notes.")
             else:
                 rule = self._zh_rule()
             parts.append(f"【用户语言】当前用户正在使用：{name}。{rule}")
@@ -762,15 +764,17 @@ class ContextState:
         )
         # 客服应答准则：永不主动说"不知道/查不到"，知识不够时用客服话术兜住。
         # 这是客服与聊天机器人的本质区别——客户要的是被接住，不是被拒绝。
+        # 语言纯度：此段无条件进每通通话的前缀，必须用标准书面中文——写成粤语
+        # 书面语会把 4B 模型的普通话回复带偏成夹粤语（2026-09-06 实证后改写）。
         parts.append(
             "【应答准则】你是客服，绝不能说「不知道」「查不到」「不清楚」「没这个资料」「我帮不了你」。"
             "资料/知识不够回答时，用客服的方式接住客户："
             "① 先给确定能给的（安抚、已确认信息、下一步动作）；"
             "② 需要查证/转办的，明确告诉客户你会跟进处理，或转给能处理的人/专员跟进；"
-            "但「帮你核实/查一下再覆你」只适用于真係要查外部资料嘅情况——如果你正按話術流程步"
-            "推进(例如要向客户讲赔偿方案/引导办理)，就直接照当前步讲，绝唔好用「等我查下/幾分鐘內覆你」"
-            "呢類拖延话术，亦唔好喺流程中途自把自为承诺返覆；"
-            "③ 客户的问题超出当前业务，就用引导话术收住（如「呢单我帮你转俾专门跟进嘅同事，佢会即刻同你联系」），绝不冷场、绝不空手。"
+            "但「帮你核实/查一下再答复你」只适用于真的要查外部资料的情况——如果你正按话术流程"
+            "推进（例如要向客户讲赔偿方案/引导办理），就直接按当前步讲，绝不要用「等我查下/几分钟内答复你」"
+            "这类拖延话术，也不要在流程中途自作主张承诺回头再答复；"
+            "③ 客户的问题超出当前业务，就用引导话术收住（如「这个问题我帮您转给专门跟进的同事，他会马上联系您」），绝不冷场、绝不空手。"
         )
         if self._flow_overview:
             parts.append("【话术流程总览(别照读,按进度推进)】\n" + self._flow_overview)
@@ -793,13 +797,13 @@ class ContextState:
         if self._whatsapp_note:
             parts.append(
                 "【已记录客户 WhatsApp】" + self._whatsapp_note +
-                "（复述号码必须逐位以此为准，唔好凭记忆/估）"
+                "（复述号码必须逐位以此为准，不要凭记忆或猜测）"
             )
         if self._call_facts:
             # 会中事实沉淀(append-only 有界,add_call_fact):客户早轮讲过的
             # 平台/号码唔随滚动记忆/历史截断蒸发,治「重复问已答过的事」。
             parts.append(
-                "【通话中客户已讲（已确认过，唔好再问）】\n"
+                "【通话中客户已讲（已确认过，不要再问）】\n"
                 + "\n".join(f"- {s}" for s in self._call_facts)
             )
         if self._flow_current:
@@ -811,7 +815,7 @@ class ContextState:
             # 语义=「你讲呢句嗰阵嘅上一句」,自洽。
             parts.append(
                 "【你上一句】已讲过的内容绝不原句或近原句再讲一次；"
-                "客户没有新异议就不要重复确认，停低等他说。\n「" + self._last_reply + "」"
+                "客户没有新异议就不要重复确认，停下来等他说。\n「" + self._last_reply + "」"
             )
         if self.rag_enabled and self._snippets:
             parts.append("【实时检索到的资料（知识库）】\n" + "\n".join(f"- {s}" for s in self._snippets))
@@ -837,6 +841,7 @@ class ContextState:
     def _zh_rule(self) -> str:
         return (
             "用自然口语的普通话回复，像打电话那样说，不要用书面语或播音腔；"
+            "全程只用普通话词汇和语法，不夹杂粤语或其它方言词；"
             "客户报号码/单号时直接口语复述确认（如「收到，尾号是七八九零，对吗」），"
             "不要输出任何拼音、发音教学或语言课程内容，不要复述或讲解系统指示；"
             "不要解释你正在使用什么语言，不要添加任何注释或括号。"

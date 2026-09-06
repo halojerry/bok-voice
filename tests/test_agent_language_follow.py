@@ -217,6 +217,69 @@ def test_zh_rule_has_no_hk_style():
     assert "港式" not in text
     # zh 数字口语复述确认 + 禁拼音/发音教学。
     assert "复述确认" in text and "拼音" in text and "发音教学" in text
+    # zh 规则明确禁方言夹杂（2026-09-06：普通话通话被 prompt 里的粤语书面语带偏）。
+    assert "不夹杂粤语" in text
+
+
+# ---- Prompt 语言纯度：无条件共享指引不得带粤语书面语（2026-09-06 实证修复）----
+# 这些特征字只要常驻 zh 通话的 prompt，4B 模型的普通话回复就会被带偏成夹粤语；
+# 方言风格只准出现在按通话语言条件渲染的规则里（_cantonese_rule/港式词表）。
+# 变量名避开旧拼写字面量（术语门禁扫描全部源文件）。
+_DIALECT_MARKS = "唔係嘅咗喺嚟嘢冇啲嗰㗎乜睇攞"
+
+
+def _zh_flow_texts_all_blocks() -> list[str]:
+    """渲染 flow 指引的全部文本块（开场已念/新一步/守卫/后备/收尾/走完），供纯度断言。"""
+    from agent_runtime.flow import FlowController
+    fc = FlowController.from_template(
+        {"steps_json": (
+            '[{"goal":"确认包裹是不是{姓名}本人的","ref":"您好，请问是{姓名}吗？我们是{物流公司}，'
+            '有个包裹单号尾号{快递尾号}运输途中丢失了，想跟您核对一下。"},'
+            '{"goal":"说明一赔二方案","ref":"以一赔二赔付，不用您贴钱"},'
+            '{"goal":"引导办理","ref":"专员会联系您"}]'
+        )},
+        {"display_name": "林先生", "tracking_no": "7890", "courier": "顺丰"},
+    )
+    fc.opening_played = True
+    texts = [fc.current_step_text()]  # 第 1 步:开场已念 + 身份核对步 → 后备块
+    fc.on_user_turn("是我的")
+    texts.append(fc.current_step_text())  # 第 2 步:【新一步】
+    texts.append(fc.closing_text())  # 收尾指引
+    fc.enter_closing()
+    texts.append(fc.current_step_text())  # 收尾态文本
+    fc2 = FlowController.from_template({"steps_json": '[{"goal":"g","ref":"r"}]'}, None)
+    fc2.advance()
+    texts.append(fc2.current_step_text())  # 流程走完文本
+    return texts
+
+
+def test_zh_prompt_purity_no_cantonese_marks():
+    from agent_runtime.providers.livekit_plugins import ContextState
+    ctx = ContextState(account_id="acc-001")
+    ctx.set_user_language("zh")
+    texts = _zh_flow_texts_all_blocks()
+    ctx.set_flow("对话按 3 步流程推进:\n第1步:确认身份\n第2步:说明方案", "\n".join(texts))
+    ctx.set_whatsapp_note("85264325433")
+    ctx.add_call_fact("客户讲过在拼多多买")
+    ctx.set_last_reply("好的，已为您登记，尾号是七八九零，对吗。")
+    ctx.add_summary("user", "客户说他在拼多多买的")
+    prefix = ctx.render_instruction_prefix()
+    tail = ctx.render_context_tail()
+    for name, text in (("prefix", prefix), ("tail", tail)):
+        bad = sorted({ch for ch in _DIALECT_MARKS if ch in text})
+        assert not bad, f"zh {name} 含粤语特征字: {bad}"
+    # 港式词表/粤语规则不得进 zh 装配。
+    assert "速遞" not in prefix and "港式粵語" not in prefix
+
+
+def test_cantonese_prompt_keeps_hk_style():
+    from agent_runtime.providers.livekit_plugins import ContextState
+    ctx = ContextState(account_id="acc-001")
+    ctx.set_user_language("cantonese")
+    ctx.set_flow("对话按 2 步流程推进:\n第1步:确认", "流程第 1/2 步\n这一步要达成:核对身份")
+    text = ctx.render_system_message()
+    assert "速遞" in text and "集運件" in text  # 港式词表仍在（cantonese 通话专用渲染）
+    assert "不夹杂粤语" not in text  # zh 专属禁令不进 cantonese 装配
 
 
 # ---- KV-cache 友好重组：稳定指令前缀在前、易变参考尾部在后 ----
