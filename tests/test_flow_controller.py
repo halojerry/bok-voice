@@ -11,6 +11,7 @@ from agent_runtime.flow import (  # noqa: E402
     FlowController,
     decide_advance,
     facts_line,
+    object_vars,
     parse_steps,
     render_template_text,
 )
@@ -98,7 +99,7 @@ def test_advance_only_on_confirm():
     assert fc.current == 1
     fc.on_user_turn("好，可以")  # 确认第2步 → 完成
     assert fc.done
-    assert fc.current_step_text() == ""  # 流程完成不再注入当前步
+    assert fc.current_step_text().startswith("话术流程已走完")  # 完成后注入答疑指引,唔再主动收线
 
 
 def test_deny_objection_stays():
@@ -146,7 +147,7 @@ def test_fact_confirm_advances_flow_step():
     cur = fc.current_step_text()
     assert "第 2/2 步" in cur
     # 推进后注入「新一步」提示,提醒 LLM 换步(唔好延续旧承诺)。
-    assert "【新一步】" in cur and "唔好延续上一步" in cur
+    assert "【新一步】" in cur and "不要延续上一步" in cur
 
 
 def test_not_confirm_stays_with_recall_guidance():
@@ -158,8 +159,8 @@ def test_not_confirm_stays_with_recall_guidance():
     assert fc.current == 0
     cur = fc.current_step_text()
     assert "核對/引導資料" in cur or "核对/引导资料" in cur
-    assert "訂單" in cur and "截圖" in cur  # 引導提供資料,唔係臨時承諾
-    assert "我幫你查完再覆你" in cur and "全程你自己同客戶傾" in cur
+    assert "订单" in cur and "截图" in cur  # 引导提供资料，不是临时承诺
+    assert "我帮你查完再答复你" in cur and "全程你自己与客户沟通" in cur
 
 
 def test_non_verify_step_no_recall_guidance():
@@ -287,6 +288,21 @@ def test_detect_whatsapp_offered_ack():
     assert detect_whatsapp_signal("嗯,好呀", step_goal=WA_GOAL, step_ref=WA_REF) == ("offered", "")
 
 
+def test_detect_whatsapp_already_captured_no_more_offered():
+    from agent_runtime.flow import detect_whatsapp_signal
+    # 已捕获过号码后:純短應承/叫加係對當前步嘅確認,唔再判 offered
+    # (offered 會鎖死確認輪唔推進,4B 就把自己上一句原樣再講一次——
+    # 2026-09-06 call-e6e5f18e 逐字重複實證)。
+    assert detect_whatsapp_signal("嗯", step_goal=WA_GOAL, step_ref=WA_REF, already_captured=True) is None
+    assert detect_whatsapp_signal("好呀，你加我啦", step_goal=WA_GOAL, step_ref=WA_REF, already_captured=True) is None
+    assert detect_whatsapp_signal("可以", step_goal=WA_GOAL, step_ref=WA_REF, already_captured=True) is None
+    # 新號碼照捕(客戶可以改口俾另一個號)。
+    assert detect_whatsapp_signal(
+        "唔好意思，啱先報錯咗，我個WhatsApp係 9852 6633",
+        step_goal=WA_GOAL, step_ref=WA_REF, already_captured=True,
+    ) == ("captured", "98526633")
+
+
 def test_detect_whatsapp_not_triggered():
     from agent_runtime.flow import detect_whatsapp_signal
     # 冇 WhatsApp / 提其他話題 / 問點加 → 唔觸發。
@@ -379,7 +395,7 @@ def test_should_auto_advance_whatsapp_captured_implicit():
 def test_no_steps_no_flow():
     fc = FlowController.from_template({}, OBJ)
     assert not fc.has_steps
-    assert fc.current_step_text() == ""
+    assert fc.current_step_text().startswith("话术流程已走完")  # 完成后注入答疑指引
     assert fc.flow_overview() == ""
 
 
@@ -472,7 +488,7 @@ def test_refuse_enters_closing_and_stays():
     assert fc.rule_verdict("我唔需要，唔好再打嚟。") == REFUSE
     fc.enter_closing()
     cur = fc.current_step_text()
-    assert "收尾" in cur and "拜拜" in cur
+    assert "收尾" in cur and "再见" in cur  # 收尾例句已改中性书面中文(语言纯度,2026-09-06)
     # 收尾态即使客户改口应承,都唔翻流程(真改口由人工/新通话处理)。
     fc.on_user_turn("係我,可以㗎。")
     assert fc.current == 0 and fc.closing
@@ -484,3 +500,81 @@ def test_should_auto_advance_never_on_refuse():
     from agent_runtime.flow import REFUSE, should_auto_advance
     assert should_auto_advance(current=0, goal="开场", ref="r", user_text="唔需要", verdict=REFUSE) is False
     assert should_auto_advance(current=1, goal="引导办理", ref="r", user_text="唔需要", verdict=REFUSE) is False
+
+
+def test_opening_text_first_line_with_vars():
+    # 开场白=第 1 步 ref 首行(变量已替换);「如果客户…」分支指引係畀 LLM 睇,唔会念出声。
+    steps_json = (
+        '[{"goal":"确认身份","ref":"您好，请问是{姓名}吗？我们是{物流公司}，'
+        '有个包裹单号尾号{快递尾号}运输途中丢失了，想跟您核对一下。\\n'
+        '如果客户不记得 → 提他下单时填的地址帮他回忆"},{"goal":"说明方案","ref":"以一赔二"}]'
+    )
+    fc = FlowController.from_template({"steps_json": steps_json}, OBJ)
+    opening = fc.opening_text()
+    assert opening.startswith("您好，请问是林先生吗？")
+    assert "顺丰" in opening and "七八九零" in opening
+    assert "如果客户" not in opening and "\n" not in opening
+
+
+def test_opening_text_missing_var_returns_empty():
+    # 变量缺失(渲染后仍剩 {占位}) → 空串:上层退通用开场白,唔会念出「{姓名}」。
+    fc = FlowController.from_template(
+        {"steps_json": '[{"goal":"g","ref":"您好，请问是{姓名}吗？"}]'}, {}
+    )
+    assert fc.opening_text() == ""
+
+
+def test_opening_text_no_steps_empty():
+    assert FlowController.from_template(None, OBJ).opening_text() == ""
+
+
+def test_current_step_opening_played_note():
+    # 开场直念后:第 1 步注入「勿重复开场」提示;推进到第 2 步后提示消失;
+    # paused 起动(冇开场白,flag=False)就唔注入,LLM 自己补第 1 步。
+    fc = FlowController.from_template(
+        {"steps_json": '[{"goal":"开场","ref":"r1"},{"goal":"方案","ref":"r2"}]'}, OBJ
+    )
+    assert "开场已念" not in fc.current_step_text()
+    fc.opening_played = True
+    assert "开场已念" in fc.current_step_text()
+    fc.advance()
+    assert "开场已念" not in fc.current_step_text()
+
+
+def test_object_vars_en_aliases():
+    # EN 模板占位 {name}/{courier}/{tracking_tail}:尾号保留阿拉伯数字(英文 TTS 直读)。
+    v = object_vars(OBJ)
+    assert v["name"] == "林先生"
+    assert v["courier"] == "顺丰"
+    assert v["tracking_tail"] == "7890"
+
+
+def test_current_step_verdict_guidance():
+    """verdict 感知指引:question/unclear/objection 各有应答指引(治复读当前步),
+    confirm 冇额外指引(由【新一步】接管)。"""
+    fc = FlowController.from_template({"steps_json": '[{"goal":"g1","ref":"r1"},{"goal":"g2","ref":"r2"}]'}, OBJ)
+    fc.last_verdict = "question"
+    cur = fc.current_step_text()
+    assert "客户在提问" in cur and "绝不重复你上一句" in cur
+    fc.last_verdict = "unclear"
+    assert "回应不明确" in fc.current_step_text()
+    fc.last_verdict = "objection"
+    assert "客户有疑虑" in fc.current_step_text()
+    fc.last_verdict = "confirm"
+    assert "客户在提问" not in fc.current_step_text()
+    # 空 verdict(会话首轮)无指引
+    fc2 = FlowController.from_template({"steps_json": '[{"goal":"g1","ref":"r1"}]'}, OBJ)
+    assert "客户在提问" not in fc2.current_step_text()
+
+
+def test_done_confirm_no_reask():
+    """话术走完 + 客户刚确认 → 注入「毋需再问已答过的事」,治 WhatsApp 号码
+    确认后逐字再问一遍(0f4df710 实证)。"""
+    fc = FlowController.from_template({"steps_json": '[{"goal":"g1","ref":"r1"}]'}, OBJ)
+    fc.advance()
+    assert fc.done
+    fc.last_verdict = "confirm"
+    cur = fc.current_step_text()
+    assert "毋需再问" in cur
+    fc.last_verdict = "question"
+    assert "毋需再问" not in fc.current_step_text()

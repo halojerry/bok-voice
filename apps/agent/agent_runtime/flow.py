@@ -110,10 +110,14 @@ def object_vars(object_card: dict | None) -> dict[str, str]:
     return {
         "姓名": name,
         "名字": name,
+        "name": name,
         "快递单号": digits_to_cantonese(tracking),
         "快递尾号": digits_to_cantonese(tail),
         "物流公司": courier,
         "快递公司": courier,
+        "courier": courier,
+        # EN 模板占位用英文名:尾号保留阿拉伯数字(英文 TTS 直读,粤语汉字会读错)。
+        "tracking_tail": tail,
         "收货地址": address,
         "地址": address,
         "电话": digits_to_cantonese(phone),
@@ -330,6 +334,7 @@ def detect_whatsapp_signal(
     step_goal: str = "",
     step_ref: str = "",
     facts: dict | None = None,
+    already_captured: bool = False,
 ) -> tuple[str, str] | None:
     """偵測客戶係咪俾出 WhatsApp。返回 ("captured", 號碼) | ("captured_implicit", "") | ("offered", "") | None。
 
@@ -343,6 +348,10 @@ def detect_whatsapp_signal(
     - offered:喺引導辦理步、客戶冇俾號碼但应承加(好/可以/加咗),又冇話冇WhatsApp。
       由 caller 喺「上一步啱啱確認推入辦理步嗰輪」唔好 call 呢個 offered 分支(嗰輪客係
       應承接受,唔係應承加)──偵測放喺 flow 推進前跑、step context 係舊步,天然避開。
+    - already_captured:本通已 captured 過號碼 → 之後嘅純短應承/叫加唔再判 offered
+      (號碼已喺手,嗰啲係對當前步嘅確認;再判 offered 會令確認輪鎖死唔推進,
+      4B 就把自己上一句原樣再講一次——2026-09-06 call-e6e5f18e 實證)。新號碼/
+      綁定來電照樣 captured(客戶可以改口俾另一個號)。
     """
     t = (user_text or "").strip()
     if not t:
@@ -373,12 +382,42 @@ def detect_whatsapp_signal(
     if caller_bound:
         return ("captured_implicit", "")
     if in_wa_step and not runs:
+        if already_captured:
+            # 已捕获过号码:纯应承/叫加都係对当前步嘅确认,唔再当 offered
+            # (确认轮锁死→逐字重复根因,见 docstring);让 rule_verdict 正常推进。
+            return None
         # offered:明確叫加,或纯短应承(冇提其他話題)。
         if _WHATSAPP_ADD_VERB.search(t):
             return ("offered", "")
         if not _WHATSAPP_TOPIC_MARK.search(t) and _is_pure_ack(t):
             return ("offered", "")
     return None
+
+
+def extract_call_facts(user_text: str, *, facts: dict | None = None) -> list[str]:
+    """从客户话里抽可沉淀的关键事实(平台/号码)——会中记忆只增唔重问。
+
+    「忘记」的直接机制(2026-09-06 行为取证):客户早轮讲过的事实只住在
+    6 行×200 字滚动记忆+8 轮历史里,16 轮内先后蒸发,模型重新追问
+    (call-701c180b 同一句「報姓名同單號」問了三遍)。这里抽「答过就该
+    记住」的最小集:购物平台、非已知资料的号码串(命中已知 单号/尾号/电话
+    唔重复沉淀);由 agent 每轮喂 ContextState.add_call_fact(去重有界),
+    渲染进尾部【通话中客户已讲】。号码经 digits_to_cantonese 逐位转汉字
+    (TTS 安全+防 LLM 凭空改号)。
+    """
+    t = (user_text or "").strip()
+    if not t:
+        return []
+    out: list[str] = []
+    m = _PLATFORM_RE.search(t)
+    if m:
+        out.append(f"客户讲过在{m.group(1)}买")
+    norm = _digit_normalize(t)
+    for run in _valid_digit_runs(norm):
+        if _run_is_known_number(run, facts):
+            continue
+        out.append(f"客户报过号码:{digits_to_cantonese(run)}")
+    return out
 
 
 def decide_advance(user_text: str, *, facts: dict | None = None) -> str:
@@ -433,6 +472,13 @@ class FlowController:
     steps: list[FlowStep] = field(default_factory=list)
     current: int = 0  # 0-based;== len(steps) 表示流程已走完
     closing: bool = False  # 客户明确拒绝/告别 → 收尾态:只讲收尾话术,唔再推进
+    # 开场白已直念(session.say) → current_step_text 加「勿重复开场」提示;
+    # paused 起动(冇开场白)时保持 False,LLM 自己补第 1 步。
+    opening_played: bool = False
+    # 最近一轮规则判定(question/unclear/objection/...)——verdict 此前只用于推进
+    # 判定、从不进提示词,客户提问/答非所问时模型冇「该怎么答」指引 → 4B 默认
+    # 复读当前步。current_step_text 据此渲染对应应答指引。
+    last_verdict: str = ""
 
     @classmethod
     def from_template(cls, template: dict | None, object_card: dict | None) -> "FlowController":
@@ -470,8 +516,8 @@ class FlowController:
     def closing_text(self) -> str:
         """收尾态注入:一句礼貌告别,唔推销、唔挽留、唔转话题、唔问问题。"""
         return (
-            "【收尾】客户已明确拒绝/表示要结束,现在只做礼貌收尾:用客户正在讲的语言讲一句告别"
-            "(多谢+再见,例如「好嘅,唔打扰你嘞,多谢你时间,拜拜」),"
+            "【收尾】客户已明确拒绝/表示要结束，现在只做礼貌收尾：用本通语言讲一句告别"
+            "（感谢+再见，例如「好的，感谢您的时间，再见」），"
             "一句讲完就停——绝不推销、绝不挽留、绝不问任何问题、绝不转新话题、绝不再提流程。"
         )
 
@@ -508,40 +554,94 @@ class FlowController:
         g = render_template_text(s.goal, self.vars_map) if s.goal else s.ref
         return g
 
+    def opening_text(self) -> str:
+        """开场白原文:第 1 步 ref 的首个非空行(变量已替换)——开场直念给 TTS。
+
+        步骤 ref 里「\\n如果客户…→ 就…」係畀 LLM 睇嘅分支指引,唔准念出声 →
+        只取首行。渲染后仍剩 {占位} = 变量缺失 → 返回空串(上层退通用开场白,
+        唔会念出「请问係咪{姓名}」)。冇流程返回空串。
+        """
+        if not self.has_steps:
+            return ""
+        s = self.steps[0]
+        rendered = render_template_text(s.ref or s.goal, self.vars_map)
+        for line in rendered.splitlines():
+            line = line.strip()
+            if line and not re.search(r"\{[^{}]+\}", line):
+                return line
+        return ""
+
+    def _verdict_guidance(self) -> str:
+        """verdict 感知应答指引:规则判定结果此前只用于推进、从不进提示词——客户
+        提问/答非所问时 flow 唔动、模型又冇「该怎么答」嘅指引,4B 默认复读当前步
+        (2026-09-06 实证:同一句 WhatsApp 确认逐字问两遍)。标准书面中文(语言纯度)。"""
+        v = self.last_verdict
+        if v == QUESTION:
+            return (
+                "【客户在提问】先用话术里的事实直接回答客户的问题"
+                "（赔偿方案、办理方式、到账时间都可以讲），答完用一句自然带回当前步；"
+                "绝不重复你上一句。"
+            )
+        if v == UNCLEAR:
+            return "【客户回应不明确】换个说法简短再引导一次（可以给选项），绝不重复你上一句原话。"
+        if v == OBJECTION:
+            return (
+                "【客户有疑虑】先针对疑虑安抚（运费险、一赔二、专员跟进都是可用事实），"
+                "再回到当前步；绝不重复你上一句原话。"
+            )
+        return ""
+
     def current_step_text(self) -> str:
         """渲染当前步(含变量替换)给本轮 system;流程完成则空;收尾态则注入收尾话术。"""
         if self.closing:
             return self.closing_text()
         if not self.has_steps or self.done:
-            return ""
+            # 话术走完 ≠ 收线:继续如常答疑/跟进,主动再见只准出现在 REFUSE/
+            # 沉默收线(否则客户问「接下来怎么」会被 LLM 拜拜,实测 2026-09-06)。
+            done_text = (
+                "话术流程已走完。不要主动讲再见或收线；继续如常回答客户问题、"
+                "确认后续安排（专员联系/到账时间），客户有问必答，等客户自然结束。"
+            )
+            if self.last_verdict == CONFIRM:
+                done_text += "客户刚确认过，毋需再问任何已答过的事——简单回应后等客户讲。"
+            return done_text
         step = self.steps[self.current]
         lines = [f"流程第 {self.current + 1}/{len(self.steps)} 步"]
+        if self.current == 0 and self.opening_played:
+            lines.append(
+                "【开场已念】上一句 assistant 就是开场白原文（开场直念，已入对话史），"
+                "不必重复开场或再问一次身份——直接听客户回应接话。"
+            )
         if self._just_advanced and self.current > 0:
             lines.append(
-                "【新一步】客户啱啱确认咗上一步，而家已经进入呢一步。"
-                "立即按呢一步嘅目标嚟讲——唔好讲「等我查下再覆你」「幾分鐘內覆你」呢類拖延话术"
-                "(你手上已经有足够资料讲呢一步)，亦唔好延续上一步话题或继续自己头先应承过嘅嘢。"
+                "【新一步】客户刚刚确认了上一步，现在已经进入这一步。"
+                "立即按这一步的目标来讲——不要讲「等我查下再答复你」「几分钟内答复你」这类拖延话术"
+                "（你手上已经有足够资料讲这一步），也不要延续上一步话题或继续自己刚才应承过的事。"
             )
+        verdict_line = self._verdict_guidance()
+        if verdict_line:
+            lines.append(verdict_line)
             self._just_advanced = False
         if step.goal:
             lines.append(f"这一步要达成:{render_template_text(step.goal, self.vars_map)}")
         if step.ref:
             lines.append(f"参考要点(内部指示,勿念给客户):{render_template_text(step.ref, self.vars_map)}")
         lines.append(
-            "只围绕当前这一步回应,说清楚就停下等用户,不要替用户答或自行跳到下一步;"
+            "只围绕当前这一步回应，说清楚就停下等用户，不要替用户答或自行跳到下一步；"
             "客户问及后续可先简短回应再把话题带回当前步。"
-            "参考要点是内部指示,用自己的口语讲,绝不把原文整段念出来,也不要把方案/金额一次倒光;"
-            "「如果客户…→ 就…」呢類分支只在出现对应情况时照做,绝不把「如果」指示念给客户。"
-            "不要索取电话/WhatsApp/微信等联系方式,除非当前步参考明确要你加(如引导加办理专员);"
-            "核实资料用选项式引导(「你係咪喺拼多多、淘寶定京東買㗎?」),客户答到关键资料就确认并自然过渡,不无限追问。"
+            "参考要点是内部指示，用自己的口语讲，绝不把原文整段念出来，也不要把方案/金额一次倒光；"
+            "「如果客户…→ 就…」这类分支只在出现对应情况时照做，绝不把「如果」指示念给客户。"
+            "不要索取电话/WhatsApp/微信等联系方式，除非当前步参考明确要求"
+            "（如向客户索取其 WhatsApp/微信号码，由专员添加）；"
+            "核实资料用选项式引导（「您是在拼多多、淘宝还是京东买的？」），客户答到关键资料就确认并自然过渡，不无限追问。"
         )
         if _is_identity_verification_step(step.goal, step.ref):
             lines.append(
-                "【核對/引導資料後備(內部指示,唔好讀出嚟)】全程你自己同客戶傾,"
-                "唔好用「我幫你查完再覆你」「幾分鐘內覆你」「轉俾同事/專人跟進」呢類拖延話術——"
-                "除非呢步本身就係要轉介。客戶答啱→自然確認停低;答唔到/唔記得/資料唔齊→唔好重複問,"
-                "用訂單平台/截圖等引導(問喺邊個平台買、叫佢開訂單、傳最近未收到嘅貨截圖);"
-                "中途問任何嘢→簡短答完帶返當前步。金額未核實前唔好講死具體賠幾多。"
+                "【核对/引导资料后备（内部指示，不要读出来）】全程你自己与客户沟通，"
+                "不要用「我帮你查完再答复你」「几分钟内答复你」「转给同事/专人跟进」这类拖延话术——"
+                "除非这一步本身就是转介。客户答对→自然确认后停下；答不出/不记得/资料不全→不要重复问，"
+                "用订单平台/截图等引导（问在哪个平台买、请他打开订单、发最近未收到货的截图）；"
+                "中途问任何事→简短答完带回当前步。金额未核实前不要讲死具体赔多少。"
             )
         return "\n".join(lines)
 

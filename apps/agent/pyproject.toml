@@ -14,11 +14,14 @@ dependencies = [
 
 [project.optional-dependencies]
 livekit = [
-  # 运行时按 1.7.1 开发/三语 E2E 实测;CI 曾解析到 1.8.0 致 preflight 单测
-  # 时序 flake(stream/channel 行为变)——锁 <1.8 令 CI 与本地/打包同版本。
-  "livekit-agents>=1.7.1,<1.8",
+  # 1.8.0(GA 2026-09-05)含打断后 playout pause 泄漏修复(release stale
+  # transcript gates and playout pauses #7083 + restore speaking state #7087
+  # + cancel parked preemptive before pausing #6865)——1.7.1 实测一次打断后
+  # 本通所有回复哑火只剩心跳(call-e49bd34d)。当年锁 <1.8 是 1.8 pre-release
+  # 时序 flake,GA 版全量 311 测试已过。锁 <1.9 待下个 GA 再评。
+  "livekit-agents>=1.8.0,<1.9",
   # OpenAI 兼容 LLM 基类(livekit_plugins 顶层 import,未声明则 CI 收集期即炸)。
-  "livekit-plugins-openai>=1.7.1,<1.8",
+  "livekit-plugins-openai>=1.8.0,<1.9",
   # Local offline SenseVoice ASR via sherpa-onnx (zh/en/ja/ko/yue).
   "sherpa-onnx>=1.13,<2",
   # Volcano (火山) streaming TTS uses a WebSocket binary protocol.

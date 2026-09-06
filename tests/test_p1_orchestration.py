@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps" / "agent"))
 
 import agent_runtime.interpret as interp_mod  # noqa: E402
 from agent_runtime.agent import (  # noqa: E402
-    _MINIMAX_DEFAULT_VOICE,
+    _MINIMAX_DEFAULT_VOICES,
     _assemble_minimax_voice_map,
     _build_object_brief,
     _context_rag_enabled,
@@ -133,25 +133,32 @@ def test_llm_metrics_tolerates_missing_cache_fields():
 
 
 def test_minimax_empty_voice_map_gets_default():
-    for mode in ("single", "per_language"):
-        vmap = _assemble_minimax_voice_map(
-            persona=None, tts_cfg={}, greet_lang="cantonese", voice_mode=mode
-        )
-        assert vmap.get("cantonese") == _MINIMAX_DEFAULT_VOICE, mode
-        # zh 回落键必须有：MiniMaxTTS._resolve_voice 对缺键回落 zh，
-        # 普通话/英语轮唔会 MINIMAX_TTS_NO_VOICE（beep）。
-        assert vmap.get("zh") == _MINIMAX_DEFAULT_VOICE, mode
+    # single:整通取 anchor_lang(人设/招呼/zh)的语言默认音色,放 zh 回落键
+    vmap_ca = _assemble_minimax_voice_map(
+        persona=None, tts_cfg={}, greet_lang="cantonese", voice_mode="single"
+    )
+    assert vmap_ca == {"zh": _MINIMAX_DEFAULT_VOICES["cantonese"]}
+    # 普通话通话(人设普通话)→ 普通话音色,唔再系粤语主播念广普
+    vmap_zh = _assemble_minimax_voice_map(
+        persona={"language": "zh"}, tts_cfg={}, greet_lang="zh", voice_mode="single"
+    )
+    assert vmap_zh == {"zh": _MINIMAX_DEFAULT_VOICES["zh"]}
+    # per_language:三键各语言默认;zh 回落键必须有(beep 不再发生)
+    vmap2 = _assemble_minimax_voice_map(
+        persona=None, tts_cfg={}, greet_lang="cantonese", voice_mode="per_language"
+    )
+    assert vmap2 == _MINIMAX_DEFAULT_VOICES
 
 
 def test_minimax_local_only_voices_filtered_then_defaulted():
-    # 人设只绑本地 Qwen3 克隆 → 全被过滤 → 空 map → 默认兜底
+    # 人设只绑本地 Qwen3 克隆 → 全被过滤 → 空 map → 默认兜底(canto 人设 → canto 音色)
     vmap = _assemble_minimax_voice_map(
         persona={"reference_audio": "serena", "language": "cantonese"},
         tts_cfg={},
         greet_lang="cantonese",
         voice_mode="single",
     )
-    assert vmap == {"zh": _MINIMAX_DEFAULT_VOICE, "cantonese": _MINIMAX_DEFAULT_VOICE}
+    assert vmap == {"zh": _MINIMAX_DEFAULT_VOICES["cantonese"]}
 
 
 def test_minimax_configured_voice_not_overridden():

@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from typing import Optional
 
 from bok_voice_core.policies import ProviderRegistry, ProviderState, select_session_manifest
@@ -215,45 +216,65 @@ def _sticky_reply_language(anchor: str, asr_lang: str, cur_sticky: str, cur_stre
     return anchor, anchor, 0
 
 
-def _nudge_instruction(name: str, lang: str) -> str:
-    """沉默心跳的生成指令:一句亲切确认「仲喺度嗎」,带返当前步话题,唔重复长内容。"""
+def _nudge_line(name: str, lang: str, count: int) -> str:
+    """沉默心跳脚本直念(session.say,不加 LLM):短确认轮换骨架。
+
+    旧版走 generate_reply(instructions=...) 令 LLM 现场生成,两个代价:
+    ①临时 system 指令入请求、下一轮即被剥 → KV-cache 严格前缀断裂(每次心跳
+    其后全尾部重 prefill);②4B 照抄指令里的例句,两连发一字不差(2026-09-06
+    call-64543304 实证)。脚本直念零 TTFT(TTS 即点即播,答案卡死时即时补位)、
+    零前缀断裂、轮换不重样。
+    """
     who = f"{name}，" if name else ""
     if lang == "cantonese":
-        return (
-            f"【沉默心跳】客户已经一段时间没有出声。现在只讲一句(最多两句)简短亲切的确认，"
-            f"例如「{who}你仲喺度嗎？我哋繼續睇下呢一步」，然后自然把话题带回当前这一步等客户回应；"
-            "绝不重复之前讲过的完整内容，绝不自问自答，一句讲完就停。"
+        variants = (
+            f"{who}你仲喺度嗎？",
+            f"{who}喂，聽唔聽到我講嘢？",
+            f"{who}唔好意思，等你一陣，仲喺度嗎？",
         )
-    if lang == "en":
-        return (
-            f"【沉默心跳】The customer has been silent for a while. Say ONE short friendly check-in "
-            f"(e.g. \"{name or 'Hello'}, are you still there?\"), then gently bring the topic back to the "
-            "current step and wait. Never repeat previous content, never answer for the customer, one line only."
+    elif lang == "en":
+        variants = (
+            f"{name or 'Hello'}, are you still there?",
+            "Hello? Can you hear me?",
+            "Sorry to keep you — still there?",
         )
-    return (
-        f"【沉默心跳】客户已经一段时间没有出声。现在只讲一句(最多两句)简短亲切的确认，"
-        f"例如「{who}您还在吗？咱们继续看这一步」，然后自然把话题带回当前这一步等客户回应；"
-        "绝不重复之前讲过的完整内容，绝不自问自答，一句讲完就停。"
-    )
+    else:
+        variants = (
+            f"{who}您还在吗？",
+            f"{who}喂，能听到我说话吗？",
+            f"{who}不好意思，您还在吗？",
+        )
+    return variants[min(max(count, 0), len(variants) - 1) % len(variants)]
 
 
-def _silence_farewell_instruction(name: str, lang: str) -> str:
-    """两次心跳都没回应:一句礼貌收尾(多谢+阵间再联系+再见),讲完即收线。"""
+def _nudge_should_fire(now: float, last_reply_ts: float, last_user_ts: float, nudge_delay: float) -> bool:
+    """沉默心跳开火时序护栏（纯函数，单测用）。
+
+    两种窗口唔开火：
+    - AI 啱講完（< nudge_delay）：俾客戶反應時間；
+    - 客戶最後開聲新過 AI 最後講完且 ≤ 2×delay：答案仲喺路上（生成/合成中），
+      唔好用「仲喺度嗎」頂替真答案；超 2×delay 仍無聲先允許心跳兜底
+      （答案可能失敗/被取消——2026-09-05 三会话实测「一直心跳」根因护栏；
+      ≤ 边界收紧系 2026-09-06 call-03a3295c:恰 16.0s 护栏失效心跳顶替真答案）。
+    """
+    if now - last_reply_ts < nudge_delay:
+        return False
+    if last_user_ts > last_reply_ts and now - last_user_ts <= nudge_delay * 2:
+        return False
+    return True
+
+
+def _farewell_line(name: str, lang: str) -> str:
+    """两次心跳都没回应:一句礼貌收尾直念(多谢+阵间再联系+再见),讲完即收线。
+
+    脚本直念同 _nudge_line:零 TTFT、零前缀断裂(收线后再无真实轮,断裂成本
+    本来就低,直念纯赚少一次 LLM 调用)。"""
     who = f"{name}，" if name else ""
     if lang == "cantonese":
-        return (
-            f"【沉默收线】客户连续两次确认都没有回应。现在只讲一句简短礼貌的收尾，"
-            f"例如「{who}咁我陣間再搵你，多謝你，拜拜」，一句讲完就停，绝不多讲。"
-        )
+        return f"{who}咁我陣間再搵你，多謝你，拜拜"
     if lang == "en":
-        return (
-            f"【沉默收线】The customer did not respond after two check-ins. Say ONE short polite goodbye "
-            f"(e.g. \"{name or 'Hello'}, I'll try again later. Thanks and goodbye.\"), one line only."
-        )
-    return (
-        f"【沉默收线】客户连续两次确认都没有回应。现在只讲一句简短礼貌的收尾，"
-        f"例如「{who}那我稍后再联系您，谢谢您，再见」，一句讲完就停，绝不多讲。"
-    )
+        return f"{name or 'Goodbye'}, I'll try again later. Thanks and goodbye."
+    return f"{who}那我稍后再联系您，谢谢您，再见"
 
 
 def _normalize_lang(raw, default: str = "") -> str:
@@ -305,9 +326,15 @@ def _resolve_tts_voice_mode(tts_cfg: dict) -> str:
 
 
 # MiniMax 空 voice map 兜底音色（设置页 speaker 三键全空/全被本地过滤时）：
-# B 线 interpret.py 同源的验证过粤语主播音色。音色 ID 是不透明标识符
-#（MiniMax 云端枚举，术语门禁白名单范畴），唔属语言字段。
-_MINIMAX_DEFAULT_VOICE = "Cantonese_crisp_news_anchor_vv2"
+# 按通话语言给各自语言的地道音色（fixed-language 整通一语言 → 一通一个默认音色）；
+# 此前 zh/en 也填粤语主播，普通话语料被粤语腔念(广普),用户判为"说粤语"。三个 id
+# 均经 /api/tts/preview 实测 200。音色 ID 是不透明标识符(MiniMax 云端枚举,术语门禁
+# 白名单范畴),唔属语言字段。
+_MINIMAX_DEFAULT_VOICES: dict[str, str] = {
+    "zh": "Chinese_wenrounvxing",
+    "cantonese": "Cantonese_crisp_news_anchor_vv2",
+    "en": "English_magnetic_voiced_man",
+}
 
 
 def _preemptive_generation_opts() -> dict:
@@ -394,29 +421,32 @@ def _prefix_prewarm_enabled() -> bool:
     return os.environ.get("LLM_PREFIX_PREWARM", "1") == "1"
 
 
-def _build_prefix_prewarm_messages(context_state, instructions: str) -> list[dict]:
-    """组装会话首轮真实 prompt 形状的预热请求体（纯函数，单测断言标记）。
+def _build_prefix_prewarm_messages(context_state, instructions: str, greeting_text: str = "") -> list[dict]:
+    """组装 turn-1 真实 prompt 形状的预热请求体（纯函数，单测断言标记）。
 
-    与 ContextAwareLLM.chat 的合并规则同构（1.7.1 KV-cache 铁律）：
-    - system = 稳定指令前缀（render_instruction_prefix：用户语言/回复节奏/
-      应答准则/话术总览/对象档案）+ 人设 base（_instructions+facts）——即
-      turn-1 真请求 system[0] 的字节内容；
-    - 易变尾部（render_context_tail：当前步/记忆）拼喺 fake user 轮文本尾部
-      （请求副本，唔落库），与真请求的尾部拼接位一致。
-    turn-1 真请求与本请求共享「system 全段 + user 头部」token 前缀 → mlx
-    prompt cache 命中，首轮免整段 prefill（p6 实测会话首轮 cached=0，
-    TTFT 2.1-3.2s，其中 system prefill ~1.4s）。
+    2026-09-05 重设计（W0-2）：真实 turn-1 请求 =
+      [system(前缀+人设 base), assistant(开场白原文), user(首句+尾部)]——
+    旧 v1 把开场白 instructions 拼进 system（真实请求里它是 greeting 生成期的
+    独立尾 system、turn-1 没有这一条）→ 预热与 turn-1 从 system 后就分叉，
+    cached=0 全量 prefill（日志铁证：greeting cached=981/982、turn1 0/1433）。
+    现在：开场白播完后取【真实 greeting 文本】作 assistant 轮，预热与 turn-1
+    共享「system 全段 + assistant 开场白」前缀 → turn-1 只 prefill 用户那句。
+    greeting_text 为空（paused/抓取失败）时退化为 [system, user] 形状（仍命中
+    system 段）。
     """
-    from .providers.livekit_plugins import _join_system
-
     prefix = context_state.render_instruction_prefix()
     tail = context_state.render_context_tail()
-    system = _join_system(prefix, instructions or "", "")
+    # ⚠️ 必须复刻 to_provider_format 的序列化:wrapper 的 merged system 是
+    # [prefix, *base_parts] 列表,序列化按 "\n" 连接(实测逐字节 diff 定位,
+    # 旧 _join_system 用 "\n\n" 差一个换行 → 预热与 turn-1 在 system 尾分叉,
+    # cached=0 全量 prefill 白烧)。
+    system = "\n".join([prefix, instructions or ""]) if instructions else prefix
     user = f"你好。\n\n{tail}" if tail else "你好。"
-    return [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
+    msgs: list[dict] = [{"role": "system", "content": system}]
+    if greeting_text:
+        msgs.append({"role": "assistant", "content": greeting_text})
+    msgs.append({"role": "user", "content": user})
+    return msgs
 
 
 def _format_llm_metrics(m) -> str:
@@ -468,20 +498,26 @@ def _assemble_minimax_voice_map(*, persona: dict | None, tts_cfg: dict, greet_la
       按 language_state.lang 换声（设置页/人设三键异值才真正分声）。
       注意 A 线新政策：language_state 整通钉死在通话语言 → 分键 map 实际恒解析
       同一把声（等效 single）；三键 map 只剩 B 线/未来逐轮语言场景还有意义。
-    - 任何模式下组装结果为空（speaker 全空/全被本地过滤）都填 _MINIMAX_DEFAULT_VOICE：
-      zh+cantonese 同值双键，_resolve_voice 对缺键回落 zh，任何语言态都解析得到
-      ——MINIMAX_TTS_NO_VOICE（beep）不能再发生。
+    - 任何模式下组装结果为空（speaker 全空/全被本地过滤）都填各语言地道默认音色
+      （_MINIMAX_DEFAULT_VOICES）——zh 普通话轮用普通话音色，唔再被粤语主播念广普；
+      _resolve_voice 对缺键回落 zh，任何语言态都解析得到——MINIMAX_TTS_NO_VOICE
+      （beep）不能再发生。
     """
     persona_voice = (persona or {}).get("reference_audio") or ""
+    persona_lang = _normalize_lang((persona or {}).get("language") or "") or greet_lang or "zh"
     raw_map = _parse_voice_map(persona_voice) if persona_voice else _build_default_voice_map(tts_cfg)
     if voice_mode != "per_language":
-        persona_lang = (persona or {}).get("language") or ""
-        anchor_lang = _normalize_lang(persona_lang) or greet_lang or "zh"
-        raw_map = _collapse_voice_map(raw_map, anchor_lang)
+        raw_map = _collapse_voice_map(raw_map, persona_lang)
     voice_map = _filter_cloud_voice_map(raw_map)
     if not voice_map:
-        voice_map = {"zh": _MINIMAX_DEFAULT_VOICE, "cantonese": _MINIMAX_DEFAULT_VOICE}
-        print(f"[agent] minimax default voice={_MINIMAX_DEFAULT_VOICE}", flush=True)
+        # 无任何配置(或全被本地过滤):按语言给各自语言地道默认音色——single 整通
+        # 只取 anchor_lang 一把声;per_language 三键全给(普通话轮再唔会拿到粤语主播
+        # 念广普)。三个默认 id 均经 /api/tts/preview 实测 200。
+        if voice_mode == "per_language":
+            voice_map = dict(_MINIMAX_DEFAULT_VOICES)
+        else:
+            voice_map = {"zh": _MINIMAX_DEFAULT_VOICES.get(persona_lang) or _MINIMAX_DEFAULT_VOICES["zh"]}
+        print(f"[agent] minimax default voices={sorted(voice_map)} anchor_lang={persona_lang}", flush=True)
     return voice_map
 
 
@@ -764,7 +800,7 @@ async def entrypoint(ctx):
 
     # 对话流程控制器:载入模板分步 + 对象变量;由它按轮注入"当前步",逐步推进。
     from .flow import FlowController, facts_line
-    from .flow import CONFIRM, OBJECTION, QUESTION, REFUSE, UNCLEAR, detect_whatsapp_signal
+    from .flow import CONFIRM, OBJECTION, QUESTION, REFUSE, UNCLEAR, detect_whatsapp_signal, extract_call_facts
 
     flow_ctrl = FlowController.from_template(template, object_card)
     _log_stage("context_resolved")
@@ -829,11 +865,16 @@ async def entrypoint(ctx):
     context_state.set_user_language(greet_lang)
     # 已上報嘅 WhatsApp 狀態(captured=已報號碼, offered=已報應承加),避免每 call 重複 spam。
     _wa_reported: set[str] = set()
+    # 本通已捕获过号码(captured/captured_implicit 任一):之後 WhatsApp 步嘅純短應承
+    # 唔再判 offered(確認輪鎖死→逐字重複根因,detect_whatsapp_signal 文檔)。
+    _wa_captured: dict = {"on": False}
     # 背景 flow judge 防疊:記錄而家 judge 緊邊一步(-1=冇)。推進唔可以同時兩個 judge。
     _judge_inflight: dict = {"step": -1}
     # 沉默心跳:AI 講完話客戶耐冇出聲 → 主動確認「仲喺度嗎」並帶返當前步。
-    # count 會喺客戶真開口(on_user_turn_completed)時歸零。
-    _nudge_state: dict = {"count": 0, "timer": None}
+    # count 會喺客戶真開口(on_user_turn_completed)時歸零。last_user_ts/last_reply_ts
+    # 記錄「客戶最後開聲」與「AI 最後講完」時刻(秒),心跳只在兩者都足夠舊先開火
+    # ——唔會喺客戶啱講完、AI 答案未出、或者 AI 啱講完幾秒內就打斷。
+    _nudge_state: dict = {"count": 0, "timer": None, "last_user_ts": 0.0, "last_reply_ts": 0.0}
     from .plugins.emotion import EmotionState
 
     emotion_state = EmotionState()
@@ -1121,16 +1162,35 @@ async def entrypoint(ctx):
     # （见下方 greeting 块），这里只定義任务体。
     if _prefix_prewarm_enabled() and isinstance(_raw_llm, MlxLlmLLM) and instructions:
 
-        async def _prefix_prewarm_task() -> None:
+        async def _prefix_prewarm_task(agent_ref, greeting_text: str = "") -> None:
             import time as _t2
 
             try:
-                msgs = _build_prefix_prewarm_messages(context_state, instructions)
+                # 预热形状必须含开场白 assistant 轮,turn-1 才命中到 assistant 轮末。
+                # greeting_text 由调用方直传(开场白直念文本,装配时已知);为空才
+                # 回退抓 chat_ctx 最新 assistant 轮(兼容旧路径)。
+                if not greeting_text:
+                    for _ in range(12):
+                        try:
+                            its = list(getattr(agent_ref, "chat_ctx", None).items or [])
+                        except Exception:
+                            its = []
+                        for it in reversed(its):
+                            if getattr(it, "role", "") == "assistant":
+                                greeting_text = str(
+                                    getattr(it, "text_content", "") or getattr(it, "raw_text_content", "") or ""
+                                ).strip()
+                                break
+                        if greeting_text:
+                            break
+                        await asyncio.sleep(0.25)
+                msgs = _build_prefix_prewarm_messages(context_state, instructions, greeting_text)
                 _pw0 = _t2.monotonic()
                 await _raw_llm.prefix_prewarm(msgs)
                 print(
                     f"[agent] llm prefix prewarm done +{(_t2.monotonic() - _pw0) * 1000:.0f}ms "
-                    f"system_chars={len(msgs[0]['content'])} (call {room_name})",
+                    f"msgs={len(msgs)} system_chars={len(msgs[0]['content'])} "
+                    f"greeting={'yes' if greeting_text else 'no'} (call {room_name})",
                     flush=True,
                 )
             except asyncio.CancelledError:
@@ -1185,6 +1245,9 @@ async def entrypoint(ctx):
                     except Exception as exc:  # pragma: no cover - 联网是增强
                         print(f"[agent] web search skipped: {exc!r}", flush=True)
             context_state.add_summary(role, _clean_transcript(text))
+            if role == "assistant":
+                # 尾部重复锚:让模型看得见自己上一句,治原句/近原句复述(R3)。
+                context_state.set_last_reply(_clean_transcript(text))
         except Exception as exc:  # pragma: no cover - context must not break turns
             print(f"[agent] context update failed: {exc!r}", flush=True)
 
@@ -1336,13 +1399,17 @@ async def entrypoint(ctx):
                 _set_preemptive_max_retries(int(_preemptive_env_opts["max_retries"]))
             # 客戶真開口 → 沉默心跳計數歸零(之後再沉默先重新計 2 次)。
             _nudge_state["count"] = 0
+            _nudge_state["last_user_ts"] = time.monotonic()
             _disarm_silence()
 
             # 抢跑×流程推进共存:框架喺 FINAL 到达时可能已按「旧步骤语境」抢跑生成
             # (preemptive 先于本钩子)。凡本轮实质改变回复语境(推进/收尾),
             # 就向 turn_ctx 落一个步骤标记——框架的抢跑校验按 chat_ctx 快照比较,
             # 见变化即作废旧抢跑、按新语境重建;无变化轮不落标记,白拿抢跑提速。
-            # mlx prompt cache 按最长公共前缀匹配,追加只增增量 token,唔伤 KV。
+            # ⚠️ 标记只准留在框架侧做失效触发,绝不能进 mlx 请求流:它是本轮一次性
+            # 消息(下轮历史无此标记),进请求会令下一轮喺同一位置分叉 → cached 钉死
+            # system 锚点、每轮全量重 prefill、TTFT 随轮次 1.2s→8.5s(指纹实证
+            # call-b882cd69)。ContextAwareLLM.chat 出口统一剥离(见 livekit_plugins)。
             def _invalidate_stale_preemptive(reason: str) -> None:
                 try:
                     turn_ctx.add_message(role="system", content=f"[流程状态] {reason}")
@@ -1372,10 +1439,13 @@ async def entrypoint(ctx):
                 if flow_ctrl.has_steps:
                     _g, _r = flow_ctrl.current_goal_ref()
                     _wa_signal = detect_whatsapp_signal(
-                        user_text, step_goal=_g, step_ref=_r, facts=flow_ctrl.vars_map
+                        user_text, step_goal=_g, step_ref=_r, facts=flow_ctrl.vars_map,
+                        already_captured=_wa_captured["on"],
                     )
                     if _wa_signal:
                         _kind, _num = _wa_signal
+                        if _kind in ("captured", "captured_implicit"):
+                            _wa_captured["on"] = True
                         if _kind == "captured_implicit":
                             # WhatsApp 綁定呢個來電/號碼:號喺系統度,攞對象電話上報 captured。
                             # 對象冇電話 → 上報 offered(操作台見「待對接」);兩種都照推進,唔死鎖。
@@ -1397,8 +1467,18 @@ async def entrypoint(ctx):
                                     print(f"[whatsapp] report failed, will retry on next signal: {exc!r} (call {room_name})", flush=True)
 
                             asyncio.create_task(_report())
+                            if _kind == "captured_implicit" or (_num and _num != "offered"):
+                                context_state.set_whatsapp_note(_num)
                             print(f"[whatsapp] {_kind} num={_num or '-'} (call {room_name})", flush=True)
             except Exception:  # pragma: no cover - WhatsApp 偵測失敗唔阻斷
+                pass
+            # 会中事实沉淀(R4):客户话里的平台/号码抽进尾部【通话中客户已讲】
+            # (去重有界 ≤4 条)——早轮事实唔再随滚动记忆/历史截断蒸发,
+            # 模型唔会重复问已答过的事(call-701c180b 同一问三遍实证)。
+            try:
+                for _fact in extract_call_facts(user_text, facts=flow_ctrl.vars_map):
+                    context_state.add_call_fact(_fact)
+            except Exception:  # pragma: no cover - 沉淀失败唔阻回复
                 pass
             # 流程推进:读用户最新话,判定是否进入下一步,更新"当前步"约束注入。
             if flow_ctrl.has_steps:
@@ -1406,6 +1486,9 @@ async def entrypoint(ctx):
                     from .flow import should_auto_advance
 
                     verdict = flow_ctrl.rule_verdict(user_text)
+                    # verdict 进尾部:规则判定结果此前只用于推进、从不进提示词,
+                    # 客户提问/答非所问时模型冇「该怎么答」指引 → 复读当前步。
+                    flow_ctrl.last_verdict = verdict
                     if verdict == REFUSE:
                         # 客户明确拒绝/告别 → 收尾态:注入收尾话术(一句礼貌再见),
                         # 唔推进/唔 judge/唔按步走;讲完后 _schedule_call_end 主动结束通话
@@ -1499,37 +1582,16 @@ async def entrypoint(ctx):
             except asyncio.TimeoutError:
                 pass
 
-    watch_task = asyncio.create_task(_supervisor_watch())
-    # AgentSession 内部已注册 job shutdown callback（自动 aclose），
-    # 这里不能提前 close，否则会话在接通后立刻被销毁。
-    await session.start(agent=agent, room=ctx.room)
-    _log_stage("session_started")
-
-    if not agent.paused:
-        # 开场白用开场语言（对象/人设语言决定）；generate_reply 的 instructions 会
-        # 在基础指令上叠加，配合 system 里的母语设定让首句即用对的语言。
-        greetings = {"zh": "请问有什么可以帮您？", "cantonese": "請問有咩可以幫到你？", "en": "How can I help you?"}
-        await session.generate_reply(instructions=greetings.get(greet_lang, greetings["zh"]))
-        _log_stage("greeting_queued")
-    # ---- 会话首轮真实前缀预热（LLM_PREFIX_PREWARM，默认 1）--------------------
-    # context_state/persona/flow 已装配完（前缀字节就此定形）、session 已建——
-    # fire-and-forget 发一个「真实 prompt 形状」的 1-token 请求：把 merged system
-    # 前缀烧进 mlx prompt cache，turn-1 真请求 cached≈system 长度，免 ~1.4s 全量
-    # prefill（p6：会话首轮 TTFT 2.1-3.2s、cached=0 是延迟台账最差档）。
-    # 触发点=开场白之后：冷启动时预热若排在 greeting prefill 前面，会把开场白
-    # TTFT 拖慢一整个 prefill（实测 7.3s vs ~2s 基线）；greeting 本身就会把
-    # system 前缀烧进 cache，预热只需在「客户开口前」补齐 [system+user 形状]
-    # 的边界——greeting playout（几秒）足够它跑完。paused（无 greeting）时立即发。
-    # 绝不阻塞会话：asyncio.create_task + 异常全吞（失败只损失预热）。
-    if _prefix_prewarm_armed:
-        asyncio.create_task(_prefix_prewarm_task())
-
-    # ---- 沉默心跳(真实电话节奏):AI 講完轉回「聆聽」後 SILENCE_NUDGE_SECONDS(默認3.5s)
+    # ---- 沉默心跳(真实电话节奏):AI 講完轉回「聆聽」後 SILENCE_NUDGE_SECONDS(默认8s)
     # 客戶冇出聲 → 一句「仲喺度嗎」帶返當前步;兩次都冇回應 → 禮貌收尾並自動收線
-    # (disposition=no_response,總靜音 ~3.5+3.5+12≈19s)。客戶出聲即撤錶歸零;
-    # 收尾態/流程走完/暫停中唔追。SILENCE_NUDGE_MAX=0 關閉。
+    # (disposition=no_response)。客戶出聲即撤錶歸零;收尾態/流程走完/暫停中唔追。
+    # SILENCE_NUDGE_MAX=0 關閉。
+    # ⚠️ 定义与注册必须先于 session.start/开场白:开场白播完的 listening 转换
+    # 发生在注册前的话,首段沉默永远收不到 arm、no_response 收线整条失效
+    # (2026-09-05 审查 P1)。依赖(session/agent/flow_ctrl/closed/...)此处均已就绪。
     nudge_max = int(os.environ.get("SILENCE_NUDGE_MAX", "2"))
-    nudge_delay = float(os.environ.get("SILENCE_NUDGE_SECONDS", "3.5"))
+    # 默认 8s:旧 3.5-4s 太激进,客戶停頓/諗嘢/答案生成中就跳心跳(實測反饋「一直心跳」)。
+    nudge_delay = float(os.environ.get("SILENCE_NUDGE_SECONDS", "8"))
     _nudge_state["farewell"] = False
 
     def _disarm_silence() -> None:
@@ -1553,14 +1615,19 @@ async def entrypoint(ctx):
                 return
             if closed.is_set() or agent.paused or flow_ctrl.closing or _nudge_state.get("farewell"):
                 return
+            now = time.monotonic()
+            last_user = float(_nudge_state.get("last_user_ts") or 0.0)
+            last_reply = float(_nudge_state.get("last_reply_ts") or 0.0)
+            if not _nudge_should_fire(now, last_reply, last_user, nudge_delay):
+                return
             name = str((object_card or {}).get("display_name") or "").strip()
             lang = language_state.lang if language_state.lang in ("zh", "cantonese", "en") else "zh"
             if _nudge_state["count"] >= nudge_max:
-                # 兩次確認都冇回應 → 禮貌收尾,講完(一句TTS+余量)自動收線。
+                # 兩次確認都冇回應 → 禮貌收尾直念,講完(一句TTS+余量)自動收線。
                 _nudge_state["farewell"] = True
                 print(f"[heartbeat] still silent after {_nudge_state['count']} nudges -> farewell+end (call {room_name})", flush=True)
                 try:
-                    await session.generate_reply(instructions=_silence_farewell_instruction(name, lang))
+                    await session.say(_farewell_line(name, lang))
                 except Exception as exc:  # pragma: no cover - 收尾失敗都照收線
                     print(f"[heartbeat] farewell failed: {exc!r} (call {room_name})", flush=True)
                 _schedule_call_end(12.0, disposition="no_response")
@@ -1568,26 +1635,71 @@ async def entrypoint(ctx):
             _nudge_state["count"] += 1
             print(f"[heartbeat] silent {nudge_delay:.0f}s -> nudge {_nudge_state['count']}/{nudge_max} (call {room_name})", flush=True)
             try:
-                await session.generate_reply(instructions=_nudge_instruction(name, lang))
+                await session.say(_nudge_line(name, lang, _nudge_state["count"] - 1))
             except Exception as exc:  # pragma: no cover - 心跳失敗唔阻通話
                 print(f"[heartbeat] nudge failed: {exc!r} (call {room_name})", flush=True)
 
         _nudge_state["timer"] = asyncio.create_task(_fire())
 
     def _on_agent_state(ev) -> None:
-        # AI 講完轉「聆聽」→ 起錶;講話/思考中 → 撤錶。
+        # AI 講完轉「聆聽」→ 記低 AI 最後講完時刻再起錶;講話/思考中 → 撤錶。
         if getattr(ev, "new_state", "") == "listening":
+            _nudge_state["last_reply_ts"] = time.monotonic()
             _arm_silence()
         else:
             _disarm_silence()
 
     def _on_user_state(ev) -> None:
         if getattr(ev, "new_state", "") == "speaking":
+            _nudge_state["last_user_ts"] = time.monotonic()
             _disarm_silence()
+        elif nudge_max > 0:
+            # 噪声/一句未成轮的短音同样撤表——用户停声后补 arm(防永久关心跳);
+            # _fire 的时序护栏会挡住「答案还在路上」的窗口,误 arm 无害。
+            _arm_silence()
 
     if nudge_max > 0:
         session.on("agent_state_changed", _on_agent_state)
         session.on("user_state_changed", _on_user_state)
+
+    watch_task = asyncio.create_task(_supervisor_watch())
+    # AgentSession 内部已注册 job shutdown callback（自动 aclose），
+    # 这里不能提前 close，否则会话在接通后立刻被销毁。
+    await session.start(agent=agent, room=ctx.room)
+    _log_stage("session_started")
+
+    if not agent.paused:
+        # 开场白脚本直念(session.say,不加 LLM):旧 generate_reply(instructions)
+        # 的临时 system 指令下轮即剥,是会话第一个 KV-cache 前缀断裂点,且冷启
+        # TTFT 2-3.4s 全灌在开场白上。直念即点即播(纯 TTS,~100ms 出声);
+        # 文本仍入 chat_ctx(say add_to_chat_ctx 默认 True),turn-1 前缀命中不变。
+        greetings = {"zh": "请问有什么可以帮您？", "cantonese": "請問有咩可以幫到你？", "en": "How can I help you?"}
+        # 开场白=话术第 1 步 ref 首行直念(变量已替换):用户在模板里配嘅开场即所念,
+        # 改模板下一通即生效;三语模板各自第 1 步就係各语言开场(三语都引用话术)。
+        # 模板语言与通话语言唔一致、或第 1 步变量缺失(渲染后仍剩 {占位}) →
+        # 退回通用语(语言/音色一致性优先,唔会念出「请问係咪{姓名}」)。
+        opening = ""
+        if flow_ctrl.has_steps and (template or {}).get("language") == greet_lang:
+            opening = flow_ctrl.opening_text()
+        # 开场已念(模板句或通用句都算) → 标记 + 先把【开场已念】写进尾部再起预热:
+        # 首条 user 尾部此时尚未冻结,保证预热形状 == turn-1 请求形状。
+        flow_ctrl.opening_played = True
+        if flow_ctrl.has_steps:
+            context_state.set_flow_current(flow_ctrl.current_step_text())
+        greeting_text = opening or greetings.get(greet_lang, greetings["zh"])
+        # 预热与开场白并行:开场白=纯 TTS(云 MiniMax),预热走本地 LLM prefill,
+        # 互无争抢——旧顺序 say() 要等整段念完才返回(话术开场白 7-11s),预热被
+        # 拖到最后,客户在开场白中途插话的 turn-1 只能全量 prefill(~2-4s TTFT)。
+        # paused(无开场白)分支在下方立即发(无开场白形状)。
+        if _prefix_prewarm_armed:
+            asyncio.create_task(_prefix_prewarm_task(agent, greeting_text))
+        await session.say(greeting_text)
+        # say() 返回=整段念完(playout end),唔係出声时刻——TTS 首包在 say 调用后
+        # ~0.4s 就到了(2026-09-06 打点纠偏,旧名 greeting_queued 曾误读为出声慢)。
+        _log_stage("greeting_playout_done")
+    elif _prefix_prewarm_armed:
+        # paused 起动无开场白:立即按「无开场白」形状预热(任务体回退抓 chat_ctx)。
+        asyncio.create_task(_prefix_prewarm_task(agent, ""))
 
     # session.start 只负责拉起流水线（返回后会话在后台运行）。保持 entrypoint
     # 存活直到房间关闭，supervisor watcher 在此期间持续轮询；_on_close 置位
@@ -1609,4 +1721,7 @@ def run_agent() -> None:
         sys.argv.append("start")
     # 显式分发(官方推荐):worker 只接 agent_name="bok-voice" 的 job——由 CP
     # /api/token 挂 RoomAgentDispatch 精确派发;不再隐式接所有房间(含同传房)。
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name="bok-voice"))
+    # port 显式钉 8081(prod status 探活 :8081/worker):A/B 线三个 worker 并存,
+    # 不分端口会同抢默认 8081,后绑者 Errno 48 即崩("Agent did not join the
+    # room" 根因,2026-09-06 实证)。
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name="bok-voice", port=8081))

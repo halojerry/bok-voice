@@ -21,7 +21,7 @@ interface ObjectRow {
 const EMPTY_FORM = {
   display_name: "",
   role_template: "采购商",
-  language: "vi",
+  language: "zh",
   background: "",
   phone: "",
   tracking_no: "",
@@ -42,6 +42,51 @@ export default function ObjectsPage() {
   const [importText, setImportText] = useState("");
   const [importMsg, setImportMsg] = useState<string | null>(null);
   const [showImport, setShowImport] = useState(false);
+  // 批量勾选删除：selected 存对象 id 集合，只对「当前搜索过滤后可见」行做全选。
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulkErr, setBulkErr] = useState<string | null>(null);
+
+  const toggleOne = (id: string) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
+  const toggleAllVisible = () =>
+    setSelected((prev) => {
+      const ids = filtered.map((r) => String(r.id ?? r.object_id ?? "")).filter(Boolean);
+      const allOn = ids.length > 0 && ids.every((id) => prev.has(id));
+      const next = new Set(prev);
+      for (const id of ids) {
+        if (allOn) next.delete(id);
+        else next.add(id);
+      }
+      return next;
+    });
+
+  async function deleteSelected() {
+    const ids = [...selected].filter(Boolean);
+    if (ids.length === 0) return;
+    if (!window.confirm(`确认删除选中的 ${ids.length} 个对象？（通话转写与结算一并删除）`)) return;
+    setBulkErr(null);
+    let failed = 0;
+    let firstErr = "";
+    for (const id of ids) {
+      try {
+        await api.deleteObject(id);
+      } catch (e) {
+        failed += 1;
+        if (!firstErr) firstErr = String(e);
+      }
+    }
+    setSelected(new Set());
+    await refresh();
+    if (failed > 0) {
+      setBulkErr(`删除完成：成功 ${ids.length - failed} 个，失败 ${failed} 个${firstErr ? `（${firstErr}）` : ""}。`);
+    }
+  }
 
   /** 解析 CSV/制表符分隔文本 → 对象行(支持表头:姓名/快递单号/物流公司/电话)。 */
   function parseImport(text: string): Record<string, string>[] {
@@ -65,7 +110,7 @@ export default function ObjectsPage() {
       rows.push({
         display_name: name,
         role_template: "采购商",
-        language: "vi",
+        language: "zh",
         tracking_no: cNo >= 0 ? cells[cNo] ?? "" : "",
         courier: cCourier >= 0 ? cells[cCourier] ?? "" : "",
         address: cAddr >= 0 ? cells[cAddr] ?? "" : "",
@@ -200,17 +245,42 @@ export default function ObjectsPage() {
             </div>
           )}
           {err && <ErrorState message={err} />}
+          {bulkErr && <p className="mb-2 text-xs text-red-300">{bulkErr}</p>}
           {loading ? (
             <LoadingState />
           ) : filtered.length === 0 ? (
             <EmptyState label="暂无对象，请在右侧建档。" />
           ) : (
-            <div className="space-y-2">
-              {filtered.map((r) => {
-                const id = String(r.id ?? r.object_id ?? "");
-                return (
-                  <div key={id} className="flex items-center justify-between gap-3 rounded-lg bg-white/5 px-4 py-3">
-                    <div className="min-w-0">
+            <>
+              <div className="mb-2 flex items-center gap-3 text-xs">
+                <label className="flex cursor-pointer items-center gap-1.5 text-[var(--muted)]">
+                  <input
+                    type="checkbox"
+                    className="accent-[var(--accent)]"
+                    checked={filtered.every((r) => selected.has(String(r.id ?? r.object_id ?? "")))}
+                    onChange={toggleAllVisible}
+                  />
+                  全选本页
+                </label>
+                <span className="text-[var(--muted)]">已选 {selected.size}</span>
+                {selected.size > 0 && (
+                  <button className="btn-ghost text-red-300" onClick={deleteSelected}>
+                    删除所选（{selected.size}）
+                  </button>
+                )}
+              </div>
+              <div className="space-y-2">
+                {filtered.map((r) => {
+                  const id = String(r.id ?? r.object_id ?? "");
+                  return (
+                    <div key={id} className="flex items-center gap-3 rounded-lg bg-white/5 px-4 py-3">
+                      <input
+                        type="checkbox"
+                        className="shrink-0 accent-[var(--accent)]"
+                        checked={selected.has(id)}
+                        onChange={() => toggleOne(id)}
+                      />
+                      <div className="min-w-0 flex-1">
                       <p className="truncate font-medium">{String(r.display_name ?? "-")}</p>
                       <p className="text-xs text-[var(--muted)]">
                         {String(r.role_template ?? "-")} · {String(r.language ?? "-")}
@@ -227,10 +297,11 @@ export default function ObjectsPage() {
                       <button className="btn-ghost text-xs" onClick={() => edit(r as unknown as ObjectRow)}>编辑</button>
                       <button className="btn-ghost text-xs text-red-300" onClick={() => remove(id)}>删除</button>
                     </div>
-                  </div>
-                );
-              })}
-            </div>
+                    </div>
+                  );
+                })}
+              </div>
+              </>
           )}
         </section>
 
@@ -258,10 +329,9 @@ export default function ObjectsPage() {
                 value={form.language}
                 onChange={(e) => setForm({ ...form, language: e.target.value })}
               >
-                <option value="vi">越南语</option>
                 <option value="zh">中文</option>
-                <option value="en">英语</option>
                 <option value="cantonese">粤语</option>
+                <option value="en">英语</option>
               </select>
             </div>
             <input
