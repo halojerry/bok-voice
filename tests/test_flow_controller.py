@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps" / "agent"))
 
 from agent_runtime.flow import (  # noqa: E402
     FlowController,
+    _digit_runs_in,
     decide_advance,
     facts_line,
     object_vars,
@@ -578,3 +579,85 @@ def test_done_confirm_no_reask():
     assert "毋需再问" in cur
     fc.last_verdict = "question"
     assert "毋需再问" not in fc.current_step_text()
+
+
+# ---- WS1 总览带各步事实(2026-09-07) ----
+
+
+def test_flow_overview_includes_step_fact_lines():
+    fc = FlowController.from_template(
+        {
+            "steps_json": (
+                '[{"goal":"开场核对","ref":"您好，请问是{courier}的件吗？\\n如果客户否认→记录"},'
+                '{"goal":"理赔说明","ref":"我们有保险，会一赔二。"}]'
+            )
+        },
+        OBJ,
+    )
+    ov = fc.flow_overview()
+    # 每步带 ref 首行事实——客户问细节时模型手头有话术事实可引用
+    assert "我们有保险，会一赔二" in ov
+    # 分支指引(第二行)唔进总览
+    assert "如果客户否认" not in ov
+    # 确定性:两次渲染字节一致(KV 前缀安全)
+    assert ov == fc.flow_overview()
+
+
+# ---- WS3 单字确认收窄(2026-09-07):≤2 字纯应承只喺问话步先算确认 ----
+
+
+def test_short_ack_confirms_only_on_question_step():
+    # 疑问步(ref 含 ？)收到单字应承 → 答话,CONFIRM 推进
+    fc = FlowController.from_template(
+        {"steps_json": '[{"goal":"g1","ref":"您看这样处理，合不合适？"},{"goal":"g2","ref":"r2"}]'}, OBJ
+    )
+    assert fc.rule_verdict("对。") == "confirm"
+    fc.last_verdict = "confirm"
+    fc.on_user_turn("对。")
+    assert fc.current == 1
+    # 陈述步(ref 冇 ？)收到单字应承 → 寒暄,UNCLEAR 停留唔推流程
+    fc2 = FlowController.from_template(
+        {"steps_json": '[{"goal":"g1","ref":"我们会一赔二赔付到您的账户"},{"goal":"g2","ref":"r2"}]'}, OBJ
+    )
+    v = fc2.rule_verdict("嗯。")
+    fc2.last_verdict = v
+    assert v == "unclear"
+    assert fc2.current == 0
+
+
+def test_multi_char_ack_still_confirms_any_step():
+    fc = FlowController.from_template(
+        {"steps_json": '[{"goal":"g1","ref":"我们会一赔二赔付到您的账户"},{"goal":"g2","ref":"r2"}]'}, OBJ
+    )
+    fc.on_user_turn("好啊，好啊，好。")
+    assert fc.current == 1
+
+
+def test_short_ack_on_statement_step_renders_reask_guidance():
+    fc = FlowController.from_template(
+        {"steps_json": '[{"goal":"g1","ref":"这一步是说明赔付方案"},{"goal":"g2","ref":"r2"}]'}, OBJ
+    )
+    v = fc.rule_verdict("嗯。")
+    fc.last_verdict = v
+    assert v == "unclear"
+    assert "换个说法简短再引导" in fc.current_step_text()
+
+
+# ---- WS4 数字读回核对(2026-09-07) ----
+
+
+def test_digit_runs_in_extracts_normalized_runs():
+    assert _digit_runs_in("我的单号是一二三四") == ["1234"]
+    assert _digit_runs_in("尾号7890，电话98765432") == ["7890", "98765432"]
+    assert _digit_runs_in("没有数字") == []
+
+
+def test_last_digits_render_readback_guidance():
+    fc = FlowController.from_template(
+        {"steps_json": '[{"goal":"g1","ref":"r1"},{"goal":"g2","ref":"r2"}]'}, OBJ
+    )
+    fc.last_digits = ["1234"]
+    cur = fc.current_step_text()
+    assert "逐位复述核对" in cur and "1234" in cur
+    fc.last_digits = []
+    assert "逐位复述核对" not in fc.current_step_text()

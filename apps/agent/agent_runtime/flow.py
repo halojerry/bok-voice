@@ -314,6 +314,20 @@ def _valid_digit_runs(norm: str) -> list[str]:
     return [r for r in re.findall(r"[0-9]{6,13}", norm)]
 
 
+def _digit_runs_in(text: str) -> list[str]:
+    """每轮客户话里的数字串(≥4 位,汉字/英文数字词已归一成 ASCII)——读回核对指引用。
+
+    唔同 _valid_digit_runs(WhatsApp 语义,6 位起),呢度只要 4 位就算「客戶報咗數字」:
+    单号尾号常係 4 位,转写出错也最伤。逐 run 归一(唔成段归一,免得两串数字被拼成一条)。"""
+    runs = re.findall(r"[0-9一二三四五六七八九零]{4,}", str(text or ""))
+    out: list[str] = []
+    for r in runs:
+        nv = _digit_normalize(r)[:13]
+        if nv and nv not in out:
+            out.append(nv)
+    return out
+
+
 def _run_is_known_number(run: str, facts: dict | None) -> bool:
     """号码 run 命中已知 单号/尾号/电话 → 客户係覆述已知资料,唔係俾新 WhatsApp。"""
     if not facts:
@@ -420,12 +434,24 @@ def extract_call_facts(user_text: str, *, facts: dict | None = None) -> list[str
     return out
 
 
-def decide_advance(user_text: str, *, facts: dict | None = None) -> str:
+def _short_pure_ack(text: str) -> bool:
+    """归一化(去标点空白)后 ≤2 字的纯应承(「好」「係啊」「嗯」「ok」)。
+
+    单字/双字应承只喺当前步係问话(「…合不合适？」)时先算回答;陈述步收到
+    单字应承多半係寒暄/过渡,当 CONFIRM 会推着流程跑(2026-09-07 走流程太急)。
+    多字应承(「好啊好啊好」「没问题」「可以可以」)唔受限——叠词本身就係
+    明确态度。"""
+    cleaned = re.sub(r"[\s,，、.!！。?？~～]+", "", (text or "").lower())
+    return 0 < len(cleaned) <= 2 and _is_pure_ack(text)
+
+
+def decide_advance(user_text: str, *, facts: dict | None = None, short_ack_confirms: bool = True) -> str:
     """判定客户对当前这一步的反应,决定停留/推进。
 
     facts=对象已知资料(vars_map:姓名/单号/尾号等)时,客户覆述啱关键资料
     (「七八九零啊」「我係林先生」)都算 confirm;纯 echo 提问(「係咪你講嗰個
     七八九零?」)唔算——答得啱先当确认,唔係淨係「佢有冇講到個冧巴」。
+    short_ack_confirms=False(当前步唔係问话)时,≤2 字纯应承降 UNCLEAR 停留。
     """
     t = user_text.strip()
     if not t:
@@ -440,11 +466,13 @@ def decide_advance(user_text: str, *, facts: dict | None = None) -> str:
     is_question = bool(_QUESTION_RE.search(t))
     strong_affirm = bool(_STRONG_AFFIRM_RE.search(t))
     fact_match = _matches_known_fact(t, facts)
+    short_ack = _short_pure_ack(t)
     # 3) 提问且冇「多字确认」→ question(唔好因为句中出现已知尾号/单字係就当确认)
     if is_question and not strong_affirm:
         return QUESTION
-    # 4) 确认/认可(社交词、多字确认、或答啱资料)→ confirm(先于提问:客户"是我的,然后呢?"主体是确认)
-    if strong_affirm or fact_match or _CONFIRM_RE.search(t):
+    # 4) 确认/认可(社交词、多字确认、或答啱资料)→ confirm(先于提问:客户"是我的,然后呢?"主体是确认)。
+    #    单字/双字纯应承喺非问话步降 UNCLEAR——寒暄唔推流程。
+    if (strong_affirm or fact_match or _CONFIRM_RE.search(t)) and not (short_ack and not short_ack_confirms):
         return CONFIRM
     # 5) 纯提问 → question(停留本步解答)
     if is_question:
@@ -479,6 +507,10 @@ class FlowController:
     # 判定、从不进提示词,客户提问/答非所问时模型冇「该怎么答」指引 → 4B 默认
     # 复读当前步。current_step_text 据此渲染对应应答指引。
     last_verdict: str = ""
+    # 最近一轮客户报出的数字串(≥4 位,已归一成 ASCII)——数字係 ASR 最弱项
+    # (同一串数字两窗两解,2026-09-07 日志实证),AI 拿到错号从不复核。
+    # current_step_text 据此渲染「逐位复述核对」指引。agent.py 钩子每轮写入。
+    last_digits: list[str] = field(default_factory=list)
 
     @classmethod
     def from_template(cls, template: dict | None, object_card: dict | None) -> "FlowController":
@@ -524,7 +556,16 @@ class FlowController:
     def rule_verdict(self, user_text: str) -> str:
         """规则判定(唔改动状态):只有"确认/认可当前步"先算可推进。"""
         # facts=vars_map:客户覆述啱已知资料(姓名/尾号/单号)都算确认,唔净靠社交词。
-        return decide_advance(user_text, facts=self.vars_map)
+        # 单字应承(好/係/嗯)只喺当前步係问话(「…合不合适？」)先算确认——
+        # 陈述步收到单字应承係寒暄,降 UNCLEAR 停留,唔推流程走太快。
+        return decide_advance(user_text, facts=self.vars_map, short_ack_confirms=self._current_step_is_question())
+
+    def _current_step_is_question(self) -> bool:
+        """当前步 ref 是否问话（含 ？/?）——单字应承算不算回答的依据。"""
+        if not self.has_steps or self.done:
+            return True
+        ref = self.steps[self.current].ref or ""
+        return ("？" in ref) or ("?" in ref)
 
     def advance(self) -> None:
         """推进到下一步(最后一步确认后即完成,唔越界)。"""
@@ -622,6 +663,12 @@ class FlowController:
         if verdict_line:
             lines.append(verdict_line)
             self._just_advanced = False
+        if self.last_digits:
+            digits_txt = "、".join(self.last_digits[:2])
+            lines.append(
+                f"【客户报了数字（{digits_txt}）】语音转写数字容易出错：先把数字逐位复述核对一次"
+                "（例如「三四——四四」，两位一组慢慢念），客户确认无误才继续；核对不符请客户重报。"
+            )
         if step.goal:
             lines.append(f"这一步要达成:{render_template_text(step.goal, self.vars_map)}")
         if step.ref:
@@ -648,15 +695,34 @@ class FlowController:
     def flow_overview(self) -> str:
         """流程总览(注入基础 system,让 LLM 知道全貌但不照读)。
 
-        为 1.5s 延迟预算瘦身 prefill：后续步只保留「第N步:目标」一行标题/要点，
-        不再带每步参考长文（当前步全文由 current_step_text 注入）。LLM 只需知道
-        大致顺序与"下一步"方向，细节按轮给。
+        2026-09-07 恢复带各步事实：旧瘦身只留「第N步:目标」标题，客户问赔偿
+        细节/到账时间时模型手头只有当前步 ref、其它步的事实不在场——verdict
+        指引叫它「用话术事实回答」也无米炊，只能复读当前步（「只跟话术不会
+        灵活回应」主因）。现在每步带 ref 首行（该步真正要讲的内容，截 60 字），
+        +400-700 token 属每通一次 prefill（LLM_PREFIX_PREWARM 首轮预热吸收，
+        之后缓存命中）。总览装配时一次定格、整场字节不变——严格前缀安全。
         """
         if not self.has_steps:
             return ""
-        lines = [f"对话按 {len(self.steps)} 步流程推进,每步等用户确认后再进下一步:"]
-        lines += self.overview_goal_lines()
+        lines = [f"对话按 {len(self.steps)} 步流程推进,每步等用户确认后再进下一步.各步要点(可引用其中事实回答客户):"]
+        for i, s in enumerate(self.steps, 1):
+            g = render_template_text(s.goal, self.vars_map) if s.goal else s.ref
+            line = f"第{i}步:{g}"
+            fact = self._step_fact_line(s)
+            if fact:
+                line += f"——{fact}"
+            lines.append(line)
         return "\n".join(lines)
+
+    def _step_fact_line(self, s: "FlowStep") -> str:
+        """该步 ref 首个非空行(变量已渲染,分支指引「\\n如果客户…」唔算)——
+        截 60 字作总览里该步的事实摘要。"""
+        rendered = render_template_text(s.ref or "", self.vars_map)
+        for line in rendered.splitlines():
+            line = line.strip()
+            if line and not re.search(r"\{[^{}]+\}", line):
+                return line[:60]
+        return ""
 
     def overview_goal_lines(self) -> list[str]:
         """淨係「第N步:目標」嘅行,畀推進判定器當 roadmap。"""
