@@ -147,7 +147,7 @@ def test_fact_confirm_advances_flow_step():
     cur = fc.current_step_text()
     assert "第 2/2 步" in cur
     # 推进后注入「新一步」提示,提醒 LLM 换步(唔好延续旧承诺)。
-    assert "【新一步】" in cur and "唔好延续上一步" in cur
+    assert "【新一步】" in cur and "不要延续上一步" in cur
 
 
 def test_not_confirm_stays_with_recall_guidance():
@@ -159,8 +159,8 @@ def test_not_confirm_stays_with_recall_guidance():
     assert fc.current == 0
     cur = fc.current_step_text()
     assert "核對/引導資料" in cur or "核对/引导资料" in cur
-    assert "訂單" in cur and "截圖" in cur  # 引導提供資料,唔係臨時承諾
-    assert "我幫你查完再覆你" in cur and "全程你自己同客戶傾" in cur
+    assert "订单" in cur and "截图" in cur  # 引导提供资料，不是临时承诺
+    assert "我帮你查完再答复你" in cur and "全程你自己与客户沟通" in cur
 
 
 def test_non_verify_step_no_recall_guidance():
@@ -488,7 +488,7 @@ def test_refuse_enters_closing_and_stays():
     assert fc.rule_verdict("我唔需要，唔好再打嚟。") == REFUSE
     fc.enter_closing()
     cur = fc.current_step_text()
-    assert "收尾" in cur and "拜拜" in cur
+    assert "收尾" in cur and "再见" in cur  # 收尾例句已改中性书面中文(语言纯度,2026-09-06)
     # 收尾态即使客户改口应承,都唔翻流程(真改口由人工/新通话处理)。
     fc.on_user_turn("係我,可以㗎。")
     assert fc.current == 0 and fc.closing
