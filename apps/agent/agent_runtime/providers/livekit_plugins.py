@@ -619,6 +619,11 @@ class ContextState:
         if t:
             self._last_reply = t[:80]
 
+    @property
+    def last_reply(self) -> str:
+        """只读出口:agent 回声守卫比对「AI 正在讲/刚讲过」的文本用。"""
+        return self._last_reply
+
     def record_applied_tail(self, orig: str, final: str) -> None:
         self._applied_tails.append((orig, final, self._revision))
 
@@ -1802,6 +1807,46 @@ def _minimax_pool_schedule(endpoint: str, key: str) -> None:
     _MINIMAX_POOL_TASK = loop.create_task(_minimax_pool_replenish(endpoint, key))
 
 
+def _trim_lead_silence(
+    pcm: bytes,
+    sample_rate: int,
+    *,
+    max_ms: int = 200,
+    fade_ms: int = 15,
+    rms_gate: int = 120,
+) -> tuple[bytes, int]:
+    """剪掉 PCM(s16le mono) 头部静音；剪过才对新的起始做 fade_ms 线性淡入。
+
+    MiniMax 首包偶带前导静音，剪掉=可闻出声更早；剪口做淡入防咔哒声
+    （RealtimeTTS base_engine 的 trim_silence_start/apply_fade_in 同款，2026-09-07
+    借鉴）。max_ms 上限防误剪气声起句（RMS 低但係真语音）；一次调用最多剪
+    max_ms，残余静音留给下次首帧检查继续剪。零静音时原样返回（字节不变，
+    零害）。返回 (处理后 pcm, 剪掉的毫秒)。
+    """
+    frame = max(1, sample_rate // 50) * 2  # 20ms 字节数(s16le mono)
+    buf = pcm
+    trimmed_ms = 0
+    while len(buf) >= frame and trimmed_ms < max_ms:
+        n = frame // 2
+        acc = 0
+        for i in range(n):
+            v = int.from_bytes(buf[i * 2 : i * 2 + 2], "little", signed=True)
+            acc += v * v
+        if (acc / n) ** 0.5 >= rms_gate:
+            break
+        buf = buf[frame:]
+        trimmed_ms += 20
+    if not trimmed_ms:
+        return pcm, 0
+    nf = max(1, sample_rate * fade_ms // 1000)
+    body = bytearray(buf)
+    for i in range(min(nf, len(body) // 2)):
+        v = int.from_bytes(body[i * 2 : i * 2 + 2], "little", signed=True)
+        v = int(v * (i + 1) / nf)
+        body[i * 2 : i * 2 + 2] = max(-32768, min(32767, v)).to_bytes(2, "little", signed=True)
+    return bytes(body), trimmed_ms
+
+
 class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
     """MiniMax 增量流式：一条 WS 连接，LLM 文本增量到达即 task_continue。
 
@@ -1976,6 +2021,17 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                             init_done = True
                         buf.extend(chunk)
                         if not first_pushed and len(buf) >= frame_bytes // 5:
+                            # 首包前导静音修剪(RealtimeTTS trim_silence_start 同款):
+                            # MiniMax 首包偶带前导静音,剪掉=可闻出声更早;剪口
+                            # fade-in 防咔哒。全静音(剪空)→ 唔推唔置位,等下一块
+                            # 再检查;每次调用最多剪 max_ms,残余静音逐次收。
+                            trimmed, trim_ms = _trim_lead_silence(bytes(buf), sample_rate)
+                            buf.clear()
+                            buf.extend(trimmed)
+                            if trim_ms:
+                                print(f"MINIMAX_TTS_LEAD_SILENCE_TRIM ms={trim_ms}", flush=True)
+                            if not buf:
+                                continue
                             # P0 首帧早推:不足 200ms 先推 ~40ms,早出声(照 Qwen3-TTS 同款)。
                             # P0 秒表:首个音频块推送时刻(距 task_start)。
                             t_first = time.monotonic()
@@ -3586,6 +3642,22 @@ _ASR_SENTENCE_MIN_CHARS = 6
 # 限速:两次句级提交最少间隔(「好。係。唔該。」连珠句防机关枪式连发,
 # 排队语义=剩余文本并入下一边界或 VAD 停嘴整句兜底)。
 _ASR_SENTENCE_MIN_INTERVAL_S = 1.5
+
+
+def _pause_commit_min_chars() -> int:
+    """vad-pause 路径提交的字数下限（默认 10 > 标点路径 6）。
+
+    微停顿（≥0.45s）只证明「喘了口气」，证明唔了「一句话讲完」——6-9 字碎片
+    （「你邊個啊。」）被当整轮提交，回复 TTS 出声前就被下一碎片新轮掐死
+    （碎片提交饿死回复）。扣住后说话继续则并入下个边界、真停嘴则整句 finish
+    兜底，轮唔会丢。QWEN3_ASR_PAUSE_COMMIT_MIN_CHARS=6 回退旧行为。
+    （借鉴 KoljaB/RealtimeVoiceChat turndetect 的语义端点思想：提交前先看
+    「像唔像说完」；官方 audio turn detector v1-mini 属架构级换件，另评估。）
+    """
+    try:
+        return int(os.environ.get("QWEN3_ASR_PAUSE_COMMIT_MIN_CHARS", "10"))
+    except ValueError:
+        return 10
 # VAD 微停顿候选句尾部的弱停顿符：滑窗 partial 说话期句尾只打逗号（p6 实测），
 # 停嘴高精度 finish 会升级成句号——提交时剥掉弱尾符，让已提交前缀与 finish
 # 整句做 startswith 匹配时唔会因「，vs。」错位（错位会触发 rfind 兜底返回
@@ -3930,7 +4002,9 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         - 稳定性：上一窗同坐标已是同一句段（首现唔提交，防滑窗跳变 flicker）；
         - 限速：距上次提交 < _ASR_SENTENCE_MIN_INTERVAL_S 唔提交（连珠句防机关枪）。
         allow_eos=True（VAD 微停顿触发）：标点扫描无果时，边界候选=当前滑窗文本
-        末尾（pause≥0.45s 唔使标点都係句边界）。稳定性用 prefix 级——上一窗剩余
+        末尾（pause≥0.45s 唔使标点都係句边界）。字数门槛比标点路径高
+        （_pause_commit_min_chars，默认 10）——微停顿只证明喘气，6-9 字碎片当
+        整轮提交会被下一碎片掐掉在途回复。稳定性用 prefix 级——上一窗剩余
         係当前剩余的严格前缀（已确认部分零改写）即过：静音期通常只有一窗重解，
         EOS 时刻最后一窗往往刚把句尾字补齐，严格相等会错过真实停顿。首窗该区间
         为空（prev_rem 空）唔提交——零跨窗证据唔赌。
@@ -3971,7 +4045,7 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
             sentence = text[start:].rstrip(_PAUSE_TRAILING_WEAK_PUNCT)
             prev_rem = prev_full[start:].rstrip(_PAUSE_TRAILING_WEAK_PUNCT)
             if (
-                len(sentence) >= _ASR_SENTENCE_MIN_CHARS
+                len(sentence) >= _pause_commit_min_chars()
                 and not _has_latin_or_digit_run(sentence)
                 and prev_rem
                 and sentence.startswith(prev_rem)
