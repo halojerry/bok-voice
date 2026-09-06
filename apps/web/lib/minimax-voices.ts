@@ -43,6 +43,12 @@ const ZH: Array<[string, string]> = [
   ["female-shaonv", "少女音"],
   ["female-yujie", "御姐音"],
   ["Chinese (Mandarin)_News_Anchor", "普通话新闻女声"],
+  // 用户 2026-09-06 补充(已逐个 preview 验 200);English_UpsetGirl 与
+  // Chinese_casual_guide_nv1 同日已在册,勿重复添加。
+  ["Chinese (Mandarin)_Gentleman", "普通话绅士男声"],
+  ["Chinese_playful_streamer_nv1", "活泼主播女声"],
+  ["Chinese_crisp_podcaster_nv1", "清脆播客女声"],
+  ["Chinese (Mandarin)_Crisp_Girl", "普通话清脆女孩"],
 ];
 
 const EN: Array<[string, string]> = [
