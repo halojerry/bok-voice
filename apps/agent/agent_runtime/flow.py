@@ -420,12 +420,24 @@ def extract_call_facts(user_text: str, *, facts: dict | None = None) -> list[str
     return out
 
 
-def decide_advance(user_text: str, *, facts: dict | None = None) -> str:
+def _short_pure_ack(text: str) -> bool:
+    """归一化(去标点空白)后 ≤2 字的纯应承(「好」「係啊」「嗯」「ok」)。
+
+    单字/双字应承只喺当前步係问话(「…合不合适？」)时先算回答;陈述步收到
+    单字应承多半係寒暄/过渡,当 CONFIRM 会推着流程跑(2026-09-07 走流程太急)。
+    多字应承(「好啊好啊好」「没问题」「可以可以」)唔受限——叠词本身就係
+    明确态度。"""
+    cleaned = re.sub(r"[\s,，、.!！。?？~～]+", "", (text or "").lower())
+    return 0 < len(cleaned) <= 2 and _is_pure_ack(text)
+
+
+def decide_advance(user_text: str, *, facts: dict | None = None, short_ack_confirms: bool = True) -> str:
     """判定客户对当前这一步的反应,决定停留/推进。
 
     facts=对象已知资料(vars_map:姓名/单号/尾号等)时,客户覆述啱关键资料
     (「七八九零啊」「我係林先生」)都算 confirm;纯 echo 提问(「係咪你講嗰個
     七八九零?」)唔算——答得啱先当确认,唔係淨係「佢有冇講到個冧巴」。
+    short_ack_confirms=False(当前步唔係问话)时,≤2 字纯应承降 UNCLEAR 停留。
     """
     t = user_text.strip()
     if not t:
@@ -440,11 +452,13 @@ def decide_advance(user_text: str, *, facts: dict | None = None) -> str:
     is_question = bool(_QUESTION_RE.search(t))
     strong_affirm = bool(_STRONG_AFFIRM_RE.search(t))
     fact_match = _matches_known_fact(t, facts)
+    short_ack = _short_pure_ack(t)
     # 3) 提问且冇「多字确认」→ question(唔好因为句中出现已知尾号/单字係就当确认)
     if is_question and not strong_affirm:
         return QUESTION
-    # 4) 确认/认可(社交词、多字确认、或答啱资料)→ confirm(先于提问:客户"是我的,然后呢?"主体是确认)
-    if strong_affirm or fact_match or _CONFIRM_RE.search(t):
+    # 4) 确认/认可(社交词、多字确认、或答啱资料)→ confirm(先于提问:客户"是我的,然后呢?"主体是确认)。
+    #    单字/双字纯应承喺非问话步降 UNCLEAR——寒暄唔推流程。
+    if (strong_affirm or fact_match or _CONFIRM_RE.search(t)) and not (short_ack and not short_ack_confirms):
         return CONFIRM
     # 5) 纯提问 → question(停留本步解答)
     if is_question:
@@ -524,7 +538,16 @@ class FlowController:
     def rule_verdict(self, user_text: str) -> str:
         """规则判定(唔改动状态):只有"确认/认可当前步"先算可推进。"""
         # facts=vars_map:客户覆述啱已知资料(姓名/尾号/单号)都算确认,唔净靠社交词。
-        return decide_advance(user_text, facts=self.vars_map)
+        # 单字应承(好/係/嗯)只喺当前步係问话(「…合不合适？」)先算确认——
+        # 陈述步收到单字应承係寒暄,降 UNCLEAR 停留,唔推流程走太快。
+        return decide_advance(user_text, facts=self.vars_map, short_ack_confirms=self._current_step_is_question())
+
+    def _current_step_is_question(self) -> bool:
+        """当前步 ref 是否问话（含 ？/?）——单字应承算不算回答的依据。"""
+        if not self.has_steps or self.done:
+            return True
+        ref = self.steps[self.current].ref or ""
+        return ("？" in ref) or ("?" in ref)
 
     def advance(self) -> None:
         """推进到下一步(最后一步确认后即完成,唔越界)。"""
