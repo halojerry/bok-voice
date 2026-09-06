@@ -3831,9 +3831,15 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                         )
                         if pause_commit is not None:
                             sentence, end_idx = pause_commit
-                            self._emit_sentence_commit(
-                                sentence, end_idx, self._last_lang, time.monotonic(), source="vad-pause"
-                            )
+                            # 标点扫描分支的门槛是 6（说话中按句提交用）——vad-pause
+                            # 语境必须再套 10 字碎片门：带句号的 6-9 字碎片会从 punct
+                            # 分支漏出，在用户话音未落时提前成轮，回复立刻被自家尾巴
+                            # 的音频活动掐死（multi_turn E2E 2026-09-07 实证：3 轮全
+                            # 被吃掉只剩心跳）。唔够格就留给停嘴 finish 整句兜底。
+                            if len(sentence) >= _pause_commit_min_chars():
+                                self._emit_sentence_commit(
+                                    sentence, end_idx, self._last_lang, time.monotonic(), source="vad-pause"
+                                )
                     self._event_ch.send_nowait(
                         stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH, speech_end_time=speech_end_time)
                     )
