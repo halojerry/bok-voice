@@ -619,6 +619,11 @@ class ContextState:
         if t:
             self._last_reply = t[:80]
 
+    @property
+    def last_reply(self) -> str:
+        """只读出口:agent 回声守卫比对「AI 正在讲/刚讲过」的文本用。"""
+        return self._last_reply
+
     def record_applied_tail(self, orig: str, final: str) -> None:
         self._applied_tails.append((orig, final, self._revision))
 

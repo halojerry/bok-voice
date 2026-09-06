@@ -264,6 +264,37 @@ def _nudge_should_fire(now: float, last_reply_ts: float, last_user_ts: float, nu
     return True
 
 
+_ECHO_SIM_RATIO = 0.9
+_ECHO_MIN_CHARS = 6
+
+
+def _is_echo_self_heard(user_text: str, last_reply: str, agent_speaking: bool) -> bool:
+    """回声自听判定（纯函数，单测用）。
+
+    外放+浏览器 AEC 失效（输出设备存档失效等）时，AI 会把自己的回复听成
+    用户插话——相似度极高的「轮」立刻打断自己、再复读一遍（自问自答）。
+    三个条件缺一不可：AI 正在讲（speaking；讲完后的复述/引用係客户正常行为）、
+    归一化（去标点空白）后两边都 ≥ _ECHO_MIN_CHARS 字（短应承「係」永唔拦）、
+    相似度 ≥ _ECHO_SIM_RATIO。归一化助手懒 import（与 livekit_plugins 的
+    重解修正/续句判定同一把尺，agent→providers 依赖方向唔成环）。
+    """
+    if not agent_speaking:
+        return False
+    from .providers.livekit_plugins import _strip_punct_space
+
+    norm_u = _strip_punct_space(user_text or "")
+    norm_r = _strip_punct_space(last_reply or "")
+    if len(norm_u) < _ECHO_MIN_CHARS or len(norm_r) < _ECHO_MIN_CHARS:
+        return False
+    import difflib
+
+    return difflib.SequenceMatcher(a=norm_r, b=norm_u).ratio() >= _ECHO_SIM_RATIO
+
+
+def _echo_guard_enabled() -> bool:
+    return os.environ.get("QWEN3_ECHO_GUARD", "1") == "1"
+
+
 def _farewell_line(name: str, lang: str) -> str:
     """两次心跳都没回应:一句礼貌收尾直念(多谢+阵间再联系+再见),讲完即收线。
 
@@ -1432,10 +1463,23 @@ async def entrypoint(ctx):
             # WhatsApp 对接触发:喺 flow 推进【前】偵測(step context 係舊步/當前步,offered 先啱);
             # 客戶俾號碼(captured)照推下一步;應承加但未俾號碼(offered)→ 唔自動跳,等 AI 叫佢俾號碼。
             _wa_signal: tuple | None = None
+            user_text = str(getattr(new_message, "text_content", None) or "")
+            # 回声自听守卫(借鉴 RVC 的 barge-in 回声门;他们的 isTTSPlaying 上报
+            # 在服务端係死代码,呢条做对):AEC 失效(外放+输出设备存档失效)时 AI
+            # 会把自己的回复听成用户插话,当场打断自己再复读一遍。AI speaking 中
+            # 且本轮文本与上一句高度相似 → 判自听,整轮丢弃(StopResponse 框架
+            # 官方姿势,同下方 paused 分支)。必须喺任何 except-pass try 之外——
+            # StopResponse 会被吞。讲完之后的复述/引用唔受影响(条件钉死 speaking)。
+            if _echo_guard_enabled():
+                _agent_speaking = str(getattr(session, "agent_state", "") or "") == "speaking"
+                if _is_echo_self_heard(user_text, context_state.last_reply, _agent_speaking):
+                    print(
+                        f"QWEN3_ECHO_SELF_HEARD_DROP (call {room_name}) "
+                        f"reply={context_state.last_reply!r} heard={user_text!r}",
+                        flush=True,
+                    )
+                    raise StopResponse()
             try:
-                user_text = ""
-                nm = getattr(new_message, "text_content", None) or ""
-                user_text = str(nm or "")
                 if flow_ctrl.has_steps:
                     _g, _r = flow_ctrl.current_goal_ref()
                     _wa_signal = detect_whatsapp_signal(
