@@ -475,6 +475,10 @@ class FlowController:
     # 开场白已直念(session.say) → current_step_text 加「勿重复开场」提示;
     # paused 起动(冇开场白)时保持 False,LLM 自己补第 1 步。
     opening_played: bool = False
+    # 最近一轮规则判定(question/unclear/objection/...)——verdict 此前只用于推进
+    # 判定、从不进提示词,客户提问/答非所问时模型冇「该怎么答」指引 → 4B 默认
+    # 复读当前步。current_step_text 据此渲染对应应答指引。
+    last_verdict: str = ""
 
     @classmethod
     def from_template(cls, template: dict | None, object_card: dict | None) -> "FlowController":
@@ -567,6 +571,26 @@ class FlowController:
                 return line
         return ""
 
+    def _verdict_guidance(self) -> str:
+        """verdict 感知应答指引:规则判定结果此前只用于推进、从不进提示词——客户
+        提问/答非所问时 flow 唔动、模型又冇「该怎么答」嘅指引,4B 默认复读当前步
+        (2026-09-06 实证:同一句 WhatsApp 确认逐字问两遍)。标准书面中文(语言纯度)。"""
+        v = self.last_verdict
+        if v == QUESTION:
+            return (
+                "【客户在提问】先用话术里的事实直接回答客户的问题"
+                "（赔偿方案、办理方式、到账时间都可以讲），答完用一句自然带回当前步；"
+                "绝不重复你上一句。"
+            )
+        if v == UNCLEAR:
+            return "【客户回应不明确】换个说法简短再引导一次（可以给选项），绝不重复你上一句原话。"
+        if v == OBJECTION:
+            return (
+                "【客户有疑虑】先针对疑虑安抚（运费险、一赔二、专员跟进都是可用事实），"
+                "再回到当前步；绝不重复你上一句原话。"
+            )
+        return ""
+
     def current_step_text(self) -> str:
         """渲染当前步(含变量替换)给本轮 system;流程完成则空;收尾态则注入收尾话术。"""
         if self.closing:
@@ -574,10 +598,13 @@ class FlowController:
         if not self.has_steps or self.done:
             # 话术走完 ≠ 收线:继续如常答疑/跟进,主动再见只准出现在 REFUSE/
             # 沉默收线(否则客户问「接下来怎么」会被 LLM 拜拜,实测 2026-09-06)。
-            return (
+            done_text = (
                 "话术流程已走完。不要主动讲再见或收线；继续如常回答客户问题、"
                 "确认后续安排（专员联系/到账时间），客户有问必答，等客户自然结束。"
             )
+            if self.last_verdict == CONFIRM:
+                done_text += "客户刚确认过，毋需再问任何已答过的事——简单回应后等客户讲。"
+            return done_text
         step = self.steps[self.current]
         lines = [f"流程第 {self.current + 1}/{len(self.steps)} 步"]
         if self.current == 0 and self.opening_played:
@@ -591,6 +618,9 @@ class FlowController:
                 "立即按这一步的目标来讲——不要讲「等我查下再答复你」「几分钟内答复你」这类拖延话术"
                 "（你手上已经有足够资料讲这一步），也不要延续上一步话题或继续自己刚才应承过的事。"
             )
+        verdict_line = self._verdict_guidance()
+        if verdict_line:
+            lines.append(verdict_line)
             self._just_advanced = False
         if step.goal:
             lines.append(f"这一步要达成:{render_template_text(step.goal, self.vars_map)}")
