@@ -137,7 +137,10 @@ def _build_tts_provider(tts_cfg: dict, target_lang: str):
         # 设置页没配/被过滤掉的分语言音色用验证过的默认(各语种母语音色,口音不串)。
         voice_map.setdefault("zh", "Chinese (Mandarin)_News_Anchor")
         voice_map.setdefault("cantonese", "Cantonese_crisp_news_anchor_vv2")
-        voice_map.setdefault("en", "male_english_speaker")
+        # EN 默认音色 2026-09-07 换:旧 male_english_speaker 已被 MiniMax 下线
+        # （每轮 2054 voice id not exist → 目标侧整轮静音,B 线 E2E 实证）,
+        # 换成 minimax-voices.ts 里 preview 验证过的 English_magnetic_voiced_man。
+        voice_map.setdefault("en", "English_magnetic_voiced_man")
         os.environ.setdefault("MINIMAX_MODEL", "speech-2.6-turbo")
         # language_boost 锁目标语,防源语音夹词时合成语种漂移;值是 MiniMax API
         # 的外部枚举字面量(术语门禁白名单单点),唔系语言字段命名。
@@ -298,10 +301,29 @@ async def entrypoint(ctx) -> None:
         ),
     )
 
-    # 落库:译文句到达时把「原文+译文」合成一条 turn(role=说话方)。
-    # 原文(user item)先到存 last_user;翻译(assistant item)后到即组合上报——
-    # 后续 settle 的总结/蒸馏/vault 落盘直接吃到双语对照文本。
+    # 落库:原文/译文拆成两条 turn(2026-09-07 审计闭环——旧行为合成一条,
+    # 无 language 标签、译文延迟无从查)。译文行带 latency;原文行即时落,
+    # 译文后到再落——总结/蒸馏按序读仍是对照文本(language 字段区分)。
     last_user = {"text": ""}
+    _turn_metrics: dict = {}
+
+    def _capture_metrics(ev) -> None:
+        m = getattr(ev, "metrics", None)
+        if getattr(m, "type", "") == "llm_metrics":
+            try:
+                _turn_metrics["llm_ttft_ms"] = int(m.ttft * 1000)
+            except Exception:  # pragma: no cover
+                pass
+
+    session.on("metrics_collected", _capture_metrics)
+
+    async def _add_turn(text: str, language: str, latency: int = 0) -> None:
+        try:
+            await cp.add_turn(
+                call_id, speaker_role, text, provider="interpret", latency_ms=latency, language=language
+            )
+        except Exception as exc:  # pragma: no cover - 落库失败不阻翻译
+            print(f"[interp] add_turn failed: {exc!r}", flush=True)
 
     def _on_item(ev) -> None:
         item = getattr(ev, "item", None)
@@ -311,16 +333,10 @@ async def entrypoint(ctx) -> None:
             return
         if role == "user":
             last_user["text"] = text
+            asyncio.create_task(_add_turn(f"原文：{text}", source_lang))
         elif role == "assistant":
-            src = last_user["text"]
-
-            async def _add(src: str = src, tgt: str = text) -> None:
-                try:
-                    await cp.add_turn(call_id, speaker_role, f"原文：{src}\n译文：{tgt}", provider="interpret")
-                except Exception as exc:  # pragma: no cover - 落库失败不阻翻译
-                    print(f"[interp] add_turn failed: {exc!r}", flush=True)
-
-            asyncio.create_task(_add())
+            latency = int(_turn_metrics.get("llm_ttft_ms") or 0)
+            asyncio.create_task(_add_turn(f"译文：{text}", target_lang, latency))
 
     session.on("conversation_item_added", _on_item)
 

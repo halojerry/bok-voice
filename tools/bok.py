@@ -463,8 +463,26 @@ def cmd_status() -> int:
     return 0
 
 
+def _rotate_log(logfile: Path, max_bytes: int = 50 * 1024 * 1024, keep: int = 3) -> None:
+    """stdout 日志大小轮转（>50MB 归档 .1/.2/.3,留 3 代）——dev 栈日志此前
+    无限增长,审计回溯既要留痕也要可磁盘承载（2026-09-07 审计闭环）。"""
+    try:
+        if not logfile.exists() or logfile.stat().st_size < max_bytes:
+            return
+        for i in range(keep - 1, 0, -1):
+            src = logfile.with_suffix(logfile.suffix + f".{i}")
+            dst = logfile.with_suffix(logfile.suffix + f".{i + 1}")
+            if src.exists():
+                dst.write_bytes(src.read_bytes())
+        logfile.with_suffix(logfile.suffix + ".1").write_bytes(logfile.read_bytes())
+        logfile.write_bytes(b"")
+    except Exception:
+        pass
+
+
 def _start_proc(args: list[str], pidfile: Path, logfile: Path, env: dict | None = None, cwd: str | Path | None = None) -> int:
     pidfile.parent.mkdir(parents=True, exist_ok=True)
+    _rotate_log(logfile)
     merged = dict(os.environ)
     # 子进程日志实时可见（写到文件时 stdout 默认块缓冲，会吞掉关键启动日志）。
     merged.setdefault("PYTHONUNBUFFERED", "1")
@@ -940,7 +958,51 @@ def cmd_down() -> int:
             print(f"[down] stopped {pidfile.stem} (pid {pid})")
         except Exception:
             continue
+    # 孤儿 worker 兜底清扫（2026-09-07 QA 实证）:serve 异常退出后 start_new_session
+    # 的 worker 存活,而 pidfile 可能已被覆写成死 pid——down 按 pidfile 清不到,
+    # 旧代码 worker 会继续注册 livekit 抢 job。按进程特征+监听端口兜底清扫一遍。
+    orphans = _sweep_orphan_workers()
+    for pid, label in orphans:
+        print(f"[down] swept orphan worker (pid {pid}, {label})")
     return 0
+
+
+def _sweep_orphan_workers() -> list[tuple[int, str]]:
+    """清扫 pidfile 体系漏掉的 agent worker/解释器进程（返回 [(pid, 标签)]）。
+
+    判据：进程命令行含 agent_runtime.main / agent_runtime.interpret。
+    只清本项目特征进程,唔会误伤无关服务。"""
+    swept: list[tuple[int, str]] = []
+    seen: set[int] = set()
+    try:
+        ps = subprocess.run(["ps", "-axo", "pid,command"], capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return swept
+    for line in ps.splitlines()[1:]:
+        parts = line.strip().split(None, 1)
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        if pid == os.getpid():
+            continue
+        for marker in ("agent_runtime.main", "agent_runtime.interpret"):
+            if marker in parts[1]:
+                if pid not in seen:
+                    seen.add(pid)
+                    swept.append((pid, marker))
+                break
+    for pid, label in swept:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except Exception:
+                continue
+    return swept
 
 
 def _nvidia_gate() -> tuple[bool, str]:

@@ -13,6 +13,36 @@ def _aid() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def _chunk_content(content: str, max_chars: int = 500) -> list[str]:
+    """按空行分段、合并短段至 ≤max_chars 的确定性分块。
+
+    检索粒度=chunk:太长则命中即整篇注入（截断后失真），太碎则上下文断裂。
+    空段落剔除;确定性输出保证同一文档重复导入得到同一组 chunk。"""
+    import re as _re
+
+    paras = [p.strip() for p in _re.split(r"\n\s*\n", content or "") if p.strip()]
+    chunks: list[str] = []
+    buf = ""
+    for para in paras:
+        while len(para) > max_chars:
+            if buf:
+                chunks.append(buf)
+                buf = ""
+            chunks.append(para[:max_chars])
+            para = para[max_chars:]
+        if not para:
+            continue
+        if len(buf) + len(para) + 2 <= max_chars:
+            buf = f"{buf}\n\n{para}" if buf else para
+        else:
+            if buf:
+                chunks.append(buf)
+            buf = para
+    if buf:
+        chunks.append(buf)
+    return chunks
+
+
 @dataclass
 class DefaultKnowledgeService:
     """KnowledgeService that composes MarkdownSource + VectorStore."""
@@ -72,6 +102,16 @@ class DefaultKnowledgeService:
         safe_path = path.lstrip("/")
         doc_path = f"accounts/{account_id}/knowledge/{safe_path}"
         write_result = self.markdown.write(doc_path, content)
-        chunk = {"id": _aid(), "text": content, "path": doc_path, "source": "import"}
-        count = await self.vector.upsert([chunk], account_id)
+        # 分块（2026-09-07 KB 复盘 P0-2）:整文档单 chunk 令检索粒度=整篇,截断
+        # 150 字后信息损失。按空行分段、合并短段至 ≤500 字符；重导入时先删同
+        # path 旧 chunk（内容变更不留 stale 残留）。
+        existing = await self.vector.list(account_id)
+        stale_ids = [str(it.get("id")) for it in existing if str(it.get("path", "")) == doc_path]
+        if stale_ids:
+            await self.vector.delete(account_id, stale_ids)
+        chunks = [
+            {"id": f"{_aid()}:{i}", "text": c, "path": doc_path, "source": "import"}
+            for i, c in enumerate(_chunk_content(content))
+        ]
+        count = await self.vector.upsert(chunks, account_id)
         return {**write_result, "indexed": count}

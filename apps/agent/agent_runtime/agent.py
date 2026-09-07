@@ -1246,7 +1246,12 @@ async def entrypoint(ctx):
             # 与音频同守则:模型若输出发音/拼音教学,转录也落「请再报单号」罐頭,
             # 唔好畀课程留喺通话记录(下次摘要又会引用返)。
             text = lecture_guard(text, language_state.lang if language_state.lang in ("zh", "cantonese") else None)
-        asyncio.create_task(cp.add_turn(call_id, role, _clean_transcript(text)))
+        # 审计闭环(2026-09-07):每轮带上最近一次官方 metrics 的 LLM TTFT 作
+        # latency_ms + 通话语言——之前 CP 侧丢弃,审计面无延迟档案可查。
+        latency = int(_turn_metrics.get("llm_ttft_ms") or 0) if role == "assistant" else 0
+        asyncio.create_task(
+            cp.add_turn(call_id, role, _clean_transcript(text), latency_ms=latency, language=language_state.lang)
+        )
 
     async def _async_update_context(role, text):
         # 渐进披露：P1 起检索默认全关（对象知识走【对象档案】静态前缀，话术对象
@@ -1307,6 +1312,8 @@ async def entrypoint(ctx):
     # ② LLMMetrics emit 在【创建流的对象】上(llm/llm.py:432),A 线 LLM 有两层包装
     #    (ContextAwareLLM→ExprAwareLLM→MlxLlmLLM),包装层已补 _bind_metrics_forward
     #    转发,否则 llm 行收不到(tts/stt 无包装,本来就通)。
+    _turn_metrics: dict = {}
+
     def _on_metrics(ev):
         m = getattr(ev, "metrics", None)
         kind = getattr(m, "type", "")
@@ -1315,6 +1322,7 @@ async def entrypoint(ctx):
         tag = f"[{call_id}] "
         try:
             if kind == "llm_metrics":
+                _turn_metrics["llm_ttft_ms"] = int(m.ttft * 1000)
                 # 行格式统一在 _format_llm_metrics（含 cached=prompt_cached/prompt,
                 # KV-cache 命中可视），单测直接喂鸭型 metrics 断言。
                 print(f"{tag}{_format_llm_metrics(m)}", flush=True)

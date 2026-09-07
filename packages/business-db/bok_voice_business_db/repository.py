@@ -99,6 +99,7 @@ class SqlAlchemyBusinessRepository:
             emotion=turn.emotion,
             provider=turn.provider,
             latency_ms=turn.latency_ms,
+            language=turn.language,
         )
         try:
             self.session.add(row)
@@ -126,9 +127,33 @@ class SqlAlchemyBusinessRepository:
                 emotion=row.emotion,
                 provider=row.provider,
                 latency_ms=row.latency_ms,
+                language=row.language,
+                created_at=row.created_at.isoformat() if row.created_at else "",
             )
             for row in rows
         ]
+
+    def turn_stats(self) -> dict[str, dict]:
+        """每通通话的轮数/延迟聚合（审计闭环:列表页一屏可见健康度）。"""
+        from sqlalchemy import func
+
+        rows = self.session.execute(
+            select(
+                models.Turn.call_id,
+                func.count(models.Turn.id),
+                func.avg(models.Turn.latency_ms),
+            ).group_by(models.Turn.call_id)
+        ).all()
+        return {
+            call_id: {"turns": n, "avg_latency_ms": int(float(avg or 0))}
+            for call_id, n, avg in rows
+        }
+
+    def get_usage_record(self, call_id: str) -> dict | None:
+        row = self.session.get(models.UsageRecord, f"usage:{call_id}")
+        if not row:
+            return None
+        return {"id": row.id, "call_id": row.call_id, "tokens": row.tokens}
 
     def get_settlement(self, call_id: str) -> dict | None:
         row = self.session.get(models.Settlement, call_id)
@@ -460,6 +485,7 @@ class InMemoryBusinessRepository:
     def __init__(self) -> None:
         self.calls: dict[str, dict] = {}
         self.turns: dict[str, list[TurnEvent]] = {}
+        self.usage_records: dict[str, dict] = {}
         self.settlements: dict[str, dict] = {}
         self.objects: dict[str, dict] = {}
         self.personas: dict[str, dict] = {}
@@ -510,11 +536,32 @@ class InMemoryBusinessRepository:
         ]
 
     def create_turn(self, turn: TurnEvent) -> dict:
+        from datetime import datetime, timezone
+
+        if not turn.created_at:
+            turn.created_at = datetime.now(timezone.utc).isoformat()
         self.turns.setdefault(turn.call_id, []).append(turn)
         return {"id": f"{turn.call_id}:{turn.turn_id}"}
 
     def get_turns(self, call_id: str) -> list[TurnEvent]:
         return list(self.turns.get(call_id, []))
+
+    def turn_stats(self) -> dict[str, dict]:
+        out: dict[str, dict] = {}
+        for call_id, turns in self.turns.items():
+            lats = [t.latency_ms for t in turns if t.latency_ms]
+            out[call_id] = {
+                "turns": len(turns),
+                "avg_latency_ms": int(sum(lats) / len(lats)) if lats else 0,
+            }
+        return out
+
+    def get_usage_record(self, call_id: str) -> dict | None:
+        return self.usage_records.get(call_id)
+
+    def create_usage_record(self, record: dict) -> dict:
+        self.usage_records[record.get("call_id", "")] = record
+        return record
 
     def get_settlement(self, call_id: str) -> dict | None:
         return self.settlements.get(call_id)

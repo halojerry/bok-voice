@@ -622,7 +622,13 @@ def _effective_providers(settings: dict) -> dict:
 
 @app.get("/api/calls")
 def list_calls(account_id: str = "acc-001", status: str = "") -> list[dict]:
-    return _repo().list_calls(account_id, status)
+    calls = _repo().list_calls(account_id, status)
+    stats = _repo().turn_stats()
+    for c in calls:
+        st = stats.get(c.get("id") or "", {})
+        c["turn_count"] = st.get("turns", 0)
+        c["avg_latency_ms"] = st.get("avg_latency_ms", 0)
+    return calls
 
 
 @app.get("/api/calls/{call_id}")
@@ -694,11 +700,13 @@ def add_turn(
     emotion: str = "",
     provider: str = "",
     latency_ms: int = 0,
+    language: str = "",
 ) -> dict:
     # turn_id 用 uuid 而非 len(get_turns()) 序号：并发写时序号竞态产生重复
     # turn_id → 主键冲突 → IntegrityError 幂等分支吞成 200（静默丢数据，QA
-    # 压测 30 并发丢 30-37% 实证）。uuid 根除竞态；agent 上报的
-    # provider/latency_ms 此前被端点签名忽略（turns 两列恒空），一并收参。
+    # 压测 30 并发丢 30-37% 实证）。uuid 根除竞态（#20 同期修 provider/latency
+    # 落库但保留了竞态序号，本合并补齐）；agent 上报的 provider/latency_ms
+    # 此前被端点签名忽略（turns 两列恒空），一并收参。
     turn = TurnEvent(
         trace_id=call_id,
         call_id=call_id,
@@ -708,6 +716,7 @@ def add_turn(
         emotion=emotion,
         provider=provider,
         latency_ms=latency_ms,
+        language=language,
     )
     return _repo().create_turn(turn)
 
@@ -772,6 +781,34 @@ def get_settlement(call_id: str) -> dict:
 @app.get("/api/calls/{call_id}/turns")
 def get_turns(call_id: str) -> list[dict]:
     return [turn.__dict__ for turn in _repo().get_turns(call_id)]
+
+
+@app.get("/api/calls/{call_id}/metrics")
+def get_call_metrics(call_id: str) -> dict:
+    """每通通话延迟档案:p50/p95 latency_ms + 轮数/语言分布（审计闭环 T3）。"""
+    import statistics as _stats
+
+    turns = _repo().get_turns(call_id)
+    lat = sorted(t.latency_ms for t in turns if t.latency_ms)
+
+    def _pct(q: float) -> int:
+        # 最近秩百分位:lat 升序,ceil(q*n)-1
+        if not lat:
+            return 0
+        import math as _math
+
+        return lat[max(0, _math.ceil(q * len(lat)) - 1)]
+
+    langs: dict[str, int] = {}
+    for t in turns:
+        if t.language:
+            langs[t.language] = langs.get(t.language, 0) + 1
+    return {
+        "call_id": call_id,
+        "turns": len(turns),
+        "latency_ms": {"p50": _pct(0.5), "p95": _pct(0.95), "max": lat[-1] if lat else 0, "n": len(lat)},
+        "languages": langs,
+    }
 
 
 def _write_settlement_docs(call: dict, turns: list[dict], result: dict) -> None:
@@ -852,6 +889,52 @@ async def _write_distill_knowledge(call: dict, result: dict) -> dict | None:
         return None
 
 
+def _backfill_turns_from_report(call_id: str, report_raw: str) -> int:
+    """SessionReport.chat_history → turns 回填（幂等：仅当该通话零轮次时调用）。
+
+    chat_history 结构 = {"items": [{type: "message", role, content: [str...]}]}。
+    回填行 turn_id 用 backfill:{i} 防与正常 t{i} 序列冲突；失败只告警不阻结算。
+    返回回填行数。"""
+    import json as _json
+
+    try:
+        report = _json.loads(report_raw or "{}")
+        items = ((report.get("chat_history") or {}).get("items")) or []
+        rows = [
+            it for it in items
+            if it.get("type") == "message" and it.get("role") in ("user", "assistant")
+        ]
+        if not rows:
+            return 0
+        from bok_voice_core.types import TurnEvent
+
+        n = 0
+        for i, it in enumerate(rows):
+            content = it.get("content")
+            text = " ".join(content) if isinstance(content, list) else str(content or "")
+            text = text.strip()
+            if not text:
+                continue
+            _repo().create_turn(
+                TurnEvent(
+                    trace_id=call_id,
+                    call_id=call_id,
+                    turn_id=f"backfill:{i}",
+                    role=it["role"],
+                    transcript=text,
+                    provider="session_report",
+                )
+            )
+            n += 1
+        if n:
+            _audit("settle.turns_backfilled", subject_type="call", subject_id=call_id,
+                   detail={"count": n})
+        return n
+    except Exception as exc:  # pragma: no cover
+        print(f"[settle] backfill failed: {exc!r}", flush=True)
+        return 0
+
+
 @app.post("/api/calls/{call_id}/settle")
 async def settle(call_id: str) -> dict:
     existing = _repo().get_settlement(call_id)
@@ -861,6 +944,13 @@ async def settle(call_id: str) -> dict:
     if not call:
         raise HTTPException(404, "call not found")
     turns = _repo().get_turns(call_id)
+    if not turns:
+        # 回填（2026-09-07 审计闭环）：打断/强挂通话的轮次可能整批未落库
+        # （conversation_item_added 未及触发），但 SessionReport.chat_history
+        # 有权威快照——settle 时回填,保证「每通通话必有档案」。
+        backfilled = _backfill_turns_from_report(call_id, call.get("session_report") or "")
+        if backfilled:
+            turns = _repo().get_turns(call_id)
     from bok_voice_core.types import CallSession
 
     session = CallSession(
@@ -871,12 +961,53 @@ async def settle(call_id: str) -> dict:
         mode=CallMode(call.get("mode", "simulation")),
     )
     result = app.state.settlement.build_result(session, turns)
+    # usage_records 落一笔（2026-09-07 审计闭环:表此前无写入者）。数据取自
+    # session_report 的真实 llm_usage(有)或轮数估算(无),重复 settle 幂等跳过
+    # ——写失败只告警不阻结算。
+    try:
+        import json as _json
+        from bok_voice_business_db.models import UsageRecord
+
+        sr_raw = call.get("session_report") or ""
+        tokens = 0
+        try:
+            tokens = int((_json.loads(sr_raw) or {}).get("llm_usage", {}).get("total_tokens") or 0)
+        except Exception:
+            tokens = 0
+        if not tokens:
+            tokens = len(turns) * 300
+        if not _repo().get_usage_record(call_id):
+            _repo().session.add(
+                UsageRecord(
+                    id=f"usage:{call_id}",
+                    account_id=call["account_id"],
+                    call_id=call_id,
+                    provider="local",
+                    kind="call",
+                    units=len(turns),
+                    tokens=tokens,
+                    audio_seconds=0.0,
+                    latency_ms=0,
+                    cost_estimate=0.0,
+                    status="ok",
+                )
+            )
+            _repo().session.commit()
+    except Exception as exc:  # pragma: no cover
+        print(f"[settle] usage_record write skipped: {exc!r}", flush=True)
     # 总结/沉淀：用本机 LLM 生成总结正文 + 新话题 + 全局洞察（失败回退纯指标）。
+    # 可观测（2026-09-07）：失败重试 1 次;仍空→审计事件 settle.distill_empty,
+    # 唔再静默吞掉（蒸馏覆盖率从此可查）。
     try:
         from .summarize import Summarizer
 
         settings = _repo().get_settings()
         summ = Summarizer().build(turns, call, settings)
+        if not (summ.get("summary") or "").strip() and turns:
+            summ = Summarizer().build(turns, call, settings)
+        if not (summ.get("summary") or "").strip() and turns:
+            _audit("settle.distill_empty", subject_type="call", subject_id=call_id,
+                   detail={"turns": len(turns)})
         if summ.get("summary"):
             result["summary"] = summ["summary"]
         else:

@@ -1,7 +1,7 @@
 """A 线多轮三语 E2E：同一场通话内连续切换 普通话→粤语→英语。
 
 验证三件事：
-  1) agent 在同一会话里逐轮跟随用户语言（zh 轮回普通话、cantonese 轮回粤语、en 轮回英语）;
+  1) 通话语言钉定：三语输入（zh/cantonese/en）的回复全部钉在通话语言（粤语）;
   2) 每轮都有 TTS 语音回复（agent_audio 非空）;
   3) 通话 turns 真实落库（数据沉淀）。
 
@@ -26,11 +26,13 @@ LIVEKIT_URL = "ws://127.0.0.1:7880"
 CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
 AUDIO_DIR = ROOT / "tests" / "fixtures" / "audio"
 
-# 每轮：参考音频 + 期望回复语言标签
+# 每轮：参考音频 + 期望回复语言标签。
+# 2026-09-07 更新为「每通语言钉定」政策（09-04 拍板，取代逐轮跟随）：通话钉定
+# cantonese，三语输入的回复都必须是粤语——混语言输入不改回复语言。
 TURNS = [
-    {"lang": "zh", "file": "zh.wav", "expect": "Chinese"},
+    {"lang": "zh", "file": "zh.wav", "expect": "Cantonese"},
     {"lang": "cantonese", "file": "cantonese.wav", "expect": "Cantonese"},
-    {"lang": "en", "file": "en.wav", "expect": "English"},
+    {"lang": "en", "file": "en.wav", "expect": "Cantonese"},
 ]
 
 
@@ -141,9 +143,11 @@ async def push_and_collect(room: rtc.Room, audio_source: rtc.AudioSource, case: 
             else:
                 silent_secs += 0.02
             processed += step
-        if speech_secs >= 1.0 and silent_secs >= 5.0:
+        # 3s 静音即收：轮间间隔必须 < SILENCE_NUDGE_SECONDS(8s)，否则心跳
+        # 8s×2 → farewell+end 会在下一轮推流前把通话收线（2026-09-07 实证）。
+        if speech_secs >= 1.0 and silent_secs >= 3.0:
             break
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.5)
 
     room.off("track_subscribed", lambda *a: None)
     for t in read_tasks:
@@ -234,8 +238,7 @@ async def main() -> None:
             lang, text = ("", "")
             if len(audio) > 4000:
                 lang, text = asr_language(audio)
-            # 每通语言固定:混合语种输入下期望全部回通话语言(cantonese)。
-            ok = bool(lang) and "cantonese" in lang.lower()
+            ok = bool(lang) and turn["expect"].lower() in lang.lower()
             if not ok:
                 ok = cantonese_markers(text)
             if not ok or len(audio) <= 4000:
@@ -245,7 +248,7 @@ async def main() -> None:
                 f"agent_audio={len(audio)}B asr_lang={lang!r} text={text[:50]!r}",
                 flush=True,
             )
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
     finally:
         await room.disconnect()
         try:
