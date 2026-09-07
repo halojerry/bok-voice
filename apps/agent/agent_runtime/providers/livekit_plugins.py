@@ -9,6 +9,7 @@ import os
 import re
 import time
 import unicodedata
+import weakref
 from dataclasses import dataclass
 
 import httpx
@@ -3540,6 +3541,9 @@ class Qwen3ASRSTT(stt.STT):
         # 热词/context(Qwen3-ASR 官方 customizable context = system message 词汇表
         # 软偏置):每通对话装配一次,随 /api/start 下发,session 级透传每次解码。
         self._hotword_context = str(hotword_context or "").strip()
+        # 会话级 partial 解码间隔档(GPU 竞态专项):agent 回复生成/播报中抬高,
+        # listening 恢复 None=env 默认。getattr 鸭型访问,勿删(测试 fake 无此属性)。
+        self._partial_ms_override: int | None = None
 
     def stream(self, *, language=None, conn_options=None):
         return _Qwen3ASRStream(self, conn_options or APIConnectOptions())
@@ -4030,12 +4034,16 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
     async def _start_session(self) -> None:
         lang_hint = _asr_language_hint(self._stt_._language_state.lang, self._stt_._pin_language)
         # start 参数:language hint + 热词 context(同 offline 路径,空则不下发;
-        # getattr 鸭型访问——测试 fake 无此属性时等同空)
+        # getattr 鸭型访问——测试 fake 无此属性时等同空)+ partial 间隔档
+        # (agent 生成中抑制,GPU 竞态专项;None=不下发用 env 默认)。
         start_params: dict[str, str] = {}
         if lang_hint:
             start_params["language"] = lang_hint
         if getattr(self._stt_, "_hotword_context", ""):
             start_params["context"] = self._stt_._hotword_context
+        _pm = getattr(self._stt_, "_partial_ms_override", None)
+        if _pm:
+            start_params["partial_ms"] = str(int(_pm))
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.post(
@@ -4047,6 +4055,22 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         except Exception as exc:  # noqa: BLE001 - 建会话失败 → 整句路径照样可用
             self._session_id = None
             print(f"QWEN3_ASR_PARTIAL start failed: {exc!r}", flush=True)
+
+    async def _apply_partial_ms(self, ms: int | None) -> None:
+        """已开的 sidecar 会话即时调 partial 档(生成中抑制/listening 恢复)。
+
+        无开会话时静默跳过——下个 _start_session 会带上 override。
+        """
+        if not self._session_id:
+            return
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                await client.post(
+                    f"{self._stt_._base_url}/api/partial_ms",
+                    params={"session_id": self._session_id, "ms": str(int(ms)) if ms else ""},
+                )
+        except Exception as exc:  # noqa: BLE001 - 调档失败不影响转写主链路
+            print(f"QWEN3_ASR_PARTIAL tune failed: {exc!r}", flush=True)
 
     async def _maybe_partial(self) -> None:
         now = time.monotonic()
@@ -4353,6 +4377,9 @@ class Qwen3ASRLiveSTT(stt.STT):
         self._vad = vad_
         self._stt = stt_
         stt_.on("metrics_collected", self._on_metrics_collected)
+        # 在活流追踪(GPU 竞态专项):set_partial_ms 要即时转发到当前 stream 的
+        # 开会话;WeakSet 随流 GC 自动清理,勿改强引用。
+        self._live_streams: weakref.WeakSet = weakref.WeakSet()
 
     @property
     def model(self) -> str:
@@ -4369,4 +4396,19 @@ class Qwen3ASRLiveSTT(stt.STT):
         return await self._stt.recognize(buffer=buffer, language=language, conn_options=conn_options)
 
     def stream(self, *, language=None, conn_options=None):
-        return _Qwen3ASRLiveStream(self._stt, vad=self._vad, conn_options=conn_options or APIConnectOptions())
+        s = _Qwen3ASRLiveStream(self._stt, vad=self._vad, conn_options=conn_options or APIConnectOptions())
+        self._live_streams.add(s)
+        return s
+
+    def set_partial_ms(self, ms: int | None) -> None:
+        """会话级 partial 解码档(GPU 竞态专项,同步入口,事件钩子直接调)。
+
+        记 override 给下个会话;在活流已开的 sidecar 会话用 ensure_future 即时
+        调档——事件回调喺 event loop 线程,无 loop 时(纯单测)静默跳过转发。
+        """
+        self._stt._partial_ms_override = ms
+        for s in list(self._live_streams):
+            try:
+                asyncio.ensure_future(s._apply_partial_ms(ms))
+            except RuntimeError:
+                pass

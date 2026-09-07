@@ -416,6 +416,25 @@ def asr_hotword_context(lang: str, object_card: dict | None, extra_hotwords: str
     return prefix + ", ".join(words)
 
 
+# ---- ASR partial 解码抑制(GPU 竞态专项,2026-09-08)----
+# 同卡上 LLM prefill/生成与 ASR partial 全窗重解抢 Metal 时间片(受控实验:持续
+# ASR 解码拖慢 LLM TTFT +24%,LLM 拖慢 ASR 2-4.6×)。回复生成/播报中把该通
+# sidecar 会话的 partial 间隔抬高,listening 恢复默认。打断係 VAD 判定,唔受
+# partial 抑制影响;BOK_ASR_PARTIAL_SLOW_MS=0 整个功能关。
+def partial_slow_ms() -> int:
+    try:
+        return int(os.environ.get("BOK_ASR_PARTIAL_SLOW_MS", "3000") or "0")
+    except ValueError:
+        return 3000
+
+
+def partial_ms_for_state(state: str, slow_ms: int) -> int | None:
+    """状态→partial 档(纯函数,单测用):thinking/speaking→抑制档,其余→None=默认。"""
+    if slow_ms <= 0:
+        return None
+    return slow_ms if state in ("thinking", "speaking") else None
+
+
 _ECHO_SIM_RATIO = 0.9
 _ECHO_MIN_CHARS = 6
 
@@ -1184,6 +1203,8 @@ async def entrypoint(ctx):
             stt_provider = Qwen3ASRLiveSTT(stt_=_asr_inner, vad_=vad_provider)
         else:
             stt_provider = stt.StreamAdapter(stt=_asr_inner, vad=vad_provider)
+    # GPU 竞态专项:仅 Live 包装可调会话级 partial 档(流式路径独有)。
+    _partial_gate_stt = stt_provider if isinstance(stt_provider, Qwen3ASRLiveSTT) else None
 
     # ---- TTS：人设可指定引擎（persona.tts_provider），留空跟随全局 tts.provider。
     # 引擎决定音色池：qwen3_tts 用本地克隆（persona.reference_audio 是本地克隆 ID）；
@@ -1989,6 +2010,19 @@ async def entrypoint(ctx):
     if nudge_max > 0:
         session.on("agent_state_changed", _on_agent_state)
         session.on("user_state_changed", _on_user_state)
+
+    def _on_partial_gate(ev) -> None:
+        # GPU 竞态专项:LLM 生成/播报中抬高 ASR partial 档,listening 恢复默认。
+        # 打断係 VAD 判定,唔受此抑制影响;独立于心跳(nudge_max=0 也要生效)。
+        if _partial_gate_stt is not None:
+            _partial_gate_stt.set_partial_ms(
+                partial_ms_for_state(str(getattr(ev, "new_state", "") or ""), partial_slow_ms())
+            )
+
+    if _partial_gate_stt is not None and partial_slow_ms() > 0:
+        # 与心跳钩子同规:必须先于 session.start 注册,错过初始 speaking 转换
+        # 会令开场白期间 partial 唔受抑制。
+        session.on("agent_state_changed", _on_partial_gate)
 
     watch_task = asyncio.create_task(_supervisor_watch())
     # AgentSession 内部已注册 job shutdown callback（自动 aclose），
