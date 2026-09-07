@@ -3857,6 +3857,10 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         # 跨段拼接 hold 状态(join_worthy 句等续段;唔入 _reset——段间记忆係佢嘅存在意义):
         self._join_hold_active = False
         self._join_task: asyncio.Task | None = None
+        # sidecar 会话纪元:每次 _start_session 成功 +1。hold 超时 flush 凭佢识别
+        # 「finish 等待期间客户已续讲、新会话已开」——咁就唔可以 reset 新会话状态
+        # (否则续讲段 partial/_session_id 被清,整轮无 FINAL,2026-09-07 审查实证)。
+        self._session_epoch = 0
 
     async def _run(self) -> None:
         vad_stream = self._vad.stream()
@@ -3994,6 +3998,7 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
             return
         self._join_hold_active = False
         self._join_task = None
+        _epoch_at_hold = self._session_epoch
         self._finishing = True
         speech_end_time = time.time()
         self._event_ch.send_nowait(
@@ -4007,7 +4012,10 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         if committed_before and payload and len(payload) < _ASR_SENTENCE_MIN_CHARS and not _tail_carries_content(payload):
             payload = ""
         self._finishing = False
-        self._reset()
+        if self._session_epoch == _epoch_at_hold:
+            self._reset()
+        # else: finish 等待期间 START 已开新 sidecar 会话——新会话状态属续讲段照常
+        # 滚动,本 flush 只负责把上一段 FINAL 发出(纪元守卫,防成轮转写被清)。
         if payload:
             self._stt_._language_state.update(lang, payload)
             self._event_ch.send_nowait(
@@ -4029,6 +4037,7 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                 )
                 r.raise_for_status()
                 self._session_id = r.json()["session_id"]
+                self._session_epoch += 1
         except Exception as exc:  # noqa: BLE001 - 建会话失败 → 整句路径照样可用
             self._session_id = None
             print(f"QWEN3_ASR_PARTIAL start failed: {exc!r}", flush=True)
