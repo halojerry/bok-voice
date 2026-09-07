@@ -149,6 +149,37 @@ class SqlAlchemyBusinessRepository:
             for call_id, n, avg in rows
         }
 
+    def append_template_revision(self, template_id: str, revision: int, snapshot: str) -> dict:
+        row = models.TemplateRevision(
+            id=f"rev:{template_id}:{revision}", template_id=template_id, revision=revision, snapshot=snapshot
+        )
+        try:
+            self.session.add(row)
+            self.session.commit()
+        except IntegrityError:
+            self.session.rollback()
+            return {"id": row.id, "duplicate": True}
+        return {"id": row.id, "revision": revision}
+
+    def list_template_revisions(self, template_id: str) -> list[dict]:
+        stmt = (
+            select(models.TemplateRevision)
+            .filter_by(template_id=template_id)
+            .order_by(models.TemplateRevision.revision)
+        )
+        return [
+            {"revision": r.revision, "snapshot": r.snapshot, "updated_at": r.updated_at.isoformat()}
+            for r in self.session.scalars(stmt)
+        ]
+
+    def update_object_digest(self, object_id: str, digest: str) -> bool:
+        obj = self.session.get(models.ObjectProfile, object_id)
+        if obj is None:
+            return False
+        obj.digest = digest
+        self.session.commit()
+        return True
+
     def get_usage_record(self, call_id: str) -> dict | None:
         row = self.session.get(models.UsageRecord, f"usage:{call_id}")
         if not row:
@@ -486,6 +517,7 @@ class InMemoryBusinessRepository:
         self.calls: dict[str, dict] = {}
         self.turns: dict[str, list[TurnEvent]] = {}
         self.usage_records: dict[str, dict] = {}
+        self.template_revisions: dict[str, list[dict]] = {}
         self.settlements: dict[str, dict] = {}
         self.objects: dict[str, dict] = {}
         self.personas: dict[str, dict] = {}
@@ -558,6 +590,20 @@ class InMemoryBusinessRepository:
 
     def get_usage_record(self, call_id: str) -> dict | None:
         return self.usage_records.get(call_id)
+
+    def append_template_revision(self, template_id: str, revision: int, snapshot: str) -> dict:
+        row = {"revision": revision, "snapshot": snapshot, "updated_at": ""}
+        self.template_revisions.setdefault(template_id, []).append(row)
+        return {"revision": revision}
+
+    def list_template_revisions(self, template_id: str) -> list[dict]:
+        return list(self.template_revisions.get(template_id, []))
+
+    def update_object_digest(self, object_id: str, digest: str) -> bool:
+        if object_id in self.objects:
+            self.objects[object_id]["digest"] = digest
+            return True
+        return False
 
     def create_usage_record(self, record: dict) -> dict:
         self.usage_records[record.get("call_id", "")] = record
