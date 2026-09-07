@@ -148,6 +148,10 @@ WorkerOptions.port)——默认同为 8081 会竞态,后绑者 Errno 48 即崩
   基线默认（2026-09-05 句号级提交落地后）：`min_silence_duration=0.45`、`min_speech_duration=0.15`；
   A 线 turn_detection=`stt`（STT 句末 END_OF_SPEECH 提交，句级 FINAL→EOS，说话中即提交，
   数字串/短句/1.5s 限流保护），endpointing `min_delay=0.25`/`max_delay=0.6`。
+  语言钉定 + 热词：每通对话语言钉死随 `/api/start?language=` 下发（Chinese/English/Cantonese
+  规范名）；热词 context（官方 customizable context，system message 词汇表软偏置）随
+  `/api/start?context=` 下发——话术领域词 + 对象文字字段（`BOK_ASR_HOTWORDS=0` /
+  `QWEN3_ASR_CONTEXT=0` 两级回退）。
   （历史警戒已失效条件化：当年压端点致哑火=轮次在离线 ASR final 前提交；现提交结构性等待
   STT FINAL 且句级路径 FINAL 即句文，三语 E2E 实证 0 丢转写。回退开关：`TURN_DETECTION=`
   置空回 EOT 模型档 + `QWEN3_ASR_SENTENCE_COMMIT=0`（两者须一起关，否则句级 FINAL 会
