@@ -368,13 +368,19 @@ class ASRService:
             last_at = float(session.get("last_partial_at") or 0.0)
             if not partial_text or covered is None:
                 return None
-            if (time.monotonic() - last_at) > FINISH_PARTIAL_FRESH_SEC:
+            # 抑制档(partial_ms 会话级抬高)下 partial 天生陈旧,旧 partial +
+            # 无上下文长尾独立解码会拼出幻觉尾巴(2026-09-08 实证)——收紧:
+            # partial 必须 ≤1.2s 新鲜、尾段 ≤1s,否则整句兜底(正确性优先)。
+            fresh_sec, tail_max_sec = FINISH_PARTIAL_FRESH_SEC, FINISH_TAIL_MAX_SEC
+            if session.get("partial_ms"):
+                fresh_sec, tail_max_sec = min(fresh_sec, 1.2), min(tail_max_sec, 1.0)
+            if (time.monotonic() - last_at) > fresh_sec:
                 return None
             if not (0 < covered <= len(pcm)):
                 return None
             tail = pcm[covered:]
             tail_sec = len(tail) / 2 / SAMPLE_RATE
-            if tail_sec > FINISH_TAIL_MAX_SEC:
+            if tail_sec > tail_max_sec:
                 return None
             if _seam_risky(partial_text):
                 return None

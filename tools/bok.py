@@ -81,10 +81,10 @@ def runtime_root() -> Path:
 
 MODELS: dict[str, dict[str, str]] = {
     "mac": {
-        # ASR 4bit(2026-09-08 GPU 竞态专项):同卡上 ASR 解码与 LLM prefill 抢 Metal
-        # 时间片,4bit 每窗快 ~1.3×、省 ~0.8GB;粤语质量以 A/B 基准把关(官方口径
-        # 4bit 对 8bit WER +0.3-1.4pp,出现退化回 aufklarer/Qwen3-ASR-1.7B-MLX-8bit)。
-        "asr": "mlx-community/Qwen3-ASR-1.7B-4bit",
+        # ASR 维持 8bit(2026-09-08 A/B 实证回退):4bit 快 ~24% 但数字路径同音字
+        # 滑失(九→狗/號→后,同渲染音频 8bit 逐字全对)——WhatsApp 捕获零降级铁律
+        # 优先。GPU 减负靠 partial 会话级抑制(见 agent BOK_ASR_PARTIAL_SLOW_MS)。
+        "asr": "aufklarer/Qwen3-ASR-1.7B-MLX-8bit",
         "tts_preset": "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit",
         "tts_clone": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
         # 客服 LLM 用 4B 关思考:话术化场景速度优先(一轮 ~1s,约为 9B 一半),

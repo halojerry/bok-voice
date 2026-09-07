@@ -187,3 +187,43 @@ def test_agent_partial_ms_for_state():
     assert partial_ms_for_state("speaking", 3000) == 3000
     assert partial_ms_for_state("listening", 3000) is None
     assert partial_ms_for_state("thinking", 0) is None
+
+
+def test_suppressed_session_incremental_finish_falls_back_to_full(monkeypatch):
+    """抑制档(partial_ms 已设)下增量拼接收紧:partial >1.2s 陈旧 → 整句兜底。
+
+    门控令 partial 变陈旧,旧 partial + 无上下文尾段独立解码会拼出幻觉尾巴
+    (2026-09-08 实证:「切把狗领…好啊好」)——抑制档下绝不赌拼接。
+    """
+    mod = _load_sidecar_app()
+
+    class _TailProbeModel:
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, wav, language=None, max_tokens=256, system_prompt=None):
+            self.calls += 1
+            dur = len(wav) / 16000
+            return types.SimpleNamespace(
+                text="整句解码" if dur > 2 else "尾段解码", language=["Cantonese"]
+            )
+
+    model = _TailProbeModel()
+    svc = _make_svc(mod, model)
+    monkeypatch.setattr(mod, "INC_FINISH", True)
+    sid = svc.start(language="cantonese", partial_ms="3000")
+    # 1s 首窗解码(covered=1s)→ 门控期间再进 2.75s(唔解码)→ partial 陈旧 → finish
+    svc.chunk(sid, b"\x00\x19" * 16000)  # 1s:首窗解码
+    svc._sessions[sid]["last_partial_at"] = time.monotonic() - 2.5  # 陈旧
+    svc.chunk(sid, b"\x00\x19" * 44000)  # 2.75s:门控内,唔解码
+    fin = svc.finish(sid)
+    assert fin["text"] == "整句解码", fin  # 整句兜底,唔拼接
+    assert fin.get("partial") is False
+
+    # 对照:非抑制会话 + 新鲜 partial → 拼接路径照常(既有提速不回退)
+    sid2 = svc.start(language="cantonese")
+    svc.chunk(sid2, b"\x00\x19" * 16000)
+    svc._sessions[sid2]["last_partial_at"] = time.monotonic() - 0.5
+    svc.chunk(sid2, b"\x00\x19" * 44000)
+    fin2 = svc.finish(sid2)
+    assert "尾段解码" in fin2["text"], fin2  # partial(1s)+尾段(2.75s≤3s 上限)拼接
