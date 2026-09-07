@@ -619,6 +619,11 @@ class ContextState:
         if t:
             self._last_reply = t[:80]
 
+    @property
+    def last_reply(self) -> str:
+        """只读出口:agent 回声守卫比对「AI 正在讲/刚讲过」的文本用。"""
+        return self._last_reply
+
     def record_applied_tail(self, orig: str, final: str) -> None:
         self._applied_tails.append((orig, final, self._revision))
 
@@ -3586,6 +3591,22 @@ _ASR_SENTENCE_MIN_CHARS = 6
 # 限速:两次句级提交最少间隔(「好。係。唔該。」连珠句防机关枪式连发,
 # 排队语义=剩余文本并入下一边界或 VAD 停嘴整句兜底)。
 _ASR_SENTENCE_MIN_INTERVAL_S = 1.5
+
+
+def _pause_commit_min_chars() -> int:
+    """vad-pause 路径提交的字数下限（默认 10 > 标点路径 6）。
+
+    微停顿（≥0.45s）只证明「喘了口气」，证明唔了「一句话讲完」——6-9 字碎片
+    （「你邊個啊。」）被当整轮提交，回复 TTS 出声前就被下一碎片新轮掐死
+    （碎片提交饿死回复）。扣住后说话继续则并入下个边界、真停嘴则整句 finish
+    兜底，轮唔会丢。QWEN3_ASR_PAUSE_COMMIT_MIN_CHARS=6 回退旧行为。
+    （借鉴 KoljaB/RealtimeVoiceChat turndetect 的语义端点思想：提交前先看
+    「像唔像说完」；官方 audio turn detector v1-mini 属架构级换件，另评估。）
+    """
+    try:
+        return int(os.environ.get("QWEN3_ASR_PAUSE_COMMIT_MIN_CHARS", "10"))
+    except ValueError:
+        return 10
 # VAD 微停顿候选句尾部的弱停顿符：滑窗 partial 说话期句尾只打逗号（p6 实测），
 # 停嘴高精度 finish 会升级成句号——提交时剥掉弱尾符，让已提交前缀与 finish
 # 整句做 startswith 匹配时唔会因「，vs。」错位（错位会触发 rfind 兜底返回
@@ -3634,6 +3655,48 @@ def _pause_trigger_enabled() -> bool:
     则全关，kill-switch 一并灭掉）。
     """
     return os.environ.get("QWEN3_ASR_SENTENCE_PAUSE_TRIGGER", "1") == "1"
+
+
+def _join_hold_s() -> float:
+    """跨段拼接 hold 窗(秒):QWEN3_ASR_JOIN_HOLD_MS,默认 800;0=关(行为同旧)。
+
+    报号句中微停顿(≥0.45s VAD 静音)会把一句 WhatsApp 号码切成两个 VAD 段、两条
+    FINAL、两个用户轮(c4f6e4f1 实证:两 FINAL 仅差 103ms,语境「我的WhatsApp是」与
+    数字「一七二二三三四」分居两轮→捕获结构性失败、AI 插话复读)。续接可能句喺
+    END_OF_SPEECH 嗰刻 hold 唔发,sidecar session 续命等下一段并入同一会话。
+    """
+    try:
+        return max(0.0, int(os.environ.get("QWEN3_ASR_JOIN_HOLD_MS", "800"))) / 1000.0
+    except ValueError:
+        return 0.8
+
+
+_JOIN_DIGIT_TRANS = str.maketrans("零一二三四五六七八九０１２３４５６７８９", "01234567890123456789")
+_JOIN_EN_DIGIT_RE = re.compile(r"\b(zero|oh|one|two|three|four|five|six|seven|eight|nine)\b", re.IGNORECASE)
+_JOIN_EN_DIGIT_MAP = {"zero": "0", "oh": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+                      "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"}
+
+
+def _join_norm_digits(text: str) -> str:
+    """join 门专用的轻量数字归一(汉字/全角/英文数字词→连续数字串)。
+
+    唔直接 import flow._digit_normalize:providers 层保持 agent→providers 单向依赖
+    (echo guard 懒 import 同一款理由),呢把尺只服务 join 门,唔参与号码捕获。
+    非数字字符全剥(空格/字母)——门只关心「有冇数字 run」,唔做号码比对。
+    """
+    lowered = _JOIN_EN_DIGIT_RE.sub(lambda m: _JOIN_EN_DIGIT_MAP[m.group(1).lower()], str(text).lower())
+    return re.sub(r"[^0-9]", "", lowered.translate(_JOIN_DIGIT_TRANS))
+
+
+def _join_worthy(text: str) -> bool:
+    """续接可能句:归一后有 ≥2 位数字、或以系词收尾(係/系/是/is)——正正係被句级门
+    (_has_latin_or_digit_run)有意排除嗰批句;普通陈述句零加迟。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if len(_join_norm_digits(t)) >= 2:
+        return True
+    return bool(re.search(r"(?:係|系|是|is)\s*[。，,．.！!？?～~]*$", t, re.IGNORECASE))
 
 
 def _has_latin_or_digit_run(text: str, min_len: int = 2) -> bool:
@@ -3695,6 +3758,9 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         self._last_sentence = ""  # 最后提交句（finish 整段坐标失配时的回退锚）
         self._commit_idx = 0  # 滑窗全文坐标的已提交位置（每句边界只发一次）
         self._last_sentence_commit_at = 0.0  # 上次句级提交时刻（monotonic，限速用）
+        # 跨段拼接 hold 状态(join_worthy 句等续段;唔入 _reset——段间记忆係佢嘅存在意义):
+        self._join_hold_active = False
+        self._join_task: asyncio.Task | None = None
 
     async def _run(self) -> None:
         vad_stream = self._vad.stream()
@@ -3713,8 +3779,12 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
             async for event in vad_stream:
                 if event.type == vad.VADEventType.START_OF_SPEECH:
                     started = True
+                    # join-hold 期间续段嚟到:取消超时 flush。sidecar session 仲生猛
+                    # (hold 唔 finish),唔好重复 start——orphan 旧会话会令拼接变两段。
+                    self._cancel_join_hold()
                     self._event_ch.send_nowait(stt.SpeechEvent(stt.SpeechEventType.START_OF_SPEECH))
-                    await self._start_session()
+                    if not self._session_id:
+                        await self._start_session()
                 elif event.type == vad.VADEventType.INFERENCE_DONE:
                     if not started or self._finishing:
                         continue
@@ -3724,6 +3794,26 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                     await self._maybe_partial()
                 elif event.type == vad.VADEventType.END_OF_SPEECH:
                     if not started:
+                        continue
+                    # ---- 跨段拼接 hold(治报号句被微停顿切碎,2026-09-06)----
+                    # 数字/字母句被句级门有意排除(防半截号码提前提交)→ 永远走逐段
+                    # 整句路径,VAD 微停顿即拆轮。续接可能句喺呢度唔发 END_OF_SPEECH、
+                    # 唔 finish、唔 reset:sidecar session 续命,下一段音频继续入同一
+                    # 会话(partial 继续滚),真正停嘴嗰刻一条 FINAL 覆盖全段——下游
+                    # flow/侦测/LLM/KV-cache 全部只见单一轮。超时冇续段 → _hold_flush
+                    # 走正常停嘴路径(该轮多等 HOLD_MS,只影响号码句)。0=回退同旧。
+                    if self._join_hold_active:
+                        # hold 中又嚟 EOS(冇 START 嘅边路)→ 当真停嘴,取消 flush 落埋正常路径。
+                        self._cancel_join_hold()
+                    elif _join_hold_s() > 0 and (self._last_partial or "").strip() and _join_worthy(self._last_partial):
+                        self._join_hold_active = True
+                        self._finishing = False  # hold 期间 partial 继续滚(INFERENCE_DONE 唔 skip)
+                        self._join_task = asyncio.create_task(self._hold_flush())
+                        print(
+                            f"QWEN3_ASR_JOIN_HOLD chars={len(self._last_partial)} "
+                            f"hold_ms={int(_join_hold_s() * 1000)}",
+                            flush=True,
+                        )
                         continue
                     self._finishing = True
                     speech_end_time = time.time() - event.silence_duration - event.inference_duration
@@ -3773,7 +3863,54 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                             )
                         )
 
-        await asyncio.gather(_forward_input(), _recognize())
+        try:
+            await asyncio.gather(_forward_input(), _recognize())
+        finally:
+            # 流关闭时撤掉 hold flush,唔好留孤儿任务向已死 event_ch 发事件。
+            self._cancel_join_hold()
+
+    def _join_worthy_now(self) -> bool:
+        text = (self._last_partial or "").strip()
+        return bool(text) and _join_worthy(text)
+
+    def _cancel_join_hold(self) -> None:
+        self._join_hold_active = False
+        task = self._join_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._join_task = None
+
+    async def _hold_flush(self) -> None:
+        """join-hold 超时:续段冇嚟(客户真停嘴)→ 走正常停嘴路径出 FINAL。
+        与 _run 的 END_OF_SPEECH 分支同一套动作(EOS→finish→短尾规则→reset→FINAL),
+        只是晚 _join_hold_s() 秒执行;期间新 START_OF_SPEECH 会 cancel 咗呢个任务。"""
+        await asyncio.sleep(_join_hold_s())
+        if not self._join_hold_active:
+            return
+        self._join_hold_active = False
+        self._join_task = None
+        self._finishing = True
+        speech_end_time = time.time()
+        self._event_ch.send_nowait(
+            stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH, speech_end_time=speech_end_time)
+        )
+        text, lang = await self._finish_session()
+        committed_before = self._committed_text
+        payload = self._uncommitted(text) if (text and committed_before) else text
+        if committed_before and payload and len(payload) < _ASR_SENTENCE_MIN_CHARS:
+            payload = ""
+        self._finishing = False
+        self._reset()
+        if payload:
+            self._stt_._language_state.update(lang, payload)
+            self._event_ch.send_nowait(
+                stt.SpeechEvent(
+                    type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                    alternatives=[stt.SpeechData(language=self._stt_._language_state.lang, text=payload)],
+                    speech_end_time=speech_end_time,
+                )
+            )
+        print(f"QWEN3_ASR_JOIN_FLUSH chars={len(payload or '')}", flush=True)
 
     async def _start_session(self) -> None:
         lang_hint = _asr_language_hint(self._stt_._language_state.lang, self._stt_._pin_language)
@@ -3930,7 +4067,9 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         - 稳定性：上一窗同坐标已是同一句段（首现唔提交，防滑窗跳变 flicker）；
         - 限速：距上次提交 < _ASR_SENTENCE_MIN_INTERVAL_S 唔提交（连珠句防机关枪）。
         allow_eos=True（VAD 微停顿触发）：标点扫描无果时，边界候选=当前滑窗文本
-        末尾（pause≥0.45s 唔使标点都係句边界）。稳定性用 prefix 级——上一窗剩余
+        末尾（pause≥0.45s 唔使标点都係句边界）。字数门槛比标点路径高
+        （_pause_commit_min_chars，默认 10）——微停顿只证明喘气，6-9 字碎片当
+        整轮提交会被下一碎片掐掉在途回复。稳定性用 prefix 级——上一窗剩余
         係当前剩余的严格前缀（已确认部分零改写）即过：静音期通常只有一窗重解，
         EOS 时刻最后一窗往往刚把句尾字补齐，严格相等会错过真实停顿。首窗该区间
         为空（prev_rem 空）唔提交——零跨窗证据唔赌。
@@ -3971,7 +4110,7 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
             sentence = text[start:].rstrip(_PAUSE_TRAILING_WEAK_PUNCT)
             prev_rem = prev_full[start:].rstrip(_PAUSE_TRAILING_WEAK_PUNCT)
             if (
-                len(sentence) >= _ASR_SENTENCE_MIN_CHARS
+                len(sentence) >= _pause_commit_min_chars()
                 and not _has_latin_or_digit_run(sentence)
                 and prev_rem
                 and sentence.startswith(prev_rem)

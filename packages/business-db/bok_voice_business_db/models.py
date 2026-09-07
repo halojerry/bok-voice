@@ -48,6 +48,8 @@ class ObjectProfile(Base):
     tracking_no: Mapped[str] = mapped_column(String(64), default="")
     courier: Mapped[str] = mapped_column(String(64), default="")
     address: Mapped[str] = mapped_column(String(255), default="")
+    # 联系渠道({聯絡方式} 话术变量):空=按对象语言缺省(zh→微信/cantonese|en→WhatsApp)。
+    contact_channel: Mapped[str] = mapped_column(String(32), default="")
     template_id: Mapped[str] = mapped_column(String(64), default="")
     status: Mapped[str] = mapped_column(String(32), default="active")
 

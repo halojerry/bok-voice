@@ -101,6 +101,7 @@ class ObjectProfile:
     tracking_no: str = ""
     courier: str = ""
     address: str = ""
+    contact_channel: str = ""
     template_id: str = ""
     status: str = "active"
 

@@ -15,6 +15,9 @@ from .plugins.knowledge import KnowledgePlugin
 from .plugins.settlement import SettlementTrigger
 from .providers.registry import build_provider_registry
 from .control_plane import ControlPlaneClient
+# 模块级引 flow(纯 stdlib 依赖,无环):_wa_numberish/_wa_number_line 等模块级
+# helper 用;entrypoint 内的 function-scoped import 属历史样式,不冲突。
+from .flow import _digit_normalize, digits_to_cantonese
 
 try:
     from bok_voice_obs.logging import configure_logging, get_logger
@@ -262,6 +265,47 @@ def _nudge_should_fire(now: float, last_reply_ts: float, last_user_ts: float, nu
     if last_user_ts > last_reply_ts and now - last_user_ts <= nudge_delay * 2:
         return False
     return True
+
+
+# ---- WA 号码碎片累积(治「一句话拆两轮、LLM 唔识自己组装」,2026-09-06)----
+# 收号码步里客户逐位/逐段报号:每段独立成轮 → 语境与数字分居两轮、捕获结构性
+# 失败,AI 对每段插话(被打断再复读/捏造拼接,call-839ec9db "03201" 实证)。
+# 号码主导句且累计 <8 位 → 暂存唔成轮,等下一段拼埋一次过处理。
+_WA_ACCUM_ENABLED = os.environ.get("BOK_WA_ACCUMULATE", "1") == "1"
+_WA_ACCUM_MIN_DIGITS = 8  # 港号 8 位;攒够即当完整号码放行
+_WA_ACCUM_TIMEOUT_S = float(os.environ.get("BOK_WA_ACCUM_TIMEOUT_S", "5"))
+# 自报头碎片:「我的WhatsApp係/是。」(渠道词+系词收尾、零数字)——号码仲喺后面的半句。
+_WA_ANNOUNCE_HEAD_RE = re.compile(
+    r"(我的|我)?\s*(whats\s?app|wechat|we\s?chat|微信)[^\n]{0,8}(?:[號号](?:[碼码])?|number)?\s*"
+    r"(就?係|就是|是|is)\s*[。，,．.！!？?～~]*$",
+    re.IGNORECASE,
+)
+
+
+def _wa_numberish(text: str) -> bool:
+    """号码主导句:去渠道词/空白/标点后,数字佢主导,剩余实质字符 ≤6
+    (「我的WhatsApp係64325432」剩「我的係」=4;「zero was three」剩「was」=3)。"""
+    norm = _digit_normalize(text)
+    digits = sum(ch.isdigit() for ch in norm)
+    rest = re.sub(r"[\s\d。，,．.！!？?～~—\-、；;：:'\"()（）]", "", norm)
+    return digits >= 1 and len(rest) <= 6
+
+
+def _wa_number_line(lang: str, num: str) -> str:
+    """碎片暂存超时 flush 嘅脚本直念(session.say,零 TTFT/零前缀断裂):captured →
+    复述确认;唔系号码 → 请客户继续。三语骨架,风格同 _nudge_line。"""
+    if num:
+        shown = digits_to_cantonese(num) if lang == "cantonese" else num
+        if lang == "cantonese":
+            return f"好，收到，你嘅WhatsApp號碼係{shown}，啱嘅話我哋而家安排專員加你。"
+        if lang == "en":
+            return f"Got it — I've noted your number {num}. If that's right, we'll have the specialist add you now."
+        return f"好的，收到您的号码{shown}，没问题的话我们现在安排专员添加您。"
+    if lang == "cantonese":
+        return "唔好意思，可能啱啱听唔完整——唔该继续报你嘅WhatsApp号码俾我。"
+    if lang == "en":
+        return "Sorry, I may have missed part of that — please go ahead with your number."
+    return "不好意思，可能刚才没听完整——麻烦您继续说一下您的号码。"
 
 
 def _farewell_line(name: str, lang: str) -> str:
@@ -801,6 +845,7 @@ async def entrypoint(ctx):
     # 对话流程控制器:载入模板分步 + 对象变量;由它按轮注入"当前步",逐步推进。
     from .flow import FlowController, facts_line
     from .flow import CONFIRM, OBJECTION, QUESTION, REFUSE, UNCLEAR, detect_whatsapp_signal, extract_call_facts
+    from .flow import _digit_normalize, _looks_like_whatsapp_step, _WHATSAPP_DECLINE, digits_to_cantonese
 
     flow_ctrl = FlowController.from_template(template, object_card)
     _log_stage("context_resolved")
@@ -868,6 +913,59 @@ async def entrypoint(ctx):
     # 本通已捕获过号码(captured/captured_implicit 任一):之後 WhatsApp 步嘅純短應承
     # 唔再判 offered(確認輪鎖死→逐字重複根因,detect_whatsapp_signal 文檔)。
     _wa_captured: dict = {"on": False}
+    # WA 号码碎片累积:客户逐位/逐段报号时暂存半截句(见 on_user_turn_completed
+    # 内 _WA_ACCUM 注释)。text=暂存拼接,ts=最后一段时刻,task=超时 flush 任务。
+    _wa_accum: dict = {"text": "", "ts": 0.0, "task": None}
+
+    def _cancel_wa_accum_flush() -> None:
+        task = _wa_accum.get("task")
+        if task is not None and not task.done():
+            task.cancel()
+        _wa_accum["task"] = None
+
+    def _arm_wa_accum_flush() -> None:
+        """碎片暂存超时兜底:等满 _WA_ACCUM_TIMEOUT_S 冇续段 → 对暂存文本跑一次侦测。
+        captured → 上报+复述确认(脚本直念,零 TTFT/零前缀断裂);唔系号码 → 短句请
+        客户继续讲。唔走 LLM——心跳护栏会把「客戶比 AI 新」当答案在途压心跳,
+        暂存轮必须有自己嘅补位,唔可以赖 8s 心跳。"""
+        _cancel_wa_accum_flush()
+
+        async def _flush() -> None:
+            await asyncio.sleep(_WA_ACCUM_TIMEOUT_S)
+            if closed.is_set():
+                return
+            stashed = _wa_accum["text"]
+            _wa_accum["text"] = ""
+            if not stashed:
+                return
+            _g, _r = flow_ctrl.current_goal_ref()
+            sig = detect_whatsapp_signal(stashed, step_goal=_g, step_ref=_r, facts=flow_ctrl.vars_map)
+            num = ""
+            if sig and sig[0] in ("captured", "captured_implicit"):
+                _wa_captured["on"] = True
+                if sig[0] == "captured_implicit":
+                    num = str((object_card or {}).get("phone") or "").strip()
+                else:
+                    num = sig[1]
+                if num and num not in _wa_reported:
+                    _wa_reported.add(num)
+                    try:
+                        await cp.report_whatsapp(call_id, num)
+                    except Exception as exc:  # pragma: no cover - 上报失败唔阻确认
+                        _wa_reported.discard(num)
+                        print(f"[whatsapp] accumulate report failed: {exc!r} (call {room_name})", flush=True)
+                if num:
+                    context_state.set_whatsapp_note(num)
+                print(f"[whatsapp] accumulate flush captured num={num} (call {room_name})", flush=True)
+            else:
+                print(f"[whatsapp] accumulate flush no-number, prompt continue (call {room_name})", flush=True)
+            try:
+                await session.say(_wa_number_line(language_state.lang, num))
+            except Exception as exc:  # pragma: no cover - 会话已关等
+                print(f"[whatsapp] accumulate flush say failed: {exc!r}", flush=True)
+
+        _wa_accum["task"] = asyncio.create_task(_flush())
+
     # 背景 flow judge 防疊:記錄而家 judge 緊邊一步(-1=冇)。推進唔可以同時兩個 judge。
     _judge_inflight: dict = {"step": -1}
     # 沉默心跳:AI 講完話客戶耐冇出聲 → 主動確認「仲喺度嗎」並帶返當前步。
@@ -1245,9 +1343,9 @@ async def entrypoint(ctx):
                     except Exception as exc:  # pragma: no cover - 联网是增强
                         print(f"[agent] web search skipped: {exc!r}", flush=True)
             context_state.add_summary(role, _clean_transcript(text))
-            if role == "assistant":
-                # 尾部重复锚:让模型看得见自己上一句,治原句/近原句复述(R3)。
-                context_state.set_last_reply(_clean_transcript(text))
+            # 尾部重复锚(set_last_reply)已上移 _on_item_for_context 同步写——原先喺
+            # 呢个异步任务里,前面仲有 RAG/联网 await,下一轮回复构建可能抢喺锚更新
+            # 前执行 → 「你上一句」重复锚失效竞态(P1,2026-09-06)。
         except Exception as exc:  # pragma: no cover - context must not break turns
             print(f"[agent] context update failed: {exc!r}", flush=True)
 
@@ -1258,10 +1356,17 @@ async def entrypoint(ctx):
             return
         text = getattr(item, "text_content", None) or getattr(item, "raw_text_content", "") or ""
         if text:
-            if role == "user":
-                # 只触发异步检索；回复语言由 on_user_turn_completed 锚定后统一注入，
-                # 避免这里读到 ASR 原始 lang 抢先注入造成竞态。
-                pass
+            if role == "assistant":
+                # 尾部重复锚同步写(R3 治原句/近原句复述):lecture_guard 守则与摘要
+                # 记忆同一把尺(转录落咗罐頭,記憶/錨都唔可以留原稿)。
+                try:
+                    guarded = lecture_guard(
+                        text,
+                        language_state.lang if language_state.lang in ("zh", "cantonese") else None,
+                    )
+                    context_state.set_last_reply(_clean_transcript(guarded))
+                except Exception:  # pragma: no cover - 锚失败唔阻主流程
+                    pass
             asyncio.create_task(_async_update_context(role, text))
 
     # 会话关闭事件：置位后 supervisor watcher 退出、结算触发。
@@ -1432,10 +1537,43 @@ async def entrypoint(ctx):
             # WhatsApp 对接触发:喺 flow 推进【前】偵測(step context 係舊步/當前步,offered 先啱);
             # 客戶俾號碼(captured)照推下一步;應承加但未俾號碼(offered)→ 唔自動跳,等 AI 叫佢俾號碼。
             _wa_signal: tuple | None = None
+            user_text = str(getattr(new_message, "text_content", None) or "")
+            # WA 号码碎片累积:号码主导句且累计 <8 位、或自报头半句(「我的WhatsApp係」)
+            # → 暂存+StopResponse(唔回复、唔侦测、唔推进),等下一段拼埋一次过处理。
+            # 超时 flush 见 _arm_wa_accum_flush。StopResponse 必须喺任何 except-pass
+            # try 之外(会被吞)。BOK_WA_ACCUMULATE=0 回退。
+            if _WA_ACCUM_ENABLED and flow_ctrl.has_steps:
+                _g, _r = flow_ctrl.current_goal_ref()
+                if _looks_like_whatsapp_step(_g, _r) and user_text.strip() and not closed.is_set():
+                    _stashed = _wa_accum["text"]
+                    _merged = (_stashed + user_text) if _stashed else user_text
+                    _n = sum(ch.isdigit() for ch in _digit_normalize(_merged))
+                    _stash_it = (
+                        not _WHATSAPP_DECLINE.search(user_text.lower())
+                        and (
+                            (_wa_numberish(_merged) and 0 < _n < _WA_ACCUM_MIN_DIGITS)
+                            or (_n == 0 and _WA_ANNOUNCE_HEAD_RE.search(user_text.strip()))
+                        )
+                    )
+                    if _stash_it:
+                        _wa_accum["text"] = _merged
+                        _wa_accum["ts"] = time.monotonic()
+                        _arm_wa_accum_flush()
+                        print(
+                            f"[whatsapp] accumulate chars={len(user_text)} total_digits={_n} (call {room_name})",
+                            flush=True,
+                        )
+                        raise StopResponse()
+                    if _stashed:
+                        # 攒够位(≥8)或客户讲咗其他嘢 → 拼上暂存,当一句话交给侦测/推进。
+                        _wa_accum["text"] = ""
+                        _cancel_wa_accum_flush()
+                        try:
+                            new_message.text_content = _merged
+                        except Exception:  # pragma: no cover - 历史合并失败仅损转写一致性
+                            pass
+                        user_text = _merged
             try:
-                user_text = ""
-                nm = getattr(new_message, "text_content", None) or ""
-                user_text = str(nm or "")
                 if flow_ctrl.has_steps:
                     _g, _r = flow_ctrl.current_goal_ref()
                     _wa_signal = detect_whatsapp_signal(
@@ -1518,7 +1656,17 @@ async def entrypoint(ctx):
                             print(f"[flow] rule=auto step={flow_ctrl.current + 1} (call {room_name})", flush=True)
                         elif verdict == CONFIRM:
                             # offered(應承加但未俾號碼)→ 唔推,停喺辦理步叫佢俾號碼(captured 先推)。
-                            if _wa_signal and _wa_signal[0] == "offered":
+                            # WA 步假確認都唔推:碎片「我的WhatsApp是。」尾部裸係/是命中 CONFIRM
+                            # (_CONFIRM_RE 有裸字),未 captured 就 advance 會喺號碼到達前越過
+                            # 收號碼步→下輪 wa_step 已唔係、捕獲結構性失敗
+                            # (2026-09-06 call-c4f6e4f1 實證:judge=confirm step=4→號碼輪走漏)。
+                            _wa_satisfied = (
+                                (_wa_signal is not None and _wa_signal[0] in ("captured", "captured_implicit"))
+                                or _wa_captured["on"]
+                            )
+                            if (_wa_signal is not None and _wa_signal[0] == "offered") or (
+                                _looks_like_whatsapp_step(_g2, _r2) and not _wa_satisfied
+                            ):
                                 pass
                             else:
                                 flow_ctrl.advance()

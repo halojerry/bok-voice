@@ -86,6 +86,12 @@ def build_engine() -> Engine | None:
                 _ensure_column(
                     conn,
                     "object_profiles",
+                    "contact_channel",
+                    "contact_channel VARCHAR(32) DEFAULT ''",
+                )
+                _ensure_column(
+                    conn,
+                    "object_profiles",
                     "address",
                     "address VARCHAR(255) DEFAULT ''",
                 )

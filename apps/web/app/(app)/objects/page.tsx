@@ -15,6 +15,7 @@ interface ObjectRow {
   tracking_no: string;
   courier: string;
   address: string;
+  contact_channel: string;
   template_id: string;
 }
 
@@ -27,6 +28,7 @@ const EMPTY_FORM = {
   tracking_no: "",
   courier: "",
   address: "",
+  contact_channel: "",
   template_id: "",
 };
 
@@ -198,6 +200,7 @@ export default function ObjectsPage() {
       tracking_no: row.tracking_no ?? "",
       courier: row.courier ?? "",
       address: row.address ?? "",
+      contact_channel: row.contact_channel ?? "",
       template_id: row.template_id ?? "",
     });
   }
@@ -339,6 +342,12 @@ export default function ObjectsPage() {
               placeholder="电话（可选）"
               value={form.phone}
               onChange={(e) => setForm({ ...form, phone: e.target.value })}
+            />
+            <input
+              className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+              placeholder="联系渠道（微信 / WhatsApp，留空按语言默认；话术里用 {聯絡方式} 引用）"
+              value={form.contact_channel}
+              onChange={(e) => setForm({ ...form, contact_channel: e.target.value })}
             />
             <div className="grid grid-cols-2 gap-3">
               <input
