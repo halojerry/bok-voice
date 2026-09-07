@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 
 from bok_voice_knowledge.knowledge import DefaultKnowledgeService, _chunk_content
 from bok_voice_knowledge.markdown_source import LocalMarkdownSource
@@ -123,3 +124,78 @@ def test_no_embedder_keeps_substring_behavior():
     assert len(hits) == 1
     misses = asyncio.run(service.search("完全无关词", "acc", limit=5))
     assert misses == []
+
+
+def test_template_versioning_snapshot_and_revisions(tmp_path):
+    """话术版本化：update 前快照旧版,revision 递增,可回放旧版内容。"""
+    os.environ.setdefault("DATABASE_URL", "")
+    os.environ.setdefault("LIVEKIT_API_KEY", "devkey")
+    os.environ.setdefault("LIVEKIT_API_SECRET", "devsecret")
+    os.environ.setdefault("LIVEKIT_URL", "ws://127.0.0.1:7880")
+
+    from fastapi.testclient import TestClient
+
+    from control_plane.main import app
+
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/templates",
+            json={"account_id": "acc-001", "name": "版本化话术", "steps_json": '[{"goal":"g1","ref":"第一版"}]'},
+        )
+        assert r.status_code in (200, 201), r.text
+        tid = r.json()["id"]
+        # 第二版:更新步骤
+        r2 = client.put(
+            f"/api/templates/{tid}",
+            json={"steps_json": '[{"goal":"g1","ref":"第二版"}]'},
+        )
+        assert r2.status_code == 200
+        revs = client.get(f"/api/templates/{tid}/revisions").json()
+        assert len(revs) == 1 and revs[0]["revision"] == 1
+        assert "第一版" in revs[0]["snapshot"], "旧版内容必须入快照"
+
+
+def test_object_digest_merges_on_settle(tmp_path):
+    """settle 时把 summary 并入对象滚动摘要（v1 结构化拼接）。"""
+    os.environ.setdefault("DATABASE_URL", "")
+    os.environ.setdefault("LIVEKIT_API_KEY", "devkey")
+    os.environ.setdefault("LIVEKIT_API_SECRET", "devsecret")
+    os.environ.setdefault("LIVEKIT_URL", "ws://127.0.0.1:7880")
+
+    from fastapi.testclient import TestClient
+
+    from control_plane.main import app
+
+    with TestClient(app) as client:
+        obj = client.post(
+            "/api/objects?account_id=acc-001",
+            json={"display_name": "摘要对象", "role_template": "buyer", "language": "cantonese"},
+        ).json()
+        call = client.post(
+            "/api/calls",
+            json={"account_id": "acc-001", "object_id": obj["id"], "mode": "simulation",
+                  "direction": "webrtc", "language": "cantonese"},
+        ).json()
+        client.post(
+            f"/api/calls/{call['id']}/turns",
+            params={"role": "user", "transcript": "我個單號係七八九零，幫我查下"},
+        )
+        client.post(
+            f"/api/calls/{call['id']}/turns",
+            params={"role": "assistant", "transcript": "好的，幫你查詢咗，稍後回覆", "latency_ms": 500},
+        )
+        r = client.post(f"/api/calls/{call['id']}/settle")
+        assert r.status_code == 200
+        digest = client.get(f"/api/objects/{obj['id']}/digest").json()
+        assert digest["digest"], "digest 应有内容"
+
+
+def test_distill_health_endpoint(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "")
+    from fastapi.testclient import TestClient
+
+    from control_plane.main import app
+
+    with TestClient(app) as client:
+        m = client.get("/api/reports/distill-health").json()
+        assert {"account_id", "calls_total", "settled", "distill_empty_events", "recent_empty"} <= set(m)

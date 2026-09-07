@@ -1014,6 +1014,20 @@ async def settle(call_id: str) -> dict:
         if not (summ.get("summary") or "").strip() and turns:
             _audit("settle.distill_empty", subject_type="call", subject_id=call_id,
                    detail={"turns": len(turns)})
+        # 对象级滚动摘要（专项 B2 v1:结构化拼接,LLM 增量润色为后续增强）
+        if (summ.get("summary") or "").strip() and call.get("object_id"):
+            try:
+                from datetime import datetime as _dt
+
+                obj = _repo().get_object(call["object_id"])
+                if obj is not None:
+                    prev = str(obj.get("digest") or "").strip()
+                    entry = f"- {_dt.now().strftime('%Y-%m-%d')}：{summ['summary'].strip()[:150]}"
+                    merged = (prev + "\n" + entry).strip()
+                    lines = merged.splitlines()
+                    _repo().update_object_digest(call["object_id"], "\n".join(lines[-10:]))
+            except Exception as exc:  # pragma: no cover
+                print(f"[settle] digest merge skipped: {exc!r}", flush=True)
         if summ.get("summary"):
             result["summary"] = summ["summary"]
         else:
@@ -1177,11 +1191,30 @@ def create_template(req: TemplateRequest) -> dict:
 
 @app.put("/api/templates/{template_id}")
 def update_template(template_id: str, req: UpdateTemplateRequest) -> dict:
-    tpl = _repo().update_template(template_id, req.model_dump())
-    if not tpl:
+    before = _repo().get_template(template_id)
+    if not before:
         raise HTTPException(404, "template not found")
-    _audit("template.update", subject_type="template", subject_id=template_id, account_id=tpl.get("account_id", ""), detail={"name": tpl.get("name", "")})
+    # 话术版本化（2026-09-07 专项 B3）:update 即快照旧版——「哪版话术转化更好」
+    # 从数据上可答;call_sessions.template_id 快照指向的版本内容不再随更新漂移。
+    revision = len(_repo().list_template_revisions(template_id)) + 1
+    import json as _revjson
+
+    _repo().append_template_revision(template_id, revision, _revjson.dumps(before, ensure_ascii=False))
+    tpl = _repo().update_template(template_id, req.model_dump())
+    _audit(
+        "template.update",
+        subject_type="template",
+        subject_id=template_id,
+        account_id=tpl.get("account_id", ""),
+        detail={"name": tpl.get("name", ""), "revision": revision,
+                "changed": sorted(k for k in req.model_dump() if req.model_dump().get(k) not in (None, "") and before.get(k) != req.model_dump().get(k))},
+    )
     return tpl
+
+
+@app.get("/api/templates/{template_id}/revisions")
+def template_revisions(template_id: str) -> list[dict]:
+    return _repo().list_template_revisions(template_id)
 
 
 @app.delete("/api/templates/{template_id}")
@@ -1334,6 +1367,34 @@ def script_insights(account_id: str = "acc-001", limit: int = 10) -> dict:
         ],
         "distill_docs": len(_repo().list_calls(account_id, "")),
     }
+
+
+@app.get("/api/reports/distill-health")
+def distill_health(account_id: str = "acc-001", limit: int = 10) -> dict:
+    """蒸馏健康度（审计事件 settle.distill_empty 由 #23 铺设,本端点出报表口径）。"""
+    calls = _repo().list_calls(account_id, "")
+    settled = [c for c in calls if c.get("status") == "ended"]
+    empty_events = _repo().list_audit_events(
+        account_id=account_id, action="settle.distill_empty", limit=200
+    )
+    return {
+        "account_id": account_id,
+        "calls_total": len(calls),
+        "settled": len(settled),
+        "distill_empty_events": len(empty_events),
+        "recent_empty": [
+            {"call_id": e.get("call_id", ""), "ts": e.get("ts", "")}
+            for e in empty_events[:limit]
+        ],
+    }
+
+
+@app.get("/api/objects/{object_id}/digest")
+def get_object_digest(object_id: str) -> dict:
+    obj = _repo().get_object(object_id)
+    if not obj:
+        raise HTTPException(404, "object not found")
+    return {"object_id": object_id, "digest": obj.get("digest", "")}
 
 
 @app.get("/api/reports/usage")

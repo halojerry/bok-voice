@@ -48,6 +48,8 @@ class ObjectProfile(Base):
     tracking_no: Mapped[str] = mapped_column(String(64), default="")
     courier: Mapped[str] = mapped_column(String(64), default="")
     address: Mapped[str] = mapped_column(String(255), default="")
+    # 对象级滚动摘要（蒸馏沉淀,settle 时并入;分析/回访视角一屏可见）
+    digest: Mapped[str] = mapped_column(Text, default="")
     template_id: Mapped[str] = mapped_column(String(64), default="")
     status: Mapped[str] = mapped_column(String(32), default="active")
 
@@ -180,6 +182,17 @@ class AuditEventRecord(Base):
     account_id: Mapped[str] = mapped_column(String(64), default="")
     object_id: Mapped[str] = mapped_column(String(64), default="")
     persona_id: Mapped[str] = mapped_column(String(64), default="")
+
+
+class TemplateRevision(Base):
+    """话术模板版本快照（话术优化的基础设施:update 即存旧版,结算可按版本分组）。"""
+
+    __tablename__ = "conversation_template_revisions"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    template_id: Mapped[str] = mapped_column(String(64), index=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    snapshot: Mapped[str] = mapped_column(Text)  # 旧版整行 JSON
+    updated_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
 class UsageRecord(Base):
