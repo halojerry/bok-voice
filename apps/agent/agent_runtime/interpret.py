@@ -236,7 +236,7 @@ async def entrypoint(ctx) -> None:
         flush=True,
     )
 
-    cp = ControlPlaneClient(os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000"))
+    cp = ControlPlaneClient(os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000"), call_id=call_id)
     settings: dict = {}
     try:
         settings = await cp.get_settings()
