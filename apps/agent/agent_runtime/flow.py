@@ -107,6 +107,12 @@ def object_vars(object_card: dict | None) -> dict[str, str]:
     address = str(oc.get("address") or "").strip()
     tail = tracking[-4:] if len(tracking) >= 4 else tracking
     phone = str(oc.get("phone") or "").strip()
+    # 联系渠道({聯絡方式}/{联系方式}/{contact}):对象显式指定优先,缺省按对象语言
+    # (zh→微信 / cantonese|en→WhatsApp)。话术模板用占位符引用,换渠道唔使改模板。
+    lang = str(oc.get("language") or "zh").strip().lower()
+    channel = str(oc.get("contact_channel") or "").strip()
+    if not channel:
+        channel = {"zh": "微信", "cantonese": "WhatsApp", "en": "WhatsApp"}.get(lang, "WhatsApp")
     return {
         "姓名": name,
         "名字": name,
@@ -121,6 +127,9 @@ def object_vars(object_card: dict | None) -> dict[str, str]:
         "收货地址": address,
         "地址": address,
         "电话": digits_to_cantonese(phone),
+        "聯絡方式": channel,
+        "联系方式": channel,
+        "contact": channel,
     }
 
 
@@ -189,13 +198,25 @@ _STRONG_AFFIRM_RE = re.compile(
 )
 
 
+# 英文数字词:ASR en 档常态输出「zero was three / one three two zero one」,
+# 无映射时英语号码结构性无法归一(2026-09-06 call-839ec9db 实证:号码词各自成轮
+# 且零 digit run,AI 只能口头捏造拼接 "03201")。
+_EN_DIGIT_WORDS_RE = re.compile(
+    r"\b(zero|oh|one|two|three|four|five|six|seven|eight|nine)\b", re.IGNORECASE
+)
+_EN_DIGIT_MAP = {"zero": "0", "oh": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+                 "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"}
+
+
 def _digit_normalize(text: str) -> str:
-    """把汉字数字/空白归一成可比对串:七八九零 → 7890(繁体简体数字都收)。"""
+    """把汉字/英文数字词/空白归一成可比对串:七八九零 → 7890、one two three → 123
+    (繁体简体数字都收)。"""
+    lowered = _EN_DIGIT_WORDS_RE.sub(lambda m: _EN_DIGIT_MAP[m.group(1).lower()], str(text).lower())
     table = {"零": "0", "一": "1", "二": "2", "三": "3", "四": "4",
              "五": "5", "六": "6", "七": "7", "八": "8", "九": "9",
              "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
              "５": "5", "６": "6", "７": "7", "８": "8", "９": "9"}
-    return "".join(table.get(ch, "" if ch.isspace() else ch) for ch in str(text))
+    return "".join(table.get(ch, "" if ch.isspace() else ch) for ch in lowered)
 
 
 def _matches_known_fact(user_text: str, facts: dict | None) -> bool:
@@ -219,18 +240,23 @@ def _matches_known_fact(user_text: str, facts: dict | None) -> bool:
 
 # ---- WhatsApp 对接触发侦测 ----
 # 客户喺通话俾出 WhatsApp(读出号码 / 应承加专员)→ 上报 control-plane → 操作台爆闪横幅。
-_WHATSAPP_STEP_HINTS = ("whatsapp", "微信", "加專員", "加我哋", "工作人員", "聯絡方式", "帳號", "加你", "加我")
-# 冇 WhatsApp / 唔想加 → 唔触发 offered
+_WHATSAPP_STEP_HINTS = ("whatsapp", "微信", "wechat", "加專員", "加我哋", "工作人員", "聯絡方式", "联系方式", "帳號", "账号", "加你", "加我", "contact")
+# 冇 WhatsApp / 唔想加 → 唔触发 offered（粤/普/英三语收齐，zh/en 模板照用）
 _WHATSAPP_DECLINE = re.compile(r"(冇whatsapp|冇用whatsapp|無whatsapp|唔用whatsapp|冇微信|無微信|唔用微信|"
+    r"没微信|没有微信|不用微信|不加微信|没whatsapp|没有whatsapp|不用whatsapp|"
+    r"no whatsapp|don'?t (use|have) whatsapp|not on whatsapp|can'?t (add|use) whatsapp|"
     r"唔方便加|冇得加|無得加|唔識加|唔加|唔想加|冇電話|無電話)", re.IGNORECASE)
 # offered 两路:①明確叫加(你加我/我加/加咗/搵我/發俾我);②纯短应承(成句好短,唔係答其他内容)。
 _WHATSAPP_ADD_VERB = re.compile(r"(你(哋|地)?加我|加我|我加咗|我加|加咗|加啦|加喇|搵我|你(哋|地)?發俾我|發俾我|快啲加|嚟加)", re.IGNORECASE)
 # 俾號語境:「我俾個號你 / 俾號碼你」→ 唔好淨靠 號碼/号码 字眼(「俾個號」冇「碼」都會走漏)。
 _WHATSAPP_GIVE_NUM_RE = re.compile(r"俾.{0,6}[號号]")
-# 明確自報:「我WhatsApp(就)係/是 <數字>」→ 號碼即 WhatsApp,就算撞已知電話/單號都當佢自報。
-# 系詞後必須直接跟數字(漢字/阿拉伯皆可):「WhatsApp 就是绑定…」唔算(嗰係綁定來電,交 caller_bound)。
+# 明確自報:「我WhatsApp/微信/WeChat (號/號碼/number) (就)係/是/is <數字>」→ 號碼即 WhatsApp/微信,
+# 就算撞已知電話/單號都當佢自報。系詞與數字之間容忍接縫標點(跨段拼接「係。一七二…」)
+# 與「號/号码/number」間綴;「WhatsApp 就是绑定…」唔算(嗰係綁定來電,交 caller_bound)。
 _WHATSAPP_NUM_ANNOUNCE_RE = re.compile(
-    r"(whatsapp|whats app|wa|微信)\s*(就?係|就是|是)\s*[0-9一二三四五六七八九零]", re.IGNORECASE
+    r"(whatsapp|whats\s?app|wechat|we\s?chat|wa|微信)(?:\s|，|,|。)*(?:[號号](?:[碼码])?|number)?(?:\s|，|,|。)*"
+    r"(就?係|就是|是|is)[\s。，,．.！!？?～~—-]{0,6}[0-9一二三四五六七八九零]",
+    re.IGNORECASE
 )
 _WHATSAPP_ACK_WORDS = ("好呀", "好丫", "好既", "好嘅", "好阿", "可以", "冇問題", "沒問題", "没问题", "無問題", "都得", "得呀", "嗯", "好", "得", "ok", "okay", "嗯嗯", "好呀好呀", "可以可以", "好嘅好嘅")
 # 句子提及其他话题(单号/电话/自己身份/地址/订单)→ 唔係应承加,唔触发 offered
@@ -263,7 +289,8 @@ def _is_pure_ack(text: str) -> bool:
 # 網購平台名:話術引導核實步(問「喺邊個平台買」)嘅關鍵答案——客戶答到就夠,唔使等確認。
 _PLATFORM_RE = re.compile(
     r"(拼多多|淘宝|淘寶|京东|京東|天貓|天猫|虾皮|蝦皮|shopee|lazada|亞馬遜|亚马逊|amazon|"
-    r"唯品會|唯品会|抖音|快手|pdd|京東|蘇寧|苏宁|当当|當當|官网|官網|直播間|直播间)",
+    r"唯品會|唯品会|抖音|快手|pdd|京東|蘇寧|苏宁|当当|當當|官网|官網|直播間|直播间|"
+    r"temu|shein|ebay|etsy|walmart|aliexpress|速卖通|速賣通)",
     re.IGNORECASE,
 )
 
@@ -285,17 +312,20 @@ def should_auto_advance(*, current: int, goal: str, ref: str, user_text: str, ve
         # 純提問(客問「你哋邊間公司?」)要喺開場步答,唔推;其他實質回應都推。
         return verdict != QUESTION
     ctx = f"{goal} {ref}"
-    # 兼要攞WhatsApp/截圖嘅核實步:客戶已俾號碼(captured)或話 WhatsApp 綁定來電
-    # (captured_implicit) → 一定推(去下一步承接);offered(應承加但未俾號碼)→ 唔推,
+    low_ctx = ctx.lower()
+    # 兼要攞WhatsApp/截圖嘅核實步(提示詞粵/普/英收齊,{聯絡方式}/{contact} 佔位字面都算):
+    # 客戶已俾號碼(captured)或話 WhatsApp 綁定來電
+    # (captured_implicit) → 一定推(去下一步承接);offered(應承加但未俾號)→ 唔推,
     # 留喺本步等號碼。淨係答到平台 → 停留。
-    wa_step = any(h in ctx for h in ("whatsapp", "WhatsApp", "微信", "帳號", "截圖", "加專員", "加你"))
+    wa_step = any(h in low_ctx for h in ("whatsapp", "wechat", "微信", "帳號", "账号", "截圖", "截图", "加專員", "加你", "聯絡方式", "联系方式", "contact"))
     if wa_step and wa in ("captured", "captured_implicit"):
         return True
     if wa_step:
         return False  # 要攞WhatsApp/截圖,未攞到 → 唔好跳去下一步
     if verdict == QUESTION:
         return False
-    if ("平台" in ctx or "核實" in ctx or "核实" in ctx or "邊個平台" in ctx) and _PLATFORM_RE.search(user_text):
+    if ("平台" in ctx or "核實" in ctx or "核实" in ctx or "邊個平台" in ctx
+            or "platform" in low_ctx or "verify" in low_ctx) and _PLATFORM_RE.search(user_text):
         return True
     return False
 # 已知资料键:若号码 run 命中佢哋 → 唔当新 WhatsApp(覆述单号/电话)
@@ -307,11 +337,14 @@ def _looks_like_whatsapp_step(goal: str, ref: str) -> bool:
     return any(h.lower() in ctx for h in _WHATSAPP_STEP_HINTS)
 
 
-def _valid_digit_runs(norm: str) -> list[str]:
-    """攞 6–13 位数字串(WhatsApp 號碼長度唔固定:香港8位/內地11位/帶區號13位;
-    6位容錯 ASR 少聽多位/口誤短號,真實 case「我WhatsApp是六四三二五四三」曾因長度走漏)。
-    短過6(單號尾4等)唔算,長過13(成串乱码)唔算;已知單號/電話另有 known-number 過濾兜底。"""
-    return [r for r in re.findall(r"[0-9]{6,13}", norm)]
+def _valid_digit_runs(norm: str, *, min_len: int = 4, max_len: int = 13) -> list[str]:
+    """攞 min_len–max_len 位数字串(WhatsApp 號碼長度唔固定:香港8位/內地11位/帶區號13位)。
+    下限 4:再短(1-3位)基本只會係 ASR 碎片——客戶讀號被 VAD 切段、或者糾正聽錯嘅
+    數字(「唔係5,係3」)——照收會攞住半個號碼提前推進,所以唔收;4 位以上喺 WhatsApp
+    語境(收號碼步/句中提 WhatsApp/微信)視為客戶報出嘅號碼照捕(用戶拍板:報出就收;
+    5位測試短號「一二二三三」曾因舊 6 位門檻全數走漏→唔爆閃)。
+    已知單號/尾號/電話另有 known-number 過濾兜底(覆述已知資料唔當新號碼)。"""
+    return [r for r in re.findall(rf"[0-9]{{{min_len},{max_len}}}", norm)]
 
 
 def _digit_runs_in(text: str) -> list[str]:
@@ -352,10 +385,12 @@ def detect_whatsapp_signal(
 ) -> tuple[str, str] | None:
     """偵測客戶係咪俾出 WhatsApp。返回 ("captured", 號碼) | ("captured_implicit", "") | ("offered", "") | None。
 
-    - captured:客戶讀出 6–13 位號碼(長度唔固定:港8/內地11/帶區號13;6位容錯 ASR 少聽),
-      且①當前步係引導辦理(問WhatsApp)或②句中明顯提 whatsapp/微信/俾號/加我;或③明確自報
-      「我WhatsApp(就)係 XXXX」(撞已知電話/單號都算)。號碼若命中已知 單號/尾號/電話 則唔當
-      (覆述已知資料)。
+    - captured:客戶讀出 4–13 位號碼(長度唔固定:港8/內地11/帶區號13;4位以下視為 ASR 碎片
+      ——讀號被 VAD 切段/糾正聽錯數字——唔收),且①當前步係引導辦理(問WhatsApp)或②句中
+      明顯提 whatsapp/微信/wechat/俾號/加我;或③明確自報「我WhatsApp(就)係 XXXX」(撞已知
+      電話/單號都算)。用戶拍板(2026-09-06):WhatsApp 語境入面客戶報出嘅數字串照捕,唔再設
+      6位高門檻(「我的微信号是一二二三三」5位測試短號曾全數走漏→唔爆閃)。
+      號碼若命中已知 單號/尾號/電話 則唔當(覆述已知資料)。
     - captured_implicit:WhatsApp 步客戶話號碼綁定「呢個來電/呢個號碼」(號喺系統度)——
       唔使讀出 8-13 位;caller 攞對象電話上報 captured。防死鎖:唔會因號碼俾 ASR
       聽亂 / 撞單號就永遠入唔到 captured、AI 無限重複要號。
@@ -375,8 +410,8 @@ def detect_whatsapp_signal(
     norm = _digit_normalize(t)
     in_wa_step = _looks_like_whatsapp_step(step_goal, step_ref)
     low = t.lower()
-    # WhatsApp 語境:句中明確講 whatsapp/微信/俾號/加我 → 出現嘅號碼優先當客戶俾嘅號。
-    wa_ctx = ("whatsapp" in low) or ("微信" in t) or bool(_WHATSAPP_GIVE_NUM_RE.search(t)) or ("号碼" in t) or ("号码" in t) or ("加我" in t)
+    # WhatsApp 語境:句中明確講 whatsapp/微信/wechat/俾號/加我 → 出現嘅號碼優先當客戶俾嘅號。
+    wa_ctx = ("whatsapp" in low) or ("wechat" in low) or ("微信" in t) or bool(_WHATSAPP_GIVE_NUM_RE.search(t)) or ("号碼" in t) or ("号码" in t) or ("加我" in t)
     runs = _valid_digit_runs(norm)
     caller_bound = in_wa_step and _WHATSAPP_CALLER_BOUND.search(t)
     if runs:

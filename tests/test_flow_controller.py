@@ -581,6 +581,97 @@ def test_done_confirm_no_reask():
     assert "毋需再问" not in fc.current_step_text()
 
 
+# ---- WA 捕获:4 位下限/微信/wechat/英文数字词/接缝标点(2026-09-06 拆句调查配套) ----
+
+from agent_runtime.flow import (  # noqa: E402
+    _digit_normalize,
+    detect_whatsapp_signal,
+    should_auto_advance,
+)
+
+_WA_STEP = {
+    "goal": "引导办理:请客户提供自己嘅{聯絡方式}号码,安排银联理赔专员对接",
+    "ref": "唔该你留個{聯絡方式}號碼俾我哋，我哋安排專員加你。\n客户报出号码 → 复述确认。",
+}
+
+
+def _wa(text: str):
+    return detect_whatsapp_signal(text, step_goal=_WA_STEP["goal"], step_ref=_WA_STEP["ref"])
+
+
+def test_digit_floor4_captures_short_announce_not_fragments():
+    # 5 位测试短号(「一二二三三」旧 6 位门槛全数走漏→唔爆闪)照捕;3 位碎片照拒。
+    assert _wa("我的WhatsApp係一二二三三") == ("captured", "12233")
+    assert _wa("我的微信号係12233") == ("captured", "12233")
+    assert _wa("係333") is None
+    assert _wa("唔係5，係3") is None
+
+
+def test_wechat_and_en_context_capture():
+    assert _wa("my wechat is 12233") == ("captured", "12233")
+    assert _wa("my WhatsApp number is 12233") == ("captured", "12233")
+    # 拒绝语(普/英)唔触发 offered
+    assert _wa("我没有微信，不用了") is None
+    assert _wa("I don't use WhatsApp") is None
+
+
+def test_en_digit_words_normalize():
+    assert _digit_normalize("one three two zero one") == "13201"
+    assert _digit_normalize("Zero was three") == "0was3"
+    # 英文号码词喺 WA 步直接捕获(归一后 run ≥4)
+    assert _wa("One three two zero one") == ("captured", "13201")
+
+
+def test_announce_seam_punctuation_captures_joined_text():
+    # 跨段拼接后的接缝:「係。一七二…」——系词与数字之间夹句号都照捕
+    assert _wa("我的WhatsApp是。一七二二三三四。") == ("captured", "1722334")
+    assert _wa("my whatsapp, is 1234") == ("captured", "1234")
+
+
+def test_known_number_facts_not_recaptured():
+    facts = {"快递单号": "sf33468899", "快递尾号": "8899", "电话": "1336758"}
+    assert detect_whatsapp_signal("尾号係8899", step_goal=_WA_STEP["goal"], step_ref=_WA_STEP["ref"], facts=facts) is None
+    assert detect_whatsapp_signal("我电话係1336758", step_goal=_WA_STEP["goal"], step_ref=_WA_STEP["ref"], facts=facts) is None
+
+
+def test_wa_step_blocks_advance_without_capture():
+    # 收号码步:未 captured 一律唔推( CONFIRM/平台名都唔放行)——假确认推进由
+    # agent 侧护栏挡(agent.py CONFIRM 分支),引擎侧 should_auto_advance 同向。
+    assert should_auto_advance(current=3, goal=_WA_STEP["goal"], ref=_WA_STEP["ref"],
+                               user_text="我的WhatsApp是。", verdict="CONFIRM", wa=None) is False
+    assert should_auto_advance(current=3, goal=_WA_STEP["goal"], ref=_WA_STEP["ref"],
+                               user_text="得，而家有時間", verdict="CONFIRM", wa=None) is False
+    assert should_auto_advance(current=3, goal=_WA_STEP["goal"], ref=_WA_STEP["ref"],
+                               user_text="6432543", verdict="ANSWER", wa="captured") is True
+
+
+def test_en_platform_answer_advances():
+    goal = "Verify: ask which platform the customer bought from"
+    ref = "May I ask where you bought it — Amazon, Temu, or eBay?"
+    assert should_auto_advance(current=1, goal=goal, ref=ref, user_text="I bought it on Temu", verdict="ANSWER") is True
+
+
+def test_contact_channel_vars_by_language_and_override():
+    base = {"display_name": "林总", "tracking_no": "sf33468899"}
+    assert object_vars({**base, "language": "cantonese"})["聯絡方式"] == "WhatsApp"
+    assert object_vars({**base, "language": "zh"})["聯絡方式"] == "微信"
+    assert object_vars({**base, "language": "en"})["contact"] == "WhatsApp"
+    assert object_vars({**base, "language": "zh", "contact_channel": "WhatsApp"})["联系方式"] == "WhatsApp"
+
+
+def test_wa_numberish_and_announce_head():
+    from agent_runtime.agent import _WA_ANNOUNCE_HEAD_RE, _wa_numberish
+
+    assert _wa_numberish("一七二二三三四") is True
+    assert _wa_numberish("Zero was three") is True
+    assert _wa_numberish("我的微信号係64325432") is True
+    assert _wa_numberish("我喺淘寶買嘢") is False
+    assert _wa_numberish("Okay.") is False
+    # 自报头:「我的WhatsApp是。」(零数字,号码喺后半句)
+    assert _WA_ANNOUNCE_HEAD_RE.search("我的WhatsApp是。") is not None
+    assert _WA_ANNOUNCE_HEAD_RE.search("你係咪加我WhatsApp呀") is None
+
+
 # ---- WS1 总览带各步事实(2026-09-07) ----
 
 

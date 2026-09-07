@@ -18,6 +18,7 @@ TURN_DETECTION≠stt → 不发任何句级事件，VAD 停嘴整段 FINAL 行�
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import time
 import types
@@ -690,6 +691,9 @@ def test_vad_pause_fragment_gate_env_fallback_six(monkeypatch):
 
 def test_vad_pause_digit_run_suppressed(monkeypatch):
     """停嘴 partial 带数字 run（单号）→ 唔提前提交，整段留给 finish 兜底。"""
+    # join-hold 关掉隔离验证:数字句而家会先被 join-hold 接手(等续段拼埋,
+    # 见 test_join_hold_*),呢度只测句级门对数字 run 嘅抑制本身。
+    monkeypatch.setenv("QWEN3_ASR_JOIN_HOLD_MS", "0")
     got, stream = _run_vad_stop(
         monkeypatch,
         last_partial="我張單號係7890123，",
@@ -903,6 +907,186 @@ def test_uncommitted_redecode_correction_dropped_and_continuation_kept():
             await _close(stream3)
 
     asyncio.run(body())
+
+
+# ---- 跨段拼接 join-hold(治报号句被微停顿切碎,2026-09-06)----
+
+from agent_runtime.providers.livekit_plugins import (  # noqa: E402
+    _join_hold_s,
+    _join_norm_digits,
+    _join_worthy,
+)
+
+
+def test_join_worthy_gate():
+    # 续接可能:数字 run / 句尾数字 / 系词收尾 / 英文号码词
+    assert _join_worthy("我的WhatsApp是。") is True
+    assert _join_worthy("一七二二三三四。") is True
+    assert _join_worthy("my whatsapp number is") is True
+    assert _join_worthy("Zero was three.") is True
+    # 普通陈述句零加迟
+    assert _join_worthy("Okay.") is False
+    assert _join_worthy("我喺淘寶買嘢。") is False
+    assert _join_worthy("好，唔该晒你。") is False
+    assert _join_worthy("") is False
+
+
+def test_join_norm_digits_cjk_fullwidth_en():
+    assert _join_norm_digits("一七二二三三四") == "1722334"
+    assert _join_norm_digits("１２３") == "123"
+    assert _join_norm_digits("one three two zero one") == "13201"
+
+
+def test_join_hold_disabled_by_env(monkeypatch):
+    monkeypatch.setenv("QWEN3_ASR_JOIN_HOLD_MS", "0")
+    assert _join_hold_s() == 0.0
+    monkeypatch.setenv("QWEN3_ASR_JOIN_HOLD_MS", "not-a-number")
+    assert _join_hold_s() == 0.8
+    monkeypatch.delenv("QWEN3_ASR_JOIN_HOLD_MS", raising=False)
+    assert _join_hold_s() == 0.8
+
+
+def _join_vad_events(stream, hold_then_continue: bool):
+    """hold 场景 fake VAD:START → EOS(续接句→hold) →
+    hold_then_continue: START(取消 hold) → EOS(真停嘴) → 收线;
+    否则:静默等 flush 超时 → 收线(延迟须 > JOIN_HOLD_MS)。
+    ref 直接用 stream 本体(假流要关 stream._input_ch;_last_partial 也落喺真流度)。"""
+
+    class _FakeVADStream:
+        def __init__(self):
+            self._ref = stream
+            self._n = 0
+
+        def flush(self):
+            pass
+
+        def end_input(self):
+            pass
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            self._n += 1
+            ev = types.SimpleNamespace(
+                type=lp.vad.VADEventType.START_OF_SPEECH,
+                speech_duration=0.0, silence_duration=0.0,
+                inference_duration=0.0, probability=1.0, speaking=True, frames=[],
+            )
+            end = types.SimpleNamespace(
+                type=lp.vad.VADEventType.END_OF_SPEECH,
+                speech_duration=2.0, silence_duration=0.5,
+                inference_duration=0.05, probability=0.0, speaking=False, frames=[],
+            )
+            if self._n == 1:
+                return ev
+            if self._n == 2:
+                self._ref._last_partial = "我的WhatsApp是。"  # 续接可能 → hold
+                return end
+            if hold_then_continue:
+                if self._n == 3:
+                    self._ref._last_partial = "我的WhatsApp是。一七二二三三四。"
+                    return ev
+                if self._n == 4:
+                    return end
+                if self._n == 5:
+                    # 第二段仍然 join-worthy → 再 hold(链式);留活等 flush 开火先收线
+                    await asyncio.sleep(_join_hold_s() + 0.1)
+            else:
+                if self._n == 3:
+                    await asyncio.sleep(_join_hold_s() + 0.05)
+            self._ref._input_ch.close()
+            raise StopAsyncIteration
+
+    class _FakeVAD:
+        def stream(self):
+            return _FakeVADStream()
+
+    return _FakeVAD()
+
+
+def _join_gates(monkeypatch) -> None:
+    monkeypatch.delenv("QWEN3_ASR_SENTENCE_COMMIT", raising=False)
+    monkeypatch.delenv("TURN_DETECTION", raising=False)
+    monkeypatch.delenv("QWEN3_ASR_JOIN_HOLD_MS", raising=False)
+    monkeypatch.setenv("QWEN3_ASR_JOIN_HOLD_MS", "40")
+    monkeypatch.setattr(lp, "httpx", types.SimpleNamespace(AsyncClient=_FakeClient))
+
+
+def test_join_hold_merges_next_segment_into_one_final(monkeypatch):
+    """续段在 hold 窗内到达:START 取消 flush、session 不重建;真正停嘴出【一条】
+    覆盖全段的 FINAL(语境+数字同轮,下游侦测先至有得拼)。"""
+    _join_gates(monkeypatch)
+    _FakeClient.finish_body = {"text": "我的WhatsApp是。一七二二三三四。", "language": "cantonese"}
+
+    async def scenario():
+        # 构造要喺 loop 入面(父类 __init__ 会 create_task);构造后同步换 vad,
+        # 主任务未跑过任何 await,唔会食到 object() vad。
+        stream = _make_stream()
+        stream._metrics_task.cancel()
+        stream._vad = _join_vad_events(stream, hold_then_continue=True)
+        stream._pending = bytearray(b"\x00\x00")
+        await asyncio.wait_for(stream._task, 3)
+        events: list[tuple[str, str]] = []
+        while True:
+            try:
+                e = stream._event_ch.recv_nowait()
+                events.append((e.type.name, e.alternatives[0].text if e.alternatives else ""))
+            except (ChanEmpty, ChanClosed):
+                break
+        stream._event_ch.close()
+        await asyncio.gather(stream._metrics_task, return_exceptions=True)
+        return events
+
+    events = asyncio.run(scenario())
+    finals = [t for (n, t) in events if n == "FINAL_TRANSCRIPT"]
+    assert len(finals) == 1, events
+    assert finals[0] == "我的WhatsApp是。一七二二三三四。"
+    # hold 期间第一段 EOS 唔好漏出嚟(框架见到 EOS 就会 commit 空/半截轮)
+    assert events.count(("END_OF_SPEECH", "")) == 1
+
+
+def test_join_hold_timeout_flushes_alone(monkeypatch):
+    """续段冇嚟(客户真停嘴):超时 flush 照常出 EOS+FINAL(该轮多等一个 hold 窗)。"""
+    _join_gates(monkeypatch)
+    _FakeClient.finish_body = {"text": "我的WhatsApp是。", "language": "cantonese"}
+
+    async def scenario():
+        stream = _make_stream()
+        stream._metrics_task.cancel()
+        stream._vad = _join_vad_events(stream, hold_then_continue=False)
+        stream._pending = bytearray(b"\x00\x00")
+        await asyncio.wait_for(stream._task, 3)
+        names: list[str] = []
+        while True:
+            try:
+                names.append(stream._event_ch.recv_nowait().type.name)
+            except (ChanEmpty, ChanClosed):
+                break
+        stream._event_ch.close()
+        await asyncio.gather(stream._metrics_task, return_exceptions=True)
+        return names
+
+    names = asyncio.run(scenario())
+    # 序列=START(第一段)→hold 唔出第一段 EOS→超时 flush EOS+FINAL
+    assert names == ["START_OF_SPEECH", "END_OF_SPEECH", "FINAL_TRANSCRIPT"], names
+
+
+def test_join_hold_cancelled_by_new_speech(monkeypatch):
+    """hold 期间新 START:超时 flush 被取消、_join_hold_active 复位——唔会喺新语音
+    讲到一半时把旧段 finish 埋(中间抢断)。"""
+    _join_gates(monkeypatch)
+
+    async def scenario():
+        stream = _make_stream()
+        stream._join_hold_active = True
+        stream._join_task = asyncio.create_task(asyncio.sleep(10))
+        stream._cancel_join_hold()
+        assert stream._join_hold_active is False
+        assert stream._join_task is None
+        stream._event_ch.close()
+
+    asyncio.run(scenario())
 
 
 def test_vad_pause_punct_path_fragment_also_gated(monkeypatch):
