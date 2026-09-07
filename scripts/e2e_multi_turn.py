@@ -234,8 +234,9 @@ async def main() -> None:
             lang, text = ("", "")
             if len(audio) > 4000:
                 lang, text = asr_language(audio)
-            ok = bool(lang) and turn["expect"].lower() in lang.lower()
-            if turn["lang"] == "cantonese" and not ok:
+            # 每通语言固定:混合语种输入下期望全部回通话语言(cantonese)。
+            ok = bool(lang) and "cantonese" in lang.lower()
+            if not ok:
                 ok = cantonese_markers(text)
             if not ok or len(audio) <= 4000:
                 all_pass = False

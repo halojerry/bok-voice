@@ -466,3 +466,20 @@ def test_audit_call_id_propagates_from_header():
         assert hit, rows[:2]
         assert hit[0]["call_id"] == "call-corr-test", hit[0]
         client.delete(f"/api/templates/{tpl['id']}?account_id=acc-001")
+
+
+def test_optional_bearer_auth(monkeypatch):
+    """R2:BOK_CP_TOKEN 设置后除 /health 外要求 Bearer;未设时全放行(本机形态)。"""
+    monkeypatch.setenv("BOK_CP_TOKEN", "secret-token")
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200  # 探活永远放行
+        assert client.get("/api/objects?account_id=acc-001").status_code == 401
+        ok = client.get(
+            "/api/objects?account_id=acc-001",
+            headers={"Authorization": "Bearer secret-token"},
+        )
+        assert ok.status_code == 200
+
+    monkeypatch.delenv("BOK_CP_TOKEN", raising=False)
+    with TestClient(app) as client:
+        assert client.get("/api/objects?account_id=acc-001").status_code == 200
