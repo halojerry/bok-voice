@@ -42,7 +42,7 @@ class _FakeModel:
         self.calls: list[dict] = []
         self.digit_tail = digit_tail
 
-    def generate(self, wav, language=None, max_tokens=256):
+    def generate(self, wav, language=None, max_tokens=256, system_prompt=None):
         self.calls.append({"samples": len(wav), "language": language})
         if len(wav) <= 16000:  # ≤1s:增量尾巴窗
             text = "單號 12345" if self.digit_tail else TAIL_TEXT
@@ -226,7 +226,7 @@ def test_finish_body_arriving_mid_partial_does_not_lose_tail():
     calls: list[int] = []
 
     class _BlockingModel:
-        def generate(self, wav, language=None, max_tokens=256):
+        def generate(self, wav, language=None, max_tokens=256, system_prompt=None):
             calls.append(len(wav))
             if len(wav) > 16000:  # partial 窗:解码中途卡住,模拟 GPU 在烧
                 started.set()
@@ -265,7 +265,7 @@ def test_trimmed_window_partial_keeps_covered_none():
     calls: list[dict] = []
 
     class _Model:
-        def generate(self, wav, language=None, max_tokens=256):
+        def generate(self, wav, language=None, max_tokens=256, system_prompt=None):
             calls.append(len(wav))
             return types.SimpleNamespace(text=PARTIAL_TEXT, language=["Cantonese"])
 
