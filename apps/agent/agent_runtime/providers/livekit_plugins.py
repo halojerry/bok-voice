@@ -3614,11 +3614,12 @@ class _Qwen3ASRStream(stt.RecognizeStream):
         for attempt in range(3):
             try:
                 async with httpx.AsyncClient(timeout=30) as client:
-                    # start 参数:language hint + 热词 context(都有先例可空,空则不下发)
+                    # start 参数:language hint + 热词 context(都有先例可空,空则不下发;
+                    # getattr 鸭型访问——测试 fake 与旧设置面无此属性时等同空)
                     start_params: dict[str, str] = {}
                     if lang_hint:
                         start_params["language"] = lang_hint
-                    if self._stt_._hotword_context:
+                    if getattr(self._stt_, "_hotword_context", ""):
                         start_params["context"] = self._stt_._hotword_context
                     start = await client.post(
                         f"{self._stt_._base_url}/api/start",
@@ -4028,11 +4029,12 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
 
     async def _start_session(self) -> None:
         lang_hint = _asr_language_hint(self._stt_._language_state.lang, self._stt_._pin_language)
-        # start 参数:language hint + 热词 context(同 offline 路径,空则不下发)
+        # start 参数:language hint + 热词 context(同 offline 路径,空则不下发;
+        # getattr 鸭型访问——测试 fake 无此属性时等同空)
         start_params: dict[str, str] = {}
         if lang_hint:
             start_params["language"] = lang_hint
-        if self._stt_._hotword_context:
+        if getattr(self._stt_, "_hotword_context", ""):
             start_params["context"] = self._stt_._hotword_context
         try:
             async with httpx.AsyncClient(timeout=10) as client:
