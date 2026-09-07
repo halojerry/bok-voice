@@ -667,6 +667,10 @@ def test_wa_numberish_and_announce_head():
     assert _wa_numberish("我的微信号係64325432") is True
     assert _wa_numberish("我喺淘寶買嘢") is False
     assert _wa_numberish("Okay.") is False
+    # 渠道英文词要先剥掉:「whatsapp」8 字母本身已超 ≤6 上限,唔剥英文通道永远进唔了累积
+    assert _wa_numberish("我的WhatsApp係64325432") is True
+    assert _wa_numberish("我的WhatsApp係六四三二") is True
+    assert _wa_numberish("WhatsApp 6432") is True
     # 自报头:「我的WhatsApp是。」(零数字,号码喺后半句)
     assert _WA_ANNOUNCE_HEAD_RE.search("我的WhatsApp是。") is not None
     assert _WA_ANNOUNCE_HEAD_RE.search("你係咪加我WhatsApp呀") is None

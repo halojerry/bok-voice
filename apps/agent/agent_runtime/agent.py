@@ -317,12 +317,17 @@ _WA_ANNOUNCE_HEAD_RE = re.compile(
 )
 
 
+# 渠道英文词(whatsapp/wechat 变体):号码主导判定前先剥——否则「whatsapp」8 个字母
+# 本身已超「剩余 ≤6」上限,英文通道报号句永远进唔了累积(docstring 示例实证假)。
+_WA_CHANNEL_WORD_RE = re.compile(r"(?:whats\s?app|wechat|we\s?chat)", re.IGNORECASE)
+
+
 def _wa_numberish(text: str) -> bool:
     """号码主导句:去渠道词/空白/标点后,数字佢主导,剩余实质字符 ≤6
-    (「我的WhatsApp係64325432」剩「我的係」=4;「zero was three」剩「was」=3)。"""
+    (「我的WhatsApp係64325432」去渠道词剩「我的係」=4;「Zero was three」剩「was」=3)。"""
     norm = _digit_normalize(text)
     digits = sum(ch.isdigit() for ch in norm)
-    rest = re.sub(r"[\s\d。，,．.！!？?～~—\-、；;：:'\"()（）]", "", norm)
+    rest = re.sub(r"[\s\d。，,．.！!？?～~—\-、；;：:'\"()（）]", "", _WA_CHANNEL_WORD_RE.sub("", norm))
     return digits >= 1 and len(rest) <= 6
 
 
