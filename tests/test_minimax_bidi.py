@@ -429,3 +429,19 @@ def test_continuous_sound_in_params_key(monkeypatch):
     key_off = tts._bidi_params_key()
     monkeypatch.setenv("MINIMAX_CONTINUOUS_SOUND", "1")
     assert tts._bidi_params_key() != key_off, "env 开关应变指纹触发重建"
+
+
+def test_emotion_legacy_values_sanitized(monkeypatch):
+    """旧部署残留 env 防呆:"1"→map、"0"/off→自动,不再直透成非法枚举。"""
+    from agent_runtime.plugins.emotion import EmotionState
+
+    monkeypatch.setenv("MINIMAX_EMOTION", "1")
+    tts = _make_tts()
+    tts._emotion_state = EmotionState(mood="happy")
+    assert tts._resolve_emotion() == "happy", '旧值 "1" 应按 map 处理'
+
+    monkeypatch.setenv("MINIMAX_EMOTION", "0")
+    assert tts._resolve_emotion() is None, '旧值 "0" 应按自动(不下发)处理'
+
+    monkeypatch.setenv("MINIMAX_EMOTION", "OFF")
+    assert tts._resolve_emotion() is None

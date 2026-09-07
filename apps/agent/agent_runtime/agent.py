@@ -784,7 +784,7 @@ async def entrypoint(ctx):
         _job_meta = {}
     call_id = str(_job_meta.get("call_id") or "").strip() or room_name
     cp_base = os.environ.get("CONTROL_PLANE_URL") or "http://127.0.0.1:8000"
-    cp = ControlPlaneClient(cp_base)
+    cp = ControlPlaneClient(cp_base, call_id=call_id)
     import time as _t
 
     _t0 = _t.monotonic()

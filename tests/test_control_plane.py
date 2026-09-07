@@ -418,3 +418,51 @@ def test_setup_status_reports_model_readiness():
         # In CI/dev the endpoint returns a structured shape even if models absent.
         for m in body["models"]:
             assert set(["name", "repo", "present", "required"]).issubset(m.keys())
+
+
+def test_concurrent_add_turns_no_silent_loss():
+    """并发 add_turn 不得静默丢数据（QA 压测 P1：旧 len 序号竞态 30 并发丢 30-37%）。
+
+    turn_id 已改 uuid：30 线程并发写同一 call，须全部落库且响应全 200 无 duplicate。
+    """
+    import concurrent.futures
+
+    with TestClient(app) as client:
+        call = client.post(
+            "/api/calls",
+            json={"account_id": "acc-001", "mode": "live", "direction": "webrtc", "language": "zh"},
+        ).json()
+        cid = call["id"]
+
+        def one(i: int):
+            return client.post(
+                f"/api/calls/{cid}/turns",
+                params={"role": "customer", "transcript": f"并发轮 {i}", "provider": "test", "latency_ms": i * 10},
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=30) as pool:
+            responses = list(pool.map(one, range(30)))
+        assert all(r.status_code == 200 for r in responses), [r.status_code for r in responses]
+
+        turns = client.get(f"/api/calls/{cid}/turns").json()
+        assert len(turns) == 30, f"并发写丢数据: {len(turns)}/30"
+        # R3 回归:provider/latency_ms 须落库(旧端点签名忽略这两个参数)
+        assert all(t.get("provider") == "test" for t in turns)
+        assert sorted(t["latency_ms"] for t in turns) == [i * 10 for i in range(30)]
+
+        client.delete(f"/api/calls/{cid}")
+
+
+def test_audit_call_id_propagates_from_header():
+    """请求带 X-Call-ID 头时,审计行 call_id 列应填充（web/agent correlation 贯通）。"""
+    with TestClient(app) as client:
+        tpl = client.post(
+            "/api/templates?account_id=acc-001",
+            json={"account_id": "acc-001", "name": "correlation头模板", "opening": "您好", "core": "介绍"},
+            headers={"X-Call-ID": "call-corr-test"},
+        ).json()
+        rows = client.get("/api/audit", params={"action": "template.create"}).json()
+        hit = [r for r in rows if r["subject_id"] == tpl["id"]]
+        assert hit, rows[:2]
+        assert hit[0]["call_id"] == "call-corr-test", hit[0]
+        client.delete(f"/api/templates/{tpl['id']}?account_id=acc-001")

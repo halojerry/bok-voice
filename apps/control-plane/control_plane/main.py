@@ -552,6 +552,8 @@ def token(req: TokenRequest) -> TokenResponse:
             _repo().update_call(req.call_id, status=CallStatus.ACTIVE.value)
         except Exception:
             pass
+    _audit("token.issue", subject_type="call", subject_id=req.call_id or "",
+           account_id=req.account_id, detail={"role": req.role})
     return TokenResponse(serverUrl=url, participantToken=participant_token)
 
 
@@ -581,7 +583,10 @@ def create_call(req: CreateCallRequest) -> dict:
         kind=req.kind,
         target_lang=req.target_lang,
     )
-    return _repo().create_call(manifest)
+    call = _repo().create_call(manifest)
+    _audit("call.create", subject_type="call", subject_id=call.get("id", ""),
+           account_id=req.account_id, detail={"mode": req.mode, "kind": req.kind, "language": req.language, "template_id": template_id})
+    return call
 
 
 def _effective_providers(settings: dict) -> dict:
@@ -636,6 +641,7 @@ async def hangup(call_id: str) -> dict:
     # 真正断开 LiveKit 房间：主管台/任意端挂断后 agent 与监听端都会被服务端踢出，
     # agent 侧 on_close 触发结算。房间不存在/服务不可用时不阻塞（DB 已置 ENDED）。
     await _disconnect_livekit_room(call_id)
+    _audit("call.hangup", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""))
     return {"call_id": call_id, "status": call["status"], "disconnected": True}
 
 
@@ -660,8 +666,28 @@ async def _disconnect_livekit_room(room_name: str) -> None:
 
 
 @app.post("/api/calls/{call_id}/turns")
-def add_turn(call_id: str, role: str, transcript: str, emotion: str = "") -> dict:
-    turn = TurnEvent(trace_id=call_id, call_id=call_id, turn_id=f"t{len(_repo().get_turns(call_id))}", role=role, transcript=transcript, emotion=emotion)
+def add_turn(
+    call_id: str,
+    role: str,
+    transcript: str,
+    emotion: str = "",
+    provider: str = "",
+    latency_ms: int = 0,
+) -> dict:
+    # turn_id 用 uuid 而非 len(get_turns()) 序号：并发写时序号竞态产生重复
+    # turn_id → 主键冲突 → IntegrityError 幂等分支吞成 200（静默丢数据，QA
+    # 压测 30 并发丢 30-37% 实证）。uuid 根除竞态；agent 上报的
+    # provider/latency_ms 此前被端点签名忽略（turns 两列恒空），一并收参。
+    turn = TurnEvent(
+        trace_id=call_id,
+        call_id=call_id,
+        turn_id=uuid.uuid4().hex[:12],
+        role=role,
+        transcript=transcript,
+        emotion=emotion,
+        provider=provider,
+        latency_ms=latency_ms,
+    )
     return _repo().create_turn(turn)
 
 
@@ -916,6 +942,7 @@ async def delete_knowledge(knowledge_id: str, account_id: str = "acc-001") -> di
     # id 形如 md:accounts/acc-001/knowledge/probe.md（含斜杠），放 path 参数会被
     # Starlette 路由层以 %2F 拒掉（404）——改走 query 参数最稳。
     removed = await app.state.knowledge.delete(account_id, [knowledge_id])
+    _audit("knowledge.delete", subject_type="knowledge", subject_id=knowledge_id, account_id=account_id, detail={"removed": removed})
     return {"deleted": removed, "knowledge_id": knowledge_id}
 
 
@@ -1231,6 +1258,7 @@ def pause_agent(call_id: str) -> dict:
     call = _repo().update_call(call_id, status=CallStatus.PAUSED.value)
     if not call:
         raise HTTPException(404, "call not found")
+    _audit("supervisor.pause", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""))
     return {"call_id": call_id, "action": "pause-agent", "status": call["status"]}
 
 
@@ -1240,6 +1268,7 @@ def resume_agent(call_id: str) -> dict:
     call = _repo().update_call(call_id, escalated_to_human=False, status=CallStatus.ACTIVE.value)
     if not call:
         raise HTTPException(404, "call not found")
+    _audit("supervisor.resume", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""))
     return {"call_id": call_id, "action": "resume-agent", "status": call["status"]}
 
 
@@ -1248,6 +1277,7 @@ def takeover(call_id: str) -> dict:
     call = _repo().update_call(call_id, escalated_to_human=True, status=CallStatus.PAUSED.value)
     if not call:
         raise HTTPException(404, "call not found")
+    _audit("supervisor.takeover", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""))
     return {"call_id": call_id, "action": "takeover", "status": call["status"]}
 
 
@@ -1257,6 +1287,7 @@ async def transfer(call_id: str) -> dict:
     if not call:
         raise HTTPException(404, "call not found")
     await _disconnect_livekit_room(call_id)
+    _audit("supervisor.transfer", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""))
     return {"call_id": call_id, "action": "transfer", "status": call["status"], "disconnected": True}
 
 
@@ -1273,4 +1304,5 @@ async def supervisor_end(call_id: str, disposition: str = "declined") -> dict:
     if not call:
         raise HTTPException(404, "call not found")
     await _disconnect_livekit_room(call_id)
+    _audit("supervisor.end", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""), detail={"disposition": disposition})
     return {"call_id": call_id, "action": "end", "status": call["status"], "disconnected": True}

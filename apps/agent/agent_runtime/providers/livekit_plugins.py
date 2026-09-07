@@ -1537,6 +1537,12 @@ class MiniMaxTTS(tts.TTS):
         raw = os.environ.get("MINIMAX_EMOTION", "").strip().lower()
         if not raw:
             return None
+        # 旧部署残留防呆:语义翻面前 "1"=开映射、"0"=关(→calm 旧版实义);
+        # 新代码里直接直透会成非法枚举(4xx)。归一:1→map、0/off→自动。
+        if raw == "1":
+            raw = "map"
+        elif raw in ("0", "off", "false"):
+            return None
         if raw == "map":
             if self._emotion_state is not None:
                 try:
@@ -2775,26 +2781,35 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                 # 轮级汇总:服务端切句数/打断/首包(首声=距首条 task_continue)。
                 # 验收读数:典型 2-3 短句回复 sentences 应 2-4;first_audio_ms 稳定
                 # 在数百 ms 且方差小于 classic overlap 时代。
-                if state["t_last_audio"] > 0.0 and state["t_first_continue"] > 0.0:
-                    print(
-                        f"MINIMAX_BIDI_PERF sentences={state['sentences']} "
-                        f"canceled={int(self._canceled_evt.is_set())} "
-                        f"first_audio_ms="
-                        f"{(state['t_last_audio'] - state['t_first_continue']) * 1000:.0f}",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        f"MINIMAX_BIDI_PERF sentences=0 "
-                        f"canceled={int(self._canceled_evt.is_set())} (no audio this turn)",
-                        flush=True,
-                    )
+                def _print_perf_summary() -> None:
+                    if state["t_last_audio"] > 0.0 and state["t_first_continue"] > 0.0:
+                        print(
+                            f"MINIMAX_BIDI_PERF sentences={state['sentences']} "
+                            f"canceled={int(self._canceled_evt.is_set())} "
+                            f"first_audio_ms="
+                            f"{(state['t_last_audio'] - state['t_first_continue']) * 1000:.0f}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"MINIMAX_BIDI_PERF sentences=0 "
+                            f"canceled={int(self._canceled_evt.is_set())} (no audio this turn)",
+                            flush=True,
+                        )
+
+                _print_perf_summary()
             except asyncio.CancelledError:
                 # 打断(barge-in):通知服务端丢弃缓冲/停合成,连接保留给下一轮。
                 try:
                     await self._cancel_on_server(ws)
                 except Exception:  # noqa: BLE001 - 收尾尽力而为
                     pass
+                # 打断轮也打 PERF(此前 CancelledError 跳过汇总,打断观测只能靠音频断言)。
+                print(
+                    f"MINIMAX_BIDI_PERF sentences={state['sentences']} "
+                    f"canceled={int(self._canceled_evt.is_set())} (interrupted)",
+                    flush=True,
+                )
                 raise
             except Exception as exc:
                 print("MINIMAX_TTS_BIDI_ERR", repr(exc), flush=True)
