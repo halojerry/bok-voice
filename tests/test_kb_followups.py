@@ -97,3 +97,29 @@ def test_settle_backfills_missing_turns_from_session_report(tmp_path, monkeypatc
         turns = client.get(f"/api/calls/{call_id}/turns").json()
         assert len(turns) >= 3, f"回填后轮次应 ≥3: {len(turns)}"
         assert any(t["role"] == "user" and "係我" in t["transcript"] for t in turns)
+
+
+def test_hybrid_vector_search_semantic_rewrite_hit(tmp_path):
+    """混合检索:改写问句（无字面子串）也能经向量余弦命中目标文档。"""
+    from bok_voice_core.embeddings import HybridLexicalEmbedding
+
+    service = DefaultKnowledgeService(
+        markdown=LocalMarkdownSource(tmp_path / "vault"),
+        vector=InMemoryVectorStore(HybridLexicalEmbedding(512)),
+    )
+    asyncio.run(service.import_document("acc", "kb/freight.md", "客户质疑运费：为什么还要我出运费？我们有运费险，退货运费保险公司赔。"))
+    asyncio.run(service.import_document("acc", "kb/eta.md", "配送时效：正常三到五天送达，偏远地区五到七天。"))
+    hits = asyncio.run(service.search("运费使乜要我俾啊", "acc", limit=2))
+    assert any("运费" in it.get("text", "") for it in hits), f"改写问句应命中运费文档: {hits}"
+
+
+def test_no_embedder_keeps_substring_behavior():
+    """无 embedder 时保持纯子串旧行为（回归保护）。"""
+    from pathlib import Path as _P
+
+    service = _service(_P("/tmp/kb-noemb"))
+    asyncio.run(service.import_document("acc", "kb/a.md", "我们的产品支持越南语通话。"))
+    hits = asyncio.run(service.search("越南语", "acc", limit=5))
+    assert len(hits) == 1
+    misses = asyncio.run(service.search("完全无关词", "acc", limit=5))
+    assert misses == []

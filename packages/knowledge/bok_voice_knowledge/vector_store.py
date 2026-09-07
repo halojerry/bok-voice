@@ -7,10 +7,15 @@ from typing import Optional
 
 
 class InMemoryVectorStore:
-    """In-memory VectorStore for tests / no-embedding local fallback."""
+    """In-memory VectorStore for tests / no-embedding local fallback.
 
-    def __init__(self) -> None:
+    2026-09-07 升级:可选 embedder（HybridLexical/Mlx）——search 改「向量余弦
+    ×0.6 + 子串命中 ×0.4」混合排序;无 embedder 时保持纯子串（旧行为不变）。
+    分析检索（跨通话找相似问题）用混合档;账户隔离不变。"""
+
+    def __init__(self, embedder=None) -> None:
         self._items: dict[str, dict] = {}
+        self._embedder = embedder
 
     def _key(self, account_id: str, text: str) -> str:
         return hashlib.sha256(f"{account_id}:{text}".encode()).hexdigest()[:16]
@@ -23,13 +28,38 @@ class InMemoryVectorStore:
 
     async def search(self, query: str, account_id: str, limit: int = 5) -> list[dict]:
         query_low = query.lower()
-        scored: list[tuple[int, dict]] = []
-        for item in self._items.values():
+        qvec = None
+        if self._embedder is not None:
+            try:
+                qvec = self._embedder.embed([query])[0]
+            except Exception:
+                qvec = None
+        doc_vecs = None
+        if qvec is not None:
+            texts = [it.get("text", "") for it in self._items.values()]
+            try:
+                doc_vecs = self._embedder.embed(texts)
+            except Exception:
+                doc_vecs = None
+
+        def _cos(a: list[float], b: list[float]) -> float:
+            num = sum(x * y for x, y in zip(a, b))
+            na = sum(x * x for x in a) ** 0.5
+            nb = sum(y * y for y in b) ** 0.5
+            return num / max(1e-9, na * nb)
+
+        scored: list[tuple[float, dict]] = []
+        for idx, item in enumerate(self._items.values()):
             if item.get("account_id") != account_id:
                 continue
-            text = item.get("text", "").lower()
-            if query_low in text:
-                scored.append((len(query_low) / max(1, len(text)), item))
+            text = item.get("text", "")
+            score = 0.0
+            if qvec is not None and doc_vecs is not None:
+                score += 0.6 * _cos(qvec, doc_vecs[idx])
+            if query_low in text.lower():
+                score += 0.4 * (len(query_low) / max(1, len(text)))
+            if score > 0:
+                scored.append((score, item))
         scored.sort(key=lambda x: x[0], reverse=True)
         return [item for _, item in scored[:limit]]
 
