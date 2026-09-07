@@ -147,7 +147,11 @@ WorkerOptions.port)——默认同为 8081 会竞态,后绑者 Errno 48 即崩
   —— 直接构造 `inference.VAD` 与打断开关（环境变量 `VAD_*` 仅作部署覆盖）。
   基线默认（2026-09-05 句号级提交落地后）：`min_silence_duration=0.45`、`min_speech_duration=0.15`；
   A 线 turn_detection=`stt`（STT 句末 END_OF_SPEECH 提交，句级 FINAL→EOS，说话中即提交，
-  数字串/短句/1.5s 限流保护），endpointing `min_delay=0.25`/`max_delay=0.6`。
+  数字串/短句/1.5s 限流保护；续接可能句——归一后 ≥2 位数字或系词收尾——会在句末被扣住
+  `QWEN3_ASR_JOIN_HOLD_MS`（默认 800，0=关）等续段并入同一 sidecar 会话、一条 FINAL
+  覆盖全段，超时由 flush 补发（该轮多等 ≤HOLD ms；flush 与正常停嘴同一套短尾规则并带
+  会话纪元守卫，finish 等待期续讲开新会话唔会被 reset 清轮）），
+  endpointing `min_delay=0.25`/`max_delay=0.6`。
   （历史警戒已失效条件化：当年压端点致哑火=轮次在离线 ASR final 前提交；现提交结构性等待
   STT FINAL 且句级路径 FINAL 即句文，三语 E2E 实证 0 丢转写。回退开关：`TURN_DETECTION=`
   置空回 EOT 模型档 + `QWEN3_ASR_SENTENCE_COMMIT=0`（两者须一起关，否则句级 FINAL 会
