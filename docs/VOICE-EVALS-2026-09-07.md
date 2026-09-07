@@ -22,9 +22,20 @@
 实测（5 通，24 条回复）：**白名单标签 0 次出现**；模型自造集外标签（如「内心」），未被剥除→被 TTS 念出（音频转写出现「内心好明白」「nội tâm」）——标签外溢污染音频。
 **处置**：试点代码保留但 `EMOTION_TAG_PILOT` 默认关（生产零影响）；止损成立——4B 在粤语客服语境下无法稳定输出受限标签集。后续若重启此方向，先解决受限生成（grammar/少样本微调）再接 voice_setting。
 
-## C3 长稳 soak（拉长批）
+## C3 长稳 soak：120 轮全绿，RSS 全线收敛（无泄漏）
 
-另起 120 通后台运行中（结果与 RSS 趋势见 /tmp/qa-soak-samples.tsv；40 通基线：全平面无泄漏迹象）。
+120 轮真实栈 soak（每轮 LLM 问答 + 轮询打点），**120/120 replies ok**，总耗时 2308s（~38.5min，平均 ~19.2s/轮）；逐轮采样（每 5 轮 × 5 进程）存 `/tmp/qa-soak-samples.tsv`。首末样本 RSS：
+
+| 进程 | 首 | 末 | 变化 |
+|---|---|---|---|
+| control-plane (uvicorn) | 104MB | 102MB | -2% |
+| agent A 线 (agent_runtime.main) | 136MB | 111MB | -18% |
+| agent B 线 (agent_runtime.interpret) | 267MB | 207MB | -23% |
+| mlx_lm LLM server | 4781MB | 2614MB | -45% |
+| TTS/ASR sidecar (app:app) | 8628MB | 2530MB | -71% |
+
+- **结论：无内存泄漏**。全部进程 RSS 单调收敛下降（首样本偏高是启动期分配/缓存未稳定，随后快速回落到稳态）；mlx_lm 稳态 ~2.6GB、sidecar ~2.5GB、两个 agent worker ≤210MB、CP ~100MB，fd/线程数全程平稳（无句柄泄漏）。
+- 40 通基线批 + 120 通拉长批两批互证，CP/agent/LLM server 长跑稳定；无 suspects（进程崩溃/重启/句柄增长）记录。
 
 ## C5 官方 audio turn detector 对比
 
