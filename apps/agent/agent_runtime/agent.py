@@ -917,6 +917,7 @@ async def entrypoint(ctx):
     from .flow import FlowController, facts_line
     from .flow import CONFIRM, OBJECTION, QUESTION, REFUSE, UNCLEAR, detect_whatsapp_signal, extract_call_facts
     from .flow import _digit_normalize, _looks_like_whatsapp_step, _WHATSAPP_DECLINE, digits_to_cantonese
+    from .flow import wa_confirm_advance_allowed
 
     flow_ctrl = FlowController.from_template(template, object_card)
     _log_stage("context_resolved")
@@ -1561,9 +1562,15 @@ async def entrypoint(ctx):
             jv = parse_judge_output(await _llm_judge(jbase, jmodel, msgs))
             if flow_ctrl.current == step_at and flow_ctrl.has_steps and not flow_ctrl.done:
                 if jv == CONFIRM:
-                    flow_ctrl.advance()
-                    context_state.set_flow_current(flow_ctrl.current_step_text())
-                    print(f"[flow] judge(bg)=confirm step={flow_ctrl.current + 1} (call {room_name})", flush=True)
+                    # WA 收号码步假确认护栏:与 rule CONFIRM 分支共用同一铁律——未
+                    # captured 唔准 judge 推进越过收号码步(c4f6e4f1 实证泄漏点)。
+                    _gj, _rj = flow_ctrl.current_goal_ref()
+                    if wa_confirm_advance_allowed(goal=_gj, ref=_rj, captured=_wa_captured["on"]):
+                        flow_ctrl.advance()
+                        context_state.set_flow_current(flow_ctrl.current_step_text())
+                        print(f"[flow] judge(bg)=confirm step={flow_ctrl.current + 1} (call {room_name})", flush=True)
+                    else:
+                        print(f"[flow] judge(bg)=confirm blocked (wa step, not captured) step={step_at + 1} (call {room_name})", flush=True)
                 else:
                     print(f"[flow] judge(bg)={jv} step={step_at + 1} (call {room_name})", flush=True)
         except Exception as exc:  # pragma: no cover - 背景判定失敗唔影響回覆
@@ -1770,8 +1777,8 @@ async def entrypoint(ctx):
                                 (_wa_signal is not None and _wa_signal[0] in ("captured", "captured_implicit"))
                                 or _wa_captured["on"]
                             )
-                            if (_wa_signal is not None and _wa_signal[0] == "offered") or (
-                                _looks_like_whatsapp_step(_g2, _r2) and not _wa_satisfied
+                            if (_wa_signal is not None and _wa_signal[0] == "offered") or not wa_confirm_advance_allowed(
+                                goal=_g2, ref=_r2, captured=_wa_satisfied
                             ):
                                 pass
                             else:

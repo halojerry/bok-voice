@@ -676,6 +676,28 @@ def test_wa_numberish_and_announce_head():
     assert _WA_ANNOUNCE_HEAD_RE.search("你係咪加我WhatsApp呀") is None
 
 
+def test_wa_confirm_guard_shared_rule_and_judge():
+    from agent_runtime.flow import wa_confirm_advance_allowed
+
+    # 收号码步未捕获:CONFIRM 唔放行(rule 与 judge 同一铁律)
+    assert wa_confirm_advance_allowed(goal=_WA_STEP["goal"], ref=_WA_STEP["ref"], captured=False) is False
+    # 捕获后放行
+    assert wa_confirm_advance_allowed(goal=_WA_STEP["goal"], ref=_WA_STEP["ref"], captured=True) is True
+    # 非 WA 步照常放行
+    assert wa_confirm_advance_allowed(goal="核实平台", ref="你喺边个平台落单?", captured=False) is True
+
+
+def test_judge_path_has_wa_guard():
+    """源码级:背景 judge 的 CONFIRM 分支必须过同一护栏(nested closure 冇法直接
+    单测,用 test_echo_guard 的源码断言姿势;泄漏点=c4f6e4f1 judge=confirm step=4)。"""
+    import agent_runtime.agent as ag
+
+    src = Path(ag.__file__).read_text(encoding="utf-8")
+    guard_pos = src.index("wa_confirm_advance_allowed(goal=_gj")
+    assert guard_pos < src.index("judge(bg)=confirm step=")
+    assert src.count("wa_confirm_advance_allowed(") >= 2  # rule 与 judge 两路共用
+
+
 # ---- WS1 总览带各步事实(2026-09-07) ----
 
 
