@@ -81,7 +81,10 @@ def runtime_root() -> Path:
 
 MODELS: dict[str, dict[str, str]] = {
     "mac": {
-        "asr": "aufklarer/Qwen3-ASR-1.7B-MLX-8bit",
+        # ASR 4bit(2026-09-08 GPU 竞态专项):同卡上 ASR 解码与 LLM prefill 抢 Metal
+        # 时间片,4bit 每窗快 ~1.3×、省 ~0.8GB;粤语质量以 A/B 基准把关(官方口径
+        # 4bit 对 8bit WER +0.3-1.4pp,出现退化回 aufklarer/Qwen3-ASR-1.7B-MLX-8bit)。
+        "asr": "mlx-community/Qwen3-ASR-1.7B-4bit",
         "tts_preset": "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit",
         "tts_clone": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
         # 客服 LLM 用 4B 关思考:话术化场景速度优先(一轮 ~1s,约为 9B 一半),
@@ -132,7 +135,16 @@ def model_path(current: dict[str, str], name: str) -> str:
     if is_packaged():
         return str(model_dir(repo))
     if is_mac():
-        return str(_lmstudio_models_dir() / repo)
+        # mac dev 惯例优先 ~/.lmstudio;但 bok.py download 落地在 app-data——
+        # 哪边真实存在用哪边,否则「download 成功但 serve 找不到」断层
+        # (2026-09-08 ASR 4bit 实证:health model_ready=false 指着不存在的 lmstudio 路径)。
+        lm = _lmstudio_models_dir() / repo
+        if lm.exists():
+            return str(lm)
+        app = model_dir(repo)
+        if app.exists():
+            return str(app)
+        return str(lm)
     return repo
 
 
