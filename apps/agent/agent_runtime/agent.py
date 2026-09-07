@@ -784,7 +784,7 @@ async def entrypoint(ctx):
         _job_meta = {}
     call_id = str(_job_meta.get("call_id") or "").strip() or room_name
     cp_base = os.environ.get("CONTROL_PLANE_URL") or "http://127.0.0.1:8000"
-    cp = ControlPlaneClient(cp_base)
+    cp = ControlPlaneClient(cp_base, call_id=call_id)
     import time as _t
 
     _t0 = _t.monotonic()
@@ -1317,17 +1317,20 @@ async def entrypoint(ctx):
     def _on_metrics(ev):
         m = getattr(ev, "metrics", None)
         kind = getattr(m, "type", "")
+        # 打点带 call_id 前缀:多路/归档日志可按通话定位(R5);llm 行保留
+        # LLM_TTFT_MS 子串(llm_cache_report 等脚本按它抓取)。
+        tag = f"[{call_id}] "
         try:
             if kind == "llm_metrics":
                 _turn_metrics["llm_ttft_ms"] = int(m.ttft * 1000)
                 # 行格式统一在 _format_llm_metrics（含 cached=prompt_cached/prompt,
                 # KV-cache 命中可视），单测直接喂鸭型 metrics 断言。
-                print(_format_llm_metrics(m), flush=True)
+                print(f"{tag}{_format_llm_metrics(m)}", flush=True)
             elif kind == "tts_metrics":
-                print(f"AGENT_METRICS tts ttfb={m.ttfb * 1000:.0f}ms audio={m.audio_duration:.2f}s", flush=True)
+                print(f"{tag}AGENT_METRICS tts ttfb={m.ttfb * 1000:.0f}ms audio={m.audio_duration:.2f}s", flush=True)
             elif kind == "eou_metrics":
                 print(
-                    f"AGENT_METRICS eou delay={m.end_of_utterance_delay * 1000:.0f}ms "
+                    f"{tag}AGENT_METRICS eou delay={m.end_of_utterance_delay * 1000:.0f}ms "
                     f"transcription={m.transcription_delay * 1000:.0f}ms",
                     flush=True,
                 )

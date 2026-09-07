@@ -14,10 +14,17 @@ async function toError(res: Response): Promise<Error> {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${CONTROL_PLANE_URL}${path}`, {
-    ...init,
-    headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
+  // correlation 透传:前端生成 request_id,audit 行可与前端动作对账;
+  // call_id 由调用方在 headers 显式带(init.headers 里已有则不覆盖)。
+  const extra = new Headers(init?.headers);
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "X-Request-ID": crypto.randomUUID(),
+  };
+  extra.forEach((v, k) => {
+    headers[k] = v;
   });
+  const res = await fetch(`${CONTROL_PLANE_URL}${path}`, { ...init, headers });
   if (!res.ok) throw await toError(res);
   return res.json() as Promise<T>;
 }

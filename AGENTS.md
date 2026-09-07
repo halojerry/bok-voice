@@ -61,6 +61,8 @@ cd desktop && npx tauri build --bundles app   # macOS bundle
 - 改完 Python 跑 `python -m compileall -q apps packages services tools scripts`；web 改动跑 `cd apps/web && npx tsc --noEmit && npm run build`。
 - **术语门禁**：`tests/test_cantonese_terminology.py` 是全仓测试的一部分（新增 `yue` 字面量即失败）。
 - E2E needs the running stack and local models. **Never fake-green**: A-line E2E must use the real `/api/token` (`E2E_SELF_TOKEN=1` is debug-only).
+- **并发/边界回归资产（2026-09-07 QA）**：`scripts/e2e_barge_in.py`（打断：AI 播报中插话→断言停声+恢复不哑火）、`scripts/e2e_edge_cases.py`（静音/超短音频不毒化链路）、`scripts/load_cp_concurrency.py`（CP 独立 :8001+临时 DB 并发压测，含 turns 并发 30/30 回归——turn_id 竞态丢数据防复发）、`scripts/load_audio_concurrency.py`（N 路真实通话并发，`LOAD_ROADS/TURNS` 可调；单机上限参照 prompt-cache 4-6 路、TTS sidecar 全局锁串行）。改动 turns/audit/并发相关代码后必跑前三个。
+- **CP 可选鉴权**：`BOK_CP_TOKEN` 设置后除 `/health` 外全部端点要求 `Authorization: Bearer <token>`（agent/web 需同步携带）；未设=全放行（本机单用户形态）。暴露到局域网/云前必须设置。
 - Merge gate: pytest, `npm test`, `cargo test`, and `scripts/verify_bundle.sh` (`--staging`, `--app`, `--doctor`, one mode per run) all green; `doctor --packaged` must report `token endpoint: ok (real JWT)`.
 
 ## Commit & Pull Request Guidelines
