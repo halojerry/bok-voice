@@ -792,6 +792,15 @@ class ContextState:
             "这类拖延话术，也不要在流程中途自作主张承诺回头再答复；"
             "③ 客户的问题超出当前业务，就用引导话术收住（如「这个问题我帮您转给专门跟进的同事，他会马上联系您」），绝不冷场、绝不空手。"
         )
+        # 情绪标签试点（专项 C4,EMOTION_TAG_PILOT=1 选入;EMOTION_TAG_PROMPT=0
+        # 可单关 prompt 只留 TTS 剥除）:4B 每轮开头输出一个白名单情绪标签,
+        # 先只验「出标签稳定性」,TTS 侧剥除,数据够格再接 voice_setting。
+        if os.environ.get("EMOTION_TAG_PROMPT", os.environ.get("EMOTION_TAG_PILOT", "0")) == "1":
+            parts.append(
+                "【情绪标签试点】每次回复的最开头，先输出一个方括号情绪标签再说话。"
+                "只能从这些里选一个：[关切] [抱歉] [耐心] [开心] [严肃]。"
+                "示例：[关切]您别着急，我马上帮您查。标签只输出一次，不要念出来，不要用别的格式。"
+            )
         if self._flow_overview:
             parts.append("【话术流程总览(别照读,按进度推进)】\n" + self._flow_overview)
         # 对象档案:静态、整场不变,放总览之后(先懂流程再看客户是谁)。有界
