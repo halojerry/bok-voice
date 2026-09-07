@@ -87,6 +87,8 @@ class TurnEvent:
     emotion: str = ""
     provider: str = ""
     latency_ms: int = 0
+    language: str = ""
+    created_at: str = ""
 
 
 @dataclass

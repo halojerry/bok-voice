@@ -792,6 +792,15 @@ class ContextState:
             "这类拖延话术，也不要在流程中途自作主张承诺回头再答复；"
             "③ 客户的问题超出当前业务，就用引导话术收住（如「这个问题我帮您转给专门跟进的同事，他会马上联系您」），绝不冷场、绝不空手。"
         )
+        # 情绪标签试点（专项 C4,EMOTION_TAG_PILOT=1 选入;EMOTION_TAG_PROMPT=0
+        # 可单关 prompt 只留 TTS 剥除）:4B 每轮开头输出一个白名单情绪标签,
+        # 先只验「出标签稳定性」,TTS 侧剥除,数据够格再接 voice_setting。
+        if os.environ.get("EMOTION_TAG_PROMPT", os.environ.get("EMOTION_TAG_PILOT", "0")) == "1":
+            parts.append(
+                "【情绪标签试点】每次回复的最开头，先输出一个方括号情绪标签再说话。"
+                "只能从这些里选一个：[关切] [抱歉] [耐心] [开心] [严肃]。"
+                "示例：[关切]您别着急，我马上帮您查。标签只输出一次，不要念出来，不要用别的格式。"
+            )
         if self._flow_overview:
             parts.append("【话术流程总览(别照读,按进度推进)】\n" + self._flow_overview)
         # 对象档案:静态、整场不变,放总览之后(先懂流程再看客户是谁)。有界
@@ -829,8 +838,11 @@ class ContextState:
             # 重复锚:模型看得见自己上一句,治「原句/近原句复述」(2026-09-06
             # 行为取证:同一确认句一字不差讲两遍)。冻结进当时 user 的尾部,
             # 语义=「你讲呢句嗰阵嘅上一句」,自洽。
+            # 2026-09-07 QA 10 轮实测补充:连续同类推进(如 T06/T07 连答「保险
+            # 自动生效+专员联络」)虽非原句但近逐字雷同——补「同类内容换措辞」。
             parts.append(
                 "【你上一句】已讲过的内容绝不原句或近原句再讲一次；"
+                "连续回答同类问题时必须换用不同的说法和角度，不得只改动个别字词；"
                 "客户没有新异议就不要重复确认，停下来等他说。\n「" + self._last_reply + "」"
             )
         if self.rag_enabled and self._snippets:
@@ -1537,6 +1549,12 @@ class MiniMaxTTS(tts.TTS):
         raw = os.environ.get("MINIMAX_EMOTION", "").strip().lower()
         if not raw:
             return None
+        # 旧部署残留防呆:语义翻面前 "1"=开映射、"0"=关(→calm 旧版实义);
+        # 新代码里直接直透会成非法枚举(4xx)。归一:1→map、0/off→自动。
+        if raw == "1":
+            raw = "map"
+        elif raw in ("0", "off", "false"):
+            return None
         if raw == "map":
             if self._emotion_state is not None:
                 try:
@@ -1807,6 +1825,46 @@ def _minimax_pool_schedule(endpoint: str, key: str) -> None:
     _MINIMAX_POOL_TASK = loop.create_task(_minimax_pool_replenish(endpoint, key))
 
 
+def _trim_lead_silence(
+    pcm: bytes,
+    sample_rate: int,
+    *,
+    max_ms: int = 200,
+    fade_ms: int = 15,
+    rms_gate: int = 120,
+) -> tuple[bytes, int]:
+    """剪掉 PCM(s16le mono) 头部静音；剪过才对新的起始做 fade_ms 线性淡入。
+
+    MiniMax 首包偶带前导静音，剪掉=可闻出声更早；剪口做淡入防咔哒声
+    （RealtimeTTS base_engine 的 trim_silence_start/apply_fade_in 同款，2026-09-07
+    借鉴）。max_ms 上限防误剪气声起句（RMS 低但係真语音）；一次调用最多剪
+    max_ms，残余静音留给下次首帧检查继续剪。零静音时原样返回（字节不变，
+    零害）。返回 (处理后 pcm, 剪掉的毫秒)。
+    """
+    frame = max(1, sample_rate // 50) * 2  # 20ms 字节数(s16le mono)
+    buf = pcm
+    trimmed_ms = 0
+    while len(buf) >= frame and trimmed_ms < max_ms:
+        n = frame // 2
+        acc = 0
+        for i in range(n):
+            v = int.from_bytes(buf[i * 2 : i * 2 + 2], "little", signed=True)
+            acc += v * v
+        if (acc / n) ** 0.5 >= rms_gate:
+            break
+        buf = buf[frame:]
+        trimmed_ms += 20
+    if not trimmed_ms:
+        return pcm, 0
+    nf = max(1, sample_rate * fade_ms // 1000)
+    body = bytearray(buf)
+    for i in range(min(nf, len(body) // 2)):
+        v = int.from_bytes(body[i * 2 : i * 2 + 2], "little", signed=True)
+        v = int(v * (i + 1) / nf)
+        body[i * 2 : i * 2 + 2] = max(-32768, min(32767, v)).to_bytes(2, "little", signed=True)
+    return bytes(body), trimmed_ms
+
+
 class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
     """MiniMax 增量流式：一条 WS 连接，LLM 文本增量到达即 task_continue。
 
@@ -1981,6 +2039,17 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                             init_done = True
                         buf.extend(chunk)
                         if not first_pushed and len(buf) >= frame_bytes // 5:
+                            # 首包前导静音修剪(RealtimeTTS trim_silence_start 同款):
+                            # MiniMax 首包偶带前导静音,剪掉=可闻出声更早;剪口
+                            # fade-in 防咔哒。全静音(剪空)→ 唔推唔置位,等下一块
+                            # 再检查;每次调用最多剪 max_ms,残余静音逐次收。
+                            trimmed, trim_ms = _trim_lead_silence(bytes(buf), sample_rate)
+                            buf.clear()
+                            buf.extend(trimmed)
+                            if trim_ms:
+                                print(f"MINIMAX_TTS_LEAD_SILENCE_TRIM ms={trim_ms}", flush=True)
+                            if not buf:
+                                continue
                             # P0 首帧早推:不足 200ms 先推 ~40ms,早出声(照 Qwen3-TTS 同款)。
                             # P0 秒表:首个音频块推送时刻(距 task_start)。
                             t_first = time.monotonic()
@@ -2724,26 +2793,35 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                 # 轮级汇总:服务端切句数/打断/首包(首声=距首条 task_continue)。
                 # 验收读数:典型 2-3 短句回复 sentences 应 2-4;first_audio_ms 稳定
                 # 在数百 ms 且方差小于 classic overlap 时代。
-                if state["t_last_audio"] > 0.0 and state["t_first_continue"] > 0.0:
-                    print(
-                        f"MINIMAX_BIDI_PERF sentences={state['sentences']} "
-                        f"canceled={int(self._canceled_evt.is_set())} "
-                        f"first_audio_ms="
-                        f"{(state['t_last_audio'] - state['t_first_continue']) * 1000:.0f}",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        f"MINIMAX_BIDI_PERF sentences=0 "
-                        f"canceled={int(self._canceled_evt.is_set())} (no audio this turn)",
-                        flush=True,
-                    )
+                def _print_perf_summary() -> None:
+                    if state["t_last_audio"] > 0.0 and state["t_first_continue"] > 0.0:
+                        print(
+                            f"MINIMAX_BIDI_PERF sentences={state['sentences']} "
+                            f"canceled={int(self._canceled_evt.is_set())} "
+                            f"first_audio_ms="
+                            f"{(state['t_last_audio'] - state['t_first_continue']) * 1000:.0f}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"MINIMAX_BIDI_PERF sentences=0 "
+                            f"canceled={int(self._canceled_evt.is_set())} (no audio this turn)",
+                            flush=True,
+                        )
+
+                _print_perf_summary()
             except asyncio.CancelledError:
                 # 打断(barge-in):通知服务端丢弃缓冲/停合成,连接保留给下一轮。
                 try:
                     await self._cancel_on_server(ws)
                 except Exception:  # noqa: BLE001 - 收尾尽力而为
                     pass
+                # 打断轮也打 PERF(此前 CancelledError 跳过汇总,打断观测只能靠音频断言)。
+                print(
+                    f"MINIMAX_BIDI_PERF sentences={state['sentences']} "
+                    f"canceled={int(self._canceled_evt.is_set())} (interrupted)",
+                    flush=True,
+                )
                 raise
             except Exception as exc:
                 print("MINIMAX_TTS_BIDI_ERR", repr(exc), flush=True)
@@ -3631,6 +3709,24 @@ def _strip_punct_space(s: str) -> str:
     )
 
 
+# 纯应承字表：短尾逐字都落喺呢个集 → 判纯语气（唔补发）；有任何集外字 → 真内容。
+_PURE_ACK_TAIL_CHARS = frozenset("好係系是嗯哦喔啊得呀对啱啦喎喽咯嘛哈唉哎欸噢唔咩呀啦")
+
+
+def _tail_carries_content(s: str) -> bool:
+    """停嘴 <6 字短尾是否带真内容（纯函数，单测用）。
+
+    True=数字/字母 run（补报的「四五七。」、英文词）或任何纯应承字表外的实词
+    （「我唔知。」的「我」「知」）→ 短尾豁免照发成轮；False=逐字纯应承
+    （「係。」「嗯嗯。」）→ 照旧丢弃（打断自噬保护）。"""
+    t = _strip_punct_space(s)
+    if not t:
+        return False
+    if re.search(r"[0-9A-Za-z]{2,}", t):
+        return True
+    return any(ch not in _PURE_ACK_TAIL_CHARS for ch in t)
+
+
 def sentence_commit_enabled() -> bool:
     """句级提交总门:QWEN3_ASR_SENTENCE_COMMIT(默认 1)且框架轮次判定=stt。
 
@@ -3831,9 +3927,15 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                         )
                         if pause_commit is not None:
                             sentence, end_idx = pause_commit
-                            self._emit_sentence_commit(
-                                sentence, end_idx, self._last_lang, time.monotonic(), source="vad-pause"
-                            )
+                            # 标点扫描分支的门槛是 6（说话中按句提交用）——vad-pause
+                            # 语境必须再套 10 字碎片门：带句号的 6-9 字碎片会从 punct
+                            # 分支漏出，在用户话音未落时提前成轮，回复立刻被自家尾巴
+                            # 的音频活动掐死（multi_turn E2E 2026-09-07 实证：3 轮全
+                            # 被吃掉只剩心跳）。唔够格就留给停嘴 finish 整句兜底。
+                            if len(sentence) >= _pause_commit_min_chars():
+                                self._emit_sentence_commit(
+                                    sentence, end_idx, self._last_lang, time.monotonic(), source="vad-pause"
+                                )
                     self._event_ch.send_nowait(
                         stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH, speech_end_time=speech_end_time)
                     )
@@ -3844,11 +3946,14 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                     committed_before = self._committed_text
                     payload = self._uncommitted(text) if (text and committed_before) else text
                     # 短尾唔补发第二条 FINAL（打断自噬修复，2026-09-05 粤语实测）：
-                    # pause-commit 刚提交半句、回复生成中，紧跟的 <6 字短尾（「係。」）
-                    # 若再发一条 FINAL → 新用户轮把未出声的回复 interrupt 掉 → 每问
-                    # 无答、8s 后心跳顶替。短尾信息量低，丢弃（停嘴整句兜底仍在）；
-                    # ≥6 字尾句可能係真第二句，照发。
-                    if committed_before and payload and len(payload) < _ASR_SENTENCE_MIN_CHARS:
+                    # pause-commit 刚提交半句、回复生成中，紧跟的 <6 字纯语气短尾
+                    # （「係。」「嗯。」）若再发一条 FINAL → 新用户轮把未出声的
+                    # 回复 interrupt 掉 → 每问无答、8s 后心跳顶替——纯语气词照丢
+                    # （信息量低）；**带内容的短尾豁免**（2026-09-07）：数字/字母
+                    # 串（「四五七。」补报单号）或任何实词（「我唔知。」）照发成轮
+                    # ——回复被新轮掐掉但新轮带着真内容，AI 直接回应它，好过吞掉
+                    # 号码/答复（「说两句第二句被吞→AI 不回话」的根因）。
+                    if committed_before and payload and len(payload) < _ASR_SENTENCE_MIN_CHARS and not _tail_carries_content(payload):
                         payload = ""
                     started = False
                     self._finishing = False

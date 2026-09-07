@@ -174,7 +174,15 @@ export default function CallsPage() {
                         {modeLabel(String(c.mode ?? "simulation"))} · {langLabel(String(c.language ?? ""))} ·{" "}
                         {String(c.created_at ?? "").slice(0, 19).replace("T", " ")}
                       </p>
-                      <p className="mt-1 truncate text-xs text-[var(--muted)]">{id}</p>
+                      <p className="mt-1 truncate text-xs text-[var(--muted)]">
+                        {id}
+                        {Number(c.turn_count ?? 0) > 0 && (
+                          <span className="ml-2">
+                            {Number(c.turn_count)} 轮 · 均延迟 {Number(c.avg_latency_ms) || "—"}
+                            {Number(c.avg_latency_ms) ? "ms" : ""}
+                          </span>
+                        )}
+                      </p>
                     </div>
                     <div className="flex shrink-0 items-center gap-3">
                       <span className="inline-flex items-center gap-1.5 text-xs text-[var(--muted)]">

@@ -95,6 +95,41 @@ def _clean_transcript(text: str) -> str:
     return _EXPR_SYNC_RE.sub("", text).strip()
 
 
+_EMOTION_TAG_PILOT_RE = re.compile(r"^\s*\[(关切|抱歉|耐心|开心|严肃)\]")
+_EMOTION_TAG_STATS = {"with_tag": 0, "without_tag": 0}
+
+
+async def _strip_emotion_tag_pilot(text):
+    """情绪标签试点（专项 C4）:流→流 transform,剥掉回复开头的白名单情绪标签
+    （跨 chunk 缓冲,防标签被流切开）,并打 EMOTION_TAG 稳定性日志——只统计,
+    不改变其余行为。TextTransforms 契约=AsyncIterable[str]→AsyncIterable[str]
+    （text→text 的「函数」会把流对象当文本,整条 TTS 静音——2026-09-07 实证）。"""
+    carry = ""
+    decided = False
+    async for chunk in text:
+        buf = carry + str(chunk)
+        carry = ""
+        if not decided:
+            m = _EMOTION_TAG_PILOT_RE.match(buf)
+            if m:
+                decided = True
+                _EMOTION_TAG_STATS["with_tag"] += 1
+                print(f"EMOTION_TAG {m.group(1)}", flush=True)
+                buf = buf[m.end() :]
+            elif "[" in buf and len(buf) < 8:
+                carry = buf  # 可能係跨 chunk 嘅半個標籤,繼續攢
+                continue
+            else:
+                decided = True
+                if buf.strip():
+                    _EMOTION_TAG_STATS["without_tag"] += 1
+                    print("EMOTION_TAG none", flush=True)
+        if buf:
+            yield buf
+    if carry:
+        yield carry
+
+
 async def _strip_expr_markup(text):
     carry = ""
     async for chunk in text:
@@ -306,6 +341,37 @@ def _wa_number_line(lang: str, num: str) -> str:
     if lang == "en":
         return "Sorry, I may have missed part of that — please go ahead with your number."
     return "不好意思，可能刚才没听完整——麻烦您继续说一下您的号码。"
+
+
+_ECHO_SIM_RATIO = 0.9
+_ECHO_MIN_CHARS = 6
+
+
+def _is_echo_self_heard(user_text: str, last_reply: str, agent_speaking: bool) -> bool:
+    """回声自听判定（纯函数，单测用）。
+
+    外放+浏览器 AEC 失效（输出设备存档失效等）时，AI 会把自己的回复听成
+    用户插话——相似度极高的「轮」立刻打断自己、再复读一遍（自问自答）。
+    三个条件缺一不可：AI 正在讲（speaking；讲完后的复述/引用係客户正常行为）、
+    归一化（去标点空白）后两边都 ≥ _ECHO_MIN_CHARS 字（短应承「係」永唔拦）、
+    相似度 ≥ _ECHO_SIM_RATIO。归一化助手懒 import（与 livekit_plugins 的
+    重解修正/续句判定同一把尺，agent→providers 依赖方向唔成环）。
+    """
+    if not agent_speaking:
+        return False
+    from .providers.livekit_plugins import _strip_punct_space
+
+    norm_u = _strip_punct_space(user_text or "")
+    norm_r = _strip_punct_space(last_reply or "")
+    if len(norm_u) < _ECHO_MIN_CHARS or len(norm_r) < _ECHO_MIN_CHARS:
+        return False
+    import difflib
+
+    return difflib.SequenceMatcher(a=norm_r, b=norm_u).ratio() >= _ECHO_SIM_RATIO
+
+
+def _echo_guard_enabled() -> bool:
+    return os.environ.get("QWEN3_ECHO_GUARD", "1") == "1"
 
 
 def _farewell_line(name: str, lang: str) -> str:
@@ -797,7 +863,7 @@ async def entrypoint(ctx):
         _job_meta = {}
     call_id = str(_job_meta.get("call_id") or "").strip() or room_name
     cp_base = os.environ.get("CONTROL_PLANE_URL") or "http://127.0.0.1:8000"
-    cp = ControlPlaneClient(cp_base)
+    cp = ControlPlaneClient(cp_base, call_id=call_id)
     import time as _t
 
     _t0 = _t.monotonic()
@@ -1254,7 +1320,12 @@ async def entrypoint(ctx):
         turn_handling=turn_handling,
         # 默认 ["filter_markdown","filter_emoji"] 会被整体替换，故带上内置两项；
         # 追加的自定义 transform 把 <expr/> 从进 TTS 的文本里剥掉（转录路径保留，框架发布 mood）。
-        tts_text_transforms=["filter_markdown", "filter_emoji", _strip_expr_markup],
+        tts_text_transforms=[
+            "filter_markdown",
+            "filter_emoji",
+            *([_strip_emotion_tag_pilot] if os.environ.get("EMOTION_TAG_PILOT", "0") == "1" else []),
+            _strip_expr_markup,
+        ],
     )
     # 会话首轮真实前缀预热（LLM_PREFIX_PREWARM，默认 1）——触发点在开场白之后
     # （见下方 greeting 块），这里只定義任务体。
@@ -1313,7 +1384,12 @@ async def entrypoint(ctx):
             # 与音频同守则:模型若输出发音/拼音教学,转录也落「请再报单号」罐頭,
             # 唔好畀课程留喺通话记录(下次摘要又会引用返)。
             text = lecture_guard(text, language_state.lang if language_state.lang in ("zh", "cantonese") else None)
-        asyncio.create_task(cp.add_turn(call_id, role, _clean_transcript(text)))
+        # 审计闭环(2026-09-07):每轮带上最近一次官方 metrics 的 LLM TTFT 作
+        # latency_ms + 通话语言——之前 CP 侧丢弃,审计面无延迟档案可查。
+        latency = int(_turn_metrics.get("llm_ttft_ms") or 0) if role == "assistant" else 0
+        asyncio.create_task(
+            cp.add_turn(call_id, role, _clean_transcript(text), latency_ms=latency, language=language_state.lang)
+        )
 
     async def _async_update_context(role, text):
         # 渐进披露：P1 起检索默认全关（对象知识走【对象档案】静态前缀，话术对象
@@ -1381,19 +1457,25 @@ async def entrypoint(ctx):
     # ② LLMMetrics emit 在【创建流的对象】上(llm/llm.py:432),A 线 LLM 有两层包装
     #    (ContextAwareLLM→ExprAwareLLM→MlxLlmLLM),包装层已补 _bind_metrics_forward
     #    转发,否则 llm 行收不到(tts/stt 无包装,本来就通)。
+    _turn_metrics: dict = {}
+
     def _on_metrics(ev):
         m = getattr(ev, "metrics", None)
         kind = getattr(m, "type", "")
+        # 打点带 call_id 前缀:多路/归档日志可按通话定位(R5);llm 行保留
+        # LLM_TTFT_MS 子串(llm_cache_report 等脚本按它抓取)。
+        tag = f"[{call_id}] "
         try:
             if kind == "llm_metrics":
+                _turn_metrics["llm_ttft_ms"] = int(m.ttft * 1000)
                 # 行格式统一在 _format_llm_metrics（含 cached=prompt_cached/prompt,
                 # KV-cache 命中可视），单测直接喂鸭型 metrics 断言。
-                print(_format_llm_metrics(m), flush=True)
+                print(f"{tag}{_format_llm_metrics(m)}", flush=True)
             elif kind == "tts_metrics":
-                print(f"AGENT_METRICS tts ttfb={m.ttfb * 1000:.0f}ms audio={m.audio_duration:.2f}s", flush=True)
+                print(f"{tag}AGENT_METRICS tts ttfb={m.ttfb * 1000:.0f}ms audio={m.audio_duration:.2f}s", flush=True)
             elif kind == "eou_metrics":
                 print(
-                    f"AGENT_METRICS eou delay={m.end_of_utterance_delay * 1000:.0f}ms "
+                    f"{tag}AGENT_METRICS eou delay={m.end_of_utterance_delay * 1000:.0f}ms "
                     f"transcription={m.transcription_delay * 1000:.0f}ms",
                     flush=True,
                 )
@@ -1538,6 +1620,22 @@ async def entrypoint(ctx):
             # 客戶俾號碼(captured)照推下一步;應承加但未俾號碼(offered)→ 唔自動跳,等 AI 叫佢俾號碼。
             _wa_signal: tuple | None = None
             user_text = str(getattr(new_message, "text_content", None) or "")
+            # 回声自听守卫(借鉴 RVC 的 barge-in 回声门;他们的 isTTSPlaying 上报
+            # 在服务端係死代码,呢条做对):AEC 失效(外放+输出设备存档失效)时 AI
+            # 会把自己的回复听成用户插话,当场打断自己再复读一遍。AI speaking 中
+            # 且本轮文本与上一句高度相似 → 判自听,整轮丢弃(StopResponse 框架
+            # 官方姿势,同下方 paused 分支)。必须喺任何 except-pass try 之外——
+            # StopResponse 会被吞。讲完之后的复述/引用唔受影响(条件钉死 speaking)。
+            # 排喺 WA 累积之前:自听回声唔可以当号码碎片暂存。
+            if _echo_guard_enabled():
+                _agent_speaking = str(getattr(session, "agent_state", "") or "") == "speaking"
+                if _is_echo_self_heard(user_text, context_state.last_reply, _agent_speaking):
+                    print(
+                        f"QWEN3_ECHO_SELF_HEARD_DROP (call {room_name}) "
+                        f"reply={context_state.last_reply!r} heard={user_text!r}",
+                        flush=True,
+                    )
+                    raise StopResponse()
             # WA 号码碎片累积:号码主导句且累计 <8 位、或自报头半句(「我的WhatsApp係」)
             # → 暂存+StopResponse(唔回复、唔侦测、唔推进),等下一段拼埋一次过处理。
             # 超时 flush 见 _arm_wa_accum_flush。StopResponse 必须喺任何 except-pass
@@ -1621,12 +1719,15 @@ async def entrypoint(ctx):
             # 流程推进:读用户最新话,判定是否进入下一步,更新"当前步"约束注入。
             if flow_ctrl.has_steps:
                 try:
-                    from .flow import should_auto_advance
+                    from .flow import should_auto_advance, _digit_runs_in
 
                     verdict = flow_ctrl.rule_verdict(user_text)
                     # verdict 进尾部:规则判定结果此前只用于推进、从不进提示词,
                     # 客户提问/答非所问时模型冇「该怎么答」指引 → 复读当前步。
                     flow_ctrl.last_verdict = verdict
+                    # 数字串进尾部:数字係 ASR 最弱项,渲染「逐位复述核对」指引,
+                    # 唔复核错号就一直错落去。
+                    flow_ctrl.last_digits = _digit_runs_in(user_text)
                     if verdict == REFUSE:
                         # 客户明确拒绝/告别 → 收尾态:注入收尾话术(一句礼貌再见),
                         # 唔推进/唔 judge/唔按步走;讲完后 _schedule_call_end 主动结束通话

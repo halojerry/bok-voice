@@ -67,6 +67,18 @@ def build_engine() -> Engine | None:
                 )
                 _ensure_column(
                     conn,
+                    "turns",
+                    "language",
+                    "language VARCHAR(32) DEFAULT ''",
+                )
+                _ensure_column(
+                    conn,
+                    "object_profiles",
+                    "digest",
+                    "digest TEXT",
+                )
+                _ensure_column(
+                    conn,
                     "persona_profiles",
                     "tts_provider",
                     "tts_provider VARCHAR(32) DEFAULT ''",

@@ -1,0 +1,41 @@
+round	elapsed_s	tag	rss_kb	threads	fds
+5	96	uvicorn control_plane	192464	0	0
+5	96	agent_runtime.main	138976	0	0
+5	96	app:app	8839264	0	0
+5	96	mlx_lm	4877024	0	0
+5	96	agent_runtime.interpret	274448	0	0
+10	192	uvicorn control_plane	193600	0	0
+10	192	agent_runtime.main	139040	0	0
+10	192	app:app	8836704	0	0
+10	192	mlx_lm	4879088	0	0
+10	192	agent_runtime.interpret	274480	0	0
+15	288	uvicorn control_plane	194768	0	0
+15	288	agent_runtime.main	139104	0	0
+15	288	app:app	8837088	0	0
+15	288	mlx_lm	4880896	0	0
+15	288	agent_runtime.interpret	274512	0	0
+20	384	uvicorn control_plane	195616	0	0
+20	384	agent_runtime.main	139104	0	0
+20	384	app:app	8837088	0	0
+20	384	mlx_lm	4882640	0	0
+20	384	agent_runtime.interpret	274512	0	0
+25	480	uvicorn control_plane	195792	0	0
+25	480	agent_runtime.main	139136	0	0
+25	480	app:app	8837056	0	0
+25	480	mlx_lm	4884896	0	0
+25	480	agent_runtime.interpret	274544	0	0
+30	575	uvicorn control_plane	196256	0	0
+30	575	agent_runtime.main	139136	0	0
+30	575	app:app	8837104	0	0
+30	575	mlx_lm	4884576	0	0
+30	575	agent_runtime.interpret	274544	0	0
+35	671	uvicorn control_plane	425920	0	0
+35	671	agent_runtime.main	139136	0	0
+35	671	app:app	8837536	0	0
+35	671	mlx_lm	4884976	0	0
+35	671	agent_runtime.interpret	274576	0	0
+40	767	uvicorn control_plane	297616	0	0
+40	767	agent_runtime.main	139184	0	0
+40	767	app:app	8837584	0	0
+40	767	mlx_lm	4903296	0	0
+40	767	agent_runtime.interpret	274576	0	0

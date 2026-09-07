@@ -6,9 +6,12 @@ import httpx
 class ControlPlaneClient:
     """Thin HTTP client from the Agent worker to the Control Plane REST API."""
 
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, call_id: str = ""):
         self.base_url = base_url.rstrip("/")
-        self._client = httpx.AsyncClient(base_url=self.base_url, timeout=15)
+        # 会话级 correlation:全部请求带 X-Call-ID → CP 审计行的 call_id 列
+        # 自动填充(此前恒空,web 按 callId 过滤审计查不到)。
+        headers = {"X-Call-ID": call_id} if call_id else {}
+        self._client = httpx.AsyncClient(base_url=self.base_url, timeout=15, headers=headers)
 
     async def get_call(self, call_id: str) -> dict:
         r = await self._client.get(f"/api/calls/{call_id}")
@@ -53,6 +56,7 @@ class ControlPlaneClient:
         emotion: str = "",
         provider: str = "",
         latency_ms: int = 0,
+        language: str = "",
     ) -> None:
         await self._client.post(
             f"/api/calls/{call_id}/turns",
@@ -62,6 +66,7 @@ class ControlPlaneClient:
                 "emotion": emotion,
                 "provider": provider,
                 "latency_ms": latency_ms,
+                "language": language,
             },
         )
 

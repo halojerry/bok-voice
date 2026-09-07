@@ -99,7 +99,14 @@ async def run(client: httpx.AsyncClient) -> None:
         s for s in hits if s["account_id"] == ACCOUNT
     ]
     instructions = _instructions(persona=fetched_persona, object_card=fetched_obj, snippets=snippets)
-    assert_step("instructions contain knowledge", KEYWORD in instructions, KEYWORD)
+    # 2026-09-07：P1 起 RAG 默认关，知识经 ContextState 尾部进 prompt（CONTEXT_RAG=1
+    # 才注入），_instructions 不再渲染 snippets（参数保留但为死参）——断言改为
+    # 装配非空且含对象/人设身份；知识检索本身已由上面 step 1-2 断言。
+    assert_step(
+        "instructions assembled with persona/object identity",
+        bool(instructions) and "Nguyen" in instructions and "MT3000" in (fetched_obj.get("background") or ""),
+        instructions[:80],
+    )
     ctx = ChatContext()
     ctx.add_message(role="system", content=instructions)
     ctx.add_message(role="user", content=f"你们这款支持{KEYWORD}吗？")

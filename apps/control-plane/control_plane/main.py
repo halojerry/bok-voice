@@ -19,7 +19,7 @@ from bok_voice_core.policies import select_session_manifest
 from bok_voice_core.types import CallMode, CallStatus, Role, SessionManifest, TurnEvent
 
 from bok_voice_core.settlement import SettlementTrigger
-from bok_voice_core.embeddings import CharHashEmbedding
+from bok_voice_core.embeddings import CharHashEmbedding, HybridLexicalEmbedding
 from bok_voice_knowledge.knowledge import DefaultKnowledgeService
 from bok_voice_knowledge.markdown_source import LocalMarkdownSource
 from bok_voice_knowledge.vector_store import InMemoryVectorStore
@@ -55,6 +55,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.add_middleware(CorrelationMiddleware)
+
+
+@app.middleware("http")
+async def optional_bearer_auth(request: Request, call_next):
+    """可选 Bearer 鉴权（R2）：BOK_CP_TOKEN 未设=全放行（本机单用户形态零变化）。
+
+    设置后除 /health 外全部端点要求 `Authorization: Bearer <BOK_CP_TOKEN>`——
+    暴露到局域网/云之前必须设置；agent(worker env)与 web 需同步带同值。
+    """
+    expected = os.environ.get("BOK_CP_TOKEN", "").strip()
+    if expected and request.url.path != "/health":
+        if request.headers.get("authorization", "") != f"Bearer {expected}":
+            return Response(status_code=401, content=b'{"detail":"unauthorized"}',
+                             media_type="application/json")
+    return await call_next(request)
 
 control_log = get_logger("control-plane", component="control-plane", service="control-plane")
 
@@ -99,7 +114,7 @@ def _startup() -> None:
         session_factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
         vector = SqlVectorStore(session_factory(), embedder)
     else:
-        vector = InMemoryVectorStore()
+        vector = InMemoryVectorStore(HybridLexicalEmbedding(512))
     app.state.knowledge = DefaultKnowledgeService(
         markdown=LocalMarkdownSource(vault),
         vector=vector,
@@ -143,11 +158,17 @@ async def _rebuild_in_memory_knowledge(vector: InMemoryVectorStore, vault_root: 
             content = md.read_text(encoding="utf-8")
         except Exception:
             continue
+        # 与 import_document 共用同一分块函数（2026-09-07 对齐:治「重启后 chunk
+        # 粒度回退整文件」的双路径漂移）;id 加序号保确定性,账户隔离不变。
+        from bok_voice_knowledge.knowledge import _chunk_content
+
+        chunks = _chunk_content(content)
         await vector.upsert(
             # path 存完整 vault 相对路径（accounts/acc-001/knowledge/...），
             # 与 import_document 的 path、delete 里 markdown.forget(path) 一致——
             # 否则 delete 找不到 vault 文件，重启后知识从 vault 复活。
-            [{"id": f"md:{rel}", "text": content, "path": rel, "source": "vault"}],
+            [{"id": f"md:{rel}:{i}", "text": c, "path": rel, "source": "vault"}
+             for i, c in enumerate(chunks)],
             account_id,
         )
 
@@ -160,8 +181,12 @@ def _audit_dir():
     return base / "BokVoice" / "audit"
 
 
-def _audit(action: str, *, subject_type: str = "", subject_id: str = "", outcome: str = "ok", account_id: str = "", detail: dict | None = None) -> dict:
-    """Emit an audit event (JSONL + optional DB copy) from a request context."""
+def _audit(action: str, *, subject_type: str = "", subject_id: str = "", outcome: str = "ok", account_id: str = "", call_id: str = "", detail: dict | None = None) -> dict:
+    """Emit an audit event (JSONL + optional DB copy) from a request context.
+
+    call_id 显式传入优先(服务端已知时就别依赖调用方带头):correlation 头
+    只覆盖 agent/web 上报路径,E2E/脚本直调端点时不带头,故端点自己传。
+    """
     detail = detail or {}
     event = audit_store().emit(
         action=action,
@@ -169,6 +194,7 @@ def _audit(action: str, *, subject_type: str = "", subject_id: str = "", outcome
         subject_id=subject_id,
         outcome=outcome,
         account_id=account_id,
+        call_id=call_id,
         detail=detail,
     )
     return event.to_dict()
@@ -552,6 +578,8 @@ def token(req: TokenRequest) -> TokenResponse:
             _repo().update_call(req.call_id, status=CallStatus.ACTIVE.value)
         except Exception:
             pass
+    _audit("token.issue", subject_type="call", subject_id=req.call_id or "",
+           account_id=req.account_id, call_id=req.call_id or "", detail={"role": req.role})
     return TokenResponse(serverUrl=url, participantToken=participant_token)
 
 
@@ -581,7 +609,11 @@ def create_call(req: CreateCallRequest) -> dict:
         kind=req.kind,
         target_lang=req.target_lang,
     )
-    return _repo().create_call(manifest)
+    call = _repo().create_call(manifest)
+    _audit("call.create", subject_type="call", subject_id=call.get("id", ""),
+           account_id=req.account_id, call_id=call.get("id", ""),
+           detail={"mode": req.mode, "kind": req.kind, "language": req.language, "template_id": template_id})
+    return call
 
 
 def _effective_providers(settings: dict) -> dict:
@@ -596,7 +628,13 @@ def _effective_providers(settings: dict) -> dict:
 
 @app.get("/api/calls")
 def list_calls(account_id: str = "acc-001", status: str = "") -> list[dict]:
-    return _repo().list_calls(account_id, status)
+    calls = _repo().list_calls(account_id, status)
+    stats = _repo().turn_stats()
+    for c in calls:
+        st = stats.get(c.get("id") or "", {})
+        c["turn_count"] = st.get("turns", 0)
+        c["avg_latency_ms"] = st.get("avg_latency_ms", 0)
+    return calls
 
 
 @app.get("/api/calls/{call_id}")
@@ -636,6 +674,7 @@ async def hangup(call_id: str) -> dict:
     # 真正断开 LiveKit 房间：主管台/任意端挂断后 agent 与监听端都会被服务端踢出，
     # agent 侧 on_close 触发结算。房间不存在/服务不可用时不阻塞（DB 已置 ENDED）。
     await _disconnect_livekit_room(call_id)
+    _audit("call.hangup", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""), call_id=call_id)
     return {"call_id": call_id, "status": call["status"], "disconnected": True}
 
 
@@ -660,8 +699,31 @@ async def _disconnect_livekit_room(room_name: str) -> None:
 
 
 @app.post("/api/calls/{call_id}/turns")
-def add_turn(call_id: str, role: str, transcript: str, emotion: str = "") -> dict:
-    turn = TurnEvent(trace_id=call_id, call_id=call_id, turn_id=f"t{len(_repo().get_turns(call_id))}", role=role, transcript=transcript, emotion=emotion)
+def add_turn(
+    call_id: str,
+    role: str,
+    transcript: str,
+    emotion: str = "",
+    provider: str = "",
+    latency_ms: int = 0,
+    language: str = "",
+) -> dict:
+    # turn_id 用 uuid 而非 len(get_turns()) 序号：并发写时序号竞态产生重复
+    # turn_id → 主键冲突 → IntegrityError 幂等分支吞成 200（静默丢数据，QA
+    # 压测 30 并发丢 30-37% 实证）。uuid 根除竞态（#20 同期修 provider/latency
+    # 落库但保留了竞态序号，本合并补齐）；agent 上报的 provider/latency_ms
+    # 此前被端点签名忽略（turns 两列恒空），一并收参。
+    turn = TurnEvent(
+        trace_id=call_id,
+        call_id=call_id,
+        turn_id=uuid.uuid4().hex[:12],
+        role=role,
+        transcript=transcript,
+        emotion=emotion,
+        provider=provider,
+        latency_ms=latency_ms,
+        language=language,
+    )
     return _repo().create_turn(turn)
 
 
@@ -725,6 +787,34 @@ def get_settlement(call_id: str) -> dict:
 @app.get("/api/calls/{call_id}/turns")
 def get_turns(call_id: str) -> list[dict]:
     return [turn.__dict__ for turn in _repo().get_turns(call_id)]
+
+
+@app.get("/api/calls/{call_id}/metrics")
+def get_call_metrics(call_id: str) -> dict:
+    """每通通话延迟档案:p50/p95 latency_ms + 轮数/语言分布（审计闭环 T3）。"""
+    import statistics as _stats
+
+    turns = _repo().get_turns(call_id)
+    lat = sorted(t.latency_ms for t in turns if t.latency_ms)
+
+    def _pct(q: float) -> int:
+        # 最近秩百分位:lat 升序,ceil(q*n)-1
+        if not lat:
+            return 0
+        import math as _math
+
+        return lat[max(0, _math.ceil(q * len(lat)) - 1)]
+
+    langs: dict[str, int] = {}
+    for t in turns:
+        if t.language:
+            langs[t.language] = langs.get(t.language, 0) + 1
+    return {
+        "call_id": call_id,
+        "turns": len(turns),
+        "latency_ms": {"p50": _pct(0.5), "p95": _pct(0.95), "max": lat[-1] if lat else 0, "n": len(lat)},
+        "languages": langs,
+    }
 
 
 def _write_settlement_docs(call: dict, turns: list[dict], result: dict) -> None:
@@ -805,6 +895,52 @@ async def _write_distill_knowledge(call: dict, result: dict) -> dict | None:
         return None
 
 
+def _backfill_turns_from_report(call_id: str, report_raw: str) -> int:
+    """SessionReport.chat_history → turns 回填（幂等：仅当该通话零轮次时调用）。
+
+    chat_history 结构 = {"items": [{type: "message", role, content: [str...]}]}。
+    回填行 turn_id 用 backfill:{i} 防与正常 t{i} 序列冲突；失败只告警不阻结算。
+    返回回填行数。"""
+    import json as _json
+
+    try:
+        report = _json.loads(report_raw or "{}")
+        items = ((report.get("chat_history") or {}).get("items")) or []
+        rows = [
+            it for it in items
+            if it.get("type") == "message" and it.get("role") in ("user", "assistant")
+        ]
+        if not rows:
+            return 0
+        from bok_voice_core.types import TurnEvent
+
+        n = 0
+        for i, it in enumerate(rows):
+            content = it.get("content")
+            text = " ".join(content) if isinstance(content, list) else str(content or "")
+            text = text.strip()
+            if not text:
+                continue
+            _repo().create_turn(
+                TurnEvent(
+                    trace_id=call_id,
+                    call_id=call_id,
+                    turn_id=f"backfill:{i}",
+                    role=it["role"],
+                    transcript=text,
+                    provider="session_report",
+                )
+            )
+            n += 1
+        if n:
+            _audit("settle.turns_backfilled", subject_type="call", subject_id=call_id,
+                   detail={"count": n})
+        return n
+    except Exception as exc:  # pragma: no cover
+        print(f"[settle] backfill failed: {exc!r}", flush=True)
+        return 0
+
+
 @app.post("/api/calls/{call_id}/settle")
 async def settle(call_id: str) -> dict:
     existing = _repo().get_settlement(call_id)
@@ -814,6 +950,13 @@ async def settle(call_id: str) -> dict:
     if not call:
         raise HTTPException(404, "call not found")
     turns = _repo().get_turns(call_id)
+    if not turns:
+        # 回填（2026-09-07 审计闭环）：打断/强挂通话的轮次可能整批未落库
+        # （conversation_item_added 未及触发），但 SessionReport.chat_history
+        # 有权威快照——settle 时回填,保证「每通通话必有档案」。
+        backfilled = _backfill_turns_from_report(call_id, call.get("session_report") or "")
+        if backfilled:
+            turns = _repo().get_turns(call_id)
     from bok_voice_core.types import CallSession
 
     session = CallSession(
@@ -824,12 +967,67 @@ async def settle(call_id: str) -> dict:
         mode=CallMode(call.get("mode", "simulation")),
     )
     result = app.state.settlement.build_result(session, turns)
+    # usage_records 落一笔（2026-09-07 审计闭环:表此前无写入者）。数据取自
+    # session_report 的真实 llm_usage(有)或轮数估算(无),重复 settle 幂等跳过
+    # ——写失败只告警不阻结算。
+    try:
+        import json as _json
+        from bok_voice_business_db.models import UsageRecord
+
+        sr_raw = call.get("session_report") or ""
+        tokens = 0
+        try:
+            tokens = int((_json.loads(sr_raw) or {}).get("llm_usage", {}).get("total_tokens") or 0)
+        except Exception:
+            tokens = 0
+        if not tokens:
+            tokens = len(turns) * 300
+        if not _repo().get_usage_record(call_id):
+            _repo().session.add(
+                UsageRecord(
+                    id=f"usage:{call_id}",
+                    account_id=call["account_id"],
+                    call_id=call_id,
+                    provider="local",
+                    kind="call",
+                    units=len(turns),
+                    tokens=tokens,
+                    audio_seconds=0.0,
+                    latency_ms=0,
+                    cost_estimate=0.0,
+                    status="ok",
+                )
+            )
+            _repo().session.commit()
+    except Exception as exc:  # pragma: no cover
+        print(f"[settle] usage_record write skipped: {exc!r}", flush=True)
     # 总结/沉淀：用本机 LLM 生成总结正文 + 新话题 + 全局洞察（失败回退纯指标）。
+    # 可观测（2026-09-07）：失败重试 1 次;仍空→审计事件 settle.distill_empty,
+    # 唔再静默吞掉（蒸馏覆盖率从此可查）。
     try:
         from .summarize import Summarizer
 
         settings = _repo().get_settings()
         summ = Summarizer().build(turns, call, settings)
+        if not (summ.get("summary") or "").strip() and turns:
+            summ = Summarizer().build(turns, call, settings)
+        if not (summ.get("summary") or "").strip() and turns:
+            _audit("settle.distill_empty", subject_type="call", subject_id=call_id,
+                   detail={"turns": len(turns)})
+        # 对象级滚动摘要（专项 B2 v1:结构化拼接,LLM 增量润色为后续增强）
+        if (summ.get("summary") or "").strip() and call.get("object_id"):
+            try:
+                from datetime import datetime as _dt
+
+                obj = _repo().get_object(call["object_id"])
+                if obj is not None:
+                    prev = str(obj.get("digest") or "").strip()
+                    entry = f"- {_dt.now().strftime('%Y-%m-%d')}：{summ['summary'].strip()[:150]}"
+                    merged = (prev + "\n" + entry).strip()
+                    lines = merged.splitlines()
+                    _repo().update_object_digest(call["object_id"], "\n".join(lines[-10:]))
+            except Exception as exc:  # pragma: no cover
+                print(f"[settle] digest merge skipped: {exc!r}", flush=True)
         if summ.get("summary"):
             result["summary"] = summ["summary"]
         else:
@@ -916,6 +1114,7 @@ async def delete_knowledge(knowledge_id: str, account_id: str = "acc-001") -> di
     # id 形如 md:accounts/acc-001/knowledge/probe.md（含斜杠），放 path 参数会被
     # Starlette 路由层以 %2F 拒掉（404）——改走 query 参数最稳。
     removed = await app.state.knowledge.delete(account_id, [knowledge_id])
+    _audit("knowledge.delete", subject_type="knowledge", subject_id=knowledge_id, account_id=account_id, detail={"removed": removed})
     return {"deleted": removed, "knowledge_id": knowledge_id}
 
 
@@ -992,11 +1191,30 @@ def create_template(req: TemplateRequest) -> dict:
 
 @app.put("/api/templates/{template_id}")
 def update_template(template_id: str, req: UpdateTemplateRequest) -> dict:
-    tpl = _repo().update_template(template_id, req.model_dump())
-    if not tpl:
+    before = _repo().get_template(template_id)
+    if not before:
         raise HTTPException(404, "template not found")
-    _audit("template.update", subject_type="template", subject_id=template_id, account_id=tpl.get("account_id", ""), detail={"name": tpl.get("name", "")})
+    # 话术版本化（2026-09-07 专项 B3）:update 即快照旧版——「哪版话术转化更好」
+    # 从数据上可答;call_sessions.template_id 快照指向的版本内容不再随更新漂移。
+    revision = len(_repo().list_template_revisions(template_id)) + 1
+    import json as _revjson
+
+    _repo().append_template_revision(template_id, revision, _revjson.dumps(before, ensure_ascii=False))
+    tpl = _repo().update_template(template_id, req.model_dump())
+    _audit(
+        "template.update",
+        subject_type="template",
+        subject_id=template_id,
+        account_id=tpl.get("account_id", ""),
+        detail={"name": tpl.get("name", ""), "revision": revision,
+                "changed": sorted(k for k in req.model_dump() if req.model_dump().get(k) not in (None, "") and before.get(k) != req.model_dump().get(k))},
+    )
     return tpl
+
+
+@app.get("/api/templates/{template_id}/revisions")
+def template_revisions(template_id: str) -> list[dict]:
+    return _repo().list_template_revisions(template_id)
 
 
 @app.delete("/api/templates/{template_id}")
@@ -1123,6 +1341,62 @@ async def livekit_webhook(request: Request) -> dict:
     return {"handled": True, "redispatch": identity}
 
 
+@app.get("/api/reports/script-insights")
+def script_insights(account_id: str = "acc-001", limit: int = 10) -> dict:
+    """话术优化分析视图（知识库=全局分析数据层）:高频问题 TOP N + 通话/轮次统计。"""
+    from collections import Counter
+
+    freq: Counter = Counter()
+    for obj in _repo().list_objects(account_id):
+        for t in _repo().list_object_topics(str(obj.get("id") or "")):
+            topic = str((t or {}).get("topic") or "").strip()
+            if topic:
+                freq[topic] += 1
+    calls = _repo().list_calls(account_id, "")
+    stats = _repo().turn_stats()
+    by_status: Counter = Counter(str(c.get("status") or "") for c in calls)
+    total_turns = sum(st.get("turns", 0) for st in stats.values())
+    return {
+        "account_id": account_id,
+        "calls": len(calls),
+        "calls_by_status": dict(by_status),
+        "turns_total": total_turns,
+        "top_issues": [
+            {"topic": topic, "mentions": n}
+            for topic, n in freq.most_common(limit)
+        ],
+        "distill_docs": len(_repo().list_calls(account_id, "")),
+    }
+
+
+@app.get("/api/reports/distill-health")
+def distill_health(account_id: str = "acc-001", limit: int = 10) -> dict:
+    """蒸馏健康度（审计事件 settle.distill_empty 由 #23 铺设,本端点出报表口径）。"""
+    calls = _repo().list_calls(account_id, "")
+    settled = [c for c in calls if c.get("status") == "ended"]
+    empty_events = _repo().list_audit_events(
+        account_id=account_id, action="settle.distill_empty", limit=200
+    )
+    return {
+        "account_id": account_id,
+        "calls_total": len(calls),
+        "settled": len(settled),
+        "distill_empty_events": len(empty_events),
+        "recent_empty": [
+            {"call_id": e.get("call_id", ""), "ts": e.get("ts", "")}
+            for e in empty_events[:limit]
+        ],
+    }
+
+
+@app.get("/api/objects/{object_id}/digest")
+def get_object_digest(object_id: str) -> dict:
+    obj = _repo().get_object(object_id)
+    if not obj:
+        raise HTTPException(404, "object not found")
+    return {"object_id": object_id, "digest": obj.get("digest", "")}
+
+
 @app.get("/api/reports/usage")
 def reports_usage(account_id: str = "acc-001") -> dict:
     calls = _repo().list_calls(account_id, "")
@@ -1231,6 +1505,7 @@ def pause_agent(call_id: str) -> dict:
     call = _repo().update_call(call_id, status=CallStatus.PAUSED.value)
     if not call:
         raise HTTPException(404, "call not found")
+    _audit("supervisor.pause", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""), call_id=call_id)
     return {"call_id": call_id, "action": "pause-agent", "status": call["status"]}
 
 
@@ -1240,6 +1515,7 @@ def resume_agent(call_id: str) -> dict:
     call = _repo().update_call(call_id, escalated_to_human=False, status=CallStatus.ACTIVE.value)
     if not call:
         raise HTTPException(404, "call not found")
+    _audit("supervisor.resume", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""), call_id=call_id)
     return {"call_id": call_id, "action": "resume-agent", "status": call["status"]}
 
 
@@ -1248,6 +1524,7 @@ def takeover(call_id: str) -> dict:
     call = _repo().update_call(call_id, escalated_to_human=True, status=CallStatus.PAUSED.value)
     if not call:
         raise HTTPException(404, "call not found")
+    _audit("supervisor.takeover", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""), call_id=call_id)
     return {"call_id": call_id, "action": "takeover", "status": call["status"]}
 
 
@@ -1257,6 +1534,7 @@ async def transfer(call_id: str) -> dict:
     if not call:
         raise HTTPException(404, "call not found")
     await _disconnect_livekit_room(call_id)
+    _audit("supervisor.transfer", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""), call_id=call_id)
     return {"call_id": call_id, "action": "transfer", "status": call["status"], "disconnected": True}
 
 
@@ -1273,4 +1551,5 @@ async def supervisor_end(call_id: str, disposition: str = "declined") -> dict:
     if not call:
         raise HTTPException(404, "call not found")
     await _disconnect_livekit_room(call_id)
+    _audit("supervisor.end", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""), call_id=call_id, detail={"disposition": disposition})
     return {"call_id": call_id, "action": "end", "status": call["status"], "disconnected": True}

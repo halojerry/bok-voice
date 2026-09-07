@@ -635,8 +635,46 @@ def test_vad_pause_commits_stable_partial_at_stop(monkeypatch):
 
     事件序 START → FINAL(停嘴句) → EOS(停嘴) → finish 整段只补未提交尾巴。
     partial 尾部弱逗号剥掉（finish 高精度句是句号——剥了先 startswith 得准，
-    唔会触发 rfind 兜底返回整段=重复转写）。
+    唔会触发 rfind 兜底返回整段=重复转写）。字数门=vad-pause 专用下限 10
+    （_pause_commit_min_chars，比标点路径 6 高——碎片防饿死回复）。
     """
+    got, stream = _run_vad_stop(
+        monkeypatch,
+        last_partial="唔該你幫我查下我張單，",
+        prev_partial="唔該你幫我查下我張單，",
+        finish_text="唔該你幫我查下我張單。佢聽日到唔到㗎？",
+    )
+    assert got == [
+        ("START_OF_SPEECH", ""),
+        ("FINAL_TRANSCRIPT", "唔該你幫我查下我張單"),
+        ("END_OF_SPEECH", ""),
+        ("FINAL_TRANSCRIPT", "佢聽日到唔到㗎？"),
+    ], got
+    # （_committed_text 已随停嘴 _reset 清空——pause 提交的事实由 FINAL 事件文本钉死）
+
+
+def test_vad_pause_fragment_6to9_chars_held_not_committed(monkeypatch):
+    """碎片提交门：6-9 字微停顿碎片（7 字「我想查下我張單」）扣住唔提交——
+
+    提前当整轮会被下一碎片新轮掐掉在途回复（碎片提交饿死回复）。停嘴 finish
+    整句兜底照达，轮唔会丢。"""
+    got, stream = _run_vad_stop(
+        monkeypatch,
+        last_partial="我想查下我張單，",
+        prev_partial="我想查下我張單，",
+        finish_text="我想查下我張單。佢聽日到唔到㗎？",
+    )
+    assert got == [
+        ("START_OF_SPEECH", ""),
+        ("END_OF_SPEECH", ""),
+        ("FINAL_TRANSCRIPT", "我想查下我張單。佢聽日到唔到㗎？"),
+    ], got
+    assert stream._committed_text == ""
+
+
+def test_vad_pause_fragment_gate_env_fallback_six(monkeypatch):
+    """QWEN3_ASR_PAUSE_COMMIT_MIN_CHARS=6 → 回退旧门槛，7 字 pause 照提交。"""
+    monkeypatch.setenv("QWEN3_ASR_PAUSE_COMMIT_MIN_CHARS", "6")
     got, stream = _run_vad_stop(
         monkeypatch,
         last_partial="我想查下我張單，",
@@ -649,11 +687,13 @@ def test_vad_pause_commits_stable_partial_at_stop(monkeypatch):
         ("END_OF_SPEECH", ""),
         ("FINAL_TRANSCRIPT", "佢聽日到唔到㗎？"),
     ], got
-    # （_committed_text 已随停嘴 _reset 清空——pause 提交的事实由 FINAL 事件文本钉死）
 
 
 def test_vad_pause_digit_run_suppressed(monkeypatch):
     """停嘴 partial 带数字 run（单号）→ 唔提前提交，整段留给 finish 兜底。"""
+    # join-hold 关掉隔离验证:数字句而家会先被 join-hold 接手(等续段拼埋,
+    # 见 test_join_hold_*),呢度只测句级门对数字 run 嘅抑制本身。
+    monkeypatch.setenv("QWEN3_ASR_JOIN_HOLD_MS", "0")
     got, stream = _run_vad_stop(
         monkeypatch,
         last_partial="我張單號係7890123，",
@@ -717,42 +757,45 @@ def test_vad_pause_env_off_punct_only(monkeypatch):
 
 
 def test_pause_boundary_gates_unit(monkeypatch):
-    """_sentence_boundary(allow_eos=True) 逐门单测：稳定/改写/数字/短句/限速/标点优先。"""
+    """_sentence_boundary(allow_eos=True) 逐门单测：稳定/改写/数字/短句/碎片/限速/标点优先。"""
     _default_gates(monkeypatch)
 
     async def scenario():
         stream = _make_stream()
         try:
             # 稳定（prev 与当前同文，弱尾符差异剥平）→ 提交，坐标=text 末尾
-            s1 = stream._sentence_boundary("我想查下我張單，", "我想查下我張單", allow_eos=True)
+            s1 = stream._sentence_boundary("唔該你幫我查下我張單，", "唔該你幫我查下我張單", allow_eos=True)
             # prev 是严格前缀（最后一窗补齐句尾字）→ 一样过
-            s2 = stream._sentence_boundary("我想查下我張單，", "我想查下我", allow_eos=True)
+            s2 = stream._sentence_boundary("唔該你幫我查下我張單，", "唔該你幫我查下我", allow_eos=True)
             # prev 改写 → None
-            s3 = stream._sentence_boundary("我想查下我張單", "我想睇下我張單", allow_eos=True)
+            s3 = stream._sentence_boundary("唔該你幫我查下我張單", "唔該你幫我睇下我張單", allow_eos=True)
             # 数字 run → None
             s4 = stream._sentence_boundary("我張單號係7890123", "我張單號係7890123", allow_eos=True)
             # <6 字 → None
             s5 = stream._sentence_boundary("係我，", "係我，", allow_eos=True)
+            # 6-9 字碎片（7 字）→ None（vad-pause 专用字数下限 10，防碎片轮饿死回复）
+            s5b = stream._sentence_boundary("我想查下我張單，", "我想查下我張單，", allow_eos=True)
             # 首窗（prev 该区间空）→ 零跨窗证据 → None
-            s6 = stream._sentence_boundary("我想查下我張單", "", allow_eos=True)
+            s6 = stream._sentence_boundary("唔該你幫我查下我張單", "", allow_eos=True)
             # 限速窗内 → None
             stream._last_sentence_commit_at = time.monotonic()
-            s7 = stream._sentence_boundary("我想查下我張單", "我想查下我張單", allow_eos=True)
+            s7 = stream._sentence_boundary("唔該你幫我查下我張單", "唔該你幫我查下我張單", allow_eos=True)
             stream._last_sentence_commit_at = 0.0
             # 标点边界优先：稳定强标点句走 punct 分支（返回句子+句号后坐标）
             s8 = stream._sentence_boundary(
                 "唔該幫我查下張單。而家到咗", "唔該幫我查下張單。而家到咗", allow_eos=True
             )
-            return s1, s2, s3, s4, s5, s6, s7, s8
+            return s1, s2, s3, s4, s5, s5b, s6, s7, s8
         finally:
             await _close(stream)
 
-    s1, s2, s3, s4, s5, s6, s7, s8 = asyncio.run(scenario())
-    assert s1 == ("我想查下我張單", len("我想查下我張單，"))
-    assert s2 == ("我想查下我張單", len("我想查下我張單，"))
+    s1, s2, s3, s4, s5, s5b, s6, s7, s8 = asyncio.run(scenario())
+    assert s1 == ("唔該你幫我查下我張單", len("唔該你幫我查下我張單，"))
+    assert s2 == ("唔該你幫我查下我張單", len("唔該你幫我查下我張單，"))
     assert s3 is None
     assert s4 is None
     assert s5 is None
+    assert s5b is None
     assert s6 is None
     assert s7 is None
     assert s8 == ("唔該幫我查下張單。", len("唔該幫我查下張單。"))
@@ -784,19 +827,48 @@ def test_partial_dedupe_window_syncs_prev(monkeypatch):
 
 
 def test_vad_pause_short_tail_after_commit_not_reemitted(monkeypatch):
-    """打断自噬修复：pause-commit 后 <6 字短尾（「係。」）唔补发第二条 FINAL——
+    """打断自噬修复：pause-commit 后 <6 字纯语气短尾（「係。」）唔补发第二条 FINAL——
     否则新用户轮会把生成中未出声的回复 interrupt 掉（每问无答→心跳顶替）。"""
     got, stream = _run_vad_stop(
         monkeypatch,
-        last_partial="我想查下我張單，",
-        prev_partial="我想查下我張單，",
-        finish_text="我想查下我張單。係。",
+        last_partial="唔該你幫我查下我張單，",
+        prev_partial="唔該你幫我查下我張單，",
+        finish_text="唔該你幫我查下我張單。係。",
     )
     assert got == [
         ("START_OF_SPEECH", ""),
-        ("FINAL_TRANSCRIPT", "我想查下我張單"),
+        ("FINAL_TRANSCRIPT", "唔該你幫我查下我張單"),
         ("END_OF_SPEECH", ""),
     ], got
+
+
+def test_vad_pause_digit_short_tail_kept(monkeypatch):
+    """内容豁免（2026-09-07）：pause-commit 后停嘴补报的数字短尾（「四五七。」）
+    照发成轮——旧行为整段丢弃会吞号码；回复被新轮掐掉但新轮带真内容，AI 直接回应。"""
+    got, stream = _run_vad_stop(
+        monkeypatch,
+        last_partial="唔該你幫我查下我張單，",
+        prev_partial="唔該你幫我查下我張單，",
+        finish_text="唔該你幫我查下我張單。四五七。",
+    )
+    assert got == [
+        ("START_OF_SPEECH", ""),
+        ("FINAL_TRANSCRIPT", "唔該你幫我查下我張單"),
+        ("END_OF_SPEECH", ""),
+        ("FINAL_TRANSCRIPT", "四五七。"),
+    ], got
+
+
+def test_tail_carries_content_unit():
+    """_tail_carries_content 纯函数：数字/字母 run 与实词=True，纯语气=False。"""
+    assert lp._tail_carries_content("四五七。") is True
+    assert lp._tail_carries_content("我唔知。") is True
+    assert lp._tail_carries_content("ok sir") is True
+    assert lp._tail_carries_content("係。") is False
+    assert lp._tail_carries_content("嗯嗯。") is False
+    assert lp._tail_carries_content("好呀。") is False
+    assert lp._tail_carries_content("。") is False
+    assert lp._tail_carries_content("") is False
 
 
 def test_uncommitted_redecode_correction_dropped_and_continuation_kept():
@@ -1015,3 +1087,21 @@ def test_join_hold_cancelled_by_new_speech(monkeypatch):
         stream._event_ch.close()
 
     asyncio.run(scenario())
+
+
+def test_vad_pause_punct_path_fragment_also_gated(monkeypatch):
+    """碎片门必须覆盖标点分支：9 字带句号 partial（「好，我想了解一下。」）从
+    punct 扫描返回（≥6），vad-pause 调用点要再套 10 字门拦住——否则话音未落
+    提前成轮，回复被自家尾巴掐死（2026-09-07 multi_turn E2E 实证）。停嘴
+    finish 整句照达。"""
+    got, stream = _run_vad_stop(
+        monkeypatch,
+        last_partial="好，我想了解一下。",
+        prev_partial="好，我想了解一下。",
+        finish_text="好，我想了解一下。还有什么可以帮你？",
+    )
+    assert got == [
+        ("START_OF_SPEECH", ""),
+        ("END_OF_SPEECH", ""),
+        ("FINAL_TRANSCRIPT", "好，我想了解一下。还有什么可以帮你？"),
+    ], got
