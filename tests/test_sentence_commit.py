@@ -1089,6 +1089,35 @@ def test_join_hold_cancelled_by_new_speech(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_join_hold_timeout_flush_keeps_content_digit_tail(monkeypatch):
+    """hold 超时 flush 与正常停嘴同一套短尾规则:带内容短尾(数字尾「六四三二」)
+    豁免照发——吞号码尾=复活 #18 修过的「第二句被吞」(2026-09-07 审查)。"""
+    _join_gates(monkeypatch)
+    _FakeClient.finish_body = {"text": "我的WhatsApp是。六四三二", "language": "cantonese"}
+
+    async def scenario():
+        stream = _make_stream()
+        stream._metrics_task.cancel()
+        stream._committed_text = "我的WhatsApp是。"  # 模拟句级已提交前半句
+        stream._vad = _join_vad_events(stream, hold_then_continue=False)
+        stream._pending = bytearray(b"\x00\x00")
+        await asyncio.wait_for(stream._task, 3)
+        events = []
+        while True:
+            try:
+                e = stream._event_ch.recv_nowait()
+                events.append((e.type.name, e.alternatives[0].text if e.alternatives else ""))
+            except (ChanEmpty, ChanClosed):
+                break
+        stream._event_ch.close()
+        await asyncio.gather(stream._metrics_task, return_exceptions=True)
+        return events
+
+    events = asyncio.run(scenario())
+    finals = [t for (n, t) in events if n == "FINAL_TRANSCRIPT"]
+    assert finals == ["六四三二"], events
+
+
 def test_vad_pause_punct_path_fragment_also_gated(monkeypatch):
     """碎片门必须覆盖标点分支：9 字带句号 partial（「好，我想了解一下。」）从
     punct 扫描返回（≥6），vad-pause 调用点要再套 10 字门拦住——否则话音未落

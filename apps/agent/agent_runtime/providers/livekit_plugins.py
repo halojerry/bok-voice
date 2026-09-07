@@ -4002,7 +4002,9 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         text, lang = await self._finish_session()
         committed_before = self._committed_text
         payload = self._uncommitted(text) if (text and committed_before) else text
-        if committed_before and payload and len(payload) < _ASR_SENTENCE_MIN_CHARS:
+        # 与 _run 正常 EOS 分支同一套短尾规则:带内容短尾(数字/字母/实词)豁免照发
+        # ——「六四三二」补报号码好过吞掉(2026-09-07 审查:hold 路漏抄豁免)。
+        if committed_before and payload and len(payload) < _ASR_SENTENCE_MIN_CHARS and not _tail_carries_content(payload):
             payload = ""
         self._finishing = False
         self._reset()
