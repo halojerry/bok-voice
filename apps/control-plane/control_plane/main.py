@@ -19,7 +19,7 @@ from bok_voice_core.policies import select_session_manifest
 from bok_voice_core.types import CallMode, CallStatus, Role, SessionManifest, TurnEvent
 
 from bok_voice_core.settlement import SettlementTrigger
-from bok_voice_core.embeddings import CharHashEmbedding
+from bok_voice_core.embeddings import CharHashEmbedding, HybridLexicalEmbedding
 from bok_voice_knowledge.knowledge import DefaultKnowledgeService
 from bok_voice_knowledge.markdown_source import LocalMarkdownSource
 from bok_voice_knowledge.vector_store import InMemoryVectorStore
@@ -99,7 +99,7 @@ def _startup() -> None:
         session_factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
         vector = SqlVectorStore(session_factory(), embedder)
     else:
-        vector = InMemoryVectorStore()
+        vector = InMemoryVectorStore(HybridLexicalEmbedding(512))
     app.state.knowledge = DefaultKnowledgeService(
         markdown=LocalMarkdownSource(vault),
         vector=vector,
@@ -143,11 +143,17 @@ async def _rebuild_in_memory_knowledge(vector: InMemoryVectorStore, vault_root: 
             content = md.read_text(encoding="utf-8")
         except Exception:
             continue
+        # 与 import_document 共用同一分块函数（2026-09-07 对齐:治「重启后 chunk
+        # 粒度回退整文件」的双路径漂移）;id 加序号保确定性,账户隔离不变。
+        from bok_voice_knowledge.knowledge import _chunk_content
+
+        chunks = _chunk_content(content)
         await vector.upsert(
             # path 存完整 vault 相对路径（accounts/acc-001/knowledge/...），
             # 与 import_document 的 path、delete 里 markdown.forget(path) 一致——
             # 否则 delete 找不到 vault 文件，重启后知识从 vault 复活。
-            [{"id": f"md:{rel}", "text": content, "path": rel, "source": "vault"}],
+            [{"id": f"md:{rel}:{i}", "text": c, "path": rel, "source": "vault"}
+             for i, c in enumerate(chunks)],
             account_id,
         )
 
@@ -1269,6 +1275,34 @@ async def livekit_webhook(request: Request) -> dict:
 
     asyncio.create_task(_redispatch())
     return {"handled": True, "redispatch": identity}
+
+
+@app.get("/api/reports/script-insights")
+def script_insights(account_id: str = "acc-001", limit: int = 10) -> dict:
+    """话术优化分析视图（知识库=全局分析数据层）:高频问题 TOP N + 通话/轮次统计。"""
+    from collections import Counter
+
+    freq: Counter = Counter()
+    for obj in _repo().list_objects(account_id):
+        for t in _repo().list_object_topics(str(obj.get("id") or "")):
+            topic = str((t or {}).get("topic") or "").strip()
+            if topic:
+                freq[topic] += 1
+    calls = _repo().list_calls(account_id, "")
+    stats = _repo().turn_stats()
+    by_status: Counter = Counter(str(c.get("status") or "") for c in calls)
+    total_turns = sum(st.get("turns", 0) for st in stats.values())
+    return {
+        "account_id": account_id,
+        "calls": len(calls),
+        "calls_by_status": dict(by_status),
+        "turns_total": total_turns,
+        "top_issues": [
+            {"topic": topic, "mentions": n}
+            for topic, n in freq.most_common(limit)
+        ],
+        "distill_docs": len(_repo().list_calls(account_id, "")),
+    }
 
 
 @app.get("/api/reports/usage")
