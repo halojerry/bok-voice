@@ -358,8 +358,8 @@ def _valid_digit_runs(norm: str, *, min_len: int = 4, max_len: int = 13) -> list
 def _digit_runs_in(text: str) -> list[str]:
     """每轮客户话里的数字串(≥4 位,汉字/英文数字词已归一成 ASCII)——读回核对指引用。
 
-    唔同 _valid_digit_runs(WhatsApp 语义,6 位起),呢度只要 4 位就算「客戶報咗數字」:
-    单号尾号常係 4 位,转写出错也最伤。逐 run 归一(唔成段归一,免得两串数字被拼成一条)。"""
+    与 _valid_digit_runs 一样 4 位起(2026-09-06 起),分别只在于逐 run 归一
+    (唔成段归一,免得两串数字被拼成一条)。"""
     runs = re.findall(r"[0-9一二三四五六七八九零]{4,}", str(text or ""))
     out: list[str] = []
     for r in runs:

@@ -3785,14 +3785,15 @@ def _join_norm_digits(text: str) -> str:
 
 
 def _join_worthy(text: str) -> bool:
-    """续接可能句:归一后有 ≥2 位数字、或以系词收尾(係/系/是/is)——正正係被句级门
-    (_has_latin_or_digit_run)有意排除嗰批句;普通陈述句零加迟。"""
+    """续接可能句:归一后有 ≥2 位数字(汉字数字/英文数字词都算,号码/价格/日期常见)、
+    或以系词收尾(係/系/是/is,英文只认独立词)。呢类句每轮多等一个 hold 窗;
+    其余普通陈述句零加迟。"""
     t = (text or "").strip()
     if not t:
         return False
     if len(_join_norm_digits(t)) >= 2:
         return True
-    return bool(re.search(r"(?:係|系|是|is)\s*[。，,．.！!？?～~]*$", t, re.IGNORECASE))
+    return bool(re.search(r"(?:係|系|是|\bis\b)\s*[。，,．.！!？?～~]*$", t, re.IGNORECASE))
 
 
 def _has_latin_or_digit_run(text: str, min_len: int = 2) -> bool:
@@ -3901,7 +3902,7 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                     # 唔 finish、唔 reset:sidecar session 续命,下一段音频继续入同一
                     # 会话(partial 继续滚),真正停嘴嗰刻一条 FINAL 覆盖全段——下游
                     # flow/侦测/LLM/KV-cache 全部只见单一轮。超时冇续段 → _hold_flush
-                    # 走正常停嘴路径(该轮多等 HOLD_MS,只影响号码句)。0=回退同旧。
+                    # 走正常停嘴路径(该轮多等 HOLD_MS——含数字/系词句都算,唔止号码句)。0=回退同旧。
                     if self._join_hold_active:
                         # hold 中又嚟 EOS(冇 START 嘅边路)→ 当真停嘴,取消 flush 落埋正常路径。
                         self._cancel_join_hold()
@@ -3977,10 +3978,6 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         finally:
             # 流关闭时撤掉 hold flush,唔好留孤儿任务向已死 event_ch 发事件。
             self._cancel_join_hold()
-
-    def _join_worthy_now(self) -> bool:
-        text = (self._last_partial or "").strip()
-        return bool(text) and _join_worthy(text)
 
     def _cancel_join_hold(self) -> None:
         self._join_hold_active = False

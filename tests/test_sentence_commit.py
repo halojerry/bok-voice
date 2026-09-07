@@ -929,6 +929,8 @@ def test_join_worthy_gate():
     assert _join_worthy("我喺淘寶買嘢。") is False
     assert _join_worthy("好，唔该晒你。") is False
     assert _join_worthy("") is False
+    # 英文 is 要词边界:句尾 -is 词(this/analysis)唔係系词,唔好误扣 hold 窗
+    assert _join_worthy("Let me confirm this.") is False
 
 
 def test_join_norm_digits_cjk_fullwidth_en():
