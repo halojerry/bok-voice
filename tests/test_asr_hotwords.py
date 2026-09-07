@@ -68,3 +68,32 @@ def test_kill_switch(monkeypatch):
 def test_unknown_lang_falls_back_to_cantonese_table():
     ctx = asr_hotword_context("", None)
     assert "單號" in ctx
+
+
+def test_template_hotwords_merged_and_prioritised():
+    """模板 hotwords 字段(二期):话术专属词入列且排在静态表前(超限截断时优先保留)。"""
+    ctx = asr_hotword_context("cantonese", None, extra_hotwords="順豐速運, 生果日報")
+    assert "順豐速運" in ctx and "生果日報" in ctx
+    assert ctx.index("順豐速運") < ctx.index("單號"), ctx  # 模板词先于静态行业词
+
+
+def test_template_hotwords_mixed_separators_and_filters():
+    """中英逗号/顿号/分号/换行都收;与静态表去重;数字主导词丢弃(幻听号码风险)。"""
+    ctx = asr_hotword_context("cantonese", None, extra_hotwords="單號、淘寶；64325432\n丰巢")
+    assert ctx.count("單號") == 1, ctx  # 与静态表去重
+    assert "淘寶" in ctx and "丰巢" in ctx
+    assert "64325432" not in ctx
+
+
+def test_template_hotwords_cap_keeps_template_words_first(monkeypatch):
+    import agent_runtime.agent as ag
+
+    monkeypatch.setattr(ag, "_ASR_HOTWORD_MAX_CHARS", 30)
+    ctx = asr_hotword_context("cantonese", None, extra_hotwords="順豐速運, 極長嘅自訂詞語示例超出上限")
+    assert "順豐速運" in ctx  # 模板词最优先保留,静态表让位
+    assert len(ctx) <= 30
+
+
+def test_template_hotwords_kill_switch(monkeypatch):
+    monkeypatch.setenv("BOK_ASR_HOTWORDS", "0")
+    assert asr_hotword_context("cantonese", None, extra_hotwords="順豐速運") == ""

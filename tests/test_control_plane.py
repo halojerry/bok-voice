@@ -47,6 +47,29 @@ def test_idempotent_migration_adds_missing_columns(tmp_path, monkeypatch):
     assert "summary" in cols["settlements"]
 
 
+def test_migration_adds_template_hotwords_column(tmp_path, monkeypatch):
+    """存量库 conversation_templates 无 hotwords 列 → 启动补列(2026-09-08 模板热词二期)。"""
+    import sqlite3
+
+    db = tmp_path / "hotwords.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        "CREATE TABLE conversation_templates (id VARCHAR(64) PRIMARY KEY, account_id VARCHAR(64) DEFAULT '', name VARCHAR(255) DEFAULT '', opening TEXT DEFAULT '', core TEXT DEFAULT '', objection TEXT DEFAULT '', closing TEXT DEFAULT '', tone_override VARCHAR(255) DEFAULT '', language VARCHAR(16) DEFAULT 'zh', steps_json TEXT DEFAULT '');"
+    )
+    conn.close()
+
+    from control_plane.deps import build_engine
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db}")
+    build_engine()
+    build_engine()  # 幂等：二启不报错
+
+    c = sqlite3.connect(db)
+    cols = [r[1] for r in c.execute("PRAGMA table_info(conversation_templates)")]
+    c.close()
+    assert "hotwords" in cols, cols
+
+
 def test_data_migration_yue_to_cantonese(tmp_path, monkeypatch):
     """存量 language='yue' 行 + reference_audio/global_settings 的 yue 键 → cantonese（幂等）。
 
@@ -364,10 +387,13 @@ def test_conversation_template_crud_and_object_binding():
                 "objection": "价格方面我们可以给出阶梯报价。",
                 "closing": "感谢您的咨询，再见。",
                 "language": "zh",
+                "hotwords": "阶梯报价, 越南语",
             },
         ).json()
         tpl_id = tpl["id"]
+        assert tpl["hotwords"] == "阶梯报价, 越南语"
         assert client.get("/api/templates", params={"account_id": "acc-001"}).json()[0]["id"] == tpl_id
+        assert client.get(f"/api/templates/{tpl_id}").json()["hotwords"] == "阶梯报价, 越南语"
         assert client.put(f"/api/templates/{tpl_id}", json={"name": "采购异议V2"}).json()["name"] == "采购异议V2"
 
         obj = client.post(
