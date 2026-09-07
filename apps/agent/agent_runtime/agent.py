@@ -92,6 +92,41 @@ def _clean_transcript(text: str) -> str:
     return _EXPR_SYNC_RE.sub("", text).strip()
 
 
+_EMOTION_TAG_PILOT_RE = re.compile(r"^\s*\[(关切|抱歉|耐心|开心|严肃)\]")
+_EMOTION_TAG_STATS = {"with_tag": 0, "without_tag": 0}
+
+
+async def _strip_emotion_tag_pilot(text):
+    """情绪标签试点（专项 C4）:流→流 transform,剥掉回复开头的白名单情绪标签
+    （跨 chunk 缓冲,防标签被流切开）,并打 EMOTION_TAG 稳定性日志——只统计,
+    不改变其余行为。TextTransforms 契约=AsyncIterable[str]→AsyncIterable[str]
+    （text→text 的「函数」会把流对象当文本,整条 TTS 静音——2026-09-07 实证）。"""
+    carry = ""
+    decided = False
+    async for chunk in text:
+        buf = carry + str(chunk)
+        carry = ""
+        if not decided:
+            m = _EMOTION_TAG_PILOT_RE.match(buf)
+            if m:
+                decided = True
+                _EMOTION_TAG_STATS["with_tag"] += 1
+                print(f"EMOTION_TAG {m.group(1)}", flush=True)
+                buf = buf[m.end() :]
+            elif "[" in buf and len(buf) < 8:
+                carry = buf  # 可能係跨 chunk 嘅半個標籤,繼續攢
+                continue
+            else:
+                decided = True
+                if buf.strip():
+                    _EMOTION_TAG_STATS["without_tag"] += 1
+                    print("EMOTION_TAG none", flush=True)
+        if buf:
+            yield buf
+    if carry:
+        yield carry
+
+
 async def _strip_expr_markup(text):
     carry = ""
     async for chunk in text:
@@ -1187,7 +1222,12 @@ async def entrypoint(ctx):
         turn_handling=turn_handling,
         # 默认 ["filter_markdown","filter_emoji"] 会被整体替换，故带上内置两项；
         # 追加的自定义 transform 把 <expr/> 从进 TTS 的文本里剥掉（转录路径保留，框架发布 mood）。
-        tts_text_transforms=["filter_markdown", "filter_emoji", _strip_expr_markup],
+        tts_text_transforms=[
+            "filter_markdown",
+            "filter_emoji",
+            *([_strip_emotion_tag_pilot] if os.environ.get("EMOTION_TAG_PILOT", "0") == "1" else []),
+            _strip_expr_markup,
+        ],
     )
     # 会话首轮真实前缀预热（LLM_PREFIX_PREWARM，默认 1）——触发点在开场白之后
     # （见下方 greeting 块），这里只定義任务体。
