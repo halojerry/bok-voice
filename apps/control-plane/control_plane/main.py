@@ -859,6 +859,52 @@ async def _write_distill_knowledge(call: dict, result: dict) -> dict | None:
         return None
 
 
+def _backfill_turns_from_report(call_id: str, report_raw: str) -> int:
+    """SessionReport.chat_history → turns 回填（幂等：仅当该通话零轮次时调用）。
+
+    chat_history 结构 = {"items": [{type: "message", role, content: [str...]}]}。
+    回填行 turn_id 用 backfill:{i} 防与正常 t{i} 序列冲突；失败只告警不阻结算。
+    返回回填行数。"""
+    import json as _json
+
+    try:
+        report = _json.loads(report_raw or "{}")
+        items = ((report.get("chat_history") or {}).get("items")) or []
+        rows = [
+            it for it in items
+            if it.get("type") == "message" and it.get("role") in ("user", "assistant")
+        ]
+        if not rows:
+            return 0
+        from bok_voice_core.types import TurnEvent
+
+        n = 0
+        for i, it in enumerate(rows):
+            content = it.get("content")
+            text = " ".join(content) if isinstance(content, list) else str(content or "")
+            text = text.strip()
+            if not text:
+                continue
+            _repo().create_turn(
+                TurnEvent(
+                    trace_id=call_id,
+                    call_id=call_id,
+                    turn_id=f"backfill:{i}",
+                    role=it["role"],
+                    transcript=text,
+                    provider="session_report",
+                )
+            )
+            n += 1
+        if n:
+            _audit("settle.turns_backfilled", subject_type="call", subject_id=call_id,
+                   detail={"count": n})
+        return n
+    except Exception as exc:  # pragma: no cover
+        print(f"[settle] backfill failed: {exc!r}", flush=True)
+        return 0
+
+
 @app.post("/api/calls/{call_id}/settle")
 async def settle(call_id: str) -> dict:
     existing = _repo().get_settlement(call_id)
@@ -868,6 +914,13 @@ async def settle(call_id: str) -> dict:
     if not call:
         raise HTTPException(404, "call not found")
     turns = _repo().get_turns(call_id)
+    if not turns:
+        # 回填（2026-09-07 审计闭环）：打断/强挂通话的轮次可能整批未落库
+        # （conversation_item_added 未及触发），但 SessionReport.chat_history
+        # 有权威快照——settle 时回填,保证「每通通话必有档案」。
+        backfilled = _backfill_turns_from_report(call_id, call.get("session_report") or "")
+        if backfilled:
+            turns = _repo().get_turns(call_id)
     from bok_voice_core.types import CallSession
 
     session = CallSession(
@@ -913,11 +966,18 @@ async def settle(call_id: str) -> dict:
     except Exception as exc:  # pragma: no cover
         print(f"[settle] usage_record write skipped: {exc!r}", flush=True)
     # 总结/沉淀：用本机 LLM 生成总结正文 + 新话题 + 全局洞察（失败回退纯指标）。
+    # 可观测（2026-09-07）：失败重试 1 次;仍空→审计事件 settle.distill_empty,
+    # 唔再静默吞掉（蒸馏覆盖率从此可查）。
     try:
         from .summarize import Summarizer
 
         settings = _repo().get_settings()
         summ = Summarizer().build(turns, call, settings)
+        if not (summ.get("summary") or "").strip() and turns:
+            summ = Summarizer().build(turns, call, settings)
+        if not (summ.get("summary") or "").strip() and turns:
+            _audit("settle.distill_empty", subject_type="call", subject_id=call_id,
+                   detail={"turns": len(turns)})
         if summ.get("summary"):
             result["summary"] = summ["summary"]
         else:
