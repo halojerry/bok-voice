@@ -212,8 +212,9 @@ class ASRService:
         if self._model is None:
             raise HTTPException(status_code=503, detail="model not loaded")
 
-    def start(self, language: str = "", context: str = "") -> str:
+    def start(self, language: str = "", context: str = "", partial_ms: str = "") -> str:
         session_id = uuid.uuid4().hex
+        pm = str(partial_ms or "").strip()
         self._sessions[session_id] = {
             "chunks": bytearray(),
             "text": "",
@@ -221,6 +222,9 @@ class ASRService:
             # 热词/context(Qwen3-ASR 官方 customizable context = system message
             # 词汇表软偏置):partial/finish 每次解码透传 system_prompt。
             "context": str(context or "").strip(),
+            # 会话级 partial 解码间隔档(2026-09-08 GPU 竞态专项):agent 在回复
+            # 生成/播报中抬高此值抑制全窗重解抢 Metal 时间片,None=用 env 默认。
+            "partial_ms": int(pm) if pm.isdigit() and int(pm) > 0 else None,
             "partial": False,
             "created_at": time.time(),
             "vllm_state": None,
@@ -297,7 +301,9 @@ class ASRService:
             # partial_covered 必须以呢份快照长度为准(睇下面赋值处注释)。
             pcm = bytes(session["chunks"])
             dur_sec = len(pcm) / 2 / SAMPLE_RATE
-            if elapsed_ms < PARTIAL_INTERVAL_MS:
+            # 会话级档位(agent 生成中抑制)优先,无则用 env 默认。
+            interval_ms = float(session.get("partial_ms") or PARTIAL_INTERVAL_MS)
+            if elapsed_ms < interval_ms:
                 return cached
             if dur_sec < 0.6:
                 return cached  # 太短没有转写价值,等下一窗
@@ -362,13 +368,19 @@ class ASRService:
             last_at = float(session.get("last_partial_at") or 0.0)
             if not partial_text or covered is None:
                 return None
-            if (time.monotonic() - last_at) > FINISH_PARTIAL_FRESH_SEC:
+            # 抑制档(partial_ms 会话级抬高)下 partial 天生陈旧,旧 partial +
+            # 无上下文长尾独立解码会拼出幻觉尾巴(2026-09-08 实证)——收紧:
+            # partial 必须 ≤1.2s 新鲜、尾段 ≤1s,否则整句兜底(正确性优先)。
+            fresh_sec, tail_max_sec = FINISH_PARTIAL_FRESH_SEC, FINISH_TAIL_MAX_SEC
+            if session.get("partial_ms"):
+                fresh_sec, tail_max_sec = min(fresh_sec, 1.2), min(tail_max_sec, 1.0)
+            if (time.monotonic() - last_at) > fresh_sec:
                 return None
             if not (0 < covered <= len(pcm)):
                 return None
             tail = pcm[covered:]
             tail_sec = len(tail) / 2 / SAMPLE_RATE
-            if tail_sec > FINISH_TAIL_MAX_SEC:
+            if tail_sec > tail_max_sec:
                 return None
             if _seam_risky(partial_text):
                 return None
@@ -529,13 +541,34 @@ def health() -> dict:
     }
 
 @app.post("/api/start")
-async def start(language: str = "", context: str = "") -> dict[str, str]:
+async def start(language: str = "", context: str = "", partial_ms: str = "") -> dict[str, str]:
     # language: 可选转写语言提示("cantonese"/"Chinese"/"English")。agent 按每通
     # 对话钉定语言传入(A 线通话/B 线同传三语全钉),强制模型按该语言转写
     # (cantonese 不钉会被 auto 误判成普通话);留空 = 交给模型 auto。
     # context: 热词/词汇表(system message 软偏置,Qwen3-ASR 官方 customizable
     # context 通道),agent 按话术领域词+对象文字字段组装;QWEN3_ASR_CONTEXT=0 关。
-    return {"session_id": service.start(language=language.strip(), context=context.strip())}
+    # partial_ms: 会话级 partial 解码间隔档(agent 生成中抑制,GPU 竞态专项);
+    # 空值=env 默认。
+    return {
+        "session_id": service.start(
+            language=language.strip(), context=context.strip(), partial_ms=partial_ms.strip()
+        )
+    }
+
+
+@app.post("/api/partial_ms")
+async def tune_partial_ms(session_id: str, ms: str = "") -> dict[str, object]:
+    """已开会话即时调 partial 解码间隔档(2026-09-08 GPU 竞态专项)。
+
+    agent 在回复生成/播报中(thinking/speaking)抬档抑制,listening 恢复。
+    ms 空/非法=恢复 env 默认;会话不存在=404。
+    """
+    session = service._sessions.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="unknown session")
+    pm = str(ms or "").strip()
+    session["partial_ms"] = int(pm) if pm.isdigit() and int(pm) > 0 else None
+    return {"ok": True, "partial_ms": session["partial_ms"]}
 
 @app.post("/api/chunk")
 async def chunk(session_id: str, request: Request) -> dict[str, str | bool]:

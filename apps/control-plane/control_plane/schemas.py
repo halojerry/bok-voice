@@ -88,6 +88,7 @@ class TemplateRequest(BaseModel):
     tone_override: str = ""
     language: str = "zh"
     steps_json: str = ""
+    hotwords: str = ""
 
 
 class UpdateTemplateRequest(BaseModel):
@@ -100,6 +101,7 @@ class UpdateTemplateRequest(BaseModel):
     tone_override: str = ""
     language: str = "zh"
     steps_json: str = ""
+    hotwords: str = ""
 
 
 class PersonaRequest(BaseModel):

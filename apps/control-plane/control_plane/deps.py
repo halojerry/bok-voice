@@ -115,6 +115,12 @@ def build_engine() -> Engine | None:
                 )
                 _ensure_column(
                     conn,
+                    "conversation_templates",
+                    "hotwords",
+                    "hotwords TEXT DEFAULT ''",
+                )
+                _ensure_column(
+                    conn,
                     "call_sessions",
                     "whatsapp_status",
                     "whatsapp_status VARCHAR(16) DEFAULT ''",

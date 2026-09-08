@@ -205,9 +205,18 @@ async def main() -> int:
     # 已知数字弱项,由读回核对指引兜底,断言唔要求逐字命中）
     if not ONLY or "E2" in ONLY:
         mark = len(agent_audio)
+        baseline_user_turns = user_turns(call_id)
         await push_pcm(audio_source, digit_pcm)
         ok_reply = await wait_reply_speech(agent_audio, mark, 40) >= 0
-        turns = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", timeout=10).json()
+        # 轮落库有写入竞态窗口(P1 turns 竞态):断言前轮询等本段用户轮落库,
+        # 唔係嘅话取到空表会把完美转写判成 FAIL(2026-09-08 实证:转写逐字全对
+        # 仍报 digits_norm='')。上限 12s,超出照旧按当刻 turns 判。
+        turns: list = []
+        for _ in range(6):
+            turns = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", timeout=10).json()
+            if sum(1 for t in turns if t.get("role") == "user") > baseline_user_turns:
+                break
+            await asyncio.sleep(2)
         user_texts = " ".join((t.get("transcript") or "") for t in turns if t.get("role") == "user")
         # 归一比对:「车」与「七」同音,把同音字映回数字再查尾串「八九零」;
         # 断言要求:回复出现 + 用户轮含「单号/單號」语境 + 号码尾段按序出现。

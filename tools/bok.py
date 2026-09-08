@@ -81,6 +81,9 @@ def runtime_root() -> Path:
 
 MODELS: dict[str, dict[str, str]] = {
     "mac": {
+        # ASR 维持 8bit(2026-09-08 A/B 实证回退):4bit 快 ~24% 但数字路径同音字
+        # 滑失(九→狗/號→后,同渲染音频 8bit 逐字全对)——WhatsApp 捕获零降级铁律
+        # 优先。GPU 减负靠 partial 会话级抑制(见 agent BOK_ASR_PARTIAL_SLOW_MS)。
         "asr": "aufklarer/Qwen3-ASR-1.7B-MLX-8bit",
         "tts_preset": "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit",
         "tts_clone": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
@@ -132,7 +135,16 @@ def model_path(current: dict[str, str], name: str) -> str:
     if is_packaged():
         return str(model_dir(repo))
     if is_mac():
-        return str(_lmstudio_models_dir() / repo)
+        # mac dev 惯例优先 ~/.lmstudio;但 bok.py download 落地在 app-data——
+        # 哪边真实存在用哪边,否则「download 成功但 serve 找不到」断层
+        # (2026-09-08 ASR 4bit 实证:health model_ready=false 指着不存在的 lmstudio 路径)。
+        lm = _lmstudio_models_dir() / repo
+        if lm.exists():
+            return str(lm)
+        app = model_dir(repo)
+        if app.exists():
+            return str(app)
+        return str(lm)
     return repo
 
 
