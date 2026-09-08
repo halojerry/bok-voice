@@ -324,8 +324,9 @@ async def _say_script(session, tts_provider, cache, text: str):
         async with tts_provider.synthesize(text) as stream:
             async for ev in stream:
                 played["frames"] += 1
+                # 唔加 sleep(0):yield 已係让位点;打断时多一个 await 挂起点
+                # 会令 teardown 撞上框架 synchronizer 已关的 channel(ChanClosed 噪音)。
                 yield ev.frame
-                await asyncio.sleep(0)
 
     try:
         return await session.say(text, audio=_synth_and_play())
