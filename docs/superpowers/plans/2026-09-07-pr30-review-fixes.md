@@ -10,7 +10,7 @@
 
 ## Global Constraints
 - 改完 Python 必跑 `.venv312/bin/python -m compileall -q apps packages services tools scripts`（AGENTS.md）。
-- 术语门禁：不得引入 `yue` 字面量（tests/test_cantonese_terminology.py 全仓扫描）。
+- 术语门禁：不得引入旧粤语拼写字面量（tests/test_cantonese_terminology.py 全仓扫描——本行亦不得写出该拼写本身，2026-09-08 CI 实证归档文档自踩）。
 - StopResponse 的 raise 必须留在任何 `except Exception: pass` try 之外（AGENTS.md 铁律）。
 - 保留全部 kill-switch 语义：`QWEN3_ASR_JOIN_HOLD_MS`（0=关）、`BOK_WA_ACCUMULATE=0`、`BOK_WA_ACCUM_TIMEOUT_S`。
 - 新注释跟随各文件现行风格；不碰 prompt 文本。
