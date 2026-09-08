@@ -337,6 +337,14 @@ def _looks_like_whatsapp_step(goal: str, ref: str) -> bool:
     return any(h.lower() in ctx for h in _WHATSAPP_STEP_HINTS)
 
 
+def wa_confirm_advance_allowed(*, goal: str, ref: str, captured: bool) -> bool:
+    """CONFIRM 假推进护栏(WA 收号码步,rule 与背景 judge 两条 CONFIRM 路共用):
+    步向係收客户号码而未捕获 → CONFIRM 唔准推进——碎片尾裸係/是命中 CONFIRM、
+    或 4B judge 对模糊轮误判 advance,都唔可以越过收号码步(c4f6e4f1 实证:
+    judge=confirm step=4→号码轮走漏)。offered(应承加未俾号)由调用方按当轮 signal 另行 block。"""
+    return captured or not _looks_like_whatsapp_step(goal, ref)
+
+
 def _valid_digit_runs(norm: str, *, min_len: int = 4, max_len: int = 13) -> list[str]:
     """攞 min_len–max_len 位数字串(WhatsApp 號碼長度唔固定:香港8位/內地11位/帶區號13位)。
     下限 4:再短(1-3位)基本只會係 ASR 碎片——客戶讀號被 VAD 切段、或者糾正聽錯嘅
@@ -350,8 +358,8 @@ def _valid_digit_runs(norm: str, *, min_len: int = 4, max_len: int = 13) -> list
 def _digit_runs_in(text: str) -> list[str]:
     """每轮客户话里的数字串(≥4 位,汉字/英文数字词已归一成 ASCII)——读回核对指引用。
 
-    唔同 _valid_digit_runs(WhatsApp 语义,6 位起),呢度只要 4 位就算「客戶報咗數字」:
-    单号尾号常係 4 位,转写出错也最伤。逐 run 归一(唔成段归一,免得两串数字被拼成一条)。"""
+    与 _valid_digit_runs 一样 4 位起(2026-09-06 起),分别只在于逐 run 归一
+    (唔成段归一,免得两串数字被拼成一条)。"""
     runs = re.findall(r"[0-9一二三四五六七八九零]{4,}", str(text or ""))
     out: list[str] = []
     for r in runs:
