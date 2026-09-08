@@ -219,7 +219,7 @@ async def main() -> int:
     # 双向+启停×3 全套变 10 分钟级;断句稳定性归 I4 长流专门验。
     zh_pcm = read_wav_pcm(AUDIO_DIR / "zh.wav")[: int(16000 * 8) * 2]
     en_pcm = read_wav_pcm(AUDIO_DIR / "en.wav")[: int(16000 * 8) * 2]
-    yue_pcm = read_wav_pcm(AUDIO_DIR / "cantonese.wav")[: int(16000 * 8) * 2]
+    canto_pcm = read_wav_pcm(AUDIO_DIR / "cantonese.wav")[: int(16000 * 8) * 2]
     long_pcm = read_wav_pcm(AUDIO_DIR / "zh.wav") + b"".join(
         read_wav_pcm(AUDIO_DIR / "zh.wav") for _ in range(8)
     )
@@ -239,15 +239,15 @@ async def main() -> int:
     # I5+I6 第二语言对（中↔粤,2026-09-08 用户点名验证）：interpret.py 对 cantonese
     # 有完整分支(ASR 钉定/港式 MT 规则/Cantonese 音色+language_boost),此前从未实测。
     # 同一通里 fwd=中→粤、rev=粤→中,两个方向一次覆盖。
-    info_yue = await run_one(zh_pcm, yue_pcm, language="zh", target_lang="cantonese",
+    info_canto = await run_one(zh_pcm, canto_pcm, language="zh", target_lang="cantonese",
                              fwd_expect="Cantonese", rev_expect="Chinese")
-    record("I5 fwd: me(zh)→other 听到粤语输出", info_yue["fwd_ok"], info_yue["fwd_text"])
-    record("I6 rev: other(粤)→me 听到中文输出", info_yue["rev_ok"], info_yue["rev_text"])
-    turns_y = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{info_yue['call_id']}/turns", timeout=10).json()
-    orig_y = [t for t in turns_y if str(t.get("transcript") or "").startswith("原文：")]
-    tran_y = [t for t in turns_y if str(t.get("transcript") or "").startswith("译文：")]
-    record("I5b turns 原文/译文分行落库 (中↔粤)", len(orig_y) >= 1 and len(tran_y) >= 1,
-           f"orig={len(orig_y)} tran={len(tran_y)} turns={len(turns_y)}")
+    record("I5 fwd: me(zh)→other 听到粤语输出", info_canto["fwd_ok"], info_canto["fwd_text"])
+    record("I6 rev: other(粤)→me 听到中文输出", info_canto["rev_ok"], info_canto["rev_text"])
+    turns_c = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{info_canto['call_id']}/turns", timeout=10).json()
+    orig_c = [t for t in turns_c if str(t.get("transcript") or "").startswith("原文：")]
+    tran_c = [t for t in turns_c if str(t.get("transcript") or "").startswith("译文：")]
+    record("I5b turns 原文/译文分行落库 (中↔粤)", len(orig_c) >= 1 and len(tran_c) >= 1,
+           f"orig={len(orig_c)} tran={len(tran_c)} turns={len(turns_c)}")
 
     # I3 连续启停 ×3
     ok_all = True
