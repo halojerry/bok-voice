@@ -241,6 +241,9 @@ export default function TemplatesPage() {
     try {
       // 分步为主:没填步骤但有四段 → 自动转成步骤(统一存 steps_json,不再存四段)。
       const finalSteps = steps.length > 0 ? steps : fourSectionsToSteps(form);
+      // 空白步(goal+ref 全空)会被 stepsToJson 静默过滤——计数提示,防「明明填了 N 步存出来少几步」困惑(2026-09-09 QA B2)。
+      const droppedBlanks = finalSteps.filter((s) => !s.goal.trim() && !s.ref.trim()).length;
+      if (droppedBlanks > 0) setErr(`已忽略 ${droppedBlanks} 个空白步（目标与参考说法都为空）。`);
       // 四段已并入步骤,保存时不落四段字段(避免双写/旧路径读到空整段)。
       const payload = { ...form, opening: "", core: "", objection: "", closing: "", steps_json: stepsToJson(finalSteps), account_id: accountId };
       if (editingId) await api.updateTemplate(editingId, payload);
@@ -497,7 +500,7 @@ export default function TemplatesPage() {
           </label>
           <div className="flex items-center gap-3">
             <button className="btn-primary" onClick={save}>{editingId ? "保存修改" : "创建模板"}</button>
-            {editingId && <button className="btn-ghost" onClick={() => { setEditingId(null); setForm(EMPTY); }}>取消</button>}
+            {editingId && <button className="btn-ghost" onClick={() => { setEditingId(null); setForm(EMPTY); setSteps([]); }}>取消</button>}
             {ok && <span className="text-sm text-emerald-400">已保存。</span>}
           </div>
         </section>

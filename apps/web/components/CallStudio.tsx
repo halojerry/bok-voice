@@ -726,11 +726,20 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
     if (stateCallId) {
       try {
         await api.hangup(stateCallId);
-        const s = await api.getSettlement(stateCallId);
-        setSettlement(s);
       } catch (e) {
-        // 未有结算(未 settle)时 /settlement 404 属预期,唔刷 console。
-        if (!String(e).includes("404")) console.warn("settle failed", e);
+        if (!String(e).includes("404")) console.warn("hangup failed", e);
+      }
+      // 结算重试(2026-09-09 QA B1):agent 侧 settle 喺 session close 后异步完成,
+      // 首查 404 属「结算在途」;3 次×2s 俾佢跑完,消除结算卡假空态。
+      for (let i = 0; i < 3; i++) {
+        await new Promise((r) => setTimeout(r, i === 0 ? 800 : 2000));
+        try {
+          const s = await api.getSettlement(stateCallId);
+          setSettlement(s);
+          break;
+        } catch {
+          /* 404=在途,继续重试 */
+        }
       }
     }
     setStateCallId("");
