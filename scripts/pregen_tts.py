@@ -99,12 +99,25 @@ def _template_for(templates: list[dict], obj: dict) -> dict | None:
     return templates[0] if templates else None
 
 
+def _template_steps(tpl: dict | None) -> list[dict]:
+    """CP 模板的步骤在 steps_json 字符串字段(列表/详情都不带解析过的 steps 数组)。"""
+    if not tpl:
+        return []
+    raw = tpl.get("steps_json") or tpl.get("steps") or []
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return []
+    return raw if isinstance(raw, list) else []
+
+
 def _opening_line(tpl: dict | None, obj: dict, lang: str) -> str:
     """话术第 1 步 ref 首行渲染(与 FlowController.opening_text 同逻辑):
     模板语言≠通话语言或变量缺失 → 空串(运行时会退通用语,预生成跳过)。"""
     if not tpl or str(tpl.get("language") or "") != lang:
         return ""
-    steps = tpl.get("steps") or []
+    steps = _template_steps(tpl)
     if not steps:
         return ""
     first = steps[0] or {}
