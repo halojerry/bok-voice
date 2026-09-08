@@ -42,6 +42,7 @@ const EMPTY = {
   closing: "",
   tone_override: "",
   language: "zh",
+  hotwords: "",
 };
 
 const STEPS_HINT = "可用变量:{姓名} {快递单号} {快递尾号} {物流公司} {收货地址}。\n参考说法是给 AI 的要点参考,不是逐字稿——AI 会结合客户原话用自己的话讲。";
@@ -221,6 +222,7 @@ export default function TemplatesPage() {
       closing: String(row.closing ?? ""),
       tone_override: String(row.tone_override ?? ""),
       language: String(row.language ?? "zh"),
+      hotwords: String(row.hotwords ?? ""),
     };
     setForm(f);
     // 分步为主:旧模板(只有四段无 steps)载入时自动转成步骤,让用户按步骤编辑。
@@ -304,6 +306,7 @@ export default function TemplatesPage() {
                         <p className="mt-1 text-xs text-[var(--muted)]">
                           {LANGS.find((l) => l[0] === String(row.language ?? "zh"))?.[1] ?? String(row.language ?? "zh")}
                           {String(row.tone_override ?? "") && ` · 语气 ${String(row.tone_override)}`}
+                          {String(row.hotwords ?? "") && ` · 热词 ${String(row.hotwords)}`}
                         </p>
                       </div>
                       <div className="flex shrink-0 gap-2">
@@ -469,6 +472,18 @@ export default function TemplatesPage() {
               onChange={(e) => setForm({ ...form, tone_override: e.target.value })}
               placeholder="如：专业、温和、简洁"
             />
+          </label>
+          <label className="block">
+            <span className="text-xs text-[var(--stage-muted)]">识别热词（可选，本套话术专属）</span>
+            <input
+              className="mt-1 w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+              value={form.hotwords}
+              onChange={(e) => setForm({ ...form, hotwords: e.target.value })}
+              placeholder="如：順豐速運, 集運, 理賠（逗号/顿号分隔）"
+            />
+            <span className="mt-1 block text-[11px] leading-relaxed text-[var(--muted)]">
+              客户或话术里的专名词容易听错，填进这里 AI 语音识别会更准。纯数字串会被忽略（防止识别出错误号码）。
+            </span>
           </label>
           <label className="block">
             <span className="text-xs text-[var(--stage-muted)]">语言</span>

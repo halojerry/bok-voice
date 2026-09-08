@@ -38,7 +38,7 @@ class _FakeModel:
     def __init__(self):
         self.calls: list[dict] = []
 
-    def generate(self, wav, language=None, max_tokens=256):
+    def generate(self, wav, language=None, max_tokens=256, system_prompt=None):
         self.calls.append({"samples": len(wav), "language": language})
         if len(wav) <= 16000:
             return types.SimpleNamespace(text=TAIL_TEXT, language=["Cantonese"])

@@ -161,7 +161,7 @@ def test_sidecar_partial_runs_and_caps_buffer():
     calls = {"n": 0, "last_pcm_len": 0}
 
     class _FakeModel:
-        def generate(self, wav, language=None, max_tokens=256):
+        def generate(self, wav, language=None, max_tokens=256, system_prompt=None):
             calls["n"] += 1
             calls["last_pcm_len"] = len(wav)
             out = types.SimpleNamespace(text="有冇人知道灣仔活道係點去㗎", language=["Cantonese"])

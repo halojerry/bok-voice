@@ -317,12 +317,17 @@ _WA_ANNOUNCE_HEAD_RE = re.compile(
 )
 
 
+# 渠道英文词(whatsapp/wechat 变体):号码主导判定前先剥——否则「whatsapp」8 个字母
+# 本身已超「剩余 ≤6」上限,英文通道报号句永远进唔了累积(docstring 示例实证假)。
+_WA_CHANNEL_WORD_RE = re.compile(r"(?:whats\s?app|wechat|we\s?chat)", re.IGNORECASE)
+
+
 def _wa_numberish(text: str) -> bool:
     """号码主导句:去渠道词/空白/标点后,数字佢主导,剩余实质字符 ≤6
-    (「我的WhatsApp係64325432」剩「我的係」=4;「zero was three」剩「was」=3)。"""
+    (「我的WhatsApp係64325432」去渠道词剩「我的係」=4;「Zero was three」剩「was」=3)。"""
     norm = _digit_normalize(text)
     digits = sum(ch.isdigit() for ch in norm)
-    rest = re.sub(r"[\s\d。，,．.！!？?～~—\-、；;：:'\"()（）]", "", norm)
+    rest = re.sub(r"[\s\d。，,．.！!？?～~—\-、；;：:'\"()（）]", "", _WA_CHANNEL_WORD_RE.sub("", norm))
     return digits >= 1 and len(rest) <= 6
 
 
@@ -341,6 +346,98 @@ def _wa_number_line(lang: str, num: str) -> str:
     if lang == "en":
         return "Sorry, I may have missed part of that — please go ahead with your number."
     return "不好意思，可能刚才没听完整——麻烦您继续说一下您的号码。"
+
+
+# ---- ASR 热词(context 软偏置)----
+# Qwen3-ASR 官方 customizable context = system message 词汇表(「Vocabulary: …」
+# 格式),与 language 强制可叠加——领域词误听(「單號」聽成「打啊」类)嘅软补。
+# 来源三层:话术模板 hotwords 字段(运营按套话术维护,最贴场景)+ 行业静态词
+# (话术域高频词,三语各一套)+ 对象文字字段(courier/contact_channel——误听
+# 高发嘅专名类)。数字串唔进(biasing 有幻听数字风险,下游 known-number 过滤
+# 兜底);总长护栏防 partial 解码 prefill 膨胀,超限时模板词/对象词优先保留。
+# BOK_ASR_HOTWORDS=0 回退(装配层唔下发;sidecar 侧另有 QWEN3_ASR_CONTEXT)。
+_ASR_HOTWORDS = {
+    "cantonese": ("單號", "運單", "賠償", "運費", "專員", "集運", "時效", "上門", "追蹤", "核實", "WhatsApp", "微信"),
+    "zh": ("单号", "运单", "赔偿", "运费", "专员", "集运", "时效", "上门", "追踪", "核实", "微信"),
+    "en": ("tracking", "shipment", "parcel", "refund", "courier", "delivery", "WhatsApp"),
+}
+_ASR_HOTWORD_MAX_CHARS = 120  # context 字符上限:官方无硬限,防 partial 每 ~700ms 重解码 prefill 变贵
+# 模板 hotwords 字段分隔符:中英逗号/顿号/分号/换行都收(运营粘贴习惯唔统一)。
+_ASR_HOTWORD_SPLIT_RE = re.compile(r"[,，、;；\n]+")
+
+
+def _is_digit_dominant(token: str) -> bool:
+    digits = sum(ch.isdigit() for ch in token)
+    return digits > 0 and digits * 2 >= len(token)
+
+
+def asr_hotword_context(lang: str, object_card: dict | None, extra_hotwords: str = "") -> str:
+    """组装 ASR 热词 context(纯函数,单测用)。
+
+    话术模板 hotwords 字段(extra_hotwords,逗号/换行分隔)最先入列——运营按套
+    话术维护,最贴当前场景;静态行业词按通话语言取表(未知语言回退粤语表=A 线
+    默认);对象文字字段(courier/contact_channel)再追加。数字主导 token 丢弃、
+    去重(大小写不敏感)、总长超限逐词回填唔截半词。格式对齐官方模型卡示例
+    「Vocabulary: w1, w2, …」。BOK_ASR_HOTWORDS=0 → 空串(唔下发)。
+    """
+    if os.environ.get("BOK_ASR_HOTWORDS", "1") != "1":
+        return ""
+    key = (lang or "").strip().lower()
+    words: list[str] = []
+    seen: set[str] = set()
+
+    def _add(tok: str) -> None:
+        tok = tok.strip()
+        if not tok or tok.lower() in seen or _is_digit_dominant(tok):
+            return
+        seen.add(tok.lower())
+        words.append(tok)
+
+    for tok in _ASR_HOTWORD_SPLIT_RE.split(extra_hotwords or ""):
+        _add(tok)
+    for w in _ASR_HOTWORDS.get(key) or _ASR_HOTWORDS["cantonese"]:
+        _add(w)
+    oc = object_card or {}
+    for field in ("courier", "contact_channel"):
+        try:
+            _add(str(oc.get(field) or ""))
+        except Exception:  # pragma: no cover - 对象字段异常回退纯静态表
+            pass
+    if not words:
+        return ""
+    prefix = "Vocabulary: "
+    if len(prefix + ", ".join(words)) > _ASR_HOTWORD_MAX_CHARS:
+        kept: list[str] = []
+        total = len(prefix)
+        for w in words:
+            add = len(w) + (2 if kept else 0)
+            if total + add > _ASR_HOTWORD_MAX_CHARS:
+                break
+            kept.append(w)
+            total += add
+        words = kept
+        if not words:
+            return ""
+    return prefix + ", ".join(words)
+
+
+# ---- ASR partial 解码抑制(GPU 竞态专项,2026-09-08)----
+# 同卡上 LLM prefill/生成与 ASR partial 全窗重解抢 Metal 时间片(受控实验:持续
+# ASR 解码拖慢 LLM TTFT +24%,LLM 拖慢 ASR 2-4.6×)。回复生成/播报中把该通
+# sidecar 会话的 partial 间隔抬高,listening 恢复默认。打断係 VAD 判定,唔受
+# partial 抑制影响;BOK_ASR_PARTIAL_SLOW_MS=0 整个功能关。
+def partial_slow_ms() -> int:
+    try:
+        return int(os.environ.get("BOK_ASR_PARTIAL_SLOW_MS", "3000") or "0")
+    except ValueError:
+        return 3000
+
+
+def partial_ms_for_state(state: str, slow_ms: int) -> int | None:
+    """状态→partial 档(纯函数,单测用):thinking/speaking→抑制档,其余→None=默认。"""
+    if slow_ms <= 0:
+        return None
+    return slow_ms if state in ("thinking", "speaking") else None
 
 
 _ECHO_SIM_RATIO = 0.9
@@ -912,6 +1009,7 @@ async def entrypoint(ctx):
     from .flow import FlowController, facts_line
     from .flow import CONFIRM, OBJECTION, QUESTION, REFUSE, UNCLEAR, detect_whatsapp_signal, extract_call_facts
     from .flow import _digit_normalize, _looks_like_whatsapp_step, _WHATSAPP_DECLINE, digits_to_cantonese
+    from .flow import wa_confirm_advance_allowed
 
     flow_ctrl = FlowController.from_template(template, object_card)
     _log_stage("context_resolved")
@@ -1090,6 +1188,12 @@ async def entrypoint(ctx):
             language_state=asr_language_state,
             # A 线恒全钉（同传式）：zh 也下发 Chinese hint，不吃 auto 漂移。
             pin_language=True,
+            # 热词 context：话术模板 hotwords 字段 + 行业词 + 对象文字字段
+            # （官方 system message 软偏置），随 /api/start 下发。
+            # BOK_ASR_HOTWORDS=0 回退。
+            hotword_context=asr_hotword_context(
+                asr_pin_lang, object_card, extra_hotwords=str((template or {}).get("hotwords") or "")
+            ),
         )
         if os.environ.get("QWEN3_ASR_STREAM", "1") == "1":
             # 「VAD+滑窗 partial」流式包装:说话期间出 INTERIM(实时字幕)/
@@ -1098,6 +1202,8 @@ async def entrypoint(ctx):
             stt_provider = Qwen3ASRLiveSTT(stt_=_asr_inner, vad_=vad_provider)
         else:
             stt_provider = stt.StreamAdapter(stt=_asr_inner, vad=vad_provider)
+    # GPU 竞态专项:仅 Live 包装可调会话级 partial 档(流式路径独有)。
+    _partial_gate_stt = stt_provider if isinstance(stt_provider, Qwen3ASRLiveSTT) else None
 
     # ---- TTS：人设可指定引擎（persona.tts_provider），留空跟随全局 tts.provider。
     # 引擎决定音色池：qwen3_tts 用本地克隆（persona.reference_audio 是本地克隆 ID）；
@@ -1549,9 +1655,15 @@ async def entrypoint(ctx):
             jv = parse_judge_output(await _llm_judge(jbase, jmodel, msgs))
             if flow_ctrl.current == step_at and flow_ctrl.has_steps and not flow_ctrl.done:
                 if jv == CONFIRM:
-                    flow_ctrl.advance()
-                    context_state.set_flow_current(flow_ctrl.current_step_text())
-                    print(f"[flow] judge(bg)=confirm step={flow_ctrl.current + 1} (call {room_name})", flush=True)
+                    # WA 收号码步假确认护栏:与 rule CONFIRM 分支共用同一铁律——未
+                    # captured 唔准 judge 推进越过收号码步(c4f6e4f1 实证泄漏点)。
+                    _gj, _rj = flow_ctrl.current_goal_ref()
+                    if wa_confirm_advance_allowed(goal=_gj, ref=_rj, captured=_wa_captured["on"]):
+                        flow_ctrl.advance()
+                        context_state.set_flow_current(flow_ctrl.current_step_text())
+                        print(f"[flow] judge(bg)=confirm step={flow_ctrl.current + 1} (call {room_name})", flush=True)
+                    else:
+                        print(f"[flow] judge(bg)=confirm blocked (wa step, not captured) step={step_at + 1} (call {room_name})", flush=True)
                 else:
                     print(f"[flow] judge(bg)={jv} step={step_at + 1} (call {room_name})", flush=True)
         except Exception as exc:  # pragma: no cover - 背景判定失敗唔影響回覆
@@ -1758,8 +1870,8 @@ async def entrypoint(ctx):
                                 (_wa_signal is not None and _wa_signal[0] in ("captured", "captured_implicit"))
                                 or _wa_captured["on"]
                             )
-                            if (_wa_signal is not None and _wa_signal[0] == "offered") or (
-                                _looks_like_whatsapp_step(_g2, _r2) and not _wa_satisfied
+                            if (_wa_signal is not None and _wa_signal[0] == "offered") or not wa_confirm_advance_allowed(
+                                goal=_g2, ref=_r2, captured=_wa_satisfied
                             ):
                                 pass
                             else:
@@ -1903,6 +2015,19 @@ async def entrypoint(ctx):
     if nudge_max > 0:
         session.on("agent_state_changed", _on_agent_state)
         session.on("user_state_changed", _on_user_state)
+
+    def _on_partial_gate(ev) -> None:
+        # GPU 竞态专项:LLM 生成/播报中抬高 ASR partial 档,listening 恢复默认。
+        # 打断係 VAD 判定,唔受此抑制影响;独立于心跳(nudge_max=0 也要生效)。
+        if _partial_gate_stt is not None:
+            _partial_gate_stt.set_partial_ms(
+                partial_ms_for_state(str(getattr(ev, "new_state", "") or ""), partial_slow_ms())
+            )
+
+    if _partial_gate_stt is not None and partial_slow_ms() > 0:
+        # 与心跳钩子同规:必须先于 session.start 注册,错过初始 speaking 转换
+        # 会令开场白期间 partial 唔受抑制。
+        session.on("agent_state_changed", _on_partial_gate)
 
     watch_task = asyncio.create_task(_supervisor_watch())
     # AgentSession 内部已注册 job shutdown callback（自动 aclose），

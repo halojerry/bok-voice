@@ -120,6 +120,7 @@ class ConversationTemplate:
     tone_override: str = ""
     language: str = "zh"
     steps_json: str = ""
+    hotwords: str = ""
 
 
 @dataclass
