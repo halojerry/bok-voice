@@ -648,9 +648,9 @@ def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
         # 16GB 机型可下调,或用 --prompt-cache-bytes 限制缓存总字节。
         # prompt-cache-bytes 6GB:给 128 槽加总字节上限——长会话(几十轮×8k ctx)
         # 单槽可涨到几十 MB,不封顶会把统一内存吃穿触发 macOS 压缩/交换,TTFT 抖尖。
-        # prefill-step-size 1024(官方默认 2048):prefill 分步喂 GPU,步子减半让
-        # 并发请求在步间插得上队——单请求 prefill 略慢一点点,换并发 TTFT/打断
-        # 响应不吃整步 2048 token 的长块。
+        # prefill-step-size 512(官方默认 2048,2026-09-08 二分实证从 1024 再降):
+        # 暖缓存 TTFT 中位 913/917ms vs 1024 的 1066/1092ms(双轮反向 A/B,增量轮
+        # 尾段一步喂完少等半步),并发交错打平——纯赚。
         # log-level INFO(旧 WARNING):延迟调试要读 mlx 请求/prompt-cache 命中行
         # (llm.log);dev/mac serve 路径专用,生产 launchd 单元不从这里起 :1235,
         # 可用 BOK_LLM_LOG_LEVEL 回 WARNING。
@@ -660,7 +660,7 @@ def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
              "--model", llm_model, "--host", "127.0.0.1", "--port", "1235",
              "--prompt-cache-size", "128",
              "--prompt-cache-bytes", "6GB",
-             "--prefill-step-size", "1024",
+             "--prefill-step-size", "512",
              "--chat-template-args", '{"enable_thinking":false}', "--log-level", llm_log_level],
             run_dir / "llm.pid",
             log_dir / "llm.log",
