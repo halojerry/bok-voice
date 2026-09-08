@@ -236,7 +236,7 @@ def test_settings_object_persona_knowledge_and_reports():
         saved = client.put(
             "/api/settings",
             json={
-                "asr": {"provider": "sherpa_sensevoice", "model": "sensevoice"},
+                "asr": {"provider": "qwen3_asr", "model": "qwen3-asr-1.7b"},
                 "llm": {"provider": "local_openai", "model": "local", "api_key": "mlx"},
                 "tts": {"provider": "volcano_streaming", "access_token": "secret"},
                 "vad": {"provider": "silero"},

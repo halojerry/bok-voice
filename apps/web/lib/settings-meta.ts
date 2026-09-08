@@ -53,10 +53,9 @@ export const SETTING_CARDS: ProviderMeta[] = [
   {
     kind: "asr",
     title: "ASR 语音识别",
-    desc: "把客户语音转成文字。qwen3_asr 走本地 sidecar；sherpa_sensevoice 走 sherpa-onnx；fake 仅用于无模型测试。",
+    desc: "把客户语音转成文字。qwen3_asr 走本地 sidecar；fake 仅用于无模型测试。",
     providers: [
       { value: "qwen3_asr", label: "Qwen3-ASR（本地）" },
-      { value: "sherpa_sensevoice", label: "SenseVoice（sherpa-onnx）" },
       { value: "fake", label: "Fake（仅测试）", hint: "无模型时用固定文本模拟识别。" },
     ],
     fields: [

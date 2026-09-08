@@ -28,15 +28,15 @@ def test_session_manifest_default_providers():
         persona_id="p1",
         mode=CallMode.SIMULATION,
     )
-    assert m.providers["asr"] == "sherpa"
+    assert m.providers["asr"] == "qwen3_asr"
     assert m.policy == "offline_first"
 
 
 def test_provider_registry_failover():
     reg = ProviderRegistry()
-    reg.register("asr", "sherpa", FakeASR())
+    reg.register("asr", "iflytek2", FakeASR())
     reg.register("asr", "volcano", FakeASR())
-    reg.mark("asr", "sherpa", ProviderState.QUARANTINED, "down")
+    reg.mark("asr", "iflytek2", ProviderState.QUARANTINED, "down")
     active = reg.active("asr")
     assert active is not None
     assert reg.active("tts") is None

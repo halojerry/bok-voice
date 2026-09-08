@@ -3,7 +3,6 @@
 全仓跟踪的源文件不得出现旧拼写 yue（大小写不敏感），唯以下单点豁免：
 - deps.py / test_control_plane.py：DB 存量迁移（唯一兼容点）及其回归夹具
 - web_search.py / test_web_search.py：维基百科外部域名 zh-yue.wikipedia.org
-- livekit_plugins.py：SenseVoice 输出标签 "YUE"（模型边界，入内即归一 cantonese）
 - interpret.py / test_interpret_tts_provider.py / agent.py / test_fixed_language_call.py：
   MiniMax language_boost 外部枚举（TTS 供应商 API 真字面量，粤=普+粤标记；
   B 线 interpret 与 A 线 entrypoint per-call 注入同源同值，值经 env 单点透传）
@@ -29,7 +28,6 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     "tests/test_control_plane.py": None,
     "apps/agent/agent_runtime/web_search.py": re.compile(r"zh-yue"),
     "tests/test_web_search.py": re.compile(r"zh-yue"),
-    "apps/agent/agent_runtime/providers/livekit_plugins.py": re.compile(r"YUE"),
     # MiniMax language_boost 外部枚举(API 真字面量,粤=普+粤标记);只豁免带该
     # 枚举值的行,语言字段本身仍一律 cantonese。A 线 agent.py 同源注入
     # (per-call 固定语言,B 线 interpret 同值)。

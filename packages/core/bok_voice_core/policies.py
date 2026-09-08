@@ -88,7 +88,7 @@ def select_session_manifest(
         mode=mode,
         direction=direction,
         language=language,
-        providers=providers or {"vad": "livekit", "asr": "sherpa", "llm": "mlx", "tts": "gpt_sovits"},
+        providers=providers or {"vad": "livekit", "asr": "qwen3_asr", "llm": "mlx", "tts": "gpt_sovits"},
         policy=policy,
         tts_reference_voice=tts_reference_voice,
         template_id=template_id,
