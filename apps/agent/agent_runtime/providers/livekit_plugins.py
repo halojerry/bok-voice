@@ -3519,6 +3519,7 @@ class Qwen3ASRSTT(stt.STT):
         base_url: str = "http://127.0.0.1:8787",
         language_state: LanguageState | None = None,
         pin_language: bool = False,
+        hotword_context: str = "",
     ):
         super().__init__(
             capabilities=stt.STTCapabilities(
@@ -3536,6 +3537,9 @@ class Qwen3ASRSTT(stt.STT):
         # True=语言钉死(同传:源语言是用户建房时选定的,zh/en/cantonese 都下发 hint);
         # False=通话模式(只有 cantonese 钉防误判,zh/en 交 auto 容忍夹语 code-switching)。
         self._pin_language = pin_language
+        # 热词/context(Qwen3-ASR 官方 customizable context = system message 词汇表
+        # 软偏置):每通对话装配一次,随 /api/start 下发,session 级透传每次解码。
+        self._hotword_context = str(hotword_context or "").strip()
 
     def stream(self, *, language=None, conn_options=None):
         return _Qwen3ASRStream(self, conn_options or APIConnectOptions())
@@ -3610,10 +3614,16 @@ class _Qwen3ASRStream(stt.RecognizeStream):
         for attempt in range(3):
             try:
                 async with httpx.AsyncClient(timeout=30) as client:
-                    params = {"session_id": ""} if lang_hint else None
+                    # start 参数:language hint + 热词 context(都有先例可空,空则不下发;
+                    # getattr 鸭型访问——测试 fake 与旧设置面无此属性时等同空)
+                    start_params: dict[str, str] = {}
+                    if lang_hint:
+                        start_params["language"] = lang_hint
+                    if getattr(self._stt_, "_hotword_context", ""):
+                        start_params["context"] = self._stt_._hotword_context
                     start = await client.post(
                         f"{self._stt_._base_url}/api/start",
-                        params={"language": lang_hint} if lang_hint else None,
+                        params=start_params or None,
                     )
                     start.raise_for_status()
                     session_id = start.json()["session_id"]
@@ -4026,11 +4036,18 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
 
     async def _start_session(self) -> None:
         lang_hint = _asr_language_hint(self._stt_._language_state.lang, self._stt_._pin_language)
+        # start 参数:language hint + 热词 context(同 offline 路径,空则不下发;
+        # getattr 鸭型访问——测试 fake 无此属性时等同空)
+        start_params: dict[str, str] = {}
+        if lang_hint:
+            start_params["language"] = lang_hint
+        if getattr(self._stt_, "_hotword_context", ""):
+            start_params["context"] = self._stt_._hotword_context
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.post(
                     f"{self._stt_._base_url}/api/start",
-                    params={"language": lang_hint} if lang_hint else None,
+                    params=start_params or None,
                 )
                 r.raise_for_status()
                 self._session_id = r.json()["session_id"]

@@ -123,6 +123,15 @@ def _fallback_language(text: str) -> str:
         return "English"
     return ""
 
+def _session_context(session: dict) -> str | None:
+    """热词/context 透传值(Qwen3-ASR 官方 customizable context = system message
+    词汇表软偏置)。运行时读 env:QWEN3_ASR_CONTEXT=0 一键回退(行为同旧=None);
+    空串同样 None(不进 prompt)。"""
+    if os.environ.get("QWEN3_ASR_CONTEXT", "1") == "1":
+        return str(session.get("context") or "") or None
+    return None
+
+
 def _finish_language_hint(start_lang: str | None) -> str | None:
     """finish 整句/增量解码的语言提示(与会话 start 语言同源,唔重跑 auto-LID)。
 
@@ -203,12 +212,15 @@ class ASRService:
         if self._model is None:
             raise HTTPException(status_code=503, detail="model not loaded")
 
-    def start(self, language: str = "") -> str:
+    def start(self, language: str = "", context: str = "") -> str:
         session_id = uuid.uuid4().hex
         self._sessions[session_id] = {
             "chunks": bytearray(),
             "text": "",
             "language": language,
+            # 热词/context(Qwen3-ASR 官方 customizable context = system message
+            # 词汇表软偏置):partial/finish 每次解码透传 system_prompt。
+            "context": str(context or "").strip(),
             "partial": False,
             "created_at": time.time(),
             "vllm_state": None,
@@ -296,6 +308,7 @@ class ASRService:
             out = self._model.generate(
                 _resample(wav, sr, SAMPLE_RATE),
                 language=session.get("language") or None,
+                system_prompt=_session_context(session),
                 max_tokens=int(os.environ.get("QWEN3_ASR_MAX_TOKENS", "256")),
             )
             text = getattr(out, "text", "") or ""
@@ -371,6 +384,7 @@ class ASRService:
             out = self._model.generate(
                 _resample(wav, sr, SAMPLE_RATE),
                 language=hint,
+                system_prompt=_session_context(session),
                 max_tokens=int(os.environ.get("QWEN3_ASR_MAX_TOKENS", "256")),
             )
             tail_text = getattr(out, "text", "") or ""
@@ -445,6 +459,7 @@ class ASRService:
             out = self._model.generate(
                 _resample(wav, sr, SAMPLE_RATE),
                 language=hint,
+                system_prompt=_session_context(session),
                 max_tokens=int(os.environ.get("QWEN3_ASR_MAX_TOKENS", "256")),
             )
             text = getattr(out, "text", "") or ""
@@ -514,11 +529,13 @@ def health() -> dict:
     }
 
 @app.post("/api/start")
-async def start(language: str = "") -> dict[str, str]:
+async def start(language: str = "", context: str = "") -> dict[str, str]:
     # language: 可选转写语言提示("cantonese"/"Chinese"/"English")。agent 按每通
     # 对话钉定语言传入(A 线通话/B 线同传三语全钉),强制模型按该语言转写
     # (cantonese 不钉会被 auto 误判成普通话);留空 = 交给模型 auto。
-    return {"session_id": service.start(language=language.strip())}
+    # context: 热词/词汇表(system message 软偏置,Qwen3-ASR 官方 customizable
+    # context 通道),agent 按话术领域词+对象文字字段组装;QWEN3_ASR_CONTEXT=0 关。
+    return {"session_id": service.start(language=language.strip(), context=context.strip())}
 
 @app.post("/api/chunk")
 async def chunk(session_id: str, request: Request) -> dict[str, str | bool]:

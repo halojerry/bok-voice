@@ -348,6 +348,73 @@ def _wa_number_line(lang: str, num: str) -> str:
     return "不好意思，可能刚才没听完整——麻烦您继续说一下您的号码。"
 
 
+# ---- ASR 热词(context 软偏置)----
+# Qwen3-ASR 官方 customizable context = system message 词汇表(「Vocabulary: …」
+# 格式),与 language 强制可叠加——领域词误听(「單號」聽成「打啊」类)嘅软补。
+# 来源两层:行业静态词(话术域高频词,三语各一套)+ 对象文字字段(courier/
+# contact_channel——误听高发嘅专名类)。数字串唔进(biasing 有幻听数字风险,
+# 下游 known-number 过滤兜底);总长护栏防 partial 解码 prefill 膨胀。
+# BOK_ASR_HOTWORDS=0 回退(装配层唔下发;sidecar 侧另有 QWEN3_ASR_CONTEXT)。
+_ASR_HOTWORDS = {
+    "cantonese": ("單號", "運單", "賠償", "運費", "專員", "集運", "時效", "上門", "追蹤", "核實", "WhatsApp", "微信"),
+    "zh": ("单号", "运单", "赔偿", "运费", "专员", "集运", "时效", "上门", "追踪", "核实", "微信"),
+    "en": ("tracking", "shipment", "parcel", "refund", "courier", "delivery", "WhatsApp"),
+}
+_ASR_HOTWORD_MAX_CHARS = 120  # context 字符上限:官方无硬限,防 partial 每 ~700ms 重解码 prefill 变贵
+
+
+def _is_digit_dominant(token: str) -> bool:
+    digits = sum(ch.isdigit() for ch in token)
+    return digits > 0 and digits * 2 >= len(token)
+
+
+def asr_hotword_context(lang: str, object_card: dict | None) -> str:
+    """组装 ASR 热词 context(纯函数,单测用)。
+
+    静态行业词按通话语言取表(未知语言回退粤语表=A 线默认);对象文字字段
+    (courier/contact_channel)追加——平台/物流专名正係误听高发类。数字主导
+    token 丢弃、去重(大小写不敏感)、总长超限逐词回填唔截半词。格式对齐官方
+    模型卡示例「Vocabulary: w1, w2, …」。BOK_ASR_HOTWORDS=0 → 空串(唔下发)。
+    """
+    if os.environ.get("BOK_ASR_HOTWORDS", "1") != "1":
+        return ""
+    key = (lang or "").strip().lower()
+    words: list[str] = []
+    seen: set[str] = set()
+
+    def _add(tok: str) -> None:
+        tok = tok.strip()
+        if not tok or tok.lower() in seen or _is_digit_dominant(tok):
+            return
+        seen.add(tok.lower())
+        words.append(tok)
+
+    for w in _ASR_HOTWORDS.get(key) or _ASR_HOTWORDS["cantonese"]:
+        _add(w)
+    oc = object_card or {}
+    for field in ("courier", "contact_channel"):
+        try:
+            _add(str(oc.get(field) or ""))
+        except Exception:  # pragma: no cover - 对象字段异常回退纯静态表
+            pass
+    if not words:
+        return ""
+    prefix = "Vocabulary: "
+    if len(prefix) + len(", ".join(words)) > _ASR_HOTWORD_MAX_CHARS:
+        kept: list[str] = []
+        total = len(prefix)
+        for w in words:
+            add = len(w) + (2 if kept else 0)
+            if total + add > _ASR_HOTWORD_MAX_CHARS:
+                break
+            kept.append(w)
+            total += add
+        words = kept
+        if not words:
+            return ""
+    return prefix + ", ".join(words)
+
+
 _ECHO_SIM_RATIO = 0.9
 _ECHO_MIN_CHARS = 6
 
@@ -1102,6 +1169,9 @@ async def entrypoint(ctx):
                 language_state=asr_language_state,
                 # A 线恒全钉（同传式）：zh 也下发 Chinese hint，不吃 auto 漂移。
                 pin_language=True,
+                # 热词 context：话术领域词 + 对象文字字段（官方 system message
+                # 软偏置），随 /api/start 下发。BOK_ASR_HOTWORDS=0 回退。
+                hotword_context=asr_hotword_context(asr_pin_lang, object_card),
             )
         )
         if not use_sherpa and os.environ.get("QWEN3_ASR_STREAM", "1") == "1":
