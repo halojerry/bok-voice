@@ -41,7 +41,11 @@ def frame_rms(pcm: bytes) -> float:
     return math.sqrt(sum(x * x for x in frames) / n)
 
 
-def read_wav_pcm(path: Path, max_seconds: float = 600.0) -> tuple[bytes, int]:
+def read_wav_pcm(path: Path, max_seconds: float = 4.5) -> tuple[bytes, int]:
+    """默认截前 4.5s——fixtures 是 2 分钟长音频（e20ed7a 起），整条推完一条要
+    137s（0.55× 实时 pacing），E3「~45s 长输入」会变成 42 分钟、E4 打断窗口
+    （40s）结构性必超时（2026-09-09 E4 两连 FAIL 根因：测试推流 bug，非产品）。
+    barge-in/trilingual 同款 fixture 一直截 4.0s 读，所以照常绿。"""
     with wave.open(str(path), "rb") as w:
         sr = w.getframerate()
         n = int(min(w.getnframes(), sr * max_seconds))
@@ -265,6 +269,26 @@ async def main() -> int:
     status = alive.json().get("status", "")
     n_after = turns_count(call_id)
     record("E5 连续短应承通话存活且有轮", status == "active" and n_after >= n_before, f"status={status} turns {n_before}->{n_after}")
+
+    # E5b 相邻 LLM 回复禁逐字复读（推进轮复读前轮话术块回归，call-feaf914c 实证）
+    import difflib
+
+    def _norm_rep(t: str) -> str:
+        return "".join(ch for ch in (t or "") if ch.isalnum())
+
+    rows = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", timeout=10).json()
+    llm_replies = [
+        _norm_rep(t.get("transcript") or "")
+        for t in rows
+        if t.get("role") == "assistant" and (t.get("latency_ms") or 0) > 0
+    ]
+    llm_replies = [t for t in llm_replies if len(t) >= 8]
+    dup = [
+        (a[:20], b[:20], round(ratio, 2))
+        for a, b in zip(llm_replies, llm_replies[1:])
+        if (ratio := difflib.SequenceMatcher(None, a, b).ratio()) >= 0.9
+    ]
+    record("E5b 相邻LLM回复不逐字复读", len(dup) == 0, f"llm_replies={len(llm_replies)} dup={dup[:2]}")
     await room.disconnect()
     try:
         httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/hangup", timeout=10)
