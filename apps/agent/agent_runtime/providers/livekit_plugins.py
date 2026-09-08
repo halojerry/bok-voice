@@ -9,6 +9,7 @@ import os
 import re
 import time
 import unicodedata
+import weakref
 from dataclasses import dataclass
 
 import httpx
@@ -3519,6 +3520,7 @@ class Qwen3ASRSTT(stt.STT):
         base_url: str = "http://127.0.0.1:8787",
         language_state: LanguageState | None = None,
         pin_language: bool = False,
+        hotword_context: str = "",
     ):
         super().__init__(
             capabilities=stt.STTCapabilities(
@@ -3536,6 +3538,12 @@ class Qwen3ASRSTT(stt.STT):
         # True=语言钉死(同传:源语言是用户建房时选定的,zh/en/cantonese 都下发 hint);
         # False=通话模式(只有 cantonese 钉防误判,zh/en 交 auto 容忍夹语 code-switching)。
         self._pin_language = pin_language
+        # 热词/context(Qwen3-ASR 官方 customizable context = system message 词汇表
+        # 软偏置):每通对话装配一次,随 /api/start 下发,session 级透传每次解码。
+        self._hotword_context = str(hotword_context or "").strip()
+        # 会话级 partial 解码间隔档(GPU 竞态专项):agent 回复生成/播报中抬高,
+        # listening 恢复 None=env 默认。getattr 鸭型访问,勿删(测试 fake 无此属性)。
+        self._partial_ms_override: int | None = None
 
     def stream(self, *, language=None, conn_options=None):
         return _Qwen3ASRStream(self, conn_options or APIConnectOptions())
@@ -3610,10 +3618,16 @@ class _Qwen3ASRStream(stt.RecognizeStream):
         for attempt in range(3):
             try:
                 async with httpx.AsyncClient(timeout=30) as client:
-                    params = {"session_id": ""} if lang_hint else None
+                    # start 参数:language hint + 热词 context(都有先例可空,空则不下发;
+                    # getattr 鸭型访问——测试 fake 与旧设置面无此属性时等同空)
+                    start_params: dict[str, str] = {}
+                    if lang_hint:
+                        start_params["language"] = lang_hint
+                    if getattr(self._stt_, "_hotword_context", ""):
+                        start_params["context"] = self._stt_._hotword_context
                     start = await client.post(
                         f"{self._stt_._base_url}/api/start",
-                        params={"language": lang_hint} if lang_hint else None,
+                        params=start_params or None,
                     )
                     start.raise_for_status()
                     session_id = start.json()["session_id"]
@@ -3785,14 +3799,15 @@ def _join_norm_digits(text: str) -> str:
 
 
 def _join_worthy(text: str) -> bool:
-    """续接可能句:归一后有 ≥2 位数字、或以系词收尾(係/系/是/is)——正正係被句级门
-    (_has_latin_or_digit_run)有意排除嗰批句;普通陈述句零加迟。"""
+    """续接可能句:归一后有 ≥2 位数字(汉字数字/英文数字词都算,号码/价格/日期常见)、
+    或以系词收尾(係/系/是/is,英文只认独立词)。呢类句每轮多等一个 hold 窗;
+    其余普通陈述句零加迟。"""
     t = (text or "").strip()
     if not t:
         return False
     if len(_join_norm_digits(t)) >= 2:
         return True
-    return bool(re.search(r"(?:係|系|是|is)\s*[。，,．.！!？?～~]*$", t, re.IGNORECASE))
+    return bool(re.search(r"(?:係|系|是|\bis\b)\s*[。，,．.！!？?～~]*$", t, re.IGNORECASE))
 
 
 def _has_latin_or_digit_run(text: str, min_len: int = 2) -> bool:
@@ -3857,6 +3872,10 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         # 跨段拼接 hold 状态(join_worthy 句等续段;唔入 _reset——段间记忆係佢嘅存在意义):
         self._join_hold_active = False
         self._join_task: asyncio.Task | None = None
+        # sidecar 会话纪元:每次 _start_session 成功 +1。hold 超时 flush 凭佢识别
+        # 「finish 等待期间客户已续讲、新会话已开」——咁就唔可以 reset 新会话状态
+        # (否则续讲段 partial/_session_id 被清,整轮无 FINAL,2026-09-07 审查实证)。
+        self._session_epoch = 0
 
     async def _run(self) -> None:
         vad_stream = self._vad.stream()
@@ -3897,7 +3916,7 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                     # 唔 finish、唔 reset:sidecar session 续命,下一段音频继续入同一
                     # 会话(partial 继续滚),真正停嘴嗰刻一条 FINAL 覆盖全段——下游
                     # flow/侦测/LLM/KV-cache 全部只见单一轮。超时冇续段 → _hold_flush
-                    # 走正常停嘴路径(该轮多等 HOLD_MS,只影响号码句)。0=回退同旧。
+                    # 走正常停嘴路径(该轮多等 HOLD_MS——含数字/系词句都算,唔止号码句)。0=回退同旧。
                     if self._join_hold_active:
                         # hold 中又嚟 EOS(冇 START 嘅边路)→ 当真停嘴,取消 flush 落埋正常路径。
                         self._cancel_join_hold()
@@ -3974,10 +3993,6 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
             # 流关闭时撤掉 hold flush,唔好留孤儿任务向已死 event_ch 发事件。
             self._cancel_join_hold()
 
-    def _join_worthy_now(self) -> bool:
-        text = (self._last_partial or "").strip()
-        return bool(text) and _join_worthy(text)
-
     def _cancel_join_hold(self) -> None:
         self._join_hold_active = False
         task = self._join_task
@@ -3994,6 +4009,7 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
             return
         self._join_hold_active = False
         self._join_task = None
+        _epoch_at_hold = self._session_epoch
         self._finishing = True
         speech_end_time = time.time()
         self._event_ch.send_nowait(
@@ -4002,10 +4018,15 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         text, lang = await self._finish_session()
         committed_before = self._committed_text
         payload = self._uncommitted(text) if (text and committed_before) else text
-        if committed_before and payload and len(payload) < _ASR_SENTENCE_MIN_CHARS:
+        # 与 _run 正常 EOS 分支同一套短尾规则:带内容短尾(数字/字母/实词)豁免照发
+        # ——「六四三二」补报号码好过吞掉(2026-09-07 审查:hold 路漏抄豁免)。
+        if committed_before and payload and len(payload) < _ASR_SENTENCE_MIN_CHARS and not _tail_carries_content(payload):
             payload = ""
         self._finishing = False
-        self._reset()
+        if self._session_epoch == _epoch_at_hold:
+            self._reset()
+        # else: finish 等待期间 START 已开新 sidecar 会话——新会话状态属续讲段照常
+        # 滚动,本 flush 只负责把上一段 FINAL 发出(纪元守卫,防成轮转写被清)。
         if payload:
             self._stt_._language_state.update(lang, payload)
             self._event_ch.send_nowait(
@@ -4019,17 +4040,45 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
 
     async def _start_session(self) -> None:
         lang_hint = _asr_language_hint(self._stt_._language_state.lang, self._stt_._pin_language)
+        # start 参数:language hint + 热词 context(同 offline 路径,空则不下发;
+        # getattr 鸭型访问——测试 fake 无此属性时等同空)+ partial 间隔档
+        # (agent 生成中抑制,GPU 竞态专项;None=不下发用 env 默认)。
+        start_params: dict[str, str] = {}
+        if lang_hint:
+            start_params["language"] = lang_hint
+        if getattr(self._stt_, "_hotword_context", ""):
+            start_params["context"] = self._stt_._hotword_context
+        _pm = getattr(self._stt_, "_partial_ms_override", None)
+        if _pm:
+            start_params["partial_ms"] = str(int(_pm))
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.post(
                     f"{self._stt_._base_url}/api/start",
-                    params={"language": lang_hint} if lang_hint else None,
+                    params=start_params or None,
                 )
                 r.raise_for_status()
                 self._session_id = r.json()["session_id"]
+                self._session_epoch += 1
         except Exception as exc:  # noqa: BLE001 - 建会话失败 → 整句路径照样可用
             self._session_id = None
             print(f"QWEN3_ASR_PARTIAL start failed: {exc!r}", flush=True)
+
+    async def _apply_partial_ms(self, ms: int | None) -> None:
+        """已开的 sidecar 会话即时调 partial 档(生成中抑制/listening 恢复)。
+
+        无开会话时静默跳过——下个 _start_session 会带上 override。
+        """
+        if not self._session_id:
+            return
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                await client.post(
+                    f"{self._stt_._base_url}/api/partial_ms",
+                    params={"session_id": self._session_id, "ms": str(int(ms)) if ms else ""},
+                )
+        except Exception as exc:  # noqa: BLE001 - 调档失败不影响转写主链路
+            print(f"QWEN3_ASR_PARTIAL tune failed: {exc!r}", flush=True)
 
     async def _maybe_partial(self) -> None:
         now = time.monotonic()
@@ -4336,6 +4385,9 @@ class Qwen3ASRLiveSTT(stt.STT):
         self._vad = vad_
         self._stt = stt_
         stt_.on("metrics_collected", self._on_metrics_collected)
+        # 在活流追踪(GPU 竞态专项):set_partial_ms 要即时转发到当前 stream 的
+        # 开会话;WeakSet 随流 GC 自动清理,勿改强引用。
+        self._live_streams: weakref.WeakSet = weakref.WeakSet()
 
     @property
     def model(self) -> str:
@@ -4352,4 +4404,19 @@ class Qwen3ASRLiveSTT(stt.STT):
         return await self._stt.recognize(buffer=buffer, language=language, conn_options=conn_options)
 
     def stream(self, *, language=None, conn_options=None):
-        return _Qwen3ASRLiveStream(self._stt, vad=self._vad, conn_options=conn_options or APIConnectOptions())
+        s = _Qwen3ASRLiveStream(self._stt, vad=self._vad, conn_options=conn_options or APIConnectOptions())
+        self._live_streams.add(s)
+        return s
+
+    def set_partial_ms(self, ms: int | None) -> None:
+        """会话级 partial 解码档(GPU 竞态专项,同步入口,事件钩子直接调)。
+
+        记 override 给下个会话;在活流已开的 sidecar 会话用 ensure_future 即时
+        调档——事件回调喺 event loop 线程,无 loop 时(纯单测)静默跳过转发。
+        """
+        self._stt._partial_ms_override = ms
+        for s in list(self._live_streams):
+            try:
+                asyncio.ensure_future(s._apply_partial_ms(ms))
+            except RuntimeError:
+                pass

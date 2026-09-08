@@ -929,6 +929,8 @@ def test_join_worthy_gate():
     assert _join_worthy("我喺淘寶買嘢。") is False
     assert _join_worthy("好，唔该晒你。") is False
     assert _join_worthy("") is False
+    # 英文 is 要词边界:句尾 -is 词(this/analysis)唔係系词,唔好误扣 hold 窗
+    assert _join_worthy("Let me confirm this.") is False
 
 
 def test_join_norm_digits_cjk_fullwidth_en():
@@ -1087,6 +1089,136 @@ def test_join_hold_cancelled_by_new_speech(monkeypatch):
         stream._event_ch.close()
 
     asyncio.run(scenario())
+
+
+def test_join_hold_timeout_flush_keeps_content_digit_tail(monkeypatch):
+    """hold 超时 flush 与正常停嘴同一套短尾规则:带内容短尾(数字尾「六四三二」)
+    豁免照发——吞号码尾=复活 #18 修过的「第二句被吞」(2026-09-07 审查)。"""
+    _join_gates(monkeypatch)
+    _FakeClient.finish_body = {"text": "我的WhatsApp是。六四三二", "language": "cantonese"}
+
+    async def scenario():
+        stream = _make_stream()
+        stream._metrics_task.cancel()
+        stream._committed_text = "我的WhatsApp是。"  # 模拟句级已提交前半句
+        stream._vad = _join_vad_events(stream, hold_then_continue=False)
+        stream._pending = bytearray(b"\x00\x00")
+        await asyncio.wait_for(stream._task, 3)
+        events = []
+        while True:
+            try:
+                e = stream._event_ch.recv_nowait()
+                events.append((e.type.name, e.alternatives[0].text if e.alternatives else ""))
+            except (ChanEmpty, ChanClosed):
+                break
+        stream._event_ch.close()
+        await asyncio.gather(stream._metrics_task, return_exceptions=True)
+        return events
+
+    events = asyncio.run(scenario())
+    finals = [t for (n, t) in events if n == "FINAL_TRANSCRIPT"]
+    assert finals == ["六四三二"], events
+
+
+def test_join_hold_flush_does_not_clobber_new_session(monkeypatch):
+    """竞态回归:flush 喺 /api/finish 等待期间客户续讲(新 START→新 session),
+    flush 完成后唔可以 reset 新会话状态——否则续讲段整轮无 FINAL(2026-09-07 审查)。"""
+    _join_gates(monkeypatch)
+
+    class _BlockingClient:
+        release = asyncio.Event()
+        bodies = [
+            {"text": "我的WhatsApp是。", "language": "cantonese"},
+            {"text": "多謝你啊。", "language": "cantonese"},
+        ]
+
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, params=None, content=None, headers=None):
+            if url.endswith("/api/start"):
+                return _FakeResp({"session_id": "sid-b"})
+            await _BlockingClient.release.wait()
+            return _FakeResp(_BlockingClient.bodies.pop(0))
+
+    monkeypatch.setattr(lp, "httpx", types.SimpleNamespace(AsyncClient=_BlockingClient))
+
+    def make_vad(stream):
+        class _S:
+            def __init__(self):
+                self._ref, self._n = stream, 0
+
+            def flush(self):
+                pass
+
+            def end_input(self):
+                pass
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                self._n += 1
+                start = types.SimpleNamespace(
+                    type=lp.vad.VADEventType.START_OF_SPEECH,
+                    speech_duration=0.0, silence_duration=0.0, inference_duration=0.0,
+                    probability=1.0, speaking=True, frames=[],
+                )
+                end = types.SimpleNamespace(
+                    type=lp.vad.VADEventType.END_OF_SPEECH,
+                    speech_duration=2.0, silence_duration=0.5, inference_duration=0.05,
+                    probability=0.0, speaking=False, frames=[],
+                )
+                if self._n == 1:
+                    return start
+                if self._n == 2:
+                    self._ref._last_partial = "我的WhatsApp是。"  # join-worthy → hold
+                    return end
+                if self._n == 3:
+                    # 等 flush 开火并阻塞喺 /api/finish,然后续讲 START(新 session)
+                    await asyncio.sleep(_join_hold_s() + 0.05)
+                    self._ref._last_partial = "多謝你啊。"
+                    return start
+                if self._n == 4:
+                    _BlockingClient.release.set()  # 放行 flush;恢复后应跳过 reset
+                    await asyncio.sleep(0.1)
+                    return end  # 续讲段真停嘴
+                self._ref._input_ch.close()
+                raise StopAsyncIteration
+
+        class _V:
+            def stream(self):
+                return _S()
+
+        return _V()
+
+    async def scenario():
+        stream = _make_stream()
+        stream._metrics_task.cancel()
+        stream._vad = make_vad(stream)
+        stream._pending = bytearray(b"\x00\x00")
+        await asyncio.wait_for(stream._task, 5)
+        events = []
+        while True:
+            try:
+                e = stream._event_ch.recv_nowait()
+                events.append((e.type.name, e.alternatives[0].text if e.alternatives else ""))
+            except (ChanEmpty, ChanClosed):
+                break
+        stream._event_ch.close()
+        await asyncio.gather(stream._metrics_task, return_exceptions=True)
+        return events
+
+    events = asyncio.run(scenario())
+    finals = [t for (n, t) in events if n == "FINAL_TRANSCRIPT"]
+    # 两条 FINAL=旧段 flush 出一条、续讲段停嘴出一条(续讲段状态冇被 reset 清走)
+    assert finals == ["我的WhatsApp是。", "多謝你啊。"], events
 
 
 def test_vad_pause_punct_path_fragment_also_gated(monkeypatch):

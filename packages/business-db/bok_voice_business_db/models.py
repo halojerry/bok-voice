@@ -70,6 +70,9 @@ class ConversationTemplate(Base):
     # 分步话术:JSON 数组 [{"goal": "这一步要达成的目标", "ref": "参考说法(可含 {变量})"}, ...]。
     # 由 agent 每轮按步骤推进,LLM 结合客户回复只回应当前步。opening/core 四段保留兼容。
     steps_json: Mapped[str] = mapped_column(Text, default="")
+    # 本套话术专属 ASR 热词(2026-09-08):逗号/顿号/分号/换行分隔,随会话装配并入
+    # asr_hotword_context 下发 /api/start context(数字主导词会被过滤,防幻听号码)。
+    hotwords: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 

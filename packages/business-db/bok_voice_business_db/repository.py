@@ -327,6 +327,7 @@ class SqlAlchemyBusinessRepository:
             tone_override=data.get("tone_override", ""),
             language=data.get("language", "zh"),
             steps_json=data.get("steps_json", ""),
+            hotwords=data.get("hotwords", ""),
         )
         self.session.add(tpl)
         self.session.commit()
@@ -340,7 +341,7 @@ class SqlAlchemyBusinessRepository:
         tpl = self.session.get(models.ConversationTemplate, template_id)
         if not tpl:
             return None
-        allowed = {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json"}
+        allowed = {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json", "hotwords"}
         for key, value in data.items():
             if key in allowed and hasattr(tpl, key):
                 setattr(tpl, key, value)
@@ -698,6 +699,7 @@ class InMemoryBusinessRepository:
             tone_override=data.get("tone_override", ""),
             language=data.get("language", "zh"),
             steps_json=data.get("steps_json", ""),
+            hotwords=data.get("hotwords", ""),
         ).__dict__
         self.templates[tpl["id"]] = tpl
         return tpl
@@ -708,7 +710,7 @@ class InMemoryBusinessRepository:
     def update_template(self, template_id: str, data: dict) -> dict | None:
         if template_id not in self.templates:
             return None
-        self.templates[template_id].update({k: v for k, v in data.items() if k in {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json"}})
+        self.templates[template_id].update({k: v for k, v in data.items() if k in {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json", "hotwords"}})
         return self.templates[template_id]
 
     def delete_template(self, template_id: str) -> bool:
