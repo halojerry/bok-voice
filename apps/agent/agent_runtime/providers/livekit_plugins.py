@@ -1718,6 +1718,35 @@ def _minimax_pool_schedule(endpoint: str, key: str) -> None:
     _MINIMAX_POOL_TASK = loop.create_task(_minimax_pool_replenish(endpoint, key))
 
 
+def _is_hotword_vocab_echo(text: str, hotword_context: str) -> bool:
+    """ASR 热词幻听判定(纯函数,单测用):极低内容音频把词表当转写整串抄出。
+
+    2026-09-08/09 实机两连回归(call-feaf914c/dd40727c):开场白期间客户没说话,
+    滑窗把「單號，運單，賠償…」词表顺串解成转写,字幕/轮次全被污染。判定:
+    转写剥标点后**完全由词表词首尾相接组成**(贪心最长匹配全覆盖)且总长 ≥6
+    ——真实用户话必有虚词/数字/词表外内容,不可能恰好全是词表词的顺串。
+    STT 源头(字幕/句级提交/停嘴 FINAL)与 agent hook 双层共用本判定。
+    """
+    norm = re.sub(r"[^\w\u4e00-\u9fff]+", "", str(text or ""))
+    if len(norm) < 6 or not hotword_context:
+        return False
+    words: set[str] = set()
+    for piece in re.split(r"[,，、;；\s]+", str(hotword_context)):
+        piece = piece.replace("Vocabulary:", "").replace("Vocabulary：", "").strip()
+        piece = re.sub(r"[^\w\u4e00-\u9fff]+", "", piece)
+        if piece:
+            words.add(piece)
+    if not words:
+        return False
+    remaining = norm
+    while remaining:
+        hit = next((w for w in sorted(words, key=len, reverse=True) if w and remaining.startswith(w)), None)
+        if hit is None:
+            return False  # 有一段唔係词表词 → 真人话,唔拦
+        remaining = remaining[len(hit):]
+    return True
+
+
 def _trim_lead_silence(
     pcm: bytes,
     sample_rate: int,
@@ -3781,6 +3810,15 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         # (否则续讲段 partial/_session_id 被清,整轮无 FINAL,2026-09-07 审查实证)。
         self._session_epoch = 0
 
+    def _vocab_echo(self, text: str) -> bool:
+        """热词幻听判定(源头闸):词表被当转写整串抄出 → True,调用方丢弃该事件。
+
+        QWEN3_HOTWORD_ECHO_GUARD=0 回退。词表与 STT context 同一份(_hotword_context)。
+        """
+        if os.environ.get("QWEN3_HOTWORD_ECHO_GUARD", "1") != "1":
+            return False
+        return _is_hotword_vocab_echo(text, getattr(self._stt_, "_hotword_context", "") or "")
+
     async def _run(self) -> None:
         vad_stream = self._vad.stream()
 
@@ -3878,6 +3916,9 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                     # 号码/答复（「说两句第二句被吞→AI 不回话」的根因）。
                     if committed_before and payload and len(payload) < _ASR_SENTENCE_MIN_CHARS and not _tail_carries_content(payload):
                         payload = ""
+                    if payload and self._vocab_echo(payload):
+                        print(f"QWEN3_HOTWORD_ECHO_DROP src=stop-mouth payload={payload!r}", flush=True)
+                        payload = ""
                     started = False
                     self._finishing = False
                     self._reset()
@@ -3925,6 +3966,9 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         # 与 _run 正常 EOS 分支同一套短尾规则:带内容短尾(数字/字母/实词)豁免照发
         # ——「六四三二」补报号码好过吞掉(2026-09-07 审查:hold 路漏抄豁免)。
         if committed_before and payload and len(payload) < _ASR_SENTENCE_MIN_CHARS and not _tail_carries_content(payload):
+            payload = ""
+        if payload and self._vocab_echo(payload):
+            print(f"QWEN3_HOTWORD_ECHO_DROP src=join-flush payload={payload!r}", flush=True)
             payload = ""
         self._finishing = False
         if self._session_epoch == _epoch_at_hold:
@@ -4043,7 +4087,7 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                 self._prev_partial = text  # 参照窗照常推进（与 _last_partial 同步）
                 # 字幕续流：只发未提交剩余（框架 _audio_transcript 已含已提交句）。
                 remainder = self._uncommitted(text)
-                if remainder:
+                if remainder and not self._vocab_echo(remainder):
                     self._event_ch.send_nowait(
                         stt.SpeechEvent(
                             type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
@@ -4055,6 +4099,9 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         # INTERIM：滑窗剩余文本（句级提交后坐标系=未提交尾巴，可能跳变，只供展示）
         display = self._uncommitted(text)
         if not display:
+            return
+        if self._vocab_echo(display):
+            print(f"QWEN3_HOTWORD_ECHO_DROP src=interim text={display!r}", flush=True)
             return
         self._event_ch.send_nowait(
             stt.SpeechEvent(
@@ -4098,6 +4145,10 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         拉不走会话语言）。只发 FINAL——句末 END_OF_SPEECH 由调用方按各自契约补
         （partial 标点路径紧随发 EOS；vad-pause 路径后面本就有停嘴 EOS，不重复发）。
         """
+        if self._vocab_echo(sentence):
+            # 词表幻听顺串:丢弃,不记账不发 FINAL(字幕/轮次/脑全链路不污染)
+            print(f"QWEN3_HOTWORD_ECHO_DROP src={source} sentence={sentence!r}", flush=True)
+            return
         self._committed_text += sentence
         self._last_sentence = sentence
         self._commit_idx = end_idx

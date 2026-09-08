@@ -501,34 +501,8 @@ def _hotword_echo_guard_enabled() -> bool:
     return os.environ.get("QWEN3_HOTWORD_ECHO_GUARD", "1") == "1"
 
 
-def _is_hotword_echo(text: str, hotword_context: str) -> bool:
-    """ASR 热词幻听守卫(纯函数,单测用):极低内容音频把词表当转写整串抄出。
-
-    2026-09-08 实机回归(call-feaf914c 首轮「單號，運單，賠償…」=词表顺串,
-    客户根本没说话)。判定:转写剥标点后**完全由词表词首尾相接组成**(贪心
-    最长匹配全覆盖)且总长 ≥6——真实用户话必有虚词/数字/词表外内容,不可能
-    恰好全是词表词的顺串。
-    """
-    import re as _re
-
-    norm = _re.sub(r"[^\w\u4e00-\u9fff]+", "", str(text or ""))
-    if len(norm) < 6 or not hotword_context:
-        return False
-    words: set[str] = set()
-    for piece in _re.split(r"[,，、;；\s]+", str(hotword_context)):
-        piece = piece.replace("Vocabulary:", "").replace("Vocabulary：", "").strip()
-        piece = _re.sub(r"[^\w\u4e00-\u9fff]+", "", piece)
-        if piece:
-            words.add(piece)
-    if not words:
-        return False
-    remaining = norm
-    while remaining:
-        hit = next((w for w in sorted(words, key=len, reverse=True) if w and remaining.startswith(w)), None)
-        if hit is None:
-            return False  # 有一段唔係词表词 → 真人话,唔拦
-        remaining = remaining[len(hit):]
-    return True
+# 幻听判定单一实现喺 livekit_plugins(STT 源头闸与 hook 双层共用,防漂移)。
+from .providers.livekit_plugins import _is_hotword_vocab_echo as _is_hotword_echo  # noqa: E402
 
 
 def _is_echo_self_heard(user_text: str, last_reply: str, agent_speaking: bool) -> bool:
