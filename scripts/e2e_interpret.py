@@ -205,8 +205,10 @@ async def run_one(name: str, src_pcm: bytes, rev_pcm: bytes | None, timeout_s: f
 
 
 async def main() -> int:
-    zh_pcm = read_wav_pcm(AUDIO_DIR / "zh.wav")
-    en_pcm = read_wav_pcm(AUDIO_DIR / "en.wav")
+    # 单句切片(~8s):135s 全长直推会把一轮拖成 ~108s(0.1s 音频/0.08s sleep 节奏),
+    # 双向+启停×3 全套变 10 分钟级;断句稳定性归 I4 长流专门验。
+    zh_pcm = read_wav_pcm(AUDIO_DIR / "zh.wav")[: int(16000 * 8) * 2]
+    en_pcm = read_wav_pcm(AUDIO_DIR / "en.wav")[: int(16000 * 8) * 2]
     long_pcm = read_wav_pcm(AUDIO_DIR / "zh.wav") + b"".join(
         read_wav_pcm(AUDIO_DIR / "zh.wav") for _ in range(8)
     )
@@ -215,10 +217,13 @@ async def main() -> int:
     info = await run_one("dual", zh_pcm, en_pcm)
     record("I1 fwd: me(zh)→other 听到英文输出", info["fwd_ok"], info["fwd_text"])
     record("I2 rev: other(en)→me 听到中文输出", info["rev_ok"], info["rev_text"])
-    # turns 双语落库
+    # turns 双语落库(2026-09-07 审计闭环起原文/译文拆成两条,language 字段区分
+    # ——旧断言查单行同含「原文：译文：」会永久假红)
     turns = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{info['call_id']}/turns", timeout=10).json()
-    bilingual = [t for t in turns if "原文：" in (t.get("transcript") or "") and "译文：" in (t.get("transcript") or "")]
-    record("I1b turns 双语落库", len(bilingual) >= 1, f"bilingual_rows={len(bilingual)} turns={len(turns)}")
+    orig = [t for t in turns if str(t.get("transcript") or "").startswith("原文：")]
+    tran = [t for t in turns if str(t.get("transcript") or "").startswith("译文：")]
+    record("I1b turns 原文/译文分行落库", len(orig) >= 1 and len(tran) >= 1,
+           f"orig={len(orig)} tran={len(tran)} turns={len(turns)}")
 
     # I3 连续启停 ×3
     ok_all = True
