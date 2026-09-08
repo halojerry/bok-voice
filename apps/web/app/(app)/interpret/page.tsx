@@ -303,11 +303,11 @@ export default function InterpretPage() {
           </p>
         </section>
         <section className="card flex flex-col gap-4 md:col-span-2">
-          <span className="label">坐席一体台 · 同机双设备组</span>
+          <span className="label">坐席一体台 · 单页双通道</span>
           <p className="text-xs leading-relaxed text-[var(--stage-muted)]">
-            我方与对象在同一台电脑前、各用一副耳机麦：一个控制台同时接入本会话两端，各自独立选
-            麦克风/扬声器（双输出独立路由），中间一条双语字幕，全程一人操作。需桌面 Chrome
-            （Chromium setSinkId 双输出）。
+            两人同机各一支麦：一个页面同时接入本会话两端，我方与对方的译文都从同一个扬声器出声
+            （默认共享输出，Mac/Windows 任何内核可用），同页看双向原文+译文字幕；译文播报时自动
+            暂让对向麦克风防串译。两人各戴耳机分路听（独立双输出）为高级选项，需桌面 Chrome。
           </p>
           <button className="stage-btn-primary md:w-fit" disabled={busy} onClick={startConsole}>
             创建一体台会话
