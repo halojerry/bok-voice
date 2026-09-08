@@ -1413,13 +1413,32 @@ def cmd_prod(cmd: str) -> int:
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="bok", description="Bok voice stack launcher (no Docker)")
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("catalog", "manifest", "download", "status", "up", "serve", "down", "doctor"):
+    for name in ("catalog", "manifest", "download", "status", "up", "serve", "down", "doctor", "tts-pregen"):
         sub.add_parser(name)
     p_prod = sub.add_parser("prod", help="生产常驻单元与健康面")
     p_prod.add_argument("action", nargs="?", default="status", choices=["install", "status"])
     p_setup = sub.add_parser("setup", help="First-run model readiness / download")
     p_setup.add_argument("action", nargs="?", default="status", choices=["status", "download"])
     return p.parse_args(argv)
+
+
+def cmd_tts_pregen() -> int:
+    """离线批量预合成 TTS 本地缓存(docs/superpowers/specs/2026-09-08-tts-cache-design.md)。
+
+    额外参数原样透传给 scripts/pregen_tts.py(--greetings/--objects/--cp/--model)。
+    子进程带仓库 PYTHONPATH 与 SSL_CERT_FILE(certifi)——venv 无系统 CA,
+    MiniMax WSS 无此必炸。
+    """
+    try:
+        idx = sys.argv.index("tts-pregen")
+    except ValueError:
+        return 2
+    extra = sys.argv[idx + 1:]
+    env = {"PYTHONPATH": _repo_pythonpath(), "PYTHONUNBUFFERED": "1"}
+    _bake_ssl_cert_file(env, repo_python())
+    cmd = [str(repo_python()), str(ROOT / "scripts" / "pregen_tts.py"), *extra]
+    proc = subprocess.run(cmd, env={**os.environ, **env})
+    return proc.returncode
 
 
 def main(argv=None) -> int:
@@ -1429,7 +1448,8 @@ def main(argv=None) -> int:
     if args.cmd == "prod":
         return cmd_prod(args.action)
     return {"catalog": cmd_catalog, "manifest": cmd_manifest, "download": cmd_download, "status": cmd_status,
-            "up": cmd_up, "serve": cmd_serve, "down": cmd_down, "doctor": cmd_doctor}[args.cmd]()
+            "up": cmd_up, "serve": cmd_serve, "down": cmd_down, "doctor": cmd_doctor,
+            "tts-pregen": cmd_tts_pregen}[args.cmd]()
 
 
 if __name__ == "__main__":
