@@ -3743,6 +3743,50 @@ def _join_worthy(text: str) -> bool:
     return bool(re.search(r"(?:係|系|是|\bis\b)\s*[。，,．.！!？?～~]*$", t, re.IGNORECASE))
 
 
+def _join_hold_vocab_enabled() -> bool:
+    """品牌/领域词防拆轮门(2026-09-09 S3 拼多多专项):partial 尾部是热词词表
+    某词的【严格前缀】(词可能未讲完)→ hold 停嘴窗等续段并单会话,整句高精度
+    解码——真实话音「京|東」微停顿把「京东」烂成「金东北」、「拼|多多」吞「拼」
+    (probe_brand_words 基线 10/16 实证)。词表与 ASR context 软偏置同一份
+    (模板 hotwords + 行业词 + 对象 courier/contact_channel),运营加词即生效。
+    QWEN3_ASR_JOIN_HOLD_VOCAB=0 关(回退纯数字/系词门)。"""
+    return os.environ.get("QWEN3_ASR_JOIN_HOLD_VOCAB", "1") == "1"
+
+
+def _parse_vocab_terms(hotword_ctx: str) -> tuple[str, ...]:
+    """从「Vocabulary: w1, w2, …」格式热词 context 反解词表(≥2 字词才有前缀信号)。"""
+    if not hotword_ctx:
+        return ()
+    raw = str(hotword_ctx).split("Vocabulary:", 1)[-1]
+    return tuple(
+        t.strip() for t in raw.split(",") if len(t.strip()) >= 2
+    )
+
+
+def _vocab_prefix_hold(text: str, terms) -> bool:
+    """partial 尾部是否词表某词的严格前缀。
+
+    CJK:剥标点连写串取长 1-3 后缀——「件货喺京」→ 京 ⊂ 京东 → True(词可能被
+    停顿拦腰);「查下單號」→ 號 唔係任何词开头 → False(词已完整,照常提交)。
+    latin:只认【末词】整词(what ⊂ WhatsApp)——不取 1-2 字尾,否则任何 t/wh
+    结尾的英文句都误扣 hold 窗。"""
+    raw = str(text or "")
+    if not raw:
+        return False
+    cjk = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", raw)
+    candidates: list[str] = [cjk[-n:] for n in (1, 2, 3) if len(cjk) >= n]
+    m = re.search(r"([A-Za-z][A-Za-z0-9']*)\s*[。，,．.！!？?～~]*$", raw)
+    if m:
+        candidates.append(m.group(1).lower())
+    for tail in candidates:
+        tl = tail.lower()
+        for term in terms:
+            t = str(term).lower()
+            if t.startswith(tl) and len(tl) < len(t):
+                return True
+    return False
+
+
 def _has_latin_or_digit_run(text: str, min_len: int = 2) -> bool:
     """句内含 ≥min_len 连续 ASCII 字母/数字 run(单号/WhatsApp 号码高危)。
 
@@ -3809,6 +3853,9 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         # 「finish 等待期间客户已续讲、新会话已开」——咁就唔可以 reset 新会话状态
         # (否则续讲段 partial/_session_id 被清,整轮无 FINAL,2026-09-07 审查实证)。
         self._session_epoch = 0
+        # join-hold 词表前缀门用的热词词表(与 context 软偏置同一份,流级缓存);
+        # fake/无 context → 空 tuple,门自动失效。
+        self._vocab_terms = _parse_vocab_terms(getattr(stt_, "_hotword_context", ""))
 
     def _vocab_echo(self, text: str) -> bool:
         """热词幻听判定(源头闸):词表被当转写整串抄出 → True,调用方丢弃该事件。
@@ -3859,15 +3906,32 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                     # 会话(partial 继续滚),真正停嘴嗰刻一条 FINAL 覆盖全段——下游
                     # flow/侦测/LLM/KV-cache 全部只见单一轮。超时冇续段 → _hold_flush
                     # 走正常停嘴路径(该轮多等 HOLD_MS——含数字/系词句都算,唔止号码句)。0=回退同旧。
+                    _vocab_hit = False
+                    _join_hit = False
                     if self._join_hold_active:
                         # hold 中又嚟 EOS(冇 START 嘅边路)→ 当真停嘴,取消 flush 落埋正常路径。
                         self._cancel_join_hold()
-                    elif _join_hold_s() > 0 and (self._last_partial or "").strip() and _join_worthy(self._last_partial):
+                    else:
+                        _vocab_hit = (
+                            _join_hold_s() > 0
+                            and _join_hold_vocab_enabled()
+                            and bool(self._vocab_terms)
+                            and (self._last_partial or "").strip()
+                            and _vocab_prefix_hold(self._last_partial, self._vocab_terms)
+                        )
+                        _join_hit = (
+                            not _vocab_hit
+                            and _join_hold_s() > 0
+                            and (self._last_partial or "").strip()
+                            and _join_worthy(self._last_partial)
+                        )
+                    if _vocab_hit or _join_hit:
                         self._join_hold_active = True
                         self._finishing = False  # hold 期间 partial 继续滚(INFERENCE_DONE 唔 skip)
                         self._join_task = asyncio.create_task(self._hold_flush())
                         print(
-                            f"QWEN3_ASR_JOIN_HOLD chars={len(self._last_partial)} "
+                            f"QWEN3_ASR_JOIN_HOLD src={'vocab' if _vocab_hit else 'digits/copula'} "
+                            f"chars={len(self._last_partial)} "
                             f"hold_ms={int(_join_hold_s() * 1000)}",
                             flush=True,
                         )

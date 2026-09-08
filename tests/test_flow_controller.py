@@ -147,8 +147,9 @@ def test_fact_confirm_advances_flow_step():
     assert fc.current == 1
     cur = fc.current_step_text()
     assert "第 2/2 步" in cur
-    # 推进后注入「新一步」提示,提醒 LLM 换步(唔好延续旧承诺)。
-    assert "【新一步】" in cur and "不要延续上一步" in cur
+    # 推进后注入「新一步」提示,提醒 LLM 换步(唔好延续旧承诺);
+    # 2026-09-09 加复读禁令(推进轮逐字复读上轮=call-feaf914c 实证缺陷)。
+    assert "【新一步】" in cur and "不要延续上一步" in cur and "严禁逐字复读" in cur
 
 
 def test_not_confirm_stays_with_recall_guidance():
