@@ -147,7 +147,11 @@ WorkerOptions.port)——默认同为 8081 会竞态,后绑者 Errno 48 即崩
   —— 直接构造 `inference.VAD` 与打断开关（环境变量 `VAD_*` 仅作部署覆盖）。
   基线默认（2026-09-05 句号级提交落地后）：`min_silence_duration=0.45`、`min_speech_duration=0.15`；
   A 线 turn_detection=`stt`（STT 句末 END_OF_SPEECH 提交，句级 FINAL→EOS，说话中即提交，
-  数字串/短句/1.5s 限流保护），endpointing `min_delay=0.25`/`max_delay=0.6`。
+  数字串/短句/1.5s 限流保护；续接可能句——归一后 ≥2 位数字或系词收尾——会在句末被扣住
+  `QWEN3_ASR_JOIN_HOLD_MS`（默认 800，0=关）等续段并入同一 sidecar 会话、一条 FINAL
+  覆盖全段，超时由 flush 补发（该轮多等 ≤HOLD ms；flush 与正常停嘴同一套短尾规则并带
+  会话纪元守卫，finish 等待期续讲开新会话唔会被 reset 清轮）），
+  endpointing `min_delay=0.25`/`max_delay=0.6`。
   语言钉定 + 热词：每通对话语言钉死随 `/api/start?language=` 下发（Chinese/English/Cantonese
   规范名）；热词 context（官方 customizable context，system message 词汇表软偏置）随
   `/api/start?context=` 下发——话术领域词 + 对象文字字段（`BOK_ASR_HOTWORDS=0` /
