@@ -15,6 +15,7 @@ from .plugins.knowledge import KnowledgePlugin
 from .plugins.settlement import SettlementTrigger
 from .providers.registry import build_provider_registry
 from .control_plane import ControlPlaneClient
+from .fillers import FillerDirector
 from .tts_cache import CachedTTS, TtsAudioCache, default_cache_dir, frames_aiter, pcm_to_frames, tts_cache_enabled
 # 模块级引 flow(纯 stdlib 依赖,无环):_wa_numberish/_wa_number_line 等模块级
 # helper 用;entrypoint 内的 function-scoped import 属历史样式,不冲突。
@@ -1496,6 +1497,23 @@ async def entrypoint(ctx):
             _strip_expr_markup,
         ],
     )
+    # 垫话编排(PR-2):LLM 临场慢轮回复首音频 ~700ms 未到 → 播预合成应承语,
+    # 真回复出声即定向打断。arm/cancel 由 on_user_turn_completed 驱动;首音频
+    # 回调挂在 CachedTTS 透传层(未包缓存时挂不上,垫话自动失效——纯透传无回调)。
+    _filler = FillerDirector(
+        session,
+        tts_provider,
+        _tts_cache,
+        lang_resolver=lambda: language_state.lang if language_state.lang in ("zh", "cantonese", "en") else "zh",
+        guards=lambda: (
+            closed.is_set()
+            or agent.paused
+            or flow_ctrl.closing
+            or (flow_ctrl.has_steps and flow_ctrl.done)
+        ),
+    )
+    if isinstance(tts_provider, CachedTTS):
+        tts_provider.add_first_audio_listener(_filler.on_reply_first_audio)
     # 会话首轮真实前缀预热（LLM_PREFIX_PREWARM，默认 1）——触发点在开场白之后
     # （见下方 greeting 块），这里只定義任务体。
     if _prefix_prewarm_enabled() and isinstance(_raw_llm, MlxLlmLLM) and instructions:
@@ -1763,6 +1781,8 @@ async def entrypoint(ctx):
             _nudge_state["count"] = 0
             _nudge_state["last_user_ts"] = time.monotonic()
             _disarm_silence()
+            # 上一轮若有垫话定时器还挂着(真回复一直未出声、客户又开口),作废它。
+            _filler.cancel()
 
             # 抢跑×流程推进共存:框架喺 FINAL 到达时可能已按「旧步骤语境」抢跑生成
             # (preemptive 先于本钩子)。凡本轮实质改变回复语境(推进/收尾),
@@ -1966,6 +1986,10 @@ async def entrypoint(ctx):
                     except Exception:  # pragma: no cover - 历史保留失败不致命
                         pass
                 raise StopResponse()
+            # 走到这=本轮走 LLM 正常回复路径(话术直念/暂停/跳过都已在前面拦截)
+            # → 起垫话定时器:回复首音频 ~700ms 未到才播,快轮零打扰(closing/WA
+            # 步由开火前 guards 复核兜住)。
+            _filler.arm()
 
         async def on_user_turn_exceeded(self, ev):
             if self.paused:

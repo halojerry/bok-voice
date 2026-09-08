@@ -124,10 +124,11 @@ async def main_async() -> int:
     ap = argparse.ArgumentParser(description="TTS 本地缓存离线预合成")
     ap.add_argument("--greetings", action="store_true", help="无变量脚本线全量(兜底问候/心跳/收线/WA)")
     ap.add_argument("--objects", action="store_true", help="逐对象渲染开场白/收线/心跳并预合成")
+    ap.add_argument("--fillers", action="store_true", help="垫话短语库预合成(PR-2 垫话用,绝不运行时合成)")
     ap.add_argument("--cp", default=os.environ.get("BOK_CP_URL", "http://127.0.0.1:8000"))
     ap.add_argument("--model", default="", help="MINIMAX_MODEL 覆盖(默认 env/2.8-hd,须与运行时一致)")
     args = ap.parse_args()
-    if not (args.greetings or args.objects):
+    if not (args.greetings or args.objects or args.fillers):
         args.greetings = True
 
     if os.environ.get("MINIMAX_API_KEY", ""):
@@ -176,6 +177,13 @@ async def main_async() -> int:
                 jobs.append((lang, _farewell_line(name, lang)))
                 for i in range(3):
                     jobs.append((lang, _nudge_line(name, lang, i)))
+
+    if args.fillers:
+        from agent_runtime.fillers import filler_lines
+
+        for lang, lines in filler_lines().items():
+            for line in lines:
+                jobs.append((lang, line))
 
     # 去重(同文本同语言只合成一次;key 已含 voice,不同 lang 同 voice 也会分开算)
     seen: set[tuple[str, str]] = set()
