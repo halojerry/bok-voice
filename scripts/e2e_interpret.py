@@ -8,6 +8,7 @@ ASR 回读断言目标语 → turns 双语落库 → hangup → settle 蒸馏落
 场景：
   I1 fwd 主链路（me 说 zh → other 听 en）
   I2 rev 反向（other 说 en → me 听 zh）
+  I5/I6 中↔粤语言对（me 说 zh → other 听粤语；other 说粤 → me 听中文）
   I3 连续启停 ×3（worker 复用无崩）
   I4 长流 45s 连续讲话（断句稳定、有输出）
 
@@ -166,12 +167,21 @@ async def wait_translated(captured: bytearray, mark: int, want_tag: str, timeout
     return ok, lang, text
 
 
-async def run_one(name: str, src_pcm: bytes, rev_pcm: bytes | None, timeout_s: float = 75.0) -> dict:
+async def run_one(
+    src_pcm: bytes,
+    rev_pcm: bytes | None,
+    *,
+    language: str = "zh",
+    target_lang: str = "en",
+    fwd_expect: str = "English",
+    rev_expect: str = "Chinese",
+    timeout_s: float = 75.0,
+) -> dict:
     ts = int(time.time() * 1000) % 1000000
     call = httpx.post(
         f"{CONTROL_PLANE_URL}/api/calls",
         json={"account_id": "acc-001", "kind": "interpret", "mode": "live", "direction": "interpret",
-              "language": "zh", "target_lang": "en", "object_id": ""},
+              "language": language, "target_lang": target_lang, "object_id": ""},
         timeout=15,
     ).json()
     call_id = call["id"]
@@ -183,16 +193,16 @@ async def run_one(name: str, src_pcm: bytes, rev_pcm: bytes | None, timeout_s: f
     await asyncio.sleep(6)
     info = {"call_id": call_id, "fwd_ok": False, "fwd_text": "", "rev_ok": False, "rev_text": ""}
     try:
-        # fwd：me 说 zh → other 听 en
+        # fwd：me 说 {language} → other 听 {target_lang}（ASR 回读断言目标语标签）
         mark_other = len(other.captured)
         await me.push(src_pcm)
-        ok, lang, text = await wait_translated(other.captured, mark_other, "English", timeout_s)
+        ok, lang, text = await wait_translated(other.captured, mark_other, fwd_expect, timeout_s)
         info["fwd_ok"], info["fwd_text"] = ok, text[:60]
-        # rev：other 说 en → me 听 zh
+        # rev：other 说 {target_lang} → me 听 {language}
         if rev_pcm is not None:
             mark_me = len(me.captured)
             await other.push(rev_pcm)
-            ok2, lang2, text2 = await wait_translated(me.captured, mark_me, "Chinese", timeout_s)
+            ok2, lang2, text2 = await wait_translated(me.captured, mark_me, rev_expect, timeout_s)
             info["rev_ok"], info["rev_text"] = ok2, text2[:60]
     finally:
         await me.close()
@@ -209,12 +219,13 @@ async def main() -> int:
     # 双向+启停×3 全套变 10 分钟级;断句稳定性归 I4 长流专门验。
     zh_pcm = read_wav_pcm(AUDIO_DIR / "zh.wav")[: int(16000 * 8) * 2]
     en_pcm = read_wav_pcm(AUDIO_DIR / "en.wav")[: int(16000 * 8) * 2]
+    canto_pcm = read_wav_pcm(AUDIO_DIR / "cantonese.wav")[: int(16000 * 8) * 2]
     long_pcm = read_wav_pcm(AUDIO_DIR / "zh.wav") + b"".join(
         read_wav_pcm(AUDIO_DIR / "zh.wav") for _ in range(8)
     )
 
-    # I1+I2 fwd/rev 双向
-    info = await run_one("dual", zh_pcm, en_pcm)
+    # I1+I2 fwd/rev 双向（中↔英）
+    info = await run_one(zh_pcm, en_pcm)
     record("I1 fwd: me(zh)→other 听到英文输出", info["fwd_ok"], info["fwd_text"])
     record("I2 rev: other(en)→me 听到中文输出", info["rev_ok"], info["rev_text"])
     # turns 双语落库(2026-09-07 审计闭环起原文/译文拆成两条,language 字段区分
@@ -225,11 +236,24 @@ async def main() -> int:
     record("I1b turns 原文/译文分行落库", len(orig) >= 1 and len(tran) >= 1,
            f"orig={len(orig)} tran={len(tran)} turns={len(turns)}")
 
+    # I5+I6 第二语言对（中↔粤,2026-09-08 用户点名验证）：interpret.py 对 cantonese
+    # 有完整分支(ASR 钉定/港式 MT 规则/Cantonese 音色+language_boost),此前从未实测。
+    # 同一通里 fwd=中→粤、rev=粤→中,两个方向一次覆盖。
+    info_canto = await run_one(zh_pcm, canto_pcm, language="zh", target_lang="cantonese",
+                             fwd_expect="Cantonese", rev_expect="Chinese")
+    record("I5 fwd: me(zh)→other 听到粤语输出", info_canto["fwd_ok"], info_canto["fwd_text"])
+    record("I6 rev: other(粤)→me 听到中文输出", info_canto["rev_ok"], info_canto["rev_text"])
+    turns_c = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{info_canto['call_id']}/turns", timeout=10).json()
+    orig_c = [t for t in turns_c if str(t.get("transcript") or "").startswith("原文：")]
+    tran_c = [t for t in turns_c if str(t.get("transcript") or "").startswith("译文：")]
+    record("I5b turns 原文/译文分行落库 (中↔粤)", len(orig_c) >= 1 and len(tran_c) >= 1,
+           f"orig={len(orig_c)} tran={len(tran_c)} turns={len(turns_c)}")
+
     # I3 连续启停 ×3
     ok_all = True
     note = ""
     for i in range(3):
-        info = await run_one(f"churn{i}", zh_pcm, None, timeout_s=50.0)
+        info = await run_one(zh_pcm, None, timeout_s=50.0)
         if not info["fwd_ok"]:
             ok_all = False
             note = f"第 {i + 1} 通失败 {info['fwd_text']!r}"
@@ -237,7 +261,7 @@ async def main() -> int:
     record("I3 连续启停×3 worker 复用", ok_all, note)
 
     # I4 长流 45s 连续讲话
-    info = await run_one("long", long_pcm[: int(16000 * 45) * 2], None, timeout_s=110.0)
+    info = await run_one(long_pcm[: int(16000 * 45) * 2], None, timeout_s=110.0)
     record("I4 长流 45s 断句有输出", info["fwd_ok"], info["fwd_text"])
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)
