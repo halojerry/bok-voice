@@ -12,8 +12,7 @@ from agent_runtime.providers.livekit_plugins import _normalize_asr_language  # n
 
 def test_explicit_language_tags():
     assert _normalize_asr_language("Cantonese", "有冇人知道？") == "cantonese"
-    # SenseVoice 的大写供应商标签在其插件边界(_repl 标签清洗)已归一 cantonese，
-    # 不会裸传进本函数；这里只验规范标签路径。
+    # 这里只验规范标签路径（大写供应商标签不裸传进本函数）。
     assert _normalize_asr_language("English", "hello there") == "en"
     assert _normalize_asr_language("Chinese", "你好") == "zh"
 

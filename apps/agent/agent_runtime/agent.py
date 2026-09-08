@@ -1055,7 +1055,6 @@ async def entrypoint(ctx):
         ContextAwareLLM,
         ContextState,
         ScriptedLLM,
-        SherpaSenseVoiceSTT,
         VolcanoTTS,
     )
 
@@ -1165,7 +1164,7 @@ async def entrypoint(ctx):
         )
     interruption_enabled = bool(vad_cfg.get("interruption", True)) if vad_provider_name != "fake" else True
 
-    # ---- ASR：设置页 asr.provider（qwen3_asr / sherpa_sensevoice / fake）----
+    # ---- ASR：设置页 asr.provider（qwen3_asr / fake）----
     asr_provider_name = (asr_cfg.get("provider") or "qwen3_asr").lower()
     # 语言钉定（A 线新政策）：每通对话语言固定 → ASR hint 整场钉死在通话语言
     # （PinnedLanguageState + pin_language=True，zh 也整场下发 Chinese hint，与
@@ -1179,30 +1178,24 @@ async def entrypoint(ctx):
     if use_fake or asr_provider_name in ("fake", "fake_stt"):
         stt_provider = FakeLiveKitSTT()
     else:
-        # 只有显式选择 sherpa 才走 sherpa-onnx；未知/缺失/历史值一律回退 sidecar
-        # （Qwen3-ASR），避免配置写错导致 agent 崩溃（sherpa 模型不再随包）。
-        use_sherpa = asr_provider_name in {"sherpa", "sherpa_sensevoice"}
-        _asr_inner = (
-            SherpaSenseVoiceSTT(language_state=asr_language_state)
-            if use_sherpa
-            else Qwen3ASRSTT(
-                base_url=_sidecar_base_url(
-                    asr_cfg.get("base_url") or "",
-                    "QWEN3_ASR_BASE_URL",
-                    "http://127.0.0.1:8787",
-                ),
-                language_state=asr_language_state,
-                # A 线恒全钉（同传式）：zh 也下发 Chinese hint，不吃 auto 漂移。
-                pin_language=True,
-                # 热词 context：话术模板 hotwords 字段 + 行业词 + 对象文字字段
-                # （官方 system message 软偏置），随 /api/start 下发。
-                # BOK_ASR_HOTWORDS=0 回退。
-                hotword_context=asr_hotword_context(
-                    asr_pin_lang, object_card, extra_hotwords=str((template or {}).get("hotwords") or "")
-                ),
-            )
+        # 未知/历史配置值一律回退 sidecar（Qwen3-ASR），避免配置写错导致 agent 崩溃。
+        _asr_inner = Qwen3ASRSTT(
+            base_url=_sidecar_base_url(
+                asr_cfg.get("base_url") or "",
+                "QWEN3_ASR_BASE_URL",
+                "http://127.0.0.1:8787",
+            ),
+            language_state=asr_language_state,
+            # A 线恒全钉（同传式）：zh 也下发 Chinese hint，不吃 auto 漂移。
+            pin_language=True,
+            # 热词 context：话术模板 hotwords 字段 + 行业词 + 对象文字字段
+            # （官方 system message 软偏置），随 /api/start 下发。
+            # BOK_ASR_HOTWORDS=0 回退。
+            hotword_context=asr_hotword_context(
+                asr_pin_lang, object_card, extra_hotwords=str((template or {}).get("hotwords") or "")
+            ),
         )
-        if not use_sherpa and os.environ.get("QWEN3_ASR_STREAM", "1") == "1":
+        if os.environ.get("QWEN3_ASR_STREAM", "1") == "1":
             # 「VAD+滑窗 partial」流式包装:说话期间出 INTERIM(实时字幕)/
             # PREFLIGHT(抢跑 prefill) 事件;停嘴仍整句高精度转写(官方 StreamAdapter
             # 骨架的 partial 增强版)。QWEN3_ASR_STREAM=0 回退纯离线。

@@ -40,7 +40,7 @@ cd desktop && npx tauri build --bundles app   # macOS bundle
 
 - **粤语规范值 = 小写 `cantonese`，全时空唯一拼写**，语言三态只有 `zh / cantonese / en`。全栈（DB、web、TS 类型、prompt 分支、`LanguageState`、voice-map 键、`speaker_cantonese`）一律 `cantonese`；旧拼写已存量清零（CP 启动迁移 `deps.py build_engine()` 是唯一兼容点），运行时代码**不留任何别名分支**。
 - **防复发门禁**：`tests/test_cantonese_terminology.py` 扫描全部跟踪源文件，旧拼写只允许出现在白名单单点，新增即测试失败——字段单轨化，杜绝双轨技术债。
-- **外部系统真字面量不改（门禁白名单内）**：Wikipedia 域名 `zh-yue.wikipedia.org`、SenseVoice 输出标签 `YUE`（入内即归一 cantonese）、Volcano dialect 枚举、MiniMax 音色 ID `Cantonese_*`。音色 id 值是不透明标识符，不属语言字段。
+- **外部系统真字面量不改（门禁白名单内）**：Wikipedia 域名 `zh-yue.wikipedia.org`、Volcano dialect 枚举、MiniMax 音色 ID `Cantonese_*`。音色 id 值是不透明标识符，不属语言字段。
 - **每通对话语言固定（A 线，取代逐轮语言跟随）**：粤语通话全程粤语、中文全程中文、英文全程英文，中途不切换。会话装配时一次钉死三方：ASR hint 恒钉通话语言（`_call_language` 人设→对象→zh；`PinnedLanguageState`+`pin_language=True` 三语全钉，zh 也下发 `Chinese`；设置 `asr.language_mode=fixed`+显式 `language` 仍优先，**mode=auto 在 A 线=钉到本通语言，不是滞回跟随**——LanguageState 滞回/sticky 机制已在 A 线退役，B 线不变）、LLM【用户语言】规则装配时 `set_user_language` 一次字节静态整通（逐轮钩子不碰语言）、TTS 音色+MiniMax `language_boost`（zh→Chinese、cantonese→Chinese,Yue、en→English，env 按通话注入）按通话语言固定。sidecar 传 `language=cantonese` 等规范名（mlx 大小写不敏感回填模型 config）消除 auto 误判（啱唔啱→难唔难）。**Prompt 语言纯度**：进 prompt 的共享指引文本（【应答准则】/当前步守卫/【新一步】/后备块/收尾/尾部节头）一律**标准书面中文**——这些无条件进每通通话，写成粤语书面语会把 4B 模型的普通话回复带偏成夹粤语（2026-09-06 实证后整批改写，`test_zh_prompt_purity_no_cantonese_marks` 钉死）；方言风格只准出现在按通话语言条件渲染的规则里（`_cantonese_rule`/港式词表，仅 cantonese 通话渲染）；`_zh_rule` 明确禁方言夹杂。
 
 ## Architecture Boundaries & Runtime Rules

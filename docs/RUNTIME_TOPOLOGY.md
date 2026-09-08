@@ -139,7 +139,7 @@ WorkerOptions.port)——默认同为 8081 会竞态,后绑者 Errno 48 即崩
 
 ### 设置（`/api/settings`，Agent 运行时会真实消费）
 
-- `asr.provider`：`qwen3_asr`（本地 sidecar）/ `sherpa_sensevoice` / `fake`（仅测试）。语言值统一 `zh/cantonese/en`（粤语全时空唯一拼写 `cantonese`）；agent 在会话语言为粤语时给 sidecar 传 `language=cantonese` 强制模型按粤语转写，避免 auto 误判成普通话。
+- `asr.provider`：`qwen3_asr`（本地 sidecar）/ `fake`（仅测试）。语言值统一 `zh/cantonese/en`（粤语全时空唯一拼写 `cantonese`）；agent 在会话语言为粤语时给 sidecar 传 `language=cantonese` 强制模型按粤语转写，避免 auto 误判成普通话。
 - `llm.provider`：`local_openai`/`mlx`（本地）/ `deepseek`（云端，缺 `api_key` 显式告警并回退本地）/ `fake`。
 - `tts.provider`：`qwen3_tts` / `volcano_streaming`（需 `VOLC_*` 环境变量）/ `fake`（静音测试音，非火山 beep）。
   音色兜底按语言 `speaker_zh/speaker_cantonese/en`（旧拼写键已由启动迁移改写）；persona 绑定 `reference_audio` 优先。
