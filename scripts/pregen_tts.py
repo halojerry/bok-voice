@@ -126,6 +126,8 @@ async def main_async() -> int:
     ap.add_argument("--objects", action="store_true", help="逐对象渲染开场白/收线/心跳并预合成")
     ap.add_argument("--fillers", action="store_true", help="垫话短语库预合成(PR-2 垫话用,绝不运行时合成)")
     ap.add_argument("--cp", default=os.environ.get("BOK_CP_URL", "http://127.0.0.1:8000"))
+    ap.add_argument("--persona", default="", help="音色覆盖:指定 persona id(默认按语言取该语言的 persona)")
+    ap.add_argument("--object-id", default="", help="只为指定对象预生成开场白/收线/心跳(配合 --objects)")
     ap.add_argument("--model", default="", help="MINIMAX_MODEL 覆盖(默认 env/2.8-hd,须与运行时一致)")
     args = ap.parse_args()
     if not (args.greetings or args.objects or args.fillers):
@@ -145,7 +147,16 @@ async def main_async() -> int:
     if args.model:
         os.environ["MINIMAX_MODEL"] = args.model
     sample_rate = int(tts_cfg.get("sample_rate") or 24000)
-    persona = personas[0] if personas else None
+    # 语言→该语言的 persona(运行时按语言用人设,音色随人设;每语言一套罐头,
+    # 音色与运行时同源)。--persona 显式覆盖时全部语言用同一 persona。
+    lang_personas: dict[str, dict | None] = {}
+    for lang in ("zh", "cantonese", "en"):
+        if args.persona:
+            lang_personas[lang] = next((x for x in personas if str(x.get("id")) == args.persona), None)
+        else:
+            lang_personas[lang] = next(
+                (x for x in personas if _normalize_lang(x.get("language"), default="") == lang), None
+            )
     voice_mode = _resolve_tts_voice_mode(tts_cfg)
 
     cache = TtsAudioCache(root=default_cache_dir(), sample_rate=sample_rate)
@@ -166,7 +177,10 @@ async def main_async() -> int:
             jobs.append((lang, _wa_number_line(lang, "")))
 
     if args.objects:
+        only_id = str(args.object_id or "").strip()
         for obj in objects:
+            if only_id and str(obj.get("id") or "") != only_id:
+                continue
             lang = _normalize_lang((obj or {}).get("language"), default="zh") or "zh"
             name = str((obj or {}).get("display_name") or "").strip()
             tpl = _template_for(templates, obj)
@@ -198,7 +212,7 @@ async def main_async() -> int:
     ok = skip = fail = 0
     for lang, text in uniq:
         provider = _provider_for(lang, _assemble_minimax_voice_map(
-            persona=persona, tts_cfg=tts_cfg, greet_lang=lang, voice_mode=voice_mode
+            persona=lang_personas.get(lang), tts_cfg=tts_cfg, greet_lang=lang, voice_mode=voice_mode
         ), api_key, sample_rate)
         voice = provider.resolved_voice()
         key = cache.key_for(text, voice=voice, model=model)

@@ -325,8 +325,9 @@ async def _say_script(session, tts_provider, cache, text: str):
         async with tts_provider.synthesize(text) as stream:
             async for ev in stream:
                 played["frames"] += 1
+                # 唔加 sleep(0):yield 已係让位点;打断时多一个 await 挂起点
+                # 会令 teardown 撞上框架 synchronizer 已关的 channel(ChanClosed 噪音)。
                 yield ev.frame
-                await asyncio.sleep(0)
 
     try:
         return await session.say(text, audio=_synth_and_play())
@@ -494,6 +495,40 @@ def partial_ms_for_state(state: str, slow_ms: int) -> int | None:
 
 _ECHO_SIM_RATIO = 0.9
 _ECHO_MIN_CHARS = 6
+
+
+def _hotword_echo_guard_enabled() -> bool:
+    return os.environ.get("QWEN3_HOTWORD_ECHO_GUARD", "1") == "1"
+
+
+def _is_hotword_echo(text: str, hotword_context: str) -> bool:
+    """ASR 热词幻听守卫(纯函数,单测用):极低内容音频把词表当转写整串抄出。
+
+    2026-09-08 实机回归(call-feaf914c 首轮「單號，運單，賠償…」=词表顺串,
+    客户根本没说话)。判定:转写剥标点后**完全由词表词首尾相接组成**(贪心
+    最长匹配全覆盖)且总长 ≥6——真实用户话必有虚词/数字/词表外内容,不可能
+    恰好全是词表词的顺串。
+    """
+    import re as _re
+
+    norm = _re.sub(r"[^\w\u4e00-\u9fff]+", "", str(text or ""))
+    if len(norm) < 6 or not hotword_context:
+        return False
+    words: set[str] = set()
+    for piece in _re.split(r"[,，、;；\s]+", str(hotword_context)):
+        piece = piece.replace("Vocabulary:", "").replace("Vocabulary：", "").strip()
+        piece = _re.sub(r"[^\w\u4e00-\u9fff]+", "", piece)
+        if piece:
+            words.add(piece)
+    if not words:
+        return False
+    remaining = norm
+    while remaining:
+        hit = next((w for w in sorted(words, key=len, reverse=True) if w and remaining.startswith(w)), None)
+        if hit is None:
+            return False  # 有一段唔係词表词 → 真人话,唔拦
+        remaining = remaining[len(hit):]
+    return True
 
 
 def _is_echo_self_heard(user_text: str, last_reply: str, agent_speaking: bool) -> bool:
@@ -1227,6 +1262,10 @@ async def entrypoint(ctx):
     asr_pin_lang = _call_asr_pin_language(asr_cfg, greet_lang)
     asr_language_state = PinnedLanguageState(lang=asr_pin_lang)
     print(f"[agent] call language={greet_lang} pinned (asr hint={asr_pin_lang})", flush=True)
+    # 热词词表文本(hook 幻听守卫与 STT context 同一份,2026-09-08 实机回归后加)
+    _hotword_ctx = asr_hotword_context(
+        asr_pin_lang, object_card, extra_hotwords=str((template or {}).get("hotwords") or "")
+    )
     if use_fake or asr_provider_name in ("fake", "fake_stt"):
         stt_provider = FakeLiveKitSTT()
     else:
@@ -1243,9 +1282,7 @@ async def entrypoint(ctx):
             # 热词 context：话术模板 hotwords 字段 + 行业词 + 对象文字字段
             # （官方 system message 软偏置），随 /api/start 下发。
             # BOK_ASR_HOTWORDS=0 回退。
-            hotword_context=asr_hotword_context(
-                asr_pin_lang, object_card, extra_hotwords=str((template or {}).get("hotwords") or "")
-            ),
+            hotword_context=_hotword_ctx,
         )
         if os.environ.get("QWEN3_ASR_STREAM", "1") == "1":
             # 「VAD+滑窗 partial」流式包装:说话期间出 INTERIM(实时字幕)/
@@ -1846,6 +1883,14 @@ async def entrypoint(ctx):
                         flush=True,
                     )
                     raise StopResponse()
+            # ASR 热词幻听守卫:极低内容音频(开场白期间没说话/杂音)会把词表
+            # 当转写整串抄出(call-feaf914c 实机回归)——顺串判定命中即丢弃整轮。
+            if _hotword_echo_guard_enabled() and _hotword_ctx and _is_hotword_echo(user_text, _hotword_ctx):
+                print(
+                    f"QWEN3_HOTWORD_ECHO_DROP (call {room_name}) heard={user_text!r}",
+                    flush=True,
+                )
+                raise StopResponse()
             # WA 号码碎片累积:号码主导句且累计 <8 位、或自报头半句(「我的WhatsApp係」)
             # → 暂存+StopResponse(唔回复、唔侦测、唔推进),等下一段拼埋一次过处理。
             # 超时 flush 见 _arm_wa_accum_flush。StopResponse 必须喺任何 except-pass

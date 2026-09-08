@@ -1419,42 +1419,35 @@ def parse_args(argv=None) -> argparse.Namespace:
     p_prod.add_argument("action", nargs="?", default="status", choices=["install", "status"])
     p_setup = sub.add_parser("setup", help="First-run model readiness / download")
     p_setup.add_argument("action", nargs="?", default="status", choices=["status", "download"])
-    return p.parse_args(argv)
+    # tts-pregen/tts-mine 参数原样透传给执行脚本,顶层不做校验
+    args, extra = p.parse_known_args(argv)
+    args.extra = list(extra)
+    return args
 
 
-def cmd_tts_pregen() -> int:
+def cmd_tts_pregen(extra: list[str] | None = None) -> int:
     """离线批量预合成 TTS 本地缓存(docs/superpowers/specs/2026-09-08-tts-cache-design.md)。
 
     额外参数原样透传给 scripts/pregen_tts.py(--greetings/--objects/--fillers/--cp/--model)。
     子进程带仓库 PYTHONPATH 与 SSL_CERT_FILE(certifi)——venv 无系统 CA,
     MiniMax WSS 无此必炸。
     """
-    try:
-        idx = sys.argv.index("tts-pregen")
-    except ValueError:
-        return 2
-    extra = sys.argv[idx + 1:]
     env = {"PYTHONPATH": _repo_pythonpath(), "PYTHONUNBUFFERED": "1"}
     _bake_ssl_cert_file(env, repo_python())
-    cmd = [str(repo_python()), str(ROOT / "scripts" / "pregen_tts.py"), *extra]
+    cmd = [str(repo_python()), str(ROOT / "scripts" / "pregen_tts.py"), *(extra or [])]
     proc = subprocess.run(cmd, env={**os.environ, **env})
     return proc.returncode
 
 
-def cmd_tts_mine() -> int:
+def cmd_tts_mine(extra: list[str] | None = None) -> int:
     """高频问答对挖掘报告(快答库,PR-3)。参数透传给 scripts/mine_qa.py。
 
     --apply N 把前 N 条入库为 qa_entries(source=mined);入库后跑
     `bok.py tts-pregen` 物化应答音频,闸门只认缓存有音频的条目。
     """
-    try:
-        idx = sys.argv.index("tts-mine")
-    except ValueError:
-        return 2
-    extra = sys.argv[idx + 1:]
     env = {"PYTHONPATH": _repo_pythonpath(), "PYTHONUNBUFFERED": "1"}
     _bake_ssl_cert_file(env, repo_python())
-    cmd = [str(repo_python()), str(ROOT / "scripts" / "mine_qa.py"), *extra]
+    cmd = [str(repo_python()), str(ROOT / "scripts" / "mine_qa.py"), *(extra or [])]
     proc = subprocess.run(cmd, env={**os.environ, **env})
     return proc.returncode
 
@@ -1465,9 +1458,12 @@ def main(argv=None) -> int:
         return cmd_setup(args.action)
     if args.cmd == "prod":
         return cmd_prod(args.action)
+    if args.cmd == "tts-pregen":
+        return cmd_tts_pregen(getattr(args, "extra", None))
+    if args.cmd == "tts-mine":
+        return cmd_tts_mine(getattr(args, "extra", None))
     return {"catalog": cmd_catalog, "manifest": cmd_manifest, "download": cmd_download, "status": cmd_status,
-            "up": cmd_up, "serve": cmd_serve, "down": cmd_down, "doctor": cmd_doctor,
-            "tts-pregen": cmd_tts_pregen, "tts-mine": cmd_tts_mine}[args.cmd]()
+            "up": cmd_up, "serve": cmd_serve, "down": cmd_down, "doctor": cmd_doctor}[args.cmd]()
 
 
 if __name__ == "__main__":
