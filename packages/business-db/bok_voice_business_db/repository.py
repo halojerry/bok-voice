@@ -149,6 +149,106 @@ class SqlAlchemyBusinessRepository:
             for call_id, n, avg in rows
         }
 
+    # ---- 快答库(Q→A 快路,2026-09-09) ----
+
+    @staticmethod
+    def _qa_to_dict(row) -> dict:
+        return {
+            "id": row.id,
+            "account_id": row.account_id,
+            "question_text": row.question_text,
+            "answer_text": row.answer_text,
+            "lang": row.lang,
+            "scope": row.scope,
+            "step_index": int(row.step_index or -1),
+            "voice_id": row.voice_id,
+            "enabled": bool(row.enabled),
+            "hit_count": int(row.hit_count or 0),
+            "source": row.source,
+            "template_id": row.template_id,
+            "created_at": row.created_at.isoformat() if row.created_at else "",
+        }
+
+    def list_qa_entries(self, account_id: str = "", enabled: bool | None = None) -> list[dict]:
+        stmt = select(models.QaEntry).order_by(models.QaEntry.created_at)
+        if account_id:
+            stmt = stmt.filter_by(account_id=account_id)
+        if enabled is not None:
+            stmt = stmt.filter_by(enabled=enabled)
+        return [self._qa_to_dict(r) for r in self.session.scalars(stmt)]
+
+    def create_qa_entry(self, data: dict) -> dict:
+        row = models.QaEntry(
+            id=data.get("id") or f"qa:{uuid.uuid4().hex[:12]}",
+            account_id=data.get("account_id") or "acc-001",
+            question_text=data.get("question_text") or "",
+            answer_text=data.get("answer_text") or "",
+            lang=data.get("lang") or "zh",
+            scope=data.get("scope") or "global",
+            step_index=int(data.get("step_index") or -1),
+            voice_id=data.get("voice_id") or "",
+            enabled=bool(data.get("enabled", True)),
+            source=data.get("source") or "curated",
+            template_id=data.get("template_id") or "",
+        )
+        self.session.add(row)
+        self.session.commit()
+        return self._qa_to_dict(row)
+
+    def update_qa_entry(self, entry_id: str, patch: dict) -> dict | None:
+        row = self.session.get(models.QaEntry, entry_id)
+        if row is None:
+            return None
+        if "question_text" in patch and patch["question_text"] is not None:
+            row.question_text = str(patch["question_text"])
+        if "answer_text" in patch and patch["answer_text"] is not None:
+            row.answer_text = str(patch["answer_text"])
+        if "lang" in patch and patch["lang"]:
+            row.lang = str(patch["lang"])
+        if "scope" in patch and patch["scope"]:
+            row.scope = str(patch["scope"])
+        if "step_index" in patch and patch["step_index"] is not None:
+            row.step_index = int(patch["step_index"])
+        if "voice_id" in patch and patch["voice_id"] is not None:
+            row.voice_id = str(patch["voice_id"])
+        if "enabled" in patch and patch["enabled"] is not None:
+            row.enabled = bool(patch["enabled"])
+        self.session.commit()
+        return self._qa_to_dict(row)
+
+    def delete_qa_entry(self, entry_id: str) -> bool:
+        row = self.session.get(models.QaEntry, entry_id)
+        if row is None:
+            return False
+        self.session.delete(row)
+        self.session.commit()
+        return True
+
+    def incr_qa_hit(self, entry_id: str, n: int = 1) -> None:
+        row = self.session.get(models.QaEntry, entry_id)
+        if row is not None:
+            row.hit_count = int(row.hit_count or 0) + int(n)
+            self.session.commit()
+
+    def iter_call_conversations(self, account_id: str = "") -> list[list[dict]]:
+        """跨通话按序轮次(高频问答对挖掘用):join calls 过账号,created_at 排序。
+
+        turns 无 seq 列,同通内轮次天然串行、同刻风险极低(created_at 排序足够)。
+        """
+        stmt = (
+            select(models.Turn, models.CallSession.account_id)
+            .join(models.CallSession, models.Turn.call_id == models.CallSession.id)
+            .order_by(models.Turn.call_id, models.Turn.created_at)
+        )
+        if account_id:
+            stmt = stmt.where(models.CallSession.account_id == account_id)
+        grouped: dict[str, list[dict]] = {}
+        for row, _acct in self.session.execute(stmt):
+            grouped.setdefault(row.call_id, []).append(
+                {"role": row.role, "text": row.transcript, "lang": row.language}
+            )
+        return list(grouped.values())
+
     def append_template_revision(self, template_id: str, revision: int, snapshot: str) -> dict:
         row = models.TemplateRevision(
             id=f"rev:{template_id}:{revision}", template_id=template_id, revision=revision, snapshot=snapshot
@@ -527,6 +627,7 @@ class InMemoryBusinessRepository:
         self.object_topics: dict[str, list[dict]] = {}
         self.global_insights: list[dict] = []
         self.audit_events: list[dict] = []
+        self.qa_entries: dict[str, dict] = {}
         self.settings: dict = SqlAlchemyBusinessRepository.default_settings()
 
     def create_call(self, manifest: SessionManifest) -> dict:
@@ -588,6 +689,65 @@ class InMemoryBusinessRepository:
                 "turns": len(turns),
                 "avg_latency_ms": int(sum(lats) / len(lats)) if lats else 0,
             }
+        return out
+
+    # ---- 快答库(Q→A 快路,2026-09-09) ----
+
+    def list_qa_entries(self, account_id: str = "", enabled: bool | None = None) -> list[dict]:
+        rows = [
+            v
+            for v in getattr(self, "qa_entries", {}).values()
+            if (not account_id or v.get("account_id") == account_id)
+            and (enabled is None or bool(v.get("enabled")) == enabled)
+        ]
+        return sorted(rows, key=lambda v: v.get("created_at") or "")
+
+    def create_qa_entry(self, data: dict) -> dict:
+        if not hasattr(self, "qa_entries"):
+            self.qa_entries = {}
+        row = {
+            "id": data.get("id") or f"qa:{uuid.uuid4().hex[:12]}",
+            "account_id": data.get("account_id") or "acc-001",
+            "question_text": data.get("question_text") or "",
+            "answer_text": data.get("answer_text") or "",
+            "lang": data.get("lang") or "zh",
+            "scope": data.get("scope") or "global",
+            "step_index": int(data.get("step_index") or -1),
+            "voice_id": data.get("voice_id") or "",
+            "enabled": bool(data.get("enabled", True)),
+            "hit_count": int(data.get("hit_count") or 0),
+            "source": data.get("source") or "curated",
+            "template_id": data.get("template_id") or "",
+            "created_at": data.get("created_at") or "",
+        }
+        self.qa_entries[row["id"]] = row
+        return dict(row)
+
+    def update_qa_entry(self, entry_id: str, patch: dict) -> dict | None:
+        row = getattr(self, "qa_entries", {}).get(entry_id)
+        if row is None:
+            return None
+        for k in ("question_text", "answer_text", "lang", "scope", "step_index", "voice_id", "enabled"):
+            if k in patch and patch[k] is not None:
+                row[k] = patch[k]
+        return dict(row)
+
+    def delete_qa_entry(self, entry_id: str) -> bool:
+        return getattr(self, "qa_entries", {}).pop(entry_id, None) is not None
+
+    def incr_qa_hit(self, entry_id: str, n: int = 1) -> None:
+        row = getattr(self, "qa_entries", {}).get(entry_id)
+        if row is not None:
+            row["hit_count"] = int(row.get("hit_count") or 0) + int(n)
+
+    def iter_call_conversations(self, account_id: str = "") -> list[list[dict]]:
+        out: list[list[dict]] = []
+        for call_id, turns in self.turns.items():
+            if account_id:
+                call = self.calls.get(call_id) or {}
+                if call.get("account_id") != account_id:
+                    continue
+            out.append([{"role": t.role, "text": t.transcript, "lang": t.language} for t in turns])
         return out
 
     def get_usage_record(self, call_id: str) -> dict | None:

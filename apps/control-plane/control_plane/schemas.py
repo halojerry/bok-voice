@@ -182,3 +182,28 @@ class WhatsAppHandledRequest(BaseModel):
     """專員喺操作台標記已對接。"""
 
     handled: bool = True
+
+
+class QaEntryCreate(BaseModel):
+    """快答库条目(Q→A 检索快路,2026-09-09)。scope=global | step(配合 step_index)。"""
+
+    question_text: str
+    answer_text: str
+    lang: str = "zh"
+    scope: str = "global"
+    step_index: int = -1
+    voice_id: str = ""
+    template_id: str = ""
+    account_id: str = "acc-001"
+    source: str = "curated"
+    enabled: bool = True
+
+
+class QaEntryPatch(BaseModel):
+    question_text: Optional[str] = None
+    answer_text: Optional[str] = None
+    lang: Optional[str] = None
+    scope: Optional[str] = None
+    step_index: Optional[int] = None
+    voice_id: Optional[str] = None
+    enabled: Optional[bool] = None

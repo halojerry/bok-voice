@@ -108,5 +108,19 @@ class ControlPlaneClient:
         )
         r.raise_for_status()
 
+    async def list_qa_entries(self, account_id: str = "acc-001") -> list[dict]:
+        """快答库启用条目(Q→A 快路,PR-3):每通装配拉一次,变更下一通生效。"""
+        r = await self._client.get("/api/qa-entries", params={"account_id": account_id, "enabled": 1})
+        r.raise_for_status()
+        data = r.json()
+        return list(data) if isinstance(data, list) else []
+
+    async def qa_hit(self, entry_id: str) -> None:
+        """快路命中计数(fire-and-forget,失败静默——计数唔阻通话)。"""
+        try:
+            await self._client.post(f"/api/qa-entries/{entry_id}/hit")
+        except Exception:  # noqa: BLE001
+            pass
+
     async def aclose(self) -> None:
         await self._client.aclose()

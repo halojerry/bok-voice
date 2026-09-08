@@ -16,8 +16,24 @@
 | MT LLM（可选） | :1236 OpenAI 兼容 | B 线同传专用翻译（Hy-MT2 小模型，逐句无状态；模型缺失自动跳过 → B 线回退 :1235） | Mac=mlx_lm | 模型 → app-data/models |
 | B-line worker | :8790 WS | 同传通道：ASR→翻译→TTS 队列 / 背压 | 内嵌 Node | 指标 → app-data/translation-metrics.jsonl |
 | LiveKit server | :7880 WS/WebRTC | RTC 信令与媒体（7881/7882 RTC 端口） | 内嵌二进制 | keys → 内嵌 livekit.yaml |
-| agent worker | 进程（健康 :8081/worker） | A 线智能体（VAD/对话/情绪/打断） | 打包 Python | 调 8787/8788/1235/8000 |
+| agent worker | 进程（健康 :8081/worker） | A 线智能体（VAD/对话/情绪/打断） | 打包 Python | 调 8787/8788/1235/8000；TTS=MiniMax 云（`tts_cache` 本地音频缓存叠加） |
 | interpreter worker ×2 | 进程（健康 :8082 fwd / :8083 rev） | B 线双 AgentSession 同传（`bok-interp-fwd/rev` 显式分发） | 打包 Python | 调 8787/8788/1236(MT,回退 1235)/8000；TTS=MiniMax 云(或本地 8788) |
+
+### 本地 TTS 音频缓存 + 垫话 + Q→A 快路（2026-09-09，`docs/superpowers/specs/2026-09-08-*-design.md`）
+
+- **缓存**：`agent_runtime/tts_cache.py`——`CachedTTS` 包装 MiniMaxTTS（仅拦
+  `synthesize()` 整句路径，stream 透传），key=sha1(归一化文本+音色+模型档+采样率)，
+  PCM 存 **app-data/tts-cache/**（LRU 500 条）。脚本直念线（开场白/心跳/收线/WA 确认）
+  经 `_say_script`：命中 ~0ms 出声，未命中边播边落盘。开关 `BOK_TTS_CACHE=0`。
+- **预生成**：`bok.py tts-pregen`（--greetings 无变量脚本线 / --objects 逐对象
+  开场白收线心跳 / --fillers 垫话库）——离线批量合成，需 CP 或 MINIMAX_API_KEY。
+- **垫话**：`agent_runtime/fillers.py`——LLM 慢轮回复首音频 700ms 未到播预合成
+  应承语，真回复出声即定向打断（CachedTTS 首音频回调）。垫话绝不进 LLM 上下文、
+  绝不触发云合成。开关 `BOK_FILLER=0`。
+- **Q→A 快路**：`agent_runtime/qa_gate.py` + CP `/api/qa-entries`、
+  `/api/reports/qa-pairs`——四道闸（作用域/关键信号旁路/推进收线让位/阈值 0.90）
+  全过且应答音频已缓存才跳过 LLM；挖掘入库 `bok.py tts-mine --apply N`。
+  开关 `BOK_QA_FASTPATH=0`。
 
 ### 音频设备（设置页）
 

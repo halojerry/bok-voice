@@ -216,5 +216,29 @@ class UsageRecord(Base):
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
+class QaEntry(Base):
+    """快答库(Q→A 检索快路,2026-09-09):用户话语命中 → 跳过 LLM 播预生成回答。
+
+    scope=global(步不变社交轮/FAQ) | step(仅限 step_index 步);source=curated
+    (运营精选) | mined(turns 高频配对挖掘)。应答音频由 tts-pregen 物化进
+    app-data/tts-cache,本表不存音频——闸门只认「缓存有音频」的条目。
+    """
+
+    __tablename__ = "qa_entries"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(64), index=True, default="acc-001")
+    question_text: Mapped[str] = mapped_column(Text)
+    answer_text: Mapped[str] = mapped_column(Text)
+    lang: Mapped[str] = mapped_column(String(16), default="zh")
+    scope: Mapped[str] = mapped_column(String(16), default="global")
+    step_index: Mapped[int] = mapped_column(Integer, default=-1)
+    voice_id: Mapped[str] = mapped_column(String(128), default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    hit_count: Mapped[int] = mapped_column(Integer, default=0)
+    source: Mapped[str] = mapped_column(String(16), default="curated")
+    template_id: Mapped[str] = mapped_column(String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
 def create_all(engine) -> None:
     Base.metadata.create_all(engine)

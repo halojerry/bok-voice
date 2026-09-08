@@ -1413,7 +1413,7 @@ def cmd_prod(cmd: str) -> int:
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="bok", description="Bok voice stack launcher (no Docker)")
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("catalog", "manifest", "download", "status", "up", "serve", "down", "doctor", "tts-pregen"):
+    for name in ("catalog", "manifest", "download", "status", "up", "serve", "down", "doctor", "tts-pregen", "tts-mine"):
         sub.add_parser(name)
     p_prod = sub.add_parser("prod", help="生产常驻单元与健康面")
     p_prod.add_argument("action", nargs="?", default="status", choices=["install", "status"])
@@ -1425,7 +1425,7 @@ def parse_args(argv=None) -> argparse.Namespace:
 def cmd_tts_pregen() -> int:
     """离线批量预合成 TTS 本地缓存(docs/superpowers/specs/2026-09-08-tts-cache-design.md)。
 
-    额外参数原样透传给 scripts/pregen_tts.py(--greetings/--objects/--cp/--model)。
+    额外参数原样透传给 scripts/pregen_tts.py(--greetings/--objects/--fillers/--cp/--model)。
     子进程带仓库 PYTHONPATH 与 SSL_CERT_FILE(certifi)——venv 无系统 CA,
     MiniMax WSS 无此必炸。
     """
@@ -1441,6 +1441,24 @@ def cmd_tts_pregen() -> int:
     return proc.returncode
 
 
+def cmd_tts_mine() -> int:
+    """高频问答对挖掘报告(快答库,PR-3)。参数透传给 scripts/mine_qa.py。
+
+    --apply N 把前 N 条入库为 qa_entries(source=mined);入库后跑
+    `bok.py tts-pregen` 物化应答音频,闸门只认缓存有音频的条目。
+    """
+    try:
+        idx = sys.argv.index("tts-mine")
+    except ValueError:
+        return 2
+    extra = sys.argv[idx + 1:]
+    env = {"PYTHONPATH": _repo_pythonpath(), "PYTHONUNBUFFERED": "1"}
+    _bake_ssl_cert_file(env, repo_python())
+    cmd = [str(repo_python()), str(ROOT / "scripts" / "mine_qa.py"), *extra]
+    proc = subprocess.run(cmd, env={**os.environ, **env})
+    return proc.returncode
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     if args.cmd == "setup":
@@ -1449,7 +1467,7 @@ def main(argv=None) -> int:
         return cmd_prod(args.action)
     return {"catalog": cmd_catalog, "manifest": cmd_manifest, "download": cmd_download, "status": cmd_status,
             "up": cmd_up, "serve": cmd_serve, "down": cmd_down, "doctor": cmd_doctor,
-            "tts-pregen": cmd_tts_pregen}[args.cmd]()
+            "tts-pregen": cmd_tts_pregen, "tts-mine": cmd_tts_mine}[args.cmd]()
 
 
 if __name__ == "__main__":
