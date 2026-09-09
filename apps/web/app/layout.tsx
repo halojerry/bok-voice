@@ -9,7 +9,12 @@ export const metadata: Metadata = {
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="zh-CN">
-      <body>{children}</body>
+      <body>
+        {/* 运行时配置注入：节点本地托管时由 node-agent 覆写 runtime-config.js，
+            必须先于所有业务脚本执行（body 首位、无 async）。 */}
+        <script src="/runtime-config.js" />
+        {children}
+      </body>
     </html>
   );
 }
