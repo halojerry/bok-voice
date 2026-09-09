@@ -15,6 +15,7 @@ from .plugins.knowledge import KnowledgePlugin
 from .plugins.settlement import SettlementTrigger
 from .providers.registry import build_provider_registry
 from .control_plane import ControlPlaneClient
+from .tts_cache import CachedTTS, TtsAudioCache, default_cache_dir, frames_aiter, pcm_to_frames, tts_cache_enabled
 # 模块级引 flow(纯 stdlib 依赖,无环):_wa_numberish/_wa_number_line 等模块级
 # helper 用;entrypoint 内的 function-scoped import 属历史样式,不冲突。
 from .flow import _digit_normalize, digits_to_cantonese
@@ -283,6 +284,56 @@ def _nudge_line(name: str, lang: str, count: int) -> str:
             f"{who}不好意思，您还在吗？",
         )
     return variants[min(max(count, 0), len(variants) - 1) % len(variants)]
+
+
+# 通用开场兜底三语(话术模板无开场/语言不符/变量缺失时用;tts-pregen 同源预生成)。
+GENERIC_GREETINGS = {
+    "zh": "请问有什么可以帮您？",
+    "cantonese": "請問有咩可以幫到你？",
+    "en": "How can I help you?",
+}
+
+
+async def _say_script(session, tts_provider, cache, text: str):
+    """脚本直念统一入口(2026-09-08 本地 TTS 音频缓存):命中本地 PCM ~0ms 直出,
+    零云调用;未命中照常流式合成——tee 边播边收集,完整播完自动落盘,同文本
+    第二通起即命中(带 {name}/单号变量话术靠这条自动沉淀)。
+
+    缓存未装配(BOK_TTS_CACHE=0/本地 TTS)或任何 I/O 异常 → 退回普通
+    session.say(text),行为与无缓存完全一致。播放已出声后的异常不重念
+    (避免重复开口);一帧未出才回退文本路径。
+    """
+    if cache is None or tts_provider is None:
+        return await session.say(text)
+    try:
+        voice = getattr(tts_provider, "resolved_voice", lambda: "")()
+        model = getattr(tts_provider, "resolved_model", lambda: "")()
+        pcm = cache.lookup(text, voice=voice, model=model)
+    except Exception:  # noqa: BLE001 - 缓存读取失败当未命中
+        pcm = None
+    if pcm is not None:
+        print(f"TTS_CACHE hit=1 chars={len(text)}", flush=True)
+        return await session.say(
+            text, audio=frames_aiter(pcm_to_frames(pcm, tts_provider.sample_rate))
+        )
+    print(f"TTS_CACHE hit=0 chars={len(text)}", flush=True)
+    played = {"frames": 0}
+
+    async def _synth_and_play():
+        async with tts_provider.synthesize(text) as stream:
+            async for ev in stream:
+                played["frames"] += 1
+                # 唔加 sleep(0):yield 已係让位点;打断时多一个 await 挂起点
+                # 会令 teardown 撞上框架 synchronizer 已关的 channel(ChanClosed 噪音)。
+                yield ev.frame
+
+    try:
+        return await session.say(text, audio=_synth_and_play())
+    except Exception as exc:  # noqa: BLE001 - 合成管线异常回退
+        print(f"TTS_CACHE say_audio_failed fallback={'text' if not played['frames'] else 'none'} err={exc!r}", flush=True)
+        if not played["frames"]:
+            return await session.say(text)
+        return None
 
 
 def _nudge_should_fire(now: float, last_reply_ts: float, last_user_ts: float, nudge_delay: float) -> bool:
@@ -1123,7 +1174,7 @@ async def entrypoint(ctx):
             else:
                 print(f"[whatsapp] accumulate flush no-number, prompt continue (call {room_name})", flush=True)
             try:
-                await session.say(_wa_number_line(language_state.lang, num))
+                await _say_script(session, tts_provider, _tts_cache, _wa_number_line(language_state.lang, num))
             except Exception as exc:  # pragma: no cover - 会话已关等
                 print(f"[whatsapp] accumulate flush say failed: {exc!r}", flush=True)
 
@@ -1276,6 +1327,26 @@ async def entrypoint(ctx):
             emotion_state=emotion_state,
             sample_rate=int(tts_cfg.get("sample_rate") or 24000),
         )
+
+    # 本地 TTS 音频缓存(2026-09-08):仅包云端 MiniMax——本地 Qwen3 TTS 无网络
+    # 首包,缓存无收益。BOK_TTS_CACHE=0 全关;包装层 stream()/事件/预热全透传,
+    # 仅 synthesize()(脚本直念整句路径)走缓存。
+    _tts_cache: TtsAudioCache | None = None
+    if isinstance(tts_provider, MiniMaxTTS) and tts_cache_enabled():
+        try:
+            _tts_cache = TtsAudioCache(
+                root=default_cache_dir(), sample_rate=int(tts_cfg.get("sample_rate") or 24000)
+            )
+            tts_provider = CachedTTS(
+                tts_provider,
+                cache=_tts_cache,
+                voice_provider=tts_provider.resolved_voice,
+                model_provider=tts_provider.resolved_model,
+            )
+            print(f"[agent] tts audio cache on dir={_tts_cache.root} (call {room_name})", flush=True)
+        except Exception as exc:  # noqa: BLE001 - 缓存装配失败零影响
+            _tts_cache = None
+            print(f"[agent] tts audio cache init failed: {exc!r} (call {room_name})", flush=True)
 
     llm_provider_name = llm_cfg.get("provider") or "local_openai"
     if os.environ.get("SCRIPTED_LLM") == "1":
@@ -1981,7 +2052,7 @@ async def entrypoint(ctx):
                 _nudge_state["farewell"] = True
                 print(f"[heartbeat] still silent after {_nudge_state['count']} nudges -> farewell+end (call {room_name})", flush=True)
                 try:
-                    await session.say(_farewell_line(name, lang))
+                    await _say_script(session, tts_provider, _tts_cache, _farewell_line(name, lang))
                 except Exception as exc:  # pragma: no cover - 收尾失敗都照收線
                     print(f"[heartbeat] farewell failed: {exc!r} (call {room_name})", flush=True)
                 _schedule_call_end(12.0, disposition="no_response")
@@ -1989,7 +2060,7 @@ async def entrypoint(ctx):
             _nudge_state["count"] += 1
             print(f"[heartbeat] silent {nudge_delay:.0f}s -> nudge {_nudge_state['count']}/{nudge_max} (call {room_name})", flush=True)
             try:
-                await session.say(_nudge_line(name, lang, _nudge_state["count"] - 1))
+                await _say_script(session, tts_provider, _tts_cache, _nudge_line(name, lang, _nudge_state["count"] - 1))
             except Exception as exc:  # pragma: no cover - 心跳失敗唔阻通話
                 print(f"[heartbeat] nudge failed: {exc!r} (call {room_name})", flush=True)
 
@@ -2040,7 +2111,6 @@ async def entrypoint(ctx):
         # 的临时 system 指令下轮即剥,是会话第一个 KV-cache 前缀断裂点,且冷启
         # TTFT 2-3.4s 全灌在开场白上。直念即点即播(纯 TTS,~100ms 出声);
         # 文本仍入 chat_ctx(say add_to_chat_ctx 默认 True),turn-1 前缀命中不变。
-        greetings = {"zh": "请问有什么可以帮您？", "cantonese": "請問有咩可以幫到你？", "en": "How can I help you?"}
         # 开场白=话术第 1 步 ref 首行直念(变量已替换):用户在模板里配嘅开场即所念,
         # 改模板下一通即生效;三语模板各自第 1 步就係各语言开场(三语都引用话术)。
         # 模板语言与通话语言唔一致、或第 1 步变量缺失(渲染后仍剩 {占位}) →
@@ -2053,14 +2123,14 @@ async def entrypoint(ctx):
         flow_ctrl.opening_played = True
         if flow_ctrl.has_steps:
             context_state.set_flow_current(flow_ctrl.current_step_text())
-        greeting_text = opening or greetings.get(greet_lang, greetings["zh"])
-        # 预热与开场白并行:开场白=纯 TTS(云 MiniMax),预热走本地 LLM prefill,
-        # 互无争抢——旧顺序 say() 要等整段念完才返回(话术开场白 7-11s),预热被
-        # 拖到最后,客户在开场白中途插话的 turn-1 只能全量 prefill(~2-4s TTFT)。
-        # paused(无开场白)分支在下方立即发(无开场白形状)。
+        greeting_text = opening or GENERIC_GREETINGS.get(greet_lang, GENERIC_GREETINGS["zh"])
+        # 预热与开场白并行:开场白=纯 TTS(云 MiniMax,本地缓存命中则 ~0ms),预热走
+        # 本地 LLM prefill,互无争抢——旧顺序 say() 要等整段念完才返回(话术开场白
+        # 7-11s),预热被拖到最后,客户在开场白中途插话的 turn-1 只能全量 prefill
+        # (~2-4s TTFT)。paused(无开场白)分支在下方立即发(无开场白形状)。
         if _prefix_prewarm_armed:
             asyncio.create_task(_prefix_prewarm_task(agent, greeting_text))
-        await session.say(greeting_text)
+        await _say_script(session, tts_provider, _tts_cache, greeting_text)
         # say() 返回=整段念完(playout end),唔係出声时刻——TTS 首包在 say 调用后
         # ~0.4s 就到了(2026-09-06 打点纠偏,旧名 greeting_queued 曾误读为出声慢)。
         _log_stage("greeting_playout_done")

@@ -1349,6 +1349,9 @@ class _VolcanoTTSStream(tts.ChunkedStream):
     async def _emit_beep(self, output_emitter):
         import math
 
+        # beep 旗标(tts_cache tee 用):合成失败兜 beep 时置位,外层据此拒绝落盘——
+        # 错误提示音一旦入缓存,该行文本之后永远播 beep。多类同款实现,统一置位。
+        self._emitted_beep = True
         sr = self._tts_.sample_rate
         n = int(sr * 0.4)
         pcm = bytearray()
@@ -1510,6 +1513,14 @@ class MiniMaxTTS(tts.TTS):
             except Exception:
                 return raw
         return raw
+
+    def resolved_voice(self) -> str:
+        """公开只读:当前语言锚定音色(tts_cache 缓存 key 取值用,唔碰私有成员)。"""
+        return self._resolve_voice()
+
+    def resolved_model(self) -> str:
+        """公开只读:当前模型档(speech-2.8-hd/turbo)——档位变更即缓存 key 全量失效。"""
+        return self._model()
 
     def _bidi_params_key(self) -> tuple:
         """bidi task_start 参数指纹：变了就重建会话(换声/换模型)。
@@ -1766,6 +1777,9 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
     async def _emit_beep(self, output_emitter):
         import math
 
+        # beep 旗标(tts_cache tee 用):合成失败兜 beep 时置位,外层据此拒绝落盘——
+        # 错误提示音一旦入缓存,该行文本之后永远播 beep。多类同款实现,统一置位。
+        self._emitted_beep = True
         sr = self._tts_.sample_rate
         n = int(sr * 0.4)
         pcm = bytearray()
@@ -2410,6 +2424,9 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
     async def _emit_beep(self, output_emitter):
         import math
 
+        # beep 旗标(tts_cache tee 用):合成失败兜 beep 时置位,外层据此拒绝落盘——
+        # 错误提示音一旦入缓存,该行文本之后永远播 beep。多类同款实现,统一置位。
+        self._emitted_beep = True
         sr = self._tts_.sample_rate
         n = int(sr * 0.4)
         pcm = bytearray()
@@ -2747,6 +2764,9 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
         super().__init__(tts=tts_, input_text=text, conn_options=conn_options)
         self._text = text
         self._tts_ = tts_
+        # beep 旗标(tts_cache tee 用):合成失败兜 beep 时置位,外层据此拒绝落盘——
+        # 错误提示音一旦入缓存,该行文本之后永远播 beep。
+        self._emitted_beep = False
 
     async def _run(self, output_emitter):
         try:
@@ -2975,6 +2995,9 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
     async def _emit_beep(self, output_emitter):
         import math
 
+        # beep 旗标(tts_cache tee 用):合成失败兜 beep 时置位,外层据此拒绝落盘——
+        # 错误提示音一旦入缓存,该行文本之后永远播 beep。多类同款实现,统一置位。
+        self._emitted_beep = True
         sr = self._tts_.sample_rate
         n = int(sr * 0.4)
         pcm = bytearray()
