@@ -1,4 +1,8 @@
-"""FillerDirector 单测:门控矩阵/缓存未命中跳过/限次/轮换/首音频打断。"""
+"""FillerDirector 单测:门控矩阵/缓存未命中跳过/限次/轮换/首音频停播/用户再开口停播。
+
+通道铁律(2026-09-09):垫话走 BackgroundAudioPlayer out-of-band 音轨,不走
+session.say()——1.8 speech 队列严格串行,垫话会排在回复后面(实机实证)。
+"""
 
 from __future__ import annotations
 
@@ -16,29 +20,33 @@ from agent_runtime.tts_cache import TtsAudioCache  # noqa: E402
 _PCM = (1000).to_bytes(2, "little", signed=True) * 4800
 
 
-class _FakeHandle:
+class _FakePlayHandle:
     def __init__(self):
-        self.interrupted = False
+        self.stopped = False
 
     def done(self):
         return False
 
-    def interrupt(self, *, force=False):
-        self.interrupted = True
+    def stop(self):
+        self.stopped = True
+
+
+class _FakePlayer:
+    """替身:与 livekit BackgroundAudioPlayer.play() 同形——同步返回 PlayHandle。"""
+
+    def __init__(self):
+        self.plays: list[object] = []
+        self.handles: list[_FakePlayHandle] = []
+
+    def play(self, source):
+        self.plays.append(source)
+        handle = _FakePlayHandle()
+        self.handles.append(handle)
+        return handle
 
 
 class _FakeSession:
     agent_state = "thinking"
-
-    def __init__(self):
-        self.says: list[dict] = []
-
-    def say(self, text, *, audio=None, add_to_chat_ctx=True):
-        """同步返回句柄(与 livekit 1.8 API 一致;await handle 只係等播完)。"""
-        self.says.append({"text": text, "audio": audio, "add_to_chat_ctx": add_to_chat_ctx})
-        handle = _FakeHandle()
-        self.says[-1]["_handle"] = handle
-        return handle
 
 
 class _FakeTTS:
@@ -52,18 +60,24 @@ class _FakeTTS:
         return "model-x"
 
 
-def _director(tmp_path, *, session=None, tts=None, guards=None, voice="voice-a"):
+_NO_PLAYER = object()  # 哨兵:显式传 None(无 player)与不传(自动 FakePlayer)区分
+
+
+def _director(tmp_path, *, session=None, tts=None, player=_NO_PLAYER, guards=None, voice="voice-a"):
     cache = TtsAudioCache(root=tmp_path / "tts-cache", sample_rate=24000)
     session = session or _FakeSession()
     tts = tts or _FakeTTS(voice=voice)
+    if player is _NO_PLAYER:
+        player = _FakePlayer()
     d = FillerDirector(
         session,
         tts,
         cache,
         lang_resolver=lambda: "cantonese",
+        player=player,
         guards=guards or (lambda: False),
     )
-    return d, session, tts, cache
+    return d, player, session, tts, cache
 
 
 def _seed(cache: TtsAudioCache, lang: str):
@@ -78,7 +92,7 @@ def _run(coro, timeout=5.0):
 
 def test_fires_when_no_reply_audio(tmp_path):
     async def _case():
-        d, session, _tts, cache = _director(tmp_path)
+        d, player, _session, _tts, cache = _director(tmp_path)
         _seed(cache, "cantonese")
         os.environ["BOK_FILLER_DELAY_MS"] = "10"
         try:
@@ -86,17 +100,30 @@ def test_fires_when_no_reply_audio(tmp_path):
             await asyncio.sleep(0.08)
         finally:
             os.environ.pop("BOK_FILLER_DELAY_MS", None)
-        assert len(session.says) == 1
-        assert session.says[0]["add_to_chat_ctx"] is False, "垫话绝不进 LLM 上下文"
-        assert session.says[0]["text"] in filler_lines()["cantonese"]
-        return d
+        assert len(player.plays) == 1, "out-of-band 播放(不排 speech 队列)"
+        assert d._fired_lines == [d._fired_lines[0]] and d._fired_lines[0] in filler_lines()["cantonese"]
+
+    _run(_case())
+
+
+def test_player_none_disables(tmp_path):
+    async def _case():
+        d, player, _session, _tts, cache = _director(tmp_path, player=None)
+        _seed(cache, "cantonese")
+        os.environ["BOK_FILLER_DELAY_MS"] = "10"
+        try:
+            d.arm()
+            await asyncio.sleep(0.08)
+        finally:
+            os.environ.pop("BOK_FILLER_DELAY_MS", None)
+        assert player is None and d._timer is None, "无 player 垫话整体失效(arm 即返)"
 
     _run(_case())
 
 
 def test_cancelled_by_reply_first_audio(tmp_path):
     async def _case():
-        d, session, _tts, cache = _director(tmp_path)
+        d, player, _session, _tts, cache = _director(tmp_path)
         _seed(cache, "cantonese")
         os.environ["BOK_FILLER_DELAY_MS"] = "400"
         try:
@@ -106,52 +133,69 @@ def test_cancelled_by_reply_first_audio(tmp_path):
             await asyncio.sleep(0.05)
         finally:
             os.environ.pop("BOK_FILLER_DELAY_MS", None)
-        assert session.says == [], "快轮永远不垫"
+        assert player.plays == [], "快轮永远不垫"
 
     _run(_case())
 
 
-def test_interrupt_playing_filler_on_reply_audio(tmp_path):
+def test_stop_playing_filler_on_reply_audio(tmp_path):
     async def _case():
-        d, session, _tts, cache = _director(tmp_path)
+        d, player, _session, _tts, cache = _director(tmp_path)
         _seed(cache, "cantonese")
         os.environ["BOK_FILLER_DELAY_MS"] = "10"
         try:
             d.arm()
-            await asyncio.sleep(0.08)  # 已开火、句柄已记(playout 中)
-            assert len(session.says) == 1
-            d.on_reply_first_audio()  # 真回复出声 → 定向打断
-            assert session.says[0]["_handle"].interrupted, "真回复出声必须打断垫话"
+            await asyncio.sleep(0.08)  # 已开火、句柄已记(out-of-band 播放中)
+            assert len(player.plays) == 1
+            d.on_reply_first_audio()  # 真回复出声 → 停垫话
+            assert player.handles[0].stopped, "真回复出声必须停垫话"
         finally:
             os.environ.pop("BOK_FILLER_DELAY_MS", None)
-        assert d._handle is None, "打断后句柄清档"
+        assert d._handle is None, "停播后句柄清档"
+
+    _run(_case())
+
+
+def test_cancel_stops_playing_filler_on_new_user_turn(tmp_path):
+    async def _case():
+        d, player, _session, _tts, cache = _director(tmp_path)
+        _seed(cache, "cantonese")
+        os.environ["BOK_FILLER_DELAY_MS"] = "10"
+        try:
+            d.arm()
+            await asyncio.sleep(0.08)
+            d.cancel()  # 用户再开口:out-of-band 音轨框架打断管不到,必须自己停
+            assert player.handles[0].stopped, "新用户轮必须停掉在播垫话"
+        finally:
+            os.environ.pop("BOK_FILLER_DELAY_MS", None)
 
     _run(_case())
 
 
 def test_cache_miss_skips_never_synthesizes(tmp_path):
     async def _case():
-        d, session, _tts, _cache = _director(tmp_path, voice="other-voice")  # 音色不同 → miss
+        d, player, _session, _tts, _cache = _director(tmp_path, voice="other-voice")  # 音色不同 → miss
         os.environ["BOK_FILLER_DELAY_MS"] = "10"
         try:
             d.arm()
             await asyncio.sleep(0.08)
         finally:
             os.environ.pop("BOK_FILLER_DELAY_MS", None)
-        assert session.says == [], "缓存未命中必须跳过,绝不触发云合成"
+        assert player.plays == [], "缓存未命中必须跳过,绝不触发云合成"
 
     _run(_case())
 
 
 def test_max_per_call_and_rotation(tmp_path):
     async def _case():
-        d, session, _tts, cache = _director(tmp_path)
+        d, player, _session, _tts, cache = _director(tmp_path)
         _seed(cache, "cantonese")
         os.environ["BOK_FILLER_DELAY_MS"] = "10"
         os.environ["BOK_FILLER_MAX"] = "2"
         try:
             d.arm()
             await asyncio.sleep(0.06)
+            d._handle = None  # 上一句已播完(句柄清档),下一句先至可以叠上
             d.arm()
             await asyncio.sleep(0.06)
             d.arm()  # 第三次:超限,唔播
@@ -159,15 +203,15 @@ def test_max_per_call_and_rotation(tmp_path):
         finally:
             os.environ.pop("BOK_FILLER_DELAY_MS", None)
             os.environ.pop("BOK_FILLER_MAX", None)
-        assert len(session.says) == 2, "每通限次"
-        assert session.says[0]["text"] != session.says[1]["text"], "轮换不重样"
+        assert len(player.plays) == 2, "每通限次"
+        assert d._fired_lines[0] != d._fired_lines[1], "轮换不重样"
 
     _run(_case())
 
 
 def test_guards_abort(tmp_path):
     async def _case():
-        d, session, _tts, cache = _director(tmp_path, guards=lambda: True)
+        d, player, _session, _tts, cache = _director(tmp_path, guards=lambda: True)
         _seed(cache, "cantonese")
         os.environ["BOK_FILLER_DELAY_MS"] = "10"
         try:
@@ -175,14 +219,14 @@ def test_guards_abort(tmp_path):
             await asyncio.sleep(0.08)
         finally:
             os.environ.pop("BOK_FILLER_DELAY_MS", None)
-        assert session.says == [], "guards(closing/收线等)命中不开火"
+        assert player.plays == [], "guards(closing/收线等)命中不开火"
 
     _run(_case())
 
 
 def test_kill_switch(tmp_path):
     async def _case():
-        d, session, _tts, cache = _director(tmp_path)
+        d, player, _session, _tts, cache = _director(tmp_path)
         _seed(cache, "cantonese")
         os.environ["BOK_FILLER_DELAY_MS"] = "10"
         os.environ["BOK_FILLER"] = "0"
@@ -192,6 +236,6 @@ def test_kill_switch(tmp_path):
         finally:
             os.environ.pop("BOK_FILLER_DELAY_MS", None)
             os.environ.pop("BOK_FILLER", None)
-        assert session.says == [], "BOK_FILLER=0 全关"
+        assert player.plays == [], "BOK_FILLER=0 全关"
 
     _run(_case())

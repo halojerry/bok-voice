@@ -153,7 +153,7 @@ async def main() -> None:
     def attach(track):
         if int(track.kind) != int(rtc.TrackKind.KIND_AUDIO):
             return
-        if getattr(track, "name", "") != "roomio_audio":
+        if getattr(track, "name", "") not in ("roomio_audio", "background_audio"):
             return
 
         async def _read():

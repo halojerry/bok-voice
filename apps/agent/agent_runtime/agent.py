@@ -1509,14 +1509,26 @@ async def entrypoint(ctx):
             _strip_expr_markup,
         ],
     )
-    # 垫话编排(PR-2):LLM 临场慢轮回复首音频 ~700ms 未到 → 播预合成应承语,
-    # 真回复出声即定向打断。arm/cancel 由 on_user_turn_completed 驱动;首音频
-    # 回调挂在 CachedTTS 透传层(未包缓存时挂不上,垫话自动失效——纯透传无回调)。
+    # 垫话编排(PR-2;2026-09-09 改版):LLM 临场慢轮回复首音频 ~700ms 未到 → 播
+    # 预合成应承语,真回复出声即停。**通道=BackgroundAudioPlayer out-of-band 音轨**
+    # (官方组件,独立 track 即刻出声)——旧 session.say() 走 speech 队列,1.8 调度
+    # 严格串行,垫话必然排在回复 speech 后面:多数被首音频回调静默吞掉(慢轮照样
+    # 纯静音),拥塞时竞态漏出=垫话在回复后才响(实机实证,call-065a1a12)。
+    # arm/cancel 由 on_user_turn_completed 驱动;首音频回调挂在 CachedTTS 透传层
+    # (未包缓存时挂不上,垫话自动失效——纯透传无回调)。start 在 session.start 之后。
+    try:
+        from livekit.agents import BackgroundAudioPlayer
+
+        _bg_audio = BackgroundAudioPlayer()
+    except Exception as _exc:  # noqa: BLE001 - 无 livekit(测试/异常环境)垫话失效
+        print(f"[agent] background audio unavailable, filler off: {_exc!r}", flush=True)
+        _bg_audio = None
     _filler = FillerDirector(
         session,
         tts_provider,
         _tts_cache,
         lang_resolver=lambda: language_state.lang if language_state.lang in ("zh", "cantonese", "en") else "zh",
+        player=_bg_audio,
         guards=lambda: (
             closed.is_set()
             or agent.paused
@@ -2277,6 +2289,15 @@ async def entrypoint(ctx):
     # AgentSession 内部已注册 job shutdown callback（自动 aclose），
     # 这里不能提前 close，否则会话在接通后立刻被销毁。
     await session.start(agent=agent, room=ctx.room)
+    # 垫话 out-of-band 音轨(官方 BackgroundAudioPlayer):独立 track 发布,web 端
+    # RoomAudioRenderer 渲染所有远端音轨故免改前端;失败仅垫话失效,唔阻通话。
+    if _bg_audio is not None:
+        try:
+            await _bg_audio.start(room=ctx.room, agent_session=session)
+            print("[agent] background audio track started (filler channel)", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[agent] background audio start failed, filler off: {exc!r}", flush=True)
+            _bg_audio = None
     _log_stage("session_started")
 
     if not agent.paused:
@@ -2318,6 +2339,12 @@ async def entrypoint(ctx):
         await closed.wait()
     finally:
         watch_task.cancel()
+        # 垫话 out-of-band 音轨收摊(取消在播任务+取消发布);失败唔阻结算。
+        if _bg_audio is not None:
+            try:
+                await asyncio.wait_for(_bg_audio.aclose(), timeout=3.0)
+            except Exception:  # noqa: BLE001
+                pass
         # 结算收尾窗口(2026-09-09 QA B1):entrypoint 返回即 job teardown,
         # 不等 _close 的话 settle/session_report 请求会被进程退出摧毁。
         # 12s 上限防卡死;teardown 路径由 shutdown callback 再兜一层。

@@ -68,7 +68,7 @@ async def road(idx: int, results: list) -> None:
     read_task = None
 
     def attach(track):
-        if int(track.kind) != int(rtc.TrackKind.KIND_AUDIO) or getattr(track, "name", "") != "roomio_audio":
+        if int(track.kind) != int(rtc.TrackKind.KIND_AUDIO) or getattr(track, "name", "") not in ("roomio_audio", "background_audio"):
             return
 
         async def _read():
