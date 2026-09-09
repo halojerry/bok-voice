@@ -128,6 +128,11 @@ def _startup() -> None:
             asyncio.get_event_loop().create_task(_rebuild_in_memory_knowledge(vector, vault))
         except Exception as exc:  # pragma: no cover
             control_log.warning("knowledge_rebuild_failed", extra={"data": {"error": str(exc)}})
+    # 僵尸通话回收(QA B4):启动先扫一遍,再 60s 周期。
+    try:
+        asyncio.get_event_loop().create_task(_reaper_loop())
+    except Exception as exc:  # pragma: no cover
+        control_log.warning("reaper_start_failed", extra={"data": {"error": str(exc)}})
     app.state.settlement = SettlementTrigger()
     # Mirror every JSONL audit event into the repository (SQL or in-memory) so
     # /api/audit is queryable without scraping the file sink.
@@ -667,6 +672,108 @@ def clear_ended_calls(account_id: str = "acc-001") -> dict:
             removed += 1
     _audit("call.clear_ended", subject_type="call", detail={"removed": removed, "account_id": account_id})
     return {"deleted": removed}
+
+
+# ---- 僵尸通话回收器(QA B4,2026-09-09):状态机流转原本挂在「下一个请求」上,
+# agent 崩溃/浏览器直接关页会让 ringing/active 永久停摆(supervisor 曾显示 26 路
+# 假活跃)。启动扫一遍 + 60s 周期:
+#   ①ringing 且 created_at>10min → FAILED(从未接通,无 token 无 turns);
+#   ②active/paused 且 LiveKit 房间已无参与者 → ENDED(abandoned)+ 兜底 settle
+#     (幂等,existing 短路——agent 实时结算为主,这里只扫尾)。
+_STALE_RINGING_S = 600
+_REAP_INTERVAL_S = 60
+
+
+async def _room_has_participants(room_name: str) -> bool:
+    """房间存在且有参与者 → True;房间不存在/服务不可用 → False(可回收)。"""
+    key = getattr(app.state, "lk_key", "") or os.environ.get("LIVEKIT_API_KEY", "")
+    secret = getattr(app.state, "lk_secret", "") or os.environ.get("LIVEKIT_API_SECRET", "")
+    url = getattr(app.state, "lk_url", "") or os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880")
+    if not key or not secret or not room_name:
+        return False
+    http_url = url.replace("ws://", "http://").replace("wss://", "https://").rstrip("/")
+    try:
+        import aiohttp
+
+        from livekit.api import ListParticipantsRequest
+        from livekit.api.room_service import RoomService
+
+        async with aiohttp.ClientSession() as session:
+            svc = RoomService(session, http_url, key, secret)
+            res = await svc.list_participants(ListParticipantsRequest(room=room_name))
+            return len(res.participants or []) > 0
+    except Exception:
+        # 房间不存在(NotFound)→ 无人 → False;鉴权/网络异常同样按可回收处理
+        # (比「永远卡 active」好;回收带 disposition=abandoned 可追溯)。
+        return False
+
+
+def _created_before(call: dict, seconds: float) -> bool:
+    raw = call.get("created_at")
+    if not raw:
+        return False
+    try:
+        import datetime as _dt
+
+        if isinstance(raw, str):
+            ts = _dt.datetime.fromisoformat(raw)
+        elif isinstance(raw, _dt.datetime):
+            ts = raw
+        else:
+            return False
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=_dt.timezone.utc)
+        import time as _time
+
+        return (_time.time() - ts.timestamp()) >= seconds
+    except Exception:
+        return False
+
+
+async def _reap_stale_calls_once() -> dict:
+    out = {"failed": 0, "ended": 0, "settled": 0}
+    for c in _repo().list_calls("", status=CallStatus.RINGING.value):
+        if _created_before(c, _STALE_RINGING_S):
+            _repo().update_call(c["id"], status=CallStatus.FAILED.value, disposition="abandoned")
+            out["failed"] += 1
+    for st in (CallStatus.ACTIVE.value, CallStatus.PAUSED.value):
+        for c in _repo().list_calls("", status=st):
+            if await _room_has_participants(c["id"]):
+                continue
+            _repo().update_call(c["id"], status=CallStatus.ENDED.value, disposition="abandoned")
+            out["ended"] += 1
+            try:
+                await settle(c["id"])  # 幂等:已结算直接 existing 短路
+                out["settled"] += 1
+            except Exception as exc:  # pragma: no cover - 兜底结算失败不阻回收
+                print(f"[cp] reaper settle skipped ({c['id']}): {exc!r}", flush=True)
+    # ③ended 但无结算的历史通话补结算(存量 172 通;幂等,每轮限量防风暴)。
+    patched = 0
+    for c in _repo().list_calls("", status=CallStatus.ENDED.value):
+        if patched >= 10:
+            break
+        if not _created_before(c, 3600):
+            continue
+        if _repo().get_settlement(c["id"]):
+            continue
+        try:
+            await settle(c["id"])
+            patched += 1
+            out["settled"] += 1
+        except Exception as exc:  # pragma: no cover
+            print(f"[cp] reaper backfill settle skipped ({c['id']}): {exc!r}", flush=True)
+    return out
+
+
+async def _reaper_loop() -> None:
+    while True:
+        try:
+            r = await _reap_stale_calls_once()
+            if any(r.values()):
+                print(f"[cp] reaper {r}", flush=True)
+        except Exception as exc:  # pragma: no cover - 回收失败不阻服务
+            print(f"[cp] reaper error {exc!r}", flush=True)
+        await asyncio.sleep(_REAP_INTERVAL_S)
 
 
 @app.post("/api/calls/{call_id}/hangup")
@@ -1250,11 +1357,18 @@ def update_template(template_id: str, req: UpdateTemplateRequest) -> dict:
         raise HTTPException(404, "template not found")
     # 话术版本化（2026-09-07 专项 B3）:update 即快照旧版——「哪版话术转化更好」
     # 从数据上可答;call_sessions.template_id 快照指向的版本内容不再随更新漂移。
+    # default=str:SQL repo 的 before 含 datetime(created_at),不转直接 500——
+    # 每次编辑保存必炸且静默丢改动(2026-09-09 QA B2 实锤;in-memory 测试替身
+    # 无 created_at 字段所以单测全绿,prod-only 断裂)。
     revision = len(_repo().list_template_revisions(template_id)) + 1
     import json as _revjson
 
-    _repo().append_template_revision(template_id, revision, _revjson.dumps(before, ensure_ascii=False))
-    tpl = _repo().update_template(template_id, req.model_dump())
+    _repo().append_template_revision(template_id, revision, _revjson.dumps(before, ensure_ascii=False, default=str))
+    # exclude_unset:部分更新只写请求里显式出现的键——schema 全字段带默认值
+    # (language 默认 zh/name 默认空),整包 dump 会把未传字段抹掉(2026-09-09
+    # QA「PUT 抹字段」实锤;前端 save 恒传全字段,行为不变,API 语义修正)。
+    payload = req.model_dump(exclude_unset=True)
+    tpl = _repo().update_template(template_id, payload)
     _audit(
         "template.update",
         subject_type="template",

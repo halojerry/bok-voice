@@ -16,6 +16,7 @@ Bok Voice 是一套本地优先的 AI 语音客服系统，可在电脑上离线
 - 计费：无需按分钟付费，一次购买本地运行。`;
 
 export default function KnowledgePage() {
+  const [showAllDocs, setShowAllDocs] = useState(false);
   const { accountId } = useAccount();
   const [q, setQ] = useState("");
   const [results, setResults] = useState<Record<string, unknown>[]>([]);
@@ -94,7 +95,7 @@ export default function KnowledgePage() {
             <EmptyState label="暂无知识源，请在右侧导入 Markdown。" />
           ) : (
             <div className="mt-3 space-y-2">
-              {docs.map((doc) => {
+              {docs.slice(0, showAllDocs ? docs.length : 50).map((doc) => {
                 const id = String(doc.id ?? "");
                 return (
                   <div key={id} className="flex items-start justify-between gap-3 rounded-lg bg-white/5 px-4 py-3">
@@ -106,6 +107,11 @@ export default function KnowledgePage() {
                   </div>
                 );
               })}
+              {docs.length > 50 && !showAllDocs && (
+                <button className="btn-ghost w-full" onClick={() => setShowAllDocs(true)}>
+                  显示全部 {docs.length} 条（当前仅显示最近 50 条）
+                </button>
+              )}
             </div>
           )}
         </section>

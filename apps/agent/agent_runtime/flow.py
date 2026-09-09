@@ -20,6 +20,7 @@ QUESTION = "question"     # 提问/要解释 → 停留本步解答
 OFFTOPIC = "offtopic"     # 明显无关/要挂断/怀疑诈骗 → 不强推
 UNCLEAR = "unclear"       # 判断不清 → 停留,自然应对
 REFUSE = "refuse"         # 明确拒绝/告别/要收线 → 收尾态:一句礼貌再见后结束通话
+REPEAT = "repeat"         # 没听清/要求重复 → 停留,把上一句关键内容再讲一遍(客户要求的重复照讲)
 
 
 @dataclass
@@ -188,6 +189,18 @@ _REFUSE_RE = re.compile(
 )
 # 「唔使X」嘅社交关心/客套短语——唔係拒绝,唔好当 REFUSE(旧实测:「唔使担心」曾误判)。
 _REFUSE_SOFT_GUARD_RE = re.compile(r"唔使(担心|擔心|客气|客氣|怕|緊張|紧张|多心|挂住|掛住)")
+# 没听清/要求重复(2026-09-09):「听唔清」「再说一次」「你说什么」→ REPEAT——客户要求
+# 嘅复述照讲(单号/数字逐位),唔算复读违例。只认【短句】(≤12 字):长句里出现
+# 「乜嘢」多半係内容提问(「乜嘢意思?」),照走 QUESTION。
+_REPEAT_RE = re.compile(
+    r"(听唔清|聽唔清|听不清|聽不清|冇聽清|冇听清|没听清|聽唔到|听唔到|听不到|听不见|聽唔見|"
+    r"再说一次|再說一次|再讲一次|再講一次|再说一遍|再講一遍|再讲一遍|讲多次|講多次|再讲啦|再講啦|"
+    r"乜嘢话|乜嘢啊|咩话|咩話|你说什么|你說什麼|你讲乜|你講乜|大声啲|大聲啲|"
+    r"repeat|pardon|say again|come again|didn'?t hear|can'?t hear|"
+    # 光杆「what?」「乜嘢?」=纯没听清;锚定整句,「what time」「乜嘢意思」照走 QUESTION
+    r"^what\s*\?*$|^乜嘢\s*\?*$|^咩\s*\?*$)",
+    re.IGNORECASE,
+)
 # 多字「强确认」:疑问句里出现都算确认(「係我,然後呢?」);单字「係/好/嗯/对/可以」
 # 喺疑问句(「係咩?」「可以點做?」)唔当确认,靠 _CONFIRM_RE 只喺非疑问句时兜底。
 _STRONG_AFFIRM_RE = re.compile(
@@ -306,11 +319,11 @@ def should_auto_advance(*, current: int, goal: str, ref: str, user_text: str, ve
       offered(應承加未俾號)則停留;淨係答到平台 → 停留喺本步,繼續叫客戶俾WhatsApp/傳截圖。
       若只係純核對平台(冇 WhatsApp 要求)→ 答到平台即過。
     """
-    if verdict in (OBJECTION, REFUSE):
+    if verdict in (OBJECTION, REFUSE, REPEAT):
         return False
     if current == 0:
         # 純提問(客問「你哋邊間公司?」)要喺開場步答,唔推;其他實質回應都推。
-        return verdict != QUESTION
+        return verdict not in (QUESTION, REPEAT)
     ctx = f"{goal} {ref}"
     low_ctx = ctx.lower()
     # 兼要攞WhatsApp/截圖嘅核實步(提示詞粵/普/英收齊,{聯絡方式}/{contact} 佔位字面都算):
@@ -323,6 +336,8 @@ def should_auto_advance(*, current: int, goal: str, ref: str, user_text: str, ve
     if wa_step:
         return False  # 要攞WhatsApp/截圖,未攞到 → 唔好跳去下一步
     if verdict == QUESTION:
+        return False
+    if verdict == REPEAT:
         return False
     if ("平台" in ctx or "核實" in ctx or "核实" in ctx or "邊個平台" in ctx
             or "platform" in low_ctx or "verify" in low_ctx) and _PLATFORM_RE.search(user_text):
@@ -506,6 +521,10 @@ def decide_advance(user_text: str, *, facts: dict | None = None, short_ack_confi
     # 2) 明确否认/不是本人 → objection(优先于确认词,避免"不是,是我…"误判)
     if _DENY_RE.search(t):
         return OBJECTION
+    # 2.5) 没听清/要求重复(短句) → REPEAT:停留,上一句关键内容照再讲一遍。
+    # 先于 question/confirm:「你说什么?」主体係要求重复,唔係内容提问。
+    if len(t) <= 12 and _REPEAT_RE.search(t):
+        return REPEAT
     is_question = bool(_QUESTION_RE.search(t))
     strong_affirm = bool(_STRONG_AFFIRM_RE.search(t))
     fact_match = _matches_known_fact(t, facts)
@@ -660,6 +679,11 @@ class FlowController:
         提问/答非所问时 flow 唔动、模型又冇「该怎么答」嘅指引,4B 默认复读当前步
         (2026-09-06 实证:同一句 WhatsApp 确认逐字问两遍)。标准书面中文(语言纯度)。"""
         v = self.last_verdict
+        if v == REPEAT:
+            return (
+                "【客户没听清，要求重复】把你上一句的关键内容再讲一遍——这是客户要求的"
+                "重复，照讲，不算复读；数字/单号要逐位慢慢念，语速放慢，讲完停下等客户。"
+            )
         if v == QUESTION:
             return (
                 "【客户在提问】先用话术里的事实直接回答客户的问题"
@@ -701,6 +725,8 @@ class FlowController:
                 "【新一步】客户刚刚确认了上一步，现在已经进入这一步。"
                 "立即按这一步的目标来讲——不要讲「等我查下再答复你」「几分钟内答复你」这类拖延话术"
                 "（你手上已经有足够资料讲这一步），也不要延续上一步话题或继续自己刚才应承过的事。"
+                "未经客户要求，不要复读你上一句回复：客户已听过一遍，换本步话术的措辞重新开头"
+                "（客户明确说没听清、要求重复时除外——那要把关键内容再讲一遍）。"
             )
         verdict_line = self._verdict_guidance()
         if verdict_line:

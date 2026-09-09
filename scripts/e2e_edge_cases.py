@@ -28,7 +28,6 @@ LIVEKIT_URL = "ws://127.0.0.1:7880"
 CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
 ASR_URL = "http://127.0.0.1:8787"
 TTS_URL = "http://127.0.0.1:8788"
-AUDIO_DIR = ROOT / "tests" / "fixtures" / "audio"
 OUT_DIR = Path("/tmp/qa-edge-audio")
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -39,13 +38,6 @@ def frame_rms(pcm: bytes) -> float:
     n = len(pcm) // 2
     frames = struct.unpack(f"<{n}h", pcm)
     return math.sqrt(sum(x * x for x in frames) / n)
-
-
-def read_wav_pcm(path: Path, max_seconds: float = 600.0) -> tuple[bytes, int]:
-    with wave.open(str(path), "rb") as w:
-        sr = w.getframerate()
-        n = int(min(w.getnframes(), sr * max_seconds))
-        return w.readframes(n), sr
 
 
 def tts_pcm(text: str, lang: str = "cantonese") -> bytes:
@@ -179,11 +171,30 @@ async def main() -> int:
     digit_pcm = tts_pcm("我個單號係三七七八九零，唔該幫我查下。")
     ack1 = tts_pcm("好。")
     ack2 = tts_pcm("係。")
-    long_pcm, _ = read_wav_pcm(AUDIO_DIR / "cantonese.wav")
-    long_input = b"".join(long_pcm + silence_pcm(0.5) for _ in range(10))  # ~45s
-    zh_pcm, _ = read_wav_pcm(AUDIO_DIR / "zh.wav")
-    cantonese_pcm, _ = read_wav_pcm(AUDIO_DIR / "cantonese.wav")
-    en_pcm, _ = read_wav_pcm(AUDIO_DIR / "en.wav")
+    # ---- 测试话音：真人客户口吻（集运/理赔域），每句只用一次 ----
+    # 旧版推 fixtures（138s 长音频截 4.5s）：同一段「有冇人知道灣仔活動」一次跑
+    # 里推 11 遍——输入复读令模型回复也近似复读（E5b 0.95 相似对误伤），且内容
+    # 与业务域无关。全部改 TTS 现场合成，句句不同。
+    canto_pool = [
+        tts_pcm(t)
+        for t in (
+            "我件貨講咗三日就到，到而家都未到喎。",
+            "你哋話一賠二，點賠㗎？",
+            "我個件喺深圳集運，係咪卡咗喺海關度？",
+            "唔該幫我查下，我個單號啱啱短信收到嘅。",
+            "送嗰日我唔喺屋企，可唔可以放喺管理處？",
+            "運費幾多錢？包唔包保險㗎？",
+            "上次個專員話會跟進，跟進咗去邊？",
+            "我件嘢爛咗，外包裝都凹咗。",
+        )
+    ]
+    e4_first = tts_pcm("我要投訴，件貨延誤咗成個禮拜。")
+    e4_interrupt = tts_pcm("Hello, I would like to know more about your compensation policy.", lang="en")
+    e6_pcm = tts_pcm("咁我唔等喇，唔該幫我跟進埋佢。")
+    e7_pcm = tts_pcm("喂，聽到咩？")
+    # E3 超长输入 = 8 句【不同】真人话连讲（句间 0.5s 自然停顿），唔再同一段
+    # fixture 推 10 遍——同输入会令模型回复也近似复读，测试失真。
+    long_input = b"".join(pcm + silence_pcm(0.5) for pcm in canto_pool)
 
     # ---- 共享通话跑 E1-E5 ----
     call_id, room, audio_source, agent_audio = await make_call("main")
@@ -241,13 +252,13 @@ async def main() -> int:
 
     # E4 回复中打断：推 cantonese 触发回复，检测到回复语音立即推 en
     mark = len(agent_audio)
-    push_task = asyncio.get_running_loop().create_task(push_pcm(audio_source, cantonese_pcm))
+    push_task = asyncio.get_running_loop().create_task(push_pcm(audio_source, e4_first))
     speech_at = await wait_reply_speech(agent_audio, mark, 40)
     await push_task
     if speech_at >= 0:
         # 回复语音中推入新输入
         interrupt_mark = len(agent_audio)
-        await push_pcm(audio_source, en_pcm)
+        await push_pcm(audio_source, e4_interrupt)
         grew = await wait_reply_speech(agent_audio, interrupt_mark, 40)
         turns = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", timeout=10).json()
         record("E4 回复中打断有后续回复", grew >= 0 and len(turns) > 0, f"turns={len(turns)}")
@@ -256,7 +267,7 @@ async def main() -> int:
 
     # E5 快速短应承×3（短应承被吞→只剩心跳收线的回归）
     n_before = turns_count(call_id)
-    for pcm in (ack1, ack2, ack1):
+    for pcm in (ack1, ack2, tts_pcm("好呀。")):
         mark = len(agent_audio)
         await push_pcm(audio_source, pcm)
         await asyncio.sleep(2.5)
@@ -265,6 +276,40 @@ async def main() -> int:
     status = alive.json().get("status", "")
     n_after = turns_count(call_id)
     record("E5 连续短应承通话存活且有轮", status == "active" and n_after >= n_before, f"status={status} turns {n_before}->{n_after}")
+
+    # E5b 相邻 LLM 回复禁逐字复读（推进轮复读前轮话术块回归，call-feaf914c 实证）。
+    # 只比「intervening 用户输入不同」的对：E3 故意同输入推 10 次，同输入→近似
+    # 回答係正确服务行为，唔算复读；「不同输入给同一答案」先係缺陷形状。
+    import difflib
+
+    def _norm_rep(t: str) -> str:
+        return "".join(ch for ch in (t or "") if ch.isalnum())
+
+    rows = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", timeout=10).json()
+    seq = [
+        (t.get("role"), _norm_rep(t.get("transcript") or ""), (t.get("latency_ms") or 0) > 0)
+        for t in rows
+    ]
+    prev_reply = ""        # 上一条 LLM 回复（归一）
+    input_before_prev = ""  # 上一条 LLM 回复之前的用户输入
+    input_since = ""        # 自上一条 LLM 回复以来的用户输入
+    dup = []
+    for role, text, is_llm in seq:
+        if role == "user" and text:
+            input_since += text
+            continue
+        if role == "assistant" and is_llm and len(text) >= 8:
+            if prev_reply and input_since:
+                input_shift = (
+                    difflib.SequenceMatcher(None, input_since, input_before_prev).ratio() < 0.8
+                )
+                ratio = difflib.SequenceMatcher(None, prev_reply, text).ratio()
+                if input_shift and ratio >= 0.9:
+                    dup.append((prev_reply[:20], text[:20], round(ratio, 2)))
+            prev_reply = text
+            input_before_prev = input_since
+            input_since = ""
+    record("E5b 相邻LLM回复不逐字复读", len(dup) == 0, f"dup={dup[:2]}")
     await room.disconnect()
     try:
         httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/hangup", timeout=10)
@@ -275,7 +320,7 @@ async def main() -> int:
     call_id2, room2, audio_source2, agent_audio2 = await make_call("hangup")
     await asyncio.sleep(12)
     mark = len(agent_audio2)
-    push_task = asyncio.get_running_loop().create_task(push_pcm(audio_source2, cantonese_pcm))
+    push_task = asyncio.get_running_loop().create_task(push_pcm(audio_source2, e6_pcm))
     await wait_reply_speech(agent_audio2, mark, 40)
     r1 = httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id2}/hangup", timeout=10)
     r2 = httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id2}/settle", timeout=30)
@@ -288,7 +333,7 @@ async def main() -> int:
     try:
         call_id3, room3, audio_source3, agent_audio3 = await make_call("alive")
         mark = len(agent_audio3)
-        await push_pcm(audio_source3, cantonese_pcm)
+        await push_pcm(audio_source3, e7_pcm)
         ok_alive = await wait_reply_speech(agent_audio3, mark, 40) >= 0
         await room3.disconnect()
         try:

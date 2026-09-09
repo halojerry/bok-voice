@@ -52,7 +52,9 @@ def test_tail_renders_facts_and_last_reply_anchor():
     tail = st.render_context_tail()
     assert "【通话中客户已讲" in tail and "拼多多" in tail
     assert "【你上一句】" in tail and "七八九零" in tail
-    assert "绝不原句或近原句再讲一次" in tail
+    # 指令文本已上移稳定前缀【重复控制】(S5 尾部瘦身),尾部只留引文
+    assert "绝不原句或近原句再讲一次" in st.render_instruction_prefix()
+    assert "绝不原句或近原句再讲一次" not in tail
     # 空态唔渲染空节
     empty = ContextState(account_id="t").render_context_tail()
     assert "【通话中客户已讲" not in empty and "【你上一句】" not in empty
@@ -96,3 +98,56 @@ def test_facts_added_midcall_keep_strict_prefix():
     assert s2.startswith(s1 + "\n"), "facts 中途加入不得破坏严格前缀"
     # 新事实出现在新 user 的尾部,且旧 user 冻结重放不含它
     assert "拼多多" in s2
+
+
+# ---- 尾部瘦身（BOK_TAIL_SLIM,2026-09-09 S5）:无实质变化轮只发紧凑标签 ----
+
+def _bok_slim_off(monkeypatch):
+    monkeypatch.setenv("BOK_TAIL_SLIM", "0")
+
+
+def test_tail_slim_compact_when_revision_unchanged():
+    st = ContextState(account_id="t")
+    st.set_flow_current("流程第 2/5 步\n这一步要达成:xxx")
+    st.set_last_reply("好的，我帮你查下。")
+    st.record_applied_tail("u1", "u1\n\n" + st.render_context_tail())  # 首轮全量冻结
+    slim = st.render_context_tail()
+    assert "·继续】" in slim and "状态无实质变化" in slim
+    assert "【你上一句】「好的，我帮你查下。」" in slim
+    # 紧凑尾不含全量【现在这一步】块(全量指引在上轮冻结尾部里可见)
+    assert "【现在这一步】" not in slim
+
+
+def test_tail_full_when_revision_changed():
+    st = ContextState(account_id="t")
+    st.set_flow_current("流程第 2/5 步\n这一步要达成:xxx")
+    st.record_applied_tail("u1", "u1\n\n" + st.render_context_tail())
+    st.set_flow_current("流程第 3/5 步\n这一步要达成:yyy")  # 推进 → revision+1
+    full = st.render_context_tail()
+    assert "【现在这一步】" in full and "yyy" in full
+    assert "·继续】" not in full
+
+
+def test_add_call_fact_bumps_revision():
+    st = ContextState(account_id="t")
+    rev0 = st.revision
+    st.add_call_fact("客户讲过在拼多多买")
+    assert st.revision == rev0 + 1  # 事实属实质变化,瘦身门需要全量尾部带新事实
+
+
+def test_tail_slim_env_off(monkeypatch):
+    _bok_slim_off(monkeypatch)
+    st = ContextState(account_id="t")
+    st.set_flow_current("流程第 2/5 步\n这一步要达成:xxx")
+    st.record_applied_tail("u1", "u1\n\n" + st.render_context_tail())
+    assert "【现在这一步】" in st.render_context_tail()  # 关闭=恒全量
+
+
+def test_repeat_control_moved_to_prefix():
+    st = ContextState(account_id="t")
+    st.set_last_reply("好的。")
+    prefix = st.render_instruction_prefix()
+    assert "【重复控制】" in prefix
+    # 尾部不再携带逐字重复的指令文本,只留引文
+    tail = st.render_context_tail()
+    assert "已讲过的内容绝不原句" not in tail

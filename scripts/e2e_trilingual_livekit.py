@@ -28,12 +28,16 @@ LIVEKIT_URL = "ws://127.0.0.1:7880"
 LIVEKIT_KEY = "devkey"
 LIVEKIT_SECRET = "devsecret"
 CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
-AUDIO_DIR = ROOT / "tests" / "fixtures" / "audio"
+TTS_URL = os.environ.get("TTS_URL", "http://127.0.0.1:8788")
 
 _ALL_CASES = [
-    {"lang": "zh", "file": "zh.wav", "expect_lang": "Chinese"},
-    {"lang": "cantonese", "file": "cantonese.wav", "expect_lang": "Cantonese"},
-    {"lang": "en", "file": "en.wav", "expect_lang": "English"},
+    # 真人客户口吻（每语言一句域内话术,TTS 现场合成,弃 fixtures 灣仔問路句）
+    {"lang": "zh", "expect_lang": "Chinese",
+     "text": "我的快递讲好三天就到，到现在还没到，麻烦帮我查一下。", "tts_lang": "zh"},
+    {"lang": "cantonese", "expect_lang": "Cantonese",
+     "text": "我件貨講咗三日就到，到而家都未到喎，唔該幫我查下。", "tts_lang": "cantonese"},
+    {"lang": "en", "expect_lang": "English",
+     "text": "Hello, my parcel was supposed to arrive three days ago and it still has not arrived.", "tts_lang": "en"},
 ]
 CASES = [
     c
@@ -50,13 +54,17 @@ def frame_rms(pcm: bytes) -> float:
     return math.sqrt(sum(x * x for x in frames) / n)
 
 
-def read_pcm16(path: Path, max_seconds: float = 4.0) -> bytes:
-    with wave.open(str(path), "rb") as w:
-        n = int(min(w.getnframes(), w.getframerate() * max_seconds))
-        frames = w.readframes(n)
-        if w.getframerate() != 16000:
-            raise SystemExit(f"{path}: need 16k, got {w.getframerate()}")
-        return frames
+def tts_pcm(text: str, lang: str) -> bytes:
+    """经 TTS sidecar 合成 16k PCM 测试话音。"""
+    import httpx
+
+    with httpx.Client(timeout=60) as client:
+        r = client.post(
+            f"{TTS_URL}/v1/audio/speech",
+            json={"input": text, "language": lang, "voice": "Vivian", "sample_rate": 16000},
+        )
+        r.raise_for_status()
+        return r.content
 
 
 async def run_case(room: rtc.Room, audio_source: rtc.AudioSource, case: dict) -> dict:
@@ -126,7 +134,7 @@ async def run_case(room: rtc.Room, audio_source: rtc.AudioSource, case: dict) ->
     agent_audio.clear()
     await asyncio.sleep(0.5)
 
-    pcm = read_pcm16(AUDIO_DIR / case["file"])
+    pcm = tts_pcm(case["text"], case["tts_lang"])
     chunk = int(16000 * 0.1) * 2
     for i in range(0, len(pcm), chunk):
         seg = pcm[i : i + chunk]

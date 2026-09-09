@@ -1684,18 +1684,48 @@ async def entrypoint(ctx):
                 # 行格式统一在 _format_llm_metrics（含 cached=prompt_cached/prompt,
                 # KV-cache 命中可视），单测直接喂鸭型 metrics 断言。
                 print(f"{tag}{_format_llm_metrics(m)}", flush=True)
+                _maybe_print_perceived(tag)
             elif kind == "tts_metrics":
+                _turn_metrics["tts_ttfb_ms"] = int(m.ttfb * 1000)
                 print(f"{tag}AGENT_METRICS tts ttfb={m.ttfb * 1000:.0f}ms audio={m.audio_duration:.2f}s", flush=True)
+                _maybe_print_perceived(tag)
             elif kind == "eou_metrics":
+                _turn_metrics["eou_ms"] = int(m.end_of_utterance_delay * 1000)
                 print(
                     f"{tag}AGENT_METRICS eou delay={m.end_of_utterance_delay * 1000:.0f}ms "
                     f"transcription={m.transcription_delay * 1000:.0f}ms",
                     flush=True,
                 )
+                _maybe_print_perceived(tag)
         except Exception:
             pass
 
+    def _maybe_print_perceived(tag: str) -> None:
+        """北极星指标（2026-09-09）:用户讲完→AI 出声 = 端点判定+LLM 首字+TTS 首包。
+
+        事件到达顺序不固定（tts_metrics 常先于 llm_metrics——LLM 流关闭在语音
+        合成完之后），所以三段各自入账、到齐即打（旁路轮:QA 快路/垫话/脚本直念
+        冇全三段,唔计,防残值串轮）。优化前后直接 grep PERCEIVED_MS 睇分布。
+        """
+        if {"eou_ms", "llm_ttft_ms", "tts_ttfb_ms"} <= _turn_metrics.keys():
+            _eou_ms = _turn_metrics.pop("eou_ms")
+            _llm_ms = _turn_metrics.pop("llm_ttft_ms")
+            _tts_ms = _turn_metrics.pop("tts_ttfb_ms")
+            _turn_metrics.clear()
+            print(
+                f"{tag}PERCEIVED_MS total={_eou_ms + _llm_ms + _tts_ms} "
+                f"(eou={_eou_ms} llm={_llm_ms} tts={_tts_ms})",
+                flush=True,
+            )
+
     session.on("metrics_collected", _on_metrics)
+
+    # 结算收尾事件(2026-09-09 QA B1):web 挂断 → close_on_disconnect → session
+    # 关闭 → entrypoint 立即返回 → job teardown 把裸 create_task 的 _close 杀掉
+    # ("Task was destroyed"),settle 请求从未发出=结算落库 0 条。现在:
+    # ①_close 完成置 _close_flushed;②entrypoint 返回前等它;③shutdown callback
+    # 再兜 teardown 路径——结算请求必定发出。
+    _close_flushed = asyncio.Event()
 
     def _on_close(ev):
         closed.set()
@@ -1711,7 +1741,11 @@ async def entrypoint(ctx):
                 print(f"[agent] session report failed: {exc!r} (call {room_name})", flush=True)
             await cp.settle(call_id)
 
-        asyncio.create_task(_close())
+        def _close_done(_task: asyncio.Task) -> None:
+            _close_flushed.set()
+
+        _close_task = asyncio.create_task(_close())
+        _close_task.add_done_callback(_close_done)
 
     # 明确拒绝收尾:礼貌告别讲完(一句 TTS+余量)后主动结束通话——
     # end_call 置 ENDED 并断房,结算由 _on_close 幂等触发。
@@ -1736,6 +1770,16 @@ async def entrypoint(ctx):
     session.on("conversation_item_added", _on_conversation_item)
     session.on("conversation_item_added", _on_item_for_context)
     session.on("close", _on_close)
+    # job shutdown callback(早注册):teardown 强杀协程前给结算收尾最后一次机会
+    # (闭包晚绑定,运行时 _close_flushed 必已定义)。
+    async def _wait_close_flush(_reason: str = "") -> None:
+        if not _close_flushed.is_set():
+            try:
+                await asyncio.wait_for(_close_flushed.wait(), timeout=12.0)
+            except asyncio.TimeoutError:
+                pass
+
+    ctx.add_shutdown_callback(_wait_close_flush)
 
     async def _background_flow_judge(step_at: int, utt: str) -> None:
         """背景跑 LLM 推進判定:唔好喺開聲前同步等(會每輪拖慢),判定完喺下一輪先生效。
@@ -2274,6 +2318,16 @@ async def entrypoint(ctx):
         await closed.wait()
     finally:
         watch_task.cancel()
+        # 结算收尾窗口(2026-09-09 QA B1):entrypoint 返回即 job teardown,
+        # 不等 _close 的话 settle/session_report 请求会被进程退出摧毁。
+        # 12s 上限防卡死;teardown 路径由 shutdown callback 再兜一层。
+        if not _close_flushed.is_set():
+            try:
+                await asyncio.wait_for(_close_flushed.wait(), timeout=12.0)
+                print(f"[agent] close flush done (call {room_name})", flush=True)
+            except asyncio.TimeoutError:
+                print(f"[agent] close flush timeout (call {room_name})", flush=True)
+
 
 
 def run_agent() -> None:

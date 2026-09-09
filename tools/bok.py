@@ -1413,7 +1413,7 @@ def cmd_prod(cmd: str) -> int:
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="bok", description="Bok voice stack launcher (no Docker)")
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("catalog", "manifest", "download", "status", "up", "serve", "down", "doctor", "tts-mine"):
+    for name in ("catalog", "manifest", "download", "status", "up", "serve", "down", "doctor", "tts-mine", "clean-testdata"):
         sub.add_parser(name)
     sub.add_parser("tts-pregen", help="离线预合成 TTS 本地缓存(参数透传:--greetings/--objects/--fillers/--cp/--model)")
     p_prod = sub.add_parser("prod", help="生产常驻单元与健康面")
@@ -1453,6 +1453,62 @@ def cmd_tts_mine(extra: list[str] | None = None) -> int:
     return proc.returncode
 
 
+def cmd_clean_testdata() -> int:
+    """清理历史测试数据(QA B3/B7,2026-09-09):对象下拉曾被 300+ E2E/soak 残留灌满。
+
+    默认 dry-run 只打印;`--apply` 才真删(经 CP API,审计可追溯)。范围:
+    ①对象 display_name 匹配测试前缀;②人设同名同公司重复(保留最早)。
+    """
+    import re as _re
+    import urllib.request as _uq
+
+    base = os.environ.get("BOK_CP_URL", "http://127.0.0.1:8000")
+    apply_mode = "--apply" in sys.argv
+    token = os.environ.get("BOK_CP_TOKEN", "")
+
+    def _get(path: str):
+        req = _uq.Request(f"{base}{path}")
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        with _uq.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+
+    def _delete(path: str) -> None:
+        req = _uq.Request(f"{base}{path}", method="DELETE")
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        _uq.urlopen(req, timeout=15).read()
+
+    pat = _re.compile(r"^(E2E-|soak\d*-?|并发|LOAD-|边角-|多轮-|probe)")
+    objs = _get("/api/objects")
+    stale = [o for o in objs if pat.match(str(o.get("display_name") or ""))]
+    print(f"objects: total={len(objs)} stale-matched={len(stale)}")
+    for o in stale:
+        print(f"  - {o['id']} {o.get('display_name')}")
+        if apply_mode:
+            _delete(f"/api/objects/{o['id']}")
+
+    seen: set[tuple[str, str]] = set()
+    dupes = []
+    for p_ in _get("/api/personas"):
+        k = (str(p_.get("name") or ""), str(p_.get("company") or ""))
+        if k in seen:
+            dupes.append(p_)
+        else:
+            seen.add(k)
+    print(f"personas: duplicate-matched={len(dupes)}")
+    for p_ in dupes:
+        print(f"  - {p_['id']} {p_.get('name')} / {p_.get('company')}")
+        if apply_mode:
+            _delete(f"/api/personas/{p_['id']}")
+
+    if not apply_mode:
+        print("dry-run: 未删除任何数据。加 --apply 执行。")
+    else:
+        print("apply done。")
+    return 0
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     if args.cmd == "setup":
@@ -1461,6 +1517,8 @@ def main(argv=None) -> int:
         return cmd_prod(args.action)
     if args.cmd == "tts-pregen":
         return cmd_tts_pregen(getattr(args, "extra", None))
+    if args.cmd == "clean-testdata":
+        return cmd_clean_testdata()
     if args.cmd == "tts-mine":
         return cmd_tts_mine(getattr(args, "extra", None))
     return {"catalog": cmd_catalog, "manifest": cmd_manifest, "download": cmd_download, "status": cmd_status,

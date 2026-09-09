@@ -215,6 +215,13 @@ export default function PersonasPage() {
   }, [activeLang, clonedVoices, speakers]);
 
   async function save() {
+    // 查重提示(QA B7,2026-09-09):同名同公司已存在 → 确认后仍可保存(不强制阻断)。
+    const dup = rows.find(
+      (x: Record<string, unknown>) => String(x.name ?? "") === form.name.trim() && String(x.company ?? "") === form.company.trim() && String(x.id) !== editingId,
+    );
+    if (dup && !window.confirm(`已存在同名同公司的人设「${dup.name} / ${dup.company}」（重复建档曾造成下拉出现多个同名项），仍要继续保存吗？`)) {
+      return;
+    }
     if (!form.name.trim()) {
       // 必须给出明确反馈：此前静默 return 会让用户以为"新建没反应"。
       setErr("请先填写称呼（名称）再保存。");

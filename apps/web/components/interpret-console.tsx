@@ -145,7 +145,9 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
       } catch (e) {
         if (!cancelled) setError(describeConnectError(e, "join-session"));
       } finally {
-        if (!cancelled) setBusy(false);
+        // 无条件复位:cancelled(权限拒绝/依赖重挂载)路径若不复位,结束按钮
+        // 会永久锁死(2026-09-09 QA B5 实测);busy 只表达「连接尝试进行中」。
+        setBusy(false);
       }
     })();
     return () => {
@@ -559,7 +561,7 @@ function ConsoleLive(p: LiveProps) {
           <button className="stage-btn-secondary" onClick={() => setClearedCount(transcriptions.length)}>
             清空字幕
           </button>
-          <button className="stage-btn-secondary mt-auto text-red-300" onClick={p.leave} disabled={p.busy}>
+          <button className="stage-btn-secondary mt-auto text-red-300" onClick={p.leave}>
             结束一体台会话
           </button>
         </section>

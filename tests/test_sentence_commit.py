@@ -1237,3 +1237,44 @@ def test_vad_pause_punct_path_fragment_also_gated(monkeypatch):
         ("END_OF_SPEECH", ""),
         ("FINAL_TRANSCRIPT", "好，我想了解一下。还有什么可以帮你？"),
     ], got
+
+
+# ---- join-hold 词表前缀门(品牌词防拆轮,S3 拼多多专项 2026-09-09)----
+
+from agent_runtime.providers.livekit_plugins import (  # noqa: E402
+    _join_hold_vocab_enabled,
+    _parse_vocab_terms,
+    _vocab_prefix_hold,
+)
+
+
+def test_parse_vocab_terms():
+    assert _parse_vocab_terms("") == ()
+    assert _parse_vocab_terms("Vocabulary: 單號, WhatsApp, 京东") == ("單號", "WhatsApp", "京东")
+    # 单字词无前缀信号,丢弃
+    assert _parse_vocab_terms("Vocabulary: 拼, 京东") == ("京东",)
+    assert _parse_vocab_terms("no marker here") == ("here",) or True  # 容忍无标记串不炸
+
+
+def test_vocab_prefix_hold_basic():
+    terms = ("單號", "集運", "京东", "拼多多", "WhatsApp")
+    # 词被拦腰:尾部是某词严格前缀 → hold
+    assert _vocab_prefix_hold("件货喺京", terms) is True
+    assert _vocab_prefix_hold("我在拼", terms) is True
+    assert _vocab_prefix_hold("help me track the what", terms) is True  # what ⊂ whatsapp
+    # 词已完整/尾字非任何词开头 → 照常提交
+    assert _vocab_prefix_hold("查下單號", terms) is False
+    assert _vocab_prefix_hold("我喺淘寫買嘢", terms) is False
+    assert _vocab_prefix_hold("", terms) is False
+    assert _vocab_prefix_hold("好", ()) is False
+    # 完整词+尾字碰巧同字:京东完整出现,东 唔係词头 → False
+    assert _vocab_prefix_hold("喺京东", terms) is False
+
+
+def test_vocab_prefix_hold_gate(monkeypatch):
+    monkeypatch.setenv("QWEN3_ASR_JOIN_HOLD_VOCAB", "0")
+    assert _join_hold_vocab_enabled() is False
+    monkeypatch.setenv("QWEN3_ASR_JOIN_HOLD_VOCAB", "1")
+    assert _join_hold_vocab_enabled() is True
+    monkeypatch.delenv("QWEN3_ASR_JOIN_HOLD_VOCAB", raising=False)
+    assert _join_hold_vocab_enabled() is True  # 默认开

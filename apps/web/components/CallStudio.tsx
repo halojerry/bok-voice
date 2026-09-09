@@ -425,6 +425,8 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
   const objIdRef = useRef("");
   const personaIdRef = useRef("");
   const [objects, setObjects] = useState<Record<string, unknown>[]>([]);
+  // 对象下拉可搜索(QA B3,2026-09-09):历史测试数据曾把下拉灌到 300+ 项。
+  const [objFilter, setObjFilter] = useState("");
   const [personas, setPersonas] = useState<Record<string, unknown>[]>([]);
   const [objId, setObjId] = useState("");
   const [personaId, setPersonaId] = useState("");
@@ -726,11 +728,20 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
     if (stateCallId) {
       try {
         await api.hangup(stateCallId);
-        const s = await api.getSettlement(stateCallId);
-        setSettlement(s);
       } catch (e) {
-        // 未有结算(未 settle)时 /settlement 404 属预期,唔刷 console。
-        if (!String(e).includes("404")) console.warn("settle failed", e);
+        if (!String(e).includes("404")) console.warn("hangup failed", e);
+      }
+      // 结算重试(2026-09-09 QA B1):agent 侧 settle 喺 session close 后异步完成,
+      // 首查 404 属「结算在途」;3 次×2s 俾佢跑完,消除结算卡假空态。
+      for (let i = 0; i < 3; i++) {
+        await new Promise((r) => setTimeout(r, i === 0 ? 800 : 2000));
+        try {
+          const s = await api.getSettlement(stateCallId);
+          setSettlement(s);
+          break;
+        } catch {
+          /* 404=在途,继续重试 */
+        }
       }
     }
     setStateCallId("");
@@ -757,9 +768,26 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
 
         {!stateCallId && (
           <>
+            <input
+              className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-2 py-1 text-xs outline-none focus:border-[var(--accent)]"
+              placeholder={`输入名称过滤对象（共 ${objects.length} 个，最多显示 50）`}
+              value={objFilter}
+              onChange={(e) => setObjFilter(e.target.value)}
+            />
             <select className="select" value={objId} onChange={(e) => setObjId(e.target.value)}>
               {objects.length === 0 && <option value="">请先建档对象</option>}
-              {objects.map((o) => (
+              {(() => {
+                const kw = objFilter.trim().toLowerCase();
+                const matched = objects.filter((o) => !kw || str(o.display_name).toLowerCase().includes(kw));
+                const selectedInList = matched.some((o) => String(o.id) === objId);
+                const list = matched.slice(0, 50);
+                if (objId && !selectedInList) {
+                  const sel = objects.find((o) => String(o.id) === objId);
+                  if (sel) list.unshift(sel);
+                }
+                if (matched.length > 50) return list;
+                return list;
+              })().map((o) => (
                 <option key={String(o.id)} value={String(o.id)}>
                   {str(o.display_name)}（{str(o.role_template)}）
                 </option>

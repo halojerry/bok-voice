@@ -308,6 +308,23 @@ class MlxLlmLLM(_OpenAICompatBase):
 
             _client.chat.completions.create = _create
 
+        # S5 排队定罪（2026-09-09）:请求级计时。header=server 受理并回响应头,
+        # 官方 TTFT=首 chunk。TTFT-LLM_REQ_MS header ≈ server 内等待（模型锁/
+        # prefill/解码）——配 llm.log 的 prefill progress 窗口可把「排队常数」
+        # 定罪到具体环节（实测 p50 ~0.65s 待拆）。
+        _qclient = self._client
+        _qraw = _qclient.chat.completions.create
+
+        async def _timed_create(**kw):
+            _t0 = time.perf_counter()
+            _resp = await _qraw(**kw)
+            _t_hdr = time.perf_counter()
+            if kw.get("stream"):
+                print(f"LLM_REQ_MS header={(_t_hdr - _t0) * 1000:.0f} msgs={len(kw.get('messages') or [])}", flush=True)
+            return _resp
+
+        _qclient.chat.completions.create = _timed_create
+
     async def _prewarm_impl(self) -> None:
         # 真实 1-token 生成：暖 mlx 模型（冷启动的 KV 分配/首 token 占首包大头）。
         # 官方 prewarm 只验连接；AgentSession 构造时会自动调用本钩子。
@@ -605,13 +622,17 @@ class ContextState:
 
     def add_call_fact(self, text: str, limit: int = 4) -> None:
         """沉淀一条会中事实(去重,有界 FIFO,≤limit 条)——渲染进尾部
-        【通话中客户已讲】,治「模型重复问已答过的事」。"""
+        【通话中客户已讲】,治「模型重复问已答过的事」。
+
+        事实属实质变化 → +revision（尾部瘦身门:变化轮才发全量尾部,
+        BOK_TAIL_SLIM=1 时未变轮只发紧凑标签,新事实漏进紧凑尾=事实失明）。"""
         t = str(text or "").strip()
         if not t or t in self._call_facts:
             return
         self._call_facts.append(t)
         if len(self._call_facts) > limit:
             self._call_facts.pop(0)
+        self._revision += 1
 
     def set_last_reply(self, text: str) -> None:
         """记录 AI 最近一句回复(截 80 字)作尾部重复锚——模型看得见自己上一句,
@@ -779,6 +800,15 @@ class ContextState:
             "先讲结论，再补一句必要解释，句与句之间自然停顿，句尾用句号或问号收住。"
             "讲完当前要点就停下把话交回客户，等客户回应再继续下一步。"
         )
+        # 重复控制(2026-09-09 S5 尾部瘦身):指令从每轮尾部上移稳定前缀——原先
+        # ~90 字指令逐字重复在每轮尾部里逐轮重 prefill,是纯浪费;前缀整场缓存
+        # 命中零成本。尾部只留【你上一句】引文。
+        parts.append(
+            "【重复控制】已讲过的内容绝不原句或近原句再讲一次；"
+            "连续回答同类问题时必须换用不同的说法和角度，不得只改动个别字词；"
+            "客户没有新异议就不要重复确认，停下来等他说。"
+            "每轮尾部的【你上一句】即你最近一次回复原文，对照它避免重复。"
+        )
         # 客服应答准则：永不主动说"不知道/查不到"，知识不够时用客服话术兜住。
         # 这是客服与聊天机器人的本质区别——客户要的是被接住，不是被拒绝。
         # 语言纯度：此段无条件进每通通话的前缀，必须用标准书面中文——写成粤语
@@ -818,8 +848,28 @@ class ContextState:
         prefill 尾部增量。当前步放尾部最前，让「推进=换一小段尾部」而非动前缀。
         知识/联网两节仅在 rag_enabled=True 时渲染(默认关:封闭话术流程不做检索,
         单对象只上话术+对象档案;CONTEXT_RAG=1/开放人设由装配处置 True)。
+
+        尾部瘦身（BOK_TAIL_SLIM=1 默认,0 回退;2026-09-09 S5）:revision 与上一
+        条已冻结尾部相同（流程/事实/WhatsApp 均无实质变化）时,只发紧凑标签
+        ——全量指引在上一轮尾部里原样可见,重复逐轮重 prefill 是纯浪费（未缓存
+        后缀实测 238-315 tok/轮,是暖轮 TTFT 大头,0.4-0.6k tok/s 下≈0.4-0.6s）。
+        【你上一句】的固定指令文本已上移稳定前缀（【重复控制】）,尾部只留引文。
         """
+        _last_rev = self._applied_tails[-1][2] if self._applied_tails else None
+        slim = (
+            os.environ.get("BOK_TAIL_SLIM", "1") == "1"
+            and _last_rev is not None
+            and _last_rev == self._revision
+        )
         parts: list[str] = []
+        if slim:
+            _step_head = (self._flow_current.strip().splitlines() or [""])[0]
+            parts.append(f"【{_step_head or '流程'}·继续】状态无实质变化，按上文同一步要求继续。")
+            if self._whatsapp_note:
+                parts.append("【已记录客户 WhatsApp】" + self._whatsapp_note)
+            if self._last_reply:
+                parts.append("【你上一句】「" + self._last_reply + "」")
+            return "\n".join(parts)
         if self._whatsapp_note:
             parts.append(
                 "【已记录客户 WhatsApp】" + self._whatsapp_note +
@@ -837,15 +887,9 @@ class ContextState:
             parts.append("【现在这一步】\n" + self._flow_current)
         if self._last_reply:
             # 重复锚:模型看得见自己上一句,治「原句/近原句复述」(2026-09-06
-            # 行为取证:同一确认句一字不差讲两遍)。冻结进当时 user 的尾部,
-            # 语义=「你讲呢句嗰阵嘅上一句」,自洽。
-            # 2026-09-07 QA 10 轮实测补充:连续同类推进(如 T06/T07 连答「保险
-            # 自动生效+专员联络」)虽非原句但近逐字雷同——补「同类内容换措辞」。
-            parts.append(
-                "【你上一句】已讲过的内容绝不原句或近原句再讲一次；"
-                "连续回答同类问题时必须换用不同的说法和角度，不得只改动个别字词；"
-                "客户没有新异议就不要重复确认，停下来等他说。\n「" + self._last_reply + "」"
-            )
+            # 行为取证)。固定指令文本已上移稳定前缀【重复控制】(2026-09-09 S5
+            # 尾部瘦身)——每轮逐字重复 ~90 字指令是纯浪费,尾部只留引文。
+            parts.append("【你上一句】「" + self._last_reply + "」")
         if self.rag_enabled and self._snippets:
             parts.append("【实时检索到的资料（知识库）】\n" + "\n".join(f"- {s}" for s in self._snippets))
         if self.rag_enabled and self._web:
@@ -3743,6 +3787,50 @@ def _join_worthy(text: str) -> bool:
     return bool(re.search(r"(?:係|系|是|\bis\b)\s*[。，,．.！!？?～~]*$", t, re.IGNORECASE))
 
 
+def _join_hold_vocab_enabled() -> bool:
+    """品牌/领域词防拆轮门(2026-09-09 S3 拼多多专项):partial 尾部是热词词表
+    某词的【严格前缀】(词可能未讲完)→ hold 停嘴窗等续段并单会话,整句高精度
+    解码——真实话音「京|東」微停顿把「京东」烂成「金东北」、「拼|多多」吞「拼」
+    (probe_brand_words 基线 10/16 实证)。词表与 ASR context 软偏置同一份
+    (模板 hotwords + 行业词 + 对象 courier/contact_channel),运营加词即生效。
+    QWEN3_ASR_JOIN_HOLD_VOCAB=0 关(回退纯数字/系词门)。"""
+    return os.environ.get("QWEN3_ASR_JOIN_HOLD_VOCAB", "1") == "1"
+
+
+def _parse_vocab_terms(hotword_ctx: str) -> tuple[str, ...]:
+    """从「Vocabulary: w1, w2, …」格式热词 context 反解词表(≥2 字词才有前缀信号)。"""
+    if not hotword_ctx:
+        return ()
+    raw = str(hotword_ctx).split("Vocabulary:", 1)[-1]
+    return tuple(
+        t.strip() for t in raw.split(",") if len(t.strip()) >= 2
+    )
+
+
+def _vocab_prefix_hold(text: str, terms) -> bool:
+    """partial 尾部是否词表某词的严格前缀。
+
+    CJK:剥标点连写串取长 1-3 后缀——「件货喺京」→ 京 ⊂ 京东 → True(词可能被
+    停顿拦腰);「查下單號」→ 號 唔係任何词开头 → False(词已完整,照常提交)。
+    latin:只认【末词】整词(what ⊂ WhatsApp)——不取 1-2 字尾,否则任何 t/wh
+    结尾的英文句都误扣 hold 窗。"""
+    raw = str(text or "")
+    if not raw:
+        return False
+    cjk = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", raw)
+    candidates: list[str] = [cjk[-n:] for n in (1, 2, 3) if len(cjk) >= n]
+    m = re.search(r"([A-Za-z][A-Za-z0-9']*)\s*[。，,．.！!？?～~]*$", raw)
+    if m:
+        candidates.append(m.group(1).lower())
+    for tail in candidates:
+        tl = tail.lower()
+        for term in terms:
+            t = str(term).lower()
+            if t.startswith(tl) and len(tl) < len(t):
+                return True
+    return False
+
+
 def _has_latin_or_digit_run(text: str, min_len: int = 2) -> bool:
     """句内含 ≥min_len 连续 ASCII 字母/数字 run(单号/WhatsApp 号码高危)。
 
@@ -3809,6 +3897,18 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         # 「finish 等待期间客户已续讲、新会话已开」——咁就唔可以 reset 新会话状态
         # (否则续讲段 partial/_session_id 被清,整轮无 FINAL,2026-09-07 审查实证)。
         self._session_epoch = 0
+        # join-hold 词表前缀门用的热词词表(与 context 软偏置同一份,流级缓存);
+        # fake/无 context → 空 tuple,门自动失效。
+        self._vocab_terms = _parse_vocab_terms(getattr(stt_, "_hotword_context", ""))
+
+    def _vocab_echo(self, text: str) -> bool:
+        """热词幻听判定(源头闸):词表被当转写整串抄出 → True,调用方丢弃该事件。
+
+        QWEN3_HOTWORD_ECHO_GUARD=0 回退。词表与 STT context 同一份(_hotword_context)。
+        """
+        if os.environ.get("QWEN3_HOTWORD_ECHO_GUARD", "1") != "1":
+            return False
+        return _is_hotword_vocab_echo(text, getattr(self._stt_, "_hotword_context", "") or "")
 
     def _vocab_echo(self, text: str) -> bool:
         """热词幻听判定(源头闸):词表被当转写整串抄出 → True,调用方丢弃该事件。
@@ -3859,15 +3959,32 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                     # 会话(partial 继续滚),真正停嘴嗰刻一条 FINAL 覆盖全段——下游
                     # flow/侦测/LLM/KV-cache 全部只见单一轮。超时冇续段 → _hold_flush
                     # 走正常停嘴路径(该轮多等 HOLD_MS——含数字/系词句都算,唔止号码句)。0=回退同旧。
+                    _vocab_hit = False
+                    _join_hit = False
                     if self._join_hold_active:
                         # hold 中又嚟 EOS(冇 START 嘅边路)→ 当真停嘴,取消 flush 落埋正常路径。
                         self._cancel_join_hold()
-                    elif _join_hold_s() > 0 and (self._last_partial or "").strip() and _join_worthy(self._last_partial):
+                    else:
+                        _vocab_hit = (
+                            _join_hold_s() > 0
+                            and _join_hold_vocab_enabled()
+                            and bool(self._vocab_terms)
+                            and (self._last_partial or "").strip()
+                            and _vocab_prefix_hold(self._last_partial, self._vocab_terms)
+                        )
+                        _join_hit = (
+                            not _vocab_hit
+                            and _join_hold_s() > 0
+                            and (self._last_partial or "").strip()
+                            and _join_worthy(self._last_partial)
+                        )
+                    if _vocab_hit or _join_hit:
                         self._join_hold_active = True
                         self._finishing = False  # hold 期间 partial 继续滚(INFERENCE_DONE 唔 skip)
                         self._join_task = asyncio.create_task(self._hold_flush())
                         print(
-                            f"QWEN3_ASR_JOIN_HOLD chars={len(self._last_partial)} "
+                            f"QWEN3_ASR_JOIN_HOLD src={'vocab' if _vocab_hit else 'digits/copula'} "
+                            f"chars={len(self._last_partial)} "
                             f"hold_ms={int(_join_hold_s() * 1000)}",
                             flush=True,
                         )
@@ -3956,7 +4073,9 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         self._join_task = None
         _epoch_at_hold = self._session_epoch
         self._finishing = True
-        speech_end_time = time.time()
+        # 停嘴时钟锚点：hold 从原 EOS 时刻起算——真实停嘴 = 现在 - hold 窗。
+        # 锚到 flush 时刻会令 min_delay 全额叠加在 hold 窗之后（白付 0.25s）。
+        speech_end_time = time.time() - _join_hold_s()
         self._event_ch.send_nowait(
             stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH, speech_end_time=speech_end_time)
         )
@@ -4040,6 +4159,11 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         self._last_post = now
         pcm = bytes(self._pending)
         self._pending.clear()
+        # 停嘴时钟锚点（2026-09-09 S5）:本窗音频在 POST 发出时刻已讲完,句级提交
+        # 的 END_OF_SPEECH 带上它——框架 min_delay 锚定 speech_end_time（停嘴时刻,
+        # audio_recognition.py:1332-1336/1679-1681）,锚点缺失会坍缩为 now,令
+        # min_delay 全额叠在解码延迟之后（白付 ~0.25s/句）。
+        t_req_wall = time.time()
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.post(
@@ -4083,7 +4207,15 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                 self._emit_sentence_commit(sentence, end_idx, lang, now, source="partial-punct")
                 # 每句事件序：FINAL(句子) → END_OF_SPEECH（框架 EOS 才置 committed
                 # + _run_eou_detection(trigger="stt")，见 _sentence_boundary 文档）。
-                self._event_ch.send_nowait(stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH))
+                # EOS 带停嘴时钟锚点：句子音频最迟在 chunk POST 发出（本窗音频
+                # 讲完）时已结束，min_delay 从那时起算——解码期间的时间框架自动
+                # 抵扣，唔再全额叠加（同提交时机，只对齐时钟，零早切风险）。
+                self._event_ch.send_nowait(
+                    stt.SpeechEvent(
+                        type=stt.SpeechEventType.END_OF_SPEECH,
+                        speech_end_time=t_req_wall,
+                    )
+                )
                 self._prev_partial = text  # 参照窗照常推进（与 _last_partial 同步）
                 # 字幕续流：只发未提交剩余（框架 _audio_transcript 已含已提交句）。
                 remainder = self._uncommitted(text)

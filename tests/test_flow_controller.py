@@ -147,8 +147,12 @@ def test_fact_confirm_advances_flow_step():
     assert fc.current == 1
     cur = fc.current_step_text()
     assert "第 2/2 步" in cur
-    # 推进后注入「新一步」提示,提醒 LLM 换步(唔好延续旧承诺)。
-    assert "【新一步】" in cur and "不要延续上一步" in cur
+    # 推进后注入「新一步」提示,提醒 LLM 换步(唔好延续旧承诺);
+    # 2026-09-09 加复读禁令(推进轮逐字复读上轮=call-feaf914c 实证缺陷)——
+    # 措辞必须收窄为「未经客户要求」:尾部账本冻结重放整通,一刀切禁令会
+    # fight 客户明话要求的复述(「听唔清」→ REPEAT verdict 照讲)。
+    assert "【新一步】" in cur and "不要延续上一步" in cur and "不要复读" in cur
+    assert "未经客户要求" in cur and "要求重复时除外" in cur
 
 
 def test_not_confirm_stays_with_recall_guidance():
@@ -778,3 +782,42 @@ def test_last_digits_render_readback_guidance():
     assert "逐位复述核对" in cur and "1234" in cur
     fc.last_digits = []
     assert "逐位复述核对" not in fc.current_step_text()
+
+
+# ---- REPEAT verdict:没听清/要求重复 → 照讲复述(2026-09-09 校准,防复读禁令一刀切)----
+
+from agent_runtime.flow import QUESTION, REFUSE, REPEAT, decide_advance  # noqa: E402
+
+
+def test_repeat_verdict_detection():
+    # 短句没听清/要求重复 → REPEAT
+    for t in ("听唔清", "听不清", "冇听清", "你说什么？", "乜嘢话？", "再说一次", "再讲一遍啦",
+              "大声啲", "what?", "pardon", "come again"):
+        assert decide_advance(t) == REPEAT, t
+    # 长句里出现「乜嘢」=内容提问,唔係 REPEAT(短句门 12 字)
+    assert decide_advance("我想问下乜嘢时候可以赔到我") != REPEAT
+    # 拒绝优先于 REPEAT:「听唔清,唔好再打」主体係收线
+    assert decide_advance("听唔清，唔好再打") == REFUSE
+    # 普通提问照 QUESTION
+    assert decide_advance("赔偿要点样算？") == QUESTION
+
+
+def test_repeat_never_advances():
+    # 开场步与中段步:REPEAT 都停留
+    assert should_auto_advance(current=0, goal="开场", ref="请问係咪你?", user_text="听唔清", verdict=REPEAT) is False
+    assert should_auto_advance(current=2, goal="办理", ref="帮你办理", user_text="再说一次", verdict=REPEAT) is False
+
+
+def test_repeat_guidance_renders():
+    fc2 = FlowController(
+        steps=parse_steps('[{"goal":"确认包裹是否本人的","ref":"你好{姓名}"},{"goal":"说明一赔二","ref":"会一赔二赔付"}]'),
+    )
+    fc2.vars_map = {"姓名": "陈生"}
+    fc2.advance()
+    fc2.last_verdict = REPEAT
+    cur = fc2.current_step_text()
+    assert "【客户没听清，要求重复】" in cur
+    assert "照讲" in cur
+    # REPEAT 唔触发【新一步】(冇 advance 发生);QUESTION 指引照旧禁复读(非重复语境)
+    fc2.last_verdict = QUESTION
+    assert "绝不重复" in fc2.current_step_text()

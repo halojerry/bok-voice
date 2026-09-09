@@ -509,3 +509,80 @@ def test_optional_bearer_auth(monkeypatch):
     monkeypatch.delenv("BOK_CP_TOKEN", raising=False)
     with TestClient(app) as client:
         assert client.get("/api/objects?account_id=acc-001").status_code == 200
+
+
+def test_template_update_sqlite_engine_roundtrip(tmp_path, monkeypatch):
+    """PUT /api/templates 走真实 SQLite 引擎必须成功（QA B2 回归，2026-09-09）。
+
+    版本化快照 json.dumps(before) 撞 datetime 不可序列化 → 每次 PUT 500、
+    编辑静默丢改动。in-memory 测试替身（dataclass 无 created_at）锁不住此
+    prod-only 断裂，必须用真实 SQL 引擎锁死。
+    """
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'tpl.db'}")
+
+    from control_plane.deps import build_engine
+
+    build_engine()
+
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/templates",
+            json={
+                "account_id": "acc-001",
+                "name": "QA-SQLite回归",
+                "language": "cantonese",
+                "hotwords": "快遞,賠償",
+                "steps_json": '[{"goal":"g1","ref":"ref1"},{"goal":"g2","ref":"ref2"},{"goal":"g3","ref":"ref3"},{"goal":"g4","ref":"ref4"},{"goal":"g5","ref":"ref5"}]',
+            },
+        )
+        assert r.status_code in (200, 201), r.text
+        tid = r.json()["id"]
+        # 编辑:改 hotwords——此前必 500(TypeError datetime)
+        r2 = client.put(
+            f"/api/templates/{tid}",
+            json={"hotwords": "快遞,賠償,新詞"},
+        )
+        assert r2.status_code == 200, f"PUT 必须成功: {r.text[:200]}"
+        body = r2.json()
+        assert body["hotwords"] == "快遞,賠償,新詞", "修改必须落库"
+        assert body["name"] == "QA-SQLite回归", "未改字段必须保留"
+        steps = json.loads(body["steps_json"])
+        assert len(steps) == 5, "未改的步骤必须保留"
+        # 版本化快照应落 1 条且可反序列化
+        revs = client.get(f"/api/templates/{tid}/revisions").json()
+        assert len(revs) == 1
+        assert json.loads(revs[0]["snapshot"])["name"] == "QA-SQLite回归"
+
+
+def test_template_partial_update_keeps_unset_fields(tmp_path, monkeypatch):
+    """PUT 只传一个字段不得抹掉其他字段（QA「PUT 抹字段」回归，2026-09-09）。
+
+    schema 全字段带默认值（language 默认 zh），整包 model_dump 会把未传字段
+    覆盖成空串/zh——exclude_unset 修正后：未传不动、显式空串才清空。
+    """
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'tpl2.db'}")
+
+    from control_plane.deps import build_engine
+
+    build_engine()
+
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/templates",
+            json={
+                "account_id": "acc-001",
+                "name": "部分更新回归",
+                "language": "cantonese",
+                "hotwords": "词甲,词乙",
+                "steps_json": '[{"goal":"g1","ref":"r1"}]',
+            },
+        )
+        assert r.status_code in (200, 201), r.text
+        tid = r.json()["id"]
+        r2 = client.put(f"/api/templates/{tid}", json={"hotwords": "词甲,词乙,词丙"})
+        assert r2.status_code == 200, r2.text
+        body = r2.json()
+        assert body["hotwords"] == "词甲,词乙,词丙"
+        assert body["name"] == "部分更新回归", "未传字段不得被抹"
+        assert body["language"] == "cantonese", "未传 language 不得回落 zh"
+        assert len(json.loads(body["steps_json"])) == 1
