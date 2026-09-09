@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, Float, Integer, String, Text, func
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -237,6 +237,30 @@ class QaEntry(Base):
     hit_count: Mapped[int] = mapped_column(Integer, default=0)
     source: Mapped[str] = mapped_column(String(16), default="curated")
     template_id: Mapped[str] = mapped_column(String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class Org(Base):
+    """租户（P0 骨架：身份体系 P1 落地，先立 org 缝）。"""
+    __tablename__ = "orgs"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), default="")
+    status: Mapped[str] = mapped_column(String(16), default="active")  # active/suspended
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class Node(Base):
+    """部署节点（客户机房 GPU 盒）：注册时签发 node_token，只存 sha256。"""
+    __tablename__ = "nodes"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    org_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    name: Mapped[str] = mapped_column(String(255), default="")
+    token_hash: Mapped[str] = mapped_column(String(128), default="")
+    platform: Mapped[str] = mapped_column(String(32), default="")  # cuda-win / mac-mlx
+    version: Mapped[str] = mapped_column(String(64), default="")
+    status: Mapped[str] = mapped_column(String(16), default="offline")  # online/offline/revoked
+    metrics_json: Mapped[str] = mapped_column(Text, default="{}")
+    last_seen_at: Mapped[object] = mapped_column(DateTime, default=None, nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
