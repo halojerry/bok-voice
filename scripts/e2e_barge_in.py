@@ -32,9 +32,11 @@ CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
 AUDIO_DIR = ROOT / "tests" / "fixtures" / "audio"
 LANG = os.environ.get("BARGEIN_LANG", "cantonese")
 TTS_URL = os.environ.get("TTS_URL", "http://127.0.0.1:8788")
-# 真人客户口吻两句（第一句触发回复,第二句播放中插入打断）——弃 fixtures 灣仔問路句
-FIRST_TEXT = os.environ.get("BARGEIN_FIRST_TEXT", "我件貨爛咗，外包裝都凹咗，想投訴。")
-SECOND_TEXT = os.environ.get("BARGEIN_SECOND_TEXT", "唔使住住，我想先問下賠幾多。")
+# 真人客户口吻两句(第一句触发回复,第二句播放中插入打断)。**无逗号**:逗号
+# 会被 vad-pause 当微停顿劈成两轮(碎片轮+迟到 FINAL 掐掉首回复,2026-09-09
+# main A/B 实证劈句致 reply1_no_speech 假故障,与垫话改动无关)。
+FIRST_TEXT = os.environ.get("BARGEIN_FIRST_TEXT", "我件貨爛咗想投訴。")
+SECOND_TEXT = os.environ.get("BARGEIN_SECOND_TEXT", "唔使住住我想先問下賠幾多。")
 
 
 def frame_rms(pcm: bytes) -> float:

@@ -29,8 +29,10 @@ ROOT = Path(__file__).resolve().parents[1]
 CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
 TTS_URL = os.environ.get("TTS_URL", "http://127.0.0.1:8788")
 LANG = os.environ.get("FILLER_LANG", "cantonese")
-# 垫话 700ms+播报起音 → <2s;旧通道实测 2.5s+,阈值两边都分得开
-ONSET_BUDGET_MS = int(os.environ.get("FILLER_ONSET_BUDGET_MS", "2000"))
+# 垫话=eou(0.5-0.9s)+hook+700ms 定时+出声检测 ≈1.6-2.3s;旧通道(纯等回复)
+# 实测 2.3-8s+。预算 2.5s + 日志硬判据(BOK_FILLER fired)双保险。
+ONSET_BUDGET_MS = int(os.environ.get("FILLER_ONSET_BUDGET_MS", "2500"))
+LOG_PATH = Path.home() / "Library/Application Support/BokVoice/logs/agent.log"
 TEXT = os.environ.get("FILLER_TEXT", "唔該幫我查下張單到邊度喇。")
 # 垫话缓存按 voice+model 做 key:探针人设显式钉 GentleLady(缓存已预合成该音色),
 # 音色唔一致时垫话会静默跳过(宁勿出声都唔换声——正确行为,但探针就测唔到)。
@@ -83,6 +85,8 @@ async def main() -> None:
     room = rtc.Room()
     agent_audio = bytearray()
     read_tasks: list[asyncio.Task] = []
+    # 日志增量基线:BOK_FILLER fired 行不带 call_id,用文件偏移做「本通之后」判定
+    log_size_before = LOG_PATH.stat().st_size if LOG_PATH.exists() else 0
 
     def attach(track):
         if int(track.kind) != int(rtc.TrackKind.KIND_AUDIO):
@@ -141,11 +145,24 @@ async def main() -> None:
                 break
             await asyncio.sleep(0.1)
 
-        ok = onset_ms is not None and onset_ms < ONSET_BUDGET_MS and speech_total >= 1.5
+        filler_fired = False
+        if LOG_PATH.exists():
+            try:
+                # 按字节切片(st_size 是字节):中文日志按字符切会跳过头过的最新行
+                new_bytes = LOG_PATH.read_bytes()[log_size_before:]
+                filler_fired = b"BOK_FILLER fired" in new_bytes
+            except Exception:
+                pass
+        ok = (
+            onset_ms is not None
+            and onset_ms < ONSET_BUDGET_MS
+            and speech_total >= 1.5
+            and filler_fired
+        )
         print(
             f"FILLER-PROBE {'PASS' if ok else 'FAIL'} "
             f"first_audio_ms={onset_ms:.0f} budget={ONSET_BUDGET_MS} "
-            f"speech_total={speech_total:.2f}s",
+            f"speech_total={speech_total:.2f}s filler_fired={filler_fired}",
             flush=True,
         )
         await asyncio.sleep(2)
