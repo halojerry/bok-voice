@@ -11,9 +11,10 @@ from collections import defaultdict
 from pathlib import Path
 
 import httpx
-from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
+from pydantic import BaseModel
 
 from bok_voice_core.providers import BusinessRepository
 from bok_voice_core.policies import select_session_manifest
@@ -33,6 +34,7 @@ from bok_voice_obs.middleware import CorrelationMiddleware
 
 from .deps import build_engine, build_repository, build_session_factory
 from .dispatch_utils import cleanup_dispatch, has_active_dispatch
+from .nodes_store import HEARTBEAT_INTERVAL_S, NodeStore
 from .schemas import (
     CreateCallRequest,
     CreateObjectRequest,
@@ -90,6 +92,14 @@ def _repo() -> BusinessRepository:
     return app.state.repo
 
 
+def _node_store() -> NodeStore:
+    """节点注册表（_repo() 同款访问姿势：startup 与 repo 同一 engine 装配）。
+
+    engine=None（dev/tests 无 DATABASE_URL）→ NodeStore 内存双模，见 nodes_store。
+    """
+    return app.state.node_store
+
+
 def _sidecar_url(env_name: str, default: str) -> str:
     return (os.environ.get(env_name) or default).rstrip("/")
 
@@ -107,6 +117,7 @@ def _startup() -> None:
     configure_logging(level=os.environ.get("BOK_LOG_LEVEL", "INFO"))
     engine = build_engine()
     app.state.repo = build_repository(engine)
+    app.state.node_store = NodeStore(engine)  # 与 repo 同一 engine；None → 内存双模
     app.state.session_factory = build_session_factory(engine)
     app.state.lk_key = os.environ.get("LIVEKIT_API_KEY", "")
     app.state.lk_secret = os.environ.get("LIVEKIT_API_SECRET", "")
@@ -948,6 +959,39 @@ def mark_whatsapp_handled(call_id: str, req: WhatsAppHandledRequest) -> dict:
     _audit("call.whatsapp_handled", subject_type="call", subject_id=call_id,
            account_id=call.get("account_id", "acc-001"), detail={"handled": req.handled})
     return updated
+
+
+class NodeRegisterRequest(BaseModel):
+    name: str = ""
+    platform: str = ""
+    org_id: str = ""
+    version: str = ""
+
+
+class NodeHeartbeatRequest(BaseModel):
+    metrics: dict = {}
+
+
+@app.post("/api/nodes/register")
+def register_node(req: NodeRegisterRequest) -> dict:
+    """节点注册（spec §4.2）：签发 node_token，明文只在本次响应出现一次。"""
+    node_id, token = _node_store().register(
+        name=req.name, platform=req.platform, org_id=req.org_id, version=req.version
+    )
+    return {"node_id": node_id, "node_token": token, "heartbeat_interval_s": HEARTBEAT_INTERVAL_S}
+
+
+@app.post("/api/nodes/heartbeat")
+def node_heartbeat(req: NodeHeartbeatRequest, authorization: str = Header(default="")) -> dict:
+    token = authorization.removeprefix("Bearer ").strip()
+    if not token or not _node_store().heartbeat(token, req.metrics):
+        raise HTTPException(401, "unknown node token")
+    return {"ok": True, "commands": []}
+
+
+@app.get("/api/nodes")
+def list_nodes() -> list[dict]:
+    return _node_store().list_nodes()
 
 
 @app.get("/api/calls/{call_id}/settlement")
