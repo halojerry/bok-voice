@@ -1413,14 +1413,14 @@ def cmd_prod(cmd: str) -> int:
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="bok", description="Bok voice stack launcher (no Docker)")
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("catalog", "manifest", "download", "status", "up", "serve", "down", "doctor"):
+    for name in ("catalog", "manifest", "download", "status", "up", "serve", "down", "doctor", "tts-mine"):
         sub.add_parser(name)
     sub.add_parser("tts-pregen", help="离线预合成 TTS 本地缓存(参数透传:--greetings/--objects/--fillers/--cp/--model)")
     p_prod = sub.add_parser("prod", help="生产常驻单元与健康面")
     p_prod.add_argument("action", nargs="?", default="status", choices=["install", "status"])
     p_setup = sub.add_parser("setup", help="First-run model readiness / download")
     p_setup.add_argument("action", nargs="?", default="status", choices=["status", "download"])
-    # tts-pregen 参数原样透传给执行脚本,顶层不做校验
+    # tts-pregen/tts-mine 参数原样透传给执行脚本,顶层不做校验
     args, extra = p.parse_known_args(argv)
     args.extra = list(extra)
     return args
@@ -1429,17 +1429,26 @@ def parse_args(argv=None) -> argparse.Namespace:
 def cmd_tts_pregen(extra: list[str] | None = None) -> int:
     """离线批量预合成 TTS 本地缓存(docs/superpowers/specs/2026-09-08-tts-cache-design.md)。
 
-<<<<<<< Updated upstream
-    额外参数原样透传给 scripts/pregen_tts.py(--greetings/--objects/--cp/--model)。
-=======
-    extra 透传给 scripts/pregen_tts.py(--greetings/--objects/--fillers/--cp/--model)。
->>>>>>> Stashed changes
+    额外参数原样透传给 scripts/pregen_tts.py(--greetings/--objects/--fillers/--cp/--model)。
     子进程带仓库 PYTHONPATH 与 SSL_CERT_FILE(certifi)——venv 无系统 CA,
     MiniMax WSS 无此必炸。
     """
     env = {"PYTHONPATH": _repo_pythonpath(), "PYTHONUNBUFFERED": "1"}
     _bake_ssl_cert_file(env, repo_python())
     cmd = [str(repo_python()), str(ROOT / "scripts" / "pregen_tts.py"), *(extra or [])]
+    proc = subprocess.run(cmd, env={**os.environ, **env})
+    return proc.returncode
+
+
+def cmd_tts_mine(extra: list[str] | None = None) -> int:
+    """高频问答对挖掘报告(快答库,PR-3)。参数透传给 scripts/mine_qa.py。
+
+    --apply N 把前 N 条入库为 qa_entries(source=mined);入库后跑
+    `bok.py tts-pregen` 物化应答音频,闸门只认缓存有音频的条目。
+    """
+    env = {"PYTHONPATH": _repo_pythonpath(), "PYTHONUNBUFFERED": "1"}
+    _bake_ssl_cert_file(env, repo_python())
+    cmd = [str(repo_python()), str(ROOT / "scripts" / "mine_qa.py"), *(extra or [])]
     proc = subprocess.run(cmd, env={**os.environ, **env})
     return proc.returncode
 
@@ -1452,6 +1461,8 @@ def main(argv=None) -> int:
         return cmd_prod(args.action)
     if args.cmd == "tts-pregen":
         return cmd_tts_pregen(getattr(args, "extra", None))
+    if args.cmd == "tts-mine":
+        return cmd_tts_mine(getattr(args, "extra", None))
     return {"catalog": cmd_catalog, "manifest": cmd_manifest, "download": cmd_download, "status": cmd_status,
             "up": cmd_up, "serve": cmd_serve, "down": cmd_down, "doctor": cmd_doctor}[args.cmd]()
 

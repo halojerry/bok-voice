@@ -16,6 +16,7 @@ from fastapi.responses import Response
 
 from bok_voice_core.providers import BusinessRepository
 from bok_voice_core.policies import select_session_manifest
+from bok_voice_core.qa_text import mine_qa_pairs
 from bok_voice_core.types import CallMode, CallStatus, Role, SessionManifest, TurnEvent
 
 from bok_voice_core.settlement import SettlementTrigger
@@ -35,6 +36,8 @@ from .schemas import (
     CreateObjectRequest,
     ImportRequest,
     PersonaRequest,
+    QaEntryCreate,
+    QaEntryPatch,
     TemplateRequest,
     UpdateTemplateRequest,
     UpdateObjectRequest,
@@ -1123,6 +1126,57 @@ async def import_knowledge(req: ImportRequest) -> dict:
     result = await app.state.knowledge.import_document(req.account_id, req.path, req.content)
     _audit("knowledge.import", subject_type="knowledge", subject_id=req.path or "", detail={"account_id": req.account_id, "content_len": len(req.content)})
     return result
+
+
+# ---- 快答库(Q→A 检索快路,2026-09-09):条目 CRUD + 高频配对报告 ----
+
+@app.get("/api/qa-entries")
+def list_qa_entries(account_id: str = "acc-001", enabled: int | None = None) -> list[dict]:
+    return _repo().list_qa_entries(account_id, enabled=None if enabled is None else bool(enabled))
+
+
+@app.post("/api/qa-entries")
+def create_qa_entry(req: QaEntryCreate) -> dict:
+    row = _repo().create_qa_entry(req.model_dump())
+    _audit("qa_entry.create", subject_type="qa_entry", subject_id=row.get("id", ""), account_id=req.account_id)
+    return row
+
+
+@app.patch("/api/qa-entries/{entry_id}")
+def update_qa_entry(entry_id: str, req: QaEntryPatch) -> dict:
+    row = _repo().update_qa_entry(entry_id, {k: v for k, v in req.model_dump().items() if v is not None})
+    if row is None:
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=404, detail="qa entry not found")
+    _audit("qa_entry.update", subject_type="qa_entry", subject_id=entry_id)
+    return row
+
+
+@app.delete("/api/qa-entries/{entry_id}")
+def delete_qa_entry(entry_id: str) -> dict:
+    ok = _repo().delete_qa_entry(entry_id)
+    _audit("qa_entry.delete", subject_type="qa_entry", subject_id=entry_id, outcome="ok" if ok else "not_found")
+    return {"deleted": ok, "id": entry_id}
+
+
+@app.post("/api/qa-entries/{entry_id}/hit")
+def hit_qa_entry(entry_id: str) -> dict:
+    """agent 快路命中计数(fire-and-forget,幂等无副作用)。"""
+    _repo().incr_qa_hit(entry_id)
+    return {"id": entry_id}
+
+
+@app.get("/api/reports/qa-pairs")
+def report_qa_pairs(min_calls: int = 5, account_id: str = "acc-001", limit: int = 100) -> list[dict]:
+    """高频问答对挖掘报告:用户轮→紧随 assistant 轮,归一化聚类按出现通话数排序。
+
+    与运行时匹配共用 bok_voice_core.qa_text.normalize_question,报告里的问句
+    到运行时才对得上。--apply 入库走 POST /api/qa-entries(source=mined),
+    音频物化统一走 agent 侧 bok.py tts-pregen。
+    """
+    conversations = _repo().iter_call_conversations(account_id)
+    return mine_qa_pairs(conversations, min_calls=min_calls, limit=limit)
 
 
 @app.get("/api/personas")

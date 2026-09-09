@@ -16,6 +16,7 @@ from .plugins.settlement import SettlementTrigger
 from .providers.registry import build_provider_registry
 from .control_plane import ControlPlaneClient
 from .fillers import FillerDirector
+from .qa_gate import QaIndex, qa_exclude_reason as _qa_exclude_reason
 from .tts_cache import CachedTTS, TtsAudioCache, default_cache_dir, frames_aiter, pcm_to_frames, tts_cache_enabled
 # 模块级引 flow(纯 stdlib 依赖,无环):_wa_numberish/_wa_number_line 等模块级
 # helper 用;entrypoint 内的 function-scoped import 属历史样式,不冲突。
@@ -494,6 +495,14 @@ def partial_ms_for_state(state: str, slow_ms: int) -> int | None:
 
 _ECHO_SIM_RATIO = 0.9
 _ECHO_MIN_CHARS = 6
+
+
+def _hotword_echo_guard_enabled() -> bool:
+    return os.environ.get("QWEN3_HOTWORD_ECHO_GUARD", "1") == "1"
+
+
+# 幻听判定单一实现喺 livekit_plugins(STT 源头闸与 hook 双层共用,防漂移)。
+from .providers.livekit_plugins import _is_hotword_vocab_echo as _is_hotword_echo  # noqa: E402
 
 
 def _is_echo_self_heard(user_text: str, last_reply: str, agent_speaking: bool) -> bool:
@@ -1227,6 +1236,10 @@ async def entrypoint(ctx):
     asr_pin_lang = _call_asr_pin_language(asr_cfg, greet_lang)
     asr_language_state = PinnedLanguageState(lang=asr_pin_lang)
     print(f"[agent] call language={greet_lang} pinned (asr hint={asr_pin_lang})", flush=True)
+    # 热词词表文本(hook 幻听守卫与 STT context 同一份,2026-09-08 实机回归后加)
+    _hotword_ctx = asr_hotword_context(
+        asr_pin_lang, object_card, extra_hotwords=str((template or {}).get("hotwords") or "")
+    )
     if use_fake or asr_provider_name in ("fake", "fake_stt"):
         stt_provider = FakeLiveKitSTT()
     else:
@@ -1243,9 +1256,7 @@ async def entrypoint(ctx):
             # 热词 context：话术模板 hotwords 字段 + 行业词 + 对象文字字段
             # （官方 system message 软偏置），随 /api/start 下发。
             # BOK_ASR_HOTWORDS=0 回退。
-            hotword_context=asr_hotword_context(
-                asr_pin_lang, object_card, extra_hotwords=str((template or {}).get("hotwords") or "")
-            ),
+            hotword_context=_hotword_ctx,
         )
         if os.environ.get("QWEN3_ASR_STREAM", "1") == "1":
             # 「VAD+滑窗 partial」流式包装:说话期间出 INTERIM(实时字幕)/
@@ -1515,6 +1526,20 @@ async def entrypoint(ctx):
     )
     if isinstance(tts_provider, CachedTTS):
         tts_provider.add_first_audio_listener(_filler.on_reply_first_audio)
+    # 快答库索引(PR-3):每通装配拉一次启用条目,变更下一通生效。拉取失败/
+    # 空表 → 闸门整体惰性(零行为变化);命中还需应答音频已在本地缓存,
+    # 未物化的条目自动视为未命中走 LLM(闸门绝不触发云合成)。
+    _qa_index = None
+    if os.environ.get("BOK_QA_FASTPATH", "1") == "1" and _tts_cache is not None:
+        try:
+            _qa_rows = await cp.list_qa_entries()
+            if _qa_rows:
+                from .qa_gate import QaIndex
+
+                _qa_index = QaIndex(_qa_rows)
+                print(f"[agent] qa fastpath on entries={len(_qa_rows)} (call {room_name})", flush=True)
+        except Exception as exc:  # noqa: BLE001 - 快答库不可用零影响
+            print(f"[agent] qa fastpath load failed: {exc!r} (call {room_name})", flush=True)
     # 会话首轮真实前缀预热（LLM_PREFIX_PREWARM，默认 1）——触发点在开场白之后
     # （见下方 greeting 块），这里只定義任务体。
     if _prefix_prewarm_enabled() and isinstance(_raw_llm, MlxLlmLLM) and instructions:
@@ -1832,6 +1857,14 @@ async def entrypoint(ctx):
                         flush=True,
                     )
                     raise StopResponse()
+            # ASR 热词幻听守卫:极低内容音频(开场白期间没说话/杂音)会把词表
+            # 当转写整串抄出(call-feaf914c 实机回归)——顺串判定命中即丢弃整轮。
+            if _hotword_echo_guard_enabled() and _hotword_ctx and _is_hotword_echo(user_text, _hotword_ctx):
+                print(
+                    f"QWEN3_HOTWORD_ECHO_DROP (call {room_name}) heard={user_text!r}",
+                    flush=True,
+                )
+                raise StopResponse()
             # WA 号码碎片累积:号码主导句且累计 <8 位、或自报头半句(「我的WhatsApp係」)
             # → 暂存+StopResponse(唔回复、唔侦测、唔推进),等下一段拼埋一次过处理。
             # 超时 flush 见 _arm_wa_accum_flush。StopResponse 必须喺任何 except-pass
@@ -1912,6 +1945,7 @@ async def entrypoint(ctx):
                     context_state.add_call_fact(_fact)
             except Exception:  # pragma: no cover - 沉淀失败唔阻回复
                 pass
+            _flow_step_before = flow_ctrl.current
             # 流程推进:读用户最新话,判定是否进入下一步,更新"当前步"约束注入。
             if flow_ctrl.has_steps:
                 try:
@@ -1979,6 +2013,77 @@ async def entrypoint(ctx):
                     context_state.set_flow_current(flow_ctrl.current_step_text())
                 except Exception:  # pragma: no cover - 流程推进失败不阻断回复
                     pass
+            # ---- Q→A 检索快路(PR-3):四道闸全过 + 应答音频已预生成才命中 ----
+            # 命中 → 跳过 LLM 直接播缓存音频(~50ms);任一闸不过 → 照旧走 LLM。
+            # 位置在流程推进块之后:推进/收尾判定已落定,闸门让位(refuse/closing/
+            # advanced 全部旁路);又在 paused 检查之前:与手动补 user 轮同姿势。
+            if _qa_index is not None and _tts_cache is not None:
+                from .flow import _looks_like_whatsapp_step as _llws
+
+                try:
+                    _wa_sig0 = str(_wa_signal[0]) if _wa_signal else ""
+                except NameError:  # 无话术/侦测异常分支:该变量未绑定
+                    _wa_sig0 = ""
+                _qg, _qr = flow_ctrl.current_goal_ref()
+                _qa_reason = _qa_exclude_reason(
+                    user_text,
+                    verdict=str(flow_ctrl.last_verdict or ""),
+                    closing=bool(flow_ctrl.closing),
+                    flow_done=bool(flow_ctrl.done),
+                    wa_signal=_wa_sig0,
+                    wa_captured=bool(_wa_captured["on"]),
+                    wa_step_locked=bool(_llws(_qg, _qr) and not _wa_captured["on"]),
+                    advanced=(flow_ctrl.current != _flow_step_before),
+                )
+                if _qa_reason:
+                    print(f"QA_FASTPATH bypass reason={_qa_reason}", flush=True)
+                else:
+                    try:
+                        _qa_entry, _qa_score = _qa_index.match(
+                            user_text,
+                            lang=language_state.lang,
+                            step_index=(flow_ctrl.current if flow_ctrl.has_steps else None),
+                        )
+                    except Exception:  # noqa: BLE001 - 匹配失败当未命中
+                        _qa_entry, _qa_score = None, 0.0
+                    if _qa_entry is not None:
+                        _qa_answer = str(_qa_entry.get("answer_text") or "").strip()
+                        _qa_voice = getattr(tts_provider, "resolved_voice", lambda: "")()
+                        _qa_model = getattr(tts_provider, "resolved_model", lambda: "")()
+                        _qa_pcm = _tts_cache.lookup(_qa_answer, voice=_qa_voice, model=_qa_model) if _qa_answer else None
+                        if _qa_pcm is not None:
+                            print(f"QA_FASTPATH hit=1 entry={_qa_entry.get('id')} score={_qa_score:.2f}", flush=True)
+                            # ① 作废停着的抢跑快照(其幻影账本条目下轮 rebase 自愈)
+                            try:
+                                await session.interrupt()
+                            except Exception:  # noqa: BLE001
+                                pass
+                            # ② 手动补 user 轮(paused 分支同款):否则记忆/落库收不到这句
+                            try:
+                                chat_ctx = getattr(self, "chat_ctx", None)
+                                if chat_ctx is not None and new_message is not None:
+                                    chat_ctx.items.append(new_message)
+                            except Exception:  # noqa: BLE001
+                                pass
+                            # ③ 回声守卫预锚(正常要 playout 完才自动置,快路要立即生效)
+                            context_state.set_last_reply(_qa_answer)
+                            # ④ 落库两轮(assistant provider=qa-fastpath 供审计/统计)
+                            try:
+                                await cp.add_turn(call_id, "user", user_text, language=language_state.lang)
+                                await cp.add_turn(
+                                    call_id, "assistant", _qa_answer, provider="qa-fastpath", language=language_state.lang
+                                )
+                            except Exception:  # noqa: BLE001
+                                pass
+                            asyncio.create_task(cp.qa_hit(str(_qa_entry.get("id") or "")))
+                            # ⑤ 播预生成音频
+                            await session.say(
+                                _qa_answer,
+                                audio=frames_aiter(pcm_to_frames(_qa_pcm, _tts_cache.sample_rate)),
+                            )
+                            # ⑥ 压掉本轮 LLM(WA 累积同款;必须在 except-pass 之外)
+                            raise StopResponse()
+                        print(f"QA_FASTPATH hit=0 reason=no_audio entry={_qa_entry.get('id')}", flush=True)
             if self.paused:
                 chat_ctx = getattr(self, "chat_ctx", None)
                 if chat_ctx is not None and new_message is not None:
