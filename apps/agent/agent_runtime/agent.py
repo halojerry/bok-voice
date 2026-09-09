@@ -757,6 +757,14 @@ def _filter_cloud_voice_map(raw_map: dict) -> dict:
     return voice_map
 
 
+def _alt_minimax_model(model: str) -> str:
+    """回退链换档映射(纯函数):hd↔turbo 同音色换档;turbo 只发过 2.6 代。
+
+    主档 hd(2.8)→ 2.6-turbo;主档 turbo/未知 → 2.8-hd。音色 ID 跨档通用。
+    """
+    return "speech-2.6-turbo" if "hd" in (model or "") else "speech-2.8-hd"
+
+
 def _assemble_minimax_voice_map(*, persona: dict | None, tts_cfg: dict, greet_lang: str, voice_mode: str) -> dict:
     """组 MiniMax voice map（纯函数，单测直接喂 dict，不起 worker）。
 
@@ -1317,6 +1325,35 @@ async def entrypoint(ctx):
             tts_provider.prewarm()
         except Exception:  # noqa: BLE001 - 预热失败零影响
             pass
+        # 主实例引用先于回退链包裹 capture:FallbackAdapter 包裹后 isinstance
+        # (tts_provider, MiniMaxTTS) 恒 False,后面 CachedTTS 装配的判据要用它。
+        _tts_primary = tts_provider
+        # 云端同音色换档回退(2026-09-09,官方 tts.FallbackAdapter):主档(hd)出错
+        # 自动切 turbo——音色 ID 跨档通用,换档不换人(用户拍板否决 MiniMax→本地
+        # Qwen3 回退:音色两套人,中途换客服违反全场同音色铁律)。看门狗在包装层
+        # 内自愈的错误不会到这层;Adapter 接的是自愈也救不回的漏网错误。BOK_TTS_
+        # FALLBACK=0 关;本地 Qwen3 不进链(要做断网兜底须一次性降级锁到通话结束)。
+        if os.environ.get("BOK_TTS_FALLBACK", "1") == "1":
+            try:
+                from livekit.agents import tts as agents_tts
+
+                primary_model = tts_provider.resolved_model()
+                alt_model = _alt_minimax_model(primary_model)
+                tts_backup = MiniMaxTTS(
+                    voice=voice_map,
+                    language_state=language_state,
+                    sample_rate=int(tts_cfg.get("sample_rate") or 24000),
+                    api_key=str(tts_cfg.get("api_key") or ""),
+                    emotion_state=emotion_state,
+                    model_override=alt_model,
+                )
+                tts_provider = agents_tts.FallbackAdapter([tts_provider, tts_backup])
+                print(
+                    f"[agent] tts fallback on primary={primary_model} backup={alt_model} (call {room_name})",
+                    flush=True,
+                )
+            except Exception as exc:  # noqa: BLE001 - 回退装配失败就用单实例
+                print(f"[agent] tts fallback init failed, single instance: {exc!r} (call {room_name})", flush=True)
     else:
         if tts_provider_name not in ("", "qwen3_tts"):
             print(f"[agent] unknown tts provider {tts_provider_name!r}, fallback qwen3_tts", flush=True)
@@ -1342,9 +1379,11 @@ async def entrypoint(ctx):
 
     # 本地 TTS 音频缓存(2026-09-08):仅包云端 MiniMax——本地 Qwen3 TTS 无网络
     # 首包,缓存无收益。BOK_TTS_CACHE=0 全关;包装层 stream()/事件/预热全透传,
-    # 仅 synthesize()(脚本直念整句路径)走缓存。
+    # 仅 synthesize()(脚本直念整句路径)走缓存。注意 voice/model provider 取
+    # 主实例(_tts_primary,包裹回退链之前 capture):缓存 key 用主档;回退档 tee
+    # 落盘也按主档 key(同文本同音色,档间微差可接受)。
     _tts_cache: TtsAudioCache | None = None
-    if isinstance(tts_provider, MiniMaxTTS) and tts_cache_enabled():
+    if _tts_primary is not None and tts_cache_enabled():
         try:
             _tts_cache = TtsAudioCache(
                 root=default_cache_dir(), sample_rate=int(tts_cfg.get("sample_rate") or 24000)
@@ -1352,8 +1391,8 @@ async def entrypoint(ctx):
             tts_provider = CachedTTS(
                 tts_provider,
                 cache=_tts_cache,
-                voice_provider=tts_provider.resolved_voice,
-                model_provider=tts_provider.resolved_model,
+                voice_provider=_tts_primary.resolved_voice,
+                model_provider=_tts_primary.resolved_model,
             )
             print(f"[agent] tts audio cache on dir={_tts_cache.root} (call {room_name})", flush=True)
         except Exception as exc:  # noqa: BLE001 - 缓存装配失败零影响
@@ -1509,14 +1548,26 @@ async def entrypoint(ctx):
             _strip_expr_markup,
         ],
     )
-    # 垫话编排(PR-2):LLM 临场慢轮回复首音频 ~700ms 未到 → 播预合成应承语,
-    # 真回复出声即定向打断。arm/cancel 由 on_user_turn_completed 驱动;首音频
-    # 回调挂在 CachedTTS 透传层(未包缓存时挂不上,垫话自动失效——纯透传无回调)。
+    # 垫话编排(PR-2;2026-09-09 改版):LLM 临场慢轮回复首音频 ~700ms 未到 → 播
+    # 预合成应承语,真回复出声即停。**通道=BackgroundAudioPlayer out-of-band 音轨**
+    # (官方组件,独立 track 即刻出声)——旧 session.say() 走 speech 队列,1.8 调度
+    # 严格串行,垫话必然排在回复 speech 后面:多数被首音频回调静默吞掉(慢轮照样
+    # 纯静音),拥塞时竞态漏出=垫话在回复后才响(实机实证,call-065a1a12)。
+    # arm/cancel 由 on_user_turn_completed 驱动;首音频回调挂在 CachedTTS 透传层
+    # (未包缓存时挂不上,垫话自动失效——纯透传无回调)。start 在 session.start 之后。
+    try:
+        from livekit.agents import BackgroundAudioPlayer
+
+        _bg_audio = BackgroundAudioPlayer()
+    except Exception as _exc:  # noqa: BLE001 - 无 livekit(测试/异常环境)垫话失效
+        print(f"[agent] background audio unavailable, filler off: {_exc!r}", flush=True)
+        _bg_audio = None
     _filler = FillerDirector(
         session,
         tts_provider,
         _tts_cache,
         lang_resolver=lambda: language_state.lang if language_state.lang in ("zh", "cantonese", "en") else "zh",
+        player=_bg_audio,
         guards=lambda: (
             closed.is_set()
             or agent.paused
@@ -2277,6 +2328,15 @@ async def entrypoint(ctx):
     # AgentSession 内部已注册 job shutdown callback（自动 aclose），
     # 这里不能提前 close，否则会话在接通后立刻被销毁。
     await session.start(agent=agent, room=ctx.room)
+    # 垫话 out-of-band 音轨(官方 BackgroundAudioPlayer):独立 track 发布,web 端
+    # RoomAudioRenderer 渲染所有远端音轨故免改前端;失败仅垫话失效,唔阻通话。
+    if _bg_audio is not None:
+        try:
+            await _bg_audio.start(room=ctx.room, agent_session=session)
+            print("[agent] background audio track started (filler channel)", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[agent] background audio start failed, filler off: {exc!r}", flush=True)
+            _bg_audio = None
     _log_stage("session_started")
 
     if not agent.paused:
@@ -2318,6 +2378,12 @@ async def entrypoint(ctx):
         await closed.wait()
     finally:
         watch_task.cancel()
+        # 垫话 out-of-band 音轨收摊(取消在播任务+取消发布);失败唔阻结算。
+        if _bg_audio is not None:
+            try:
+                await asyncio.wait_for(_bg_audio.aclose(), timeout=3.0)
+            except Exception:  # noqa: BLE001
+                pass
         # 结算收尾窗口(2026-09-09 QA B1):entrypoint 返回即 job teardown,
         # 不等 _close 的话 settle/session_report 请求会被进程退出摧毁。
         # 12s 上限防卡死;teardown 路径由 shutdown callback 再兜一层。
