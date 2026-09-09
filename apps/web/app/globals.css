@@ -146,6 +146,11 @@
   @apply stage-btn h-7 px-3 border border-(--card-border) bg-(--card) text-(--foreground) hover:border-[#2c2d2d] hover:bg-[#141515];
 }
 
+@utility stage-btn-secondary {
+  /* 次级舞台按钮：ghost 描边样式（interpret 页/一体台控制按钮；别名复用 stage-btn-ghost） */
+  @apply stage-btn-ghost;
+}
+
 @utility text-accent {
   color: var(--accent);
 }
