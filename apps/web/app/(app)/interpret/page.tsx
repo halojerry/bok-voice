@@ -259,7 +259,7 @@ export default function InterpretPage() {
           <span className="label">我方端 · 创建同传房间</span>
           <div className="flex gap-3">
             <label className="flex flex-1 flex-col gap-1 text-xs">
-              <span className="text-[var(--stage-muted)]">我方讲</span>
+              <span className="text-(--stage-muted)">我方讲</span>
               <select className="select" value={myLang} onChange={(e) => setMyLang(e.target.value)}>
                 {LANGS.map((l) => (
                   <option key={l.value} value={l.value}>
@@ -269,7 +269,7 @@ export default function InterpretPage() {
               </select>
             </label>
             <label className="flex flex-1 flex-col gap-1 text-xs">
-              <span className="text-[var(--stage-muted)]">对方讲</span>
+              <span className="text-(--stage-muted)">对方讲</span>
               <select className="select" value={otherLang} onChange={(e) => setOtherLang(e.target.value)}>
                 {LANGS.map((l) => (
                   <option key={l.value} value={l.value}>
@@ -282,7 +282,7 @@ export default function InterpretPage() {
           <button className="stage-btn-primary" disabled={busy} onClick={() => startAs("me")}>
             创建房间并开始
           </button>
-          <p className="text-xs leading-relaxed text-[var(--stage-muted)]">
+          <p className="text-xs leading-relaxed text-(--stage-muted)">
             创建后把房间号发给对方;双方各自选好麦克风/扬声器。AI 同传会把你讲的翻译成对方语言、
             只播给对方听,反之亦然;全文双语字幕都看得到。
           </p>
@@ -298,13 +298,13 @@ export default function InterpretPage() {
           <button className="stage-btn-primary" disabled={busy} onClick={() => startAs("other")}>
             加入房间
           </button>
-          <p className="text-xs leading-relaxed text-[var(--stage-muted)]">
+          <p className="text-xs leading-relaxed text-(--stage-muted)">
             加入后选好自己的麦克风与扬声器即可开讲。
           </p>
         </section>
         <section className="card flex flex-col gap-4 md:col-span-2">
           <span className="label">坐席一体台 · 单页双通道</span>
-          <p className="text-xs leading-relaxed text-[var(--stage-muted)]">
+          <p className="text-xs leading-relaxed text-(--stage-muted)">
             两人同机各一支麦：一个页面同时接入本会话两端，我方与对方的译文都从同一个扬声器出声
             （默认共享输出，Mac/Windows 任何内核可用），同页看双向原文+译文字幕；译文播报时自动
             暂让对向麦克风防串译。两人各戴耳机分路听（独立双输出）为高级选项，需桌面 Chrome。
@@ -416,7 +416,7 @@ function InterpretLive(p: LiveProps) {
       <section className="card flex min-h-0 flex-col gap-3 overflow-hidden">
         <div className="flex shrink-0 items-center justify-between">
           <span className="label">双语字幕 · {p.connected ? "进行中" : "连接中…"}</span>
-          <span className="flex items-center gap-3 text-xs text-[var(--stage-muted)]">
+          <span className="flex items-center gap-3 text-xs text-(--stage-muted)">
             <span>房间 {p.roomName}</span>
             <button className="stage-btn-secondary px-2 py-0.5" onClick={p.onCopy}>
               {p.copied ? "已复制" : "复制"}
@@ -426,7 +426,7 @@ function InterpretLive(p: LiveProps) {
         {!p.canPlayAudio && <StartAudio label="点击开启声音" />}
         <div ref={listRef} className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-1 py-2">
           {items.length === 0 && (
-            <div className="flex flex-1 items-center justify-center font-mono text-[10px] uppercase tracking-[0.16em] text-[var(--stage-muted)]">
+            <div className="flex flex-1 items-center justify-center font-mono text-[10px] uppercase tracking-[0.16em] text-(--stage-muted)">
               {p.connected ? "等说话…开口即译" : "正在接入同传房间…"}
             </div>
           )}
@@ -437,8 +437,8 @@ function InterpretLive(p: LiveProps) {
                 <div
                   className={`max-w-[85%] rounded-lg px-3 py-2 text-[13px] leading-relaxed ${
                     label.kind === "dst"
-                      ? "border border-[var(--card-border)] bg-white/5 text-[var(--foreground)]"
-                      : "bg-[var(--accent)] text-[var(--accent-ink)]"
+                      ? "border border-(--card-border) bg-white/5 text-(--foreground)"
+                      : "bg-(--accent) text-(--accent-ink)"
                   }`}
                 >
                   <span className="mr-1.5 font-mono text-[10px] font-bold uppercase opacity-70">
@@ -458,12 +458,12 @@ function InterpretLive(p: LiveProps) {
       <aside className="card flex min-h-0 flex-col gap-4 overflow-y-auto">
         <div className="flex flex-col gap-1">
           <span className="label">{p.side === "me" ? "我方端" : "对方端"}</span>
-          <span className="text-xs text-[var(--stage-muted)]">
+          <span className="text-xs text-(--stage-muted)">
             对方{otherOnline ? "已在线" : "未在线"} · 同传 AI {p.connected ? "已就绪" : "接入中"}
           </span>
         </div>
         <label className="flex flex-col gap-1 text-xs">
-          <span className="text-[var(--stage-muted)]">麦克风</span>
+          <span className="text-(--stage-muted)">麦克风</span>
           <select className="select" value={p.micId} onChange={(e) => p.pickMic(e.target.value)}>
             <option value="">系统默认</option>
             {p.micDevices.map((d) => (
@@ -474,7 +474,7 @@ function InterpretLive(p: LiveProps) {
           </select>
         </label>
         <label className="flex flex-col gap-1 text-xs">
-          <span className="text-[var(--stage-muted)]">扬声器{isTauriShell() ? "(系统输出)" : ""}</span>
+          <span className="text-(--stage-muted)">扬声器{isTauriShell() ? "(系统输出)" : ""}</span>
           <select className="select" value={p.outId} onChange={(e) => p.pickOut(e.target.value)}>
             <option value="">系统默认</option>
             {p.outDevices.map((d) => (

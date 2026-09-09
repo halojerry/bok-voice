@@ -372,8 +372,8 @@ type LiveProps = {
 
 function Stat({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="rounded-md border border-[var(--card-border)] bg-white/5 px-2 py-1.5">
-      <div className="text-[10px] uppercase tracking-wide text-[var(--stage-muted)]">{label}</div>
+    <div className="rounded-md border border-(--card-border) bg-white/5 px-2 py-1.5">
+      <div className="text-[10px] uppercase tracking-wide text-(--stage-muted)">{label}</div>
       <div className="mt-0.5 flex items-center font-mono text-[12px]">{children}</div>
     </div>
   );
@@ -426,7 +426,7 @@ function ConsoleLive(p: LiveProps) {
         <section className="card flex flex-col gap-3 p-4">
           <span className="label">声音设备</span>
           <label className="flex flex-col gap-1 text-xs">
-            <span className="text-[var(--stage-muted)]">我方麦克风</span>
+            <span className="text-(--stage-muted)">我方麦克风</span>
             <select className="select" value={p.meMicId} onChange={(e) => p.pickMeMic(e.target.value)}>
               <option value="">系统默认</option>
               {p.micDevices.map((d) => (
@@ -437,7 +437,7 @@ function ConsoleLive(p: LiveProps) {
             </select>
           </label>
           <label className="flex flex-col gap-1 text-xs">
-            <span className="text-[var(--stage-muted)]">对方麦克风</span>
+            <span className="text-(--stage-muted)">对方麦克风</span>
             <select className="select" value={p.othMicId} onChange={(e) => p.pickOthMic(e.target.value)}>
               <option value="">系统默认</option>
               {p.micDevices.map((d) => (
@@ -448,19 +448,19 @@ function ConsoleLive(p: LiveProps) {
             </select>
           </label>
           <div className="flex flex-col gap-1.5 text-xs">
-            <span className="text-[var(--stage-muted)]">扬声器输出</span>
+            <span className="text-(--stage-muted)">扬声器输出</span>
             <div className="grid grid-cols-2 gap-2">
               <label
-                className={`flex items-center gap-1.5 rounded-md border border-[var(--card-border)] px-2 py-1.5 ${
-                  p.outputMode === "shared" ? "ring-1 ring-[var(--accent)]" : ""
+                className={`flex items-center gap-1.5 rounded-md border border-(--card-border) px-2 py-1.5 ${
+                  p.outputMode === "shared" ? "ring-1 ring-(--accent)" : ""
                 }`}
               >
                 <input type="radio" name="out-mode" checked={p.outputMode === "shared"} onChange={() => p.setOutputMode("shared")} />
                 共享扬声器
               </label>
               <label
-                className={`flex items-center gap-1.5 rounded-md border border-[var(--card-border)] px-2 py-1.5 ${
-                  p.outputMode === "dual" ? "ring-1 ring-[var(--accent)]" : ""
+                className={`flex items-center gap-1.5 rounded-md border border-(--card-border) px-2 py-1.5 ${
+                  p.outputMode === "dual" ? "ring-1 ring-(--accent)" : ""
                 } ${p.canDual ? "" : "opacity-50"}`}
                 title={p.canDual ? "两人各戴一副耳机,分路独立输出" : "需要桌面 Chrome(setSinkId)"}
               >
@@ -475,13 +475,13 @@ function ConsoleLive(p: LiveProps) {
               </label>
             </div>
             {p.outputMode === "shared" ? (
-              <p className="text-[10px] leading-relaxed text-[var(--stage-muted)]">
+              <p className="text-[10px] leading-relaxed text-(--stage-muted)">
                 双向译文都从系统当前扬声器出声;任何内核可用(Mac/Windows),跟系统走。
               </p>
             ) : (
               <div className="grid grid-cols-2 gap-2">
                 <label className="flex flex-col gap-1">
-                  <span className="text-[var(--stage-muted)]">我方扬声器</span>
+                  <span className="text-(--stage-muted)">我方扬声器</span>
                   <select className="select" value={p.meOutId} onChange={(e) => p.pickMeOut(e.target.value)}>
                     <option value="">系统默认</option>
                     {p.outDevices.map((d) => (
@@ -492,7 +492,7 @@ function ConsoleLive(p: LiveProps) {
                   </select>
                 </label>
                 <label className="flex flex-col gap-1">
-                  <span className="text-[var(--stage-muted)]">对方扬声器</span>
+                  <span className="text-(--stage-muted)">对方扬声器</span>
                   <select className="select" value={p.othOutId} onChange={(e) => p.pickOthOut(e.target.value)}>
                     <option value="">系统默认</option>
                     {p.outDevices.map((d) => (
@@ -505,7 +505,7 @@ function ConsoleLive(p: LiveProps) {
               </div>
             )}
             {!p.canDual && (
-              <p className="text-[10px] text-[var(--stage-muted)]">独立双输出需桌面 Chrome;当前内核走共享扬声器。</p>
+              <p className="text-[10px] text-(--stage-muted)">独立双输出需桌面 Chrome;当前内核走共享扬声器。</p>
             )}
           </div>
         </section>
@@ -532,7 +532,7 @@ function ConsoleLive(p: LiveProps) {
             </Stat>
             <Stat label="翻译条数">{dstCount}</Stat>
           </div>
-          <p className="text-xs leading-relaxed text-[var(--stage-muted)]">
+          <p className="text-xs leading-relaxed text-(--stage-muted)">
             语言对:我方 {LANG_SHORT[p.myLang] ?? p.myLang} ⇄ 对方 {LANG_SHORT[p.otherLang] ?? p.otherLang}
             (建房时已钉死,换语言对需结束并重建房间)。
           </p>
@@ -582,8 +582,8 @@ function ConsoleLive(p: LiveProps) {
                 onClick={() => setFilter(v)}
                 className={`rounded-full px-2.5 py-1 text-[11px] ${
                   filter === v
-                    ? "bg-[var(--accent)] font-medium text-[var(--accent-ink)]"
-                    : "border border-[var(--card-border)] text-[var(--stage-muted)]"
+                    ? "bg-(--accent) font-medium text-(--accent-ink)"
+                    : "border border-(--card-border) text-(--stage-muted)"
                 }`}
               >
                 {label}
@@ -593,7 +593,7 @@ function ConsoleLive(p: LiveProps) {
         </div>
         <div ref={listRef} className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-1 py-2">
           {items.length === 0 && (
-            <div className="flex flex-1 items-center justify-center font-mono text-[10px] uppercase tracking-[0.16em] text-[var(--stage-muted)]">
+            <div className="flex flex-1 items-center justify-center font-mono text-[10px] uppercase tracking-[0.16em] text-(--stage-muted)">
               等说话…开口即译
             </div>
           )}
@@ -608,8 +608,8 @@ function ConsoleLive(p: LiveProps) {
                 <div
                   className={`max-w-[85%] rounded-lg px-3 py-2 text-[13px] leading-relaxed ${
                     who.kind === "dst"
-                      ? "border border-[var(--card-border)] bg-white/5 text-[var(--foreground)]"
-                      : "bg-[var(--accent)] text-[var(--accent-ink)]"
+                      ? "border border-(--card-border) bg-white/5 text-(--foreground)"
+                      : "bg-(--accent) text-(--accent-ink)"
                   }`}
                 >
                   <span className="mr-1.5 font-mono text-[10px] font-bold uppercase opacity-70">{who.text}</span>

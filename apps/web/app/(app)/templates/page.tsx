@@ -281,7 +281,7 @@ export default function TemplatesPage() {
     setTableText("");
   }
 
-  const textarea = "w-full resize-none rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]";
+  const textarea = "w-full resize-none rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)";
 
   return (
     <div>
@@ -306,7 +306,7 @@ export default function TemplatesPage() {
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
                         <p className="font-medium">{String(row.name ?? "-")}</p>
-                        <p className="mt-1 text-xs text-[var(--muted)]">
+                        <p className="mt-1 text-xs muted">
                           {LANGS.find((l) => l[0] === String(row.language ?? "zh"))?.[1] ?? String(row.language ?? "zh")}
                           {String(row.tone_override ?? "") && ` · 语气 ${String(row.tone_override)}`}
                           {String(row.hotwords ?? "") && ` · 热词 ${String(row.hotwords)}`}
@@ -324,8 +324,8 @@ export default function TemplatesPage() {
                           return (
                             <div className="space-y-1">
                               {s.map((st, i) => (
-                                <p key={i} className="text-[var(--muted)]">
-                                  <span className="font-bold text-[var(--accent)]">{i + 1}.</span>{" "}
+                                <p key={i} className="muted">
+                                  <span className="font-bold text-accent">{i + 1}.</span>{" "}
                                   {st.goal || "(无目标)"}
                                 </p>
                               ))}
@@ -337,7 +337,7 @@ export default function TemplatesPage() {
                             {TEMPLATE_FIELDS.map((k) => (
                               <div key={k}>
                                 <span className="label">{FIELD_LABELS[k]}</span>
-                                <p className="mt-0.5 line-clamp-3 text-[var(--muted)]">{String(row[k] ?? "")}</p>
+                                <p className="mt-0.5 line-clamp-3 muted">{String(row[k] ?? "")}</p>
                               </div>
                             ))}
                           </div>
@@ -354,14 +354,14 @@ export default function TemplatesPage() {
         <section className="card space-y-3">
           <span className="label">{editingId ? "编辑模板" : "新建模板"}</span>
           <input
-            className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+            className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
             value={form.name}
             onChange={(e) => setForm({ ...form, name: e.target.value })}
             placeholder="模板名，例如：顺丰理赔·分步（粤语）"
           />
 
           {/* 分步话术(主编辑方式):1.2.3.4 逐步推进,每步填 目标 + 参考说法 */}
-          <div className="rounded-lg border border-[var(--accent)]/40 p-3">
+          <div className="rounded-lg border border-(--accent)/40 p-3">
             <div className="flex items-center justify-between">
               <span className="label">分步话术（推荐 · 通话按步骤逐步推进，不会一口气讲完）</span>
               <button
@@ -371,20 +371,20 @@ export default function TemplatesPage() {
                 + 加一步
               </button>
             </div>
-            <p className="mt-1 whitespace-pre-line text-[11px] leading-relaxed text-[var(--muted)]">{STEPS_HINT}</p>
-            <p className="mt-1 text-[11px] leading-relaxed text-[var(--muted)]">
-              参考说法可分行写分支：<span className="text-[var(--accent)]">如果客户… → 就…</span>，AI 会看客户实际反应挑对应分支回答。
+            <p className="mt-1 whitespace-pre-line text-[11px] leading-relaxed muted">{STEPS_HINT}</p>
+            <p className="mt-1 text-[11px] leading-relaxed muted">
+              参考说法可分行写分支：<span className="text-accent">如果客户… → 就…</span>，AI 会看客户实际反应挑对应分支回答。
             </p>
             {steps.length === 0 && (
-              <p className="mt-1 text-[11px] text-[var(--muted)]">
+              <p className="mt-1 text-[11px] muted">
                 还没配置步骤？点上方「填入示例」一键带出完整分步（含分支写法），或「从旧四段导入」把下方开场/核心/异议/收尾转成步骤。
               </p>
             )}
             <div className="mt-2 space-y-3">
               {steps.map((st, i) => (
-                <div key={i} className="rounded-lg border border-[var(--card-border)] bg-white/5 p-2">
+                <div key={i} className="rounded-lg border border-(--card-border) bg-white/5 p-2">
                   <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-[var(--accent)]">第 {i + 1} 步</span>
+                    <span className="text-xs font-bold text-accent">第 {i + 1} 步</span>
                     <div className="flex gap-1">
                       <button className="btn-ghost px-1.5 py-0 text-xs" disabled={i === 0} onClick={() => setSteps((s) => { const n = [...s]; [n[i - 1], n[i]] = [n[i], n[i - 1]]; return n; })}>↑</button>
                       <button className="btn-ghost px-1.5 py-0 text-xs" disabled={i === steps.length - 1} onClick={() => setSteps((s) => { const n = [...s]; [n[i + 1], n[i]] = [n[i], n[i + 1]]; return n; })}>↓</button>
@@ -392,7 +392,7 @@ export default function TemplatesPage() {
                     </div>
                   </div>
                   <input
-                    className="mt-1.5 w-full rounded-lg border border-[var(--card-border)] bg-transparent px-2 py-1 text-xs outline-none focus:border-[var(--accent)]"
+                    className="mt-1.5 w-full rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--accent)"
                     placeholder="这一步要达成的目标(如:确认包裹是不是{姓名}本人的)"
                     value={st.goal}
                     onChange={(e) => setSteps((s) => s.map((x, j) => (j === i ? { ...x, goal: e.target.value } : x)))}
@@ -421,15 +421,15 @@ export default function TemplatesPage() {
                 </button>
               )}
               {steps.length > 0 && (
-                <button className="btn-ghost px-2 py-0.5 text-xs text-[var(--muted)]" onClick={() => setSteps([])}>清空步骤</button>
+                <button className="btn-ghost px-2 py-0.5 text-xs muted" onClick={() => setSteps([])}>清空步骤</button>
               )}
             </div>
             {showTableImport && (
-              <div className="mt-2 rounded-lg border border-dashed border-[var(--card-border)] p-2">
-                <p className="text-[11px] leading-relaxed text-[var(--muted)]">
+              <div className="mt-2 rounded-lg border border-dashed border-(--card-border) p-2">
+                <p className="text-[11px] leading-relaxed muted">
                   从表格（Excel/Google Sheets/CSV）粘贴：<b>每行一步</b>，第一列=目标，第二列=参考说法。
                   支持带表头（列名：目标/参考说法）或不带表头（直接两列）。参考说法里可写
-                  <span className="text-[var(--accent)]">如果客户… → 就…</span>分支与{"{变量}"}。
+                  <span className="text-accent">如果客户… → 就…</span>分支与{"{变量}"}。
                 </p>
                 <textarea
                   className={`mt-1.5 h-24 ${textarea} text-xs`}
@@ -439,23 +439,23 @@ export default function TemplatesPage() {
                 />
                 <div className="mt-1.5 flex items-center gap-2">
                   <button className="btn-primary px-3 py-1 text-xs" onClick={importTable}>导入为步骤</button>
-                  {tableMsg && <span className="text-xs text-[var(--muted)]">{tableMsg}</span>}
+                  {tableMsg && <span className="text-xs muted">{tableMsg}</span>}
                 </div>
               </div>
             )}
           </div>
 
           {/* 旧式四段(兼容折叠):历史模板仍可编辑;新模板建议直接用分步 */}
-          <div className="rounded-lg border border-[var(--card-border)] p-3">
+          <div className="rounded-lg border border-(--card-border) p-3">
             <button className="flex w-full items-center justify-between text-left" onClick={() => setShowLegacy((v) => !v)}>
-              <span className="text-xs text-[var(--stage-muted)]">旧式四段话术（开场/核心/异议/收尾 — 兼容历史模板，保存时自动转步骤）</span>
-              <span className="text-xs text-[var(--muted)]">{showLegacy ? "收起 ▲" : "展开 ▼"}</span>
+              <span className="text-xs text-(--stage-muted)">旧式四段话术（开场/核心/异议/收尾 — 兼容历史模板，保存时自动转步骤）</span>
+              <span className="text-xs muted">{showLegacy ? "收起 ▲" : "展开 ▼"}</span>
             </button>
             {showLegacy && (
               <div className="mt-2 space-y-2">
                 {TEMPLATE_FIELDS.map((k) => (
                   <label key={k} className="block">
-                    <span className="text-xs text-[var(--stage-muted)]">{FIELD_LABELS[k]}</span>
+                    <span className="text-xs text-(--stage-muted)">{FIELD_LABELS[k]}</span>
                     <textarea
                       className={`mt-1 h-16 ${textarea} text-xs`}
                       value={form[k]}
@@ -468,30 +468,30 @@ export default function TemplatesPage() {
             )}
           </div>
           <label className="block">
-            <span className="text-xs text-[var(--stage-muted)]">语气覆盖（可选，优先于人设）</span>
+            <span className="text-xs text-(--stage-muted)">语气覆盖（可选，优先于人设）</span>
             <input
-              className="mt-1 w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
               value={form.tone_override}
               onChange={(e) => setForm({ ...form, tone_override: e.target.value })}
               placeholder="如：专业、温和、简洁"
             />
           </label>
           <label className="block">
-            <span className="text-xs text-[var(--stage-muted)]">识别热词（可选，本套话术专属）</span>
+            <span className="text-xs text-(--stage-muted)">识别热词（可选，本套话术专属）</span>
             <input
-              className="mt-1 w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
               value={form.hotwords}
               onChange={(e) => setForm({ ...form, hotwords: e.target.value })}
               placeholder="如：順豐速運, 集運, 理賠（逗号/顿号分隔）"
             />
-            <span className="mt-1 block text-[11px] leading-relaxed text-[var(--muted)]">
+            <span className="mt-1 block text-[11px] leading-relaxed muted">
               客户或话术里的专名词容易听错，填进这里 AI 语音识别会更准。纯数字串会被忽略（防止识别出错误号码）。
             </span>
           </label>
           <label className="block">
-            <span className="text-xs text-[var(--stage-muted)]">语言</span>
+            <span className="text-xs text-(--stage-muted)">语言</span>
             <select
-              className="mt-1 w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm"
+              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm"
               value={form.language}
               onChange={(e) => setForm({ ...form, language: e.target.value })}
             >

@@ -424,10 +424,10 @@ export default function PersonasPage() {
                   <div key={id} className="flex items-start justify-between gap-3 rounded-lg bg-white/5 px-4 py-3">
                     <div className="min-w-0">
                       <p className="font-medium">{String(row.name ?? "-")}</p>
-                      <p className="mt-1 text-xs text-[var(--muted)]">
+                      <p className="mt-1 text-xs muted">
                         {String(row.company ?? "")} · AI语言：{LANG_LABEL[String(row.language ?? "zh")] ?? String(row.language ?? "zh")}
                       </p>
-                      {String(row.tone ?? "") && <p className="mt-1 line-clamp-3 text-sm text-[var(--muted)]">{String(row.tone)}</p>}
+                      {String(row.tone ?? "") && <p className="mt-1 line-clamp-3 text-sm muted">{String(row.tone)}</p>}
                     </div>
                     <div className="flex shrink-0 gap-2">
                       <button className="btn-ghost text-xs" onClick={() => edit(row)}>编辑</button>
@@ -443,33 +443,33 @@ export default function PersonasPage() {
         <section className="card space-y-4">
           <span className="label">{editingId ? "编辑人设" : "新建人设"}</span>
           <input
-            className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+            className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
             value={form.name}
             onChange={(e) => setForm({ ...form, name: e.target.value })}
             placeholder="称呼，例如：小博"
           />
           <input
-            className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+            className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
             value={form.company}
             onChange={(e) => setForm({ ...form, company: e.target.value })}
             placeholder="代表公司，例如：Bok 建材"
           />
           <textarea
-            className="h-28 w-full resize-none rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+            className="h-28 w-full resize-none rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
             value={form.tone}
             onChange={(e) => setForm({ ...form, tone: e.target.value })}
             placeholder="专业、温和、简洁；适当使用敬语…"
           />
-          <div className="rounded-lg border border-[var(--card-border)] p-3">
+          <div className="rounded-lg border border-(--card-border) p-3">
             <span className="label mb-1 block">AI 使用语言</span>
-            <p className="mb-2 text-[11px] text-[var(--muted)]">
+            <p className="mb-2 text-[11px] muted">
               决定 AI 用什么语言开口（开场白）与默认表达；客户说其它语言时仍会跟随客户切换。
             </p>
             <div className="flex flex-wrap gap-2">
               {LANGS.map(([lang, label]) => (
                 <button
                   key={lang}
-                  className={`btn-ghost text-xs ${form.language === lang ? "!border-[var(--accent)]" : ""}`}
+                  className={`btn-ghost text-xs ${form.language === lang ? "border-(--accent)!" : ""}`}
                   onClick={() => setForm({ ...form, language: lang })}
                 >
                   {label}
@@ -477,14 +477,14 @@ export default function PersonasPage() {
               ))}
             </div>
           </div>
-          <div className="rounded-lg border border-[var(--card-border)] p-3">
+          <div className="rounded-lg border border-(--card-border) p-3">
             <span className="label mb-1 block">语音引擎</span>
-            <p className="mb-2 text-[11px] text-[var(--muted)]">
+            <p className="mb-2 text-[11px] muted">
               决定该人设通话用哪套 TTS：本地 Qwen3（可用下方克隆音色）或云端 MiniMax
               （可在下方为这个人设选一个固定音色，整场同声）。留空 = 跟随全局设置。
             </p>
             <select
-              className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+              className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
               value={form.tts_provider ?? ""}
               onChange={(e) => setForm({ ...form, tts_provider: e.target.value })}
             >
@@ -494,7 +494,7 @@ export default function PersonasPage() {
               <option value="volcano_streaming">火山引擎（云端）</option>
             </select>
             {(form.tts_provider === "minimax" || form.tts_provider === "volcano_streaming") && (
-              <p className="mt-2 text-[11px] text-[var(--accent)]">
+              <p className="mt-2 text-[11px] text-accent">
                 云端引擎：人设绑定一个音色后，整场通话（粤/普/英）都用它发声。火山引擎目前仍用全局配置音色。
               </p>
             )}
@@ -503,12 +503,12 @@ export default function PersonasPage() {
             {engineIsCloud ? (
               <>
                 {/* 云端引擎：整场固定一个音色（不随语言换声）。 */}
-                <span className="text-xs text-[var(--stage-muted)]">AI 音色（整场同声 · 不随语言切换）</span>
-                <p className="text-[11px] text-[var(--muted)]">
+                <span className="text-xs text-(--stage-muted)">AI 音色（整场同声 · 不随语言切换）</span>
+                <p className="text-[11px] muted">
                   只列与当前人设语言匹配的音色（英文人设显示英文音色，对应语言显示对应音色），不会混在一起挑错。
                 </p>
                 <select
-                  className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+                  className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
                   value={cloudVoice}
                   onChange={(e) => { setCloudVoice(e.target.value); setCloudPreviewLang(""); setPreviewUrl(""); }}
                 >
@@ -523,13 +523,13 @@ export default function PersonasPage() {
                   )}
                 </select>
                 <div className="flex items-center gap-2">
-                  <span className="text-[11px] text-[var(--muted)]">试听语言：</span>
+                  <span className="text-[11px] muted">试听语言：</span>
                   {([["cantonese", "粤"], ["zh", "普"], ["en", "英"]] as const).map(([lv, lb]) => {
                     const cur = cloudPreviewLang || previewLangForVoice(cloudVoice);
                     return (
                       <button
                         key={lv}
-                        className={`btn-ghost px-1.5 py-0 text-[11px] ${cur === lv ? "!border-[var(--accent)]" : ""}`}
+                        className={`btn-ghost px-1.5 py-0 text-[11px] ${cur === lv ? "border-(--accent)!" : ""}`}
                         onClick={() => { setCloudPreviewLang(lv); setPreviewUrl(""); }}
                       >
                         {lb}
@@ -544,22 +544,22 @@ export default function PersonasPage() {
             ) : (
               <>
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-xs text-[var(--stage-muted)]">为该语言选音色：</span>
+                  <span className="text-xs text-(--stage-muted)">为该语言选音色：</span>
                   {LANGS.map(([lang, label]) => (
                     <button
                       key={lang}
-                      className={`btn-ghost text-xs ${activeLang === lang ? "!border-[var(--accent)]" : ""}`}
+                      className={`btn-ghost text-xs ${activeLang === lang ? "border-(--accent)!" : ""}`}
                       onClick={() => setActiveLang(lang)}
                     >
                       {label}
                     </button>
                   ))}
                 </div>
-                <p className="text-[11px] text-[var(--muted)]">
+                <p className="text-[11px] muted">
                   {`当前「${LANG_LABEL[activeLang] ?? activeLang}」音色：没绑时自动推荐${activeLang === "cantonese" ? "粤语克隆" : "该语言克隆"}${activeLang !== "cantonese" ? "" : "；要讲粤语请用「粤语参考音频克隆」的音色，普通话音色读粤语会带普通话音"}`}
                 </p>
             <select
-              className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+              className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
               value={voiceMap[activeLang] ?? ""}
               onChange={(e) => setVoiceMap((prev) => ({ ...prev, [activeLang]: e.target.value }))}
             >
@@ -574,16 +574,16 @@ export default function PersonasPage() {
               )}
             </select>
             <input
-              className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+              className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
               value={refText}
               onChange={(e) => setRefText(e.target.value)}
               placeholder={activeLang === "cantonese" ? "参考音频对应的文字（录音/上传都要填），例如：你好，我係小博，有咩可以幫到你？" : "参考音频对应的文字（录音/上传都要填）"}
             />
             {/* 录音克隆：直接对麦克风说一段话作为该语言的参考音色 */}
-            <div className="rounded-lg border border-[var(--card-border)] p-2">
+            <div className="rounded-lg border border-(--card-border) p-2">
               <div className="flex items-center gap-2">
                 <button
-                  className={`btn-ghost flex-1 text-xs ${recording ? "!text-red-300" : ""}`}
+                  className={`btn-ghost flex-1 text-xs ${recording ? "text-red-300!" : ""}`}
                   onClick={toggleRecording}
                 >
                   {recording ? `● 停止录音（${recSec}s）` : "🎙 录音（用麦克风录一段）"}
@@ -597,7 +597,7 @@ export default function PersonasPage() {
               )}
               {recBlobUrl && (
                 <div className="mt-2">
-                  <p className="text-xs text-[var(--muted)]">录音预览（将作为克隆参考音频）：</p>
+                  <p className="text-xs muted">录音预览（将作为克隆参考音频）：</p>
                   <audio controls src={recBlobUrl} className="mt-1 w-full" />
                 </div>
               )}
@@ -611,8 +611,8 @@ export default function PersonasPage() {
                 setRecBlobUrl("");
               }}
             />
-            <p className="rounded-lg bg-white/5 p-2 text-[11px] leading-relaxed text-[var(--muted)]">
-              克隆出来的音色会讲什么语言/口音，由你录的参考音频决定：想让 AI 讲<b className="text-[var(--foreground)]">粤语</b>，就对着麦用粤语说一段参考语料（如上方的粤语示例）；用普通话参考音频克隆出的音色，读粤语文字也会带普通话音。克隆会存为独立音色，可随时回来试听。
+            <p className="rounded-lg bg-white/5 p-2 text-[11px] leading-relaxed muted">
+              克隆出来的音色会讲什么语言/口音，由你录的参考音频决定：想让 AI 讲<b className="text-(--foreground)">粤语</b>，就对着麦用粤语说一段参考语料（如上方的粤语示例）；用普通话参考音频克隆出的音色，读粤语文字也会带普通话音。克隆会存为独立音色，可随时回来试听。
             </p>
             <div className="flex gap-2">
               <button className="btn-ghost w-full" onClick={registerVoice} disabled={recording}>克隆并保存音色</button>
@@ -620,18 +620,18 @@ export default function PersonasPage() {
             </div>
             {previewUrl && <audio controls autoPlay src={previewUrl} className="mt-2 w-full" />}
             {clonedVoices.length > 0 && (
-              <div className="rounded-lg border border-[var(--card-border)] p-2">
-                <span className="text-xs text-[var(--stage-muted)]">已克隆音色</span>
+              <div className="rounded-lg border border-(--card-border) p-2">
+                <span className="text-xs text-(--stage-muted)">已克隆音色</span>
                 <ul className="mt-1.5 space-y-1">
                   {clonedVoices.map((cv) => (
                     <li key={cv.id} className="flex items-center justify-between gap-2 text-xs">
-                      <span className="truncate text-[var(--foreground)]">
+                      <span className="truncate text-(--foreground)">
                         {cv.id}
                         {cv.lang ? `（${LANG_LABEL[cv.lang] ?? cv.lang}）` : ""}
                       </span>
                       <div className="flex shrink-0 gap-1">
                         <button
-                          className="text-[var(--muted)] hover:text-[var(--accent)]"
+                          className="muted hover:text-accent"
                           onClick={async () => {
                             // 试听该克隆：临时切到对应语言标签并绑定，再试听。
                             if (cv.lang && ["zh", "cantonese", "en"].includes(cv.lang)) {

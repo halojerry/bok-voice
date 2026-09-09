@@ -58,7 +58,7 @@ export default function ReportsPage() {
               <span className="label">通话记录</span>
               <table className="mt-3 w-full text-sm">
                 <thead>
-                  <tr className="text-left text-xs text-[var(--muted)]">
+                  <tr className="text-left text-xs muted">
                     <th className="pb-2">对象</th>
                     <th className="pb-2">状态</th>
                     <th className="pb-2">模式</th>
@@ -67,9 +67,9 @@ export default function ReportsPage() {
                 </thead>
                 <tbody>
                   {calls.map((c) => (
-                    <tr key={String(c.id)} className="border-t border-[var(--card-border)]">
+                    <tr key={String(c.id)} className="border-t border-(--card-border)">
                       <td className="py-2">{String(c.object_id ?? "-")}</td>
-                      <td className="py-2 text-[var(--muted)]">{String(c.status ?? "-")}</td>
+                      <td className="py-2 muted">{String(c.status ?? "-")}</td>
                       <td className="py-2">{String(c.mode ?? "-")}</td>
                       <td className="py-2">{String(c.language ?? "-")}</td>
                     </tr>
@@ -88,7 +88,7 @@ export default function ReportsPage() {
                   ["VAD", usage?.vad_calls],
                 ].map(([k, v]) => (
                   <div key={String(k)} className="flex justify-between">
-                    <span className="text-[var(--muted)]">{String(k)}</span>
+                    <span className="muted">{String(k)}</span>
                     <span>{String(v ?? "—")}</span>
                   </div>
                 ))}
@@ -98,15 +98,15 @@ export default function ReportsPage() {
 
           <section className="card mt-6">
             <span className="label">全局洞察</span>
-            <p className="mt-1 text-xs text-[var(--muted)]">由每场挂断结算自动蒸馏（本机 LLM），反映对象群共性的观察。结算过的通话越多越有价值。</p>
+            <p className="mt-1 text-xs muted">由每场挂断结算自动蒸馏（本机 LLM），反映对象群共性的观察。结算过的通话越多越有价值。</p>
             {insights.length === 0 ? (
-              <p className="mt-3 text-sm text-[var(--muted)]">暂无洞察。完成几场通话并挂断结算后会自动沉淀到这里。</p>
+              <p className="mt-3 text-sm muted">暂无洞察。完成几场通话并挂断结算后会自动沉淀到这里。</p>
             ) : (
               <div className="mt-3 space-y-2">
                 {insights.map((ins, i) => (
                   <div key={String(ins.id ?? i)} className="rounded-lg bg-white/5 p-3 text-sm">
                     <p>{String(ins.statement ?? "")}</p>
-                    <p className="mt-1 text-xs text-[var(--muted)]">
+                    <p className="mt-1 text-xs muted">
                       置信度 {String(ins.confidence ?? "-")} · {String(ins.language ?? "zh")}
                       {ins.created_at ? ` · ${String(ins.created_at).slice(0, 19)}` : ""}
                     </p>

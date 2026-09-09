@@ -207,50 +207,50 @@ export default function TranslatePage() {
         <div>
           <p className="stage-eyebrow">REALTIME TRANSLATION</p>
           <h1 className="text-2xl font-semibold tracking-tight">同声传译</h1>
-          <p className="mt-1 text-sm text-[var(--stage-muted)]">
+          <p className="mt-1 text-sm text-(--stage-muted)">
             独立于客服 Agent 的 B 线：ASR → 原文字幕 → 翻译 → Qwen3-TTS → 播放/字幕
           </p>
         </div>
-        <span className={`font-mono text-xs ${wsState === "open" ? "text-[var(--stage-value)]" : "text-red-300"}`}>
+        <span className={`font-mono text-xs ${wsState === "open" ? "text-(--stage-value)" : "text-red-300"}`}>
           WS {wsState.toUpperCase()} · {WS_URL}
         </span>
       </div>
 
-      <div className="flex flex-wrap items-end gap-3 rounded-xl border border-[var(--card-border)] bg-[var(--card)]/60 p-4">
+      <div className="flex flex-wrap items-end gap-3 rounded-xl border border-(--card-border) bg-(--card)/60 p-4">
         <label className="text-sm">
-          <span className="block text-xs text-[var(--stage-muted)]">源语言</span>
-          <select className="mt-1 rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm" value={form.sourceLang} onChange={(e) => setForm({ ...form, sourceLang: e.target.value })}>
+          <span className="block text-xs text-(--stage-muted)">源语言</span>
+          <select className="mt-1 rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm" value={form.sourceLang} onChange={(e) => setForm({ ...form, sourceLang: e.target.value })}>
             {LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
           </select>
         </label>
         <label className="text-sm">
-          <span className="block text-xs text-[var(--stage-muted)]">目标语言</span>
-          <select className="mt-1 rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm" value={form.targetLang} onChange={(e) => setForm({ ...form, targetLang: e.target.value })}>
+          <span className="block text-xs text-(--stage-muted)">目标语言</span>
+          <select className="mt-1 rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm" value={form.targetLang} onChange={(e) => setForm({ ...form, targetLang: e.target.value })}>
             {LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
           </select>
         </label>
         <label className="text-sm">
-          <span className="block text-xs text-[var(--stage-muted)]">翻译引擎</span>
-          <select className="mt-1 rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm" value={form.provider} onChange={(e) => setForm({ ...form, provider: e.target.value as Channel["provider"] })}>
+          <span className="block text-xs text-(--stage-muted)">翻译引擎</span>
+          <select className="mt-1 rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm" value={form.provider} onChange={(e) => setForm({ ...form, provider: e.target.value as Channel["provider"] })}>
             <option value="local_openai">本地 LLM</option>
             <option value="dashscope">DashScope Qwen-MT</option>
           </select>
         </label>
         <button className="btn-ghost" onClick={addChannel}>+ 添加通道</button>
-        <span className="ml-auto font-mono text-xs text-[var(--stage-muted)]">{runningCount} 通道运行中</span>
+        <span className="ml-auto font-mono text-xs text-(--stage-muted)">{runningCount} 通道运行中</span>
       </div>
 
-      {channels.length === 0 && <p className="text-sm text-[var(--stage-muted)]">还没有通道。选择语言对后点「添加通道」，再点「开始」。</p>}
+      {channels.length === 0 && <p className="text-sm text-(--stage-muted)">还没有通道。选择语言对后点「添加通道」，再点「开始」。</p>}
 
       <div className="grid gap-4 lg:grid-cols-2">
         {channels.map((ch) => (
-          <div key={ch.id} className="rounded-xl border border-[var(--card-border)] bg-[var(--card)]/60 p-4">
+          <div key={ch.id} className="rounded-xl border border-(--card-border) bg-(--card)/60 p-4">
             <div className="mb-3 flex items-center justify-between">
               <div className="font-mono text-sm">
-                <span className="text-[var(--stage-value)]">{LANGS.find((l) => l.code === ch.sourceLang)?.label}</span>
-                <span className="mx-2 text-[var(--stage-muted)]">→</span>
+                <span className="text-(--stage-value)">{LANGS.find((l) => l.code === ch.sourceLang)?.label}</span>
+                <span className="mx-2 text-(--stage-muted)">→</span>
                 <span>{LANGS.find((l) => l.code === ch.targetLang)?.label}</span>
-                <span className="ml-3 rounded bg-[var(--stage-muted)]/10 px-2 py-0.5 text-xs">{ch.provider}</span>
+                <span className="ml-3 rounded-sm bg-(--stage-muted)/10 px-2 py-0.5 text-xs">{ch.provider}</span>
               </div>
               {ch.running ? (
                 <button className="btn-ghost" onClick={() => stopChannel(ch)}>停止</button>
@@ -259,24 +259,24 @@ export default function TranslatePage() {
               )}
             </div>
 
-            <p className="mb-3 text-xs text-[var(--stage-muted)]">{ch.status}</p>
+            <p className="mb-3 text-xs text-(--stage-muted)">{ch.status}</p>
 
             <div className="max-h-56 space-y-2 overflow-y-auto">
-              {ch.subtitles.length === 0 && <p className="text-xs text-[var(--stage-muted)]">等待字幕…</p>}
+              {ch.subtitles.length === 0 && <p className="text-xs text-(--stage-muted)">等待字幕…</p>}
               {ch.subtitles.map((s, i) => (
-                <div key={`${s.sourceSeqId}-${i}`} className="rounded-lg border border-[var(--card-border)] bg-black/20 p-3">
-                  <p className="text-sm text-[var(--stage-muted)]">{s.source}</p>
-                  <p className="mt-1 text-sm text-[var(--stage-value)]">{s.translated}</p>
+                <div key={`${s.sourceSeqId}-${i}`} className="rounded-lg border border-(--card-border) bg-black/20 p-3">
+                  <p className="text-sm text-(--stage-muted)">{s.source}</p>
+                  <p className="mt-1 text-sm text-(--stage-value)">{s.translated}</p>
                 </div>
               ))}
             </div>
 
             {ch.metrics && (
-              <div className="mt-3 grid grid-cols-3 gap-2 border-t border-[var(--card-border)] pt-3 font-mono text-xs">
-                <span>queueDepth <b className="text-[var(--stage-value)]">{ch.metrics.queueDepth}</b></span>
-                <span>backlog <b className="text-[var(--stage-value)]">{ch.metrics.playableBacklogMs}ms</b></span>
-                <span>chase <b className="text-[var(--stage-value)]">{ch.metrics.chaseState} ×{ch.metrics.chaseSpeed.toFixed(2)}</b></span>
-                <span>queued <b className="text-[var(--stage-value)]">{ch.metrics.queuedAudioMs}ms</b></span>
+              <div className="mt-3 grid grid-cols-3 gap-2 border-t border-(--card-border) pt-3 font-mono text-xs">
+                <span>queueDepth <b className="text-(--stage-value)">{ch.metrics.queueDepth}</b></span>
+                <span>backlog <b className="text-(--stage-value)">{ch.metrics.playableBacklogMs}ms</b></span>
+                <span>chase <b className="text-(--stage-value)">{ch.metrics.chaseState} ×{ch.metrics.chaseSpeed.toFixed(2)}</b></span>
+                <span>queued <b className="text-(--stage-value)">{ch.metrics.queuedAudioMs}ms</b></span>
                 <span>dropped <b className="text-red-300">{ch.metrics.droppedBlocks}块/{ch.metrics.droppedMs}ms</b></span>
               </div>
             )}

@@ -29,19 +29,19 @@ export function StageHeader({ status }: { status?: ReactNode }) {
   return (
     <header className="mx-auto flex h-16 w-full max-w-7xl items-center justify-between gap-4 px-6 lg:px-10">
       <Link href="/" className="flex shrink-0 items-center gap-2.5">
-        <span className="flex h-9 w-9 items-center justify-center rounded bg-[var(--stage-value)] font-mono text-base font-bold text-[#01191c]">
+        <span className="flex h-9 w-9 items-center justify-center rounded-sm bg-(--stage-value) font-mono text-base font-bold text-[#01191c]">
           B
         </span>
         <span className="text-[15px] font-medium tracking-tight">Bok Voice</span>
       </Link>
 
-      <nav className="hidden items-center gap-7 text-sm text-[var(--stage-muted)] md:flex">
+      <nav className="hidden items-center gap-7 text-sm text-(--stage-muted) md:flex">
         {NAV.map((n) => (
           <Link
             key={n.href}
             href={n.href}
-            className={`transition hover:text-[var(--foreground)] ${
-              isActive(n.href) ? "text-[var(--stage-value)]" : ""
+            className={`transition hover:text-(--foreground) ${
+              isActive(n.href) ? "text-(--stage-value)" : ""
             }`}
           >
             {n.label}
@@ -50,10 +50,10 @@ export function StageHeader({ status }: { status?: ReactNode }) {
       </nav>
 
       <div className="flex shrink-0 items-center gap-4">
-        <span className="hidden items-center gap-2 text-xs text-[var(--stage-muted)] sm:inline-flex">
+        <span className="hidden items-center gap-2 text-xs text-(--stage-muted) sm:inline-flex">
           {status ?? (
             <>
-              <span className="h-2 w-2 rounded-full bg-[var(--stage-value)]" />
+              <span className="h-2 w-2 rounded-full bg-(--stage-value)" />
               <span className="font-mono">v0.1.0</span>
             </>
           )}

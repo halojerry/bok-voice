@@ -53,18 +53,18 @@ export default function DesktopStatus() {
 
   if (reason) {
     return (
-      <div className="rounded-xl border border-[var(--card-border)] bg-[var(--card)] p-4 text-sm text-muted-foreground">
+      <div className="rounded-xl border border-(--card-border) bg-(--card) p-4 text-sm text-muted-foreground">
         {reason}
       </div>
     );
   }
   if (!report) {
-    return <div className="rounded-xl border border-[var(--card-border)] p-4 text-sm text-muted-foreground">正在读取桌面服务状态…</div>;
+    return <div className="rounded-xl border border-(--card-border) p-4 text-sm text-muted-foreground">正在读取桌面服务状态…</div>;
   }
 
   const up = report.services.filter((s) => s.up).length;
   return (
-    <div className="rounded-xl border border-[var(--card-border)] bg-[var(--card)] p-4">
+    <div className="rounded-xl border border-(--card-border) bg-(--card) p-4">
       <div className="mb-2 flex items-center justify-between">
         <h3 className="text-sm font-semibold">本机桌面服务</h3>
         <span className="text-xs text-muted-foreground">
@@ -75,7 +75,7 @@ export default function DesktopStatus() {
         {report.services.map((s) => (
           <div
             key={s.name}
-            className="flex items-center justify-between rounded-lg border border-[var(--card-border)] px-3 py-2 text-xs"
+            className="flex items-center justify-between rounded-lg border border-(--card-border) px-3 py-2 text-xs"
           >
             <span>{s.name}</span>
             <span className={s.up ? "text-emerald-400" : "text-rose-400"}>
@@ -86,13 +86,13 @@ export default function DesktopStatus() {
       </div>
       <p className="mt-2 truncate text-xs text-muted-foreground">数据目录：{report.app_data_dir}</p>
       <div className="mt-3 flex gap-2">
-        <button className="rounded-lg border border-[var(--card-border)] px-3 py-1.5 text-xs hover:border-[var(--accent)]" onClick={() => startServices()}>
+        <button className="rounded-lg border border-(--card-border) px-3 py-1.5 text-xs hover:border-(--accent)" onClick={() => startServices()}>
           启动服务
         </button>
-        <button className="rounded-lg border border-[var(--card-border)] px-3 py-1.5 text-xs hover:border-[var(--accent)]" onClick={() => stopServices()}>
+        <button className="rounded-lg border border-(--card-border) px-3 py-1.5 text-xs hover:border-(--accent)" onClick={() => stopServices()}>
           停止服务
         </button>
-        <button className="rounded-lg border border-[var(--card-border)] px-3 py-1.5 text-xs hover:border-[var(--accent)]" onClick={() => openLogs()}>
+        <button className="rounded-lg border border-(--card-border) px-3 py-1.5 text-xs hover:border-(--accent)" onClick={() => openLogs()}>
           打开日志目录
         </button>
       </div>

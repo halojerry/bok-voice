@@ -9,8 +9,8 @@ function StatusBadge() {
   if (settingsLoading) return <span className="font-mono">loading</span>;
   if (health === false) return <span className="text-xs text-red-300">控制面离线</span>;
   return (
-    <span className="hidden items-center gap-2 text-xs text-[var(--stage-muted)] sm:inline-flex">
-      <span className="h-2 w-2 rounded-full bg-[var(--stage-value)]" />
+    <span className="hidden items-center gap-2 text-xs text-(--stage-muted) sm:inline-flex">
+      <span className="h-2 w-2 rounded-full bg-(--stage-value)" />
       <span className="font-mono">v0.1.0</span>
     </span>
   );
@@ -28,11 +28,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 }
 
 export function LoadingState({ label = "加载中…" }: { label?: string }) {
-  return <p className="text-sm text-[var(--muted)]">{label}</p>;
+  return <p className="text-sm muted">{label}</p>;
 }
 
 export function EmptyState({ label = "暂无数据" }: { label?: string }) {
-  return <p className="text-sm text-[var(--muted)]">{label}</p>;
+  return <p className="text-sm muted">{label}</p>;
 }
 
 export function ErrorState({ message }: { message: string }) {

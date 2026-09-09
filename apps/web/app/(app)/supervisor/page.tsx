@@ -99,25 +99,25 @@ export default function SupervisorPage() {
             const num = waNum(c);
             const isCaptured = st === "captured";
             return (
-              <div key={`banner-${id}`} className="wa-flash rounded-lg border border-[var(--accent)] bg-[var(--card)] p-4">
+              <div key={`banner-${id}`} className="wa-flash rounded-lg border border-(--accent) bg-(--card) p-4">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div className="min-w-0">
-                    <p className="text-sm font-semibold text-[var(--accent)]">
+                    <p className="text-sm font-semibold text-accent">
                       📱 WhatsApp 待对接
-                      <span className="ml-2 rounded bg-[var(--accent)]/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider">
+                      <span className="ml-2 rounded-sm bg-(--accent)/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider">
                         {isCaptured ? "已拿到号码" : "客户已应承加"}
                       </span>
                     </p>
-                    <p className="mt-1 text-sm text-[var(--foreground)]">
-                      {labelOf(c)} <span className="text-[var(--muted)]">· {id}</span>
+                    <p className="mt-1 text-sm text-(--foreground)">
+                      {labelOf(c)} <span className="muted">· {id}</span>
                     </p>
                     {isCaptured && num ? (
-                      <p className="mt-0.5 font-mono text-lg tracking-wider text-[var(--foreground)]">
+                      <p className="mt-0.5 font-mono text-lg tracking-wider text-(--foreground)">
                         {num}
                         {copied === num && <span className="ml-2 text-xs text-emerald-400">已复制 ✓</span>}
                       </p>
                     ) : (
-                      <p className="mt-0.5 text-xs text-[var(--muted)]">客户应承咗加专员,等紧佢俾号码 / 由专员主动联系。</p>
+                      <p className="mt-0.5 text-xs muted">客户应承咗加专员,等紧佢俾号码 / 由专员主动联系。</p>
                     )}
                   </div>
                   <div className="flex shrink-0 flex-wrap gap-2">
@@ -141,10 +141,10 @@ export default function SupervisorPage() {
       <section className="card">
         <div className="mb-3 flex items-center justify-between">
           <h2 className="font-semibold">通话</h2>
-          <span className="text-xs text-[var(--muted)]">{rows.length} 路</span>
+          <span className="text-xs muted">{rows.length} 路</span>
         </div>
         {rows.length === 0 ? (
-          <p className="text-sm text-[var(--muted)]">暂无通话。有进行中(active)或已暂停(paused)的通话会显示在这里。</p>
+          <p className="text-sm muted">暂无通话。有进行中(active)或已暂停(paused)的通话会显示在这里。</p>
         ) : (
           <div className="space-y-3">
             {rows.map((c) => {
@@ -160,12 +160,12 @@ export default function SupervisorPage() {
                       <p className="truncate font-medium">
                         {labelOf(c)}
                         {waPending && (
-                          <span className="ml-2 rounded bg-[var(--accent)]/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-[var(--accent)]">
+                          <span className="ml-2 rounded-sm bg-(--accent)/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-accent">
                             WhatsApp {wa === "captured" && waNum(c) ? waNum(c) : "待对接"}
                           </span>
                         )}
                       </p>
-                      <p className="text-xs text-[var(--muted)]">{status} · {id}</p>
+                      <p className="text-xs muted">{status} · {id}</p>
                     </div>
                     <span
                       className={`inline-flex shrink-0 items-center gap-1.5 text-xs ${
@@ -194,11 +194,11 @@ export default function SupervisorPage() {
       <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-2">
         <section className="card">
           <span className="label">质量监控</span>
-          <p className="mt-3 text-sm text-[var(--muted)]">表达密度 / 填充词 / 犹豫词 / 打断成功率。接结算后展示。</p>
+          <p className="mt-3 text-sm muted">表达密度 / 填充词 / 犹豫词 / 打断成功率。接结算后展示。</p>
         </section>
         <section className="card">
           <span className="label">纪律控制</span>
-          <p className="mt-3 text-sm text-[var(--muted)]">provider 降级状态机、熔断、回切、审计。MVP 骨架。</p>
+          <p className="mt-3 text-sm muted">provider 降级状态机、熔断、回切、审计。MVP 骨架。</p>
         </section>
       </div>
     </div>
