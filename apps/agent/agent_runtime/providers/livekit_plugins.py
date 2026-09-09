@@ -3910,6 +3910,15 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
             return False
         return _is_hotword_vocab_echo(text, getattr(self._stt_, "_hotword_context", "") or "")
 
+    def _vocab_echo(self, text: str) -> bool:
+        """热词幻听判定(源头闸):词表被当转写整串抄出 → True,调用方丢弃该事件。
+
+        QWEN3_HOTWORD_ECHO_GUARD=0 回退。词表与 STT context 同一份(_hotword_context)。
+        """
+        if os.environ.get("QWEN3_HOTWORD_ECHO_GUARD", "1") != "1":
+            return False
+        return _is_hotword_vocab_echo(text, getattr(self._stt_, "_hotword_context", "") or "")
+
     async def _run(self) -> None:
         vad_stream = self._vad.stream()
 
