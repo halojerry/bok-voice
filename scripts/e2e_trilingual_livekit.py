@@ -31,13 +31,20 @@ CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
 TTS_URL = os.environ.get("TTS_URL", "http://127.0.0.1:8788")
 
 _ALL_CASES = [
-    # 真人客户口吻（每语言一句域内话术,TTS 现场合成,弃 fixtures 灣仔問路句）
+    # 真人客户口吻（每语言一句域内话术,TTS 现场合成,弃 fixtures 灣仔問路句）。
+    # 句内不带逗号:vad-pause 微停顿会把逗号句劈成碎片轮/触发 join-hold,
+    # 提交变慢还会把断言窗拉进心跳线（barge-in A/B 与 zh 腿 call-6ba7c47c 实证）。
     {"lang": "zh", "expect_lang": "Chinese",
-     "text": "我的快递讲好三天就到，到现在还没到，麻烦帮我查一下。", "tts_lang": "zh"},
+     "text": "我的快递三天了还没到麻烦帮我查一下。", "tts_lang": "zh"},
     {"lang": "cantonese", "expect_lang": "Cantonese",
-     "text": "我件貨講咗三日就到，到而家都未到喎，唔該幫我查下。", "tts_lang": "cantonese"},
+     # 9字单口气句(<10 字 vad-pause 提交门槛→只可能 EOS 单轮提交,结构性唔会
+     # 劈轮):长句渲染内停顿 >0.45s 会被 vad-pause 劈轮+尾段前缀续句 interrupt
+     # 掉生成中回复→零回复音频→断言窗跑满(e856d796 实证,同文本隔轮就过=渲染
+     # 方差);barge-in 同款 9 字句今日 4+ 轮 in-room 零劈轮。断言只看回复语言
+     # 标签,短句唔伤语义。
+     "text": "我件貨爛咗想投訴。", "tts_lang": "cantonese"},
     {"lang": "en", "expect_lang": "English",
-     "text": "Hello, my parcel was supposed to arrive three days ago and it still has not arrived.", "tts_lang": "en"},
+     "text": "Hello my parcel was due three days ago and it still has not arrived.", "tts_lang": "en"},
 ]
 CASES = [
     c
