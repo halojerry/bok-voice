@@ -138,12 +138,13 @@ async def main_async() -> int:
     ap.add_argument("--greetings", action="store_true", help="无变量脚本线全量(兜底问候/心跳/收线/WA)")
     ap.add_argument("--objects", action="store_true", help="逐对象渲染开场白/收线/心跳并预合成")
     ap.add_argument("--fillers", action="store_true", help="垫话短语库预合成(PR-2 垫话用,绝不运行时合成)")
+    ap.add_argument("--qa", action="store_true", help="Q→A 快路启用条目的应答预合成(闸门只认缓存有音频的条目)")
     ap.add_argument("--cp", default=os.environ.get("BOK_CP_URL", "http://127.0.0.1:8000"))
     ap.add_argument("--persona", default="", help="音色覆盖:指定 persona id(默认按语言取该语言的 persona)")
     ap.add_argument("--object-id", default="", help="只为指定对象预生成开场白/收线/心跳(配合 --objects)")
     ap.add_argument("--model", default="", help="MINIMAX_MODEL 覆盖(默认 env/2.8-hd,须与运行时一致)")
     args = ap.parse_args()
-    if not (args.greetings or args.objects or args.fillers):
+    if not (args.greetings or args.objects or args.fillers or args.qa):
         args.greetings = True
 
     if os.environ.get("MINIMAX_API_KEY", ""):
@@ -211,6 +212,23 @@ async def main_async() -> int:
         for lang, lines in filler_lines().items():
             for line in lines:
                 jobs.append((lang, line))
+
+    if args.qa:
+        # Q→A 快路启用条目:应答文本按条目语言取对应 persona 音色物化——运行时
+        # 闸门按 (answer_text, resolved_voice, model) 查缓存,音色必须同源。
+        # 空表/拉取失败静默(库未建=无物化需求)。
+        try:
+            qa_rows = _cp_get(args.cp, "/api/qa-entries?enabled=1", token) or []
+        except Exception as exc:  # noqa: BLE001 - 库未建/CP 不可达唔阻其他预合成
+            print(f"qa entries fetch failed: {exc!r}", flush=True)
+            qa_rows = []
+        for e in qa_rows:
+            if not bool(e.get("enabled", True)):
+                continue
+            text = str(e.get("answer_text") or "").strip()
+            lang = _normalize_lang((e or {}).get("lang"), default="zh") or "zh"
+            if text:
+                jobs.append((lang, text))
 
     # 去重(同文本同语言只合成一次;key 已含 voice,不同 lang 同 voice 也会分开算)
     seen: set[tuple[str, str]] = set()

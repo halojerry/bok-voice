@@ -17,10 +17,11 @@ prometheus_port: 6789
 
 # 崩溃补位 webhook(可选):agent 离开房间 → CP 自动重派(见 /api/webhook/livekit)。
 # 指向本机 CP(外网可达则填 http://<host>:8000/api/webhook/livekit;签名用下方 api_key)。
-# webhook:
-#   urls:
-#     - http://127.0.0.1:8000/api/webhook/livekit
-#   api_key: devkey
+# 2026-09-09 启用:崩溃补位生效,重派防重见 dispatch_utils。
+webhook:
+  urls:
+    - http://127.0.0.1:8000/api/webhook/livekit
+  api_key: devkey
 
 logging:
   level: info

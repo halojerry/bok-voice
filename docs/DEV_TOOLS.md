@@ -17,7 +17,7 @@
     }
   }
   ```
-- 无 MCP 时的 CLI 等价物：`lk docs`（封装同款检索）。
+- 无 MCP 时的 CLI 等价物：`lk docs`（封装同款检索，已收编，用法见 §4.1）。
 
 ## 2. 排障渠道分工（按问题类型）
 
@@ -47,11 +47,54 @@
 
 ## 4. 压测 / 负载演练
 
-- `lk load-test`（server 压测）、`lk perf agent-load-test --agent-name bok-voice`
-  （模拟 agent 房间 + 回声说话人）——进大版本升级/生产档演练的验收。
 - 官方 server 指标：`prometheus_port: 6789`（livekit.yaml 已开）→ import 官方
   Grafana dashboard（livekit repo `deploy/grafana/livekit-server-overview.json`）。
 - agent worker 健康：`GET :8081/worker` → `{agent_name, active_jobs, worker_load}`。
+
+### 4.1 lk CLI（官方 livekit-cli，已收编）
+
+安装：`brew install livekit-cli`（2026-09-09 装 **2.18.6**，随 `brew upgrade` 跟新）。
+定位：官方一手调试/压测/查文档工具，与 Docs MCP（§1）同源。
+
+**`lk token create` — 手工调试房间签 token（离线签名，不用起 control-plane）**：
+
+```bash
+# 2026-09-09 实测通过（lk 2.18.6 非交互模式必须显式给权限位，缺 --join/--create 直接报错）
+lk token create --api-key devkey --api-secret devsecret --room smoke --identity smoke --valid-for 1h --join --create
+```
+
+适用场景：手工连房排障（Meet / rtc 探针）时对本地 devkey 自签 token——同
+`E2E_SELF_TOKEN=1` 一类的调试自签；**正式 E2E 门禁仍必须走真实 `/api/token`**
+（never fake-green）。签出的 JWT 直接 base64 解 payload 可核对 room/identity
+（实测 `iss=devkey`、`identity=smoke`、`video.room=smoke`、`roomJoin+roomCreate=true`）。
+
+**`lk docs` — 终端版官方文档检索（无 MCP 环境用，与 Docs MCP 等价）**：
+
+```bash
+lk docs overview                                  # 站点目录
+lk docs search "agent dispatch"                   # 搜索（实测命中 AgentDispatchService API 等）
+lk docs get-page /agents/server/agent-dispatch/   # 整页 markdown
+lk docs code-search "CreateDispatch"              # LiveKit 公开 repo 代码检索
+lk docs changelog pypi:livekit-agents             # 盯版本（等价 §3 的 releases.atom）
+```
+
+**升级门禁配套压测**（需全栈在跑：`python tools/bok.py serve`）：
+
+```bash
+lk load-test                                  # server 面：模拟发布/订阅压力
+lk perf agent-load-test --agent-name bok-voice  # agent 面：模拟 agent 房间 + 回声说话人
+```
+
+进大版本升级 / 生产档演练的验收项，与 `scripts/load_audio_concurrency.py` 并跑：
+官方工具覆盖 dispatch/job 分派语义仿真，自家脚本覆盖真实音频链路（ASR→LLM→TTS）并发，
+两者互补缺一不可。
+
+**明确不收编**（用自有方案替代）：
+
+| 子命令 | 不收编理由 | 替代 |
+|---|---|---|
+| `lk room join --publish-demo` | 只能推内置 demo 音视频，推不了 16k PCM 定制音频 | E2E 用 Python rtc driver（`scripts/e2e_*`） |
+| `lk agent init` | 生成的是官方示例骨架 | 已有自有 `apps/agent` 骨架 |
 
 ## 5. 自部署崩溃恢复语义（官方源码核实）
 
