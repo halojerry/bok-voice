@@ -8,12 +8,16 @@ import {
   useAgentExpression,
   useAudioPlayback,
   useSession,
+  useSessionMessages,
   useTranscriptions,
+  type UseSessionReturn,
 } from "@livekit/components-react";
 import { ConnectionState, TokenSource, Track, type Room } from "livekit-client";
 import { api } from "@/lib/api";
 import { describeConnectError, friendlyErrorText, useControlPlaneReady } from "@/lib/api-ready";
 import { applyOutputDevice, listAudioDevicesOf, requestMicPermission, saveMicDevice, savedMicDevice, savedOutputDevice, switchWebOutputDevice, webCanSwitchOutput, isTauriShell, type AudioDeviceInfo } from "@/lib/audio";
+import { AgentChatIndicator } from "@/components/agents-ui/agent-chat-indicator";
+import { AgentChatTranscript } from "@/components/agents-ui/agent-chat-transcript";
 import { AgentSessionProvider } from "@/components/agents-ui/agent-session-provider";
 import { VoiceAgentInterface } from "@/components/VoiceAgentInterface";
 import { useAccount } from "@/components/account-context";
@@ -33,7 +37,9 @@ function AgentStateLabel({ state }: { state: string }) {
   const item = map[state] ?? map.connecting;
   return (
     <span className="inline-flex items-center gap-2 text-sm">
-      <span className={`h-2.5 w-2.5 rounded-full ${item.color} animate-pulse`} />
+      {/* 官方 AgentChatIndicator（motion 呼吸脉冲）替代手写 animate-pulse 点；
+          状态色经 className 覆盖官方默认 bg-muted-foreground（cn 走 tailwind-merge 同组取末值） */}
+      <AgentChatIndicator size="sm" className={item.color} />
       {item.label}
     </span>
   );
@@ -41,23 +47,15 @@ function AgentStateLabel({ state }: { state: string }) {
 
 /**
  * 官方 Agents UI 会话面板：LiveKit Aura 可视化（情绪驱动颜色）+ 官方控制条。
- * 转写暂用 useTranscriptions 自绘（视觉已对齐官方；官方 AgentChatTranscript 需 Tailwind v4，见 AGENT.md）。
+ * 转写用官方 AgentChatTranscript（useSessionMessages 聚合语音转写+文字消息、自动滚底、
+ * thinking 指示内置）；流式 partial 粒度的 useTranscriptions 保留给实时分析统计。
  */
-function LiveAgentPanel({ room }: { room: Room | null }) {
-  const { state, microphoneTrack, identity, failureReasons } = useAgent();
+function LiveAgentPanel({ room, session }: { room: Room | null; session: UseSessionReturn }) {
+  const { state, microphoneTrack, failureReasons } = useAgent();
   const { mood } = useAgentExpression();
   const transcriptions = useTranscriptions();
-  const agentIdentity = identity ?? "agent";
-  // 按时间正序(旧→新,最新在底部),像常规聊天一样自动滚到底看最新一条。
-  const recent = useMemo(() => transcriptions.slice(-20), [transcriptions]);
+  const { messages } = useSessionMessages(session);
   const agentState = state ?? "connecting";
-  const listRef = useRef<HTMLDivElement | null>(null);
-  useEffect(() => {
-    // 新气泡到达时滚到容器底部 = 最新消息,不被旧消息顶开。
-    const el = listRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [recent]);
-  const speaking = agentState === "speaking";
 
   // 实时分析：基于本通转写实时统计（非挂断后结算值）。
   const liveStats = useMemo(() => {
@@ -75,39 +73,14 @@ function LiveAgentPanel({ room }: { room: Room | null }) {
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden">
-      {/* 转写时间线：固定占中栏剩余空间(至少 280px 高,内部滚动),绝不会被压没。
-          对话记录始终可见,多轮后在该区域内滚,不把页面顶走。 */}
-      <div ref={listRef} className="flex min-h-[280px] flex-1 flex-col gap-2 overflow-y-auto px-1 py-2">
-        {recent.length === 0 && (
-          <div className="flex flex-1 items-center justify-center font-mono text-[10px] font-bold uppercase tracking-[0.16em] text-(--stage-muted)">
+      {/* 转写时间线：官方 AgentChatTranscript——自动滚底/滚到底按钮/thinking 指示组件内置，
+          容器只管占位高度（至少 280px、占中栏剩余空间，绝不会被压没）。
+          官方组件空列表时无占位内容，用绝对定位层保留「等待对话…」空态提示。 */}
+      <div className="relative flex min-h-[280px] flex-1 flex-col overflow-hidden">
+        <AgentChatTranscript agentState={agentState} messages={messages} className="px-1 py-2" />
+        {messages.length === 0 && (
+          <div className="pointer-events-none absolute inset-0 flex items-center justify-center font-mono text-[10px] font-bold uppercase tracking-[0.16em] text-(--stage-muted)">
             等待对话…
-          </div>
-        )}
-        {recent.map((t, i) => {
-          const identity = t.participantInfo?.identity ?? "";
-          const text = String(t.text ?? "");
-          const isAgent = identity === agentIdentity;
-          const ts = t.streamInfo?.timestamp ? new Date(t.streamInfo.timestamp).toLocaleTimeString([], { hour12: false }) : "";
-          return (
-            <div key={`${identity}-${i}`} className={`flex ${isAgent ? "justify-start" : "justify-end"}`}>
-              <div
-                className={`max-w-[80%] rounded-lg px-3 py-2 font-mono text-[11px] leading-relaxed ${
-                  isAgent
-                    ? "bg-(--accent) text-(--accent-ink)"
-                    : "bg-white/10 text-(--foreground)"
-                }`}
-              >
-                <span className="mr-1.5 font-bold uppercase">{isAgent ? "AGENT" : "YOU"}</span>
-                {ts && <span className="ml-1 mr-1 opacity-60">{ts}</span>}
-                {text}
-              </div>
-            </div>
-          );
-        })}
-        {speaking && recent.length > 0 && (
-          <div className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.14em] text-(--stage-value)">
-            <span className="h-1.5 w-1.5 rounded-full bg-(--stage-value) animate-pulse" />
-            AI 说话中
           </div>
         )}
       </div>
@@ -977,7 +950,7 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
 
         <div className="flex min-h-0 flex-1 flex-col">
           <AgentSessionProvider session={session} volume={1} muted={false}>
-            {roomConnected ? <LiveAgentPanel room={session.room} /> : <IdleStage />}
+            {roomConnected ? <LiveAgentPanel room={session.room} session={session} /> : <IdleStage />}
           </AgentSessionProvider>
         </div>
       </section>

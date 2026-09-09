@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { StartAudio, useAudioPlayback, useSession, useTranscriptions } from "@livekit/components-react";
+import { StartAudio, useAudioPlayback, useMediaDeviceSelect, usePersistentUserChoices, useSession, useTranscriptions } from "@livekit/components-react";
 import { ConnectionState, TokenSource, type Room } from "livekit-client";
 import { api, CONTROL_PLANE_URL } from "@/lib/api";
 import { describeConnectError, friendlyErrorText } from "@/lib/api-ready";
@@ -9,10 +9,7 @@ import {
   applyOutputDevice,
   isTauriShell,
   listAudioDevicesOf,
-  requestMicPermission,
-  saveMicDevice,
   saveOutputDevice,
-  savedMicDevice,
   savedOutputDevice,
   switchWebOutputDevice,
   webCanSwitchOutput,
@@ -68,20 +65,32 @@ export default function InterpretPage() {
   const { canPlayAudio, startAudio } = useAudioPlayback(session.room);
   const connected = session.room.state === ConnectionState.Connected;
 
-  const [micDevices, setMicDevices] = useState<AudioDeviceInfo[]>([]);
   const [outDevices, setOutDevices] = useState<AudioDeviceInfo[]>([]);
-  const [micId, setMicId] = useState("");
   const [outId, setOutId] = useState("");
   const [micOn, setMicOn] = useState(true);
 
+  // 麦克风（输入侧）官方 hooks 试点：枚举+选择 useMediaDeviceSelect、持久化 usePersistentUserChoices
+  // （lk-user-choices 本地存储；saveAudioInputDeviceId 落盘、activeDeviceId 随房间的
+  // ActiveDeviceChanged 同步）。输出侧（Tauri CoreAudio / 浏览器 setSinkId，lib/audio.ts）
+  // 不在浏览器枚举体系内，保持自有通路不动。
+  const { userChoices, saveAudioInputDeviceId } = usePersistentUserChoices();
+  const {
+    devices: micDevices,
+    activeDeviceId: micId,
+    setActiveMediaDevice: activateMicDevice,
+  } = useMediaDeviceSelect({ kind: "audioinput", room: session.room, requestPermissions: true });
+
+  // 装配即应用已存麦克风：未连房时 switchActiveDevice 写入 audioCaptureDefaults（session.start
+  // 开麦即用该设备）并 emit ActiveDeviceChanged（hook 回填 activeDeviceId，下拉显示已存值）。
+  // 仅首挂载跑一次，复刻旧 savedMicDevice 的装配应用时点。
   useEffect(() => {
-    requestMicPermission()
-      .then(async () => {
-        setMicDevices(await listAudioDevicesOf("input"));
-        setOutDevices(await listAudioDevicesOf("output"));
-      })
-      .catch(() => {});
-    setMicId(savedMicDevice());
+    const saved = userChoices.audioDeviceId;
+    if (saved && saved !== "default") void activateMicDevice(saved).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    listAudioDevicesOf("output").then(setOutDevices).catch(() => {});
     setOutId(savedOutputDevice());
   }, []);
 
@@ -89,7 +98,7 @@ export default function InterpretPage() {
   useEffect(() => {
     if (!connected) return;
     (async () => {
-      if (micId) await session.room.switchActiveDevice("audioinput", micId, false).catch(() => {});
+      if (micId && micId !== "default") await session.room.switchActiveDevice("audioinput", micId, false).catch(() => {});
       if (outId) {
         if (isTauriShell()) await applyOutputDevice(outId).catch(() => {});
         else if (webCanSwitchOutput()) await switchWebOutputDevice(session.room, outId).catch(() => {});
@@ -99,11 +108,11 @@ export default function InterpretPage() {
 
   const pickMic = useCallback(
     (id: string) => {
-      setMicId(id);
-      saveMicDevice(id);
-      if (id) session.room.switchActiveDevice("audioinput", id, false).catch(() => {});
+      if (!id) return;
+      saveAudioInputDeviceId(id);
+      void activateMicDevice(id).catch(() => {});
     },
-    [session.room],
+    [activateMicDevice, saveAudioInputDeviceId],
   );
 
   const pickOut = useCallback(
@@ -202,7 +211,7 @@ export default function InterpretPage() {
     (async () => {
       setBusy(true);
       try {
-        if (micId) await session.room.switchActiveDevice("audioinput", micId, false).catch(() => {});
+        if (micId && micId !== "default") await session.room.switchActiveDevice("audioinput", micId, false).catch(() => {});
         // 连接前预缓冲：建房/agent join 需 1-2s,此时对方可能已开口,缓冲防「吃头字」。
         await session.room.localParticipant.setMicrophoneEnabled(true, undefined, { preConnectBuffer: true }).catch(() => {});
         await session.start({ tracks: { microphone: { enabled: true } } });
@@ -378,7 +387,7 @@ type LiveProps = {
   connected: boolean;
   canPlayAudio: boolean;
   micOn: boolean;
-  micDevices: AudioDeviceInfo[];
+  micDevices: MediaDeviceInfo[];
   outDevices: AudioDeviceInfo[];
   micId: string;
   outId: string;
@@ -465,10 +474,10 @@ function InterpretLive(p: LiveProps) {
         <label className="flex flex-col gap-1 text-xs">
           <span className="text-(--stage-muted)">麦克风</span>
           <select className="select" value={p.micId} onChange={(e) => p.pickMic(e.target.value)}>
-            <option value="">系统默认</option>
+            <option value="default">系统默认</option>
             {p.micDevices.map((d) => (
-              <option key={d.id} value={d.id}>
-                {d.name}
+              <option key={d.deviceId} value={d.deviceId}>
+                {d.label || d.deviceId}
               </option>
             ))}
           </select>
