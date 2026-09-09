@@ -12,9 +12,19 @@ HEARTBEAT_INTERVAL_S = 60
 ONLINE_WINDOW_S = HEARTBEAT_INTERVAL_S * 3
 
 
+def _as_utc(dt: datetime | None) -> datetime | None:
+    """SQL DateTime 列无时区（SQLite/Postgres 静默丢 tz）→ naive 值按 UTC 归一。
+
+    库里恒存 `_utcnow()` 的 UTC 墙钟，naive 即 UTC；aware 原样透传。"""
+    if dt is None or dt.tzinfo is not None:
+        return dt
+    return dt.replace(tzinfo=timezone.utc)
+
+
 def effective_status(last_seen_at, now, revoked: bool = False) -> str:
     if revoked:
         return "revoked"
+    last_seen_at = _as_utc(last_seen_at)
     if last_seen_at is None:
         return "offline"
     return "online" if (now - last_seen_at).total_seconds() <= ONLINE_WINDOW_S else "offline"
@@ -97,12 +107,13 @@ class NodeStore:
                      "version": n.version, "revoked": n.status == "revoked", "last_seen_at": n.last_seen_at}
                     for n in session.query(models.Node).all()
                 ]
-        return [
-            {
+        out = []
+        for r in rows:
+            last_seen = _as_utc(r.get("last_seen_at"))  # 双模 isoformat 同形（aware UTC）
+            out.append({
                 "node_id": r["node_id"], "org_id": r["org_id"], "name": r["name"],
                 "platform": r["platform"], "version": r["version"],
-                "status": effective_status(r.get("last_seen_at"), now, r.get("revoked", False)),
-                "last_seen_at": r["last_seen_at"].isoformat() if r.get("last_seen_at") else None,
-            }
-            for r in rows
-        ]
+                "status": effective_status(last_seen, now, r.get("revoked", False)),
+                "last_seen_at": last_seen.isoformat() if last_seen else None,
+            })
+        return out

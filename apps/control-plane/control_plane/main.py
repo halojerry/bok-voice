@@ -68,11 +68,14 @@ app.add_middleware(CorrelationMiddleware)
 async def optional_bearer_auth(request: Request, call_next):
     """可选 Bearer 鉴权（R2）：BOK_CP_TOKEN 未设=全放行（本机单用户形态零变化）。
 
-    设置后除 /health 外全部端点要求 `Authorization: Bearer <BOK_CP_TOKEN>`——
-    暴露到局域网/云之前必须设置；agent(worker env)与 web 需同步带同值。
+    设置后除 /health 与 /api/nodes/heartbeat 外全部端点要求
+    `Authorization: Bearer <BOK_CP_TOKEN>`——暴露到局域网/云之前必须设置；
+    agent(worker env)与 web 需同步带同值。心跳豁免：该端点用注册时签发的
+    node_token 自鉴权（sha256 比对，与 CP token 不同源），CP 门禁会把它拦死
+    令节点注册表失联；register/list 属管理操作，仍在门禁内。
     """
     expected = os.environ.get("BOK_CP_TOKEN", "").strip()
-    if expected and request.url.path != "/health":
+    if expected and request.url.path not in ("/health", "/api/nodes/heartbeat"):
         if request.headers.get("authorization", "") != f"Bearer {expected}":
             return Response(status_code=401, content=b'{"detail":"unauthorized"}',
                              media_type="application/json")
