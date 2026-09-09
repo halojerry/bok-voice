@@ -1594,7 +1594,12 @@ async def livekit_webhook(request: Request) -> dict:
                             },
                         )
                         return "dup"
-                    await client.agent_dispatch.create_dispatch(room=room_name, agent_name="bok-voice")
+                    # 官方签名收请求对象(非 kwargs;kwarg 形态 TypeError,
+                    # 2026-09-10 实机演练暴露——mock 测试看不见签名错配)。
+                    from livekit.api import CreateAgentDispatchRequest
+                    await client.agent_dispatch.create_dispatch(
+                        CreateAgentDispatchRequest(agent_name="bok-voice", room=room_name)
+                    )
                 _audit("agent.redispatch", subject_type="call", subject_id=room_name, detail={"agent_name": "bok-voice", "event": event, "attempt": attempt})
                 print(f"[webhook] redispatch created (call {room_name}, attempt {attempt})", flush=True)
                 return "created"
