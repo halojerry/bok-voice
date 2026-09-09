@@ -270,25 +270,39 @@ async def main() -> int:
     n_after = turns_count(call_id)
     record("E5 连续短应承通话存活且有轮", status == "active" and n_after >= n_before, f"status={status} turns {n_before}->{n_after}")
 
-    # E5b 相邻 LLM 回复禁逐字复读（推进轮复读前轮话术块回归，call-feaf914c 实证）
+    # E5b 相邻 LLM 回复禁逐字复读（推进轮复读前轮话术块回归，call-feaf914c 实证）。
+    # 只比「intervening 用户输入不同」的对：E3 故意同输入推 10 次，同输入→近似
+    # 回答係正确服务行为，唔算复读；「不同输入给同一答案」先係缺陷形状。
     import difflib
 
     def _norm_rep(t: str) -> str:
         return "".join(ch for ch in (t or "") if ch.isalnum())
 
     rows = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", timeout=10).json()
-    llm_replies = [
-        _norm_rep(t.get("transcript") or "")
+    seq = [
+        (t.get("role"), _norm_rep(t.get("transcript") or ""), (t.get("latency_ms") or 0) > 0)
         for t in rows
-        if t.get("role") == "assistant" and (t.get("latency_ms") or 0) > 0
     ]
-    llm_replies = [t for t in llm_replies if len(t) >= 8]
-    dup = [
-        (a[:20], b[:20], round(ratio, 2))
-        for a, b in zip(llm_replies, llm_replies[1:])
-        if (ratio := difflib.SequenceMatcher(None, a, b).ratio()) >= 0.9
-    ]
-    record("E5b 相邻LLM回复不逐字复读", len(dup) == 0, f"llm_replies={len(llm_replies)} dup={dup[:2]}")
+    prev_reply = ""        # 上一条 LLM 回复（归一）
+    input_before_prev = ""  # 上一条 LLM 回复之前的用户输入
+    input_since = ""        # 自上一条 LLM 回复以来的用户输入
+    dup = []
+    for role, text, is_llm in seq:
+        if role == "user" and text:
+            input_since += text
+            continue
+        if role == "assistant" and is_llm and len(text) >= 8:
+            if prev_reply and input_since:
+                input_shift = (
+                    difflib.SequenceMatcher(None, input_since, input_before_prev).ratio() < 0.8
+                )
+                ratio = difflib.SequenceMatcher(None, prev_reply, text).ratio()
+                if input_shift and ratio >= 0.9:
+                    dup.append((prev_reply[:20], text[:20], round(ratio, 2)))
+            prev_reply = text
+            input_before_prev = input_since
+            input_since = ""
+    record("E5b 相邻LLM回复不逐字复读", len(dup) == 0, f"dup={dup[:2]}")
     await room.disconnect()
     try:
         httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/hangup", timeout=10)
