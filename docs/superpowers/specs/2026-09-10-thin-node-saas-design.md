@@ -81,7 +81,7 @@
 
 ### 4.1 内容物与数据驻留
 
-- 内容 = 现 `bok.py serve` 编排的那套**去掉 CP 与 SQLite**：LiveKit + ASR/LLM sidecar + agent worker ×N + `node-agent` 守护进程（由 `bok.py serve` 无头演化而来，复用其启动顺序/健康轮询/自愈骨架，新增心跳与指令执行；承接桌面壳职责：进程编排、崩溃自愈、日志轮转——顺手修「日志无轮转」旧审计缺口）。
+- 内容 = 现 `bok.py serve` 编排的那套**去掉 CP 与 SQLite**：LiveKit + ASR/LLM sidecar + **A 线 agent worker ×N + B 线 interpreter worker ×2（:8082/8083）+ MT 翻译 server :1236（可选，缺模型自动跳过→B 线回退 :1235，既有行为）** + `node-agent` 守护进程（由 `bok.py serve` 无头演化而来，复用其启动顺序/健康轮询/自愈骨架，新增心跳与指令执行；承接桌面壳职责：进程编排、崩溃自愈、日志轮转——顺手修「日志无轮转」旧审计缺口）。**B 线与 A 线同一节点包、同一运维面**（license/心跳/L1-L3/错误上报/一键部署全复用），GPU 不够的客户可不装 MT server。
 - **业务数据零本地驻留**：全部实时落云 Postgres。本地仅易失物（tts-cache、滚动日志）。
 - 断网语义：媒体面可继续在途通话，登录/建通话/看板不可用（符合既有「必须联网」铁律）。
 
@@ -120,7 +120,8 @@
 | 字段 | 说明 |
 |---|---|
 | `org_id / call_id / seq` | 租户缝 + 通话内顺序 |
-| `speaker` | `customer` / `agent_ai` / `agent_human`（主管接管的人工发言）——会话级区分发言人 |
+| `line` | `a`（客服）/ `b`（同传）——两条业务线同账本 |
+| `speaker` | A 线：`customer` / `agent_ai` / `agent_human`（主管接管的人工发言）；B 线：`me` / `other`（源语方/听译方）——会话级区分发言人 |
 | `gen` | `llm` / `script`（开场白/心跳/收线直念）/ `filler`（垫话）/ `qa_fastpath`——区分模型生成与罐头 |
 | `template_step` | 该轮当时话术步号——话术卡点分析主维度 |
 | `text / lang / started_ms / ended_ms` | 内容 + 通话内时间轴 |
@@ -156,10 +157,11 @@
 
 - **办公室场景（首客户默认）**：媒体走内网，站点零公网暴露。
 - **远程/居家坐席**：站点 LiveKit 需公网可达（UDP 端口段转发或 TURN-over-TLS 443）。
+- **B 线注意**：同传天然是两个不同地点的人（me/other 双端常有一端远程）——「站点公网可达/TURN」对 B 线是常态需求，不是可选项；远程部署勘察时按 B 线场景核实。
 
 ## 9. GPU 容量与栈
 
-- 峰值 20-60 路：CUDA 上 4B 模型连续批处理，**1 张 48GB 卡扛 LLM 60 路**；ASR（qwen-asr CUDA）单独计容量。推荐节点配置 1-2 张卡；不够加节点，LiveKit dispatch 自动分流。
+- 峰值 20-60 路：CUDA 上 4B 模型连续批处理，**1 张 48GB 卡扛 LLM 60 路**；ASR（qwen-asr CUDA）单独计容量。推荐节点配置 1-2 张卡；不够加节点，LiveKit dispatch 自动分流。B 线 MT 模型（Hy-MT2 小模型）与主 LLM 同卡共存、用量小，缺省自动跳过。
 - Mac Studio 备选档：4-8 路/台 → 3-8 台；胜在全部调优已实证，零延迟重校成本。
 - **大技术风险 = CUDA 延迟重校**：PERCEIVED_MS 基线是 Mac 实测；CUDA 侧 prefix cache 行为、ASR 速度、8bit 量化决策全部重验。对策：P0 即打 CUDA 原型节点，跑 `scripts/load_audio_concurrency.py` + `scripts/measure_latency.py` 出基线；**过不了门禁则首客户改用 Mac Studio 档**。给客户承诺的数字以实测为准。
 - MiniMax TTS：节点 api_key 由 CP 引导下发（加密存本地、可吊销，与 L1/L2 联动）。
@@ -197,7 +199,7 @@
 **CP 上云后不分发**，早期「Nuitka 编译 CP」不再需要；交付物只有节点包。保护对象=agent worker 业务逻辑（flow 引擎/prompt 脚手架/罐头与 QA 逻辑）：
 
 - agent worker + node-agent + sidecar 自研部分全部 Nuitka 编译；CI 出 Windows CUDA + macOS MLX 两档产物。
-- **prompt 真源在云端 DB**（运行时 HTTPS 拉取装配），二进制只含脚手架=最小暴露。
+- **prompt 真源在云端 DB**（运行时 HTTPS 拉取装配），二进制只含脚手架=最小暴露。**逐轮响应零影响**：prompt 是每通一次装配（建通话拿 token 的同一班车，增量仅一次 HTTPS 往返中多几 KB，落在接通准备上），逐轮生成靠 KV-cache 已有前缀、字节整通冻结（尾部冻结重放前提不变）；可选节点按 `(org, template_id, revision)` 缓存模板，未改版不重复拉。云端真源的收益=改话术全局下一通生效。
 - 上游二进制（llama-server/livekit/ASR 引擎）无可保护。
 - 门禁：`verify_bundle.sh` 校验交付产物为编译产物，明文 Python 不进客户机房。
 - 诚实边界：提高逆向成本非绝对（内存 dump 可取运行时拼装结果）；真正防线是 L1/L2 熔断——盗版二进制会哑火。
@@ -233,8 +235,7 @@
 
 ## 13. 明确不做（YAGNI）
 
-- 坐席桌面客户端分发（浏览器已覆盖；Tauri 壳保留给 B 线同传与开发形态）。
+- 坐席桌面客户端分发（浏览器已覆盖；Tauri 壳保留给开发形态）。
 - 声纹/diarization 模型（结构性说话人标签已权威）。
 - 音频录音默认存档（开关位保留，默认关）。
 - 多租户 RLS/配额/计费（P4）。
-- B 线同传上云（首客户范围外，桌面形态保留）。
