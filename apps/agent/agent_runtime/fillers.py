@@ -1,9 +1,9 @@
 """LLM 慢生成轮垫话(2026-09-09,PR-2;设计见 docs/superpowers/specs/2026-09-08-tts-cache-design.md)。
 
 只垫「必须 LLM 临场生成」的轮次(话术缓存未命中、hook 正常返回走 LLM):
-回复首音频 BOK_FILLER_DELAY_MS(默认 300ms;2026-09-09 由 700 下调,用户拍板
-「体感第一声 ≤1s」——eou 0.5-0.9s+定时器,首声 ~0.8-1.2s;罐头直念轮首音频
-先到会作废定时器,快轮照旧零垫话)未到 → 播一句预合成应承语,
+回复首音频 BOK_FILLER_DELAY_MS(默认 500ms;2026-09-09 用户实选定档:300ms
+偏抢、700ms 偏钝,500ms 落在真人「好,等我睇下」的自然应承带 ~1.0-1.4s)未到
+→ 播一句预合成应承语,
 真回复首音频到达 → 停掉垫话(CachedTTS 首音频回调驱动)。
 
 通道铁律(2026-09-09 实证改版):垫话必须走 BackgroundAudioPlayer out-of-band
@@ -65,9 +65,9 @@ def filler_enabled() -> bool:
 
 def filler_delay_s() -> float:
     try:
-        return max(0.0, int(os.environ.get("BOK_FILLER_DELAY_MS", "300")) / 1000)
+        return max(0.0, int(os.environ.get("BOK_FILLER_DELAY_MS", "500")) / 1000)
     except ValueError:
-        return 0.3
+        return 0.5
 
 
 def filler_max_per_call() -> int:
