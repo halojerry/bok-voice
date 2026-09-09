@@ -622,13 +622,17 @@ class ContextState:
 
     def add_call_fact(self, text: str, limit: int = 4) -> None:
         """沉淀一条会中事实(去重,有界 FIFO,≤limit 条)——渲染进尾部
-        【通话中客户已讲】,治「模型重复问已答过的事」。"""
+        【通话中客户已讲】,治「模型重复问已答过的事」。
+
+        事实属实质变化 → +revision（尾部瘦身门:变化轮才发全量尾部,
+        BOK_TAIL_SLIM=1 时未变轮只发紧凑标签,新事实漏进紧凑尾=事实失明）。"""
         t = str(text or "").strip()
         if not t or t in self._call_facts:
             return
         self._call_facts.append(t)
         if len(self._call_facts) > limit:
             self._call_facts.pop(0)
+        self._revision += 1
 
     def set_last_reply(self, text: str) -> None:
         """记录 AI 最近一句回复(截 80 字)作尾部重复锚——模型看得见自己上一句,
@@ -796,6 +800,15 @@ class ContextState:
             "先讲结论，再补一句必要解释，句与句之间自然停顿，句尾用句号或问号收住。"
             "讲完当前要点就停下把话交回客户，等客户回应再继续下一步。"
         )
+        # 重复控制(2026-09-09 S5 尾部瘦身):指令从每轮尾部上移稳定前缀——原先
+        # ~90 字指令逐字重复在每轮尾部里逐轮重 prefill,是纯浪费;前缀整场缓存
+        # 命中零成本。尾部只留【你上一句】引文。
+        parts.append(
+            "【重复控制】已讲过的内容绝不原句或近原句再讲一次；"
+            "连续回答同类问题时必须换用不同的说法和角度，不得只改动个别字词；"
+            "客户没有新异议就不要重复确认，停下来等他说。"
+            "每轮尾部的【你上一句】即你最近一次回复原文，对照它避免重复。"
+        )
         # 客服应答准则：永不主动说"不知道/查不到"，知识不够时用客服话术兜住。
         # 这是客服与聊天机器人的本质区别——客户要的是被接住，不是被拒绝。
         # 语言纯度：此段无条件进每通通话的前缀，必须用标准书面中文——写成粤语
@@ -835,8 +848,28 @@ class ContextState:
         prefill 尾部增量。当前步放尾部最前，让「推进=换一小段尾部」而非动前缀。
         知识/联网两节仅在 rag_enabled=True 时渲染(默认关:封闭话术流程不做检索,
         单对象只上话术+对象档案;CONTEXT_RAG=1/开放人设由装配处置 True)。
+
+        尾部瘦身（BOK_TAIL_SLIM=1 默认,0 回退;2026-09-09 S5）:revision 与上一
+        条已冻结尾部相同（流程/事实/WhatsApp 均无实质变化）时,只发紧凑标签
+        ——全量指引在上一轮尾部里原样可见,重复逐轮重 prefill 是纯浪费（未缓存
+        后缀实测 238-315 tok/轮,是暖轮 TTFT 大头,0.4-0.6k tok/s 下≈0.4-0.6s）。
+        【你上一句】的固定指令文本已上移稳定前缀（【重复控制】）,尾部只留引文。
         """
+        _last_rev = self._applied_tails[-1][2] if self._applied_tails else None
+        slim = (
+            os.environ.get("BOK_TAIL_SLIM", "1") == "1"
+            and _last_rev is not None
+            and _last_rev == self._revision
+        )
         parts: list[str] = []
+        if slim:
+            _step_head = (self._flow_current.strip().splitlines() or [""])[0]
+            parts.append(f"【{_step_head or '流程'}·继续】状态无实质变化，按上文同一步要求继续。")
+            if self._whatsapp_note:
+                parts.append("【已记录客户 WhatsApp】" + self._whatsapp_note)
+            if self._last_reply:
+                parts.append("【你上一句】「" + self._last_reply + "」")
+            return "\n".join(parts)
         if self._whatsapp_note:
             parts.append(
                 "【已记录客户 WhatsApp】" + self._whatsapp_note +
@@ -854,15 +887,9 @@ class ContextState:
             parts.append("【现在这一步】\n" + self._flow_current)
         if self._last_reply:
             # 重复锚:模型看得见自己上一句,治「原句/近原句复述」(2026-09-06
-            # 行为取证:同一确认句一字不差讲两遍)。冻结进当时 user 的尾部,
-            # 语义=「你讲呢句嗰阵嘅上一句」,自洽。
-            # 2026-09-07 QA 10 轮实测补充:连续同类推进(如 T06/T07 连答「保险
-            # 自动生效+专员联络」)虽非原句但近逐字雷同——补「同类内容换措辞」。
-            parts.append(
-                "【你上一句】已讲过的内容绝不原句或近原句再讲一次；"
-                "连续回答同类问题时必须换用不同的说法和角度，不得只改动个别字词；"
-                "客户没有新异议就不要重复确认，停下来等他说。\n「" + self._last_reply + "」"
-            )
+            # 行为取证)。固定指令文本已上移稳定前缀【重复控制】(2026-09-09 S5
+            # 尾部瘦身)——每轮逐字重复 ~90 字指令是纯浪费,尾部只留引文。
+            parts.append("【你上一句】「" + self._last_reply + "」")
         if self.rag_enabled and self._snippets:
             parts.append("【实时检索到的资料（知识库）】\n" + "\n".join(f"- {s}" for s in self._snippets))
         if self.rag_enabled and self._web:

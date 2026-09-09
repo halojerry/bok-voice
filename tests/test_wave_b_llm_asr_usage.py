@@ -85,7 +85,13 @@ def test_context_aware_llm_keeps_byte_stable_prefix():
         # 易变尾部(含当前步)拼在最后一条 user 消息上(请求副本)。
         last_role, last_text = call[-1]
         assert last_role == "user", last_role
-        assert "【现在这一步】" in last_text and "开场确认" in last_text, last_text[:120]
+        # S5 尾部瘦身:首轮 revision 冻结后,无实质变化的后续轮=紧凑标签;
+        # 首轮(账本空)恒全量。
+        if call is inner.calls[0]:
+            assert "【现在这一步】" in last_text and "开场确认" in last_text, last_text[:120]
+        else:
+            assert "【第 1 步：开场确认·继续】" in last_text, last_text[:120]
+            assert "【现在这一步】" not in last_text, last_text[:120]
     # 前缀系统段不被历史轮次污染(两轮第一段都是 system 注入)。
     assert inner.calls[0][0][0] == "system" and inner.calls[1][0][0] == "system"
 
