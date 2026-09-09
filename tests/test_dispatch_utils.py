@@ -158,7 +158,7 @@ def test_webhook_redispatch_skipped_when_active_dispatch_exists(monkeypatch):
     skip 后安排 20s 复查(测试注入 0.2s),复查时 dispatch 仍活跃 → 依旧不补派。"""
     from control_plane import main as m
 
-    monkeypatch.setattr(m, "_REDISPATCH_RECHECK_DELAY", 0.2)
+    monkeypatch.setattr(m, "_REDISPATCH_RETRY_SCHEDULE", (0.0, 0.2, 0.4))
     lkapi = _lkapi_dummy()
     lkapi.agent_dispatch.create_dispatch = AsyncMock()
     monkeypatch.setattr(m, "_lkapi_client", lambda: lkapi)
@@ -173,12 +173,12 @@ def test_webhook_redispatch_skipped_when_active_dispatch_exists(monkeypatch):
         _wait_until(lambda: skip_log.info.call_count == 1, "redispatch skip log")
         # F5: aclose 纳入同一轮询等待,不依赖「后台任务已跑完」的调度假设。
         _wait_until(lambda: lkapi.aclose.await_count == 1, "client aclose")
-        # 复查任务(0.2s 后)跑完:dispatch 仍活跃 → 依旧 skip,不补派。
-        _wait_until(lambda: has_active.await_count >= 2, "recheck has_active")
+        # 复查排程(0.2/0.4s)三次尝试都是 dup:dispatch 仍活跃 → 全程不补派。
+        _wait_until(lambda: has_active.await_count >= 3, "retry attempts done")
 
     assert all(c.args == (lkapi, room) for c in has_active.await_args_list)
     lkapi.agent_dispatch.create_dispatch.assert_not_awaited()
-    assert skip_log.info.call_count == 1
+    assert skip_log.info.call_count == has_active.await_count
     assert "redispatch_skip" in str(skip_log.info.call_args.args[0])
     assert skip_log.info.call_args.kwargs["extra"]["event"] == "dispatch.redispatch.skip"
     assert skip_log.info.call_args.kwargs["extra"]["data"]["room"] == room
@@ -189,7 +189,7 @@ def test_webhook_redispatch_recheck_creates_when_dispatch_gone(monkeypatch):
     20s 复查(测试注入 0.2s)时 dispatch 已被 livekit 判死消失 → 补派。"""
     from control_plane import main as m
 
-    monkeypatch.setattr(m, "_REDISPATCH_RECHECK_DELAY", 0.2)
+    monkeypatch.setattr(m, "_REDISPATCH_RETRY_SCHEDULE", (0.0, 0.2, 0.4))
     lkapi = _lkapi_dummy()
     create = AsyncMock(return_value=AgentDispatch())
     lkapi.agent_dispatch.create_dispatch = create
@@ -217,7 +217,7 @@ def test_webhook_redispatch_matches_sdk_agent_identity(monkeypatch):
     webhook 门必须认 agent- 前缀，否则崩溃补位永不触发。"""
     from control_plane import main as m
 
-    monkeypatch.setattr(m, "_REDISPATCH_RECHECK_DELAY", 0.2)
+    monkeypatch.setattr(m, "_REDISPATCH_RETRY_SCHEDULE", (0.0, 0.2, 0.4))
     lkapi = _lkapi_dummy()
     lkapi.agent_dispatch.create_dispatch = AsyncMock()
     monkeypatch.setattr(m, "_lkapi_client", lambda: lkapi)
@@ -317,7 +317,7 @@ def test_webhook_concurrent_redispatch_serialized_by_per_room_lock(monkeypatch):
     create = AsyncMock(return_value=AgentDispatch())
     lkapi.agent_dispatch.create_dispatch = create
     monkeypatch.setattr(m, "_lkapi_client", lambda: lkapi)
-    monkeypatch.setattr(m, "_REDISPATCH_RECHECK_DELAY", 0.2)
+    monkeypatch.setattr(m, "_REDISPATCH_RETRY_SCHEDULE", (0.0, 0.2, 0.4))
 
     observed: list[int] = []
 
