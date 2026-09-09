@@ -146,10 +146,10 @@ def _create_call(client: TestClient) -> dict:
     ).json()
 
 
-def _post_webhook(client: TestClient, room: str) -> dict:
+def _post_webhook(client: TestClient, room: str, identity: str = "bok-voice") -> dict:
     return client.post(
         "/api/webhook/livekit",
-        json={"event": "participant_left", "room": {"name": room}, "participant": {"identity": "bok-voice"}},
+        json={"event": "participant_left", "room": {"name": room}, "participant": {"identity": identity}},
     ).json()
 
 
@@ -178,6 +178,34 @@ def test_webhook_redispatch_skipped_when_active_dispatch_exists(monkeypatch):
     assert "redispatch_skip" in str(skip_log.info.call_args.args[0])
     assert skip_log.info.call_args.kwargs["extra"]["event"] == "dispatch.redispatch.skip"
     assert skip_log.info.call_args.kwargs["extra"]["data"]["room"] == room
+
+
+def test_webhook_redispatch_matches_sdk_agent_identity(monkeypatch):
+    """实机实证(2026-09-10)：agents SDK 真实 job 入房 identity 是 agent-<jobid>
+    （livekit/agents job.py:1018 服务端 job token 签发，非 agent_name bok-voice）——
+    webhook 门必须认 agent- 前缀，否则崩溃补位永不触发。"""
+    from control_plane import main as m
+
+    lkapi = _lkapi_dummy()
+    lkapi.agent_dispatch.create_dispatch = AsyncMock()
+    monkeypatch.setattr(m, "_lkapi_client", lambda: lkapi)
+    has_active = AsyncMock(return_value=True)
+    monkeypatch.setattr(m, "has_active_dispatch", has_active)
+    skip_log = MagicMock()
+    monkeypatch.setattr(m, "control_log", skip_log)
+
+    with TestClient(m.app) as client:
+        room = _create_call(client)["id"]
+        # 真实形态：identity = "agent-" + job id（如 agent-AJ_aZTC3G9UvEuy）
+        # 端点响应回显 identity（create_dispatch 仍按 agent_name="bok-voice" 重派）
+        assert _post_webhook(client, room, identity="agent-AJ_aZTC3G9UvEuy") == {
+            "handled": True,
+            "redispatch": "agent-AJ_aZTC3G9UvEuy",
+        }
+        _wait_until(lambda: skip_log.info.call_count == 1, "redispatch skip log")
+
+    has_active.assert_awaited_once_with(lkapi, room)
+    lkapi.agent_dispatch.create_dispatch.assert_not_awaited()
 
 
 def test_webhook_redispatch_creates_when_no_active_dispatch(monkeypatch):
