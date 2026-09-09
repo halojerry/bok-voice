@@ -26,8 +26,8 @@
   PCM 存 **app-data/tts-cache/**（LRU 500 条）。脚本直念线（开场白/心跳/收线/WA 确认）
   经 `_say_script`：命中 ~0ms 出声，未命中边播边落盘。开关 `BOK_TTS_CACHE=0`。
 - **预生成**：`bok.py tts-pregen`（--greetings 无变量脚本线 / --objects 逐对象
-  开场白收线心跳 / --fillers 垫话库）——离线批量合成，需 CP 或 MINIMAX_API_KEY。
-- **垫话**：`agent_runtime/fillers.py`——LLM 慢轮回复首音频 700ms 未到播预合成
+  开场白收线心跳 / --fillers 垫话库 / --qa 快答库启用条目应答）——离线批量合成，需 CP 或 MINIMAX_API_KEY。
+- **垫话**：`agent_runtime/fillers.py`——LLM 慢轮回复首音频 500ms 未到播预合成
   应承语，真回复出声即定向打断（CachedTTS 首音频回调）。垫话绝不进 LLM 上下文、
   绝不触发云合成。开关 `BOK_FILLER=0`。
 - **Q→A 快路**：`agent_runtime/qa_gate.py` + CP `/api/qa-entries`、
