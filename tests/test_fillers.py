@@ -7,6 +7,7 @@ session.say()——1.8 speech 队列严格串行,垫话会排在回复后面(实
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -207,6 +208,31 @@ def test_max_per_call_and_rotation(tmp_path):
         assert d._fired_lines[0] != d._fired_lines[1], "轮换不重样"
 
     _run(_case())
+
+
+def test_pick_line_random_avoids_consecutive_repeat(tmp_path, monkeypatch):
+    # 随机不重样:剔除最近 2 句后随机——连续取 12 次永不与上一句相同,且都出自池
+    monkeypatch.setenv(
+        "BOK_FILLER_LINES",
+        json.dumps({"cantonese": ["好，等我睇下。", "好，你等陣。", "好嘅，幫你跟緊。"]}, ensure_ascii=False),
+    )
+    d, _player, _session, _tts, _cache = _director(tmp_path)
+    picks = [d._pick_line("cantonese") for _ in range(12)]
+    pool = set(filler_lines()["cantonese"])
+    assert set(picks) <= pool
+    for prev, cur in zip(picks, picks[1:]):
+        assert prev != cur, "相邻两句垫话不得重复"
+
+
+def test_pick_line_falls_back_when_pool_small(tmp_path, monkeypatch):
+    # 池=2 且 fired 已含两句:候选空 → 回落全池,唔会无句可拣
+    monkeypatch.setenv(
+        "BOK_FILLER_LINES",
+        json.dumps({"cantonese": ["好，等我睇下。", "好，你等陣。"]}, ensure_ascii=False),
+    )
+    d, _player, _session, _tts, _cache = _director(tmp_path)
+    d._fired_lines = ["好，等我睇下。", "好，你等陣。"]
+    assert d._pick_line("cantonese") in {"好，等我睇下。", "好，你等陣。"}
 
 
 def test_guards_abort(tmp_path):

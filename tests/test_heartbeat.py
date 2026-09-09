@@ -7,7 +7,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps" / "agent"))
 
-from agent_runtime.agent import _farewell_line, _nudge_line, _nudge_should_fire  # noqa: E402
+from agent_runtime.agent import (  # noqa: E402
+    _effective_nudge_max,
+    _farewell_line,
+    _is_test_object_name,
+    _nudge_line,
+    _nudge_should_fire,
+)
 
 
 def test_nudge_cantonese_with_name():
@@ -59,3 +65,34 @@ def test_nudge_should_fire_guard_windows():
     assert not _nudge_should_fire(116.0, 90.0, 100.0, d)
     # 超 2×delay 仍無聲 → 兜底跳(答案可能失敗)
     assert _nudge_should_fire(100.0, 90.0, 73.0, d)
+
+
+def test_test_object_name_family():
+    # 与 tools/bok.py clean-testdata 同一套前缀族
+    assert _is_test_object_name("E2E-zh-1788952794")
+    assert _is_test_object_name("E2E-cantonese-1")
+    assert _is_test_object_name("soak1")
+    assert _is_test_object_name("并发-4路-1")
+    assert _is_test_object_name("LOAD-20260909")
+    assert _is_test_object_name("边角-e1")
+    assert _is_test_object_name("多轮-对话3")
+    assert _is_test_object_name("probe-filler")
+    # 真实客户对象名不能误伤
+    assert not _is_test_object_name("陳先生")
+    assert not _is_test_object_name("E2E客服")  # 人设名以「客服」结尾,对象名才是门
+    assert not _is_test_object_name("")
+
+
+def test_effective_nudge_max_test_object_immunity(monkeypatch):
+    monkeypatch.setenv("BOK_E2E_NUDGE_IMMUNE", "1")
+    # 测试对象 → 心跳整条关(0:arm 注册/farewell/12s 自动收线全部不挂)
+    assert _effective_nudge_max("2", "E2E-zh-1") == 0
+    assert _effective_nudge_max("2", "边角-e1") == 0
+    # 真实对象照常
+    assert _effective_nudge_max("2", "陳先生") == 2
+    # 显式关闭豁免 → 测试对象恢复心跳(逃生口)
+    monkeypatch.setenv("BOK_E2E_NUDGE_IMMUNE", "0")
+    assert _effective_nudge_max("2", "E2E-zh-1") == 2
+    # env 本来就关心跳 → 保持 0,豁免逻辑不碍事
+    monkeypatch.setenv("BOK_E2E_NUDGE_IMMUNE", "1")
+    assert _effective_nudge_max("0", "E2E-zh-1") == 0
