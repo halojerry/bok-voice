@@ -207,7 +207,9 @@ def test_webhook_redispatch_recheck_creates_when_dispatch_gone(monkeypatch):
         # 会取消 app 后台任务。
         _wait_until(lambda: create.await_count == 1, "recheck create_dispatch")
 
-    create.assert_awaited_once_with(room=room, agent_name="bok-voice")
+    create.assert_awaited_once()
+    req = create.await_args.args[0]
+    assert req.agent_name == "bok-voice" and req.room == room
     assert has_active.await_count == 2
 
 
@@ -256,7 +258,9 @@ def test_webhook_redispatch_creates_when_no_active_dispatch(monkeypatch):
         _wait_until(lambda: create.await_count == 1, "create_dispatch")
         _wait_until(lambda: lkapi.aclose.await_count == 1, "client aclose")
 
-    create.assert_awaited_once_with(room=room, agent_name="bok-voice")
+    create.assert_awaited_once()
+    req = create.await_args.args[0]
+    assert req.agent_name == "bok-voice" and req.room == room
     lkapi.aclose.assert_awaited_once()
 
 
