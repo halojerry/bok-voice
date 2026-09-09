@@ -1415,6 +1415,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     sub = p.add_subparsers(dest="cmd", required=True)
     for name in ("catalog", "manifest", "download", "status", "up", "serve", "down", "doctor", "tts-pregen", "tts-mine"):
         sub.add_parser(name)
+    sub.add_parser("tts-pregen", help="离线预合成 TTS 本地缓存(参数透传:--greetings/--objects/--fillers/--cp/--model)")
     p_prod = sub.add_parser("prod", help="生产常驻单元与健康面")
     p_prod.add_argument("action", nargs="?", default="status", choices=["install", "status"])
     p_setup = sub.add_parser("setup", help="First-run model readiness / download")
