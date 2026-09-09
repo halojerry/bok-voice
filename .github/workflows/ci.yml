@@ -95,9 +95,10 @@ jobs:
           cache-dependency-path: desktop/package-lock.json
       - name: Install Tauri system deps
         run: |
-          # runner 镜像自带的 google-chrome apt 源偶发 Hash Sum mismatch(2026-09-10),
-          # 与本仓无关——移除该源让 update 只走 Ubuntu 官方源,Tauri 依赖不受影响。
-          sudo rm -f /etc/apt/sources.list.d/google-chrome.list
+          # runner 镜像自带 dl.google.com chrome apt 源近期 Hash Sum mismatch
+          # (2026-09-10 PR#53 连续失败,与本仓改动无关)——凡引用该域的源文件一律
+          # 移除,update 只走 Ubuntu 官方源,Tauri 依赖不受影响。
+          sudo grep -rlZ dl.google.com /etc/apt/sources.list.d/ 2>/dev/null | xargs -0 -r sudo rm -f
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
       - name: Build web (frontendDist) + stub runtime resources
