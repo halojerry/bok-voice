@@ -7,6 +7,7 @@ import os
 import sys
 import uuid
 import wave
+from collections import defaultdict
 from pathlib import Path
 
 import httpx
@@ -1502,6 +1503,16 @@ async def ingest_session_report(call_id: str, request: Request) -> dict:
     return {"call_id": call_id, "stored": True}
 
 
+# 重派防复活门:终态通话(或记录已删)不得重派——为死通话新建的 dispatch 无
+# 回收路径(reaper 只扫 ACTIVE/PAUSED),agent 会被带进空房念开场白。
+_TERMINAL_CALL_STATUSES = (CallStatus.ENDED.value, CallStatus.FAILED.value)
+# per-room 重派锁:串行化「has_active_dispatch 检查 + create_dispatch」临界区,
+# 收口 TOCTOU(后进锁者复查时见到先进锁者新建的 dispatch → 跳过,并发双 create
+# 坍缩为一次)。锁图按房间单调增长:每通话房间一个小锁对象,CP 单进程 4-6 路并发
+# 规模下可接受;不做淘汰——锁被取走瞬间另一任务可能正持有,边界不值得。
+_redispatch_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
 @app.post("/api/webhook/livekit")
 async def livekit_webhook(request: Request) -> dict:
     """LiveKit webhook：agent 崩溃补位。
@@ -1531,20 +1542,42 @@ async def livekit_webhook(request: Request) -> dict:
         return {"handled": False, "reason": "not A-line agent"}
 
     async def _redispatch() -> None:
+        # 防复活(F1):挂断链是 update_call(ENDED) → delete_room 踢出 agent →
+        # 本 webhook 重派,与 _disconnect_livekit_room 的 cleanup 赛跑——cleanup
+        # 先赢时 has_active=False,死通话会被新建 dispatch「复活」。先查通话
+        # 终态(记录已删同罪),死通话直接跳过,DB 状态是挂断链的权威先序信号。
+        try:
+            call = _repo().get_call(room_name) or {}
+        except Exception:
+            call = {}
+        if not call or str(call.get("status") or "") in _TERMINAL_CALL_STATUSES:
+            control_log.info(
+                "redispatch_skip_active_dispatch",
+                extra={
+                    "event": "dispatch.redispatch.skip",
+                    "data": {
+                        "room": room_name,
+                        "event": event,
+                        "reason": "call_ended" if call else "call_not_found",
+                    },
+                },
+            )
+            return
         # 防重(僵尸通话 P1):participant_left 可能连发/与 worker 自愈竞态,
         # 先查同 agent 是否已有 PENDING/RUNNING job,有则跳过——叠加两套
-        # agent 会互相抢麦、双重播报。防重判定与 create 共用一个客户端。
+        # agent 会互相抢麦、双重播报。per-room 锁包住检查+创建收口 TOCTOU。
         client = _lkapi_client()
         if client is None:
             return
         try:
-            if await has_active_dispatch(client, room_name):
-                control_log.info(
-                    "redispatch_skip_active_dispatch",
-                    extra={"event": "dispatch.redispatch.skip", "data": {"room": room_name, "event": event}},
-                )
-                return
-            await client.agent_dispatch.create_dispatch(room=room_name, agent_name="bok-voice")
+            async with _redispatch_locks[room_name]:
+                if await has_active_dispatch(client, room_name):
+                    control_log.info(
+                        "redispatch_skip_active_dispatch",
+                        extra={"event": "dispatch.redispatch.skip", "data": {"room": room_name, "event": event}},
+                    )
+                    return
+                await client.agent_dispatch.create_dispatch(room=room_name, agent_name="bok-voice")
             _audit("agent.redispatch", subject_type="call", subject_id=room_name, detail={"agent_name": "bok-voice", "event": event})
         except Exception as exc:  # pragma: no cover - 重派失败不致命(launchd 兜底拉起 worker)
             print(f"[webhook] redispatch failed: {exc!r}", flush=True)
