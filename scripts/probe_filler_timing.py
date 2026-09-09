@@ -120,11 +120,17 @@ async def main() -> None:
             src, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
         )
 
-        # 等开场白播完(≥1s 语音 + 3s 尾静音)——复用 barge-in 战斗测试口径
+        # 等开场白播完(≥1s 语音 + 3s 尾静音)——复用 barge-in 战斗测试口径。
+        # 冷 worker 首通 greeting 可能晚到:没等到语音就再来一轮(最多 3 轮)。
         state = {"processed": 0, "speech": 0.0, "silent": 0.0}
-        await wait_speech_then_silence(
-            agent_audio, state, need_speech=1.0, need_silence=3.0, timeout=40
-        )
+        for _ in range(3):
+            state.update(processed=len(agent_audio) if state["speech"] < 1.0 else state["processed"])
+            await wait_speech_then_silence(
+                agent_audio, state, need_speech=1.0, need_silence=3.0, timeout=40
+            )
+            if state["speech"] >= 1.0:
+                break
+        assert state["speech"] >= 1.0, "开场白 40s 内没出声(agent 未就绪?)"
         state.update(processed=len(agent_audio), speech=0.0, silent=0.0)
         await asyncio.sleep(0.5)
         probe = len(agent_audio)
@@ -153,11 +159,15 @@ async def main() -> None:
                 filler_fired = b"BOK_FILLER fired" in new_bytes
             except Exception:
                 pass
+        # 主判据=首声预算(快轮回复自己快/慢轮垫话顶上,两条路都要 <2.5s);
+        # filler_fired 是信息位:回复首音频 <700ms 时垫话按设计作废(快轮不垫)。
+        # FILLER_REQUIRE=1 强制要求开火(验证垫话通道本身,慢轮场景)。
+        require_fired = os.environ.get("FILLER_REQUIRE", "0") == "1"
         ok = (
             onset_ms is not None
             and onset_ms < ONSET_BUDGET_MS
             and speech_total >= 1.5
-            and filler_fired
+            and (filler_fired or not require_fired)
         )
         print(
             f"FILLER-PROBE {'PASS' if ok else 'FAIL'} "
