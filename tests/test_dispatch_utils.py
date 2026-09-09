@@ -124,9 +124,19 @@ def test_cleanup_dispatch_partial_delete_failure_keeps_deleted_count():
 # ---- 调用点级测试（control_plane.main 三处接线）----
 
 
+from types import SimpleNamespace
+
+
 def _lkapi_dummy() -> MagicMock:
-    """patch `_lkapi_client` 用的一次性假客户端：aclose 必须 awaitable。"""
-    return MagicMock(aclose=AsyncMock())
+    """patch `_lkapi_client` 用的一次性假客户端：aclose 必须 awaitable。
+    room.list_participants 默认返回空房(agent 缺席)——复查轮清扫会删全部
+    dispatch 后走 create;需要不同行为时在用例内覆写。"""
+    api = MagicMock(aclose=AsyncMock())
+    api.room.list_participants = AsyncMock(
+        return_value=SimpleNamespace(participants=[])
+    )
+    api.agent_dispatch.list_dispatch = AsyncMock(return_value=[])
+    return api
 
 
 def _wait_until(pred, what: str, timeout: float = 5.0) -> None:
