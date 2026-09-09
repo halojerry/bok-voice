@@ -1825,22 +1825,43 @@ async def entrypoint(ctx):
     # 明确拒绝收尾:礼貌告别讲完(一句 TTS+余量)后主动结束通话——
     # end_call 置 ENDED 并断房,结算由 _on_close 幂等触发。
     # disposition: declined=客户拒绝 / no_response=静音收线(心跳两次无回应)。
-    _end_scheduled = {"on": False}
+    _end_scheduled = {"on": False, "fired": False, "disposition": "declined"}
+
+    async def _fire_end_call(disposition: str) -> None:
+        # 幂等:delayed task 与 shutdown 回调两边都可能触发,只放行第一发。
+        if _end_scheduled["fired"]:
+            return
+        _end_scheduled["fired"] = True
+        await cp.end_call(call_id, disposition=disposition)
+        print(f"[flow] call ended by agent ({disposition}) (call {room_name})", flush=True)
 
     def _schedule_call_end(delay: float = 14.0, disposition: str = "declined") -> None:
         if _end_scheduled["on"]:
             return
         _end_scheduled["on"] = True
+        _end_scheduled["disposition"] = disposition
 
         async def _end():
             try:
                 await asyncio.sleep(delay)
-                await cp.end_call(call_id, disposition=disposition)
-                print(f"[flow] call ended by agent ({disposition}) (call {room_name})", flush=True)
+                await _fire_end_call(disposition)
+                print(f"[flow] delayed end task done ({disposition}) (call {room_name})", flush=True)
             except Exception as exc:  # pragma: no cover - 已结束/断房失败都不致命
                 print(f"[flow] end_call skipped: {exc!r} (call {room_name})", flush=True)
 
         asyncio.create_task(_end())
+
+    async def _end_on_shutdown(_reason: str = "") -> None:
+        # job 进程在 delayed _end() 睡眠期间就会被拆除(2026-09-10 静音收线实测:
+        # farewell 一说完 worker 即收 job 进程,12s 定时器陪葬,通话卡 active 等
+        # reaper 迟兜底)。teardown 窗口内 end_call 仍未发出就立即补发。
+        if _end_scheduled["on"] and not _end_scheduled["fired"]:
+            try:
+                await _fire_end_call(_end_scheduled["disposition"])
+            except Exception as exc:  # pragma: no cover
+                print(f"[flow] end_call skipped (shutdown): {exc!r} (call {room_name})", flush=True)
+
+    ctx.add_shutdown_callback(_end_on_shutdown)
 
     session.on("conversation_item_added", _on_conversation_item)
     session.on("conversation_item_added", _on_item_for_context)
