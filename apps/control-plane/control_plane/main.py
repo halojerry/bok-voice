@@ -7,6 +7,7 @@ import os
 import sys
 import uuid
 import wave
+from collections import defaultdict
 from pathlib import Path
 
 import httpx
@@ -31,6 +32,7 @@ from bok_voice_obs.logging import configure_logging, get_logger
 from bok_voice_obs.middleware import CorrelationMiddleware
 
 from .deps import build_engine, build_repository, build_session_factory
+from .dispatch_utils import cleanup_dispatch, has_active_dispatch
 from .schemas import (
     CreateCallRequest,
     CreateObjectRequest,
@@ -684,6 +686,42 @@ _STALE_RINGING_S = 600
 _REAP_INTERVAL_S = 60
 
 
+def _lkapi_client():
+    """按 app.state/env 凭据构造一次性 LiveKitAPI 客户端；无凭据返回 None。
+
+    dispatch 相关三处调用点（崩溃重派防重 / 挂断断房回收 / reaper 回收）共用
+    同一获取方式；客户端自带 aiohttp session，用完必须 `await aclose()`
+    （调用方负责）。URL 统一归一为 http(s)，与 `_room_has_participants` 一致。
+    """
+    key = getattr(app.state, "lk_key", "") or os.environ.get("LIVEKIT_API_KEY", "")
+    secret = getattr(app.state, "lk_secret", "") or os.environ.get("LIVEKIT_API_SECRET", "")
+    if not key or not secret:
+        return None
+    from livekit import api
+
+    url = getattr(app.state, "lk_url", "") or os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880")
+    http_url = url.replace("ws://", "http://").replace("wss://", "https://").rstrip("/")
+    return api.LiveKitAPI(url=http_url, api_key=key, api_secret=secret)
+
+
+async def _cleanup_room_dispatch(room_name: str) -> None:
+    """best-effort 回收房间的 explicit dispatch（僵尸通话 P1 收口）；无凭据时 no-op。
+
+    cleanup_dispatch 自吞 LiveKit API 异常；这里再兜一层（含 aclose），
+    保证回收失败绝不外溢到挂断/回收主流程。
+    """
+    lkapi = _lkapi_client()
+    if lkapi is None:
+        return
+    try:
+        try:
+            await cleanup_dispatch(lkapi, room_name)
+        finally:
+            await lkapi.aclose()
+    except Exception as exc:  # pragma: no cover - 回收失败不阻挂断/回收主流程
+        print(f"[cp] dispatch cleanup skipped ({room_name}): {exc!r}", flush=True)
+
+
 async def _room_has_participants(room_name: str) -> bool:
     """房间存在且有参与者 → True;房间不存在/服务不可用 → False(可回收)。"""
     key = getattr(app.state, "lk_key", "") or os.environ.get("LIVEKIT_API_KEY", "")
@@ -747,6 +785,9 @@ async def _reap_stale_calls_once() -> dict:
                 out["settled"] += 1
             except Exception as exc:  # pragma: no cover - 兜底结算失败不阻回收
                 print(f"[cp] reaper settle skipped ({c['id']}): {exc!r}", flush=True)
+            # 通话已 ENDED 且房间确认空:主动回收 explicit dispatch(防同 id
+            # 重开会房时旧 dispatch 立刻带起 agent,P1 僵尸通话收口)。
+            await _cleanup_room_dispatch(c["id"])
     # ③ended 但无结算的历史通话补结算(存量 172 通;幂等,每轮限量防风暴)。
     patched = 0
     for c in _repo().list_calls("", status=CallStatus.ENDED.value):
@@ -790,22 +831,27 @@ async def hangup(call_id: str) -> dict:
 
 async def _disconnect_livekit_room(room_name: str) -> None:
     """调用 LiveKit RoomService 删除房间（房间名 = call_id），容错。"""
+    if not room_name:
+        return
     key = getattr(app.state, "lk_key", "") or os.environ.get("LIVEKIT_API_KEY", "")
     secret = getattr(app.state, "lk_secret", "") or os.environ.get("LIVEKIT_API_SECRET", "")
     url = getattr(app.state, "lk_url", "") or os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880")
-    if not key or not secret or not room_name:
-        return
-    http_url = url.replace("ws://", "http://").replace("wss://", "https://").rstrip("/")
-    try:
-        import aiohttp
+    if key and secret:
+        http_url = url.replace("ws://", "http://").replace("wss://", "https://").rstrip("/")
+        try:
+            import aiohttp
 
-        from livekit.api.room_service import DeleteRoomRequest, RoomService
+            from livekit.api.room_service import DeleteRoomRequest, RoomService
 
-        async with aiohttp.ClientSession() as session:
-            svc = RoomService(session, http_url, key, secret)
-            await svc.delete_room(DeleteRoomRequest(room=room_name))
-    except Exception as exc:  # pragma: no cover - 房间不存在/livekit 未起都不阻塞挂断
-        print(f"[cp] livekit room delete skipped ({room_name}): {exc!r}", flush=True)
+            async with aiohttp.ClientSession() as session:
+                svc = RoomService(session, http_url, key, secret)
+                await svc.delete_room(DeleteRoomRequest(room=room_name))
+        except Exception as exc:  # pragma: no cover - 房间不存在/livekit 未起都不阻塞挂断
+            print(f"[cp] livekit room delete skipped ({room_name}): {exc!r}", flush=True)
+    # 通话已 ENDED（三个调用方 hangup/transfer/supervisor_end 都先置 ENDED）:
+    # 房间拆除后主动回收 explicit dispatch——房间删除失败/livekit 短暂不可用
+    # 也不影响回收尝试(无凭据时 _cleanup_room_dispatch 自行 no-op)。
+    await _cleanup_room_dispatch(room_name)
 
 
 @app.post("/api/calls/{call_id}/turns")
@@ -1457,6 +1503,16 @@ async def ingest_session_report(call_id: str, request: Request) -> dict:
     return {"call_id": call_id, "stored": True}
 
 
+# 重派防复活门:终态通话(或记录已删)不得重派——为死通话新建的 dispatch 无
+# 回收路径(reaper 只扫 ACTIVE/PAUSED),agent 会被带进空房念开场白。
+_TERMINAL_CALL_STATUSES = (CallStatus.ENDED.value, CallStatus.FAILED.value)
+# per-room 重派锁:串行化「has_active_dispatch 检查 + create_dispatch」临界区,
+# 收口 TOCTOU(后进锁者复查时见到先进锁者新建的 dispatch → 跳过,并发双 create
+# 坍缩为一次)。锁图按房间单调增长:每通话房间一个小锁对象,CP 单进程 4-6 路并发
+# 规模下可接受;不做淘汰——锁被取走瞬间另一任务可能正持有,边界不值得。
+_redispatch_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
 @app.post("/api/webhook/livekit")
 async def livekit_webhook(request: Request) -> dict:
     """LiveKit webhook：agent 崩溃补位。
@@ -1486,19 +1542,42 @@ async def livekit_webhook(request: Request) -> dict:
         return {"handled": False, "reason": "not A-line agent"}
 
     async def _redispatch() -> None:
-        key = os.environ.get("LIVEKIT_API_KEY", "")
-        secret = os.environ.get("LIVEKIT_API_SECRET", "")
-        if not key or not secret:
-            return
-        from livekit import api
-
-        client = api.LiveKitAPI(
-            url=os.environ.get("LIVEKIT_URL", "http://127.0.0.1:7880").replace("ws://", "http://").replace("wss://", "https://"),
-            api_key=key,
-            api_secret=secret,
-        )
+        # 防复活(F1):挂断链是 update_call(ENDED) → delete_room 踢出 agent →
+        # 本 webhook 重派,与 _disconnect_livekit_room 的 cleanup 赛跑——cleanup
+        # 先赢时 has_active=False,死通话会被新建 dispatch「复活」。先查通话
+        # 终态(记录已删同罪),死通话直接跳过,DB 状态是挂断链的权威先序信号。
         try:
-            await client.agent_dispatch.create_dispatch(room=room_name, agent_name="bok-voice")
+            call = _repo().get_call(room_name) or {}
+        except Exception:
+            call = {}
+        if not call or str(call.get("status") or "") in _TERMINAL_CALL_STATUSES:
+            control_log.info(
+                "redispatch_skip_active_dispatch",
+                extra={
+                    "event": "dispatch.redispatch.skip",
+                    "data": {
+                        "room": room_name,
+                        "event": event,
+                        "reason": "call_ended" if call else "call_not_found",
+                    },
+                },
+            )
+            return
+        # 防重(僵尸通话 P1):participant_left 可能连发/与 worker 自愈竞态,
+        # 先查同 agent 是否已有 PENDING/RUNNING job,有则跳过——叠加两套
+        # agent 会互相抢麦、双重播报。per-room 锁包住检查+创建收口 TOCTOU。
+        client = _lkapi_client()
+        if client is None:
+            return
+        try:
+            async with _redispatch_locks[room_name]:
+                if await has_active_dispatch(client, room_name):
+                    control_log.info(
+                        "redispatch_skip_active_dispatch",
+                        extra={"event": "dispatch.redispatch.skip", "data": {"room": room_name, "event": event}},
+                    )
+                    return
+                await client.agent_dispatch.create_dispatch(room=room_name, agent_name="bok-voice")
             _audit("agent.redispatch", subject_type="call", subject_id=room_name, detail={"agent_name": "bok-voice", "event": event})
         except Exception as exc:  # pragma: no cover - 重派失败不致命(launchd 兜底拉起 worker)
             print(f"[webhook] redispatch failed: {exc!r}", flush=True)
