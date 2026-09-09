@@ -32,11 +32,12 @@ CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
 AUDIO_DIR = ROOT / "tests" / "fixtures" / "audio"
 LANG = os.environ.get("BARGEIN_LANG", "cantonese")
 TTS_URL = os.environ.get("TTS_URL", "http://127.0.0.1:8788")
-# 真人客户口吻两句(第一句触发回复,第二句播放中插入打断)。**无逗号**:逗号
-# 会被 vad-pause 当微停顿劈成两轮(碎片轮+迟到 FINAL 掐掉首回复,2026-09-09
-# main A/B 实证劈句致 reply1_no_speech 假故障,与垫话改动无关)。
+# 真人客户口吻两句(第一句触发回复,第二句播放中插入打断)。**无逗号且低内停顿**:
+# 逗号/换气微停顿会被 vad-pause 劈成两轮(碎片轮+迟到 FINAL 掐掉生成中回复,
+# 2026-09-09 实证两句中招:SECOND_TEXT 12字渲染「唔使住住」后有 >0.45s 停顿,
+# 尾段「几多啊？」前缀续句 interrupt 掉 reply2 首包;换 9 字单口气句 max_gap 0.18s)。
 FIRST_TEXT = os.environ.get("BARGEIN_FIRST_TEXT", "我件貨爛咗想投訴。")
-SECOND_TEXT = os.environ.get("BARGEIN_SECOND_TEXT", "唔使住住我想先問下賠幾多。")
+SECOND_TEXT = os.environ.get("BARGEIN_SECOND_TEXT", "我想先問下賠幾多。")
 
 
 def frame_rms(pcm: bytes) -> float:

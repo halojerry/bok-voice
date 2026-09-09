@@ -355,6 +355,30 @@ def _nudge_should_fire(now: float, last_reply_ts: float, last_user_ts: float, nu
     return True
 
 
+# 测试对象名前缀族(与 tools/bok.py clean-testdata 同一套命名约定):命中则沉默
+# 心跳整条关闭。E2E/压测脚本的 greeting→用户语音间隙(greeting 静默判定+脚本侧
+# 语音合成)必然跨过 8s 心跳线,心跳 7-9s 音频会越过脚本的 agent_audio.clear()
+# 落进回复断言窗(zh 腿 ASR 读回污染,call-6ba7c47c 实证),farewell+12s 自动收线
+# 也会错挂到慢提交的测试轮上。BOK_E2E_NUDGE_IMMUNE=0 可关豁免。
+_TEST_OBJECT_NAME_RE = re.compile(r"^(E2E-|soak\d*-?|并发|LOAD-|边角-|多轮-|probe)")
+
+
+def _is_test_object_name(name: str) -> bool:
+    return bool(_TEST_OBJECT_NAME_RE.match(name or ""))
+
+
+def _effective_nudge_max(env_value: str, object_name: str) -> int:
+    """心跳次数上限(纯函数,BOK_E2E_NUDGE_IMMUNE 单测用 monkeypatch 设env)。"""
+    nudge_max = int(env_value or "2")
+    if (
+        nudge_max > 0
+        and _is_test_object_name(object_name)
+        and os.environ.get("BOK_E2E_NUDGE_IMMUNE", "1") == "1"
+    ):
+        nudge_max = 0
+    return nudge_max
+
+
 # ---- WA 号码碎片累积(治「一句话拆两轮、LLM 唔识自己组装」,2026-09-06)----
 # 收号码步里客户逐位/逐段报号:每段独立成轮 → 语境与数字分居两轮、捕获结构性
 # 失败,AI 对每段插话(被打断再复读/捏造拼接,call-839ec9db "03201" 实证)。
@@ -2238,9 +2262,12 @@ async def entrypoint(ctx):
     # ⚠️ 定义与注册必须先于 session.start/开场白:开场白播完的 listening 转换
     # 发生在注册前的话,首段沉默永远收不到 arm、no_response 收线整条失效
     # (2026-09-05 审查 P1)。依赖(session/agent/flow_ctrl/closed/...)此处均已就绪。
-    nudge_max = int(os.environ.get("SILENCE_NUDGE_MAX", "2"))
+    _nudge_max_env = os.environ.get("SILENCE_NUDGE_MAX", "2")
+    nudge_max = _effective_nudge_max(_nudge_max_env, str((object_card or {}).get("display_name") or ""))
     # 默认 8s:旧 3.5-4s 太激进,客戶停頓/諗嘢/答案生成中就跳心跳(實測反饋「一直心跳」)。
     nudge_delay = float(os.environ.get("SILENCE_NUDGE_SECONDS", "8"))
+    if nudge_max == 0 and int(_nudge_max_env or "2") > 0:
+        print(f"[heartbeat] test object {(object_card or {}).get('display_name')!r} -> silence nudge disabled (call {room_name})", flush=True)
     _nudge_state["farewell"] = False
 
     def _disarm_silence() -> None:

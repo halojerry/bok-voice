@@ -552,6 +552,98 @@ class _ExprPrependStream(llm.LLMStream):
             self._event_ch.send_nowait(ev)
 
 
+# 尾部重复锚的标签原文（render_context_tail 渲染,4B 会拟声复刻进输出）。
+_TAIL_ANCHOR_LABEL = "【你上一句】"
+
+
+class _StripTailAnchorStream(llm.LLMStream):
+    """剥离模型输出里拟声复刻的「你上一句」锚块（LLM 流出口单点拦截）。
+
+    2026-09-09 call-974d8da3 实证:S5 尾部瘦身令易变尾部以【你上一句】「…」
+    模板块收尾,4B 模型把这个格式模式照抄进回复（答案后面追加标签+自引整块）,
+    TTS 念出声、落 turns 库,进历史还会强化后续轮的模仿（反馈回路）。在
+    ContextAwareLLM.chat 出口包一层,TTS/历史/turns/重复锚四个下游全部拿到
+    干净文本;渲染本身不动（锚的重复控制功能保留）。壳照抄 _ExprPrependStream:
+    metrics 由内芯发出经 _bind_metrics_forward 转发,此处只排空监视分支。
+    """
+
+    def __init__(self, plugin, inner: "llm.LLMStream"):
+        super().__init__(llm=plugin, chat_ctx=llm.ChatContext(), tools=[], conn_options=APIConnectOptions())
+        self._inner = inner
+        # HOLD:缓冲可能是标签前缀的尾段(防跨 chunk 劈开);DROP:已进块,吞到「」止。
+        self._hold = ""
+        self._drop = False
+
+    async def _metrics_monitor_task(self, event_aiter) -> None:
+        async for _ in event_aiter:
+            pass
+
+    def _feed(self, text: str) -> str:
+        """状态机过滤一段增量文本,返回可安全发出的部分。"""
+        buf = self._hold + text
+        self._hold = ""
+        out: list[str] = []
+        while buf:
+            if self._drop:
+                end = buf.find("」")
+                if end == -1:
+                    buf = ""
+                    break  # 块未闭合,余下全吞
+                self._drop = False
+                buf = buf[end + 1 :]
+                continue
+            idx = buf.find(_TAIL_ANCHOR_LABEL)
+            if idx != -1:
+                out.append(buf[:idx])
+                print("TAIL_ANCHOR_MIMIC_SUPPRESSED", flush=True)
+                self._drop = True
+                buf = buf[idx + len(_TAIL_ANCHOR_LABEL) :]
+                continue
+            # 无完整标签:只扣住可能是标签前缀的尾段(通常没有,零延迟透传)。
+            keep = 0
+            for n in range(min(len(buf), len(_TAIL_ANCHOR_LABEL) - 1), 0, -1):
+                if _TAIL_ANCHOR_LABEL.startswith(buf[-n:]):
+                    keep = n
+                    break
+            if keep < len(buf):
+                out.append(buf[: len(buf) - keep])
+            self._hold = buf[len(buf) - keep :] if keep else ""
+            break
+        return "".join(out)
+
+    def _flush_at_end(self) -> str:
+        # 流末仍 drop=块被截断,弃;尾段是残缺标签前缀(模仿起头没写完),同样弃
+        # ——残缺「【你上一」念出去比丢掉更伤。
+        if self._drop:
+            return ""
+        if self._hold and _TAIL_ANCHOR_LABEL.startswith(self._hold):
+            return ""
+        return self._hold
+
+    async def _run(self):
+        async for ev in self._inner:
+            delta = getattr(ev, "delta", None)
+            content = getattr(delta, "content", None) if delta is not None else None
+            if not content:
+                self._event_ch.send_nowait(ev)
+                continue
+            clean = self._feed(content)
+            if not clean:
+                continue
+            if clean != content:
+                ev = llm.ChatChunk(
+                    id=getattr(ev, "id", ""),
+                    delta=llm.ChoiceDelta(content=clean, role=getattr(delta, "role", "assistant")),
+                    usage=getattr(ev, "usage", None),
+                )
+            self._event_ch.send_nowait(ev)
+        tail = self._flush_at_end()
+        if tail:
+            self._event_ch.send_nowait(
+                llm.ChatChunk(id="tail-flush", delta=llm.ChoiceDelta(content=tail, role="assistant"))
+            )
+
+
 # 对象档案行边界=调用方给的显式换行(每个输入行是一个语义单元,如一行背景
 # +一行备注);绝不在句号处二次切分——多句背景若被句号切碎,第 2 行(备注)
 # 会被静默挤掉,档案失真。
@@ -1073,7 +1165,7 @@ class ContextAwareLLM(llm.LLM):
                 ]
                 copy.items = items
                 chat_ctx = copy
-        return self._inner.chat(
+        inner_stream = self._inner.chat(
             chat_ctx=chat_ctx,
             tools=tools,
             conn_options=conn_options,
@@ -1081,6 +1173,11 @@ class ContextAwareLLM(llm.LLM):
             tool_choice=tool_choice,
             extra_kwargs=_forward_extra_kwargs(extra_kwargs),
         )
+        # 出口剥离拟声复刻的尾部锚块(见 _StripTailAnchorStream):测试替身返回
+        # 非 LLMStream(单测 _CaptureInner 返回 "ok")时原样透传。
+        if isinstance(inner_stream, llm.LLMStream):
+            return _StripTailAnchorStream(self, inner_stream)
+        return inner_stream
 
 
 def _truncate_chat_items(items: list, max_turns: int = 4) -> list:
