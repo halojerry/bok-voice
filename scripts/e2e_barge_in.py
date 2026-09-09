@@ -31,8 +31,10 @@ LIVEKIT_URL = "ws://127.0.0.1:7880"
 CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
 AUDIO_DIR = ROOT / "tests" / "fixtures" / "audio"
 LANG = os.environ.get("BARGEIN_LANG", "cantonese")
-FIRST_FILE = os.environ.get("BARGEIN_FIRST", "cantonese.wav")
-SECOND_FILE = os.environ.get("BARGEIN_SECOND", "zh.wav")
+TTS_URL = os.environ.get("TTS_URL", "http://127.0.0.1:8788")
+# 真人客户口吻两句（第一句触发回复,第二句播放中插入打断）——弃 fixtures 灣仔問路句
+FIRST_TEXT = os.environ.get("BARGEIN_FIRST_TEXT", "我件貨爛咗，外包裝都凹咗，想投訴。")
+SECOND_TEXT = os.environ.get("BARGEIN_SECOND_TEXT", "唔使住住，我想先問下賠幾多。")
 
 
 def frame_rms(pcm: bytes) -> float:
@@ -41,6 +43,18 @@ def frame_rms(pcm: bytes) -> float:
     n = len(pcm) // 2
     frames = struct.unpack(f"<{n}h", pcm)
     return math.sqrt(sum(x * x for x in frames) / n)
+
+
+def tts_pcm(text: str, lang: str = "cantonese") -> bytes:
+    import httpx
+
+    with httpx.Client(timeout=60) as client:
+        r = client.post(
+            f"{TTS_URL}/v1/audio/speech",
+            json={"input": text, "language": lang, "voice": "Vivian", "sample_rate": 16000},
+        )
+        r.raise_for_status()
+        return r.content
 
 
 def read_pcm16(path: Path, max_seconds: float = 4.0) -> bytes:
@@ -182,7 +196,7 @@ async def main() -> None:
         await asyncio.sleep(0.5)
 
         # 第一句 → 等回复开始出声（speech ≥1.0s，不等静音）
-        await push_pcm(audio_source, read_pcm16(AUDIO_DIR / FIRST_FILE))
+        await push_pcm(audio_source, tts_pcm(FIRST_TEXT))
         started = time.perf_counter()
         while time.perf_counter() - started < 45:
             s, _, state["processed"] = speech_stats(bytes(agent_audio), state["processed"])
@@ -198,7 +212,7 @@ async def main() -> None:
 
         # 打断：立即推第二句用户音频
         interrupt_at = time.perf_counter()
-        await push_pcm(audio_source, read_pcm16(AUDIO_DIR / SECOND_FILE))
+        await push_pcm(audio_source, tts_pcm(SECOND_TEXT))
 
         # 断言①：agent ≤8s 内停声（打断生效——若一直在讲说明打断失败）
         state2 = {"processed": reply1_speech_at, "speech": 0.0, "silent": 0.0}
