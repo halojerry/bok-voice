@@ -16,6 +16,7 @@ import { ConnectionState, TokenSource, Track, type Room } from "livekit-client";
 import { api } from "@/lib/api";
 import { describeConnectError, friendlyErrorText, useControlPlaneReady } from "@/lib/api-ready";
 import { applyOutputDevice, listAudioDevicesOf, requestMicPermission, saveMicDevice, savedMicDevice, savedOutputDevice, switchWebOutputDevice, webCanSwitchOutput, isTauriShell, type AudioDeviceInfo } from "@/lib/audio";
+import { AgentChatIndicator } from "@/components/agents-ui/agent-chat-indicator";
 import { AgentChatTranscript } from "@/components/agents-ui/agent-chat-transcript";
 import { AgentSessionProvider } from "@/components/agents-ui/agent-session-provider";
 import { VoiceAgentInterface } from "@/components/VoiceAgentInterface";
@@ -36,7 +37,9 @@ function AgentStateLabel({ state }: { state: string }) {
   const item = map[state] ?? map.connecting;
   return (
     <span className="inline-flex items-center gap-2 text-sm">
-      <span className={`h-2.5 w-2.5 rounded-full ${item.color} animate-pulse`} />
+      {/* 官方 AgentChatIndicator（motion 呼吸脉冲）替代手写 animate-pulse 点；
+          状态色经 className 覆盖官方默认 bg-muted-foreground（cn 走 tailwind-merge 同组取末值） */}
+      <AgentChatIndicator size="sm" className={item.color} />
       {item.label}
     </span>
   );
