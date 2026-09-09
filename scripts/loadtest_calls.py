@@ -98,7 +98,7 @@ async def one_call(idx: int, pushes: list[bytes]) -> dict:
             pass
 
     def on_track(track, pub, participant):
-        if int(track.kind) == int(rtc.TrackKind.KIND_AUDIO) and getattr(track, "name", "") in ("roomio_audio", "background_audio"):
+        if int(track.kind) == int(rtc.TrackKind.KIND_AUDIO) and getattr(track, "name", "") == "roomio_audio":
             asyncio.get_running_loop().create_task(_read(rtc.AudioStream(track, sample_rate=16000, num_channels=1)))
 
     room.on("track_subscribed", on_track)

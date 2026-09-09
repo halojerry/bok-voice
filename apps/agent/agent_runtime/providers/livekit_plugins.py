@@ -1452,6 +1452,7 @@ class MiniMaxTTS(tts.TTS):
         sample_rate: int = 24000,
         api_key: str = "",
         emotion_state=None,
+        model_override: str = "",
     ):
         super().__init__(
             # 真流式：声明 streaming=True，voice 管线调 stream() 走 SynthesizeStream，
@@ -1466,6 +1467,9 @@ class MiniMaxTTS(tts.TTS):
         self._language_state = language_state or LanguageState()
         self._key = api_key
         self._emotion_state = emotion_state
+        # 回退链第二实例用(tts.FallbackAdapter hd→turbo 同音色换档):空=读 env,
+        # 与主实例同 env 会拿同一档,回退链就失去意义。
+        self._model_override = model_override
 
     def _resolve_emotion(self) -> str | None:
         """emotion 策略(2026-09-07 翻默认):不指定 → MiniMax 按文本自动匹配。
@@ -1536,7 +1540,7 @@ class MiniMaxTTS(tts.TTS):
         return self._ENDPOINT_WS_BIDI_INTL if region in {"intl", "global", "chat"} else self._ENDPOINT_WS_BIDI_CN
 
     def _model(self) -> str:
-        return os.environ.get("MINIMAX_MODEL", "speech-2.8-hd")
+        return self._model_override or os.environ.get("MINIMAX_MODEL", "speech-2.8-hd")
 
     def _language_boost(self) -> str:
         """目标语 language_boost(env 注入,B 线同传按 target_lang 钉死;空=不下发)。

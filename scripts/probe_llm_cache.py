@@ -86,7 +86,7 @@ async def main() -> None:
     def on_track(track, publication, participant):
         if int(track.kind) != int(rtc.TrackKind.KIND_AUDIO):
             return
-        if getattr(track, "name", "") not in ("roomio_audio", "background_audio"):
+        if getattr(track, "name", "") != "roomio_audio":
             return
 
         async def _read():

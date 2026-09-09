@@ -387,8 +387,22 @@ class CachedTTS(tts.TTS):
     def _forward_metric(self, *args, **kwargs) -> None:
         self.emit("metrics_collected", *args, **kwargs)
 
+    def _norm_conn_options(self, conn_options):
+        """conn_options 归一:None → 官方默认(含 max_retry)。
+
+        内芯是官方 FallbackAdapter(hd→turbo 回退链)时,其 ChunkedStream 会读
+        conn_options.max_retry——透传 None 直接 AttributeError(2026-09-09 en 腿
+        _tts_task 崩实证)。自有内芯不读这键,以前 None 无害纯属侥幸。
+        """
+        if conn_options is None:
+            from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS
+
+            return DEFAULT_API_CONNECT_OPTIONS
+        return conn_options
+
     def synthesize(self, text: str, *, conn_options=None) -> tts.ChunkedStream:
         text = str(text or "")
+        conn_options = self._norm_conn_options(conn_options)
         key = self._cache.key_for(
             text, voice=self.resolved_voice(), model=self.resolved_model()
         )
@@ -409,7 +423,7 @@ class CachedTTS(tts.TTS):
         return _StoreChunkedStream(tts_=self, inner=inner, on_done=_done)
 
     def stream(self, *, conn_options=None) -> tts.SynthesizeStream:
-        inner = self._wrapped.stream(conn_options=conn_options)
+        inner = self._wrapped.stream(conn_options=self._norm_conn_options(conn_options))
         return _RelaySynthesizeStream(tts_=self, inner=inner, on_first_audio=self._fire_first_audio)
 
     def prewarm(self) -> None:

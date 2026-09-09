@@ -757,6 +757,14 @@ def _filter_cloud_voice_map(raw_map: dict) -> dict:
     return voice_map
 
 
+def _alt_minimax_model(model: str) -> str:
+    """回退链换档映射(纯函数):hd↔turbo 同音色换档;turbo 只发过 2.6 代。
+
+    主档 hd(2.8)→ 2.6-turbo;主档 turbo/未知 → 2.8-hd。音色 ID 跨档通用。
+    """
+    return "speech-2.6-turbo" if "hd" in (model or "") else "speech-2.8-hd"
+
+
 def _assemble_minimax_voice_map(*, persona: dict | None, tts_cfg: dict, greet_lang: str, voice_mode: str) -> dict:
     """组 MiniMax voice map（纯函数，单测直接喂 dict，不起 worker）。
 
@@ -1317,6 +1325,35 @@ async def entrypoint(ctx):
             tts_provider.prewarm()
         except Exception:  # noqa: BLE001 - 预热失败零影响
             pass
+        # 主实例引用先于回退链包裹 capture:FallbackAdapter 包裹后 isinstance
+        # (tts_provider, MiniMaxTTS) 恒 False,后面 CachedTTS 装配的判据要用它。
+        _tts_primary = tts_provider
+        # 云端同音色换档回退(2026-09-09,官方 tts.FallbackAdapter):主档(hd)出错
+        # 自动切 turbo——音色 ID 跨档通用,换档不换人(用户拍板否决 MiniMax→本地
+        # Qwen3 回退:音色两套人,中途换客服违反全场同音色铁律)。看门狗在包装层
+        # 内自愈的错误不会到这层;Adapter 接的是自愈也救不回的漏网错误。BOK_TTS_
+        # FALLBACK=0 关;本地 Qwen3 不进链(要做断网兜底须一次性降级锁到通话结束)。
+        if os.environ.get("BOK_TTS_FALLBACK", "1") == "1":
+            try:
+                from livekit.agents import tts as agents_tts
+
+                primary_model = tts_provider.resolved_model()
+                alt_model = _alt_minimax_model(primary_model)
+                tts_backup = MiniMaxTTS(
+                    voice=voice_map,
+                    language_state=language_state,
+                    sample_rate=int(tts_cfg.get("sample_rate") or 24000),
+                    api_key=str(tts_cfg.get("api_key") or ""),
+                    emotion_state=emotion_state,
+                    model_override=alt_model,
+                )
+                tts_provider = agents_tts.FallbackAdapter([tts_provider, tts_backup])
+                print(
+                    f"[agent] tts fallback on primary={primary_model} backup={alt_model} (call {room_name})",
+                    flush=True,
+                )
+            except Exception as exc:  # noqa: BLE001 - 回退装配失败就用单实例
+                print(f"[agent] tts fallback init failed, single instance: {exc!r} (call {room_name})", flush=True)
     else:
         if tts_provider_name not in ("", "qwen3_tts"):
             print(f"[agent] unknown tts provider {tts_provider_name!r}, fallback qwen3_tts", flush=True)
@@ -1342,9 +1379,11 @@ async def entrypoint(ctx):
 
     # 本地 TTS 音频缓存(2026-09-08):仅包云端 MiniMax——本地 Qwen3 TTS 无网络
     # 首包,缓存无收益。BOK_TTS_CACHE=0 全关;包装层 stream()/事件/预热全透传,
-    # 仅 synthesize()(脚本直念整句路径)走缓存。
+    # 仅 synthesize()(脚本直念整句路径)走缓存。注意 voice/model provider 取
+    # 主实例(_tts_primary,包裹回退链之前 capture):缓存 key 用主档;回退档 tee
+    # 落盘也按主档 key(同文本同音色,档间微差可接受)。
     _tts_cache: TtsAudioCache | None = None
-    if isinstance(tts_provider, MiniMaxTTS) and tts_cache_enabled():
+    if _tts_primary is not None and tts_cache_enabled():
         try:
             _tts_cache = TtsAudioCache(
                 root=default_cache_dir(), sample_rate=int(tts_cfg.get("sample_rate") or 24000)
@@ -1352,8 +1391,8 @@ async def entrypoint(ctx):
             tts_provider = CachedTTS(
                 tts_provider,
                 cache=_tts_cache,
-                voice_provider=tts_provider.resolved_voice,
-                model_provider=tts_provider.resolved_model,
+                voice_provider=_tts_primary.resolved_voice,
+                model_provider=_tts_primary.resolved_model,
             )
             print(f"[agent] tts audio cache on dir={_tts_cache.root} (call {room_name})", flush=True)
         except Exception as exc:  # noqa: BLE001 - 缓存装配失败零影响
