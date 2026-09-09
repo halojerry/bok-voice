@@ -154,9 +154,11 @@ def _post_webhook(client: TestClient, room: str, identity: str = "bok-voice") ->
 
 
 def test_webhook_redispatch_skipped_when_active_dispatch_exists(monkeypatch):
-    """崩溃重派防重：同 agent 已有活跃 dispatch → 不调 create_dispatch + REDISPATCH_SKIP 打点。"""
+    """崩溃重派防重：同 agent 已有活跃 dispatch → 不调 create_dispatch + REDISPATCH_SKIP 打点；
+    skip 后安排 20s 复查(测试注入 0.2s),复查时 dispatch 仍活跃 → 依旧不补派。"""
     from control_plane import main as m
 
+    monkeypatch.setattr(m, "_REDISPATCH_RECHECK_DELAY", 0.2)
     lkapi = _lkapi_dummy()
     lkapi.agent_dispatch.create_dispatch = AsyncMock()
     monkeypatch.setattr(m, "_lkapi_client", lambda: lkapi)
@@ -171,13 +173,42 @@ def test_webhook_redispatch_skipped_when_active_dispatch_exists(monkeypatch):
         _wait_until(lambda: skip_log.info.call_count == 1, "redispatch skip log")
         # F5: aclose 纳入同一轮询等待,不依赖「后台任务已跑完」的调度假设。
         _wait_until(lambda: lkapi.aclose.await_count == 1, "client aclose")
+        # 复查任务(0.2s 后)跑完:dispatch 仍活跃 → 依旧 skip,不补派。
+        _wait_until(lambda: has_active.await_count >= 2, "recheck has_active")
 
-    has_active.assert_awaited_once_with(lkapi, room)
+    assert all(c.args == (lkapi, room) for c in has_active.await_args_list)
     lkapi.agent_dispatch.create_dispatch.assert_not_awaited()
     assert skip_log.info.call_count == 1
     assert "redispatch_skip" in str(skip_log.info.call_args.args[0])
     assert skip_log.info.call_args.kwargs["extra"]["event"] == "dispatch.redispatch.skip"
     assert skip_log.info.call_args.kwargs["extra"]["data"]["room"] == room
+
+
+def test_webhook_redispatch_recheck_creates_when_dispatch_gone(monkeypatch):
+    """真崩溃场景(实机实证 2026-09-10):强杀瞬间 job 仍 RUNNING → 首查 skip;
+    20s 复查(测试注入 0.2s)时 dispatch 已被 livekit 判死消失 → 补派。"""
+    from control_plane import main as m
+
+    monkeypatch.setattr(m, "_REDISPATCH_RECHECK_DELAY", 0.2)
+    lkapi = _lkapi_dummy()
+    create = AsyncMock(return_value=AgentDispatch())
+    lkapi.agent_dispatch.create_dispatch = create
+    monkeypatch.setattr(m, "_lkapi_client", lambda: lkapi)
+    has_active = AsyncMock(side_effect=[True, False])
+    monkeypatch.setattr(m, "has_active_dispatch", has_active)
+    skip_log = MagicMock()
+    monkeypatch.setattr(m, "control_log", skip_log)
+
+    with TestClient(m.app) as client:
+        room = _create_call(client)["id"]
+        assert _post_webhook(client, room) == {"handled": True, "redispatch": "bok-voice"}
+        _wait_until(lambda: skip_log.info.call_count == 1, "redispatch skip log")
+        # 复查(0.2s)必须在 TestClient 上下文内等完——F5 同款教训:上下文退出
+        # 会取消 app 后台任务。
+        _wait_until(lambda: create.await_count == 1, "recheck create_dispatch")
+
+    create.assert_awaited_once_with(room=room, agent_name="bok-voice")
+    assert has_active.await_count == 2
 
 
 def test_webhook_redispatch_matches_sdk_agent_identity(monkeypatch):
@@ -186,6 +217,7 @@ def test_webhook_redispatch_matches_sdk_agent_identity(monkeypatch):
     webhook 门必须认 agent- 前缀，否则崩溃补位永不触发。"""
     from control_plane import main as m
 
+    monkeypatch.setattr(m, "_REDISPATCH_RECHECK_DELAY", 0.2)
     lkapi = _lkapi_dummy()
     lkapi.agent_dispatch.create_dispatch = AsyncMock()
     monkeypatch.setattr(m, "_lkapi_client", lambda: lkapi)
@@ -204,8 +236,8 @@ def test_webhook_redispatch_matches_sdk_agent_identity(monkeypatch):
         }
         _wait_until(lambda: skip_log.info.call_count == 1, "redispatch skip log")
 
-    has_active.assert_awaited_once_with(lkapi, room)
     lkapi.agent_dispatch.create_dispatch.assert_not_awaited()
+    assert has_active.await_count >= 1
 
 
 def test_webhook_redispatch_creates_when_no_active_dispatch(monkeypatch):
@@ -285,6 +317,7 @@ def test_webhook_concurrent_redispatch_serialized_by_per_room_lock(monkeypatch):
     create = AsyncMock(return_value=AgentDispatch())
     lkapi.agent_dispatch.create_dispatch = create
     monkeypatch.setattr(m, "_lkapi_client", lambda: lkapi)
+    monkeypatch.setattr(m, "_REDISPATCH_RECHECK_DELAY", 0.2)
 
     observed: list[int] = []
 
@@ -302,7 +335,7 @@ def test_webhook_concurrent_redispatch_serialized_by_per_room_lock(monkeypatch):
         # 完成信号：两任务各自 aclose 一次（第二个任务只 skip 不 create）。
         _wait_until(lambda: lkapi.aclose.await_count == 2, "both redispatch tasks finished")
 
-    assert observed == [0, 1]  # 第二次检查被锁串行到第一次 create 之后
+    assert observed[:2] == [0, 1]  # 第二次检查被锁串行到第一次 create 之后(recheck 尾查可能追加)
     assert create.await_count == 1
 
 
