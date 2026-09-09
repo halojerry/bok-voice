@@ -1534,11 +1534,13 @@ async def livekit_webhook(request: Request) -> dict:
     identity = str(participant.get("identity") or "")
     if event != "participant_left" or not room_name:
         return {"handled": False, "reason": "not participant_left"}
-    # A 线 agent 进房 identity = agent_name "bok-voice"(独立身份,崩溃可可靠识别)。
+    # A 线 agent 身份识别:agents SDK 真实 job 入房 identity 是 "agent-<jobid>"
+    # (livekit/agents job.py:1018,服务端签发的 job token 所带,非 agent_name——
+    # 2026-09-10 实机演练实证 agent-AJ_*,"bok-voice" 永不出现;保留它作兼容)。
     # B 线 interpreter 以 listen 身份(me-<room>/other-<room>,与真人同款)在场——
     # participant_left 无法区分是 agent 崩溃还是真人离开,不做自动补位(房间短命,
-    # 双端可重开);且 bok-interp-* 不会以自身名字发离开事件,故只匹配 bok-voice。
-    if identity != "bok-voice":
+    # 双端可重开);me-/other- 前缀与 agent-* 天然不重叠。
+    if identity != "bok-voice" and not identity.startswith("agent-"):
         return {"handled": False, "reason": "not A-line agent"}
 
     async def _redispatch() -> None:
