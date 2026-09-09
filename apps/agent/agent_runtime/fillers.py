@@ -26,12 +26,34 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 
 # 默认垫话骨架(最终话术可经 BOK_FILLER_LINES JSON 覆盖;用户拍板后改这里也行)。
+# 2026-09-09 扩容:按语言口头禅+客服常用语起池(粤语繁体、zh 书面普通话、en
+# 口语),每通限次内随机不重样(见 _pick_line)——旧版每通固定从第 0 句起轮换,
+# 每通第一句垫话千篇一律。
 DEFAULT_FILLER_LINES: dict[str, tuple[str, ...]] = {
-    "zh": ("好的，您稍等。", "我看一下哈。"),
-    "cantonese": ("好，等我睇下。", "好，你等陣。"),
-    "en": ("Sure, let me check.", "One moment please."),
+    "zh": (
+        "好的，您稍等。",
+        "我看一下哈。",
+        "马上帮您查。",
+        "收到，您别急。",
+        "明白，您等等啊。",
+    ),
+    "cantonese": (
+        "好，等我睇下。",
+        "好，你等陣。",
+        "好嘅，幫你跟緊。",
+        "收到，冇問題。",
+        "明白，等我一陣。",
+    ),
+    "en": (
+        "Sure, let me check.",
+        "One moment please.",
+        "Got it, checking now.",
+        "Of course, one sec.",
+        "Right away, let me see.",
+    ),
 }
 
 
@@ -91,9 +113,9 @@ class FillerDirector:
         self._guards = guards or (lambda: False)
         self._timer: asyncio.Task | None = None
         self._handle = None
-        self._fired_lines: list[str] = []
+        self._fired_lines: list[str] = []  # 已实际播放(审计/探针断言用)
+        self._recent: list[str] = []  # 已选取(含未播出),防相邻重复
         self._count = 0
-        self._idx = 0
 
     # ---- 生命周期 ----
 
@@ -122,8 +144,8 @@ class FillerDirector:
 
     def reset_per_call(self) -> None:
         self._count = 0
-        self._idx = 0
         self._fired_lines.clear()
+        self._recent.clear()
         self._cancel_timer()
         self._stop_playing()
         self._handle = None
@@ -152,8 +174,12 @@ class FillerDirector:
         lines = filler_lines().get(lang) or filler_lines().get("zh") or ()
         if not lines:
             return ""
-        line = lines[self._idx % len(lines)]
-        self._idx += 1
+        # 随机不重样(同垫话连续两轮最刺耳):池里剔除上一句后随机,池=1 才允许重复。
+        # 旧版顺序轮换 _idx 从 0 起——per-job 进程每通重建,每通第一句永远相同。
+        recent = set(self._recent[-2:])
+        pool = [x for x in lines if x not in recent] or list(lines)
+        line = random.choice(pool)
+        self._recent.append(line)
         return line
 
     async def _fire(self, delay: float) -> None:
