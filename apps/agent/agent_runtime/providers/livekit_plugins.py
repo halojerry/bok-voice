@@ -308,6 +308,23 @@ class MlxLlmLLM(_OpenAICompatBase):
 
             _client.chat.completions.create = _create
 
+        # S5 排队定罪（2026-09-09）:请求级计时。header=server 受理并回响应头,
+        # 官方 TTFT=首 chunk。TTFT-LLM_REQ_MS header ≈ server 内等待（模型锁/
+        # prefill/解码）——配 llm.log 的 prefill progress 窗口可把「排队常数」
+        # 定罪到具体环节（实测 p50 ~0.65s 待拆）。
+        _qclient = self._client
+        _qraw = _qclient.chat.completions.create
+
+        async def _timed_create(**kw):
+            _t0 = time.perf_counter()
+            _resp = await _qraw(**kw)
+            _t_hdr = time.perf_counter()
+            if kw.get("stream"):
+                print(f"LLM_REQ_MS header={(_t_hdr - _t0) * 1000:.0f} msgs={len(kw.get('messages') or [])}", flush=True)
+            return _resp
+
+        _qclient.chat.completions.create = _timed_create
+
     async def _prewarm_impl(self) -> None:
         # 真实 1-token 生成：暖 mlx 模型（冷启动的 KV 分配/首 token 占首包大头）。
         # 官方 prewarm 只验连接；AgentSession 构造时会自动调用本钩子。
@@ -4020,7 +4037,9 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         self._join_task = None
         _epoch_at_hold = self._session_epoch
         self._finishing = True
-        speech_end_time = time.time()
+        # 停嘴时钟锚点：hold 从原 EOS 时刻起算——真实停嘴 = 现在 - hold 窗。
+        # 锚到 flush 时刻会令 min_delay 全额叠加在 hold 窗之后（白付 0.25s）。
+        speech_end_time = time.time() - _join_hold_s()
         self._event_ch.send_nowait(
             stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH, speech_end_time=speech_end_time)
         )
@@ -4104,6 +4123,11 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         self._last_post = now
         pcm = bytes(self._pending)
         self._pending.clear()
+        # 停嘴时钟锚点（2026-09-09 S5）:本窗音频在 POST 发出时刻已讲完,句级提交
+        # 的 END_OF_SPEECH 带上它——框架 min_delay 锚定 speech_end_time（停嘴时刻,
+        # audio_recognition.py:1332-1336/1679-1681）,锚点缺失会坍缩为 now,令
+        # min_delay 全额叠在解码延迟之后（白付 ~0.25s/句）。
+        t_req_wall = time.time()
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.post(
@@ -4147,7 +4171,15 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                 self._emit_sentence_commit(sentence, end_idx, lang, now, source="partial-punct")
                 # 每句事件序：FINAL(句子) → END_OF_SPEECH（框架 EOS 才置 committed
                 # + _run_eou_detection(trigger="stt")，见 _sentence_boundary 文档）。
-                self._event_ch.send_nowait(stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH))
+                # EOS 带停嘴时钟锚点：句子音频最迟在 chunk POST 发出（本窗音频
+                # 讲完）时已结束，min_delay 从那时起算——解码期间的时间框架自动
+                # 抵扣，唔再全额叠加（同提交时机，只对齐时钟，零早切风险）。
+                self._event_ch.send_nowait(
+                    stt.SpeechEvent(
+                        type=stt.SpeechEventType.END_OF_SPEECH,
+                        speech_end_time=t_req_wall,
+                    )
+                )
                 self._prev_partial = text  # 参照窗照常推进（与 _last_partial 同步）
                 # 字幕续流：只发未提交剩余（框架 _audio_transcript 已含已提交句）。
                 remainder = self._uncommitted(text)
