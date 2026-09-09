@@ -4,18 +4,17 @@
 `background_audio`,本探针两条音轨都收)。改版前垫话被 speech 队列堵在回复后面,
 慢轮纯静音 2.5-4s;改版后垫话 ~700ms 出声,感知首声由回复 TTFT 决定变为垫话
 定时器决定。断言:用户推完音频到 agent 首声 <2000ms(垫话 ~0.7-1.2s,回复
-warm TTFT+TTFB ~2.5-4s,阈值两边都分开);随后有 ≥1.5s 总语音(回复真来了,
-唔係误触噪声)。
+warm TTFT+TTFB ~2.5-4s,阈值两边都分开);随后累计 ≥1.5s 语音(回复真来了,
+唔係误触噪声)。复用 e2e_barge_in 的语音统计/推流工具。
 
-用法:python3 scripts/probe_filler_timing.py [lang](默认 cantonese,需 dev 栈在跑)
+用法:python3 scripts/probe_filler_timing.py(默认 cantonese,需 dev 栈在跑;
+可用 runtime python 或 .venv312,需 livekit+httpx)
 """
 
 from __future__ import annotations
 
 import asyncio
-import math
 import os
-import struct
 import sys
 import time
 from pathlib import Path
@@ -23,63 +22,19 @@ from pathlib import Path
 import httpx
 import livekit.rtc as rtc
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from e2e_barge_in import push_pcm, speech_stats, tts_pcm, wait_speech_then_silence  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
-LIVEKIT_URL = "ws://127.0.0.1:7880"
 CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
 TTS_URL = os.environ.get("TTS_URL", "http://127.0.0.1:8788")
 LANG = os.environ.get("FILLER_LANG", "cantonese")
 # 垫话 700ms+播报起音 → <2s;旧通道实测 2.5s+,阈值两边都分得开
 ONSET_BUDGET_MS = int(os.environ.get("FILLER_ONSET_BUDGET_MS", "2000"))
-TEXT = os.environ.get("FILLER_TEXT", "我想問下我張單點解仲未到。")
-
-
-def frame_rms(pcm: bytes) -> float:
-    if len(pcm) < 2:
-        return 0.0
-    n = len(pcm) // 2
-    frames = struct.unpack(f"<{n}h", pcm)
-    return math.sqrt(sum(x * x for x in frames) / n)
-
-
-def tts_pcm(text: str, lang: str) -> bytes:
-    with httpx.Client(timeout=60) as client:
-        r = client.post(
-            f"{TTS_URL}/v1/audio/speech",
-            json={"input": text, "language": lang, "voice": "Vivian", "sample_rate": 16000},
-        )
-        r.raise_for_status()
-        return r.content
-
-
-async def push_pcm(audio_source: rtc.AudioSource, pcm: bytes) -> None:
-    frame_size = 320  # 20ms @16k
-    for i in range(0, len(pcm), frame_size * 2):
-        chunk = pcm[i : i + frame_size * 2]
-        if len(chunk) < frame_size * 2:
-            chunk = chunk + b"\0" * (frame_size * 2 - len(chunk))
-        frame = rtc.AudioFrame(
-            data=chunk,
-            sample_rate=16000,
-            num_channels=1,
-            samples_per_channel=len(chunk) // 2,
-        )
-        await audio_source.capture_frame(frame)
-
-
-def speech_stats(pcm: bytes, processed: int, threshold: float = 220.0):
-    """从 processed 偏移继续统计 (新增语音ms, 新增静音ms, 新消费偏移)。20ms 步进。"""
-    new_speech_ms = 0.0
-    new_sil_ms = 0.0
-    i = processed
-    step = 320  # 20ms
-    while i + step * 2 <= len(pcm):
-        seg = pcm[i : i + step * 2]
-        if frame_rms(seg) > threshold:
-            new_speech_ms += 20
-        else:
-            new_sil_ms += 20
-        i += step * 2
-    return new_speech_ms, new_sil_ms, i
+TEXT = os.environ.get("FILLER_TEXT", "唔該幫我查下張單到邊度喇。")
+# 垫话缓存按 voice+model 做 key:探针人设显式钉 GentleLady(缓存已预合成该音色),
+# 音色唔一致时垫话会静默跳过(宁勿出声都唔换声——正确行为,但探针就测唔到)。
+PERSONA_VOICE = os.environ.get("FILLER_PERSONA_VOICE", "Cantonese_GentleLady")
 
 
 async def main() -> None:
@@ -96,7 +51,12 @@ async def main() -> None:
     ).json()
     persona = httpx.post(
         f"{CONTROL_PLANE_URL}/api/personas?account_id=acc-001",
-        json={"name": "E2E客服", "language": lang, "tone": "礼貌专业"},
+        json={
+            "name": "E2E客服",
+            "language": lang,
+            "tone": "礼貌专业",
+            "reference_audio": PERSONA_VOICE,
+        },
         timeout=10,
     ).json()
     call = httpx.post(
@@ -156,49 +116,36 @@ async def main() -> None:
             src, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
         )
 
-        # 等开场白播完(≥1s 语音 + 3s 尾静音)
+        # 等开场白播完(≥1s 语音 + 3s 尾静音)——复用 barge-in 战斗测试口径
         state = {"processed": 0, "speech": 0.0, "silent": 0.0}
-        deadline = time.perf_counter() + 40
-        while time.perf_counter() < deadline:
-            s, sil, state["processed"] = speech_stats(bytes(agent_audio), state["processed"])
-            state["speech"] += s
-            if state["speech"] >= 1.0 and sil >= 3.0 * 50:  # sil 以 20ms 计
-                break
-            if state["speech"] < 1.0:
-                state["silent"] = 0.0
-            await asyncio.sleep(0.1)
-        state.update(processed=len(agent_audio) - 640, speech=0.0, silent=0.0)
+        await wait_speech_then_silence(
+            agent_audio, state, need_speech=1.0, need_silence=3.0, timeout=40
+        )
+        state.update(processed=len(agent_audio), speech=0.0, silent=0.0)
         await asyncio.sleep(0.5)
+        probe = len(agent_audio)
 
-        # 推一句用户音频 → 计时 agent 首声
+        # 推一句用户音频 → 计时 agent 首声(垫话或回复,先到先算)
         pcm = tts_pcm(TEXT, lang)
-        t0 = time.perf_counter()
         await push_pcm(audio_source, pcm)
         t_pushed = time.perf_counter()
 
         onset_ms = None
         speech_total = 0.0
-        probe = len(agent_audio)
-        speech_acc = 0.0
         while time.perf_counter() - t_pushed < 20:
             s, _, probe = speech_stats(bytes(agent_audio), probe)
-            speech_acc += s
-            if onset_ms is None and speech_acc >= 0.12:  # 连续 ≥120ms 语音=真出声
+            speech_total += s
+            if onset_ms is None and speech_total >= 0.12:  # 累计 ≥120ms 语音=真出声
                 onset_ms = (time.perf_counter() - t_pushed) * 1000
-            if onset_ms is not None and speech_acc >= 1.5:
+            if onset_ms is not None and speech_total >= 1.5:
                 break
             await asyncio.sleep(0.1)
 
-        total_ms = (time.perf_counter() - t_pushed) * 1000
-        ok = (
-            onset_ms is not None
-            and onset_ms < ONSET_BUDGET_MS
-            and speech_acc >= 1.5
-        )
+        ok = onset_ms is not None and onset_ms < ONSET_BUDGET_MS and speech_total >= 1.5
         print(
             f"FILLER-PROBE {'PASS' if ok else 'FAIL'} "
             f"first_audio_ms={onset_ms:.0f} budget={ONSET_BUDGET_MS} "
-            f"speech_total={speech_acc:.2f}s observed_ms={total_ms:.0f}",
+            f"speech_total={speech_total:.2f}s",
             flush=True,
         )
         await asyncio.sleep(2)
