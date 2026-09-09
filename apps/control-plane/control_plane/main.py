@@ -863,6 +863,16 @@ def add_turn(
     provider: str = "",
     latency_ms: int = 0,
     language: str = "",
+    # 分析账本列（spec 2026-09-10 §6.1）：可选带缺省，旧调用方（只报
+    # role/transcript）零破坏；org/线别/说话人/生成源/话术步/时间轴/perceived_ms。
+    org_id: str = "",
+    line: str = "a",
+    speaker: str = "",
+    gen: str = "",
+    template_step: int = 0,
+    started_ms: int = 0,
+    ended_ms: int = 0,
+    perceived_ms: int = 0,
 ) -> dict:
     # turn_id 用 uuid 而非 len(get_turns()) 序号：并发写时序号竞态产生重复
     # turn_id → 主键冲突 → IntegrityError 幂等分支吞成 200（静默丢数据，QA
@@ -879,6 +889,14 @@ def add_turn(
         provider=provider,
         latency_ms=latency_ms,
         language=language,
+        org_id=org_id,
+        line=line,
+        speaker=speaker,
+        gen=gen,
+        template_step=template_step,
+        started_ms=started_ms,
+        ended_ms=ended_ms,
+        perceived_ms=perceived_ms,
     )
     return _repo().create_turn(turn)
 

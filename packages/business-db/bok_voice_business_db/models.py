@@ -127,6 +127,16 @@ class Turn(Base):
     latency_ms: Mapped[int] = mapped_column(Integer, default=0)
     language: Mapped[str] = mapped_column(String(32), default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    # ---- 分析账本列（spec 2026-09-10 §6.1）：缺省值兜底旧库/旧调用；
+    # 既有库的列由 deps.build_engine 幂等 _ensure_column 补齐。
+    org_id: Mapped[str] = mapped_column(String(64), index=True, default="")
+    line: Mapped[str] = mapped_column(String(8), default="a")  # a=客服(A 线) / b=同传(B 线)
+    speaker: Mapped[str] = mapped_column(String(32), default="")
+    gen: Mapped[str] = mapped_column(String(16), default="")
+    template_step: Mapped[int] = mapped_column(Integer, default=0)
+    started_ms: Mapped[int] = mapped_column(Integer, default=0)
+    ended_ms: Mapped[int] = mapped_column(Integer, default=0)
+    perceived_ms: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class Settlement(Base):
