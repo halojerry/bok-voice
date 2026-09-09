@@ -60,6 +60,23 @@
 - LiveKit agent 分发机制天然是「可插拔推理节点」编排——worker 注册到 LiveKit、`RoomAgentDispatch` 自动分配，扩容=加节点，零新路由代码。「推理可分位」只是 CP 签 token 时 `serverUrl` 指向哪个 LiveKit 的区别（CP 已是官方 TokenSource 契约端点）。
 - agent worker 本来就是调 CP API 写 turns/审计/结算——CP URL 从 `127.0.0.1:8000` 换成云端地址，业务数据即实时落云。
 
+### 3.1 数据落点清单（什么、存哪、过不过公网）
+
+登录/建通话走云端（图：坐席→CP 拿 JWT→CP 签 LiveKit token→坐席 WebRTC 直连机房）；**唯一真源=云端 Postgres，机房零业务驻留**。
+
+| 数据 | 存哪里 | 过公网？ |
+|---|---|---|
+| 账号/角色/组织 | 云 Postgres | 是（HTTPS） |
+| 对象/话术/知识库 | 云 Postgres+Storage | 是（HTTPS） |
+| 通话转写+AI回复+审计+结算 | 云 Postgres（实时） | 是（HTTPS） |
+| **语音音频包** | 不落盘，内网浏览器↔LiveKit | **否** |
+| **ASR/LLM 推理** | 机房 GPU | **否** |
+| 回复文本（TTS 待合成） | MiniMax 云（09-04 既有设计：客户听到的每句回复文字都过 MiniMax，但客户原声转写/话术/资料不经它） | 是 |
+| 罐头音频缓存/日志 | 机房本地磁盘（易失，L3a 可擦） | 否 |
+| 心跳/负载指标 | 云 CP（出站上报） | 是（HTTPS） |
+
+断网语义推论：音频+推理都在机房，在途通话能继续讲完；新登录/建通话/看板全停（必须联网铁律成立）。
+
 ## 4. 本地薄节点
 
 ### 4.1 内容物与数据驻留
@@ -151,21 +168,70 @@
 
 | 期 | 内容 |
 |---|---|
-| P0 地基拆分 | 仓库拆「节点包」（LiveKit+sidecars+workers+node-agent）与「云 CP」；CP 搬 Supabase Postgres；turns 新 schema 落地；CUDA 原型节点打样 + 延迟/负载基线（并行线） |
-| P1 身份与两级管理员 | orgs/users/roles/JWT、web 登录、token 流按 org 路由、super_admin 最小控制台、org_admin（老板）视图 |
-| P2 分析地基 | 说话人/话术步/延迟落库的消费面：老板看板 + QA 挖掘接云 |
-| P3 熔断与升级 | L1 心跳/license、L2 停用、L3a/L3b、灰度升级与回滚（此前首客户阶段用 ssh+脚本过渡） |
+| P0 地基拆分 | 仓库拆「节点包」（LiveKit+sidecars+workers+node-agent）与「云 CP」；CP 搬 Supabase Postgres；turns 新 schema 落地；节点注册/心跳最小版；CUDA 原型节点打样 + 延迟/负载基线（并行线）；手工部署脚本草版（ps1/install.sh） |
+| P1 身份与两级管理员 | orgs/users/roles/JWT、web 登录、token 流按 org 路由、super_admin 最小控制台、org_admin（老板）视图；**错误上报 v1**（模板+fingerprint 聚合+最简看板+浏览器 beacon——部署在客户机房，远程排障是首客户前必备） |
+| P2 分析地基与发行管线 | 老板看板（通话量/卡点/QA 命中/坐席对比）+ QA 挖掘接云；**节点发行管线**：Nuitka 编译产物（Windows CUDA + macOS MLX 两档）+ 签名 + `install-node.ps1` 一键部署正式化（在线脚本+离线包）；`verify_bundle.sh` 加「产物必须为编译产物」门禁 |
+| P3 熔断与升级 | L1 心跳/license、L2 停用、L3a/L3b、**`teardown-org` 一键删除完整版**（dry-run 清单/离线指令排队/删除回执单）、灰度升级与回滚（此前首客户阶段用 ssh+脚本过渡） |
 | P4 多租户硬化（首客户后） | Postgres RLS、配额、计费 |
 
-## 11. 风险清单
+## 11. 运维工具链与交付加固（2026-09-10 追加拍板）
+
+### 11.1 一键删除 `teardown-org`
+
+工具脚本与管理台按钮同一套 CP 端点，动作独立幂等、中断可续跑：
+
+1. **dry-run（默认先跑）**：打印将删清单（各表行数统计+将触达节点列表），不动数据。
+2. **L2 停用 + L1 吊销 node_token**：节点立即停摆。
+3. **L3a 签名擦除指令**（nonce 一次性）：指令挂在心跳通道，**节点离线时排队、下次上线即执行并回执**——拔网线逃不掉；控制台显示「已确认擦除 n/m」直至收齐。
+4. **L3b 云端数据清除**：`--grace-days` 宽限期（默认按合同条款）。
+5. **删除回执单**：删除的表/行数统计、节点回执状态、未确认项清单；签发与执行双份审计。
+
+### 11.2 Windows CUDA 一键部署
+
+`install-node.ps1`（在线）+ 离线包（zip+`install.cmd`，runtime+模型全量，企业内网无外网交付硬要求）：
+
+① 环境体检（nvidia-smi 驱动/CUDA/显存/磁盘/端口占用）→ ② 装 runtime + `bok.py download` 模型（幂等续传）→ ③ `--CP <url> --Token <node_token>` 注册节点拉配置 → ④ 注册 Windows 服务（自启+崩溃重启，对应 Mac launchd KeepAlive）→ ⑤ 防火墙内网接口放行 7880/7881/7882+UDP 段 → ⑥ `doctor` 终检出「节点就绪单」。对称配 uninstall。Mac 档复用 `bok.py prod install`（launchd）。
+
+### 11.3 防反编译（面收缩到节点包）
+
+**CP 上云后不分发**，早期「Nuitka 编译 CP」不再需要；交付物只有节点包。保护对象=agent worker 业务逻辑（flow 引擎/prompt 脚手架/罐头与 QA 逻辑）：
+
+- agent worker + node-agent + sidecar 自研部分全部 Nuitka 编译；CI 出 Windows CUDA + macOS MLX 两档产物。
+- **prompt 真源在云端 DB**（运行时 HTTPS 拉取装配），二进制只含脚手架=最小暴露。
+- 上游二进制（llama-server/livekit/ASR 引擎）无可保护。
+- 门禁：`verify_bundle.sh` 校验交付产物为编译产物，明文 Python 不进客户机房。
+- 诚实边界：提高逆向成本非绝对（内存 dump 可取运行时拼装结果）；真正防线是 L1/L2 熔断——盗版二进制会哑火。
+
+### 11.4 错误上报（P1 提前）
+
+远程排障是首客户前必备（P3 升级通道落地前更依赖）。事件模板四段：
+
+```text
+【环境指纹】event_id/ts_node/ts_utc/node_id/org_id/node_version(构建号)/
+  os+版本/GPU+显存/driver/CUDA/引擎版本/uptime_s/当前并发+近1h峰值
+【错误本体】severity(fatal|error|warn)/category(asr|llm|tts|dispatch|livekit|node|cpsync)/
+  error_type/fingerprint(归一化stack sha1,同指纹聚合防刷屏)/message/stack(路径归一)
+【复现钥匙】call_id/room/call_language/template_id/flow_step/
+  事发前操作序列(近10事件)/metrics时间线(事发前120s: PERCEIVED_MS/ASR_MS/
+  LLM_TTFT_MS(cached=N/M)/TTS_FIRST_AUDIO_MS/MINIMAX_BIDI_PERF/partial抑制态/
+  抢跑命中率——直接读现有打点环形缓冲)/日志尾(category过滤,脱敏,近200行)
+【聚合】repeat_count/first_seen/related_event_ids
+```
+
+- 端点 `/api/telemetry/errors`（node_token 认证，批量）；坐席浏览器 JS 错误走 beacon（无浏览器侧报错则「挂断不结算」类 bug 无法复现）。
+- 看板按 fingerprint 聚合、按 org/node/version 切；super_admin 全局、org_admin 本 org。
+- **铁律：上报永不阻塞通话链路**——异步队列、失败静默重试有上限、队列满丢弃保通话。
+
+## 12. 风险清单
 
 1. **CUDA 延迟重校不过关** → Mac Studio 备选档兜底，P0 原型先行验证。
 2. **云 CP 单点**：CP 挂=不能登录/建通话/看板，在途通话媒体面不受影响 → CP 多实例 + 托管 Postgres 高可用。
 3. **站点网络**：远程坐席需公网媒体端口/TURN；办公室场景零要求——部署前勘察。
-4. **版本碎片**：升级通道 P3 前用 ssh+脚本，明确为临时态。
+4. **版本碎片**：升级通道 P3 前用 ssh+脚本，明确为临时态；一键部署/升级正式化后节点版本可观测（心跳带 node_version）。
 5. **安全**：节点通信全 TLS + node_token；L3 指令一次性 nonce 防重放；super_admin 全操作审计。
+6. **离线交付**：首客户机房可能无外网，离线包须在干净 Windows 机器上预演安装（含模型全量与驱动缺失的失败路径文案）。
 
-## 12. 明确不做（YAGNI）
+## 13. 明确不做（YAGNI）
 
 - 坐席桌面客户端分发（浏览器已覆盖；Tauri 壳保留给 B 线同传与开发形态）。
 - 声纹/diarization 模型（结构性说话人标签已权威）。
