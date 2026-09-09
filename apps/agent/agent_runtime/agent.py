@@ -1684,16 +1684,39 @@ async def entrypoint(ctx):
                 # 行格式统一在 _format_llm_metrics（含 cached=prompt_cached/prompt,
                 # KV-cache 命中可视），单测直接喂鸭型 metrics 断言。
                 print(f"{tag}{_format_llm_metrics(m)}", flush=True)
+                _maybe_print_perceived(tag)
             elif kind == "tts_metrics":
+                _turn_metrics["tts_ttfb_ms"] = int(m.ttfb * 1000)
                 print(f"{tag}AGENT_METRICS tts ttfb={m.ttfb * 1000:.0f}ms audio={m.audio_duration:.2f}s", flush=True)
+                _maybe_print_perceived(tag)
             elif kind == "eou_metrics":
+                _turn_metrics["eou_ms"] = int(m.end_of_utterance_delay * 1000)
                 print(
                     f"{tag}AGENT_METRICS eou delay={m.end_of_utterance_delay * 1000:.0f}ms "
                     f"transcription={m.transcription_delay * 1000:.0f}ms",
                     flush=True,
                 )
+                _maybe_print_perceived(tag)
         except Exception:
             pass
+
+    def _maybe_print_perceived(tag: str) -> None:
+        """北极星指标（2026-09-09）:用户讲完→AI 出声 = 端点判定+LLM 首字+TTS 首包。
+
+        事件到达顺序不固定（tts_metrics 常先于 llm_metrics——LLM 流关闭在语音
+        合成完之后），所以三段各自入账、到齐即打（旁路轮:QA 快路/垫话/脚本直念
+        冇全三段,唔计,防残值串轮）。优化前后直接 grep PERCEIVED_MS 睇分布。
+        """
+        if {"eou_ms", "llm_ttft_ms", "tts_ttfb_ms"} <= _turn_metrics.keys():
+            _eou_ms = _turn_metrics.pop("eou_ms")
+            _llm_ms = _turn_metrics.pop("llm_ttft_ms")
+            _tts_ms = _turn_metrics.pop("tts_ttfb_ms")
+            _turn_metrics.clear()
+            print(
+                f"{tag}PERCEIVED_MS total={_eou_ms + _llm_ms + _tts_ms} "
+                f"(eou={_eou_ms} llm={_llm_ms} tts={_tts_ms})",
+                flush=True,
+            )
 
     session.on("metrics_collected", _on_metrics)
 
