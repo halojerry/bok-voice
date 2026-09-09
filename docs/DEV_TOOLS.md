@@ -113,3 +113,13 @@ python tools/bok.py prod status    # 官方健康面汇总(server GET / + worker
 ```
 
 开发期仍用 `python tools/bok.py serve`（前台 + run/*.pid）。
+
+## 7. 前端组件（shadcn / @agents-ui）
+
+- `apps/web` 已初始化 shadcn（`components.json`，registry 用 LiveKit 官方 `@agents-ui`）。
+- **勿重跑 `npx shadcn@latest init`**——它会在 `app/globals.css` 追加一块**无 layer** 的
+  浅色 `:root`（外加字体映射）。unlayered 声明压过一切 layer，会把全站打回浅色，
+  破坏现有层序设计：本站 app token 在 `@layer utilities`、shadcn 调色板在
+  `@layer base`（`globals.css` 「勿移出 layer」注释段只防拆改、防不了 init 重跑重注入）。
+- 装/更新单个组件用 `npx shadcn@latest add <component>`——安全，CLI 覆盖本地改动前会先询问。
+- 若误跑过 init：删掉追加进 `globals.css` 的无 layer `:root`/字体块即可恢复（对照 git diff）。
