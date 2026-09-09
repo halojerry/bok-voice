@@ -23,6 +23,8 @@
 | 4 | 生产硬件 | 接受 CUDA；Mac Studio 为备选档 |
 | 5 | 部署主体 | 控制面云端 + 推理可分位；最终收敛为「GPU 本地 + 云端轻面板」薄节点变体 |
 | 6 | 远程删除权限 | **仅 super_admin 独占**，目的=防客户不续费；org 侧零删除权限 |
+| 7 | 通话通道 | 纯 WebRTC（客户点链接/坐席代拨）；SIP 官方栈列二期预留（8kHz ASR 重验为前置门） |
+| 8 | 站点 TLS 策略 | 纯内网 + 节点本地 HTTP 托管坐席 UI（B 线双端也在本地）；远程需求出现才升级域名+证书档 |
 
 ## 3. 总体拓扑
 
@@ -49,11 +51,11 @@
 └─────────────────────────────────────────────────┘
 ```
 
-三条流量线各走各的：
+三条流量线各走各的（另加第 0 条：**坐席 UI 静态资源=节点本地 HTTP 托管**，见 §8 TLS 策略）：
 
 1. **坐席业务操作**（登录/对象/建通话/看板）→ 云 CP。
 2. **语音媒体**（WebRTC）→ 客户机房 LiveKit——坐席与节点同办公室时全程内网，**现有 PERCEIVED_MS p50=1.82s 的延迟底盘原样保留**。
-3. **节点回传**：仅出站 HTTPS（turns/审计写云库、心跳、轮询指令）。云端永不反向连入节点——天然穿 NAT，节点侧无需入站白名单。
+3. **节点回传**：仅出站 HTTPS（turns/审计写云库、心跳、轮询指令）。云端永不反向连入节点——天然穿 NAT，节点侧无需入站白名单（官方确认：agent server 注册接 job 不需要任何入站端口）。
 
 **架构红利（为什么工作量比想象小）**：
 
@@ -109,7 +111,8 @@
 1. **身份**：账号/角色/JWT（§7）。
 2. **业务数据**：对象/话术/知识库/通话/turns/审计（现 CP 的表搬 Supabase Postgres，SQLite 停用）。
 3. **编排**：节点注册表/心跳/license/L1-L3 指令通道/版本清单。
-4. **静态 web UI** 托管。
+4. **静态 web UI** 托管（管理台；坐席工作台由节点本地托管，见 §8）。
+5. **备份与告警**：Supabase PITR + 定期逻辑备份；节点离线/错误激增告警（首版=看板红点+错误上报聚合视图，邮件/IM 通知通道二期）。
 
 不碰音频、不做推理、不缓存媒体。100-200 坐席的 API 写入量对托管 Postgres 是零压力，一台小容器足够。
 
@@ -132,7 +135,7 @@
 ### 6.2 知识库与录音
 
 - **知识库上云**：vault markdown → Supabase Storage + Postgres 检索索引列；知识蒸馏在云端 settle 时跑。节点擦除（L3a）**不伤知识库**（属 org 云资产）。
-- **录音**：留 `call_recordings` 开关位（节点上传 Supabase Storage），**默认关**——存储成本与隐私面大，等分析优化确需回听再开。
+- **录音**：留 `call_recordings` 开关位，**默认关**——存储成本与隐私面大，等分析优化确需回听再开。**依赖注明**：录音走官方自托管 **egress 独立服务**（S3 兼容存储；RoomComposite 需 headless Chrome 很重，**音频轨 egress 轻**——录音需求启用时优先 track/audio egress；旧 `StartRoomCompositeEgress` API 已废弃，用 `StartEgress` TemplateSource）。开关打开=节点多跑一个 egress runner 服务。
 
 ### 6.3 分析消费面（P2）
 
@@ -153,15 +156,25 @@
 
 登录 → CP 发用户 JWT → `POST /api/calls` → CP 查该 org 绑定节点 → `/api/token` 返回 `{serverUrl: 客户机房 LiveKit, participantToken}`。**与现有官方 TokenSource 契约完全一致**，唯一变化是 `serverUrl` 从 `ws://127.0.0.1:7880` 变为站点地址。坐席硬件 = 普通办公 PC + 耳机 + 浏览器，零安装、零 GPU 要求。
 
-网络两路（写进部署要求，不在代码里解决）：
+### TLS/证书策略（拍板：纯内网 + 节点本地托管 UI）
 
-- **办公室场景（首客户默认）**：媒体走内网，站点零公网暴露。
-- **远程/居家坐席**：站点 LiveKit 需公网可达（UDP 端口段转发或 TURN-over-TLS 443）。
-- **B 线注意**：同传天然是两个不同地点的人（me/other 双端常有一端远程）——「站点公网可达/TURN」对 B 线是常态需求，不是可选项；远程部署勘察时按 B 线场景核实。
+云端 HTTPS 页面连 `ws://` 会被浏览器 mixed-content 拦死，且官方明确 TURN/TLS 必须**受信 CA 证书（self-signed 不行）**、TURN 还需单独域名+证书。拍板走**纯内网路线**（首客户与 B 线双端都在本地）：
+
+- **坐席 UI 由节点本地 HTTP 托管**（`http://<节点内网地址>:<port>`）——`http://` 页面连 `ws://` LiveKit 合法，零证书、零公网暴露。node-agent 注入运行时配置（`cpUrl`/`livekitUrl`），同一份 Next.js 静态导出两处托管：**云端=管理台（super_admin/org_admin，HTTPS）**，**节点=坐席工作台（A 线 CallStudio + B 线 interpret）**。
+- 云 CP 开 CORS（坐席 UI origin 在节点、API 在云端，跨源）。
+- **预留升级档**：一旦出现远程/居家坐席或 B 线跨地域端点，该站点升级为「公网域名 + Let's Encrypt 两张证书（主域 + TURN 域）」+ TURN-over-TLS 443（官方部署清单：443/80/7881/3478 UDP/50000-60000 UDP）。部署勘察时逐站点确认。
+
+### 通话通道（拍板：纯 WebRTC，SIP 二期预留）
+
+首客户客户侧=WebRTC 进房（点链接/坐席代拨），规格现状不变。**SIP 列二期预留**（客户要打真手机/固话时启用）：LiveKit 官方自托管 SIP 栈入口=SIP server 自托管（5060 信令 + RTP 10000-20000、`use_external_ip`）+ trunk 供应商（Twilio/Telnyx/Plivo 等）+ 外呼 `CreateSIPParticipant` + 入呼 dispatch rules + 答录机检测 AMD + 电话专用 Krisp 降噪 `BVCTelephony`。**启用前重验项=8kHz 窄带音频 vs 整条 16kHz ASR 栈**（句级提交/热词/数字保护全部要重新过测试）。
 
 ## 9. GPU 容量与栈
 
 - 峰值 20-60 路：CUDA 上 4B 模型连续批处理，**1 张 48GB 卡扛 LLM 60 路**；ASR（qwen-asr CUDA）单独计容量。推荐节点配置 1-2 张卡；不够加节点，LiveKit dispatch 自动分流。B 线 MT 模型（Hy-MT2 小模型）与主 LLM 同卡共存、用量小，缺省自动跳过。
+- **分流按官方参数落地**：worker `load_fnc` 默认是 5s CPU 均值（阈值 0.7）——GPU 场景必须自定义为**GPU 利用率**（`AgentServer(load_threshold=…)` + `server.load_fnc=…`），否则 GPU 打满 CPU 空闲时 dispatch 照样塞 job。LiveKit server 内建 load-aware round-robin + 单一派发原则。
+- **多节点边界**：每站点**恰一个** LiveKit server、N 个 worker 注册（官方：standalone 零外部依赖；同站点起第二个 LiveKit 才需要 Redis——防误扩）。
+- **升级 drain 语义官方现成**：SIGTERM → 拒接新 job、在途跑完（Python 生产模式 drain 默认 3600s）——P3 灰度升级直接复用；prewarm 走 `server.setup_fnc`。
+- **指标白捡**：LiveKit server/egress 均支持 `prometheus_port` 暴露 `livekit_*` 指标——node-agent 心跳顺手抓，作节点健康与错误上报的数据源。
 - Mac Studio 备选档：4-8 路/台 → 3-8 台；胜在全部调优已实证，零延迟重校成本。
 - **大技术风险 = CUDA 延迟重校**：PERCEIVED_MS 基线是 Mac 实测；CUDA 侧 prefix cache 行为、ASR 速度、8bit 量化决策全部重验。对策：P0 即打 CUDA 原型节点，跑 `scripts/load_audio_concurrency.py` + `scripts/measure_latency.py` 出基线；**过不了门禁则首客户改用 Mac Studio 档**。给客户承诺的数字以实测为准。
 - MiniMax TTS：节点 api_key 由 CP 引导下发（加密存本地、可吊销，与 L1/L2 联动）。
@@ -198,7 +211,8 @@
 
 **CP 上云后不分发**，早期「Nuitka 编译 CP」不再需要；交付物只有节点包。保护对象=agent worker 业务逻辑（flow 引擎/prompt 脚手架/罐头与 QA 逻辑）：
 
-- agent worker + node-agent + sidecar 自研部分全部 Nuitka 编译；CI 出 Windows CUDA + macOS MLX 两档产物。
+- agent worker + node-agent + sidecar 自研部分全部 Nuitka 编译；CI 出 Windows CUDA + macOS MLX 两档产物。**Nuitka 不支持交叉编译——Windows 产物必须在 Windows CI runner 构建**（GitHub Actions windows-latest），构建矩阵两档并行。
+- **模型权重分发渠道**：升级通道只覆盖代码；GB 级模型权重走离线包内置（首版）或云端 CDN 按需下载（客户带宽允许时），安装脚本两路都支持。
 - **prompt 真源在云端 DB**（运行时 HTTPS 拉取装配），二进制只含脚手架=最小暴露。**逐轮响应零影响**：prompt 是每通一次装配（建通话拿 token 的同一班车，增量仅一次 HTTPS 往返中多几 KB，落在接通准备上），逐轮生成靠 KV-cache 已有前缀、字节整通冻结（尾部冻结重放前提不变）；可选节点按 `(org, template_id, revision)` 缓存模板，未改版不重复拉。云端真源的收益=改话术全局下一通生效。
 - 上游二进制（llama-server/livekit/ASR 引擎）无可保护。
 - 门禁：`verify_bundle.sh` 校验交付产物为编译产物，明文 Python 不进客户机房。
@@ -228,7 +242,7 @@
 
 1. **CUDA 延迟重校不过关** → Mac Studio 备选档兜底，P0 原型先行验证。
 2. **云 CP 单点**：CP 挂=不能登录/建通话/看板，在途通话媒体面不受影响 → CP 多实例 + 托管 Postgres 高可用。
-3. **站点网络**：远程坐席需公网媒体端口/TURN；办公室场景零要求——部署前勘察。
+3. **站点网络**：拍板纯内网+节点本地托管 UI，零证书零公网；**远程坐席/B 线跨地域端点出现时**该站点须升级「公网域名+受信证书+TURN」档——部署前勘察确认无隐藏远程需求。
 4. **版本碎片**：升级通道 P3 前用 ssh+脚本，明确为临时态；一键部署/升级正式化后节点版本可观测（心跳带 node_version）。
 5. **安全**：节点通信全 TLS + node_token；L3 指令一次性 nonce 防重放；super_admin 全操作审计。
 6. **离线交付**：首客户机房可能无外网，离线包须在干净 Windows 机器上预演安装（含模型全量与驱动缺失的失败路径文案）。
