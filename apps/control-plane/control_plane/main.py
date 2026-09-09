@@ -1506,6 +1506,8 @@ async def ingest_session_report(call_id: str, request: Request) -> dict:
 # 重派防复活门:终态通话(或记录已删)不得重派——为死通话新建的 dispatch 无
 # 回收路径(reaper 只扫 ACTIVE/PAUSED),agent 会被带进空房念开场白。
 _TERMINAL_CALL_STATUSES = (CallStatus.ENDED.value, CallStatus.FAILED.value)
+# 防重 skip 后的复查延时(秒):等 livekit 把死 worker 的 job 判 FAILED。测试可注入调短。
+_REDISPATCH_RECHECK_DELAY = 20.0
 # per-room 重派锁:串行化「has_active_dispatch 检查 + create_dispatch」临界区,
 # 收口 TOCTOU(后进锁者复查时见到先进锁者新建的 dispatch → 跳过,并发双 create
 # 坍缩为一次)。锁图按房间单调增长:每通话房间一个小锁对象,CP 单进程 4-6 路并发
@@ -1571,16 +1573,46 @@ async def livekit_webhook(request: Request) -> dict:
         client = _lkapi_client()
         if client is None:
             return
-        try:
+
+        async def _create_if_idle(lk) -> bool:
+            """防重检查+创建(同锁收口)。True=已补派。"""
             async with _redispatch_locks[room_name]:
-                if await has_active_dispatch(client, room_name):
-                    control_log.info(
-                        "redispatch_skip_active_dispatch",
-                        extra={"event": "dispatch.redispatch.skip", "data": {"room": room_name, "event": event}},
-                    )
-                    return
-                await client.agent_dispatch.create_dispatch(room=room_name, agent_name="bok-voice")
-            _audit("agent.redispatch", subject_type="call", subject_id=room_name, detail={"agent_name": "bok-voice", "event": event})
+                if await has_active_dispatch(lk, room_name):
+                    return False
+                await lk.agent_dispatch.create_dispatch(room=room_name, agent_name="bok-voice")
+                return True
+
+        try:
+            if await _create_if_idle(client):
+                _audit("agent.redispatch", subject_type="call", subject_id=room_name, detail={"agent_name": "bok-voice", "event": event})
+            else:
+                control_log.info(
+                    "redispatch_skip_active_dispatch",
+                    extra={"event": "dispatch.redispatch.skip", "data": {"room": room_name, "event": event}},
+                )
+                # Worker 被强杀时其 job 在 livekit 侧要等断连判定才转 FAILED;
+                # participant_left 一刻 dispatch 常仍显示 RUNNING——立即跳过会
+                # 漏掉真崩溃(2026-09-10 kill-recover 演练实证:skip 后 agent 永不
+                # 回房)。20s 后复查一次:通话仍非终态且 dispatch 已消失(=真崩溃)
+                # 才补派;participant_left 连发的真叠加场景复查依旧跳过,语义不变。
+                async def _recheck() -> None:
+                    await asyncio.sleep(_REDISPATCH_RECHECK_DELAY)
+                    re = _lkapi_client()
+                    if re is None:
+                        return
+                    try:
+                        call = _repo().get_call(room_name) or {}
+                        if not call or str(call.get("status") or "") in _TERMINAL_CALL_STATUSES:
+                            return
+                        if await _create_if_idle(re):
+                            _audit("agent.redispatch", subject_type="call", subject_id=room_name, detail={"agent_name": "bok-voice", "event": "recheck"})
+                            print(f"[webhook] redispatch created on recheck (call {room_name})", flush=True)
+                    except Exception as exc:  # pragma: no cover
+                        print(f"[webhook] redispatch recheck failed: {exc!r} (call {room_name})", flush=True)
+                    finally:
+                        await re.aclose()
+
+                asyncio.create_task(_recheck())
         except Exception as exc:  # pragma: no cover - 重派失败不致命(launchd 兜底拉起 worker)
             print(f"[webhook] redispatch failed: {exc!r}", flush=True)
         finally:
