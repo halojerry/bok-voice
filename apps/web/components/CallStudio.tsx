@@ -79,7 +79,7 @@ function LiveAgentPanel({ room }: { room: Room | null }) {
           对话记录始终可见,多轮后在该区域内滚,不把页面顶走。 */}
       <div ref={listRef} className="flex min-h-[280px] flex-1 flex-col gap-2 overflow-y-auto px-1 py-2">
         {recent.length === 0 && (
-          <div className="flex flex-1 items-center justify-center font-mono text-[10px] font-bold uppercase tracking-[0.16em] text-[var(--stage-muted)]">
+          <div className="flex flex-1 items-center justify-center font-mono text-[10px] font-bold uppercase tracking-[0.16em] text-(--stage-muted)">
             等待对话…
           </div>
         )}
@@ -93,8 +93,8 @@ function LiveAgentPanel({ room }: { room: Room | null }) {
               <div
                 className={`max-w-[80%] rounded-lg px-3 py-2 font-mono text-[11px] leading-relaxed ${
                   isAgent
-                    ? "bg-[var(--accent)] text-[var(--accent-ink)]"
-                    : "bg-white/10 text-[var(--foreground)]"
+                    ? "bg-(--accent) text-(--accent-ink)"
+                    : "bg-white/10 text-(--foreground)"
                 }`}
               >
                 <span className="mr-1.5 font-bold uppercase">{isAgent ? "AGENT" : "YOU"}</span>
@@ -105,8 +105,8 @@ function LiveAgentPanel({ room }: { room: Room | null }) {
           );
         })}
         {speaking && recent.length > 0 && (
-          <div className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.14em] text-[var(--stage-value)]">
-            <span className="h-1.5 w-1.5 rounded-full bg-[var(--stage-value)] animate-pulse" />
+          <div className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.14em] text-(--stage-value)">
+            <span className="h-1.5 w-1.5 rounded-full bg-(--stage-value) animate-pulse" />
             AI 说话中
           </div>
         )}
@@ -135,16 +135,16 @@ function LiveAgentPanel({ room }: { room: Room | null }) {
 
       {/* 实时分析（基于本通转写实时统计） */}
       {liveStats && (
-        <div className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-1 border-t border-[var(--card-border)] px-2 py-1.5 text-[10px] text-[var(--muted)]">
-          <span>轮次 <b className="text-[var(--foreground)]">{liveStats.turnCount}</b></span>
-          <span>均每轮字数 <b className="text-[var(--foreground)]">{liveStats.density}</b></span>
-          <span>填充词 <b className="text-[var(--foreground)]">{liveStats.fillers}</b></span>
-          <span>犹豫词 <b className="text-[var(--foreground)]">{liveStats.hedges}</b></span>
+        <div className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-1 border-t border-(--card-border) px-2 py-1.5 text-[10px] muted">
+          <span>轮次 <b className="text-(--foreground)">{liveStats.turnCount}</b></span>
+          <span>均每轮字数 <b className="text-(--foreground)">{liveStats.density}</b></span>
+          <span>填充词 <b className="text-(--foreground)">{liveStats.fillers}</b></span>
+          <span>犹豫词 <b className="text-(--foreground)">{liveStats.hedges}</b></span>
         </div>
       )}
 
       {/* 控制条（AgentSessionProvider 已内置音频渲染）；设备切换已移到右侧「音频设备」卡片 */}
-      <div className="flex shrink-0 flex-col items-center gap-2 border-t border-[var(--card-border)] py-2">
+      <div className="flex shrink-0 flex-col items-center gap-2 border-t border-(--card-border) py-2">
         <div className="flex items-center justify-center gap-3">
           <StartAudio label="点击开启声音" />
           <VoiceAssistantControlBar />
@@ -250,13 +250,13 @@ function MicLevelMeter({ room }: { room: Room | null }) {
   return (
     <div className="mt-2">
       <div className="flex items-center justify-between">
-        <span className="text-[10px] text-[var(--muted)]">麦克风输入波形</span>
-        <span className={`text-[10px] ${active ? "text-emerald-400" : "text-[var(--muted)]"}`}>
+        <span className="text-[10px] muted">麦克风输入波形</span>
+        <span className={`text-[10px] ${active ? "text-emerald-400" : "muted"}`}>
           {active ? `● 采集中 ${level > 3 ? `音量 ${level}` : "(静音)"}` : error ? "无法分析" : "未采集"}
         </span>
       </div>
-      <canvas ref={canvasRef} width={260} height={40} className="mt-1 w-full rounded bg-black/20" />
-      {trackInfo && <p className="mt-0.5 truncate text-[9px] text-[var(--muted)]" title={trackInfo}>{trackInfo}</p>}
+      <canvas ref={canvasRef} width={260} height={40} className="mt-1 w-full rounded-sm bg-black/20" />
+      {trackInfo && <p className="mt-0.5 truncate text-[9px] muted" title={trackInfo}>{trackInfo}</p>}
       {error && <p className="mt-1 text-[10px] text-red-300">{error}</p>}
     </div>
   );
@@ -317,10 +317,10 @@ function AudioDevicesCard({ room }: { room: Room | null }) {
       <span className="label mb-2 block">音频设备</span>
       <div className="space-y-2 text-xs">
         <div className="flex items-center justify-between gap-2">
-          <span className="text-[var(--muted)]">麦克风</span>
+          <span className="muted">麦克风</span>
           <div className="flex min-w-0 items-center gap-1">
             <select
-              className="max-w-[150px] rounded-lg border border-[var(--card-border)] bg-transparent px-2 py-1 text-xs outline-none focus:border-[var(--accent)]"
+              className="max-w-[150px] rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--accent)"
               value={micId}
               onChange={(e) => {
                 const id = e.target.value;
@@ -339,7 +339,7 @@ function AudioDevicesCard({ room }: { room: Room | null }) {
               ))}
             </select>
             <button
-              className="rounded-lg border border-[var(--card-border)] px-2 py-1 opacity-70 hover:opacity-100"
+              className="rounded-lg border border-(--card-border) px-2 py-1 opacity-70 hover:opacity-100"
               onClick={async () => {
                 const ok = await requestMicPermission();
                 setMicNote(ok ? "" : "麦克风权限被拒绝。请在 系统设置 › 隐私与安全性 › 麦克风 中允许本应用。");
@@ -352,10 +352,10 @@ function AudioDevicesCard({ room }: { room: Room | null }) {
         </div>
         {micDevices.length === 0 && micNote && <p className="text-red-300">{micNote}</p>}
         <div className="flex items-center justify-between gap-2">
-          <span className="text-[var(--muted)]">扬声器</span>
+          <span className="muted">扬声器</span>
           {outputCanSwitch ? (
             <select
-              className="max-w-[150px] rounded-lg border border-[var(--card-border)] bg-transparent px-2 py-1 text-xs outline-none focus:border-[var(--accent)]"
+              className="max-w-[150px] rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--accent)"
               value={outId}
               onChange={(e) => { void changeOutput(e.target.value); }}
             >
@@ -368,7 +368,7 @@ function AudioDevicesCard({ room }: { room: Room | null }) {
             <span className="opacity-70">跟随系统默认</span>
           )}
         </div>
-        {!room && <p className="text-[var(--muted)]">接通后可用</p>}
+        {!room && <p className="muted">接通后可用</p>}
         <MicLevelMeter room={room} />
       </div>
     </div>
@@ -381,8 +381,8 @@ function IdleStage() {
     <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
       <VoiceAgentInterface state="connecting" size="md" />
       <p className="stage-value stage-glow mt-2">Live Agent</p>
-      <p className="text-sm text-[var(--foreground)]">点击「接通」开始与 AI 助手对话</p>
-      <p className="text-xs text-[var(--muted)]">浏览器将请求麦克风权限</p>
+      <p className="text-sm text-(--foreground)">点击「接通」开始与 AI 助手对话</p>
+      <p className="text-xs muted">浏览器将请求麦克风权限</p>
     </div>
   );
 }
@@ -769,7 +769,7 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
         {!stateCallId && (
           <>
             <input
-              className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-2 py-1 text-xs outline-none focus:border-[var(--accent)]"
+              className="w-full rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--accent)"
               placeholder={`输入名称过滤对象（共 ${objects.length} 个，最多显示 50）`}
               value={objFilter}
               onChange={(e) => setObjFilter(e.target.value)}
@@ -810,23 +810,23 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
 
         <h2 className="text-lg font-semibold">{object ? str(object.display_name) : "未选择对象"}</h2>
         {object && (
-          <p className="text-xs text-[var(--muted)]">
+          <p className="text-xs muted">
             {str(object.role_template)} / {str(object.language)} {object.phone ? `· ${str(object.phone)}` : ""}
           </p>
         )}
         {object?.background && (
-          <p className="rounded-lg bg-white/5 p-3 text-sm text-[var(--muted)]">{String(object.background)}</p>
+          <p className="rounded-lg bg-white/5 p-3 text-sm muted">{String(object.background)}</p>
         )}
 
         <div className="rounded-lg bg-white/5 p-3 text-sm">
           <span className="label mb-1 block">历史主题</span>
           {objectTopics.length === 0 ? (
-            <p className="text-[var(--muted)]">暂无（挂断结算后自动沉淀）</p>
+            <p className="muted">暂无（挂断结算后自动沉淀）</p>
           ) : (
             <ul className="space-y-1.5">
               {objectTopics.slice(-5).map((t) => (
-                <li key={String(t.id ?? t.topic ?? "")} className="text-[var(--muted)]">
-                  <span className="text-[var(--foreground)]">{str(t.topic)}</span>
+                <li key={String(t.id ?? t.topic ?? "")} className="muted">
+                  <span className="text-(--foreground)">{str(t.topic)}</span>
                   {str(t.summary) ? ` — ${str(t.summary)}` : ""}
                 </li>
               ))}
@@ -838,15 +838,15 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
           {persona ? (
             <>
               <p className="font-medium">{str(persona.name)}</p>
-              <p className="text-[var(--muted)]">
+              <p className="muted">
                 {str(persona.company)} · {str(persona.tone)}
               </p>
             </>
           ) : (
-            <p className="text-[var(--muted)]">默认人设未配置</p>
+            <p className="muted">默认人设未配置</p>
           )}
         </div>
-        <div className="mt-auto rounded-lg border border-dashed border-[var(--card-border)] p-3 text-xs text-[var(--muted)]">
+        <div className="mt-auto rounded-lg border border-dashed border-(--card-border) p-3 text-xs muted">
           对象档案与知识库由当前账号注入，挂断后自动沉淀到该账号。
         </div>
       </section>
@@ -854,7 +854,7 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
       {/* 中：官方 LiveKit 会话台（AgentSessionProvider + 官方可视化） */}
       <section className="card flex min-h-0 flex-col">
         <div className="mb-4 flex items-center justify-between">
-          <div className="text-xs text-[var(--muted)]">
+          <div className="text-xs muted">
             {stateCallId ? `会话 ${stateCallId}` : "新建会话"}
           </div>
           <div className="flex flex-col items-end gap-2">
@@ -862,7 +862,7 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
               {!roomConnected ? (
                 <div className="flex flex-col items-end gap-1">
                   {!stateCallId && objId && (
-                    <p className="text-[10px] text-[var(--muted)]">
+                    <p className="text-[10px] muted">
                       接通后：{str(objects.find((o) => String(o.id) === objId)?.display_name)}{" "}
                       · {str(personas.find((p) => String(p.id) === personaId)?.name ?? "默认人设")}
                     </p>
@@ -905,7 +905,7 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
                     转人工
                   </button>
                 </div>
-                {superviseMsg && <span className="text-[10px] text-[var(--muted)]">{superviseMsg}</span>}
+                {superviseMsg && <span className="text-[10px] muted">{superviseMsg}</span>}
               </div>
             )}
           </div>
@@ -913,31 +913,31 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
 
         {error && <p className="rounded-lg bg-red-500/10 p-3 text-sm text-red-300">{error}</p>}
         {!error && !cp.ready && (
-          <p className="rounded-lg bg-white/5 p-3 text-sm text-[var(--muted)]">
+          <p className="rounded-lg bg-white/5 p-3 text-sm muted">
             本地服务启动中…（Control Plane / ASR / TTS），就绪后会自动加载对象与人设，请稍候。
           </p>
         )}
         {!stateCallId && objects.length === 0 && (
-          <p className="mb-3 rounded-lg bg-white/5 p-3 text-sm text-[var(--muted)]">
+          <p className="mb-3 rounded-lg bg-white/5 p-3 text-sm muted">
             请先在「对象」页建档一个对象，再回到这里接通。
           </p>
         )}
 
         {/* WhatsApp 對接橫幅:客戶俾咗號碼/應承加 → 面板內提示,唔影響 AI 通話 */}
         {(waStatus === "captured" || waStatus === "offered") && (
-          <div className="wa-flash mb-3 rounded-lg border border-[var(--accent)] bg-[var(--card)] p-3">
+          <div className="wa-flash mb-3 rounded-lg border border-(--accent) bg-(--card) p-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="min-w-0">
-                <p className="text-xs font-semibold text-[var(--accent)]">
+                <p className="text-xs font-semibold text-accent">
                   📱 WhatsApp 待对接
-                  <span className="ml-2 rounded bg-[var(--accent)]/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider">
+                  <span className="ml-2 rounded-sm bg-(--accent)/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider">
                     {waStatus === "captured" ? "已拿到号码" : "客户已应承加"}
                   </span>
                 </p>
                 {waStatus === "captured" && waNum ? (
                   <p className="mt-1 font-mono text-lg tracking-wider">{waNum}</p>
                 ) : (
-                  <p className="mt-1 text-xs text-[var(--muted)]">客户应承咗加专员,等紧佢俾号码 / 由专员主动联系。</p>
+                  <p className="mt-1 text-xs muted">客户应承咗加专员,等紧佢俾号码 / 由专员主动联系。</p>
                 )}
               </div>
               <div className="flex shrink-0 gap-2">
@@ -989,7 +989,7 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
           <div className="mt-2 space-y-1 text-sm">
             {PROVIDER_FIELDS.map(([kind, label]) => (
               <p key={kind} className="flex justify-between">
-                <span className="text-[var(--muted)]">{label}</span>
+                <span className="muted">{label}</span>
                 <span className="inline-flex items-center gap-1.5 text-emerald-400">
                   <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
                   已连接
@@ -1004,29 +1004,29 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
           {settlement ? (
             <>
               <p className="flex justify-between">
-                <span className="text-[var(--muted)]">状态</span>
+                <span className="muted">状态</span>
                 <span className="text-emerald-400">{str(settlement.status)}</span>
               </p>
               {str(settlement.summary) && (
-                <p className="mt-2 border-t border-[var(--card-border)] pt-2 text-xs leading-relaxed text-[var(--muted)]">
+                <p className="mt-2 border-t border-(--card-border) pt-2 text-xs leading-relaxed muted">
                   {str(settlement.summary)}
                 </p>
               )}
               {Array.isArray(settlement.new_topics) && settlement.new_topics.length > 0 && (
-                <div className="mt-2 border-t border-[var(--card-border)] pt-2">
+                <div className="mt-2 border-t border-(--card-border) pt-2">
                   <span className="label mb-1 block">本轮新沉淀话题</span>
-                  <ul className="space-y-1 text-xs text-[var(--muted)]">
+                  <ul className="space-y-1 text-xs muted">
                     {(settlement.new_topics as Record<string, unknown>[]).map((t, i) => (
                       <li key={i}>{str(t.topic)}</li>
                     ))}
                   </ul>
                 </div>
               )}
-              <p className="mt-1 break-all text-xs text-[var(--muted)]">通话文档：{str(settlement.transcript_doc_path)}</p>
-              <p className="mt-1 break-all text-xs text-[var(--muted)]">结算文档：{str(settlement.settlement_doc_path)}</p>
+              <p className="mt-1 break-all text-xs muted">通话文档：{str(settlement.transcript_doc_path)}</p>
+              <p className="mt-1 break-all text-xs muted">结算文档：{str(settlement.settlement_doc_path)}</p>
             </>
           ) : (
-            <p className="text-xs text-[var(--muted)]">挂断后自动沉淀：通话文档 / 对象主题 / 全局洞察 / 成本。</p>
+            <p className="text-xs muted">挂断后自动沉淀：通话文档 / 对象主题 / 全局洞察 / 成本。</p>
           )}
         </div>
       </section>

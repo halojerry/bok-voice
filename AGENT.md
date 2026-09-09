@@ -137,7 +137,7 @@
 - ✅ 全站统一 LiveKit 主题（近黑+亮青+灰 mono；StageHeader 顶栏无侧边栏）
 - ✅ 主页舞台（遥测 MODEL 子行缩进、转写 AGENT 青/YOU 近白发光）
 - ✅ 主管台活跃通话「挂断」按钮（POST /api/calls/{id}/hangup）
-- ✅ 官方组件接入（Phase 1）：复制 `components/agents-ui/`（session-provider / react-shader-toy / agent-audio-visualizer-aura / agent-audio-visualizer-grid + hooks）；依赖 cva/clsx/tailwind-merge/motion/chroma-js；`lib/utils.ts`(cn)；grid 的 `bg-current/10`（v4 语法）已改用 `.lk-grid-cell-base`（globals.css）。
+- ✅ 官方组件接入（Phase 1）：复制 `components/agents-ui/`（session-provider / react-shader-toy / agent-audio-visualizer-aura / agent-audio-visualizer-grid + hooks）；依赖 cva/clsx/tailwind-merge/motion/chroma-js；`lib/utils.ts`(cn)；grid 的 `bg-current/10`（v4 语法）曾降配为 `.lk-grid-cell-base`（globals.css），Tailwind 4 迁移已删该降配类、恢复官方写法。
 - ✅ 会话流官方化（Phase 2）：CallStudio 用 `TokenSource.custom`（createCall→token→`{serverUrl,participantToken}` 映射）+ `useSession` + `AgentSessionProvider` + `session.start()/end()`；保留 hangup→settle 业务流；浏览器 E2E `BROWSER_E2E_PASSED`。
 - ✅ 可视化官方化（Phase 3）：官方 `AgentAudioVisualizerGrid`（点阵，官方 agents 页同款）替换自绘 canvas；`VoiceAgentInterface`（grid + mood 颜色）+ `hooks/use-mood-color.ts`（官方 11 色映射 + motion/chroma 平滑过渡）；主页麦克风用 `LocalAudioTrack` 喂官方多频段音量；已删除 `DotVisualizer.tsx`。
 - ✅ 后端 mood 链路（Phase 4，Path B）：`agent.py` 的 instructions 追加「每句开头吐 `<expr type="expression" label="英文mood"/>`」规则；`AgentSession(tts_text_transforms=[...])` 追加 `_strip_expr_markup` 从 TTS 路径剥标签（转录路径框架自动发布 `lk.expression`）；`plugins/emotion.py` 扩成官方 11 类英文 mood（中文关键词→英文 label，normalize 兜底）；`SherpaSenseVoiceSTT` 不再一刀切洗掉 `<|HAPPY|>` 情绪标签（记录到 `last_emotion`，显示文本仍干净）。

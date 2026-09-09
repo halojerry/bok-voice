@@ -40,7 +40,7 @@ function FieldInput({
   onChange: (v: unknown) => void;
 }) {
   const base =
-    "w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]";
+    "w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)";
   if (field.type === "select") {
     const options = field.options ?? [];
     const isBool = options.some((o) => o.value === "true" || o.value === "false");
@@ -96,11 +96,11 @@ function ProviderCard({
   return (
     <section className="card">
       <span className="label">{meta.title}</span>
-      <p className="mt-1 text-xs text-[var(--muted)]">{meta.desc}</p>
+      <p className="mt-1 text-xs muted">{meta.desc}</p>
       <div className="mt-3 space-y-2">
         <div>
           <select
-            className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+            className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
             value={provider}
             onChange={(e) => onChange({ ...value, provider: e.target.value })}
           >
@@ -110,34 +110,34 @@ function ProviderCard({
               </option>
             ))}
           </select>
-          {providerMeta?.hint && <p className="mt-1 text-xs text-[var(--muted)]">{providerMeta.hint}</p>}
+          {providerMeta?.hint && <p className="mt-1 text-xs muted">{providerMeta.hint}</p>}
         </div>
         {kind === "llm" && (provider === "local_openai" || provider === "mlx") && value.local_model ? (
-          <p className="rounded-lg bg-white/5 p-2 text-[11px] text-[var(--muted)]">
-            本地模型切换需<b className="text-[var(--foreground)]">重启本地服务</b>生效（`bok serve` 或点「本机桌面服务」重启）；重启后通话与蒸馏都用所选模型。
+          <p className="rounded-lg bg-white/5 p-2 text-[11px] muted">
+            本地模型切换需<b className="text-(--foreground)">重启本地服务</b>生效（`bok serve` 或点「本机桌面服务」重启）；重启后通话与蒸馏都用所选模型。
           </p>
         ) : null}
         {meta.fields.filter((f) => !f.advanced && (!f.providers || f.providers.includes(provider))).map((field) => (
           <label key={field.key} className="block">
-            <span className="text-xs text-[var(--stage-muted)]">{field.label}</span>
+            <span className="text-xs text-(--stage-muted)">{field.label}</span>
             <FieldInput field={field} value={value[field.key]} onChange={(v) => onChange({ ...value, [field.key]: v })} />
-            {field.hint && <p className="mt-1 text-xs text-[var(--muted)]">{field.hint}</p>}
+            {field.hint && <p className="mt-1 text-xs muted">{field.hint}</p>}
             {field.preview && kind === "tts" && (
               <VoicePreview provider={provider} fieldKey={field.key} voice={String(value[field.key] ?? "")} />
             )}
           </label>
         ))}
         {meta.fields.some((f) => f.advanced) && (
-          <details className="rounded-lg border border-[var(--card-border)] p-2 text-sm">
-            <summary className="cursor-pointer text-xs text-[var(--muted)] hover:text-[var(--accent)]">
+          <details className="rounded-lg border border-(--card-border) p-2 text-sm">
+            <summary className="cursor-pointer text-xs muted hover:text-accent">
               高级（旧按语言分音色，仅兼容旧数据）
             </summary>
             <div className="mt-2 space-y-2">
               {meta.fields.filter((f) => f.advanced && (!f.providers || f.providers.includes(provider))).map((field) => (
                 <label key={field.key} className="block">
-                  <span className="text-xs text-[var(--stage-muted)]">{field.label}</span>
+                  <span className="text-xs text-(--stage-muted)">{field.label}</span>
                   <FieldInput field={field} value={value[field.key]} onChange={(v) => onChange({ ...value, [field.key]: v })} />
-                  {field.hint && <p className="mt-1 text-xs text-[var(--muted)]">{field.hint}</p>}
+                  {field.hint && <p className="mt-1 text-xs muted">{field.hint}</p>}
                   {field.preview && kind === "tts" && (
                     <VoicePreview provider={provider} fieldKey={field.key} voice={String(value[field.key] ?? "")} />
                   )}
@@ -227,17 +227,17 @@ function AudioDevicesCard() {
   return (
     <section className="card">
       <span className="label">音频设备</span>
-      <p className="mt-1 text-xs text-[var(--muted)]">
+      <p className="mt-1 text-xs muted">
         {isTauriShell()
           ? "桌面版扬声器切换的是系统默认输出设备（A 线通话与 B 线同传都会跟随）。"
           : "浏览器模式下仅 Chromium 内核支持切换扬声器输出。"}
       </p>
       <div className="mt-3 space-y-3">
         <div>
-          <span className="text-xs text-[var(--stage-muted)]">麦克风（输入）</span>
+          <span className="text-xs text-(--stage-muted)">麦克风（输入）</span>
           <div className="mt-1 flex gap-2">
             <select
-              className="flex-1 rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+              className="flex-1 rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
               value={micId}
               onChange={(e) => { setMicId(e.target.value); saveMicDevice(e.target.value); }}
             >
@@ -265,10 +265,10 @@ function AudioDevicesCard() {
         </div>
 
         <div>
-          <span className="text-xs text-[var(--stage-muted)]">扬声器 / 输出</span>
+          <span className="text-xs text-(--stage-muted)">扬声器 / 输出</span>
           {canSetOutput ? (
             <select
-              className="mt-1 w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
               value={outId}
               onChange={(e) => {
                 const id = e.target.value;
@@ -283,12 +283,12 @@ function AudioDevicesCard() {
               ))}
             </select>
           ) : (
-            <p className="mt-1 text-xs text-[var(--muted)]">
+            <p className="mt-1 text-xs muted">
               当前浏览器（WebKit）不支持网页切换扬声器。输出跟随系统默认设备，请在系统声音设置中选择。
             </p>
           )}
         </div>
-        {note && <p className="text-xs text-[var(--muted)]">{note}</p>}
+        {note && <p className="text-xs muted">{note}</p>}
       </div>
     </section>
   );
@@ -368,7 +368,7 @@ export default function SettingsPage() {
           <section className="card">
             <span className="label">{POLICY_META.title}</span>
             <select
-              className="mt-3 w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+              className="mt-3 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
               value={policyValue}
               onChange={(e) => setForm({ ...form, policy: e.target.value })}
             >
@@ -376,15 +376,15 @@ export default function SettingsPage() {
                 <option key={o.value} value={o.value}>{o.label}</option>
               ))}
             </select>
-            {policyOption?.hint && <p className="mt-2 text-xs text-[var(--muted)]">{policyOption.hint}</p>}
-            <p className="mt-2 text-xs text-[var(--muted)]">策略与 Provider 会在下一次建立通话时应用到 Agent 会话。</p>
+            {policyOption?.hint && <p className="mt-2 text-xs muted">{policyOption.hint}</p>}
+            <p className="mt-2 text-xs muted">策略与 Provider 会在下一次建立通话时应用到 Agent 会话。</p>
           </section>
           <div className="flex flex-wrap items-end gap-3 lg:col-span-2">
             <button className="btn-primary" onClick={save}>保存设置</button>
             <button className="btn-ghost" onClick={() => testHealth("asr")}>测试 ASR</button>
             <button className="btn-ghost" onClick={() => testHealth("tts")}>测试 TTS</button>
             {ok && <span className="text-sm text-emerald-400">已保存。</span>}
-            {health && <span className="text-sm text-[var(--muted)]">{health}</span>}
+            {health && <span className="text-sm muted">{health}</span>}
           </div>
           {err && <div className="lg:col-span-2"><ErrorState message={err} /></div>}
           <div className="lg:col-span-2">

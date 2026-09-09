@@ -85,7 +85,7 @@ function DashboardContent() {
             <section className="card">
               <div className="flex items-center justify-between">
                 <span className="label">最近会话</span>
-                <Link href="/calls" className="text-xs text-[var(--accent)]">查看全部 →</Link>
+                <Link href="/calls" className="text-xs text-accent">查看全部 →</Link>
               </div>
               <div className="mt-3 space-y-2">
                 {calls.slice(0, 6).map((call) => (
@@ -98,14 +98,14 @@ function DashboardContent() {
                   >
                     <div className="min-w-0">
                       <p className="truncate text-sm font-medium">{String(call.object_id ?? "-")}</p>
-                      <p className="text-xs text-[var(--muted)]">
+                      <p className="text-xs muted">
                         {String(call.status ?? "-")} · {String(call.mode ?? "-")} · {String(call.language ?? "-")}
                       </p>
                     </div>
-                    <span className="text-[var(--accent)]">查看 →</span>
+                    <span className="text-accent">查看 →</span>
                   </Link>
                 ))}
-                {calls.length === 0 && <p className="text-sm text-[var(--muted)]">暂无会话，从「新建通话」开始。</p>}
+                {calls.length === 0 && <p className="text-sm muted">暂无会话，从「新建通话」开始。</p>}
               </div>
             </section>
 
@@ -118,7 +118,7 @@ function DashboardContent() {
                 <Link href="/supervisor" className="btn-ghost w-full">主管台</Link>
                 <Link href="/settings" className="btn-ghost w-full">设置</Link>
               </div>
-              <div className="mt-4 rounded-lg bg-white/5 p-3 text-xs text-[var(--muted)]">
+              <div className="mt-4 rounded-lg bg-white/5 p-3 text-xs muted">
                 控制面状态：{health === false ? "离线" : health === true ? "在线" : "未知"}
               </div>
             </section>

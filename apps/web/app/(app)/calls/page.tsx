@@ -108,7 +108,7 @@ export default function CallsPage() {
         </div>
         <div className="flex items-center gap-2">
           <button
-            className="btn-ghost text-xs text-[var(--muted)]"
+            className="btn-ghost text-xs muted"
             onClick={clearEnded}
             disabled={clearing}
           >
@@ -121,7 +121,7 @@ export default function CallsPage() {
       </div>
 
       {err && <p className="mb-4 text-sm text-red-300">{err}</p>}
-      {loading && <p className="text-sm text-[var(--muted)]">加载中…</p>}
+      {loading && <p className="text-sm muted">加载中…</p>}
 
       {openId && (
         <section className="mb-6">
@@ -139,7 +139,7 @@ export default function CallsPage() {
         <section className="card">
           <div className="space-y-2">
             {!loading && rows.length === 0 && (
-              <p className="text-sm text-[var(--muted)]">暂无会话，点击右上角「新建通话」开始。</p>
+              <p className="text-sm muted">暂无会话，点击右上角「新建通话」开始。</p>
             )}
             {rows.map((c) => {
               const id = String(c.id ?? c.call_id);
@@ -165,16 +165,16 @@ export default function CallsPage() {
                       <p className="truncate font-medium">
                         {objectName(c.object_id)}
                         {waPending && (
-                          <span className="ml-2 rounded bg-[var(--accent)]/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-[var(--accent)]">
+                          <span className="ml-2 rounded-sm bg-(--accent)/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-accent">
                             WhatsApp {wa === "captured" && waNum ? waNum : "待对接"}
                           </span>
                         )}
                       </p>
-                      <p className="mt-1 text-xs text-[var(--muted)]">
+                      <p className="mt-1 text-xs muted">
                         {modeLabel(String(c.mode ?? "simulation"))} · {langLabel(String(c.language ?? ""))} ·{" "}
                         {String(c.created_at ?? "").slice(0, 19).replace("T", " ")}
                       </p>
-                      <p className="mt-1 truncate text-xs text-[var(--muted)]">
+                      <p className="mt-1 truncate text-xs muted">
                         {id}
                         {Number(c.turn_count ?? 0) > 0 && (
                           <span className="ml-2">
@@ -185,11 +185,11 @@ export default function CallsPage() {
                       </p>
                     </div>
                     <div className="flex shrink-0 items-center gap-3">
-                      <span className="inline-flex items-center gap-1.5 text-xs text-[var(--muted)]">
+                      <span className="inline-flex items-center gap-1.5 text-xs muted">
                         <span className={`h-2 w-2 rounded-full ${color}`} />
                         {label}
                       </span>
-                      <span className="text-[var(--accent)]">进入 →</span>
+                      <span className="text-accent">进入 →</span>
                     </div>
                   </button>
                   <button

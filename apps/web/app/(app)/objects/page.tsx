@@ -221,7 +221,7 @@ export default function ObjectsPage() {
         <section className="card">
           <div className="mb-4 flex items-center gap-2">
             <input
-              className="min-w-0 flex-1 rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+              className="min-w-0 flex-1 rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
               placeholder="搜索对象…"
               value={q}
               onChange={(e) => setQ(e.target.value)}
@@ -231,19 +231,19 @@ export default function ObjectsPage() {
             </button>
           </div>
           {showImport && (
-            <div className="mb-4 rounded-lg border border-[var(--card-border)] p-3">
-              <p className="text-xs text-[var(--muted)]">
+            <div className="mb-4 rounded-lg border border-(--card-border) p-3">
+              <p className="text-xs muted">
                 粘贴表格(支持 CSV/制表符,首行为表头):<b>姓名</b>、<b>快递单号</b>、<b>物流公司</b>、<b>收货地址</b>、电话(后两列可选)
               </p>
               <textarea
-                className="mt-2 h-28 w-full resize-none rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 font-mono text-xs outline-none focus:border-[var(--accent)]"
+                className="mt-2 h-28 w-full resize-none rounded-lg border border-(--card-border) bg-transparent px-3 py-2 font-mono text-xs outline-hidden focus:border-(--accent)"
                 placeholder={"姓名,快递单号,物流公司,收货地址,电话\n张三,SF1234567890,顺丰,广东省深圳市南山区科技园路1号,13800000000\n李四,YT9988776655,圆通,广州市天河区体育西路100号"} 
                 value={importText}
                 onChange={(e) => setImportText(e.target.value)}
               />
               <div className="mt-2 flex items-center gap-2">
                 <button className="btn-primary px-3 py-1 text-xs" onClick={doImport}>导入</button>
-                {importMsg && <span className="text-xs text-[var(--muted)]">{importMsg}</span>}
+                {importMsg && <span className="text-xs muted">{importMsg}</span>}
               </div>
             </div>
           )}
@@ -256,16 +256,16 @@ export default function ObjectsPage() {
           ) : (
             <>
               <div className="mb-2 flex items-center gap-3 text-xs">
-                <label className="flex cursor-pointer items-center gap-1.5 text-[var(--muted)]">
+                <label className="flex cursor-pointer items-center gap-1.5 muted">
                   <input
                     type="checkbox"
-                    className="accent-[var(--accent)]"
+                    className="accent-(--accent)"
                     checked={filtered.every((r) => selected.has(String(r.id ?? r.object_id ?? "")))}
                     onChange={toggleAllVisible}
                   />
                   全选本页
                 </label>
-                <span className="text-[var(--muted)]">已选 {selected.size}</span>
+                <span className="muted">已选 {selected.size}</span>
                 {selected.size > 0 && (
                   <button className="btn-ghost text-red-300" onClick={deleteSelected}>
                     删除所选（{selected.size}）
@@ -279,13 +279,13 @@ export default function ObjectsPage() {
                     <div key={id} className="flex items-center gap-3 rounded-lg bg-white/5 px-4 py-3">
                       <input
                         type="checkbox"
-                        className="shrink-0 accent-[var(--accent)]"
+                        className="shrink-0 accent-(--accent)"
                         checked={selected.has(id)}
                         onChange={() => toggleOne(id)}
                       />
                       <div className="min-w-0 flex-1">
                       <p className="truncate font-medium">{String(r.display_name ?? "-")}</p>
-                      <p className="text-xs text-[var(--muted)]">
+                      <p className="text-xs muted">
                         {String(r.role_template ?? "-")} · {String(r.language ?? "-")}
                         {String(r.phone ?? "") ? ` · ${String(r.phone)}` : ""}
                         {String(r.tracking_no ?? "") ? ` · 单号 ${String(r.tracking_no)}` : ""}
@@ -293,7 +293,7 @@ export default function ObjectsPage() {
                         {String(r.address ?? "") ? ` · ${String(r.address)}` : ""}
                       </p>
                       {String(r.background ?? "") && (
-                        <p className="mt-1 line-clamp-2 text-xs text-[var(--muted)]">{String(r.background)}</p>
+                        <p className="mt-1 line-clamp-2 text-xs muted">{String(r.background)}</p>
                       )}
                     </div>
                     <div className="flex shrink-0 gap-2">
@@ -312,14 +312,14 @@ export default function ObjectsPage() {
           <span className="label">{editingId ? "编辑对象" : "新建对象"}</span>
           <div className="mt-3 space-y-3">
             <input
-              className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+              className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
               placeholder="姓名"
               value={form.display_name}
               onChange={(e) => setForm({ ...form, display_name: e.target.value })}
             />
             <div className="grid grid-cols-2 gap-3">
               <select
-                className="rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none"
+                className="rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden"
                 value={form.role_template}
                 onChange={(e) => setForm({ ...form, role_template: e.target.value })}
               >
@@ -328,7 +328,7 @@ export default function ObjectsPage() {
                 <option>经销商</option>
               </select>
               <select
-                className="rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none"
+                className="rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden"
                 value={form.language}
                 onChange={(e) => setForm({ ...form, language: e.target.value })}
               >
@@ -338,47 +338,47 @@ export default function ObjectsPage() {
               </select>
             </div>
             <input
-              className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+              className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
               placeholder="电话（可选）"
               value={form.phone}
               onChange={(e) => setForm({ ...form, phone: e.target.value })}
             />
             <input
-              className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+              className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
               placeholder="联系渠道（微信 / WhatsApp，留空按语言默认；话术里用 {聯絡方式} 引用）"
               value={form.contact_channel}
               onChange={(e) => setForm({ ...form, contact_channel: e.target.value })}
             />
             <div className="grid grid-cols-2 gap-3">
               <input
-                className="rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+                className="rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
                 placeholder="快递单号"
                 value={form.tracking_no}
                 onChange={(e) => setForm({ ...form, tracking_no: e.target.value })}
               />
               <input
-                className="rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+                className="rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
                 placeholder="物流公司"
                 value={form.courier}
                 onChange={(e) => setForm({ ...form, courier: e.target.value })}
               />
             </div>
             <input
-              className="w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+              className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
               placeholder="收货地址（可选，话术里可用 {收货地址} 引用）"
               value={form.address}
               onChange={(e) => setForm({ ...form, address: e.target.value })}
             />
             <textarea
-              className="h-28 w-full resize-none rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+              className="h-28 w-full resize-none rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
               placeholder="背景 / 角色说明…"
               value={form.background}
               onChange={(e) => setForm({ ...form, background: e.target.value })}
             />
             <label className="block">
-              <span className="text-xs text-[var(--stage-muted)]">绑定话术模板</span>
+              <span className="text-xs text-(--stage-muted)">绑定话术模板</span>
               <select
-                className="mt-1 w-full rounded-lg border border-[var(--card-border)] bg-transparent px-3 py-2 text-sm outline-none"
+                className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden"
                 value={form.template_id}
                 onChange={(e) => setForm({ ...form, template_id: e.target.value })}
               >
@@ -391,7 +391,7 @@ export default function ObjectsPage() {
             <button className="btn-primary w-full" onClick={save}>
               {editingId ? "保存修改" : "建档"}
             </button>
-            <p className="text-xs text-[var(--muted)]">对象档案会注入后续通话上下文。</p>
+            <p className="text-xs muted">对象档案会注入后续通话上下文。</p>
           </div>
         </section>
       </div>
