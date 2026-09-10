@@ -229,10 +229,45 @@ def build_engine() -> Engine | None:
             with engine.begin() as conn:
                 conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
             VectorBase.metadata.create_all(engine)
+            _migrate_knowledge_content_hash(engine)
         except Exception as exc:  # pragma: no cover - sqlite / missing extension
             print(f"[deps] vector schema skipped: {exc}")
         return engine
     return None
+
+
+def _migrate_knowledge_content_hash(engine: Engine) -> None:
+    """KB 增量索引(2026-09-10): knowledge_chunks 补 content_hash 列并回填存量。
+
+    create_all 不会给已存在的表加列;回填走 Python 侧 sha256(方言无关,
+    Postgres 无内置 sha256,不为此引 pgcrypto)。知识库量级小,一次性成本可忽略。
+    幂等:列已存在且全部行已有哈希时为纯 no-op。"""
+    import hashlib
+
+    from sqlalchemy import inspect as sa_inspect
+    from sqlalchemy import select, text
+
+    from bok_voice_business_db.vector_models import KnowledgeChunk
+
+    insp = sa_inspect(engine)
+    if "knowledge_chunks" not in insp.get_table_names():
+        return
+    with engine.begin() as conn:
+        cols = {c["name"] for c in insp.get_columns("knowledge_chunks")}
+        if "content_hash" not in cols:
+            conn.execute(
+                text("ALTER TABLE knowledge_chunks ADD COLUMN content_hash VARCHAR(64) DEFAULT ''")
+            )
+        rows = conn.execute(select(KnowledgeChunk.id, KnowledgeChunk.text)).all()
+        for cid, txt in rows:
+            digest = hashlib.sha256((txt or "").encode("utf-8")).hexdigest()[:32]
+            conn.execute(
+                text(
+                    "UPDATE knowledge_chunks SET content_hash=:h "
+                    "WHERE id=:id AND (content_hash IS NULL OR content_hash='')"
+                ),
+                {"h": digest, "id": cid},
+            )
 
 
 def build_repository(engine: Engine | None = None):
