@@ -35,7 +35,9 @@ _ALL_CASES = [
     # 句内不带逗号:vad-pause 微停顿会把逗号句劈成碎片轮/触发 join-hold,
     # 提交变慢还会把断言窗拉进心跳线（barge-in A/B 与 zh 腿 call-6ba7c47c 实证）。
     {"lang": "zh", "expect_lang": "Chinese",
-     "text": "我的快递三天了还没到麻烦帮我查一下。", "tts_lang": "zh"},
+     # 8 字单口气(<10 字 vad-pause 门槛):zh 渲染长句自然停顿>vad-pause min_silence
+     # 会劈轮,迟到 finish 续句 interrupt 初生回复(zh 腿 sentences=0 canceled=1 实证)。
+     "text": "快递三天了还没到", "tts_lang": "zh"},
     {"lang": "cantonese", "expect_lang": "Cantonese",
      # 9字单口气句(<10 字 vad-pause 提交门槛→只可能 EOS 单轮提交,结构性唔会
      # 劈轮):长句渲染内停顿 >0.45s 会被 vad-pause 劈轮+尾段前缀续句 interrupt

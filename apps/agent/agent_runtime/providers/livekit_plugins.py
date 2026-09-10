@@ -325,6 +325,24 @@ class MlxLlmLLM(_OpenAICompatBase):
 
         _qclient.chat.completions.create = _timed_create
 
+        # PrefillSpeculator 快照钩子（agent.py 会设 on_request_messages 回调）:
+        # 抓「逐字节就是本次真实请求 messages」的快照,投机预热按下一条请求的
+        # 严格前缀组装(见 prefill_speculator.py)。回调未设=零开销直通。
+        _sclient = self._client
+        _sraw = _sclient.chat.completions.create
+        self.on_request_messages = None  # Callable[[list[dict]], None] | None
+
+        async def _snapshot_create(**kw):
+            _cb = self.on_request_messages
+            if _cb is not None:
+                try:
+                    _cb(list(kw.get("messages") or []))
+                except Exception:  # noqa: BLE001 - 快照失败唔阻真实请求
+                    pass
+            return await _sraw(**kw)
+
+        _sclient.chat.completions.create = _snapshot_create
+
     async def _prewarm_impl(self) -> None:
         # 真实 1-token 生成：暖 mlx 模型（冷启动的 KV 分配/首 token 占首包大头）。
         # 官方 prewarm 只验连接；AgentSession 构造时会自动调用本钩子。
@@ -4369,6 +4387,15 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                 )
             )
             print(f"QWEN3_ASR_PREFLIGHT chars={len(common)}", flush=True)
+            # PrefillSpeculator 挂点（agent.py 按会话设 stable_prefix_listener）:
+            # 稳定前缀=下一请求 user 文本的保守前缀,拿来做 out-of-band prefill
+            # 预热。回调异常绝不影响 STT 事件流。
+            _spec_cb = getattr(self._stt_, "stable_prefix_listener", None)
+            if _spec_cb is not None:
+                try:
+                    _spec_cb(common)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"BOK_PREFILL_SPEC listener error: {exc!r}", flush=True)
 
     def _emit_sentence_commit(self, sentence: str, end_idx: int, lang: str, now: float, source: str) -> None:
         """句级提交共用出口（partial-punct / vad-pause 两个事件源同一套记账）。
@@ -4584,6 +4611,16 @@ class Qwen3ASRLiveSTT(stt.STT):
     @property
     def provider(self) -> str:
         return self._stt.provider
+
+    # 稳定前缀监听（PrefillSpeculator）：流对象持有的是内芯(_stt),监听经此
+    # property 转发落位到内芯,agent.py 只见到包装。
+    @property
+    def stable_prefix_listener(self):
+        return getattr(self._stt, "stable_prefix_listener", None)
+
+    @stable_prefix_listener.setter
+    def stable_prefix_listener(self, cb) -> None:
+        self._stt.stable_prefix_listener = cb
 
     def _on_metrics_collected(self, *args, **kwargs) -> None:
         self.emit("metrics_collected", *args, **kwargs)

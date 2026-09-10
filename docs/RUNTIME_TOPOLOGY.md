@@ -45,6 +45,18 @@
   （`BOK_FILLER_GAP_MS`）→回复**（不再掐垫话，回复首帧经 `_RelaySynthesizeStream`
   hold 扣压）；语言=装配时钉死的通话语言，池缺失跳过绝不跨语言。垫话绝不进
   LLM 上下文。开关 `BOK_FILLER=0`。
+- **抢跑防抖 + PrefillSpeculator**（2026-09-10）：框架抢跑默认关
+  （`PREEMPTIVE_GENERATION=0`，命中在本仓 STT 架构下结构性不可能——PREFLIGHT
+  只发稳定前缀而提交是全句 FINAL，843 失效/0 命中实测）。替代预热=
+  `prefill_speculator.py`：说话中按稳定前缀发 max_tokens=1 out-of-band 请求
+  （严格前缀=上次真实请求快照+回复历史原文+user 前缀），真轮只 prefill 分叉
+  尾巴；`BOK_PREFILL_SPEC=0` 关。诊断 `BOK_PREEMPTIVE_DEBUG=1` +
+  `scripts/probe_preemptive.py`。
+- **turns 分析账本**：A 线 `_on_conversation_item` 每轮上报
+  line/speaker/gen/template_step/started_ms/ended_ms/perceived_ms（B 线
+  `line=b`、speaker=me/other）；`gen`=llm/script/qa_fastpath 生成源；
+  perceived_ms=eou+llm+tts 三段（时序：item_added 时 pending 已就位即取）；
+  上报任务挂断 flush 防 teardown 丢轮。
 - **Q→A 快路**：`agent_runtime/qa_gate.py` + CP `/api/qa-entries`、
   `/api/reports/qa-pairs`——四道闸（作用域/关键信号旁路/推进收线让位/阈值 0.90）
   全过且应答音频已缓存才跳过 LLM；挖掘入库 `bok.py tts-mine --apply N`。
