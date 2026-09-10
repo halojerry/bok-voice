@@ -244,3 +244,18 @@ def test_load_manifest_shape(tmp_path):
     assert m["zh"][0]["text"] == "好的，您稍等。"
     assert m["zh"][0]["file"] == "zh-01.wav"
     assert m["zh"][0]["dur_s"] == 1.0
+
+
+def test_filler_assets_manifest_shape():
+    """真实资产契约:随源码分发的 manifest 三语齐全、10 短+3 长池子不回退,
+    长句 tier(覆盖窗目标 1.7-2.3s)真实存在且 wav 文件在位。"""
+    from agent_runtime.fillers import FILLER_ASSETS_DIR, load_manifest
+
+    m = load_manifest(FILLER_ASSETS_DIR)
+    assert set(m) == {"zh", "cantonese", "en"}
+    for lang, entries in m.items():
+        assert len(entries) >= 13, f"{lang} 池应含 10 短 + 3 长"
+        durs = sorted(e["dur_s"] for e in entries)
+        assert durs[-1] >= 1.6, f"{lang} 应含 ≥1.6s 长句"
+        for e in entries:
+            assert (FILLER_ASSETS_DIR / e["file"]).exists()

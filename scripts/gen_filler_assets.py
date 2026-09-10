@@ -7,7 +7,9 @@
   零动作动词——随机触发语境永不穿帮;
 - zh/粤 speed=1.2 pitch=0 vol=1.0;en speed=1.0(用户指定);
 - <#x#> 停顿标记直传(MiniMax 官方语法,x=秒,0.01-99.99,须夹在可发音文本间);
-- 每条实测时长目标 1.0-1.5s,窗 [0.9,1.6] WARN,窗外 FAIL;
+- 两档时长窗:短句 tier(lines,10 条/语言)目标 1.0-1.5s,窗 [0.9,1.6] WARN,
+  窗外 FAIL;长句 tier(long_lines,3 条/语言,文件名 -11..13)覆盖窗目标
+  1.7-2.3s,窗 [1.6,2.4] WARN,窗外 FAIL;
 - 输出 wav(24k mono 16bit)+manifest.json 到 apps/agent/agent_runtime/assets/fillers/,
   运行时(fillers.py)只播文件,绝不云合成。
 
@@ -56,6 +58,13 @@ FILLERS: dict[str, dict] = {
             "嗯，收到了。",
             "好，稍等一下啊。",
         ],
+        "long_lines": [
+            # 首轮实测修订:zh 双逗号/冗字拖腔超窗(「您别急」轮 3.49s),删中段
+            # 压回窗内;万能话术不变(应承+等待邀请,查一下=等待邀请动词面)。
+            "好的，您稍等，我马上帮您看一下。",
+            "收到收到，我这就帮您查一下。",
+            "麻烦您稍等一下，我马上看一下。",
+        ],
     },
     "cantonese": {
         "voice": "Cantonese_crisp_news_anchor_vv2",
@@ -72,6 +81,11 @@ FILLERS: dict[str, dict] = {
             "麻煩你稍為等一陣。",
             "收到，等我一陣。",
             "唔好急，等一陣先啊。",
+        ],
+        "long_lines": [
+            "好嘅，你稍等陣，我而家就幫你睇下。",
+            "收到，唔好急，等我幫你睇下先。",
+            "明白，麻煩你稍等多一陣，我即刻睇。",
         ],
     },
     "en": {
@@ -90,11 +104,21 @@ FILLERS: dict[str, dict] = {
             "Let me look into that for you.",
             "Sure, sure.",
         ],
+        # en 社媒女声停顿拖腔实证(两轮):逗号(Mm-hm, sure.=2.57s)与 <#0.3#>
+        # 标记都令相邻词拖长 +1.8s 以上——en 长句一律零停顿连读,靠 9 词左右
+        # (~0.2s/词)落窗;只保留等待邀请/应承语义,无中段句号。
+        "long_lines": [
+            "Just a moment and I will check that.",
+            "One moment and I will check on it.",
+            "One moment please and I will check that.",
+        ],
     },
 }
 
 WIN_WARN = (0.9, 1.6)
 WIN_FAIL = (0.8, 1.8)
+LONG_WIN_WARN = (1.6, 2.4)  # 长句 tier:覆盖窗目标 1.7-2.3s
+LONG_WIN_FAIL = (1.5, 2.6)
 
 
 def load_api_key() -> str:
@@ -211,30 +235,35 @@ def main() -> int:
 
     for lang, cfg in FILLERS.items():
         entries: list[dict] = []
-        for i, text in enumerate(cfg["lines"], 1):
-            name = f"{lang}-{i:02d}.wav"
-            if args.dry_run:
-                print(f"[plan] {name}: {text!r} voice={cfg['voice']} speed={cfg['speed']}")
-                continue
-            target = OUT_DIR / name
-            if target.exists() and not args.force:
-                with wave.open(str(target), "rb") as w:
-                    dur = w.getnframes() / w.getframerate()
-                print(f"SKIP {name}: {dur:.2f}s (已存在)")
+        tiers = [
+            (cfg["lines"], 1, WIN_WARN, WIN_FAIL),
+            (cfg.get("long_lines", []), 2, LONG_WIN_WARN, LONG_WIN_FAIL),
+        ]
+        for lines, tier, warn_win, fail_win in tiers:
+            for i, text in enumerate(lines, 1):
+                name = f"{lang}-{i:02d}.wav" if tier == 1 else f"{lang}-{10 + i}.wav"
+                if args.dry_run:
+                    print(f"[plan] {name}: {text!r} voice={cfg['voice']} speed={cfg['speed']}")
+                    continue
+                target = OUT_DIR / name
+                if target.exists() and not args.force:
+                    with wave.open(str(target), "rb") as w:
+                        dur = w.getnframes() / w.getframerate()
+                    print(f"SKIP {name}: {dur:.2f}s (已存在)")
+                    entries.append({"text": text, "file": name, "dur_s": round(dur, 2)})
+                    continue
+                pcm = synth_pcm(key, base, text, cfg["voice"], cfg["speed"], cfg["pitch"])
+                pcm = trim_silence(pcm)
+                dur = len(pcm) / 2 / SAMPLE_RATE
+                ok = fail_win[0] <= dur <= fail_win[1]
+                warn = not (warn_win[0] <= dur <= warn_win[1])
+                mark = "OK " if not warn else ("WARN" if ok else "FAIL")
+                print(f"{mark} {name}: {dur:.2f}s {text!r}")
+                if not ok and not args.force:
+                    failures.append(f"{name} {dur:.2f}s 超窗 {text!r}")
+                    continue
+                write_wav(target, pcm)
                 entries.append({"text": text, "file": name, "dur_s": round(dur, 2)})
-                continue
-            pcm = synth_pcm(key, base, text, cfg["voice"], cfg["speed"], cfg["pitch"])
-            pcm = trim_silence(pcm)
-            dur = len(pcm) / 2 / SAMPLE_RATE
-            ok = WIN_FAIL[0] <= dur <= WIN_FAIL[1]
-            warn = not (WIN_WARN[0] <= dur <= WIN_WARN[1])
-            mark = "OK " if not warn else ("WARN" if ok else "FAIL")
-            print(f"{mark} {name}: {dur:.2f}s {text!r}")
-            if not ok and not args.force:
-                failures.append(f"{name} {dur:.2f}s 超窗 {text!r}")
-                continue
-            write_wav(target, pcm)
-            entries.append({"text": text, "file": name, "dur_s": round(dur, 2)})
         manifest[lang] = entries
         import time as _t
 
