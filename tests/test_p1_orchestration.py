@@ -52,11 +52,17 @@ def test_preemptive_max_retries_env_override(monkeypatch):
 
 
 def test_preemptive_enabled_and_tts_defaults(monkeypatch):
+    """2026-09-10 抢跑防抖:框架抢跑默认关(命中结构性不可能,843失效/0命中),
+    替代=PrefillSpeculator out-of-band prefill 预热;PREEMPTIVE_GENERATION=1
+    回旧行为。"""
     monkeypatch.delenv("PREEMPTIVE_GENERATION", raising=False)
     monkeypatch.delenv("PREEMPTIVE_TTS", raising=False)
     opts = _preemptive_generation_opts()
-    assert opts["enabled"] is True
+    assert opts["enabled"] is False
     assert opts["preemptive_tts"] is False
+
+    monkeypatch.setenv("PREEMPTIVE_GENERATION", "1")
+    assert _preemptive_generation_opts()["enabled"] is True
 
 
 def test_marker_pause_default_off(monkeypatch):

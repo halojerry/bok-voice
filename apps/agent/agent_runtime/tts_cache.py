@@ -278,8 +278,10 @@ class _RelaySynthesizeStream(tts.SynthesizeStream):
         self._hold_provider = hold_provider
         self._fired = False
 
-    async def _metrics_monitor_task(self, event_aiter) -> None:
-        pass  # 内芯自带 metrics(经事件转发),避免双份
+    # ⚠️ 勿覆写 _metrics_monitor_task:基类监视器在转发帧上算 ttfb/audio 时长并
+    # emit tts_metrics。曾 pass 掉(垫话 PR,注释误以为内芯會转发,实际 session 只
+    # 监听包装层)→ PERCEIVED_MS 北极星缺 tts 段、turns 账本 perceived_ms 哑火
+    # (2026-09-10 实测恢复)。
 
     async def _run(self, output_emitter) -> None:
         output_emitter.initialize(

@@ -320,7 +320,8 @@ async def entrypoint(ctx) -> None:
     async def _add_turn(text: str, language: str, latency: int = 0) -> None:
         try:
             await cp.add_turn(
-                call_id, speaker_role, text, provider="interpret", latency_ms=latency, language=language
+                call_id, speaker_role, text, provider="interpret", latency_ms=latency, language=language,
+                line="b", speaker=speaker_role,  # B 线账本:此前缺省误标 line=a(P0 遗留)
             )
         except Exception as exc:  # pragma: no cover - 落库失败不阻翻译
             print(f"[interp] add_turn failed: {exc!r}", flush=True)

@@ -632,16 +632,19 @@ _MINIMAX_DEFAULT_VOICES: dict[str, str] = {
 def _preemptive_generation_opts() -> dict:
     """抢跑（preemptive generation）预算，env 逐项可回退。
 
-    max_retries 默认 3（P1 churn 收敛，旧 8 会把误判轮的 prefill 白烧放大）：
-    每个 PREFLIGHT 事件 count+1（agent_activity.py:2392），烧穿后 FINAL 到达只
-    cancel 不重建 → commit 从零生成、新请求还排在被 cancel 的 prefill 后面
-    （实测 +0.2-0.7s）。标记轮暂停见 entrypoint 的 _preemptive_gate
-    （PREEMPTIVE_DISABLE_ON_MARKER）。
+    **默认关（2026-09-10 抢跑防抖，PREEMPTIVE_GENERATION=1 回旧行为）**：
+    实机 843 次失效 / 0 次命中（agent.log 全量统计）——命中在本仓 STT 架构下
+    结构性不可能：插件 PREFLIGHT 只发稳定前缀（防幻觉尾巴），提交转写是全句
+    FINAL，框架 `_transcripts_equivalent`（逐词相等）恒假；且 max_retries 烧穿
+    后新 PREFLIGHT 先 cancel 旧快照再 bail → commit 时连比较都不跑。每次失效
+    的投机请求被 mlx「无断连中止」解码到完才放锁，解码尾巴（~1-2s GPU）挤占
+    真请求队列。替代=PrefillSpeculator out-of-band prefill 预热（不出声、
+    max_tokens=1、只暖 KV），见 prefill_speculator.py。
     """
     return {
         # 官方源码证实(1.7.1 audio_recognition):FINAL_TRANSCRIPT 一到即触发
         # 抢跑,LLM prefill 与端点判定窗口并行——唔使等 interim。默认开。
-        "enabled": os.environ.get("PREEMPTIVE_GENERATION", "1") == "1",
+        "enabled": os.environ.get("PREEMPTIVE_GENERATION", "0") == "1",
         # preemptive_tts 默认关:MiniMax 云 TTS 按字计费,误判轮次唔好白烧;
         # dev 可 PREEMPTIVE_TTS=1 实验首声再提前。
         "preemptive_tts": os.environ.get("PREEMPTIVE_TTS", "0") == "1",
@@ -1044,6 +1047,12 @@ async def entrypoint(ctx):
     from livekit.agents import Agent, AgentSession, StopResponse, TurnHandlingOptions, inference, stt
     from .providers.livekit_plugins import ContextState, DeepSeekLLM, ExprAwareLLM, lecture_guard
 
+    # 诊断探针须在 job 进程内安装:livekit job 由 JobExecutorProc 子进程执行,
+    # run_agent()/worker 主进程的安装对 serving 进程无效。
+    from .preemptive_debug import install_preemptive_debug
+
+    install_preemptive_debug()
+
     room_name = ctx.room.name
     # call_id 来自显式分发 metadata(CP /api/token 挂 RoomAgentDispatch 时写入);
     # 房间名与 call_id 全栈同约定,兜底相等。AGENT_CALL_ID env 旁路已废除。
@@ -1216,6 +1225,7 @@ async def entrypoint(ctx):
             else:
                 print(f"[whatsapp] accumulate flush no-number, prompt continue (call {room_name})", flush=True)
             try:
+                _turn_origin["gen"] = "script"  # WA 号码复述=脚本直念
                 await _say_script(session, tts_provider, _tts_cache, _wa_number_line(language_state.lang, num))
             except Exception as exc:  # pragma: no cover - 会话已关等
                 print(f"[whatsapp] accumulate flush say failed: {exc!r}", flush=True)
@@ -1468,6 +1478,24 @@ async def entrypoint(ctx):
     # 确定性 mood 通道：无论模型是否遵守「吐 <expr> 标签」的指令，
     # ExprAwareLLM 都会在每次回复前强制前置标签，保证转录发布 lk.expression。
     _raw_llm = llm_provider  # 内芯留引用：会话首轮真实前缀预热（FIX prewarm）
+    # PrefillSpeculator（2026-09-10 抢跑防抖替代件）：框架抢跑默认关后,由本件
+    # 在说话中按稳定前缀做 out-of-band prefill 预热（max_tokens=1 只暖 KV 不出
+    # 声）。仅本地 OpenAI 兼容内芯有 prefix_prewarm;快照钩子抓逐字节请求。
+    _prefill_spec = None
+    if (
+        os.environ.get("BOK_PREFILL_SPEC", "1") == "1"
+        and hasattr(llm_provider, "prefix_prewarm")
+        and hasattr(llm_provider, "on_request_messages")
+    ):
+        from .prefill_speculator import PrefillSpeculator
+
+        _prefill_spec = PrefillSpeculator(llm_provider.prefix_prewarm, context_state)
+        llm_provider.on_request_messages = _prefill_spec.on_request_messages
+        # STT 稳定前缀挂点(Qwen3ASRLiveSTT 实例属性,流发射 PREFLIGHT 时回调);
+        # 非流式包装(StreamAdapter)无此通道,预热退化为无原料不接。
+        if isinstance(stt_provider, Qwen3ASRLiveSTT):
+            stt_provider.stable_prefix_listener = _prefill_spec.on_stable_prefix
+        print("[agent] prefill speculator on (BOK_PREFILL_SPEC=0 关)", flush=True)
     llm_provider = ContextAwareLLM(
         ExprAwareLLM(llm_provider, emotion_state=emotion_state),
         context_state=context_state,
@@ -1663,6 +1691,10 @@ async def entrypoint(ctx):
         _prefix_prewarm_armed = False
 
     # Persist turns + auto-settle on hangup (idempotent server side).
+    # 分析账本 gen 标记：脚本直念/QA 快路改写来源,LLM 轮消费后即重置(consume-once)。
+    # provider 允许顺带覆盖(QA 快路审计列 qa-fastpath,原 ④ 直报改由 item_added 收编)。
+    _turn_origin = {"gen": "llm", "provider": ""}
+
     def _on_conversation_item(ev):
         item = getattr(ev, "item", None)
         role = getattr(item, "role", None)
@@ -1678,9 +1710,64 @@ async def entrypoint(ctx):
         # 审计闭环(2026-09-07):每轮带上最近一次官方 metrics 的 LLM TTFT 作
         # latency_ms + 通话语言——之前 CP 侧丢弃,审计面无延迟档案可查。
         latency = int(_turn_metrics.get("llm_ttft_ms") or 0) if role == "assistant" else 0
-        asyncio.create_task(
-            cp.add_turn(call_id, role, _clean_transcript(text), latency_ms=latency, language=language_state.lang)
-        )
+        # 分析账本(P0 §6.1):线别/说话人/生成源/话术步/时间轴/perceived_ms。
+        now_ms = int((time.monotonic() - _t0) * 1000)
+        step = 0
+        try:
+            if flow_ctrl.has_steps:
+                step = int(flow_ctrl.current) + 1
+        except Exception:  # pragma: no cover - 步号拿不到只损分析列
+            step = 0
+        if role == "user":
+            _spawn_report(
+                cp.add_turn(
+                    call_id, role, _clean_transcript(text), latency_ms=0,
+                    language=language_state.lang, line="a", speaker="customer",
+                    gen="", template_step=step, started_ms=now_ms, ended_ms=now_ms,
+                )
+            )
+            return
+        gen = _turn_origin["gen"]
+        provider = _turn_origin["provider"]  # 默认空串(与旧行为一致;QA 快路=qa-fastpath)
+        _turn_origin["gen"] = "llm"  # consume-once:下一轮默认 llm
+        _turn_origin["provider"] = ""
+        started_ms = max(0, now_ms - latency)  # 生成起点≈落库时刻-TTFT(近似)
+        _spawn_report(_report_assistant_turn(text, latency, gen, provider, step, started_ms))
+
+    # 在途 turn 上报任务:挂断时结算前要等佢哋落地(裸 create_task 会被 job
+    # teardown 杀掉=整轮丢失)。
+    _report_tasks: set = set()
+
+    def _spawn_report(coro):
+        task = asyncio.create_task(coro)
+        _report_tasks.add(task)
+        task.add_done_callback(_report_tasks.discard)
+
+    async def _report_assistant_turn(
+        text: str, latency: int, gen: str, provider: str, step: int, started_ms: int
+    ) -> None:
+        # perceived(用户讲完→AI 出声)=eou+llm+tts 三段。时序实测(2026-09-10):
+        # tts_metrics 在整段合成完才 emit,而 llm 流关闭又在 TTS 之后 →
+        # item_added 触发本函数时 pending 已就位——启动即取,唔使等。取不到
+        # 按 0 落库(脚本直念/QA 快路冇全三段);ts 宽窗只防跨通残值。
+        t_begin = time.monotonic()
+        perceived = 0
+        pending = _turn_metrics.get("perceived_pending")
+        if pending is not None:
+            total, ts = pending
+            _turn_metrics.pop("perceived_pending", None)
+            if ts >= t_begin - 120:
+                perceived = int(total or 0)
+        try:
+            await cp.add_turn(
+                call_id, "assistant", _clean_transcript(text), provider=provider,
+                latency_ms=latency, language=language_state.lang, line="a",
+                speaker="agent_ai", gen=gen, template_step=step,
+                started_ms=started_ms,
+                ended_ms=int((time.monotonic() - _t0) * 1000), perceived_ms=perceived,
+            )
+        except Exception as exc:  # pragma: no cover - 落库失败不阻通话
+            print(f"[agent] add_turn(assistant) failed: {exc!r}", flush=True)
 
     async def _async_update_context(role, text):
         # 渐进披露：P1 起检索默认全关（对象知识走【对象档案】静态前缀，话术对象
@@ -1724,6 +1811,14 @@ async def entrypoint(ctx):
         text = getattr(item, "text_content", None) or getattr(item, "raw_text_content", "") or ""
         if text:
             if role == "assistant":
+                # PrefillSpeculator:历史条目原文（含 expr 标记）——投机预热按下
+                # 一条请求的严格前缀组装,assistant 段必须与框架追加进历史的
+                # 逐字节一致(last_reply 是清洗后的锚文本,直接用会分叉白暖)。
+                if _prefill_spec is not None:
+                    try:
+                        _prefill_spec.on_reply_history_text(text)
+                    except Exception:  # noqa: BLE001 - 预热原料失败唔阻主流程
+                        pass
                 # 尾部重复锚同步写(R3 治原句/近原句复述):lecture_guard 守则与摘要
                 # 记忆同一把尺(转录落咗罐頭,記憶/錨都唔可以留原稿)。
                 try:
@@ -1790,6 +1885,14 @@ async def entrypoint(ctx):
             _llm_ms = _turn_metrics.pop("llm_ttft_ms")
             _tts_ms = _turn_metrics.pop("tts_ttfb_ms")
             _turn_metrics.clear()
+            # 账本生产者:pending 由 _report_assistant_turn 限窗取走落 perceived_ms。
+            # llm_ttft_ms 回存:turns 的 latency_ms 列喺 item_added 时先读,
+            # 唔回存会被上面的 pop 清走(perceived 组装先于 item_added)。
+            _turn_metrics["llm_ttft_ms"] = _llm_ms
+            _turn_metrics["perceived_pending"] = (
+                _eou_ms + _llm_ms + _tts_ms,
+                time.monotonic(),
+            )
             print(
                 f"{tag}PERCEIVED_MS total={_eou_ms + _llm_ms + _tts_ms} "
                 f"(eou={_eou_ms} llm={_llm_ms} tts={_tts_ms})",
@@ -1817,6 +1920,14 @@ async def entrypoint(ctx):
                 print(f"[agent] session report posted (call {room_name})", flush=True)
             except Exception as exc:  # pragma: no cover - 报表失败唔阻结算
                 print(f"[agent] session report failed: {exc!r} (call {room_name})", flush=True)
+            # 在途 turns 上报(含 perceived 等待窗)先落地再结算,防 teardown 杀任务丢轮。
+            if _report_tasks:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*list(_report_tasks), return_exceptions=True), timeout=10.0
+                    )
+                except asyncio.TimeoutError:
+                    pass
             await cp.settle(call_id)
 
         def _close_done(_task: asyncio.Task) -> None:
@@ -1946,6 +2057,9 @@ async def entrypoint(ctx):
             if _preemptive_gate["paused"]:
                 _preemptive_gate["paused"] = False
                 _set_preemptive_max_retries(int(_preemptive_env_opts["max_retries"]))
+            # prefill 投机预算重置：上一说话窗的开火配额归还,下一窗重新计。
+            if _prefill_spec is not None:
+                _prefill_spec.new_turn()
             # 客戶真開口 → 沉默心跳計數歸零(之後再沉默先重新計 2 次)。
             _nudge_state["count"] = 0
             _nudge_state["last_user_ts"] = time.monotonic()
@@ -2210,11 +2324,19 @@ async def entrypoint(ctx):
                                 pass
                             # ③ 回声守卫预锚(正常要 playout 完才自动置,快路要立即生效)
                             context_state.set_last_reply(_qa_answer)
-                            # ④ 落库两轮(assistant provider=qa-fastpath 供审计/统计)
+                            # ④ 落库 user 轮(paused 分支同款手动补轮,item_added
+                            # 唔会为 StopResponse 轮触发);assistant 轮由 say() 的
+                            # item_added 统一上报——旧 ④ 直报+item_added 双报同文
+                            # 两行,顺手收编。origin 标记 gen/provider 供账本。
+                            _turn_origin["gen"] = "qa_fastpath"
+                            _turn_origin["provider"] = "qa-fastpath"
                             try:
-                                await cp.add_turn(call_id, "user", user_text, language=language_state.lang)
+                                _qa_step = (int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0
+                                _qa_now = int((time.monotonic() - _t0) * 1000)
                                 await cp.add_turn(
-                                    call_id, "assistant", _qa_answer, provider="qa-fastpath", language=language_state.lang
+                                    call_id, "user", user_text, language=language_state.lang,
+                                    line="a", speaker="customer",
+                                    template_step=_qa_step, started_ms=_qa_now, ended_ms=_qa_now,
                                 )
                             except Exception:  # noqa: BLE001
                                 pass
@@ -2327,6 +2449,7 @@ async def entrypoint(ctx):
                 _nudge_state["farewell"] = True
                 print(f"[heartbeat] still silent after {_nudge_state['count']} nudges -> farewell+end (call {room_name})", flush=True)
                 try:
+                    _turn_origin["gen"] = "script"  # 收线告别=脚本直念
                     await _say_script(session, tts_provider, _tts_cache, _farewell_line(name, lang))
                 except Exception as exc:  # pragma: no cover - 收尾失敗都照收線
                     print(f"[heartbeat] farewell failed: {exc!r} (call {room_name})", flush=True)
@@ -2335,6 +2458,7 @@ async def entrypoint(ctx):
             _nudge_state["count"] += 1
             print(f"[heartbeat] silent {nudge_delay:.0f}s -> nudge {_nudge_state['count']}/{nudge_max} (call {room_name})", flush=True)
             try:
+                _turn_origin["gen"] = "script"  # 心跳补位=脚本直念
                 await _say_script(session, tts_provider, _tts_cache, _nudge_line(name, lang, _nudge_state["count"] - 1))
             except Exception as exc:  # pragma: no cover - 心跳失敗唔阻通話
                 print(f"[heartbeat] nudge failed: {exc!r} (call {room_name})", flush=True)
@@ -2375,6 +2499,17 @@ async def entrypoint(ctx):
         # 会令开场白期间 partial 唔受抑制。
         session.on("agent_state_changed", _on_partial_gate)
 
+    if _prefill_spec is not None:
+
+        def _on_spec_state(ev) -> None:
+            # LLM 生成/播报中不开火:预热请求排在真回复后面=抢不过还添堵
+            # (与 partial 抑制同一状态口径)。listening 恢复可开火。
+            _prefill_spec.set_busy(
+                str(getattr(ev, "new_state", "") or "") in ("thinking", "speaking")
+            )
+
+        session.on("agent_state_changed", _on_spec_state)
+
     watch_task = asyncio.create_task(_supervisor_watch())
     # AgentSession 内部已注册 job shutdown callback（自动 aclose），
     # 这里不能提前 close，否则会话在接通后立刻被销毁。
@@ -2414,6 +2549,7 @@ async def entrypoint(ctx):
         # (~2-4s TTFT)。paused(无开场白)分支在下方立即发(无开场白形状)。
         if _prefix_prewarm_armed:
             asyncio.create_task(_prefix_prewarm_task(agent, greeting_text))
+        _turn_origin["gen"] = "script"  # 开场白=脚本直念
         await _say_script(session, tts_provider, _tts_cache, greeting_text)
         # say() 返回=整段念完(playout end),唔係出声时刻——TTS 首包在 say 调用后
         # ~0.4s 就到了(2026-09-06 打点纠偏,旧名 greeting_queued 曾误读为出声慢)。
@@ -2452,6 +2588,12 @@ def run_agent() -> None:
     import sys
 
     from livekit.agents import WorkerOptions, cli
+
+    # 抢跑失效诊断探针（BOK_PREEMPTIVE_DEBUG=1）：须在 worker 起跑前包好框架
+    # 比较函数，否则首通 session 已绑旧引用。
+    from .preemptive_debug import install_preemptive_debug
+
+    install_preemptive_debug()
 
     # livekit-agents 1.7.x 的 cli.run_app 需要显式子命令（start）。
     if len(sys.argv) == 1:
