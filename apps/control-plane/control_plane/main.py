@@ -1583,6 +1583,27 @@ async def livekit_webhook(request: Request) -> dict:
             client = _lkapi_client()
             if client is None:
                 return "terminal"
+            if attempt > 0:
+                # 复查轮清扫(livekit OSS 缺口,2026-09-10 演练实证):worker 死后
+                # 其 job 永停 JS_RUNNING(dispatch 常驻"活跃"挡住补派),且新注册
+                # worker 不拾取 PENDING dispatch——双重死锁。agent 参与者确实不在
+                # 房时,删光本 agent 的 dispatch,让下面的 create 走全新补派。
+                try:
+                    from livekit.api import ListParticipantsRequest
+                    ps = await client.room.list_participants(ListParticipantsRequest(room=room_name))
+                    agent_absent = not any(
+                        p.identity == "bok-voice" or p.identity.startswith("agent-")
+                        for p in ps.participants
+                    )
+                    if agent_absent:
+                        for d in await client.agent_dispatch.list_dispatch(room_name=room_name):
+                            if d.agent_name == "bok-voice":
+                                await client.agent_dispatch.delete_dispatch(
+                                    dispatch_id=d.id, room_name=room_name
+                                )
+                                print(f"[webhook] stale dispatch {d.id} deleted (agent absent, call {room_name})", flush=True)
+                except Exception as exc:  # pragma: no cover - 清扫失败不致命,补派照走
+                    print(f"[webhook] stale sweep skipped: {exc!r} (call {room_name})", flush=True)
             try:
                 async with _redispatch_locks[room_name]:
                     if await has_active_dispatch(client, room_name):
