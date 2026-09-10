@@ -1,0 +1,158 @@
+{
+  "zh": [
+    {
+      "text": "好的，您稍等。",
+      "file": "zh-01.wav",
+      "dur_s": 1.01
+    },
+    {
+      "text": "我帮您看一下啊。",
+      "file": "zh-02.wav",
+      "dur_s": 0.92
+    },
+    {
+      "text": "马上帮您查一下。",
+      "file": "zh-03.wav",
+      "dur_s": 0.91
+    },
+    {
+      "text": "收到，您稍等。",
+      "file": "zh-04.wav",
+      "dur_s": 1.04
+    },
+    {
+      "text": "明白，稍等一下。",
+      "file": "zh-05.wav",
+      "dur_s": 1.04
+    },
+    {
+      "text": "嗯<#0.3#>让我看下。",
+      "file": "zh-06.wav",
+      "dur_s": 1.43
+    },
+    {
+      "text": "好的好的，您稍等。",
+      "file": "zh-07.wav",
+      "dur_s": 1.51
+    },
+    {
+      "text": "好的，请稍等一下。",
+      "file": "zh-08.wav",
+      "dur_s": 1.48
+    },
+    {
+      "text": "嗯，收到了。",
+      "file": "zh-09.wav",
+      "dur_s": 1.15
+    },
+    {
+      "text": "好，稍等一下啊。",
+      "file": "zh-10.wav",
+      "dur_s": 1.15
+    }
+  ],
+  "cantonese": [
+    {
+      "text": "好，我而家就幫你睇下。",
+      "file": "cantonese-01.wav",
+      "dur_s": 1.11
+    },
+    {
+      "text": "好，等一陣。",
+      "file": "cantonese-02.wav",
+      "dur_s": 0.94
+    },
+    {
+      "text": "收到，你等陣。",
+      "file": "cantonese-03.wav",
+      "dur_s": 1.33
+    },
+    {
+      "text": "明白，請稍等。",
+      "file": "cantonese-04.wav",
+      "dur_s": 1.16
+    },
+    {
+      "text": "冇問題，你等一陣。",
+      "file": "cantonese-05.wav",
+      "dur_s": 1.02
+    },
+    {
+      "text": "嗯<#0.2#>我睇下。",
+      "file": "cantonese-06.wav",
+      "dur_s": 1.49
+    },
+    {
+      "text": "好嘅，等我一陣。",
+      "file": "cantonese-07.wav",
+      "dur_s": 0.92
+    },
+    {
+      "text": "麻煩你稍為等一陣。",
+      "file": "cantonese-08.wav",
+      "dur_s": 1.08
+    },
+    {
+      "text": "收到，等我一陣。",
+      "file": "cantonese-09.wav",
+      "dur_s": 1.1
+    },
+    {
+      "text": "唔好急，等一陣先啊。",
+      "file": "cantonese-10.wav",
+      "dur_s": 1.1
+    }
+  ],
+  "en": [
+    {
+      "text": "Sure, one moment.",
+      "file": "en-01.wav",
+      "dur_s": 1.2
+    },
+    {
+      "text": "Let me see.",
+      "file": "en-02.wav",
+      "dur_s": 0.9
+    },
+    {
+      "text": "Got it.",
+      "file": "en-03.wav",
+      "dur_s": 0.98
+    },
+    {
+      "text": "Can you hold on a moment?",
+      "file": "en-04.wav",
+      "dur_s": 1.2
+    },
+    {
+      "text": "Of course I can do that.",
+      "file": "en-05.wav",
+      "dur_s": 1.53
+    },
+    {
+      "text": "I'm checking it right now.",
+      "file": "en-06.wav",
+      "dur_s": 1.17
+    },
+    {
+      "text": "Right away.",
+      "file": "en-07.wav",
+      "dur_s": 1.14
+    },
+    {
+      "text": "Checking now.",
+      "file": "en-08.wav",
+      "dur_s": 1.47
+    },
+    {
+      "text": "Let me look into that for you.",
+      "file": "en-09.wav",
+      "dur_s": 1.34
+    },
+    {
+      "text": "Sure, sure.",
+      "file": "en-10.wav",
+      "dur_s": 1.09
+    }
+  ]
+}

@@ -1588,9 +1588,9 @@ async def entrypoint(ctx):
         _bg_audio = None
     _filler = FillerDirector(
         session,
-        tts_provider,
-        _tts_cache,
-        lang_resolver=lambda: language_state.lang if language_state.lang in ("zh", "cantonese", "en") else "zh",
+        # 语言铁律(2026-09-10):垫话语言=装配时钉死的通话语言,构造时捕获,
+        # 绝不做运行时状态回退——en 通话曾因 lang 漂移落 zh 池放普通话垫话。
+        lang_resolver=lambda: greet_lang,
         player=_bg_audio,
         guards=lambda: (
             closed.is_set()
@@ -1601,6 +1601,9 @@ async def entrypoint(ctx):
     )
     if isinstance(tts_provider, CachedTTS):
         tts_provider.add_first_audio_listener(_filler.on_reply_first_audio)
+        # 播放排序契约(2026-09-10):垫话播完→gap→回复。回复首帧到达时若垫话
+        # 在播,流出口扣压(垫话剩余+gap),不再掐垫话。
+        tts_provider.set_hold_provider(_filler.hold_if_playing)
     # 快答库索引(PR-3):每通装配拉一次启用条目,变更下一通生效。拉取失败/
     # 空表 → 闸门整体惰性(零行为变化);命中还需应答音频已在本地缓存,
     # 未物化的条目自动视为未命中走 LLM(闸门绝不触发云合成)。

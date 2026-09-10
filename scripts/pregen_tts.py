@@ -207,11 +207,13 @@ async def main_async() -> int:
                     jobs.append((lang, _nudge_line(name, lang, i)))
 
     if args.fillers:
-        from agent_runtime.fillers import filler_lines
-
-        for lang, lines in filler_lines().items():
-            for line in lines:
-                jobs.append((lang, line))
+        # 2026-09-10 资产化改版:垫话=随源码分发的 wav 资产(fillers.py 只播文件),
+        # 不再走 tts_cache 预合成。生成入口迁至 scripts/gen_filler_assets.py。
+        print("[pregen] --fillers 已停用:垫话改为源码内音频资产,"
+              "运行 scripts/gen_filler_assets.py 生成(apps/agent/agent_runtime/assets/fillers/)")
+        args.fillers = False
+        if not (args.greetings or args.objects or args.qa):
+            return 0
 
     if args.qa:
         # Q→A 快路启用条目:应答文本按条目语言取对应 persona 音色物化——运行时

@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""垫话音频资产生成器(2026-09-10 拍板,spec 讨论见会话)。
+
+设计契约:
+- 垫话=随源码分发的固定资产:固定音色+固定参数预生成,与运行时人设音色解耦;
+- 万能话术:只保留注意力应承(好的/收到/明白/嗯)与等待邀请(稍等/我看下),
+  零动作动词——随机触发语境永不穿帮;
+- zh/粤 speed=1.2 pitch=0 vol=1.0;en speed=1.0(用户指定);
+- <#x#> 停顿标记直传(MiniMax 官方语法,x=秒,0.01-99.99,须夹在可发音文本间);
+- 每条实测时长目标 1.0-1.5s,窗 [0.9,1.6] WARN,窗外 FAIL;
+- 输出 wav(24k mono 16bit)+manifest.json 到 apps/agent/agent_runtime/assets/fillers/,
+  运行时(fillers.py)只播文件,绝不云合成。
+
+用法:
+    .venv312/bin/python scripts/gen_filler_assets.py [--dry-run] [--force]
+key 读取顺序: settings DB(tts.api_key) → MINIMAX_API_KEY env。端点同生产 worker:
+MINIMAX_BASE_URL > MINIMAX_REGION(cn→api.minimax.cn / intl→api.minimax.chat)。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import urllib.request
+import wave
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "apps" / "agent"))
+
+OUT_DIR = REPO / "apps" / "agent" / "agent_runtime" / "assets" / "fillers"
+SAMPLE_RATE = 24000
+MODEL = "speech-2.8-hd"
+
+# 万能话术清单(2026-09-10 用户逐条过审;第一轮实测修订:停顿标记只放句中
+# ——尾随标记违反官方「须夹在两段可发音文本之间」被静默忽略;短句以双 token
+# 或句中停顿拉到窗内,不靠尾随停顿)。改话术=改这里重新生成,一个 PR。
+# en 社媒女声逗号处拖长腔明显(Mm-hm, sure.=2.57s 实测),en 全部无逗号短句。
+FILLERS: dict[str, dict] = {
+    "zh": {
+        "voice": "Chinese_wenrounvxing",
+        "speed": 1.2,
+        "pitch": 0,
+        "lines": [
+            "好的，您稍等。",
+            "我帮您看一下啊。",
+            "马上帮您查一下。",
+            "收到，您稍等。",
+            "明白，稍等一下。",
+            "嗯<#0.3#>让我看下。",
+            "好的好的，您稍等。",
+            "好的，请稍等一下。",
+            "嗯，收到了。",
+            "好，稍等一下啊。",
+        ],
+    },
+    "cantonese": {
+        "voice": "Cantonese_crisp_news_anchor_vv2",
+        "speed": 1.2,
+        "pitch": 0,
+        "lines": [
+            "好，我而家就幫你睇下。",
+            "好，等一陣。",
+            "收到，你等陣。",
+            "明白，請稍等。",
+            "冇問題，你等一陣。",
+            "嗯<#0.2#>我睇下。",
+            "好嘅，等我一陣。",
+            "麻煩你稍為等一陣。",
+            "收到，等我一陣。",
+            "唔好急，等一陣先啊。",
+        ],
+    },
+    "en": {
+        "voice": "socialmedia_female_2_v1",
+        "speed": 1.0,
+        "pitch": 0,
+        "lines": [
+            "Sure, one moment.",
+            "Let me see.",
+            "Got it.",
+            "Can you hold on a moment?",
+            "Of course I can do that.",
+            "I'm checking it right now.",
+            "Right away.",
+            "Checking now.",
+            "Let me look into that for you.",
+            "Sure, sure.",
+        ],
+    },
+}
+
+WIN_WARN = (0.9, 1.6)
+WIN_FAIL = (0.8, 1.8)
+
+
+def load_api_key() -> str:
+    raw = os.environ.get("MINIMAX_API_KEY", "").strip()
+    if raw:
+        return raw
+    db = Path.home() / "Library" / "Application Support" / "BokVoice" / "bok_voice.db"
+    if db.exists():
+        row = sqlite3.connect(str(db)).execute(
+            "SELECT tts_json FROM global_settings WHERE id='global'"
+        ).fetchone()
+        if row:
+            key = str((json.loads(row[0]) or {}).get("api_key") or "").strip()
+            if key:
+                return key
+    print("FAIL: no MiniMax key (settings DB / MINIMAX_API_KEY)", file=sys.stderr)
+    sys.exit(2)
+
+
+def endpoint() -> str:
+    base = os.environ.get("MINIMAX_BASE_URL", "").strip().rstrip("/")
+    if base:
+        return base
+    region = os.environ.get("MINIMAX_REGION", "cn").strip().lower()
+    return "https://api.minimax.cn" if region == "cn" else "https://api.minimax.chat"
+
+
+def synth_pcm(key: str, base: str, text: str, voice: str, speed: float, pitch: int) -> bytes:
+    """t2a_v2 HTTP → 24k mono 16bit PCM。停顿标记 <#x#> 随 text 直传(句中)。
+
+    RPM 限频(1002)退避重试 ×3。"""
+    body = {
+        "model": MODEL,
+        "text": text,
+        "stream": False,
+        "voice_setting": {"voice_id": voice, "speed": float(speed), "vol": 1.0, "pitch": int(pitch)},
+        "audio_setting": {"sample_rate": SAMPLE_RATE, "format": "pcm", "channel": 1},
+    }
+    import certifi, ssl, time
+
+    ctx = ssl.create_default_context(cafile=certifi.where())
+    last = ""
+    for attempt in range(3):
+        req = urllib.request.Request(
+            f"{base}/v1/t2a_v2",
+            data=json.dumps(body).encode(),
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60, context=ctx) as resp:
+            data = json.loads(resp.read().decode())
+        code = int(data.get("base_resp", {}).get("status_code", -1))
+        if code == 0:
+            audio = (data.get("data") or {}).get("audio")
+            if not audio:
+                raise RuntimeError(f"minimax empty audio: {str(data)[:200]}")
+            return bytes.fromhex(audio)
+        last = str(data.get("base_resp"))
+        if code == 1002:  # rate limit(RPM)——退避后重试
+            time.sleep(10 * (attempt + 1))
+            continue
+        break
+    raise RuntimeError(f"minimax base_resp={last}")
+
+
+def trim_silence(pcm: bytes) -> bytes:
+    """首尾静音修剪(阈值 200,保留 20ms 余量)+15ms fade 防咔哒。"""
+    import array
+
+    samples = array.array("h")
+    samples.frombytes(pcm)
+    n = len(samples)
+    thr = 200
+    lead = 0
+    while lead < n and abs(samples[lead]) < thr:
+        lead += 1
+    trail = n
+    while trail > lead and abs(samples[trail - 1]) < thr:
+        trail -= 1
+    keep = 320  # 20ms @24k 余量
+    lead = max(0, lead - keep)
+    trail = min(n, trail + keep)
+    out = samples[lead:trail]
+    fade = 360  # 15ms
+    for i in range(min(fade, len(out))):
+        out[i] = int(out[i] * i / fade)
+        out[-1 - i] = int(out[-1 - i] * i / fade)
+    return out.tobytes()
+
+
+def write_wav(path: Path, pcm: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLE_RATE)
+        w.writeframes(pcm)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--force", action="store_true", help="超窗也写资产(manifest 标 warn)")
+    args = ap.parse_args()
+
+    key = load_api_key()
+    base = endpoint()
+    print(f"endpoint={base} model={MODEL} out={OUT_DIR}")
+
+    manifest: dict[str, list[dict]] = {}
+    failures: list[str] = []
+    if not args.dry_run:
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    for lang, cfg in FILLERS.items():
+        entries: list[dict] = []
+        for i, text in enumerate(cfg["lines"], 1):
+            name = f"{lang}-{i:02d}.wav"
+            if args.dry_run:
+                print(f"[plan] {name}: {text!r} voice={cfg['voice']} speed={cfg['speed']}")
+                continue
+            target = OUT_DIR / name
+            if target.exists() and not args.force:
+                with wave.open(str(target), "rb") as w:
+                    dur = w.getnframes() / w.getframerate()
+                print(f"SKIP {name}: {dur:.2f}s (已存在)")
+                entries.append({"text": text, "file": name, "dur_s": round(dur, 2)})
+                continue
+            pcm = synth_pcm(key, base, text, cfg["voice"], cfg["speed"], cfg["pitch"])
+            pcm = trim_silence(pcm)
+            dur = len(pcm) / 2 / SAMPLE_RATE
+            ok = WIN_FAIL[0] <= dur <= WIN_FAIL[1]
+            warn = not (WIN_WARN[0] <= dur <= WIN_WARN[1])
+            mark = "OK " if not warn else ("WARN" if ok else "FAIL")
+            print(f"{mark} {name}: {dur:.2f}s {text!r}")
+            if not ok and not args.force:
+                failures.append(f"{name} {dur:.2f}s 超窗 {text!r}")
+                continue
+            write_wav(target, pcm)
+            entries.append({"text": text, "file": name, "dur_s": round(dur, 2)})
+        manifest[lang] = entries
+        import time as _t
+
+        _t.sleep(2)  # 语言批次间限频缓冲
+
+    if args.dry_run:
+        return 0
+    (OUT_DIR / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(f"manifest.json written ({sum(len(v) for v in manifest.values())} entries)")
+    if failures:
+        print("FAIL(超窗未写入,改话术后重跑):", *failures, sep="\n  ", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -266,13 +266,16 @@ class _StoreChunkedStream(tts.ChunkedStream):
 class _RelaySynthesizeStream(tts.SynthesizeStream):
     """stream() 透传:输入逐条转内芯,音频转发本 emitter(整轮单 segment,同 bidi 口径)。
 
-    首个音频帧触发 on_first_audio 回调一次(PR-2 垫话:真回复出声 → 取消垫话)。
+    首个音频帧触发 on_first_audio 回调一次(PR-2 垫话),随后向 hold_provider
+    询问扣压时长——播放排序契约(2026-09-10):在播垫话必须播完,垫话→gap→回复,
+    不再掐垫话;帧在本流内缓冲到点再放,内芯 iterator 惰性天然背压。
     """
 
-    def __init__(self, *, tts_: tts.TTS, inner: tts.SynthesizeStream, on_first_audio) -> None:
+    def __init__(self, *, tts_: tts.TTS, inner: tts.SynthesizeStream, on_first_audio, hold_provider=None) -> None:
         super().__init__(tts=tts_, conn_options=APIConnectOptions(max_retry=0))
         self._inner = inner
         self._on_first_audio = on_first_audio
+        self._hold_provider = hold_provider
         self._fired = False
 
     async def _metrics_monitor_task(self, event_aiter) -> None:
@@ -306,6 +309,18 @@ class _RelaySynthesizeStream(tts.SynthesizeStream):
                             self._on_first_audio()
                         except Exception:  # noqa: BLE001 - 回调失败唔阻播放
                             pass
+                        if self._hold_provider is not None:
+                            try:
+                                hold = float(self._hold_provider() or 0.0)
+                            except Exception:  # noqa: BLE001 - 询时失败=不扣压
+                                hold = 0.0
+                            if hold > 0:
+                                print(
+                                    f"BOK_FILLER hold reply {hold * 1000:.0f}ms"
+                                    " (垫话播完+gap 后衔接回复)",
+                                    flush=True,
+                                )
+                                await asyncio.sleep(hold)
                     data = ev.frame.data
                     chunk = data.tobytes() if isinstance(data, memoryview) else bytes(data)
                     output_emitter.push(chunk)
@@ -352,6 +367,7 @@ class CachedTTS(tts.TTS):
         self._voice_provider = voice_provider or (lambda: "")
         self._model_provider = model_provider or (lambda: "")
         self._first_audio_cbs: list = []
+        self._hold_provider = None  # 垫话扣压(FillerDirector.hold_if_playing),agent 侧注入
         wrapped.on("metrics_collected", self._forward_metric)
 
     @property
@@ -376,6 +392,11 @@ class CachedTTS(tts.TTS):
 
     def add_first_audio_listener(self, cb) -> None:
         self._first_audio_cbs.append(cb)
+
+    def set_hold_provider(self, cb) -> None:
+        """注入垫话扣压询问(FillerDirector.hold_if_playing)——回复首帧到达时
+        若垫话在播,返回「垫话剩余+gap」秒数,帧缓冲到点再放(播放排序契约)。"""
+        self._hold_provider = cb
 
     def _fire_first_audio(self) -> None:
         for cb in list(self._first_audio_cbs):
@@ -424,7 +445,10 @@ class CachedTTS(tts.TTS):
 
     def stream(self, *, conn_options=None) -> tts.SynthesizeStream:
         inner = self._wrapped.stream(conn_options=self._norm_conn_options(conn_options))
-        return _RelaySynthesizeStream(tts_=self, inner=inner, on_first_audio=self._fire_first_audio)
+        return _RelaySynthesizeStream(
+            tts_=self, inner=inner, on_first_audio=self._fire_first_audio,
+            hold_provider=self._hold_provider,
+        )
 
     def prewarm(self) -> None:
         self._wrapped.prewarm()
