@@ -174,6 +174,9 @@ def test_flush_on_end_input_and_connection_kept(monkeypatch, capsys):
 
 def test_cancel_sends_task_cancel_and_keeps_connection(monkeypatch):
     """打断 → task_cancel + 等 task_canceled;连接保留,下个流同一条连接继续。"""
+    # 本场景( cancel 应答超时 3s + s2 等 flushed )天然存活 >6s,唔係 stall;
+    # 关掉本任务无关的首包看门狗,避免 6s 无音频被判僵死重连。
+    monkeypatch.setenv("MINIMAX_BIDI_FIRST_AUDIO_TIMEOUT_S", "0")
     ws = _FakeWS([_CONNECTED, _STARTED, _CANCELED, _FLUSHED, _FLUSHED])
     fake_connect = _FakeConnect([ws])
     monkeypatch.setattr("websockets.connect", fake_connect)
@@ -624,3 +627,114 @@ def test_ping_consecutive_misses_force_invalidate(monkeypatch, capsys):
     assert "MINIMAX_TTS_BIDI_PING_TIMEOUT miss=1" in out
     assert "MINIMAX_TTS_BIDI_PING_TIMEOUT miss=2" in out
     assert "MINIMAX_TTS_BIDI_DEAD" in out
+
+
+# ---- 2026-09-10 bidi 首包看门狗(重连+重发) ------------------------------------
+
+
+def test_bidi_first_audio_timeout_env(monkeypatch):
+    """MINIMAX_BIDI_FIRST_AUDIO_TIMEOUT_S 读 env;缺省 6;"0" 关;配错回 6。"""
+    monkeypatch.delenv("MINIMAX_BIDI_FIRST_AUDIO_TIMEOUT_S", raising=False)
+    assert lp._MiniMaxBidiStream._first_audio_timeout_s() == 6.0
+    monkeypatch.setenv("MINIMAX_BIDI_FIRST_AUDIO_TIMEOUT_S", "2.5")
+    assert lp._MiniMaxBidiStream._first_audio_timeout_s() == 2.5
+    monkeypatch.setenv("MINIMAX_BIDI_FIRST_AUDIO_TIMEOUT_S", "abc")
+    assert lp._MiniMaxBidiStream._first_audio_timeout_s() == 6.0, "配错回默认 6"
+    monkeypatch.setenv("MINIMAX_BIDI_FIRST_AUDIO_TIMEOUT_S", "0")
+    assert lp._MiniMaxBidiStream._first_audio_timeout_s() == 0.0, "0=关"
+
+
+def test_bidi_stall_watchdog_reconnects_and_resends(monkeypatch, capsys):
+    """首段文本发出后 1s 无首包 → MINIMAX_TTS_BIDI_STALL:弃旧连接、新连接上
+    单条合并重发已发文本、认领纪元、首包计时复位,音频恢复推送,后续文本落新连接。"""
+    monkeypatch.setenv("MINIMAX_BIDI_FIRST_AUDIO_TIMEOUT_S", "1")
+    ws1 = _FakeWS([_CONNECTED, _STARTED])  # 僵死:握手后永远不出音频
+    ws2 = _FakeWS([_CONNECTED, _STARTED, _AUDIO, _FLUSHED])
+    fake_connect = _FakeConnect([ws1, ws2])
+    monkeypatch.setattr("websockets.connect", fake_connect)
+    tts = _make_tts()
+    session = tts._bidi_session()
+    got = {"audio": bytearray()}
+
+    async def run():
+        s = tts.stream()
+        s.push_text("你好")  # 两个分片 → 两条 task_continue → 重发必须单条合并
+        s.push_text("。")
+        assert await _wait_for(lambda: len(_continue_texts(ws1)) == 2), _continue_texts(ws1)
+        # 1s 无首包 → 看门狗重连
+        assert await _wait_for(
+            lambda: fake_connect.calls == 2, timeout=5
+        ), f"看门狗应重连: calls={fake_connect.calls}"
+        assert ws1.closed, "僵死旧连接应被 invalidate 关闭"
+        assert await _wait_for(
+            lambda: _continue_texts(ws2) == ["你好。"], timeout=5
+        ), f"新连接应单条合并重发已发文本: {_continue_texts(ws2)}"
+        assert _events(ws2)[:2] == ["task_start", "task_continue"], _events(ws2)
+        assert session.active_epoch == 1, "重发应认领本流纪元"
+        # 重连后新文本直落新连接(闸清、闭包重绑)
+        s.push_text("再见")
+        assert await _wait_for(lambda: "再见" in _continue_texts(ws2), timeout=5), _continue_texts(ws2)
+        s.end_input()
+        await _wait_for(lambda: s._task.done(), timeout=10)
+        async for a in s:
+            got["audio"] += bytes(a.frame.data)
+
+    asyncio.run(asyncio.wait_for(run(), timeout=15))
+    assert _continue_texts(ws2) == ["你好。", "再见"], "合并重发单条在前,后续文本按序跟进"
+    assert "task_flush" in _events(ws2)
+    audio = bytes(got["audio"])
+    # emitter 收尾会带少量尾帧,同既有测试用内容包含断言,唔做全等
+    assert b"\x00" * 2000 in audio, f"重连后音频应恢复推送: {len(audio)} bytes"
+    out = capsys.readouterr().out
+    assert "MINIMAX_TTS_BIDI_STALL" in out
+    assert "MINIMAX_TTS_BIDI_STALL_FAIL" not in out
+    assert "first_continue_to_audio_ms=" in out, "计时复位后重连首包应重打 PERF"
+
+
+def test_bidi_stall_watchdog_off(monkeypatch, capsys):
+    """MINIMAX_BIDI_FIRST_AUDIO_TIMEOUT_S=0:看门狗关,无首包也照旧挂起等,唔重连。"""
+    monkeypatch.setenv("MINIMAX_BIDI_FIRST_AUDIO_TIMEOUT_S", "0")
+    ws1 = _FakeWS([_CONNECTED, _STARTED, _CANCELED])
+    fake_connect = _FakeConnect([ws1])
+    monkeypatch.setattr("websockets.connect", fake_connect)
+    tts = _make_tts()
+
+    async def run():
+        s = tts.stream()
+        s.push_text("你好")
+        assert await _wait_for(lambda: len(_continue_texts(ws1)) == 1)
+        await asyncio.sleep(1.5)  # 跨过默认阈值也唔重连
+        assert fake_connect.calls == 1, "env=0 唔应重连"
+        assert not ws1.closed
+        s._task.cancel()
+        await asyncio.sleep(0.2)
+
+    asyncio.run(asyncio.wait_for(run(), timeout=10))
+    assert "MINIMAX_TTS_BIDI_STALL" not in capsys.readouterr().out
+
+
+def test_bidi_stall_watchdog_not_armed_when_audio_arrives(monkeypatch, capsys):
+    """音频按时到达 → 看门狗到点也不触发:唔重连、唔拆连接、唔重发。"""
+    monkeypatch.setenv("MINIMAX_BIDI_FIRST_AUDIO_TIMEOUT_S", "1")
+    ws1 = _FakeWS([_CONNECTED, _STARTED, _AUDIO, _FLUSHED])
+    fake_connect = _FakeConnect([ws1])
+    monkeypatch.setattr("websockets.connect", fake_connect)
+    tts = _make_tts()
+    got = {"audio": bytearray()}
+
+    async def run():
+        s = tts.stream()
+        s.push_text("你好")
+        s.end_input()
+        await _wait_for(lambda: s._task.done(), timeout=10)
+        async for a in s:
+            got["audio"] += bytes(a.frame.data)
+        await asyncio.sleep(1.3)  # 跨过阈值:已出首包,看门狗必须静默
+        assert fake_connect.calls == 1, "已出首包唔应重连"
+        assert not ws1.closed
+        assert _continue_texts(ws1) == ["你好"], "唔应重发"
+
+    asyncio.run(asyncio.wait_for(run(), timeout=15))
+    # emitter 收尾会带少量尾帧,用内容包含断言
+    assert b"\x00" * 2000 in bytes(got["audio"])
+    assert "MINIMAX_TTS_BIDI_STALL" not in capsys.readouterr().out
