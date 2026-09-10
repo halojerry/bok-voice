@@ -738,3 +738,179 @@ def test_bidi_stall_watchdog_not_armed_when_audio_arrives(monkeypatch, capsys):
     # emitter 收尾会带少量尾帧,用内容包含断言
     assert b"\x00" * 2000 in bytes(got["audio"])
     assert "MINIMAX_TTS_BIDI_STALL" not in capsys.readouterr().out
+
+
+# ---- 2026-09-10 Task 8: prewarm 失败重试 + 可选合成级预热 ----------------------
+
+
+class _FailFirstConnect:
+    """前 fail_n 次 connect 抛错,之后回 fake WS(测预热失败重试/重试关)。"""
+
+    def __init__(self, socket: _FakeWS, fail_n: int = 1):
+        self._socket = socket
+        self._fail_n = fail_n
+        self.calls = 0
+
+    async def __call__(self, *a, **kw):
+        self.calls += 1
+        if self.calls <= self._fail_n:
+            raise RuntimeError(f"transient connect boom #{self.calls}")
+        return self._socket
+
+
+class _RecvDieWS(_FakeWS):
+    """脚本耗尽后 recv 直接抛错(模拟预热合成中服务端断连)。"""
+
+    async def recv(self):
+        if self._script:
+            return self._script.pop(0)
+        raise ConnectionError("server gone mid-warmup")
+
+
+def test_prewarm_fail_retries_once(monkeypatch, capsys):
+    """预热失败 → 1s 后自动重试一次成功(MINIMAX_BIDI_PREWARM_RETRY 缺省=1,
+    官方 #6969 姿势);重试成功的连接计入 _connect_and_start 成功尾 → 计数清零。"""
+    monkeypatch.delenv("MINIMAX_BIDI_PREWARM_RETRY", raising=False)  # 缺省=开
+    monkeypatch.delenv("MINIMAX_BIDI_SYNTH_WARMUP", raising=False)
+    good = _FakeWS([_CONNECTED, _STARTED])
+    fake_connect = _FailFirstConnect(good, fail_n=1)
+    monkeypatch.setattr("websockets.connect", fake_connect)
+    tts = _make_tts()
+    session = tts._bidi_session()
+
+    async def run():
+        t0 = time.monotonic()
+        session.prewarm()
+        assert await _wait_for(lambda: session._ws is good), "重试后应连上"
+        elapsed = time.monotonic() - t0
+        assert elapsed >= 0.9, f"重试应等 1s 退避再连,实测 {elapsed:.2f}s"
+        assert fake_connect.calls == 2, "失败 1 次 + 重试 1 次 = 两次连接"
+        assert session._prewarm_retries == 0, "连接成功应清零重试计数"
+        assert await _wait_for(lambda: session._prewarm_task.done())
+        await session.aclose()  # 收摊:停 ping 循环
+
+    asyncio.run(asyncio.wait_for(run(), timeout=10))
+    out = capsys.readouterr().out
+    assert "MINIMAX_TTS_BIDI_PREWARM_FAIL" in out
+    assert "MINIMAX_TTS_BIDI_PREWARM connect_ms=" in out, "重试成功应照常打 PREWARM 点"
+
+
+def test_prewarm_retry_disabled_only_one_attempt(monkeypatch, capsys):
+    """MINIMAX_BIDI_PREWARM_RETRY=0:失败只试一次,唔重试、连接保持弃置。"""
+    monkeypatch.setenv("MINIMAX_BIDI_PREWARM_RETRY", "0")
+    fake_connect = _FailFirstConnect(_FakeWS([_CONNECTED, _STARTED]), fail_n=999)
+    monkeypatch.setattr("websockets.connect", fake_connect)
+    tts = _make_tts()
+    session = tts._bidi_session()
+
+    async def run():
+        session.prewarm()
+        assert await _wait_for(lambda: session._prewarm_task.done()), "失败后任务应收尾"
+        await asyncio.sleep(1.3)  # 跨过 1s 重试退避窗:env=0 也绝唔重试
+        assert fake_connect.calls == 1, "RETRY=0 唔应发起第二次连接"
+        assert session._ws is None, "失败后连接应保持弃置"
+        await session.aclose()
+
+    asyncio.run(asyncio.wait_for(run(), timeout=10))
+    assert "MINIMAX_TTS_BIDI_PREWARM_FAIL" in capsys.readouterr().out
+
+
+def test_aclose_during_retry_backoff_cancels_retry(monkeypatch):
+    """T7 共存:teardown(aclose) 落喺 1s 重试退避 sleep 内 → 重试任务被取消,
+    teardown 后绝唔拉新连接(retry 期间 _prewarm_task 引用保持指向本任务)。"""
+    fake_connect = _FailFirstConnect(_FakeWS([_CONNECTED, _STARTED]), fail_n=999)
+    monkeypatch.setattr("websockets.connect", fake_connect)
+    monkeypatch.delenv("MINIMAX_BIDI_PREWARM_RETRY", raising=False)  # 缺省=开
+    tts = _make_tts()
+    session = tts._bidi_session()
+
+    async def run():
+        session.prewarm()
+        # 进入失败分支:首次连接已发生且任务还活着(失败收尾+退避 sleep 中)
+        assert await _wait_for(
+            lambda: fake_connect.calls == 1 and not session._prewarm_task.done()
+        )
+        await session.aclose()
+        await asyncio.sleep(1.3)  # 跨过退避窗:被取消的重试绝唔醒来拉新连接
+        assert fake_connect.calls == 1, "teardown 后重试不得发起新连接"
+        assert session._prewarm_task is None
+
+    asyncio.run(asyncio.wait_for(run(), timeout=10))
+
+
+def test_synth_warmup_sends_and_discards(monkeypatch, capsys):
+    """MINIMAX_BIDI_SYNTH_WARMUP=1:预热连接后发一条 task_continue(顶层 text 字段)
+    +task_flush,收包丢音频至 task_flushed;连接仍活、参数指纹唔变、唔认领纪元
+    (残留音频门禁由首个真实流兜底)。"""
+    monkeypatch.setenv("MINIMAX_BIDI_SYNTH_WARMUP", "1")
+    ws = _FakeWS([_CONNECTED, _STARTED, _AUDIO, _FLUSHED])
+    fake_connect = _FakeConnect([ws])
+    monkeypatch.setattr("websockets.connect", fake_connect)
+    tts = _make_tts()
+    session = tts._bidi_session()
+
+    async def run():
+        session.prewarm()
+        assert await _wait_for(lambda: session._prewarm_task.done())
+        assert _events(ws) == ["task_start", "task_continue", "task_flush"], _events(ws)
+        assert _continue_texts(ws) == ["好的，您稍等。"], _continue_texts(ws)
+        assert session._alive() and not ws.closed, "预热合成后连接应保留复用"
+        assert session._params == tts._bidi_params_key(), "合成级预热唔应动参数指纹"
+        assert session.active_epoch == 0, "暖机合成唔认领纪元,音频全靠门禁丢弃"
+        await session.aclose()
+
+    asyncio.run(asyncio.wait_for(run(), timeout=10))
+    assert fake_connect.calls == 1
+    out = capsys.readouterr().out
+    assert "MINIMAX_BIDI_SYNTH_WARMUP ms=" in out
+    assert "MINIMAX_BIDI_SYNTH_WARMUP_FAIL" not in out
+
+
+def test_synth_warmup_off_sends_nothing(monkeypatch, capsys):
+    """SYNTH_WARMUP 缺省(=0,T1 探针:合成级预热零收益):预热只建连,唔发
+    task_continue/task_flush。"""
+    monkeypatch.delenv("MINIMAX_BIDI_SYNTH_WARMUP", raising=False)
+    ws = _FakeWS([_CONNECTED, _STARTED])
+    fake_connect = _FakeConnect([ws])
+    monkeypatch.setattr("websockets.connect", fake_connect)
+    tts = _make_tts()
+    session = tts._bidi_session()
+
+    async def run():
+        session.prewarm()
+        assert await _wait_for(lambda: session._prewarm_task.done())
+        assert _events(ws) == ["task_start"], f"只应 task_start: {_events(ws)}"
+        assert session._alive()
+        await session.aclose()
+
+    asyncio.run(asyncio.wait_for(run(), timeout=10))
+    out = capsys.readouterr().out
+    assert "MINIMAX_BIDI_SYNTH_WARMUP" not in out
+    assert "task_continue" not in out
+
+
+def test_synth_warmup_fail_no_invalidate(monkeypatch, capsys):
+    """合成级预热自身失败(服务端合成中断连)→ 只打 SYNTH_WARMUP_FAIL:
+    唔 invalidate、连接/指纹保留、唔触发 prewarm 失败重试(预热文本合成失败≠连接坏)。"""
+    monkeypatch.setenv("MINIMAX_BIDI_SYNTH_WARMUP", "1")
+    ws = _RecvDieWS([_CONNECTED, _STARTED])
+    fake_connect = _FakeConnect([ws])
+    monkeypatch.setattr("websockets.connect", fake_connect)
+    tts = _make_tts()
+    session = tts._bidi_session()
+
+    async def run():
+        session.prewarm()
+        assert await _wait_for(lambda: session._prewarm_task.done())
+        await asyncio.sleep(1.3)  # 跨过重试退避窗:预热成功路径唔应触发重试
+        assert fake_connect.calls == 1, "暖机失败唔应重连(invalidate 才会)"
+        assert session._ws is ws and not ws.closed, "连接应保留"
+        assert session._params == tts._bidi_params_key(), "指纹应保留"
+        assert _continue_texts(ws) == ["好的，您稍等。"], "continue/flush 已发出"
+        await session.aclose()
+
+    asyncio.run(asyncio.wait_for(run(), timeout=10))
+    out = capsys.readouterr().out
+    assert "MINIMAX_BIDI_SYNTH_WARMUP_FAIL" in out
+    assert "MINIMAX_TTS_BIDI_PREWARM_FAIL" not in out, "暖机失败唔应升级成预热失败"
+    assert "MINIMAX_TTS_BIDI_PREWARM connect_ms=" in out, "预热主流程应照常成功收尾"

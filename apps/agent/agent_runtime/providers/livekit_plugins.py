@@ -2439,6 +2439,8 @@ class _MiniMaxBidiSession:
         # 供 PERF 打点:ensure_ready 本次是复用还是新连
         self.last_reused = False
         self.last_connect_ms = 0.0
+        # prewarm 失败重试计数(官方 #6969 姿势,上限 1):连接成功即清零
+        self._prewarm_retries = 0
 
     def alloc_epoch(self) -> int:
         """为本流分配纪元号（只占号，唔认领——认领发生在首个 task_continue）。"""
@@ -2550,6 +2552,29 @@ class _MiniMaxBidiSession:
         self._ws = ws
         self._params = params
         self._start_ping(ws)
+        self._prewarm_retries = 0  # 连接成功,重试计数归零
+
+    async def _synth_warmup(self, ws) -> None:
+        """合成级预热:连接建好后立刻做一次真实合成把服务端会话焐热,音频全丢。
+        task_continue 用顶层 text 字段(同生产发送代码,唔係 data 嵌套);收包至
+        task_flushed 止,单次 recv 8s 上限防挂死。自身异常只打日志不 invalidate——
+        预热文本合成失败≠连接坏,残留音频由首个真实流的纪元门禁兜底丢弃。"""
+        try:
+            t0 = time.monotonic()
+            await ws.send(json.dumps({"event": "task_continue", "text": "好的，您稍等。"}))
+            await ws.send(json.dumps({"event": "task_flush"}))
+            while True:  # 丢弃音频至 task_flushed(上限 8s);纪元门禁由首个真实流兜底
+                raw = await asyncio.wait_for(ws.recv(), timeout=8)
+                if json.loads(raw).get("event") == "task_flushed":
+                    break
+            print(
+                f"MINIMAX_BIDI_SYNTH_WARMUP ms={(time.monotonic() - t0) * 1000:.0f}",
+                flush=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 预热失败≠连接坏,唔 invalidate
+            print(f"MINIMAX_BIDI_SYNTH_WARMUP_FAIL {exc!r}", flush=True)
 
     async def ensure_ready(self):
         """返回可 task_continue 的连接（调用方已持 lock）。
@@ -2630,6 +2655,11 @@ class _MiniMaxBidiSession:
             async with self._lock:
                 if not self._alive():
                     await self._connect_and_start(self._tts_._bidi_params_key())
+                    # 合成级预热(T1 探针:处女连接首合成仅比二次慢 ~22ms,收益可忽略
+                    # 故默认关):锁内执行——真实流 ensure_ready 排同一把锁,预热文本
+                    # 唔会与真实轮 task_continue 在服务端同会话串台。
+                    if os.environ.get("MINIMAX_BIDI_SYNTH_WARMUP", "0") == "1":
+                        await self._synth_warmup(self._ws)
             print(
                 f"MINIMAX_TTS_BIDI_PREWARM connect_ms={self.last_connect_ms:.0f}",
                 flush=True,
@@ -2639,6 +2669,18 @@ class _MiniMaxBidiSession:
         except Exception as exc:  # noqa: BLE001 - 预热尽力而为,首段合成自会重试
             print(f"MINIMAX_TTS_BIDI_PREWARM_FAIL {exc!r}", flush=True)
             await self.invalidate()
+            # 官方 #6969 姿势:失败 1s 后重试一次(上限 1,连接成功即清零计数)。
+            # 休眠期间 _prewarm_task 仍指向本任务——teardown(aclose)的 cancel 会在
+            # sleep 点掀掉重试,teardown 后绝不拉新连接;醒来先清自引用再走 prewarm()
+            # 幂等门重建(门内 alive/在飞检查照常生效,唔破 T6 死亡重预热去重)。
+            if (
+                self._prewarm_retries < 1
+                and os.environ.get("MINIMAX_BIDI_PREWARM_RETRY", "1") == "1"
+            ):
+                self._prewarm_retries += 1
+                await asyncio.sleep(1.0)
+                self._prewarm_task = None
+                self.prewarm()
 
 
 class _MiniMaxBidiStream(tts.SynthesizeStream):
