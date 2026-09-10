@@ -100,6 +100,14 @@ class SqlAlchemyBusinessRepository:
             provider=turn.provider,
             latency_ms=turn.latency_ms,
             language=turn.language,
+            org_id=turn.org_id,
+            line=turn.line,
+            speaker=turn.speaker,
+            gen=turn.gen,
+            template_step=turn.template_step,
+            started_ms=turn.started_ms,
+            ended_ms=turn.ended_ms,
+            perceived_ms=turn.perceived_ms,
         )
         try:
             self.session.add(row)
@@ -129,6 +137,14 @@ class SqlAlchemyBusinessRepository:
                 latency_ms=row.latency_ms,
                 language=row.language,
                 created_at=row.created_at.isoformat() if row.created_at else "",
+                org_id=row.org_id,
+                line=row.line,
+                speaker=row.speaker,
+                gen=row.gen,
+                template_step=row.template_step,
+                started_ms=row.started_ms,
+                ended_ms=row.ended_ms,
+                perceived_ms=row.perceived_ms,
             )
             for row in rows
         ]

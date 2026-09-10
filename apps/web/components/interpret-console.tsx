@@ -27,7 +27,7 @@ import {
 } from "livekit-client";
 import { useSession, useTranscriptions } from "@livekit/components-react";
 import { AgentSessionProvider } from "@/components/agents-ui/agent-session-provider";
-import { api, CONTROL_PLANE_URL } from "@/lib/api";
+import { api, apiBase } from "@/lib/api";
 import { describeConnectError } from "@/lib/api-ready";
 import {
   listAudioDevicesOf,
@@ -741,7 +741,7 @@ function watchTransAudio(room: Room | null, setHeld: (v: boolean) => void): () =
 }
 
 async function fetchToken(account: string, callId: string, role: "me" | "other"): Promise<{ serverUrl: string; participantToken: string }> {
-  const resp = await fetch(`${CONTROL_PLANE_URL}/api/token`, {
+  const resp = await fetch(`${apiBase()}/api/token`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ account_id: account, call_id: callId, participant_identity: `${role}-${callId}` }),

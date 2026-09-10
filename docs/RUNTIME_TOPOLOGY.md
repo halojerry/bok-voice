@@ -3,6 +3,16 @@
 > 本文件是"安装后的 App 能不能正常使用"的唯一验收基准。任何改动必须保证
 > 按这张图跑起来：组件齐全、端口可达、数据落在 app-data、bundle 只读。
 
+## 0. 分发型拓扑（P0 起双形态，spec=2026-09-10-thin-node-saas-design.md）
+
+单机形态（本文其余部分描述的 dev/打包形态）不变。分发货形态新增：
+- **云 CP**：同一 control-plane 代码，`DATABASE_URL` 指 Supabase Postgres；托管管理台静态 UI
+- **节点包**：LiveKit + ASR/LLM sidecar + agent/interp worker + node-agent（tools/node_agent.py，
+  心跳 :8000/api/nodes/heartbeat，commands 通道 P3）+ 节点本地托管坐席 UI（runtime-config.js 注入
+  cpUrl/livekitUrl，spec §8 纯内网档）
+- 新数据列：turns.org_id/line/speaker/gen/template_step/started_ms/ended_ms/perceived_ms（分析账本，spec §6.1）
+- 新表：orgs/nodes（org 缝 + 节点注册表，node_token 只存 sha256）
+
 ## 1. 组件与端口
 
 | 组件 | 端口/协议 | 职责 | 运行时 | 数据落点 |

@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { StartAudio, useAudioPlayback, useMediaDeviceSelect, usePersistentUserChoices, useSession, useTranscriptions } from "@livekit/components-react";
 import { ConnectionState, TokenSource, type Room } from "livekit-client";
-import { api, CONTROL_PLANE_URL } from "@/lib/api";
+import { api, apiBase } from "@/lib/api";
 import { describeConnectError, friendlyErrorText } from "@/lib/api-ready";
 import {
   applyOutputDevice,
@@ -56,7 +56,7 @@ export default function InterpretPage() {
   // 官方 TokenSource.endpoint：直连 CP /api/token（官方契约），useSession options
   // 驱动官方请求体（room_name / participant_identity），CP 按 identity 前缀反推
   // 角色并挂 agent 分发。进房动作在渲染后的 effect 里（见下），options 时序安全。
-  const tokenSource = useMemo(() => TokenSource.endpoint(`${CONTROL_PLANE_URL}/api/token`), []);
+  const tokenSource = useMemo(() => TokenSource.endpoint(`${apiBase()}/api/token`), []);
   const roomId = callId || joinRoom.trim();
   const session = useSession(tokenSource, {
     roomName: roomId || undefined,

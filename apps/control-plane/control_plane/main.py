@@ -11,9 +11,10 @@ from collections import defaultdict
 from pathlib import Path
 
 import httpx
-from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
+from pydantic import BaseModel
 
 from bok_voice_core.providers import BusinessRepository
 from bok_voice_core.policies import select_session_manifest
@@ -33,6 +34,7 @@ from bok_voice_obs.middleware import CorrelationMiddleware
 
 from .deps import build_engine, build_repository, build_session_factory
 from .dispatch_utils import cleanup_dispatch, has_active_dispatch
+from .nodes_store import HEARTBEAT_INTERVAL_S, NodeStore
 from .schemas import (
     CreateCallRequest,
     CreateObjectRequest,
@@ -66,11 +68,14 @@ app.add_middleware(CorrelationMiddleware)
 async def optional_bearer_auth(request: Request, call_next):
     """可选 Bearer 鉴权（R2）：BOK_CP_TOKEN 未设=全放行（本机单用户形态零变化）。
 
-    设置后除 /health 外全部端点要求 `Authorization: Bearer <BOK_CP_TOKEN>`——
-    暴露到局域网/云之前必须设置；agent(worker env)与 web 需同步带同值。
+    设置后除 /health 与 /api/nodes/heartbeat 外全部端点要求
+    `Authorization: Bearer <BOK_CP_TOKEN>`——暴露到局域网/云之前必须设置；
+    agent(worker env)与 web 需同步带同值。心跳豁免：该端点用注册时签发的
+    node_token 自鉴权（sha256 比对，与 CP token 不同源），CP 门禁会把它拦死
+    令节点注册表失联；register/list 属管理操作，仍在门禁内。
     """
     expected = os.environ.get("BOK_CP_TOKEN", "").strip()
-    if expected and request.url.path != "/health":
+    if expected and request.url.path not in ("/health", "/api/nodes/heartbeat"):
         if request.headers.get("authorization", "") != f"Bearer {expected}":
             return Response(status_code=401, content=b'{"detail":"unauthorized"}',
                              media_type="application/json")
@@ -90,6 +95,14 @@ def _repo() -> BusinessRepository:
     return app.state.repo
 
 
+def _node_store() -> NodeStore:
+    """节点注册表（_repo() 同款访问姿势：startup 与 repo 同一 engine 装配）。
+
+    engine=None（dev/tests 无 DATABASE_URL）→ NodeStore 内存双模，见 nodes_store。
+    """
+    return app.state.node_store
+
+
 def _sidecar_url(env_name: str, default: str) -> str:
     return (os.environ.get(env_name) or default).rstrip("/")
 
@@ -107,6 +120,7 @@ def _startup() -> None:
     configure_logging(level=os.environ.get("BOK_LOG_LEVEL", "INFO"))
     engine = build_engine()
     app.state.repo = build_repository(engine)
+    app.state.node_store = NodeStore(engine)  # 与 repo 同一 engine；None → 内存双模
     app.state.session_factory = build_session_factory(engine)
     app.state.lk_key = os.environ.get("LIVEKIT_API_KEY", "")
     app.state.lk_secret = os.environ.get("LIVEKIT_API_SECRET", "")
@@ -863,6 +877,16 @@ def add_turn(
     provider: str = "",
     latency_ms: int = 0,
     language: str = "",
+    # 分析账本列（spec 2026-09-10 §6.1）：可选带缺省，旧调用方（只报
+    # role/transcript）零破坏；org/线别/说话人/生成源/话术步/时间轴/perceived_ms。
+    org_id: str = "",
+    line: str = "a",
+    speaker: str = "",
+    gen: str = "",
+    template_step: int = 0,
+    started_ms: int = 0,
+    ended_ms: int = 0,
+    perceived_ms: int = 0,
 ) -> dict:
     # turn_id 用 uuid 而非 len(get_turns()) 序号：并发写时序号竞态产生重复
     # turn_id → 主键冲突 → IntegrityError 幂等分支吞成 200（静默丢数据，QA
@@ -879,6 +903,14 @@ def add_turn(
         provider=provider,
         latency_ms=latency_ms,
         language=language,
+        org_id=org_id,
+        line=line,
+        speaker=speaker,
+        gen=gen,
+        template_step=template_step,
+        started_ms=started_ms,
+        ended_ms=ended_ms,
+        perceived_ms=perceived_ms,
     )
     return _repo().create_turn(turn)
 
@@ -930,6 +962,39 @@ def mark_whatsapp_handled(call_id: str, req: WhatsAppHandledRequest) -> dict:
     _audit("call.whatsapp_handled", subject_type="call", subject_id=call_id,
            account_id=call.get("account_id", "acc-001"), detail={"handled": req.handled})
     return updated
+
+
+class NodeRegisterRequest(BaseModel):
+    name: str = ""
+    platform: str = ""
+    org_id: str = ""
+    version: str = ""
+
+
+class NodeHeartbeatRequest(BaseModel):
+    metrics: dict = {}
+
+
+@app.post("/api/nodes/register")
+def register_node(req: NodeRegisterRequest) -> dict:
+    """节点注册（spec §4.2）：签发 node_token，明文只在本次响应出现一次。"""
+    node_id, token = _node_store().register(
+        name=req.name, platform=req.platform, org_id=req.org_id, version=req.version
+    )
+    return {"node_id": node_id, "node_token": token, "heartbeat_interval_s": HEARTBEAT_INTERVAL_S}
+
+
+@app.post("/api/nodes/heartbeat")
+def node_heartbeat(req: NodeHeartbeatRequest, authorization: str = Header(default="")) -> dict:
+    token = authorization.removeprefix("Bearer ").strip()
+    if not token or not _node_store().heartbeat(token, req.metrics):
+        raise HTTPException(401, "unknown node token")
+    return {"ok": True, "commands": []}
+
+
+@app.get("/api/nodes")
+def list_nodes() -> list[dict]:
+    return _node_store().list_nodes()
 
 
 @app.get("/api/calls/{call_id}/settlement")
