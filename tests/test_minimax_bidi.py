@@ -558,6 +558,33 @@ def test_aclose_cancels_inflight_prewarm(monkeypatch):
     asyncio.run(asyncio.wait_for(run(), timeout=10))
 
 
+def test_aclose_cancels_queued_orphan_invalidate(monkeypatch):
+    """ping DEAD 甩出的孤儿 invalidate task(reprewarm=True)排队未跑时 teardown:
+    aclose 必须看得见并取消它——唔会 aclose 无参 invalidate 跑完后孤儿才执行,
+    teardown 后拉起全新连接+ping 保活(关机泄漏)。"""
+    ws1 = _SlowCloseWS([_CONNECTED, _STARTED])
+    fake_connect = _FakeConnect([ws1])
+    monkeypatch.setattr("websockets.connect", fake_connect)
+    monkeypatch.delenv("MINIMAX_BIDI_AUTO_REWARM", raising=False)
+    tts = _make_tts()
+    session = tts._bidi_session()
+
+    async def run():
+        await session.ensure_ready()
+        assert session._ws is ws1
+        # 复演 ping DEAD 分支姿势:孤儿 invalidate 排队、未让出即 teardown
+        orphan = asyncio.get_running_loop().create_task(session.invalidate(reprewarm=True))
+        session._invalidate_task = orphan
+        await session.aclose()
+        assert session._invalidate_task is None, "aclose 应清掉孤儿 invalidate 引用"
+        await asyncio.sleep(0.05)
+        assert orphan.cancelled(), "排队孤儿应被取消(reprewarm 永不执行)"
+        assert fake_connect.calls == 1, "teardown 后唔应拉起全新连接"
+        assert session._ws is None and ws1.closed, "旧连接由 aclose 自己的 invalidate 收尾"
+
+    asyncio.run(asyncio.wait_for(run(), timeout=10))
+
+
 def test_ping_consecutive_misses_force_invalidate(monkeypatch, capsys):
     """ping 连失 ≥ MINIMAX_BIDI_PING_MAX_MISS(默认 2) → MINIMAX_TTS_BIDI_DEAD
     强断 invalidate + 后台重预热(真实 close 让出下也唔会被 self-cancel 吞掉);
@@ -586,6 +613,7 @@ def test_ping_consecutive_misses_force_invalidate(monkeypatch, capsys):
         # 连失 2 次(=默认上限) → 强断 + 后台重预热
         ws1.fail_left = 2
         assert await _wait_for(lambda: session._ws is None), "连失到上限应强断 invalidate"
+        assert session._invalidate_task is not None, "DEAD 分支应持引用孤儿 invalidate task(防 GC/aclose 可见)"
         assert await _wait_for(lambda: ws1.closed), "强断应关闭死连接(真实 close 让出下收尾唔被掀)"
         assert await _wait_for(lambda: session._ws is ws2), "强断后应后台重预热零冷启动"
         assert fake_connect.calls == 2

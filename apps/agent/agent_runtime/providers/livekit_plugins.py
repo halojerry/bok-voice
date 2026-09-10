@@ -2426,6 +2426,9 @@ class _MiniMaxBidiSession:
         self._ping_task: asyncio.Task | None = None
         self._ping_misses = 0  # pong 连失计数(连失达上限强断重预热)
         self._prewarm_task: asyncio.Task | None = None
+        # ping 连失强断甩出的孤儿 invalidate task——必须持引用:事件循环对 task 只持
+        # 弱引用(裸 create_task 即弃可被 GC 中途回收),aclose 也要看得见先取消它。
+        self._invalidate_task: asyncio.Task | None = None
         # 残留音频门禁（epoch 纪元）：连接打断后保留复用，上一流 cancel 超时
         # （MINIMAX_TTS_BIDI_CANCEL_TIMEOUT）时服务端可能没停稳，迟到的音频会落
         # 在同一条连接上。流在首个 task_continue 才认领 active_epoch=own_epoch；
@@ -2491,8 +2494,12 @@ class _MiniMaxBidiSession:
                         print("MINIMAX_TTS_BIDI_DEAD ping连失 — 强断重预热", flush=True)
                         # 唔可以在这里 await invalidate:invalidate 会 _stop_ping() 自cancel
                         # 当前 ping task,后续 close/prewarm 会在首个让出点(生产 close 的
-                        # I/O)被 CancelledError 掀掉——强断重预热静默蒸发。甩独立 task 跑。
-                        asyncio.get_running_loop().create_task(self.invalidate(reprewarm=True))
+                        # I/O)被 CancelledError 掀掉——强断重预热静默蒸发。甩独立 task 跑;
+                        # 引用必须存 self._invalidate_task(loop 对 task 只持弱引用,裸即弃
+                        # 可被 GC 中途回收;aclose 也要看得见它先取消,防 teardown 后重预热)。
+                        self._invalidate_task = asyncio.get_running_loop().create_task(
+                            self.invalidate(reprewarm=True)
+                        )
                         return
                 except Exception:
                     return  # 连接已死,接收侧会 invalidate
@@ -2585,12 +2592,25 @@ class _MiniMaxBidiSession:
             self.prewarm()
 
     async def aclose(self) -> None:
-        # 防 teardown 期重预热(官方 #7050 形状):先取消在飞预热任务再 invalidate,
-        # 唔然 invalidate 排出的 reprewarm 会在关连接后又拉起一条新连接。
-        task = self._prewarm_task
+        # 防 teardown 期重预热(官方 #7050 形状):先取消在飞预热任务与 ping 连失
+        # 甩出的孤儿 invalidate task(reprewarm=True)再 invalidate——唔然 aclose 的
+        # 无参 invalidate 跑完后孤儿才执行,teardown 后拉起全新连接+ping 保活=泄漏。
+        tasks = [
+            t
+            for t in (self._prewarm_task, self._invalidate_task)
+            if t is not None and not t.done()
+        ]
         self._prewarm_task = None
-        if task is not None and not task.done():
-            task.cancel()
+        self._invalidate_task = None
+        for t in tasks:
+            t.cancel()
+        for t in tasks:  # 等取消落地,唔留悬空任务过 teardown
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass  # 自己 cancel 嘅——继续收尾
+            except Exception:
+                pass
         await self.invalidate()
 
     def prewarm(self) -> None:
