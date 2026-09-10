@@ -14,6 +14,11 @@
 (垫话剩余+BOK_FILLER_GAP_MS 默认 300ms),帧缓冲到点再放——垫话→静默→回复
 自然衔接。新用户轮(cancel)仍立即掐垫话:用户插话优先,放完旧垫话反而怪。
 
+链发(2026-09-10):首条垫话播完、回复首音频仍未到 → 垫话后残余静默照旧,
+BOK_FILLER_GAP_MS 呼吸后自动补第二发——挂「播完观察者」等官方
+PlayHandle.wait_for_playout()(播完即醒,精确补位,不靠估时长)。每轮封顶
+1 次(_chain_depth),链发消耗 BOK_FILLER_MAX 同一计数;BOK_FILLER_CHAIN=0 关。
+
 通道铁律(不变):垫话走 BackgroundAudioPlayer out-of-band 音轨,绝不能走
 session.say()——livekit 1.8 speech 队列严格串行,垫话必排回复后(实机实证)。
 垫话不进 LLM 上下文(out-of-band 不入 chat_ctx,KV 前缀/回声锚零污染)。
@@ -62,6 +67,11 @@ def filler_max_per_call() -> int:
         return max(0, int(os.environ.get("BOK_FILLER_MAX", "2")))
     except ValueError:
         return 2
+
+
+def filler_chain_enabled() -> bool:
+    """首条垫话播完回复仍未出声 → 自动补第二条(BOK_FILLER_CHAIN,默认开)。"""
+    return os.environ.get("BOK_FILLER_CHAIN", "1") == "1"
 
 
 def load_manifest(assets_dir: Path) -> dict[str, list[dict]]:
@@ -115,12 +125,16 @@ class FillerDirector:
         self._fired_lines: list[str] = []  # 已实际播放(审计/探针断言用)
         self._recent: list[str] = []  # 已选取(含未播出),防相邻重复
         self._count = 0
+        self._chain_task: asyncio.Task | None = None
+        self._chain_depth = 0  # 本轮已链发次数(每轮封顶 1)
+        self._reply_audio_seen = False  # on_reply_first_audio 置位,新轮/arm 重置
 
     # ---- 生命周期 ----
 
     def arm(self) -> None:
-        """轮提交、确认走 LLM 正常路径后调用;重复 arm 先作废旧定时器。"""
+        """轮提交、确认走 LLM 正常路径后调用;重复 arm 先作废旧定时器/链发。"""
         self._cancel_timer()
+        self._cancel_chain()
         if not filler_enabled() or self._count >= filler_max_per_call():
             return
         if self._player is None:
@@ -135,7 +149,9 @@ class FillerDirector:
 
         在播垫话**不掐**——播放排序契约=垫话播完→gap→回复;扣压由
         tts_cache._RelaySynthesizeStream 向 hold_if_playing() 询时实现。
+        置位 _reply_audio_seen:链发观察者醒来时据此放弃补第二发。
         """
+        self._reply_audio_seen = True
         self._cancel_timer()
 
     def hold_if_playing(self) -> float:
@@ -151,9 +167,10 @@ class FillerDirector:
         return remaining + filler_gap_s()
 
     def cancel(self) -> None:
-        """新用户轮到达等场景:作废定时器并停掉在播垫话——用户插话优先,
+        """新用户轮到达等场景:作废定时器/链发并停掉在播垫话——用户插话优先,
         out-of-band 音轨不受框架打断机制管理,必须自己停。"""
         self._cancel_timer()
+        self._cancel_chain()
         self._stop_playing()
 
     def reset_per_call(self) -> None:
@@ -161,6 +178,7 @@ class FillerDirector:
         self._fired_lines.clear()
         self._recent.clear()
         self._cancel_timer()
+        self._cancel_chain()
         self._stop_playing()
         self._handle = None
 
@@ -170,6 +188,14 @@ class FillerDirector:
         if self._timer is not None and not self._timer.done():
             self._timer.cancel()
         self._timer = None
+
+    def _cancel_chain(self) -> None:
+        """取消链发观察者并复位本轮链发状态(arm/cancel/reset 三处共用)。"""
+        if self._chain_task is not None and not self._chain_task.done():
+            self._chain_task.cancel()
+        self._chain_task = None
+        self._chain_depth = 0
+        self._reply_audio_seen = False
 
     def _stop_playing(self) -> None:
         handle = self._handle
@@ -183,6 +209,42 @@ class FillerDirector:
             handle.stop()
         except Exception:  # noqa: BLE001 - 停播失败让垫话自然播完(短语 ≤1.5s)
             pass
+
+    def _spawn_chain(self) -> None:
+        """首条起播即挂「播完观察者」——官方 PlayHandle.wait_for_playout 精确补位。"""
+        if not filler_chain_enabled() or self._chain_depth > 0:
+            return
+        self._chain_task = asyncio.create_task(self._chain_wait())
+
+    async def _chain_wait(self) -> None:
+        try:
+            handle = self._handle
+            if handle is None:
+                return
+            wait = getattr(handle, "wait_for_playout", None)
+            if callable(wait):
+                await wait()  # 官方 API:播完即醒(async def,须调用后 await)
+            else:  # 测试替身无官方 API:按已知时长等(少量过等由后续门复核兜住)
+                await asyncio.sleep(self._cur_dur + 0.05)
+        except asyncio.CancelledError:
+            return
+        except Exception:  # noqa: BLE001 - 观察者失败=退回单发行为,唔阻通话
+            return
+        self._handle = None  # 已播完:清档,放行 _fire 的「上一句还在播」门
+        if self._reply_audio_seen:
+            return  # 回复首音频已到,hold 契约自会衔接,唔使链发
+        if not filler_enabled() or self._player is None:
+            return
+        if self._guards() or filler_max_per_call() <= self._count:
+            return
+        state = str(getattr(self._session, "agent_state", "") or "")
+        if state not in ("listening", "thinking", ""):
+            return
+        await asyncio.sleep(filler_gap_s())  # 垫话→垫话同款呼吸
+        if self._reply_audio_seen or self._handle is not None:
+            return  # gap 中回复出声/新开火——让位,唔叠音
+        self._chain_depth += 1
+        await self._fire(0.0)  # 复用开火路径(门在 _fire 内再复核;计数同源)
 
     def _pools(self) -> dict[str, list[dict]]:
         if self._manifest is None:
@@ -248,6 +310,7 @@ class FillerDirector:
             self._cur_dur = float(entry.get("dur_s") or round(len(pcm) / 2 / rate, 2))
             self._play_started = time.monotonic()
             self._handle = self._player.play(source)
+            self._spawn_chain()  # 挂播完观察者:回复没来就链发第二发
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - 垫话失败唔阻通话
