@@ -445,3 +445,154 @@ def test_emotion_legacy_values_sanitized(monkeypatch):
 
     monkeypatch.setenv("MINIMAX_EMOTION", "OFF")
     assert tts._resolve_emotion() is None
+
+
+# ---- 2026-09-10 死亡即重预热 + ping 连失强断 --------------------------------
+
+
+class _SlowCloseWS(_FakeWS):
+    """close() 真让出事件循环(真实 websockets 的 close 有 I/O)——
+    锁定「ping 连失强断唔可以喺 ping task 内联 await invalidate(self-cancel 会
+    喺 close 让出点掀 CancelledError,吞掉 close 收尾与 reprewarm)」的生产语义。"""
+
+    def __init__(self, script: list[str] | None = None):
+        super().__init__(script)
+
+    async def close(self):
+        await asyncio.sleep(0.01)
+        self.closed = True
+
+
+class _FlakyPingWS(_SlowCloseWS):
+    """ping 按 fail_left 次数抛 TimeoutError(测连失计数);耗尽后恢复计数成功。"""
+
+    def __init__(self, script: list[str] | None = None, fail_left: int = 0):
+        super().__init__(script)
+        self.fail_left = fail_left
+
+    async def ping(self):
+        if self.fail_left > 0:
+            self.fail_left -= 1
+            raise asyncio.TimeoutError()
+        self.pings += 1
+
+
+class _HangingConnect:
+    """connect 永远挂起(模拟慢握手)——测 aclose 取消在飞预热任务。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def __call__(self, *a, **kw):
+        self.calls += 1
+        await asyncio.Event().wait()  # 挂起直到被 cancel
+
+
+def test_ping_max_miss_env(monkeypatch):
+    """MINIMAX_BIDI_PING_MAX_MISS 读 env;缺省/配错(非整数/非正数)回 2。"""
+    monkeypatch.delenv("MINIMAX_BIDI_PING_MAX_MISS", raising=False)
+    assert lp._MiniMaxBidiSession._ping_max_miss() == 2
+    monkeypatch.setenv("MINIMAX_BIDI_PING_MAX_MISS", "4")
+    assert lp._MiniMaxBidiSession._ping_max_miss() == 4
+    monkeypatch.setenv("MINIMAX_BIDI_PING_MAX_MISS", "abc")
+    assert lp._MiniMaxBidiSession._ping_max_miss() == 2, "配错回默认 2"
+    monkeypatch.setenv("MINIMAX_BIDI_PING_MAX_MISS", "0")
+    assert lp._MiniMaxBidiSession._ping_max_miss() == 2, "非正数回默认 2"
+
+
+def test_invalidate_reprewarm_schedules_background_prewarm(monkeypatch):
+    """invalidate(reprewarm=True) → 连接弃置 + 后台预热在飞(fake connect 成功重连);
+    MINIMAX_BIDI_AUTO_REWARM=0 → 只弃置,唔排预热。"""
+    monkeypatch.delenv("MINIMAX_BIDI_AUTO_REWARM", raising=False)  # 缺省=开
+    ws1 = _FakeWS([_CONNECTED, _STARTED])
+    ws2 = _FakeWS([_CONNECTED, _STARTED])
+    fake_connect = _FakeConnect([ws1, ws2])
+    monkeypatch.setattr("websockets.connect", fake_connect)
+    tts = _make_tts()
+    session = tts._bidi_session()
+
+    async def run():
+        await session.ensure_ready()
+        assert session._ws is ws1
+
+        # reprewarm=True:弃置 + 后台重预热排上(在飞任务,假 connect 成功)
+        await session.invalidate(reprewarm=True)
+        assert session._ws is None and ws1.closed, "invalidate 应弃置旧连接"
+        assert (
+            session._prewarm_task is not None and not session._prewarm_task.done()
+        ), "reprewarm=True 应立即排后台预热任务"
+        assert await _wait_for(lambda: session._ws is ws2), "后台预热应自动重连成功"
+        assert await _wait_for(lambda: session._prewarm_task.done())
+        assert fake_connect.calls == 2
+
+        # AUTO_REWARM=0:只弃置,唔排预热(唔发起新连接)
+        monkeypatch.setenv("MINIMAX_BIDI_AUTO_REWARM", "0")
+        await session.invalidate(reprewarm=True)
+        assert session._ws is None and ws2.closed
+        await asyncio.sleep(0.15)
+        assert fake_connect.calls == 2, "AUTO_REWARM=0 唔应排预热重连"
+
+    asyncio.run(asyncio.wait_for(run(), timeout=10))
+
+
+def test_aclose_cancels_inflight_prewarm(monkeypatch):
+    """teardown(aclose) 先取消在飞预热任务再 invalidate——唔会 teardown 期
+    重预热拉起新连接(官方 #7050 形状)。"""
+    fake_connect = _HangingConnect()
+    monkeypatch.setattr("websockets.connect", fake_connect)
+    monkeypatch.delenv("MINIMAX_BIDI_AUTO_REWARM", raising=False)
+    tts = _make_tts()
+    session = tts._bidi_session()
+
+    async def run():
+        session.prewarm()
+        assert await _wait_for(lambda: fake_connect.calls == 1), "预热应发起连接"
+        assert session._prewarm_task is not None and not session._prewarm_task.done()
+        inflight = session._prewarm_task
+        await session.aclose()
+        assert session._prewarm_task is None, "aclose 应清掉预热任务引用"
+        await asyncio.sleep(0.05)
+        assert inflight.cancelled(), "在飞预热应被取消"
+        assert fake_connect.calls == 1, "teardown 唔应再发起新连接"
+
+    asyncio.run(asyncio.wait_for(run(), timeout=10))
+
+
+def test_ping_consecutive_misses_force_invalidate(monkeypatch, capsys):
+    """ping 连失 ≥ MINIMAX_BIDI_PING_MAX_MISS(默认 2) → MINIMAX_TTS_BIDI_DEAD
+    强断 invalidate + 后台重预热(真实 close 让出下也唔会被 self-cancel 吞掉);
+    单次 miss 唔断连,pong 恢复清零计数。"""
+    monkeypatch.setenv("MINIMAX_BIDI_PING_S", "0.05")
+    monkeypatch.delenv("MINIMAX_BIDI_PING_MAX_MISS", raising=False)  # 缺省=2
+    monkeypatch.delenv("MINIMAX_BIDI_AUTO_REWARM", raising=False)
+    ws1 = _FlakyPingWS([_CONNECTED, _STARTED])
+    ws2 = _FlakyPingWS([_CONNECTED, _STARTED])
+    fake_connect = _FakeConnect([ws1, ws2])
+    monkeypatch.setattr("websockets.connect", fake_connect)
+    tts = _make_tts()
+    session = tts._bidi_session()
+
+    async def run():
+        await session.ensure_ready()
+        assert session._ws is ws1
+
+        # 单次 miss:计数=1 唔断连;下一拍 pong 恢复 → 清零
+        ws1.fail_left = 1
+        assert await _wait_for(lambda: session._ping_misses == 1), "单次 miss 应计数"
+        assert session._ws is ws1, "单次 ping miss 唔应强断(未到上限)"
+        assert await _wait_for(lambda: session._ping_misses == 0), "pong 恢复应清零计数"
+        assert session._ws is ws1
+
+        # 连失 2 次(=默认上限) → 强断 + 后台重预热
+        ws1.fail_left = 2
+        assert await _wait_for(lambda: session._ws is None), "连失到上限应强断 invalidate"
+        assert await _wait_for(lambda: ws1.closed), "强断应关闭死连接(真实 close 让出下收尾唔被掀)"
+        assert await _wait_for(lambda: session._ws is ws2), "强断后应后台重预热零冷启动"
+        assert fake_connect.calls == 2
+        await session.aclose()  # 收摊:停 ws2 的 ping 循环
+
+    asyncio.run(asyncio.wait_for(run(), timeout=10))
+    out = capsys.readouterr().out
+    assert "MINIMAX_TTS_BIDI_PING_TIMEOUT miss=1" in out
+    assert "MINIMAX_TTS_BIDI_PING_TIMEOUT miss=2" in out
+    assert "MINIMAX_TTS_BIDI_DEAD" in out

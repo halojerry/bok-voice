@@ -2424,6 +2424,7 @@ class _MiniMaxBidiSession:
         self._ws = None
         self._params: tuple | None = None  # 运行中 task_start 的参数指纹
         self._ping_task: asyncio.Task | None = None
+        self._ping_misses = 0  # pong 连失计数(连失达上限强断重预热)
         self._prewarm_task: asyncio.Task | None = None
         # 残留音频门禁（epoch 纪元）：连接打断后保留复用，上一流 cancel 超时
         # （MINIMAX_TTS_BIDI_CANCEL_TIMEOUT）时服务端可能没停稳，迟到的音频会落
@@ -2453,6 +2454,14 @@ class _MiniMaxBidiSession:
             v = 60.0
         return v if v > 0 else 0.0  # <=0 关闭自管 ping
 
+    @staticmethod
+    def _ping_max_miss() -> int:
+        try:
+            v = int(os.environ.get("MINIMAX_BIDI_PING_MAX_MISS", "2"))
+        except Exception:  # pragma: no cover - 配错回默认
+            v = 2
+        return v if v > 0 else 2  # 非正数=配错回默认(0 会逢超时即断)
+
     def _alive(self) -> bool:
         if self._ws is None:
             return False
@@ -2476,9 +2485,19 @@ class _MiniMaxBidiSession:
                     # pong 静默由接收侧(读消息超时/ConnectionClosed)判死。
                     await asyncio.wait_for(ws.ping(), timeout=10)
                 except asyncio.TimeoutError:
-                    print("MINIMAX_TTS_BIDI_PING_TIMEOUT", flush=True)
+                    self._ping_misses += 1
+                    print(f"MINIMAX_TTS_BIDI_PING_TIMEOUT miss={self._ping_misses}", flush=True)
+                    if self._ping_misses >= self._ping_max_miss():
+                        print("MINIMAX_TTS_BIDI_DEAD ping连失 — 强断重预热", flush=True)
+                        # 唔可以在这里 await invalidate:invalidate 会 _stop_ping() 自cancel
+                        # 当前 ping task,后续 close/prewarm 会在首个让出点(生产 close 的
+                        # I/O)被 CancelledError 掀掉——强断重预热静默蒸发。甩独立 task 跑。
+                        asyncio.get_running_loop().create_task(self.invalidate(reprewarm=True))
+                        return
                 except Exception:
                     return  # 连接已死,接收侧会 invalidate
+                else:
+                    self._ping_misses = 0
         except asyncio.CancelledError:
             raise
 
@@ -2550,18 +2569,28 @@ class _MiniMaxBidiSession:
                 pass
         await self.invalidate()
 
-    async def invalidate(self) -> None:
-        """弃置当前连接（2201/异常关闭/收尾）；下个 ensure_ready 自动全新重连。"""
+    async def invalidate(self, *, reprewarm: bool = False) -> None:
+        """弃置当前连接(2201/异常关闭/收尾);下个 ensure_ready 自动全新重连。
+        reprewarm=True:死亡即后台重预热——唔等下一个真实轮先撞冷启动。"""
         ws, self._ws = self._ws, None
         self._params = None
+        self._ping_misses = 0
         self._stop_ping()
         if ws is not None:
             try:
                 await ws.close()
             except Exception:  # noqa: BLE001
                 pass
+        if reprewarm and os.environ.get("MINIMAX_BIDI_AUTO_REWARM", "1") == "1":
+            self.prewarm()
 
     async def aclose(self) -> None:
+        # 防 teardown 期重预热(官方 #7050 形状):先取消在飞预热任务再 invalidate,
+        # 唔然 invalidate 排出的 reprewarm 会在关连接后又拉起一条新连接。
+        task = self._prewarm_task
+        self._prewarm_task = None
+        if task is not None and not task.done():
+            task.cancel()
         await self.invalidate()
 
     def prewarm(self) -> None:
@@ -2715,8 +2744,9 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                                 return  # 尾巴排干净了
                             continue  # 还在等句子音频,继续等
                         except Exception:
-                            # 连接死亡(2201/网络):标记死连接 + 解锁等待方
-                            await session.invalidate()
+                            # 连接死亡(2201/网络):标记死连接 + 解锁等待方;
+                            # 死亡即后台重预热,下个真实轮零冷启动
+                            await session.invalidate(reprewarm=True)
                             self._flushed_evt.set()
                             self._canceled_evt.set()
                             return
