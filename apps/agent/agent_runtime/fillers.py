@@ -22,7 +22,7 @@ PlayHandle.wait_for_playout()(播完即醒,精确补位,不靠估时长)。每�
 通道铁律(不变):垫话走 BackgroundAudioPlayer out-of-band 音轨,绝不能走
 session.say()——livekit 1.8 speech 队列严格串行,垫话必排回复后(实机实证)。
 垫话不进 LLM 上下文(out-of-band 不入 chat_ctx,KV 前缀/回声锚零污染)。
-每通限次 BOK_FILLER_MAX(默认 2)+随机不重样;BOK_FILLER=0 一键全关。
+每通限次 BOK_FILLER_MAX(默认 3)+随机不重样;BOK_FILLER=0 一键全关。
 
 语言铁律(2026-09-10 实证修复):垫话语言=会话装配时钉死的通话语言,构造时
 由调用方捕获传入——en 通话曾因运行时 lang 状态漂移落回 zh 池,英国腔通话里
@@ -63,10 +63,12 @@ def filler_gap_s() -> float:
 
 
 def filler_max_per_call() -> int:
+    # 默认 3(2026-09-10 task-5):链发与主动 arm 共享同一计数,单轮至多
+    # 「1 主动 + 1 链发」耗 2 发,留 1 发给后续轮——默认 2 时一次链发即耗尽全通。
     try:
-        return max(0, int(os.environ.get("BOK_FILLER_MAX", "2")))
+        return max(0, int(os.environ.get("BOK_FILLER_MAX", "3")))
     except ValueError:
-        return 2
+        return 3
 
 
 def filler_chain_enabled() -> bool:

@@ -1591,6 +1591,10 @@ async def entrypoint(ctx):
         llm=llm_provider,
         tts=tts_provider,
         turn_handling=turn_handling,
+        # 队列内连发呼吸感(2026-09-10 task-5):speech 队列相邻两条播报(如开场白
+        # say → 回复、心跳直念衔接)最小间隔 0.3s,防背靠背机械感;垫话走
+        # BackgroundAudioPlayer out-of-band 音轨不经此队列,零影响。B 线 interpret.py 不加。
+        min_consecutive_speech_delay=0.3,
         # 默认 ["filter_markdown","filter_emoji"] 会被整体替换，故带上内置两项；
         # 追加的自定义 transform 把 <expr/> 从进 TTS 的文本里剥掉（转录路径保留，框架发布 mood）。
         tts_text_transforms=[

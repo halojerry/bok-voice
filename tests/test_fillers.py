@@ -210,7 +210,9 @@ def test_manifest_missing_disables(tmp_path):
     _run(_case())
 
 
-def test_max_per_call_and_rotation(tmp_path):
+def test_max_per_call_and_rotation(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOK_FILLER_MAX", "2")  # 默认已改 3(task-5):限次用例显式钉 2
+
     async def _case():
         d, player = _director(tmp_path)
         await d._fire(0)
@@ -249,6 +251,12 @@ def test_gap_env_default_and_override(monkeypatch):
     assert filler_gap_s() == 0.3
     monkeypatch.setenv("BOK_FILLER_GAP_MS", "500")
     assert filler_gap_s() == 0.5
+
+
+def test_filler_max_default_is_three(monkeypatch):
+    monkeypatch.delenv("BOK_FILLER_MAX", raising=False)
+    from agent_runtime.fillers import filler_max_per_call
+    assert filler_max_per_call() == 3
 
 
 def test_load_manifest_shape(tmp_path):
