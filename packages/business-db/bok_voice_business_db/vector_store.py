@@ -43,6 +43,7 @@ class SqlVectorStore:
                     text=item.get("text", ""),
                     path=item.get("path", ""),
                     source=item.get("source", "import"),
+                    content_hash=item.get("content_hash", ""),
                     embedding=vec,
                 )
             )
@@ -91,4 +92,5 @@ class SqlVectorStore:
             "text": row.text,
             "path": row.path,
             "source": row.source,
+            "content_hash": row.content_hash,
         }

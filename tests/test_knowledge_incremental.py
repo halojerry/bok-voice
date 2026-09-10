@@ -81,3 +81,14 @@ def test_reimport_chunks_gain_content_hash() -> None:
     asyncio.run(svc.import_document("acc-1", "a.md", "唯一段落。"))
     items = asyncio.run(svc.vector.list("acc-1"))
     assert items and all(it.get("content_hash") for it in items)
+
+
+def test_inmemory_search_reuses_cached_vectors() -> None:
+    emb = CountingEmbedder()
+    svc = _service(emb)
+    asyncio.run(svc.import_document("acc-1", "a.md", "常见问题：退货政策是什么？"))
+    before = emb.calls
+    hits = asyncio.run(svc.search("退货政策", "acc-1"))
+    assert hits  # 命中
+    # 只应新增 1 次嵌入(查询向量);文档向量在 upsert 时已缓存,不再每查询全量重算
+    assert emb.calls - before == 1
