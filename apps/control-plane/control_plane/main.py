@@ -35,6 +35,7 @@ from bok_voice_obs.middleware import CorrelationMiddleware
 from .deps import build_engine, build_repository, build_session_factory
 from .dispatch_utils import cleanup_dispatch, has_active_dispatch
 from .nodes_store import HEARTBEAT_INTERVAL_S, NodeStore
+from .pregen import persona_pregen_status
 from .schemas import (
     CreateCallRequest,
     CreateObjectRequest,
@@ -1416,25 +1417,38 @@ def get_persona(persona_id: str) -> dict:
 
 
 @app.post("/api/personas")
-def create_persona(req: PersonaRequest) -> dict:
+def create_persona(req: PersonaRequest, request: Request) -> dict:
     persona = _repo().create_persona(req.model_dump())
     _audit("persona.create", subject_type="persona", subject_id=persona.get("id", ""), account_id=persona.get("account_id", ""), detail={"name": persona.get("name", "")})
+    # 新人设上线:无罐头即提醒+自动全量物化(W3,响应 tts_pregen=提醒面)
+    persona["tts_pregen"] = persona_pregen_status(
+        persona, base_url=str(request.base_url).rstrip("/")
+    )
     return persona
 
 
 @app.put("/api/personas/{persona_id}")
-def update_persona(persona_id: str, req: UpdatePersonaRequest) -> dict:
-    existing = _repo().get_persona(persona_id)
+def update_persona(persona_id: str, req: UpdatePersonaRequest, request: Request) -> dict:
+    # 冻结更新前快照(内存 repo 返回活引用,update 原地改会令 existing==persona,
+    # 音色变化判定恒 False);audit 与物化触发都以此为准。
+    existing = dict(_repo().get_persona(persona_id) or {})
     persona = _repo().update_persona(persona_id, req.model_dump())
     if not persona:
         raise HTTPException(404, "persona not found")
     _audit("persona.update", subject_type="persona", subject_id=persona_id, account_id=(existing or {}).get("account_id", ""), detail={"name": persona.get("name", "")})
+    persona["tts_pregen"] = persona_pregen_status(
+        persona, base_url=str(request.base_url).rstrip("/"), existing=existing
+    )
     return persona
 
 
 @app.put("/api/personas")
-def upsert_persona(req: PersonaRequest) -> dict:
-    return _repo().create_persona(req.model_dump())
+def upsert_persona(req: PersonaRequest, request: Request) -> dict:
+    persona = _repo().create_persona(req.model_dump())
+    persona["tts_pregen"] = persona_pregen_status(
+        persona, base_url=str(request.base_url).rstrip("/")
+    )
+    return persona
 
 
 @app.delete("/api/personas/{persona_id}")

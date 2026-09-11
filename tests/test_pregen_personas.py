@@ -20,16 +20,16 @@ import pregen_tts  # noqa: E402
 
 
 def test_resolve_voice_map_dict_takes_lang_key():
-    m = {"zh": "v_zh", "cantonese": "v_yue", "en": "v_en"}
+    m = {"zh": "v_zh", "cantonese": "v_canto", "en": "v_en"}
     assert pregen_tts._resolve_voice_map(m, "zh") == "v_zh"
-    assert pregen_tts._resolve_voice_map(m, "cantonese") == "v_yue"
+    assert pregen_tts._resolve_voice_map(m, "cantonese") == "v_canto"
     assert pregen_tts._resolve_voice_map(m, "en") == "v_en"
 
 
 def test_resolve_voice_map_dict_missing_lang_falls_back_zh():
     # 缺 lang 键回落 zh 键(运行时同款);zh 也缺=空串(无该语言音色)。
     assert pregen_tts._resolve_voice_map({"zh": "v_zh"}, "cantonese") == "v_zh"
-    assert pregen_tts._resolve_voice_map({"cantonese": "v_yue"}, "zh") == ""
+    assert pregen_tts._resolve_voice_map({"cantonese": "v_canto"}, "zh") == ""
     assert pregen_tts._resolve_voice_map({"en": "v_en"}, "cantonese") == ""
 
 
@@ -56,12 +56,12 @@ def test_resolve_voice_map_empty_and_garbage():
 
 def test_persona_resolved_voice_full_chain_same_source():
     # 全链:_parse_voice_map(JSON 串)→ single collapse(人设主语言)→ 解析。
-    persona = {"id": "p1", "language": "cantonese", "reference_audio": '{"zh":"Vzh","cantonese":"Vyue"}'}
+    persona = {"id": "p1", "language": "cantonese", "reference_audio": '{"zh":"Vzh","cantonese":"Vcanto"}'}
     # single 模式(默认):collapse 成人设主语言(粤)一把声放 zh 键,任何语言都它。
     assert (
-        pregen_tts._persona_resolved_voice(persona, "cantonese", {}, "single") == "Vyue"
+        pregen_tts._persona_resolved_voice(persona, "cantonese", {}, "single") == "Vcanto"
     )
-    assert pregen_tts._persona_resolved_voice(persona, "zh", {}, "single") == "Vyue"
+    assert pregen_tts._persona_resolved_voice(persona, "zh", {}, "single") == "Vcanto"
     # per_language 模式:按请求语言取键,zh 请求拿 Vzh。
     assert pregen_tts._persona_resolved_voice(persona, "zh", {}, "per_language") == "Vzh"
     assert pregen_tts._persona_resolved_voice(persona, "en", {}, "per_language") == "Vzh"
@@ -91,7 +91,7 @@ def test_fillers_jobs_per_persona_own_language_pool():
 
 def test_fillers_jobs_skips_persona_without_voice_for_its_lang(capsys):
     # per_language 模式下 en 人设只有 cantonese 键 → en 解析为空 → 跳过(响亮打印)。
-    personas = [{"id": "pbad", "language": "en", "reference_audio": '{"cantonese":"Vyue"}'}]
+    personas = [{"id": "pbad", "language": "en", "reference_audio": '{"cantonese":"Vcanto"}'}]
     jobs = pregen_tts._fillers_jobs(personas, _MANIFEST, {}, "per_language")
     assert jobs == []
     out = capsys.readouterr().out
@@ -99,11 +99,11 @@ def test_fillers_jobs_skips_persona_without_voice_for_its_lang(capsys):
 
 
 def test_fillers_jobs_skips_lang_without_pool(capsys):
-    personas = [{"id": "pyue", "language": "cantonese", "reference_audio": '{"zh":"Vyue"}'}]
+    personas = [{"id": "pcanto", "language": "cantonese", "reference_audio": '{"zh":"Vcanto"}'}]
     jobs = pregen_tts._fillers_jobs(personas, _MANIFEST, {}, "single")
     assert jobs == []  # manifest 无 cantonese 池
     out = capsys.readouterr().out
-    assert "persona=pyue" in out and "skipped" in out
+    assert "persona=pcanto" in out and "skipped" in out
 
 
 # ---- _qa_jobs:默认每语言一人设 / --all-personas 全人设覆盖 ----
@@ -119,7 +119,7 @@ _QA_ROWS = [
 def test_qa_jobs_default_one_persona_per_lang():
     lang_personas = {
         "zh": {"id": "pzh", "language": "zh", "reference_audio": '{"zh":"Vzh"}'},
-        "cantonese": {"id": "pyue", "language": "cantonese", "reference_audio": '{"zh":"Vyue"}'},
+        "cantonese": {"id": "pcanto", "language": "cantonese", "reference_audio": '{"zh":"Vcanto"}'},
         "en": None,
     }
     jobs = pregen_tts._qa_jobs(
@@ -134,14 +134,14 @@ def test_qa_jobs_default_one_persona_per_lang():
 def test_qa_jobs_all_personas_covers_every_persona_with_voice():
     personas = [
         {"id": "pzh", "language": "zh", "reference_audio": '{"zh":"Vzh"}'},
-        {"id": "pyue", "language": "cantonese", "reference_audio": '{"cantonese":"Vyue"}'},
+        {"id": "pcanto", "language": "cantonese", "reference_audio": '{"cantonese":"Vcanto"}'},
     ]
     jobs = pregen_tts._qa_jobs(
         _QA_ROWS, personas, {}, all_personas=True, tts_cfg={}, voice_mode="per_language"
     )
-    # zh 条目:pzh zh 键直取;pyue 只有 cantonese 键、zh 请求解析为空 → 跳过
+    # zh 条目:pzh zh 键直取;pcanto 只有 cantonese 键、zh 请求解析为空 → 跳过
     # (「音色匹配条目语言」门:运行时音色为空同样不查缓存,物化无意义)。
-    # cantonese 条目:pyue 直取;pzh 缺 cantonese 键回落 zh 键=运行时同款回落
+    # cantonese 条目:pcanto 直取;pzh 缺 cantonese 键回落 zh 键=运行时同款回落
     # (运行时同人设同语言解析出同一音色,该组合物化后照样命中)。
     assert jobs == [
         (personas[0], "zh", "我们九点上班。"),

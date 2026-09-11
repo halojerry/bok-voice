@@ -254,12 +254,16 @@ async def _materialize(
     tts_cfg: dict,
     voice_mode: str,
     dry_run: bool = False,
+    pin: bool = False,
 ) -> tuple[int, int, int, list[Record]]:
     """合成+落盘主循环(greetings/objects/fillers/qa 四条物化线共用)。
 
     voice 按 (persona, lang) 运行时同源解析(map 组装带备忘,同人设同语言只算
     一次);(persona, lang, text) 三元组去重;已在缓存(同 text+voice+model)的
     条目 skip 不重合成。dry_run=True 只按同口径分类计数,绝不碰云 API。
+
+    pin=True 落盘打钉不逐出(罐头集:静态直念线/垫话/QA——无界的逐对象
+    开场白别传,否则 LRU 失去意义)。
 
     返回 (generated, skipped, failed, records)。
     """
@@ -309,7 +313,7 @@ async def _materialize(
             records.append((persona, lang, voice, "fail"))
             print(f"FAIL lang={lang} chars={len(text)} err={exc!r}", flush=True)
             continue
-        stored = cache.store(key, pcm, text=text, voice=voice, model=model)
+        stored = cache.store(key, pcm, text=text, voice=voice, model=model, pin=pin)
         if stored:
             ok += 1
             records.append((persona, lang, voice, "new"))
@@ -402,16 +406,18 @@ async def main_async() -> int:
 
     total = gen = skip = fail = 0
 
-    # ---- 无变量脚本线 + 逐对象线(每语言 lang_personas 人设) ----
-    legacy_jobs: list[Job] = []
+    # ---- 无变量脚本线(静态有限集=钉住)+ 逐对象线(开场白无界=不钉) ----
+    # 每语言 lang_personas 人设;两条线 pin 语义不同,分开物化。
+    greet_jobs: list[Job] = []
+    object_jobs: list[Job] = []
     if args.greetings:
         for lang, text in GENERIC_GREETINGS.items():
-            legacy_jobs.append((lang_personas.get(lang), lang, text))
+            greet_jobs.append((lang_personas.get(lang), lang, text))
         for lang in ("zh", "cantonese", "en"):
             for i in range(3):
-                legacy_jobs.append((lang_personas.get(lang), lang, _nudge_line("", lang, i)))
-            legacy_jobs.append((lang_personas.get(lang), lang, _farewell_line("", lang)))
-            legacy_jobs.append((lang_personas.get(lang), lang, _wa_number_line(lang, "")))
+                greet_jobs.append((lang_personas.get(lang), lang, _nudge_line("", lang, i)))
+            greet_jobs.append((lang_personas.get(lang), lang, _farewell_line("", lang)))
+            greet_jobs.append((lang_personas.get(lang), lang, _wa_number_line(lang, "")))
 
     if args.objects:
         only_id = str(args.object_id or "").strip()
@@ -423,17 +429,19 @@ async def main_async() -> int:
             tpl = _template_for(templates, obj)
             opening = _opening_line(tpl, obj, lang)
             if opening:
-                legacy_jobs.append((lang_personas.get(lang), lang, opening))
+                object_jobs.append((lang_personas.get(lang), lang, opening))
             if name:
-                legacy_jobs.append((lang_personas.get(lang), lang, _farewell_line(name, lang)))
+                object_jobs.append((lang_personas.get(lang), lang, _farewell_line(name, lang)))
                 for i in range(3):
-                    legacy_jobs.append((lang_personas.get(lang), lang, _nudge_line(name, lang, i)))
+                    object_jobs.append((lang_personas.get(lang), lang, _nudge_line(name, lang, i)))
 
-    if legacy_jobs:
+    for jobs, pin in ((greet_jobs, True), (object_jobs, False)):
+        if not jobs:
+            continue
         ok, sk, fl, records = await _materialize(
-            cache, model, legacy_jobs,
+            cache, model, jobs,
             api_key=api_key, sample_rate=sample_rate, tts_cfg=tts_cfg,
-            voice_mode=voice_mode, dry_run=args.dry_run,
+            voice_mode=voice_mode, dry_run=args.dry_run, pin=pin,
         )
         gen += ok
         skip += sk
@@ -457,7 +465,7 @@ async def main_async() -> int:
             ok, sk, fl, records = await _materialize(
                 cache, model, fillers_jobs,
                 api_key=api_key, sample_rate=sample_rate, tts_cfg=tts_cfg,
-                voice_mode=voice_mode, dry_run=args.dry_run,
+                voice_mode=voice_mode, dry_run=args.dry_run, pin=True,
             )
             gen += ok
             skip += sk
@@ -483,7 +491,7 @@ async def main_async() -> int:
             ok, sk, fl, records = await _materialize(
                 cache, model, qa_job_list,
                 api_key=api_key, sample_rate=sample_rate, tts_cfg=tts_cfg,
-                voice_mode=voice_mode, dry_run=args.dry_run,
+                voice_mode=voice_mode, dry_run=args.dry_run, pin=True,
             )
             gen += ok
             skip += sk
