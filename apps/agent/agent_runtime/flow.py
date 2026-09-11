@@ -27,6 +27,11 @@ REPEAT = "repeat"         # 没听清/要求重复 → 停留,把上一句关键
 class FlowStep:
     goal: str = ""
     ref: str = ""
+    # 直念步(say=1):进入该步的当轮以 ref 首行直念作答(session.say 脚本线,
+    # 不走 LLM)——通知/道歉/赔偿承诺这类合规内容要逐字一致,LLM 自由发挥会
+    # 每轮换措辞(call-2cae7769 同一段通知三种说法念了三遍)。开场身份步不标
+    # (opening 机制已覆盖 step 0)。
+    say: bool = False
 
 
 def parse_steps(steps_json: str) -> list[FlowStep]:
@@ -42,7 +47,7 @@ def parse_steps(steps_json: str) -> list[FlowStep]:
     out: list[FlowStep] = []
     for s in arr:
         if isinstance(s, dict):
-            out.append(FlowStep(goal=str(s.get("goal") or ""), ref=str(s.get("ref") or "")))
+            out.append(FlowStep(goal=str(s.get("goal") or ""), ref=str(s.get("ref") or ""), say=bool(s.get("say"))))
         elif isinstance(s, str):
             out.append(FlowStep(goal="", ref=s))
     return [s for s in out if s.goal.strip() or s.ref.strip()]
@@ -308,12 +313,14 @@ _PLATFORM_RE = re.compile(
 )
 
 
-def should_auto_advance(*, current: int, goal: str, ref: str, user_text: str, verdict: str, wa: str | None = None) -> bool:
+def should_auto_advance(*, current: int, goal: str, ref: str, user_text: str, verdict: str, wa: str | None = None, say_step: bool = False) -> bool:
     """規則級「一定要推進」override,唔靠 LLM judge(judge 慢/唔穩會卡死)。
 
-    - 開場步(current==0,開場白+問個開啟問題):客戶俾咗任何實質回應
-      (唔記得/唔知/確認/俾資料,但唔係純提問或拒絕)→ 即過,由下一步承接。
-      「唔記得」係開場問題嘅完整答案,下一步(引導核實)正正承接——唔應該滯留。
+    - 身份確認步(current==0,2026-09-12 拆分後只問「係咪{姓名}」):客戶任何
+      非拒絕回應(確認/提問你係邊個/唔係呀)→ 即過,由通知步(自報家門)承接。
+    - 通知直念步(say_step=True,自報家門+問貨品):實質回應(記得/唔記得/
+      直接講出货品)即推去平台步;純提問(問公司/點解遺失)唔推,原地答
+      (步內分支+QA 罐頭)——同舊長開場步語義一致。
     - 引導核實步:若呢步兼要「攞WhatsApp/傳截圖」(ref含 whatsapp/微信/截圖/帳號),
       必須客戶已俾到 WhatsApp(wa=captured/綁定來電 captured_implicit)先推;
       offered(應承加未俾號)則停留;淨係答到平台 → 停留喺本步,繼續叫客戶俾WhatsApp/傳截圖。
@@ -322,8 +329,17 @@ def should_auto_advance(*, current: int, goal: str, ref: str, user_text: str, ve
     if verdict in (OBJECTION, REFUSE, REPEAT):
         return False
     if current == 0:
-        # 純提問(客問「你哋邊間公司?」)要喺開場步答,唔推;其他實質回應都推。
-        return verdict not in (QUESTION, REPEAT)
+        # 身份確認步(2026-09-12 開場白三段拆分):客戶任何非拒絕實質回應——
+        # 確認「係我」、提問「你係邊個/邊間公司/点解打嚟」——都推進,由下一步
+        # (來電通知,自報家門)承接:通知正正係呢啲問題嘅答案。舊規則「純提問
+        # 唔推」係長開場年代嘅產物(開場已自報門,提問要原地答);拆分後原地
+        # 答反而令通知姍姍來遲、開場步滯留(call-2cae7769 步標記喺 1/2 之間
+        # 亂跳實證)。REFUSE/OBJECTION/REPEAT 已喺頂部攔走。
+        return True
+    if say_step:
+        # 通知直念步:客戶對「記唔記得買咗咩貨品」嘅實質回應即推(下一步問平台
+        # 正正承接);純提問唔推——通知步分支/QA 罐頭原地答,唔好搶步。
+        return verdict not in (QUESTION,)
     ctx = f"{goal} {ref}"
     low_ctx = ctx.lower()
     # 兼要攞WhatsApp/截圖嘅核實步(提示詞粵/普/英收齊,{聯絡方式}/{contact} 佔位字面都算):
@@ -565,6 +581,9 @@ class FlowController:
     # 开场白已直念(session.say) → current_step_text 加「勿重复开场」提示;
     # paused 起动(冇开场白)时保持 False,LLM 自己补第 1 步。
     opening_played: bool = False
+    # 直念步(say=1)已念账本:推进/进入该步的当轮 agent 直念 ref 首行,
+    # 念过即记 —— 后续轮 current_step_text 注入【通知已念】防 LLM 重复整段。
+    said_steps: set[int] = field(default_factory=set)
     # 最近一轮规则判定(question/unclear/objection/...)——verdict 此前只用于推进
     # 判定、从不进提示词,客户提问/答非所问时模型冇「该怎么答」指引 → 4B 默认
     # 复读当前步。current_step_text 据此渲染对应应答指引。
@@ -666,13 +685,41 @@ class FlowController:
         """
         if not self.has_steps:
             return ""
-        s = self.steps[0]
+        return self.step_say_text(0, force=True)
+
+    def step_say_text(self, idx: int, *, force: bool = False) -> str:
+        """直念步文本:该步 ref 的首个非空行(变量已替换、无残留占位)。
+
+        force=True 跳过 say 旗标(开场白机制用——step 0 恒取首行,不要求标 say)。
+        渲染后仍剩 {占位} = 变量缺失 → 返回空串(直念线宁可退 LLM,唔念占位符)。
+        """
+        if not self.has_steps or not (0 <= idx < len(self.steps)):
+            return ""
+        s = self.steps[idx]
+        if not s.say and not force:
+            return ""
         rendered = render_template_text(s.ref or s.goal, self.vars_map)
         for line in rendered.splitlines():
             line = line.strip()
             if line and not re.search(r"\{[^{}]+\}", line):
                 return line
         return ""
+
+    def pending_say_text(self) -> str:
+        """当前步係直念步且未念 → 返回要直念的文本;否则空串。
+
+        agent 轮钩子在流程推进后查询:非空=本轮以脚本直念作答(跳过 LLM),
+        念完 note_step_said() 记账。
+        """
+        if not self.has_steps or self.done or self.closing:
+            return ""
+        if self.current in self.said_steps:
+            return ""
+        return self.step_say_text(self.current)
+
+    def note_step_said(self) -> None:
+        """直念步念完记账(幂等)。"""
+        self.said_steps.add(self.current)
 
     def _verdict_guidance(self) -> str:
         """verdict 感知应答指引:规则判定结果此前只用于推进、从不进提示词——客户
@@ -719,6 +766,12 @@ class FlowController:
             lines.append(
                 "【开场已念】上一句 assistant 就是开场白原文（开场直念，已入对话史），"
                 "不必重复开场或再问一次身份——直接听客户回应接话。"
+            )
+        if step.say and self.current in self.said_steps:
+            lines.append(
+                "【通知已念】这一步的直念原文上一句 assistant 已完整讲过（已入对话史），"
+                "不必再整段重复——接客户对通知的回应（答货品/质疑/情绪）继续，"
+                "客户明确要求重讲时除外（那要放慢再讲一遍关键内容）。"
             )
         if self._just_advanced and self.current > 0:
             lines.append(

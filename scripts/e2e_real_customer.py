@@ -88,6 +88,36 @@ SCENARIOS: dict[str, dict] = {
             "how do I contact you",
         ],
     },
+    # 理赔三段式验收（2026-09-12 开场白拆分）：轮1=身份确认(应触发 step2 通知
+    # 直念 gen=script)、轮2=货品答唔记得(→平台)、轮3=平台(→赔偿)、轮4=赔偿
+    # 措辞(应命中 QA 罐头快路 gen=qa_fastpath)、轮5=接受(→办理问号码)、
+    # 轮6=报号(WA 捕获+复述+收尾)。
+    "claims-canto": {
+        "label": "小九（粤语·理赔三段式）",
+        "lang": "cantonese",
+        "persona_voice": "Cantonese_GentleLady",
+        "lines": [
+            "係呀",
+            "唔记得呀",
+            "拼多多",
+            "点样赔俾我",
+            "接受呀",
+            "六四三二五四三",
+        ],
+    },
+    "claims-zh": {
+        "label": "小普（普通话·理赔三段式）",
+        "lang": "zh",
+        "persona_voice": "Chinese_crisp_podcaster_nv1",
+        "lines": [
+            "是我本人",
+            "我不记得了",
+            "淘宝买的",
+            "怎么赔给我",
+            "可以呀",
+            "九八七六五四三二",
+        ],
+    },
 }
 
 # agent.log 证据行（本通字节窗口内 grep；行式见 agent.py / fillers.py）
@@ -160,10 +190,11 @@ def log_slice_markers(offset: int) -> list[str]:
     return lines[:40]
 
 
-def create_call(lang: str, persona_id: str | None) -> tuple[str, str]:
+def create_call(lang: str, persona_id: str | None, voice: str = "") -> tuple[str, str]:
     """建对象+人设+通话，返回 (call_id, persona_voice)。对象 E2E- 前缀=心跳豁免。
     绑账号该语言的正牌话术模板（E2E/probe 模板排除）——开场白=话术第 1 步
-    原文、推进走 FlowController，这才是「真实客户对话」要测的链路。"""
+    原文、推进走 FlowController，这才是「真实客户对话」要测的链路。
+    voice 缺省回落 SCENARIOS[lang]（旧三场景=键即语言）。"""
     ts = int(time.time() * 1000) % 100000
     # 话术模板：该语言的正牌模板（排除测试模板）。绑定走**对象**的 template_id
     # 字段——/api/calls 不读请求体直传，模板跟对象走（对象→话术是产品绑定设计）。
@@ -214,7 +245,7 @@ def create_call(lang: str, persona_id: str | None) -> tuple[str, str]:
                 "name": f"E2E真实客服{lang}",
                 "language": lang,
                 "tone": "礼貌专业",
-                "reference_audio": SCENARIOS[lang]["persona_voice"],
+                "reference_audio": voice or SCENARIOS[lang]["persona_voice"],
             },
         )
         voice = str(persona.get("reference_audio") or "")
@@ -320,7 +351,7 @@ async def run_scenario(key: str, persona_id: str | None) -> dict:
     print(f"\n[real-customer] 场景 {key} · {sc['label']} —— 预合成 {len(lines)} 轮客户话音…", flush=True)
     pcms = [tts_pcm(text, lang) for text in lines]
 
-    call_id, voice = create_call(lang, persona_id)
+    call_id, voice = create_call(lang, persona_id, sc.get("persona_voice", ""))
     log_offset = LOG_PATH.stat().st_size if LOG_PATH.exists() else 0
     print(f"[real-customer] call={call_id} persona_voice={voice!r} (log offset {log_offset})", flush=True)
 
