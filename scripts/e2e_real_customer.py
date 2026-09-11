@@ -161,15 +161,40 @@ def log_slice_markers(offset: int) -> list[str]:
 
 
 def create_call(lang: str, persona_id: str | None) -> tuple[str, str]:
-    """建对象+人设+通话，返回 (call_id, persona_voice)。对象 E2E- 前缀=心跳豁免。"""
+    """建对象+人设+通话，返回 (call_id, persona_voice)。对象 E2E- 前缀=心跳豁免。
+    绑账号该语言的正牌话术模板（E2E/probe 模板排除）——开场白=话术第 1 步
+    原文、推进走 FlowController，这才是「真实客户对话」要测的链路。"""
     ts = int(time.time() * 1000) % 100000
+    # 话术模板：该语言的正牌模板（排除测试模板）。绑定走**对象**的 template_id
+    # 字段——/api/calls 不读请求体直传，模板跟对象走（对象→话术是产品绑定设计）。
+    template_id = ""
+    try:
+        tpls = httpx.get(
+            f"{CONTROL_PLANE_URL}/api/templates?account_id=acc-001", timeout=10
+        ).json()
+        tpls = tpls.get("items", tpls) if isinstance(tpls, dict) else tpls
+        tpl = next(
+            (
+                t
+                for t in tpls
+                if str(t.get("language")) == lang
+                and "e2e" not in str(t.get("name", "")).lower()
+                and "probe" not in str(t.get("name", "")).lower()
+            ),
+            None,
+        )
+        template_id = str(tpl.get("id") or "") if tpl else ""
+    except Exception:  # noqa: BLE001 - 模板拉不到=退无模板链路(通用语开场)
+        template_id = ""
     obj = httpx.post(
         f"{CONTROL_PLANE_URL}/api/objects?account_id=acc-001",
         json={
-            "display_name": f"E2E-真实客户{lang}-{ts}",
+            # E2E- 前缀保心跳豁免；「陳小明」给话术 {姓名} 变量一个真名可念
+            "display_name": f"E2E-陳小明-{ts}",
             "role_template": "buyer",
             "language": lang,
             "background": "real customer e2e",
+            "template_id": template_id,
         },
         timeout=10,
     ).json()
@@ -188,6 +213,7 @@ def create_call(lang: str, persona_id: str | None) -> tuple[str, str]:
             timeout=10,
         ).json()
         voice = str(persona.get("reference_audio") or "")
+    # 话术模板已随对象绑定（template_id 跟对象走，/api/calls 自动取）
     call = httpx.post(
         f"{CONTROL_PLANE_URL}/api/calls",
         json={
