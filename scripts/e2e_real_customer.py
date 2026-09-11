@@ -79,7 +79,7 @@ SCENARIOS: dict[str, dict] = {
     "en": {
         "label": "Elen（英语·短问询）",
         "lang": "en",
-        "persona_voice": "English_GentleTeacher",
+        "persona_voice": "socialmedia_female_2_v1",
         "lines": [
             "hi there",
             "my parcel is late",
