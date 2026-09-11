@@ -23,7 +23,9 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -44,8 +46,12 @@ from agent_runtime.agent import (  # noqa: E402
     _wa_number_line,
 )
 from agent_runtime.fillers import FILLER_ASSETS_DIR, load_manifest  # noqa: E402
-from agent_runtime.flow import object_vars, render_template_text  # noqa: E402
-from agent_runtime.providers.livekit_plugins import LanguageState, MiniMaxTTS  # noqa: E402
+from agent_runtime.flow import object_vars, parse_steps, render_template_text  # noqa: E402
+from agent_runtime.providers.livekit_plugins import (  # noqa: E402
+    LanguageState,
+    MiniMaxTTS,
+    minimax_speed_for,
+)
 from agent_runtime.tts_cache import TtsAudioCache, default_cache_dir  # noqa: E402
 
 # 物化 job=(persona, lang, text);persona=None=无对应人设(回落设置默认音色)。
@@ -54,13 +60,31 @@ Job = tuple[dict | None, str, str]
 Record = tuple[dict | None, str, str, str]
 
 
-def _cp_get(base: str, path: str, token: str) -> object:
+# 瞬断重试间隔(秒):CP 重启/uvicorn 瞬时拒连曾令保存点自动物化 4 连崩
+# (RemoteDisconnected,2026-09-11 实证)——物化窗口常跨 CP 生命周期,必须扛抖。
+_CP_RETRY_DELAYS = (1.0, 3.0)
+
+
+def _cp_get(base: str, path: str, token: str, *, opener=None) -> object:
     url = f"{base.rstrip('/')}{path}"
-    req = urllib.request.Request(url)
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    opener = opener or urllib.request.urlopen
+    last_exc: Exception | None = None
+    attempts = 1 + len(_CP_RETRY_DELAYS)
+    for i in range(attempts):
+        if i:
+            time.sleep(_CP_RETRY_DELAYS[i - 1])
+        req = urllib.request.Request(url)
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        try:
+            with opener(req, timeout=10) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as exc:
+            # http.client.RemoteDisconnected 是 ConnectionError 子类;HTTPError 是
+            # URLError 子类但代表服务端明确答复(4xx/5xx),重试无益——放行抛出。
+            last_exc = exc
+            continue
+    raise last_exc  # type: ignore[misc]
 
 
 def _fetch_cp(base: str, token: str) -> tuple[dict, list, list, list]:
@@ -184,6 +208,25 @@ def _opening_line(tpl: dict | None, obj: dict, lang: str) -> str:
     return ""
 
 
+def _say_step_lines(tpl: dict | None) -> list[str]:
+    """直念步(say=1)ref 首行(2026-09-12 开场白三段拆分):通知/道歉类文本
+    无变量,agent 走 _say_script 脚本线——与本脚本同一条缓存线物化后即点即播。
+    与 FlowController.step_say_text 同首行规则。"""
+    if not tpl:
+        return []
+    out: list[str] = []
+    for s in parse_steps(str(tpl.get("steps_json") or "")):
+        if not s.say:
+            continue
+        rendered = render_template_text(s.ref or s.goal, {})
+        for line in rendered.splitlines():
+            line = line.strip()
+            if line and not re.search(r"\{[^{}]+\}", line):
+                out.append(line)
+                break
+    return out
+
+
 def _fillers_jobs(
     persona_pool: list[dict], manifest: dict[str, list[dict]], tts_cfg: dict, voice_mode: str
 ) -> list[Job]:
@@ -296,7 +339,10 @@ async def _materialize(
             records.append((persona, lang, "", "fail"))
             print(f"NO_VOICE persona={pk[0]} lang={lang} — 跳过", flush=True)
             continue
-        key = cache.key_for(text, voice=voice, model=model)
+        # 语速维度(W2):与运行时同一条语言档规则(zh/粤 1.2)——合成(provider 的
+        # language_state 已按 lang 构造)与缓存键同步带 speed,速度烧在音频里。
+        speed = minimax_speed_for(lang)
+        key = cache.key_for(text, voice=voice, model=model, speed=speed)
         if cache.get(key) is not None:
             skip += 1
             records.append((persona, lang, voice, "skip"))
@@ -313,7 +359,7 @@ async def _materialize(
             records.append((persona, lang, voice, "fail"))
             print(f"FAIL lang={lang} chars={len(text)} err={exc!r}", flush=True)
             continue
-        stored = cache.store(key, pcm, text=text, voice=voice, model=model, pin=pin)
+        stored = cache.store(key, pcm, text=text, voice=voice, model=model, pin=pin, speed=speed)
         if stored:
             ok += 1
             records.append((persona, lang, voice, "new"))
@@ -418,6 +464,18 @@ async def main_async() -> int:
                 greet_jobs.append((lang_personas.get(lang), lang, _nudge_line("", lang, i)))
             greet_jobs.append((lang_personas.get(lang), lang, _farewell_line("", lang)))
             greet_jobs.append((lang_personas.get(lang), lang, _wa_number_line(lang, "")))
+        # 直念步(say=1)文本线:通知/道歉类合规内容,agent 走 _say_script 脚本线
+        # ——同一条缓存线物化(钉住)。按语言去重(同语言模板共用同一段通知)。
+        _seen_notice: set[tuple[str, str]] = set()
+        for tpl in templates or []:
+            _tlang = _normalize_lang((tpl or {}).get("language"), default="") or ""
+            if not _tlang:
+                continue
+            for text in _say_step_lines(tpl):
+                if (_tlang, text) in _seen_notice:
+                    continue
+                _seen_notice.add((_tlang, text))
+                greet_jobs.append((lang_personas.get(_tlang), _tlang, text))
 
     if args.objects:
         only_id = str(args.object_id or "").strip()

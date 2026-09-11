@@ -84,7 +84,16 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
     [account, callId],
   );
   const meSession = useSession(tokenMe, { roomName: callId });
+  // deps 用稳定的 Room 实例而非 meSession 对象:后者是 useMemo 产物、身份随本地轨
+  // publish/mute 变动(半双工每轮暂让都在换),旧 deps [meSession] 令连接 effect 反复
+  // 重跑、leave 窗口还会重连污染结算(2026-09-11 审计 P1-3)。
+  const meRoom = meSession.room;
   const otherRoomRef = useRef<Room | null>(null);
+  // other 房间重建计数:驱动半双工 watcher 重新挂载(重挂/StrictMode 下 watcher
+  // 曾盯着已 disconnect 的死房,othHeld 永不生效,2026-09-11 审计 P1-4)。
+  const [otherRoomVersion, setOtherRoomVersion] = useState(0);
+  const leavingRef = useRef(false);
+  const [leaving, setLeaving] = useState(false);
 
   const [meConnected, setMeConnected] = useState(false);
   const [otherConnected, setOtherConnected] = useState(false);
@@ -116,9 +125,9 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   const [meHeld, setMeHeld] = useState(false);
   const [othHeld, setOthHeld] = useState(false);
 
-  // ---- 我方连接(照抄 interpret 页已验证路径) ----
+  // ---- 我方连接(照抄 interpret 页/CallStudio 已验证路径) ----
   useEffect(() => {
-    if (meSession.room.state === ConnectionState.Connected || meSession.room.state === ConnectionState.Connecting) return;
+    if (meRoom.state === ConnectionState.Connected || meRoom.state === ConnectionState.Connecting) return;
     let cancelled = false;
     (async () => {
       setBusy(true);
@@ -126,24 +135,38 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
         // 连接 effect 可能早于设备恢复 state,直接用已存值兜底。
         const micId = meMicId || savedMicDevice("me");
         const outId = meOutId || savedOutputDevice("me");
-        if (micId) await meSession.room.switchActiveDevice("audioinput", micId, false).catch(() => {});
-        await meSession.room.localParticipant
-          .setMicrophoneEnabled(true, undefined, { preConnectBuffer: true })
-          .catch(() => {});
-        await meSession.start({ tracks: { microphone: { enabled: true } } });
+        if (micId) await meRoom.switchActiveDevice("audioinput", micId, false).catch(() => {});
+        // 麦克风采集放进 session.start 的 tracks(与 token/连房并行,CallStudio 同款)。
+        // 绝不能先在未连接的房间上 await setMicrophoneEnabled——发布等连接、连接又
+        // 等这行返回,互等死到 livekit 内部 ~15s 超时,且超时会 track.stop() 杀掉
+        // 已采集的麦克风轨、错误被吞,房间照常连接 = 「已接入」假象 + fwd 收不到
+        // 任何音频(2026-09-11 同传审计:09-10「fwd 进房 6 分钟零译文」根因)。
+        await meSession.start({
+          tracks: { microphone: { enabled: true, publishOptions: { preConnectBuffer: true } } },
+        });
+        // 确保我方麦克风真正发布:失败(权限被拒/设备被占)显式报错并把开关拉回
+        // 现实,不再静默装「已接入」。
         try {
-          await meSession.room.localParticipant.setMicrophoneEnabled(true);
+          const pub = await meRoom.localParticipant.setMicrophoneEnabled(true);
+          setMeMicOn(Boolean(pub));
+          if (!pub) setError("无法开启我方麦克风：请检查浏览器麦克风权限——已连接,但同传听不到我方说话。");
         } catch {
-          setError("无法开启我方麦克风：请检查浏览器麦克风权限。");
+          setMeMicOn(false);
+          setError("无法开启我方麦克风：请检查浏览器麦克风权限——已连接,但同传听不到我方说话。");
         }
-        setMeConnected(true);
-        setStartedAt((prev) => prev ?? Date.now());
         // 共享扬声器(默认)不碰输出路由;独立双输出才 setSinkId。
         if (outputModeRef.current === "dual" && outId) {
-          await switchWebOutputDevice(meSession.room, outId).catch(() => {});
+          await switchWebOutputDevice(meRoom, outId).catch(() => {});
         }
       } catch (e) {
-        if (!cancelled) setError(describeConnectError(e, "join-session"));
+        // session.start 内部 token/连房与麦克风并行:麦克风失败时房间可能仍连上。
+        const raw = e instanceof Error ? e.message : String(e ?? "");
+        if (/notallowed|permission|notreadable|track invalid|device in use/i.test(raw)) {
+          if (!cancelled) {
+            setMeMicOn(false);
+            setError("无法开启我方麦克风：请检查浏览器麦克风权限——已连接,但同传听不到我方说话。");
+          }
+        } else if (!cancelled) setError(describeConnectError(e, "join-session"));
       } finally {
         // 无条件复位:cancelled(权限拒绝/依赖重挂载)路径若不复位,结束按钮
         // 会永久锁死(2026-09-09 QA B5 实测);busy 只表达「连接尝试进行中」。
@@ -154,29 +177,75 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [meSession]);
+  }, [meRoom]);
+
+  // meConnected 由房间状态驱动,不押在 start() resolve 上——其末尾「等 agent 就绪」
+  // 无超时、agent 慢/异常时永久挂起,旧写法 meConnected/时钟/busy 全部死在 await 后
+  // (2026-09-11 审计 P0:一体台恒显「连接中」的直接根因)。
+  useEffect(() => {
+    if (meRoom.state !== ConnectionState.Connected) return;
+    setMeConnected(true);
+    setStartedAt((prev) => prev ?? Date.now());
+    setBusy(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [meRoom, meRoom.state]);
 
   // ---- 对象连接(纯手动 Room:麦克风收音 + 译文放音) ----
   useEffect(() => {
+    // 顺序契约(2026-09-12 一体台「没翻译」根因):RoomAgentDispatch 只在首个
+    // 参与者建房时生效且只挂 me 端 token——两端同时起跑时 other(无 dispatch)
+    // 抢先建房,me 的 dispatch 永不激活=同传 AI 拉不起来。other 必须等 me 连上
+    // (房间已由 me 建好)再进。
+    if (!meConnected) return;
     let cancelled = false;
     let room: Room | null = null;
     (async () => {
       try {
         const tok = await fetchToken(account, callId, "other");
+        // fetch 挂起期间 cleanup 已跑:直接放弃。旧写法在此之后才查 cancelled,
+        // 会把 room 完整连上后弃管(无 disconnect),靠同身份重连互踢才收敛。
+        if (cancelled) return;
         room = new Room();
         otherRoomRef.current = room;
+        setOtherRoomVersion((v) => v + 1);
+        // 译文出声(2026-09-12「听不到我方话的同传」根因):手动 Room 没有
+        // AgentSessionProvider 的全轨音频渲染——连接时 startAudio() 只 attach
+        // 当时的轨,而 fwd 的 trans-<对方语言> 译文轨是**之后**说话才发布订阅的,
+        // 永远没有 audio element=永远无声(me 端中文译文走官方渲染器所以听得到)。
+        // TrackSubscribed 即刻 attach;autoplay 被拦时首次点击恢复。
+        room.on(RoomEvent.TrackSubscribed, (track) => {
+          if (track.kind !== "audio") return;
+          const el = track.attach();
+          el.autoplay = true;
+          el.style.display = "none";
+          document.body.appendChild(el);
+          el.play().catch(() => {
+            const resume = () => {
+              el.play().catch(() => {});
+              document.removeEventListener("click", resume);
+            };
+            document.addEventListener("click", resume);
+          });
+        });
+        room.on(RoomEvent.TrackUnsubscribed, (track) => {
+          track.detach().forEach((el) => el.remove());
+        });
         // 连接 effect 可能早于设备恢复 state,直接用已存值兜底。
         const micId = othMicId || savedMicDevice("other");
         const outId = othOutId || savedOutputDevice("other");
         if (micId) await room.switchActiveDevice("audioinput", micId, false).catch(() => {});
         await room.connect(tok.serverUrl, tok.participantToken);
-        if (cancelled) return;
+        if (cancelled) {
+          room.disconnect().catch(() => {});
+          return;
+        }
         await room.localParticipant.setMicrophoneEnabled(othMicOn);
         // 共享扬声器(默认)不碰输出路由;独立双输出才 setSinkId。
         if (outputModeRef.current === "dual" && outId) {
           await switchWebOutputDevice(room, outId).catch(() => {});
         }
         setOtherConnected(true);
+        setOtherRoomVersion((v) => v + 1);
         await room.startAudio().catch(() => {});
       } catch (e) {
         if (!cancelled) setError(describeConnectError(e, "join-session"));
@@ -189,14 +258,14 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
       if (r) r.disconnect().catch(() => {});
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [callId]);
+  }, [callId, meConnected]);
 
   // ---- 设备选择应用 ----
   const pickMeMic = useCallback(
     (id: string) => {
       setMeMicId(id);
       saveMicDevice(id, "me");
-      if (meConnected) meSession.room.switchActiveDevice("audioinput", id, false).catch(() => {});
+      if (meConnected) meRoom.switchActiveDevice("audioinput", id, false).catch(() => {});
     },
     [meSession, meConnected],
   );
@@ -204,7 +273,7 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
     (id: string) => {
       setMeOutId(id);
       saveOutputDevice(id, "me");
-      if (outputModeRef.current === "dual" && meConnected) switchWebOutputDevice(meSession.room, id).catch(() => {});
+      if (outputModeRef.current === "dual" && meConnected) switchWebOutputDevice(meRoom, id).catch(() => {});
     },
     [meSession, meConnected],
   );
@@ -227,7 +296,7 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   const toggleOthMic = useCallback(() => setOthMicOn((v) => !v), []);
   useEffect(() => {
     if (!meConnected) return;
-    meSession.room.localParticipant.setMicrophoneEnabled(meMicOn && !meHeld).catch(() => {});
+    meRoom.localParticipant.setMicrophoneEnabled(meMicOn && !meHeld).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [meMicOn, meHeld, meConnected]);
   useEffect(() => {
@@ -241,7 +310,7 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   useEffect(() => {
     if (outputMode !== "dual" || !canDual || !meConnected) return;
     const id = meOutId || savedOutputDevice("me");
-    if (id) switchWebOutputDevice(meSession.room, id).catch(() => {});
+    if (id) switchWebOutputDevice(meRoom, id).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [outputMode, meOutId, meConnected, canDual]);
   useEffect(() => {
@@ -254,7 +323,7 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   // 切回共享扬声器:显式回系统默认输出(sinkId="default"),避免残留上一档路由。
   useEffect(() => {
     if (outputMode !== "shared" || !canDual) return;
-    if (meConnected) meSession.room.switchActiveDevice("audiooutput", "default", false).catch(() => {});
+    if (meConnected) meRoom.switchActiveDevice("audiooutput", "default", false).catch(() => {});
     const r = otherRoomRef.current;
     if (otherConnected && r) r.switchActiveDevice("audiooutput", "default", false).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -267,14 +336,15 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
       setOthHeld(false);
       return;
     }
-    const stopMe = watchTransAudio(meSession.room, setMeHeld);
+    const stopMe = watchTransAudio(meRoom, setMeHeld);
     const stopOth = watchTransAudio(otherRoomRef.current, setOthHeld);
     return () => {
       stopMe();
       stopOth();
     };
+    // otherRoomVersion:other 房间(重)建后重挂 watcher,防盯死房。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [halfDuplex, meConnected, otherConnected]);
+  }, [halfDuplex, meConnected, otherConnected, otherRoomVersion]);
 
   // 同设备告警:同麦永远要提示;同扬声器只在独立双输出档才是问题(共享档本来就共用)。
   const sameDeviceWarning = [
@@ -287,13 +357,14 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   return (
     <AgentSessionProvider session={meSession} volume={1} muted={false}>
       <ConsoleLive
-        room={meSession.room}
+        room={meRoom}
         myLang={myLang}
         otherLang={otherLang}
         meConnected={meConnected}
         otherConnected={otherConnected}
         error={error}
         busy={busy}
+        leaving={leaving}
         micDevices={micDevices}
         outDevices={outDevices}
         meMicId={meMicId}
@@ -323,16 +394,28 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   );
 
   async function leave() {
+    // 防抖:CP 断房后台化之前,hangup 慢时连点曾打出 7 连发(2026-09-10 实证);
+    // onExit 收进 finally——任何一步挂起/抛错都放行退出,不再把用户锁在页面里。
+    if (leavingRef.current) return;
+    leavingRef.current = true;
+    setLeaving(true);
     try {
-      await meSession.end();
-    } catch {
-      /* ignore */
+      try {
+        await Promise.race([meSession.end(), new Promise((r) => setTimeout(r, 5000))]);
+      } catch {
+        /* ignore */
+      }
+      const r = otherRoomRef.current;
+      otherRoomRef.current = null;
+      if (r) await Promise.race([r.disconnect(), new Promise((res) => setTimeout(res, 3000))]).catch(() => {});
+      await api.hangup(callId).catch((e) => {
+        if (!String(e).includes("404")) console.warn("hangup failed", e);
+      });
+    } finally {
+      leavingRef.current = false;
+      setLeaving(false);
+      onExit();
     }
-    const r = otherRoomRef.current;
-    otherRoomRef.current = null;
-    if (r) await r.disconnect().catch(() => {});
-    await api.hangup(callId).catch(() => {});
-    onExit();
   }
 }
 
@@ -344,6 +427,7 @@ type LiveProps = {
   otherConnected: boolean;
   error: string | null;
   busy: boolean;
+  leaving: boolean;
   micDevices: AudioDeviceInfo[];
   outDevices: AudioDeviceInfo[];
   meMicId: string;
@@ -561,8 +645,9 @@ function ConsoleLive(p: LiveProps) {
           <button className="stage-btn-secondary" onClick={() => setClearedCount(transcriptions.length)}>
             清空字幕
           </button>
-          <button className="stage-btn-secondary mt-auto text-red-300" onClick={p.leave}>
-            结束一体台会话
+          {/* 结束按钮只在「已在退出中」时禁用(防 7 连发),连接/busy 中都保持可点。 */}
+          <button className="stage-btn-secondary mt-auto text-red-300" onClick={p.leave} disabled={p.leaving}>
+            {p.leaving ? "结束中…" : "结束一体台会话"}
           </button>
         </section>
       </div>
@@ -678,7 +763,6 @@ function watchTransAudio(room: Room | null, setHeld: (v: boolean) => void): () =
   if (!room) return () => {};
   let ctx: AudioContext | null = null;
   const nodes = new Map<string, { source: MediaStreamAudioSourceNode; analyser: AnalyserNode }>();
-  let busyUntil = 0;
 
   const attach = (track: RemoteTrack, pub: RemoteTrackPublication) => {
     if (!String(pub.trackName ?? "").startsWith("trans-")) return;
@@ -709,19 +793,39 @@ function watchTransAudio(room: Room | null, setHeld: (v: boolean) => void): () =
   }
 
   const buf = new Float32Array(512);
+  let busyUntil = 0;
+  let heldSince = 0;
+  let quietUntil = 0;
   const timer = window.setInterval(() => {
+    // 看门狗(2026-09-11 审计 P0-3):AudioContext 被系统挂起(WKWebView 切后台/
+    // 长会话音频路由切换)时 analyser 数据会冻结在最后一帧——冻结在响段令
+    // busyUntil 无限续期、对向麦克风被永久暂让(fail-closed = 零翻译)。持续
+    // resume + 单次连续 hold 超 10s 强制释放并给 5s 说话冷却窗(fail-open 串译
+    // 优于永久压麦,用户可用手动静音按钮兜底)。
+    if (ctx && ctx.state !== "running") ctx.resume().catch(() => {});
+    const now = Date.now();
     let loud = false;
-    for (const { analyser } of nodes.values()) {
-      analyser.getFloatTimeDomainData(buf);
-      let sum = 0;
-      for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
-      if (Math.sqrt(sum / buf.length) > 0.012) {
-        loud = true;
-        break;
+    if (now >= quietUntil) {
+      for (const { analyser } of nodes.values()) {
+        analyser.getFloatTimeDomainData(buf);
+        let sum = 0;
+        for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+        if (Math.sqrt(sum / buf.length) > 0.012) {
+          loud = true;
+          break;
+        }
       }
     }
-    if (loud) busyUntil = Date.now() + 600;
-    setHeld(Date.now() < busyUntil);
+    if (loud) busyUntil = now + 600;
+    const held = now < busyUntil;
+    if (held && !heldSince) heldSince = now;
+    if (!held) heldSince = 0;
+    if (heldSince && now - heldSince > 10_000) {
+      busyUntil = 0;
+      heldSince = 0;
+      quietUntil = now + 5_000;
+    }
+    setHeld(held);
   }, 120);
 
   return () => {

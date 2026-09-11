@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import time
 import wave
 from pathlib import Path
 
@@ -141,7 +142,7 @@ class _FakeCache:
         self.sample_rate = sample_rate
         self.lookups: list[tuple[str, str, str]] = []
 
-    def lookup(self, text: str, *, voice: str, model: str):
+    def lookup(self, text: str, *, voice: str, model: str, speed: float = 1.0):
         self.lookups.append((text, voice, model))
         return self.pcm_by_text.get(text)
 
@@ -189,15 +190,20 @@ def test_hold_if_playing_remaining_plus_gap(tmp_path):
         assert d.hold_if_playing() == 0.0  # 未播
         await d._fire(0)
         hold = d.hold_if_playing()
-        assert 1.2 <= hold <= 1.31, f"hold 应≈dur(1.0)+gap(0.3): {hold}"
-        player.handles[-1].stopped = True  # 直接置标志不改 done;用 done 模拟播完
-        d._handle = type(player.handles[-1])()
-        # 直接置 done 句柄:hold 归零
-        class _Done:
-            def done(self):
-                return True
+        # 2026-09-12: dur 恒用实际 PCM(测试资产 20ms)——manifest dur_s 仅资产层参考。
+        assert 0.3 <= hold <= 0.65, f"hold 应≈dur(0.02)+gap(0.3-0.6随机): {hold}"
+        # 2026-09-11 语义升级:播完(handle done)不再立即归零——回复恰在垫话尾后
+        # 到达=零间隔硬接(用户实证生硬),须保住余下 gap 窗;时间轴超出才归零。
+        import time as _t
 
-        d._handle = _Done()
+        d._cur_dur = 1.0
+        d._play_started = _t.monotonic() - 1.0  # 1s 前开播,dur=1.0 → 刚播完
+        hold_done = d.hold_if_playing()
+        assert 0.25 < hold_done <= 0.62, f"播完 gap 窗(随机): {hold_done}"
+        d._play_started = _t.monotonic() - 10.0  # 远超窗
+        assert d.hold_if_playing() == 0.0
+        await d._fire(0)  # 重新开一把再 cancel:用户插话清窗
+        d.cancel()
         assert d.hold_if_playing() == 0.0
 
     _run(_case())
@@ -277,15 +283,19 @@ def test_kill_switch(tmp_path, monkeypatch):
 
 def test_gap_env_default_and_override(monkeypatch):
     monkeypatch.delenv("BOK_FILLER_GAP_MS", raising=False)
+    # 2026-09-12 用户定档:默认 300-600ms 均匀随机(固定值机械感)。
+    vals = {filler_gap_s() for _ in range(30)}
+    assert all(0.3 <= v <= 0.6 for v in vals)
+    assert len(vals) > 1, "随机窗应产生变化值"
+    monkeypatch.setenv("BOK_FILLER_GAP_MS", "300")
     assert filler_gap_s() == 0.3
-    monkeypatch.setenv("BOK_FILLER_GAP_MS", "500")
-    assert filler_gap_s() == 0.5
 
 
-def test_filler_max_default_is_three(monkeypatch):
+def test_filler_max_default_is_twelve(monkeypatch):
     monkeypatch.delenv("BOK_FILLER_MAX", raising=False)
     from agent_runtime.fillers import filler_max_per_call
-    assert filler_max_per_call() == 3
+    # 2026-09-12 定档:3 被首轮「主动+链发」耗尽致「几轮就没」→ 12 覆盖整通。
+    assert filler_max_per_call() == 12
 
 
 def test_load_manifest_shape(tmp_path):
@@ -335,6 +345,10 @@ def test_chain_fires_second_filler_when_reply_late(tmp_path, monkeypatch):
         await asyncio.sleep(0.15)  # gap + 观察者补位
         assert len(player.plays) == 2 and d._count == 2, "播完无回复应链发第二发"
         assert d._fired_lines[0] != d._fired_lines[1], "链发两条不重样"
+        # 测试资产仅 20ms 实际音频,断言前手动置「在播」窗验证 hold 契约
+        # (2026-09-12: _cur_dur 恒用实际 PCM 口径,20ms 已自然播完)。
+        d._cur_dur = 1.0
+        d._play_started = time.monotonic() - 0.1
         assert d.hold_if_playing() > 0, "垫话2 在播:hold 扣压契约照常生效"
 
     _run(_case())

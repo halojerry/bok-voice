@@ -46,18 +46,21 @@ FILLERS: dict[str, dict] = {
         "voice": "Chinese_wenrounvxing",
         "speed": 1.2,
         "pitch": 0,
+        # 2026-09-12 用户定档重排:旧池「好的您稍等」式万能腔机械——按集运理赔
+        # 话术语域重写(订单/物流/核实/这单),口语语气词自然衔接;1.5-2.0s 口径。
         "lines": [
-            "好的，您稍等。",
-            "我帮您看一下啊。",
-            "马上帮您查一下。",
-            "收到，您稍等。",
-            "明白，稍等一下。",
-            "嗯<#0.3#>让我看下。",
-            "好的好的，您稍等。",
-            "好的，请稍等一下。",
-            "嗯，收到了。",
-            "好，稍等一下啊。",
+            "哎好的，您稍等，我马上查。",
+            "您别急，我看一下您这单的情况。",
+            "好的您说，我这就去核实。",
+            "嗯，您稍等，我查一下物流信息。",
+            "收到收到，我马上给您查这单。",
+            "您慢慢说，我听着呢。",
+            "好嘞，您稍等，我帮您核实一下。",
+            "别着急，我正在看您这单。",
+            "嗯<#0.2#>您稍等，我看一下。",
+            "好的稍等，马上给您查清楚。",
         ],
+        "win": ((1.35, 2.15), (1.25, 2.3)),  # 短句 tier zh 专属窗(目标 1.5-2.0s)
         "long_lines": [
             # 首轮实测修订:zh 双逗号/冗字拖腔超窗(「您别急」轮 3.49s),删中段
             # 压回窗内;万能话术不变(应承+等待邀请,查一下=等待邀请动词面)。
@@ -70,18 +73,21 @@ FILLERS: dict[str, dict] = {
         "voice": "Cantonese_crisp_news_anchor_vv2",
         "speed": 1.2,
         "pitch": 0,
+        # 2026-09-12 用户定档重排:旧池 0.9-1.5s 偏短,整批换 1.5-2.0s 口径
+        # (13-16 字/条,应承+等待邀请万能话术不变);窗见 win 字段。
         "lines": [
-            "好，我而家就幫你睇下。",
-            "好，等一陣。",
-            "收到，你等陣。",
-            "明白，請稍等。",
-            "冇問題，你等一陣。",
-            "嗯<#0.2#>我睇下。",
-            "好嘅，等我一陣。",
-            "麻煩你稍為等一陣。",
-            "收到，等我一陣。",
-            "唔好急，等一陣先啊。",
+            "唔使急，你慢慢講，我幫你睇緊。",
+            "好嘅，你稍等一陣，我即刻幫你核實。",
+            "收到，你等我幾秒，查緊喇。",
+            "明白，你繼續講，我聽緊。",
+            "好，你講先，我而家幫你睇返。",
+            "冇問題，你稍等多一陣，我跟進緊。",
+            "唔使擔心，我幫你睇緊先。",
+            "好嘅，你等陣，我幫你查下先。",
+            "收到，你慢慢講，我聽緊。",
+            "嗯<#0.3#>你稍等，我就幫你睇。",
         ],
+        "win": ((1.35, 2.15), (1.25, 2.3)),  # 短句 tier 粤语专属窗(目标 1.5-2.0s)
         "long_lines": [
             "好嘅，你稍等陣，我而家就幫你睇下。",
             "收到，唔好急，等我幫你睇下先。",
@@ -92,18 +98,21 @@ FILLERS: dict[str, dict] = {
         "voice": "socialmedia_female_2_v1",
         "speed": 1.0,
         "pitch": 0,
+        # 2026-09-12 同步重排:按话术语域(order/shipment/verify)+零停顿连读
+        # (en 音色逗号拖腔实证)——无逗号短句,目标 1.2-1.8s。
         "lines": [
-            "Sure, one moment.",
-            "Let me see.",
-            "Got it.",
-            "Can you hold on a moment?",
-            "Of course I can do that.",
-            "I'm checking it right now.",
-            "Right away.",
-            "Checking now.",
-            "Let me look into that for you.",
-            "Sure, sure.",
+            "Sure let me check your order right away.",
+            "Okay give me a second to look into it.",
+            "Hold on I'm checking your shipment now.",
+            "One moment please I'll verify your order.",
+            "Let me pull up your order details now.",
+            "Just a moment while I check on this.",
+            "Checking your order now.",
+            "Give me a second to verify it.",
+            "Checking the shipping info now.",
+            "Sure I'll look into that for you right away.",
         ],
+        "win": ((1.1, 2.0), (1.0, 2.2)),  # 短句 tier en 专属窗(目标 1.2-1.8s)
         # en 社媒女声停顿拖腔实证(两轮):逗号(Mm-hm, sure.=2.57s)与 <#0.3#>
         # 标记都令相邻词拖长 +1.8s 以上——en 长句一律零停顿连读,靠 9 词左右
         # (~0.2s/词)落窗;只保留等待邀请/应承语义,无中段句号。
@@ -240,6 +249,9 @@ def main() -> int:
             (cfg.get("long_lines", []), 2, LONG_WIN_WARN, LONG_WIN_FAIL),
         ]
         for lines, tier, warn_win, fail_win in tiers:
+            # 语言专属窗覆盖(cantonese 短句 tier 1.5-2.0s 定档,2026-09-12)
+            if tier == 1 and "win" in cfg:
+                warn_win, fail_win = cfg["win"]
             for i, text in enumerate(lines, 1):
                 name = f"{lang}-{i:02d}.wav" if tier == 1 else f"{lang}-{10 + i}.wav"
                 if args.dry_run:

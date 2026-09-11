@@ -63,9 +63,14 @@ def normalize_cache_text(text: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
-def cache_key(text: str, *, voice_id: str, model: str, sample_rate: int) -> str:
+def cache_key(text: str, *, voice_id: str, model: str, sample_rate: int, speed: float = 1.0) -> str:
     norm = normalize_cache_text(text)
     raw = f"{norm}\x1f{voice_id}\x1f{model}\x1f{int(sample_rate)}"
+    # 语速维度(W2,2026-09-11):speed≠1.0 才进 key——存量 1.0 条目(en/旧 zh)键
+    # 不变零失效继续命中;zh/粤 1.2 产生新键自然触发重物化(速度烧在音频里,
+    # 同文本不同速度必须不同条目)。
+    if abs(float(speed) - 1.0) > 1e-6:
+        raw = f"{raw}\x1f{float(speed):g}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
@@ -122,8 +127,10 @@ class TtsAudioCache:
         env_max = os.environ.get(_MAX_ENTRIES_ENV, "").strip()
         self.max_entries = int(env_max) if env_max else (max_entries or _DEFAULT_MAX_ENTRIES)
 
-    def key_for(self, text: str, *, voice: str, model: str) -> str:
-        return cache_key(text, voice_id=voice or "", model=model or "", sample_rate=self.sample_rate)
+    def key_for(self, text: str, *, voice: str, model: str, speed: float = 1.0) -> str:
+        return cache_key(
+            text, voice_id=voice or "", model=model or "", sample_rate=self.sample_rate, speed=speed
+        )
 
     def _pcm_path(self, key: str) -> Path:
         return self.root / f"{key}.pcm"
@@ -145,11 +152,12 @@ class TtsAudioCache:
         except OSError:
             return None
 
-    def lookup(self, text: str, *, voice: str, model: str) -> bytes | None:
-        return self.get(self.key_for(text, voice=voice, model=model))
+    def lookup(self, text: str, *, voice: str, model: str, speed: float = 1.0) -> bytes | None:
+        return self.get(self.key_for(text, voice=voice, model=model, speed=speed))
 
     def store(
-        self, key: str, pcm: bytes, *, text: str, voice: str, model: str, pin: bool = False
+        self, key: str, pcm: bytes, *, text: str, voice: str, model: str, pin: bool = False,
+        speed: float = 1.0,
     ) -> bool:
         """原子写入+LRU 淘汰;任何失败静默 False(缓存永不影响播放)。
 
@@ -175,6 +183,7 @@ class TtsAudioCache:
                 "voice": voice or "",
                 "model": model or "",
                 "sample_rate": self.sample_rate,
+                "speed": float(speed),
                 "bytes": len(pcm),
                 "stored_at": time.time(),
             }
@@ -378,6 +387,7 @@ class CachedTTS(tts.TTS):
         cache: TtsAudioCache,
         voice_provider=None,
         model_provider=None,
+        speed_provider=None,
     ) -> None:
         caps = wrapped.capabilities
         super().__init__(
@@ -391,6 +401,9 @@ class CachedTTS(tts.TTS):
         self._cache = cache
         self._voice_provider = voice_provider or (lambda: "")
         self._model_provider = model_provider or (lambda: "")
+        # 语速维度(W2):内芯语言档语速(zh/粤 1.2)进缓存 key——同文本不同速度
+        # 必须不同条目,速度烧在音频里。缺省 1.0=旧键语义零变化。
+        self._speed_provider = speed_provider or (lambda: 1.0)
         self._first_audio_cbs: list = []
         self._hold_provider = None  # 垫话扣压(FillerDirector.hold_if_playing),agent 侧注入
         wrapped.on("metrics_collected", self._forward_metric)
@@ -414,6 +427,13 @@ class CachedTTS(tts.TTS):
             return str(self._model_provider() or "")
         except Exception:
             return ""
+
+    def resolved_speed(self) -> float:
+        """当前语言档语速(zh/粤 1.2)——缓存 key 速度维度(QA 快路/垫话共用取值口)。"""
+        try:
+            return float(self._speed_provider() or 1.0)
+        except Exception:
+            return 1.0
 
     def add_first_audio_listener(self, cb) -> None:
         self._first_audio_cbs.append(cb)
@@ -449,8 +469,9 @@ class CachedTTS(tts.TTS):
     def synthesize(self, text: str, *, conn_options=None) -> tts.ChunkedStream:
         text = str(text or "")
         conn_options = self._norm_conn_options(conn_options)
+        speed = self.resolved_speed()
         key = self._cache.key_for(
-            text, voice=self.resolved_voice(), model=self.resolved_model()
+            text, voice=self.resolved_voice(), model=self.resolved_model(), speed=speed
         )
         pcm = self._cache.get(key)
         if pcm is not None:
@@ -463,7 +484,9 @@ class CachedTTS(tts.TTS):
         inner = self._wrapped.synthesize(text, conn_options=conn_options)
 
         def _done(out: bytes) -> None:
-            ok = self._cache.store(key, out, text=text, voice=voice, model=self.resolved_model())
+            ok = self._cache.store(
+                key, out, text=text, voice=voice, model=self.resolved_model(), speed=speed
+            )
             print(f"TTS_CACHE stored=1 ok={int(ok)} key={key[:10]} bytes={len(out)}", flush=True)
 
         return _StoreChunkedStream(tts_=self, inner=inner, on_done=_done)

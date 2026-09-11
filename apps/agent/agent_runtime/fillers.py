@@ -42,11 +42,43 @@ import asyncio
 import json
 import os
 import random
+import re
 import time
 import wave
 from pathlib import Path
 
 FILLER_ASSETS_DIR = Path(__file__).resolve().parent / "assets" / "fillers"
+
+# livekit BackgroundAudioPlayer 内部音轨固定 48k(AudioSource(48000)+AudioMixer(48000),
+# agents 1.8.0 源码),且 AudioMixer 无重采样——垫话两层(资产 wav 24k/tts-cache pcm 24k)
+# 直进=2 倍速升调「机器人声」(2026-09-11 实机实证),播放前必须对齐此速率。
+BACKGROUND_PLAYER_RATE = 48000
+
+
+def resample_pcm(pcm: bytes, from_rate: int, to_rate: int) -> bytes:
+    """s16le 单声道线性插值重采样(from==to/空输入原样返回)。
+
+    24k→48k 偶数位保原样本、奇数位插值;任意比率按时长守恒。numpy 向量化
+    (~50ms/条,off 关键路径——arm 后 500ms 定时器期外的一次性开销)。"""
+    if from_rate == to_rate or not pcm:
+        return pcm
+    import numpy as np
+
+    s = np.frombuffer(pcm, dtype=np.int16)
+    n = len(s)
+    if n == 0:
+        return pcm
+    out_n = max(1, int(round(n * to_rate / from_rate)))
+    if out_n == 1:
+        return s[:1].tobytes()
+    # 时间基索引(pos=i*from/to,非跨度基):2× 上采样时 step 恰为 0.5,偶数位
+    # 严格保原样本——零相位偏移,时轴与源严格对齐。
+    idx = np.arange(out_n, dtype=np.float64) * (from_rate / to_rate)
+    i0 = np.minimum(idx.astype(np.int64), n - 1)
+    frac = np.clip(idx - i0, 0.0, 1.0)
+    i1 = np.minimum(i0 + 1, n - 1)
+    out = (s[i0].astype(np.float64) * (1.0 - frac) + s[i1].astype(np.float64) * frac)
+    return out.astype(np.int16).tobytes()
 
 
 def filler_enabled() -> bool:
@@ -61,25 +93,48 @@ def filler_delay_s() -> float:
 
 
 def filler_gap_s() -> float:
-    """垫话播完 → 回复衔接前的静默间隔(用户定档 300ms)。"""
-    try:
-        return max(0.0, int(os.environ.get("BOK_FILLER_GAP_MS", "300")) / 1000)
-    except ValueError:
-        return 0.3
+    """垫话播完 → 回复衔接前的静默间隔。
+
+    默认 300-600ms 均匀随机(2026-09-12 用户定档:固定值机械感,逐次随机更
+    自然;垫话播完才放行回复由 hold 时间轴契约保证,间隔只是呼吸窗)。
+    BOK_FILLER_GAP_MS 显式设置=固定值 kill-switch(测试/调档用)。"""
+    env = os.environ.get("BOK_FILLER_GAP_MS", "").strip()
+    if env:
+        try:
+            return max(0.0, int(env) / 1000)
+        except ValueError:
+            pass
+    return random.uniform(0.3, 0.6)
+
+
+_PAUSE_MARK_RE = re.compile(r"<#\d+(?:\.\d+)?#>")
+
+
+def _strip_pause_marks(text: str) -> str:
+    """剥 MiniMax 停顿标记(<#0.3#>)——字幕/turns 账本等展示面用。
+
+    标记是合成指令(部分垫话句内嵌微停顿),缓存键/backfill 查找必须用原文
+    (物化时同文本同键);原样进字幕或 turns =用户可见的指令泄漏。
+    """
+    return _PAUSE_MARK_RE.sub("", str(text or ""))
 
 
 def filler_max_per_call() -> int:
-    # 默认 3(2026-09-10 task-5):链发与主动 arm 共享同一计数,单轮至多
-    # 「1 主动 + 1 链发」耗 2 发,留 1 发给后续轮——默认 2 时一次链发即耗尽全通。
+    # 默认 12(2026-09-12 用户实测「几轮就没」:旧默认 3 被首轮「主动+链发」耗
+    # 2 发,第三轮起全程裸等;链发与主动 arm 共享计数,12 覆盖 8-10 轮慢轮)。
     try:
-        return max(0, int(os.environ.get("BOK_FILLER_MAX", "3")))
+        return max(0, int(os.environ.get("BOK_FILLER_MAX", "12")))
     except ValueError:
-        return 3
+        return 12
 
 
 def filler_chain_enabled() -> bool:
-    """首条垫话播完回复仍未出声 → 自动补第二条(BOK_FILLER_CHAIN,默认开)。"""
-    return os.environ.get("BOK_FILLER_CHAIN", "1") == "1"
+    """首条垫话播完回复仍未出声 → 自动补第二条。
+
+    默认关(2026-09-12 用户实测「重复的垫话」):暖轮回复 1.5-2s,首条垫话
+    ~1.5s 播完时回复几乎必未到,链发=每轮固定双发,体感重复啰嗦;单条+随机
+    gap 已足够衔接。BOK_FILLER_CHAIN=1 恢复。"""
+    return os.environ.get("BOK_FILLER_CHAIN", "0") == "1"
 
 
 def filler_backfill_enabled() -> bool:
@@ -125,6 +180,9 @@ class FillerDirector:
         cache=None,
         voice_model_resolver=None,
         backfill=None,
+        speed_resolver=None,
+        report=None,
+        caption=None,
     ) -> None:
         self._session = session
         self._lang_resolver = lang_resolver
@@ -133,6 +191,15 @@ class FillerDirector:
         self._player = player
         self._guards = guards or (lambda: False)
         self._assets = Path(assets_dir) if assets_dir else FILLER_ASSETS_DIR
+        # 缓存键语速维度(W2):resolver 取合成时点语速(zh/粤 1.2),缺省 1.0=
+        # 旧键语义;miss 落资产层与语速无关。
+        self._speed_resolver = speed_resolver or (lambda: 1.0)
+        # turns 账本上报(W3):开火即报(line, dur_s)——垫话 out-of-band 不进
+        # 转写/字幕,账本是它唯一的可见性出口(gen=filler)。None=零行为变化。
+        self._report = report
+        # 字幕回调(F4,2026-09-11 用户点名):开火即发文本——agent 侧转
+        # lk.transcription 数据包(官方组件聚合通道),不进 chat_ctx 零 LLM 污染。
+        self._caption = caption
         # 人设音色双层(task-14a):cache=TtsAudioCache(lookup 运行时人设 voice/model
         # 的物化版,命中=与通话完全同人声);voice_model_resolver=() -> (voice, model),
         # 异常/空值=纯资产;backfill=async(text) 补物化执行体——由 agent 侧注入
@@ -180,22 +247,23 @@ class FillerDirector:
         self._cancel_timer()
 
     def hold_if_playing(self) -> float:
-        """回复首帧应扣压的秒数:在播垫话的剩余时长 + gap;没在播=0。"""
-        handle = self._handle
-        if handle is None:
+        """回复首帧应扣压的秒数:垫话时间轴(开播+时长+gap)内=剩余量。
+
+        2026-09-11 用户复测实证「垫话→回复衔接生硬」:回复恰在垫话播完后到达时,
+        旧实现(handle done 即 0)零间隔硬接——现在播完后仍保住余下 gap 窗,
+        最小间隔契约=垫话结束→回复出声 ≥ gap;cancel(用户插话)清窗不扣压。"""
+        if not self._play_started:
             return 0.0
-        done = getattr(handle, "done", None)
-        if callable(done) and done():
-            return 0.0
-        elapsed = time.monotonic() - self._play_started if self._play_started else 0.0
-        remaining = max(0.0, self._cur_dur - elapsed)
-        return remaining + filler_gap_s()
+        hold = self._play_started + self._cur_dur + filler_gap_s() - time.monotonic()
+        return max(0.0, hold)
 
     def cancel(self) -> None:
         """新用户轮到达等场景:作废定时器/链发并停掉在播垫话——用户插话优先,
         out-of-band 音轨不受框架打断机制管理,必须自己停。"""
         self._cancel_timer()
         self._cancel_chain()
+        # 时间轴清零:插话后的回复不再被旧垫话的 gap 窗扣压。
+        self._play_started = 0.0
         self._stop_playing()
 
     def reset_per_call(self) -> None:
@@ -327,6 +395,14 @@ class FillerDirector:
                     voice = model = ""
                 if voice and model:
                     try:
+                        speed = 1.0
+                        try:
+                            speed = float(self._speed_resolver() or 1.0)
+                        except Exception:  # noqa: BLE001
+                            speed = 1.0
+                        cached = self._cache.lookup(entry["text"], voice=voice, model=model, speed=speed)
+                    except TypeError:
+                        # 旧签名替身(测试/嵌入方)无 speed 形参:按 1.0 旧语义查
                         cached = self._cache.lookup(entry["text"], voice=voice, model=model)
                     except Exception:  # noqa: BLE001 - 缓存读取失败当未命中
                         cached = None
@@ -337,15 +413,36 @@ class FillerDirector:
                 # 键里就含它)。dur 按实际 PCM 算(物化版时长≠资产 manifest dur_s)。
                 rate = int(getattr(self._cache, "sample_rate", 24000))
                 pcm = cached
-                frames = pcm_to_frames(pcm, rate)
                 voice_mark = "voice_hit=1"
             else:
                 pcm, rate = load_wav_pcm(self._assets / entry["file"])
-                frames = pcm_to_frames(pcm, rate)
                 voice_mark = "voice_hit=0"
+            # W1:两层都对齐 BackgroundAudioPlayer 的固定 48k(混音器无重采样,
+            # 24k 直进=2 倍速升调「机器人声」);时长口径仍按源速率算。
+            frames = pcm_to_frames(resample_pcm(pcm, rate, BACKGROUND_PLAYER_RATE), BACKGROUND_PLAYER_RATE)
             self._count += 1
             self._fired_lines.append(entry["text"])
             print(f"BOK_FILLER fired count={self._count} line={entry['text']!r} {voice_mark}", flush=True)
+            # 展示/账本文本剥 MiniMax 停顿标记——<#0.3#> 是合成指令,原样进字幕
+            # 与 turns 账本=用户可见的指令泄漏(缓存键/backfill 仍用原文,勿动)。
+            display_text = _strip_pause_marks(str(entry["text"]))
+            # 时长恒用实际 PCM 口径(2026-09-12 call-55c6fb1f「垫音重叠」根因:
+            # manifest dur_s 是资产层音色的时长,人设物化版可差到 1.11s→2.72s,
+            # hold 按旧值提前放行回复=回复压着垫话尾巴出声)——账本 dur 同源
+            # 实际播放时长,勿回落 manifest dur_s。
+            self._cur_dur = round(len(pcm) / 2 / rate, 2)
+            if self._report is not None:
+                # W3:开火即上报账本(异常零影响——上报失败绝不阻垫话)。
+                try:
+                    self._report(display_text, self._cur_dur)
+                except Exception:  # noqa: BLE001
+                    pass
+            if self._caption is not None:
+                # F4:字幕(同上异常零影响)。
+                try:
+                    self._caption(display_text)
+                except Exception:  # noqa: BLE001
+                    pass
             if cached is None:
                 # miss=「新人设缺垫话物化」的运行时提醒信号;资产兜底永不哑。
                 print(
@@ -362,7 +459,6 @@ class FillerDirector:
                 source = AudioConfig(source=frames_aiter(frames), fade_in=0.015, fade_out=0.05)
             except Exception:  # noqa: BLE001 - 无 livekit(测试替身)直接喂裸帧迭代
                 source = frames_aiter(frames)
-            self._cur_dur = float(entry.get("dur_s") or round(len(pcm) / 2 / rate, 2))
             self._play_started = time.monotonic()
             self._handle = self._player.play(source)
             self._spawn_chain()  # 挂播完观察者:回复没来就链发第二发

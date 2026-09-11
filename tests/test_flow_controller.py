@@ -229,14 +229,73 @@ WA_REF = "你加工作人員嘅WhatsApp帳號…你直接俾你個WhatsApp號碼
 
 
 def test_should_auto_advance_opening_step():
-    # 開場步:客俾咗實質回應(唔記得)→ 即過;純提問/拒絕 → 唔過。
+    # 身份確認步(2026-09-12 開場白三段拆分):任何非拒絕回應都推——純提問
+    # 「你哋邊間公司」都推,由下一步(來電通知,自報家門)承接;拒絕/異議/要求
+    # 重複唔推(頂部攔走)。舊「純提問唔推」係長開場年代語義,已廢。
     from agent_runtime.flow import should_auto_advance
-    g = "開場說明:通知貨件遺失,問客戶記唔記得買咗咩"
-    r = "你好,請問係{姓名}嗎?…件貨遺失…問你記唔記得買咗咩"
+    g = "身份確認:問對方係咪{姓名}"
+    r = "你好,請問係{姓名}嗎?"
     assert should_auto_advance(current=0, goal=g, ref=r, user_text="我唔记得咗啊！", verdict="unclear") is True
     assert should_auto_advance(current=0, goal=g, ref=r, user_text="好呀，係我", verdict="confirm") is True
-    assert should_auto_advance(current=0, goal=g, ref=r, user_text="你哋係邊間公司㗎？", verdict="question") is False
+    assert should_auto_advance(current=0, goal=g, ref=r, user_text="你哋係邊間公司㗎？", verdict="question") is True
     assert should_auto_advance(current=0, goal=g, ref=r, user_text="唔好再打嚟！", verdict="objection") is False
+    assert should_auto_advance(current=0, goal=g, ref=r, user_text="你讲咩啊？", verdict="repeat") is False
+
+
+def test_should_auto_advance_say_step():
+    # 通知直念步(say=1):客户对「记唔记得买咩货品」的实质回应即推去平台步;
+    # 纯提问(问公司/点解遗失)唔推,原地答(分支+QA 罐头)。未标 say 的步
+    # (平台/赔偿)语义不变——unclear 唔推、答到平台先推。
+    from agent_runtime.flow import should_auto_advance
+    g = "來電通知:自報家門,問客户記唔記得買嘅貨品"
+    r = "我哋係集運中轉倉…想問下你仲記唔記得當時買嘅係咩貨品呢?"
+    assert should_auto_advance(current=1, goal=g, ref=r, user_text="我唔记得咗", verdict="unclear", say_step=True) is True
+    assert should_auto_advance(current=1, goal=g, ref=r, user_text="我买咗件衫", verdict="confirm", say_step=True) is True
+    assert should_auto_advance(current=1, goal=g, ref=r, user_text="你哋係邊間公司？", verdict="question", say_step=True) is False
+    # 平台步(无 say):unclear 唔推
+    assert should_auto_advance(current=2, goal="引导核实", ref="你係喺邊個平台買?", user_text="随便", verdict="unclear", say_step=False) is False
+
+
+def test_parse_steps_say_flag():
+    from agent_runtime.flow import parse_steps
+    import json as _json
+    steps = parse_steps(_json.dumps([
+        {"goal": "身份確認", "ref": "你好，請問係{姓名}嗎？"},
+        {"goal": "來電通知", "ref": "我哋係集運中轉倉…", "say": 1},
+    ]))
+    assert steps[0].say is False
+    assert steps[1].say is True
+
+
+def test_say_step_pending_and_ledger():
+    import json as _json
+    fc = FlowController.from_template({"steps_json": _json.dumps([
+        {"goal": "身份確認:問對方係咪{姓名}", "ref": "你好，請問係{姓名}嗎？"},
+        {"goal": "來電通知", "ref": "我哋係集運中轉倉，今次致電係想通知你。\n如果客户唔记得 → 去下一步问平台", "say": 1},
+        {"goal": "引导核实", "ref": "邊個平台買？"},
+    ])}, OBJ)
+    # 身份步(0)不是直念步 → 无待念文本(开场白走 opening 机制)
+    assert fc.pending_say_text() == ""
+    fc.advance()  # 客户确认身份 → 通知步
+    assert fc.pending_say_text() == "我哋係集運中轉倉，今次致電係想通知你。"
+    # 念完记账:不再待念,当前步注入【通知已念】防 LLM 重复整段
+    fc.note_step_said()
+    assert fc.pending_say_text() == ""
+    cur = fc.current_step_text()
+    assert "【通知已念】" in cur
+    # 收尾态/完成后不直念
+    fc.enter_closing()
+    assert fc.pending_say_text() == ""
+
+
+def test_say_step_missing_var_returns_empty():
+    import json as _json
+    fc = FlowController.from_template({"steps_json": _json.dumps([
+        {"goal": "身份", "ref": "你好"},
+        {"goal": "通知", "ref": "我哋係{不存在的变量}中轉倉", "say": 1},
+    ])}, OBJ)
+    fc.advance()
+    assert fc.pending_say_text() == ""  # 变量缺失宁可退 LLM,不念占位符
 
 
 def test_should_auto_advance_platform_answer():
