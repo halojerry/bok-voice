@@ -573,6 +573,13 @@ class _ExprPrependStream(llm.LLMStream):
 # 尾部重复锚的标签原文（render_context_tail 渲染,4B 会拟声复刻进输出）。
 _TAIL_ANCHOR_LABEL = "【你上一句】"
 
+# 单字数字(汉字+阿拉伯)之间的顿/逗号——剥离后连续读;「拼多多、淘宝」等
+# 普通列表不含数字字,不受影响。(2026-09-12「普通话念数字很奇怪」:4B 爱写
+# 「一、一、二、二」,每个顿号一次 TTS 停顿=机器人感;MiniMax 对阿拉伯数字串
+# 本来就逐位读,时长实验 6.54s vs 6.40s 等价,无需改写数字形态。)
+_DIGIT_PAUSE_RE = re.compile(r"(?<=[零〇一二三四五六七八九0-9])[、，]\s*(?=[零〇一二三四五六七八九0-9])")
+_DIGIT_CHAR_RE = re.compile(r"[零〇一二三四五六七八九0-9]")
+
 
 class _StripTailAnchorStream(llm.LLMStream):
     """剥离模型输出里拟声复刻的「你上一句」锚块（LLM 流出口单点拦截）。
@@ -583,6 +590,11 @@ class _StripTailAnchorStream(llm.LLMStream):
     ContextAwareLLM.chat 出口包一层,TTS/历史/turns/重复锚四个下游全部拿到
     干净文本;渲染本身不动（锚的重复控制功能保留）。壳照抄 _ExprPrependStream:
     metrics 由内芯发出经 _bind_metrics_forward 转发,此处只排空监视分支。
+
+    2026-09-12 同流加数字顿号剥离:4B 复述号码爱写「一、一、二、二」——每个
+    顿号一次 TTS 停顿=机器人感(call-a2705ed2 实证);剥成连续「一一二二」
+    才自然。MiniMax 对阿拉伯数字串本来就逐位读(时长实验 6.54s vs 6.40s 等价),
+    WA 直念线无需改写。
     """
 
     def __init__(self, plugin, inner: "llm.LLMStream"):
@@ -591,6 +603,10 @@ class _StripTailAnchorStream(llm.LLMStream):
         # HOLD:缓冲可能是标签前缀的尾段(防跨 chunk 劈开);DROP:已进块,吞到「」止。
         self._hold = ""
         self._drop = False
+        # 上一段已发出的末字符(仅当是数字字):跨 chunk 配对「一|、一」用。
+        self._prev_digit = ""
+        # 末尾「数字+顿/逗」扣住的分隔符:未发出,待下段首字符配对。
+        self._pending_sep = ""
 
     async def _metrics_monitor_task(self, event_aiter) -> None:
         async for _ in event_aiter:
@@ -627,7 +643,27 @@ class _StripTailAnchorStream(llm.LLMStream):
                 out.append(buf[: len(buf) - keep])
             self._hold = buf[len(buf) - keep :] if keep else ""
             break
-        return "".join(out)
+        return self._strip_digit_pauses("".join(out))
+
+    def _strip_digit_pauses(self, text: str) -> str:
+        """数字顿号剥离(跨 chunk 左右文配对):见类注释 2026-09-12 段。
+
+        _prev_digit=上段末位数字(已发出,仅作左文);_pending_sep=末尾「数字+
+        顿/逗」的分隔符(未发出,扣住等下段首字符配对——是数字则消,不是则照发)。"""
+        if not text:
+            return text
+        work = (self._prev_digit or "") + (self._pending_sep or "") + text
+        self._pending_sep = ""
+        merged = _DIGIT_PAUSE_RE.sub("", work)
+        if self._prev_digit and merged.startswith(self._prev_digit):
+            merged = merged[1:]  # 左文锚字符已在上段发出,只留新合并结果
+        m = re.search(r"[零〇一二三四五六七八九0-9][、，]$", merged)
+        if m:
+            self._pending_sep = merged[-1]
+            merged = merged[:-1]
+        last = merged[-1] if merged else ""
+        self._prev_digit = last if _DIGIT_CHAR_RE.match(last) else ""
+        return merged
 
     def _flush_at_end(self) -> str:
         # 流末仍 drop=块被截断,弃;尾段是残缺标签前缀(模仿起头没写完),同样弃
@@ -1521,6 +1557,21 @@ class _VolcanoTTSStream(tts.ChunkedStream):
         output_emitter.flush()
 
 
+def minimax_speed_for(lang: str) -> float:
+    """语言档语速(zh/cantonese 1.2、其余 1.0)——用户定档:中文/粤语音频 1.0 太慢。
+
+    MINIMAX_SPEED 显式设置=全语言 kill-switch 覆盖(回退通道保留);缺省按语言。
+    垫话资产层自始即 1.2(gen_filler_assets),本函数把同档铺到运行时回复/
+    pregen 物化/backfill 三处,四层语速一致。"""
+    env = os.environ.get("MINIMAX_SPEED", "").strip()
+    if env:
+        try:
+            return float(env)
+        except ValueError:
+            pass
+    return 1.2 if str(lang or "").strip().lower() in ("zh", "cantonese") else 1.0
+
+
 class MiniMaxTTS(tts.TTS):
     """LiveKit TTS adapter for MiniMax 语音合成 (T2A).
 
@@ -1550,7 +1601,7 @@ class MiniMaxTTS(tts.TTS):
         """
         setting: dict = {
             "voice_id": voice,
-            "speed": float(os.environ.get("MINIMAX_SPEED", "1")),
+            "speed": self.resolved_speed(),
             "vol": float(os.environ.get("MINIMAX_VOL", "1")),
             "pitch": int(os.environ.get("MINIMAX_PITCH", "0")),
         }
@@ -1680,6 +1731,10 @@ class MiniMaxTTS(tts.TTS):
     def resolved_voice(self) -> str:
         """公开只读:当前语言锚定音色(tts_cache 缓存 key 取值用,唔碰私有成员)。"""
         return self._resolve_voice()
+
+    def resolved_speed(self) -> float:
+        """公开只读:当前语言档语速(zh/粤 1.2)——tts_cache 缓存 key 的速度维度。"""
+        return minimax_speed_for(getattr(self._language_state, "lang", ""))
 
     def resolved_model(self) -> str:
         """公开只读:当前模型档(speech-2.8-hd/turbo)——档位变更即缓存 key 全量失效。"""
@@ -1881,6 +1936,44 @@ def _minimax_pool_schedule(endpoint: str, key: str) -> None:
     _MINIMAX_POOL_TASK = loop.create_task(_minimax_pool_replenish(endpoint, key))
 
 
+# 精简繁→简映射(词表回声守卫专用,2026-09-11 call-a2705ed2 实证:ASR 抄词表时
+# 用了繁体「顺豐速運/賠償/單號」,词表是简体,逐字匹配断链)。覆盖商务中文常见
+# 繁简差集字符;未映射字符原样透传——两比对侧同表归一,不依赖外部转换库。
+_T2S_PAIRS = (
+    "豐丰 運运 賠赔 償偿 單单 號号 費费 專专 員员 時时 蹤踪 實实 門门 倉仓"
+    " 遞递 關关 係系 貨货 遺遗 請请 圖图 們们 個个 來来 裡里 後后 點点 問题"
+    " 題题 發发 現现 經经 過过 務务 業业 確确 認认 訊讯 聯联 絡络 轉转 帳账"
+    " 匯汇 錢钱 銀银 電电 訂订 額额 價价 樣样 麼么 嗎吗 與与 還还 這这 東东"
+    " 車车 長长 頁页 雲云 絲丝 網网 讓让 討讨 傳传 嘆叹 觀观 覺觉 覽览 識识"
+    " 計计 議议 記记 講讲 證证 許许 設设 訪访 評评 詞词 試试 誠诚 語语 誤误"
+    " 說说 諸诸 讀读 課课 調调 謹谨 負负 貢贡 財财 責责 賢贤 敗败 質质 買买"
+    " 賣卖 賺赚 賽赛 贈赠 輸输 達达 遠远 運运 較较 辦办 為为 風风 飛飞 馬马"
+    " 鳥鸟 貝贝 開开 閉闭 閑闲 間间 鬧闹 聞闻 閱阅 陽阳 陰阴 陣阵 陳陈 險险"
+    " 隨随 隱隐 難难 雙双 發发 戶户 據据 購购 輸运 輸输 國国 際际 韓韩 愛爱"
+    "爾尔"
+)
+_T2S_MAP = {ord(tok[0]): tok[1] for tok in _T2S_PAIRS.split() if len(tok) == 2}
+
+
+def _to_simp(s: str) -> str:
+    """繁→简(仅守卫比对用:逐字映射,未覆盖字符透传;与词表/转写两侧同表归一)。"""
+    try:
+        return str(s or "").translate(_T2S_MAP)
+    except Exception:
+        return str(s or "")
+
+
+def _vocab_words_from_context(hotword_context: str) -> set[str]:
+    """词表上下文 → 归一词集(去 Vocabulary: 头、剥标点、繁→简)。"""
+    words: set[str] = set()
+    for piece in re.split(r"[,，、;；\s]+", str(hotword_context or "")):
+        piece = piece.replace("Vocabulary:", "").replace("Vocabulary：", "").strip()
+        piece = re.sub(r"[^\w\u4e00-\u9fff]+", "", _to_simp(piece))
+        if piece:
+            words.add(piece)
+    return words
+
+
 def _is_hotword_vocab_echo(text: str, hotword_context: str) -> bool:
     """ASR 热词幻听判定(纯函数,单测用):极低内容音频把词表当转写整串抄出。
 
@@ -1889,16 +1982,13 @@ def _is_hotword_vocab_echo(text: str, hotword_context: str) -> bool:
     转写剥标点后**完全由词表词首尾相接组成**(贪心最长匹配全覆盖)且总长 ≥6
     ——真实用户话必有虚词/数字/词表外内容,不可能恰好全是词表词的顺串。
     STT 源头(字幕/句级提交/停嘴 FINAL)与 agent hook 双层共用本判定。
+    2026-09-11:比对两侧同经 _to_simp(繁简归一)——call-a2705ed2 实证回声可被
+    ASR 用繁体抄出,旧简体逐字匹配在首词即断链。
     """
-    norm = re.sub(r"[^\w\u4e00-\u9fff]+", "", str(text or ""))
+    norm = re.sub(r"[^\w\u4e00-\u9fff]+", "", _to_simp(str(text or "")))
     if len(norm) < 6 or not hotword_context:
         return False
-    words: set[str] = set()
-    for piece in re.split(r"[,，、;；\s]+", str(hotword_context)):
-        piece = piece.replace("Vocabulary:", "").replace("Vocabulary：", "").strip()
-        piece = re.sub(r"[^\w\u4e00-\u9fff]+", "", piece)
-        if piece:
-            words.add(piece)
+    words = _vocab_words_from_context(hotword_context)
     if not words:
         return False
     remaining = norm
@@ -1908,6 +1998,57 @@ def _is_hotword_vocab_echo(text: str, hotword_context: str) -> bool:
             return False  # 有一段唔係词表词 → 真人话,唔拦
         remaining = remaining[len(hit):]
     return True
+
+
+_VOCAB_ECHO_MIN_RUN = 4
+
+
+def _strip_vocab_echo_tail(text: str, hotword_context: str) -> str:
+    """剥离词表回声**尾部**、保住真话头(2026-09-11 call-a2705ed2 实证形态:
+    「拼多多。顺豐速運，運通，理賠…」——真答案词恰在词表里,全有全无丢弃会
+    连真实回答一起丢掉)。
+
+    规则:按逗/顿/分号切段,从尾往头收「归一后整段 ∈ 词表词集」的连续尾段;
+    收满 ≥_VOCAB_ECHO_MIN_RUN 段才剥(<4 段可能是平台选择类真实回答);整条
+    全是回声 → 空串(调用方按噪声轮丢弃)。繁简两侧归一后比对。"""
+    raw = str(text or "")
+    if not raw or not hotword_context:
+        return raw
+    words = _vocab_words_from_context(hotword_context)
+    if not words:
+        return raw
+    # 尾随分隔符剥掉(否则 split 产生尾空段,把回声尾的回收循环在第一步就打断)。
+    # 分段含句读符(。！？)——回声可从句中开始(「拼多多。顺豐速運,運通…」实证:
+    # 头段=真话+首个回声词同段,不按句读切就剥不干净)。
+    _SEP = "[.。！？!,，、;；]"
+    _SENT_FINAL = set(".。！？!?")
+    trimmed = re.sub(rf"{_SEP}+[ \t]*$", "", raw)
+    parts = re.split(rf"({_SEP})", trimmed)
+    # split with capture → [seg, sep, seg, sep, ...];按段收集(尾段无分隔符)
+    segments: list[str] = [p for i, p in enumerate(parts) if i % 2 == 0]
+    seps: list[str] = [p for i, p in enumerate(parts) if i % 2 == 1]
+    # 从尾回收词表段,但**不跨句界**:真话以句读收尾(「拼多多。」),回声串是
+    # 逗号粘合的词表顺串——句读左边的完整句子是真人话,哪怕它恰好是词表词
+    # (拼多多在词表里)也不能剥。
+    run = 0
+    for idx in range(len(segments) - 1, -1, -1):
+        if idx < len(segments) - 1 and seps[idx] in _SENT_FINAL:
+            break  # 左侧是完整句子,句界止步
+        norm = re.sub(r"[^\w\u4e00-\u9fff]+", "", _to_simp(segments[idx]))
+        if norm and norm in words:
+            run += 1
+        else:
+            break
+    if run < _VOCAB_ECHO_MIN_RUN:
+        return raw  # 未命中回声:原文原样(含尾标点)——2026-09-12 call-aa86dfc9
+        # 实证旧版误把剥过尾标点的 trimmed 返回,每轮都误改文本+误打 ECHO_STRIP。
+    keep = len(segments) - run
+    if keep <= 0:
+        return ""
+    out = segments[0]
+    for i in range(1, keep):
+        out += seps[i - 1] + segments[i]
+    return out
 
 
 def _trim_lead_silence(

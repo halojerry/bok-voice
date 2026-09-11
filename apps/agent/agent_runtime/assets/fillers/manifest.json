@@ -1,54 +1,54 @@
 {
   "zh": [
     {
-      "text": "好的，您稍等。",
+      "text": "哎好的，您稍等，我马上查。",
       "file": "zh-01.wav",
-      "dur_s": 1.01
+      "dur_s": 1.8
     },
     {
-      "text": "我帮您看一下啊。",
+      "text": "您别急，我看一下您这单的情况。",
       "file": "zh-02.wav",
-      "dur_s": 0.92
+      "dur_s": 2.27
     },
     {
-      "text": "马上帮您查一下。",
+      "text": "好的您说，我这就去核实。",
       "file": "zh-03.wav",
-      "dur_s": 0.91
+      "dur_s": 1.98
     },
     {
-      "text": "收到，您稍等。",
+      "text": "嗯，您稍等，我查一下物流信息。",
       "file": "zh-04.wav",
-      "dur_s": 1.04
+      "dur_s": 2.28
     },
     {
-      "text": "明白，稍等一下。",
+      "text": "收到收到，我马上给您查这单。",
       "file": "zh-05.wav",
-      "dur_s": 1.04
+      "dur_s": 2.12
     },
     {
-      "text": "嗯<#0.3#>让我看下。",
+      "text": "您慢慢说，我听着呢。",
       "file": "zh-06.wav",
-      "dur_s": 1.43
+      "dur_s": 1.42
     },
     {
-      "text": "好的好的，您稍等。",
+      "text": "好嘞，您稍等，我帮您核实一下。",
       "file": "zh-07.wav",
-      "dur_s": 1.51
+      "dur_s": 2.1
     },
     {
-      "text": "好的，请稍等一下。",
+      "text": "别着急，我正在看您这单。",
       "file": "zh-08.wav",
-      "dur_s": 1.48
+      "dur_s": 1.72
     },
     {
-      "text": "嗯，收到了。",
+      "text": "嗯<#0.2#>您稍等，我看一下。",
       "file": "zh-09.wav",
-      "dur_s": 1.15
+      "dur_s": 2.05
     },
     {
-      "text": "好，稍等一下啊。",
+      "text": "好的稍等，马上给您查清楚。",
       "file": "zh-10.wav",
-      "dur_s": 1.15
+      "dur_s": 2.05
     },
     {
       "text": "好的，您稍等，我马上帮您看一下。",
@@ -68,54 +68,54 @@
   ],
   "cantonese": [
     {
-      "text": "好，我而家就幫你睇下。",
+      "text": "唔使急，你慢慢講，我幫你睇緊。",
       "file": "cantonese-01.wav",
-      "dur_s": 1.11
+      "dur_s": 2.09
     },
     {
-      "text": "好，等一陣。",
+      "text": "好嘅，你稍等一陣，我即刻幫你核實。",
       "file": "cantonese-02.wav",
-      "dur_s": 0.94
+      "dur_s": 1.89
     },
     {
-      "text": "收到，你等陣。",
+      "text": "收到，你等我幾秒，查緊喇。",
       "file": "cantonese-03.wav",
-      "dur_s": 1.33
+      "dur_s": 2.06
     },
     {
-      "text": "明白，請稍等。",
+      "text": "明白，你繼續講，我聽緊。",
       "file": "cantonese-04.wav",
-      "dur_s": 1.16
+      "dur_s": 1.9
     },
     {
-      "text": "冇問題，你等一陣。",
+      "text": "好，你講先，我而家幫你睇返。",
       "file": "cantonese-05.wav",
-      "dur_s": 1.02
+      "dur_s": 1.45
     },
     {
-      "text": "嗯<#0.2#>我睇下。",
+      "text": "冇問題，你稍等多一陣，我跟進緊。",
       "file": "cantonese-06.wav",
-      "dur_s": 1.49
+      "dur_s": 1.56
     },
     {
-      "text": "好嘅，等我一陣。",
+      "text": "唔使擔心，我幫你睇緊先。",
       "file": "cantonese-07.wav",
-      "dur_s": 0.92
+      "dur_s": 1.72
     },
     {
-      "text": "麻煩你稍為等一陣。",
+      "text": "好嘅，你等陣，我幫你查下先。",
       "file": "cantonese-08.wav",
-      "dur_s": 1.08
+      "dur_s": 1.64
     },
     {
-      "text": "收到，等我一陣。",
+      "text": "收到，你慢慢講，我聽緊。",
       "file": "cantonese-09.wav",
-      "dur_s": 1.1
+      "dur_s": 1.47
     },
     {
-      "text": "唔好急，等一陣先啊。",
+      "text": "嗯<#0.3#>你稍等，我就幫你睇。",
       "file": "cantonese-10.wav",
-      "dur_s": 1.1
+      "dur_s": 2.0
     },
     {
       "text": "好嘅，你稍等陣，我而家就幫你睇下。",
@@ -135,54 +135,54 @@
   ],
   "en": [
     {
-      "text": "Sure, one moment.",
+      "text": "Sure let me check your order right away.",
       "file": "en-01.wav",
-      "dur_s": 1.2
+      "dur_s": 1.77
     },
     {
-      "text": "Let me see.",
+      "text": "Okay give me a second to look into it.",
       "file": "en-02.wav",
-      "dur_s": 0.9
+      "dur_s": 1.62
     },
     {
-      "text": "Got it.",
+      "text": "Hold on I'm checking your shipment now.",
       "file": "en-03.wav",
-      "dur_s": 0.98
+      "dur_s": 1.82
     },
     {
-      "text": "Can you hold on a moment?",
+      "text": "One moment please I'll verify your order.",
       "file": "en-04.wav",
-      "dur_s": 1.2
+      "dur_s": 1.93
     },
     {
-      "text": "Of course I can do that.",
+      "text": "Let me pull up your order details now.",
       "file": "en-05.wav",
-      "dur_s": 1.53
+      "dur_s": 1.62
     },
     {
-      "text": "I'm checking it right now.",
+      "text": "Just a moment while I check on this.",
       "file": "en-06.wav",
-      "dur_s": 1.17
+      "dur_s": 1.57
     },
     {
-      "text": "Right away.",
+      "text": "Checking your order now.",
       "file": "en-07.wav",
-      "dur_s": 1.14
+      "dur_s": 1.23
     },
     {
-      "text": "Checking now.",
+      "text": "Give me a second to verify it.",
       "file": "en-08.wav",
-      "dur_s": 1.47
+      "dur_s": 1.13
     },
     {
-      "text": "Let me look into that for you.",
+      "text": "Checking the shipping info now.",
       "file": "en-09.wav",
       "dur_s": 1.34
     },
     {
-      "text": "Sure, sure.",
+      "text": "Sure I'll look into that for you right away.",
       "file": "en-10.wav",
-      "dur_s": 1.09
+      "dur_s": 1.69
     },
     {
       "text": "Just a moment and I will check that.",
