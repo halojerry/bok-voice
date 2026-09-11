@@ -1871,6 +1871,17 @@ async def entrypoint(ctx):
         except Exception:  # pragma: no cover - 步号拿不到只损分析列
             step = 0
         if role == "user":
+            # 词表回声隐藏面(2026-09-12 用户拍板「不影响通话就不要显示」):
+            # 流程/QA 早喺 turn 钩子用净文(那边 user_text 已替换),呢度只改
+            # 落库展示——剥尾净文入库;纯回声轮(整句=词表,客户根本冇讲过)
+            # 完全唔落库。原文审计留 agent.log QWEN3_HOTWORD_ECHO_STRIP 行。
+            if _hotword_ctx and _hotword_echo_guard_enabled():
+                _u_text = _strip_vocab_echo_tail(text, _hotword_ctx)
+                if not _u_text.strip("。，, 、;；"):
+                    print(f"QWEN3_HOTWORD_ECHO_TURN_HIDDEN (call {room_name})", flush=True)
+                    return
+                if _u_text != text:
+                    text = _u_text
             _spawn_report(
                 cp.add_turn(
                     call_id, role, _clean_transcript(text), latency_ms=0,
