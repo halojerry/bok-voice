@@ -45,7 +45,8 @@
 - 构建：`bootstrap.sh` `test.sh` `build_livekit.sh` `build_runtime.sh` `build_release.sh` `verify_bundle.sh`（--staging/--app/--doctor）`stub_external_bin.sh`
 - E2E：`e2e_trilingual_livekit.py`（三语，真 /api/token，一案一通话）`e2e_flow_scenario.py` `e2e_multi_turn.py` `e2e_http.py` `e2e_pipeline.py`
 - 测量/探针：`measure_latency.py`（需真栈）`measure_prompt.py`（本地）`probe_cantonese_digits.py` `smoke_sidecars.py` `pad_test_audio.py` `test_deepseek.py` `test_volcano_v3.py`
-- TTS 缓存/快答库：`pregen_tts.py`（`bok.py tts-pregen` 执行体：--greetings/--objects/--fillers/--qa 离线预合成，写 app-data/tts-cache）`mine_qa.py`（`bok.py tts-mine` 执行体：高频问答对报告 + --apply 入库快答库）
+- TTS 缓存/快答库：`pregen_tts.py`（`bok.py tts-pregen` 执行体：--greetings/--objects/--fillers/--qa 离线预合成，写 app-data/tts-cache；也被 CP 人设保存点自动触发，见 `apps/control-plane/control_plane/pregen.py`）`mine_qa.py`（`bok.py tts-mine` 执行体：高频问答对报告 + --apply 入库 / --sync 自动学习闭环：挖掘→质量闸→入库→按语言物化）
+- 真实客户多轮 E2E：`e2e_real_customer.py`（三语三音色多轮真问题连聊，模板绑定走对象 template_id）
 - 平台：`setup-windows.ps1`
 
 ## 关键入口

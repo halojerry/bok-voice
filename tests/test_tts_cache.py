@@ -112,6 +112,18 @@ def test_unpinned_default_stays_evictable(tmp_path):
     assert "pinned" not in meta  # 未钉不写键,旧行为不变
 
 
+def test_unpinned_restore_preserves_pin(tmp_path):
+    """双写者竞态保钉:pregen 落钉后,运行时 tee 迟到重写同 key 不得洗掉
+    pinned(否则罐头静默退回可逐出——保存人设→来电窗口恰会撞上)。"""
+    c = _cache(tmp_path)
+    pcm = b"\xe8\x03" * 4800
+    k = c.key_for("垫话池句", voice="v", model="m")
+    assert c.store(k, pcm, text="垫话池句", voice="v", model="m", pin=True)
+    # 迟到的未钉写回(pcm 变了也会换内容,但 key 同)
+    assert c.store(k, b"\xe8\x03" * 2400, text="垫话池句", voice="v", model="m")
+    assert c._is_pinned(k) is True
+
+
 def test_pcm_to_frames_slices_200ms():
     sr = 24000
     pcm = b"\xe8\x03" * sr  # 1s mono s16le(48000 bytes)

@@ -74,6 +74,15 @@ def test_gate_rejects_digit_runs():
     assert auto_apply_verdict(_pair(question="三天內到嗎123"))[0] is True
 
 
+def test_gate_rejects_cjk_digit_runs():
+    """中文数字与 ASCII 同口径:运行时旁路归一中文数字,「三七七八九零」类
+    问句永远走不到快路,入库即死重(审查 #5)。"""
+    ok, reason = auto_apply_verdict(_pair(question="我個單號係三七七八九零"))
+    assert (ok, reason) == (False, "digits")
+    # 少于 4 位的中文数字不拦
+    assert auto_apply_verdict(_pair(question="三日前送到嗎"))[0] is True
+
+
 def test_gate_rejects_duplicate_against_existing():
     existing = {normalize_question("你哋幾時可以送到!")}  # 带标点,归一后同键
     ok, reason = auto_apply_verdict(_pair(), existing)

@@ -186,8 +186,13 @@ def create_call(lang: str, persona_id: str | None) -> tuple[str, str]:
         template_id = str(tpl.get("id") or "") if tpl else ""
     except Exception:  # noqa: BLE001 - 模板拉不到=退无模板链路(通用语开场)
         template_id = ""
-    obj = httpx.post(
-        f"{CONTROL_PLANE_URL}/api/objects?account_id=acc-001",
+    def _post(path: str, **kw) -> dict:
+        resp = httpx.post(f"{CONTROL_PLANE_URL}{path}", timeout=10, **kw)
+        resp.raise_for_status()
+        return resp.json()
+
+    obj = _post(
+        "/api/objects?account_id=acc-001",
         json={
             # E2E- 前缀保心跳豁免；「陳小明」给话术 {姓名} 变量一个真名可念
             "display_name": f"E2E-陳小明-{ts}",
@@ -196,26 +201,26 @@ def create_call(lang: str, persona_id: str | None) -> tuple[str, str]:
             "background": "real customer e2e",
             "template_id": template_id,
         },
-        timeout=10,
-    ).json()
+    )
     if persona_id:
-        persona = httpx.get(f"{CONTROL_PLANE_URL}/api/personas/{persona_id}", timeout=10).json()
+        resp = httpx.get(f"{CONTROL_PLANE_URL}/api/personas/{persona_id}", timeout=10)
+        resp.raise_for_status()
+        persona = resp.json()
         voice = str(persona.get("reference_audio") or "")
     else:
-        persona = httpx.post(
-            f"{CONTROL_PLANE_URL}/api/personas?account_id=acc-001",
+        persona = _post(
+            "/api/personas?account_id=acc-001",
             json={
                 "name": f"E2E真实客服{lang}",
                 "language": lang,
                 "tone": "礼貌专业",
                 "reference_audio": SCENARIOS[lang]["persona_voice"],
             },
-            timeout=10,
-        ).json()
+        )
         voice = str(persona.get("reference_audio") or "")
     # 话术模板已随对象绑定（template_id 跟对象走，/api/calls 自动取）
-    call = httpx.post(
-        f"{CONTROL_PLANE_URL}/api/calls",
+    call = _post(
+        "/api/calls",
         json={
             "account_id": "acc-001",
             "object_id": obj["id"],
@@ -224,8 +229,7 @@ def create_call(lang: str, persona_id: str | None) -> tuple[str, str]:
             "direction": "webrtc",
             "language": lang,
         },
-        timeout=10,
-    ).json()
+    )
     return str(call["id"]), voice
 
 

@@ -105,6 +105,14 @@ AUTO_MAX_Q_LEN = 24
 
 _DIGIT_RUN_RE = re.compile(r"\d{4,}")
 
+# 闸门用中文数字→阿拉伯映射(仅 digits 检查用,不进 normalize_question——问题
+# 键与运行时匹配必须同源同形)。运行时旁路(flow._digit_runs_in)归一中文数字,
+# 「三七七八九零」类问句运行时永远走不到快路,入库即死重,闸要同口径拦。
+_CJK_DIGIT_TRANS = str.maketrans(
+    {"零": "0", "〇": "0", "一": "1", "二": "2", "两": "2", "三": "3", "四": "4",
+     "五": "5", "六": "6", "七": "7", "八": "8", "九": "9"}
+)
+
 
 def auto_apply_verdict(pair: dict, existing_norm_questions: set[str] | None = None) -> tuple[bool, str]:
     """自动入库闸(2026-09-11 自动学习闭环)。保守:错答案罐头化=复读机。
@@ -115,7 +123,8 @@ def auto_apply_verdict(pair: dict, existing_norm_questions: set[str] | None = No
       挖掘已按通话去重,总票数=通话数);
     - 归一问法长度 [AUTO_MIN_Q_LEN, AUTO_MAX_Q_LEN](4-24,滤单字应承与
       超长叙述);
-    - 无 ≥4 位连续数字(数字轮运行时被四道闸旁路,库内是死重);
+    - 无 ≥4 位连续数字(ASCII 或中文数字,数字轮运行时被四道闸旁路,库内
+      是死重);
     - 归一后不与现有词条重复(existing_norm_questions=None 跳过该项)。
     返回 (入库?, 原因码);过闸原因码为空串。
     """
@@ -128,7 +137,7 @@ def auto_apply_verdict(pair: dict, existing_norm_questions: set[str] | None = No
         return False, "unstable_answer"
     if not AUTO_MIN_Q_LEN <= len(q) <= AUTO_MAX_Q_LEN:
         return False, "question_length"
-    if _DIGIT_RUN_RE.search(q):
+    if _DIGIT_RUN_RE.search(q) or _DIGIT_RUN_RE.search(q.translate(_CJK_DIGIT_TRANS)):
         return False, "digits"
     if existing_norm_questions is not None and q in existing_norm_questions:
         return False, "duplicate"

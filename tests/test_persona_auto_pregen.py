@@ -22,7 +22,7 @@ from control_plane.main import app
 
 
 class _FakePopen:
-    """记录 spawn;poll() 缺省 None=在跑(单飞判定用)。"""
+    """记录 spawn;poll() 缺省 None=在跑(单飞判定用),wait() 模拟 reaper。"""
 
     def __init__(self, cmd, **kw):
         self.cmd = list(cmd)
@@ -31,6 +31,9 @@ class _FakePopen:
         self.rc = None
 
     def poll(self):
+        return self.rc
+
+    def wait(self):
         return self.rc
 
 

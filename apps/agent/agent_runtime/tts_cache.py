@@ -160,6 +160,11 @@ class TtsAudioCache:
         if not pcm:
             return False
         pcm = _trim_lead_silence_safe(pcm, self.sample_rate)
+        # 保钉(双写者竞态):运行时 tee 与 pregen 子进程共用 key 空间,运行时
+        # 合成在途时 pregen 先落钉、tee 迟到 _done 重写 meta——未钉写回不得
+        # 洗掉已有 pinned(否则罐头静默退回可逐出,W3 保存→来电窗口恰放大)。
+        if not pin and self._is_pinned(key):
+            pin = True
         try:
             self.root.mkdir(parents=True, exist_ok=True)
             tmp = self._pcm_path(key).with_suffix(".tmp")

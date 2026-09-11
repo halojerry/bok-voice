@@ -1420,11 +1420,13 @@ def get_persona(persona_id: str) -> dict:
 def create_persona(req: PersonaRequest, request: Request) -> dict:
     persona = _repo().create_persona(req.model_dump())
     _audit("persona.create", subject_type="persona", subject_id=persona.get("id", ""), account_id=persona.get("account_id", ""), detail={"name": persona.get("name", "")})
-    # 新人设上线:无罐头即提醒+自动全量物化(W3,响应 tts_pregen=提醒面)
-    persona["tts_pregen"] = persona_pregen_status(
-        persona, base_url=str(request.base_url).rstrip("/")
+    # 新人设上线:无罐头即提醒+自动全量物化(W3,响应 tts_pregen=提醒面)。
+    # 装饰浅拷贝——内存 repo 返回活引用,直接写会把一次性状态键落进存储。
+    out = dict(persona)
+    out["tts_pregen"] = persona_pregen_status(
+        out, base_url=str(request.base_url).rstrip("/")
     )
-    return persona
+    return out
 
 
 @app.put("/api/personas/{persona_id}")
@@ -1436,19 +1438,21 @@ def update_persona(persona_id: str, req: UpdatePersonaRequest, request: Request)
     if not persona:
         raise HTTPException(404, "persona not found")
     _audit("persona.update", subject_type="persona", subject_id=persona_id, account_id=(existing or {}).get("account_id", ""), detail={"name": persona.get("name", "")})
-    persona["tts_pregen"] = persona_pregen_status(
-        persona, base_url=str(request.base_url).rstrip("/"), existing=existing
+    out = dict(persona)
+    out["tts_pregen"] = persona_pregen_status(
+        out, base_url=str(request.base_url).rstrip("/"), existing=existing
     )
-    return persona
+    return out
 
 
 @app.put("/api/personas")
 def upsert_persona(req: PersonaRequest, request: Request) -> dict:
     persona = _repo().create_persona(req.model_dump())
-    persona["tts_pregen"] = persona_pregen_status(
-        persona, base_url=str(request.base_url).rstrip("/")
+    out = dict(persona)
+    out["tts_pregen"] = persona_pregen_status(
+        out, base_url=str(request.base_url).rstrip("/")
     )
-    return persona
+    return out
 
 
 @app.delete("/api/personas/{persona_id}")

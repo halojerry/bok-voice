@@ -17,6 +17,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 
@@ -76,7 +77,40 @@ def _log_path() -> Path:
 
 
 # 同进程单飞账本:persona_id → Popen(跑完留着,poll() 非 None 即可覆盖)。
+# FastAPI sync handler 跑线程池——check-and-spawn 必须整段持锁,否则并发
+# 保存同一人设会双双通过 poll() 检查双发子进程(重复云合成,60 RPM 压力)。
 _PREGEN_PROCS: dict[str, subprocess.Popen] = {}
+_SPAWN_LOCK = threading.Lock()
+
+
+def _spawn_detached(cmd: list[str], env: dict[str, str], log: Path) -> subprocess.Popen:
+    """起子进程:新会话(栈 Ctrl-C/组杀不断它)+日志落盘,失败退 DEVNULL。
+
+    daemon reaper 线程回收退出码——不挂的话子进程退出后留僵尸直到该人设
+    下一次保存才被 poll() 顺手收尸。
+    """
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("ab") as lf:
+            proc = subprocess.Popen(  # noqa: S603 - 固定脚本+参数,无 shell
+                cmd,
+                cwd=str(_repo_root()),
+                env=env,
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+    except OSError:
+        proc = subprocess.Popen(  # noqa: S603
+            cmd,
+            cwd=str(_repo_root()),
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    threading.Thread(target=proc.wait, daemon=True, name=f"pregen-reap-{proc.pid}").start()
+    return proc
 
 
 def persona_pregen_status(
@@ -105,37 +139,24 @@ def persona_pregen_status(
                 "status": "script_missing",
                 "hint": "运行目录无 scripts/pregen_tts.py(打包部署),请手动执行 bok.py tts-pregen --greetings --fillers --qa --persona " + pid,
             }
-        running = _PREGEN_PROCS.get(pid)
-        if running is not None and running.poll() is None:
-            return {"status": "already_running", "persona_id": pid}
-        env = {**os.environ, "PYTHONUNBUFFERED": "1", "BOK_CP_URL": base_url}
-        _bake_ssl_cert_file(env)
-        cmd = [
-            sys.executable,
-            str(script),
-            "--greetings",
-            "--fillers",
-            "--qa",
-            "--persona",
-            pid,
-        ]
+        with _SPAWN_LOCK:
+            running = _PREGEN_PROCS.get(pid)
+            if running is not None and running.poll() is None:
+                return {"status": "already_running", "persona_id": pid}
+            env = {**os.environ, "PYTHONUNBUFFERED": "1", "BOK_CP_URL": base_url}
+            _bake_ssl_cert_file(env)
+            cmd = [
+                sys.executable,
+                str(script),
+                "--greetings",
+                "--fillers",
+                "--qa",
+                "--persona",
+                pid,
+            ]
+            proc = _spawn_detached(cmd, env, _log_path())
+            _PREGEN_PROCS[pid] = proc
         log = _log_path()
-        try:
-            log.parent.mkdir(parents=True, exist_ok=True)
-            with log.open("ab") as lf:
-                proc = subprocess.Popen(  # noqa: S603 - 固定脚本+参数,无 shell
-                    cmd,
-                    cwd=str(_repo_root()),
-                    env=env,
-                    stdout=lf,
-                    stderr=subprocess.STDOUT,
-                )
-        except OSError:
-            proc = subprocess.Popen(  # noqa: S603
-                cmd, cwd=str(_repo_root()), env=env,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-        _PREGEN_PROCS[pid] = proc
         print(
             f"BOK_PERSONA_PREGEN queued persona={pid} pid={proc.pid} log={log}",
             flush=True,
