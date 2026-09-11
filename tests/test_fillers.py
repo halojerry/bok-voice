@@ -98,6 +98,9 @@ def _director(
     lang="cantonese",
     player=_NO_PLAYER,
     guards=None,
+    cache=None,
+    voice_model_resolver=None,
+    backfill=None,
 ):
     pools = pools if pools is not None else {
         "cantonese": ["好，等我睇下。", "好，等一陣。"],
@@ -113,8 +116,34 @@ def _director(
         player=player,
         guards=guards or (lambda: False),
         assets_dir=assets,
+        cache=cache,
+        voice_model_resolver=voice_model_resolver,
+        backfill=backfill,
     )
     return d, player
+
+
+class _Recorder:
+    """backfill 替身:记录调用文本(async 兼容 sync callable 都可——Director 只 await 结果)。"""
+
+    def __init__(self):
+        self.texts: list[str] = []
+
+    async def __call__(self, text: str) -> None:
+        self.texts.append(text)
+
+
+class _FakeCache:
+    """与 TtsAudioCache.lookup 同形:文本→pcm bytes 或 None。"""
+
+    def __init__(self, pcm_by_text=None, sample_rate: int = 24000):
+        self.pcm_by_text = pcm_by_text or {}
+        self.sample_rate = sample_rate
+        self.lookups: list[tuple[str, str, str]] = []
+
+    def lookup(self, text: str, *, voice: str, model: str):
+        self.lookups.append((text, voice, model))
+        return self.pcm_by_text.get(text)
 
 
 def _run(coro, timeout=5.0):
@@ -364,5 +393,123 @@ def test_chain_cancelled_on_new_turn(tmp_path, monkeypatch):
         player.handles[0].complete()  # 停播已 resolve;不再唤醒任何链发
         await asyncio.sleep(0.15)
         assert len(player.plays) == 1, "取消后不得链发"
+
+    _run(_case())
+
+
+# ---- 人设音色双层出声(2026-09-10 task-14a):cache 命中=与通话完全同人声,
+# miss=资产兜底(永不哑)+异步补物化(off 关键路径);铁律「全场同一音色」。 ----
+
+_VOICE_KW = {"voice_model_resolver": lambda: ("VoiceX", "speech-2.8-hd")}
+
+
+def test_voice_cache_hit_plays_cached_never_reads_asset(tmp_path, monkeypatch):
+    """命中层:cache 有运行时人设物化版 → 播缓存 PCM,完全不读资产 wav、不补物化。"""
+
+    async def _case():
+        d, player = _director(tmp_path, cache=_FakeCache(), **_VOICE_KW)
+        # 池随机选句:全部条目都物化进 cache,命中层断言与随机结果无关。
+        d._cache.pcm_by_text = {e["text"]: _PCM for e in d._pools()["cantonese"]}
+        recorder = _Recorder()
+        d._backfill = recorder
+
+        import agent_runtime.fillers as fillers_mod
+
+        def _boom(path):
+            raise AssertionError("cache 命中时不应读资产 wav")
+
+        monkeypatch.setattr(fillers_mod, "load_wav_pcm", _boom)
+        await d._fire(0)
+        assert len(player.plays) == 1, "命中层照常出声"
+        fired = d._fired_lines[0]
+        assert (fired, "VoiceX", "speech-2.8-hd") in d._cache.lookups, "按运行时人设 voice/model 查"
+        assert all(row[1:] == ("VoiceX", "speech-2.8-hd") for row in d._cache.lookups)
+        assert recorder.texts == [], "命中层无需补物化"
+
+    _run(_case())
+
+
+def test_voice_cache_miss_plays_asset_and_backfills(tmp_path):
+    """miss 层:资产兜底出声(永不哑)+ backfill 用该句文本异步补物化恰好一次。"""
+
+    async def _case():
+        recorder = _Recorder()
+        d, player = _director(tmp_path, cache=_FakeCache(), backfill=recorder, **_VOICE_KW)
+        await d._fire(0)
+        assert len(player.plays) == 1, "miss 必须资产兜底,绝不哑"
+        await asyncio.sleep(0.05)  # 让异步补物化任务跑完
+        assert d._fired_lines and recorder.texts == [d._fired_lines[0]]
+
+    _run(_case())
+
+
+def test_none_cache_or_resolver_pure_asset(tmp_path):
+    """cache/resolver 任一缺省 → 纯资产模式(既有行为零变化,零 lookup 零 backfill)。"""
+
+    async def _case():
+        for kwargs in ({}, {"cache": _FakeCache()}, {"backfill": _Recorder(), **_VOICE_KW}):
+            recorder = _Recorder()
+            cache = _FakeCache()
+            kw = dict(kwargs)
+            if "cache" in kw:
+                kw["cache"] = cache
+            if "backfill" in kw:
+                kw["backfill"] = recorder
+            d, player = _director(tmp_path, **kw)
+            await d._fire(0)
+            assert len(player.plays) == 1, f"纯资产照播: {list(kwargs)}"
+            assert cache.lookups == [] and recorder.texts == []
+
+    _run(_case())
+
+
+def test_resolver_failure_pure_asset_no_backfill(tmp_path):
+    """resolver 抛异常 → 纯资产兜底,不 lookup 不 backfill(try 包住,不毒化开火)。"""
+
+    async def _case():
+        def _boom():
+            raise RuntimeError("voice resolver down")
+
+        recorder = _Recorder()
+        cache = _FakeCache()
+        d, player = _director(tmp_path, cache=cache, voice_model_resolver=_boom, backfill=recorder)
+        await d._fire(0)
+        assert len(player.plays) == 1, "resolver 失败=纯资产照播"
+        assert cache.lookups == [] and recorder.texts == []
+
+    _run(_case())
+
+
+def test_backfill_failure_does_not_poison(tmp_path):
+    """backfill 抛异常 → 吞掉打日志,本次出声不受影响,后续 fire 照常。"""
+
+    async def _case():
+        async def _boom(text):
+            raise RuntimeError("cloud down")
+
+        d, player = _director(tmp_path, cache=_FakeCache(), backfill=_boom, **_VOICE_KW)
+        await d._fire(0)
+        assert len(player.plays) == 1, "补物化失败不毒化本次出声"
+        await asyncio.sleep(0.05)  # 让任务吞异常
+        d._handle = None  # 模拟播完
+        await d._fire(0)
+        assert len(player.plays) == 2, "异常后编排器照常工作"
+
+    _run(_case())
+
+
+def test_backfill_env_off(tmp_path, monkeypatch):
+    """BOK_FILLER_BACKFILL=0 → miss 照播资产但不补物化(物化交还 tts-pregen)。"""
+    monkeypatch.setenv("BOK_FILLER_BACKFILL", "0")
+
+    async def _case():
+        recorder = _Recorder()
+        cache = _FakeCache()
+        d, player = _director(tmp_path, cache=cache, backfill=recorder, **_VOICE_KW)
+        await d._fire(0)
+        assert len(player.plays) == 1, "env 关只关补物化,兜底照播"
+        assert cache.lookups != [], "命中层查找照做(下通物化后仍命中)"
+        await asyncio.sleep(0.05)
+        assert recorder.texts == [], "env 关不触发云合成补物化"
 
     _run(_case())

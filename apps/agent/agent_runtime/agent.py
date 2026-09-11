@@ -1677,6 +1677,15 @@ async def entrypoint(ctx):
     except Exception as _exc:  # noqa: BLE001 - 无 livekit(测试/异常环境)垫话失效
         print(f"[agent] background audio unavailable, filler off: {_exc!r}", flush=True)
         _bg_audio = None
+    # 垫话补物化执行体(task-14a):消费整段合成流(音频丢弃)——CachedTTS 未命中
+    # tee 完整消费成功自动落 tts_cache,下一通同人设即命中(FillerDirector 只认
+    # (text) 签名;不碰云 API 的 tee 归属与 _say_script 同一姿势)。voice 为空时
+    # CachedTTS.synthesize 不挂 tee(原样透传),fillers 侧 resolver 门已挡该情形。
+    async def _filler_backfill(text: str) -> None:
+        async with tts_provider.synthesize(text) as _stream:
+            async for _ev in _stream:
+                pass
+
     _filler = FillerDirector(
         session,
         # 语言铁律(2026-09-10):垫话语言=装配时钉死的通话语言,构造时捕获,
@@ -1689,6 +1698,16 @@ async def entrypoint(ctx):
             or flow_ctrl.closing
             or (flow_ctrl.has_steps and flow_ctrl.done)
         ),
+        # 人设音色双层(task-14a,铁律「全场同一音色」):cache 与 QA 快路同源
+        # (_tts_cache);resolver 取合成时点人设音色/模型档(CachedTTS 透传
+        # resolved_*;getattr 守卫同 QA 块姿势,未包缓存/内芯直连时降级空值=
+        # 纯资产);miss 播资产兜底后异步补物化。
+        cache=_tts_cache,
+        voice_model_resolver=lambda: (
+            getattr(tts_provider, "resolved_voice", lambda: "")(),
+            getattr(tts_provider, "resolved_model", lambda: "")(),
+        ),
+        backfill=_filler_backfill,
     )
     if isinstance(tts_provider, CachedTTS):
         tts_provider.add_first_audio_listener(_filler.on_reply_first_audio)

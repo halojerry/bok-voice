@@ -1,9 +1,15 @@
-"""LLM 慢生成轮垫话(2026-09-09 PR-2;2026-09-10 资产化改版)。
+"""LLM 慢生成轮垫话(2026-09-09 PR-2;2026-09-10 资产化改版;task-14a 人设音色双层)。
 
 垫话=随源码分发的固定资产:固定音色+固定参数(见 scripts/gen_filler_assets.py)
 经 MiniMax 预生成 wav,连同 manifest.json 提交在 assets/fillers/——运行时只播
-文件,绝不云合成,与人设音色/tts_cache 状态解耦(旧 cache.lookup 路径废弃:
-人设一换或未 pregen 就静默 miss)。
+文件,与人设音色/tts_cache 状态解耦(人设一换也永不哑)。
+
+人设音色双层(task-14a,铁律「全场同一音色」):选句后先查 tts_cache 按运行时
+人设 voice/model 物化的版本(cache.lookup,命中=与通话完全同人声,打点
+voice_hit=1);miss 播源码资产兜底(永不哑,打点 voice_fallback=运行时提醒
+「新人设缺垫话物化」)+ asyncio 后台调 backfill(注入的 CachedTTS.synthesize
+消费 tee 自动落盘,本模块不碰云 API)把该句用运行时音色补物化进缓存——
+同人设下一通起命中。cache/resolver/backfill 任一缺失=纯资产模式(旧行为)。
 
 万能话术原则(2026-09-10):垫话随机触发,语境永不匹配——只保留注意力应承
 (好的/收到/明白/嗯)与等待邀请(稍等/我看下),零动作动词;改话术=改生成脚本
@@ -76,6 +82,11 @@ def filler_chain_enabled() -> bool:
     return os.environ.get("BOK_FILLER_CHAIN", "1") == "1"
 
 
+def filler_backfill_enabled() -> bool:
+    """miss 播资产后异步把该句用运行时人设音色补物化进缓存(BOK_FILLER_BACKFILL,默认开)。"""
+    return os.environ.get("BOK_FILLER_BACKFILL", "1") == "1"
+
+
 def load_manifest(assets_dir: Path) -> dict[str, list[dict]]:
     """manifest.json → {lang: [{text, file, dur_s}, ...]}。"""
     p = Path(assets_dir) / "manifest.json"
@@ -111,6 +122,9 @@ class FillerDirector:
         player=None,
         guards=None,
         assets_dir: Path | None = None,
+        cache=None,
+        voice_model_resolver=None,
+        backfill=None,
     ) -> None:
         self._session = session
         self._lang_resolver = lang_resolver
@@ -119,6 +133,15 @@ class FillerDirector:
         self._player = player
         self._guards = guards or (lambda: False)
         self._assets = Path(assets_dir) if assets_dir else FILLER_ASSETS_DIR
+        # 人设音色双层(task-14a):cache=TtsAudioCache(lookup 运行时人设 voice/model
+        # 的物化版,命中=与通话完全同人声);voice_model_resolver=() -> (voice, model),
+        # 异常/空值=纯资产;backfill=async(text) 补物化执行体——由 agent 侧注入
+        # CachedTTS.synthesize 消费(miss tee 自动落盘),本模块不碰云 API。
+        # 三者任一缺失=纯资产模式(既有行为零变化)。
+        self._cache = cache
+        self._voice_model_resolver = voice_model_resolver
+        self._backfill = backfill
+        self._backfill_tasks: set[asyncio.Task] = set()  # 持强引用防 GC,完成自弃
         self._manifest: dict[str, list[dict]] | None = None
         self._timer: asyncio.Task | None = None
         self._handle = None
@@ -294,13 +317,43 @@ class FillerDirector:
             entry = self._pick(self._lang_resolver())
             if not entry:
                 return
-            pcm, rate = load_wav_pcm(self._assets / entry["file"])
+            # 双层选源(task-14a):先查运行时人设物化版,miss 落源码资产兜底。
+            voice = model = ""
+            cached: bytes | None = None
+            if self._cache is not None and self._voice_model_resolver is not None:
+                try:
+                    voice, model = self._voice_model_resolver()
+                except Exception:  # noqa: BLE001 - resolver 失败=纯资产
+                    voice = model = ""
+                if voice and model:
+                    try:
+                        cached = self._cache.lookup(entry["text"], voice=voice, model=model)
+                    except Exception:  # noqa: BLE001 - 缓存读取失败当未命中
+                        cached = None
             from .tts_cache import frames_aiter, pcm_to_frames
 
-            frames = pcm_to_frames(pcm, rate)
+            if cached is not None:
+                # 命中层:与通话完全同人声(cache.sample_rate 恒等 meta sample_rate,
+                # 键里就含它)。dur 按实际 PCM 算(物化版时长≠资产 manifest dur_s)。
+                rate = int(getattr(self._cache, "sample_rate", 24000))
+                pcm = cached
+                frames = pcm_to_frames(pcm, rate)
+                voice_mark = "voice_hit=1"
+            else:
+                pcm, rate = load_wav_pcm(self._assets / entry["file"])
+                frames = pcm_to_frames(pcm, rate)
+                voice_mark = "voice_hit=0"
             self._count += 1
             self._fired_lines.append(entry["text"])
-            print(f"BOK_FILLER fired count={self._count} line={entry['text']!r}", flush=True)
+            print(f"BOK_FILLER fired count={self._count} line={entry['text']!r} {voice_mark}", flush=True)
+            if cached is None:
+                # miss=「新人设缺垫话物化」的运行时提醒信号;资产兜底永不哑。
+                print(
+                    f"BOK_FILLER voice_fallback voice={voice!r} model={model!r}"
+                    " — 人设垫话未物化,资产兜底",
+                    flush=True,
+                )
+                self._maybe_backfill(entry["text"], voice, model)
             # out-of-band 播放:即刻出声,唔排 speech 队列。fade_in 防咔哒(同
             # MiniMax 首包修剪 15ms 姿势),fade_out 令 stop() 有 50ms 淡出。
             try:
@@ -317,3 +370,27 @@ class FillerDirector:
             raise
         except Exception as exc:  # noqa: BLE001 - 垫话失败唔阻通话
             print(f"BOK_FILLER error err={exc!r}", flush=True)
+
+    def _maybe_backfill(self, text: str, voice: str, model: str) -> None:
+        """miss 后异步把该句用运行时人设音色云合成进缓存(off 关键路径,task-14a)。
+
+        backfill 执行体由 agent 侧注入(CachedTTS.synthesize 消费,未命中 tee
+        完整消费自动落盘);同一 (text,voice) 不显式去重——下次 lookup 命中即
+        自然止。resolver 失败/空音色已在上游挡(纯资产),这里再挡一次。
+        """
+        if not filler_backfill_enabled() or self._backfill is None:
+            return
+        if not (voice and model):
+            return
+        task = asyncio.create_task(self._backfill_safe(text))
+        self._backfill_tasks.add(task)
+        task.add_done_callback(self._backfill_tasks.discard)
+
+    async def _backfill_safe(self, text: str) -> None:
+        try:
+            await self._backfill(text)
+            print(f"BOK_FILLER backfill_done line={text!r}", flush=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 补物化失败零影响(下通照样资产兜底)
+            print(f"BOK_FILLER backfill_fail line={text!r} err={exc!r}", flush=True)
