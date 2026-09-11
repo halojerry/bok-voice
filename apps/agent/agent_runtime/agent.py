@@ -8,6 +8,7 @@ import time
 from typing import Optional
 
 from bok_voice_core.policies import ProviderRegistry, ProviderState, select_session_manifest
+from bok_voice_core.testdata import is_test_object_name as _is_test_object_name
 from bok_voice_core.types import CallMode
 
 from .plugins.context import ContextInjector
@@ -355,16 +356,12 @@ def _nudge_should_fire(now: float, last_reply_ts: float, last_user_ts: float, nu
     return True
 
 
-# 测试对象名前缀族(与 tools/bok.py clean-testdata 同一套命名约定):命中则沉默
+# 测试对象名前缀族判定已抽单源 bok_voice_core.testdata(文件头 import 为
+# `_is_test_object_name` 别名,CP qa-pairs 挖掘过滤共用同一份):命中则沉默
 # 心跳整条关闭。E2E/压测脚本的 greeting→用户语音间隙(greeting 静默判定+脚本侧
 # 语音合成)必然跨过 8s 心跳线,心跳 7-9s 音频会越过脚本的 agent_audio.clear()
 # 落进回复断言窗(zh 腿 ASR 读回污染,call-6ba7c47c 实证),farewell+12s 自动收线
 # 也会错挂到慢提交的测试轮上。BOK_E2E_NUDGE_IMMUNE=0 可关豁免。
-_TEST_OBJECT_NAME_RE = re.compile(r"^(E2E-|soak\d*-?|并发|LOAD-|边角-|多轮-|probe)")
-
-
-def _is_test_object_name(name: str) -> bool:
-    return bool(_TEST_OBJECT_NAME_RE.match(name or ""))
 
 
 def _effective_nudge_max(env_value: str, object_name: str) -> int:

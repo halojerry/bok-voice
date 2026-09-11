@@ -1386,14 +1386,19 @@ def hit_qa_entry(entry_id: str) -> dict:
 
 
 @app.get("/api/reports/qa-pairs")
-def report_qa_pairs(min_calls: int = 5, account_id: str = "acc-001", limit: int = 100) -> list[dict]:
+def report_qa_pairs(
+    min_calls: int = 5, account_id: str = "acc-001", limit: int = 100, exclude_test: bool = True
+) -> list[dict]:
     """高频问答对挖掘报告:用户轮→紧随 assistant 轮,归一化聚类按出现通话数排序。
 
     与运行时匹配共用 bok_voice_core.qa_text.normalize_question,报告里的问句
     到运行时才对得上。--apply 入库走 POST /api/qa-entries(source=mined),
     音频物化统一走 agent 侧 bok.py tts-pregen。
+    exclude_test 默认滤掉测试对象(E2E/压测前缀族)的通话——真实采集时代的
+    报告要干净(2026-09-09 实测 top20 高频里 16 条是测试 fixture 音频);
+    显式传 false 看全量。
     """
-    conversations = _repo().iter_call_conversations(account_id)
+    conversations = _repo().iter_call_conversations(account_id, exclude_test_objects=exclude_test)
     return mine_qa_pairs(conversations, min_calls=min_calls, limit=limit)
 
 

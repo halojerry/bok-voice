@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from bok_voice_core.providers import BusinessRepository
+from bok_voice_core.testdata import is_test_object_name
 from bok_voice_core.types import (
     CallMode,
     CallSession,
@@ -246,20 +247,26 @@ class SqlAlchemyBusinessRepository:
             row.hit_count = int(row.hit_count or 0) + int(n)
             self.session.commit()
 
-    def iter_call_conversations(self, account_id: str = "") -> list[list[dict]]:
+    def iter_call_conversations(self, account_id: str = "", exclude_test_objects: bool = False) -> list[list[dict]]:
         """跨通话按序轮次(高频问答对挖掘用):join calls 过账号,created_at 排序。
 
         turns 无 seq 列,同通内轮次天然串行、同刻风险极低(created_at 排序足够)。
+        exclude_test_objects=True 时滤掉测试对象(clean-testdata 前缀族,E2E/压测
+        fixture 音频)的通话;对象缺失的通话保留——判不了的不误杀。
         """
         stmt = (
-            select(models.Turn, models.CallSession.account_id)
+            select(models.Turn, models.CallSession.account_id, models.ObjectProfile.display_name)
             .join(models.CallSession, models.Turn.call_id == models.CallSession.id)
+            # outerjoin:call.object_id 是普通列无外键约束,对象可能已删/缺失
+            .outerjoin(models.ObjectProfile, models.CallSession.object_id == models.ObjectProfile.id)
             .order_by(models.Turn.call_id, models.Turn.created_at)
         )
         if account_id:
             stmt = stmt.where(models.CallSession.account_id == account_id)
         grouped: dict[str, list[dict]] = {}
-        for row, _acct in self.session.execute(stmt):
+        for row, _acct, obj_name in self.session.execute(stmt):
+            if exclude_test_objects and is_test_object_name(obj_name):
+                continue
             grouped.setdefault(row.call_id, []).append(
                 {"role": row.role, "text": row.transcript, "lang": row.language}
             )
@@ -756,12 +763,16 @@ class InMemoryBusinessRepository:
         if row is not None:
             row["hit_count"] = int(row.get("hit_count") or 0) + int(n)
 
-    def iter_call_conversations(self, account_id: str = "") -> list[list[dict]]:
+    def iter_call_conversations(self, account_id: str = "", exclude_test_objects: bool = False) -> list[list[dict]]:
         out: list[list[dict]] = []
         for call_id, turns in self.turns.items():
-            if account_id:
-                call = self.calls.get(call_id) or {}
-                if call.get("account_id") != account_id:
+            call = self.calls.get(call_id) or {}
+            if account_id and call.get("account_id") != account_id:
+                continue
+            if exclude_test_objects:
+                # 对象缺失(call 没挂对象)的通话保留:判不了的不误杀
+                obj = self.objects.get(call.get("object_id") or "", {}) or {}
+                if is_test_object_name(obj.get("display_name")):
                     continue
             out.append([{"role": t.role, "text": t.transcript, "lang": t.language} for t in turns])
         return out
