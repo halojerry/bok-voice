@@ -2424,7 +2424,11 @@ class _MiniMaxBidiSession:
         self._ws = None
         self._params: tuple | None = None  # 运行中 task_start 的参数指纹
         self._ping_task: asyncio.Task | None = None
+        self._ping_misses = 0  # pong 连失计数(连失达上限强断重预热)
         self._prewarm_task: asyncio.Task | None = None
+        # ping 连失强断甩出的孤儿 invalidate task——必须持引用:事件循环对 task 只持
+        # 弱引用(裸 create_task 即弃可被 GC 中途回收),aclose 也要看得见先取消它。
+        self._invalidate_task: asyncio.Task | None = None
         # 残留音频门禁（epoch 纪元）：连接打断后保留复用，上一流 cancel 超时
         # （MINIMAX_TTS_BIDI_CANCEL_TIMEOUT）时服务端可能没停稳，迟到的音频会落
         # 在同一条连接上。流在首个 task_continue 才认领 active_epoch=own_epoch；
@@ -2435,6 +2439,8 @@ class _MiniMaxBidiSession:
         # 供 PERF 打点:ensure_ready 本次是复用还是新连
         self.last_reused = False
         self.last_connect_ms = 0.0
+        # prewarm 失败重试计数(官方 #6969 姿势,上限 1):连接成功即清零
+        self._prewarm_retries = 0
 
     def alloc_epoch(self) -> int:
         """为本流分配纪元号（只占号，唔认领——认领发生在首个 task_continue）。"""
@@ -2452,6 +2458,14 @@ class _MiniMaxBidiSession:
         except Exception:  # pragma: no cover - 配错回默认
             v = 60.0
         return v if v > 0 else 0.0  # <=0 关闭自管 ping
+
+    @staticmethod
+    def _ping_max_miss() -> int:
+        try:
+            v = int(os.environ.get("MINIMAX_BIDI_PING_MAX_MISS", "2"))
+        except Exception:  # pragma: no cover - 配错回默认
+            v = 2
+        return v if v > 0 else 2  # 非正数=配错回默认(0 会逢超时即断)
 
     def _alive(self) -> bool:
         if self._ws is None:
@@ -2476,9 +2490,23 @@ class _MiniMaxBidiSession:
                     # pong 静默由接收侧(读消息超时/ConnectionClosed)判死。
                     await asyncio.wait_for(ws.ping(), timeout=10)
                 except asyncio.TimeoutError:
-                    print("MINIMAX_TTS_BIDI_PING_TIMEOUT", flush=True)
+                    self._ping_misses += 1
+                    print(f"MINIMAX_TTS_BIDI_PING_TIMEOUT miss={self._ping_misses}", flush=True)
+                    if self._ping_misses >= self._ping_max_miss():
+                        print("MINIMAX_TTS_BIDI_DEAD ping连失 — 强断重预热", flush=True)
+                        # 唔可以在这里 await invalidate:invalidate 会 _stop_ping() 自cancel
+                        # 当前 ping task,后续 close/prewarm 会在首个让出点(生产 close 的
+                        # I/O)被 CancelledError 掀掉——强断重预热静默蒸发。甩独立 task 跑;
+                        # 引用必须存 self._invalidate_task(loop 对 task 只持弱引用,裸即弃
+                        # 可被 GC 中途回收;aclose 也要看得见它先取消,防 teardown 后重预热)。
+                        self._invalidate_task = asyncio.get_running_loop().create_task(
+                            self.invalidate(reprewarm=True)
+                        )
+                        return
                 except Exception:
                     return  # 连接已死,接收侧会 invalidate
+                else:
+                    self._ping_misses = 0
         except asyncio.CancelledError:
             raise
 
@@ -2524,6 +2552,29 @@ class _MiniMaxBidiSession:
         self._ws = ws
         self._params = params
         self._start_ping(ws)
+        self._prewarm_retries = 0  # 连接成功,重试计数归零
+
+    async def _synth_warmup(self, ws) -> None:
+        """合成级预热:连接建好后立刻做一次真实合成把服务端会话焐热,音频全丢。
+        task_continue 用顶层 text 字段(同生产发送代码,唔係 data 嵌套);收包至
+        task_flushed 止,单次 recv 8s 上限防挂死。自身异常只打日志不 invalidate——
+        预热文本合成失败≠连接坏,残留音频由首个真实流的纪元门禁兜底丢弃。"""
+        try:
+            t0 = time.monotonic()
+            await ws.send(json.dumps({"event": "task_continue", "text": "好的，您稍等。"}))
+            await ws.send(json.dumps({"event": "task_flush"}))
+            while True:  # 丢弃音频至 task_flushed(上限 8s);纪元门禁由首个真实流兜底
+                raw = await asyncio.wait_for(ws.recv(), timeout=8)
+                if json.loads(raw).get("event") == "task_flushed":
+                    break
+            print(
+                f"MINIMAX_BIDI_SYNTH_WARMUP ms={(time.monotonic() - t0) * 1000:.0f}",
+                flush=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 预热失败≠连接坏,唔 invalidate
+            print(f"MINIMAX_BIDI_SYNTH_WARMUP_FAIL {exc!r}", flush=True)
 
     async def ensure_ready(self):
         """返回可 task_continue 的连接（调用方已持 lock）。
@@ -2550,18 +2601,41 @@ class _MiniMaxBidiSession:
                 pass
         await self.invalidate()
 
-    async def invalidate(self) -> None:
-        """弃置当前连接（2201/异常关闭/收尾）；下个 ensure_ready 自动全新重连。"""
+    async def invalidate(self, *, reprewarm: bool = False) -> None:
+        """弃置当前连接(2201/异常关闭/收尾);下个 ensure_ready 自动全新重连。
+        reprewarm=True:死亡即后台重预热——唔等下一个真实轮先撞冷启动。"""
         ws, self._ws = self._ws, None
         self._params = None
+        self._ping_misses = 0
         self._stop_ping()
         if ws is not None:
             try:
                 await ws.close()
             except Exception:  # noqa: BLE001
                 pass
+        if reprewarm and os.environ.get("MINIMAX_BIDI_AUTO_REWARM", "1") == "1":
+            self.prewarm()
 
     async def aclose(self) -> None:
+        # 防 teardown 期重预热(官方 #7050 形状):先取消在飞预热任务与 ping 连失
+        # 甩出的孤儿 invalidate task(reprewarm=True)再 invalidate——唔然 aclose 的
+        # 无参 invalidate 跑完后孤儿才执行,teardown 后拉起全新连接+ping 保活=泄漏。
+        tasks = [
+            t
+            for t in (self._prewarm_task, self._invalidate_task)
+            if t is not None and not t.done()
+        ]
+        self._prewarm_task = None
+        self._invalidate_task = None
+        for t in tasks:
+            t.cancel()
+        for t in tasks:  # 等取消落地,唔留悬空任务过 teardown
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass  # 自己 cancel 嘅——继续收尾
+            except Exception:
+                pass
         await self.invalidate()
 
     def prewarm(self) -> None:
@@ -2581,6 +2655,11 @@ class _MiniMaxBidiSession:
             async with self._lock:
                 if not self._alive():
                     await self._connect_and_start(self._tts_._bidi_params_key())
+                    # 合成级预热(T1 探针:处女连接首合成仅比二次慢 ~22ms,收益可忽略
+                    # 故默认关):锁内执行——真实流 ensure_ready 排同一把锁,预热文本
+                    # 唔会与真实轮 task_continue 在服务端同会话串台。
+                    if os.environ.get("MINIMAX_BIDI_SYNTH_WARMUP", "0") == "1":
+                        await self._synth_warmup(self._ws)
             print(
                 f"MINIMAX_TTS_BIDI_PREWARM connect_ms={self.last_connect_ms:.0f}",
                 flush=True,
@@ -2590,6 +2669,18 @@ class _MiniMaxBidiSession:
         except Exception as exc:  # noqa: BLE001 - 预热尽力而为,首段合成自会重试
             print(f"MINIMAX_TTS_BIDI_PREWARM_FAIL {exc!r}", flush=True)
             await self.invalidate()
+            # 官方 #6969 姿势:失败 1s 后重试一次(上限 1,连接成功即清零计数)。
+            # 休眠期间 _prewarm_task 仍指向本任务——teardown(aclose)的 cancel 会在
+            # sleep 点掀掉重试,teardown 后绝不拉新连接;醒来先清自引用再走 prewarm()
+            # 幂等门重建(门内 alive/在飞检查照常生效,唔破 T6 死亡重预热去重)。
+            if (
+                self._prewarm_retries < 1
+                and os.environ.get("MINIMAX_BIDI_PREWARM_RETRY", "1") == "1"
+            ):
+                self._prewarm_retries += 1
+                await asyncio.sleep(1.0)
+                self._prewarm_task = None
+                self.prewarm()
 
 
 class _MiniMaxBidiStream(tts.SynthesizeStream):
@@ -2612,6 +2703,9 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
         self._canceled_evt = asyncio.Event()  # 收到 task_canceled
         self._resend_evt = asyncio.Event()  # 收到 2205 软背压
         self._last_continue: str | None = None  # 2205 重发用
+        # 本流已发全部 task_continue 文本(按发送序)——看门狗僵死重连后单条合并重发
+        # (官方 2204:单条 >10k 字跳过,故截 10k);2205 重发係重放已发文本,唔 append。
+        self._sent_text_parts: list[str] = []
 
     async def _emit_beep(self, output_emitter):
         import math
@@ -2634,6 +2728,16 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
             return float(os.environ.get("MINIMAX_BIDI_CANCEL_WAIT_S", "3"))
         except Exception:  # pragma: no cover
             return 3.0
+
+    @staticmethod
+    def _first_audio_timeout_s() -> float:
+        """看门狗阈值:首段文本发出后 N 秒仍无首包 → 判连接僵死重连+重发。
+        默认 6(bidi 服务端攒句,首包天然比 classic 按句慢,阈值放宽);"0" 关;
+        配错回 6.0。"""
+        try:
+            return float(os.environ.get("MINIMAX_BIDI_FIRST_AUDIO_TIMEOUT_S", "6"))
+        except Exception:  # pragma: no cover
+            return 6.0
 
     async def _cancel_on_server(self, ws) -> None:
         """打断：task_cancel 丢服务端缓冲+停当前合成;连接保留,下轮继续用。"""
@@ -2672,6 +2776,7 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
             ws = None
             recv_task: asyncio.Task | None = None
             resend_task: asyncio.Task | None = None
+            stall_task: asyncio.Task | None = None
             self._flushed_evt.clear()
             self._canceled_evt.clear()
             self._resend_evt.clear()
@@ -2688,6 +2793,12 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                 "sentences": 0,
             }
             t_flush = 0.0
+            # 重连窗口发送闸(看门狗换连接期间):输入循环若继续 task_continue 会发到
+            # 已弃旧 ws → 整轮音频丢失。所有发送点先 is_set() 再 wait()(Event.wait()
+            # 对未 set 事件挂起,无条件 await 会把正常轮首句卡到重连后,classic 同款)。
+            # 闸亮时间=重连 ~0.2-0.65s,期间文本排队唔丢唔乱序:闸清前已 append 进
+            # _sent_text_parts 的由看门狗合并重发覆盖,闸清后照常直发新连接。
+            _reconnecting = asyncio.Event()
             try:
                 try:
                     ws = await session.ensure_ready()
@@ -2715,8 +2826,9 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                                 return  # 尾巴排干净了
                             continue  # 还在等句子音频,继续等
                         except Exception:
-                            # 连接死亡(2201/网络):标记死连接 + 解锁等待方
-                            await session.invalidate()
+                            # 连接死亡(2201/网络):标记死连接 + 解锁等待方;
+                            # 死亡即后台重预热,下个真实轮零冷启动
+                            await session.invalidate(reprewarm=True)
                             self._flushed_evt.set()
                             self._canceled_evt.set()
                             return
@@ -2823,8 +2935,63 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                     except Exception:
                         return  # 连接已死,接收侧会 invalidate
 
-                recv_task = asyncio.create_task(_recv_loop())
-                resend_task = asyncio.create_task(_resend_loop())
+                def _start_loops() -> None:
+                    nonlocal recv_task, resend_task
+                    recv_task = asyncio.create_task(_recv_loop())
+                    resend_task = asyncio.create_task(_resend_loop())
+
+                _start_loops()
+
+                async def _stall_watch() -> None:
+                    """首段文本发出后 N 秒无首包 → 判连接僵死:弃连接重连+重发已发文本。
+                    classic MINIMAX_FIRST_AUDIO_TIMEOUT_S 同语义移植(_stall_watch);bidi
+                    无此看门狗时只能干等 30s recv 超时(整轮回复静默)。一流一次自愈
+                    (重连后唔重臂)——对端持续僵死时 6s 一轮的重连风暴比 30s 干等更伤,
+                    后续轮自会撞死亡路径(invalidate+重预热)。"""
+                    nonlocal ws, reused, connect_ms
+                    timeout = self._first_audio_timeout_s()
+                    if timeout <= 0:
+                        return
+                    await asyncio.sleep(timeout)
+                    if state["first_pushed"] or self._flushed_evt.is_set() or not state["sent_any"]:
+                        return  # 已出首包/流已收尾(死亡分支置 flushed)/无已发文本:唔干预
+                    print(f"MINIMAX_TTS_BIDI_STALL timeout={timeout}s — 重连重发", flush=True)
+                    _reconnecting.set()
+                    try:
+                        # 先停两条收发协程再拆连接(只 cancel 唔 await:外层 cancel 唔会
+                        # 俾内层 except 吞掉):防旧 recv 喺旧 ws 上判死走
+                        # invalidate(reprewarm=True)——呢条无锁路径会杀死看门狗刚建好的
+                        # 新连接(或与 ensure_ready 竞态双连);也防在飞 2205 重发跨连接
+                        # 重放成重复文本。收流死亡分支若已喺 sleep 期间跑过(reprewarm
+                        # 已排),flushed 已置 → 上面已让位,prewarm 排队喺本流锁后、
+                        # 睇 _alive() 决定连唔连,两种到达顺序都唔会双连。
+                        for task in (recv_task, resend_task):
+                            if task:
+                                task.cancel()
+                        self._resend_evt.clear()
+                        await session.invalidate()  # 不 reprewarm:本流自持锁,紧接 ensure_ready
+                        ws = await session.ensure_ready()  # 全新连接(我们仍持 session.lock)
+                        reused = session.last_reused
+                        connect_ms = session.last_connect_ms
+                        text = "".join(self._sent_text_parts)[:10000]  # 官方单条 ≤10k
+                        if text:
+                            await ws.send(json.dumps({"event": "task_continue", "text": text}))
+                            # 新连接上「最后一条 continue」=合并重发,后续 2205 原样重发它
+                            self._last_continue = text
+                        state["t_first_continue"] = time.monotonic()
+                        state["first_pushed"] = False
+                        session.active_epoch = my_epoch  # 认领纪元:重发即本流首个 continue,同发送分支
+                        _start_loops()  # 新连接新收发协程(ws 已重绑进闭包)
+                    except Exception as exc:  # noqa: BLE001 - 重连失败:闸清后下一发撞死连接走既有收摊
+                        print(f"MINIMAX_TTS_BIDI_STALL_FAIL {exc!r}", flush=True)
+                        self._flushed_evt.set()  # 流已救唔返:收尾 flush 唔好白等 15s
+                    finally:
+                        _reconnecting.clear()
+
+                def _arm_stall_watch() -> None:
+                    nonlocal stall_task
+                    if stall_task is None and self._first_audio_timeout_s() > 0:
+                        stall_task = asyncio.create_task(_stall_watch())
 
                 async def _send_text(s: str) -> None:
                     if not self._lecture_fired and is_lecture_text(s):
@@ -2833,9 +3000,13 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                         self._lecture_fired = True
                         if not state["sent_any"]:
                             canned = lecture_canned(self._tts_._speech_lang())
+                            if _reconnecting.is_set():
+                                await _reconnecting.wait()
                             self._last_continue = canned
+                            self._sent_text_parts.append(canned)  # 看门狗重连合并重发用
                             if state["t_first_continue"] == 0.0:
                                 state["t_first_continue"] = time.monotonic()
+                                _arm_stall_watch()  # 首条 task_continue 起看门狗计时
                             await ws.send(json.dumps({"event": "task_continue", "text": canned}))
                             state["sent_any"] = True
                             session.active_epoch = my_epoch  # 认领纪元:此后残留门禁对本流放行
@@ -2843,9 +3014,13 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                     if is_lecture_text(s):
                         return  # 已触发过,课程延续句照丢
                     # bidi:逐块原样透传,唔切句——服务端自己按标点/长度切句合成。
+                    if _reconnecting.is_set():
+                        await _reconnecting.wait()
                     if state["t_first_continue"] == 0.0:
                         state["t_first_continue"] = time.monotonic()
+                        _arm_stall_watch()  # 首条 task_continue 起看门狗计时
                     self._last_continue = s
+                    self._sent_text_parts.append(s)  # 看门狗重连合并重发用
                     await ws.send(json.dumps({"event": "task_continue", "text": s}))
                     state["sent_any"] = True
                     session.active_epoch = my_epoch  # 认领纪元:此后残留门禁对本流放行
@@ -2861,6 +3036,8 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                 # 文本结束:task_flush 强制吐出无标点尾巴,会话唔结束(连接保留)。
                 try:
                     if state["t_first_continue"] > 0.0:
+                        if _reconnecting.is_set():
+                            await _reconnecting.wait()
                         t_flush = time.monotonic()
                         await ws.send(json.dumps({"event": "task_flush"}))
                 except Exception:  # noqa: BLE001
@@ -2904,6 +3081,8 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
             except asyncio.CancelledError:
                 # 打断(barge-in):通知服务端丢弃缓冲/停合成,连接保留给下一轮。
                 try:
+                    if _reconnecting.is_set():
+                        await _reconnecting.wait()  # 等看门狗换完连接,cancel 落新连接
                     await self._cancel_on_server(ws)
                 except Exception:  # noqa: BLE001 - 收尾尽力而为
                     pass
@@ -2917,7 +3096,7 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
             except Exception as exc:
                 print("MINIMAX_TTS_BIDI_ERR", repr(exc), flush=True)
             finally:
-                for task in (resend_task, recv_task):
+                for task in (resend_task, recv_task, stall_task):
                     if task:
                         task.cancel()
                         try:

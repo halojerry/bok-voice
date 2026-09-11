@@ -78,6 +78,52 @@ def test_lru_eviction(tmp_path):
     assert c.get(keys[2]) is not None
 
 
+def test_pinned_entries_survive_eviction(tmp_path):
+    """罐头集(垫话/QA/静态直念线)打钉:无界动态条目(逐对象开场白)灌满
+    LRU 也不会把钉住条目挤走——否则音色一致性静默破功(2026-09-10)。"""
+    c = _cache(tmp_path, max_entries=2)
+    pcm = b"\xe8\x03" * 4800
+    pinned = c.key_for("垫话池句", voice="v", model="m")
+    assert c.store(pinned, pcm, text="垫话池句", voice="v", model="m", pin=True)
+    time.sleep(0.01)
+    dyn = []
+    for i in range(3):  # 动态条目淹没(pinned 最旧,处在淘汰区)
+        k = c.key_for(f"开场白{i}", voice="v", model="m")
+        c.store(k, pcm, text=f"开场白{i}", voice="v", model="m")
+        dyn.append(k)
+        time.sleep(0.01)
+    assert c.get(pinned) is not None  # 钉住永不逐出
+    assert c.get(dyn[0]) is None  # 未钉条目照常 LRU
+    assert c.get(dyn[2]) is not None
+
+
+def test_unpinned_default_stays_evictable(tmp_path):
+    """运行时 tee 落盘(session.say 直念线)不传 pin=默认可逐出。"""
+    c = _cache(tmp_path, max_entries=1)
+    pcm = b"\xe8\x03" * 4800
+    a = c.key_for("a", voice="v", model="m")
+    b = c.key_for("b", voice="v", model="m")
+    c.store(a, pcm, text="a", voice="v", model="m")
+    time.sleep(0.01)
+    c.store(b, pcm, text="b", voice="v", model="m")
+    assert c.get(a) is None
+    assert c.get(b) is not None
+    meta = c._meta_path(b).read_text(encoding="utf-8")
+    assert "pinned" not in meta  # 未钉不写键,旧行为不变
+
+
+def test_unpinned_restore_preserves_pin(tmp_path):
+    """双写者竞态保钉:pregen 落钉后,运行时 tee 迟到重写同 key 不得洗掉
+    pinned(否则罐头静默退回可逐出——保存人设→来电窗口恰会撞上)。"""
+    c = _cache(tmp_path)
+    pcm = b"\xe8\x03" * 4800
+    k = c.key_for("垫话池句", voice="v", model="m")
+    assert c.store(k, pcm, text="垫话池句", voice="v", model="m", pin=True)
+    # 迟到的未钉写回(pcm 变了也会换内容,但 key 同)
+    assert c.store(k, b"\xe8\x03" * 2400, text="垫话池句", voice="v", model="m")
+    assert c._is_pinned(k) is True
+
+
 def test_pcm_to_frames_slices_200ms():
     sr = 24000
     pcm = b"\xe8\x03" * sr  # 1s mono s16le(48000 bytes)

@@ -8,6 +8,7 @@ import time
 from typing import Optional
 
 from bok_voice_core.policies import ProviderRegistry, ProviderState, select_session_manifest
+from bok_voice_core.testdata import is_test_object_name as _is_test_object_name
 from bok_voice_core.types import CallMode
 
 from .plugins.context import ContextInjector
@@ -16,7 +17,7 @@ from .plugins.settlement import SettlementTrigger
 from .providers.registry import build_provider_registry
 from .control_plane import ControlPlaneClient
 from .fillers import FillerDirector
-from .qa_gate import QaIndex, qa_exclude_reason as _qa_exclude_reason
+from .qa_gate import QaIndex, qa_exclude_reason as _qa_exclude_reason, qa_fastpath_enabled
 from .tts_cache import CachedTTS, TtsAudioCache, default_cache_dir, frames_aiter, pcm_to_frames, tts_cache_enabled
 # 模块级引 flow(纯 stdlib 依赖,无环):_wa_numberish/_wa_number_line 等模块级
 # helper 用;entrypoint 内的 function-scoped import 属历史样式,不冲突。
@@ -355,16 +356,12 @@ def _nudge_should_fire(now: float, last_reply_ts: float, last_user_ts: float, nu
     return True
 
 
-# 测试对象名前缀族(与 tools/bok.py clean-testdata 同一套命名约定):命中则沉默
+# 测试对象名前缀族判定已抽单源 bok_voice_core.testdata(文件头 import 为
+# `_is_test_object_name` 别名,CP qa-pairs 挖掘过滤共用同一份):命中则沉默
 # 心跳整条关闭。E2E/压测脚本的 greeting→用户语音间隙(greeting 静默判定+脚本侧
 # 语音合成)必然跨过 8s 心跳线,心跳 7-9s 音频会越过脚本的 agent_audio.clear()
 # 落进回复断言窗(zh 腿 ASR 读回污染,call-6ba7c47c 实证),farewell+12s 自动收线
 # 也会错挂到慢提交的测试轮上。BOK_E2E_NUDGE_IMMUNE=0 可关豁免。
-_TEST_OBJECT_NAME_RE = re.compile(r"^(E2E-|soak\d*-?|并发|LOAD-|边角-|多轮-|probe)")
-
-
-def _is_test_object_name(name: str) -> bool:
-    return bool(_TEST_OBJECT_NAME_RE.match(name or ""))
 
 
 def _effective_nudge_max(env_value: str, object_name: str) -> int:
@@ -759,6 +756,68 @@ def _format_llm_metrics(m) -> str:
         f"LLM_TTFT_MS {ttft * 1000:.0f} (official) "
         f"cached={cached}/{prompt} prompt={prompt} "
         f"gen={getattr(m, 'completion_tokens', 0)} tps={tps:.1f}"
+    )
+
+
+# ---- QA 快路每通汇总打点(2026-09-10 task-9) ----
+# QA 块在 entrypoint 多层嵌套闭包里,模块级计数 dict 是唯一可测路径;job 进程
+# 一通一命,每通收尾 _close 打一行 QA_FASTPATH_SUMMARY 后清零(清零属防御)。
+QA_COUNTERS: dict[str, int] = {}
+
+
+def _qa_bump(key: str) -> None:
+    """计数自增,try/except 包裹——打点失败绝不毒化通话。"""
+    try:
+        QA_COUNTERS[key] = QA_COUNTERS.get(key, 0) + 1
+    except Exception:  # noqa: BLE001 - 打点失败零影响
+        pass
+
+
+# bypass reason 字符串(qa_gate.qa_exclude_reason 返回值)→ 汇总列键映射,就地定死:
+#   digits/refuse/verdict/advanced 直映同名列;
+#   wa_signal/wa_step_locked 并入 bypass_wa(同为 WhatsApp 相关旁路,汇总只留一格);
+#   closing 不计列(汇总列固定无 closing 格——收线/流程完结轮快路本就无从触发,
+#   常态背景噪声,不并入其他列防列语义漂移;.get 未命中即跳过)。
+_QA_BYPASS_KEY = {
+    "digits": "bypass_digits",
+    "refuse": "bypass_refuse",
+    "wa_signal": "bypass_wa",
+    "wa_step_locked": "bypass_wa",
+    "advanced": "bypass_advanced",
+    "verdict": "bypass_verdict",
+}
+
+
+def _qa_bump_bypass(reason: str) -> None:
+    key = _QA_BYPASS_KEY.get(str(reason or ""))
+    if key:
+        _qa_bump(key)
+
+
+def format_qa_summary(counters: dict) -> str:
+    """渲染 QA_FASTPATH_SUMMARY 单行(PERF 风格,列固定、零值也打,便于日志聚合)。
+
+    纯函数:只 .get 读,绝不 mutate counters,也不清零(清零由收尾方管)。
+    hit=命中条目的轮(hit=1 出声轮 + no_audio 轮之和);no_audio=命中但缓存无
+    应答音频;hit_audio=hit-no_audio 在此求差(真出声命中);match0=匹配零命中
+    (含匹配异常当未命中);bypass *=四道闸旁路;disabled=快路整体关闭(env 关/
+    无缓存/空表/装配失败,每通至多一次)。
+    """
+
+    def _n(key: str) -> int:
+        try:
+            return int(counters.get(key, 0))
+        except Exception:  # noqa: BLE001 - 脏值当 0
+            return 0
+
+    hit = _n("hit")
+    no_audio = _n("no_audio")
+    return (
+        f"QA_FASTPATH_SUMMARY hit={hit} hit_audio={hit - no_audio} no_audio={no_audio} "
+        f"match0={_n('match0')} bypass digits={_n('bypass_digits')} "
+        f"refuse={_n('bypass_refuse')} wa={_n('bypass_wa')} "
+        f"advanced={_n('bypass_advanced')} verdict={_n('bypass_verdict')} "
+        f"disabled={_n('disabled')}"
     )
 
 
@@ -1591,6 +1650,10 @@ async def entrypoint(ctx):
         llm=llm_provider,
         tts=tts_provider,
         turn_handling=turn_handling,
+        # 队列内连发呼吸感(2026-09-10 task-5):speech 队列相邻两条播报(如开场白
+        # say → 回复、心跳直念衔接)最小间隔 0.3s,防背靠背机械感;垫话走
+        # BackgroundAudioPlayer out-of-band 音轨不经此队列,零影响。B 线 interpret.py 不加。
+        min_consecutive_speech_delay=0.3,
         # 默认 ["filter_markdown","filter_emoji"] 会被整体替换，故带上内置两项；
         # 追加的自定义 transform 把 <expr/> 从进 TTS 的文本里剥掉（转录路径保留，框架发布 mood）。
         tts_text_transforms=[
@@ -1614,6 +1677,15 @@ async def entrypoint(ctx):
     except Exception as _exc:  # noqa: BLE001 - 无 livekit(测试/异常环境)垫话失效
         print(f"[agent] background audio unavailable, filler off: {_exc!r}", flush=True)
         _bg_audio = None
+    # 垫话补物化执行体(task-14a):消费整段合成流(音频丢弃)——CachedTTS 未命中
+    # tee 完整消费成功自动落 tts_cache,下一通同人设即命中(FillerDirector 只认
+    # (text) 签名;不碰云 API 的 tee 归属与 _say_script 同一姿势)。voice 为空时
+    # CachedTTS.synthesize 不挂 tee(原样透传),fillers 侧 resolver 门已挡该情形。
+    async def _filler_backfill(text: str) -> None:
+        async with tts_provider.synthesize(text) as _stream:
+            async for _ev in _stream:
+                pass
+
     _filler = FillerDirector(
         session,
         # 语言铁律(2026-09-10):垫话语言=装配时钉死的通话语言,构造时捕获,
@@ -1626,6 +1698,16 @@ async def entrypoint(ctx):
             or flow_ctrl.closing
             or (flow_ctrl.has_steps and flow_ctrl.done)
         ),
+        # 人设音色双层(task-14a,铁律「全场同一音色」):cache 与 QA 快路同源
+        # (_tts_cache);resolver 取合成时点人设音色/模型档(CachedTTS 透传
+        # resolved_*;getattr 守卫同 QA 块姿势,未包缓存/内芯直连时降级空值=
+        # 纯资产);miss 播资产兜底后异步补物化。
+        cache=_tts_cache,
+        voice_model_resolver=lambda: (
+            getattr(tts_provider, "resolved_voice", lambda: "")(),
+            getattr(tts_provider, "resolved_model", lambda: "")(),
+        ),
+        backfill=_filler_backfill,
     )
     if isinstance(tts_provider, CachedTTS):
         tts_provider.add_first_audio_listener(_filler.on_reply_first_audio)
@@ -1636,7 +1718,9 @@ async def entrypoint(ctx):
     # 空表 → 闸门整体惰性(零行为变化);命中还需应答音频已在本地缓存,
     # 未物化的条目自动视为未命中走 LLM(闸门绝不触发云合成)。
     _qa_index = None
-    if os.environ.get("BOK_QA_FASTPATH", "1") == "1" and _tts_cache is not None:
+    # disabled 打点(task-9):快路整体关闭(env 关/无 TTS 缓存/空表/装配失败)每通
+    # 记一次——放装配点不放轮级,轮级会重复计。
+    if qa_fastpath_enabled() and _tts_cache is not None:
         try:
             _qa_rows = await cp.list_qa_entries()
             if _qa_rows:
@@ -1644,8 +1728,13 @@ async def entrypoint(ctx):
 
                 _qa_index = QaIndex(_qa_rows)
                 print(f"[agent] qa fastpath on entries={len(_qa_rows)} (call {room_name})", flush=True)
+            else:
+                _qa_bump("disabled")  # 空表:闸门整体惰性,等同关闭
         except Exception as exc:  # noqa: BLE001 - 快答库不可用零影响
+            _qa_bump("disabled")
             print(f"[agent] qa fastpath load failed: {exc!r} (call {room_name})", flush=True)
+    else:
+        _qa_bump("disabled")  # env 关/无 TTS 缓存:无应答音频可播,快路整体关闭
     # 会话首轮真实前缀预热（LLM_PREFIX_PREWARM，默认 1）——触发点在开场白之后
     # （见下方 greeting 块），这里只定義任务体。
     if _prefix_prewarm_enabled() and isinstance(_raw_llm, MlxLlmLLM) and instructions:
@@ -1929,6 +2018,13 @@ async def entrypoint(ctx):
                 except asyncio.TimeoutError:
                     pass
             await cp.settle(call_id)
+            # QA 快路每通汇总(task-9):每通一行 PERF 风格,打完即清零(job 进程
+            # 一通一命,清零属防御);打点失败绝不影响结算。
+            try:
+                print(format_qa_summary(QA_COUNTERS), flush=True)
+            except Exception:  # noqa: BLE001 - 汇总打点失败零影响
+                pass
+            QA_COUNTERS.clear()
 
         def _close_done(_task: asyncio.Task) -> None:
             _close_flushed.set()
@@ -2294,6 +2390,7 @@ async def entrypoint(ctx):
                 )
                 if _qa_reason:
                     print(f"QA_FASTPATH bypass reason={_qa_reason}", flush=True)
+                    _qa_bump_bypass(_qa_reason)
                 else:
                     try:
                         _qa_entry, _qa_score = _qa_index.match(
@@ -2303,6 +2400,10 @@ async def entrypoint(ctx):
                         )
                     except Exception:  # noqa: BLE001 - 匹配失败当未命中
                         _qa_entry, _qa_score = None, 0.0
+                    # 汇总打点(task-9):match0=零命中轮(含匹配异常);hit=命中条目
+                    # 轮(=下文 hit=1 出声轮 + no_audio 轮之和,hit_audio=hit-no_audio
+                    # 由 format_qa_summary 求差)。
+                    _qa_bump("match0" if _qa_entry is None else "hit")
                     if _qa_entry is not None:
                         _qa_answer = str(_qa_entry.get("answer_text") or "").strip()
                         _qa_voice = getattr(tts_provider, "resolved_voice", lambda: "")()
@@ -2349,6 +2450,7 @@ async def entrypoint(ctx):
                             # ⑥ 压掉本轮 LLM(WA 累积同款;必须在 except-pass 之外)
                             raise StopResponse()
                         print(f"QA_FASTPATH hit=0 reason=no_audio entry={_qa_entry.get('id')}", flush=True)
+                        _qa_bump("no_audio")
             if self.paused:
                 chat_ctx = getattr(self, "chat_ctx", None)
                 if chat_ctx is not None and new_message is not None:

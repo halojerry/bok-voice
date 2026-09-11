@@ -49,6 +49,21 @@
       "text": "好，稍等一下啊。",
       "file": "zh-10.wav",
       "dur_s": 1.15
+    },
+    {
+      "text": "好的，您稍等，我马上帮您看一下。",
+      "file": "zh-11.wav",
+      "dur_s": 2.33
+    },
+    {
+      "text": "收到收到，我这就帮您查一下。",
+      "file": "zh-12.wav",
+      "dur_s": 2.17
+    },
+    {
+      "text": "麻烦您稍等一下，我马上看一下。",
+      "file": "zh-13.wav",
+      "dur_s": 2.17
     }
   ],
   "cantonese": [
@@ -101,6 +116,21 @@
       "text": "唔好急，等一陣先啊。",
       "file": "cantonese-10.wav",
       "dur_s": 1.1
+    },
+    {
+      "text": "好嘅，你稍等陣，我而家就幫你睇下。",
+      "file": "cantonese-11.wav",
+      "dur_s": 2.36
+    },
+    {
+      "text": "收到，唔好急，等我幫你睇下先。",
+      "file": "cantonese-12.wav",
+      "dur_s": 1.79
+    },
+    {
+      "text": "明白，麻煩你稍等多一陣，我即刻睇。",
+      "file": "cantonese-13.wav",
+      "dur_s": 2.31
     }
   ],
   "en": [
@@ -153,6 +183,21 @@
       "text": "Sure, sure.",
       "file": "en-10.wav",
       "dur_s": 1.09
+    },
+    {
+      "text": "Just a moment and I will check that.",
+      "file": "en-11.wav",
+      "dur_s": 2.2
+    },
+    {
+      "text": "One moment and I will check on it.",
+      "file": "en-12.wav",
+      "dur_s": 2.05
+    },
+    {
+      "text": "One moment please and I will check that.",
+      "file": "en-13.wav",
+      "dur_s": 1.79
     }
   ]
 }

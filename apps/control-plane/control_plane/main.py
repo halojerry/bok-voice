@@ -35,6 +35,7 @@ from bok_voice_obs.middleware import CorrelationMiddleware
 from .deps import build_engine, build_repository, build_session_factory
 from .dispatch_utils import cleanup_dispatch, has_active_dispatch
 from .nodes_store import HEARTBEAT_INTERVAL_S, NodeStore
+from .pregen import persona_pregen_status
 from .schemas import (
     CreateCallRequest,
     CreateObjectRequest,
@@ -1386,14 +1387,19 @@ def hit_qa_entry(entry_id: str) -> dict:
 
 
 @app.get("/api/reports/qa-pairs")
-def report_qa_pairs(min_calls: int = 5, account_id: str = "acc-001", limit: int = 100) -> list[dict]:
+def report_qa_pairs(
+    min_calls: int = 5, account_id: str = "acc-001", limit: int = 100, exclude_test: bool = True
+) -> list[dict]:
     """高频问答对挖掘报告:用户轮→紧随 assistant 轮,归一化聚类按出现通话数排序。
 
     与运行时匹配共用 bok_voice_core.qa_text.normalize_question,报告里的问句
     到运行时才对得上。--apply 入库走 POST /api/qa-entries(source=mined),
     音频物化统一走 agent 侧 bok.py tts-pregen。
+    exclude_test 默认滤掉测试对象(E2E/压测前缀族)的通话——真实采集时代的
+    报告要干净(2026-09-09 实测 top20 高频里 16 条是测试 fixture 音频);
+    显式传 false 看全量。
     """
-    conversations = _repo().iter_call_conversations(account_id)
+    conversations = _repo().iter_call_conversations(account_id, exclude_test_objects=exclude_test)
     return mine_qa_pairs(conversations, min_calls=min_calls, limit=limit)
 
 
@@ -1411,25 +1417,42 @@ def get_persona(persona_id: str) -> dict:
 
 
 @app.post("/api/personas")
-def create_persona(req: PersonaRequest) -> dict:
+def create_persona(req: PersonaRequest, request: Request) -> dict:
     persona = _repo().create_persona(req.model_dump())
     _audit("persona.create", subject_type="persona", subject_id=persona.get("id", ""), account_id=persona.get("account_id", ""), detail={"name": persona.get("name", "")})
-    return persona
+    # 新人设上线:无罐头即提醒+自动全量物化(W3,响应 tts_pregen=提醒面)。
+    # 装饰浅拷贝——内存 repo 返回活引用,直接写会把一次性状态键落进存储。
+    out = dict(persona)
+    out["tts_pregen"] = persona_pregen_status(
+        out, base_url=str(request.base_url).rstrip("/")
+    )
+    return out
 
 
 @app.put("/api/personas/{persona_id}")
-def update_persona(persona_id: str, req: UpdatePersonaRequest) -> dict:
-    existing = _repo().get_persona(persona_id)
+def update_persona(persona_id: str, req: UpdatePersonaRequest, request: Request) -> dict:
+    # 冻结更新前快照(内存 repo 返回活引用,update 原地改会令 existing==persona,
+    # 音色变化判定恒 False);audit 与物化触发都以此为准。
+    existing = dict(_repo().get_persona(persona_id) or {})
     persona = _repo().update_persona(persona_id, req.model_dump())
     if not persona:
         raise HTTPException(404, "persona not found")
     _audit("persona.update", subject_type="persona", subject_id=persona_id, account_id=(existing or {}).get("account_id", ""), detail={"name": persona.get("name", "")})
-    return persona
+    out = dict(persona)
+    out["tts_pregen"] = persona_pregen_status(
+        out, base_url=str(request.base_url).rstrip("/"), existing=existing
+    )
+    return out
 
 
 @app.put("/api/personas")
-def upsert_persona(req: PersonaRequest) -> dict:
-    return _repo().create_persona(req.model_dump())
+def upsert_persona(req: PersonaRequest, request: Request) -> dict:
+    persona = _repo().create_persona(req.model_dump())
+    out = dict(persona)
+    out["tts_pregen"] = persona_pregen_status(
+        out, base_url=str(request.base_url).rstrip("/")
+    )
+    return out
 
 
 @app.delete("/api/personas/{persona_id}")

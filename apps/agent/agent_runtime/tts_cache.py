@@ -148,11 +148,23 @@ class TtsAudioCache:
     def lookup(self, text: str, *, voice: str, model: str) -> bytes | None:
         return self.get(self.key_for(text, voice=voice, model=model))
 
-    def store(self, key: str, pcm: bytes, *, text: str, voice: str, model: str) -> bool:
-        """原子写入+LRU 淘汰;任何失败静默 False(缓存永不影响播放)。"""
+    def store(
+        self, key: str, pcm: bytes, *, text: str, voice: str, model: str, pin: bool = False
+    ) -> bool:
+        """原子写入+LRU 淘汰;任何失败静默 False(缓存永不影响播放)。
+
+        pin=True=罐头集(垫话/QA 应答/静态直念线,pregen 物化)——永不逐出
+        (2026-09-10:逐对象开场白这类无界动态条目会把罐头挤出 LRU,音色一致性
+        静默破功,垫话回落固定资产音)。无界条目(逐对象开场白)保持不钉。
+        """
         if not pcm:
             return False
         pcm = _trim_lead_silence_safe(pcm, self.sample_rate)
+        # 保钉(双写者竞态):运行时 tee 与 pregen 子进程共用 key 空间,运行时
+        # 合成在途时 pregen 先落钉、tee 迟到 _done 重写 meta——未钉写回不得
+        # 洗掉已有 pinned(否则罐头静默退回可逐出,W3 保存→来电窗口恰放大)。
+        if not pin and self._is_pinned(key):
+            pin = True
         try:
             self.root.mkdir(parents=True, exist_ok=True)
             tmp = self._pcm_path(key).with_suffix(".tmp")
@@ -166,6 +178,8 @@ class TtsAudioCache:
                 "bytes": len(pcm),
                 "stored_at": time.time(),
             }
+            if pin:
+                meta["pinned"] = True
             mtmp = self._meta_path(key).with_suffix(".mtmp")
             mtmp.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
             os.replace(mtmp, self._meta_path(key))
@@ -174,7 +188,14 @@ class TtsAudioCache:
         except OSError:
             return False
 
+    def _is_pinned(self, key: str) -> bool:
+        try:
+            return bool(json.loads(self._meta_path(key).read_text(encoding="utf-8")).get("pinned"))
+        except (OSError, ValueError):
+            return False
+
     def _evict(self) -> None:
+        """淘汰最旧的未钉条目(只读候选区 meta,通常 0-1 个,不扫全库)。"""
         try:
             entries = sorted(
                 (p for p in self.root.glob("*.pcm")),
@@ -182,6 +203,8 @@ class TtsAudioCache:
                 reverse=True,
             )
             for stale in entries[self.max_entries :]:
+                if self._is_pinned(stale.stem):
+                    continue
                 stale.unlink(missing_ok=True)
                 self._meta_path(stale.stem).unlink(missing_ok=True)
         except OSError:

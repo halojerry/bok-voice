@@ -36,14 +36,23 @@
   PCM 存 **app-data/tts-cache/**（LRU 500 条）。脚本直念线（开场白/心跳/收线/WA 确认）
   经 `_say_script`：命中 ~0ms 出声，未命中边播边落盘。开关 `BOK_TTS_CACHE=0`。
 - **预生成**：`bok.py tts-pregen`（--greetings 无变量脚本线 / --objects 逐对象
-  开场白收线心跳 / --qa 快答库启用条目应答）——离线批量合成，需 CP 或 MINIMAX_API_KEY。
-  --fillers 已停用（2026-09-10 垫话资产化）。
+  开场白收线心跳 / --qa 快答库启用条目应答 / --fillers 按人设音色物化垫话，
+  2026-09-10 双层出声复活）——离线批量合成，需 CP 或 MINIMAX_API_KEY。
+  greetings/fillers/qa 落盘**打钉不逐出**（逐对象开场白与运行时 tee 不钉，
+  LRU 500 只淘汰未钉条目）。**人设保存点自动物化（W3）**：CP POST/PUT
+  /api/personas 音色变化 → 后台 detached 子进程跑 `scripts/pregen_tts.py
+  --greetings --fillers --qa --persona <id>`（新会话不被栈重启打断，单飞，
+  `BOK_PERSONA_AUTO_PREGEN=0` 关），日志 **app-data/logs/tts-pregen.log**，
+  响应 `tts_pregen.status` 即提醒面。
 - **垫话**：`agent_runtime/fillers.py`——LLM 慢轮回复首音频 500ms 未到播预合成
   应承语。**2026-09-10 资产化改版**：垫话=随源码分发 wav 资产（`assets/fillers/`
-  +manifest，`scripts/gen_filler_assets.py` 固定音色/参数预生成，三语各 10 句
+  +manifest，`scripts/gen_filler_assets.py` 固定音色/参数预生成，三语各 10 短句
   万能话术 1.0-1.5s），运行时只播文件绝不云合成；**播放排序=垫话播完→300ms
   （`BOK_FILLER_GAP_MS`）→回复**（不再掐垫话，回复首帧经 `_RelaySynthesizeStream`
-  hold 扣压）；语言=装配时钉死的通话语言，池缺失跳过绝不跨语言。垫话绝不进
+  hold 扣压）；**链发**（2026-09-10）：首条播完回复仍未出声 → gap 后自动补第二发
+  （`BOK_FILLER_CHAIN` 默认 1，每轮封顶 1 次、与主动播共享 `BOK_FILLER_MAX=3`
+  计数；池 39 条=每语言 10 短 1.0-1.5s+3 长 1.7-2.3s）；语言=装配时钉死的通话语言，
+  池缺失跳过绝不跨语言。垫话绝不进
   LLM 上下文。开关 `BOK_FILLER=0`。
 - **抢跑防抖 + PrefillSpeculator**（2026-09-10）：框架抢跑默认关
   （`PREEMPTIVE_GENERATION=0`，命中在本仓 STT 架构下结构性不可能——PREFLIGHT
