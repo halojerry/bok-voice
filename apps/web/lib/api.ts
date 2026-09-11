@@ -63,6 +63,10 @@ export const api = {
     if (!res.ok) throw await toError(res);
     return await res.blob();
   },
+  // 罐头音试听(2026-09-11):词条列表(垫话资产走 /api/tts/filler-preview 二进制端点,
+  // 由调用方直接 fetch blob,不经 JSON request)。
+  listQaEntries: (enabled = 1) =>
+    request<Record<string, unknown>[]>(`/api/qa-entries?enabled=${enabled}`),
   getSettings: () => request<Record<string, unknown>>("/api/settings"),
   saveSettings: (body: unknown) => request<Record<string, unknown>>("/api/settings", { method: "PUT", body: JSON.stringify(body) }),
   // 官方 TokenSourceResponse 契约({serverUrl, participantToken});TokenSource

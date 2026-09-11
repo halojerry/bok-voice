@@ -400,6 +400,34 @@ async def tts_register_voice(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+@app.get("/api/tts/filler-preview")
+def tts_filler_preview(lang: str = "zh", i: int = 0) -> Response:
+    """垫话资产试听（2026-09-11 症状④）：直接吐源码 wav（随包分发,零云调用）。
+
+    i=池内索引(取模轮换),web 端随机传即「换一句试听」。浏览器按 wav 头原生
+    播放=正确速率;房间内 48k 混音器错配是 agent 播放路径问题,与此端点无关。"""
+    from fastapi.responses import FileResponse
+
+    assets = Path(__file__).resolve().parents[2] / "agent" / "agent_runtime" / "assets" / "fillers"
+    manifest_path = assets / "manifest.json"
+    if not manifest_path.exists():
+        raise HTTPException(status_code=404, detail="filler assets not found")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        pool = manifest.get(lang) or manifest.get("zh") or []
+        if not pool:
+            raise HTTPException(status_code=404, detail=f"no filler pool for lang={lang}")
+        entry = pool[int(i) % len(pool)]
+        wav = assets / str(entry.get("file") or "")
+        if not wav.exists():
+            raise HTTPException(status_code=404, detail="filler wav missing")
+        return FileResponse(str(wav), media_type="audio/wav", filename=str(entry.get("file") or "filler.wav"))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"filler preview failed: {exc}") from exc
+
+
 @app.post("/api/tts/preview")
 async def tts_preview(payload: dict) -> Response:
     """试听一段 TTS。provider=qwen3_tts 走本地 sidecar；provider=minimax 走云端 MiniMax
@@ -409,6 +437,14 @@ async def tts_preview(payload: dict) -> Response:
     text = str(payload.get("text") or "")
     voice = str(payload.get("voice") or "")
     language = str(payload.get("language") or "zh")
+    if not voice and provider in ("minimax", "minimax_streaming"):
+        # qa_entries.voice_id 可空(罐头物化时音色取自人设而非词条字段)——试听
+        # 按语言回落 agent 同一套 lang_personas 默认音色,否则空 voice 被 MiniMax 拒。
+        voice = {
+            "zh": "Chinese_crisp_podcaster_nv1",
+            "cantonese": "Cantonese_GentleLady",
+            "en": "socialmedia_female_2_v1",
+        }.get(language, "Chinese_crisp_podcaster_nv1")
     try:
         if provider in ("minimax", "minimax_streaming"):
             # 与 agent 一致：优先读设置库里持久化的 tts.api_key，环境变量仅作兜底，
@@ -428,7 +464,15 @@ async def tts_preview(payload: dict) -> Response:
                     json={
                         "model": os.environ.get("MINIMAX_MODEL", "speech-2.8-hd"),
                         "text": text,
-                        "voice_setting": {"voice_id": voice, "speed": 1, "vol": 1, "pitch": 0},
+                        # 语速与运行时同一条语言档规则(zh/粤 1.2,见 agent_runtime
+                        # minimax_speed_for;CP 进程不引 agent 包,同规则内联)——
+                        # 否则试听节奏与真通话不一致,试了白试。
+                        "voice_setting": {
+                            "voice_id": voice,
+                            "speed": 1.2 if language in ("zh", "cantonese") else 1.0,
+                            "vol": 1,
+                            "pitch": 0,
+                        },
                         "audio_setting": {"sample_rate": sample_rate, "format": "pcm", "channel": 1},
                     },
                 )
