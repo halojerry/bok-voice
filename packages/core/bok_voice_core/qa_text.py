@@ -93,3 +93,43 @@ def mine_qa_pairs(
         )
     out.sort(key=lambda r: (-r["calls"], r["question"]))
     return out[:limit]
+
+
+# ---- 自动入库闸(2026-09-11 自动学习闭环:mine_qa --sync) ----
+# 保守优先:错答案一旦罐头化就是复读机。闸必须严;闸外条目打印给人看,
+# 人可用 DELETE /api/qa-entries/{id} 否决。
+AUTO_MIN_CALLS = 5
+AUTO_MIN_VOTE_RATIO = 0.8
+AUTO_MIN_Q_LEN = 4
+AUTO_MAX_Q_LEN = 24
+
+_DIGIT_RUN_RE = re.compile(r"\d{4,}")
+
+
+def auto_apply_verdict(pair: dict, existing_norm_questions: set[str] | None = None) -> tuple[bool, str]:
+    """自动入库闸(2026-09-11 自动学习闭环)。保守:错答案罐头化=复读机。
+
+    闸(依次判,首个不过即拒):
+    - calls≥AUTO_MIN_CALLS(5);
+    - 众数答案得票占比 votes/calls≥AUTO_MIN_VOTE_RATIO(0.8,答案稳定性;
+      挖掘已按通话去重,总票数=通话数);
+    - 归一问法长度 [AUTO_MIN_Q_LEN, AUTO_MAX_Q_LEN](4-24,滤单字应承与
+      超长叙述);
+    - 无 ≥4 位连续数字(数字轮运行时被四道闸旁路,库内是死重);
+    - 归一后不与现有词条重复(existing_norm_questions=None 跳过该项)。
+    返回 (入库?, 原因码);过闸原因码为空串。
+    """
+    q = str(pair.get("question") or "")
+    calls = int(pair.get("calls") or 0)
+    votes = int(pair.get("answer_votes") or 0)
+    if calls < AUTO_MIN_CALLS:
+        return False, "low_calls"
+    if votes / calls < AUTO_MIN_VOTE_RATIO:
+        return False, "unstable_answer"
+    if not AUTO_MIN_Q_LEN <= len(q) <= AUTO_MAX_Q_LEN:
+        return False, "question_length"
+    if _DIGIT_RUN_RE.search(q):
+        return False, "digits"
+    if existing_norm_questions is not None and q in existing_norm_questions:
+        return False, "duplicate"
+    return True, ""
