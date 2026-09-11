@@ -615,8 +615,10 @@ def test_ping_consecutive_misses_force_invalidate(monkeypatch, capsys):
 
         # 连失 2 次(=默认上限) → 强断 + 后台重预热
         ws1.fail_left = 2
-        assert await _wait_for(lambda: session._ws is None), "连失到上限应强断 invalidate"
-        assert session._invalidate_task is not None, "DEAD 分支应持引用孤儿 invalidate task(防 GC/aclose 可见)"
+        # 等「强断已触发」而非 `_ws is None` 瞬态:invalidate 置空→重预热接回
+        # ws2 的 None 窗口在慢机(CI)上短于 0.02s 轮询粒度,polling 只见 ws2
+        # →瞬态断言假失败(2026-09-11 CI 实证:DEAD/PREWARM 打点齐全仍红)。
+        assert await _wait_for(lambda: session._invalidate_task is not None), "连失到上限应强断 invalidate(DEAD 分支应持引用孤儿 task)"
         assert await _wait_for(lambda: ws1.closed), "强断应关闭死连接(真实 close 让出下收尾唔被掀)"
         assert await _wait_for(lambda: session._ws is ws2), "强断后应后台重预热零冷启动"
         assert fake_connect.calls == 2
