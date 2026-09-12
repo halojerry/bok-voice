@@ -84,8 +84,10 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
       const outs = await listAudioDevicesOf("output");
       setOutDevices(outs);
       wlog("devices", {
-        mics: mics.map((d) => ({ n: d.name, def: d.is_default })),
-        outs: outs.map((d) => ({ n: d.name, def: d.is_default })),
+        // id 前 6 位随名记录:sink_apply 只记 id 前缀,没名字对照就没法定案
+        // 「两个 sink 各落在哪台物理设备」(2026-09-12 c199e001 排障缺的最后拼图)。
+        mics: mics.map((d) => ({ n: d.name, def: d.is_default, id: d.id.slice(0, 6) })),
+        outs: outs.map((d) => ({ n: d.name, def: d.is_default, id: d.id.slice(0, 6) })),
         saved: { meMic: savedMicDevice("me"), othMic: savedMicDevice("other"), meOut: savedOutputDevice("me"), othOut: savedOutputDevice("other") },
       });
         // 双麦自动分配(2026-09-12「没有分我的麦克风和对方麦克风」根因):两个下拉
@@ -190,8 +192,18 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   const [halfDuplex, setHalfDuplex] = useState(true);
   const [meHeld, setMeHeld] = useState(false);
   const [othHeld, setOthHeld] = useState(false);
+  // 声源仲裁让麦(2026-09-12 对方耳机听到自己话被译一遍的根因=同桌物理串音:
+  // 对方的声音漏进我方麦,fwd 把它也翻译播出)。谁的原文转写流活跃,对面的麦
+  // 就暂让——由字幕流驱动(半双工是 TTS 播放驱动,另一维度);双方同时活跃
+  // (真插话)不拦。
+  const [voiceHoldMe, setVoiceHoldMe] = useState(false);
+  const [voiceHoldOth, setVoiceHoldOth] = useState(false);
   const logHold = useCallback((who: "me" | "oth") => (v: boolean) => {
     if (v) wlog("held", { who });
+  }, []);
+  const onVoiceActivity = useCallback((meActive: boolean, othActive: boolean) => {
+    setVoiceHoldMe(othActive && !meActive);
+    setVoiceHoldOth(meActive && !othActive);
   }, []);
 
   // ---- 传译总开关(2026-09-12 用户拍板:进房不自动开始) ----
@@ -444,15 +456,15 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   const toggleOthMic = useCallback(() => setOthMicOn((v) => !v), []);
   useEffect(() => {
     if (!meConnected) return;
-    meRoom.localParticipant.setMicrophoneEnabled(meMicOn && !meHeld && interpOn).catch(() => {});
+    meRoom.localParticipant.setMicrophoneEnabled(meMicOn && !meHeld && !voiceHoldMe && interpOn).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [meMicOn, meHeld, meConnected, interpOn]);
+  }, [meMicOn, meHeld, voiceHoldMe, meConnected, interpOn]);
   useEffect(() => {
     const r = otherRoomRef.current;
     if (!otherConnected || !r) return;
-    r.localParticipant.setMicrophoneEnabled(othMicOn && !othHeld && interpOn).catch(() => {});
+    r.localParticipant.setMicrophoneEnabled(othMicOn && !othHeld && !voiceHoldOth && interpOn).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [othMicOn, othHeld, otherConnected, interpOn]);
+  }, [othMicOn, othHeld, voiceHoldOth, otherConnected, interpOn]);
 
   // ---- 输出模式切换:对已连接房间重投路由 ----
   // dual 模式不变量(2026-09-12 根因收口):两路必须都有指认,有洞必补。根因链=
@@ -547,7 +559,7 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   // 我听到对方原声,像直接通话;回声由浏览器 AEC 兜(默认输出播放的浏览器音频
   // 在两支麦的采集中被回声消除)。对方侧由 other 房只挂 trans- 译文轨承担。
   return (
-    <AgentSessionProvider session={meSession} volume={1}>
+    <AgentSessionProvider session={meSession} volume={1} onlyRemoteIdentity={`other-${callId}`}>
       <ConsoleLive
         room={meRoom}
         myLang={myLang}
@@ -579,6 +591,7 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
         pickOthOut={pickOthOut}
         interpOn={interpOn}
         toggleInterp={toggleInterp}
+        onVoiceActivity={onVoiceActivity}
         toggleMeMic={toggleMeMic}
         toggleOthMic={toggleOthMic}
         setHalfDuplex={setHalfDuplex}
@@ -630,6 +643,7 @@ type LiveProps = {
   othMicId: string;
   othOutId: string;
   setError: (s: string) => void;
+  onVoiceActivity: (meActive: boolean, othActive: boolean) => void;
   interpOn: boolean;
   toggleInterp: () => void;
   meMicOn: boolean;
@@ -716,6 +730,25 @@ function ConsoleLive(p: LiveProps) {
   const [filter, setFilter] = useState<"both" | "me" | "other">("both");
   const [clearedCount, setClearedCount] = useState(0);
   const items = useMemo(() => transcriptions.slice(-80), [transcriptions]);
+  // 声源仲裁:两侧「原文转写流」的最近更新时刻=谁在说话;400ms 轮询衰减
+  // (1.5s 窗)。AGT 译文(meHeld/othHeld 的 TTS 暂让已覆盖)不算说话。
+  const lastSpokeRef = useRef<{ me: number; oth: number }>({ me: 0, oth: 0 });
+  useEffect(() => {
+    const now = Date.now();
+    for (const tr of transcriptions) {
+      const id = String(tr.participantInfo?.identity ?? "");
+      if (id.startsWith("me-")) lastSpokeRef.current.me = now;
+      else if (id.startsWith("other-")) lastSpokeRef.current.oth = now;
+    }
+  }, [transcriptions]);
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const now = Date.now();
+      p.onVoiceActivity(now - lastSpokeRef.current.me < 1500, now - lastSpokeRef.current.oth < 1500);
+    }, 400);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const offset = transcriptions.length - items.length;
   const dstCount = useMemo(
     () => transcriptions.filter((t) => whoIs(t, p.room, p.myLang, p.otherLang).kind === "dst").length,
@@ -792,7 +825,7 @@ function ConsoleLive(p: LiveProps) {
                 <label className="flex flex-col gap-1">
                   <span className="text-(--stage-muted)">我方扬声器</span>
                   <div className="flex gap-1">
-                    <select className="select" value={p.meOutId} onChange={(e) => p.pickMeOut(e.target.value)}>
+                    <select className="select min-w-0 flex-1" value={p.meOutId} onChange={(e) => p.pickMeOut(e.target.value)}>
                       <option value="" disabled>系统默认（双输出档需指定）</option>
                       {p.outDevices.map((d) => (
                         <option key={d.id} value={d.id}>
@@ -812,7 +845,7 @@ function ConsoleLive(p: LiveProps) {
                 <label className="flex flex-col gap-1">
                   <span className="text-(--stage-muted)">对方扬声器</span>
                   <div className="flex gap-1">
-                    <select className="select" value={p.othOutId} onChange={(e) => p.pickOthOut(e.target.value)}>
+                    <select className="select min-w-0 flex-1" value={p.othOutId} onChange={(e) => p.pickOthOut(e.target.value)}>
                       <option value="" disabled>系统默认（双输出档需指定）</option>
                       {p.outDevices.map((d) => (
                         <option key={d.id} value={d.id}>
