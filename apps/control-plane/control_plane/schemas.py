@@ -185,6 +185,18 @@ class WhatsAppHandledRequest(BaseModel):
     handled: bool = True
 
 
+class RosterClaimRequest(BaseModel):
+    """名册认领：claimed_by 缺省 acc-001（本机单账号形态）。"""
+
+    claimed_by: str = "acc-001"
+
+
+class RosterHandledRequest(BaseModel):
+    """名册「已对接」标记：true=handled 并同步来源通话横幅；false=撤销认领。"""
+
+    handled: bool = True
+
+
 class QaEntryCreate(BaseModel):
     """快答库条目(Q→A 检索快路,2026-09-09)。scope=global | step(配合 step_index)。"""
 

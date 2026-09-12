@@ -120,6 +120,18 @@ export const api = {
   supervisorTransfer: (id: string) => request<Record<string, unknown>>(`/api/supervisor/${id}/transfer`, { method: "POST" }),
   markWhatsappHandled: (id: string, handled = true) =>
     request<Record<string, unknown>>(`/api/calls/${id}/whatsapp/handled`, { method: "POST", body: JSON.stringify({ handled }) }),
+  // 名册认领池（Wave1 outbound campaign）：status/channel 空=不过滤；
+  // claim/unclaim/handled 均返回更新后的条目，handled 联动来源通话横幅状态。
+  listRoster: (status = "", channel = "", accountId = "acc-001") =>
+    request<Record<string, unknown>[]>(
+      `/api/roster?account_id=${encodeURIComponent(accountId)}&status=${encodeURIComponent(status)}&channel=${encodeURIComponent(channel)}`,
+    ),
+  rosterClaim: (id: string, claimedBy = "acc-001") =>
+    request<Record<string, unknown>>(`/api/roster/${id}/claim`, { method: "POST", body: JSON.stringify({ claimed_by: claimedBy }) }),
+  rosterUnclaim: (id: string) =>
+    request<Record<string, unknown>>(`/api/roster/${id}/unclaim`, { method: "POST" }),
+  rosterHandled: (id: string, handled = true) =>
+    request<Record<string, unknown>>(`/api/roster/${id}/handled`, { method: "POST", body: JSON.stringify({ handled }) }),
   reportsSummary: () => request<Record<string, unknown>>("/api/reports/summary"),
   reportsCalls: () => request<Record<string, unknown>[]>("/api/reports/calls"),
   reportsUsage: () => request<Record<string, unknown>>("/api/reports/usage"),

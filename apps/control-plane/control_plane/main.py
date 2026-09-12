@@ -8,7 +8,9 @@ import sys
 import uuid
 import wave
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import httpx
 from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
@@ -43,6 +45,8 @@ from .schemas import (
     PersonaRequest,
     QaEntryCreate,
     QaEntryPatch,
+    RosterClaimRequest,
+    RosterHandledRequest,
     TemplateRequest,
     UpdateTemplateRequest,
     UpdateObjectRequest,
@@ -1068,6 +1072,76 @@ def mark_whatsapp_handled(call_id: str, req: WhatsAppHandledRequest) -> dict:
     _audit("call.whatsapp_handled", subject_type="call", subject_id=call_id,
            account_id=call.get("account_id", "acc-001"), detail={"handled": req.handled})
     return updated
+
+
+@app.get("/api/roster")
+def list_roster(account_id: str = "acc-001", status: str = "", channel: str = "") -> list[dict]:
+    """名册认领池列表；status/channel 空=不过滤。"""
+    return _repo().list_roster(account_id, status=status, channel=channel)
+
+
+@app.post("/api/roster/{entry_id}/claim")
+def roster_claim(entry_id: str, req: RosterClaimRequest) -> dict:
+    """认领名册条目：status=claimed + claimed_by/claimed_at（naive UTC，与读侧 ISO 对齐）。"""
+    entry = _repo().update_roster_entry(
+        entry_id, status="claimed", claimed_by=req.claimed_by,
+        claimed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+    )
+    if not entry:
+        raise HTTPException(404, "roster entry not found")
+    _audit("roster.claim", subject_type="roster", subject_id=entry_id,
+           account_id=req.claimed_by, detail={"claimed_by": req.claimed_by})
+    return entry
+
+
+@app.post("/api/roster/{entry_id}/unclaim")
+def roster_unclaim(entry_id: str) -> dict:
+    """释放认领：status=unclaimed、claimed_by 清空。
+
+    claimed_at 必须传空串（repo 契约 None=不修改、""=清空）——空串在双后端
+    都映射回「未认领」的读侧契约（SQL 存 NULL / InMemory 存 ""，读侧都渲染 ""）。
+    """
+    entry = _repo().update_roster_entry(entry_id, status="unclaimed", claimed_by="", claimed_at="")
+    if not entry:
+        raise HTTPException(404, "roster entry not found")
+    _audit("roster.unclaim", subject_type="roster", subject_id=entry_id,
+           account_id=str(entry.get("account_id") or ""))
+    return entry
+
+
+@app.post("/api/roster/{entry_id}/handled")
+def roster_handled(entry_id: str, req: RosterHandledRequest) -> dict:
+    """操作台标「已对接」/撤销，联动来源通话 whatsapp_status（与通话内横幅同源语义）。
+
+    true → 名册 handled + 通话 whatsapp_status=handled（爆闪停止）；
+    false → 名册回 unclaimed，通话按有无号码回 captured/offered。
+    来源通话缺失/已删除不阻塞名册状态变更。
+    """
+    entry = _repo().get_roster_entry(entry_id)
+    if not entry:
+        raise HTTPException(404, "roster entry not found")
+    if req.handled:
+        entry = _repo().update_roster_entry(entry_id, status="handled") or entry
+        _sync_call_whatsapp_status(entry.get("call_id"), "handled")
+    else:
+        entry = _repo().update_roster_entry(
+            entry_id, status="unclaimed", claimed_by="", claimed_at="") or entry
+        call = _repo().get_call(str(entry.get("call_id") or "")) or {}
+        back = "captured" if str(call.get("customer_whatsapp") or "").strip() else "offered"
+        _sync_call_whatsapp_status(entry.get("call_id"), back)
+    _audit("roster.handled", subject_type="roster", subject_id=entry_id,
+           account_id=str(entry.get("account_id") or ""), detail={"handled": req.handled})
+    return entry
+
+
+def _sync_call_whatsapp_status(call_id: Any, status: str) -> None:
+    """名册动作回写来源通话横幅状态；通话不存在/存储异常都不阻塞名册主流程。"""
+    if not call_id:
+        return
+    try:
+        _repo().update_call(str(call_id), whatsapp_status=status)
+    except Exception as exc:  # pragma: no cover - 存储抖动不阻断名册状态
+        print(f"[cp] roster whatsapp_status sync skipped ({call_id}): {exc!r}", flush=True)
 
 
 class NodeRegisterRequest(BaseModel):
