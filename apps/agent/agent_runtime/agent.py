@@ -547,7 +547,7 @@ def _hotword_echo_guard_enabled() -> bool:
 
 # 幻听判定单一实现喺 livekit_plugins(STT 源头闸与 hook 双层共用,防漂移)。
 from .providers.livekit_plugins import _is_hotword_vocab_echo as _is_hotword_echo  # noqa: E402
-from .providers.livekit_plugins import _strip_vocab_echo_tail  # noqa: E402
+from .providers.livekit_plugins import _strip_vocab_echo_tail, _vocab_echo_guard  # noqa: E402
 
 
 def _is_echo_self_heard(user_text: str, last_reply: str, agent_speaking: bool) -> bool:
@@ -1365,6 +1365,9 @@ async def entrypoint(ctx):
     _hotword_ctx = asr_hotword_context(
         asr_pin_lang, object_card, extra_hotwords=str((template or {}).get("hotwords") or "")
     )
+    # 词表回声事件账本(call-1043de7c):确认过一次剥尾/纯回声后,后续「词表单词残片」
+    # (回声衰落成只抄出词表首词「顺豐速運」)也按回声丢弃——首现孤词保留(真人可讲「微信」)。
+    _vocab_echo_seen: dict = {"on": False}
     if use_fake or asr_provider_name in ("fake", "fake_stt"):
         stt_provider = FakeLiveKitSTT()
     else:
@@ -1894,9 +1897,12 @@ async def entrypoint(ctx):
             # 词表回声隐藏面(2026-09-12 用户拍板「不影响通话就不要显示」):
             # 流程/QA 早喺 turn 钩子用净文(那边 user_text 已替换),呢度只改
             # 落库展示——剥尾净文入库;纯回声轮(整句=词表,客户根本冇讲过)
-            # 完全唔落库。原文审计留 agent.log QWEN3_HOTWORD_ECHO_STRIP 行。
+            # 完全唔落库;回声确认后的词表孤词残片(「顺豐速運」)同样唔落库。
+            # 原文审计留 agent.log QWEN3_HOTWORD_ECHO_* 行。
             if _hotword_ctx and _hotword_echo_guard_enabled():
-                _u_text = _strip_vocab_echo_tail(text, _hotword_ctx)
+                _u_text, _vocab_echo_seen["on"] = _vocab_echo_guard(
+                    text, _hotword_ctx, echo_seen=_vocab_echo_seen["on"]
+                )
                 if not _u_text.strip("。，, 、;；"):
                     print(f"QWEN3_HOTWORD_ECHO_TURN_HIDDEN (call {room_name})", flush=True)
                     return
@@ -2323,10 +2329,16 @@ async def entrypoint(ctx):
             # 当转写整串抄出(call-feaf914c 实机回归)——顺串判定命中即丢弃整轮。
             # 2026-09-11 call-a2705ed2 升级:回声可被 ASR 用繁体抄出(守卫已繁简
             # 归一),且「真话头+回声尾」形态(「拼多多。顺豐速運，運通…」)整轮
-            # 丢弃会连真实回答一起丢——改剥尾保头,纯回声才丢;本地处理(QA 匹配/
-            # facts/flow)用净文,chat 消息保留原文(4B 对噪音轮已被实证稳健)。
+            # 丢弃会连真实回答一起丢——改剥尾保头,纯回声才丢。
+            # 2026-09-12 call-1043de7c 再升级:①T2S 表曾漏「順→顺」致词表首词归一
+            # 断链,全串回声被当「真话头」留下「顺豐速運」假轮;②回声确认后的词表
+            # 孤词残片同样丢弃(_vocab_echo_guard 三层)。净文同步写回 chat 消息
+            # ——实时字幕/会话记录/LLM 上下文三面全净(旧「chat 留原文」已被用户
+            # 「不要显示」拍板取代)。
             if _hotword_echo_guard_enabled() and _hotword_ctx:
-                _stripped = _strip_vocab_echo_tail(user_text, _hotword_ctx)
+                _stripped, _vocab_echo_seen["on"] = _vocab_echo_guard(
+                    user_text, _hotword_ctx, echo_seen=_vocab_echo_seen["on"]
+                )
                 if _stripped != user_text:
                     print(
                         f"QWEN3_HOTWORD_ECHO_STRIP (call {room_name}) "
