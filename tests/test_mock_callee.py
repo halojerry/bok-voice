@@ -26,11 +26,16 @@ def test_plan_timeline_no_answer():
 
 
 def test_plan_timeline_reject():
-    # reject:进房即走——join ≈ ring_delay,leave ≈ +0.5s(必须落在 agent 1.5s 窗内)。
+    # reject:进房即走。事件序列固定 join→leave;但 leave 的**计划时刻只是占位**——
+    # 真正的离房锚在 run() 里改为「实际 connect 完成 + DWELL_AFTER_CONNECT_S」,
+    # 否则 connect 耗时 ≥0.5s 时离房会抢在 agent 侧监听注册前到达 → 误判 answered。
     tl = mock_callee.plan_timeline("reject", ring_delay_s=3.0, lines=2)
     assert [e for e, _ in tl] == ["join", "leave"]
     assert tl[0][1] == 3.0
-    assert 3.0 < tl[1][1] <= 3.0 + 1.5
+    assert "reject" in mock_callee.DWELL_AFTER_CONNECT_S
+    dwell = mock_callee.DWELL_AFTER_CONNECT_S["reject"]
+    # dwell 必须落在 agent 的 1.5s 离房监听窗内(>0 且 <1.5)。
+    assert 0.0 < dwell < 1.5
 
 
 def test_plan_timeline_hangup_mid():
@@ -111,11 +116,11 @@ def test_parse_args_script_json_malformed_is_empty():
 
 
 def test_language_normalized_to_three_states():
-    # 语言三态 zh/cantonese/en;旧拼写/未知值一律回落 cantonese(B 线规范值)。
+    # 语言三态 zh/cantonese/en;未知值一律回落 cantonese(B 线规范值)。
     assert mock_callee.normalize_language("zh") == "zh"
     assert mock_callee.normalize_language("cantonese") == "cantonese"
     assert mock_callee.normalize_language("en") == "en"
-    assert mock_callee.normalize_language("yue") == "cantonese"
+    assert mock_callee.normalize_language("bogus") == "cantonese"
     assert mock_callee.normalize_language("") == "cantonese"
 
 

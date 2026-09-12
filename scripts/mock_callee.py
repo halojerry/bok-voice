@@ -38,6 +38,13 @@ FIRST_SPEAK_OFFSET_S = 0.8    # join→首句:>1.5s 窗后才出声,不被误判
 SPEAK_INTERVAL_S = 6.0        # 句间隔(≈一轮问答)
 TAIL_SILENCE_S = 2.0          # 末句后收尾静默
 
+# 离房**锚定实际 connect 完成时刻**的剧本(而非计划 join 时刻)——rtc connect
+# 耗时若 ≥REJECT_LEAVE_OFFSET_S,按计划时刻离房会抢在 agent 侧 participant 监听
+# 注册之前到达(join 事件与 agent 认领之间仍有 connect 间隙),reject 被误判
+# answered。锚 connect 完成时刻后,join→leave 间隙恒为 0.5s 落 1.5s 窗内。
+# 键=scenario,值=connect 完成后停留秒数(leave 事件的计划时刻仅作纯函数序列占位)。
+DWELL_AFTER_CONNECT_S: dict[str, float] = {"reject": REJECT_LEAVE_OFFSET_S}
+
 VALID_SCENARIOS = ("answer", "no_answer", "reject", "hangup_mid")
 VALID_LANGUAGES = ("zh", "cantonese", "en")
 
@@ -59,6 +66,9 @@ def plan_timeline(scenario: str, *, ring_delay_s: float, lines: int) -> list[tup
     """纯函数:剧本 → [(event, at_s)] 时间线(event ∈ join/speak/leave/exit)。
 
     时间锚=进程启动时刻,ring_delay_s 模拟拨号到接通的响铃延迟。
+    reject 的 leave 时刻仅是「事件序列占位」——run() 对 DWELL_AFTER_CONNECT_S
+    命中的剧本改为锚**实际 connect 完成时刻**+dwell(见该常量注释),因为真正的
+    接通耗时不可能在纯函数里预知。
     """
     t = max(0.0, float(ring_delay_s))
     if scenario == "no_answer":
@@ -217,6 +227,11 @@ class MockCallee:
         speak_idx = 0
         joined = False
         for event, at in timeline:
+            if event == "leave" and args.scenario in DWELL_AFTER_CONNECT_S:
+                # reject 档:leave 锚实际 connect 完成时刻(见 DWELL_AFTER_CONNECT_S),
+                # 不按计划 join 时刻——connect 耗时 ≥0.5s 时计划锚会抢在 agent 监听
+                # 注册前离房,reject 被误判 answered。
+                return await self._leave_after_dwell(DWELL_AFTER_CONNECT_S[args.scenario])
             if not await self._sleep_until(at):
                 return 0  # 房间已断开(被删/agent 收线)
             self._emit(event, at)
@@ -236,6 +251,14 @@ class MockCallee:
                 return 0
         if joined:
             await self._leave()
+        return 0
+
+    async def _leave_after_dwell(self, dwell_s: float) -> int:
+        """connect 完成后停留 dwell_s 再离房(时序窗锚实际接通时刻,恒定)。"""
+        await asyncio.sleep(max(0.0, dwell_s))
+        self._emit("leave", time.monotonic() - self._start)
+        await self._leave()
+        self._left.set()
         return 0
 
 

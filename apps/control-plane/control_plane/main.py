@@ -1216,6 +1216,11 @@ def spawn_mock_callee(req: MockCalleeRequest) -> dict:
             )
     except OSError as exc:
         raise HTTPException(500, f"failed to spawn mock callee: {exc}") from exc
+    # 确定性收尸(pregen._spawn_detached 同款):不排 daemon reaper 的话,子进程
+    # 退出后留僵尸直到进程表被别处顺手 wait —— mock 被叫每次拨号一发,长跑会累积。
+    import threading
+
+    threading.Thread(target=proc.wait, daemon=True, name=f"mock-callee-reap-{proc.pid}").start()
     _audit("sip.mock_callee_spawn", subject_type="room", subject_id=req.room,
            account_id="acc-001",
            detail={"scenario": req.scenario, "pid": proc.pid, "identity": identity})
