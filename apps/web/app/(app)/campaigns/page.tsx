@@ -48,24 +48,33 @@ export default function CampaignsPage() {
   }, [reload]);
 
   // 已展开详情的轮询：只对展开过的战役续拉（列表本身不带 items）。
+  // running 门控：无 running 战役（null/全 draft/done/stopped）时整轮 skip，停栈态不再打 CP。
   useEffect(() => {
     const ids = Object.keys(detail);
     const t = setInterval(() => {
+      if (!list?.some((c) => c.status === "running")) return;
       void reload();
       for (const id of ids) {
+        if (detail[id]?.status !== "running") continue;
         void api.getCampaign(id).then((d) =>
           setDetail((prev) => ({ ...prev, [id]: d as Campaign }))).catch(() => {});
       }
     }, 3000);
     return () => clearInterval(t);
-  }, [reload, detail]);
+  }, [reload, detail, list]);
 
   const create = async () => {
     setBusy(true);
     setErr("");
     try {
       await api.createCampaign(form);
-      setForm({ ...EMPTY_FORM, object_ids: [], template_id: form.template_id, persona_id: form.persona_id });
+      // 只清「本波特有的」名称与名单；话术/人设/语言/间隔是跨波复用意图，
+      // 尤其 language——连建粤语波回落 zh 会静默误拨错语言。
+      setForm({
+        ...EMPTY_FORM,
+        template_id: form.template_id, persona_id: form.persona_id,
+        language: form.language, gap_seconds: form.gap_seconds,
+      });
       await reload();
     } catch (e) {
       setErr(String(e));
