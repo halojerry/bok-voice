@@ -1023,6 +1023,30 @@ def report_whatsapp(call_id: str, req: WhatsAppCaptureRequest) -> dict:
         if number:
             fields["customer_whatsapp"] = number
     updated = _repo().update_call(call_id, **fields) or call
+    if number:
+        # 名册自动入册（Wave1）：captured 带号码 → upsert；channel 归一——
+        # 优先 agent 上报（客户原话渠道词），缺省按对象 contact_channel 推断。
+        channel = (req.channel or "").strip().lower()
+        if channel not in ("whatsapp", "wechat"):
+            obj_channel = ""
+            if call.get("object_id"):
+                obj = _repo().get_object(call.get("object_id")) or {}
+                obj_channel = str(obj.get("contact_channel") or "")
+            channel = "wechat" if "微信" in obj_channel or "wechat" in obj_channel.lower() else "whatsapp"
+        display_name = ""
+        summary = ""
+        try:
+            obj = _repo().get_object(call.get("object_id") or "") or {}
+            display_name = str(obj.get("display_name") or "")
+            settlement = _repo().get_settlement(call_id) or {}
+            summary = str(settlement.get("summary") or "")[:300]
+        except Exception:
+            pass
+        _repo().upsert_roster_entry(
+            account_id=call.get("account_id", "acc-001"), call_id=call_id,
+            object_id=call.get("object_id", ""), channel=channel, number=number,
+            display_name=display_name, summary=summary,
+        )
     _audit("call.whatsapp_captured", subject_type="call", subject_id=call_id,
            account_id=call.get("account_id", "acc-001"),
            detail={"status": fields["whatsapp_status"], "number": (number or "")[:3] + "***"})

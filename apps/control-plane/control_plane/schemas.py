@@ -176,6 +176,7 @@ class WhatsAppCaptureRequest(BaseModel):
     """Agent 偵測到客戶俾 WhatsApp:number 有值=captured(客戶讀出號碼),空=offered(應承加專員)。"""
 
     number: str = ""
+    channel: str = ""  # whatsapp | wechat,缺省由 CP 按对象 contact_channel 推断
 
 
 class WhatsAppHandledRequest(BaseModel):

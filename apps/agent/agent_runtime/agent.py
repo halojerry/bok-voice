@@ -1196,7 +1196,7 @@ async def entrypoint(ctx):
     from .flow import FlowController, facts_line
     from .flow import CONFIRM, OBJECTION, QUESTION, REFUSE, UNCLEAR, detect_whatsapp_signal, extract_call_facts
     from .flow import _digit_normalize, _looks_like_whatsapp_step, _WHATSAPP_DECLINE, digits_to_cantonese
-    from .flow import wa_confirm_advance_allowed
+    from .flow import channel_from_text, wa_confirm_advance_allowed
 
     flow_ctrl = FlowController.from_template(template, object_card)
     _log_stage("context_resolved")
@@ -1266,6 +1266,9 @@ async def entrypoint(ctx):
     # WA 号码碎片累积:客户逐位/逐段报号时暂存半截句(见 on_user_turn_completed
     # 内 _WA_ACCUM 注释)。text=暂存拼接,ts=最后一段时刻,task=超时 flush 任务。
     _wa_accum: dict = {"text": "", "ts": 0.0, "task": None}
+    # 捕获渠道账本:flush 时原句已不在作用域,检测处(channel_from_text)记落嚟随
+    # 上报透传,名册 channel 数据源。缺省 whatsapp(对象 contact_channel 缺省同款)。
+    _wa_channel: dict = {"v": "whatsapp"}
 
     def _cancel_wa_accum_flush() -> None:
         task = _wa_accum.get("task")
@@ -1300,7 +1303,7 @@ async def entrypoint(ctx):
                 if num and num not in _wa_reported:
                     _wa_reported.add(num)
                     try:
-                        await cp.report_whatsapp(call_id, num)
+                        await cp.report_whatsapp(call_id, num, channel=_wa_channel["v"])
                     except Exception as exc:  # pragma: no cover - 上报失败唔阻确认
                         _wa_reported.discard(num)
                         print(f"[whatsapp] accumulate report failed: {exc!r} (call {room_name})", flush=True)
@@ -2375,6 +2378,9 @@ async def entrypoint(ctx):
                     if _stash_it:
                         _wa_accum["text"] = _merged
                         _wa_accum["ts"] = time.monotonic()
+                        # 渠道账本:客户讲嘅渠道词可能喺本段或在途,随合并文本更新;
+                        # flush 时只读账本(原句已唔喺作用域)。
+                        _wa_channel["v"] = channel_from_text(_merged)
                         _arm_wa_accum_flush()
                         print(
                             f"[whatsapp] accumulate chars={len(user_text)} total_digits={_n} (call {room_name})",
@@ -2397,6 +2403,8 @@ async def entrypoint(ctx):
                         user_text, step_goal=_g, step_ref=_r, facts=flow_ctrl.vars_map,
                         already_captured=_wa_captured["on"],
                     )
+                    _wa_ch = channel_from_text(user_text)
+                    _wa_channel["v"] = _wa_ch
                     if _wa_signal:
                         _kind, _num = _wa_signal
                         if _kind in ("captured", "captured_implicit"):
@@ -2414,7 +2422,7 @@ async def entrypoint(ctx):
 
                             async def _report():
                                 try:
-                                    await cp.report_whatsapp(call_id, _num)
+                                    await cp.report_whatsapp(call_id, _num, channel=_wa_ch)
                                 except Exception as exc:  # pragma: no cover
                                     # 上报失败唔好永久丢:清 key,後續輪再偵測到會補報
                                     # (server 幂等,重複 POST 唔會造成重複爆閃)。

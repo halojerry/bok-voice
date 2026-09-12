@@ -264,6 +264,16 @@ _WHATSAPP_DECLINE = re.compile(r"(冇whatsapp|冇用whatsapp|無whatsapp|唔用w
     r"没微信|没有微信|不用微信|不加微信|没whatsapp|没有whatsapp|不用whatsapp|"
     r"no whatsapp|don'?t (use|have) whatsapp|not on whatsapp|can'?t (add|use) whatsapp|"
     r"唔方便加|冇得加|無得加|唔識加|唔加|唔想加|冇電話|無電話)", re.IGNORECASE)
+# 捕获渠道判定：客户报号码句里讲嘅係微信定 WhatsApp——微信系词命中 → wechat,
+# 否则 whatsapp（缺省主渠道,与对象 contact_channel 缺省一致）。名册 channel 数据源。
+_WECHAT_MARK = re.compile(r"(微信|wechat|we\s?chat)", re.IGNORECASE)
+
+
+def channel_from_text(user_text: str) -> str:
+    """捕获号码时客户讲的渠道：微信系词 → wechat，否则 whatsapp。"""
+    return "wechat" if _WECHAT_MARK.search(user_text or "") else "whatsapp"
+
+
 # offered 两路:①明確叫加(你加我/我加/加咗/搵我/發俾我);②纯短应承(成句好短,唔係答其他内容)。
 _WHATSAPP_ADD_VERB = re.compile(r"(你(哋|地)?加我|加我|我加咗|我加|加咗|加啦|加喇|搵我|你(哋|地)?發俾我|發俾我|快啲加|嚟加)", re.IGNORECASE)
 # 俾號語境:「我俾個號你 / 俾號碼你」→ 唔好淨靠 號碼/号码 字眼(「俾個號」冇「碼」都會走漏)。

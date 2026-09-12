@@ -115,15 +115,16 @@ class ControlPlaneClient:
         r.raise_for_status()
         return r.json()
 
-    async def report_whatsapp(self, call_id: str, number: str = "") -> None:
+    async def report_whatsapp(self, call_id: str, number: str = "", channel: str = "") -> None:
         """上報偵測到客戶俾 WhatsApp。number 有值=captured,空=offered。fire-and-forget。
 
-        raise_for_status 俾 caller 知失敗(清 key 等下次偵測補報)——server 幂等,
-        重複 POST 唔會造成重複爆閃。
+        channel=客户原话渠道词(whatsapp|wechat,flow.channel_from_text),空则由 CP
+        按对象 contact_channel 推断(名册入册用)。raise_for_status 俾 caller 知失敗
+        (清 key 等下次偵測補報)——server 幂等,重複 POST 唔會造成重複爆閃。
         """
         r = await self._client.post(
             f"/api/calls/{call_id}/whatsapp",
-            json={"number": number},
+            json={"number": number, "channel": channel},
         )
         r.raise_for_status()
 
