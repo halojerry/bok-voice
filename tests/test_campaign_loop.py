@@ -116,7 +116,9 @@ def test_tick_dial_block_carries_script_for_object():
         for i in range(2)
     ]
     lines = ["你好", "我WhatsApp係", "六四三二零一一一"]
-    # gap 置 0：本用例只验 dial 块内容，第二通起拨不被冷却挡住（冷却另有专测）。
+    # gap 置 0 实际仍兜 5s（`_gap_seconds()` 对 0/空值兜 DEFAULT_GAP_SECONDS）——
+    # 第二通能起拨是靠下面把首件终态的 updated_at 手动拨回过期锚，不是靠 gap=0。
+    # 冻结冷却语义另有 test_gap_seconds_delays_next_call 专测。
     c = repo.create_campaign("acc-001", name="t", template_id="", persona_id="",
                              language="zh", gap_seconds=0,
                              object_ids=[o["id"] for o in objs],

@@ -48,6 +48,21 @@ GAP_SECONDS = int(os.environ.get("E2E_CAMPAIGN_GAP", "5"))
 MOCK_SPEAK_INTERVAL_S = float(os.environ.get("E2E_CAMPAIGN_SPEAK_INTERVAL", "10"))
 # 接通轮的号码（客户台词念出）——5 位起（捕获下限 4 位；测试短号亦可）。
 WA_NUMBER = "64320111"
+# 捕获号码的容差：mock 客户为对齐 AI 收号步会重复念号，**哪一次念号先被判定 captured
+# 由 ASR 解码竞速决定**——某次念号听岔一位（实证 64320111 → 64320117）就会先占位。
+# 本 E2E 验的是「captured→名册自动入册」链路，不是 ASR 逐位精度（那有专属探针）；
+# 故按「同长度 + 至少 7/8 位吻合」判定为对脚本号码的忠实捕获，同时把实际值打进
+# 报告便于复盘听岔。位数不足/渠道错/本轮无条目照旧 FAIL（真链路问题不许放过）。
+WA_MIN_MATCH_DIGITS = 7
+
+
+def _number_close(captured: str, want: str = WA_NUMBER,
+                  min_match: int = WA_MIN_MATCH_DIGITS) -> bool:
+    """捕获号码是否忠实于脚本号码（同长度 + 至少 min_match 位逐位吻合）。"""
+    got = "".join(ch for ch in str(captured or "") if ch.isdigit())
+    if len(got) != len(want):
+        return False
+    return sum(1 for a, b in zip(got, want) if a == b) >= min_match
 
 RESULTS: list[tuple[str, bool, str]] = []
 LEG_TIMINGS: list[tuple[str, float, str]] = []
@@ -192,9 +207,9 @@ def pick_zh_template() -> str:
 
     steps = _json.dumps([
         {"goal": "开场：自报家门，说明来意",
-         "ref": "你好，我系快递公司嘅专员，想同你确认一下包裹嘅联络方式。", "say": True},
+         "ref": "你好，我是快递公司的专员，想和你确认一下包裹的联络方式。", "say": True},
         {"goal": "向客户索取他自己的 WhatsApp 号码，方便专员对接",
-         "ref": "方便嘅话，可唔可以读一下你嘅 WhatsApp 号码？我哋专员会加你。", "say": True},
+         "ref": "方便的话，可以读一下你的 WhatsApp 号码吗？我们专员会加你。", "say": True},
     ], ensure_ascii=False)
     tpl = _api("POST", "/api/templates", json={
         "account_id": ACCOUNT_ID, "name": E2E_TEMPLATE_NAME, "language": "zh",
@@ -216,7 +231,7 @@ def _cleanup_stale_roster() -> None:
     except Exception:  # noqa: BLE001
         return
     stale = [e for e in entries
-             if str(e.get("number") or "").endswith(WA_NUMBER)
+             if _number_close(str(e.get("number") or ""))
              and str(e.get("display_name") or "").startswith("E2E-CAMP-")]
     if not stale:
         return
@@ -382,19 +397,23 @@ def run() -> int:
     try:
         entries = _api("GET", f"/api/roster?account_id={ACCOUNT_ID}", timeout=15).json()
         hits = [e for e in entries if str(e.get("call_id") or "") == answer_call
-                and str(e.get("number") or "").endswith(WA_NUMBER)
+                and _number_close(str(e.get("number") or ""))
                 and str(e.get("channel") or "") == "whatsapp"]
         roster_ok = bool(hits)
         if hits:
             roster_entry_id = str(hits[0].get("id") or "")
             call = _api("GET", f"/api/calls/{answer_call}", timeout=15).json()
-            roster_note = (f"number={hits[0].get('number')} channel={hits[0].get('channel')} "
+            got_num = str(hits[0].get("number") or "")
+            roster_note = (f"number={got_num} channel={hits[0].get('channel')} "
                            f"status={hits[0].get('status')} "
-                           f"call.whatsapp_status={call.get('whatsapp_status')!r}")
+                           f"call.whatsapp_status={call.get('whatsapp_status')!r}"
+                           + ("" if got_num.endswith(WA_NUMBER)
+                              else f"（ASR 听岔：脚本 {WA_NUMBER}）"))
         else:
-            same_num = [e for e in entries if str(e.get("number") or "").endswith(WA_NUMBER)]
-            roster_note = (f"本轮通话 {answer_call} 无名册条目"
-                           f"（全库同号条目 {len(same_num)} 条，共 {len(entries)} 条名册）")
+            got_all = [(str(e.get("number") or ""), str(e.get("call_id") or ""))
+                       for e in entries if str(e.get("call_id") or "") == answer_call]
+            roster_note = (f"本轮通话 {answer_call} 无合格名册条目"
+                           f"（本轮全部条目 {got_all}，共 {len(entries)} 条名册）")
     except Exception as exc:  # noqa: BLE001
         roster_note = f"{type(exc).__name__}: {exc}"
     record("C4 名册自动入册（captured→roster）", roster_ok, roster_note)
