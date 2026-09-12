@@ -87,7 +87,14 @@ async def _dial_real(ctx, *, number: str, trunk_id: str, ringing_timeout_s: floa
         code = int(getattr(exc, "sip_status_code", 0) or 0)
         return DialOutcome(status=map_sip_status_code(code), participant_identity=identity,
                            detail=f"{type(exc).__name__}: {exc}")
-    await _wait_participant(ctx, identity, 10.0)
+    try:
+        await _wait_participant(ctx, identity, 10.0)
+    except (TimeoutError, asyncio.TimeoutError):
+        # 竞态:T5 审查遗留——CreateSIPParticipant(wait_until_answered) 返回后 participant
+        # 已被 dismantle/未落地时 wait_for_participant 会超时。统一四态出口铁律:
+        # 任何异常不得逸出 dial_outbound,超时按 FAILED(振铃已过、人未在房=接线落地失败)。
+        return DialOutcome(status=OUT_FAILED, participant_identity=identity,
+                           detail="participant not in room after answer")
     return DialOutcome(status=OUT_ANSWERED, participant_identity=identity)
 
 

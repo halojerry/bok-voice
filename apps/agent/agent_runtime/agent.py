@@ -1192,6 +1192,78 @@ async def entrypoint(ctx):
     except Exception as e:
         print(f"[agent] context resolve failed ({room_name}): {e}", flush=True)
 
+    # ---- 外呼模式（spec 2026-09-12 Wave2）:metadata 带 dial 块 → 先拨号、接通才装配。
+    # 官方两段式:agent 先入房 → CreateSIPParticipant(或 CP 派生 mock 客户)→
+    # wait_for_participant → 才 session.start(开场白时序=接通后)。
+    # 官方铁律:no_answer/failed 两态 RoomIO 不自动收线 —— 必须手动 ctx.shutdown(),
+    # 且删房(房间不删的话真电话对端会一直听静音)。
+    _dial = dict(_job_meta.get("dial") or {})
+    if _dial:
+        from .dialer import OUT_ANSWERED, dial_outbound, resolve_dial_mode
+
+        _dial_settings: dict = {}
+        try:
+            _dial_settings = await cp.get_settings()
+        except Exception as e:
+            print(f"[agent] dial settings resolve failed ({room_name}): {e}", flush=True)
+        # metadata 显式 mode 优先(编排/测试钉死后端);缺省 env kill-switch→settings→mock。
+        _dial_mode = str(_dial.get("mode") or "").strip().lower()
+        if _dial_mode not in ("mock", "real"):
+            _dial_mode = resolve_dial_mode(os.environ, _dial_settings or {})
+        try:
+            _outcome = await dial_outbound(
+                ctx, number=str(_dial.get("to") or ""), mode=_dial_mode, cp_base=cp_base,
+                call_id=call_id, scenario=str(_dial.get("scenario") or ""),
+                language=str(_dial.get("language") or ""),
+                trunk_id=str(_dial.get("trunk_id") or ""),
+            )
+        except Exception as e:  # dial_outbound 契约=四态出口,此处仅最后兜底防逸出
+            from .dialer import DialOutcome, OUT_FAILED
+
+            _outcome = DialOutcome(status=OUT_FAILED, detail=f"{type(e).__name__}: {e}")
+        print(f"[dial] outcome={_outcome.status} detail={_outcome.detail} "
+              f"(call {room_name})", flush=True)
+        try:
+            await cp.report_dial_result(call_id, _outcome.status, _outcome.detail)
+        except Exception as exc:  # noqa: BLE001 - 上报失败不阻收线
+            print(f"[dial] report failed: {exc!r} (call {room_name})", flush=True)
+        if _outcome.status != OUT_ANSWERED:
+            # 收线三连:通话置终态 → 删房 → ctx.shutdown()。
+            try:
+                await cp.end_call(call_id, disposition=_outcome.status)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[dial] end_call failed: {exc!r} (call {room_name})", flush=True)
+            try:
+                from livekit.api import DeleteRoomRequest
+
+                await ctx.api.room.delete_room(DeleteRoomRequest(room=ctx.room.name))
+            except Exception as exc:  # noqa: BLE001
+                print(f"[dial] delete_room failed: {exc!r} (call {room_name})", flush=True)
+            ctx.shutdown()
+            return
+        # mock 档时长保险丝:mock 客户无通信运营商侧挂断,靠本地计时器兜底收线
+        # (real 档由 CreateSIPParticipant 的 API 参数承担,不重复挂)。
+        _fuse_s = float(_dial.get("max_call_duration_s") or 0)
+        if _dial_mode == "mock" and _fuse_s > 0:
+
+            async def _duration_fuse() -> None:
+                await asyncio.sleep(_fuse_s)
+                print(f"[dial] duration fuse fired (call {room_name})", flush=True)
+                try:
+                    await cp.end_call(call_id, disposition="completed")
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[dial] fuse end_call failed: {exc!r} (call {room_name})",
+                          flush=True)
+                from livekit.api import DeleteRoomRequest
+
+                try:
+                    await ctx.api.room.delete_room(DeleteRoomRequest(room=ctx.room.name))
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[dial] fuse delete_room failed: {exc!r} (call {room_name})",
+                          flush=True)
+
+            asyncio.create_task(_duration_fuse())
+
     # 对话流程控制器:载入模板分步 + 对象变量;由它按轮注入"当前步",逐步推进。
     from .flow import FlowController, facts_line
     from .flow import CONFIRM, OBJECTION, QUESTION, REFUSE, UNCLEAR, detect_whatsapp_signal, extract_call_facts

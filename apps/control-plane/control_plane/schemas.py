@@ -185,6 +185,16 @@ class WhatsAppHandledRequest(BaseModel):
     handled: bool = True
 
 
+class DialResultRequest(BaseModel):
+    """Agent 外呼拨号结果上报（spec Wave2）：answered→ACTIVE；三失败态→ENDED+disposition。
+
+    status 空/未知 = no-op（幂等，不误伤尚在 RINGING 的通话）。
+    """
+
+    status: str = ""  # answered | no_answer | rejected | failed
+    detail: str = ""
+
+
 class RosterClaimRequest(BaseModel):
     """名册认领：claimed_by 缺省 acc-001（本机单账号形态）。"""
 

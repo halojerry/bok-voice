@@ -23,6 +23,10 @@ from bok_voice_core.policies import select_session_manifest
 from bok_voice_core.qa_text import mine_qa_pairs
 from bok_voice_core.types import CallMode, CallStatus, Role, SessionManifest, TurnEvent
 
+# 通话终态集合：抽取到模块级（原定义在下方重派段，dial-result 等端点复用）。
+# 只含真终态——CallStatus.FAILED 是通话级失败终态(与拨号失败 disposition="failed" 同名不同义)。
+_TERMINAL_CALL_STATUSES = (CallStatus.ENDED.value, CallStatus.FAILED.value)
+
 from bok_voice_core.settlement import SettlementTrigger
 from bok_voice_core.embeddings import CharHashEmbedding, HybridLexicalEmbedding
 from bok_voice_knowledge.knowledge import DefaultKnowledgeService
@@ -42,6 +46,7 @@ from .schemas import (
     CreateCallRequest,
     CreateObjectRequest,
     ImportRequest,
+    DialResultRequest,
     PersonaRequest,
     QaEntryCreate,
     QaEntryPatch,
@@ -1057,6 +1062,33 @@ def report_whatsapp(call_id: str, req: WhatsAppCaptureRequest) -> dict:
     return updated
 
 
+@app.post("/api/calls/{call_id}/dial-result")
+def report_dial_result(call_id: str, req: DialResultRequest) -> dict:
+    """Agent 外呼拨号结果上报:answered→ACTIVE;三失败态→ENDED+disposition。
+
+    幂等：已终态(ended/failed)的通话直接原样返回，不复活也不改写 disposition
+    （重派/重复上报时 4B 侧时序抖动不会把已收线的通话抬回 ACTIVE）。
+    status 空/未知同样 no-op（仍记审计，便于排查上游漏配）。
+    """
+    call = _repo().get_call(call_id)
+    if not call:
+        raise HTTPException(404, "call not found")
+    if str(call.get("status") or "") in _TERMINAL_CALL_STATUSES:
+        return call
+    status = str(req.status or "").strip()
+    if status == "answered":
+        updated = _repo().update_call(call_id, status=CallStatus.ACTIVE.value) or call
+    elif status in ("no_answer", "rejected", "failed"):
+        updated = _repo().update_call(call_id, status=CallStatus.ENDED.value,
+                                      disposition=status) or call
+    else:
+        updated = call
+    _audit("call.dial_result", subject_type="call", subject_id=call_id,
+           account_id=str(call.get("account_id", "acc-001")),
+           detail={"status": status, "detail": (req.detail or "")[:120]})
+    return updated
+
+
 @app.post("/api/calls/{call_id}/whatsapp/handled")
 def mark_whatsapp_handled(call_id: str, req: WhatsAppHandledRequest) -> dict:
     """專員喺操作台標記已對接 → status=handled,爆閃停止(AI 通話不受影響)。"""
@@ -1855,7 +1887,6 @@ async def ingest_session_report(call_id: str, request: Request) -> dict:
 
 # 重派防复活门:终态通话(或记录已删)不得重派——为死通话新建的 dispatch 无
 # 回收路径(reaper 只扫 ACTIVE/PAUSED),agent 会被带进空房念开场白。
-_TERMINAL_CALL_STATUSES = (CallStatus.ENDED.value, CallStatus.FAILED.value)
 # 重派重试排程(秒):等 livekit 把死 worker 的 job 判 FAILED / dispatch 服务恢复。测试可注入。
 _REDISPATCH_RETRY_SCHEDULE = (0.0, 10.0, 25.0)
 # per-room 重派锁:串行化「has_active_dispatch 检查 + create_dispatch」临界区,

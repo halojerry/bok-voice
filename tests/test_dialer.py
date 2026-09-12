@@ -149,6 +149,29 @@ def test_dial_real_answered():
     assert out.participant_identity == "sip-123"
 
 
+class _RealCtxNeverJoins(_RealCtx):
+    """CreateSIPParticipant 成功但 participant 落地前被拆/未进房 → wait 超时。"""
+
+    async def wait_for_participant(self, identity=None, kind=None):
+        await asyncio.sleep(30)
+
+
+def test_dial_real_participant_wait_timeout_is_failed(monkeypatch):
+    # T5 审查遗留:wait_for_participant 的 TimeoutError 曾逸出 dial_outbound,
+    # 违背「统一四态出口」。修复后包成 OUT_FAILED(_wait_participant 走 wait_for 回退,
+    # 故把超时压到 0 避免单测真等 10s)。
+    from agent_runtime import dialer
+    monkeypatch.setattr(dialer, "_wait_participant",
+                        lambda ctx, identity, timeout: asyncio.wait_for(
+                            ctx.wait_for_participant(identity=identity), 0.05))
+    ctx = _RealCtxNeverJoins(None)
+    out = asyncio.run(_dial_real(ctx, number="123", trunk_id="t1",
+                                 ringing_timeout_s=30.0))
+    assert isinstance(out, DialOutcome)
+    assert out.status == OUT_FAILED
+    assert out.participant_identity == "sip-123"
+
+
 # ---- mock 后端：spawn HTTP / 进房超时 / 接通前离房 ----
 
 class _MockRoom:

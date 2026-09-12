@@ -128,6 +128,18 @@ class ControlPlaneClient:
         )
         r.raise_for_status()
 
+    async def report_dial_result(self, call_id: str, status: str, detail: str = "") -> None:
+        """上报外呼拨号结果(spec Wave2):answered→CP 置 ACTIVE;三失败态→ENDED+disposition。
+
+        server 幂等(已终态原样返回);raise_for_status 俾 caller 知失败——失败收线另有
+        ctx.shutdown()+删房兜底,上报失败唔阻收线。
+        """
+        r = await self._client.post(
+            f"/api/calls/{call_id}/dial-result",
+            json={"status": status, "detail": detail},
+        )
+        r.raise_for_status()
+
     async def list_qa_entries(self, account_id: str = "acc-001") -> list[dict]:
         """快答库启用条目(Q→A 快路,PR-3):每通装配拉一次,变更下一通生效。"""
         r = await self._client.get("/api/qa-entries", params={"account_id": account_id, "enabled": 1})
