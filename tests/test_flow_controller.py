@@ -526,9 +526,11 @@ def test_legacy_four_sections_become_steps():
 
     fc = FlowController.from_template(LEGACY_TPL, OBJ)
     assert fc.has_steps
-    assert "第 1/4 步" in fc.current_step_text()
-    # 开场步的 ref 是 opening 全文
-    assert "你好请问" in fc.current_step_text()
+    txt = fc.current_step_text()
+    assert "第 1/4 步" in txt
+    # 开场步的 ref 是 opening 全文(渐进披露:每步首轮渲染注入底稿,二次调用
+    # 已转分支模式——单次捕获断言)
+    assert "你好请问" in txt
 
 
 def test_legacy_steps_advance_one_by_one():
@@ -549,7 +551,9 @@ def test_legacy_steps_advance_one_by_one():
 
 
 def test_current_step_explicit_no_leak_instruction():
-    # 当前步注入须明确区分"参考要点(内部)"与"对客户说的话",禁止复述分支指示。
+    # 当前步注入须明确区分"内部底稿"与"对客户说的话",禁止复述分支指示;
+    # 渐进披露后分支不再以「如果客户X→就Y」原文形态进 prompt(只改写成
+    # 【应对客户当前回应】单条),命中分支的应对内容本身照给。
     from agent_runtime.flow import FlowController
 
     fc = FlowController.from_template(
@@ -557,9 +561,14 @@ def test_current_step_explicit_no_leak_instruction():
         OBJ,
     )
     txt = fc.current_step_text()
-    assert "勿念给客户" in txt
-    assert "绝不把「如果" in txt
-    assert "参考要点(内部指示" in txt
+    assert "内部资料" in txt  # 底稿明确标记为内部
+    assert "绝不逐字念" in txt  # 禁止逐字念出
+    assert "如果客户" not in txt  # 分支指示原文不进(首轮无分支)
+    fc.last_verdict = "unclear"
+    fc.last_user_text = "我唔记得了"
+    txt2 = fc.current_step_text()
+    assert "提佢地址帮佢回忆" in txt2  # 命中分支的应对照注入
+    assert "如果客户" not in txt2  # 但分支指示原文形态不进
 
 
 # ---- 明确拒绝 → REFUSE(一句礼貌收尾 + 主动结束通话) ----
@@ -922,3 +931,36 @@ def test_repeat_guidance_renders():
     # REPEAT 唔触发【新一步】(冇 advance 发生);QUESTION 指引照旧禁复读(非重复语境)
     fc2.last_verdict = QUESTION
     assert "绝不重复" in fc2.current_step_text()
+
+
+def test_say_step_loose_semantics_scoped_to_notification_step():
+    # 2026-09-12 call-8fa17d2b:赔偿直念步(say=1,承诺型问句「可以接受吗」)吃到
+    # 通知步的宽松推进语义——UNCLEAR 语气点评「呃，自然多了」假推进 step4→5。
+    # 修复:say_step 由调用方只对通知型步(goal 含「通知」)传 True;此测试钉死
+    # 流程层契约:赔偿步传 say_step=False 时 UNCLEAR 唔推。
+    from agent_runtime.flow import should_auto_advance
+
+    g4 = "赔偿标准:核实订单金额后按三档标准讲赔偿,问客户是否接受"
+    r4 = "首先，我们会先核实您这件货品的订单金额…您看这个方案可以接受吗？"
+    assert should_auto_advance(current=3, goal=g4, ref=r4, user_text="呃，自然多了", verdict="unclear", say_step=False) is False
+    # 真确认经 agent 的 rule=confirm 分支推进(wa_confirm_advance_allowed 放行)
+    from agent_runtime.flow import wa_confirm_advance_allowed
+
+    assert wa_confirm_advance_allowed(goal=g4, ref=r4, captured=False) is True
+    # 通知步(调用方会传 say_step=True)宽松语义照旧
+    g2 = "来电通知:自报家门,通知货件遗失,问客户记不记得货品"
+    assert should_auto_advance(current=1, goal=g2, ref="我哋係…記唔記得?", user_text="啊，不记得了。", verdict="unclear", say_step=True) is True
+
+
+def test_judge_confirm_gate_blocks_ackless_long_utt():
+    # call-8fa17d2b:长 UNCLEAR 轮被 judge 误判 confirm——问句步(赔偿接受吗)
+    # 无应承特征的长句拦下;短句与真应承放行;非问句步(通知)保持宽松。
+    from agent_runtime.flow import judge_confirm_advance_allowed
+
+    g4 = "赔偿标准:核实订单金额后按三档标准讲赔偿,问客户是否接受"
+    r4 = "首先，我们会先核实您这件货品的订单金额…您看这个方案可以接受吗？"
+    assert judge_confirm_advance_allowed(goal=g4, ref=r4, user_text="他这个就过来了。") is False
+    assert judge_confirm_advance_allowed(goal=g4, ref=r4, user_text="可以，就这样赔偿吧") is True
+    assert judge_confirm_advance_allowed(goal=g4, ref=r4, user_text="行") is True  # 短句
+    g2 = "来电通知:自报家门,通知货件遗失"  # 非问句步(无？)
+    assert judge_confirm_advance_allowed(goal=g2, ref="我哋係集運中轉倉…", user_text="随便讲点什么都很长的一段话") is True

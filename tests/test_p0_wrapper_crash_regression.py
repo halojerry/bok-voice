@@ -234,3 +234,41 @@ def test_asr_live_stream_speech_frames_reach_pending():
     # 修复前走不到这里：_run 在 INFERENCE_DONE 处 TypeError,流异常终止。
     assert bytes(stream._pending) == b"\x01\x00" * 8 + b"\x02\x00" * 8, bytes(stream._pending)[:32]
     assert fake_vad.last_stream.pushed  # 输入帧确实经 forward 进了 VAD
+
+
+def test_start_of_speech_preroll_frames_reach_pending():
+    from agent_runtime.providers.livekit_plugins import _Qwen3ASRLiveStream
+
+    """快语速吃首字修复(2026-09-12):官方 VAD 把 prefix padding(0.5s)+min_speech
+    确认窗音频挂在 START 事件 frames 里交还——增量会话必须并入 _pending,否则
+    sidecar 从「确认说话」那刻才收音频,快语速首 1-3 字结构性缺失、finish 救不回。"""
+    pre = rtc.AudioFrame(data=b"\x03\x00" * 8, sample_rate=16000, num_channels=1, samples_per_channel=8)
+    events = [
+        vad.VADEvent(
+            type=vad.VADEventType.START_OF_SPEECH,
+            samples_index=0,
+            timestamp=0.0,
+            speech_duration=0.15,
+            silence_duration=0.0,
+            frames=[pre],
+        ),
+    ]
+    fake_vad = _FakeVAD(events)
+
+    async def _run():
+        stream = _Qwen3ASRLiveStream(
+            _fake_stt_backend(),
+            vad=fake_vad,
+            conn_options=APIConnectOptions(),
+        )
+        stream.push_frame(pre)
+        stream.end_input()
+        got = []
+        async for ev in stream:
+            got.append(ev.type)
+            if len(got) > 4:  # noqa: PLR2004 - 防御性上限
+                break
+        return stream
+
+    stream = asyncio.run(asyncio.wait_for(_run(), timeout=15))
+    assert bytes(stream._pending).startswith(b"\x03\x00"), bytes(stream._pending)[:16]
