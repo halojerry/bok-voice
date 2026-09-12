@@ -662,9 +662,12 @@ class SqlAlchemyBusinessRepository:
                 # claimed_at 读侧是 ISO 字符串（_roster_to_dict），调用方做读改写时
                 # 会把字符串传回来；SQLite/Postgres DateTime 列只收 datetime，
                 # 不收会抛 StatementError——与 InMemory 侧字符串直存对齐语义。
+                # 空串=未认领行的读侧契约（_roster_to_dict 输出 ""），须映射回
+                # None 存 NULL，否则 fromisoformat("") 抛 ValueError。
                 value = fields[key]
-                if key == "claimed_at" and isinstance(value, str):
-                    value = datetime.fromisoformat(value)
+                if key == "claimed_at":
+                    if isinstance(value, str):
+                        value = datetime.fromisoformat(value) if value else None
                 setattr(row, key, value)
         self.session.commit()
         return self._roster_to_dict(row)
@@ -1096,5 +1099,9 @@ class InMemoryBusinessRepository:
         row = self.roster.get(entry_id)
         if not row:
             return None
-        row.update({k: v for k, v in fields.items() if v is not None})
+        # 与 SQL 侧同款白名单：未知键（含 id/created_at）忽略，防两后端分叉。
+        for key in ("call_id", "object_id", "channel", "number", "display_name",
+                    "summary", "status", "claimed_by", "claimed_at"):
+            if key in fields and fields[key] is not None:
+                row[key] = fields[key]
         return dict(row)

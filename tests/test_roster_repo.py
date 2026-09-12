@@ -135,3 +135,51 @@ def test_sqlalchemy_backend_parity(sql_repo):
     assert c["id"] != a["id"] and c["status"] == "unclaimed"
     assert sql_repo.get_roster_entry("missing") is None
     assert sql_repo.update_roster_entry("missing", status="claimed") is None
+
+
+def test_update_roster_entry_empty_claimed_at(sql_repo):
+    """未认领行读侧 claimed_at="", 表单读改写原样传回不能崩（SQL 后端）。"""
+    e = sql_repo.upsert_roster_entry(
+        account_id="acc-001", call_id="call-a", object_id="obj-1",
+        channel="whatsapp", number="64320111",
+    )
+    assert e["claimed_at"] == ""
+    got = sql_repo.update_roster_entry(
+        e["id"], status="claimed", claimed_by="acc-001",
+        claimed_at=e["claimed_at"],  # 空串回写
+    )
+    assert got["status"] == "claimed"
+    assert got["claimed_at"] == ""
+    # 真时间戳照常写入
+    stamped = sql_repo.update_roster_entry(
+        e["id"], claimed_at="2026-09-12T00:00:00+00:00")
+    assert stamped["claimed_at"]
+
+
+def test_update_roster_entry_ignores_unknown_keys():
+    """白名单外键（id/created_at）被忽略，两后端同语义。"""
+    repo = _repo()
+    e = repo.upsert_roster_entry(
+        account_id="acc-001", call_id="call-a", object_id="obj-1",
+        channel="whatsapp", number="64320111",
+    )
+    got = repo.update_roster_entry(
+        e["id"], status="claimed", id="hacked", created_at="1970-01-01T00:00:00",
+        bogus="x",
+    )
+    assert got["id"] == e["id"]
+    assert got["created_at"] == e["created_at"]
+    assert "bogus" not in got
+    assert got["status"] == "claimed"
+
+
+def test_inmemory_empty_claimed_at_roundtrip():
+    """InMemory 侧空串回写同样不崩且保持 ""（与 SQL 后端同契约）。"""
+    repo = _repo()
+    e = repo.upsert_roster_entry(
+        account_id="acc-001", call_id="call-a", object_id="obj-1",
+        channel="wechat", number="12345678",
+    )
+    assert e["claimed_at"] == ""
+    got = repo.update_roster_entry(e["id"], claimed_at=e["claimed_at"])
+    assert got["claimed_at"] == ""
