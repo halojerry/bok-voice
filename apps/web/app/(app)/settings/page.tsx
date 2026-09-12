@@ -23,11 +23,13 @@ import { friendlyErrorText } from "@/lib/api-ready";
 
 type ProviderForm = Record<string, unknown> & { provider?: string };
 
-const EMPTY_FORM: Record<ProviderKind, ProviderForm> & { policy: string } = {
+const EMPTY_FORM: Record<ProviderKind, ProviderForm> & { policy: string } & { sip: ProviderForm } = {
   asr: { provider: DEFAULT_PROVIDER.asr, language_mode: "auto", language: "" },
   llm: { provider: DEFAULT_PROVIDER.llm, local_model: "" },
   tts: { provider: DEFAULT_PROVIDER.tts, voice_mode: "single", speaker: "", sample_rate: 24000 },
   vad: { provider: DEFAULT_PROVIDER.vad, max_buffered_speech: 15, min_speech_duration: 0.15, min_silence_duration: 0.45, sensitivity: 0.75, interruption: true },
+  // 外呼（SIP）段：与 business-db default_settings()["sip"] 逐键同形。
+  sip: { mode: "mock", trunk_id: "", address: "", auth_username: "", auth_password: "", numbers: [], ringing_timeout_s: 30, max_call_duration_s: 600 },
   policy: "offline_first",
 };
 
@@ -196,7 +198,116 @@ function VoicePreview({ provider, fieldKey, voice }: { provider: string; fieldKe
   );
 }
 
+/** 外呼（SIP）卡片：mode 决定后端；real 档才显示 trunk/鉴权字段组。 */
+function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: ProviderForm) => void }) {
+  const base =
+    "mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)";
+  const mode = String(value.mode ?? "mock");
+  const set = (key: string, v: unknown) => onChange({ ...value, [key]: v });
+  const numbers = Array.isArray(value.numbers) ? (value.numbers as string[]) : [];
+  const hasPassword = Boolean(value.has_auth_password) || Boolean(value.auth_password);
+  return (
+    <section className="card">
+      <span className="label">外呼（SIP）</span>
+      <p className="mt-1 text-xs muted">
+        mock=本机派生真语音被叫（演示/E2E），real=经 SIP trunk 拨真号码。环境变量
+        <code className="mx-1">BOK_SIP_MODE</code>是运维级覆盖，设置后此处不生效。
+      </p>
+      <div className="mt-3 space-y-2">
+        <label className="block">
+          <span className="text-xs text-(--stage-muted)">拨号后端</span>
+          <select className={base} value={mode} onChange={(e) => set("mode", e.target.value)}>
+            <option value="mock">mock（本机派生被叫）</option>
+            <option value="real">real（SIP trunk 真拨号）</option>
+          </select>
+        </label>
+        {mode === "real" && (
+          <>
+            <label className="block">
+              <span className="text-xs text-(--stage-muted)">Trunk ID</span>
+              <input
+                className={base}
+                placeholder="ST_xxxxxxxx"
+                value={String(value.trunk_id ?? "")}
+                onChange={(e) => set("trunk_id", e.target.value)}
+              />
+              <p className="mt-1 text-xs muted">LiveKit SIP trunk 的 ID（sip_trunk_id）。</p>
+            </label>
+            <label className="block">
+              <span className="text-xs text-(--stage-muted)">SIP 地址 / 网关</span>
+              <input
+                className={base}
+                placeholder="sip.example.com"
+                value={String(value.address ?? "")}
+                onChange={(e) => set("address", e.target.value)}
+              />
+            </label>
+            <label className="block">
+              <span className="text-xs text-(--stage-muted)">鉴权用户名</span>
+              <input
+                className={base}
+                value={String(value.auth_username ?? "")}
+                onChange={(e) => set("auth_username", e.target.value)}
+              />
+            </label>
+            <label className="block">
+              <span className="text-xs text-(--stage-muted)">鉴权密码</span>
+              <input
+                type="password"
+                className={base}
+                placeholder={hasPassword ? "已保存（留空即不修改）" : ""}
+                value={String(value.auth_password ?? "")}
+                onChange={(e) => set("auth_password", e.target.value)}
+              />
+              <p className="mt-1 text-xs muted">留空保存=保留已存密码。</p>
+            </label>
+            <label className="block">
+              <span className="text-xs text-(--stage-muted)">许可主叫号（逗号分隔）</span>
+              <input
+                className={base}
+                placeholder="+8613800138000, +8613800138001"
+                value={numbers.join(", ")}
+                onChange={(e) =>
+                  set(
+                    "numbers",
+                    e.target.value
+                      .split(",")
+                      .map((n) => n.trim())
+                      .filter(Boolean),
+                  )
+                }
+              />
+            </label>
+          </>
+        )}
+        <div className="grid grid-cols-2 gap-2">
+          <label className="block">
+            <span className="text-xs text-(--stage-muted)">振铃超时（秒）</span>
+            <input
+              type="number"
+              className={base}
+              value={String(value.ringing_timeout_s ?? 30)}
+              onChange={(e) => set("ringing_timeout_s", Number(e.target.value))}
+            />
+          </label>
+          <label className="block">
+            <span className="text-xs text-(--stage-muted)">单通最长时长（秒）</span>
+            <input
+              type="number"
+              className={base}
+              value={String(value.max_call_duration_s ?? 600)}
+              onChange={(e) => set("max_call_duration_s", Number(e.target.value))}
+            />
+            <p className="mt-1 text-xs muted">mock 档由本地计时器兜底收线。</p>
+          </label>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function AudioDevicesCard() {
+
   const [mic, setMic] = useState<AudioDeviceInfo[]>([]);
   const [outs, setOuts] = useState<AudioDeviceInfo[]>([]);
   const [micId, setMicId] = useState("");
@@ -311,6 +422,7 @@ export default function SettingsPage() {
           llm: { ...EMPTY_FORM.llm, ...(s.llm ?? {}) },
           tts: { ...EMPTY_FORM.tts, ...(s.tts ?? {}) },
           vad: { ...EMPTY_FORM.vad, ...(s.vad ?? {}) },
+          sip: { ...EMPTY_FORM.sip, ...(s.sip ?? {}) },
           policy: s.policy ?? "offline_first",
         });
       })
@@ -327,6 +439,7 @@ export default function SettingsPage() {
         llm: { ...EMPTY_FORM.llm, ...form.llm },
         tts: { ...EMPTY_FORM.tts, ...form.tts },
         vad: { ...EMPTY_FORM.vad, ...form.vad },
+        sip: { ...EMPTY_FORM.sip, ...form.sip },
         policy: form.policy ?? "offline_first",
       };
       await api.saveSettings(payload);
@@ -366,6 +479,7 @@ export default function SettingsPage() {
             <ProviderCard key={kind} kind={kind} value={form[kind] ?? {}} onChange={(next) => setForm({ ...form, [kind]: next })} />
           ))}
           <AudioDevicesCard />
+          <SipCard value={form.sip ?? {}} onChange={(next) => setForm({ ...form, sip: next })} />
           <CannedAuditionCard />
           <section className="card">
             <span className="label">{POLICY_META.title}</span>

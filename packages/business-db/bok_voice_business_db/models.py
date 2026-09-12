@@ -192,6 +192,9 @@ class GlobalSetting(Base):
     llm_json: Mapped[str] = mapped_column(Text, default="{}")
     tts_json: Mapped[str] = mapped_column(Text, default="{}")
     vad_json: Mapped[str] = mapped_column(Text, default="{}")
+    # 外呼（SIP）配置段（spec 2026-09-12 Wave2）：mode/trunk/主叫号/超时/许可号码。
+    # 空串=老库尚未补列或从未保存 → 读侧回落 default_settings()["sip"]。
+    sip_json: Mapped[str] = mapped_column(Text, default="")
     policy: Mapped[str] = mapped_column(String(64), default="offline_first")
     updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
 

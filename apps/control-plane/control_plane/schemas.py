@@ -160,11 +160,32 @@ class ProviderSettings(BaseModel):
     sample_rate: int = 24000
 
 
+class SipSettingsModel(BaseModel):
+    """外呼（SIP）配置段（spec 2026-09-12 Wave2）。
+
+    mode=mock|real：mock=CP 派生真语音被叫（本地演示/E2E），real=官方
+    CreateSIPParticipant 走真 trunk。env `BOK_SIP_MODE` 是 kill-switch
+    （有值即终局，见 agent dialer.resolve_dial_mode），settings 只在 env
+    缺省时生效。auth_password 走 secret 掩码（GET 返回空串+has_ 标记，
+    PUT 传空=保留旧值）。
+    """
+
+    mode: str = "mock"
+    trunk_id: str = ""
+    address: str = ""
+    auth_username: str = ""
+    auth_password: str = ""
+    numbers: list[str] = []
+    ringing_timeout_s: int = 30
+    max_call_duration_s: int = 600
+
+
 class SettingsRequest(BaseModel):
     asr: ProviderSettings = ProviderSettings()
     llm: ProviderSettings = ProviderSettings()
     tts: ProviderSettings = ProviderSettings()
     vad: ProviderSettings = ProviderSettings()
+    sip: SipSettingsModel = SipSettingsModel()
     policy: str = "offline_first"
 
 

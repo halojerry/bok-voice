@@ -257,10 +257,11 @@ def put_settings(req: SettingsRequest) -> dict:
         "llm": req.llm.model_dump(),
         "tts": req.tts.model_dump(),
         "vad": req.vad.model_dump(),
+        "sip": req.sip.model_dump(),
         "policy": req.policy,
     }
-    secret_keys = {"api_key", "access_token", "token"}
-    for kind in ("asr", "llm", "tts", "vad"):
+    secret_keys = {"api_key", "access_token", "token", "auth_password"}
+    for kind in ("asr", "llm", "tts", "vad", "sip"):
         old = existing.get(kind, {})
         new = new_values[kind]
         for key in secret_keys:
@@ -277,7 +278,7 @@ def put_settings(req: SettingsRequest) -> dict:
 
 def _mask_secrets(config: dict) -> dict:
     out = dict(config)
-    secret_keys = {"api_key", "access_token", "token"}
+    secret_keys = {"api_key", "access_token", "token", "auth_password"}
     for key in secret_keys:
         if out.get(key):
             out[key] = ""

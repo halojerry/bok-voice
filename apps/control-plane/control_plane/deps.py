@@ -159,6 +159,8 @@ def build_engine() -> Engine | None:
                 _ensure_column(conn, "turns", "started_ms", "started_ms INTEGER DEFAULT 0")
                 _ensure_column(conn, "turns", "ended_ms", "ended_ms INTEGER DEFAULT 0")
                 _ensure_column(conn, "turns", "perceived_ms", "perceived_ms INTEGER DEFAULT 0")
+                # 外呼 SIP 配置段（spec 2026-09-12 Wave2）：空串=读侧回落默认段。
+                _ensure_column(conn, "global_settings", "sip_json", "sip_json TEXT NOT NULL DEFAULT ''")
         except Exception as exc:  # pragma: no cover - sqlite / duplicate column
             print(f"[deps] idempotent column migration skipped: {exc}")
 

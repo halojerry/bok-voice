@@ -534,6 +534,8 @@ class SqlAlchemyBusinessRepository:
             "llm": json.loads(row.llm_json or "{}"),
             "tts": json.loads(row.tts_json or "{}"),
             "vad": json.loads(row.vad_json or "{}"),
+            # 空 blob（老库补列后未保存）回落默认段，否则 dialer 拿不到 mode。
+            "sip": json.loads(row.sip_json or "{}") or self.default_settings()["sip"],
             "policy": row.policy,
         }
 
@@ -546,6 +548,9 @@ class SqlAlchemyBusinessRepository:
         row.llm_json = json.dumps(settings.get("llm", {}), ensure_ascii=False)
         row.tts_json = json.dumps(settings.get("tts", {}), ensure_ascii=False)
         row.vad_json = json.dumps(settings.get("vad", {}), ensure_ascii=False)
+        row.sip_json = json.dumps(
+            settings.get("sip") or self.default_settings()["sip"], ensure_ascii=False
+        )
         row.policy = settings.get("policy", row.policy or "offline_first")
         self.session.commit()
         return self.get_settings()
@@ -710,6 +715,19 @@ class SqlAlchemyBusinessRepository:
                 "min_speech_duration": 0.15,
                 "min_silence_duration": 0.45,
                 "interruption": True,
+            },
+            # 外呼（SIP）配置段（spec 2026-09-12 Wave2）：mode=mock|real（env
+            # BOK_SIP_MODE 是 kill-switch，有值即终局——见 agent dialer.resolve_dial_mode）。
+            # numbers=许可主叫号池；两个超时字段供 dialer 振铃窗与时长保险丝读取。
+            "sip": {
+                "mode": "mock",
+                "trunk_id": "",
+                "address": "",
+                "auth_username": "",
+                "auth_password": "",
+                "numbers": [],
+                "ringing_timeout_s": 30,
+                "max_call_duration_s": 600,
             },
             "policy": "offline_first",
         }
@@ -1040,6 +1058,8 @@ class InMemoryBusinessRepository:
             "llm": settings.get("llm", {}),
             "tts": settings.get("tts", {}),
             "vad": settings.get("vad", {}),
+            # 缺键/空值回落默认段（与 SQL 后端同语义：不允许把 sip 段清成空）。
+            "sip": settings.get("sip") or SqlAlchemyBusinessRepository.default_settings()["sip"],
             "policy": settings.get("policy", "offline_first"),
         }
         return self.settings
