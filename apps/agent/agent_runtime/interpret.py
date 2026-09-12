@@ -188,6 +188,18 @@ def _preemptive_generation_opts() -> dict:
     }
 
 
+def _direction_audio_enabled(speaker_role: str) -> bool:
+    """该方向译文是否合成+发布音频(纯函数,单测用)。
+
+    2026-09-12 用户拍板:同传操作台**只听我方译文(fwd TTS,给对方听)**;对方→我
+    方向(rev,speaker_role=other)只看双栏字幕,不出声——省一半 MiniMax 合成,
+    也令「两路译文分两个扬声器」的需求消失(只剩一路音频)。BOK_INTERP_REV_AUDIO=1
+    恢复双向出声(旧双端形态/未来我要听对方译文的场景)。"""
+    if speaker_role != "other":
+        return True
+    return os.environ.get("BOK_INTERP_REV_AUDIO", "0") == "1"
+
+
 async def entrypoint(ctx) -> None:
     from livekit import rtc
     from livekit.agents import (
@@ -232,7 +244,8 @@ async def entrypoint(ctx) -> None:
 
     print(
         f"[interp] room={room_name} listen={listen_identity} deliver={deliver_identity} "
-        f"{source_lang}->{target_lang}",
+        f"{source_lang}->{target_lang} "
+        f"audio={'on' if _direction_audio_enabled(speaker_role) else 'text-only'}",
         flush=True,
     )
 
@@ -377,7 +390,13 @@ async def entrypoint(ctx) -> None:
             text_enabled=False,
         ),
         # 具名译文轨 trans-<目标语言>(前端可按名渲染);订阅权限白名单见下。
-        room_output_options=RoomOutputOptions(audio_enabled=True, audio_track_name=f"trans-{target_lang}"),
+        # audio_enabled=False = 文字-only agent:框架跳过 TTS 推理(agent_activity
+        # 的 perform_tts_inference 只在 audio_output 非空时跑),译文照常走
+        # transcription 通道——对方→我方向默认只看字幕不出声(_direction_audio_enabled)。
+        room_output_options=RoomOutputOptions(
+            audio_enabled=_direction_audio_enabled(speaker_role),
+            audio_track_name=f"trans-{target_lang}",
+        ),
     )
 
     # 「我方输出=对方听到的内容」:本 agent 的译文轨只授权 deliver 端订阅。

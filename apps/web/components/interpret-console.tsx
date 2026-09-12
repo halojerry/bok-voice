@@ -3,16 +3,18 @@
 /**
  * 坐席一体台（单页双通道工作台,参考金喜同传的单页操作形态）:
  * 两人同机各一支麦,一个控制台同时接入同传房间的 me/other 两个身份,
- * 双向译文默认都从系统当前扬声器出声(共享输出),同页看双向原文+译文字幕。
+ * 同页看双向原文+译文字幕;出声单向——我方译文 TTS 播给对方听。
  *
  * - me 身份走 interpret 页同款官方会话(AgentSessionProvider + useTranscriptions)
  *   ——字幕沿用已验证管线(lk.transcription 全量广播,同页双向原文译文都看得到)。
  * - other 身份是纯手动 livekit Room:只负责「对象的麦克风收音 + 对象译文放音」,
  *   不重复渲染字幕(同一房间两边看到的是同一份字幕)。
- * - 输出两档:共享扬声器(默认,系统当前输出,任何内核可用,Mac/Windows 通吃)/
- *   独立双输出(高级,Chromium setSinkId,两人各戴一副耳机时用)。
- * - 自动半双工(默认开):任一方向译文出声时自动暂让对向麦克风——共享扬声器外放,
- *   麦克风会拾到译文原声,不暂让会把译文再翻译一遍(串译死循环)。
+ * - 听感拓扑(2026-09-12 终版):对方=听我方译文 TTS(fwd,trans-<对方语言>,other
+ *   房只挂 trans- 轨);我方=听对方麦克风原声(me 渲染器,me 房唯一远端音频),
+ *   rev 译文纯字幕零 TTS——同传台姿势:听原声+看译文。双输出档:「对方扬声器」
+ *   =译文指到朝向对方的音箱,「我方扬声器」=对方原声指到我方耳机/音箱。
+ * - 自动半双工(默认开):我方译文出声时自动暂让对方麦克风——共享扬声器外放,
+ *   对方麦会拾到译文原声,不暂让会把译文再翻译一遍(串译死循环)。
  * - 离开 = 结束我方连接 + hangup 整个 call(两个 interpreter 与对象端一起被踢)。
  */
 
@@ -29,6 +31,7 @@ import { useSession, useTranscriptions } from "@livekit/components-react";
 import { AgentSessionProvider } from "@/components/agents-ui/agent-session-provider";
 import { api, apiBase } from "@/lib/api";
 import { describeConnectError } from "@/lib/api-ready";
+import { wlog, wlogBindCall } from "@/lib/weblog";
 import {
   listAudioDevicesOf,
   requestMicPermission,
@@ -52,10 +55,15 @@ export type ConsoleProps = {
 };
 
 export default function InterpretConsole({ account, callId, myLang, otherLang, onExit }: ConsoleProps) {
+  wlogBindCall(callId);
   // 独立双输出(两个 room 各自 setSinkId)仅 Chromium 可用;探测放 effect 避开 SSR。
+  // 2026-09-12 用户拍板:支持 setSinkId 的内核**默认双独立输出**(我方输出走对方
+  // 原声、对方输出走译文 TTS,各走各的);WKWebView/Safari 等不支持内核保持共享档。
   const [canDual, setCanDual] = useState(false);
   useEffect(() => {
-    setCanDual(webCanSwitchOutput());
+    const can = webCanSwitchOutput();
+    setCanDual(can);
+    if (can) setOutputMode("dual");
   }, []);
   const [outputMode, setOutputMode] = useState<"shared" | "dual">("shared");
   const outputModeRef = useRef(outputMode);
@@ -66,14 +74,71 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   // ---- 设备枚举(两端共用一份列表,各存各的选择) ----
   const [micDevices, setMicDevices] = useState<AudioDeviceInfo[]>([]);
   const [outDevices, setOutDevices] = useState<AudioDeviceInfo[]>([]);
-  useEffect(() => {
-    requestMicPermission()
-      .then(async () => {
-        setMicDevices(await listAudioDevicesOf("input"));
-        setOutDevices(await listAudioDevicesOf("output"));
-      })
-      .catch(() => {});
+  // meRoom 声明在本函数更下方:deps 数组渲染期求值会 TDZ,枚举器经 ref 取房。
+  const meRoomRef = useRef<Room | null>(null);
+  const refreshDevices = useCallback(async () => {
+    await requestMicPermission().catch(() => false);
+    {
+      const mics = await listAudioDevicesOf("input");
+      setMicDevices(mics);
+      const outs = await listAudioDevicesOf("output");
+      setOutDevices(outs);
+      wlog("devices", {
+        mics: mics.map((d) => ({ n: d.name, def: d.is_default })),
+        outs: outs.map((d) => ({ n: d.name, def: d.is_default })),
+        saved: { meMic: savedMicDevice("me"), othMic: savedMicDevice("other"), meOut: savedOutputDevice("me"), othOut: savedOutputDevice("other") },
+      });
+        // 双麦自动分配(2026-09-12「没有分我的麦克风和对方麦克风」根因):两个下拉
+        // 默认「系统默认」=me/other 同抢一支默认麦,两方向收到同一个人。有 ≥2 支
+        // 输入且两边都从未选过 → 第一支给我方、第二支给对方(跳过 default 伪条目,
+        // 它与显式设备同一物理麦),持久化;方向装反了用下拉对调。
+        if (mics.length >= 2 && !savedMicDevice("me") && !savedMicDevice("other")) {
+          const real = mics.filter((d) => !d.is_default);
+          if (real.length >= 2) {
+            wlog("mic_auto_assign", { me: real[0].name, oth: real[1].name });
+            saveMicDevice(real[0].id, "me");
+            saveMicDevice(real[1].id, "other");
+            setMeMicId(real[0].id);
+            setOthMicId(real[1].id);
+            // me 会话可能已在连/已用默认麦:当即切换(已发布轨热切,未发布走
+            // audioCaptureDefaults);other 房尚未连接,连接 effect 会读到新值。
+            meRoomRef.current?.switchActiveDevice("audioinput", real[0].id, false).catch(() => {});
+            // other 房可能已连(权限弹窗令枚举晚于连接,review P1):连接期的
+            // switchActiveDevice 已跑过,不补切会停留在默认麦而下拉显示已分配。
+            otherRoomRef.current?.switchActiveDevice("audioinput", real[1].id, false).catch(() => {});
+          }
+        }
+        // 双扬声器自动分配(2026-09-12「我的扬声器还听到译文 TTS」根因):双输出档
+        // 两个下拉默认「系统默认」=两路声音(对方原声+我方译文 TTS)全混进默认输出,
+        // 我方耳机两样都放。≥2 台输出且从未选过 → 第一台=我方(放对方原声)、第二台
+        // =对方(放译文 TTS);分配后 dual 档的 sink effect 会自动路由,装反了下拉对调。
+      if (
+        webCanSwitchOutput() && outs.length >= 2 &&
+        !savedOutputDevice("me") && !savedOutputDevice("other")
+      ) {
+        const realOut = outs.filter((d) => !d.is_default);
+        if (realOut.length >= 2) {
+          wlog("out_auto_assign", { me: realOut[0].name, oth: realOut[1].name });
+          saveOutputDevice(realOut[0].id, "me");
+          saveOutputDevice(realOut[1].id, "other");
+          setMeOutId(realOut[0].id);
+          setOthOutId(realOut[1].id);
+        }
+      }
+    }
   }, []);
+  useEffect(() => {
+    void refreshDevices();
+    // 蓝牙/USB 声卡晚接入(2026-09-12「对方扬声器没声,两路混进默认输出」根因之一:
+    // 首次枚举看不见晚接入设备,自动分配跳过,两路 sink 全落系统默认):热插拔重枚举
+    // + 自动分配重试(选过的不动,只补从未选过的)。
+    const h = () => {
+      wlog("devicechange");
+      void refreshDevices();
+    };
+    navigator.mediaDevices?.addEventListener?.("devicechange", h);
+    return () => navigator.mediaDevices?.removeEventListener?.("devicechange", h);
+  }, [refreshDevices]);
 
   // ---- 官方会话(我方 me)：TokenSource.custom 直连 CP,身份钉 me-<callId> ----
   const tokenMe = useMemo(
@@ -88,6 +153,7 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   // publish/mute 变动(半双工每轮暂让都在换),旧 deps [meSession] 令连接 effect 反复
   // 重跑、leave 窗口还会重连污染结算(2026-09-11 审计 P1-3)。
   const meRoom = meSession.room;
+  meRoomRef.current = meRoom;
   const otherRoomRef = useRef<Room | null>(null);
   // other 房间重建计数:驱动半双工 watcher 重新挂载(重挂/StrictMode 下 watcher
   // 曾盯着已 disconnect 的死房,othHeld 永不生效,2026-09-11 审计 P1-4)。
@@ -124,6 +190,25 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   const [halfDuplex, setHalfDuplex] = useState(true);
   const [meHeld, setMeHeld] = useState(false);
   const [othHeld, setOthHeld] = useState(false);
+  const logHold = useCallback((who: "me" | "oth") => (v: boolean) => {
+    if (v) wlog("held", { who });
+  }, []);
+
+  // ---- 传译总开关(2026-09-12 用户拍板:进房不自动开始) ----
+  // 停止 = 两端麦克风全部静默:无音频→无 ASR→无翻译,原文/译文字幕一并暂停,
+  // 在播的译文念完即止;启动 = 恢复采集。与半双工暂让共用同一套麦克风生效
+  // effect(生效值 = 人工开关 && !自动暂让 && 传译开)。
+  const [interpOn, setInterpOn] = useState(false);
+  const interpOnRef = useRef(interpOn);
+  useEffect(() => {
+    interpOnRef.current = interpOn;
+  }, [interpOn]);
+  const toggleInterp = useCallback(() => {
+    setInterpOn((v) => {
+      wlog("interp_toggle", { on: !v });
+      return !v;
+    });
+  }, []);
 
   // ---- 我方连接(照抄 interpret 页/CallStudio 已验证路径) ----
   useEffect(() => {
@@ -142,17 +227,21 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
         // 已采集的麦克风轨、错误被吞,房间照常连接 = 「已接入」假象 + fwd 收不到
         // 任何音频(2026-09-11 同传审计:09-10「fwd 进房 6 分钟零译文」根因)。
         await meSession.start({
-          tracks: { microphone: { enabled: true, publishOptions: { preConnectBuffer: true } } },
+          // 传译总开关(默认关):进房只连接不采麦,按「启动传译」才开始——已连接
+          // 房间上后开采集无 15s 死锁风险(那死锁只发生在未连接房间上 await)。
+          tracks: { microphone: { enabled: interpOnRef.current, publishOptions: { preConnectBuffer: true } } },
         });
         // 确保我方麦克风真正发布:失败(权限被拒/设备被占)显式报错并把开关拉回
-        // 现实,不再静默装「已接入」。
-        try {
-          const pub = await meRoom.localParticipant.setMicrophoneEnabled(true);
-          setMeMicOn(Boolean(pub));
-          if (!pub) setError("无法开启我方麦克风：请检查浏览器麦克风权限——已连接,但同传听不到我方说话。");
-        } catch {
-          setMeMicOn(false);
-          setError("无法开启我方麦克风：请检查浏览器麦克风权限——已连接,但同传听不到我方说话。");
+        // 现实,不再静默装「已接入」。传译未启动时跳过探活(探活会把麦打开)。
+        if (interpOnRef.current) {
+          try {
+            const pub = await meRoom.localParticipant.setMicrophoneEnabled(true);
+            setMeMicOn(Boolean(pub));
+            if (!pub) setError("无法开启我方麦克风：请检查浏览器麦克风权限——已连接,但同传听不到我方说话。");
+          } catch {
+            setMeMicOn(false);
+            setError("无法开启我方麦克风：请检查浏览器麦克风权限——已连接,但同传听不到我方说话。");
+          }
         }
         // 共享扬声器(默认)不碰输出路由;独立双输出才 setSinkId。
         if (outputModeRef.current === "dual" && outId) {
@@ -184,6 +273,7 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   // (2026-09-11 审计 P0:一体台恒显「连接中」的直接根因)。
   useEffect(() => {
     if (meRoom.state !== ConnectionState.Connected) return;
+    wlog("me_connected");
     setMeConnected(true);
     setStartedAt((prev) => prev ?? Date.now());
     setBusy(false);
@@ -213,8 +303,11 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
         // 当时的轨,而 fwd 的 trans-<对方语言> 译文轨是**之后**说话才发布订阅的,
         // 永远没有 audio element=永远无声(me 端中文译文走官方渲染器所以听得到)。
         // TrackSubscribed 即刻 attach;autoplay 被拦时首次点击恢复。
-        room.on(RoomEvent.TrackSubscribed, (track) => {
-          if (track.kind !== "audio") return;
+        // 只挂 trans-* 译文轨(2026-09-12 麦克风原声外放根因):attach-all 会把
+        // me-<room> 的麦克风轨也挂上扬声器——客户听到自己原声+译文双声。麦克风轨
+        // 名是默认 microphone,白名单前缀过滤即够。
+        room.on(RoomEvent.TrackSubscribed, (track, pub) => {
+          if (track.kind !== "audio" || !String(pub.trackName ?? "").startsWith("trans-")) return;
           const el = track.attach();
           el.autoplay = true;
           el.style.display = "none";
@@ -239,11 +332,12 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
           room.disconnect().catch(() => {});
           return;
         }
-        await room.localParticipant.setMicrophoneEnabled(othMicOn);
+        await room.localParticipant.setMicrophoneEnabled(othMicOn && interpOnRef.current);
         // 共享扬声器(默认)不碰输出路由;独立双输出才 setSinkId。
         if (outputModeRef.current === "dual" && outId) {
           await switchWebOutputDevice(room, outId).catch(() => {});
         }
+        wlog("other_connected");
         setOtherConnected(true);
         setOtherRoomVersion((v) => v + 1);
         await room.startAudio().catch(() => {});
@@ -261,34 +355,88 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   }, [callId, meConnected]);
 
   // ---- 设备选择应用 ----
+  // 独立双输出失败(setSinkId 被 Chromium 拒/设备被占)此前静默 return false——用户
+  // 体感「不能同时用两个扬声器」却无线索。失败显式亮错误条,把实测变成诊断。
+  const applyDualOutput = useCallback(
+    async (room: { switchActiveDevice: (kind: string, id: string, exact?: boolean) => Promise<boolean> } | null, id: string, who: string) => {
+      if (!room || !id) return;
+      const ok = await switchWebOutputDevice(room, id).catch(() => false);
+      wlog("sink_apply", { who, id: id.slice(0, 12), ok });
+      if (!ok) setError(`无法把${who}的译文路由到所选扬声器（setSinkId 失败）——请换一台输出设备或改用共享扬声器。`);
+    },
+    [],
+  );
+  // 麦克风热切换(2026-09-12 call-ae8fece8 实证):switchActiveDevice 内部会重启采集
+  // (getUserMedia 换设备),失败(设备被另一会话占用/macOS 蓝牙 HFP 双开必败)时旧轨
+  // 已停、新轨没起来 = 房里挂着一条「活着但全静音」的死轨,rev 方向从此收不到声,
+  // 且旧代码 .catch(()=>{}) 静默吞掉。失败必须可见+回滚救活:切回旧设备并做一次
+  // 关-开重采集,仍失败亮错误条让操作员换设备。
+  const applyMicSwitch = useCallback(
+    async (
+      room: Room | null,
+      id: string,
+      prevId: string,
+      who: string,
+      revert: () => void,
+    ) => {
+      if (!room) return;
+      const ok = await room.switchActiveDevice("audioinput", id, false).catch(() => false);
+      wlog("mic_switch", { who, id: id.slice(0, 12), prev: prevId.slice(0, 12), ok });
+      if (ok) return;
+      console.warn(`mic hot-switch failed: ${who} -> ${id}, rolling back to ${prevId || "default"}`);
+      try {
+        if (prevId) await room.switchActiveDevice("audioinput", prevId, false).catch(() => {});
+        await room.localParticipant.setMicrophoneEnabled(false).catch(() => {});
+        await room.localParticipant.setMicrophoneEnabled(true).catch(() => {});
+      } catch {
+        /* 回滚尽力而为 */
+      }
+      revert();
+      setError(
+        `切换${who}麦克风失败（设备被占用或不支持同时双开，如蓝牙耳机麦）——已切回原设备；请给${who}换一支独立麦克风。`,
+      );
+    },
+    [],
+  );
   const pickMeMic = useCallback(
     (id: string) => {
+      const prev = meMicId;
       setMeMicId(id);
       saveMicDevice(id, "me");
-      if (meConnected) meRoom.switchActiveDevice("audioinput", id, false).catch(() => {});
+      if (meConnected) void applyMicSwitch(meRoom, id, prev, "我方", () => {
+        setMeMicId(prev);
+        saveMicDevice(prev, "me");
+      });
     },
-    [meSession, meConnected],
+    [meSession, meConnected, meMicId, applyMicSwitch],
   );
   const pickMeOut = useCallback(
     (id: string) => {
       setMeOutId(id);
       saveOutputDevice(id, "me");
-      if (outputModeRef.current === "dual" && meConnected) switchWebOutputDevice(meRoom, id).catch(() => {});
+      if (outputModeRef.current === "dual" && meConnected) void applyDualOutput(meRoom, id, "我方");
     },
-    [meSession, meConnected],
+    [meSession, meConnected, applyDualOutput],
   );
-  const pickOthMic = useCallback((id: string) => {
-    setOthMicId(id);
-    saveMicDevice(id, "other");
-    const r = otherRoomRef.current;
-    if (r) r.switchActiveDevice("audioinput", id, false).catch(() => {});
-  }, []);
+  const pickOthMic = useCallback(
+    (id: string) => {
+      const prev = othMicId;
+      setOthMicId(id);
+      saveMicDevice(id, "other");
+      const r = otherRoomRef.current;
+      if (r) void applyMicSwitch(r, id, prev, "对方", () => {
+        setOthMicId(prev);
+        saveMicDevice(prev, "other");
+      });
+    },
+    [othMicId, applyMicSwitch],
+  );
   const pickOthOut = useCallback((id: string) => {
     setOthOutId(id);
     saveOutputDevice(id, "other");
     const r = otherRoomRef.current;
-    if (outputModeRef.current === "dual" && r) switchWebOutputDevice(r, id).catch(() => {});
-  }, []);
+    if (outputModeRef.current === "dual" && r) void applyDualOutput(r, id, "对方");
+  }, [applyDualOutput]);
 
   // ---- 麦克风开关:按钮只改人工意图,生效值由本 effect 统一投到房间 ----
   // 生效值 = 人工开关 && !自动暂让——暂让结束后按人工意图恢复,人工静音始终优先。
@@ -296,28 +444,65 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   const toggleOthMic = useCallback(() => setOthMicOn((v) => !v), []);
   useEffect(() => {
     if (!meConnected) return;
-    meRoom.localParticipant.setMicrophoneEnabled(meMicOn && !meHeld).catch(() => {});
+    meRoom.localParticipant.setMicrophoneEnabled(meMicOn && !meHeld && interpOn).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [meMicOn, meHeld, meConnected]);
+  }, [meMicOn, meHeld, meConnected, interpOn]);
   useEffect(() => {
     const r = otherRoomRef.current;
     if (!otherConnected || !r) return;
-    r.localParticipant.setMicrophoneEnabled(othMicOn && !othHeld).catch(() => {});
+    r.localParticipant.setMicrophoneEnabled(othMicOn && !othHeld && interpOn).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [othMicOn, othHeld, otherConnected]);
+  }, [othMicOn, othHeld, otherConnected, interpOn]);
 
   // ---- 输出模式切换:对已连接房间重投路由 ----
+  // dual 模式不变量(2026-09-12 根因收口):两路必须都有指认,有洞必补。根因链=
+  // 用户早前手动选过我方扬声器(持久化)→自动分配的「双空才跑」条件被挡→对方路
+  // 恒空=走系统默认→默认恰是我方那台→两路(原声+译文)全混同一设备,对方音箱静默。
+  // 补洞无视 localStorage 空值历史(显式非空选择不动);只在有 ≥2 台真实输出时补。
+  useEffect(() => {
+    if (outputMode !== "dual" || !canDual) return;
+    const real = outDevices.filter((d) => !d.is_default);
+    if (real.length < 2) return;
+    const meEmpty = !meOutId, othEmpty = !othOutId;
+    if (!meEmpty && !othEmpty) return;
+    wlog("out_fill", { meEmpty, othEmpty });
+    if (meEmpty && othEmpty) {
+      wlog("out_fill_both", { me: real[0].name, oth: real[1].name });
+      saveOutputDevice(real[0].id, "me");
+      saveOutputDevice(real[1].id, "other");
+      setMeOutId(real[0].id);
+      setOthOutId(real[1].id);
+      return;
+    }
+    if (meEmpty) {
+      const cand = real.find((d) => d.id !== othOutId);
+      if (cand) {
+        wlog("out_fill_me", { picked: cand.name });
+        saveOutputDevice(cand.id, "me");
+        setMeOutId(cand.id);
+      }
+    } else {
+      const cand = real.find((d) => d.id !== meOutId);
+      if (cand) {
+        wlog("out_fill_oth", { picked: cand.name });
+        saveOutputDevice(cand.id, "other");
+        setOthOutId(cand.id);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [outputMode, canDual, outDevices, meOutId, othOutId]);
+
   useEffect(() => {
     if (outputMode !== "dual" || !canDual || !meConnected) return;
     const id = meOutId || savedOutputDevice("me");
-    if (id) switchWebOutputDevice(meRoom, id).catch(() => {});
+    if (id) void applyDualOutput(meRoom, id, "我方");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [outputMode, meOutId, meConnected, canDual]);
   useEffect(() => {
     const r = otherRoomRef.current;
     if (outputMode !== "dual" || !canDual || !otherConnected || !r) return;
     const id = othOutId || savedOutputDevice("other");
-    if (id) switchWebOutputDevice(r, id).catch(() => {});
+    if (id) void applyDualOutput(r, id, "对方");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [outputMode, othOutId, otherConnected, canDual]);
   // 切回共享扬声器:显式回系统默认输出(sinkId="default"),避免残留上一档路由。
@@ -336,8 +521,8 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
       setOthHeld(false);
       return;
     }
-    const stopMe = watchTransAudio(meRoom, setMeHeld);
-    const stopOth = watchTransAudio(otherRoomRef.current, setOthHeld);
+    const stopMe = watchTransAudio(meRoom, logHold("me"));
+    const stopOth = watchTransAudio(otherRoomRef.current, logHold("oth"));
     return () => {
       stopMe();
       stopOth();
@@ -349,13 +534,20 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   // 同设备告警:同麦永远要提示;同扬声器只在独立双输出档才是问题(共享档本来就共用)。
   const sameDeviceWarning = [
     meMicId && meMicId === othMicId ? "我方与对象选中了同一支麦克风——两人请各用一支。" : "",
+    !meMicId && !othMicId && micDevices.length >= 2
+      ? "两支麦克风都还是「系统默认」——两个方向会收到同一个人的声音，请各指定一支。"
+      : "",
     outputMode === "dual" && meOutId && meOutId === othOutId ? "独立双输出选中了同一台扬声器——请各用一副耳机。" : "",
   ]
     .filter(Boolean)
     .join(" ");
 
+  // 我方渲染器不静音(2026-09-12 终版拓扑:用户拍板「我的扬声器听对方原声」):
+  // me 房唯一远端音频=对方麦克风原声(rev 译文 TTS 已关=纯字幕)——渲染器放声=
+  // 我听到对方原声,像直接通话;回声由浏览器 AEC 兜(默认输出播放的浏览器音频
+  // 在两支麦的采集中被回声消除)。对方侧由 other 房只挂 trans- 译文轨承担。
   return (
-    <AgentSessionProvider session={meSession} volume={1} muted={false}>
+    <AgentSessionProvider session={meSession} volume={1}>
       <ConsoleLive
         room={meRoom}
         myLang={myLang}
@@ -363,6 +555,7 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
         meConnected={meConnected}
         otherConnected={otherConnected}
         error={error}
+        setError={setError}
         busy={busy}
         leaving={leaving}
         micDevices={micDevices}
@@ -384,6 +577,8 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
         pickMeOut={pickMeOut}
         pickOthMic={pickOthMic}
         pickOthOut={pickOthOut}
+        interpOn={interpOn}
+        toggleInterp={toggleInterp}
         toggleMeMic={toggleMeMic}
         toggleOthMic={toggleOthMic}
         setHalfDuplex={setHalfDuplex}
@@ -434,6 +629,9 @@ type LiveProps = {
   meOutId: string;
   othMicId: string;
   othOutId: string;
+  setError: (s: string) => void;
+  interpOn: boolean;
+  toggleInterp: () => void;
   meMicOn: boolean;
   othMicOn: boolean;
   meHeld: boolean;
@@ -488,6 +686,32 @@ function SessionClock({ startedAt }: { startedAt: number | null }) {
 
 function ConsoleLive(p: LiveProps) {
   const transcriptions = useTranscriptions();
+  // 🔊 试听(2026-09-12):在指定输出设备上放一句语音——自动分配是按枚举顺序猜的,
+  // 「我方扬声器出译文/对方扬声器没声」九成是两路方向猜反或设备不在列表;试听令
+  // 物理指认 5 秒锁定,选完下拉即记住。走本地 TTS sidecar 预览端点,零云端开销。
+  const playSinkTest = useCallback(async (deviceId: string, label: string) => {
+    wlog("sink_test", { label, id: deviceId.slice(0, 12) });
+    try {
+      const r = await fetch(`${apiBase()}/api/tts/preview`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: "qwen3_tts", voice: "Vivian", language: "zh", text: label }),
+      });
+      if (!r.ok) throw new Error(`preview ${r.status}`);
+      const el = new Audio(URL.createObjectURL(await r.blob()));
+      try {
+        await (el as HTMLAudioElement & { setSinkId?: (id: string) => Promise<void> }).setSinkId?.(
+          deviceId || "default",
+        );
+      } catch {
+        /* 不支持 setSinkId 的内核走默认输出 */
+      }
+      await el.play();
+      el.addEventListener("ended", () => URL.revokeObjectURL(el.src));
+    } catch (e) {
+      p.setError(`试听失败(${e instanceof Error ? e.message : String(e)})——请确认本地 TTS 服务在跑。`);
+    }
+  }, [p.setError]);
   const listRef = useRef<HTMLDivElement | null>(null);
   const [filter, setFilter] = useState<"both" | "me" | "other">("both");
   const [clearedCount, setClearedCount] = useState(0);
@@ -555,7 +779,7 @@ function ConsoleLive(p: LiveProps) {
                   checked={p.outputMode === "dual"}
                   onChange={() => p.setOutputMode("dual")}
                 />
-                独立双输出
+                独立双输出（默认）
               </label>
             </div>
             {p.outputMode === "shared" ? (
@@ -563,30 +787,58 @@ function ConsoleLive(p: LiveProps) {
                 双向译文都从系统当前扬声器出声;任何内核可用(Mac/Windows),跟系统走。
               </p>
             ) : (
+              <>
               <div className="grid grid-cols-2 gap-2">
                 <label className="flex flex-col gap-1">
                   <span className="text-(--stage-muted)">我方扬声器</span>
-                  <select className="select" value={p.meOutId} onChange={(e) => p.pickMeOut(e.target.value)}>
-                    <option value="">系统默认</option>
-                    {p.outDevices.map((d) => (
-                      <option key={d.id} value={d.id}>
-                        {d.name}
-                      </option>
-                    ))}
-                  </select>
+                  <div className="flex gap-1">
+                    <select className="select" value={p.meOutId} onChange={(e) => p.pickMeOut(e.target.value)}>
+                      <option value="" disabled>系统默认（双输出档需指定）</option>
+                      {p.outDevices.map((d) => (
+                        <option key={d.id} value={d.id}>
+                          {d.name}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      className="stage-btn-secondary shrink-0 px-2"
+                      title="在这台设备放一句试听,确认它就是你想的那台"
+                      onClick={() => void playSinkTest(p.meOutId, "我方输出,播放对方原声")}
+                    >
+                      🔊
+                    </button>
+                  </div>
                 </label>
                 <label className="flex flex-col gap-1">
                   <span className="text-(--stage-muted)">对方扬声器</span>
-                  <select className="select" value={p.othOutId} onChange={(e) => p.pickOthOut(e.target.value)}>
-                    <option value="">系统默认</option>
-                    {p.outDevices.map((d) => (
-                      <option key={d.id} value={d.id}>
-                        {d.name}
-                      </option>
-                    ))}
-                  </select>
+                  <div className="flex gap-1">
+                    <select className="select" value={p.othOutId} onChange={(e) => p.pickOthOut(e.target.value)}>
+                      <option value="" disabled>系统默认（双输出档需指定）</option>
+                      {p.outDevices.map((d) => (
+                        <option key={d.id} value={d.id}>
+                          {d.name}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      className="stage-btn-secondary shrink-0 px-2"
+                      title="在这台设备放一句试听,确认它就是你想的那台"
+                      onClick={() => void playSinkTest(p.othOutId, "对方输出,播放我方译文")}
+                    >
+                      🔊
+                    </button>
+                  </div>
                 </label>
               </div>
+              <p className="text-[10px] leading-relaxed text-(--stage-muted)">
+                当前路由：我方→{p.outDevices.find((d) => d.id === p.meOutId)?.name ?? "系统默认"}（放对方原声）
+                · 对方→{p.outDevices.find((d) => d.id === p.othOutId)?.name ?? "系统默认"}（放我方译文）。
+                {(!p.meOutId || !p.othOutId) && (
+                  <span className="text-amber-300"> 有输出未指定＝该路走系统默认，两路会混进同一台设备！</span>
+                )}
+                <span className="block">我方建议戴耳机：Chrome 回声消除只覆盖默认输出，双输出档外放对方原声可能串进我方麦。</span>
+              </p>
+              </>
             )}
             {!p.canDual && (
               <p className="text-[10px] text-(--stage-muted)">独立双输出需桌面 Chrome;当前内核走共享扬声器。</p>
@@ -625,6 +877,17 @@ function ConsoleLive(p: LiveProps) {
         {/* ③ 控制卡 */}
         <section className="card flex flex-col gap-2.5 p-4">
           <span className="label">控制</span>
+          <button
+            className={p.interpOn ? "stage-btn-secondary" : "stage-btn-primary"}
+            onClick={p.toggleInterp}
+            disabled={!p.meConnected}
+            title="进房不自动开始:启动前两端麦克风静默,原文/译文都不产生"
+          >
+            {p.interpOn ? "■ 停止传译" : "▶ 启动传译"}
+          </button>
+          <p className="-mt-1 text-[10px] leading-relaxed text-(--stage-muted)">
+            传译{p.interpOn ? "进行中" : "未启动"}——停止后两端静默,字幕与译文暂停,在播译文念完即止。
+          </p>
           <div className="grid grid-cols-2 gap-2">
             <button className="stage-btn-secondary" onClick={p.toggleMeMic} disabled={!p.meConnected}>
               {p.meHeld ? "暂让中…" : p.meMicOn ? "静音我方麦" : "开我方麦"}

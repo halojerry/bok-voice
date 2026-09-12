@@ -26,13 +26,20 @@ from agent_runtime.agent import _say_script  # noqa: E402
 from agent_runtime.fillers import FillerDirector, filler_gap_s  # noqa: E402
 from agent_runtime.providers.livekit_plugins import (  # noqa: E402
     _is_hotword_vocab_echo,
+    _is_lone_vocab_word,
     _strip_vocab_echo_tail,
+    _vocab_echo_guard,
     _StripTailAnchorStream,
 )
 
 _VOCAB = (
     "Vocabulary: 顺丰速运,运通,理赔,京东,拼多多,单号,运单,赔偿,运费,专员,集运,"
     "时效,上门,追踪,核实"
+)
+# call-1043de7c 真实词表形态:模板热词(繁体「順豐速運」)+静态 zh 表(简体)+对象字段
+_VOCAB_MIXED = (
+    "Vocabulary: 順豐速運,運通,理賠,京東,拼多多,单号,运单,赔偿,运费,专员,集运,"
+    "时效,上门,追踪,核实,微信,顺丰物流"
 )
 
 
@@ -143,6 +150,40 @@ def test_strip_vocab_echo_normal_text_untouched():
 def test_strip_vocab_echo_short_run_not_stripped():
     """尾段词表词 <4 个=可能是真实回答(平台选择类),不剥。"""
     assert _strip_vocab_echo_tail("快件,运单,赔偿", _VOCAB) == "快件,运单,赔偿"
+
+
+def test_full_mixed_echo_dropped_after_t2s_fix():
+    """call-1043de7c 实证:词表首词「順豐速運」(繁)被 ASR 抄成「顺豐速運」
+    (简繁混)——T2S 表曾漏「順→顺」致首段归一断链,整串回声被当真话头留下
+    「顺豐速運」假轮。修复后全串回声 → 纯回声空串(整轮丢弃)。"""
+    heard = "顺豐速運，運通，理賠，京東，拼多多，单号，运单，赔偿，运费，专员，集运，时效，上门，追踪，核实，微信，顺丰物流。"
+    assert _strip_vocab_echo_tail(heard, _VOCAB_MIXED) == ""
+    # 同日变体:回声里「上門」也是繁体(call-1043de7c 第二条 ECHO_STRIP)
+    heard2 = "顺豐速運，運通，理賠，京東，拼多多，单号，运单，赔偿，运费，专员，集运，时效，上門，追踪，核实，微信，顺丰物流。"
+    assert _strip_vocab_echo_tail(heard2, _VOCAB_MIXED) == ""
+
+
+def test_vocab_echo_guard_lone_word_after_confirmed_echo():
+    """回声衰落残片:整条只抄出词表首词「顺豐速運」(无尾可剥)。首现保留
+    (真人可能真讲词表词,如「微信」);同通已确认过回声事件后再来孤词 → 丢弃。"""
+    # 首现孤词:保留,不置 seen
+    out, seen = _vocab_echo_guard("顺豐速運", _VOCAB_MIXED, echo_seen=False)
+    assert out == "顺豐速運" and seen is False
+    # 真人孤词(微信)无前置回声:同样保留
+    out, seen = _vocab_echo_guard("微信", _VOCAB_MIXED, echo_seen=False)
+    assert out == "微信" and seen is False
+    # 确认过回声后的孤词残片:丢弃
+    out, seen = _vocab_echo_guard("顺豐速運", _VOCAB_MIXED, echo_seen=True)
+    assert out == "" and seen is True
+    # 全串回声:直接丢弃并置 seen
+    full = "顺豐速運，運通，理賠，京東，拼多多，单号，运单，赔偿，运费，专员，集运，时效，上门，追踪，核实，微信，顺丰物流。"
+    out, seen = _vocab_echo_guard(full, _VOCAB_MIXED, echo_seen=False)
+    assert out == "" and seen is True
+    # 正常话永不受影响
+    out, seen = _vocab_echo_guard("我在京东买了个东西", _VOCAB_MIXED, echo_seen=True)
+    assert out == "我在京东买了个东西"
+    assert _is_lone_vocab_word("微信", _VOCAB_MIXED) is True
+    assert _is_lone_vocab_word("我在京东买了个东西", _VOCAB_MIXED) is False
 
 
 # ---- F3: 垫话→回复最小间隔 ----

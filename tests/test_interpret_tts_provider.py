@@ -157,3 +157,12 @@ def test_build_llm_provider_fallback(monkeypatch):
     ds = interpret._build_llm_provider({"provider": "deepseek", "api_key": "sk-test"}, "en")
     assert isinstance(ds, DeepSeekLLM)
     assert ds._opts.model == "deepseek-chat"
+
+def test_direction_audio_enabled_rev_text_only_by_default(monkeypatch):
+    """2026-09-12 用户拍板:同传出声单向——fwd(听 me,译文给对方)恒出声;
+    rev(听 other,对方→我)默认纯字幕零 TTS;BOK_INTERP_REV_AUDIO=1 恢复双向。"""
+    monkeypatch.delenv("BOK_INTERP_REV_AUDIO", raising=False)
+    assert interpret._direction_audio_enabled("me") is True
+    assert interpret._direction_audio_enabled("other") is False
+    monkeypatch.setenv("BOK_INTERP_REV_AUDIO", "1")
+    assert interpret._direction_audio_enabled("other") is True

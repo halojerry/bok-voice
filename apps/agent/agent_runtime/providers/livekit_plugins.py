@@ -1951,6 +1951,7 @@ _T2S_PAIRS = (
     " 鳥鸟 貝贝 開开 閉闭 閑闲 間间 鬧闹 聞闻 閱阅 陽阳 陰阴 陣阵 陳陈 險险"
     " 隨随 隱隐 難难 雙双 發发 戶户 據据 購购 輸运 輸输 國国 際际 韓韩 愛爱"
     "爾尔"
+    " 順顺 寶宝 亞亚 遜逊"
 )
 _T2S_MAP = {ord(tok[0]): tok[1] for tok in _T2S_PAIRS.split() if len(tok) == 2}
 
@@ -2049,6 +2050,32 @@ def _strip_vocab_echo_tail(text: str, hotword_context: str) -> str:
     for i in range(1, keep):
         out += seps[i - 1] + segments[i]
     return out
+
+
+def _is_lone_vocab_word(text: str, hotword_context: str) -> bool:
+    """整条文本归一后恰好是单个词表词(词表残片形态)——call-1043de7c 第三轮
+    实证:回声衰落成只抄出词表首词「顺豐速運」,无尾可剥、整条当正常轮过关。"""
+    norm = re.sub(r"[^\w\u4e00-\u9fff]+", "", _to_simp(str(text or "")))
+    if len(norm) < 2 or not hotword_context:
+        return False
+    return norm in _vocab_words_from_context(hotword_context)
+
+
+def _vocab_echo_guard(
+    text: str, hotword_context: str, *, echo_seen: bool
+) -> tuple[str, bool]:
+    """词表回声守卫统一入口(纯函数,状态由调用方持有):返回 (净文, 新 echo_seen)。
+
+    三层:①剥尾保头(真话头+词表尾,见 _strip_vocab_echo_tail);②剥动或纯回声
+    → 置 echo_seen(本通已确认回声事件);③echo_seen 后的**词表单词残片**也丢弃
+    ——首次出现的单词词表词保留(真人可能真讲「微信」),但同通已抄过整条词表
+    之后再来孤词,是回声衰落残片(call-1043de7c「顺豐速運」×3 实证)。"""
+    stripped = _strip_vocab_echo_tail(text, hotword_context)
+    if stripped != text:
+        return stripped, True
+    if echo_seen and _is_lone_vocab_word(text, hotword_context):
+        return "", True
+    return text, echo_seen
 
 
 def _trim_lead_silence(
