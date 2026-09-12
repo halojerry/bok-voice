@@ -526,9 +526,11 @@ def test_legacy_four_sections_become_steps():
 
     fc = FlowController.from_template(LEGACY_TPL, OBJ)
     assert fc.has_steps
-    assert "第 1/4 步" in fc.current_step_text()
-    # 开场步的 ref 是 opening 全文
-    assert "你好请问" in fc.current_step_text()
+    txt = fc.current_step_text()
+    assert "第 1/4 步" in txt
+    # 开场步的 ref 是 opening 全文(渐进披露:每步首轮渲染注入底稿,二次调用
+    # 已转分支模式——单次捕获断言)
+    assert "你好请问" in txt
 
 
 def test_legacy_steps_advance_one_by_one():
@@ -549,7 +551,9 @@ def test_legacy_steps_advance_one_by_one():
 
 
 def test_current_step_explicit_no_leak_instruction():
-    # 当前步注入须明确区分"参考要点(内部)"与"对客户说的话",禁止复述分支指示。
+    # 当前步注入须明确区分"内部底稿"与"对客户说的话",禁止复述分支指示;
+    # 渐进披露后分支不再以「如果客户X→就Y」原文形态进 prompt(只改写成
+    # 【应对客户当前回应】单条),命中分支的应对内容本身照给。
     from agent_runtime.flow import FlowController
 
     fc = FlowController.from_template(
@@ -557,9 +561,14 @@ def test_current_step_explicit_no_leak_instruction():
         OBJ,
     )
     txt = fc.current_step_text()
-    assert "勿念给客户" in txt
-    assert "绝不把「如果" in txt
-    assert "参考要点(内部指示" in txt
+    assert "内部资料" in txt  # 底稿明确标记为内部
+    assert "绝不逐字念" in txt  # 禁止逐字念出
+    assert "如果客户" not in txt  # 分支指示原文不进(首轮无分支)
+    fc.last_verdict = "unclear"
+    fc.last_user_text = "我唔记得了"
+    txt2 = fc.current_step_text()
+    assert "提佢地址帮佢回忆" in txt2  # 命中分支的应对照注入
+    assert "如果客户" not in txt2  # 但分支指示原文形态不进
 
 
 # ---- 明确拒绝 → REFUSE(一句礼貌收尾 + 主动结束通话) ----

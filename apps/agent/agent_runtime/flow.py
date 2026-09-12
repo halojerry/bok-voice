@@ -21,6 +21,20 @@ OFFTOPIC = "offtopic"     # 明显无关/要挂断/怀疑诈骗 → 不强推
 UNCLEAR = "unclear"       # 判断不清 → 停留,自然应对
 REFUSE = "refuse"         # 明确拒绝/告别/要收线 → 收尾态:一句礼貌再见后结束通话
 REPEAT = "repeat"         # 没听清/要求重复 → 停留,把上一句关键内容再讲一遍(客户要求的重复照讲)
+DEFER = "defer"           # 客户要自己去查/稍等再讲(社交拖延) → 脚本直念短应承,零 LLM(2026-09-12:
+                          # call-8fa17d2b「我先查一下」落到 LLM 只会照本重问,体验=只剩垫话)
+
+# 客户社交拖延语:「我先查一下」「有了再通知你」「稍等我看看」——意图是暂停/
+# 稍后,不是答复也不是提问。命中即 DEFER:agent 钩子 _say_script 直念三语短
+# 应承(好的您慢慢查我等您),不推进/不 judge/不走 LLM(零 TTFT、零照本)。
+_DEFER_RE = re.compile(
+    r"(我先?查一下|我先?查查|我先?看看|我想(?:一)?想|我考虑(?:一)?下|稍等|等一下|等下先|"
+    r"等我(?:查|看|问|想想)|回头再|晚点再|迟点再|让我(?:查|看|问)|我看看|"
+    r"有的?话?再(?:通知|联系|告诉|打)|到时候再|"
+    r"let me (?:check|see|look|think)|hold on|one sec|wait a (?:moment|sec|bit)|"
+    r"i(?:'| a)?ll (?:check|get back|take a look))",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -51,6 +65,93 @@ def parse_steps(steps_json: str) -> list[FlowStep]:
         elif isinstance(s, str):
             out.append(FlowStep(goal="", ref=s))
     return [s for s in out if s.goal.strip() or s.ref.strip()]
+
+
+# ---- 话术分支渐进披露(2026-09-12 P0「会说话」) ----
+# call-8fa17d2b 实证:QA miss 落到 LLM 后,尾部把整段 ref(正稿+全部「如果
+# 客户X→就Y」分支)以台词形态常驻注入,4B 的复制引力压过「勿念原文」指引——
+# 「你说什么东西?」换来 11.9s 整段重念、两轮回复一字不差。拆三件渐进披露:
+# 正稿只进本步首轮(此后已入对话史);分支按客户当轮回应只命中一条注入;
+# 「注意:」行是操作性事实恒注入。运营在模板里写的分支就是现成的分情景
+# 应答对,直接白捡,不用另造资料层。
+_BRANCH_LINE_RE = re.compile(r"^如果客户\s*(?P<cond>.{1,48}?)\s*→\s*(?P<resp>\S.*)$")
+_NOTE_LINE_RE = re.compile(r"^注意[:：]\s*(?P<note>.+)$")
+
+
+@dataclass
+class StepRefParts:
+    """ref 解析三件:正稿(首个非空非分支行)/分支(条件,应对)/注意行。"""
+
+    script: str = ""
+    branches: list = field(default_factory=list)  # list[tuple[cond, resp]]
+    notes: list = field(default_factory=list)  # list[str]
+
+
+def parse_step_ref(ref: str) -> StepRefParts:
+    """把 step.ref 拆成 正稿/分支/注意 三件(纯函数,变量不渲染——注入时才渲染)。"""
+    parts = StepRefParts()
+    for raw in str(ref or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = _BRANCH_LINE_RE.match(line)
+        if m:
+            parts.branches.append((m.group("cond").strip(), m.group("resp").strip()))
+            continue
+        m = _NOTE_LINE_RE.match(line)
+        if m:
+            parts.notes.append(m.group("note").strip())
+            continue
+        if not parts.script:
+            parts.script = line
+    return parts
+
+
+# verdict 家族 → 分支条件关键词(条件是运营自然语言,含家族词即同族候选)。
+_BRANCH_FAMILY: dict[str, tuple[str, ...]] = {
+    REPEAT: ("听不清", "再说", "再讲", "重复", "没听清", "大声"),
+    QUESTION: ("问",),
+    OBJECTION: ("嫌", "不接受", "打错", "不是", "拒绝", "投诉", "担心", "怀疑"),
+    UNCLEAR: ("不记得", "不知道", "没买", "没印象", "想不起"),
+}
+
+
+def _cond_bigram_hits(cond: str, user_text: str) -> int:
+    """条件核心(剥引导「说/问」)与用户话的 2-gram 重叠数——措辞不同也能挂上
+    (条件「问为什么这样赔」↔客户「为什么赔这么多」共享「为什么」)。"""
+    core = re.sub(r"^[说问]", "", str(cond or ""))
+    u = re.sub(r"[^\w\u4e00-\u9fff]+", "", str(user_text or ""))
+    return sum(1 for i in range(len(core) - 1) if core[i : i + 2] in u)
+
+
+def match_step_branch(
+    parts: StepRefParts, user_text: str, verdict: str
+) -> tuple[str, str] | None:
+    """按 verdict+用户话从分支里选一条;命中不了返回 None。
+
+    调用方拿到 None 就什么都不注入(绝不退回全量正稿/全分支——那正是照念
+    话术的复制引力源)。家族优先:同族多条按 bigram 重叠分高者;无同族时
+    bigram ≥2 兜底跨族命中(如「不记得」族词不在条件里但客户原话挂上)。"""
+    if not parts.branches:
+        return None
+    fam = _BRANCH_FAMILY.get(verdict, ())
+    fam_hits = [
+        (c, r, _cond_bigram_hits(c, user_text))
+        for c, r in parts.branches
+        if any(k in c for k in fam)
+    ]
+    if fam_hits:
+        best = max(fam_hits, key=lambda t: t[2])
+        return (best[0], best[1])
+    kw_hits = [
+        (c, r, n)
+        for c, r in parts.branches
+        if (n := _cond_bigram_hits(c, user_text)) >= 2
+    ]
+    if kw_hits:
+        best = max(kw_hits, key=lambda t: t[2])
+        return (best[0], best[1])
+    return None
 
 
 # 粤语数字逐个读法:0 读「零」;1-9 对应汉字。数字串/单号要逐个读,
@@ -326,7 +427,8 @@ def should_auto_advance(*, current: int, goal: str, ref: str, user_text: str, ve
       offered(應承加未俾號)則停留;淨係答到平台 → 停留喺本步,繼續叫客戶俾WhatsApp/傳截圖。
       若只係純核對平台(冇 WhatsApp 要求)→ 答到平台即過。
     """
-    if verdict in (OBJECTION, REFUSE, REPEAT):
+    # DEFER(客户要自己去查/稍后再讲)同拦:拖延唔係任何一步嘅答案。
+    if verdict in (OBJECTION, REFUSE, REPEAT, DEFER):
         return False
     if current == 0:
         # 身份確認步(2026-09-12 開場白三段拆分):客戶任何非拒絕實質回應——
@@ -334,7 +436,7 @@ def should_auto_advance(*, current: int, goal: str, ref: str, user_text: str, ve
         # (來電通知,自報家門)承接:通知正正係呢啲問題嘅答案。舊規則「純提問
         # 唔推」係長開場年代嘅產物(開場已自報門,提問要原地答);拆分後原地
         # 答反而令通知姍姍來遲、開場步滯留(call-2cae7769 步標記喺 1/2 之間
-        # 亂跳實證)。REFUSE/OBJECTION/REPEAT 已喺頂部攔走。
+        # 亂跳實證)。REFUSE/OBJECTION/REPEAT/DEFER 已喺頂部攔走。
         return True
     if say_step:
         # 通知直念步:客戶對「記唔記得買咗咩貨品」嘅實質回應即推(下一步問平台
@@ -586,6 +688,10 @@ def decide_advance(user_text: str, *, facts: dict | None = None, short_ack_confi
     # 3) 提问且冇「多字确认」→ question(唔好因为句中出现已知尾号/单字係就当确认)
     if is_question and not strong_affirm:
         return QUESTION
+    # 3.5) 社交拖延(先于 CONFIRM:「好的我查一下」的「好的」唔好抢跑)→ DEFER:
+    #      客户要去查/稍后讲,agent 直念三语短应承,唔推进唔 judge 唔走 LLM。
+    if _DEFER_RE.search(t):
+        return DEFER
     # 4) 确认/认可(社交词、多字确认、或答啱资料)→ confirm(先于提问:客户"是我的,然后呢?"主体是确认)。
     #    单字/双字纯应承喺非问话步降 UNCLEAR——寒暄唔推流程。
     if (strong_affirm or fact_match or _CONFIRM_RE.search(t)) and not (short_ack and not short_ack_confirms):
@@ -622,9 +728,12 @@ class FlowController:
     # 直念步(say=1)已念账本:推进/进入该步的当轮 agent 直念 ref 首行,
     # 念过即记 —— 后续轮 current_step_text 注入【通知已念】防 LLM 重复整段。
     said_steps: set[int] = field(default_factory=set)
+    # 最近一轮客户原话(渐进披露用:match_step_branch 按它+verdict 命中单分支,
+    # 只给 verdict 不给原话时「问为什么赔/问什么时候到」这类同族分支分不开)。
+    last_user_text: str = ""
     # 最近一轮规则判定(question/unclear/objection/...)——verdict 此前只用于推进
-    # 判定、从不进提示词,客户提问/答非所问时模型冇「该怎么答」指引 → 4B 默认
-    # 复读当前步。current_step_text 据此渲染对应应答指引。
+    # 判定、从不进提示词,客户提问/答非所问时模型冇「该怎么答」指引 → 复读当前步。
+    # current_step_text 据此渲染对应应答指引。
     last_verdict: str = ""
     # 最近一轮客户报出的数字串(≥4 位,已归一成 ASCII)——数字係 ASR 最弱项
     # (同一串数字两窗两解,2026-09-07 日志实证),AI 拿到错号从不复核。
@@ -642,6 +751,9 @@ class FlowController:
     def __post_init__(self) -> None:
         self.vars_map: dict[str, str] = {}
         self._just_advanced = False  # 上一轮确认推进咗 → 注入「新一步」提示,提醒 LLM 换步
+        # 渐进披露渲染账本:每步第一次渲染(装配/推进后首轮)才注入底稿,
+        # 此后转分支模式(正稿已入对话史,重发只喂复制引力)。
+        self._last_render_step = -1
 
     @property
     def has_steps(self) -> bool:
@@ -799,6 +911,15 @@ class FlowController:
                 done_text += "客户刚确认过，毋需再问任何已答过的事——简单回应后等客户讲。"
             return done_text
         step = self.steps[self.current]
+        # 渐进披露首轮判定:每步的第一次渲染(装配/推进后的首轮)注入底稿,此后
+        # 分支模式。渲染计数而非从 _just_advanced/opening_played 推导——装配
+        # 渲染(会话搭建时 set_flow)也算首轮,单步模板/暂停起步不会卡在首轮。
+        # 【新一步】块另用 _just_advanced(只有真推进才提示「换步重新开头」)。
+        _first_turn = self._last_render_step != self.current
+        self._last_render_step = self.current
+        _new_step = self._just_advanced and self.current > 0
+        self._just_advanced = False
+        parts = parse_step_ref(step.ref)
         lines = [f"流程第 {self.current + 1}/{len(self.steps)} 步"]
         if self.current == 0 and self.opening_played:
             lines.append(
@@ -811,7 +932,7 @@ class FlowController:
                 "不必再整段重复——接客户对通知的回应（答货品/质疑/情绪）继续，"
                 "客户明确要求重讲时除外（那要放慢再讲一遍关键内容）。"
             )
-        if self._just_advanced and self.current > 0:
+        if _new_step:
             lines.append(
                 "【新一步】客户刚刚确认了上一步，现在已经进入这一步。"
                 "立即按这一步的目标来讲——不要讲「等我查下再答复你」「几分钟内答复你」这类拖延话术"
@@ -822,7 +943,6 @@ class FlowController:
         verdict_line = self._verdict_guidance()
         if verdict_line:
             lines.append(verdict_line)
-            self._just_advanced = False
         if self.last_digits:
             digits_txt = "、".join(self.last_digits[:2])
             lines.append(
@@ -831,13 +951,30 @@ class FlowController:
             )
         if step.goal:
             lines.append(f"这一步要达成:{render_template_text(step.goal, self.vars_map)}")
-        if step.ref:
-            lines.append(f"参考要点(内部指示,勿念给客户):{render_template_text(step.ref, self.vars_map)}")
+        # 渐进披露(2026-09-12 P0):正稿只进本步首轮——此后它已入对话史(模型
+        # 自己讲过/直念过),逐轮重发只是喂复制引力(call-8fa17d2b 整段重念根因);
+        # say 步恒不给正稿(直念原文在历史,另有【通知已念】提示)。分支只在
+        # 非首轮按当轮回应命中一条;命中不了就不注入,绝不退回全量。
+        if _first_turn and not step.say and parts.script:
+            lines.append(
+                "本步底稿(内部资料,用自己的口语讲,绝不逐字念出来,也不要把内容一次倒光):"
+                + render_template_text(parts.script, self.vars_map)
+            )
+        if not _first_turn or step.say:
+            _m = match_step_branch(parts, self.last_user_text, self.last_verdict)
+            if _m:
+                lines.append(
+                    "【应对客户当前回应】客户"
+                    + render_template_text(_m[0], self.vars_map)
+                    + " → 应对:"
+                    + render_template_text(_m[1], self.vars_map)
+                )
+        for _n in parts.notes[:2]:
+            lines.append("注意:" + render_template_text(_n, self.vars_map))
         lines.append(
-            "只围绕当前这一步回应，说清楚就停下等用户，不要替用户答或自行跳到下一步；"
-            "客户问及后续可先简短回应再把话题带回当前步。"
-            "参考要点是内部指示，用自己的口语讲，绝不把原文整段念出来，也不要把方案/金额一次倒光；"
-            "「如果客户…→ 就…」这类分支只在出现对应情况时照做，绝不把「如果」指示念给客户。"
+            "只围绕当前这一步回应，说清楚就停下等客户，不要替客户答或自行跳到下一步；"
+            "客户问什么，先用一句话直接答他问的事（用手上的资料和上面的应对，不照念底稿），"
+            "再把话题带回当前步。"
             "不要索取电话/WhatsApp/微信等联系方式，除非当前步参考明确要求"
             "（如向客户索取其 WhatsApp/微信号码，由专员添加）；"
             "核实资料用选项式引导（「您是在拼多多、淘宝还是京东买的？」），客户答到关键资料就确认并自然过渡，不无限追问。"

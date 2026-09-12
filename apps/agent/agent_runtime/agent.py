@@ -428,6 +428,17 @@ def _wa_accum_merge(stashed: str, incoming: str) -> str:
     return f"{stashed}，{incoming}"
 
 
+def _defer_ack_line(lang: str) -> str:
+    """DEFER 短应承(session.say 脚本直念,零 TTFT/零前缀断裂):客户要自己去查/
+    稍后再讲时的一句应承。三语骨架,风格同 _nudge_line;万能话术原则——不含
+    动作承诺,任何拖延语境都不穿帮。"""
+    if lang == "cantonese":
+        return "好嘅，唔急，您慢慢睇，我喺電話呢邊等您。"
+    if lang == "en":
+        return "Sure, no rush — take your time, I'll stay on the line."
+    return "好的，不着急，您慢慢看，我在电话这边等您。"
+
+
 def _wa_number_line(lang: str, num: str) -> str:
     """碎片暂存超时 flush 嘅脚本直念(session.say,零 TTFT/零前缀断裂):captured →
     复述确认;唔系号码 → 请客户继续。三语骨架,风格同 _nudge_line。"""
@@ -1194,7 +1205,7 @@ async def entrypoint(ctx):
 
     # 对话流程控制器:载入模板分步 + 对象变量;由它按轮注入"当前步",逐步推进。
     from .flow import FlowController, facts_line
-    from .flow import CONFIRM, OBJECTION, QUESTION, REFUSE, UNCLEAR, detect_whatsapp_signal, extract_call_facts
+    from .flow import CONFIRM, DEFER, OBJECTION, QUESTION, REFUSE, REPEAT, UNCLEAR, detect_whatsapp_signal, extract_call_facts
     from .flow import _digit_normalize, _looks_like_whatsapp_step, _WHATSAPP_DECLINE, digits_to_cantonese
     from .flow import wa_confirm_advance_allowed
 
@@ -2445,6 +2456,13 @@ async def entrypoint(ctx):
                     # verdict 进尾部:规则判定结果此前只用于推进、从不进提示词,
                     # 客户提问/答非所问时模型冇「该怎么答」指引 → 复读当前步。
                     flow_ctrl.last_verdict = verdict
+                    # 客户原话进尾部账本:渐进披露按 verdict+原话命中单分支
+                    # (只给 verdict 时「问为什么赔/问什么时候到」同族分不开)。
+                    flow_ctrl.last_user_text = user_text
+                    # 出口复读防线放行标志:客户明确要求重讲(REPEAT)时,模型
+                    # 照讲上一句关键内容是正确行为,不当拟声复读剥掉;其余轮
+                    # 逐句比对上一句回复,复读句出口剥除。
+                    context_state.repeat_requested = verdict == REPEAT
                     # 数字串进尾部:数字係 ASR 最弱项,渲染「逐位复述核对」指引,
                     # 唔复核错号就一直错落去。
                     flow_ctrl.last_digits = _digit_runs_in(user_text)
@@ -2517,6 +2535,34 @@ async def entrypoint(ctx):
                     context_state.set_flow_current(flow_ctrl.current_step_text())
                 except Exception:  # pragma: no cover - 流程推进失败不阻断回复
                     pass
+            # ---- DEFER 短应承车道(2026-09-12 P0「会说话」) ----
+            # 客户社交拖延(「我先查一下/有了再通知你/稍等我看看」)→ 三语短应承
+            # 脚本直念(零 TTFT/零照本),不推进/不 judge/不走 LLM——call-8fa17d2b
+            # 实证:这类轮落到 LLM 只会把当前步问题原样重发,多句连说时配合碎片
+            # 提交=「只剩垫话不答正事」的卡死体感。raise 须在 except-pass try 之外
+            # (同 say-step/WA 累积姿势);BOK_DEFER_ACK=0 回退走 LLM。
+            if (
+                flow_ctrl.last_verdict == DEFER
+                and os.environ.get("BOK_DEFER_ACK", "1") == "1"
+                and not closed.is_set()
+            ):
+                _ack = _defer_ack_line(language_state.lang)
+                context_state.set_last_reply(_ack)
+                _turn_origin["gen"] = "script"
+                _turn_origin["provider"] = "defer-ack"
+                try:
+                    _defer_ms = int((time.monotonic() - _t0) * 1000)
+                    await cp.add_turn(
+                        call_id, "user", user_text, language=language_state.lang,
+                        line="a", speaker="customer",
+                        template_step=(int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0,
+                        started_ms=_defer_ms, ended_ms=_defer_ms,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                print(f"[flow] defer-ack (call {room_name})", flush=True)
+                await _say_script(session, tts_provider, _tts_cache, _ack)
+                raise StopResponse()
             # ---- 直念步快路(2026-09-12 开场白三段拆分):当前步标 say=1 且未念
             # → 本轮以脚本直念作答(ref 首行,_say_script 缓存线),跳过 LLM。
             # 通知/道歉/赔偿承诺要逐字一致:LLM 自由发挥会同一段通知每轮换措辞
