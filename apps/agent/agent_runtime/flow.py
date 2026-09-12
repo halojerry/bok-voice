@@ -376,14 +376,52 @@ def wa_confirm_advance_allowed(*, goal: str, ref: str, captured: bool) -> bool:
     return captured or not _looks_like_whatsapp_step(goal, ref)
 
 
+# 分组报号折叠(call-5f8bef6b 实证):客户按组报号「751 ⏸ 220」,ASR 在组间落
+# 逗号/顿号/连字符 → run 被劈成 3+3,4 位下限全打回 → captured 永不触发、WA 步
+# 锁死(LLM 明明听懂了 751-220,规则层不认账)。只折叠「两侧皆数字」的分组分隔符;
+# 句号(.。)与小数点不折——句界两侧虽也常是数字,折叠会把「賠300。號碼…」两句焊成
+# 一条,小数 1.5 会变 15。修正句「唔係5，係3」中间是汉字,天然不受影响。
+# 2026-09-12 review 加固:①～/~ 是范围语义字符非分组符,不进折叠类(「300～500」
+# 是赔偿区间不是号码);②金额/量词守卫——右组紧跟 块蚊元倍件年月日斤个% 或左组
+# 前贴货币符时该边界不折(「賠300-500塊」=区间,「¥300，500」=两笔金额)。
+_DIGIT_GROUP_SEP_RE = re.compile(r"(?<=[0-9])[，,、．·\-—–]+(?=[0-9])")
+_RANGEY_UNIT_AFTER = "块塊蚊元倍件年月日斤个個％%"
+_CURRENCY_BEFORE = "¥$＄"
+
+
+def _collapse_digit_groups(norm: str) -> str:
+    """逐边界折叠数字组间分隔符;金额/量词语境的边界保留(见上注释)。"""
+    parts = _DIGIT_GROUP_SEP_RE.split(norm)
+    if len(parts) <= 1:
+        return norm
+    seps = _DIGIT_GROUP_SEP_RE.findall(norm)
+    out = parts[0]
+    for sep, part in zip(seps, parts[1:]):
+        guarded = False
+        m = re.match(r"\d+", part)
+        if m:
+            nxt = part[m.end() : m.end() + 1]
+            if nxt and nxt in _RANGEY_UNIT_AFTER:
+                guarded = True
+        tail = re.search(r"\d+$", out)
+        if tail and tail.start() > 0:
+            prev = out[tail.start() - 1 : tail.start()]
+            if prev and prev in _CURRENCY_BEFORE:
+                guarded = True
+        out += (sep if guarded else "") + part
+    return out
+
+
 def _valid_digit_runs(norm: str, *, min_len: int = 4, max_len: int = 13) -> list[str]:
     """攞 min_len–max_len 位数字串(WhatsApp 號碼長度唔固定:香港8位/內地11位/帶區號13位)。
     下限 4:再短(1-3位)基本只會係 ASR 碎片——客戶讀號被 VAD 切段、或者糾正聽錯嘅
     數字(「唔係5,係3」)——照收會攞住半個號碼提前推進,所以唔收;4 位以上喺 WhatsApp
     語境(收號碼步/句中提 WhatsApp/微信)視為客戶報出嘅號碼照捕(用戶拍板:報出就收;
     5位測試短號「一二二三三」曾因舊 6 位門檻全數走漏→唔爆閃)。
-    已知單號/尾號/電話另有 known-number 過濾兜底(覆述已知資料唔當新號碼)。"""
-    return [r for r in re.findall(rf"[0-9]{{{min_len},{max_len}}}", norm)]
+    已知單號/尾號/電話另有 known-number 過濾兜底(覆述已知資料唔當新號碼)。
+    组间分组分隔符(逗号/顿号/连字符等,两侧皆数字)先折叠——「751,220」係分组报号
+    唔係两个号(2026-09-12 拍板);空格由 _digit_normalize 已删,唔喺此列。"""
+    return [r for r in re.findall(rf"[0-9]{{{min_len},{max_len}}}", _collapse_digit_groups(norm))]
 
 
 def _digit_runs_in(text: str) -> list[str]:

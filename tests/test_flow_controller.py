@@ -335,6 +335,48 @@ def test_detect_whatsapp_captured_number():
     assert detect_whatsapp_signal("我WhatsApp號碼係 9852 6633", step_goal=WA_GOAL, step_ref=WA_REF) == ("captured", "98526633")
 
 
+def test_detect_whatsapp_grouped_digits_collapsed():
+    """分组报号(call-5f8bef6b 实证):客户按组报号「751 ⏸ 220」,ASR 在组间落
+    逗号/顿号/连字符 → 归一后 run 被劈成 3+3,4 位连续下限全部打回 → captured
+    永不触发、WA 步锁死。组间分隔符(两侧皆数字)折叠成一条 run;句号/小数点
+    是句界与小数语义,不折叠。"""
+    from agent_runtime.flow import detect_whatsapp_signal
+    # 英文分组报号(本通实证形态)
+    assert detect_whatsapp_signal("Seven five one, two two zero.", step_goal=WA_GOAL, step_ref=WA_REF) == ("captured", "751220")
+    # 中文分组:逗号/顿号/连字符
+    assert detect_whatsapp_signal("我嘅號碼係 9852，6633", step_goal=WA_GOAL, step_ref=WA_REF) == ("captured", "98526633")
+    assert detect_whatsapp_signal("六四三二、五四三二", step_goal=WA_GOAL, step_ref=WA_REF) == ("captured", "64325432")
+    assert detect_whatsapp_signal("我WhatsApp係 9852-6633", step_goal=WA_GOAL, step_ref=WA_REF) == ("captured", "98526633")
+    # 修正句「唔係5，係3」:中间是汉字,唔折叠,两段各 <4 位照舊唔收
+    assert detect_whatsapp_signal("唔係5，係3", step_goal=WA_GOAL, step_ref=WA_REF) is None
+    # 小数点/句号不折叠:小数句号两侧虽是数字,折叠会把 1.5 变 15、把「赔300。号码…」两句焊成一条
+    assert detect_whatsapp_signal("賠償1.5倍呀", step_goal=WA_GOAL, step_ref=WA_REF) is None
+    assert detect_whatsapp_signal(
+        "賠償300。我號碼係98526633", step_goal=WA_GOAL, step_ref=WA_REF
+    ) == ("captured", "98526633")
+    # review 加固:范围/金额语境不折——「300～500」是赔偿区间、「300-500块」带量词、
+    # 「¥300,500」两笔金额;折了会捏出 300500 假号码假捕获。
+    assert detect_whatsapp_signal("賠償300～500蚊", step_goal=WA_GOAL, step_ref=WA_REF) is None
+    assert detect_whatsapp_signal("賠償300-500塊", step_goal=WA_GOAL, step_ref=WA_REF) is None
+    assert detect_whatsapp_signal("¥300,500的賠償", step_goal=WA_GOAL, step_ref=WA_REF) is None
+
+
+def test_wa_accum_merge_redecode_prefix_replaced():
+    """累积合并(「唔结合上下文」根因):第二段 FINAL 常是全窗重解(自带前文头),
+    盲拼 stash+新段 → 头重复 → 「oneSeven」粘连吃数字。归一前缀命中 → 用新段
+    整句替换;真续段 → 带分隔符拼接(唔可以裸拼,「five one」「two zero」会粘词)。"""
+    from agent_runtime.agent import _wa_accum_merge
+
+    # 全窗重解(新段含暂存头)→ 替换,唔可以 doubling
+    assert _wa_accum_merge("seven five one", "Seven five one, two two zero.") == "Seven five one, two two zero."
+    # 大小写/词形差异由归一吃掉
+    assert _wa_accum_merge("我的WhatsApp係", "我的WhatsApp係64325432") == "我的WhatsApp係64325432"
+    # 真续段 → 带分隔符拼接
+    assert _wa_accum_merge("我的WhatsApp係", "六四三二五四三二") == "我的WhatsApp係，六四三二五四三二"
+    # 空暂存直通
+    assert _wa_accum_merge("", "abc") == "abc"
+
+
 def test_detect_whatsapp_known_number_excluded():
     from agent_runtime.flow import detect_whatsapp_signal
     F = {"姓名": "林先生", "快递单号": "SF1234567890", "快递尾号": "7890", "电话": "13800000000"}

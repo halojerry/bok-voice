@@ -408,6 +408,26 @@ def _wa_numberish(text: str) -> bool:
     return digits >= 1 and len(rest) <= 6
 
 
+def _wa_accum_merge(stashed: str, incoming: str) -> str:
+    """累积合并:「结合上下文」的正确姿势(call-5f8bef6b 实证)。
+
+    第二段 FINAL 常是全窗重解(自带前文头)——盲拼 stash+新段会头重复,
+    「oneSeven」类粘连吃掉数字、numberish 判假提前放行、captured 永不触发。
+    归一前缀命中(暂存是新段的前缀,或新段是暂存的前缀)→ 用长的一方整句替换;
+    真续段 → 带「，」分隔符拼接(裸拼会毁灭词边界:「five one」+「two zero」
+    →「onetwo」不再匹配数字词表)。"""
+    if not stashed:
+        return incoming
+    sn = _digit_normalize(stashed)
+    un = _digit_normalize(incoming)
+    if sn and un:
+        if un.startswith(sn):
+            return incoming
+        if sn.startswith(un):
+            return stashed
+    return f"{stashed}，{incoming}"
+
+
 def _wa_number_line(lang: str, num: str) -> str:
     """碎片暂存超时 flush 嘅脚本直念(session.say,零 TTFT/零前缀断裂):captured →
     复述确认;唔系号码 → 请客户继续。三语骨架,风格同 _nudge_line。"""
@@ -2325,7 +2345,7 @@ async def entrypoint(ctx):
                 _g, _r = flow_ctrl.current_goal_ref()
                 if _looks_like_whatsapp_step(_g, _r) and user_text.strip() and not closed.is_set():
                     _stashed = _wa_accum["text"]
-                    _merged = (_stashed + user_text) if _stashed else user_text
+                    _merged = _wa_accum_merge(_stashed, user_text)
                     _n = sum(ch.isdigit() for ch in _digit_normalize(_merged))
                     _stash_it = (
                         not _WHATSAPP_DECLINE.search(user_text.lower())
