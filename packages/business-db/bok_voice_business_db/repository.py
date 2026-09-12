@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select
@@ -651,14 +652,20 @@ class SqlAlchemyBusinessRepository:
         row = self.session.get(models.RosterEntry, entry_id)
         return self._roster_to_dict(row) if row else None
 
-    def update_roster_entry(self, entry_id: str, **fields) -> dict | None:
+    def update_roster_entry(self, entry_id: str, **fields: Any) -> dict | None:
         row = self.session.get(models.RosterEntry, entry_id)
         if not row:
             return None
         for key in ("call_id", "object_id", "channel", "number", "display_name",
                     "summary", "status", "claimed_by", "claimed_at"):
             if key in fields and fields[key] is not None:
-                setattr(row, key, fields[key])
+                # claimed_at 读侧是 ISO 字符串（_roster_to_dict），调用方做读改写时
+                # 会把字符串传回来；SQLite/Postgres DateTime 列只收 datetime，
+                # 不收会抛 StatementError——与 InMemory 侧字符串直存对齐语义。
+                value = fields[key]
+                if key == "claimed_at" and isinstance(value, str):
+                    value = datetime.fromisoformat(value)
+                setattr(row, key, value)
         self.session.commit()
         return self._roster_to_dict(row)
 
