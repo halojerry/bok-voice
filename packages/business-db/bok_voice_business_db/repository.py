@@ -587,6 +587,81 @@ class SqlAlchemyBusinessRepository:
             out.append(item)
         return out
 
+    # ---- roster（名册认领池）----
+
+    @staticmethod
+    def _roster_to_dict(row: models.RosterEntry) -> dict:
+        return {
+            "id": row.id, "account_id": row.account_id, "call_id": row.call_id,
+            "object_id": row.object_id, "channel": row.channel, "number": row.number,
+            "display_name": row.display_name, "summary": row.summary,
+            "status": row.status, "claimed_by": row.claimed_by,
+            "claimed_at": row.claimed_at.isoformat() if row.claimed_at else "",
+            "created_at": row.created_at.isoformat() if row.created_at else "",
+        }
+
+    def upsert_roster_entry(self, *, account_id: str, call_id: str, object_id: str,
+                            channel: str, number: str, display_name: str = "",
+                            summary: str = "") -> dict:
+        from sqlalchemy import and_
+        row = (
+            self.session.query(models.RosterEntry)
+            .filter(and_(
+                models.RosterEntry.account_id == account_id,
+                models.RosterEntry.object_id == object_id,
+                models.RosterEntry.channel == channel,
+                models.RosterEntry.number == number,
+                models.RosterEntry.status != "handled",
+            ))
+            .order_by(models.RosterEntry.created_at.desc())
+            .first()
+        )
+        if row is None:
+            row = models.RosterEntry(
+                id=f"roster-{_uuid()[:8]}", account_id=account_id, call_id=call_id,
+                object_id=object_id, channel=channel, number=number,
+                display_name=display_name, summary=summary,
+            )
+            self.session.add(row)
+        else:
+            row.call_id = call_id
+            if display_name:
+                row.display_name = display_name
+            if summary:
+                row.summary = summary
+        self.session.commit()
+        return self._roster_to_dict(row)
+
+    def list_roster(self, account_id: str = "acc-001", status: str = "",
+                    channel: str = "") -> list[dict]:
+        from sqlalchemy import and_
+        q = self.session.query(models.RosterEntry).filter(
+            models.RosterEntry.account_id == account_id)
+        conds = []
+        if status:
+            conds.append(models.RosterEntry.status == status)
+        if channel:
+            conds.append(models.RosterEntry.channel == channel)
+        if conds:
+            q = q.filter(and_(*conds))
+        rows = q.order_by(models.RosterEntry.created_at.desc()).all()
+        return [self._roster_to_dict(r) for r in rows]
+
+    def get_roster_entry(self, entry_id: str) -> dict | None:
+        row = self.session.get(models.RosterEntry, entry_id)
+        return self._roster_to_dict(row) if row else None
+
+    def update_roster_entry(self, entry_id: str, **fields) -> dict | None:
+        row = self.session.get(models.RosterEntry, entry_id)
+        if not row:
+            return None
+        for key in ("call_id", "object_id", "channel", "number", "display_name",
+                    "summary", "status", "claimed_by", "claimed_at"):
+            if key in fields and fields[key] is not None:
+                setattr(row, key, fields[key])
+        self.session.commit()
+        return self._roster_to_dict(row)
+
     @staticmethod
     def default_settings() -> dict:
         return {
@@ -654,6 +729,7 @@ class InMemoryBusinessRepository:
         self.global_insights: list[dict] = []
         self.audit_events: list[dict] = []
         self.qa_entries: dict[str, dict] = {}
+        self.roster: dict[str, dict] = {}
         self.settings: dict = SqlAlchemyBusinessRepository.default_settings()
 
     def create_call(self, manifest: SessionManifest) -> dict:
@@ -971,3 +1047,47 @@ class InMemoryBusinessRepository:
         if call_id:
             items = [e for e in items if e.get("call_id") == call_id]
         return items[:limit]
+
+    # ---- roster（名册认领池）----
+
+    def upsert_roster_entry(self, *, account_id: str, call_id: str, object_id: str,
+                            channel: str, number: str, display_name: str = "",
+                            summary: str = "") -> dict:
+        for row in self.roster.values():
+            if (row["account_id"] == account_id and row["object_id"] == object_id
+                    and row["channel"] == channel and row["number"] == number
+                    and row["status"] != "handled"):
+                row["call_id"] = call_id
+                if display_name:
+                    row["display_name"] = display_name
+                if summary:
+                    row["summary"] = summary
+                return dict(row)
+        from datetime import datetime, timezone
+        entry = {
+            "id": f"roster-{uuid.uuid4().hex[:8]}", "account_id": account_id,
+            "call_id": call_id, "object_id": object_id, "channel": channel,
+            "number": number, "display_name": display_name, "summary": summary,
+            "status": "unclaimed", "claimed_by": "", "claimed_at": "",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.roster[entry["id"]] = entry
+        return dict(entry)
+
+    def list_roster(self, account_id: str = "acc-001", status: str = "",
+                    channel: str = "") -> list[dict]:
+        rows = [dict(r) for r in self.roster.values() if r["account_id"] == account_id
+                and (not status or r["status"] == status)
+                and (not channel or r["channel"] == channel)]
+        return sorted(rows, key=lambda r: r["created_at"], reverse=True)
+
+    def get_roster_entry(self, entry_id: str) -> dict | None:
+        row = self.roster.get(entry_id)
+        return dict(row) if row else None
+
+    def update_roster_entry(self, entry_id: str, **fields: Any) -> dict | None:
+        row = self.roster.get(entry_id)
+        if not row:
+            return None
+        row.update({k: v for k, v in fields.items() if v is not None})
+        return dict(row)

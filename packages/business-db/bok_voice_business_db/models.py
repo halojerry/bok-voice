@@ -115,6 +115,27 @@ class CallSession(Base):
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
+class RosterEntry(Base):
+    """名册（认领池）：通话中捕获的客户 WhatsApp/微信号码，专员认领后对接。
+
+    去重键 = account+object+channel+number 且 status != handled；captured 自动入册。
+    status: unclaimed(待认领) / claimed(已认领) / handled(已对接)。
+    """
+    __tablename__ = "roster_entries"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(64), index=True)
+    call_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    object_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    channel: Mapped[str] = mapped_column(String(16), default="whatsapp")
+    number: Mapped[str] = mapped_column(String(64), default="")
+    display_name: Mapped[str] = mapped_column(String(255), default="")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(16), default="unclaimed")
+    claimed_by: Mapped[str] = mapped_column(String(64), default="")
+    claimed_at: Mapped[datetime | None] = mapped_column(default=None)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
 class Turn(Base):
     __tablename__ = "turns"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
