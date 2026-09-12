@@ -2351,6 +2351,10 @@ async def entrypoint(ctx):
                         print(f"QWEN3_HOTWORD_ECHO_DROP (call {room_name})", flush=True)
                         raise StopResponse()
                     user_text = _stripped
+                    try:
+                        new_message.text_content = _stripped
+                    except Exception:  # pragma: no cover - 历史消息改写失败只损显示一致性
+                        pass
             # WA 号码碎片累积:号码主导句且累计 <8 位、或自报头半句(「我的WhatsApp係」)
             # → 暂存+StopResponse(唔回复、唔侦测、唔推进),等下一段拼埋一次过处理。
             # 超时 flush 见 _arm_wa_accum_flush。StopResponse 必须喺任何 except-pass

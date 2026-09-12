@@ -1980,6 +1980,37 @@ def supervisor_join(call_id: str) -> dict:
     }
 
 
+@app.post("/api/web_logs")
+async def web_logs(payload: dict) -> dict:
+    """web 客户端(浏览器侧)关键事件落盘——同传控制台的设备枚举/自动分配/sink 路由/
+    麦克风开关等决策只发生在浏览器里,服务端日志全然看不见(2026-09-12 同传输出
+    路由排障多轮全靠排除法实证)。JSON 行追加 logs/web-client.log,与 agent.log 同
+    目录;行限长防刷爆。上报失败静默(诊断通道永不影响功能)。"""
+    from datetime import datetime, timezone
+
+    event = str(payload.get("event") or "")[:80]
+    if not event:
+        return {"ok": False}
+    call_id = str(payload.get("call_id") or "")[:64]
+    try:
+        data = json.dumps(payload.get("data"), ensure_ascii=False)[:2000]
+    except Exception:
+        data = "??"
+    line = json.dumps(
+        {"ts": datetime.now(timezone.utc).isoformat(), "call_id": call_id, "event": event, "data": data},
+        ensure_ascii=False,
+    )
+    try:
+        log_dir = Path(os.environ.get("BOK_APP_DATA", str(Path.home() / "Library" / "Application Support" / "BokVoice"))) / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with (log_dir / "web-client.log").open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as exc:  # pragma: no cover - 诊断通道失败不阻功能
+        print(f"[web_logs] write failed: {exc!r}", flush=True)
+        return {"ok": False}
+    return {"ok": True}
+
+
 @app.post("/api/supervisor/{call_id}/pause-agent")
 def pause_agent(call_id: str) -> dict:
     call = _repo().update_call(call_id, status=CallStatus.PAUSED.value)

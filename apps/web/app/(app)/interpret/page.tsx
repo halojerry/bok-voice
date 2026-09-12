@@ -98,10 +98,10 @@ export default function InterpretPage() {
           </label>
         </div>
         <p className="text-xs leading-relaxed text-(--stage-muted)">
-          两人同机各一支麦：一个页面同时接入本会话两端，我方与对方的译文都从同一个扬声器出声
-          （默认共享输出，Mac/Windows 任何内核可用），同页看双向原文+译文字幕；译文播报时自动
-          暂让对向麦克风防串译。语言对在建房时钉死——请先选好再创建。两人各戴耳机分路听（独立双输出）
-          为高级选项，需桌面 Chrome。
+          两人各一支麦：一个页面同时接入本会话两端，同页看双向原文+译文字幕。听感拓扑——
+          <strong>对方听到我方译文的 TTS</strong>，<strong>我方听到对方原声</strong>（像直接通话），
+          对方→我方的译文只显示文字不出声；我方译文播报时自动暂让对方麦克风防串译。
+          语言对在建房时钉死——请先选好再创建。进房后按「启动传译」才开始。
         </p>
         <button className="stage-btn-primary w-fit" disabled={busy} onClick={startConsole}>
           创建一体台会话
