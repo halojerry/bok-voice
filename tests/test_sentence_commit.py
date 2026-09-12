@@ -1278,3 +1278,113 @@ def test_vocab_prefix_hold_gate(monkeypatch):
     assert _join_hold_vocab_enabled() is True
     monkeypatch.delenv("QWEN3_ASR_JOIN_HOLD_VOCAB", raising=False)
     assert _join_hold_vocab_enabled() is True  # 默认开
+
+
+# ---- 停嘴层词表回声闸=剥尾保头(2026-09-12 call-46b94ebd P0) ----
+# 旧版停嘴 FINAL 用纯回声判定整条丢弃:真答案词恰在词表里(「拼多多。顺豐速運,…」)
+# 连真实回答一起丢——平台问题答「拼多多」被吞、客户抱怨触发假推进。闸口对齐
+# hook 层 _vocab_echo_guard 三件套语义。
+
+
+_ECHO_VOCAB = (
+    "Vocabulary: 順豐速運, 運通, 理賠, 京東, 拼多多, 單號, 運單, 賠償, 運費, 專員, 集運, 時效, 上門, 追蹤, 核實, 微信, 顺丰物流"
+)
+
+
+def _echo_stream():
+    """LLMStream/RecognizeStream 构造依赖运行中的事件循环(同其它用例 asyncio.run 姿势)。"""
+    import asyncio as _a
+
+    async def _mk():
+        st = _make_stream("zh")
+        st._stt_._hotword_context = _ECHO_VOCAB
+        return st
+
+    return _a.run(_mk())
+
+
+def test_echo_filter_keeps_real_head_over_vocab_tail():
+    stream = _echo_stream()
+    out = stream._echo_filter(
+        "拼多多。顺豐速運，運通，理賠，京東，拼多多，单号，运单，赔偿，运费，专员，集运，时效，上门，追踪，核实，微信，顺丰物流。",
+        "stop-mouth",
+    )
+    assert out.strip("。，, 、;；") == "拼多多"
+
+
+def test_echo_filter_pure_echo_dropped_and_lone_word_after_seen():
+    stream = _echo_stream()
+    assert stream._echo_filter("顺豐速運，運通，理賠，京東，拼多多，单号，运单。", "stop-mouth").strip(
+        "。，, 、;；"
+    ) == ""
+    # echo_seen 后孤词残片同丢;kill-switch 关闸全放行
+    assert stream._vocab_echo_seen is True
+    assert stream._echo_filter("顺丰速运", "stop-mouth").strip("。，, 、;；") == ""
+    os.environ["QWEN3_HOTWORD_ECHO_GUARD"] = "0"
+    try:
+        assert stream._echo_filter("顺豐速運，運通，理賠。", "stop-mouth") == "顺豐速運，運通，理賠。"
+    finally:
+        del os.environ["QWEN3_HOTWORD_ECHO_GUARD"]
+
+
+def test_echo_filter_normal_text_untouched():
+    stream = _echo_stream()
+    assert stream._echo_filter("好的，淘宝，京东。", "stop-mouth") == "好的，淘宝，京东。"
+    assert stream._echo_filter("我件货三天了还没到，麻烦帮我查一下。", "stop-mouth") == "我件货三天了还没到，麻烦帮我查一下。"
+
+
+def test_echo_filter_separatorless_pure_chain_dropped_but_short_real_answer_kept():
+    stream = _echo_stream()
+    # 无分隔符纯顺串(旧判定形态)照丢
+    assert stream._echo_filter("單號運單賠償", "stop-mouth") == ""
+    # 有分隔符的短真答案(平台选择)不进纯回声门——剥尾 <4 段宽容保留
+    assert stream._echo_filter("拼多多，京东。", "stop-mouth") == "拼多多，京东。"
+
+
+# ---- _uncommitted 长度感知取尾(2026-09-12「快语速吃尾字」) ----
+# 全量日志实证:91 次 REDECODE_DROP 里 19 次真吃内容(387 字)——finish 比
+# committed 长(客户继续讲的权威重解)被整条丢。长度感知:更长+高相似=同头+
+# 新尾,对齐截尾照发;长度相当才当纯重解丢弃。
+
+
+def test_uncommitted_longer_finish_extracts_new_tail():
+    async def scenario():
+        stream = _make_stream("zh")
+        try:
+            stream._committed_text = "我件货赶左三夜就到，到一格都未到啊！"
+            stream._last_sentence = "到一格都未到啊！"
+            out = stream._uncommitted("我件货赶左三夜就到，到一啩都未到啊！你的玩意破一颠破一个。")
+            assert "你的玩意破一颠破一个" in out
+            assert "我件货" not in out
+        finally:
+            stream._event_ch.close()
+
+    asyncio.run(scenario())
+
+
+def test_uncommitted_similar_length_still_dropped():
+    async def scenario():
+        stream = _make_stream("zh")
+        try:
+            stream._committed_text = "件嘢烂咗，外包装都阿咗。"
+            stream._last_sentence = "件嘢烂咗，外包装都阿咗。"
+            assert stream._uncommitted("件也爛咗，外包裝都阿咗。") == ""
+        finally:
+            stream._event_ch.close()
+
+    asyncio.run(scenario())
+
+
+def test_pure_hesitation_gate():
+    from agent_runtime.providers.livekit_plugins import _pure_hesitation
+
+    assert _pure_hesitation("呃呃呃呃。")
+    assert _pure_hesitation("啊呃。")
+    assert _pure_hesitation("哦哦")
+    # 单字应承/实词/数字/内容碎片绝不拦
+    assert not _pure_hesitation("嗯。")  # 单字应承=合法确认轮
+    assert not _pure_hesitation("好的。")
+    assert not _pure_hesitation("我唔知。")
+    assert not _pure_hesitation("通知你。")
+    assert not _pure_hesitation("呃")  # 单犹豫字保守放行
+    assert not _pure_hesitation("")

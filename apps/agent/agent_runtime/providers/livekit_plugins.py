@@ -2192,6 +2192,19 @@ def _is_lone_vocab_word(text: str, hotword_context: str) -> bool:
     return norm in _vocab_words_from_context(hotword_context)
 
 
+# 纯犹豫残片(2026-09-12 call-46b94ebd「呃呃呃呃」成轮):剥尾余头/全新短段只由
+# 语气字组成(呃/啊/哦…,不含 嗯/好/係/对——单字应承是合法确认轮),≥2 字即不成
+# 轮——成轮必发垫话+生成 LLM+打断在途回复(canceled=1 三连的卡死体感)。
+_HESITATION_CHARS = "呃啊哦噢唉诶嘛呗咯哼呣"
+_HESITATION_RE = re.compile(r"^(?:[" + _HESITATION_CHARS + r"])+$")
+
+
+def _pure_hesitation(text: str) -> bool:
+    """净文(去标点空白)全部由犹豫语气字组成且 ≥2 字 → 纯犹豫不成轮。"""
+    norm = re.sub(r"[^\w\u4e00-\u9fff]+", "", str(text or ""))
+    return len(norm) >= 2 and bool(_HESITATION_RE.match(norm))
+
+
 def _vocab_echo_guard(
     text: str, hotword_context: str, *, echo_seen: bool
 ) -> tuple[str, bool]:
@@ -2204,6 +2217,13 @@ def _vocab_echo_guard(
     stripped = _strip_vocab_echo_tail(text, hotword_context)
     if stripped != text:
         return stripped, True
+    # 无分隔符的纯顺串(「單號運單賠償」)剥尾看不见结构,用贪心全覆判定整条丢
+    # ——**只在无分隔符时**进此门:有分隔符的短串(「拼多多，京东。」)剥尾的
+    # <4 段宽容已判保留,纯回声判定会误杀平台选择类真实回答。
+    if not re.search(r"[.。！？!,，、;；]", str(text or "")) and _is_hotword_vocab_echo(
+        text, hotword_context
+    ):
+        return "", True
     if echo_seen and _is_lone_vocab_word(text, hotword_context):
         return "", True
     return text, echo_seen
@@ -4341,6 +4361,11 @@ def _pause_trigger_enabled() -> bool:
     return os.environ.get("QWEN3_ASR_SENTENCE_PAUSE_TRIGGER", "1") == "1"
 
 
+def _hesitation_gate_on() -> bool:
+    """纯犹豫残片门(QWEN3_ASR_HESITATION_GATE,默认开;0=回退成轮)。"""
+    return os.environ.get("QWEN3_ASR_HESITATION_GATE", "1") == "1"
+
+
 def _join_hold_s() -> float:
     """跨段拼接 hold 窗(秒):QWEN3_ASR_JOIN_HOLD_MS,默认 800;0=关(行为同旧)。
 
@@ -4497,24 +4522,31 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         # join-hold 词表前缀门用的热词词表(与 context 软偏置同一份,流级缓存);
         # fake/无 context → 空 tuple,门自动失效。
         self._vocab_terms = _parse_vocab_terms(getattr(stt_, "_hotword_context", ""))
+        # 词表回声事件账本(call-46b94ebd/1043de7c):确认过一次剥尾/纯回声后,
+        # 后续词表孤词残片按回声衰落丢弃——首现孤词保留(真人可能真讲「微信」)。
+        self._vocab_echo_seen: bool = False
 
-    def _vocab_echo(self, text: str) -> bool:
-        """热词幻听判定(源头闸):词表被当转写整串抄出 → True,调用方丢弃该事件。
+    def _echo_filter(self, text: str, src: str) -> str:
+        """词表回声统一闸(剥尾保头版,2026-09-12 call-46b94ebd P0)。
 
-        QWEN3_HOTWORD_ECHO_GUARD=0 回退。词表与 STT context 同一份(_hotword_context)。
-        """
+        旧版停嘴 FINAL 用纯回声判定(_is_hotword_vocab_echo)整条丢弃——真答案
+        词恰在词表里(「拼多多。顺豐速運,運通…」平台答案)连真实回答一起丢,
+        客户抱怨触发假推进。四个闸口(停嘴/join-flush/interim/句级提交)统一
+        换 hook 层 _vocab_echo_guard 三件套语义:真话头+词表尾→剥尾保头;纯回声
+        /echo_seen 后孤词残片→空串(调用方丢弃)。QWEN3_HOTWORD_ECHO_GUARD=0 关。"""
         if os.environ.get("QWEN3_HOTWORD_ECHO_GUARD", "1") != "1":
-            return False
-        return _is_hotword_vocab_echo(text, getattr(self._stt_, "_hotword_context", "") or "")
-
-    def _vocab_echo(self, text: str) -> bool:
-        """热词幻听判定(源头闸):词表被当转写整串抄出 → True,调用方丢弃该事件。
-
-        QWEN3_HOTWORD_ECHO_GUARD=0 回退。词表与 STT context 同一份(_hotword_context)。
-        """
-        if os.environ.get("QWEN3_HOTWORD_ECHO_GUARD", "1") != "1":
-            return False
-        return _is_hotword_vocab_echo(text, getattr(self._stt_, "_hotword_context", "") or "")
+            return text
+        clean, self._vocab_echo_seen = _vocab_echo_guard(
+            text,
+            getattr(self._stt_, "_hotword_context", "") or "",
+            echo_seen=self._vocab_echo_seen,
+        )
+        if clean != text:
+            if clean.strip("。，, 、;；"):
+                print(f"QWEN3_HOTWORD_ECHO_STRIP src={src} payload={text!r} keep={clean!r}", flush=True)
+            else:
+                print(f"QWEN3_HOTWORD_ECHO_DROP src={src} payload={text!r}", flush=True)
+        return clean
 
     async def _run(self) -> None:
         vad_stream = self._vad.stream()
@@ -4539,6 +4571,22 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                     self._event_ch.send_nowait(stt.SpeechEvent(stt.SpeechEventType.START_OF_SPEECH))
                     if not self._session_id:
                         await self._start_session()
+                        # VAD 起报前导喂会话(2026-09-12「快语速吃首字」修复):官方
+                        # silero 把 prefix padding(0.5s)+min_speech 确认窗的音频挂在
+                        # START 事件 frames 里交还(官方 StreamAdapter 在 END 用同一
+                        # buffer 识别);旧版增量会话无视之,起报前的 INFERENCE_DONE
+                        # 帧又被 not started 跳过——sidecar 从「确认说话」那刻才收
+                        # 音频,快语速首 1-3 字结构性缺失、finish 重解也救不回音频。
+                        # 新开会话时并入 _pending(下一个 INFERENCE_DONE 的
+                        # _maybe_partial 自动喂走);hold 续段(会话存活、INFERENCE_
+                        # DONE 全程在喂)不并入,防音频重复。
+                        if event.frames:
+                            try:
+                                self._pending.extend(
+                                    bytes(utils.merge_frames(event.frames).data)
+                                )
+                            except Exception:  # noqa: BLE001 - pre-roll 合帧失败不致命
+                                pass
                 elif event.type == vad.VADEventType.INFERENCE_DONE:
                     if not started or self._finishing:
                         continue
@@ -4630,8 +4678,10 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                     # 号码/答复（「说两句第二句被吞→AI 不回话」的根因）。
                     if committed_before and payload and len(payload) < _ASR_SENTENCE_MIN_CHARS and not _tail_carries_content(payload):
                         payload = ""
-                    if payload and self._vocab_echo(payload):
-                        print(f"QWEN3_HOTWORD_ECHO_DROP src=stop-mouth payload={payload!r}", flush=True)
+                    if payload:
+                        payload = self._echo_filter(payload, "stop-mouth")
+                    if payload and _hesitation_gate_on() and _pure_hesitation(payload):
+                        print(f"QWEN3_ASR_HESITATION_DROP payload={payload!r}", flush=True)
                         payload = ""
                     started = False
                     self._finishing = False
@@ -4683,8 +4733,10 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         # ——「六四三二」补报号码好过吞掉(2026-09-07 审查:hold 路漏抄豁免)。
         if committed_before and payload and len(payload) < _ASR_SENTENCE_MIN_CHARS and not _tail_carries_content(payload):
             payload = ""
-        if payload and self._vocab_echo(payload):
-            print(f"QWEN3_HOTWORD_ECHO_DROP src=join-flush payload={payload!r}", flush=True)
+        if payload:
+            payload = self._echo_filter(payload, "join-flush")
+        if payload and _hesitation_gate_on() and _pure_hesitation(payload):
+            print(f"QWEN3_ASR_HESITATION_DROP payload={payload!r}", flush=True)
             payload = ""
         self._finishing = False
         if self._session_epoch == _epoch_at_hold:
@@ -4815,8 +4867,8 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                 )
                 self._prev_partial = text  # 参照窗照常推进（与 _last_partial 同步）
                 # 字幕续流：只发未提交剩余（框架 _audio_transcript 已含已提交句）。
-                remainder = self._uncommitted(text)
-                if remainder and not self._vocab_echo(remainder):
+                remainder = self._echo_filter(self._uncommitted(text), "interim-window")
+                if remainder.strip("。，, 、;；"):
                     self._event_ch.send_nowait(
                         stt.SpeechEvent(
                             type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
@@ -4829,8 +4881,8 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         display = self._uncommitted(text)
         if not display:
             return
-        if self._vocab_echo(display):
-            print(f"QWEN3_HOTWORD_ECHO_DROP src=interim text={display!r}", flush=True)
+        display = self._echo_filter(display, "interim")
+        if not display.strip("。，, 、;；"):
             return
         self._event_ch.send_nowait(
             stt.SpeechEvent(
@@ -4883,9 +4935,9 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         拉不走会话语言）。只发 FINAL——句末 END_OF_SPEECH 由调用方按各自契约补
         （partial 标点路径紧随发 EOS；vad-pause 路径后面本就有停嘴 EOS，不重复发）。
         """
-        if self._vocab_echo(sentence):
-            # 词表幻听顺串:丢弃,不记账不发 FINAL(字幕/轮次/脑全链路不污染)
-            print(f"QWEN3_HOTWORD_ECHO_DROP src={source} sentence={sentence!r}", flush=True)
+        sentence = self._echo_filter(sentence, source)
+        if not sentence.strip("。，, 、;；"):
+            # 纯回声/残片:丢弃,不记账不发 FINAL(字幕/轮次/脑全链路不污染)
             return
         self._committed_text += sentence
         self._last_sentence = sentence
@@ -5001,13 +5053,44 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                     aligned_idx = i
                     break
             return text[aligned_idx + 1:].lstrip(_UNCOMMITTED_LEADING_WEAK_PUNCT) if aligned_idx >= 0 else ""
-        if difflib.SequenceMatcher(a=norm_c, b=norm_t).ratio() >= _ASR_REDECODE_DROP_RATIO:
+        sm = difflib.SequenceMatcher(a=norm_c, b=norm_t)
+        if sm.ratio() < _ASR_REDECODE_DROP_RATIO:
+            return text
+        if len(norm_t) <= len(norm_c) + 3:
+            # 长度相当:同一句话的更好重解,冇新内容——迟到 FINAL 会喺框架
+            # on_final_transcript 里掐死生成中的回复(call-58601bba),唔补发。
             print(
                 f"QWEN3_ASR_REDECODE_DROP committed={self._committed_text!r} finish={text!r}",
                 flush=True,
             )
             return ""
-        return text
+        # 同头+新尾(2026-09-12 长度感知):finish 明显更长=客户快语速继续讲的内容
+        # 在权威重解里,整条丢=真吃字(当日全量日志实测 19 次/387 字,单次最多 36
+        # 字)。按 diff 定位 committed 末端,对齐 raw 截新尾照发——内容送达优先,
+        # 碎片回复被 barge-in 是其本分。
+        tail_start = None
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "equal" and i1 < i2 and i2 == len(norm_c):
+                tail_start = j2  # committed 全文映射完之后=新尾巴起点(norm 坐标)
+        if tail_start:
+            cnt = 0
+            for i, ch in enumerate(text):
+                if ch.isspace() or unicodedata.category(ch).startswith("P"):
+                    continue
+                cnt += 1
+                if cnt == tail_start:
+                    _tail = text[i + 1 :].lstrip(_UNCOMMITTED_LEADING_WEAK_PUNCT)
+                    print(
+                        f"QWEN3_ASR_REDECODE_TAIL committed={self._committed_text!r} tail={_tail!r}",
+                        flush=True,
+                    )
+                    return _tail
+        # 高相似但 committed 末端对不齐(极端改写,理论边角):按重解丢弃。
+        print(
+            f"QWEN3_ASR_REDECODE_DROP committed={self._committed_text!r} finish={text!r}",
+            flush=True,
+        )
+        return ""
 
     async def _finish_session(self) -> tuple[str, str]:
         sid = self._session_id
