@@ -132,6 +132,13 @@ export const api = {
     request<Record<string, unknown>>(`/api/roster/${id}/unclaim`, { method: "POST" }),
   rosterHandled: (id: string, handled = true) =>
     request<Record<string, unknown>>(`/api/roster/${id}/handled`, { method: "POST", body: JSON.stringify({ handled }) }),
+  // 外呼战役（Wave 12）：建波次/启停/进度。启停非法迁移后端 409，UI 按 status 显隐按钮。
+  createCampaign: (body: unknown) => request<Record<string, unknown>>("/api/campaigns", { method: "POST", body: JSON.stringify(body) }),
+  listCampaigns: () => request<Record<string, unknown>[]>("/api/campaigns"),
+  getCampaign: (id: string) => request<Record<string, unknown>>(`/api/campaigns/${id}`),
+  startCampaign: (id: string) => request<Record<string, unknown>>(`/api/campaigns/${id}/start`, { method: "POST" }),
+  pauseCampaign: (id: string) => request<Record<string, unknown>>(`/api/campaigns/${id}/pause`, { method: "POST" }),
+  stopCampaign: (id: string) => request<Record<string, unknown>>(`/api/campaigns/${id}/stop`, { method: "POST" }),
   reportsSummary: () => request<Record<string, unknown>>("/api/reports/summary"),
   reportsCalls: () => request<Record<string, unknown>[]>("/api/reports/calls"),
   reportsUsage: () => request<Record<string, unknown>>("/api/reports/usage"),
