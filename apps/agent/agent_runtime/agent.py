@@ -1198,6 +1198,9 @@ async def entrypoint(ctx):
     # 官方铁律:no_answer/failed 两态 RoomIO 不自动收线 —— 必须手动 ctx.shutdown(),
     # 且删房(房间不删的话真电话对端会一直听静音)。
     _dial = dict(_job_meta.get("dial") or {})
+    # 时长保险丝 task 强引用集合(见下方 create_task 处注释);entrypoint 局部存活
+    # 整个 job 生命周期,通话收线由 done 回调自清。
+    _fuse_tasks: set[asyncio.Task] = set()
     if _dial:
         from .dialer import OUT_ANSWERED, dial_outbound, resolve_dial_mode
 
@@ -1262,7 +1265,12 @@ async def entrypoint(ctx):
                     print(f"[dial] fuse delete_room failed: {exc!r} (call {room_name})",
                           flush=True)
 
-            asyncio.create_task(_duration_fuse())
+            # 强引用存活:事件循环对 task 只持弱引用,保险丝睡数十至数百秒,期间
+            # 无强引用可被 GC 中途回收 → mock 通话失去唯一时长上限(本仓 MiniMax
+            # bidi 孤儿 invalidate task 实证过同类 bug)。集合 + done 回调自清。
+            _fuse_task = asyncio.create_task(_duration_fuse())
+            _fuse_tasks.add(_fuse_task)
+            _fuse_task.add_done_callback(_fuse_tasks.discard)
 
     # 对话流程控制器:载入模板分步 + 对象变量;由它按轮注入"当前步",逐步推进。
     from .flow import FlowController, facts_line

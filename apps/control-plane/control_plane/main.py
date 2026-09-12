@@ -23,10 +23,6 @@ from bok_voice_core.policies import select_session_manifest
 from bok_voice_core.qa_text import mine_qa_pairs
 from bok_voice_core.types import CallMode, CallStatus, Role, SessionManifest, TurnEvent
 
-# 通话终态集合：抽取到模块级（原定义在下方重派段，dial-result 等端点复用）。
-# 只含真终态——CallStatus.FAILED 是通话级失败终态(与拨号失败 disposition="failed" 同名不同义)。
-_TERMINAL_CALL_STATUSES = (CallStatus.ENDED.value, CallStatus.FAILED.value)
-
 from bok_voice_core.settlement import SettlementTrigger
 from bok_voice_core.embeddings import CharHashEmbedding, HybridLexicalEmbedding
 from bok_voice_knowledge.knowledge import DefaultKnowledgeService
@@ -62,6 +58,10 @@ from .schemas import (
     WhatsAppCaptureRequest,
     WhatsAppHandledRequest,
 )
+
+# 通话终态集合：模块级常量（dial-result 端点与下方重派段共用）。
+# 只含真终态——CallStatus.FAILED 是通话级失败终态(与拨号失败 disposition="failed" 同名不同义)。
+_TERMINAL_CALL_STATUSES = (CallStatus.ENDED.value, CallStatus.FAILED.value)
 
 
 app = FastAPI(title="Bok Voice Control Plane", version="0.1.0")
