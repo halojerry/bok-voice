@@ -159,6 +159,15 @@ def _startup() -> None:
         asyncio.get_event_loop().create_task(_reaper_loop())
     except Exception as exc:  # pragma: no cover
         control_log.warning("reaper_start_failed", extra={"data": {"error": str(exc)}})
+    # 外呼战役串行循环(spec 2026-09-12 Wave3):5s 巡检收割终态→起下一通→判 done。
+    # 函数体内延迟 import:campaign 模块反查 main(_repo/_lkapi_client/_create_call_in),
+    # 模块级 import 会成环。
+    try:
+        from .campaign import _campaign_loop
+
+        asyncio.get_event_loop().create_task(_campaign_loop())
+    except Exception as exc:  # pragma: no cover
+        control_log.warning("campaign_start_failed", extra={"data": {"error": str(exc)}})
     app.state.settlement = SettlementTrigger()
     # Mirror every JSONL audit event into the repository (SQL or in-memory) so
     # /api/audit is queryable without scraping the file sink.
@@ -670,14 +679,23 @@ def token(req: TokenRequest) -> TokenResponse:
 
 @app.post("/api/calls")
 def create_call(req: CreateCallRequest) -> dict:
+    return _create_call_in(_repo(), req)
+
+
+def _create_call_in(repo, req: CreateCallRequest) -> dict:
+    """建通话（会话清单装配 + 审计）；repo 由调用方给出（端点= `_repo()`）。
+
+    抽成函数便于 campaign 循环在**注入的 repo** 上建通话（campaign_tick 的 repo
+    参数与 app.state 可不同源，单测注入内存仓时不能走 `_repo()`）。
+    """
     # 会话清单：读取全局策略(offline_first/cloud_first)与已配置 provider，
     # 并把对象绑定的模板快照到 call（审计「这场用了哪版话术」）。
-    settings = _repo().get_settings()
+    settings = repo.get_settings()
     policy = (settings or {}).get("policy") or "offline_first"
     providers = _effective_providers(settings or {})
     template_id = ""
     if req.object_id:
-        obj = _repo().get_object(req.object_id)
+        obj = repo.get_object(req.object_id)
         template_id = (obj or {}).get("template_id", "") or ""
     manifest = select_session_manifest(
         session_id=f"call-{uuid.uuid4().hex[:8]}",
@@ -694,7 +712,7 @@ def create_call(req: CreateCallRequest) -> dict:
         kind=req.kind,
         target_lang=req.target_lang,
     )
-    call = _repo().create_call(manifest)
+    call = repo.create_call(manifest)
     _audit("call.create", subject_type="call", subject_id=call.get("id", ""),
            account_id=req.account_id, call_id=call.get("id", ""),
            detail={"mode": req.mode, "kind": req.kind, "language": req.language, "template_id": template_id})
