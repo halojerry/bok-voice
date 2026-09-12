@@ -1144,6 +1144,84 @@ def _sync_call_whatsapp_status(call_id: Any, status: str) -> None:
         print(f"[cp] roster whatsapp_status sync skipped ({call_id}): {exc!r}", flush=True)
 
 
+class MockCalleeRequest(BaseModel):
+    room: str
+    number: str
+    identity: str = ""
+    scenario: str = "answer"  # answer | no_answer | reject | hangup_mid
+    language: str = "cantonese"
+    script: list[str] = []
+    ring_delay_s: float = 3.0
+    ringing_window_s: float = 35.0
+
+
+@app.post("/api/sip/mock/callee")
+def spawn_mock_callee(req: MockCalleeRequest) -> dict:
+    """模拟联调档:派生 mock 客户子进程(同 pregen detached 姿势,失败不阻拨号主链)。
+
+    真语音被叫——子进程进房后按剧本(四型)TTS 轮播客户话音,agent 侧
+    dialer._dial_mock 靠 participant identity 认它。无 LiveKit 凭据=404
+    (与 /api/token 同语义:缺凭据不静默回退)。
+    """
+    import subprocess
+
+    if not req.room or not req.number:
+        raise HTTPException(400, "room and number are required")
+    identity = req.identity or f"sip-mock-{req.number}"
+    key = getattr(app.state, "lk_key", "") or os.environ.get("LIVEKIT_API_KEY", "")
+    secret = getattr(app.state, "lk_secret", "") or os.environ.get("LIVEKIT_API_SECRET", "")
+    if not key or not secret:
+        raise HTTPException(404, "livekit credentials not configured")
+    lk_url = (
+        getattr(app.state, "lk_url", "") or os.environ.get("LIVEKIT_URL", "")
+        or "ws://127.0.0.1:7880"
+    )
+    from livekit import api as lk_api
+
+    import datetime as _dt
+
+    at = (
+        lk_api.AccessToken(key, secret)
+        .with_identity(identity)
+        .with_name("Mock Callee")
+        .with_grants(lk_api.VideoGrants(
+            room_join=True, room=req.room,
+            can_publish=True, can_subscribe=True, can_publish_data=True,
+        ))
+        .with_ttl(_dt.timedelta(seconds=3600))
+        .with_attributes({"bok.role": "customer", "bok.mock": "1"})
+    )
+    token = at.to_jwt()
+
+    repo_root = Path(__file__).resolve().parents[3]
+    script_path = repo_root / "scripts" / "mock_callee.py"
+    if not script_path.exists():
+        raise HTTPException(404, "scripts/mock_callee.py not found (packaged runtime)")
+    cmd = [
+        sys.executable, str(script_path),
+        "--url", lk_url, "--token", token, "--identity", identity,
+        "--scenario", req.scenario, "--language", req.language,
+        "--script-json", json.dumps(req.script, ensure_ascii=False),
+        "--ring-delay", str(req.ring_delay_s),
+        "--ringing-window", str(req.ringing_window_s),
+    ]
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    log_path = repo_root / "runtime" / "logs" / "mock-callee.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "ab") as logf:
+            proc = subprocess.Popen(  # noqa: S603 - 固定脚本+参数,无 shell
+                cmd, cwd=str(repo_root), env=env, stdout=logf,
+                stderr=subprocess.STDOUT, start_new_session=True,
+            )
+    except OSError as exc:
+        raise HTTPException(500, f"failed to spawn mock callee: {exc}") from exc
+    _audit("sip.mock_callee_spawn", subject_type="room", subject_id=req.room,
+           account_id="acc-001",
+           detail={"scenario": req.scenario, "pid": proc.pid, "identity": identity})
+    return {"ok": True, "pid": proc.pid, "identity": identity}
+
+
 class NodeRegisterRequest(BaseModel):
     name: str = ""
     platform: str = ""
