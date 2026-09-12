@@ -470,6 +470,25 @@ def _looks_like_whatsapp_step(goal: str, ref: str) -> bool:
     return any(h.lower() in ctx for h in _WHATSAPP_STEP_HINTS)
 
 
+def judge_confirm_advance_allowed(*, goal: str, ref: str, user_text: str) -> bool:
+    """judge(bg)=confirm 的内容门槛:问句步(承诺型问题「可以接受吗/有没有时间」)
+    的 judge confirm 需要客户话里有实质应承特征——超短句(≤4 字,「行/嗯嗯/可以哦」
+    类真应承)、CONFIRM 词、数字或平台词任一;更长且无特征=误判(call-8fa17d2b
+    「他这个就过来了。」7 字长 UNCLEAR judge=confirm 假进赔偿直念步,147 字合规
+    稿对没确认过的客户整段念出)。非问句步保持宽松——judge 本就是模糊轮兜底。"""
+    ctx = f"{goal} {ref}"
+    if "？" not in ctx and "?" not in ctx:
+        return True
+    t = (user_text or "").strip()
+    if not t:
+        return False
+    if len(t) <= 4:
+        return True
+    if _CONFIRM_RE.search(t) or _PLATFORM_RE.search(t) or _digit_runs_in(t):
+        return True
+    return False
+
+
 def wa_confirm_advance_allowed(*, goal: str, ref: str, captured: bool) -> bool:
     """CONFIRM 假推进护栏(WA 收号码步,rule 与背景 judge 两条 CONFIRM 路共用):
     步向係收客户号码而未捕获 → CONFIRM 唔准推进——碎片尾裸係/是命中 CONFIRM、

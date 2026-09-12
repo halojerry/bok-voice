@@ -1205,7 +1205,18 @@ async def entrypoint(ctx):
 
     # 对话流程控制器:载入模板分步 + 对象变量;由它按轮注入"当前步",逐步推进。
     from .flow import FlowController, facts_line
-    from .flow import CONFIRM, DEFER, OBJECTION, QUESTION, REFUSE, REPEAT, UNCLEAR, detect_whatsapp_signal, extract_call_facts
+    from .flow import (
+        CONFIRM,
+        DEFER,
+        OBJECTION,
+        QUESTION,
+        REFUSE,
+        REPEAT,
+        UNCLEAR,
+        detect_whatsapp_signal,
+        extract_call_facts,
+        judge_confirm_advance_allowed,
+    )
     from .flow import _digit_normalize, _looks_like_whatsapp_step, _WHATSAPP_DECLINE, digits_to_cantonese
     from .flow import wa_confirm_advance_allowed
 
@@ -2250,7 +2261,16 @@ async def entrypoint(ctx):
                     # WA 收号码步假确认护栏:与 rule CONFIRM 分支共用同一铁律——未
                     # captured 唔准 judge 推进越过收号码步(c4f6e4f1 实证泄漏点)。
                     _gj, _rj = flow_ctrl.current_goal_ref()
-                    if wa_confirm_advance_allowed(goal=_gj, ref=_rj, captured=_wa_captured["on"]):
+                    # 问句步内容门槛(2026-09-12 call-8fa17d2b):「他这个就过来了。」
+                    # 长 UNCLEAR 轮被 4B judge 误判 confirm 假进赔偿直念步——问句
+                    # 步(「可以接受吗/有没有时间」类承诺问题)的 judge confirm 需要
+                    # 客户话里有实质应承特征,长句无特征拦下。
+                    if not judge_confirm_advance_allowed(goal=_gj, ref=_rj, user_text=utt):
+                        print(
+                            f"[flow] judge(bg)=confirm blocked (no ack signal) step={step_at + 1} (call {room_name})",
+                            flush=True,
+                        )
+                    elif wa_confirm_advance_allowed(goal=_gj, ref=_rj, captured=_wa_captured["on"]):
                         flow_ctrl.advance()
                         context_state.set_flow_current(flow_ctrl.current_step_text())
                         print(f"[flow] judge(bg)=confirm step={flow_ctrl.current + 1} (call {room_name})", flush=True)
@@ -2497,10 +2517,15 @@ async def entrypoint(ctx):
                             # 兼要攞WhatsApp嘅核實步:要客戶俾咗號碼/應承先推
                             wa=(_wa_signal[0] if _wa_signal else None),
                             # 通知直念步(say=1)用開場級寬鬆推進語義(實質回應即推)
+                            # say_step 宽松语义只给通知型直念步(2026-09-12 call-8fa17d2b:
+                            # 赔偿直念步也是 say=1,UNCLEAR 的语气点评「呃，自然多了」
+                            # 借宽松语义假推进 step4→5);承诺型问句步(赔偿/办理)回落
+                            # CONFIRM 门槛,goal 含「通知」才算通知步。
                             say_step=(
                                 flow_ctrl.has_steps
                                 and 0 <= flow_ctrl.current < len(flow_ctrl.steps)
                                 and flow_ctrl.steps[flow_ctrl.current].say
+                                and "通知" in (flow_ctrl.steps[flow_ctrl.current].goal or "")
                             ),
                         )
                         if _auto:
