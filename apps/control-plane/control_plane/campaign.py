@@ -16,7 +16,7 @@ import asyncio
 import json
 import os
 from datetime import datetime, timezone
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from bok_voice_core.types import CallMode, CallStatus
 from bok_voice_obs.logging import get_logger
@@ -30,6 +30,9 @@ DEFAULT_ACCOUNT_ID = "acc-001"
 AGENT_NAME = "bok-voice"
 # item 的「进行中」集合：这两种状态下的 item 独占一路，串行循环不再起下一通。
 _INFLIGHT_ITEM_STATUSES = ("dialing", "in_call")
+# item 的终态集合：这些 item 已经跑完一轮（不管成败），起拨冷却以它们的 updated_at 为锚。
+_TERMINAL_ITEM_STATUSES = ("done", "no_answer", "rejected", "failed", "skipped")
+DEFAULT_GAP_SECONDS = 5.0
 
 Dispatcher = Callable[[str, str], Awaitable[None]]
 
@@ -118,7 +121,7 @@ async def _tick_campaign(repo, campaign: dict, dispatcher: Dispatcher, out: dict
             str(item["id"]),
             status=item_status_for_call(call),
             last_error=str(call.get("disposition") or "")[:250],
-            updated_at=_utcnow_naive(),
+            updated_at=_utcnow_iso(),
         )
         out["harvested"] += 1
 
@@ -129,11 +132,32 @@ async def _tick_campaign(repo, campaign: dict, dispatcher: Dispatcher, out: dict
     pending = [i for i in items if i.get("status") == "pending"]
     if not pending:
         repo.update_campaign(str(campaign["id"]), status="done",
-                             finished_at=_utcnow_naive())
+                             finished_at=_utcnow_iso())
         out["finished"] += 1
+        return
+    # 两通之间留 gap_seconds 冷却：上一通终态刚落就起拨会让运营配的间隔失效
+    # （5s 巡检粒度下起拨最早也只比配置快 5s，但同轮收割+起拨会压成 0s）。
+    if _in_gap_cooldown(items, campaign):
         return
     await _start_call(repo, campaign, pending[0], dispatcher)
     out["started"] += 1
+
+
+def _in_gap_cooldown(items: list[dict], campaign: dict, now: datetime | None = None) -> bool:
+    """最近一个终态 item 距今不足 gap_seconds → 本轮不起拨（纯函数，便于单测）。
+
+    updated_at 解析不出的终态 item 不算锚（视为陈旧）；一个终态锚都没有=首通，放行。
+    """
+    now = now or _utcnow_naive()
+    last_terminal = max(
+        (dt for dt in (_parse_updated_at(i.get("updated_at"))
+                       for i in items if i.get("status") in _TERMINAL_ITEM_STATUSES)
+         if dt is not None),
+        default=None,
+    )
+    if last_terminal is None:
+        return False
+    return (now - last_terminal).total_seconds() < _gap_seconds(campaign)
 
 
 async def _start_call(repo, campaign: dict, item: dict, dispatcher: Dispatcher) -> None:
@@ -178,10 +202,10 @@ async def _start_call(repo, campaign: dict, item: dict, dispatcher: Dispatcher) 
         )
         repo.update_item(str(item["id"]), status="failed", call_id=call_id,
                          last_error=f"dispatch: {exc}"[:250],
-                         updated_at=_utcnow_naive())
+                         updated_at=_utcnow_iso())
         return
     repo.update_item(str(item["id"]), status="dialing", call_id=call_id,
-                     updated_at=_utcnow_naive())
+                     updated_at=_utcnow_iso())
     log.info(
         "campaign_call_started",
         extra={"event": "campaign.call_started",
@@ -191,11 +215,45 @@ async def _start_call(repo, campaign: dict, item: dict, dispatcher: Dispatcher) 
 
 
 def _utcnow_naive() -> datetime:
-    """item/campaign 的 updated_at/finished_at 列无时区（SQLite/PG 静默丢 tz）。
-
-    与 CP 其余落库点一致：存 UTC 墙钟的 naive datetime。
-    """
+    """UTC 墙钟 naive datetime（比较用）。"""
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _utcnow_iso() -> str:
+    """落库用的 UTC ISO 串（naive 墙钟，无 +00:00 后缀）。
+
+    M-2：`updated_at`/`finished_at` 内存仓与 SQL 仓混存过 datetime 与 str 两形态，
+    读侧（`_parse_updated_at`）两种都收，但写入统一成 ISO 串——与内存仓
+    `create_campaign` 的 `datetime.now(timezone.utc).isoformat()` 同族、SQL 侧
+    `DateTime` 列 `fromisoformat` 收串同姿势（`update_item` 已有该分支）。
+    """
+    return _utcnow_naive().isoformat()
+
+
+def _parse_updated_at(value: Any) -> datetime | None:
+    """updated_at 归一为 naive UTC datetime；解析不出（空/非法/类型不符）→ None。
+
+    内存仓与 SQL 仓混存两种形态（M-2 备案）：SQL 读侧回 ISO 串（`_item_to_dict`
+    对 DateTime 列 `.isoformat()`），内存仓历史上也可能存 datetime 对象。
+    两种都收；naive 视为 UTC 墙钟，aware 转 UTC 后剥 tz（与 `_utcnow_naive` 同域）。
+    """
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).replace(tzinfo=None) if value.tzinfo else value
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        return parsed.astimezone(timezone.utc).replace(tzinfo=None) if parsed.tzinfo else parsed
+    return None
+
+
+def _gap_seconds(campaign: dict) -> float:
+    """冷却秒数：campaign.gap_seconds 为 0/空/非法时兜 5s（0 值不静默变无冷却）。"""
+    try:
+        return float(campaign.get("gap_seconds") or DEFAULT_GAP_SECONDS)
+    except (TypeError, ValueError):
+        return DEFAULT_GAP_SECONDS
 
 
 async def _campaign_loop() -> None:

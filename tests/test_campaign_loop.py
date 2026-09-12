@@ -167,6 +167,44 @@ def test_tick_ignores_non_running_and_unknown_disposition():
     assert item_status_for_call({"status": "ended", "disposition": "rejected"}) == "rejected"
 
 
+def test_gap_seconds_delays_next_call():
+    """I-1：上一通终态后必须等满 gap_seconds 才起下一通（同轮收割+起拨不得压成 0s）。"""
+    from datetime import datetime, timedelta, timezone
+
+    repo = InMemoryBusinessRepository()
+    objs = [
+        repo.create_object("acc-001", {"display_name": f"A{i}", "phone": f"+8521111111{i}"})
+        for i in range(2)
+    ]
+    c = repo.create_campaign("acc-001", name="t", template_id="", persona_id="",
+                             language="zh", gap_seconds=30, object_ids=[o["id"] for o in objs])
+    repo.update_campaign(c["id"], status="running")
+    items = repo.list_items(c["id"])
+    call = repo.create_call(_manifest("call-gap1"))
+    repo.update_call(call["id"], status="ended", disposition="completed")
+    repo.update_item(items[0]["id"], status="dialing", call_id=call["id"])
+    dispatched: list[tuple] = []
+
+    async def fake_dispatch(room: str, metadata: str) -> None:
+        dispatched.append((room, metadata))
+
+    # item 刚终态（收割写 now）→ 冷却未满，只收割不起拨
+    out = asyncio.run(campaign_tick(repo, dispatcher=fake_dispatch))
+    assert out == {"harvested": 1, "started": 0, "finished": 0}
+    assert repo.get_item(items[0]["id"])["status"] == "done"
+    assert dispatched == []
+    assert repo.list_items(c["id"])[1]["status"] == "pending"
+
+    # 把终态 item 的 updated_at 拨回 31s 前（> gap=30）→ 下一轮起拨
+    past = (datetime.now(timezone.utc) - timedelta(seconds=31)).replace(tzinfo=None).isoformat()
+    repo.update_item(items[0]["id"], updated_at=past)
+    out2 = asyncio.run(campaign_tick(repo, dispatcher=fake_dispatch))
+    assert out2 == {"harvested": 0, "started": 1, "finished": 0}
+    assert len(dispatched) == 1
+    assert repo.list_items(c["id"])[1]["status"] == "dialing"
+
+
 async def _noop_dispatch(room: str, metadata: str) -> None:  # pragma: no cover
     raise AssertionError("不应派发")
+
 
