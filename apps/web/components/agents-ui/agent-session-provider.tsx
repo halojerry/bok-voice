@@ -42,6 +42,13 @@ export type AgentSessionProviderProps = SessionProviderProps &
      */
     onlyRemoteIdentity?: string;
     /**
+     * 完全不渲染音频(2026-09-12 终版):Chromium 40647375——element.setSinkId 对
+     * WebRTC 远端流静默失效(读回 match:true 但声音仍走默认输出);一体台全部远端
+     * 放音改走 AudioContext.setSinkId(interpret-console 的 createAudioRouter),
+     * 渲染器层只剩 SessionProvider 语义,不再出声。
+     */
+    disableAudio?: boolean;
+    /**
      * The children to render.
      */
     children: React.ReactNode;
@@ -63,16 +70,19 @@ export function AgentSessionProvider({
   session,
   children,
   onlyRemoteIdentity,
+  disableAudio,
   ...roomAudioRendererProps
 }: AgentSessionProviderProps) {
+  const audio =
+    disableAudio ? null : onlyRemoteIdentity ? (
+      <IdentityFilteredAudio session={session} identity={onlyRemoteIdentity} {...roomAudioRendererProps} />
+    ) : (
+      <RoomAudioRenderer {...roomAudioRendererProps} />
+    );
   return (
     <SessionProvider session={session}>
       {children}
-      {onlyRemoteIdentity ? (
-        <IdentityFilteredAudio session={session} identity={onlyRemoteIdentity} {...roomAudioRendererProps} />
-      ) : (
-        <RoomAudioRenderer {...roomAudioRendererProps} />
-      )}
+      {audio}
     </SessionProvider>
   );
 }
