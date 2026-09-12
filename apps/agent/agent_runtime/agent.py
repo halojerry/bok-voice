@@ -643,8 +643,10 @@ def _resolve_tts_voice_mode(tts_cfg: dict) -> str:
 # 此前 zh/en 也填粤语主播，普通话语料被粤语腔念(广普),用户判为"说粤语"。三个 id
 # 均经 /api/tts/preview 实测 200。音色 ID 是不透明标识符(MiniMax 云端枚举,术语门禁
 # 白名单范畴),唔属语言字段。
+# zh 默认 = 用户克隆音色 moss_audio_*(2026-09-12 拍板,preview 200 实测)——垫话资产
+# 层(gen_filler_assets)/罐头物化(pregen)与本表同源,换默认须同步重生成 zh 池资产。
 _MINIMAX_DEFAULT_VOICES: dict[str, str] = {
-    "zh": "Chinese_wenrounvxing",
+    "zh": "moss_audio_aaa1346a-7ce7-11f0-8e61-2e6e3c7ee85d",
     "cantonese": "Cantonese_crisp_news_anchor_vv2",
     "en": "English_magnetic_voiced_man",
 }

@@ -439,12 +439,13 @@ async def tts_preview(payload: dict) -> Response:
     language = str(payload.get("language") or "zh")
     if not voice and provider in ("minimax", "minimax_streaming"):
         # qa_entries.voice_id 可空(罐头物化时音色取自人设而非词条字段)——试听
-        # 按语言回落 agent 同一套 lang_personas 默认音色,否则空 voice 被 MiniMax 拒。
+        # 按语言回落 agent 同一套默认音色(_MINIMAX_DEFAULT_VOICES 同步,2026-09-12
+        # zh 换克隆 moss),否则空 voice 被 MiniMax 拒。
         voice = {
-            "zh": "Chinese_crisp_podcaster_nv1",
-            "cantonese": "Cantonese_GentleLady",
-            "en": "socialmedia_female_2_v1",
-        }.get(language, "Chinese_crisp_podcaster_nv1")
+            "zh": "moss_audio_aaa1346a-7ce7-11f0-8e61-2e6e3c7ee85d",
+            "cantonese": "Cantonese_crisp_news_anchor_vv2",
+            "en": "English_magnetic_voiced_man",
+        }.get(language, "moss_audio_aaa1346a-7ce7-11f0-8e61-2e6e3c7ee85d")
     try:
         if provider in ("minimax", "minimax_streaming"):
             # 与 agent 一致：优先读设置库里持久化的 tts.api_key，环境变量仅作兜底，

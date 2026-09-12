@@ -35,6 +35,8 @@ const CANTONESE: Array<[string, string]> = [
 ];
 
 const ZH: Array<[string, string]> = [
+  // 用户克隆音色(2026-09-12 preview 验 200,现为普通话默认音色)
+  ["moss_audio_aaa1346a-7ce7-11f0-8e61-2e6e3c7ee85d", "克隆音色 moss（默认）"],
   // 用户 2026-09-05 补充(已逐个试听 200)
   ["Chinese_wenrounvxing", "温柔女声"],
   ["Chinese_casual_guide_nv1", "休闲导游女声1"],
