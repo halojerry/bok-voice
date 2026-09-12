@@ -136,6 +136,37 @@ class RosterEntry(Base):
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
+class Campaign(Base):
+    """外呼战役:对象名单串行逐个拨(spec Wave3)。status: draft/running/paused/done/stopped。"""
+    __tablename__ = "campaigns"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(64), index=True)
+    name: Mapped[str] = mapped_column(String(255), default="")
+    template_id: Mapped[str] = mapped_column(String(64), default="")
+    persona_id: Mapped[str] = mapped_column(String(64), default="")
+    language: Mapped[str] = mapped_column(String(16), default="zh")
+    status: Mapped[str] = mapped_column(String(16), default="draft")
+    gap_seconds: Mapped[int] = mapped_column(Integer, default=5)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(default=None)
+
+
+class CampaignItem(Base):
+    """战役单条:一个对象一通。scenario=mock 剧本钩子(测试/演练用,生产空)。"""
+    __tablename__ = "campaign_items"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    campaign_id: Mapped[str] = mapped_column(String(64), index=True)
+    seq: Mapped[int] = mapped_column(Integer, default=0)
+    object_id: Mapped[str] = mapped_column(String(64), default="")
+    phone: Mapped[str] = mapped_column(String(64), default="")
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    call_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=1)
+    last_error: Mapped[str] = mapped_column(String(255), default="")
+    scenario: Mapped[str] = mapped_column(String(16), default="")
+    updated_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
 class Turn(Base):
     __tablename__ = "turns"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
