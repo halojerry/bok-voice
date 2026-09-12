@@ -57,13 +57,15 @@ def resolve_dial_mode(env: Mapping[str, str],
 async def dial_outbound(ctx, *, number: str, mode: str, cp_base: str, call_id: str,
                         scenario: str = "", language: str = "",
                         script: list[str] | None = None,
-                        ringing_timeout_s: float = 30.0, trunk_id: str = "") -> DialOutcome:
+                        ringing_timeout_s: float = 30.0, trunk_id: str = "",
+                        speak_interval_s: float = 0.0) -> DialOutcome:
     if mode == "real":
         return await _dial_real(ctx, number=number, trunk_id=trunk_id,
                                 ringing_timeout_s=ringing_timeout_s)
     return await _dial_mock(ctx, number=number, cp_base=cp_base, call_id=call_id,
                             scenario=scenario, language=language, script=script,
-                            ringing_timeout_s=ringing_timeout_s)
+                            ringing_timeout_s=ringing_timeout_s,
+                            speak_interval_s=speak_interval_s)
 
 
 async def _dial_real(ctx, *, number: str, trunk_id: str, ringing_timeout_s: float) -> DialOutcome:
@@ -108,7 +110,8 @@ async def _wait_participant(ctx, identity: str, timeout_s: float):
 
 async def _dial_mock(ctx, *, number: str, cp_base: str, call_id: str, scenario: str,
                      language: str, script: list[str] | None,
-                     ringing_timeout_s: float) -> DialOutcome:
+                     ringing_timeout_s: float,
+                     speak_interval_s: float = 0.0) -> DialOutcome:
     import aiohttp
 
     identity = f"sip-mock-{number}"
@@ -118,6 +121,10 @@ async def _dial_mock(ctx, *, number: str, cp_base: str, call_id: str, scenario: 
         "script": script or [], "ring_delay_s": 3.0,
         "ringing_window_s": ringing_timeout_s,
     }
+    # 句间隔只在调用方显式给了正数时下发——缺省沿用子进程自带的 6s（演练/手起
+    # 调试零行为变化；E2E 用 campaign dial 块把它对齐到 AI 步进）。
+    if float(speak_interval_s or 0) > 0:
+        payload["speak_interval_s"] = float(speak_interval_s)
     async with aiohttp.ClientSession() as http:
         async with http.post(f"{cp_base}/api/sip/mock/callee", json=payload) as resp:
             if resp.status != 200:

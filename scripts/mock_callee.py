@@ -37,6 +37,23 @@ REJECT_LEAVE_OFFSET_S = 0.5   # join→leave:必须 <1.5s(太早撞监听注册�
 FIRST_SPEAK_OFFSET_S = 0.8    # join→首句:>1.5s 窗后才出声,不被误判 reject
 SPEAK_INTERVAL_S = 6.0        # 句间隔(≈一轮问答)
 TAIL_SILENCE_S = 2.0          # 末句后收尾静默
+# 轮次对齐(2026-09-12):台词要等 AI 讲完再讲。固定时刻表会在 AI 还在念开场白时
+# 插话,客户首句被 VAD 当插话丢掉 → 报号句变成首轮、落在收号步之外(外呼 E2E
+# 实测:同一台词有时 captured 有时走漏,根因就是首句丢没丢)。
+AGENT_VOICE_RMS = 150         # 对端帧能量门限(16000Hz int16 帧;低于=静音)
+AGENT_QUIET_S = 1.0           # 对端静默满这么久才让下一句出声
+AGENT_QUIET_TIMEOUT_S = 45.0  # 等不到静默的兜底上限(防死等;超时照讲)
+
+
+def _rms(pcm: bytes) -> float:
+    """16-bit PCM 帧的 RMS(能量门限判定用)。"""
+    if len(pcm) < 2:
+        return 0.0
+    import struct
+
+    n = len(pcm) // 2
+    frames = struct.unpack(f"<{n}h", pcm[: n * 2])
+    return (sum(x * x for x in frames) / n) ** 0.5
 
 # 离房**锚定实际 connect 完成时刻**的剧本(而非计划 join 时刻)——rtc connect
 # 耗时若 ≥REJECT_LEAVE_OFFSET_S,按计划时刻离房会抢在 agent 侧 participant 监听
@@ -47,6 +64,21 @@ DWELL_AFTER_CONNECT_S: dict[str, float] = {"reject": REJECT_LEAVE_OFFSET_S}
 
 VALID_SCENARIOS = ("answer", "no_answer", "reject", "hangup_mid")
 VALID_LANGUAGES = ("zh", "cantonese", "en")
+
+# 台词兜底：answer 剧本没带台词时用语言相关默认 2 句。没有这层兜底，campaign
+# dial 块漏传 script 的 mock 客户会进房后静坐无声（E2E 里表现为「接通但零转写」，
+# 不是链路故障却像链路故障）。句子均为通用客户应承语（不含具体业务事实），
+# 单句 <10 字单口气口吻——vad-pause 劈轮保护（≥10 字 + 长停顿会被切轮）。
+DEFAULT_SCRIPTS: dict[str, list[str]] = {
+    "zh": ["你好", "好的我知道啦"],
+    "cantonese": ["你好呀", "好嘅我知啦"],
+    "en": ["hello", "yes okay"],
+}
+
+
+def default_script(language: str) -> list[str]:
+    """语言相关默认台词（answer 剧本兜底）；未知语言回落 cantonese。"""
+    return list(DEFAULT_SCRIPTS.get(normalize_language(language), DEFAULT_SCRIPTS["cantonese"]))
 
 
 def normalize_language(raw: str) -> str:
@@ -62,15 +94,21 @@ def event_line(name: str, at: float, identity: str) -> str:
     return f"MOCK_CALLEE event={name} at={at:.1f} identity={identity}"
 
 
-def plan_timeline(scenario: str, *, ring_delay_s: float, lines: int) -> list[tuple[str, float]]:
+def plan_timeline(scenario: str, *, ring_delay_s: float, lines: int,
+                  speak_interval_s: float = SPEAK_INTERVAL_S) -> list[tuple[str, float]]:
     """纯函数:剧本 → [(event, at_s)] 时间线(event ∈ join/speak/leave/exit)。
 
     时间锚=进程启动时刻,ring_delay_s 模拟拨号到接通的响铃延迟。
     reject 的 leave 时刻仅是「事件序列占位」——run() 对 DWELL_AFTER_CONNECT_S
     命中的剧本改为锚**实际 connect 完成时刻**+dwell(见该常量注释),因为真正的
     接通耗时不可能在纯函数里预知。
+    speak_interval_s:句间隔(默认 6s≈一轮问答);E2E 要把客户报号句对齐到 AI 的
+    收号步时,AI 每轮处理+播报可能要 8-12s,间隔太短会令号码句在 AI 还在念
+    开场白/上一步时就到了(号码句落在收号步之外 → 捕获门失效),由调用方按
+    `--speak-interval` 调大。
     """
     t = max(0.0, float(ring_delay_s))
+    interval = max(0.1, float(speak_interval_s))
     if scenario == "no_answer":
         # 永不进房:等响铃窗耗尽(哨兵时刻)后退出。
         return [("exit", 1e9)]
@@ -80,13 +118,13 @@ def plan_timeline(scenario: str, *, ring_delay_s: float, lines: int) -> list[tup
         return [
             ("join", t),
             ("speak", t + FIRST_SPEAK_OFFSET_S),
-            ("leave", t + SPEAK_INTERVAL_S),
+            ("leave", t + interval),
         ]
     tl: list[tuple[str, float]] = [("join", t)]
     at = t + FIRST_SPEAK_OFFSET_S
     for _ in range(max(1, int(lines))):
         tl.append(("speak", at))
-        at += SPEAK_INTERVAL_S
+        at += interval
     tl.append(("leave", at + TAIL_SILENCE_S))
     return tl
 
@@ -101,6 +139,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--language", default="cantonese", help="zh|cantonese|en")
     parser.add_argument("--ring-delay", type=float, default=3.0)
     parser.add_argument("--ringing-window", type=float, default=35.0)
+    parser.add_argument("--speak-interval", type=float, default=SPEAK_INTERVAL_S,
+                        help="句间隔秒(默认 6≈一轮问答;E2E 对齐 AI 步进可调大)")
     parser.add_argument("--hangup-after-turns", type=int, default=0,
                         help=">0 时说满 N 句后离房(覆盖剧本 speak 轮数)")
     args = parser.parse_args(argv)
@@ -157,6 +197,12 @@ class MockCallee:
         self.audio_source: Any = None
         self._left = asyncio.Event()
         self._start = time.monotonic()
+        # 对端(AI)语音活动账本:最后一次听到对端有声的时刻(monotonic)。
+        # 台词要等 AI 讲完再讲——固定时刻表会在 AI 还在念开场白时插话,那一段
+        # 客户话音要么被 VAD 当插话丢掉、要么把流程推进时机打乱(实测客户首句
+        # 被吞 → 报号句变成首轮,落在收号步之外)。
+        self._agent_last_voice = 0.0
+        self._agent_tasks: list[Any] = []
 
     def _emit(self, name: str, at: float) -> None:
         print(event_line(name, at, self.args.identity), flush=True)
@@ -191,11 +237,54 @@ class MockCallee:
         await self.room.local_participant.publish_track(
             track, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
         )
+        # 订阅对端音轨,维护「AI 是否正在讲话」——台词节奏要跟 AI 的轮次走。
+        self.room.on("track_subscribed", self._on_remote_track)
+        for participant in self.room.remote_participants.values():
+            for pub in participant.track_publications.values():
+                tr = getattr(pub, "track", None)
+                if tr is not None:
+                    self._on_remote_track(tr, pub, participant)
+
+    def _on_remote_track(self, track: Any, _pub: Any = None, _p: Any = None) -> None:
+        """对端音轨订阅回调:按帧能量更新「AI 最后出声时刻」。"""
+        from livekit import rtc
+
+        if int(getattr(track, "kind", 0)) != int(rtc.TrackKind.KIND_AUDIO):
+            return
+
+        async def _read() -> None:
+            try:
+                stream = rtc.AudioStream(track, sample_rate=16000, num_channels=1)
+                async for ev in stream:
+                    frame = getattr(ev, "frame", ev)
+                    pcm = bytes(getattr(frame, "data", b"") or b"")
+                    if _rms(pcm) >= AGENT_VOICE_RMS:
+                        self._agent_last_voice = time.monotonic()
+            except Exception:  # noqa: BLE001 - 对端音轨读取失败不影响剧本
+                return
+
+        try:
+            self._agent_tasks.append(asyncio.get_running_loop().create_task(_read()))
+        except RuntimeError:  # 无运行中事件循环(理论不可达)
+            return
+
+    async def _wait_agent_quiet(self, quiet_s: float, timeout_s: float) -> None:
+        """等到对端(AI)静默 quiet_s 秒再让台词出声(超时兜底防死等)。"""
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline and not self._left.is_set():
+            idle = time.monotonic() - self._agent_last_voice
+            if self._agent_last_voice <= 0.0 or idle >= quiet_s:
+                return
+            await asyncio.sleep(0.1)
 
     async def _speak(self, idx: int) -> None:
         script: list[str] = self.args.script()
         if not script:
             return
+        # 轮次对齐:等 AI 讲完(静默 ≥AGENT_QUIET_S)再出声。首句无对端语音账本
+        # (还没听到 AI)时直接放行,由时间线的 FIRST_SPEAK_OFFSET_S 管首句时机。
+        if self._agent_last_voice > 0.0:
+            await self._wait_agent_quiet(AGENT_QUIET_S, AGENT_QUIET_TIMEOUT_S)
         text = script[idx % len(script)]
         try:
             pcm = await asyncio.to_thread(tts_pcm, text, self.args.language)
@@ -205,6 +294,13 @@ class MockCallee:
         await push_pcm(self.audio_source, pcm)
 
     async def _leave(self) -> None:
+        # 先收掉对端音轨读取任务(房间断开后它们会自然结束,这里主动 cancel 免挂)。
+        for t in self._agent_tasks:
+            try:
+                t.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+        self._agent_tasks.clear()
         try:
             if self.room is not None:
                 await self.room.disconnect()
@@ -213,10 +309,15 @@ class MockCallee:
 
     async def run(self) -> int:
         args = self.args
+        # 台词兜底：answer 剧本空台词 → 语言相关默认 2 句（否则进房静坐无声）。
+        if args.scenario == "answer" and not args.script():
+            args.script = lambda: default_script(args.language)
+            print(f"MOCK_CALLEE default_script language={args.language}", flush=True)
         lines = len(args.script())
         if args.hangup_after_turns > 0:
             lines = min(lines or args.hangup_after_turns, args.hangup_after_turns)
-        timeline = plan_timeline(args.scenario, ring_delay_s=args.ring_delay, lines=lines)
+        timeline = plan_timeline(args.scenario, ring_delay_s=args.ring_delay, lines=lines,
+                                 speak_interval_s=args.speak_interval)
 
         if args.scenario == "no_answer":
             # 永不进房:睡满响铃窗(上限哨兵时刻)后退出。

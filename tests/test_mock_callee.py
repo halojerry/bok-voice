@@ -127,3 +127,31 @@ def test_language_normalized_to_three_states():
 def test_log_event_line_format():
     line = mock_callee.event_line("join", 3.0, "sip-mock-64320111")
     assert line == "MOCK_CALLEE event=join at=3.0 identity=sip-mock-64320111"
+
+
+# ---- 台词兜底（answer 剧本空台词=语言默认 2 句） ----
+
+def test_default_script_per_language():
+    """三语各 2 句：空台词 answer 剧本必须仍有声（否则客户静坐无声）。"""
+    for lang in ("zh", "cantonese", "en"):
+        lines = mock_callee.default_script(lang)
+        assert len(lines) == 2 and all(isinstance(x, str) and x.strip() for x in lines)
+    # 未知语言回落 cantonese（与 normalize_language 同语义）。
+    assert mock_callee.default_script("bogus") == mock_callee.default_script("cantonese")
+
+
+def test_default_script_lines_are_single_breath():
+    """默认台词须逐句 <10 字：vad-pause 提交门槛是 10 字，超了会被劈轮。
+
+    `len()` 直接数字符：en 台词按字符数算（"okay I see"=10）已贴门槛，
+    这里取 ≤9 字符留余量。
+    """
+    for lang in ("zh", "cantonese", "en"):
+        for line in mock_callee.default_script(lang):
+            assert len(line) <= 9, f"{lang} 默认台词过长: {line!r} ({len(line)})"
+
+
+def test_default_script_languages_are_canonical():
+    """台词表键只用三态规范名 zh/cantonese/en（不写旧拼写）。"""
+    assert set(mock_callee.DEFAULT_SCRIPTS) == {"zh", "cantonese", "en"}
+    assert set(mock_callee.VALID_LANGUAGES) == {"zh", "cantonese", "en"}

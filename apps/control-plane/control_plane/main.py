@@ -1232,6 +1232,13 @@ class CampaignCreateRequest(BaseModel):
     language: str = "zh"
     gap_seconds: int = 5
     scenarios: dict[str, str] = {}
+    # mock 演练台词（object_id → [句子]），与 scenarios 同 spirit 的测试钩子：
+    # campaign 级存 `scripts_json`，起拨时按 object_id 取出来进 dial 块 `script`。
+    # 生产真实通话恒空（真 SIP 对端是真客户）。
+    scripts: dict[str, list[str]] = {}
+    # mock 客户台词句间隔秒（0=子进程默认 6s）。E2E 要把客户报号句对齐到 AI 的
+    # 收号步时调大（AI 每轮处理+播报 8-12s）。
+    mock_speak_interval_s: float = 0.0
 
 
 @app.post("/api/campaigns")
@@ -1240,14 +1247,26 @@ def create_campaign(req: CampaignCreateRequest) -> dict:
 
     scenarios 值白名单过滤（answer/no_answer/reject/hangup_mid）：运营表单里
     残留的非法值静默丢弃，不 4xx——名单本身仍照建，避免一个错字废掉整波。
+    scripts 同样清洗成 `dict[str, list[str]]`（Pydantic 已保证形状，这里只剔
+    空白句并丢空数组，免得 dial 块带一堆空串）。
     """
     if not req.object_ids:
         raise HTTPException(400, "object_ids 不能为空")
+    scripts = {
+        str(k): [str(s) for s in v if str(s).strip()]
+        for k, v in req.scripts.items() if isinstance(v, list)
+    }
+    scripts = {k: v for k, v in scripts.items() if v}
+    # 句间隔与台词同源存进 scripts_json（保留键 `__speak_interval__`）：只加列
+    # 不加宽、不加新表，起拨时 campaign._start_call 从同一份 JSON 取。
+    if float(req.mock_speak_interval_s or 0) > 0:
+        scripts["__speak_interval__"] = float(req.mock_speak_interval_s)
     camp = _repo().create_campaign(
         req.account_id, name=req.name, template_id=req.template_id,
         persona_id=req.persona_id, language=req.language,
         gap_seconds=req.gap_seconds, object_ids=req.object_ids,
         scenarios={k: v for k, v in req.scenarios.items() if v in _CAMPAIGN_SCENARIOS},
+        scripts=scripts,
     )
     _audit("campaign.create", subject_type="campaign", subject_id=camp["id"],
            account_id=req.account_id, detail={"objects": len(req.object_ids)})
@@ -1329,6 +1348,9 @@ class MockCalleeRequest(BaseModel):
     script: list[str] = []
     ring_delay_s: float = 3.0
     ringing_window_s: float = 35.0
+    # 句间隔秒（默认 6≈一轮问答）：E2E/演练要把客户台词对齐到 AI 的话术步进时
+    # 调大（AI 每轮处理+播报可能 8-12s，太密会令报号句落在收号步之外）。
+    speak_interval_s: float = 6.0
 
 
 @app.post("/api/sip/mock/callee")
@@ -1380,6 +1402,7 @@ def spawn_mock_callee(req: MockCalleeRequest) -> dict:
         "--script-json", json.dumps(req.script, ensure_ascii=False),
         "--ring-delay", str(req.ring_delay_s),
         "--ringing-window", str(req.ringing_window_s),
+        "--speak-interval", str(req.speak_interval_s),
     ]
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     log_path = repo_root / "runtime" / "logs" / "mock-callee.log"

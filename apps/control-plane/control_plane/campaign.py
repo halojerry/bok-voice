@@ -186,10 +186,30 @@ async def _start_call(repo, campaign: dict, item: dict, dispatcher: Dispatcher) 
         repo.update_call(call_id, contact_phone=phone)
     settings = repo.get_settings() or {}
     sip = dict(settings.get("sip") or {})
+    # mock 演练台词（campaign 级 object_id→[句子]）：只有 mock 档需要（真 SIP 对端
+    # 是真客户）。读取失败/缺键一律空数组——agent 侧 dial_outbound 的 script 缺省
+    # 已是 []，子进程再有语言默认兜底，三层都不会因缺台词卡住。
+    try:
+        _scripts = repo.get_campaign_scripts(str(campaign.get("id") or ""))
+        script = _scripts.get(str(item.get("object_id") or ""), [])
+        # 句间隔与台词同源（campaign 级 mock 钩子，键 "__speak_interval__" 避开
+        # object_id 命名空间；0/缺省=子进程自带 6s）。
+        pace = float(_scripts.get("__speak_interval__") or 0)
+    except Exception as exc:  # noqa: BLE001 - 台词是演练钩子，取不到照常拨号
+        log.warning(
+            "campaign_scripts_read_failed",
+            extra={"event": "campaign.scripts.error",
+                   "data": {"campaign": campaign.get("id", ""), "error": str(exc)}},
+        )
+        script, pace = [], 0.0
     dial = {
         "to": phone,
         "mode": _dial_mode(sip),
         "scenario": str(item.get("scenario") or ""),
+        "script": list(script or []),
+        # mock 台词句间隔（campaign 级可选钩子）：E2E 把客户报号句对齐到 AI 的
+        # 收号步用；缺省 0=子进程自带 6s。
+        "speak_interval_s": pace,
         "language": str(campaign.get("language") or "zh"),
         "trunk_id": str(sip.get("trunk_id") or ""),
         "campaign_item_id": str(item.get("id") or ""),

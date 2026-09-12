@@ -105,6 +105,50 @@ def test_tick_starts_first_pending_serially_and_carries_dial_block():
     assert repo.find_item_by_call(items[0]["call_id"])["id"] == items[0]["id"]
 
 
+def test_tick_dial_block_carries_script_for_object():
+    """dial 块带 `script`（campaign scripts 按 object_id 取）：mock 客户才有台词。
+
+    无剧本对象 → 空数组（agent 侧默认已是 []，子进程再有语言默认兜底）。
+    """
+    repo = InMemoryBusinessRepository()
+    objs = [
+        repo.create_object("acc-001", {"display_name": f"A{i}", "phone": f"+8521111111{i}"})
+        for i in range(2)
+    ]
+    lines = ["你好", "我WhatsApp係", "六四三二零一一一"]
+    # gap 置 0：本用例只验 dial 块内容，第二通起拨不被冷却挡住（冷却另有专测）。
+    c = repo.create_campaign("acc-001", name="t", template_id="", persona_id="",
+                             language="zh", gap_seconds=0,
+                             object_ids=[o["id"] for o in objs],
+                             scenarios={objs[0]["id"]: "answer",
+                                        objs[1]["id"]: "no_answer"},
+                             scripts={objs[0]["id"]: lines})
+    repo.update_campaign(c["id"], status="running")
+    dispatched: list[tuple] = []
+
+    async def fake_dispatch(room: str, metadata: str) -> None:
+        dispatched.append((room, metadata))
+
+    out = asyncio.run(campaign_tick(repo, dispatcher=fake_dispatch))
+    assert out["started"] == 1
+    dial = json.loads(dispatched[0][1])["dial"]
+    assert dial["scenario"] == "answer"
+    assert dial["script"] == lines
+    # 第二路（no_answer，无台词）尚未起拨；模拟收割后起第二通，script 应为空数组。
+    # 收割写入的 updated_at 是 now，冷却会挡住下一轮起拨 → 把它拨回过期时间
+    # （gap 冷却另有 test_gap_seconds_delays_next_call 专测）。
+    from datetime import datetime, timedelta, timezone
+
+    item0 = repo.list_items(c["id"])[0]
+    repo.update_call(item0["call_id"], status="ended", disposition="completed")
+    past = (datetime.now(timezone.utc) - timedelta(seconds=31)).replace(tzinfo=None).isoformat()
+    asyncio.run(campaign_tick(repo, dispatcher=fake_dispatch))
+    repo.update_item(item0["id"], updated_at=past)
+    asyncio.run(campaign_tick(repo, dispatcher=fake_dispatch))
+    dial2 = json.loads(dispatched[1][1])["dial"]
+    assert dial2["scenario"] == "no_answer" and dial2["script"] == []
+
+
 def test_tick_dispatch_failure_marks_item_failed():
     repo = InMemoryBusinessRepository()
     obj = repo.create_object("acc-001", {"display_name": "A", "phone": "+85211111111"})

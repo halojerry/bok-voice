@@ -147,6 +147,10 @@ class Campaign(Base):
     language: Mapped[str] = mapped_column(String(16), default="zh")
     status: Mapped[str] = mapped_column(String(16), default="draft")
     gap_seconds: Mapped[int] = mapped_column(Integer, default=5)
+    # mock 演练台词：object_id → [句子]，JSON 串。与 scenario 同 spirit 的测试钩子
+    # （生产空）。campaign 级存一份（item.scenario 只有 16 字符放不下台词），
+    # 起拨时按 item.object_id 取出来塞进 dial 块 `script`。
+    scripts_json: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(default=None)
 

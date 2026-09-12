@@ -77,6 +77,22 @@ def _has_latin_or_digit(text: str) -> bool:
     """
     return any(ch.isascii() and ch.isalnum() for ch in text)
 
+
+def _strip_punct_space(text: str) -> str:
+    """去标点/空白,只留正字——用于「文本长度 vs 覆盖音频秒数」可信度比较。"""
+    import unicodedata
+
+    return "".join(ch for ch in str(text or "")
+                   if not ch.isspace() and not unicodedata.category(ch).startswith("P"))
+
+
+# 增量 finish 覆盖可信度下限(字/秒):语音正常节奏 ≥4 字/秒,取极保守的 2 字/秒
+# 当门——只有「partial 窗起点切在语音中间 / 模型只解到后半截」这类坏窗会被挡下
+# (2026-09-12 外呼 E2E 实证:2 字 partial 覆盖 2.6s → FINAL 丢首字)。
+# 挡下即退回整句高精度兜底,只损失提速不损正确性。QWEN3_ASR_INC_MIN_CPS 可调。
+_INC_PARTIAL_MIN_CHARS_PER_SEC = float(os.environ.get("QWEN3_ASR_INC_MIN_CPS", "2"))
+
+
 def _seam_risky(partial_text: str) -> bool:
     """接缝安全检查:partial 尾字符是 latin/数字 → 词/号码可能被缝截断,不可验证。
 
@@ -87,6 +103,7 @@ def _seam_risky(partial_text: str) -> bool:
         return True
     ch = partial_text[-1]
     return ch.isascii() and ch.isalnum()
+
 
 def _join_stitched(left: str, right: str) -> str:
     """拼接 partial 与尾段:CJK 边界直接相连,含空格/标点边界保持自然间隔。"""
@@ -383,6 +400,23 @@ class ASRService:
             if tail_sec > tail_max_sec:
                 return None
             if _seam_risky(partial_text):
+                return None
+            # 覆盖可信度门（2026-09-12 外呼 E2E 实证）：partial 声称覆盖 covered
+            # 秒音频，但文本短到不可能是这段音频的转写 → 该窗起点落在语音中间
+            # （模型只解到后半截 / 滑窗起点切片），拿它当 FINAL 头部会**静默丢掉
+            # 前半句**。实证：号码句「六四三二零一一一」被听成「四三二零一一一」
+            # （首字六丢失）、tail 拼接出「他。的再见。」（partial=2 字覆盖 2.6s）。
+            # 语音正常节奏 ≥4 字/秒，取极保守下限 2 字/秒——正常 partial 远超此线,
+            # 只有「窗起点切在语音中间」的坏窗会被挡下并退回整句高精度兜底。
+            partial_sec = covered / 2 / SAMPLE_RATE
+            min_chars = int(partial_sec * _INC_PARTIAL_MIN_CHARS_PER_SEC)
+            if len(_strip_punct_space(partial_text)) < min_chars:
+                print(
+                    f"[qwen3-asr] incremental rejected: partial too short "
+                    f"({len(_strip_punct_space(partial_text))}ch < {min_chars}ch for "
+                    f"{partial_sec:.1f}s) — falling back to full decode",
+                    flush=True,
+                )
                 return None
             if not tail:
                 # 尾巴为零:最后一窗已解码完整 buffer(≤PARTIAL_MAX_SEC 才有 covered),

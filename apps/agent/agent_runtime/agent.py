@@ -1217,6 +1217,11 @@ async def entrypoint(ctx):
             _outcome = await dial_outbound(
                 ctx, number=str(_dial.get("to") or ""), mode=_dial_mode, cp_base=cp_base,
                 call_id=call_id, scenario=str(_dial.get("scenario") or ""),
+                # mock 演练台词（campaign scripts 钩子）：dial 块缺键/坏值一律空数组，
+                # dial_outbound 的 script 缺省已是 None → mock_callee 语言默认兜底。
+                script=[str(s) for s in (_dial.get("script") or []) if str(s).strip()],
+                # mock 客户台词句间隔（campaign 演练钩子，0=子进程默认 6s）。
+                speak_interval_s=float(_dial.get("speak_interval_s") or 0),
                 language=str(_dial.get("language") or ""),
                 trunk_id=str(_dial.get("trunk_id") or ""),
             )

@@ -91,6 +91,40 @@ def test_missing_phone_item_is_skipped_sql(sql_repo):
     assert items[0]["status"] == "skipped" and items[0]["last_error"] == "对象无电话"
 
 
+# ---- mock 演练台词（scripts：object_id → [句子]）存取 roundtrip ----
+
+def test_campaign_scripts_roundtrip_both_backends(sql_repo):
+    """台词存 campaign 级（item.scenario 16 字符装不下）：两后端读出口一致。"""
+    for repo in (InMemoryBusinessRepository(), sql_repo):
+        objs = [repo.create_object("acc-001", {"display_name": f"O{i}", "phone": f"+852{i}"})
+                for i in range(2)]
+        scripts = {objs[0]["id"]: ["你好", "我WhatsApp係"], objs[1]["id"]: ["好的再见"]}
+        c = repo.create_campaign(
+            "acc-001", name="c", template_id="", persona_id="", language="zh",
+            gap_seconds=5, object_ids=[o["id"] for o in objs], scripts=scripts,
+        )
+        assert repo.get_campaign_scripts(c["id"]) == scripts
+        # 无战役 → {}（不抛）
+        assert repo.get_campaign_scripts("nope") == {}
+
+
+def test_campaign_scripts_sanitize_and_default(sql_repo):
+    """空白句剔除、空数组丢弃；不传 scripts 时两后端都回 {}。"""
+    for repo in (InMemoryBusinessRepository(), sql_repo):
+        obj = repo.create_object("acc-001", {"display_name": "O", "phone": "+8521"})
+        plain = repo.create_campaign(
+            "acc-001", name="c", template_id="", persona_id="", language="zh",
+            gap_seconds=5, object_ids=[obj["id"]],
+        )
+        assert repo.get_campaign_scripts(plain["id"]) == {}
+        c = repo.create_campaign(
+            "acc-001", name="c2", template_id="", persona_id="", language="zh",
+            gap_seconds=5, object_ids=[obj["id"]],
+            scripts={obj["id"]: ["你好", "  ", ""]},
+        )
+        assert repo.get_campaign_scripts(c["id"]) == {obj["id"]: ["你好"]}
+
+
 def test_list_campaigns_filters_and_orders():
     repo, obj = _repo_with_object()
     c1 = repo.create_campaign(

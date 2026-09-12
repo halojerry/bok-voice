@@ -691,6 +691,32 @@ class SqlAlchemyBusinessRepository:
         }
 
     @staticmethod
+    def _campaign_scripts(row: models.Campaign) -> dict[str, Any]:
+        """`scripts_json` 反序列化：object_id → 台词数组；坏 JSON/非 dict 一律 {}。
+
+        mock 演练钩子，解析失败不抛（起拨链路不能因为一句脏台词整波停摆）。
+        保留键（`__` 前缀，如 `__speak_interval__`）原样透传标量——它们不是
+        object_id 命名空间下的台词，是 campaign 级 mock 参数。
+        """
+        raw = str(getattr(row, "scripts_json", "") or "")
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        out: dict[str, Any] = {}
+        for k, v in data.items():
+            key = str(k)
+            if key.startswith("__"):
+                out[key] = v
+            elif isinstance(v, list):
+                out[key] = [str(x) for x in v if str(x).strip()]
+        return out
+
+    @staticmethod
     def _item_to_dict(row: models.CampaignItem) -> dict:
         return {
             "id": row.id, "campaign_id": row.campaign_id, "seq": row.seq,
@@ -703,12 +729,14 @@ class SqlAlchemyBusinessRepository:
     def create_campaign(self, account_id: str, *, name: str, template_id: str,
                         persona_id: str, language: str, gap_seconds: int,
                         object_ids: list[str],
-                        scenarios: dict[str, str] | None = None) -> dict:
+                        scenarios: dict[str, str] | None = None,
+                        scripts: dict[str, list[str]] | None = None) -> dict:
         campaign_id = f"camp-{_uuid()}"
         row = models.Campaign(
             id=campaign_id, account_id=account_id, name=name,
             template_id=template_id, persona_id=persona_id, language=language,
             status="draft", gap_seconds=gap_seconds,
+            scripts_json=json.dumps(scripts or {}, ensure_ascii=False),
         )
         self.session.add(row)
         for seq, object_id in enumerate(object_ids or []):
@@ -728,6 +756,11 @@ class SqlAlchemyBusinessRepository:
     def get_campaign(self, campaign_id: str) -> dict | None:
         row = self.session.get(models.Campaign, campaign_id)
         return self._campaign_to_dict(row) if row else None
+
+    def get_campaign_scripts(self, campaign_id: str) -> dict[str, Any]:
+        """战役 mock 台词（object_id → 句子数组）+ campaign 级 mock 参数（`__` 键）。"""
+        row = self.session.get(models.Campaign, campaign_id)
+        return self._campaign_scripts(row) if row else {}
 
     def update_campaign(self, campaign_id: str, **fields: Any) -> dict | None:
         row = self.session.get(models.Campaign, campaign_id)
@@ -1247,7 +1280,8 @@ class InMemoryBusinessRepository:
     def create_campaign(self, account_id: str, *, name: str, template_id: str,
                         persona_id: str, language: str, gap_seconds: int,
                         object_ids: list[str],
-                        scenarios: dict[str, str] | None = None) -> dict:
+                        scenarios: dict[str, str] | None = None,
+                        scripts: dict[str, list[str]] | None = None) -> dict:
         now = datetime.now(timezone.utc).isoformat()
         campaign_id = f"camp-{uuid.uuid4().hex[:12]}"
         campaign = {
@@ -1255,6 +1289,11 @@ class InMemoryBusinessRepository:
             "template_id": template_id, "persona_id": persona_id,
             "language": language, "status": "draft", "gap_seconds": gap_seconds,
             "created_at": now, "finished_at": "",
+            # 与 SQL 侧同键同名：内存仓直接存 dict（SQL 侧存 JSON 串），
+            # 读侧统一走 get_campaign_scripts（`__` 前缀键=保留的 campaign 级参数）。
+            "scripts": {str(k): ([str(x) for x in v if str(x).strip()]
+                                 if isinstance(v, list) else v)
+                        for k, v in (scripts or {}).items()},
         }
         self.campaigns[campaign_id] = campaign
         for seq, object_id in enumerate(object_ids or []):
@@ -1274,6 +1313,22 @@ class InMemoryBusinessRepository:
     def get_campaign(self, campaign_id: str) -> dict | None:
         row = self.campaigns.get(campaign_id)
         return dict(row) if row else None
+
+    def get_campaign_scripts(self, campaign_id: str) -> dict[str, Any]:
+        """战役 mock 台词（object_id → 句子数组）+ campaign 级 mock 参数（`__` 键）。
+
+        与 SQL 侧同出口：调用方（campaign._start_call）不感知两后端存储形态差异。
+        """
+        row = self.campaigns.get(campaign_id) or {}
+        scripts = row.get("scripts") or {}
+        out: dict[str, Any] = {}
+        for k, v in scripts.items():
+            key = str(k)
+            if key.startswith("__"):
+                out[key] = v
+            elif isinstance(v, list):
+                out[key] = [str(x) for x in v if str(x).strip()]
+        return out
 
     def update_campaign(self, campaign_id: str, **fields: Any) -> dict | None:
         row = self.campaigns.get(campaign_id)
