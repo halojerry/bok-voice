@@ -243,6 +243,15 @@ def _audit(action: str, *, subject_type: str = "", subject_id: str = "", outcome
     return event.to_dict()
 
 
+def _utcnow_iso() -> str:
+    """UTC 墙钟 naive ISO 串（落库/比较统一口径，与 campaign._utcnow_iso 同族）。
+
+    内存仓 `updated_at` 存字符串、SQL 仓 DateTime 列 `fromisoformat` 收串，两后端
+    都吃这一种形态；带 `+00:00` 后缀会与读侧 naive 比较产生偏移，故剥 tz。
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+
+
 @app.get("/health")
 def health() -> dict:
     return {"ok": True, "service": "bok-voice-control-plane"}
@@ -1102,6 +1111,18 @@ def report_dial_result(call_id: str, req: DialResultRequest) -> dict:
                                       disposition=status) or call
     else:
         updated = call
+    # 战役名单联动（Wave3）：通话若由某个 campaign item 拨出（call_id 反查），把
+    # 拨号结果同步到 item。只认「进行中」item（dialing/in_call）——pending 阶段的
+    # call_id 是预写占位、终态 item 已收割过，都不能被迟到的上报改写。
+    if status in ("answered", "no_answer", "rejected", "failed"):
+        item = _repo().find_item_by_call(call_id)
+        if item and str(item.get("status") or "") in ("dialing", "in_call"):
+            _repo().update_item(
+                str(item["id"]),
+                status="in_call" if status == "answered" else status,
+                last_error=(req.detail or "")[:250],
+                updated_at=_utcnow_iso(),
+            )
     _audit("call.dial_result", subject_type="call", subject_id=call_id,
            account_id=str(call.get("account_id", "acc-001")),
            detail={"status": status, "detail": (req.detail or "")[:120]})
@@ -1193,6 +1214,110 @@ def _sync_call_whatsapp_status(call_id: Any, status: str) -> None:
         _repo().update_call(str(call_id), whatsapp_status=status)
     except Exception as exc:  # pragma: no cover - 存储抖动不阻断名册状态
         print(f"[cp] roster whatsapp_status sync skipped ({call_id}): {exc!r}", flush=True)
+
+
+# ---- campaigns（外呼战役：建波次 / 启停 / 进度）----
+# 名单项由 repo.create_campaign 按 object_ids 一次建仓（无电话的对象落 skipped）。
+# 状态机三档（`_campaign_transition`）：running←draft/paused、paused←running、
+# stopped←running/paused/draft；`done` 由 campaign 循环名单跑尽时置，不可手动迁。
+_CAMPAIGN_SCENARIOS = ("answer", "no_answer", "reject", "hangup_mid")
+
+
+class CampaignCreateRequest(BaseModel):
+    account_id: str = "acc-001"
+    name: str = ""
+    object_ids: list[str] = []
+    template_id: str = ""
+    persona_id: str = ""
+    language: str = "zh"
+    gap_seconds: int = 5
+    scenarios: dict[str, str] = {}
+
+
+@app.post("/api/campaigns")
+def create_campaign(req: CampaignCreateRequest) -> dict:
+    """建战役（draft）+ 名单项；object_ids 空=400（空波次无意义）。
+
+    scenarios 值白名单过滤（answer/no_answer/reject/hangup_mid）：运营表单里
+    残留的非法值静默丢弃，不 4xx——名单本身仍照建，避免一个错字废掉整波。
+    """
+    if not req.object_ids:
+        raise HTTPException(400, "object_ids 不能为空")
+    camp = _repo().create_campaign(
+        req.account_id, name=req.name, template_id=req.template_id,
+        persona_id=req.persona_id, language=req.language,
+        gap_seconds=req.gap_seconds, object_ids=req.object_ids,
+        scenarios={k: v for k, v in req.scenarios.items() if v in _CAMPAIGN_SCENARIOS},
+    )
+    _audit("campaign.create", subject_type="campaign", subject_id=camp["id"],
+           account_id=req.account_id, detail={"objects": len(req.object_ids)})
+    return camp
+
+
+@app.get("/api/campaigns")
+def list_campaigns(account_id: str = "acc-001") -> list[dict]:
+    """战役列表，每条带 progress 汇总（列表页免二次请求）。"""
+    out = []
+    for camp in _repo().list_campaigns(account_id):
+        camp["progress"] = _progress(_repo().list_items(camp["id"]))
+        out.append(camp)
+    return out
+
+
+@app.get("/api/campaigns/{campaign_id}")
+def get_campaign(campaign_id: str) -> dict:
+    """战役详情：campaign + items + progress。"""
+    camp = _repo().get_campaign(campaign_id)
+    if not camp:
+        raise HTTPException(404, "campaign not found")
+    items = _repo().list_items(campaign_id)
+    camp["items"] = items
+    camp["progress"] = _progress(items)
+    return camp
+
+
+@app.post("/api/campaigns/{campaign_id}/start")
+def campaign_start(campaign_id: str) -> dict:
+    """启波（draft/paused → running；循环巡检即刻接手首通）。"""
+    return _campaign_transition(campaign_id, "running")
+
+
+@app.post("/api/campaigns/{campaign_id}/pause")
+def campaign_pause(campaign_id: str) -> dict:
+    """暂停（running → paused）：循环不再起新通，进行中的一路不打断。"""
+    return _campaign_transition(campaign_id, "paused")
+
+
+@app.post("/api/campaigns/{campaign_id}/stop")
+def campaign_stop(campaign_id: str) -> dict:
+    """终止（running/paused/draft → stopped，终态不可再启）。"""
+    return _campaign_transition(campaign_id, "stopped")
+
+
+def _campaign_transition(campaign_id: str, status: str) -> dict:
+    """战役状态机唯一入口（三个启停端点共用），非法迁移 409、未找到 404。"""
+    camp = _repo().get_campaign(campaign_id)
+    if not camp:
+        raise HTTPException(404, "campaign not found")
+    cur = str(camp.get("status") or "")
+    allowed = {"running": ("draft", "paused"), "paused": ("running",),
+               "stopped": ("running", "paused", "draft")}
+    if cur not in allowed[status]:
+        raise HTTPException(409, f"cannot {status} from {cur}")
+    updated = _repo().update_campaign(campaign_id, status=status) or camp
+    _audit(f"campaign.{status}", subject_type="campaign", subject_id=campaign_id,
+           account_id=str(camp.get("account_id", "acc-001")))
+    return updated
+
+
+def _progress(items: list[dict]) -> dict:
+    """名单进度汇总：8 个状态计数 + answered 粗口径（拨出去有结果的三态之和）。"""
+    p = {"total": len(items)}
+    for key in ("pending", "dialing", "in_call", "done", "no_answer", "rejected",
+                "failed", "skipped"):
+        p[key] = sum(1 for i in items if i.get("status") == key)
+    p["answered"] = p["done"] + p["no_answer"] + p["rejected"]
+    return p
 
 
 class MockCalleeRequest(BaseModel):

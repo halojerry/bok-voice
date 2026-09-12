@@ -147,11 +147,17 @@ def _in_gap_cooldown(items: list[dict], campaign: dict, now: datetime | None = N
     """最近一个终态 item 距今不足 gap_seconds → 本轮不起拨（纯函数，便于单测）。
 
     updated_at 解析不出的终态 item 不算锚（视为陈旧）；一个终态锚都没有=首通，放行。
+
+    锚集合 = `_TERMINAL_ITEM_STATUSES` 减去 `skipped`：建仓即 skipped 的 item（对象
+    无电话）带的是**建仓时间戳**，若计入锚，波次一开始就被自己的建仓时间门控住，
+    首通至多延迟 gap 秒。冷却语义是「两通真实电话之间留间隔」，从未拨过的 item
+    不构成锚。
     """
     now = now or _utcnow_naive()
+    anchors = tuple(s for s in _TERMINAL_ITEM_STATUSES if s != "skipped")
     last_terminal = max(
         (dt for dt in (_parse_updated_at(i.get("updated_at"))
-                       for i in items if i.get("status") in _TERMINAL_ITEM_STATUSES)
+                       for i in items if i.get("status") in anchors)
          if dt is not None),
         default=None,
     )

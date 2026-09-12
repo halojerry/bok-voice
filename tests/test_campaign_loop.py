@@ -204,6 +204,31 @@ def test_gap_seconds_delays_next_call():
     assert repo.list_items(c["id"])[1]["status"] == "dialing"
 
 
+def test_gap_cooldown_ignores_skipped_anchor():
+    """T10 遗留修复：建仓即 skipped 的 item 不得门控首通（锚=真实拨过的终态 item）。"""
+    from bok_voice_business_db.repository import InMemoryBusinessRepository as Repo
+
+    repo = Repo()
+    no_phone = repo.create_object("acc-001", {"display_name": "无号", "phone": ""})
+    runner = repo.create_object("acc-001", {"display_name": "有号", "phone": "+85211111111"})
+    c = repo.create_campaign("acc-001", name="t", template_id="", persona_id="",
+                             language="zh", gap_seconds=30,
+                             object_ids=[no_phone["id"], runner["id"]])
+    repo.update_campaign(c["id"], status="running")
+    items = repo.list_items(c["id"])
+    # 建仓顺序：skipped 在前（其 updated_at 即建仓 now）→ 首通不得被它挡住
+    assert items[0]["status"] == "skipped" and items[1]["status"] == "pending"
+    dispatched: list[tuple] = []
+
+    async def fake_dispatch(room: str, metadata: str) -> None:
+        dispatched.append((room, metadata))
+
+    out = asyncio.run(campaign_tick(repo, dispatcher=fake_dispatch))
+    assert out == {"harvested": 0, "started": 1, "finished": 0}
+    assert len(dispatched) == 1
+    assert repo.list_items(c["id"])[1]["status"] == "dialing"
+
+
 async def _noop_dispatch(room: str, metadata: str) -> None:  # pragma: no cover
     raise AssertionError("不应派发")
 
