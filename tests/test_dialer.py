@@ -11,6 +11,27 @@ from agent_runtime.dialer import (
     DialOutcome, map_sip_status_code, resolve_dial_mode,
 )
 from agent_runtime.dialer import _dial_mock, _dial_real, _wait_participant
+from agent_runtime import dialer as _dialer_mod
+
+
+def test_dial_outbound_clamps_ringing_timeout(monkeypatch):
+    """入口硬钳 [0, 80]（spec §3：protobuf Duration 端上限 80s）。
+
+    运营/编排给超窗值一律砍到 80，负值归 0（=不等振铃）；钳制发生在后端分派前。
+    """
+    seen: list[float] = []
+
+    async def _fake_mock(ctx, *, number, cp_base, call_id, scenario, language,
+                         script, ringing_timeout_s, speak_interval_s=0.0):
+        seen.append(ringing_timeout_s)
+        return DialOutcome(status=OUT_ANSWERED)
+
+    monkeypatch.setattr(_dialer_mod, "_dial_mock", _fake_mock, raising=True)
+    for given, expected in ((30.0, 30.0), (999.0, 80.0), (-5.0, 0.0), (80.0, 80.0)):
+        asyncio.run(_dialer_mod.dial_outbound(
+            object(), number="123", mode="mock", cp_base="http://cp", call_id="c1",
+            ringing_timeout_s=given))
+        assert seen[-1] == expected, f"given={given}"
 
 
 def test_map_sip_status_code():

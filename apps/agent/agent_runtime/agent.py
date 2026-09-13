@@ -1224,6 +1224,9 @@ async def entrypoint(ctx):
                 speak_interval_s=float(_dial.get("speak_interval_s") or 0),
                 language=str(_dial.get("language") or ""),
                 trunk_id=str(_dial.get("trunk_id") or ""),
+                # 振铃窗口（settings sip.ringing_timeout_s，CP dial 块透传；缺键/坏值
+                # 兜 30s 与 CP 侧同款）。dial_outbound 入口还会钳 [0, 80] 硬上限。
+                ringing_timeout_s=float(_dial.get("ringing_timeout_s") or 30),
             )
         except Exception as e:  # dial_outbound 契约=四态出口,此处仅最后兜底防逸出
             from .dialer import DialOutcome, OUT_FAILED

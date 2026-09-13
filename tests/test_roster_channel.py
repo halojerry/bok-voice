@@ -86,3 +86,55 @@ def test_report_whatsapp_channel_defaults_from_object():
         assert len(hit2) == 1, hit2
         assert hit2[0]["channel"] == "wechat"
 
+
+def test_report_whatsapp_summary_falls_back_to_last_customer_turn():
+    """spec §4.3：无 settlement（结算未生成）时 summary 退「末轮客户转写」。
+
+    captured 通常发生在通话进行中，settlement 由收线后异步产出 → 届时摘要恒空、
+    名册条目只剩号码。兜底取最后一轮 speaker=customer 的 transcript（截 300 字）。
+    """
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/calls",
+            json={"account_id": "acc-001", "object_id": "obj-1", "persona_id": "p-1", "mode": "simulation"},
+        ).json()
+        call_id = created["id"]
+        # 无 settlement；两轮客户转写 + 一轮 AI（末轮客户=第二条）
+        client.post(f"/api/calls/{call_id}/turns",
+                    params={"role": "user", "transcript": "我想問快遞",
+                            "speaker": "customer"})
+        client.post(f"/api/calls/{call_id}/turns",
+                    params={"role": "assistant", "transcript": "好嘅",
+                            "speaker": "agent_ai"})
+        client.post(f"/api/calls/{call_id}/turns",
+                    params={"role": "user", "transcript": "我WhatsApp係六四三二零一一一",
+                            "speaker": "customer"})
+
+        assert _repo().get_settlement(call_id) in (None, {}, "")
+        r = client.post(f"/api/calls/{call_id}/whatsapp",
+                        json={"number": "64320111"}).json()
+        assert r["whatsapp_status"] == "captured"
+
+        hit = _roster_for(call_id)
+        assert len(hit) == 1, hit
+        assert hit[0]["summary"] == "我WhatsApp係六四三二零一一一"
+
+
+def test_report_whatsapp_summary_prefers_settlement_over_transcript():
+    """settlement 有 summary 时优先用它，不被末轮转写兜底覆盖。"""
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/calls",
+            json={"account_id": "acc-001", "object_id": "obj-1", "persona_id": "p-1", "mode": "simulation"},
+        ).json()
+        call_id = created["id"]
+        client.post(f"/api/calls/{call_id}/turns",
+                    params={"role": "user", "transcript": "末轮客户话",
+                            "speaker": "customer"})
+        _repo().append_settlement(call_id, {"summary": "结算摘要正文"})
+
+        client.post(f"/api/calls/{call_id}/whatsapp", json={"number": "64320111"})
+        hit = _roster_for(call_id)
+        assert len(hit) == 1, hit
+        assert hit[0]["summary"] == "结算摘要正文"
+

@@ -140,7 +140,7 @@ web /campaigns（建波/启停/进度表）
         · `speak_interval_s` 控句间隔；子进程会等 AI 讲完（对端音轨能量）
           再出声，避免与开场白撞轮
       → wait_for_participant：超时=no_answer、进房 1.5s 内离房零音频=rejected
-  → agent `PUT /api/calls/{id}/dial-result`（answered→ACTIVE，三失败态→ENDED+
+  → agent `POST /api/calls/{id}/dial-result`（answered→ACTIVE，三失败态→ENDED+
     disposition）→ CP 按 call_id 反查 campaign item 同步状态（只认 dialing/in_call）
   → 接通后走正常 A 线装配（开场白=话术第 1 步直念）；captured 号码自动入名册
   → web /roster（认领池：unclaimed → claimed → handled）

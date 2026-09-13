@@ -99,10 +99,33 @@ def test_tick_starts_first_pending_serially_and_carries_dial_block():
     assert dial["language"] == "cantonese" and dial["scenario"] == ""
     # 0 值数字字段必须兜默认（否则静默变「无保险丝」）
     assert dial["max_call_duration_s"] == 600
+    # 振铃窗同款兜底：settings 未配 → 30（CP 与 agent 双层默认一致）
+    assert dial["ringing_timeout_s"] == 30
     # 通话已落库且带被叫号
     call = repo.get_call(items[0]["call_id"])
     assert call["contact_phone"] == items[0]["phone"]
     assert repo.find_item_by_call(items[0]["call_id"])["id"] == items[0]["id"]
+
+
+def test_tick_dial_block_carries_configured_ringing_timeout():
+    """T7/T8 接缝：settings.sip.ringing_timeout_s 必须进 dial 块（此前无人消费）。
+
+    运营在设置页改 60s，全链路（CP dial 块 → agent dial_outbound）要真收到 60。
+    """
+    repo = InMemoryBusinessRepository()
+    obj = repo.create_object("acc-001", {"display_name": "A", "phone": "+85211111111"})
+    c = repo.create_campaign("acc-001", name="t", template_id="", persona_id="",
+                             language="zh", gap_seconds=5, object_ids=[obj["id"]])
+    repo.update_campaign(c["id"], status="running")
+    repo.save_settings({"sip": {"mode": "mock", "ringing_timeout_s": 60}})
+    dispatched: list[tuple] = []
+
+    async def fake_dispatch(room: str, metadata: str) -> None:
+        dispatched.append((room, metadata))
+
+    asyncio.run(campaign_tick(repo, dispatcher=fake_dispatch))
+    dial = json.loads(dispatched[0][1])["dial"]
+    assert dial["ringing_timeout_s"] == 60
 
 
 def test_tick_dial_block_carries_script_for_object():

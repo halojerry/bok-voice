@@ -59,6 +59,9 @@ async def dial_outbound(ctx, *, number: str, mode: str, cp_base: str, call_id: s
                         script: list[str] | None = None,
                         ringing_timeout_s: float = 30.0, trunk_id: str = "",
                         speak_interval_s: float = 0.0) -> DialOutcome:
+    # 振铃窗口硬上限 80s（spec §3：protobuf Duration 端拒绝/截断超窗值，且真 SIP 侧
+    # 同一振铃窗最多 ~80s）。settings/编排给什么都在入口钳死，负值一律归 0（=不等振铃）。
+    ringing_timeout_s = min(max(0.0, float(ringing_timeout_s)), 80.0)
     if mode == "real":
         return await _dial_real(ctx, number=number, trunk_id=trunk_id,
                                 ringing_timeout_s=ringing_timeout_s)

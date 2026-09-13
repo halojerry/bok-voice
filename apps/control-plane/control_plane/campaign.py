@@ -215,6 +215,7 @@ async def _start_call(repo, campaign: dict, item: dict, dispatcher: Dispatcher) 
         "campaign_item_id": str(item.get("id") or ""),
         # 数字字段必须 `or 默认` 兜底：settings 里 0/空会静默变成「无保险丝/零振铃窗」。
         "max_call_duration_s": int(sip.get("max_call_duration_s") or 600),
+        "ringing_timeout_s": int(sip.get("ringing_timeout_s") or 30),
     }
     metadata = json.dumps({"call_id": call_id, "dial": dial}, ensure_ascii=False)
     try:

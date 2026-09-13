@@ -1077,6 +1077,17 @@ def report_whatsapp(call_id: str, req: WhatsAppCaptureRequest) -> dict:
             display_name = str(obj.get("display_name") or "")
             settlement = _repo().get_settlement(call_id) or {}
             summary = str(settlement.get("summary") or "")[:300]
+            if not summary:
+                # spec §4.3 兜底：captured 常发生在通话进行中/结算未生成时（settlement
+                # 由收线后异步产出），摘要恒空 → 名册条目只剩号码不可用。退「末轮客户
+                # 转写」（repo.get_turns 返回 TurnEvent 对象，属性访问，同 /turns 端点）。
+                turns = _repo().get_turns(call_id)
+                customer = [
+                    t for t in turns
+                    if str(getattr(t, "speaker", "") or "") == "customer"
+                ]
+                if customer:
+                    summary = str(getattr(customer[-1], "transcript", "") or "")[:300]
         except Exception:
             pass
         _repo().upsert_roster_entry(
