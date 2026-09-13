@@ -32,6 +32,8 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     # 枚举值的行,语言字段本身仍一律 cantonese。A 线 agent.py 同源注入
     # (per-call 固定语言,B 线 interpret 同值)。
     "apps/agent/agent_runtime/interpret.py": re.compile(r"Chinese,Yue"),
+    # 0913 验收探针的 MM 合成话音线同枚举(t2a_v2 language_boost 外部字面量)。
+    "scripts/acceptance_0913_scenarios.py": re.compile(r"Chinese,Yue"),
     "apps/agent/agent_runtime/agent.py": re.compile(r"Chinese,Yue"),
     "tests/test_interpret_tts_provider.py": re.compile(r"Chinese,Yue"),
     "tests/test_fixed_language_call.py": re.compile(r"Chinese,Yue"),

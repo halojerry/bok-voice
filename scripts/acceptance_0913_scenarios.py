@@ -65,8 +65,37 @@ class Ear:
             t.cancel()
 
 
-async def speak(src: rtc.AudioSource, text: str, lang: str) -> None:
-    pcm = tts_pcm(text, lang)
+_MM_VOICES = {"cantonese": ("Cantonese_crisp_news_anchor_vv2", "Chinese,Yue"),
+              "zh": ("Chinese_wenrounvxing", "Chinese"), "en": ("socialmedia_female_2_v1", "English")}
+
+
+def mm_pcm(text: str, lang: str) -> bytes:
+    """MiniMax 云合成 16k PCM(探针话音质量线:本地 TTS 粤语短词 ASR 可懂度差,
+    「拼多多」→「二。二。」实测;MiniMax 同生产音色回读「拼多多。淘宝」全对)。"""
+    import json, sqlite3, ssl, urllib.request
+    import certifi
+    db = sqlite3.connect(str(Path.home() / "Library/Application Support/BokVoice/bok_voice.db"))
+    key = json.loads(db.execute("SELECT tts_json FROM global_settings ORDER BY updated_at DESC LIMIT 1").fetchone()[0])["api_key"]
+    voice, boost = _MM_VOICES.get(lang, _MM_VOICES["zh"])
+    ctx = ssl.create_default_context(cafile=certifi.where())
+    req = urllib.request.Request("https://api.minimax.cn/v1/t2a_v2", method="POST",
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        data=json.dumps({"model": "speech-2.8-hd", "text": text, "stream": False,
+            "voice_setting": {"voice_id": voice, "speed": 1.0},
+            "audio_setting": {"format": "pcm", "sample_rate": 16000},
+            "language_boost": boost}).encode())
+    r = json.loads(urllib.request.urlopen(req, timeout=30, context=ctx).read())
+    return bytes.fromhex(r["data"]["audio"])
+
+
+async def speak(src: rtc.AudioSource, text: str, lang: str, engine: str = "local") -> None:
+    # 间歇哑根因修复(2026-09-13):tts_pcm 是同步 httpx,直调会阻塞 asyncio 循环
+    # 数秒→livekit 心跳饿死→连接静默断(participant disconnect 后推音全进黑洞,
+    # 多通「前段正常后段零事件」实证)。to_thread 隔离。
+    if engine == "minimax":
+        pcm = await asyncio.to_thread(mm_pcm, text, lang)
+    else:
+        pcm = await asyncio.to_thread(tts_pcm, text, lang)
     chunk = 1600
     for i in range(0, len(pcm), chunk):
         seg = pcm[i : i + chunk]
@@ -81,17 +110,18 @@ async def wait_reply(ear: Ear, min_speech: float = 0.8, timeout: float = 60.0) -
     while time.perf_counter() - t0 < timeout:
         s = ear.speech_secs()
         if s >= min_speech:
-            # 再等到停止增长 3s
-            prev = -1
+            # 等停止增长:轨道静默时不推帧,改看总字节量停滞 ≥3s(旧逐帧静止判定
+            # 永不满足→每 say 后拖满 60s,叠加出「静默超时拆房/断连」假哑)。
+            prev_len = -1
             still = 0
-            while still < 3:
+            while still < 3 and time.perf_counter() - t0 < timeout:
                 await asyncio.sleep(1)
-                cur = ear.speech_secs()
-                if abs(cur - prev) < 0.02:
+                cur = len(ear.audio)
+                if cur == prev_len:
                     still += 1
                 else:
                     still = 0
-                prev = cur
+                prev_len = cur
             return ear.speech_secs()
         await asyncio.sleep(1)
     return ear.speech_secs()
