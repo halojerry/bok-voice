@@ -145,7 +145,15 @@ async def run_case(room: rtc.Room, audio_source: rtc.AudioSource, case: dict) ->
 
     # 间歇哑根因修复(2026-09-13):同步 httpx 阻塞事件循环→livekit 心跳饿死→
     # 连接静默断(cantonese D/E 腿「TTS 不启动+零轮」同根因)。to_thread 隔离。
-    pcm = await asyncio.to_thread(tts_pcm, case["text"], case["tts_lang"])
+    # E2E_TTS_ENGINE=minimax:话音走 MiniMax 云合成(本地 TTS 粤语短词 ASR 可懂
+    # 度差,「拼多多」→「二。二。」实测;MM 回读 2/3 全对)。
+    if os.environ.get("E2E_TTS_ENGINE", "") == "minimax":
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from scripts.mm_voice import mm_pcm
+        pcm = await asyncio.to_thread(mm_pcm, case["text"], case["tts_lang"])
+    else:
+        pcm = await asyncio.to_thread(tts_pcm, case["text"], case["tts_lang"])
     chunk = int(16000 * 0.1) * 2
     for i in range(0, len(pcm), chunk):
         seg = pcm[i : i + chunk]

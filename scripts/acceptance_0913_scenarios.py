@@ -19,6 +19,7 @@ from livekit import rtc
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.e2e_trilingual_livekit import frame_rms, tts_pcm  # noqa: E402
+from scripts.mm_voice import mm_pcm  # noqa: E402
 
 CP = "http://127.0.0.1:8000"
 LOG = Path.home() / "Library/Application Support/BokVoice/logs/agent.log"
@@ -63,29 +64,6 @@ class Ear:
         room.off("track_subscribed", self._on)
         for t in self.tasks:
             t.cancel()
-
-
-_MM_VOICES = {"cantonese": ("Cantonese_crisp_news_anchor_vv2", "Chinese,Yue"),
-              "zh": ("Chinese_wenrounvxing", "Chinese"), "en": ("socialmedia_female_2_v1", "English")}
-
-
-def mm_pcm(text: str, lang: str) -> bytes:
-    """MiniMax 云合成 16k PCM(探针话音质量线:本地 TTS 粤语短词 ASR 可懂度差,
-    「拼多多」→「二。二。」实测;MiniMax 同生产音色回读「拼多多。淘宝」全对)。"""
-    import json, sqlite3, ssl, urllib.request
-    import certifi
-    db = sqlite3.connect(str(Path.home() / "Library/Application Support/BokVoice/bok_voice.db"))
-    key = json.loads(db.execute("SELECT tts_json FROM global_settings ORDER BY updated_at DESC LIMIT 1").fetchone()[0])["api_key"]
-    voice, boost = _MM_VOICES.get(lang, _MM_VOICES["zh"])
-    ctx = ssl.create_default_context(cafile=certifi.where())
-    req = urllib.request.Request("https://api.minimax.cn/v1/t2a_v2", method="POST",
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        data=json.dumps({"model": "speech-2.8-hd", "text": text, "stream": False,
-            "voice_setting": {"voice_id": voice, "speed": 1.0},
-            "audio_setting": {"format": "pcm", "sample_rate": 16000},
-            "language_boost": boost}).encode())
-    r = json.loads(urllib.request.urlopen(req, timeout=30, context=ctx).read())
-    return bytes.fromhex(r["data"]["audio"])
 
 
 async def speak(src: rtc.AudioSource, text: str, lang: str, engine: str = "local") -> None:
