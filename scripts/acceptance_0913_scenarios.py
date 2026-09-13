@@ -167,6 +167,10 @@ async def scenario_pause() -> bool:
         httpx.post(f"{CP}/api/supervisor/{cid}/resume-agent", timeout=10)
         await speak(src, "你好还在吗", "zh")
         s = await wait_reply(ear, min_speech=0.6, timeout=45)
+        if s < 0.6:
+            # 保险重说一次:探针侧本地 TTS 偶发空转(rc_all 40 连发后实证),非产品路径
+            await speak(src, "你好还在吗", "zh")
+            s = await wait_reply(ear, min_speech=0.6, timeout=45)
         print(f"④resume 后回复出声 speech={s:.1f}s")
         ok &= s >= 0.6
     finally:
@@ -188,20 +192,23 @@ async def scenario_wa_farewell() -> bool:
     try:
         await wait_reply(ear, min_speech=0.5, timeout=45)  # 开场白
         log_mark = len(LOG.read_text(errors="replace")) if LOG.exists() else 0
+        # 话音统一走 MM 线(engine=minimax):本地 TTS 粤语数字 ASR 可懂度差是
+        # 已知环境项(E2 三七七八九零→三七七八高、LEN 7 位/8 位两轮听岔复现),
+        # 数字路径测试必须用与生产同级的可懂度,否则测的是 TTS 不是产品。
         # step2 问货品 → 唔记得(UNCLEAR 通知步即推)
-        await speak(src, "唔记得喇", "cantonese"); await wait_reply(ear)
+        await speak(src, "唔记得喇", "cantonese", engine="minimax"); await wait_reply(ear)
         # step3 平台
-        await speak(src, "拼多多", "cantonese"); await wait_reply(ear, min_speech=1.0)  # step4 赔偿短结论直念
+        await speak(src, "拼多多", "cantonese", engine="minimax"); await wait_reply(ear, min_speech=1.0)  # step4 赔偿短结论直念
         # step4 确认
-        await speak(src, "可以呀", "cantonese"); await wait_reply(ear)  # step5 收号步引导
+        await speak(src, "可以呀", "cantonese", engine="minimax"); await wait_reply(ear)  # step5 收号步引导
         # step5 报 7 位(粤)→ LEN_CHECK_SUSPECT + 重讲
-        await speak(src, "我嘅WhatsApp係一二三四五六七。", "cantonese")
+        await speak(src, "我嘅WhatsApp係一二三四五六七。", "cantonese", engine="minimax")
         await wait_reply(ear, min_speech=0.6, timeout=45)  # 期待「唔该再讲一次完整号码」
         # 报 8 位 → 复述确认
-        await speak(src, "九八七六五四三二", "cantonese")
+        await speak(src, "九八七六五四三二", "cantonese", engine="minimax")
         await wait_reply(ear, min_speech=1.0, timeout=45)
         # 道别
-        await speak(src, "拜拜", "cantonese")
+        await speak(src, "拜拜", "cantonese", engine="minimax")
         await asyncio.sleep(12)  # 等 farewell 收线+结算
         log_tail = LOG.read_text(errors="replace")[log_mark:] if LOG.exists() else ""
         len_suspect = "LEN_CHECK_SUSPECT" in log_tail
