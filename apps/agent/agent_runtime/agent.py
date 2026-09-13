@@ -439,6 +439,17 @@ def _defer_ack_line(lang: str) -> str:
     return "好的，不着急，您慢慢看，我在电话这边等您。"
 
 
+def _pause_ack_line(lang: str) -> str:
+    """暂停进入播报(C1 暂停黑洞,2026-09-13):supervisor 暂停/人工接管瞬间
+    脚本直念一句可听交代——旧版暂停=26s 纯静默(call-15a2f586 实证),客户
+    不知道发生了什么。万能话术原则:不含任何动作承诺。BOK_PAUSE_ACK=0 关。"""
+    if lang == "cantonese":
+        return "好嘅，你稍等一陣。"
+    if lang == "en":
+        return "Sure, one moment please."
+    return "好的，您稍等一下。"
+
+
 def _wa_number_line(lang: str, num: str) -> str:
     """碎片暂存超时 flush 嘅脚本直念(session.say,零 TTFT/零前缀断裂):captured →
     复述确认;唔系号码 → 请客户继续。三语骨架,风格同 _nudge_line。"""
@@ -1304,7 +1315,9 @@ async def entrypoint(ctx):
 
         async def _flush() -> None:
             await asyncio.sleep(_WA_ACCUM_TIMEOUT_S)
-            if closed.is_set():
+            if closed.is_set() or agent.paused:
+                # C1:暂停期 flush 冻结(侦测/上报/直念全部让位)——stash 文本
+                # 留在 _wa_accum,resume 后下一段号码话会拼上继续走。
                 return
             stashed = _wa_accum["text"]
             _wa_accum["text"] = ""
@@ -2283,6 +2296,10 @@ async def entrypoint(ctx):
                 flow_ctrl.current == step_at
                 and flow_ctrl.has_steps
                 and not flow_ctrl.done
+                # C1 暂停冻结(2026-09-13):暂停前起跑的 judge 完成时若在暂停中,
+                # 不推进不注入(旧版 call-15a2f586:暂停期 judge=confirm 静默推
+                # step4→6,恢复后错步)。judge 结果丢弃,resume 后重新判。
+                and not agent.paused
                 # 直念步待念唔推进(同轮内 say 锁):未念的 say=1 步被 judge 跳过去
                 # =合规内容被吞——先等 agent 把直念念完,下一轮判定先有效。
                 and not flow_ctrl.pending_say_text()
@@ -2416,6 +2433,25 @@ async def entrypoint(ctx):
                         new_message.text_content = _stripped
                     except Exception:  # pragma: no cover - 历史消息改写失败只损显示一致性
                         pass
+            # ---- C1 暂停冻结(2026-09-13,call-15a2f586) ----
+            # 暂停期用户轮:照落库(gen=paused,客户讲过的话永远在案)+ 整轮丢弃。
+            # 必须在 WA 累积/detect/rule 推进/judge 之前——旧版暂停期 flow 静默
+            # 推进 step4→6(rule=auto/judge 两路都照跑),恢复后直接错步+暂停期
+            # 轮次蒸发(turns 表 26s 空洞)。resume(agent.paused=False)后自然
+            # 走完整回复路径,零恢复逻辑。
+            if self.paused:
+                try:
+                    _p_ms = int((time.monotonic() - _t0) * 1000)
+                    await cp.add_turn(
+                        call_id, "user", user_text, language=language_state.lang,
+                        line="a", speaker="customer", gen="paused",
+                        template_step=(int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0,
+                        started_ms=_p_ms, ended_ms=_p_ms,
+                    )
+                except Exception:  # noqa: BLE001 - 落库失败不阻暂停语义
+                    pass
+                print(f"[agent] paused turn logged, flow frozen (call {room_name})", flush=True)
+                raise StopResponse()
             # WA 号码碎片累积:号码主导句且累计 <8 位、或自报头半句(「我的WhatsApp係」)
             # → 暂存+StopResponse(唔回复、唔侦测、唔推进),等下一段拼埋一次过处理。
             # 超时 flush 见 _arm_wa_accum_flush。StopResponse 必须喺任何 except-pass
@@ -2760,13 +2796,9 @@ async def entrypoint(ctx):
                             raise StopResponse()
                         print(f"QA_FASTPATH hit=0 reason=no_audio entry={_qa_entry.get('id')}", flush=True)
                         _qa_bump("no_audio")
+            # (旧 paused 分支已前移为 hook 顶部的 C1 暂停冻结——落库 gen=paused+
+            # 三路推进全冻结;此处保留防御性兜底,正常流到不到。)
             if self.paused:
-                chat_ctx = getattr(self, "chat_ctx", None)
-                if chat_ctx is not None and new_message is not None:
-                    try:
-                        chat_ctx.items.append(new_message)
-                    except Exception:  # pragma: no cover - 历史保留失败不致命
-                        pass
                 raise StopResponse()
             # 走到这=本轮走 LLM 正常回复路径(话术直念/暂停/跳过都已在前面拦截)
             # → 起垫话定时器:回复首音频 ~700ms 未到才播,快轮零打扰(closing/WA
@@ -2804,6 +2836,18 @@ async def entrypoint(ctx):
                         session.interrupt(force=True)
                     except Exception:  # pragma: no cover - 无正在播放内容时中断抛错
                         pass
+                    # C1 暂停黑洞(2026-09-13,call-15a2f586):暂停进入=26s 纯静默,
+                    # 客户不知道发生了什么。脚本直念一句可听交代(_say_script 缓存线,
+                    # 零 TTFT);人工接管(escalated)时也适用——人接手前的一句过渡。
+                    # BOK_PAUSE_ACK=0 关。
+                    if os.environ.get("BOK_PAUSE_ACK", "1") == "1" and not closed.is_set():
+                        try:
+                            await _say_script(
+                                session, tts_provider, _tts_cache,
+                                _pause_ack_line(language_state.lang),
+                            )
+                        except Exception:  # noqa: BLE001 - 播报失败不阻暂停语义
+                            pass
                 elif not paused and agent.paused:
                     agent.paused = False
                     print(f"[agent] supervisor resumed agent ({room_name})", flush=True)
