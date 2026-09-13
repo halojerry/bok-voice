@@ -2520,12 +2520,14 @@ async def entrypoint(ctx):
                             # say_step 宽松语义只给通知型直念步(2026-09-12 call-8fa17d2b:
                             # 赔偿直念步也是 say=1,UNCLEAR 的语气点评「呃，自然多了」
                             # 借宽松语义假推进 step4→5);承诺型问句步(赔偿/办理)回落
-                            # CONFIRM 门槛,goal 含「通知」才算通知步。
+                            # CONFIRM 门槛,goal 含「通知」才算通知步。0913:EN goal 是
+                            # "Notice: ..." → 补英文判定,三语行为对齐。
                             say_step=(
                                 flow_ctrl.has_steps
                                 and 0 <= flow_ctrl.current < len(flow_ctrl.steps)
                                 and flow_ctrl.steps[flow_ctrl.current].say
-                                and "通知" in (flow_ctrl.steps[flow_ctrl.current].goal or "")
+                                and ("通知" in (flow_ctrl.steps[flow_ctrl.current].goal or "")
+                                     or "notice" in (flow_ctrl.steps[flow_ctrl.current].goal or "").lower())
                             ),
                         )
                         if _auto:

@@ -31,8 +31,9 @@ _DEFER_RE = re.compile(
     r"(我先?查一下|我先?查查|我先?看看|我想(?:一)?想|我考虑(?:一)?下|稍等|等一下|等下先|"
     r"等我(?:查|看|问|想想)|回头再|晚点再|迟点再|让我(?:查|看|问)|我看看|"
     r"有的?话?再(?:通知|联系|告诉|打)|到时候再|"
+    r"我諗(?:一)?下|等我睇(?:下|先)|遲[啲d][先再]|迟[啲d][先再]|下次先|再算|以后再(?:说|讲)|以後再(?:說|講)|"
     r"let me (?:check|see|look|think)|hold on|one sec|wait a (?:moment|sec|bit)|"
-    r"i(?:'| a)?ll (?:check|get back|take a look))",
+    r"maybe later|another time|i(?:'| a)?ll (?:check|get back|take a look))",
     re.IGNORECASE,
 )
 
@@ -74,8 +75,30 @@ def parse_steps(steps_json: str) -> list[FlowStep]:
 # 正稿只进本步首轮(此后已入对话史);分支按客户当轮回应只命中一条注入;
 # 「注意:」行是操作性事实恒注入。运营在模板里写的分支就是现成的分情景
 # 应答对,直接白捡,不用另造资料层。
-_BRANCH_LINE_RE = re.compile(r"^如果客户\s*(?P<cond>.{1,48}?)\s*→\s*(?P<resp>\S.*)$")
-_NOTE_LINE_RE = re.compile(r"^注意[:：]\s*(?P<note>.+)$")
+_BRANCH_LINE_RE = re.compile(
+    r"^(?:如果客户|(?:If|When)\s+the\s+customer)\s*(?P<cond>.{1,120}?)\s*→\s*(?P<resp>\S.*)$",
+    re.IGNORECASE,
+)
+_NOTE_LINE_RE = re.compile(r"^(?:注意|Notes?)\s*[:：]\s*(?P<note>.+)$", re.IGNORECASE)
+
+# 未知指令行告警(2026-09-13):行内带「→」但行头不被识别(会被静默丢弃)时打一次
+# 告警——运营写了引擎不认的行式(如「客户报出号码(数字串)→复述确认」),静默丢弃
+# =指令悄悄失效(0913 审计:EN 模板 "If the customer…" 整层分支曾因此从未生效)。
+_UNPARSED_DIRECTIVE_WARNED: set[str] = set()
+
+
+def _warn_unparsed_directive(line: str) -> None:
+    key = line[:60]
+    if key in _UNPARSED_DIRECTIVE_WARNED:
+        return
+    if len(_UNPARSED_DIRECTIVE_WARNED) > 200:
+        _UNPARSED_DIRECTIVE_WARNED.clear()
+    _UNPARSED_DIRECTIVE_WARNED.add(key)
+    print(
+        f"[flow] ref_directive_unparsed line={line[:60]!r} —— 行内含「→」但行头不被识别"
+        f"(仅认 如果客户/If the customer/When the customer 与 注意:/Note:),该行已被忽略",
+        flush=True,
+    )
 
 
 @dataclass
@@ -104,6 +127,8 @@ def parse_step_ref(ref: str) -> StepRefParts:
             continue
         if not parts.script:
             parts.script = line
+        elif "→" in line:
+            _warn_unparsed_directive(line)
     return parts
 
 
@@ -271,30 +296,50 @@ _CONFIRM_RE = re.compile(
     re.IGNORECASE,
 )
 # 否认/不是本人/没买过 → 异议
+# 2026-09-13:no 加 \b 词边界(旧裸 no 令 "not/nothing/know" 全中);收「投诉/投訴」
+# (从挂断表迁入)——客户问「投诉点处理」走 OBJECTION 答疑分支,唔再被收线。
 _DENY_RE = re.compile(
-    r"(不是|没有|不是我|我没|唔系|唔係|唔关我事|不关我事|没买过|冇买过|没有买过|骗子|诈骗|报警|"
-    r"no|not me|wrong|never)",
+    r"(不是|没有|不是我|我没|唔系|唔係|唔关我事|不关我事|没买过|冇买过|没有买过|骗子|诈骗|报警|投诉|投訴|"
+    r"\bno\b|not me|wrong|never)",
     re.IGNORECASE,
 )
 # 提问/要解释 → question(在 confirm 之后判,避免"是吗"被当确认)
+# 2026-09-13:补 多少/几多/几钱(粤语「赔几多」唔带问号旧版漏判 UNCLEAR 裸奔)。
 _QUESTION_RE = re.compile(
-    r"(\?|？|怎么|如何|为啥|为什么|几时|几耐|多久|边度|哪里|点解|为什么赔|怎么赔|要多久|真假|"
+    r"(\?|？|怎么|如何|为啥|为什么|几时|几耐|多久|边度|哪里|点解|为什么赔|怎么赔|要多久|真假|多少|几多|幾多|几钱|幾錢|"
     r"what|how|why|when|where|really)",
     re.IGNORECASE,
 )
+# 转折/嫌少词(2026-09-13):「好的,不过我觉得赔太少」的主体係异议,「好的」只係
+# 开头应承——带转折词时 CONFIRM 唔抢判,落 UNCLEAR 交 judge+嫌少分支。
+_CONFIRM_TURN_RE = re.compile(
+    r"(但是|但係|但系|不过|不過|可是|只是|嫌|太少|太低|不够|不夠|唔够|唔夠|"
+    r"\bbut\b|\bhowever\b|too little|too low|not enough)",
+    re.IGNORECASE,
+)
 # 强异议/不想继续/威胁 → objection/offtopic
-_HANGUP_RE = re.compile(r"(不用了|不需要|别再打|别打|不要打|挂|拉黑|投诉|再见|拜拜|唔使|唔使啦|"
+# 2026-09-13:裸「挂」收窄为挂线/挂断/挂咗(旧版「我挂住做嘢」被误判收线);
+# 「唔使」裸词移除(「唔使啦」已在,「唔使担心」类靠软守卫);「投诉」迁去 _DENY_RE。
+_HANGUP_RE = re.compile(r"(不用了|不需要|别再打|别打|不要打|挂线|挂断|挂咗|拉黑|再见|拜拜|唔使啦|"
     r"stop|don't call|leave me|bye)", re.IGNORECASE)
 # 明确拒绝/婉拒(唔需要/唔办/我唔要/拒绝…) → REFUSE:直接收尾话术+结束通话,唔停留挽留。
 # 注意社交软语「唔使担心/唔使客气」等唔算拒绝(见 _REFUSE_SOFT_GUARD_RE)。
+# 2026-09-13:补英文拒绝(旧版 EN 无拒绝词,"I'm not interested" 命中裸 no → OBJECTION
+# 永不收线,通话拖死)。
 _REFUSE_RE = re.compile(
     r"(唔需要|唔辦|唔办|唔好办|唔好辦|我唔要|唔要啦|唔要喇|唔要嘎|唔要咗|唔要了|不要啦|不要喇|不要了|"
     r"唔使喇|唔使啦|唔使再打|唔好再打|唔好再嚟|唔好再來|别再打|別再打|唔好搵我|唔好煩我|唔好骚扰|"
-    r"拒绝|拒絕|收线啦|收線啦|收工啦|唔好搞我)",
+    r"拒绝|拒絕|收线啦|收線啦|收工啦|唔好搞我|"
+    r"not interested|don'?t want (?:it|this|to)|do not want (?:it|this|to)|no thank(?:s| you))",
     re.IGNORECASE,
 )
 # 「唔使X」嘅社交关心/客套短语——唔係拒绝,唔好当 REFUSE(旧实测:「唔使担心」曾误判)。
-_REFUSE_SOFT_GUARD_RE = re.compile(r"唔使(担心|擔心|客气|客氣|怕|緊張|紧张|多心|挂住|掛住)")
+# 2026-09-13 扩组合守卫:「唔使喇,唔方便/唔得闲」=而家唔得闲(脚本要求约好再跟进),
+# 唔係拒绝——压住 REFUSE 落 DEFER/UNCLEAR 车道(call-6f1c4ee3 家族误伤)。
+_REFUSE_SOFT_GUARD_RE = re.compile(
+    r"唔使(担心|擔心|客气|客氣|怕|緊張|紧张|多心|挂住|掛住)"
+    r"|(?:唔使喇|唔使啦).{0,12}(?:唔方便|唔得闲|唔得閒)|(?:唔方便|唔得闲|唔得閒).{0,12}(?:唔使喇|唔使啦)"
+)
 # 没听清/要求重复(2026-09-09):「听唔清」「再说一次」「你说什么」→ REPEAT——客户要求
 # 嘅复述照讲(单号/数字逐位),唔算复读违例。只认【短句】(≤12 字):长句里出现
 # 「乜嘢」多半係内容提问(「乜嘢意思?」),照走 QUESTION。
@@ -406,10 +451,11 @@ def _is_pure_ack(text: str) -> bool:
 
 # ---- 規則級「必定推進」override(唔靠 LLM judge,防止卡死) ----
 # 網購平台名:話術引導核實步(問「喺邊個平台買」)嘅關鍵答案——客戶答到就夠,唔使等確認。
+# 2026-09-13:补 小红书/微信小店;去重复的 京東(旧版重复列了两次,说明没维护过)。
 _PLATFORM_RE = re.compile(
     r"(拼多多|淘宝|淘寶|京东|京東|天貓|天猫|虾皮|蝦皮|shopee|lazada|亞馬遜|亚马逊|amazon|"
-    r"唯品會|唯品会|抖音|快手|pdd|京東|蘇寧|苏宁|当当|當當|官网|官網|直播間|直播间|"
-    r"temu|shein|ebay|etsy|walmart|aliexpress|速卖通|速賣通)",
+    r"唯品會|唯品会|抖音|快手|pdd|蘇寧|苏宁|当当|當當|官网|官網|直播間|直播间|"
+    r"小红书|小紅書|微信小店|temu|shein|ebay|etsy|walmart|aliexpress|速卖通|速賣通)",
     re.IGNORECASE,
 )
 
@@ -457,8 +503,7 @@ def should_auto_advance(*, current: int, goal: str, ref: str, user_text: str, ve
         return False
     if verdict == REPEAT:
         return False
-    if ("平台" in ctx or "核實" in ctx or "核实" in ctx or "邊個平台" in ctx
-            or "platform" in low_ctx or "verify" in low_ctx) and _PLATFORM_RE.search(user_text):
+    if ("平台" in ctx or "platform" in low_ctx) and _PLATFORM_RE.search(user_text):
         return True
     return False
 # 已知资料键:若号码 run 命中佢哋 → 唔当新 WhatsApp(覆述单号/电话)
@@ -713,7 +758,7 @@ def decide_advance(user_text: str, *, facts: dict | None = None, short_ack_confi
         return DEFER
     # 4) 确认/认可(社交词、多字确认、或答啱资料)→ confirm(先于提问:客户"是我的,然后呢?"主体是确认)。
     #    单字/双字纯应承喺非问话步降 UNCLEAR——寒暄唔推流程。
-    if (strong_affirm or fact_match or _CONFIRM_RE.search(t)) and not (short_ack and not short_ack_confirms):
+    if (strong_affirm or fact_match or _CONFIRM_RE.search(t)) and not (short_ack and not short_ack_confirms) and not _CONFIRM_TURN_RE.search(t):
         return CONFIRM
     # 5) 纯提问 → question(停留本步解答)
     if is_question:
@@ -910,8 +955,8 @@ class FlowController:
             return "【客户回应不明确】换个说法简短再引导一次（可以给选项），绝不重复你上一句原话。"
         if v == OBJECTION:
             return (
-                "【客户有疑虑】先针对疑虑安抚（运费险、一赔二、专员跟进都是可用事实），"
-                "再回到当前步；绝不重复你上一句原话。"
+                "【客户有疑虑】先针对疑虑安抚（用当前话术模板里的赔偿标准、专员跟进"
+                "承诺作事实——不要引用模板之外的数字或承诺），再回到当前步；绝不重复你上一句原话。"
             )
         return ""
 
