@@ -3023,15 +3023,11 @@ async def entrypoint(ctx):
                     # 零 TTFT);人工接管(escalated)时也适用——人接手前的一句过渡。
                     # BOK_PAUSE_ACK=0 关。
                     if os.environ.get("BOK_PAUSE_ACK", "1") == "1" and not closed.is_set():
-                        _turn_origin["gen"] = "script"
-                        _turn_origin["provider"] = "pause-ack"
-                        try:
-                            await _say_script(
-                                session, tts_provider, _tts_cache,
-                                _pause_ack_line(language_state.lang),
-                            )
-                        except Exception:  # noqa: BLE001 - 播报失败不阻暂停语义
-                            pass
+                        # 2026-09-13 实机 A/B 实证:session.say() 版 ack 令 turn_detection=stt
+                        # 轮提交链在 paused 期间停摆(ack-on 三轮暂停期零 ASR/零轮;ack-off
+                        # 对照组 gen=paused 轮正常落库)——改走 out-of-band 音轨(垫话同
+                        # 通道,零 speech 队列交互;cache miss 异步补物化,下通起有声)。
+                        _filler.play_offband(_pause_ack_line(language_state.lang))
                 elif not paused and agent.paused:
                     agent.paused = False
                     print(f"[agent] supervisor resumed agent ({room_name})", flush=True)

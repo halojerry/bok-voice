@@ -435,6 +435,58 @@ class FillerDirector:
         hold = self._play_started + self._cur_dur + filler_gap_s() - time.monotonic()
         return max(0.0, hold)
 
+    def play_offband(self, text: str) -> None:
+        """C1 修复(2026-09-13 实机 A/B 实证):暂停播报绝不能走 session.say()——
+        它令 turn_detection=stt 的轮提交链在 paused 期间停摆(ack-on 三轮暂停期
+        零 AST 事件;ack-off 对照组 gen=paused 轮正常落库)。改走 out-of-band
+        音轨(垫话同通道,零 speech 队列交互)。tts-cache 命中人设物化版即播;
+        miss 不同步云合成(暂停语义不打断优先)——打点并异步 backfill,下一通
+        起有声。
+        """
+        if self._player is None or not text:
+            return
+        try:
+            voice = model = ""
+            cached: bytes | None = None
+            if self._cache is not None and self._voice_model_resolver is not None:
+                try:
+                    voice, model = self._voice_model_resolver()
+                except Exception:  # noqa: BLE001
+                    voice = model = ""
+                if voice and model:
+                    try:
+                        speed = 1.0
+                        try:
+                            speed = float(self._speed_resolver() or 1.0)
+                        except Exception:  # noqa: BLE001
+                            speed = 1.0
+                        cached = self._cache.lookup(text, voice=voice, model=model, speed=speed)
+                    except TypeError:
+                        cached = self._cache.lookup(text, voice=voice, model=model)
+                    except Exception:  # noqa: BLE001
+                        cached = None
+            if cached is None:
+                print(
+                    f"BOK_PAUSE_ACK_NO_AUDIO text={text[:16]!r} voice={voice!r} — 未物化,异步补,下通起有声",
+                    flush=True,
+                )
+                self._maybe_backfill(text, voice, model)
+                return
+            from .tts_cache import frames_aiter, pcm_to_frames
+
+            rate = int(getattr(self._cache, "sample_rate", 24000))
+            frames = pcm_to_frames(resample_pcm(cached, rate, BACKGROUND_PLAYER_RATE), BACKGROUND_PLAYER_RATE)
+            try:
+                from livekit.agents import AudioConfig
+
+                source = AudioConfig(source=frames_aiter(frames), fade_in=0.015, fade_out=0.05)
+            except Exception:  # noqa: BLE001 - 无 livekit(测试替身)裸帧
+                source = frames_aiter(frames)
+            self._player.play(source)
+            print(f"BOK_PAUSE_ACK offband played text={text[:16]!r}", flush=True)
+        except Exception as exc:  # noqa: BLE001 - 播报失败不阻暂停语义
+            print(f"BOK_PAUSE_ACK offband error={exc!r}", flush=True)
+
     def cancel(self) -> None:
         """新用户轮到达等场景:作废定时器/链发并停掉在播垫话——用户插话优先,
         out-of-band 音轨不受框架打断机制管理,必须自己停。"""

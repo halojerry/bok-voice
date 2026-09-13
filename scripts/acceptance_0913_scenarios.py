@@ -34,7 +34,8 @@ class Ear:
         room.on("track_subscribed", self._on)
 
     def _on(self, track, pub, participant):
-        if int(track.kind) != int(rtc.TrackKind.KIND_AUDIO) or getattr(track, "name", "") != "roomio_audio":
+        # roomio=语音回复轨;background=off-band 垫话/暂停播报轨(ack 在这条)。
+        if int(track.kind) != int(rtc.TrackKind.KIND_AUDIO) or getattr(track, "name", "") not in ("roomio_audio", "background_audio"):
             return
 
         async def _read():
