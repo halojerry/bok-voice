@@ -467,6 +467,40 @@ def _wa_number_line(lang: str, num: str) -> str:
     return "不好意思，可能刚才没听完整——麻烦您继续说一下您的号码。"
 
 
+def _wa_len_expected(lang: str) -> int | None:
+    """C3b 号长期望(2026-09-13,call-6f1c4ee3:7 位错号被复述确认+客户假确认):
+    粤=8 位港号(852+8=11 亦收);zh=11 位手机;en 宽松不校验。BOK_WA_LEN_CHECK=0 关。
+    只挡「复述确认」,不挡捕获——「报出就收」铁律不动(捕获/上报/横幅照旧)。"""
+    if os.environ.get("BOK_WA_LEN_CHECK", "1") != "1":
+        return None
+    if lang == "cantonese":
+        return 8
+    if lang == "zh":
+        return 11
+    return None
+
+
+def _wa_confirm_or_reask(lang: str, num: str) -> str:
+    """复述确认前的号长闸:长度可疑 → 不复述确认,改口请客户报完整号码(打点
+    LEN_CHECK_SUSPECT);长度合理/校验关闭 → 原 _wa_number_line 复述确认。"""
+    exp = _wa_len_expected(lang)
+    if exp is not None and num and str(num).isdigit():
+        n = len(str(num))
+        ok = n == exp or (lang == "cantonese" and str(num).startswith("852") and n == 11)
+        if not ok:
+            print(
+                f"[whatsapp] LEN_CHECK_SUSPECT num_len={n} expected={exp} lang={lang} "
+                "— 复述改请重讲(捕获/上报照旧,不破「报出就收」)",
+                flush=True,
+            )
+            if lang == "cantonese":
+                return "唔该再讲一次你完整嘅WhatsApp號碼。"
+            if lang == "en":
+                return "Could you read out your full number again, please?"
+            return "麻烦您再报一次完整的号码。"
+    return _wa_number_line(lang, num)
+
+
 # ---- ASR 热词(context 软偏置)----
 # Qwen3-ASR 官方 customizable context = system message 词汇表(「Vocabulary: …」
 # 格式),与 language 强制可叠加——领域词误听(「單號」聽成「打啊」类)嘅软补。
@@ -1232,6 +1266,7 @@ async def entrypoint(ctx):
     from .flow import (
         CONFIRM,
         DEFER,
+        FAREWELL,
         OBJECTION,
         QUESTION,
         REFUSE,
@@ -1336,6 +1371,18 @@ async def entrypoint(ctx):
             _wa_accum["text"] = ""
             if not stashed:
                 return
+            # C3a:合并轮落库(provider=wa-merged)——stash 轮(provider=wa-stash)
+            # 已各段在案,这里是拼完的整句,分析侧按 provider 对账。
+            try:
+                _fm_ms = int((time.monotonic() - _t0) * 1000)
+                await cp.add_turn(
+                    call_id, "user", stashed, language=language_state.lang,
+                    line="a", speaker="customer", provider="wa-merged",
+                    template_step=(int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0,
+                    started_ms=_fm_ms, ended_ms=_fm_ms,
+                )
+            except Exception:  # noqa: BLE001 - 落库失败唔阻 flush
+                pass
             _g, _r = flow_ctrl.current_goal_ref()
             sig = detect_whatsapp_signal(stashed, step_goal=_g, step_ref=_r, facts=flow_ctrl.vars_map)
             num = ""
@@ -1359,7 +1406,7 @@ async def entrypoint(ctx):
                 print(f"[whatsapp] accumulate flush no-number, prompt continue (call {room_name})", flush=True)
             try:
                 _turn_origin["gen"] = "script"  # WA 号码复述=脚本直念
-                await _say_script(session, tts_provider, _tts_cache, _wa_number_line(language_state.lang, num))
+                await _say_script(session, tts_provider, _tts_cache, _wa_confirm_or_reask(language_state.lang, num))
             except Exception as exc:  # pragma: no cover - 会话已关等
                 print(f"[whatsapp] accumulate flush say failed: {exc!r}", flush=True)
 
@@ -2486,6 +2533,19 @@ async def entrypoint(ctx):
                         _wa_accum["text"] = _merged
                         _wa_accum["ts"] = time.monotonic()
                         _arm_wa_accum_flush()
+                        # C3a(2026-09-13,call-6f1c4ee3):报号碎片轮照落库——stash
+                        # 路径旧版整轮蒸发(turns 表空洞),客户报过什么必须永远在案;
+                        # flush 时合并轮另记 provider=wa-merged,分析侧可对账去重。
+                        try:
+                            _st_ms = int((time.monotonic() - _t0) * 1000)
+                            await cp.add_turn(
+                                call_id, "user", user_text, language=language_state.lang,
+                                line="a", speaker="customer", provider="wa-stash",
+                                template_step=(int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0,
+                                started_ms=_st_ms, ended_ms=_st_ms,
+                            )
+                        except Exception:  # noqa: BLE001 - 落库失败唔阻累积
+                            pass
                         print(
                             f"[whatsapp] accumulate chars={len(user_text)} total_digits={_n} (call {room_name})",
                             flush=True,
@@ -2582,6 +2642,20 @@ async def entrypoint(ctx):
                             _invalidate_stale_preemptive("客户明确拒绝 → 收尾")
                             _schedule_call_end()
                             print(f"[flow] refuse -> closing, end scheduled (call {room_name})", flush=True)
+                    elif verdict == FAREWELL:
+                        # C4 道别分流(2026-09-13,call-6f1c4ee3):「拜拜/再见」≠拒绝——
+                        # 谈成的通话因道别词被标 declined 是误伤。收线照走(closing 态
+                        # 注入收尾话术,LLM 自然道别),disposition 按业务结果记:
+                        # 已捕获号码=scheduled(办理中),否则 polite_close。
+                        if not flow_ctrl.closing:
+                            _disp = "scheduled" if _wa_captured["on"] else "polite_close"
+                            flow_ctrl.enter_closing()
+                            _invalidate_stale_preemptive("客户道别 → 收尾")
+                            _schedule_call_end(8.0, disposition=_disp)
+                            print(
+                                f"[flow] farewell -> closing, end scheduled disposition={_disp} (call {room_name})",
+                                flush=True,
+                            )
                     elif not flow_ctrl.done and not flow_ctrl.closing and not _say_pending_before:
                         _g2, _r2 = flow_ctrl.current_goal_ref()
                         # 規則級必定推進 override(開場步客已回應 / 核實步答到平台):

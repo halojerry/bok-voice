@@ -574,7 +574,7 @@ def test_current_step_explicit_no_leak_instruction():
 # ---- 明确拒绝 → REFUSE(一句礼貌收尾 + 主动结束通话) ----
 def test_decide_advance_refuse_family():
     # 高频拒绝说法(旧版漏成 unclear/objection 然后无限重问):现在直接 REFUSE。
-    from agent_runtime.flow import REFUSE, decide_advance
+    from agent_runtime.flow import FAREWELL, REFUSE, decide_advance
     assert decide_advance("唔需要喇，唔该") == REFUSE
     assert decide_advance("唔办啦。") == REFUSE
     assert decide_advance("我唔要。") == REFUSE
@@ -583,13 +583,16 @@ def test_decide_advance_refuse_family():
     assert decide_advance("唔好再打嚟！") == REFUSE
     assert decide_advance("不用了谢谢") == REFUSE
     assert decide_advance("别再打来了") == REFUSE
-    assert decide_advance("再见") == REFUSE
-    assert decide_advance("拜拜") == REFUSE
+    # 2026-09-13 C4:纯道别≠拒绝——剥出 FAREWELL 分流(谈成通话道别标 declined 是误伤)。
+    assert decide_advance("再见") == FAREWELL
+    assert decide_advance("拜拜") == FAREWELL
+    # 拒绝优先于道别:「唔好再打嚟,拜拜」主体仍是拒绝。
+    assert decide_advance("唔好再打嚟，拜拜。") == REFUSE
 
 
 def test_refuse_social_phrase_not_refuse():
     # 「唔使担心/唔使客气」係社交关心/客套,唔係拒绝(防误收线)。
-    from agent_runtime.flow import REFUSE, decide_advance
+    from agent_runtime.flow import FAREWELL, REFUSE, decide_advance
     assert decide_advance("唔使担心，我明白嘅。") != REFUSE
     assert decide_advance("你哋唔使客气。") != REFUSE
 

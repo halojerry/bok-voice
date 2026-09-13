@@ -19,7 +19,10 @@ OBJECTION = "objection"   # 有异议/否认/不配合 → 停留本步应对
 QUESTION = "question"     # 提问/要解释 → 停留本步解答
 OFFTOPIC = "offtopic"     # 明显无关/要挂断/怀疑诈骗 → 不强推
 UNCLEAR = "unclear"       # 判断不清 → 停留,自然应对
-REFUSE = "refuse"         # 明确拒绝/告别/要收线 → 收尾态:一句礼貌再见后结束通话
+REFUSE = "refuse"         # 明确拒绝/要收线(唔需要/别再打/拉黑) → 收尾态:一句礼貌再见后结束通话
+FAREWELL = "farewell"     # 纯道别(拜拜/再见/bye)≠拒绝——C4 分流(2026-09-13,call-6f1c4ee3
+                          # 谈成通话因「拜拜」命中 REFUSE 被标 declined):closing/收线态=自然道别,
+                          # 中途=礼貌告别收线;disposition 按业务结果记,唔再落 declined。
 REPEAT = "repeat"         # 没听清/要求重复 → 停留,把上一句关键内容再讲一遍(客户要求的重复照讲)
 DEFER = "defer"           # 客户要自己去查/稍等再讲(社交拖延) → 脚本直念短应承,零 LLM(2026-09-12:
                           # call-8fa17d2b「我先查一下」落到 LLM 只会照本重问,体验=只剩垫话)
@@ -319,9 +322,13 @@ _CONFIRM_TURN_RE = re.compile(
 )
 # 强异议/不想继续/威胁 → objection/offtopic
 # 2026-09-13:裸「挂」收窄为挂线/挂断/挂咗(旧版「我挂住做嘢」被误判收线);
-# 「唔使」裸词移除(「唔使啦」已在,「唔使担心」类靠软守卫);「投诉」迁去 _DENY_RE。
-_HANGUP_RE = re.compile(r"(不用了|不需要|别再打|别打|不要打|挂线|挂断|挂咗|拉黑|再见|拜拜|唔使啦|"
-    r"stop|don't call|leave me|bye)", re.IGNORECASE)
+# 「唔使」裸词移除(「唔使啦」已在,「唔使担心」类靠软守卫);「投诉」迁去 _DENY_RE;
+# 道别词(再见/拜拜/bye)剥出 → _FAREWELL_RE(C4:道别≠拒绝)。
+_HANGUP_RE = re.compile(r"(不用了|不需要|别再打|别打|不要打|挂线|挂断|挂咗|拉黑|唔使啦|"
+    r"stop|don't call|leave me)", re.IGNORECASE)
+# 纯道别(2026-09-13 C4):「拜拜/再见/bye」——非收线要求,非拒绝。判定在 REFUSE 之后
+# (「唔好再打,拜拜」主体係拒绝)。
+_FAREWELL_RE = re.compile(r"(再见|再見|再會|拜拜|goodbye|\bbye\b)", re.IGNORECASE)
 # 明确拒绝/婉拒(唔需要/唔办/我唔要/拒绝…) → REFUSE:直接收尾话术+结束通话,唔停留挽留。
 # 注意社交软语「唔使担心/唔使客气」等唔算拒绝(见 _REFUSE_SOFT_GUARD_RE)。
 # 2026-09-13:补英文拒绝(旧版 EN 无拒绝词,"I'm not interested" 命中裸 no → OBJECTION
@@ -474,7 +481,8 @@ def should_auto_advance(*, current: int, goal: str, ref: str, user_text: str, ve
       若只係純核對平台(冇 WhatsApp 要求)→ 答到平台即過。
     """
     # DEFER(客户要自己去查/稍后再讲)同拦:拖延唔係任何一步嘅答案。
-    if verdict in (OBJECTION, REFUSE, REPEAT, DEFER):
+    # FAREWELL(2026-09-13 C4)同拦:道别轮唔推进(收线分流在 agent 侧)。
+    if verdict in (OBJECTION, REFUSE, REPEAT, DEFER, FAREWELL):
         return False
     if current == 0:
         # 身份確認步(2026-09-12 開場白三段拆分):客戶任何非拒絕實質回應——
@@ -738,6 +746,10 @@ def decide_advance(user_text: str, *, facts: dict | None = None, short_ack_confi
     #    拒绝优先于一切(含否认/提问):「唔係我,唔好再打」主体係收线。
     if (_REFUSE_RE.search(t) or _HANGUP_RE.search(t)) and not _REFUSE_SOFT_GUARD_RE.search(t):
         return REFUSE
+    # 1.5) 纯道别 → FAREWELL(2026-09-13 C4):拒绝优先已过;道别≠拒绝,
+    # agent 侧按 closing 态/业务结果分流(captured→scheduled,否则 polite_close)。
+    if _FAREWELL_RE.search(t):
+        return FAREWELL
     # 2) 明确否认/不是本人 → objection(优先于确认词,避免"不是,是我…"误判)
     if _DENY_RE.search(t):
         return OBJECTION
