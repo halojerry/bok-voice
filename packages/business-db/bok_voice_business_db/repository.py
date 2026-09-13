@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
@@ -533,6 +534,8 @@ class SqlAlchemyBusinessRepository:
             "llm": json.loads(row.llm_json or "{}"),
             "tts": json.loads(row.tts_json or "{}"),
             "vad": json.loads(row.vad_json or "{}"),
+            # 空 blob（老库补列后未保存）回落默认段，否则 dialer 拿不到 mode。
+            "sip": json.loads(row.sip_json or "{}") or self.default_settings()["sip"],
             "policy": row.policy,
         }
 
@@ -545,6 +548,9 @@ class SqlAlchemyBusinessRepository:
         row.llm_json = json.dumps(settings.get("llm", {}), ensure_ascii=False)
         row.tts_json = json.dumps(settings.get("tts", {}), ensure_ascii=False)
         row.vad_json = json.dumps(settings.get("vad", {}), ensure_ascii=False)
+        row.sip_json = json.dumps(
+            settings.get("sip") or self.default_settings()["sip"], ensure_ascii=False
+        )
         row.policy = settings.get("policy", row.policy or "offline_first")
         self.session.commit()
         return self.get_settings()
@@ -587,6 +593,237 @@ class SqlAlchemyBusinessRepository:
             out.append(item)
         return out
 
+    # ---- roster（名册认领池）----
+
+    @staticmethod
+    def _roster_to_dict(row: models.RosterEntry) -> dict:
+        return {
+            "id": row.id, "account_id": row.account_id, "call_id": row.call_id,
+            "object_id": row.object_id, "channel": row.channel, "number": row.number,
+            "display_name": row.display_name, "summary": row.summary,
+            "status": row.status, "claimed_by": row.claimed_by,
+            "claimed_at": row.claimed_at.isoformat() if row.claimed_at else "",
+            "created_at": row.created_at.isoformat() if row.created_at else "",
+        }
+
+    def upsert_roster_entry(self, *, account_id: str, call_id: str, object_id: str,
+                            channel: str, number: str, display_name: str = "",
+                            summary: str = "") -> dict:
+        from sqlalchemy import and_
+        row = (
+            self.session.query(models.RosterEntry)
+            .filter(and_(
+                models.RosterEntry.account_id == account_id,
+                models.RosterEntry.object_id == object_id,
+                models.RosterEntry.channel == channel,
+                models.RosterEntry.number == number,
+                models.RosterEntry.status != "handled",
+            ))
+            .order_by(models.RosterEntry.created_at.desc())
+            .first()
+        )
+        if row is None:
+            row = models.RosterEntry(
+                id=f"roster-{_uuid()[:8]}", account_id=account_id, call_id=call_id,
+                object_id=object_id, channel=channel, number=number,
+                display_name=display_name, summary=summary,
+            )
+            self.session.add(row)
+        else:
+            row.call_id = call_id
+            if display_name:
+                row.display_name = display_name
+            if summary:
+                row.summary = summary
+        self.session.commit()
+        return self._roster_to_dict(row)
+
+    def list_roster(self, account_id: str = "acc-001", status: str = "",
+                    channel: str = "") -> list[dict]:
+        from sqlalchemy import and_
+        q = self.session.query(models.RosterEntry).filter(
+            models.RosterEntry.account_id == account_id)
+        conds = []
+        if status:
+            conds.append(models.RosterEntry.status == status)
+        if channel:
+            conds.append(models.RosterEntry.channel == channel)
+        if conds:
+            q = q.filter(and_(*conds))
+        rows = q.order_by(models.RosterEntry.created_at.desc()).all()
+        return [self._roster_to_dict(r) for r in rows]
+
+    def get_roster_entry(self, entry_id: str) -> dict | None:
+        row = self.session.get(models.RosterEntry, entry_id)
+        return self._roster_to_dict(row) if row else None
+
+    def update_roster_entry(self, entry_id: str, **fields: Any) -> dict | None:
+        row = self.session.get(models.RosterEntry, entry_id)
+        if not row:
+            return None
+        for key in ("call_id", "object_id", "channel", "number", "display_name",
+                    "summary", "status", "claimed_by", "claimed_at"):
+            if key in fields and fields[key] is not None:
+                # claimed_at 读侧是 ISO 字符串（_roster_to_dict），调用方做读改写时
+                # 会把字符串传回来；SQLite/Postgres DateTime 列只收 datetime，
+                # 不收会抛 StatementError——与 InMemory 侧字符串直存对齐语义。
+                # 空串=未认领行的读侧契约（_roster_to_dict 输出 ""），须映射回
+                # None 存 NULL，否则 fromisoformat("") 抛 ValueError。
+                value = fields[key]
+                if key == "claimed_at":
+                    if isinstance(value, str):
+                        value = datetime.fromisoformat(value) if value else None
+                setattr(row, key, value)
+        self.session.commit()
+        return self._roster_to_dict(row)
+
+    # ---- campaigns（外呼战役:串行逐个拨）----
+
+    @staticmethod
+    def _campaign_to_dict(row: models.Campaign) -> dict:
+        return {
+            "id": row.id, "account_id": row.account_id, "name": row.name,
+            "template_id": row.template_id, "persona_id": row.persona_id,
+            "language": row.language, "status": row.status,
+            "gap_seconds": row.gap_seconds,
+            "created_at": row.created_at.isoformat() if row.created_at else "",
+            "finished_at": row.finished_at.isoformat() if row.finished_at else "",
+        }
+
+    @staticmethod
+    def _campaign_scripts(row: models.Campaign) -> dict[str, Any]:
+        """`scripts_json` 反序列化：object_id → 台词数组；坏 JSON/非 dict 一律 {}。
+
+        mock 演练钩子，解析失败不抛（起拨链路不能因为一句脏台词整波停摆）。
+        保留键（`__` 前缀，如 `__speak_interval__`）原样透传标量——它们不是
+        object_id 命名空间下的台词，是 campaign 级 mock 参数。
+        """
+        raw = str(getattr(row, "scripts_json", "") or "")
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        out: dict[str, Any] = {}
+        for k, v in data.items():
+            key = str(k)
+            if key.startswith("__"):
+                out[key] = v
+            elif isinstance(v, list):
+                out[key] = [str(x) for x in v if str(x).strip()]
+        return out
+
+    @staticmethod
+    def _item_to_dict(row: models.CampaignItem) -> dict:
+        return {
+            "id": row.id, "campaign_id": row.campaign_id, "seq": row.seq,
+            "object_id": row.object_id, "phone": row.phone, "status": row.status,
+            "call_id": row.call_id, "attempts": row.attempts,
+            "last_error": row.last_error, "scenario": row.scenario,
+            "updated_at": row.updated_at.isoformat() if row.updated_at else "",
+        }
+
+    def create_campaign(self, account_id: str, *, name: str, template_id: str,
+                        persona_id: str, language: str, gap_seconds: int,
+                        object_ids: list[str],
+                        scenarios: dict[str, str] | None = None,
+                        scripts: dict[str, list[str]] | None = None) -> dict:
+        campaign_id = f"camp-{_uuid()}"
+        row = models.Campaign(
+            id=campaign_id, account_id=account_id, name=name,
+            template_id=template_id, persona_id=persona_id, language=language,
+            status="draft", gap_seconds=gap_seconds,
+            scripts_json=json.dumps(scripts or {}, ensure_ascii=False),
+        )
+        self.session.add(row)
+        for seq, object_id in enumerate(object_ids or []):
+            obj = self.get_object(object_id)
+            phone = (obj or {}).get("phone", "") or ""
+            self.session.add(models.CampaignItem(
+                id=f"citem-{_uuid()}", campaign_id=campaign_id, seq=seq,
+                object_id=object_id, phone=phone,
+                status="pending" if phone else "skipped",
+                call_id="", attempts=1,
+                last_error="" if phone else "对象无电话",
+                scenario=(scenarios or {}).get(object_id, "") or "",
+            ))
+        self.session.commit()
+        return self._campaign_to_dict(row)
+
+    def get_campaign(self, campaign_id: str) -> dict | None:
+        row = self.session.get(models.Campaign, campaign_id)
+        return self._campaign_to_dict(row) if row else None
+
+    def get_campaign_scripts(self, campaign_id: str) -> dict[str, Any]:
+        """战役 mock 台词（object_id → 句子数组）+ campaign 级 mock 参数（`__` 键）。"""
+        row = self.session.get(models.Campaign, campaign_id)
+        return self._campaign_scripts(row) if row else {}
+
+    def update_campaign(self, campaign_id: str, **fields: Any) -> dict | None:
+        row = self.session.get(models.Campaign, campaign_id)
+        if not row:
+            return None
+        for key in ("name", "template_id", "persona_id", "language", "status",
+                    "gap_seconds", "finished_at"):
+            if key in fields and fields[key] is not None:
+                # finished_at 读侧是 ISO 字符串（_campaign_to_dict），调用方读改写会
+                # 把字符串传回来；DateTime 列只收 datetime，空串=未完成行读侧契约，
+                # 须映射回 None 存 NULL（同 update_roster_entry 姿势）。
+                value = fields[key]
+                if key == "finished_at" and isinstance(value, str):
+                    value = datetime.fromisoformat(value) if value else None
+                setattr(row, key, value)
+        self.session.commit()
+        return self._campaign_to_dict(row)
+
+    def list_campaigns(self, account_id: str = "acc-001", status: str = "") -> list[dict]:
+        q = self.session.query(models.Campaign).filter(
+            models.Campaign.account_id == account_id)
+        if status:
+            q = q.filter(models.Campaign.status == status)
+        rows = q.order_by(models.Campaign.created_at.desc()).all()
+        return [self._campaign_to_dict(r) for r in rows]
+
+    def list_items(self, campaign_id: str) -> list[dict]:
+        rows = (
+            self.session.query(models.CampaignItem)
+            .filter(models.CampaignItem.campaign_id == campaign_id)
+            .order_by(models.CampaignItem.seq.asc())
+            .all()
+        )
+        return [self._item_to_dict(r) for r in rows]
+
+    def get_item(self, item_id: str) -> dict | None:
+        row = self.session.get(models.CampaignItem, item_id)
+        return self._item_to_dict(row) if row else None
+
+    def update_item(self, item_id: str, **fields: Any) -> dict | None:
+        row = self.session.get(models.CampaignItem, item_id)
+        if not row:
+            return None
+        for key in ("seq", "object_id", "phone", "status", "call_id", "attempts",
+                    "last_error", "scenario", "updated_at"):
+            if key in fields and fields[key] is not None:
+                value = fields[key]
+                if key == "updated_at" and isinstance(value, str):
+                    value = datetime.fromisoformat(value) if value else None
+                setattr(row, key, value)
+        self.session.commit()
+        return self._item_to_dict(row)
+
+    def find_item_by_call(self, call_id: str) -> dict | None:
+        if not call_id:
+            return None
+        row = (
+            self.session.query(models.CampaignItem)
+            .filter(models.CampaignItem.call_id == call_id)
+            .first()
+        )
+        return self._item_to_dict(row) if row else None
+
     @staticmethod
     def default_settings() -> dict:
         return {
@@ -626,6 +863,19 @@ class SqlAlchemyBusinessRepository:
                 "min_silence_duration": 0.45,
                 "interruption": True,
             },
+            # 外呼（SIP）配置段（spec 2026-09-12 Wave2）：mode=mock|real（env
+            # BOK_SIP_MODE 是 kill-switch，有值即终局——见 agent dialer.resolve_dial_mode）。
+            # numbers=许可主叫号池；两个超时字段供 dialer 振铃窗与时长保险丝读取。
+            "sip": {
+                "mode": "mock",
+                "trunk_id": "",
+                "address": "",
+                "auth_username": "",
+                "auth_password": "",
+                "numbers": [],
+                "ringing_timeout_s": 30,
+                "max_call_duration_s": 600,
+            },
             "policy": "offline_first",
         }
 
@@ -654,6 +904,9 @@ class InMemoryBusinessRepository:
         self.global_insights: list[dict] = []
         self.audit_events: list[dict] = []
         self.qa_entries: dict[str, dict] = {}
+        self.roster: dict[str, dict] = {}
+        self.campaigns: dict[str, dict] = {}
+        self.campaign_items: dict[str, dict] = {}
         self.settings: dict = SqlAlchemyBusinessRepository.default_settings()
 
     def create_call(self, manifest: SessionManifest) -> dict:
@@ -954,6 +1207,8 @@ class InMemoryBusinessRepository:
             "llm": settings.get("llm", {}),
             "tts": settings.get("tts", {}),
             "vad": settings.get("vad", {}),
+            # 缺键/空值回落默认段（与 SQL 后端同语义：不允许把 sip 段清成空）。
+            "sip": settings.get("sip") or SqlAlchemyBusinessRepository.default_settings()["sip"],
             "policy": settings.get("policy", "offline_first"),
         }
         return self.settings
@@ -971,3 +1226,151 @@ class InMemoryBusinessRepository:
         if call_id:
             items = [e for e in items if e.get("call_id") == call_id]
         return items[:limit]
+
+    # ---- roster（名册认领池）----
+
+    def upsert_roster_entry(self, *, account_id: str, call_id: str, object_id: str,
+                            channel: str, number: str, display_name: str = "",
+                            summary: str = "") -> dict:
+        for row in self.roster.values():
+            if (row["account_id"] == account_id and row["object_id"] == object_id
+                    and row["channel"] == channel and row["number"] == number
+                    and row["status"] != "handled"):
+                row["call_id"] = call_id
+                if display_name:
+                    row["display_name"] = display_name
+                if summary:
+                    row["summary"] = summary
+                return dict(row)
+        from datetime import datetime, timezone
+        entry = {
+            "id": f"roster-{uuid.uuid4().hex[:8]}", "account_id": account_id,
+            "call_id": call_id, "object_id": object_id, "channel": channel,
+            "number": number, "display_name": display_name, "summary": summary,
+            "status": "unclaimed", "claimed_by": "", "claimed_at": "",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.roster[entry["id"]] = entry
+        return dict(entry)
+
+    def list_roster(self, account_id: str = "acc-001", status: str = "",
+                    channel: str = "") -> list[dict]:
+        rows = [dict(r) for r in self.roster.values() if r["account_id"] == account_id
+                and (not status or r["status"] == status)
+                and (not channel or r["channel"] == channel)]
+        return sorted(rows, key=lambda r: r["created_at"], reverse=True)
+
+    def get_roster_entry(self, entry_id: str) -> dict | None:
+        row = self.roster.get(entry_id)
+        return dict(row) if row else None
+
+    def update_roster_entry(self, entry_id: str, **fields: Any) -> dict | None:
+        row = self.roster.get(entry_id)
+        if not row:
+            return None
+        # 与 SQL 侧同款白名单：未知键（含 id/created_at）忽略，防两后端分叉。
+        for key in ("call_id", "object_id", "channel", "number", "display_name",
+                    "summary", "status", "claimed_by", "claimed_at"):
+            if key in fields and fields[key] is not None:
+                row[key] = fields[key]
+        return dict(row)
+
+    # ---- campaigns（外呼战役:串行逐个拨）----
+
+    def create_campaign(self, account_id: str, *, name: str, template_id: str,
+                        persona_id: str, language: str, gap_seconds: int,
+                        object_ids: list[str],
+                        scenarios: dict[str, str] | None = None,
+                        scripts: dict[str, list[str]] | None = None) -> dict:
+        now = datetime.now(timezone.utc).isoformat()
+        campaign_id = f"camp-{uuid.uuid4().hex[:12]}"
+        campaign = {
+            "id": campaign_id, "account_id": account_id, "name": name,
+            "template_id": template_id, "persona_id": persona_id,
+            "language": language, "status": "draft", "gap_seconds": gap_seconds,
+            "created_at": now, "finished_at": "",
+            # 与 SQL 侧同键同名：内存仓直接存 dict（SQL 侧存 JSON 串），
+            # 读侧统一走 get_campaign_scripts（`__` 前缀键=保留的 campaign 级参数）。
+            "scripts": {str(k): ([str(x) for x in v if str(x).strip()]
+                                 if isinstance(v, list) else v)
+                        for k, v in (scripts or {}).items()},
+        }
+        self.campaigns[campaign_id] = campaign
+        for seq, object_id in enumerate(object_ids or []):
+            obj = self.get_object(object_id)
+            phone = (obj or {}).get("phone", "") or ""
+            item = {
+                "id": f"citem-{uuid.uuid4().hex[:12]}", "campaign_id": campaign_id,
+                "seq": seq, "object_id": object_id, "phone": phone,
+                "status": "pending" if phone else "skipped", "call_id": "",
+                "attempts": 1, "last_error": "" if phone else "对象无电话",
+                "scenario": (scenarios or {}).get(object_id, "") or "",
+                "updated_at": now,
+            }
+            self.campaign_items[item["id"]] = item
+        return dict(campaign)
+
+    def get_campaign(self, campaign_id: str) -> dict | None:
+        row = self.campaigns.get(campaign_id)
+        return dict(row) if row else None
+
+    def get_campaign_scripts(self, campaign_id: str) -> dict[str, Any]:
+        """战役 mock 台词（object_id → 句子数组）+ campaign 级 mock 参数（`__` 键）。
+
+        与 SQL 侧同出口：调用方（campaign._start_call）不感知两后端存储形态差异。
+        """
+        row = self.campaigns.get(campaign_id) or {}
+        scripts = row.get("scripts") or {}
+        out: dict[str, Any] = {}
+        for k, v in scripts.items():
+            key = str(k)
+            if key.startswith("__"):
+                out[key] = v
+            elif isinstance(v, list):
+                out[key] = [str(x) for x in v if str(x).strip()]
+        return out
+
+    def update_campaign(self, campaign_id: str, **fields: Any) -> dict | None:
+        row = self.campaigns.get(campaign_id)
+        if not row:
+            return None
+        # 与 SQL 侧同款白名单：未知键（含 id/created_at）忽略，防两后端分叉。
+        for key in ("name", "template_id", "persona_id", "language", "status",
+                    "gap_seconds", "finished_at"):
+            if key in fields and fields[key] is not None:
+                row[key] = fields[key]
+        return dict(row)
+
+    def list_campaigns(self, account_id: str = "acc-001", status: str = "") -> list[dict]:
+        rows = [dict(r) for r in self.campaigns.values()
+                if r["account_id"] == account_id
+                and (not status or r["status"] == status)]
+        return sorted(rows, key=lambda r: r["created_at"], reverse=True)
+
+    def list_items(self, campaign_id: str) -> list[dict]:
+        rows = [dict(r) for r in self.campaign_items.values()
+                if r["campaign_id"] == campaign_id]
+        return sorted(rows, key=lambda r: r["seq"])
+
+    def get_item(self, item_id: str) -> dict | None:
+        row = self.campaign_items.get(item_id)
+        return dict(row) if row else None
+
+    def update_item(self, item_id: str, **fields: Any) -> dict | None:
+        row = self.campaign_items.get(item_id)
+        if not row:
+            return None
+        # 与 SQL 侧同款白名单：未知键（含 id/campaign_id）忽略，防两后端分叉。
+        for key in ("seq", "object_id", "phone", "status", "call_id", "attempts",
+                    "last_error", "scenario", "updated_at"):
+            if key in fields and fields[key] is not None:
+                row[key] = fields[key]
+        return dict(row)
+
+    def find_item_by_call(self, call_id: str) -> dict | None:
+        if not call_id:
+            return None
+        for row in self.campaign_items.values():
+            if row["call_id"] == call_id:
+                return dict(row)
+        return None

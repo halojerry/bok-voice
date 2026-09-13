@@ -10,8 +10,8 @@
 | `tools/bok.py` | 编排/模型/健康/自检唯一入口（serve/status/down/doctor/prod/download） | both |
 | `scripts/` | CI 构建、E2E、延迟测量、smoke、sidecar 启动（见下「脚本」） | dev/CI |
 | `apps/agent/` | LiveKit agent 运行时（A 线客服 + B 线同传 worker） | both |
-| `apps/control-plane/` | FastAPI 业务服务 :8000（对象/人设/知识/话术/通话/审计/token/webhook） | both |
-| `apps/web/` | Next.js 静态导出（Tauri 托管 UI：calls/interpret/supervisor/objects/personas/settings…） | both |
+| `apps/control-plane/` | FastAPI 业务服务 :8000（对象/人设/知识/话术/通话/审计/token/webhook/名册/外呼战役） | both |
+| `apps/web/` | Next.js 静态导出（Tauri 托管 UI：calls/interpret/supervisor/objects/personas/settings/roster/campaigns…） | both |
 | `packages/core/` | 领域模型 + 策略（`bok_voice_core`：policies/types） | both |
 | `packages/business-db/` | SQLAlchemy 仓库（`bok_voice_business_db`：global_settings 默认等） | both |
 | `packages/knowledge/` | 知识服务 / Markdown / 向量（沉淀知识库） | both |
@@ -34,6 +34,7 @@
 | `agent.py` | A 线装配：语言钉定/ASR/LLM/抢跑/打断/话术推进 hook/心跳/收尾 |
 | `interpret.py` | B 线同传 worker（fwd/rev，Hy-MT2 :1236 + MiniMax 三语音色） |
 | `flow.py` | 话术分步推进引擎（FlowController/rule_verdict/should_auto_advance） |
+| `dialer.py` | SIP 外播薄层（`dial_outbound` 四态出口：real=官方 CreateSIPParticipant / mock=CP 派生真语音被叫；`resolve_dial_mode` env→settings→mock） |
 | `control_plane.py` | CP HTTP 客户端 |
 | `web_search.py` | 联网检索（默认关） |
 | `providers/livekit_plugins.py` | 本地模型插件：LanguageState/PinnedLanguageState/ContextState(前缀/尾/对象档案)/MlxLlmLLM/DeepSeekLLM/StatelessMTLLM/Qwen3ASR(STT/流式句级)/Qwen3TTS/MiniMaxTTS(classic 池+bidi 实验)/VolcanoTTS |
@@ -47,6 +48,9 @@
 - 测量/探针：`measure_latency.py`（需真栈）`measure_prompt.py`（本地）`probe_cantonese_digits.py` `smoke_sidecars.py` `pad_test_audio.py` `test_deepseek.py` `test_volcano_v3.py`
 - TTS 缓存/快答库：`pregen_tts.py`（`bok.py tts-pregen` 执行体：--greetings/--objects/--fillers/--qa 离线预合成，写 app-data/tts-cache；也被 CP 人设保存点自动触发，见 `apps/control-plane/control_plane/pregen.py`）`mine_qa.py`（`bok.py tts-mine` 执行体：高频问答对报告 + --apply 入库 / --sync 自动学习闭环：挖掘→质量闸→入库→按语言物化）
 - 真实客户多轮 E2E：`e2e_real_customer.py`（三语三音色多轮真问题连聊，模板绑定走对象 template_id）
+- 外呼战役 E2E：`e2e_campaign.py`（mock 档全链路：3 对象战役串行自动下一通 + 终态三态 + captured 入名册）
+- mock SIP 被叫：`mock_callee.py`（CP 派生的真语音被叫子进程：answer/no_answer/reject/hangup_mid 四剧本；台词/句间隔由 dial 块下发，会等 AI 讲完再出声）
+- 并发/边界：`e2e_barge_in.py` `e2e_edge_cases.py` `e2e_interpret.py` `load_cp_concurrency.py` `load_audio_concurrency.py` `probe_filler_timing.py`
 - 平台：`setup-windows.ps1`
 
 ## 关键入口
@@ -61,6 +65,25 @@
 | A 线通话 | 前端 /calls → LiveKit :7880 → agent worker（每通语言固定） |
 | B 线同传 v2 | 前端 /interpret → LiveKit :7880 → interp worker ×2（:1236 MT + MiniMax） |
 | B 线同传 v1(冻结) | 前端 /translate → ws://127.0.0.1:8790 |
+
+## apps/control-plane（control_plane）
+
+| 文件 | 职责 |
+|---|---|
+| `main.py` | 全部 API 端点 + 启动装配（含 `/api/roster*`、`/api/campaigns*`、`/api/sip/mock/callee`） |
+| `campaign.py` | 外呼战役串行循环（5s 巡检：终态收割 / 串行起下一通 / 名单尽判 done；gap 冷却；dispatcher 可注入） |
+| `deps.py` | 引擎装配 + 幂等 DB 迁移唯一入口（新建列/数据迁移都在 `build_engine()`） |
+| `schemas.py` | 请求/响应模型（含 `SipSettingsModel`） |
+| `pregen.py` | 人设保存点自动物化（detached 子进程跑 pregen_tts.py） |
+
+## 数据表（packages/business-db，新表须方言可移植）
+
+| 表 | 用途 |
+|---|---|
+| `call_sessions` / `turns` | 通话主记录 / 逐轮分析账本（speaker/gen/template_step/perceived_ms） |
+| `roster_entries` | 名册认领池（captured 号码自动入册；unclaimed→claimed→handled） |
+| `campaigns` | 外呼战役（status draft/running/paused/done/stopped、gap_seconds、scripts_json mock 台词钩子） |
+| `campaign_items` | 战役名单项（seq/phone/status/call_id/scenario，无电话对象直接 skipped） |
 
 ## 运行时装配（packaged）
 

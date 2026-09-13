@@ -160,11 +160,32 @@ class ProviderSettings(BaseModel):
     sample_rate: int = 24000
 
 
+class SipSettingsModel(BaseModel):
+    """外呼（SIP）配置段（spec 2026-09-12 Wave2）。
+
+    mode=mock|real：mock=CP 派生真语音被叫（本地演示/E2E），real=官方
+    CreateSIPParticipant 走真 trunk。env `BOK_SIP_MODE` 是 kill-switch
+    （有值即终局，见 agent dialer.resolve_dial_mode），settings 只在 env
+    缺省时生效。auth_password 走 secret 掩码（GET 返回空串+has_ 标记，
+    PUT 传空=保留旧值）。
+    """
+
+    mode: str = "mock"
+    trunk_id: str = ""
+    address: str = ""
+    auth_username: str = ""
+    auth_password: str = ""
+    numbers: list[str] = []
+    ringing_timeout_s: int = 30
+    max_call_duration_s: int = 600
+
+
 class SettingsRequest(BaseModel):
     asr: ProviderSettings = ProviderSettings()
     llm: ProviderSettings = ProviderSettings()
     tts: ProviderSettings = ProviderSettings()
     vad: ProviderSettings = ProviderSettings()
+    sip: SipSettingsModel = SipSettingsModel()
     policy: str = "offline_first"
 
 
@@ -176,10 +197,33 @@ class WhatsAppCaptureRequest(BaseModel):
     """Agent 偵測到客戶俾 WhatsApp:number 有值=captured(客戶讀出號碼),空=offered(應承加專員)。"""
 
     number: str = ""
+    channel: str = ""  # whatsapp | wechat,缺省由 CP 按对象 contact_channel 推断
 
 
 class WhatsAppHandledRequest(BaseModel):
     """專員喺操作台標記已對接。"""
+
+    handled: bool = True
+
+
+class DialResultRequest(BaseModel):
+    """Agent 外呼拨号结果上报（spec Wave2）：answered→ACTIVE；三失败态→ENDED+disposition。
+
+    status 空/未知 = no-op（幂等，不误伤尚在 RINGING 的通话）。
+    """
+
+    status: str = ""  # answered | no_answer | rejected | failed
+    detail: str = ""
+
+
+class RosterClaimRequest(BaseModel):
+    """名册认领：claimed_by 缺省 acc-001（本机单账号形态）。"""
+
+    claimed_by: str = "acc-001"
+
+
+class RosterHandledRequest(BaseModel):
+    """名册「已对接」标记：true=handled 并同步来源通话横幅；false=撤销认领。"""
 
     handled: bool = True
 

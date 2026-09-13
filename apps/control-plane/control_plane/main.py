@@ -8,7 +8,9 @@ import sys
 import uuid
 import wave
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import httpx
 from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
@@ -40,9 +42,12 @@ from .schemas import (
     CreateCallRequest,
     CreateObjectRequest,
     ImportRequest,
+    DialResultRequest,
     PersonaRequest,
     QaEntryCreate,
     QaEntryPatch,
+    RosterClaimRequest,
+    RosterHandledRequest,
     TemplateRequest,
     UpdateTemplateRequest,
     UpdateObjectRequest,
@@ -53,6 +58,10 @@ from .schemas import (
     WhatsAppCaptureRequest,
     WhatsAppHandledRequest,
 )
+
+# 通话终态集合：模块级常量（dial-result 端点与下方重派段共用）。
+# 只含真终态——CallStatus.FAILED 是通话级失败终态(与拨号失败 disposition="failed" 同名不同义)。
+_TERMINAL_CALL_STATUSES = (CallStatus.ENDED.value, CallStatus.FAILED.value)
 
 
 app = FastAPI(title="Bok Voice Control Plane", version="0.1.0")
@@ -150,6 +159,15 @@ def _startup() -> None:
         asyncio.get_event_loop().create_task(_reaper_loop())
     except Exception as exc:  # pragma: no cover
         control_log.warning("reaper_start_failed", extra={"data": {"error": str(exc)}})
+    # 外呼战役串行循环(spec 2026-09-12 Wave3):5s 巡检收割终态→起下一通→判 done。
+    # 函数体内延迟 import:campaign 模块反查 main(_repo/_lkapi_client/_create_call_in),
+    # 模块级 import 会成环。
+    try:
+        from .campaign import _campaign_loop
+
+        asyncio.get_event_loop().create_task(_campaign_loop())
+    except Exception as exc:  # pragma: no cover
+        control_log.warning("campaign_start_failed", extra={"data": {"error": str(exc)}})
     app.state.settlement = SettlementTrigger()
     # Mirror every JSONL audit event into the repository (SQL or in-memory) so
     # /api/audit is queryable without scraping the file sink.
@@ -225,6 +243,15 @@ def _audit(action: str, *, subject_type: str = "", subject_id: str = "", outcome
     return event.to_dict()
 
 
+def _utcnow_iso() -> str:
+    """UTC 墙钟 naive ISO 串（落库/比较统一口径，与 campaign._utcnow_iso 同族）。
+
+    内存仓 `updated_at` 存字符串、SQL 仓 DateTime 列 `fromisoformat` 收串，两后端
+    都吃这一种形态；带 `+00:00` 后缀会与读侧 naive 比较产生偏移，故剥 tz。
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+
+
 @app.get("/health")
 def health() -> dict:
     return {"ok": True, "service": "bok-voice-control-plane"}
@@ -248,10 +275,11 @@ def put_settings(req: SettingsRequest) -> dict:
         "llm": req.llm.model_dump(),
         "tts": req.tts.model_dump(),
         "vad": req.vad.model_dump(),
+        "sip": req.sip.model_dump(),
         "policy": req.policy,
     }
-    secret_keys = {"api_key", "access_token", "token"}
-    for kind in ("asr", "llm", "tts", "vad"):
+    secret_keys = {"api_key", "access_token", "token", "auth_password"}
+    for kind in ("asr", "llm", "tts", "vad", "sip"):
         old = existing.get(kind, {})
         new = new_values[kind]
         for key in secret_keys:
@@ -268,7 +296,7 @@ def put_settings(req: SettingsRequest) -> dict:
 
 def _mask_secrets(config: dict) -> dict:
     out = dict(config)
-    secret_keys = {"api_key", "access_token", "token"}
+    secret_keys = {"api_key", "access_token", "token", "auth_password"}
     for key in secret_keys:
         if out.get(key):
             out[key] = ""
@@ -660,14 +688,23 @@ def token(req: TokenRequest) -> TokenResponse:
 
 @app.post("/api/calls")
 def create_call(req: CreateCallRequest) -> dict:
+    return _create_call_in(_repo(), req)
+
+
+def _create_call_in(repo, req: CreateCallRequest) -> dict:
+    """建通话（会话清单装配 + 审计）；repo 由调用方给出（端点= `_repo()`）。
+
+    抽成函数便于 campaign 循环在**注入的 repo** 上建通话（campaign_tick 的 repo
+    参数与 app.state 可不同源，单测注入内存仓时不能走 `_repo()`）。
+    """
     # 会话清单：读取全局策略(offline_first/cloud_first)与已配置 provider，
     # 并把对象绑定的模板快照到 call（审计「这场用了哪版话术」）。
-    settings = _repo().get_settings()
+    settings = repo.get_settings()
     policy = (settings or {}).get("policy") or "offline_first"
     providers = _effective_providers(settings or {})
     template_id = ""
     if req.object_id:
-        obj = _repo().get_object(req.object_id)
+        obj = repo.get_object(req.object_id)
         template_id = (obj or {}).get("template_id", "") or ""
     manifest = select_session_manifest(
         session_id=f"call-{uuid.uuid4().hex[:8]}",
@@ -684,7 +721,7 @@ def create_call(req: CreateCallRequest) -> dict:
         kind=req.kind,
         target_lang=req.target_lang,
     )
-    call = _repo().create_call(manifest)
+    call = repo.create_call(manifest)
     _audit("call.create", subject_type="call", subject_id=call.get("id", ""),
            account_id=req.account_id, call_id=call.get("id", ""),
            detail={"mode": req.mode, "kind": req.kind, "language": req.language, "template_id": template_id})
@@ -1023,9 +1060,83 @@ def report_whatsapp(call_id: str, req: WhatsAppCaptureRequest) -> dict:
         if number:
             fields["customer_whatsapp"] = number
     updated = _repo().update_call(call_id, **fields) or call
+    if number:
+        # 名册自动入册（Wave1）：captured 带号码 → upsert；channel 归一——
+        # 优先 agent 上报（客户原话渠道词），缺省按对象 contact_channel 推断。
+        channel = (req.channel or "").strip().lower()
+        if channel not in ("whatsapp", "wechat"):
+            obj_channel = ""
+            if call.get("object_id"):
+                obj = _repo().get_object(call.get("object_id")) or {}
+                obj_channel = str(obj.get("contact_channel") or "")
+            channel = "wechat" if "微信" in obj_channel or "wechat" in obj_channel.lower() else "whatsapp"
+        display_name = ""
+        summary = ""
+        try:
+            obj = _repo().get_object(call.get("object_id") or "") or {}
+            display_name = str(obj.get("display_name") or "")
+            settlement = _repo().get_settlement(call_id) or {}
+            summary = str(settlement.get("summary") or "")[:300]
+            if not summary:
+                # spec §4.3 兜底：captured 常发生在通话进行中/结算未生成时（settlement
+                # 由收线后异步产出），摘要恒空 → 名册条目只剩号码不可用。退「末轮客户
+                # 转写」（repo.get_turns 返回 TurnEvent 对象，属性访问，同 /turns 端点）。
+                turns = _repo().get_turns(call_id)
+                customer = [
+                    t for t in turns
+                    if str(getattr(t, "speaker", "") or "") == "customer"
+                ]
+                if customer:
+                    summary = str(getattr(customer[-1], "transcript", "") or "")[:300]
+        except Exception:
+            pass
+        _repo().upsert_roster_entry(
+            account_id=call.get("account_id", "acc-001"), call_id=call_id,
+            object_id=call.get("object_id", ""), channel=channel, number=number,
+            display_name=display_name, summary=summary,
+        )
     _audit("call.whatsapp_captured", subject_type="call", subject_id=call_id,
            account_id=call.get("account_id", "acc-001"),
            detail={"status": fields["whatsapp_status"], "number": (number or "")[:3] + "***"})
+    return updated
+
+
+@app.post("/api/calls/{call_id}/dial-result")
+def report_dial_result(call_id: str, req: DialResultRequest) -> dict:
+    """Agent 外呼拨号结果上报:answered→ACTIVE;三失败态→ENDED+disposition。
+
+    幂等：已终态(ended/failed)的通话直接原样返回，不复活也不改写 disposition
+    （重派/重复上报时 4B 侧时序抖动不会把已收线的通话抬回 ACTIVE）。
+    status 空/未知同样 no-op（仍记审计，便于排查上游漏配）。
+    """
+    call = _repo().get_call(call_id)
+    if not call:
+        raise HTTPException(404, "call not found")
+    if str(call.get("status") or "") in _TERMINAL_CALL_STATUSES:
+        return call
+    status = str(req.status or "").strip()
+    if status == "answered":
+        updated = _repo().update_call(call_id, status=CallStatus.ACTIVE.value) or call
+    elif status in ("no_answer", "rejected", "failed"):
+        updated = _repo().update_call(call_id, status=CallStatus.ENDED.value,
+                                      disposition=status) or call
+    else:
+        updated = call
+    # 战役名单联动（Wave3）：通话若由某个 campaign item 拨出（call_id 反查），把
+    # 拨号结果同步到 item。只认「进行中」item（dialing/in_call）——pending 阶段的
+    # call_id 是预写占位、终态 item 已收割过，都不能被迟到的上报改写。
+    if status in ("answered", "no_answer", "rejected", "failed"):
+        item = _repo().find_item_by_call(call_id)
+        if item and str(item.get("status") or "") in ("dialing", "in_call"):
+            _repo().update_item(
+                str(item["id"]),
+                status="in_call" if status == "answered" else status,
+                last_error=(req.detail or "")[:250],
+                updated_at=_utcnow_iso(),
+            )
+    _audit("call.dial_result", subject_type="call", subject_id=call_id,
+           account_id=str(call.get("account_id", "acc-001")),
+           detail={"status": status, "detail": (req.detail or "")[:120]})
     return updated
 
 
@@ -1044,6 +1155,286 @@ def mark_whatsapp_handled(call_id: str, req: WhatsAppHandledRequest) -> dict:
     _audit("call.whatsapp_handled", subject_type="call", subject_id=call_id,
            account_id=call.get("account_id", "acc-001"), detail={"handled": req.handled})
     return updated
+
+
+@app.get("/api/roster")
+def list_roster(account_id: str = "acc-001", status: str = "", channel: str = "") -> list[dict]:
+    """名册认领池列表；status/channel 空=不过滤。"""
+    return _repo().list_roster(account_id, status=status, channel=channel)
+
+
+@app.post("/api/roster/{entry_id}/claim")
+def roster_claim(entry_id: str, req: RosterClaimRequest) -> dict:
+    """认领名册条目：status=claimed + claimed_by/claimed_at（naive UTC，与读侧 ISO 对齐）。"""
+    entry = _repo().update_roster_entry(
+        entry_id, status="claimed", claimed_by=req.claimed_by,
+        claimed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+    )
+    if not entry:
+        raise HTTPException(404, "roster entry not found")
+    _audit("roster.claim", subject_type="roster", subject_id=entry_id,
+           account_id=req.claimed_by, detail={"claimed_by": req.claimed_by})
+    return entry
+
+
+@app.post("/api/roster/{entry_id}/unclaim")
+def roster_unclaim(entry_id: str) -> dict:
+    """释放认领：status=unclaimed、claimed_by 清空。
+
+    claimed_at 必须传空串（repo 契约 None=不修改、""=清空）——空串在双后端
+    都映射回「未认领」的读侧契约（SQL 存 NULL / InMemory 存 ""，读侧都渲染 ""）。
+    """
+    entry = _repo().update_roster_entry(entry_id, status="unclaimed", claimed_by="", claimed_at="")
+    if not entry:
+        raise HTTPException(404, "roster entry not found")
+    _audit("roster.unclaim", subject_type="roster", subject_id=entry_id,
+           account_id=str(entry.get("account_id") or ""))
+    return entry
+
+
+@app.post("/api/roster/{entry_id}/handled")
+def roster_handled(entry_id: str, req: RosterHandledRequest) -> dict:
+    """操作台标「已对接」/撤销，联动来源通话 whatsapp_status（与通话内横幅同源语义）。
+
+    true → 名册 handled + 通话 whatsapp_status=handled（爆闪停止）；
+    false → 名册回 unclaimed，通话按有无号码回 captured/offered。
+    来源通话缺失/已删除不阻塞名册状态变更。
+    """
+    entry = _repo().get_roster_entry(entry_id)
+    if not entry:
+        raise HTTPException(404, "roster entry not found")
+    if req.handled:
+        entry = _repo().update_roster_entry(entry_id, status="handled") or entry
+        _sync_call_whatsapp_status(entry.get("call_id"), "handled")
+    else:
+        entry = _repo().update_roster_entry(
+            entry_id, status="unclaimed", claimed_by="", claimed_at="") or entry
+        call = _repo().get_call(str(entry.get("call_id") or "")) or {}
+        back = "captured" if str(call.get("customer_whatsapp") or "").strip() else "offered"
+        _sync_call_whatsapp_status(entry.get("call_id"), back)
+    _audit("roster.handled", subject_type="roster", subject_id=entry_id,
+           account_id=str(entry.get("account_id") or ""), detail={"handled": req.handled})
+    return entry
+
+
+def _sync_call_whatsapp_status(call_id: Any, status: str) -> None:
+    """名册动作回写来源通话横幅状态；通话不存在/存储异常都不阻塞名册主流程。"""
+    if not call_id:
+        return
+    try:
+        _repo().update_call(str(call_id), whatsapp_status=status)
+    except Exception as exc:  # pragma: no cover - 存储抖动不阻断名册状态
+        print(f"[cp] roster whatsapp_status sync skipped ({call_id}): {exc!r}", flush=True)
+
+
+# ---- campaigns（外呼战役：建波次 / 启停 / 进度）----
+# 名单项由 repo.create_campaign 按 object_ids 一次建仓（无电话的对象落 skipped）。
+# 状态机三档（`_campaign_transition`）：running←draft/paused、paused←running、
+# stopped←running/paused/draft；`done` 由 campaign 循环名单跑尽时置，不可手动迁。
+_CAMPAIGN_SCENARIOS = ("answer", "no_answer", "reject", "hangup_mid")
+
+
+class CampaignCreateRequest(BaseModel):
+    account_id: str = "acc-001"
+    name: str = ""
+    object_ids: list[str] = []
+    template_id: str = ""
+    persona_id: str = ""
+    language: str = "zh"
+    gap_seconds: int = 5
+    scenarios: dict[str, str] = {}
+    # mock 演练台词（object_id → [句子]），与 scenarios 同 spirit 的测试钩子：
+    # campaign 级存 `scripts_json`，起拨时按 object_id 取出来进 dial 块 `script`。
+    # 生产真实通话恒空（真 SIP 对端是真客户）。
+    scripts: dict[str, list[str]] = {}
+    # mock 客户台词句间隔秒（0=子进程默认 6s）。E2E 要把客户报号句对齐到 AI 的
+    # 收号步时调大（AI 每轮处理+播报 8-12s）。
+    mock_speak_interval_s: float = 0.0
+
+
+@app.post("/api/campaigns")
+def create_campaign(req: CampaignCreateRequest) -> dict:
+    """建战役（draft）+ 名单项；object_ids 空=400（空波次无意义）。
+
+    scenarios 值白名单过滤（answer/no_answer/reject/hangup_mid）：运营表单里
+    残留的非法值静默丢弃，不 4xx——名单本身仍照建，避免一个错字废掉整波。
+    scripts 同样清洗成 `dict[str, list[str]]`（Pydantic 已保证形状，这里只剔
+    空白句并丢空数组，免得 dial 块带一堆空串）。
+    """
+    if not req.object_ids:
+        raise HTTPException(400, "object_ids 不能为空")
+    scripts = {
+        str(k): [str(s) for s in v if str(s).strip()]
+        for k, v in req.scripts.items() if isinstance(v, list)
+    }
+    scripts = {k: v for k, v in scripts.items() if v}
+    # 句间隔与台词同源存进 scripts_json（保留键 `__speak_interval__`）：只加列
+    # 不加宽、不加新表，起拨时 campaign._start_call 从同一份 JSON 取。
+    if float(req.mock_speak_interval_s or 0) > 0:
+        scripts["__speak_interval__"] = float(req.mock_speak_interval_s)
+    camp = _repo().create_campaign(
+        req.account_id, name=req.name, template_id=req.template_id,
+        persona_id=req.persona_id, language=req.language,
+        gap_seconds=req.gap_seconds, object_ids=req.object_ids,
+        scenarios={k: v for k, v in req.scenarios.items() if v in _CAMPAIGN_SCENARIOS},
+        scripts=scripts,
+    )
+    _audit("campaign.create", subject_type="campaign", subject_id=camp["id"],
+           account_id=req.account_id, detail={"objects": len(req.object_ids)})
+    return camp
+
+
+@app.get("/api/campaigns")
+def list_campaigns(account_id: str = "acc-001") -> list[dict]:
+    """战役列表，每条带 progress 汇总（列表页免二次请求）。"""
+    out = []
+    for camp in _repo().list_campaigns(account_id):
+        camp["progress"] = _progress(_repo().list_items(camp["id"]))
+        out.append(camp)
+    return out
+
+
+@app.get("/api/campaigns/{campaign_id}")
+def get_campaign(campaign_id: str) -> dict:
+    """战役详情：campaign + items + progress。"""
+    camp = _repo().get_campaign(campaign_id)
+    if not camp:
+        raise HTTPException(404, "campaign not found")
+    items = _repo().list_items(campaign_id)
+    camp["items"] = items
+    camp["progress"] = _progress(items)
+    return camp
+
+
+@app.post("/api/campaigns/{campaign_id}/start")
+def campaign_start(campaign_id: str) -> dict:
+    """启波（draft/paused → running；循环巡检即刻接手首通）。"""
+    return _campaign_transition(campaign_id, "running")
+
+
+@app.post("/api/campaigns/{campaign_id}/pause")
+def campaign_pause(campaign_id: str) -> dict:
+    """暂停（running → paused）：循环不再起新通，进行中的一路不打断。"""
+    return _campaign_transition(campaign_id, "paused")
+
+
+@app.post("/api/campaigns/{campaign_id}/stop")
+def campaign_stop(campaign_id: str) -> dict:
+    """终止（running/paused/draft → stopped，终态不可再启）。"""
+    return _campaign_transition(campaign_id, "stopped")
+
+
+def _campaign_transition(campaign_id: str, status: str) -> dict:
+    """战役状态机唯一入口（三个启停端点共用），非法迁移 409、未找到 404。"""
+    camp = _repo().get_campaign(campaign_id)
+    if not camp:
+        raise HTTPException(404, "campaign not found")
+    cur = str(camp.get("status") or "")
+    allowed = {"running": ("draft", "paused"), "paused": ("running",),
+               "stopped": ("running", "paused", "draft")}
+    if cur not in allowed[status]:
+        raise HTTPException(409, f"cannot {status} from {cur}")
+    updated = _repo().update_campaign(campaign_id, status=status) or camp
+    _audit(f"campaign.{status}", subject_type="campaign", subject_id=campaign_id,
+           account_id=str(camp.get("account_id", "acc-001")))
+    return updated
+
+
+def _progress(items: list[dict]) -> dict:
+    """名单进度汇总：8 个状态计数 + answered 粗口径（拨出去有结果的三态之和）。"""
+    p = {"total": len(items)}
+    for key in ("pending", "dialing", "in_call", "done", "no_answer", "rejected",
+                "failed", "skipped"):
+        p[key] = sum(1 for i in items if i.get("status") == key)
+    p["answered"] = p["done"] + p["no_answer"] + p["rejected"]
+    return p
+
+
+class MockCalleeRequest(BaseModel):
+    room: str
+    number: str
+    identity: str = ""
+    scenario: str = "answer"  # answer | no_answer | reject | hangup_mid
+    language: str = "cantonese"
+    script: list[str] = []
+    ring_delay_s: float = 3.0
+    ringing_window_s: float = 35.0
+    # 句间隔秒（默认 6≈一轮问答）：E2E/演练要把客户台词对齐到 AI 的话术步进时
+    # 调大（AI 每轮处理+播报可能 8-12s，太密会令报号句落在收号步之外）。
+    speak_interval_s: float = 6.0
+
+
+@app.post("/api/sip/mock/callee")
+def spawn_mock_callee(req: MockCalleeRequest) -> dict:
+    """模拟联调档:派生 mock 客户子进程(同 pregen detached 姿势,失败不阻拨号主链)。
+
+    真语音被叫——子进程进房后按剧本(四型)TTS 轮播客户话音,agent 侧
+    dialer._dial_mock 靠 participant identity 认它。无 LiveKit 凭据=404
+    (与 /api/token 同语义:缺凭据不静默回退)。
+    """
+    import subprocess
+
+    if not req.room or not req.number:
+        raise HTTPException(400, "room and number are required")
+    identity = req.identity or f"sip-mock-{req.number}"
+    key = getattr(app.state, "lk_key", "") or os.environ.get("LIVEKIT_API_KEY", "")
+    secret = getattr(app.state, "lk_secret", "") or os.environ.get("LIVEKIT_API_SECRET", "")
+    if not key or not secret:
+        raise HTTPException(404, "livekit credentials not configured")
+    lk_url = (
+        getattr(app.state, "lk_url", "") or os.environ.get("LIVEKIT_URL", "")
+        or "ws://127.0.0.1:7880"
+    )
+    from livekit import api as lk_api
+
+    import datetime as _dt
+
+    at = (
+        lk_api.AccessToken(key, secret)
+        .with_identity(identity)
+        .with_name("Mock Callee")
+        .with_grants(lk_api.VideoGrants(
+            room_join=True, room=req.room,
+            can_publish=True, can_subscribe=True, can_publish_data=True,
+        ))
+        .with_ttl(_dt.timedelta(seconds=3600))
+        .with_attributes({"bok.role": "customer", "bok.mock": "1"})
+    )
+    token = at.to_jwt()
+
+    repo_root = Path(__file__).resolve().parents[3]
+    script_path = repo_root / "scripts" / "mock_callee.py"
+    if not script_path.exists():
+        raise HTTPException(404, "scripts/mock_callee.py not found (packaged runtime)")
+    cmd = [
+        sys.executable, str(script_path),
+        "--url", lk_url, "--token", token, "--identity", identity,
+        "--scenario", req.scenario, "--language", req.language,
+        "--script-json", json.dumps(req.script, ensure_ascii=False),
+        "--ring-delay", str(req.ring_delay_s),
+        "--ringing-window", str(req.ringing_window_s),
+        "--speak-interval", str(req.speak_interval_s),
+    ]
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    log_path = repo_root / "runtime" / "logs" / "mock-callee.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "ab") as logf:
+            proc = subprocess.Popen(  # noqa: S603 - 固定脚本+参数,无 shell
+                cmd, cwd=str(repo_root), env=env, stdout=logf,
+                stderr=subprocess.STDOUT, start_new_session=True,
+            )
+    except OSError as exc:
+        raise HTTPException(500, f"failed to spawn mock callee: {exc}") from exc
+    # 确定性收尸(pregen._spawn_detached 同款):不排 daemon reaper 的话,子进程
+    # 退出后留僵尸直到进程表被别处顺手 wait —— mock 被叫每次拨号一发,长跑会累积。
+    import threading
+
+    threading.Thread(target=proc.wait, daemon=True, name=f"mock-callee-reap-{proc.pid}").start()
+    _audit("sip.mock_callee_spawn", subject_type="room", subject_id=req.room,
+           account_id="acc-001",
+           detail={"scenario": req.scenario, "pid": proc.pid, "identity": identity})
+    return {"ok": True, "pid": proc.pid, "identity": identity}
 
 
 class NodeRegisterRequest(BaseModel):
@@ -1674,7 +2065,6 @@ async def ingest_session_report(call_id: str, request: Request) -> dict:
 
 # 重派防复活门:终态通话(或记录已删)不得重派——为死通话新建的 dispatch 无
 # 回收路径(reaper 只扫 ACTIVE/PAUSED),agent 会被带进空房念开场白。
-_TERMINAL_CALL_STATUSES = (CallStatus.ENDED.value, CallStatus.FAILED.value)
 # 重派重试排程(秒):等 livekit 把死 worker 的 job 判 FAILED / dispatch 服务恢复。测试可注入。
 _REDISPATCH_RETRY_SCHEDULE = (0.0, 10.0, 25.0)
 # per-room 重派锁:串行化「has_active_dispatch 检查 + create_dispatch」临界区,

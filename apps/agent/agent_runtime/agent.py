@@ -1203,6 +1203,94 @@ async def entrypoint(ctx):
     except Exception as e:
         print(f"[agent] context resolve failed ({room_name}): {e}", flush=True)
 
+    # ---- 外呼模式（spec 2026-09-12 Wave2）:metadata 带 dial 块 → 先拨号、接通才装配。
+    # 官方两段式:agent 先入房 → CreateSIPParticipant(或 CP 派生 mock 客户)→
+    # wait_for_participant → 才 session.start(开场白时序=接通后)。
+    # 官方铁律:no_answer/failed 两态 RoomIO 不自动收线 —— 必须手动 ctx.shutdown(),
+    # 且删房(房间不删的话真电话对端会一直听静音)。
+    _dial = dict(_job_meta.get("dial") or {})
+    # 时长保险丝 task 强引用集合(见下方 create_task 处注释);entrypoint 局部存活
+    # 整个 job 生命周期,通话收线由 done 回调自清。
+    _fuse_tasks: set[asyncio.Task] = set()
+    if _dial:
+        from .dialer import OUT_ANSWERED, dial_outbound, resolve_dial_mode
+
+        _dial_settings: dict = {}
+        try:
+            _dial_settings = await cp.get_settings()
+        except Exception as e:
+            print(f"[agent] dial settings resolve failed ({room_name}): {e}", flush=True)
+        # metadata 显式 mode 优先(编排/测试钉死后端);缺省 env kill-switch→settings→mock。
+        _dial_mode = str(_dial.get("mode") or "").strip().lower()
+        if _dial_mode not in ("mock", "real"):
+            _dial_mode = resolve_dial_mode(os.environ, _dial_settings or {})
+        try:
+            _outcome = await dial_outbound(
+                ctx, number=str(_dial.get("to") or ""), mode=_dial_mode, cp_base=cp_base,
+                call_id=call_id, scenario=str(_dial.get("scenario") or ""),
+                # mock 演练台词（campaign scripts 钩子）：dial 块缺键/坏值一律空数组，
+                # dial_outbound 的 script 缺省已是 None → mock_callee 语言默认兜底。
+                script=[str(s) for s in (_dial.get("script") or []) if str(s).strip()],
+                # mock 客户台词句间隔（campaign 演练钩子，0=子进程默认 6s）。
+                speak_interval_s=float(_dial.get("speak_interval_s") or 0),
+                language=str(_dial.get("language") or ""),
+                trunk_id=str(_dial.get("trunk_id") or ""),
+                # 振铃窗口（settings sip.ringing_timeout_s，CP dial 块透传；缺键/坏值
+                # 兜 30s 与 CP 侧同款）。dial_outbound 入口还会钳 [0, 80] 硬上限。
+                ringing_timeout_s=float(_dial.get("ringing_timeout_s") or 30),
+            )
+        except Exception as e:  # dial_outbound 契约=四态出口,此处仅最后兜底防逸出
+            from .dialer import DialOutcome, OUT_FAILED
+
+            _outcome = DialOutcome(status=OUT_FAILED, detail=f"{type(e).__name__}: {e}")
+        print(f"[dial] outcome={_outcome.status} detail={_outcome.detail} "
+              f"(call {room_name})", flush=True)
+        try:
+            await cp.report_dial_result(call_id, _outcome.status, _outcome.detail)
+        except Exception as exc:  # noqa: BLE001 - 上报失败不阻收线
+            print(f"[dial] report failed: {exc!r} (call {room_name})", flush=True)
+        if _outcome.status != OUT_ANSWERED:
+            # 收线三连:通话置终态 → 删房 → ctx.shutdown()。
+            try:
+                await cp.end_call(call_id, disposition=_outcome.status)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[dial] end_call failed: {exc!r} (call {room_name})", flush=True)
+            try:
+                from livekit.api import DeleteRoomRequest
+
+                await ctx.api.room.delete_room(DeleteRoomRequest(room=ctx.room.name))
+            except Exception as exc:  # noqa: BLE001
+                print(f"[dial] delete_room failed: {exc!r} (call {room_name})", flush=True)
+            ctx.shutdown()
+            return
+        # mock 档时长保险丝:mock 客户无通信运营商侧挂断,靠本地计时器兜底收线
+        # (real 档由 CreateSIPParticipant 的 API 参数承担,不重复挂)。
+        _fuse_s = float(_dial.get("max_call_duration_s") or 0)
+        if _dial_mode == "mock" and _fuse_s > 0:
+
+            async def _duration_fuse() -> None:
+                await asyncio.sleep(_fuse_s)
+                print(f"[dial] duration fuse fired (call {room_name})", flush=True)
+                try:
+                    await cp.end_call(call_id, disposition="completed")
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[dial] fuse end_call failed: {exc!r} (call {room_name})",
+                          flush=True)
+                from livekit.api import DeleteRoomRequest
+
+                try:
+                    await ctx.api.room.delete_room(DeleteRoomRequest(room=ctx.room.name))
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[dial] fuse delete_room failed: {exc!r} (call {room_name})",
+                          flush=True)
+
+            # 强引用存活:事件循环对 task 只持弱引用,保险丝睡数十至数百秒,期间
+            # 无强引用可被 GC 中途回收 → mock 通话失去唯一时长上限(本仓 MiniMax
+            # bidi 孤儿 invalidate task 实证过同类 bug)。集合 + done 回调自清。
+            _fuse_task = asyncio.create_task(_duration_fuse())
+            _fuse_tasks.add(_fuse_task)
+            _fuse_task.add_done_callback(_fuse_tasks.discard)
+
     # 对话流程控制器:载入模板分步 + 对象变量;由它按轮注入"当前步",逐步推进。
     from .flow import FlowController, facts_line
     from .flow import (
@@ -1218,7 +1306,7 @@ async def entrypoint(ctx):
         judge_confirm_advance_allowed,
     )
     from .flow import _digit_normalize, _looks_like_whatsapp_step, _WHATSAPP_DECLINE, digits_to_cantonese
-    from .flow import wa_confirm_advance_allowed
+    from .flow import channel_from_text, wa_confirm_advance_allowed
 
     flow_ctrl = FlowController.from_template(template, object_card)
     _log_stage("context_resolved")
@@ -1288,6 +1376,9 @@ async def entrypoint(ctx):
     # WA 号码碎片累积:客户逐位/逐段报号时暂存半截句(见 on_user_turn_completed
     # 内 _WA_ACCUM 注释)。text=暂存拼接,ts=最后一段时刻,task=超时 flush 任务。
     _wa_accum: dict = {"text": "", "ts": 0.0, "task": None}
+    # 捕获渠道账本:flush 时原句已不在作用域,检测处(channel_from_text)记落嚟随
+    # 上报透传,名册 channel 数据源。缺省 whatsapp(对象 contact_channel 缺省同款)。
+    _wa_channel: dict = {"v": "whatsapp"}
 
     def _cancel_wa_accum_flush() -> None:
         task = _wa_accum.get("task")
@@ -1322,7 +1413,7 @@ async def entrypoint(ctx):
                 if num and num not in _wa_reported:
                     _wa_reported.add(num)
                     try:
-                        await cp.report_whatsapp(call_id, num)
+                        await cp.report_whatsapp(call_id, num, channel=_wa_channel["v"])
                     except Exception as exc:  # pragma: no cover - 上报失败唔阻确认
                         _wa_reported.discard(num)
                         print(f"[whatsapp] accumulate report failed: {exc!r} (call {room_name})", flush=True)
@@ -2406,6 +2497,9 @@ async def entrypoint(ctx):
                     if _stash_it:
                         _wa_accum["text"] = _merged
                         _wa_accum["ts"] = time.monotonic()
+                        # 渠道账本:客户讲嘅渠道词可能喺本段或在途,随合并文本更新;
+                        # flush 时只读账本(原句已唔喺作用域)。
+                        _wa_channel["v"] = channel_from_text(_merged)
                         _arm_wa_accum_flush()
                         print(
                             f"[whatsapp] accumulate chars={len(user_text)} total_digits={_n} (call {room_name})",
@@ -2428,6 +2522,8 @@ async def entrypoint(ctx):
                         user_text, step_goal=_g, step_ref=_r, facts=flow_ctrl.vars_map,
                         already_captured=_wa_captured["on"],
                     )
+                    _wa_ch = channel_from_text(user_text)
+                    _wa_channel["v"] = _wa_ch
                     if _wa_signal:
                         _kind, _num = _wa_signal
                         if _kind in ("captured", "captured_implicit"):
@@ -2445,7 +2541,7 @@ async def entrypoint(ctx):
 
                             async def _report():
                                 try:
-                                    await cp.report_whatsapp(call_id, _num)
+                                    await cp.report_whatsapp(call_id, _num, channel=_wa_ch)
                                 except Exception as exc:  # pragma: no cover
                                     # 上报失败唔好永久丢:清 key,後續輪再偵測到會補報
                                     # (server 幂等,重複 POST 唔會造成重複爆閃)。

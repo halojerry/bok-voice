@@ -1015,9 +1015,11 @@ def cmd_down() -> int:
 
 
 def _sweep_orphan_workers() -> list[tuple[int, str]]:
-    """清扫 pidfile 体系漏掉的 agent worker/解释器进程（返回 [(pid, 标签)]）。
+    """清扫 pidfile 体系漏掉的 agent worker/解释器/mock 客户进程（返回 [(pid, 标签)]）。
 
-    判据：进程命令行含 agent_runtime.main / agent_runtime.interpret。
+    判据：进程命令行含 agent_runtime.main / agent_runtime.interpret /
+    scripts/mock_callee.py（CP detached 派生的 mock 被叫 start_new_session,
+    同样绕过 pidfile 体系——房间断了会自退,但栈 down 时若仍卡响铃窗须一并清）。
     只清本项目特征进程,唔会误伤无关服务。"""
     swept: list[tuple[int, str]] = []
     seen: set[int] = set()
@@ -1035,7 +1037,7 @@ def _sweep_orphan_workers() -> list[tuple[int, str]]:
             continue
         if pid == os.getpid():
             continue
-        for marker in ("agent_runtime.main", "agent_runtime.interpret"):
+        for marker in ("agent_runtime.main", "agent_runtime.interpret", "scripts/mock_callee.py"):
             if marker in parts[1]:
                 if pid not in seen:
                     seen.add(pid)

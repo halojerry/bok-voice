@@ -117,6 +117,48 @@
   礼貌再见，随后 `POST /api/supervisor/{id}/end` 置 `ended` + `disposition=declined`
   并断房，结算由 agent `_on_close` 幂等触发。
 
+### 外呼战役（mock 档，spec 2026-09-12-outbound-campaign-roster）
+
+```text
+web /campaigns（建波/启停/进度表）
+  → CP POST /api/campaigns（object_ids 名单 + scenarios/scripts mock 剧本钩子）
+    + POST /api/campaigns/{id}/start
+  → CP 常驻 campaign loop（campaign.py `_campaign_loop`，5s 巡检 POLL_S）
+      ①收割：dialing/in_call 的 item 其通话已终态 → item 落结果（幂等）
+      ②串行：无进行中 item 且有 pending → 建通话 + explicit agent dispatch
+        （metadata 带 `dial` 块），item 置 dialing；**任意时刻至多 1 路在跑**
+      ③名单尽 → campaign done
+      起拨前 gap 冷却：最近终态 item 距今 < gap_seconds 不起下一通（首通不受门控）
+  → agent 收 metadata `dial` 块 → dial_outbound（dialer.py，四态出口）
+      real 档：官方 CreateSIPParticipant(wait_until_answered) + SipCallError 码映射
+               （486/603 拒接、408/480 无人接、5xx trunk 故障）；需 Redis + 公网
+               reachable 的 trunk，本地 mock 档无需
+      mock 档：CP `POST /api/sip/mock/callee` 派生 scripts/mock_callee.py 子进程
+               （真 TTS 客户语音进房；answer 逐句轮播 / no_answer 不入房 /
+               reject 进房即离 / hangup_mid 说一句就走）
+        · 台词从 dial 块 `script` 下发，空台词按语言默认 2 句兜底
+        · `speak_interval_s` 控句间隔；子进程会等 AI 讲完（对端音轨能量）
+          再出声，避免与开场白撞轮
+      → wait_for_participant：超时=no_answer、进房 1.5s 内离房零音频=rejected
+  → agent `POST /api/calls/{id}/dial-result`（answered→ACTIVE，三失败态→ENDED+
+    disposition）→ CP 按 call_id 反查 campaign item 同步状态（只认 dialing/in_call）
+  → 接通后走正常 A 线装配（开场白=话术第 1 步直念）；captured 号码自动入名册
+  → web /roster（认领池：unclaimed → claimed → handled）
+```
+
+- `BOK_SIP_MODE` 是 dial 后端 kill-switch（有值即终局：`mock`/`real`，非法值
+  回落 mock）；缺省读设置 DB `sip.mode`（设置页 SIP 卡片）。agent 侧
+  `resolve_dial_mode` 与 CP 侧 `_dial_mode` 同语义双实现（跨包分层，CP 不 import agent）。
+- mock 客户子进程日志落 `runtime/logs/mock-callee.log`（`MOCK_CALLEE event=…`
+  结构化行，E2E 断言素材）；房间断开立即收尾，CP 起子进程后起 daemon reaper 防僵尸。
+- campaign 名单由 `POST /api/campaigns` 一次建仓：对象无电话 → item 直接 `skipped`
+  （且不作 gap 冷却锚）。
+- mock 剧本钩子（`scenarios`/`scripts`/`mock_speak_interval_s`）只服务演练与 E2E；
+  campaign 级存 `campaigns.scripts_json`（无独立列，`__` 前缀键放 campaign 级参数），
+  起拨时按 object_id 取台词塞进 dial 块 `script`。真实 SIP 拨号恒为空。
+- 全链路 E2E：`python scripts/e2e_campaign.py`（3 对象战役——1 接通走完话术+captured
+  入名册 / 1 无人接 / 1 接通即挂；断言串行、终态三态、名册入册与 handled 回写）。
+
 ### B 线（同声传译 v2，LiveKit 双端）
 
 ```text
@@ -195,8 +237,7 @@ WorkerOptions.port)——默认同为 8081 会竞态,后绑者 Errno 48 即崩
 - `llm.provider`：`local_openai`/`mlx`（本地）/ `deepseek`（云端，缺 `api_key` 显式告警并回退本地）/ `fake`。
 - `tts.provider`：`qwen3_tts` / `volcano_streaming`（需 `VOLC_*` 环境变量）/ `fake`（静音测试音，非火山 beep）。
   音色兜底按语言 `speaker_zh/speaker_cantonese/en`（旧拼写键已由启动迁移改写）；persona 绑定 `reference_audio` 优先。
-- `vad`：`provider` + `max_buffered_speech` / `min_speech_duration` / `min_silence_duration` / `interruption`
-  —— 直接构造 `inference.VAD` 与打断开关（环境变量 `VAD_*` 仅作部署覆盖）。
+- `vad`：`provider` + `max_buffered_speech` / `min_speech_duration` / `min_silence_duration` / `interruption`  —— 直接构造 `inference.VAD` 与打断开关（环境变量 `VAD_*` 仅作部署覆盖）。
   基线默认（2026-09-05 句号级提交落地后）：`min_silence_duration=0.45`、`min_speech_duration=0.15`；
   A 线 turn_detection=`stt`（STT 句末 END_OF_SPEECH 提交，句级 FINAL→EOS，说话中即提交，
   数字串/短句/1.5s 限流保护；续接可能句——归一后 ≥2 位数字或系词收尾——会在句末被扣住
@@ -204,6 +245,12 @@ WorkerOptions.port)——默认同为 8081 会竞态,后绑者 Errno 48 即崩
   覆盖全段，超时由 flush 补发（该轮多等 ≤HOLD ms；flush 与正常停嘴同一套短尾规则并带
   会话纪元守卫，finish 等待期续讲开新会话唔会被 reset 清轮）），
   endpointing `min_delay=0.25`/`max_delay=0.6`。
+- `sip`（Wave2）：`mode`（`mock`/`real`，外呼拨号后端；env `BOK_SIP_MODE` 优先且
+  有值即终局）/ `trunk_id` / `address` / `auth_username` / `auth_password`（secret 掩码：
+  GET 回空串 + `has_auth_password`，PUT 传空=保留旧值）/ `numbers`（本端号码池）/
+  `ringing_timeout_s`（默认 30）/ `max_call_duration_s`（默认 600，mock 档作 agent 侧时长
+  保险丝）。切 `real` 的前提：已注册 SIP trunk + Redis（LiveKit 的 SIP 服务依赖）+
+  公网可达；未满足时保留 `mock`。
   语言钉定 + 热词：每通对话语言钉死随 `/api/start?language=` 下发（Chinese/English/Cantonese
   规范名）；热词 context（官方 customizable context，system message 词汇表软偏置）随
   `/api/start?context=` 下发——话术模板 hotwords 字段 + 话术领域词 + 对象文字字段
