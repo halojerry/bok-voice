@@ -2764,12 +2764,9 @@ async def entrypoint(ctx):
                     await session.interrupt()
                 except Exception:  # noqa: BLE001
                     pass
-                try:
-                    chat_ctx = getattr(self, "chat_ctx", None)
-                    if chat_ctx is not None and new_message is not None:
-                        chat_ctx.items.append(new_message)
-                except Exception:  # noqa: BLE001
-                    pass
+                # C5:官方姿势补 user 轮(旧 chat_ctx.items.append 打只读上下文
+                # 恒 RuntimeError,9/12 单日 189 次 ERROR 且从未生效)。
+                await self._try_append_user_message(new_message)
                 context_state.set_last_reply(_say_now)
                 _turn_origin["gen"] = "script"
                 _turn_origin["provider"] = "flow-say"
@@ -2849,12 +2846,8 @@ async def entrypoint(ctx):
                             except Exception:  # noqa: BLE001
                                 pass
                             # ② 手动补 user 轮(paused 分支同款):否则记忆/落库收不到这句
-                            try:
-                                chat_ctx = getattr(self, "chat_ctx", None)
-                                if chat_ctx is not None and new_message is not None:
-                                    chat_ctx.items.append(new_message)
-                            except Exception:  # noqa: BLE001
-                                pass
+                            # C5:官方姿势(旧 chat_ctx.items.append 打只读上下文恒失败)。
+                            await self._try_append_user_message(new_message)
                             # ③ 回声守卫预锚(正常要 playout 完才自动置,快路要立即生效)
                             context_state.set_last_reply(_qa_answer)
                             # ④ 落库 user 轮(paused 分支同款手动补轮,item_added
@@ -2891,6 +2884,27 @@ async def entrypoint(ctx):
             # → 起垫话定时器:回复首音频 ~700ms 未到才播,快轮零打扰(closing/WA
             # 步由开火前 guards 复核兜住)。
             _filler.arm()
+
+        async def _try_append_user_message(self, new_message) -> bool:
+            """C5(2026-09-13):官方姿势把 user 轮补进会话历史。
+
+            旧三处 chat_ctx.items.append 全打在 _ReadOnlyChatContext 上(livekit
+            1.8 Agent.chat_ctx 只读视图)——RuntimeError 被 except-pass 吞,9/12
+            单日 189 次 ERROR、「手动补 user 轮」从未生效(say-step/QA 快路的
+            用户话进唔到后续 LLM 上下文)。官方解=错误信息原文:.copy() 后改,
+            再 await agent.update_chat_ctx()。copy() 保留 items 原对象,KV 前缀
+            字节不变。失败打点返回 False(补轮是尽力而为,唔阻主路径)。
+            """
+            try:
+                if new_message is None:
+                    return False
+                ctx = self.chat_ctx.copy()
+                ctx.items.append(new_message)
+                await self.update_chat_ctx(ctx)
+                return True
+            except Exception as exc:  # noqa: BLE001
+                print(f"[agent] append_user_message failed: {exc!r} (call {room_name})", flush=True)
+                return False
 
         async def on_user_turn_exceeded(self, ev):
             if self.paused:
