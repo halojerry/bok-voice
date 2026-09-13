@@ -427,6 +427,16 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
       TokenSource.custom(async () => {
         const id = callIdRef.current;
         if (!id) throw new Error("no call id");
+        // C2 幽灵重连闸(2026-09-13,call-6bd59b40):TokenSource 自带 exp 前自动
+        // 续签,房间被删后的 livekit 全量重连会再来要 token——通话已 ended 时
+        // 提前 throw,掐断「新 token→重连重建房→幽灵 job 重放开场白」链
+        // (CP /api/token 侧同款 409 双保险)。
+        const cur = (await api.getCall(id).catch(() => null)) as
+          | (Record<string, unknown> & { status?: string })
+          | null;
+        if (cur && String(cur.status ?? "") === "ended") {
+          throw new Error("call ended — refusing to renew token (ghost rejoin guard)");
+        }
         return await api.token({ account_id: ACCOUNT, call_id: id });
       }),
     [],

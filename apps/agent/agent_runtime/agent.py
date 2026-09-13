@@ -1214,6 +1214,19 @@ async def entrypoint(ctx):
     except Exception as e:
         print(f"[agent] context resolve failed ({room_name}): {e}", flush=True)
 
+    # C2 闸1·幽灵 job 拒接(2026-09-13,call-6bd59b40):挂断后 operator 页重连
+    # 重建房间会再派一个 job,旧版对无人房重放开场白+幽灵轮落库+session_report
+    # 被覆盖+旧进程 kill -30。call 装配已拿到状态:ended → 拒接(return=无副
+    # 作用收工,不连房不念稿不上报);CP 不可达(call=None)保守放行——可用性
+    # 优先,不能因为 CP 抖动掐死正常通话。
+    if call is not None and str(call.get("status") or "") == "ended":
+        print(
+            f"[agent] GHOST_JOB_REJECTED call_id={call_id} status=ended — "
+            "通话已结束,拒接幽灵 job(不连房/不念开场白/不覆盖 report)",
+            flush=True,
+        )
+        return
+
     # 对话流程控制器:载入模板分步 + 对象变量;由它按轮注入"当前步",逐步推进。
     from .flow import FlowController, facts_line
     from .flow import (

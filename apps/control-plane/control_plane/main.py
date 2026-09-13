@@ -590,6 +590,20 @@ def token(req: TokenRequest) -> TokenResponse:
         _call = _repo().get_call(room) or {}
     except Exception:
         _call = {}
+    # C2 闸3·幽灵重连源(2026-09-13,call-6bd59b40):agent-ui TokenSource 带
+    # 自动续签,房间被删后 livekit 全量重连会再来要 token——旧版照签,operator
+    # 重连重建房 → 幽灵 job 重放开场白。A 线明确知道已 ended → 拒签(409);
+    # B 线 interpret 不拦——0912 定案契约「断线重连客户端仍可取 token,但终态
+    # 不翻」(test_token_does_not_revive_terminated_call 钉死);CP 读不到通话
+    # 记录(新建流/竞态)保守放行。
+    if (
+        str(_call.get("status") or "") == "ended"
+        and str(_call.get("kind") or "") != "interpret"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="call has ended — token refused (ghost rejoin guard)",
+        )
     kind = str(_call.get("kind") or "")
 
     # 同传房间:我方端是创建者,token 里挂 RoomConfiguration 显式分发两个方向的
@@ -1682,6 +1696,29 @@ async def ingest_session_report(call_id: str, request: Request) -> dict:
         payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="invalid json body")
+    # C2 闸2·幽灵覆盖防护(2026-09-13,call-6bd59b40):挂断后重连产生的幽灵 job
+    # 会用自己的 report 覆盖真实通话的 session_report。ended 且已有 report →
+    # 409 拒绝(首个 report 在 ended 后仍收——agent 收尾顺序是先 ended 后上报,
+    # 只挡「第二次覆盖」)。caller 已容错(报表失败不阻结算)。
+    try:
+        _cur = _repo().get_call(call_id) or {}
+    except Exception:  # pragma: no cover - 读取失败按旧行为放行
+        _cur = {}
+    if (
+        str(_cur.get("status") or "") == "ended"
+        and str(_cur.get("session_report") or "").strip()
+    ):
+        _audit(
+            "call.session_report_rejected",
+            subject_type="call",
+            subject_id=call_id,
+            account_id=_cur.get("account_id", ""),
+            outcome="ghost_overwrite",
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="call ended with existing session_report — ghost overwrite rejected",
+        )
     row = _repo().update_call(call_id, session_report=json.dumps(payload, ensure_ascii=False, default=str))
     if not row:
         raise HTTPException(status_code=404, detail="call not found")
