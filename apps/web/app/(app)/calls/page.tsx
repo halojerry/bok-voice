@@ -88,6 +88,15 @@ export default function CallsPage() {
       .finally(() => setLoading(false));
   }, [accountId]);
 
+  // 从内嵌工作台返回列表时立即刷新:挂断的那通此刻状态已变,不等 ≤4s 轮询
+  // (否则行还挂着「进行中」,交互不自洽)。
+  useEffect(() => {
+    if (openId) return;
+    api.listCalls(accountId, "")
+      .then((c) => setRows(Array.isArray(c) ? c : []))
+      .catch(() => {});
+  }, [accountId, openId]);
+
   // 主管台橫幅撳「進入工作台」→ /calls?call=<id>:自動開嗰通工作台(靜態 export 用 query,唔使新 route)。
   useEffect(() => {
     const m = window.location.search.match(/[?&]call=([^&]+)/);
