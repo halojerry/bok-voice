@@ -439,6 +439,39 @@ def _defer_ack_line(lang: str) -> str:
     return "好的，不着急，您慢慢看，我在电话这边等您。"
 
 
+def _starve_ack_line(lang: str) -> str:
+    """A3 饿死兜底短承接(C3 长独白饿死家族,2026-09-13):连续 2 轮零回复后
+    的让路语——≤15 字、零内容承诺(下一轮才恢复完整生成),只让客户知道
+    「还在、在听」。BOK_STARVE_ACK=0 关。"""
+    if lang == "cantonese":
+        return "係嘅，你講，我即刻答你。"
+    if lang == "en":
+        return "I'm here — please go ahead."
+    return "在的，您讲，我马上答复您。"
+
+
+def _say_step_cap(text: str) -> str:
+    """A2a 直念步长度护栏(2026-09-13):模板步正稿超 BOK_SAY_STEP_LIMIT(默认
+    80 字≈15s 音频)→ 只念首句+打点 SAY_STEP_TOO_LONG 提醒拆步——治运营手滑
+    再灌长稿(147/160 字直念=28-30s 独白的数据根源复燃)。甲.1 拆步后三语
+    模板全部 ≤55 字,本护栏纯兜底。"""
+    try:
+        limit = int(os.environ.get("BOK_SAY_STEP_LIMIT", "80") or 0)
+    except ValueError:
+        limit = 80
+    t = str(text or "")
+    if limit <= 0 or len(t) <= limit:
+        return t
+    m = re.search(r"[。！？!?]", t)
+    head = t[: m.end()] if (m and m.end() <= limit + 40) else t[:limit]
+    print(
+        f"SAY_STEP_TOO_LONG chars={len(t)} → 截断念首句({len(head)} 字)"
+        "——模板步超长,请运营拆步(plan 甲.1 单次直念铁律 ≤50 字)",
+        flush=True,
+    )
+    return head
+
+
 def _pause_ack_line(lang: str) -> str:
     """暂停进入播报(C1 暂停黑洞,2026-09-13):supervisor 暂停/人工接管瞬间
     脚本直念一句可听交代——旧版暂停=26s 纯静默(call-15a2f586 实证),客户
@@ -1347,6 +1380,13 @@ async def entrypoint(ctx):
     # WA 号码碎片累积:客户逐位/逐段报号时暂存半截句(见 on_user_turn_completed
     # 内 _WA_ACCUM 注释)。text=暂存拼接,ts=最后一段时刻,task=超时 flush 任务。
     _wa_accum: dict = {"text": "", "ts": 0.0, "task": None}
+    # A3 饿死兜底(2026-09-13,call-909744db「太长啦」3 连轮 sentences=0
+    # canceled=1 只闻垫话):连续 2 个用户轮之间零 assistant 输出(含 say/QA/
+    # LLM 任何形态)→ 第 3 轮跳过完整生成,直念 ≤15 字短承接+StopResponse,
+    # 下一轮恢复正常生成(计数清零)。BOK_STARVE_ACK=0 关。
+    _starve: dict = {"n": 0}
+    _assistant_out: dict = {"on": True}  # assistant 轮出现即置位(item_added)
+    _had_user_turn: dict = {"on": False}
 
     def _cancel_wa_accum_flush() -> None:
         task = _wa_accum.get("task")
@@ -2043,6 +2083,7 @@ async def entrypoint(ctx):
                 )
             )
             return
+        _assistant_out["on"] = True  # A3:assistant 轮出现=上一用户轮已被接住
         gen = _turn_origin["gen"]
         provider = _turn_origin["provider"]  # 默认空串(与旧行为一致;QA 快路=qa-fastpath)
         _turn_origin["gen"] = "llm"  # consume-once:下一轮默认 llm
@@ -2516,6 +2557,41 @@ async def entrypoint(ctx):
             # → 暂存+StopResponse(唔回复、唔侦测、唔推进),等下一段拼埋一次过处理。
             # 超时 flush 见 _arm_wa_accum_flush。StopResponse 必须喺任何 except-pass
             # try 之外(会被吞)。BOK_WA_ACCUMULATE=0 回退。
+            # ---- A3 饿死兜底(2026-09-13,call-909744db):连续 2 轮零 assistant
+            # 输出(长独白锁死对话权→碎片轮反复掐死在途回复,客户只闻垫话)→ 本轮
+            # (第 3 轮)跳过完整生成,直念 ≤15 字短承接,下一轮恢复完整生成。
+            if _had_user_turn["on"] and not _assistant_out["on"]:
+                _starve["n"] += 1
+            else:
+                _starve["n"] = 0
+            _assistant_out["on"] = False
+            _had_user_turn["on"] = True
+            if (
+                _starve["n"] >= 2
+                and os.environ.get("BOK_STARVE_ACK", "1") == "1"
+                and not closed.is_set()
+            ):
+                _starve["n"] = 0
+                _ack = _starve_ack_line(language_state.lang)
+                context_state.set_last_reply(_ack)
+                _turn_origin["gen"] = "script"
+                _turn_origin["provider"] = "starve-ack"
+                try:
+                    _sa_ms = int((time.monotonic() - _t0) * 1000)
+                    await cp.add_turn(
+                        call_id, "user", user_text, language=language_state.lang,
+                        line="a", speaker="customer", provider="starve-ack",
+                        template_step=(int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0,
+                        started_ms=_sa_ms, ended_ms=_sa_ms,
+                    )
+                except Exception:  # noqa: BLE001 - 落库失败唔阻承接
+                    pass
+                print(
+                    f"[agent] starve-ack (连续 2 轮零回复,短承接让路) (call {room_name})",
+                    flush=True,
+                )
+                await _say_script(session, tts_provider, _tts_cache, _ack)
+                raise StopResponse()
             if _WA_ACCUM_ENABLED and flow_ctrl.has_steps:
                 _g, _r = flow_ctrl.current_goal_ref()
                 if _looks_like_whatsapp_step(_g, _r) and user_text.strip() and not closed.is_set():
@@ -2754,6 +2830,7 @@ async def entrypoint(ctx):
                 _say_now = flow_ctrl.pending_say_text()
             except Exception:  # noqa: BLE001 - 无话术/异常退 LLM
                 _say_now = ""
+            _say_now = _say_step_cap(_say_now)
             if _say_now:
                 flow_ctrl.note_step_said()
                 try:
@@ -3148,6 +3225,12 @@ def run_agent() -> None:
     import sys
 
     from livekit.agents import WorkerOptions, cli
+
+    # C6-2 端口单例守卫(2026-09-13):重复 spawn 撞 8081 时良性退出 0(旧版
+    # Errno 48 崩溃+假故障噪音);BOK_WORKER_PORT_GUARD=0 关。
+    from .worker_guard import worker_port_singleton_guard
+
+    worker_port_singleton_guard(8081, "agent")
 
     # 抢跑失效诊断探针（BOK_PREEMPTIVE_DEBUG=1）：须在 worker 起跑前包好框架
     # 比较函数，否则首通 session 已绑旧引用。
