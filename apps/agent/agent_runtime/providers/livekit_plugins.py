@@ -698,6 +698,100 @@ class _StripTailAnchorStream(llm.LLMStream):
             )
 
 
+# ---- 出口复读防线(2026-09-12 P0「会说话」兜底层) ----
+# call-8fa17d2b 实证:两轮回复一字不差、连续两轮重念整段通知。渐进披露(话术
+# 分支单条命中)+【你上一句】锚截短治的是源头;这里在 LLM 流出口逐句比对
+# 上一句回复,拟声复读句剥掉不出声——确定性兜底,不赌 4B 听话。客户明确
+# 要求重讲(REPEAT verdict,agent 钩子置 ctx.repeat_requested)时放行。
+_SENT_END_RE = re.compile(r"[。！？!?]")
+
+
+def _norm_for_similarity(text: str) -> str:
+    return re.sub(r"[^\w\u4e00-\u9fff]+", "", str(text or ""))
+
+
+def _is_parrot_sentence(sentence: str, last_reply: str, threshold: float = 0.9) -> bool:
+    """句子与上一句回复的任一原句归一化相似 ≥threshold、或净文是其子串
+    (前缀截断式复读:整句重念但剪短了,ratio 0.87 会漏) → 拟声复读。"""
+    s = _norm_for_similarity(sentence)
+    if len(s) < 6:
+        return False
+    for prev in _SENT_END_RE.split(last_reply):
+        p = _norm_for_similarity(prev)
+        if len(p) >= 6 and (s in p or difflib.SequenceMatcher(a=s, b=p).ratio() >= threshold):
+            return True
+    return False
+
+
+class _RepeatSelfGuardStream(llm.LLMStream):
+    """LLM 流出口逐句剥复读:缓冲到句边界,复读句吞掉、新内容照发。
+
+    全剥空 → 流空收尾(罕见;渐进披露治源头后这里只兜底,真发生时垫话/心跳
+    补位)。壳与 _StripTailAnchorStream 同款:metrics 由内芯转发,此处排空。"""
+
+    def __init__(self, plugin, inner: "llm.LLMStream", last_reply: str, *, bypass: bool = False):
+        super().__init__(llm=plugin, chat_ctx=llm.ChatContext(), tools=[], conn_options=APIConnectOptions())
+        self._inner = inner
+        self._last_reply = last_reply
+        self._bypass = bypass or not last_reply
+        self._buf = ""
+
+    async def _metrics_monitor_task(self, event_aiter) -> None:
+        async for _ in event_aiter:
+            pass
+
+    def _feed(self, text: str) -> str:
+        """缓冲到句边界;完整句非复读才放行,复读句整句吞掉。"""
+        if self._bypass:
+            return text
+        self._buf += text
+        out: list[str] = []
+        while True:
+            m = _SENT_END_RE.search(self._buf)
+            if not m:
+                break
+            sentence = self._buf[: m.end()]
+            self._buf = self._buf[m.end() :]
+            if _is_parrot_sentence(sentence, self._last_reply):
+                print(f"REPEAT_SELF_SUPPRESSED sent={sentence!r}", flush=True)
+                continue
+            out.append(sentence)
+        return "".join(out)
+
+    def _flush_at_end(self) -> str:
+        if self._bypass or not self._buf:
+            return self._buf
+        rest = self._buf
+        self._buf = ""
+        if _is_parrot_sentence(rest, self._last_reply):
+            print(f"REPEAT_SELF_SUPPRESSED sent={rest!r}", flush=True)
+            return ""
+        return rest
+
+    async def _run(self):
+        async for ev in self._inner:
+            delta = getattr(ev, "delta", None)
+            content = getattr(delta, "content", None) if delta is not None else None
+            if not content:
+                self._event_ch.send_nowait(ev)
+                continue
+            clean = self._feed(content)
+            if not clean:
+                continue
+            if clean != content:
+                ev = llm.ChatChunk(
+                    id=getattr(ev, "id", ""),
+                    delta=llm.ChoiceDelta(content=clean, role=getattr(delta, "role", "assistant")),
+                    usage=getattr(ev, "usage", None),
+                )
+            self._event_ch.send_nowait(ev)
+        tail = self._flush_at_end()
+        if tail:
+            self._event_ch.send_nowait(
+                llm.ChatChunk(id="repeat-flush", delta=llm.ChoiceDelta(content=tail, role="assistant"))
+            )
+
+
 # 对象档案行边界=调用方给的显式换行(每个输入行是一个语义单元,如一行背景
 # +一行备注);绝不在句号处二次切分——多句背景若被句号切碎,第 2 行(备注)
 # 会被静默挤掉,档案失真。
@@ -744,6 +838,10 @@ class ContextState:
         # 都渲染进尾部，治「忘记早轮信息」「原句重复复述」（2026-09-06 行为取证）。
         self._call_facts: list[str] = []
         self._last_reply: str = ""
+        # 本轮客户是否要求重讲（REPEAT verdict）——出口复读防线放行合法复述
+        # (2026-09-12:agent 钩子每轮写入;客户明确要求重复时模型照讲上一句关键
+        # 内容是正确行为,不能被当拟声复读剥掉)。
+        self.repeat_requested: bool = False
 
     @property
     def revision(self) -> int:
@@ -969,6 +1067,19 @@ class ContextState:
             "这类拖延话术，也不要在流程中途自作主张承诺回头再答复；"
             "③ 客户的问题超出当前业务，就用引导话术收住（如「这个问题我帮您转给专门跟进的同事，他会马上联系您」），绝不冷场、绝不空手。"
         )
+        # 回应范例(2026-09-12 P0「会说话」):4B 靠示例学风格远胜靠禁令——
+        # call-8fa17d2b 实证「勿念原文」挡不住话术全文常驻的复制引力;话术已改
+        # 渐进披露(分支按回应单条命中,见 flow.match_step_branch),这里再钉住
+        # 「一句答所问+一句带回」的回复形态。示例用通用客服语,不绑具体模板
+        # 事实;进静态前缀=整场 KV-cache 命中,零每轮成本。
+        parts.append(
+            "【回应范例（学这种答法，不要照抄例句本身）】客户问什么，你先用一句话直接答他问的那件事，"
+            "再用一句把话题带回当前要办的事，两句收住。"
+            "例：客户问「你们是哪里的」→「我们是帮你收发转运的集运仓库。」"
+            "例：客户说「我不记得了」→「没关系，我这边帮您一起核对。」"
+            "例：客户问「为什么是这个数」→「是按对应标准算的，您的情况适用这一档。」"
+            "每个例子都一样：先答客户问的事，不念稿、不重复上一句，答完自然带回流程。"
+        )
         # 情绪标签试点（专项 C4,EMOTION_TAG_PILOT=1 选入;EMOTION_TAG_PROMPT=0
         # 可单关 prompt 只留 TTS 剥除）:4B 每轮开头输出一个白名单情绪标签,
         # 先只验「出标签稳定性」,TTS 侧剥除,数据够格再接 voice_setting。
@@ -985,6 +1096,15 @@ class ContextState:
         if self._object_brief:
             parts.append("【对象档案】\n" + self._object_brief)
         return "\n\n".join(parts)
+
+    def _last_reply_anchor(self) -> str:
+        """【你上一句】截短锚:只示开头 12 字,带转换性指令(勿原样重述)。"""
+        head = self._last_reply[:12]
+        ell = "…" if len(self._last_reply) > 12 else ""
+        return (
+            "【你上一句】「" + head + ell + "」"
+            "（只示开头，全文在对话历史；这句已讲过，禁止原样或只换个别字重述）"
+        )
 
     def render_context_tail(self) -> str:
         """【易变参考尾部】——每轮变的当前步/检索资料/记忆，垫在 system 最末。
@@ -1014,7 +1134,7 @@ class ContextState:
             if self._whatsapp_note:
                 parts.append("【已记录客户 WhatsApp】" + self._whatsapp_note)
             if self._last_reply:
-                parts.append("【你上一句】「" + self._last_reply + "」")
+                parts.append(self._last_reply_anchor())
             return "\n".join(parts)
         if self._whatsapp_note:
             parts.append(
@@ -1032,10 +1152,11 @@ class ContextState:
             # 当前步约束(随 flow 推进而变):放尾部最前,推进只改这里、前缀字节不动。
             parts.append("【现在这一步】\n" + self._flow_current)
         if self._last_reply:
-            # 重复锚:模型看得见自己上一句,治「原句/近原句复述」(2026-09-06
-            # 行为取证)。固定指令文本已上移稳定前缀【重复控制】(2026-09-09 S5
-            # 尾部瘦身)——每轮逐字重复 ~90 字指令是纯浪费,尾部只留引文。
-            parts.append("【你上一句】「" + self._last_reply + "」")
+            # 重复锚(截短版,2026-09-12 P0):旧版把上一句全文引在尾部,等于把
+            # 抄袭素材递到 4B 嘴边(call-8fa17d2b 两轮回复一字不差实证)。只示
+            # 开头 12 字+转换性指令——全文在对话历史里,对照能力不丢;标签
+            # 【你上一句】字面不变(_StripTailAnchorStream 靠它剥拟声复刻)。
+            parts.append(self._last_reply_anchor())
         if self.rag_enabled and self._snippets:
             parts.append("【实时检索到的资料（知识库）】\n" + "\n".join(f"- {s}" for s in self._snippets))
         if self.rag_enabled and self._web:
@@ -1230,7 +1351,17 @@ class ContextAwareLLM(llm.LLM):
         # 出口剥离拟声复刻的尾部锚块(见 _StripTailAnchorStream):测试替身返回
         # 非 LLMStream(单测 _CaptureInner 返回 "ok")时原样透传。
         if isinstance(inner_stream, llm.LLMStream):
-            return _StripTailAnchorStream(self, inner_stream)
+            _stripped = _StripTailAnchorStream(self, inner_stream)
+            if (
+                os.environ.get("BOK_REPEAT_GUARD", "1") == "1"
+                and self._ctx is not None
+            ):
+                # 出口复读防线(2026-09-12):逐句比对上一句回复,拟声复读句剥掉
+                # (call-8fa17d2b 两轮一字不差实证);客户要求重讲轮放行。
+                return _RepeatSelfGuardStream(
+                    self, _stripped, self._ctx.last_reply, bypass=self._ctx.repeat_requested
+                )
+            return _stripped
         return inner_stream
 
 
@@ -2061,6 +2192,19 @@ def _is_lone_vocab_word(text: str, hotword_context: str) -> bool:
     return norm in _vocab_words_from_context(hotword_context)
 
 
+# 纯犹豫残片(2026-09-12 call-46b94ebd「呃呃呃呃」成轮):剥尾余头/全新短段只由
+# 语气字组成(呃/啊/哦…,不含 嗯/好/係/对——单字应承是合法确认轮),≥2 字即不成
+# 轮——成轮必发垫话+生成 LLM+打断在途回复(canceled=1 三连的卡死体感)。
+_HESITATION_CHARS = "呃啊哦噢唉诶嘛呗咯哼呣"
+_HESITATION_RE = re.compile(r"^(?:[" + _HESITATION_CHARS + r"])+$")
+
+
+def _pure_hesitation(text: str) -> bool:
+    """净文(去标点空白)全部由犹豫语气字组成且 ≥2 字 → 纯犹豫不成轮。"""
+    norm = re.sub(r"[^\w\u4e00-\u9fff]+", "", str(text or ""))
+    return len(norm) >= 2 and bool(_HESITATION_RE.match(norm))
+
+
 def _vocab_echo_guard(
     text: str, hotword_context: str, *, echo_seen: bool
 ) -> tuple[str, bool]:
@@ -2073,6 +2217,13 @@ def _vocab_echo_guard(
     stripped = _strip_vocab_echo_tail(text, hotword_context)
     if stripped != text:
         return stripped, True
+    # 无分隔符的纯顺串(「單號運單賠償」)剥尾看不见结构,用贪心全覆判定整条丢
+    # ——**只在无分隔符时**进此门:有分隔符的短串(「拼多多，京东。」)剥尾的
+    # <4 段宽容已判保留,纯回声判定会误杀平台选择类真实回答。
+    if not re.search(r"[.。！？!,，、;；]", str(text or "")) and _is_hotword_vocab_echo(
+        text, hotword_context
+    ):
+        return "", True
     if echo_seen and _is_lone_vocab_word(text, hotword_context):
         return "", True
     return text, echo_seen
@@ -4210,6 +4361,11 @@ def _pause_trigger_enabled() -> bool:
     return os.environ.get("QWEN3_ASR_SENTENCE_PAUSE_TRIGGER", "1") == "1"
 
 
+def _hesitation_gate_on() -> bool:
+    """纯犹豫残片门(QWEN3_ASR_HESITATION_GATE,默认开;0=回退成轮)。"""
+    return os.environ.get("QWEN3_ASR_HESITATION_GATE", "1") == "1"
+
+
 def _join_hold_s() -> float:
     """跨段拼接 hold 窗(秒):QWEN3_ASR_JOIN_HOLD_MS,默认 800;0=关(行为同旧)。
 
@@ -4366,24 +4522,31 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         # join-hold 词表前缀门用的热词词表(与 context 软偏置同一份,流级缓存);
         # fake/无 context → 空 tuple,门自动失效。
         self._vocab_terms = _parse_vocab_terms(getattr(stt_, "_hotword_context", ""))
+        # 词表回声事件账本(call-46b94ebd/1043de7c):确认过一次剥尾/纯回声后,
+        # 后续词表孤词残片按回声衰落丢弃——首现孤词保留(真人可能真讲「微信」)。
+        self._vocab_echo_seen: bool = False
 
-    def _vocab_echo(self, text: str) -> bool:
-        """热词幻听判定(源头闸):词表被当转写整串抄出 → True,调用方丢弃该事件。
+    def _echo_filter(self, text: str, src: str) -> str:
+        """词表回声统一闸(剥尾保头版,2026-09-12 call-46b94ebd P0)。
 
-        QWEN3_HOTWORD_ECHO_GUARD=0 回退。词表与 STT context 同一份(_hotword_context)。
-        """
+        旧版停嘴 FINAL 用纯回声判定(_is_hotword_vocab_echo)整条丢弃——真答案
+        词恰在词表里(「拼多多。顺豐速運,運通…」平台答案)连真实回答一起丢,
+        客户抱怨触发假推进。四个闸口(停嘴/join-flush/interim/句级提交)统一
+        换 hook 层 _vocab_echo_guard 三件套语义:真话头+词表尾→剥尾保头;纯回声
+        /echo_seen 后孤词残片→空串(调用方丢弃)。QWEN3_HOTWORD_ECHO_GUARD=0 关。"""
         if os.environ.get("QWEN3_HOTWORD_ECHO_GUARD", "1") != "1":
-            return False
-        return _is_hotword_vocab_echo(text, getattr(self._stt_, "_hotword_context", "") or "")
-
-    def _vocab_echo(self, text: str) -> bool:
-        """热词幻听判定(源头闸):词表被当转写整串抄出 → True,调用方丢弃该事件。
-
-        QWEN3_HOTWORD_ECHO_GUARD=0 回退。词表与 STT context 同一份(_hotword_context)。
-        """
-        if os.environ.get("QWEN3_HOTWORD_ECHO_GUARD", "1") != "1":
-            return False
-        return _is_hotword_vocab_echo(text, getattr(self._stt_, "_hotword_context", "") or "")
+            return text
+        clean, self._vocab_echo_seen = _vocab_echo_guard(
+            text,
+            getattr(self._stt_, "_hotword_context", "") or "",
+            echo_seen=self._vocab_echo_seen,
+        )
+        if clean != text:
+            if clean.strip("。，, 、;；"):
+                print(f"QWEN3_HOTWORD_ECHO_STRIP src={src} payload={text!r} keep={clean!r}", flush=True)
+            else:
+                print(f"QWEN3_HOTWORD_ECHO_DROP src={src} payload={text!r}", flush=True)
+        return clean
 
     async def _run(self) -> None:
         vad_stream = self._vad.stream()
@@ -4408,6 +4571,22 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                     self._event_ch.send_nowait(stt.SpeechEvent(stt.SpeechEventType.START_OF_SPEECH))
                     if not self._session_id:
                         await self._start_session()
+                        # VAD 起报前导喂会话(2026-09-12「快语速吃首字」修复):官方
+                        # silero 把 prefix padding(0.5s)+min_speech 确认窗的音频挂在
+                        # START 事件 frames 里交还(官方 StreamAdapter 在 END 用同一
+                        # buffer 识别);旧版增量会话无视之,起报前的 INFERENCE_DONE
+                        # 帧又被 not started 跳过——sidecar 从「确认说话」那刻才收
+                        # 音频,快语速首 1-3 字结构性缺失、finish 重解也救不回音频。
+                        # 新开会话时并入 _pending(下一个 INFERENCE_DONE 的
+                        # _maybe_partial 自动喂走);hold 续段(会话存活、INFERENCE_
+                        # DONE 全程在喂)不并入,防音频重复。
+                        if event.frames:
+                            try:
+                                self._pending.extend(
+                                    bytes(utils.merge_frames(event.frames).data)
+                                )
+                            except Exception:  # noqa: BLE001 - pre-roll 合帧失败不致命
+                                pass
                 elif event.type == vad.VADEventType.INFERENCE_DONE:
                     if not started or self._finishing:
                         continue
@@ -4499,8 +4678,10 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                     # 号码/答复（「说两句第二句被吞→AI 不回话」的根因）。
                     if committed_before and payload and len(payload) < _ASR_SENTENCE_MIN_CHARS and not _tail_carries_content(payload):
                         payload = ""
-                    if payload and self._vocab_echo(payload):
-                        print(f"QWEN3_HOTWORD_ECHO_DROP src=stop-mouth payload={payload!r}", flush=True)
+                    if payload:
+                        payload = self._echo_filter(payload, "stop-mouth")
+                    if payload and _hesitation_gate_on() and _pure_hesitation(payload):
+                        print(f"QWEN3_ASR_HESITATION_DROP payload={payload!r}", flush=True)
                         payload = ""
                     started = False
                     self._finishing = False
@@ -4552,8 +4733,10 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         # ——「六四三二」补报号码好过吞掉(2026-09-07 审查:hold 路漏抄豁免)。
         if committed_before and payload and len(payload) < _ASR_SENTENCE_MIN_CHARS and not _tail_carries_content(payload):
             payload = ""
-        if payload and self._vocab_echo(payload):
-            print(f"QWEN3_HOTWORD_ECHO_DROP src=join-flush payload={payload!r}", flush=True)
+        if payload:
+            payload = self._echo_filter(payload, "join-flush")
+        if payload and _hesitation_gate_on() and _pure_hesitation(payload):
+            print(f"QWEN3_ASR_HESITATION_DROP payload={payload!r}", flush=True)
             payload = ""
         self._finishing = False
         if self._session_epoch == _epoch_at_hold:
@@ -4684,8 +4867,8 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                 )
                 self._prev_partial = text  # 参照窗照常推进（与 _last_partial 同步）
                 # 字幕续流：只发未提交剩余（框架 _audio_transcript 已含已提交句）。
-                remainder = self._uncommitted(text)
-                if remainder and not self._vocab_echo(remainder):
+                remainder = self._echo_filter(self._uncommitted(text), "interim-window")
+                if remainder.strip("。，, 、;；"):
                     self._event_ch.send_nowait(
                         stt.SpeechEvent(
                             type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
@@ -4698,8 +4881,8 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         display = self._uncommitted(text)
         if not display:
             return
-        if self._vocab_echo(display):
-            print(f"QWEN3_HOTWORD_ECHO_DROP src=interim text={display!r}", flush=True)
+        display = self._echo_filter(display, "interim")
+        if not display.strip("。，, 、;；"):
             return
         self._event_ch.send_nowait(
             stt.SpeechEvent(
@@ -4752,9 +4935,9 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         拉不走会话语言）。只发 FINAL——句末 END_OF_SPEECH 由调用方按各自契约补
         （partial 标点路径紧随发 EOS；vad-pause 路径后面本就有停嘴 EOS，不重复发）。
         """
-        if self._vocab_echo(sentence):
-            # 词表幻听顺串:丢弃,不记账不发 FINAL(字幕/轮次/脑全链路不污染)
-            print(f"QWEN3_HOTWORD_ECHO_DROP src={source} sentence={sentence!r}", flush=True)
+        sentence = self._echo_filter(sentence, source)
+        if not sentence.strip("。，, 、;；"):
+            # 纯回声/残片:丢弃,不记账不发 FINAL(字幕/轮次/脑全链路不污染)
             return
         self._committed_text += sentence
         self._last_sentence = sentence
@@ -4870,13 +5053,44 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                     aligned_idx = i
                     break
             return text[aligned_idx + 1:].lstrip(_UNCOMMITTED_LEADING_WEAK_PUNCT) if aligned_idx >= 0 else ""
-        if difflib.SequenceMatcher(a=norm_c, b=norm_t).ratio() >= _ASR_REDECODE_DROP_RATIO:
+        sm = difflib.SequenceMatcher(a=norm_c, b=norm_t)
+        if sm.ratio() < _ASR_REDECODE_DROP_RATIO:
+            return text
+        if len(norm_t) <= len(norm_c) + 3:
+            # 长度相当:同一句话的更好重解,冇新内容——迟到 FINAL 会喺框架
+            # on_final_transcript 里掐死生成中的回复(call-58601bba),唔补发。
             print(
                 f"QWEN3_ASR_REDECODE_DROP committed={self._committed_text!r} finish={text!r}",
                 flush=True,
             )
             return ""
-        return text
+        # 同头+新尾(2026-09-12 长度感知):finish 明显更长=客户快语速继续讲的内容
+        # 在权威重解里,整条丢=真吃字(当日全量日志实测 19 次/387 字,单次最多 36
+        # 字)。按 diff 定位 committed 末端,对齐 raw 截新尾照发——内容送达优先,
+        # 碎片回复被 barge-in 是其本分。
+        tail_start = None
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "equal" and i1 < i2 and i2 == len(norm_c):
+                tail_start = j2  # committed 全文映射完之后=新尾巴起点(norm 坐标)
+        if tail_start:
+            cnt = 0
+            for i, ch in enumerate(text):
+                if ch.isspace() or unicodedata.category(ch).startswith("P"):
+                    continue
+                cnt += 1
+                if cnt == tail_start:
+                    _tail = text[i + 1 :].lstrip(_UNCOMMITTED_LEADING_WEAK_PUNCT)
+                    print(
+                        f"QWEN3_ASR_REDECODE_TAIL committed={self._committed_text!r} tail={_tail!r}",
+                        flush=True,
+                    )
+                    return _tail
+        # 高相似但 committed 末端对不齐(极端改写,理论边角):按重解丢弃。
+        print(
+            f"QWEN3_ASR_REDECODE_DROP committed={self._committed_text!r} finish={text!r}",
+            flush=True,
+        )
+        return ""
 
     async def _finish_session(self) -> tuple[str, str]:
         sid = self._session_id
