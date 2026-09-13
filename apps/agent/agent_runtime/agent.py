@@ -1793,6 +1793,19 @@ async def entrypoint(ctx):
             async for _ev in _stream:
                 pass
 
+    # 垫话罐头命中计数(2026-09-13 乙节):fire-and-forget,失败零影响。
+    def _filler_entry_hit(entry_id: str) -> None:
+        async def _go() -> None:
+            try:
+                await cp.filler_hit(entry_id)
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            asyncio.create_task(_go())
+        except Exception:  # noqa: BLE001 - 无事件循环(测试)=丢弃计数
+            pass
+
     _filler = FillerDirector(
         session,
         # 语言铁律(2026-09-10):垫话语言=装配时钉死的通话语言,构造时捕获,
@@ -1819,6 +1832,23 @@ async def entrypoint(ctx):
         report=_on_filler_played,
         caption=_filler_caption,
     )
+    # 垫话罐头确定性匹配(2026-09-13 乙节):拉 CP filler_entries 建索引——命中
+    # 即同语境同条目(用户拍板:随机抽签才是机器感);客户上一句复用
+    # flow_ctrl.last_user_text(hook L2481 已维护)。拉取失败/空表 → 纯分类器
+    # +资产池(既有行为);BOK_FILLER_MATCH=0 同样回退。
+    try:
+        _filler_rows = await cp.list_filler_entries()
+    except Exception as exc:  # noqa: BLE001 - 罐头库不可用零影响
+        _filler_rows = []
+        print(f"[agent] filler entries load failed: {exc!r} (call {room_name})", flush=True)
+    if _filler_rows:
+        from .fillers import FillerEntryIndex
+
+        _filler_index = FillerEntryIndex(_filler_rows)
+        _filler._entries_index = _filler_index
+        _filler._user_text_provider = lambda: flow_ctrl.last_user_text
+        _filler._entry_hit = _filler_entry_hit
+        print(f"[agent] filler canned on entries={len(_filler_index)} (call {room_name})", flush=True)
     if isinstance(tts_provider, CachedTTS):
         tts_provider.add_first_audio_listener(_filler.on_reply_first_audio)
         # 播放排序契约(2026-09-10):垫话播完→gap→回复。回复首帧到达时若垫话

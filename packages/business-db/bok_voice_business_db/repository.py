@@ -247,6 +247,64 @@ class SqlAlchemyBusinessRepository:
             row.hit_count = int(row.hit_count or 0) + int(n)
             self.session.commit()
 
+    # ---- 垫话罐头库(2026-09-13 乙节,镜像 qa_entries 姿势) ----
+
+    def _filler_to_dict(self, row) -> dict:
+        return {
+            "id": row.id,
+            "account_id": row.account_id,
+            "lang": row.lang,
+            "category": row.category,
+            "text": row.text,
+            "triggers": row.triggers,
+            "voice_id": row.voice_id,
+            "priority": int(row.priority or 0),
+            "per_call_cap": int(row.per_call_cap or 2),
+            "enabled": bool(row.enabled),
+            "hit_count": int(row.hit_count or 0),
+            "source": row.source,
+            "created_at": row.created_at.isoformat() if row.created_at else "",
+        }
+
+    def list_filler_entries(self, account_id: str = "", enabled: bool | None = None, lang: str = "") -> list[dict]:
+        stmt = select(models.FillerEntry).order_by(models.FillerEntry.created_at)
+        if account_id:
+            stmt = stmt.filter_by(account_id=account_id)
+        if enabled is not None:
+            stmt = stmt.filter_by(enabled=enabled)
+        if lang:
+            stmt = stmt.filter_by(lang=lang)
+        return [self._filler_to_dict(r) for r in self.session.scalars(stmt)]
+
+    def create_filler_entry(self, data: dict) -> dict:
+        row = models.FillerEntry(
+            id=data.get("id") or f"filler:{uuid.uuid4().hex[:12]}",
+            account_id=data.get("account_id") or "acc-001",
+            lang=data.get("lang") or "zh",
+            category=data.get("category") or "default",
+            text=data.get("text") or "",
+            triggers=data.get("triggers") or "[]",
+            voice_id=data.get("voice_id") or "",
+            priority=int(data.get("priority") or 0),
+            per_call_cap=int(data.get("per_call_cap") or 2),
+            enabled=bool(data.get("enabled", True)),
+            source=data.get("source") or "curated",
+        )
+        self.session.add(row)
+        self.session.commit()
+        return self._filler_to_dict(row)
+
+    def count_filler_entries(self) -> int:
+        from sqlalchemy import func
+
+        return int(self.session.scalar(select(func.count()).select_from(models.FillerEntry)) or 0)
+
+    def incr_filler_hit(self, entry_id: str, n: int = 1) -> None:
+        row = self.session.get(models.FillerEntry, entry_id)
+        if row is not None:
+            row.hit_count = int(row.hit_count or 0) + int(n)
+            self.session.commit()
+
     def iter_call_conversations(self, account_id: str = "", exclude_test_objects: bool = False) -> list[list[dict]]:
         """跨通话按序轮次(高频问答对挖掘用):join calls 过账号,created_at 排序。
 
@@ -654,6 +712,7 @@ class InMemoryBusinessRepository:
         self.global_insights: list[dict] = []
         self.audit_events: list[dict] = []
         self.qa_entries: dict[str, dict] = {}
+        self.filler_entries: dict[str, dict] = {}
         self.settings: dict = SqlAlchemyBusinessRepository.default_settings()
 
     def create_call(self, manifest: SessionManifest) -> dict:
@@ -727,6 +786,47 @@ class InMemoryBusinessRepository:
             and (enabled is None or bool(v.get("enabled")) == enabled)
         ]
         return sorted(rows, key=lambda v: v.get("created_at") or "")
+
+    # ---- 垫话罐头库(2026-09-13 乙节,镜像 qa_entries 姿势) ----
+
+    def list_filler_entries(self, account_id: str = "", enabled: bool | None = None, lang: str = "") -> list[dict]:
+        rows = [
+            v
+            for v in getattr(self, "filler_entries", {}).values()
+            if (not account_id or v.get("account_id") == account_id)
+            and (enabled is None or bool(v.get("enabled")) == enabled)
+            and (not lang or v.get("lang") == lang)
+        ]
+        return sorted(rows, key=lambda v: v.get("created_at") or "")
+
+    def create_filler_entry(self, data: dict) -> dict:
+        if not hasattr(self, "filler_entries"):
+            self.filler_entries = {}
+        row = {
+            "id": data.get("id") or f"filler:{uuid.uuid4().hex[:12]}",
+            "account_id": data.get("account_id") or "acc-001",
+            "lang": data.get("lang") or "zh",
+            "category": data.get("category") or "default",
+            "text": data.get("text") or "",
+            "triggers": data.get("triggers") or "[]",
+            "voice_id": data.get("voice_id") or "",
+            "priority": int(data.get("priority") or 0),
+            "per_call_cap": int(data.get("per_call_cap") or 2),
+            "enabled": bool(data.get("enabled", True)),
+            "hit_count": int(data.get("hit_count") or 0),
+            "source": data.get("source") or "curated",
+            "created_at": data.get("created_at") or "",
+        }
+        self.filler_entries[row["id"]] = row
+        return dict(row)
+
+    def count_filler_entries(self) -> int:
+        return len(getattr(self, "filler_entries", {}))
+
+    def incr_filler_hit(self, entry_id: str, n: int = 1) -> None:
+        row = getattr(self, "filler_entries", {}).get(entry_id)
+        if row is not None:
+            row["hit_count"] = int(row.get("hit_count") or 0) + int(n)
 
     def create_qa_entry(self, data: dict) -> dict:
         if not hasattr(self, "qa_entries"):

@@ -1467,6 +1467,23 @@ def hit_qa_entry(entry_id: str) -> dict:
     return {"id": entry_id}
 
 
+# ---- 垫话罐头库(2026-09-13 乙节):确定性语境命中,镜像 qa_entries ----
+
+
+@app.get("/api/fillers")
+def list_filler_entries(account_id: str = "acc-001", enabled: int | None = None, lang: str = "") -> list[dict]:
+    return _repo().list_filler_entries(
+        account_id, enabled=None if enabled is None else bool(enabled), lang=lang
+    )
+
+
+@app.post("/api/fillers/{entry_id}/hit")
+def hit_filler_entry(entry_id: str) -> dict:
+    """agent 垫话罐头命中计数(fire-and-forget,幂等无副作用)。"""
+    _repo().incr_filler_hit(entry_id)
+    return {"id": entry_id}
+
+
 @app.get("/api/reports/qa-pairs")
 def report_qa_pairs(
     min_calls: int = 5, account_id: str = "acc-001", limit: int = 100, exclude_test: bool = True

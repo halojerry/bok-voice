@@ -291,11 +291,12 @@ def test_gap_env_default_and_override(monkeypatch):
     assert filler_gap_s() == 0.3
 
 
-def test_filler_max_default_is_twelve(monkeypatch):
+def test_filler_max_default_is_six(monkeypatch):
     monkeypatch.delenv("BOK_FILLER_MAX", raising=False)
     from agent_runtime.fillers import filler_max_per_call
-    # 2026-09-12 定档:3 被首轮「主动+链发」耗尽致「几轮就没」→ 12 覆盖整通。
-    assert filler_max_per_call() == 12
+    # 2026-09-13 乙节定档:罐头确定性命中后 12 次只会放大复读感——垫话是补丁
+    # 不是台词,6 发覆盖最差慢轮(旧 12 是随机池年代的补丁,见 plan 乙节 B3)。
+    assert filler_max_per_call() == 6
 
 
 def test_load_manifest_shape(tmp_path):
