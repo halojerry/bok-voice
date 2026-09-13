@@ -15,6 +15,12 @@ export interface AudioDeviceInfo {
   name: string;
   is_default: boolean;
   kind: AudioDeviceKind;
+  /**
+   * Chrome 的物理设备组 id：同一台设备的输入与输出**共用**一个 groupId，且不随 id 轮换
+   * （蓝牙重连后 deviceId 会换、groupId 不变）。用于「两个角色是不是同一台物理设备」的
+   * 判定——只比设备名会把同型号的两支麦误判成同一台。原生枚举（Tauri）没有这个概念，传空串。
+   */
+  groupId: string;
 }
 
 const MIC_KEY = "bok.audio.mic";
@@ -77,6 +83,7 @@ async function listWebDevices(kind: AudioDeviceKind, granted: boolean): Promise<
       name: d.label || (kind === "input" ? "麦克风" : "扬声器"),
       is_default: d.deviceId === "default",
       kind,
+      groupId: d.groupId ?? "",
     }));
 }
 
@@ -94,7 +101,7 @@ export async function listAudioDevicesOf(kind: AudioDeviceKind): Promise<AudioDe
     try {
       const native = await listAudioDevices("output");
       if (Array.isArray(native) && native.length > 0) {
-        return native.map((d) => ({ id: d.id, name: d.name, is_default: d.is_default, kind }));
+        return native.map((d) => ({ id: d.id, name: d.name, is_default: d.is_default, kind, groupId: "" }));
       }
     } catch {
       /* 原生枚举失败（Windows 占位）时回退 web */

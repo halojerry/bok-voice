@@ -57,6 +57,18 @@ class ControlPlaneClient:
         provider: str = "",
         latency_ms: int = 0,
         language: str = "",
+        # 分析账本列（P0 turns ledger）：line=线别(a/b)、speaker=说话人
+        # (customer/agent_ai/agent_human|me/other)、gen=生成源(llm/script/
+        # qa_fastpath)、template_step=话术步、started/ended_ms=轮时间轴
+        # (call 相对)、perceived_ms=用户讲完→AI 出声北极星。CP 侧全可选带
+        # 缺省,旧调用零破坏。
+        line: str = "",
+        speaker: str = "",
+        gen: str = "",
+        template_step: int = 0,
+        started_ms: int = 0,
+        ended_ms: int = 0,
+        perceived_ms: int = 0,
     ) -> None:
         await self._client.post(
             f"/api/calls/{call_id}/turns",
@@ -67,6 +79,13 @@ class ControlPlaneClient:
                 "provider": provider,
                 "latency_ms": latency_ms,
                 "language": language,
+                "line": line,
+                "speaker": speaker,
+                "gen": gen,
+                "template_step": template_step,
+                "started_ms": started_ms,
+                "ended_ms": ended_ms,
+                "perceived_ms": perceived_ms,
             },
         )
 

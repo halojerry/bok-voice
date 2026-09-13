@@ -28,10 +28,13 @@ const FIELD_PLACEHOLDERS = {
 
 const TEMPLATE_FIELDS = ["opening", "core", "objection", "closing"] as const;
 
-/** 分步话术:每一步 = 要达成的目标(goal) + 参考说法(ref,可含 {变量})。 */
+/** 分步话术:每一步 = 要达成的目标(goal) + 参考说法(ref,可含 {变量})。
+ * say=直念步:进入该步的当轮 AI 逐字念参考说法首行(通知/道歉等要逐字一致的
+ * 合规内容),不走 LLM 自由发挥;第 1 步的首行始终是开场白直念,不必勾选。 */
 interface FlowStep {
   goal: string;
   ref: string;
+  say?: boolean;
 }
 
 const EMPTY = {
@@ -45,11 +48,15 @@ const EMPTY = {
   hotwords: "",
 };
 
-const STEPS_HINT = "可用变量:{姓名} {快递单号} {快递尾号} {物流公司} {收货地址}。\n参考说法是给 AI 的要点参考,不是逐字稿——AI 会结合客户原话用自己的话讲。";
+const STEPS_HINT = "可用变量:{姓名} {快递单号} {快递尾号} {物流公司} {收货地址}。\n参考说法是给 AI 的要点参考,不是逐字稿——AI 会结合客户原话用自己的话讲。\n勾选「直念」的步骤:进入该步的当轮 AI 逐字念参考说法首行,适合通知/道歉等要逐字一致的内容。";
 
-/** 把 steps 序列化/反序列化为 steps_json(存库)。 */
+/** 把 steps 序列化/反序列化为 steps_json(存库)。say 只在 true 时写出(省体积)。 */
 function stepsToJson(steps: FlowStep[]): string {
-  return JSON.stringify(steps.filter((s) => s.goal.trim() || s.ref.trim()));
+  return JSON.stringify(
+    steps
+      .filter((s) => s.goal.trim() || s.ref.trim())
+      .map((s) => (s.say ? { goal: s.goal, ref: s.ref, say: 1 } : { goal: s.goal, ref: s.ref })),
+  );
 }
 function jsonToSteps(raw: unknown): FlowStep[] {
   try {
@@ -57,7 +64,11 @@ function jsonToSteps(raw: unknown): FlowStep[] {
     if (!Array.isArray(arr)) return [];
     return arr
       .filter((s) => s && typeof s === "object")
-      .map((s) => ({ goal: String((s as { goal?: unknown }).goal ?? ""), ref: String((s as { ref?: unknown }).ref ?? "") }));
+      .map((s) => ({
+        goal: String((s as { goal?: unknown }).goal ?? ""),
+        ref: String((s as { ref?: unknown }).ref ?? ""),
+        say: Boolean((s as { say?: unknown }).say),
+      }));
   } catch {
     return [];
   }
@@ -403,6 +414,15 @@ export default function TemplatesPage() {
                     value={st.ref}
                     onChange={(e) => setSteps((s) => s.map((x, j) => (j === i ? { ...x, ref: e.target.value } : x)))}
                   />
+                  <label className="mt-1 flex items-center gap-1.5 text-[11px] muted">
+                    <input
+                      type="checkbox"
+                      className="size-3 accent-(--accent)"
+                      checked={Boolean(st.say)}
+                      onChange={(e) => setSteps((s) => s.map((x, j) => (j === i ? { ...x, say: e.target.checked } : x)))}
+                    />
+                    直念(进入该步的当轮逐字念首行,适合通知/道歉等合规内容)
+                  </label>
                 </div>
               ))}
             </div>

@@ -55,8 +55,9 @@ def test_stream_vocab_echo_detector():
     async def scenario():
         stream = _make_stream()
         try:
-            assert stream._vocab_echo("單號運單賠償") is True
-            assert stream._vocab_echo("我個單號係三七七八九零") is False
+            # 剥尾保头版统一闸:纯回声→空串,真话原样
+            assert stream._echo_filter("單號運單賠償", "stop-mouth") == ""
+            assert stream._echo_filter("我個單號係三七七八九零", "stop-mouth") == "我個單號係三七七八九零"
         finally:
             stream._event_ch.close()
 
@@ -92,7 +93,7 @@ def test_kill_switch_disables_detector(monkeypatch):
     async def scenario():
         stream = _make_stream()
         try:
-            assert stream._vocab_echo("單號運單賠償") is False, "开关关闭=旧行为(不过滤)"
+            assert stream._echo_filter("單號運單賠償", "stop-mouth") == "單號運單賠償", "开关关闭=旧行为(不过滤)"
         finally:
             stream._event_ch.close()
 

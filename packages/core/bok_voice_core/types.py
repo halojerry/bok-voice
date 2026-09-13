@@ -89,6 +89,15 @@ class TurnEvent:
     latency_ms: int = 0
     language: str = ""
     created_at: str = ""
+    # ---- 分析账本列（spec 2026-09-10 §6.1）：带缺省值，旧调用零破坏。
+    org_id: str = ""
+    line: str = "a"          # a=客服(A 线) / b=同传(B 线)
+    speaker: str = ""        # customer/agent_ai/agent_human | me/other(B 线)
+    gen: str = ""            # llm/script/filler/qa_fastpath
+    template_step: int = 0
+    started_ms: int = 0
+    ended_ms: int = 0
+    perceived_ms: int = 0
 
 
 @dataclass

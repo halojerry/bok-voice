@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "@/lib/api";
 import { ErrorState, LoadingState } from "@/components/app-shell";
+import CannedAuditionCard from "@/components/canned-audition";
 import DesktopStatus from "@/components/desktop-status";
 import { SETTING_CARDS, POLICY_META, DEFAULT_PROVIDER, type ProviderKind, type FieldMeta } from "@/lib/settings-meta";
 import { previewLangForVoice } from "@/lib/minimax-voices";
@@ -365,6 +366,7 @@ export default function SettingsPage() {
             <ProviderCard key={kind} kind={kind} value={form[kind] ?? {}} onChange={(next) => setForm({ ...form, [kind]: next })} />
           ))}
           <AudioDevicesCard />
+          <CannedAuditionCard />
           <section className="card">
             <span className="label">{POLICY_META.title}</span>
             <select

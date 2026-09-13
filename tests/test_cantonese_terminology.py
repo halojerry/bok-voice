@@ -36,6 +36,9 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     "tests/test_interpret_tts_provider.py": re.compile(r"Chinese,Yue"),
     "tests/test_fixed_language_call.py": re.compile(r"Chinese,Yue"),
     "scripts/test_volcano_v3.py": None,
+    # MiniMax ASR BCP-47 语言头外部枚举(粤语=yue,asr-1.0 /v1/speech_to_text 真字面量,
+    # 同 language_boost 政策):只豁免带该枚举值的行,探针内部语言字段一律 cantonese。
+    "scripts/probe_cloud_asr_ab.py": re.compile(r'"yue"'),
     "docs/ARCHITECTURE.md": re.compile(r"VOLC_DIALECT"),
     "AGENTS.md": None,
     "AGENT.md": None,

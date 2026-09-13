@@ -469,6 +469,11 @@ def cmd_status() -> int:
         ("mt-llm", 1236),
         ("b-line", 8790),
         ("livekit", 7880),
+        # worker 三件(2026-09-12):status 旧版只查基础服务——serve 竞态令 worker
+        # 静默缺失时 status 仍全 UP,「看着正常其实通话全灭」。worker 端口一并上表。
+        ("agent-worker", 8081),
+        ("interp-fwd", 8082),
+        ("interp-rev", 8083),
     ]
     for name, port in services:
         print(f"  {name:<13} :{port:<6} {'UP' if healthy(port) else 'DOWN'}")
@@ -884,6 +889,29 @@ def cmd_serve() -> int:
         return rc
 
     # Agent worker registers to the embedded/local LiveKit server.
+    # livekit 就绪等待(2026-09-12):livekit 刚被上方 spawn 时 7880 尚未 bind,
+    # 旧版一次性 healthy(7880) 探测在 down→serve 快速循环时恒 False → 三个
+    # worker 静默跳过、还照打 desktop ready(当日两次实证:8081-8083 全空、
+    # 对话/同传全灭)。改轮询等待;等不到时若上方因「入口探测健康而跳过 spawn」
+    # (down 后优雅关停中的 livekit 仍监听、却被残留房间连接拖住几分钟才真退,
+    # 实证 20:11 才放端口)则补拉一次;再等不到就明确报错,由下方 targets 如实失败。
+    _lk_respawned = False
+    _lk_deadline = time.monotonic() + 30.0
+    while not healthy(7880):
+        if time.monotonic() >= _lk_deadline:
+            if livekit_bin and Path(livekit_bin).exists() and not _lk_respawned:
+                _start_proc(
+                    [str(livekit_bin), "--config", str(ROOT / "services" / "livekit-server" / "livekit.yaml")],
+                    run_dir / "livekit.pid",
+                    log_dir / "livekit.log",
+                )
+                _lk_respawned = True
+                _lk_deadline = time.monotonic() + 15.0
+                print("[bok] livekit went down during startup — respawned a fresh instance")
+                continue
+            print("[bok] livekit :7880 not ready — agent workers NOT started", file=sys.stderr)
+            break
+        time.sleep(0.5)
     if healthy(7880):
         _cur = MODELS["mac"] if is_mac() else MODELS["windows"]
         agent_env: dict[str, str] = {
@@ -899,34 +927,41 @@ def cmd_serve() -> int:
         # .venv312 OpenSSL 无默认 CA 束 → MiniMax WSS 必炸；固化 SSL_CERT_FILE
         # （与 _agent_prod_env 同源；interp 经 _interp_env 拷贝继承）。
         _bake_ssl_cert_file(agent_env, py)
-        _start_proc([str(py), "-m", "agent_runtime.main"], run_dir / "agent.pid", log_dir / "agent.log", env=agent_env)
+        # serve 幂等:worker 端口已被监听就跳过——重复 spawn 撞显式端口
+        # (8081/8082/8083,后绑者 Errno 48 即崩)。已在跑的可能是别的 worktree
+        # 起的旧代码,要换码重启先 bok.py down。
+        if not healthy(8081):
+            _start_proc([str(py), "-m", "agent_runtime.main"], run_dir / "agent.pid", log_dir / "agent.log", env=agent_env)
+        else:
+            print("[bok] agent worker already listening :8081 (run bok.py down first to restart it)")
 
         # B 线同传 interpreter:每个方向一个 worker(agent_name 显式分发,
         # 方向/语言对由 CP 在 me 端 token 的 RoomAgentDispatch metadata 下发)。
         # worker 常驻待命,没有同传房间时零占用(不加载模型,job 到达才拉管线)。
-        for _dir, _pidname, _logname in (
-            ("fwd", "interp-fwd.pid", "interp-fwd.log"),
-            ("rev", "interp-rev.pid", "interp-rev.log"),
+        for _dir, _port, _pidname, _logname in (
+            ("fwd", 8082, "interp-fwd.pid", "interp-fwd.log"),
+            ("rev", 8083, "interp-rev.pid", "interp-rev.log"),
         ):
             interp_env = _interp_env(agent_env)
             interp_env["BOK_SERVICE"] = f"interp-{_dir}"
             interp_env["INTERP_DIRECTION"] = _dir
-            _start_proc(
-                [str(py), "-m", "agent_runtime.interpret"],
-                run_dir / _pidname,
-                log_dir / _logname,
-                env=interp_env,
-            )
+            if not healthy(_port):
+                _start_proc(
+                    [str(py), "-m", "agent_runtime.interpret"],
+                    run_dir / _pidname,
+                    log_dir / _logname,
+                    env=interp_env,
+                )
+            else:
+                print(f"[bok] interp-{_dir} worker already listening :{_port}")
 
     print("[bok] waiting for desktop stack…")
-    targets = [8000, 8787, 8788, 8790, 1235]
+    targets = [8000, 8787, 8788, 8790, 1235, 7880, 8081, 8082, 8083]
     if healthy(1236):
         # MT 翻译小模型(:1236)可选:cmd_up 拉起了才纳入等待,缺模型不算失败。
         targets.append(1236)
     if not is_packaged():
         targets.append(3000)
-    if healthy(7880):
-        targets.append(7880)
     for _ in range(120):
         if all(healthy(p) for p in targets):
             ready = "[bok] desktop ready: control-plane=8000 asr=8787 tts=8788 llm=1235 b-line=8790"

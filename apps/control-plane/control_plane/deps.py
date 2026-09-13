@@ -149,6 +149,16 @@ def build_engine() -> Engine | None:
                     "session_report",
                     "session_report TEXT",
                 )
+                # turns 分析账本列（spec 2026-09-10 §6.1）：org/线别/说话人/生成源/
+                # 话术步/时间轴。缺省值兜底旧行，二启幂等（列在即跳过）。
+                _ensure_column(conn, "turns", "org_id", "org_id VARCHAR(64) DEFAULT ''")
+                _ensure_column(conn, "turns", "line", "line VARCHAR(8) DEFAULT 'a'")
+                _ensure_column(conn, "turns", "speaker", "speaker VARCHAR(32) DEFAULT ''")
+                _ensure_column(conn, "turns", "gen", "gen VARCHAR(16) DEFAULT ''")
+                _ensure_column(conn, "turns", "template_step", "template_step INTEGER DEFAULT 0")
+                _ensure_column(conn, "turns", "started_ms", "started_ms INTEGER DEFAULT 0")
+                _ensure_column(conn, "turns", "ended_ms", "ended_ms INTEGER DEFAULT 0")
+                _ensure_column(conn, "turns", "perceived_ms", "perceived_ms INTEGER DEFAULT 0")
         except Exception as exc:  # pragma: no cover - sqlite / duplicate column
             print(f"[deps] idempotent column migration skipped: {exc}")
 

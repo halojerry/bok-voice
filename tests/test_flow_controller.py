@@ -229,14 +229,73 @@ WA_REF = "你加工作人員嘅WhatsApp帳號…你直接俾你個WhatsApp號碼
 
 
 def test_should_auto_advance_opening_step():
-    # 開場步:客俾咗實質回應(唔記得)→ 即過;純提問/拒絕 → 唔過。
+    # 身份確認步(2026-09-12 開場白三段拆分):任何非拒絕回應都推——純提問
+    # 「你哋邊間公司」都推,由下一步(來電通知,自報家門)承接;拒絕/異議/要求
+    # 重複唔推(頂部攔走)。舊「純提問唔推」係長開場年代語義,已廢。
     from agent_runtime.flow import should_auto_advance
-    g = "開場說明:通知貨件遺失,問客戶記唔記得買咗咩"
-    r = "你好,請問係{姓名}嗎?…件貨遺失…問你記唔記得買咗咩"
+    g = "身份確認:問對方係咪{姓名}"
+    r = "你好,請問係{姓名}嗎?"
     assert should_auto_advance(current=0, goal=g, ref=r, user_text="我唔记得咗啊！", verdict="unclear") is True
     assert should_auto_advance(current=0, goal=g, ref=r, user_text="好呀，係我", verdict="confirm") is True
-    assert should_auto_advance(current=0, goal=g, ref=r, user_text="你哋係邊間公司㗎？", verdict="question") is False
+    assert should_auto_advance(current=0, goal=g, ref=r, user_text="你哋係邊間公司㗎？", verdict="question") is True
     assert should_auto_advance(current=0, goal=g, ref=r, user_text="唔好再打嚟！", verdict="objection") is False
+    assert should_auto_advance(current=0, goal=g, ref=r, user_text="你讲咩啊？", verdict="repeat") is False
+
+
+def test_should_auto_advance_say_step():
+    # 通知直念步(say=1):客户对「记唔记得买咩货品」的实质回应即推去平台步;
+    # 纯提问(问公司/点解遗失)唔推,原地答(分支+QA 罐头)。未标 say 的步
+    # (平台/赔偿)语义不变——unclear 唔推、答到平台先推。
+    from agent_runtime.flow import should_auto_advance
+    g = "來電通知:自報家門,問客户記唔記得買嘅貨品"
+    r = "我哋係集運中轉倉…想問下你仲記唔記得當時買嘅係咩貨品呢?"
+    assert should_auto_advance(current=1, goal=g, ref=r, user_text="我唔记得咗", verdict="unclear", say_step=True) is True
+    assert should_auto_advance(current=1, goal=g, ref=r, user_text="我买咗件衫", verdict="confirm", say_step=True) is True
+    assert should_auto_advance(current=1, goal=g, ref=r, user_text="你哋係邊間公司？", verdict="question", say_step=True) is False
+    # 平台步(无 say):unclear 唔推
+    assert should_auto_advance(current=2, goal="引导核实", ref="你係喺邊個平台買?", user_text="随便", verdict="unclear", say_step=False) is False
+
+
+def test_parse_steps_say_flag():
+    from agent_runtime.flow import parse_steps
+    import json as _json
+    steps = parse_steps(_json.dumps([
+        {"goal": "身份確認", "ref": "你好，請問係{姓名}嗎？"},
+        {"goal": "來電通知", "ref": "我哋係集運中轉倉…", "say": 1},
+    ]))
+    assert steps[0].say is False
+    assert steps[1].say is True
+
+
+def test_say_step_pending_and_ledger():
+    import json as _json
+    fc = FlowController.from_template({"steps_json": _json.dumps([
+        {"goal": "身份確認:問對方係咪{姓名}", "ref": "你好，請問係{姓名}嗎？"},
+        {"goal": "來電通知", "ref": "我哋係集運中轉倉，今次致電係想通知你。\n如果客户唔记得 → 去下一步问平台", "say": 1},
+        {"goal": "引导核实", "ref": "邊個平台買？"},
+    ])}, OBJ)
+    # 身份步(0)不是直念步 → 无待念文本(开场白走 opening 机制)
+    assert fc.pending_say_text() == ""
+    fc.advance()  # 客户确认身份 → 通知步
+    assert fc.pending_say_text() == "我哋係集運中轉倉，今次致電係想通知你。"
+    # 念完记账:不再待念,当前步注入【通知已念】防 LLM 重复整段
+    fc.note_step_said()
+    assert fc.pending_say_text() == ""
+    cur = fc.current_step_text()
+    assert "【通知已念】" in cur
+    # 收尾态/完成后不直念
+    fc.enter_closing()
+    assert fc.pending_say_text() == ""
+
+
+def test_say_step_missing_var_returns_empty():
+    import json as _json
+    fc = FlowController.from_template({"steps_json": _json.dumps([
+        {"goal": "身份", "ref": "你好"},
+        {"goal": "通知", "ref": "我哋係{不存在的变量}中轉倉", "say": 1},
+    ])}, OBJ)
+    fc.advance()
+    assert fc.pending_say_text() == ""  # 变量缺失宁可退 LLM,不念占位符
 
 
 def test_should_auto_advance_platform_answer():
@@ -274,6 +333,48 @@ def test_detect_whatsapp_captured_number():
     # 客戶喺引導辦理步讀出自己 WhatsApp 號碼(漢字/阿拉伯/空格)→ captured。
     assert detect_whatsapp_signal("我個WhatsApp係 六八六八一二三四五六", step_goal=WA_GOAL, step_ref=WA_REF) == ("captured", "6868123456")
     assert detect_whatsapp_signal("我WhatsApp號碼係 9852 6633", step_goal=WA_GOAL, step_ref=WA_REF) == ("captured", "98526633")
+
+
+def test_detect_whatsapp_grouped_digits_collapsed():
+    """分组报号(call-5f8bef6b 实证):客户按组报号「751 ⏸ 220」,ASR 在组间落
+    逗号/顿号/连字符 → 归一后 run 被劈成 3+3,4 位连续下限全部打回 → captured
+    永不触发、WA 步锁死。组间分隔符(两侧皆数字)折叠成一条 run;句号/小数点
+    是句界与小数语义,不折叠。"""
+    from agent_runtime.flow import detect_whatsapp_signal
+    # 英文分组报号(本通实证形态)
+    assert detect_whatsapp_signal("Seven five one, two two zero.", step_goal=WA_GOAL, step_ref=WA_REF) == ("captured", "751220")
+    # 中文分组:逗号/顿号/连字符
+    assert detect_whatsapp_signal("我嘅號碼係 9852，6633", step_goal=WA_GOAL, step_ref=WA_REF) == ("captured", "98526633")
+    assert detect_whatsapp_signal("六四三二、五四三二", step_goal=WA_GOAL, step_ref=WA_REF) == ("captured", "64325432")
+    assert detect_whatsapp_signal("我WhatsApp係 9852-6633", step_goal=WA_GOAL, step_ref=WA_REF) == ("captured", "98526633")
+    # 修正句「唔係5，係3」:中间是汉字,唔折叠,两段各 <4 位照舊唔收
+    assert detect_whatsapp_signal("唔係5，係3", step_goal=WA_GOAL, step_ref=WA_REF) is None
+    # 小数点/句号不折叠:小数句号两侧虽是数字,折叠会把 1.5 变 15、把「赔300。号码…」两句焊成一条
+    assert detect_whatsapp_signal("賠償1.5倍呀", step_goal=WA_GOAL, step_ref=WA_REF) is None
+    assert detect_whatsapp_signal(
+        "賠償300。我號碼係98526633", step_goal=WA_GOAL, step_ref=WA_REF
+    ) == ("captured", "98526633")
+    # review 加固:范围/金额语境不折——「300～500」是赔偿区间、「300-500块」带量词、
+    # 「¥300,500」两笔金额;折了会捏出 300500 假号码假捕获。
+    assert detect_whatsapp_signal("賠償300～500蚊", step_goal=WA_GOAL, step_ref=WA_REF) is None
+    assert detect_whatsapp_signal("賠償300-500塊", step_goal=WA_GOAL, step_ref=WA_REF) is None
+    assert detect_whatsapp_signal("¥300,500的賠償", step_goal=WA_GOAL, step_ref=WA_REF) is None
+
+
+def test_wa_accum_merge_redecode_prefix_replaced():
+    """累积合并(「唔结合上下文」根因):第二段 FINAL 常是全窗重解(自带前文头),
+    盲拼 stash+新段 → 头重复 → 「oneSeven」粘连吃数字。归一前缀命中 → 用新段
+    整句替换;真续段 → 带分隔符拼接(唔可以裸拼,「five one」「two zero」会粘词)。"""
+    from agent_runtime.agent import _wa_accum_merge
+
+    # 全窗重解(新段含暂存头)→ 替换,唔可以 doubling
+    assert _wa_accum_merge("seven five one", "Seven five one, two two zero.") == "Seven five one, two two zero."
+    # 大小写/词形差异由归一吃掉
+    assert _wa_accum_merge("我的WhatsApp係", "我的WhatsApp係64325432") == "我的WhatsApp係64325432"
+    # 真续段 → 带分隔符拼接
+    assert _wa_accum_merge("我的WhatsApp係", "六四三二五四三二") == "我的WhatsApp係，六四三二五四三二"
+    # 空暂存直通
+    assert _wa_accum_merge("", "abc") == "abc"
 
 
 def test_detect_whatsapp_known_number_excluded():
@@ -425,9 +526,11 @@ def test_legacy_four_sections_become_steps():
 
     fc = FlowController.from_template(LEGACY_TPL, OBJ)
     assert fc.has_steps
-    assert "第 1/4 步" in fc.current_step_text()
-    # 开场步的 ref 是 opening 全文
-    assert "你好请问" in fc.current_step_text()
+    txt = fc.current_step_text()
+    assert "第 1/4 步" in txt
+    # 开场步的 ref 是 opening 全文(渐进披露:每步首轮渲染注入底稿,二次调用
+    # 已转分支模式——单次捕获断言)
+    assert "你好请问" in txt
 
 
 def test_legacy_steps_advance_one_by_one():
@@ -448,7 +551,9 @@ def test_legacy_steps_advance_one_by_one():
 
 
 def test_current_step_explicit_no_leak_instruction():
-    # 当前步注入须明确区分"参考要点(内部)"与"对客户说的话",禁止复述分支指示。
+    # 当前步注入须明确区分"内部底稿"与"对客户说的话",禁止复述分支指示;
+    # 渐进披露后分支不再以「如果客户X→就Y」原文形态进 prompt(只改写成
+    # 【应对客户当前回应】单条),命中分支的应对内容本身照给。
     from agent_runtime.flow import FlowController
 
     fc = FlowController.from_template(
@@ -456,9 +561,14 @@ def test_current_step_explicit_no_leak_instruction():
         OBJ,
     )
     txt = fc.current_step_text()
-    assert "勿念给客户" in txt
-    assert "绝不把「如果" in txt
-    assert "参考要点(内部指示" in txt
+    assert "内部资料" in txt  # 底稿明确标记为内部
+    assert "绝不逐字念" in txt  # 禁止逐字念出
+    assert "如果客户" not in txt  # 分支指示原文不进(首轮无分支)
+    fc.last_verdict = "unclear"
+    fc.last_user_text = "我唔记得了"
+    txt2 = fc.current_step_text()
+    assert "提佢地址帮佢回忆" in txt2  # 命中分支的应对照注入
+    assert "如果客户" not in txt2  # 但分支指示原文形态不进
 
 
 # ---- 明确拒绝 → REFUSE(一句礼貌收尾 + 主动结束通话) ----
@@ -821,3 +931,36 @@ def test_repeat_guidance_renders():
     # REPEAT 唔触发【新一步】(冇 advance 发生);QUESTION 指引照旧禁复读(非重复语境)
     fc2.last_verdict = QUESTION
     assert "绝不重复" in fc2.current_step_text()
+
+
+def test_say_step_loose_semantics_scoped_to_notification_step():
+    # 2026-09-12 call-8fa17d2b:赔偿直念步(say=1,承诺型问句「可以接受吗」)吃到
+    # 通知步的宽松推进语义——UNCLEAR 语气点评「呃，自然多了」假推进 step4→5。
+    # 修复:say_step 由调用方只对通知型步(goal 含「通知」)传 True;此测试钉死
+    # 流程层契约:赔偿步传 say_step=False 时 UNCLEAR 唔推。
+    from agent_runtime.flow import should_auto_advance
+
+    g4 = "赔偿标准:核实订单金额后按三档标准讲赔偿,问客户是否接受"
+    r4 = "首先，我们会先核实您这件货品的订单金额…您看这个方案可以接受吗？"
+    assert should_auto_advance(current=3, goal=g4, ref=r4, user_text="呃，自然多了", verdict="unclear", say_step=False) is False
+    # 真确认经 agent 的 rule=confirm 分支推进(wa_confirm_advance_allowed 放行)
+    from agent_runtime.flow import wa_confirm_advance_allowed
+
+    assert wa_confirm_advance_allowed(goal=g4, ref=r4, captured=False) is True
+    # 通知步(调用方会传 say_step=True)宽松语义照旧
+    g2 = "来电通知:自报家门,通知货件遗失,问客户记不记得货品"
+    assert should_auto_advance(current=1, goal=g2, ref="我哋係…記唔記得?", user_text="啊，不记得了。", verdict="unclear", say_step=True) is True
+
+
+def test_judge_confirm_gate_blocks_ackless_long_utt():
+    # call-8fa17d2b:长 UNCLEAR 轮被 judge 误判 confirm——问句步(赔偿接受吗)
+    # 无应承特征的长句拦下;短句与真应承放行;非问句步(通知)保持宽松。
+    from agent_runtime.flow import judge_confirm_advance_allowed
+
+    g4 = "赔偿标准:核实订单金额后按三档标准讲赔偿,问客户是否接受"
+    r4 = "首先，我们会先核实您这件货品的订单金额…您看这个方案可以接受吗？"
+    assert judge_confirm_advance_allowed(goal=g4, ref=r4, user_text="他这个就过来了。") is False
+    assert judge_confirm_advance_allowed(goal=g4, ref=r4, user_text="可以，就这样赔偿吧") is True
+    assert judge_confirm_advance_allowed(goal=g4, ref=r4, user_text="行") is True  # 短句
+    g2 = "来电通知:自报家门,通知货件遗失"  # 非问句步(无？)
+    assert judge_confirm_advance_allowed(goal=g2, ref="我哋係集運中轉倉…", user_text="随便讲点什么都很长的一段话") is True

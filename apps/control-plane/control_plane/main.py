@@ -11,9 +11,10 @@ from collections import defaultdict
 from pathlib import Path
 
 import httpx
-from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
+from pydantic import BaseModel
 
 from bok_voice_core.providers import BusinessRepository
 from bok_voice_core.policies import select_session_manifest
@@ -33,6 +34,8 @@ from bok_voice_obs.middleware import CorrelationMiddleware
 
 from .deps import build_engine, build_repository, build_session_factory
 from .dispatch_utils import cleanup_dispatch, has_active_dispatch
+from .nodes_store import HEARTBEAT_INTERVAL_S, NodeStore
+from .pregen import persona_pregen_status
 from .schemas import (
     CreateCallRequest,
     CreateObjectRequest,
@@ -66,11 +69,14 @@ app.add_middleware(CorrelationMiddleware)
 async def optional_bearer_auth(request: Request, call_next):
     """可选 Bearer 鉴权（R2）：BOK_CP_TOKEN 未设=全放行（本机单用户形态零变化）。
 
-    设置后除 /health 外全部端点要求 `Authorization: Bearer <BOK_CP_TOKEN>`——
-    暴露到局域网/云之前必须设置；agent(worker env)与 web 需同步带同值。
+    设置后除 /health 与 /api/nodes/heartbeat 外全部端点要求
+    `Authorization: Bearer <BOK_CP_TOKEN>`——暴露到局域网/云之前必须设置；
+    agent(worker env)与 web 需同步带同值。心跳豁免：该端点用注册时签发的
+    node_token 自鉴权（sha256 比对，与 CP token 不同源），CP 门禁会把它拦死
+    令节点注册表失联；register/list 属管理操作，仍在门禁内。
     """
     expected = os.environ.get("BOK_CP_TOKEN", "").strip()
-    if expected and request.url.path != "/health":
+    if expected and request.url.path not in ("/health", "/api/nodes/heartbeat"):
         if request.headers.get("authorization", "") != f"Bearer {expected}":
             return Response(status_code=401, content=b'{"detail":"unauthorized"}',
                              media_type="application/json")
@@ -90,6 +96,14 @@ def _repo() -> BusinessRepository:
     return app.state.repo
 
 
+def _node_store() -> NodeStore:
+    """节点注册表（_repo() 同款访问姿势：startup 与 repo 同一 engine 装配）。
+
+    engine=None（dev/tests 无 DATABASE_URL）→ NodeStore 内存双模，见 nodes_store。
+    """
+    return app.state.node_store
+
+
 def _sidecar_url(env_name: str, default: str) -> str:
     return (os.environ.get(env_name) or default).rstrip("/")
 
@@ -107,6 +121,7 @@ def _startup() -> None:
     configure_logging(level=os.environ.get("BOK_LOG_LEVEL", "INFO"))
     engine = build_engine()
     app.state.repo = build_repository(engine)
+    app.state.node_store = NodeStore(engine)  # 与 repo 同一 engine；None → 内存双模
     app.state.session_factory = build_session_factory(engine)
     app.state.lk_key = os.environ.get("LIVEKIT_API_KEY", "")
     app.state.lk_secret = os.environ.get("LIVEKIT_API_SECRET", "")
@@ -385,6 +400,34 @@ async def tts_register_voice(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+@app.get("/api/tts/filler-preview")
+def tts_filler_preview(lang: str = "zh", i: int = 0) -> Response:
+    """垫话资产试听（2026-09-11 症状④）：直接吐源码 wav（随包分发,零云调用）。
+
+    i=池内索引(取模轮换),web 端随机传即「换一句试听」。浏览器按 wav 头原生
+    播放=正确速率;房间内 48k 混音器错配是 agent 播放路径问题,与此端点无关。"""
+    from fastapi.responses import FileResponse
+
+    assets = Path(__file__).resolve().parents[2] / "agent" / "agent_runtime" / "assets" / "fillers"
+    manifest_path = assets / "manifest.json"
+    if not manifest_path.exists():
+        raise HTTPException(status_code=404, detail="filler assets not found")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        pool = manifest.get(lang) or manifest.get("zh") or []
+        if not pool:
+            raise HTTPException(status_code=404, detail=f"no filler pool for lang={lang}")
+        entry = pool[int(i) % len(pool)]
+        wav = assets / str(entry.get("file") or "")
+        if not wav.exists():
+            raise HTTPException(status_code=404, detail="filler wav missing")
+        return FileResponse(str(wav), media_type="audio/wav", filename=str(entry.get("file") or "filler.wav"))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"filler preview failed: {exc}") from exc
+
+
 @app.post("/api/tts/preview")
 async def tts_preview(payload: dict) -> Response:
     """试听一段 TTS。provider=qwen3_tts 走本地 sidecar；provider=minimax 走云端 MiniMax
@@ -394,6 +437,15 @@ async def tts_preview(payload: dict) -> Response:
     text = str(payload.get("text") or "")
     voice = str(payload.get("voice") or "")
     language = str(payload.get("language") or "zh")
+    if not voice and provider in ("minimax", "minimax_streaming"):
+        # qa_entries.voice_id 可空(罐头物化时音色取自人设而非词条字段)——试听
+        # 按语言回落 agent 同一套默认音色(_MINIMAX_DEFAULT_VOICES 同步,2026-09-12
+        # zh 换克隆 moss),否则空 voice 被 MiniMax 拒。
+        voice = {
+            "zh": "moss_audio_aaa1346a-7ce7-11f0-8e61-2e6e3c7ee85d",
+            "cantonese": "Cantonese_crisp_news_anchor_vv2",
+            "en": "English_magnetic_voiced_man",
+        }.get(language, "moss_audio_aaa1346a-7ce7-11f0-8e61-2e6e3c7ee85d")
     try:
         if provider in ("minimax", "minimax_streaming"):
             # 与 agent 一致：优先读设置库里持久化的 tts.api_key，环境变量仅作兜底，
@@ -413,7 +465,15 @@ async def tts_preview(payload: dict) -> Response:
                     json={
                         "model": os.environ.get("MINIMAX_MODEL", "speech-2.8-hd"),
                         "text": text,
-                        "voice_setting": {"voice_id": voice, "speed": 1, "vol": 1, "pitch": 0},
+                        # 语速与运行时同一条语言档规则(zh/粤 1.2,见 agent_runtime
+                        # minimax_speed_for;CP 进程不引 agent 包,同规则内联)——
+                        # 否则试听节奏与真通话不一致,试了白试。
+                        "voice_setting": {
+                            "voice_id": voice,
+                            "speed": 1.2 if language in ("zh", "cantonese") else 1.0,
+                            "vol": 1,
+                            "pitch": 0,
+                        },
                         "audio_setting": {"sample_rate": sample_rate, "format": "pcm", "channel": 1},
                     },
                 )
@@ -585,7 +645,12 @@ def token(req: TokenRequest) -> TokenResponse:
     # "active calls" view reflects the real live room.
     if req.call_id:
         try:
-            _repo().update_call(req.call_id, status=CallStatus.ACTIVE.value)
+            # 终态守卫（2026-09-11 同传审计 P0）：断线重连的客户端在 hangup 后再取
+            # token（call-a9511563 实证 hangup 200 后 +18ms 一发），无条件写 ACTIVE
+            # 会把 ENDED/FAILED 复活——最后一写者胜令「挂断不结算」成立。
+            cur = _repo().get_call(req.call_id) or {}
+            if str(cur.get("status") or "") not in _TERMINAL_CALL_STATUSES:
+                _repo().update_call(req.call_id, status=CallStatus.ACTIVE.value)
         except Exception:
             pass
     _audit("token.issue", subject_type="call", subject_id=req.call_id or "",
@@ -722,8 +787,21 @@ async def _cleanup_room_dispatch(room_name: str) -> None:
         print(f"[cp] dispatch cleanup skipped ({room_name}): {exc!r}", flush=True)
 
 
+def _is_agent_identity(identity: str) -> bool:
+    """agents SDK 真实 job 入房 identity=agent-<jobid>；A 线另兼容旧 bok-voice 直名。"""
+    return identity == "bok-voice" or identity.startswith("agent-")
+
+
+def _has_human_participants(participants) -> bool:
+    """房里是否有真人（me-/other-/operator/supervisor 等）。
+
+    只数真人（2026-09-11 同传审计 P1）：被误派进去的 agent 自己就是 participants，
+    旧判定「len>0 即有人」令纯 agent 殭尸房永远不满足回收条件、reaper 兜底失效。"""
+    return any(not _is_agent_identity(str(getattr(p, "identity", "") or "")) for p in participants or [])
+
+
 async def _room_has_participants(room_name: str) -> bool:
-    """房间存在且有参与者 → True;房间不存在/服务不可用 → False(可回收)。"""
+    """房间存在且有真人 → True;房间不存在/服务不可用/只剩 agent → False(可回收)。"""
     key = getattr(app.state, "lk_key", "") or os.environ.get("LIVEKIT_API_KEY", "")
     secret = getattr(app.state, "lk_secret", "") or os.environ.get("LIVEKIT_API_SECRET", "")
     url = getattr(app.state, "lk_url", "") or os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880")
@@ -739,7 +817,7 @@ async def _room_has_participants(room_name: str) -> bool:
         async with aiohttp.ClientSession() as session:
             svc = RoomService(session, http_url, key, secret)
             res = await svc.list_participants(ListParticipantsRequest(room=room_name))
-            return len(res.participants or []) > 0
+            return _has_human_participants(res.participants)
     except Exception:
         # 房间不存在(NotFound)→ 无人 → False;鉴权/网络异常同样按可回收处理
         # (比「永远卡 active」好;回收带 disposition=abandoned 可追溯)。
@@ -817,14 +895,32 @@ async def _reaper_loop() -> None:
         await asyncio.sleep(_REAP_INTERVAL_S)
 
 
+_disconnect_room_tasks: set = set()
+
+
+def _disconnect_room_background(room_name: str) -> None:
+    """断房+回收 dispatch 后台化：调用方（hangup/transfer/supervisor_end）都已先置
+    终态，断房本质是 best-effort 的收尾——LiveKit 慢/短暂故障时同步 await 每发
+    ~3s（2026-09-10 实证 7 连发各 3012-3023ms），期间 leave 无防抖连点放大风暴。
+    fire-and-forget 持强引用防事件循环弱引用 GC 中途回收。"""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:  # pragma: no cover - 无事件循环的调用上下文
+        return
+    t = loop.create_task(_disconnect_livekit_room(room_name))
+    _disconnect_room_tasks.add(t)
+    t.add_done_callback(_disconnect_room_tasks.discard)
+
+
 @app.post("/api/calls/{call_id}/hangup")
 async def hangup(call_id: str) -> dict:
     call = _repo().update_call(call_id, status=CallStatus.ENDED.value)
     if not call:
         raise HTTPException(404, "call not found")
     # 真正断开 LiveKit 房间：主管台/任意端挂断后 agent 与监听端都会被服务端踢出，
-    # agent 侧 on_close 触发结算。房间不存在/服务不可用时不阻塞（DB 已置 ENDED）。
-    await _disconnect_livekit_room(call_id)
+    # agent 侧 on_close 触发结算。房间不存在/服务不可用时不阻塞（DB 已置 ENDED）；
+    # 后台执行（2026-09-11 同传审计 P0）：挂断响应不再等 LiveKit。
+    _disconnect_room_background(call_id)
     _audit("call.hangup", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""), call_id=call_id)
     return {"call_id": call_id, "status": call["status"], "disconnected": True}
 
@@ -863,6 +959,16 @@ def add_turn(
     provider: str = "",
     latency_ms: int = 0,
     language: str = "",
+    # 分析账本列（spec 2026-09-10 §6.1）：可选带缺省，旧调用方（只报
+    # role/transcript）零破坏；org/线别/说话人/生成源/话术步/时间轴/perceived_ms。
+    org_id: str = "",
+    line: str = "a",
+    speaker: str = "",
+    gen: str = "",
+    template_step: int = 0,
+    started_ms: int = 0,
+    ended_ms: int = 0,
+    perceived_ms: int = 0,
 ) -> dict:
     # turn_id 用 uuid 而非 len(get_turns()) 序号：并发写时序号竞态产生重复
     # turn_id → 主键冲突 → IntegrityError 幂等分支吞成 200（静默丢数据，QA
@@ -879,6 +985,14 @@ def add_turn(
         provider=provider,
         latency_ms=latency_ms,
         language=language,
+        org_id=org_id,
+        line=line,
+        speaker=speaker,
+        gen=gen,
+        template_step=template_step,
+        started_ms=started_ms,
+        ended_ms=ended_ms,
+        perceived_ms=perceived_ms,
     )
     return _repo().create_turn(turn)
 
@@ -930,6 +1044,39 @@ def mark_whatsapp_handled(call_id: str, req: WhatsAppHandledRequest) -> dict:
     _audit("call.whatsapp_handled", subject_type="call", subject_id=call_id,
            account_id=call.get("account_id", "acc-001"), detail={"handled": req.handled})
     return updated
+
+
+class NodeRegisterRequest(BaseModel):
+    name: str = ""
+    platform: str = ""
+    org_id: str = ""
+    version: str = ""
+
+
+class NodeHeartbeatRequest(BaseModel):
+    metrics: dict = {}
+
+
+@app.post("/api/nodes/register")
+def register_node(req: NodeRegisterRequest) -> dict:
+    """节点注册（spec §4.2）：签发 node_token，明文只在本次响应出现一次。"""
+    node_id, token = _node_store().register(
+        name=req.name, platform=req.platform, org_id=req.org_id, version=req.version
+    )
+    return {"node_id": node_id, "node_token": token, "heartbeat_interval_s": HEARTBEAT_INTERVAL_S}
+
+
+@app.post("/api/nodes/heartbeat")
+def node_heartbeat(req: NodeHeartbeatRequest, authorization: str = Header(default="")) -> dict:
+    token = authorization.removeprefix("Bearer ").strip()
+    if not token or not _node_store().heartbeat(token, req.metrics):
+        raise HTTPException(401, "unknown node token")
+    return {"ok": True, "commands": []}
+
+
+@app.get("/api/nodes")
+def list_nodes() -> list[dict]:
+    return _node_store().list_nodes()
 
 
 @app.get("/api/calls/{call_id}/settlement")
@@ -1321,14 +1468,19 @@ def hit_qa_entry(entry_id: str) -> dict:
 
 
 @app.get("/api/reports/qa-pairs")
-def report_qa_pairs(min_calls: int = 5, account_id: str = "acc-001", limit: int = 100) -> list[dict]:
+def report_qa_pairs(
+    min_calls: int = 5, account_id: str = "acc-001", limit: int = 100, exclude_test: bool = True
+) -> list[dict]:
     """高频问答对挖掘报告:用户轮→紧随 assistant 轮,归一化聚类按出现通话数排序。
 
     与运行时匹配共用 bok_voice_core.qa_text.normalize_question,报告里的问句
     到运行时才对得上。--apply 入库走 POST /api/qa-entries(source=mined),
     音频物化统一走 agent 侧 bok.py tts-pregen。
+    exclude_test 默认滤掉测试对象(E2E/压测前缀族)的通话——真实采集时代的
+    报告要干净(2026-09-09 实测 top20 高频里 16 条是测试 fixture 音频);
+    显式传 false 看全量。
     """
-    conversations = _repo().iter_call_conversations(account_id)
+    conversations = _repo().iter_call_conversations(account_id, exclude_test_objects=exclude_test)
     return mine_qa_pairs(conversations, min_calls=min_calls, limit=limit)
 
 
@@ -1346,25 +1498,42 @@ def get_persona(persona_id: str) -> dict:
 
 
 @app.post("/api/personas")
-def create_persona(req: PersonaRequest) -> dict:
+def create_persona(req: PersonaRequest, request: Request) -> dict:
     persona = _repo().create_persona(req.model_dump())
     _audit("persona.create", subject_type="persona", subject_id=persona.get("id", ""), account_id=persona.get("account_id", ""), detail={"name": persona.get("name", "")})
-    return persona
+    # 新人设上线:无罐头即提醒+自动全量物化(W3,响应 tts_pregen=提醒面)。
+    # 装饰浅拷贝——内存 repo 返回活引用,直接写会把一次性状态键落进存储。
+    out = dict(persona)
+    out["tts_pregen"] = persona_pregen_status(
+        out, base_url=str(request.base_url).rstrip("/")
+    )
+    return out
 
 
 @app.put("/api/personas/{persona_id}")
-def update_persona(persona_id: str, req: UpdatePersonaRequest) -> dict:
-    existing = _repo().get_persona(persona_id)
+def update_persona(persona_id: str, req: UpdatePersonaRequest, request: Request) -> dict:
+    # 冻结更新前快照(内存 repo 返回活引用,update 原地改会令 existing==persona,
+    # 音色变化判定恒 False);audit 与物化触发都以此为准。
+    existing = dict(_repo().get_persona(persona_id) or {})
     persona = _repo().update_persona(persona_id, req.model_dump())
     if not persona:
         raise HTTPException(404, "persona not found")
     _audit("persona.update", subject_type="persona", subject_id=persona_id, account_id=(existing or {}).get("account_id", ""), detail={"name": persona.get("name", "")})
-    return persona
+    out = dict(persona)
+    out["tts_pregen"] = persona_pregen_status(
+        out, base_url=str(request.base_url).rstrip("/"), existing=existing
+    )
+    return out
 
 
 @app.put("/api/personas")
-def upsert_persona(req: PersonaRequest) -> dict:
-    return _repo().create_persona(req.model_dump())
+def upsert_persona(req: PersonaRequest, request: Request) -> dict:
+    persona = _repo().create_persona(req.model_dump())
+    out = dict(persona)
+    out["tts_pregen"] = persona_pregen_status(
+        out, base_url=str(request.base_url).rstrip("/")
+    )
+    return out
 
 
 @app.delete("/api/personas/{persona_id}")
@@ -1544,6 +1713,16 @@ async def livekit_webhook(request: Request) -> dict:
     # 双端可重开);me-/other- 前缀与 agent-* 天然不重叠。
     if identity != "bok-voice" and not identity.startswith("agent-"):
         return {"handled": False, "reason": "not A-line agent"}
+    # kind=interpret 房的 agent-<jobid> 离房 ≠ A 线崩溃——B 线 interp worker 的 job
+    # identity 同为 agent-*，挂断踢出时一样触发本 webhook；误判会往同传房补派
+    # bok-voice 形成 5min 周期殭尸循环（2026-09-10 实证 redispatch 至 1 小时）。
+    # B 线同传房短命、双端可重开，崩溃不自动补位。
+    try:
+        _wcall = _repo().get_call(room_name) or {}
+    except Exception:
+        _wcall = {}
+    if str(_wcall.get("kind") or "") == "interpret":
+        return {"handled": False, "reason": "interpret room"}
 
     async def _redispatch() -> None:
         # 防复活(F1):挂断链是 update_call(ENDED) → delete_room 踢出 agent →
@@ -1801,6 +1980,37 @@ def supervisor_join(call_id: str) -> dict:
     }
 
 
+@app.post("/api/web_logs")
+async def web_logs(payload: dict) -> dict:
+    """web 客户端(浏览器侧)关键事件落盘——同传控制台的设备枚举/自动分配/sink 路由/
+    麦克风开关等决策只发生在浏览器里,服务端日志全然看不见(2026-09-12 同传输出
+    路由排障多轮全靠排除法实证)。JSON 行追加 logs/web-client.log,与 agent.log 同
+    目录;行限长防刷爆。上报失败静默(诊断通道永不影响功能)。"""
+    from datetime import datetime, timezone
+
+    event = str(payload.get("event") or "")[:80]
+    if not event:
+        return {"ok": False}
+    call_id = str(payload.get("call_id") or "")[:64]
+    try:
+        data = json.dumps(payload.get("data"), ensure_ascii=False)[:2000]
+    except Exception:
+        data = "??"
+    line = json.dumps(
+        {"ts": datetime.now(timezone.utc).isoformat(), "call_id": call_id, "event": event, "data": data},
+        ensure_ascii=False,
+    )
+    try:
+        log_dir = Path(os.environ.get("BOK_APP_DATA", str(Path.home() / "Library" / "Application Support" / "BokVoice"))) / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with (log_dir / "web-client.log").open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as exc:  # pragma: no cover - 诊断通道失败不阻功能
+        print(f"[web_logs] write failed: {exc!r}", flush=True)
+        return {"ok": False}
+    return {"ok": True}
+
+
 @app.post("/api/supervisor/{call_id}/pause-agent")
 def pause_agent(call_id: str) -> dict:
     call = _repo().update_call(call_id, status=CallStatus.PAUSED.value)
@@ -1834,7 +2044,7 @@ async def transfer(call_id: str) -> dict:
     call = _repo().update_call(call_id, escalated_to_human=True, disposition="transferred", status=CallStatus.ENDED.value)
     if not call:
         raise HTTPException(404, "call not found")
-    await _disconnect_livekit_room(call_id)
+    _disconnect_room_background(call_id)
     _audit("supervisor.transfer", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""), call_id=call_id)
     return {"call_id": call_id, "action": "transfer", "status": call["status"], "disconnected": True}
 
@@ -1851,6 +2061,6 @@ async def supervisor_end(call_id: str, disposition: str = "declined") -> dict:
     call = _repo().update_call(call_id, escalated_to_human=False, disposition=disposition, status=CallStatus.ENDED.value)
     if not call:
         raise HTTPException(404, "call not found")
-    await _disconnect_livekit_room(call_id)
+    _disconnect_room_background(call_id)
     _audit("supervisor.end", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""), call_id=call_id, detail={"disposition": disposition})
     return {"call_id": call_id, "action": "end", "status": call["status"], "disconnected": True}

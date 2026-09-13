@@ -63,9 +63,14 @@ def normalize_cache_text(text: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
-def cache_key(text: str, *, voice_id: str, model: str, sample_rate: int) -> str:
+def cache_key(text: str, *, voice_id: str, model: str, sample_rate: int, speed: float = 1.0) -> str:
     norm = normalize_cache_text(text)
     raw = f"{norm}\x1f{voice_id}\x1f{model}\x1f{int(sample_rate)}"
+    # 语速维度(W2,2026-09-11):speed≠1.0 才进 key——存量 1.0 条目(en/旧 zh)键
+    # 不变零失效继续命中;zh/粤 1.2 产生新键自然触发重物化(速度烧在音频里,
+    # 同文本不同速度必须不同条目)。
+    if abs(float(speed) - 1.0) > 1e-6:
+        raw = f"{raw}\x1f{float(speed):g}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
@@ -122,8 +127,10 @@ class TtsAudioCache:
         env_max = os.environ.get(_MAX_ENTRIES_ENV, "").strip()
         self.max_entries = int(env_max) if env_max else (max_entries or _DEFAULT_MAX_ENTRIES)
 
-    def key_for(self, text: str, *, voice: str, model: str) -> str:
-        return cache_key(text, voice_id=voice or "", model=model or "", sample_rate=self.sample_rate)
+    def key_for(self, text: str, *, voice: str, model: str, speed: float = 1.0) -> str:
+        return cache_key(
+            text, voice_id=voice or "", model=model or "", sample_rate=self.sample_rate, speed=speed
+        )
 
     def _pcm_path(self, key: str) -> Path:
         return self.root / f"{key}.pcm"
@@ -145,14 +152,27 @@ class TtsAudioCache:
         except OSError:
             return None
 
-    def lookup(self, text: str, *, voice: str, model: str) -> bytes | None:
-        return self.get(self.key_for(text, voice=voice, model=model))
+    def lookup(self, text: str, *, voice: str, model: str, speed: float = 1.0) -> bytes | None:
+        return self.get(self.key_for(text, voice=voice, model=model, speed=speed))
 
-    def store(self, key: str, pcm: bytes, *, text: str, voice: str, model: str) -> bool:
-        """原子写入+LRU 淘汰;任何失败静默 False(缓存永不影响播放)。"""
+    def store(
+        self, key: str, pcm: bytes, *, text: str, voice: str, model: str, pin: bool = False,
+        speed: float = 1.0,
+    ) -> bool:
+        """原子写入+LRU 淘汰;任何失败静默 False(缓存永不影响播放)。
+
+        pin=True=罐头集(垫话/QA 应答/静态直念线,pregen 物化)——永不逐出
+        (2026-09-10:逐对象开场白这类无界动态条目会把罐头挤出 LRU,音色一致性
+        静默破功,垫话回落固定资产音)。无界条目(逐对象开场白)保持不钉。
+        """
         if not pcm:
             return False
         pcm = _trim_lead_silence_safe(pcm, self.sample_rate)
+        # 保钉(双写者竞态):运行时 tee 与 pregen 子进程共用 key 空间,运行时
+        # 合成在途时 pregen 先落钉、tee 迟到 _done 重写 meta——未钉写回不得
+        # 洗掉已有 pinned(否则罐头静默退回可逐出,W3 保存→来电窗口恰放大)。
+        if not pin and self._is_pinned(key):
+            pin = True
         try:
             self.root.mkdir(parents=True, exist_ok=True)
             tmp = self._pcm_path(key).with_suffix(".tmp")
@@ -163,9 +183,12 @@ class TtsAudioCache:
                 "voice": voice or "",
                 "model": model or "",
                 "sample_rate": self.sample_rate,
+                "speed": float(speed),
                 "bytes": len(pcm),
                 "stored_at": time.time(),
             }
+            if pin:
+                meta["pinned"] = True
             mtmp = self._meta_path(key).with_suffix(".mtmp")
             mtmp.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
             os.replace(mtmp, self._meta_path(key))
@@ -174,7 +197,14 @@ class TtsAudioCache:
         except OSError:
             return False
 
+    def _is_pinned(self, key: str) -> bool:
+        try:
+            return bool(json.loads(self._meta_path(key).read_text(encoding="utf-8")).get("pinned"))
+        except (OSError, ValueError):
+            return False
+
     def _evict(self) -> None:
+        """淘汰最旧的未钉条目(只读候选区 meta,通常 0-1 个,不扫全库)。"""
         try:
             entries = sorted(
                 (p for p in self.root.glob("*.pcm")),
@@ -182,6 +212,8 @@ class TtsAudioCache:
                 reverse=True,
             )
             for stale in entries[self.max_entries :]:
+                if self._is_pinned(stale.stem):
+                    continue
                 stale.unlink(missing_ok=True)
                 self._meta_path(stale.stem).unlink(missing_ok=True)
         except OSError:
@@ -266,17 +298,22 @@ class _StoreChunkedStream(tts.ChunkedStream):
 class _RelaySynthesizeStream(tts.SynthesizeStream):
     """stream() 透传:输入逐条转内芯,音频转发本 emitter(整轮单 segment,同 bidi 口径)。
 
-    首个音频帧触发 on_first_audio 回调一次(PR-2 垫话:真回复出声 → 取消垫话)。
+    首个音频帧触发 on_first_audio 回调一次(PR-2 垫话),随后向 hold_provider
+    询问扣压时长——播放排序契约(2026-09-10):在播垫话必须播完,垫话→gap→回复,
+    不再掐垫话;帧在本流内缓冲到点再放,内芯 iterator 惰性天然背压。
     """
 
-    def __init__(self, *, tts_: tts.TTS, inner: tts.SynthesizeStream, on_first_audio) -> None:
+    def __init__(self, *, tts_: tts.TTS, inner: tts.SynthesizeStream, on_first_audio, hold_provider=None) -> None:
         super().__init__(tts=tts_, conn_options=APIConnectOptions(max_retry=0))
         self._inner = inner
         self._on_first_audio = on_first_audio
+        self._hold_provider = hold_provider
         self._fired = False
 
-    async def _metrics_monitor_task(self, event_aiter) -> None:
-        pass  # 内芯自带 metrics(经事件转发),避免双份
+    # ⚠️ 勿覆写 _metrics_monitor_task:基类监视器在转发帧上算 ttfb/audio 时长并
+    # emit tts_metrics。曾 pass 掉(垫话 PR,注释误以为内芯會转发,实际 session 只
+    # 监听包装层)→ PERCEIVED_MS 北极星缺 tts 段、turns 账本 perceived_ms 哑火
+    # (2026-09-10 实测恢复)。
 
     async def _run(self, output_emitter) -> None:
         output_emitter.initialize(
@@ -306,6 +343,18 @@ class _RelaySynthesizeStream(tts.SynthesizeStream):
                             self._on_first_audio()
                         except Exception:  # noqa: BLE001 - 回调失败唔阻播放
                             pass
+                        if self._hold_provider is not None:
+                            try:
+                                hold = float(self._hold_provider() or 0.0)
+                            except Exception:  # noqa: BLE001 - 询时失败=不扣压
+                                hold = 0.0
+                            if hold > 0:
+                                print(
+                                    f"BOK_FILLER hold reply {hold * 1000:.0f}ms"
+                                    " (垫话播完+gap 后衔接回复)",
+                                    flush=True,
+                                )
+                                await asyncio.sleep(hold)
                     data = ev.frame.data
                     chunk = data.tobytes() if isinstance(data, memoryview) else bytes(data)
                     output_emitter.push(chunk)
@@ -338,6 +387,7 @@ class CachedTTS(tts.TTS):
         cache: TtsAudioCache,
         voice_provider=None,
         model_provider=None,
+        speed_provider=None,
     ) -> None:
         caps = wrapped.capabilities
         super().__init__(
@@ -351,7 +401,11 @@ class CachedTTS(tts.TTS):
         self._cache = cache
         self._voice_provider = voice_provider or (lambda: "")
         self._model_provider = model_provider or (lambda: "")
+        # 语速维度(W2):内芯语言档语速(zh/粤 1.2)进缓存 key——同文本不同速度
+        # 必须不同条目,速度烧在音频里。缺省 1.0=旧键语义零变化。
+        self._speed_provider = speed_provider or (lambda: 1.0)
         self._first_audio_cbs: list = []
+        self._hold_provider = None  # 垫话扣压(FillerDirector.hold_if_playing),agent 侧注入
         wrapped.on("metrics_collected", self._forward_metric)
 
     @property
@@ -374,8 +428,20 @@ class CachedTTS(tts.TTS):
         except Exception:
             return ""
 
+    def resolved_speed(self) -> float:
+        """当前语言档语速(zh/粤 1.2)——缓存 key 速度维度(QA 快路/垫话共用取值口)。"""
+        try:
+            return float(self._speed_provider() or 1.0)
+        except Exception:
+            return 1.0
+
     def add_first_audio_listener(self, cb) -> None:
         self._first_audio_cbs.append(cb)
+
+    def set_hold_provider(self, cb) -> None:
+        """注入垫话扣压询问(FillerDirector.hold_if_playing)——回复首帧到达时
+        若垫话在播,返回「垫话剩余+gap」秒数,帧缓冲到点再放(播放排序契约)。"""
+        self._hold_provider = cb
 
     def _fire_first_audio(self) -> None:
         for cb in list(self._first_audio_cbs):
@@ -403,8 +469,9 @@ class CachedTTS(tts.TTS):
     def synthesize(self, text: str, *, conn_options=None) -> tts.ChunkedStream:
         text = str(text or "")
         conn_options = self._norm_conn_options(conn_options)
+        speed = self.resolved_speed()
         key = self._cache.key_for(
-            text, voice=self.resolved_voice(), model=self.resolved_model()
+            text, voice=self.resolved_voice(), model=self.resolved_model(), speed=speed
         )
         pcm = self._cache.get(key)
         if pcm is not None:
@@ -417,14 +484,19 @@ class CachedTTS(tts.TTS):
         inner = self._wrapped.synthesize(text, conn_options=conn_options)
 
         def _done(out: bytes) -> None:
-            ok = self._cache.store(key, out, text=text, voice=voice, model=self.resolved_model())
+            ok = self._cache.store(
+                key, out, text=text, voice=voice, model=self.resolved_model(), speed=speed
+            )
             print(f"TTS_CACHE stored=1 ok={int(ok)} key={key[:10]} bytes={len(out)}", flush=True)
 
         return _StoreChunkedStream(tts_=self, inner=inner, on_done=_done)
 
     def stream(self, *, conn_options=None) -> tts.SynthesizeStream:
         inner = self._wrapped.stream(conn_options=self._norm_conn_options(conn_options))
-        return _RelaySynthesizeStream(tts_=self, inner=inner, on_first_audio=self._fire_first_audio)
+        return _RelaySynthesizeStream(
+            tts_=self, inner=inner, on_first_audio=self._fire_first_audio,
+            hold_provider=self._hold_provider,
+        )
 
     def prewarm(self) -> None:
         self._wrapped.prewarm()

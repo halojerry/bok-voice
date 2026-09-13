@@ -8,6 +8,7 @@ import time
 from typing import Optional
 
 from bok_voice_core.policies import ProviderRegistry, ProviderState, select_session_manifest
+from bok_voice_core.testdata import is_test_object_name as _is_test_object_name
 from bok_voice_core.types import CallMode
 
 from .plugins.context import ContextInjector
@@ -16,7 +17,7 @@ from .plugins.settlement import SettlementTrigger
 from .providers.registry import build_provider_registry
 from .control_plane import ControlPlaneClient
 from .fillers import FillerDirector
-from .qa_gate import QaIndex, qa_exclude_reason as _qa_exclude_reason
+from .qa_gate import QaIndex, qa_exclude_reason as _qa_exclude_reason, qa_fastpath_enabled
 from .tts_cache import CachedTTS, TtsAudioCache, default_cache_dir, frames_aiter, pcm_to_frames, tts_cache_enabled
 # 模块级引 flow(纯 stdlib 依赖,无环):_wa_numberish/_wa_number_line 等模块级
 # helper 用;entrypoint 内的 function-scoped import 属历史样式,不冲突。
@@ -310,7 +311,10 @@ async def _say_script(session, tts_provider, cache, text: str):
     try:
         voice = getattr(tts_provider, "resolved_voice", lambda: "")()
         model = getattr(tts_provider, "resolved_model", lambda: "")()
-        pcm = cache.lookup(text, voice=voice, model=model)
+        # 语速维度(2026-09-11 call-a2705ed2 实证「开场白慢半档」):直念线查找必须
+        # 带运行时语速——不带则命中旧 1.0 条目,开场白/心跳/收线与 1.2 回复不同速。
+        speed = float(getattr(tts_provider, "resolved_speed", lambda: 1.0)())
+        pcm = cache.lookup(text, voice=voice, model=model, speed=speed)
     except Exception:  # noqa: BLE001 - 缓存读取失败当未命中
         pcm = None
     if pcm is not None:
@@ -355,16 +359,12 @@ def _nudge_should_fire(now: float, last_reply_ts: float, last_user_ts: float, nu
     return True
 
 
-# 测试对象名前缀族(与 tools/bok.py clean-testdata 同一套命名约定):命中则沉默
+# 测试对象名前缀族判定已抽单源 bok_voice_core.testdata(文件头 import 为
+# `_is_test_object_name` 别名,CP qa-pairs 挖掘过滤共用同一份):命中则沉默
 # 心跳整条关闭。E2E/压测脚本的 greeting→用户语音间隙(greeting 静默判定+脚本侧
 # 语音合成)必然跨过 8s 心跳线,心跳 7-9s 音频会越过脚本的 agent_audio.clear()
 # 落进回复断言窗(zh 腿 ASR 读回污染,call-6ba7c47c 实证),farewell+12s 自动收线
 # 也会错挂到慢提交的测试轮上。BOK_E2E_NUDGE_IMMUNE=0 可关豁免。
-_TEST_OBJECT_NAME_RE = re.compile(r"^(E2E-|soak\d*-?|并发|LOAD-|边角-|多轮-|probe)")
-
-
-def _is_test_object_name(name: str) -> bool:
-    return bool(_TEST_OBJECT_NAME_RE.match(name or ""))
 
 
 def _effective_nudge_max(env_value: str, object_name: str) -> int:
@@ -406,6 +406,37 @@ def _wa_numberish(text: str) -> bool:
     digits = sum(ch.isdigit() for ch in norm)
     rest = re.sub(r"[\s\d。，,．.！!？?～~—\-、；;：:'\"()（）]", "", _WA_CHANNEL_WORD_RE.sub("", norm))
     return digits >= 1 and len(rest) <= 6
+
+
+def _wa_accum_merge(stashed: str, incoming: str) -> str:
+    """累积合并:「结合上下文」的正确姿势(call-5f8bef6b 实证)。
+
+    第二段 FINAL 常是全窗重解(自带前文头)——盲拼 stash+新段会头重复,
+    「oneSeven」类粘连吃掉数字、numberish 判假提前放行、captured 永不触发。
+    归一前缀命中(暂存是新段的前缀,或新段是暂存的前缀)→ 用长的一方整句替换;
+    真续段 → 带「，」分隔符拼接(裸拼会毁灭词边界:「five one」+「two zero」
+    →「onetwo」不再匹配数字词表)。"""
+    if not stashed:
+        return incoming
+    sn = _digit_normalize(stashed)
+    un = _digit_normalize(incoming)
+    if sn and un:
+        if un.startswith(sn):
+            return incoming
+        if sn.startswith(un):
+            return stashed
+    return f"{stashed}，{incoming}"
+
+
+def _defer_ack_line(lang: str) -> str:
+    """DEFER 短应承(session.say 脚本直念,零 TTFT/零前缀断裂):客户要自己去查/
+    稍后再讲时的一句应承。三语骨架,风格同 _nudge_line;万能话术原则——不含
+    动作承诺,任何拖延语境都不穿帮。"""
+    if lang == "cantonese":
+        return "好嘅，唔急，您慢慢睇，我喺電話呢邊等您。"
+    if lang == "en":
+        return "Sure, no rush — take your time, I'll stay on the line."
+    return "好的，不着急，您慢慢看，我在电话这边等您。"
 
 
 def _wa_number_line(lang: str, num: str) -> str:
@@ -527,6 +558,7 @@ def _hotword_echo_guard_enabled() -> bool:
 
 # 幻听判定单一实现喺 livekit_plugins(STT 源头闸与 hook 双层共用,防漂移)。
 from .providers.livekit_plugins import _is_hotword_vocab_echo as _is_hotword_echo  # noqa: E402
+from .providers.livekit_plugins import _strip_vocab_echo_tail, _vocab_echo_guard  # noqa: E402
 
 
 def _is_echo_self_heard(user_text: str, last_reply: str, agent_speaking: bool) -> bool:
@@ -622,8 +654,10 @@ def _resolve_tts_voice_mode(tts_cfg: dict) -> str:
 # 此前 zh/en 也填粤语主播，普通话语料被粤语腔念(广普),用户判为"说粤语"。三个 id
 # 均经 /api/tts/preview 实测 200。音色 ID 是不透明标识符(MiniMax 云端枚举,术语门禁
 # 白名单范畴),唔属语言字段。
+# zh 默认 = 用户克隆音色 moss_audio_*(2026-09-12 拍板,preview 200 实测)——垫话资产
+# 层(gen_filler_assets)/罐头物化(pregen)与本表同源,换默认须同步重生成 zh 池资产。
 _MINIMAX_DEFAULT_VOICES: dict[str, str] = {
-    "zh": "Chinese_wenrounvxing",
+    "zh": "moss_audio_aaa1346a-7ce7-11f0-8e61-2e6e3c7ee85d",
     "cantonese": "Cantonese_crisp_news_anchor_vv2",
     "en": "English_magnetic_voiced_man",
 }
@@ -632,16 +666,19 @@ _MINIMAX_DEFAULT_VOICES: dict[str, str] = {
 def _preemptive_generation_opts() -> dict:
     """抢跑（preemptive generation）预算，env 逐项可回退。
 
-    max_retries 默认 3（P1 churn 收敛，旧 8 会把误判轮的 prefill 白烧放大）：
-    每个 PREFLIGHT 事件 count+1（agent_activity.py:2392），烧穿后 FINAL 到达只
-    cancel 不重建 → commit 从零生成、新请求还排在被 cancel 的 prefill 后面
-    （实测 +0.2-0.7s）。标记轮暂停见 entrypoint 的 _preemptive_gate
-    （PREEMPTIVE_DISABLE_ON_MARKER）。
+    **默认关（2026-09-10 抢跑防抖，PREEMPTIVE_GENERATION=1 回旧行为）**：
+    实机 843 次失效 / 0 次命中（agent.log 全量统计）——命中在本仓 STT 架构下
+    结构性不可能：插件 PREFLIGHT 只发稳定前缀（防幻觉尾巴），提交转写是全句
+    FINAL，框架 `_transcripts_equivalent`（逐词相等）恒假；且 max_retries 烧穿
+    后新 PREFLIGHT 先 cancel 旧快照再 bail → commit 时连比较都不跑。每次失效
+    的投机请求被 mlx「无断连中止」解码到完才放锁，解码尾巴（~1-2s GPU）挤占
+    真请求队列。替代=PrefillSpeculator out-of-band prefill 预热（不出声、
+    max_tokens=1、只暖 KV），见 prefill_speculator.py。
     """
     return {
         # 官方源码证实(1.7.1 audio_recognition):FINAL_TRANSCRIPT 一到即触发
         # 抢跑,LLM prefill 与端点判定窗口并行——唔使等 interim。默认开。
-        "enabled": os.environ.get("PREEMPTIVE_GENERATION", "1") == "1",
+        "enabled": os.environ.get("PREEMPTIVE_GENERATION", "0") == "1",
         # preemptive_tts 默认关:MiniMax 云 TTS 按字计费,误判轮次唔好白烧;
         # dev 可 PREEMPTIVE_TTS=1 实验首声再提前。
         "preemptive_tts": os.environ.get("PREEMPTIVE_TTS", "0") == "1",
@@ -756,6 +793,68 @@ def _format_llm_metrics(m) -> str:
         f"LLM_TTFT_MS {ttft * 1000:.0f} (official) "
         f"cached={cached}/{prompt} prompt={prompt} "
         f"gen={getattr(m, 'completion_tokens', 0)} tps={tps:.1f}"
+    )
+
+
+# ---- QA 快路每通汇总打点(2026-09-10 task-9) ----
+# QA 块在 entrypoint 多层嵌套闭包里,模块级计数 dict 是唯一可测路径;job 进程
+# 一通一命,每通收尾 _close 打一行 QA_FASTPATH_SUMMARY 后清零(清零属防御)。
+QA_COUNTERS: dict[str, int] = {}
+
+
+def _qa_bump(key: str) -> None:
+    """计数自增,try/except 包裹——打点失败绝不毒化通话。"""
+    try:
+        QA_COUNTERS[key] = QA_COUNTERS.get(key, 0) + 1
+    except Exception:  # noqa: BLE001 - 打点失败零影响
+        pass
+
+
+# bypass reason 字符串(qa_gate.qa_exclude_reason 返回值)→ 汇总列键映射,就地定死:
+#   digits/refuse/verdict/advanced 直映同名列;
+#   wa_signal/wa_step_locked 并入 bypass_wa(同为 WhatsApp 相关旁路,汇总只留一格);
+#   closing 不计列(汇总列固定无 closing 格——收线/流程完结轮快路本就无从触发,
+#   常态背景噪声,不并入其他列防列语义漂移;.get 未命中即跳过)。
+_QA_BYPASS_KEY = {
+    "digits": "bypass_digits",
+    "refuse": "bypass_refuse",
+    "wa_signal": "bypass_wa",
+    "wa_step_locked": "bypass_wa",
+    "advanced": "bypass_advanced",
+    "verdict": "bypass_verdict",
+}
+
+
+def _qa_bump_bypass(reason: str) -> None:
+    key = _QA_BYPASS_KEY.get(str(reason or ""))
+    if key:
+        _qa_bump(key)
+
+
+def format_qa_summary(counters: dict) -> str:
+    """渲染 QA_FASTPATH_SUMMARY 单行(PERF 风格,列固定、零值也打,便于日志聚合)。
+
+    纯函数:只 .get 读,绝不 mutate counters,也不清零(清零由收尾方管)。
+    hit=命中条目的轮(hit=1 出声轮 + no_audio 轮之和);no_audio=命中但缓存无
+    应答音频;hit_audio=hit-no_audio 在此求差(真出声命中);match0=匹配零命中
+    (含匹配异常当未命中);bypass *=四道闸旁路;disabled=快路整体关闭(env 关/
+    无缓存/空表/装配失败,每通至多一次)。
+    """
+
+    def _n(key: str) -> int:
+        try:
+            return int(counters.get(key, 0))
+        except Exception:  # noqa: BLE001 - 脏值当 0
+            return 0
+
+    hit = _n("hit")
+    no_audio = _n("no_audio")
+    return (
+        f"QA_FASTPATH_SUMMARY hit={hit} hit_audio={hit - no_audio} no_audio={no_audio} "
+        f"match0={_n('match0')} bypass digits={_n('bypass_digits')} "
+        f"refuse={_n('bypass_refuse')} wa={_n('bypass_wa')} "
+        f"advanced={_n('bypass_advanced')} verdict={_n('bypass_verdict')} "
+        f"disabled={_n('disabled')}"
     )
 
 
@@ -1044,6 +1143,12 @@ async def entrypoint(ctx):
     from livekit.agents import Agent, AgentSession, StopResponse, TurnHandlingOptions, inference, stt
     from .providers.livekit_plugins import ContextState, DeepSeekLLM, ExprAwareLLM, lecture_guard
 
+    # 诊断探针须在 job 进程内安装:livekit job 由 JobExecutorProc 子进程执行,
+    # run_agent()/worker 主进程的安装对 serving 进程无效。
+    from .preemptive_debug import install_preemptive_debug
+
+    install_preemptive_debug()
+
     room_name = ctx.room.name
     # call_id 来自显式分发 metadata(CP /api/token 挂 RoomAgentDispatch 时写入);
     # 房间名与 call_id 全栈同约定,兜底相等。AGENT_CALL_ID env 旁路已废除。
@@ -1100,7 +1205,18 @@ async def entrypoint(ctx):
 
     # 对话流程控制器:载入模板分步 + 对象变量;由它按轮注入"当前步",逐步推进。
     from .flow import FlowController, facts_line
-    from .flow import CONFIRM, OBJECTION, QUESTION, REFUSE, UNCLEAR, detect_whatsapp_signal, extract_call_facts
+    from .flow import (
+        CONFIRM,
+        DEFER,
+        OBJECTION,
+        QUESTION,
+        REFUSE,
+        REPEAT,
+        UNCLEAR,
+        detect_whatsapp_signal,
+        extract_call_facts,
+        judge_confirm_advance_allowed,
+    )
     from .flow import _digit_normalize, _looks_like_whatsapp_step, _WHATSAPP_DECLINE, digits_to_cantonese
     from .flow import wa_confirm_advance_allowed
 
@@ -1216,6 +1332,7 @@ async def entrypoint(ctx):
             else:
                 print(f"[whatsapp] accumulate flush no-number, prompt continue (call {room_name})", flush=True)
             try:
+                _turn_origin["gen"] = "script"  # WA 号码复述=脚本直念
                 await _say_script(session, tts_provider, _tts_cache, _wa_number_line(language_state.lang, num))
             except Exception as exc:  # pragma: no cover - 会话已关等
                 print(f"[whatsapp] accumulate flush say failed: {exc!r}", flush=True)
@@ -1272,6 +1389,9 @@ async def entrypoint(ctx):
     _hotword_ctx = asr_hotword_context(
         asr_pin_lang, object_card, extra_hotwords=str((template or {}).get("hotwords") or "")
     )
+    # 词表回声事件账本(call-1043de7c):确认过一次剥尾/纯回声后,后续「词表单词残片」
+    # (回声衰落成只抄出词表首词「顺豐速運」)也按回声丢弃——首现孤词保留(真人可讲「微信」)。
+    _vocab_echo_seen: dict = {"on": False}
     if use_fake or asr_provider_name in ("fake", "fake_stt"):
         stt_provider = FakeLiveKitSTT()
     else:
@@ -1417,6 +1537,7 @@ async def entrypoint(ctx):
                 cache=_tts_cache,
                 voice_provider=_tts_primary.resolved_voice,
                 model_provider=_tts_primary.resolved_model,
+                speed_provider=getattr(_tts_primary, "resolved_speed", None),
             )
             print(f"[agent] tts audio cache on dir={_tts_cache.root} (call {room_name})", flush=True)
         except Exception as exc:  # noqa: BLE001 - 缓存装配失败零影响
@@ -1468,6 +1589,24 @@ async def entrypoint(ctx):
     # 确定性 mood 通道：无论模型是否遵守「吐 <expr> 标签」的指令，
     # ExprAwareLLM 都会在每次回复前强制前置标签，保证转录发布 lk.expression。
     _raw_llm = llm_provider  # 内芯留引用：会话首轮真实前缀预热（FIX prewarm）
+    # PrefillSpeculator（2026-09-10 抢跑防抖替代件）：框架抢跑默认关后,由本件
+    # 在说话中按稳定前缀做 out-of-band prefill 预热（max_tokens=1 只暖 KV 不出
+    # 声）。仅本地 OpenAI 兼容内芯有 prefix_prewarm;快照钩子抓逐字节请求。
+    _prefill_spec = None
+    if (
+        os.environ.get("BOK_PREFILL_SPEC", "1") == "1"
+        and hasattr(llm_provider, "prefix_prewarm")
+        and hasattr(llm_provider, "on_request_messages")
+    ):
+        from .prefill_speculator import PrefillSpeculator
+
+        _prefill_spec = PrefillSpeculator(llm_provider.prefix_prewarm, context_state)
+        llm_provider.on_request_messages = _prefill_spec.on_request_messages
+        # STT 稳定前缀挂点(Qwen3ASRLiveSTT 实例属性,流发射 PREFLIGHT 时回调);
+        # 非流式包装(StreamAdapter)无此通道,预热退化为无原料不接。
+        if isinstance(stt_provider, Qwen3ASRLiveSTT):
+            stt_provider.stable_prefix_listener = _prefill_spec.on_stable_prefix
+        print("[agent] prefill speculator on (BOK_PREFILL_SPEC=0 关)", flush=True)
     llm_provider = ContextAwareLLM(
         ExprAwareLLM(llm_provider, emotion_state=emotion_state),
         context_state=context_state,
@@ -1563,6 +1702,10 @@ async def entrypoint(ctx):
         llm=llm_provider,
         tts=tts_provider,
         turn_handling=turn_handling,
+        # 队列内连发呼吸感(2026-09-10 task-5):speech 队列相邻两条播报(如开场白
+        # say → 回复、心跳直念衔接)最小间隔 0.3s,防背靠背机械感;垫话走
+        # BackgroundAudioPlayer out-of-band 音轨不经此队列,零影响。B 线 interpret.py 不加。
+        min_consecutive_speech_delay=0.3,
         # 默认 ["filter_markdown","filter_emoji"] 会被整体替换，故带上内置两项；
         # 追加的自定义 transform 把 <expr/> 从进 TTS 的文本里剥掉（转录路径保留，框架发布 mood）。
         tts_text_transforms=[
@@ -1586,11 +1729,75 @@ async def entrypoint(ctx):
     except Exception as _exc:  # noqa: BLE001 - 无 livekit(测试/异常环境)垫话失效
         print(f"[agent] background audio unavailable, filler off: {_exc!r}", flush=True)
         _bg_audio = None
+    # 垫话补物化执行体(task-14a):消费整段合成流(音频丢弃)——CachedTTS 未命中
+    def _filler_caption(text: str) -> None:
+        # F4(2026-09-11 用户点名「垫话字幕要出来」):out-of-band 音轨不入 chat_ctx
+        # (零 LLM 污染),字幕走 lk.transcription 文本流——与框架 Agent 转写
+        # (RoomOutput._create_text_writer)同一机制同一属性,web 的
+        # AgentChatTranscript/useTranscriptions 聚合的正是这条通道
+        # (publish_transcription 旧数据包通道 web 收不到,2026-09-12 双端实测)。
+        async def _pub() -> None:
+            room = ctx.room
+            # 字幕归属=垫话出声的那条 out-of-band 轨(与 web 端
+            # lk.transcribed_track_id 归属解析同构)。
+            track_sid = ""
+            pub = getattr(_bg_audio, "publication", None)
+            trk = getattr(pub, "track", None)
+            if trk is not None and getattr(trk, "sid", ""):
+                track_sid = str(trk.sid)
+            attributes = {
+                "lk.transcription_final": "true",
+                "lk.transcription_segment_id": f"filler-{int(time.time() * 1000)}",
+            }
+            if track_sid:
+                attributes["lk.transcribed_track_id"] = track_sid
+            w = await room.local_participant.stream_text(
+                topic="lk.transcription",
+                attributes=attributes,
+            )
+            await w.write(text)
+            await w.aclose()
+            print(f"BOK_FILLER caption published sid={track_sid} text={text!r}", flush=True)
+
+        try:
+            _spawn_report(_pub())
+        except Exception:  # noqa: BLE001 - 字幕失败零影响垫话
+            pass
+
+    def _on_filler_played(line: str, dur_s: float) -> None:
+        # W3(2026-09-11):垫话 out-of-band 不进转写/字幕,turns 账本(gen=filler)
+        # 是它唯一的可见性出口;_spawn_report 登记挂断 flush(裸 create_task 会被
+        # job teardown 杀掉丢轮)。_spawn_report 在装配尾段定义,这里闭包晚绑定。
+        async def _report() -> None:
+            try:
+                now_ms = int((time.monotonic() - _t0) * 1000)
+                await cp.add_turn(
+                    call_id, "assistant", line,
+                    language=greet_lang, line="a", speaker="agent_ai", gen="filler",
+                    template_step=(flow_ctrl.current + 1) if flow_ctrl.has_steps else 0,
+                    started_ms=now_ms, ended_ms=now_ms + int(dur_s * 1000),
+                )
+            except Exception:  # noqa: BLE001 - 上报失败零影响垫话
+                pass
+
+        try:
+            _spawn_report(_report())
+        except Exception:  # noqa: BLE001
+            pass
+
+    # tee 完整消费成功自动落 tts_cache,下一通同人设即命中(FillerDirector 只认
+    # (text) 签名;不碰云 API 的 tee 归属与 _say_script 同一姿势)。voice 为空时
+    # CachedTTS.synthesize 不挂 tee(原样透传),fillers 侧 resolver 门已挡该情形。
+    async def _filler_backfill(text: str) -> None:
+        async with tts_provider.synthesize(text) as _stream:
+            async for _ev in _stream:
+                pass
+
     _filler = FillerDirector(
         session,
-        tts_provider,
-        _tts_cache,
-        lang_resolver=lambda: language_state.lang if language_state.lang in ("zh", "cantonese", "en") else "zh",
+        # 语言铁律(2026-09-10):垫话语言=装配时钉死的通话语言,构造时捕获,
+        # 绝不做运行时状态回退——en 通话曾因 lang 漂移落 zh 池放普通话垫话。
+        lang_resolver=lambda: greet_lang,
         player=_bg_audio,
         guards=lambda: (
             closed.is_set()
@@ -1598,14 +1805,32 @@ async def entrypoint(ctx):
             or flow_ctrl.closing
             or (flow_ctrl.has_steps and flow_ctrl.done)
         ),
+        # 人设音色双层(task-14a,铁律「全场同一音色」):cache 与 QA 快路同源
+        # (_tts_cache);resolver 取合成时点人设音色/模型档(CachedTTS 透传
+        # resolved_*;getattr 守卫同 QA 块姿势,未包缓存/内芯直连时降级空值=
+        # 纯资产);miss 播资产兜底后异步补物化。
+        cache=_tts_cache,
+        voice_model_resolver=lambda: (
+            getattr(tts_provider, "resolved_voice", lambda: "")(),
+            getattr(tts_provider, "resolved_model", lambda: "")(),
+        ),
+        speed_resolver=lambda: getattr(tts_provider, "resolved_speed", lambda: 1.0)(),
+        backfill=_filler_backfill,
+        report=_on_filler_played,
+        caption=_filler_caption,
     )
     if isinstance(tts_provider, CachedTTS):
         tts_provider.add_first_audio_listener(_filler.on_reply_first_audio)
+        # 播放排序契约(2026-09-10):垫话播完→gap→回复。回复首帧到达时若垫话
+        # 在播,流出口扣压(垫话剩余+gap),不再掐垫话。
+        tts_provider.set_hold_provider(_filler.hold_if_playing)
     # 快答库索引(PR-3):每通装配拉一次启用条目,变更下一通生效。拉取失败/
     # 空表 → 闸门整体惰性(零行为变化);命中还需应答音频已在本地缓存,
     # 未物化的条目自动视为未命中走 LLM(闸门绝不触发云合成)。
     _qa_index = None
-    if os.environ.get("BOK_QA_FASTPATH", "1") == "1" and _tts_cache is not None:
+    # disabled 打点(task-9):快路整体关闭(env 关/无 TTS 缓存/空表/装配失败)每通
+    # 记一次——放装配点不放轮级,轮级会重复计。
+    if qa_fastpath_enabled() and _tts_cache is not None:
         try:
             _qa_rows = await cp.list_qa_entries()
             if _qa_rows:
@@ -1613,8 +1838,13 @@ async def entrypoint(ctx):
 
                 _qa_index = QaIndex(_qa_rows)
                 print(f"[agent] qa fastpath on entries={len(_qa_rows)} (call {room_name})", flush=True)
+            else:
+                _qa_bump("disabled")  # 空表:闸门整体惰性,等同关闭
         except Exception as exc:  # noqa: BLE001 - 快答库不可用零影响
+            _qa_bump("disabled")
             print(f"[agent] qa fastpath load failed: {exc!r} (call {room_name})", flush=True)
+    else:
+        _qa_bump("disabled")  # env 关/无 TTS 缓存:无应答音频可播,快路整体关闭
     # 会话首轮真实前缀预热（LLM_PREFIX_PREWARM，默认 1）——触发点在开场白之后
     # （见下方 greeting 块），这里只定義任务体。
     if _prefix_prewarm_enabled() and isinstance(_raw_llm, MlxLlmLLM) and instructions:
@@ -1660,6 +1890,10 @@ async def entrypoint(ctx):
         _prefix_prewarm_armed = False
 
     # Persist turns + auto-settle on hangup (idempotent server side).
+    # 分析账本 gen 标记：脚本直念/QA 快路改写来源,LLM 轮消费后即重置(consume-once)。
+    # provider 允许顺带覆盖(QA 快路审计列 qa-fastpath,原 ④ 直报改由 item_added 收编)。
+    _turn_origin = {"gen": "llm", "provider": ""}
+
     def _on_conversation_item(ev):
         item = getattr(ev, "item", None)
         role = getattr(item, "role", None)
@@ -1675,9 +1909,86 @@ async def entrypoint(ctx):
         # 审计闭环(2026-09-07):每轮带上最近一次官方 metrics 的 LLM TTFT 作
         # latency_ms + 通话语言——之前 CP 侧丢弃,审计面无延迟档案可查。
         latency = int(_turn_metrics.get("llm_ttft_ms") or 0) if role == "assistant" else 0
-        asyncio.create_task(
-            cp.add_turn(call_id, role, _clean_transcript(text), latency_ms=latency, language=language_state.lang)
-        )
+        # 分析账本(P0 §6.1):线别/说话人/生成源/话术步/时间轴/perceived_ms。
+        now_ms = int((time.monotonic() - _t0) * 1000)
+        step = 0
+        try:
+            if flow_ctrl.has_steps:
+                step = int(flow_ctrl.current) + 1
+        except Exception:  # pragma: no cover - 步号拿不到只损分析列
+            step = 0
+        if role == "user":
+            # 词表回声隐藏面(2026-09-12 用户拍板「不影响通话就不要显示」):
+            # 流程/QA 早喺 turn 钩子用净文(那边 user_text 已替换),呢度只改
+            # 落库展示——剥尾净文入库;纯回声轮(整句=词表,客户根本冇讲过)
+            # 完全唔落库;回声确认后的词表孤词残片(「顺豐速運」)同样唔落库。
+            # 原文审计留 agent.log QWEN3_HOTWORD_ECHO_* 行。
+            if _hotword_ctx and _hotword_echo_guard_enabled():
+                _u_text, _vocab_echo_seen["on"] = _vocab_echo_guard(
+                    text, _hotword_ctx, echo_seen=_vocab_echo_seen["on"]
+                )
+                if not _u_text.strip("。，, 、;；"):
+                    print(f"QWEN3_HOTWORD_ECHO_TURN_HIDDEN (call {room_name})", flush=True)
+                    return
+                if _u_text != text:
+                    text = _u_text
+            _spawn_report(
+                cp.add_turn(
+                    call_id, role, _clean_transcript(text), latency_ms=0,
+                    language=language_state.lang, line="a", speaker="customer",
+                    gen="", template_step=step, started_ms=now_ms, ended_ms=now_ms,
+                )
+            )
+            return
+        gen = _turn_origin["gen"]
+        provider = _turn_origin["provider"]  # 默认空串(与旧行为一致;QA 快路=qa-fastpath)
+        _turn_origin["gen"] = "llm"  # consume-once:下一轮默认 llm
+        _turn_origin["provider"] = ""
+        started_ms = max(0, now_ms - latency)  # 生成起点≈落库时刻-TTFT(近似)
+        _spawn_report(_report_assistant_turn(text, latency, gen, provider, step, started_ms))
+
+    # 在途 turn 上报任务:挂断时结算前要等佢哋落地(裸 create_task 会被 job
+    # teardown 杀掉=整轮丢失)。
+    _report_tasks: set = set()
+
+    def _spawn_report(coro):
+        task = asyncio.create_task(coro)
+        _report_tasks.add(task)
+
+        def _done(t: asyncio.Task) -> None:
+            _report_tasks.discard(t)
+            if not t.cancelled() and t.exception() is not None:
+                # 上报/字幕任务失败不阻通话,但必须打点——静默 never-retrieved 会
+                # 掩盖「字幕没出/轮次丢报」这类缺口(2026-09-11 caption 实证)。
+                print(f"REPORT_TASK_ERR {t.exception()!r}", flush=True)
+
+        task.add_done_callback(_done)
+
+    async def _report_assistant_turn(
+        text: str, latency: int, gen: str, provider: str, step: int, started_ms: int
+    ) -> None:
+        # perceived(用户讲完→AI 出声)=eou+llm+tts 三段。时序实测(2026-09-10):
+        # tts_metrics 在整段合成完才 emit,而 llm 流关闭又在 TTS 之后 →
+        # item_added 触发本函数时 pending 已就位——启动即取,唔使等。取不到
+        # 按 0 落库(脚本直念/QA 快路冇全三段);ts 宽窗只防跨通残值。
+        t_begin = time.monotonic()
+        perceived = 0
+        pending = _turn_metrics.get("perceived_pending")
+        if pending is not None:
+            total, ts = pending
+            _turn_metrics.pop("perceived_pending", None)
+            if ts >= t_begin - 120:
+                perceived = int(total or 0)
+        try:
+            await cp.add_turn(
+                call_id, "assistant", _clean_transcript(text), provider=provider,
+                latency_ms=latency, language=language_state.lang, line="a",
+                speaker="agent_ai", gen=gen, template_step=step,
+                started_ms=started_ms,
+                ended_ms=int((time.monotonic() - _t0) * 1000), perceived_ms=perceived,
+            )
+        except Exception as exc:  # pragma: no cover - 落库失败不阻通话
+            print(f"[agent] add_turn(assistant) failed: {exc!r}", flush=True)
 
     async def _async_update_context(role, text):
         # 渐进披露：P1 起检索默认全关（对象知识走【对象档案】静态前缀，话术对象
@@ -1721,6 +2032,14 @@ async def entrypoint(ctx):
         text = getattr(item, "text_content", None) or getattr(item, "raw_text_content", "") or ""
         if text:
             if role == "assistant":
+                # PrefillSpeculator:历史条目原文（含 expr 标记）——投机预热按下
+                # 一条请求的严格前缀组装,assistant 段必须与框架追加进历史的
+                # 逐字节一致(last_reply 是清洗后的锚文本,直接用会分叉白暖)。
+                if _prefill_spec is not None:
+                    try:
+                        _prefill_spec.on_reply_history_text(text)
+                    except Exception:  # noqa: BLE001 - 预热原料失败唔阻主流程
+                        pass
                 # 尾部重复锚同步写(R3 治原句/近原句复述):lecture_guard 守则与摘要
                 # 记忆同一把尺(转录落咗罐頭,記憶/錨都唔可以留原稿)。
                 try:
@@ -1787,6 +2106,14 @@ async def entrypoint(ctx):
             _llm_ms = _turn_metrics.pop("llm_ttft_ms")
             _tts_ms = _turn_metrics.pop("tts_ttfb_ms")
             _turn_metrics.clear()
+            # 账本生产者:pending 由 _report_assistant_turn 限窗取走落 perceived_ms。
+            # llm_ttft_ms 回存:turns 的 latency_ms 列喺 item_added 时先读,
+            # 唔回存会被上面的 pop 清走(perceived 组装先于 item_added)。
+            _turn_metrics["llm_ttft_ms"] = _llm_ms
+            _turn_metrics["perceived_pending"] = (
+                _eou_ms + _llm_ms + _tts_ms,
+                time.monotonic(),
+            )
             print(
                 f"{tag}PERCEIVED_MS total={_eou_ms + _llm_ms + _tts_ms} "
                 f"(eou={_eou_ms} llm={_llm_ms} tts={_tts_ms})",
@@ -1814,7 +2141,22 @@ async def entrypoint(ctx):
                 print(f"[agent] session report posted (call {room_name})", flush=True)
             except Exception as exc:  # pragma: no cover - 报表失败唔阻结算
                 print(f"[agent] session report failed: {exc!r} (call {room_name})", flush=True)
+            # 在途 turns 上报(含 perceived 等待窗)先落地再结算,防 teardown 杀任务丢轮。
+            if _report_tasks:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*list(_report_tasks), return_exceptions=True), timeout=10.0
+                    )
+                except asyncio.TimeoutError:
+                    pass
             await cp.settle(call_id)
+            # QA 快路每通汇总(task-9):每通一行 PERF 风格,打完即清零(job 进程
+            # 一通一命,清零属防御);打点失败绝不影响结算。
+            try:
+                print(format_qa_summary(QA_COUNTERS), flush=True)
+            except Exception:  # noqa: BLE001 - 汇总打点失败零影响
+                pass
+            QA_COUNTERS.clear()
 
         def _close_done(_task: asyncio.Task) -> None:
             _close_flushed.set()
@@ -1907,12 +2249,28 @@ async def entrypoint(ctx):
                 facts=flow_ctrl.vars_map,
             )
             jv = parse_judge_output(await _llm_judge(jbase, jmodel, msgs))
-            if flow_ctrl.current == step_at and flow_ctrl.has_steps and not flow_ctrl.done:
+            if (
+                flow_ctrl.current == step_at
+                and flow_ctrl.has_steps
+                and not flow_ctrl.done
+                # 直念步待念唔推进(同轮内 say 锁):未念的 say=1 步被 judge 跳过去
+                # =合规内容被吞——先等 agent 把直念念完,下一轮判定先有效。
+                and not flow_ctrl.pending_say_text()
+            ):
                 if jv == CONFIRM:
                     # WA 收号码步假确认护栏:与 rule CONFIRM 分支共用同一铁律——未
                     # captured 唔准 judge 推进越过收号码步(c4f6e4f1 实证泄漏点)。
                     _gj, _rj = flow_ctrl.current_goal_ref()
-                    if wa_confirm_advance_allowed(goal=_gj, ref=_rj, captured=_wa_captured["on"]):
+                    # 问句步内容门槛(2026-09-12 call-8fa17d2b):「他这个就过来了。」
+                    # 长 UNCLEAR 轮被 4B judge 误判 confirm 假进赔偿直念步——问句
+                    # 步(「可以接受吗/有没有时间」类承诺问题)的 judge confirm 需要
+                    # 客户话里有实质应承特征,长句无特征拦下。
+                    if not judge_confirm_advance_allowed(goal=_gj, ref=_rj, user_text=utt):
+                        print(
+                            f"[flow] judge(bg)=confirm blocked (no ack signal) step={step_at + 1} (call {room_name})",
+                            flush=True,
+                        )
+                    elif wa_confirm_advance_allowed(goal=_gj, ref=_rj, captured=_wa_captured["on"]):
                         flow_ctrl.advance()
                         context_state.set_flow_current(flow_ctrl.current_step_text())
                         print(f"[flow] judge(bg)=confirm step={flow_ctrl.current + 1} (call {room_name})", flush=True)
@@ -1943,6 +2301,9 @@ async def entrypoint(ctx):
             if _preemptive_gate["paused"]:
                 _preemptive_gate["paused"] = False
                 _set_preemptive_max_retries(int(_preemptive_env_opts["max_retries"]))
+            # prefill 投机预算重置：上一说话窗的开火配额归还,下一窗重新计。
+            if _prefill_spec is not None:
+                _prefill_spec.new_turn()
             # 客戶真開口 → 沉默心跳計數歸零(之後再沉默先重新計 2 次)。
             _nudge_state["count"] = 0
             _nudge_state["last_user_ts"] = time.monotonic()
@@ -1999,12 +2360,32 @@ async def entrypoint(ctx):
                     raise StopResponse()
             # ASR 热词幻听守卫:极低内容音频(开场白期间没说话/杂音)会把词表
             # 当转写整串抄出(call-feaf914c 实机回归)——顺串判定命中即丢弃整轮。
-            if _hotword_echo_guard_enabled() and _hotword_ctx and _is_hotword_echo(user_text, _hotword_ctx):
-                print(
-                    f"QWEN3_HOTWORD_ECHO_DROP (call {room_name}) heard={user_text!r}",
-                    flush=True,
+            # 2026-09-11 call-a2705ed2 升级:回声可被 ASR 用繁体抄出(守卫已繁简
+            # 归一),且「真话头+回声尾」形态(「拼多多。顺豐速運，運通…」)整轮
+            # 丢弃会连真实回答一起丢——改剥尾保头,纯回声才丢。
+            # 2026-09-12 call-1043de7c 再升级:①T2S 表曾漏「順→顺」致词表首词归一
+            # 断链,全串回声被当「真话头」留下「顺豐速運」假轮;②回声确认后的词表
+            # 孤词残片同样丢弃(_vocab_echo_guard 三层)。净文同步写回 chat 消息
+            # ——实时字幕/会话记录/LLM 上下文三面全净(旧「chat 留原文」已被用户
+            # 「不要显示」拍板取代)。
+            if _hotword_echo_guard_enabled() and _hotword_ctx:
+                _stripped, _vocab_echo_seen["on"] = _vocab_echo_guard(
+                    user_text, _hotword_ctx, echo_seen=_vocab_echo_seen["on"]
                 )
-                raise StopResponse()
+                if _stripped != user_text:
+                    print(
+                        f"QWEN3_HOTWORD_ECHO_STRIP (call {room_name}) "
+                        f"heard={user_text!r} keep={_stripped!r}",
+                        flush=True,
+                    )
+                    if not _stripped.strip("。，, 、;；"):
+                        print(f"QWEN3_HOTWORD_ECHO_DROP (call {room_name})", flush=True)
+                        raise StopResponse()
+                    user_text = _stripped
+                    try:
+                        new_message.text_content = _stripped
+                    except Exception:  # pragma: no cover - 历史消息改写失败只损显示一致性
+                        pass
             # WA 号码碎片累积:号码主导句且累计 <8 位、或自报头半句(「我的WhatsApp係」)
             # → 暂存+StopResponse(唔回复、唔侦测、唔推进),等下一段拼埋一次过处理。
             # 超时 flush 见 _arm_wa_accum_flush。StopResponse 必须喺任何 except-pass
@@ -2013,7 +2394,7 @@ async def entrypoint(ctx):
                 _g, _r = flow_ctrl.current_goal_ref()
                 if _looks_like_whatsapp_step(_g, _r) and user_text.strip() and not closed.is_set():
                     _stashed = _wa_accum["text"]
-                    _merged = (_stashed + user_text) if _stashed else user_text
+                    _merged = _wa_accum_merge(_stashed, user_text)
                     _n = sum(ch.isdigit() for ch in _digit_normalize(_merged))
                     _stash_it = (
                         not _WHATSAPP_DECLINE.search(user_text.lower())
@@ -2095,9 +2476,24 @@ async def entrypoint(ctx):
                     # verdict 进尾部:规则判定结果此前只用于推进、从不进提示词,
                     # 客户提问/答非所问时模型冇「该怎么答」指引 → 复读当前步。
                     flow_ctrl.last_verdict = verdict
+                    # 客户原话进尾部账本:渐进披露按 verdict+原话命中单分支
+                    # (只给 verdict 时「问为什么赔/问什么时候到」同族分不开)。
+                    flow_ctrl.last_user_text = user_text
+                    # 出口复读防线放行标志:客户明确要求重讲(REPEAT)时,模型
+                    # 照讲上一句关键内容是正确行为,不当拟声复读剥掉;其余轮
+                    # 逐句比对上一句回复,复读句出口剥除。
+                    context_state.repeat_requested = verdict == REPEAT
                     # 数字串进尾部:数字係 ASR 最弱项,渲染「逐位复述核对」指引,
                     # 唔复核错号就一直错落去。
                     flow_ctrl.last_digits = _digit_runs_in(user_text)
+                    # 直念步待念锁(2026-09-12):轮开始时当前步係 say=1 未念 → 本轮
+                    # 先念(下方 say 块),流程推进让位——上一轮后台 judge 进入的直念步
+                    # (如赔偿三档)被本轮规则推进直接跳过去=客户从未听过的合规内容
+                    # 整段被吞(call-73f13391 轮4 实证:可以呀→3→4,三档一句未念)。
+                    try:
+                        _say_pending_before = flow_ctrl.pending_say_text() != ""
+                    except Exception:  # noqa: BLE001
+                        _say_pending_before = False
                     if verdict == REFUSE:
                         # 客户明确拒绝/告别 → 收尾态:注入收尾话术(一句礼貌再见),
                         # 唔推进/唔 judge/唔按步走;讲完后 _schedule_call_end 主动结束通话
@@ -2107,7 +2503,7 @@ async def entrypoint(ctx):
                             _invalidate_stale_preemptive("客户明确拒绝 → 收尾")
                             _schedule_call_end()
                             print(f"[flow] refuse -> closing, end scheduled (call {room_name})", flush=True)
-                    elif not flow_ctrl.done and not flow_ctrl.closing:
+                    elif not flow_ctrl.done and not flow_ctrl.closing and not _say_pending_before:
                         _g2, _r2 = flow_ctrl.current_goal_ref()
                         # 規則級必定推進 override(開場步客已回應 / 核實步答到平台):
                         # 唔靠 LLM judge,防止卡死(offered 應承加嗰輪除外——要等客俾號碼)。
@@ -2120,6 +2516,17 @@ async def entrypoint(ctx):
                             verdict=verdict,
                             # 兼要攞WhatsApp嘅核實步:要客戶俾咗號碼/應承先推
                             wa=(_wa_signal[0] if _wa_signal else None),
+                            # 通知直念步(say=1)用開場級寬鬆推進語義(實質回應即推)
+                            # say_step 宽松语义只给通知型直念步(2026-09-12 call-8fa17d2b:
+                            # 赔偿直念步也是 say=1,UNCLEAR 的语气点评「呃，自然多了」
+                            # 借宽松语义假推进 step4→5);承诺型问句步(赔偿/办理)回落
+                            # CONFIRM 门槛,goal 含「通知」才算通知步。
+                            say_step=(
+                                flow_ctrl.has_steps
+                                and 0 <= flow_ctrl.current < len(flow_ctrl.steps)
+                                and flow_ctrl.steps[flow_ctrl.current].say
+                                and "通知" in (flow_ctrl.steps[flow_ctrl.current].goal or "")
+                            ),
                         )
                         if _auto:
                             flow_ctrl.advance()
@@ -2153,6 +2560,82 @@ async def entrypoint(ctx):
                     context_state.set_flow_current(flow_ctrl.current_step_text())
                 except Exception:  # pragma: no cover - 流程推进失败不阻断回复
                     pass
+            # ---- DEFER 短应承车道(2026-09-12 P0「会说话」) ----
+            # 客户社交拖延(「我先查一下/有了再通知你/稍等我看看」)→ 三语短应承
+            # 脚本直念(零 TTFT/零照本),不推进/不 judge/不走 LLM——call-8fa17d2b
+            # 实证:这类轮落到 LLM 只会把当前步问题原样重发,多句连说时配合碎片
+            # 提交=「只剩垫话不答正事」的卡死体感。raise 须在 except-pass try 之外
+            # (同 say-step/WA 累积姿势);BOK_DEFER_ACK=0 回退走 LLM。
+            if (
+                flow_ctrl.last_verdict == DEFER
+                and os.environ.get("BOK_DEFER_ACK", "1") == "1"
+                and not closed.is_set()
+            ):
+                _ack = _defer_ack_line(language_state.lang)
+                context_state.set_last_reply(_ack)
+                _turn_origin["gen"] = "script"
+                _turn_origin["provider"] = "defer-ack"
+                try:
+                    _defer_ms = int((time.monotonic() - _t0) * 1000)
+                    await cp.add_turn(
+                        call_id, "user", user_text, language=language_state.lang,
+                        line="a", speaker="customer",
+                        template_step=(int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0,
+                        started_ms=_defer_ms, ended_ms=_defer_ms,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                print(f"[flow] defer-ack (call {room_name})", flush=True)
+                await _say_script(session, tts_provider, _tts_cache, _ack)
+                raise StopResponse()
+            # ---- 直念步快路(2026-09-12 开场白三段拆分):当前步标 say=1 且未念
+            # → 本轮以脚本直念作答(ref 首行,_say_script 缓存线),跳过 LLM。
+            # 通知/道歉/赔偿承诺要逐字一致:LLM 自由发挥会同一段通知每轮换措辞
+            # (call-2cae7769 三种说法念三遍);直念=零 TTFT+语速/音色与罐头同源。
+            # 推进轮(身份确认→通知)与 judge 迟推轮都覆盖;QA 快路让位(直念
+            # 优先——QA 罐头一句答不完通知)。user 轮补记+回声锚+账本 gen=script
+            # 同 QA fastpath 姿势。
+            try:
+                _say_now = flow_ctrl.pending_say_text()
+            except Exception:  # noqa: BLE001 - 无话术/异常退 LLM
+                _say_now = ""
+            if _say_now:
+                flow_ctrl.note_step_said()
+                try:
+                    context_state.set_flow_current(flow_ctrl.current_step_text())
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    await session.interrupt()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    chat_ctx = getattr(self, "chat_ctx", None)
+                    if chat_ctx is not None and new_message is not None:
+                        chat_ctx.items.append(new_message)
+                except Exception:  # noqa: BLE001
+                    pass
+                context_state.set_last_reply(_say_now)
+                _turn_origin["gen"] = "script"
+                _turn_origin["provider"] = "flow-say"
+                try:
+                    _say_step = (int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0
+                    _say_ms = int((time.monotonic() - _t0) * 1000)
+                    await cp.add_turn(
+                        call_id, "user", user_text, language=language_state.lang,
+                        line="a", speaker="customer",
+                        template_step=_say_step, started_ms=_say_ms, ended_ms=_say_ms,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                print(
+                    f"[flow] say-step verbatim step={flow_ctrl.current + 1} "
+                    f"chars={len(_say_now)} (call {room_name})",
+                    flush=True,
+                )
+                # 必须在 except-pass try 之外 raise(同 WA 累积/QA 快路)
+                await _say_script(session, tts_provider, _tts_cache, _say_now)
+                raise StopResponse()
             # ---- Q→A 检索快路(PR-3):四道闸全过 + 应答音频已预生成才命中 ----
             # 命中 → 跳过 LLM 直接播缓存音频(~50ms);任一闸不过 → 照旧走 LLM。
             # 位置在流程推进块之后:推进/收尾判定已落定,闸门让位(refuse/closing/
@@ -2177,6 +2660,7 @@ async def entrypoint(ctx):
                 )
                 if _qa_reason:
                     print(f"QA_FASTPATH bypass reason={_qa_reason}", flush=True)
+                    _qa_bump_bypass(_qa_reason)
                 else:
                     try:
                         _qa_entry, _qa_score = _qa_index.match(
@@ -2186,11 +2670,22 @@ async def entrypoint(ctx):
                         )
                     except Exception:  # noqa: BLE001 - 匹配失败当未命中
                         _qa_entry, _qa_score = None, 0.0
+                    # 汇总打点(task-9):match0=零命中轮(含匹配异常);hit=命中条目
+                    # 轮(=下文 hit=1 出声轮 + no_audio 轮之和,hit_audio=hit-no_audio
+                    # 由 format_qa_summary 求差)。
+                    _qa_bump("match0" if _qa_entry is None else "hit")
                     if _qa_entry is not None:
                         _qa_answer = str(_qa_entry.get("answer_text") or "").strip()
                         _qa_voice = getattr(tts_provider, "resolved_voice", lambda: "")()
                         _qa_model = getattr(tts_provider, "resolved_model", lambda: "")()
-                        _qa_pcm = _tts_cache.lookup(_qa_answer, voice=_qa_voice, model=_qa_model) if _qa_answer else None
+                        _qa_pcm = (
+                            _tts_cache.lookup(
+                                _qa_answer, voice=_qa_voice, model=_qa_model,
+                                speed=getattr(tts_provider, "resolved_speed", lambda: 1.0)(),
+                            )
+                            if _qa_answer
+                            else None
+                        )
                         if _qa_pcm is not None:
                             print(f"QA_FASTPATH hit=1 entry={_qa_entry.get('id')} score={_qa_score:.2f}", flush=True)
                             # ① 作废停着的抢跑快照(其幻影账本条目下轮 rebase 自愈)
@@ -2207,11 +2702,19 @@ async def entrypoint(ctx):
                                 pass
                             # ③ 回声守卫预锚(正常要 playout 完才自动置,快路要立即生效)
                             context_state.set_last_reply(_qa_answer)
-                            # ④ 落库两轮(assistant provider=qa-fastpath 供审计/统计)
+                            # ④ 落库 user 轮(paused 分支同款手动补轮,item_added
+                            # 唔会为 StopResponse 轮触发);assistant 轮由 say() 的
+                            # item_added 统一上报——旧 ④ 直报+item_added 双报同文
+                            # 两行,顺手收编。origin 标记 gen/provider 供账本。
+                            _turn_origin["gen"] = "qa_fastpath"
+                            _turn_origin["provider"] = "qa-fastpath"
                             try:
-                                await cp.add_turn(call_id, "user", user_text, language=language_state.lang)
+                                _qa_step = (int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0
+                                _qa_now = int((time.monotonic() - _t0) * 1000)
                                 await cp.add_turn(
-                                    call_id, "assistant", _qa_answer, provider="qa-fastpath", language=language_state.lang
+                                    call_id, "user", user_text, language=language_state.lang,
+                                    line="a", speaker="customer",
+                                    template_step=_qa_step, started_ms=_qa_now, ended_ms=_qa_now,
                                 )
                             except Exception:  # noqa: BLE001
                                 pass
@@ -2224,6 +2727,7 @@ async def entrypoint(ctx):
                             # ⑥ 压掉本轮 LLM(WA 累积同款;必须在 except-pass 之外)
                             raise StopResponse()
                         print(f"QA_FASTPATH hit=0 reason=no_audio entry={_qa_entry.get('id')}", flush=True)
+                        _qa_bump("no_audio")
             if self.paused:
                 chat_ctx = getattr(self, "chat_ctx", None)
                 if chat_ctx is not None and new_message is not None:
@@ -2301,8 +2805,11 @@ async def entrypoint(ctx):
             return
         if _nudge_state.get("farewell"):
             return  # 已收線,唔再追
-        if flow_ctrl.closing or (flow_ctrl.has_steps and flow_ctrl.done):
-            return  # 拒絕收尾/流程已走完:唔追
+        if flow_ctrl.closing:
+            return  # 拒絕收尾:唔追
+        # 流程已走完(话术 5 步/WA 已捕获):不再两轮心跳拖尾——下一窗直接
+        # farewell 收线(2026-09-12 call-034cfdee 用户实测「没自动挂断」:收线
+        # 在途但 2×8s 心跳+farewell+12s 尾巴太长,用户 8s 后即关页)。
         _disarm_silence()
 
         async def _fire() -> None:
@@ -2319,11 +2826,13 @@ async def entrypoint(ctx):
                 return
             name = str((object_card or {}).get("display_name") or "").strip()
             lang = language_state.lang if language_state.lang in ("zh", "cantonese", "en") else "zh"
-            if _nudge_state["count"] >= nudge_max:
+            if _nudge_state["count"] >= nudge_max or (flow_ctrl.has_steps and flow_ctrl.done):
+                # 流程已走完 = 业务闭环,沉默即收线(不再心跳拖尾,见 _arm_silence 注)。
                 # 兩次確認都冇回應 → 禮貌收尾直念,講完(一句TTS+余量)自動收線。
                 _nudge_state["farewell"] = True
                 print(f"[heartbeat] still silent after {_nudge_state['count']} nudges -> farewell+end (call {room_name})", flush=True)
                 try:
+                    _turn_origin["gen"] = "script"  # 收线告别=脚本直念
                     await _say_script(session, tts_provider, _tts_cache, _farewell_line(name, lang))
                 except Exception as exc:  # pragma: no cover - 收尾失敗都照收線
                     print(f"[heartbeat] farewell failed: {exc!r} (call {room_name})", flush=True)
@@ -2332,6 +2841,7 @@ async def entrypoint(ctx):
             _nudge_state["count"] += 1
             print(f"[heartbeat] silent {nudge_delay:.0f}s -> nudge {_nudge_state['count']}/{nudge_max} (call {room_name})", flush=True)
             try:
+                _turn_origin["gen"] = "script"  # 心跳补位=脚本直念
                 await _say_script(session, tts_provider, _tts_cache, _nudge_line(name, lang, _nudge_state["count"] - 1))
             except Exception as exc:  # pragma: no cover - 心跳失敗唔阻通話
                 print(f"[heartbeat] nudge failed: {exc!r} (call {room_name})", flush=True)
@@ -2372,6 +2882,17 @@ async def entrypoint(ctx):
         # 会令开场白期间 partial 唔受抑制。
         session.on("agent_state_changed", _on_partial_gate)
 
+    if _prefill_spec is not None:
+
+        def _on_spec_state(ev) -> None:
+            # LLM 生成/播报中不开火:预热请求排在真回复后面=抢不过还添堵
+            # (与 partial 抑制同一状态口径)。listening 恢复可开火。
+            _prefill_spec.set_busy(
+                str(getattr(ev, "new_state", "") or "") in ("thinking", "speaking")
+            )
+
+        session.on("agent_state_changed", _on_spec_state)
+
     watch_task = asyncio.create_task(_supervisor_watch())
     # AgentSession 内部已注册 job shutdown callback（自动 aclose），
     # 这里不能提前 close，否则会话在接通后立刻被销毁。
@@ -2411,6 +2932,7 @@ async def entrypoint(ctx):
         # (~2-4s TTFT)。paused(无开场白)分支在下方立即发(无开场白形状)。
         if _prefix_prewarm_armed:
             asyncio.create_task(_prefix_prewarm_task(agent, greeting_text))
+        _turn_origin["gen"] = "script"  # 开场白=脚本直念
         await _say_script(session, tts_provider, _tts_cache, greeting_text)
         # say() 返回=整段念完(playout end),唔係出声时刻——TTS 首包在 say 调用后
         # ~0.4s 就到了(2026-09-06 打点纠偏,旧名 greeting_queued 曾误读为出声慢)。
@@ -2449,6 +2971,12 @@ def run_agent() -> None:
     import sys
 
     from livekit.agents import WorkerOptions, cli
+
+    # 抢跑失效诊断探针（BOK_PREEMPTIVE_DEBUG=1）：须在 worker 起跑前包好框架
+    # 比较函数，否则首通 session 已绑旧引用。
+    from .preemptive_debug import install_preemptive_debug
+
+    install_preemptive_debug()
 
     # livekit-agents 1.7.x 的 cli.run_app 需要显式子命令（start）。
     if len(sys.argv) == 1:

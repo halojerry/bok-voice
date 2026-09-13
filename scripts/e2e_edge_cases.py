@@ -188,7 +188,10 @@ async def main() -> int:
             "我件嘢爛咗，外包裝都凹咗。",
         )
     ]
-    e4_first = tts_pcm("我要投訴，件貨延誤咗成個禮拜。")
+    # E2E 句形铁律:<10 字单口气句结构性免疫 vad-pause 劈轮(渲染内停顿致
+    # vad-pause 劈轮→迟到 finish 续句 interrupt 初生回复→首轮无语音,E4 连挂实证;
+    # 短句只可能 EOS 单轮提交)。
+    e4_first = tts_pcm("我要投訴件貨延誤")
     e4_interrupt = tts_pcm("Hello, I would like to know more about your compensation policy.", lang="en")
     e6_pcm = tts_pcm("咁我唔等喇，唔該幫我跟進埋佢。")
     e7_pcm = tts_pcm("喂，聽到咩？")

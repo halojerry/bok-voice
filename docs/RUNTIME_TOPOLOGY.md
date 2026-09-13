@@ -3,6 +3,16 @@
 > 本文件是"安装后的 App 能不能正常使用"的唯一验收基准。任何改动必须保证
 > 按这张图跑起来：组件齐全、端口可达、数据落在 app-data、bundle 只读。
 
+## 0. 分发型拓扑（P0 起双形态，spec=2026-09-10-thin-node-saas-design.md）
+
+单机形态（本文其余部分描述的 dev/打包形态）不变。分发货形态新增：
+- **云 CP**：同一 control-plane 代码，`DATABASE_URL` 指 Supabase Postgres；托管管理台静态 UI
+- **节点包**：LiveKit + ASR/LLM sidecar + agent/interp worker + node-agent（tools/node_agent.py，
+  心跳 :8000/api/nodes/heartbeat，commands 通道 P3）+ 节点本地托管坐席 UI（runtime-config.js 注入
+  cpUrl/livekitUrl，spec §8 纯内网档）
+- 新数据列：turns.org_id/line/speaker/gen/template_step/started_ms/ended_ms/perceived_ms（分析账本，spec §6.1）
+- 新表：orgs/nodes（org 缝 + 节点注册表，node_token 只存 sha256）
+
 ## 1. 组件与端口
 
 | 组件 | 端口/协议 | 职责 | 运行时 | 数据落点 |
@@ -26,10 +36,36 @@
   PCM 存 **app-data/tts-cache/**（LRU 500 条）。脚本直念线（开场白/心跳/收线/WA 确认）
   经 `_say_script`：命中 ~0ms 出声，未命中边播边落盘。开关 `BOK_TTS_CACHE=0`。
 - **预生成**：`bok.py tts-pregen`（--greetings 无变量脚本线 / --objects 逐对象
-  开场白收线心跳 / --fillers 垫话库 / --qa 快答库启用条目应答）——离线批量合成，需 CP 或 MINIMAX_API_KEY。
+  开场白收线心跳 / --qa 快答库启用条目应答 / --fillers 按人设音色物化垫话，
+  2026-09-10 双层出声复活）——离线批量合成，需 CP 或 MINIMAX_API_KEY。
+  greetings/fillers/qa 落盘**打钉不逐出**（逐对象开场白与运行时 tee 不钉，
+  LRU 500 只淘汰未钉条目）。**人设保存点自动物化（W3）**：CP POST/PUT
+  /api/personas 音色变化 → 后台 detached 子进程跑 `scripts/pregen_tts.py
+  --greetings --fillers --qa --persona <id>`（新会话不被栈重启打断，单飞，
+  `BOK_PERSONA_AUTO_PREGEN=0` 关），日志 **app-data/logs/tts-pregen.log**，
+  响应 `tts_pregen.status` 即提醒面。
 - **垫话**：`agent_runtime/fillers.py`——LLM 慢轮回复首音频 500ms 未到播预合成
-  应承语，真回复出声即定向打断（CachedTTS 首音频回调）。垫话绝不进 LLM 上下文、
-  绝不触发云合成。开关 `BOK_FILLER=0`。
+  应承语。**2026-09-10 资产化改版**：垫话=随源码分发 wav 资产（`assets/fillers/`
+  +manifest，`scripts/gen_filler_assets.py` 固定音色/参数预生成，三语各 10 短句
+  万能话术 1.0-1.5s），运行时只播文件绝不云合成；**播放排序=垫话播完→300ms
+  （`BOK_FILLER_GAP_MS`）→回复**（不再掐垫话，回复首帧经 `_RelaySynthesizeStream`
+  hold 扣压）；**链发**（2026-09-10）：首条播完回复仍未出声 → gap 后自动补第二发
+  （`BOK_FILLER_CHAIN` 默认 1，每轮封顶 1 次、与主动播共享 `BOK_FILLER_MAX=3`
+  计数；池 39 条=每语言 10 短 1.0-1.5s+3 长 1.7-2.3s）；语言=装配时钉死的通话语言，
+  池缺失跳过绝不跨语言。垫话绝不进
+  LLM 上下文。开关 `BOK_FILLER=0`。
+- **抢跑防抖 + PrefillSpeculator**（2026-09-10）：框架抢跑默认关
+  （`PREEMPTIVE_GENERATION=0`，命中在本仓 STT 架构下结构性不可能——PREFLIGHT
+  只发稳定前缀而提交是全句 FINAL，843 失效/0 命中实测）。替代预热=
+  `prefill_speculator.py`：说话中按稳定前缀发 max_tokens=1 out-of-band 请求
+  （严格前缀=上次真实请求快照+回复历史原文+user 前缀），真轮只 prefill 分叉
+  尾巴；`BOK_PREFILL_SPEC=0` 关。诊断 `BOK_PREEMPTIVE_DEBUG=1` +
+  `scripts/probe_preemptive.py`。
+- **turns 分析账本**：A 线 `_on_conversation_item` 每轮上报
+  line/speaker/gen/template_step/started_ms/ended_ms/perceived_ms（B 线
+  `line=b`、speaker=me/other）；`gen`=llm/script/qa_fastpath 生成源；
+  perceived_ms=eou+llm+tts 三段（时序：item_added 时 pending 已就位即取）；
+  上报任务挂断 flush 防 teardown 丢轮。
 - **Q→A 快路**：`agent_runtime/qa_gate.py` + CP `/api/qa-entries`、
   `/api/reports/qa-pairs`——四道闸（作用域/关键信号旁路/推进收线让位/阈值 0.90）
   全过且应答音频已缓存才跳过 LLM；挖掘入库 `bok.py tts-mine --apply N`。

@@ -121,6 +121,39 @@ def test_inmemory_repo_qa_crud_and_conversations():
     assert len(convos) == 1 and convos[0][0]["role"] == "user" and convos[0][1]["role"] == "assistant"
 
 
+def test_inmemory_repo_exclude_test_objects():
+    """挖掘过滤(InMemory):测试对象+无对象通话滤掉;默认参数(不过滤)全保留。
+
+    无对象=A 线真实通话按对象发起,E2E 免 object_id 路径的合成残留。
+    """
+    from bok_voice_business_db.repository import InMemoryBusinessRepository
+
+    repo = InMemoryBusinessRepository()
+    seed = {
+        "c-test": ("obj-test", "E2E-甲", "幫我查下測試單號"),
+        "c-real": ("obj-real", "陳大文", "你哋幾時送到"),
+        "c-orphan": ("obj-gone", "", "單唔見咗"),  # 对象缺失(挂了不存在的 id)
+        "c-noobj": ("", "", "冇對象通話"),  # 无对象通话(E2E 免 object_id 路径)
+    }
+    for cid, (oid, _name, text) in seed.items():
+        repo.calls[cid] = {"id": cid, "account_id": "acc-001", "object_id": oid}
+        if _name:
+            repo.objects[oid] = {"id": oid, "display_name": _name}
+        repo.turns[cid] = [
+            TurnEvent(trace_id=cid, call_id=cid, turn_id="t0", role="user", transcript=text, language="cantonese")
+        ]
+
+    assert {c[0]["text"] for c in repo.iter_call_conversations("acc-001")} == {
+        "幫我查下測試單號",
+        "你哋幾時送到",
+        "單唔見咗",
+        "冇對象通話",
+    }
+    assert [c[0]["text"] for c in repo.iter_call_conversations("acc-001", exclude_test_objects=True)] == [
+        "你哋幾時送到"
+    ]
+
+
 # ---- CP 端点(sqlite 路径,验证建表+CRUD+报告) ----
 
 def test_cp_qa_endpoints(monkeypatch):
@@ -146,3 +179,58 @@ def test_cp_qa_endpoints(monkeypatch):
         assert client.post(f"/api/qa-entries/{eid}/hit").status_code == 200
         assert client.get("/api/reports/qa-pairs?min_calls=5").json() == []
         assert client.delete(f"/api/qa-entries/{eid}").json()["deleted"] is True
+
+
+def test_cp_qa_pairs_exclude_test_objects(tmp_path, monkeypatch):
+    """CP 挖掘链(sqlite):默认滤测试对象+无对象通话,exclude_test=false 看全量。
+
+    同账号三通(测试对象 E2E-甲 / 真实对象 陳大文 / 无对象)各含一个
+    user→assistant 对。无对象=E2E /api/start 免 object_id 路径的残留
+    (「湾仔活道」197 通 fixture 实证)。
+    """
+    os.environ.setdefault("LIVEKIT_API_KEY", "devkey")
+    os.environ.setdefault("LIVEKIT_API_SECRET", "devsecret")
+    os.environ.setdefault("LIVEKIT_URL", "ws://127.0.0.1:7880")
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'qa_pairs.db'}")
+
+    from fastapi.testclient import TestClient
+
+    from control_plane.main import app
+
+    with TestClient(app) as client:
+        test_obj = client.post(
+            "/api/objects", params={"account_id": "acc-001"}, json={"display_name": "E2E-甲", "language": "cantonese"}
+        ).json()
+        real_obj = client.post(
+            "/api/objects", params={"account_id": "acc-001"}, json={"display_name": "陳大文", "language": "cantonese"}
+        ).json()
+        test_call = client.post(
+            "/api/calls", json={"account_id": "acc-001", "object_id": test_obj["id"], "language": "cantonese"}
+        ).json()
+        real_call = client.post(
+            "/api/calls", json={"account_id": "acc-001", "object_id": real_obj["id"], "language": "cantonese"}
+        ).json()
+        noobj_call = client.post(
+            "/api/calls", json={"account_id": "acc-001", "language": "cantonese"}  # object_id 缺省=""
+        ).json()
+        convos = {
+            test_call["id"]: ("幫我查下測試單號", "測試回覆。"),
+            real_call["id"]: ("你哋幾時送到", "一般三至五日。"),
+            noobj_call["id"]: ("冇對象嘅單點查", "無對象回覆。"),
+        }
+        for call_id, (question, answer) in convos.items():
+            r = client.post(f"/api/calls/{call_id}/turns", params={"role": "user", "transcript": question, "language": "cantonese"})
+            assert r.status_code == 200, r.text
+            r = client.post(f"/api/calls/{call_id}/turns", params={"role": "assistant", "transcript": answer, "language": "cantonese"})
+            assert r.status_code == 200, r.text
+
+        # 默认(exclude_test=true):报告只含真实对象通话的问答
+        rows = client.get("/api/reports/qa-pairs", params={"min_calls": 1}).json()
+        assert [r["question"] for r in rows] == [normalize_question("你哋幾時送到")]
+        # 显式 false:三通都在(含无对象通话)
+        rows_all = client.get("/api/reports/qa-pairs", params={"min_calls": 1, "exclude_test": "false"}).json()
+        assert {r["question"] for r in rows_all} == {
+            normalize_question("你哋幾時送到"),
+            normalize_question("幫我查下測試單號"),
+            normalize_question("冇對象嘅單點查"),
+        }
