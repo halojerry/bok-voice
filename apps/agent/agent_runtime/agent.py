@@ -2534,6 +2534,10 @@ async def entrypoint(ctx):
                         new_message.text_content = _stripped
                     except Exception:  # pragma: no cover - 历史消息改写失败只损显示一致性
                         pass
+            # 垫话罐头匹配的口粮(2026-09-13 实机实证):旧版只在 has_steps 块内
+            # 赋值 → 无模板通话(E2E 腿)last_user_text 恒空,匹配层饿死
+            # (BOK_FILLER_MATCH miss best=0.00)。无条件赋值——纯字段,无模板零副作用。
+            flow_ctrl.last_user_text = user_text
             # ---- C1 暂停冻结(2026-09-13,call-15a2f586) ----
             # 暂停期用户轮:照落库(gen=paused,客户讲过的话永远在案)+ 整轮丢弃。
             # 必须在 WA 累积/detect/rule 推进/judge 之前——旧版暂停期 flow 静默
@@ -3019,6 +3023,8 @@ async def entrypoint(ctx):
                     # 零 TTFT);人工接管(escalated)时也适用——人接手前的一句过渡。
                     # BOK_PAUSE_ACK=0 关。
                     if os.environ.get("BOK_PAUSE_ACK", "1") == "1" and not closed.is_set():
+                        _turn_origin["gen"] = "script"
+                        _turn_origin["provider"] = "pause-ack"
                         try:
                             await _say_script(
                                 session, tts_provider, _tts_cache,

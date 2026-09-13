@@ -162,6 +162,8 @@ async def run_case(room: rtc.Room, audio_source: rtc.AudioSource, case: dict) ->
     speech_secs = 0.0
     silent_secs = 0.0
     processed = 0
+    _last_len = 0
+    _stall = 0
     started = time.perf_counter()
     while time.perf_counter() - started < 90:
         # count only newly arrived 20ms frames
@@ -174,13 +176,28 @@ async def run_case(room: rtc.Room, audio_source: rtc.AudioSource, case: dict) ->
             else:
                 silent_secs += 0.02
             processed += step
-        if speech_secs >= 1.5 and silent_secs >= 5.0:
+        # 0913:产品回复已按【回复长度】变短(≤2 短句),旧 1.5s 语音门槛把短回复
+        # 当哑火跑满 90s——门槛经 E2E_MIN_SPEECH 可调(默认 0.8 匹配新常态)。
+        _min_speech = float(os.environ.get("E2E_MIN_SPEECH", "0.8"))
+        if speech_secs >= _min_speech and silent_secs >= 5.0:
             break
+        # 0913:livekit 音轨静默时不推帧(旧 silent_secs 只数「到达的静音帧」,
+        # 轨道一停就永不满 5 → 满窗 90s)。补字节量停滞判定:回复讲完、音频
+        # 不再增长 ≥5s 即视为说完。
+        if speech_secs >= _min_speech and len(agent_audio) - _last_len >= 5 * 32000:
+            pass  # 仍在增长(讲紧/有声)——继续等
+        elif speech_secs >= _min_speech and _stall >= 5:
+            break
+        _stall = _stall + 1 if len(agent_audio) == _last_len else 0
+        _last_len = len(agent_audio)
         await asyncio.sleep(1)
 
     room.off("track_subscribed", on_track)
     for t in read_tasks:
         t.cancel()
+    # 0913:cancel 后必须收尾 await——裸 cancel 下 _read 的 finally stream.aclose()
+    # 在已取消协程内挂起,read_tasks 泄漏令整腿永不返回(实机挂 15min 实证)。
+    await asyncio.gather(*read_tasks, return_exceptions=True)
     await asyncio.sleep(0.3)
 
     return {

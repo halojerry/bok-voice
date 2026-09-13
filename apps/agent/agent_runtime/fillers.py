@@ -134,10 +134,13 @@ def filler_match_enabled() -> bool:
 
 
 def filler_match_threshold() -> float:
+    # 0.42(2026-09-13 实机校准:ASR 变体「张单↔账单」下最佳 trigger 得分 0.48,
+    # 旧 0.55 全 miss;垫话有分类器+资产双层兜底,宁 hit 勿 miss——比 QA 快路
+    # 的 0.90 宽松一个档位是设计本意)。
     try:
-        return max(0.0, min(1.0, float(os.environ.get("BOK_FILLER_MATCH_THRESHOLD", "0.55"))))
+        return max(0.0, min(1.0, float(os.environ.get("BOK_FILLER_MATCH_THRESHOLD", "0.42"))))
     except ValueError:
-        return 0.55
+        return 0.42
 
 
 # ---- 五类分类器(2026-09-13 乙节回退层) ----
@@ -306,8 +309,14 @@ class FillerEntryIndex:
             score = 0.0
             for tq, tv in zip(it["trig"], it["vecs"]):
                 s = 0.6 * _hybrid_cos(qv, tv)
-                if q_low and q_low in tq.lower():
+                # 子串奖励双向(2026-09-13 实机实证:只认 user⊂entry 是把 QA 快路的
+                # 「超集句」缺口照搬过来——垫话场景恰恰相反,词条短、用户句长
+                # (「唔该帮我查下张单到边度」⊃trigger「帮我查下张单」),单向恒 0 分)。
+                tq_low = tq.lower()
+                if q_low and q_low in tq_low:
                     s += 0.4 * (len(q_low) / max(1, len(tq)))
+                elif tq_low and tq_low in q_low:
+                    s += 0.4 * (len(tq_low) / max(1, len(q_low)))
                 score = max(score, s)
             if classifier_cat and classifier_cat == it["cat"]:
                 score += 0.15
