@@ -397,6 +397,43 @@ def test_classify_offtopic_question_is_default():
     assert classify_filler_category("我个件几时到") == "check"
 
 
+def test_zero_action_scope_applies_when_category_pool_empty(tmp_path):
+    """请求类在该语言池中不存在(如 default 无条目)时,零动作约束仍生效——
+    旧版 preferred 保持整池、放宽分支不触发,会抽到 check 动作词
+    (2026-09-14 call-eabb80f0:manifest 归位后 default 类为空,约束不能漏)。"""
+
+    async def _case():
+        pools = {"cantonese": ["应承一。", "应承二。", "忙紧查。"]}  # 无 default 类
+        cats = {"cantonese": ["ack", "ack", "check"]}
+        d, _ = _director(tmp_path, pools=pools, cats=cats)
+        for _ in range(3):
+            e = d._pick("cantonese", "default")
+            assert e["cat"] != "check", f"default 类缺失时抽到动作词: {e}"
+
+    _run(_case())
+
+
+def test_manifest_zero_action_categories_have_no_action_words():
+    """数据守卫(0913 铁律 + 2026-09-14 call-eabb80f0):动作词只准出现在 check 类。
+    非 check 条目含动作词会在非业务轮穿帮——新增/改动垫话资产必须过本条。"""
+    import json
+    import re
+
+    from agent_runtime.fillers import FILLER_ASSETS_DIR
+
+    action = re.compile(r"(睇|看|查|核实|核實|跟进|跟進|物流|处理|處理|check|track|look|process)", re.IGNORECASE)
+    manifest = json.loads(
+        (FILLER_ASSETS_DIR / "manifest.json").read_text(encoding="utf-8")
+    )
+    bad = [
+        (lang, e["file"], e.get("cat"), e.get("text"))
+        for lang, entries in manifest.items()
+        for e in entries
+        if e.get("cat") != "check" and action.search(str(e.get("text")))
+    ]
+    assert not bad, f"零动作类条目含动作词(须归 check 类或改文案): {bad}"
+
+
 def test_load_manifest_shape(tmp_path):
     assets = _make_assets(tmp_path, {"zh": ["好的，您稍等。"]})
     m = load_manifest(assets)

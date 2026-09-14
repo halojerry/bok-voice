@@ -606,19 +606,22 @@ class FillerDirector:
         # (2026-09-14 call-c76832ac 实证:cantonese default 池=1 条,
         # 「冇問題，你稍等多一陣…」4 分钟播 3 次)。只有整池都在去重窗内
         # 才允许重复(池太小没有别的可选)。
-        # 零动作类请求(default/minimal/ack)的放宽档也限制在零动作池
-        # (2026-09-14 call-807629ca):动作词只准进 check 类(0913 乙节铁律),
-        # 旧版放宽到整池时,非业务轮会抽到 check 类动作词(「一加一等于几？」
-        # 的垫话放出「我即刻帮你核实」)。整池兜底仅当零动作池全在去重窗内。
-        second = pool
-        if category in _ZERO_ACTION_CATS:
-            zero = [e for e in pool if e.get("cat") in _ZERO_ACTION_CATS]
-            if zero:
-                second = zero
+        # 零动作类请求(default/minimal/ack):优先池与放宽档都被限制在零动作池内,
+        # 动作词只准进 check 类(0913 乙节铁律)。旧版两处漏:①请求类在该语言
+        # 池中不存在时 preferred 保持整池,约束被绕开;②放宽档落回整池。该语言
+        # 一条零动作条目都没有(如 en 全池皆 check)时无约束可用,退回整池——
+        # 这是数据缺口,由 manifest 打标审计测试看守。
+        zero = (
+            [e for e in pool if e.get("cat") in _ZERO_ACTION_CATS]
+            if category in _ZERO_ACTION_CATS
+            else []
+        )
+        if zero:
+            preferred = [e for e in preferred if e.get("cat") in _ZERO_ACTION_CATS] or zero
         recent = set(self._recent[-2:])
         candidates = [e for e in preferred if e["file"] not in recent]
         if not candidates and preferred is not pool:
-            candidates = [e for e in second if e["file"] not in recent]
+            candidates = [e for e in (zero or pool) if e["file"] not in recent]
         if not candidates:
             candidates = list(pool)
         entry = random.choice(candidates)

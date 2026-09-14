@@ -10,13 +10,13 @@
       "text": "您别急，我看一下您这单的情况。",
       "file": "zh-02.wav",
       "dur_s": 1.93,
-      "cat": "empathy"
+      "cat": "check"
     },
     {
       "text": "好的您说，我这就去核实。",
       "file": "zh-03.wav",
       "dur_s": 1.73,
-      "cat": "ack"
+      "cat": "check"
     },
     {
       "text": "嗯稍等，我查下物流。",
@@ -46,7 +46,7 @@
       "text": "别着急，我正在看您这单。",
       "file": "zh-08.wav",
       "dur_s": 1.84,
-      "cat": "empathy"
+      "cat": "check"
     },
     {
       "text": "嗯<#0.2#>您稍等，我看一下。",
@@ -84,7 +84,7 @@
       "text": "唔使急，你慢慢講，我幫你睇緊。",
       "file": "cantonese-01.wav",
       "dur_s": 2.09,
-      "cat": "empathy"
+      "cat": "check"
     },
     {
       "text": "好嘅，你稍等一陣，我即刻幫你核實。",
@@ -108,19 +108,19 @@
       "text": "好，你講先，我而家幫你睇返。",
       "file": "cantonese-05.wav",
       "dur_s": 1.45,
-      "cat": "ack"
+      "cat": "check"
     },
     {
       "text": "冇問題，你稍等多一陣，我跟進緊。",
       "file": "cantonese-06.wav",
       "dur_s": 1.56,
-      "cat": "default"
+      "cat": "check"
     },
     {
       "text": "唔使擔心，我幫你睇緊先。",
       "file": "cantonese-07.wav",
       "dur_s": 1.72,
-      "cat": "empathy"
+      "cat": "check"
     },
     {
       "text": "好嘅，你等陣，我幫你查下先。",
@@ -150,7 +150,7 @@
       "text": "收到，唔好急，等我幫你睇下先。",
       "file": "cantonese-12.wav",
       "dur_s": 1.79,
-      "cat": "empathy"
+      "cat": "check"
     },
     {
       "text": "明白，麻煩你稍等多一陣，我即刻睇。",
@@ -200,7 +200,7 @@
       "text": "Checking your order now.",
       "file": "en-07.wav",
       "dur_s": 1.23,
-      "cat": "minimal"
+      "cat": "check"
     },
     {
       "text": "Give me a second to verify it.",
@@ -212,7 +212,7 @@
       "text": "Checking the shipping info now.",
       "file": "en-09.wav",
       "dur_s": 1.34,
-      "cat": "default"
+      "cat": "check"
     },
     {
       "text": "Sure I'll look into that for you right away.",
