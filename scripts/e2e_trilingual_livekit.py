@@ -143,7 +143,17 @@ async def run_case(room: rtc.Room, audio_source: rtc.AudioSource, case: dict) ->
     agent_audio.clear()
     await asyncio.sleep(0.5)
 
-    pcm = tts_pcm(case["text"], case["tts_lang"])
+    # 间歇哑根因修复(2026-09-13):同步 httpx 阻塞事件循环→livekit 心跳饿死→
+    # 连接静默断(cantonese D/E 腿「TTS 不启动+零轮」同根因)。to_thread 隔离。
+    # E2E_TTS_ENGINE=minimax:话音走 MiniMax 云合成(本地 TTS 粤语短词 ASR 可懂
+    # 度差,「拼多多」→「二。二。」实测;MM 回读 2/3 全对)。
+    if os.environ.get("E2E_TTS_ENGINE", "") == "minimax":
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from scripts.mm_voice import mm_pcm
+        pcm = await asyncio.to_thread(mm_pcm, case["text"], case["tts_lang"])
+    else:
+        pcm = await asyncio.to_thread(tts_pcm, case["text"], case["tts_lang"])
     chunk = int(16000 * 0.1) * 2
     for i in range(0, len(pcm), chunk):
         seg = pcm[i : i + chunk]
@@ -162,6 +172,8 @@ async def run_case(room: rtc.Room, audio_source: rtc.AudioSource, case: dict) ->
     speech_secs = 0.0
     silent_secs = 0.0
     processed = 0
+    _last_len = 0
+    _stall = 0
     started = time.perf_counter()
     while time.perf_counter() - started < 90:
         # count only newly arrived 20ms frames
@@ -174,13 +186,28 @@ async def run_case(room: rtc.Room, audio_source: rtc.AudioSource, case: dict) ->
             else:
                 silent_secs += 0.02
             processed += step
-        if speech_secs >= 1.5 and silent_secs >= 5.0:
+        # 0913:产品回复已按【回复长度】变短(≤2 短句),旧 1.5s 语音门槛把短回复
+        # 当哑火跑满 90s——门槛经 E2E_MIN_SPEECH 可调(默认 0.8 匹配新常态)。
+        _min_speech = float(os.environ.get("E2E_MIN_SPEECH", "0.8"))
+        if speech_secs >= _min_speech and silent_secs >= 5.0:
             break
+        # 0913:livekit 音轨静默时不推帧(旧 silent_secs 只数「到达的静音帧」,
+        # 轨道一停就永不满 5 → 满窗 90s)。补字节量停滞判定:回复讲完、音频
+        # 不再增长 ≥5s 即视为说完。
+        if speech_secs >= _min_speech and len(agent_audio) - _last_len >= 5 * 32000:
+            pass  # 仍在增长(讲紧/有声)——继续等
+        elif speech_secs >= _min_speech and _stall >= 5:
+            break
+        _stall = _stall + 1 if len(agent_audio) == _last_len else 0
+        _last_len = len(agent_audio)
         await asyncio.sleep(1)
 
     room.off("track_subscribed", on_track)
     for t in read_tasks:
         t.cancel()
+    # 0913:cancel 后必须收尾 await——裸 cancel 下 _read 的 finally stream.aclose()
+    # 在已取消协程内挂起,read_tasks 泄漏令整腿永不返回(实机挂 15min 实证)。
+    await asyncio.gather(*read_tasks, return_exceptions=True)
     await asyncio.sleep(0.3)
 
     return {
