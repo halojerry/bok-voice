@@ -4,6 +4,15 @@ import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
+import {
+  emptyStepRefModel,
+  parseStepRef,
+  serializeStepRef,
+  validateStepRef,
+  type StepRefBlock,
+  type StepRefIssue,
+  type StepRefModel,
+} from "@/lib/step-ref";
 
 const LANGS = [
   ["zh", "普通话"],
@@ -48,7 +57,8 @@ const EMPTY = {
   hotwords: "",
 };
 
-const STEPS_HINT = "可用变量:{姓名} {快递单号} {快递尾号} {物流公司} {收货地址}。\n参考说法是给 AI 的要点参考,不是逐字稿——AI 会结合客户原话用自己的话讲。\n勾选「直念」的步骤:进入该步的当轮 AI 逐字念参考说法首行,适合通知/道歉等要逐字一致的内容。";
+const STEPS_HINT =
+  "可用变量:{姓名} {名字} {快递单号} {快递尾号} {物流公司} {收货地址} {电话} {聯絡方式}（EN 模板:{name} {tracking_tail} {courier} {contact}）。\n主话术是给 AI 的要点参考,不是逐字稿——AI 会结合客户原话用自己的话讲。\n分支=「如果客户… → …」(客户反应 → 应对),注意=「注意:…」(操作要点),AI 会按客户实际回应挑对应分支。\n勾选「直念」的步骤:进入该步的当轮 AI 逐字念主话术首行(建议 ≤50 字,超 80 字会被截首句),适合通知/道歉等要逐字一致的内容。";
 
 /** 把 steps 序列化/反序列化为 steps_json(存库)。say 只在 true 时写出(省体积)。 */
 function stepsToJson(steps: FlowStep[]): string {
@@ -72,6 +82,52 @@ function jsonToSteps(raw: unknown): FlowStep[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * 每步的编辑态。ref 仍是唯一存储形态（steps_json 格式不变）：结构模式下
+ * 编辑的是 parse 出来的结构化模型，保存时现场 serialize 回 ref；原文模式
+ * 直接编辑 ref 原文（raw），切回结构模式时重新 parse——双向同步经
+ * lib/step-ref.ts 的 parse/serialize（与后端 flow.py 同构，无损往返）。
+ */
+interface StepDraft {
+  goal: string;
+  say: boolean;
+  model: StepRefModel;
+  /** null=结构模式；非 null=原文模式（用户直接编辑的 ref 原文）。 */
+  raw: string | null;
+}
+
+function stepToDraft(s: FlowStep): StepDraft {
+  return { goal: s.goal, say: Boolean(s.say), model: parseStepRef(s.ref), raw: null };
+}
+
+/** 这一步当前实际会保存的 ref（原文模式用原文，结构模式按当前模板语言序列化）。 */
+function draftRef(d: StepDraft, lang: string): string {
+  return d.raw !== null ? d.raw : serializeStepRef(d.model, lang);
+}
+
+function draftsToSteps(drafts: StepDraft[], lang: string): FlowStep[] {
+  return drafts.map((d) => ({ goal: d.goal, ref: draftRef(d, lang), say: d.say }));
+}
+
+/** 单步校验（原文模式先 parse 回模型再校验，规则与保存结果一致）。 */
+function stepIssuesOf(d: StepDraft, lang: string): StepRefIssue[] {
+  return validateStepRef(d.raw !== null ? parseStepRef(d.raw) : d.model, { say: d.say, goal: d.goal, lang });
+}
+
+/** 行内红/黄提示列表（warn=红：AI 收不到/会被截；info=黄：软提示请确认）。 */
+function IssueList({ issues }: { issues: StepRefIssue[] }) {
+  if (issues.length === 0) return null;
+  return (
+    <div className="mt-0.5 space-y-0.5">
+      {issues.map((x, k) => (
+        <p key={k} className={`text-[11px] leading-relaxed ${x.level === "warn" ? "text-red-300" : "text-amber-300"}`}>
+          {x.msg}
+        </p>
+      ))}
+    </div>
+  );
 }
 
 /** 旧式四段 → 步骤(与 agent flow.template_to_steps 同款 goal 标签)。 */
@@ -107,19 +163,24 @@ const STEPS_EXAMPLES: Record<string, FlowStep[]> = {
   ],
   en: [
     { goal: "Confirm the parcel belongs to {name}", ref: "Hello, is this {name}? We're {courier}. A parcel (tracking ending {tracking_tail}) was lost in transit and I'd like to verify with you." },
-    { goal: "Explain 1-for-2 compensation and reassure", ref: "It's our responsibility. We have shipping insurance, so we'll compensate 2x. You won't lose money.\nIf they ask why → it was lost in transit, we take full responsibility\nIf they worry about payment → it goes straight to their WeChat wallet" },
-    { goal: "Ask for their WeChat ID; specialist will add them", ref: "The claim is handled by our WeChat consumer-protection specialist. Could you give me your WeChat ID? The specialist will add you and walk you through the steps.\nIf they're busy right now → ask when or how works best and arrange a follow-up." },
+    { goal: "Explain 1-for-2 compensation and reassure", ref: "It's our responsibility. We have shipping insurance, so we'll compensate 2x. You won't lose money.\nIf the customer asks why → it was lost in transit, we take full responsibility\nIf the customer worries about payment → it goes straight to their WeChat wallet" },
+    { goal: "Ask for their WeChat ID; specialist will add them", ref: "The claim is handled by our WeChat consumer-protection specialist. Could you give me your WeChat ID? The specialist will add you and walk you through the steps.\nIf the customer is busy right now → ask when or how works best and arrange a follow-up." },
     { goal: "Confirm and close politely", ref: "Thank you for your time. We'll follow up — reach out anytime. Goodbye!" },
   ],
 };
 
-function fillExample(form: typeof EMPTY, setForm: (f: typeof EMPTY) => void, lang: string, setSteps: (s: FlowStep[]) => void) {
+function fillExample(
+  form: typeof EMPTY,
+  setForm: (f: typeof EMPTY) => void,
+  lang: string,
+  setSteps: (s: StepDraft[]) => void,
+) {
   // 分步为主:示例直接填成分步(含分支写法示范),四段清空(由步骤统一承载)。
   const steps = STEPS_EXAMPLES[lang];
   if (!steps) return;
   const nameByLang = { cantonese: "理赔·分步（粤语示例）", zh: "理赔·分步（普通话示例）", en: "Claims · Step-by-step (English)" };
   setForm({ ...form, name: nameByLang[lang as keyof typeof nameByLang] ?? "", opening: "", core: "", objection: "", closing: "", language: lang });
-  setSteps(steps);
+  setSteps(steps.map(stepToDraft));
 }
 
 /** 解析单元格：去掉首尾空白。 */
@@ -197,7 +258,7 @@ export default function TemplatesPage() {
   const [rows, setRows] = useState<Record<string, unknown>[]>([]);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState(EMPTY);
-  const [steps, setSteps] = useState<FlowStep[]>([]);
+  const [steps, setSteps] = useState<StepDraft[]>([]);
   const [showLegacy, setShowLegacy] = useState(false);
   const [showTableImport, setShowTableImport] = useState(false);
   const [tableText, setTableText] = useState("");
@@ -238,7 +299,7 @@ export default function TemplatesPage() {
     setForm(f);
     // 分步为主:旧模板(只有四段无 steps)载入时自动转成步骤,让用户按步骤编辑。
     const saved = jsonToSteps(row.steps_json);
-    setSteps(saved.length > 0 ? saved : fourSectionsToSteps(f));
+    setSteps((saved.length > 0 ? saved : fourSectionsToSteps(f)).map(stepToDraft));
     setOk(false);
   }
 
@@ -251,7 +312,12 @@ export default function TemplatesPage() {
     setOk(false);
     try {
       // 分步为主:没填步骤但有四段 → 自动转成步骤(统一存 steps_json,不再存四段)。
-      const finalSteps = steps.length > 0 ? steps : fourSectionsToSteps(form);
+      // 结构模式步骤现场序列化成 ref(存储形态不变,与 lib/step-ref.ts 同构后端);
+      // 原文模式步骤直接保存用户编辑的原文。
+      const finalSteps = draftsToSteps(
+        steps.length > 0 ? steps : fourSectionsToSteps(form).map(stepToDraft),
+        form.language,
+      );
       // 空白步(goal+ref 全空)会被 stepsToJson 静默过滤——计数提示,防「明明填了 N 步存出来少几步」困惑(2026-09-09 QA B2)。
       const droppedBlanks = finalSteps.filter((s) => !s.goal.trim() && !s.ref.trim()).length;
       if (droppedBlanks > 0) setErr(`已忽略 ${droppedBlanks} 个空白步（目标与参考说法都为空）。`);
@@ -286,11 +352,40 @@ export default function TemplatesPage() {
       setTableMsg(error);
       return;
     }
-    setSteps((prev) => [...prev, ...parsed]);
+    setSteps((prev) => [...prev, ...parsed.map(stepToDraft)]);
     setTableMsg(`已从表格导入 ${parsed.length} 步。`);
     setShowTableImport(false);
     setTableText("");
   }
+
+  /** 单步 结构模式 ↔ 原文模式 双向同步：进原文=serialize 当前模型；回结构=parse 原文。 */
+  function toggleRawMode(i: number) {
+    setSteps((s) =>
+      s.map((d, j) => {
+        if (j !== i) return d;
+        return d.raw === null
+          ? { ...d, raw: serializeStepRef(d.model, form.language) }
+          : { ...d, model: parseStepRef(d.raw), raw: null };
+      }),
+    );
+  }
+
+  /** 结构模式下改某步的结构化模型（ref 在保存时才序列化）。 */
+  function updateDraftModel(i: number, fn: (m: StepRefModel) => StepRefModel) {
+    setSteps((s) => s.map((x, j) => (j === i ? { ...x, model: fn(x.model) } : x)));
+  }
+
+  // 保存按钮旁的校验汇总：跨全部步骤聚合（空白步保存时会被过滤，不重复报）。
+  const saveIssues = steps
+    .map((d, i) => ({
+      step: i + 1,
+      empty: !d.goal.trim() && draftRef(d, form.language).trim() === "",
+      issues: stepIssuesOf(d, form.language),
+    }))
+    .filter((x) => !x.empty)
+    .flatMap((x) => x.issues.map((issue) => ({ step: x.step, issue })));
+  const warnCount = saveIssues.filter((x) => x.issue.level === "warn").length;
+  const infoCount = saveIssues.length - warnCount;
 
   const textarea = "w-full resize-none rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)";
 
@@ -377,14 +472,18 @@ export default function TemplatesPage() {
               <span className="label">分步话术（推荐 · 通话按步骤逐步推进，不会一口气讲完）</span>
               <button
                 className="btn-ghost px-2 py-0.5 text-xs"
-                onClick={() => setSteps((s) => [...s, { goal: "", ref: "" }])}
+                onClick={() => setSteps((s) => [...s, { goal: "", say: false, model: emptyStepRefModel(), raw: null }])}
               >
                 + 加一步
               </button>
             </div>
             <p className="mt-1 whitespace-pre-line text-[11px] leading-relaxed muted">{STEPS_HINT}</p>
             <p className="mt-1 text-[11px] leading-relaxed muted">
-              参考说法可分行写分支：<span className="text-accent">如果客户… → 就…</span>，AI 会看客户实际反应挑对应分支回答。
+              每步三个编辑块：<span className="text-accent">主话术</span>（AI 的要点参考）、
+              <span className="text-accent">分支</span>（如果客户… → …，AI 按客户实际回应挑一条）、
+              <span className="text-accent">注意</span>（操作要点，每轮提醒 AI）。
+              保存时自动生成规范 ref 文本（存储格式不变）；写法不规范的行会收进「原文行」并红/黄提示，绝不静默丢弃。
+              需要精细控制时可对单步切「原文模式」直接改 ref 原文，切回结构模式会重新解析。
             </p>
             {steps.length === 0 && (
               <p className="mt-1 text-[11px] muted">
@@ -392,39 +491,159 @@ export default function TemplatesPage() {
               </p>
             )}
             <div className="mt-2 space-y-3">
-              {steps.map((st, i) => (
+              {steps.map((d, i) => {
+                const issues = stepIssuesOf(d, form.language);
+                // 行内提示按编辑块归位：script/unknown 整块显示（信息里带行号），branch/note 逐行显示。
+                const perBlock = (block: StepRefBlock, index?: number) =>
+                  issues.filter((x) => x.block === block && (index === undefined || x.index === index));
+                return (
                 <div key={i} className="rounded-lg border border-(--card-border) bg-white/5 p-2">
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-bold text-accent">第 {i + 1} 步</span>
                     <div className="flex gap-1">
                       <button className="btn-ghost px-1.5 py-0 text-xs" disabled={i === 0} onClick={() => setSteps((s) => { const n = [...s]; [n[i - 1], n[i]] = [n[i], n[i - 1]]; return n; })}>↑</button>
                       <button className="btn-ghost px-1.5 py-0 text-xs" disabled={i === steps.length - 1} onClick={() => setSteps((s) => { const n = [...s]; [n[i + 1], n[i]] = [n[i], n[i + 1]]; return n; })}>↓</button>
+                      <button
+                        className="btn-ghost px-1.5 py-0 text-xs"
+                        title={d.raw === null ? "切换到原文模式:直接编辑这一步的 ref 原文" : "切回结构模式:按原文重新解析成 主话术/分支/注意"}
+                        onClick={() => toggleRawMode(i)}
+                      >
+                        {d.raw === null ? "原文模式" : "结构模式"}
+                      </button>
                       <button className="btn-ghost px-1.5 py-0 text-xs text-red-300" onClick={() => setSteps((s) => s.filter((_, j) => j !== i))}>删</button>
                     </div>
                   </div>
                   <input
                     className="mt-1.5 w-full rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--accent)"
                     placeholder="这一步要达成的目标(如:确认包裹是不是{姓名}本人的)"
-                    value={st.goal}
+                    value={d.goal}
                     onChange={(e) => setSteps((s) => s.map((x, j) => (j === i ? { ...x, goal: e.target.value } : x)))}
                   />
-                  <textarea
-                    className={`mt-1.5 h-20 ${textarea} text-xs`}
-                    placeholder={"参考说法(要点+分支;AI 结合客户原话用自己的话讲)\n例:你好,请问係咪{姓名}?我哋係{物流公司}…\n如果客户唔记得 → 提佢下单填嘅地址帮佢回忆"}
-                    value={st.ref}
-                    onChange={(e) => setSteps((s) => s.map((x, j) => (j === i ? { ...x, ref: e.target.value } : x)))}
-                  />
+                  {d.raw === null ? (
+                    <div className="mt-1.5 space-y-2">
+                      <div>
+                        <span className="text-[11px] text-(--stage-muted)">主话术(AI 的要点参考,不是逐字稿;直念步逐字念首行)</span>
+                        <textarea
+                          className={`mt-1 h-16 ${textarea} text-xs`}
+                          placeholder={"这一步对客户讲的核心内容\n例:你好,请问係咪{姓名}?我哋係{物流公司}…"}
+                          value={d.model.scriptLines.join("\n")}
+                          onChange={(e) => updateDraftModel(i, (m) => ({ ...m, scriptLines: e.target.value.split("\n") }))}
+                        />
+                        <IssueList issues={perBlock("script")} />
+                      </div>
+                      <div>
+                        <div className="flex items-center justify-between">
+                          <span className="text-[11px] text-(--stage-muted)">分支(客户反应 → 应对;AI 按客户实际回应挑一条讲)</span>
+                          <button
+                            className="btn-ghost px-1.5 py-0 text-[11px]"
+                            onClick={() => updateDraftModel(i, (m) => ({ ...m, branches: [...m.branches, { cond: "", resp: "" }] }))}
+                          >
+                            + 加分支
+                          </button>
+                        </div>
+                        {d.model.branches.length === 0 && (
+                          <p className="mt-0.5 text-[11px] muted">还没有分支——客户问/嫌/不记得时 AI 没有现成应对，只能自由发挥。</p>
+                        )}
+                        {d.model.branches.map((b, r) => (
+                          <div key={r}>
+                            <div className="mt-1 flex items-center gap-1">
+                              <span className="shrink-0 text-[11px] text-accent">{form.language === "en" ? "If the customer" : "如果客户"}</span>
+                              <input
+                                className="min-w-0 flex-1 rounded-md border border-(--card-border) bg-transparent px-1.5 py-0.5 text-xs outline-hidden focus:border-(--accent)"
+                                placeholder={form.language === "en" ? "asks why" : "问为什么赔"}
+                                value={b.cond}
+                                onChange={(e) => updateDraftModel(i, (m) => ({ ...m, branches: m.branches.map((x, k) => (k === r ? { ...x, cond: e.target.value } : x)) }))}
+                              />
+                              <span className="shrink-0 text-[11px] muted">→</span>
+                              <input
+                                className="min-w-0 flex-1 rounded-md border border-(--card-border) bg-transparent px-1.5 py-0.5 text-xs outline-hidden focus:border-(--accent)"
+                                placeholder={form.language === "en" ? "it was lost in transit" : "说明是运输途中遗失"}
+                                value={b.resp}
+                                onChange={(e) => updateDraftModel(i, (m) => ({ ...m, branches: m.branches.map((x, k) => (k === r ? { ...x, resp: e.target.value } : x)) }))}
+                              />
+                              <button
+                                className="btn-ghost shrink-0 px-1.5 py-0 text-xs text-red-300"
+                                title="删除这条分支"
+                                onClick={() => updateDraftModel(i, (m) => ({ ...m, branches: m.branches.filter((_, k) => k !== r) }))}
+                              >
+                                ✕
+                              </button>
+                            </div>
+                            <IssueList issues={perBlock("branch", r)} />
+                          </div>
+                        ))}
+                      </div>
+                      <div>
+                        <div className="flex items-center justify-between">
+                          <span className="text-[11px] text-(--stage-muted)">注意(操作要点,每轮都会提示 AI)</span>
+                          <button
+                            className="btn-ghost px-1.5 py-0 text-[11px]"
+                            onClick={() => updateDraftModel(i, (m) => ({ ...m, notes: [...m.notes, ""] }))}
+                          >
+                            + 加注意
+                          </button>
+                        </div>
+                        {d.model.notes.map((n, r) => (
+                          <div key={r}>
+                            <div className="mt-1 flex items-center gap-1">
+                              <span className="shrink-0 text-[11px] text-accent">{form.language === "en" ? "Note:" : "注意:"}</span>
+                              <input
+                                className="min-w-0 flex-1 rounded-md border border-(--card-border) bg-transparent px-1.5 py-0.5 text-xs outline-hidden focus:border-(--accent)"
+                                placeholder="如:语气保持礼貌"
+                                value={n}
+                                onChange={(e) => updateDraftModel(i, (m) => ({ ...m, notes: m.notes.map((x, k) => (k === r ? e.target.value : x)) }))}
+                              />
+                              <button
+                                className="btn-ghost shrink-0 px-1.5 py-0 text-xs text-red-300"
+                                title="删除这条注意"
+                                onClick={() => updateDraftModel(i, (m) => ({ ...m, notes: m.notes.filter((_, k) => k !== r) }))}
+                              >
+                                ✕
+                              </button>
+                            </div>
+                            <IssueList issues={perBlock("note", r)} />
+                          </div>
+                        ))}
+                      </div>
+                      {d.model.unknownLines.length > 0 && (
+                        <div>
+                          <span className="text-[11px] text-(--stage-muted)">原文行(AI 也看得到,但不当分支/注意生效——请改写进上面两块,这里只保底不丢字)</span>
+                          <textarea
+                            className={`mt-1 h-14 ${textarea} text-xs`}
+                            value={d.model.unknownLines.join("\n")}
+                            onChange={(e) => updateDraftModel(i, (m) => ({ ...m, unknownLines: e.target.value.split("\n") }))}
+                          />
+                          <IssueList issues={perBlock("unknown")} />
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div>
+                      <textarea
+                        className={`mt-1.5 h-32 ${textarea} text-xs`}
+                        placeholder={"ref 原文:首行=主话术;分支行「如果客户… → …」/「If the customer … → …」;注意行「注意:…」/「Note: …」"}
+                        value={d.raw}
+                        onChange={(e) => setSteps((s) => s.map((x, j) => (j === i ? { ...x, raw: e.target.value } : x)))}
+                      />
+                      <p className="mt-0.5 text-[11px] leading-relaxed muted">
+                        原文模式：直接改这一步的 ref 原文（保存的存储形态）；切回结构模式会按原文重新解析成 主话术/分支/注意，解析不出的行进「原文行」，不会丢。
+                      </p>
+                      <IssueList issues={issues} />
+                    </div>
+                  )}
+                  <IssueList issues={perBlock("step")} />
                   <label className="mt-1 flex items-center gap-1.5 text-[11px] muted">
                     <input
                       type="checkbox"
                       className="size-3 accent-(--accent)"
-                      checked={Boolean(st.say)}
+                      checked={d.say}
                       onChange={(e) => setSteps((s) => s.map((x, j) => (j === i ? { ...x, say: e.target.checked } : x)))}
                     />
-                    直念(进入该步的当轮逐字念首行,适合通知/道歉等合规内容)
+                    直念(进入该步的当轮逐字念主话术首行,适合通知/道歉等合规内容)
                   </label>
                 </div>
-              ))}
+                );
+              })}
             </div>
             <div className="mt-3 flex flex-wrap gap-2">
               <button className="btn-ghost text-xs" onClick={() => setShowTableImport((v) => !v)}>
@@ -436,7 +655,7 @@ export default function TemplatesPage() {
                 </button>
               ))}
               {(form.opening || form.core || form.objection || form.closing) && (
-                <button className="btn-ghost text-xs" onClick={() => { setSteps(fourSectionsToSteps(form)); setForm({ ...form, opening: "", core: "", objection: "", closing: "" }); }}>
+                <button className="btn-ghost text-xs" onClick={() => { setSteps(fourSectionsToSteps(form).map(stepToDraft)); setForm({ ...form, opening: "", core: "", objection: "", closing: "" }); }}>
                   从旧四段导入步骤
                 </button>
               )}
@@ -518,6 +737,22 @@ export default function TemplatesPage() {
               {LANGS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
             </select>
           </label>
+          {saveIssues.length > 0 && (
+            <div className="space-y-0.5 rounded-lg border border-(--card-border) bg-white/5 p-2 text-[11px] leading-relaxed">
+              <p className="muted">
+                保存前校验：
+                {warnCount > 0 && <span className="text-red-300">{warnCount} 条警告（AI 可能收不到/会被截断）</span>}
+                {warnCount > 0 && infoCount > 0 && "，"}
+                {infoCount > 0 && <span className="text-amber-300">{infoCount} 条提示（请确认）</span>}
+              </p>
+              {saveIssues.slice(0, 8).map(({ step, issue }, k) => (
+                <p key={k} className={issue.level === "warn" ? "text-red-300" : "text-amber-300"}>
+                  第 {step} 步：{issue.msg}
+                </p>
+              ))}
+              {saveIssues.length > 8 && <p className="muted">…其余 {saveIssues.length - 8} 条见各步骤卡片内提示。</p>}
+            </div>
+          )}
           <div className="flex items-center gap-3">
             <button className="btn-primary" onClick={save}>{editingId ? "保存修改" : "创建模板"}</button>
             {editingId && <button className="btn-ghost" onClick={() => { setEditingId(null); setForm(EMPTY); setSteps([]); }}>取消</button>}
