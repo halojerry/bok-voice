@@ -2122,7 +2122,11 @@ async def entrypoint(ctx):
                 from .qa_gate import QaIndex
 
                 _qa_index = QaIndex(_qa_rows)
-                print(f"[agent] qa fastpath on entries={len(_qa_rows)} (call {room_name})", flush=True)
+                print(
+                    f"[agent] qa fastpath on entries={len(_qa_rows)} embedding={_qa_index.backend}"
+                    f" (call {room_name})",
+                    flush=True,
+                )
             else:
                 _qa_bump("disabled")  # 空表:闸门整体惰性,等同关闭
         except Exception as exc:  # noqa: BLE001 - 快答库不可用零影响

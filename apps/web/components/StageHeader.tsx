@@ -12,6 +12,7 @@ const NAV = [
   { href: "/knowledge", label: "知识库" },
   { href: "/personas", label: "人设" },
   { href: "/templates", label: "话术" },
+  { href: "/qa", label: "快答库" },
   { href: "/interpret", label: "同传" },
   { href: "/supervisor", label: "主管台" },
   { href: "/reports", label: "报表" },

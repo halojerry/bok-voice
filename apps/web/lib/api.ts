@@ -67,6 +67,15 @@ export const api = {
   // 由调用方直接 fetch blob,不经 JSON request)。
   listQaEntries: (enabled = 1) =>
     request<Record<string, unknown>[]>(`/api/qa-entries?enabled=${enabled}`),
+  // 快答库管理页:不带 enabled 过滤(后端 enabled 缺省=None 即全量,启停条目都要能看到)。
+  listAllQaEntries: (accountId = "acc-001") =>
+    request<Record<string, unknown>[]>(`/api/qa-entries?account_id=${accountId}`),
+  createQaEntry: (body: unknown) =>
+    request<Record<string, unknown>>("/api/qa-entries", { method: "POST", body: JSON.stringify(body) }),
+  updateQaEntry: (id: string, body: unknown) =>
+    request<Record<string, unknown>>(`/api/qa-entries/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) }),
+  deleteQaEntry: (id: string) =>
+    request<Record<string, unknown>>(`/api/qa-entries/${encodeURIComponent(id)}`, { method: "DELETE" }),
   getSettings: () => request<Record<string, unknown>>("/api/settings"),
   saveSettings: (body: unknown) => request<Record<string, unknown>>("/api/settings", { method: "PUT", body: JSON.stringify(body) }),
   // 官方 TokenSourceResponse 契约({serverUrl, participantToken});TokenSource

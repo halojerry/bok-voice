@@ -73,6 +73,66 @@ def test_match_step_scope():
     assert miss2 is None
 
 
+# ---- 语义档接线(2026-09-14 v2) ----
+
+class _FakeSemanticEmbed:
+    """替身:按语义簇给向量(同簇 cos=1)——证明注入/选档/阈值/纯余弦打分链路,
+    不模拟真实模型的连续相似度尺度。"""
+
+    _CLUSTER = ("几时送到", "幾時送到", "什么时候能到", "什麼時候能到", "多久到", "要等多久")
+
+    def embed(self, texts):
+        return [
+            [1.0, 0.0, 0.0] if any(k in t for k in self._CLUSTER) else [0.0, 1.0, 0.0]
+            for t in texts
+        ]
+
+
+def test_semantic_backend_paraphrase_hit_pure_cosine():
+    """语义档:释义句(字面不同)命中——纯余弦打分,阈值取语义档默认。"""
+    idx = QaIndex(_entries(), embed=_FakeSemanticEmbed(), backend="mlx:test")
+    assert idx.backend == "mlx:test" and idx._semantic is True
+    entry, score = idx.match("什么时候能到", lang="zh")
+    assert entry is not None and entry["id"] == "qa1"
+    assert score >= 0.72  # 纯余弦尺度(混合公式下上限 0.6,该阈值不可达)
+    # 不同簇不命中
+    miss, _ = idx.match("今日天氣點呀", lang="zh")
+    assert miss is None
+
+
+def test_lexical_backend_keeps_mixed_scoring_and_threshold():
+    """词法档(默认)打分/阈值零变化:0.6×cos+0.4×子串、0.90。"""
+    idx = QaIndex(_entries())
+    assert idx.backend == "lexical" and idx._semantic is False
+    assert idx._threshold == 0.90
+    entry, score = idx.match("你們幾時送到", lang="zh")
+    assert entry is not None and score >= 0.90
+
+
+def test_semantic_threshold_env_override(monkeypatch):
+    monkeypatch.setenv("BOK_QA_MATCH_THRESHOLD", "0.55")
+    idx = QaIndex(_entries(), embed=_FakeSemanticEmbed(), backend="mlx:demo")
+    assert idx._threshold == 0.55
+    lex = QaIndex(_entries())
+    assert lex._threshold == 0.55  # 显式 env 对两档都优先
+    monkeypatch.delenv("BOK_QA_MATCH_THRESHOLD", raising=False)
+
+
+def test_build_qa_embedder_defaults_lexical_and_falls_back(monkeypatch):
+    """未设模型名 → 词法;模型名不可加载 → 回退词法,绝不抛(快答库不因模型缺失失效)。"""
+    from agent_runtime.qa_gate import build_qa_embedder
+
+    monkeypatch.delenv("QA_EMBEDDING_MODEL", raising=False)
+    monkeypatch.delenv("KB_EMBEDDING_MODEL", raising=False)
+    emb, backend = build_qa_embedder()
+    assert backend == "lexical" and emb is not None
+
+    monkeypatch.setenv("QA_EMBEDDING_MODEL", "mlx-community/definitely-not-a-real-model-zzz")
+    emb2, backend2 = build_qa_embedder()
+    assert backend2 == "lexical" and emb2 is not None
+    monkeypatch.delenv("QA_EMBEDDING_MODEL", raising=False)
+
+
 # ---- 挖掘 ----
 
 def test_mine_qa_pairs_counts_calls_not_turns():
