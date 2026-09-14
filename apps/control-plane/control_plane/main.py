@@ -43,10 +43,14 @@ from .auth import (
     JWT_TTL_S,
     auth_required,
     create_token,
+    current_identity,
+    deny_cross_account,
     hash_password,
     identity_from_request,
     identity_gate,
     jwt_secret,
+    require_role,
+    scoped_account,
     verify_password,
 )
 from .schemas import (
@@ -310,7 +314,9 @@ def health() -> dict:
 
 
 @app.get("/api/settings")
-def get_settings(internal: bool = False) -> dict:
+def get_settings(request: Request, internal: bool = False) -> dict:
+    # 设置=节点运维面（含云端凭据），话务员不可见；agent 机器通道直通。
+    require_role(request, "admin", "root")
     raw = _repo().get_settings()
     if internal:
         return raw
@@ -320,7 +326,8 @@ def get_settings(internal: bool = False) -> dict:
 
 
 @app.put("/api/settings")
-def put_settings(req: SettingsRequest) -> dict:
+def put_settings(req: SettingsRequest, request: Request) -> dict:
+    require_role(request, "admin", "root")
     existing = _repo().get_settings()
     new_values = {
         "asr": req.asr.model_dump(),
@@ -401,7 +408,8 @@ async def tts_voices() -> list[dict]:
 
 
 @app.delete("/api/tts/voices/{voice_id}")
-async def tts_delete_voice(voice_id: str) -> dict:
+async def tts_delete_voice(voice_id: str, request: Request) -> dict:
+    require_role(request, "admin", "root")
     """删除已克隆音色（preset 不可删；同步清理 registry/缓存/参考音频）。"""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -442,11 +450,13 @@ async def tts_delete_voice(voice_id: str) -> dict:
 
 @app.post("/api/tts/voices")
 async def tts_register_voice(
+    request: Request,
     file: UploadFile = File(...),
     voice_id: str = Form(...),
     ref_text: str = Form(...),
     language: str = Form("zh"),
 ) -> dict:
+    require_role(request, "admin", "root")
     try:
         files = {"file": (file.filename or "reference.wav", await file.read())}
         data = {
@@ -509,7 +519,9 @@ def tts_filler_preview(lang: str = "zh", i: int = 0) -> Response:
 
 
 @app.post("/api/tts/preview")
-async def tts_preview(payload: dict) -> Response:
+async def tts_preview(payload: dict, request: Request) -> Response:
+    # 试听会真实消耗云端 TTS 配额（MiniMax），auth-on 时归管理面。
+    require_role(request, "admin", "root")
     """试听一段 TTS。provider=qwen3_tts 走本地 sidecar；provider=minimax 走云端 MiniMax
     （voice 是 MiniMax 音色 ID，如 Cantonese_Male_news_anchor_vv2）。返回 WAV。"""
     provider = str(payload.get("provider") or "qwen3_tts").lower()
@@ -748,7 +760,7 @@ def update_user(user_id: str, req: UpdateUserRequest, request: Request) -> dict:
 
 
 @app.post("/api/token", response_model=TokenResponse, status_code=201)
-def token(req: TokenRequest) -> TokenResponse:
+def token(req: TokenRequest, request: Request) -> TokenResponse:
     """签发参与者 token——LiveKit 官方 TokenSource endpoint 契约。
 
     请求体兼容两种形态:官方 TokenSourceRequest(snake_case: room_name /
@@ -756,6 +768,16 @@ def token(req: TokenRequest) -> TokenResponse:
     业务字段(call_id/role)。响应即官方 TokenSourceResponse({serverUrl,
     participantToken}),任何按标准实现的客户端(playground/Swift/Flutter…)可直接消费。
     """
+    # B2：auth-on 时房 token 需要身份（机器通道直通）；supervisor 角色是主管
+    # 语义（旁听/接管），话务员不得自签。auth-off 开发形态全部放行。
+    # 注意用 _ident：本函数后文的 `identity` 是参与者身份字符串（官方字段），
+    # 会遮蔽此处的用户身份对象。
+    _ident = current_identity(request)
+    _machine = getattr(request.state, "machine", False)
+    if auth_required() and _ident is None and not _machine:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    if _ident is not None and _ident.role not in ("root", "admin") and (req.role or "").strip().lower() == "supervisor":
+        raise HTTPException(status_code=403, detail="forbidden")
     key = getattr(app.state, "lk_key", "") or os.environ.get("LIVEKIT_API_KEY", "")
     secret = getattr(app.state, "lk_secret", "") or os.environ.get("LIVEKIT_API_SECRET", "")
     url = getattr(app.state, "lk_url", "") or os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880")
@@ -832,6 +854,12 @@ def token(req: TokenRequest) -> TokenResponse:
         _call = _repo().get_call(room) or {}
     except Exception:
         _call = {}
+    # B2 归属：有身份且非 root 时，只能给本账号的通话签房 token（记录缺失保守放行，
+    # 沿用 C2 幽灵守卫同口径）。
+    if _ident is not None and _ident.role != "root" and _call:
+        _call_acct = str(_call.get("account_id") or "")
+        if _call_acct and _call_acct != _ident.account_id:
+            raise HTTPException(status_code=404, detail="not found")
     # C2 闸3·幽灵重连源(2026-09-13,call-6bd59b40):agent-ui TokenSource 带
     # 自动续签,房间被删后 livekit 全量重连会再来要 token——旧版照签,operator
     # 重连重建房 → 幽灵 job 重放开场白。A 线明确知道已 ended → 拒签(409);
@@ -922,7 +950,11 @@ def token(req: TokenRequest) -> TokenResponse:
 
 
 @app.post("/api/calls")
-def create_call(req: CreateCallRequest) -> dict:
+def create_call(req: CreateCallRequest, request: Request) -> dict:
+    identity = current_identity(request)
+    if identity is not None and identity.role != "root":
+        # 话务员/主管建通话强制落本账号（root 可显式指定）。
+        req = req.model_copy(update={"account_id": identity.account_id})
     return _create_call_in(_repo(), req)
 
 
@@ -975,7 +1007,8 @@ def _effective_providers(settings: dict) -> dict:
 
 
 @app.get("/api/calls")
-def list_calls(account_id: str = "acc-001", status: str = "") -> list[dict]:
+def list_calls(request: Request, account_id: str = "acc-001", status: str = "") -> list[dict]:
+    account_id = scoped_account(request, account_id)
     calls = _repo().list_calls(account_id, status)
     stats = _repo().turn_stats()
     for c in calls:
@@ -986,15 +1019,16 @@ def list_calls(account_id: str = "acc-001", status: str = "") -> list[dict]:
 
 
 @app.get("/api/calls/{call_id}")
-def get_call(call_id: str) -> dict:
-    call = _repo().get_call(call_id)
+def get_call(call_id: str, request: Request) -> dict:
+    call = deny_cross_account(request, _repo().get_call(call_id))
     if not call:
         raise HTTPException(404, "call not found")
     return call
 
 
 @app.delete("/api/calls/{call_id}")
-def delete_call(call_id: str) -> dict:
+def delete_call(call_id: str, request: Request) -> dict:
+    deny_cross_account(request, _repo().get_call(call_id))
     if not _repo().delete_call(call_id):
         raise HTTPException(404, "call not found")
     _audit("call.delete", subject_type="call", subject_id=call_id, detail={})
@@ -1002,8 +1036,9 @@ def delete_call(call_id: str) -> dict:
 
 
 @app.delete("/api/calls")
-def clear_ended_calls(account_id: str = "acc-001") -> dict:
+def clear_ended_calls(request: Request, account_id: str = "acc-001") -> dict:
     """清空该账号下已结束(ended)的通话历史。活跃/进行中的通话不删。"""
+    account_id = scoped_account(request, account_id)
     calls = _repo().list_calls(account_id, status=CallStatus.ENDED.value)
     removed = 0
     for c in calls:
@@ -1186,7 +1221,8 @@ def _disconnect_room_background(room_name: str) -> None:
 
 
 @app.post("/api/calls/{call_id}/hangup")
-async def hangup(call_id: str) -> dict:
+async def hangup(call_id: str, request: Request) -> dict:
+    deny_cross_account(request, _repo().get_call(call_id))
     call = _repo().update_call(call_id, status=CallStatus.ENDED.value)
     if not call:
         raise HTTPException(404, "call not found")
@@ -1226,6 +1262,7 @@ async def _disconnect_livekit_room(room_name: str) -> None:
 @app.post("/api/calls/{call_id}/turns")
 def add_turn(
     call_id: str,
+    request: Request,
     role: str,
     transcript: str,
     emotion: str = "",
@@ -1243,6 +1280,8 @@ def add_turn(
     ended_ms: int = 0,
     perceived_ms: int = 0,
 ) -> dict:
+    # B2 归属闸（agent 机器上报无身份恒过）；先于 turn_id 说明注释。
+    deny_cross_account(request, _repo().get_call(call_id))
     # turn_id 用 uuid 而非 len(get_turns()) 序号：并发写时序号竞态产生重复
     # turn_id → 主键冲突 → IntegrityError 幂等分支吞成 200（静默丢数据，QA
     # 压测 30 并发丢 30-37% 实证）。uuid 根除竞态（#20 同期修 provider/latency
@@ -1271,11 +1310,12 @@ def add_turn(
 
 
 @app.post("/api/calls/{call_id}/whatsapp")
-def report_whatsapp(call_id: str, req: WhatsAppCaptureRequest) -> dict:
+def report_whatsapp(call_id: str, req: WhatsAppCaptureRequest, request: Request) -> dict:
     """Agent 偵測到客戶俾 WhatsApp。number 有值 → captured(客戶讀出自己號碼);
     空 → offered(客戶應承加專員,未俾號碼)。升級規則:offered→captured 容許、
     captured 唔覆寫、handled 後唔再降級(避免專員已對接又彈返出嚟)。
     """
+    deny_cross_account(request, _repo().get_call(call_id))
     call = _repo().get_call(call_id)
     if not call:
         raise HTTPException(404, "call not found")
@@ -1338,13 +1378,14 @@ def report_whatsapp(call_id: str, req: WhatsAppCaptureRequest) -> dict:
 
 
 @app.post("/api/calls/{call_id}/dial-result")
-def report_dial_result(call_id: str, req: DialResultRequest) -> dict:
+def report_dial_result(call_id: str, req: DialResultRequest, request: Request) -> dict:
     """Agent 外呼拨号结果上报:answered→ACTIVE;三失败态→ENDED+disposition。
 
     幂等：已终态(ended/failed)的通话直接原样返回，不复活也不改写 disposition
     （重派/重复上报时 4B 侧时序抖动不会把已收线的通话抬回 ACTIVE）。
     status 空/未知同样 no-op（仍记审计，便于排查上游漏配）。
     """
+    deny_cross_account(request, _repo().get_call(call_id))
     call = _repo().get_call(call_id)
     if not call:
         raise HTTPException(404, "call not found")
@@ -1377,8 +1418,9 @@ def report_dial_result(call_id: str, req: DialResultRequest) -> dict:
 
 
 @app.post("/api/calls/{call_id}/whatsapp/handled")
-def mark_whatsapp_handled(call_id: str, req: WhatsAppHandledRequest) -> dict:
+def mark_whatsapp_handled(call_id: str, req: WhatsAppHandledRequest, request: Request) -> dict:
     """專員喺操作台標記已對接 → status=handled,爆閃停止(AI 通話不受影響)。"""
+    deny_cross_account(request, _repo().get_call(call_id))
     call = _repo().get_call(call_id)
     if not call:
         raise HTTPException(404, "call not found")
@@ -1394,32 +1436,41 @@ def mark_whatsapp_handled(call_id: str, req: WhatsAppHandledRequest) -> dict:
 
 
 @app.get("/api/roster")
-def list_roster(account_id: str = "acc-001", status: str = "", channel: str = "") -> list[dict]:
+def list_roster(request: Request, account_id: str = "acc-001", status: str = "", channel: str = "") -> list[dict]:
     """名册认领池列表；status/channel 空=不过滤。"""
+    account_id = scoped_account(request, account_id)
     return _repo().list_roster(account_id, status=status, channel=channel)
 
 
 @app.post("/api/roster/{entry_id}/claim")
-def roster_claim(entry_id: str, req: RosterClaimRequest) -> dict:
-    """认领名册条目：status=claimed + claimed_by/claimed_at（naive UTC，与读侧 ISO 对齐）。"""
+def roster_claim(entry_id: str, req: RosterClaimRequest, request: Request) -> dict:
+    """认领名册条目：status=claimed + claimed_by/claimed_at（naive UTC，与读侧 ISO 对齐）。
+
+    B2：claimed_by 有身份时取用户名（并修正旧版把 claimed_by 误写进审计
+    account 列的用法）；跨账号条目一律 404。
+    """
+    deny_cross_account(request, _repo().get_roster_entry(entry_id))
+    ident = current_identity(request)
+    claimed_by = ident.username if ident else req.claimed_by
     entry = _repo().update_roster_entry(
-        entry_id, status="claimed", claimed_by=req.claimed_by,
+        entry_id, status="claimed", claimed_by=claimed_by,
         claimed_at=datetime.now(timezone.utc).replace(tzinfo=None),
     )
     if not entry:
         raise HTTPException(404, "roster entry not found")
     _audit("roster.claim", subject_type="roster", subject_id=entry_id,
-           account_id=req.claimed_by, detail={"claimed_by": req.claimed_by})
+           account_id=str(entry.get("account_id") or ""), detail={"claimed_by": claimed_by})
     return entry
 
 
 @app.post("/api/roster/{entry_id}/unclaim")
-def roster_unclaim(entry_id: str) -> dict:
+def roster_unclaim(entry_id: str, request: Request) -> dict:
     """释放认领：status=unclaimed、claimed_by 清空。
 
     claimed_at 必须传空串（repo 契约 None=不修改、""=清空）——空串在双后端
     都映射回「未认领」的读侧契约（SQL 存 NULL / InMemory 存 ""，读侧都渲染 ""）。
     """
+    deny_cross_account(request, _repo().get_roster_entry(entry_id))
     entry = _repo().update_roster_entry(entry_id, status="unclaimed", claimed_by="", claimed_at="")
     if not entry:
         raise HTTPException(404, "roster entry not found")
@@ -1429,13 +1480,14 @@ def roster_unclaim(entry_id: str) -> dict:
 
 
 @app.post("/api/roster/{entry_id}/handled")
-def roster_handled(entry_id: str, req: RosterHandledRequest) -> dict:
+def roster_handled(entry_id: str, req: RosterHandledRequest, request: Request) -> dict:
     """操作台标「已对接」/撤销，联动来源通话 whatsapp_status（与通话内横幅同源语义）。
 
     true → 名册 handled + 通话 whatsapp_status=handled（爆闪停止）；
     false → 名册回 unclaimed，通话按有无号码回 captured/offered。
     来源通话缺失/已删除不阻塞名册状态变更。
     """
+    deny_cross_account(request, _repo().get_roster_entry(entry_id))
     entry = _repo().get_roster_entry(entry_id)
     if not entry:
         raise HTTPException(404, "roster entry not found")
@@ -1489,7 +1541,7 @@ class CampaignCreateRequest(BaseModel):
 
 
 @app.post("/api/campaigns")
-def create_campaign(req: CampaignCreateRequest) -> dict:
+def create_campaign(req: CampaignCreateRequest, request: Request) -> dict:
     """建战役（draft）+ 名单项；object_ids 空=400（空波次无意义）。
 
     scenarios 值白名单过滤（answer/no_answer/reject/hangup_mid）：运营表单里
@@ -1497,6 +1549,10 @@ def create_campaign(req: CampaignCreateRequest) -> dict:
     scripts 同样清洗成 `dict[str, list[str]]`（Pydantic 已保证形状，这里只剔
     空白句并丢空数组，免得 dial 块带一堆空串）。
     """
+    identity = current_identity(request)
+    if identity is not None and identity.role != "root":
+        # 话务员/主管建波强制落本账号（root 可显式指定）。
+        req = req.model_copy(update={"account_id": identity.account_id})
     if not req.object_ids:
         raise HTTPException(400, "object_ids 不能为空")
     scripts = {
@@ -1521,8 +1577,9 @@ def create_campaign(req: CampaignCreateRequest) -> dict:
 
 
 @app.get("/api/campaigns")
-def list_campaigns(account_id: str = "acc-001") -> list[dict]:
+def list_campaigns(request: Request, account_id: str = "acc-001") -> list[dict]:
     """战役列表，每条带 progress 汇总（列表页免二次请求）。"""
+    account_id = scoped_account(request, account_id)
     out = []
     for camp in _repo().list_campaigns(account_id):
         camp["progress"] = _progress(_repo().list_items(camp["id"]))
@@ -1531,9 +1588,9 @@ def list_campaigns(account_id: str = "acc-001") -> list[dict]:
 
 
 @app.get("/api/campaigns/{campaign_id}")
-def get_campaign(campaign_id: str) -> dict:
+def get_campaign(campaign_id: str, request: Request) -> dict:
     """战役详情：campaign + items + progress。"""
-    camp = _repo().get_campaign(campaign_id)
+    camp = deny_cross_account(request, _repo().get_campaign(campaign_id))
     if not camp:
         raise HTTPException(404, "campaign not found")
     items = _repo().list_items(campaign_id)
@@ -1543,26 +1600,26 @@ def get_campaign(campaign_id: str) -> dict:
 
 
 @app.post("/api/campaigns/{campaign_id}/start")
-def campaign_start(campaign_id: str) -> dict:
+def campaign_start(campaign_id: str, request: Request) -> dict:
     """启波（draft/paused → running；循环巡检即刻接手首通）。"""
-    return _campaign_transition(campaign_id, "running")
+    return _campaign_transition(request, campaign_id, "running")
 
 
 @app.post("/api/campaigns/{campaign_id}/pause")
-def campaign_pause(campaign_id: str) -> dict:
+def campaign_pause(campaign_id: str, request: Request) -> dict:
     """暂停（running → paused）：循环不再起新通，进行中的一路不打断。"""
-    return _campaign_transition(campaign_id, "paused")
+    return _campaign_transition(request, campaign_id, "paused")
 
 
 @app.post("/api/campaigns/{campaign_id}/stop")
-def campaign_stop(campaign_id: str) -> dict:
+def campaign_stop(campaign_id: str, request: Request) -> dict:
     """终止（running/paused/draft → stopped，终态不可再启）。"""
-    return _campaign_transition(campaign_id, "stopped")
+    return _campaign_transition(request, campaign_id, "stopped")
 
 
-def _campaign_transition(campaign_id: str, status: str) -> dict:
+def _campaign_transition(request: Request, campaign_id: str, status: str) -> dict:
     """战役状态机唯一入口（三个启停端点共用），非法迁移 409、未找到 404。"""
-    camp = _repo().get_campaign(campaign_id)
+    camp = deny_cross_account(request, _repo().get_campaign(campaign_id))
     if not camp:
         raise HTTPException(404, "campaign not found")
     cur = str(camp.get("status") or "")
@@ -1577,9 +1634,9 @@ def _campaign_transition(campaign_id: str, status: str) -> dict:
 
 
 @app.delete("/api/campaigns/{campaign_id}")
-def delete_campaign(campaign_id: str) -> dict:
+def delete_campaign(campaign_id: str, request: Request) -> dict:
     """删战役（含名单项）。running 拒删（409）——先停止再删，防误删在跑波次。"""
-    camp = _repo().get_campaign(campaign_id)
+    camp = deny_cross_account(request, _repo().get_campaign(campaign_id))
     if not camp:
         raise HTTPException(404, "campaign not found")
     status = str(camp.get("status") or "")
@@ -1719,12 +1776,15 @@ def node_heartbeat(req: NodeHeartbeatRequest, authorization: str = Header(defaul
 
 
 @app.get("/api/nodes")
-def list_nodes() -> list[dict]:
+def list_nodes(request: Request) -> list[dict]:
+    # 节点注册表=平台面（root）。
+    require_role(request, "root")
     return _node_store().list_nodes()
 
 
 @app.get("/api/calls/{call_id}/settlement")
-def get_settlement(call_id: str) -> dict:
+def get_settlement(call_id: str, request: Request) -> dict:
+    deny_cross_account(request, _repo().get_call(call_id))
     settlement = _repo().get_settlement(call_id)
     if not settlement:
         raise HTTPException(404, "settlement not found")
@@ -1732,13 +1792,15 @@ def get_settlement(call_id: str) -> dict:
 
 
 @app.get("/api/calls/{call_id}/turns")
-def get_turns(call_id: str) -> list[dict]:
+def get_turns(call_id: str, request: Request) -> list[dict]:
+    deny_cross_account(request, _repo().get_call(call_id))
     return [turn.__dict__ for turn in _repo().get_turns(call_id)]
 
 
 @app.get("/api/calls/{call_id}/metrics")
-def get_call_metrics(call_id: str) -> dict:
+def get_call_metrics(call_id: str, request: Request) -> dict:
     """每通通话延迟档案:p50/p95 latency_ms + 轮数/语言分布（审计闭环 T3）。"""
+    deny_cross_account(request, _repo().get_call(call_id))
     import statistics as _stats
 
     turns = _repo().get_turns(call_id)
@@ -1889,7 +1951,8 @@ def _backfill_turns_from_report(call_id: str, report_raw: str) -> int:
 
 
 @app.post("/api/calls/{call_id}/settle")
-async def settle(call_id: str) -> dict:
+async def settle(call_id: str, request: Request) -> dict:
+    deny_cross_account(request, _repo().get_call(call_id))
     existing = _repo().get_settlement(call_id)
     if existing:
         return existing
@@ -2002,12 +2065,14 @@ async def settle(call_id: str) -> dict:
 
 
 @app.get("/api/objects")
-def list_objects(account_id: str = "acc-001") -> list[dict]:
+def list_objects(request: Request, account_id: str = "acc-001") -> list[dict]:
+    account_id = scoped_account(request, account_id)
     return _repo().list_objects(account_id)
 
 
 @app.get("/api/objects/{object_id}")
-def get_object(object_id: str) -> dict:
+def get_object(object_id: str, request: Request) -> dict:
+    deny_cross_account(request, _repo().get_object(object_id))
     obj = _repo().get_object(object_id)
     if not obj:
         raise HTTPException(404, "object not found")
@@ -2015,14 +2080,19 @@ def get_object(object_id: str) -> dict:
 
 
 @app.post("/api/objects")
-def create_object(account_id: str, req: CreateObjectRequest) -> dict:
+def create_object(request: Request, account_id: str, req: CreateObjectRequest) -> dict:
+    # 对象=客户资料，话务员只读（页面矩阵）；建/改/删归 admin/root。
+    require_role(request, "admin", "root")
+    account_id = scoped_account(request, account_id)
     obj = _repo().create_object(account_id, req.model_dump())
     _audit("object.create", subject_type="object", subject_id=obj.get("id", ""), account_id=account_id, detail={"display_name": obj.get("display_name", "")})
     return obj
 
 
 @app.patch("/api/objects/{object_id}")
-def update_object(object_id: str, req: UpdateObjectRequest) -> dict:
+def update_object(object_id: str, req: UpdateObjectRequest, request: Request) -> dict:
+    require_role(request, "admin", "root")
+    deny_cross_account(request, _repo().get_object(object_id))
     existing = _repo().get_object(object_id)
     obj = _repo().update_object(object_id, req.model_dump())
     if not obj:
@@ -2032,7 +2102,9 @@ def update_object(object_id: str, req: UpdateObjectRequest) -> dict:
 
 
 @app.delete("/api/objects/{object_id}")
-def delete_object(object_id: str) -> dict:
+def delete_object(object_id: str, request: Request) -> dict:
+    require_role(request, "admin", "root")
+    deny_cross_account(request, _repo().get_object(object_id))
     existing = _repo().get_object(object_id)
     if not _repo().delete_object(object_id):
         raise HTTPException(404, "object not found")
@@ -2041,23 +2113,32 @@ def delete_object(object_id: str) -> dict:
 
 
 @app.post("/api/objects/import")
-def import_objects(account_id: str, rows: list[CreateObjectRequest] = Body(...)) -> dict:
+def import_objects(request: Request, account_id: str, rows: list[CreateObjectRequest] = Body(...)) -> dict:
+    require_role(request, "admin", "root")
+    account_id = scoped_account(request, account_id)
     created = [_repo().create_object(account_id, row.model_dump()) for row in rows]
     return {"imported": len(created), "items": created}
 
 
 @app.get("/api/knowledge/search")
-async def search_knowledge(query: str, account_id: str = "acc-001", limit: int = 5) -> list[dict]:
+async def search_knowledge(request: Request, query: str, account_id: str = "acc-001", limit: int = 5) -> list[dict]:
+    # 知识库=org 资产，话务员不可见（页面矩阵）。
+    require_role(request, "admin", "root")
+    account_id = scoped_account(request, account_id)
     return await app.state.knowledge.search(query, account_id, limit)
 
 
 @app.get("/api/knowledge")
-async def list_knowledge(account_id: str = "acc-001") -> list[dict]:
+async def list_knowledge(request: Request, account_id: str = "acc-001") -> list[dict]:
+    require_role(request, "admin", "root")
+    account_id = scoped_account(request, account_id)
     return await app.state.knowledge.list(account_id)
 
 
 @app.delete("/api/knowledge")
-async def delete_knowledge(knowledge_id: str, account_id: str = "acc-001") -> dict:
+async def delete_knowledge(request: Request, knowledge_id: str, account_id: str = "acc-001") -> dict:
+    require_role(request, "admin", "root")
+    account_id = scoped_account(request, account_id)
     # id 形如 md:accounts/acc-001/knowledge/probe.md（含斜杠），放 path 参数会被
     # Starlette 路由层以 %2F 拒掉（404）——改走 query 参数最稳。
     removed = await app.state.knowledge.delete(account_id, [knowledge_id])
@@ -2066,7 +2147,8 @@ async def delete_knowledge(knowledge_id: str, account_id: str = "acc-001") -> di
 
 
 @app.post("/api/knowledge/import")
-async def import_knowledge(req: ImportRequest) -> dict:
+async def import_knowledge(req: ImportRequest, request: Request) -> dict:
+    require_role(request, "admin", "root")
     result = await app.state.knowledge.import_document(req.account_id, req.path, req.content)
     _audit("knowledge.import", subject_type="knowledge", subject_id=req.path or "", detail={"account_id": req.account_id, "content_len": len(req.content)})
     return result
@@ -2075,19 +2157,25 @@ async def import_knowledge(req: ImportRequest) -> dict:
 # ---- 快答库(Q→A 检索快路,2026-09-09):条目 CRUD + 高频配对报告 ----
 
 @app.get("/api/qa-entries")
-def list_qa_entries(account_id: str = "acc-001", enabled: int | None = None) -> list[dict]:
+def list_qa_entries(request: Request, account_id: str = "acc-001", enabled: int | None = None) -> list[dict]:
+    # QA 库话务员可读可编辑（页面矩阵），按账号收窄；owner 级差异在 B3。
+    account_id = scoped_account(request, account_id)
     return _repo().list_qa_entries(account_id, enabled=None if enabled is None else bool(enabled))
 
 
 @app.post("/api/qa-entries")
-def create_qa_entry(req: QaEntryCreate) -> dict:
+def create_qa_entry(req: QaEntryCreate, request: Request) -> dict:
+    identity = current_identity(request)
+    if identity is not None and identity.role != "root":
+        req = req.model_copy(update={"account_id": identity.account_id})
     row = _repo().create_qa_entry(req.model_dump())
     _audit("qa_entry.create", subject_type="qa_entry", subject_id=row.get("id", ""), account_id=req.account_id)
     return row
 
 
 @app.patch("/api/qa-entries/{entry_id}")
-def update_qa_entry(entry_id: str, req: QaEntryPatch) -> dict:
+def update_qa_entry(entry_id: str, req: QaEntryPatch, request: Request) -> dict:
+    deny_cross_account(request, _repo().get_qa_entry(entry_id))
     row = _repo().update_qa_entry(entry_id, {k: v for k, v in req.model_dump().items() if v is not None})
     if row is None:
         from fastapi import HTTPException
@@ -2098,15 +2186,17 @@ def update_qa_entry(entry_id: str, req: QaEntryPatch) -> dict:
 
 
 @app.delete("/api/qa-entries/{entry_id}")
-def delete_qa_entry(entry_id: str) -> dict:
+def delete_qa_entry(entry_id: str, request: Request) -> dict:
+    deny_cross_account(request, _repo().get_qa_entry(entry_id))
     ok = _repo().delete_qa_entry(entry_id)
     _audit("qa_entry.delete", subject_type="qa_entry", subject_id=entry_id, outcome="ok" if ok else "not_found")
     return {"deleted": ok, "id": entry_id}
 
 
 @app.post("/api/qa-entries/{entry_id}/hit")
-def hit_qa_entry(entry_id: str) -> dict:
+def hit_qa_entry(entry_id: str, request: Request) -> dict:
     """agent 快路命中计数(fire-and-forget,幂等无副作用)。"""
+    deny_cross_account(request, _repo().get_qa_entry(entry_id))
     _repo().incr_qa_hit(entry_id)
     return {"id": entry_id}
 
@@ -2115,7 +2205,10 @@ def hit_qa_entry(entry_id: str) -> dict:
 
 
 @app.get("/api/fillers")
-def list_filler_entries(account_id: str = "acc-001", enabled: int | None = None, lang: str = "") -> list[dict]:
+def list_filler_entries(request: Request, account_id: str = "acc-001", enabled: int | None = None, lang: str = "") -> list[dict]:
+    # 垫话罐头=运营配置面（agent 机器通道直通），话务员不可见。
+    require_role(request, "admin", "root")
+    account_id = scoped_account(request, account_id)
     return _repo().list_filler_entries(
         account_id, enabled=None if enabled is None else bool(enabled), lang=lang
     )
@@ -2130,6 +2223,7 @@ def hit_filler_entry(entry_id: str) -> dict:
 
 @app.get("/api/reports/qa-pairs")
 def report_qa_pairs(
+    request: Request,
     min_calls: int = 5, account_id: str = "acc-001", limit: int = 100, exclude_test: bool = True
 ) -> list[dict]:
     """高频问答对挖掘报告:用户轮→紧随 assistant 轮,归一化聚类按出现通话数排序。
@@ -2141,17 +2235,23 @@ def report_qa_pairs(
     报告要干净(2026-09-09 实测 top20 高频里 16 条是测试 fixture 音频);
     显式传 false 看全量。
     """
+    require_role(request, "admin", "root")
+    account_id = scoped_account(request, account_id)
     conversations = _repo().iter_call_conversations(account_id, exclude_test_objects=exclude_test)
     return mine_qa_pairs(conversations, min_calls=min_calls, limit=limit)
 
 
 @app.get("/api/personas")
-def list_personas(account_id: str = "acc-001") -> list[dict]:
+def list_personas(request: Request, account_id: str = "acc-001") -> list[dict]:
+    # 人设=管理面（页面矩阵：话务员不可见）。
+    require_role(request, "admin", "root")
+    account_id = scoped_account(request, account_id)
     return _repo().list_personas(account_id)
 
 
 @app.get("/api/personas/{persona_id}")
-def get_persona(persona_id: str) -> dict:
+def get_persona(persona_id: str, request: Request) -> dict:
+    require_role(request, "admin", "root")
     persona = _repo().get_persona(persona_id)
     if not persona:
         raise HTTPException(404, "persona not found")
@@ -2160,6 +2260,7 @@ def get_persona(persona_id: str) -> dict:
 
 @app.post("/api/personas")
 def create_persona(req: PersonaRequest, request: Request) -> dict:
+    require_role(request, "admin", "root")
     persona = _repo().create_persona(req.model_dump())
     _audit("persona.create", subject_type="persona", subject_id=persona.get("id", ""), account_id=persona.get("account_id", ""), detail={"name": persona.get("name", "")})
     # 新人设上线:无罐头即提醒+自动全量物化(W3,响应 tts_pregen=提醒面)。
@@ -2173,6 +2274,7 @@ def create_persona(req: PersonaRequest, request: Request) -> dict:
 
 @app.put("/api/personas/{persona_id}")
 def update_persona(persona_id: str, req: UpdatePersonaRequest, request: Request) -> dict:
+    require_role(request, "admin", "root")
     # 冻结更新前快照(内存 repo 返回活引用,update 原地改会令 existing==persona,
     # 音色变化判定恒 False);audit 与物化触发都以此为准。
     existing = dict(_repo().get_persona(persona_id) or {})
@@ -2189,6 +2291,7 @@ def update_persona(persona_id: str, req: UpdatePersonaRequest, request: Request)
 
 @app.put("/api/personas")
 def upsert_persona(req: PersonaRequest, request: Request) -> dict:
+    require_role(request, "admin", "root")
     persona = _repo().create_persona(req.model_dump())
     out = dict(persona)
     out["tts_pregen"] = persona_pregen_status(
@@ -2198,7 +2301,8 @@ def upsert_persona(req: PersonaRequest, request: Request) -> dict:
 
 
 @app.delete("/api/personas/{persona_id}")
-def delete_persona(persona_id: str) -> dict:
+def delete_persona(persona_id: str, request: Request) -> dict:
+    require_role(request, "admin", "root")
     existing = _repo().get_persona(persona_id)
     if not _repo().delete_persona(persona_id):
         raise HTTPException(404, "persona not found")
@@ -2207,12 +2311,14 @@ def delete_persona(persona_id: str) -> dict:
 
 
 @app.get("/api/templates")
-def list_templates(account_id: str = "acc-001") -> list[dict]:
+def list_templates(request: Request, account_id: str = "acc-001") -> list[dict]:
+    account_id = scoped_account(request, account_id)
     return _repo().list_templates(account_id)
 
 
 @app.get("/api/templates/{template_id}")
-def get_template(template_id: str) -> dict:
+def get_template(template_id: str, request: Request) -> dict:
+    deny_cross_account(request, _repo().get_template(template_id))
     tpl = _repo().get_template(template_id)
     if not tpl:
         raise HTTPException(404, "template not found")
@@ -2220,14 +2326,19 @@ def get_template(template_id: str) -> dict:
 
 
 @app.post("/api/templates")
-def create_template(req: TemplateRequest) -> dict:
+def create_template(req: TemplateRequest, request: Request) -> dict:
+    identity = current_identity(request)
+    if identity is not None and identity.role != "root":
+        # 话务员建话术落本账号（owner 级差异在 B3；修正「无主话术落空账号」旧漏）。
+        req = req.model_copy(update={"account_id": identity.account_id})
     tpl = _repo().create_template(req.model_dump())
     _audit("template.create", subject_type="template", subject_id=tpl.get("id", ""), account_id=tpl.get("account_id", ""), detail={"name": tpl.get("name", "")})
     return tpl
 
 
 @app.put("/api/templates/{template_id}")
-def update_template(template_id: str, req: UpdateTemplateRequest) -> dict:
+def update_template(template_id: str, req: UpdateTemplateRequest, request: Request) -> dict:
+    deny_cross_account(request, _repo().get_template(template_id))
     before = _repo().get_template(template_id)
     if not before:
         raise HTTPException(404, "template not found")
@@ -2257,12 +2368,14 @@ def update_template(template_id: str, req: UpdateTemplateRequest) -> dict:
 
 
 @app.get("/api/templates/{template_id}/revisions")
-def template_revisions(template_id: str) -> list[dict]:
+def template_revisions(template_id: str, request: Request) -> list[dict]:
+    deny_cross_account(request, _repo().get_template(template_id))
     return _repo().list_template_revisions(template_id)
 
 
 @app.delete("/api/templates/{template_id}")
-def delete_template(template_id: str) -> dict:
+def delete_template(template_id: str, request: Request) -> dict:
+    deny_cross_account(request, _repo().get_template(template_id))
     tpl = _repo().get_template(template_id)
     if not _repo().delete_template(template_id):
         raise HTTPException(404, "template not found")
@@ -2271,14 +2384,18 @@ def delete_template(template_id: str) -> dict:
 
 
 @app.get("/api/supervisor/active-calls")
-def active_calls() -> list[dict]:
+def active_calls(request: Request) -> list[dict]:
     """主管台可见通话：进行中(active) + 已暂停(paused / 人工接管)。"""
-    calls = _repo().list_calls("", "") if hasattr(_repo(), "list_calls") else []
+    # 主管台=管理面（话务员不可见），且按账号收窄。
+    require_role(request, "admin", "root")
+    calls = _repo().list_calls(scoped_account(request, ""), "") if hasattr(_repo(), "list_calls") else []
     return [c for c in calls if c.get("status") in (CallStatus.ACTIVE.value, CallStatus.PAUSED.value)]
 
 
 @app.get("/api/reports/summary")
-def reports_summary(account_id: str = "acc-001") -> dict:
+def reports_summary(request: Request, account_id: str = "acc-001") -> dict:
+    require_role(request, "admin", "root")
+    account_id = scoped_account(request, account_id)
     calls = _repo().list_calls(account_id, "")
     turns_total = 0
     settled = 0
@@ -2299,19 +2416,22 @@ def reports_summary(account_id: str = "acc-001") -> dict:
 
 
 @app.get("/api/reports/calls")
-def reports_calls(account_id: str = "acc-001") -> list[dict]:
-    return _repo().list_calls(account_id, "")
+def reports_calls(request: Request, account_id: str = "acc-001") -> list[dict]:
+    require_role(request, "admin", "root")
+    return _repo().list_calls(scoped_account(request, account_id), "")
 
 
 @app.get("/api/insights")
-def list_insights() -> list[dict]:
+def list_insights(request: Request) -> list[dict]:
     """全局洞察（结算时 Summarizer 蒸馏产出，跨对象共性的观察）。"""
+    require_role(request, "admin", "root")
     return _repo().list_global_insights(kind="insight")
 
 
 @app.get("/api/objects/{object_id}/topics")
-def list_object_topics(object_id: str) -> list[dict]:
+def list_object_topics(object_id: str, request: Request) -> list[dict]:
     """对象历史主题（结算时 Summarizer 蒸馏产出并 append 到该对象）。"""
+    deny_cross_account(request, _repo().get_object(object_id))
     return _repo().list_object_topics(object_id)
 
 
@@ -2322,6 +2442,7 @@ async def ingest_session_report(call_id: str, request: Request) -> dict:
     存 call_sessions.session_report(JSON)；结算/报表优先吃这里的真数据，
     没有上报的旧通话才回退估算口径。
     """
+    deny_cross_account(request, _repo().get_call(call_id))
     try:
         payload = await request.json()
     except Exception:
@@ -2505,7 +2626,9 @@ async def livekit_webhook(request: Request) -> dict:
 
 
 @app.get("/api/reports/script-insights")
-def script_insights(account_id: str = "acc-001", limit: int = 10) -> dict:
+def script_insights(request: Request, account_id: str = "acc-001", limit: int = 10) -> dict:
+    require_role(request, "admin", "root")
+    account_id = scoped_account(request, account_id)
     """话术优化分析视图（知识库=全局分析数据层）:高频问题 TOP N + 通话/轮次统计。"""
     from collections import Counter
 
@@ -2533,7 +2656,9 @@ def script_insights(account_id: str = "acc-001", limit: int = 10) -> dict:
 
 
 @app.get("/api/reports/distill-health")
-def distill_health(account_id: str = "acc-001", limit: int = 10) -> dict:
+def distill_health(request: Request, account_id: str = "acc-001", limit: int = 10) -> dict:
+    require_role(request, "admin", "root")
+    account_id = scoped_account(request, account_id)
     """蒸馏健康度（审计事件 settle.distill_empty 由 #23 铺设,本端点出报表口径）。"""
     calls = _repo().list_calls(account_id, "")
     settled = [c for c in calls if c.get("status") == "ended"]
@@ -2553,15 +2678,17 @@ def distill_health(account_id: str = "acc-001", limit: int = 10) -> dict:
 
 
 @app.get("/api/objects/{object_id}/digest")
-def get_object_digest(object_id: str) -> dict:
-    obj = _repo().get_object(object_id)
+def get_object_digest(object_id: str, request: Request) -> dict:
+    obj = deny_cross_account(request, _repo().get_object(object_id))
     if not obj:
         raise HTTPException(404, "object not found")
     return {"object_id": object_id, "digest": obj.get("digest", "")}
 
 
 @app.get("/api/reports/usage")
-def reports_usage(account_id: str = "acc-001") -> dict:
+def reports_usage(request: Request, account_id: str = "acc-001") -> dict:
+    require_role(request, "admin", "root")
+    account_id = scoped_account(request, account_id)
     calls = _repo().list_calls(account_id, "")
     # 真实用量优先：官方 SessionReport 的逐模型 input/output tokens；
     # 没有上报的旧通话才回退「轮次数」估算（口径见字段名后缀）。
@@ -2592,7 +2719,10 @@ def reports_usage(account_id: str = "acc-001") -> dict:
 
 
 @app.get("/api/audit")
-def list_audit(account_id: str = "", action: str = "", call_id: str = "", limit: int = 200) -> list[dict]:
+def list_audit(request: Request, account_id: str = "", action: str = "", call_id: str = "", limit: int = 200) -> list[dict]:
+    # 审计=管理面（主管操作留痕的查看口），话务员不可见。
+    require_role(request, "admin", "root")
+    account_id = scoped_account(request, account_id)
     repo = _repo()
     if hasattr(repo, "list_audit_events"):
         return repo.list_audit_events(account_id=account_id, action=action, call_id=call_id, limit=limit)
@@ -2643,17 +2773,19 @@ def _parse_setup(stdout: str) -> dict:
 
 
 @app.post("/api/supervisor/{call_id}/join")
-def supervisor_join(call_id: str) -> dict:
+def supervisor_join(call_id: str, request: Request) -> dict:
     """主管进房:校验通话存在并直接签发 supervisor token(官方 TokenSource 契约)。
 
     以前只回 role 不回 token(与 CONTRACTS.md「主管进房 token」自相矛盾);现在
     与 /api/token 同一条签发链路(identity=supervisor-<room>,挂 bok.role 属性,
     A 线 dispatch 由 token 端点统一处理)。
     """
+    require_role(request, "admin", "root")
+    deny_cross_account(request, _repo().get_call(call_id))
     call = _repo().get_call(call_id)
     if not call:
         raise HTTPException(404, "call not found")
-    issued = token(TokenRequest(call_id=call_id, role="supervisor"))
+    issued = token(TokenRequest(call_id=call_id, role="supervisor"), request)
     return {
         "call_id": call_id,
         "status": call.get("status", "active"),
@@ -2664,13 +2796,15 @@ def supervisor_join(call_id: str) -> dict:
 
 
 @app.post("/api/supervisor/{call_id}/listen")
-def supervisor_listen(call_id: str) -> dict:
+def supervisor_listen(call_id: str, request: Request) -> dict:
     """主管静默旁听：签发只订阅 token（can_publish 全关）+ 留审计。
 
     与 `/join` 的区别：join 是通用主管身份（可发布），listen 是旁听专线——
     从 token 层保证「只听不说」，且不翻通话状态；被听方无任何提示（产品拍板），
     但每次旁听都在审计留痕（此处记 start，前端结束回执 stop 补时长）。
     """
+    require_role(request, "admin", "root")
+    deny_cross_account(request, _repo().get_call(call_id))
     call = _repo().get_call(call_id)
     if not call:
         raise HTTPException(404, "call not found")
@@ -2678,7 +2812,7 @@ def supervisor_listen(call_id: str) -> dict:
         raise HTTPException(409, "call has ended")
     account_id = str(call.get("account_id") or "acc-001")
     issued = token(TokenRequest(call_id=call_id, role="supervisor",
-                                purpose="listen", account_id=account_id))
+                                purpose="listen", account_id=account_id), request)
     _audit("supervisor.listen.start", subject_type="call", subject_id=call_id,
            account_id=account_id, call_id=call_id, detail={"purpose": "listen"})
     return {
@@ -2690,8 +2824,9 @@ def supervisor_listen(call_id: str) -> dict:
 
 
 @app.post("/api/supervisor/{call_id}/listen/stop")
-def supervisor_listen_stop(call_id: str, req: ListenStopRequest) -> dict:
+def supervisor_listen_stop(call_id: str, req: ListenStopRequest, request: Request) -> dict:
     """旁听结束回执：补一条带时长的审计（纯留痕，不改通话状态）。"""
+    require_role(request, "admin", "root")
     call = _repo().get_call(call_id) or {}
     _audit("supervisor.listen.stop", subject_type="call", subject_id=call_id,
            account_id=str(call.get("account_id") or ""), call_id=call_id,
@@ -2731,7 +2866,9 @@ async def web_logs(payload: dict) -> dict:
 
 
 @app.post("/api/supervisor/{call_id}/pause-agent")
-def pause_agent(call_id: str) -> dict:
+def pause_agent(call_id: str, request: Request) -> dict:
+    require_role(request, "admin", "root")
+    deny_cross_account(request, _repo().get_call(call_id))
     call = _repo().update_call(call_id, status=CallStatus.PAUSED.value)
     if not call:
         raise HTTPException(404, "call not found")
@@ -2740,8 +2877,10 @@ def pause_agent(call_id: str) -> dict:
 
 
 @app.post("/api/supervisor/{call_id}/resume-agent")
-def resume_agent(call_id: str) -> dict:
+def resume_agent(call_id: str, request: Request) -> dict:
     """恢复 AI 自动应答：解除人工接管并把通话置回 active（agent 轮询到后恢复）。"""
+    require_role(request, "admin", "root")
+    deny_cross_account(request, _repo().get_call(call_id))
     call = _repo().update_call(call_id, escalated_to_human=False, status=CallStatus.ACTIVE.value)
     if not call:
         raise HTTPException(404, "call not found")
@@ -2750,7 +2889,9 @@ def resume_agent(call_id: str) -> dict:
 
 
 @app.post("/api/supervisor/{call_id}/takeover")
-def takeover(call_id: str) -> dict:
+def takeover(call_id: str, request: Request) -> dict:
+    require_role(request, "admin", "root")
+    deny_cross_account(request, _repo().get_call(call_id))
     call = _repo().update_call(call_id, escalated_to_human=True, status=CallStatus.PAUSED.value)
     if not call:
         raise HTTPException(404, "call not found")
@@ -2759,7 +2900,9 @@ def takeover(call_id: str) -> dict:
 
 
 @app.post("/api/supervisor/{call_id}/transfer")
-async def transfer(call_id: str) -> dict:
+async def transfer(call_id: str, request: Request) -> dict:
+    require_role(request, "admin", "root")
+    deny_cross_account(request, _repo().get_call(call_id))
     call = _repo().update_call(call_id, escalated_to_human=True, disposition="transferred", status=CallStatus.ENDED.value)
     if not call:
         raise HTTPException(404, "call not found")
@@ -2769,13 +2912,18 @@ async def transfer(call_id: str) -> dict:
 
 
 @app.post("/api/supervisor/{call_id}/end")
-async def supervisor_end(call_id: str, disposition: str = "declined") -> dict:
+async def supervisor_end(call_id: str, request: Request, disposition: str = "declined") -> dict:
     """AI 收尾后主动结束通话:置 ENDED 并断房。
 
     disposition=declined(客户明确拒绝/告别,默认)| no_response(沉默心跳两次无回应)。
     agent 讲完一句礼貌再见后调用;结算由 agent 侧 _on_close 幂等触发,这里只负责
     归档 disposition + 踢出房间。房间不存在/服务不可用不阻塞(DB 已置 ENDED)。
     """
+    # agent 收线走机器通道直通；人工触发时按管理面闸。
+    ident = current_identity(request)
+    if ident is not None and ident.role not in ("admin", "root"):
+        raise HTTPException(status_code=403, detail="forbidden")
+    deny_cross_account(request, _repo().get_call(call_id))
     disposition = (disposition or "declined").strip()[:64] or "declined"
     call = _repo().update_call(call_id, escalated_to_human=False, disposition=disposition, status=CallStatus.ENDED.value)
     if not call:

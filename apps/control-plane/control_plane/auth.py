@@ -33,8 +33,17 @@ _JWT_ALGO = "HS256"
 JWT_TTL_S = 8 * 3600
 _SCRYPT_N, _SCRYPT_R, _SCRYPT_P = 2**14, 8, 1
 
-# 豁免路径：健康检查 / 登录本身 / 节点心跳自鉴权 / API 文档。
-_EXEMPT_PATHS = ("/health", "/api/auth/login", "/api/nodes/heartbeat", "/docs", "/openapi.json", "/redoc")
+# 豁免路径：健康检查 / 登录本身 / 节点心跳自鉴权 / API 文档 / LiveKit 服务端 webhook
+#（webhook 由 LiveKit server 直调 CP，无用户也无机器 env，属基础设施通道）。
+_EXEMPT_PATHS = (
+    "/health",
+    "/api/auth/login",
+    "/api/nodes/heartbeat",
+    "/docs",
+    "/openapi.json",
+    "/redoc",
+    "/api/webhook/livekit",
+)
 
 
 @dataclass
@@ -130,6 +139,60 @@ def identity_from_request(request: Request) -> Identity | None:
         return None
 
 
+def current_identity(request: Request) -> Identity | None:
+    """优先取门禁已解析的身份，否则显式解头部（便于无门禁环境下的测试/内部调用）。"""
+    ident = getattr(request.state, "identity", None)
+    return ident or identity_from_request(request)
+
+
+def scoped_account(request: Request, requested: str = "") -> str:
+    """列表端点的账号过滤值。
+
+    语义：**有身份就按身份收紧**——user/admin 强制本账号（显式传别账号也被压回），
+    root 可显式指定任意账号（空=跨账号全部）；无身份（auth-off 开发形态或机器通道）
+    原样放行，与现状同信任级。
+    """
+    ident = current_identity(request)
+    if ident is None or ident.role == "root":
+        return requested
+    return ident.account_id
+
+
+def same_account(request: Request, row: dict | None) -> bool:
+    """by-ID 资源归属判定：root/无身份（auth-off 或机器通道）恒真；user/admin 仅本账号。"""
+    if row is None:
+        return True
+    ident = current_identity(request)
+    if ident is None or ident.role == "root":
+        return True
+    return str(row.get("account_id") or "") == ident.account_id
+
+
+def deny_cross_account(request: Request, row: dict | None) -> dict | None:
+    """越权一律 404（不泄露资源存在性）；row=None 原样返回（由调用方 404）。"""
+    if row is not None and not same_account(request, row):
+        raise HTTPException(status_code=404, detail="not found")
+    return row
+
+
+def require_role(request: Request, *roles: str) -> Identity | None:
+    """管理面角色闸（与页面矩阵对齐：报表/审计/知识库/人设/设置/主管操作等）。
+
+    auth-on：无身份 401、身份不在允许角色 403；auth-off 无身份直通（开发形态）；
+    机器通道（BOK_CP_TOKEN，state.machine）恒直通——agent 等内部服务不受角色闸误杀。
+    """
+    ident = current_identity(request)
+    if ident is None:
+        if getattr(request.state, "machine", False):
+            return None
+        if auth_required():
+            raise HTTPException(status_code=401, detail="unauthorized")
+        return None
+    if roles and ident.role not in roles:
+        raise HTTPException(status_code=403, detail="forbidden")
+    return ident
+
+
 def _unauthorized() -> Response:
     return Response(status_code=401, content=b'{"detail":"unauthorized"}', media_type="application/json")
 
@@ -142,9 +205,11 @@ async def identity_gate(request: Request, call_next):
         return await call_next(request)
     auth = request.headers.get("authorization", "")
     token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
-    # 机器通道：BOK_CP_TOKEN 同值直通（脚本/工具/CI）。
+    # 机器通道：BOK_CP_TOKEN 同值直通（脚本/工具/CI），并打 machine 标记——
+    # require_role 等助手对机器请求放行（agent 等内部服务不受角色闸误杀）。
     cp_token = os.environ.get("BOK_CP_TOKEN", "").strip()
     if cp_token and token == cp_token:
+        request.state.machine = True
         return await call_next(request)
     if not token:
         return _unauthorized()
