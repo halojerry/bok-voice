@@ -1,11 +1,45 @@
 from __future__ import annotations
 
+import json as _json
 import os
 
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 
 from bok_voice_business_db.repository import InMemoryBusinessRepository, SqlAlchemyBusinessRepository
+
+# 垫话罐头种子(2026-09-13 乙节 B5):三语×六场景。trigger=用户口吻示例句(取材
+# 9/9-9/12 285 条实机配对的高频问法),text=该场景确定性垫话。同场景多 text 变体
+# 的意图:per_call_cap 撞顶后的第二选择,不是同通随机。
+_FILLER_SEEDS: list[dict] = [
+    # ---- zh ----
+    {"id": "filler:zh-comp-1", "lang": "zh", "category": "compensate", "text": "嗯……怎么赔，我给您讲。", "triggers": _json.dumps(["那要怎么赔给我呢", "怎么赔偿", "能赔多少钱", "你们是怎么赔偿方式", "赔给我"], ensure_ascii=False), "priority": 5, "cap": 2},
+    {"id": "filler:zh-comp-2", "lang": "zh", "category": "compensate", "text": "嗯，等我先跟您说下赔法。", "triggers": _json.dumps(["怎么个赔法", "赔偿标准是什么", "按什么赔"], ensure_ascii=False), "priority": 3, "cap": 2},
+    {"id": "filler:zh-check-1", "lang": "zh", "category": "check", "text": "嗯……我看一下。", "triggers": _json.dumps(["帮我查一下", "快递三天了还没到", "查一下我的快递", "到哪里了"], ensure_ascii=False), "priority": 4, "cap": 2},
+    {"id": "filler:zh-check-2", "lang": "zh", "category": "check", "text": "嗯，收到了，我查着了。", "triggers": _json.dumps(["还没收到货", "物流更新了吗", "我的件到哪了"], ensure_ascii=False), "priority": 3, "cap": 2},
+    {"id": "filler:zh-ack-1", "lang": "zh", "category": "ack", "text": "好，收到。", "triggers": _json.dumps(["我的微信号是", "单号是", "在淘宝买的", "好像是拼多多"], ensure_ascii=False), "priority": 4, "cap": 2},
+    {"id": "filler:zh-ack-2", "lang": "zh", "category": "ack", "text": "嗯，收到您说的。", "triggers": _json.dumps(["我买的", "快递是顺丰", "对，拼多多"], ensure_ascii=False), "priority": 3, "cap": 2},
+    {"id": "filler:zh-emp-1", "lang": "zh", "category": "empathy", "text": "理解您的心情，我们跟进。", "triggers": _json.dumps(["想投诉", "太过分了", "等太久了", "怎么这么慢"], ensure_ascii=False), "priority": 5, "cap": 1},
+    {"id": "filler:zh-min-1", "lang": "zh", "category": "minimal", "text": "嗯——。", "triggers": _json.dumps(["嗯", "好", "哦", "行", "好的"], ensure_ascii=False), "priority": 2, "cap": 2},
+    {"id": "filler:zh-def-1", "lang": "zh", "category": "default", "text": "嗯，好。", "triggers": _json.dumps([], ensure_ascii=False), "priority": 1, "cap": 2},
+    # ---- cantonese ----
+    {"id": "filler:can-comp-1", "lang": "cantonese", "category": "compensate", "text": "嗯……点样赔，等我讲你知。", "triggers": _json.dumps(["点样赔偿", "赔几多", "几时赔到", "想问下赔几多", "点赔"], ensure_ascii=False), "priority": 5, "cap": 2},
+    {"id": "filler:can-comp-2", "lang": "cantonese", "category": "compensate", "text": "嗯，等我同你讲下赔法先。", "triggers": _json.dumps(["点解咁赔", "赔偿标准係咩"], ensure_ascii=False), "priority": 3, "cap": 2},
+    {"id": "filler:can-check-1", "lang": "cantonese", "category": "check", "text": "嗯……我睇下。", "triggers": _json.dumps(["帮我查下张单", "我件货到边度", "三日都未到", "查下物流"], ensure_ascii=False), "priority": 4, "cap": 2},
+    {"id": "filler:can-check-2", "lang": "cantonese", "category": "check", "text": "收到，等我查返先。", "triggers": _json.dumps(["仲未收到", "件货去咗边"], ensure_ascii=False), "priority": 3, "cap": 2},
+    {"id": "filler:can-ack-1", "lang": "cantonese", "category": "ack", "text": "好，收到。", "triggers": _json.dumps(["我WhatsApp系", "我微信係", "單號係", "拼多多買"], ensure_ascii=False), "priority": 4, "cap": 2},
+    {"id": "filler:can-ack-2", "lang": "cantonese", "category": "ack", "text": "明白，记低咗。", "triggers": _json.dumps(["淘寶買", "京東買"], ensure_ascii=False), "priority": 3, "cap": 2},
+    {"id": "filler:can-emp-1", "lang": "cantonese", "category": "empathy", "text": "明白你嘅心情，我哋跟紧。", "triggers": _json.dumps(["想投诉", "等咗好耐", "太过分", "点解咁慢"], ensure_ascii=False), "priority": 5, "cap": 1},
+    {"id": "filler:can-min-1", "lang": "cantonese", "category": "minimal", "text": "嗯——。", "triggers": _json.dumps(["嗯", "好", "哦", "係"], ensure_ascii=False), "priority": 2, "cap": 2},
+    {"id": "filler:can-def-1", "lang": "cantonese", "category": "default", "text": "嗯，好。", "triggers": _json.dumps([], ensure_ascii=False), "priority": 1, "cap": 2},
+    # ---- en ----
+    {"id": "filler:en-comp-1", "lang": "en", "category": "compensate", "text": "Okay let me walk you through it.", "triggers": _json.dumps(["how much compensation", "how does the compensation work", "how will you compensate me"], ensure_ascii=False), "priority": 5, "cap": 2},
+    {"id": "filler:en-check-1", "lang": "en", "category": "check", "text": "Let me see.", "triggers": _json.dumps(["check my parcel", "where is my order", "my parcel was due three days"], ensure_ascii=False), "priority": 4, "cap": 2},
+    {"id": "filler:en-ack-1", "lang": "en", "category": "ack", "text": "Got it.", "triggers": _json.dumps(["my number is", "it's from amazon", "on temu", "on ebay"], ensure_ascii=False), "priority": 4, "cap": 2},
+    {"id": "filler:en-emp-1", "lang": "en", "category": "empathy", "text": "I am really sorry about that.", "triggers": _json.dumps(["I want to complain", "this is unacceptable", "so slow"], ensure_ascii=False), "priority": 5, "cap": 1},
+    {"id": "filler:en-min-1", "lang": "en", "category": "minimal", "text": "Mm hm.", "triggers": _json.dumps(["yeah", "okay", "sure"], ensure_ascii=False), "priority": 2, "cap": 2},
+    {"id": "filler:en-def-1", "lang": "en", "category": "default", "text": "Sure.", "triggers": _json.dumps([], ensure_ascii=False), "priority": 1, "cap": 2},
+]
 
 
 def build_engine() -> Engine | None:
@@ -242,6 +276,28 @@ def build_engine() -> Engine | None:
             _migrate_knowledge_content_hash(engine)
         except Exception as exc:  # pragma: no cover - sqlite / missing extension
             print(f"[deps] vector schema skipped: {exc}")
+        # 垫话罐头库种子(2026-09-13 乙节):表空才灌,幂等——运营改词条/删除后
+        # 不复活。种子=三语×六场景,trigger 是用户口吻示例句(HybridLexical 用)。
+        try:
+            from sqlalchemy import text
+
+            with engine.begin() as conn:
+                n = conn.execute(text("SELECT COUNT(*) FROM filler_entries")).scalar()
+                if not n:
+                    for row in _FILLER_SEEDS:
+                        conn.execute(
+                            text(
+                                "INSERT INTO filler_entries"
+                                " (id, account_id, lang, category, text, triggers, voice_id,"
+                                " priority, per_call_cap, enabled, hit_count, source, created_at)"
+                                " VALUES (:id, 'acc-001', :lang, :category, :text, :triggers, '',"
+                                " :priority, :cap, 1, 0, 'curated', CURRENT_TIMESTAMP)"
+                            ),
+                            row,
+                        )
+                    print(f"[deps] filler_entries seeded rows={len(_FILLER_SEEDS)}")
+        except Exception as exc:  # pragma: no cover - 种子失败不阻断启动
+            print(f"[deps] filler_entries seed skipped: {exc}")
         return engine
     return None
 

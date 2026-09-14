@@ -228,29 +228,40 @@ def _say_step_lines(tpl: dict | None) -> list[str]:
 
 
 def _fillers_jobs(
-    persona_pool: list[dict], manifest: dict[str, list[dict]], tts_cfg: dict, voice_mode: str
+    persona_pool: list[dict],
+    manifest: dict[str, list[dict]],
+    tts_cfg: dict,
+    voice_mode: str,
+    canned: dict[str, list[str]] | None = None,
 ) -> list[Job]:
-    """垫话物化计划:每个启用人设取其语言对应池的整池句(39 句 manifest,每语言 13)。
+    """垫话物化计划:每个启用人设取其语言对应池的整池句(39 句 manifest,每语言 13)
+    + 垫话罐头库该语言的条目文本(2026-09-13 乙节:filler_entries 确定性命中层,
+    同 (text, voice) 键去重——罐头文本与 manifest 文本撞车时只物化一次)。
 
     无该语言池 / 解析不出音色(如 per_language 模式下该人设缺此语言键)的人设
     响亮跳过——运行时该人设本来就查不到缓存(音色为空不查),物化也无意义。
     """
+    canned = canned or {}
     jobs: list[Job] = []
     for persona in persona_pool:
         lang = _normalize_lang((persona or {}).get("language"), default="zh") or "zh"
         entries = manifest.get(lang) or []
+        texts = [str(e.get("text") or "") for e in entries]
+        for t in canned.get(lang) or []:
+            if t and t not in texts:
+                texts.append(t)  # 罐头文本(manifest 无对应资产,纯 cache 物化层)
         voice = _persona_resolved_voice(persona, lang, tts_cfg, voice_mode)
-        if not entries or not voice:
+        if (not entries and not texts) or not voice:
             print(
                 f"fillers: persona={_persona_key(persona)} lang={lang} "
                 f"voice={voice or '-'} skipped (no pool or no voice)",
                 flush=True,
             )
             continue
-        for e in entries:
+        for t in texts:
             # text 原样透传(含 MiniMax <#x#> 停顿标记)——运行时 lookup/backfill
             # 都用 manifest 原文,key 必须同文。
-            jobs.append((persona, lang, str(e.get("text") or "")))
+            jobs.append((persona, lang, t))
     return jobs
 
 
@@ -508,17 +519,29 @@ async def main_async() -> int:
         if args.dry_run:
             _print_group_counts("plan", records, with_total=True)
 
-    # ---- 垫话按人设物化(task-14b 复活) ----
+    # ---- 垫话按人设物化(task-14b 复活;2026-09-13 含罐头条目) ----
     # 运行时 FillerDirector 双层选源:先查 (text, voice, model) 人设物化版
     # (命中=与通话完全同人声),miss 播源码资产兜底+后台补物化。这里即批量
-    # 补物化入口:新人设上线跑一次 --fillers,垫话即全程人设音色。
+    # 补物化入口:新人设上线跑一次 --fillers,垫话即全程人设音色。罐头库
+    # (filler_entries)条目文本一并物化——确定性命中层只有 cache 有音频才出声。
     if args.fillers:
         try:
             manifest = load_manifest(FILLER_ASSETS_DIR)
         except Exception as exc:  # noqa: BLE001 - 资产缺失=垫话物化停用(响亮降级)
             print(f"fillers manifest unavailable dir={FILLER_ASSETS_DIR} err={exc!r}", flush=True)
             manifest = {}
-        fillers_jobs = _fillers_jobs(persona_pool, manifest, tts_cfg, voice_mode)
+        canned: dict[str, list[str]] = {}
+        try:
+            for row in _cp_get(args.cp, "/api/fillers?enabled=1", token) or []:
+                _lang = _normalize_lang((row or {}).get("lang"), default="") or ""
+                _text = str((row or {}).get("text") or "").strip()
+                if _lang and _text:
+                    canned.setdefault(_lang, []).append(_text)
+            if canned:
+                print(f"fillers canned entries: { {k: len(v) for k, v in canned.items()} }", flush=True)
+        except Exception as exc:  # noqa: BLE001 - CP 不可达=只物化 manifest 句
+            print(f"fillers canned fetch failed: {exc!r} — 只物化 manifest 句", flush=True)
+        fillers_jobs = _fillers_jobs(persona_pool, manifest, tts_cfg, voice_mode, canned=canned)
         if fillers_jobs:
             ok, sk, fl, records = await _materialize(
                 cache, model, fillers_jobs,

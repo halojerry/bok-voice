@@ -120,12 +120,72 @@ def _strip_pause_marks(text: str) -> str:
 
 
 def filler_max_per_call() -> int:
-    # 默认 12(2026-09-12 用户实测「几轮就没」:旧默认 3 被首轮「主动+链发」耗
-    # 2 发,第三轮起全程裸等;链发与主动 arm 共享计数,12 覆盖 8-10 轮慢轮)。
+    # 默认 6(2026-09-13 乙节罐头体系:确定性命中后 12 次只会放大复读感——垫话
+    # 是补丁不是台词;6 发覆盖最差慢轮,同条目 per_call_cap 再防同语境连击)。
     try:
-        return max(0, int(os.environ.get("BOK_FILLER_MAX", "12")))
+        return max(0, int(os.environ.get("BOK_FILLER_MAX", "6")))
     except ValueError:
-        return 12
+        return 6
+
+
+def filler_match_enabled() -> bool:
+    """垫话罐头确定性匹配总闸(BOK_FILLER_MATCH,默认开;0=回退纯分类器随机池)。"""
+    return os.environ.get("BOK_FILLER_MATCH", "1") == "1"
+
+
+def filler_match_threshold() -> float:
+    # 0.42(2026-09-13 实机校准:ASR 变体「张单↔账单」下最佳 trigger 得分 0.48,
+    # 旧 0.55 全 miss;垫话有分类器+资产双层兜底,宁 hit 勿 miss——比 QA 快路
+    # 的 0.90 宽松一个档位是设计本意)。
+    try:
+        return max(0.0, min(1.0, float(os.environ.get("BOK_FILLER_MATCH_THRESHOLD", "0.42"))))
+    except ValueError:
+        return 0.42
+
+
+# ---- 五类分类器(2026-09-13 乙节回退层) ----
+# 只看客户上一句(垫话在回复生成前就要选出,那是唯一可靠上下文)。优先级
+# B安抚 > A确认接收 > C查证 > D短应承 > E默认。铁律:A/B/D/E 类垫话零动作
+# 动词(治 285 条配对实证「问赔多少→马上查」式穿帮,动作词只准进 C 类——
+# 客户真的在要进度时才承诺查)。
+_FILLER_CAT_EMPATHY_RE = re.compile(
+    r"(投诉|投訴|嬲|闹|鬧|爛|烂|冇到|未到|太耐|太长|太長|激气|激氣|生气|生氣|着急|著急|过分|過分|"
+    r"complain|unacceptable|too slow|frustrat)",
+    re.IGNORECASE,
+)
+_FILLER_CAT_ACK_RE = re.compile(
+    r"(WhatsApp|微信|WeChat|單號|单号|运单|運單|淘宝|淘寶|拼多多|京東|京东|天猫|天貓|"
+    r"小红书|小紅書|亚马逊|亞馬遜|顺丰|順豐|eBay|Amazon|Temu|UnionPay|银联|銀聯)",
+    re.IGNORECASE,
+)
+_FILLER_CAT_CHECK_RE = re.compile(
+    r"(查询|查詢|查下|查一下|边度|邊度|几时|幾時|几多|幾多|多久|点解|點解|点样|點樣|进度|進度|到未|"
+    r"怎么|如何|为什么|為什麼|check|track|where.*order|when|how much|how many|how long)",
+    re.IGNORECASE,
+)
+_FILLER_CAT_MINIMAL_RE = re.compile(
+    r"^[嗯啊哦好的呀呢嘅啦喇系係得对對\s。.!！~～]+$", re.IGNORECASE
+)
+
+
+def classify_filler_category(user_text: str) -> str:
+    """客户上一句 → 垫话场景五类之一(empathy/ack/check/minimal/default)。
+
+    纯函数、三语共用;数字串(报号码轮)归 ack——确认收到,别催别查。
+    minimal=纯应承词/语气粒子组合(「嗯」「好的呀」「好啦」)。
+    """
+    t = str(user_text or "").strip()
+    if not t:
+        return "default"
+    if len(t) <= 6 and _FILLER_CAT_MINIMAL_RE.match(t):
+        return "minimal"
+    if _FILLER_CAT_EMPATHY_RE.search(t):
+        return "empathy"
+    if re.search(r"\d{4,}", t) or _FILLER_CAT_ACK_RE.search(t):
+        return "ack"
+    if _FILLER_CAT_CHECK_RE.search(t):
+        return "check"
+    return "default"
 
 
 def filler_chain_enabled() -> bool:
@@ -161,6 +221,113 @@ def load_wav_pcm(path: Path) -> tuple[bytes, int]:
         return w.readframes(w.getnframes()), w.getframerate()
 
 
+def _hybrid_cos(a: list[float], b: list[float]) -> float:
+    num = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(y * y for y in b) ** 0.5
+    return num / max(1e-9, na * nb)
+
+
+class FillerEntryIndex:
+    """垫话罐头索引(镜像 qa_gate.QaIndex):triggers=用户口吻示例句,HybridLexical
+    打分(0.6×余弦+0.4×子串,与 QA 快路同款词法),分类器场景一致给 +0.15 加分。
+
+    确定性铁律(用户拍板:随机抽签才是机器感):同输入永远同条目——打分取
+    (score, priority, id) 严格排序的 top-1,并列时 priority 高、id 字典序小者胜。
+    """
+
+    def __init__(self, entries: list[dict]):
+        from bok_voice_core.embeddings import HybridLexicalEmbedding
+        from bok_voice_core.qa_text import normalize_question
+
+        self._embed = HybridLexicalEmbedding(512)
+        self._norm = normalize_question
+        self._items: list[dict] = []
+        for e in entries or []:
+            text = str(e.get("text") or "").strip()
+            if not text:
+                continue
+            try:
+                triggers = json.loads(str(e.get("triggers") or "[]"))
+            except Exception:  # noqa: BLE001 - triggers 坏 JSON 当空
+                triggers = []
+            trig: list[str] = []
+            vecs: list[list[float]] = []
+            for t in triggers:
+                q = normalize_question(str(t or ""))
+                if not q:
+                    continue
+                try:
+                    vecs.append(self._embed.embed([q])[0])
+                except Exception:  # noqa: BLE001 - 单条向量失败跳过该 trigger
+                    continue
+                trig.append(q)
+            self._items.append(
+                {
+                    "e": e,
+                    "text": text,
+                    "trig": trig,
+                    "vecs": vecs,
+                    "priority": int(e.get("priority") or 0),
+                    "cap": max(1, int(e.get("per_call_cap") or 2)),
+                    "lang": str(e.get("lang") or ""),
+                    "cat": str(e.get("category") or "default"),
+                }
+            )
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def match(
+        self,
+        user_text: str,
+        *,
+        lang: str = "",
+        classifier_cat: str = "",
+        used: dict | None = None,
+        threshold: float | None = None,
+    ) -> tuple[dict | None, float]:
+        """返回 (命中条目原 dict, 得分);used={id: 已用次数} 做 per_call_cap 淘汰。"""
+        q = self._norm(str(user_text or ""))
+        if not q or not self._items:
+            return None, 0.0
+        try:
+            qv = self._embed.embed([q])[0]
+        except Exception:  # noqa: BLE001 - embed 失败=回退分类器
+            return None, 0.0
+        q_low = q.lower()
+        thr = filler_match_threshold() if threshold is None else threshold
+        best: dict | None = None
+        best_key: tuple | None = None
+        best_score = 0.0
+        for it in self._items:
+            if lang and it["lang"] and it["lang"] != lang:
+                continue
+            eid = str(it["e"].get("id") or "")
+            if used is not None and eid and used.get(eid, 0) >= it["cap"]:
+                continue
+            score = 0.0
+            for tq, tv in zip(it["trig"], it["vecs"]):
+                s = 0.6 * _hybrid_cos(qv, tv)
+                # 子串奖励双向(2026-09-13 实机实证:只认 user⊂entry 是把 QA 快路的
+                # 「超集句」缺口照搬过来——垫话场景恰恰相反,词条短、用户句长
+                # (「唔该帮我查下张单到边度」⊃trigger「帮我查下张单」),单向恒 0 分)。
+                tq_low = tq.lower()
+                if q_low and q_low in tq_low:
+                    s += 0.4 * (len(q_low) / max(1, len(tq)))
+                elif tq_low and tq_low in q_low:
+                    s += 0.4 * (len(tq_low) / max(1, len(q_low)))
+                score = max(score, s)
+            if classifier_cat and classifier_cat == it["cat"]:
+                score += 0.15
+            key = (round(score, 6), it["priority"], "-" + eid)  # id 取负字典序=小者胜
+            if score >= thr and (best_key is None or key > best_key):
+                best, best_key, best_score = it["e"], key, score
+        if best is not None:
+            return best, best_score
+        return None, best_score
+
+
 class FillerDirector:
     """垫话编排:arm(轮提交后) → 定时器 → 资产命中即播;首音频回调 → 只作废
     定时器(垫话播完),回复帧由 tts_cache hold 到「垫话完+gap」。
@@ -183,6 +350,9 @@ class FillerDirector:
         speed_resolver=None,
         report=None,
         caption=None,
+        entries_index=None,
+        user_text_provider=None,
+        entry_hit=None,
     ) -> None:
         self._session = session
         self._lang_resolver = lang_resolver
@@ -200,6 +370,14 @@ class FillerDirector:
         # 字幕回调(F4,2026-09-11 用户点名):开火即发文本——agent 侧转
         # lk.transcription 数据包(官方组件聚合通道),不进 chat_ctx 零 LLM 污染。
         self._caption = caption
+        # 垫话罐头确定性匹配(2026-09-13 乙节):entries_index=FillerEntryIndex
+        # (CP filler_entries,装配时拉取);user_text_provider=客户上一句(开火
+        # 时点取值);entry_hit=命中计数回调(fire-and-forget)。任一缺失或
+        # BOK_FILLER_MATCH=0 → 纯分类器+资产池(既有行为)。
+        self._entries_index = entries_index
+        self._user_text_provider = user_text_provider
+        self._entry_hit = entry_hit
+        self._entry_used: dict[str, int] = {}  # 条目 id → 本通已用次数(per_call_cap)
         # 人设音色双层(task-14a):cache=TtsAudioCache(lookup 运行时人设 voice/model
         # 的物化版,命中=与通话完全同人声);voice_model_resolver=() -> (voice, model),
         # 异常/空值=纯资产;backfill=async(text) 补物化执行体——由 agent 侧注入
@@ -257,6 +435,58 @@ class FillerDirector:
         hold = self._play_started + self._cur_dur + filler_gap_s() - time.monotonic()
         return max(0.0, hold)
 
+    def play_offband(self, text: str) -> None:
+        """C1 修复(2026-09-13 实机 A/B 实证):暂停播报绝不能走 session.say()——
+        它令 turn_detection=stt 的轮提交链在 paused 期间停摆(ack-on 三轮暂停期
+        零 AST 事件;ack-off 对照组 gen=paused 轮正常落库)。改走 out-of-band
+        音轨(垫话同通道,零 speech 队列交互)。tts-cache 命中人设物化版即播;
+        miss 不同步云合成(暂停语义不打断优先)——打点并异步 backfill,下一通
+        起有声。
+        """
+        if self._player is None or not text:
+            return
+        try:
+            voice = model = ""
+            cached: bytes | None = None
+            if self._cache is not None and self._voice_model_resolver is not None:
+                try:
+                    voice, model = self._voice_model_resolver()
+                except Exception:  # noqa: BLE001
+                    voice = model = ""
+                if voice and model:
+                    try:
+                        speed = 1.0
+                        try:
+                            speed = float(self._speed_resolver() or 1.0)
+                        except Exception:  # noqa: BLE001
+                            speed = 1.0
+                        cached = self._cache.lookup(text, voice=voice, model=model, speed=speed)
+                    except TypeError:
+                        cached = self._cache.lookup(text, voice=voice, model=model)
+                    except Exception:  # noqa: BLE001
+                        cached = None
+            if cached is None:
+                print(
+                    f"BOK_PAUSE_ACK_NO_AUDIO text={text[:16]!r} voice={voice!r} — 未物化,异步补,下通起有声",
+                    flush=True,
+                )
+                self._maybe_backfill(text, voice, model)
+                return
+            from .tts_cache import frames_aiter, pcm_to_frames
+
+            rate = int(getattr(self._cache, "sample_rate", 24000))
+            frames = pcm_to_frames(resample_pcm(cached, rate, BACKGROUND_PLAYER_RATE), BACKGROUND_PLAYER_RATE)
+            try:
+                from livekit.agents import AudioConfig
+
+                source = AudioConfig(source=frames_aiter(frames), fade_in=0.015, fade_out=0.05)
+            except Exception:  # noqa: BLE001 - 无 livekit(测试替身)裸帧
+                source = frames_aiter(frames)
+            self._player.play(source)
+            print(f"BOK_PAUSE_ACK offband played text={text[:16]!r}", flush=True)
+        except Exception as exc:  # noqa: BLE001 - 播报失败不阻暂停语义
+            print(f"BOK_PAUSE_ACK offband error={exc!r}", flush=True)
+
     def cancel(self) -> None:
         """新用户轮到达等场景:作废定时器/链发并停掉在播垫话——用户插话优先,
         out-of-band 音轨不受框架打断机制管理,必须自己停。"""
@@ -270,6 +500,7 @@ class FillerDirector:
         self._count = 0
         self._fired_lines.clear()
         self._recent.clear()
+        self._entry_used.clear()
         self._cancel_timer()
         self._cancel_chain()
         self._stop_playing()
@@ -351,18 +582,73 @@ class FillerDirector:
                 self._manifest = {}
         return self._manifest
 
-    def _pick(self, lang: str) -> dict | None:
+    def _pick(self, lang: str, category: str = "") -> dict | None:
         pool = self._pools().get(lang)
         if not pool:
             # 语言铁律:宁可不垫,绝不跨语言发声(池缺失响亮日志,不落其他语言池)。
             print(f"BOK_FILLER no pool lang={lang!r} — 跳过", flush=True)
             return None
-        # 随机不重样(同垫话连续两轮最刺耳):池里剔除上两句后随机,池小才允许重复。
+        # 分类器回退层(2026-09-13):按场景类过滤 manifest 池(manifest 条目带
+        # cat 标签);该类无条目 → default 标签池 → 整池(既有行为)。
+        preferred = pool
+        if category:
+            cat_pool = [e for e in pool if e.get("cat") == category]
+            if not cat_pool:
+                cat_pool = [e for e in pool if e.get("cat") == "default"]
+            if cat_pool:
+                preferred = cat_pool
+        # 随机不重样(同垫话连续两轮最刺耳):池里剔除上两句后随机。
+        # 优先池被去重清空 → 向整池放宽再挑,而不是原样落回单条池——旧版
+        # `or list(pool)` 兜底在分类池只有 1 条时把同一条放回,同句连播
+        # (2026-09-14 call-c76832ac 实证:cantonese default 池=1 条,
+        # 「冇問題，你稍等多一陣…」4 分钟播 3 次)。只有整池都在去重窗内
+        # 才允许重复(池太小没有别的可选)。
         recent = set(self._recent[-2:])
-        candidates = [e for e in pool if e["file"] not in recent] or list(pool)
+        candidates = [e for e in preferred if e["file"] not in recent]
+        if not candidates and preferred is not pool:
+            candidates = [e for e in pool if e["file"] not in recent]
+        if not candidates:
+            candidates = list(pool)
         entry = random.choice(candidates)
         self._recent.append(entry["file"])
         return entry
+
+    def _select(self, lang: str) -> tuple[dict | None, str]:
+        """选取链:①罐头确定性匹配(客户上一句) ②分类器→资产池回退。
+
+        返回 (条目, 场景类)。罐头条目 {"text":..., "file": None}(音频只能来自
+        tts-cache 人设物化,miss 在 _fire 里落资产兜底);资产条目带 file。
+        """
+        if (
+            self._entries_index is not None
+            and self._user_text_provider is not None
+            and filler_match_enabled()
+        ):
+            try:
+                user_text = str(self._user_text_provider() or "").strip()
+            except Exception:  # noqa: BLE001 - provider 失败=回退
+                user_text = ""
+            if user_text:
+                cat = classify_filler_category(user_text)
+                entry, score = self._entries_index.match(
+                    user_text, lang=lang, classifier_cat=cat, used=self._entry_used
+                )
+                if entry is not None:
+                    eid = str(entry.get("id") or "")
+                    self._entry_used[eid] = self._entry_used.get(eid, 0) + 1
+                    print(
+                        f"BOK_FILLER_MATCH hit entry={eid} score={score:.2f} cat={cat}",
+                        flush=True,
+                    )
+                    if self._entry_hit is not None and eid:
+                        try:
+                            self._entry_hit(eid)
+                        except Exception:  # noqa: BLE001 - 计数唔阻垫话
+                            pass
+                    return {"text": str(entry.get("text") or ""), "file": None}, cat
+                print(f"BOK_FILLER_MATCH miss best={score:.2f} cat={cat}", flush=True)
+                return self._pick(lang, cat), cat
+        return self._pick(lang), ""
 
     async def _fire(self, delay: float) -> None:
         try:
@@ -382,7 +668,8 @@ class FillerDirector:
                 return  # 别的东西在播/状态不明,唔叠音
             if self._handle is not None:
                 return  # 上一句垫话还在播(理论到唔到:cancel 已清),唔叠音
-            entry = self._pick(self._lang_resolver())
+            lang = self._lang_resolver()
+            entry, cat = self._select(lang)
             if not entry:
                 return
             # 双层选源(task-14a):先查运行时人设物化版,miss 落源码资产兜底。
@@ -406,6 +693,19 @@ class FillerDirector:
                         cached = self._cache.lookup(entry["text"], voice=voice, model=model)
                     except Exception:  # noqa: BLE001 - 缓存读取失败当未命中
                         cached = None
+            if cached is None and not entry.get("file"):
+                # 罐头条目只能出自 tts-cache 人设物化(无源码资产);miss=新人设
+                # 缺物化 → 落分类器资产兜底(永不哑),并异步补物化罐头原文——
+                # 同人设下一通起命中(补的是罐头文本,唔係兜底资产文本)。
+                print(
+                    f"BOK_FILLER_MATCH voice_miss entry_text={entry['text'][:20]!r}"
+                    " — 罐头未物化,分类器资产兜底",
+                    flush=True,
+                )
+                self._maybe_backfill(entry["text"], voice, model)
+                entry = self._pick(lang, cat)
+                if not entry:
+                    return
             from .tts_cache import frames_aiter, pcm_to_frames
 
             if cached is not None:

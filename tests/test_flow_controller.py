@@ -574,7 +574,7 @@ def test_current_step_explicit_no_leak_instruction():
 # ---- 明确拒绝 → REFUSE(一句礼貌收尾 + 主动结束通话) ----
 def test_decide_advance_refuse_family():
     # 高频拒绝说法(旧版漏成 unclear/objection 然后无限重问):现在直接 REFUSE。
-    from agent_runtime.flow import REFUSE, decide_advance
+    from agent_runtime.flow import FAREWELL, REFUSE, decide_advance
     assert decide_advance("唔需要喇，唔该") == REFUSE
     assert decide_advance("唔办啦。") == REFUSE
     assert decide_advance("我唔要。") == REFUSE
@@ -583,13 +583,16 @@ def test_decide_advance_refuse_family():
     assert decide_advance("唔好再打嚟！") == REFUSE
     assert decide_advance("不用了谢谢") == REFUSE
     assert decide_advance("别再打来了") == REFUSE
-    assert decide_advance("再见") == REFUSE
-    assert decide_advance("拜拜") == REFUSE
+    # 2026-09-13 C4:纯道别≠拒绝——剥出 FAREWELL 分流(谈成通话道别标 declined 是误伤)。
+    assert decide_advance("再见") == FAREWELL
+    assert decide_advance("拜拜") == FAREWELL
+    # 拒绝优先于道别:「唔好再打嚟,拜拜」主体仍是拒绝。
+    assert decide_advance("唔好再打嚟，拜拜。") == REFUSE
 
 
 def test_refuse_social_phrase_not_refuse():
     # 「唔使担心/唔使客气」係社交关心/客套,唔係拒绝(防误收线)。
-    from agent_runtime.flow import REFUSE, decide_advance
+    from agent_runtime.flow import FAREWELL, REFUSE, decide_advance
     assert decide_advance("唔使担心，我明白嘅。") != REFUSE
     assert decide_advance("你哋唔使客气。") != REFUSE
 
@@ -788,6 +791,44 @@ def test_wa_numberish_and_announce_head():
     # 自报头:「我的WhatsApp是。」(零数字,号码喺后半句)
     assert _WA_ANNOUNCE_HEAD_RE.search("我的WhatsApp是。") is not None
     assert _WA_ANNOUNCE_HEAD_RE.search("你係咪加我WhatsApp呀") is None
+
+
+def test_wa_question_gate_blocks_staging():
+    """疑问/算式句唔进号码累积暂存(2026-09-14 call-c76832ac:「一加一等于几？」
+    连问两轮被 accumulate+StopResponse 静默吞掉,flush 后回「请继续报号码」答非所问)。
+    标记词=报号碎片结构性唔会出现的提问/算术词。"""
+    from agent_runtime.agent import _wa_numberish, _wa_questionish
+
+    # 真实事故句:numberish 判真(一一=2 数字/剩「加等于几」≤6)但语境门必须拦住
+    assert _wa_numberish("一加一等于几？") is True
+    assert _wa_questionish("一加一等于几？") is True
+    # 中文疑问/算式族
+    assert _wa_questionish("three减one等于几多") is True
+    assert _wa_questionish("呢个要几钱啊？") is True
+    assert _wa_questionish("你点解问我啊？") is True
+    assert _wa_questionish("呢个係咩嚟㗎？") is True
+    # 英文族
+    assert _wa_questionish("1 plus 1 equals?") is True
+    assert _wa_questionish("What is 3 times 4") is True
+    # 报号碎片照旧唔被拦(回归):纯数字/自报头/渠道词+数字
+    assert _wa_questionish("我的WhatsApp係六四三") is False
+    assert _wa_questionish("六四三二五四三二") is False
+    assert _wa_questionish("Zero was three") is False
+    assert _wa_questionish("我的WhatsApp是。") is False
+    # 裸「等」「点/點」唔入标记词:「三点」「等阵」係正常会话词,唔可以误拦
+    assert _wa_questionish("而家三点") is False
+    assert _wa_questionish("我等阵再讲") is False
+
+
+def test_wa_stash_decision_has_question_gate():
+    """源码级:暂存判定必须过 _wa_questionish(接线点喺 nested closure,冇法直接单测)。"""
+    import agent_runtime.agent as ag
+
+    src = Path(ag.__file__).read_text(encoding="utf-8")
+    gate_pos = src.index("and not _wa_questionish(_merged)")
+    stash_pos = src.index("_stash_it = (")
+    assert stash_pos < gate_pos < src.index("if _stash_it:")
+    assert "_WA_QUESTION_MARKERS" in src
 
 
 def test_wa_confirm_guard_shared_rule_and_judge():

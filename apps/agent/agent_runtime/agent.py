@@ -408,6 +408,23 @@ def _wa_numberish(text: str) -> bool:
     return digits >= 1 and len(rest) <= 6
 
 
+# 疑问/算式标记(2026-09-14,call-c76832ac):客户喺收号码步问「一加一等于几？」
+# 连问两轮——「一一」被归一成 2 个数字、剩「加等于几」≤6 字,误中 numberish 被
+# 暂存 + StopResponse 吞声,5s flush 后回「请继续报WhatsApp号码」答非所问。
+# 标记词係报号碎片结构性唔会出现的提问/算术词:命中即唔当报号碎片暂存,
+# 走正常轮次俾 LLM 接住。唔收裸「等」「點/点」(「三点」「等阵」係正常会话词)。
+_WA_QUESTION_MARKERS = re.compile(
+    r"加|減|减|乘|除|等于|等於|幾|几|乜|咩|甚麼|什麼|什么|嗎|吗|麼|么|點解|点解|"
+    r"plus|minus|times|divided|multiplied|equals?\b",
+    re.IGNORECASE,
+)
+
+
+def _wa_questionish(text: str) -> bool:
+    """疑问/算式句:含提问或算术标记 ⇒ 不暂存、不 StopResponse,走正常轮次。"""
+    return bool(_WA_QUESTION_MARKERS.search(text))
+
+
 def _wa_accum_merge(stashed: str, incoming: str) -> str:
     """累积合并:「结合上下文」的正确姿势(call-5f8bef6b 实证)。
 
@@ -439,6 +456,50 @@ def _defer_ack_line(lang: str) -> str:
     return "好的，不着急，您慢慢看，我在电话这边等您。"
 
 
+def _starve_ack_line(lang: str) -> str:
+    """A3 饿死兜底短承接(C3 长独白饿死家族,2026-09-13):连续 2 轮零回复后
+    的让路语——≤15 字、零内容承诺(下一轮才恢复完整生成),只让客户知道
+    「还在、在听」。BOK_STARVE_ACK=0 关。"""
+    if lang == "cantonese":
+        return "係嘅，你講，我即刻答你。"
+    if lang == "en":
+        return "I'm here — please go ahead."
+    return "在的，您讲，我马上答复您。"
+
+
+def _say_step_cap(text: str) -> str:
+    """A2a 直念步长度护栏(2026-09-13):模板步正稿超 BOK_SAY_STEP_LIMIT(默认
+    80 字≈15s 音频)→ 只念首句+打点 SAY_STEP_TOO_LONG 提醒拆步——治运营手滑
+    再灌长稿(147/160 字直念=28-30s 独白的数据根源复燃)。甲.1 拆步后三语
+    模板全部 ≤55 字,本护栏纯兜底。"""
+    try:
+        limit = int(os.environ.get("BOK_SAY_STEP_LIMIT", "80") or 0)
+    except ValueError:
+        limit = 80
+    t = str(text or "")
+    if limit <= 0 or len(t) <= limit:
+        return t
+    m = re.search(r"[。！？!?]", t)
+    head = t[: m.end()] if (m and m.end() <= limit + 40) else t[:limit]
+    print(
+        f"SAY_STEP_TOO_LONG chars={len(t)} → 截断念首句({len(head)} 字)"
+        "——模板步超长,请运营拆步(plan 甲.1 单次直念铁律 ≤50 字)",
+        flush=True,
+    )
+    return head
+
+
+def _pause_ack_line(lang: str) -> str:
+    """暂停进入播报(C1 暂停黑洞,2026-09-13):supervisor 暂停/人工接管瞬间
+    脚本直念一句可听交代——旧版暂停=26s 纯静默(call-15a2f586 实证),客户
+    不知道发生了什么。万能话术原则:不含任何动作承诺。BOK_PAUSE_ACK=0 关。"""
+    if lang == "cantonese":
+        return "好嘅，你稍等一陣。"
+    if lang == "en":
+        return "Sure, one moment please."
+    return "好的，您稍等一下。"
+
+
 def _wa_number_line(lang: str, num: str) -> str:
     """碎片暂存超时 flush 嘅脚本直念(session.say,零 TTFT/零前缀断裂):captured →
     复述确认;唔系号码 → 请客户继续。三语骨架,风格同 _nudge_line。"""
@@ -454,6 +515,40 @@ def _wa_number_line(lang: str, num: str) -> str:
     if lang == "en":
         return "Sorry, I may have missed part of that — please go ahead with your number."
     return "不好意思，可能刚才没听完整——麻烦您继续说一下您的号码。"
+
+
+def _wa_len_expected(lang: str) -> int | None:
+    """C3b 号长期望(2026-09-13,call-6f1c4ee3:7 位错号被复述确认+客户假确认):
+    粤=8 位港号(852+8=11 亦收);zh=11 位手机;en 宽松不校验。BOK_WA_LEN_CHECK=0 关。
+    只挡「复述确认」,不挡捕获——「报出就收」铁律不动(捕获/上报/横幅照旧)。"""
+    if os.environ.get("BOK_WA_LEN_CHECK", "1") != "1":
+        return None
+    if lang == "cantonese":
+        return 8
+    if lang == "zh":
+        return 11
+    return None
+
+
+def _wa_confirm_or_reask(lang: str, num: str) -> str:
+    """复述确认前的号长闸:长度可疑 → 不复述确认,改口请客户报完整号码(打点
+    LEN_CHECK_SUSPECT);长度合理/校验关闭 → 原 _wa_number_line 复述确认。"""
+    exp = _wa_len_expected(lang)
+    if exp is not None and num and str(num).isdigit():
+        n = len(str(num))
+        ok = n == exp or (lang == "cantonese" and str(num).startswith("852") and n == 11)
+        if not ok:
+            print(
+                f"[whatsapp] LEN_CHECK_SUSPECT num_len={n} expected={exp} lang={lang} "
+                "— 复述改请重讲(捕获/上报照旧,不破「报出就收」)",
+                flush=True,
+            )
+            if lang == "cantonese":
+                return "唔该再讲一次你完整嘅WhatsApp號碼。"
+            if lang == "en":
+                return "Could you read out your full number again, please?"
+            return "麻烦您再报一次完整的号码。"
+    return _wa_number_line(lang, num)
 
 
 # ---- ASR 热词(context 软偏置)----
@@ -1203,11 +1298,25 @@ async def entrypoint(ctx):
     except Exception as e:
         print(f"[agent] context resolve failed ({room_name}): {e}", flush=True)
 
+    # C2 闸1·幽灵 job 拒接(2026-09-13,call-6bd59b40):挂断后 operator 页重连
+    # 重建房间会再派一个 job,旧版对无人房重放开场白+幽灵轮落库+session_report
+    # 被覆盖+旧进程 kill -30。call 装配已拿到状态:ended → 拒接(return=无副
+    # 作用收工,不连房不念稿不上报);CP 不可达(call=None)保守放行——可用性
+    # 优先,不能因为 CP 抖动掐死正常通话。
+    if call is not None and str(call.get("status") or "") == "ended":
+        print(
+            f"[agent] GHOST_JOB_REJECTED call_id={call_id} status=ended — "
+            "通话已结束,拒接幽灵 job(不连房/不念开场白/不覆盖 report)",
+            flush=True,
+        )
+        return
+
     # 对话流程控制器:载入模板分步 + 对象变量;由它按轮注入"当前步",逐步推进。
     from .flow import FlowController, facts_line
     from .flow import (
         CONFIRM,
         DEFER,
+        FAREWELL,
         OBJECTION,
         QUESTION,
         REFUSE,
@@ -1288,6 +1397,13 @@ async def entrypoint(ctx):
     # WA 号码碎片累积:客户逐位/逐段报号时暂存半截句(见 on_user_turn_completed
     # 内 _WA_ACCUM 注释)。text=暂存拼接,ts=最后一段时刻,task=超时 flush 任务。
     _wa_accum: dict = {"text": "", "ts": 0.0, "task": None}
+    # A3 饿死兜底(2026-09-13,call-909744db「太长啦」3 连轮 sentences=0
+    # canceled=1 只闻垫话):连续 2 个用户轮之间零 assistant 输出(含 say/QA/
+    # LLM 任何形态)→ 第 3 轮跳过完整生成,直念 ≤15 字短承接+StopResponse,
+    # 下一轮恢复正常生成(计数清零)。BOK_STARVE_ACK=0 关。
+    _starve: dict = {"n": 0}
+    _assistant_out: dict = {"on": True}  # assistant 轮出现即置位(item_added)
+    _had_user_turn: dict = {"on": False}
 
     def _cancel_wa_accum_flush() -> None:
         task = _wa_accum.get("task")
@@ -1304,12 +1420,26 @@ async def entrypoint(ctx):
 
         async def _flush() -> None:
             await asyncio.sleep(_WA_ACCUM_TIMEOUT_S)
-            if closed.is_set():
+            if closed.is_set() or agent.paused:
+                # C1:暂停期 flush 冻结(侦测/上报/直念全部让位)——stash 文本
+                # 留在 _wa_accum,resume 后下一段号码话会拼上继续走。
                 return
             stashed = _wa_accum["text"]
             _wa_accum["text"] = ""
             if not stashed:
                 return
+            # C3a:合并轮落库(provider=wa-merged)——stash 轮(provider=wa-stash)
+            # 已各段在案,这里是拼完的整句,分析侧按 provider 对账。
+            try:
+                _fm_ms = int((time.monotonic() - _t0) * 1000)
+                await cp.add_turn(
+                    call_id, "user", stashed, language=language_state.lang,
+                    line="a", speaker="customer", provider="wa-merged",
+                    template_step=(int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0,
+                    started_ms=_fm_ms, ended_ms=_fm_ms,
+                )
+            except Exception:  # noqa: BLE001 - 落库失败唔阻 flush
+                pass
             _g, _r = flow_ctrl.current_goal_ref()
             sig = detect_whatsapp_signal(stashed, step_goal=_g, step_ref=_r, facts=flow_ctrl.vars_map)
             num = ""
@@ -1333,7 +1463,7 @@ async def entrypoint(ctx):
                 print(f"[whatsapp] accumulate flush no-number, prompt continue (call {room_name})", flush=True)
             try:
                 _turn_origin["gen"] = "script"  # WA 号码复述=脚本直念
-                await _say_script(session, tts_provider, _tts_cache, _wa_number_line(language_state.lang, num))
+                await _say_script(session, tts_provider, _tts_cache, _wa_confirm_or_reask(language_state.lang, num))
             except Exception as exc:  # pragma: no cover - 会话已关等
                 print(f"[whatsapp] accumulate flush say failed: {exc!r}", flush=True)
 
@@ -1793,6 +1923,19 @@ async def entrypoint(ctx):
             async for _ev in _stream:
                 pass
 
+    # 垫话罐头命中计数(2026-09-13 乙节):fire-and-forget,失败零影响。
+    def _filler_entry_hit(entry_id: str) -> None:
+        async def _go() -> None:
+            try:
+                await cp.filler_hit(entry_id)
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            asyncio.create_task(_go())
+        except Exception:  # noqa: BLE001 - 无事件循环(测试)=丢弃计数
+            pass
+
     _filler = FillerDirector(
         session,
         # 语言铁律(2026-09-10):垫话语言=装配时钉死的通话语言,构造时捕获,
@@ -1819,6 +1962,23 @@ async def entrypoint(ctx):
         report=_on_filler_played,
         caption=_filler_caption,
     )
+    # 垫话罐头确定性匹配(2026-09-13 乙节):拉 CP filler_entries 建索引——命中
+    # 即同语境同条目(用户拍板:随机抽签才是机器感);客户上一句复用
+    # flow_ctrl.last_user_text(hook L2481 已维护)。拉取失败/空表 → 纯分类器
+    # +资产池(既有行为);BOK_FILLER_MATCH=0 同样回退。
+    try:
+        _filler_rows = await cp.list_filler_entries()
+    except Exception as exc:  # noqa: BLE001 - 罐头库不可用零影响
+        _filler_rows = []
+        print(f"[agent] filler entries load failed: {exc!r} (call {room_name})", flush=True)
+    if _filler_rows:
+        from .fillers import FillerEntryIndex
+
+        _filler_index = FillerEntryIndex(_filler_rows)
+        _filler._entries_index = _filler_index
+        _filler._user_text_provider = lambda: flow_ctrl.last_user_text
+        _filler._entry_hit = _filler_entry_hit
+        print(f"[agent] filler canned on entries={len(_filler_index)} (call {room_name})", flush=True)
     if isinstance(tts_provider, CachedTTS):
         tts_provider.add_first_audio_listener(_filler.on_reply_first_audio)
         # 播放排序契约(2026-09-10):垫话播完→gap→回复。回复首帧到达时若垫话
@@ -1940,6 +2100,7 @@ async def entrypoint(ctx):
                 )
             )
             return
+        _assistant_out["on"] = True  # A3:assistant 轮出现=上一用户轮已被接住
         gen = _turn_origin["gen"]
         provider = _turn_origin["provider"]  # 默认空串(与旧行为一致;QA 快路=qa-fastpath)
         _turn_origin["gen"] = "llm"  # consume-once:下一轮默认 llm
@@ -2253,6 +2414,10 @@ async def entrypoint(ctx):
                 flow_ctrl.current == step_at
                 and flow_ctrl.has_steps
                 and not flow_ctrl.done
+                # C1 暂停冻结(2026-09-13):暂停前起跑的 judge 完成时若在暂停中,
+                # 不推进不注入(旧版 call-15a2f586:暂停期 judge=confirm 静默推
+                # step4→6,恢复后错步)。judge 结果丢弃,resume 后重新判。
+                and not agent.paused
                 # 直念步待念唔推进(同轮内 say 锁):未念的 say=1 步被 judge 跳过去
                 # =合规内容被吞——先等 agent 把直念念完,下一轮判定先有效。
                 and not flow_ctrl.pending_say_text()
@@ -2386,10 +2551,68 @@ async def entrypoint(ctx):
                         new_message.text_content = _stripped
                     except Exception:  # pragma: no cover - 历史消息改写失败只损显示一致性
                         pass
+            # 垫话罐头匹配的口粮(2026-09-13 实机实证):旧版只在 has_steps 块内
+            # 赋值 → 无模板通话(E2E 腿)last_user_text 恒空,匹配层饿死
+            # (BOK_FILLER_MATCH miss best=0.00)。无条件赋值——纯字段,无模板零副作用。
+            flow_ctrl.last_user_text = user_text
+            # ---- C1 暂停冻结(2026-09-13,call-15a2f586) ----
+            # 暂停期用户轮:照落库(gen=paused,客户讲过的话永远在案)+ 整轮丢弃。
+            # 必须在 WA 累积/detect/rule 推进/judge 之前——旧版暂停期 flow 静默
+            # 推进 step4→6(rule=auto/judge 两路都照跑),恢复后直接错步+暂停期
+            # 轮次蒸发(turns 表 26s 空洞)。resume(agent.paused=False)后自然
+            # 走完整回复路径,零恢复逻辑。
+            if self.paused:
+                try:
+                    _p_ms = int((time.monotonic() - _t0) * 1000)
+                    await cp.add_turn(
+                        call_id, "user", user_text, language=language_state.lang,
+                        line="a", speaker="customer", gen="paused",
+                        template_step=(int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0,
+                        started_ms=_p_ms, ended_ms=_p_ms,
+                    )
+                except Exception:  # noqa: BLE001 - 落库失败不阻暂停语义
+                    pass
+                print(f"[agent] paused turn logged, flow frozen (call {room_name})", flush=True)
+                raise StopResponse()
             # WA 号码碎片累积:号码主导句且累计 <8 位、或自报头半句(「我的WhatsApp係」)
             # → 暂存+StopResponse(唔回复、唔侦测、唔推进),等下一段拼埋一次过处理。
             # 超时 flush 见 _arm_wa_accum_flush。StopResponse 必须喺任何 except-pass
             # try 之外(会被吞)。BOK_WA_ACCUMULATE=0 回退。
+            # ---- A3 饿死兜底(2026-09-13,call-909744db):连续 2 轮零 assistant
+            # 输出(长独白锁死对话权→碎片轮反复掐死在途回复,客户只闻垫话)→ 本轮
+            # (第 3 轮)跳过完整生成,直念 ≤15 字短承接,下一轮恢复完整生成。
+            if _had_user_turn["on"] and not _assistant_out["on"]:
+                _starve["n"] += 1
+            else:
+                _starve["n"] = 0
+            _assistant_out["on"] = False
+            _had_user_turn["on"] = True
+            if (
+                _starve["n"] >= 2
+                and os.environ.get("BOK_STARVE_ACK", "1") == "1"
+                and not closed.is_set()
+            ):
+                _starve["n"] = 0
+                _ack = _starve_ack_line(language_state.lang)
+                context_state.set_last_reply(_ack)
+                _turn_origin["gen"] = "script"
+                _turn_origin["provider"] = "starve-ack"
+                try:
+                    _sa_ms = int((time.monotonic() - _t0) * 1000)
+                    await cp.add_turn(
+                        call_id, "user", user_text, language=language_state.lang,
+                        line="a", speaker="customer", provider="starve-ack",
+                        template_step=(int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0,
+                        started_ms=_sa_ms, ended_ms=_sa_ms,
+                    )
+                except Exception:  # noqa: BLE001 - 落库失败唔阻承接
+                    pass
+                print(
+                    f"[agent] starve-ack (连续 2 轮零回复,短承接让路) (call {room_name})",
+                    flush=True,
+                )
+                await _say_script(session, tts_provider, _tts_cache, _ack)
+                raise StopResponse()
             if _WA_ACCUM_ENABLED and flow_ctrl.has_steps:
                 _g, _r = flow_ctrl.current_goal_ref()
                 if _looks_like_whatsapp_step(_g, _r) and user_text.strip() and not closed.is_set():
@@ -2398,6 +2621,9 @@ async def entrypoint(ctx):
                     _n = sum(ch.isdigit() for ch in _digit_normalize(_merged))
                     _stash_it = (
                         not _WHATSAPP_DECLINE.search(user_text.lower())
+                        # 疑问/算式句唔暂存(2026-09-14 call-c76832ac:「一加一等于几？」
+                        # 连问两轮被静音;标记词报号碎片唔会出现,见 _wa_questionish)。
+                        and not _wa_questionish(_merged)
                         and (
                             (_wa_numberish(_merged) and 0 < _n < _WA_ACCUM_MIN_DIGITS)
                             or (_n == 0 and _WA_ANNOUNCE_HEAD_RE.search(user_text.strip()))
@@ -2407,6 +2633,19 @@ async def entrypoint(ctx):
                         _wa_accum["text"] = _merged
                         _wa_accum["ts"] = time.monotonic()
                         _arm_wa_accum_flush()
+                        # C3a(2026-09-13,call-6f1c4ee3):报号碎片轮照落库——stash
+                        # 路径旧版整轮蒸发(turns 表空洞),客户报过什么必须永远在案;
+                        # flush 时合并轮另记 provider=wa-merged,分析侧可对账去重。
+                        try:
+                            _st_ms = int((time.monotonic() - _t0) * 1000)
+                            await cp.add_turn(
+                                call_id, "user", user_text, language=language_state.lang,
+                                line="a", speaker="customer", provider="wa-stash",
+                                template_step=(int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0,
+                                started_ms=_st_ms, ended_ms=_st_ms,
+                            )
+                        except Exception:  # noqa: BLE001 - 落库失败唔阻累积
+                            pass
                         print(
                             f"[whatsapp] accumulate chars={len(user_text)} total_digits={_n} (call {room_name})",
                             flush=True,
@@ -2503,6 +2742,20 @@ async def entrypoint(ctx):
                             _invalidate_stale_preemptive("客户明确拒绝 → 收尾")
                             _schedule_call_end()
                             print(f"[flow] refuse -> closing, end scheduled (call {room_name})", flush=True)
+                    elif verdict == FAREWELL:
+                        # C4 道别分流(2026-09-13,call-6f1c4ee3):「拜拜/再见」≠拒绝——
+                        # 谈成的通话因道别词被标 declined 是误伤。收线照走(closing 态
+                        # 注入收尾话术,LLM 自然道别),disposition 按业务结果记:
+                        # 已捕获号码=scheduled(办理中),否则 polite_close。
+                        if not flow_ctrl.closing:
+                            _disp = "scheduled" if _wa_captured["on"] else "polite_close"
+                            flow_ctrl.enter_closing()
+                            _invalidate_stale_preemptive("客户道别 → 收尾")
+                            _schedule_call_end(8.0, disposition=_disp)
+                            print(
+                                f"[flow] farewell -> closing, end scheduled disposition={_disp} (call {room_name})",
+                                flush=True,
+                            )
                     elif not flow_ctrl.done and not flow_ctrl.closing and not _say_pending_before:
                         _g2, _r2 = flow_ctrl.current_goal_ref()
                         # 規則級必定推進 override(開場步客已回應 / 核實步答到平台):
@@ -2520,12 +2773,14 @@ async def entrypoint(ctx):
                             # say_step 宽松语义只给通知型直念步(2026-09-12 call-8fa17d2b:
                             # 赔偿直念步也是 say=1,UNCLEAR 的语气点评「呃，自然多了」
                             # 借宽松语义假推进 step4→5);承诺型问句步(赔偿/办理)回落
-                            # CONFIRM 门槛,goal 含「通知」才算通知步。
+                            # CONFIRM 门槛,goal 含「通知」才算通知步。0913:EN goal 是
+                            # "Notice: ..." → 补英文判定,三语行为对齐。
                             say_step=(
                                 flow_ctrl.has_steps
                                 and 0 <= flow_ctrl.current < len(flow_ctrl.steps)
                                 and flow_ctrl.steps[flow_ctrl.current].say
-                                and "通知" in (flow_ctrl.steps[flow_ctrl.current].goal or "")
+                                and ("通知" in (flow_ctrl.steps[flow_ctrl.current].goal or "")
+                                     or "notice" in (flow_ctrl.steps[flow_ctrl.current].goal or "").lower())
                             ),
                         )
                         if _auto:
@@ -2599,6 +2854,7 @@ async def entrypoint(ctx):
                 _say_now = flow_ctrl.pending_say_text()
             except Exception:  # noqa: BLE001 - 无话术/异常退 LLM
                 _say_now = ""
+            _say_now = _say_step_cap(_say_now)
             if _say_now:
                 flow_ctrl.note_step_said()
                 try:
@@ -2609,12 +2865,9 @@ async def entrypoint(ctx):
                     await session.interrupt()
                 except Exception:  # noqa: BLE001
                     pass
-                try:
-                    chat_ctx = getattr(self, "chat_ctx", None)
-                    if chat_ctx is not None and new_message is not None:
-                        chat_ctx.items.append(new_message)
-                except Exception:  # noqa: BLE001
-                    pass
+                # C5:官方姿势补 user 轮(旧 chat_ctx.items.append 打只读上下文
+                # 恒 RuntimeError,9/12 单日 189 次 ERROR 且从未生效)。
+                await self._try_append_user_message(new_message)
                 context_state.set_last_reply(_say_now)
                 _turn_origin["gen"] = "script"
                 _turn_origin["provider"] = "flow-say"
@@ -2694,12 +2947,8 @@ async def entrypoint(ctx):
                             except Exception:  # noqa: BLE001
                                 pass
                             # ② 手动补 user 轮(paused 分支同款):否则记忆/落库收不到这句
-                            try:
-                                chat_ctx = getattr(self, "chat_ctx", None)
-                                if chat_ctx is not None and new_message is not None:
-                                    chat_ctx.items.append(new_message)
-                            except Exception:  # noqa: BLE001
-                                pass
+                            # C5:官方姿势(旧 chat_ctx.items.append 打只读上下文恒失败)。
+                            await self._try_append_user_message(new_message)
                             # ③ 回声守卫预锚(正常要 playout 完才自动置,快路要立即生效)
                             context_state.set_last_reply(_qa_answer)
                             # ④ 落库 user 轮(paused 分支同款手动补轮,item_added
@@ -2728,18 +2977,35 @@ async def entrypoint(ctx):
                             raise StopResponse()
                         print(f"QA_FASTPATH hit=0 reason=no_audio entry={_qa_entry.get('id')}", flush=True)
                         _qa_bump("no_audio")
+            # (旧 paused 分支已前移为 hook 顶部的 C1 暂停冻结——落库 gen=paused+
+            # 三路推进全冻结;此处保留防御性兜底,正常流到不到。)
             if self.paused:
-                chat_ctx = getattr(self, "chat_ctx", None)
-                if chat_ctx is not None and new_message is not None:
-                    try:
-                        chat_ctx.items.append(new_message)
-                    except Exception:  # pragma: no cover - 历史保留失败不致命
-                        pass
                 raise StopResponse()
             # 走到这=本轮走 LLM 正常回复路径(话术直念/暂停/跳过都已在前面拦截)
             # → 起垫话定时器:回复首音频 ~700ms 未到才播,快轮零打扰(closing/WA
             # 步由开火前 guards 复核兜住)。
             _filler.arm()
+
+        async def _try_append_user_message(self, new_message) -> bool:
+            """C5(2026-09-13):官方姿势把 user 轮补进会话历史。
+
+            旧三处 chat_ctx.items.append 全打在 _ReadOnlyChatContext 上(livekit
+            1.8 Agent.chat_ctx 只读视图)——RuntimeError 被 except-pass 吞,9/12
+            单日 189 次 ERROR、「手动补 user 轮」从未生效(say-step/QA 快路的
+            用户话进唔到后续 LLM 上下文)。官方解=错误信息原文:.copy() 后改,
+            再 await agent.update_chat_ctx()。copy() 保留 items 原对象,KV 前缀
+            字节不变。失败打点返回 False(补轮是尽力而为,唔阻主路径)。
+            """
+            try:
+                if new_message is None:
+                    return False
+                ctx = self.chat_ctx.copy()
+                ctx.items.append(new_message)
+                await self.update_chat_ctx(ctx)
+                return True
+            except Exception as exc:  # noqa: BLE001
+                print(f"[agent] append_user_message failed: {exc!r} (call {room_name})", flush=True)
+                return False
 
         async def on_user_turn_exceeded(self, ev):
             if self.paused:
@@ -2772,6 +3038,16 @@ async def entrypoint(ctx):
                         session.interrupt(force=True)
                     except Exception:  # pragma: no cover - 无正在播放内容时中断抛错
                         pass
+                    # C1 暂停黑洞(2026-09-13,call-15a2f586):暂停进入=26s 纯静默,
+                    # 客户不知道发生了什么。脚本直念一句可听交代(_say_script 缓存线,
+                    # 零 TTFT);人工接管(escalated)时也适用——人接手前的一句过渡。
+                    # BOK_PAUSE_ACK=0 关。
+                    if os.environ.get("BOK_PAUSE_ACK", "1") == "1" and not closed.is_set():
+                        # 2026-09-13 实机 A/B 实证:session.say() 版 ack 令 turn_detection=stt
+                        # 轮提交链在 paused 期间停摆(ack-on 三轮暂停期零 ASR/零轮;ack-off
+                        # 对照组 gen=paused 轮正常落库)——改走 out-of-band 音轨(垫话同
+                        # 通道,零 speech 队列交互;cache miss 异步补物化,下通起有声)。
+                        _filler.play_offband(_pause_ack_line(language_state.lang))
                 elif not paused and agent.paused:
                     agent.paused = False
                     print(f"[agent] supervisor resumed agent ({room_name})", flush=True)
@@ -2971,6 +3247,12 @@ def run_agent() -> None:
     import sys
 
     from livekit.agents import WorkerOptions, cli
+
+    # C6-2 端口单例守卫(2026-09-13):重复 spawn 撞 8081 时良性退出 0(旧版
+    # Errno 48 崩溃+假故障噪音);BOK_WORKER_PORT_GUARD=0 关。
+    from .worker_guard import worker_port_singleton_guard
+
+    worker_port_singleton_guard(8081, "agent")
 
     # 抢跑失效诊断探针（BOK_PREEMPTIVE_DEBUG=1）：须在 worker 起跑前包好框架
     # 比较函数，否则首通 session 已绑旧引用。

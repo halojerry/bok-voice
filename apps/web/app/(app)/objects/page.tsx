@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { api } from "@/lib/api";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
@@ -297,6 +298,13 @@ export default function ObjectsPage() {
                       )}
                     </div>
                     <div className="flex shrink-0 gap-2">
+                      <Link
+                        href={`/calls/new?object=${encodeURIComponent(String(r.id))}`}
+                        className="btn-ghost text-xs text-accent"
+                        title="用该对象发起一通新通话（工作台预选）"
+                      >
+                        发起新通话
+                      </Link>
                       <button className="btn-ghost text-xs" onClick={() => edit(r as unknown as ObjectRow)}>编辑</button>
                       <button className="btn-ghost text-xs text-red-300" onClick={() => remove(id)}>删除</button>
                     </div>

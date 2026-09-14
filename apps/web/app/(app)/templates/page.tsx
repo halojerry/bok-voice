@@ -96,19 +96,19 @@ const STEPS_EXAMPLES: Record<string, FlowStep[]> = {
   cantonese: [
     { goal: "确认包裹是不是{姓名}本人的", ref: "你好，请问係咪{姓名}？我哋係{物流公司}，有个包裹单号尾号{快递尾号}运输途中唔见咗，想同你核对下。\n如果客户唔记得 → 提佢下单时填嘅地址/电话帮佢回忆" },
     { goal: "说明一赔二方案,稳住客户", ref: "係我哋责任,我哋有买运费保险,会以一赔二赔俾你,唔使自己蚀钱。\n如果客户问点解要赔 → 讲係运输途中遗失,顺丰全责\n如果客户担心唔到账 → 讲赔付会直接落微信零钱/钱包\n如果客户话要重新买 → 讲可以用赔付抵扣,唔使自己再贴钱" },
-    { goal: "引导客户加微信线上专员办理", ref: "理赔係通过微信消费者保护线上专员办理,我发微信号俾你,你加咗之后按佢步骤操作就得。\n如果客户话唔方便加微信 → 问佢方便嘅时间/方式,约好再跟进" },
+    { goal: "向客户索取微信号,微信专员加客户办理", ref: "理赔係通过微信消费者保护线上专员办理,麻烦你将你嘅微信号报俾我,微信专员会加你,按佢步骤操作办理就得。\n如果客户话唔方便/而家冇空 → 问佢几时方便或者用咩方式,约好再跟进" },
     { goal: "收尾确认,礼貌结束", ref: "好,唔该晒你今日嘅时间。我哋会跟进,有咩问题随时搵我。祝你一切顺利,拜拜!" },
   ],
   zh: [
     { goal: "确认包裹是不是{姓名}本人的", ref: "您好，请问是{姓名}吗？我们是{物流公司}，有个包裹单号尾号{快递尾号}运输途中丢失了，想跟您核对一下。\n如果客户不记得 → 提他下单时填的地址/电话帮他回忆" },
     { goal: "说明一赔二方案,稳住客户", ref: "这是我们的责任，我们有购买运费保险，会以一赔二赔付给您，不用自己贴钱。\n如果客户问为什么赔 → 说明是运输途中遗失，我方全责\n如果客户担心不到账 → 说明赔付会直接到微信零钱/钱包\n如果客户说要重新买 → 说明可以用赔付抵扣，不用自己再贴钱" },
-    { goal: "引导客户加微信线上专员办理", ref: "理赔是通过微信消费者保护线上专员办理，我把微信号发给您，您添加后按步骤操作就行。\n如果客户说不方便加微信 → 问他方便的时间/方式，约好再跟进" },
+    { goal: "向客户索取微信号，微信专员加客户办理", ref: "理赔是通过微信消费者保护线上专员办理，麻烦您把您的微信号报给我，微信专员会加您，按步骤操作办理就行。\n如果客户说不方便/现在没空 → 问他什么时候方便或用什么方式，约好再跟进" },
     { goal: "收尾确认,礼貌结束", ref: "好的，感谢您今天的时间。我们会跟进，有问题随时找我。祝您一切顺利，再见！" },
   ],
   en: [
     { goal: "Confirm the parcel belongs to {name}", ref: "Hello, is this {name}? We're {courier}. A parcel (tracking ending {tracking_tail}) was lost in transit and I'd like to verify with you." },
     { goal: "Explain 1-for-2 compensation and reassure", ref: "It's our responsibility. We have shipping insurance, so we'll compensate 2x. You won't lose money.\nIf they ask why → it was lost in transit, we take full responsibility\nIf they worry about payment → it goes straight to their WeChat wallet" },
-    { goal: "Guide them to add the WeChat specialist", ref: "The claim is handled by our WeChat consumer-protection specialist. I'll send the ID — add it and follow the steps." },
+    { goal: "Ask for their WeChat ID; specialist will add them", ref: "The claim is handled by our WeChat consumer-protection specialist. Could you give me your WeChat ID? The specialist will add you and walk you through the steps.\nIf they're busy right now → ask when or how works best and arrange a follow-up." },
     { goal: "Confirm and close politely", ref: "Thank you for your time. We'll follow up — reach out anytime. Goodbye!" },
   ],
 };

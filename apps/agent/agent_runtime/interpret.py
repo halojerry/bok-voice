@@ -459,6 +459,10 @@ def run_interpreter() -> None:
     # 与 A 线 main(8081)并存须分端口:三 worker 同抢默认 8081,后绑者 Errno 48
     # 即崩(A 线输掉竞态时每通通话 "Agent did not join the room")。
     ports = {"fwd": 8082, "rev": 8083}
+    # C6-2 端口单例守卫(2026-09-13):重复 spawn 良性退出(治 Errno 48 崩溃)。
+    from .worker_guard import worker_port_singleton_guard
+
+    worker_port_singleton_guard(ports[direction], f"interp-{direction}")
     cli.run_app(
         WorkerOptions(entrypoint_fnc=entrypoint, agent_name=f"bok-interp-{direction}", port=ports[direction])
     )
