@@ -324,14 +324,15 @@ def _migrate_knowledge_content_hash(engine: Engine) -> None:
             conn.execute(
                 text("ALTER TABLE knowledge_chunks ADD COLUMN content_hash VARCHAR(64) DEFAULT ''")
             )
-        rows = conn.execute(select(KnowledgeChunk.id, KnowledgeChunk.text)).all()
+        rows = conn.execute(
+            select(KnowledgeChunk.id, KnowledgeChunk.text).where(
+                (KnowledgeChunk.content_hash == "") | (KnowledgeChunk.content_hash.is_(None))
+            )
+        ).all()
         for cid, txt in rows:
             digest = hashlib.sha256((txt or "").encode("utf-8")).hexdigest()[:32]
             conn.execute(
-                text(
-                    "UPDATE knowledge_chunks SET content_hash=:h "
-                    "WHERE id=:id AND (content_hash IS NULL OR content_hash='')"
-                ),
+                text("UPDATE knowledge_chunks SET content_hash=:h WHERE id=:id"),
                 {"h": digest, "id": cid},
             )
 
