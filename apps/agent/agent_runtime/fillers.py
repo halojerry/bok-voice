@@ -623,7 +623,9 @@ class FillerDirector:
         if not candidates and preferred is not pool:
             candidates = [e for e in (zero or pool) if e["file"] not in recent]
         if not candidates:
-            candidates = list(pool)
+            # 全池都在窗内(极端小池,如零动作池 2 条连抽第 3 次):至少避开
+            # 刚播的那一条——「同垫话连续两轮最刺耳」是硬底线,池=1 才允许。
+            candidates = [e for e in pool if e["file"] not in set(self._recent[-1:])] or list(pool)
         entry = random.choice(candidates)
         self._recent.append(entry["file"])
         return entry

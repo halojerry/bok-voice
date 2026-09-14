@@ -340,17 +340,19 @@ def test_tiny_pool_allows_repeat_without_error(tmp_path):
     _run(_case())
 
 
-def test_real_manifest_cantonese_default_no_three_peat():
-    """真 manifest 回归:cantonese `default` 类只有 1 条(call-c76832ac 现场),
-    连抽 3 次不得同句连播——分类去重必须吃真资产数据。"""
+def test_real_manifest_cantonese_default_no_adjacent_repeat():
+    """真 manifest 回归(call-c76832ac 三连播 + call-eabb80f0 归位后池变薄):
+    连续抽取相邻两条不得同句——零动作池只有 2 条时第 3 抽会落整池兜底,
+    兜底也必须避开刚播的那一条(硬底线:连续两轮同句最刺耳)。"""
     d = FillerDirector(
         _FakeSession(),
         lang_resolver=lambda: "cantonese",
         player=_FakePlayer(),
         guards=lambda: False,
     )
-    lines = [d._pick("cantonese", "default")["text"] for _ in range(3)]
-    assert len(set(lines)) == 3, f"同句连播回归: {lines}"
+    lines = [d._pick("cantonese", "default")["text"] for _ in range(8)]
+    for a, b in zip(lines, lines[1:]):
+        assert a != b, f"相邻同句: {lines}"
 
 
 def test_zero_action_categories_never_pick_check_lines(tmp_path):
@@ -403,8 +405,10 @@ def test_zero_action_scope_applies_when_category_pool_empty(tmp_path):
     (2026-09-14 call-eabb80f0:manifest 归位后 default 类为空,约束不能漏)。"""
 
     async def _case():
-        pools = {"cantonese": ["应承一。", "应承二。", "忙紧查。"]}  # 无 default 类
-        cats = {"cantonese": ["ack", "ack", "check"]}
+        # 零动作池 3 条 > 去重窗(2),3 次抽取不会抽空→不触发整池兜底;
+        # 池里刻意没有 default 类(请求类缺失的分支覆盖)
+        pools = {"cantonese": ["应承一。", "应承二。", "应承三。", "忙紧查。"]}
+        cats = {"cantonese": ["ack", "ack", "ack", "check"]}
         d, _ = _director(tmp_path, pools=pools, cats=cats)
         for _ in range(3):
             e = d._pick("cantonese", "default")
