@@ -223,6 +223,10 @@ class SqlAlchemyBusinessRepository:
             stmt = stmt.filter_by(enabled=enabled)
         return [self._qa_to_dict(r) for r in self.session.scalars(stmt)]
 
+    def get_qa_entry(self, entry_id: str) -> dict | None:
+        row = self.session.get(models.QaEntry, entry_id)
+        return self._qa_to_dict(row) if row else None
+
     def create_qa_entry(self, data: dict) -> dict:
         row = models.QaEntry(
             id=data.get("id") or f"qa:{uuid.uuid4().hex[:12]}",
@@ -1142,6 +1146,10 @@ class InMemoryBusinessRepository:
             and (enabled is None or bool(v.get("enabled")) == enabled)
         ]
         return sorted(rows, key=lambda v: v.get("created_at") or "")
+
+    def get_qa_entry(self, entry_id: str) -> dict | None:
+        row = getattr(self, "qa_entries", {}).get(entry_id)
+        return dict(row) if row else None
 
     # ---- 垫话罐头库(2026-09-13 乙节,镜像 qa_entries 姿势) ----
 
