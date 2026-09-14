@@ -89,6 +89,12 @@ def build_engine() -> Engine | None:
                 )
                 _ensure_column(
                     conn,
+                    "accounts",
+                    "org_id",
+                    "org_id VARCHAR(64) DEFAULT ''",
+                )
+                _ensure_column(
+                    conn,
                     "call_sessions",
                     "template_id",
                     "template_id VARCHAR(64) DEFAULT ''",

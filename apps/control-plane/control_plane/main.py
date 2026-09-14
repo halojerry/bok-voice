@@ -38,12 +38,27 @@ from .deps import build_engine, build_repository, build_session_factory
 from .dispatch_utils import cleanup_dispatch, has_active_dispatch
 from .nodes_store import HEARTBEAT_INTERVAL_S, NodeStore
 from .pregen import persona_pregen_status
+from .auth import (
+    Identity,
+    JWT_TTL_S,
+    auth_required,
+    create_token,
+    hash_password,
+    identity_from_request,
+    identity_gate,
+    jwt_secret,
+    verify_password,
+)
 from .schemas import (
     CreateCallRequest,
     CreateObjectRequest,
     ImportRequest,
     DialResultRequest,
     ListenStopRequest,
+    LoginRequest,
+    ChangePasswordRequest,
+    CreateUserRequest,
+    UpdateUserRequest,
     PersonaRequest,
     QaEntryCreate,
     QaEntryPatch,
@@ -66,6 +81,10 @@ _TERMINAL_CALL_STATUSES = (CallStatus.ENDED.value, CallStatus.FAILED.value)
 
 
 app = FastAPI(title="Bok Voice Control Plane", version="0.1.0")
+# 注册顺序=洋葱层次（后注册者在最外层）。identity_gate 必须**第一个**注册（最内层）：
+# 它要在 CorrelationMiddleware 内层运行——读取其 correlation 并覆写 user_id=已验证
+# 身份，审计 actor 由此自动落账（见 auth.py 模块注释）。
+app.middleware("http")(identity_gate)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -85,6 +104,10 @@ async def optional_bearer_auth(request: Request, call_next):
     node_token 自鉴权（sha256 比对，与 CP token 不同源），CP 门禁会把它拦死
     令节点注册表失联；register/list 属管理操作，仍在门禁内。
     """
+    if auth_required():
+        # BOK_AUTH_REQUIRED=1 时门禁统一由 identity_gate 承担（用户 JWT 或机器
+        # token 二选一）；本中间件若照旧比对 CP token 会把用户 JWT 误杀在门外。
+        return await call_next(request)
     expected = os.environ.get("BOK_CP_TOKEN", "").strip()
     if expected and request.url.path not in ("/health", "/api/nodes/heartbeat"):
         if request.headers.get("authorization", "") != f"Bearer {expected}":
@@ -126,6 +149,28 @@ def _qwen3_asr_url() -> str:
     return _sidecar_url("QWEN3_ASR_BASE_URL", "http://127.0.0.1:8787")
 
 
+def _seed_root_user() -> None:
+    """BOK_ROOT_USERNAME/BOK_ROOT_PASSWORD 置定时幂等种 root 账号（云端部署入口）。
+
+    环境变量未置=不种子（单机/开发形态无用户体系，行为零变化）；同名用户已存在
+    =跳过（幂等，重启不重置密码）。
+    """
+    username = os.environ.get("BOK_ROOT_USERNAME", "").strip()
+    password = os.environ.get("BOK_ROOT_PASSWORD", "")
+    if not username or not password:
+        return
+    if _repo().get_user_by_username(username):
+        return
+    _repo().create_user(
+        username=username, password_hash=hash_password(password), role="root",
+        display_name="Platform Root",
+    )
+    control_log.warning(
+        "root_user_seeded",
+        extra={"event": "auth.root.seeded", "data": {"username": username}},
+    )
+
+
 @app.on_event("startup")
 def _startup() -> None:
     configure_logging(level=os.environ.get("BOK_LOG_LEVEL", "INFO"))
@@ -136,6 +181,12 @@ def _startup() -> None:
     app.state.lk_key = os.environ.get("LIVEKIT_API_KEY", "")
     app.state.lk_secret = os.environ.get("LIVEKIT_API_SECRET", "")
     app.state.lk_url = os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880")
+    if auth_required() and not jwt_secret():
+        # fail-closed：拒绝用可伪造密钥开启认证（宁愿起不来也不裸奔）。
+        raise RuntimeError(
+            "BOK_AUTH_REQUIRED=1 但未配置 BOK_JWT_SECRET（或 BOK_CP_TOKEN）——拒绝开启认证"
+        )
+    _seed_root_user()
     vault = os.environ.get("VAULT_ROOT", "./data/vault")
     embedder = CharHashEmbedding(384)
     if engine is not None and getattr(engine.dialect, "name", "") != "sqlite":
@@ -547,6 +598,153 @@ async def tts_preview(payload: dict) -> Response:
         raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+# ---- 三层 RBAC 认证（路线 B1）：登录 / 身份 / 改密 / 账号管理 ----
+# 门禁开关 BOK_AUTH_REQUIRED（见 auth.py）：未设=开放（单机形态零变化）。
+# 账号管理端点带 Authorization 头时按身份收紧（root 全域 / admin 仅本账号 user /
+# user 无权）；无头（auth-off 开发形态）放行，与该形态其余端点同信任级。
+
+
+def _user_public(user: dict) -> dict:
+    """users dict 出仓前剥 password_hash——凭据材料任何情况下不出仓。"""
+    return {k: v for k, v in user.items() if k != "password_hash"}
+
+
+def _require_user_admin(identity: Identity | None, target_role: str, target_account: str) -> None:
+    if identity is None:
+        return
+    if identity.role == "root":
+        return
+    if identity.role == "admin":
+        if target_role != "user":
+            raise HTTPException(403, "admin 只能创建/管理 user 角色")
+        if target_account and target_account != identity.account_id:
+            raise HTTPException(403, "admin 只能管理本账号成员")
+        return
+    raise HTTPException(403, "无账号管理权限")
+
+
+@app.post("/api/auth/login")
+def auth_login(req: LoginRequest) -> dict:
+    user = _repo().get_user_by_username(req.username.strip())
+    if (
+        not user
+        or user.get("status") != "active"
+        or not verify_password(req.password, str(user.get("password_hash") or ""))
+    ):
+        _audit("auth.login_failed", subject_type="user", subject_id=req.username[:64], outcome="denied")
+        raise HTTPException(401, "用户名或密码不正确")
+    identity = Identity(
+        user_id=str(user["id"]),
+        username=str(user["username"]),
+        role=str(user["role"]),
+        org_id=str(user.get("org_id") or ""),
+        account_id=str(user.get("account_id") or ""),
+    )
+    token = create_token(identity)
+    _audit("auth.login", subject_type="user", subject_id=str(user["id"]))
+    return {"token": token, "token_type": "bearer", "expires_in": JWT_TTL_S, "user": _user_public(user)}
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request) -> dict:
+    identity = identity_from_request(request)
+    if identity is None:
+        raise HTTPException(401, "missing or invalid token")
+    return {
+        "user_id": identity.user_id,
+        "username": identity.username,
+        "role": identity.role,
+        "org_id": identity.org_id,
+        "account_id": identity.account_id,
+    }
+
+
+@app.post("/api/auth/change-password")
+def auth_change_password(req: ChangePasswordRequest, request: Request) -> dict:
+    identity = identity_from_request(request)
+    if identity is None:
+        raise HTTPException(401, "missing or invalid token")
+    if len(req.new_password) < 8:
+        raise HTTPException(400, "新密码至少 8 位")
+    user = _repo().get_user(identity.user_id)
+    if not user or not verify_password(req.old_password, str(user.get("password_hash") or "")):
+        raise HTTPException(401, "原密码不正确")
+    _repo().update_user(user["id"], password_hash=hash_password(req.new_password))
+    _audit("auth.password_changed", subject_type="user", subject_id=str(user["id"]))
+    return {"changed": True}
+
+
+@app.post("/api/users")
+def create_user(req: CreateUserRequest, request: Request) -> dict:
+    identity = identity_from_request(request)
+    if req.role not in ("root", "admin", "user"):
+        raise HTTPException(400, "role 必须是 root/admin/user")
+    if len(req.password) < 8:
+        raise HTTPException(400, "密码至少 8 位")
+    _require_user_admin(identity, req.role, req.account_id)
+    if _repo().get_user_by_username(req.username.strip()):
+        raise HTTPException(409, "用户名已存在")
+    user = _repo().create_user(
+        username=req.username.strip(),
+        password_hash=hash_password(req.password),
+        role=req.role,
+        org_id=req.org_id or (identity.org_id if identity else ""),
+        # admin 建话务员：不传 account 时默认落 admin 本账号。
+        account_id=req.account_id or (identity.account_id if identity and identity.role == "admin" else ""),
+        display_name=req.display_name,
+    )
+    _audit("user.create", subject_type="user", subject_id=str(user["id"]),
+           account_id=str(user.get("account_id") or ""))
+    return _user_public(user)
+
+
+@app.get("/api/users")
+def list_users(request: Request, account_id: str = "") -> dict:
+    identity = identity_from_request(request)
+    if identity and identity.role == "user":
+        raise HTTPException(403, "无账号管理权限")
+    # admin 强制本账号视角；root/auth-off 按参过滤（空=全部）。
+    acct = identity.account_id if (identity and identity.role == "admin") else account_id
+    return {"users": [_user_public(u) for u in _repo().list_users(acct)]}
+
+
+@app.patch("/api/users/{user_id}")
+def update_user(user_id: str, req: UpdateUserRequest, request: Request) -> dict:
+    identity = identity_from_request(request)
+    target = _repo().get_user(user_id)
+    if not target:
+        raise HTTPException(404, "user not found")
+    if identity:
+        if identity.role == "admin":
+            if target.get("account_id") != identity.account_id or target.get("role") == "root":
+                raise HTTPException(403, "admin 只能管理本账号的非 root 成员")
+        elif identity.role != "root":
+            raise HTTPException(403, "无账号管理权限")
+    if req.role:
+        if not identity or identity.role != "root":
+            raise HTTPException(403, "仅 root 可改角色")
+        if req.role not in ("root", "admin", "user"):
+            raise HTTPException(400, "role 必须是 root/admin/user")
+    if req.password and len(req.password) < 8:
+        raise HTTPException(400, "密码至少 8 位")
+    if req.status and req.status not in ("active", "disabled"):
+        raise HTTPException(400, "status 必须是 active/disabled")
+    fields: dict = {}
+    if req.password:
+        fields["password_hash"] = hash_password(req.password)
+    if req.status:
+        fields["status"] = req.status
+    if req.display_name:
+        fields["display_name"] = req.display_name
+    if req.role:
+        fields["role"] = req.role
+    updated = _repo().update_user(user_id, **fields)
+    _audit("user.update", subject_type="user", subject_id=user_id,
+           account_id=str(target.get("account_id") or ""),
+           detail={"fields": sorted(fields.keys()), "status": req.status})
+    return _user_public(updated or target)
 
 
 @app.post("/api/token", response_model=TokenResponse, status_code=201)
