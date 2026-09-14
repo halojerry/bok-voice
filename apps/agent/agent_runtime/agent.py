@@ -1372,7 +1372,12 @@ async def entrypoint(ctx):
             return
         # mock 档时长保险丝:mock 客户无通信运营商侧挂断,靠本地计时器兜底收线
         # (real 档由 CreateSIPParticipant 的 API 参数承担,不重复挂)。
-        _fuse_s = float(_dial.get("max_call_duration_s") or 0)
+        # dial 块来自 metadata(客户端可控),坏值须兜 0 不炸 job——dial_outbound
+        # 入参有同款防御 try,此解析点在 try 之外须自带。
+        try:
+            _fuse_s = float(_dial.get("max_call_duration_s") or 0)
+        except (TypeError, ValueError):
+            _fuse_s = 0.0
         if _dial_mode == "mock" and _fuse_s > 0:
 
             async def _duration_fuse() -> None:
@@ -3266,7 +3271,29 @@ async def entrypoint(ctx):
     watch_task = asyncio.create_task(_supervisor_watch())
     # AgentSession 内部已注册 job shutdown callback（自动 aclose），
     # 这里不能提前 close，否则会话在接通后立刻被销毁。
-    await session.start(agent=agent, room=ctx.room)
+    try:
+        await session.start(agent=agent, room=ctx.room)
+    except Exception:
+        # 外呼已拨通（ANSWERED）才到这一步；start 失败（连房/注册异常）时入线
+        # 通话仍保持 in_progress 且房间开着——与 !ANSWERED 路径同款收线三连，
+        # 否则 dial 四态契约在此逸出。入线通话（无 dial 块）保持原行为向上抛。
+        if _dial:
+            try:
+                await cp.end_call(call_id, disposition="failed")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[dial] start-fail end_call failed: {exc!r} (call {room_name})",
+                      flush=True)
+            try:
+                from livekit.api import DeleteRoomRequest
+
+                await ctx.api.room.delete_room(DeleteRoomRequest(room=ctx.room.name))
+            except Exception as exc:  # noqa: BLE001
+                print(f"[dial] start-fail delete_room failed: {exc!r} (call {room_name})",
+                      flush=True)
+            watch_task.cancel()
+            ctx.shutdown()
+            return
+        raise
     # 垫话 out-of-band 音轨(官方 BackgroundAudioPlayer):独立 track 发布,web 端
     # RoomAudioRenderer 渲染所有远端音轨故免改前端;失败仅垫话失效,唔阻通话。
     if _bg_audio is not None:

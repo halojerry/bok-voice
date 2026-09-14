@@ -1415,6 +1415,15 @@ class InMemoryBusinessRepository:
 
     # ---- campaigns（外呼战役:串行逐个拨）----
 
+    @staticmethod
+    def _campaign_public(row: dict) -> dict:
+        # 与 SQL 侧同出口：scripts 只经 get_campaign_scripts 读，不进 campaign
+        # dict 响应（SQL 侧存 scripts_json 从不外泄）——两后端 API 形状对齐，
+        # 防「内存仓响应多带 scripts 键」的隐性分叉。
+        out = dict(row)
+        out.pop("scripts", None)
+        return out
+
     def create_campaign(self, account_id: str, *, name: str, template_id: str,
                         persona_id: str, language: str, gap_seconds: int,
                         object_ids: list[str],
@@ -1446,11 +1455,11 @@ class InMemoryBusinessRepository:
                 "updated_at": now,
             }
             self.campaign_items[item["id"]] = item
-        return dict(campaign)
+        return self._campaign_public(campaign)
 
     def get_campaign(self, campaign_id: str) -> dict | None:
         row = self.campaigns.get(campaign_id)
-        return dict(row) if row else None
+        return self._campaign_public(row) if row else None
 
     def get_campaign_scripts(self, campaign_id: str) -> dict[str, Any]:
         """战役 mock 台词（object_id → 句子数组）+ campaign 级 mock 参数（`__` 键）。
@@ -1477,10 +1486,10 @@ class InMemoryBusinessRepository:
                     "gap_seconds", "finished_at"):
             if key in fields and fields[key] is not None:
                 row[key] = fields[key]
-        return dict(row)
+        return self._campaign_public(row)
 
     def list_campaigns(self, account_id: str = "acc-001", status: str = "") -> list[dict]:
-        rows = [dict(r) for r in self.campaigns.values()
+        rows = [self._campaign_public(r) for r in self.campaigns.values()
                 if r["account_id"] == account_id
                 and (not status or r["status"] == status)]
         return sorted(rows, key=lambda r: r["created_at"], reverse=True)
