@@ -836,6 +836,153 @@ def _repo_web_modules() -> Path:
     return ROOT / "apps" / "web" / "node_modules"
 
 
+def _agent_worker_env(py) -> dict[str, str]:
+    """A 线 main worker 的 env(serve 与 monitor 同源单点)。"""
+    _cur = MODELS["mac"] if is_mac() else MODELS["windows"]
+    env: dict[str, str] = {
+        "PYTHONPATH": _repo_pythonpath(),
+        "BOK_SERVICE": "agent",
+        "LIVEKIT_URL": os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880"),
+        "LIVEKIT_API_KEY": os.environ.get("LIVEKIT_API_KEY", "devkey"),
+        "LIVEKIT_API_SECRET": os.environ.get("LIVEKIT_API_SECRET", "devsecret"),
+        "CONTROL_PLANE_URL": os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000"),
+        "MLX_LLM_BASE_URL": os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
+        "MLX_LLM_MODEL": model_path({**_cur, "llm": resolve_llm_repo(_cur)}, "llm"),
+    }
+    # .venv312 OpenSSL 无默认 CA 束 → MiniMax WSS 必炸;固化 SSL_CERT_FILE。
+    _bake_ssl_cert_file(env, py)
+    return env
+
+
+def _worker_specs(py) -> list[dict]:
+    """三个 agent worker(A 线 main + B 线 fwd/rev)的 spawn 描述(serve/monitor 同源)。"""
+    agent_env = _agent_worker_env(py)
+    run_dir = app_data_dir() / "run"
+    log_dir = app_data_dir() / "logs"
+    specs = [
+        {
+            "name": "agent",
+            "port": 8081,
+            "pidfile": run_dir / "agent.pid",
+            "logfile": log_dir / "agent.log",
+            "argv": [str(py), "-m", "agent_runtime.main"],
+            "env": agent_env,
+        }
+    ]
+    for _dir, _port in (("fwd", 8082), ("rev", 8083)):
+        interp_env = _interp_env(agent_env)
+        interp_env["BOK_SERVICE"] = f"interp-{_dir}"
+        interp_env["INTERP_DIRECTION"] = _dir
+        specs.append(
+            {
+                "name": f"interp-{_dir}",
+                "port": _port,
+                "pidfile": run_dir / f"interp-{_dir}.pid",
+                "logfile": log_dir / f"interp-{_dir}.log",
+                "argv": [str(py), "-m", "agent_runtime.interpret"],
+                "env": interp_env,
+            }
+        )
+    return specs
+
+
+def _pid_alive(pidfile: Path) -> bool:
+    try:
+        pid = int(pidfile.read_text().strip())
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _kill_pidfile(pidfile: Path) -> None:
+    """按 pidfile 杀进程组(_start_proc 是会话组长,子进程一并清)。"""
+    try:
+        pid = int(pidfile.read_text().strip())
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _ensure_monitor(py) -> None:
+    """C6-1:常驻 worker monitor 单例拉起(pidfile 存活即跳过)。"""
+    run_dir = app_data_dir() / "run"
+    log_dir = app_data_dir() / "logs"
+    pidfile = run_dir / "monitor.pid"
+    if _pid_alive(pidfile):
+        return
+    _start_proc(
+        [str(py), str(Path(__file__).resolve()), "monitor"],
+        pidfile,
+        log_dir / "monitor.log",
+        env={"BOK_MONITOR": "1"},
+    )
+    print("[bok] worker monitor started (livekit restart → respawn all workers)")
+
+
+def cmd_monitor() -> int:
+    """C6-1 常驻监控环:LiveKit 重启→A+B 全 worker respawn(重注册);单 worker
+    掉线→补拉。9/12 11:52-12:05 实证:livekit 重启后 worker 注册全丢,
+    「no worker is available」连 4 通 0 轮、无人补拉;serve 一次性返回管唔到。
+    """
+    py = repo_python()
+    run_dir = app_data_dir() / "run"
+    log_dir = app_data_dir() / "logs"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    print("[monitor] started — watching :7880 + workers 8081/8082/8083")
+    lk_up = healthy(7880)
+    last_action = 0.0
+
+    def _respawn(specs: list[dict], why: str) -> None:
+        nonlocal last_action
+        # 限频:转换风暴(重启抖动)下 30s 内只动作一次。
+        if time.monotonic() - last_action < 30.0:
+            return
+        last_action = time.monotonic()
+        print(f"[monitor] {why} — respawning workers")
+        for spec in specs:
+            _kill_pidfile(spec["pidfile"])
+        # 等端口释放(优雅关停最长 ~10s;拿不到就交给端口单例守卫兜底)。
+        _deadline = time.monotonic() + 10.0
+        while time.monotonic() < _deadline:
+            if not any(healthy(s["port"]) for s in specs):
+                break
+            time.sleep(0.5)
+        for spec in specs:
+            _start_proc(spec["argv"], spec["pidfile"], spec["logfile"], env=spec["env"])
+            print(f"[monitor] respawned {spec['name']} :{spec['port']}")
+
+    while True:
+        try:
+            specs = _worker_specs(py)
+            now_up = healthy(7880)
+            if not lk_up and now_up:
+                # LiveKit 回来了(重启)——注册在新进程,worker 必须重注册。
+                _respawn(specs, "livekit back up (restart detected)")
+            elif now_up:
+                down = [s for s in specs if not healthy(s["port"])]
+                if len(down) == len(specs):
+                    _respawn(specs, "all workers down")
+                elif down:
+                    # 单个掉线:补拉(同样吃 30s 限频,防崩溃循环)。
+                    if time.monotonic() - last_action >= 30.0:
+                        last_action = time.monotonic()
+                        for spec in down:
+                            _start_proc(spec["argv"], spec["pidfile"], spec["logfile"], env=spec["env"])
+                            print(f"[monitor] worker {spec['name']} down — respawned :{spec['port']}")
+            lk_up = now_up
+        except Exception as exc:  # noqa: BLE001 - 监控环任何异常都唔准退出
+            print(f"[monitor] loop error: {exc!r} — keep watching")
+        time.sleep(5.0)
+
+
 def cmd_serve() -> int:
     """Bring up the full no-Docker desktop stack and wait until ready.
 
@@ -913,47 +1060,17 @@ def cmd_serve() -> int:
             break
         time.sleep(0.5)
     if healthy(7880):
-        _cur = MODELS["mac"] if is_mac() else MODELS["windows"]
-        agent_env: dict[str, str] = {
-            "PYTHONPATH": _repo_pythonpath(),
-            "BOK_SERVICE": "agent",
-            "LIVEKIT_URL": os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880"),
-            "LIVEKIT_API_KEY": os.environ.get("LIVEKIT_API_KEY", "devkey"),
-            "LIVEKIT_API_SECRET": os.environ.get("LIVEKIT_API_SECRET", "devsecret"),
-            "CONTROL_PLANE_URL": os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000"),
-            "MLX_LLM_BASE_URL": os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
-            "MLX_LLM_MODEL": model_path({**_cur, "llm": resolve_llm_repo(_cur)}, "llm"),
-        }
-        # .venv312 OpenSSL 无默认 CA 束 → MiniMax WSS 必炸；固化 SSL_CERT_FILE
-        # （与 _agent_prod_env 同源；interp 经 _interp_env 拷贝继承）。
-        _bake_ssl_cert_file(agent_env, py)
-        # serve 幂等:worker 端口已被监听就跳过——重复 spawn 撞显式端口
-        # (8081/8082/8083,后绑者 Errno 48 即崩)。已在跑的可能是别的 worktree
-        # 起的旧代码,要换码重启先 bok.py down。
-        if not healthy(8081):
-            _start_proc([str(py), "-m", "agent_runtime.main"], run_dir / "agent.pid", log_dir / "agent.log", env=agent_env)
-        else:
-            print("[bok] agent worker already listening :8081 (run bok.py down first to restart it)")
-
-        # B 线同传 interpreter:每个方向一个 worker(agent_name 显式分发,
-        # 方向/语言对由 CP 在 me 端 token 的 RoomAgentDispatch metadata 下发)。
-        # worker 常驻待命,没有同传房间时零占用(不加载模型,job 到达才拉管线)。
-        for _dir, _port, _pidname, _logname in (
-            ("fwd", 8082, "interp-fwd.pid", "interp-fwd.log"),
-            ("rev", 8083, "interp-rev.pid", "interp-rev.log"),
-        ):
-            interp_env = _interp_env(agent_env)
-            interp_env["BOK_SERVICE"] = f"interp-{_dir}"
-            interp_env["INTERP_DIRECTION"] = _dir
-            if not healthy(_port):
-                _start_proc(
-                    [str(py), "-m", "agent_runtime.interpret"],
-                    run_dir / _pidname,
-                    log_dir / _logname,
-                    env=interp_env,
-                )
+        # C6:三个 worker 统一走 _worker_specs(env 构造/spawn 单点,与 monitor 同源)。
+        for _spec in _worker_specs(py):
+            if not healthy(_spec["port"]):
+                _start_proc(_spec["argv"], _spec["pidfile"], _spec["logfile"], env=_spec["env"])
             else:
-                print(f"[bok] interp-{_dir} worker already listening :{_port}")
+                print(f"[bok] {_spec['name']} worker already listening :{_spec['port']} (run bok.py down first to restart it)")
+        # C6-1 常驻监控环(2026-09-13):LiveKit 重启后 worker 注册全丢(9/12
+        # 11:52-12:05 「no worker is available」连 4 通 0 轮实证)——serve 是
+        # 一次性的,没人补拉。起 detached monitor:livekit down→up 转换即全量
+        # respawn(重注册),单 worker 掉线补拉;单例(pidfile 存活检查)。
+        _ensure_monitor(py)
 
     print("[bok] waiting for desktop stack…")
     targets = [8000, 8787, 8788, 8790, 1235, 7880, 8081, 8082, 8083]
@@ -1450,7 +1567,7 @@ def cmd_prod(cmd: str) -> int:
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="bok", description="Bok voice stack launcher (no Docker)")
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("catalog", "manifest", "download", "status", "up", "serve", "down", "doctor", "tts-mine", "clean-testdata"):
+    for name in ("catalog", "manifest", "download", "status", "up", "serve", "down", "doctor", "tts-mine", "clean-testdata", "monitor"):
         sub.add_parser(name)
     sub.add_parser("tts-pregen", help="离线预合成 TTS 本地缓存(参数透传:--greetings/--objects/--fillers/--cp/--model)")
     p_prod = sub.add_parser("prod", help="生产常驻单元与健康面")
@@ -1558,6 +1675,8 @@ def main(argv=None) -> int:
         return cmd_clean_testdata()
     if args.cmd == "tts-mine":
         return cmd_tts_mine(getattr(args, "extra", None))
+    if args.cmd == "monitor":
+        return cmd_monitor()
     return {"catalog": cmd_catalog, "manifest": cmd_manifest, "download": cmd_download, "status": cmd_status,
             "up": cmd_up, "serve": cmd_serve, "down": cmd_down, "doctor": cmd_doctor}[args.cmd]()
 

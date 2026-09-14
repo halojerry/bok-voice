@@ -227,7 +227,12 @@ async def main() -> int:
     # I1+I2 fwd/rev 双向（中↔英）
     info = await run_one(zh_pcm, en_pcm)
     record("I1 fwd: me(zh)→other 听到英文输出", info["fwd_ok"], info["fwd_text"])
-    record("I2 rev: other(en)→me 听到中文输出", info["rev_ok"], info["rev_text"])
+    # I2 改钉「出声单向化」契约(2026-09-12 拍板):rev 方向译文只走字幕/落库,
+    # 我方不播译文 TTS(BOK_INTERP_REV_AUDIO=1 才回退)——我方听感=对方麦克风
+    # 原声。所以 rev 断言=me 不应听到译文音轨(rev_ok=False 才对);rev 翻译链
+    # 路本身(转写→MT→turns 落库)由 I1b 原文/译文行覆盖。
+    record("I2 rev 单向化: other(en)→me 无译文音轨(仅字幕,0912 契约)",
+           not info["rev_ok"], info["rev_text"] or "me 侧零译文音轨 ✓")
     # turns 双语落库(2026-09-07 审计闭环起原文/译文拆成两条,language 字段区分
     # ——旧断言查单行同含「原文：译文：」会永久假红)
     turns = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{info['call_id']}/turns", timeout=10).json()
@@ -242,7 +247,9 @@ async def main() -> int:
     info_canto = await run_one(zh_pcm, canto_pcm, language="zh", target_lang="cantonese",
                              fwd_expect="Cantonese", rev_expect="Chinese")
     record("I5 fwd: me(zh)→other 听到粤语输出", info_canto["fwd_ok"], info_canto["fwd_text"])
-    record("I6 rev: other(粤)→me 听到中文输出", info_canto["rev_ok"], info_canto["rev_text"])
+    # I6 同 I2:出声单向化契约(粤→中方向 me 不播译文 TTS),翻译落库由 I5b 覆盖。
+    record("I6 rev 单向化: other(粤)→me 无译文音轨(仅字幕,0912 契约)",
+           not info_canto["rev_ok"], info_canto["rev_text"] or "me 侧零译文音轨 ✓")
     turns_c = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{info_canto['call_id']}/turns", timeout=10).json()
     orig_c = [t for t in turns_c if str(t.get("transcript") or "").startswith("原文：")]
     tran_c = [t for t in turns_c if str(t.get("transcript") or "").startswith("译文：")]

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { api } from "@/lib/api";
 import { useAccount } from "@/components/account-context";
@@ -40,6 +40,17 @@ export default function CallsPage() {
   const [clearing, setClearing] = useState(false);
   // 选中的通话：同页内嵌工作台（静态导出无法为真实 call id 生成路由，改内嵌而非 /calls/[id]）。
   const [openId, setOpenId] = useState<string | null>(null);
+  // 列表上限递增（QA 2026-09-13）：CP 全量返回 1000+ 通且最老在前——刚挂断的通话
+  // 沉底=切换客户闭环断头；改客户端最新优先排序 + 只渲染最近 limit 通。
+  const [limit, setLimit] = useState(50);
+  const sortedRows = useMemo(() => {
+    const arr = [...rows];
+    arr.sort((a, b) =>
+      String(b.created_at ?? "").localeCompare(String(a.created_at ?? ""))
+    );
+    return arr;
+  }, [rows]);
+  const visibleRows = sortedRows.slice(0, limit);
 
   async function removeOne(id: string) {
     if (!window.confirm("确认删除该通话记录？（转写与结算一并删除）")) return;
@@ -76,6 +87,15 @@ export default function CallsPage() {
       .catch((e) => setErr(String(e)))
       .finally(() => setLoading(false));
   }, [accountId]);
+
+  // 从内嵌工作台返回列表时立即刷新:挂断的那通此刻状态已变,不等 ≤4s 轮询
+  // (否则行还挂着「进行中」,交互不自洽)。
+  useEffect(() => {
+    if (openId) return;
+    api.listCalls(accountId, "")
+      .then((c) => setRows(Array.isArray(c) ? c : []))
+      .catch(() => {});
+  }, [accountId, openId]);
 
   // 主管台橫幅撳「進入工作台」→ /calls?call=<id>:自動開嗰通工作台(靜態 export 用 query,唔使新 route)。
   useEffect(() => {
@@ -131,7 +151,14 @@ export default function CallsPage() {
               ← 返回列表
             </button>
           </div>
-          <CallStudio callId={openId} />
+          <CallStudio
+            callId={openId}
+            onRequestNewCall={(oid) => {
+              // 退出内嵌工作台 → 跳独立新建页并预选该对象（?object= 预选已验证路径）
+              setOpenId(null);
+              window.location.assign(`/calls/new?object=${encodeURIComponent(oid)}`);
+            }}
+          />
         </section>
       )}
 
@@ -141,7 +168,17 @@ export default function CallsPage() {
             {!loading && rows.length === 0 && (
               <p className="text-sm muted">暂无会话，点击右上角「新建通话」开始。</p>
             )}
-            {rows.map((c) => {
+            {rows.length > 0 && (
+              <p className="px-2 text-xs muted">
+                共 {rows.length} 通 · 按最新优先显示 {visibleRows.length} 通
+                {sortedRows.length > visibleRows.length && (
+                  <button className="ml-2 text-accent" onClick={() => setLimit((v) => v + 100)}>
+                    显示更多
+                  </button>
+                )}
+              </p>
+            )}
+            {visibleRows.map((c) => {
               const id = String(c.id ?? c.call_id);
               const status = String(c.status ?? "idle");
               const [label, color] = STATUS[status] ?? [status, "bg-neutral-500"];
@@ -199,6 +236,15 @@ export default function CallsPage() {
                   >
                     删除
                   </button>
+                  {status === "ended" && String(c.object_id ?? "") && (
+                    <Link
+                      href={`/calls/new?object=${encodeURIComponent(String(c.object_id))}`}
+                      className="btn-ghost shrink-0 text-xs text-accent"
+                      title="用同一对象发起新通话（工作台预选该对象）"
+                    >
+                      再拨
+                    </Link>
+                  )}
                 </div>
               );
             })}

@@ -154,5 +154,19 @@ class ControlPlaneClient:
         except Exception:  # noqa: BLE001
             pass
 
+    async def list_filler_entries(self, account_id: str = "acc-001") -> list[dict]:
+        """垫话罐头启用条目(2026-09-13 乙节):每通装配拉一次,变更下一通生效。"""
+        r = await self._client.get("/api/fillers", params={"account_id": account_id, "enabled": 1})
+        r.raise_for_status()
+        data = r.json()
+        return list(data) if isinstance(data, list) else []
+
+    async def filler_hit(self, entry_id: str) -> None:
+        """垫话罐头命中计数(fire-and-forget,失败静默)。"""
+        try:
+            await self._client.post(f"/api/fillers/{entry_id}/hit")
+        except Exception:  # noqa: BLE001
+            pass
+
     async def aclose(self) -> None:
         await self._client.aclose()

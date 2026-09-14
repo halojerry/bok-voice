@@ -118,6 +118,42 @@ SCENARIOS: dict[str, dict] = {
             "九八七六五四三二",
         ],
     },
+    # 全旅程验收（2026-09-13）：QA 罐头快路 + OBJECTION 安抚 + DEFER 短应承
+    # 直念（gen=script，零 LLM）+ 道别收线——0913 修复面的多轮自然对话覆盖。
+    "zh-journey": {
+        "label": "小普（普通话·全旅程：快路/异议/拖延/收线）",
+        "lang": "zh",
+        "persona_voice": "Chinese_crisp_podcaster_nv1",
+        "lines": [
+            "你好",
+            "你们是哪家公司",  # QA 词条原文——应命中罐头快路 gen=qa_fastpath
+            "你们这个太慢了吧",  # OBJECTION——安抚指引
+            "我先想想吧",  # DEFER——短应承直念（defer-ack 车道）
+            "怎么赔偿",  # QA 词条原文——快路观察位
+            "好的拜拜",  # FAREWELL——礼貌收线
+        ],
+        "expect": [
+            {"kind": "log", "pattern": "QA_FASTPATH hit=", "label": "QA 罐头快路命中"},
+            {"kind": "log", "pattern": "defer-ack", "label": "DEFER 短应承车道开火"},
+            {"kind": "turn", "pattern": "不着急", "label": "DEFER 应承文本落库"},
+            {"kind": "turn", "pattern": "再见", "label": "道别收线回复"},
+        ],
+    },
+    "canto-repeat": {
+        "label": "小九（粤语·听唔清复述+收线）",
+        "lang": "cantonese",
+        "persona_voice": "Cantonese_GentleLady",
+        "lines": [
+            "你好",
+            "我個件遲咗三日",
+            "你讲咩呀听唔清",  # REPEAT——照讲复述（数字/单号逐位放慢）
+            "咁我個件仲喺邊度",
+            "冇嘢啦拜拜",  # FAREWELL——polite_close（未 captured）
+        ],
+        "expect": [
+            {"kind": "turn", "pattern": "拜拜", "label": "道别收线回复"},
+        ],
+    },
 }
 
 # agent.log 证据行（本通字节窗口内 grep；行式见 agent.py / fillers.py）
@@ -127,6 +163,7 @@ LOG_MARKERS = (
     b"BOK_FILLER fired",
     b"BOK_FILLER voice_fallback",
     b"[whatsapp]",
+    b"defer-ack",
 )
 
 
@@ -450,6 +487,7 @@ async def run_scenario(key: str, persona_id: str | None) -> dict:
         "measures": measures,
         "turns": turns,
         "evidence": evidence,
+        "evidence_text": "\n".join(evidence),
     }
 
 
@@ -493,6 +531,19 @@ def print_report(res: dict) -> None:
         print("\n本场证据行（agent.log 本通窗口）：", flush=True)
         for line in res["evidence"]:
             print(f"  {line}", flush=True)
+
+    # 预期证据核对（✓/⚠ 信息位，不改 PASS/FAIL 口径——哑轮才是硬失败）：
+    # kind=log 查 agent.log 证据行，kind=turn 查落库 transcript。
+    expects = SCENARIOS.get(res["key"], {}).get("expect") or []
+    if expects:
+        print("\n预期证据核对：", flush=True)
+        all_transcripts = "\n".join(
+            str(t.get("transcript") or "") for t in turns
+        )
+        for e in expects:
+            hay = res["evidence_text"] if e["kind"] == "log" else all_transcripts
+            ok = str(e["pattern"]) in (hay or "")
+            print(f"  {'✓' if ok else '⚠ 未命中'} [{e['kind']}] {e['label']}（pattern={e['pattern']!r}）", flush=True)
 
     total = len(res["measures"])
     print(f"\n小计[{res['key']}]: {total} 轮 · 有答 {total - mute} · 哑 {mute}"

@@ -360,6 +360,66 @@ function IdleStage() {
   );
 }
 
+/** 历史/挂断通话的转写回放（2026-09-14 交互自洽）：useSessionMessages 只含活
+ * 会话消息,ended 通话打开面板时中栏原本永远「等待对话…」,转写落库无入口——
+ * 从 CP turns 拉全量,按角色着色回放。结算落库有写入窗口,前几轮短轮询补齐。 */
+function HistoryTranscript({ callId }: { callId: string }) {
+  const [turns, setTurns] = useState<Record<string, unknown>[]>([]);
+  useEffect(() => {
+    let stopped = false;
+    let tries = 0;
+    const load = async () => {
+      try {
+        const rows = await api.getTurns(callId);
+        if (!stopped) setTurns(Array.isArray(rows) ? rows : []);
+      } catch {
+        /* CP 一时不可达等下轮 */
+      }
+    };
+    void load();
+    const t = setInterval(() => {
+      tries += 1;
+      if (tries > 6) {
+        clearInterval(t);
+        return;
+      }
+      void load();
+    }, 2500);
+    return () => {
+      stopped = true;
+      clearInterval(t);
+    };
+  }, [callId]);
+  return (
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <div className="flex-1 space-y-1.5 overflow-y-auto p-2">
+        <p className="text-center text-[10px] font-bold uppercase tracking-[0.16em] text-(--stage-muted)">
+          本通对话记录
+        </p>
+        {turns.length === 0 && <p className="text-center text-xs muted">暂无转写落库</p>}
+        {turns.map((t, i) => {
+          const role = String(t.role ?? "");
+          const text = String(t.transcript ?? "").trim();
+          if (!text) return null;
+          return (
+            <p
+              key={String(t.id ?? i)}
+              className={`rounded-lg px-3 py-1.5 text-sm leading-relaxed ${
+                role === "user" ? "bg-(--accent)/10" : "bg-white/5"
+              }`}
+            >
+              <span className="mr-2 text-[10px] font-medium muted">
+                {role === "user" ? "客户" : "AI"}
+              </span>
+              {text}
+            </p>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 const PROVIDER_FIELDS: [string, string][] = [
   ["asr", "ASR"],
   ["llm", "LLM"],
@@ -371,7 +431,77 @@ function str(v: unknown, fallback = "-") {
   return v === undefined || v === null || v === "" ? fallback : String(v);
 }
 
-export function CallStudio({ callId = "" }: { callId?: string }) {
+/**
+ * 通话工作台外壳（2026-09-13 切换客户闭环）：
+ * useSession 实例 end 之后不可复用——旧版挂断后切对象再「接通」挂在死 session
+ * 上，只有刷新页面重新 mount 才活。外壳持 epoch：挂断/切换通话 → key 重挂 =
+ * 全新 session + 全新转写 + 全新错误态，对象/人设选择经 localStorage「上次选择」
+ * 保留——等同「重新进工作台」但零页面刷新。结算上提外壳：重挂后仍可读上一通。
+ * 支持 /calls/new?object=&persona= 预选（对象页/通话列表「再拨」直达入口）。
+ */
+export function CallStudio({
+  callId = "",
+  onRequestNewCall,
+}: {
+  callId?: string;
+  /** 嵌入模式（/calls?call=）下「用该对象发起新通话」由宿主页路由走
+   * /calls/new?object=（退出内嵌工作台）；独立页(/calls/new)走 preset 重挂。 */
+  onRequestNewCall?: (objectId: string) => void;
+}) {
+  const [epoch, setEpoch] = useState(0);
+  const [settlement, setSettlement] = useState<Record<string, unknown> | null>(null);
+  const [lastFinished, setLastFinished] = useState("");
+  const [preset, setPreset] = useState({ object: "", persona: "" });
+  useEffect(() => {
+    const q = new URLSearchParams(window.location.search);
+    setPreset({ object: q.get("object") ?? "", persona: q.get("persona") ?? "" });
+  }, []);
+  return (
+    <CallStudioInner
+      key={`${epoch}:${callId}:${preset.object}:${preset.persona}`}
+      callId={callId}
+      initialObject={preset.object}
+      initialPersona={preset.persona}
+      settlement={settlement}
+      setSettlement={setSettlement}
+      lastFinishedCallId={lastFinished}
+      onCycle={(id) => {
+        if (id) setLastFinished(id);
+        setEpoch((e) => e + 1);
+      }}
+      onReDialWithObject={(oid) => {
+        if (onRequestNewCall) {
+          onRequestNewCall(oid);
+          return;
+        }
+        // 独立页：preset 重挂=已验证的 ?object= 同一条预选路径（原地状态手术
+        // 与 hydrate/default-pick 时序打架，重挂是唯一干净的预选状态机）。
+        setPreset({ object: oid, persona: "" });
+        setEpoch((e) => e + 1);
+      }}
+    />
+  );
+}
+
+function CallStudioInner({
+  callId = "",
+  initialObject = "",
+  initialPersona = "",
+  settlement,
+  setSettlement,
+  lastFinishedCallId = "",
+  onCycle,
+  onReDialWithObject,
+}: {
+  callId?: string;
+  initialObject?: string;
+  initialPersona?: string;
+  settlement: Record<string, unknown> | null;
+  setSettlement: (s: Record<string, unknown> | null) => void;
+  lastFinishedCallId?: string;
+  onCycle: (finishedCallId?: string) => void;
+  onReDialWithObject: (objectId: string) => void;
+}) {
   const { accountId: ACCOUNT } = useAccount();
   // 记住本账号上一次使用的人设/对象：新建通话默认恢复它(而非恒取列表第一个),
   // 挂断后切新人设/对象 → 接通即用新选择,唔会悄悄回到上个对话的档案。
@@ -408,7 +538,6 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
   const [object, setObject] = useState<Record<string, unknown> | null>(null);
   const [persona, setPersona] = useState<Record<string, unknown> | null>(null);
   const [mode, setMode] = useState<"simulation" | "live">("simulation");
-  const [settlement, setSettlement] = useState<Record<string, unknown> | null>(null);
   const [objectTopics, setObjectTopics] = useState<Record<string, unknown>[]>([]);
   const [settings, setSettings] = useState<Record<string, unknown> | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -416,6 +545,7 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
   // 服务就绪自愈：桌面壳异步拉起整栈，首次加载失败后在 Control Plane 就绪时自动重拉。
   const cp = useControlPlaneReady();
   const loadAttemptRef = useRef(-1);
+  const loadedModeRef = useRef("");
 
   // 官方会话：CP /api/token 已说官方 TokenSource 契约({serverUrl, participantToken})，
   // 这里直透响应体、零键名映射；TokenSource.custom 自带 exp 前缓存与自动续签。
@@ -427,6 +557,16 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
       TokenSource.custom(async () => {
         const id = callIdRef.current;
         if (!id) throw new Error("no call id");
+        // C2 幽灵重连闸(2026-09-13,call-6bd59b40):TokenSource 自带 exp 前自动
+        // 续签,房间被删后的 livekit 全量重连会再来要 token——通话已 ended 时
+        // 提前 throw,掐断「新 token→重连重建房→幽灵 job 重放开场白」链
+        // (CP /api/token 侧同款 409 双保险)。
+        const cur = (await api.getCall(id).catch(() => null)) as
+          | (Record<string, unknown> & { status?: string })
+          | null;
+        if (cur && String(cur.status ?? "") === "ended") {
+          throw new Error("call ended — refusing to renew token (ghost rejoin guard)");
+        }
         return await api.token({ account_id: ACCOUNT, call_id: id });
       }),
     [],
@@ -445,8 +585,10 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
   const [waStatus, setWaStatus] = useState("");
   const [waNum, setWaNum] = useState("");
   const [waHandling, setWaHandling] = useState(false);
-  // 接通后「AI 初始化中」提示窗口(到点自动消失;期间面板状态灯同显)
+  // 「接通后 AI 初始化中」提示窗口(到点自动消失;期间面板状态灯同显)
   const [initHintUntil, setInitHintUntil] = useState(0);
+  // ended 通话拦截：显示「用该对象发起新通话」入口(经外壳 preset 重挂,干净状态机)
+  const [endedBlock, setEndedBlock] = useState(false);
   const [nowTick, setNowTick] = useState(0);
   useEffect(() => {
     if (!initHintUntil) return;
@@ -518,11 +660,14 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
   // again on each Control Plane offline→ready transition (desktop cold start), so
   // the "接通" button never stays dead behind a one-shot network error.
   useEffect(() => {
-    if (loadAttemptRef.current === cp.attempt) return;
+    // 工作台模式（callId 非空且有活跃会话）：档案由 hydrate 从服务端解析,列表
+    // 默认选择唔跑——两者异步竞态会把历史通话档案覆写成「列表首个/上次」。
+    // reDial（用该对象发起新通话）在 callId prop 为真的实例内回到新建模式,
+    // stateCallId 清空 → 本 effect 重跑加载列表（callId prop 判会永久跳过）。
+    if (callId && stateCallId) return;
+    if (loadAttemptRef.current === cp.attempt && loadedModeRef.current === "new") return;
     loadAttemptRef.current = cp.attempt;
-    // 工作台模式（callId 非空）：档案由 hydrate 从服务端解析,列表默认选择唔跑——
-    // 两者异步竞态会把历史通话档案覆写成「列表首个/上次」。
-    if (callId) return;
+    loadedModeRef.current = "new";
     let cancelled = false;
     Promise.all([api.listObjects(ACCOUNT), api.listPersonas()])
       .then(([objs, pers]) => {
@@ -530,14 +675,43 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
         if (Array.isArray(objs)) setObjects(objs);
         if (Array.isArray(pers)) setPersonas(pers);
         // 默认选「上次用的人设/对象」(存在且在列表内);否则取第一个。
+        // ?object=&persona= 预选优先(对象页/通话列表「再拨」直达入口);
+        // 已有选择(reDial 预选)则保留,默认选择让位。
+        const presetObj =
+          initialObject && objs.some((o) => String(o.id) === initialObject) ? initialObject : "";
+        const presetPers =
+          initialPersona && pers.some((p) => String(p.id) === initialPersona) ? initialPersona : "";
         const lastObj = lsGet(lastKey("object"));
         const lastPers = lsGet(lastKey("persona"));
-        if (objs?.length) {
-          const picked = objs.find((o) => String(o.id) === lastObj) ? lastObj : String(objs[0].id);
+        if (objs?.length && !objIdRef.current) {
+          const picked = presetObj
+            ? presetObj
+            : objs.find((o) => String(o.id) === lastObj)
+              ? lastObj
+              : String(objs[0].id);
           setObjId(picked);
         }
-        if (pers?.length) {
-          const picked = pers.find((p) => String(p.id) === lastPers) ? lastPers : String(pers[0].id);
+        if (pers?.length && !personaIdRef.current) {
+          let picked = presetPers
+            ? presetPers
+            : pers.find((p) => String(p.id) === lastPers)
+              ? lastPers
+              : String(pers[0].id);
+          // 对象跳转(「发起新通话」/「再拨」带 ?object=)时,人设语言优先匹配
+          // 对象语言——否则粤语对象会配上次的普通话人设,接通即语言错配
+          // (callLang 人设优先,2026-09-14 交互自洽修)。
+          if (!presetPers && initialObject) {
+            const objLang = str(
+              (objs.find((o) => String(o.id) === initialObject) || {}).language
+            ).trim();
+            if (objLang) {
+              const matched = pers.filter((p) => str(p.language).trim() === objLang);
+              if (matched.length > 0) {
+                const lastMatched = matched.find((p) => String(p.id) === lastPers);
+                picked = String((lastMatched ?? matched[0]).id);
+              }
+            }
+          }
           setPersonaId(picked);
         }
         setError(null);
@@ -547,7 +721,7 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
       });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cp.attempt, ACCOUNT]);
+  }, [cp.attempt, ACCOUNT, stateCallId]);
 
   // 拉取全局设置：右栏 Provider 卡显示实际生效的 provider(而非硬编码)。
   useEffect(() => {
@@ -569,6 +743,9 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
         if (c.object_id) setObjId(String(c.object_id));
         if (c.persona_id) setPersonaId(String(c.persona_id));
         if (c.mode) setMode(c.mode as "simulation" | "live");
+        // ended 通话:点亮「用该对象发起新通话」并禁用接通按钮——别让用户点
+        // 一次必然失败的「接通/进房」才看到提示(交互自洽,2026-09-14)。
+        if (String(c.status ?? "") === "ended") setEndedBlock(true);
       })
       .catch((e) => setError(friendlyErrorText(String(e))));
   }, [callId]);
@@ -635,6 +812,7 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
         id = String(created.id);
         setStateCallId(id);
         callIdRef.current = id;
+        setSettlement(null); // 新一通开始，清上一通结算展示
       } else {
         // Join 已结束嘅 call:LiveKit room 已清,簽咗 token 去 join 會 401
         // (前端會誤報「令牌校驗失敗」)。直接攔截,叫用戶開新通話。
@@ -643,7 +821,7 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
           | null;
         if (cur && String(cur.status ?? "") === "ended") {
           setConnecting(false);
-          setError("该通话已结束（房间已关闭），无法重新接通。请返回列表发起新通话。");
+          setEndedBlock(true); // 面板交代+发起新通话入口(按钮已同时禁用)
           return;
         }
       }
@@ -692,6 +870,7 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
   }
 
   async function leave() {
+    const finished = stateCallId;
     // 先断开官方会话，再挂断 + 结算（业务流保留）。
     try {
       await session.end();
@@ -719,6 +898,11 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
     }
     setStateCallId("");
     callIdRef.current = "";
+    // 切换客户闭环（2026-09-13）：session 实例 end 后不可复用，挂断即换 key
+    // 重挂（外壳 epoch+1）——全新 session/转写/错误态，对象选择经 localStorage
+    // 「上次选择」保留，下拉换客户直接接通，零页面刷新。带回落地通话 id,
+    // 外壳保留「查看通话记录」入口(转写在会话页,工作台重挂后已清)。
+    onCycle(finished);
   }
 
   return (
@@ -752,13 +936,14 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
               {(() => {
                 const kw = objFilter.trim().toLowerCase();
                 const matched = objects.filter((o) => !kw || str(o.display_name).toLowerCase().includes(kw));
-                const selectedInList = matched.some((o) => String(o.id) === objId);
                 const list = matched.slice(0, 50);
-                if (objId && !selectedInList) {
+                // 选中项必须永远在选项表里:只在全量 matched 判「在」的话,选中项
+                // 排在 350+ 位时前 50 渲染不到它→DOM value 无匹配→浏览器回落
+                // 第一项,显示与状态脱钩(2026-09-13 实测:reDial 预选显示成列表首项)。
+                if (objId && !list.some((o) => String(o.id) === objId)) {
                   const sel = objects.find((o) => String(o.id) === objId);
                   if (sel) list.unshift(sel);
                 }
-                if (matched.length > 50) return list;
                 return list;
               })().map((o) => (
                 <option key={String(o.id)} value={String(o.id)}>
@@ -840,8 +1025,21 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
                       · {str(personas.find((p) => String(p.id) === personaId)?.name ?? "默认人设")}
                     </p>
                   )}
-                  <button className="btn-primary" onClick={connect} disabled={connecting || (!stateCallId && !objId)}>
-                    {connecting ? "接通中…" : error ? "重试接通" : isJoiningExisting ? "接通 / 进房" : "接通"}
+                  <button
+                    className="btn-primary"
+                    onClick={connect}
+                    disabled={connecting || endedBlock || (!stateCallId && !objId)}
+                    title={endedBlock ? "该通话已结束，房间已关闭" : undefined}
+                  >
+                    {endedBlock
+                      ? "通话已结束"
+                      : connecting
+                        ? "接通中…"
+                        : error
+                          ? "重试接通"
+                          : isJoiningExisting
+                            ? "接通 / 进房"
+                            : "接通"}
                   </button>
                   {connecting && (
                     <p className="animate-pulse text-[11px] text-sky-300">
@@ -884,7 +1082,27 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
           </div>
         </div>
 
-        {error && <p className="rounded-lg bg-red-500/10 p-3 text-sm text-red-300">{error}</p>}
+        {error && (
+          <div className="rounded-lg bg-red-500/10 p-3 text-sm text-red-300">
+            <p>{error}</p>
+          </div>
+        )}
+        {/* ended 通话面板(hydrate 即亮,不必先点一次接通吃报错):一句交代+直达发起新通话 */}
+        {endedBlock && !roomConnected && (
+          <div className="rounded-lg bg-white/5 p-3 text-sm">
+            <p className="muted">该通话已结束（房间已关闭），无法重新接通。可直接用该对象发起新通话。</p>
+            <button
+              className="btn-ghost mt-2 text-xs"
+              onClick={() => {
+                const oid = objIdRef.current;
+                setEndedBlock(false);
+                if (oid) onReDialWithObject(oid);
+              }}
+            >
+              用该对象发起新通话 →
+            </button>
+          </div>
+        )}
         {!error && !cp.ready && (
           <p className="rounded-lg bg-white/5 p-3 text-sm muted">
             本地服务启动中…（Control Plane / ASR / TTS），就绪后会自动加载对象与人设，请稍候。
@@ -950,7 +1168,13 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
 
         <div className="flex min-h-0 flex-1 flex-col">
           <AgentSessionProvider session={session} volume={1} muted={false}>
-            {roomConnected ? <LiveAgentPanel room={session.room} session={session} /> : <IdleStage />}
+            {roomConnected ? (
+              <LiveAgentPanel room={session.room} session={session} />
+            ) : stateCallId ? (
+              <HistoryTranscript callId={stateCallId} />
+            ) : (
+              <IdleStage />
+            )}
           </AgentSessionProvider>
         </div>
       </section>
@@ -996,6 +1220,14 @@ export function CallStudio({ callId = "" }: { callId?: string }) {
                 </div>
               )}
               <p className="mt-1 break-all text-xs muted">通话文档：{str(settlement.transcript_doc_path)}</p>
+              {lastFinishedCallId && (
+                <a
+                  className="mt-2 inline-block text-xs text-accent"
+                  href={`/calls?call=${encodeURIComponent(lastFinishedCallId)}`}
+                >
+                  查看通话记录（转写/逐轮）→
+                </a>
+              )}
               <p className="mt-1 break-all text-xs muted">结算文档：{str(settlement.settlement_doc_path)}</p>
             </>
           ) : (

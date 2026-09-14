@@ -309,6 +309,33 @@ class QaEntry(Base):
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
+class FillerEntry(Base):
+    """垫话罐头库(2026-09-13 乙节):客户上一句 → 确定性命中一条垫话。
+
+    镜像 qa_entries 全套基建:triggers=JSON 数组(用户口吻示例句,HybridLexical
+    匹配);category=compensate/check/ack/empathy/minimal/default(五类分类器
+    同一套枚举,命中加分);per_call_cap=同条目每通封顶(防同语境连击);音频由
+    tts-pregen --fillers 按人设物化进 tts-cache(pin),本表不存音频。匹配是
+    确定性的(同输入同条目)——用户拍板:随机抽签才是机器感,真人客服同样
+    场景说同样话。
+    """
+
+    __tablename__ = "filler_entries"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(64), index=True, default="acc-001")
+    lang: Mapped[str] = mapped_column(String(16), default="zh")
+    category: Mapped[str] = mapped_column(String(16), default="default")
+    text: Mapped[str] = mapped_column(Text)
+    triggers: Mapped[str] = mapped_column(Text, default="[]")  # JSON 数组(示例句)
+    voice_id: Mapped[str] = mapped_column(String(128), default="")
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    per_call_cap: Mapped[int] = mapped_column(Integer, default=2)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    hit_count: Mapped[int] = mapped_column(Integer, default=0)
+    source: Mapped[str] = mapped_column(String(16), default="curated")
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
 class Org(Base):
     """租户（P0 骨架：身份体系 P1 落地，先立 org 缝）。"""
     __tablename__ = "orgs"

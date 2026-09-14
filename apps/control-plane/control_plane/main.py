@@ -618,6 +618,20 @@ def token(req: TokenRequest) -> TokenResponse:
         _call = _repo().get_call(room) or {}
     except Exception:
         _call = {}
+    # C2 闸3·幽灵重连源(2026-09-13,call-6bd59b40):agent-ui TokenSource 带
+    # 自动续签,房间被删后 livekit 全量重连会再来要 token——旧版照签,operator
+    # 重连重建房 → 幽灵 job 重放开场白。A 线明确知道已 ended → 拒签(409);
+    # B 线 interpret 不拦——0912 定案契约「断线重连客户端仍可取 token,但终态
+    # 不翻」(test_token_does_not_revive_terminated_call 钉死);CP 读不到通话
+    # 记录(新建流/竞态)保守放行。
+    if (
+        str(_call.get("status") or "") == "ended"
+        and str(_call.get("kind") or "") != "interpret"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="call has ended — token refused (ghost rejoin guard)",
+        )
     kind = str(_call.get("kind") or "")
 
     # 同传房间:我方端是创建者,token 里挂 RoomConfiguration 显式分发两个方向的
@@ -673,12 +687,15 @@ def token(req: TokenRequest) -> TokenResponse:
     # "active calls" view reflects the real live room.
     if req.call_id:
         try:
-            # 终态守卫（2026-09-11 同传审计 P0）：断线重连的客户端在 hangup 后再取
+            # 终态守卫（2026-09-11 同传审计 P0）:断线重连的客户端在 hangup 后再取
             # token（call-a9511563 实证 hangup 200 后 +18ms 一发），无条件写 ACTIVE
             # 会把 ENDED/FAILED 复活——最后一写者胜令「挂断不结算」成立。
-            cur = _repo().get_call(req.call_id) or {}
-            if str(cur.get("status") or "") not in _TERMINAL_CALL_STATUSES:
-                _repo().update_call(req.call_id, status=CallStatus.ACTIVE.value)
+            # 原子化（2026-09-14 call-c76832ac）:旧版 Python 层「读-判断-写」两步
+            # 在并发请求交错时仍有窗口——hangup 提交 ended 后 5ms 的同通话 token
+            # 重签读到旧状态、写在提交之后，把终态翻回 active；下游 webhook 崩溃
+            # 补位据此往已挂断空房补派幽灵 agent（白跑 64s、预热开场白烧 TTS）。
+            # 改仓储层单条条件 UPDATE，终态判定与写入同语句求值，并发签发不可复活。
+            _repo().mark_active_if_live(req.call_id)
         except Exception:
             pass
     _audit("token.issue", subject_type="call", subject_id=req.call_id or "",
@@ -1858,6 +1875,23 @@ def hit_qa_entry(entry_id: str) -> dict:
     return {"id": entry_id}
 
 
+# ---- 垫话罐头库(2026-09-13 乙节):确定性语境命中,镜像 qa_entries ----
+
+
+@app.get("/api/fillers")
+def list_filler_entries(account_id: str = "acc-001", enabled: int | None = None, lang: str = "") -> list[dict]:
+    return _repo().list_filler_entries(
+        account_id, enabled=None if enabled is None else bool(enabled), lang=lang
+    )
+
+
+@app.post("/api/fillers/{entry_id}/hit")
+def hit_filler_entry(entry_id: str) -> dict:
+    """agent 垫话罐头命中计数(fire-and-forget,幂等无副作用)。"""
+    _repo().incr_filler_hit(entry_id)
+    return {"id": entry_id}
+
+
 @app.get("/api/reports/qa-pairs")
 def report_qa_pairs(
     min_calls: int = 5, account_id: str = "acc-001", limit: int = 100, exclude_test: bool = True
@@ -2056,6 +2090,29 @@ async def ingest_session_report(call_id: str, request: Request) -> dict:
         payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="invalid json body")
+    # C2 闸2·幽灵覆盖防护(2026-09-13,call-6bd59b40):挂断后重连产生的幽灵 job
+    # 会用自己的 report 覆盖真实通话的 session_report。ended 且已有 report →
+    # 409 拒绝(首个 report 在 ended 后仍收——agent 收尾顺序是先 ended 后上报,
+    # 只挡「第二次覆盖」)。caller 已容错(报表失败不阻结算)。
+    try:
+        _cur = _repo().get_call(call_id) or {}
+    except Exception:  # pragma: no cover - 读取失败按旧行为放行
+        _cur = {}
+    if (
+        str(_cur.get("status") or "") == "ended"
+        and str(_cur.get("session_report") or "").strip()
+    ):
+        _audit(
+            "call.session_report_rejected",
+            subject_type="call",
+            subject_id=call_id,
+            account_id=_cur.get("account_id", ""),
+            outcome="ghost_overwrite",
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="call ended with existing session_report — ghost overwrite rejected",
+        )
     row = _repo().update_call(call_id, session_report=json.dumps(payload, ensure_ascii=False, default=str))
     if not row:
         raise HTTPException(status_code=404, detail="call not found")
