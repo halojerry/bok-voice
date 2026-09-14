@@ -15,6 +15,9 @@ class TokenRequest(BaseModel):
     # other(同传对方端) / supervisor(主管旁听)。官方契约路径(participant_identity
     # 前缀)优先于本字段。
     role: str = "operator"
+    # 签发用途:""=正常入房 / "listen"=主管静默旁听专线(can_publish 全关,
+    # 不加 RoomConfiguration——主管不是房间创建者,不得建房/拉起 agent)。
+    purpose: str = ""
     # ---- LiveKit 官方 TokenSource endpoint 契约(livekit_token_source.proto,
     # snake_case 请求体)。room_name/participant_identity 提供时优先于旧字段。
     room_name: str = ""
@@ -31,11 +34,19 @@ class TokenResponse(BaseModel):
     participantToken: str = ""
 
 
+class ListenStopRequest(BaseModel):
+    """旁听结束回执：seconds=本次旁听时长（前端尽力而为，取不到传 0）。"""
+
+    seconds: int = 0
+
+
 class CreateCallRequest(BaseModel):
     account_id: str
     # 同传会话(kind=interpret)没有客服对象,允许空。
     object_id: str = ""
     persona_id: str = ""
+    # 显式话术(建单即快照):外呼战役/话务员自选话术走这里;空=回落对象卡绑定。
+    template_id: str = ""
     mode: CallMode = CallMode.SIMULATION
     direction: str = "webrtc"
     language: str = "zh"

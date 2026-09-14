@@ -1,21 +1,79 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "@/lib/api";
 import { friendlyErrorText } from "@/lib/api-ready";
 import { useAccount } from "@/components/account-context";
+import ListenPanel from "@/components/listen-panel";
 
 type CallRow = Record<string, unknown> & { id?: string; call_id?: string; status?: string };
+type TurnRow = Record<string, unknown>;
 
 const PENDING_WA = ["offered", "captured"];
+const LANG_LABEL: Record<string, string> = { zh: "中文", cantonese: "粤语", en: "英语" };
+/** 实时字段（话术步/最近一句）每条通话要拉一次 turns，设上限防 N 路打爆 CP。 */
+const MAX_ENRICH = 8;
+
+const idOf = (c: CallRow) => String(c.id ?? c.call_id ?? "");
+
+function langLabel(v: unknown): string {
+  const s = String(v ?? "");
+  return LANG_LABEL[s] ?? (s || "—");
+}
+
+/** CP 的 created_at 是 naive UTC（无时区后缀）：补 Z 再解析，否则被当本地时间差 8 小时。 */
+function parseTs(v: unknown): number {
+  const s = String(v ?? "").trim();
+  if (!s) return 0;
+  const hasTz = /([zZ]|[+-]\d{2}:?\d{2})$/.test(s);
+  const t = Date.parse(hasTz ? s : `${s}Z`);
+  return Number.isNaN(t) ? 0 : t;
+}
+
+function elapsedLabel(createdAt: unknown): string {
+  const t = parseTs(createdAt);
+  if (!t) return "";
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (s < 60) return `${s} 秒`;
+  const m = Math.floor(s / 60);
+  return s % 60 ? `${m} 分 ${s % 60} 秒` : `${m} 分钟`;
+}
+
+/** 最近一句客户原话（turns 账本 speaker=customer；老数据无 speaker 时按 role=user 兜底）。 */
+function lastCustomerLine(turns?: TurnRow[]): string {
+  if (!turns?.length) return "";
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const t = turns[i];
+    const speaker = String(t.speaker ?? "");
+    const role = String(t.role ?? "");
+    if (speaker === "customer" || (!speaker && role === "user")) {
+      const text = String(t.transcript ?? "").trim();
+      if (text) return text;
+    }
+  }
+  return "";
+}
+
+/** 当前话术步（agent 上报已 1-based；0=该通无话术）。 */
+function currentStep(turns?: TurnRow[]): number {
+  if (!turns?.length) return 0;
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const step = Number(turns[i].template_step ?? 0);
+    if (step > 0) return step;
+  }
+  return 0;
+}
 
 export default function SupervisorPage() {
   const { accountId } = useAccount();
   const [rows, setRows] = useState<CallRow[]>([]);
+  const [turns, setTurns] = useState<Record<string, TurnRow[]>>({});
   const [err, setErr] = useState<string | null>(null);
   const [objName, setObjName] = useState<Record<string, string>>({});
   const [copied, setCopied] = useState<string | null>(null);
+  const [listenId, setListenId] = useState<string | null>(null);
+  const [busy, setBusy] = useState("");
 
   const refresh = useCallback(async () => {
     try {
@@ -49,13 +107,67 @@ export default function SupervisorPage() {
     })();
   }, [accountId]);
 
-  const idOf = (c: CallRow) => String(c.id ?? c.call_id ?? "");
+  // 实时字段富化：为前 N 路通话拉 turns（话术步/最近一句客户话），4s 一轮。
+  const idsKey = useMemo(() => rows.slice(0, MAX_ENRICH).map(idOf).filter(Boolean).join(","), [rows]);
+  useEffect(() => {
+    if (!idsKey) return;
+    const ids = idsKey.split(",");
+    let cancelled = false;
+    const load = async () => {
+      const pairs = await Promise.all(
+        ids.map(async (id) => {
+          try {
+            return [id, (await api.getTurns(id)) as TurnRow[]] as const;
+          } catch {
+            return null;
+          }
+        }),
+      );
+      if (cancelled) return;
+      setTurns((prev) => {
+        const next = { ...prev };
+        for (const p of pairs) if (p) next[p[0]] = p[1];
+        return next;
+      });
+    };
+    void load();
+    const t = setInterval(load, 4000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, [idsKey]);
+
+  // 深链：/supervisor?listen=<callId>（静态导出用 query，不开动态路由）。
+  useEffect(() => {
+    const m = window.location.search.match(/[?&]listen=([^&]+)/);
+    if (m) setListenId(decodeURIComponent(m[1]));
+  }, []);
+  const openListen = (id: string) => {
+    setListenId(id);
+    try {
+      window.history.replaceState(null, "", `/supervisor/?listen=${encodeURIComponent(id)}`);
+    } catch {
+      /* 历史 API 失败不影响面板 */
+    }
+  };
+  const closeListen = () => {
+    setListenId(null);
+    try {
+      window.history.replaceState(null, "", "/supervisor/");
+    } catch {
+      /* 同上 */
+    }
+  };
+
   const labelOf = (c: CallRow) =>
     String(objName[String(c.object_id ?? "")] ?? c.object_name ?? c.call_id ?? c.id ?? "-");
   const waStatus = (c: CallRow) => String(c.whatsapp_status ?? "");
   const waNum = (c: CallRow) => String(c.customer_whatsapp ?? "");
 
   const pending = rows.filter((c) => PENDING_WA.includes(waStatus(c)));
+  const activeCount = rows.filter((c) => String(c.status ?? "active") === "active").length;
+  const pausedCount = rows.length - activeCount;
 
   async function copyNum(num: string) {
     try {
@@ -76,19 +188,59 @@ export default function SupervisorPage() {
     }
   }
 
+  async function act(id: string, key: string, fn: (id: string) => Promise<unknown>) {
+    setErr(null);
+    setBusy(`${id}:${key}`);
+    try {
+      await fn(id);
+      await refresh();
+    } catch (e) {
+      setErr(friendlyErrorText(String(e)));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  const confirmAct = (c: CallRow, key: string, fn: (id: string) => Promise<unknown>, question: string) => {
+    if (!window.confirm(question)) return;
+    void act(idOf(c), key, fn);
+  };
+
   return (
     <div>
-      <div className="mb-8 flex items-start justify-between">
+      <div className="mb-6 flex items-start justify-between">
         <div>
           <h1 className="page-title">主管台</h1>
           <p className="page-sub">
-            只读监控（进行中通话 / 暂停 / WhatsApp 对接待办）。暂停 AI · 接管 · 转人工 · 挂断请到「通话会话」进入该通话的工作台操作。
+            实时总控：静默旁听（无提示、留审计）· 暂停 / 接管 / 挂断；详情与转写在工作台看。
           </p>
         </div>
         <button className="btn-ghost" onClick={() => refresh()}>刷新</button>
       </div>
 
+      <div className="mb-6 flex flex-wrap gap-3 text-sm">
+        <span className="card px-4 py-2">
+          进行中 <b className="text-(--stage-value)">{activeCount}</b>
+        </span>
+        <span className="card px-4 py-2">
+          已暂停 <b className={pausedCount ? "text-amber-400" : "muted"}>{pausedCount}</b>
+        </span>
+        <span className="card px-4 py-2">
+          WhatsApp 待对接 <b className={pending.length ? "text-accent" : "muted"}>{pending.length}</b>
+        </span>
+      </div>
+
       {err && <p className="mb-4 rounded-lg bg-red-500/10 p-3 text-sm text-red-300">{err}</p>}
+
+      {listenId && (
+        <div className="mb-6">
+          <ListenPanel
+            callId={listenId}
+            label={labelOf(rows.find((c) => idOf(c) === listenId) ?? { id: listenId })}
+            onClose={closeListen}
+          />
+        </div>
+      )}
 
       {/* WhatsApp 對接橫幅區:有待對接 call 先顯示,撳「已對接」就收起 */}
       {pending.length > 0 && (
@@ -153,9 +305,12 @@ export default function SupervisorPage() {
               const paused = status === "paused" || Boolean(c.escalated_to_human);
               const wa = waStatus(c);
               const waPending = PENDING_WA.includes(wa);
+              const step = currentStep(turns[id]);
+              const lastLine = lastCustomerLine(turns[id]);
+              const isBusy = busy.startsWith(`${id}:`);
               return (
                 <div key={id} className={`rounded-lg p-4 ${waPending ? "wa-flash bg-white/5" : "bg-white/5"}`}>
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
                       <p className="truncate font-medium">
                         {labelOf(c)}
@@ -165,7 +320,13 @@ export default function SupervisorPage() {
                           </span>
                         )}
                       </p>
-                      <p className="text-xs muted">{status} · {id}</p>
+                      <p className="mt-0.5 text-xs muted">
+                        {langLabel(c.language)} · {step ? `话术第 ${step} 步` : "无话术"} ·{" "}
+                        {elapsedLabel(c.created_at) ? `已进行 ${elapsedLabel(c.created_at)}` : "—"} · {id}
+                      </p>
+                      {lastLine && (
+                        <p className="mt-1 truncate text-xs text-(--foreground)/80">客户：「{lastLine}」</p>
+                      )}
                     </div>
                     <span
                       className={`inline-flex shrink-0 items-center gap-1.5 text-xs ${
@@ -177,12 +338,47 @@ export default function SupervisorPage() {
                     </span>
                   </div>
                   <div className="mt-3 flex flex-wrap gap-2">
-                    <Link href="/calls" className="btn-ghost text-xs">
-                      进入工作台（暂停/接管/挂断）
-                    </Link>
-                    {waPending && (
-                      <button className="btn-primary text-xs" onClick={() => handleDone(c)}>标记 WhatsApp 已对接</button>
+                    <button className="btn-primary text-xs" onClick={() => openListen(id)}>静默旁听</button>
+                    {!paused && (
+                      <button className="btn-ghost text-xs" disabled={isBusy} onClick={() => void act(id, "pause", api.supervisorPause)}>
+                        暂停 AI
+                      </button>
                     )}
+                    {paused && (
+                      <button className="btn-ghost text-xs" disabled={isBusy} onClick={() => void act(id, "resume", api.supervisorResume)}>
+                        恢复 AI
+                      </button>
+                    )}
+                    {!c.escalated_to_human && (
+                      <button
+                        className="btn-ghost text-xs"
+                        disabled={isBusy}
+                        onClick={() =>
+                          confirmAct(c, "takeover", api.supervisorTakeover, `确认接管「${labelOf(c)}」？接管后 AI 停止自动应答。`)
+                        }
+                      >
+                        接管（人工）
+                      </button>
+                    )}
+                    <button
+                      className="btn-ghost text-xs"
+                      disabled={isBusy}
+                      onClick={() =>
+                        confirmAct(c, "transfer", api.supervisorTransfer, `确认转人工？将结束 AI 通话并断开房间：「${labelOf(c)}」。`)
+                      }
+                    >
+                      转人工
+                    </button>
+                    <button
+                      className="btn-ghost text-xs text-red-300/80 hover:text-red-300"
+                      disabled={isBusy}
+                      onClick={() => confirmAct(c, "hangup", api.hangup, `确认挂断「${labelOf(c)}」？通话将结束并触发结算。`)}
+                    >
+                      挂断
+                    </button>
+                    <Link href={`/calls?call=${encodeURIComponent(id)}`} className="btn-ghost text-xs text-accent">
+                      进入工作台
+                    </Link>
                   </div>
                 </div>
               );
@@ -190,17 +386,6 @@ export default function SupervisorPage() {
           </div>
         )}
       </section>
-
-      <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-2">
-        <section className="card">
-          <span className="label">质量监控</span>
-          <p className="mt-3 text-sm muted">表达密度 / 填充词 / 犹豫词 / 打断成功率。接结算后展示。</p>
-        </section>
-        <section className="card">
-          <span className="label">纪律控制</span>
-          <p className="mt-3 text-sm muted">provider 降级状态机、熔断、回切、审计。MVP 骨架。</p>
-        </section>
-      </div>
     </div>
   );
 }

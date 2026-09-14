@@ -118,6 +118,10 @@ export const api = {
   supervisorResume: (id: string) => request<Record<string, unknown>>(`/api/supervisor/${id}/resume-agent`, { method: "POST" }),
   supervisorTakeover: (id: string) => request<Record<string, unknown>>(`/api/supervisor/${id}/takeover`, { method: "POST" }),
   supervisorTransfer: (id: string) => request<Record<string, unknown>>(`/api/supervisor/${id}/transfer`, { method: "POST" }),
+  // 静默旁听：只订阅 token（can_publish 全关）；start 记审计、stop 补时长。
+  supervisorListen: (id: string) => request<Record<string, unknown>>(`/api/supervisor/${id}/listen`, { method: "POST" }),
+  supervisorListenStop: (id: string, seconds: number) =>
+    request<Record<string, unknown>>(`/api/supervisor/${id}/listen/stop`, { method: "POST", body: JSON.stringify({ seconds }) }),
   markWhatsappHandled: (id: string, handled = true) =>
     request<Record<string, unknown>>(`/api/calls/${id}/whatsapp/handled`, { method: "POST", body: JSON.stringify({ handled }) }),
   // 名册认领池（Wave1 outbound campaign）：status/channel 空=不过滤；
@@ -139,6 +143,7 @@ export const api = {
   startCampaign: (id: string) => request<Record<string, unknown>>(`/api/campaigns/${id}/start`, { method: "POST" }),
   pauseCampaign: (id: string) => request<Record<string, unknown>>(`/api/campaigns/${id}/pause`, { method: "POST" }),
   stopCampaign: (id: string) => request<Record<string, unknown>>(`/api/campaigns/${id}/stop`, { method: "POST" }),
+  deleteCampaign: (id: string) => request<Record<string, unknown>>(`/api/campaigns/${id}`, { method: "DELETE" }),
   reportsSummary: () => request<Record<string, unknown>>("/api/reports/summary"),
   reportsCalls: () => request<Record<string, unknown>[]>("/api/reports/calls"),
   reportsUsage: () => request<Record<string, unknown>>("/api/reports/usage"),

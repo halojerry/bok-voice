@@ -43,6 +43,7 @@ from .schemas import (
     CreateObjectRequest,
     ImportRequest,
     DialResultRequest,
+    ListenStopRequest,
     PersonaRequest,
     QaEntryCreate,
     QaEntryPatch,
@@ -586,6 +587,12 @@ def token(req: TokenRequest) -> TokenResponse:
             role = "supervisor"
         else:
             role = "operator"
+    # 旁听专线（purpose=listen）：主管静默旁听——角色钉 supervisor（只订阅不发布）。
+    # 官方路径带 participant_identity 时不覆盖（身份由调用方保证）。
+    _purpose = (req.purpose or "").strip().lower()
+    is_listen = _purpose == "listen"
+    if is_listen and not identity_input:
+        role = "supervisor"
     if role == "me":
         name = "Bok Interpret Me"
     elif role == "other":
@@ -600,11 +607,20 @@ def token(req: TokenRequest) -> TokenResponse:
         else f"supervisor-{room}" if role == "supervisor"
         else f"operator-{req.account_id}-{room}"
     )
+    # 旁听专线 grants：can_publish/can_publish_data 全关——主管旁听绝不向通话
+    # 注入音频或数据；can_subscribe 保证能收双方音轨与字幕流。
+    _grants = (
+        api.VideoGrants(room_join=True, room=room, can_publish=False,
+                        can_subscribe=True, can_publish_data=False)
+        if is_listen
+        else api.VideoGrants(room_join=True, room=room, can_publish=True,
+                             can_subscribe=True, can_publish_data=True)
+    )
     at = (
         api.AccessToken(key, secret)
         .with_identity(identity)
         .with_name(req.participant_name or name)
-        .with_grants(api.VideoGrants(room_join=True, room=room, can_publish=True, can_subscribe=True, can_publish_data=True))
+        .with_grants(_grants)
         .with_ttl(datetime.timedelta(seconds=3600))
     )
     if req.participant_metadata:
@@ -666,7 +682,9 @@ def token(req: TokenRequest) -> TokenResponse:
                 ]
             )
         )
-    elif kind != "interpret" and role in ("operator", "supervisor"):
+    elif not is_listen and kind != "interpret" and role in ("operator", "supervisor"):
+        # 旁听 token 不加 RoomConfiguration：主管通常后于坐席进房（无副作用），
+        # 但若先到，挂 dispatch 会替房间建房并拉起 agent——旁听必须零副作用。
         # A 线显式分发(官方推荐,隐式 dispatch 已废除):worker 以 agent_name="bok-voice"
         # 注册,只有挂了本 dispatch 的房间会拉起客服 agent——顺带杜绝「同传房被
         # A 线 agent 隐式抢派」。metadata 带 call_id,取代已删除的 AGENT_CALL_ID env 旁路。
@@ -685,7 +703,8 @@ def token(req: TokenRequest) -> TokenResponse:
     participant_token = at.to_jwt()
     # When the operator connects an existing call, flip it to ACTIVE so the supervisor
     # "active calls" view reflects the real live room.
-    if req.call_id:
+    # 旁听不翻状态：主管听一通 paused 通话，不得把它悄悄恢复成 active。
+    if req.call_id and not is_listen:
         try:
             # 终态守卫（2026-09-11 同传审计 P0）:断线重连的客户端在 hangup 后再取
             # token（call-a9511563 实证 hangup 200 后 +18ms 一发），无条件写 ACTIVE
@@ -699,7 +718,8 @@ def token(req: TokenRequest) -> TokenResponse:
         except Exception:
             pass
     _audit("token.issue", subject_type="call", subject_id=req.call_id or "",
-           account_id=req.account_id, call_id=req.call_id or "", detail={"role": req.role})
+           account_id=req.account_id, call_id=req.call_id or "",
+           detail={"role": role, "purpose": _purpose})
     return TokenResponse(serverUrl=url, participantToken=participant_token)
 
 
@@ -715,12 +735,13 @@ def _create_call_in(repo, req: CreateCallRequest) -> dict:
     参数与 app.state 可不同源，单测注入内存仓时不能走 `_repo()`）。
     """
     # 会话清单：读取全局策略(offline_first/cloud_first)与已配置 provider，
-    # 并把对象绑定的模板快照到 call（审计「这场用了哪版话术」）。
+    # 并把话术快照到 call（审计「这场用了哪版话术」）。
+    # 话术优先级：显式指定（外呼战役/话务员自选）> 对象卡绑定。
     settings = repo.get_settings()
     policy = (settings or {}).get("policy") or "offline_first"
     providers = _effective_providers(settings or {})
-    template_id = ""
-    if req.object_id:
+    template_id = str(req.template_id or "")
+    if not template_id and req.object_id:
         obj = repo.get_object(req.object_id)
         template_id = (obj or {}).get("template_id", "") or ""
     manifest = select_session_manifest(
@@ -1355,6 +1376,23 @@ def _campaign_transition(campaign_id: str, status: str) -> dict:
     _audit(f"campaign.{status}", subject_type="campaign", subject_id=campaign_id,
            account_id=str(camp.get("account_id", "acc-001")))
     return updated
+
+
+@app.delete("/api/campaigns/{campaign_id}")
+def delete_campaign(campaign_id: str) -> dict:
+    """删战役（含名单项）。running 拒删（409）——先停止再删，防误删在跑波次。"""
+    camp = _repo().get_campaign(campaign_id)
+    if not camp:
+        raise HTTPException(404, "campaign not found")
+    status = str(camp.get("status") or "")
+    if status == "running":
+        raise HTTPException(409, "campaign is running — stop it first")
+    items = _repo().list_items(campaign_id)
+    _repo().delete_campaign(campaign_id)
+    _audit("campaign.delete", subject_type="campaign", subject_id=campaign_id,
+           account_id=str(camp.get("account_id") or ""),
+           detail={"items": len(items), "status": status})
+    return {"campaign_id": campaign_id, "deleted": True, "items_removed": len(items)}
 
 
 def _progress(items: list[dict]) -> dict:
@@ -2425,6 +2463,42 @@ def supervisor_join(call_id: str) -> dict:
         "serverUrl": issued.serverUrl,
         "participantToken": issued.participantToken,
     }
+
+
+@app.post("/api/supervisor/{call_id}/listen")
+def supervisor_listen(call_id: str) -> dict:
+    """主管静默旁听：签发只订阅 token（can_publish 全关）+ 留审计。
+
+    与 `/join` 的区别：join 是通用主管身份（可发布），listen 是旁听专线——
+    从 token 层保证「只听不说」，且不翻通话状态；被听方无任何提示（产品拍板），
+    但每次旁听都在审计留痕（此处记 start，前端结束回执 stop 补时长）。
+    """
+    call = _repo().get_call(call_id)
+    if not call:
+        raise HTTPException(404, "call not found")
+    if str(call.get("status") or "") in _TERMINAL_CALL_STATUSES:
+        raise HTTPException(409, "call has ended")
+    account_id = str(call.get("account_id") or "acc-001")
+    issued = token(TokenRequest(call_id=call_id, role="supervisor",
+                                purpose="listen", account_id=account_id))
+    _audit("supervisor.listen.start", subject_type="call", subject_id=call_id,
+           account_id=account_id, call_id=call_id, detail={"purpose": "listen"})
+    return {
+        "call_id": call_id,
+        "status": call.get("status", "active"),
+        "serverUrl": issued.serverUrl,
+        "participantToken": issued.participantToken,
+    }
+
+
+@app.post("/api/supervisor/{call_id}/listen/stop")
+def supervisor_listen_stop(call_id: str, req: ListenStopRequest) -> dict:
+    """旁听结束回执：补一条带时长的审计（纯留痕，不改通话状态）。"""
+    call = _repo().get_call(call_id) or {}
+    _audit("supervisor.listen.stop", subject_type="call", subject_id=call_id,
+           account_id=str(call.get("account_id") or ""), call_id=call_id,
+           detail={"seconds": max(0, int(req.seconds or 0))})
+    return {"call_id": call_id, "recorded": True}
 
 
 @app.post("/api/web_logs")
