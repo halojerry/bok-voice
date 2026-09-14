@@ -23,5 +23,8 @@ class KnowledgeChunk(VectorBase):
     text: Mapped[str] = mapped_column(Text)
     path: Mapped[str] = mapped_column(String(512), default="")
     source: Mapped[str] = mapped_column(String(64), default="import")
+    # KB 增量索引(2026-09-10): chunk 文本 sha256 前 32 位,重导入据此对账,
+    # 未变 chunk 不删不重嵌入。
+    content_hash: Mapped[str] = mapped_column(String(64), default="")
     embedding: Mapped[list[float]] = mapped_column(Vector(384))
     created_at: Mapped[datetime] = mapped_column(default=utcnow, server_default=func.now())

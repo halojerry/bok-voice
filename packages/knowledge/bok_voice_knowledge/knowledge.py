@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
@@ -11,6 +12,11 @@ from bok_voice_core.types import ContextBundle, TurnEvent
 
 def _aid() -> str:
     return uuid.uuid4().hex[:12]
+
+
+def _chunk_hash(text: str) -> str:
+    """chunk 文本 sha256 前 32 位——重导入对账的稳定性来源。"""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:32]
 
 
 def _chunk_content(content: str, max_chars: int = 500) -> list[str]:
@@ -103,15 +109,33 @@ class DefaultKnowledgeService:
         doc_path = f"accounts/{account_id}/knowledge/{safe_path}"
         write_result = self.markdown.write(doc_path, content)
         # 分块（2026-09-07 KB 复盘 P0-2）:整文档单 chunk 令检索粒度=整篇,截断
-        # 150 字后信息损失。按空行分段、合并短段至 ≤500 字符；重导入时先删同
-        # path 旧 chunk（内容变更不留 stale 残留）。
+        # 150 字后信息损失。按空行分段、合并短段至 ≤500 字符。
+        # 增量对账（2026-09-10）:按 chunk 文本哈希集合比对——同 path 既有 chunk
+        # 中哈希仍在集合内的原样保留（id/向量不动）,其余删除;只为新哈希做嵌入。
+        # 内容完全未变的重导入 = 零删除零嵌入。
+        new_chunks = _chunk_content(content)
+        new_hashes = {_chunk_hash(c) for c in new_chunks}
         existing = await self.vector.list(account_id)
-        stale_ids = [str(it.get("id")) for it in existing if str(it.get("path", "")) == doc_path]
+        same_path = [it for it in existing if str(it.get("path", "")) == doc_path]
+        stale_ids = [
+            str(it.get("id"))
+            for it in same_path
+            if str(it.get("content_hash") or "") not in new_hashes
+        ]
+        if same_path and not stale_ids and len(same_path) == len(new_chunks):
+            return {**write_result, "indexed": 0, "reindexed": 0, "changed": False}
         if stale_ids:
             await self.vector.delete(account_id, stale_ids)
+        kept_hashes = {
+            str(it.get("content_hash") or "")
+            for it in same_path
+            if str(it.get("content_hash") or "") in new_hashes
+        }
         chunks = [
-            {"id": f"{_aid()}:{i}", "text": c, "path": doc_path, "source": "import"}
-            for i, c in enumerate(_chunk_content(content))
+            {"id": f"{_aid()}:{i}", "text": c, "path": doc_path, "source": "import",
+             "content_hash": _chunk_hash(c)}
+            for i, c in enumerate(new_chunks)
+            if _chunk_hash(c) not in kept_hashes
         ]
-        count = await self.vector.upsert(chunks, account_id)
-        return {**write_result, "indexed": count}
+        count = await self.vector.upsert(chunks, account_id) if chunks else 0
+        return {**write_result, "indexed": count, "reindexed": len(chunks), "changed": True}
