@@ -22,8 +22,15 @@ from agent_runtime.fillers import FillerDirector, filler_gap_s, load_manifest  #
 _PCM = (1000).to_bytes(2, "little", signed=True) * 480  # 20ms @24k
 
 
-def _make_assets(tmp_path: Path, pools: dict[str, list[str]]) -> Path:
-    """微型 wav+manifest;音频本身 20ms,时长断言走 manifest dur_s(权威)。"""
+def _make_assets(
+    tmp_path: Path,
+    pools: dict[str, list[str]],
+    cats: dict[str, list[str]] | None = None,
+) -> Path:
+    """微型 wav+manifest;音频本身 20ms,时长断言走 manifest dur_s(权威)。
+
+    cats:每语言与 texts 对齐的 cat 标签表(缺省不打标,与旧用例零变化)。
+    """
     assets = tmp_path / "fillers"
     assets.mkdir(parents=True, exist_ok=True)
     manifest: dict[str, list[dict]] = {}
@@ -36,7 +43,10 @@ def _make_assets(tmp_path: Path, pools: dict[str, list[str]]) -> Path:
                 w.setsampwidth(2)
                 w.setframerate(24000)
                 w.writeframes(_PCM)
-            entries.append({"text": text, "file": name, "dur_s": 1.0})
+            entry = {"text": text, "file": name, "dur_s": 1.0}
+            if cats and cats.get(lang):
+                entry["cat"] = cats[lang][i - 1]
+            entries.append(entry)
         manifest[lang] = entries
     (assets / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
     return assets
@@ -96,6 +106,7 @@ def _director(
     tmp_path,
     *,
     pools: dict[str, list[str]] | None = None,
+    cats: dict[str, list[str]] | None = None,
     lang="cantonese",
     player=_NO_PLAYER,
     guards=None,
@@ -108,7 +119,7 @@ def _director(
         "zh": ["好的，您稍等。"],
         "en": ["Sure."],
     }
-    assets = _make_assets(tmp_path, pools)
+    assets = _make_assets(tmp_path, pools, cats)
     if player is _NO_PLAYER:
         player = _FakePlayer()
     d = FillerDirector(
@@ -297,6 +308,49 @@ def test_filler_max_default_is_six(monkeypatch):
     # 2026-09-13 乙节定档:罐头确定性命中后 12 次只会放大复读感——垫话是补丁
     # 不是台词,6 发覆盖最差慢轮(旧 12 是随机池年代的补丁,见 plan 乙节 B3)。
     assert filler_max_per_call() == 6
+
+
+def test_single_entry_category_pool_widens_on_recent_dedup(tmp_path):
+    """2026-09-14 call-c76832ac 实证:分类池只有 1 条时旧 `or list(pool)` 兜底
+    把同一条放回,「冇問題，你稍等多一陣…」4 分钟连播 3 次(voice_hit=1)。
+    去重清空必须向整池放宽,不得落回单条池。"""
+
+    async def _case():
+        pools = {"cantonese": ["默认垫话。", "应承一。", "应承二。"]}
+        cats = {"cantonese": ["default", "ack", "ack"]}
+        d, _ = _director(tmp_path, pools=pools, cats=cats)
+        e1 = d._pick("cantonese", "default")
+        assert e1["text"] == "默认垫话。"  # 首抽仍优先 default 类(既有行为)
+        e2 = d._pick("cantonese", "default")
+        assert e2["text"] != "默认垫话。", "优先池唯一条已在去重窗内 → 放宽整池,不得复播"
+        e3 = d._pick("cantonese", "default")
+        assert len({e1["text"], e2["text"], e3["text"]}) == 3  # 三连必不同
+
+    _run(_case())
+
+
+def test_tiny_pool_allows_repeat_without_error(tmp_path):
+    """池全部落在去重窗内(池=1)时允许重复——永不因去重没垫话播/抛错。"""
+
+    async def _case():
+        d, _ = _director(tmp_path, pools={"cantonese": ["唯一垫话。"]})
+        assert d._pick("cantonese")["text"] == "唯一垫话。"
+        assert d._pick("cantonese")["text"] == "唯一垫话。"
+
+    _run(_case())
+
+
+def test_real_manifest_cantonese_default_no_three_peat():
+    """真 manifest 回归:cantonese `default` 类只有 1 条(call-c76832ac 现场),
+    连抽 3 次不得同句连播——分类去重必须吃真资产数据。"""
+    d = FillerDirector(
+        _FakeSession(),
+        lang_resolver=lambda: "cantonese",
+        player=_FakePlayer(),
+        guards=lambda: False,
+    )
+    lines = [d._pick("cantonese", "default")["text"] for _ in range(3)]
+    assert len(set(lines)) == 3, f"同句连播回归: {lines}"
 
 
 def test_load_manifest_shape(tmp_path):

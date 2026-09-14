@@ -590,15 +590,25 @@ class FillerDirector:
             return None
         # 分类器回退层(2026-09-13):按场景类过滤 manifest 池(manifest 条目带
         # cat 标签);该类无条目 → default 标签池 → 整池(既有行为)。
+        preferred = pool
         if category:
             cat_pool = [e for e in pool if e.get("cat") == category]
             if not cat_pool:
                 cat_pool = [e for e in pool if e.get("cat") == "default"]
             if cat_pool:
-                pool = cat_pool
-        # 随机不重样(同垫话连续两轮最刺耳):池里剔除上两句后随机,池小才允许重复。
+                preferred = cat_pool
+        # 随机不重样(同垫话连续两轮最刺耳):池里剔除上两句后随机。
+        # 优先池被去重清空 → 向整池放宽再挑,而不是原样落回单条池——旧版
+        # `or list(pool)` 兜底在分类池只有 1 条时把同一条放回,同句连播
+        # (2026-09-14 call-c76832ac 实证:cantonese default 池=1 条,
+        # 「冇問題，你稍等多一陣…」4 分钟播 3 次)。只有整池都在去重窗内
+        # 才允许重复(池太小没有别的可选)。
         recent = set(self._recent[-2:])
-        candidates = [e for e in pool if e["file"] not in recent] or list(pool)
+        candidates = [e for e in preferred if e["file"] not in recent]
+        if not candidates and preferred is not pool:
+            candidates = [e for e in pool if e["file"] not in recent]
+        if not candidates:
+            candidates = list(pool)
         entry = random.choice(candidates)
         self._recent.append(entry["file"])
         return entry
