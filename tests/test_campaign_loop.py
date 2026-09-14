@@ -298,6 +298,24 @@ def test_gap_cooldown_ignores_skipped_anchor():
     assert repo.list_items(c["id"])[1]["status"] == "dialing"
 
 
+def test_tick_snapshots_campaign_template_into_call():
+    """战役选定的话术建单即快照——此前该字段只存不读，运营选的话术被静默忽略。"""
+    repo = InMemoryBusinessRepository()
+    obj = repo.create_object("acc-001", {"display_name": "A", "phone": "+85211111111"})
+    c = repo.create_campaign("acc-001", name="t", template_id="tpl-wave",
+                             persona_id="", language="zh", gap_seconds=5,
+                             object_ids=[obj["id"]])
+    repo.update_campaign(c["id"], status="running")
+    started: list[str] = []
+
+    async def fake_dispatch(room: str, metadata: str) -> None:
+        started.append(room)
+
+    asyncio.run(campaign_tick(repo, dispatcher=fake_dispatch))
+    assert len(started) == 1
+    assert repo.get_call(started[0])["template_id"] == "tpl-wave"
+
+
 async def _noop_dispatch(room: str, metadata: str) -> None:  # pragma: no cover
     raise AssertionError("不应派发")
 

@@ -116,6 +116,16 @@
 - 拒绝收线：客户明确拒绝/告别（`flow.py` REFUSE 判定）→ agent 注入收尾话术讲一句
   礼貌再见，随后 `POST /api/supervisor/{id}/end` 置 `ended` + `disposition=declined`
   并断房，结算由 agent `_on_close` 幂等触发。
+- **静默旁听（2026-09-14 路线 A）**：`POST /api/supervisor/{id}/listen` 签发
+  `purpose=listen` token（can_publish/can_publish_data=False、can_subscribe=True），
+  **不挂 RoomConfiguration、不翻通话状态**（听一通 paused 不得把它恢复 active）；
+  被听方无任何提示（产品拍板），`supervisor.listen.start`（签发即记）+
+  `/listen/stop`（补时长）双审计。web 入口 `/supervisor?listen=<id>`，
+  `ListenPanel` 用官方 LiveKitRoom 只订阅、绝不发布麦克风。
+- **主管台真实化（2026-09-14）**：通话卡片直接操作（暂停/恢复/接管/转人工/挂断，均 confirm），
+  卡片展示 对象/语言/当前话术步/已进行时长/最近一句客户话（`/api/calls/{id}/turns` 的
+  template_step/speaker，3–4s 轮询只跑在途通话）；「进入工作台」深链 `/calls?call=<id>`；
+  原「质量监控/纪律控制」占位卡已删。
 
 ### 外呼战役（mock 档，spec 2026-09-12-outbound-campaign-roster）
 
@@ -156,6 +166,11 @@ web /campaigns（建波/启停/进度表）
 - mock 剧本钩子（`scenarios`/`scripts`/`mock_speak_interval_s`）只服务演练与 E2E；
   campaign 级存 `campaigns.scripts_json`（无独立列，`__` 前缀键放 campaign 级参数），
   起拨时按 object_id 取台词塞进 dial 块 `script`。真实 SIP 拨号恒为空。
+- **话术快照（2026-09-14）**：`campaigns.template_id` 由 `_start_call` 写入建单
+  （`POST /api/calls` 的 `template_id`），agent 装配读 `call_sessions.template_id`
+  优先、回落对象卡绑定——此前该字段只存不读，运营在战役里选的话术被静默忽略。
+- **删除战役**：`DELETE /api/campaigns/{id}`——running 拒删（409，先停止），
+  删除连名单项一起清并审计 `campaign.delete`。
 - 全链路 E2E：`python scripts/e2e_campaign.py`（3 对象战役——1 接通走完话术+captured
   入名册 / 1 无人接 / 1 接通即挂；断言串行、终态三态、名册入册与 handled 回写）。
 
@@ -232,6 +247,10 @@ WorkerOptions.port)——默认同为 8081 会竞态,后绑者 Errno 48 即崩
 | 服务绑定 | 127.0.0.1 | 仅本机可访问 |
 
 ### 设置（`/api/settings`，Agent 运行时会真实消费）
+
+> web 设置页（2026-09-14 路线 A 瘦身）：主视图只留「语音与凭据 / 音频设备 / 外呼 SIP /
+> 罐头试听 / 本机桌面服务」；ASR/LLM/VAD/运行策略收进底部「开发者参数」折叠区。
+> 默认值不变、PUT 载荷形状不变（CP 零改动）。
 
 - `asr.provider`：`qwen3_asr`（本地 sidecar）/ `fake`（仅测试）。语言值统一 `zh/cantonese/en`（粤语全时空唯一拼写 `cantonese`）；agent 在会话语言为粤语时给 sidecar 传 `language=cantonese` 强制模型按粤语转写，避免 auto 误判成普通话。
 - `llm.provider`：`local_openai`/`mlx`（本地）/ `deepseek`（云端，缺 `api_key` 显式告警并回退本地）/ `fake`。

@@ -175,6 +175,9 @@ async def _start_call(repo, campaign: dict, item: dict, dispatcher: Dispatcher) 
         account_id=str(campaign.get("account_id") or DEFAULT_ACCOUNT_ID),
         object_id=str(item.get("object_id") or ""),
         persona_id=str(campaign.get("persona_id") or ""),
+        # 战役选定的话术建单即快照(agent 装配读通话快照优先)——此前该字段
+        # 只存不读,运营在战役里选的话术被静默忽略、通话仍走对象卡绑定话术。
+        template_id=str(campaign.get("template_id") or ""),
         mode=CallMode.LIVE,
         direction="outbound",
         language=str(campaign.get("language") or "zh"),

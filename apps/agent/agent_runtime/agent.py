@@ -1281,11 +1281,15 @@ async def entrypoint(ctx):
         context_state = ContextState.from_env(account_id=account_id)
         object_id = call.get("object_id", "")
         persona_id = call.get("persona_id", "")
+        # 话术来源优先级:通话快照(建单时显式指定,如外呼战役/话务员自选)> 对象卡绑定。
+        # 快照优先让「战役选的话术」真正生效,同时保住「改话术不回溯历史通话」的语义
+        # (call_sessions.template_id 建单即冻结)。老数据快照为空→原行为。
+        template_id = str(call.get("template_id") or "")
         if object_id:
             object_card = await cp.get_object(object_id)
-            template_id = (object_card or {}).get("template_id", "")
-            if template_id:
-                template = await cp.get_template(template_id)
+            template_id = template_id or (object_card or {}).get("template_id", "")
+        if template_id:
+            template = await cp.get_template(template_id)
         if persona_id:
             persona = await cp.get_persona(persona_id)
         # 对象档案静态注入（P1）：一次装配、set_object_brief 至多一次，字节静态进

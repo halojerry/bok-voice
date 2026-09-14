@@ -910,6 +910,18 @@ class SqlAlchemyBusinessRepository:
         )
         return self._item_to_dict(row) if row else None
 
+    def delete_campaign(self, campaign_id: str) -> bool:
+        """删战役及其名单项（items 无独立生命周期，随战役一并清除）。"""
+        row = self.session.get(models.Campaign, campaign_id)
+        if not row:
+            return False
+        self.session.query(models.CampaignItem).filter(
+            models.CampaignItem.campaign_id == campaign_id
+        ).delete(synchronize_session=False)
+        self.session.delete(row)
+        self.session.commit()
+        return True
+
     @staticmethod
     def default_settings() -> dict:
         return {
@@ -1521,3 +1533,13 @@ class InMemoryBusinessRepository:
             if row["call_id"] == call_id:
                 return dict(row)
         return None
+
+    def delete_campaign(self, campaign_id: str) -> bool:
+        """见 SqlAlchemyBusinessRepository.delete_campaign（内存替身同语义）。"""
+        if campaign_id not in self.campaigns:
+            return False
+        del self.campaigns[campaign_id]
+        for item_id in [iid for iid, r in self.campaign_items.items()
+                        if r["campaign_id"] == campaign_id]:
+            del self.campaign_items[item_id]
+        return True
