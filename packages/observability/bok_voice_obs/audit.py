@@ -49,7 +49,8 @@ class AuditEvent:
         out["object_id"] = self.object_id or corr.object_id
         out["persona_id"] = self.persona_id or corr.persona_id
         if not out["actor"]:
-            out["actor"] = "system"
+            # B1：认证门禁把已验证身份写进 correlation.user_id——审计 actor 自动落账。
+            out["actor"] = corr.user_id or "system"
         return out
 
 

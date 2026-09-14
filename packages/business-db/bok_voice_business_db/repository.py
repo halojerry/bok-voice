@@ -922,6 +922,58 @@ class SqlAlchemyBusinessRepository:
         self.session.commit()
         return True
 
+    # ---- users（三层 RBAC 账号；B1 身份内核。dict 出仓在 CP 层剥 password_hash）----
+
+    @staticmethod
+    def _user_to_dict(row: models.User) -> dict:
+        return {
+            "id": row.id, "org_id": row.org_id, "account_id": row.account_id,
+            "username": row.username, "display_name": row.display_name,
+            "role": row.role, "status": row.status,
+            "created_at": row.created_at.isoformat() if row.created_at else "",
+        }
+
+    def create_user(self, *, username: str, password_hash: str, role: str,
+                    org_id: str = "", account_id: str = "", display_name: str = "") -> dict:
+        row = models.User(
+            id=f"user-{_uuid()}", org_id=org_id, account_id=account_id,
+            username=username, password_hash=password_hash, display_name=display_name,
+            role=role, status="active",
+        )
+        self.session.add(row)
+        self.session.commit()
+        return self._user_to_dict(row)
+
+    def get_user(self, user_id: str) -> dict | None:
+        row = self.session.get(models.User, user_id)
+        return self._user_to_dict(row) if row else None
+
+    def get_user_by_username(self, username: str) -> dict | None:
+        row = (
+            self.session.query(models.User)
+            .filter(models.User.username == username)
+            .first()
+        )
+        return self._user_to_dict(row) if row else None
+
+    def list_users(self, account_id: str = "") -> list[dict]:
+        q = self.session.query(models.User)
+        if account_id:
+            q = q.filter(models.User.account_id == account_id)
+        rows = q.order_by(models.User.created_at.asc()).all()
+        return [self._user_to_dict(r) for r in rows]
+
+    def update_user(self, user_id: str, **fields: Any) -> dict | None:
+        row = self.session.get(models.User, user_id)
+        if not row:
+            return None
+        # 白名单：未知键（含 id/username/created_at/org_id/account_id）忽略，防两后端分叉。
+        for key in ("password_hash", "display_name", "role", "status"):
+            if key in fields and fields[key] is not None:
+                setattr(row, key, fields[key])
+        self.session.commit()
+        return self._user_to_dict(row)
+
     @staticmethod
     def default_settings() -> dict:
         return {
@@ -1007,6 +1059,7 @@ class InMemoryBusinessRepository:
         self.campaign_items: dict[str, dict] = {}
         self.filler_entries: dict[str, dict] = {}
         self.settings: dict = SqlAlchemyBusinessRepository.default_settings()
+        self.users: dict[str, dict] = {}
 
     def create_call(self, manifest: SessionManifest) -> dict:
         call_id = manifest.session_id or _uuid()
@@ -1376,6 +1429,45 @@ class InMemoryBusinessRepository:
         if call_id:
             items = [e for e in items if e.get("call_id") == call_id]
         return items[:limit]
+
+    # ---- users（三层 RBAC 账号；见 SQL 侧同款契约）----
+
+    def create_user(self, *, username: str, password_hash: str, role: str,
+                    org_id: str = "", account_id: str = "", display_name: str = "") -> dict:
+        user_id = f"user-{uuid.uuid4().hex[:12]}"
+        row = {
+            "id": user_id, "org_id": org_id, "account_id": account_id,
+            "username": username, "password_hash": password_hash,
+            "display_name": display_name, "role": role, "status": "active",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.users[user_id] = row
+        return dict(row)
+
+    def get_user(self, user_id: str) -> dict | None:
+        row = self.users.get(user_id)
+        return dict(row) if row else None
+
+    def get_user_by_username(self, username: str) -> dict | None:
+        for row in self.users.values():
+            if row["username"] == username:
+                return dict(row)
+        return None
+
+    def list_users(self, account_id: str = "") -> list[dict]:
+        rows = [dict(r) for r in self.users.values()
+                if not account_id or r["account_id"] == account_id]
+        return sorted(rows, key=lambda r: r["created_at"])
+
+    def update_user(self, user_id: str, **fields: Any) -> dict | None:
+        row = self.users.get(user_id)
+        if not row:
+            return None
+        # 与 SQL 侧同款白名单：未知键（含 id/username/created_at/org_id/account_id）忽略。
+        for key in ("password_hash", "display_name", "role", "status"):
+            if key in fields and fields[key] is not None:
+                row[key] = fields[key]
+        return dict(row)
 
     # ---- roster（名册认领池）----
 

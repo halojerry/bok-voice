@@ -40,6 +40,33 @@ class ListenStopRequest(BaseModel):
     seconds: int = 0
 
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class ChangePasswordRequest(BaseModel):
+    old_password: str
+    # 最低 8 位，校验在端点侧（scrypt hash 见 control_plane/auth.py）。
+    new_password: str
+
+
+class CreateUserRequest(BaseModel):
+    username: str
+    password: str
+    role: str = "user"  # root/admin/user
+    org_id: str = ""
+    account_id: str = ""
+    display_name: str = ""
+
+
+class UpdateUserRequest(BaseModel):
+    password: str = ""  # 非空=重置密码
+    status: str = ""  # active/disabled
+    display_name: str = ""
+    role: str = ""  # 仅 root 可改
+
+
 class CreateCallRequest(BaseModel):
     account_id: str
     # 同传会话(kind=interpret)没有客服对象,允许空。
