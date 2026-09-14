@@ -793,6 +793,44 @@ def test_wa_numberish_and_announce_head():
     assert _WA_ANNOUNCE_HEAD_RE.search("你係咪加我WhatsApp呀") is None
 
 
+def test_wa_question_gate_blocks_staging():
+    """疑问/算式句唔进号码累积暂存(2026-09-14 call-c76832ac:「一加一等于几？」
+    连问两轮被 accumulate+StopResponse 静默吞掉,flush 后回「请继续报号码」答非所问)。
+    标记词=报号碎片结构性唔会出现的提问/算术词。"""
+    from agent_runtime.agent import _wa_numberish, _wa_questionish
+
+    # 真实事故句:numberish 判真(一一=2 数字/剩「加等于几」≤6)但语境门必须拦住
+    assert _wa_numberish("一加一等于几？") is True
+    assert _wa_questionish("一加一等于几？") is True
+    # 中文疑问/算式族
+    assert _wa_questionish("three减one等于几多") is True
+    assert _wa_questionish("呢个要几钱啊？") is True
+    assert _wa_questionish("你点解问我啊？") is True
+    assert _wa_questionish("呢个係咩嚟㗎？") is True
+    # 英文族
+    assert _wa_questionish("1 plus 1 equals?") is True
+    assert _wa_questionish("What is 3 times 4") is True
+    # 报号碎片照旧唔被拦(回归):纯数字/自报头/渠道词+数字
+    assert _wa_questionish("我的WhatsApp係六四三") is False
+    assert _wa_questionish("六四三二五四三二") is False
+    assert _wa_questionish("Zero was three") is False
+    assert _wa_questionish("我的WhatsApp是。") is False
+    # 裸「等」「点/點」唔入标记词:「三点」「等阵」係正常会话词,唔可以误拦
+    assert _wa_questionish("而家三点") is False
+    assert _wa_questionish("我等阵再讲") is False
+
+
+def test_wa_stash_decision_has_question_gate():
+    """源码级:暂存判定必须过 _wa_questionish(接线点喺 nested closure,冇法直接单测)。"""
+    import agent_runtime.agent as ag
+
+    src = Path(ag.__file__).read_text(encoding="utf-8")
+    gate_pos = src.index("and not _wa_questionish(_merged)")
+    stash_pos = src.index("_stash_it = (")
+    assert stash_pos < gate_pos < src.index("if _stash_it:")
+    assert "_WA_QUESTION_MARKERS" in src
+
+
 def test_wa_confirm_guard_shared_rule_and_judge():
     from agent_runtime.flow import wa_confirm_advance_allowed
 

@@ -408,6 +408,23 @@ def _wa_numberish(text: str) -> bool:
     return digits >= 1 and len(rest) <= 6
 
 
+# 疑问/算式标记(2026-09-14,call-c76832ac):客户喺收号码步问「一加一等于几？」
+# 连问两轮——「一一」被归一成 2 个数字、剩「加等于几」≤6 字,误中 numberish 被
+# 暂存 + StopResponse 吞声,5s flush 后回「请继续报WhatsApp号码」答非所问。
+# 标记词係报号碎片结构性唔会出现的提问/算术词:命中即唔当报号碎片暂存,
+# 走正常轮次俾 LLM 接住。唔收裸「等」「點/点」(「三点」「等阵」係正常会话词)。
+_WA_QUESTION_MARKERS = re.compile(
+    r"加|減|减|乘|除|等于|等於|幾|几|乜|咩|甚麼|什麼|什么|嗎|吗|麼|么|點解|点解|"
+    r"plus|minus|times|divided|multiplied|equals?\b",
+    re.IGNORECASE,
+)
+
+
+def _wa_questionish(text: str) -> bool:
+    """疑问/算式句:含提问或算术标记 ⇒ 不暂存、不 StopResponse,走正常轮次。"""
+    return bool(_WA_QUESTION_MARKERS.search(text))
+
+
 def _wa_accum_merge(stashed: str, incoming: str) -> str:
     """累积合并:「结合上下文」的正确姿势(call-5f8bef6b 实证)。
 
@@ -2604,6 +2621,9 @@ async def entrypoint(ctx):
                     _n = sum(ch.isdigit() for ch in _digit_normalize(_merged))
                     _stash_it = (
                         not _WHATSAPP_DECLINE.search(user_text.lower())
+                        # 疑问/算式句唔暂存(2026-09-14 call-c76832ac:「一加一等于几？」
+                        # 连问两轮被静音;标记词报号碎片唔会出现,见 _wa_questionish)。
+                        and not _wa_questionish(_merged)
                         and (
                             (_wa_numberish(_merged) and 0 < _n < _WA_ACCUM_MIN_DIGITS)
                             or (_n == 0 and _WA_ANNOUNCE_HEAD_RE.search(user_text.strip()))
