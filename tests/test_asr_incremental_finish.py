@@ -278,3 +278,58 @@ def test_trimmed_window_partial_keeps_covered_none():
     final = svc.finish(sid)
     assert final["text"] == PARTIAL_TEXT  # 整句兜底结果
     assert calls[-1] == 16000 * 6  # 整句解码喂全 buffer(头段 partial 从未见过)
+
+
+# ---- 覆盖可信度门（2026-09-12 外呼 E2E 实证的头丢修复） ----
+
+def test_short_partial_rejected_falls_back_to_full_decode():
+    """partial 文本短到不可能是 covered 秒音频的转写 → 拒用增量、整句兜底。
+
+    实证场景：partial=2 字却声称覆盖 2.6s（窗起点切在语音中间），当 FINAL 头部
+    会静默丢掉前半句；号码句首数字丢失即此因。
+    """
+    mod = _load_sidecar_app()
+    calls: list[int] = []
+
+    class _Model:
+        def generate(self, wav, language=None, max_tokens=256, system_prompt=None):
+            calls.append(len(wav))
+            n = len(wav)
+            text = "他。的再见。" if n > 16000 else "四三二零一一一。"
+            return types.SimpleNamespace(text=text, language=["Chinese"])
+
+    svc = mod.ASRService()
+    svc._model = _Model()
+    sid = svc.start(language="zh")
+    svc._sessions[sid]["last_partial_at"] = 0.0
+    svc.chunk(sid, VOICED * (16000 * 3))  # 3s:partial 文本 2 字 → 远低于 2 字/秒下限
+    assert svc._sessions[sid]["partial_covered"] is not None
+    final = svc.finish(sid)
+    # 兜底整句（而非 partial 头部 + tail 拼接）
+    assert final["text"] == "他。的再见。"
+    assert calls[-1] == 16000 * 3  # 最后一路喂的是整个 buffer
+
+
+def test_plausible_partial_still_uses_incremental_path():
+    """正常密度的 partial（字/秒达标）仍走增量快路——修复不能把提速整体关掉。"""
+    mod = _load_sidecar_app()
+    calls: list[int] = []
+
+    class _Model:
+        def generate(self, wav, language=None, max_tokens=256, system_prompt=None):
+            calls.append(len(wav))
+            # 长输入=partial 整段（10 字），短输入=尾巴
+            return types.SimpleNamespace(
+                text=PARTIAL_TEXT if len(wav) > 16000 else TAIL_TEXT,
+                language=["Cantonese"],
+            )
+
+    svc = mod.ASRService()
+    svc._model = _Model()
+    sid = svc.start(language="cantonese")
+    svc._sessions[sid]["last_partial_at"] = 0.0
+    svc.chunk(sid, VOICED * (16000 * 2))  # 2s:PARTIAL_TEXT 10 字 ≥ 4 字下限
+    svc._sessions[sid]["chunks"].extend(VOICED * 8000)  # 0.5s 尾巴
+    final = svc.finish(sid)
+    assert final["text"] == PARTIAL_TEXT + TAIL_TEXT  # 增量拼接生效
+    assert calls[-1] == 8000  # 只解尾巴

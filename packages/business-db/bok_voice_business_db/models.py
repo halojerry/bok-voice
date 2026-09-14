@@ -115,6 +115,62 @@ class CallSession(Base):
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
+class RosterEntry(Base):
+    """名册（认领池）：通话中捕获的客户 WhatsApp/微信号码，专员认领后对接。
+
+    去重键 = account+object+channel+number 且 status != handled；captured 自动入册。
+    status: unclaimed(待认领) / claimed(已认领) / handled(已对接)。
+    """
+    __tablename__ = "roster_entries"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(64), index=True)
+    call_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    object_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    channel: Mapped[str] = mapped_column(String(16), default="whatsapp")
+    number: Mapped[str] = mapped_column(String(64), default="")
+    display_name: Mapped[str] = mapped_column(String(255), default="")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(16), default="unclaimed")
+    claimed_by: Mapped[str] = mapped_column(String(64), default="")
+    claimed_at: Mapped[datetime | None] = mapped_column(default=None)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class Campaign(Base):
+    """外呼战役:对象名单串行逐个拨(spec Wave3)。status: draft/running/paused/done/stopped。"""
+    __tablename__ = "campaigns"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(64), index=True)
+    name: Mapped[str] = mapped_column(String(255), default="")
+    template_id: Mapped[str] = mapped_column(String(64), default="")
+    persona_id: Mapped[str] = mapped_column(String(64), default="")
+    language: Mapped[str] = mapped_column(String(16), default="zh")
+    status: Mapped[str] = mapped_column(String(16), default="draft")
+    gap_seconds: Mapped[int] = mapped_column(Integer, default=5)
+    # mock 演练台词：object_id → [句子]，JSON 串。与 scenario 同 spirit 的测试钩子
+    # （生产空）。campaign 级存一份（item.scenario 只有 16 字符放不下台词），
+    # 起拨时按 item.object_id 取出来塞进 dial 块 `script`。
+    scripts_json: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(default=None)
+
+
+class CampaignItem(Base):
+    """战役单条:一个对象一通。scenario=mock 剧本钩子(测试/演练用,生产空)。"""
+    __tablename__ = "campaign_items"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    campaign_id: Mapped[str] = mapped_column(String(64), index=True)
+    seq: Mapped[int] = mapped_column(Integer, default=0)
+    object_id: Mapped[str] = mapped_column(String(64), default="")
+    phone: Mapped[str] = mapped_column(String(64), default="")
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    call_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=1)
+    last_error: Mapped[str] = mapped_column(String(255), default="")
+    scenario: Mapped[str] = mapped_column(String(16), default="")
+    updated_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
 class Turn(Base):
     __tablename__ = "turns"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -171,6 +227,9 @@ class GlobalSetting(Base):
     llm_json: Mapped[str] = mapped_column(Text, default="{}")
     tts_json: Mapped[str] = mapped_column(Text, default="{}")
     vad_json: Mapped[str] = mapped_column(Text, default="{}")
+    # 外呼（SIP）配置段（spec 2026-09-12 Wave2）：mode/trunk/主叫号/超时/许可号码。
+    # 空串=老库尚未补列或从未保存 → 读侧回落 default_settings()["sip"]。
+    sip_json: Mapped[str] = mapped_column(Text, default="")
     policy: Mapped[str] = mapped_column(String(64), default="offline_first")
     updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
 

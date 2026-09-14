@@ -6,6 +6,8 @@ import type { ReactNode } from "react";
 
 const NAV = [
   { href: "/calls", label: "会话" },
+  { href: "/roster", label: "名册" },
+  { href: "/campaigns", label: "外呼" },
   { href: "/objects", label: "对象" },
   { href: "/knowledge", label: "知识库" },
   { href: "/personas", label: "人设" },
