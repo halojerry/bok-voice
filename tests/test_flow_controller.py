@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -710,6 +711,24 @@ _WA_STEP = {
     "goal": "引导办理:请客户提供自己嘅{聯絡方式}号码,安排银联理赔专员对接",
     "ref": "唔该你留個{聯絡方式}號碼俾我哋，我哋安排專員加你。\n客户报出号码 → 复述确认。",
 }
+
+
+def test_wa_step_return_hint_helper():
+    """收号码步→带回提示;普通步→空串(2026-09-14 call-807629ca 接线门)。"""
+    from agent_runtime.agent import _WA_RETURN_HINT, _wa_step_return_hint
+    from agent_runtime.flow import FlowController
+
+    wa = FlowController.from_template(
+        {"steps_json": json.dumps([_WA_STEP], ensure_ascii=False)}, OBJ
+    )
+    assert _wa_step_return_hint(wa) == _WA_RETURN_HINT
+    plain = FlowController.from_template(
+        {"steps_json": '[{"goal":"核对身份","ref":"请问是{姓名}吗"}]'}, OBJ
+    )
+    assert _wa_step_return_hint(plain) == ""
+    # 无步骤(has_steps=False)照给空串,不抛
+    empty = FlowController.from_template({}, OBJ)
+    assert _wa_step_return_hint(empty) == ""
 
 
 def _wa(text: str):

@@ -824,6 +824,9 @@ class ContextState:
         self.rag_enabled: bool = False
         # WhatsApp 已捕获号码（注入尾部,防 LLM 复述错号——2026-09-06 实测尾号读错）
         self._whatsapp_note: str = ""
+        # 收号码步未捕获时的「带回本步」提示（2026-09-14）：agent 侧按当前步是否
+        # 收号码步计算、随 set_flow_current 传入；捕获号码后渲染侧自动撤下。
+        self._return_hint: str = ""
         # 追加式尾部账本（KV-cache 铁律 2026-09-05）：记录每个 user 消息被
         # ContextAwareLLM 拼上的易变尾部（原文, 原文+尾部, 当时 revision），FIFO
         # 对应历史里的 user 消息。下一轮请求把历史中的旧 user 重放成「原文+当时的
@@ -853,15 +856,20 @@ class ContextState:
             self._whatsapp_note = v
             self._revision += 1
 
-    def set_flow_current(self, current: str) -> None:
+    def set_flow_current(self, current: str, *, return_hint: str = "") -> None:
         """每轮更新当前步约束(flow controller 推进后调用)。
 
         内容实质变化才 +revision:每轮同值重复 set 唔虚增;【新一步】一次性提示
         在下一轮消失亦算变化(重建轮据此把末条 user 尾部对齐到当前版)。
+
+        return_hint(2026-09-14,call-807629ca):收号码步未捕获时的「答完带回本步」
+        提示,渲染进尾部(捕获号码后由渲染侧自动撤下——见 render_context_tail)。
         """
         current = current or ""
-        if current != self._flow_current:
+        hint = return_hint or ""
+        if current != self._flow_current or hint != self._return_hint:
             self._flow_current = current
+            self._return_hint = hint
             self._revision += 1
 
     def add_call_fact(self, text: str, limit: int = 4) -> None:
@@ -1086,6 +1094,10 @@ class ContextState:
             "例：客户问「你们是哪里的」→「我们是帮你收发转运的集运仓库。」"
             "例：客户说「我不记得了」→「没关系，我这边帮您一起核对。」"
             "例：客户问「为什么是这个数」→「是按对应标准算的，您的情况适用这一档。」"
+            # 业务外问题也算「客户问什么」(2026-09-14 call-807629ca):客户喺收号码步
+            # 用「一加一等于几」试模型,4B 只答「等于二」不带回本步、对话停摆。闲聊/
+            # 考你类必须先答一句再带回——这条就是给非业务输入的模仿样本。
+            "例：客户问业务外的小问题（如「一加一等于几」）→「等于二。我们先把正事办完，麻烦您报一下联系方式。」"
             "每个例子都一样：先答客户问的事，不念稿、不重复上一句，答完自然带回流程。"
         )
         # 情绪标签试点（专项 C4,EMOTION_TAG_PILOT=1 选入;EMOTION_TAG_PROMPT=0
@@ -1139,6 +1151,8 @@ class ContextState:
         if slim:
             _step_head = (self._flow_current.strip().splitlines() or [""])[0]
             parts.append(f"【{_step_head or '流程'}·继续】状态无实质变化，按上文同一步要求继续。")
+            if self._return_hint and not self._whatsapp_note:
+                parts.append("【带回本步】" + self._return_hint)
             if self._whatsapp_note:
                 parts.append("【已记录客户 WhatsApp】" + self._whatsapp_note)
             if self._last_reply:
@@ -1159,6 +1173,9 @@ class ContextState:
         if self._flow_current:
             # 当前步约束(随 flow 推进而变):放尾部最前,推进只改这里、前缀字节不动。
             parts.append("【现在这一步】\n" + self._flow_current)
+        if self._return_hint and not self._whatsapp_note:
+            # 收号码步(未捕获)的「答完带回本步」提示,见 set_flow_current 注释。
+            parts.append("【带回本步】" + self._return_hint)
         if self._last_reply:
             # 重复锚(截短版,2026-09-12 P0):旧版把上一句全文引在尾部,等于把
             # 抄袭素材递到 4B 嘴边(call-8fa17d2b 两轮回复一字不差实证)。只示

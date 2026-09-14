@@ -148,6 +148,9 @@ def filler_match_threshold() -> float:
 # B安抚 > A确认接收 > C查证 > D短应承 > E默认。铁律:A/B/D/E 类垫话零动作
 # 动词(治 285 条配对实证「问赔多少→马上查」式穿帮,动作词只准进 C 类——
 # 客户真的在要进度时才承诺查)。
+# 零动作类集合(default/minimal/ack):_pick 放宽时也只在这几类里选,
+# 防非业务轮抽到 check 类动作词(见 _pick 注释)。
+_ZERO_ACTION_CATS = ("default", "minimal", "ack")
 _FILLER_CAT_EMPATHY_RE = re.compile(
     r"(投诉|投訴|嬲|闹|鬧|爛|烂|冇到|未到|太耐|太长|太長|激气|激氣|生气|生氣|着急|著急|过分|過分|"
     r"complain|unacceptable|too slow|frustrat)",
@@ -598,15 +601,24 @@ class FillerDirector:
             if cat_pool:
                 preferred = cat_pool
         # 随机不重样(同垫话连续两轮最刺耳):池里剔除上两句后随机。
-        # 优先池被去重清空 → 向整池放宽再挑,而不是原样落回单条池——旧版
+        # 优先池被去重清空 → 放宽再挑,而不是原样落回单条池——旧版
         # `or list(pool)` 兜底在分类池只有 1 条时把同一条放回,同句连播
         # (2026-09-14 call-c76832ac 实证:cantonese default 池=1 条,
         # 「冇問題，你稍等多一陣…」4 分钟播 3 次)。只有整池都在去重窗内
         # 才允许重复(池太小没有别的可选)。
+        # 零动作类请求(default/minimal/ack)的放宽档也限制在零动作池
+        # (2026-09-14 call-807629ca):动作词只准进 check 类(0913 乙节铁律),
+        # 旧版放宽到整池时,非业务轮会抽到 check 类动作词(「一加一等于几？」
+        # 的垫话放出「我即刻帮你核实」)。整池兜底仅当零动作池全在去重窗内。
+        second = pool
+        if category in _ZERO_ACTION_CATS:
+            zero = [e for e in pool if e.get("cat") in _ZERO_ACTION_CATS]
+            if zero:
+                second = zero
         recent = set(self._recent[-2:])
         candidates = [e for e in preferred if e["file"] not in recent]
         if not candidates and preferred is not pool:
-            candidates = [e for e in pool if e["file"] not in recent]
+            candidates = [e for e in second if e["file"] not in recent]
         if not candidates:
             candidates = list(pool)
         entry = random.choice(candidates)

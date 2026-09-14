@@ -353,6 +353,50 @@ def test_real_manifest_cantonese_default_no_three_peat():
     assert len(set(lines)) == 3, f"同句连播回归: {lines}"
 
 
+def test_zero_action_categories_never_pick_check_lines(tmp_path):
+    """零动作类请求(default/minimal/ack)的放宽档不得落进 check 类
+    (2026-09-14 call-807629ca:「一加一等于几？」的垫话放出「我即刻帮你核实」
+    ——动作词只准进 check 类,非业务轮不许抽到)。"""
+
+    async def _case():
+        pools = {"cantonese": ["万能垫话。", "应承一。", "应承二。", "忙紧查。"]}
+        cats = {"cantonese": ["default", "ack", "ack", "check"]}
+        d, _ = _director(tmp_path, pools=pools, cats=cats)
+        # 连抽超过零动作池容量(3 条)也不得抽到 check —— 整池兜底仅在第 4 抽出现
+        picked_cats = []
+        for _ in range(3):
+            e = d._pick("cantonese", "default")
+            picked_cats.append(e["cat"])
+            assert e["cat"] in {"default", "ack"}, f"非业务轮抽到动作词类: {e}"
+        assert d._pick("cantonese", "default")["cat"] in {"default", "ack", "check"}  # 全窗后整池兜底
+
+    _run(_case())
+
+
+def test_check_category_still_allows_check_lines(tmp_path):
+    """check 类请求(客户真要进度)照旧只从 check 抽,不受零动作约束影响。"""
+
+    async def _case():
+        pools = {"cantonese": ["万能垫话。", "应承一。", "忙紧查。", "帮您睇下。"]}
+        cats = {"cantonese": ["default", "ack", "check", "check"]}
+        d, _ = _director(tmp_path, pools=pools, cats=cats)
+        for _ in range(2):
+            assert d._pick("cantonese", "check")["cat"] == "check"
+
+    _run(_case())
+
+
+def test_classify_offtopic_question_is_default():
+    """业务外问题(算数/闲聊)分类到 default(零动作池),不得落 check——
+    该分类是 2026-09-14 垫话穿帮修复的上游信号。"""
+    from agent_runtime.fillers import classify_filler_category
+
+    assert classify_filler_category("一加一等于几？") == "default"
+    assert classify_filler_category("你今日食咗饭未啊") == "default"
+    # 真要进度的问句仍归 check(动作词合法语境)
+    assert classify_filler_category("我个件几时到") == "check"
+
+
 def test_load_manifest_shape(tmp_path):
     assets = _make_assets(tmp_path, {"zh": ["好的，您稍等。"]})
     m = load_manifest(assets)

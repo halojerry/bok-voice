@@ -425,6 +425,37 @@ def _wa_questionish(text: str) -> bool:
     return bool(_WA_QUESTION_MARKERS.search(text))
 
 
+# 收号码步「答完带回本步」提示(2026-09-14,call-807629ca):客户喺收号码步问无关
+# 问题(闲聊/考你/算数)时,4B 只答问嗰句、唔带回本步,对话停摆。当前步=收号码步
+# → 尾部【现在这一步】后附一行带回提示(渲染侧在号码已捕获时自动撤下,见
+# ContextState.render_context_tail)。语言纯度:呢句无条件进每通通话的尾部,
+# 必须标准书面中文(test_zh_prompt_purity_no_cantonese_marks 钉死)。
+_WA_RETURN_HINT = (
+    "客户问与本步无关的问题（闲聊、考你、算数等）时：先用一句直接回答他，"
+    "再用一句把话题带回本步——请客户报号码；说完停下等客户回应。"
+)
+
+
+def _wa_step_return_hint(fc) -> str:
+    """当前步是收号码步 → 带回提示文本;无步骤/异常 → 空串(零提示)。"""
+    try:
+        from .flow import _looks_like_whatsapp_step
+
+        goal, ref = fc.current_goal_ref()
+        return _WA_RETURN_HINT if _looks_like_whatsapp_step(goal, ref) else ""
+    except Exception:  # noqa: BLE001 - 无步骤/异常=无提示
+        return ""
+
+
+def _sync_current_step(ctx, fc) -> None:
+    """推进/开场各点共用的尾部同步:当前步文本 + 收号码步带回提示一起写入。
+
+    取代四处裸 set_flow_current(flow_ctrl.current_step_text())——带回提示必须
+    跟当前步同源更新,漏一处就有一处推进后提示不撤/不挂。
+    """
+    ctx.set_flow_current(fc.current_step_text(), return_hint=_wa_step_return_hint(fc))
+
+
 def _wa_accum_merge(stashed: str, incoming: str) -> str:
     """累积合并:「结合上下文」的正确姿势(call-5f8bef6b 实证)。
 
@@ -2531,7 +2562,7 @@ async def entrypoint(ctx):
                         )
                     elif wa_confirm_advance_allowed(goal=_gj, ref=_rj, captured=_wa_captured["on"]):
                         flow_ctrl.advance()
-                        context_state.set_flow_current(flow_ctrl.current_step_text())
+                        _sync_current_step(context_state, flow_ctrl)
                         print(f"[flow] judge(bg)=confirm step={flow_ctrl.current + 1} (call {room_name})", flush=True)
                     else:
                         print(f"[flow] judge(bg)=confirm blocked (wa step, not captured) step={step_at + 1} (call {room_name})", flush=True)
@@ -2911,7 +2942,7 @@ async def entrypoint(ctx):
                             if _judge_inflight["step"] != _step_at:
                                 _judge_inflight["step"] = _step_at
                                 asyncio.create_task(_background_flow_judge(_step_at, user_text))
-                    context_state.set_flow_current(flow_ctrl.current_step_text())
+                    _sync_current_step(context_state, flow_ctrl)
                 except Exception:  # pragma: no cover - 流程推进失败不阻断回复
                     pass
             # ---- DEFER 短应承车道(2026-09-12 P0「会说话」) ----
@@ -2957,7 +2988,7 @@ async def entrypoint(ctx):
             if _say_now:
                 flow_ctrl.note_step_said()
                 try:
-                    context_state.set_flow_current(flow_ctrl.current_step_text())
+                    _sync_current_step(context_state, flow_ctrl)
                 except Exception:  # noqa: BLE001
                     pass
                 try:
@@ -3321,7 +3352,7 @@ async def entrypoint(ctx):
         # 首条 user 尾部此时尚未冻结,保证预热形状 == turn-1 请求形状。
         flow_ctrl.opening_played = True
         if flow_ctrl.has_steps:
-            context_state.set_flow_current(flow_ctrl.current_step_text())
+            _sync_current_step(context_state, flow_ctrl)
         greeting_text = opening or GENERIC_GREETINGS.get(greet_lang, GENERIC_GREETINGS["zh"])
         # 预热与开场白并行:开场白=纯 TTS(云 MiniMax,本地缓存命中则 ~0ms),预热走
         # 本地 LLM prefill,互无争抢——旧顺序 say() 要等整段念完才返回(话术开场白

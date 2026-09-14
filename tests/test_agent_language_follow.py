@@ -281,6 +281,45 @@ def test_cantonese_prompt_keeps_hk_style():
     assert "不夹杂粤语" not in text  # zh 专属禁令不进 cantonese 装配
 
 
+def test_wa_return_hint_in_tail_and_purity():
+    """收号码步「答完带回本步」提示(2026-09-14 call-807629ca):未捕获进尾部、
+    捕获后自动撤下、语言纯度(标准书面中文——无条件进每通通话尾部)。"""
+    from agent_runtime.agent import _WA_RETURN_HINT
+    from agent_runtime.providers.livekit_plugins import ContextState
+
+    ctx = ContextState(account_id="acc-001")
+    ctx.set_user_language("zh")
+    ctx.set_flow("对话按 3 步流程推进:\n第1步:核对身份\n第2步:索取号码", "")
+    ctx.set_flow_current("流程第 2/3 步\n这一步要达成:向客户索取微信号", return_hint=_WA_RETURN_HINT)
+    tail = ctx.render_context_tail()
+    assert "【带回本步】" in tail and _WA_RETURN_HINT in tail
+    bad = sorted({ch for ch in _DIALECT_MARKS if ch in tail})
+    assert not bad, f"带回提示含粤语特征字: {bad}"
+    # 号码已捕获 → 提示撤下(渲染侧兜底,即使 agent 侧漏更新)
+    ctx.set_whatsapp_note("85264325432")
+    assert "【带回本步】" not in ctx.render_context_tail()
+    # 推进到非收号码步(return_hint 清空) → 提示消失
+    ctx2 = ContextState(account_id="acc-001")
+    ctx2.set_flow("对话按 2 步流程推进:\n第1步:核对", "")
+    ctx2.set_flow_current("流程第 1/2 步\n这一步要达成:核对身份", return_hint=_WA_RETURN_HINT)
+    assert "【带回本步】" in ctx2.render_context_tail()
+    ctx2.set_flow_current("流程第 2/2 步\n这一步要达成:道别", return_hint="")
+    assert "【带回本步】" not in ctx2.render_context_tail()
+
+
+def test_reply_examples_include_offtopic_then_return():
+    """静态前缀【回应范例】必须含「业务外问题→先答一句再带回」的模仿样本
+    (2026-09-14:4B 对非业务输入只答问、不带回;靠示例学形态远胜靠禁令)。"""
+    from agent_runtime.providers.livekit_plugins import ContextState
+
+    ctx = ContextState(account_id="acc-001")
+    ctx.set_user_language("zh")
+    prefix = ctx.render_instruction_prefix()
+    assert "业务外" in prefix and "一加一等于几" in prefix
+    bad = sorted({ch for ch in _DIALECT_MARKS if ch in prefix})
+    assert not bad, f"前缀含粤语特征字: {bad}"
+
+
 # ---- KV-cache 友好重组：稳定指令前缀在前、易变参考尾部在后 ----
 def test_render_split_prefix_has_instructions_tail_has_reference():
     from agent_runtime.providers.livekit_plugins import ContextState
