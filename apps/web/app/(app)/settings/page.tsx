@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { ErrorState, LoadingState } from "@/components/app-shell";
 import CannedAuditionCard from "@/components/canned-audition";
@@ -406,6 +406,99 @@ function AudioDevicesCard() {
   );
 }
 
+/** 设置页主视图只留最常用的语音字段；其余（base_url/采样率/分语言音色）收进「更多」。 */
+const VOICE_SIMPLE_KEYS = ["api_key", "voice_mode", "speaker", "instruct"];
+
+function FieldRow({
+  field,
+  kind,
+  provider,
+  value,
+  onChange,
+}: {
+  field: FieldMeta;
+  kind: ProviderKind;
+  provider: string;
+  value: unknown;
+  onChange: (v: unknown) => void;
+}) {
+  return (
+    <label className="block">
+      <span className="text-xs text-(--stage-muted)">{field.label}</span>
+      <FieldInput field={field} value={value} onChange={onChange} />
+      {field.hint && <p className="mt-1 text-xs muted">{field.hint}</p>}
+      {field.preview && kind === "tts" && (
+        <VoicePreview provider={provider} fieldKey={field.key} voice={String(value ?? "")} />
+      )}
+    </label>
+  );
+}
+
+/**
+ * 语音与凭据卡（主视图唯一保留的引擎卡）：provider + Key + 默认音色 + 语气指令。
+ * 分发形态下这些凭据由云端下发（spec §9）；单机形态仍从这里改。
+ */
+function VoiceCard({ value, onChange }: { value: ProviderForm; onChange: (next: ProviderForm) => void }) {
+  const meta = SETTING_CARDS.find((c) => c.kind === "tts")!;
+  const provider = String(value.provider ?? DEFAULT_PROVIDER.tts);
+  const providerMeta = meta.providers.find((p) => p.value === provider);
+  const visible = meta.fields.filter((f) => !f.advanced && (!f.providers || f.providers.includes(provider)));
+  const simple = visible.filter((f) => VOICE_SIMPLE_KEYS.includes(f.key));
+  const rest = visible.filter((f) => !VOICE_SIMPLE_KEYS.includes(f.key));
+  const advanced = meta.fields.filter((f) => f.advanced && (!f.providers || f.providers.includes(provider)));
+  return (
+    <section className="card">
+      <span className="label">语音与凭据</span>
+      <p className="mt-1 text-xs muted">
+        客户听到的声音与云端凭据（MiniMax / DeepSeek 等，持久化保存、重启不丢）。音色也可在「人设」页按人设绑定。
+      </p>
+      <div className="mt-3 space-y-2">
+        <div>
+          <select
+            className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+            value={provider}
+            onChange={(e) => onChange({ ...value, provider: e.target.value })}
+          >
+            {meta.providers.map((p) => (
+              <option key={p.value} value={p.value}>
+                {p.label}
+              </option>
+            ))}
+          </select>
+          {providerMeta?.hint && <p className="mt-1 text-xs muted">{providerMeta.hint}</p>}
+        </div>
+        {simple.map((field) => (
+          <FieldRow
+            key={field.key}
+            field={field}
+            kind="tts"
+            provider={provider}
+            value={value[field.key]}
+            onChange={(v) => onChange({ ...value, [field.key]: v })}
+          />
+        ))}
+        {(rest.length > 0 || advanced.length > 0) && (
+          <details className="rounded-lg border border-(--card-border) p-2 text-sm">
+            <summary className="cursor-pointer text-xs muted hover:text-accent">更多语音参数（服务地址 / 采样率 / 分语言音色）</summary>
+            <div className="mt-2 space-y-2">
+              {[...rest, ...advanced].map((field) => (
+                <FieldRow
+                  key={field.key}
+                  field={field}
+                  kind="tts"
+                  provider={provider}
+                  value={value[field.key]}
+                  onChange={(v) => onChange({ ...value, [field.key]: v })}
+                />
+              ))}
+            </div>
+          </details>
+        )}
+      </div>
+    </section>
+  );
+}
+
 export default function SettingsPage() {
   const [form, setForm] = useState<Record<string, any>>(EMPTY_FORM);
   const [loading, setLoading] = useState(true);
@@ -462,39 +555,55 @@ export default function SettingsPage() {
   const policyValue = form.policy ?? "offline_first";
   const policyOption = POLICY_META.options.find((o) => o.value === policyValue);
 
-  const kindCards = useMemo(() => SETTING_CARDS.map((c) => c.kind), []);
+  // 引擎参数收进「开发者参数」折叠区：语音卡之外的 ASR/LLM/VAD 与运行策略。
+  const devCards: ProviderKind[] = ["asr", "llm", "vad"];
 
   return (
     <div>
       <div className="mb-8">
         <h1 className="page-title">设置</h1>
-        <p className="page-sub">引擎 Provider · VAD 与打断 · 音频设备 · 运行策略</p>
+        <p className="page-sub">语音与凭据 · 音频设备 · 外呼 · 本机服务</p>
       </div>
 
       {loading ? (
         <LoadingState />
       ) : (
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-          {kindCards.map((kind) => (
-            <ProviderCard key={kind} kind={kind} value={form[kind] ?? {}} onChange={(next) => setForm({ ...form, [kind]: next })} />
-          ))}
+          <VoiceCard value={form.tts ?? {}} onChange={(next) => setForm({ ...form, tts: next })} />
           <AudioDevicesCard />
           <SipCard value={form.sip ?? {}} onChange={(next) => setForm({ ...form, sip: next })} />
           <CannedAuditionCard />
-          <section className="card">
-            <span className="label">{POLICY_META.title}</span>
-            <select
-              className="mt-3 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
-              value={policyValue}
-              onChange={(e) => setForm({ ...form, policy: e.target.value })}
-            >
-              {POLICY_META.options.map((o) => (
-                <option key={o.value} value={o.value}>{o.label}</option>
+          <div className="lg:col-span-2">
+            <DesktopStatus />
+          </div>
+          <details className="rounded-xl border border-(--card-border) bg-(--card) p-4 lg:col-span-2">
+            <summary className="cursor-pointer text-sm font-medium">
+              开发者参数（ASR / LLM / VAD / 运行策略）
+            </summary>
+            <p className="mt-2 text-xs muted">
+              面向本机部署与排障：引擎 Provider、识别语言、VAD 与打断、本地模型、运行策略。
+              默认值已按当前本地栈校准，日常使用无需改动；改本地模型需重启本地服务生效。
+            </p>
+            <div className="mt-4 grid grid-cols-1 gap-6 lg:grid-cols-2">
+              {devCards.map((kind) => (
+                <ProviderCard key={kind} kind={kind} value={form[kind] ?? {}} onChange={(next) => setForm({ ...form, [kind]: next })} />
               ))}
-            </select>
-            {policyOption?.hint && <p className="mt-2 text-xs muted">{policyOption.hint}</p>}
-            <p className="mt-2 text-xs muted">策略与 Provider 会在下一次建立通话时应用到 Agent 会话。</p>
-          </section>
+              <section className="card">
+                <span className="label">{POLICY_META.title}</span>
+                <select
+                  className="mt-3 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+                  value={policyValue}
+                  onChange={(e) => setForm({ ...form, policy: e.target.value })}
+                >
+                  {POLICY_META.options.map((o) => (
+                    <option key={o.value} value={o.value}>{o.label}</option>
+                  ))}
+                </select>
+                {policyOption?.hint && <p className="mt-2 text-xs muted">{policyOption.hint}</p>}
+                <p className="mt-2 text-xs muted">策略与 Provider 会在下一次建立通话时应用到 Agent 会话。</p>
+              </section>
+            </div>
+          </details>
           <div className="flex flex-wrap items-end gap-3 lg:col-span-2">
             <button className="btn-primary" onClick={save}>保存设置</button>
             <button className="btn-ghost" onClick={() => testHealth("asr")}>测试 ASR</button>
@@ -503,9 +612,6 @@ export default function SettingsPage() {
             {health && <span className="text-sm muted">{health}</span>}
           </div>
           {err && <div className="lg:col-span-2"><ErrorState message={err} /></div>}
-          <div className="lg:col-span-2">
-            <DesktopStatus />
-          </div>
         </div>
       )}
     </div>
