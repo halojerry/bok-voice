@@ -68,6 +68,34 @@ class SqlAlchemyBusinessRepository:
         self.session.commit()
         return self._call_to_dict(row)
 
+    def mark_active_if_live(self, call_id: str) -> bool:
+        """终态守卫的原子版:非终态才置 active,返回是否真的改了行。
+
+        2026-09-14 call-c76832ac:挂断(ended)落库后 5ms,同通话的并发 token
+        重签在 Python 层「读-判断-写」两步窗口里把 status 翻回 active,下游
+        webhook 崩溃补位据此往已挂断空房补派幽灵 agent(白跑 64s)。改单条
+        条件 UPDATE——终态判定与写入在同一语句内求值,并发签发不可能复活终态。
+        语义与旧读-写块等价:ringing/active/paused → active;ended/failed 不动。
+        """
+        from sqlalchemy import update as _sa_update
+        from sqlalchemy import and_
+
+        stmt = (
+            _sa_update(models.CallSession)
+            .where(
+                and_(
+                    models.CallSession.id == call_id,
+                    models.CallSession.status.notin_(
+                        [CallStatus.ENDED.value, CallStatus.FAILED.value]
+                    ),
+                )
+            )
+            .values(status=CallStatus.ACTIVE.value)
+        )
+        res = self.session.execute(stmt)
+        self.session.commit()
+        return bool(res.rowcount)
+
     def delete_call(self, call_id: str) -> bool:
         """删除通话及连带数据(turns/settlements)。审计事件保留(只读历史)。"""
         row = self.session.get(models.CallSession, call_id)
@@ -740,6 +768,16 @@ class InMemoryBusinessRepository:
             return None
         self.calls[call_id].update(fields)
         return self.calls[call_id]
+
+    def mark_active_if_live(self, call_id: str) -> bool:
+        """见 SqlAlchemyBusinessRepository.mark_active_if_live(内存替身同语义)。"""
+        cur = self.calls.get(call_id)
+        if not cur:
+            return False
+        if str(cur.get("status") or "") in (CallStatus.ENDED.value, CallStatus.FAILED.value):
+            return False
+        cur["status"] = CallStatus.ACTIVE.value
+        return True
 
     def delete_call(self, call_id: str) -> bool:
         if call_id not in self.calls:

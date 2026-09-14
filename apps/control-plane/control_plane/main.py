@@ -659,12 +659,15 @@ def token(req: TokenRequest) -> TokenResponse:
     # "active calls" view reflects the real live room.
     if req.call_id:
         try:
-            # 终态守卫（2026-09-11 同传审计 P0）：断线重连的客户端在 hangup 后再取
+            # 终态守卫（2026-09-11 同传审计 P0）:断线重连的客户端在 hangup 后再取
             # token（call-a9511563 实证 hangup 200 后 +18ms 一发），无条件写 ACTIVE
             # 会把 ENDED/FAILED 复活——最后一写者胜令「挂断不结算」成立。
-            cur = _repo().get_call(req.call_id) or {}
-            if str(cur.get("status") or "") not in _TERMINAL_CALL_STATUSES:
-                _repo().update_call(req.call_id, status=CallStatus.ACTIVE.value)
+            # 原子化（2026-09-14 call-c76832ac）:旧版 Python 层「读-判断-写」两步
+            # 在并发请求交错时仍有窗口——hangup 提交 ended 后 5ms 的同通话 token
+            # 重签读到旧状态、写在提交之后，把终态翻回 active；下游 webhook 崩溃
+            # 补位据此往已挂断空房补派幽灵 agent（白跑 64s、预热开场白烧 TTS）。
+            # 改仓储层单条条件 UPDATE，终态判定与写入同语句求值，并发签发不可复活。
+            _repo().mark_active_if_live(req.call_id)
         except Exception:
             pass
     _audit("token.issue", subject_type="call", subject_id=req.call_id or "",
