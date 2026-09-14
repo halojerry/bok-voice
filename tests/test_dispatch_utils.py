@@ -368,6 +368,12 @@ def test_hangup_cleans_up_dispatch_after_ended(monkeypatch):
             json={"account_id": "acc-001", "object_id": "obj-1", "persona_id": "p-1", "mode": "simulation"},
         ).json()
         resp = client.post(f"/api/calls/{created['id']}/hangup")
+        # 断房+回收走 create_task fire-and-forget：portal 关闭前轮询等后台任务到位，
+        # 否则断言与后台任务赛跑（全套运行偶发失败）。
+        _wait_until(
+            lambda: cleanup.await_count == 1 and lkapi.aclose.await_count == 1,
+            "hangup disconnect task finished",
+        )
 
     assert resp.status_code == 200
     assert resp.json()["status"] == "ended"

@@ -120,6 +120,25 @@ export const api = {
   supervisorTransfer: (id: string) => request<Record<string, unknown>>(`/api/supervisor/${id}/transfer`, { method: "POST" }),
   markWhatsappHandled: (id: string, handled = true) =>
     request<Record<string, unknown>>(`/api/calls/${id}/whatsapp/handled`, { method: "POST", body: JSON.stringify({ handled }) }),
+  // 名册认领池（Wave1 outbound campaign）：status/channel 空=不过滤；
+  // claim/unclaim/handled 均返回更新后的条目，handled 联动来源通话横幅状态。
+  listRoster: (status = "", channel = "", accountId = "acc-001") =>
+    request<Record<string, unknown>[]>(
+      `/api/roster?account_id=${encodeURIComponent(accountId)}&status=${encodeURIComponent(status)}&channel=${encodeURIComponent(channel)}`,
+    ),
+  rosterClaim: (id: string, claimedBy = "acc-001") =>
+    request<Record<string, unknown>>(`/api/roster/${id}/claim`, { method: "POST", body: JSON.stringify({ claimed_by: claimedBy }) }),
+  rosterUnclaim: (id: string) =>
+    request<Record<string, unknown>>(`/api/roster/${id}/unclaim`, { method: "POST" }),
+  rosterHandled: (id: string, handled = true) =>
+    request<Record<string, unknown>>(`/api/roster/${id}/handled`, { method: "POST", body: JSON.stringify({ handled }) }),
+  // 外呼战役（Wave 12）：建波次/启停/进度。启停非法迁移后端 409，UI 按 status 显隐按钮。
+  createCampaign: (body: unknown) => request<Record<string, unknown>>("/api/campaigns", { method: "POST", body: JSON.stringify(body) }),
+  listCampaigns: () => request<Record<string, unknown>[]>("/api/campaigns"),
+  getCampaign: (id: string) => request<Record<string, unknown>>(`/api/campaigns/${id}`),
+  startCampaign: (id: string) => request<Record<string, unknown>>(`/api/campaigns/${id}/start`, { method: "POST" }),
+  pauseCampaign: (id: string) => request<Record<string, unknown>>(`/api/campaigns/${id}/pause`, { method: "POST" }),
+  stopCampaign: (id: string) => request<Record<string, unknown>>(`/api/campaigns/${id}/stop`, { method: "POST" }),
   reportsSummary: () => request<Record<string, unknown>>("/api/reports/summary"),
   reportsCalls: () => request<Record<string, unknown>[]>("/api/reports/calls"),
   reportsUsage: () => request<Record<string, unknown>>("/api/reports/usage"),

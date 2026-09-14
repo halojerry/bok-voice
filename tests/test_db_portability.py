@@ -15,6 +15,8 @@ EXPECTED_TABLES = {
     "object_topics", "call_sessions", "turns", "settlements", "global_insights",
     "global_settings", "audit_events", "conversation_template_revisions",
     "usage_records", "qa_entries", "orgs", "nodes",
+    # 外呼战役 + 名册（spec 2026-09-12）：补进下限集，缺表即门禁失败。
+    "roster_entries", "campaigns", "campaign_items",
 }
 
 
