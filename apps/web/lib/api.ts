@@ -69,6 +69,18 @@ export const api = {
     request<Record<string, unknown>[]>(`/api/qa-entries?enabled=${enabled}`),
   getSettings: () => request<Record<string, unknown>>("/api/settings"),
   saveSettings: (body: unknown) => request<Record<string, unknown>>("/api/settings", { method: "PUT", body: JSON.stringify(body) }),
+  // 电话边缘站点（P1.5）：站点下拉 + 一次性把 SIP 供应商凭据注册成 outbound trunk。
+  // 注册成功返回 trunk_id——调用方回填设置表单的 sip.trunk_id（保存后 campaign 按站点取）。
+  listSites: (accountId = "acc-001") =>
+    request<Record<string, unknown>[]>(`/api/sip/sites?account_id=${encodeURIComponent(accountId)}`),
+  registerSipTrunk: (
+    siteId: string,
+    body: { address: string; numbers: string[]; auth_username?: string; auth_password?: string },
+  ) =>
+    request<{ trunk_id: string; site: Record<string, unknown> }>(
+      `/api/sip/sites/${encodeURIComponent(siteId)}/trunk`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
   // 官方 TokenSourceResponse 契约({serverUrl, participantToken});TokenSource
   // 直连本响应,无需键名映射。
   token: (body: { account_id: string; object_id?: string; call_id?: string; role?: string }) =>

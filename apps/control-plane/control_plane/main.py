@@ -55,6 +55,7 @@ from .schemas import (
     SettingsRequest,
     TokenRequest,
     TokenResponse,
+    TrunkRegisterRequest,
     WhatsAppCaptureRequest,
     WhatsAppHandledRequest,
 )
@@ -1369,6 +1370,68 @@ def _progress(items: list[dict]) -> dict:
         p[key] = sum(1 for i in items if i.get("status") == key)
     p["answered"] = p["done"] + p["no_answer"] + p["rejected"]
     return p
+
+
+@app.get("/api/sip/sites")
+def list_sip_sites(account_id: str = "acc-001") -> list[dict]:
+    """站点列表（P1.5 T1 repo 直通）：设置页「注册 trunk 到站点」的下拉数据源。
+
+    只返回库中真站点——虚拟兜底站点 `site-local`（`get_default_site` 恒合成、
+    不入库）不在列表里：它没有行可回填 trunk_id，注册动作对它无意义。
+    """
+    return _repo().list_sites(account_id)
+
+
+@app.post("/api/sip/sites/{site_id}/trunk")
+async def register_sip_trunk(site_id: str, req: TrunkRegisterRequest) -> dict:
+    """把 SIP 供应商凭据注册成 LiveKit outbound trunk，并把返回 id 回填站点。
+
+    站点生命周期的一次性引导动作（spec 2026-09-13 P1.5 T3）：调 LiveKit SIP 服务
+    `CreateSIPOutboundTrunk` 建 trunk → `site.trunk_id` = 返回的 `sip_trunk_id`
+    ——T2 的 campaign 按 site 优先取 trunk（无站点时才回退 settings），agent 侧零改。
+    `address`/`numbers` 必填（400）；`auth_*` 可空 = IP 白名单模式；**密码不回显**。
+    失败（凭据缺 / SIP 服务未部署 / 不可达 / 返回空 id）一律 502 且**绝不写**
+    site.trunk_id——宁可报错也不静默清空站点已注册的 trunk。
+    """
+    site = _repo().get_site(site_id)
+    if not site:
+        raise HTTPException(404, "site not found")
+    address = (req.address or "").strip()
+    numbers = [str(n).strip() for n in req.numbers if str(n).strip()]
+    if not address or not numbers:
+        raise HTTPException(400, "address 与 numbers 必填")
+    client = _lkapi_client()
+    if client is None:
+        raise HTTPException(502, "LiveKit 凭据未配置——livekit-sip 未部署或不可达")
+    # SDK 1.2+ 的写法：CreateSIPOutboundTrunkRequest(trunk=SIPOutboundTrunkInfo)；
+    # `create_sip_outbound_trunk` 是同一调用的弃用名（1.2 起 warnings.warn）。
+    from livekit.api import CreateSIPOutboundTrunkRequest, SIPOutboundTrunkInfo
+
+    create = CreateSIPOutboundTrunkRequest(
+        trunk=SIPOutboundTrunkInfo(
+            name=f"outbound-{site_id[:8]}-{int(datetime.now(timezone.utc).timestamp())}",
+            address=address,
+            numbers=numbers,
+            auth_username=req.auth_username,
+            auth_password=req.auth_password,
+        )
+    )
+    try:
+        info = await client.sip.create_outbound_trunk(create)
+    except Exception as exc:
+        raise HTTPException(
+            502, f"trunk 注册失败——livekit-sip 未部署或不可达: {exc}"
+        ) from exc
+    finally:
+        await client.aclose()  # 一次性客户端（自带 aiohttp session）必须关
+    trunk_id = str(getattr(info, "sip_trunk_id", "") or "")
+    if not trunk_id:
+        raise HTTPException(502, "trunk 注册失败——livekit-sip 未返回 trunk id")
+    updated = _repo().update_site(site_id, trunk_id=trunk_id) or site
+    _audit("sip.trunk_registered", subject_type="site", subject_id=site_id,
+           account_id=str(site.get("account_id") or ""),
+           detail={"trunk_id": trunk_id, "address": address})
+    return {"trunk_id": trunk_id, "site": updated}
 
 
 class MockCalleeRequest(BaseModel):

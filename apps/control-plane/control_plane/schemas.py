@@ -216,6 +216,21 @@ class DialResultRequest(BaseModel):
     detail: str = ""
 
 
+class TrunkRegisterRequest(BaseModel):
+    """站点注册 SIP outbound trunk 入参（spec 2026-09-13 P1.5 Task 3，一次性引导）。
+
+    `numbers` 严格 `list[str]`（T1 审查定案）：CP 层 Pydantic 类型是唯一防线——
+    repository 层的 `_normalize_site_numbers` 对畸形入参静默归一会把号码池清空。
+    `auth_username`/`auth_password` 留空 = IP 白名单模式（LiveKit 官方同款语义）；
+    **密码只进不出**，端点响应不回显（凭据安全，T8 掩码先例）。
+    """
+
+    address: str
+    auth_username: str = ""
+    auth_password: str = ""
+    numbers: list[str] = []
+
+
 class RosterClaimRequest(BaseModel):
     """名册认领：claimed_by 缺省 acc-001（本机单账号形态）。"""
 

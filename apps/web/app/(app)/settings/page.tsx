@@ -206,6 +206,49 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
   const set = (key: string, v: unknown) => onChange({ ...value, [key]: v });
   const numbers = Array.isArray(value.numbers) ? (value.numbers as string[]) : [];
   const hasPassword = Boolean(value.has_auth_password) || Boolean(value.auth_password);
+  // 站点注册 trunk（P1.5 T3）：站点来自 CP 站点表；注册成功把返回 id 回填 trunk_id 字段。
+  const [sites, setSites] = useState<Record<string, unknown>[]>([]);
+  const [siteId, setSiteId] = useState("");
+  const [trunkBusy, setTrunkBusy] = useState(false);
+  const [trunkNote, setTrunkNote] = useState<{ text: string; error?: boolean } | null>(null);
+
+  useEffect(() => {
+    if (mode !== "real") return;
+    api.listSites()
+      .then((rows) => {
+        setSites(rows);
+        setSiteId((cur) => (cur && rows.some((r) => String(r.id) === cur) ? cur : String(rows[0]?.id ?? "")));
+      })
+      .catch(() => setSites([]));
+  }, [mode]);
+
+  async function registerTrunk() {
+    setTrunkNote(null);
+    setTrunkBusy(true);
+    try {
+      const res = await api.registerSipTrunk(siteId, {
+        address: String(value.address ?? "").trim(),
+        auth_username: String(value.auth_username ?? ""),
+        auth_password: String(value.auth_password ?? ""),
+        numbers,
+      });
+      set("trunk_id", res.trunk_id);
+      setSites((rows) => rows.map((r) => (String(r.id) === siteId ? { ...r, trunk_id: res.trunk_id } : r)));
+      // 掩码回显下表单密码为空=已存密码不回传：此时注册走 IP 白名单模式，提示用户
+      // 免得以为用的是已存密码。
+      const ipMode = !String(value.auth_password ?? "") && hasPassword;
+      setTrunkNote({
+        text:
+          `已注册 ${res.trunk_id}，Trunk ID 已回填——记得保存设置。` +
+          (ipMode ? "（表单密码留空，本次按 IP 白名单模式注册；要密码鉴权重填后再注册一次）" : ""),
+      });
+    } catch (e) {
+      setTrunkNote({ text: friendlyErrorText(String(e)), error: true });
+    } finally {
+      setTrunkBusy(false);
+    }
+  }
+
   return (
     <section className="card">
       <span className="label">外呼（SIP）</span>
@@ -278,6 +321,40 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
                 }
               />
             </label>
+            <div className="rounded-lg border border-(--card-border) p-2">
+              <span className="text-xs text-(--stage-muted)">注册 trunk 到站点</span>
+              <p className="mt-1 text-xs muted">
+                用上面的地址/主叫号/鉴权在当前站点创建 LiveKit outbound trunk，成功后 Trunk ID 自动回填
+                （campaign 按站点取 trunk；密码不会回显）。
+              </p>
+              <select
+                className={base}
+                value={siteId}
+                onChange={(e) => setSiteId(e.target.value)}
+                disabled={sites.length === 0}
+              >
+                {sites.length === 0 ? (
+                  <option value="">（暂无站点——请先在后端登记站点）</option>
+                ) : (
+                  sites.map((s) => (
+                    <option key={String(s.id)} value={String(s.id)}>
+                      {String(s.name || s.id)}
+                      {s.trunk_id ? `（已注册 ${String(s.trunk_id)}）` : ""}
+                    </option>
+                  ))
+                )}
+              </select>
+              <button
+                className="btn-ghost mt-2 px-2 py-0.5 text-[11px]"
+                onClick={registerTrunk}
+                disabled={!siteId || trunkBusy}
+              >
+                {trunkBusy ? "注册中…" : "注册 trunk"}
+              </button>
+              {trunkNote && (
+                <p className={`mt-1 text-[11px] ${trunkNote.error ? "text-red-300" : "muted"}`}>{trunkNote.text}</p>
+              )}
+            </div>
           </>
         )}
         <div className="grid grid-cols-2 gap-2">
