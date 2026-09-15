@@ -87,6 +87,21 @@ spec §2 拍板 7 原文有效：**真中继启用前必须过 8kHz 窄带重验
 | P2 | 节点包 `--sip-edge` 组件组进发行管线；形态 1 成为客户站点部署选项（安装脚本/doctor/节点就绪单扩展） |
 | P4 | 电话边缘多租户共享（形态 2 有规模需求时）、中继计费、号码池按 org 隔离硬化 |
 
+**P1.5 完成状态（2026-09-15 收尾，分支 `feat/sip-edge-p15`）**：
+
+- **本地可做子集 = done**：`sip_sites` 表+双后端 repo（T1）；campaign 挂 `site_id` +
+  dial 块 trunk 按 site 优先（T2）；`POST /api/sip/sites/{id}/trunk` 注册 outbound
+  trunk + 面板按钮（T3）；对象页「立即外呼」单发外呼复用 dispatch 链路（T4）；
+  8kHz 窄带重验专项 = **mock 档门禁 PASS**（宽 0.950/窄 0.950、号码逐位 2/2，
+  §6.1 起仍受「真中继启用硬条件」两条约束）（T5）；`scripts/deploy_sip_edge.sh`
+  VPS 部署 runbook（T6）；`POST /api/sip/sites` 建站端点 + 面板「+ 新建站点」
+  表单（T7）。门禁：pytest 全量 944 passed、compileall OK、`tsc --noEmit`+web
+  build OK、`scripts/e2e_campaign.py` 13/13、`scripts/e2e_trilingual_livekit.py` 3/3。
+- **follow-up（不在 P1.5 交付内）**：真 VPS 部署（用户资源到位后按 runbook 执行 +
+  实测真中继）；`site.livekit_url` 目前只是登记字段——token/dispatch 仍按 env
+  `LIVEKIT_URL` 单点路由（逐站点路由列 P2）；号码句 live 链路头段 ASR 多解一个音
+  （`六四三二零一一一` → `664320111`，T7 定责见 `scripts/e2e_campaign.py` 注释）
+
 ## 8. 明确不做（YAGNI）
 
 - 给客户 Mac/机房做端口转发/VPN 打洞跑 SIP（脚枪：SDP 公网地址、万端口段 NAT、CGNAT——形态 2 的 VPS 就是为避免它存在的）。

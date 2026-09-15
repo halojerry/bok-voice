@@ -374,13 +374,27 @@ log "写入 ${CONF_FILE}（0640 root:${SERVICE_USER}）"
 
 step "4/6 安装 systemd 单元 ${UNIT_NAME}.service"
 
+# Redis 依赖行按 --redis-url 分支（T6 审查遗留）：
+#   本机档（127.0.0.1:6379 / localhost:6379）= livekit-sip 与 Redis 同机，Redis
+#   停则 SIP 必死——Requires 强依赖（redis 重启连带拉起 SIP，避免断连空转）。
+#   远端档 = 站点 Redis 在别处（形态 2 里 SIP 与站点 LiveKit 可不同机），本机
+#   apt 装上的 redis-server 只是旁路：用 Wants 弱依赖，别让本机 redis 的状态
+#   拖停/拖起重启真正在用的远端连路。
+if [[ "${REDIS_ADDR}" == "127.0.0.1:6379" || "${REDIS_ADDR}" == "localhost:6379" ]]; then
+  REDIS_UNIT_DEP="# 本机 Redis（同机档）：强依赖——redis 停则 SIP 停
+Requires=redis-server.service"
+else
+  REDIS_UNIT_DEP="# 远端 Redis ${REDIS_ADDR}：本机 redis-server 与站点无关，弱依赖
+Wants=redis-server.service"
+fi
+
 cat > "${UNIT_FILE}" <<UNIT
 [Unit]
 Description=Bok Voice 电话边缘 SIP（livekit-sip）
 Documentation=https://github.com/livekit/sip
 After=network-online.target redis-server.service
 Wants=network-online.target
-Requires=redis-server.service
+${REDIS_UNIT_DEP}
 
 [Service]
 Type=simple

@@ -158,6 +158,11 @@ web /campaigns（建波/启停/进度表）
   起拨时按 object_id 取台词塞进 dial 块 `script`。真实 SIP 拨号恒为空。
 - 全链路 E2E：`python scripts/e2e_campaign.py`（3 对象战役——1 接通走完话术+captured
   入名册 / 1 无人接 / 1 接通即挂；断言串行、终态三态、名册入册与 handled 回写）。
+  **C4 号码容差（2026-09-15 T7 定责）**：本 E2E 验「captured→名册」链路，不验逐位
+  ASR 精度——live 链路里号码句**头段**会被多解一个音（实证：`六四三二零一一一` →
+  `六六四三二零一一一`/`八六四三二零一一一`，TTS 渲染与 sidecar 流式路径均无锅，
+  照 agent 插件「VAD 前导帧并 `_pending`」喂法可 6/6 复现），故按「捕获串**含**脚本
+  号码的 ≥7 位连续子串」判定；逐位精度归 `probe_cantonese_digits`/`probe_8khz_asr`。
 
 ### 电话边缘站点（VPS，spec 2026-09-13-sip-edge-thin-node-v2 §7 P1.5）
 
@@ -177,16 +182,22 @@ Mac/客户机房侧，worker 只**出站**连站点 LiveKit —— 无任何入�
         （CGO_ENABLED=1，同上游 Dockerfile）
       → 产物装 /usr/local/bin/livekit-sip（幂等：已在则跳过，--force 重编）
       → 渲染 /etc/bok/livekit-sip.yaml（0640 root:livekit-sip）
-      → systemd bok-livekit-sip.service（Restart=always、User=livekit-sip 非 root）
+      → systemd bok-livekit-sip.service（Restart=always、User=livekit-sip 非 root；
+        Redis 依赖按 `--redis-url` 分支：本机档 `Requires=redis-server.service`，
+        远端档 `Wants=`+注释——远端 Redis 与本机 redis.service 状态无关，别被拖停/拖起重启）
       → 结尾打印防火墙/健康检查提示：5060/UDP + 10000-20000/UDP **只打印不代开**
     配置键（上游 pkg/config/config.go 核实）：api_key / api_secret / ws_url /
     redis.address / sip_port: 5060 / rtp_port: "10000-20000"（只认字符串形态）/
     use_external_ip: true（SDP 通告公网 IP）/ logging.level
 
-②CP 登记站点行（sip_sites 表）：**HTTP 建站入口尚未实现**——现只有
-    GET /api/sip/sites（列表，面板下拉数据源）与
-    POST /api/sip/sites/{id}/trunk（注册 trunk）；建行入口=T7 收尾补，
-    当前需直调 repository（`create_site`）或直接落库
+②CP 建站点行（sip_sites 表）：
+    POST /api/sip/sites {name, livekit_url, sip_edge?, trunk_id?, numbers?, region?}
+    → 建行（**幂等**：同 account+name 已存在返回既有行、不重复建不改写；审计
+    `sip.site_created`；name 空/sip_edge 越界=400）
+    GET /api/sip/sites（列表，面板下拉数据源）、
+    POST /api/sip/sites/{id}/trunk（注册 trunk）。
+    面板「设置 → 外呼（SIP）」站点下拉旁「+ 新建站点」最小表单（name +
+    livekit_url 两字段）直连 POST 建行——旧版空库只能提示「请先在后端登记站点」。
 
 ③面板「设置 → 外呼（SIP）」切 real 档 → 选站点 → 填 trunk 商（如 Telnyx）
     地址/主叫号/鉴权 → 「注册 trunk」= POST /api/sip/sites/{id}/trunk：
