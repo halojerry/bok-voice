@@ -125,18 +125,21 @@ def test_token_supervisor_identity_prefix_blocked_for_user(monkeypatch):
                            headers=peon).status_code == 201
 
 
-def _sign_webhook(body: bytes, secret: str) -> str:
+def _sign_webhook(body: bytes, secret: str, claims: dict | None = None) -> str:
     import hashlib
     import time
 
     import jwt as pyjwt
 
     now = int(time.time())
-    return pyjwt.encode({
+    payload = {
         "iss": "devkey", "sub": "devkey", "iat": now, "nbf": now - 5, "exp": now + 300,
         "video": {"webhook": True},
         "sha256": hashlib.sha256(body).hexdigest(),
-    }, secret, algorithm="HS256")
+    }
+    if claims:  # 负例用：覆写单字段构造「签名合法但 grant/摘要不对」的 token
+        payload.update(claims)
+    return pyjwt.encode(payload, secret, algorithm="HS256")
 
 
 def test_livekit_webhook_requires_valid_signature(monkeypatch):
@@ -178,3 +181,46 @@ def test_livekit_webhook_open_when_no_secret(monkeypatch):
                                                   "room": {"name": "call-x"},
                                                   "participant": {"identity": "bok-voice"}})
     assert r.status_code == 200  # 本地无 LiveKit 联调形态保持可用
+
+
+def test_livekit_webhook_rejects_valid_jwt_without_webhook_grant(monkeypatch):
+    from control_plane import main as cp_main
+
+    secret = "whsec-test-0123456789abcdef"
+    monkeypatch.setenv("LIVEKIT_API_SECRET", secret)
+    monkeypatch.setattr(cp_main.app.state, "lk_secret", secret, raising=False)
+    client, repo = _make(monkeypatch)
+    payload = {"event": "participant_left", "room": {"name": "call-x"},
+               "participant": {"identity": "bok-voice"}}
+    import json as _json
+
+    raw = _json.dumps(payload).encode()
+    # participant/roomJoin token 与 webhook 共用同一 LIVEKIT_API_SECRET——
+    # 签名合法但 grant 是 roomJoin 而非 webhook → 必须 401。钉死 grant 精确
+    # 检查分支：若回归成 claims["video"] 真值判断，本测试即红。
+    r = client.post("/api/webhook/livekit", content=raw,
+                    headers={"Authorization": "Bearer " + _sign_webhook(
+                        raw, secret, claims={"video": {"roomJoin": True}}),
+                        "Content-Type": "application/json"})
+    assert r.status_code == 401, r.text
+
+
+def test_livekit_webhook_rejects_sha256_digest_mismatch(monkeypatch):
+    from control_plane import main as cp_main
+
+    secret = "whsec-test-0123456789abcdef"
+    monkeypatch.setenv("LIVEKIT_API_SECRET", secret)
+    monkeypatch.setattr(cp_main.app.state, "lk_secret", secret, raising=False)
+    client, repo = _make(monkeypatch)
+    payload = {"event": "participant_left", "room": {"name": "call-x"},
+               "participant": {"identity": "bok-voice"}}
+    import json as _json
+
+    raw = _json.dumps(payload).encode()
+    # video.webhook grant 正确但 claim 摘要 ≠ sha256(body) → 必须 401
+    # （重放/篡改 body 防线，防摘要检查被回归掉）。
+    r = client.post("/api/webhook/livekit", content=raw,
+                    headers={"Authorization": "Bearer " + _sign_webhook(
+                        raw, secret, claims={"sha256": "f" * 64}),
+                        "Content-Type": "application/json"})
+    assert r.status_code == 401, r.text
