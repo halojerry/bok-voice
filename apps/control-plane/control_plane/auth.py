@@ -193,6 +193,41 @@ def require_role(request: Request, *roles: str) -> Identity | None:
     return ident
 
 
+def owner_scope_filter(request: Request, requested: str | None) -> str | None:
+    """列表端点的 owner 过滤值（B3 话务员级资源）。
+
+    语义与 scoped_account 同族：user 强制本人（仓库层展开为「共享+本人」）；
+    admin/root 原样（默认 None=本账号全部）；无身份（auth-off/机器通道）原样——
+    agent 机器通道显式传 owner_scope=建单人，CP 不做二次推断。
+    """
+    ident = current_identity(request)
+    if ident is None or ident.role in ("admin", "root"):
+        return requested
+    return ident.user_id
+
+
+def deny_foreign_owner(request: Request, row: dict | None, *, edit: bool = False) -> dict | None:
+    """by-ID 资源的话务员级归属闸（B3）。
+
+    user：别人的条目 404（不泄露存在性，与跨账号口径一致）；共享条目（owner=''）
+    可读可引用，但**改动（edit=True）403**——共享基线只归 admin/root，防一个话务员
+    改掉全组的话术/QA。admin/root/无身份放行。
+    """
+    if row is None:
+        return row
+    ident = current_identity(request)
+    if ident is None or ident.role in ("admin", "root"):
+        return row
+    owner = str(row.get("owner_user_id") or "")
+    if owner == "":
+        if edit:
+            raise HTTPException(status_code=403, detail="shared resource requires admin")
+        return row
+    if owner != ident.user_id:
+        raise HTTPException(status_code=404, detail="not found")
+    return row
+
+
 def _unauthorized() -> Response:
     return Response(status_code=401, content=b'{"detail":"unauthorized"}', media_type="application/json")
 

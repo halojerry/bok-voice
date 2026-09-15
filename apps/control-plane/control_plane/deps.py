@@ -204,6 +204,10 @@ def build_engine() -> Engine | None:
                 # 外呼战役 mock 演练台词（spec 2026-09-12 Wave3）：object_id→[句子]
                 # JSON，空串=无台词（真实通话恒空）。
                 _ensure_column(conn, "campaigns", "scripts_json", "scripts_json TEXT DEFAULT ''")
+                # 话务员级资源(B3):话术/QA 个人归属 + 通话建单人——''=共享/无主。
+                _ensure_column(conn, "conversation_templates", "owner_user_id", "owner_user_id VARCHAR(64) DEFAULT ''")
+                _ensure_column(conn, "qa_entries", "owner_user_id", "owner_user_id VARCHAR(64) DEFAULT ''")
+                _ensure_column(conn, "call_sessions", "created_by", "created_by VARCHAR(64) DEFAULT ''")
         except Exception as exc:  # pragma: no cover - sqlite / duplicate column
             print(f"[deps] idempotent column migration skipped: {exc}")
 

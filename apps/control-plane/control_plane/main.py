@@ -45,10 +45,12 @@ from .auth import (
     create_token,
     current_identity,
     deny_cross_account,
+    deny_foreign_owner,
     hash_password,
     identity_from_request,
     identity_gate,
     jwt_secret,
+    owner_scope_filter,
     require_role,
     scoped_account,
     verify_password,
@@ -952,13 +954,17 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
 @app.post("/api/calls")
 def create_call(req: CreateCallRequest, request: Request) -> dict:
     identity = current_identity(request)
-    if identity is not None and identity.role != "root":
-        # 话务员/主管建通话强制落本账号（root 可显式指定）。
-        req = req.model_copy(update={"account_id": identity.account_id})
-    return _create_call_in(_repo(), req)
+    created_by = ""
+    if identity is not None:
+        if identity.role != "root":
+            # 话务员/主管建通话强制落本账号（root 可显式指定）。
+            req = req.model_copy(update={"account_id": identity.account_id})
+        # 建单人盖章（B3）：运行时 QA 检索按「共享+建单人个人」收窄；战役建单无身份=''。
+        created_by = identity.user_id
+    return _create_call_in(_repo(), req, created_by=created_by)
 
 
-def _create_call_in(repo, req: CreateCallRequest) -> dict:
+def _create_call_in(repo, req: CreateCallRequest, created_by: str = "") -> dict:
     """建通话（会话清单装配 + 审计）；repo 由调用方给出（端点= `_repo()`）。
 
     抽成函数便于 campaign 循环在**注入的 repo** 上建通话（campaign_tick 的 repo
@@ -988,11 +994,13 @@ def _create_call_in(repo, req: CreateCallRequest) -> dict:
         tts_reference_voice=req.tts_reference_voice,
         kind=req.kind,
         target_lang=req.target_lang,
+        created_by=created_by,
     )
     call = repo.create_call(manifest)
     _audit("call.create", subject_type="call", subject_id=call.get("id", ""),
            account_id=req.account_id, call_id=call.get("id", ""),
-           detail={"mode": req.mode, "kind": req.kind, "language": req.language, "template_id": template_id})
+           detail={"mode": req.mode, "kind": req.kind, "language": req.language, "template_id": template_id,
+                   "created_by": created_by})
     return call
 
 
@@ -2157,26 +2165,41 @@ async def import_knowledge(req: ImportRequest, request: Request) -> dict:
 # ---- 快答库(Q→A 检索快路,2026-09-09):条目 CRUD + 高频配对报告 ----
 
 @app.get("/api/qa-entries")
-def list_qa_entries(request: Request, account_id: str = "acc-001", enabled: int | None = None) -> list[dict]:
-    # QA 库话务员可读可编辑（页面矩阵），按账号收窄；owner 级差异在 B3。
+def list_qa_entries(request: Request, account_id: str = "acc-001", enabled: int | None = None, owner_scope: str | None = None) -> list[dict]:
+    # QA 库话务员可读可编辑（页面矩阵），按账号收窄；B3 owner 维度：user=自己的+共享
+    # （owner_scope_filter 强制本人），admin/root/无身份不过滤；机器通道显式传
+    # owner_scope=建单人（agent 装配线），''=仅共享（战役等无主通话）。
     account_id = scoped_account(request, account_id)
-    return _repo().list_qa_entries(account_id, enabled=None if enabled is None else bool(enabled))
+    return _repo().list_qa_entries(
+        account_id, enabled=None if enabled is None else bool(enabled),
+        owner_scope=owner_scope_filter(request, owner_scope),
+    )
 
 
 @app.post("/api/qa-entries")
 def create_qa_entry(req: QaEntryCreate, request: Request) -> dict:
     identity = current_identity(request)
     if identity is not None and identity.role != "root":
-        req = req.model_copy(update={"account_id": identity.account_id})
+        # B3：user 建的自动归自己（body 的 owner 无效）；admin 建默认共享、可显式指派。
+        updates: dict = {"account_id": identity.account_id}
+        if identity.role == "user":
+            updates["owner_user_id"] = identity.user_id
+        req = req.model_copy(update=updates)
     row = _repo().create_qa_entry(req.model_dump())
-    _audit("qa_entry.create", subject_type="qa_entry", subject_id=row.get("id", ""), account_id=req.account_id)
+    _audit("qa_entry.create", subject_type="qa_entry", subject_id=row.get("id", ""), account_id=req.account_id,
+           detail={"owner_user_id": row.get("owner_user_id", "")})
     return row
 
 
 @app.patch("/api/qa-entries/{entry_id}")
 def update_qa_entry(entry_id: str, req: QaEntryPatch, request: Request) -> dict:
-    deny_cross_account(request, _repo().get_qa_entry(entry_id))
-    row = _repo().update_qa_entry(entry_id, {k: v for k, v in req.model_dump().items() if v is not None})
+    deny_foreign_owner(request, deny_cross_account(request, _repo().get_qa_entry(entry_id)), edit=True)
+    patch = {k: v for k, v in req.model_dump().items() if v is not None}
+    # 所有权转移只归 admin/root——user 的 patch 剥掉。
+    ident = current_identity(request)
+    if ident is not None and ident.role == "user":
+        patch.pop("owner_user_id", None)
+    row = _repo().update_qa_entry(entry_id, patch)
     if row is None:
         from fastapi import HTTPException
 
@@ -2187,7 +2210,7 @@ def update_qa_entry(entry_id: str, req: QaEntryPatch, request: Request) -> dict:
 
 @app.delete("/api/qa-entries/{entry_id}")
 def delete_qa_entry(entry_id: str, request: Request) -> dict:
-    deny_cross_account(request, _repo().get_qa_entry(entry_id))
+    deny_foreign_owner(request, deny_cross_account(request, _repo().get_qa_entry(entry_id)), edit=True)
     ok = _repo().delete_qa_entry(entry_id)
     _audit("qa_entry.delete", subject_type="qa_entry", subject_id=entry_id, outcome="ok" if ok else "not_found")
     return {"deleted": ok, "id": entry_id}
@@ -2311,15 +2334,15 @@ def delete_persona(persona_id: str, request: Request) -> dict:
 
 
 @app.get("/api/templates")
-def list_templates(request: Request, account_id: str = "acc-001") -> list[dict]:
+def list_templates(request: Request, account_id: str = "acc-001", owner_scope: str | None = None) -> list[dict]:
+    # B3 owner 维度同 qa-entries：user=自己的+共享，admin/root/无身份不过滤。
     account_id = scoped_account(request, account_id)
-    return _repo().list_templates(account_id)
+    return _repo().list_templates(account_id, owner_scope=owner_scope_filter(request, owner_scope))
 
 
 @app.get("/api/templates/{template_id}")
 def get_template(template_id: str, request: Request) -> dict:
-    deny_cross_account(request, _repo().get_template(template_id))
-    tpl = _repo().get_template(template_id)
+    tpl = deny_foreign_owner(request, deny_cross_account(request, _repo().get_template(template_id)))
     if not tpl:
         raise HTTPException(404, "template not found")
     return tpl
@@ -2329,17 +2352,20 @@ def get_template(template_id: str, request: Request) -> dict:
 def create_template(req: TemplateRequest, request: Request) -> dict:
     identity = current_identity(request)
     if identity is not None and identity.role != "root":
-        # 话务员建话术落本账号（owner 级差异在 B3；修正「无主话术落空账号」旧漏）。
-        req = req.model_copy(update={"account_id": identity.account_id})
+        # 话务员建话术落本账号；B3：user 建的自动归自己，admin 建默认共享、可显式指派。
+        updates: dict = {"account_id": identity.account_id}
+        if identity.role == "user":
+            updates["owner_user_id"] = identity.user_id
+        req = req.model_copy(update=updates)
     tpl = _repo().create_template(req.model_dump())
-    _audit("template.create", subject_type="template", subject_id=tpl.get("id", ""), account_id=tpl.get("account_id", ""), detail={"name": tpl.get("name", "")})
+    _audit("template.create", subject_type="template", subject_id=tpl.get("id", ""), account_id=tpl.get("account_id", ""),
+           detail={"name": tpl.get("name", ""), "owner_user_id": tpl.get("owner_user_id", "")})
     return tpl
 
 
 @app.put("/api/templates/{template_id}")
 def update_template(template_id: str, req: UpdateTemplateRequest, request: Request) -> dict:
-    deny_cross_account(request, _repo().get_template(template_id))
-    before = _repo().get_template(template_id)
+    before = deny_foreign_owner(request, deny_cross_account(request, _repo().get_template(template_id)), edit=True)
     if not before:
         raise HTTPException(404, "template not found")
     # 话术版本化（2026-09-07 专项 B3）:update 即快照旧版——「哪版话术转化更好」
@@ -2355,6 +2381,13 @@ def update_template(template_id: str, req: UpdateTemplateRequest, request: Reque
     # (language 默认 zh/name 默认空),整包 dump 会把未传字段抹掉(2026-09-09
     # QA「PUT 抹字段」实锤;前端 save 恒传全字段,行为不变,API 语义修正)。
     payload = req.model_dump(exclude_unset=True)
+    # 归属字段冻结（B3 堵洞）：非 root 不得经 body 改 account_id（update 白名单曾放行，
+    # 可把模板挪去别账号）；所有权转移（owner_user_id）只归 admin/root。
+    ident = current_identity(request)
+    if ident is not None and ident.role != "root":
+        payload.pop("account_id", None)
+    if ident is not None and ident.role == "user":
+        payload.pop("owner_user_id", None)
     tpl = _repo().update_template(template_id, payload)
     _audit(
         "template.update",
@@ -2369,14 +2402,13 @@ def update_template(template_id: str, req: UpdateTemplateRequest, request: Reque
 
 @app.get("/api/templates/{template_id}/revisions")
 def template_revisions(template_id: str, request: Request) -> list[dict]:
-    deny_cross_account(request, _repo().get_template(template_id))
+    deny_foreign_owner(request, deny_cross_account(request, _repo().get_template(template_id)))
     return _repo().list_template_revisions(template_id)
 
 
 @app.delete("/api/templates/{template_id}")
 def delete_template(template_id: str, request: Request) -> dict:
-    deny_cross_account(request, _repo().get_template(template_id))
-    tpl = _repo().get_template(template_id)
+    tpl = deny_foreign_owner(request, deny_cross_account(request, _repo().get_template(template_id)), edit=True)
     if not _repo().delete_template(template_id):
         raise HTTPException(404, "template not found")
     _audit("template.delete", subject_type="template", subject_id=template_id, account_id=(tpl or {}).get("account_id", ""))

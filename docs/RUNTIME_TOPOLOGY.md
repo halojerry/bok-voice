@@ -69,7 +69,8 @@
 - **Q→A 快路**：`agent_runtime/qa_gate.py` + CP `/api/qa-entries`、
   `/api/reports/qa-pairs`——四道闸（作用域/关键信号旁路/推进收线让位/阈值 0.90）
   全过且应答音频已缓存才跳过 LLM；挖掘入库 `bok.py tts-mine --apply N`。
-  开关 `BOK_QA_FASTPATH=0`。
+  开关 `BOK_QA_FASTPATH=0`。B3：装配取数钉本通账号+`owner_scope=created_by`
+  （共享+建单人个人条目；战役等无主通话='' 仅共享），不再硬编码 acc-001。
 
 ### 音频设备（设置页）
 
