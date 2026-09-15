@@ -216,6 +216,25 @@ class DialResultRequest(BaseModel):
     detail: str = ""
 
 
+class SiteCreateRequest(BaseModel):
+    """建站入参（spec 2026-09-13 P1.5 Task 7 收尾：面板「+ 新建站点」数据源）。
+
+    **幂等**：同 `account_id` + `name` 已有站点时端点直接返回既有行（不重复建、
+    不改写）——建站是站点生命周期的一次性引导动作，重复提交（面板双击/脚本重跑）
+    不应产生同名重复站点。要改字段走 `update_site`（后续端点），不靠重名行堆叠。
+    `numbers` 严格 `list[str]`（T1 审查定案，与 `TrunkRegisterRequest` 同款防线）。
+    `sip_edge` 值域 `none|local|cloud`（空=local，与 repo 默认一致；越界=400）。
+    """
+
+    name: str
+    livekit_url: str = ""
+    sip_edge: str = "local"
+    trunk_id: str = ""
+    numbers: list[str] = []
+    region: str = ""
+    account_id: str = "acc-001"
+
+
 class TrunkRegisterRequest(BaseModel):
     """站点注册 SIP outbound trunk 入参（spec 2026-09-13 P1.5 Task 3，一次性引导）。
 

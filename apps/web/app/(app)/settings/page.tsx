@@ -211,6 +211,13 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
   const [siteId, setSiteId] = useState("");
   const [trunkBusy, setTrunkBusy] = useState(false);
   const [trunkNote, setTrunkNote] = useState<{ text: string; error?: boolean } | null>(null);
+  // 建站（P1.5 T7）：站点表此前只有 repo 层入口，空库时下拉只能提示「请先在后端
+  // 登记站点」——这里补最小建站表单（name + livekit_url 两字段，其余走默认）。
+  const [showSiteForm, setShowSiteForm] = useState(false);
+  const [newSiteName, setNewSiteName] = useState("");
+  const [newSiteUrl, setNewSiteUrl] = useState("");
+  const [siteBusy, setSiteBusy] = useState(false);
+  const [siteNote, setSiteNote] = useState<{ text: string; error?: boolean } | null>(null);
 
   useEffect(() => {
     if (mode !== "real") return;
@@ -246,6 +253,34 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
       setTrunkNote({ text: friendlyErrorText(String(e)), error: true });
     } finally {
       setTrunkBusy(false);
+    }
+  }
+
+  async function createSite() {
+    setSiteNote(null);
+    setSiteBusy(true);
+    try {
+      const row = await api.createSite({
+        name: newSiteName.trim(),
+        livekit_url: newSiteUrl.trim(),
+      });
+      const id = String(row.id ?? "");
+      // CP 侧幂等：同账号同名返回既有行——据此如实提示「已存在」而不是谎报新建。
+      const existed = sites.some((r) => String(r.id) === id);
+      setSites((rows) => (existed ? rows.map((r) => (String(r.id) === id ? row : r)) : [...rows, row]));
+      setSiteId(id);
+      setNewSiteName("");
+      setNewSiteUrl("");
+      setShowSiteForm(false);
+      setSiteNote({
+        text: existed
+          ? `已存在同名站点「${String(row.name ?? id)}」，已为你选中（未重复建）。`
+          : `站点「${String(row.name ?? id)}」已建好——可继续注册 trunk。`,
+      });
+    } catch (e) {
+      setSiteNote({ text: friendlyErrorText(String(e)), error: true });
+    } finally {
+      setSiteBusy(false);
     }
   }
 
@@ -334,7 +369,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
                 disabled={sites.length === 0}
               >
                 {sites.length === 0 ? (
-                  <option value="">（暂无站点——请先在后端登记站点）</option>
+                  <option value="">（暂无站点——用下方「+ 新建站点」建一个）</option>
                 ) : (
                   sites.map((s) => (
                     <option key={String(s.id)} value={String(s.id)}>
@@ -346,6 +381,46 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
               </select>
               <button
                 className="btn-ghost mt-2 px-2 py-0.5 text-[11px]"
+                onClick={() => {
+                  setSiteNote(null);
+                  setShowSiteForm((v) => !v);
+                }}
+              >
+                {showSiteForm ? "取消新建" : "+ 新建站点"}
+              </button>
+              {showSiteForm && (
+                <div className="mt-2 rounded-lg border border-(--card-border) p-2">
+                  <label className="block">
+                    <span className="text-xs text-(--stage-muted)">站点名</span>
+                    <input
+                      className={base}
+                      placeholder="hk-edge"
+                      value={newSiteName}
+                      onChange={(e) => setNewSiteName(e.target.value)}
+                    />
+                  </label>
+                  <label className="mt-2 block">
+                    <span className="text-xs text-(--stage-muted)">LiveKit 地址</span>
+                    <input
+                      className={base}
+                      placeholder="wss://vps.example:7880"
+                      value={newSiteUrl}
+                      onChange={(e) => setNewSiteUrl(e.target.value)}
+                    />
+                    <p className="mt-1 text-xs muted">站点 LiveKit 的 ws:// / wss:// 地址（VPS 同机=ws://127.0.0.1:7880）。</p>
+                  </label>
+                  <button
+                    className="btn-ghost mt-2 px-2 py-0.5 text-[11px]"
+                    onClick={createSite}
+                    disabled={!newSiteName.trim() || siteBusy}
+                  >
+                    {siteBusy ? "创建中…" : "创建站点"}
+                  </button>
+                  <p className="mt-1 text-xs muted">同名站点已存在时直接复用（不会重复建）。</p>
+                </div>
+              )}
+              <button
+                className="btn-ghost mt-2 px-2 py-0.5 text-[11px]"
                 onClick={registerTrunk}
                 disabled={!siteId || trunkBusy}
               >
@@ -353,6 +428,9 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
               </button>
               {trunkNote && (
                 <p className={`mt-1 text-[11px] ${trunkNote.error ? "text-red-300" : "muted"}`}>{trunkNote.text}</p>
+              )}
+              {siteNote && (
+                <p className={`mt-1 text-[11px] ${siteNote.error ? "text-red-300" : "muted"}`}>{siteNote.text}</p>
               )}
             </div>
           </>

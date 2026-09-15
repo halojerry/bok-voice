@@ -73,6 +73,10 @@ export const api = {
   // 注册成功返回 trunk_id——调用方回填设置表单的 sip.trunk_id（保存后 campaign 按站点取）。
   listSites: (accountId = "acc-001") =>
     request<Record<string, unknown>[]>(`/api/sip/sites?account_id=${encodeURIComponent(accountId)}`),
+  // 建站（P1.5 T7）：最小 body = name + livekit_url；**幂等**——同账号同名已存在
+  // 时 CP 返回既有行（不重复建、不改写字段），调用方按返回 id 选中即可。
+  createSite: (body: { name: string; livekit_url?: string; sip_edge?: string; numbers?: string[]; region?: string; account_id?: string }) =>
+    request<Record<string, unknown>>("/api/sip/sites", { method: "POST", body: JSON.stringify(body) }),
   registerSipTrunk: (
     siteId: string,
     body: { address: string; numbers: string[]; auth_username?: string; auth_password?: string },

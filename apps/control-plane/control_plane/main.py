@@ -54,6 +54,7 @@ from .schemas import (
     UpdateObjectRequest,
     UpdatePersonaRequest,
     SettingsRequest,
+    SiteCreateRequest,
     TokenRequest,
     TokenResponse,
     TrunkRegisterRequest,
@@ -1377,6 +1378,45 @@ def _progress(items: list[dict]) -> dict:
         p[key] = sum(1 for i in items if i.get("status") == key)
     p["answered"] = p["done"] + p["no_answer"] + p["rejected"]
     return p
+
+
+@app.post("/api/sip/sites")
+def create_sip_site(req: SiteCreateRequest) -> dict:
+    """建站（spec 2026-09-13 P1.5 T7 收尾：面板「+ 新建站点」入口）。
+
+    P1.5 起站点表只有 repo 层入口时，面板站点下拉在空库只能提示「请先在后端登记
+    站点」；本端点把建行收进 HTTP 面（name 必填 + livekit_url 两字段即可建最小
+    站点，后续 trunk 注册/战役挂 site_id 都按这个 id 走）。
+
+    **幂等**（T7 定案，非 409）：同 `account_id` + `name` 已存在时直接返回既有行
+    ——建站是引导期动作，面板双击/脚本重跑不该堆出同名重复行；同账号要用两个
+    同名站点无实际意义（站点选择按 id，名字只给人看）。不覆盖既有行字段（改字段
+    走 update_site；重名幂等不承担 upsert 语义，避免误清已注册 trunk_id）。
+    失败面：name 空=400；sip_edge 越界（值域 none|local|cloud）=400；
+    numbers 非 list[str]=422（Pydantic 严格类型，T1 审查同款防线）。
+    """
+    name = (req.name or "").strip()
+    if not name:
+        raise HTTPException(400, "name 必填")
+    sip_edge = (req.sip_edge or "local").strip() or "local"
+    if sip_edge not in ("none", "local", "cloud"):
+        raise HTTPException(400, f"sip_edge 只支持 none|local|cloud（收到：{sip_edge}）")
+    account_id = (req.account_id or "acc-001").strip() or "acc-001"
+    repo = _repo()
+    for row in repo.list_sites(account_id):
+        if str(row.get("name") or "") == name:
+            return row  # 幂等命中：返回既有行，不重复建、不改写
+    site = repo.create_site(
+        account_id, name=name, livekit_url=(req.livekit_url or "").strip(),
+        sip_edge=sip_edge, trunk_id=(req.trunk_id or "").strip(),
+        numbers=[str(n).strip() for n in req.numbers if str(n).strip()],
+        region=(req.region or "").strip(),
+    )
+    _audit("sip.site_created", subject_type="site", subject_id=str(site.get("id") or ""),
+           account_id=account_id,
+           detail={"name": name, "livekit_url": site.get("livekit_url", ""),
+                   "sip_edge": sip_edge})
+    return site
 
 
 @app.get("/api/sip/sites")
