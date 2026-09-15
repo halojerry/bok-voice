@@ -102,15 +102,21 @@ jobs:
       - name: PowerShell syntax parse
         shell: pwsh
         run: |
-          $tokens = $null
-          $errors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile(
-            (Join-Path $PWD "scripts/install-node.ps1"), [ref]$tokens, [ref]$errors) | Out-Null
-          if ($errors -and $errors.Count -gt 0) {
-            $errors | ForEach-Object { Write-Host ("parse error: {0}" -f $_.Message) }
-            exit 1
+          foreach ($f in @("scripts/install-node.ps1", "scripts/setup-virtual-audio.ps1")) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Join-Path $PWD $f), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors -and $errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Host ("{0} parse error: {1}" -f $f, $_.Message) }
+              exit 1
+            }
+            Write-Host "$f 语法解析通过"
           }
-          Write-Host "install-node.ps1 语法解析通过"
       - name: install-node.ps1 -DryRun (零副作用，Windows runner 无 docker 不起 CP)
         shell: pwsh
         run: ./scripts/install-node.ps1 -CpUrl http://127.0.0.1:18011 -NodeToken ci-dummy-token -DryRun
+
+      - name: setup-virtual-audio.ps1 -DryRun (检测/计划打印，不下载不提权)
+        shell: pwsh
+        run: ./scripts/setup-virtual-audio.ps1 -DryRun

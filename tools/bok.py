@@ -240,6 +240,31 @@ def repo_python() -> Path:
     return candidates[-1]
 
 
+def _virtual_audio_present() -> bool:
+    """B 线同传的虚拟声卡是否就绪（macOS=BlackHole / Windows=VB-CABLE）。
+
+    报告性探测（doctor 打印、不判死）：CI runner/纯 A 线部署没有音频设备属正常。
+    """
+    import subprocess as _sp
+
+    try:
+        if is_mac():
+            out = _sp.run(["system_profiler", "SPAudioDataType"],
+                          capture_output=True, text=True, timeout=10).stdout
+            return "blackhole" in out.lower()
+        if os.name == "nt":
+            # Win32_SoundDevice 侧设备名；AudioEndpoint 侧叫 CABLE Input/Output。
+            ps = ("Get-CimInstance Win32_SoundDevice | Where-Object "
+                  "{$_.Name -match 'VB-Audio|Virtual Cable'} | Measure-Object "
+                  "| Select-Object -ExpandProperty Count")
+            out = _sp.run(["powershell", "-NoProfile", "-Command", ps],
+                          capture_output=True, text=True, timeout=15).stdout.strip()
+            return out not in ("", "0")
+    except Exception:  # noqa: BLE001 - 探测失败=按缺失报告，不阻 doctor
+        return False
+    return False
+
+
 def bundled_node() -> str | None:
     """Bundled Node binary (externalBin: Resources or Contents/MacOS; runtime dir)."""
     res = os.environ.get("BOK_RESOURCE_DIR", "")
@@ -1358,6 +1383,16 @@ def cmd_doctor() -> int:
         print(f"llama-server: {llama if llama else 'MISSING'}")
         if packaged and llama is None:
             fails.append("llama-server missing (Windows 需要 CUDA 版)")
+
+    # 虚拟声卡（B 线同传路由用；A 线通话不需要——报告性不判死：纯 A 线部署/
+    # CI runner 都没有音频设备）。macOS=BlackHole、Windows=VB-CABLE，两平台
+    # 生态不同不能共用；装法见 scripts/setup-virtual-audio.sh|ps1。
+    va_ok = _virtual_audio_present()
+    print(f"virtual audio ({'BlackHole' if is_mac() else 'VB-CABLE'}): "
+          f"{'ok' if va_ok else 'MISSING(B线同传需要;A线可忽略)'}")
+    if not va_ok:
+        print("  (一键安装: scripts/setup-virtual-audio."
+              f"{'sh' if is_mac() else 'ps1'}；装完重启浏览器)")
         ok, msg = _nvidia_gate()
         print(f"nvidia gate: {msg}")
         if packaged and not ok:
