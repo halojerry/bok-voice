@@ -2947,6 +2947,29 @@ _REDISPATCH_RETRY_SCHEDULE = (0.0, 10.0, 25.0)
 _redispatch_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
+def _verify_livekit_webhook(request: Request, body: bytes) -> bool:
+    """LiveKit webhook 官方验签：Authorization Bearer JWT（HS256/LIVEKIT_API_SECRET）
+    + video.webhook grant + sha256(body) 摘要（2026-09-16 深测 P2）。"""
+    import hashlib
+
+    import jwt as _pyjwt
+
+    secret = getattr(app.state, "lk_secret", "") or os.environ.get("LIVEKIT_API_SECRET", "")
+    if not secret:
+        control_log.warning("webhook_unsigned_accepted", extra={"event": "webhook.unsigned"})
+        return True
+    token = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+    if not token:
+        return False
+    try:
+        claims = _pyjwt.decode(token, secret, algorithms=["HS256"], options={"verify_aud": False})
+    except _pyjwt.PyJWTError:
+        return False
+    if not (claims.get("video") or {}).get("webhook"):
+        return False
+    return claims.get("sha256") == hashlib.sha256(body).hexdigest()
+
+
 @app.post("/api/webhook/livekit")
 async def livekit_webhook(request: Request) -> dict:
     """LiveKit webhook：agent 崩溃补位。
@@ -2958,8 +2981,20 @@ async def livekit_webhook(request: Request) -> dict:
     只在建房时生效，这是官方指定通路）。launchd KeepAlive 只拉起 worker 本体，本端点
     补「房间内 agent 缺席」这一层。本端点需在 livekit.yaml 配 webhook 指向本 CP。
     """
+    # 验签（2026-09-16 深测 P2）：本端点在中间件豁免表里=匿名可达。伪造
+    # participant_left 会触发最多 3 轮 LiveKit 云 API 放大调用 + _redispatch_locks
+    # 无界增长。官方姿势：LiveKit server 以 LIVEKIT_API_SECRET 签 JWT（HS256，
+    # video.webhook grant）并在 claim 里带 sha256(body) 摘要——双验。
+    # LIVEKIT_API_SECRET 未配置（本地无 LiveKit 联调）→ 放行并打点，生产必配。
+    raw = await request.body()
+    if not _verify_livekit_webhook(request, raw):
+        raise HTTPException(status_code=401, detail="invalid webhook signature")
+    if len(_redispatch_locks) > 512:
+        # 攻击者可用任意 room 名撑大锁图（模块注释自认不做淘汰）——上限修剪。
+        for _k in [k for k, v in _redispatch_locks.items() if not v.locked()][:256]:
+            _redispatch_locks.pop(_k, None)
     try:
-        payload = await request.json()
+        payload = json.loads(raw)
     except Exception:
         raise HTTPException(status_code=400, detail="invalid json body")
     event = str(payload.get("event") or "")
