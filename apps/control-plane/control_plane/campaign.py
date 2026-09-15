@@ -142,7 +142,7 @@ async def campaign_tick(repo=None, *, dispatcher: Dispatcher | None = None) -> d
     repo = repo if repo is not None else _repo()
     dispatcher = dispatcher or _default_dispatcher
     out = {"harvested": 0, "started": 0, "finished": 0}
-    for campaign in repo.list_campaigns(DEFAULT_ACCOUNT_ID, status="running"):
+    for campaign in repo.list_campaigns("", status="running"):
         try:
             await _tick_campaign(repo, campaign, dispatcher, out)
         except Exception as exc:  # noqa: BLE001 - 单条战役失败不阻其余

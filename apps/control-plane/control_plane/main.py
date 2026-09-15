@@ -1082,6 +1082,13 @@ def create_call(req: CreateCallRequest, request: Request) -> dict:
             req = req.model_copy(update={"account_id": identity.account_id})
         # 建单人盖章（B3）：运行时 QA 检索按「共享+建单人个人」收窄；战役建单无身份=''。
         created_by = identity.user_id
+        # 对象归属（2026-09-16 深测 P2）：跨账号对象 404——旧版照常建单，对象卡
+        # 话术快照外泄他账号话术 id，agent 装配线（机器通道）更会把他账号客户
+        # 档案读进 prompt。root 例外；对象不存在沿用旧行为（无模板快照）。
+        if req.object_id:
+            obj = _repo().get_object(req.object_id)
+            if obj is not None and str(obj.get("account_id") or "") != req.account_id:
+                raise HTTPException(status_code=404, detail="not found")
     return _create_call_in(_repo(), req, created_by=created_by)
 
 
@@ -1697,6 +1704,13 @@ def create_campaign(req: CampaignCreateRequest, request: Request) -> dict:
     if identity is not None and identity.role != "root":
         # 话务员/主管建波强制落本账号（root 可显式指定）。
         req = req.model_copy(update={"account_id": identity.account_id})
+    # 名单归属（2026-09-16 深测 P2）：任一对象属他账号 → 整单 404（fail-closed）。
+    # 旧版 items[].phone 直接回显他账号客户手机号，且战役循环会真实外呼该号码。
+    if identity is not None and identity.role != "root":
+        for oid in req.object_ids:
+            obj = _repo().get_object(oid)
+            if obj is not None and str(obj.get("account_id") or "") != req.account_id:
+                raise HTTPException(status_code=404, detail="not found")
     if not req.object_ids:
         raise HTTPException(400, "object_ids 不能为空")
     scripts = {
