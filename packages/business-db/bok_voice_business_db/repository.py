@@ -921,8 +921,9 @@ class SqlAlchemyBusinessRepository:
         return self._campaign_to_dict(row)
 
     def list_campaigns(self, account_id: str = "acc-001", status: str = "") -> list[dict]:
-        q = self.session.query(models.Campaign).filter(
-            models.Campaign.account_id == account_id)
+        q = self.session.query(models.Campaign)
+        if account_id:  # 空=跨账号全部（campaign 循环巡检用，与 list_calls("") 同语义）
+            q = q.filter(models.Campaign.account_id == account_id)
         if status:
             q = q.filter(models.Campaign.status == status)
         rows = q.order_by(models.Campaign.created_at.desc()).all()
@@ -1739,7 +1740,7 @@ class InMemoryBusinessRepository:
 
     def list_campaigns(self, account_id: str = "acc-001", status: str = "") -> list[dict]:
         rows = [self._campaign_public(r) for r in self.campaigns.values()
-                if r["account_id"] == account_id
+                if (not account_id or r["account_id"] == account_id)
                 and (not status or r["status"] == status)]
         return sorted(rows, key=lambda r: r["created_at"], reverse=True)
 
