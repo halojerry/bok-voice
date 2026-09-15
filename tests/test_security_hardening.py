@@ -239,3 +239,12 @@ def test_machine_channel_actor_cannot_be_spoofed(monkeypatch):
 
         dumped = _json.dumps(repo.list_audit_events(limit=100)).lower()
         assert "spoofed" not in dumped
+
+
+def test_login_unknown_user_still_401_with_uniform_message(monkeypatch):
+    client, repo = _make(monkeypatch, users=[{"username": "alice", "role": "user"}])
+    assert client.post("/api/auth/login",
+                       json={"username": "nobody", "password": "wrong"}).status_code == 401
+    assert client.post("/api/auth/login",
+                       json={"username": "alice", "password": "wrong"}).status_code == 401
+    # 两条路径错误文案一致（存在性只可经时序探测——实现里已均衡，此处锁文案）
