@@ -243,8 +243,20 @@ def test_machine_channel_actor_cannot_be_spoofed(monkeypatch):
 
 def test_login_unknown_user_still_401_with_uniform_message(monkeypatch):
     client, repo = _make(monkeypatch, users=[{"username": "alice", "role": "user"}])
-    assert client.post("/api/auth/login",
-                       json={"username": "nobody", "password": "wrong"}).status_code == 401
-    assert client.post("/api/auth/login",
-                       json={"username": "alice", "password": "wrong"}).status_code == 401
-    # 两条路径错误文案一致（存在性只可经时序探测——实现里已均衡，此处锁文案）
+    # 空 hash 账号行（数据异常）——dummy 口令是仓库公开字面量，绝不能据此放行。
+    repo.create_user(username="bob", password_hash="", role="user",
+                     org_id="org-t", account_id="acc-001")
+    paths = [
+        ("nobody", "wrong"),  # 用户不存在
+        ("alice", "wrong"),  # 存在但密码错
+        ("bob", "bok-dummy-login-timing-equalizer"),  # 存在但 hash 为空 + 公开 dummy 口令
+    ]
+    for name, pw in paths:
+        r = client.post("/api/auth/login", json={"username": name, "password": pw})
+        assert r.status_code == 401, r.text
+    # 三条路径错误文案完全相等（存在性只可经时序探测——实现里已均衡，此处锁文案；
+    # 空 hash 真实账号恒判失败，公开 dummy 口令不得成为后门）。
+    details = [client.post("/api/auth/login",
+                           json={"username": name, "password": pw}).json()["detail"]
+               for name, pw in paths]
+    assert details[0] == details[1] == details[2]

@@ -732,10 +732,10 @@ def _require_user_admin(identity: Identity | None, target_role: str, target_acco
 @app.post("/api/auth/login")
 def auth_login(req: LoginRequest) -> dict:
     user = _repo().get_user_by_username(req.username.strip())
-    ok = verify_password(
-        req.password,
-        str((user or {}).get("password_hash") or "") or _DUMMY_PASSWORD_HASH,
-    )
+    stored = str((user or {}).get("password_hash") or "")
+    # 时序均衡且 fail-closed：user 缺失或其 hash 为空（数据异常）都跑同价位
+    # dummy scrypt（均衡），但空 hash 的真实账号恒判失败（不得用公开 dummy 口令通过）。
+    ok = verify_password(req.password, stored or _DUMMY_PASSWORD_HASH) and bool(stored)
     if not user or user.get("status") != "active" or not ok:
         _audit("auth.login_failed", subject_type="user", subject_id=req.username[:64], outcome="denied")
         raise HTTPException(401, "用户名或密码不正确")
