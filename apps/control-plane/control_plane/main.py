@@ -89,6 +89,10 @@ from .schemas import (
 # 只含真终态——CallStatus.FAILED 是通话级失败终态(与拨号失败 disposition="failed" 同名不同义)。
 _TERMINAL_CALL_STATUSES = (CallStatus.ENDED.value, CallStatus.FAILED.value)
 
+# 登录时序均衡（2026-09-16 深测 P3）：用户不存在时也跑一次同价位 scrypt 校验。
+# 旧版短路令「存在且 active」可被 ~20× 响应差探测（1.1ms vs 25.5ms 实测）。
+_DUMMY_PASSWORD_HASH = hash_password("bok-dummy-login-timing-equalizer")
+
 
 app = FastAPI(
     title="Bok Voice Control Plane",
@@ -728,11 +732,11 @@ def _require_user_admin(identity: Identity | None, target_role: str, target_acco
 @app.post("/api/auth/login")
 def auth_login(req: LoginRequest) -> dict:
     user = _repo().get_user_by_username(req.username.strip())
-    if (
-        not user
-        or user.get("status") != "active"
-        or not verify_password(req.password, str(user.get("password_hash") or ""))
-    ):
+    ok = verify_password(
+        req.password,
+        str((user or {}).get("password_hash") or "") or _DUMMY_PASSWORD_HASH,
+    )
+    if not user or user.get("status") != "active" or not ok:
         _audit("auth.login_failed", subject_type="user", subject_id=req.username[:64], outcome="denied")
         raise HTTPException(401, "用户名或密码不正确")
     identity = Identity(
