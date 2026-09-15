@@ -97,6 +97,10 @@ def test_disabled_or_demoted_token_dies_immediately(monkeypatch):
 
 def test_token_supervisor_identity_prefix_blocked_for_user(monkeypatch):
     monkeypatch.setenv("BOK_AUTH_REQUIRED", "1")
+    # 与上一测试同理：test_auth.py 先收集时其模块级短密钥占位 env，startup
+    # fail-closed 会拒启——显式钉住合法密钥，与文件顺序解耦（全量跑 pytest 时
+    # test_auth.py 按字母序在前，2026-09-16 实测该测试在此顺序下必炸）。
+    monkeypatch.setenv("BOK_JWT_SECRET", "unit-test-jwt-secret-0123456789abcdef")
     client, repo = _make(monkeypatch, users=[
         {"username": "peon", "role": "user"},
         {"username": "op2", "role": "user", "account": "acc-002"},
