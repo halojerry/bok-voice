@@ -48,6 +48,9 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     "docs/superpowers/plans/2026-09-10-kb-incremental-indexing.md": re.compile(r"yue"),
     "docs/superpowers/plans/2026-09-10-smart-turn-cantonese-spike.md": re.compile(r"yue"),
     "scripts/probe_smart_turn.py": re.compile(r"yue"),
+    # P0 真库烟测做 yue→cantonese 数据迁移演练(铺旧值行验证 build_engine 改写)，
+    # 同 deps.py 类：旧拼写是演练夹具非运行时语言字段，按行豁免。
+    "scripts/smoke_postgres.py": re.compile(r"yue"),
     "docs/ARCHITECTURE.md": re.compile(r"VOLC_DIALECT"),
     "AGENTS.md": None,
     "AGENT.md": None,
