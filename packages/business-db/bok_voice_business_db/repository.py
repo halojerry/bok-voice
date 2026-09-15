@@ -807,7 +807,7 @@ class SqlAlchemyBusinessRepository:
             "id": row.id, "account_id": row.account_id, "name": row.name,
             "template_id": row.template_id, "persona_id": row.persona_id,
             "language": row.language, "status": row.status,
-            "gap_seconds": row.gap_seconds,
+            "gap_seconds": row.gap_seconds, "site_id": row.site_id,
             "created_at": row.created_at.isoformat() if row.created_at else "",
             "finished_at": row.finished_at.isoformat() if row.finished_at else "",
         }
@@ -852,13 +852,15 @@ class SqlAlchemyBusinessRepository:
                         persona_id: str, language: str, gap_seconds: int,
                         object_ids: list[str],
                         scenarios: dict[str, str] | None = None,
-                        scripts: dict[str, list[str]] | None = None) -> dict:
+                        scripts: dict[str, list[str]] | None = None,
+                        site_id: str = "") -> dict:
         campaign_id = f"camp-{_uuid()}"
         row = models.Campaign(
             id=campaign_id, account_id=account_id, name=name,
             template_id=template_id, persona_id=persona_id, language=language,
             status="draft", gap_seconds=gap_seconds,
             scripts_json=json.dumps(scripts or {}, ensure_ascii=False),
+            site_id=site_id,
         )
         self.session.add(row)
         for seq, object_id in enumerate(object_ids or []):
@@ -889,7 +891,7 @@ class SqlAlchemyBusinessRepository:
         if not row:
             return None
         for key in ("name", "template_id", "persona_id", "language", "status",
-                    "gap_seconds", "finished_at"):
+                    "gap_seconds", "finished_at", "site_id"):
             if key in fields and fields[key] is not None:
                 # finished_at 读侧是 ISO 字符串（_campaign_to_dict），调用方读改写会
                 # 把字符串传回来；DateTime 列只收 datetime，空串=未完成行读侧契约，
@@ -1527,13 +1529,15 @@ class InMemoryBusinessRepository:
                         persona_id: str, language: str, gap_seconds: int,
                         object_ids: list[str],
                         scenarios: dict[str, str] | None = None,
-                        scripts: dict[str, list[str]] | None = None) -> dict:
+                        scripts: dict[str, list[str]] | None = None,
+                        site_id: str = "") -> dict:
         now = datetime.now(timezone.utc).isoformat()
         campaign_id = f"camp-{uuid.uuid4().hex[:12]}"
         campaign = {
             "id": campaign_id, "account_id": account_id, "name": name,
             "template_id": template_id, "persona_id": persona_id,
             "language": language, "status": "draft", "gap_seconds": gap_seconds,
+            "site_id": site_id,
             "created_at": now, "finished_at": "",
             # 与 SQL 侧同键同名：内存仓直接存 dict（SQL 侧存 JSON 串），
             # 读侧统一走 get_campaign_scripts（`__` 前缀键=保留的 campaign 级参数）。
@@ -1582,7 +1586,7 @@ class InMemoryBusinessRepository:
             return None
         # 与 SQL 侧同款白名单：未知键（含 id/created_at）忽略，防两后端分叉。
         for key in ("name", "template_id", "persona_id", "language", "status",
-                    "gap_seconds", "finished_at"):
+                    "gap_seconds", "finished_at", "site_id"):
             if key in fields and fields[key] is not None:
                 row[key] = fields[key]
         return self._campaign_public(row)

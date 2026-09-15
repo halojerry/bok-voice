@@ -151,6 +151,9 @@ class Campaign(Base):
     # （生产空）。campaign 级存一份（item.scenario 只有 16 字符放不下台词），
     # 起拨时按 item.object_id 取出来塞进 dial 块 `script`。
     scripts_json: Mapped[str] = mapped_column(Text, default="")
+    # 电话边缘站点（spec 2026-09-13 P1.5）：空串=未挂站点，dial 块回退 settings
+    # `sip`（单站点旧行为零变化）；挂站点时 trunk 取站点注册值、settings 兜底。
+    site_id: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(default=None)
 

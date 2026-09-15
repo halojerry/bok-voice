@@ -186,6 +186,12 @@ async def _start_call(repo, campaign: dict, item: dict, dispatcher: Dispatcher) 
         repo.update_call(call_id, contact_phone=phone)
     settings = repo.get_settings() or {}
     sip = dict(settings.get("sip") or {})
+    # 站点的 trunk 优先、settings 兜底（spec 2026-09-13 P1.5）：战役挂了站点且该
+    # 站点注册过 outbound trunk（`ST_...`）→ 用站点的；否则（无 site_id/站点不存在/
+    # `site-local` 恒合成不入库/站点 trunk 未注册）逐字回退 settings `sip.trunk_id`
+    # ——单站点旧行为零变化。
+    site = repo.get_site(str(campaign.get("site_id") or "")) if campaign.get("site_id") else None
+    trunk_id = str((site or {}).get("trunk_id") or "") or str(sip.get("trunk_id") or "")
     # mock 演练台词（campaign 级 object_id→[句子]）：只有 mock 档需要（真 SIP 对端
     # 是真客户）。读取失败/缺键一律空数组——agent 侧 dial_outbound 的 script 缺省
     # 已是 []，子进程再有语言默认兜底，三层都不会因缺台词卡住。
@@ -211,7 +217,7 @@ async def _start_call(repo, campaign: dict, item: dict, dispatcher: Dispatcher) 
         # 收号步用；缺省 0=子进程自带 6s。
         "speak_interval_s": pace,
         "language": str(campaign.get("language") or "zh"),
-        "trunk_id": str(sip.get("trunk_id") or ""),
+        "trunk_id": trunk_id,
         "campaign_item_id": str(item.get("id") or ""),
         # 数字字段必须 `or 默认` 兜底：settings 里 0/空会静默变成「无保险丝/零振铃窗」。
         "max_call_duration_s": int(sip.get("max_call_duration_s") or 600),

@@ -1267,6 +1267,9 @@ class CampaignCreateRequest(BaseModel):
     # mock 客户台词句间隔秒（0=子进程默认 6s）。E2E 要把客户报号句对齐到 AI 的
     # 收号步时调大（AI 每轮处理+播报 8-12s）。
     mock_speak_interval_s: float = 0.0
+    # 电话边缘站点（spec 2026-09-13 P1.5）：空串=不挂站点（dial 块走 settings
+    # `sip` 兜底，单站点旧行为零变化）；挂站点时 dial 块 trunk 取站点注册值。
+    site_id: str = ""
 
 
 @app.post("/api/campaigns")
@@ -1295,6 +1298,7 @@ def create_campaign(req: CampaignCreateRequest) -> dict:
         gap_seconds=req.gap_seconds, object_ids=req.object_ids,
         scenarios={k: v for k, v in req.scenarios.items() if v in _CAMPAIGN_SCENARIOS},
         scripts=scripts,
+        site_id=req.site_id,
     )
     _audit("campaign.create", subject_type="campaign", subject_id=camp["id"],
            account_id=req.account_id, detail={"objects": len(req.object_ids)})
