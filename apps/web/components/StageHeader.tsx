@@ -118,8 +118,18 @@ export function StageHeader({ status }: { status?: ReactNode }) {
           )}
         </span>
         {session?.anonymous && (
-          <span className="rounded-sm border border-(--card-border) px-2 py-0.5 text-[11px] text-(--stage-muted)">
-            本地模式
+          <span className="flex items-center gap-2">
+            <span className="rounded-sm border border-(--card-border) px-2 py-0.5 text-[11px] text-(--stage-muted)">
+              本地模式
+            </span>
+            {/* 匿名=auth-off 单机形态的兜底会话，但登录入口必须可达（2026-09-15
+                用户实测「看不到登录页」）——已配 BOK_JWT_SECRET 的部署点此进入账号态。 */}
+            <Link
+              href="/login/"
+              className="transition hover:text-(--foreground) text-xs text-(--stage-muted)"
+            >
+              登录
+            </Link>
           </span>
         )}
         {session && !session.anonymous && (
