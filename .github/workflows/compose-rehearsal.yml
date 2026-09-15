@@ -86,10 +86,15 @@ jobs:
         run: |
           set -euo pipefail
           # 二次执行必须复用 .env（不重生成密钥/root 密码）并再次就绪。
+          # 注意不要把脚本管道进 grep -q：grep 命中即退出会 SIGPIPE 杀掉还在
+          # 打印的脚本（pipefail 下误报失败，首跑实证）——先落文件再断言。
           before="$(md5sum deploy/cloud/.env | cut -d' ' -f1)"
-          bash deploy/cloud/install.sh \
-            --database-url 'postgresql+psycopg://postgres:postgres@host.docker.internal:5439/postgres' \
-            --port 18010 --image "${BOK_CP_IMAGE}" | grep -q "复用" || { echo "二次运行未走复用路径"; exit 1; }
+          if ! bash deploy/cloud/install.sh \
+              --database-url 'postgresql+psycopg://postgres:postgres@host.docker.internal:5439/postgres' \
+              --port 18010 --image "${BOK_CP_IMAGE}" > /tmp/rerun.log 2>&1; then
+            cat /tmp/rerun.log; exit 1
+          fi
+          grep -q "复用" /tmp/rerun.log || { echo "二次运行未走复用路径"; cat /tmp/rerun.log; exit 1; }
           after="$(md5sum deploy/cloud/.env | cut -d' ' -f1)"
           [[ "${before}" == "${after}" ]] || { echo ".env 被重写（密钥轮换=事故）"; exit 1; }
           curl -fsS "${CP_URL}/health" | grep -q '"ok":true'
