@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from unittest.mock import AsyncMock, MagicMock
 
@@ -24,6 +25,30 @@ from livekit.api import AgentDispatch
 from livekit.protocol.agent import JS_FAILED, JS_PENDING, JS_RUNNING, JS_SUCCESS, JobState
 
 from control_plane.dispatch_utils import cleanup_dispatch, has_active_dispatch
+
+# 2026-09-16 P2-5 起 /api/webhook/livekit 有验签闸（tests/test_security_hardening.py），
+# 且本文件没有模块级 LIVEKIT_API_SECRET setdefault——standalone 时 env 为空=闸开放、
+# 合跑时被别的测试文件毒化成 devsecret=闸收紧，未签名请求两种世界行为不一致。
+# 这里显式钉 secret 并给每个 webhook 请求签名，任何收集顺序都走已鉴权生产路径。
+_WEBHOOK_SECRET = "devsecret"
+
+
+def _sign_webhook(body: bytes, secret: str) -> str:
+    """LiveKit webhook 官方 JWT（HS256 + video.webhook grant + sha256(body) 摘要）。
+
+    本地复制小 helper 而非从 tests/test_security_hardening.py import：tests/ 非包，
+    跨测试模块 import 会触发其模块级 setdefault 并造出第二份模块实例。
+    """
+    import hashlib
+
+    import jwt as pyjwt
+
+    now = int(time.time())
+    return pyjwt.encode(
+        {"iss": "devkey", "sub": "devkey", "iat": now, "nbf": now - 5, "exp": now + 300,
+         "video": {"webhook": True},
+         "sha256": hashlib.sha256(body).hexdigest()},
+        secret, algorithm="HS256")
 
 
 def _dispatch(agent_name: str, job_statuses: tuple[int, ...] = (), dispatch_id: str = "") -> AgentDispatch:
@@ -157,9 +182,16 @@ def _create_call(client: TestClient) -> dict:
 
 
 def _post_webhook(client: TestClient, room: str, identity: str = "bok-voice") -> dict:
+    payload = {"event": "participant_left", "room": {"name": room}, "participant": {"identity": identity}}
+    raw = json.dumps(payload).encode()
+    # 验签闸读 app.state.lk_secret（startup 从 env 快照）——startup 已随 with TestClient
+    # 跑过，这里显式钉成与签名同源的 secret，不依赖会话里谁先 setdefault 了什么。
+    client.app.state.lk_secret = _WEBHOOK_SECRET
     return client.post(
         "/api/webhook/livekit",
-        json={"event": "participant_left", "room": {"name": room}, "participant": {"identity": identity}},
+        content=raw,
+        headers={"Authorization": "Bearer " + _sign_webhook(raw, _WEBHOOK_SECRET),
+                 "Content-Type": "application/json"},
     ).json()
 
 
