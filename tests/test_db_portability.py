@@ -17,6 +17,8 @@ EXPECTED_TABLES = {
     "usage_records", "qa_entries", "orgs", "nodes",
     # 外呼战役 + 名册（spec 2026-09-12）：补进下限集，缺表即门禁失败。
     "roster_entries", "campaigns", "campaign_items",
+    # 电话边缘站点（spec 2026-09-13 P1.5）：同上，缺表即门禁失败。
+    "sip_sites",
 }
 
 

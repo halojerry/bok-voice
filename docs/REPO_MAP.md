@@ -84,6 +84,7 @@
 | `roster_entries` | 名册认领池（captured 号码自动入册；unclaimed→claimed→handled） |
 | `campaigns` | 外呼战役（status draft/running/paused/done/stopped、gap_seconds、scripts_json mock 台词钩子） |
 | `campaign_items` | 战役名单项（seq/phone/status/call_id/scenario，无电话对象直接 skipped） |
+| `sip_sites` | 电话边缘站点（livekit_url/sip_edge none·local·cloud/trunk_id/numbers_json；`site-local` 是 repo 合成的虚拟默认站点，不入库） |
 
 ## 运行时装配（packaged）
 

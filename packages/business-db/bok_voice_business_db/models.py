@@ -155,6 +155,32 @@ class Campaign(Base):
     finished_at: Mapped[datetime | None] = mapped_column(default=None)
 
 
+class SipSite(Base):
+    """电话边缘站点(spec 2026-09-13 sip-edge-thin-node-v2 §7 P1.5)。
+
+    站点 = 电话边缘拓扑的最小维度:本机/VPS 的 LiveKit 地址、SIP 边缘形态
+    (none=纯 WebRTC 无电话边缘 / local=本机 livekit-sip / cloud=云端 SIP)、
+    注册后的 outbound trunk id(`ST_...`,长生命周期只建不逐通建)、可用主叫
+    号码池(numbers_json=JSON 数组)、部署区域。campaign 经 site_id 挂站点,
+    未挂站点时 dial 块回退 settings `sip`(单站点旧行为零变化)。
+
+    `site-local` 不是本表行:它是 `get_default_site` 的虚拟默认站点
+    (env LIVEKIT_URL + sip_edge=none),不入库、不进 list_sites。
+    """
+
+    __tablename__ = "sip_sites"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(64), index=True, default="")
+    name: Mapped[str] = mapped_column(String(255), default="")
+    livekit_url: Mapped[str] = mapped_column(String(512), default="")
+    sip_edge: Mapped[str] = mapped_column(String(16), default="local")  # none/local/cloud
+    trunk_id: Mapped[str] = mapped_column(String(64), default="")
+    numbers_json: Mapped[str] = mapped_column(Text, default="[]")
+    region: Mapped[str] = mapped_column(String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
+
+
 class CampaignItem(Base):
     """战役单条:一个对象一通。scenario=mock 剧本钩子(测试/演练用,生产空)。"""
     __tablename__ = "campaign_items"

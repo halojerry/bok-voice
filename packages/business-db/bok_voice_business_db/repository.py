@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -27,6 +28,41 @@ from . import models
 
 def _uuid() -> str:
     return uuid.uuid4().hex[:12]
+
+
+def _normalize_site_numbers(value: Any) -> list[str]:
+    """号码池归一：None/畸形值（字符串、标量）→ []，两后端共用防分叉。"""
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(x) for x in value]
+
+
+def _parse_site_numbers(raw: str) -> list[str]:
+    """`numbers_json` 反序列化：空/坏 JSON/非数组一律 []（脏行不拖垮站点列表）。"""
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [str(x) for x in data]
+
+
+def _default_site_dict(account_id: str) -> dict:
+    """虚拟默认站点 `site-local`（spec 2026-09-13 P1.5：不入库，无行时兜底）。
+
+    两后端共用同一出口：livekit_url 取 env `LIVEKIT_URL`（agent/worker 同源），
+    缺省本地 LiveKit；sip_edge=none=纯 WebRTC 无电话边缘；trunk 留空由 dial 块
+    回退 settings `sip.trunk_id`——未配站点的外呼行为与本表引入前零变化。
+    """
+    return {
+        "id": "site-local", "account_id": account_id, "name": "local",
+        "livekit_url": os.environ.get("LIVEKIT_URL", "") or "ws://127.0.0.1:7880",
+        "sip_edge": "none", "trunk_id": "", "numbers": [], "region": "",
+        "created_at": "", "updated_at": "",
+    }
 
 
 class SqlAlchemyBusinessRepository:
@@ -910,6 +946,68 @@ class SqlAlchemyBusinessRepository:
         )
         return self._item_to_dict(row) if row else None
 
+    # ---- sip_sites（电话边缘站点，spec 2026-09-13 P1.5）----
+
+    @staticmethod
+    def _site_to_dict(row: models.SipSite) -> dict:
+        return {
+            "id": row.id, "account_id": row.account_id, "name": row.name,
+            "livekit_url": row.livekit_url, "sip_edge": row.sip_edge,
+            "trunk_id": row.trunk_id, "numbers": _parse_site_numbers(row.numbers_json),
+            "region": row.region,
+            "created_at": row.created_at.isoformat() if row.created_at else "",
+            "updated_at": row.updated_at.isoformat() if row.updated_at else "",
+        }
+
+    def create_site(self, account_id: str = "acc-001", *, name: str,
+                    livekit_url: str = "", sip_edge: str = "local",
+                    trunk_id: str = "", numbers: list[str] | None = None,
+                    region: str = "") -> dict:
+        row = models.SipSite(
+            id=f"site-{_uuid()}", account_id=account_id, name=name,
+            livekit_url=livekit_url, sip_edge=sip_edge, trunk_id=trunk_id,
+            numbers_json=json.dumps(_normalize_site_numbers(numbers), ensure_ascii=False),
+            region=region,
+        )
+        self.session.add(row)
+        self.session.commit()
+        return self._site_to_dict(row)
+
+    def list_sites(self, account_id: str = "acc-001") -> list[dict]:
+        rows = (
+            self.session.query(models.SipSite)
+            .filter(models.SipSite.account_id == account_id)
+            .order_by(models.SipSite.created_at.asc())
+            .all()
+        )
+        return [self._site_to_dict(r) for r in rows]
+
+    def get_site(self, site_id: str) -> dict | None:
+        row = self.session.get(models.SipSite, site_id) if site_id else None
+        return self._site_to_dict(row) if row else None
+
+    def update_site(self, site_id: str, **fields: Any) -> dict | None:
+        row = self.session.get(models.SipSite, site_id) if site_id else None
+        if not row:
+            return None
+        for key in ("name", "livekit_url", "sip_edge", "trunk_id", "numbers", "region"):
+            if key in fields and fields[key] is not None:
+                # 未知键（含 id/account_id/created_at/updated_at）忽略；None=不修改、
+                # 空串/空列表=清空（同 update_roster_entry 姿势）。numbers 走 JSON
+                # 列，读侧 ISO/JSON 反序列化由 _site_to_dict 统一收口。
+                value = fields[key]
+                if key == "numbers":
+                    row.numbers_json = json.dumps(
+                        _normalize_site_numbers(value), ensure_ascii=False)
+                else:
+                    setattr(row, key, value)
+        self.session.commit()
+        return self._site_to_dict(row)
+
+    def get_default_site(self, account_id: str = "acc-001") -> dict:
+        """默认站点合成（不入库）：未配站点时的兜底站点，与库中行无关。"""
+        return _default_site_dict(account_id)
+
     @staticmethod
     def default_settings() -> dict:
         return {
@@ -993,6 +1091,7 @@ class InMemoryBusinessRepository:
         self.roster: dict[str, dict] = {}
         self.campaigns: dict[str, dict] = {}
         self.campaign_items: dict[str, dict] = {}
+        self.sites: dict[str, dict] = {}
         self.filler_entries: dict[str, dict] = {}
         self.settings: dict = SqlAlchemyBusinessRepository.default_settings()
 
@@ -1521,3 +1620,59 @@ class InMemoryBusinessRepository:
             if row["call_id"] == call_id:
                 return dict(row)
         return None
+
+    # ---- sip_sites（电话边缘站点，spec 2026-09-13 P1.5）----
+
+    @staticmethod
+    def _site_public(row: dict) -> dict:
+        # 与 SQL 侧同出口：numbers 读侧恒为副本（SQL 走 json.loads 天然如此），
+        # 调用方原地改不污染库——两后端 API 形状对齐。
+        out = dict(row)
+        out["numbers"] = list(row.get("numbers") or [])
+        return out
+
+    def create_site(self, account_id: str = "acc-001", *, name: str,
+                    livekit_url: str = "", sip_edge: str = "local",
+                    trunk_id: str = "", numbers: list[str] | None = None,
+                    region: str = "") -> dict:
+        now = datetime.now(timezone.utc).isoformat()
+        row = {
+            "id": f"site-{uuid.uuid4().hex[:12]}", "account_id": account_id,
+            "name": name, "livekit_url": livekit_url, "sip_edge": sip_edge,
+            "trunk_id": trunk_id, "numbers": _normalize_site_numbers(numbers),
+            "region": region, "created_at": now, "updated_at": now,
+        }
+        self.sites[row["id"]] = row
+        return self._site_public(row)
+
+    def list_sites(self, account_id: str = "acc-001") -> list[dict]:
+        rows = [self._site_public(r) for r in self.sites.values()
+                if r["account_id"] == account_id]
+        return sorted(rows, key=lambda r: r["created_at"])
+
+    def get_site(self, site_id: str) -> dict | None:
+        row = self.sites.get(site_id)
+        return self._site_public(row) if row else None
+
+    def update_site(self, site_id: str, **fields: Any) -> dict | None:
+        row = self.sites.get(site_id)
+        if not row:
+            return None
+        # 与 SQL 侧同款白名单：未知键（含 id/account_id/created_at/updated_at）
+        # 忽略、None 不修改、空串/空列表清空（同 update_roster_entry 姿势）。
+        # updated_at 是 SQL onupdate 的镜像：值真变了才刷（SQL 只在行 dirty
+        # 时发 UPDATE）。
+        changed = False
+        for key in ("name", "livekit_url", "sip_edge", "trunk_id", "numbers", "region"):
+            if key in fields and fields[key] is not None:
+                value = _normalize_site_numbers(fields[key]) if key == "numbers" else fields[key]
+                if row.get(key) != value:
+                    changed = True
+                row[key] = value
+        if changed:
+            row["updated_at"] = datetime.now(timezone.utc).isoformat()
+        return self._site_public(row)
+
+    def get_default_site(self, account_id: str = "acc-001") -> dict:
+        """默认站点合成（不入库）：未配站点时的兜底站点，与库中行无关。"""
+        return _default_site_dict(account_id)
