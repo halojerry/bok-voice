@@ -74,3 +74,15 @@ def test_campaign_loop_covers_all_accounts(monkeypatch):
     repo.update_campaign(camp_b["id"], status="running")
     running = repo.list_campaigns("", status="running")
     assert {c["id"] for c in running} == {camp_a["id"], camp_b["id"]}
+
+
+def test_settle_docs_path_sanitizes_object_id(monkeypatch, tmp_path):
+    from control_plane import main as cp_main
+
+    # brief 原文期望值 ".._.._acc-002_knowledge_evil" 与其自身实现矛盾：
+    # 白名单 [A-Za-z0-9_-] 不含 `.`，`../../` 六字符全收成下划线（`.` 漏过会让
+    # 纯 ".." 原样成段=遍历仍在）。以实现/docstring/commit message 一致的收敛为准。
+    assert cp_main._safe_segment("../../acc-002/knowledge/evil", "unknown") == "______acc-002_knowledge_evil"
+    assert cp_main._safe_segment("..", "unknown") == "__"  # 纯 .. 不成遍历段
+    assert cp_main._safe_segment("", "unknown") == "unknown"
+    assert cp_main._safe_segment("obj-abc123", "unknown") == "obj-abc123"
