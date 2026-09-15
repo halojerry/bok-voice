@@ -2618,8 +2618,17 @@ async def delete_knowledge(request: Request, knowledge_id: str, account_id: str 
 @app.post("/api/knowledge/import")
 async def import_knowledge(req: ImportRequest, request: Request) -> dict:
     require_role(request, "admin", "root")
-    result = await app.state.knowledge.import_document(req.account_id, req.path, req.content)
-    _audit("knowledge.import", subject_type="knowledge", subject_id=req.path or "", detail={"account_id": req.account_id, "content_len": len(req.content)})
+    # 账号收窄（2026-09-16 深测 P2）：读侧 search/list/delete 都过 scoped_account，
+    # 写侧曾原样收 body account_id——admin 可写穿他账号知识命名空间（读写口径分裂）。
+    account_id = scoped_account(request, req.account_id)
+    # 路径段校验：vault 内相对路径不允许 ..（跨目录挪位；与 LocalMarkdownSource
+    # 的 root 逃逸守卫互补——那层只防逃出 vault，不防 vault 内跨账号目录）。
+    parts = [p for p in req.path.replace("\\", "/").split("/") if p]
+    if any(p == ".." for p in parts):
+        raise HTTPException(status_code=400, detail="path must not contain '..'")
+    result = await app.state.knowledge.import_document(account_id, req.path, req.content)
+    _audit("knowledge.import", subject_type="knowledge", subject_id=req.path or "",
+           account_id=account_id, detail={"content_len": len(req.content)})
     return result
 
 

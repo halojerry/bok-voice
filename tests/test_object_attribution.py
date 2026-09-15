@@ -86,3 +86,26 @@ def test_settle_docs_path_sanitizes_object_id(monkeypatch, tmp_path):
     assert cp_main._safe_segment("..", "unknown") == "__"  # 纯 .. 不成遍历段
     assert cp_main._safe_segment("", "unknown") == "unknown"
     assert cp_main._safe_segment("obj-abc123", "unknown") == "obj-abc123"
+
+
+def test_knowledge_import_scoped_and_no_dotdot(monkeypatch, tmp_path):
+    monkeypatch.setenv("VAULT_ROOT", str(tmp_path))
+    client, repo = _make(monkeypatch)  # _make 已用 hash_password 建号（Task 8）
+    repo.create_user(username="adm", password_hash=hash_password(PW),
+                     role="admin", org_id="org-t", account_id="acc-001")
+    with client:  # startup：装配 app.state.knowledge（VAULT_ROOT 此刻已 patch）
+        r = client.post("/api/auth/login", json={"username": "adm", "password": PW})
+        h = {"Authorization": "Bearer " + r.json()["token"]}
+        # ① body account_id 指他账号 → 被压回本账号（旧版 200 写进他账号命名空间）
+        r = client.post("/api/knowledge/import",
+                        json={"account_id": "acc-002", "path": "notes.md", "content": "hi"},
+                        headers=h)
+        assert r.status_code == 200
+        assert not (tmp_path / "accounts" / "acc-002").exists()
+        assert (tmp_path / "accounts" / "acc-001" / "knowledge" / "notes.md").exists()
+        # ② path 含 .. → 400
+        r = client.post("/api/knowledge/import",
+                        json={"account_id": "acc-001", "path": "../acc-002/knowledge/x.md",
+                              "content": "pwned"},
+                        headers=h)
+        assert r.status_code == 400
