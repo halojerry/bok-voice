@@ -17,6 +17,7 @@ class Base(DeclarativeBase):
 class Account(Base):
     __tablename__ = "accounts"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    org_id: Mapped[str] = mapped_column(String(64), default="", index=True)  # 租户缝（B1 身份）
     display_name: Mapped[str] = mapped_column(String(255), default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
@@ -73,6 +74,8 @@ class ConversationTemplate(Base):
     # 本套话术专属 ASR 热词(2026-09-08):逗号/顿号/分号/换行分隔,随会话装配并入
     # asr_hotword_context 下发 /api/start context(数字主导词会被过滤,防幻听号码)。
     hotwords: Mapped[str] = mapped_column(Text, default="")
+    # 话务员级归属(B3):''=账号共享 / user_id=话务员个人——user 只见自己的+共享。
+    owner_user_id: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
@@ -93,6 +96,8 @@ class CallSession(Base):
     object_id: Mapped[str] = mapped_column(String(64), index=True)
     persona_id: Mapped[str] = mapped_column(String(64), default="")
     template_id: Mapped[str] = mapped_column(String(64), default="")
+    # 建单人身份(B3):user_id——运行时 QA 检索按「共享+建单人个人」收窄;战役建单无身份=''。
+    created_by: Mapped[str] = mapped_column(String(64), default="")
     mode: Mapped[str] = mapped_column(String(32), default="simulation")
     direction: Mapped[str] = mapped_column(String(32), default="webrtc")
     language: Mapped[str] = mapped_column(String(16), default="zh")
@@ -325,6 +330,8 @@ class QaEntry(Base):
     __tablename__ = "qa_entries"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     account_id: Mapped[str] = mapped_column(String(64), index=True, default="acc-001")
+    # 话务员级归属(B3):''=账号共享 / user_id=话务员个人。
+    owner_user_id: Mapped[str] = mapped_column(String(64), default="")
     question_text: Mapped[str] = mapped_column(Text)
     answer_text: Mapped[str] = mapped_column(Text)
     lang: Mapped[str] = mapped_column(String(16), default="zh")
@@ -386,6 +393,28 @@ class Node(Base):
     status: Mapped[str] = mapped_column(String(16), default="offline")  # online/offline/revoked
     metrics_json: Mapped[str] = mapped_column(Text, default="{}")
     last_seen_at: Mapped[object] = mapped_column(DateTime, default=None, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class User(Base):
+    """平台用户（三层 RBAC：root/admin/user，thin-node spec §7 2026-09-14 修订）。
+
+    密码只存 scrypt hash（control_plane/auth.py）；username 全库唯一。
+    org/account 是数据边界：user 只见本 account（+本人资源），admin 见整 org，
+    root 跨 org。机器通道（BOK_CP_TOKEN / node_token）与用户身份严格分离。
+    """
+
+    __tablename__ = "users"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    org_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    account_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255), default="")
+    display_name: Mapped[str] = mapped_column(String(255), default="")
+    role: Mapped[str] = mapped_column(String(16), default="user")  # root/admin/user
+    status: Mapped[str] = mapped_column(String(16), default="active")  # active/disabled
+    # B4 页面权限：JSON 数组串（''=默认集，读侧见 control_plane/permissions.py）。
+    permissions_json: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 

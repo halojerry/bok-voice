@@ -1,0 +1,83 @@
+name: Cloud CP image
+
+# 云端控制面容器镜像：构建 → 起容器冒烟（/health + 管理台静态站）→ 推送 GHCR。
+# PR 只构建+冒烟不推送；push 到 main / v* tag 才推（latest + sha-<short> + git tag）。
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+concurrency:
+  group: cloud-image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    name: Build, smoke, push CP image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # GHCR 要求全小写仓库名（owner 可能含大写），在下方 step 里归一后回写
+      IMAGE_NAME: ghcr.io/${{ github.repository }}
+      SMOKE_URL: http://127.0.0.1:18000
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t bok-cp:ci .
+
+      - name: Smoke test (health + admin console)
+        run: |
+          set -euo pipefail
+          docker run -d --name cp-smoke -p 127.0.0.1:18000:8000 bok-cp:ci
+          # 轮询等待 uvicorn 起监听：docker-proxy 秒级就绪而应用 ~1-2s 才 bind，
+          # 该窗口 curl 会吃到 connection reset（exit 56）——旧 curl 不把它当
+          # 瞬态错误重试（CI 首跑实证），必须显式循环兜住一切失败形态。
+          for i in $(seq 1 30); do
+            if curl -fsS "${SMOKE_URL}/health" > /tmp/cp-health.json 2>/dev/null; then break; fi
+            sleep 1
+          done
+          health="$(cat /tmp/cp-health.json 2>/dev/null || true)"
+          echo "health: ${health}"
+          [[ "${health}" == *'"ok":true'* ]] || { echo "health 响应不含 ok:true"; exit 1; }
+          # 管理台静态站（Next.js 导出挂载在 CP 根路径），200 且是 HTML
+          index_status="$(curl -sS -o /tmp/cp-index.html -w '%{http_code}' "${SMOKE_URL}/")"
+          echo "GET / -> ${index_status}"
+          [[ "${index_status}" == "200" ]] || { echo "管理台静态站未就绪"; exit 1; }
+          grep -qi '<html' /tmp/cp-index.html || { echo "/ 返回内容不是 HTML"; exit 1; }
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs cp-smoke || true
+
+      - name: Teardown smoke container
+        if: always()
+        run: docker rm -f cp-smoke || true
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag + push to GHCR
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          image="$(echo "${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')"
+          tags=("latest" "sha-${GITHUB_SHA::7}")
+          # v* tag 推送时额外打 git tag（refs/tags/v1.2.3 → v1.2.3）
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            tags+=("${GITHUB_REF_NAME}")
+          fi
+          for tag in "${tags[@]}"; do
+            docker tag bok-cp:ci "${image}:${tag}"
+            docker push "${image}:${tag}"
+          done

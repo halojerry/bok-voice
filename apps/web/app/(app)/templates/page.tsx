@@ -1,9 +1,10 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { api } from "@/lib/api";
+import { api, type UserRow } from "@/lib/api";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
+import { useSession } from "@/components/session-context";
 
 const LANGS = [
   ["zh", "普通话"],
@@ -205,6 +206,13 @@ export default function TemplatesPage() {
   const [err, setErr] = useState<string | null>(null);
   const [ok, setOk] = useState(false);
   const [loading, setLoading] = useState(true);
+  // B4：归属徽标与编辑权——话务员（user）只能改自己的条目，共享/他人只读（服务端 403 兜底）。
+  const session = useSession();
+  const [userNames, setUserNames] = useState<Record<string, string>>({});
+  const [scopeTab, setScopeTab] = useState<"all" | "mine" | "shared">("all");
+  const isManager = Boolean(
+    session && (session.anonymous || session.role === "admin" || session.role === "root"),
+  );
 
   async function refresh() {
     setLoading(true);
@@ -222,6 +230,34 @@ export default function TemplatesPage() {
   useEffect(() => {
     refresh();
   }, [accountId]);
+
+  // 主管面：拉成员表把归属 user_id 显示成姓名（话务员无权访问 /api/users，不请求）。
+  useEffect(() => {
+    if (!isManager) return;
+    let alive = true;
+    void (async () => {
+      try {
+        const raw = (await api.listUsers()) as unknown;
+        // 兼容裸数组与 {users:[...]} 包裹两种响应形态。
+        const list = Array.isArray(raw)
+          ? (raw as UserRow[])
+          : Array.isArray((raw as { users?: UserRow[] })?.users)
+            ? (raw as { users: UserRow[] }).users
+            : [];
+        if (!alive) return;
+        const map: Record<string, string> = {};
+        list.forEach((u) => {
+          map[u.id] = u.display_name || u.username || u.id;
+        });
+        setUserNames(map);
+      } catch {
+        if (alive) setUserNames({}); // 拉不到成员名时退化为「个人」徽标
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [isManager]);
 
   function edit(row: Record<string, unknown>) {
     setEditingId(String(row.id ?? ""));
@@ -263,6 +299,8 @@ export default function TemplatesPage() {
       setSteps([]);
       setEditingId(null);
       setOk(true);
+      // 话务员新建的模板归属本人：切回「全部」保证刚保存的条目可见。
+      if (!isManager) setScopeTab("all");
       await refresh();
     } catch (e) {
       setErr(String(e));
@@ -292,13 +330,43 @@ export default function TemplatesPage() {
     setTableText("");
   }
 
+  if (!session) return <LoadingState label="正在读取会话…" />;
+
+  const ownerIdOf = (row: Record<string, unknown>) => String(row.owner_user_id ?? "");
+  const mineCount = rows.filter((r) => session.user_id !== "" && ownerIdOf(r) === session.user_id).length;
+  const sharedCount = rows.filter((r) => ownerIdOf(r) === "").length;
+  // 话务员视图是服务端已过滤的「共享+本人」，这里只做客户端分组。
+  const visibleRows =
+    isManager || scopeTab === "all"
+      ? rows
+      : rows.filter((r) => (scopeTab === "mine" ? ownerIdOf(r) === session.user_id : ownerIdOf(r) === ""));
+
   const textarea = "w-full resize-none rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)";
 
   return (
     <div>
-      <div className="mb-8">
-        <h1 className="page-title">话术库</h1>
-        <p className="page-sub">可复用的对话模板 · 开场白 / 核心话术 / 异议应对 / 收尾，对象卡可绑定</p>
+      <div className="mb-8 flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <h1 className="page-title">话术库</h1>
+          <p className="page-sub">可复用的对话模板 · 开场白 / 核心话术 / 异议应对 / 收尾，对象卡可绑定</p>
+        </div>
+        {!isManager && (
+          <div className="flex items-center gap-1">
+            {([
+              ["all", `全部（${rows.length}）`],
+              ["mine", `我的（${mineCount}）`],
+              ["shared", `共享（${sharedCount}）`],
+            ] as const).map(([key, label]) => (
+              <button
+                key={key}
+                className={`btn-ghost text-xs ${scopeTab === key ? "border-(--accent) text-accent" : "muted"}`}
+                onClick={() => setScopeTab(key)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_440px]">
@@ -308,24 +376,63 @@ export default function TemplatesPage() {
             <LoadingState />
           ) : rows.length === 0 ? (
             <EmptyState label="暂无话术模板，请在右侧新建。" />
+          ) : visibleRows.length === 0 ? (
+            <EmptyState label="该分组下暂无话术模板。" />
           ) : (
             <div className="space-y-3">
-              {rows.map((row) => {
+              {visibleRows.map((row) => {
                 const id = String(row.id ?? "");
+                const ownerId = ownerIdOf(row);
+                const isMine = session.user_id !== "" && ownerId === session.user_id;
+                const canEdit = isManager || isMine;
+                const ownerLabel =
+                  ownerId === ""
+                    ? "共享"
+                    : isManager
+                      ? userNames[ownerId] || "个人"
+                      : isMine
+                        ? "我的"
+                        : "他人";
                 return (
                   <div key={id} className="rounded-lg bg-white/5 p-4">
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
-                        <p className="font-medium">{String(row.name ?? "-")}</p>
+                        <p className="flex flex-wrap items-center gap-2 font-medium">
+                          {String(row.name ?? "-")}
+                          <span
+                            className={`rounded-sm px-1.5 py-0.5 text-[10px] font-normal ${
+                              ownerId === "" ? "bg-white/10 muted" : "bg-sky-400/15 text-sky-300"
+                            }`}
+                          >
+                            {ownerLabel}
+                          </span>
+                        </p>
                         <p className="mt-1 text-xs muted">
                           {LANGS.find((l) => l[0] === String(row.language ?? "zh"))?.[1] ?? String(row.language ?? "zh")}
                           {String(row.tone_override ?? "") && ` · 语气 ${String(row.tone_override)}`}
                           {String(row.hotwords ?? "") && ` · 热词 ${String(row.hotwords)}`}
                         </p>
                       </div>
-                      <div className="flex shrink-0 gap-2">
-                        <button className="btn-ghost text-xs" onClick={() => edit(row)}>编辑</button>
-                        <button className="btn-ghost text-xs text-red-300" onClick={() => remove(id)}>删除</button>
+                      <div
+                        className="flex shrink-0 gap-2"
+                        title={canEdit ? undefined : "共享话术由主管维护"}
+                      >
+                        <button
+                          className="btn-ghost text-xs"
+                          disabled={!canEdit}
+                          title={canEdit ? undefined : "共享话术由主管维护"}
+                          onClick={() => edit(row)}
+                        >
+                          编辑
+                        </button>
+                        <button
+                          className="btn-ghost text-xs text-red-300"
+                          disabled={!canEdit}
+                          title={canEdit ? undefined : "共享话术由主管维护"}
+                          onClick={() => remove(id)}
+                        >
+                          删除
+                        </button>
                       </div>
                     </div>
                     <div className="mt-2 text-xs">

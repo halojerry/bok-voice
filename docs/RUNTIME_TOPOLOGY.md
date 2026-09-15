@@ -69,7 +69,8 @@
 - **Q→A 快路**：`agent_runtime/qa_gate.py` + CP `/api/qa-entries`、
   `/api/reports/qa-pairs`——四道闸（作用域/关键信号旁路/推进收线让位/阈值 0.90）
   全过且应答音频已缓存才跳过 LLM；挖掘入库 `bok.py tts-mine --apply N`。
-  开关 `BOK_QA_FASTPATH=0`。
+  开关 `BOK_QA_FASTPATH=0`。B3：装配取数钉本通账号+`owner_scope=created_by`
+  （共享+建单人个人条目；战役等无主通话='' 仅共享），不再硬编码 acc-001。
 
 ### 音频设备（设置页）
 
@@ -116,6 +117,70 @@
 - 拒绝收线：客户明确拒绝/告别（`flow.py` REFUSE 判定）→ agent 注入收尾话术讲一句
   礼貌再见，随后 `POST /api/supervisor/{id}/end` 置 `ended` + `disposition=declined`
   并断房，结算由 agent `_on_close` 幂等触发。
+- **静默旁听（2026-09-14 路线 A）**：`POST /api/supervisor/{id}/listen` 签发
+  `purpose=listen` token（can_publish/can_publish_data=False、can_subscribe=True），
+  **不挂 RoomConfiguration、不翻通话状态**（听一通 paused 不得把它恢复 active）；
+  被听方无任何提示（产品拍板），`supervisor.listen.start`（签发即记）+
+  `/listen/stop`（补时长）双审计。web 入口 `/supervisor?listen=<id>`，
+  `ListenPanel` 用官方 LiveKitRoom 只订阅、绝不发布麦克风。
+- **主管台真实化（2026-09-14）**：通话卡片直接操作（暂停/恢复/接管/转人工/挂断，均 confirm），
+  卡片展示 对象/语言/当前话术步/已进行时长/最近一句客户话（`/api/calls/{id}/turns` 的
+  template_step/speaker，3–4s 轮询只跑在途通话）；「进入工作台」深链 `/calls?call=<id>`；
+  原「质量监控/纪律控制」占位卡已删。
+- **登录与权限分面（B4，2026-09-14）**：`/login` 登录（localStorage `bok_token`，
+  api.ts 自动附 Bearer、401 跳登录页）；**无 token=匿名本地模式**（全部页面+acc-001，
+  单机 auth-off 现状零变化）。SessionProvider 拉 `/api/auth/me`（含 `permissions`
+  有效集）；导航按权限过滤（user=8 键目录 ∩ 本人权限，主管专属面 admin 可见），
+  路由守卫 `gateForPath`（无权面板）。`/users` 员工管理（admin 建号/启停/重置密码/
+  按人勾选 8 权限键）；`/qa` 快答库页（B3 owner 分档）；话术页归属徽标。
+  后端 `_gate_page` 逐请求查库——主管改权限对在线 token 即时生效。
+
+### 外呼战役（mock 档，spec 2026-09-12-outbound-campaign-roster）
+
+```text
+web /campaigns（建波/启停/进度表）
+  → CP POST /api/campaigns（object_ids 名单 + scenarios/scripts mock 剧本钩子）
+    + POST /api/campaigns/{id}/start
+  → CP 常驻 campaign loop（campaign.py `_campaign_loop`，5s 巡检 POLL_S）
+      ①收割：dialing/in_call 的 item 其通话已终态 → item 落结果（幂等）
+      ②串行：无进行中 item 且有 pending → 建通话 + explicit agent dispatch
+        （metadata 带 `dial` 块），item 置 dialing；**任意时刻至多 1 路在跑**
+      ③名单尽 → campaign done
+      起拨前 gap 冷却：最近终态 item 距今 < gap_seconds 不起下一通（首通不受门控）
+  → agent 收 metadata `dial` 块 → dial_outbound（dialer.py，四态出口）
+      real 档：官方 CreateSIPParticipant(wait_until_answered) + SipCallError 码映射
+               （486/603 拒接、408/480 无人接、5xx trunk 故障）；需 Redis + 公网
+               reachable 的 trunk，本地 mock 档无需
+      mock 档：CP `POST /api/sip/mock/callee` 派生 scripts/mock_callee.py 子进程
+               （真 TTS 客户语音进房；answer 逐句轮播 / no_answer 不入房 /
+               reject 进房即离 / hangup_mid 说一句就走）
+        · 台词从 dial 块 `script` 下发，空台词按语言默认 2 句兜底
+        · `speak_interval_s` 控句间隔；子进程会等 AI 讲完（对端音轨能量）
+          再出声，避免与开场白撞轮
+      → wait_for_participant：超时=no_answer、进房 1.5s 内离房零音频=rejected
+  → agent `POST /api/calls/{id}/dial-result`（answered→ACTIVE，三失败态→ENDED+
+    disposition）→ CP 按 call_id 反查 campaign item 同步状态（只认 dialing/in_call）
+  → 接通后走正常 A 线装配（开场白=话术第 1 步直念）；captured 号码自动入名册
+  → web /roster（认领池：unclaimed → claimed → handled）
+```
+
+- `BOK_SIP_MODE` 是 dial 后端 kill-switch（有值即终局：`mock`/`real`，非法值
+  回落 mock）；缺省读设置 DB `sip.mode`（设置页 SIP 卡片）。agent 侧
+  `resolve_dial_mode` 与 CP 侧 `_dial_mode` 同语义双实现（跨包分层，CP 不 import agent）。
+- mock 客户子进程日志落 `runtime/logs/mock-callee.log`（`MOCK_CALLEE event=…`
+  结构化行，E2E 断言素材）；房间断开立即收尾，CP 起子进程后起 daemon reaper 防僵尸。
+- campaign 名单由 `POST /api/campaigns` 一次建仓：对象无电话 → item 直接 `skipped`
+  （且不作 gap 冷却锚）。
+- mock 剧本钩子（`scenarios`/`scripts`/`mock_speak_interval_s`）只服务演练与 E2E；
+  campaign 级存 `campaigns.scripts_json`（无独立列，`__` 前缀键放 campaign 级参数），
+  起拨时按 object_id 取台词塞进 dial 块 `script`。真实 SIP 拨号恒为空。
+- **话术快照（2026-09-14）**：`campaigns.template_id` 由 `_start_call` 写入建单
+  （`POST /api/calls` 的 `template_id`），agent 装配读 `call_sessions.template_id`
+  优先、回落对象卡绑定——此前该字段只存不读，运营在战役里选的话术被静默忽略。
+- **删除战役**：`DELETE /api/campaigns/{id}`——running 拒删（409，先停止），
+  删除连名单项一起清并审计 `campaign.delete`。
+- 全链路 E2E：`python scripts/e2e_campaign.py`（3 对象战役——1 接通走完话术+captured
+  入名册 / 1 无人接 / 1 接通即挂；断言串行、终态三态、名册入册与 handled 回写）。
 
 ### 外呼战役（mock 档，spec 2026-09-12-outbound-campaign-roster）
 
@@ -300,6 +365,10 @@ WorkerOptions.port)——默认同为 8081 会竞态,后绑者 Errno 48 即崩
 | 服务绑定 | 127.0.0.1 | 仅本机可访问 |
 
 ### 设置（`/api/settings`，Agent 运行时会真实消费）
+
+> web 设置页（2026-09-14 路线 A 瘦身）：主视图只留「语音与凭据 / 音频设备 / 外呼 SIP /
+> 罐头试听 / 本机桌面服务」；ASR/LLM/VAD/运行策略收进底部「开发者参数」折叠区。
+> 默认值不变、PUT 载荷形状不变（CP 零改动）。
 
 - `asr.provider`：`qwen3_asr`（本地 sidecar）/ `fake`（仅测试）。语言值统一 `zh/cantonese/en`（粤语全时空唯一拼写 `cantonese`）；agent 在会话语言为粤语时给 sidecar 传 `language=cantonese` 强制模型按粤语转写，避免 auto 误判成普通话。
 - `llm.provider`：`local_openai`/`mlx`（本地）/ `deepseek`（云端，缺 `api_key` 显式告警并回退本地）/ `fake`。

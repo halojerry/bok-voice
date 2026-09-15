@@ -320,3 +320,51 @@ def test_campaign_sql_backend_parity(monkeypatch):
     repo.update_item(detail["items"][0]["id"], status="dialing", call_id=call["id"])
     client.post(f"/api/calls/{call['id']}/dial-result", json={"status": "answered"})
     assert repo.get_item(detail["items"][0]["id"])["status"] == "in_call"
+
+
+def test_delete_campaign_removes_items_and_audits(monkeypatch):
+    """删战役：连带名单项；审计 campaign.delete；再删 404。"""
+    from bok_voice_obs.audit import AuditStore, audit_store
+
+    events: list[str] = []
+    original = audit_store()
+    monkeypatch.setattr(
+        "bok_voice_obs.audit._STORE",
+        AuditStore(original.directory, tap=lambda e: events.append(e.action)),
+    )
+    client, repo = _client_and_repo(monkeypatch)
+    obj = repo.create_object("acc-001", {"display_name": "A", "phone": "+85211111111"})
+    cid = client.post("/api/campaigns", json=_campaign_body(obj)).json()["id"]
+    assert len(repo.list_items(cid)) == 1
+
+    r = client.delete(f"/api/campaigns/{cid}")
+    assert r.status_code == 200
+    assert r.json() == {"campaign_id": cid, "deleted": True, "items_removed": 1}
+    assert repo.get_campaign(cid) is None
+    assert repo.list_items(cid) == []
+    assert "campaign.delete" in events
+    assert client.delete(f"/api/campaigns/{cid}").status_code == 404
+
+
+def test_delete_running_campaign_is_409(monkeypatch):
+    """在跑波次拒删——先停止再删，防误删名单。"""
+    client, repo = _client_and_repo(monkeypatch)
+    obj = repo.create_object("acc-001", {"display_name": "A", "phone": "+85211111111"})
+    cid = client.post("/api/campaigns", json=_campaign_body(obj)).json()["id"]
+    client.post(f"/api/campaigns/{cid}/start")
+    assert client.delete(f"/api/campaigns/{cid}").status_code == 409
+    assert repo.get_campaign(cid)["status"] == "running"
+
+
+def test_create_call_explicit_template_overrides_object_binding(monkeypatch):
+    """显式话术（战役/话务员自选）建单即快照；缺省仍回落对象卡绑定。"""
+    client, repo = _client_and_repo(monkeypatch)
+    obj = repo.create_object("acc-001", {"display_name": "A", "template_id": "tpl-object"})
+    explicit = client.post("/api/calls", json={
+        "account_id": "acc-001", "object_id": obj["id"], "template_id": "tpl-explicit",
+    }).json()
+    assert explicit["template_id"] == "tpl-explicit"
+    fallback = client.post("/api/calls", json={
+        "account_id": "acc-001", "object_id": obj["id"],
+    }).json()
+    assert fallback["template_id"] == "tpl-object"

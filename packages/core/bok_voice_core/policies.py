@@ -79,6 +79,7 @@ def select_session_manifest(
     template_id: str = "",
     kind: str = "",
     target_lang: str = "",
+    created_by: str = "",
 ) -> SessionManifest:
     return SessionManifest(
         session_id=session_id,
@@ -94,4 +95,5 @@ def select_session_manifest(
         template_id=template_id,
         kind=kind,
         target_lang=target_lang,
+        created_by=created_by,
     )

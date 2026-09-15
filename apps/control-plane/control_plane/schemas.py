@@ -15,6 +15,9 @@ class TokenRequest(BaseModel):
     # other(同传对方端) / supervisor(主管旁听)。官方契约路径(participant_identity
     # 前缀)优先于本字段。
     role: str = "operator"
+    # 签发用途:""=正常入房 / "listen"=主管静默旁听专线(can_publish 全关,
+    # 不加 RoomConfiguration——主管不是房间创建者,不得建房/拉起 agent)。
+    purpose: str = ""
     # ---- LiveKit 官方 TokenSource endpoint 契约(livekit_token_source.proto,
     # snake_case 请求体)。room_name/participant_identity 提供时优先于旧字段。
     room_name: str = ""
@@ -31,11 +34,51 @@ class TokenResponse(BaseModel):
     participantToken: str = ""
 
 
+class ListenStopRequest(BaseModel):
+    """旁听结束回执：seconds=本次旁听时长（前端尽力而为，取不到传 0）。"""
+
+    seconds: int = 0
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class ChangePasswordRequest(BaseModel):
+    old_password: str
+    # 最低 8 位，校验在端点侧（scrypt hash 见 control_plane/auth.py）。
+    new_password: str
+
+
+class CreateUserRequest(BaseModel):
+    username: str
+    password: str
+    role: str = "user"  # root/admin/user
+    org_id: str = ""
+    account_id: str = ""
+    display_name: str = ""
+    # B4 页面权限（仅 role=user 目标）：键 ⊆ permissions.GRANTABLE_PERMISSIONS；
+    # None=不写（存 '' → 读侧默认集），list 含 '[]' 时=全关。
+    permissions: list[str] | None = None
+
+
+class UpdateUserRequest(BaseModel):
+    password: str = ""  # 非空=重置密码
+    status: str = ""  # active/disabled
+    display_name: str = ""
+    role: str = ""  # 仅 root 可改
+    # B4：None=不改权限（与 '' 区分——空 list 是「全关」这一显式意图）。
+    permissions: list[str] | None = None
+
+
 class CreateCallRequest(BaseModel):
     account_id: str
     # 同传会话(kind=interpret)没有客服对象,允许空。
     object_id: str = ""
     persona_id: str = ""
+    # 显式话术(建单即快照):外呼战役/话务员自选话术走这里;空=回落对象卡绑定。
+    template_id: str = ""
     mode: CallMode = CallMode.SIMULATION
     direction: str = "webrtc"
     language: str = "zh"
@@ -80,6 +123,8 @@ class UpdateObjectRequest(BaseModel):
 
 class TemplateRequest(BaseModel):
     account_id: str = ""
+    # 话务员级归属(B3):''=账号共享 / user_id=话务员个人;user 建的 CP 强制盖章本人。
+    owner_user_id: str = ""
     name: str = ""
     opening: str = ""
     core: str = ""
@@ -93,6 +138,8 @@ class TemplateRequest(BaseModel):
 
 class UpdateTemplateRequest(BaseModel):
     account_id: str = ""
+    # 所有权转移只归 admin/root(user 的 payload 由 CP 剥掉);非 root 的 account_id 冻结。
+    owner_user_id: str = ""
     name: str = ""
     opening: str = ""
     core: str = ""
@@ -287,6 +334,8 @@ class QaEntryCreate(BaseModel):
     voice_id: str = ""
     template_id: str = ""
     account_id: str = "acc-001"
+    # 话务员级归属(B3):''=账号共享 / user_id=话务员个人;user 建的 CP 强制盖章本人。
+    owner_user_id: str = ""
     source: str = "curated"
     enabled: bool = True
 
@@ -299,3 +348,5 @@ class QaEntryPatch(BaseModel):
     step_index: Optional[int] = None
     voice_id: Optional[str] = None
     enabled: Optional[bool] = None
+    # 所有权转移只归 admin/root(user 的 patch 由 CP 剥掉)。
+    owner_user_id: Optional[str] = None

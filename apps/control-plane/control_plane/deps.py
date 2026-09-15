@@ -60,24 +60,20 @@ def build_engine() -> Engine | None:
         # create_all 不会给已存在的表加列 —— 幂等补上新增列。注意 SQLite 不支持
         # `ADD COLUMN IF NOT EXISTS`（MySQL 语法，会抛错被吞），必须先查列是否存在。
         try:
+            from sqlalchemy import inspect as sa_inspect
             from sqlalchemy import text
 
             def _ensure_column(conn, table: str, column: str, ddl: str) -> None:
-                dialect = engine.dialect.name
-                if dialect == "sqlite":
-                    exists = any(
-                        row[1] == column
-                        for row in conn.execute(text(f"PRAGMA table_info({table})"))
-                    )
-                else:
-                    exists = conn.execute(
-                        text(
-                            "SELECT 1 FROM information_schema.columns "
-                            "WHERE table_name = :t AND column_name = :c"
-                        ),
-                        {"t": table, "c": column},
-                    ).first() is not None
-                if not exists:
+                # 存在性探测走 SQLAlchemy inspector：方言无关（sqlite/postgres 同一套），
+                # 且由方言把范围限定到当前 schema。旧实现用不带 schema 过滤的
+                # information_schema 查询，多 schema 库（共享 PG 实例、Supabase 的
+                # auth/storage schema、并排 staging schema）里有同名表就被误判「列已存在」
+                # → ALTER 跳过、存量库升级静默丢列（2026-09-15 真 Postgres 冒烟实证）。
+                # 表不存在=跳过该列（半旧库不再让整块补列中断）。
+                insp = sa_inspect(conn)
+                if not insp.has_table(table):
+                    return
+                if column not in {c["name"] for c in insp.get_columns(table)}:
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
 
             with engine.begin() as conn:
@@ -86,6 +82,12 @@ def build_engine() -> Engine | None:
                     "object_profiles",
                     "template_id",
                     "template_id VARCHAR(64) DEFAULT ''",
+                )
+                _ensure_column(
+                    conn,
+                    "accounts",
+                    "org_id",
+                    "org_id VARCHAR(64) DEFAULT ''",
                 )
                 _ensure_column(
                     conn,
@@ -201,6 +203,13 @@ def build_engine() -> Engine | None:
                 # 战役挂站点（spec 2026-09-13 P1.5 Task 2）：空串=未挂站点，dial 块
                 # trunk 回退 settings `sip`（单站点旧行为零变化）。
                 _ensure_column(conn, "campaigns", "site_id", "site_id VARCHAR(64) DEFAULT ''")
+                # 话务员级资源(B3):话术/QA 个人归属 + 通话建单人——''=共享/无主。
+                _ensure_column(conn, "conversation_templates", "owner_user_id", "owner_user_id VARCHAR(64) DEFAULT ''")
+                _ensure_column(conn, "qa_entries", "owner_user_id", "owner_user_id VARCHAR(64) DEFAULT ''")
+                _ensure_column(conn, "call_sessions", "created_by", "created_by VARCHAR(64) DEFAULT ''")
+                # 页面权限(B4):主管按人配置话务员可见面——''=默认集（7 键，报表默认关），
+                # 否则=JSON 数组精确集合（'[]'=全关，见 control_plane/permissions.py）。
+                _ensure_column(conn, "users", "permissions_json", "permissions_json TEXT DEFAULT ''")
         except Exception as exc:  # pragma: no cover - sqlite / duplicate column
             print(f"[deps] idempotent column migration skipped: {exc}")
 
@@ -281,6 +290,7 @@ def build_engine() -> Engine | None:
             with engine.begin() as conn:
                 conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
             VectorBase.metadata.create_all(engine)
+            _migrate_knowledge_content_hash(engine)
         except Exception as exc:  # pragma: no cover - sqlite / missing extension
             print(f"[deps] vector schema skipped: {exc}")
         # 垫话罐头库种子(2026-09-13 乙节):表空才灌,幂等——运营改词条/删除后
@@ -294,11 +304,15 @@ def build_engine() -> Engine | None:
                     for row in _FILLER_SEEDS:
                         conn.execute(
                             text(
+                                # enabled 用 TRUE 字面量（SQLite 3.23+/Postgres 都认）：
+                                # 写 1 在 SQLite（INTEGER 亲和）能存，Postgres 的 boolean
+                                # 列直接 DatatypeMismatch——整块种子被 except 吞掉，
+                                # 分发部署首启垫话库静默为空（2026-09-15 真 PG 冒烟实证）。
                                 "INSERT INTO filler_entries"
                                 " (id, account_id, lang, category, text, triggers, voice_id,"
                                 " priority, per_call_cap, enabled, hit_count, source, created_at)"
                                 " VALUES (:id, 'acc-001', :lang, :category, :text, :triggers, '',"
-                                " :priority, :cap, 1, 0, 'curated', CURRENT_TIMESTAMP)"
+                                " :priority, :cap, TRUE, 0, 'curated', CURRENT_TIMESTAMP)"
                             ),
                             row,
                         )
@@ -307,6 +321,41 @@ def build_engine() -> Engine | None:
             print(f"[deps] filler_entries seed skipped: {exc}")
         return engine
     return None
+
+
+def _migrate_knowledge_content_hash(engine: Engine) -> None:
+    """KB 增量索引(2026-09-10): knowledge_chunks 补 content_hash 列并回填存量。
+
+    create_all 不会给已存在的表加列;回填走 Python 侧 sha256(方言无关,
+    Postgres 无内置 sha256,不为此引 pgcrypto)。知识库量级小,一次性成本可忽略。
+    幂等:列已存在且全部行已有哈希时为纯 no-op。"""
+    import hashlib
+
+    from sqlalchemy import inspect as sa_inspect
+    from sqlalchemy import select, text
+
+    from bok_voice_business_db.vector_models import KnowledgeChunk
+
+    insp = sa_inspect(engine)
+    if "knowledge_chunks" not in insp.get_table_names():
+        return
+    with engine.begin() as conn:
+        cols = {c["name"] for c in insp.get_columns("knowledge_chunks")}
+        if "content_hash" not in cols:
+            conn.execute(
+                text("ALTER TABLE knowledge_chunks ADD COLUMN content_hash VARCHAR(64) DEFAULT ''")
+            )
+        rows = conn.execute(
+            select(KnowledgeChunk.id, KnowledgeChunk.text).where(
+                (KnowledgeChunk.content_hash == "") | (KnowledgeChunk.content_hash.is_(None))
+            )
+        ).all()
+        for cid, txt in rows:
+            digest = hashlib.sha256((txt or "").encode("utf-8")).hexdigest()[:32]
+            conn.execute(
+                text("UPDATE knowledge_chunks SET content_hash=:h WHERE id=:id"),
+                {"h": digest, "id": cid},
+            )
 
 
 def build_repository(engine: Engine | None = None):

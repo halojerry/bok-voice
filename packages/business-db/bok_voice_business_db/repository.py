@@ -80,6 +80,7 @@ class SqlAlchemyBusinessRepository:
             object_id=manifest.object_id,
             persona_id=manifest.persona_id,
             template_id=getattr(manifest, "template_id", "") or "",
+            created_by=getattr(manifest, "created_by", "") or "",
             mode=manifest.mode.value if isinstance(manifest.mode, CallMode) else str(manifest.mode),
             direction=manifest.direction,
             language=manifest.language,
@@ -238,6 +239,7 @@ class SqlAlchemyBusinessRepository:
         return {
             "id": row.id,
             "account_id": row.account_id,
+            "owner_user_id": row.owner_user_id or "",
             "question_text": row.question_text,
             "answer_text": row.answer_text,
             "lang": row.lang,
@@ -251,18 +253,26 @@ class SqlAlchemyBusinessRepository:
             "created_at": row.created_at.isoformat() if row.created_at else "",
         }
 
-    def list_qa_entries(self, account_id: str = "", enabled: bool | None = None) -> list[dict]:
+    def list_qa_entries(self, account_id: str = "", enabled: bool | None = None, owner_scope: str | None = None) -> list[dict]:
+        # owner_scope(B3):None=不滤(admin/root/无身份) / ''=仅共享 / uid=共享+本人。
         stmt = select(models.QaEntry).order_by(models.QaEntry.created_at)
         if account_id:
             stmt = stmt.filter_by(account_id=account_id)
         if enabled is not None:
             stmt = stmt.filter_by(enabled=enabled)
+        if owner_scope is not None:
+            stmt = stmt.filter(models.QaEntry.owner_user_id.in_(["", owner_scope]))
         return [self._qa_to_dict(r) for r in self.session.scalars(stmt)]
+
+    def get_qa_entry(self, entry_id: str) -> dict | None:
+        row = self.session.get(models.QaEntry, entry_id)
+        return self._qa_to_dict(row) if row else None
 
     def create_qa_entry(self, data: dict) -> dict:
         row = models.QaEntry(
             id=data.get("id") or f"qa:{uuid.uuid4().hex[:12]}",
             account_id=data.get("account_id") or "acc-001",
+            owner_user_id=data.get("owner_user_id") or "",
             question_text=data.get("question_text") or "",
             answer_text=data.get("answer_text") or "",
             lang=data.get("lang") or "zh",
@@ -295,6 +305,8 @@ class SqlAlchemyBusinessRepository:
             row.voice_id = str(patch["voice_id"])
         if "enabled" in patch and patch["enabled"] is not None:
             row.enabled = bool(patch["enabled"])
+        if "owner_user_id" in patch and patch["owner_user_id"] is not None:
+            row.owner_user_id = str(patch["owner_user_id"])
         self.session.commit()
         return self._qa_to_dict(row)
 
@@ -560,8 +572,11 @@ class SqlAlchemyBusinessRepository:
             stmt = stmt.filter_by(account_id=account_id)
         return [self._to_dict(p) for p in self.session.scalars(stmt)]
 
-    def list_templates(self, account_id: str) -> list[dict]:
+    def list_templates(self, account_id: str, owner_scope: str | None = None) -> list[dict]:
+        # owner_scope(B3):None=不滤(admin/root/无身份) / ''=仅共享 / uid=共享+本人。
         stmt = select(models.ConversationTemplate).filter_by(account_id=account_id)
+        if owner_scope is not None:
+            stmt = stmt.filter(models.ConversationTemplate.owner_user_id.in_(["", owner_scope]))
         return [self._to_dict(t) for t in self.session.scalars(stmt)]
 
     def create_template(self, data: dict) -> dict:
@@ -577,6 +592,7 @@ class SqlAlchemyBusinessRepository:
             language=data.get("language", "zh"),
             steps_json=data.get("steps_json", ""),
             hotwords=data.get("hotwords", ""),
+            owner_user_id=data.get("owner_user_id") or "",
         )
         self.session.add(tpl)
         self.session.commit()
@@ -590,7 +606,7 @@ class SqlAlchemyBusinessRepository:
         tpl = self.session.get(models.ConversationTemplate, template_id)
         if not tpl:
             return None
-        allowed = {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json", "hotwords"}
+        allowed = {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json", "hotwords", "owner_user_id"}
         for key, value in data.items():
             if key in allowed and hasattr(tpl, key):
                 setattr(tpl, key, value)
@@ -1009,6 +1025,76 @@ class SqlAlchemyBusinessRepository:
     def get_default_site(self, account_id: str = "acc-001") -> dict:
         """默认站点合成（不入库）：未配站点时的兜底站点，与库中行无关。"""
         return _default_site_dict(account_id)
+    def delete_campaign(self, campaign_id: str) -> bool:
+        """删战役及其名单项（items 无独立生命周期，随战役一并清除）。"""
+        row = self.session.get(models.Campaign, campaign_id)
+        if not row:
+            return False
+        self.session.query(models.CampaignItem).filter(
+            models.CampaignItem.campaign_id == campaign_id
+        ).delete(synchronize_session=False)
+        self.session.delete(row)
+        self.session.commit()
+        return True
+
+    # ---- users（三层 RBAC 账号；B1 身份内核。dict 出仓在 CP 层剥 password_hash）----
+
+    @staticmethod
+    def _user_to_dict(row: models.User) -> dict:
+        return {
+            "id": row.id, "org_id": row.org_id, "account_id": row.account_id,
+            "username": row.username, "display_name": row.display_name,
+            "role": row.role, "status": row.status,
+            # 凭据哈希必须进 repo 字典：auth_login 走 get_user_by_username 验密
+            # （B1 起漏带致 SQL 库登录恒 401，2026-09-15 实机冒烟实证）；出仓剥凭据
+            # 在 CP 侧 _user_public 单点做，repo 层恒为完整内部行。
+            "password_hash": row.password_hash or "",
+            # B4：NULL（存量库补列前的行）与 '' 同义=默认集，读侧统一空串。
+            "permissions_json": row.permissions_json or "",
+            "created_at": row.created_at.isoformat() if row.created_at else "",
+        }
+
+    def create_user(self, *, username: str, password_hash: str, role: str,
+                    org_id: str = "", account_id: str = "", display_name: str = "",
+                    permissions_json: str = "") -> dict:
+        row = models.User(
+            id=f"user-{_uuid()}", org_id=org_id, account_id=account_id,
+            username=username, password_hash=password_hash, display_name=display_name,
+            role=role, status="active", permissions_json=permissions_json or "",
+        )
+        self.session.add(row)
+        self.session.commit()
+        return self._user_to_dict(row)
+
+    def get_user(self, user_id: str) -> dict | None:
+        row = self.session.get(models.User, user_id)
+        return self._user_to_dict(row) if row else None
+
+    def get_user_by_username(self, username: str) -> dict | None:
+        row = (
+            self.session.query(models.User)
+            .filter(models.User.username == username)
+            .first()
+        )
+        return self._user_to_dict(row) if row else None
+
+    def list_users(self, account_id: str = "") -> list[dict]:
+        q = self.session.query(models.User)
+        if account_id:
+            q = q.filter(models.User.account_id == account_id)
+        rows = q.order_by(models.User.created_at.asc()).all()
+        return [self._user_to_dict(r) for r in rows]
+
+    def update_user(self, user_id: str, **fields: Any) -> dict | None:
+        row = self.session.get(models.User, user_id)
+        if not row:
+            return None
+        # 白名单：未知键（含 id/username/created_at/org_id/account_id）忽略，防两后端分叉。
+        for key in ("password_hash", "display_name", "role", "status", "permissions_json"):
+            if key in fields and fields[key] is not None:
+                setattr(row, key, fields[key])
+        self.session.commit()
+        return self._user_to_dict(row)
 
     @staticmethod
     def default_settings() -> dict:
@@ -1096,6 +1182,7 @@ class InMemoryBusinessRepository:
         self.sites: dict[str, dict] = {}
         self.filler_entries: dict[str, dict] = {}
         self.settings: dict = SqlAlchemyBusinessRepository.default_settings()
+        self.users: dict[str, dict] = {}
 
     def create_call(self, manifest: SessionManifest) -> dict:
         call_id = manifest.session_id or _uuid()
@@ -1105,6 +1192,7 @@ class InMemoryBusinessRepository:
             "object_id": manifest.object_id,
             "persona_id": manifest.persona_id,
             "template_id": getattr(manifest, "template_id", "") or "",
+            "created_by": getattr(manifest, "created_by", "") or "",
             "mode": manifest.mode.value if isinstance(manifest.mode, CallMode) else str(manifest.mode),
             "status": CallStatus.RINGING.value,
             "whatsapp_status": "",
@@ -1170,14 +1258,20 @@ class InMemoryBusinessRepository:
 
     # ---- 快答库(Q→A 快路,2026-09-09) ----
 
-    def list_qa_entries(self, account_id: str = "", enabled: bool | None = None) -> list[dict]:
+    def list_qa_entries(self, account_id: str = "", enabled: bool | None = None, owner_scope: str | None = None) -> list[dict]:
+        # owner_scope(B3):None=不滤 / ''=仅共享 / uid=共享+本人(与 SQL 后端同语义)。
         rows = [
             v
             for v in getattr(self, "qa_entries", {}).values()
             if (not account_id or v.get("account_id") == account_id)
             and (enabled is None or bool(v.get("enabled")) == enabled)
+            and (owner_scope is None or str(v.get("owner_user_id") or "") in ("", owner_scope))
         ]
         return sorted(rows, key=lambda v: v.get("created_at") or "")
+
+    def get_qa_entry(self, entry_id: str) -> dict | None:
+        row = getattr(self, "qa_entries", {}).get(entry_id)
+        return dict(row) if row else None
 
     # ---- 垫话罐头库(2026-09-13 乙节,镜像 qa_entries 姿势) ----
 
@@ -1226,6 +1320,7 @@ class InMemoryBusinessRepository:
         row = {
             "id": data.get("id") or f"qa:{uuid.uuid4().hex[:12]}",
             "account_id": data.get("account_id") or "acc-001",
+            "owner_user_id": data.get("owner_user_id") or "",
             "question_text": data.get("question_text") or "",
             "answer_text": data.get("answer_text") or "",
             "lang": data.get("lang") or "zh",
@@ -1245,7 +1340,7 @@ class InMemoryBusinessRepository:
         row = getattr(self, "qa_entries", {}).get(entry_id)
         if row is None:
             return None
-        for k in ("question_text", "answer_text", "lang", "scope", "step_index", "voice_id", "enabled"):
+        for k in ("question_text", "answer_text", "lang", "scope", "step_index", "voice_id", "enabled", "owner_user_id"):
             if k in patch and patch[k] is not None:
                 row[k] = patch[k]
         return dict(row)
@@ -1368,8 +1463,14 @@ class InMemoryBusinessRepository:
             if not account_id or p.get("account_id", "") == account_id
         ]
 
-    def list_templates(self, account_id: str) -> list[dict]:
-        return [t for t in self.templates.values() if t.get("account_id", "") == account_id]
+    def list_templates(self, account_id: str, owner_scope: str | None = None) -> list[dict]:
+        # owner_scope(B3):None=不滤 / ''=仅共享 / uid=共享+本人(与 SQL 后端同语义)。
+        return [
+            t
+            for t in self.templates.values()
+            if t.get("account_id", "") == account_id
+            and (owner_scope is None or str(t.get("owner_user_id") or "") in ("", owner_scope))
+        ]
 
     def create_template(self, data: dict) -> dict:
         tpl = ConversationTemplate(
@@ -1384,6 +1485,7 @@ class InMemoryBusinessRepository:
             language=data.get("language", "zh"),
             steps_json=data.get("steps_json", ""),
             hotwords=data.get("hotwords", ""),
+            owner_user_id=data.get("owner_user_id") or "",
         ).__dict__
         self.templates[tpl["id"]] = tpl
         return tpl
@@ -1394,7 +1496,7 @@ class InMemoryBusinessRepository:
     def update_template(self, template_id: str, data: dict) -> dict | None:
         if template_id not in self.templates:
             return None
-        self.templates[template_id].update({k: v for k, v in data.items() if k in {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json", "hotwords"}})
+        self.templates[template_id].update({k: v for k, v in data.items() if k in {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json", "hotwords", "owner_user_id"}})
         return self.templates[template_id]
 
     def delete_template(self, template_id: str) -> bool:
@@ -1465,6 +1567,48 @@ class InMemoryBusinessRepository:
         if call_id:
             items = [e for e in items if e.get("call_id") == call_id]
         return items[:limit]
+
+    # ---- users（三层 RBAC 账号；见 SQL 侧同款契约）----
+
+    def create_user(self, *, username: str, password_hash: str, role: str,
+                    org_id: str = "", account_id: str = "", display_name: str = "",
+                    permissions_json: str = "") -> dict:
+        user_id = f"user-{uuid.uuid4().hex[:12]}"
+        row = {
+            "id": user_id, "org_id": org_id, "account_id": account_id,
+            "username": username, "password_hash": password_hash,
+            "display_name": display_name, "role": role, "status": "active",
+            # B4 页面权限（与 SQL 侧同契约：''=默认集）。
+            "permissions_json": permissions_json or "",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.users[user_id] = row
+        return dict(row)
+
+    def get_user(self, user_id: str) -> dict | None:
+        row = self.users.get(user_id)
+        return dict(row) if row else None
+
+    def get_user_by_username(self, username: str) -> dict | None:
+        for row in self.users.values():
+            if row["username"] == username:
+                return dict(row)
+        return None
+
+    def list_users(self, account_id: str = "") -> list[dict]:
+        rows = [dict(r) for r in self.users.values()
+                if not account_id or r["account_id"] == account_id]
+        return sorted(rows, key=lambda r: r["created_at"])
+
+    def update_user(self, user_id: str, **fields: Any) -> dict | None:
+        row = self.users.get(user_id)
+        if not row:
+            return None
+        # 与 SQL 侧同款白名单：未知键（含 id/username/created_at/org_id/account_id）忽略。
+        for key in ("password_hash", "display_name", "role", "status", "permissions_json"):
+            if key in fields and fields[key] is not None:
+                row[key] = fields[key]
+        return dict(row)
 
     # ---- roster（名册认领池）----
 
@@ -1680,3 +1824,12 @@ class InMemoryBusinessRepository:
     def get_default_site(self, account_id: str = "acc-001") -> dict:
         """默认站点合成（不入库）：未配站点时的兜底站点，与库中行无关。"""
         return _default_site_dict(account_id)
+    def delete_campaign(self, campaign_id: str) -> bool:
+        """见 SqlAlchemyBusinessRepository.delete_campaign（内存替身同语义）。"""
+        if campaign_id not in self.campaigns:
+            return False
+        del self.campaigns[campaign_id]
+        for item_id in [iid for iid, r in self.campaign_items.items()
+                        if r["campaign_id"] == campaign_id]:
+            del self.campaign_items[item_id]
+        return True
