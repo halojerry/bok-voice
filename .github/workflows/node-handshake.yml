@@ -1,0 +1,116 @@
+name: Node handshake smoke
+
+# P1 节点侧门禁：
+#   linux   —— 起真 CP（postgres:16 服务容器 + auth-on + root 种子）跑
+#              scripts/node_handshake_smoke.py 全验握手链路（register → node_token
+#              心跳 → 伪 token 401 → root JWT 查节点列表 → heartbeat_interval_s），
+#              并对 install-node.sh 做语法解析 + 零副作用干跑；
+#   windows —— runner 无 docker，只验 install-node.ps1 本体：语法解析 + -DryRun 干跑。
+# CP 依赖安装照 postgres-smoke.yml；起监听等待照 cloud-image.yml 的显式 curl 轮询
+# 循环——进程起 ≠ 端口就绪，bind 时差窗内裸 curl/connrefused 重试不可靠（CI 实证）。
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: node-handshake-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Handshake vs real CP (register/heartbeat/list)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      # psycopg 3 驱动显式写全：postgresql:// 会被 SQLAlchemy 解析成 psycopg2。
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/postgres
+      # auth-on 形态起步：握手链路的 401/门禁分支只有在认证开着时才被真实执行。
+      BOK_AUTH_REQUIRED: "1"
+      BOK_JWT_SECRET: ci-node-handshake-jwt-secret
+      BOK_ROOT_USERNAME: root
+      CP_BASE: http://127.0.0.1:18011
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install CP deps (照 postgres-smoke.yml)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -e packages/core -e packages/business-db -e packages/knowledge -e packages/observability
+          pip install -e apps/control-plane
+      - name: Start CP on :18011 (root seed + random password)
+        run: |
+          set -euo pipefail
+          # token_hex 而非 token_urlsafe：urlsafe 字母表含 -，前导 - 会被下游
+          # argparse 当 flag（CI 首跑实证）；hex 无连字符一劳永逸。
+          ROOT_PASS="$(python -c 'import secrets; print(secrets.token_hex(16))')"
+          echo "ROOT_PASS=$ROOT_PASS" >> "$GITHUB_ENV"
+          # root 密码只进 uvicorn 进程 env，不落 GITHUB_ENV 之外的日志面
+          BOK_ROOT_PASSWORD="$ROOT_PASS" nohup python -m uvicorn control_plane.main:app \
+            --host 127.0.0.1 --port 18011 > /tmp/cp.log 2>&1 &
+          echo $! > /tmp/cp.pid
+          # 显式轮询等 /health：docker-proxy/uvicorn 起监听存在秒级时差，窗口内
+          # connection reset/refused 一切失败形态都要兜住（勿用 --retry-connrefused 裸 curl）。
+          ready=0
+          for i in $(seq 1 60); do
+            if curl -fsS "$CP_BASE/health" >/dev/null 2>&1; then ready=1; break; fi
+            sleep 1
+          done
+          if [[ $ready -ne 1 ]]; then
+            echo "CP 未在 60s 内就绪"; tail -50 /tmp/cp.log; exit 1
+          fi
+          echo "CP ready: $(curl -fsS "$CP_BASE/health")"
+      - name: bash -n install-node.sh
+        run: bash -n scripts/install-node.sh
+      - name: install-node.sh --dry-run (零副作用)
+        run: scripts/install-node.sh --cp-url "$CP_BASE" --node-token ci-dummy-token --dry-run
+      - name: Node handshake smoke (对真 CP 全验)
+        run: |
+          python scripts/node_handshake_smoke.py --base-url "$CP_BASE" \
+            --root-user="$BOK_ROOT_USERNAME" --root-pass="$ROOT_PASS"
+      - name: CP logs on failure
+        if: failure()
+        run: tail -100 /tmp/cp.log || true
+      - name: Teardown CP
+        if: always()
+        run: |
+          if [[ -f /tmp/cp.pid ]]; then kill "$(cat /tmp/cp.pid)" 2>/dev/null || true; fi
+
+  windows:
+    name: install-node.ps1 syntax + dry-run
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: PowerShell syntax parse
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PWD "scripts/install-node.ps1"), [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors -and $errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Host ("parse error: {0}" -f $_.Message) }
+            exit 1
+          }
+          Write-Host "install-node.ps1 语法解析通过"
+      - name: install-node.ps1 -DryRun (零副作用，Windows runner 无 docker 不起 CP)
+        shell: pwsh
+        run: ./scripts/install-node.ps1 -CpUrl http://127.0.0.1:18011 -NodeToken ci-dummy-token -DryRun

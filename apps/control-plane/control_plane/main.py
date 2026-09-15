@@ -36,7 +36,7 @@ from bok_voice_obs.middleware import CorrelationMiddleware
 
 from .deps import build_engine, build_repository, build_session_factory
 from .dispatch_utils import cleanup_dispatch, has_active_dispatch
-from .nodes_store import HEARTBEAT_INTERVAL_S, NodeStore
+from .nodes_store import HEARTBEAT_INTERVAL_S, LicenseError, NodeStore
 from .permissions import GRANTABLE_PERMISSIONS, PAGE_PERMISSIONS, effective_permissions
 from .pregen import persona_pregen_status
 from .auth import (
@@ -108,7 +108,8 @@ app.add_middleware(CorrelationMiddleware)
 async def optional_bearer_auth(request: Request, call_next):
     """可选 Bearer 鉴权（R2）：BOK_CP_TOKEN 未设=全放行（本机单用户形态零变化）。
 
-    设置后除 /health 与 /api/nodes/heartbeat 外全部端点要求
+    设置后除 /health、/api/nodes/heartbeat 与 /api/nodes/register（license 自证，
+    端点内 license 闸把关）外全部端点要求
     `Authorization: Bearer <BOK_CP_TOKEN>`——暴露到局域网/云之前必须设置；
     agent(worker env)与 web 需同步带同值。心跳豁免：该端点用注册时签发的
     node_token 自鉴权（sha256 比对，与 CP token 不同源），CP 门禁会把它拦死
@@ -119,8 +120,13 @@ async def optional_bearer_auth(request: Request, call_next):
         # token 二选一）；本中间件若照旧比对 CP token 会把用户 JWT 误杀在门外。
         return await call_next(request)
     expected = os.environ.get("BOK_CP_TOKEN", "").strip()
-    if expected and request.url.path not in ("/health", "/api/nodes/heartbeat"):
-        if request.headers.get("authorization", "") != f"Bearer {expected}":
+    if expected and request.url.path not in (
+            "/health", "/api/nodes/heartbeat", "/api/nodes/register"):
+        # 静态站 GET/HEAD 同豁免（同 identity_gate：登录页不得被机器 token 门拦死，
+        # 特权数据全在 /api/* 后面）。
+        static_get = (request.method in ("GET", "HEAD")
+                      and not request.url.path.startswith("/api/"))
+        if not static_get and request.headers.get("authorization", "") != f"Bearer {expected}":
             return Response(status_code=401, content=b'{"detail":"unauthorized"}',
                              media_type="application/json")
     return await call_next(request)
@@ -1978,26 +1984,77 @@ class NodeRegisterRequest(BaseModel):
     platform: str = ""
     org_id: str = ""
     version: str = ""
+    # P1 节点鉴权（加固模式必填）：license_key=root 签发的节点许可证；
+    # fingerprint=机器指纹（node-agent 采集的 sha256，非原始序列号）。
+    license_key: str = ""
+    fingerprint: str = ""
 
 
 class NodeHeartbeatRequest(BaseModel):
     metrics: dict = {}
+    fingerprint: str = ""
+
+
+class NodeLicenseCreateRequest(BaseModel):
+    """root 签发节点许可证入参：max_nodes 配额、归属 org/account、备注。"""
+
+    org_id: str = ""
+    account_id: str = ""
+    max_nodes: int = 1
+    note: str = ""
 
 
 @app.post("/api/nodes/register")
 def register_node(req: NodeRegisterRequest) -> dict:
-    """节点注册（spec §4.2）：签发 node_token，明文只在本次响应出现一次。"""
-    node_id, token = _node_store().register(
-        name=req.name, platform=req.platform, org_id=req.org_id, version=req.version
+    """节点注册（spec §4.2）：签发 node_token，明文只在本次响应出现一次。
+
+    P1 节点鉴权：**加固模式（BOK_AUTH_REQUIRED=1 或 BOK_CP_TOKEN 已设）下必须携带
+    有效 license_key**（root 签发、配额内、未吊销），并绑定机器指纹——同
+    (license, fingerprint) 重注册幂等复用 node_id 换新 token；配额满且指纹不同
+    =403（克隆/挪机检出）；本地双关全空=开放注册（单机形态零变化）。此闸叠加在
+    CP token/JWT 门禁之上（中间件先挡无凭据请求，这里挡「有凭据但无许可」）。
+    """
+    store = _node_store()
+    license_id = ""
+    if node_license_required():
+        try:
+            lic = store.validate_license_for_register(
+                (req.license_key or "").strip(), (req.fingerprint or "").strip())
+        except LicenseError as exc:
+            raise HTTPException(exc.status_code, exc.reason) from exc
+        license_id = lic["license_id"]
+    elif (req.license_key or "").strip():
+        # 非加固模式也尊重显式 license（登记归属，不强制）。
+        lic = store.find_license((req.license_key or "").strip())
+        license_id = lic["license_id"] if lic else ""
+    node_id, token = store.register(
+        name=req.name, platform=req.platform, org_id=req.org_id, version=req.version,
+        license_id=license_id, fingerprint=(req.fingerprint or "").strip(),
     )
+    _audit("node.registered", subject_type="node", subject_id=node_id,
+           account_id="", detail={
+               "name": req.name, "platform": req.platform, "version": req.version,
+               "license_id": license_id,
+               "fingerprint_prefix": (req.fingerprint or "")[:12]})
     return {"node_id": node_id, "node_token": token, "heartbeat_interval_s": HEARTBEAT_INTERVAL_S}
 
 
 @app.post("/api/nodes/heartbeat")
 def node_heartbeat(req: NodeHeartbeatRequest, authorization: str = Header(default="")) -> dict:
     token = authorization.removeprefix("Bearer ").strip()
-    if not token or not _node_store().heartbeat(token, req.metrics):
-        raise HTTPException(401, "unknown node token")
+    ok, reason = (False, "unknown_token")
+    if token:
+        ok, reason = _node_store().heartbeat(
+            token, req.metrics, fingerprint=(req.fingerprint or "").strip())
+    if not ok:
+        # 克隆/吊销是安全事件（节点已被 store 自动吊销），一次性落审计；普通
+        # 凭据错误只 401 不刷审计（防心跳重试刷屏）。
+        if reason in ("fingerprint_mismatch", "license_revoked"):
+            _audit(f"node.denied.{reason}", subject_type="node", subject_id="",
+                   account_id="", detail={"reason": reason})
+        detail = {"fingerprint_mismatch": "fingerprint mismatch (clone/relocated?)",
+                  "license_revoked": "license revoked", "revoked": "node revoked"}.get(reason)
+        raise HTTPException(401, detail or "unknown node token")
     return {"ok": True, "commands": []}
 
 
@@ -2006,6 +2063,47 @@ def list_nodes(request: Request) -> list[dict]:
     # 节点注册表=平台面（root）。
     require_role(request, "root")
     return _node_store().list_nodes()
+
+
+def node_license_required() -> bool:
+    """加固模式判定：任一强制凭据开启即要求节点 license（本地双关全空=开放）。"""
+    return auth_required() or bool(os.environ.get("BOK_CP_TOKEN", "").strip())
+
+
+@app.post("/api/nodes/licenses")
+def create_node_license(req: NodeLicenseCreateRequest, request: Request) -> dict:
+    """签发节点许可证（root 专属）：key 明文只在本次响应出现一次。"""
+    require_role(request, "root")
+    if req.max_nodes < 1:
+        raise HTTPException(400, "max_nodes must be >= 1")
+    out = _node_store().create_license(
+        org_id=req.org_id.strip(), account_id=req.account_id.strip(),
+        max_nodes=req.max_nodes, note=req.note.strip())
+    _audit("node.license_created", subject_type="license",
+           subject_id=out["license_id"], account_id=req.account_id.strip(),
+           detail={"max_nodes": req.max_nodes, "org_id": req.org_id.strip(),
+                   "note": req.note.strip()})
+    return out
+
+
+@app.get("/api/nodes/licenses")
+def list_node_licenses(request: Request) -> list[dict]:
+    """license 清单（root 专属；永不回显 key/hash）。"""
+    require_role(request, "root")
+    return _node_store().list_licenses()
+
+
+@app.post("/api/nodes/licenses/{license_id}/revoke")
+def revoke_node_license(license_id: str, request: Request) -> dict:
+    """吊销 license：名下全部节点 token 即刻失效（心跳 401）。"""
+    require_role(request, "root")
+    out = _node_store().revoke_license(license_id)
+    if out is None:
+        raise HTTPException(404, "license not found")
+    _audit("node.license_revoked", subject_type="license", subject_id=license_id,
+           account_id=out.get("account_id", ""),
+           detail={"nodes_revoked": out.get("nodes_revoked", 0)})
+    return out
 
 
 @app.get("/api/calls/{call_id}/settlement")

@@ -19,8 +19,8 @@ def test_register_returns_plaintext_token_once_and_stores_hash():
 def test_heartbeat_authenticates_by_token():
     store = NodeStore(None)
     node_id, token = store.register(name="n1", platform="cuda-win", org_id="")
-    assert store.heartbeat(token, metrics={"gpu": 0.4}) is True
-    assert store.heartbeat("bad-token", metrics={}) is False
+    assert store.heartbeat(token, metrics={"gpu": 0.4}) == (True, "")
+    assert store.heartbeat("bad-token", metrics={})[0] is False
 
 
 def test_effective_status_offline_after_window():
@@ -51,7 +51,7 @@ def test_sql_mode_list_nodes_no_typeerror_and_iso_shape(tmp_path):
     models.create_all(engine)
     store = NodeStore(engine)
     node_id, token = store.register(name="edge-sql", platform="cuda-win", org_id="org-1")
-    assert store.heartbeat(token, metrics={"gpu": 0.5}) is True
+    assert store.heartbeat(token, metrics={"gpu": 0.5}) == (True, "")
     rows = store.list_nodes()
     assert rows[0]["node_id"] == node_id
     assert rows[0]["status"] == "online"
@@ -61,8 +61,9 @@ def test_sql_mode_list_nodes_no_typeerror_and_iso_shape(tmp_path):
 
 
 def test_node_heartbeat_bypasses_cp_token_gate_register_does_not(monkeypatch):
-    """BOK_CP_TOKEN 门禁豁免仅限 /api/nodes/heartbeat：该端点用 node_token 自鉴权
-    （sha256 比对，与 CP token 不同源）；register/list 属管理操作仍受门禁。"""
+    """BOK_CP_TOKEN 门禁豁免：heartbeat 用 node_token 自鉴权、register 用 license
+    key 自证（P1 起两者都在端点内自鉴权，中间件不预拦——无凭据请求仍 401：
+    register 裸注册被 license 闸拒）；list 属管理操作仍受门禁。"""
     from fastapi.testclient import TestClient
 
     from control_plane.main import app
@@ -72,10 +73,14 @@ def test_node_heartbeat_bypasses_cp_token_gate_register_does_not(monkeypatch):
     with TestClient(app) as client:
         reg = client.post("/api/nodes/register", json={"name": "n", "platform": "cuda-win"})
         assert reg.status_code == 401  # 无 CP token → 管理操作被门禁拒
+        # P1 起加固模式 register 还要 license（第二因子）：先经机器通道签发。
+        cp = {"Authorization": "Bearer cp-secret-1"}
+        lic = client.post("/api/nodes/licenses", json={"max_nodes": 1}, headers=cp).json()
         reg_ok = client.post(
             "/api/nodes/register",
-            json={"name": "n", "platform": "cuda-win"},
-            headers={"Authorization": "Bearer cp-secret-1"},
+            json={"name": "n", "platform": "cuda-win",
+                  "license_key": lic["license_key"], "fingerprint": "fp-z"},
+            headers=cp,
         )
         assert reg_ok.status_code == 200
         hb = client.post(

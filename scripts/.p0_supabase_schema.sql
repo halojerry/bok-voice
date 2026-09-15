@@ -11,7 +11,7 @@
 -- 源镜像:   pgvector/pgvector:pg16
 -- 源命令:   docker exec pg-ddl pg_dump -U postgres --schema-only --no-owner --no-privileges postgres
 -- 回环校验: pgvector/pgvector:pg16 上应用本文件 + 重跑 build_engine() = 零 DDL 变更(生成时实测)
--- 规模:     CREATE TABLE 22 张 / CREATE INDEX 30 条 / 数据语句 0 条
+-- 规模:     CREATE TABLE 24 张 / CREATE INDEX 34 条 / 数据语句 0 条
 --           (--schema-only:正常应 0 条数据语句;带 DEFAULT/COMMENT 属 schema 本身)
 --
 -- 目标: 全新 Supabase(Postgres)项目首次引导。应用方式(Main 线程):
@@ -165,6 +165,7 @@ CREATE TABLE public.campaigns (
     status character varying(16) NOT NULL,
     gap_seconds integer NOT NULL,
     scripts_json text NOT NULL,
+    site_id character varying(64) NOT NULL,
     created_at timestamp without time zone NOT NULL,
     finished_at timestamp without time zone
 );
@@ -272,6 +273,23 @@ CREATE TABLE public.knowledge_chunks (
 
 
 --
+-- Name: node_licenses; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.node_licenses (
+    id character varying(64) NOT NULL,
+    org_id character varying(64) NOT NULL,
+    account_id character varying(64) NOT NULL,
+    key_hash character varying(128) NOT NULL,
+    max_nodes integer NOT NULL,
+    note character varying(255) NOT NULL,
+    status character varying(16) NOT NULL,
+    created_at timestamp without time zone NOT NULL,
+    updated_at timestamp without time zone NOT NULL
+);
+
+
+--
 -- Name: nodes; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -285,7 +303,9 @@ CREATE TABLE public.nodes (
     status character varying(16) NOT NULL,
     metrics_json text NOT NULL,
     last_seen_at timestamp without time zone,
-    created_at timestamp without time zone NOT NULL
+    created_at timestamp without time zone NOT NULL,
+    license_id character varying(64) NOT NULL,
+    fingerprint character varying(128) NOT NULL
 );
 
 
@@ -411,6 +431,24 @@ CREATE TABLE public.settlements (
     global_insight_id character varying(64) NOT NULL,
     error text NOT NULL,
     created_at timestamp without time zone NOT NULL
+);
+
+
+--
+-- Name: sip_sites; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.sip_sites (
+    id character varying(64) NOT NULL,
+    account_id character varying(64) NOT NULL,
+    name character varying(255) NOT NULL,
+    livekit_url character varying(512) NOT NULL,
+    sip_edge character varying(16) NOT NULL,
+    trunk_id character varying(64) NOT NULL,
+    numbers_json text NOT NULL,
+    region character varying(64) NOT NULL,
+    created_at timestamp without time zone NOT NULL,
+    updated_at timestamp without time zone NOT NULL
 );
 
 
@@ -567,6 +605,14 @@ ALTER TABLE ONLY public.knowledge_chunks
 
 
 --
+-- Name: node_licenses node_licenses_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.node_licenses
+    ADD CONSTRAINT node_licenses_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: nodes nodes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -628,6 +674,14 @@ ALTER TABLE ONLY public.roster_entries
 
 ALTER TABLE ONLY public.settlements
     ADD CONSTRAINT settlements_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: sip_sites sip_sites_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sip_sites
+    ADD CONSTRAINT sip_sites_pkey PRIMARY KEY (id);
 
 
 --
@@ -746,6 +800,27 @@ CREATE INDEX ix_knowledge_chunks_account_id ON public.knowledge_chunks USING btr
 
 
 --
+-- Name: ix_node_licenses_account_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_node_licenses_account_id ON public.node_licenses USING btree (account_id);
+
+
+--
+-- Name: ix_node_licenses_org_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_node_licenses_org_id ON public.node_licenses USING btree (org_id);
+
+
+--
+-- Name: ix_nodes_license_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_nodes_license_id ON public.nodes USING btree (license_id);
+
+
+--
 -- Name: ix_nodes_org_id; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -813,6 +888,13 @@ CREATE INDEX ix_roster_entries_object_id ON public.roster_entries USING btree (o
 --
 
 CREATE INDEX ix_settlements_call_id ON public.settlements USING btree (call_id);
+
+
+--
+-- Name: ix_sip_sites_account_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_sip_sites_account_id ON public.sip_sites USING btree (account_id);
 
 
 --
