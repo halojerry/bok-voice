@@ -314,28 +314,39 @@ class NodeStore:
                     "revoked": n.status == "revoked", "status": n.status,
                     "license_id": n.license_id or "", "fingerprint": n.fingerprint or ""}
 
-    def _revoke_node(self, node_id: str) -> None:
+    def revoke_node(self, node_id: str) -> bool:
+        """吊销单节点；行存在且未吊销返回 True（root 面 /api/nodes/{id}/revoke 用）。"""
         if self._session_factory is None:
-            if node_id in self._rows:
-                self._rows[node_id]["revoked"] = True
-            return
+            row = self._rows.get(node_id)
+            if row is None or row["revoked"]:
+                return False
+            row["revoked"] = True
+            return True
         from sqlalchemy import update
 
         from bok_voice_business_db import models
 
         with self._session_factory() as session:
-            session.execute(
-                update(models.Node).where(models.Node.id == node_id)
+            result = session.execute(
+                update(models.Node).where(models.Node.id == node_id,
+                                           models.Node.status != "revoked")
                 .values(status="revoked"))
             session.commit()
+            return result.rowcount > 0
 
     def heartbeat(self, token: str, metrics: dict | None = None,
-                  fingerprint: str = "") -> tuple[bool, str]:
-        """心跳三验：token 有效 / 所属 license 仍 active / 指纹（若上报）与注册一致。
+                  fingerprint: str = "", require_license: bool = False) -> tuple[bool, str]:
+        """心跳四验：token / license active /（加固模式）license 绑定 / 指纹。
+
+        require_license=True（CP 加固模式）：开放期注册的 license_id="" 存量 token
+        是不可吊销的长命凭证（吊销端点够不着它）——拒绝但不自动吊销，留现场供
+        root 处置/迁移（2026-09-16 深测 P2）。注册绑定了指纹的节点心跳缺指纹=
+        不合作客户端绕过克隆检测——按指纹不符自动吊销（协议强制）。
 
         返回 (ok, reason)；reason ∈ {"", "unknown_token", "revoked",
-        "license_revoked", "fingerprint_mismatch"}——后两者节点被自动吊销，
-        供 CP 侧审计克隆/挪机与吊销面。
+        "license_revoked", "license_required", "fingerprint_mismatch"}——后两者
+        （license_revoked/fingerprint_mismatch）节点被自动吊销，供 CP 侧审计
+        克隆/挪机与吊销面。
         """
         token_hash = _hash(token)
         node = self._get_node_for_token(token_hash)
@@ -354,15 +365,21 @@ class NodeStore:
                     row = session.get(models.NodeLicense, node["license_id"])
                     lic = {"status": row.status} if row else None
             if lic is None or lic["status"] != "active":
-                self._revoke_node(node["node_id"])
+                self.revoke_node(node["node_id"])
                 return False, "license_revoked"
         if node["revoked"] or node.get("status") == "revoked":
             return False, "revoked"
+        if require_license and not node.get("license_id"):
+            return False, "license_required"
+        if node.get("fingerprint") and not fingerprint:
+            # 协议强制（深测 P2）：指纹检测是「客户端自愿」时对不合作实现无效。
+            self.revoke_node(node["node_id"])
+            return False, "fingerprint_mismatch"
         if (node.get("fingerprint") and fingerprint
                 and fingerprint != node["fingerprint"]):
             # 克隆/挪机：token 被另一台机器持有——自动吊销该 token（原机指纹重注册
             # 幂等复用 node_id 换新 token，恢复路径存在）。
-            self._revoke_node(node["node_id"])
+            self.revoke_node(node["node_id"])
             return False, "fingerprint_mismatch"
         if self._session_factory is None:
             row = self._rows.get(node["node_id"])
