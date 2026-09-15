@@ -31,6 +31,12 @@ docs/
 .superpowers/
 scripts/
 
+# 任意深度的 env 档不进 build context（.env* 只匹配根层，deploy/cloud/.env
+# 曾整体送进 BuildKit——镜像层未 COPY 它，但上下文本身不该见密钥）。
+**/.env
+**/.env.*
+!**/.env.example
+
 # macOS / 编辑器杂项
 **/.DS_Store
 .DS_Store

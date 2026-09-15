@@ -39,3 +39,9 @@ tests/fixtures/audio/e2e_multi/
 
 # SDD plan workspace (superpowers subagent-driven development scratch)
 .superpowers/
+
+# 未跟踪本地资产（2026-09-16 深测 P3）：商业路演稿/扫描器会话/视频产物，
+# 公开仓一次 git add -A 即泄——显式忽略。
+decks/
+.mimosa/
+.v2c/
