@@ -394,6 +394,32 @@ class Node(Base):
     metrics_json: Mapped[str] = mapped_column(Text, default="{}")
     last_seen_at: Mapped[object] = mapped_column(DateTime, default=None, nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    # P1 节点鉴权：注册时绑定的 license 与机器指纹（sha256 hex，非原始序列号）。
+    # license_id 空=加固模式前注册的存量节点（心跳只查 token 不查 license）。
+    license_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    fingerprint: Mapped[str] = mapped_column(String(128), default="")
+
+
+class NodeLicense(Base):
+    """节点许可证（P1 节点鉴权）：root 签发，节点注册的第二因子。
+
+    加固模式（BOK_AUTH_REQUIRED=1 或 BOK_CP_TOKEN 已设）下 register 必须携带
+    有效 license_key；key 明文只在签发响应出现一次，库内恒为 sha256。
+    吊销 license = 其名下全部节点 token 即刻失效（心跳 401）。max_nodes 配额
+    按未吊销节点数计；同一 (license_id, fingerprint) 重注册幂等复用同一 node_id
+    （机器重装/重启不烧配额），指纹不同且配额满 = 拒绝（克隆/挪机检出）。
+    """
+
+    __tablename__ = "node_licenses"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    org_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    account_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    key_hash: Mapped[str] = mapped_column(String(128), default="")
+    max_nodes: Mapped[int] = mapped_column(default=1)
+    note: Mapped[str] = mapped_column(String(255), default="")
+    status: Mapped[str] = mapped_column(String(16), default="active")  # active/revoked
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
 
 
 class User(Base):

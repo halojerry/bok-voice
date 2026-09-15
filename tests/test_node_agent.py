@@ -24,7 +24,8 @@ def test_heartbeat_once_posts_bearer_and_parses_commands():
         captured["url"] = req.full_url
         captured["headers"] = dict(req.header_items())
         body = json.loads(req.data.decode())
-        assert body == {"metrics": {"gpu": 0.5}}
+        # P1 起心跳体带机器指纹（CP 侧克隆检测用；缺省空串=不上报）。
+        assert body == {"metrics": {"gpu": 0.5}, "fingerprint": ""}
 
         class R:
             def read(self, n=-1):

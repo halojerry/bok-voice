@@ -11,7 +11,7 @@
 -- 源镜像:   pgvector/pgvector:pg16
 -- 源命令:   docker exec pg-ddl pg_dump -U postgres --schema-only --no-owner --no-privileges postgres
 -- 回环校验: pgvector/pgvector:pg16 上应用本文件 + 重跑 build_engine() = 零 DDL 变更(生成时实测)
--- 规模:     CREATE TABLE 23 张 / CREATE INDEX 31 条 / 数据语句 0 条
+-- 规模:     CREATE TABLE 24 张 / CREATE INDEX 34 条 / 数据语句 0 条
 --           (--schema-only:正常应 0 条数据语句;带 DEFAULT/COMMENT 属 schema 本身)
 --
 -- 目标: 全新 Supabase(Postgres)项目首次引导。应用方式(Main 线程):
@@ -273,6 +273,23 @@ CREATE TABLE public.knowledge_chunks (
 
 
 --
+-- Name: node_licenses; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.node_licenses (
+    id character varying(64) NOT NULL,
+    org_id character varying(64) NOT NULL,
+    account_id character varying(64) NOT NULL,
+    key_hash character varying(128) NOT NULL,
+    max_nodes integer NOT NULL,
+    note character varying(255) NOT NULL,
+    status character varying(16) NOT NULL,
+    created_at timestamp without time zone NOT NULL,
+    updated_at timestamp without time zone NOT NULL
+);
+
+
+--
 -- Name: nodes; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -286,7 +303,9 @@ CREATE TABLE public.nodes (
     status character varying(16) NOT NULL,
     metrics_json text NOT NULL,
     last_seen_at timestamp without time zone,
-    created_at timestamp without time zone NOT NULL
+    created_at timestamp without time zone NOT NULL,
+    license_id character varying(64) NOT NULL,
+    fingerprint character varying(128) NOT NULL
 );
 
 
@@ -586,6 +605,14 @@ ALTER TABLE ONLY public.knowledge_chunks
 
 
 --
+-- Name: node_licenses node_licenses_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.node_licenses
+    ADD CONSTRAINT node_licenses_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: nodes nodes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -770,6 +797,27 @@ CREATE INDEX ix_filler_entries_account_id ON public.filler_entries USING btree (
 --
 
 CREATE INDEX ix_knowledge_chunks_account_id ON public.knowledge_chunks USING btree (account_id);
+
+
+--
+-- Name: ix_node_licenses_account_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_node_licenses_account_id ON public.node_licenses USING btree (account_id);
+
+
+--
+-- Name: ix_node_licenses_org_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_node_licenses_org_id ON public.node_licenses USING btree (org_id);
+
+
+--
+-- Name: ix_nodes_license_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_nodes_license_id ON public.nodes USING btree (license_id);
 
 
 --

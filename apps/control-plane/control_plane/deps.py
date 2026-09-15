@@ -210,6 +210,9 @@ def build_engine() -> Engine | None:
                 # 页面权限(B4):主管按人配置话务员可见面——''=默认集（7 键，报表默认关），
                 # 否则=JSON 数组精确集合（'[]'=全关，见 control_plane/permissions.py）。
                 _ensure_column(conn, "users", "permissions_json", "permissions_json TEXT DEFAULT ''")
+                # 节点鉴权(P1):license 绑定与机器指纹（node_licenses 新表走 create_all）。
+                _ensure_column(conn, "nodes", "license_id", "license_id VARCHAR(64) DEFAULT ''")
+                _ensure_column(conn, "nodes", "fingerprint", "fingerprint VARCHAR(128) DEFAULT ''")
         except Exception as exc:  # pragma: no cover - sqlite / duplicate column
             print(f"[deps] idempotent column migration skipped: {exc}")
 

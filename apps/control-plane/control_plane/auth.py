@@ -39,6 +39,10 @@ _EXEMPT_PATHS = (
     "/health",
     "/api/auth/login",
     "/api/nodes/heartbeat",
+    # register 的鉴权因子=license key（体内自证，节点没有 JWT/CP token）：
+    # 加固模式下由端点内的 license 闸把关（无 key 即 401），与 heartbeat 用
+    # node_token 自鉴权同构——中间件不重复预拦。
+    "/api/nodes/register",
     "/docs",
     "/openapi.json",
     "/redoc",
@@ -236,7 +240,11 @@ async def identity_gate(request: Request, call_next):
     """全局身份门禁：auth-off 直通；auth-on 要求用户 JWT 或机器 token。"""
     request.state.identity = None
     path = request.url.path
-    if path in _EXEMPT_PATHS or not auth_required():
+    # 静态站（管理台 SPA）GET/HEAD 豁免：全部特权数据都在 /api/* 端点后面，
+    # auth-on 不得把登录页自己也 401——云端 BOK_AUTH_REQUIRED=1 下裸 GET /
+    # 曾被整站拦死（2026-09-15 compose 排练实测，B4 登录流程不可达）。
+    static_get = request.method in ("GET", "HEAD") and not path.startswith("/api/")
+    if path in _EXEMPT_PATHS or static_get or not auth_required():
         return await call_next(request)
     auth = request.headers.get("authorization", "")
     token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
