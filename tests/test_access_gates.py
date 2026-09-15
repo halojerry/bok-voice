@@ -67,3 +67,26 @@ def test_personas_account_scoped_for_admin(monkeypatch):
     # 建人设强制本账号（旧版可建进任意账号）
     r = client.post("/api/personas", json={"account_id": "acc-002", "name": "evil"}, headers=ah)
     assert r.status_code == 200 and r.json()["account_id"] == "acc-001"
+
+
+def test_misc_gates(monkeypatch):
+    client, repo = _make(monkeypatch, permissions="none")
+    h = _peon(client)
+    # fillers hit 曾完全无闸（匿名/任意身份可刷他账号计数）
+    entry = repo.create_filler_entry({"account_id": "acc-001", "lang": "zh", "text": "稍等"})
+    r = client.post(f"/api/fillers/{entry['id']}/hit", headers=h)
+    assert r.status_code == 403  # permissions=[] → calls/qa 均无,垫话计数归 qa 键
+    # insights 曾仅 reports 页面键且无账号维度 → 管理面 only
+    assert client.get("/api/insights", headers=h).status_code == 403
+    # setup 曾无角色闸 → admin/root only
+    assert client.get("/api/setup", headers=h).status_code == 403
+    assert client.post("/api/setup/download", headers=h).status_code == 403
+    # roster 认领保护：u2 不能释放/抢走 u1 的认领
+    repo.create_user(username="op1", password_hash=hash_password(PW), role="user",
+                     org_id="org-t", account_id="acc-001")
+    entry2 = repo.upsert_roster_entry(account_id="acc-001", call_id="call-r1",
+                                      object_id="", channel="whatsapp", number="138",
+                                      display_name="", summary="")
+    repo.update_roster_entry(entry2["id"], status="claimed", claimed_by="op1")
+    r = client.post(f"/api/roster/{entry2['id']}/unclaim", headers=h)
+    assert r.status_code == 403  # peon ≠ 认领人 op1

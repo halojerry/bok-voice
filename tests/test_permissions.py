@@ -24,7 +24,8 @@ from control_plane.permissions import (
 )
 
 PW = "Passw0rd!x"
-# 契约报表面（6 端点）+ 洞察：全部归 reports 键。
+# 契约报表面（6 端点）：全部归 reports 键。（/api/insights 深测 P3 收管理面，
+# GlobalInsight 无账号维度 → require_role admin/root，不归任何页面键。）
 _REPORT_URLS = (
     "/api/reports/summary",
     "/api/reports/calls",
@@ -32,7 +33,6 @@ _REPORT_URLS = (
     "/api/reports/usage",
     "/api/reports/script-insights",
     "/api/reports/distill-health",
-    "/api/insights",
 )
 
 
@@ -122,7 +122,8 @@ def test_patch_permissions_exact_set_and_immediate(monkeypatch):
     me = client.get("/api/auth/me", headers=ids["op1"]).json()
     assert me["permissions"] == ["calls", "reports"]
     assert client.get("/api/reports/summary", headers=ids["op1"]).status_code == 200
-    assert client.get("/api/insights", headers=ids["op1"]).status_code == 200
+    # insights 深测 P3 收管理面：授 reports 也不该看（全平台蒸馏、无账号维度）
+    assert client.get("/api/insights", headers=ids["op1"]).status_code == 403
     assert client.get("/api/templates", headers=ids["op1"]).status_code == 403
     # 全关（'[]'）→ 连默认面一起关
     assert _patch_perms(client, ids["admin"], ids["op1_id"], []).status_code == 200
@@ -237,6 +238,7 @@ def test_endpoint_matrix_revoked_vs_granted(monkeypatch):
     # 非页面面（管理面）仍按角色 403 不变
     assert client.get("/api/settings", headers=u).status_code == 403
     assert client.get("/api/users", headers=u).status_code == 403
+    assert client.get("/api/insights", headers=u).status_code == 403
 
     # 全开（8 键）→ 各面恢复（话术/QA 归 user 本人，B3 共享闸不参与；
     # /api/token 契约状态码是 201，其余 200）
@@ -246,6 +248,8 @@ def test_endpoint_matrix_revoked_vs_granted(monkeypatch):
             else getattr(client, method)(url, headers=u)
         assert r.status_code == (201 if url == "/api/token" else 200), \
             (method, url, r.status_code, r.text)
+    # insights 是管理面：页面键全开也不恢复（深测 P3）
+    assert client.get("/api/insights", headers=u).status_code == 403
 
 
 def test_interpret_key_mapping(monkeypatch):
