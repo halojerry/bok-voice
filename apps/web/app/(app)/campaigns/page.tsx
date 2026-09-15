@@ -23,7 +23,7 @@ const ITEM_LABEL: Record<string, string> = {
 
 const EMPTY_FORM = {
   name: "", object_ids: [] as string[], template_id: "", persona_id: "",
-  language: "zh", gap_seconds: 5,
+  language: "zh", gap_seconds: 5, site_id: "",
 };
 
 export default function CampaignsPage() {
@@ -31,6 +31,7 @@ export default function CampaignsPage() {
   const [detail, setDetail] = useState<Record<string, Campaign>>({});
   const [objects, setObjects] = useState<Obj[]>([]);
   const [refs, setRefs] = useState<{ templates: Ref[]; personas: Ref[] }>({ templates: [], personas: [] });
+  const [sites, setSites] = useState<Ref[]>([]);
   const [form, setForm] = useState(EMPTY_FORM);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
@@ -45,6 +46,8 @@ export default function CampaignsPage() {
     // 下拉取数照 objects 页姿势（listTemplates/listPersonas 都只需 account_id 缺省）。
     void api.listTemplates().then((t) => setRefs((p) => ({ ...p, templates: t as Ref[] }))).catch(() => {});
     void api.listPersonas().then((p) => setRefs((prev) => ({ ...prev, personas: p as Ref[] }))).catch(() => {});
+    // 站点下拉（P1.5）：拉取失败静默降级为只有「本地（默认）」，不阻塞建战役。
+    void api.listSites().then((s) => setSites(s as Ref[])).catch(() => setSites([]));
   }, [reload]);
 
   // 已展开详情的轮询：只对展开过的战役续拉（列表本身不带 items）。
@@ -68,12 +71,13 @@ export default function CampaignsPage() {
     setErr("");
     try {
       await api.createCampaign(form);
-      // 只清「本波特有的」名称与名单；话术/人设/语言/间隔是跨波复用意图，
+      // 只清「本波特有的」名称与名单；话术/人设/语言/站点/间隔是跨波复用意图，
       // 尤其 language——连建粤语波回落 zh 会静默误拨错语言。
       setForm({
         ...EMPTY_FORM,
         template_id: form.template_id, persona_id: form.persona_id,
         language: form.language, gap_seconds: form.gap_seconds,
+        site_id: form.site_id,
       });
       await reload();
     } catch (e) {
@@ -123,6 +127,11 @@ export default function CampaignsPage() {
           </select>
           <select value={form.language} onChange={(e) => setForm({ ...form, language: e.target.value })} className="rounded border px-2 py-1 text-sm">
             <option value="zh">中文</option><option value="cantonese">粤语</option><option value="en">English</option>
+          </select>
+          <select value={form.site_id} onChange={(e) => setForm({ ...form, site_id: e.target.value })}
+                  className="rounded border px-2 py-1 text-sm">
+            <option value="">本地（默认）</option>
+            {sites.map((s) => <option key={s.id} value={s.id}>{s.name || s.id}</option>)}
           </select>
           <input type="number" min={1} value={form.gap_seconds}
                  onChange={(e) => setForm({ ...form, gap_seconds: Number(e.target.value) || 5 })}
