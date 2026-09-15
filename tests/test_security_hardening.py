@@ -67,3 +67,29 @@ def test_startup_rejects_missing_or_shared_or_weak_secret(monkeypatch):
     monkeypatch.setenv("BOK_JWT_SECRET", "short")
     with pytest.raises(RuntimeError, match="强度不足"):
         cp_main._startup()
+
+
+def test_disabled_or_demoted_token_dies_immediately(monkeypatch):
+    monkeypatch.setenv("BOK_AUTH_REQUIRED", "1")
+    # startup fail-closed 校验密钥强度：模块级 setdefault 会按 pytest 收集顺序被
+    # 先导入的 test_auth.py 的短值占位——这里显式钉住合法密钥，与文件顺序解耦。
+    monkeypatch.setenv("BOK_JWT_SECRET", "unit-test-jwt-secret-0123456789abcdef")
+    client, repo = _make(monkeypatch, users=[
+        {"username": "peon", "role": "user"},
+        {"username": "boss", "role": "admin"},
+        {"username": "rooty", "role": "root", "account": "acc-002"},
+    ])
+    with client:  # 触发 startup：注入 app.state.user_lookup
+        peon_token = _login(client, "peon")
+        boss_token = _login(client, "boss")
+        # 禁用 peon → 旧 token 立即 401
+        rooty_headers = {"Authorization": "Bearer " + _login(client, "rooty")}
+        assert client.post("/api/users", json={"username": "x1", "password": PW,
+                                               "role": "user"}, headers=rooty_headers).status_code == 200
+        # root 停用 peon（rooty 在 acc-002，跨账号管理被 deny——改由 admin 路径：
+        # 直接用 repo 模拟主管禁用）
+        repo.update_user(repo.get_user_by_username("peon")["id"], status="disabled")
+        assert client.get("/api/objects", headers={"Authorization": f"Bearer {peon_token}"}).status_code == 401
+        # 降级 boss：admin→user 后旧 token 打管理面立即 403
+        repo.update_user(repo.get_user_by_username("boss")["id"], role="user")
+        assert client.get("/api/settings", headers={"Authorization": f"Bearer {boss_token}"}).status_code == 403
