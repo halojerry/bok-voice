@@ -866,21 +866,14 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
     业务字段(call_id/role)。响应即官方 TokenSourceResponse({serverUrl,
     participantToken}),任何按标准实现的客户端(playground/Swift/Flutter…)可直接消费。
     """
-    # B2：auth-on 时房 token 需要身份（机器通道直通）；supervisor 角色是主管
-    # 语义（旁听/接管），话务员不得自签。auth-off 开发形态全部放行。
+    # B2：auth-on 时房 token 需要身份（机器通道直通）。auth-off 开发形态全部放行。
     # 注意用 _ident：本函数后文的 `identity` 是参与者身份字符串（官方字段），
-    # 会遮蔽此处的用户身份对象。
+    # 会遮蔽此处的用户身份对象。supervisor 语义 403 闸见下方角色解析之后——
+    # 必须等 role/is_listen 定型（含 participant_identity 前缀反推）才判得准。
     _ident = current_identity(request)
     _machine = getattr(request.state, "machine", False)
     if auth_required() and _ident is None and not _machine:
         raise HTTPException(status_code=401, detail="unauthorized")
-    if _ident is not None and _ident.role not in ("root", "admin") and (
-        (req.role or "").strip().lower() == "supervisor"
-        # 旁听专线（purpose=listen）同样钉 supervisor 语义——不带 role 字段也
-        # 不得绕过（B4 审计补漏：静默旁听是主管权力，话务员不可自签）。
-        or (req.purpose or "").strip().lower() == "listen"
-    ):
-        raise HTTPException(status_code=403, detail="forbidden")
     key = getattr(app.state, "lk_key", "") or os.environ.get("LIVEKIT_API_KEY", "")
     secret = getattr(app.state, "lk_secret", "") or os.environ.get("LIVEKIT_API_SECRET", "")
     url = getattr(app.state, "lk_url", "") or os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880")
@@ -916,6 +909,14 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
     is_listen = _purpose == "listen"
     if is_listen and not identity_input:
         role = "supervisor"
+    # supervisor 语义闸（2026-09-16 深测 P2）：**移到角色解析之后**——旧闸只看
+    # req.role/req.purpose 字段，participant_identity="supervisor-<room>" 走前缀
+    # 反推在闸后改写 role=supervisor，话务员可自签主管身份房 token（第三条绕过路）。
+    # 显式字段与前缀两条路都由最终 role 统一把关；is_listen 单列（grants 语义不同）。
+    if _ident is not None and _ident.role not in ("root", "admin") and (
+        role == "supervisor" or is_listen
+    ):
+        raise HTTPException(status_code=403, detail="forbidden")
     if role == "me":
         name = "Bok Interpret Me"
     elif role == "other":
