@@ -60,24 +60,20 @@ def build_engine() -> Engine | None:
         # create_all 不会给已存在的表加列 —— 幂等补上新增列。注意 SQLite 不支持
         # `ADD COLUMN IF NOT EXISTS`（MySQL 语法，会抛错被吞），必须先查列是否存在。
         try:
+            from sqlalchemy import inspect as sa_inspect
             from sqlalchemy import text
 
             def _ensure_column(conn, table: str, column: str, ddl: str) -> None:
-                dialect = engine.dialect.name
-                if dialect == "sqlite":
-                    exists = any(
-                        row[1] == column
-                        for row in conn.execute(text(f"PRAGMA table_info({table})"))
-                    )
-                else:
-                    exists = conn.execute(
-                        text(
-                            "SELECT 1 FROM information_schema.columns "
-                            "WHERE table_name = :t AND column_name = :c"
-                        ),
-                        {"t": table, "c": column},
-                    ).first() is not None
-                if not exists:
+                # 存在性探测走 SQLAlchemy inspector：方言无关（sqlite/postgres 同一套），
+                # 且由方言把范围限定到当前 schema。旧实现用不带 schema 过滤的
+                # information_schema 查询，多 schema 库（共享 PG 实例、Supabase 的
+                # auth/storage schema、并排 staging schema）里有同名表就被误判「列已存在」
+                # → ALTER 跳过、存量库升级静默丢列（2026-09-15 真 Postgres 冒烟实证）。
+                # 表不存在=跳过该列（半旧库不再让整块补列中断）。
+                insp = sa_inspect(conn)
+                if not insp.has_table(table):
+                    return
+                if column not in {c["name"] for c in insp.get_columns(table)}:
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
 
             with engine.begin() as conn:
@@ -305,11 +301,15 @@ def build_engine() -> Engine | None:
                     for row in _FILLER_SEEDS:
                         conn.execute(
                             text(
+                                # enabled 用 TRUE 字面量（SQLite 3.23+/Postgres 都认）：
+                                # 写 1 在 SQLite（INTEGER 亲和）能存，Postgres 的 boolean
+                                # 列直接 DatatypeMismatch——整块种子被 except 吞掉，
+                                # 分发部署首启垫话库静默为空（2026-09-15 真 PG 冒烟实证）。
                                 "INSERT INTO filler_entries"
                                 " (id, account_id, lang, category, text, triggers, voice_id,"
                                 " priority, per_call_cap, enabled, hit_count, source, created_at)"
                                 " VALUES (:id, 'acc-001', :lang, :category, :text, :triggers, '',"
-                                " :priority, :cap, 1, 0, 'curated', CURRENT_TIMESTAMP)"
+                                " :priority, :cap, TRUE, 0, 'curated', CURRENT_TIMESTAMP)"
                             ),
                             row,
                         )

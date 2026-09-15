@@ -1,0 +1,45 @@
+name: gitleaks
+
+# 公开仓库密钥门禁：全历史扫描，防泄漏凭据被爬取（仓库 2026-09-15 转 public）。
+# 直接用 gitleaks 官方容器镜像（zricethezav/gitleaks:latest，v8.30.1），
+# 不经任何第三方 action——gitleaks/gitleaks-action@v2 对组织仓库需 license key，
+# 官方镜像无此约束；`gitleaks git` 为 v8.19+ 现行子命令（旧写法 `gitleaks detect`
+# 已废弃，本镜像 help 证实 `git` 可用且接受 --verbose/--redact）。
+#
+# 为什么不用 job 级 container：官方镜像基于 Alpine(musl)，而 job 容器里执行 JS
+# action（actions/checkout）走的是 runner 挂载进容器的 node20（glibc 构建，见
+# actions/runner externals/node20 + /__e 挂载），musl 下不可执行——checkout 会在
+# 容器里挂掉。改为在 runner 上 `docker run` 同一官方镜像：镜像/扫描行为等价、
+# ubuntu-latest hosted runner 自带 docker，本地已实测同一条命令可用。
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gitleaks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gitleaks:
+    name: gitleaks (full history)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 = 全历史；gitleaks 扫的是 git 历史而非工作区文件，
+          # 浅克隆（默认 depth=1）会漏掉历史提交里的凭据。
+          fetch-depth: 0
+      - name: Scan git history with official gitleaks container
+        # --redact：命中时输出打码（CI 日志本身也是泄漏面）。
+        # 发现泄漏时 gitleaks 默认 exit code 1，step 直接失败。
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/repo" \
+            -w /repo \
+            zricethezav/gitleaks:latest git --verbose --redact .

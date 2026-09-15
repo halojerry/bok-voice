@@ -1,0 +1,53 @@
+name: Postgres smoke
+
+# 分发型拓扑 P0（AGENTS.md「分发型拓扑」条）：业务库必须 SQL 方言可移植。
+# tests/test_db_portability.py 只编译 DDL（静态），本 job 起真 postgres:16 跑
+# scripts/smoke_postgres.py —— 建表 + 幂等补列迁移 + 全量 CRUD 回程，把静态
+# 门禁漏掉的运行时方言差异（VARCHAR 长度约束、bool/int 强制、多 schema 探测、
+# 事务语义）挡在合入前。
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: postgres-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  postgres-smoke:
+    name: Real Postgres (migrations + CRUD)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      # psycopg 3 驱动显式写全：postgresql:// 会被 SQLAlchemy 解析成 psycopg2。
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -e packages/core -e packages/business-db -e packages/knowledge -e packages/observability
+          pip install -e "apps/control-plane" -e "apps/agent[livekit]"
+      - name: DDL portability gate (sqlite + postgres compile)
+        run: python -m pytest tests/test_db_portability.py -q
+      - name: Real Postgres smoke (migrations + CRUD)
+        run: python scripts/smoke_postgres.py

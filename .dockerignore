@@ -1,0 +1,36 @@
+# 云端 CP 镜像构建上下文瘦身（只影响 `docker build .`；dev/docker/docker-compose.yml 与本文件无关）
+.git
+.github
+.gitignore
+
+# Python 虚拟环境 / 缓存 / 构建残留
+.venv*
+**/__pycache__
+**/*.pyc
+**/*.egg-info
+.pytest_cache
+
+# Node：依赖一律在镜像内 npm ci，本地副本绝不进上下文
+node_modules
+apps/web/.next
+apps/web/out
+
+# 本机形态的运行时数据与产物（云端镜像零残留）
+app-data
+data
+runtime
+release-artifacts
+*.db
+.env*
+
+# 与云端 CP 无关的子系统（agent runtime 跑在客户节点，不进云端镜像）
+desktop/
+services/
+tests/
+docs/
+.superpowers/
+scripts/
+
+# macOS / 编辑器杂项
+**/.DS_Store
+.DS_Store
