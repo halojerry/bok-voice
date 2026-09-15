@@ -114,3 +114,15 @@ def test_explicit_settings_used(monkeypatch):
     result = Summarizer().build(_TURNS, _call(), settings)
     assert captured["url"] == "https://api.deepseek.com/v1/chat/completions"
     assert result["summary"] == "s"
+
+
+def test_settle_uses_thread_offload_not_inline_llm_call(monkeypatch):
+    """P1-4：settle 不得在事件循环里同步 httpx 调用——黑洞 LLM 曾致 /health
+    59.4s 全局停摆。静态锁死调用形态：settle 源码必须经 asyncio.to_thread。"""
+    import inspect
+
+    from control_plane import main as cp_main
+
+    src = inspect.getsource(cp_main.settle)
+    assert "asyncio.to_thread" in src
+    assert src.count("Summarizer().build") == 1  # 二次同步重试一并移除（重试=双倍停摆）

@@ -26,7 +26,7 @@ class Summarizer:
     summary so settlement never blocks on the model.
     """
 
-    def __init__(self, timeout: float = 60.0) -> None:
+    def __init__(self, timeout: float = 15.0) -> None:
         self.timeout = timeout
 
     def build(self, turns: list[Any], call: dict, settings: dict) -> dict:

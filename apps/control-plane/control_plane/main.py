@@ -2428,15 +2428,17 @@ async def settle(call_id: str, request: Request) -> dict:
     except Exception as exc:  # pragma: no cover
         print(f"[settle] usage_record write skipped: {exc!r}", flush=True)
     # 总结/沉淀：用本机 LLM 生成总结正文 + 新话题 + 全局洞察（失败回退纯指标）。
-    # 可观测（2026-09-07）：失败重试 1 次;仍空→审计事件 settle.distill_empty,
+    # 可观测（2026-09-07）：单次尝试,仍空→审计事件 settle.distill_empty,
     # 唔再静默吞掉（蒸馏覆盖率从此可查）。
     try:
         from .summarize import Summarizer
 
         settings = _repo().get_settings()
-        summ = Summarizer().build(turns, call, settings)
-        if not (summ.get("summary") or "").strip() and turns:
-            summ = Summarizer().build(turns, call, settings)
+        # P1-4（2026-09-16 深测）：Summarizer.build 是同步 httpx 调用（原 timeout
+        # 60s×2 次重试），直接跑在 async 路由=事件循环整体冻结——黑洞 LLM 实测
+        # /health 59.4s 停摆（turns 上报/心跳/token 全部停摆）。挪工作线程+单次
+        # 尝试；蒸馏失败由审计 settle.distill_empty 可观测。
+        summ = await asyncio.to_thread(Summarizer().build, turns, call, settings)
         if not (summ.get("summary") or "").strip() and turns:
             _audit("settle.distill_empty", subject_type="call", subject_id=call_id,
                    detail={"turns": len(turns)})
