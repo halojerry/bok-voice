@@ -5,6 +5,7 @@ import hmac
 import io
 import json
 import os
+import re
 import sys
 import uuid
 import wave
@@ -2204,13 +2205,22 @@ def get_call_metrics(call_id: str, request: Request) -> dict:
     }
 
 
+def _safe_segment(value: str, fallback: str) -> str:
+    """vault 相对路径段白名单（2026-09-16 深测 P2）：object_id/call_id 拼路径前收敛
+    成 [A-Za-z0-9_-]。旧版 create_call 收任意 object_id，settle 落盘
+    accounts/{account}/objects/{object}/… 可用 ../../ 把转写/蒸馏写进他账号
+    knowledge/ 并被重启索引（跨租户知识投毒）。合法 id（obj-*/call-*/acc-*）逐字节不变。"""
+    cleaned = re.sub(r"[^A-Za-z0-9_-]", "_", str(value or "").strip())
+    return cleaned or fallback
+
+
 def _write_settlement_docs(call: dict, turns: list[dict], result: dict) -> None:
     """把通话转写与结算文档真实落盘到 vault（与 settlement 声明的 doc path 一致）。
     路径：accounts/{account}/objects/{object}/calls/{call}/transcript.md(.settlement.md)。
     失败只告警，不阻塞结算主流程。"""
-    account_id = call.get("account_id") or "acc-001"
-    object_id = call.get("object_id") or "unknown"
-    call_id = call.get("id") or ""
+    account_id = _safe_segment(call.get("account_id") or "", "acc-001")
+    object_id = _safe_segment(call.get("object_id") or "", "unknown")
+    call_id = _safe_segment(call.get("id") or "", "unknown")
     base = f"accounts/{account_id}/objects/{object_id}/calls/{call_id}"
     lines: list[str] = [f"# 通话转写 {call_id}", ""]
     for t in turns:
@@ -2249,9 +2259,9 @@ async def _write_distill_knowledge(call: dict, result: dict) -> dict | None:
         new_topics = result.get("new_topics") or []
         if not summary and not new_topics:
             return None
-        account_id = call.get("account_id") or "acc-001"
-        object_id = call.get("object_id") or "unknown"
-        call_id = call.get("id") or ""
+        account_id = _safe_segment(call.get("account_id") or "", "acc-001")
+        object_id = _safe_segment(call.get("object_id") or "", "unknown")
+        call_id = _safe_segment(call.get("id") or "", "unknown")
         lines = ["# 通话蒸馏", "", f"- call_id: {call_id}"]
         if summary:
             lines += ["", "## 摘要", summary]
