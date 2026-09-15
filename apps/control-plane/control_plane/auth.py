@@ -240,6 +240,24 @@ def _unauthorized() -> Response:
     return Response(status_code=401, content=b'{"detail":"unauthorized"}', media_type="application/json")
 
 
+def _override_correlation_user(request: Request, user_id: str) -> None:
+    """无验证身份的通道（机器/豁免/静态）覆写 correlation.user_id——审计 actor
+    不可被客户端 X-User-ID 头伪造（2026-09-16 深测 P2：机器通道曾可自带
+    X-User-ID: spoofed-root 落审计，破坏追溯完整性）。"""
+    corr = get_correlation()
+    set_correlation(
+        Correlation(
+            request_id=corr.request_id,
+            call_id=corr.call_id,
+            account_id=corr.account_id,
+            object_id=corr.object_id,
+            persona_id=corr.persona_id,
+            user_id=user_id,
+            span_id=corr.span_id,
+        )
+    )
+
+
 async def identity_gate(request: Request, call_next):
     """全局身份门禁：auth-off 直通；auth-on 要求用户 JWT 或机器 token。"""
     request.state.identity = None
@@ -249,14 +267,16 @@ async def identity_gate(request: Request, call_next):
     # 曾被整站拦死（2026-09-15 compose 排练实测，B4 登录流程不可达）。
     static_get = request.method in ("GET", "HEAD") and not path.startswith("/api/")
     if path in _EXEMPT_PATHS or static_get or not auth_required():
+        _override_correlation_user(request, "anonymous")
         return await call_next(request)
     auth = request.headers.get("authorization", "")
     token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
     # 机器通道：BOK_CP_TOKEN 同值直通（脚本/工具/CI），并打 machine 标记——
     # require_role 等助手对机器请求放行（agent 等内部服务不受角色闸误杀）。
     cp_token = os.environ.get("BOK_CP_TOKEN", "").strip()
-    if cp_token and token == cp_token:
+    if cp_token and token and hmac.compare_digest(token, cp_token):
         request.state.machine = True
+        _override_correlation_user(request, "machine")
         return await call_next(request)
     if not token:
         return _unauthorized()

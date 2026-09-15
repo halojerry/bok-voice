@@ -224,3 +224,18 @@ def test_livekit_webhook_rejects_sha256_digest_mismatch(monkeypatch):
                         raw, secret, claims={"sha256": "f" * 64}),
                         "Content-Type": "application/json"})
     assert r.status_code == 401, r.text
+
+
+def test_machine_channel_actor_cannot_be_spoofed(monkeypatch):
+    monkeypatch.delenv("BOK_AUTH_REQUIRED", raising=False)
+    monkeypatch.setenv("BOK_CP_TOKEN", "mach-token-xyz")
+    client, repo = _make(monkeypatch)
+    with client:  # startup 装审计 tap → 审计进 repo
+        r = client.post("/api/calls", json={"account_id": "acc-001"},
+                        headers={"Authorization": "Bearer mach-token-xyz",
+                                 "X-User-ID": "spoofed-root"})
+        assert r.status_code == 200
+        import json as _json
+
+        dumped = _json.dumps(repo.list_audit_events(limit=100)).lower()
+        assert "spoofed" not in dumped
