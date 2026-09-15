@@ -1,0 +1,57 @@
+# Bok Voice 云端控制面（thin-node SaaS 云侧）Compose 编排 —— 宝塔/通用 Docker 主机通用。
+#
+# 镜像：CI 产出（.github/workflows/cloud-image.yml）→ ghcr.io/halojerry/bok-voice:latest
+#   内容 = CP API（apps/control-plane）+ 管理台静态站（apps/web 导出，挂在 "/"）。
+#   **不含** agent runtime（VAD/ASR/LLM/TTS 管线跑在客户节点 GPU 机器上，见
+#   docs/RUNTIME_TOPOLOGY.md §0 分发型拓扑）——本编排只起云侧控制面一个服务。
+#
+# 使用：cp .env.example .env → 填好 → docker compose up -d（详见同目录 README.md）。
+# 数据：业务库在 Supabase Postgres（DATABASE_URL）；知识库 vault（人设参考音频等
+#   文件）落命名卷 cp-vault——容器重建/镜像升级不丢。
+
+name: bok-cloud
+
+services:
+  cp:
+    # 默认拉 CI 发布的 latest；排练/灰度可用 BOK_CP_IMAGE 覆盖（shell env 或 .env）。
+    image: ${BOK_CP_IMAGE:-ghcr.io/halojerry/bok-voice:latest}
+    # 宿主端口可用 BOK_CP_PORT 改口（如 18010 避让宿主上已有服务）；容器口固定
+    # 8000——镜像的 EXPOSE/HEALTHCHECK/CMD 都按 8000 写死，勿改右侧。
+    ports:
+      - "${BOK_CP_PORT:-8000}:8000"
+    # .env 承载全部变量（见 .env.example）；文件不存在 compose 直接报错——
+    # 刻意 fail-fast：裸 up 起来的 CP 要么连不上库要么裸奔，不如起不来。
+    env_file:
+      - .env
+    environment:
+      # 关键变量显式透传：①在 `compose config` 就能验出缺失/拼错（:? 必填守卫），
+      # ②shell env 优先级高于 .env，便于排练时临时覆盖（CI 即这样用）。
+      # 业务库：Supabase Supavisor **session pooler**（5432 端），格式见 .env.example。
+      DATABASE_URL: ${DATABASE_URL:?请在 .env 配置 DATABASE_URL（postgresql+psycopg://...，见 .env.example）}
+      # 认证开关：云端默认 1（不开=全 API 裸奔）；CP startup 对「开认证无密钥」
+      # fail-closed 拒启，双保险。
+      BOK_AUTH_REQUIRED: ${BOK_AUTH_REQUIRED:-1}
+      # 用户 JWT 签发/校验密钥。必填：泄露=全部 token 可伪造（可冒充任意角色）。
+      BOK_JWT_SECRET: ${BOK_JWT_SECRET:?请在 .env 配置 BOK_JWT_SECRET（openssl rand -hex 32 生成）}
+      # 机器通道钥匙：agent worker / 脚本 / CI 直调 CP 用。分布式部署时 agent env
+      # 必须带同值，否则 turns/whatsapp/设置上报会被角色闸误杀（auth-on 时）。
+      BOK_CP_TOKEN: ${BOK_CP_TOKEN:-}
+      # 首次启动幂等种子 root 账号（同名已存在=跳过，改这里不会重置已有密码）。
+      BOK_ROOT_USERNAME: ${BOK_ROOT_USERNAME:-}
+      BOK_ROOT_PASSWORD: ${BOK_ROOT_PASSWORD:-}
+    volumes:
+      # vault：人设参考音频（TTS 克隆注册）+ 知识库 markdown 源文件。镜像内
+      # VAULT_ROOT=/app/data/vault，属主 appuser；首挂载时 Docker 把镜像内目录
+      # 内容连属主复制进空卷。**容器重建/升级镜像数据不丢，删卷才丢。**
+      - cp-vault:/app/data/vault
+    # 排练/本机联调时 compose 会用 host-gateway 把 host.docker.internal 指到宿主
+    # （DATABASE_URL 指宿主上的 postgres 服务容器用）；生产指 Supabase 时无用无害。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    # healthcheck 不在此重复声明：镜像已内置 HEALTHCHECK（纯 stdlib urllib 打
+    # /health，startup 段 DB 迁移/种子完成后才 200），compose 自动继承——
+    # `docker compose ps` 的 STATUS 列与 --wait 都以它为准。
+
+volumes:
+  cp-vault:
