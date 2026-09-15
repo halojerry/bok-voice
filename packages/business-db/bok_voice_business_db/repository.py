@@ -946,15 +946,18 @@ class SqlAlchemyBusinessRepository:
             "id": row.id, "org_id": row.org_id, "account_id": row.account_id,
             "username": row.username, "display_name": row.display_name,
             "role": row.role, "status": row.status,
+            # B4：NULL（存量库补列前的行）与 '' 同义=默认集，读侧统一空串。
+            "permissions_json": row.permissions_json or "",
             "created_at": row.created_at.isoformat() if row.created_at else "",
         }
 
     def create_user(self, *, username: str, password_hash: str, role: str,
-                    org_id: str = "", account_id: str = "", display_name: str = "") -> dict:
+                    org_id: str = "", account_id: str = "", display_name: str = "",
+                    permissions_json: str = "") -> dict:
         row = models.User(
             id=f"user-{_uuid()}", org_id=org_id, account_id=account_id,
             username=username, password_hash=password_hash, display_name=display_name,
-            role=role, status="active",
+            role=role, status="active", permissions_json=permissions_json or "",
         )
         self.session.add(row)
         self.session.commit()
@@ -984,7 +987,7 @@ class SqlAlchemyBusinessRepository:
         if not row:
             return None
         # 白名单：未知键（含 id/username/created_at/org_id/account_id）忽略，防两后端分叉。
-        for key in ("password_hash", "display_name", "role", "status"):
+        for key in ("password_hash", "display_name", "role", "status", "permissions_json"):
             if key in fields and fields[key] is not None:
                 setattr(row, key, fields[key])
         self.session.commit()
@@ -1464,12 +1467,15 @@ class InMemoryBusinessRepository:
     # ---- users（三层 RBAC 账号；见 SQL 侧同款契约）----
 
     def create_user(self, *, username: str, password_hash: str, role: str,
-                    org_id: str = "", account_id: str = "", display_name: str = "") -> dict:
+                    org_id: str = "", account_id: str = "", display_name: str = "",
+                    permissions_json: str = "") -> dict:
         user_id = f"user-{uuid.uuid4().hex[:12]}"
         row = {
             "id": user_id, "org_id": org_id, "account_id": account_id,
             "username": username, "password_hash": password_hash,
             "display_name": display_name, "role": role, "status": "active",
+            # B4 页面权限（与 SQL 侧同契约：''=默认集）。
+            "permissions_json": permissions_json or "",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         self.users[user_id] = row
@@ -1495,7 +1501,7 @@ class InMemoryBusinessRepository:
         if not row:
             return None
         # 与 SQL 侧同款白名单：未知键（含 id/username/created_at/org_id/account_id）忽略。
-        for key in ("password_hash", "display_name", "role", "status"):
+        for key in ("password_hash", "display_name", "role", "status", "permissions_json"):
             if key in fields and fields[key] is not None:
                 row[key] = fields[key]
         return dict(row)

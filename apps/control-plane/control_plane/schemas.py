@@ -58,6 +58,9 @@ class CreateUserRequest(BaseModel):
     org_id: str = ""
     account_id: str = ""
     display_name: str = ""
+    # B4 页面权限（仅 role=user 目标）：键 ⊆ permissions.GRANTABLE_PERMISSIONS；
+    # None=不写（存 '' → 读侧默认集），list 含 '[]' 时=全关。
+    permissions: list[str] | None = None
 
 
 class UpdateUserRequest(BaseModel):
@@ -65,6 +68,8 @@ class UpdateUserRequest(BaseModel):
     status: str = ""  # active/disabled
     display_name: str = ""
     role: str = ""  # 仅 root 可改
+    # B4：None=不改权限（与 '' 区分——空 list 是「全关」这一显式意图）。
+    permissions: list[str] | None = None
 
 
 class CreateCallRequest(BaseModel):

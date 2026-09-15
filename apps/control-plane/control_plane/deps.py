@@ -208,6 +208,9 @@ def build_engine() -> Engine | None:
                 _ensure_column(conn, "conversation_templates", "owner_user_id", "owner_user_id VARCHAR(64) DEFAULT ''")
                 _ensure_column(conn, "qa_entries", "owner_user_id", "owner_user_id VARCHAR(64) DEFAULT ''")
                 _ensure_column(conn, "call_sessions", "created_by", "created_by VARCHAR(64) DEFAULT ''")
+                # 页面权限(B4):主管按人配置话务员可见面——''=默认集（7 键，报表默认关），
+                # 否则=JSON 数组精确集合（'[]'=全关，见 control_plane/permissions.py）。
+                _ensure_column(conn, "users", "permissions_json", "permissions_json TEXT DEFAULT ''")
         except Exception as exc:  # pragma: no cover - sqlite / duplicate column
             print(f"[deps] idempotent column migration skipped: {exc}")
 
