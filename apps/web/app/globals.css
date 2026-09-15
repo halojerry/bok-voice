@@ -90,6 +90,11 @@
   @apply rounded-lg border border-(--card-border) bg-(--background) px-3 py-1.5 text-sm text-(--foreground) outline-hidden focus:border-(--accent);
 }
 
+@utility textarea {
+  /* 多行输入(同传术语表/QA 问答对):input 同款细边,可纵向拉伸 */
+  @apply w-full resize-y rounded-lg border border-(--card-border) bg-(--background) px-3 py-1.5 text-sm text-(--foreground) outline-hidden placeholder:text-(--muted) focus:border-(--accent);
+}
+
 @utility dot {
   /* 状态小圆点 */
   @apply inline-block h-2 w-2 rounded-full;

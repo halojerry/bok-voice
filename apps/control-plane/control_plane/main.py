@@ -966,6 +966,9 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
     if kind == "interpret" and role == "me":
         src = (_call.get("language") or "zh").strip() or "zh"
         tgt = (_call.get("target_lang") or "en").strip() or "en"
+        # 术语表随 dispatch metadata 下发(P0-2):建单已截 1000 字,这里原样透传
+        # (双向同带——fwd 译给对方、rev 译给我方,各自按源语词条取用)。
+        glossary = str(_call.get("glossary") or "")
         from livekit.api import RoomAgentDispatch, RoomConfiguration
 
         at = at.with_room_config(
@@ -978,6 +981,7 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
                             "deliver_identity": f"other-{room}",
                             "source_lang": src,
                             "target_lang": tgt,
+                            "glossary": glossary,
                         }),
                     ),
                     RoomAgentDispatch(
@@ -987,6 +991,7 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
                             "deliver_identity": f"me-{room}",
                             "source_lang": tgt,
                             "target_lang": src,
+                            "glossary": glossary,
                         }),
                     ),
                 ]
@@ -1079,6 +1084,9 @@ def _create_call_in(repo, req: CreateCallRequest, created_by: str = "") -> dict:
         kind=req.kind,
         target_lang=req.target_lang,
         created_by=created_by,
+        # B 线同传术语表(P0-2,2026-09-16):1000 字硬截(防 metadata/prefill 膨胀,
+        # agent 侧另有 400 字 prompt 护栏);A 线建单恒空。
+        glossary=(req.glossary or "")[:1000],
     )
     call = repo.create_call(manifest)
     _audit("call.create", subject_type="call", subject_id=call.get("id", ""),

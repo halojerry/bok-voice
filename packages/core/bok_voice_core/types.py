@@ -65,6 +65,10 @@ class SessionManifest:
     target_lang: str = ""
     # 建单人身份(B3):user_id——运行时 QA 检索按「共享+建单人个人」收窄;战役建单=''。
     created_by: str = ""
+    # B 线同传术语表(P0-2,2026-09-16):「源=译」或纯词条,逗号/分号/换行分隔。
+    # 随建单存 call_sessions.glossary,token 分发进 dispatch metadata → agent
+    # 装配 ASR 热词 + MT prompt 术语槽;客服通话恒空。
+    glossary: str = ""
 
 
 @dataclass

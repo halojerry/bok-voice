@@ -1496,10 +1496,15 @@ def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
     ——TTS 供应商/音色由 interpret.py 按设置与方向解析。
     """
     env = dict(agent_env)
-    # P2 句级提交 B 线本轮保持关：interpret.py 的 turn_handling 未切 stt（仍是
-    # EOT 默认），STT 侧句级 FINAL 会在 EOT 模式叠进停嘴整段 → 转写重复。A 线
-    # 默认开（agent.py TURN_DETECTION 默认 stt + livekit_plugins 同判）。
-    env["QWEN3_ASR_SENTENCE_COMMIT"] = "0"
+    # B 线句级提交(2026-09-16 起)与 A 线同档默认开：interpret.py 的
+    # turn_handling 已切 turn_detection=stt（与句级 FINAL 成对，_turn_handling_opts
+    # 单源复用 A 线 _turn_detection_mode_from_env/_endpointing_delays_from_env），
+    # STT 说话中按句 FINAL+EOS 成轮 → 翻译+TTS 与源语音重叠，同传粒度从
+    # 「停嘴整段」提前到句级。kill-switch 配对全自动：TURN_DETECTION≠stt
+    # (空串/vad/EOT) 时 livekit_plugins.sentence_commit_enabled() 自行熄火 +
+    # endpointing min_delay 自动回 ≥0.35 地板，无需动这里。setdefault 不抢用户
+    # 显式 env（QWEN3_ASR_SENTENCE_COMMIT=0 仍是应急逃生口）。
+    env.setdefault("QWEN3_ASR_SENTENCE_COMMIT", "1")
     mt_model = _mt_llm_model(MODELS["mac"] if is_mac() else MODELS["windows"])
     if (mt_model and Path(mt_model).exists()) or healthy(1236):
         env["MT_LLM_BASE_URL"] = os.environ.get("MT_LLM_BASE_URL", "http://127.0.0.1:1236/v1")

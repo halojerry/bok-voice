@@ -179,6 +179,14 @@ def build_engine() -> Engine | None:
                     "target_lang",
                     "target_lang VARCHAR(16) DEFAULT ''",
                 )
+                # B 线同传术语表(P0-2,2026-09-16):建单随会话存,token 分发进
+                # dispatch metadata → agent 装配 ASR 热词 + MT prompt 术语槽。
+                _ensure_column(
+                    conn,
+                    "call_sessions",
+                    "glossary",
+                    "glossary TEXT DEFAULT ''",
+                )
                 _ensure_column(
                     conn,
                     "call_sessions",

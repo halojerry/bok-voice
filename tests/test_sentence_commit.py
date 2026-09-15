@@ -11,8 +11,9 @@ min_delay 仍适用）→ 框架按句建轮，LLM+TTS 与客户说话重叠。
 - 跨窗稳定（上一窗同坐标已是同一句段，防滑窗跳变 flicker）；
 - 1.5s 限速（连珠短句排队并入下一边界或停嘴兜底）。
 
-kill-switch：QWEN3_ASR_SENTENCE_COMMIT=0（B 线 interpret 即此档）或
-TURN_DETECTION≠stt → 不发任何句级事件，VAD 停嘴整段 FINAL 行为同旧。
+kill-switch：QWEN3_ASR_SENTENCE_COMMIT=0 或 TURN_DETECTION≠stt → 不发任何
+句级事件，VAD 停嘴整段 FINAL 行为同旧（B 线 2026-09-16 起默认同 A 线开句级，
+kill-switch 配对仍全自动，见 test_interp_env_sentence_commit_on）。
 """
 
 from __future__ import annotations
@@ -324,7 +325,7 @@ def test_decimal_point_not_boundary(monkeypatch):
 
 
 def test_env_off_no_sentence_events(monkeypatch):
-    """QWEN3_ASR_SENTENCE_COMMIT=0（B 线档）→ 无任何句级事件，行为同旧。"""
+    """QWEN3_ASR_SENTENCE_COMMIT=0（kill-switch 档）→ 无任何句级事件，行为同旧。"""
     monkeypatch.setenv("QWEN3_ASR_SENTENCE_COMMIT", "0")
     monkeypatch.delenv("TURN_DETECTION", raising=False)
     monkeypatch.setattr(lp, "httpx", types.SimpleNamespace(AsyncClient=_FakeClient))
@@ -430,11 +431,33 @@ def test_turn_detection_kill_switch_disables_emission(monkeypatch):
     assert committed == ""
 
 
-def test_interp_env_sentence_commit_off():
-    """B 线 interpret worker env 显式关句级提交（本轮 B 线不切 stt）。"""
+def test_interp_env_sentence_commit_on():
+    """B 线句级提交默认开（2026-09-16 P0 句级出稿，与 interpret.py
+    turn_detection=stt 成对，_turn_handling_opts 单源断言在 test_interpret_glossary）。
+
+    旧档「B 线强制关」退役；显式 env 0 仍是应急逃生口（setdefault 不抢），
+    TURN_DETECTION≠stt 时配对自动熄火（sentence_commit_enabled 同判）。
+    """
     env = bok._interp_env({"PASSTHROUGH": "1"})
-    assert env["QWEN3_ASR_SENTENCE_COMMIT"] == "0"
+    assert env.get("QWEN3_ASR_SENTENCE_COMMIT") == "1"
     assert env["PASSTHROUGH"] == "1"  # agent_env 透传不受影响
+
+    # 应急逃生口：用户显式 0 > setdefault
+    env2 = bok._interp_env({"QWEN3_ASR_SENTENCE_COMMIT": "0"})
+    assert env2["QWEN3_ASR_SENTENCE_COMMIT"] == "0"
+
+
+def test_interp_sentence_commit_pairing(monkeypatch):
+    """承诺制/句级出稿 B 线形态钉死：默认 env 下句级提交开；
+    TURN_DETECTION kill-switch 时与 A 线同一对 env 连动熄火（旧「EOT 模式吃
+    句子 FINAL 叠成重复转写」结构性不可能复发——两开关同源同判）。"""
+    monkeypatch.delenv("QWEN3_ASR_SENTENCE_COMMIT", raising=False)
+    monkeypatch.delenv("TURN_DETECTION", raising=False)
+    monkeypatch.setenv("QWEN3_ASR_SENTENCE_COMMIT", "1")  # B 线 _interp_env 默认档
+    assert sentence_commit_enabled() is True
+
+    monkeypatch.setenv("TURN_DETECTION", "")
+    assert sentence_commit_enabled() is False
 
 
 def test_latin_digit_run_helper():

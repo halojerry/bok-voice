@@ -87,6 +87,7 @@ class SqlAlchemyBusinessRepository:
             status=CallStatus.RINGING.value,
             kind=getattr(manifest, "kind", "") or "",
             target_lang=getattr(manifest, "target_lang", "") or "",
+            glossary=getattr(manifest, "glossary", "") or "",
         )
         self.session.add(call)
         self.session.commit()
@@ -1199,6 +1200,7 @@ class InMemoryBusinessRepository:
             "customer_whatsapp": "",
             "kind": getattr(manifest, "kind", "") or "",
             "target_lang": getattr(manifest, "target_lang", "") or "",
+            "glossary": getattr(manifest, "glossary", "") or "",
         }
         return self.calls[call_id]
 

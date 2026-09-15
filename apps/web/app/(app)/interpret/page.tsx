@@ -25,6 +25,7 @@ export default function InterpretPage() {
   const { accountId: ACCOUNT } = useAccount();
   const [myLang, setMyLang] = useState("zh");
   const [otherLang, setOtherLang] = useState("en");
+  const [glossary, setGlossary] = useState("");
   const [callId, setCallId] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -41,6 +42,7 @@ export default function InterpretPage() {
         direction: "interpret",
         language: myLang,
         target_lang: otherLang,
+        glossary,
       });
       const id = String((created as { id?: string }).id ?? "");
       if (!id) {
@@ -97,11 +99,20 @@ export default function InterpretPage() {
             </select>
           </label>
         </div>
+        <label className="flex flex-col gap-1 text-xs">
+          <span className="text-(--stage-muted)">术语表（可选，治专名误听与译名漂移）</span>
+          <textarea
+            className="textarea min-h-20"
+            value={glossary}
+            onChange={(e) => setGlossary(e.target.value)}
+            placeholder={"每条「源词=译文」或纯词条，逗号/分号/换行分隔。如：\n顺丰=SF Express；拼多多=Pinduoduo\n林总（纯词条=原样保留）"}
+          />
+        </label>
         <p className="text-xs leading-relaxed text-(--stage-muted)">
           两人各一支麦：一个页面同时接入本会话两端，同页看双向原文+译文字幕。听感拓扑——
           <strong>对方听到我方译文的 TTS</strong>，<strong>我方听到对方原声</strong>（像直接通话），
           对方→我方的译文只显示文字不出声；我方译文播报时自动暂让对方麦克风防串译。
-          语言对在建房时钉死——请先选好再创建。进房后按「启动传译」才开始。
+          说话中按句出译文（不必等停嘴）。语言对在建房时钉死——请先选好再创建。进房后按「启动传译」才开始。
         </p>
         <button className="stage-btn-primary w-fit" disabled={busy} onClick={startConsole}>
           创建一体台会话
