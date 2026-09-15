@@ -50,7 +50,6 @@ from .auth import (
     hash_password,
     identity_from_request,
     identity_gate,
-    jwt_secret,
     owner_scope_filter,
     require_role,
     scoped_account,
@@ -90,7 +89,16 @@ from .schemas import (
 _TERMINAL_CALL_STATUSES = (CallStatus.ENDED.value, CallStatus.FAILED.value)
 
 
-app = FastAPI(title="Bok Voice Control Plane", version="0.1.0")
+app = FastAPI(
+    title="Bok Voice Control Plane",
+    version="0.1.0",
+    # auth-on 生产关 API 文档（深测 P3：/openapi.json /docs /redoc 匿名可读=全
+    # API 面暴露）。auth-on 必须在 CP 进程 env 先行设置（与下方 startup 校验同一
+    # 要求）；auth-off 开发形态文档照常。
+    docs_url=None if auth_required() else "/docs",
+    redoc_url=None if auth_required() else "/redoc",
+    openapi_url=None if auth_required() else "/openapi.json",
+)
 # 注册顺序=洋葱层次（后注册者在最外层）。identity_gate 必须**第一个**注册（最内层）：
 # 它要在 CorrelationMiddleware 内层运行——读取其 correlation 并覆写 user_id=已验证
 # 身份，审计 actor 由此自动落账（见 auth.py 模块注释）。
@@ -197,11 +205,22 @@ def _startup() -> None:
     app.state.lk_key = os.environ.get("LIVEKIT_API_KEY", "")
     app.state.lk_secret = os.environ.get("LIVEKIT_API_SECRET", "")
     app.state.lk_url = os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880")
-    if auth_required() and not jwt_secret():
-        # fail-closed：拒绝用可伪造密钥开启认证（宁愿起不来也不裸奔）。
-        raise RuntimeError(
-            "BOK_AUTH_REQUIRED=1 但未配置 BOK_JWT_SECRET（或 BOK_CP_TOKEN）——拒绝开启认证"
-        )
+    if auth_required():
+        secret = (os.environ.get("BOK_JWT_SECRET") or "").strip()
+        cp_token = (os.environ.get("BOK_CP_TOKEN") or "").strip()
+        if not secret:
+            # fail-closed：拒绝无签名密钥开认证（机器通道 CP token 不再回落）。
+            raise RuntimeError(
+                "BOK_AUTH_REQUIRED=1 但未配置 BOK_JWT_SECRET —— 拒绝开启认证"
+                "（机器通道 CP token 不得兼作签名密钥）")
+        if cp_token and cp_token == secret:
+            # 2026-09-16 深测 P1：CP token 会拷进每台 agent worker，同值=泄露即
+            # 离线伪造 root JWT。
+            raise RuntimeError(
+                "BOK_CP_TOKEN 与 BOK_JWT_SECRET 同值 —— 机器通道凭据不得兼作"
+                " JWT 签名密钥，拒绝开启认证")
+        if len(secret.encode("utf-8")) < 32:
+            raise RuntimeError("BOK_JWT_SECRET 强度不足（<32 字节）—— 拒绝开启认证")
     _seed_root_user()
     vault = os.environ.get("VAULT_ROOT", "./data/vault")
     embedder = CharHashEmbedding(384)
