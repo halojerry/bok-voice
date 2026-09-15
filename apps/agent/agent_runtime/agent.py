@@ -1349,6 +1349,8 @@ async def entrypoint(ctx):
                 # 振铃窗口（settings sip.ringing_timeout_s，CP dial 块透传；缺键/坏值
                 # 兜 30s 与 CP 侧同款）。dial_outbound 入口还会钳 [0, 80] 硬上限。
                 ringing_timeout_s=float(_dial.get("ringing_timeout_s") or 30),
+                # 8kHz 窄带档（T5 前置门，mock 档专属；dial 块缺键=False=旧行为）。
+                narrowband=bool(_dial.get("narrowband") or False),
             )
         except Exception as e:  # dial_outbound 契约=四态出口,此处仅最后兜底防逸出
             from .dialer import DialOutcome, OUT_FAILED

@@ -188,6 +188,27 @@ def test_campaign_crud_and_dial_result(monkeypatch):
     assert repo.get_item(detail["items"][0]["id"])["status"] == "no_answer"
 
 
+def test_create_campaign_narrowband_flag_rides_scripts_json(monkeypatch):
+    """窄带档（8kHz 重验测试床）：`narrowband: true` → scripts_json 保留键，缺省不发。"""
+    client, repo = _client_and_repo(monkeypatch)
+    obj = repo.create_object("acc-001", {"display_name": "A", "phone": "+85211111111"})
+    cid = client.post("/api/campaigns", json=_campaign_body(obj)).json()["id"]
+    assert repo.get_campaign_scripts(cid) == {}
+
+    obj2 = repo.create_object("acc-001", {"display_name": "B", "phone": "+85222222222"})
+    cid2 = client.post(
+        "/api/campaigns", json=_campaign_body(obj2, narrowband=True)
+    ).json()["id"]
+    scripts = repo.get_campaign_scripts(cid2)
+    assert scripts["__narrowband__"] is True
+    # 假值（false/缺省）不污染 scripts_json——旧战役行为零变化。
+    obj3 = repo.create_object("acc-001", {"display_name": "C", "phone": "+85233333333"})
+    cid3 = client.post(
+        "/api/campaigns", json=_campaign_body(obj3, narrowband=False)
+    ).json()["id"]
+    assert repo.get_campaign_scripts(cid3) == {}
+
+
 def test_dial_result_links_all_failure_states(monkeypatch):
     client, repo = _client_and_repo(monkeypatch)
     obj = repo.create_object("acc-001", {"display_name": "A", "phone": "+85211111111"})

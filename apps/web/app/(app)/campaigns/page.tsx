@@ -48,7 +48,7 @@ const SCENARIOS = [
 
 type Form = {
   name: string; object_ids: string[]; template_id: string; persona_id: string;
-  language: string; gap_seconds: number;
+  language: string; gap_seconds: number; site_id: string;
   scenarios: Record<string, string>;
   scripts: Record<string, string>;
   mock_speak_interval_s: number;
@@ -56,7 +56,7 @@ type Form = {
 
 const EMPTY_FORM: Form = {
   name: "", object_ids: [], template_id: "", persona_id: "",
-  language: "zh", gap_seconds: 5,
+  language: "zh", gap_seconds: 5, site_id: "",
   scenarios: {}, scripts: {}, mock_speak_interval_s: 0,
 };
 
@@ -91,6 +91,7 @@ function ProgressLegend({ progress }: { progress?: Progress }) {
 function CampaignWizard({
   objects,
   refs,
+  sites,
   form,
   setForm,
   onCancel,
@@ -98,6 +99,7 @@ function CampaignWizard({
 }: {
   objects: Obj[];
   refs: { templates: Ref[]; personas: Ref[] };
+  sites: Ref[];
   form: Form;
   setForm: (f: Form) => void;
   onCancel: () => void;
@@ -147,6 +149,7 @@ function CampaignWizard({
         language: form.language,
         gap_seconds: form.gap_seconds,
       };
+      if (form.site_id) body.site_id = form.site_id;
       if (Object.keys(scripts).length) body.scripts = scripts;
       if (form.mock_speak_interval_s > 0) body.mock_speak_interval_s = form.mock_speak_interval_s;
       const scenarios = Object.fromEntries(Object.entries(form.scenarios).filter(([, v]) => v));
@@ -221,6 +224,18 @@ function CampaignWizard({
               <option value="">默认人设</option>
               {refs.personas.map((p) => <option key={p.id} value={p.id}>{p.name || p.id}</option>)}
             </select>
+          </label>
+          <label className="block">
+            <span className="text-xs text-(--stage-muted)">站点</span>
+            <select
+              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+              value={form.site_id}
+              onChange={(e) => setForm({ ...form, site_id: e.target.value })}
+            >
+              <option value="">默认站点（settings 单站点）</option>
+              {sites.map((s) => <option key={s.id} value={s.id}>{s.name || s.id}</option>)}
+            </select>
+            <p className="mt-1 text-xs muted">挂站点后拨号 trunk 用站点注册值，未挂用 settings 兜底。</p>
           </label>
           <label className="block">
             <span className="text-xs text-(--stage-muted)">两通间隔（秒）</span>
@@ -337,6 +352,7 @@ export default function CampaignsPage() {
   const [list, setList] = useState<Campaign[] | null>(null);
   const [objects, setObjects] = useState<Obj[]>([]);
   const [refs, setRefs] = useState<{ templates: Ref[]; personas: Ref[] }>({ templates: [], personas: [] });
+  const [sites, setSites] = useState<Ref[]>([]);
   const [wizardOpen, setWizardOpen] = useState(false);
   const [form, setForm] = useState<Form>(EMPTY_FORM);
   const [openId, setOpenId] = useState<string | null>(null);
@@ -360,6 +376,7 @@ export default function CampaignsPage() {
     void api.listObjects().then((o) => setObjects(o as Obj[])).catch(() => setObjects([]));
     void api.listTemplates().then((t) => setRefs((p) => ({ ...p, templates: t as Ref[] }))).catch(() => {});
     void api.listPersonas().then((p) => setRefs((prev) => ({ ...prev, personas: p as Ref[] }))).catch(() => {});
+    void api.listSites().then((s) => setSites(s as Ref[])).catch(() => setSites([]));
   }, [reload]);
 
   // 深链：/campaigns?open=<id>（静态导出用 query，不开动态路由）。
@@ -493,6 +510,7 @@ export default function CampaignsPage() {
         <CampaignWizard
           objects={objects}
           refs={refs}
+          sites={sites}
           form={form}
           setForm={setForm}
           onCancel={() => setWizardOpen(false)}

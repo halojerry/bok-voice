@@ -22,7 +22,8 @@ def test_dial_outbound_clamps_ringing_timeout(monkeypatch):
     seen: list[float] = []
 
     async def _fake_mock(ctx, *, number, cp_base, call_id, scenario, language,
-                         script, ringing_timeout_s, speak_interval_s=0.0):
+                         script, ringing_timeout_s, speak_interval_s=0.0,
+                         narrowband=False):
         seen.append(ringing_timeout_s)
         return DialOutcome(status=OUT_ANSWERED)
 
@@ -272,6 +273,51 @@ def test_dial_mock_answered(monkeypatch):
     out = _run_mock(monkeypatch, ctx=_MockCtx(joins=True))
     assert out.status == OUT_ANSWERED
     assert out.participant_identity == "sip-mock-123"
+
+
+def test_dial_mock_payload_carries_narrowband(monkeypatch):
+    """窄带档透传 mock 载荷：dial 块 narrowband → CP spawn payload（8kHz 重验测试床）。"""
+    payloads: list[dict] = []
+
+    class _RecordingHttp(_FakeHttp):
+        def post(self, *a, **k):
+            payloads.append(dict(k.get("json") or {}))
+            return super().post(*a, **k)
+
+    import aiohttp
+    monkeypatch.setattr(aiohttp, "ClientSession",
+                        lambda *a, **k: _RecordingHttp(200), raising=True)
+
+    async def _run(narrowband: bool):
+        return await _dial_mock(
+            _MockCtx(joins=True), number="123", cp_base="http://cp", call_id="c1",
+            scenario="answer", language="cantonese", script=["你好"],
+            ringing_timeout_s=5.0, narrowband=narrowband)
+
+    out = asyncio.run(_run(True))
+    assert out.status == OUT_ANSWERED
+    assert payloads[-1]["narrowband"] is True
+    asyncio.run(_run(False))
+    assert payloads[-1]["narrowband"] is False
+
+
+def test_dial_outbound_passes_narrowband_to_mock_backend(monkeypatch):
+    """dial_outbound 入口把 narrowband 传给 mock 后端（real 档无消费）。"""
+    seen: list[bool] = []
+
+    async def _fake_mock(ctx, *, number, cp_base, call_id, scenario, language,
+                         script, ringing_timeout_s, speak_interval_s=0.0,
+                         narrowband=False):
+        seen.append(narrowband)
+        return DialOutcome(status=OUT_ANSWERED)
+
+    monkeypatch.setattr(_dialer_mod, "_dial_mock", _fake_mock, raising=True)
+    asyncio.run(_dialer_mod.dial_outbound(
+        object(), number="123", mode="mock", cp_base="http://cp", call_id="c1",
+        narrowband=True))
+    asyncio.run(_dialer_mod.dial_outbound(
+        object(), number="123", mode="mock", cp_base="http://cp", call_id="c1"))
+    assert seen == [True, False]
 
 
 def test_dial_mock_spawn_http_error_is_failed(monkeypatch):

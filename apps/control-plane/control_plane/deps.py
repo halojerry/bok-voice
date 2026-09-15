@@ -200,6 +200,9 @@ def build_engine() -> Engine | None:
                 # 外呼战役 mock 演练台词（spec 2026-09-12 Wave3）：object_id→[句子]
                 # JSON，空串=无台词（真实通话恒空）。
                 _ensure_column(conn, "campaigns", "scripts_json", "scripts_json TEXT DEFAULT ''")
+                # 战役挂站点（spec 2026-09-13 P1.5 Task 2）：空串=未挂站点，dial 块
+                # trunk 回退 settings `sip`（单站点旧行为零变化）。
+                _ensure_column(conn, "campaigns", "site_id", "site_id VARCHAR(64) DEFAULT ''")
                 # 话务员级资源(B3):话术/QA 个人归属 + 通话建单人——''=共享/无主。
                 _ensure_column(conn, "conversation_templates", "owner_user_id", "owner_user_id VARCHAR(64) DEFAULT ''")
                 _ensure_column(conn, "qa_entries", "owner_user_id", "owner_user_id VARCHAR(64) DEFAULT ''")

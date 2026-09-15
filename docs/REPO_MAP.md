@@ -48,9 +48,11 @@
 - 测量/探针：`measure_latency.py`（需真栈）`measure_prompt.py`（本地）`probe_cantonese_digits.py` `smoke_sidecars.py` `pad_test_audio.py` `test_deepseek.py` `test_volcano_v3.py`
 - TTS 缓存/快答库：`pregen_tts.py`（`bok.py tts-pregen` 执行体：--greetings/--objects/--fillers/--qa 离线预合成，写 app-data/tts-cache；也被 CP 人设保存点自动触发，见 `apps/control-plane/control_plane/pregen.py`）`mine_qa.py`（`bok.py tts-mine` 执行体：高频问答对报告 + --apply 入库 / --sync 自动学习闭环：挖掘→质量闸→入库→按语言物化）
 - 真实客户多轮 E2E：`e2e_real_customer.py`（三语三音色多轮真问题连聊，模板绑定走对象 template_id）
-- 外呼战役 E2E：`e2e_campaign.py`（mock 档全链路：3 对象战役串行自动下一通 + 终态三态 + captured 入名册）
+- 外呼战役 E2E：`e2e_campaign.py`（mock 档全链路：3 对象战役串行自动下一通 + 终态三态 + captured 入名册；C4 号码容差=「含脚本号码的 ≥7 位**连续子串**」——live 链路号码句**头段**会被 ASR 多解一个音，定责与证据见脚本内注释）
+- 8kHz 窄带重验：`probe_8khz_asr.py`（宽/窄对照 + 号码逐位 + 窄带档真伪核验，真栈探针；前置门见 spec §6.1）
 - mock SIP 被叫：`mock_callee.py`（CP 派生的真语音被叫子进程：answer/no_answer/reject/hangup_mid 四剧本；台词/句间隔由 dial 块下发，会等 AI 讲完再出声）
 - 并发/边界：`e2e_barge_in.py` `e2e_edge_cases.py` `e2e_interpret.py` `load_cp_concurrency.py` `load_audio_concurrency.py` `probe_filler_timing.py`
+- 电话边缘站点部署：`deploy_sip_edge.sh`（Ubuntu 22.04+ VPS，root/sudo：apt 依赖 + livekit-sip 原生编译装 `/usr/local/bin/livekit-sip` + `/etc/bok/livekit-sip.yaml` + systemd `bok-livekit-sip.service`（Redis 依赖按 `--redis-url` 分支：本机档 `Requires=`、远端档 `Wants=`）；幂等，`--force` 重编；周期=脚本部署→CP 建站→面板注册 trunk→战役挂 site_id，见 RUNTIME_TOPOLOGY「电话边缘站点」）
 - 平台：`setup-windows.ps1`
 
 ## 关键入口
@@ -70,7 +72,7 @@
 
 | 文件 | 职责 |
 |---|---|
-| `main.py` | 全部 API 端点 + 启动装配（含 `/api/roster*`、`/api/campaigns*`、`/api/sip/mock/callee`） |
+| `main.py` | 全部 API 端点 + 启动装配（含 `/api/roster*`、`/api/campaigns*`、`/api/objects/{id}/dial-now`（单发外呼）、`/api/sip/sites`（GET 列表 / **POST 建站，同 account+name 幂等**）、`/api/sip/sites/{id}/trunk`（注册 outbound trunk）、`/api/sip/mock/callee`） |
 | `campaign.py` | 外呼战役串行循环（5s 巡检：终态收割 / 串行起下一通 / 名单尽判 done；gap 冷却；dispatcher 可注入） |
 | `deps.py` | 引擎装配 + 幂等 DB 迁移唯一入口（新建列/数据迁移都在 `build_engine()`） |
 | `schemas.py` | 请求/响应模型（含 `SipSettingsModel`） |
@@ -82,8 +84,9 @@
 |---|---|
 | `call_sessions` / `turns` | 通话主记录 / 逐轮分析账本（speaker/gen/template_step/perceived_ms） |
 | `roster_entries` | 名册认领池（captured 号码自动入册；unclaimed→claimed→handled） |
-| `campaigns` | 外呼战役（status draft/running/paused/done/stopped、gap_seconds、scripts_json mock 台词钩子） |
+| `campaigns` | 外呼战役（status draft/running/paused/done/stopped、site_id 电话边缘站点、gap_seconds、scripts_json mock 台词钩子） |
 | `campaign_items` | 战役名单项（seq/phone/status/call_id/scenario，无电话对象直接 skipped） |
+| `sip_sites` | 电话边缘站点（livekit_url/sip_edge none·local·cloud/trunk_id/numbers_json；`site-local` 是 repo 合成的虚拟默认站点，不入库） |
 
 ## 运行时装配（packaged）
 

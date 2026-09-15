@@ -122,6 +122,22 @@ export const api = {
   deleteQa: (id: string) => request<Record<string, unknown>>(`/api/qa-entries/${id}`, { method: "DELETE" }),
   getSettings: () => request<Record<string, unknown>>("/api/settings"),
   saveSettings: (body: unknown) => request<Record<string, unknown>>("/api/settings", { method: "PUT", body: JSON.stringify(body) }),
+  // 电话边缘站点（P1.5）：站点下拉 + 一次性把 SIP 供应商凭据注册成 outbound trunk。
+  // 注册成功返回 trunk_id——调用方回填设置表单的 sip.trunk_id（保存后 campaign 按站点取）。
+  listSites: (accountId = "acc-001") =>
+    request<Record<string, unknown>[]>(`/api/sip/sites?account_id=${encodeURIComponent(accountId)}`),
+  // 建站（P1.5 T7）：最小 body = name + livekit_url；**幂等**——同账号同名已存在
+  // 时 CP 返回既有行（不重复建、不改写字段），调用方按返回 id 选中即可。
+  createSite: (body: { name: string; livekit_url?: string; sip_edge?: string; numbers?: string[]; region?: string; account_id?: string }) =>
+    request<Record<string, unknown>>("/api/sip/sites", { method: "POST", body: JSON.stringify(body) }),
+  registerSipTrunk: (
+    siteId: string,
+    body: { address: string; numbers: string[]; auth_username?: string; auth_password?: string },
+  ) =>
+    request<{ trunk_id: string; site: Record<string, unknown> }>(
+      `/api/sip/sites/${encodeURIComponent(siteId)}/trunk`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
   // 官方 TokenSourceResponse 契约({serverUrl, participantToken});TokenSource
   // 直连本响应,无需键名映射。
   token: (body: { account_id: string; object_id?: string; call_id?: string; role?: string }) =>
@@ -140,6 +156,16 @@ export const api = {
   listObjects: (accountId = "acc-001") =>
     request<Record<string, unknown>[]>(`/api/objects?account_id=${accountId}`),
   getObject: (id: string) => request<Record<string, unknown>>(`/api/objects/${id}`),
+  // 单发外呼（P1.5）：对象页「立即外呼」——建一通 outbound 通话并直接派 agent
+  // （dial 块与 campaign 同一 build_dial_block；无 phone=400）。
+  dialNow: (
+    objectId: string,
+    body: { template_id?: string; persona_id?: string; language?: string; site_id?: string } = {},
+  ) =>
+    request<{ call_id: string; status: string }>(
+      `/api/objects/${encodeURIComponent(objectId)}/dial-now`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
   getObjectTopics: (id: string) => request<Record<string, unknown>[]>(`/api/objects/${id}/topics`),
   listGlobalInsights: () => request<Record<string, unknown>[]>("/api/insights"),
   createObject: (body: unknown, accountId = "acc-001") =>

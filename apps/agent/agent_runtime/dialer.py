@@ -58,17 +58,20 @@ async def dial_outbound(ctx, *, number: str, mode: str, cp_base: str, call_id: s
                         scenario: str = "", language: str = "",
                         script: list[str] | None = None,
                         ringing_timeout_s: float = 30.0, trunk_id: str = "",
-                        speak_interval_s: float = 0.0) -> DialOutcome:
+                        speak_interval_s: float = 0.0,
+                        narrowband: bool = False) -> DialOutcome:
     # 振铃窗口硬上限 80s（spec §3：protobuf Duration 端拒绝/截断超窗值，且真 SIP 侧
     # 同一振铃窗最多 ~80s）。settings/编排给什么都在入口钳死，负值一律归 0（=不等振铃）。
     ringing_timeout_s = min(max(0.0, float(ringing_timeout_s)), 80.0)
     if mode == "real":
+        # 窄带档是 mock 测试床专属：真中继的窄带话音来自运营商本身，real 档无消费。
         return await _dial_real(ctx, number=number, trunk_id=trunk_id,
                                 ringing_timeout_s=ringing_timeout_s)
     return await _dial_mock(ctx, number=number, cp_base=cp_base, call_id=call_id,
                             scenario=scenario, language=language, script=script,
                             ringing_timeout_s=ringing_timeout_s,
-                            speak_interval_s=speak_interval_s)
+                            speak_interval_s=speak_interval_s,
+                            narrowband=narrowband)
 
 
 async def _dial_real(ctx, *, number: str, trunk_id: str, ringing_timeout_s: float) -> DialOutcome:
@@ -114,7 +117,8 @@ async def _wait_participant(ctx, identity: str, timeout_s: float):
 async def _dial_mock(ctx, *, number: str, cp_base: str, call_id: str, scenario: str,
                      language: str, script: list[str] | None,
                      ringing_timeout_s: float,
-                     speak_interval_s: float = 0.0) -> DialOutcome:
+                     speak_interval_s: float = 0.0,
+                     narrowband: bool = False) -> DialOutcome:
     import aiohttp
 
     identity = f"sip-mock-{number}"
@@ -123,6 +127,8 @@ async def _dial_mock(ctx, *, number: str, cp_base: str, call_id: str, scenario: 
         "scenario": scenario or "answer", "language": language or "cantonese",
         "script": script or [], "ring_delay_s": 3.0,
         "ringing_window_s": ringing_timeout_s,
+        # 8kHz 窄带档（spec 2026-09-13 §6）：mock 客户话音走电话频带推流。
+        "narrowband": bool(narrowband),
     }
     # 句间隔只在调用方显式给了正数时下发——缺省沿用子进程自带的 6s（演练/手起
     # 调试零行为变化；E2E 用 campaign dial 块把它对齐到 AI 步进）。

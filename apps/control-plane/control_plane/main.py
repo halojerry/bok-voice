@@ -59,6 +59,7 @@ from .auth import (
 from .schemas import (
     CreateCallRequest,
     CreateObjectRequest,
+    DialNowRequest,
     ImportRequest,
     DialResultRequest,
     ListenStopRequest,
@@ -76,8 +77,10 @@ from .schemas import (
     UpdateObjectRequest,
     UpdatePersonaRequest,
     SettingsRequest,
+    SiteCreateRequest,
     TokenRequest,
     TokenResponse,
+    TrunkRegisterRequest,
     WhatsAppCaptureRequest,
     WhatsAppHandledRequest,
 )
@@ -1626,6 +1629,12 @@ class CampaignCreateRequest(BaseModel):
     # mock 客户台词句间隔秒（0=子进程默认 6s）。E2E 要把客户报号句对齐到 AI 的
     # 收号步时调大（AI 每轮处理+播报 8-12s）。
     mock_speak_interval_s: float = 0.0
+    # 电话边缘站点（spec 2026-09-13 P1.5）：空串=不挂站点（dial 块走 settings
+    # `sip` 兜底，单站点旧行为零变化）；挂站点时 dial 块 trunk 取站点注册值。
+    site_id: str = ""
+    # 8kHz 窄带档（T5 前置门）：mock 客户话音走电话频带，重验窄带下的 ASR。
+    # 与句间隔同一份 scripts_json 保留键（`__narrowband__`），只加键不加列。
+    narrowband: bool = False
 
 
 @app.post("/api/campaigns")
@@ -1653,12 +1662,16 @@ def create_campaign(req: CampaignCreateRequest, request: Request) -> dict:
     # 不加宽、不加新表，起拨时 campaign._start_call 从同一份 JSON 取。
     if float(req.mock_speak_interval_s or 0) > 0:
         scripts["__speak_interval__"] = float(req.mock_speak_interval_s)
+    # 窄带档（T5）：假值不发键——旧战役的 scripts_json 逐字节零变化。
+    if req.narrowband:
+        scripts["__narrowband__"] = True
     camp = _repo().create_campaign(
         req.account_id, name=req.name, template_id=req.template_id,
         persona_id=req.persona_id, language=req.language,
         gap_seconds=req.gap_seconds, object_ids=req.object_ids,
         scenarios={k: v for k, v in req.scenarios.items() if v in _CAMPAIGN_SCENARIOS},
         scripts=scripts,
+        site_id=req.site_id,
     )
     _audit("campaign.create", subject_type="campaign", subject_id=camp["id"],
            account_id=req.account_id, detail={"objects": len(req.object_ids)})
@@ -1753,6 +1766,116 @@ def _progress(items: list[dict]) -> dict:
     return p
 
 
+@app.post("/api/sip/sites")
+def create_sip_site(req: SiteCreateRequest, request: Request) -> dict:
+    """建站（spec 2026-09-13 P1.5 T7 收尾：面板「+ 新建站点」入口）。
+
+    P1.5 起站点表只有 repo 层入口时，面板站点下拉在空库只能提示「请先在后端登记
+    站点」；本端点把建行收进 HTTP 面（name 必填 + livekit_url 两字段即可建最小
+    站点，后续 trunk 注册/战役挂 site_id 都按这个 id 走）。
+
+    **幂等**（T7 定案，非 409）：同 `account_id` + `name` 已存在时直接返回既有行
+    ——建站是引导期动作，面板双击/脚本重跑不该堆出同名重复行；同账号要用两个
+    同名站点无实际意义（站点选择按 id，名字只给人看）。不覆盖既有行字段（改字段
+    走 update_site；重名幂等不承担 upsert 语义，避免误清已注册 trunk_id）。
+    失败面：name 空=400；sip_edge 越界（值域 none|local|cloud）=400；
+    numbers 非 list[str]=422（Pydantic 严格类型，T1 审查同款防线）。
+    """
+    name = (req.name or "").strip()
+    if not name:
+        raise HTTPException(400, "name 必填")
+    sip_edge = (req.sip_edge or "local").strip() or "local"
+    if sip_edge not in ("none", "local", "cloud"):
+        raise HTTPException(400, f"sip_edge 只支持 none|local|cloud（收到：{sip_edge}）")
+    # 建站=基础设施引导（B2 管理面语义）：user 不可建；admin 非 root 强制本账号。
+    require_role(request, "admin", "root")
+    account_id = (req.account_id or "acc-001").strip() or "acc-001"
+    identity = current_identity(request)
+    if identity is not None and identity.role != "root":
+        account_id = identity.account_id or account_id
+    repo = _repo()
+    for row in repo.list_sites(account_id):
+        if str(row.get("name") or "") == name:
+            return row  # 幂等命中：返回既有行，不重复建、不改写
+    site = repo.create_site(
+        account_id, name=name, livekit_url=(req.livekit_url or "").strip(),
+        sip_edge=sip_edge, trunk_id=(req.trunk_id or "").strip(),
+        numbers=[str(n).strip() for n in req.numbers if str(n).strip()],
+        region=(req.region or "").strip(),
+    )
+    _audit("sip.site_created", subject_type="site", subject_id=str(site.get("id") or ""),
+           account_id=account_id,
+           detail={"name": name, "livekit_url": site.get("livekit_url", ""),
+                   "sip_edge": sip_edge})
+    return site
+
+
+@app.get("/api/sip/sites")
+def list_sip_sites(request: Request, account_id: str = "acc-001") -> list[dict]:
+    """站点列表（P1.5 T1 repo 直通）：外呼页/设置页「注册 trunk 到站点」的下拉数据源。
+
+    只返回库中真站点——虚拟兜底站点 `site-local`（`get_default_site` 恒合成、
+    不入库）不在列表里：它没有行可回填 trunk_id，注册动作对它无意义。
+    """
+    _gate_page(request, "campaigns")
+    account_id = scoped_account(request, account_id)
+    return _repo().list_sites(account_id)
+
+
+@app.post("/api/sip/sites/{site_id}/trunk")
+async def register_sip_trunk(site_id: str, req: TrunkRegisterRequest, request: Request) -> dict:
+    """把 SIP 供应商凭据注册成 LiveKit outbound trunk，并把返回 id 回填站点。
+
+    站点生命周期的一次性引导动作（spec 2026-09-13 P1.5 T3）：调 LiveKit SIP 服务
+    `CreateSIPOutboundTrunk` 建 trunk → `site.trunk_id` = 返回的 `sip_trunk_id`
+    ——T2 的 campaign 按 site 优先取 trunk（无站点时才回退 settings），agent 侧零改。
+    `address`/`numbers` 必填（400）；`auth_*` 可空 = IP 白名单模式；**密码不回显**。
+    失败（凭据缺 / SIP 服务未部署 / 不可达 / 返回空 id）一律 502 且**绝不写**
+    site.trunk_id——宁可报错也不静默清空站点已注册的 trunk。
+    """
+    # trunk 注册携带 SIP 凭据=基础设施动作（B2 管理面）；跨账号站点一律 404。
+    require_role(request, "admin", "root")
+    site = deny_cross_account(request, _repo().get_site(site_id))
+    if not site:
+        raise HTTPException(404, "site not found")
+    address = (req.address or "").strip()
+    numbers = [str(n).strip() for n in req.numbers if str(n).strip()]
+    if not address or not numbers:
+        raise HTTPException(400, "address 与 numbers 必填")
+    client = _lkapi_client()
+    if client is None:
+        raise HTTPException(502, "LiveKit 凭据未配置——livekit-sip 未部署或不可达")
+    # SDK 1.2+ 的写法：CreateSIPOutboundTrunkRequest(trunk=SIPOutboundTrunkInfo)；
+    # `create_sip_outbound_trunk` 是同一调用的弃用名（1.2 起 warnings.warn）。
+    from livekit.api import CreateSIPOutboundTrunkRequest, SIPOutboundTrunkInfo
+
+    create = CreateSIPOutboundTrunkRequest(
+        trunk=SIPOutboundTrunkInfo(
+            name=f"outbound-{site_id[:8]}-{int(datetime.now(timezone.utc).timestamp())}",
+            address=address,
+            numbers=numbers,
+            auth_username=req.auth_username,
+            auth_password=req.auth_password,
+        )
+    )
+    try:
+        info = await client.sip.create_outbound_trunk(create)
+    except Exception as exc:
+        raise HTTPException(
+            502, f"trunk 注册失败——livekit-sip 未部署或不可达: {exc}"
+        ) from exc
+    finally:
+        await client.aclose()  # 一次性客户端（自带 aiohttp session）必须关
+    trunk_id = str(getattr(info, "sip_trunk_id", "") or "")
+    if not trunk_id:
+        raise HTTPException(502, "trunk 注册失败——livekit-sip 未返回 trunk id")
+    updated = _repo().update_site(site_id, trunk_id=trunk_id) or site
+    _audit("sip.trunk_registered", subject_type="site", subject_id=site_id,
+           account_id=str(site.get("account_id") or ""),
+           detail={"trunk_id": trunk_id, "address": address})
+    return {"trunk_id": trunk_id, "site": updated}
+
+
 class MockCalleeRequest(BaseModel):
     room: str
     number: str
@@ -1765,11 +1888,17 @@ class MockCalleeRequest(BaseModel):
     # 句间隔秒（默认 6≈一轮问答）：E2E/演练要把客户台词对齐到 AI 的话术步进时
     # 调大（AI 每轮处理+播报可能 8-12s，太密会令报号句落在收号步之外）。
     speak_interval_s: float = 6.0
+    # 8kHz 窄带档（spec 2026-09-13 §6 前置门）：客户话音按电话频带（3.4kHz
+    # 抗混叠 → 8k → 升回 16k）再推流，模拟运营商 PCMU/PCMA 窄带线路。
+    narrowband: bool = False
 
 
 @app.post("/api/sip/mock/callee")
-def spawn_mock_callee(req: MockCalleeRequest) -> dict:
+def spawn_mock_callee(req: MockCalleeRequest, request: Request) -> dict:
     """模拟联调档:派生 mock 客户子进程(同 pregen detached 姿势,失败不阻拨号主链)。
+
+    联调/演练工具面：user 不开放（防话务员自己派 mock 客户刷通话），
+    agent 机器通道直通（campaign 派发链在用）。
 
     真语音被叫——子进程进房后按剧本(四型)TTS 轮播客户话音,agent 侧
     dialer._dial_mock 靠 participant identity 认它。无 LiveKit 凭据=404
@@ -1777,6 +1906,7 @@ def spawn_mock_callee(req: MockCalleeRequest) -> dict:
     """
     import subprocess
 
+    require_role(request, "admin", "root")
     if not req.room or not req.number:
         raise HTTPException(400, "room and number are required")
     identity = req.identity or f"sip-mock-{req.number}"
@@ -1818,6 +1948,8 @@ def spawn_mock_callee(req: MockCalleeRequest) -> dict:
         "--ringing-window", str(req.ringing_window_s),
         "--speak-interval", str(req.speak_interval_s),
     ]
+    if req.narrowband:
+        cmd.append("--narrowband")
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     log_path = repo_root / "runtime" / "logs" / "mock-callee.log"
     try:
@@ -1836,7 +1968,8 @@ def spawn_mock_callee(req: MockCalleeRequest) -> dict:
     threading.Thread(target=proc.wait, daemon=True, name=f"mock-callee-reap-{proc.pid}").start()
     _audit("sip.mock_callee_spawn", subject_type="room", subject_id=req.room,
            account_id="acc-001",
-           detail={"scenario": req.scenario, "pid": proc.pid, "identity": identity})
+           detail={"scenario": req.scenario, "pid": proc.pid, "identity": identity,
+                   "narrowband": req.narrowband})
     return {"ok": True, "pid": proc.pid, "identity": identity}
 
 
@@ -2206,6 +2339,70 @@ def delete_object(object_id: str, request: Request) -> dict:
         raise HTTPException(404, "object not found")
     _audit("object.delete", subject_type="object", subject_id=object_id, account_id=(existing or {}).get("account_id", ""))
     return {"object_id": object_id, "deleted": True}
+
+
+@app.post("/api/objects/{object_id}/dial-now")
+async def dial_now(object_id: str, req: DialNowRequest, request: Request) -> dict:
+    """单发外呼「立即外呼」（spec 2026-09-13 P1.5 T4）：建一通 outbound 通话并直接派 agent。
+
+    复用 campaign 的派发链路，只是名单退化成「就这一通」：
+    `build_dial_block`（键序/trunk 解析/数字兜底与 campaign 同源，T2 站点优先）→
+    `_create_call_in`（`direction=outbound` / `mode=live`，agent 侧零改，靠 metadata
+    的 dial 块拨号）→ `_default_dispatcher`（= campaign 的 explicit dispatch，
+    `campaign_item_id` 留空：不属任何战役名单）。
+
+    失败面：对象不存在=404；对象无电话（strip 后空）=400；派发失败（LiveKit 凭据缺/
+    不可达）=502——通话已建好留在库里便于排查（campaign 落 item failed 同语义），
+    悬挂的 ringing 通话由僵尸回收器兜底翻 FAILED。
+    """
+    _gate_page(request, "calls")
+    repo = _repo()
+    obj = deny_cross_account(request, repo.get_object(object_id))
+    if not obj:
+        raise HTTPException(404, "object not found")
+    phone = str(obj.get("phone") or "").strip()
+    if not phone:
+        raise HTTPException(400, "对象无电话号码")
+    account_id = str(obj.get("account_id") or "acc-001")
+    settings = repo.get_settings() or {}
+    # 语言缺省链：请求 language > 对象 language > zh（粤语值只准 cantonese）。
+    language = req.language or str(obj.get("language") or "zh")
+    site = repo.get_site(str(req.site_id or "")) if req.site_id else None
+    from .campaign import build_dial_block  # 延迟 import 防 main↔campaign 循环
+
+    dial = build_dial_block(
+        number=phone,
+        language=language,
+        sip=dict(settings.get("sip") or {}),
+        site=site,
+    )
+    call = _create_call_in(repo, CreateCallRequest(
+        account_id=account_id,
+        object_id=object_id,
+        persona_id=req.persona_id or "",
+        language=dial["language"],
+        mode=CallMode.LIVE,
+        direction="outbound",
+    ))
+    call_id = str(call.get("id") or "")
+    repo.update_call(call_id, contact_phone=phone)
+    # 话术快照：显式 template_id 压过对象绑定模板（call_sessions.template_id 是
+    # agent 装配的第一优先来源，与 campaign/工作台建单同优先级）。
+    if req.template_id:
+        repo.update_call(call_id, template_id=req.template_id)
+    metadata = json.dumps({"call_id": call_id, "dial": dial}, ensure_ascii=False)
+    from .campaign import _default_dispatcher
+
+    try:
+        await _default_dispatcher(call_id, metadata)
+    except Exception as exc:  # noqa: BLE001 - 凭据缺/不可达统一成 502（不裸 500）
+        _audit("call.dial_now", subject_type="call", subject_id=call_id,
+               outcome="error", account_id=account_id,
+               detail={"object": object_id, "error": str(exc)[:200]})
+        raise HTTPException(502, f"外呼派发失败——LiveKit 不可达: {exc}") from exc
+    _audit("call.dial_now", subject_type="call", subject_id=call_id,
+           account_id=account_id, detail={"object": object_id})
+    return {"call_id": call_id, "status": str(call.get("status") or "")}
 
 
 @app.post("/api/objects/import")

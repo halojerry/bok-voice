@@ -59,6 +59,25 @@ spec §2 拍板 7 原文有效：**真中继启用前必须过 8kHz 窄带重验
 - 专项先于任何真中继配置；PR#68 的 mock 档是现成测试床（`mock_callee` 加 8kHz 重采样合成档即可模拟窄带话音，先在 mock 档重跑三语/数字/拆句探针，再上真中继）。
 - 真中继数据（真实客户话音 8kHz 录音样本）回填喂重验——外呼自用期顺路产生。
 
+### 6.1 mock 档实测（2026-09-15，第一轮）
+
+测试床：`mock_callee --narrowband`（3.4kHz 6 阶 Butterworth 抗混叠 → 抽降至 8k → 升回 16k 推流，模拟电话频带损失；不含 G.711 8bit 量化噪声）。探针：`scripts/probe_8khz_asr.py`——**真链路**（CP 建最小战役 → agent 读 dial 块 `narrowband` → mock 档窄带推流 → agent 真 ASR 转写 → `/api/calls/{id}/turns` 取 customer 转写 → difflib 字符准确率 + 号码逐位比对）。宽/窄同词同音色各 4 腿 × 2 轮，取各档较好轮次：
+
+| 腿（语言） | 台词 | 宽档 | 窄档 |
+|---|---|---|---|
+| zh-sentence（zh） | 你好我是快递公司的专员 + 好的再见 | **1.000** | **1.000** |
+| en-sentence（en） | Let me check that for you + okay bye bye | **0.933** | **0.933** |
+| hotword（zh，模板热词 拼多多/京东/下单） | 拼多多京东下单 + 好的再见 | **0.917** | **0.917** |
+| cantonese-number（cantonese） | 我WhatsApp係 + 六四三二零一一一 + 好嘅再見 | 0.564 | 0.579 |
+
+- **号码句窄带逐位全对**：`64320111` 逐位命中，宽档 2/2 轮 + 窄档 2/2 轮（每档各 2 轮）均如此（归档 `task-5-probe-data-valid.json` 共 4 条 `digits_want` 记录，全部 `digit_ok=true`）。
+- **门禁结论：过** —— `8KHZ_PROBE wide_acc=0.950 narrow_acc=0.950 digit_ok=1 gate=PASS`（三语句窄带准确率 0.950 ≥ 0.90 且号码句逐位全对）；窄带档真伪核验 8/8 腿（每通窄腿的 `mock_callee` 日志都有 `narrowband=1` 自报，排除「窄带档没真跑」的假绿）。
+- 三条语句腿的窄档转写与宽档**逐字一致**（±0.000）：3.4kHz 电话频带对本 ASR 栈的句级提交 / 热词软偏置（拼多多、京东、下单全中）/ 数字保护没有可测退化。
+- cantonese 腿的两句短句（「我WhatsApp係」「好嘅再見」）在**宽窄两档同样**听岔（"我。惨唔系" / "我。单号"），与窄带无关（本地 TTS 混排短句 + ASR 组合问题）——该腿不进三语句分母，只作号码逐位比对。
+- **真中继启用硬条件（2026-09-15 审查定案）：mock 档过门 ≠ 真中继放行**，下列两项在真中继启用前必须闭环，缺一不放行——
+  1. **报号短句专项（带前缀粤语报号窄带复测）**：本节窄带复测的号码腿只覆盖「裸号码串」（`六四三二零一一一`）的逐位命中；真实报号形态是**带前缀的粤语短句**（「我WhatsApp係…」一类），需在窄带下专门复测「前缀 + 号码」的拆句组装（join-hold/累积）与号码逐位，且以带前缀形态为准。
+  2. **真 G.711 样本回填**：mock 档只模拟带宽损失（3.4kHz 抗混叠 + 8k 抽取 + 升回 16k），未模拟 G.711 8bit 对数量化噪声与真线路抖动；需以真中继录音（真实客户 8kHz 话音）按本节口径复测通过（外呼自用期顺路产出样本）。
+
 ## 7. 分期（对 spec §10 的增量）
 
 | 期 | 内容 |
@@ -67,6 +86,21 @@ spec §2 拍板 7 原文有效：**真中继启用前必须过 8kHz 窄带重验
 | **P1.5（新增：自用外呼上线）** | 香港 VPS 电话边缘（形态 2 单租户）+ `sites` 维度最小版 + campaign 按 site 路由 + trunk 商开户配置（推荐 Telnyx，备 DIDWW/Plivo）+ **8kHz ASR 重验专项**（mock 档先测床）——自用外呼业务先跑通，同时产出真话音数据 |
 | P2 | 节点包 `--sip-edge` 组件组进发行管线；形态 1 成为客户站点部署选项（安装脚本/doctor/节点就绪单扩展） |
 | P4 | 电话边缘多租户共享（形态 2 有规模需求时）、中继计费、号码池按 org 隔离硬化 |
+
+**P1.5 完成状态（2026-09-15 收尾，分支 `feat/sip-edge-p15`）**：
+
+- **本地可做子集 = done**：`sip_sites` 表+双后端 repo（T1）；campaign 挂 `site_id` +
+  dial 块 trunk 按 site 优先（T2）；`POST /api/sip/sites/{id}/trunk` 注册 outbound
+  trunk + 面板按钮（T3）；对象页「立即外呼」单发外呼复用 dispatch 链路（T4）；
+  8kHz 窄带重验专项 = **mock 档门禁 PASS**（宽 0.950/窄 0.950、号码逐位 2/2，
+  §6.1 起仍受「真中继启用硬条件」两条约束）（T5）；`scripts/deploy_sip_edge.sh`
+  VPS 部署 runbook（T6）；`POST /api/sip/sites` 建站端点 + 面板「+ 新建站点」
+  表单（T7）。门禁：pytest 全量 944 passed、compileall OK、`tsc --noEmit`+web
+  build OK、`scripts/e2e_campaign.py` 13/13、`scripts/e2e_trilingual_livekit.py` 3/3。
+- **follow-up（不在 P1.5 交付内）**：真 VPS 部署（用户资源到位后按 runbook 执行 +
+  实测真中继）；`site.livekit_url` 目前只是登记字段——token/dispatch 仍按 env
+  `LIVEKIT_URL` 单点路由（逐站点路由列 P2）；号码句 live 链路头段 ASR 多解一个音
+  （`六四三二零一一一` → `664320111`，T7 定责见 `scripts/e2e_campaign.py` 注释）
 
 ## 8. 明确不做（YAGNI）
 
