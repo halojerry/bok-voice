@@ -134,12 +134,13 @@ sys.exit(0 if ok else 1)
   local agent_args=(--cp-url "$CP_URL" --livekit-url "$LIVEKIT_URL" \
     --ui-dir "$REPO_ROOT/apps/web/out" --heartbeat-only --interval 1)
   if [[ -n "$NODE_TOKEN" ]]; then
-    agent_args+=(--node-token "$NODE_TOKEN")
+    "$PY" "$REPO_ROOT/tools/node_agent.py" "${agent_args[@]}" \
+      --node-token "$NODE_TOKEN" >"$agent_log" 2>&1 &
   else
-    agent_args+=(--license-key "$LICENSE_KEY")
+    # license 经 env 传递（2026-09-16 深测 P3）：argv 在 ps/shell history 可见。
+    BOK_LICENSE_KEY="$LICENSE_KEY" "$PY" "$REPO_ROOT/tools/node_agent.py" \
+      "${agent_args[@]}" >"$agent_log" 2>&1 &
   fi
-  "$PY" "$REPO_ROOT/tools/node_agent.py" "${agent_args[@]}" \
-    >"$agent_log" 2>&1 &
   AGENT_PID=$!
   trap cleanup_agent EXIT
   sleep 3
