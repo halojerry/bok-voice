@@ -7,8 +7,9 @@
 
 门禁开关：`BOK_AUTH_REQUIRED` 未设（默认）→ `identity_gate` 直通，单机/开发形态
 零变化；置 1 后除豁免路径外全部要求有效用户 JWT 或机器 token。开认证时必须配置
-`BOK_JWT_SECRET`（或回落 `BOK_CP_TOKEN`）——CP startup fail-closed，拒绝用可伪造
-的 dev 密钥开认证。
+`BOK_JWT_SECRET`（≥32 字节随机、与 `BOK_CP_TOKEN` 异值）——CP startup fail-closed，
+机器通道凭据不再回落作签名密钥（2026-09-16 深测 P1：回落令 CP token 泄露=离线
+伪造 8h root JWT）。
 
 注册顺序约定：identity_gate 必须**第一个**注册（Starlette 后注册者在外层），
 保证它在 CorrelationMiddleware 内层运行——读取其 correlation 并覆写
@@ -33,8 +34,9 @@ _JWT_ALGO = "HS256"
 JWT_TTL_S = 8 * 3600
 _SCRYPT_N, _SCRYPT_R, _SCRYPT_P = 2**14, 8, 1
 
-# 豁免路径：健康检查 / 登录本身 / 节点心跳自鉴权 / API 文档 / LiveKit 服务端 webhook
-#（webhook 由 LiveKit server 直调 CP，无用户也无机器 env，属基础设施通道）。
+# 豁免路径：健康检查 / 登录本身 / 节点心跳与注册自鉴权 / LiveKit 服务端 webhook
+#（webhook 由 LiveKit server 直调 CP，无用户也无机器 env，属基础设施通道；
+# API 文档不再豁免——auth-on 生产由 FastAPI 条件参数直接关闭）。
 _EXEMPT_PATHS = (
     "/health",
     "/api/auth/login",
@@ -43,9 +45,6 @@ _EXEMPT_PATHS = (
     # 加固模式下由端点内的 license 闸把关（无 key 即 401），与 heartbeat 用
     # node_token 自鉴权同构——中间件不重复预拦。
     "/api/nodes/register",
-    "/docs",
-    "/openapi.json",
-    "/redoc",
     "/api/webhook/livekit",
 )
 
@@ -66,7 +65,12 @@ def auth_required() -> bool:
 
 
 def jwt_secret() -> str:
-    return (os.environ.get("BOK_JWT_SECRET") or os.environ.get("BOK_CP_TOKEN") or "").strip()
+    """JWT 签名密钥：只认 BOK_JWT_SECRET（2026-09-16 深测 P1 删除 CP token 回落）。
+
+    BOK_CP_TOKEN 需拷进每台 agent worker，任何一份泄露即离线伪造 8h root JWT；
+    两值必须独立配置（startup 校验同值/缺失/弱密钥拒绝开认证）。
+    """
+    return (os.environ.get("BOK_JWT_SECRET") or "").strip()
 
 
 def hash_password(password: str) -> str:
