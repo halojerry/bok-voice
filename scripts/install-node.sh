@@ -20,15 +20,19 @@ usage() {
   --license-key  license 流（加固云推荐）：node_agent 自动注册（同机幂等复用
                  node_id），token 落 ~/.bok/node-state.json（0600）重启复用不烧配额
   --repo-root    仓库根目录（缺省自动探测为本脚本上级目录）
+  --livekit-url  节点 LiveKit 地址（默认 ws://127.0.0.1:7880；**内网多话务员必填
+                 本机内网 IP** 如 ws://192.168.1.10:7880，否则只有节点本机能通话）
   --dry-run      只打印步骤计划，零副作用
   --skip-models  跳过 [3/5] 模型下载（已在别处下载过时用）
 EOF
 }
 
 CP_URL=""; NODE_TOKEN=""; LICENSE_KEY=""; DRY_RUN=0; SKIP_MODELS=0; REPO_ROOT_ARG=""
+LIVEKIT_URL="ws://127.0.0.1:7880"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --cp-url) CP_URL="${2:-}"; shift 2;;
+    --livekit-url) LIVEKIT_URL="${2:-}"; shift 2;;
     --node-token) NODE_TOKEN="${2:-}"; shift 2;;
     --license-key) LICENSE_KEY="${2:-}"; shift 2;;
     --repo-root) REPO_ROOT_ARG="${2:-}"; shift 2;;
@@ -127,7 +131,8 @@ sys.exit(0 if ok else 1)
   # ② 后台起 node_agent（1s 一跳，跑 3s ≥2 跳），失败日志落临时文件。
   #   license 流：node_agent 自注册（同机幂等复用 node_id）、token 落状态文件复用。
   local agent_log; agent_log="$(mktemp "${TMPDIR:-/tmp}/bok-node-agent.XXXXXX")"
-  local agent_args=(--cp-url "$CP_URL" --ui-dir "$REPO_ROOT/apps/web/out" --heartbeat-only --interval 1)
+  local agent_args=(--cp-url "$CP_URL" --livekit-url "$LIVEKIT_URL" \
+    --ui-dir "$REPO_ROOT/apps/web/out" --heartbeat-only --interval 1)
   if [[ -n "$NODE_TOKEN" ]]; then
     agent_args+=(--node-token "$NODE_TOKEN")
   else
@@ -207,6 +212,7 @@ else
   1. 常驻心跳 + 全栈:
        nohup $PY $REPO_ROOT/tools/node_agent.py \\
          --cp-url $CP_URL $(if [[ -n "$NODE_TOKEN" ]]; then echo '--node-token ***'; else echo '--license-key ***（token 已落 ~/.bok/node-state.json 自动复用）'; fi) \\
+         --livekit-url $LIVEKIT_URL \\
          --ui-dir $REPO_ROOT/apps/web/out --interval 60 >/dev/null 2>&1 &
      （不带 --heartbeat-only 即拉起全栈 serve + 心跳守护）
   2. 健康观测: 用管理员凭证 GET $CP_URL/api/nodes 确认节点 online
