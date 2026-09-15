@@ -91,6 +91,13 @@ jobs:
       - name: Derive platform icons
         run: cd desktop && npx tauri icon src-tauri/icons/icon.png
 
+      - name: Clean stale MSI (Windows; cache residue)
+        # cargo/tauri target 缓存可能携带旧版本 MSI——不清掉会出现双版本 MSI：
+        # test 裸 glob 多参数报错 + 旧 MSI 被上传进 release（v0.2.0 首发实证）。
+        if: runner.os == 'Windows'
+        shell: bash
+        run: rm -fv desktop/src-tauri/target/release/bundle/msi/*.msi
+
       - name: Build desktop app
         shell: bash
         run: |
@@ -121,7 +128,17 @@ jobs:
         run: |
           ls -la desktop/runtime/llama/ | head -20
           desktop/runtime/llama/llama-server.exe --version
-          test -f desktop/src-tauri/target/release/bundle/msi/*.msi && echo "MSI present"
+          # 版本一致性门禁：tauri.conf.json 版本必须与 tag 一致（防 0.1.0 MSI 混进
+          # 0.2.0 release 的发布卫生事故），且精确文件名必须存在（裸 glob 会把
+          # 多文件喂给 test 报 binary operator expected）。
+          ver="$(python -c "import json;print(json.load(open('desktop/src-tauri/tauri.conf.json'))['version'])")"
+          echo "tauri version: ${ver}  tag: ${GITHUB_REF_NAME}"
+          if [ "${GITHUB_REF_NAME#v}" != "$ver" ]; then
+            echo "::error::tag/tauri version mismatch: ${GITHUB_REF_NAME} vs ${ver}"; exit 1
+          fi
+          msi="desktop/src-tauri/target/release/bundle/msi/BokVoice_${ver}_x64_zh-CN.msi"
+          test -f "$msi" && echo "MSI present (${ver})"
+          echo "msi dir file count: $(ls desktop/src-tauri/target/release/bundle/msi/*.msi 2>/dev/null | wc -l)"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
