@@ -1161,6 +1161,7 @@ def list_calls(request: Request, account_id: str = "acc-001", status: str = "") 
 
 @app.get("/api/calls/{call_id}")
 def get_call(call_id: str, request: Request) -> dict:
+    _gate_page(request, "calls")
     call = deny_cross_account(request, _repo().get_call(call_id))
     if not call:
         raise HTTPException(404, "call not found")
@@ -1169,6 +1170,8 @@ def get_call(call_id: str, request: Request) -> dict:
 
 @app.delete("/api/calls/{call_id}")
 def delete_call(call_id: str, request: Request) -> dict:
+    require_role(request, "admin", "root")
+    _gate_page(request, "calls")
     deny_cross_account(request, _repo().get_call(call_id))
     if not _repo().delete_call(call_id):
         raise HTTPException(404, "call not found")
@@ -1178,6 +1181,8 @@ def delete_call(call_id: str, request: Request) -> dict:
 
 @app.delete("/api/calls")
 def clear_ended_calls(request: Request, account_id: str = "acc-001") -> dict:
+    require_role(request, "admin", "root")
+    _gate_page(request, "calls")
     """清空该账号下已结束(ended)的通话历史。活跃/进行中的通话不删。"""
     account_id = scoped_account(request, account_id)
     calls = _repo().list_calls(account_id, status=CallStatus.ENDED.value)
@@ -1363,6 +1368,7 @@ def _disconnect_room_background(room_name: str) -> None:
 
 @app.post("/api/calls/{call_id}/hangup")
 async def hangup(call_id: str, request: Request) -> dict:
+    _gate_page(request, "calls")
     deny_cross_account(request, _repo().get_call(call_id))
     call = _repo().update_call(call_id, status=CallStatus.ENDED.value)
     if not call:
@@ -1421,6 +1427,7 @@ def add_turn(
     ended_ms: int = 0,
     perceived_ms: int = 0,
 ) -> dict:
+    _gate_page(request, "calls")
     # B2 归属闸（agent 机器上报无身份恒过）；先于 turn_id 说明注释。
     deny_cross_account(request, _repo().get_call(call_id))
     # turn_id 用 uuid 而非 len(get_turns()) 序号：并发写时序号竞态产生重复
@@ -1456,6 +1463,7 @@ def report_whatsapp(call_id: str, req: WhatsAppCaptureRequest, request: Request)
     空 → offered(客戶應承加專員,未俾號碼)。升級規則:offered→captured 容許、
     captured 唔覆寫、handled 後唔再降級(避免專員已對接又彈返出嚟)。
     """
+    _gate_page(request, "calls")
     deny_cross_account(request, _repo().get_call(call_id))
     call = _repo().get_call(call_id)
     if not call:
@@ -1526,6 +1534,7 @@ def report_dial_result(call_id: str, req: DialResultRequest, request: Request) -
     （重派/重复上报时 4B 侧时序抖动不会把已收线的通话抬回 ACTIVE）。
     status 空/未知同样 no-op（仍记审计，便于排查上游漏配）。
     """
+    _gate_page(request, "calls")
     deny_cross_account(request, _repo().get_call(call_id))
     call = _repo().get_call(call_id)
     if not call:
@@ -1561,6 +1570,7 @@ def report_dial_result(call_id: str, req: DialResultRequest, request: Request) -
 @app.post("/api/calls/{call_id}/whatsapp/handled")
 def mark_whatsapp_handled(call_id: str, req: WhatsAppHandledRequest, request: Request) -> dict:
     """專員喺操作台標記已對接 → status=handled,爆閃停止(AI 通話不受影響)。"""
+    _gate_page(request, "calls")
     deny_cross_account(request, _repo().get_call(call_id))
     call = _repo().get_call(call_id)
     if not call:
@@ -2163,6 +2173,7 @@ def revoke_node_license(license_id: str, request: Request) -> dict:
 
 @app.get("/api/calls/{call_id}/settlement")
 def get_settlement(call_id: str, request: Request) -> dict:
+    _gate_page(request, "calls")
     deny_cross_account(request, _repo().get_call(call_id))
     settlement = _repo().get_settlement(call_id)
     if not settlement:
@@ -2172,6 +2183,7 @@ def get_settlement(call_id: str, request: Request) -> dict:
 
 @app.get("/api/calls/{call_id}/turns")
 def get_turns(call_id: str, request: Request) -> list[dict]:
+    _gate_page(request, "calls")
     deny_cross_account(request, _repo().get_call(call_id))
     return [turn.__dict__ for turn in _repo().get_turns(call_id)]
 
@@ -2179,6 +2191,7 @@ def get_turns(call_id: str, request: Request) -> list[dict]:
 @app.get("/api/calls/{call_id}/metrics")
 def get_call_metrics(call_id: str, request: Request) -> dict:
     """每通通话延迟档案:p50/p95 latency_ms + 轮数/语言分布（审计闭环 T3）。"""
+    _gate_page(request, "calls")
     deny_cross_account(request, _repo().get_call(call_id))
     import statistics as _stats
 
@@ -2340,6 +2353,7 @@ def _backfill_turns_from_report(call_id: str, report_raw: str) -> int:
 
 @app.post("/api/calls/{call_id}/settle")
 async def settle(call_id: str, request: Request) -> dict:
+    _gate_page(request, "calls")
     deny_cross_account(request, _repo().get_call(call_id))
     existing = _repo().get_settlement(call_id)
     if existing:
@@ -2934,6 +2948,7 @@ async def ingest_session_report(call_id: str, request: Request) -> dict:
     存 call_sessions.session_report(JSON)；结算/报表优先吃这里的真数据，
     没有上报的旧通话才回退估算口径。
     """
+    _gate_page(request, "calls")
     deny_cross_account(request, _repo().get_call(call_id))
     try:
         payload = await request.json()
