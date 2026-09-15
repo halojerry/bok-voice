@@ -90,3 +90,13 @@ def test_misc_gates(monkeypatch):
     repo.update_roster_entry(entry2["id"], status="claimed", claimed_by="op1")
     r = client.post(f"/api/roster/{entry2['id']}/unclaim", headers=h)
     assert r.status_code == 403  # peon ≠ 认领人 op1
+
+
+def test_audit_limit_clamped(monkeypatch):
+    client, repo = _make(monkeypatch)
+    repo.create_user(username="rooty", password_hash=hash_password(PW), role="root",
+                     org_id="", account_id="")
+    r = client.post("/api/auth/login", json={"username": "rooty", "password": PW})
+    h = {"Authorization": "Bearer " + r.json()["token"]}
+    # 巨值 limit 不再透传（SQL LIMIT 巨值=全表进内存）；钳制后正常返回
+    assert client.get("/api/audit", params={"limit": 999999999}, headers=h).status_code == 200
