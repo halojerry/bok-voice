@@ -54,6 +54,7 @@
 - 并发/边界：`e2e_barge_in.py` `e2e_edge_cases.py` `e2e_interpret.py` `load_cp_concurrency.py` `load_audio_concurrency.py` `probe_filler_timing.py`
 - 云端部署三件套：`deploy/cloud/`（docker-compose.yml + .env.example + 宝塔 runbook README——云 CP 单容器接 Supabase，vault 落命名卷；CI `compose-rehearsal.yml` 每次改动真跑 compose 排练：config 校验→本地构建→up→/health+静态站+root 登录断言）
 - Supabase 漂移门禁：`check_schema_drift.py`（产物应用→build_engine→双 dump+代码基线四向比对，死对象方向也逮；CI `schema-drift.yml`）+ 节点握手 smoke `node_handshake_smoke.py`（license 流 9 步，CI `node-handshake.yml` Linux 真握手/Windows ps1 干跑）
+- 话务员机虚拟声卡：`setup-virtual-audio.sh|ps1`（B 线同传路由；mac=BlackHole GPL/win=VB-CABLE donationware **下载即装不随包分发**——再分发限制；doctor 有检测行；指南 `docs/OPERATOR_AUDIO_SETUP.md`）
 - 节点安装/打包：`install-node.sh|ps1`（步骤计划器 fail-fast，`--node-token|--license-key` 双流，dry-run 零副作用）+ `build_node_agent.sh`/`node_agent.spec`（PyInstaller onefile node-agent 二进制，`docs/NODE_PACKAGING.md`）
 - 电话边缘站点部署：`deploy_sip_edge.sh`（Ubuntu 22.04+ VPS，root/sudo：apt 依赖 + livekit-sip 原生编译装 `/usr/local/bin/livekit-sip` + `/etc/bok/livekit-sip.yaml` + systemd `bok-livekit-sip.service`（Redis 依赖按 `--redis-url` 分支：本机档 `Requires=`、远端档 `Wants=`）；幂等，`--force` 重编；周期=脚本部署→CP 建站→面板注册 trunk→战役挂 site_id，见 RUNTIME_TOPOLOGY「电话边缘站点」）
 - 平台：`setup-windows.ps1`
