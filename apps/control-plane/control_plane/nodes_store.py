@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import threading
 from datetime import datetime, timezone
 
 HEARTBEAT_INTERVAL_S = 60
@@ -74,6 +75,7 @@ class NodeStore:
             from sqlalchemy.orm import sessionmaker
 
             self._session_factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+        self._register_lock = threading.Lock()
 
     # ---- license 签发/查询/吊销 ----
 
@@ -222,6 +224,35 @@ class NodeStore:
             raise LicenseError(
                 403, f"license quota exhausted ({lic['nodes_used']}/{lic['max_nodes']})")
         return lic
+
+    def register_licensed(self, *, license_key: str, fingerprint: str, name: str = "",
+                          platform: str = "", org_id: str = "", version: str = ""
+                          ) -> tuple[dict, str, str]:
+        """加固模式注册（2026-09-16 深测 P1）：license 三查 + 建行同锁收口配额
+        TOCTOU——旧版 validate 与 register 分属两事务，max_nodes=1 并发 12 实测
+        10 个全过闸落库。进程内由 _register_lock 串行；多实例部署由 deps 幂等
+        段的 (license_id, fingerprint) 部分唯一索引兜底（撞索 → 403）。
+        返回 (license 行, node_id, 明文 token)；失败抛 LicenseError。"""
+        with self._register_lock:
+            lic = self.find_license(license_key)
+            if lic is None:
+                raise LicenseError(401, "unknown or missing license key")
+            if lic["status"] != "active":
+                raise LicenseError(401, "license revoked")
+            reuse_id = self.find_node_by_fingerprint(lic["license_id"], fingerprint)
+            if reuse_id is None and lic["nodes_used"] >= lic["max_nodes"]:
+                raise LicenseError(
+                    403, f"license quota exhausted ({lic['nodes_used']}/{lic['max_nodes']})")
+            try:
+                node_id, token = self.register(
+                    name=name, platform=platform, org_id=org_id, version=version,
+                    license_id=lic["license_id"], fingerprint=fingerprint)
+            except Exception as exc:
+                # 多实例并发撞 (license_id, fingerprint) 唯一索引 → 按配额语义 403。
+                if "unique" in str(exc).lower() or "duplicate" in str(exc).lower():
+                    raise LicenseError(403, "duplicate node registration") from exc
+                raise
+            return lic, node_id, token
 
     # ---- 注册/心跳 ----
 
