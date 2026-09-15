@@ -50,3 +50,20 @@ def test_permissionless_user_cannot_read_or_delete_calls_by_id(monkeypatch):
     assert client.get("/api/calls/call-g1", headers=h).status_code == 403
     assert client.get("/api/calls/call-g1/turns", headers=h).status_code == 403
     assert client.delete("/api/calls/call-g1", headers=h).status_code == 403
+
+
+def test_personas_account_scoped_for_admin(monkeypatch):
+    client, repo = _make(monkeypatch)
+    foreign = repo.create_persona({"account_id": "acc-002", "name": "p2"})
+    repo.create_user(username="adm", password_hash=hash_password(PW), role="admin",
+                     org_id="org-t", account_id="acc-001")
+    h = _peon(client)  # peon 仍 403（管理面不变）
+    assert client.get(f"/api/personas/{foreign['id']}", headers=h).status_code == 403
+    # admin 登录后跨账号读 → 404（旧版 200）；删除 → 404
+    r = client.post("/api/auth/login", json={"username": "adm", "password": PW})
+    ah = {"Authorization": "Bearer " + r.json()["token"]}
+    assert client.get(f"/api/personas/{foreign['id']}", headers=ah).status_code == 404
+    assert client.delete(f"/api/personas/{foreign['id']}", headers=ah).status_code == 404
+    # 建人设强制本账号（旧版可建进任意账号）
+    r = client.post("/api/personas", json={"account_id": "acc-002", "name": "evil"}, headers=ah)
+    assert r.status_code == 200 and r.json()["account_id"] == "acc-001"
