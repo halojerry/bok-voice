@@ -221,6 +221,14 @@ def build_engine() -> Engine | None:
                 # 节点鉴权(P1):license 绑定与机器指纹（node_licenses 新表走 create_all）。
                 _ensure_column(conn, "nodes", "license_id", "license_id VARCHAR(64) DEFAULT ''")
                 _ensure_column(conn, "nodes", "fingerprint", "fingerprint VARCHAR(128) DEFAULT ''")
+                # 节点鉴权(P1,深测): (license_id, fingerprint) 部分唯一索引——多实例
+                # 部署下配额竞态的库级兜底(进程内由 NodeStore.register_licensed 的
+                # 锁收口)。只约束 license 绑定行:开放模式存量空值行不受影响。
+                # 部分索引 WHERE 语法 SQLite/Postgres 双支持。
+                conn.execute(text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_nodes_license_fingerprint "
+                    "ON nodes (license_id, fingerprint) WHERE license_id <> ''"
+                ))
         except Exception as exc:  # pragma: no cover - sqlite / duplicate column
             print(f"[deps] idempotent column migration skipped: {exc}")
 

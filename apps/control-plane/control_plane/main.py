@@ -2096,12 +2096,31 @@ def register_node(req: NodeRegisterRequest) -> dict:
     store = _node_store()
     license_id = ""
     if node_license_required():
+        license_key = (req.license_key or "").strip()
+        # 先 license 后指纹（401 优先于 400）：裸注册（无任何凭据）保持旧 401
+        # 「unknown or missing license key」语义（tests/test_nodes_registry.py
+        # 契约：register 裸注册被 license 闸拒）；带了 license 才要求指纹。
+        if not license_key:
+            raise HTTPException(401, "unknown or missing license key")
+        # 指纹必填（2026-09-16 深测 P1）：空指纹曾以 " " 兜底查询=永不命中复用，
+        # 任何机器心跳全过、克隆检测结构性永不触发——1 配额=无限台机器。
+        fingerprint = (req.fingerprint or "").strip()
+        if not fingerprint:
+            raise HTTPException(400, "fingerprint is required in hardened mode")
         try:
-            lic = store.validate_license_for_register(
-                (req.license_key or "").strip(), (req.fingerprint or "").strip())
+            lic, node_id, token = store.register_licensed(
+                license_key=license_key, fingerprint=fingerprint,
+                name=req.name, platform=req.platform, org_id=req.org_id,
+                version=req.version)
         except LicenseError as exc:
             raise HTTPException(exc.status_code, exc.reason) from exc
-        license_id = lic["license_id"]
+        _audit("node.registered", subject_type="node", subject_id=node_id,
+               account_id="", detail={
+                   "name": req.name, "platform": req.platform, "version": req.version,
+                   "license_id": lic["license_id"],
+                   "fingerprint_prefix": fingerprint[:12]})
+        return {"node_id": node_id, "node_token": token,
+                "heartbeat_interval_s": HEARTBEAT_INTERVAL_S}
     elif (req.license_key or "").strip():
         # 非加固模式也尊重显式 license（登记归属，不强制）。
         lic = store.find_license((req.license_key or "").strip())

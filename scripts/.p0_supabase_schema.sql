@@ -955,6 +955,13 @@ CREATE UNIQUE INDEX ix_users_username ON public.users USING btree (username);
 
 
 --
+-- Name: uq_nodes_license_fingerprint; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_nodes_license_fingerprint ON public.nodes USING btree (license_id, fingerprint) WHERE ((license_id)::text <> ''::text);
+
+
+--
 -- PostgreSQL database dump complete
 --
 
