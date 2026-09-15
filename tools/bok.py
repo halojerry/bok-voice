@@ -1377,10 +1377,16 @@ def cmd_doctor() -> int:
     if healthy(8000):
         try:
             body = json.dumps({"account_id": "acc-001", "room_name": "doctor-probe"}).encode()
+            headers = {"Content-Type": "application/json"}
+            # B1/B2 起 /api/token 在 auth-on 下要求身份；机器通道（BOK_CP_TOKEN）
+            # 直通——auth-on 栈必须带（agent worker 同源同款，serve 与 doctor 同 env）。
+            cp_token = os.environ.get("BOK_CP_TOKEN", "").strip()
+            if cp_token:
+                headers["Authorization"] = f"Bearer {cp_token}"
             req = urllib.request.Request(
                 "http://127.0.0.1:8000/api/token",
                 data=body,
-                headers={"Content-Type": "application/json"},
+                headers=headers,
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=8) as resp:
@@ -1393,7 +1399,11 @@ def cmd_doctor() -> int:
                 fails.append(msg)
                 print(f"token endpoint: FAIL ({msg})")
         except urllib.error.HTTPError as exc:
-            msg = f"token endpoint HTTP {exc.code}（LiveKit 凭据缺失或服务异常）"
+            if exc.code == 401 and not os.environ.get("BOK_CP_TOKEN", "").strip():
+                msg = ("token endpoint HTTP 401（auth-on 栈要求身份——请带 "
+                       "BOK_CP_TOKEN=<serve 同值> 重跑 doctor；agent worker 同理）")
+            else:
+                msg = f"token endpoint HTTP {exc.code}（LiveKit 凭据缺失或服务异常）"
             fails.append(msg)
             print(f"token endpoint: FAIL ({msg})")
         except Exception as exc:
