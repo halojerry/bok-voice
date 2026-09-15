@@ -946,6 +946,10 @@ class SqlAlchemyBusinessRepository:
             "id": row.id, "org_id": row.org_id, "account_id": row.account_id,
             "username": row.username, "display_name": row.display_name,
             "role": row.role, "status": row.status,
+            # 凭据哈希必须进 repo 字典：auth_login 走 get_user_by_username 验密
+            # （B1 起漏带致 SQL 库登录恒 401，2026-09-15 实机冒烟实证）；出仓剥凭据
+            # 在 CP 侧 _user_public 单点做，repo 层恒为完整内部行。
+            "password_hash": row.password_hash or "",
             # B4：NULL（存量库补列前的行）与 '' 同义=默认集，读侧统一空串。
             "permissions_json": row.permissions_json or "",
             "created_at": row.created_at.isoformat() if row.created_at else "",

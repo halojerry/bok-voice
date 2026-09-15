@@ -342,6 +342,38 @@ def test_repo_permissions_roundtrip_sql(tmp_path):
     assert repo.update_user(row["id"], username="hack")["username"] == "u1"
 
 
+def test_repo_login_password_hash_roundtrip_both_backends(tmp_path):
+    """登录凭据回程双后端一致性（2026-09-15 实机冒烟实证的 B1 漂移防复发）。
+
+    SQL 后端 _user_to_dict 曾漏带 password_hash → SQL 库登录恒 401（auth_login 验
+    空串）；B1-B4 全部鉴权测试走 InMemory 替身从未踩到。钉死：两后端
+    get_user_by_username 回程都必须带可验的 password_hash——出仓剥凭据在 CP
+    侧 _user_public 单点做，repo 层恒为完整内部行。
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from bok_voice_business_db import models as m
+    from bok_voice_business_db.repository import InMemoryBusinessRepository, SqlAlchemyBusinessRepository
+    from control_plane.auth import hash_password, verify_password
+
+    pw_hash = hash_password("Passw0rd!x")
+
+    sql_engine = create_engine(f"sqlite:///{tmp_path / 'login.db'}")
+    m.Base.metadata.create_all(sql_engine)
+    repos = [
+        SqlAlchemyBusinessRepository(sessionmaker(sql_engine)()),
+        InMemoryBusinessRepository(),
+    ]
+    for repo in repos:
+        name = type(repo).__name__
+        repo.create_user(username="op1", password_hash=pw_hash, role="user", account_id="acc-001")
+        row = repo.get_user_by_username("op1")
+        assert row, name
+        got = str(row.get("password_hash") or "")
+        assert got and verify_password("Passw0rd!x", got), f"{name}: 登录凭据回程可验"
+
+
 def test_migration_adds_users_permissions_column(tmp_path, monkeypatch):
     """存量 users 表无 permissions_json → 启动补列（幂等，B4）。"""
     import sqlite3
