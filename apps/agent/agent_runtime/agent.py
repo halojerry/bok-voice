@@ -2064,8 +2064,12 @@ async def entrypoint(ctx):
     # 即同语境同条目(用户拍板:随机抽签才是机器感);客户上一句复用
     # flow_ctrl.last_user_text(hook L2481 已维护)。拉取失败/空表 → 纯分类器
     # +资产池(既有行为);BOK_FILLER_MATCH=0 同样回退。
+    # B3:垫话/QA 取数钉本通账号(call.context 装配段;取数失败兜底 acc-001 旧行为)
+    # ——旧版硬编码 acc-001,多账号下错库。QA 再带 owner 维度:共享+建单人个人条目。
+    _ctx_account = str((call or {}).get("account_id") or "acc-001")
+    _ctx_qa_owner = str((call or {}).get("created_by") or "") if call is not None else None
     try:
-        _filler_rows = await cp.list_filler_entries()
+        _filler_rows = await cp.list_filler_entries(account_id=_ctx_account)
     except Exception as exc:  # noqa: BLE001 - 罐头库不可用零影响
         _filler_rows = []
         print(f"[agent] filler entries load failed: {exc!r} (call {room_name})", flush=True)
@@ -2090,7 +2094,7 @@ async def entrypoint(ctx):
     # 记一次——放装配点不放轮级,轮级会重复计。
     if qa_fastpath_enabled() and _tts_cache is not None:
         try:
-            _qa_rows = await cp.list_qa_entries()
+            _qa_rows = await cp.list_qa_entries(account_id=_ctx_account, owner_scope=_ctx_qa_owner)
             if _qa_rows:
                 from .qa_gate import QaIndex
 

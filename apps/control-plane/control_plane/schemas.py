@@ -118,6 +118,8 @@ class UpdateObjectRequest(BaseModel):
 
 class TemplateRequest(BaseModel):
     account_id: str = ""
+    # 话务员级归属(B3):''=账号共享 / user_id=话务员个人;user 建的 CP 强制盖章本人。
+    owner_user_id: str = ""
     name: str = ""
     opening: str = ""
     core: str = ""
@@ -131,6 +133,8 @@ class TemplateRequest(BaseModel):
 
 class UpdateTemplateRequest(BaseModel):
     account_id: str = ""
+    # 所有权转移只归 admin/root(user 的 payload 由 CP 剥掉);非 root 的 account_id 冻结。
+    owner_user_id: str = ""
     name: str = ""
     opening: str = ""
     core: str = ""
@@ -277,6 +281,8 @@ class QaEntryCreate(BaseModel):
     voice_id: str = ""
     template_id: str = ""
     account_id: str = "acc-001"
+    # 话务员级归属(B3):''=账号共享 / user_id=话务员个人;user 建的 CP 强制盖章本人。
+    owner_user_id: str = ""
     source: str = "curated"
     enabled: bool = True
 
@@ -289,3 +295,5 @@ class QaEntryPatch(BaseModel):
     step_index: Optional[int] = None
     voice_id: Optional[str] = None
     enabled: Optional[bool] = None
+    # 所有权转移只归 admin/root(user 的 patch 由 CP 剥掉)。
+    owner_user_id: Optional[str] = None

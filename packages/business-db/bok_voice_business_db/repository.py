@@ -44,6 +44,7 @@ class SqlAlchemyBusinessRepository:
             object_id=manifest.object_id,
             persona_id=manifest.persona_id,
             template_id=getattr(manifest, "template_id", "") or "",
+            created_by=getattr(manifest, "created_by", "") or "",
             mode=manifest.mode.value if isinstance(manifest.mode, CallMode) else str(manifest.mode),
             direction=manifest.direction,
             language=manifest.language,
@@ -202,6 +203,7 @@ class SqlAlchemyBusinessRepository:
         return {
             "id": row.id,
             "account_id": row.account_id,
+            "owner_user_id": row.owner_user_id or "",
             "question_text": row.question_text,
             "answer_text": row.answer_text,
             "lang": row.lang,
@@ -215,12 +217,15 @@ class SqlAlchemyBusinessRepository:
             "created_at": row.created_at.isoformat() if row.created_at else "",
         }
 
-    def list_qa_entries(self, account_id: str = "", enabled: bool | None = None) -> list[dict]:
+    def list_qa_entries(self, account_id: str = "", enabled: bool | None = None, owner_scope: str | None = None) -> list[dict]:
+        # owner_scope(B3):None=不滤(admin/root/无身份) / ''=仅共享 / uid=共享+本人。
         stmt = select(models.QaEntry).order_by(models.QaEntry.created_at)
         if account_id:
             stmt = stmt.filter_by(account_id=account_id)
         if enabled is not None:
             stmt = stmt.filter_by(enabled=enabled)
+        if owner_scope is not None:
+            stmt = stmt.filter(models.QaEntry.owner_user_id.in_(["", owner_scope]))
         return [self._qa_to_dict(r) for r in self.session.scalars(stmt)]
 
     def get_qa_entry(self, entry_id: str) -> dict | None:
@@ -231,6 +236,7 @@ class SqlAlchemyBusinessRepository:
         row = models.QaEntry(
             id=data.get("id") or f"qa:{uuid.uuid4().hex[:12]}",
             account_id=data.get("account_id") or "acc-001",
+            owner_user_id=data.get("owner_user_id") or "",
             question_text=data.get("question_text") or "",
             answer_text=data.get("answer_text") or "",
             lang=data.get("lang") or "zh",
@@ -263,6 +269,8 @@ class SqlAlchemyBusinessRepository:
             row.voice_id = str(patch["voice_id"])
         if "enabled" in patch and patch["enabled"] is not None:
             row.enabled = bool(patch["enabled"])
+        if "owner_user_id" in patch and patch["owner_user_id"] is not None:
+            row.owner_user_id = str(patch["owner_user_id"])
         self.session.commit()
         return self._qa_to_dict(row)
 
@@ -528,8 +536,11 @@ class SqlAlchemyBusinessRepository:
             stmt = stmt.filter_by(account_id=account_id)
         return [self._to_dict(p) for p in self.session.scalars(stmt)]
 
-    def list_templates(self, account_id: str) -> list[dict]:
+    def list_templates(self, account_id: str, owner_scope: str | None = None) -> list[dict]:
+        # owner_scope(B3):None=不滤(admin/root/无身份) / ''=仅共享 / uid=共享+本人。
         stmt = select(models.ConversationTemplate).filter_by(account_id=account_id)
+        if owner_scope is not None:
+            stmt = stmt.filter(models.ConversationTemplate.owner_user_id.in_(["", owner_scope]))
         return [self._to_dict(t) for t in self.session.scalars(stmt)]
 
     def create_template(self, data: dict) -> dict:
@@ -545,6 +556,7 @@ class SqlAlchemyBusinessRepository:
             language=data.get("language", "zh"),
             steps_json=data.get("steps_json", ""),
             hotwords=data.get("hotwords", ""),
+            owner_user_id=data.get("owner_user_id") or "",
         )
         self.session.add(tpl)
         self.session.commit()
@@ -558,7 +570,7 @@ class SqlAlchemyBusinessRepository:
         tpl = self.session.get(models.ConversationTemplate, template_id)
         if not tpl:
             return None
-        allowed = {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json", "hotwords"}
+        allowed = {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json", "hotwords", "owner_user_id"}
         for key, value in data.items():
             if key in allowed and hasattr(tpl, key):
                 setattr(tpl, key, value)
@@ -1073,6 +1085,7 @@ class InMemoryBusinessRepository:
             "object_id": manifest.object_id,
             "persona_id": manifest.persona_id,
             "template_id": getattr(manifest, "template_id", "") or "",
+            "created_by": getattr(manifest, "created_by", "") or "",
             "mode": manifest.mode.value if isinstance(manifest.mode, CallMode) else str(manifest.mode),
             "status": CallStatus.RINGING.value,
             "whatsapp_status": "",
@@ -1138,12 +1151,14 @@ class InMemoryBusinessRepository:
 
     # ---- 快答库(Q→A 快路,2026-09-09) ----
 
-    def list_qa_entries(self, account_id: str = "", enabled: bool | None = None) -> list[dict]:
+    def list_qa_entries(self, account_id: str = "", enabled: bool | None = None, owner_scope: str | None = None) -> list[dict]:
+        # owner_scope(B3):None=不滤 / ''=仅共享 / uid=共享+本人(与 SQL 后端同语义)。
         rows = [
             v
             for v in getattr(self, "qa_entries", {}).values()
             if (not account_id or v.get("account_id") == account_id)
             and (enabled is None or bool(v.get("enabled")) == enabled)
+            and (owner_scope is None or str(v.get("owner_user_id") or "") in ("", owner_scope))
         ]
         return sorted(rows, key=lambda v: v.get("created_at") or "")
 
@@ -1198,6 +1213,7 @@ class InMemoryBusinessRepository:
         row = {
             "id": data.get("id") or f"qa:{uuid.uuid4().hex[:12]}",
             "account_id": data.get("account_id") or "acc-001",
+            "owner_user_id": data.get("owner_user_id") or "",
             "question_text": data.get("question_text") or "",
             "answer_text": data.get("answer_text") or "",
             "lang": data.get("lang") or "zh",
@@ -1217,7 +1233,7 @@ class InMemoryBusinessRepository:
         row = getattr(self, "qa_entries", {}).get(entry_id)
         if row is None:
             return None
-        for k in ("question_text", "answer_text", "lang", "scope", "step_index", "voice_id", "enabled"):
+        for k in ("question_text", "answer_text", "lang", "scope", "step_index", "voice_id", "enabled", "owner_user_id"):
             if k in patch and patch[k] is not None:
                 row[k] = patch[k]
         return dict(row)
@@ -1340,8 +1356,14 @@ class InMemoryBusinessRepository:
             if not account_id or p.get("account_id", "") == account_id
         ]
 
-    def list_templates(self, account_id: str) -> list[dict]:
-        return [t for t in self.templates.values() if t.get("account_id", "") == account_id]
+    def list_templates(self, account_id: str, owner_scope: str | None = None) -> list[dict]:
+        # owner_scope(B3):None=不滤 / ''=仅共享 / uid=共享+本人(与 SQL 后端同语义)。
+        return [
+            t
+            for t in self.templates.values()
+            if t.get("account_id", "") == account_id
+            and (owner_scope is None or str(t.get("owner_user_id") or "") in ("", owner_scope))
+        ]
 
     def create_template(self, data: dict) -> dict:
         tpl = ConversationTemplate(
@@ -1356,6 +1378,7 @@ class InMemoryBusinessRepository:
             language=data.get("language", "zh"),
             steps_json=data.get("steps_json", ""),
             hotwords=data.get("hotwords", ""),
+            owner_user_id=data.get("owner_user_id") or "",
         ).__dict__
         self.templates[tpl["id"]] = tpl
         return tpl
@@ -1366,7 +1389,7 @@ class InMemoryBusinessRepository:
     def update_template(self, template_id: str, data: dict) -> dict | None:
         if template_id not in self.templates:
             return None
-        self.templates[template_id].update({k: v for k, v in data.items() if k in {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json", "hotwords"}})
+        self.templates[template_id].update({k: v for k, v in data.items() if k in {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json", "hotwords", "owner_user_id"}})
         return self.templates[template_id]
 
     def delete_template(self, template_id: str) -> bool:

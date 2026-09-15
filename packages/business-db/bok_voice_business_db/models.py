@@ -74,6 +74,8 @@ class ConversationTemplate(Base):
     # 本套话术专属 ASR 热词(2026-09-08):逗号/顿号/分号/换行分隔,随会话装配并入
     # asr_hotword_context 下发 /api/start context(数字主导词会被过滤,防幻听号码)。
     hotwords: Mapped[str] = mapped_column(Text, default="")
+    # 话务员级归属(B3):''=账号共享 / user_id=话务员个人——user 只见自己的+共享。
+    owner_user_id: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
@@ -94,6 +96,8 @@ class CallSession(Base):
     object_id: Mapped[str] = mapped_column(String(64), index=True)
     persona_id: Mapped[str] = mapped_column(String(64), default="")
     template_id: Mapped[str] = mapped_column(String(64), default="")
+    # 建单人身份(B3):user_id——运行时 QA 检索按「共享+建单人个人」收窄;战役建单无身份=''。
+    created_by: Mapped[str] = mapped_column(String(64), default="")
     mode: Mapped[str] = mapped_column(String(32), default="simulation")
     direction: Mapped[str] = mapped_column(String(32), default="webrtc")
     language: Mapped[str] = mapped_column(String(16), default="zh")
@@ -297,6 +301,8 @@ class QaEntry(Base):
     __tablename__ = "qa_entries"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     account_id: Mapped[str] = mapped_column(String(64), index=True, default="acc-001")
+    # 话务员级归属(B3):''=账号共享 / user_id=话务员个人。
+    owner_user_id: Mapped[str] = mapped_column(String(64), default="")
     question_text: Mapped[str] = mapped_column(Text)
     answer_text: Mapped[str] = mapped_column(Text)
     lang: Mapped[str] = mapped_column(String(16), default="zh")

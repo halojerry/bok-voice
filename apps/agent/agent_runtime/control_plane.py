@@ -140,9 +140,16 @@ class ControlPlaneClient:
         )
         r.raise_for_status()
 
-    async def list_qa_entries(self, account_id: str = "acc-001") -> list[dict]:
-        """快答库启用条目(Q→A 快路,PR-3):每通装配拉一次,变更下一通生效。"""
-        r = await self._client.get("/api/qa-entries", params={"account_id": account_id, "enabled": 1})
+    async def list_qa_entries(self, account_id: str = "acc-001", owner_scope: str | None = None) -> list[dict]:
+        """快答库启用条目(Q→A 快路,PR-3):每通装配拉一次,变更下一通生效。
+
+        B3:account_id 必传本通账号(旧版硬编码 acc-001,多账号错库);owner_scope=
+        建单人 user_id → CP 返回「共享+建单人个人」,战役等无主通话传 ''=仅共享。
+        """
+        params: dict = {"account_id": account_id, "enabled": 1}
+        if owner_scope is not None:
+            params["owner_scope"] = owner_scope
+        r = await self._client.get("/api/qa-entries", params=params)
         r.raise_for_status()
         data = r.json()
         return list(data) if isinstance(data, list) else []
@@ -155,7 +162,10 @@ class ControlPlaneClient:
             pass
 
     async def list_filler_entries(self, account_id: str = "acc-001") -> list[dict]:
-        """垫话罐头启用条目(2026-09-13 乙节):每通装配拉一次,变更下一通生效。"""
+        """垫话罐头启用条目(2026-09-13 乙节):每通装配拉一次,变更下一通生效。
+
+        B3:account_id 必传本通账号(垫话罐头保持账号级,无 owner 维度)。
+        """
         r = await self._client.get("/api/fillers", params={"account_id": account_id, "enabled": 1})
         r.raise_for_status()
         data = r.json()

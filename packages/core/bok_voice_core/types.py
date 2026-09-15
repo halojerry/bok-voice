@@ -63,6 +63,8 @@ class SessionManifest:
     # target_lang 只在 interpret 会话有值:language=我方语言,target_lang=对方语言。
     kind: str = ""
     target_lang: str = ""
+    # 建单人身份(B3):user_id——运行时 QA 检索按「共享+建单人个人」收窄;战役建单=''。
+    created_by: str = ""
 
 
 @dataclass
@@ -130,6 +132,8 @@ class ConversationTemplate:
     language: str = "zh"
     steps_json: str = ""
     hotwords: str = ""
+    # 话务员级归属(B3):''=账号共享 / user_id=话务员个人(InMemory 建行回程用)。
+    owner_user_id: str = ""
 
 
 @dataclass
