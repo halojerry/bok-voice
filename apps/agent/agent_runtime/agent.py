@@ -574,14 +574,21 @@ def _is_digit_dominant(token: str) -> bool:
     return digits > 0 and digits * 2 >= len(token)
 
 
-def asr_hotword_context(lang: str, object_card: dict | None, extra_hotwords: str = "") -> str:
+def asr_hotword_context(
+    lang: str,
+    object_card: dict | None,
+    extra_hotwords: str = "",
+    *,
+    include_industry: bool = True,
+) -> str:
     """组装 ASR 热词 context(纯函数,单测用)。
 
     话术模板 hotwords 字段(extra_hotwords,逗号/换行分隔)最先入列——运营按套
     话术维护,最贴当前场景;静态行业词按通话语言取表(未知语言回退粤语表=A 线
-    默认);对象文字字段(courier/contact_channel)再追加。数字主导 token 丢弃、
-    去重(大小写不敏感)、总长超限逐词回填唔截半词。格式对齐官方模型卡示例
-    「Vocabulary: w1, w2, …」。BOK_ASR_HOTWORDS=0 → 空串(唔下发)。
+    默认;B 线同传 include_industry=False 唔吃——行业词係快递客服域,通用同传
+    硬塞会污染);对象文字字段(courier/contact_channel)再追加。数字主导 token
+    丢弃、去重(大小写不敏感)、总长超限逐词回填唔截半词。格式对齐官方模型卡
+    示例「Vocabulary: w1, w2, …」。BOK_ASR_HOTWORDS=0 → 空串(唔下发)。
     """
     if os.environ.get("BOK_ASR_HOTWORDS", "1") != "1":
         return ""
@@ -598,8 +605,9 @@ def asr_hotword_context(lang: str, object_card: dict | None, extra_hotwords: str
 
     for tok in _ASR_HOTWORD_SPLIT_RE.split(extra_hotwords or ""):
         _add(tok)
-    for w in _ASR_HOTWORDS.get(key) or _ASR_HOTWORDS["cantonese"]:
-        _add(w)
+    if include_industry:
+        for w in _ASR_HOTWORDS.get(key) or _ASR_HOTWORDS["cantonese"]:
+            _add(w)
     oc = object_card or {}
     for field in ("courier", "contact_channel"):
         try:

@@ -397,7 +397,8 @@ WorkerOptions.port)——默认同为 8081 会竞态,后绑者 Errno 48 即崩
   置空回 EOT 模型档 + `QWEN3_ASR_SENTENCE_COMMIT=0`（两者须一起关，否则句级 FINAL 会
   叠进停嘴 FINAL 重复转写）；**kill-switch 档 endpointing min_delay 自动回 ≥0.35**
   （`_endpointing_delays_from_env` 强制，无需手动——未校准 EOT 配 0.25 早提交截断粤语，
-  p6 实证）；B 线 interp env 已强制 sentence-commit=0。真实音频滑窗句间只出逗号，
+  p6 实证）；B 线 interp 2026-09-16 起与 A 线同默认开（`_turn_handling_opts` 单源
+  切 stt + 打断默认关，见 AGENTS.md B 线同传条）。真实音频滑窗句间只出逗号，
   VAD 停嘴微停顿（≥0.45s）为第二句边界源（`QWEN3_ASR_SENTENCE_PAUSE_TRIGGER` 默认 1）。）
 - `policy`：`offline_first`/`cloud_first`；建通话（`POST /api/calls`）时写入 manifest。
 

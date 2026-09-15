@@ -115,6 +115,9 @@ class CallSession(Base):
     # interpret 会话:language=我方语言,target_lang=对方语言,object_id 通常为空。
     kind: Mapped[str] = mapped_column(String(32), default="")
     target_lang: Mapped[str] = mapped_column(String(16), default="")
+    # B 线同传术语表(P0-2,2026-09-16):「源=译」或纯词条,分隔符见 interpret
+    # parse_glossary;建单随会话存,token 分发进 dispatch metadata。客服通话恒空。
+    glossary: Mapped[str] = mapped_column(Text, default="")
     # 官方 SessionReport JSON(agent shutdown 上报):真实逐模型 usage/权威 chat_history。
     session_report: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)

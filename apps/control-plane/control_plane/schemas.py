@@ -86,6 +86,9 @@ class CreateCallRequest(BaseModel):
     # 会话种类:""=客服通话 / interpret=双端同传(B 线 v2)。target_lang=对方语言。
     kind: str = ""
     target_lang: str = ""
+    # B 线同传术语表(P0-2):「源=译」或纯词条,逗号/分号/换行分隔;1000 字上限
+    # 在 _create_call_in 截断(agent 侧另有 400 字 prompt 护栏)。客服通话忽略。
+    glossary: str = ""
 
 
 class CreateObjectRequest(BaseModel):

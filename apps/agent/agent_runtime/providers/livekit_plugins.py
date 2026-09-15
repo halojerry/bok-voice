@@ -428,10 +428,82 @@ def _bind_metrics_forward(inner: llm.LLM, outer: llm.LLM) -> None:
     inner.on("metrics_collected", lambda *args, **kwargs: outer.emit("metrics_collected", *args, **kwargs))
 
 
-def _mt_prompt(text: str, target_lang: str) -> str:
-    """官方 Hy-MT2 中文翻译模板:只要译文,不解释。"""
+def _mt_prompt(text: str, target_lang: str, glossary: str = "") -> str:
+    """官方 Hy-MT2 中文翻译模板:只要译文,不解释。
+
+    glossary 非空时在模板前插一行术语块(会话级常量 → 每轮请求前缀稳定,KV
+    缓存友好);缺省空串=逐字节同旧模板,零行为变化。术语走 prompt 唔改解码
+    ——glossary 走 prompt 是工程界共识(SimulStreaming static_init_prompt /
+    WhisperLive hotwords 同路,2026-09-16 B 线 P0-2 调研定案)。"""
     name = _MT_PROMPT_NAMES.get(target_lang, target_lang)
-    return f"将以下文本翻译为 `{name}`，注意只需要输出翻译后的结果，不要额外解释：\n\n`{text}`"
+    prefix = f"术语表（保持一致）：{glossary}\n\n" if glossary else ""
+    return f"{prefix}将以下文本翻译为 `{name}`，注意只需要输出翻译后的结果，不要额外解释：\n\n`{text}`"
+
+
+# MT 输出包裹引号(Hy-MT2 偶发给整段译文裹引号,2026-09-16 E2E 实证
+# 「“你好，我想了解更多…”」):TTS 读引号=怪停顿、字幕带杂质。
+# 首尾独立剥——整段包裹场景全覆盖;译文内容本身以引号开头的罕见场景会被误剥
+# (spoken-style MT 输出几乎不含内容引号,可接受)。
+_MT_QUOTES_OPEN = "\"“「『'"
+_MT_QUOTES_CLOSE = "\"”」』'"
+
+
+class _StripMTQuoteStream(llm.LLMStream):
+    """剥离 MT 输出包裹引号(StatelessMTLLM 出口单点,TTS/字幕/历史全干净)。
+
+    首个非空增量剥前引号;末字符扣住待定——流结束时是闭合引号则吞、否则补发
+    (一字符 hold,延迟≈一个 chunk)。壳照抄 _ExprPrependStream:metrics 由内芯
+    发出经 _bind_metrics_forward 转发,此处只排空监视分支。
+    """
+
+    def __init__(self, plugin, inner: "llm.LLMStream"):
+        super().__init__(llm=plugin, chat_ctx=llm.ChatContext(), tools=[], conn_options=APIConnectOptions())
+        self._inner = inner
+        self._lead_done = False
+        self._held: str | None = None  # 扣住的末字符;None=无
+
+    async def _metrics_monitor_task(self, event_aiter) -> None:
+        async for _ in event_aiter:
+            pass
+
+    def _transform(self, text: str) -> str:
+        if not self._lead_done:
+            stripped = text.lstrip()
+            if not stripped:
+                return ""
+            if stripped[0] in _MT_QUOTES_OPEN:
+                print("MT_QUOTE_LEAD_STRIPPED", flush=True)
+                stripped = stripped[1:].lstrip()
+                if not stripped:
+                    return ""
+            self._lead_done = True
+            text = stripped
+        if self._held is not None:
+            text = self._held + text
+            self._held = None
+        if text:
+            self._held = text[-1]
+            text = text[:-1]
+        return text
+
+    async def _run(self):
+        async for ev in self._inner:
+            delta = getattr(ev, "delta", None)
+            content = getattr(delta, "content", None)
+            if isinstance(content, str) and content:
+                new_text = self._transform(content)
+                if new_text != content:
+                    ev = ev.model_copy(update={"delta": delta.model_copy(update={"content": new_text})})
+            self._event_ch.send_nowait(ev)
+        # 收尾:被扣末字符是闭合引号 → 吞;否则补发
+        if self._held is not None:
+            if self._held in _MT_QUOTES_CLOSE:
+                print("MT_QUOTE_TAIL_STRIPPED", flush=True)
+            else:
+                self._event_ch.send_nowait(
+                    llm.ChatChunk(id="mt-quote-tail", delta=llm.ChoiceDelta(content=self._held, role="assistant"))
+                )
+            self._held = None
 
 
 class StatelessMTLLM(llm.LLM):
@@ -440,13 +512,21 @@ class StatelessMTLLM(llm.LLM):
     MT 模型逐句无状态:每次调用只取进来 chat_ctx 的最后一条 user 文本,套官方
     模板压成一条 user 消息发内芯。丢历史有两个理由——历史会污染译文(前文术语/
     译法串味,翻译要每句独立);且无状态请求前缀恒定,prefill 不随通话增长,
-    TTFT 全场稳定(第 100 句同第 1 句快)。
+    TTFT 全场稳定(第 100 句同第 1 句快)。glossary 非空时进模板术语槽——
+    术语一致性靠每轮显式注入,唔靠历史(与无状态铁律自洽)。
+
+    滚动上下文(BOK_INTERP_MT_CONTEXT,默认 0=关):非零时从 chat_ctx 抽最近 N 对
+    「源→译」做「上文参考」块(LLMA/RALCP 式,治代词/指代断裂)——参考段每次
+    现场重抽,内芯零内部状态,与无状态自洽;代价是该段逐轮位移→prefix 从参考
+    段起失效(术语槽/模板头仍命中),N 小时 prefill 增量可忽略(probe 实测)。
     """
 
-    def __init__(self, inner: llm.LLM, target_lang: str):
+    def __init__(self, inner: llm.LLM, target_lang: str, glossary: str = "", context_turns: int = 0):
         super().__init__()
         self._inner = inner
         self._target_lang = target_lang
+        self._glossary = str(glossary or "").strip()
+        self._context_turns = max(0, int(context_turns))
         _bind_metrics_forward(inner, self)
 
     @property
@@ -457,6 +537,40 @@ class StatelessMTLLM(llm.LLM):
     @property
     def provider(self) -> str:
         return str(getattr(self._inner, "provider", "unknown"))
+
+    def _rolling_pairs(self, chat_ctx) -> list[tuple[str, str]]:
+        """从 chat_ctx 抽最近 N 对「源→译」(不含当前句,旧→新序;纯函数式,零内部状态)。
+
+        chat_ctx 帧架自动累积 user/assistant 原文(无「原文：/译文：」前缀——
+        那是 add_turn 落库口径,不进上下文)。倒序找 assistant,再回找其 user;
+        单对截 120 字(参考段是 prompt 一部分,防长句膨胀)。"""
+        items = list(getattr(chat_ctx, "items", []) or [])
+        last_user = None
+        for i in range(len(items) - 1, -1, -1):
+            if getattr(items[i], "role", None) == "user":
+                last_user = i
+                break
+        if last_user is None:
+            return []
+        pairs: list[tuple[str, str]] = []
+        i = last_user - 1
+        while i >= 0 and len(pairs) < self._context_turns:
+            if getattr(items[i], "role", None) == "assistant":
+                tgt = str(getattr(items[i], "text_content", None) or "").strip()
+                j = i - 1
+                src = ""
+                while j >= 0:
+                    if getattr(items[j], "role", None) == "user":
+                        src = str(getattr(items[j], "text_content", None) or "").strip()
+                        break
+                    j -= 1
+                if src and tgt:
+                    pairs.append((src[:120], tgt[:120]))
+                    i = j - 1
+                    continue
+            i -= 1
+        pairs.reverse()
+        return pairs
 
     def chat(
         self,
@@ -483,9 +597,18 @@ class StatelessMTLLM(llm.LLM):
                 tool_choice=tool_choice,
                 extra_kwargs=_forward_extra_kwargs(extra_kwargs),
             )
+        content = _mt_prompt(last_user, self._target_lang, self._glossary)
+        if self._context_turns:
+            pairs = self._rolling_pairs(chat_ctx)
+            if pairs:
+                lines = ["上文参考（保持译名与指代一致，勿输出本段）："]
+                for src, tgt in pairs:
+                    lines.append(f"源：{src}")
+                    lines.append(f"译：{tgt}")
+                content = "\n".join(lines) + "\n\n" + content
         mt_ctx = llm.ChatContext()
-        mt_ctx.add_message(role="user", content=_mt_prompt(last_user, self._target_lang))
-        return self._inner.chat(
+        mt_ctx.add_message(role="user", content=content)
+        inner_stream = self._inner.chat(
             chat_ctx=mt_ctx,
             tools=tools,
             conn_options=conn_options,
@@ -493,6 +616,7 @@ class StatelessMTLLM(llm.LLM):
             tool_choice=tool_choice,
             extra_kwargs=_forward_extra_kwargs(extra_kwargs),
         )
+        return _StripMTQuoteStream(self, inner_stream)
 
     async def _prewarm_impl(self) -> None:
         # 委托内芯:MT 模型同样吃 1-token 真生成的暖机收益(对齐 MlxLlmLLM)。
