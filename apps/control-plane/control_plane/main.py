@@ -2751,7 +2751,7 @@ def list_personas(request: Request, account_id: str = "acc-001") -> list[dict]:
 @app.get("/api/personas/{persona_id}")
 def get_persona(persona_id: str, request: Request) -> dict:
     require_role(request, "admin", "root")
-    persona = _repo().get_persona(persona_id)
+    persona = deny_cross_account(request, _repo().get_persona(persona_id))
     if not persona:
         raise HTTPException(404, "persona not found")
     return persona
@@ -2760,6 +2760,10 @@ def get_persona(persona_id: str, request: Request) -> dict:
 @app.post("/api/personas")
 def create_persona(req: PersonaRequest, request: Request) -> dict:
     require_role(request, "admin", "root")
+    identity = current_identity(request)
+    if identity is not None and identity.role != "root":
+        # admin 建人设强制本账号（深测：曾可建进/挪进任意账号）。
+        req = req.model_copy(update={"account_id": identity.account_id})
     persona = _repo().create_persona(req.model_dump())
     _audit("persona.create", subject_type="persona", subject_id=persona.get("id", ""), account_id=persona.get("account_id", ""), detail={"name": persona.get("name", "")})
     # 新人设上线:无罐头即提醒+自动全量物化(W3,响应 tts_pregen=提醒面)。
@@ -2777,6 +2781,12 @@ def update_persona(persona_id: str, req: UpdatePersonaRequest, request: Request)
     # 冻结更新前快照(内存 repo 返回活引用,update 原地改会令 existing==persona,
     # 音色变化判定恒 False);audit 与物化触发都以此为准。
     existing = dict(_repo().get_persona(persona_id) or {})
+    if existing:
+        deny_cross_account(request, existing)
+    identity = current_identity(request)
+    if existing and identity is not None and identity.role != "root":
+        # 冻结归属：非 root 不得经 UpdatePersonaRequest.account_id 挪账号。
+        req = req.model_copy(update={"account_id": str(existing.get("account_id") or "")})
     persona = _repo().update_persona(persona_id, req.model_dump())
     if not persona:
         raise HTTPException(404, "persona not found")
@@ -2791,6 +2801,10 @@ def update_persona(persona_id: str, req: UpdatePersonaRequest, request: Request)
 @app.put("/api/personas")
 def upsert_persona(req: PersonaRequest, request: Request) -> dict:
     require_role(request, "admin", "root")
+    identity = current_identity(request)
+    if identity is not None and identity.role != "root":
+        # admin 建人设强制本账号（深测：曾可建进/挪进任意账号）。
+        req = req.model_copy(update={"account_id": identity.account_id})
     persona = _repo().create_persona(req.model_dump())
     out = dict(persona)
     out["tts_pregen"] = persona_pregen_status(
@@ -2802,7 +2816,7 @@ def upsert_persona(req: PersonaRequest, request: Request) -> dict:
 @app.delete("/api/personas/{persona_id}")
 def delete_persona(persona_id: str, request: Request) -> dict:
     require_role(request, "admin", "root")
-    existing = _repo().get_persona(persona_id)
+    existing = deny_cross_account(request, _repo().get_persona(persona_id))
     if not _repo().delete_persona(persona_id):
         raise HTTPException(404, "persona not found")
     _audit("persona.delete", subject_type="persona", subject_id=persona_id, account_id=(existing or {}).get("account_id", ""))
