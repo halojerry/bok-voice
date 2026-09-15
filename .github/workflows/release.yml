@@ -131,7 +131,9 @@ jobs:
           # 版本一致性门禁：tauri.conf.json 版本必须与 tag 一致（防 0.1.0 MSI 混进
           # 0.2.0 release 的发布卫生事故），且精确文件名必须存在（裸 glob 会把
           # 多文件喂给 test 报 binary operator expected）。
-          ver="$(python -c "import json;print(json.load(open('desktop/src-tauri/tauri.conf.json'))['version'])")"
+          # Windows Python 默认 cp1252 读 UTF-8（tauri.conf.json 含中文）→ charmap
+          # UnicodeDecodeError——必须显式 encoding='utf-8'（v0.2.0 第四次构建实证）。
+          ver="$(python -c "import json;print(json.load(open('desktop/src-tauri/tauri.conf.json',encoding='utf-8'))['version'])")"
           echo "tauri version: ${ver}  tag: ${GITHUB_REF_NAME}"
           if [ "${GITHUB_REF_NAME#v}" != "$ver" ]; then
             echo "::error::tag/tauri version mismatch: ${GITHUB_REF_NAME} vs ${ver}"; exit 1
