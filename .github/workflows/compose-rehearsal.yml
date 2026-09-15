@@ -1,13 +1,11 @@
 name: Compose rehearsal
 
-# 「宝塔导入路径永远有效」排练门禁：deploy/cloud 的 docker-compose.yml 一旦坏了
-# （插值拼错、必填守卫误伤、镜像/健康语义漂移、env 契约变动未同步 .env.example），
-# 合入前就在 CI 用与云上一致的路径复现：compose config → 本地构建镜像 →
-# compose up → 健康断言。构建用本地 tag 不拉 GHCR——latest 滞后会掩盖回归。
-#
-# 真实 Postgres 用 job 级服务容器（写法照抄 postgres-smoke.yml，宿主口 5439），
-# CP 容器经 host-gateway 连它——顺带把「compose 路径下 build_engine() 对真 PG
-# 建表迁移 + root 种子 + 登录签发 JWT」整条链也排练进去了。
+# 「宝塔导入路径 + 一键脚本永远有效」排练门禁：deploy/cloud 的 compose/install.sh
+# 一旦坏了（插值拼错、必填守卫误伤、镜像/健康语义漂移、env 契约变动未同步、
+# install.sh 自身 bash 兼容坑），合入前就在 CI 用与云上一致的路径复现：
+# 本地构建镜像 → **跑 deploy/cloud/install.sh 一键脚本本体**（env 生成→up→轮询
+# →health/静态站/root 登录三验收，与客户侧执行的是同一份代码）→ 追加 JWT
+# round-trip 断言。构建用本地 tag 不拉 GHCR——latest 滞后会掩盖回归。
 on:
   push:
     branches: [main]
@@ -25,7 +23,7 @@ concurrency:
 
 jobs:
   rehearsal:
-    name: Compose up + health rehearsal
+    name: One-click install rehearsal
     runs-on: ubuntu-latest
     timeout-minutes: 45
     services:
@@ -49,87 +47,52 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Generate rehearsal .env
-        run: |
-          set -euo pipefail
-          # 生产同款 posture：auth-on + 随机密钥 + root 种子；DATABASE_URL 走
-          # host-gateway 指宿主上的 pg 服务容器（compose 里有 extra_hosts 映射）。
-          # BOK_CP_PORT=18010：排练专用口，避开 runner/宿主上可能占用的 8000。
-          cat > deploy/cloud/.env <<EOF
-          DATABASE_URL=postgresql+psycopg://postgres:postgres@host.docker.internal:5439/postgres
-          BOK_AUTH_REQUIRED=1
-          BOK_JWT_SECRET=$(openssl rand -hex 32)
-          BOK_CP_TOKEN=$(openssl rand -hex 24)
-          BOK_ROOT_USERNAME=root
-          BOK_ROOT_PASSWORD=$(openssl rand -hex 16)
-          BOK_CP_PORT=18010
-          EOF
-          chmod 600 deploy/cloud/.env
-
-      - name: Validate compose config
-        run: |
-          set -euo pipefail
-          # config 阶段就验出：yaml 语法 / ${VAR:?} 必填守卫 / 插值与端口映射形状
-          # （config 输出是归一化格式，端口是 target/published 结构而非 a:b 字面量）
-          docker compose -f deploy/cloud/docker-compose.yml --env-file deploy/cloud/.env config > /tmp/compose-config.yaml
-          grep -q "image: ${BOK_CP_IMAGE}" /tmp/compose-config.yaml
-          grep -q 'published: "18010"' /tmp/compose-config.yaml
-          echo "compose config OK（镜像/端口插值生效）"
-
       - name: Build image (local, no GHCR pull)
         run: docker build -t "${BOK_CP_IMAGE}" .
 
-      - name: Compose up
+      - name: Run one-click install.sh (真实入口：env 生成→up→轮询→三验收)
         run: |
           set -euo pipefail
-          docker compose -f deploy/cloud/docker-compose.yml --env-file deploy/cloud/.env up -d
-          # 显式轮询，别信 curl --retry-connrefused：docker-proxy 秒级就绪而
-          # uvicorn 要等 startup（DB 迁移/种子）~数秒才 bind，窗口期连接被
-          # reset（exit 56）——旧 curl 不把它当瞬态错误重试（CI 首跑实证，
-          # cloud-image.yml 同款坑），必须显式循环兜住一切失败形态。
-          ok=""
-          for i in $(seq 1 30); do
-            if curl -fsS "${CP_URL}/health" > /tmp/cp-health.json 2>/dev/null; then ok=1; break; fi
-            sleep 2
-          done
-          if [[ -z "${ok}" ]]; then
-            echo "::error::CP 60s 内未出健康响应"; exit 1
-          fi
+          # DATABASE_URL 走 host-gateway 指宿主上的 pg 服务容器（compose 有
+          # extra_hosts 映射）；18010 排练专用口避开 8000。root 密码交给脚本
+          # 随机生成（写进 deploy/cloud/.env，后续断言从那里读）。
+          bash deploy/cloud/install.sh \
+            --database-url 'postgresql+psycopg://postgres:postgres@host.docker.internal:5439/postgres' \
+            --port 18010 \
+            --image "${BOK_CP_IMAGE}"
 
-      - name: Assertions (health / static console / login chain)
+      - name: Post-install assertions (JWT round-trip + env 契约)
         run: |
           set -euo pipefail
-          # ① /health 返回 ok:true（豁免路径，裸 curl）
-          health="$(cat /tmp/cp-health.json)"
-          echo "health: ${health}"
-          [[ "${health}" == *'"ok":true'* ]] || { echo "health 响应不含 ok:true"; exit 1; }
-
-          # ② 管理台静态站 200 且是 HTML。带机器通道头取页：auth-on 下 identity_gate
-          #    只豁免 API 精确路径，浏览器裸开 / 目前是 401（静态页未豁免的已知缺口，
-          #    见 deploy/cloud/README.md §4）——此处断言的是「镜像里有静态站 + 机器
-          #    通道可取到」，后端补豁免后本断言依然成立。
-          cp_token="$(grep '^BOK_CP_TOKEN=' deploy/cloud/.env | cut -d= -f2-)"
-          index_status="$(curl -sS -o /tmp/cp-index.html -w '%{http_code}' \
-            -H "Authorization: Bearer ${cp_token}" "${CP_URL}/")"
-          echo "GET / (machine token) -> ${index_status}"
-          [[ "${index_status}" == "200" ]] || { echo "管理台静态站未就绪"; exit 1; }
-          grep -qi '<html' /tmp/cp-index.html || { echo "/ 返回内容不是 HTML"; exit 1; }
-
-          # ③ root 种子 + 登录签发 JWT（compose 路径下 build_engine 迁移真 PG 的回执）
           root_password="$(grep '^BOK_ROOT_PASSWORD=' deploy/cloud/.env | cut -d= -f2-)"
+          # install.sh 已验 root 登录拿 JWT；这里补 round-trip + 静态站裸可达
+          # （v0.2.0 起静态 GET 豁免，浏览器裸开 / 必须 200 HTML 不是 401）。
           login_code="$(curl -sS -o /tmp/cp-login.json -w '%{http_code}' \
             -X POST "${CP_URL}/api/auth/login" -H 'Content-Type: application/json' \
-            -d "{\"username\":\"root\",\"password\":\"${root_password}\"}")"
+            -d "{\"username\":\"admin\",\"password\":\"${root_password}\"}")"
           [[ "${login_code}" == "200" ]] || { echo "root 登录失败 HTTP ${login_code}"; cat /tmp/cp-login.json; exit 1; }
           token="$(jq -r '.token // empty' /tmp/cp-login.json)"
-          [[ -n "${token}" ]] || { echo "登录响应缺 token"; exit 1; }
-
-          # ④ JWT round-trip：/api/auth/me 用签出的 token 取回 root 身份
           me="$(curl -sS -o /tmp/cp-me.json -w '%{http_code}' \
             -H "Authorization: Bearer ${token}" "${CP_URL}/api/auth/me")"
           [[ "${me}" == "200" ]] || { echo "/api/auth/me HTTP ${me}"; exit 1; }
           [[ "$(jq -r '.role // empty' /tmp/cp-me.json)" == "root" ]] || { echo "身份不是 root"; exit 1; }
-          echo "rehearsal assertions: 4/4 OK"
+          index_status="$(curl -sS -o /tmp/cp-index.html -w '%{http_code}' "${CP_URL}/")"
+          [[ "${index_status}" == "200" ]] || { echo "裸 GET / HTTP ${index_status}（期望 200：静态站豁免）"; exit 1; }
+          grep -qi '<html' /tmp/cp-index.html || { echo "/ 返回内容不是 HTML"; exit 1; }
+          stat -c '%a' deploy/cloud/.env | grep -qx 600 || { echo ".env 权限不是 600"; exit 1; }
+          echo "post-install assertions: 4/4 OK（JWT 回程/静态站裸达/env 0600/镜像内静态产物）"
+
+      - name: Idempotent re-run (升级路径 = 重跑脚本)
+        run: |
+          set -euo pipefail
+          # 二次执行必须复用 .env（不重生成密钥/root 密码）并再次就绪。
+          before="$(md5sum deploy/cloud/.env | cut -d' ' -f1)"
+          bash deploy/cloud/install.sh \
+            --database-url 'postgresql+psycopg://postgres:postgres@host.docker.internal:5439/postgres' \
+            --port 18010 --image "${BOK_CP_IMAGE}" | grep -q "复用" || { echo "二次运行未走复用路径"; exit 1; }
+          after="$(md5sum deploy/cloud/.env | cut -d' ' -f1)"
+          [[ "${before}" == "${after}" ]] || { echo ".env 被重写（密钥轮换=事故）"; exit 1; }
+          curl -fsS "${CP_URL}/health" | grep -q '"ok":true'
 
       - name: Container logs on failure
         if: failure()
