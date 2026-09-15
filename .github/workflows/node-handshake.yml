@@ -58,7 +58,9 @@ jobs:
       - name: Start CP on :18011 (root seed + random password)
         run: |
           set -euo pipefail
-          ROOT_PASS="$(python -c 'import secrets; print(secrets.token_urlsafe(16))')"
+          # token_hex 而非 token_urlsafe：urlsafe 字母表含 -，前导 - 会被下游
+          # argparse 当 flag（CI 首跑实证）；hex 无连字符一劳永逸。
+          ROOT_PASS="$(python -c 'import secrets; print(secrets.token_hex(16))')"
           echo "ROOT_PASS=$ROOT_PASS" >> "$GITHUB_ENV"
           # root 密码只进 uvicorn 进程 env，不落 GITHUB_ENV 之外的日志面
           BOK_ROOT_PASSWORD="$ROOT_PASS" nohup python -m uvicorn control_plane.main:app \
@@ -82,7 +84,7 @@ jobs:
       - name: Node handshake smoke (对真 CP 全验)
         run: |
           python scripts/node_handshake_smoke.py --base-url "$CP_BASE" \
-            --root-user "$BOK_ROOT_USERNAME" --root-pass "$ROOT_PASS"
+            --root-user="$BOK_ROOT_USERNAME" --root-pass="$ROOT_PASS"
       - name: CP logs on failure
         if: failure()
         run: tail -100 /tmp/cp.log || true
