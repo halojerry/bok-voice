@@ -21,6 +21,37 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "apps" / "agent"))
 sys.path.insert(0, str(ROOT / "apps" / "control-plane"))
 
+# 2026-09-16 P2-5 起 /api/webhook/livekit 有验签闸（tests/test_security_hardening.py）。
+_WEBHOOK_SECRET = "devsecret"
+
+
+def _sign_webhook(body: bytes, secret: str) -> str:
+    """LiveKit webhook 官方 JWT（HS256 + video.webhook grant + sha256(body) 摘要）。
+
+    本地复制小 helper 而非从 tests/test_security_hardening.py import：tests/ 非包，
+    跨测试模块 import 会触发其模块级 setdefault 并造出第二份模块实例。
+    """
+    import hashlib
+    import time
+
+    import jwt as pyjwt
+
+    now = int(time.time())
+    return pyjwt.encode(
+        {"iss": "devkey", "sub": "devkey", "iat": now, "nbf": now - 5, "exp": now + 300,
+         "video": {"webhook": True},
+         "sha256": hashlib.sha256(body).hexdigest()},
+        secret, algorithm="HS256")
+
+
+def _signed_webhook_post(client, payload):
+    raw = json.dumps(payload).encode()
+    return client.post(
+        "/api/webhook/livekit",
+        content=raw,
+        headers={"Authorization": "Bearer " + _sign_webhook(raw, _WEBHOOK_SECRET),
+                 "Content-Type": "application/json"})
+
 
 def _load_sidecar_app():
     """从文件路径加载 qwen3-asr-sidecar app.py(无 __init__ 包,用 importlib)。
@@ -246,16 +277,19 @@ def test_livekit_webhook_redispatch_gate():
     from control_plane.main import app
 
     with TestClient(app) as client:
+        # 验签闸读 app.state.lk_secret（startup 从 env 快照）——显式钉成与签名同源
+        # 的 secret；第三发 patch 了 os.environ.get，闸不能依赖 env 兜底（P2-5）。
+        app.state.lk_secret = _WEBHOOK_SECRET
         # 非 participant_left → 忽略
-        r = client.post("/api/webhook/livekit", json={"event": "room_started", "room": {"name": "r1"}})
+        r = _signed_webhook_post(client, {"event": "room_started", "room": {"name": "r1"}})
         assert r.json()["handled"] is False
         # 非我方 agent 离开 → 忽略(真人断开不重派)
-        r = client.post("/api/webhook/livekit", json={"event": "participant_left", "room": {"name": "r1"}, "participant": {"identity": "me-r1"}})
+        r = _signed_webhook_post(client, {"event": "participant_left", "room": {"name": "r1"}, "participant": {"identity": "me-r1"}})
         assert r.json()["handled"] is False
         # bok-voice 离开 → 触发重派(用 patch 拦住真 LiveKitAPI 连接)
         with patch("control_plane.main.os.environ.get", side_effect=lambda k, d=None: {"LIVEKIT_API_KEY": "k", "LIVEKIT_API_SECRET": "s", "LIVEKIT_URL": "ws://127.0.0.1:7880"}.get(k, d)):
             from livekit import api as lk_api
 
             with patch.object(lk_api, "LiveKitAPI") as mk:
-                r = client.post("/api/webhook/livekit", json={"event": "participant_left", "room": {"name": "call-x"}, "participant": {"identity": "bok-voice"}})
+                r = _signed_webhook_post(client, {"event": "participant_left", "room": {"name": "call-x"}, "participant": {"identity": "bok-voice"}})
         assert r.json()["handled"] is True

@@ -10,6 +10,7 @@
 4. reaper 判「房里有人」只数真人——纯 agent 房（殭尸被补派进去的）按空房回收。
 """
 import asyncio
+import json
 import os
 import time
 from types import SimpleNamespace
@@ -23,6 +24,27 @@ os.environ.setdefault("LIVEKIT_URL", "ws://127.0.0.1:7880")
 from fastapi.testclient import TestClient
 
 from control_plane.main import app
+
+# 2026-09-16 P2-5 起 /api/webhook/livekit 有验签闸（tests/test_security_hardening.py）。
+_WEBHOOK_SECRET = "devsecret"
+
+
+def _sign_webhook(body: bytes, secret: str) -> str:
+    """LiveKit webhook 官方 JWT（HS256 + video.webhook grant + sha256(body) 摘要）。
+
+    本地复制小 helper 而非从 tests/test_security_hardening.py import：tests/ 非包，
+    跨测试模块 import 会触发其模块级 setdefault 并造出第二份模块实例。
+    """
+    import hashlib
+
+    import jwt as pyjwt
+
+    now = int(time.time())
+    return pyjwt.encode(
+        {"iss": "devkey", "sub": "devkey", "iat": now, "nbf": now - 5, "exp": now + 300,
+         "video": {"webhook": True},
+         "sha256": hashlib.sha256(body).hexdigest()},
+        secret, algorithm="HS256")
 
 
 def _wait_until(pred, what: str, timeout: float = 5.0) -> None:
@@ -118,10 +140,17 @@ def test_webhook_skips_redispatch_for_interpret_rooms(monkeypatch):
     lkapi.agent_dispatch.create_dispatch = AsyncMock()
     monkeypatch.setattr(m, "_lkapi_client", lambda: lkapi)
     with TestClient(m.app) as client:
+        # 验签闸读 app.state.lk_secret（startup 从 env 快照）——显式钉成与签名
+        # 同源的 secret，不依赖会话里谁先 setdefault 了什么（P2-5 后必需）。
+        m.app.state.lk_secret = _WEBHOOK_SECRET
         room = _create_interpret_call(client)["id"]
+        raw = json.dumps({"event": "participant_left", "room": {"name": room},
+                          "participant": {"identity": "agent-AJ_test"}}).encode()
         resp = client.post(
             "/api/webhook/livekit",
-            json={"event": "participant_left", "room": {"name": room}, "participant": {"identity": "agent-AJ_test"}},
+            content=raw,
+            headers={"Authorization": "Bearer " + _sign_webhook(raw, _WEBHOOK_SECRET),
+                     "Content-Type": "application/json"},
         )
         assert resp.json().get("handled") is False
         # 留出后台误派窗口再断言（若回归，create_task 会在毫秒级就 create）。
