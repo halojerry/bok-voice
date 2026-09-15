@@ -1,0 +1,85 @@
+name: Schema drift gate
+
+# Supabase schema 漂移门禁:scripts/.p0_supabase_schema.sql 是「生成物,勿手改」的
+# P0 引导件(schema 唯一真源 = packages/business-db ORM + deps.build_engine() 幂等
+# 迁移)。代码改表而忘记重跑 scripts/dump_postgres_ddl.py → 产物过期 → 新部署拿旧
+# schema 静默起家。本 job 在服务容器上跑 scripts/check_schema_drift.py:应用产物 →
+# 跑 build_engine → 与「全新库只跑 build_engine」的代码基线双向 dump 比对
+# (产物缺对象/死对象两个方向都红)。
+#
+# 镜像必须带 pgvector(产物含 `CREATE EXTENSION vector` + knowledge_chunks 表)——
+# vanilla postgres:16 会让 psql 应用失败、令 build_engine 静默跳过知识库整块,
+# 与产物结构性不等价,门禁会红(这正是要拦的形状)。
+#
+# 直连模式:脚本经 DATABASE_URL 连服务容器,不再自起 docker 容器;schema dump 走
+# runner 本地 pg_dump/psql 客户端(版本须 >= 服务端大版本,下一步有兜底安装)。
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/.p0_supabase_schema.sql'
+      - 'scripts/check_schema_drift.py'
+      - 'scripts/dump_postgres_ddl.py'
+      - 'apps/control-plane/**'
+      - 'packages/business-db/**'
+      - '.github/workflows/schema-drift.yml'
+  pull_request:
+    paths:
+      - 'scripts/.p0_supabase_schema.sql'
+      - 'scripts/check_schema_drift.py'
+      - 'scripts/dump_postgres_ddl.py'
+      - 'apps/control-plane/**'
+      - 'packages/business-db/**'
+      - '.github/workflows/schema-drift.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: schema-drift-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  schema-drift:
+    name: Supabase artifact vs build_engine
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      # psycopg 3 驱动显式写全:postgresql:// 会被 SQLAlchemy 解析成 psycopg2。
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Ensure psql/pg_dump client >= server major 16
+        run: |
+          major() { "$1" --version 2>/dev/null | grep -oE '[0-9]+' | head -1 || echo 0; }
+          if ! command -v psql >/dev/null 2>&1 \
+             || ! command -v pg_dump >/dev/null 2>&1 \
+             || [ "$(major pg_dump)" -lt 16 ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq postgresql-client-16
+          fi
+          psql --version
+          pg_dump --version
+      - name: Install dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -e packages/core -e packages/business-db -e packages/knowledge -e packages/observability
+          pip install -e "apps/control-plane" -e "apps/agent[livekit]"
+      - name: Schema drift gate (artifact vs build_engine)
+        run: python scripts/check_schema_drift.py
