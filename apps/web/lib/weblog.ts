@@ -8,7 +8,7 @@
  * POST /api/web_logs 落盘 logs/web-client.log（与 agent.log 同目录）。
  * fire-and-forget + keepalive：失败静默，诊断通道永不影响功能、永不抛错。
  */
-import { apiBase } from "@/lib/api";
+import { apiBase, authHeaders } from "@/lib/api";
 
 let callId = "";
 
@@ -21,7 +21,7 @@ export function wlog(event: string, data?: unknown) {
   try {
     void fetch(`${apiBase()}/api/web_logs`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify({ event, call_id: callId, data }),
       keepalive: true,
     }).catch(() => {});

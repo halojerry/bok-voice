@@ -9,7 +9,7 @@ import re
 import sys
 import uuid
 import wave
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -109,9 +109,10 @@ app = FastAPI(
 # 它要在 CorrelationMiddleware 内层运行——读取其 correlation 并覆写 user_id=已验证
 # 身份，审计 actor 由此自动落账（见 auth.py 模块注释）。
 app.middleware("http")(identity_gate)
+_cors_origins = [o.strip() for o in os.environ.get("BOK_CORS_ORIGINS", "*").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins or ["*"],  # 云端部署设 BOK_CORS_ORIGINS 收敛到管理台 origin
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -2597,8 +2598,12 @@ async def dial_now(object_id: str, req: DialNowRequest, request: Request) -> dic
 @app.post("/api/objects/import")
 def import_objects(request: Request, account_id: str, rows: list[CreateObjectRequest] = Body(...)) -> dict:
     require_role(request, "admin", "root")
+    if len(rows) > 500:
+        raise HTTPException(400, "单次导入上限 500 行")
     account_id = scoped_account(request, account_id)
     created = [_repo().create_object(account_id, row.model_dump()) for row in rows]
+    _audit("object.import", subject_type="object", account_id=account_id,
+           detail={"rows": len(created)})
     return {"imported": len(created), "items": created}
 
 
@@ -2827,6 +2832,8 @@ def upsert_persona(req: PersonaRequest, request: Request) -> dict:
         # admin 建人设强制本账号（深测：曾可建进/挪进任意账号）。
         req = req.model_copy(update={"account_id": identity.account_id})
     persona = _repo().create_persona(req.model_dump())
+    _audit("persona.upsert", subject_type="persona", subject_id=persona.get("id", ""),
+           account_id=req.account_id, detail={"name": req.name})
     out = dict(persona)
     out["tts_pregen"] = persona_pregen_status(
         out, base_url=str(request.base_url).rstrip("/")
@@ -3038,6 +3045,10 @@ _REDISPATCH_RETRY_SCHEDULE = (0.0, 10.0, 25.0)
 # 坍缩为一次)。锁图按房间单调增长:每通话房间一个小锁对象,CP 单进程 4-6 路并发
 # 规模下可接受;不做淘汰——锁被取走瞬间另一任务可能正持有,边界不值得。
 _redispatch_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+# web_logs 上报滑动窗口限速（2026-09-16 深测 P3）：/api/web_logs 曾无限速，
+# 匿名/任意身份可高频刷盘（logs/web-client.log 无界增长）。600 行/分钟封顶。
+_weblog_times: deque = deque(maxlen=600)
 
 
 def _verify_livekit_webhook(request: Request, body: bytes) -> bool:
@@ -3310,6 +3321,7 @@ def reports_usage(request: Request, account_id: str = "acc-001") -> dict:
 def list_audit(request: Request, account_id: str = "", action: str = "", call_id: str = "", limit: int = 200) -> list[dict]:
     # 审计=管理面（主管操作留痕的查看口），话务员不可见。
     require_role(request, "admin", "root")
+    limit = max(1, min(int(limit or 200), 1000))  # 巨值 limit 曾直透 SQL（全表进内存）
     account_id = scoped_account(request, account_id)
     repo = _repo()
     if hasattr(repo, "list_audit_events"):
@@ -3377,6 +3389,8 @@ def supervisor_join(call_id: str, request: Request) -> dict:
     if not call:
         raise HTTPException(404, "call not found")
     issued = token(TokenRequest(call_id=call_id, role="supervisor"), request)
+    _audit("supervisor.join", subject_type="call", subject_id=call_id,
+           account_id=str(call.get("account_id") or ""), call_id=call_id)
     return {
         "call_id": call_id,
         "status": call.get("status", "active"),
@@ -3432,6 +3446,13 @@ async def web_logs(payload: dict) -> dict:
     路由排障多轮全靠排除法实证)。JSON 行追加 logs/web-client.log,与 agent.log 同
     目录;行限长防刷爆。上报失败静默(诊断通道永不影响功能)。"""
     from datetime import datetime, timezone
+
+    import time as _t
+
+    now = _t.time()
+    if len(_weblog_times) >= 600 and now - _weblog_times[0] < 60:
+        return {"ok": False, "reason": "rate_limited"}  # 600 行/分钟上限,防刷盘
+    _weblog_times.append(now)
 
     event = str(payload.get("event") or "")[:80]
     if not event:
