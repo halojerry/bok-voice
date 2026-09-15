@@ -51,6 +51,7 @@
 - 外呼战役 E2E：`e2e_campaign.py`（mock 档全链路：3 对象战役串行自动下一通 + 终态三态 + captured 入名册）
 - mock SIP 被叫：`mock_callee.py`（CP 派生的真语音被叫子进程：answer/no_answer/reject/hangup_mid 四剧本；台词/句间隔由 dial 块下发，会等 AI 讲完再出声）
 - 并发/边界：`e2e_barge_in.py` `e2e_edge_cases.py` `e2e_interpret.py` `load_cp_concurrency.py` `load_audio_concurrency.py` `probe_filler_timing.py`
+- 电话边缘站点部署：`deploy_sip_edge.sh`（Ubuntu 22.04+ VPS，root/sudo：apt 依赖 + livekit-sip 原生编译装 `/usr/local/bin/livekit-sip` + `/etc/bok/livekit-sip.yaml` + systemd `bok-livekit-sip.service`；幂等，`--force` 重编；周期=脚本部署→CP 登记站点→面板注册 trunk→战役挂 site_id，见 RUNTIME_TOPOLOGY「电话边缘站点」）
 - 平台：`setup-windows.ps1`
 
 ## 关键入口
@@ -70,7 +71,7 @@
 
 | 文件 | 职责 |
 |---|---|
-| `main.py` | 全部 API 端点 + 启动装配（含 `/api/roster*`、`/api/campaigns*`、`/api/sip/mock/callee`） |
+| `main.py` | 全部 API 端点 + 启动装配（含 `/api/roster*`、`/api/campaigns*`、`/api/sip/sites*`、`/api/sip/mock/callee`；站点建行入口待补，站点表增删仍是 repo 层） |
 | `campaign.py` | 外呼战役串行循环（5s 巡检：终态收割 / 串行起下一通 / 名单尽判 done；gap 冷却；dispatcher 可注入） |
 | `deps.py` | 引擎装配 + 幂等 DB 迁移唯一入口（新建列/数据迁移都在 `build_engine()`） |
 | `schemas.py` | 请求/响应模型（含 `SipSettingsModel`） |
@@ -82,7 +83,7 @@
 |---|---|
 | `call_sessions` / `turns` | 通话主记录 / 逐轮分析账本（speaker/gen/template_step/perceived_ms） |
 | `roster_entries` | 名册认领池（captured 号码自动入册；unclaimed→claimed→handled） |
-| `campaigns` | 外呼战役（status draft/running/paused/done/stopped、gap_seconds、scripts_json mock 台词钩子） |
+| `campaigns` | 外呼战役（status draft/running/paused/done/stopped、site_id 电话边缘站点、gap_seconds、scripts_json mock 台词钩子） |
 | `campaign_items` | 战役名单项（seq/phone/status/call_id/scenario，无电话对象直接 skipped） |
 | `sip_sites` | 电话边缘站点（livekit_url/sip_edge none·local·cloud/trunk_id/numbers_json；`site-local` 是 repo 合成的虚拟默认站点，不入库） |
 

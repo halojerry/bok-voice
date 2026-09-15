@@ -159,6 +159,63 @@ web /campaigns（建波/启停/进度表）
 - 全链路 E2E：`python scripts/e2e_campaign.py`（3 对象战役——1 接通走完话术+captured
   入名册 / 1 无人接 / 1 接通即挂；断言串行、终态三态、名册入册与 handled 回写）。
 
+### 电话边缘站点（VPS，spec 2026-09-13-sip-edge-thin-node-v2 §7 P1.5）
+
+战役真中继档（`mode=real`）需要一个有公网口的 SIP 边缘。自用期（形态 2 单租户）
+= 香港/同城小 VPS 上跑 **Redis + livekit-sip + 独立 LiveKit 站点**；GPU 仍在
+Mac/客户机房侧，worker 只**出站**连站点 LiveKit —— 无任何入站端口需求。
+
+```text
+①VPS 部署（一次性，root/sudo）：
+    sudo scripts/deploy_sip_edge.sh --api-key K --api-secret S \
+         --livekit-url ws://127.0.0.1:7880 [--redis-url redis://127.0.0.1:6379]
+    apt 依赖: redis-server + Go>=1.21 + pkg-config libopus-dev libopusfile-dev
+    libsoxr-dev + **build-essential**（cgo 必须：media-sdk→amrwb-cgo 的 dec/enc
+    全靠 #cgo，缺 C 编译器 = "build constraints exclude all Go files"；运行库
+    libopus0/libopusfile0/libsoxr0）
+      → git clone https://github.com/livekit/sip 到 /opt/livekit-sip → mage build
+        （CGO_ENABLED=1，同上游 Dockerfile）
+      → 产物装 /usr/local/bin/livekit-sip（幂等：已在则跳过，--force 重编）
+      → 渲染 /etc/bok/livekit-sip.yaml（0640 root:livekit-sip）
+      → systemd bok-livekit-sip.service（Restart=always、User=livekit-sip 非 root）
+      → 结尾打印防火墙/健康检查提示：5060/UDP + 10000-20000/UDP **只打印不代开**
+    配置键（上游 pkg/config/config.go 核实）：api_key / api_secret / ws_url /
+    redis.address / sip_port: 5060 / rtp_port: "10000-20000"（只认字符串形态）/
+    use_external_ip: true（SDP 通告公网 IP）/ logging.level
+
+②CP 登记站点行（sip_sites 表）：**HTTP 建站入口尚未实现**——现只有
+    GET /api/sip/sites（列表，面板下拉数据源）与
+    POST /api/sip/sites/{id}/trunk（注册 trunk）；建行入口=T7 收尾补，
+    当前需直调 repository（`create_site`）或直接落库
+
+③面板「设置 → 外呼（SIP）」切 real 档 → 选站点 → 填 trunk 商（如 Telnyx）
+    地址/主叫号/鉴权 → 「注册 trunk」= POST /api/sip/sites/{id}/trunk：
+    CP 用 LIVEKIT_URL/LIVEKIT_API_KEY(env 或 app.state) 调官方
+    CreateSIPOutboundTrunk（address/numbers 必填，auth_* 空=IP 白名单模式）→
+    返回 ST_... 回填 site.trunk_id（密码只进不出；失败 502 且不写 trunk_id）
+
+④战役挂站点：POST /api/campaigns 带 site_id → campaign 起拨的 dial 块
+    trunk 按站点优先（站点无 trunk/未挂站点 → 回退 settings `sip.trunk_id`，
+    单站点旧行为零变化）
+
+⑤Mac worker 出站注册到远端站点（无入站端口）：
+    LIVEKIT_URL=wss://<vps> LIVEKIT_API_KEY=<站点 key> LIVEKIT_API_SECRET=<站点 secret> \
+      python tools/bok.py serve
+    bok.py 原样透传 LIVEKIT_URL/凭据给 agent/interp worker（tools/bok.py）。
+    **P1.5 现状**：CP 与 worker 的 LiveKit 地址由 env `LIVEKIT_URL` 单点决定，
+    `site.livekit_url` 只是登记字段（`get_default_site` 的 `site-local` 恒合成、
+    不入库）——token/dispatch 尚未按 site 逐站点路由
+```
+
+- **Redis 是硬依赖**：livekit-sip 经 Redis（psrpc）与站点 LiveKit 耦合，两边必须
+  指同一个 Redis，否则 trunk 注册/房间调度互不可见（trunk 注册会 502）。
+- 端口面：5060/UDP（SIP 信令）+ 10000-20000/UDP（RTP 媒体）必须公网可达（VPS
+  安全组人工放行）；VPS 其余端口不对公网。
+- dial 后端开关语义不变：`BOK_SIP_MODE`（env，终局）> 设置 DB `sip.mode`。
+- 真中继启用前置门（spec §6，2026-09-15 审查定案）：mock 档 8kHz 窄带门禁已过
+  （`scripts/probe_8khz_asr.py`），仍需闭环「带前缀粤语报号窄带复测」+
+  「真 G.711 样本回填」两项，缺一不放行。
+
 ### B 线（同声传译 v2，LiveKit 双端）
 
 ```text
