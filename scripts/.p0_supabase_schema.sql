@@ -11,7 +11,7 @@
 -- 源镜像:   pgvector/pgvector:pg16
 -- 源命令:   docker exec pg-ddl pg_dump -U postgres --schema-only --no-owner --no-privileges postgres
 -- 回环校验: pgvector/pgvector:pg16 上应用本文件 + 重跑 build_engine() = 零 DDL 变更(生成时实测)
--- 规模:     CREATE TABLE 22 张 / CREATE INDEX 30 条 / 数据语句 0 条
+-- 规模:     CREATE TABLE 23 张 / CREATE INDEX 31 条 / 数据语句 0 条
 --           (--schema-only:正常应 0 条数据语句;带 DEFAULT/COMMENT 属 schema 本身)
 --
 -- 目标: 全新 Supabase(Postgres)项目首次引导。应用方式(Main 线程):
@@ -165,6 +165,7 @@ CREATE TABLE public.campaigns (
     status character varying(16) NOT NULL,
     gap_seconds integer NOT NULL,
     scripts_json text NOT NULL,
+    site_id character varying(64) NOT NULL,
     created_at timestamp without time zone NOT NULL,
     finished_at timestamp without time zone
 );
@@ -415,6 +416,24 @@ CREATE TABLE public.settlements (
 
 
 --
+-- Name: sip_sites; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.sip_sites (
+    id character varying(64) NOT NULL,
+    account_id character varying(64) NOT NULL,
+    name character varying(255) NOT NULL,
+    livekit_url character varying(512) NOT NULL,
+    sip_edge character varying(16) NOT NULL,
+    trunk_id character varying(64) NOT NULL,
+    numbers_json text NOT NULL,
+    region character varying(64) NOT NULL,
+    created_at timestamp without time zone NOT NULL,
+    updated_at timestamp without time zone NOT NULL
+);
+
+
+--
 -- Name: turns; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -631,6 +650,14 @@ ALTER TABLE ONLY public.settlements
 
 
 --
+-- Name: sip_sites sip_sites_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sip_sites
+    ADD CONSTRAINT sip_sites_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: turns turns_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -813,6 +840,13 @@ CREATE INDEX ix_roster_entries_object_id ON public.roster_entries USING btree (o
 --
 
 CREATE INDEX ix_settlements_call_id ON public.settlements USING btree (call_id);
+
+
+--
+-- Name: ix_sip_sites_account_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_sip_sites_account_id ON public.sip_sites USING btree (account_id);
 
 
 --
