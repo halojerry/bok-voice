@@ -64,6 +64,46 @@ def _dial_mode(sip: dict) -> str:
     return mode if mode in ("mock", "real") else "mock"
 
 
+def build_dial_block(
+    *,
+    number: str,
+    language: str,
+    sip: dict,
+    site: dict | None = None,
+    scenario: str = "",
+    script: list[str] | None = None,
+    speak_interval_s: float = 0.0,
+    campaign_item_id: str = "",
+) -> dict:
+    """组 dial 块（campaign 建通链与单发外呼共用；spec 2026-09-13 P1.5 T4）。
+
+    **键序与 campaign 旧 dial 块逐键一致**（agent 侧按键读，形状是有意契约）：
+    to/mode/scenario/script/speak_interval_s/language/trunk_id/campaign_item_id/
+    max_call_duration_s/ringing_timeout_s。
+
+    trunk 解析（T2 语义）：`site.trunk_id` 非空优先，否则回退 `sip.trunk_id`
+    ——`site=None`/站点不存在/站点未注册 trunk/虚拟 `site-local` 都安全回退，
+    单站点旧行为零变化。数字字段一律 `or 默认` 兜底：settings 里 0/空会静默
+    变成「无保险丝/零振铃窗」。
+    """
+    trunk_id = str((site or {}).get("trunk_id") or "") or str(sip.get("trunk_id") or "")
+    return {
+        "to": number,
+        "mode": _dial_mode(sip),
+        "scenario": scenario,
+        "script": list(script or []),
+        # mock 台词句间隔（campaign 级可选钩子）：E2E 把客户报号句对齐到 AI 的
+        # 收号步用；缺省 0=子进程自带 6s。
+        "speak_interval_s": speak_interval_s,
+        "language": language,
+        "trunk_id": trunk_id,
+        "campaign_item_id": campaign_item_id,
+        # 数字字段必须 `or 默认` 兜底：settings 里 0/空会静默变成「无保险丝/零振铃窗」。
+        "max_call_duration_s": int(sip.get("max_call_duration_s") or 600),
+        "ringing_timeout_s": int(sip.get("ringing_timeout_s") or 30),
+    }
+
+
 async def _default_dispatcher(room: str, metadata: str) -> None:
     """默认派发：LiveKit 官方 explicit agent dispatch（metadata 带 dial 块）。"""
     from .main import _lkapi_client  # 延迟 import 防 main↔campaign 循环
@@ -191,7 +231,6 @@ async def _start_call(repo, campaign: dict, item: dict, dispatcher: Dispatcher) 
     # `site-local` 恒合成不入库/站点 trunk 未注册）逐字回退 settings `sip.trunk_id`
     # ——单站点旧行为零变化。
     site = repo.get_site(str(campaign.get("site_id") or "")) if campaign.get("site_id") else None
-    trunk_id = str((site or {}).get("trunk_id") or "") or str(sip.get("trunk_id") or "")
     # mock 演练台词（campaign 级 object_id→[句子]）：只有 mock 档需要（真 SIP 对端
     # 是真客户）。读取失败/缺键一律空数组——agent 侧 dial_outbound 的 script 缺省
     # 已是 []，子进程再有语言默认兜底，三层都不会因缺台词卡住。
@@ -208,21 +247,17 @@ async def _start_call(repo, campaign: dict, item: dict, dispatcher: Dispatcher) 
                    "data": {"campaign": campaign.get("id", ""), "error": str(exc)}},
         )
         script, pace = [], 0.0
-    dial = {
-        "to": phone,
-        "mode": _dial_mode(sip),
-        "scenario": str(item.get("scenario") or ""),
-        "script": list(script or []),
-        # mock 台词句间隔（campaign 级可选钩子）：E2E 把客户报号句对齐到 AI 的
-        # 收号步用；缺省 0=子进程自带 6s。
-        "speak_interval_s": pace,
-        "language": str(campaign.get("language") or "zh"),
-        "trunk_id": trunk_id,
-        "campaign_item_id": str(item.get("id") or ""),
-        # 数字字段必须 `or 默认` 兜底：settings 里 0/空会静默变成「无保险丝/零振铃窗」。
-        "max_call_duration_s": int(sip.get("max_call_duration_s") or 600),
-        "ringing_timeout_s": int(sip.get("ringing_timeout_s") or 30),
-    }
+    # dial 块单点在 build_dial_block（单发外呼走同一函数，键序/取值同源）。
+    dial = build_dial_block(
+        number=phone,
+        language=str(campaign.get("language") or "zh"),
+        sip=sip,
+        site=site,
+        scenario=str(item.get("scenario") or ""),
+        script=script,
+        speak_interval_s=pace,
+        campaign_item_id=str(item.get("id") or ""),
+    )
     metadata = json.dumps({"call_id": call_id, "dial": dial}, ensure_ascii=False)
     try:
         await dispatcher(call_id, metadata)

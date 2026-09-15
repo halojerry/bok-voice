@@ -41,6 +41,7 @@ from .pregen import persona_pregen_status
 from .schemas import (
     CreateCallRequest,
     CreateObjectRequest,
+    DialNowRequest,
     ImportRequest,
     DialResultRequest,
     PersonaRequest,
@@ -1869,6 +1870,69 @@ def delete_object(object_id: str) -> dict:
         raise HTTPException(404, "object not found")
     _audit("object.delete", subject_type="object", subject_id=object_id, account_id=(existing or {}).get("account_id", ""))
     return {"object_id": object_id, "deleted": True}
+
+
+@app.post("/api/objects/{object_id}/dial-now")
+async def dial_now(object_id: str, req: DialNowRequest) -> dict:
+    """单发外呼「立即外呼」（spec 2026-09-13 P1.5 T4）：建一通 outbound 通话并直接派 agent。
+
+    复用 campaign 的派发链路，只是名单退化成「就这一通」：
+    `build_dial_block`（键序/trunk 解析/数字兜底与 campaign 同源，T2 站点优先）→
+    `_create_call_in`（`direction=outbound` / `mode=live`，agent 侧零改，靠 metadata
+    的 dial 块拨号）→ `_default_dispatcher`（= campaign 的 explicit dispatch，
+    `campaign_item_id` 留空：不属任何战役名单）。
+
+    失败面：对象不存在=404；对象无电话（strip 后空）=400；派发失败（LiveKit 凭据缺/
+    不可达）=502——通话已建好留在库里便于排查（campaign 落 item failed 同语义），
+    悬挂的 ringing 通话由僵尸回收器兜底翻 FAILED。
+    """
+    repo = _repo()
+    obj = repo.get_object(object_id)
+    if not obj:
+        raise HTTPException(404, "object not found")
+    phone = str(obj.get("phone") or "").strip()
+    if not phone:
+        raise HTTPException(400, "对象无电话号码")
+    account_id = str(obj.get("account_id") or "acc-001")
+    settings = repo.get_settings() or {}
+    # 语言缺省链：请求 language > 对象 language > zh（粤语值只准 cantonese）。
+    language = req.language or str(obj.get("language") or "zh")
+    site = repo.get_site(str(req.site_id or "")) if req.site_id else None
+    from .campaign import build_dial_block  # 延迟 import 防 main↔campaign 循环
+
+    dial = build_dial_block(
+        number=phone,
+        language=language,
+        sip=dict(settings.get("sip") or {}),
+        site=site,
+    )
+    call = _create_call_in(repo, CreateCallRequest(
+        account_id=account_id,
+        object_id=object_id,
+        persona_id=req.persona_id or "",
+        language=dial["language"],
+        mode=CallMode.LIVE,
+        direction="outbound",
+    ))
+    call_id = str(call.get("id") or "")
+    repo.update_call(call_id, contact_phone=phone)
+    # 话术快照：显式 template_id 压过对象绑定模板（call_sessions.template_id 是
+    # agent 装配的第一优先来源，与 campaign/工作台建单同优先级）。
+    if req.template_id:
+        repo.update_call(call_id, template_id=req.template_id)
+    metadata = json.dumps({"call_id": call_id, "dial": dial}, ensure_ascii=False)
+    from .campaign import _default_dispatcher
+
+    try:
+        await _default_dispatcher(call_id, metadata)
+    except Exception as exc:  # noqa: BLE001 - 凭据缺/不可达统一成 502（不裸 500）
+        _audit("call.dial_now", subject_type="call", subject_id=call_id,
+               outcome="error", account_id=account_id,
+               detail={"object": object_id, "error": str(exc)[:200]})
+        raise HTTPException(502, f"外呼派发失败——LiveKit 不可达: {exc}") from exc
+    _audit("call.dial_now", subject_type="call", subject_id=call_id,
+           account_id=account_id, detail={"object": object_id})
+    return {"call_id": call_id, "status": str(call.get("status") or "")}
 
 
 @app.post("/api/objects/import")

@@ -48,6 +48,24 @@ export default function ObjectsPage() {
   // 批量勾选删除：selected 存对象 id 集合，只对「当前搜索过滤后可见」行做全选。
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkErr, setBulkErr] = useState<string | null>(null);
+  // 立即外呼（P1.5 单发外呼）：逐行按钮正在跑 + 成功后展示的 call_id。
+  const [dialingId, setDialingId] = useState<string | null>(null);
+  const [dialMsg, setDialMsg] = useState<string | null>(null);
+
+  /** 用对象的电话立即外呼一通（后端建 outbound 通话 + 派 agent，走 SIP settings/site）。 */
+  async function dialNow(id: string) {
+    setErr(null);
+    setDialMsg(null);
+    setDialingId(id);
+    try {
+      const res = await api.dialNow(id);
+      setDialMsg(`已发起外呼，通话 ${res.call_id}`);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setDialingId(null);
+    }
+  }
 
   const toggleOne = (id: string) =>
     setSelected((prev) => {
@@ -250,6 +268,11 @@ export default function ObjectsPage() {
           )}
           {err && <ErrorState message={err} />}
           {bulkErr && <p className="mb-2 text-xs text-red-300">{bulkErr}</p>}
+          {dialMsg && (
+            <p className="mb-2 text-xs muted">
+              {dialMsg} · <Link href="/calls" className="text-accent">查看通话</Link>
+            </p>
+          )}
           {loading ? (
             <LoadingState />
           ) : filtered.length === 0 ? (
@@ -298,6 +321,16 @@ export default function ObjectsPage() {
                       )}
                     </div>
                     <div className="flex shrink-0 gap-2">
+                      {String(r.phone ?? "").trim() !== "" && (
+                        <button
+                          className="btn-ghost text-xs text-accent"
+                          disabled={dialingId === id}
+                          onClick={() => dialNow(id)}
+                          title="用该对象的电话立即外呼（建 outbound 通话并派 AI 客服，用设置里的 SIP/SIP 站点）"
+                        >
+                          {dialingId === id ? "呼叫中…" : "立即外呼"}
+                        </button>
+                      )}
                       <Link
                         href={`/calls/new?object=${encodeURIComponent(String(r.id))}`}
                         className="btn-ghost text-xs text-accent"

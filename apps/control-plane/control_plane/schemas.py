@@ -231,6 +231,20 @@ class TrunkRegisterRequest(BaseModel):
     numbers: list[str] = []
 
 
+class DialNowRequest(BaseModel):
+    """对象页「立即外呼」入参（spec 2026-09-13 P1.5 Task 4：单发外呼）。
+
+    全部可省：`template_id` 空=用对象绑定话术（显式给则覆盖通话快照）、
+    `persona_id` 空=agent 按对象/默认人设解析、`language` 空=对象语言（再兜 zh）、
+    `site_id` 空=不挂站点（dial 块 trunk 回退 settings `sip.trunk_id`）。
+    """
+
+    template_id: str = ""
+    persona_id: str = ""
+    language: str = ""
+    site_id: str = ""
+
+
 class RosterClaimRequest(BaseModel):
     """名册认领：claimed_by 缺省 acc-001（本机单账号形态）。"""
 

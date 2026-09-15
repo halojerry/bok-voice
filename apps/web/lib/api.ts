@@ -99,6 +99,16 @@ export const api = {
   listObjects: (accountId = "acc-001") =>
     request<Record<string, unknown>[]>(`/api/objects?account_id=${accountId}`),
   getObject: (id: string) => request<Record<string, unknown>>(`/api/objects/${id}`),
+  // 单发外呼（P1.5）：对象页「立即外呼」——建一通 outbound 通话并直接派 agent
+  // （dial 块与 campaign 同一 build_dial_block；无 phone=400）。
+  dialNow: (
+    objectId: string,
+    body: { template_id?: string; persona_id?: string; language?: string; site_id?: string } = {},
+  ) =>
+    request<{ call_id: string; status: string }>(
+      `/api/objects/${encodeURIComponent(objectId)}/dial-now`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
   getObjectTopics: (id: string) => request<Record<string, unknown>[]>(`/api/objects/${id}/topics`),
   listGlobalInsights: () => request<Record<string, unknown>[]>("/api/insights"),
   createObject: (body: unknown, accountId = "acc-001") =>
