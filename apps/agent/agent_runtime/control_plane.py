@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import httpx
 
 
@@ -11,6 +13,12 @@ class ControlPlaneClient:
         # 会话级 correlation:全部请求带 X-Call-ID → CP 审计行的 call_id 列
         # 自动填充(此前恒空,web 按 callId 过滤审计查不到)。
         headers = {"X-Call-ID": call_id} if call_id else {}
+        # 机器通道（2026-09-16 深测 P2-8）：CP 设 BOK_CP_TOKEN 时全部请求自动
+        # 携带——auth-on 下 turns/QA/垫话/设置上报不再 401（此前 env 无任何代码
+        # 读取，文档「agent env 必须带同值」是 aspirational）。未设=零变化。
+        cp_token = (os.environ.get("BOK_CP_TOKEN") or "").strip()
+        if cp_token:
+            headers["Authorization"] = f"Bearer {cp_token}"
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=15, headers=headers)
 
     async def get_call(self, call_id: str) -> dict:
