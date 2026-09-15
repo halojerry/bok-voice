@@ -93,3 +93,29 @@ def test_disabled_or_demoted_token_dies_immediately(monkeypatch):
         # 降级 boss：admin→user 后旧 token 打管理面立即 403
         repo.update_user(repo.get_user_by_username("boss")["id"], role="user")
         assert client.get("/api/settings", headers={"Authorization": f"Bearer {boss_token}"}).status_code == 403
+
+
+def test_token_supervisor_identity_prefix_blocked_for_user(monkeypatch):
+    monkeypatch.setenv("BOK_AUTH_REQUIRED", "1")
+    client, repo = _make(monkeypatch, users=[
+        {"username": "peon", "role": "user"},
+        {"username": "op2", "role": "user", "account": "acc-002"},
+    ])
+    with client:
+        peon = {"Authorization": "Bearer " + _login(client, "peon")}
+        # 建一通本账号通话
+        r = client.post("/api/calls", json={"account_id": "acc-001"}, headers=peon)
+        call_id = r.json()["id"]
+        # 直路：role/purpose 字段已被 B4 堵死
+        assert client.post("/api/token", json={"call_id": call_id, "role": "supervisor"},
+                           headers=peon).status_code == 403
+        assert client.post("/api/token", json={"call_id": call_id, "purpose": "listen"},
+                           headers=peon).status_code == 403
+        # 第三条路（深测 P2）：participant_identity 前缀反推——旧版 201 漏签
+        r = client.post("/api/token", json={"call_id": call_id,
+                                            "participant_identity": f"supervisor-{call_id}"},
+                        headers=peon)
+        assert r.status_code == 403, r.text
+        # operator 正常签发不受影响
+        assert client.post("/api/token", json={"call_id": call_id},
+                           headers=peon).status_code == 201
