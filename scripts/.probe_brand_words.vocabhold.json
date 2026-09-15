@@ -1,0 +1,186 @@
+[
+ {
+  "lang": "zh",
+  "text": "我在拼多多买的东西还没有到货",
+  "brand": "拼多多",
+  "shape": "continuous",
+  "turns": [
+   "在拼多多买的东西还没有到。"
+  ],
+  "intact_single": true,
+  "intact_any": true
+ },
+ {
+  "lang": "zh",
+  "text": "我在拼多多买的东西还没有到货",
+  "brand": "拼多多",
+  "shape": "pause_before_brand",
+  "turns": [
+   "货。",
+   "在。 拼多多买的东西还没有到。"
+  ],
+  "intact_single": true,
+  "intact_any": true
+ },
+ {
+  "lang": "zh",
+  "text": "我在拼多多买的东西还没有到货",
+  "brand": "拼多多",
+  "shape": "pause_inside_brand",
+  "turns": [
+   "到货。 在拼多多买的东西还没有到货。"
+  ],
+  "intact_single": true,
+  "intact_any": true
+ },
+ {
+  "lang": "zh",
+  "text": "我在拼多多买的东西还没有到货",
+  "brand": "拼多多",
+  "shape": "pause_after_brand",
+  "turns": [
+   "在拼多多。我。"
+  ],
+  "intact_single": true,
+  "intact_any": true
+ },
+ {
+  "lang": "cantonese",
+  "text": "我喺拼多多買嘅嘢仲未到",
+  "brand": "拼多多",
+  "shape": "continuous",
+  "turns": [
+   "东西还没有到货。 喺拼多多买个嘢仲未到。"
+  ],
+  "intact_single": true,
+  "intact_any": true
+ },
+ {
+  "lang": "cantonese",
+  "text": "我喺拼多多買嘅嘢仲未到",
+  "brand": "拼多多",
+  "shape": "pause_before_brand",
+  "turns": [
+   "可惜。",
+   "拼多多买个野种味道。"
+  ],
+  "intact_single": true,
+  "intact_any": true
+ },
+ {
+  "lang": "cantonese",
+  "text": "我喺拼多多買嘅嘢仲未到",
+  "brand": "拼多多",
+  "shape": "pause_inside_brand",
+  "turns": [
+   "是批。單號。",
+   "多买个也种味道。"
+  ],
+  "intact_single": false,
+  "intact_any": false
+ },
+ {
+  "lang": "cantonese",
+  "text": "我喺拼多多買嘅嘢仲未到",
+  "brand": "拼多多",
+  "shape": "pause_after_brand",
+  "turns": [
+   "系拼多多。"
+  ],
+  "intact_single": true,
+  "intact_any": true
+ },
+ {
+  "lang": "zh",
+  "text": "我上一单就是淘宝买的",
+  "brand": "淘宝",
+  "shape": "continuous",
+  "turns": [
+   "上一单就是淘宝买的。"
+  ],
+  "intact_single": true,
+  "intact_any": true
+ },
+ {
+  "lang": "zh",
+  "text": "我上一单就是淘宝买的",
+  "brand": "淘宝",
+  "shape": "pause_before_brand",
+  "turns": [
+   "上一单就是淘宝买的。"
+  ],
+  "intact_single": true,
+  "intact_any": true
+ },
+ {
+  "lang": "zh",
+  "text": "我上一单就是淘宝买的",
+  "brand": "淘宝",
+  "shape": "pause_inside_brand",
+  "turns": [
+   "我上一单就是淘宝。好。",
+   "我买的。"
+  ],
+  "intact_single": true,
+  "intact_any": true
+ },
+ {
+  "lang": "zh",
+  "text": "我上一单就是淘宝买的",
+  "brand": "淘宝",
+  "shape": "pause_after_brand",
+  "turns": [
+   "上一单就是淘宝。",
+   "好的。"
+  ],
+  "intact_single": true,
+  "intact_any": true
+ },
+ {
+  "lang": "cantonese",
+  "text": "我件貨係京東買的",
+  "brand": "京東",
+  "shape": "continuous",
+  "turns": [
+   "件货喺京东买的。"
+  ],
+  "intact_single": true,
+  "intact_any": true
+ },
+ {
+  "lang": "cantonese",
+  "text": "我件貨係京東買的",
+  "brand": "京東",
+  "shape": "pause_before_brand",
+  "turns": [
+   "贱货！百。",
+   "京东买的。"
+  ],
+  "intact_single": true,
+  "intact_any": true
+ },
+ {
+  "lang": "cantonese",
+  "text": "我件貨係京東買的",
+  "brand": "京東",
+  "shape": "pause_inside_brand",
+  "turns": [
+   "件货海。金。",
+   "東百的。啊！"
+  ],
+  "intact_single": false,
+  "intact_any": false
+ },
+ {
+  "lang": "cantonese",
+  "text": "我件貨係京東買的",
+  "brand": "京東",
+  "shape": "pause_after_brand",
+  "turns": [
+   "件货黑。京东。",
+   "買的。"
+  ],
+  "intact_single": true,
+  "intact_any": true
+ }
+]
