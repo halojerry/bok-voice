@@ -1272,6 +1272,9 @@ class CampaignCreateRequest(BaseModel):
     # 电话边缘站点（spec 2026-09-13 P1.5）：空串=不挂站点（dial 块走 settings
     # `sip` 兜底，单站点旧行为零变化）；挂站点时 dial 块 trunk 取站点注册值。
     site_id: str = ""
+    # 8kHz 窄带档（T5 前置门）：mock 客户话音走电话频带，重验窄带下的 ASR。
+    # 与句间隔同一份 scripts_json 保留键（`__narrowband__`），只加键不加列。
+    narrowband: bool = False
 
 
 @app.post("/api/campaigns")
@@ -1294,6 +1297,9 @@ def create_campaign(req: CampaignCreateRequest) -> dict:
     # 不加宽、不加新表，起拨时 campaign._start_call 从同一份 JSON 取。
     if float(req.mock_speak_interval_s or 0) > 0:
         scripts["__speak_interval__"] = float(req.mock_speak_interval_s)
+    # 窄带档（T5）：假值不发键——旧战役的 scripts_json 逐字节零变化。
+    if req.narrowband:
+        scripts["__narrowband__"] = True
     camp = _repo().create_campaign(
         req.account_id, name=req.name, template_id=req.template_id,
         persona_id=req.persona_id, language=req.language,
@@ -1447,6 +1453,9 @@ class MockCalleeRequest(BaseModel):
     # 句间隔秒（默认 6≈一轮问答）：E2E/演练要把客户台词对齐到 AI 的话术步进时
     # 调大（AI 每轮处理+播报可能 8-12s，太密会令报号句落在收号步之外）。
     speak_interval_s: float = 6.0
+    # 8kHz 窄带档（spec 2026-09-13 §6 前置门）：客户话音按电话频带（3.4kHz
+    # 抗混叠 → 8k → 升回 16k）再推流，模拟运营商 PCMU/PCMA 窄带线路。
+    narrowband: bool = False
 
 
 @app.post("/api/sip/mock/callee")
@@ -1500,6 +1509,8 @@ def spawn_mock_callee(req: MockCalleeRequest) -> dict:
         "--ringing-window", str(req.ringing_window_s),
         "--speak-interval", str(req.speak_interval_s),
     ]
+    if req.narrowband:
+        cmd.append("--narrowband")
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     log_path = repo_root / "runtime" / "logs" / "mock-callee.log"
     try:
@@ -1518,7 +1529,8 @@ def spawn_mock_callee(req: MockCalleeRequest) -> dict:
     threading.Thread(target=proc.wait, daemon=True, name=f"mock-callee-reap-{proc.pid}").start()
     _audit("sip.mock_callee_spawn", subject_type="room", subject_id=req.room,
            account_id="acc-001",
-           detail={"scenario": req.scenario, "pid": proc.pid, "identity": identity})
+           detail={"scenario": req.scenario, "pid": proc.pid, "identity": identity,
+                   "narrowband": req.narrowband})
     return {"ok": True, "pid": proc.pid, "identity": identity}
 
 

@@ -74,6 +74,7 @@ def build_dial_block(
     script: list[str] | None = None,
     speak_interval_s: float = 0.0,
     campaign_item_id: str = "",
+    narrowband: bool = False,
 ) -> dict:
     """组 dial 块（campaign 建通链与单发外呼共用；spec 2026-09-13 P1.5 T4）。
 
@@ -85,9 +86,13 @@ def build_dial_block(
     ——`site=None`/站点不存在/站点未注册 trunk/虚拟 `site-local` 都安全回退，
     单站点旧行为零变化。数字字段一律 `or 默认` 兜底：settings 里 0/空会静默
     变成「无保险丝/零振铃窗」。
+
+    窄带档（T5，8kHz 重验测试床）：**只在 True 时追加键**——旧 10 键键序与
+    「缺键=False」语义零变化（agent 侧 `bool(_dial.get("narrowband"))`）。
+    mock 档专属（真中继的窄带来自运营商本身，real 档无消费）。
     """
     trunk_id = str((site or {}).get("trunk_id") or "") or str(sip.get("trunk_id") or "")
-    return {
+    dial = {
         "to": number,
         "mode": _dial_mode(sip),
         "scenario": scenario,
@@ -102,6 +107,9 @@ def build_dial_block(
         "max_call_duration_s": int(sip.get("max_call_duration_s") or 600),
         "ringing_timeout_s": int(sip.get("ringing_timeout_s") or 30),
     }
+    if narrowband:
+        dial["narrowband"] = True
+    return dial
 
 
 async def _default_dispatcher(room: str, metadata: str) -> None:
@@ -240,13 +248,15 @@ async def _start_call(repo, campaign: dict, item: dict, dispatcher: Dispatcher) 
         # 句间隔与台词同源（campaign 级 mock 钩子，键 "__speak_interval__" 避开
         # object_id 命名空间；0/缺省=子进程自带 6s）。
         pace = float(_scripts.get("__speak_interval__") or 0)
+        # 窄带档（T5）：同一份保留键命名空间的 mock 钩子，缺省 False=旧战役零变化。
+        narrowband = bool(_scripts.get("__narrowband__") or False)
     except Exception as exc:  # noqa: BLE001 - 台词是演练钩子，取不到照常拨号
         log.warning(
             "campaign_scripts_read_failed",
             extra={"event": "campaign.scripts.error",
                    "data": {"campaign": campaign.get("id", ""), "error": str(exc)}},
         )
-        script, pace = [], 0.0
+        script, pace, narrowband = [], 0.0, False
     # dial 块单点在 build_dial_block（单发外呼走同一函数，键序/取值同源）。
     dial = build_dial_block(
         number=phone,
@@ -257,6 +267,7 @@ async def _start_call(repo, campaign: dict, item: dict, dispatcher: Dispatcher) 
         script=script,
         speak_interval_s=pace,
         campaign_item_id=str(item.get("id") or ""),
+        narrowband=narrowband,
     )
     metadata = json.dumps({"call_id": call_id, "dial": dial}, ensure_ascii=False)
     try:

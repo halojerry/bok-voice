@@ -192,6 +192,23 @@ def test_build_dial_block_numeric_fields_pass_configured_values():
     assert dial["max_call_duration_s"] == 120 and dial["ringing_timeout_s"] == 45
 
 
+def test_build_dial_block_narrowband_omitted_by_default():
+    """窄带档默认关：键**不出现**（旧 dial 块逐字节零变化；agent 侧缺键=False）。"""
+    dial = build_dial_block(number="+8529", language="zh", sip={})
+    assert "narrowband" not in dial
+    assert list(dial.keys()) == LEGACY_DIAL_KEYS
+    # 显式 False 与缺省同语义（不发键）。
+    assert "narrowband" not in build_dial_block(number="+8529", language="zh", sip={},
+                                                narrowband=False)
+
+
+def test_build_dial_block_narrowband_appended_when_enabled():
+    """窄带档开：键追加在尾部（键序=旧 10 键 + narrowband，前面键位不动）。"""
+    dial = build_dial_block(number="+8529", language="zh", sip={}, narrowband=True)
+    assert dial["narrowband"] is True
+    assert list(dial.keys()) == [*LEGACY_DIAL_KEYS, "narrowband"]
+
+
 def test_build_dial_block_mode_env_kill_switch(monkeypatch):
     """env BOK_SIP_MODE 合法值压过 settings；非法值回落 settings（`_dial_mode` 语义）。"""
     monkeypatch.setenv("BOK_SIP_MODE", "real")
@@ -235,6 +252,29 @@ def test_campaign_start_call_delegates_to_build_dial_block(monkeypatch):
         sip={"mode": "real", "trunk_id": SETTINGS_TRUNK},
         campaign_item_id=str(item["id"]),
     )
+
+
+def test_campaign_narrowband_flag_rides_scripts_json_into_dial_block(monkeypatch):
+    """战役窄带档：`__narrowband__` 与句间隔同源（scripts_json 保留键），进 dial 块。
+
+    8kHz 重验探针要按战役开窄带（mock 测试床专属；real 档无消费）。
+    """
+    import asyncio
+
+    from control_plane.campaign import campaign_tick
+
+    repo = InMemoryBusinessRepository()
+    obj = _make_object(repo, display_name="A", phone="+85211111111")
+    camp = repo.create_campaign("acc-001", name="t", template_id="", persona_id="",
+                                language="zh", gap_seconds=5, object_ids=[obj["id"]],
+                                scripts={"__narrowband__": True,
+                                         "__speak_interval__": 8.0})
+    repo.update_campaign(camp["id"], status="running")
+    fake = _FakeDispatch()
+    asyncio.run(campaign_tick(repo, dispatcher=fake))
+    dial = fake.dial()
+    assert dial["narrowband"] is True
+    assert dial["speak_interval_s"] == 8.0
 
 
 # ---- ② 端点：成功路径 ----
