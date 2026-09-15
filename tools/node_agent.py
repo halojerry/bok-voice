@@ -133,6 +133,7 @@ def ensure_token(cp_url: str, license_key: str, fingerprint: str,
     state_file.parent.mkdir(parents=True, exist_ok=True)
     # 先 0600 建档再写（write_text+chmod 有 0644 窗口）：token=本机凭据。
     fd = os.open(str(state_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)  # O_TRUNC 对已存在文件保留旧 mode——旧版 0644 残档在此扳回
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(json.dumps({"node_id": node_id, "node_token": token}, ensure_ascii=False))
     print(f"[node-agent] registered as {node_id} (state -> {state_file})", flush=True)
@@ -202,6 +203,8 @@ def heartbeat_tick(cfg: NodeConfig, missed: int, *, license_key: str = "",
                 return 0 if ok else 1
             except SystemExit as exc:
                 print(f"[node-agent] re-register failed: {exc}", flush=True)
+            except Exception as exc:  # noqa: BLE001 - 网络抖动不令守护进程死亡
+                print(f"[node-agent] re-register failed: {exc!r}", flush=True)
     return 0 if ok else missed + 1
 
 

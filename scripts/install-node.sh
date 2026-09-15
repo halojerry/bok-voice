@@ -212,7 +212,7 @@ else
 下一步（正式常驻部署；systemd/launchd 模板在后续轮提供）:
   1. 常驻心跳 + 全栈:
        nohup $PY $REPO_ROOT/tools/node_agent.py \\
-         --cp-url $CP_URL $(if [[ -n "$NODE_TOKEN" ]]; then echo '--node-token ***'; else echo '--license-key ***（token 已落 ~/.bok/node-state.json 自动复用）'; fi) \\
+         --cp-url $CP_URL $(if [[ -n "$NODE_TOKEN" ]]; then echo '--node-token ***'; else echo 'BOK_LICENSE_KEY=***（license 经 env 传递，token 已落 ~/.bok/node-state.json 自动复用）'; fi) \\
          --livekit-url $LIVEKIT_URL \\
          --ui-dir $REPO_ROOT/apps/web/out --interval 60 >/dev/null 2>&1 &
      （不带 --heartbeat-only 即拉起全栈 serve + 心跳守护）

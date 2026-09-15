@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import stat
 import sys
+import urllib.error
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
@@ -50,6 +51,34 @@ def test_ensure_token_writes_state_file_0600_from_creation(monkeypatch, tmp_path
                         lambda *a, **k: ("node-1", "tok-1"))
     monkeypatch.setattr(node_agent, "_post_json",
                         lambda *a, **k: (401, {}))  # 缓存探测直接 401
+    token = node_agent.ensure_token("http://cp.test", "bokn_k", "f" * 64, state)
+    assert token == "tok-1"
+    assert stat.S_IMODE(state.stat().st_mode) == 0o600
+
+
+def test_heartbeat_tick_swallows_reregister_network_error(monkeypatch, tmp_path):
+    """重注册窗口内网络抖动（URLError）不得穿透 tick 令守护进程退出/线程死亡。"""
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(node_agent, "heartbeat_once",
+                        lambda c, metrics=None: (False, {"detail": "unknown node token"}))
+
+    def fake_ensure(cp_url, license_key, fingerprint, state_file):
+        raise urllib.error.URLError("network blip")
+
+    monkeypatch.setattr(node_agent, "ensure_token", fake_ensure)
+    assert node_agent.heartbeat_tick(cfg, 2, license_key="bokn_k",
+                                     state_file=tmp_path / "state.json") == 3
+
+
+def test_ensure_token_repairs_stale_0644_state_file(monkeypatch, tmp_path):
+    """O_TRUNC 对已存在文件保留旧 mode——旧版 0644 崩溃残档写出后必须扳回 0600。"""
+    state = tmp_path / "node-state.json"
+    state.write_text('{"node_id": "old", "node_token": "stale"}', encoding="utf-8")
+    os.chmod(state, 0o644)
+    monkeypatch.setattr(node_agent, "register_once",
+                        lambda *a, **k: ("node-1", "tok-1"))
+    monkeypatch.setattr(node_agent, "_post_json",
+                        lambda *a, **k: (401, {}))  # 缓存探测 401 → 重注册覆盖
     token = node_agent.ensure_token("http://cp.test", "bokn_k", "f" * 64, state)
     assert token == "tok-1"
     assert stat.S_IMODE(state.stat().st_mode) == 0o600
