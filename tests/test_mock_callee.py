@@ -319,3 +319,11 @@ def test_parse_args_narrowband_flag():
     base = ["--url", "ws://x", "--token", "t", "--identity", "i"]
     assert mock_callee.parse_args(base).narrowband is False
     assert mock_callee.parse_args([*base, "--narrowband"]).narrowband is True
+
+
+def test_narrowband_marker_line_carries_identity():
+    """窄带档自报行必须带 identity——探针逐腿按它强绑核验「这条腿真走了窄带档」。"""
+    line = mock_callee.narrowband_marker_line("sip-mock-+85291234567")
+    assert line.startswith("MOCK_CALLEE narrowband=1 ")
+    assert "identity=sip-mock-+85291234567" in line
+    assert str(int(mock_callee.NB_CUTOFF_HZ)) in line

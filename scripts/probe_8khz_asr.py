@@ -193,16 +193,18 @@ def ensure_template(language: str, hotwords: str) -> str:
     return str(tpl.get("id") or "")
 
 
-def create_object(leg: Leg, template_id: str, tag: str, seq: int) -> str:
+def create_object(leg: Leg, template_id: str, tag: str, seq: int) -> tuple[str, str]:
+    """建探针对象；返回 `(object_id, phone)`——phone 用来算 mock 客户的 identity。"""
     ts = int(time.time() * 1000) % 10000
+    phone = f"+8529{ts:04d}{seq:02d}"
     obj = ec._api("POST", f"/api/objects?account_id={ec.ACCOUNT_ID}", json={
         "display_name": f"{OBJECT_PREFIX}-{leg.name}-{tag}-{ts}",
         "language": leg.language,
-        "phone": f"+8529{ts:04d}{seq:02d}",
+        "phone": phone,
         "template_id": template_id,
         "contact_channel": "whatsapp",
     }, timeout=15).json()
-    return str(obj.get("id") or "")
+    return str(obj.get("id") or ""), phone
 
 
 def start_campaign(leg: Leg, object_id: str, template_id: str,
@@ -266,9 +268,19 @@ def _log_new_text(offset: int) -> str:
         return ""
 
 
-def narrowband_evidence(offset: int) -> bool:
-    """该通通话窗内的 mock_callee 日志是否出现窄带档自报（`narrowband=1`）。"""
-    return "narrowband=1" in _log_new_text(offset)
+def narrowband_evidence(offset: int, identity: str) -> bool:
+    """该通通话窗内是否出现**本腿 identity** 的窄带档自报（`narrowband=1 identity=…`）。
+
+    强绑定：`identity` 是 mock 客户在房间里的唯一身份（`sip-mock-<号码>`，agent 侧
+    按同一 identity 认它）。只按时间窗找 `narrowband=1` 会被并发/错位归属骗过——
+    「本腿窄带档真的跑了」必须由本腿自己的日志行作证。
+    """
+    if not identity:
+        return False
+    return any(
+        "narrowband=1" in line and f"identity={identity}" in line
+        for line in _log_new_text(offset).splitlines()
+    )
 
 
 # ── 一轮（宽/窄各一遍全部台词腿）────────────────────────────────────────
@@ -297,8 +309,11 @@ def run_leg(leg: Leg, mode: str, rnd: int, *, speak_interval_s: float,
             call_timeout_s: float) -> Record:
     template_id = ensure_template(leg.language, leg.hotwords)
     tag = f"{mode}-r{rnd}"
-    object_id = create_object(leg, template_id, tag, seq=_SEQ[0])
+    object_id, phone = create_object(leg, template_id, tag, seq=_SEQ[0])
     _SEQ[0] += 1
+    # mock 客户在房间里的 identity（agent 侧 `_dial_mock` 按同一 identity 认它）——
+    # 窄带档核验按它逐腿强绑定。
+    mock_identity = f"sip-mock-{phone}"
     rec = Record(leg=leg.name, language=leg.language, mode=mode, rnd=rnd,
                  lines=list(leg.lines), transcript="", acc=0.0,
                  sentence=leg.sentence, digits_want=leg.digits)
@@ -318,9 +333,9 @@ def run_leg(leg: Leg, mode: str, rnd: int, *, speak_interval_s: float,
     rec.notes.append(f"wall={time.perf_counter() - t0:.1f}s")
     if item.get("last_error"):
         rec.notes.append(f"last_error={item['last_error']}")
-    rec.narrowband_marker = narrowband_evidence(log_offset)
+    rec.narrowband_marker = narrowband_evidence(log_offset, mock_identity)
     if mode == "narrow" and not rec.narrowband_marker:
-        rec.notes.append("窄带档未见 mock_callee 日志自报")
+        rec.notes.append(f"窄带档未见本腿自报（identity={mock_identity}）")
     if rec.call_id:
         try:
             turns = ec._api("GET", f"/api/calls/{rec.call_id}/turns", timeout=15).json()

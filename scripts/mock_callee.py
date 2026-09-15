@@ -191,6 +191,17 @@ def event_line(name: str, at: float, identity: str) -> str:
     return f"MOCK_CALLEE event={name} at={at:.1f} identity={identity}"
 
 
+def narrowband_marker_line(identity: str) -> str:
+    """窄带档自报行(测试床真伪核验的唯一凭据)。
+
+    带 identity=mock 客户在房间里的唯一身份(`sip-mock-<号码>`,agent 侧按同一
+    identity 认它):窄带重验探针逐腿按 identity 强绑核验「这条腿真的走了窄带档」,
+    仅按时间窗找 `narrowband=1` 会被并发/错位归属骗过(实测踩过栈混用假绿)。
+    """
+    return (f"MOCK_CALLEE narrowband=1 cutoff_hz={NB_CUTOFF_HZ:g} "
+            f"target_rate={NB_TARGET_RATE} identity={identity}")
+
+
 def plan_timeline(scenario: str, *, ring_delay_s: float, lines: int,
                   speak_interval_s: float = SPEAK_INTERVAL_S) -> list[tuple[str, float]]:
     """纯函数:剧本 → [(event, at_s)] 时间线(event ∈ join/speak/leave/exit)。
@@ -429,8 +440,7 @@ class MockCallee:
             args.script = lambda: default_script(args.language)
             print(f"MOCK_CALLEE default_script language={args.language}", flush=True)
         if getattr(args, "narrowband", False):
-            print(f"MOCK_CALLEE narrowband=1 cutoff_hz={NB_CUTOFF_HZ:g} "
-                  f"target_rate={NB_TARGET_RATE}", flush=True)
+            print(narrowband_marker_line(args.identity), flush=True)
         lines = len(args.script())
         if args.hangup_after_turns > 0:
             lines = min(lines or args.hangup_after_turns, args.hangup_after_turns)

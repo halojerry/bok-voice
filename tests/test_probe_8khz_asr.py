@@ -66,6 +66,26 @@ def test_customer_transcripts_filters_speaker_and_blanks():
 BRIEF_ZH_LINE = "你好我是快递公司的专员"
 
 
+def test_narrowband_evidence_binds_to_leg_identity(monkeypatch, tmp_path):
+    """核验按 identity 强绑：他腿的自报行不算本腿的窄带证据（时间窗弱口径会假绿）。"""
+    log = tmp_path / "mock-callee.log"
+    log.write_text("MOCK_CALLEE event=join at=3.0 identity=sip-mock-+85290000001\n",
+                   encoding="utf-8")
+    monkeypatch.setattr(probe, "_mock_callee_log_path", lambda: log)
+    offset = log.stat().st_size
+
+    log.write_text(
+        "MOCK_CALLEE event=join at=3.0 identity=sip-mock-+85290000001\n"
+        "MOCK_CALLEE narrowband=1 cutoff_hz=3400 target_rate=8000 identity=sip-mock-+85290000002\n",
+        encoding="utf-8",
+    )
+    assert probe.narrowband_evidence(offset, "sip-mock-+85290000002") is True
+    assert probe.narrowband_evidence(offset, "sip-mock-+85290000001") is False
+    assert probe.narrowband_evidence(offset, "") is False
+    # 宽带腿（无 narrowband=1 行）任何 identity 都不算。
+    assert probe.narrowband_evidence(offset, "sip-mock-+85290000003") is False
+
+
 def test_legs_contract_single_breath_and_digits_target():
     """台词铁律：单口气（中文 ≤10 字 / 英文 ≤6 词，无标点停顿），号码句目标钉死。"""
     by_name = {leg.name: leg for leg in probe.DEFAULT_LEGS}
