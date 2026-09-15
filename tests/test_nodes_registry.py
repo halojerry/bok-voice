@@ -85,7 +85,9 @@ def test_node_heartbeat_bypasses_cp_token_gate_register_does_not(monkeypatch):
         assert reg_ok.status_code == 200
         hb = client.post(
             "/api/nodes/heartbeat",
-            json={},
+            # P2-7 起心跳指纹协议强制：注册绑定了指纹的节点心跳必须带同指纹
+            #（缺=按 fingerprint_mismatch 自动吊销）。
+            json={"fingerprint": "fp-z"},
             headers={"Authorization": f"Bearer {reg_ok.json()['node_token']}"},
         )
         assert hb.status_code == 200  # node_token 直达心跳，不被 CP 门禁拦

@@ -133,10 +133,15 @@ def main(argv: list[str] | None = None) -> int:
         f"HTTP {status} node_id={node_id or body}",
     )
 
-    # ② 真 token 心跳
+    # ② 真 token 心跳（P2-7 心跳指纹协议强制：license 流注册绑定了指纹，
+    # 心跳必须带同指纹——缺=按 fingerprint_mismatch 自动吊销；开放流无绑定，
+    # 带了也不参与校验）。
+    hb_body: dict[str, Any] = {"metrics": {"smoke": ts}}
+    if license_used:
+        hb_body["fingerprint"] = fingerprint
     status, body = _request(
         "POST", f"{base}/api/nodes/heartbeat",
-        token=node_token, body={"metrics": {"smoke": ts}}, timeout=args.timeout,
+        token=node_token, body=hb_body, timeout=args.timeout,
     )
     _record(
         status == 200 and isinstance(body, dict) and body.get("ok") is True,

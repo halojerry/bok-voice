@@ -2143,7 +2143,8 @@ def node_heartbeat(req: NodeHeartbeatRequest, authorization: str = Header(defaul
     ok, reason = (False, "unknown_token")
     if token:
         ok, reason = _node_store().heartbeat(
-            token, req.metrics, fingerprint=(req.fingerprint or "").strip())
+            token, req.metrics, fingerprint=(req.fingerprint or "").strip(),
+            require_license=node_license_required())
     if not ok:
         # 克隆/吊销是安全事件（节点已被 store 自动吊销），一次性落审计；普通
         # 凭据错误只 401 不刷审计（防心跳重试刷屏）。
@@ -2151,7 +2152,8 @@ def node_heartbeat(req: NodeHeartbeatRequest, authorization: str = Header(defaul
             _audit(f"node.denied.{reason}", subject_type="node", subject_id="",
                    account_id="", detail={"reason": reason})
         detail = {"fingerprint_mismatch": "fingerprint mismatch (clone/relocated?)",
-                  "license_revoked": "license revoked", "revoked": "node revoked"}.get(reason)
+                  "license_revoked": "license revoked", "revoked": "node revoked",
+                  "license_required": "node not licensed (hardened mode)"}.get(reason)
         raise HTTPException(401, detail or "unknown node token")
     return {"ok": True, "commands": []}
 
@@ -2202,6 +2204,17 @@ def revoke_node_license(license_id: str, request: Request) -> dict:
            account_id=out.get("account_id", ""),
            detail={"nodes_revoked": out.get("nodes_revoked", 0)})
     return out
+
+
+@app.post("/api/nodes/{node_id}/revoke")
+def revoke_node(node_id: str, request: Request) -> dict:
+    """吊销单个节点（root 专属）：token 即刻失效。开放期存量 token（无 license）
+    此前无任何吊销手段（2026-09-16 深测 P2）。"""
+    require_role(request, "root")
+    if not _node_store().revoke_node(node_id):
+        raise HTTPException(404, "node not found")
+    _audit("node.revoked", subject_type="node", subject_id=node_id)
+    return {"node_id": node_id, "revoked": True}
 
 
 @app.get("/api/calls/{call_id}/settlement")
