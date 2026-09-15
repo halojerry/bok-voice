@@ -3065,3 +3065,13 @@ async def supervisor_end(call_id: str, request: Request, disposition: str = "dec
     _disconnect_room_background(call_id)
     _audit("supervisor.end", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""), call_id=call_id, detail={"disposition": disposition})
     return {"call_id": call_id, "action": "end", "status": call["status"], "disconnected": True}
+
+
+# 管理台静态托管（云端形态）：目录在才挂载，本地开发形态零变化。
+# 必须**放在全部 API 路由之后**——FastAPI 按注册顺序匹配，路由先于挂载命中，
+# `/api/*` 与 `/health` 不受影响；目录缺失(本地仓库/测试)整段跳过，连 import 都不发生。
+_web_static_dir = Path(os.environ.get("BOK_WEB_STATIC_DIR", "/app/web-out"))
+if _web_static_dir.is_dir():
+    from fastapi.staticfiles import StaticFiles
+
+    app.mount("/", StaticFiles(directory=str(_web_static_dir), html=True), name="web")
