@@ -3,6 +3,7 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { useControlPlaneReady } from "@/lib/api-ready";
+import { useSession } from "@/components/session-context";
 
 type Settings = Record<string, unknown> | null;
 
@@ -17,7 +18,9 @@ interface AccountContextValue {
 const AccountContext = createContext<AccountContextValue | null>(null);
 
 export function AccountProvider({ children }: { children: React.ReactNode }) {
-  const accountId = "acc-001";
+  // 账号归属随会话（B4）：登录后 = 会话 account_id；匿名本地模式 = acc-001（单机现状）。
+  const session = useSession();
+  const accountId = session?.account_id || "acc-001";
   const [settings, setSettings] = useState<Settings>(null);
   const [settingsLoading, setSettingsLoading] = useState(true);
   const [health, setHealth] = useState<boolean | null>(null);

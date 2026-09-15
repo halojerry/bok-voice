@@ -37,6 +37,7 @@ from bok_voice_obs.middleware import CorrelationMiddleware
 from .deps import build_engine, build_repository, build_session_factory
 from .dispatch_utils import cleanup_dispatch, has_active_dispatch
 from .nodes_store import HEARTBEAT_INTERVAL_S, NodeStore
+from .permissions import GRANTABLE_PERMISSIONS, PAGE_PERMISSIONS, effective_permissions
 from .pregen import persona_pregen_status
 from .auth import (
     Identity,
@@ -621,8 +622,57 @@ async def tts_preview(payload: dict, request: Request) -> Response:
 
 
 def _user_public(user: dict) -> dict:
-    """users dict 出仓前剥 password_hash——凭据材料任何情况下不出仓。"""
-    return {k: v for k, v in user.items() if k != "password_hash"}
+    """users dict 出仓形态：剥凭据材料 + 换算出仓权限键。
+
+    password_hash 任何情况下不出仓；B4 的 `permissions_json` 是存储细节（原始串）
+    同样不外泄，出仓键 `permissions` 恒为有效集（见 permissions.effective_permissions）。
+    """
+    out = {k: v for k, v in user.items() if k not in ("password_hash", "permissions_json")}
+    out["permissions"] = effective_permissions(
+        str(user.get("role") or ""), str(user.get("permissions_json") or "")
+    )
+    return out
+
+
+def _gate_page(request: Request, key: str) -> None:
+    """B4 页面权限闸：主管按人配置 user 的可见面，逐请求查库（改权限即时生效）。
+
+    语义（CONTRACT §2）：无身份（auth-off/机器通道）直通；admin/root（token 角色）
+    直通；user → 查库算有效集，缺键 403。用户行的 role 参与计算（行上被提升为
+    admin 的旧 token 也不误杀），行缺失按 '' 兜底=默认集。本闸只判页面面，
+    与 B2 账号闸 / B3 归属闸叠加（本闸先判，逐请求查库改权限即时生效）。
+    """
+    ident = current_identity(request)
+    if ident is None or ident.role in ("admin", "root"):
+        return
+    user = _repo().get_user(ident.user_id) or {}
+    perms = effective_permissions(
+        str(user.get("role") or ident.role), str(user.get("permissions_json") or "")
+    )
+    if key not in perms:
+        raise HTTPException(status_code=403, detail="forbidden")
+
+
+def _permissions_payload(permissions: list[str] | None) -> str:
+    """写入形态：None → ''（默认集）；list → 目录序去重的 JSON 数组串（'[]'=全关）。
+
+    校验（键白名单 / 目标角色）在 `_validate_user_permissions`，调用方先过闸。
+    """
+    if permissions is None:
+        return ""
+    wanted = {str(k) for k in permissions}
+    return json.dumps([k for k in PAGE_PERMISSIONS if k in wanted], ensure_ascii=False)
+
+
+def _validate_user_permissions(target_role: str, permissions: list[str] | None) -> None:
+    """B4 权限写入校验：只对 role=user 目标；键必须 ⊆ grantable（主管专属永不进目录）。"""
+    if permissions is None:
+        return
+    if target_role != "user":
+        raise HTTPException(400, "permissions 仅适用于 role=user 的账号")
+    unknown = sorted({str(k) for k in permissions} - GRANTABLE_PERMISSIONS)
+    if unknown:
+        raise HTTPException(400, f"未知权限键: {', '.join(unknown)}")
 
 
 def _require_user_admin(identity: Identity | None, target_role: str, target_account: str) -> None:
@@ -666,12 +716,19 @@ def auth_me(request: Request) -> dict:
     identity = identity_from_request(request)
     if identity is None:
         raise HTTPException(401, "missing or invalid token")
+    # B4：权限逐请求查库（JWT 只装身份）——主管改权限对已签发 token 即时生效；
+    # 行缺失（删号后旧 token）按 '' 兜底不炸（=默认集，见 permissions.py 模块注释）。
+    user = _repo().get_user(identity.user_id) or {}
     return {
         "user_id": identity.user_id,
         "username": identity.username,
+        "display_name": str(user.get("display_name") or ""),
         "role": identity.role,
         "org_id": identity.org_id,
         "account_id": identity.account_id,
+        "permissions": effective_permissions(
+            str(user.get("role") or identity.role), str(user.get("permissions_json") or "")
+        ),
     }
 
 
@@ -698,6 +755,8 @@ def create_user(req: CreateUserRequest, request: Request) -> dict:
     if len(req.password) < 8:
         raise HTTPException(400, "密码至少 8 位")
     _require_user_admin(identity, req.role, req.account_id)
+    # B4 页面权限：仅 role=user 目标可带，键 ⊆ grantable；缺省=None → 存 ''（默认集）。
+    _validate_user_permissions(req.role, req.permissions)
     if _repo().get_user_by_username(req.username.strip()):
         raise HTTPException(409, "用户名已存在")
     user = _repo().create_user(
@@ -708,6 +767,7 @@ def create_user(req: CreateUserRequest, request: Request) -> dict:
         # admin 建话务员：不传 account 时默认落 admin 本账号。
         account_id=req.account_id or (identity.account_id if identity and identity.role == "admin" else ""),
         display_name=req.display_name,
+        permissions_json=_permissions_payload(req.permissions),
     )
     _audit("user.create", subject_type="user", subject_id=str(user["id"]),
            account_id=str(user.get("account_id") or ""))
@@ -754,6 +814,11 @@ def update_user(user_id: str, req: UpdateUserRequest, request: Request) -> dict:
         fields["display_name"] = req.display_name
     if req.role:
         fields["role"] = req.role
+    if req.permissions is not None:
+        # B4：目标角色取**现存**角色（改角色与改权限同 request 时以旧角色判，
+        # 免一次请求内绕过「permissions 仅限 user 目标」）；None=不改。
+        _validate_user_permissions(str(target.get("role") or ""), req.permissions)
+        fields["permissions_json"] = _permissions_payload(req.permissions)
     updated = _repo().update_user(user_id, **fields)
     _audit("user.update", subject_type="user", subject_id=user_id,
            account_id=str(target.get("account_id") or ""),
@@ -778,7 +843,12 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
     _machine = getattr(request.state, "machine", False)
     if auth_required() and _ident is None and not _machine:
         raise HTTPException(status_code=401, detail="unauthorized")
-    if _ident is not None and _ident.role not in ("root", "admin") and (req.role or "").strip().lower() == "supervisor":
+    if _ident is not None and _ident.role not in ("root", "admin") and (
+        (req.role or "").strip().lower() == "supervisor"
+        # 旁听专线（purpose=listen）同样钉 supervisor 语义——不带 role 字段也
+        # 不得绕过（B4 审计补漏：静默旁听是主管权力，话务员不可自签）。
+        or (req.purpose or "").strip().lower() == "listen"
+    ):
         raise HTTPException(status_code=403, detail="forbidden")
     key = getattr(app.state, "lk_key", "") or os.environ.get("LIVEKIT_API_KEY", "")
     secret = getattr(app.state, "lk_secret", "") or os.environ.get("LIVEKIT_API_SECRET", "")
@@ -856,6 +926,9 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
         _call = _repo().get_call(room) or {}
     except Exception:
         _call = {}
+    # B4 页面权限：A 线通话归 calls 键，同传会话（kind=interpret）归 interpret 键
+    # （与建单同口径）；通话记录缺失（新建流/竞态）按 A 线默认面处理。
+    _gate_page(request, "interpret" if str(_call.get("kind") or "") == "interpret" else "calls")
     # B2 归属：有身份且非 root 时，只能给本账号的通话签房 token（记录缺失保守放行，
     # 沿用 C2 幽灵守卫同口径）。
     if _ident is not None and _ident.role != "root" and _call:
@@ -953,6 +1026,8 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
 
 @app.post("/api/calls")
 def create_call(req: CreateCallRequest, request: Request) -> dict:
+    # B4 页面权限：同传建单（kind=interpret）归 interpret 键，其余客服通话归 calls。
+    _gate_page(request, "interpret" if (req.kind or "").strip() == "interpret" else "calls")
     identity = current_identity(request)
     created_by = ""
     if identity is not None:
@@ -1016,6 +1091,7 @@ def _effective_providers(settings: dict) -> dict:
 
 @app.get("/api/calls")
 def list_calls(request: Request, account_id: str = "acc-001", status: str = "") -> list[dict]:
+    _gate_page(request, "calls")
     account_id = scoped_account(request, account_id)
     calls = _repo().list_calls(account_id, status)
     stats = _repo().turn_stats()
@@ -1446,6 +1522,7 @@ def mark_whatsapp_handled(call_id: str, req: WhatsAppHandledRequest, request: Re
 @app.get("/api/roster")
 def list_roster(request: Request, account_id: str = "acc-001", status: str = "", channel: str = "") -> list[dict]:
     """名册认领池列表；status/channel 空=不过滤。"""
+    _gate_page(request, "roster")
     account_id = scoped_account(request, account_id)
     return _repo().list_roster(account_id, status=status, channel=channel)
 
@@ -1457,6 +1534,7 @@ def roster_claim(entry_id: str, req: RosterClaimRequest, request: Request) -> di
     B2：claimed_by 有身份时取用户名（并修正旧版把 claimed_by 误写进审计
     account 列的用法）；跨账号条目一律 404。
     """
+    _gate_page(request, "roster")
     deny_cross_account(request, _repo().get_roster_entry(entry_id))
     ident = current_identity(request)
     claimed_by = ident.username if ident else req.claimed_by
@@ -1478,6 +1556,7 @@ def roster_unclaim(entry_id: str, request: Request) -> dict:
     claimed_at 必须传空串（repo 契约 None=不修改、""=清空）——空串在双后端
     都映射回「未认领」的读侧契约（SQL 存 NULL / InMemory 存 ""，读侧都渲染 ""）。
     """
+    _gate_page(request, "roster")
     deny_cross_account(request, _repo().get_roster_entry(entry_id))
     entry = _repo().update_roster_entry(entry_id, status="unclaimed", claimed_by="", claimed_at="")
     if not entry:
@@ -1495,6 +1574,7 @@ def roster_handled(entry_id: str, req: RosterHandledRequest, request: Request) -
     false → 名册回 unclaimed，通话按有无号码回 captured/offered。
     来源通话缺失/已删除不阻塞名册状态变更。
     """
+    _gate_page(request, "roster")
     deny_cross_account(request, _repo().get_roster_entry(entry_id))
     entry = _repo().get_roster_entry(entry_id)
     if not entry:
@@ -1557,6 +1637,7 @@ def create_campaign(req: CampaignCreateRequest, request: Request) -> dict:
     scripts 同样清洗成 `dict[str, list[str]]`（Pydantic 已保证形状，这里只剔
     空白句并丢空数组，免得 dial 块带一堆空串）。
     """
+    _gate_page(request, "campaigns")
     identity = current_identity(request)
     if identity is not None and identity.role != "root":
         # 话务员/主管建波强制落本账号（root 可显式指定）。
@@ -1587,6 +1668,7 @@ def create_campaign(req: CampaignCreateRequest, request: Request) -> dict:
 @app.get("/api/campaigns")
 def list_campaigns(request: Request, account_id: str = "acc-001") -> list[dict]:
     """战役列表，每条带 progress 汇总（列表页免二次请求）。"""
+    _gate_page(request, "campaigns")
     account_id = scoped_account(request, account_id)
     out = []
     for camp in _repo().list_campaigns(account_id):
@@ -1598,6 +1680,7 @@ def list_campaigns(request: Request, account_id: str = "acc-001") -> list[dict]:
 @app.get("/api/campaigns/{campaign_id}")
 def get_campaign(campaign_id: str, request: Request) -> dict:
     """战役详情：campaign + items + progress。"""
+    _gate_page(request, "campaigns")
     camp = deny_cross_account(request, _repo().get_campaign(campaign_id))
     if not camp:
         raise HTTPException(404, "campaign not found")
@@ -1627,6 +1710,7 @@ def campaign_stop(campaign_id: str, request: Request) -> dict:
 
 def _campaign_transition(request: Request, campaign_id: str, status: str) -> dict:
     """战役状态机唯一入口（三个启停端点共用），非法迁移 409、未找到 404。"""
+    _gate_page(request, "campaigns")
     camp = deny_cross_account(request, _repo().get_campaign(campaign_id))
     if not camp:
         raise HTTPException(404, "campaign not found")
@@ -1644,6 +1728,7 @@ def _campaign_transition(request: Request, campaign_id: str, status: str) -> dic
 @app.delete("/api/campaigns/{campaign_id}")
 def delete_campaign(campaign_id: str, request: Request) -> dict:
     """删战役（含名单项）。running 拒删（409）——先停止再删，防误删在跑波次。"""
+    _gate_page(request, "campaigns")
     camp = deny_cross_account(request, _repo().get_campaign(campaign_id))
     if not camp:
         raise HTTPException(404, "campaign not found")
@@ -2074,12 +2159,15 @@ async def settle(call_id: str, request: Request) -> dict:
 
 @app.get("/api/objects")
 def list_objects(request: Request, account_id: str = "acc-001") -> list[dict]:
+    # B4 页面权限：对象读面归 objects 键（写面下面三个端点仍是 admin/root）。
+    _gate_page(request, "objects")
     account_id = scoped_account(request, account_id)
     return _repo().list_objects(account_id)
 
 
 @app.get("/api/objects/{object_id}")
 def get_object(object_id: str, request: Request) -> dict:
+    _gate_page(request, "objects")
     deny_cross_account(request, _repo().get_object(object_id))
     obj = _repo().get_object(object_id)
     if not obj:
@@ -2169,6 +2257,8 @@ def list_qa_entries(request: Request, account_id: str = "acc-001", enabled: int 
     # QA 库话务员可读可编辑（页面矩阵），按账号收窄；B3 owner 维度：user=自己的+共享
     # （owner_scope_filter 强制本人），admin/root/无身份不过滤；机器通道显式传
     # owner_scope=建单人（agent 装配线），''=仅共享（战役等无主通话）。
+    # B4 页面权限归 qa 键（hit 端点不在此闸：agent 机器通道）。
+    _gate_page(request, "qa")
     account_id = scoped_account(request, account_id)
     return _repo().list_qa_entries(
         account_id, enabled=None if enabled is None else bool(enabled),
@@ -2178,6 +2268,7 @@ def list_qa_entries(request: Request, account_id: str = "acc-001", enabled: int 
 
 @app.post("/api/qa-entries")
 def create_qa_entry(req: QaEntryCreate, request: Request) -> dict:
+    _gate_page(request, "qa")
     identity = current_identity(request)
     if identity is not None and identity.role != "root":
         # B3：user 建的自动归自己（body 的 owner 无效）；admin 建默认共享、可显式指派。
@@ -2193,6 +2284,7 @@ def create_qa_entry(req: QaEntryCreate, request: Request) -> dict:
 
 @app.patch("/api/qa-entries/{entry_id}")
 def update_qa_entry(entry_id: str, req: QaEntryPatch, request: Request) -> dict:
+    _gate_page(request, "qa")
     deny_foreign_owner(request, deny_cross_account(request, _repo().get_qa_entry(entry_id)), edit=True)
     patch = {k: v for k, v in req.model_dump().items() if v is not None}
     # 所有权转移只归 admin/root——user 的 patch 剥掉。
@@ -2210,6 +2302,7 @@ def update_qa_entry(entry_id: str, req: QaEntryPatch, request: Request) -> dict:
 
 @app.delete("/api/qa-entries/{entry_id}")
 def delete_qa_entry(entry_id: str, request: Request) -> dict:
+    _gate_page(request, "qa")
     deny_foreign_owner(request, deny_cross_account(request, _repo().get_qa_entry(entry_id)), edit=True)
     ok = _repo().delete_qa_entry(entry_id)
     _audit("qa_entry.delete", subject_type="qa_entry", subject_id=entry_id, outcome="ok" if ok else "not_found")
@@ -2258,7 +2351,8 @@ def report_qa_pairs(
     报告要干净(2026-09-09 实测 top20 高频里 16 条是测试 fixture 音频);
     显式传 false 看全量。
     """
-    require_role(request, "admin", "root")
+    # B4：报表面归 reports 键（主管默认关、可按人开），替换原 admin/root 角色闸。
+    _gate_page(request, "reports")
     account_id = scoped_account(request, account_id)
     conversations = _repo().iter_call_conversations(account_id, exclude_test_objects=exclude_test)
     return mine_qa_pairs(conversations, min_calls=min_calls, limit=limit)
@@ -2336,12 +2430,14 @@ def delete_persona(persona_id: str, request: Request) -> dict:
 @app.get("/api/templates")
 def list_templates(request: Request, account_id: str = "acc-001", owner_scope: str | None = None) -> list[dict]:
     # B3 owner 维度同 qa-entries：user=自己的+共享，admin/root/无身份不过滤。
+    _gate_page(request, "templates")
     account_id = scoped_account(request, account_id)
     return _repo().list_templates(account_id, owner_scope=owner_scope_filter(request, owner_scope))
 
 
 @app.get("/api/templates/{template_id}")
 def get_template(template_id: str, request: Request) -> dict:
+    _gate_page(request, "templates")
     tpl = deny_foreign_owner(request, deny_cross_account(request, _repo().get_template(template_id)))
     if not tpl:
         raise HTTPException(404, "template not found")
@@ -2350,6 +2446,7 @@ def get_template(template_id: str, request: Request) -> dict:
 
 @app.post("/api/templates")
 def create_template(req: TemplateRequest, request: Request) -> dict:
+    _gate_page(request, "templates")
     identity = current_identity(request)
     if identity is not None and identity.role != "root":
         # 话务员建话术落本账号；B3：user 建的自动归自己，admin 建默认共享、可显式指派。
@@ -2365,6 +2462,7 @@ def create_template(req: TemplateRequest, request: Request) -> dict:
 
 @app.put("/api/templates/{template_id}")
 def update_template(template_id: str, req: UpdateTemplateRequest, request: Request) -> dict:
+    _gate_page(request, "templates")
     before = deny_foreign_owner(request, deny_cross_account(request, _repo().get_template(template_id)), edit=True)
     if not before:
         raise HTTPException(404, "template not found")
@@ -2402,12 +2500,14 @@ def update_template(template_id: str, req: UpdateTemplateRequest, request: Reque
 
 @app.get("/api/templates/{template_id}/revisions")
 def template_revisions(template_id: str, request: Request) -> list[dict]:
+    _gate_page(request, "templates")
     deny_foreign_owner(request, deny_cross_account(request, _repo().get_template(template_id)))
     return _repo().list_template_revisions(template_id)
 
 
 @app.delete("/api/templates/{template_id}")
 def delete_template(template_id: str, request: Request) -> dict:
+    _gate_page(request, "templates")
     tpl = deny_foreign_owner(request, deny_cross_account(request, _repo().get_template(template_id)), edit=True)
     if not _repo().delete_template(template_id):
         raise HTTPException(404, "template not found")
@@ -2426,7 +2526,7 @@ def active_calls(request: Request) -> list[dict]:
 
 @app.get("/api/reports/summary")
 def reports_summary(request: Request, account_id: str = "acc-001") -> dict:
-    require_role(request, "admin", "root")
+    _gate_page(request, "reports")
     account_id = scoped_account(request, account_id)
     calls = _repo().list_calls(account_id, "")
     turns_total = 0
@@ -2449,20 +2549,21 @@ def reports_summary(request: Request, account_id: str = "acc-001") -> dict:
 
 @app.get("/api/reports/calls")
 def reports_calls(request: Request, account_id: str = "acc-001") -> list[dict]:
-    require_role(request, "admin", "root")
+    _gate_page(request, "reports")
     return _repo().list_calls(scoped_account(request, account_id), "")
 
 
 @app.get("/api/insights")
 def list_insights(request: Request) -> list[dict]:
     """全局洞察（结算时 Summarizer 蒸馏产出，跨对象共性的观察）。"""
-    require_role(request, "admin", "root")
+    _gate_page(request, "reports")
     return _repo().list_global_insights(kind="insight")
 
 
 @app.get("/api/objects/{object_id}/topics")
 def list_object_topics(object_id: str, request: Request) -> list[dict]:
     """对象历史主题（结算时 Summarizer 蒸馏产出并 append 到该对象）。"""
+    _gate_page(request, "objects")
     deny_cross_account(request, _repo().get_object(object_id))
     return _repo().list_object_topics(object_id)
 
@@ -2659,7 +2760,7 @@ async def livekit_webhook(request: Request) -> dict:
 
 @app.get("/api/reports/script-insights")
 def script_insights(request: Request, account_id: str = "acc-001", limit: int = 10) -> dict:
-    require_role(request, "admin", "root")
+    _gate_page(request, "reports")
     account_id = scoped_account(request, account_id)
     """话术优化分析视图（知识库=全局分析数据层）:高频问题 TOP N + 通话/轮次统计。"""
     from collections import Counter
@@ -2689,7 +2790,7 @@ def script_insights(request: Request, account_id: str = "acc-001", limit: int = 
 
 @app.get("/api/reports/distill-health")
 def distill_health(request: Request, account_id: str = "acc-001", limit: int = 10) -> dict:
-    require_role(request, "admin", "root")
+    _gate_page(request, "reports")
     account_id = scoped_account(request, account_id)
     """蒸馏健康度（审计事件 settle.distill_empty 由 #23 铺设,本端点出报表口径）。"""
     calls = _repo().list_calls(account_id, "")
@@ -2711,6 +2812,7 @@ def distill_health(request: Request, account_id: str = "acc-001", limit: int = 1
 
 @app.get("/api/objects/{object_id}/digest")
 def get_object_digest(object_id: str, request: Request) -> dict:
+    _gate_page(request, "objects")
     obj = deny_cross_account(request, _repo().get_object(object_id))
     if not obj:
         raise HTTPException(404, "object not found")
@@ -2719,7 +2821,7 @@ def get_object_digest(object_id: str, request: Request) -> dict:
 
 @app.get("/api/reports/usage")
 def reports_usage(request: Request, account_id: str = "acc-001") -> dict:
-    require_role(request, "admin", "root")
+    _gate_page(request, "reports")
     account_id = scoped_account(request, account_id)
     calls = _repo().list_calls(account_id, "")
     # 真实用量优先：官方 SessionReport 的逐模型 input/output tokens；

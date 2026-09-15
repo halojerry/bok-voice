@@ -384,6 +384,8 @@ class User(Base):
     display_name: Mapped[str] = mapped_column(String(255), default="")
     role: Mapped[str] = mapped_column(String(16), default="user")  # root/admin/user
     status: Mapped[str] = mapped_column(String(16), default="active")  # active/disabled
+    # B4 页面权限：JSON 数组串（''=默认集，读侧见 control_plane/permissions.py）。
+    permissions_json: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 

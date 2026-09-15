@@ -127,6 +127,13 @@
   卡片展示 对象/语言/当前话术步/已进行时长/最近一句客户话（`/api/calls/{id}/turns` 的
   template_step/speaker，3–4s 轮询只跑在途通话）；「进入工作台」深链 `/calls?call=<id>`；
   原「质量监控/纪律控制」占位卡已删。
+- **登录与权限分面（B4，2026-09-14）**：`/login` 登录（localStorage `bok_token`，
+  api.ts 自动附 Bearer、401 跳登录页）；**无 token=匿名本地模式**（全部页面+acc-001，
+  单机 auth-off 现状零变化）。SessionProvider 拉 `/api/auth/me`（含 `permissions`
+  有效集）；导航按权限过滤（user=8 键目录 ∩ 本人权限，主管专属面 admin 可见），
+  路由守卫 `gateForPath`（无权面板）。`/users` 员工管理（admin 建号/启停/重置密码/
+  按人勾选 8 权限键）；`/qa` 快答库页（B3 owner 分档）；话术页归属徽标。
+  后端 `_gate_page` 逐请求查库——主管改权限对在线 token 即时生效。
 
 ### 外呼战役（mock 档，spec 2026-09-12-outbound-campaign-roster）
 
