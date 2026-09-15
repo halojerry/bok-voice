@@ -201,6 +201,9 @@ def _startup() -> None:
     engine = build_engine()
     app.state.repo = build_repository(engine)
     app.state.node_store = NodeStore(engine)  # 与 repo 同一 engine；None → 内存双模
+    # token 生命周期（2026-09-16 深测 P2）：identity_gate 解码后按 sub 查库——
+    # 禁用/删号立即 401、role 以库为准（降权即时生效），不再吃满 8h TTL。
+    app.state.user_lookup = lambda user_id: _repo().get_user(user_id)
     app.state.session_factory = build_session_factory(engine)
     app.state.lk_key = os.environ.get("LIVEKIT_API_KEY", "")
     app.state.lk_secret = os.environ.get("LIVEKIT_API_SECRET", "")

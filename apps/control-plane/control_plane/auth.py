@@ -264,6 +264,15 @@ async def identity_gate(request: Request, call_next):
         identity = decode_token(token)
     except HTTPException:
         return _unauthorized()
+    lookup = getattr(getattr(request, "app", None), "state", None)
+    lookup = getattr(lookup, "user_lookup", None) if lookup is not None else None
+    if lookup is not None:
+        row = lookup(identity.user_id) or {}
+        if not row or str(row.get("status") or "") != "active":
+            # 禁用/删号的旧 token 立即失效（此前最长 8h TTL 内照常全权调用）。
+            return _unauthorized()
+        # 角色以库为准：降权（admin→user）即时生效，require_role 不再信过期 claim。
+        identity.role = str(row.get("role") or identity.role)
     request.state.identity = identity
     # 覆写 correlation.user_id（保留 CorrelationMiddleware 已设的其余字段）——
     # 审计 to_dict 的 actor 由此自动落成已验证身份。
