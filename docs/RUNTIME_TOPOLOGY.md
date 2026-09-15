@@ -428,3 +428,7 @@ WorkerOptions.port)——默认同为 8081 会竞态,后绑者 Errno 48 即崩
 2. `python tools/bok.py doctor --packaged` — 结构/依赖/硬件体检
 3. app-data/logs/*.log — 各服务日志；app-data/audit/*.jsonl — 审计
 4. bundle 只读：任何试图写 bundle 的路径都要改到 app-data
+
+## 云端部署（P1，宝塔/Docker 主机）
+
+`deploy/cloud/` 是云侧唯一部署物：单容器（GHCR `ghcr.io/halojerry/bok-voice:latest`，CI 产出）+ Supabase 业务库 + vault 命名卷。操作 runbook（含宝塔导入/升级/HTTPS 反代/备份）见 `deploy/cloud/README.md`；首次启动 `build_engine()` 幂等迁移自动建表（无需手工 SQL）。CI 门禁：`compose-rehearsal.yml`（宝塔导入路径永远有效）+ `schema-drift.yml`（schema 产物与代码零漂移）。节点接入见 `scripts/install-node.sh`（license 流）与 `docs/NODE_PACKAGING.md`（node-agent 二进制）。
