@@ -119,3 +119,58 @@ def test_token_supervisor_identity_prefix_blocked_for_user(monkeypatch):
         # operator 正常签发不受影响
         assert client.post("/api/token", json={"call_id": call_id},
                            headers=peon).status_code == 201
+
+
+def _sign_webhook(body: bytes, secret: str) -> str:
+    import hashlib
+    import time
+
+    import jwt as pyjwt
+
+    now = int(time.time())
+    return pyjwt.encode({
+        "iss": "devkey", "sub": "devkey", "iat": now, "nbf": now - 5, "exp": now + 300,
+        "video": {"webhook": True},
+        "sha256": hashlib.sha256(body).hexdigest(),
+    }, secret, algorithm="HS256")
+
+
+def test_livekit_webhook_requires_valid_signature(monkeypatch):
+    from control_plane import main as cp_main
+
+    monkeypatch.setenv("LIVEKIT_API_SECRET", "whsec-test-0123456789abcdef")
+    # app 是模块级单例：同会话先跑的 startup（_startup 直调或 with client）会把
+    # env 快照进 app.state.lk_secret，只改 env 骗不过验签闸——同步钉 state。
+    monkeypatch.setattr(cp_main.app.state, "lk_secret",
+                        "whsec-test-0123456789abcdef", raising=False)
+    client, repo = _make(monkeypatch)
+    payload = {"event": "participant_left", "room": {"name": "call-x"},
+               "participant": {"identity": "bok-voice"}}
+    # 无签名 → 401（旧版 200 handled:true）
+    r = client.post("/api/webhook/livekit", json=payload)
+    assert r.status_code == 401, r.text
+    # 错误签名 → 401
+    r = client.post("/api/webhook/livekit", json=payload,
+                    headers={"Authorization": "Bearer not-a-jwt"})
+    assert r.status_code == 401
+    # 正确签名 → 200
+    import json as _json
+
+    raw = _json.dumps(payload).encode()
+    r = client.post("/api/webhook/livekit", content=raw,
+                    headers={"Authorization": "Bearer " + _sign_webhook(raw, "whsec-test-0123456789abcdef"),
+                             "Content-Type": "application/json"})
+    assert r.status_code == 200, r.text
+
+
+def test_livekit_webhook_open_when_no_secret(monkeypatch):
+    from control_plane import main as cp_main
+
+    monkeypatch.delenv("LIVEKIT_API_SECRET", raising=False)
+    # 同上：清掉兄弟测试 startup 留下的 state 快照，env 兜底才会生效。
+    monkeypatch.delattr(cp_main.app.state, "lk_secret", raising=False)
+    client, repo = _make(monkeypatch)
+    r = client.post("/api/webhook/livekit", json={"event": "participant_left",
+                                                  "room": {"name": "call-x"},
+                                                  "participant": {"identity": "bok-voice"}})
+    assert r.status_code == 200  # 本地无 LiveKit 联调形态保持可用
