@@ -1335,7 +1335,10 @@ def cmd_doctor() -> int:
 
     # 本地语义端点判定(LiveKit turn-detector v1-mini):缺失时端点判定退回纯 VAD,
     # 客户思考停顿更容易被提前截断。粤(cantonese)语无官方校准,阈值回退英文档。
-    eot_ok = _import_ok(py, "livekit_local_inference") if py.exists() else False
+    # import 名是 livekit.local_inference(命名空间包)——pip 名 livekit-local-inference
+    # 的下划线拼法不是模块路径,v0.2.0 首次 tag 流水线即被此假 MISSING 判死(mac
+    # verify 挂 31 分钟后 FAIL,2026-09-15 实证)。
+    eot_ok = _import_ok(py, "livekit.local_inference") if py.exists() else False
     print(f"local EOT inference (turn-detector v1-mini): {'ok' if eot_ok else 'MISSING(退回纯 VAD 端点)'}")
     if packaged and not eot_ok:
         fails.append("livekit-local-inference missing (EOT 退回纯 VAD)")
