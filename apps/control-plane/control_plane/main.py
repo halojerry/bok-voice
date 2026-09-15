@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import io
 import json
 import os
@@ -134,7 +135,11 @@ async def optional_bearer_auth(request: Request, call_next):
         # 特权数据全在 /api/* 后面）。
         static_get = (request.method in ("GET", "HEAD")
                       and not request.url.path.startswith("/api/"))
-        if not static_get and request.headers.get("authorization", "") != f"Bearer {expected}":
+        provided = request.headers.get("authorization", "")
+        if not static_get and not (
+            provided.startswith("Bearer ")
+            and hmac.compare_digest(provided[7:].strip(), expected)
+        ):
             return Response(status_code=401, content=b'{"detail":"unauthorized"}',
                              media_type="application/json")
     return await call_next(request)
