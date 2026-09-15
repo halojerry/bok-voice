@@ -1602,8 +1602,15 @@ def roster_claim(entry_id: str, req: RosterClaimRequest, request: Request) -> di
     account 列的用法）；跨账号条目一律 404。
     """
     _gate_page(request, "roster")
-    deny_cross_account(request, _repo().get_roster_entry(entry_id))
+    entry = deny_cross_account(request, _repo().get_roster_entry(entry_id))
+    if not entry:
+        raise HTTPException(404, "roster entry not found")
     ident = current_identity(request)
+    holder = str(entry.get("claimed_by") or "")
+    if holder and ident is not None and ident.role == "user" and holder != ident.username:
+        # 认领保护（深测 P3）：话务员只能认领无人/自己持有的条目；403 而非 404
+        # ——认领人本就在同账号名册池可见，无存在性泄露。主管/机器通道不受限。
+        raise HTTPException(403, "claimed by another operator")
     claimed_by = ident.username if ident else req.claimed_by
     entry = _repo().update_roster_entry(
         entry_id, status="claimed", claimed_by=claimed_by,
@@ -1624,7 +1631,13 @@ def roster_unclaim(entry_id: str, request: Request) -> dict:
     都映射回「未认领」的读侧契约（SQL 存 NULL / InMemory 存 ""，读侧都渲染 ""）。
     """
     _gate_page(request, "roster")
-    deny_cross_account(request, _repo().get_roster_entry(entry_id))
+    entry = deny_cross_account(request, _repo().get_roster_entry(entry_id))
+    if not entry:
+        raise HTTPException(404, "roster entry not found")
+    ident = current_identity(request)
+    holder = str(entry.get("claimed_by") or "")
+    if holder and ident is not None and ident.role == "user" and holder != ident.username:
+        raise HTTPException(403, "claimed by another operator")
     entry = _repo().update_roster_entry(entry_id, status="unclaimed", claimed_by="", claimed_at="")
     if not entry:
         raise HTTPException(404, "roster entry not found")
@@ -2713,8 +2726,16 @@ def list_filler_entries(request: Request, account_id: str = "acc-001", enabled: 
 
 
 @app.post("/api/fillers/{entry_id}/hit")
-def hit_filler_entry(entry_id: str) -> dict:
-    """agent 垫话罐头命中计数(fire-and-forget,幂等无副作用)。"""
+def hit_filler_entry(entry_id: str, request: Request) -> dict:
+    """agent 垫话罐头命中计数(fire-and-forget,幂等无副作用)。
+
+    2026-09-16 深测 P3：旧版完全无闸（对照 qa hit 有 deny_cross_account）——
+    经列表全量反查目标条目后走同一 404 口径；qa 键页面闸兜匿名刷计数。
+    """
+    _gate_page(request, "qa")
+    entry = next((e for e in _repo().list_filler_entries("")
+                  if str(e.get("id") or "") == entry_id), None)
+    deny_cross_account(request, entry)
     _repo().incr_filler_hit(entry_id)
     return {"id": entry_id}
 
@@ -2951,8 +2972,9 @@ def reports_calls(request: Request, account_id: str = "acc-001") -> list[dict]:
 
 @app.get("/api/insights")
 def list_insights(request: Request) -> list[dict]:
-    """全局洞察（结算时 Summarizer 蒸馏产出，跨对象共性的观察）。"""
-    _gate_page(request, "reports")
+    """全局洞察（结算蒸馏产出）。跨账号内容（GlobalInsight 无 account 维度，
+    深测 P2）→ 收管理面；账号维度化留待 schema 加列（见计划尾部延后项）。"""
+    require_role(request, "admin", "root")
     return _repo().list_global_insights(kind="insight")
 
 
@@ -3296,8 +3318,9 @@ def list_audit(request: Request, account_id: str = "", action: str = "", call_id
 
 
 @app.get("/api/setup")
-def setup_status() -> dict:
+def setup_status(request: Request) -> dict:
     """Report first-run model readiness for the desktop setup wizard."""
+    require_role(request, "admin", "root")
     try:
         import subprocess
 
@@ -3314,8 +3337,9 @@ def setup_status() -> dict:
 
 
 @app.post("/api/setup/download")
-def setup_download() -> dict:
+def setup_download(request: Request) -> dict:
     """Trigger model download (best-effort; UI polls /api/setup for progress)."""
+    require_role(request, "admin", "root")
     try:
         import subprocess
 
@@ -3326,6 +3350,7 @@ def setup_download() -> dict:
             stderr=subprocess.DEVNULL,
             cwd=str(root),
         )
+        _audit("setup.download", subject_type="global_settings", subject_id="models")
         return {"started": True}
     except Exception as exc:
         return {"started": False, "error": str(exc)}
