@@ -26,6 +26,29 @@ async function toError(res: Response): Promise<Error> {
   return new Error(detail ? `${res.status} ${detail}` : `${res.status} ${res.statusText}`);
 }
 
+/**
+ * 鉴权请求头（B4 契约 §4）：localStorage 存在 `bok_token` 时附 Bearer 头。
+ * 无 token / 服务端渲染（静态导出预渲染）一律返回空表——本函数只在客户端生效。
+ */
+export function authHeaders(): Record<string, string> {
+  if (typeof window === "undefined") return {};
+  const token = window.localStorage.getItem("bok_token");
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+/**
+ * 401 统一处理（契约 §4）：清 token 并硬跳登录页。
+ * 豁免口一：/api/auth/*（登录失败、me() 探测要留在原页展示错误）；
+ * 豁免口二：已经在登录页时不重复跳转（避免刷新循环）。
+ */
+function handleUnauthorized(path: string) {
+  if (typeof window === "undefined") return;
+  if (path.startsWith("/api/auth/")) return;
+  if (window.location.pathname.startsWith("/login")) return;
+  window.localStorage.removeItem("bok_token");
+  window.location.href = "/login/";
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   // correlation 透传:前端生成 request_id,audit 行可与前端动作对账;
   // call_id 由调用方在 headers 显式带(init.headers 里已有则不覆盖)。
@@ -33,12 +56,16 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "X-Request-ID": crypto.randomUUID(),
+    ...authHeaders(),
   };
   extra.forEach((v, k) => {
     headers[k] = v;
   });
   const res = await fetch(`${apiBase()}${path}`, { ...init, headers });
-  if (!res.ok) throw await toError(res);
+  if (!res.ok) {
+    if (res.status === 401) handleUnauthorized(path);
+    throw await toError(res);
+  }
   return res.json() as Promise<T>;
 }
 
@@ -50,14 +77,15 @@ export const api = {
   listTtsVoices: () => request<Record<string, unknown>[]>("/api/tts/voices"),
   deleteTtsVoice: (voiceId: string) => request<Record<string, unknown>>(`/api/tts/voices/${encodeURIComponent(voiceId)}`, { method: "DELETE" }),
   registerTtsVoice: (body: FormData) =>
-    fetch(`${apiBase()}/api/tts/voices`, { method: "POST", body }).then(async (res) => {
+    // FormData 不能手写 Content-Type（边界由浏览器生成），只补鉴权头。
+    fetch(`${apiBase()}/api/tts/voices`, { method: "POST", body, headers: authHeaders() }).then(async (res) => {
       if (!res.ok) throw await toError(res);
       return res.json() as Promise<Record<string, unknown>>;
     }),
   previewTts: async (body: { text: string; voice?: string; language?: string; instruct?: string; sample_rate?: number; provider?: string }) => {
     const res = await fetch(`${apiBase()}/api/tts/preview`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify(body),
     });
     if (!res.ok) throw await toError(res);
@@ -67,6 +95,31 @@ export const api = {
   // 由调用方直接 fetch blob,不经 JSON request)。
   listQaEntries: (enabled = 1) =>
     request<Record<string, unknown>[]>(`/api/qa-entries?enabled=${enabled}`),
+  // ---- B4 会话/权限/员工管理（契约预埋，见 .superpowers/sdd/2026-09-14-b4-permissions/CONTRACT.md） ----
+  login: (username: string, password: string) =>
+    request<{ token: string } & Record<string, unknown>>("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    }),
+  me: () => request<SessionInfo>("/api/auth/me"),
+  changeMyPassword: (oldPassword: string, newPassword: string) =>
+    request<Record<string, unknown>>("/api/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }),
+    }),
+  // 后端返回 {"users": [...]} 信封（B1 形状），此处解包成数组供消费方直用。
+  listUsers: () => request<{ users?: UserRow[] }>("/api/users").then((r) => r.users ?? []),
+  createUser: (body: { username: string; password: string; role?: string; display_name?: string; permissions?: string[] }) =>
+    request<UserRow>("/api/users", { method: "POST", body: JSON.stringify(body) }),
+  updateUser: (id: string, body: { password?: string; status?: string; display_name?: string; permissions?: string[] }) =>
+    request<UserRow>(`/api/users/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  // 快答库管理 CRUD（B3 owner 语义：user 只改自己的，共享=admin/root；hit 走 agent 通道不在此）。
+  listQaAll: (accountId = "acc-001") =>
+    request<Record<string, unknown>[]>(`/api/qa-entries?account_id=${encodeURIComponent(accountId)}`),
+  createQa: (body: unknown) => request<Record<string, unknown>>("/api/qa-entries", { method: "POST", body: JSON.stringify(body) }),
+  patchQa: (id: string, body: unknown) =>
+    request<Record<string, unknown>>(`/api/qa-entries/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  deleteQa: (id: string) => request<Record<string, unknown>>(`/api/qa-entries/${id}`, { method: "DELETE" }),
   getSettings: () => request<Record<string, unknown>>("/api/settings"),
   saveSettings: (body: unknown) => request<Record<string, unknown>>("/api/settings", { method: "PUT", body: JSON.stringify(body) }),
   // 官方 TokenSourceResponse 契约({serverUrl, participantToken});TokenSource
@@ -158,7 +211,7 @@ export const api = {
       `/api/audit?account_id=${encodeURIComponent(accountId)}&action=${encodeURIComponent(action)}&call_id=${encodeURIComponent(callId)}`,
     ),
   setupStatus: () => request<SetupStatus>("/api/setup"),
-  setupDownload: () => fetch(`${apiBase()}/api/setup/download`, { method: "POST" }).then(async (res) => {
+  setupDownload: () => fetch(`${apiBase()}/api/setup/download`, { method: "POST", headers: authHeaders() }).then(async (res) => {
     if (!res.ok) throw await toError(res);
     return res.json() as Promise<{ started: boolean }>;
   }),
@@ -176,4 +229,28 @@ export type SetupStatus = {
   ready: boolean;
   models: SetupModelStatus[];
   error?: string;
+};
+
+// ---- B4 会话与权限类型（契约预埋） ----
+export type SessionInfo = {
+  user_id: string;
+  username: string;
+  display_name?: string;
+  role: "root" | "admin" | "user";
+  org_id?: string;
+  account_id: string;
+  /** 有效权限键（目录 8 键，见 CONTRACT.md；admin/root=全部 grantable） */
+  permissions: string[];
+};
+
+export type UserRow = {
+  id: string;
+  username: string;
+  display_name?: string;
+  role: string;
+  status: string;
+  account_id?: string;
+  /** 有效权限（user 角色）；admin/root 为全部 grantable 键 */
+  permissions?: string[];
+  created_at?: string;
 };
