@@ -9,6 +9,7 @@ P0 职责：①向云 CP 心跳上报（失联 ≥max_missed 置 refuse_jobs 旗
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import subprocess
@@ -130,13 +131,10 @@ def ensure_token(cp_url: str, license_key: str, fingerprint: str,
         print(f"[node-agent] cached token rejected ({code}) — re-registering", flush=True)
     node_id, token = register_once(cp_url, license_key, fingerprint)
     state_file.parent.mkdir(parents=True, exist_ok=True)
-    state_file.write_text(
-        json.dumps({"node_id": node_id, "node_token": token}, ensure_ascii=False),
-        encoding="utf-8")
-    try:
-        os.chmod(state_file, 0o600)  # token=本机凭据，仅属主可读
-    except OSError:
-        pass
+    # 先 0600 建档再写（write_text+chmod 有 0644 窗口）：token=本机凭据。
+    fd = os.open(str(state_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"node_id": node_id, "node_token": token}, ensure_ascii=False))
     print(f"[node-agent] registered as {node_id} (state -> {state_file})", flush=True)
     return token
 
@@ -152,6 +150,15 @@ def heartbeat_once(cfg: NodeConfig, metrics: dict | None = None) -> tuple[bool, 
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return True, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        # 401/403 带 body（detail=unknown node token / node revoked / license revoked /
+        # not licensed…）——返回 body 供 heartbeat_tick 自愈判定（2026-09-16 深测 P2-7）。
+        try:
+            detail = json.loads(exc.read().decode())
+        except Exception:  # noqa: BLE001
+            detail = {}
+        print(f"[node-agent] heartbeat failed: {exc!r} {detail}", flush=True)
+        return False, detail
     except Exception as exc:  # 失联不抛——计数交给调用方
         print(f"[node-agent] heartbeat failed: {exc!r}", flush=True)
         return False, {}
@@ -173,11 +180,36 @@ def write_ui_config(out_dir: Path, cp_url: str, livekit_url: str) -> Path:
     return target
 
 
-def heartbeat_loop(cfg: NodeConfig, stop: threading.Event) -> None:
+# token 失效的自愈判定：CP 心跳 401 的 wire detail（nodes_store/main.py）。
+#   "license_required" 是 CP 内部 reason 键，线上 detail 实为
+#   "node not licensed (hardened mode)"——一并按字面收录。
+_TOKEN_DEAD_DETAILS = ("unknown node token", "revoked", "license_required", "not licensed")
+
+
+def heartbeat_tick(cfg: NodeConfig, missed: int, *, license_key: str = "",
+                   state_file: Path | None = None) -> int:
+    """单次心跳；token 失效且带 license 流 → 同 (license,fingerprint) 幂等重注册
+    自愈（2026-09-16 深测 P2：单请求顶掉真机后旧版 REFUSE_JOBS 挂到人工重启）。
+    被克隆顶掉的场景双方互踢，官方指纹靠 60s 周期最终抢回——每轮至多一次重注册，
+    无风暴。返回新 missed 计数。"""
+    ok, body = heartbeat_once(cfg, metrics={"missed": missed})
+    if not ok and license_key and state_file is not None:
+        detail = str((body or {}).get("detail") or "")
+        if any(mark in detail for mark in _TOKEN_DEAD_DETAILS):
+            try:
+                cfg.node_token = ensure_token(cfg.cp_url, license_key, cfg.fingerprint, state_file)
+                ok, _ = heartbeat_once(cfg, metrics={"missed": 0})  # 新 token 立即复跳确认
+                return 0 if ok else 1
+            except SystemExit as exc:
+                print(f"[node-agent] re-register failed: {exc}", flush=True)
+    return 0 if ok else missed + 1
+
+
+def heartbeat_loop(cfg: NodeConfig, stop: threading.Event, *,
+                   license_key: str = "", state_file: Path | None = None) -> None:
     missed = 0
     while not stop.wait(cfg.heartbeat_interval_s):
-        ok, _ = heartbeat_once(cfg, metrics={"missed": missed})
-        missed = 0 if ok else missed + 1
+        missed = heartbeat_tick(cfg, missed, license_key=license_key, state_file=state_file)
         if should_refuse_jobs(missed, cfg.max_missed):
             print(f"[node-agent] missed={missed} >= {cfg.max_missed}: REFUSE_JOBS (L1)", flush=True)
 
@@ -187,8 +219,9 @@ def main(argv=None) -> int:
     ap.add_argument("--cp-url", required=True)
     ap.add_argument("--node-token", default="",
                     help="直接给 token（预签发/旧流程）；与 --license-key 二选一")
-    ap.add_argument("--license-key", default="",
-                    help="license 流：自动注册（同机幂等复用 node_id），token 落状态文件")
+    ap.add_argument("--license-key", default=os.environ.get("BOK_LICENSE_KEY", ""),
+                    help="license 流：自动注册（同机幂等复用 node_id），token 落状态文件；"
+                         "缺省回退 BOK_LICENSE_KEY env（键不走 argv——ps/history 可见）")
     ap.add_argument("--state-file", default="",
                     help="license 流 token 状态文件（默认 ~/.bok/node-state.json，chmod 600）")
     ap.add_argument("--name", default="", help="节点名（缺省 CP 侧默认）")
@@ -202,6 +235,7 @@ def main(argv=None) -> int:
 
     fingerprint = collect_fingerprint()
     token = args.node_token
+    state_file = None
     if not token:
         state_file = (Path(args.state_file) if args.state_file
                       else Path.home() / ".bok" / "node-state.json")
@@ -217,7 +251,7 @@ def main(argv=None) -> int:
         stop = threading.Event()
         print(f"[node-agent] heartbeat loop start (interval={cfg.heartbeat_interval_s}s)", flush=True)
         try:
-            heartbeat_loop(cfg, stop)
+            heartbeat_loop(cfg, stop, license_key=args.license_key, state_file=state_file)
         except KeyboardInterrupt:
             stop.set()
         return 0
@@ -226,7 +260,10 @@ def main(argv=None) -> int:
 
     bok.cmd_up()
     stop = threading.Event()
-    worker = threading.Thread(target=heartbeat_loop, args=(cfg, stop), daemon=True)
+    worker = threading.Thread(
+        target=functools.partial(heartbeat_loop, cfg, stop,
+                                 license_key=args.license_key, state_file=state_file),
+        daemon=True)
     worker.start()
     try:
         while worker.is_alive():
