@@ -17,7 +17,7 @@ from typing import Any
 import httpx
 from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from bok_voice_core.providers import BusinessRepository
@@ -147,6 +147,31 @@ async def optional_bearer_auth(request: Request, call_next):
         ):
             return Response(status_code=401, content=b'{"detail":"unauthorized"}',
                              media_type="application/json")
+    return await call_next(request)
+
+
+# 云端窒息点路径（site-delivery M1）：revoked node_token 打这两个通话面端点即 403。
+_KILLSWITCH_PATHS = frozenset({"/api/calls", "/api/token"})
+
+
+@app.middleware("http")
+async def node_revoked_gate(request: Request, call_next):
+    """熔断窒息点（site-delivery M1，2026-09-16）：root 吊销的 node_token 打云端
+    通话面（建单 /api/calls、发房 token /api/token）即刻 403 "node revoked"。
+
+    注册位置铁律=**两个门禁之外**（后注册者在外层，这里最后注册=最外层）：
+    auth-on 下 node_token 不是用户 JWT，内层 identity_gate 只会给 401——窒息
+    语义要求 403 且与认证模式无关（auth-off 开放流同样要拦）。只对 POST 且路径
+    命中时解 Bearer 为 node_token（sha256 查注册表；空 Bearer/用户 JWT/CP token
+    解不出节点=零命中直通，行为零变化）。revoked 节点打其余端点仍走各自门禁
+    （心跳 401 附 shutdown 指令由端点自己塑形）。"""
+    if request.method == "POST" and request.url.path in _KILLSWITCH_PATHS:
+        auth = request.headers.get("authorization", "")
+        token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        if token:
+            node = _node_store().resolve_node_token(token)
+            if node is not None and node.get("revoked"):
+                return JSONResponse(status_code=403, content={"detail": "node revoked"})
     return await call_next(request)
 
 control_log = get_logger("control-plane", component="control-plane", service="control-plane")
@@ -968,6 +993,15 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
         _call = _repo().get_call(room) or {}
     except Exception:
         _call = {}
+    # 熔断产品路径（site-delivery M1）：通话建单时绑定了承载节点（call.node_id）
+    # → 签发房 token 前校验该节点未吊销——覆盖「坐席 JWT 建单、非 node_token 通道」
+    # 的 thin-node 拓扑（窒息点中间件只拦 node_token Bearer，这条拦通话绑定）。
+    # 绑定节点查不到（已删/竞态）保守放行，与幽灵守卫同口径；只有存在且 revoked 才拒。
+    _bound_node = str(_call.get("node_id") or "")
+    if _bound_node:
+        _bnode = _node_store().node_by_id(_bound_node)
+        if _bnode is not None and _bnode.get("revoked"):
+            raise HTTPException(status_code=403, detail="node revoked")
     # B4 页面权限：A 线通话归 calls 键，同传会话（kind=interpret）归 interpret 键
     # （与建单同口径）；通话记录缺失（新建流/竞态）按 A 线默认面处理。
     _gate_page(request, "interpret" if str(_call.get("kind") or "") == "interpret" else "calls")
@@ -1075,6 +1109,16 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
 def create_call(req: CreateCallRequest, request: Request) -> dict:
     # B4 页面权限：同传建单（kind=interpret）归 interpret 键，其余客服通话归 calls。
     _gate_page(request, "interpret" if (req.kind or "").strip() == "interpret" else "calls")
+    # 熔断产品路径（site-delivery M1）：显式绑定承载节点的建单先验节点——
+    # 未知 404（既有 404 约定）、revoked 403（root 熔断即刻断供，含坐席 JWT 通道）。
+    _req_node = (req.node_id or "").strip()
+    if _req_node:
+        _node = _node_store().node_by_id(_req_node)
+        if _node is None:
+            raise HTTPException(status_code=404, detail="node not found")
+        if _node.get("revoked"):
+            raise HTTPException(status_code=403, detail="node revoked")
+        req = req.model_copy(update={"node_id": _req_node})
     identity = current_identity(request)
     created_by = ""
     if identity is not None:
@@ -1124,6 +1168,8 @@ def _create_call_in(repo, req: CreateCallRequest, created_by: str = "") -> dict:
         kind=req.kind,
         target_lang=req.target_lang,
         created_by=created_by,
+        # 通话绑定节点(site-delivery M1,2026-09-16):显式指定才落,token 签发时校验。
+        node_id=(req.node_id or "").strip(),
         # B 线同传术语表(P0-2,2026-09-16):1000 字硬截(防 metadata/prefill 膨胀,
         # agent 侧另有 400 字 prompt 护栏);A 线建单恒空。
         glossary=(req.glossary or "")[:1000],
@@ -2124,10 +2170,14 @@ def register_node(req: NodeRegisterRequest) -> dict:
         # 非加固模式也尊重显式 license（登记归属，不强制）。
         lic = store.find_license((req.license_key or "").strip())
         license_id = lic["license_id"] if lic else ""
-    node_id, token = store.register(
-        name=req.name, platform=req.platform, org_id=req.org_id, version=req.version,
-        license_id=license_id, fingerprint=(req.fingerprint or "").strip(),
-    )
+    try:
+        node_id, token = store.register(
+            name=req.name, platform=req.platform, org_id=req.org_id, version=req.version,
+            license_id=license_id, fingerprint=(req.fingerprint or "").strip(),
+        )
+    except LicenseError as exc:
+        # 开放流复用候选是 root 吊销行（sticky）：同一拒绝语义，不分认证模式。
+        raise HTTPException(exc.status_code, exc.reason) from exc
     _audit("node.registered", subject_type="node", subject_id=node_id,
            account_id="", detail={
                "name": req.name, "platform": req.platform, "version": req.version,
@@ -2153,6 +2203,14 @@ def node_heartbeat(req: NodeHeartbeatRequest, authorization: str = Header(defaul
         detail = {"fingerprint_mismatch": "fingerprint mismatch (clone/relocated?)",
                   "license_revoked": "license revoked", "revoked": "node revoked",
                   "license_required": "node not licensed (hardened mode)"}.get(reason)
+        if reason == "revoked" and token:
+            # 停栈指令（site-delivery M1）：root 吊销（sticky）的心跳 401 detail
+            # 必须携带机器可执行 action:"shutdown"——node_agent 据此不 self-heal、
+            # 停栈退出。auto_clone 吊销保持纯文本（原机重注册复活路径保留，
+            # 不该逼停整台机器）。resolve 失败（token 已被换发覆盖等）按纯文本兜底。
+            node = _node_store().resolve_node_token(token)
+            if node is not None and (node.get("revoked_source") or "") == "root":
+                detail = {"reason": "node revoked", "action": "shutdown"}
         raise HTTPException(401, detail or "unknown node token")
     return {"ok": True, "commands": []}
 
@@ -2208,12 +2266,32 @@ def revoke_node_license(license_id: str, request: Request) -> dict:
 @app.post("/api/nodes/{node_id}/revoke")
 def revoke_node(node_id: str, request: Request) -> dict:
     """吊销单个节点（root 专属）：token 即刻失效。开放期存量 token（无 license）
-    此前无任何吊销手段（2026-09-16 深测 P2）。"""
+    此前无任何吊销手段（2026-09-16 深测 P2）。打 source='root'=sticky：注册端点
+    不得复活，唯一恢复路径是 /unrevoke（auto_clone 吊销由 store 打标、可自愈）。"""
     require_role(request, "root")
-    if not _node_store().revoke_node(node_id):
+    if not _node_store().revoke_node(node_id, source="root"):
         raise HTTPException(404, "node not found")
-    _audit("node.revoked", subject_type="node", subject_id=node_id)
+    _audit("node.revoked", subject_type="node", subject_id=node_id,
+           detail={"source": "root"})
     return {"node_id": node_id, "revoked": True}
+
+
+@app.post("/api/nodes/{node_id}/unrevoke")
+def unrevoke_node(node_id: str, request: Request) -> dict:
+    """解除节点吊销（root 专属；sticky 吊销的唯一恢复路径，site-delivery M1）。
+
+    语义：解除后 status→offline（节点须重注册换发 token 或心跳成功才回 online）、
+    revoked_source→''；revoked_at 保留作历史（最近一次吊销时刻，审计可循）。
+    404=节点不存在；409=节点本就未吊销（live）——显式冲突而非幂等 200，让误触
+    （双击/竞态）可被操作面分辨，与 revoke 二次调用 404 的既有口径对齐。"""
+    require_role(request, "root")
+    out = _node_store().unrevoke_node(node_id)
+    if out is None:
+        raise HTTPException(404, "node not found")
+    if out == "live":
+        raise HTTPException(409, "node not revoked")
+    _audit("node.unrevoked", subject_type="node", subject_id=node_id)
+    return {"node_id": node_id, "revoked": False}
 
 
 @app.get("/api/calls/{call_id}/settlement")

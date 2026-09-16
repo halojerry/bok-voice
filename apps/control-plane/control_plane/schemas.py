@@ -86,6 +86,10 @@ class CreateCallRequest(BaseModel):
     # 会话种类:""=客服通话 / interpret=双端同传(B 线 v2)。target_lang=对方语言。
     kind: str = ""
     target_lang: str = ""
+    # 通话绑定节点(site-delivery M1,2026-09-16 thin-node 拓扑):建单钉死承载节点,
+    # /api/token 签发前校验其未吊销。''=无绑定(单机全栈形态零变化);未知节点 404、
+    # revoked 节点 403 在 create_call 端点校验。
+    node_id: str = ""
     # B 线同传术语表(P0-2):「源=译」或纯词条,逗号/分号/换行分隔;1000 字上限
     # 在 _create_call_in 截断(agent 侧另有 400 字 prompt 护栏)。客服通话忽略。
     glossary: str = ""

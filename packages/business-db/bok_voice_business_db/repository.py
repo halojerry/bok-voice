@@ -88,6 +88,7 @@ class SqlAlchemyBusinessRepository:
             kind=getattr(manifest, "kind", "") or "",
             target_lang=getattr(manifest, "target_lang", "") or "",
             glossary=getattr(manifest, "glossary", "") or "",
+            node_id=getattr(manifest, "node_id", "") or "",
         )
         self.session.add(call)
         self.session.commit()
@@ -1202,6 +1203,7 @@ class InMemoryBusinessRepository:
             "kind": getattr(manifest, "kind", "") or "",
             "target_lang": getattr(manifest, "target_lang", "") or "",
             "glossary": getattr(manifest, "glossary", "") or "",
+            "node_id": getattr(manifest, "node_id", "") or "",
         }
         return self.calls[call_id]
 

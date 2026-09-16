@@ -69,6 +69,9 @@ class SessionManifest:
     # 随建单存 call_sessions.glossary,token 分发进 dispatch metadata → agent
     # 装配 ASR 热词 + MT prompt 术语槽;客服通话恒空。
     glossary: str = ""
+    # 通话绑定节点(site-delivery M1,2026-09-16 thin-node 拓扑):建单钉死承载节点,
+    # /api/token 签发前校验其未吊销。''=无绑定(单机全栈形态),行为零变化。
+    node_id: str = ""
 
 
 @dataclass
