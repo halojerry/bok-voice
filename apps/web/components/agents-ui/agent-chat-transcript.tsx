@@ -134,7 +134,7 @@ export function AgentChatTranscript({
                         variant={isUser ? 'secondary' : 'ghost'}
                       >
                         <BubbleContent>
-                          <Streamdown>{message}</Streamdown>
+                          <Streamdown disallowedElements={["a"]} unwrapDisallowed>{message}</Streamdown>
                         </BubbleContent>
                       </Bubble>
                     </MessageContent>
