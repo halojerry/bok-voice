@@ -10,7 +10,7 @@
     "frontendDist": "../../apps/web/out"
   },
   "app": {
-    "withGlobalTauri": true,
+    "withGlobalTauri": false,
     "windows": [
       {
         "title": "Bok Voice 客服助手",
@@ -22,7 +22,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; media-src 'self' blob: data:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* ws://127.0.0.1:* http://localhost:* ws://localhost:*"
     }
   },
   "bundle": {
@@ -71,10 +71,5 @@
       "binaries/node"
     ],
     "createUpdaterArtifacts": false
-  },
-  "plugins": {
-    "shell": {
-      "open": true
-    }
   }
 }
