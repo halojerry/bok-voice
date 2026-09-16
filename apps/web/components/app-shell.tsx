@@ -53,7 +53,7 @@ function SessionReady({ children }: { children: React.ReactNode }) {
   return <>{children}</>;
 }
 
-/** 路由守卫（契约 §4）：路径前缀 → 权限键 / 主管专属；未匹配前缀放行。 */
+/** 路由守卫（契约 §4）：路径前缀 → 权限键 / 主管专属 / root 专属；未匹配前缀放行。 */
 function RouteGuard({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const session = useSession();
@@ -61,6 +61,10 @@ function RouteGuard({ children }: { children: React.ReactNode }) {
   const gate = gateForPath(pathname);
   if (gate.kind === "page" && !hasPage(session, gate.key)) return <NoPermission />;
   if (gate.kind === "manager" && !isManager(session)) return <NoPermission />;
+  // root 专属（/nodes 平台面）：匿名本地会话不算 root（匿名=acc-001 工作台形态）。
+  if (gate.kind === "root" && !(session.role === "root" && !session.anonymous)) {
+    return <NoPermission />;
+  }
   return <>{children}</>;
 }
 
