@@ -522,6 +522,23 @@ def _rotate_log(logfile: Path, max_bytes: int = 50 * 1024 * 1024, keep: int = 3)
         pass
 
 
+def _spawn_kwargs() -> dict:
+    """平台 spawn 旗标（与 down 的停止语义成对：改这里必须同步 _kill_proc_tree）。
+
+    POSIX：start_new_session=True 起会话组长，killpg 一组全清。
+    Windows：CPython 对 start_new_session 是**静默忽略**（POSIX-only kwarg，
+    见 scripts/probe_windows_lifecycle.py docstring 记录的 CPython 事实），必须
+    显式 CREATE_NEW_PROCESS_GROUP 建独立进程组——taskkill /PID <pid> /T /F 才有
+    干净的树根可收割；组内子进程也不再收宿主控制台的 Ctrl 事件（服务形态更稳）。
+    """
+    if os.name == "nt":
+        # 0x200=CREATE_NEW_PROCESS_GROUP（win32 常量，跨 SDK 版本稳定）；getattr
+        # 守卫让 POSIX 解释器上模拟 nt 的单测/probe 也能走到这个分支（POSIX 的
+        # subprocess 没有该属性，真机 nt 恒命中第一候选）。
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)}
+    return {"start_new_session": True}
+
+
 def _start_proc(args: list[str], pidfile: Path, logfile: Path, env: dict | None = None, cwd: str | Path | None = None) -> int:
     pidfile.parent.mkdir(parents=True, exist_ok=True)
     _rotate_log(logfile)
@@ -531,7 +548,7 @@ def _start_proc(args: list[str], pidfile: Path, logfile: Path, env: dict | None 
     if env:
         merged.update(env)
     with logfile.open("ab") as log:
-        proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, env=merged, start_new_session=True, cwd=str(cwd) if cwd else None)
+        proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, env=merged, cwd=str(cwd) if cwd else None, **_spawn_kwargs())
     pidfile.write_text(str(proc.pid))
     return proc.pid
 
@@ -920,17 +937,50 @@ def _pid_alive(pidfile: Path) -> bool:
         return False
 
 
+class _KillTreeError(RuntimeError):
+    """Windows taskkill 停树失败（带 rc/输出尾）——必须浮出，不得静默吞
+    （旧版 os.killpg 在 nt 抛 AttributeError 被外层 except 吞掉 = down 静默失效）。"""
+
+
+def _kill_proc_tree(pid: int) -> None:
+    """按 _start_proc 的会话/进程组语义终止整棵进程树。
+
+    POSIX：与旧代码逐字节同款——killpg(SIGTERM)，(ProcessLookupError,
+    PermissionError, OSError) 时回退单杀；异常照旧上抛给调用方。
+    Windows：taskkill /T /F 沿父子树收割（_start_proc 用 CREATE_NEW_PROCESS_GROUP
+    建组，见 _spawn_kwargs）。rc=128（进程已不在）等价 ProcessLookupError，静默
+    放行；其余失败抛 _KillTreeError——真失败必须浮出，绝不重演静默吞。
+    """
+    if os.name == "nt":
+        try:
+            r = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except Exception as exc:  # noqa: BLE001 - taskkill 缺失/超时都要浮出
+            raise _KillTreeError(f"taskkill /PID {pid} /T /F error: {exc!r}") from exc
+        if r.returncode == 128:  # process not found = 已死，对齐 POSIX 静默放行
+            return
+        if r.returncode != 0:
+            tail = ((r.stderr or "").strip() or (r.stdout or "").strip()).splitlines()
+            detail = tail[-1][:200] if tail else ""
+            raise _KillTreeError(
+                f"taskkill /PID {pid} /T /F rc={r.returncode} {detail}")
+        return
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        os.kill(pid, signal.SIGTERM)
+
+
 def _kill_pidfile(pidfile: Path) -> None:
     """按 pidfile 杀进程组(_start_proc 是会话组长,子进程一并清)。"""
     try:
         pid = int(pidfile.read_text().strip())
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError):
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except Exception:
-                pass
+        _kill_proc_tree(pid)
+    except _KillTreeError as exc:
+        # monitor respawn 路径的 best-effort 停止：Windows 真失败留痕不炸环。
+        print(f"[kill] {pidfile.name}: {exc}", file=sys.stderr)
     except Exception:
         pass
 
@@ -1125,19 +1175,28 @@ def cmd_serve() -> int:
 
 def cmd_down() -> int:
     run_dir = app_data_dir() / "run"
+    stop_failures = 0
     for pidfile in run_dir.glob("*.pid"):
         try:
             pid = int(pidfile.read_text().strip())
-            # _start_proc 以 start_new_session=True 启动（会话组长）；按进程组
-            # 终止可连 livekit-agents worker 的 multiprocessing 子进程一起清掉，
-            # 避免子进程残留占用 8081 导致下次 agent 启动失败。
-            try:
-                os.killpg(os.getpgid(pid), signal.SIGTERM)
-            except (ProcessLookupError, PermissionError, OSError):
-                os.kill(pid, signal.SIGTERM)
-            print(f"[down] stopped {pidfile.stem} (pid {pid})")
         except Exception:
             continue
+        # _start_proc 以 start_new_session=True 启动（会话组长）；按进程组
+        # 终止可连 livekit-agents worker 的 multiprocessing 子进程一起清掉，
+        # 避免子进程残留占用 8081 导致下次 agent 启动失败。
+        # Windows(M2)：taskkill /T /F 沿父子树收割；真失败必须浮出——旧代码
+        # os.killpg 在 nt 不存在，AttributeError 被外层 except 整个吞掉，down
+        # 全程静默失效（probe_windows_lifecycle.py 记录的 M1 断层）。
+        try:
+            _kill_proc_tree(pid)
+        except _KillTreeError as exc:
+            print(f"[down] FAILED to stop {pidfile.stem}: {exc}", file=sys.stderr)
+            stop_failures += 1
+            continue
+        except Exception:
+            # 死 pid / 权限缺失：与旧 POSIX 行为一致，静默跳过。
+            continue
+        print(f"[down] stopped {pidfile.stem} (pid {pid})")
     # Legacy dev sidecars managed by old start_sidecars.sh (host pids in data/).
     data_dir = ROOT / "data"
     for pidfile in data_dir.glob("sidecar-*.pid"):
@@ -1153,7 +1212,7 @@ def cmd_down() -> int:
     orphans = _sweep_orphan_workers()
     for pid, label in orphans:
         print(f"[down] swept orphan worker (pid {pid}, {label})")
-    return 0
+    return 1 if stop_failures else 0
 
 
 def _sweep_orphan_workers() -> list[tuple[int, str]]:
@@ -1162,9 +1221,17 @@ def _sweep_orphan_workers() -> list[tuple[int, str]]:
     判据：进程命令行含 agent_runtime.main / agent_runtime.interpret /
     scripts/mock_callee.py（CP detached 派生的 mock 被叫 start_new_session,
     同样绕过 pidfile 体系——房间断了会自退,但栈 down 时若仍卡响铃窗须一并清）。
-    只清本项目特征进程,唔会误伤无关服务。"""
+    只清本项目特征进程,唔会误伤无关服务。
+    Windows（M2 定案）：**明跳**（返回空表,不清扫）。tasklist 不回命令行
+    （image 只有 python.exe,无法安全区分本项目 worker——宁可少清不可误杀）；
+    wmic 已弃用；PowerShell CIM 查询未在本仓 Windows 实机验证过。无头形态下
+    Windows 栈整体活在单一 node_agent 任务树里（taskkill /T /F / schtasks /end
+    一把清,见 _kill_proc_tree）,孤儿面远小于 mac 多单元拓扑;实装 CIM 清扫前
+    诚实跳过,不假装扫过。"""
     swept: list[tuple[int, str]] = []
     seen: set[int] = set()
+    if os.name == "nt":
+        return swept
     try:
         ps = subprocess.run(["ps", "-axo", "pid,command"], capture_output=True, text=True, timeout=10).stdout
     except Exception:
