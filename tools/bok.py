@@ -929,8 +929,29 @@ def _worker_specs(py) -> list[dict]:
 
 
 def _pid_alive(pidfile: Path) -> bool:
+    """pidfile 指向的进程还活着吗（_ensure_monitor 单例判定的唯一探针）。
+
+    Windows（M2-fix）：绝不能用 os.kill(pid, 0)——CPython 的 os.kill 在 nt 上
+    对非 CTRL_C_EVENT/CTRL_BREAK_EVENT 的 sig 一律调 TerminateProcess，探活即
+    击杀（活的 monitor 被探死、仍返回 True、_ensure_monitor 误判单例存活跳过
+    respawn → 栈从此无人看护）。改用 tasklist 按 PID 查询
+    （scripts/probe_windows_lifecycle.py `_win_pid_alive` 同款；冷路径不缓存；
+    查询失败保守当存活——宁可不重拉也不误判）。POSIX 分支与旧代码逐字节同款
+    （sig 0 在 POSIX 是纯探活）。"""
     try:
         pid = int(pidfile.read_text().strip())
+    except Exception:
+        return False
+    if os.name == "nt":
+        try:
+            r = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=15,
+            )
+        except Exception:
+            return True  # 查询失败保守当存活（勿误判单例已死而重复拉起）
+        return f'"{pid}"' in (r.stdout or "")
+    try:
         os.kill(pid, 0)
         return True
     except Exception:
