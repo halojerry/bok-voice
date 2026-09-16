@@ -1,5 +1,13 @@
 # 薄节点部署脚本 Windows/CUDA 档（spec §11.2；正式版 P2 出离线包 + 服务模板）。
 # 用法: .\install-node.ps1 -CpUrl URL -NodeToken TOK [-RepoRoot DIR] [-DryRun] [-SkipModels]
+#       .\install-node.ps1 -CpUrl URL -NodeToken TOK [-DryRun] [-InstallService]   # 装完注册常驻服务
+#       .\install-node.ps1 [-UninstallService] [-DryRun]                           # 卸载常驻服务
+#
+# 服务模式（site-delivery Task 8）：委派 bok.py prod install --node-agent / prod
+# uninstall —— Task Scheduler 注册单个 bok-node-agent SYSTEM 任务（开机自起 +
+# RestartOnFailure 崩溃拉回；node_agent 内部经 cmd_up 拉全栈）。XML/argv 生成见
+# tools/schtasks_units.py。注册需要管理员 PowerShell；-UninstallService 不需要
+# CpUrl/NodeToken。
 #
 # 与 scripts/install-node.sh 同一套步骤计划器语义：
 #   - 每步带编号执行，任一步失败 throw 并报告第几步（$ErrorActionPreference=Stop）；
@@ -11,13 +19,23 @@
 #   - GPU 探测与 sh 同款 nvidia-smi 逻辑：有才查、查失败不阻断（草版无探测直接
 #     跑 nvidia-smi，无 GPU 机器上 CommandNotFound 会炸掉整个脚本——已修）。
 param(
-  [Parameter(Mandatory = $true)][string]$CpUrl,
-  [Parameter(Mandatory = $true)][string]$NodeToken,
+  [string]$CpUrl = "",
+  [string]$NodeToken = "",
   [string]$RepoRoot = "",
   [switch]$DryRun,
-  [switch]$SkipModels
+  [switch]$SkipModels,
+  [switch]$InstallService,
+  [switch]$UninstallService
 )
 $ErrorActionPreference = "Stop"
+
+if ($InstallService -and $UninstallService) {
+  throw "-InstallService 与 -UninstallService 互斥"
+}
+if (-not $UninstallService) {
+  if (-not $CpUrl) { throw "-CpUrl 必填（仅 -UninstallService 免）" }
+  if (-not $NodeToken) { throw "-NodeToken 必填（仅 -UninstallService 免）" }
+}
 
 if (-not $RepoRoot) {
   $RepoRoot = Split-Path -Parent $PSScriptRoot
@@ -27,10 +45,13 @@ if (-not (Test-Path (Join-Path $RepoRoot "tools\node_agent.py"))) {
 }
 $VenvPy = Join-Path $RepoRoot ".venv312\Scripts\python.exe"
 $AgentPy = Join-Path $RepoRoot "tools\node_agent.py"
+$BokPy = Join-Path $RepoRoot "tools\bok.py"
 
 $script:StepNo = 0
 $script:StepTotal = 5
 if ($SkipModels) { $script:StepTotal = 4 }
+if ($InstallService) { $script:StepTotal = 6 }
+if ($UninstallService) { $script:StepTotal = 1 }
 
 function Step([string]$desc) {
   $script:StepNo++
@@ -48,6 +69,22 @@ function Invoke-Step([string]$desc, [scriptblock]$action) {
   if ($LASTEXITCODE -ne 0) {
     throw ("第 {0}/{1} 步失败 rc={2}: {3}" -f $script:StepNo, $script:StepTotal, $LASTEXITCODE, $desc)
   }
+}
+
+# ---------- 卸载模式：一步委派 prod uninstall，不走安装计划 ----------
+if ($UninstallService) {
+  Step "卸载常驻服务（bok.py prod uninstall；schtasks bok-node-agent 等一把清）"
+  if ($DryRun) {
+    Write-Host "    (dry-run) & <python> tools\bok.py prod uninstall"
+  } else {
+    $py = $VenvPy
+    if (-not (Test-Path $py)) { $py = "python" }
+    & $py $BokPy prod uninstall
+    if ($LASTEXITCODE -ne 0) { throw "bok.py prod uninstall 失败 rc=$LASTEXITCODE" }
+  }
+  Write-Host ""
+  Write-Host "卸载完成（Task Scheduler 已无 bok-* 任务；app-data 数据/日志保留）。"
+  return
 }
 
 # ---------- [1/5] 环境体检（报告性，不阻断） ----------
@@ -172,16 +209,35 @@ if ($DryRun) {
   }
 }
 
+# ---------- [6/6] 注册常驻服务（-InstallService 才有；需管理员 PowerShell） ----------
+if ($InstallService) {
+  Invoke-Step "注册常驻服务（Task Scheduler bok-node-agent：开机自起 + RestartOnFailure 崩溃拉回）" {
+    & $VenvPy $BokPy prod install --node-agent --cp-url $CpUrl --node-token $NodeToken --ui-dir (Join-Path $RepoRoot "apps\web\out")
+    if ($LASTEXITCODE -ne 0) { throw "bok.py prod install --node-agent rc=$LASTEXITCODE" }
+    Write-Host "    - 查询: schtasks /query /tn bok-node-agent"
+    Write-Host "    - 卸载: .\install-node.ps1 -UninstallService 或 bok.py prod uninstall"
+  }
+}
+
 # ---------- 收尾 ----------
 Write-Host ""
 if ($DryRun) {
   Write-Host ("共 {0}/{1} 步（dry-run：未执行任何副作用）。" -f $script:StepNo, $script:StepTotal)
 } else {
   Write-Host ("共 {0}/{1} 步，安装完成。" -f $script:StepNo, $script:StepTotal)
-  Write-Host "下一步（正式常驻部署；Windows 服务/NSSM 模板在后续轮提供）:"
-  Write-Host "  1. 常驻心跳 + 全栈:"
-  Write-Host "       & `"$VenvPy`" `"$AgentPy`" --cp-url $CpUrl --node-token *** --ui-dir `"$RepoRoot\apps\web\out`" --interval 60"
-  Write-Host "     （不带 --heartbeat-only 即拉起全栈 serve + 心跳守护）"
-  Write-Host "  2. 健康观测: 用管理员凭证 GET $CpUrl/api/nodes 确认节点 online"
-  Write-Host "  3. 链路自检: & `"$VenvPy`" `"$RepoRoot\tools\bok.py`" doctor"
+  if ($InstallService) {
+    Write-Host "常驻服务已注册（开机自起 + 崩溃拉回）："
+    Write-Host "  - 健康观测: schtasks /query /tn bok-node-agent；日志在 %LOCALAPPDATA%\BokVoice\logs"
+    Write-Host "  - 节点名册: 用管理员凭证 GET $CpUrl/api/nodes 确认节点 online"
+    Write-Host "  - 链路自检: & `"$VenvPy`" `"$BokPy`" doctor"
+  } else {
+    Write-Host "下一步（正式常驻部署）:"
+    Write-Host "  1. 注册常驻服务（Task Scheduler；需管理员 PowerShell）:"
+    Write-Host "       .\install-node.ps1 -CpUrl $CpUrl -NodeToken *** -InstallService"
+    Write-Host "     或手动:"
+    Write-Host "       & `"$VenvPy`" `"$BokPy`" prod install --node-agent --cp-url $CpUrl --node-token *** --ui-dir `"$RepoRoot\apps\web\out`""
+    Write-Host "     （node_agent 拉起全栈 serve + 心跳守护）"
+    Write-Host "  2. 健康观测: 用管理员凭证 GET $CpUrl/api/nodes 确认节点 online"
+    Write-Host "  3. 链路自检: & `"$VenvPy`" `"$BokPy`" doctor"
+  }
 }
