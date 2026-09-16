@@ -372,4 +372,82 @@ mod tests {
         // to assert the false path without leaking a real socket.
         assert!(!is_up(1));
     }
+
+    /// Character-level balanced-span extraction (open..close) starting at byte
+    /// offset `open_pos`. Contract-source heuristic: the wiring checked here is
+    /// plain Rust with no brace/paren-bearing string literals inside the spans
+    /// of interest.
+    fn span_balanced(src: &str, open_pos: usize, open: char, close: char) -> String {
+        let mut depth = 0usize;
+        for (i, ch) in src[open_pos..].char_indices() {
+            if ch == open {
+                depth += 1;
+            } else if ch == close {
+                depth -= 1;
+                if depth == 0 {
+                    return src[open_pos..open_pos + i + ch.len_utf8()].to_string();
+                }
+            }
+        }
+        panic!(
+            "unbalanced '{}'..='{}' span at byte {} in contract source",
+            open, close, open_pos
+        );
+    }
+
+    /// Target-semantics contract for the launcher's single-instance guarantee
+    /// (milestone M3). Today the shell has NO single-instance guard: a second
+    /// launch of the app re-runs the `.setup` hook and double-spawns
+    /// `bok.py serve`. M3 lands `tauri-plugin-single-instance`, which must:
+    ///   - be declared as a dependency in `Cargo.toml`,
+    ///   - be registered on the builder chain via
+    ///     `tauri_plugin_single_instance::init`,
+    ///   - route second launches to a named `fn on_second_instance` handler
+    ///     wired into `init`, whose body only focuses the existing window —
+    ///     the serve-spawn helper must NOT be reachable from that callback.
+    ///
+    /// Ignored until M3 lands the plugin; M3 removes this `#[ignore]` to turn
+    /// the probe green. Running it today (`cargo test -- --ignored`) fails on
+    /// assertion (a) — that is the intended RED state.
+    #[test]
+    #[ignore = "M3 single-instance not yet implemented — remove ignore when the plugin lands"]
+    fn single_instance_contract() {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        // (a) Cargo.toml declares the single-instance plugin dependency.
+        let cargo_toml = std::fs::read_to_string(manifest.join("Cargo.toml"))
+            .expect("read desktop/src-tauri/Cargo.toml");
+        assert!(
+            cargo_toml.contains("tauri-plugin-single-instance"),
+            "Cargo.toml must declare dependency tauri-plugin-single-instance (M3)"
+        );
+
+        // (b) src/lib.rs registers the plugin on the builder chain.
+        let lib_rs = std::fs::read_to_string(manifest.join("src").join("lib.rs"))
+            .expect("read desktop/src-tauri/src/lib.rs");
+        let init_pos = lib_rs
+            .find("tauri_plugin_single_instance::init")
+            .expect("lib.rs must invoke tauri_plugin_single_instance::init in the builder chain");
+
+        // A named second-instance handler must exist and be wired into init.
+        let handler_name = "on_second_instance";
+        let handler_pos = lib_rs
+            .find(&format!("fn {}(", handler_name))
+            .expect("lib.rs must define a named fn on_second_instance(...) handler");
+        let init_open = init_pos + lib_rs[init_pos..].find('(').expect("init call arguments");
+        let init_call = span_balanced(&lib_rs, init_open, '(', ')');
+        assert!(
+            init_call.contains(handler_name),
+            "the second-instance handler must be passed to tauri_plugin_single_instance::init"
+        );
+
+        // (c) The callback must focus the existing window, not re-run the serve
+        // spawn: the serve-spawn helper must be unreachable from its body.
+        let body_open = handler_pos + lib_rs[handler_pos..].find('{').expect("handler body");
+        let handler_body = span_balanced(&lib_rs, body_open, '{', '}');
+        assert!(
+            !handler_body.contains("spawn_bok"),
+            "on_second_instance must not spawn the stack; it must focus the existing window only"
+        );
+    }
 }
