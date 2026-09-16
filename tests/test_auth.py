@@ -2,8 +2,10 @@
 
 关键契约：
 - BOK_AUTH_REQUIRED 未设（默认）→ 全站开放（单机/开发形态零变化，基线测试不破）；
-- 置 1 → 除豁免路径（/health、/api/auth/login、/api/nodes/heartbeat、/docs）外
-  全部要求用户 JWT 或 BOK_CP_TOKEN 机器 token；
+- 置 1 → 除豁免路径（/health、/api/auth/login、/api/nodes/heartbeat、
+  /api/nodes/register、/api/webhook/livekit）外
+  全部要求用户 JWT 或 BOK_CP_TOKEN 机器 token（/docs 已移出豁免、auth-on 关闭，
+  静态站非 /api 的 GET/HEAD 另有豁免——管理台 SPA/登录页不得被拦）；
 - 角色规则：root 全域；admin 仅本 account 且只能建/管 user；user 无权。
 """
 from __future__ import annotations
