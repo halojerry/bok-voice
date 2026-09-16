@@ -147,7 +147,11 @@ class NodeStore:
                     "status": lic.status, "created_at": lic.created_at, "nodes_used": used}
 
     def revoke_license(self, license_id: str) -> dict | None:
-        """吊销 license 及其名下全部节点（未找到返回 None）。"""
+        """吊销 license 及其名下全部节点（未找到返回 None）。
+
+        名下节点按 root 面动作吊销（source='root'）——license 重发本就须 root
+        签新 key，sticky 语义与单节点 root 吊销一致。"""
+        now = _utcnow().isoformat()
         if self._session_factory is None:
             row = self._licenses.get(license_id)
             if row is None:
@@ -157,6 +161,8 @@ class NodeStore:
             for n in self._rows.values():
                 if n.get("license_id") == license_id and not n["revoked"]:
                     n["revoked"] = True
+                    n["revoked_source"] = "root"
+                    n["revoked_at"] = now
                     revoked_nodes += 1
             out = _license_public(row)
             out["nodes_revoked"] = revoked_nodes
@@ -174,7 +180,7 @@ class NodeStore:
                 update(models.Node)
                 .where(models.Node.license_id == license_id,
                        models.Node.status != "revoked")
-                .values(status="revoked")
+                .values(status="revoked", revoked_source="root", revoked_at=now)
             )
             session.commit()
             out = {"license_id": lic.id, "org_id": lic.org_id, "account_id": lic.account_id,
@@ -258,15 +264,25 @@ class NodeStore:
 
     def register(self, name: str, platform: str, org_id: str = "", version: str = "",
                  license_id: str = "", fingerprint: str = "") -> tuple[str, str]:
-        """签发 node_token；带 license_id 时同指纹幂等复用 node_id。"""
+        """签发 node_token；带 license_id 时同指纹幂等复用 node_id。
+
+        sticky（site-delivery M1）：复用候选是 **root 吊销**（revoked_source='root'）
+        的行时抛 LicenseError(401, "node revoked")——不复活、不换发 token、不新建
+        行（配额零消耗）；auto_clone/未标记行照旧复活（克隆检出恢复路径）。"""
         reuse_id = (self.find_node_by_fingerprint(license_id, fingerprint)
                     if license_id and fingerprint else None)
+        if reuse_id:
+            existing = self.node_by_id(reuse_id)
+            if existing is not None and existing.get("revoked") and (
+                    existing.get("revoked_source") or "") == "root":
+                raise LicenseError(401, "node revoked")
         node_id = reuse_id or f"node-{secrets.token_hex(6)}"
         token = secrets.token_urlsafe(32)
         row = {
             "node_id": node_id, "org_id": org_id, "name": name, "platform": platform,
             "version": version, "token_hash": _hash(token), "metrics_json": "{}",
             "last_seen_at": _utcnow(), "revoked": False,
+            "revoked_source": "", "revoked_at": "",
             "license_id": license_id, "fingerprint": fingerprint,
         }
         if self._session_factory is None:
@@ -282,6 +298,9 @@ class NodeStore:
                         existing.token_hash = row["token_hash"]
                         existing.last_seen_at = row["last_seen_at"]
                         existing.status = "online"
+                        # 复活清来源标记（revoked_at 保留作历史）——auto_clone 行
+                        # 复活后不得残留误导性的吊销来源。
+                        existing.revoked_source = ""
                         existing.name = name or existing.name
                         existing.platform = platform or existing.platform
                         existing.version = version or existing.version
@@ -312,15 +331,60 @@ class NodeStore:
                 return None
             return {"node_id": n.id, "token_hash": n.token_hash,
                     "revoked": n.status == "revoked", "status": n.status,
+                    "revoked_source": n.revoked_source or "",
+                    "revoked_at": n.revoked_at or "",
                     "license_id": n.license_id or "", "fingerprint": n.fingerprint or ""}
 
-    def revoke_node(self, node_id: str) -> bool:
-        """吊销单节点；行存在且未吊销返回 True（root 面 /api/nodes/{id}/revoke 用）。"""
+    def resolve_node_token(self, token: str) -> dict | None:
+        """按明文 node_token 解节点行（sha256 查找；窒息点/心跳 401 detail 用）。
+
+        空 token / 非 node_token 凭据（用户 JWT、CP token）→ None——调用方必须
+        容忍缺位直通，不得把 None 当拒绝依据。"""
+        if not token:
+            return None
+        return self._get_node_for_token(_hash(token))
+
+    def node_by_id(self, node_id: str) -> dict | None:
+        """按 node_id 取节点行（建单绑定校验 / register 复用路径 sticky 判定用）。
+
+        双模同形出参：revoked（bool）/ status（str）/ revoked_source / revoked_at。"""
+        if not node_id:
+            return None
+        if self._session_factory is None:
+            row = self._rows.get(node_id)
+            if row is None:
+                return None
+            return {"node_id": node_id, "revoked": bool(row["revoked"]),
+                    "status": "revoked" if row["revoked"] else "online",
+                    "revoked_source": row.get("revoked_source", ""),
+                    "revoked_at": row.get("revoked_at", ""),
+                    "license_id": row.get("license_id", ""),
+                    "fingerprint": row.get("fingerprint", "")}
+        from bok_voice_business_db import models
+
+        with self._session_factory() as session:
+            n = session.get(models.Node, node_id)
+            if n is None:
+                return None
+            return {"node_id": n.id, "revoked": n.status == "revoked",
+                    "status": n.status, "revoked_source": n.revoked_source or "",
+                    "revoked_at": n.revoked_at or "",
+                    "license_id": n.license_id or "", "fingerprint": n.fingerprint or ""}
+
+    def revoke_node(self, node_id: str, *, source: str = "root") -> bool:
+        """吊销单节点并打来源标记；行存在且未吊销返回 True（root 面
+        /api/nodes/{id}/revoke 用 source="root"，心跳克隆检出用 "auto_clone"）。
+
+        source 决定 sticky 语义：'root'=注册端点不得复活（须 /unrevoke），
+        'auto_clone'/''=原机指纹重注册仍可复活（克隆检出恢复路径）。"""
+        now = _utcnow().isoformat()
         if self._session_factory is None:
             row = self._rows.get(node_id)
             if row is None or row["revoked"]:
                 return False
             row["revoked"] = True
+            row["revoked_source"] = source
+            row["revoked_at"] = now
             return True
         from sqlalchemy import update
 
@@ -330,9 +394,37 @@ class NodeStore:
             result = session.execute(
                 update(models.Node).where(models.Node.id == node_id,
                                            models.Node.status != "revoked")
-                .values(status="revoked"))
+                .values(status="revoked", revoked_source=source, revoked_at=now))
             session.commit()
             return result.rowcount > 0
+
+    def unrevoke_node(self, node_id: str) -> str | None:
+        """解除节点吊销（root 面 /api/nodes/{id}/unrevoke 用；sticky 的唯一恢复路径）。
+
+        返回 "unrevoked"（已解除：status→offline、revoked_source→''，revoked_at
+        保留作历史）/ "live"（节点本就未吊销——调用方语义 409）/ None（节点不存在）。
+        解除后节点须重注册（换发 token）或心跳成功才回到 online。"""
+        if self._session_factory is None:
+            row = self._rows.get(node_id)
+            if row is None:
+                return None
+            if not row["revoked"]:
+                return "live"
+            row["revoked"] = False
+            row["revoked_source"] = ""
+            return "unrevoked"
+        from bok_voice_business_db import models
+
+        with self._session_factory() as session:
+            n = session.get(models.Node, node_id)
+            if n is None:
+                return None
+            if n.status != "revoked":
+                return "live"
+            n.status = "offline"
+            n.revoked_source = ""
+            session.commit()
+            return "unrevoked"
 
     def heartbeat(self, token: str, metrics: dict | None = None,
                   fingerprint: str = "", require_license: bool = False) -> tuple[bool, str]:
@@ -346,7 +438,9 @@ class NodeStore:
         返回 (ok, reason)；reason ∈ {"", "unknown_token", "revoked",
         "license_revoked", "license_required", "fingerprint_mismatch"}——后两者
         （license_revoked/fingerprint_mismatch）节点被自动吊销，供 CP 侧审计
-        克隆/挪机与吊销面。
+        克隆/挪机与吊销面。auto_clone 吊销来源行（revoked_source）随行持久化：
+        root 吊销=sticky（注册不得复活、心跳 401 附 shutdown 指令，见 main），
+        auto_clone=原机重注册复活保留。
         """
         token_hash = _hash(token)
         node = self._get_node_for_token(token_hash)
@@ -373,13 +467,13 @@ class NodeStore:
             return False, "license_required"
         if node.get("fingerprint") and not fingerprint:
             # 协议强制（深测 P2）：指纹检测是「客户端自愿」时对不合作实现无效。
-            self.revoke_node(node["node_id"])
+            self.revoke_node(node["node_id"], source="auto_clone")
             return False, "fingerprint_mismatch"
         if (node.get("fingerprint") and fingerprint
                 and fingerprint != node["fingerprint"]):
             # 克隆/挪机：token 被另一台机器持有——自动吊销该 token（原机指纹重注册
-            # 幂等复用 node_id 换新 token，恢复路径存在）。
-            self.revoke_node(node["node_id"])
+            # 幂等复用 node_id 换新 token，恢复路径存在；auto_clone 非 sticky）。
+            self.revoke_node(node["node_id"], source="auto_clone")
             return False, "fingerprint_mismatch"
         if self._session_factory is None:
             row = self._rows.get(node["node_id"])
@@ -412,6 +506,7 @@ class NodeStore:
                 rows = [
                     {"node_id": n.id, "org_id": n.org_id, "name": n.name, "platform": n.platform,
                      "version": n.version, "revoked": n.status == "revoked",
+                     "revoked_source": n.revoked_source or "",
                      "last_seen_at": n.last_seen_at,
                      "license_id": n.license_id or "",
                      "fingerprint": (n.fingerprint or "")[:12]}
@@ -424,6 +519,7 @@ class NodeStore:
                 "node_id": r["node_id"], "org_id": r["org_id"], "name": r["name"],
                 "platform": r["platform"], "version": r["version"],
                 "status": effective_status(last_seen, now, r.get("revoked", False)),
+                "revoked_source": r.get("revoked_source", ""),
                 "last_seen_at": last_seen.isoformat() if last_seen else None,
                 "license_id": r.get("license_id", ""),
                 # 指纹只出前 12 位 hex（可辨识、不可还原完整机器标识）。

@@ -120,6 +120,10 @@ class CallSession(Base):
     glossary: Mapped[str] = mapped_column(Text, default="")
     # 官方 SessionReport JSON(agent shutdown 上报):真实逐模型 usage/权威 chat_history。
     session_report: Mapped[str] = mapped_column(Text, default="")
+    # 通话绑定节点(site-delivery M1,2026-09-16 thin-node 拓扑):建单时钉死承载节点,
+    # /api/token 签发前校验其未吊销——root 熔断对「坐席 JWT 建单」路径同样生效。
+    # ''=无绑定(单机全栈形态),行为零变化。server_default 与迁移 DDL 同形（DEFAULT ''）。
+    node_id: Mapped[str] = mapped_column(String(64), default="", server_default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
@@ -401,6 +405,13 @@ class Node(Base):
     # license_id 空=加固模式前注册的存量节点（心跳只查 token 不查 license）。
     license_id: Mapped[str] = mapped_column(String(64), default="", index=True)
     fingerprint: Mapped[str] = mapped_column(String(128), default="")
+    # 熔断真实化（site-delivery M1，2026-09-16）：sticky 吊销来源与时刻。
+    # revoked_source: ''=在册 / 'root'=root 显式吊销（sticky——注册端点不得复活，
+    # 须 root /unrevoke 解除）/ 'auto_clone'=克隆/挪机自动吊销（原机指纹重注册
+    # 复活路径保留）。revoked_at=ISO 字符串（吊销时刻；解除后保留作历史）。
+    # server_default 与 deps._ensure_column 迁移 DDL 同形（DEFAULT ''）。
+    revoked_source: Mapped[str] = mapped_column(String(16), default="", server_default="")
+    revoked_at: Mapped[str] = mapped_column(String(32), default="", server_default="")
 
 
 class NodeLicense(Base):

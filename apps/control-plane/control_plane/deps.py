@@ -231,6 +231,13 @@ def build_engine() -> Engine | None:
                 # 节点鉴权(P1):license 绑定与机器指纹（node_licenses 新表走 create_all）。
                 _ensure_column(conn, "nodes", "license_id", "license_id VARCHAR(64) DEFAULT ''")
                 _ensure_column(conn, "nodes", "fingerprint", "fingerprint VARCHAR(128) DEFAULT ''")
+                # 熔断真实化(site-delivery M1,2026-09-16):sticky 吊销来源/时刻。
+                # revoked_source ''=在册 / 'root'=root 吊销(注册端点不得复活,须
+                # /unrevoke) / 'auto_clone'=克隆自动吊销(原机重注册复活保留)。
+                _ensure_column(conn, "nodes", "revoked_source", "revoked_source VARCHAR(16) DEFAULT ''")
+                _ensure_column(conn, "nodes", "revoked_at", "revoked_at VARCHAR(32) DEFAULT ''")
+                # 通话绑定节点(thin-node 拓扑):建单钉死承载节点,token 签发前校验。
+                _ensure_column(conn, "call_sessions", "node_id", "node_id VARCHAR(64) DEFAULT ''")
                 # 节点鉴权(P1,深测): (license_id, fingerprint) 部分唯一索引——多实例
                 # 部署下配额竞态的库级兜底(进程内由 NodeStore.register_licensed 的
                 # 锁收口)。只约束 license 绑定行:开放模式存量空值行不受影响。
