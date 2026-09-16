@@ -33,7 +33,10 @@
     taskkill /IM ping.exe /T /F 清理 → `/delete /tn <name> /f` → `/query`
     必须失败(零残留)。ping 前后 PID 集合差分定位任务拉起的子进程,防把机器上
     无关 ping.exe 记到任务头上。非 Windows 平台把命令序列与完整 XML 原样打
-    [skip] 供评审与日后排障,不影响退出码。
+    [skip] 供评审与日后排障,不影响退出码。Windows 实跑但 /create 被
+    access-denied 类错误拒绝(CI runner 提权状态不定,SYSTEM principal 任务
+    注册需要管理员)→ [warn] 大声提示 + B 段整段 [skip]——skip 不计 pass
+    (退出码只看真实执行步),已执行步 FAIL 仍 exit 1,绝不静默漂绿。
 
 用法:
   python scripts/probe_windows_lifecycle.py [--task-name NAME]
@@ -413,6 +416,24 @@ def _ping_pids() -> set[int]:
     return pids
 
 
+# access-denied 类错误标记（stdout/stderr 小写后子串匹配）：SYSTEM principal
+# 任务注册需要管理员，CI runner 提权状态不定——/create 被这类错误拒绝属环境
+# 限制（非被测语义失败），B 段整段 [skip]（skip 不计 pass；已执行步 FAIL 仍
+# exit 1）。英文报错与中文 Windows 的「拒绝访问」都收。
+_ACCESS_DENIED_MARKERS = ("access is denied", "access denied", "拒绝访问",
+                          "0x80070005")
+
+
+def _access_denied(r: "subprocess.CompletedProcess[str]") -> bool:
+    text = f"{r.stdout or ''}\n{r.stderr or ''}".lower()
+    return any(marker in text for marker in _ACCESS_DENIED_MARKERS)
+
+
+class _AdminDenied(Exception):
+    """schtasks /create 被 access-denied 类错误拒绝——环境无管理员权限，
+    后续 B 段步骤失去载体（任务没注册成），由调用方整段 [skip]。"""
+
+
 def _run_section_b_windows(task_name: str, unit: str) -> None:
     tmp = Path(tempfile.mkdtemp(prefix="bok-schtasks-probe-"))
     # 探针任务动作用 30s 长 ping:给 /run 与 /end 一个真实运行中的实例可操作。
@@ -424,7 +445,8 @@ def _run_section_b_windows(task_name: str, unit: str) -> None:
     )
     xml_file = tmp / f"{task_name}.xml"
 
-    def _sch(step: str, sch_args: list[str], expect_ok: bool) -> None:
+    def _sch(step: str, sch_args: list[str], expect_ok: bool,
+             *, admin_graceful: bool = False) -> None:
         cmd = " ".join(["schtasks", *sch_args])
         print(f"[info] $ {cmd}", flush=True)
         try:
@@ -435,6 +457,10 @@ def _run_section_b_windows(task_name: str, unit: str) -> None:
             return
         tail = ((r.stdout or "").strip() or (r.stderr or "").strip()).splitlines()
         detail = f"rc={r.returncode}" + (f" {tail[-1][:160]}" if tail else "")
+        # admin_graceful 只给 B2 用：rc!=0 且输出属 access-denied 类 → 抛
+        # _AdminDenied 让整段走 [skip]（环境限制）；其余任何失败照常记 FAIL。
+        if admin_graceful and r.returncode != 0 and _access_denied(r):
+            raise _AdminDenied(detail)
         _record((r.returncode == 0) == expect_ok, step, detail)
 
     try:
@@ -445,37 +471,58 @@ def _run_section_b_windows(task_name: str, unit: str) -> None:
                 "B1 生成 Task Scheduler XML(onstart+RestartOnFailure+SYSTEM,一 unit 一 task)",
                 str(xml_file))
         ping_before = _ping_pids()  # 基线:只把 /run 之后新出现的 ping 记到任务头上
-        _sch("B2 /create /xml /f(注册任务)", ["/create", "/tn", task_name,
-                                              "/xml", str(xml_file), "/f"], True)
-        _sch("B3 /query(注册可查)", ["/query", "/tn", task_name], True)
-        _sch("B4 /run(按需启动)", ["/run", "/tn", task_name], True)
-        time.sleep(2.0)
-        # B4b 前置确认:/run 真的拉起了 Exec 子进程(ping -n 30 约 29s,2s 处必活)。
-        # 没有这一步,B5b 的「/end 杀干净」可以是空转的假绿。
-        child_pids = _ping_pids() - ping_before
-        _record(bool(child_pids),
+        try:
+            _sch("B2 /create /xml /f(注册任务)", ["/create", "/tn", task_name,
+                                                 "/xml", str(xml_file), "/f"], True,
+                 admin_graceful=True)
+            _sch("B3 /query(注册可查)", ["/query", "/tn", task_name], True)
+            _sch("B4 /run(按需启动)", ["/run", "/tn", task_name], True)
+            time.sleep(2.0)
+            # B4b 前置确认:/run 真的拉起了 Exec 子进程(ping -n 30 约 29s,2s 处必活)。
+            # 没有这一步,B5b 的「/end 杀干净」可以是空转的假绿。
+            child_pids = _ping_pids() - ping_before
+            _record(bool(child_pids),
+                    "B4b Exec 子进程(ping.exe)已被任务拉起",
+                    f"任务新增 pids={sorted(child_pids) or '无(/run 没拉起子进程,后续断言不可信)'}")
+            _sch("B5 /end(停运行实例)", ["/end", "/tn", task_name], True)
+            time.sleep(1.0)
+            # B5b 核心断言(M2-fix):/end 必须连 Exec 子进程一起停。Task Scheduler
+            # 只终止动作进程 cmd.exe,链式子进程会存活——旧断言只查 /query 零残留,
+            # 对幸存子进程结构性失明。prod 侧 cmd_prod_uninstall 按此假设写
+            # (pidfile 补杀,勿按镜像名杀共享镜像)。
+            survivors = _ping_pids() & child_pids
+            _record(bool(child_pids) and not survivors,
+                    "B5b /end 必须连 Exec 子进程一起停(杀不到=schtasks /end 不够用,停栈/卸载须补 taskkill)",
+                    f"存活={sorted(survivors) or '无'}")
+            # best-effort 卫生清理(非被测语义):探针绝不留 ping 残留。
+            if _ping_pids():
+                print("[info] best-effort cleanup: taskkill /IM ping.exe /T /F", flush=True)
+                try:
+                    subprocess.run(["taskkill", "/IM", "ping.exe", "/T", "/F"],
+                                   capture_output=True, timeout=15)
+                except Exception:
+                    pass
+            _sch("B6 /delete /f(卸载任务)", ["/delete", "/tn", task_name, "/f"], True)
+            _sch("B7 /query 零残留(查不到才算过)", ["/query", "/tn", task_name], False)
+        except _AdminDenied as exc:
+            # CI runner 提权状态不定:/create 被拒=环境无管理员权限,不是契约失败。
+            # [warn] 大声 + B 段整段 [skip]——skip 不进 _RESULTS 不计 pass,
+            # 已执行步 FAIL 仍会把退出码压到 1,绝不静默漂绿。
+            print(flush=True)
+            print(f"[warn] B 段 /create 被 access-denied 类错误拒绝(无管理员权限): {exc}", flush=True)
+            print("[warn] schtasks 生命周期腿整段 [skip]——skip 不等于 PASS;"
+                  "有管理员权限的环境(实机/提权 CI)必须全绿", flush=True)
+            _skip("B2 /create /xml /f(注册任务)", f"access-denied({exc}),任务未注册")
+            for label in (
+                "B3 /query(注册可查)",
+                "B4 /run(按需启动)",
                 "B4b Exec 子进程(ping.exe)已被任务拉起",
-                f"任务新增 pids={sorted(child_pids) or '无(/run 没拉起子进程,后续断言不可信)'}")
-        _sch("B5 /end(停运行实例)", ["/end", "/tn", task_name], True)
-        time.sleep(1.0)
-        # B5b 核心断言(M2-fix):/end 必须连 Exec 子进程一起停。Task Scheduler
-        # 只终止动作进程 cmd.exe,链式子进程会存活——旧断言只查 /query 零残留,
-        # 对幸存子进程结构性失明。prod 侧 cmd_prod_uninstall 按此假设写
-        # (pidfile 补杀,勿按镜像名杀共享镜像)。
-        survivors = _ping_pids() & child_pids
-        _record(bool(child_pids) and not survivors,
+                "B5 /end(停运行实例)",
                 "B5b /end 必须连 Exec 子进程一起停(杀不到=schtasks /end 不够用,停栈/卸载须补 taskkill)",
-                f"存活={sorted(survivors) or '无'}")
-        # best-effort 卫生清理(非被测语义):探针绝不留 ping 残留。
-        if _ping_pids():
-            print("[info] best-effort cleanup: taskkill /IM ping.exe /T /F", flush=True)
-            try:
-                subprocess.run(["taskkill", "/IM", "ping.exe", "/T", "/F"],
-                               capture_output=True, timeout=15)
-            except Exception:
-                pass
-        _sch("B6 /delete /f(卸载任务)", ["/delete", "/tn", task_name, "/f"], True)
-        _sch("B7 /query 零残留(查不到才算过)", ["/query", "/tn", task_name], False)
+                "B6 /delete /f(卸载任务)",
+                "B7 /query 零残留(查不到才算过)",
+            ):
+                _skip(label, "B2 /create 无管理员权限,任务未注册")
     finally:
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)

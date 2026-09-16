@@ -1,11 +1,17 @@
 name: Node handshake smoke
 
-# P1 节点侧门禁：
+# P1 节点侧门禁 + site-delivery M4 探针接线：
 #   linux   —— 起真 CP（postgres:16 服务容器 + auth-on + root 种子）跑
 #              scripts/node_handshake_smoke.py 全验握手链路（register → node_token
 #              心跳 → 伪 token 401 → root JWT 查节点列表 → heartbeat_interval_s），
-#              并对 install-node.sh 做语法解析 + 零副作用干跑；
-#   windows —— runner 无 docker，只验 install-node.ps1 本体：语法解析 + -DryRun 干跑。
+#              再跑 scripts/probe_killswitch.py（同一 CP 自建独立节点：吊销 sticky
+#              → 通话面 403 窒息 → unrevoke 复活全链），并对 install-node.sh 做
+#              语法解析 + 零副作用干跑；
+#   windows —— runner 无 docker，不起 CP；验 install-node.ps1 本体（语法解析 +
+#              -DryRun 干跑）+ scripts/probe_windows_lifecycle.py 生命周期探针
+#              （A 段 down 树杀实跑，纯 stdlib；B 段 schtasks 契约实跑，runner
+#              无提权注册 SYSTEM 任务被拒时按 access-denied 优雅 [skip]——
+#              skip 不计 pass，已执行步 FAIL 仍红）。
 # CP 依赖安装照 postgres-smoke.yml；起监听等待照 cloud-image.yml 的显式 curl 轮询
 # 循环——进程起 ≠ 端口就绪，bind 时差窗内裸 curl/connrefused 重试不可靠（CI 实证）。
 on:
@@ -85,6 +91,10 @@ jobs:
         run: |
           python scripts/node_handshake_smoke.py --base-url "$CP_BASE" \
             --root-user="$BOK_ROOT_USERNAME" --root-pass="$ROOT_PASS"
+      - name: Kill-switch probe (同一 CP 自建独立节点:吊销→窒息点→unrevoke 复活全链)
+        run: |
+          python scripts/probe_killswitch.py --base-url "$CP_BASE" \
+            --root-user="$BOK_ROOT_USERNAME" --root-pass="$ROOT_PASS"
       - name: CP logs on failure
         if: failure()
         run: tail -100 /tmp/cp.log || true
@@ -94,11 +104,14 @@ jobs:
           if [[ -f /tmp/cp.pid ]]; then kill "$(cat /tmp/cp.pid)" 2>/dev/null || true; fi
 
   windows:
-    name: install-node.ps1 syntax + dry-run
+    name: install-node.ps1 syntax + dry-run + lifecycle probe
     runs-on: windows-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: PowerShell syntax parse
         shell: pwsh
         run: |
@@ -120,3 +133,6 @@ jobs:
       - name: setup-virtual-audio.ps1 -DryRun (检测/计划打印，不下载不提权)
         shell: pwsh
         run: ./scripts/setup-virtual-audio.ps1 -DryRun
+
+      - name: Windows 生命周期探针 (A 段 down 树杀实跑 + B 段 schtasks 契约;无提权时 B 段优雅 skip)
+        run: python scripts/probe_windows_lifecycle.py
