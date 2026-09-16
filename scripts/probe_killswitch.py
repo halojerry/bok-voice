@@ -32,10 +32,13 @@ env（CP 侧相关；探针自身无专用 env）:
   ②b 完好性基线：节点在线时建最小通话 + 取房 token 成功（给 ⑥ 一个对照）
   ③  root 吊销节点 POST /api/nodes/{id}/revoke
   ④  心跳 401 且 detail 提及 revoked
-  ⑤  sticky：同指纹重注册被拒 401（今天原地复活 200 → 红，刻意）
+  ⑤  sticky：同指纹重注册被拒 401（仅加固档；今天原地复活 200 → 红，刻意；
+      开放流 [skip]——auth-off 本机单机信任不属 killswitch 威胁模型）
   ⑥  云端窒息点：revoked 节点打 POST /api/calls 与 /api/token 返 403（今天 → 红，刻意）
-  ⑦  心跳 401 体 detail 含 action:"shutdown"（今天纯文本 → 红，刻意）
-  ⑧  root POST /api/nodes/{id}/unrevoke 解除后重注册复活（今天 404 → 红，刻意）
+  ⑦  心跳 401 体 detail 携带机器可执行 action:"shutdown"（结构断言，两模式都跑；
+      今天纯文本 → 红，刻意）
+  ⑧  root POST /api/nodes/{id}/unrevoke 解除后重注册复活（仅加固档；今天 404 →
+      红，刻意；开放流注册本不复用 node_id，[skip]）
   ⑨  license 吊销=永久：吊销 license 后同指纹/新指纹注册均 401 无 self-heal
       （仅加固档；开放流 CP 不拦 license 注册，[skip]）
 
@@ -106,6 +109,22 @@ def _mentions(body: Any, word: str) -> bool:
         return False
 
 
+def _has_shutdown_action(body: Any) -> bool:
+    """结构断言（⑦）：401 体必须携带**机器可执行**的行动指令，不是给人看的
+    纯文本。首选 detail 为 dict 且 action=="shutdown"；序列化体退路至少同时
+    含 "action" 与 "shutdown" 两个标记——"node revoked; please shutdown" 这类
+    纯文本缺 "action"，不得假绿。"""
+    if isinstance(body, dict):
+        d = body.get("detail")
+        if isinstance(d, dict) and str(d.get("action", "")).lower() == "shutdown":
+            return True
+    try:
+        s = json.dumps(body, ensure_ascii=False).lower()
+    except Exception:
+        return False
+    return "action" in s and "shutdown" in s
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Bok 远程停机开关（killswitch）目标语义探针")
     parser.add_argument("--base-url", required=True, help="已起 CP 的基址，如 http://127.0.0.1:18099")
@@ -141,9 +160,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # ① 注册：加固档（auth-on / CP token）裸注册 401 → 有 root 凭据时走完整
     # license 流（root 签发 → 带 key+指纹注册），开放流维持裸注册。
+    # 指纹两模式都带上（开放端点今天收下但只存档不参与复用，行为零变化）——
+    # ⑤⑧ 的同指纹语义才有载体（复用需 license_id+指纹同时在场）。
     fingerprint = hashlib.sha256(f"killswitch-fp-{ts}".encode()).hexdigest()
     reg_body: dict[str, Any] = {
-        "name": f"killswitch-probe-{ts}", "platform": sys.platform, "version": "probe"}
+        "name": f"killswitch-probe-{ts}", "platform": sys.platform,
+        "version": "probe", "fingerprint": fingerprint}
     status, body = _request(
         "POST", f"{base}/api/nodes/register", token=jwt, body=reg_body,
         timeout=args.timeout,
@@ -160,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
             "①a 加固档：root 签发节点 license",
             f"HTTP {lic_status}" + ("" if license_key else f" {lic_body}"),
         )
-        reg_body.update({"license_key": license_key, "fingerprint": fingerprint})
+        reg_body.update({"license_key": license_key})
         license_used = license_key
         status, body = _request(
             "POST", f"{base}/api/nodes/register", token=jwt, body=reg_body,
@@ -257,17 +279,28 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # ⑤ sticky：同指纹重注册必须被拒（401）——吊销不能被原机注册自愈绕过。
-    # 今天 register 幂等复活同一 node_id 并换发新 token（200）→ 刻意红。
-    status, body = _request(
-        "POST", f"{base}/api/nodes/register", token=jwt, body=reg_body,
-        timeout=args.timeout)
-    reg2 = body if isinstance(body, dict) else {}
-    _record(
-        status == 401,
-        "⑤ sticky：同指纹重注册被拒 401",
-        f"HTTP {status} node_id={reg2.get('node_id') or body}（期望 401，"
-        f"{'原地复活=目标未实装' if status == 200 else ''}）",
-    )
+    # 仅加固档断言（scope 裁决）：killswitch sticky 是加固档属性，auth-off 本机
+    # 单机信任模型不属威胁范围（B4 先例）。今天加固档 register 幂等复活同一
+    # node_id 并换发新 token（200）→ 刻意红。
+    if license_used:
+        status, body = _request(
+            "POST", f"{base}/api/nodes/register", token=jwt, body=reg_body,
+            timeout=args.timeout)
+        reg2 = body if isinstance(body, dict) else {}
+        same_node = str(reg2.get("node_id") or "") == node_id
+        diag = ""
+        if status == 200:
+            diag = ("同 node_id 原地复活并换发新 token=目标未实装" if same_node
+                    else "新建节点注册=目标未实装")
+        _record(
+            status == 401,
+            "⑤ sticky：同指纹重注册被拒 401",
+            f"HTTP {status} node_id={reg2.get('node_id') or body}（期望 401）{diag}",
+        )
+    else:
+        _skip("⑤ sticky：同指纹重注册被拒 401",
+              "开放流（auth-off）不属 killswitch 威胁模型（本机单机信任，B4 先例），"
+              "sticky 语义仅加固档断言")
 
     # ⑥ 云端窒息点：revoked 节点的凭据打建单/发 token 必须被 403 拒——
     # 被吊销节点不得再消耗云端通话面。今天 CP 完全不感知节点状态 → 刻意红。
@@ -285,37 +318,45 @@ def main(argv: list[str] | None = None) -> int:
         detail += "；token 腿 [skip]：CP 未配 LiveKit 凭据，无法表达 403 语义"
     _record(choke_ok, "⑥ 云端窒息点：revoked 节点建单/token 返 403", detail)
 
-    # ⑦ 行动指令：心跳 401 体 detail 必须含 action:"shutdown"（节点端可执行
-    # 的自毁指令），不是给人看的纯文本。今天 detail="node revoked" → 刻意红。
+    # ⑦ 行动指令（两模式都断言——心跳 401 拒绝路径与模式无关）：401 体 detail
+    # 必须携带机器可执行的 action:"shutdown" 指令（结构断言，见
+    # _has_shutdown_action），纯文本提及 shutdown 不算。今天 detail="node
+    # revoked" → 刻意红。
     status, body = _request(
         "POST", f"{base}/api/nodes/heartbeat", token=node_token,
         body={"metrics": {}, "fingerprint": fingerprint}, timeout=args.timeout)
     _record(
-        status == 401 and _mentions(body, "shutdown"),
+        status == 401 and _has_shutdown_action(body),
         "⑦ 心跳 401 detail 含 action:shutdown",
         f"HTTP {status} {body}",
     )
 
-    # ⑧ 受控解除：root 专用 unrevoke，解除后同指纹重注册才允许复活——
-    # 恢复路径必须经 root 显式操作，而非注册端点自愈。今天 404 → 刻意红
-    # （「未解除前不得复活」的 sticky 已由 ⑤ 钉住，此处不重复注册）。
-    u_status, u_body = _request(
-        "POST", f"{base}/api/nodes/{node_id}/unrevoke", token=jwt,
-        timeout=args.timeout)
-    unrevoke_ok = u_status in (200, 201)
-    detail = f"HTTP {u_status} {u_body}（期望 2xx）"
-    if unrevoke_ok:
-        r_status, r_body = _request(
-            "POST", f"{base}/api/nodes/register", token=jwt, body=reg_body,
+    # ⑧ 受控解除（仅加固档）：root 专用 unrevoke，解除后同指纹重注册才允许
+    # 复活——恢复路径必须经 root 显式操作，而非注册端点自愈。开放流注册本就
+    # 不复用 node_id（复用需 license_id+指纹同时在场），无死行可解 → [skip]。
+    # 今天加固档 unrevoke 404 → 刻意红（「未解除前不得复活」已由 ⑤ 钉住）。
+    if license_used:
+        u_status, u_body = _request(
+            "POST", f"{base}/api/nodes/{node_id}/unrevoke", token=jwt,
             timeout=args.timeout)
-        reg3 = r_body if isinstance(r_body, dict) else {}
-        revive_ok = r_status == 200 and str(reg3.get("node_id") or "") == node_id
-        detail += f"；解除后重注册 HTTP {r_status} node_id={reg3.get('node_id') or r_body}"
-        _record(unrevoke_ok and revive_ok, "⑧ unrevoke 解除后重注册复活", detail)
-        node_token = str(reg3.get("node_token") or node_token)  # 复活换发新 token
+        unrevoke_ok = u_status in (200, 201)
+        detail = f"HTTP {u_status} {u_body}（期望 2xx）"
+        if unrevoke_ok:
+            r_status, r_body = _request(
+                "POST", f"{base}/api/nodes/register", token=jwt, body=reg_body,
+                timeout=args.timeout)
+            reg3 = r_body if isinstance(r_body, dict) else {}
+            revive_ok = r_status == 200 and str(reg3.get("node_id") or "") == node_id
+            detail += f"；解除后重注册 HTTP {r_status} node_id={reg3.get('node_id') or r_body}"
+            _record(unrevoke_ok and revive_ok, "⑧ unrevoke 解除后重注册复活", detail)
+            node_token = str(reg3.get("node_token") or node_token)  # 复活换发新 token
+        else:
+            _record(False, "⑧ unrevoke 解除后重注册复活",
+                    detail + "（未解除前不得复活已由⑤钉住）")
     else:
-        _record(False, "⑧ unrevoke 解除后重注册复活",
-                detail + "（未解除前不得复活已由⑤钉住）")
+        _skip("⑧ unrevoke 解除后重注册复活",
+              "开放流注册本不复用 node_id（复用需 license_id+指纹），"
+              "unrevoke/复活契约仅加固档有意义")
 
     # ⑨ license 吊销=永久（仅加固档）：吊销 license 后，同指纹重注册与新指纹
     # 首注都 401——license 没有 self-heal 出路。开放流 CP 不拦 license 注册，
