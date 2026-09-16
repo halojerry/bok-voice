@@ -1285,6 +1285,22 @@ def _nvidia_gate() -> tuple[bool, str]:
         return False, f"nvidia-smi 不可用: {exc}"
 
 
+def _doctor_gpu_gate(packaged: bool, fails: list[str]) -> None:
+    """Windows NVIDIA 硬件门禁（独立于虚拟声卡检测）。
+
+    曾误缩进在 `if not va_ok:` 下——装了 VB-CABLE 的 Windows 机器直接跳过 GPU
+    检查（打包 doctor 漏报），而没装虚拟声卡的 mac 反而被拖去跑 nvidia-smi
+    （packaged 模式误报 fail）。d0035c3 原始意图就是挂在 Windows 分支
+    （nvidia-smi 是 Windows LLM=CUDA llama.cpp 的前置，mac 无此检查）。
+    """
+    if os.name != "nt":
+        return
+    ok, msg = _nvidia_gate()
+    print(f"nvidia gate: {msg}")
+    if packaged and not ok:
+        fails.append(msg)
+
+
 def _import_ok(py: Path, module: str) -> bool:
     try:
         r = subprocess.run([str(py), "-c", f"import {module}"], capture_output=True, text=True, timeout=60)
@@ -1460,10 +1476,8 @@ def cmd_doctor() -> int:
     if not va_ok:
         print("  (一键安装: scripts/setup-virtual-audio."
               f"{'sh' if is_mac() else 'ps1'}；装完重启浏览器)")
-        ok, msg = _nvidia_gate()
-        print(f"nvidia gate: {msg}")
-        if packaged and not ok:
-            fails.append(msg)
+    # NVIDIA 门禁独立于虚拟声卡有无（曾误缩进在 if not va_ok 下，见 _doctor_gpu_gate）。
+    _doctor_gpu_gate(packaged=packaged, fails=fails)
 
     current = MODELS["mac"] if is_mac() else MODELS["windows"]
     for name, repo in current.items():
