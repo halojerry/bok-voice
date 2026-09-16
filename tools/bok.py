@@ -1580,31 +1580,51 @@ def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
     return env
 
 
-def cmd_prod_install() -> int:
-    """生成生产常驻单元（mac launchd plist / Windows 服务脚本），不启动。
+def _prod_units() -> list[tuple[str, list[str], dict[str, str], str]]:
+    """生产常驻单元清单（mac plists 与 Windows Task Scheduler 任务共用同一份定义，
+    含完整 env（SSL_CERT_FILE 烘焙后），防两平台定义漂移）。"""
+    agent_env = _agent_prod_env()
+    livekit_bin = str(_embedded_livekit() or "livekit-server")
+    py = repo_python()
+    # unit 定义:name → (args, 附加 env)。agent/interp 共用 agent_env。
+    return [
+        ("bok-control-plane", [str(py), "-m", "uvicorn", "control_plane.main:app", "--host", "127.0.0.1", "--port", "8000"], _control_plane_env((app_data_dir() / "bok_voice.db").as_posix()), "Bok 控制面 API"),
+        ("bok-livekit", [livekit_bin, "--config", str(ROOT / "services" / "livekit-server" / "livekit.yaml")], {}, "LiveKit 信令/媒体"),
+        ("bok-agent", [str(py), "-m", "agent_runtime.main"], agent_env, "A 线客服 agent worker"),
+        ("bok-interp-fwd", [str(py), "-m", "agent_runtime.interpret"], {**_interp_env(agent_env), "BOK_SERVICE": "interp-fwd", "INTERP_DIRECTION": "fwd"}, "B 线同传 fwd"),
+        ("bok-interp-rev", [str(py), "-m", "agent_runtime.interpret"], {**_interp_env(agent_env), "BOK_SERVICE": "interp-rev", "INTERP_DIRECTION": "rev"}, "B 线同传 rev"),
+    ]
+
+
+def cmd_prod_install(node_agent: bool = False, node_args: list[str] | None = None,
+                     open_firewall: bool = False) -> int:
+    """生成生产常驻单元（mac launchd plist / Windows Task Scheduler 任务），不启动。
 
     dev 栈用 `bok.py serve`（前台 + run/*.pid）；生产档把常驻进程交给 OS 守护
-    （launchd KeepAlive=崩溃自动拉起），补上桌面形态天然缺的 watchdog。
-    首次需配 livekit.yaml 生产键（services/livekit-server/livekit.yaml）。
+    （launchd KeepAlive / schtasks RestartOnFailure=崩溃自动拉起），补上桌面形态
+    天然缺的 watchdog。首次需配 livekit.yaml 生产键（services/livekit-server/livekit.yaml）。
+
+    Windows（无头部署，tools/schtasks_units.py 单点生成）：
+      - 缺省真注册 5 个 stack 任务（单机全栈模式；需要管理员 PowerShell）；
+      - `--node-agent [node_agent 参数...]` 改注册单个 bok-node-agent 任务
+        （节点包拓扑：node_agent 内部经 cmd_up 拉全栈，心跳/凭据参数原样透传），
+        例：bok.py prod install --node-agent --cp-url http://cp:8000 --license-key bokn_xxx；
+      - `--open-firewall` 执行 netsh 放行（:8000/:7880 TCP+UDP，需管理员；
+        缺省只打印计划）。
     """
-    agent_env = _agent_prod_env()
+    if is_mac() and node_agent:
+        print("[prod] --node-agent 是 Windows 节点拓扑模式；mac 全栈机用标准 5 单元安装",
+              file=sys.stderr)
+        return 2
     unit_dir = app_data_dir() / "units"
     unit_dir.mkdir(parents=True, exist_ok=True)
     log_dir = app_data_dir() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
     if is_mac():
-        livekit_bin = str(_embedded_livekit() or "livekit-server")
-        py = repo_python()
-        # unit 定义:name → (args, 附加 env)。agent/interp 共用 agent_env。
-        units = [
-            ("bok-control-plane", [str(py), "-m", "uvicorn", "control_plane.main:app", "--host", "127.0.0.1", "--port", "8000"], _control_plane_env((app_data_dir() / "bok_voice.db").as_posix()), "Bok 控制面 API"),
-            ("bok-livekit", [livekit_bin, "--config", str(ROOT / "services" / "livekit-server" / "livekit.yaml")], {}, "LiveKit 信令/媒体"),
-            ("bok-agent", [str(py), "-m", "agent_runtime.main"], agent_env, "A 线客服 agent worker"),
-            ("bok-interp-fwd", [str(py), "-m", "agent_runtime.interpret"], {**_interp_env(agent_env), "BOK_SERVICE": "interp-fwd", "INTERP_DIRECTION": "fwd"}, "B 线同传 fwd"),
-            ("bok-interp-rev", [str(py), "-m", "agent_runtime.interpret"], {**_interp_env(agent_env), "BOK_SERVICE": "interp-rev", "INTERP_DIRECTION": "rev"}, "B 线同传 rev"),
-        ]
-        for name, args, env, comment in units:
+        if open_firewall:
+            print("[prod] --open-firewall 是 Windows(netsh) 专用；mac 走系统防火墙应用签名规则，忽略")
+        for name, args, env, comment in _prod_units():
             label = f"com.bokvoice.{name}"
             arg_xml = "\n".join(f"    <string>{a}</string>" for a in args)
             env_xml = "\n".join(f"      <key>{k}</key>\n      <string>{v}</string>" for k, v in sorted(env.items()))
@@ -1626,20 +1646,115 @@ def cmd_prod_install() -> int:
             out = unit_dir / f"{label}.plist"
             out.write_text(plist)
             print(f"generated {out.relative_to(app_data_dir())}  ({comment})")
+        print(f"\nunits 目录: {unit_dir}")
+        print("mac 装载(KeepAlive 自动拉起):  launchctl bootstrap gui/$(id -u) " + str(unit_dir) + "/*.plist")
+        print("mac 卸载:                      bok.py prod uninstall（或 launchctl bootout gui/$(id -u)/com.bokvoice.bok-control-plane 等）")
+        print("livekit 生产键/端口见 services/livekit-server/livekit.yaml")
+        return 0
+
+    # Windows：Task Scheduler 真注册（BootTrigger=开机自起 + RestartOnFailure=
+    # 崩溃拉回 + SYSTEM principal，与 mac plists 同信息量；XML/argv 组装见
+    # tools/schtasks_units.py，元素顺序/env 前缀链约束见其模块 docstring）。
+    import schtasks_units as _sch
+
+    if node_agent:
+        node_args = list(node_args or [])
+        if "--cp-url" not in node_args:
+            print("[prod] --node-agent 需要 node_agent 参数（--cp-url 必填）："
+                  "bok.py prod install --node-agent --cp-url <url> "
+                  "[--node-token TOK | --license-key KEY] [--ui-dir DIR] ...",
+                  file=sys.stderr)
+            return 2
+        py = repo_python()
+        units = [(
+            "node-agent",
+            [str(py), str(ROOT / "tools" / "node_agent.py"), *node_args],
+            {"PYTHONUNBUFFERED": "1"},
+            "薄节点守护（cmd_up 拉全栈 + 心跳；参数原样透传 node_agent）",
+        )]
     else:
-        print("Windows 生产档：请用 NSSM 将以下进程注册为服务（本项目开发期用 `bok.py serve`）：")
-        for name, args, _env, comment in []:
-            pass
-        for name, args in (
-            ("bok-control-plane", [str(repo_python()), "-m", "uvicorn", "control_plane.main:app", "--port", "8000"]),
-            ("bok-agent", [str(repo_python()), "-m", "agent_runtime.main"]),
-        ):
-            print(f"  nssm install {name} {args[0]} {' '.join(args[1:])}")
+        units = _prod_units()
+
+    comspec = os.environ.get("ComSpec", "cmd.exe")
+    install_ok = True
+    for name, args, env, comment in units:
+        tname = _sch.task_name(name)
+        arguments = _sch.build_cmd_arguments(env, args, str(ROOT),
+                                             log_dir / f"{name}.log",
+                                             log_dir / f"{name}.err.log")
+        xml = _sch.build_unit_task_xml(name, comspec, arguments, str(ROOT))
+        xml_path = _sch.write_task_xml(unit_dir / f"{tname}.xml", xml)
+        r = _sch.run_schtasks(_sch.schtasks_create_argv(tname, xml_path))
+        if r.returncode == 0:
+            print(f"registered {tname}  ({comment})")
+            print(f"  xml: {xml_path.relative_to(app_data_dir())}")
+            print(f"  action: {comspec} {arguments}")
+        else:
+            install_ok = False
+            tail = ((r.stderr or "").strip() or (r.stdout or "").strip()).splitlines()
+            detail = tail[-1][:200] if tail else ""
+            print(f"FAILED {tname}: schtasks rc={r.returncode} {detail}"
+                  "（需要管理员 PowerShell？）", file=sys.stderr)
+
+    fw_rc = _sch.apply_firewall_rules(open_firewall)
     print(f"\nunits 目录: {unit_dir}")
-    print("mac 装载(KeepAlive 自动拉起):  launchctl bootstrap gui/$(id -u) " + str(unit_dir) + "/*.plist")
-    print("mac 卸载:                      launchctl bootout gui/$(id -u)/com.bokvoice.bok-control-plane 等")
+    print("windows 查询: schtasks /query /tn bok-control-plane 等（开机自起+RestartOnFailure 拉回）")
+    print("windows 卸载: bok.py prod uninstall")
     print("livekit 生产键/端口见 services/livekit-server/livekit.yaml")
-    return 0
+    return 0 if (install_ok and fw_rc == 0) else 1
+
+
+def cmd_prod_uninstall() -> int:
+    """卸载生产常驻单元（mac launchd bootout+删 plist / Windows schtasks /delete）。
+
+    幂等：未安装的单元记 informational 不算失败；真失败（权限/删除被拒）返回 1。
+    Windows 卸载面含 bok-node-agent（装过 --node-agent 的机器一把清）。
+    """
+    unit_dir = app_data_dir() / "units"
+    failures = 0
+    if is_mac():
+        for name, _args, _env, _comment in _prod_units():
+            label = f"com.bokvoice.{name}"
+            plist = unit_dir / f"{label}.plist"
+            if not plist.exists():
+                print(f"[uninstall] {label}: not installed")
+                continue
+            r = subprocess.run(
+                ["launchctl", "bootout", f"gui/{os.getuid()}", str(plist)],
+                capture_output=True, text=True, timeout=60)
+            if r.returncode == 0:
+                print(f"[uninstall] {label}: bootout ok")
+            else:
+                # 未加载（No such process）是幂等卸载的常态，不算失败。
+                tail = ((r.stderr or "").strip().splitlines() or [""])[0][:120]
+                print(f"[uninstall] {label}: bootout rc={r.returncode} {tail}")
+            plist.unlink(missing_ok=True)
+            print(f"[uninstall] removed {plist.relative_to(app_data_dir())}")
+        return 0
+
+    import schtasks_units as _sch
+
+    for name in [u[0] for u in _prod_units()] + ["node-agent"]:
+        tname = _sch.task_name(name)
+        # /end 停运行实例（未在跑 rc!=0 属常态，忽略）；/delete /f 卸载注册。
+        _sch.run_schtasks(_sch.schtasks_end_argv(tname))
+        r = _sch.run_schtasks(_sch.schtasks_delete_argv(tname))
+        combined = ((r.stdout or "") + (r.stderr or "")).lower()
+        if r.returncode == 0:
+            print(f"[uninstall] {tname}: deleted")
+        elif "does not exist" in combined:
+            print(f"[uninstall] {tname}: not installed")
+        else:
+            failures += 1
+            tail = ((r.stderr or "").strip() or (r.stdout or "").strip()).splitlines()
+            detail = tail[-1][:200] if tail else ""
+            print(f"[uninstall] FAILED {tname}: schtasks rc={r.returncode} {detail}",
+                  file=sys.stderr)
+        xml_path = unit_dir / f"{tname}.xml"
+        if xml_path.exists():
+            xml_path.unlink()
+            print(f"[uninstall] removed {xml_path.relative_to(app_data_dir())}")
+    return 1 if failures else 0
 
 
 def cmd_prod_status() -> int:
@@ -1678,9 +1793,14 @@ def cmd_prod_status() -> int:
     return 0 if all_ok else 1
 
 
-def cmd_prod(cmd: str) -> int:
+def cmd_prod(cmd: str, node_agent: bool = False,
+             node_args: list[str] | None = None,
+             open_firewall: bool = False) -> int:
     if cmd == "install":
-        return cmd_prod_install()
+        return cmd_prod_install(node_agent=node_agent, node_args=node_args,
+                                open_firewall=open_firewall)
+    if cmd == "uninstall":
+        return cmd_prod_uninstall()
     return cmd_prod_status()
 
 
@@ -1691,7 +1811,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         sub.add_parser(name)
     sub.add_parser("tts-pregen", help="离线预合成 TTS 本地缓存(参数透传:--greetings/--objects/--fillers/--cp/--model)")
     p_prod = sub.add_parser("prod", help="生产常驻单元与健康面")
-    p_prod.add_argument("action", nargs="?", default="status", choices=["install", "status"])
+    p_prod.add_argument("action", nargs="?", default="status",
+                        choices=["install", "status", "uninstall"])
+    p_prod.add_argument("--node-agent", action="store_true",
+                        help="[install;Windows] 注册单个 node_agent 任务，其余参数原样透传")
+    p_prod.add_argument("--open-firewall", action="store_true",
+                        help="[install;Windows] 执行 netsh 防火墙放行(需管理员；缺省只打印计划)")
     p_setup = sub.add_parser("setup", help="First-run model readiness / download")
     p_setup.add_argument("action", nargs="?", default="status", choices=["status", "download"])
     # tts-pregen/tts-mine 参数原样透传给执行脚本,顶层不做校验
@@ -1788,7 +1913,10 @@ def main(argv=None) -> int:
     if args.cmd == "setup":
         return cmd_setup(args.action)
     if args.cmd == "prod":
-        return cmd_prod(args.action)
+        return cmd_prod(args.action,
+                        node_agent=getattr(args, "node_agent", False),
+                        node_args=getattr(args, "extra", None),
+                        open_firewall=getattr(args, "open_firewall", False))
     if args.cmd == "tts-pregen":
         return cmd_tts_pregen(getattr(args, "extra", None))
     if args.cmd == "clean-testdata":
