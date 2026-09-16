@@ -19,6 +19,8 @@ type NavItem = {
   key?: PageKey;
   /** 主管专属（不可授予 user，见契约 §1）；管理员/匿名本地模式可见。 */
   admin?: boolean;
+  /** root 专属（平台面，如 /nodes 节点吊销）；管理员与匿名本地模式也不可见。 */
+  rootOnly?: boolean;
 };
 
 /** 主导航（user 项在前、主管管理区在后；顺序即契约 §4 的最终顺序）。 */
@@ -33,6 +35,7 @@ const NAV: NavItem[] = [
   { href: "/reports", label: "报表", key: "reports" },
   { href: "/supervisor", label: "主管台", admin: true },
   { href: "/users", label: "员工", admin: true },
+  { href: "/nodes", label: "节点", rootOnly: true },
   { href: "/knowledge", label: "知识库", admin: true },
   { href: "/personas", label: "人设", admin: true },
   { href: "/audit", label: "审计", admin: true },
@@ -44,8 +47,12 @@ const GUARD_ONLY: NavItem[] = [
   { href: "/translate", label: "同传", key: "interpret" },
 ];
 
-/** 路由访问门（契约 §4）：open=放行；page=按权限键；manager=主管专属。 */
-export type RouteGate = { kind: "open" } | { kind: "page"; key: PageKey } | { kind: "manager" };
+/** 路由访问门（契约 §4）：open=放行；page=按权限键；manager=主管专属；root=root 专属。 */
+export type RouteGate =
+  | { kind: "open" }
+  | { kind: "page"; key: PageKey }
+  | { kind: "manager" }
+  | { kind: "root" };
 
 /** 前缀匹配：/calls 命中 /calls 与 /calls/**（静态导出尾斜杠兼容），不命中 /callsXYZ。 */
 function matchesPath(pathname: string, prefix: string): boolean {
@@ -56,13 +63,15 @@ function matchesPath(pathname: string, prefix: string): boolean {
 export function gateForPath(pathname: string): RouteGate {
   const hit = [...NAV, ...GUARD_ONLY].find((n) => matchesPath(pathname, n.href));
   if (!hit) return { kind: "open" };
+  if (hit.rootOnly) return { kind: "root" };
   if (hit.admin) return { kind: "manager" };
   return hit.key ? { kind: "page", key: hit.key } : { kind: "open" };
 }
 
-/** 导航项可见性：匿名本地模式/admin/root=全部；user=权限键 ∩ 有效集（主管项隐藏）。 */
+/** 导航项可见性：root 专属项仅登录 root 可见；匿名本地模式/admin=主管项全可见；user=权限键 ∩ 有效集。 */
 function navVisible(item: NavItem, session: Session | null): boolean {
   if (!session) return false;
+  if (item.rootOnly) return !session.anonymous && session.role === "root";
   if (isManager(session)) return true;
   if (item.admin) return false;
   return item.key ? hasPage(session, item.key) : true;

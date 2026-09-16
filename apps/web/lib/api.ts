@@ -236,6 +236,19 @@ export const api = {
     request<Record<string, unknown>[]>(
       `/api/audit?account_id=${encodeURIComponent(accountId)}&action=${encodeURIComponent(action)}&call_id=${encodeURIComponent(callId)}`,
     ),
+  // 节点注册表（P1 平台面，root 专属）：清单 + 吊销/解除吊销（kill-switch UI）。
+  // unrevoke 后端 409=节点本就未吊销（live），404=节点不存在，均由页面内联展示。
+  listNodes: () => request<NodeRow[]>("/api/nodes"),
+  revokeNode: (nodeId: string) =>
+    request<{ node_id: string; revoked: boolean }>(
+      `/api/nodes/${encodeURIComponent(nodeId)}/revoke`,
+      { method: "POST" },
+    ),
+  unrevokeNode: (nodeId: string) =>
+    request<{ node_id: string; revoked: boolean }>(
+      `/api/nodes/${encodeURIComponent(nodeId)}/unrevoke`,
+      { method: "POST" },
+    ),
   setupStatus: () => request<SetupStatus>("/api/setup"),
   setupDownload: () => fetch(`${apiBase()}/api/setup/download`, { method: "POST", headers: authHeaders() }).then(async (res) => {
     if (!res.ok) throw await toError(res);
@@ -279,4 +292,21 @@ export type UserRow = {
   /** 有效权限（user 角色）；admin/root 为全部 grantable 键 */
   permissions?: string[];
   created_at?: string;
+};
+
+// ---- 节点注册表（P1，root 平台面；与 CP nodes_store.list_nodes 输出对齐） ----
+export type NodeRow = {
+  node_id: string;
+  org_id?: string;
+  name: string;
+  platform: string;
+  version?: string;
+  /** online（心跳窗口内）/ offline / revoked（sticky 吊销） */
+  status: "online" | "offline" | "revoked";
+  /** root=人工吊销（sticky）；auto_clone=克隆检出自动吊销（重注册可复活） */
+  revoked_source?: string;
+  last_seen_at?: string | null;
+  license_id?: string;
+  /** 指纹只出前 12 位 hex（可辨识、不可还原） */
+  fingerprint_prefix?: string;
 };
