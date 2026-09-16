@@ -170,7 +170,10 @@ def schtasks_delete_argv(tname: str) -> list[str]:
 
 
 def run_schtasks(argv: list[str], timeout: float = 60.0) -> subprocess.CompletedProcess:
-    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    # errors="replace"：zh-CN Windows 的 schtasks 输出是 GBK（cp936），偶发杂字节
+    # 不得让 install/uninstall 整体崩掉——坏字节替换成 U+FFFD，仅影响人读的日志面。
+    return subprocess.run(argv, capture_output=True, text=True, errors="replace",
+                          timeout=timeout)
 
 
 # ---- 防火墙放行（netsh advfirewall；默认 print-only，--open-firewall 才执行）----
