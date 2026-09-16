@@ -171,6 +171,12 @@ async def node_revoked_gate(request: Request, call_next):
         if token:
             node = _node_store().resolve_node_token(token)
             if node is not None and node.get("revoked"):
+                # 取证审计（site-delivery fixwave）：窒息点每次命中落一条（按尝试计，
+                # revoked 节点已在停栈流程中，量级天然有界）。_audit 为运行时名字
+                # 解析，中间件注册先于其定义无碍。
+                _audit("node.chokepoint_denied", subject_type="node",
+                       subject_id=node.get("node_id", ""), outcome="denied",
+                       account_id="", detail={"path": request.url.path})
                 return JSONResponse(status_code=403, content={"detail": "node revoked"})
     return await call_next(request)
 
@@ -2158,6 +2164,12 @@ def register_node(req: NodeRegisterRequest) -> dict:
                 name=req.name, platform=req.platform, org_id=req.org_id,
                 version=req.version)
         except LicenseError as exc:
+            # sticky 熔断取证（site-delivery fixwave）：root 吊销行重注册被拒不复活
+            # 落审计（按尝试计）；其余 license 拒绝维持原语义不刷审计。
+            if exc.reason == "node revoked":
+                _audit("node.register_denied_revoked", subject_type="node",
+                       subject_id="", outcome="denied", account_id="",
+                       detail={"fingerprint_prefix": fingerprint[:12]})
             raise HTTPException(exc.status_code, exc.reason) from exc
         _audit("node.registered", subject_type="node", subject_id=node_id,
                account_id="", detail={
@@ -2177,6 +2189,11 @@ def register_node(req: NodeRegisterRequest) -> dict:
         )
     except LicenseError as exc:
         # 开放流复用候选是 root 吊销行（sticky）：同一拒绝语义，不分认证模式。
+        # 熔断取证（site-delivery fixwave）：sticky 拒绝落审计，按尝试计。
+        if exc.reason == "node revoked":
+            _audit("node.register_denied_revoked", subject_type="node",
+                   subject_id="", outcome="denied", account_id="",
+                   detail={"fingerprint_prefix": (req.fingerprint or "")[:12]})
         raise HTTPException(exc.status_code, exc.reason) from exc
     _audit("node.registered", subject_type="node", subject_id=node_id,
            account_id="", detail={
