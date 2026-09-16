@@ -352,6 +352,11 @@ root 在 web `/nodes` 页（`POST /api/nodes/{id}/revoke`，`/unrevoke` 解除�
   同样拦）；携带 node_id 的建单在建单时 403（未知节点 404）、该通话取 token
   时同样 403（覆盖坐席 JWT 通道）。revoked 节点打其余端点仍走各自原有门禁，
   行为零变化。
+- **node_id 绑定的生产者边界（诚实边界，fixwave 记录）**：`call_sessions.node_id`
+  目前只由**直连 API 的调用方**写入（`POST /api/calls` 显式携带）——外呼战役
+  （`control_plane/campaign.py`）与 web UI 建单尚未接线，node_id 绑定窒息通道
+  对这两条路径暂为潜在防线；已交付的真实 choke 是 node_token 通道（上面的窒息
+  点中间件）。campaign/UI 建单接线为 tracked follow-up。
 - **root 吊销=sticky**：永久生效，唯一恢复路径 `POST /api/nodes/{id}/unrevoke`
   （root 专属；解除后节点须重注册换发 token / 心跳成功才回 online）；克隆检出
   自动吊销（revoked_source=auto_clone）保留同指纹重注册复活路径——root 吊销
