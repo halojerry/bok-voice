@@ -47,7 +47,9 @@ jobs:
       DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/postgres
       # auth-on 形态起步：握手链路的 401/门禁分支只有在认证开着时才被真实执行。
       BOK_AUTH_REQUIRED: "1"
-      BOK_JWT_SECRET: ci-node-handshake-jwt-secret
+      # ≥32 字节：main.py startup fail-closed 校验拒签发强度不足的密钥（<32B 即拒启），
+      # 短常量会让 linux job 的 CP 根本起不来（kill-switch 探针随之无从跑起）。
+      BOK_JWT_SECRET: ci-node-handshake-jwt-secret-0123456789abcdef
       BOK_ROOT_USERNAME: root
       CP_BASE: http://127.0.0.1:18011
     steps:
