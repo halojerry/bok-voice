@@ -48,7 +48,7 @@ jobs:
           npm test
 
   web:
-    name: Web typecheck + export
+    name: Web typecheck + export + unit tests
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -64,6 +64,11 @@ jobs:
           npm ci
           npx tsc --noEmit
           npm run build
+      - name: Web unit tests (node --test)
+        working-directory: apps/web
+        run: npm test
+      - name: Thin-client static probe (out/ 注入链形状 + 无烤死 localhost; runner python 即可,纯 stdlib)
+        run: python scripts/probe_thin_client_static.py
 
   bok:
     name: Launcher smoke
