@@ -7,9 +7,27 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from livekit.agents import llm as agents_llm
 
 from agent_runtime.providers.livekit_plugins import MlxLlmLLM, StatelessMTLLM
+
+
+@pytest.fixture(autouse=True)
+def _owned_event_loop():
+    """本文件自带事件循环,次序与依赖版本双免疫。
+
+    CI 按 livekit-agents>=1.8.0,<1.9 解析到最新补丁版(2026-09-16 实测 1.8.2;
+    本地 venv 钉 1.8.0),其 LLM 路径新增 asyncio.get_event_loop() 调用;而套件
+    里先跑的 asyncio.run 测试收尾 set_event_loop(None) 把默认策略毒化——
+    Python 3.12 起毒化态不再自动建 loop,直接 RuntimeError(no current event
+    loop in MainThread)。每个测试前挂全新 loop,收尾清场不外溢。"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    yield
+    asyncio.set_event_loop(None)
+    loop.close()
 
 
 class _RecorderLLM(agents_llm.LLM):
