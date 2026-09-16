@@ -129,7 +129,8 @@ CREATE TABLE public.call_sessions (
     target_lang character varying(16) NOT NULL,
     glossary text NOT NULL,
     session_report text NOT NULL,
-    created_at timestamp without time zone NOT NULL
+    created_at timestamp without time zone NOT NULL,
+    node_id character varying(64) DEFAULT ''::character varying
 );
 
 
@@ -306,7 +307,9 @@ CREATE TABLE public.nodes (
     last_seen_at timestamp without time zone,
     created_at timestamp without time zone NOT NULL,
     license_id character varying(64) NOT NULL,
-    fingerprint character varying(128) NOT NULL
+    fingerprint character varying(128) NOT NULL,
+    revoked_source character varying(16) DEFAULT ''::character varying,
+    revoked_at character varying(32) DEFAULT ''::character varying
 );
 
 
