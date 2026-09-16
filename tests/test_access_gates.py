@@ -100,3 +100,33 @@ def test_audit_limit_clamped(monkeypatch):
     h = {"Authorization": "Bearer " + r.json()["token"]}
     # 巨值 limit 不再透传（SQL LIMIT 巨值=全表进内存）；钳制后正常返回
     assert client.get("/api/audit", params={"limit": 999999999}, headers=h).status_code == 200
+
+
+def test_demoted_admin_old_token_hits_demotion_immediately(monkeypatch):
+    """Task 3 残余收口：create_user/list_users/update_user/change-password/auth_me
+    曾直调 identity_from_request（信 token 内 8h claim）绕过门禁按库刷新的
+    state.identity——admin 被降权后旧 token 在这些端点仍按 admin 放行。改走
+    current_identity（优先门禁刷新身份）后降权即时生效。"""
+    monkeypatch.setenv("BOK_AUTH_REQUIRED", "1")
+    # 显式钉住合法密钥：pytest 收集顺序下 test_auth.py 的短占位可能已占 env，
+    # startup fail-closed 会拒启（与 test_security_hardening 同款处理）。
+    monkeypatch.setenv("BOK_JWT_SECRET", "unit-test-jwt-secret-0123456789abcdef")
+    client, repo = _make(monkeypatch)
+    repo.create_user(username="boss", password_hash=hash_password(PW), role="admin",
+                     org_id="org-t", account_id="acc-001")
+    with client:  # 触发 startup：注入 app.state.user_lookup
+        r = client.post("/api/auth/login", json={"username": "boss", "password": PW})
+        assert r.status_code == 200, r.text
+        h = {"Authorization": "Bearer " + r.json()["token"]}
+        boss_id = repo.get_user_by_username("boss")["id"]
+        # 降权前：admin 管理面操作正常
+        assert client.get("/api/users", headers=h).status_code == 200
+        r = client.patch(f"/api/users/{boss_id}", json={"display_name": "Boss"}, headers=h)
+        assert r.status_code == 200, r.text
+        # 降权：admin → user（repo 直改，模拟另一主管操作；身份未禁用，token 仍有效）
+        repo.update_user(boss_id, role="user")
+        # 降权即时生效：管理面 PATCH 自己（含列表）403；/api/auth/me 报库角色
+        assert client.get("/api/users", headers=h).status_code == 403
+        r = client.patch(f"/api/users/{boss_id}", json={"display_name": "Boss2"}, headers=h)
+        assert r.status_code == 403, r.text
+        assert client.get("/api/auth/me", headers=h).json()["role"] == "user"

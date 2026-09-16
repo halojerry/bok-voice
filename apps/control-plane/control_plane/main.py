@@ -50,7 +50,6 @@ from .auth import (
     deny_cross_account,
     deny_foreign_owner,
     hash_password,
-    identity_from_request,
     identity_gate,
     owner_scope_filter,
     require_role,
@@ -755,7 +754,7 @@ def auth_login(req: LoginRequest) -> dict:
 
 @app.get("/api/auth/me")
 def auth_me(request: Request) -> dict:
-    identity = identity_from_request(request)
+    identity = current_identity(request)
     if identity is None:
         raise HTTPException(401, "missing or invalid token")
     # B4：权限逐请求查库（JWT 只装身份）——主管改权限对已签发 token 即时生效；
@@ -776,7 +775,7 @@ def auth_me(request: Request) -> dict:
 
 @app.post("/api/auth/change-password")
 def auth_change_password(req: ChangePasswordRequest, request: Request) -> dict:
-    identity = identity_from_request(request)
+    identity = current_identity(request)
     if identity is None:
         raise HTTPException(401, "missing or invalid token")
     if len(req.new_password) < 8:
@@ -791,7 +790,7 @@ def auth_change_password(req: ChangePasswordRequest, request: Request) -> dict:
 
 @app.post("/api/users")
 def create_user(req: CreateUserRequest, request: Request) -> dict:
-    identity = identity_from_request(request)
+    identity = current_identity(request)
     if req.role not in ("root", "admin", "user"):
         raise HTTPException(400, "role 必须是 root/admin/user")
     if len(req.password) < 8:
@@ -818,7 +817,7 @@ def create_user(req: CreateUserRequest, request: Request) -> dict:
 
 @app.get("/api/users")
 def list_users(request: Request, account_id: str = "") -> dict:
-    identity = identity_from_request(request)
+    identity = current_identity(request)
     if identity and identity.role == "user":
         raise HTTPException(403, "无账号管理权限")
     # admin 强制本账号视角；root/auth-off 按参过滤（空=全部）。
@@ -828,7 +827,7 @@ def list_users(request: Request, account_id: str = "") -> dict:
 
 @app.patch("/api/users/{user_id}")
 def update_user(user_id: str, req: UpdateUserRequest, request: Request) -> dict:
-    identity = identity_from_request(request)
+    identity = current_identity(request)
     target = _repo().get_user(user_id)
     if not target:
         raise HTTPException(404, "user not found")
