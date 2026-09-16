@@ -19,8 +19,10 @@
     kill(pid,0) 仍成功)+ os.kill(pid,0) 轮询;Windows 目标判据 = tasklist
     按 PID 查询,目标停止命令 = `taskkill /PID <pid> /T /F`(M2 要落地的
     正主)。Windows 今日状态:_start_proc 的 start_new_session 在 Windows
-    抛 ValueError(POSIX-only),故 A1 打 [skip] 并注记 M2 目标,依赖步随跳,
-    不计入退出码——M2 落地后本段必须转绿。
+    抛 ValueError(POSIX-only)——只认这一种签名(nt + ValueError 且消息点名
+    start_new_session)才打 [skip] 并附 [warn] 提示,依赖步随跳,不计入退出码;
+    其余任何 spawn 异常一律 fatal(exit 2),绝不静默漂绿——M2 落地后本段
+    必须转绿。
 
   B 段「schtasks 生命周期」仅 Windows 实跑:纯函数生成 Task Scheduler XML
     (onstart 触发 + RestartOnFailure + SYSTEM principal,一 unit 一 task)→
@@ -212,8 +214,22 @@ def run_section_a(mod: Any, tree_timeout: float) -> str:
             child_pid = mod._start_proc(
                 [sys.executable, "-c", _CHILD_CODE, str(tmp)], pidfile, logfile)
         except Exception as exc:
-            if os.name == "nt":
+            # 窄匹配:只有 nt + ValueError 且消息点名 start_new_session 这一种
+            # 形态才算「今日代码预期 limitation」→ [skip]。其余任何异常(解释器
+            # 问题/杀软拦杀/路径/权限…)一律 fatal(exit 2)——绝不能把无关的
+            # spawn 失败伪装成 skip,让 Windows 腿在 CI 里静默漂绿、什么都没测。
+            if (
+                os.name == "nt"
+                and isinstance(exc, ValueError)
+                and "start_new_session" in str(exc)
+            ):
                 keep_tmp = False  # 还什么都没起,无需留现场
+                print(
+                    "[warn] Windows 停止语义腿(A 段)今日按契约 [skip]:"
+                    "M2 落地 cmd_down/_start_proc Windows 修复后必须转绿;"
+                    "本次运行没有测到任何 Windows down 行为,勿当 Windows 验收依据",
+                    flush=True,
+                )
                 _skip(
                     "A1 起进程树(bok._start_proc,Windows 腿)",
                     f"M2 目标:今日 start_new_session 在 Windows 不可用 -> {exc!r};"
