@@ -1,0 +1,10 @@
+# gitleaks 全历史扫描豁免清单(官方机制:.gitleaksignore,指纹=commit:path:rule:line)。
+# 以下均为测试夹具/文档引用中的合成字面量,不是真实凭据:
+#   tests/test_security_hardening.py:141/189/211 —— webhook/节点鉴权测试用的
+#     "whsec-test-…"/占位常量(断言 401/拒绝路径的输入)。
+#   docs/superpowers/plans/2026-09-16-security-remediation.md:474 —— 整改计划
+#     文档引用的同一测试行。
+4e9ece056e3b4e319c3c33417d45de88b12497bc:tests/test_security_hardening.py:generic-api-key:189
+4e9ece056e3b4e319c3c33417d45de88b12497bc:tests/test_security_hardening.py:generic-api-key:211
+995a8dc7dd444b938aa3d0a5ddeb7549836d466d:tests/test_security_hardening.py:generic-api-key:141
+67d772455f33190576d62c9d50036bf5ed567678:docs/superpowers/plans/2026-09-16-security-remediation.md:generic-api-key:474
