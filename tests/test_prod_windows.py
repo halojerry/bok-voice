@@ -480,6 +480,9 @@ def test_prod_install_windows_schtasks_failure_rc1(monkeypatch, tmp_path: Path) 
     assert bok.cmd_prod_install() == 1
 
 
+@pytest.mark.skipif(sys.platform != "darwin",
+                    reason="mac 契约测试:--node-agent 的 mac 拒绝分支只在 mac 生效;"
+                           "Linux 上 prod install 走不到该分支(跟进项:非 mac/nt 平台应有显式 unsupported 挡板)")
 def test_prod_install_mac_node_agent_rejected(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
     assert bok.cmd_prod_install(node_agent=True, node_args=["--cp-url", "x"]) == 2
