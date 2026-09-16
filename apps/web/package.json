@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next dev -H 127.0.0.1 -p 3000",
-    "lint": "next lint"
+    "lint": "next lint",
+    "test": "node --test \"test/*.test.mjs\""
   },
   "dependencies": {
     "@livekit/components-react": "^2.9.24",
