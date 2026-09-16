@@ -473,6 +473,19 @@ mod tests {
             .find("tauri_plugin_single_instance::init")
             .expect("lib.rs must invoke tauri_plugin_single_instance::init in the builder chain");
 
+        // (b2) Init-order pin (site-delivery fixwave): the plugin must register
+        // EARLIER on the builder chain than `.setup(` — a reorder (setup first,
+        // single-instance later) re-opens the second-launch window before the
+        // OS-level handshake is armed, which is the blind spot this cheap
+        // character-offset compare closes.
+        let setup_pos = source
+            .find(".setup(")
+            .expect("lib.rs must configure the app via Builder::setup");
+        assert!(
+            init_pos < setup_pos,
+            "tauri_plugin_single_instance::init must appear earlier in the builder chain than .setup("
+        );
+
         // A named second-instance handler must exist and be wired into init.
         let handler_name = "on_second_instance";
         let handler_pos = source
