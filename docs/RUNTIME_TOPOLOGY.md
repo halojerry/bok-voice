@@ -12,6 +12,7 @@
   cpUrl/livekitUrl，spec §8 纯内网档）
 - 新数据列：turns.org_id/line/speaker/gen/template_step/started_ms/ended_ms/perceived_ms（分析账本，spec §6.1）
 - 新表：orgs/nodes（org 缝 + 节点注册表，node_token 只存 sha256）
+- 节点远程停机开关（kill-switch）与 Windows 无头常驻契约：见 §3 对应小节
 
 ## 1. 组件与端口
 
@@ -339,6 +340,69 @@ WorkerOptions.port)——默认同为 8081 会竞态,后绑者 Errno 48 即崩
 - 任一服务超时未 UP：`bok.py serve` 返回非零，日志在 app-data/logs，不静默继续
 - 模型缺失：首启向导 `setup status/download`，幂等 + 断点续传
 - 硬件不满足（Windows 无 NVIDIA GPU）：`doctor --packaged` 阻止 LLM 启动并给文案
+
+### 节点远程停机开关（kill-switch，2026-09-16 site-delivery M1/M2）
+
+root 在 web `/nodes` 页（`POST /api/nodes/{id}/revoke`，`/unrevoke` 解除）熔断
+一台节点的云端供给：
+
+- **窒息点=通话面、认证模式无关（不是整 CP 封锁）**：`POST /api/calls` 与
+  `POST /api/token` 两个端点上，任何 Bearer 解析到已吊销节点的请求一律
+  403 `node revoked`（`node_revoked_gate` 中间件注册在最外层，auth-off 开放流
+  同样拦）；携带 node_id 的建单在建单时 403（未知节点 404）、该通话取 token
+  时同样 403（覆盖坐席 JWT 通道）。revoked 节点打其余端点仍走各自原有门禁，
+  行为零变化。
+- **root 吊销=sticky**：永久生效，唯一恢复路径 `POST /api/nodes/{id}/unrevoke`
+  （root 专属；解除后节点须重注册换发 token / 心跳成功才回 online）；克隆检出
+  自动吊销（revoked_source=auto_clone）保留同指纹重注册复活路径——root 吊销
+  不存在注册端点自愈的出路，恢复必须经 root 显式操作。
+- **心跳 401 行动指令**：仅 root-revoked 的心跳 401 detail 携带机器可执行的
+  `{"reason": "…", "action": "shutdown"}`（license 类 401 仍是纯文本）。
+- **node-agent 服从语义**（`tools/node_agent.py`）：`BOK_NODE_KILL_ON_REVOKE`
+  默认 1 = 收到 shutdown 指令即 cmd_down 停栈 + exit 0（绝不 self-heal、
+  不重注册）；=0 观察档（只逐轮大声记录，不停栈不退出——心跳持续 401、失联
+  REFUSE_JOBS 照旧）。license 吊销=永久：node-agent 连续 3 次心跳确认后退避
+  停栈（无 self-heal 出路）；token 失效/auto_clone 吊销仍走 license 流幂等
+  重注册自愈（复活路径保留）。
+- **launchd/KeepAlive 复活环**：mac 生产档（launchd KeepAlive）下被吊销节点
+  会被重新拉起，但只会循环在「注册探测→心跳 401→停栈→exit 0」——栈不复活，
+  只余每次探测的烧耗；彻底止息等 root `unrevoke` 或卸载节点。
+- 验收量尺：`scripts/probe_killswitch.py`（CI `node-handshake.yml` linux job
+  对真 CP 实跑 吊销→窒息点→unrevoke 复活 全链）。
+
+### Windows 无头常驻（Task Scheduler，`bok.py prod install`）
+
+Windows 站点机的常驻等价物（对照 mac launchd RunAtLoad + KeepAlive）：
+
+- `bok.py prod install` 在 Windows 经 `tools/schtasks_units.py` 逐 unit 注册
+  Task Scheduler 任务（任务名 `bok-<unit>`；XML 落盘必须带 BOM 的 UTF-16）：
+  BootTrigger（开机自起）+ RestartOnFailure（PT1M × 3 次）+ SYSTEM principal。
+  **诚实边界**：RestartOnFailure 是有限次拉回（3 次），不等价 launchd
+  KeepAlive 的无限 KeepAlive。
+- **`--node-agent` 单任务模式**（节点包拓扑）：只注册 `bok-node-agent` 一个
+  任务，node_agent 内部经 cmd_up 拉全栈，心跳/凭据参数原样透传
+  （`bok.py prod install --node-agent --cp-url <url> --license-key bokn_…`）。
+- Task Scheduler XML 没有 env 元素：action 用 cmd.exe 前缀链
+  （`cd /d … && set "K=V" && … && "exe" args`）注入 env，env dict 与 mac plist
+  同源同 dict（`cmd_prod_install` 单点组装，含 SSL_CERT_FILE 烘焙）——凭据
+  存放在任务 XML 与 plist env 中等价。
+- `prod uninstall` 对称卸载（mac launchd bootout + 删 plist / Windows
+  `schtasks /delete`；装过 `--node-agent` 的机器连 bok-node-agent 一把清）。
+- `--open-firewall`（netsh 放行 :8000/:7880 TCP+UDP）**默认只打印计划不
+  执行**，显式 flag + 管理员权限才落防火墙。
+- **`schtasks /end` 子树边界**：/end 只终止任务的 Exec 动作进程（本仓恒为
+  cmd.exe），链式子进程（python/livekit 等 payload）存活——
+  `scripts/probe_windows_lifecycle.py` B5b 在真 Windows 实跑断言；依赖 /end
+  停栈的 `prod uninstall` 据此按 pidfile 精确补杀（只杀自己 pid 记录的进程，
+  绝不按镜像名杀共享镜像），无 pidfile 的任务树成员（如 node_agent 自身）
+  WARNING 提示手工处理。
+- `scripts/install-node.ps1 -InstallService`：装完即注册常驻服务（内部执行的
+  就是上面的 `prod install --node-agent`）；当前为 **token 模式**
+  （`--node-token` 直传），license 模式节点直接用 bok.py 注册；任务 XML 经
+  env 前缀链存凭据，与 plist env 等价。
+- 生命周期实跑量尺：`scripts/probe_windows_lifecycle.py`（A 段 down 树杀
+  全平台执行、B 段 schtasks 契约仅 Windows 实跑，runner 无提权时 B 段按
+  access-denied 优雅 [skip]；CI windows job 实跑）。
 
 ## 4. 路径约定
 
