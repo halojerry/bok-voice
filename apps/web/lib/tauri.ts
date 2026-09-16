@@ -2,8 +2,8 @@
 
 /**
  * 前端到 Tauri 桌面壳的桥接薄封装。
- * - desktop/src/bridge.ts 是给 web 工程引用的真实实现；这里按需转发，
- *   避免直接依赖 __TAURI_INTERNALS__（非 Tauri 环境返回失败态）。
+ * - 直接按需转发 __TAURI_INTERNALS__.invoke（非 Tauri 环境返回失败态），
+ *   不依赖任何 desktop 侧 TS 文件。
  */
 export interface ServiceStatus {
   name: string;
