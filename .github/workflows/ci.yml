@@ -48,7 +48,9 @@ jobs:
           npm test
 
   web:
-    name: Web typecheck + export + unit tests
+    # name 必须与 main 分支保护的 required context 逐字一致("Web typecheck + export");
+    # 改名=必检上下文永不出现→PR 永久 BLOCKED(2026-09-16 实证)。加步骤勿改 name。
+    name: Web typecheck + export
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
