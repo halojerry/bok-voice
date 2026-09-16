@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { getAutostart, setAutostart } from "@/lib/tauri";
 
 type ServiceStatus = { name: string; port: number; up: boolean };
 type HealthReport = { app_data_dir: string; services: ServiceStatus[] };
@@ -39,6 +40,8 @@ async function openLogs(): Promise<string> {
 export default function DesktopStatus() {
   const [report, setReport] = useState<HealthReport | null>(null);
   const [reason, setReason] = useState<string>("");
+  const [autostart, setAutostartState] = useState(false);
+  const [autostartBusy, setAutostartBusy] = useState(false);
 
   useEffect(() => {
     if (!invoke()) {
@@ -47,6 +50,8 @@ export default function DesktopStatus() {
     }
     const refresh = () => health().then(setReport).catch(() => setReason("无法读取服务状态"));
     refresh();
+    // 开机自启默认关闭；卡片加载时从系统读回真实状态同步勾选。
+    getAutostart().then(setAutostartState).catch(() => setAutostartState(false));
     const timer = setInterval(refresh, 4000);
     return () => clearInterval(timer);
   }, []);
@@ -96,6 +101,25 @@ export default function DesktopStatus() {
           打开日志目录
         </button>
       </div>
+      <label className="mt-3 flex items-center gap-2 text-xs text-muted-foreground">
+        <input
+          type="checkbox"
+          checked={autostart}
+          disabled={autostartBusy}
+          onChange={async (e) => {
+            const next = e.target.checked;
+            setAutostartBusy(true);
+            try {
+              setAutostartState(await setAutostart(next));
+            } catch {
+              setAutostartState(false);
+            } finally {
+              setAutostartBusy(false);
+            }
+          }}
+        />
+        开机自启（登录时）
+      </label>
     </div>
   );
 }
