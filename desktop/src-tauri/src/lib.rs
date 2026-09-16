@@ -269,18 +269,6 @@ fn open_logs(_app: AppHandle) -> Result<String, String> {
     Ok(dir.display().to_string())
 }
 
-#[tauri::command]
-fn manifest(app: AppHandle) -> Result<String, String> {
-    let root = resolve_root(&app);
-    let out = Command::new(bundled_python(&root))
-        .arg(root.join("tools/bok.py"))
-        .arg("manifest")
-        .current_dir(&root)
-        .output()
-        .map_err(|e| e.to_string())?;
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
-}
-
 fn run_bok_json(app: &AppHandle, args: &[&str]) -> Result<String, String> {
     let root = resolve_root(app);
     let use_py = bundled_python(&root);
@@ -333,7 +321,6 @@ pub fn run() {
             start,
             stop,
             open_logs,
-            manifest,
             setup_status,
             setup_download,
             audio::list_audio_devices,
