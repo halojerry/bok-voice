@@ -9,20 +9,21 @@
   `except Exception: continue` 整个吞掉,pidfile 一条都杀不掉。本探针把目标
   停止/生命周期语义钉成可执行契约,是 M2(Windows down 修复)验收的量尺:
 
-  A 段「down 停止语义」全平台执行——POSIX 腿必须在本机绿(当前 killpg 契约
-    的回归门禁);Windows 腿今日不可跑(见下),由 windows-latest CI(M4)实跑。
+  A 段「down 停止语义」全平台执行——POSIX 腿必须在本机绿(killpg 契约的
+    回归门禁);Windows 腿 M2 起同样实跑(spawn 走 CREATE_NEW_PROCESS_GROUP、
+    探活 tasklist、停止 taskkill /T /F),由 windows-latest CI(M4)实跑。
     步骤:用 bok._start_proc 起「子进程→孙进程」真进程树(POSIX
     start_new_session=True 与 bok 完全同款,杀的是进程组)→ pidfile 落临时
     目录 → monkeypatch 把 cmd_down 的三个副作用出口(run 目录/legacy data
     目录/孤儿清扫)指到临时目录与空操作(零改动 bok.py)→ 跑真 cmd_down →
     断言树成员全灭。死亡判据:POSIX = waitpid 收割直接子进程(zombie 上
     kill(pid,0) 仍成功)+ os.kill(pid,0) 轮询;Windows 目标判据 = tasklist
-    按 PID 查询,目标停止命令 = `taskkill /PID <pid> /T /F`(M2 要落地的
-    正主)。Windows 今日状态:_start_proc 的 start_new_session 在 Windows
-    抛 ValueError(POSIX-only)——只认这一种签名(nt + ValueError 且消息点名
-    start_new_session)才打 [skip] 并附 [warn] 提示,依赖步随跳,不计入退出码;
-    其余任何 spawn 异常一律 fatal(exit 2),绝不静默漂绿——M2 落地后本段
-    必须转绿。
+    按 PID 查询,目标停止命令 = `taskkill /PID <pid> /T /F`(M2 已落地的
+    正主)。防御性 [skip] 门(M2 前的遗留)只剩死代码保险价值:只认
+    nt + ValueError 且消息点名 start_new_session 这一种签名(M2 起 nt spawn
+    走 CREATE_NEW_PROCESS_GROUP,该形态理论上不再出现)才打 [skip] 并附
+    [warn] 提示,依赖步随跳,不计入退出码;其余任何 spawn 异常一律
+    fatal(exit 2),绝不静默漂绿。
 
   B 段「schtasks 生命周期」仅 Windows 实跑:纯函数生成 Task Scheduler XML
     (onstart 触发 + RestartOnFailure + SYSTEM principal,一 unit 一 task)→
@@ -222,9 +223,11 @@ def run_section_a(mod: Any, tree_timeout: float) -> str:
                 [sys.executable, "-c", _CHILD_CODE, str(tmp)], pidfile, logfile)
         except Exception as exc:
             # 窄匹配:只有 nt + ValueError 且消息点名 start_new_session 这一种
-            # 形态才算「今日代码预期 limitation」→ [skip]。其余任何异常(解释器
-            # 问题/杀软拦杀/路径/权限…)一律 fatal(exit 2)——绝不能把无关的
-            # spawn 失败伪装成 skip,让 Windows 腿在 CI 里静默漂绿、什么都没测。
+            # 形态才走防御性 [skip](M2 前的遗留门,现仅剩死代码保险价值——
+            # M2 起 nt spawn 走 CREATE_NEW_PROCESS_GROUP,不应再出现)。其余任何
+            # 异常(解释器问题/杀软拦杀/路径/权限…)一律 fatal(exit 2)——绝不
+            # 能把无关的 spawn 失败伪装成 skip,让 Windows 腿在 CI 里静默漂绿、
+            # 什么都没测。
             if (
                 os.name == "nt"
                 and isinstance(exc, ValueError)
@@ -232,14 +235,15 @@ def run_section_a(mod: Any, tree_timeout: float) -> str:
             ):
                 keep_tmp = False  # 还什么都没起,无需留现场
                 print(
-                    "[warn] Windows 停止语义腿(A 段)今日按契约 [skip]:"
-                    "M2 落地 cmd_down/_start_proc Windows 修复后必须转绿;"
-                    "本次运行没有测到任何 Windows down 行为,勿当 Windows 验收依据",
+                    "[warn] Windows 停止语义腿(A 段)按防御性 [skip] 门跳过"
+                    "(M2 已落地,该门仅剩死代码保险——出现即说明 Windows spawn "
+                    "语义回退了);本次运行没有测到任何 Windows down 行为,"
+                    "勿当 Windows 验收依据",
                     flush=True,
                 )
                 _skip(
                     "A1 起进程树(bok._start_proc,Windows 腿)",
-                    f"M2 目标:今日 start_new_session 在 Windows 不可用 -> {exc!r};"
+                    f"start_new_session ValueError(M2 后不应出现) -> {exc!r};"
                     f"目标停止命令 = taskkill /PID <pid> /T /F",
                 )
                 return "skipped"
