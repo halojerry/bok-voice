@@ -9,7 +9,9 @@
   `web(:3000)`、`asr(:8787)`、`tts(:8788)`、`llm(:1235)`、`b-line(:8790)`，
   及可选的 `livekit(:7880)`。
 - 主窗口指向 `http://127.0.0.1:3000`（dev 网页工作台；打包版直接内嵌静态产物 `apps/web/out`，经 `tauri://localhost` 加载），服务未就绪时显示启动页并自动跳转。
-- 通过 `@tauri-apps/api` 桥接把服务健康、日志目录、模型清单暴露给前端。
+- 前端经 `apps/web/lib/tauri.ts` 直连 Tauri `invoke`（`__TAURI_INTERNALS__`，
+  非 Tauri 环境优雅失败态），把服务健康、日志目录、模型下载状态、音频设备、
+  自启开关暴露给设置页。
 - 模型首启下载走 `tools/bok.py download`，全部落在平台级 `app-data` 目录；
   macOS `~/Library/Application Support/BokVoice`，Windows `%LOCALAPPDATA%\BokVoice`。
 
@@ -44,16 +46,29 @@ cd desktop/src-tauri && cargo test && cargo check
 ```text
 desktop/
   package.json          # tauri CLI 入口
-  src/bridge.ts         # 前端调 Tauri 命令的桥
   src-tauri/
     Cargo.toml
     tauri.conf.json
     src/main.rs
-    src/lib.rs          # 服务编排 / 健康检查 / 打开日志 / manifest
+    src/lib.rs          # 服务编排 / 健康 / 日志 / setup / 自启 / 单实例（invoke 命令面）
+    src/audio.rs        # CoreAudio 系统输出设备枚举/切换
     icons/
     capabilities/default.json
   dist/index.html       # 兜底启动页（窗口未指向 web 时）
 ```
+
+> 前端没有独立桥文件：`desktop/src/` 已删，web 侧 `apps/web/lib/tauri.ts`
+> 直接转发 invoke。
+
+## 自启与常驻（定位注意）
+
+- **自启注册的是当前运行中的二进制路径**（tauri-plugin-autostart）——从安装后的
+  `.app`/安装包里开启才指向安装产物；在开发构建里打开会注册 dev 可执行文件。
+- **`prod install` 站点机上 GUI 自启开关只是便利项**：launchd/schtasks 已接管
+  整栈常驻（见 `docs/RUNTIME_TOPOLOGY.md` §3），桌面自启只决定 GUI 壳是否随
+  登录打开，不重复托管服务。
+- **第二实例聚焦依赖默认 `main` 窗口 label**：单实例插件把后续启动重定向到
+  label 为 `main` 的既有窗口（tauri.conf.json 默认窗口），改 label 会丢聚焦。
 
 ## 可审计性
 

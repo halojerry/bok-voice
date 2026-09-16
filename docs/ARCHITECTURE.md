@@ -37,11 +37,12 @@ Agent Worker (livekit-agents) ── ControlPlaneClient ── ContextInjector �
 
 ### 桌面壳（Tauri）
 
-- **位置**：`desktop/`，Tauri v2 应用：`desktop/src-tauri`（Rust 编排）+ `desktop/src/bridge.ts`（前端桥）。
-- **启动模型**：打开应用即拉起本机服务，**不做开机自启**。Rust 侧 `setup` 调用
+- **位置**：`desktop/`，Tauri v2 应用：`desktop/src-tauri`（Rust 编排）；前端不设独立桥文件，`apps/web/lib/tauri.ts` 按需直连 `invoke`（非 Tauri 环境优雅失败态）。
+- **启动模型**：打开应用即拉起本机服务；默认不开机自启，可选自启经设置页开关
+  （`set_autostart`，注意注册的是运行中二进制路径，见 `desktop/README.md`「自启与常驻」）。Rust 侧 `setup` 调用
   `python tools/bok.py serve`，随后轮询 `:3000/:8000/:8787/:8788/:1235/:8790` 健康度并推送事件。
 - **主窗口**：指向 `http://localhost:3000`（网页工作台）；Web 端在浏览器模式会自动回退为普通页面。
-- **命令**：`health` / `start` / `stop` / `open_logs` / `manifest`，供前端设置页「本机桌面服务」面板调用。
+- **命令**：invoke 命令面 `health` / `start` / `stop` / `open_logs` / `setup_status` / `setup_download` / `list_audio_devices` / `set_system_output` / `set_autostart` / `get_autostart`，供前端设置页「本机桌面服务」与音频设备卡调用。
 - **仓库根解析**：`BOK_ROOT` 环境变量 → Tauri `resource_dir` → `CARGO_MANIFEST_DIR` 上溯（dev）。
 
 ### 平台模型与首启下载
@@ -66,7 +67,8 @@ Agent Worker (livekit-agents) ── ControlPlaneClient ── ContextInjector �
 ### CI/CD
 
 - **CI**（`.github/workflows/ci.yml`）：Python `compileall+pytest`、Node `realtime-translation` 测试、
-  Web `tsc --noEmit`、`docker compose config+build`、`bok manifest/status` 冒烟。
+  Web `tsc --noEmit` + `npm test` + 瘦客户端静态探针、`bok manifest/status` 冒烟、Tauri 桌壳 cargo test/check；
+  节点侧 `node-handshake.yml`：Linux 真 CP 握手 + kill-switch 探针 / Windows ps1 干跑 + 生命周期探针。
 - **Release**（`.github/workflows/release.yml`）：tag `v*` 触发矩阵
   macos-14(dmg) / windows-latest(msi)；`build_release.sh` 构建 web、跑测试、派生图标、
   生成 `models.sha256.json`；`tauri build` 产安装包并上传 artifact。
