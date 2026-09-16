@@ -9,7 +9,7 @@
 --
 -- 生成日期: 2026-09-16
 -- 源镜像:   pgvector/pgvector:pg16
--- 源命令:   docker exec pg-ddl pg_dump -U postgres --schema-only --no-owner --no-privileges postgres
+-- 源命令:   docker exec pg-ddl-fresh pg_dump -U postgres --schema-only --no-owner --no-privileges postgres
 -- 回环校验: pgvector/pgvector:pg16 上应用本文件 + 重跑 build_engine() = 零 DDL 变更(生成时实测)
 -- 规模:     CREATE TABLE 24 张 / CREATE INDEX 34 条 / 数据语句 0 条
 --           (--schema-only:正常应 0 条数据语句;带 DEFAULT/COMMENT 属 schema 本身)
@@ -129,8 +129,8 @@ CREATE TABLE public.call_sessions (
     target_lang character varying(16) NOT NULL,
     glossary text NOT NULL,
     session_report text NOT NULL,
-    created_at timestamp without time zone NOT NULL,
-    node_id character varying(64) DEFAULT ''::character varying
+    node_id character varying(64) DEFAULT ''::character varying NOT NULL,
+    created_at timestamp without time zone NOT NULL
 );
 
 
@@ -308,8 +308,8 @@ CREATE TABLE public.nodes (
     created_at timestamp without time zone NOT NULL,
     license_id character varying(64) NOT NULL,
     fingerprint character varying(128) NOT NULL,
-    revoked_source character varying(16) DEFAULT ''::character varying,
-    revoked_at character varying(32) DEFAULT ''::character varying
+    revoked_source character varying(16) DEFAULT ''::character varying NOT NULL,
+    revoked_at character varying(32) DEFAULT ''::character varying NOT NULL
 );
 
 
