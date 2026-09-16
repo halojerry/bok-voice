@@ -537,3 +537,105 @@ def test_parse_args_prod_uninstall_choice() -> None:
     args = bok.parse_args(["prod", "uninstall"])
     assert args.action == "uninstall"
     assert args.node_agent is False
+
+
+# ---------------- M2-fix ①: _pid_alive 探活不得击杀 ----------------
+
+
+def test_pid_alive_windows_uses_tasklist_never_os_kill(monkeypatch, tmp_path: Path) -> None:
+    """nt：os.kill(pid, 0) 会 TerminateProcess（探活即击杀）——nt 分支必须只走
+    tasklist，绝不碰 os.kill。"""
+    def explode(pid, sig):
+        raise AssertionError(f"os.kill called on nt (pid={pid}, sig={sig})")
+
+    monkeypatch.setattr(bok.os, "name", "nt")
+    monkeypatch.setattr(bok.os, "kill", explode)
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        out = '"python.exe","4242","Console","1","1,000 K"\n' if any("4242" in a for a in argv) else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(bok.subprocess, "run", fake_run)
+    pf = tmp_path / "monitor.pid"
+    pf.write_text("4242\n")
+    assert bok._pid_alive(pf) is True
+    pf.write_text("9999\n")
+    assert bok._pid_alive(pf) is False  # tasklist 查无此 PID → 死
+    assert calls and all(c[:2] == ["tasklist", "/FI"] for c in calls)
+    assert calls[0] == ["tasklist", "/FI", "PID eq 4242", "/FO", "CSV", "/NH"]
+
+
+def test_pid_alive_windows_query_failure_conservative_alive(monkeypatch, tmp_path: Path) -> None:
+    """tasklist 查询失败保守当存活（勿误判单例已死而重复拉起 monitor）。"""
+    monkeypatch.setattr(bok.os, "name", "nt")
+
+    def fake_run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(bok.subprocess, "run", fake_run)
+    pf = tmp_path / "monitor.pid"
+    pf.write_text("4242\n")
+    assert bok._pid_alive(pf) is True
+
+
+def test_pid_alive_posix_still_uses_os_kill(monkeypatch, tmp_path: Path) -> None:
+    """POSIX：与旧代码同款，os.kill(pid, 0) 纯探活。"""
+    if bok.os.name == "nt":
+        pytest.skip("POSIX-only contract")
+    calls: list[tuple] = []
+    monkeypatch.setattr(bok.os, "kill", lambda pid, sig: calls.append((pid, sig)))
+    pf = tmp_path / "monitor.pid"
+    pf.write_text("4242\n")
+    assert bok._pid_alive(pf) is True
+    assert calls == [(4242, 0)]
+
+    def _raise(pid, sig):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(bok.os, "kill", _raise)
+    assert bok._pid_alive(pf) is False
+
+
+# ---------------- M2-fix ②: schtasks /end 杀不到链式子进程 ----------------
+
+
+def test_prod_uninstall_windows_survivor_cleanup(monkeypatch, tmp_path: Path, capsys) -> None:
+    """/end 只杀 Exec 动作进程：pidfile 存活的链式子进程必须被点名 WARNING 并
+    best-effort cmd_down()（taskkill /T /F 按 pidfile）清掉，且全部 /end 先于
+    全部 /delete（先停动作进程→清子进程→再删注册）。"""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(bok, "is_mac", lambda: False)
+    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(0, calls))
+    monkeypatch.setattr(bok, "_pid_alive", lambda pf: True)
+    down_calls: list[int] = []
+    monkeypatch.setattr(bok, "cmd_down", lambda: down_calls.append(1))
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "bok-agent.pid").write_text("111\n")
+    (run_dir / "llm.pid").write_text("222\n")
+    rc = bok.cmd_prod_uninstall()
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert down_calls == [1]
+    assert "bok-agent" in captured.err and "llm" in captured.err
+    assert "WARNING" in captured.err
+    ends = [i for i, c in enumerate(calls) if c[1] == "/end"]
+    deletes = [i for i, c in enumerate(calls) if c[1] == "/delete"]
+    assert ends and deletes and max(ends) < min(deletes)
+
+
+def test_prod_uninstall_windows_no_survivors_skips_down(monkeypatch, tmp_path: Path, capsys) -> None:
+    """无 pidfile 存活：不打 WARNING、不跑 cmd_down（silence = 没有要 surface 的东西）。"""
+    monkeypatch.setattr(bok, "is_mac", lambda: False)
+    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(0, []))
+    monkeypatch.setattr(bok, "_pid_alive", lambda pf: False)
+    down_calls: list[int] = []
+    monkeypatch.setattr(bok, "cmd_down", lambda: down_calls.append(1))
+    assert bok.cmd_prod_uninstall() == 0
+    captured = capsys.readouterr()
+    assert down_calls == []
+    assert "WARNING" not in captured.err
