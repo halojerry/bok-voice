@@ -1079,13 +1079,22 @@ def cmd_monitor() -> int:
         time.sleep(5.0)
 
 
+def _cp_bind_host() -> str:
+    """CP 监听地址（site-delivery fixwave，补 M2.3 计划项「bind 0.0.0.0 env 开关」）：
+    BOK_BIND_HOST 显式 opt-in（如 0.0.0.0）才对外监听，缺省恒 127.0.0.1——本机
+    单用户形态行为零变化。serve 与 prod install（launchd/schtasks 单元定义）共用
+    同一份解析：--open-firewall 的 :8000 放行规则只有 bind 0.0.0.0 时才有意义。"""
+    return (os.environ.get("BOK_BIND_HOST") or "").strip() or "127.0.0.1"
+
+
 def cmd_serve() -> int:
     """Bring up the full no-Docker desktop stack and wait until ready.
 
     Packaged mode (BOK_PACKAGED=1) serves the UI from the Tauri static bundle,
     so the Next server on :3000 is NOT started. All local services bind
-    127.0.0.1. Business data goes to SQLite and the knowledge vault lives in
-    app-data (never the read-only bundle).
+    127.0.0.1 (CP honors BOK_BIND_HOST, default 127.0.0.1). Business data goes
+    to SQLite and the knowledge vault lives in app-data (never the read-only
+    bundle).
     """
     run_dir = app_data_dir() / "run"
     log_dir = app_data_dir() / "logs"
@@ -1101,7 +1110,7 @@ def cmd_serve() -> int:
     cp_env: dict[str, str] = _control_plane_env(db)
     if not healthy(8000):
         _start_proc(
-            [str(py), "-m", "uvicorn", "control_plane.main:app", "--host", "127.0.0.1", "--port", "8000"],
+            [str(py), "-m", "uvicorn", "control_plane.main:app", "--host", _cp_bind_host(), "--port", "8000"],
             run_dir / "control-plane.pid",
             log_dir / "control-plane.log",
             env=cp_env,
@@ -1623,7 +1632,7 @@ def _prod_units() -> list[tuple[str, list[str], dict[str, str], str]]:
     py = repo_python()
     # unit 定义:name → (args, 附加 env)。agent/interp 共用 agent_env。
     return [
-        ("bok-control-plane", [str(py), "-m", "uvicorn", "control_plane.main:app", "--host", "127.0.0.1", "--port", "8000"], _control_plane_env((app_data_dir() / "bok_voice.db").as_posix()), "Bok 控制面 API"),
+        ("bok-control-plane", [str(py), "-m", "uvicorn", "control_plane.main:app", "--host", _cp_bind_host(), "--port", "8000"], _control_plane_env((app_data_dir() / "bok_voice.db").as_posix()), "Bok 控制面 API"),
         ("bok-livekit", [livekit_bin, "--config", str(ROOT / "services" / "livekit-server" / "livekit.yaml")], {}, "LiveKit 信令/媒体"),
         ("bok-agent", [str(py), "-m", "agent_runtime.main"], agent_env, "A 线客服 agent worker"),
         ("bok-interp-fwd", [str(py), "-m", "agent_runtime.interpret"], {**_interp_env(agent_env), "BOK_SERVICE": "interp-fwd", "INTERP_DIRECTION": "fwd"}, "B 线同传 fwd"),

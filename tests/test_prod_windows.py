@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import inspect
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -639,3 +640,47 @@ def test_prod_uninstall_windows_no_survivors_skips_down(monkeypatch, tmp_path: P
     captured = capsys.readouterr()
     assert down_calls == []
     assert "WARNING" not in captured.err
+
+
+# ---------------- ⑨ CP bind host（BOK_BIND_HOST，M2.3 补课） ----------------
+
+
+def _patch_prod_unit_deps(monkeypatch, tmp_path: Path) -> None:
+    """_prod_units 的环境依赖全部钉到无害桩（不碰真实 app-data / 模型路径）。"""
+    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(bok, "repo_python", lambda: "py")
+    monkeypatch.setattr(bok, "_embedded_livekit", lambda: None)
+    monkeypatch.setattr(bok, "_agent_prod_env", lambda: {})
+    monkeypatch.setattr(bok, "_interp_env", lambda env: {})
+    monkeypatch.setattr(bok, "_control_plane_env", lambda db: {})
+
+
+def _cp_unit_args(monkeypatch, tmp_path: Path) -> list[str]:
+    _patch_prod_unit_deps(monkeypatch, tmp_path)
+    units = {name: args for name, args, _env, _comment in bok._prod_units()}
+    return units["bok-control-plane"]
+
+
+def test_prod_units_cp_bind_host_defaults_loopback(monkeypatch, tmp_path: Path) -> None:
+    """缺省恒 127.0.0.1（本机单用户形态行为零变化）；serve 路径消费同一 helper。"""
+    monkeypatch.delenv("BOK_BIND_HOST", raising=False)
+    argv = _cp_unit_args(monkeypatch, tmp_path)
+    assert argv[argv.index("--host") + 1] == "127.0.0.1"
+    serve_src = inspect.getsource(bok.cmd_serve)
+    assert "_cp_bind_host()" in serve_src, (
+        "cmd_serve must consume the same _cp_bind_host() helper as _prod_units")
+
+
+def test_prod_units_cp_bind_host_opt_in_wildcard(monkeypatch, tmp_path: Path) -> None:
+    """BOK_BIND_HOST=0.0.0.0 显式 opt-in 后单元参数携带该 host（--open-firewall
+    的 :8000 规则只在此形态下有意义）。"""
+    monkeypatch.setenv("BOK_BIND_HOST", "0.0.0.0")
+    argv = _cp_unit_args(monkeypatch, tmp_path)
+    assert argv[argv.index("--host") + 1] == "0.0.0.0"
+
+
+def test_prod_units_cp_bind_host_blank_env_falls_back(monkeypatch, tmp_path: Path) -> None:
+    """空串/纯空白 env 等价未设（`or` 兜底），不得下发空 --host。"""
+    monkeypatch.setenv("BOK_BIND_HOST", "   ")
+    argv = _cp_unit_args(monkeypatch, tmp_path)
+    assert argv[argv.index("--host") + 1] == "127.0.0.1"

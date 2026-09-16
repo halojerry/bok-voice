@@ -389,7 +389,10 @@ Windows 站点机的常驻等价物（对照 mac launchd RunAtLoad + KeepAlive�
 - `prod uninstall` 对称卸载（mac launchd bootout + 删 plist / Windows
   `schtasks /delete`；装过 `--node-agent` 的机器连 bok-node-agent 一把清）。
 - `--open-firewall`（netsh 放行 :8000/:7880 TCP+UDP）**默认只打印计划不
-  执行**，显式 flag + 管理员权限才落防火墙。
+  执行**，显式 flag + 管理员权限才落防火墙。**:8000 规则只有 CP 以
+  `BOK_BIND_HOST=0.0.0.0` 显式 opt-in 对外监听时才有意义**——CP 缺省恒绑
+  127.0.0.1（`bok.py` `_cp_bind_host()`：serve 与 prod install 单元定义共用，
+  M2.3 补课的 env 开关），:7880 由 livekit.yaml 决定。
 - **`schtasks /end` 子树边界**：/end 只终止任务的 Exec 动作进程（本仓恒为
   cmd.exe），链式子进程（python/livekit 等 payload）存活——
   `scripts/probe_windows_lifecycle.py` B5b 在真 Windows 实跑断言；依赖 /end
