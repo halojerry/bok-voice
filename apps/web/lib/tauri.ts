@@ -41,3 +41,17 @@ export async function setSystemOutput(deviceId: string): Promise<string> {
   if (!fn) throw new Error("not running in Tauri");
   return (await fn("set_system_output", { deviceId })) as string;
 }
+
+/** 开机自启（登录时）：读取当前状态（非 Tauri 环境抛错；默认关闭）。 */
+export async function getAutostart(): Promise<boolean> {
+  const fn = invoke();
+  if (!fn) throw new Error("not running in Tauri");
+  return (await fn("get_autostart")) as boolean;
+}
+
+/** 开机自启（登录时）：写入状态，返回写入后从系统读回的实际状态。 */
+export async function setAutostart(enabled: boolean): Promise<boolean> {
+  const fn = invoke();
+  if (!fn) throw new Error("not running in Tauri");
+  return (await fn("set_autostart", { enabled })) as boolean;
+}
