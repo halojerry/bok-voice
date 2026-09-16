@@ -642,6 +642,29 @@ def test_prod_uninstall_windows_no_survivors_skips_down(monkeypatch, tmp_path: P
     assert "WARNING" not in captured.err
 
 
+# ---------------- ⑧ doctor 门禁调用位置（结构断言） ----------------
+
+
+def test_doctor_gpu_gate_called_at_function_top_level() -> None:
+    """结构断言（镜像 cargo 探针的源码扫描风格）：`_doctor_gpu_gate(` 在
+    cmd_doctor 里的调用必须位于函数体顶层（缩进 4，不在任何 `if not va_ok:`
+    块内）——曾误缩进在块内（缩进 8），装了虚拟声卡的 Windows 机器结构性跳过
+    GPU 门禁。行为回归见 ⑤ 的三只 gate 单测，这里钉「调用位置」本身。"""
+    src = inspect.getsource(bok.cmd_doctor)
+    calls = [
+        (idx, ln)
+        for idx, ln in enumerate(src.splitlines())
+        if "_doctor_gpu_gate(" in ln and not ln.lstrip().startswith("#")
+    ]
+    assert calls, "cmd_doctor must call _doctor_gpu_gate("
+    for idx, ln in calls:
+        indent = len(ln) - len(ln.lstrip())
+        assert indent == 4, (
+            f"cmd_doctor source line {idx + 1}: _doctor_gpu_gate call indented "
+            f"{indent} spaces — must sit at function-body top level "
+            "(outside any `if not va_ok:` block)")
+
+
 # ---------------- ⑨ CP bind host（BOK_BIND_HOST，M2.3 补课） ----------------
 
 
