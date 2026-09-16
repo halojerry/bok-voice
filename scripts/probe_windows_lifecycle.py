@@ -66,6 +66,16 @@ from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape as _xml_escape
 
+# Windows 控制台默认代码页(cp1252/GBK)不是 UTF-8:探针输出含中文步骤标签,
+# 首 print 即 UnicodeEncodeError(2026-09-16 CI windows-latest 实证,crash 在
+# main() 第一行 [info])。stdout/stderr 重配 UTF-8——替身流(io.StringIO 捕获)
+# 没有 reconfigure,逐流 try 不阻断探针本体。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BOK_PY = REPO_ROOT / "tools" / "bok.py"
 
