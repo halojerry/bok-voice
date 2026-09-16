@@ -5,6 +5,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{AppHandle, Manager, State};
+use tauri_plugin_autostart::ManagerExt;
 
 mod audio;
 
@@ -313,8 +314,56 @@ fn setup_download(app: AppHandle) -> Result<String, String> {
     Ok("started".to_string())
 }
 
+/// Opt in/out of launch-at-login (autostart plugin). Wrapped as our own
+/// command so the frontend never touches plugin permissions directly —
+/// `capabilities/default.json` stays at `core:default` only.
+/// Returns the post-write state read back from the OS registration.
+#[tauri::command]
+fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    let autostart = app.autolaunch();
+    if enabled {
+        autostart.enable().map_err(|e| e.to_string())?;
+    } else {
+        autostart.disable().map_err(|e| e.to_string())?;
+    }
+    autostart.is_enabled().map_err(|e| e.to_string())
+}
+
+/// Read the current launch-at-login state (settings card sync on load).
+#[tauri::command]
+fn get_autostart(app: AppHandle) -> Result<bool, String> {
+    app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
+/// Second launcher launch while one is already running: focus/raise the
+/// existing main window. Deliberately does NOT touch the serve stack — the
+/// first instance already spawned `bok.py serve`; re-running the spawn from
+/// here would double-spawn the whole stack.
+fn on_second_instance(app: &AppHandle, _args: Vec<String>, _cwd: String) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.unminimize();
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
+        // Single-instance guard MUST be the first plugin on the chain and run
+        // before the `.setup` hook below spawns `bok.py serve`: the plugin's
+        // OS-level handshake makes any second launcher process exit during
+        // plugin init (its own setup hook never runs), and the launch is
+        // forwarded to the first instance's `on_second_instance` which only
+        // focuses the window. First-instance-wins: exactly one serve spawn
+        // per machine, ever.
+        .plugin(tauri_plugin_single_instance::init(on_second_instance))
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            // Minimal launch args (none). Autostart defaults to DISABLED —
+            // we never call enable() at startup; users opt in via the
+            // settings card (`set_autostart`).
+            None,
+        ))
         .manage(AppState { bok: Mutex::new(None) })
         .invoke_handler(tauri::generate_handler![
             health,
@@ -323,6 +372,8 @@ pub fn run() {
             open_logs,
             setup_status,
             setup_download,
+            set_autostart,
+            get_autostart,
             audio::list_audio_devices,
             audio::set_system_output
         ])
@@ -382,22 +433,22 @@ mod tests {
         );
     }
 
-    /// Target-semantics contract for the launcher's single-instance guarantee
-    /// (milestone M3). Today the shell has NO single-instance guard: a second
-    /// launch of the app re-runs the `.setup` hook and double-spawns
-    /// `bok.py serve`. M3 lands `tauri-plugin-single-instance`, which must:
-    ///   - be declared as a dependency in `Cargo.toml`,
-    ///   - be registered on the builder chain via
+    /// Target-semantics contract for the launcher's single-instance guarantee.
+    /// The shell is a site installer/launcher for exactly one GPU-machine
+    /// deployment; a second launch of the app must never double-spawn
+    /// `bok.py serve`. `tauri-plugin-single-instance` provides the OS-level
+    /// handshake, and this probe pins the wiring:
+    ///   - the plugin is declared as a dependency in `Cargo.toml`,
+    ///   - it is registered on the builder chain via
     ///     `tauri_plugin_single_instance::init`,
-    ///   - route second launches to a named `fn on_second_instance` handler
+    ///   - second launches route to a named `fn on_second_instance` handler
     ///     wired into `init`, whose body only focuses the existing window —
     ///     the serve-spawn helper must NOT be reachable from that callback.
     ///
-    /// Ignored until M3 lands the plugin; M3 removes this `#[ignore]` to turn
-    /// the probe green. Running it today (`cargo test -- --ignored`) fails on
-    /// assertion (a) — that is the intended RED state.
+    /// Scan hygiene (Task-4 review minor): only the pre-test source region is
+    /// scanned — the source is split on `#[cfg(test)]` so this test module's
+    /// own text (handler name literals, doc-comments) cannot self-match.
     #[test]
-    #[ignore = "M3 single-instance not yet implemented — remove ignore when the plugin lands"]
     fn single_instance_contract() {
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
@@ -406,23 +457,29 @@ mod tests {
             .expect("read desktop/src-tauri/Cargo.toml");
         assert!(
             cargo_toml.contains("tauri-plugin-single-instance"),
-            "Cargo.toml must declare dependency tauri-plugin-single-instance (M3)"
+            "Cargo.toml must declare dependency tauri-plugin-single-instance"
         );
 
-        // (b) src/lib.rs registers the plugin on the builder chain.
+        // (b) src/lib.rs registers the plugin on the builder chain — scan the
+        // pre-test region only so the test's own literals can't self-match.
         let lib_rs = std::fs::read_to_string(manifest.join("src").join("lib.rs"))
             .expect("read desktop/src-tauri/src/lib.rs");
-        let init_pos = lib_rs
+        let source = lib_rs
+            .split("#[cfg(test)]")
+            .next()
+            .expect("lib.rs must contain pre-test source")
+            .to_string();
+        let init_pos = source
             .find("tauri_plugin_single_instance::init")
             .expect("lib.rs must invoke tauri_plugin_single_instance::init in the builder chain");
 
         // A named second-instance handler must exist and be wired into init.
         let handler_name = "on_second_instance";
-        let handler_pos = lib_rs
+        let handler_pos = source
             .find(&format!("fn {}(", handler_name))
             .expect("lib.rs must define a named fn on_second_instance(...) handler");
-        let init_open = init_pos + lib_rs[init_pos..].find('(').expect("init call arguments");
-        let init_call = span_balanced(&lib_rs, init_open, '(', ')');
+        let init_open = init_pos + source[init_pos..].find('(').expect("init call arguments");
+        let init_call = span_balanced(&source, init_open, '(', ')');
         assert!(
             init_call.contains(handler_name),
             "the second-instance handler must be passed to tauri_plugin_single_instance::init"
@@ -430,8 +487,8 @@ mod tests {
 
         // (c) The callback must focus the existing window, not re-run the serve
         // spawn: the serve-spawn helper must be unreachable from its body.
-        let body_open = handler_pos + lib_rs[handler_pos..].find('{').expect("handler body");
-        let handler_body = span_balanced(&lib_rs, body_open, '{', '}');
+        let body_open = handler_pos + source[handler_pos..].find('{').expect("handler body");
+        let handler_body = span_balanced(&source, body_open, '{', '}');
         assert!(
             !handler_body.contains("spawn_bok"),
             "on_second_instance must not spawn the stack; it must focus the existing window only"
