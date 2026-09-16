@@ -27,9 +27,13 @@
   B 段「schtasks 生命周期」仅 Windows 实跑:纯函数生成 Task Scheduler XML
     (onstart 触发 + RestartOnFailure + SYSTEM principal,一 unit 一 task)→
     `schtasks /create /tn <name> /xml <file> /f` → `/query` → `/run` →
-    `/end` → `/delete /tn <name> /f` → `/query` 必须失败(零残留)。
-    非 Windows 平台把命令序列与完整 XML 原样打 [skip] 供评审与日后排障,
-    不影响退出码。
+    Exec 子进程(ping.exe)拉起确认 → `/end` → **/end 必须连 Exec 子进程一起停**
+    (B5b,M2-fix:Task Scheduler 只终止 Exec 动作进程 cmd.exe,链式子进程会存活
+    ——旧断言只查 /query 零残留,对幸存子进程结构性失明) → best-effort
+    taskkill /IM ping.exe /T /F 清理 → `/delete /tn <name> /f` → `/query`
+    必须失败(零残留)。ping 前后 PID 集合差分定位任务拉起的子进程,防把机器上
+    无关 ping.exe 记到任务头上。非 Windows 平台把命令序列与完整 XML 原样打
+    [skip] 供评审与日后排障,不影响退出码。
 
 用法:
   python scripts/probe_windows_lifecycle.py [--task-name NAME]
@@ -360,8 +364,10 @@ def _schtasks_plan(task_name: str, xml_file: str = "<utf-16 编码的 XML 文件
         f"schtasks /create /tn {task_name} /xml \"{xml_file}\" /f",
         f"schtasks /query /tn {task_name}          # rc=0 注册可查",
         f"schtasks /run /tn {task_name}            # rc=0 按需启动",
-        "(sleep 2s)",
+        "tasklist /FI \"IMAGENAME eq ping.exe\"   # B4b: Exec 子进程已被拉起(前后 PID 差分)",
         f"schtasks /end /tn {task_name}            # rc=0 停实例",
+        "tasklist /FI \"IMAGENAME eq ping.exe\"   # B5b: 子进程必须已死(存活=FAIL)",
+        "taskkill /IM ping.exe /T /F              # best-effort 清理(不留残留)",
         f"schtasks /delete /tn {task_name} /f      # rc=0 卸载",
         f"schtasks /query /tn {task_name}          # 必须失败(零残留)",
     ]
@@ -383,6 +389,28 @@ def _skip_section_b(task_name: str) -> None:
     print("[skip] 任务 XML 全文(utf-16 落盘,schtasks /xml 只认带 BOM 的 UTF-16):", flush=True)
     for line in xml.splitlines():
         print(f"[skip]   {line}", flush=True)
+
+
+def _ping_pids() -> set[int]:
+    """机器上 ping.exe 的存活 PID 集（tasklist CSV；查询异常=空集，由调用方
+    把「前置缺失」与「已死」区分开——B4b/B5b 的断言都建立在 PID 差分上，
+    防把机器上无关 ping.exe 记到任务头上）。"""
+    try:
+        r = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq ping.exe", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except Exception:
+        return set()
+    pids: set[int] = set()
+    for line in (r.stdout or "").splitlines():
+        parts = [p.strip('"') for p in line.split('","')]
+        if len(parts) >= 2 and parts[0].lower() == "ping.exe":
+            try:
+                pids.add(int(parts[1]))
+            except ValueError:
+                continue
+    return pids
 
 
 def _run_section_b_windows(task_name: str, unit: str) -> None:
@@ -416,12 +444,36 @@ def _run_section_b_windows(task_name: str, unit: str) -> None:
         _record(xml_file.exists() and roundtrip,
                 "B1 生成 Task Scheduler XML(onstart+RestartOnFailure+SYSTEM,一 unit 一 task)",
                 str(xml_file))
+        ping_before = _ping_pids()  # 基线:只把 /run 之后新出现的 ping 记到任务头上
         _sch("B2 /create /xml /f(注册任务)", ["/create", "/tn", task_name,
                                               "/xml", str(xml_file), "/f"], True)
         _sch("B3 /query(注册可查)", ["/query", "/tn", task_name], True)
         _sch("B4 /run(按需启动)", ["/run", "/tn", task_name], True)
         time.sleep(2.0)
+        # B4b 前置确认:/run 真的拉起了 Exec 子进程(ping -n 30 约 29s,2s 处必活)。
+        # 没有这一步,B5b 的「/end 杀干净」可以是空转的假绿。
+        child_pids = _ping_pids() - ping_before
+        _record(bool(child_pids),
+                "B4b Exec 子进程(ping.exe)已被任务拉起",
+                f"任务新增 pids={sorted(child_pids) or '无(/run 没拉起子进程,后续断言不可信)'}")
         _sch("B5 /end(停运行实例)", ["/end", "/tn", task_name], True)
+        time.sleep(1.0)
+        # B5b 核心断言(M2-fix):/end 必须连 Exec 子进程一起停。Task Scheduler
+        # 只终止动作进程 cmd.exe,链式子进程会存活——旧断言只查 /query 零残留,
+        # 对幸存子进程结构性失明。prod 侧 cmd_prod_uninstall 按此假设写
+        # (pidfile 补杀,勿按镜像名杀共享镜像)。
+        survivors = _ping_pids() & child_pids
+        _record(bool(child_pids) and not survivors,
+                "B5b /end 必须连 Exec 子进程一起停(杀不到=schtasks /end 不够用,停栈/卸载须补 taskkill)",
+                f"存活={sorted(survivors) or '无'}")
+        # best-effort 卫生清理(非被测语义):探针绝不留 ping 残留。
+        if _ping_pids():
+            print("[info] best-effort cleanup: taskkill /IM ping.exe /T /F", flush=True)
+            try:
+                subprocess.run(["taskkill", "/IM", "ping.exe", "/T", "/F"],
+                               capture_output=True, timeout=15)
+            except Exception:
+                pass
         _sch("B6 /delete /f(卸载任务)", ["/delete", "/tn", task_name, "/f"], True)
         _sch("B7 /query 零残留(查不到才算过)", ["/query", "/tn", task_name], False)
     finally:

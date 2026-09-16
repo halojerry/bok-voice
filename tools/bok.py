@@ -1744,6 +1744,9 @@ def cmd_prod_uninstall() -> int:
 
     幂等：未安装的单元记 informational 不算失败；真失败（权限/删除被拒）返回 1。
     Windows 卸载面含 bok-node-agent（装过 --node-agent 的机器一把清）。
+    Windows 停栈顺序（schtasks /end 只杀 Exec 动作进程 cmd.exe，链式子进程
+    存活——probe_windows_lifecycle B5b 断言）：/end 全部 → 按 pidfile 补杀
+    幸存子进程（cmd_down，ours-only）→ /delete 全部。
     """
     unit_dir = app_data_dir() / "units"
     failures = 0
@@ -1769,10 +1772,28 @@ def cmd_prod_uninstall() -> int:
 
     import schtasks_units as _sch
 
-    for name in [u[0] for u in _prod_units()] + ["node-agent"]:
+    names = [u[0] for u in _prod_units()] + ["node-agent"]
+    # /end 只终止任务实例的 Exec 动作进程（本仓恒为 cmd.exe），cmd_up 拉起的
+    # 链式子进程（ASR/TTS/LLM/LiveKit/CP/worker）会存活——scripts/
+    # probe_windows_lifecycle.py B5b 在真 Windows 上断言这一点。顺序：
+    # ①逐任务 /end（停动作进程）→ ②按 pidfile 精确清幸存子进程（ours-only；
+    # 勿按镜像名杀——python.exe/livekit-server.exe 是共享镜像，会误杀无关
+    # 进程；无 pidfile 的任务树成员如 node_agent 自身无法廉价归因，见 WARNING
+    # 尾注）→ ③/delete /f 卸载注册。
+    for name in names:
+        _sch.run_schtasks(_sch.schtasks_end_argv(_sch.task_name(name)))
+    alive = [pf for pf in sorted((app_data_dir() / "run").glob("*.pid"))
+             if _pid_alive(pf)]
+    if alive:
+        stems = ", ".join(pf.stem for pf in alive)
+        print(f"[uninstall] WARNING: schtasks /end 杀不到链式子进程，仍在运行: {stems}"
+              " —— best-effort taskkill /T /F（按 pidfile，逐树收割）", file=sys.stderr)
+        cmd_down()
+        print("[uninstall] note: 无 pidfile 记录的任务树成员（如 node_agent 自身）"
+              "若仍存活，请按 PID 手工 taskkill——无法按镜像名安全归因")
+    for name in names:
         tname = _sch.task_name(name)
-        # /end 停运行实例（未在跑 rc!=0 属常态，忽略）；/delete /f 卸载注册。
-        _sch.run_schtasks(_sch.schtasks_end_argv(tname))
+        # /delete /f 卸载注册（未安装 rc!=0 + "does not exist" 属幂等常态）。
         r = _sch.run_schtasks(_sch.schtasks_delete_argv(tname))
         combined = ((r.stdout or "") + (r.stderr or "")).lower()
         if r.returncode == 0:
