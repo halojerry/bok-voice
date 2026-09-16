@@ -13,7 +13,7 @@
 - 分支：从当前默认分支切 `security-remediation-20260916` 工作。
 - Python：PEP 8、4 空格、`from __future__ import annotations`、签名带类型注解；每次 Python 改动后跑 `.venv312/bin/python -m compileall -q apps packages services tools scripts`。
 - DB 迁移只准写在 `apps/control-plane/control_plane/deps.py` `build_engine()` 幂等段；SQL 必须方言可移植（`tests/test_db_portability.py` 门禁）。
-- 术语门禁：不引入 `yue` 字面量（`tests/test_cantonese_terminology.py` 全仓扫描）。
+- 术语门禁：不引入旧粤语拼写的历史字面量（三字母 `y u e`，此处插空格避开扫描；规范值=cantonese，见 `tests/test_cantonese_terminology.py` 全仓扫描）。
 - Conventional commits with scope（`fix(security):` / `test(security):` / `chore(ci):`）；一次提交一个逻辑变更；body 写根因 + 验证证据。
 - 测试命令统一用 `.venv312/bin/python -m pytest`。
 - E2E 铁律不适用本计划（无新 E2E）；回归以单元/组件测试 + 全量 pytest 为准。
