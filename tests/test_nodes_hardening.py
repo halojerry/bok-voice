@@ -87,3 +87,56 @@ def test_node_revoke_endpoint_semantics():
     assert s.revoke_node(node_id) is False  # 已吊销
     ok, reason = s.heartbeat(token, {})
     assert not ok
+
+
+def test_deps_dedupes_duplicate_fingerprint_rows(tmp_path):
+    """终审修复(2)：唯一索引建前的 (license_id, fingerprint) 去重语句回归。
+
+    历史配额竞态可能在 nodes 表留下同 (license_id, fingerprint) 重复行，令
+    CREATE UNIQUE INDEX 直接失败。用裸 SQLAlchemy engine 执行 deps.py 的
+    NODES_FP_DEDUPE_SQL（与启动迁移同一语句，防漂移）：行数收敛、每组保留
+    MAX(id) 行、随后唯一索引可建成；open-mode（license_id=''）行不受影响。
+    """
+    from sqlalchemy import create_engine, text
+
+    from control_plane.deps import NODES_FP_DEDUPE_SQL
+
+    engine = create_engine(f"sqlite:///{tmp_path}/nodes_dedupe.db", future=True)
+    from bok_voice_business_db import models
+
+    models.create_all(engine)
+    with engine.begin() as conn:
+        # 同 (lic-1, fp-A) 三行：应只留 MAX(id)='node-n3'；另置一组 (lic-2, fp-B)
+        # 重复两行 + 一行 open-mode（license_id=''）重复两行（必须原样保留）。
+        conn.execute(text(
+            "INSERT INTO nodes (id, org_id, name, token_hash, platform, version,"
+            " status, metrics_json, license_id, fingerprint, created_at) VALUES"
+            "('node-n1','o','a','','t','v','offline','{}','lic-1','fp-A','2026-09-16 00:00:01'),"
+            "('node-n3','o','c','','t','v','offline','{}','lic-1','fp-A','2026-09-16 00:00:01'),"
+            "('node-n2','o','b','','t','v','offline','{}','lic-1','fp-A','2026-09-16 00:00:01'),"
+            "('node-m1','o','m1','','t','v','offline','{}','lic-2','fp-B','2026-09-16 00:00:01'),"
+            "('node-m2','o','m2','','t','v','offline','{}','lic-2','fp-B','2026-09-16 00:00:01'),"
+            "('node-o1','o','o1','','t','v','offline','{}','','fp-X','2026-09-16 00:00:01'),"
+            "('node-o2','o','o2','','t','v','offline','{}','','fp-X','2026-09-16 00:00:01')"
+        ))
+        result = conn.execute(text(NODES_FP_DEDUPE_SQL))
+        # lic-1 组删 2（留 n3）、lic-2 组删 1（留 m2）；open-mode 组零删除。
+        assert result.rowcount == 3, result.rowcount
+        remaining = dict(conn.execute(
+            text("SELECT id, license_id FROM nodes")
+        ).fetchall())
+    assert set(remaining) == {"node-n3", "node-m2", "node-o1", "node-o2"}
+    assert remaining["node-n3"] == "lic-1" and remaining["node-m2"] == "lic-2"
+    # 去重后部分唯一索引必须可建成（重复行在则 IntegrityError）。
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_nodes_license_fingerprint "
+            "ON nodes (license_id, fingerprint) WHERE license_id <> ''"
+        ))
+    # 幂等：再跑一遍零删除，索引仍在。
+    with engine.begin() as conn:
+        assert conn.execute(text(NODES_FP_DEDUPE_SQL)).rowcount == 0
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_nodes_license_fingerprint "
+            "ON nodes (license_id, fingerprint) WHERE license_id <> ''"
+        ))

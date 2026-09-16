@@ -41,6 +41,16 @@ _FILLER_SEEDS: list[dict] = [
     {"id": "filler:en-def-1", "lang": "en", "category": "default", "text": "Sure.", "triggers": _json.dumps([], ensure_ascii=False), "priority": 1, "cap": 2},
 ]
 
+# 节点鉴权(P1,终审修复):唯一索引建前去重语句。历史配额竞态可能在 nodes 表留下
+# 同 (license_id, fingerprint) 重复行,令 CREATE UNIQUE INDEX 失败——每组保留
+# MAX(id) 一行。方言可移植写法(SQLite/Postgres 通用,禁 sqlite rowid),
+# tests/test_db_portability.py 门禁;tests/test_nodes_hardening.py 直接执行本语句回归。
+NODES_FP_DEDUPE_SQL = (
+    "DELETE FROM nodes WHERE license_id <> '' AND id NOT IN ("
+    "SELECT MAX(id) FROM nodes WHERE license_id <> '' "
+    "GROUP BY license_id, fingerprint)"
+)
+
 
 def build_engine() -> Engine | None:
     url = os.environ.get("DATABASE_URL", "")
@@ -225,10 +235,25 @@ def build_engine() -> Engine | None:
                 # 部署下配额竞态的库级兜底(进程内由 NodeStore.register_licensed 的
                 # 锁收口)。只约束 license 绑定行:开放模式存量空值行不受影响。
                 # 部分索引 WHERE 语法 SQLite/Postgres 双支持。
-                conn.execute(text(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_nodes_license_fingerprint "
-                    "ON nodes (license_id, fingerprint) WHERE license_id <> ''"
-                ))
+                # 建索引前先去重(终审修复):历史竞态可能已留下同 (license_id,
+                # fingerprint) 重复行,直接 CREATE UNIQUE INDEX 会失败。每组保留
+                # MAX(id) 一行——方言可移植写法(SQLite/Postgres 通用,禁 rowid)。
+                _deduped = conn.execute(text(NODES_FP_DEDUPE_SQL))
+                if _deduped.rowcount > 0:
+                    print(
+                        "[deps] nodes duplicate (license_id, fingerprint) rows "
+                        f"deduped before unique index: removed={_deduped.rowcount} "
+                        "(kept newest MAX(id) row per group)"
+                    )
+                try:
+                    conn.execute(text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS uq_nodes_license_fingerprint "
+                        "ON nodes (license_id, fingerprint) WHERE license_id <> ''"
+                    ))
+                except Exception as exc:
+                    # 专属告警(终审修复):不再落泛化的 migration skipped 文案,
+                    # 索引建不起来(如仍有个别脏行)必须可定位。
+                    print(f"[deps] uq_nodes_license_fingerprint create skipped: {exc}")
         except Exception as exc:  # pragma: no cover - sqlite / duplicate column
             print(f"[deps] idempotent column migration skipped: {exc}")
 
