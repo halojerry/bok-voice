@@ -48,9 +48,12 @@ $AgentPy = Join-Path $RepoRoot "tools\node_agent.py"
 $BokPy = Join-Path $RepoRoot "tools\bok.py"
 
 $script:StepNo = 0
-$script:StepTotal = 5
-if ($SkipModels) { $script:StepTotal = 4 }
-if ($InstallService) { $script:StepTotal = 6 }
+# 步总数=加法不是覆盖：常驻 4 步（体检/venv/握手探活/doctor 终检），模型下载与
+# 注册常驻服务按开关各 +1。旧覆盖式写法在 -SkipModels -InstallService 组合下
+# 报 [x/6] 实跑 5 步（后一个 if 覆盖前一个，组合枚举错了 1）。
+$script:StepTotal = 4
+if (-not $SkipModels) { $script:StepTotal++ }
+if ($InstallService) { $script:StepTotal++ }
 if ($UninstallService) { $script:StepTotal = 1 }
 
 function Step([string]$desc) {
