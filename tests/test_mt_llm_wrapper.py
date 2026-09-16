@@ -7,27 +7,9 @@ from __future__ import annotations
 
 import asyncio
 
-import pytest
-
 from livekit.agents import llm as agents_llm
 
 from agent_runtime.providers.livekit_plugins import MlxLlmLLM, StatelessMTLLM
-
-
-@pytest.fixture(autouse=True)
-def _owned_event_loop():
-    """本文件自带事件循环,次序与依赖版本双免疫。
-
-    CI 按 livekit-agents>=1.8.0,<1.9 解析到最新补丁版(2026-09-16 实测 1.8.2;
-    本地 venv 钉 1.8.0),其 LLM 路径新增 asyncio.get_event_loop() 调用;而套件
-    里先跑的 asyncio.run 测试收尾 set_event_loop(None) 把默认策略毒化——
-    Python 3.12 起毒化态不再自动建 loop,直接 RuntimeError(no current event
-    loop in MainThread)。每个测试前挂全新 loop,收尾清场不外溢。"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    yield
-    asyncio.set_event_loop(None)
-    loop.close()
 
 
 class _RecorderLLM(agents_llm.LLM):
@@ -61,67 +43,82 @@ def _conversation_ctx() -> agents_llm.ChatContext:
 
 
 def test_mt_template_exact_cantonese_and_zh():
-    """模板精确断言：历史/system 全丢，只剩一条套官方模板的 user 消息。"""
-    inner = _RecorderLLM()
-    StatelessMTLLM(inner, "cantonese").chat(chat_ctx=_conversation_ctx())
-    assert len(inner.calls) == 1
-    assert inner.calls[0]["items"] == [
-        (
-            "user",
-            "将以下文本翻译为 `粤语`，注意只需要输出翻译后的结果，不要额外解释：\n\n`hello there`",
-        )
-    ]
+    """模板精确断言：历史/system 全丢，只剩一条套官方模板的 user 消息。
 
-    zh_inner = _RecorderLLM()
-    StatelessMTLLM(zh_inner, "zh").chat(chat_ctx=_conversation_ctx())
-    assert zh_inner.calls[0]["items"] == [
-        (
-            "user",
-            "将以下文本翻译为 `中文`，注意只需要输出翻译后的结果，不要额外解释：\n\n`hello there`",
-        )
-    ]
+    chat 链路在 livekit-agents 补丁版(1.8.2+)要运行中事件循环
+    (get_running_loop)，asyncio.run 驱动；1.8.0 钉版下同样成立。
+    """
+
+    async def _run():
+        inner = _RecorderLLM()
+        StatelessMTLLM(inner, "cantonese").chat(chat_ctx=_conversation_ctx())
+        assert len(inner.calls) == 1
+        assert inner.calls[0]["items"] == [
+            (
+                "user",
+                "将以下文本翻译为 `粤语`，注意只需要输出翻译后的结果，不要额外解释：\n\n`hello there`",
+            )
+        ]
+
+        zh_inner = _RecorderLLM()
+        StatelessMTLLM(zh_inner, "zh").chat(chat_ctx=_conversation_ctx())
+        assert zh_inner.calls[0]["items"] == [
+            (
+                "user",
+                "将以下文本翻译为 `中文`，注意只需要输出翻译后的结果，不要额外解释：\n\n`hello there`",
+            )
+        ]
+
+    asyncio.run(_run())
 
 
 def test_mt_is_stateless_across_histories():
     """无状态：历史天差地别，只要最后一条 user 文本相同，发给内芯的 ctx 逐字节一致。"""
-    inner = _RecorderLLM()
-    wrapper = StatelessMTLLM(inner, "en")
 
-    ctx_a = agents_llm.ChatContext()
-    ctx_a.add_message(role="system", content="场景 A：集运客服，讲了 40 轮粤语。")
-    ctx_a.add_message(role="user", content="之前讲咗一大輪關於包裹破損賠償嘅嘢")
-    ctx_a.add_message(role="assistant", content="A 的回复历史")
-    ctx_a.add_message(role="user", content="hello there")
+    async def _run():
+        inner = _RecorderLLM()
+        wrapper = StatelessMTLLM(inner, "en")
 
-    ctx_b = agents_llm.ChatContext()
-    ctx_b.add_message(role="user", content="hello there")
+        ctx_a = agents_llm.ChatContext()
+        ctx_a.add_message(role="system", content="场景 A：集运客服，讲了 40 轮粤语。")
+        ctx_a.add_message(role="user", content="之前讲咗一大輪關於包裹破損賠償嘅嘢")
+        ctx_a.add_message(role="assistant", content="A 的回复历史")
+        ctx_a.add_message(role="user", content="hello there")
 
-    wrapper.chat(chat_ctx=ctx_a)
-    wrapper.chat(chat_ctx=ctx_b)
-    assert inner.calls[0]["items"] == inner.calls[1]["items"]
-    assert inner.calls[0]["items"][0][1] == (
-        "将以下文本翻译为 `英语`，注意只需要输出翻译后的结果，不要额外解释：\n\n`hello there`"
-    )
+        ctx_b = agents_llm.ChatContext()
+        ctx_b.add_message(role="user", content="hello there")
+
+        wrapper.chat(chat_ctx=ctx_a)
+        wrapper.chat(chat_ctx=ctx_b)
+        assert inner.calls[0]["items"] == inner.calls[1]["items"]
+        assert inner.calls[0]["items"][0][1] == (
+            "将以下文本翻译为 `英语`，注意只需要输出翻译后的结果，不要额外解释：\n\n`hello there`"
+        )
+
+    asyncio.run(_run())
 
 
 def test_mt_delegates_and_passes_through_without_user_text():
     """无 user 文本原样透传；conn_options/extra_kwargs 照传内芯（对齐其他包装层）。"""
     from livekit.agents import APIConnectOptions
 
-    inner = _RecorderLLM()
-    wrapper = StatelessMTLLM(inner, "cantonese")
-    opts = APIConnectOptions(max_retry=1, timeout=5.0)
+    async def _run():
+        inner = _RecorderLLM()
+        wrapper = StatelessMTLLM(inner, "cantonese")
+        opts = APIConnectOptions(max_retry=1, timeout=5.0)
 
-    empty = agents_llm.ChatContext()
-    empty.add_message(role="system", content="冇 user 消息")
-    wrapper.chat(chat_ctx=empty, conn_options=opts, extra_kwargs={"foo": "bar"})
-    # 原样透传：items 原封不动，conn_options/extra_kwargs 照传。
-    assert inner.calls[0]["items"] == [("system", "冇 user 消息")]
-    assert inner.calls[0]["conn_options"] is opts
-    assert inner.calls[0]["extra_kwargs"] == {"foo": "bar"}
+        empty = agents_llm.ChatContext()
+        empty.add_message(role="system", content="冇 user 消息")
+        wrapper.chat(chat_ctx=empty, conn_options=opts, extra_kwargs={"foo": "bar"})
+        # 原样透传：items 原封不动，conn_options/extra_kwargs 照传。
+        assert inner.calls[0]["items"] == [("system", "冇 user 消息")]
+        assert inner.calls[0]["conn_options"] is opts
+        assert inner.calls[0]["extra_kwargs"] == {"foo": "bar"}
 
-    wrapper.chat(chat_ctx=_conversation_ctx(), conn_options=opts)
-    assert inner.calls[1]["conn_options"] is opts
+        wrapper.chat(chat_ctx=_conversation_ctx(), conn_options=opts)
+        assert inner.calls[1]["conn_options"] is opts
+
+    asyncio.run(_run())
 
 
 def test_mt_model_provider_declared_from_inner():
