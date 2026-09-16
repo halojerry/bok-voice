@@ -45,12 +45,15 @@ def test_probe_skips_when_key_absent(tmp_path, monkeypatch):
     assert fails == []
 
 
-def test_probe_fails_when_no_voice_configured(tmp_path, monkeypatch):
+def test_probe_warns_when_no_voice_configured(tmp_path, monkeypatch, capsys):
+    """漏配=warning 唔阻断发布:运行时有默认音色兜底(空音色防 beep),
+    「全空=静音」係 e20ed7a 时代的过期前提。确定性错配仍係硬 fail。"""
     monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
     _make_db(tmp_path, {"provider": "minimax", "api_key": "k"})
     fails: list[str] = []
     bok._doctor_minimax_tts(tmp_path, fails)
-    assert len(fails) == 1 and "speaker_zh" in fails[0]
+    assert fails == []
+    assert "warning" in capsys.readouterr().out
 
 
 def test_probe_resolves_configured_voice(tmp_path, monkeypatch):

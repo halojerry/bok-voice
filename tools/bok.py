@@ -1383,9 +1383,11 @@ def _doctor_minimax_tts(data: Path, fails: list[str]) -> None:
     voices = [str(tts.get(k) or "").strip() for k in ("speaker", "speaker_zh", "speaker_cantonese", "speaker_en")]
     configured = [v for v in voices if v]
     if not configured:
-        msg = "minimax tts: provider=minimax 且已配 key,但 speaker_zh/cantonese/en 全空(通话会静音)"
-        print(f"minimax tts voice: FAIL ({msg})")
-        fails.append(msg)
+        # 按本函数 docstring 的原意记 warning 而非硬 fail:e20ed7a 时代的「全空=静音」
+        # 前提已失效——A 线运行时有默认音色兜底(Cantonese_crisp_news_anchor_vv2,
+        # 三语通用、空音色防 beep),漏配只是设置页待补,不是发布阻断项。
+        msg = "minimax tts: provider=minimax 且已配 key,但 speaker_zh/cantonese/en 全空(运行时走默认音色兜底,设置页可补配)"
+        print(f"minimax tts voice: warning ({msg})")
         return
     region = os.environ.get("MINIMAX_REGION", "cn").strip().lower()
     base = os.environ.get("MINIMAX_BASE_URL", "").strip().rstrip("/")
