@@ -1181,9 +1181,9 @@ def delete_call(call_id: str, request: Request) -> dict:
 
 @app.delete("/api/calls")
 def clear_ended_calls(request: Request, account_id: str = "acc-001") -> dict:
+    """清空该账号下已结束(ended)的通话历史。活跃/进行中的通话不删。"""
     require_role(request, "admin", "root")
     _gate_page(request, "calls")
-    """清空该账号下已结束(ended)的通话历史。活跃/进行中的通话不删。"""
     account_id = scoped_account(request, account_id)
     calls = _repo().list_calls(account_id, status=CallStatus.ENDED.value)
     removed = 0
@@ -2774,6 +2774,8 @@ def hit_filler_entry(entry_id: str, request: Request) -> dict:
     entry = next((e for e in _repo().list_filler_entries("")
                   if str(e.get("id") or "") == entry_id), None)
     deny_cross_account(request, entry)
+    if not entry:
+        raise HTTPException(status_code=404, detail="not found")
     _repo().incr_filler_hit(entry_id)
     return {"id": entry_id}
 
@@ -3099,7 +3101,11 @@ def _verify_livekit_webhook(request: Request, body: bytes) -> bool:
     if not token:
         return False
     try:
-        claims = _pyjwt.decode(token, secret, algorithms=["HS256"], options={"verify_aud": False})
+        # leeway=10（终审修复）：秒级时钟偏移不拒真 webhook——exp/nbf 校验保持
+        # 开启（LiveKit 签发带 exp/nbf），只容忍 ±10s 漂移。
+        claims = _pyjwt.decode(
+            token, secret, algorithms=["HS256"], options={"verify_aud": False}, leeway=10
+        )
     except _pyjwt.PyJWTError:
         return False
     if not (claims.get("video") or {}).get("webhook"):
