@@ -4259,5 +4259,8 @@ def run_agent() -> None:
     # /api/token 挂 RoomAgentDispatch 精确派发;不再隐式接所有房间(含同传房)。
     # port 显式钉 8081(prod status 探活 :8081/worker):A/B 线三个 worker 并存,
     # 不分端口会同抢默认 8081,后绑者 Errno 48 即崩("Agent did not join the
-    # room" 根因,2026-09-06 实证)。
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name="bok-voice", port=8081))
+    # room" 根因,2026-09-06 实证)。BOK_WORKER_PORT 可覆盖(默认 8081 零漂移):
+    # 单机多栈并存(并行会话/多 worktree 验收)时错开端口,免被对方端口预清
+    # 当殭尸杀(2026-09-18 漏斗 v2 隔离 E2E 实证)。
+    _worker_port = int(os.environ.get("BOK_WORKER_PORT", "8081") or 8081)
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name="bok-voice", port=_worker_port))
