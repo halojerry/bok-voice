@@ -181,9 +181,8 @@ async def _tick_campaign(repo, campaign: dict, dispatcher: Dispatcher, out: dict
     now_local = (now if now is not None else localnow_naive())
     if now_local.tzinfo is not None:  # aware → 转本地墙钟再剥 tz（M2 分域，窗口判定域）
         now_local = now_local.astimezone().replace(tzinfo=None)
-    policy = redispatch_policy(campaign)
 
-    # ① 收割：进行中 item 的通话已终态 → 回写 item 结果（新增：命中重拨策略回 pending）。
+    # ① 收割：进行中 item 的通话已终态 → 回写 item 结果（重拨命中回 pending：
     for item in [i for i in repo.list_items(campaign["id"])
                  if i.get("status") in _INFLIGHT_ITEM_STATUSES]:
         call = repo.get_call(str(item.get("call_id") or ""))
@@ -195,16 +194,13 @@ async def _tick_campaign(repo, campaign: dict, dispatcher: Dispatcher, out: dict
         updates = {"status": result,
                    "last_error": str(call.get("disposition") or "")[:250],
                    "updated_at": _utcnow_iso()}
-        try:
-            attempts = int(item.get("attempts") or 1)
-        except (TypeError, ValueError):
-            attempts = 1
-        if result in policy["on"] and attempts < policy["max_attempts"]:
-            # 重拨预约：回 pending 等 interval_minutes；attempts 不重置、+1 = 下一次
-            # 尝试编号——等待中的 pending item 靠 attempts>=2 与首拨区分，
-            # redispatch_due 据此闸门（attempts<=1 恒不放等）。
-            updates["status"] = "pending"
-            updates["attempts"] = attempts + 1
+        # 重拨预约：回 pending 等 interval_minutes（终审 C-1：判定抽纯函数
+        # redispatch_harvest_updates，与 main.report_dial_result 直写路共用——
+        # attempts 不重置、+1 = 下一次尝试编号，等待中的 pending item 靠
+        # attempts>=2 与首拨区分，redispatch_due 据此闸门（attempts<=1 恒不放等）。
+        redispatch = redispatch_harvest_updates(item, result, campaign)
+        if redispatch:
+            updates.update(redispatch)
         repo.update_item(str(item["id"]), **updates)
         out["harvested"] += 1
 
@@ -540,6 +536,30 @@ def redispatch_policy(campaign: dict) -> dict:
     allowed = {"no_answer", "rejected", "failed"}
     outcomes = frozenset(str(x) for x in (raw.get("on") or []) if str(x) in allowed)
     return {"max_attempts": max_attempts, "interval_minutes": interval, "on": outcomes}
+
+
+def redispatch_harvest_updates(item: dict, result: str, campaign: dict) -> dict | None:
+    """重联回队判定（纯函数，终审 C-1）：dial-result 直写与循环收割两路共用。
+
+    命中（result ∈ policy["on"] 且 attempts < max_attempts）→ 返回
+    `{"status": "pending", "attempts": attempts+1, "updated_at": _utcnow_iso()}`
+    由调用方落库（last_error 各自带：收割路=call.disposition、直写路同源）；
+    不命中 → None（调用方维持各自现行为写终态）。attempts 语义与收割段一致：
+    不重置、+1=下一次尝试编号，redispatch_due 据 attempts≥2 闸等待窗。
+
+    此前重拨回队只活在 `_tick_campaign` 收割段（只扫在途 item），而
+    report_dial_result 把失败三态直写终态——生产主路 item 一轮即终态、永不进
+    收割，attempts 永不加、重拨静默 no-op（终审 C-1）。
+    """
+    policy = redispatch_policy(campaign)
+    try:
+        attempts = int(item.get("attempts") or 1)
+    except (TypeError, ValueError):
+        attempts = 1
+    if result in policy["on"] and attempts < policy["max_attempts"]:
+        return {"status": "pending", "attempts": attempts + 1,
+                "updated_at": _utcnow_iso()}
+    return None
 
 
 def redispatch_due(item: dict, campaign: dict, now: datetime | None = None) -> bool:

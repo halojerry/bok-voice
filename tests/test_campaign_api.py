@@ -454,6 +454,57 @@ def test_update_campaign_redispatch_three_states(monkeypatch):
     assert repo.get_campaign(camp["id"])["redispatch_json"] == ""
 
 
+def test_dial_result_redispatch_returns_item_to_pending(monkeypatch):
+    """终审 C-1（HTTP 级集成）：dial-result 失败三态直写路径同样过重联回队判定。
+
+    旧版 report_dial_result 把失败三态 item 直写终态，而收割段只扫在途
+    （dialing/in_call）item——终态 item 永不进收割，attempts 永不加、自动重拨在
+    生产主路静默 no-op。现命中（result ∈ policy.on 且 attempts<max）回
+    pending+attempts+1，与循环收割共用 redispatch_harvest_updates。
+    """
+    from bok_voice_core.types import CallMode, SessionManifest
+
+    client, repo = _client_and_repo(monkeypatch)
+    obj = repo.create_object("acc-001", {"display_name": "A", "phone": "+85211111111"})
+    camp = client.post("/api/campaigns", json=_campaign_body(
+        obj, redispatch={"max_attempts": 2, "interval_minutes": 30,
+                         "on": ["no_answer"]})).json()
+    assert client.post(f"/api/campaigns/{camp['id']}/start").status_code == 200
+    item = repo.list_items(camp["id"])[0]
+    assert item["status"] == "pending" and item["attempts"] == 1
+
+    def _dialing_call(seq: int) -> dict:
+        """模拟 _start_call 产物：建通话 + item 置 dialing 并钉 call_id。"""
+        call = repo.create_call(SessionManifest(
+            session_id=f"call-c1-{seq}-{obj['id']}", account_id="acc-001",
+            object_id=obj["id"], persona_id="", mode=CallMode.LIVE,
+            direction="outbound", language="zh", providers={},
+        ))
+        repo.update_item(item["id"], status="dialing", call_id=call["id"])
+        return call
+
+    # 命中路：no_answer ∈ policy.on 且 attempts=1 < max=2 → 回 pending 等 interval。
+    call = _dialing_call(1)
+    assert client.post(f"/api/calls/{call['id']}/dial-result",
+                       json={"status": "no_answer"}).status_code == 200
+    item = repo.list_items(camp["id"])[0]
+    assert item["status"] == "pending" and item["attempts"] == 2
+    assert item["last_error"] == "no_answer"  # 与收割路同源=通话 disposition
+
+    # 不命中①：result 不在 policy.on（rejected）→ 维持终态直写（attempts 不动）。
+    call2 = _dialing_call(2)
+    client.post(f"/api/calls/{call2['id']}/dial-result", json={"status": "rejected"})
+    item = repo.list_items(camp["id"])[0]
+    assert item["status"] == "rejected" and item["attempts"] == 2
+
+    # 不命中②：attempts 已 = max，再报 no_answer 也不回队（重拨上限封死）。
+    call3 = _dialing_call(3)
+    repo.update_item(item["id"], attempts=2)
+    client.post(f"/api/calls/{call3['id']}/dial-result", json={"status": "no_answer"})
+    item = repo.list_items(camp["id"])[0]
+    assert item["status"] == "no_answer" and item["attempts"] == 2
+
+
 def test_update_campaign_missing_is_404_and_audits(monkeypatch):
     """PUT 404 同既有端点；成功编辑落 campaign.update 审计。"""
     from bok_voice_obs.audit import AuditStore, audit_store

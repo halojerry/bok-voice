@@ -36,7 +36,7 @@ from bok_voice_obs.context import get_correlation
 from bok_voice_obs.logging import configure_logging, get_logger
 from bok_voice_obs.middleware import CorrelationMiddleware
 
-from .campaign import parse_call_windows, _utcnow_naive
+from .campaign import parse_call_windows, redispatch_harvest_updates, _utcnow_naive
 from .deps import build_engine, build_repository, build_session_factory
 from .dispatch_utils import cleanup_dispatch, has_active_dispatch
 from .nodes_store import HEARTBEAT_INTERVAL_S, LicenseError, NodeStore
@@ -1730,12 +1730,34 @@ def report_dial_result(call_id: str, req: DialResultRequest, request: Request) -
     if status in ("answered", "no_answer", "rejected", "failed"):
         item = _repo().find_item_by_call(call_id)
         if item and str(item.get("status") or "") in ("dialing", "in_call"):
-            _repo().update_item(
-                str(item["id"]),
-                status="in_call" if status == "answered" else status,
-                last_error=(req.detail or "")[:250],
-                updated_at=_utcnow_iso(),
-            )
+            if status == "answered":
+                _repo().update_item(
+                    str(item["id"]),
+                    status="in_call",
+                    last_error=(req.detail or "")[:250],
+                    updated_at=_utcnow_iso(),
+                )
+            else:
+                # 失败三态先过重联回队判定（终审 C-1）：命中（result ∈ policy.on 且
+                # attempts < max）回 pending 等 interval——旧版直写终态令收割段（只扫
+                # 在途 item）永远等不到它，重拨在生产主路静默 no-op。last_error 与
+                # 收割路同源=通话 disposition；不命中维持终态直写（last_error 仍带
+                # agent detail）。
+                campaign = _repo().get_campaign(str(item.get("campaign_id") or ""))
+                redispatch = redispatch_harvest_updates(item, status, campaign or {})
+                if redispatch:
+                    _repo().update_item(
+                        str(item["id"]),
+                        **redispatch,
+                        last_error=str(updated.get("disposition") or status)[:250],
+                    )
+                else:
+                    _repo().update_item(
+                        str(item["id"]),
+                        status=status,
+                        last_error=(req.detail or "")[:250],
+                        updated_at=_utcnow_iso(),
+                    )
     _audit("call.dial_result", subject_type="call", subject_id=call_id,
            account_id=str(call.get("account_id", "acc-001")),
            detail={"status": status, "detail": (req.detail or "")[:120]})
