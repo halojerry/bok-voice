@@ -3628,6 +3628,7 @@ async def ingest_session_report(call_id: str, request: Request) -> dict:
                 subject_id=call_id,
                 account_id=_cur.get("account_id", ""),
                 outcome="ghost_overwrite",
+                call_id=call_id,
             )
             raise HTTPException(
                 status_code=409,
@@ -3636,7 +3637,7 @@ async def ingest_session_report(call_id: str, request: Request) -> dict:
         row = _repo().update_call(call_id, session_report=json.dumps(payload, ensure_ascii=False, default=str))
         if not row:
             raise HTTPException(status_code=404, detail="call not found")
-        _audit("call.session_report", subject_type="call", subject_id=call_id, account_id=row.get("account_id", ""))
+        _audit("call.session_report", subject_type="call", subject_id=call_id, account_id=row.get("account_id", ""), call_id=call_id)
         return {"call_id": call_id, "stored": True}
     # ---- worker 非空：per-worker 历史 upsert（P1-A） ----
     try:
@@ -3666,6 +3667,7 @@ async def ingest_session_report(call_id: str, request: Request) -> dict:
         subject_type="call",
         subject_id=call_id,
         account_id=row.get("account_id", ""),
+        call_id=call_id,
         detail={"worker": worker[:64], "replaced": replaced,
                 "ended_merge": str(_cur.get("status") or "") == "ended"},
     )
