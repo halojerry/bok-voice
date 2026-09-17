@@ -257,7 +257,7 @@ export default function SupervisorPage() {
                   <div className="min-w-0">
                     <p className="text-sm font-semibold text-(--live)">
                       📱 WhatsApp 待对接
-                      <span className="ml-2 rounded-sm bg-(--live-soft) px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider">
+                      <span className="ml-2 rounded-sm bg-(--live-soft) px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-(--live-ink)">
                         {isCaptured ? "已拿到号码" : "客户已应承加"}
                       </span>
                     </p>

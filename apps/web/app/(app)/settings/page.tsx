@@ -368,7 +368,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
                 disabled={sites.length === 0}
               >
                 {sites.length === 0 ? (
-                  <option value="">（暂无站点——用下方「+ 新建站点」建一个）</option>
+                  <option value="">（暂无站点——用下方「新建站点」建一个）</option>
                 ) : (
                   sites.map((s) => (
                     <option key={String(s.id)} value={String(s.id)}>
