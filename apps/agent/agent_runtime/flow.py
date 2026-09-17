@@ -1268,9 +1268,17 @@ def build_judge_messages(
         "stay=客户答/问的仍是当前步要处理的（关键资料还没给到，如在核实步未讲到平台、在问当前步该交代的事）。\n"
         "objection=客户否认/拒绝/不关事/想挂线。\n"
         "全程是AI客服自己和客户聊，客户答不出不等于要转真人，判断只管推进流程。\n"
-        "例子：\n"
-        "客户：「我要投诉件货延误」且当前係核实 -> stay\n"
-        "route=register_followup conf=0.8\n"
+    )
+    ex_head = "例子：\n"
+    if route_enabled:
+        # route 示例置顶(primacy):放例尾会被前 6 条稀释,9B 实测投诉例置顶后 5/5 compliant。
+        ex_head += (
+            "客户：「我要投诉件货延误」且当前係核实 -> stay\n"
+            "route=register_followup conf=0.8\n"
+            "客户：「你哋係咪呃人㗎」-> stay\n"
+            "route=keep conf=0.6\n"
+        )
+    sys += ex_head + (
         "客户：「好，没问题，係我嘅」-> advance\n"
         "客户：「你哋係邊間公司㗎？」-> stay\n"
         "客户：「唔好再打嚟！」-> objection\n"
@@ -1278,13 +1286,6 @@ def build_judge_messages(
         "客户：「我冇訂單，唔記得喺邊買」且当前係引導核實(要答平台先過) -> stay\n"
         "客户：「我唔記得買咗咩」且当前係開場問記憶、下一步係引導核實 -> advance"
     )
-    if route_enabled:
-        sys += (
-            "\n客户：「我要投诉件货延误」且当前係核实 -> stay\n"
-            "route=register_followup conf=0.8\n"
-            "客户：「你哋係咪呃人㗎」-> stay\n"
-            "route=keep conf=0.6"
-        )
     if facts:
         known = " ".join(f"{k}={v}" for k, v in facts.items() if v)
         sys += f"\n已知客戶資料:{known}"
