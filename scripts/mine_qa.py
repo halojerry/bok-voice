@@ -1,4 +1,5 @@
-"""高频问答对挖掘报告(bok.py tts-mine 的执行体,PR-3;2026-09-11 加 --sync)。
+"""高频问答对挖掘报告(bok.py tts-mine 的执行体,PR-3;2026-09-11 加 --sync;
+2026-09-16 加 --cluster LLM 同义聚类)。
 
 从 CP /api/reports/qa-pairs 取报告(归一化聚类、按出现通话数排序)打印;
 --apply N 把前 N 条入库为 qa_entries(source=mined,答案取各报告条目的
@@ -10,13 +11,21 @@
 闸(bok_voice_core.qa_text.auto_apply_verdict)必须严;闸外条目按原因码
 打印给人看,人可用 DELETE /api/qa-entries/{id} 否决。--dry-run 只打印
 auto/skip 两列表不写库(单独用同义)。
+
+--cluster LLM 同义聚类(2026-09-16,治「0.90 只认字面措辞」):本地 LLM 把
+挖掘候选对着现有词条判 variant/new/junk——variant=同义同答 → 以候选原话为
+question、继承目标词条 answer_text 入库(真实用户措辞即 qa_gate 匹配面;
+同文同音色 → TTS 缓存键同条目,零新增合成)。默认只打印计划,--apply 才入库;
+new 类不自动入库(留给 --sync 质量闸),junk 只报原因。
 """
 
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -94,6 +103,244 @@ def _run_pregen(cp: str) -> bool:
     return proc.returncode == 0
 
 
+# ---- --cluster:LLM 同义聚类(2026-09-16,治「0.90 只认字面措辞」) ----
+# LLM 端点固定本机回环 mlx_lm server:主机硬编码、端口 int 校验(无动态 URL,
+# 同 probe_minimax_emotion_tags 先例);model 取 /v1/models 真实路径(仓规)。
+_LLM_HOST = "127.0.0.1"
+_LLM_PORT = int(os.environ.get("BOK_LLM_PORT", "1235"))
+
+_CLUSTER_SYSTEM_PROMPT = (
+    "你是客服快答词库的管理员。输入是现有词条列表和新挖掘的问答候选。"
+    "对每个候选独立判断:\n"
+    '1. "variant":候选问题与某条现有词条意图相同,且候选答案与该词条答案语义一致'
+    " → 给出该词条 id 作 target;question 字段必须原样抄候选的问题(不要改写,"
+    "真实用户措辞就是匹配面)。\n"
+    '2. "new":全新问答,现有库里没有同义词条 → target 留空字符串。\n'
+    '3. "junk":寒暄/语气词/与业务无关/答案与相关词条语义冲突。\n'
+    '只输出 JSON 数组,不要任何解释或代码块标记:'
+    '[{"i":候选序号,"decision":"variant|new|junk","target":"词条id或空串","note":"不超过8字的理由"}]'
+)
+
+
+def _llm_chat(model: str, system: str, user: str, *, timeout: int = 180) -> str:
+    """OpenAI 兼容 /v1/chat/completions(本机回环,路径常量)。"""
+    body = json.dumps(
+        {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": 0,
+            "max_tokens": 4096,
+            "stream": False,
+        }
+    ).encode("utf-8")
+    conn = http.client.HTTPConnection(_LLM_HOST, _LLM_PORT, timeout=timeout)
+    try:
+        conn.request("POST", "/v1/chat/completions", body=body, headers={"Content-Type": "application/json"})
+        data = json.loads(conn.getresponse().read())
+    finally:
+        conn.close()
+    return str((data.get("choices") or [{}])[0].get("message", {}).get("content") or "")
+
+
+def _llm_model() -> str:
+    """取本地 server 已加载模型的真实路径(仓规:request model 必须填真实路径)。"""
+    conn = http.client.HTTPConnection(_LLM_HOST, _LLM_PORT, timeout=10)
+    try:
+        conn.request("GET", "/v1/models")
+        data = json.loads(conn.getresponse().read())
+    finally:
+        conn.close()
+    ids = [str(d.get("id") or "") for d in (data.get("data") or [])]
+    paths = [i for i in ids if i.startswith("/")]
+    for p in paths:  # 4B 主对话模型优先(1.8B 是 B 线翻译专才)
+        if "4b" in p.lower():
+            return p
+    return paths[0] if paths else (ids[0] if ids else "")
+
+
+def _parse_llm_decisions(text: str) -> dict[int, dict]:
+    """宽松解析 LLM 输出 → {候选序号: decision dict};非 JSON/缺字段静默跳过。"""
+    t = re.sub(r"```(?:json)?|```", "", str(text or "")).strip()
+    start = t.find("[")
+    end = t.rfind("]")
+    if start < 0 or end <= start:
+        return {}
+    try:
+        arr = json.loads(t[start : end + 1])
+    except ValueError:
+        return {}
+    out: dict[int, dict] = {}
+    if not isinstance(arr, list):
+        return out
+    for d in arr:
+        if not isinstance(d, dict) or isinstance(d.get("i"), bool):
+            continue
+        try:
+            i = int(d.get("i"))
+        except (TypeError, ValueError):
+            continue
+        decision = str(d.get("decision") or "").strip().lower()
+        if decision not in ("variant", "new", "junk"):
+            continue
+        out[i] = {
+            "decision": decision,
+            "target": str(d.get("target") or "").strip(),
+            "note": str(d.get("note") or "")[:16],
+        }
+    return out
+
+
+def plan_cluster(
+    pairs: list[dict],
+    existing_rows: list[dict],
+    decisions: dict[int, dict],
+) -> tuple[list[dict], list[dict], list[tuple[dict, str]]]:
+    """决策 → 三列(可测核心):variants 入库 payload / new 交回 --sync 闸 / junk。
+
+    variant 入库 payload:question=候选原话(真实措辞即匹配面),answer=继承目标
+    词条 answer_text(答案以既有为准,防答案漂移)。保守门:目标词条必须存在
+    且同语言;归一后与现有词条重复 → 丢。
+    """
+    by_id = {str(e.get("id") or ""): e for e in existing_rows or []}
+    existing_norms = {
+        normalize_question(str(e.get("question_text") or ""))
+        for e in existing_rows or []
+        if str(e.get("question_text") or "").strip()
+    }
+    variants: list[dict] = []
+    fresh: list[dict] = []
+    junk: list[tuple[dict, str]] = []
+    for i, r in enumerate(pairs or []):
+        d = decisions.get(i)
+        if d is None:
+            junk.append((r, "no-decision"))
+            continue
+        if d["decision"] == "variant":
+            target = by_id.get(d["target"])
+            if target is None:
+                junk.append((r, "target-missing"))
+                continue
+            if str(target.get("lang") or "") != str(r.get("lang") or ""):
+                junk.append((r, "lang-mismatch"))
+                continue
+            q = str(r.get("question") or "").strip()
+            if not q:
+                junk.append((r, "empty-question"))
+                continue
+            # 问法长度门(与 --sync 闸同源 AUTO_MIN/MAX_Q_LEN):4B judge 对
+            # 「啊」「多多」类碎片会误判 variant——LLM 提议,字数门处决。
+            if not (AUTO_MIN_Q_LEN <= len(q) <= AUTO_MAX_Q_LEN):
+                junk.append((r, "q-len-out-of-range"))
+                continue
+            if normalize_question(q) in existing_norms:
+                junk.append((r, "dup-existing"))
+                continue
+            variants.append(
+                {
+                    "question_text": q,
+                    "answer_text": str(target.get("answer_text") or ""),
+                    "lang": r["lang"],
+                    "scope": "global",
+                    "source": "mined",
+                    "enabled": True,
+                    "account_id": str(target.get("account_id") or "acc-001"),
+                }
+            )
+            existing_norms.add(normalize_question(q))
+        elif d["decision"] == "new":
+            fresh.append(r)
+        else:
+            junk.append((r, d["note"] or "junk"))
+    return variants, fresh, junk
+
+
+def _cluster(args: argparse.Namespace, rows: list[dict], token: str) -> int:
+    """--cluster 主循环:取词条 → 分语言批量问 LLM → 计划打印 → (--apply)入库。"""
+    try:
+        existing_rows = _cp_request(args.cp, f"/api/qa-entries?account_id={args.account}", token) or []
+    except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+        print(f"list qa entries failed: {exc!r} — 中止", flush=True)
+        return 1
+    try:
+        model = args.llm_model or _llm_model()
+    except Exception as exc:
+        print(f"llm models 探测失败({_LLM_HOST}:{_LLM_PORT}): {exc!r} — 中止", flush=True)
+        return 1
+    if not model:
+        print("llm 无可用模型 — 中止", flush=True)
+        return 1
+
+    variants: list[dict] = []
+    fresh: list[dict] = []
+    junk: list[tuple[dict, str]] = []
+    langs = sorted({str(r.get("lang") or "") for r in rows} - {""})
+    for lang in langs:
+        lang_rows = [r for r in rows if str(r.get("lang")) == lang]
+        entries = [
+            {
+                "id": str(e.get("id") or ""),
+                "question": str(e.get("question_text") or ""),
+                "answer": str(e.get("answer_text") or "")[:160],
+            }
+            for e in existing_rows
+            if str(e.get("lang")) == lang and str(e.get("question_text") or "").strip()
+        ][:60]
+        if not entries:
+            fresh.extend(lang_rows)  # 该语言还没有词条 → 全部交回 --sync 质量闸
+            continue
+        cands = [
+            {"i": i, "question": str(r.get("question") or ""), "answer": str(r.get("answer") or "")[:120]}
+            for i, r in enumerate(lang_rows)
+        ]
+        user = (
+            f"现有词条(lang={lang}):{json.dumps(entries, ensure_ascii=False)}\n"
+            f"候选:{json.dumps(cands, ensure_ascii=False)}"
+        )
+        try:
+            text = _llm_chat(model, _CLUSTER_SYSTEM_PROMPT, user)
+        except Exception as exc:
+            print(f"[cluster:{lang}] llm 请求失败: {exc!r} — 该语言跳过", flush=True)
+            continue
+        decisions = _parse_llm_decisions(text)
+        # 候选序号是分语言局部 i → plan_cluster 按 (lang_rows, 局部 decisions) 跑
+        v, f, j = plan_cluster(lang_rows, existing_rows, decisions)
+        variants.extend(v)
+        fresh.extend(f)
+        junk.extend(j)
+
+    print(
+        f"[cluster] variant {len(variants)} / new {len(fresh)} / junk {len(junk)}"
+        f" (llm={model.rsplit('/', 1)[-1]})",
+        flush=True,
+    )
+    for v in variants:
+        print(f"  VARIANT [{v['lang']}] {v['question_text']!r} -> 继承答案 {v['answer_text'][:36]!r}")
+    for r in fresh:
+        print(f"  NEW     [{r['lang']}] {r['question']!r} (留待 tts-mine --sync 质量闸)")
+    for r, reason in junk:
+        print(f"  JUNK    [{r.get('lang')}] {str(r.get('question'))[:32]!r} ({reason})")
+    if not args.apply:
+        print("[cluster] dry:未写库(--cluster 配 --apply 落地 variant)", flush=True)
+        return 0
+
+    applied = 0
+    for v in variants:
+        try:
+            _cp_request(args.cp, "/api/qa-entries", token, method="POST", payload=v)
+            applied += 1
+        except urllib.error.HTTPError as exc:
+            print(f"apply failed for {v['question_text'][:32]!r}: HTTP {exc.code}", flush=True)
+    print(
+        f"[cluster] 入库 variant {applied} 条(答案同文同音色 → 缓存键已存在零重合成;"
+        f"换新人设/新音色后跑 `bok.py tts-pregen --qa`)",
+        flush=True,
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Q→A 高频问答对挖掘")
     ap.add_argument("--cp", default=os.environ.get("BOK_CP_URL", "http://127.0.0.1:8000"))
@@ -103,11 +350,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--sync", action="store_true", help="自动学习闭环:质量闸→入库→tts-pregen --qa 按语言物化")
     ap.add_argument("--dry-run", action="store_true", help="只打印 auto/skip 两列表,不写库不物化(单独用同义)")
     ap.add_argument("--no-pregen", action="store_true", help="跳过入库后的 tts-pregen --qa 物化")
+    ap.add_argument("--cluster", action="store_true", help="LLM 同义聚类:候选对着现有词条判 variant/new/junk")
+    ap.add_argument("--llm-model", default=os.environ.get("BOK_LLM_CLUSTER_MODEL", ""), help="覆盖聚类用模型(默认 /v1/models 自动取 4B 路径)")
     args = ap.parse_args(argv)
     token = os.environ.get("BOK_CP_TOKEN", "")
 
     if args.sync and args.apply:
         print("--sync 与 --apply 互斥(一条命令各干各的)", flush=True)
+        return 2
+    if args.cluster and args.sync:
+        print("--cluster 与 --sync 互斥(--cluster 配 --apply 落地 variant)", flush=True)
         return 2
 
     try:
@@ -128,6 +380,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{r['calls']:>5}  {r['lang']:<9} {r['question']} -> {r['answer'][:48]} ({r['answer_votes']} votes)")
     print(f"total {len(rows)} pairs (threshold >= {args.min_calls} calls)", flush=True)
 
+    if args.cluster:
+        return _cluster(args, rows, token)
     if not (args.sync or args.dry_run):
         return _apply_top_n(args, rows, token)
     return _sync(args, rows, token)
