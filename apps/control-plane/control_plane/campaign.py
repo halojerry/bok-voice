@@ -348,3 +348,164 @@ async def _campaign_loop() -> None:
                 extra={"event": "campaign.tick.error", "data": {"error": str(exc)}},
             )
         await asyncio.sleep(POLL_S)
+
+
+# ---------------------------------------------------------------------------
+# 调度决策纯函数（spec 2026-09-17 Task 2）：时段窗/重拨/并发。
+# 全部无副作用、时间可注入（now 参数），Task 3/4 的起拨门控直接消费。
+# ---------------------------------------------------------------------------
+
+MAX_CALL_WINDOWS = 3
+
+
+def parse_call_windows(raw: Any) -> list[dict]:
+    """外呼时段窗归一（纯函数）：≤3 组、days⊆{1..7} 升序去重、HH:MM、start<end。
+
+    逐项校验，非法项静默丢弃不抛——运营表单一个错字不废整单（与 create 端点
+    scenarios 白名单同哲学）。非 list/解析失败 → []（不限时段语义由调用方空表表达）。
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for entry in raw:
+        if len(out) >= MAX_CALL_WINDOWS:
+            break
+        if not isinstance(entry, dict):
+            continue
+        days = entry.get("days")
+        if not isinstance(days, list):
+            continue
+        try:
+            norm_days = sorted({int(d) for d in days
+                                if isinstance(d, (int, str)) and str(d).isdigit()
+                                and 1 <= int(d) <= 7})
+        except (TypeError, ValueError):
+            continue
+        start = _hhmm(entry.get("start"))
+        end = _hhmm(entry.get("end"))
+        if not norm_days or start is None or end is None or start >= end:
+            continue
+        out.append({"days": norm_days, "start": start, "end": end})
+    return out
+
+
+def _hhmm(value: Any) -> str | None:
+    """"08:00"/"08:00:00" → "08:00"；非法 → None。"""
+    text = str(value or "").strip()
+    parts = text.split(":")
+    if len(parts) < 2:
+        return None
+    try:
+        hour, minute = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
+def within_call_windows(now_local: datetime, windows: Any) -> bool:
+    """now（本地 naive）落任一窗 → True；窗空 → True（不限）；窗形状非法 → False。
+
+    解析层保证 start<end（跨零点窗不支持解析层）；本函数对 end<=start 的窗按
+    「start→次日 end」防御判定（接口契约，days 判起点日，次日清晨段看昨日是否
+    在窗天内）。秒级比较、端点含——18:00:00 在窗内、18:00:01 已出窗。
+    """
+    if windows is None:
+        return True
+    if not isinstance(windows, list):
+        return False
+    if windows and all(isinstance(w, dict) and "start" in w for w in windows):
+        parsed: list[dict] = windows  # 已归一形状（Task 1 仓储读侧）直接用
+    else:
+        parsed = parse_call_windows(windows)
+    if not parsed:
+        return not windows  # 空表=不限（True）；给了窗但全非法=不放行（False）
+    now_seconds = now_local.hour * 3600 + now_local.minute * 60 + now_local.second
+    iso_weekday = now_local.isoweekday()
+    for window in parsed:
+        try:
+            day_set = {int(d) for d in window.get("days", [])}
+        except (TypeError, ValueError):
+            continue
+        if not day_set:
+            continue
+        start = _hhmm_to_minute(window.get("start"))
+        end = _hhmm_to_minute(window.get("end"))
+        if start is None or end is None:
+            continue
+        start_s, end_s = start * 60, end * 60
+        if end > start:
+            if iso_weekday in day_set and start_s <= now_seconds <= end_s:
+                return True
+        elif iso_weekday in day_set and now_seconds >= start_s:
+            return True  # 跨零点前半段：起点日 start→24:00
+        elif now_seconds <= end_s and (iso_weekday - 2) % 7 + 1 in day_set:
+            return True  # 跨零点后半段：昨日为起点日 00:00→end
+    return False
+
+
+def _hhmm_to_minute(value: Any) -> int | None:
+    text = str(value or "").strip()
+    parts = text.split(":")
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[0]) * 60 + int(parts[1])
+    except ValueError:
+        return None
+
+
+def redispatch_policy(campaign: dict) -> dict:
+    """redispatch 解析（纯函数）：空/非法 → 不重拨（max_attempts=0）。"""
+    raw = campaign.get("redispatch")
+    if not isinstance(raw, dict):
+        return {"max_attempts": 0, "interval_minutes": 0.0, "on": frozenset()}
+    try:
+        max_attempts = max(0, int(raw.get("max_attempts") or 0))
+    except (TypeError, ValueError):
+        max_attempts = 0
+    try:
+        interval = max(0.0, float(raw.get("interval_minutes") or 0.0))
+    except (TypeError, ValueError):
+        interval = 0.0
+    allowed = {"no_answer", "rejected", "failed"}
+    outcomes = frozenset(str(x) for x in (raw.get("on") or []) if str(x) in allowed)
+    return {"max_attempts": max_attempts, "interval_minutes": interval, "on": outcomes}
+
+
+def redispatch_due(item: dict, campaign: dict, now: datetime | None = None) -> bool:
+    """pending item 还没到重拨时刻 → True（本轮跳过）。首拨（attempts≤1）恒 False。
+
+    updated_at 解析不出 → False（放行，不因脏数据卡死名单）。
+    """
+    try:
+        attempts = int(item.get("attempts") or 1)
+    except (TypeError, ValueError):
+        attempts = 1
+    if attempts <= 1:
+        return False
+    policy = redispatch_policy(campaign)
+    if policy["max_attempts"] <= 0 or policy["interval_minutes"] <= 0:
+        return False
+    updated = _parse_updated_at(item.get("updated_at"))
+    if updated is None:
+        return False
+    now = now if now is not None else _utcnow_naive()
+    if now.tzinfo is not None:
+        now = now.astimezone(timezone.utc).replace(tzinfo=None)
+    return (now - updated).total_seconds() < policy["interval_minutes"] * 60
+
+
+def concurrency_cap(campaign: dict) -> int:
+    """max_concurrency：0=不限；空/非法=1（旧串行行为）。"""
+    try:
+        return max(0, int(campaign.get("max_concurrency")
+                          if campaign.get("max_concurrency") is not None else 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def localnow_naive() -> datetime:
+    """服务器本地时区 naive datetime（时段窗判定用，运营语义）。"""
+    return datetime.now().astimezone().replace(tzinfo=None)
