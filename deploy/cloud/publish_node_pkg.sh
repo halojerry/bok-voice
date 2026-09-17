@@ -31,11 +31,15 @@ push() { # push <src> <dest-in-volume>
 }
 
 echo "==> [publish] $VERSION <- $ARTIFACTS"
-push "$ARTIFACTS/bok-node-$VERSION.tar.gz"        "pkg/$VERSION/bok-node-$VERSION.tar.gz"
-push "$ARTIFACTS/bok-node-$VERSION.tar.gz.sha256" "pkg/$VERSION/bok-node-$VERSION.tar.gz.sha256"
+# 代码包命名两态兼容：CI 产 <version>（tag 剥 v），手工产 v<version>——任一在位即可。
+NODE_TGZ="$(ls "$ARTIFACTS/bok-node-$VERSION.tar.gz" "$ARTIFACTS/bok-node-v$VERSION.tar.gz" 2>/dev/null | head -1 || true)"
+[ -n "$NODE_TGZ" ] || { echo "缺工件: bok-node-$VERSION.tar.gz（或 bok-node-v$VERSION.tar.gz）" >&2; exit 1; }
+NODE_SHA="$NODE_TGZ.sha256"
+push "$NODE_TGZ"        "pkg/$VERSION/$(basename "$NODE_TGZ")"
+push "$NODE_SHA"        "pkg/$VERSION/$(basename "$NODE_SHA")"
 # latest 别名：装机引导固定拉 latest，升级走 commands 通道按版本走。
-push "$ARTIFACTS/bok-node-$VERSION.tar.gz"        "pkg/latest/bok-node-latest.tar.gz"
-push "$ARTIFACTS/bok-node-$VERSION.tar.gz.sha256" "pkg/latest/bok-node-latest.tar.gz.sha256"
+push "$NODE_TGZ"        "pkg/latest/bok-node-latest.tar.gz"
+push "$NODE_SHA"        "pkg/latest/bok-node-latest.tar.gz.sha256"
 for rt in "$ARTIFACTS"/runtime-*-"$VERSION".tar.gz; do
   [ -e "$rt" ] || { echo "  (无 runtime 工件，跳过——节点装机将缺运行时!)"; break; }
   rt_base="$(basename "$rt")"
@@ -49,7 +53,9 @@ if ls "$ARTIFACTS"/runtime-*-"$VERSION".tar.gz >/dev/null 2>&1; then
   push "$FIRST_RT.sha256" "runtime/latest/runtime-latest.tar.gz.sha256"
 fi
 # 装机入口脚本（latest 恒指当前仓版本；脚本本身无密钥，鉴权在下载端点）。
-ROOT="$(cd .. && pwd)"
+# 本脚本位于 deploy/cloud/，repo 根在两级之上（实跑踩坑：上跳一层落到
+# deploy/scripts → 缺文件退出，pkg/runtime 已进卷但 bootstrap 缺失，2026-09-18）。
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 push "$ROOT/scripts/bootstrap-node.sh" "bootstrap/latest/bootstrap-node.sh"
 push "$ROOT/scripts/install-node.sh"   "bootstrap/latest/install-node.sh"
 push "$ROOT/scripts/install-node.ps1"  "bootstrap/latest/install-node.ps1"
