@@ -429,7 +429,7 @@ cd apps/web && grep -rn "bg-white/\|bg-black/\|border-white/" app components --i
 - [ ] **Step 2: 门禁 grep 归零（豁免除外）**
 
 ```bash
-cd apps/web && grep -rn "bg-white/\|bg-black/\|border-white/" app components --include="*.tsx" | grep -v "interpret-console.tsx:15[6-9][0-9]\|interpret-console.tsx:16[0-2][0-9]"
+cd apps/web && grep -rn "bg-white/\|bg-black/\|border-white/" app components --include="*.tsx" | grep -vE "interpret-console.tsx:16(0[5-9]|[1-6][0-9]|7[0-2])"
 ```
 预期：零输出。
 
