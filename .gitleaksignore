@@ -1,9 +1,11 @@
-# gitleaks 全历史扫描豁免清单(官方机制:.gitleaksignore,指纹=commit:path:rule:line)。
-# 以下均为测试夹具/文档引用中的合成字面量,不是真实凭据:
-#   tests/test_security_hardening.py:141/189/211 —— webhook/节点鉴权测试用的
-#     "whsec-test-…"/占位常量(断言 401/拒绝路径的输入)。
-#   docs/superpowers/plans/2026-09-16-security-remediation.md:474 —— 整改计划
-#     文档引用的同一测试行。
+# 测试假值指纹白名单——whsec-test-* 为 webhook 验签测试 fixture，见 tests/test_security_hardening.py
+75b738f87b8b360f70b27429e2454041ba02dccb:tests/test_security_hardening.py:generic-api-key:189
+75b738f87b8b360f70b27429e2454041ba02dccb:tests/test_security_hardening.py:generic-api-key:211
+938bf44028a6c2dd058a03a004ca9c92a8d96fa2:tests/test_security_hardening.py:generic-api-key:141
+42b5fadb863e8d8df90b4b68219aa38fc216571a:docs/superpowers/plans/2026-09-16-security-remediation.md:generic-api-key:474
+# 以下 4 条：同内容补丁在另一分支 origin/site-delivery-20260916 上的重复提交指纹——
+# gitleaks git 实为 --all 全引用扫描（git log -p -U0 --full-history --all），主干 history 不含这些提交，
+# 但 CI fetch-depth:0 拉全分支后仍会命中，缺一条即红。
 4e9ece056e3b4e319c3c33417d45de88b12497bc:tests/test_security_hardening.py:generic-api-key:189
 4e9ece056e3b4e319c3c33417d45de88b12497bc:tests/test_security_hardening.py:generic-api-key:211
 995a8dc7dd444b938aa3d0a5ddeb7549836d466d:tests/test_security_hardening.py:generic-api-key:141
