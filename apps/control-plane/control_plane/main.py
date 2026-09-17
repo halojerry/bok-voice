@@ -1713,8 +1713,11 @@ def report_dial_result(call_id: str, req: DialResultRequest, request: Request) -
     status = str(req.status or "").strip()
     if status == "answered":
         # 接通即首次转 ACTIVE：started_at 落点（仪表盘 duration 口径起点）。
-        updated = _repo().update_call(call_id, status=CallStatus.ACTIVE.value,
-                                      started_at=_utcnow_naive()) or call
+        # coalesce（T5-M1）：重复上报/重派不重置起点（与 resume-agent 路径同款）。
+        updated = _repo().update_call(
+            call_id, status=CallStatus.ACTIVE.value,
+            started_at=call.get("started_at") or _utcnow_naive(),
+        ) or call
     elif status in ("no_answer", "rejected", "failed"):
         updated = _repo().update_call(call_id, status=CallStatus.ENDED.value,
                                       disposition=status,
@@ -3470,17 +3473,41 @@ def _duration_bucket(duration_s: int) -> str | None:
     return None
 
 
+def _local_midnight_utc_boundary() -> datetime:
+    """今日边界（T5-M3）：本地午夜对应的 UTC naive 时刻（单一公式，测试同源现算）。
+
+    today 判定=created_at（经 _parse_updated_at 归一为 naive UTC）≥ 该边界；
+    旧「存储串 startswith 本地日期前缀」把 UTC 串与本地日错配（正时区 UTC 深夜
+    时段本地已是明天 → 漏计；负时区反向多计）。
+    """
+    midnight_local = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight_local.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 @app.get("/api/stats/dashboard")
 def stats_dashboard(request: Request, account_id: str = "acc-001") -> dict:
-    """工作台仪表盘单端点（2026-09-17）。口径见 plan Task 5；P0 全量 Python 聚合。"""
+    """工作台仪表盘单端点（2026-09-17）。口径见 plan Task 5；P0 全量 Python 聚合。
+
+    修复波 T5-M2/M3（2026-09-17）：answered 只认 status==ENDED 且 disposition 不在
+    排除集——FAILED+abandoned（reaper 振铃超时，从未接通）不算接通，但仍计入
+    answer_rate 分母（拨出有结果）；today/answered_today=created_at ≥ 本地午夜
+    的 UTC 边界（`_local_midnight_utc_boundary`）。
+    """
+    from .campaign import _parse_updated_at
     _gate_page(request, "calls")
     account_id = scoped_account(request, account_id)
     calls = _repo().list_calls(account_id)
-    now_local = datetime.now().astimezone()
-    today_prefix = now_local.strftime("%Y-%m-%d")
+    today_boundary = _local_midnight_utc_boundary()
+
+    def _is_today(call: dict) -> bool:
+        created = _parse_updated_at(call.get("created_at"))
+        return created is not None and created >= today_boundary
+
     ended = [c for c in calls if str(c.get("status") or "") in
              (CallStatus.ENDED.value, CallStatus.FAILED.value)]
-    answered = [c for c in ended if str(c.get("disposition") or "") not in _ANSWERED_EXCLUDED]
+    answered = [c for c in ended
+                if str(c.get("status") or "") == CallStatus.ENDED.value
+                and str(c.get("disposition") or "") not in _ANSWERED_EXCLUDED]
     answered_ids = {c.get("id") for c in answered}
     buckets = {name: 0 for name, _, _ in _DURATION_BUCKETS}
     for call in answered:
@@ -3512,9 +3539,9 @@ def stats_dashboard(request: Request, account_id: str = "acc-001") -> dict:
             whatsapp_counts[w] = whatsapp_counts.get(w, 0) + 1
     return {
         "concurrency": {"current": sum(1 for c in calls if str(c.get("status") or "") == CallStatus.ACTIVE.value)},
-        "calls": {"today": sum(1 for c in calls
-                               if str(c.get("created_at") or "").startswith(today_prefix)),
+        "calls": {"today": sum(1 for c in calls if _is_today(c)),
                   "total": len(calls), "answered": len(answered),
+                  "answered_today": sum(1 for c in answered if _is_today(c)),
                   "answer_rate": round(len(answered) / len(ended), 4) if ended else 0.0},
         "duration_buckets": buckets,
         "agents": sorted(by_agent.values(), key=lambda a: (-a["calls"], a["user_id"]))[:8],

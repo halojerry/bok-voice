@@ -1,27 +1,28 @@
 """Task 5（2026-09-17 campaign-scheduling-dashboard）：工作台统计端点 + 通话时长落点。
 
-契约（plan Task 5 / task-5-brief.md）：
+契约（plan Task 5 / task-5-brief.md，修复波 T5-M1/M2/M3 修订）：
 - ``GET /api/stats/dashboard?account_id=`` → concurrency/calls/duration_buckets/
   agents/tags 五段聚合；
-- 口径：current=status==active 计数；answered=ENDED/FAILED 且 disposition 不在
-  {no_answer,rejected,failed}；answer_rate=answered/ENDED 总数（ENDED=0→0.0）；
-  today=created_at 落**本地**自然日；duration_buckets 只统计 duration_s>0 的
-  通话，桶界 [0,15)/[15,30)/[30,60)/[60,90)/[90+,∞)（90+ 含 90）；agents 按
-  created_by 分组（空串=战役单剔除），join users 显示名，按 calls 降序截 8；
-- 时长落点：answered→ACTIVE 落 started_at；终态（ENDED/FAILED）落 ended_at，
-  duration_s=ended-started（started_at 空→0），全部 UTC naive datetime
-  （T1-M2 铁律：时间列传 datetime 对象，不传 ISO 串）。
+- 口径：current=status==active 计数；answered=**ENDED** 且 disposition 不在
+  {no_answer,rejected,failed}（FAILED+abandoned=reaper 振铃超时从未接通，不算
+  接通）；answer_rate 分母=ENDED+FAILED 全体（拨出有结果）；today/answered_today
+  =created_at ≥ **本地午夜对应的 UTC 边界**（``_local_midnight_utc_boundary``，
+  测试同源现算）；duration_buckets 只统计 duration_s>0 的通话，桶界
+  [0,15)/[15,30)/[30,60)/[60,90)/[90+,∞)（90+ 含 90）；agents 按 created_by
+  分组（空串=战役单剔除），join users 显示名，按 calls 降序截 8；
+- 时长落点：answered→ACTIVE 落 started_at（**coalesce**：重复上报不重置起点）；
+  终态（ENDED/FAILED）落 ended_at，duration_s=ended-started（started_at 空→0），
+  全部 UTC naive datetime（T1-M2 铁律：时间列传 datetime 对象，不传 ISO 串）。
 
 造数口径：内存仓 fixture（``DATABASE_URL=""`` 强制，与 test_campaign_api.py
-同款）；created_at 经 ``update_call`` 注入**本地**墙钟 ISO 串——端点的 today
-判定拿存储串与本地日期前缀做 startswith，注入本地时域串即「本地自然日」语义
-最直接的 fixture 形态（内存仓 dict 直通写入；SQL 仓走 ORM 才能改 created_at，
-本测不覆盖 SQL 腿，与既有 session_reports/campaign_api 测试同界）。
+同款）；created_at 注入 **UTC 边界 ±1min 的确定性锚点** ISO 串——端点 today
+判定拿 ``_parse_updated_at`` 归一后的 naive UTC 与边界比较，锚点直接以同一公式
+现算的边界为基准，任意时区/任意时刻（含本地午夜附近）跑测试都稳定。
 """
 from __future__ import annotations
 
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 os.environ.setdefault("DATABASE_URL", "")  # force in-memory repo for tests
@@ -36,11 +37,11 @@ from bok_voice_business_db.repository import InMemoryBusinessRepository
 _SEQ = iter(range(1, 10_000))
 
 
-def datetime_local_now():
-    """本地墙钟 naive datetime（today 判定同域，见模块 docstring 造数口径）。"""
-    import datetime as dt
+def _today_boundary() -> datetime:
+    """与端点同源的今日 UTC 边界（`_local_midnight_utc_boundary` 现算）。"""
+    from control_plane.main import _local_midnight_utc_boundary
 
-    return dt.datetime.now().astimezone().replace(tzinfo=None)
+    return _local_midnight_utc_boundary()
 
 
 def _seed_call(
@@ -49,17 +50,18 @@ def _seed_call(
     status: str,
     disposition: str = "",
     duration_s: int = 0,
-    created_days_ago: int = 0,
+    created_at_utc: datetime | None = None,
     created_by: str = "",
     whatsapp_status: str = "",
 ) -> str:
     """repo.create_call + update_call 造一通带统计字段的通话，返回 call_id。
 
-    created_at 注入本地墙钟（now - created_days_ago）ISO 串：端点 today 判定
-    是「存储串 startswith 本地今日前缀」，以本地 now 为基准保证任意时区/任意
-    时刻跑测试都稳定（UTC 深夜跑时 UTC now 会落在「本地明天/昨天」）。
+    created_at 注入 UTC 锚点 ISO 串（缺省=当前 UTC 墙钟，恒在今日边界之后）：
+    端点 today 判定是「归一化 created_at ≥ 本地午夜 UTC 边界」，以同源边界 ±1min
+    构造跨日界两侧锚点，任意时区跑都确定（T5-M3 测试锚点改造）。
     """
     from bok_voice_core.types import CallMode, SessionManifest
+    from control_plane.campaign import _utcnow_naive
 
     cid = f"call-stats-{next(_SEQ)}"
     repo.create_call(
@@ -74,13 +76,13 @@ def _seed_call(
             providers={},
         )
     )
-    created_local = (datetime_local_now() - timedelta(days=created_days_ago)).isoformat()
+    created = (created_at_utc or _utcnow_naive()).isoformat()
     fields: dict = {
         "status": status,
         "disposition": disposition,
         "duration_s": duration_s,
         "created_by": created_by,
-        "created_at": created_local,
+        "created_at": created,
     }
     if whatsapp_status:
         fields["whatsapp_status"] = whatsapp_status
@@ -102,19 +104,22 @@ def client_with_repo(monkeypatch):
 
 def test_dashboard_aggregates(client_with_repo):
     repo = client_with_repo.repo
-    _seed_call(repo, status="active", created_days_ago=0)                      # 并发 1
+    boundary = _today_boundary()
+    _seed_call(repo, status="active", created_at_utc=boundary + timedelta(minutes=1))   # 并发 1
     _seed_call(repo, status="ended", disposition="completed", duration_s=45,
-               created_days_ago=0, created_by="u-1")                           # 今日接通 30-60 桶
+               created_at_utc=boundary + timedelta(minutes=1), created_by="u-1")        # 今日接通 30-60 桶
     _seed_call(repo, status="ended", disposition="no_answer", duration_s=0,
-               created_days_ago=0, created_by="u-1")                           # 未接通
+               created_at_utc=boundary + timedelta(minutes=1), created_by="u-1")        # 未接通
     _seed_call(repo, status="ended", disposition="completed", duration_s=120,
-               created_days_ago=2, created_by="u-2")                           # 昨天不计今日、90+ 桶
+               created_at_utc=boundary - timedelta(minutes=1), created_by="u-2")        # 边界前不计今日、90+ 桶
     _seed_call(repo, status="ended", disposition="", whatsapp_status="captured",
-               duration_s=20, created_days_ago=0, created_by="u-1")
+               duration_s=20, created_at_utc=boundary + timedelta(minutes=1),
+               created_by="u-1")
     data = client_with_repo.client.get("/api/stats/dashboard").json()
     assert data["concurrency"] == {"current": 1}
     assert data["calls"]["today"] == 4 and data["calls"]["total"] == 5
     assert data["calls"]["answered"] == 3
+    assert data["calls"]["answered_today"] == 2  # 三通接通中两通在边界后（u-2 那通在边界前）
     assert data["duration_buckets"]["30-60"] == 1 and data["duration_buckets"]["90+"] == 1
     assert data["duration_buckets"]["15-30"] == 1
     assert [a["user_id"] for a in data["agents"]] == ["u-1", "u-2"]
@@ -130,10 +135,47 @@ def test_dashboard_empty_account_zero_division_safe(client_with_repo):
     """ENDED=0 → answer_rate=0.0（不 ZeroDivisionError）；各段形状齐整。"""
     data = client_with_repo.client.get("/api/stats/dashboard").json()
     assert data["concurrency"] == {"current": 0}
-    assert data["calls"] == {"today": 0, "total": 0, "answered": 0, "answer_rate": 0.0}
+    assert data["calls"] == {"today": 0, "total": 0, "answered": 0, "answered_today": 0,
+                             "answer_rate": 0.0}
     assert set(data["duration_buckets"]) == {"0-15", "15-30", "30-60", "60-90", "90+"}
     assert data["agents"] == []
     assert data["tags"] == {"disposition": {}, "whatsapp": {}}
+
+
+# ---- 修复波 T5-M2/M3（2026-09-17）：answered 排除 FAILED + today UTC 边界 ----
+
+
+def test_dashboard_answered_excludes_failed_abandoned(client_with_repo):
+    """T5-M2：reaper 振铃超时（FAILED+abandoned，从未接通）不计 answered，
+    但计入 answer_rate 分母（拨出有结果）。"""
+    repo = client_with_repo.repo
+    boundary = _today_boundary()
+    _seed_call(repo, status="ended", disposition="completed", duration_s=30,
+               created_at_utc=boundary + timedelta(minutes=1))
+    _seed_call(repo, status="failed", disposition="abandoned",
+               created_at_utc=boundary + timedelta(minutes=1))
+    data = client_with_repo.client.get("/api/stats/dashboard").json()
+    assert data["calls"]["answered"] == 1
+    assert data["calls"]["answered_today"] == 1
+    assert data["calls"]["answer_rate"] == round(1 / 2, 4)  # 分母=ENDED+FAILED 全体
+    # 标记统计照记 abandoned（reaper 结果可见），不因 answered 口径丢失。
+    assert data["tags"]["disposition"]["abandoned"] == 1
+
+
+def test_dashboard_today_boundary_utc_cross(client_with_repo):
+    """T5-M3：today/answered_today 判定=本地午夜 UTC 边界（同源公式现算）。
+    边界前 1 分钟不计、边界后 1 分钟计入；全时段 answered/total 不受边界影响。"""
+    repo = client_with_repo.repo
+    boundary = _today_boundary()
+    _seed_call(repo, status="ended", disposition="completed", duration_s=20,
+               created_at_utc=boundary - timedelta(minutes=1))
+    _seed_call(repo, status="ended", disposition="completed", duration_s=20,
+               created_at_utc=boundary + timedelta(minutes=1))
+    data = client_with_repo.client.get("/api/stats/dashboard").json()
+    assert data["calls"]["today"] == 1
+    assert data["calls"]["answered_today"] == 1
+    assert data["calls"]["answered"] == 2
+    assert data["calls"]["total"] == 2
 
 
 def test_dashboard_agent_name_joins_users(client_with_repo):
@@ -147,9 +189,9 @@ def test_dashboard_agent_name_joins_users(client_with_repo):
         role="user", org_id="org-t", account_id="acc-001",
     )
     _seed_call(repo, status="ended", disposition="completed", duration_s=45,
-               created_days_ago=0, created_by=u1["id"])
+               created_by=u1["id"])
     _seed_call(repo, status="ended", disposition="no_answer", duration_s=0,
-               created_days_ago=0, created_by="nobody")
+               created_by="nobody")
     data = client_with_repo.client.get("/api/stats/dashboard").json()
     agents = {a["user_id"]: a for a in data["agents"]}
     assert agents[u1["id"]]["name"] == "阿明"
@@ -163,7 +205,7 @@ def test_dashboard_agent_name_joins_users(client_with_repo):
 def test_dial_result_answered_stamps_started_at(client_with_repo):
     """dial-result answered→ACTIVE 落 started_at（datetime 形态）。"""
     repo = client_with_repo.repo
-    cid = _seed_call(repo, status="ringing", created_days_ago=0)
+    cid = _seed_call(repo, status="ringing")
     r = client_with_repo.client.post(f"/api/calls/{cid}/dial-result", json={"status": "answered"})
     assert r.status_code == 200
     call = repo.get_call(cid)
@@ -171,10 +213,24 @@ def test_dial_result_answered_stamps_started_at(client_with_repo):
     assert call["started_at"] is not None
 
 
+def test_dial_result_answered_repeat_coalesces_started_at(client_with_repo):
+    """T5-M1：重复 answered 上报 coalesce started_at——已有起点不重置
+    （防重复上报把 duration 口径起点推后，与 resume-agent 路径同款）。"""
+    from control_plane.campaign import _utcnow_naive
+
+    repo = client_with_repo.repo
+    cid = _seed_call(repo, status="ringing")
+    first = _utcnow_naive() - timedelta(seconds=30)
+    repo.update_call(cid, started_at=first)
+    r = client_with_repo.client.post(f"/api/calls/{cid}/dial-result", json={"status": "answered"})
+    assert r.status_code == 200
+    assert repo.get_call(cid)["started_at"] == first
+
+
 def test_dial_result_failure_stamps_ended_and_zero_duration(client_with_repo):
     """dial-result 失败态→ENDED：ended_at 落点、started_at 空 → duration_s=0。"""
     repo = client_with_repo.repo
-    cid = _seed_call(repo, status="ringing", created_days_ago=0)
+    cid = _seed_call(repo, status="ringing")
     r = client_with_repo.client.post(f"/api/calls/{cid}/dial-result", json={"status": "no_answer"})
     assert r.status_code == 200
     call = repo.get_call(cid)
@@ -188,7 +244,7 @@ def test_hangup_computes_duration_from_started_at(client_with_repo):
     from control_plane.campaign import _utcnow_naive
 
     repo = client_with_repo.repo
-    cid = _seed_call(repo, status="active", created_days_ago=0)
+    cid = _seed_call(repo, status="active")
     repo.update_call(cid, started_at=_utcnow_naive() - timedelta(seconds=30))
     r = client_with_repo.client.post(f"/api/calls/{cid}/hangup")
     assert r.status_code == 200
@@ -203,7 +259,7 @@ def test_supervisor_end_stamps_ended_fields(client_with_repo):
     from control_plane.campaign import _utcnow_naive
 
     repo = client_with_repo.repo
-    cid = _seed_call(repo, status="active", created_days_ago=0)
+    cid = _seed_call(repo, status="active")
     repo.update_call(cid, started_at=_utcnow_naive() - timedelta(seconds=10))
     r = client_with_repo.client.post(f"/api/supervisor/{cid}/end?disposition=declined")
     assert r.status_code == 200

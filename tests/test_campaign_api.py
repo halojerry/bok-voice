@@ -435,6 +435,25 @@ def test_update_campaign_edits_paused(monkeypatch):
     assert row["max_concurrency"] == 3
 
 
+def test_update_campaign_redispatch_three_states(monkeypatch):
+    """T7-I1 服务端契约（web 开关依赖）：PUT redispatch 显式 `{}`=清除；
+    缺键=保留旧值；合法策略=覆盖。关开关只 save 不传键曾致「关不掉」。"""
+    client, repo = _client_and_repo(monkeypatch)
+    camp = _create_campaign(client, repo)
+    policy = {"max_attempts": 2, "interval_minutes": 30, "on": ["no_answer"]}
+    # 1) 设置策略
+    assert client.put(f"/api/campaigns/{camp['id']}",
+                      json={"redispatch": policy}).status_code == 200
+    assert repo.get_campaign(camp["id"])["redispatch"] == policy
+    # 2) 不传键 → 保留旧值
+    client.put(f"/api/campaigns/{camp['id']}", json={"gap_seconds": 9})
+    assert repo.get_campaign(camp["id"])["redispatch"] == policy
+    # 3) 显式 `{}` → 清除（web 重拨开关关闭的落点）
+    client.put(f"/api/campaigns/{camp['id']}", json={"redispatch": {}})
+    assert repo.get_campaign(camp["id"])["redispatch"] == {}
+    assert repo.get_campaign(camp["id"])["redispatch_json"] == ""
+
+
 def test_update_campaign_missing_is_404_and_audits(monkeypatch):
     """PUT 404 同既有端点；成功编辑落 campaign.update 审计。"""
     from bok_voice_obs.audit import AuditStore, audit_store
