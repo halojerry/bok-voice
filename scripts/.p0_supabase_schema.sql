@@ -7,11 +7,11 @@
 --   schema 唯一真源 = packages/business-db ORM 模型 + deps.build_engine() 的幂等迁移;
 --   **改表后必须重跑本脚本重新生成**,再应用到 Supabase。
 --
--- 生成日期: 2026-09-17
+-- 生成日期: 2026-09-18
 -- 源镜像:   pgvector/pgvector:pg16
 -- 源命令:   docker exec pg-ddl pg_dump -U postgres --schema-only --no-owner --no-privileges postgres
 -- 回环校验: pgvector/pgvector:pg16 上应用本文件 + 重跑 build_engine() = 零 DDL 变更(生成时实测)
--- 规模:     CREATE TABLE 25 张 / CREATE INDEX 36 条 / 数据语句 0 条
+-- 规模:     CREATE TABLE 26 张 / CREATE INDEX 38 条 / 数据语句 0 条
 --           (--schema-only:正常应 0 条数据语句;带 DEFAULT/COMMENT 属 schema 本身)
 --
 -- 目标: 全新 Supabase(Postgres)项目首次引导。应用方式(Main 线程):
@@ -100,6 +100,23 @@ CREATE TABLE public.audit_events (
     account_id character varying(64) NOT NULL,
     object_id character varying(64) NOT NULL,
     persona_id character varying(64) NOT NULL
+);
+
+
+--
+-- Name: call_followups; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.call_followups (
+    id character varying(64) NOT NULL,
+    call_id character varying(64) NOT NULL,
+    account_id character varying(64) NOT NULL,
+    object_id character varying(64) NOT NULL,
+    kind character varying(16) NOT NULL,
+    note text NOT NULL,
+    status character varying(16) NOT NULL,
+    created_by character varying(64) NOT NULL,
+    created_at timestamp without time zone NOT NULL
 );
 
 
@@ -558,6 +575,14 @@ ALTER TABLE ONLY public.audit_events
 
 
 --
+-- Name: call_followups call_followups_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.call_followups
+    ADD CONSTRAINT call_followups_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: call_sessions call_sessions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -767,6 +792,20 @@ CREATE INDEX ix_audit_events_request_id ON public.audit_events USING btree (requ
 --
 
 CREATE INDEX ix_audit_events_ts ON public.audit_events USING btree (ts);
+
+
+--
+-- Name: ix_call_followups_account_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_call_followups_account_id ON public.call_followups USING btree (account_id);
+
+
+--
+-- Name: ix_call_followups_call_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_call_followups_call_id ON public.call_followups USING btree (call_id);
 
 
 --
