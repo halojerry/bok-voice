@@ -36,10 +36,18 @@ function QaEntryNode({ data }: NodeProps) {
       className={`w-[260px] rounded-lg border bg-white/5 p-3 text-xs ${dim ? "opacity-50" : ""} ${d.isHead ? "border-(--accent)" : "border-(--card-border)"}`}
       title={d.canEdit ? undefined : "共享条目由主管维护"}
     >
-      {/* 柄始终渲染(v12 边锚定柄,缺柄=008 且簇/步骤边整体消失),编辑权走 isConnectable:
-          只读条目拖不出也接不进,共享行写权限仍由 CP 兜底。 */}
-      <Handle type="target" position={Position.Right} isConnectable={d.canEdit} style={HANDLE_STYLE} />
-      <Handle type="source" position={Position.Left} isConnectable={d.canEdit} style={HANDLE_STYLE} />
+      {/* 柄始终渲染(v12 边锚定柄,缺柄=008 且簇/步骤边整体消失)。只读条目双向闸:
+          接进=落点校验查 isConnectable;拖出=onPointerDown 只查 isConnectableStart
+          (v12 不看 isConnectable,反向从 target 柄拖出同理),两枚柄都钉 canEdit。
+          共享行写权限仍由 CP 兜底。 */}
+      <Handle
+        type="target" position={Position.Right}
+        isConnectable={d.canEdit} isConnectableStart={d.canEdit} style={HANDLE_STYLE}
+      />
+      <Handle
+        type="source" position={Position.Left}
+        isConnectable={d.canEdit} isConnectableStart={d.canEdit} style={HANDLE_STYLE}
+      />
       <p className="line-clamp-2 font-medium">{String(d.question_text ?? "(无问法)")}</p>
       <p className="mt-1 line-clamp-1 muted">{String(d.answer_text ?? "")}</p>
       <div className="mt-2 flex flex-wrap items-center gap-1">
