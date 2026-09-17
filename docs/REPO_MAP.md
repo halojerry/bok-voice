@@ -12,7 +12,7 @@
 | `scripts/` | CI 构建、E2E、延迟测量、smoke、sidecar 启动（见下「脚本」） | dev/CI |
 | `apps/agent/` | LiveKit agent 运行时（A 线客服 + B 线同传 worker） | both |
 | `apps/control-plane/` | FastAPI 业务服务 :8000（对象/人设/知识/话术/通话/审计/token/webhook/名册/外呼战役） | both |
-| `apps/web/` | Next.js 静态导出（Tauri 托管 UI：calls/interpret/supervisor/objects/personas/settings/roster/campaigns/nodes（root 停机开关）…；`test/*.test.mjs` node --test 单测，CI web job `npm test`） | both |
+| `apps/web/` | Next.js 静态导出（纯浏览器 UI，节点 :3000 / 云 CP 托管：calls/interpret/supervisor/objects/personas/settings/roster/campaigns/nodes（root 停机开关）…；`test/*.test.mjs` node --test 单测，CI web job `npm test`） | both |
 | `packages/core/` | 领域模型 + 策略（`bok_voice_core`：policies/types） | both |
 | `packages/business-db/` | SQLAlchemy 仓库（`bok_voice_business_db`：global_settings 默认等） | both |
 | `packages/knowledge/` | 知识服务 / Markdown / 向量（沉淀知识库） | both |
@@ -59,7 +59,7 @@
 - 云端部署三件套：`deploy/cloud/`（docker-compose.yml + .env.example + 宝塔 runbook README——云 CP 单容器接 Supabase，vault 落命名卷；CI `compose-rehearsal.yml` 每次改动真跑 compose 排练：config 校验→本地构建→up→/health+静态站+root 登录断言）
 - Supabase 漂移门禁：`check_schema_drift.py`（产物应用→build_engine→双 dump+代码基线四向比对，死对象方向也逮；CI `schema-drift.yml`）+ 节点握手 smoke `node_handshake_smoke.py`（license 流 9 步）+ kill-switch 探针（CI `node-handshake.yml`：Linux 真 CP 实跑握手+停机开关全链 / Windows ps1 干跑 + 生命周期探针）
 - 话务员机虚拟声卡：`setup-virtual-audio.sh|ps1`（B 线同传路由；mac=BlackHole GPL/win=VB-CABLE donationware **下载即装不随包分发**——再分发限制；doctor 有检测行；指南 `docs/OPERATOR_AUDIO_SETUP.md`）
-- 节点安装/打包：`install-node.sh|ps1`（步骤计划器 fail-fast，`--node-token|--license-key` 双流，dry-run 零副作用；ps1 `-InstallService` 装完注册 Windows 常驻服务——token 模式，license 模式节点直接 bok.py 注册）+ `build_node_agent.sh`/`node_agent.spec`（PyInstaller onefile node-agent 二进制，`docs/NODE_PACKAGING.md`）
+- 节点安装/打包：`install-node.sh|ps1`（步骤计划器 fail-fast，`--node-token|--license-key` 双流，dry-run 零副作用；ps1 `-Fetch` 冷装机自举（CP 拉包）+ `-InstallService` 注册常驻（token/license 双流透传）；`bootstrap-node.sh`=bash 自举入口）+ `build_node_pkg.sh`/`build_runtime_pkg.sh`（发版工件：代码包+运行时包，`deploy/cloud/publish_node_pkg.sh` 推云 CP）+ `build_node_agent.sh`/`node_agent.spec`（PyInstaller onefile node-agent 二进制，`docs/NODE_PACKAGING.md`）
 - 电话边缘站点部署：`deploy_sip_edge.sh`（Ubuntu 22.04+ VPS，root/sudo：apt 依赖 + livekit-sip 原生编译装 `/usr/local/bin/livekit-sip` + `/etc/bok/livekit-sip.yaml` + systemd `bok-livekit-sip.service`（Redis 依赖按 `--redis-url` 分支：本机档 `Requires=`、远端档 `Wants=`）；幂等，`--force` 重编；周期=脚本部署→CP 建站→面板注册 trunk→战役挂 site_id，见 RUNTIME_TOPOLOGY「电话边缘站点」）
 - 平台：`setup-windows.ps1`
 
@@ -68,9 +68,9 @@
 | 场景 | 入口 |
 |---|---|
 | 本机开发拉起全栈 | `python tools/bok.py serve`（无 Docker） |
-| 桌面打包 | `cd desktop && npx tauri build --bundles app`（CI release.yml） |
+| 节点发版打包 | `scripts/build_node_pkg.sh <版本>` + `build_runtime_pkg.sh <版本>`（CI release.yml） |
 | 模型首启下载 | `python tools/bok.py setup download` |
-| 打包自检 | `bok.py doctor --packaged` + `scripts/verify_bundle.sh` |
+| 节点自检 | `bok.py doctor`（安装树：`BOK_ROOT` 指安装根） |
 | 生产常驻（launchd） | `bok.py prod install` / `prod status` |
 | A 线通话 | 前端 /calls → LiveKit :7880 → agent worker（每通语言固定） |
 | B 线同传 v2 | 前端 /interpret → LiveKit :7880 → interp worker ×2（:1236 MT + MiniMax） |
@@ -99,10 +99,9 @@
 ## 运行时装配（packaged）
 
 ```text
-desktop/runtime/python/        独立 CPython（依赖 requirements-runtime-<平台>.txt）
-desktop/runtime/llama/         Windows llama-server.exe + cudart DLL
-desktop/runtime/bline-node_modules/
-desktop/src-tauri/binaries/    externalBin：livekit-server / node（<name>-<target-triple>）
+runtime/python/                独立 CPython（依赖 requirements-runtime-<平台>.txt；2026-09-17 迁出 desktop/）
+runtime/llama/                 Windows llama-server.exe + cudart DLL
+runtime/bline-node_modules/    B-line worker 依赖
 ```
 
 ## 已清理的遗留

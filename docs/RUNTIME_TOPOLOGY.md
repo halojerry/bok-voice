@@ -337,7 +337,7 @@ WorkerOptions.port)——默认同为 8081 会竞态,后绑者 Errno 48 即崩
 
 ### 关闭（`bok.py down`）
 
-按 pid 文件逐个 SIGTERM（run/*.pid）。Tauri 退出时调用 `stop`。
+按 pid 文件逐个 SIGTERM（run/*.pid）；node_agent full 模式退出/收到 shutdown 指令时经 cmd_down 收栈。
 
 ### 失败处理
 
@@ -420,7 +420,7 @@ Windows 站点机的常驻等价物（对照 mac launchd RunAtLoad + KeepAlive�
 
 | 路径 | 可写 | 用途 |
 |---|---|---|
-| bundle（`.app/Contents/Resources`） | 否（只读） | 代码、Python 运行时、二进制、静态前端 |
+| 节点安装树（`~/bok-voice` / `%USERPROFILE%\bok-voice`） | 代码可更新 | 代码、runtime/（Python/二进制复用）、静态前端 |
 | `~/Library/Application Support/BokVoice`（win `%LOCALAPPDATA%\BokVoice`） | 是 | models / vault / logs / run / bok_voice.db / audit / bline.json |
 | `~/.lmstudio/models` | 只读引用 | 本机开发/软链复用（`--` 目录名映射） |
 
