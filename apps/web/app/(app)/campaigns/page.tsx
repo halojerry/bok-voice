@@ -5,13 +5,16 @@ import Link from "next/link";
 import { api } from "@/lib/api";
 import { LoadingState, EmptyState, ErrorState } from "@/components/app-shell";
 
+type CallWindow = { days: number[]; start: string; end: string };
+type Redispatch = { max_attempts?: number; interval_minutes?: number; on?: string[] };
 type Campaign = {
   id: string; name: string; status: string; language: string; gap_seconds: number;
   template_id?: string; persona_id?: string;
+  call_windows?: CallWindow[]; max_concurrency?: number; redispatch?: Redispatch;
   created_at: string; items?: Item[]; progress?: Progress;
 };
 type Progress = Record<string, number>;
-type Item = { id: string; object_id: string; phone: string; status: string; call_id: string; scenario: string };
+type Item = { id: string; object_id: string; phone: string; status: string; call_id: string; scenario: string; attempts?: number };
 type Obj = { id: string; display_name: string; phone?: string };
 type Ref = { id: string; name?: string };
 
@@ -46,7 +49,78 @@ const SCENARIOS = [
   { value: "hangup_mid", label: "中途挂断" },
 ];
 
-type Form = {
+/** 外呼时段编辑（2026-09-17 调度三字段）：星期 ISO 1..7（1=周一），≤3 组；days 空行提交前过滤，非法项由服务端静默丢弃。 */
+const MAX_WINDOWS = 3;
+const WEEK_DAYS: { value: number; label: string }[] = [
+  { value: 1, label: "周一" }, { value: 2, label: "周二" }, { value: 3, label: "周三" },
+  { value: 4, label: "周四" }, { value: 5, label: "周五" }, { value: 6, label: "周六" }, { value: 7, label: "周日" },
+];
+const REDISPATCH_OUTCOMES: { value: string; label: string }[] = [
+  { value: "no_answer", label: "未接听" },
+  { value: "rejected", label: "拒接" },
+  { value: "failed", label: "失败" },
+];
+
+const dayLabel = (d: number) => WEEK_DAYS.find((x) => x.value === d)?.label ?? String(d);
+
+/** 时段摘要紧凑串：连续星期段「周一~周五」、非连续「/」分隔；多窗「 · 」相连。 */
+function summarizeWindows(windows: CallWindow[]): string {
+  if (!windows.length) return "";
+  return windows
+    .map((w) => {
+      const days = [...w.days].sort((a, b) => a - b);
+      const runs: number[][] = [];
+      for (const d of days) {
+        const last = runs[runs.length - 1];
+        if (last && d === last[last.length - 1] + 1) last.push(d);
+        else runs.push([d]);
+      }
+      const dayPart = runs
+        .map((r) => (r.length === 1 ? dayLabel(r[0]) : `${dayLabel(r[0])}~${dayLabel(r[r.length - 1])}`))
+        .join("/");
+      return `${dayPart} ${w.start}-${w.end}`;
+    })
+    .join(" · ");
+}
+
+/** 时段/并发/重拨三组控件共享值（向导①步与详情编辑弹层同源同构）。 */
+type SchedValue = {
+  call_windows: CallWindow[];
+  max_concurrency: number;
+  redispatch_on: boolean;
+  redispatch_max: number;
+  redispatch_interval: number;
+  redispatch_outcomes: string[];
+};
+
+const EMPTY_SCHED: SchedValue = {
+  call_windows: [],
+  max_concurrency: 1,
+  redispatch_on: false,
+  redispatch_max: 2,
+  redispatch_interval: 30,
+  redispatch_outcomes: ["no_answer"],
+};
+
+/** POST/PUT 提交体（同构）：call_windows 过滤 days 空行；并发钳 ≥0；重拨关=不传键。 */
+function buildSchedBody(s: SchedValue): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    call_windows: s.call_windows
+      .map((w) => ({ days: [...w.days].sort((a, b) => a - b), start: w.start, end: w.end }))
+      .filter((w) => w.days.length > 0 && Boolean(w.start) && Boolean(w.end)),
+    max_concurrency: Math.max(0, Math.floor(Number(s.max_concurrency) || 0)),
+  };
+  if (s.redispatch_on) {
+    body.redispatch = {
+      max_attempts: Math.min(5, Math.max(1, Math.floor(Number(s.redispatch_max) || 0))),
+      interval_minutes: Math.max(1, Number(s.redispatch_interval) || 0),
+      on: REDISPATCH_OUTCOMES.map((o) => o.value).filter((v) => s.redispatch_outcomes.includes(v)),
+    };
+  }
+  return body;
+}
+
+type Form = SchedValue & {
   name: string; object_ids: string[]; template_id: string; persona_id: string;
   language: string; gap_seconds: number; site_id: string;
   scenarios: Record<string, string>;
@@ -58,6 +132,7 @@ const EMPTY_FORM: Form = {
   name: "", object_ids: [], template_id: "", persona_id: "",
   language: "zh", gap_seconds: 5, site_id: "",
   scenarios: {}, scripts: {}, mock_speak_interval_s: 0,
+  ...EMPTY_SCHED,
 };
 
 function ProgressBar({ progress }: { progress?: Progress }) {
@@ -83,6 +158,134 @@ function ProgressLegend({ progress }: { progress?: Progress }) {
           {s.label} {progress?.[s.key] ?? 0}
         </span>
       ))}
+    </div>
+  );
+}
+
+/** 时段/并发/重拨编辑器：向导①步与详情「编辑配置」弹层共用（提交体都走 buildSchedBody）。 */
+function SchedulingEditor({ value, onChange }: { value: SchedValue; onChange: (v: SchedValue) => void }) {
+  const addWindow = () =>
+    onChange({ ...value, call_windows: [...value.call_windows, { days: [1, 2, 3, 4, 5], start: "09:00", end: "18:00" }] });
+  const removeWindow = (idx: number) =>
+    onChange({ ...value, call_windows: value.call_windows.filter((_, i) => i !== idx) });
+  const toggleWindowDay = (idx: number, day: number) =>
+    onChange({
+      ...value,
+      call_windows: value.call_windows.map((w, i) => {
+        if (i !== idx) return w;
+        const days = w.days.includes(day)
+          ? w.days.filter((d) => d !== day)
+          : [...w.days, day].sort((a, b) => a - b);
+        return { ...w, days };
+      }),
+    });
+  const setWindowField = (idx: number, key: "start" | "end", v: string) =>
+    onChange({ ...value, call_windows: value.call_windows.map((w, i) => (i === idx ? { ...w, [key]: v } : w)) });
+  const toggleOutcome = (v: string) =>
+    onChange({
+      ...value,
+      redispatch_outcomes: value.redispatch_outcomes.includes(v)
+        ? value.redispatch_outcomes.filter((x) => x !== v)
+        : [...value.redispatch_outcomes, v],
+    });
+
+  return (
+    <div className="space-y-3">
+      <div className="space-y-2">
+        <span className="text-xs text-(--stage-muted)">外呼时段</span>
+        {value.call_windows.map((w, idx) => (
+          <div key={idx} className="flex flex-wrap items-center gap-2">
+            <div className="flex flex-wrap items-center gap-1">
+              {WEEK_DAYS.map((d) => (
+                <label key={d.value} className="flex cursor-pointer items-center gap-1 rounded px-1 py-0.5 text-xs hover:bg-white/5">
+                  <input type="checkbox" checked={w.days.includes(d.value)} onChange={() => toggleWindowDay(idx, d.value)} />
+                  {d.label}
+                </label>
+              ))}
+            </div>
+            <input
+              type="time"
+              className="rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--accent)"
+              value={w.start}
+              onChange={(e) => setWindowField(idx, "start", e.target.value)}
+            />
+            <span className="text-xs muted">至</span>
+            <input
+              type="time"
+              className="rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--accent)"
+              value={w.end}
+              onChange={(e) => setWindowField(idx, "end", e.target.value)}
+            />
+            <button className="btn-ghost text-xs" onClick={() => removeWindow(idx)}>删除</button>
+          </div>
+        ))}
+        {value.call_windows.length === 0 && (
+          <p className="text-xs muted">不设置 = 全天可拨；最多 {MAX_WINDOWS} 组。</p>
+        )}
+        {value.call_windows.length < MAX_WINDOWS && (
+          <button className="btn-ghost text-xs" onClick={addWindow}>+ 添加时段</button>
+        )}
+      </div>
+
+      <label className="block max-w-52">
+        <span className="text-xs text-(--stage-muted)">最大并发</span>
+        <input
+          type="number"
+          min={0}
+          className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+          value={value.max_concurrency}
+          onChange={(e) => onChange({ ...value, max_concurrency: Math.max(0, Math.floor(Number(e.target.value) || 0)) })}
+        />
+        <p className="mt-1 text-xs muted">0 = 不限制；默认 1 = 逐通串行。</p>
+      </label>
+
+      <div className="space-y-2">
+        <label className="flex cursor-pointer items-center gap-2">
+          <input
+            type="checkbox"
+            checked={value.redispatch_on}
+            onChange={(e) => onChange({ ...value, redispatch_on: e.target.checked })}
+          />
+          <span className="text-xs text-(--stage-muted)">自动重拨</span>
+          <span className="text-xs muted">未接通时按策略回队重拨</span>
+        </label>
+        {value.redispatch_on && (
+          <div className="flex flex-wrap items-center gap-3 text-xs">
+            <label className="flex items-center gap-1">
+              最多
+              <input
+                type="number"
+                min={1}
+                max={5}
+                className="w-16 rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--accent)"
+                value={value.redispatch_max}
+                onChange={(e) => onChange({ ...value, redispatch_max: Math.floor(Number(e.target.value) || 0) })}
+              />
+              次
+            </label>
+            <label className="flex items-center gap-1">
+              间隔
+              <input
+                type="number"
+                min={1}
+                className="w-16 rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--accent)"
+                value={value.redispatch_interval}
+                onChange={(e) => onChange({ ...value, redispatch_interval: Number(e.target.value) || 0 })}
+              />
+              分钟
+            </label>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="muted">结果：</span>
+              {REDISPATCH_OUTCOMES.map((o) => (
+                <label key={o.value} className="flex cursor-pointer items-center gap-1">
+                  <input type="checkbox" checked={value.redispatch_outcomes.includes(o.value)} onChange={() => toggleOutcome(o.value)} />
+                  {o.label}
+                </label>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -154,6 +357,7 @@ function CampaignWizard({
       if (form.mock_speak_interval_s > 0) body.mock_speak_interval_s = form.mock_speak_interval_s;
       const scenarios = Object.fromEntries(Object.entries(form.scenarios).filter(([, v]) => v));
       if (Object.keys(scenarios).length) body.scenarios = scenarios;
+      Object.assign(body, buildSchedBody(form));
       await api.createCampaign(body);
       await onCreated();
     } catch (e) {
@@ -247,6 +451,9 @@ function CampaignWizard({
               onChange={(e) => setForm({ ...form, gap_seconds: Number(e.target.value) || 5 })}
             />
           </label>
+          <div className="space-y-3 sm:col-span-2">
+            <SchedulingEditor value={form} onChange={(v) => setForm({ ...form, ...v })} />
+          </div>
         </div>
       )}
 
@@ -420,10 +627,62 @@ export default function CampaignsPage() {
     void act(c.id, "delete", api.deleteCampaign);
   };
 
+  // 编辑配置（draft/paused/stopped）：只改时段/并发/重拨三字段，running 由服务端 409 锁定。
+  const [editOpen, setEditOpen] = useState(false);
+  const [editSched, setEditSched] = useState<SchedValue>(EMPTY_SCHED);
+  const [editBusy, setEditBusy] = useState(false);
+
+  const openEdit = () => {
+    if (!detail) return;
+    const rd = detail.redispatch;
+    const rawOn = rd?.on;
+    const on: string[] = Array.isArray(rawOn)
+      ? rawOn.filter((x) => REDISPATCH_OUTCOMES.some((o) => o.value === x))
+      : [];
+    const hasRd = Number(rd?.max_attempts ?? 0) > 0 && on.length > 0;
+    setEditSched({
+      call_windows: (detail.call_windows ?? []).map((w) => ({
+        days: [...w.days],
+        start: w.start || "09:00",
+        end: w.end || "18:00",
+      })),
+      max_concurrency: Number(detail.max_concurrency ?? 1),
+      redispatch_on: hasRd,
+      redispatch_max: hasRd ? Number(rd?.max_attempts) : EMPTY_SCHED.redispatch_max,
+      redispatch_interval: hasRd ? Number(rd?.interval_minutes) : EMPTY_SCHED.redispatch_interval,
+      redispatch_outcomes: on.length ? [...on] : [...EMPTY_SCHED.redispatch_outcomes],
+    });
+    setErr("");
+    setEditOpen(true);
+  };
+
+  const saveEdit = async () => {
+    if (!openId) return;
+    setEditBusy(true);
+    setErr("");
+    try {
+      await api.updateCampaign(openId, buildSchedBody(editSched));
+      setEditOpen(false);
+      await loadDetail(openId);
+      await reload();
+    } catch (e) {
+      const msg = String(e);
+      // 409（running 锁定）与其它 4xx 都走页面既有错误提示；409 附中文指引。
+      setErr(msg.includes("409") ? `运行中请先暂停（${msg}）` : msg);
+    } finally {
+      setEditBusy(false);
+    }
+  };
+
   const objName = (id: string) => objects.find((o) => o.id === id)?.display_name || id || "—";
 
   if (openId) {
     const items = (detail?.items ?? []).filter((it) => !itemFilter || it.status === itemFilter);
+    const schedSummary = detail ? summarizeWindows(detail.call_windows ?? []) : "";
+    const rdInfo = detail?.redispatch;
+    const rdSummary = Number(rdInfo?.max_attempts ?? 0) > 0
+      ? `${rdInfo?.max_attempts}次/${rdInfo?.interval_minutes}分`
+      : "";
     return (
       <div className="space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
@@ -432,15 +691,23 @@ export default function CampaignsPage() {
             <p className="page-sub">
               {STATUS_LABEL[detail?.status ?? ""] ?? detail?.status ?? "加载中"} ·{" "}
               {LANG_LABEL[detail?.language ?? ""] ?? detail?.language} · 名单 {detail?.progress?.total ?? 0}
+              {schedSummary ? <> · 时段 {schedSummary}</> : <> · 时段 不限</>}
+              {" "}· 并发 {(detail?.max_concurrency ?? 1) === 0 ? "不限" : detail?.max_concurrency ?? 1}
+              {rdSummary ? <> · 重拨 {rdSummary}</> : null}
             </p>
           </div>
           <div className="flex items-center gap-2">
+            {detail && detail.status !== "running" && (
+              <button className="btn-ghost text-xs" disabled={editBusy} onClick={() => (editOpen ? setEditOpen(false) : openEdit())}>
+                {editOpen ? "收起编辑" : "编辑配置"}
+              </button>
+            )}
             {detail?.status === "running" && <button className="btn-ghost text-xs" onClick={() => act(openId, "pause", api.pauseCampaign)}>暂停</button>}
             {detail?.status === "paused" && <button className="btn-primary text-xs" onClick={() => act(openId, "start", api.startCampaign)}>继续</button>}
             {(detail?.status === "running" || detail?.status === "paused") && (
               <button className="btn-ghost text-xs" onClick={() => detail && stopCampaign(detail)}>停止</button>
             )}
-            <button className="btn-ghost text-xs" onClick={() => { setOpenId(null); setDetail(null); setItemFilter(""); }}>← 返回列表</button>
+            <button className="btn-ghost text-xs" onClick={() => { setOpenId(null); setDetail(null); setItemFilter(""); setEditOpen(false); }}>← 返回列表</button>
           </div>
         </div>
 
@@ -465,7 +732,7 @@ export default function CampaignsPage() {
           <table className="w-full text-sm">
             <thead>
               <tr className="text-left muted">
-                <th className="py-1">对象</th><th>电话</th><th>状态</th><th>剧本</th><th>通话</th>
+                <th className="py-1">对象</th><th>电话</th><th>状态</th><th>次</th><th>剧本</th><th>通话</th>
               </tr>
             </thead>
             <tbody>
@@ -474,6 +741,7 @@ export default function CampaignsPage() {
                   <td className="py-1.5">{objName(it.object_id)}</td>
                   <td className="font-mono text-xs">{it.phone || "—"}</td>
                   <td>{ITEM_LABEL[it.status] || it.status}</td>
+                  <td className="text-xs muted" title="已尝试拨打次数">{it.attempts ?? "—"}</td>
                   <td>{it.scenario || "—"}</td>
                   <td>
                     {it.call_id ? (
@@ -485,11 +753,28 @@ export default function CampaignsPage() {
                 </tr>
               ))}
               {items.length === 0 && (
-                <tr><td colSpan={5} className="py-3 text-xs muted">没有符合筛选的名单项。</td></tr>
+                <tr><td colSpan={6} className="py-3 text-xs muted">没有符合筛选的名单项。</td></tr>
               )}
             </tbody>
           </table>
         </section>
+
+        {editOpen && (
+          <section className="card space-y-3">
+            <div className="flex items-center justify-between">
+              <span className="label">编辑配置（时段 / 并发 / 重拨）</span>
+              <button className="btn-ghost text-xs" onClick={() => setEditOpen(false)}>关闭</button>
+            </div>
+            <SchedulingEditor value={editSched} onChange={setEditSched} />
+            <div className="flex items-center gap-2">
+              <button className="btn-primary text-xs" disabled={editBusy} onClick={() => void saveEdit()}>
+                {editBusy ? "保存中…" : "保存"}
+              </button>
+              <button className="btn-ghost text-xs" onClick={() => setEditOpen(false)}>取消</button>
+              <span className="text-xs muted">进行中战役不可改（先暂停）；保存成功后立即刷新。</span>
+            </div>
+          </section>
+        )}
       </div>
     );
   }
