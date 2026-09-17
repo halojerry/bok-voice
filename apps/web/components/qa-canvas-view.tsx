@@ -7,7 +7,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Background, Controls, MiniMap, ReactFlow,
-  type Edge, type Node, type NodeProps,
+  type Edge, type Node, type NodeChange, type NodeProps,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import {
@@ -68,7 +68,7 @@ export default function QaCanvasView(props: {
   onDisconnect: (edge: { id: string; data?: { kind?: string }; source: string; target: string }) => void;
   onStepConnect: (entryId: string, stepIndex: number) => void;
 }) {
-  const { rows, templates, templateId, canned } = props;
+  const { rows, templates, templateId, canned, canEditRow } = props;
   const [langFilter, setLangFilter] = useState("all");
   const [positions, setPositions] = useState<Record<string, Pt>>({});
   const accountId = "acc-001"; // 与页面 useAccount 同源,Task 7 接线时由 props 传入替换。
@@ -97,10 +97,10 @@ export default function QaCanvasView(props: {
       ...graph.stepNodes.map((n) => ({ ...n, data: { ...n.data } })),
       ...graph.qaNodes.map((n) => ({
         ...n,
-        data: { ...n.data, canned: canned[String(n.id)]?.state, canEdit: props.canEditRow(n.data) },
+        data: { ...n.data, canned: canned[String(n.id)]?.state, canEdit: canEditRow(n.data) },
       })),
     ],
-    [graph, canned, props],
+    [graph, canned, canEditRow],
   );
   const edges: Edge[] = useMemo(
     () =>
@@ -127,6 +127,22 @@ export default function QaCanvasView(props: {
     },
     [accountId, templateId],
   );
+
+  // 受控模式必须消化 position 变更(v12):拖动实时跟手走 deriveGraph 同一条
+  // positions 覆盖路径(batch 合并一次 setPositions);onNodeDragStop 只做落盘。
+  const onNodesChange = useCallback((changes: NodeChange[]) => {
+    setPositions((prev) => {
+      const next = { ...prev };
+      let moved = false;
+      for (const c of changes) {
+        if (c.type === "position" && c.position) {
+          next[c.id] = c.position;
+          moved = true;
+        }
+      }
+      return moved ? next : prev;
+    });
+  }, []);
 
   return (
     <div className="space-y-2">
@@ -166,13 +182,16 @@ export default function QaCanvasView(props: {
           nodeTypes={NODE_TYPES}
           fitView
           minZoom={0.2}
+          onNodesChange={onNodesChange}
           onNodeDragStop={onNodeDragStop}
           onNodeClick={(_, node) => {
             const row = rows.find((r) => String(r.id) === node.id);
             if (row) props.onNodeClick(row);
           }}
           onEdgeClick={(_, edge) => {
-            if (confirm("解除这条连线？")) props.onDisconnect(edge as never);
+            // Edge→上抛载荷的结构收窄(仅取本页关心的字段,不再 as never 逃逸)。
+            const hit = edge as { id: string; data?: { kind?: string }; source: string; target: string };
+            if (confirm("解除这条连线？")) props.onDisconnect(hit);
           }}
         >
           <Background gap={24} />
