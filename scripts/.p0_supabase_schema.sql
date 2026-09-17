@@ -7,7 +7,7 @@
 --   schema 唯一真源 = packages/business-db ORM 模型 + deps.build_engine() 的幂等迁移;
 --   **改表后必须重跑本脚本重新生成**,再应用到 Supabase。
 --
--- 生成日期: 2026-09-17
+-- 生成日期: 2026-09-18
 -- 源镜像:   pgvector/pgvector:pg16
 -- 源命令:   docker exec pg-ddl pg_dump -U postgres --schema-only --no-owner --no-privileges postgres
 -- 回环校验: pgvector/pgvector:pg16 上应用本文件 + 重跑 build_engine() = 零 DDL 变更(生成时实测)
@@ -131,6 +131,9 @@ CREATE TABLE public.call_sessions (
     voices_json text NOT NULL,
     session_report text NOT NULL,
     session_reports_json text DEFAULT '[]'::text NOT NULL,
+    started_at timestamp without time zone,
+    ended_at timestamp without time zone,
+    duration_s integer DEFAULT 0 NOT NULL,
     node_id character varying(64) DEFAULT ''::character varying NOT NULL,
     created_at timestamp without time zone NOT NULL
 );
@@ -170,6 +173,9 @@ CREATE TABLE public.campaigns (
     gap_seconds integer NOT NULL,
     scripts_json text NOT NULL,
     site_id character varying(64) NOT NULL,
+    call_windows_json text DEFAULT '[]'::text NOT NULL,
+    max_concurrency integer DEFAULT 1 NOT NULL,
+    redispatch_json text DEFAULT ''::text NOT NULL,
     created_at timestamp without time zone NOT NULL,
     finished_at timestamp without time zone
 );
@@ -255,6 +261,7 @@ CREATE TABLE public.global_settings (
     tts_json text NOT NULL,
     vad_json text NOT NULL,
     sip_json text NOT NULL,
+    campaign_json text DEFAULT ''::text NOT NULL,
     policy character varying(64) NOT NULL,
     updated_at timestamp without time zone NOT NULL
 );

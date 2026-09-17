@@ -231,7 +231,12 @@ export const api = {
   pauseCampaign: (id: string) => request<Record<string, unknown>>(`/api/campaigns/${id}/pause`, { method: "POST" }),
   stopCampaign: (id: string) => request<Record<string, unknown>>(`/api/campaigns/${id}/stop`, { method: "POST" }),
   deleteCampaign: (id: string) => request<Record<string, unknown>>(`/api/campaigns/${id}`, { method: "DELETE" }),
+  // 改战役配置（2026-09-17 调度三字段）：running 服务端 409 锁定，字段全 optional。
+  updateCampaign: (id: string, body: Record<string, unknown>) =>
+    request<Record<string, unknown>>(`/api/campaigns/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   reportsSummary: () => request<Record<string, unknown>>("/api/reports/summary"),
+  // 工作台仪表盘聚合（2026-09-17）：并发/呼叫量/接通率/时长分布/坐席排行/标记。
+  statsDashboard: () => request<Record<string, unknown>>("/api/stats/dashboard"),
   reportsCalls: () => request<Record<string, unknown>[]>("/api/reports/calls"),
   reportsUsage: () => request<Record<string, unknown>>("/api/reports/usage"),
   listTemplates: (accountId = "acc-001") => request<Record<string, unknown>[]>(`/api/templates?account_id=${accountId}`),

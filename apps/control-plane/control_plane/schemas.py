@@ -237,12 +237,26 @@ class SipSettingsModel(BaseModel):
     max_call_duration_s: int = 600
 
 
+class CampaignSettingsModel(BaseModel):
+    """全局外呼时段窗段（2026-09-17 T3b）：settings.campaign。
+
+    call_windows 形状 [{"days":[1..7],"start":"HH:MM","end":"HH:MM"}]（≤3 组，
+    归一见 campaign.parse_call_windows，非法项静默丢弃）；空=不限时段。与任务级
+    call_windows 取交集（campaign._tick_campaign 双层都过才起拨）。
+    """
+
+    call_windows: list[dict] = []
+
+
 class SettingsRequest(BaseModel):
     asr: ProviderSettings = ProviderSettings()
     llm: ProviderSettings = ProviderSettings()
     tts: ProviderSettings = ProviderSettings()
     vad: ProviderSettings = ProviderSettings()
     sip: SipSettingsModel = SipSettingsModel()
+    # None=请求未带 campaign 键 → 保留既有段（不清运营已配的全局窗）；
+    # 传 {} / call_windows=[] = 清空（不限时段）。
+    campaign: CampaignSettingsModel | None = None
     policy: str = "offline_first"
 
 

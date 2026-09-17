@@ -36,6 +36,7 @@ from bok_voice_obs.context import get_correlation
 from bok_voice_obs.logging import configure_logging, get_logger
 from bok_voice_obs.middleware import CorrelationMiddleware
 
+from .campaign import parse_call_windows, redispatch_harvest_updates, _utcnow_naive
 from .deps import build_engine, build_repository, build_session_factory
 from .dispatch_utils import cleanup_dispatch, has_active_dispatch
 from .nodes_store import HEARTBEAT_INTERVAL_S, LicenseError, NodeStore
@@ -426,6 +427,11 @@ def put_settings(req: SettingsRequest, request: Request) -> dict:
             if not new.get(key) and old.get(key):
                 new[key] = old[key]
         new_values[kind] = new
+    if req.campaign is not None:
+        # 全局外呼时段窗（T3b）：归一后落库（非法项静默丢弃、≤3 组），
+        # 空/全非法=不限时段。请求未带 campaign 键（None）→ 段不动（仓库层
+        # 缺键保留语义接管，不清运营已配的全局窗）。
+        new_values["campaign"] = {"call_windows": parse_call_windows(req.campaign.call_windows)}
     raw = new_values
     saved = _repo().save_settings(raw)
     _audit("settings.save", subject_type="global_settings", subject_id="global", detail={"llm_provider": raw.get("llm", {}).get("provider", "")})
@@ -1368,7 +1374,13 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
             # 重签读到旧状态、写在提交之后，把终态翻回 active；下游 webhook 崩溃
             # 补位据此往已挂断空房补派幽灵 agent（白跑 64s、预热开场白烧 TTS）。
             # 改仓储层单条条件 UPDATE，终态判定与写入同语句求值，并发签发不可复活。
-            _repo().mark_active_if_live(req.call_id)
+            # started_at 落点（2026-09-17 仪表盘口径）:真翻成功才补——首次转 ACTIVE
+            # 时刻；已有值（dial-result 先行）不覆盖，读改写竞态最坏=挂断后补写
+            # started_at 而 duration_s 停留 0（仪表盘不进时长桶，无害）。
+            if _repo().mark_active_if_live(req.call_id):
+                _cur = _repo().get_call(req.call_id) or {}
+                if not _cur.get("started_at"):
+                    _repo().update_call(req.call_id, started_at=_utcnow_naive())
         except Exception:
             pass
     _audit("token.issue", subject_type="call", subject_id=req.call_id or "",
@@ -1631,13 +1643,15 @@ async def _reap_stale_calls_once() -> dict:
     out = {"failed": 0, "ended": 0, "settled": 0}
     for c in _repo().list_calls("", status=CallStatus.RINGING.value):
         if _created_before(c, _STALE_RINGING_S):
-            _repo().update_call(c["id"], status=CallStatus.FAILED.value, disposition="abandoned")
+            _repo().update_call(c["id"], status=CallStatus.FAILED.value, disposition="abandoned",
+                                **_call_end_fields(c))
             out["failed"] += 1
     for st in (CallStatus.ACTIVE.value, CallStatus.PAUSED.value):
         for c in _repo().list_calls("", status=st):
             if await _room_has_participants(c["id"]):
                 continue
-            _repo().update_call(c["id"], status=CallStatus.ENDED.value, disposition="abandoned")
+            _repo().update_call(c["id"], status=CallStatus.ENDED.value, disposition="abandoned",
+                                **_call_end_fields(c))
             out["ended"] += 1
             try:
                 await settle(c["id"])  # 幂等:已结算直接 existing 短路
@@ -1696,8 +1710,12 @@ def _disconnect_room_background(room_name: str) -> None:
 @app.post("/api/calls/{call_id}/hangup")
 async def hangup(call_id: str, request: Request) -> dict:
     _gate_page(request, "calls")
-    deny_cross_account(request, _repo().get_call(call_id))
-    call = _repo().update_call(call_id, status=CallStatus.ENDED.value)
+    existing = _repo().get_call(call_id)
+    deny_cross_account(request, existing)
+    if not existing:
+        raise HTTPException(404, "call not found")
+    call = _repo().update_call(call_id, status=CallStatus.ENDED.value,
+                               **_call_end_fields(existing))
     if not call:
         raise HTTPException(404, "call not found")
     # 真正断开 LiveKit 房间：主管台/任意端挂断后 agent 与监听端都会被服务端踢出，
@@ -1870,10 +1888,16 @@ def report_dial_result(call_id: str, req: DialResultRequest, request: Request) -
         return call
     status = str(req.status or "").strip()
     if status == "answered":
-        updated = _repo().update_call(call_id, status=CallStatus.ACTIVE.value) or call
+        # 接通即首次转 ACTIVE：started_at 落点（仪表盘 duration 口径起点）。
+        # coalesce（T5-M1）：重复上报/重派不重置起点（与 resume-agent 路径同款）。
+        updated = _repo().update_call(
+            call_id, status=CallStatus.ACTIVE.value,
+            started_at=call.get("started_at") or _utcnow_naive(),
+        ) or call
     elif status in ("no_answer", "rejected", "failed"):
         updated = _repo().update_call(call_id, status=CallStatus.ENDED.value,
-                                      disposition=status) or call
+                                      disposition=status,
+                                      **_call_end_fields(call)) or call
     else:
         updated = call
     # 战役名单联动（Wave3）：通话若由某个 campaign item 拨出（call_id 反查），把
@@ -1882,12 +1906,34 @@ def report_dial_result(call_id: str, req: DialResultRequest, request: Request) -
     if status in ("answered", "no_answer", "rejected", "failed"):
         item = _repo().find_item_by_call(call_id)
         if item and str(item.get("status") or "") in ("dialing", "in_call"):
-            _repo().update_item(
-                str(item["id"]),
-                status="in_call" if status == "answered" else status,
-                last_error=(req.detail or "")[:250],
-                updated_at=_utcnow_iso(),
-            )
+            if status == "answered":
+                _repo().update_item(
+                    str(item["id"]),
+                    status="in_call",
+                    last_error=(req.detail or "")[:250],
+                    updated_at=_utcnow_iso(),
+                )
+            else:
+                # 失败三态先过重联回队判定（终审 C-1）：命中（result ∈ policy.on 且
+                # attempts < max）回 pending 等 interval——旧版直写终态令收割段（只扫
+                # 在途 item）永远等不到它，重拨在生产主路静默 no-op。last_error 与
+                # 收割路同源=通话 disposition；不命中维持终态直写（last_error 仍带
+                # agent detail）。
+                campaign = _repo().get_campaign(str(item.get("campaign_id") or ""))
+                redispatch = redispatch_harvest_updates(item, status, campaign or {})
+                if redispatch:
+                    _repo().update_item(
+                        str(item["id"]),
+                        **redispatch,
+                        last_error=str(updated.get("disposition") or status)[:250],
+                    )
+                else:
+                    _repo().update_item(
+                        str(item["id"]),
+                        status=status,
+                        last_error=(req.detail or "")[:250],
+                        updated_at=_utcnow_iso(),
+                    )
     _audit("call.dial_result", subject_type="call", subject_id=call_id,
            account_id=str(call.get("account_id", "acc-001")),
            detail={"status": status, "detail": (req.detail or "")[:120]})
@@ -2039,6 +2085,13 @@ class CampaignCreateRequest(BaseModel):
     # 8kHz 窄带档（T5 前置门）：mock 客户话音走电话频带，重验窄带下的 ASR。
     # 与句间隔同一份 scripts_json 保留键（`__narrowband__`），只加键不加列。
     narrowband: bool = False
+    # 调度三字段（2026-09-17）：时段窗（≤3 组，非法项由 parse_call_windows 静默
+    # 丢弃）、并发（0=不限，缺省 1=旧串行）、重拨策略（空=不重拨）。
+    call_windows: list[dict] = []
+    # `| None` 是 T1-M1 防呆：显式 `"max_concurrency": null` 收口为缺省 1（串行），
+    # 不落 0（不限）——端点在 `is None` 时传 1。
+    max_concurrency: int | None = 1
+    redispatch: dict = {}
 
 
 @app.post("/api/campaigns")
@@ -2083,6 +2136,10 @@ def create_campaign(req: CampaignCreateRequest, request: Request) -> dict:
         scenarios={k: v for k, v in req.scenarios.items() if v in _CAMPAIGN_SCENARIOS},
         scripts=scripts,
         site_id=req.site_id,
+        call_windows=parse_call_windows(req.call_windows),
+        # 显式 null / 缺省 → 1（旧串行）；绝不向 repo 传 None（T1-M1 防呆）。
+        max_concurrency=1 if req.max_concurrency is None else max(0, int(req.max_concurrency)),
+        redispatch=_clean_redispatch(req.redispatch),
     )
     _audit("campaign.create", subject_type="campaign", subject_id=camp["id"],
            account_id=req.account_id, detail={"objects": len(req.object_ids)})
@@ -2165,6 +2222,80 @@ def delete_campaign(campaign_id: str, request: Request) -> dict:
            account_id=str(camp.get("account_id") or ""),
            detail={"items": len(items), "status": status})
     return {"campaign_id": campaign_id, "deleted": True, "items_removed": len(items)}
+
+
+_REDISPATCH_OUTCOMES = ("no_answer", "rejected", "failed")
+
+
+def _clean_redispatch(raw: dict | None) -> dict:
+    """重拨策略清洗：max_attempts≥0、interval_minutes>0 才有意义、on 白名单剔除。"""
+    if not isinstance(raw, dict):
+        return {}
+    try:
+        max_attempts = max(0, int(raw.get("max_attempts") or 0))
+    except (TypeError, ValueError):
+        return {}
+    try:
+        interval = float(raw.get("interval_minutes") or 0)
+    except (TypeError, ValueError):
+        return {}
+    if max_attempts <= 0 or interval <= 0:
+        return {}
+    on = [str(x) for x in (raw.get("on") or []) if str(x) in _REDISPATCH_OUTCOMES]
+    return {"max_attempts": max_attempts, "interval_minutes": interval, "on": on}
+
+
+class CampaignUpdateRequest(BaseModel):
+    name: str | None = None
+    template_id: str | None = None
+    persona_id: str | None = None
+    language: str | None = None
+    gap_seconds: int | None = None
+    site_id: str | None = None
+    call_windows: list[dict] | None = None
+    max_concurrency: int | None = None
+    redispatch: dict | None = None
+
+
+@app.put("/api/campaigns/{campaign_id}")
+def update_campaign(campaign_id: str, req: CampaignUpdateRequest, request: Request) -> dict:
+    """改战役配置：running 拒改（409，运行中时段/并发锁定——对齐惜客通语义）；
+    draft/paused/stopped 可改。字段只增不改默认语义（None=不碰该字段）。"""
+    _gate_page(request, "campaigns")
+    camp = deny_cross_account(request, _repo().get_campaign(campaign_id))
+    if not camp:
+        raise HTTPException(404, "campaign not found")
+    if str(camp.get("status") or "") == "running":
+        raise HTTPException(409, "campaign is running — pause it first")
+    fields: dict = {k: v for k, v in {
+        "name": req.name, "template_id": req.template_id, "persona_id": req.persona_id,
+        "language": req.language, "gap_seconds": req.gap_seconds, "site_id": req.site_id,
+    }.items() if v is not None}
+    if req.call_windows is not None:
+        fields["call_windows_json"] = json.dumps(
+            parse_call_windows(req.call_windows), ensure_ascii=False)
+    if req.max_concurrency is not None:
+        fields["max_concurrency"] = max(0, int(req.max_concurrency))
+    if req.redispatch is not None:
+        cleaned = _clean_redispatch(req.redispatch)
+        fields["redispatch_json"] = json.dumps(cleaned, ensure_ascii=False) if cleaned else ""
+    updated = _repo().update_campaign(campaign_id, **fields) or camp
+    _audit("campaign.update", subject_type="campaign", subject_id=campaign_id,
+           account_id=str(camp.get("account_id") or ""),
+           detail={"fields": sorted(fields)})
+    return updated
+
+
+def _call_end_fields(call: dict) -> dict:
+    """通话终态时间戳落点（2026-09-17 仪表盘口径）：ended_at=now、duration_s=ended-started。
+
+    started_at 为空（未接通/从未 ACTIVE）→ duration_s=0。全部 UTC naive，与 created_at 同域。
+    """
+    from .campaign import _parse_updated_at, _utcnow_naive
+    ended = _utcnow_naive()
+    started = _parse_updated_at(call.get("started_at"))
+    duration = int((ended - started).total_seconds()) if started and ended >= started else 0
+    return {"ended_at": ended, "duration_s": duration}
 
 
 def _progress(items: list[dict]) -> dict:
@@ -3528,6 +3659,94 @@ def reports_calls(request: Request, account_id: str = "acc-001") -> list[dict]:
     return _repo().list_calls(scoped_account(request, account_id), "")
 
 
+_DURATION_BUCKETS: tuple[tuple[str, int, int | None], ...] = (
+    ("0-15", 0, 15), ("15-30", 15, 30), ("30-60", 30, 60), ("60-90", 60, 90), ("90+", 90, None))
+_ANSWERED_EXCLUDED = {"no_answer", "rejected", "failed"}
+
+
+def _duration_bucket(duration_s: int) -> str | None:
+    for name, low, high in _DURATION_BUCKETS:
+        if duration_s >= low and (high is None or duration_s < high):
+            return name
+    return None
+
+
+def _local_midnight_utc_boundary() -> datetime:
+    """今日边界（T5-M3）：本地午夜对应的 UTC naive 时刻（单一公式，测试同源现算）。
+
+    today 判定=created_at（经 _parse_updated_at 归一为 naive UTC）≥ 该边界；
+    旧「存储串 startswith 本地日期前缀」把 UTC 串与本地日错配（正时区 UTC 深夜
+    时段本地已是明天 → 漏计；负时区反向多计）。
+    """
+    midnight_local = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight_local.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+@app.get("/api/stats/dashboard")
+def stats_dashboard(request: Request, account_id: str = "acc-001") -> dict:
+    """工作台仪表盘单端点（2026-09-17）。口径见 plan Task 5；P0 全量 Python 聚合。
+
+    修复波 T5-M2/M3（2026-09-17）：answered 只认 status==ENDED 且 disposition 不在
+    排除集——FAILED+abandoned（reaper 振铃超时，从未接通）不算接通，但仍计入
+    answer_rate 分母（拨出有结果）；today/answered_today=created_at ≥ 本地午夜
+    的 UTC 边界（`_local_midnight_utc_boundary`）。
+    """
+    from .campaign import _parse_updated_at
+    _gate_page(request, "calls")
+    account_id = scoped_account(request, account_id)
+    calls = _repo().list_calls(account_id)
+    today_boundary = _local_midnight_utc_boundary()
+
+    def _is_today(call: dict) -> bool:
+        created = _parse_updated_at(call.get("created_at"))
+        return created is not None and created >= today_boundary
+
+    ended = [c for c in calls if str(c.get("status") or "") in
+             (CallStatus.ENDED.value, CallStatus.FAILED.value)]
+    answered = [c for c in ended
+                if str(c.get("status") or "") == CallStatus.ENDED.value
+                and str(c.get("disposition") or "") not in _ANSWERED_EXCLUDED]
+    answered_ids = {c.get("id") for c in answered}
+    buckets = {name: 0 for name, _, _ in _DURATION_BUCKETS}
+    for call in answered:
+        duration = int(call.get("duration_s") or 0)
+        if duration <= 0:
+            continue  # 时长桶只统计 duration_s>0 的通话（未接通/边角零时长不进桶）。
+        bucket = _duration_bucket(duration)
+        if bucket:
+            buckets[bucket] += 1
+    by_agent: dict[str, dict] = {}
+    for call in calls:
+        uid = str(call.get("created_by") or "")
+        if not uid:
+            continue
+        slot = by_agent.setdefault(uid, {"user_id": uid, "name": uid, "calls": 0, "answered": 0})
+        slot["calls"] += 1
+        if call.get("id") in answered_ids:
+            slot["answered"] += 1
+    for user in _repo().list_users():
+        slot = by_agent.get(str(user.get("id") or ""))
+        if slot:
+            slot["name"] = str(user.get("display_name") or user.get("username") or slot["name"])
+    disposition_counts: dict[str, int] = {}
+    whatsapp_counts: dict[str, int] = {}
+    for call in calls:
+        if d := str(call.get("disposition") or ""):
+            disposition_counts[d] = disposition_counts.get(d, 0) + 1
+        if w := str(call.get("whatsapp_status") or ""):
+            whatsapp_counts[w] = whatsapp_counts.get(w, 0) + 1
+    return {
+        "concurrency": {"current": sum(1 for c in calls if str(c.get("status") or "") == CallStatus.ACTIVE.value)},
+        "calls": {"today": sum(1 for c in calls if _is_today(c)),
+                  "total": len(calls), "answered": len(answered),
+                  "answered_today": sum(1 for c in answered if _is_today(c)),
+                  "answer_rate": round(len(answered) / len(ended), 4) if ended else 0.0},
+        "duration_buckets": buckets,
+        "agents": sorted(by_agent.values(), key=lambda a: (-a["calls"], a["user_id"]))[:8],
+        "tags": {"disposition": disposition_counts, "whatsapp": whatsapp_counts},
+    }
+
+
 @app.get("/api/insights")
 def list_insights(request: Request) -> list[dict]:
     """全局洞察（结算蒸馏产出）。跨账号内容（GlobalInsight 无 account 维度，
@@ -4175,7 +4394,14 @@ def resume_agent(call_id: str, request: Request) -> dict:
     """恢复 AI 自动应答：解除人工接管并把通话置回 active（agent 轮询到后恢复）。"""
     require_role(request, "admin", "root")
     deny_cross_account(request, _repo().get_call(call_id))
-    call = _repo().update_call(call_id, escalated_to_human=False, status=CallStatus.ACTIVE.value)
+    existing = _repo().get_call(call_id)
+    if not existing:
+        raise HTTPException(404, "call not found")
+    # 恢复 ACTIVE 不覆盖 started_at（首转 ACTIVE 时刻口径）；从未接过的边角
+    # （ringing 直接被 pause/resume）就地补起点，避免 duration 永远 0。
+    call = _repo().update_call(call_id, escalated_to_human=False,
+                               started_at=existing.get("started_at") or _utcnow_naive(),
+                               status=CallStatus.ACTIVE.value)
     if not call:
         raise HTTPException(404, "call not found")
     _audit("supervisor.resume", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""), call_id=call_id)
@@ -4197,7 +4423,11 @@ def takeover(call_id: str, request: Request) -> dict:
 async def transfer(call_id: str, request: Request) -> dict:
     require_role(request, "admin", "root")
     deny_cross_account(request, _repo().get_call(call_id))
-    call = _repo().update_call(call_id, escalated_to_human=True, disposition="transferred", status=CallStatus.ENDED.value)
+    existing = _repo().get_call(call_id)
+    if not existing:
+        raise HTTPException(404, "call not found")
+    call = _repo().update_call(call_id, escalated_to_human=True, disposition="transferred",
+                               status=CallStatus.ENDED.value, **_call_end_fields(existing))
     if not call:
         raise HTTPException(404, "call not found")
     _disconnect_room_background(call_id)
@@ -4219,7 +4449,11 @@ async def supervisor_end(call_id: str, request: Request, disposition: str = "dec
         raise HTTPException(status_code=403, detail="forbidden")
     deny_cross_account(request, _repo().get_call(call_id))
     disposition = (disposition or "declined").strip()[:64] or "declined"
-    call = _repo().update_call(call_id, escalated_to_human=False, disposition=disposition, status=CallStatus.ENDED.value)
+    existing = _repo().get_call(call_id)
+    if not existing:
+        raise HTTPException(404, "call not found")
+    call = _repo().update_call(call_id, escalated_to_human=False, disposition=disposition,
+                               status=CallStatus.ENDED.value, **_call_end_fields(existing))
     if not call:
         raise HTTPException(404, "call not found")
     _disconnect_room_background(call_id)

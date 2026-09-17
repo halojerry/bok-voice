@@ -679,6 +679,9 @@ class SqlAlchemyBusinessRepository:
             "vad": json.loads(row.vad_json or "{}"),
             # 空 blob（老库补列后未保存）回落默认段，否则 dialer 拿不到 mode。
             "sip": json.loads(row.sip_json or "{}") or self.default_settings()["sip"],
+            # 全局外呼时段窗段（T3b）：空 blob=不限时段（campaign._global_call_windows
+            # 消费 settings.campaign.call_windows，读侧缺省 []）。
+            "campaign": json.loads(row.campaign_json or "{}"),
             "policy": row.policy,
         }
 
@@ -694,6 +697,10 @@ class SqlAlchemyBusinessRepository:
         row.sip_json = json.dumps(
             settings.get("sip") or self.default_settings()["sip"], ensure_ascii=False
         )
+        # campaign 段（T3b）：缺键=保留既有（同 policy 的缺键保留语义，PUT 不传段
+        # 不清运营已配的全局窗）；传空 dict=清空（不限时段）。
+        if "campaign" in settings:
+            row.campaign_json = json.dumps(settings.get("campaign") or {}, ensure_ascii=False)
         row.policy = settings.get("policy", row.policy or "offline_first")
         self.session.commit()
         return self.get_settings()
@@ -824,14 +831,33 @@ class SqlAlchemyBusinessRepository:
 
     @staticmethod
     def _campaign_to_dict(row: models.Campaign) -> dict:
-        return {
+        out = {
             "id": row.id, "account_id": row.account_id, "name": row.name,
             "template_id": row.template_id, "persona_id": row.persona_id,
             "language": row.language, "status": row.status,
             "gap_seconds": row.gap_seconds, "site_id": row.site_id,
             "created_at": row.created_at.isoformat() if row.created_at else "",
             "finished_at": row.finished_at.isoformat() if row.finished_at else "",
+            # 调度三字段（2026-09-17）：两后端同存 JSON 串（列名同内存仓行键），
+            # 解析单点在 public 层（与内存仓 _campaign_public 同款片段）。
+            "call_windows_json": row.call_windows_json,
+            "max_concurrency": row.max_concurrency,
+            "redispatch_json": row.redispatch_json,
         }
+        out["max_concurrency"] = int(out.get("max_concurrency") or 0) if out.get("max_concurrency") is not None else 1
+        try:
+            out["call_windows"] = json.loads(out.get("call_windows_json") or "[]")
+        except (TypeError, ValueError):
+            out["call_windows"] = []
+        if not isinstance(out["call_windows"], list):
+            out["call_windows"] = []
+        try:
+            out["redispatch"] = json.loads(out.get("redispatch_json") or "")
+        except (TypeError, ValueError):
+            out["redispatch"] = {}
+        if not isinstance(out["redispatch"], dict):
+            out["redispatch"] = {}
+        return out
 
     @staticmethod
     def _campaign_scripts(row: models.Campaign) -> dict[str, Any]:
@@ -874,7 +900,10 @@ class SqlAlchemyBusinessRepository:
                         object_ids: list[str],
                         scenarios: dict[str, str] | None = None,
                         scripts: dict[str, list[str]] | None = None,
-                        site_id: str = "") -> dict:
+                        site_id: str = "",
+                        call_windows: list[dict] | None = None,
+                        max_concurrency: int = 1,
+                        redispatch: dict | None = None) -> dict:
         campaign_id = f"camp-{_uuid()}"
         row = models.Campaign(
             id=campaign_id, account_id=account_id, name=name,
@@ -882,6 +911,10 @@ class SqlAlchemyBusinessRepository:
             status="draft", gap_seconds=gap_seconds,
             scripts_json=json.dumps(scripts or {}, ensure_ascii=False),
             site_id=site_id,
+            # 调度三字段（2026-09-17）：两后端同存 JSON 串，解析单点在 public 层。
+            call_windows_json=json.dumps(call_windows or [], ensure_ascii=False),
+            max_concurrency=int(max_concurrency or 0),
+            redispatch_json=json.dumps(redispatch, ensure_ascii=False) if redispatch else "",
         )
         self.session.add(row)
         for seq, object_id in enumerate(object_ids or []):
@@ -912,7 +945,8 @@ class SqlAlchemyBusinessRepository:
         if not row:
             return None
         for key in ("name", "template_id", "persona_id", "language", "status",
-                    "gap_seconds", "finished_at", "site_id"):
+                    "gap_seconds", "finished_at", "site_id",
+                    "call_windows_json", "max_concurrency", "redispatch_json"):
             if key in fields and fields[key] is not None:
                 # finished_at 读侧是 ISO 字符串（_campaign_to_dict），调用方读改写会
                 # 把字符串传回来；DateTime 列只收 datetime，空串=未完成行读侧契约，
@@ -1157,6 +1191,8 @@ class SqlAlchemyBusinessRepository:
                 "ringing_timeout_s": 30,
                 "max_call_duration_s": 600,
             },
+            # 全局外呼时段窗段（T3b）：空=不限时段；GET 端点照常回显该键。
+            "campaign": {"call_windows": []},
             "policy": "offline_first",
         }
 
@@ -1211,6 +1247,12 @@ class InMemoryBusinessRepository:
             "glossary": getattr(manifest, "glossary", "") or "",
             "voices_json": getattr(manifest, "voices_json", "") or "",
             "node_id": getattr(manifest, "node_id", "") or "",
+            # 仪表盘时长统计（2026-09-17）：缺省与 SQL 侧列默认值同形
+            # （_call_to_dict 全列返回 started_at=None/ended_at=None/duration_s=0），
+            # update_call 白名单外透传写入（datetime 直通）。
+            "started_at": None,
+            "ended_at": None,
+            "duration_s": 0,
         }
         return self.calls[call_id]
 
@@ -1556,6 +1598,7 @@ class InMemoryBusinessRepository:
         return self.settings
 
     def save_settings(self, settings: dict) -> dict:
+        old = self.settings
         self.settings = {
             "asr": settings.get("asr", {}),
             "llm": settings.get("llm", {}),
@@ -1563,6 +1606,9 @@ class InMemoryBusinessRepository:
             "vad": settings.get("vad", {}),
             # 缺键/空值回落默认段（与 SQL 后端同语义：不允许把 sip 段清成空）。
             "sip": settings.get("sip") or SqlAlchemyBusinessRepository.default_settings()["sip"],
+            # campaign 段（T3b）：缺键=保留既有（与 SQL 侧同语义）；传空=清空（不限）。
+            "campaign": settings["campaign"] if "campaign" in settings
+            else old.get("campaign", {}),
             "policy": settings.get("policy", "offline_first"),
         }
         return self.settings
@@ -1680,6 +1726,21 @@ class InMemoryBusinessRepository:
         # 防「内存仓响应多带 scripts 键」的隐性分叉。
         out = dict(row)
         out.pop("scripts", None)
+        # 调度三字段（2026-09-17）：与 SQL 侧 _campaign_to_dict 同款解析片段，
+        # 行内 JSON 串坏值/形状不符一律回缺省（[]/{}/1），不抛。
+        out["max_concurrency"] = int(row.get("max_concurrency") or 0) if row.get("max_concurrency") is not None else 1
+        try:
+            out["call_windows"] = json.loads(row.get("call_windows_json") or "[]")
+        except (TypeError, ValueError):
+            out["call_windows"] = []
+        if not isinstance(out["call_windows"], list):
+            out["call_windows"] = []
+        try:
+            out["redispatch"] = json.loads(row.get("redispatch_json") or "")
+        except (TypeError, ValueError):
+            out["redispatch"] = {}
+        if not isinstance(out["redispatch"], dict):
+            out["redispatch"] = {}
         return out
 
     def create_campaign(self, account_id: str, *, name: str, template_id: str,
@@ -1687,7 +1748,10 @@ class InMemoryBusinessRepository:
                         object_ids: list[str],
                         scenarios: dict[str, str] | None = None,
                         scripts: dict[str, list[str]] | None = None,
-                        site_id: str = "") -> dict:
+                        site_id: str = "",
+                        call_windows: list[dict] | None = None,
+                        max_concurrency: int = 1,
+                        redispatch: dict | None = None) -> dict:
         now = datetime.now(timezone.utc).isoformat()
         campaign_id = f"camp-{uuid.uuid4().hex[:12]}"
         campaign = {
@@ -1695,6 +1759,11 @@ class InMemoryBusinessRepository:
             "template_id": template_id, "persona_id": persona_id,
             "language": language, "status": "draft", "gap_seconds": gap_seconds,
             "site_id": site_id,
+            # 调度三字段（2026-09-17）：与 SQL 侧同列名同存 JSON 串，
+            # 解析单点在 _campaign_public。
+            "call_windows_json": json.dumps(call_windows or [], ensure_ascii=False),
+            "max_concurrency": int(max_concurrency or 0),
+            "redispatch_json": json.dumps(redispatch, ensure_ascii=False) if redispatch else "",
             "created_at": now, "finished_at": "",
             # 与 SQL 侧同键同名：内存仓直接存 dict（SQL 侧存 JSON 串），
             # 读侧统一走 get_campaign_scripts（`__` 前缀键=保留的 campaign 级参数）。
@@ -1743,7 +1812,8 @@ class InMemoryBusinessRepository:
             return None
         # 与 SQL 侧同款白名单：未知键（含 id/created_at）忽略，防两后端分叉。
         for key in ("name", "template_id", "persona_id", "language", "status",
-                    "gap_seconds", "finished_at", "site_id"):
+                    "gap_seconds", "finished_at", "site_id",
+                    "call_windows_json", "max_concurrency", "redispatch_json"):
             if key in fields and fields[key] is not None:
                 row[key] = fields[key]
         return self._campaign_public(row)
