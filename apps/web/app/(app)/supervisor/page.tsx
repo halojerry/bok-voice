@@ -226,7 +226,7 @@ export default function SupervisorPage() {
           已暂停 <b className={pausedCount ? "text-amber-700" : "muted"}>{pausedCount}</b>
         </span>
         <span className="card px-4 py-2">
-          WhatsApp 待对接 <b className={pending.length ? "text-accent" : "muted"}>{pending.length}</b>
+          WhatsApp 待对接 <b className={pending.length ? "text-(--live)" : "muted"}>{pending.length}</b>
         </span>
       </div>
 
@@ -251,12 +251,12 @@ export default function SupervisorPage() {
             const num = waNum(c);
             const isCaptured = st === "captured";
             return (
-              <div key={`banner-${id}`} className="wa-flash rounded-lg border border-(--accent) bg-(--card) p-4">
+              <div key={`banner-${id}`} className="wa-flash rounded-lg border border-(--live) bg-(--card) p-4">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div className="min-w-0">
-                    <p className="text-sm font-semibold text-accent">
+                    <p className="text-sm font-semibold text-(--live)">
                       📱 WhatsApp 待对接
-                      <span className="ml-2 rounded-sm bg-(--accent)/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider">
+                      <span className="ml-2 rounded-sm bg-(--live-soft) px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider">
                         {isCaptured ? "已拿到号码" : "客户已应承加"}
                       </span>
                     </p>
@@ -315,7 +315,7 @@ export default function SupervisorPage() {
                       <p className="truncate font-medium">
                         {labelOf(c)}
                         {waPending && (
-                          <span className="ml-2 rounded-sm bg-(--accent)/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-accent">
+                          <span className="ml-2 rounded-sm bg-(--live-soft) px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-(--live-ink)">
                             WhatsApp {wa === "captured" && waNum(c) ? waNum(c) : "待对接"}
                           </span>
                         )}
@@ -376,7 +376,7 @@ export default function SupervisorPage() {
                     >
                       挂断
                     </button>
-                    <Link href={`/calls?call=${encodeURIComponent(id)}`} className="btn-ghost text-xs text-accent">
+                    <Link href={`/calls?call=${encodeURIComponent(id)}`} className="btn-ghost text-xs text-(--live)">
                       进入工作台
                     </Link>
                   </div>

@@ -223,7 +223,7 @@ function DashboardContent() {
                   <div key={name} className="flex items-center gap-3">
                     <div className="h-2 flex-1 rounded bg-muted/60">
                       <div
-                        className="h-2 rounded bg-accent"
+                        className="h-2 rounded bg-live"
                         style={{ width: `${Math.round((count / maxBucket) * 100)}%` }}
                       />
                     </div>
@@ -287,7 +287,7 @@ function DashboardContent() {
             <section className="card">
               <div className="flex items-center justify-between">
                 <span className="label">最近会话</span>
-                <Link href="/calls" className="text-xs text-accent">查看全部 →</Link>
+                <Link href="/calls" className="text-xs text-(--live)">查看全部 →</Link>
               </div>
               <div className="mt-3 space-y-2">
                 {calls.slice(0, 6).map((call) => (
@@ -304,7 +304,7 @@ function DashboardContent() {
                         {String(call.status ?? "-")} · {String(call.mode ?? "-")} · {String(call.language ?? "-")}
                       </p>
                     </div>
-                    <span className="text-accent">查看 →</span>
+                    <span className="text-(--live)">查看 →</span>
                   </Link>
                 ))}
                 {calls.length === 0 && <p className="text-sm muted">暂无会话，从「新建通话」开始。</p>}

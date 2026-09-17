@@ -1344,7 +1344,7 @@ function ConsoleLive(p: LiveProps) {
             <div className="grid grid-cols-2 gap-2">
               <label
                 className={`flex items-center gap-1.5 rounded-md border border-(--card-border) px-2 py-1.5 ${
-                  p.outputMode === "shared" ? "ring-1 ring-(--accent)" : ""
+                  p.outputMode === "shared" ? "ring-1 ring-(--live)" : ""
                 }`}
               >
                 <input type="radio" name="out-mode" checked={p.outputMode === "shared"} onChange={() => p.setOutputMode("shared")} />
@@ -1352,7 +1352,7 @@ function ConsoleLive(p: LiveProps) {
               </label>
               <label
                 className={`flex items-center gap-1.5 rounded-md border border-(--card-border) px-2 py-1.5 ${
-                  p.outputMode === "dual" ? "ring-1 ring-(--accent)" : ""
+                  p.outputMode === "dual" ? "ring-1 ring-(--live)" : ""
                 } ${p.canDual ? "" : "opacity-50"}`}
                 title={p.canDual ? "两人各戴一副耳机,分路独立输出" : "需要桌面 Chrome(setSinkId)"}
               >
@@ -1541,7 +1541,7 @@ function ConsoleLive(p: LiveProps) {
                 onClick={() => setFilter(v)}
                 className={`rounded-full px-2.5 py-1 text-[11px] ${
                   filter === v
-                    ? "bg-(--accent) font-medium text-(--accent-ink)"
+                    ? "bg-(--live-soft) font-medium text-(--live-ink)"
                     : "border border-(--card-border) text-(--stage-muted)"
                 }`}
               >
@@ -1574,7 +1574,7 @@ function ConsoleLive(p: LiveProps) {
                   className={`max-w-[85%] rounded-lg px-3 py-2 text-[13px] leading-relaxed ${
                     who.kind === "dst"
                       ? "border border-(--card-border) bg-muted/60 text-(--foreground)"
-                      : "bg-(--accent) text-(--accent-ink)"
+                      : "bg-(--live-soft) text-(--live-ink)"
                   }`}
                 >
                   <span className="mr-1.5 font-mono text-[10px] font-bold uppercase opacity-70">{who.text}</span>

@@ -35,7 +35,7 @@ const SEGMENTS: { key: string; label: string; cls: string }[] = [
   { key: "rejected", label: "拒接", cls: "bg-amber-400" },
   { key: "failed", label: "失败", cls: "bg-red-400" },
   { key: "skipped", label: "跳过", cls: "bg-neutral-600" },
-  { key: "pending", label: "待拨", cls: "bg-muted" },
+  { key: "pending", label: "待拨", cls: "bg-foreground/10" },
 ];
 
 const LANG_LABEL: Record<string, string> = { zh: "中文", cantonese: "粤语", en: "英语" };
@@ -213,14 +213,14 @@ function SchedulingEditor({ value, onChange }: { value: SchedValue; onChange: (v
             </div>
             <input
               type="time"
-              className="rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--accent)"
+              className="rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--live)"
               value={w.start}
               onChange={(e) => setWindowField(idx, "start", e.target.value)}
             />
             <span className="text-xs muted">至</span>
             <input
               type="time"
-              className="rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--accent)"
+              className="rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--live)"
               value={w.end}
               onChange={(e) => setWindowField(idx, "end", e.target.value)}
             />
@@ -240,7 +240,7 @@ function SchedulingEditor({ value, onChange }: { value: SchedValue; onChange: (v
         <input
           type="number"
           min={0}
-          className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+          className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
           value={value.max_concurrency}
           onChange={(e) => onChange({ ...value, max_concurrency: Math.max(0, Math.floor(Number(e.target.value) || 0)) })}
         />
@@ -265,7 +265,7 @@ function SchedulingEditor({ value, onChange }: { value: SchedValue; onChange: (v
                 type="number"
                 min={1}
                 max={5}
-                className="w-16 rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--accent)"
+                className="w-16 rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--live)"
                 value={value.redispatch_max}
                 onChange={(e) => onChange({ ...value, redispatch_max: Math.floor(Number(e.target.value) || 0) })}
               />
@@ -276,7 +276,7 @@ function SchedulingEditor({ value, onChange }: { value: SchedValue; onChange: (v
               <input
                 type="number"
                 min={1}
-                className="w-16 rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--accent)"
+                className="w-16 rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--live)"
                 value={value.redispatch_interval}
                 onChange={(e) => onChange({ ...value, redispatch_interval: Number(e.target.value) || 0 })}
               />
@@ -396,7 +396,7 @@ function CampaignWizard({
           <label className="block">
             <span className="text-xs text-(--stage-muted)">战役名称</span>
             <input
-              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               value={form.name}
               onChange={(e) => setForm({ ...form, name: e.target.value })}
               placeholder="如：0901 老客回访"
@@ -405,7 +405,7 @@ function CampaignWizard({
           <label className="block">
             <span className="text-xs text-(--stage-muted)">通话语言</span>
             <select
-              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               value={form.language}
               onChange={(e) => setForm({ ...form, language: e.target.value })}
             >
@@ -417,7 +417,7 @@ function CampaignWizard({
           <label className="block">
             <span className="text-xs text-(--stage-muted)">话术</span>
             <select
-              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               value={form.template_id}
               onChange={(e) => setForm({ ...form, template_id: e.target.value })}
             >
@@ -429,7 +429,7 @@ function CampaignWizard({
           <label className="block">
             <span className="text-xs text-(--stage-muted)">人设</span>
             <select
-              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               value={form.persona_id}
               onChange={(e) => setForm({ ...form, persona_id: e.target.value })}
             >
@@ -440,7 +440,7 @@ function CampaignWizard({
           <label className="block">
             <span className="text-xs text-(--stage-muted)">站点</span>
             <select
-              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               value={form.site_id}
               onChange={(e) => setForm({ ...form, site_id: e.target.value })}
             >
@@ -454,7 +454,7 @@ function CampaignWizard({
             <input
               type="number"
               min={1}
-              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               value={form.gap_seconds}
               onChange={(e) => setForm({ ...form, gap_seconds: Number(e.target.value) || 5 })}
             />
@@ -469,7 +469,7 @@ function CampaignWizard({
         <div className="space-y-2">
           <div className="flex flex-wrap items-center gap-2">
             <input
-              className="min-w-40 flex-1 rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+              className="min-w-40 flex-1 rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               placeholder="搜对象名 / 电话"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
@@ -501,7 +501,7 @@ function CampaignWizard({
             <input
               type="number"
               min={0}
-              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               value={form.mock_speak_interval_s}
               onChange={(e) => setForm({ ...form, mock_speak_interval_s: Number(e.target.value) || 0 })}
             />
@@ -512,7 +512,7 @@ function CampaignWizard({
                 <div className="flex items-center gap-2">
                   <span className="min-w-0 flex-1 truncate text-sm">{o.display_name || o.id}</span>
                   <select
-                    className="rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--accent)"
+                    className="rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--live)"
                     value={form.scenarios[o.id] ?? ""}
                     onChange={(e) => setForm({ ...form, scenarios: { ...form.scenarios, [o.id]: e.target.value } })}
                   >
@@ -521,7 +521,7 @@ function CampaignWizard({
                 </div>
                 <textarea
                   rows={2}
-                  className="w-full rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--accent)"
+                  className="w-full rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--live)"
                   placeholder="被叫台词，每行一句（留空=默认台词）"
                   value={form.scripts[o.id] ?? ""}
                   onChange={(e) => setForm({ ...form, scripts: { ...form.scripts, [o.id]: e.target.value } })}
@@ -727,7 +727,7 @@ export default function CampaignsPage() {
           <div className="flex items-center gap-2">
             <span className="text-xs muted">明细筛选</span>
             <select
-              className="rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--accent)"
+              className="rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--live)"
               value={itemFilter}
               onChange={(e) => setItemFilter(e.target.value)}
             >
@@ -753,7 +753,7 @@ export default function CampaignsPage() {
                   <td>{it.scenario || "—"}</td>
                   <td>
                     {it.call_id ? (
-                      <Link className="text-accent underline" href={`/calls?call=${encodeURIComponent(it.call_id)}`}>
+                      <Link className="text-(--live) underline" href={`/calls?call=${encodeURIComponent(it.call_id)}`}>
                         进入工作台
                       </Link>
                     ) : "—"}

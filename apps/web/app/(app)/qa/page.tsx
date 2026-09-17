@@ -503,7 +503,7 @@ export default function QaPage() {
               ] as const).map(([key, label]) => (
                 <button
                   key={key}
-                  className={`btn-ghost text-xs ${tab === key ? "border-(--live) text-(--live)" : "muted"}`}
+                  className={`btn-ghost text-xs ${tab === key ? "border-(--live) text-(--live-ink)" : "muted"}`}
                   onClick={() => setTab(key)}
                 >
                   {label}
@@ -515,7 +515,7 @@ export default function QaPage() {
             {([["list", "列表"], ["canvas", "画布"]] as const).map(([k, label]) => (
               <button
                 key={k}
-                className={`btn-ghost text-xs ${view === k ? "border-(--live) text-(--live)" : "muted"}`}
+                className={`btn-ghost text-xs ${view === k ? "border-(--live) text-(--live-ink)" : "muted"}`}
                 onClick={() => setView(k)}
               >
                 {label}

@@ -121,7 +121,7 @@ export default function KnowledgePage() {
             <span className="label">语义检索</span>
             <div className="mt-3 flex gap-2">
               <input
-                className="flex-1 rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+                className="flex-1 rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
                 placeholder="检索产品知识…"
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
@@ -143,7 +143,7 @@ export default function KnowledgePage() {
           <div className="card">
             <span className="label">导入 Markdown</span>
             <textarea
-              className="mt-3 h-44 w-full resize-none rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+              className="mt-3 h-44 w-full resize-none rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               placeholder="粘贴文档 / 产品资料…"
               value={content}
               onChange={(e) => setContent(e.target.value)}

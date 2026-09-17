@@ -191,7 +191,7 @@ function MicLevelMeter({ room }: { room: Room | null }) {
         }
         const rms = Math.sqrt(sum / data.length);
         setLevel(Math.min(100, Math.round(rms * 220)));
-        g.strokeStyle = "var(--accent, #22d3ee)";
+        g.strokeStyle = "var(--live, #0891b2)";
         g.lineWidth = 2;
         g.beginPath();
         for (let i = 0; i < data.length; i++) {
@@ -306,7 +306,7 @@ function AudioDevicesCard({ room }: { room: Room | null }) {
           <span className="muted">麦克风</span>
           <div className="flex min-w-0 items-center gap-1">
             <select
-              className="max-w-[150px] rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--accent)"
+              className="max-w-[150px] rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--live)"
               value={micId}
               onChange={(e) => {
                 const id = e.target.value;
@@ -343,7 +343,7 @@ function AudioDevicesCard({ room }: { room: Room | null }) {
           <span className="muted">扬声器</span>
           {outputCanSwitch ? (
             <select
-              className="max-w-[150px] rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--accent)"
+              className="max-w-[150px] rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--live)"
               value={outId}
               onChange={(e) => { void changeOutput(e.target.value); }}
             >
@@ -421,7 +421,7 @@ function HistoryTranscript({ callId }: { callId: string }) {
             <p
               key={String(t.id ?? i)}
               className={`rounded-lg px-3 py-1.5 text-sm leading-relaxed ${
-                role === "user" ? "bg-(--accent)/10" : "bg-muted/60"
+                role === "user" ? "bg-(--live-soft-bg)" : "bg-muted/60"
               }`}
             >
               <span className="mr-2 text-[10px] font-medium muted">
@@ -965,7 +965,7 @@ function CallStudioInner({
         {!stateCallId && (
           <>
             <input
-              className="w-full rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--accent)"
+              className="w-full rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--live)"
               placeholder={`输入名称过滤对象（共 ${objects.length} 个，最多显示 50）`}
               value={objFilter}
               onChange={(e) => setObjFilter(e.target.value)}
@@ -1155,12 +1155,12 @@ function CallStudioInner({
 
         {/* WhatsApp 對接橫幅:客戶俾咗號碼/應承加 → 面板內提示,唔影響 AI 通話 */}
         {(waStatus === "captured" || waStatus === "offered") && (
-          <div className="wa-flash mb-3 rounded-lg border border-(--accent) bg-(--card) p-3">
+          <div className="wa-flash mb-3 rounded-lg border border-(--live) bg-(--card) p-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="min-w-0">
-                <p className="text-xs font-semibold text-accent">
+                <p className="text-xs font-semibold text-(--live-ink)">
                   📱 WhatsApp 待对接
-                  <span className="ml-2 rounded-sm bg-(--accent)/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider">
+                  <span className="ml-2 rounded-sm bg-(--live-soft) px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider">
                     {waStatus === "captured" ? "已拿到号码" : "客户已应承加"}
                   </span>
                 </p>
@@ -1261,7 +1261,7 @@ function CallStudioInner({
               <p className="mt-1 break-all text-xs muted">通话文档：{str(settlement.transcript_doc_path)}</p>
               {lastFinishedCallId && (
                 <a
-                  className="mt-2 inline-block text-xs text-accent"
+                  className="mt-2 inline-block text-xs text-(--live)"
                   href={`/calls?call=${encodeURIComponent(lastFinishedCallId)}`}
                 >
                   查看通话记录（转写/逐轮）→

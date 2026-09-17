@@ -130,7 +130,7 @@ export default function CannedAuditionCard() {
           <button
             key={l.value}
             className={`rounded-full px-2.5 py-1 text-[11px] ${
-              lang === l.value ? "bg-(--accent) font-medium text-(--accent-ink)" : "border border-(--card-border) text-(--stage-muted)"
+              lang === l.value ? "bg-(--live-soft) font-medium text-(--live-ink)" : "border border-(--card-border) text-(--stage-muted)"
             }`}
             onClick={() => setLang(l.value)}
           >

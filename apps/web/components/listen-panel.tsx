@@ -109,7 +109,7 @@ export default function ListenPanel({
   };
 
   return (
-    <section className="card space-y-3 border-(--accent)">
+    <section className="card space-y-3 border-(--live)">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="min-w-0">
           <span className="label">静默旁听</span>

@@ -172,7 +172,7 @@ export default function CallsPage() {
               <p className="px-2 text-xs muted">
                 共 {rows.length} 通 · 按最新优先显示 {visibleRows.length} 通
                 {sortedRows.length > visibleRows.length && (
-                  <button className="ml-2 text-accent" onClick={() => setLimit((v) => v + 100)}>
+                  <button className="ml-2 text-(--live)" onClick={() => setLimit((v) => v + 100)}>
                     显示更多
                   </button>
                 )}
@@ -202,7 +202,7 @@ export default function CallsPage() {
                       <p className="truncate font-medium">
                         {objectName(c.object_id)}
                         {waPending && (
-                          <span className="ml-2 rounded-sm bg-(--accent)/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-accent">
+                          <span className="ml-2 rounded-sm bg-(--live-soft) px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-(--live-ink)">
                             WhatsApp {wa === "captured" && waNum ? waNum : "待对接"}
                           </span>
                         )}
@@ -226,7 +226,7 @@ export default function CallsPage() {
                         <span className={`h-2 w-2 rounded-full ${color}`} />
                         {label}
                       </span>
-                      <span className="text-accent">进入 →</span>
+                      <span className="text-(--live)">进入 →</span>
                     </div>
                   </button>
                   <button
@@ -239,7 +239,7 @@ export default function CallsPage() {
                   {status === "ended" && String(c.object_id ?? "") && (
                     <Link
                       href={`/calls/new?object=${encodeURIComponent(String(c.object_id))}`}
-                      className="btn-ghost shrink-0 text-xs text-accent"
+                      className="btn-ghost shrink-0 text-xs text-(--live)"
                       title="用同一对象发起新通话（工作台预选该对象）"
                     >
                       再拨

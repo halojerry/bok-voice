@@ -51,7 +51,7 @@ function PermissionChecks({
         <label key={k} className={`flex items-center gap-1.5 text-xs ${disabled ? "muted" : ""}`}>
           <input
             type="checkbox"
-            className="size-3 accent-(--accent)"
+            className="size-3 accent-(--live)"
             checked={value.includes(k)}
             disabled={disabled}
             onChange={(e) => onChange(e.target.checked ? [...value, k] : value.filter((x) => x !== k))}
@@ -218,7 +218,7 @@ export default function UsersPage() {
     );
   }
 
-  const input = "w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)";
+  const input = "w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)";
 
   return (
     <div className="space-y-4">
@@ -436,7 +436,7 @@ export default function UsersPage() {
                           <div className="mt-1.5 flex flex-wrap items-center gap-2">
                             <input
                               type="password"
-                              className="w-56 rounded-lg border border-(--card-border) bg-transparent px-3 py-1.5 text-sm outline-hidden focus:border-(--accent)"
+                              className="w-56 rounded-lg border border-(--card-border) bg-transparent px-3 py-1.5 text-sm outline-hidden focus:border-(--live)"
                               value={pwDraft}
                               onChange={(e) => {
                                 setPwDraft(e.target.value);

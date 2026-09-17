@@ -41,7 +41,7 @@ function FieldInput({
   onChange: (v: unknown) => void;
 }) {
   const base =
-    "w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)";
+    "w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)";
   if (field.type === "select") {
     const options = field.options ?? [];
     const isBool = options.some((o) => o.value === "true" || o.value === "false");
@@ -101,7 +101,7 @@ function ProviderCard({
       <div className="mt-3 space-y-2">
         <div>
           <select
-            className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+            className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
             value={provider}
             onChange={(e) => onChange({ ...value, provider: e.target.value })}
           >
@@ -130,7 +130,7 @@ function ProviderCard({
         ))}
         {meta.fields.some((f) => f.advanced) && (
           <details className="rounded-lg border border-(--card-border) p-2 text-sm">
-            <summary className="cursor-pointer text-xs muted hover:text-accent">
+            <summary className="cursor-pointer text-xs muted hover:text-(--live)">
               高级（旧按语言分音色，仅兼容旧数据）
             </summary>
             <div className="mt-2 space-y-2">
@@ -199,7 +199,7 @@ function VoicePreview({ provider, fieldKey, voice }: { provider: string; fieldKe
 /** 外呼（SIP）卡片：mode 决定后端；real 档才显示 trunk/鉴权字段组。 */
 function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: ProviderForm) => void }) {
   const base =
-    "mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)";
+    "mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)";
   const mode = String(value.mode ?? "mock");
   const set = (key: string, v: unknown) => onChange({ ...value, [key]: v });
   const numbers = Array.isArray(value.numbers) ? (value.numbers as string[]) : [];
@@ -500,7 +500,7 @@ function AudioDevicesCard() {
           <span className="text-xs text-(--stage-muted)">麦克风（输入）</span>
           <div className="mt-1 flex gap-2">
             <select
-              className="flex-1 rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+              className="flex-1 rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               value={micId}
               onChange={(e) => { setMicId(e.target.value); saveMicDevice(e.target.value); }}
             >
@@ -531,7 +531,7 @@ function AudioDevicesCard() {
           <span className="text-xs text-(--stage-muted)">扬声器 / 输出</span>
           {canSetOutput ? (
             <select
-              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               value={outId}
               onChange={(e) => {
                 const id = e.target.value;
@@ -693,7 +693,7 @@ function MinimaxClonePanel({ clones, onChange }: { clones: MinimaxClone[]; onCha
 
   return (
     <details className="rounded-lg border border-(--card-border) p-2 text-sm">
-      <summary className="cursor-pointer text-xs muted hover:text-accent">克隆我的声音（MiniMax 云端）</summary>
+      <summary className="cursor-pointer text-xs muted hover:text-(--live)">克隆我的声音（MiniMax 云端）</summary>
       <p className="mt-2 text-xs muted">
         念 10 秒~1 分钟干净人声（普通话/粤语样本均可），克隆成云端音色后可在分语言音色与
         同传会话中选用。<strong>克隆本身免费</strong>；MiniMax 规则：7 天内未用于合成会过期，
@@ -709,7 +709,7 @@ function MinimaxClonePanel({ clones, onChange }: { clones: MinimaxClone[]; onCha
             onChange={(e) => { const f = e.target.files?.[0]; if (f) setRefFile(f); }} />
         </label>
         <input
-          className="w-40 rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--accent)"
+          className="w-40 rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--live)"
           placeholder="标签（如：我的声音）"
           value={label}
           onChange={(e) => setLabel(e.target.value)}
@@ -770,7 +770,7 @@ function VoiceCard({ value, onChange }: { value: ProviderForm; onChange: (next: 
       <div className="mt-3 space-y-2">
         <div>
           <select
-            className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+            className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
             value={provider}
             onChange={(e) => onChange({ ...value, provider: e.target.value })}
           >
@@ -794,7 +794,7 @@ function VoiceCard({ value, onChange }: { value: ProviderForm; onChange: (next: 
         ))}
         {(rest.length > 0 || advanced.length > 0) && (
           <details className="rounded-lg border border-(--card-border) p-2 text-sm">
-            <summary className="cursor-pointer text-xs muted hover:text-accent">更多语音参数（服务地址 / 采样率 / 分语言音色）</summary>
+            <summary className="cursor-pointer text-xs muted hover:text-(--live)">更多语音参数（服务地址 / 采样率 / 分语言音色）</summary>
             <div className="mt-2 space-y-2">
               {[...rest, ...advanced].map((field) => (
                 <FieldRow
@@ -904,7 +904,7 @@ export default function SettingsPage() {
               <section className="card">
                 <span className="label">{POLICY_META.title}</span>
                 <select
-                  className="mt-3 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+                  className="mt-3 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
                   value={policyValue}
                   onChange={(e) => setForm({ ...form, policy: e.target.value })}
                 >
