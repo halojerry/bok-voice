@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import InterpretConsole from "@/components/interpret-console";
 import { useAccount } from "@/components/account-context";
 import { api } from "@/lib/api";
@@ -22,11 +22,6 @@ const LANGS = [
   { value: "en", label: "English" },
 ];
 
-/** 会话级音色下拉：首项=跟随设置（settings 三键/硬编码默认）。 */
-function voiceOptions(lang: string) {
-  return [{ value: "", label: "（默认，跟随设置）" }, ...minimaxVoiceOptionsFor(lang)];
-}
-
 export default function InterpretPage() {
   const { accountId: ACCOUNT } = useAccount();
   const [myLang, setMyLang] = useState("zh");
@@ -34,10 +29,26 @@ export default function InterpretPage() {
   // 会话级音色(2026-09-17):我方/对方语言各选一把 MiniMax 音色,空=跟随设置。
   const [myVoice, setMyVoice] = useState("");
   const [otherVoice, setOtherVoice] = useState("");
+  // MiniMax 云端克隆音色（路线 B）：全语言槽可选（克隆音色无语言绑定）。
+  const [cloneVoices, setCloneVoices] = useState<Array<{ voice_id: string; label?: string }>>([]);
+  useEffect(() => {
+    api.listMinimaxVoices()
+      .then((rows) => setCloneVoices(rows.map((r) => ({ voice_id: String(r.voice_id ?? ""), label: r.label ? String(r.label) : undefined }))))
+      .catch(() => setCloneVoices([]));
+  }, []);
   const [glossary, setGlossary] = useState("");
   const [callId, setCallId] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  /** 会话级音色下拉：首项=跟随设置 + MiniMax 静态目录 + 云端克隆（全语言槽）。 */
+  function voiceOptions(lang: string) {
+    return [
+      { value: "", label: "（默认，跟随设置）" },
+      ...minimaxVoiceOptionsFor(lang),
+      ...cloneVoices.map((c) => ({ value: c.voice_id, label: `克隆 · ${c.label || c.voice_id}` })),
+    ];
+  }
 
   async function startConsole() {
     setError(null);

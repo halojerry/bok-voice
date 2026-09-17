@@ -199,6 +199,12 @@ class ProviderSettings(BaseModel):
     speaker_zh: str = ""
     speaker_cantonese: str = ""
     speaker_en: str = ""
+    # MiniMax 云端克隆音色清单（路线 B，2026-09-18）：[{voice_id,label,sample_lang,
+    # created_at,activated}] JSON 数组。CP /api/tts/minimax-voices 三端点读写；
+    # web 设置页/同传页音色下拉合并显示。不属 secret（_mask_secrets 不掩），免 DB
+    # 迁移（settings JSON blob）。未声明此键的 ProviderSettings 会在 PUT
+    # model_dump 时把它蒸发掉——必须显式声明。
+    minimax_clones_json: str = "[]"
     instruct: str = ""
     resource_id: str = ""
     app_id: str = ""
