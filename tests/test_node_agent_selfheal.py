@@ -26,7 +26,7 @@ def test_heartbeat_tick_reregisters_on_unknown_token(monkeypatch, tmp_path):
     cfg = _cfg(tmp_path)
     calls = []
 
-    def fake_once(c, metrics=None):
+    def fake_once(c, metrics=None, acks=None):
         calls.append(c.node_token)
         return (False, {"detail": "unknown node token"}) if c.node_token == "dead-token" \
             else (True, {})
@@ -46,7 +46,7 @@ def test_heartbeat_tick_reregisters_on_unknown_token(monkeypatch, tmp_path):
 def test_heartbeat_tick_counts_missed_without_license_flow(monkeypatch, tmp_path):
     cfg = _cfg(tmp_path)
     monkeypatch.setattr(node_agent, "heartbeat_once",
-                        lambda c, metrics=None: (False, {"detail": "network"}))
+                        lambda c, metrics=None, acks=None: (False, {"detail": "network"}))
     assert node_agent.heartbeat_tick(cfg, 1) == 2  # 无 license 流不自愈
 
 
@@ -65,7 +65,7 @@ def test_heartbeat_tick_swallows_reregister_network_error(monkeypatch, tmp_path)
     """重注册窗口内网络抖动（URLError）不得穿透 tick 令守护进程退出/线程死亡。"""
     cfg = _cfg(tmp_path)
     monkeypatch.setattr(node_agent, "heartbeat_once",
-                        lambda c, metrics=None: (False, {"detail": "unknown node token"}))
+                        lambda c, metrics=None, acks=None: (False, {"detail": "unknown node token"}))
 
     def fake_ensure(cp_url, license_key, fingerprint, state_file):
         raise urllib.error.URLError("network blip")
@@ -122,7 +122,7 @@ def test_root_revoked_dict_stops_stack_and_exits_no_reregister(monkeypatch, tmp_
     cfg = _cfg(tmp_path)
     monkeypatch.setenv("BOK_NODE_KILL_ON_REVOKE", "1")
     monkeypatch.setattr(node_agent, "heartbeat_once",
-                        lambda c, metrics=None: (False, _SHUTDOWN_BODY))
+                        lambda c, metrics=None, acks=None: (False, _SHUTDOWN_BODY))
     stops, registers = [], []
     monkeypatch.setattr(node_agent, "_kill_stack_hook", lambda: stops.append(1))
     monkeypatch.setattr(node_agent, "ensure_token",
@@ -140,7 +140,7 @@ def test_heartbeat_loop_exits_process_on_root_revoked(monkeypatch, tmp_path):
     cfg.heartbeat_interval_s = 0
     monkeypatch.setenv("BOK_NODE_KILL_ON_REVOKE", "1")
     monkeypatch.setattr(node_agent, "heartbeat_once",
-                        lambda c, metrics=None: (False, _SHUTDOWN_BODY))
+                        lambda c, metrics=None, acks=None: (False, _SHUTDOWN_BODY))
     stops = []
     monkeypatch.setattr(node_agent, "_kill_stack_hook", lambda: stops.append(1))
     with pytest.raises(SystemExit) as ei:
@@ -154,7 +154,7 @@ def test_root_revoked_kills_without_license_flow(monkeypatch, tmp_path):
     cfg = _cfg(tmp_path)
     monkeypatch.setenv("BOK_NODE_KILL_ON_REVOKE", "1")
     monkeypatch.setattr(node_agent, "heartbeat_once",
-                        lambda c, metrics=None: (False, _SHUTDOWN_BODY))
+                        lambda c, metrics=None, acks=None: (False, _SHUTDOWN_BODY))
     stops = []
     monkeypatch.setattr(node_agent, "_kill_stack_hook", lambda: stops.append(1))
     with pytest.raises(SystemExit):
@@ -167,7 +167,7 @@ def test_root_revoked_observe_only_env_disables_kill(monkeypatch, tmp_path, caps
     cfg = _cfg(tmp_path)
     monkeypatch.setenv("BOK_NODE_KILL_ON_REVOKE", "0")
     monkeypatch.setattr(node_agent, "heartbeat_once",
-                        lambda c, metrics=None: (False, _SHUTDOWN_BODY))
+                        lambda c, metrics=None, acks=None: (False, _SHUTDOWN_BODY))
     stops, registers = [], []
     monkeypatch.setattr(node_agent, "_kill_stack_hook", lambda: stops.append(1))
     monkeypatch.setattr(node_agent, "ensure_token",
@@ -186,7 +186,7 @@ def test_auto_clone_revoked_keeps_self_heal(monkeypatch, tmp_path):
     cfg = _cfg(tmp_path)
     calls = []
 
-    def fake_once(c, metrics=None):
+    def fake_once(c, metrics=None, acks=None):
         calls.append(c.node_token)
         return (False, {"detail": "node revoked"}) if c.node_token == "dead-token" \
             else (True, {})
@@ -211,7 +211,7 @@ def test_license_revoked_fatal_after_three_consecutive(monkeypatch, tmp_path):
     cfg = _cfg(tmp_path)
     monkeypatch.setenv("BOK_NODE_KILL_ON_REVOKE", "1")
     monkeypatch.setattr(node_agent, "heartbeat_once",
-                        lambda c, metrics=None: (False, {"detail": "license revoked"}))
+                        lambda c, metrics=None, acks=None: (False, {"detail": "license revoked"}))
     stops, registers = [], []
     monkeypatch.setattr(node_agent, "_kill_stack_hook", lambda: stops.append(1))
     monkeypatch.setattr(node_agent, "ensure_token",
@@ -241,7 +241,7 @@ def test_license_revoked_streak_resets_on_success(monkeypatch, tmp_path):
     ]
     monkeypatch.setenv("BOK_NODE_KILL_ON_REVOKE", "1")
     monkeypatch.setattr(node_agent, "heartbeat_once",
-                        lambda c, metrics=None: responses.pop(0))
+                        lambda c, metrics=None, acks=None: responses.pop(0))
     stops = []
     monkeypatch.setattr(node_agent, "_kill_stack_hook", lambda: stops.append(1))
     hb = node_agent.HeartbeatState()
@@ -320,7 +320,7 @@ def test_heartbeat_tick_does_not_swallow_sticky_register_refusal(monkeypatch, tm
     cfg = _cfg(tmp_path)
     monkeypatch.setenv("BOK_NODE_KILL_ON_REVOKE", "1")
     monkeypatch.setattr(node_agent, "heartbeat_once",
-                        lambda c, metrics=None: (False, {"detail": "node revoked"}))
+                        lambda c, metrics=None, acks=None: (False, {"detail": "node revoked"}))
 
     def fake_ensure(cp_url, license_key, fingerprint, state_file):
         raise node_agent.RegisterRevoked("[node-agent] FATAL: registration refused — revoked.")

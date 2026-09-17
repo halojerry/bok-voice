@@ -29,6 +29,10 @@ from livekit import rtc
 ROOT = Path(__file__).resolve().parents[1]
 LIVEKIT_URL = "ws://127.0.0.1:7880"
 CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
+# auth-on 栈(2026-09-15 标准姿势):CP 请求带机器通道 Bearer,未设 env 零变化。
+_CP_HEADERS: dict[str, str] = {}
+if os.environ.get("BOK_CP_TOKEN", "").strip():
+    _CP_HEADERS["Authorization"] = f"Bearer {os.environ['BOK_CP_TOKEN'].strip()}"
 AUDIO_DIR = ROOT / "tests" / "fixtures" / "audio"
 LANG = os.environ.get("BARGEIN_LANG", "cantonese")
 TTS_URL = os.environ.get("TTS_URL", "http://127.0.0.1:8788")
@@ -115,6 +119,7 @@ async def main() -> None:
     lang = LANG
     obj = httpx.post(
         f"{CONTROL_PLANE_URL}/api/objects?account_id=acc-001",
+        headers=_CP_HEADERS,
         json={
             "display_name": f"E2E-bargein-{int(time.time())}",
             "role_template": "buyer",
@@ -125,11 +130,13 @@ async def main() -> None:
     ).json()
     persona = httpx.post(
         f"{CONTROL_PLANE_URL}/api/personas?account_id=acc-001",
+        headers=_CP_HEADERS,
         json={"name": "E2E客服", "language": lang, "tone": "礼貌专业"},
         timeout=10,
     ).json()
     call = httpx.post(
         f"{CONTROL_PLANE_URL}/api/calls",
+        headers=_CP_HEADERS,
         json={
             "account_id": "acc-001",
             "object_id": obj["id"],
@@ -143,6 +150,7 @@ async def main() -> None:
     room_name = call["id"]
     resp = httpx.post(
         f"{CONTROL_PLANE_URL}/api/token",
+        headers=_CP_HEADERS,
         json={"account_id": "acc-001", "call_id": room_name},
         timeout=10,
     )
@@ -266,7 +274,7 @@ async def main() -> None:
             t.cancel()
         await room.disconnect()
         try:
-            httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{room_name}/hangup", timeout=10)
+            httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{room_name}/hangup", headers=_CP_HEADERS, timeout=10)
         except Exception:
             pass
 

@@ -15,9 +15,16 @@
    docker compose 插件；命令行 `docker compose version` 能出版本号即可）。
 3. **Supabase 项目**：拿到数据库连接串（见 `.env.example` 里 `DATABASE_URL` 的
    格式说明——**必须用 session pooler 的 5432 端**）。
-4. **GHCR 拉取慢（国内常见）**，两种处理任选：
+4. **GHCR 私有镜像登录（仓库转私有的必做，2026-09-17 起）**：源码仓已转私有，
+   镜像随仓库变私有——拉取前先登 GHCR（GitHub → Settings → Developer personal
+   access tokens 造一个 `read:packages` token）：
+   ```bash
+   echo "<GH_PAT>" | docker login ghcr.io -u <github用户名> --password-stdin
+   ```
+   漏了这步 `docker compose up` 会 `denied`。**搬运法同样要先 login**。
+5. **GHCR 拉取慢（国内常见）**，两种处理任选：
    - 宝塔 Docker 设置里配置**镜像加速**，把 `ghcr.io` 加入加速/代理列表；
-   - 或本地/中转机手动搬运后 retag：
+   - 或本地/中转机手动搬运后 retag（同样先 login）：
      ```bash
      docker pull ghcr.io/halojerry/bok-voice:latest
      docker tag  ghcr.io/halojerry/bok-voice:latest bok-voice:local

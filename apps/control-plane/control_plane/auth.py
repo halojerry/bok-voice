@@ -48,6 +48,13 @@ _EXEMPT_PATHS = (
     "/api/webhook/livekit",
 )
 
+# 前缀豁免（端点内自证，同 register/heartbeat 模式）：节点工件下载带
+# version/filename 路径参数无法精确匹配；鉴权因子=node_token 或 license key
+# （Bearer），端点内 resolve/验活性——中间件放行不等于无凭据可下。
+_EXEMPT_PREFIXES = (
+    "/api/nodes/downloads/",
+)
+
 
 @dataclass
 class Identity:
@@ -163,6 +170,11 @@ def scoped_account(request: Request, requested: str = "") -> str:
     ident = current_identity(request)
     if ident is None or ident.role == "root":
         return requested
+    if not ident.account_id:
+        # 空账号 user=通配符漂移:仓库层把过滤值 "" 当 match-all,该 user 会列表
+        # 全账号 calls/objects/roster/campaigns(建号链路只有 root 传空 account_id
+        # 才造得出这种行)。fail-closed 403,不给越权视图(2026-09-17 全量 debug F7)。
+        raise HTTPException(status_code=403, detail="user account unassigned")
     return ident.account_id
 
 
@@ -266,7 +278,8 @@ async def identity_gate(request: Request, call_next):
     # auth-on 不得把登录页自己也 401——云端 BOK_AUTH_REQUIRED=1 下裸 GET /
     # 曾被整站拦死（2026-09-15 compose 排练实测，B4 登录流程不可达）。
     static_get = request.method in ("GET", "HEAD") and not path.startswith("/api/")
-    if path in _EXEMPT_PATHS or static_get or not auth_required():
+    prefix_exempt = any(path.startswith(p) for p in _EXEMPT_PREFIXES)
+    if path in _EXEMPT_PATHS or prefix_exempt or static_get or not auth_required():
         _override_correlation_user(request, "anonymous")
         return await call_next(request)
     auth = request.headers.get("authorization", "")

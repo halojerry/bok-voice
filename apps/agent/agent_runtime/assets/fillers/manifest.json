@@ -2,240 +2,366 @@
   "zh": [
     {
       "text": "哎好的，您稍等，我马上查。",
-      "file": "zh-01.wav",
-      "dur_s": 2.12,
+      "file": "zh-s01.wav",
+      "dur_s": 2.17,
       "cat": "check"
     },
     {
       "text": "您别急，我看一下您这单的情况。",
-      "file": "zh-02.wav",
-      "dur_s": 1.93,
+      "file": "zh-s02.wav",
+      "dur_s": 2.21,
       "cat": "empathy"
     },
     {
       "text": "好的您说，我这就去核实。",
-      "file": "zh-03.wav",
-      "dur_s": 1.73,
+      "file": "zh-s03.wav",
+      "dur_s": 1.93,
       "cat": "ack"
     },
     {
       "text": "嗯稍等，我查下物流。",
-      "file": "zh-04.wav",
-      "dur_s": 1.71,
+      "file": "zh-s04.wav",
+      "dur_s": 1.62,
       "cat": "check"
     },
     {
       "text": "收到收到，我马上给您查这单。",
-      "file": "zh-05.wav",
-      "dur_s": 1.68,
+      "file": "zh-s05.wav",
+      "dur_s": 2.03,
       "cat": "check"
     },
     {
       "text": "您慢慢说，我在听着呢。",
-      "file": "zh-06.wav",
-      "dur_s": 1.49,
+      "file": "zh-s06.wav",
+      "dur_s": 1.41,
       "cat": "ack"
     },
     {
       "text": "好嘞，稍等，我帮您核实。",
-      "file": "zh-07.wav",
-      "dur_s": 2.22,
+      "file": "zh-s07.wav",
+      "dur_s": 2.19,
       "cat": "check"
     },
     {
       "text": "别着急，我正在看您这单。",
-      "file": "zh-08.wav",
-      "dur_s": 1.84,
+      "file": "zh-s08.wav",
+      "dur_s": 1.6,
       "cat": "empathy"
     },
     {
       "text": "嗯<#0.2#>您稍等，我看一下。",
-      "file": "zh-09.wav",
-      "dur_s": 1.78,
+      "file": "zh-s09.wav",
+      "dur_s": 2.24,
       "cat": "check"
     },
     {
       "text": "好的稍等，马上给您查清楚。",
-      "file": "zh-10.wav",
+      "file": "zh-s10.wav",
       "dur_s": 1.82,
       "cat": "check"
     },
     {
+      "text": "嗯嗯好的，我记着呢。",
+      "file": "zh-s11.wav",
+      "dur_s": 1.91,
+      "cat": "minimal"
+    },
+    {
+      "text": "好的好的，您慢慢讲。",
+      "file": "zh-s12.wav",
+      "dur_s": 1.63,
+      "cat": "minimal"
+    },
+    {
+      "text": "嗯好，您继续讲，我听着。",
+      "file": "zh-s13.wav",
+      "dur_s": 2.11,
+      "cat": "minimal"
+    },
+    {
+      "text": "好的，您稍等一下，很快就好。",
+      "file": "zh-s14.wav",
+      "dur_s": 1.95,
+      "cat": "default"
+    },
+    {
+      "text": "嗯好，我这边看一下就回您。",
+      "file": "zh-s15.wav",
+      "dur_s": 2.04,
+      "cat": "default"
+    },
+    {
+      "text": "好，您说，我在记。",
+      "file": "zh-s16.wav",
+      "dur_s": 1.73,
+      "cat": "ack"
+    },
+    {
+      "text": "明白明白，我帮您看着呢。",
+      "file": "zh-s17.wav",
+      "dur_s": 1.62,
+      "cat": "empathy"
+    },
+    {
       "text": "好的，您稍等，我马上帮您看一下。",
-      "file": "zh-11.wav",
-      "dur_s": 2.1,
+      "file": "zh-l01.wav",
+      "dur_s": 2.07,
       "cat": "check"
     },
     {
       "text": "收到收到，我这就帮您查一下。",
-      "file": "zh-12.wav",
-      "dur_s": 2.05,
+      "file": "zh-l02.wav",
+      "dur_s": 2.31,
       "cat": "check"
     },
     {
       "text": "麻烦您稍等一下，我马上看一下。",
-      "file": "zh-13.wav",
-      "dur_s": 1.88,
+      "file": "zh-l03.wav",
+      "dur_s": 2.14,
       "cat": "check"
     }
   ],
   "cantonese": [
     {
       "text": "唔使急，你慢慢講，我幫你睇緊。",
-      "file": "cantonese-01.wav",
-      "dur_s": 2.09,
+      "file": "cantonese-s01.wav",
+      "dur_s": 1.92,
       "cat": "empathy"
     },
     {
       "text": "好嘅，你稍等一陣，我即刻幫你核實。",
-      "file": "cantonese-02.wav",
-      "dur_s": 1.89,
+      "file": "cantonese-s02.wav",
+      "dur_s": 2.15,
       "cat": "check"
     },
     {
       "text": "收到，你等我幾秒，查緊喇。",
-      "file": "cantonese-03.wav",
-      "dur_s": 2.06,
+      "file": "cantonese-s03.wav",
+      "dur_s": 1.99,
       "cat": "check"
     },
     {
       "text": "明白，你繼續講，我聽緊。",
-      "file": "cantonese-04.wav",
-      "dur_s": 1.9,
+      "file": "cantonese-s04.wav",
+      "dur_s": 1.4,
       "cat": "ack"
     },
     {
       "text": "好，你講先，我而家幫你睇返。",
-      "file": "cantonese-05.wav",
-      "dur_s": 1.45,
+      "file": "cantonese-s05.wav",
+      "dur_s": 1.77,
       "cat": "ack"
     },
     {
       "text": "冇問題，你稍等多一陣，我跟進緊。",
-      "file": "cantonese-06.wav",
-      "dur_s": 1.56,
+      "file": "cantonese-s06.wav",
+      "dur_s": 2.18,
       "cat": "default"
     },
     {
       "text": "唔使擔心，我幫你睇緊先。",
-      "file": "cantonese-07.wav",
-      "dur_s": 1.72,
+      "file": "cantonese-s07.wav",
+      "dur_s": 1.89,
       "cat": "empathy"
     },
     {
       "text": "好嘅，你等陣，我幫你查下先。",
-      "file": "cantonese-08.wav",
-      "dur_s": 1.64,
+      "file": "cantonese-s08.wav",
+      "dur_s": 1.26,
       "cat": "check"
     },
     {
       "text": "收到，你慢慢講，我聽緊。",
-      "file": "cantonese-09.wav",
-      "dur_s": 1.47,
+      "file": "cantonese-s09.wav",
+      "dur_s": 1.55,
       "cat": "ack"
     },
     {
       "text": "嗯<#0.3#>你稍等，我就幫你睇。",
-      "file": "cantonese-10.wav",
-      "dur_s": 2.0,
+      "file": "cantonese-s10.wav",
+      "dur_s": 2.02,
       "cat": "check"
     },
     {
+      "text": "嗯嗯好嘅，我記住喇。",
+      "file": "cantonese-s11.wav",
+      "dur_s": 1.45,
+      "cat": "minimal"
+    },
+    {
+      "text": "好嘅好嘅，你慢慢講。",
+      "file": "cantonese-s12.wav",
+      "dur_s": 1.29,
+      "cat": "minimal"
+    },
+    {
+      "text": "嗯好，你繼續講，我聽住。",
+      "file": "cantonese-s13.wav",
+      "dur_s": 1.83,
+      "cat": "minimal"
+    },
+    {
+      "text": "好嘅，你等一等，我好快覆你。",
+      "file": "cantonese-s14.wav",
+      "dur_s": 1.91,
+      "cat": "default"
+    },
+    {
+      "text": "嗯，你等等，我睇下就覆你。",
+      "file": "cantonese-s15.wav",
+      "dur_s": 1.9,
+      "cat": "default"
+    },
+    {
+      "text": "好，你慢慢講，我聽住。",
+      "file": "cantonese-s16.wav",
+      "dur_s": 1.43,
+      "cat": "ack"
+    },
+    {
+      "text": "明白明白，我幫你跟緊。",
+      "file": "cantonese-s17.wav",
+      "dur_s": 1.75,
+      "cat": "empathy"
+    },
+    {
       "text": "好嘅，你稍等陣，我而家就幫你睇下。",
-      "file": "cantonese-11.wav",
-      "dur_s": 2.36,
+      "file": "cantonese-l01.wav",
+      "dur_s": 1.74,
       "cat": "check"
     },
     {
       "text": "收到，唔好急，等我幫你睇下先。",
-      "file": "cantonese-12.wav",
-      "dur_s": 1.79,
+      "file": "cantonese-l02.wav",
+      "dur_s": 1.67,
       "cat": "empathy"
     },
     {
       "text": "明白，麻煩你稍等多一陣，我即刻睇。",
-      "file": "cantonese-13.wav",
-      "dur_s": 2.31,
+      "file": "cantonese-l03.wav",
+      "dur_s": 2.56,
       "cat": "check"
     }
   ],
   "en": [
     {
       "text": "Sure let me check your order right away.",
-      "file": "en-01.wav",
-      "dur_s": 1.77,
+      "file": "en-s01.wav",
+      "dur_s": 2.02,
       "cat": "check"
     },
     {
       "text": "Okay give me a second to look into it.",
-      "file": "en-02.wav",
-      "dur_s": 1.62,
+      "file": "en-s02.wav",
+      "dur_s": 1.52,
       "cat": "check"
     },
     {
       "text": "Hold on I'm checking your shipment now.",
-      "file": "en-03.wav",
-      "dur_s": 1.82,
+      "file": "en-s03.wav",
+      "dur_s": 2.0,
       "cat": "check"
     },
     {
-      "text": "One moment please I'll verify your order.",
-      "file": "en-04.wav",
-      "dur_s": 1.93,
+      "text": "One moment I'll verify your order.",
+      "file": "en-s04.wav",
+      "dur_s": 1.54,
       "cat": "check"
     },
     {
       "text": "Let me pull up your order details now.",
-      "file": "en-05.wav",
-      "dur_s": 1.62,
+      "file": "en-s05.wav",
+      "dur_s": 2.01,
       "cat": "check"
     },
     {
       "text": "Just a moment while I check on this.",
-      "file": "en-06.wav",
-      "dur_s": 1.57,
+      "file": "en-s06.wav",
+      "dur_s": 2.14,
       "cat": "check"
     },
     {
       "text": "Checking your order now.",
-      "file": "en-07.wav",
-      "dur_s": 1.23,
+      "file": "en-s07.wav",
+      "dur_s": 1.37,
       "cat": "minimal"
     },
     {
       "text": "Give me a second to verify it.",
-      "file": "en-08.wav",
-      "dur_s": 1.13,
+      "file": "en-s08.wav",
+      "dur_s": 1.49,
       "cat": "check"
     },
     {
       "text": "Checking the shipping info now.",
-      "file": "en-09.wav",
-      "dur_s": 1.34,
+      "file": "en-s09.wav",
+      "dur_s": 1.62,
       "cat": "default"
     },
     {
       "text": "Sure I'll look into that for you right away.",
-      "file": "en-10.wav",
-      "dur_s": 1.69,
+      "file": "en-s10.wav",
+      "dur_s": 1.95,
       "cat": "check"
     },
     {
+      "text": "I understand let me check it now.",
+      "file": "en-s11.wav",
+      "dur_s": 1.46,
+      "cat": "empathy"
+    },
+    {
+      "text": "I see I am checking it for you.",
+      "file": "en-s12.wav",
+      "dur_s": 1.81,
+      "cat": "empathy"
+    },
+    {
+      "text": "I understand I will sort this out.",
+      "file": "en-s13.wav",
+      "dur_s": 1.65,
+      "cat": "empathy"
+    },
+    {
+      "text": "Got it please go ahead I am listening.",
+      "file": "en-s14.wav",
+      "dur_s": 1.65,
+      "cat": "ack"
+    },
+    {
+      "text": "Understood I am noting that down.",
+      "file": "en-s15.wav",
+      "dur_s": 1.8,
+      "cat": "ack"
+    },
+    {
+      "text": "Okay sure please continue I am with you.",
+      "file": "en-s16.wav",
+      "dur_s": 2.14,
+      "cat": "ack"
+    },
+    {
+      "text": "Alright got it I am checking it now.",
+      "file": "en-s17.wav",
+      "dur_s": 2.08,
+      "cat": "minimal"
+    },
+    {
       "text": "Just a moment and I will check that.",
-      "file": "en-11.wav",
-      "dur_s": 2.2,
+      "file": "en-l01.wav",
+      "dur_s": 2.32,
       "cat": "check"
     },
     {
       "text": "One moment and I will check on it.",
-      "file": "en-12.wav",
-      "dur_s": 2.05,
+      "file": "en-l02.wav",
+      "dur_s": 1.54,
       "cat": "check"
     },
     {
       "text": "One moment please and I will check that.",
-      "file": "en-13.wav",
-      "dur_s": 1.79,
+      "file": "en-l03.wav",
+      "dur_s": 2.39,
       "cat": "check"
     }
   ]

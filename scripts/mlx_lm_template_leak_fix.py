@@ -13,7 +13,7 @@ ArraysCache 层不可裁剪（is_trimmable()=False），fetch 的「修剪长键
 差异、零语义变化；实测命中 25/78 → 48/78（剩余未命中为生成头 <think>
 不对称，属模板语义改动，另行决策）。模板无该注释模式时为 no-op。
 
-runtime site-packages 不入 git：desktop/runtime 重建后由 tools/bok.py
+runtime site-packages 不入 git：runtime/ 重建后由 tools/bok.py
 启动 :1235/:1236 前自动重跑本脚本。
 """
 

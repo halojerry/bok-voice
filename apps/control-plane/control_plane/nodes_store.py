@@ -1,7 +1,8 @@
 """节点注册表（P0 最小版 + P1 节点鉴权，spec §4.2）：engine 有则走 SQL(nodes/
-node_licenses 表)、无则内存 dict（dev/tests，与 build_repository 的双模一致）。
-token/license key 明文只在注册/签发响应出现一次，库内恒为 sha256。
-commands 通道 P3 填充（L1/L2/L3），当前恒返回空表。
+node_licenses/node_commands 表)、无则内存 dict（dev/tests，与 build_repository
+的双模一致）。token/license key 明文只在注册/签发响应出现一次，库内恒为 sha256。
+commands 通道（P3，2026-09-17 落地）：root 经 CP 入队（白名单动作），节点心跳
+领走（pop→delivered），update 靠心跳 version 收敛自动关单。
 
 P1 节点鉴权（加固模式=BOK_AUTH_REQUIRED=1 或 BOK_CP_TOKEN 已设）：
 register 必须携带有效 license_key；同一 (license_id, fingerprint) 重注册幂等
@@ -18,6 +19,10 @@ from datetime import datetime, timezone
 
 HEARTBEAT_INTERVAL_S = 60
 ONLINE_WINDOW_S = HEARTBEAT_INTERVAL_S * 3
+
+# 指令动作白名单（CP 端点与 store 双闸——新增动作须两端同步，绝不经此通道
+# 传任意 shell/命令行）。
+NODE_COMMAND_ACTIONS = ("update", "restart", "shutdown")
 
 
 def _as_utc(dt: datetime | None) -> datetime | None:
@@ -70,6 +75,7 @@ class NodeStore:
         self._engine = engine
         self._rows: dict[str, dict] = {}  # 内存模式（engine=None）
         self._licenses: dict[str, dict] = {}  # 内存模式（engine=None）
+        self._commands: dict[str, dict] = {}  # 内存模式（engine=None）
         self._session_factory = None
         if engine is not None:
             from sqlalchemy.orm import sessionmaker
@@ -427,13 +433,19 @@ class NodeStore:
             return "unrevoked"
 
     def heartbeat(self, token: str, metrics: dict | None = None,
-                  fingerprint: str = "", require_license: bool = False) -> tuple[bool, str]:
+                  fingerprint: str = "", require_license: bool = False,
+                  version: str = "") -> tuple[bool, str]:
         """心跳四验：token / license active /（加固模式）license 绑定 / 指纹。
 
         require_license=True（CP 加固模式）：开放期注册的 license_id="" 存量 token
         是不可吊销的长命凭证（吊销端点够不着它）——拒绝但不自动吊销，留现场供
         root 处置/迁移（2026-09-16 深测 P2）。注册绑定了指纹的节点心跳缺指纹=
         不合作客户端绕过克隆检测——按指纹不符自动吊销（协议强制）。
+
+        version（P3 commands，2026-09-17）：节点上报当前包版本——写回 Node.version
+        （舰队版本面板），并自动关闭该节点 target_version==version 的 update 指令
+        （收敛即完成，无需 ack 协议；重启/换版本间隙的心跳不误关——版本不匹配
+        的指令保持 delivered）。
 
         返回 (ok, reason)；reason ∈ {"", "unknown_token", "revoked",
         "license_revoked", "license_required", "fingerprint_mismatch"}——后两者
@@ -480,20 +492,210 @@ class NodeStore:
             if row is not None:
                 row["last_seen_at"] = _utcnow()
                 row["metrics_json"] = json.dumps(metrics or {})
+                if version:
+                    row["version"] = version
         else:
-            from sqlalchemy import update
+            from bok_voice_business_db import models
 
+            # ORM 单元工作（属性赋值+commit，无 update() 构建——心跳每分钟
+            # 一发，行级读取更新成本可忽略）。
+            with self._session_factory() as session:
+                n = session.query(models.Node).filter(
+                    models.Node.token_hash == token_hash,
+                    models.Node.status != "revoked").first()
+                if n is not None:
+                    n.last_seen_at = _utcnow()
+                    n.metrics_json = json.dumps(metrics or {})
+                    if version:
+                        n.version = version
+                session.commit()
+        if version:
+            # update 收敛关单：只关 target_version 精确匹配的（重启/换版本间隙
+            # 的其他 update 指令保持 delivered，等各自目标版本到达再关）。
+            self._close_update_commands_by_version(node["node_id"], version)
+        return True, ""
+
+    def _close_update_commands_by_version(self, node_id: str, version: str) -> int:
+        """节点心跳 version 与目标版本收敛 → 对应 update 指令关单（done）。
+
+        版本匹配在 Python 侧做（ORM 取行后逐行比 target_version）——精确、
+        且不把运行期值带进任何语句构建位。"""
+        now = _utcnow()
+        if self._session_factory is None:
+            n = 0
+            for c in self._commands.values():
+                if (c["node_id"] == node_id and c["action"] == "update"
+                        and c["status"] in ("pending", "delivered")
+                        and c["target_version"] == version):
+                    c["status"] = "done"
+                    c["result"] = "node version converged"
+                    c["closed_at"] = now
+                    n += 1
+            return n
+        from bok_voice_business_db import models
+
+        with self._session_factory() as session:
+            rows = session.query(models.NodeCommand).filter(
+                models.NodeCommand.node_id == node_id,
+                models.NodeCommand.action == "update",
+                models.NodeCommand.status.in_(("pending", "delivered"))).all()
+            changed = 0
+            for r in rows:
+                if r.target_version == version:
+                    r.status = "done"
+                    r.result = "node version converged"
+                    r.closed_at = now
+                    changed += 1
+            if changed:
+                session.commit()
+            return changed
+
+    # ---- commands 通道（P3，2026-09-17）----
+
+    def enqueue_command(self, node_id: str, action: str, *,
+                        args: dict | None = None, created_by: str = "") -> dict | None:
+        """入队一条指令（root 面 CP 端点用）。动作白名单外抛 ValueError——
+        端点层 400，绝不把未审计动作放进通道。update 必带 target_version。"""
+        if action not in NODE_COMMAND_ACTIONS:
+            raise ValueError(f"unsupported action: {action}")
+        args = dict(args or {})
+        target_version = str(args.get("version", ""))
+        if action == "update" and not target_version:
+            raise ValueError("update command requires version")
+        cmd_id = f"cmd-{secrets.token_hex(6)}"
+        now = _utcnow()
+        row = {
+            "id": cmd_id, "node_id": node_id, "action": action,
+            "target_version": target_version, "args_json": json.dumps(args),
+            "status": "pending", "result": "", "created_by": created_by,
+            "created_at": now, "delivered_at": None, "closed_at": None,
+        }
+        if self._session_factory is None:
+            self._commands[cmd_id] = row
+        else:
             from bok_voice_business_db import models
 
             with self._session_factory() as session:
-                session.execute(
-                    update(models.Node)
-                    .where(models.Node.token_hash == token_hash,
-                           models.Node.status != "revoked")
-                    .values(last_seen_at=_utcnow(), metrics_json=json.dumps(metrics or {}))
-                )
+                session.add(models.NodeCommand(
+                    id=cmd_id, node_id=node_id, action=action,
+                    target_version=target_version, args_json=row["args_json"],
+                    status="pending", created_by=created_by, created_at=now,
+                ))
                 session.commit()
-        return True, ""
+        return self._command_public(row)
+
+    def _command_public(self, row: dict) -> dict:
+        created = _as_utc(row.get("created_at"))
+        delivered = _as_utc(row.get("delivered_at"))
+        closed = _as_utc(row.get("closed_at"))
+        try:
+            args = json.loads(row.get("args_json") or "{}")
+        except (TypeError, ValueError):
+            args = {}
+        return {
+            "id": row["id"], "node_id": row["node_id"], "action": row["action"],
+            "target_version": row.get("target_version", ""), "args": args,
+            "status": row["status"], "result": row.get("result", ""),
+            "created_by": row.get("created_by", ""),
+            "created_at": created.isoformat() if created else None,
+            "delivered_at": delivered.isoformat() if delivered else None,
+            "closed_at": closed.isoformat() if closed else None,
+        }
+
+    def pop_commands(self, node_id: str, limit: int = 8) -> list[dict]:
+        """心跳领指令：pending → delivered（delivered_at 落时刻），wire 形返回。
+
+        双发竞态窗（同一节点并发心跳）结构性不存在——node_agent 单循环单飞；
+        即便撞上，动作幂等（restart/update 收敛、shutdown 终态）。"""
+        now = _utcnow()
+        if self._session_factory is None:
+            pending = sorted(
+                (c for c in self._commands.values()
+                 if c["node_id"] == node_id and c["status"] == "pending"),
+                key=lambda c: c["created_at"])[:limit]
+            for c in pending:
+                c["status"] = "delivered"
+                c["delivered_at"] = now
+            return [{"id": c["id"], "action": c["action"],
+                     "args": json.loads(c["args_json"])} for c in pending]
+        from bok_voice_business_db import models
+
+        with self._session_factory() as session:
+            rows = (session.query(models.NodeCommand)
+                    .filter(models.NodeCommand.node_id == node_id,
+                            models.NodeCommand.status == "pending")
+                    .order_by(models.NodeCommand.created_at)
+                    .limit(limit).all())
+            out = []
+            for r in rows:
+                r.status = "delivered"
+                r.delivered_at = now
+                try:
+                    args = json.loads(r.args_json or "{}")
+                except (TypeError, ValueError):
+                    args = {}
+                out.append({"id": r.id, "action": r.action, "args": args})
+            session.commit()
+            return out
+
+    def ack_command(self, node_id: str, cmd_id: str, ok: bool, result: str = "") -> bool:
+        """节点 ack 单条指令（update 失败回执用；成功路径走 version 收敛关单）。"""
+        now = _utcnow()
+        target = "done" if ok else "failed"
+        if self._session_factory is None:
+            c = self._commands.get(cmd_id)
+            if c is None or c["node_id"] != node_id or c["status"] not in ("pending", "delivered"):
+                return False
+            c["status"] = target
+            c["result"] = result[:255]
+            c["closed_at"] = now
+            return True
+        from bok_voice_business_db import models
+
+        with self._session_factory() as session:
+            c = session.get(models.NodeCommand, cmd_id)
+            if c is None or c.node_id != node_id or c.status not in ("pending", "delivered"):
+                return False
+            c.status = target
+            c.result = result[:255]
+            c.closed_at = now
+            session.commit()
+            return True
+
+    def pending_command_count(self, node_id: str) -> int:
+        if self._session_factory is None:
+            return sum(1 for c in self._commands.values()
+                       if c["node_id"] == node_id and c["status"] == "pending")
+        from bok_voice_business_db import models
+
+        with self._session_factory() as session:
+            return session.query(models.NodeCommand).filter(
+                models.NodeCommand.node_id == node_id,
+                models.NodeCommand.status == "pending").count()
+
+    def list_commands(self, node_id: str | None = None, limit: int = 50) -> list[dict]:
+        """指令台账（root 面排障用；node_id 空=全舰队）。"""
+        if self._session_factory is None:
+            rows = [c for c in self._commands.values()
+                    if node_id is None or c["node_id"] == node_id]
+        else:
+            from bok_voice_business_db import models
+
+            with self._session_factory() as session:
+                q = session.query(models.NodeCommand)
+                if node_id:
+                    q = q.filter(models.NodeCommand.node_id == node_id)
+                rows = [
+                    {"id": c.id, "node_id": c.node_id, "action": c.action,
+                     "target_version": c.target_version, "args_json": c.args_json,
+                     "status": c.status, "result": c.result, "created_by": c.created_by,
+                     "created_at": c.created_at, "delivered_at": c.delivered_at,
+                     "closed_at": c.closed_at}
+                    for c in q.order_by(models.NodeCommand.created_at.desc())
+                    .limit(limit).all()
+                ]
+        rows = sorted(rows, key=lambda c: c["created_at"], reverse=True)[:limit]
+        return [self._command_public(c) for c in rows]
 
     def list_nodes(self) -> list[dict]:
         now = _utcnow()

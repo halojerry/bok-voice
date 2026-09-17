@@ -1,15 +1,14 @@
-"""B 线 interp session-report 409 竞态（2026-09-18，「全量 debug 收编」缓项收编）。
+"""B 线 interp session-report 竞态——审计关联收尾（2026-09-18）。
 
-同传一通 call 有 fwd/rev 两个 worker（同 call_id=房间名），挂断后各自上报官方
-SessionReport（真实逐模型 usage + 权威 chat_history 快照）。CP 幽灵覆盖闸
-（C2 闸2）对「ended 且已有 report」一律 409 → 后到的兄弟 worker 报告（双语
-对照的另一半 + 其逐模型 usage）被当失败丢弃，纪要静默缺半边。
+本会话原始修法（reporter 标记 + 主列 blob 幂等合并）与并行 PR #95 的 P1-A
+同题同撞：P1-A 用 worker 字段 + per-worker 历史列（session_reports_json）
++ _iter_call_reports 聚合读点，覆盖面更完整且已自带 tests/test_session_reports.py
+12 条——冲突收敛取 P1-A 为准，本文件不再重复钉竞态行为。
 
-修法=reporter 标记幂等合并：fwd/rev 报告各带 reporter 标记（agent 侧
-`_mark_session_report`），不同标记的兄弟报告按 chat_history.items/usage 追加
-合并进已存 blob，返回 200+merged（审计可观测，不再静默）；同标记重复（幽灵
-重派同 worker 线）与无标记（A 线单 worker 语义）维持 409 幽灵防护——首个
-报告永不覆盖，A 线既有结算语义零变化。
+保留的本会话增量：**审计事件显式带 call_id**。_audit 文档口径「服务端已知
+call_id 就显式传入，别依赖调用方带头」，但本端点三处审计事件此前只传
+subject_id——按 call_id 过滤 /api/audit 查不到 session-report 任何留痕
+（幽灵拒绝、双 worker 合并均不可按通话关联），排查竞态时账本断链。
 """
 
 from __future__ import annotations
@@ -27,129 +26,56 @@ from fastapi.testclient import TestClient  # noqa: E402
 from control_plane.main import app  # noqa: E402
 
 
-def _mk_interp_call(client: TestClient) -> str:
+def _mk_call(client: TestClient) -> str:
     created = client.post(
         "/api/calls",
         json={"account_id": "acc-001", "object_id": "obj-1", "persona_id": "p-1",
-              "mode": "simulation", "kind": "interpret", "target_lang": "en"},
+              "mode": "simulation"},
     ).json()
     return str(created["id"])
 
 
-def _report(reporter: str, item_text: str, input_tokens: int) -> dict:
-    """官方 SessionReport.to_dict() 关键字段的极简替身（fwd/rev 各自快照不相交）。"""
-    payload: dict = {
-        "job_id": f"AJ_{reporter}",
-        "room": "call-x",
-        "chat_history": {"items": [{"type": "message", "role": "user", "content": [item_text]}]},
-        "usage": [{"type": "llm_usage", "input_tokens": input_tokens, "output_tokens": 10}],
-    }
-    if reporter:
-        payload["reporter"] = reporter
-    return payload
+def _audit_actions_with_call_id(client: TestClient, call_id: str) -> set[str]:
+    """按 call_id 过滤出的审计动作集——只有显式带 call_id 的事件才可见。"""
+    events = client.get("/api/audit", params={"call_id": call_id}).json()
+    return {str(e.get("action") or "") for e in events}
 
 
-def _stored_blob(client: TestClient, call_id: str) -> dict:
-    row = client.get(f"/api/calls/{call_id}").json()
-    return json.loads(row.get("session_report") or "{}")
-
-
-# ---- 兄弟报告合并：纪要不丢 ----
-
-
-def test_sibling_session_report_merged_not_rejected():
-    """fwd 先存、rev 后到 → 200+merged 合并进已存 blob（修复前 409 丢弃）。"""
+def test_worker_report_audits_are_visible_by_call_id():
+    """worker 报告（含 ended 合并）的审计事件按 call_id 可关联。"""
     with TestClient(app) as client:
-        call_id = _mk_interp_call(client)
+        call_id = _mk_call(client)
         client.post(f"/api/supervisor/{call_id}/end")
-        # agent 收尾顺序：先 ended 后上报；fwd（我方→对方）先存
+        # B 线 fwd 先存、rev 后到：ended 后异 worker 照收（P1-A 合并语义）
         first = client.post(
-            f"/api/calls/{call_id}/session-report", json=_report("interp-me", "原文：我方一", 100)
+            f"/api/calls/{call_id}/session-report",
+            json={"worker": "bok-interp-fwd", "job_id": "AJ_1", "usage": []},
         )
-        assert first.status_code == 200 and first.json()["stored"] is True
-        # rev（对方→我方）后到：不同 reporter 标记=兄弟 worker，幂等合并不丢
-        second = client.post(
-            f"/api/calls/{call_id}/session-report", json=_report("interp-other", "原文：对方一", 200)
-        )
-        assert second.status_code == 200
-        assert second.json()["merged"] is True
-        blob = _stored_blob(client, call_id)
-        texts = [c for it in blob["chat_history"]["items"] for c in it["content"]]
-        assert "原文：我方一" in texts and "原文：对方一" in texts
-        assert {u["input_tokens"] for u in blob["usage"]} == {100, 200}
-        assert blob["reporters"] == ["interp-me", "interp-other"]
-
-
-def test_merge_preserves_first_writer_fields():
-    """合并只追加 chat_history/usage/reporters，首个报告的 job_id 等字段不动。"""
-    with TestClient(app) as client:
-        call_id = _mk_interp_call(client)
-        client.post(f"/api/supervisor/{call_id}/end")
-        client.post(f"/api/calls/{call_id}/session-report", json=_report("interp-me", "a", 1))
-        second = client.post(
-            f"/api/calls/{call_id}/session-report", json=_report("interp-other", "b", 2)
-        )
-        assert second.status_code == 200
-        blob = _stored_blob(client, call_id)
-        assert blob["job_id"] == "AJ_interp-me"  # 首个报告者身份不被后者顶掉
-
-
-def test_merged_report_is_observable_in_audit():
-    """合并走显式审计事件（call.session_report_merged），不再静默。"""
-    with TestClient(app) as client:
-        call_id = _mk_interp_call(client)
-        client.post(f"/api/supervisor/{call_id}/end")
-        client.post(f"/api/calls/{call_id}/session-report", json=_report("interp-me", "a", 1))
-        client.post(f"/api/calls/{call_id}/session-report", json=_report("interp-other", "b", 2))
-        events = client.get("/api/audit", params={"call_id": call_id}).json()
-        actions = {str(e.get("action") or "") for e in events}
-        assert "call.session_report_merged" in actions
-
-
-# ---- 幽灵防护不削弱 ----
-
-
-def test_same_reporter_duplicate_still_rejected():
-    """同 worker 线（同标记）的第二份=幽灵重派，维持 409，真数据不被覆盖。"""
-    with TestClient(app) as client:
-        call_id = _mk_interp_call(client)
-        client.post(f"/api/supervisor/{call_id}/end")
-        assert client.post(
-            f"/api/calls/{call_id}/session-report", json=_report("interp-me", "真", 100)
-        ).status_code == 200
-        ghost = client.post(
-            f"/api/calls/{call_id}/session-report", json=_report("interp-me", "幽灵", 999)
-        )
-        assert ghost.status_code == 409
-        blob = _stored_blob(client, call_id)
-        texts = [c for it in blob["chat_history"]["items"] for c in it["content"]]
-        assert texts == ["真"] and {u["input_tokens"] for u in blob["usage"]} == {100}
-
-
-def test_unmarked_second_report_still_rejected():
-    """无 reporter 标记（A 线单 worker）的第二份照旧 409——既有语义零变化。"""
-    with TestClient(app) as client:
-        call_id = _mk_interp_call(client)
-        client.post(f"/api/supervisor/{call_id}/end")
-        first = client.post(f"/api/calls/{call_id}/session-report", json=_report("", "真", 1))
         assert first.status_code == 200
-        ghost = client.post(f"/api/calls/{call_id}/session-report", json=_report("", "幽灵", 999))
-        assert ghost.status_code == 409
-        assert _stored_blob(client, call_id)["usage"][0]["input_tokens"] == 1
+        second = client.post(
+            f"/api/calls/{call_id}/session-report",
+            json={"worker": "bok-interp-rev", "job_id": "AJ_2", "usage": []},
+        )
+        assert second.status_code == 200 and second.json()["merged"] is True
+        actions = _audit_actions_with_call_id(client, call_id)
+        assert "call.session_report" in actions
 
 
-# ---- agent 侧：报告带 reporter 标记（纯函数） ----
-
-
-def test_interpret_report_carries_reporter_marker():
-    from agent_runtime.interpret import _mark_session_report
-
-    official = {"job_id": "AJ_x", "usage": [{"type": "llm_usage"}]}
-    fwd = _mark_session_report(official, "me")
-    assert fwd["reporter"] == "interp-me"
-    rev = _mark_session_report(official, "other")
-    assert rev["reporter"] == "interp-other"
-    # 官方 to_dict 产物不被原地改（fwd/rev 各自从同一份快照打标）
-    assert "reporter" not in official
-    # 空值兜底：标记恒非空（CP 以非空标记作为兄弟合并门槛）
-    assert _mark_session_report({}, "")["reporter"] == "interp-unknown"
+def test_ghost_rejected_audit_is_visible_by_call_id():
+    """幽灵覆盖 409 的拒绝留痕同样按 call_id 可关联（排查竞态的账本不断链）。"""
+    with TestClient(app) as client:
+        call_id = _mk_call(client)
+        client.post(f"/api/supervisor/{call_id}/end")
+        # 旧格式（无 worker=A 线语义）：首个照存，第二份 409
+        assert client.post(
+            f"/api/calls/{call_id}/session-report", json={"job_id": "AJ_main"}
+        ).status_code == 200
+        assert client.post(
+            f"/api/calls/{call_id}/session-report", json={"job_id": "AJ_ghost"}
+        ).status_code == 409
+        actions = _audit_actions_with_call_id(client, call_id)
+        assert "call.session_report" in actions
+        assert "call.session_report_rejected" in actions
+        # 真数据未被覆盖
+        row = client.get(f"/api/calls/{call_id}").json()
+        assert json.loads(row["session_report"])["job_id"] == "AJ_main"

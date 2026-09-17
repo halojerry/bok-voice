@@ -1,14 +1,17 @@
-# Windows 实机验收 Checklist（v0.1.0）
+# Windows 实机验收 Checklist（节点分发行，2026-09-17 修订）
 
 > 本机（Mac）无法实机验收 Windows；以下清单在 NVIDIA GPU 的 Windows 机器上逐项执行，全部通过后回填结果并归档。
 
-## 硬件与安装
+## 硬件与安装（install-node.ps1 -Fetch 路径）
 
 - [ ] Windows 10/11 x64，NVIDIA GPU（驱动 >= 550，显存 >= 8GB）
-- [ ] 安装 BokVoice_0.1.0_x64_zh-CN.msi（WiX MSI；NSIS 因 >2GB payload 不可用）
-- [ ] 首启向导：GGUF 模型 lukey03/Qwen3.5-9B-abliterated-GGUF Q4_K_M（约 5.6GB）断点续传下载成功
+- [ ] `install-node.ps1 -CpUrl … -LicenseKey bokn_… -LivekitUrl ws://<内网IP>:7880 -Fetch` 自举：
+      代码包+运行时包从云 CP 拉取（sha256 校验）、解到 %USERPROFILE%\bok-voice
+- [ ] 首启模型下载：Qwen3-ASR/TTS + GGUF Q4_K_M（约 5.6GB）断点续传成功
 - [ ] bok.py setup status -> ready: true
-- [ ] 无 GPU / 驱动旧 / 显存不足机器：doctor --packaged 阻止 LLM 启动并给出明确文案
+- [ ] 无 GPU / 驱动旧 / 显存不足机器：doctor 阻止 LLM 启动并给出明确文案
+- [ ] -InstallService 注册 Task Scheduler bok-node-agent：开机自起 + 崩溃拉回；
+      远程 update 后 exit(75) 被拉回且版本收敛
 
 ## 服务拓扑（七项端口）
 

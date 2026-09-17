@@ -31,6 +31,12 @@ ROOT = Path(__file__).resolve().parents[1]
 LIVEKIT_URL = "ws://127.0.0.1:7880"
 CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
 ASR_URL = "http://127.0.0.1:8787"
+# auth-on 栈(2026-09-15 标准姿势)要求 CP 请求带机器通道 token——E2E 建单/取
+# token/收线/读 turns 全是机器语义,Bearer BOK_CP_TOKEN 直通(与 agent worker 同源)。
+# 未设 env(老 auth-off 栈)零变化。CP 之外(asr sidecar)不带。
+_CP_HEADERS: dict[str, str] = {}
+if os.environ.get("BOK_CP_TOKEN", "").strip():
+    _CP_HEADERS["Authorization"] = f"Bearer {os.environ['BOK_CP_TOKEN'].strip()}"
 AUDIO_DIR = ROOT / "tests" / "fixtures" / "audio"
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -90,6 +96,7 @@ class Side:
     async def connect(self) -> None:
         data = httpx.post(
             f"{CONTROL_PLANE_URL}/api/token",
+            headers=_CP_HEADERS,
             json={"account_id": "acc-001", "call_id": self.call_id, "participant_identity": self.identity},
             timeout=15,
         ).json()
@@ -180,6 +187,7 @@ async def run_one(
     ts = int(time.time() * 1000) % 1000000
     call = httpx.post(
         f"{CONTROL_PLANE_URL}/api/calls",
+        headers=_CP_HEADERS,
         json={"account_id": "acc-001", "kind": "interpret", "mode": "live", "direction": "interpret",
               "language": language, "target_lang": target_lang, "object_id": ""},
         timeout=15,
@@ -208,7 +216,7 @@ async def run_one(
         await me.close()
         await other.close()
         try:
-            httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/hangup", timeout=10)
+            httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/hangup", headers=_CP_HEADERS, timeout=10)
         except Exception:
             pass
     return info
@@ -235,7 +243,7 @@ async def main() -> int:
            not info["rev_ok"], info["rev_text"] or "me 侧零译文音轨 ✓")
     # turns 双语落库(2026-09-07 审计闭环起原文/译文拆成两条,language 字段区分
     # ——旧断言查单行同含「原文：译文：」会永久假红)
-    turns = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{info['call_id']}/turns", timeout=10).json()
+    turns = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{info['call_id']}/turns", headers=_CP_HEADERS, timeout=10).json()
     orig = [t for t in turns if str(t.get("transcript") or "").startswith("原文：")]
     tran = [t for t in turns if str(t.get("transcript") or "").startswith("译文：")]
     record("I1b turns 原文/译文分行落库", len(orig) >= 1 and len(tran) >= 1,
@@ -250,7 +258,7 @@ async def main() -> int:
     # I6 同 I2:出声单向化契约(粤→中方向 me 不播译文 TTS),翻译落库由 I5b 覆盖。
     record("I6 rev 单向化: other(粤)→me 无译文音轨(仅字幕,0912 契约)",
            not info_canto["rev_ok"], info_canto["rev_text"] or "me 侧零译文音轨 ✓")
-    turns_c = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{info_canto['call_id']}/turns", timeout=10).json()
+    turns_c = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{info_canto['call_id']}/turns", headers=_CP_HEADERS, timeout=10).json()
     orig_c = [t for t in turns_c if str(t.get("transcript") or "").startswith("原文：")]
     tran_c = [t for t in turns_c if str(t.get("transcript") or "").startswith("译文：")]
     record("I5b turns 原文/译文分行落库 (中↔粤)", len(orig_c) >= 1 and len(tran_c) >= 1,

@@ -18,6 +18,21 @@ _SYSTEM = (
     '"insight":{"statement":"...","confidence":0.8,"language":"zh"}}'
 )
 
+# 同传会话(B 线,kind=interpret)专用:逐轮是「原文：/译文：」双语对照行,没有
+# 客服对象——纪要框架对齐会议同传场景(Good-Interpreter 调研项:赛后总结喂
+# 双语对照,2026-09-16 P1 落地)。总结用中文写,引用发言标注「我方/对方」。
+_SYSTEM_INTERP = (
+    "你是双语会议同传纪要助手。给定一场同传会话的逐轮文本（每轮含「原文：」与"
+    "「译文：」两行，原文=说话人原话，译文=给另一方的翻译；说话人只分「我方/对方」），"
+    "提炼：\n"
+    "1) 一段 3-5 句的中文对话纪要（双方各说了什么、达成什么，引用时标注「我方/对方」）；\n"
+    "2) 值得沉淀的关键点/待办（每个一句，含承诺、数字、时间等硬信息）；\n"
+    "3) 一条全局洞察（statement：此类同传会话的共性观察；confidence：0~1）。\n"
+    "只输出 JSON，格式："
+    '{"summary":"...","new_topics":[{"topic":"...","summary":"..."}],'
+    '"insight":{"statement":"...","confidence":0.8,"language":"zh"}}'
+)
+
 
 class Summarizer:
     """Runs conversation → summary/topics/insight through the configured LLM.
@@ -37,6 +52,13 @@ class Summarizer:
         llm_cfg = settings.get("llm", {}) or {}
         base_url = (llm_cfg.get("base_url") or "").rstrip("/")
         model = (llm_cfg.get("model") or "").strip()
+        # settle 专线优先(BOK_SETTLE_*,bok.py 注入指向 :1237 9B):纪要/蒸馏係
+        # 延迟不敏感的后台重活,大模型质量↑且与活通话的 :1235 完全隔离;env
+        # 缺席回退原链路(settings llm 卡 > MLX_LLM_* env,语义同旧)。
+        _settle_base = os.environ.get("BOK_SETTLE_LLM_BASE_URL", "").strip()
+        _settle_model = os.environ.get("BOK_SETTLE_LLM_MODEL", "").strip()
+        if _settle_base and _settle_model:
+            base_url, model = _settle_base.rstrip("/"), _settle_model
         # 设置页 LLM 卡片可存空 base_url / 占位 model="local"；本机 MLX 的真实地址
         # 由启动器经 env 注入（与 agent 的 MlxLlmLLM 同一来源）。只读 settings 会打到
         # 空 URL / model=local → mlx_lm 404 → 蒸馏表（new_topics/insight）永不写入。
@@ -48,16 +70,17 @@ class Summarizer:
         if not base_url or not model:
             return self._fallback(turns)
         try:
-            return self._via_llm(base_url, model, transcript, call)
+            system = _SYSTEM_INTERP if str(call.get("kind") or "") == "interpret" else _SYSTEM
+            return self._via_llm(base_url, model, transcript, call, system)
         except Exception as exc:  # pragma: no cover - model/network failure
             print(f"[summarize] LLM summary failed, falling back: {exc!r}", flush=True)
             return self._fallback(turns)
 
-    def _via_llm(self, base_url: str, model: str, transcript: str, call: dict) -> dict:
+    def _via_llm(self, base_url: str, model: str, transcript: str, call: dict, system: str = _SYSTEM) -> dict:
         payload = {
             "model": model,
             "messages": [
-                {"role": "system", "content": _SYSTEM},
+                {"role": "system", "content": system},
                 {
                     "role": "user",
                     "content": f"通话对象：{call.get('object_id','')}\n对话：\n{transcript}",

@@ -22,9 +22,12 @@ Qwen3-ASR(源语言钉死) + 翻译 LLM(Hy-MT2 MT 小模型 :1236 逐句无状�
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import re
+import time
+from collections import deque
 
 
 def _norm_lang(raw: str, default: str = "zh") -> str:
@@ -67,6 +70,57 @@ def _translation_instructions(src: str, tgt: str, glossary: str = "") -> str:
             "數字/單號逐個讀寫漢字(7890→七八九零),可自然夾英文詞。"
         )
     return "\n".join(lines)
+
+
+# MiniMax 2.8 系语气词标记(官方文档 2026-09-16 核实:仅 speech-2.8-hd/2.8-turbo
+# 支持;非 2.8 模型会把标记当文本念出来——所以有 _voice_tags_supported 门控)。
+_VOICE_TAG_RE = re.compile(
+    r"\((?:laughs|chuckle|coughs?|clear-throat|groans|breath|pant|inhale|exhale|gasps?|"
+    r"sniffs|sighs?|snorts|burps|lip-smacking|humming|hissing|emm|sneezes)\)",
+    re.IGNORECASE,
+)
+# 引导词→标记:Hy-MT2 会把源文语气词照词翻译(Hahaha/Coughs/Ah),MiniMax 2.8
+# 对这些词只会「念字」;say 前换成括号标记,合成层才出真声(笑/咳/叹)。
+_VOICE_TAG_LEAD_RE = re.compile(
+    r"^\s*((?:(?:ha){2,}|(?:he)+|lol|coughs?|ahem|sighs?|alas)\b)[,;:!.\s]*",
+    re.IGNORECASE,
+)
+
+
+def _voice_tags_supported(model: str) -> bool:
+    """语气词标记仅 2.8 系合成模型支持(纯函数,单测直喂)。"""
+    return "2.8" in (model or "")
+
+
+def _apply_voice_tags(text: str) -> str:
+    """句首语气引导词 → MiniMax 2.8 语气标记(纯函数,单测直喂)。
+
+    Hy-MT2 实测会照词翻译语气(Hahaha/Coughs/…),念出来是假人念稿;换成括号
+    标记后 2.8 合成层出真声。只动句首(位置最稳),不认识的中性句原样返回。"""
+    m = _VOICE_TAG_LEAD_RE.match(text)
+    if not m:
+        return text
+    word = m.group(1).lower()
+    if word.startswith("hah") or word == "lol":
+        tag = "(laughs)"
+    elif word.startswith("heh"):
+        tag = "(chuckle)"
+    elif word.startswith(("cough", "ahem")):
+        tag = "(coughs)"
+    elif word.startswith(("sigh", "alas")):
+        tag = "(sighs)"
+    else:
+        return text
+    rest = text[m.end():].lstrip()
+    return f"{tag} {rest}" if rest else tag
+
+
+def _strip_voice_tags(text: str) -> str:
+    """剥语气词标记(字幕/落库口径):标记只属合成层,不该出现在读者面前。
+    剥后把标点前的悬挂空格收掉(「morning (laughs),」→「morning,」)。"""
+    cleaned = _VOICE_TAG_RE.sub("", text)
+    cleaned = re.sub(r"\s+([,!?;:.，。？！；：、])", r"\1", cleaned)
+    return re.sub(r"\s{2,}", " ", cleaned).strip()
 
 
 # 术语表分隔符:中英逗号/顿号/分号/换行都收(与 A 线 hotwords 字段同口径)。
@@ -120,12 +174,17 @@ def glossary_source_terms(pairs) -> str:
 def _turn_handling_opts() -> dict:
     """B 线 turn_handling 组装(纯函数,单测喂 env 断言;与 A 线同一对 env 单源)。
 
-    2026-09-16 P0 句级出稿:turn_detection 默认 stt + 句级提交(QWEN3_ASR_SENTENCE_COMMIT
-    默认 1,见 bok._interp_env)——STT 说话中按句 FINAL+EOS 成轮,翻译+TTS 与源语音
-    重叠,同传粒度从「停嘴整段」提前到句级。函数体 import agent.py 拿单源实现
-    (kill-switch 配对:TURN_DETECTION≠stt → 句级 FINAL 熄火 + endpointing min_delay
-    自动回 ≥0.35 地板),B 线不复制这份逻辑。打断默认关(同传语义:源说话人续讲
-    ≠抢话,见 interruption 块注释;BOK_INTERP_INTERRUPT=1 实验档恢复)。"""
+    2026-09-16 P2 定案:框架模式 **manual**——STT 句级 FINAL 不再走框架自动回复,
+    由 worker 的 `user_input_transcribed(is_final=True)` 监听自驱 MT→`session.say()`
+    队列。理由(实弹 probe_interp_backlog 实证):框架对「播报中到达的新用户轮」
+    只有两条路——打断(current_speech.allow_interruptions=True,整轮取消生成中/
+    播报中的译文)或**整轮丢弃**(=False,agent_activity「skipping reply to user
+    input, current speech generation cannot be interrupted」,连原文落库都没有;
+    低门槛压测 8 句只落 5 句)。两条都唔係译员行为;manual 零丢弃零打断,句子
+    进 say 队列串行播,背压归 _PlaybackBacklog 管。kill-switch 配对不变:
+    TURN_DETECTION≠stt → 不设 turn_detection(框架回 EOT)+ 插件句级 FINAL 熄火,
+    旧行为原样回退。打断恒关(BOK_INTERP_INTERRUPT=1 也不该开——manual 下无
+    自动回复可打断,仅余 VAD 音频打断译文的实验危害)。"""
     from .agent import _endpointing_delays_from_env, _turn_detection_mode_from_env
 
     mode = _turn_detection_mode_from_env()
@@ -134,22 +193,63 @@ def _turn_handling_opts() -> dict:
         "endpointing": {"mode": "dynamic", "min_delay": min_delay, "max_delay": max_delay},
         "preemptive_generation": _preemptive_generation_opts(),
         "interruption": {
-            # 同传语义(2026-09-16 E2E 实证 call-b79e1f1b):源说话人继续讲≠抢话——
-            # 句级提交后译文在途时源语音续讲,框架按「用户插话」打断会整轮取消
-            # 生成中/播报中的译文(fwd 译文被吞,I1/I5 FAIL 根因)。译员不可能被
-            # 源说话人打断,后续句排队接续播。BOK_INTERP_INTERRUPT=1 显式恢复
-            # A 线打断语义(实验档,勿在生产开)。
-            "enabled": os.environ.get("BOK_INTERP_INTERRUPT", "0") == "1",
+            # 同传语义:manual 模式下框架不再自动回复,此开关只余「音频活动打断
+            # 译文」一条路,恒关。字段保留为显式声明+防未来框架行为变化。
+            "enabled": False,
             "min_duration": float(os.environ.get("INTERRUPT_MIN_DURATION", "0.6")),
             "min_words": 0,
             "resume_false_interruption": os.environ.get("RESUME_FALSE_INTERRUPTION", "1") == "1",
             "false_interruption_timeout": float(os.environ.get("FALSE_INTERRUPTION_TIMEOUT", "1.0")),
         },
     }
-    if mode:
-        # 唔设 key = 框架默认(EOT 模型),kill-switch 档原样回退,唔整 None 别名分支。
-        opts["turn_detection"] = mode
+    if mode == "stt":
+        # 与 sentence_commit_enabled 同判:TURN_DETECTION=stt(默认)→ B 线走
+        # manual 自驱管线;其余值(vad/""→EOT)整族回退框架自动回复旧档——
+        # 插件句级 FINAL 同源熄火,不可能出现「manual 模式吃不到句子 FINAL」
+        # 的错配(kill-switch 一对 env 同进同退)。
+        opts["turn_detection"] = "manual"
     return opts
+
+
+def _build_mt_context(instructions: str, pairs, text: str):
+    """单句翻译用 ChatContext(纯函数,单测直喂):instructions(系统)+滚动「源→译」
+    对(旧→新)+当前句(user)。StatelessMTLLM 只读最后一条 user(模板无状态),
+    滚动对由 _rolling_pairs 现场重抽做参考块;回退通用 LLM 路径则把 instructions
+    与对历史当真实上下文翻译。"""
+    from livekit.agents import llm as lk_llm
+
+    ctx = lk_llm.ChatContext()
+    if instructions:
+        ctx.add_message(role="system", content=[instructions])
+    for src_t, tgt_t in pairs:
+        ctx.add_message(role="user", content=[src_t])
+        ctx.add_message(role="assistant", content=[tgt_t])
+    ctx.add_message(role="user", content=[text])
+    return ctx
+
+
+async def _mt_once(llm_provider, ctx, *, timeout_s: float = 15.0) -> str:
+    """单句直调翻译 LLM(StatelessMTLLM/通用 LLM 同一入口),超时保护防句堆积。
+
+    conn_options 必显式给——插件内芯直接读 conn_options.max_retry,session 托管
+    调用才有默认值,直调传 None 会 AttributeError(max_retry of None)。直调档
+    单次尝试不重试:重试是延迟放大器,积压由背压门槛管。"""
+    from livekit.agents import APIConnectOptions
+
+    stream = llm_provider.chat(chat_ctx=ctx, conn_options=APIConnectOptions(max_retry=1))
+    if inspect.isawaitable(stream):
+        stream = await stream
+    parts: list[str] = []
+
+    async def _drain() -> None:
+        async for chunk in stream:
+            delta = getattr(chunk, "delta", None)
+            content = getattr(delta, "content", None) if delta is not None else None
+            if content:
+                parts.append(content)
+
+    await asyncio.wait_for(_drain(), timeout=timeout_s)
+    return "".join(parts).strip()
 
 
 def _sidecar_url(cfg_value: str, env_key: str, default: str) -> str:
@@ -202,11 +302,60 @@ def _build_llm_provider(llm_cfg: dict, target_lang: str, glossary: str = ""):
     )
 
 
-def _build_tts_provider(tts_cfg: dict, target_lang: str):
+# 与 A 线 agent.py _MINIMAX_LOCAL_VOICES 同源（复制不 import：agent 模块装配重，
+# interpret 单测要保持轻导入）。设置页/同传页误配本地 Qwen3 音色（预设 9 个 +
+# 克隆 agent-*/acceptance-*）发给云端 MiniMax 会 2054 voice not exist，逐句 beep。
+_MINIMAX_LOCAL_VOICES = frozenset({
+    "serena", "vivian", "uncle_fu", "ryan", "aiden", "ono_anna", "sohee", "eric", "dylan",
+})
+_MINIMAX_LOCAL_PREFIXES = ("agent-", "acceptance-")
+
+
+def _cloud_voice(vid: str) -> str:
+    """云端 MiniMax 可用音色过滤（纯函数，单测直喂）：本地 Qwen3 音色返回空串，
+    有效云端音色原样返回（trim 后）。"""
+    raw = (vid or "").strip()
+    base = raw.lower()
+    if not base:
+        return ""
+    if base in _MINIMAX_LOCAL_VOICES or base.startswith(_MINIMAX_LOCAL_PREFIXES):
+        return ""
+    return raw
+
+
+def _parse_session_voices(raw) -> dict:
+    """会话级音色 map 解析（纯函数，单测直喂）：同传页建单 voices_json 经 CP
+    dispatch metadata 下发，`{"zh": "voice_id", ...}` → 归一 {lang: voice_id}。
+
+    坏 JSON / 形状不对 / 空值 / 未知语言键 → 丢弃 + 日志，返回空 dict——配置
+    错误绝不能打死通话，全链回落设置三键 > 硬编码默认。键经 _norm_lang 归一
+    成 zh/cantonese/en 三态。"""
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[interp] session voices parse failed: {exc!r} — ignore", flush=True)
+        return {}
+    if not isinstance(data, dict):
+        print(f"[interp] session voices not an object: {type(data).__name__} — ignore", flush=True)
+        return {}
+    voices: dict = {}
+    for key, val in data.items():
+        lang = _norm_lang(str(key), default="")
+        vid = str(val or "").strip()
+        if lang and vid:
+            voices[lang] = vid
+    return voices
+
+
+def _build_tts_provider(tts_cfg: dict, target_lang: str, session_voices=None):
     """组装 B 线 TTS:settings 指定 minimax → 云端 MiniMax;否则本地 Qwen3-TTS 兜底。
 
     音色锁口音——粤语音色读普/英自然,普通话音色读粤文变广普,故按 target_lang
-    三键换音色;B 线默认 turbo 档(agent 场景 <250ms、$60/M),A 线仍 2.8-hd。
+    三键换音色;音色优先级=会话级(同传页建单选定,session_voices)>设置页三键>
+    硬编码默认。B 线默认 turbo 档(agent 场景 <250ms、$60/M),A 线仍 2.8-hd。
     """
     from .providers.livekit_plugins import LanguageState, MiniMaxTTS, Qwen3TTSTTS
 
@@ -214,30 +363,41 @@ def _build_tts_provider(tts_cfg: dict, target_lang: str):
     tts_ls.lang = target_lang
     provider = (tts_cfg.get("provider") or "qwen3_tts").lower()
     if provider in ("minimax", "minimax_streaming"):
+        # 防御与 A 线 agent.py 同源:设置页误选本地 Qwen3 音色发给云端会 2054。
         keymap = {"zh": "speaker_zh", "cantonese": "speaker_cantonese", "en": "speaker_en"}
-        # 防御与 A 线 agent.py 同源:设置页误选本地 Qwen3 音色(预设 9 个 + 克隆
-        # agent-*/acceptance-*)发给云端 MiniMax 会 2054 voice not exist,逐句 beep。
-        local_qwen3 = {
-            "serena", "vivian", "uncle_fu", "ryan", "aiden", "ono_anna", "sohee", "eric", "dylan",
-        }
         voice_map = {}
         for lang, key in keymap.items():
-            vid = str(tts_cfg.get(key) or "").strip()
-            base = vid.lower()
-            if not base:
+            vid = _cloud_voice(str(tts_cfg.get(key) or ""))
+            if vid:
+                voice_map[lang] = vid
+        # 会话级音色最优先,覆盖设置三键;误配本地音色同样过滤 → 回落设置/默认。
+        if isinstance(session_voices, str):
+            session_voices = _parse_session_voices(session_voices)
+        for lang_raw, vid_raw in (session_voices or {}).items():
+            lang = _norm_lang(str(lang_raw), default="")
+            if not lang:
                 continue
-            if base in local_qwen3 or base.startswith(("agent-", "acceptance-")):
-                print(f"[interp] minimax skip local qwen3 voice {vid!r} for {lang}", flush=True)
+            vid = str(vid_raw or "").strip()
+            cloud = _cloud_voice(vid)
+            if not cloud:
+                if vid:
+                    print(f"[interp] minimax skip local qwen3 session voice {vid!r} for {lang}", flush=True)
                 continue
-            voice_map[lang] = vid
-        # 设置页没配/被过滤掉的分语言音色用验证过的默认(各语种母语音色,口音不串)。
+            if voice_map.get(lang) != cloud:
+                print(f"[interp] session voice {lang}: {voice_map.get(lang) or '(default)'} -> {cloud}", flush=True)
+            voice_map[lang] = cloud
+        # 设置页/会话级都没配的分语言音色用验证过的默认(各语种母语音色,口音不串)。
         voice_map.setdefault("zh", "Chinese (Mandarin)_News_Anchor")
         voice_map.setdefault("cantonese", "Cantonese_crisp_news_anchor_vv2")
         # EN 默认音色 2026-09-07 换:旧 male_english_speaker 已被 MiniMax 下线
         # （每轮 2054 voice id not exist → 目标侧整轮静音,B 线 E2E 实证）,
         # 换成 minimax-voices.ts 里 preview 验证过的 English_magnetic_voiced_man。
         voice_map.setdefault("en", "English_magnetic_voiced_man")
-        os.environ.setdefault("MINIMAX_MODEL", "speech-2.6-turbo")
+        # B 线默认 2026-09-16 起 2.8-turbo(原 2.6-turbo):语气词标记 (laughs)/
+        # (coughs)/(sighs) 仅 2.8 系支持——真人感需求拍板上 2.8,实测代价 ~0.2s
+        # 感知 lag(2532→2721ms,预算 3500 内);要快可 MINIMAX_MODEL=speech-2.6-
+        # turbo 回退(标记自动熄火)或 BOK_INTERP_VOICE_TAGS=0 只关标记。
+        os.environ.setdefault("MINIMAX_MODEL", "speech-2.8-turbo")
         # language_boost 锁目标语,防源语音夹词时合成语种漂移;值是 MiniMax API
         # 的外部枚举字面量(术语门禁白名单单点),唔系语言字段命名。
         boost_map = {"zh": "Chinese", "cantonese": "Chinese,Yue", "en": "English"}
@@ -296,17 +456,113 @@ def _direction_audio_enabled(speaker_role: str) -> bool:
     return os.environ.get("BOK_INTERP_REV_AUDIO", "0") == "1"
 
 
-def _mark_session_report(report: dict, speaker_role: str) -> dict:
-    """SessionReport 打 reporter 标记（纯函数，单测钉住）。
+def _session_report_payload(report_dict: dict) -> dict:
+    """SessionReport dict + 来源 worker 标识(纯函数,单测直喂)。
 
-    fwd/rev 双 worker 同 call 各自上报 SessionReport，CP 按 reporter 标记把兄弟
-    报告幂等合并进已存 blob（2026-09-18 缓项收编）——不打标记会撞「ended 且已有
-    report」的幽灵覆盖闸 409 被当失败丢弃，双语纪要静默缺半边。标记恒非空：
-    CP 以非空标记作为合并门槛；同标记重复（幽灵重派同 worker 线）仍维持 409。
+    P1-A(2026-09-17 全量 debug):fwd/rev 双 worker 共享同一 call_id、各自产一份
+    真实 usage 的 SessionReport,后收尾者曾撞 CP ghost guard 409(报告静默丢失,
+    interp-fwd.log 2026-09-16 call-c7a63c17 实证)。CP 端按 worker 维度收多份,
+    body 带 worker 字段区分来源;不带 worker 的旧格式(A 线 _close)走原单报告
+    ghost guard 语义,行为不变。深拷贝入 payload,绝不 mutate caller 的 dict。
     """
-    payload = dict(report or {})
-    payload["reporter"] = f"interp-{speaker_role or 'unknown'}"
+    payload = dict(report_dict)
+    payload["worker"] = f"bok-interp-{os.environ.get('INTERP_DIRECTION', 'fwd')}"
     return payload
+
+
+def _spawn_pooled_task(coro, pool: set, err_tag: str) -> None:
+    """fire-and-forget 但入池(2026-09-17 全量 debug P2-A 的通用机制,单测直喂)。
+
+    事件循环对 task 只持弱引用,GC 中途回收=任务静默丢失(B 线纪要账本行丢失
+    不可补)。入强引用池 + done-callback 自清(防池无界增长)+ 失败打点 err_tag;
+    纯引用+打点,不补重试、不改异常语义。镜像 A 线 agent.py `_spawn_report`。
+    """
+    task = asyncio.create_task(coro)
+    pool.add(task)
+
+    def _done(t: asyncio.Task) -> None:
+        pool.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            print(f"{err_tag} {t.exception()!r}", flush=True)
+
+    task.add_done_callback(_done)
+
+
+def _estimate_speech_seconds(text: str, target_lang: str) -> float:
+    """粗估译文播报时长(秒,纯函数,单测直喂)。
+
+    zh/cantonese 按字(去标点;MiniMax speed 1.2 ≈ 5 字/秒),en 按词(≈2.6 词/秒)。
+    估算只喂背压门槛不求精确;非空地板 0.8s(TTS 起播+段间开销)。"""
+    if not text:
+        return 0.0
+    if target_lang == "en":
+        return max(0.8, len(text.split()) / 2.6)
+    stripped = "".join(ch for ch in text if ch.isalnum())
+    return max(0.8, len(stripped) / 5.0)
+
+
+class _PlaybackBacklog:
+    """译文播放背压——v1 PlaybackScheduler 的 maxBacklogMs 门移植(2026-09-16 P2)。
+
+    句级提交+打断默认关之后,源语语速 > 译文播报速度时,译文在框架 speech 队列
+    无限堆积,体感 lag 变雪球(字幕早出声、译文越拖越远)。策略=「追最新」
+    (AlignAtt 的 always-attend-latest 哲学,同传译员摘译的工程化形态):估时总量
+    超限时从最旧开始 force 中断**未开播**的译文句;队头(当前播报)与最新一条
+    永不弃——弃音保字,已生成文本的 chat item 照常落库/进字幕。生成中被取消的
+    句=整句摘掉(译员压力下的跳句形态)。
+
+    `BOK_INTERP_BACKLOG=0` 总闸关;`BOK_INTERP_MAX_BACKLOG_S` 调门槛(默认 6s
+    ≈通路 lag 2.5s+一句余量)。只在 speech_created 事件判定——队列只在新建句时
+    增长;interrupt 必须 force=True(会话打断默认关,非 force 会 RuntimeError)。
+    """
+
+    def __init__(self, target_lang: str):
+        self._target_lang = target_lang
+        try:
+            self._max_s = float(os.environ.get("BOK_INTERP_MAX_BACKLOG_S", "6") or 6)
+        except ValueError:
+            self._max_s = 6.0
+        self._pending: list[tuple[object, float]] = []  # [(handle, 估时秒)]
+        self.dropped = 0
+        self.dropped_est_s = 0.0
+
+    @property
+    def enabled(self) -> bool:
+        return os.environ.get("BOK_INTERP_BACKLOG", "1") == "1" and self._max_s > 0
+
+    def _est_of(self, handle) -> float:
+        texts = []
+        for item in getattr(handle, "chat_items", None) or []:
+            t = getattr(item, "text_content", None) or getattr(item, "raw_text_content", "")
+            if t:
+                texts.append(str(t))
+        return _estimate_speech_seconds(" ".join(texts), self._target_lang)
+
+    def on_speech_created(self, handle) -> tuple[int, float, int]:
+        """登记新译文句并按门槛弃旧。返回 (队列深度, 估时总量秒, 本轮弃句数)。"""
+        if not self.enabled:
+            return (0, 0.0, 0)
+        # 1) 清账:已播完/已取消的句出队(text-only 方向句句秒完,队列天然不积)。
+        self._pending = [(h, e) for (h, e) in self._pending if not h.done()]
+        # 2) 估时:chat item 尚未生成的按旧值/地板记,下轮决策自动补准。
+        refreshed = [(h, self._est_of(h) or e) for (h, e) in self._pending]
+        est_new = self._est_of(handle) or 0.8  # 新句此刻多半还没有 chat item
+        refreshed.append((handle, est_new))
+        self._pending = refreshed
+        # 3) 门槛:队头=当前播报永不弃、最新一条永不弃 → 只从 index 1 起弃。
+        total = sum(e for _, e in self._pending)
+        dropped_now = 0
+        while total > self._max_s and len(self._pending) > 2:
+            h, e = self._pending.pop(1)
+            try:
+                h.interrupt(force=True)
+            except RuntimeError:  # 已完成/已取消——账面照扣
+                pass
+            total -= e
+            dropped_now += 1
+            self.dropped += 1
+            self.dropped_est_s += e
+        return len(self._pending), total, dropped_now
 
 
 async def entrypoint(ctx) -> None:
@@ -342,6 +598,9 @@ async def entrypoint(ctx) -> None:
     # 术语槽双路注入,治领域词误听与译名漂移(「无术语表」是 B 线对业界同传的
     # 结构性差距,2026-09-16 调研定案 P0-2)。
     glossary_pairs = parse_glossary(str(meta.get("glossary") or ""))
+    # 会话级音色(可选,同传页建单时我方/对方各选一把):voices_json 随 dispatch
+    # metadata 下发,_build_tts_provider 组 voice_map 时最优先(> 设置三键 > 默认)。
+    session_voices = _parse_session_voices(meta.get("voices"))
     if not listen_identity or not deliver_identity:
         print(
             f"[interp] job metadata missing listen_identity/deliver_identity: {meta!r} — abort",
@@ -397,7 +656,7 @@ async def entrypoint(ctx) -> None:
     asr_ls.lang = source_lang
     # 热词 context:术语表源语词条(用户建单指定,最贴当前场景)。include_industry
     # =False——A 线行业静态词(单号/运单/赔偿…)是快递客服域,B 线通用同传不吃;
-    # 数字主导项丢弃/去重/120 字上限/BOK_ASR_HOTWORDS kill-switch 全部复用单源。
+    # 数字主导项丢弃/去重/200 字上限/BOK_ASR_HOTWORDS kill-switch 全部复用单源。
     from .agent import asr_hotword_context
 
     _asr_hotword_ctx = asr_hotword_context(
@@ -422,11 +681,21 @@ async def entrypoint(ctx) -> None:
     _glossary = glossary_block(glossary_pairs)
     if _glossary:
         print(f"[interp] glossary {len(glossary_pairs)} terms -> asr+mt", flush=True)
+    tts_provider = _build_tts_provider(tts_cfg, target_lang, session_voices)
+    # 语气词标记(2026-09-16 用户拍板):Hy-MT2 会把语气照词翻译(Hahaha/Coughs),
+    # say 前由 _apply_voice_tags 换成 MiniMax 2.8 括号标记——合成层出真声(笑/咳/
+    # 叹),不再是假人念稿。双门控:模型档(仅 2.8 系支持,非 2.8 会把标记念出来)
+    # + env 总闸(BOK_INTERP_VOICE_TAGS=0 关)。标记进 say() 文本,字幕/落库由
+    # _strip_voice_tags(译文行)与前端 stripVoiceTags(字幕)剥掉,只活合成层。
+    tts_model = os.environ.get("MINIMAX_MODEL", "")
+    voice_tags = os.environ.get("BOK_INTERP_VOICE_TAGS", "1") == "1" and _voice_tags_supported(tts_model)
+    if tts_model:
+        print(f"[interp] voice_tags {'on' if voice_tags else 'off'} (tts={tts_model})", flush=True)
     llm_provider = _build_llm_provider(llm_cfg, target_lang, glossary=_glossary)
-    tts_provider = _build_tts_provider(tts_cfg, target_lang)
 
-    # 轮次判定走 _turn_handling_opts(纯函数):默认 turn_detection=stt + 句级提交,
-    # 说话中按句成轮(翻译+TTS 与源语音重叠);kill-switch 配对与 A 线同一对 env。
+    # 轮次判定走 _turn_handling_opts(纯函数):manual 模式 + STT 句级 FINAL 自驱
+    # MT→say 队列(P2 定案,函数注释有框架打断/丢弃两条路的实证);kill-switch
+    # 配对与 A 线同一对 env(TURN_DETECTION≠stt → 回 EOT 整段档)。
     turn_handling = _turn_handling_opts()
     _th = turn_handling
     print(
@@ -435,7 +704,8 @@ async def entrypoint(ctx) -> None:
         f"preemptive={'on' if _th['preemptive_generation']['enabled'] else 'off'} "
         f"max_retries={_th['preemptive_generation']['max_retries']} "
         f"interruption={'on' if _th['interruption']['enabled'] else 'off(同传语义)'} "
-        f"turn_detection={_th.get('turn_detection') or 'default(EOT kill-switch)'}",
+        f"turn_detection={_th.get('turn_detection') or 'default(EOT kill-switch)'}"
+        f"{'(STT句final自驱MT→say队列)' if _th.get('turn_detection') == 'manual' else ''}",
         flush=True,
     )
     session = AgentSession(
@@ -450,17 +720,6 @@ async def entrypoint(ctx) -> None:
     # 无 language 标签、译文延迟无从查)。译文行带 latency;原文行即时落,
     # 译文后到再落——总结/蒸馏按序读仍是对照文本(language 字段区分)。
     last_user = {"text": ""}
-    _turn_metrics: dict = {}
-
-    def _capture_metrics(ev) -> None:
-        m = getattr(ev, "metrics", None)
-        if getattr(m, "type", "") == "llm_metrics":
-            try:
-                _turn_metrics["llm_ttft_ms"] = int(m.ttft * 1000)
-            except Exception:  # pragma: no cover
-                pass
-
-    session.on("metrics_collected", _capture_metrics)
 
     async def _add_turn(text: str, language: str, latency: int = 0) -> None:
         try:
@@ -471,6 +730,26 @@ async def entrypoint(ctx) -> None:
         except Exception as exc:  # pragma: no cover - 落库失败不阻翻译
             print(f"[interp] add_turn failed: {exc!r}", flush=True)
 
+    # 在途账本任务强引用池(2026-09-17 全量 debug P2-A):GC 中途回收=原文/译文
+    # 行静默缺行——B 线纪要账本行丢失不可补,池化首选。机制在模块级
+    # _spawn_pooled_task(单测直喂),此处只是入口点作用域的薄包装。
+    _ledger_tasks: set = set()
+
+    def _spawn_ledger(coro) -> None:
+        _spawn_pooled_task(coro, _ledger_tasks, "LEDGER_TASK_ERR")
+
+    # —— 同传主链(P2 manual 架构):STT 句 final 自驱 MT → session.say() 队列 ——
+    # 框架 turn_detection=manual:不再自动回复。框架对「播报中到达的新用户轮」
+    # 只有两条路——打断在途译文(allow_interruptions=True)或整轮丢弃(=False,
+    # 连原文落库都没有;probe_interp_backlog 实弹 8 句只落 5 句),两条都唔係
+    # 译员行为。manual 下句子经 user_input_transcribed(is_final) 进本 worker 的
+    # 单消费队列,MT 完一条 say 一条:say 队列串行播,MT 与播报流水线重叠,
+    # 积压由 _PlaybackBacklog 门槛追最新弃旧。
+    _llm_instructions = _translation_instructions(source_lang, target_lang, _glossary)
+    _mt_pairs: deque = deque(maxlen=8)  # (源,译) 滚动对——_rolling_pairs 的参考料
+    _mt_latency = {"ms": 0}
+    _src_q: asyncio.Queue = asyncio.Queue(maxsize=48)
+
     def _on_item(ev) -> None:
         item = getattr(ev, "item", None)
         role = getattr(item, "role", None)
@@ -478,19 +757,97 @@ async def entrypoint(ctx) -> None:
         if not text:
             return
         if role == "user":
+            # manual 模式用户轮不进 chat ctx(原文行由 _on_user_input 即时落);
+            # 此分支只兜收线 drain 的残余 user item,不再落库防重复行。
             last_user["text"] = text
-            asyncio.create_task(_add_turn(f"原文：{text}", source_lang))
         elif role == "assistant":
-            latency = int(_turn_metrics.get("llm_ttft_ms") or 0)
-            asyncio.create_task(_add_turn(f"译文：{text}", target_lang, latency))
+            latency = int(_mt_latency.get("ms") or 0)
+            _spawn_ledger(_add_turn(f"译文：{_strip_voice_tags(text)}", target_lang, latency))
 
     session.on("conversation_item_added", _on_item)
 
+    async def _mt_say_worker() -> None:
+        # 单消费 FIFO:句序=翻译序=播报序。MT 下一句时上一句照播(流水线重叠)。
+        while True:
+            text = await _src_q.get()
+            try:
+                t0 = time.perf_counter()
+                ctx = _build_mt_context(_llm_instructions, list(_mt_pairs), text)
+                translated = await _mt_once(llm_provider, ctx)
+                _mt_latency["ms"] = int((time.perf_counter() - t0) * 1000)
+                if translated:
+                    _mt_pairs.append((text, translated))
+                    session.say(_apply_voice_tags(translated) if voice_tags else translated)
+                else:
+                    print(f"[interp] mt empty for {len(text)} chars, skipped", flush=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # 单句失败不阻后续
+                print(f"[interp] mt/say failed: {exc!r}", flush=True)
+            finally:
+                _src_q.task_done()
+
+    _mt_worker = asyncio.create_task(_mt_say_worker())
+
+    def _on_user_input(ev) -> None:
+        # STT 句级 FINAL 是 manual 模式下唯一句子入口(interim/空串过滤);
+        # 原文行即时落库,翻译进单消费队列。
+        if not getattr(ev, "is_final", False):
+            return
+        text = str(getattr(ev, "transcript", "") or "").strip()
+        if not text:
+            return
+        last_user["text"] = text
+        _spawn_ledger(_add_turn(f"原文：{text}", source_lang))
+        try:
+            _src_q.put_nowait(text)
+        except asyncio.QueueFull:  # 48 句积压=极端场景,摘最新句防雪崩
+            print("[interp] source queue overflow, sentence dropped(摘译)", flush=True)
+
+    session.on("user_input_transcribed", _on_user_input)
+
+    # 译文播放背压(P2):manual 之下译文堆在 say 队列——超门槛从最旧弃起
+    # (已生成文本照常进字幕/落库,只弃音)。text-only 方向句句秒完播,队列
+    # 天然不积,同一钩子零害。
+    backlog = _PlaybackBacklog(target_lang)
+    if backlog.enabled:
+        print(f"[interp] backlog gate={backlog._max_s:g}s (追最新弃音保字)", flush=True)
+
+    def _on_speech_created(ev) -> None:
+        handle = getattr(ev, "speech_handle", None)
+        if handle is None or not backlog.enabled:
+            return
+        depth, est_s, dropped = backlog.on_speech_created(handle)
+        if dropped or depth > 1:
+            print(
+                f"[interp] INTERP_BACKLOG depth={depth} est_ms={int(est_s * 1000)} "
+                f"drop={dropped} total_dropped={backlog.dropped}",
+                flush=True,
+            )
+
+    session.on("speech_created", _on_speech_created)
+
     # 房间断开 → SessionReport(真实 usage) + settle(总结/知识蒸馏/vault,服务端幂等;失败不阻塞退出)。
     async def _shutdown() -> None:
+        _mt_worker.cancel()  # 排空 MT 消费协程(挂队列 get 上,不 cancel 会泄漏到下个 job)
+        try:
+            await _mt_worker
+        except (asyncio.CancelledError, Exception):
+            pass
+        # 在途账本行先落地再报告/结算(镜像 A 线 _close 的 _report_tasks gather):
+        # job teardown 会把裸任务杀掉——原文/译文行丢失不可补。短超时防收尾卡死。
+        if _ledger_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*list(_ledger_tasks), return_exceptions=True), timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                pass
         try:
             report = ctx.make_session_report(session)
-            await cp.post_session_report(call_id, _mark_session_report(report.to_dict(), speaker_role))
+            # P1-A(2026-09-17):body 带 worker 来源标识,CP 按方向维度收多份报告
+            # (见 _session_report_payload 注释)。
+            await cp.post_session_report(call_id, _session_report_payload(report.to_dict()))
         except Exception as exc:
             print(f"[interp] session report failed: {exc!r}", flush=True)
         try:

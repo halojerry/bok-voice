@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { applyOutputDevice, savedMicDevice, savedOutputDevice } from "@/lib/audio";
+import { savedMicDevice } from "@/lib/audio";
 
 const WS_URL = process.env.NEXT_PUBLIC_TRANSLATION_WS_URL || "ws://127.0.0.1:8790";
 const LANGS = [
@@ -140,9 +140,7 @@ export default function TranslatePage() {
   }
 
   async function startCapture(channelId: string) {
-    // 输出跟随用户在设置里选的设备（桌面壳切系统默认输出 / Chromium setSinkId）。
-    const outId = savedOutputDevice();
-    if (outId) applyOutputDevice(outId).catch(() => {});
+    // 输出跟随系统默认（legacy v1 页：无元素级 sink 路由，设备选择只作用于 A 线/一体台）。
     const micId = savedMicDevice();
     const audioConstraints: MediaTrackConstraints = { channelCount: 1 };
     // 非 exact：保存的麦克风失效/已插拔时回退系统默认，避免 getUserMedia reject。

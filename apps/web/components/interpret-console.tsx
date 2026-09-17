@@ -54,7 +54,6 @@ import {
   savedOutputDevice,
   saveMicDevice,
   saveOutputDevice,
-  switchWebOutputDevice,
   webCanSwitchOutput,
   type AudioDeviceInfo,
 } from "@/lib/audio";
@@ -346,30 +345,22 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
     };
   }, []);
   const onVoiceActivity = useCallback((meActive: boolean, othActive: boolean) => {
+    // 全双工档(halfDuplex=关,戴耳机)下仲裁一并熄火:物理隔离后串音不存在,
+    // 让麦只会白白掐掉同时说话的一边。外放同桌必须开(串译死循环的闸)。
+    if (!halfDuplexRef.current) {
+      setVoiceHoldMe(false);
+      setVoiceHoldOth(false);
+      return;
+    }
     setVoiceHoldMe(othActive && !meActive);
     setVoiceHoldOth(meActive && !othActive);
   }, []);
 
-  // ---- 输出路由应用(2026-09-12 双输出「译文全进我方扬声器」排查后统一入口) ----
-  // 实证:room 级 switchActiveDevice 的 ok:true 只代表「没抛异常」——元素级
-  // setSinkId 失败被 livekit 吞进浏览器 console,wlog/UI 全盲;「没 id」更是静默
-  // return 连日志都没有。连接时/选择器/重投 effect 全走这里,无静默路径。
-  const applyDualOutput = useCallback(
-    async (
-      room: { switchActiveDevice: (kind: string, id: string, exact?: boolean) => Promise<boolean> } | null,
-      id: string,
-      who: string,
-    ) => {
-      if (!room || !id) {
-        wlog("sink_apply", { who, id: id ? id.slice(0, 12) : null, ok: false, reason: !room ? "no_room" : "no_id" });
-        return;
-      }
-      const ok = await switchWebOutputDevice(room, id).catch(() => false);
-      wlog("sink_apply", { who, id: id.slice(0, 12), ok });
-      if (!ok) setError(`无法把${who}的译文路由到所选扬声器（setSinkId 失败）——请换一台输出设备或改用共享扬声器。`);
-    },
-    [],
-  );
+  // ---- 输出路由(2026-09-17 收口) ----
+  // 元素级 setSinkId 对 WebRTC 远端流静默失效(crbug 40647375,本仓 09-12 实证)
+  // ——room.switchActiveDevice 那条 applyDualOutput 死路径已删:选设备即刻直投
+  // createAudioRouter(真实放音),失败经 onSinkError 浮 UI,不再有「ok:true 但
+  // 声音走默认输出」的假成功。
   // 远端放音路由(2026-09-12 终版,crbug 40647375):element.setSinkId 对 WebRTC
   // 远端流静默失效——读回 match:true 但声音仍走默认输出,这就是「只有一个扬声器
   // 响」的真身;本机 Chrome 实验同时证明 AudioContext.setSinkId 物理路由可用
@@ -378,7 +369,15 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   // ctx.setSinkId(Chrome 110+)。
   const routersRef = useRef<{ me: ReturnType<typeof createAudioRouter> | null; oth: ReturnType<typeof createAudioRouter> | null }>({ me: null, oth: null });
   const getRouter = useCallback((who: "me" | "oth") => {
-    if (!routersRef.current[who]) routersRef.current[who] = createAudioRouter(who);
+    if (!routersRef.current[who])
+      routersRef.current[who] = createAudioRouter(who, (id, err) => {
+        const unsupported = err instanceof Error && /unsupported/i.test(err.message);
+        setError(
+          unsupported
+            ? `当前内核不支持音频输出路由（ctx.setSinkId 需 Chromium 110+；桌面壳请在系统声音设置切换默认输出）——「${who === "me" ? "我方" : "对方"}」声音走的是系统默认设备。`
+            : `「${who === "me" ? "我方" : "对方"}」译文无法路由到所选输出设备（${id.slice(0, 12)}）——请重选扬声器或切回共享扬声器。`,
+        );
+      });
     return routersRef.current[who]!;
   }, []);
   // AudioContext 受自动播放策略管:手势前 suspended,任意点击唤醒两路放音。
@@ -465,11 +464,9 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
             setError("无法开启我方麦克风：请检查浏览器麦克风权限——已连接,但同传听不到我方说话。");
           }
         }
-        // 共享扬声器(默认)不碰输出路由;独立双输出才 setSinkId(统一走
-        // applyDualOutput——没 id 也落日志,不再静默走系统默认)。
-        if (outputModeRef.current === "dual") {
-          await applyDualOutput(meRoom, outId, "我方");
-        }
+        // 输出路由:连接后的初投由 ctx_sink effect(meConnected 入 deps)直投
+        // router,这里不再走已删的死路径。outId 仅留存状态供 effect 读取。
+        void outId;
       } catch (e) {
         // session.start 内部 token/连房与麦克风并行:麦克风失败时房间可能仍连上。
         const raw = e instanceof Error ? e.message : String(e ?? "");
@@ -511,12 +508,29 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
 
   // 我方侧「对方原声」放音(2026-09-12 终版):对方麦轨订阅即接入 me 路放音
   // AudioContext(输出设备由 ctx_sink effect 管理)。监听挂载晚于订阅时补扫在房轨。
+  // 2026-09-16 用户拍板做成开关:关=纯字幕同传(对方麦轨不进 me 路放音,译文
+  // 照常),开=像直接通话。持久化 localStorage,进房读回。
+  const [hearOrig, setHearOrigState] = useState(() => {
+    try {
+      return localStorage.getItem("bok_interp_hear_orig") !== "0";
+    } catch {
+      return true;
+    }
+  });
+  const setHearOrig = useCallback((v: boolean) => {
+    setHearOrigState(v);
+    try {
+      localStorage.setItem("bok_interp_hear_orig", v ? "1" : "0");
+    } catch {
+      /* 隐私模式等场景持久化失败不阻功能 */
+    }
+  }, []);
   useEffect(() => {
     if (!meConnected) return;
     const want = (track: RemoteTrack, participant: RemoteParticipant) =>
       track.kind === "audio" && participant.identity === `other-${callId}`;
     const onSub = (track: RemoteTrack, _pub: RemoteTrackPublication, participant: RemoteParticipant) => {
-      if (!want(track, participant)) return;
+      if (!hearOrig || !want(track, participant)) return;
       wlog("orig_elem", { route: "ctx", out: (meOutIdRef.current || savedOutputDevice("me") || "default").slice(0, 12) });
       getRouter("me").add(track.sid, track.mediaStreamTrack);
     };
@@ -525,7 +539,9 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
     meRoom.on(RoomEvent.TrackUnsubscribed, onUnsub);
     for (const p of meRoom.remoteParticipants.values()) {
       for (const pub of p.trackPublications.values()) {
-        if (pub.track && want(pub.track as RemoteTrack, p)) getRouter("me").add(pub.track.sid, pub.track.mediaStreamTrack);
+        if (!pub.track || !want(pub.track as RemoteTrack, p)) continue;
+        if (hearOrig) getRouter("me").add(pub.track.sid, pub.track.mediaStreamTrack);
+        else getRouter("me").remove(pub.track.sid); // 关=摘掉在播原声
       }
     }
     return () => {
@@ -533,7 +549,7 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
       meRoom.off(RoomEvent.TrackUnsubscribed, onUnsub);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [meRoom, meConnected, callId]);
+  }, [meRoom, meConnected, callId, hearOrig]);
 
   // ---- 对象连接(纯手动 Room:麦克风收音 + 译文放音) ----
   useEffect(() => {
@@ -580,11 +596,8 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
           return;
         }
         await room.localParticipant.setMicrophoneEnabled(othMicOn && interpOnRef.current);
-        // 共享扬声器(默认)不碰输出路由;独立双输出才 setSinkId(统一走
-        // applyDualOutput——没 id 也落日志,不再静默走系统默认)。
-        if (outputModeRef.current === "dual") {
-          await applyDualOutput(room, outId, "对方");
-        }
+        // 输出路由:otherConnected 翻转触发 ctx_sink effect 直投 router(同我方侧)。
+        void outId;
         wlog("other_connected");
         setOtherConnected(true);
         setOtherRoomVersion((v) => v + 1);
@@ -658,9 +671,13 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
     (id: string) => {
       setMeOutId(id);
       saveOutputDevice(id, "me");
-      if (outputModeRef.current === "dual" && meConnected) void applyDualOutput(meRoom, id, "我方");
+      // 真实放音在 AudioContext router(元素级 sink 已被 crbug 40647375 废掉,
+      // 旧 applyDualOutput→room.switchActiveDevice 是证伪死路径,选了等于没选)。
+      // 即刻直投 router,不等 effect 链/连房状态;失败经 onSinkError 浮 UI。
+      // WebKit(Safari/WKWebView)无 ctx.setSinkId → 回退系统默认输出(持久化仅存档)。
+      void getRouter("me").setSink(id || "default");
     },
-    [meSession, meConnected, applyDualOutput],
+    [getRouter],
   );
   const pickOthMic = useCallback(
     (id: string) => {
@@ -678,9 +695,10 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   const pickOthOut = useCallback((id: string) => {
     setOthOutId(id);
     saveOutputDevice(id, "other");
-    const r = otherRoomRef.current;
-    if (outputModeRef.current === "dual" && r) void applyDualOutput(r, id, "对方");
-  }, [applyDualOutput]);
+    // 同 pickMeOut:直投 ctx router(真实放音路径),不走已证伪的元素级死路径。
+    // WebKit 无 ctx.setSinkId → 回退系统默认输出(持久化仅存档)。
+    void getRouter("oth").setSink(id || "default");
+  }, [getRouter]);
 
   // ---- 麦克风开关:按钮只改人工意图,生效值由本 effect 统一投到房间 ----
   // 生效值 = 人工开关 && !自动暂让——暂让结束后按人工意图恢复,人工静音始终优先。
@@ -721,6 +739,8 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   const meMicOnRef = useRef(meMicOn);
   const othMicOnRef = useRef(othMicOn);
   const heldRef = useRef({ me: meHeld, oth: othHeld });
+  // halfDuplex 的 ref 镜像:onVoiceActivity 是 [] 依赖的稳定回调,读 ref 拿当前档。
+  const halfDuplexRef = useRef(halfDuplex);
   const voiceHoldRef = useRef({ me: voiceHoldMe, oth: voiceHoldOth });
   useEffect(() => {
     meMicOnRef.current = meMicOn;
@@ -728,6 +748,9 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
     heldRef.current = { me: meHeld, oth: othHeld };
     voiceHoldRef.current = { me: voiceHoldMe, oth: voiceHoldOth };
   }, [meMicOn, othMicOn, meHeld, othHeld, voiceHoldMe, voiceHoldOth]);
+  useEffect(() => {
+    halfDuplexRef.current = halfDuplex;
+  }, [halfDuplex]);
   useEffect(() => {
     if (!meConnected && !otherConnected) return;
     const tick = () => {
@@ -810,20 +833,8 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [outputMode, canDual, outDevices, meOutId, othOutId]);
-
-  useEffect(() => {
-    if (outputMode !== "dual" || !canDual || !meConnected) return;
-    const id = meOutId || savedOutputDevice("me");
-    if (id) void applyDualOutput(meRoom, id, "我方");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [outputMode, meOutId, meConnected, canDual]);
-  useEffect(() => {
-    const r = otherRoomRef.current;
-    if (outputMode !== "dual" || !canDual || !otherConnected || !r) return;
-    const id = othOutId || savedOutputDevice("other");
-    if (id) void applyDualOutput(r, id, "对方");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [outputMode, othOutId, otherConnected, canDual]);
+  // (原两个 applyDualOutput 重投 effect 已删——死路径;输出重投统一在
+  // ctx_sink effect:deps 含 meConnected/otherConnected/othOutId/meOutId。)
   // 放音上下文输出路由(ctx_sink)——这是远端音频「真实」的输出去向:双输出两路
   // 各自钉设备,共享档回默认。元素 sink 已被 crbug 40647375 废掉,ctx.setSinkId
   // 才是有效指令;输出热切换/补洞/死 id 自愈后 deps 变化自动重投。
@@ -859,6 +870,8 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
     if (!halfDuplex) {
       setMeHeld(false);
       setOthHeld(false);
+      setVoiceHoldMe(false); // 全双工档:声源仲裁一并熄火(戴耳机物理隔离,无需让麦)
+      setVoiceHoldOth(false);
       return;
     }
     const stopMe = watchTransAudio(meRoom, logHold("me"));
@@ -923,6 +936,8 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
         toggleOthMic={toggleOthMic}
         setHalfDuplex={setHalfDuplex}
         setOutputMode={setOutputMode}
+        hearOrig={hearOrig}
+        setHearOrig={setHearOrig}
         leave={leave}
       />
     </AgentSessionProvider>
@@ -999,6 +1014,9 @@ type LiveProps = {
   toggleOthMic: () => void;
   setHalfDuplex: (v: boolean) => void;
   setOutputMode: (v: "shared" | "dual") => void;
+  /** 听对方原声总开关:开=像直接通话(默认),关=纯字幕同传。 */
+  hearOrig: boolean;
+  setHearOrig: (v: boolean) => void;
   leave: () => void;
 };
 
@@ -1071,9 +1089,70 @@ function ConsoleLive(p: LiveProps) {
     }
   }, [p.setError]);
   const listRef = useRef<HTMLDivElement | null>(null);
-  const [filter, setFilter] = useState<"both" | "me" | "other">("both");
+  // 译员视角(2026-09-16 对齐 Windows 版字幕窗语义):默认只看「对方→我」流
+  // (对方说的 + 我方语译文)——我方说了什么自己知道,译文播给对方听;字幕区
+  // 是给译员读的,不是聊天记录。「我→对方」流与全部仍可切。
+  const [filter, setFilter] = useState<"rev" | "fwd" | "both">("rev");
   const [clearedCount, setClearedCount] = useState(0);
   const items = useMemo(() => transcriptions.slice(-80), [transcriptions]);
+  // 大字幕窗(对齐 Windows 版 SubtitleWindow:scope/字号/追帧;浏览器形态=页内
+  // 浮动置顶面板,可拖动可全屏,投屏场景把主界面藏起来只留字幕)。
+  const [popOpen, setPopOpen] = useState(false);
+  const [popFont, setPopFont] = useState(36);
+  const [popScope, setPopScope] = useState<"rev" | "fwd" | "both">("rev");
+  const [popPos, setPopPos] = useState<{ x: number; y: number } | null>(null);
+  const popRef = useRef<HTMLDivElement | null>(null);
+  const popDragRef = useRef<{ dx: number; dy: number } | null>(null);
+  useEffect(() => {
+    if (!popOpen) return;
+    const move = (e: MouseEvent) => {
+      if (!popDragRef.current) return;
+      setPopPos({ x: e.clientX - popDragRef.current.dx, y: e.clientY - popDragRef.current.dy });
+    };
+    const up = () => {
+      popDragRef.current = null;
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+    return () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+    };
+  }, [popOpen]);
+  const popRows = useMemo(() => {
+    const out: { who: Bubble; text: string }[] = [];
+    for (const t of transcriptions.slice(-60)) {
+      const w = whoIs(t, p.room, p.myLang, p.otherLang);
+      if (popScope !== "both" && w.flow !== popScope) continue;
+      out.push({ who: w, text: stripVoiceTags(String(t.text ?? "")) });
+    }
+    return out.slice(-6); // 追帧:只留最新 6 行,旧的让位
+  }, [transcriptions, p.room, p.myLang, p.otherLang, popScope]);
+  // 逐句翻译延迟(对方→我):原文行到达 → 其后第一条 rev 译文字幕的差值。
+  // 口径注:rev 译文字幕≈MT 完成时刻(纯字幕无音频输出);fwd 译文字幕被
+  // sync_transcription 锚到播报,数值含播报等待,不进均值只看 rev 流。
+  const stampsRef = useRef<number[]>([]);
+  useEffect(() => {
+    const arr = stampsRef.current;
+    while (arr.length < transcriptions.length) arr.push(Date.now());
+  }, [transcriptions]);
+  const revLatency = useMemo(() => {
+    const stamps = stampsRef.current;
+    const last: number[] = [];
+    let anchor = -1;
+    transcriptions.forEach((t, i) => {
+      const w = whoIs(t, p.room, p.myLang, p.otherLang);
+      if (w.kind === "src" && w.flow === "rev") anchor = i;
+      else if (w.kind === "dst" && w.flow === "rev" && anchor >= 0) {
+        last.push(Math.max(0, (stamps[i] ?? 0) - (stamps[anchor] ?? 0)));
+        anchor = -1;
+      }
+    });
+    const recent = last.slice(-8);
+    if (!recent.length) return null;
+    const avg = Math.round(recent.reduce((a, b) => a + b, 0) / recent.length);
+    return { lastMs: recent[recent.length - 1], avgMs: avg };
+  }, [transcriptions, p.room, p.myLang, p.otherLang]);
   // 声源仲裁:两侧「原文转写流」的最近更新时刻=谁在说话;400ms 轮询衰减
   // (1.5s 窗)。AGT 译文(meHeld/othHeld 的 TTS 暂让已覆盖)不算说话。
   const lastSpokeRef = useRef<{ me: number; oth: number }>({ me: 0, oth: 0 });
@@ -1336,6 +1415,11 @@ function ConsoleLive(p: LiveProps) {
               <SessionClock startedAt={p.startedAt} />
             </Stat>
             <Stat label="翻译条数">{dstCount}</Stat>
+            <Stat label="翻译延迟·对方→我">
+              {revLatency
+                ? `${(revLatency.lastMs / 1000).toFixed(1)}s·均${(revLatency.avgMs / 1000).toFixed(1)}s`
+                : "--"}
+            </Stat>
             <Stat label="会话编号">
               <span className="truncate" title={p.callId}>{p.callId}</span>
             </Stat>
@@ -1375,7 +1459,19 @@ function ConsoleLive(p: LiveProps) {
               checked={p.halfDuplex}
               onChange={(e) => p.setHalfDuplex(e.target.checked)}
             />
-            <span>自动半双工:译文播报时暂让对向麦克风,防共享扬声器串译(外放建议开;戴耳机可关)</span>
+            <span>
+              自动半双工与声源仲裁:译文播报或对方说话时暂让对向麦克风,防共享扬声器串译。
+              外放同桌必开;**双人各戴耳机可关=真全双工**(双方边说边译、互不暂让),关后外放会串译死循环
+            </span>
+          </label>
+          <label className="flex items-start gap-2 text-xs leading-relaxed">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={p.hearOrig}
+              onChange={(e) => p.setHearOrig(e.target.checked)}
+            />
+            <span>听对方原声:开=像直接通话(译文叠加在原声上);关=纯字幕同传,只看「对方→我」字幕不出原声</span>
           </label>
           <button className="stage-btn-secondary" onClick={() => setClearedCount(transcriptions.length)}>
             清空字幕
@@ -1393,9 +1489,9 @@ function ConsoleLive(p: LiveProps) {
           <span className="label">一体台 · 双语字幕</span>
           <div className="flex items-center gap-1.5">
             {([
-              ["both", "双方"],
-              ["me", "仅我方"],
-              ["other", "仅对方"],
+              ["rev", "对方→我"],
+              ["fwd", "我→对方"],
+              ["both", "全部"],
             ] as const).map(([v, label]) => (
               <button
                 key={v}
@@ -1409,6 +1505,13 @@ function ConsoleLive(p: LiveProps) {
                 {label}
               </button>
             ))}
+            <button
+              onClick={() => setPopOpen(true)}
+              className="rounded-full border border-(--card-border) px-2.5 py-1 text-[11px] text-(--stage-muted) hover:text-(--foreground)"
+              title="大字幕窗:置顶大字号,可拖动/全屏,投屏用"
+            >
+              大字幕
+            </button>
           </div>
         </div>
         <div ref={listRef} className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-1 py-2">
@@ -1421,8 +1524,7 @@ function ConsoleLive(p: LiveProps) {
             const idx = offset + i;
             if (idx < clearedCount) return null;
             const who = whoIs(t, p.room, p.myLang, p.otherLang);
-            if (filter === "me" && who.side !== "right") return null;
-            if (filter === "other" && who.side !== "left") return null;
+            if (filter !== "both" && who.flow !== filter) return null;
             return (
               <div key={`${who.text}-${idx}`} className={`flex ${who.side === "right" ? "justify-end" : "justify-start"}`}>
                 <div
@@ -1433,7 +1535,7 @@ function ConsoleLive(p: LiveProps) {
                   }`}
                 >
                   <span className="mr-1.5 font-mono text-[10px] font-bold uppercase opacity-70">{who.text}</span>
-                  {String(t.text ?? "")}
+                  {stripVoiceTags(String(t.text ?? ""))}
                 </div>
               </div>
             );
@@ -1454,11 +1556,94 @@ function ConsoleLive(p: LiveProps) {
         )}
         {p.error && <p className="shrink-0 text-xs text-red-400">{p.error}</p>}
       </section>
+
+      {/* 大字幕窗(Windows 版 SubtitleWindow 的浏览器形态):置顶浮动、可拖动、
+          三档字号、scope 切换、全屏;黑底白字是字幕机本色,与主题无关。 */}
+      {popOpen && (
+        <div
+          ref={popRef}
+          className="fixed z-50 w-[min(92vw,920px)] rounded-xl border border-white/20 bg-black/85 p-4 text-white shadow-2xl backdrop-blur"
+          style={popPos ? { left: popPos.x, top: popPos.y } : { right: 24, bottom: 24 }}
+        >
+          <div
+            className="mb-3 flex cursor-move select-none flex-wrap items-center gap-2 text-xs"
+            onMouseDown={(e) => {
+              const el = popRef.current;
+              if (!el) return;
+              const r = el.getBoundingClientRect();
+              popDragRef.current = { dx: e.clientX - r.left, dy: e.clientY - r.top };
+              if (!popPos) setPopPos({ x: r.left, y: r.top });
+            }}
+          >
+            {([["rev", "对方→我"], ["fwd", "我→对方"], ["both", "全部"]] as const).map(([v, label]) => (
+              <button
+                key={v}
+                onClick={() => setPopScope(v)}
+                className={`rounded-full px-2.5 py-1 ${
+                  popScope === v ? "bg-white/90 font-medium text-black" : "border border-white/30 text-white/70"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+            <select
+              className="rounded-full border border-white/30 bg-transparent px-2 py-1 text-white/80"
+              value={popFont}
+              onChange={(e) => setPopFont(Number(e.target.value))}
+            >
+              {[24, 36, 52].map((n) => (
+                <option key={n} value={n} className="text-black">
+                  {n === 24 ? "小" : n === 36 ? "中" : "特大"}
+                </option>
+              ))}
+            </select>
+            <span className="flex-1" />
+            <button
+              className="rounded-full border border-white/30 px-2.5 py-1 text-white/70"
+              onClick={() => popRef.current?.requestFullscreen?.().catch(() => {})}
+            >
+              全屏
+            </button>
+            <button className="rounded-full border border-white/30 px-2.5 py-1 text-white/70" onClick={() => setPopOpen(false)}>
+              收起
+            </button>
+          </div>
+          <div className="flex min-h-[140px] flex-col gap-3">
+            {popRows.length === 0 && (
+              <div className="py-6 text-center text-white/40">等说话…开口即译</div>
+            )}
+            {popRows.map(({ who, text }, i) => (
+              <div key={`${i}-${text.slice(0, 12)}`} className="leading-snug" style={{ fontSize: popFont }}>
+                <span className={`mr-2 font-mono text-sm ${who.flow === "rev" ? "text-sky-300" : "text-emerald-300"}`}>
+                  {who.text}
+                </span>
+                {text}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
-type Bubble = { text: string; side: "left" | "right"; kind: "src" | "dst" };
+type Bubble = {
+  text: string;
+  side: "left" | "right";
+  kind: "src" | "dst";
+  /** 传译流:rev=对方→我(对方原文+我方语译文),fwd=我→对方。译员视角过滤器按流切。 */
+  flow: "rev" | "fwd";
+  lang: string;
+};
+
+/** MiniMax 语气词标记((laughs)/(coughs)/(sighs) 等,仅合成层语义)——字幕不展示。 */
+const VOICE_TAG_RE = /\((?:laughs?|chuckles?|coughs?|clear[- ]throat|groans?|breaths?|pants?|inhales?|exhales?|gasps?|sniffs|sighs?|snorts|burps|lip-smacking|humming|hissing|emm|sneezes?)\)/gi;
+const stripVoiceTags = (s: string) =>
+  s
+    .replace(VOICE_TAG_RE, "")
+    .replace(/\s+([,!?;:.，。？！；：、])/g, "$1")
+    .replace(/\s{2,}/g, " ")
+    .trim();
 
 type TextStreamEntry = {
   text?: unknown;
@@ -1471,8 +1656,8 @@ type TextStreamEntry = {
  * 指向 agent 自己的 trans-<lang> 轨=译文。译文听众 = 该目标语言那一端。 */
 function whoIs(t: TextStreamEntry, room: Room, myLang: string, otherLang: string): Bubble {
   const id = String(t.participantInfo?.identity ?? "");
-  if (id.startsWith("me-")) return { text: "我方说的", side: "right", kind: "src" };
-  if (id.startsWith("other-")) return { text: "对方说的", side: "left", kind: "src" };
+  if (id.startsWith("me-")) return { text: "我方说的", side: "right", kind: "src", flow: "fwd", lang: myLang };
+  if (id.startsWith("other-")) return { text: "对方说的", side: "left", kind: "src", flow: "rev", lang: otherLang };
   const trackSid = t.streamInfo?.attributes?.["lk.transcribed_track_id"] ?? "";
   if (trackSid) {
     const pools = [room.remoteParticipants.values(), [room.localParticipant].values()];
@@ -1481,19 +1666,19 @@ function whoIs(t: TextStreamEntry, room: Room, myLang: string, otherLang: string
         for (const pub of Object.values(participant.trackPublications ?? {})) {
           if (pub?.trackSid !== trackSid) continue;
           const owner = String(participant.identity ?? "");
-          if (owner.startsWith("me-")) return { text: "我方说的", side: "right", kind: "src" };
-          if (owner.startsWith("other-")) return { text: "对方说的", side: "left", kind: "src" };
+          if (owner.startsWith("me-")) return { text: "我方说的", side: "right", kind: "src", flow: "fwd", lang: myLang };
+          if (owner.startsWith("other-")) return { text: "对方说的", side: "left", kind: "src", flow: "rev", lang: otherLang };
           const name = String(pub.trackName ?? "");
           if (name.startsWith("trans-")) {
             const lang = name.slice("trans-".length);
             const ear = LANG_SHORT[lang] ?? lang;
-            return { text: `译文·${ear}`, side: lang === myLang ? "right" : "left", kind: "dst" };
+            return { text: `译文·${ear}`, side: lang === myLang ? "right" : "left", kind: "dst", flow: lang === myLang ? "rev" : "fwd", lang };
           }
         }
       }
     }
   }
-  return { text: "同传", side: "left", kind: "dst" };
+  return { text: "同传", side: "left", kind: "dst", flow: "rev", lang: myLang };
 }
 
 /**
@@ -1591,9 +1776,10 @@ function createMicMeter() {
   };
 }
 
-function createAudioRouter(who: string) {
+function createAudioRouter(who: string, onSinkError?: (id: string, err: unknown) => void) {
   let ctx: AudioContext | null = null;
   let lastSink = "";
+  let lastErrId = "";
   const sources = new Map<string, { src: MediaStreamAudioSourceNode; primer: HTMLAudioElement }>();
   const ensure = () => {
     ctx = ctx ?? new AudioContext();
@@ -1602,8 +1788,23 @@ function createAudioRouter(who: string) {
   };
   const applySink = async (id: string) => {
     const c = ensure();
+    // setSinkId 在 suspended ctx 上部分内核拒绝:先等 resume 落地再投(失败不阻投,
+    // resume() 的补投路径会再试)。
+    if (c.state !== "running") {
+      try {
+        await c.resume();
+      } catch {
+        /* 手势缺失:维持现状,后续 resume() 补投 */
+      }
+    }
     const sinkCtx = c as AudioContext & { setSinkId?: (id: string) => Promise<void>; sinkId?: string };
-    await sinkCtx.setSinkId?.(id || "default");
+    // 非 Chromium(WKWebView/Safari)没有 ctx.setSinkId——旧 `?.` 写法静默跳过,
+    // UI 以为「已应用」、声音永远走系统默认(「选了对方扬声器没声音」的一类真相)。
+    // 显式抛错交给 setSink 的 catch → onSinkError → UI 可见。
+    if (typeof sinkCtx.setSinkId !== "function") {
+      throw new Error("setSinkId unsupported (need Chromium 110+)");
+    }
+    await sinkCtx.setSinkId(id || "default");
     wlog("ctx_sink", { who, want: (id || "default").slice(0, 12), got: String(sinkCtx.sinkId ?? "").slice(0, 12), ctxState: c.state });
   };
   return {
@@ -1647,6 +1848,12 @@ function createAudioRouter(who: string) {
         await applySink(id);
       } catch (e) {
         wlog("ctx_sink", { who, want: (id || "default").slice(0, 12), err: e instanceof Error ? e.name : String(e) });
+        // 失败浮到 UI(按目标 id 去重,同一设备只报一次):路由失败再也不是只有
+        // console 里一行 wlog,操作员看得到「声音为什么不在选的设备上」。
+        if (onSinkError && id !== lastErrId) {
+          lastErrId = id;
+          onSinkError(id, e);
+        }
       }
     },
     // 手势唤醒后重投上次目标:suspended 期间 setSinkId 可能被拒,恢复 running 必须

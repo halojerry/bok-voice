@@ -118,8 +118,16 @@ class CallSession(Base):
     # B 线同传术语表(P0-2,2026-09-16):「源=译」或纯词条,分隔符见 interpret
     # parse_glossary;建单随会话存,token 分发进 dispatch metadata。客服通话恒空。
     glossary: Mapped[str] = mapped_column(Text, default="")
+    # B 线会话级音色(2026-09-17):同传页建单我方/对方语言各选一把 MiniMax 音色
+    # 的 JSON map。token 分发进 dispatch metadata → interpret 按 target_lang 取键。
+    voices_json: Mapped[str] = mapped_column(Text, default="")
     # 官方 SessionReport JSON(agent shutdown 上报):真实逐模型 usage/权威 chat_history。
     session_report: Mapped[str] = mapped_column(Text, default="")
+    # P1-A per-worker SessionReport 历史(2026-09-17 全量 debug):JSON 数组,元素
+    # {"worker","report","ts"}——B 线 fwd/rev 双 worker 各留一份,同 worker 重发
+    # (重试)替换、异 worker 追加。server_default 与 deps.build_engine 迁移 DDL
+    # 同形（DEFAULT '[]'，单引号字面量 SQLite/Postgres 双认）。
+    session_reports_json: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
     # 通话绑定节点(site-delivery M1,2026-09-16 thin-node 拓扑):建单时钉死承载节点,
     # /api/token 签发前校验其未吊销——root 熔断对「坐席 JWT 建单」路径同样生效。
     # ''=无绑定(单机全栈形态),行为零变化。server_default 与迁移 DDL 同形（DEFAULT ''）。
@@ -434,6 +442,30 @@ class NodeLicense(Base):
     status: Mapped[str] = mapped_column(String(16), default="active")  # active/revoked
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
+
+
+class NodeCommand(Base):
+    """节点指令（P3 commands 通道，2026-09-17 落地）：root 经 CP 下发，节点心跳领走执行。
+
+    action 白名单（update/restart/shutdown——CP 出口与端点双闸，绝不推任意
+    shell）；target_version 独立列（update 的目标版本——完成判定=节点心跳上报
+    version 收敛自动关单，不做 JSON 反刮）。status: pending → delivered →
+    done/failed（shutdown/restart 是 fire-and-expect：delivered 即终态，结果
+    由节点 status 变化间接可见；update 失败经心跳 acks 报回 failed）。
+    """
+
+    __tablename__ = "node_commands"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    node_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    action: Mapped[str] = mapped_column(String(32), default="")
+    target_version: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    args_json: Mapped[str] = mapped_column(Text, default="{}")
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    result: Mapped[str] = mapped_column(String(255), default="", server_default="")
+    created_by: Mapped[str] = mapped_column(String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    delivered_at: Mapped[object] = mapped_column(DateTime, default=None, nullable=True)
+    closed_at: Mapped[object] = mapped_column(DateTime, default=None, nullable=True)
 
 
 class User(Base):

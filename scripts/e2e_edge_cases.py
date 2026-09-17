@@ -26,6 +26,10 @@ from livekit import rtc
 ROOT = Path(__file__).resolve().parents[1]
 LIVEKIT_URL = "ws://127.0.0.1:7880"
 CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
+# auth-on 栈(2026-09-15 标准姿势):CP 请求带机器通道 Bearer,未设 env 零变化。
+_CP_HEADERS: dict[str, str] = {}
+if os.environ.get("BOK_CP_TOKEN", "").strip():
+    _CP_HEADERS["Authorization"] = f"Bearer {os.environ['BOK_CP_TOKEN'].strip()}"
 ASR_URL = "http://127.0.0.1:8787"
 TTS_URL = "http://127.0.0.1:8788"
 OUT_DIR = Path("/tmp/qa-edge-audio")
@@ -68,7 +72,7 @@ async def push_pcm(audio_source: rtc.AudioSource, pcm: bytes, real_time: bool = 
 
 
 def turns_count(call_id: str) -> int:
-    r = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", timeout=10).json()
+    r = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", headers=_CP_HEADERS, timeout=10).json()
     return len(r)
 
 
@@ -116,22 +120,25 @@ async def make_call(prefix: str) -> tuple[str, rtc.Room, rtc.AudioSource, bytear
     ts = int(time.time() * 1000) % 100000
     obj = httpx.post(
         f"{CONTROL_PLANE_URL}/api/objects?account_id=acc-001",
+        headers=_CP_HEADERS,
         json={"display_name": f"边角-{prefix}-{ts}", "role_template": "buyer", "language": "cantonese", "background": "qa edge"},
         timeout=10,
     ).json()
     persona = httpx.post(
         f"{CONTROL_PLANE_URL}/api/personas",
+        headers=_CP_HEADERS,
         json={"name": f"边角客服{prefix}", "language": "cantonese", "tone": "礼貌专业"},
         timeout=10,
     ).json()
     call = httpx.post(
         f"{CONTROL_PLANE_URL}/api/calls",
+        headers=_CP_HEADERS,
         json={"account_id": "acc-001", "object_id": obj["id"], "persona_id": persona["id"],
               "mode": "live", "direction": "webrtc", "language": "cantonese"},
         timeout=10,
     ).json()
     call_id = call["id"]
-    data = httpx.post(f"{CONTROL_PLANE_URL}/api/token", json={"account_id": "acc-001", "call_id": call_id}, timeout=10).json()
+    data = httpx.post(f"{CONTROL_PLANE_URL}/api/token", headers=_CP_HEADERS, json={"account_id": "acc-001", "call_id": call_id}, timeout=10).json()
     room = rtc.Room()
     await room.connect(data["serverUrl"], data["participantToken"])
     audio_source = rtc.AudioSource(sample_rate=16000, num_channels=1)
@@ -205,7 +212,7 @@ async def main() -> int:
 
     # E1 空输入（只数 user 轮——心跳 nudge 行係 assistant,唔算输入误判）
     def user_turns(cid: str) -> int:
-        rows = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{cid}/turns", timeout=10).json()
+        rows = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{cid}/turns", headers=_CP_HEADERS, timeout=10).json()
         return sum(1 for t in rows if t.get("role") == "user")
 
     n0 = user_turns(call_id)
@@ -227,7 +234,7 @@ async def main() -> int:
         # 仍报 digits_norm='')。上限 12s,超出照旧按当刻 turns 判。
         turns: list = []
         for _ in range(6):
-            turns = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", timeout=10).json()
+            turns = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", headers=_CP_HEADERS, timeout=10).json()
             if sum(1 for t in turns if t.get("role") == "user") > baseline_user_turns:
                 break
             await asyncio.sleep(2)
@@ -250,7 +257,7 @@ async def main() -> int:
     await push_pcm(audio_source, long_input)
     ok_long = await wait_reply_speech(agent_audio, mark, 60) >= 0
     await wait_silence(agent_audio, mark, 4.0, 70)
-    turns = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", timeout=10).json()
+    turns = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", headers=_CP_HEADERS, timeout=10).json()
     record("E3 超长输入成轮有回复", ok_long and len(turns) > n_before, f"turns {n_before}->{len(turns)}")
 
     # E4 回复中打断：推 cantonese 触发回复，检测到回复语音立即推 en
@@ -263,7 +270,7 @@ async def main() -> int:
         interrupt_mark = len(agent_audio)
         await push_pcm(audio_source, e4_interrupt)
         grew = await wait_reply_speech(agent_audio, interrupt_mark, 40)
-        turns = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", timeout=10).json()
+        turns = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", headers=_CP_HEADERS, timeout=10).json()
         record("E4 回复中打断有后续回复", grew >= 0 and len(turns) > 0, f"turns={len(turns)}")
     else:
         record("E4 回复中打断有后续回复", False, "首轮无回复语音可打断")
@@ -275,7 +282,7 @@ async def main() -> int:
         await push_pcm(audio_source, pcm)
         await asyncio.sleep(2.5)
     await asyncio.sleep(6)
-    alive = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}", timeout=10)
+    alive = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}", headers=_CP_HEADERS, timeout=10)
     status = alive.json().get("status", "")
     n_after = turns_count(call_id)
     record("E5 连续短应承通话存活且有轮", status == "active" and n_after >= n_before, f"status={status} turns {n_before}->{n_after}")
@@ -288,7 +295,7 @@ async def main() -> int:
     def _norm_rep(t: str) -> str:
         return "".join(ch for ch in (t or "") if ch.isalnum())
 
-    rows = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", timeout=10).json()
+    rows = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", headers=_CP_HEADERS, timeout=10).json()
     seq = [
         (t.get("role"), _norm_rep(t.get("transcript") or ""), (t.get("latency_ms") or 0) > 0)
         for t in rows
@@ -315,7 +322,7 @@ async def main() -> int:
     record("E5b 相邻LLM回复不逐字复读", len(dup) == 0, f"dup={dup[:2]}")
     await room.disconnect()
     try:
-        httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/hangup", timeout=10)
+        httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/hangup", headers=_CP_HEADERS, timeout=10)
     except Exception:
         pass
 
@@ -325,9 +332,9 @@ async def main() -> int:
     mark = len(agent_audio2)
     push_task = asyncio.get_running_loop().create_task(push_pcm(audio_source2, e6_pcm))
     await wait_reply_speech(agent_audio2, mark, 40)
-    r1 = httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id2}/hangup", timeout=10)
-    r2 = httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id2}/settle", timeout=30)
-    r3 = httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id2}/settle", timeout=30)
+    r1 = httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id2}/hangup", headers=_CP_HEADERS, timeout=10)
+    r2 = httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id2}/settle", headers=_CP_HEADERS, timeout=30)
+    r3 = httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id2}/settle", headers=_CP_HEADERS, timeout=30)
     await room2.disconnect()
     record("E6 生成中挂断+重复 settle 幂等", r1.status_code == 200 and r2.status_code == 200 and r3.status_code == 200,
            f"hangup={r1.status_code} settle={r2.status_code}/{r3.status_code}")
@@ -340,7 +347,7 @@ async def main() -> int:
         ok_alive = await wait_reply_speech(agent_audio3, mark, 40) >= 0
         await room3.disconnect()
         try:
-            httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id3}/hangup", timeout=10)
+            httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id3}/hangup", headers=_CP_HEADERS, timeout=10)
         except Exception:
             pass
         record("E7 agent 挂断后存活", ok_alive)

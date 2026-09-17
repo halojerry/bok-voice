@@ -81,6 +81,7 @@ def select_session_manifest(
     target_lang: str = "",
     created_by: str = "",
     glossary: str = "",
+    voices_json: str = "",
     node_id: str = "",
 ) -> SessionManifest:
     return SessionManifest(
@@ -99,5 +100,6 @@ def select_session_manifest(
         target_lang=target_lang,
         created_by=created_by,
         glossary=glossary,
+        voices_json=voices_json,
         node_id=node_id,
     )

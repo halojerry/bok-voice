@@ -7,11 +7,11 @@
 --   schema 唯一真源 = packages/business-db ORM 模型 + deps.build_engine() 的幂等迁移;
 --   **改表后必须重跑本脚本重新生成**,再应用到 Supabase。
 --
--- 生成日期: 2026-09-16
+-- 生成日期: 2026-09-17
 -- 源镜像:   pgvector/pgvector:pg16
--- 源命令:   docker exec pg-ddl-fresh pg_dump -U postgres --schema-only --no-owner --no-privileges postgres
+-- 源命令:   docker exec pg-ddl pg_dump -U postgres --schema-only --no-owner --no-privileges postgres
 -- 回环校验: pgvector/pgvector:pg16 上应用本文件 + 重跑 build_engine() = 零 DDL 变更(生成时实测)
--- 规模:     CREATE TABLE 24 张 / CREATE INDEX 34 条 / 数据语句 0 条
+-- 规模:     CREATE TABLE 25 张 / CREATE INDEX 36 条 / 数据语句 0 条
 --           (--schema-only:正常应 0 条数据语句;带 DEFAULT/COMMENT 属 schema 本身)
 --
 -- 目标: 全新 Supabase(Postgres)项目首次引导。应用方式(Main 线程):
@@ -128,7 +128,9 @@ CREATE TABLE public.call_sessions (
     kind character varying(32) NOT NULL,
     target_lang character varying(16) NOT NULL,
     glossary text NOT NULL,
+    voices_json text NOT NULL,
     session_report text NOT NULL,
+    session_reports_json text DEFAULT '[]'::text NOT NULL,
     node_id character varying(64) DEFAULT ''::character varying NOT NULL,
     created_at timestamp without time zone NOT NULL
 );
@@ -271,6 +273,25 @@ CREATE TABLE public.knowledge_chunks (
     content_hash character varying(64) NOT NULL,
     embedding public.vector(384) NOT NULL,
     created_at timestamp without time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: node_commands; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.node_commands (
+    id character varying(64) NOT NULL,
+    node_id character varying(64) NOT NULL,
+    action character varying(32) NOT NULL,
+    target_version character varying(64) DEFAULT ''::character varying NOT NULL,
+    args_json text NOT NULL,
+    status character varying(16) NOT NULL,
+    result character varying(255) DEFAULT ''::character varying NOT NULL,
+    created_by character varying(64) NOT NULL,
+    created_at timestamp without time zone NOT NULL,
+    delivered_at timestamp without time zone,
+    closed_at timestamp without time zone
 );
 
 
@@ -609,6 +630,14 @@ ALTER TABLE ONLY public.knowledge_chunks
 
 
 --
+-- Name: node_commands node_commands_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.node_commands
+    ADD CONSTRAINT node_commands_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: node_licenses node_licenses_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -801,6 +830,20 @@ CREATE INDEX ix_filler_entries_account_id ON public.filler_entries USING btree (
 --
 
 CREATE INDEX ix_knowledge_chunks_account_id ON public.knowledge_chunks USING btree (account_id);
+
+
+--
+-- Name: ix_node_commands_node_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_node_commands_node_id ON public.node_commands USING btree (node_id);
+
+
+--
+-- Name: ix_node_commands_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_node_commands_status ON public.node_commands USING btree (status);
 
 
 --

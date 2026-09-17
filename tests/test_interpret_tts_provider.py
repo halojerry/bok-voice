@@ -31,8 +31,9 @@ def test_build_tts_provider_minimax_branch(monkeypatch):
     # 音色锁口音：粤目标语解析到设置页配的粤语音色。
     assert provider._resolve_voice() == "Cantonese_GentleLady"
     assert provider._language_state.lang == "cantonese"
-    # B 线默认 turbo 档 + language_boost 锁目标语。
-    assert os.environ["MINIMAX_MODEL"] == "speech-2.6-turbo"
+    # B 线默认 2.8-turbo 档(2026-09-16 起:语气词标记仅 2.8 系支持;原 2.6-turbo)
+    # + language_boost 锁目标语。
+    assert os.environ["MINIMAX_MODEL"] == "speech-2.8-turbo"
     assert os.environ["MINIMAX_LANGUAGE_BOOST"] == _MINIMAX_BOOST
     assert provider._language_boost() == _MINIMAX_BOOST
     assert provider._api_key() == "k-test"
@@ -70,6 +71,50 @@ def test_build_tts_provider_qwen3_fallback(monkeypatch):
     assert interpret._build_tts_provider({"speaker_zh": "zh-voice"}, "zh")._resolve_voice() == "zh-voice"
     assert "MINIMAX_MODEL" not in os.environ
     assert "MINIMAX_LANGUAGE_BOOST" not in os.environ
+
+
+def test_parse_session_voices_shapes():
+    """会话级音色 JSON 解析（纯函数）：坏 JSON/形状不对/空值/未知键 → 丢弃不炸。"""
+    assert interpret._parse_session_voices("") == {}
+    assert interpret._parse_session_voices(None) == {}
+    assert interpret._parse_session_voices("not-json") == {}
+    assert interpret._parse_session_voices("[]") == {}
+    # 空音色值丢弃；键经 _norm_lang 归一（未知语言键丢弃,唔进 map）。
+    assert interpret._parse_session_voices('{"zh":"v-zh","en":""}') == {"zh": "v-zh"}
+    assert interpret._parse_session_voices('{"EN":" v-en "}') == {"en": "v-en"}
+
+
+def test_build_tts_provider_session_voice_overrides_settings_and_defaults(monkeypatch):
+    """会话级音色最优先：> 设置三键 > 硬编码默认；未传/空 map 行为与现状逐字节一致。"""
+    from agent_runtime.providers.livekit_plugins import MiniMaxTTS
+
+    for key in ("MINIMAX_MODEL", "MINIMAX_LANGUAGE_BOOST"):
+        monkeypatch.delenv(key, raising=False)
+    cfg = {"provider": "minimax", "speaker_en": "settings-en", "api_key": "k"}
+
+    p = interpret._build_tts_provider(cfg, "en", {"en": "session-en"})
+    assert isinstance(p, MiniMaxTTS)
+    assert p._resolve_voice() == "session-en"
+    zh = interpret._build_tts_provider(cfg, "zh", {"zh": "session-zh"})
+    assert zh._resolve_voice() == "session-zh"
+
+    # 未选（None/空 dict）→ 现状：设置键命中，缺省键落硬编码默认。
+    assert interpret._build_tts_provider(cfg, "en", None)._resolve_voice() == "settings-en"
+    assert interpret._build_tts_provider(cfg, "en", {})._resolve_voice() == "settings-en"
+    assert interpret._build_tts_provider(cfg, "zh", {})._resolve_voice() == "Chinese (Mandarin)_News_Anchor"
+    # 原始 JSON 串也收（防御 entrypoint 忘解析直接透传）。
+    assert interpret._build_tts_provider(cfg, "en", '{"en":"raw-json-voice"}')._resolve_voice() == "raw-json-voice"
+
+
+def test_build_tts_provider_session_voice_filters_local_qwen3(monkeypatch):
+    """会话级误选本地 Qwen3 音色（预设/克隆前缀）→ 过滤回落设置三键/默认，防 2054。"""
+    for key in ("MINIMAX_MODEL", "MINIMAX_LANGUAGE_BOOST"):
+        monkeypatch.delenv(key, raising=False)
+    cfg = {"provider": "minimax", "speaker_en": "settings-en", "api_key": "k"}
+    p = interpret._build_tts_provider(cfg, "en", {"en": "vivian"})
+    assert p._resolve_voice() == "settings-en"
+    p2 = interpret._build_tts_provider({"provider": "minimax"}, "cantonese", {"cantonese": "agent-clone-x"})
+    assert p2._resolve_voice() == "Cantonese_crisp_news_anchor_vv2"
 
 
 def test_build_llm_provider_mt_branch(monkeypatch):

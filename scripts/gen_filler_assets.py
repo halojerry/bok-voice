@@ -41,6 +41,12 @@ MODEL = "speech-2.8-hd"
 # ——尾随标记违反官方「须夹在两段可发音文本之间」被静默忽略;短句以双 token
 # 或句中停顿拉到窗内,不靠尾随停顿)。改话术=改这里重新生成,一个 PR。
 # en 社媒女声逗号处拖长腔明显(Mm-hm, sure.=2.57s 实测),en 全部无逗号短句。
+# 2026-09-16 池深补缺+cat 标签入 dict:行格式 (text, cat),cat=分类器场景标签
+# (empathy/ack/check/minimal/default,与 fillers.classify_filler_category 五类
+# 对齐;缺省=不标,进整池)。此前 cat 是生成后手工补进 manifest——再生成即洗掉
+# (隐性陷阱);现回填进源,manifest 由本脚本全权产出。补缺:zh minimal/default
+# 为 0、粤 minimal 为 0(default 仅 1 条=call-c76832ac 同句连播主角)、en
+# empathy/ack 为 0——分类器选不出=回退整池(check 主导)=语境错位。
 FILLERS: dict[str, dict] = {
     "zh": {
         # 2026-09-12 普通话默认音色切用户克隆 moss_audio_*(agent._MINIMAX_DEFAULT_VOICES
@@ -51,24 +57,32 @@ FILLERS: dict[str, dict] = {
         # 2026-09-12 用户定档重排:旧池「好的您稍等」式万能腔机械——按集运理赔
         # 话术语域重写(订单/物流/核实/这单),口语语气词自然衔接;1.5-2.0s 口径。
         "lines": [
-            "哎好的，您稍等，我马上查。",
-            "您别急，我看一下您这单的情况。",
-            "好的您说，我这就去核实。",
-            "嗯稍等，我查下物流。",
-            "收到收到，我马上给您查这单。",
-            "您慢慢说，我在听着呢。",
-            "好嘞，稍等，我帮您核实。",
-            "别着急，我正在看您这单。",
-            "嗯<#0.2#>您稍等，我看一下。",
-            "好的稍等，马上给您查清楚。",
+            ("哎好的，您稍等，我马上查。", "check"),
+            ("您别急，我看一下您这单的情况。", "empathy"),
+            ("好的您说，我这就去核实。", "ack"),
+            ("嗯稍等，我查下物流。", "check"),
+            ("收到收到，我马上给您查这单。", "check"),
+            ("您慢慢说，我在听着呢。", "ack"),
+            ("好嘞，稍等，我帮您核实。", "check"),
+            ("别着急，我正在看您这单。", "empathy"),
+            ("嗯<#0.2#>您稍等，我看一下。", "check"),
+            ("好的稍等，马上给您查清楚。", "check"),
+            # 2026-09-16 池深补缺:minimal(纯应承轮回应同能量)、default(兜底)
+            ("嗯嗯好的，我记着呢。", "minimal"),
+            ("好的好的，您慢慢讲。", "minimal"),
+            ("嗯好，您继续讲，我听着。", "minimal"),
+            ("好的，您稍等一下，很快就好。", "default"),
+            ("嗯好，我这边看一下就回您。", "default"),
+            ("好，您说，我在记。", "ack"),
+            ("明白明白，我帮您看着呢。", "empathy"),
         ],
         "win": ((1.35, 2.15), (1.25, 2.3)),  # 短句 tier zh 专属窗(目标 1.5-2.0s)
         "long_lines": [
             # 首轮实测修订:zh 双逗号/冗字拖腔超窗(「您别急」轮 3.49s),删中段
             # 压回窗内;万能话术不变(应承+等待邀请,查一下=等待邀请动词面)。
-            "好的，您稍等，我马上帮您看一下。",
-            "收到收到，我这就帮您查一下。",
-            "麻烦您稍等一下，我马上看一下。",
+            ("好的，您稍等，我马上帮您看一下。", "check"),
+            ("收到收到，我这就帮您查一下。", "check"),
+            ("麻烦您稍等一下，我马上看一下。", "check"),
         ],
     },
     "cantonese": {
@@ -78,22 +92,31 @@ FILLERS: dict[str, dict] = {
         # 2026-09-12 用户定档重排:旧池 0.9-1.5s 偏短,整批换 1.5-2.0s 口径
         # (13-16 字/条,应承+等待邀请万能话术不变);窗见 win 字段。
         "lines": [
-            "唔使急，你慢慢講，我幫你睇緊。",
-            "好嘅，你稍等一陣，我即刻幫你核實。",
-            "收到，你等我幾秒，查緊喇。",
-            "明白，你繼續講，我聽緊。",
-            "好，你講先，我而家幫你睇返。",
-            "冇問題，你稍等多一陣，我跟進緊。",
-            "唔使擔心，我幫你睇緊先。",
-            "好嘅，你等陣，我幫你查下先。",
-            "收到，你慢慢講，我聽緊。",
-            "嗯<#0.3#>你稍等，我就幫你睇。",
+            ("唔使急，你慢慢講，我幫你睇緊。", "empathy"),
+            ("好嘅，你稍等一陣，我即刻幫你核實。", "check"),
+            ("收到，你等我幾秒，查緊喇。", "check"),
+            ("明白，你繼續講，我聽緊。", "ack"),
+            ("好，你講先，我而家幫你睇返。", "ack"),
+            ("冇問題，你稍等多一陣，我跟進緊。", "default"),
+            ("唔使擔心，我幫你睇緊先。", "empathy"),
+            ("好嘅，你等陣，我幫你查下先。", "check"),
+            ("收到，你慢慢講，我聽緊。", "ack"),
+            ("嗯<#0.3#>你稍等，我就幫你睇。", "check"),
+            # 2026-09-16 池深补缺:minimal 0 条、default 仅 1 条(call-c76832ac
+            # 「同句 4 分钟 3 次」主角)——minimal/default 各补
+            ("嗯嗯好嘅，我記住喇。", "minimal"),
+            ("好嘅好嘅，你慢慢講。", "minimal"),
+            ("嗯好，你繼續講，我聽住。", "minimal"),
+            ("好嘅，你等一等，我好快覆你。", "default"),
+            ("嗯，你等等，我睇下就覆你。", "default"),
+            ("好，你慢慢講，我聽住。", "ack"),
+            ("明白明白，我幫你跟緊。", "empathy"),
         ],
         "win": ((1.35, 2.15), (1.25, 2.3)),  # 短句 tier 粤语专属窗(目标 1.5-2.0s)
         "long_lines": [
-            "好嘅，你稍等陣，我而家就幫你睇下。",
-            "收到，唔好急，等我幫你睇下先。",
-            "明白，麻煩你稍等多一陣，我即刻睇。",
+            ("好嘅，你稍等陣，我而家就幫你睇下。", "check"),
+            ("收到，唔好急，等我幫你睇下先。", "empathy"),
+            ("明白，麻煩你稍等多一陣，我即刻睇。", "check"),
         ],
     },
     "en": {
@@ -103,25 +126,35 @@ FILLERS: dict[str, dict] = {
         # 2026-09-12 同步重排:按话术语域(order/shipment/verify)+零停顿连读
         # (en 音色逗号拖腔实证)——无逗号短句,目标 1.2-1.8s。
         "lines": [
-            "Sure let me check your order right away.",
-            "Okay give me a second to look into it.",
-            "Hold on I'm checking your shipment now.",
-            "One moment please I'll verify your order.",
-            "Let me pull up your order details now.",
-            "Just a moment while I check on this.",
-            "Checking your order now.",
-            "Give me a second to verify it.",
-            "Checking the shipping info now.",
-            "Sure I'll look into that for you right away.",
+            ("Sure let me check your order right away.", "check"),
+            ("Okay give me a second to look into it.", "check"),
+            ("Hold on I'm checking your shipment now.", "check"),
+            ("One moment I'll verify your order.", "check"),
+            ("Let me pull up your order details now.", "check"),
+            ("Just a moment while I check on this.", "check"),
+            ("Checking your order now.", "minimal"),
+            ("Give me a second to verify it.", "check"),
+            ("Checking the shipping info now.", "default"),
+            ("Sure I'll look into that for you right away.", "check"),
+            # 2026-09-16 池深补缺:empathy/ack 为 0(客户焦虑/报号轮落 check 池
+            # =「马上查」答非所问);en 一律零停顿无逗号(拖腔实证);首版 10 词
+            # 全爆窗(实测定档:en 真实语速 ~0.28s/词,上限 7 词)后砍到 6-7 词
+            ("I understand let me check it now.", "empathy"),
+            ("I see I am checking it for you.", "empathy"),
+            ("I understand I will sort this out.", "empathy"),
+            ("Got it please go ahead I am listening.", "ack"),
+            ("Understood I am noting that down.", "ack"),
+            ("Okay sure please continue I am with you.", "ack"),
+            ("Alright got it I am checking it now.", "minimal"),
         ],
         "win": ((1.1, 2.0), (1.0, 2.2)),  # 短句 tier en 专属窗(目标 1.2-1.8s)
         # en 社媒女声停顿拖腔实证(两轮):逗号(Mm-hm, sure.=2.57s)与 <#0.3#>
         # 标记都令相邻词拖长 +1.8s 以上——en 长句一律零停顿连读,靠 9 词左右
         # (~0.2s/词)落窗;只保留等待邀请/应承语义,无中段句号。
         "long_lines": [
-            "Just a moment and I will check that.",
-            "One moment and I will check on it.",
-            "One moment please and I will check that.",
+            ("Just a moment and I will check that.", "check"),
+            ("One moment and I will check on it.", "check"),
+            ("One moment please and I will check that.", "check"),
         ],
     },
 }
@@ -247,24 +280,29 @@ def main() -> int:
     for lang, cfg in FILLERS.items():
         entries: list[dict] = []
         tiers = [
-            (cfg["lines"], 1, WIN_WARN, WIN_FAIL),
-            (cfg.get("long_lines", []), 2, LONG_WIN_WARN, LONG_WIN_FAIL),
+            ("s", cfg["lines"], 1, WIN_WARN, WIN_FAIL),
+            ("l", cfg.get("long_lines", []), 2, LONG_WIN_WARN, LONG_WIN_FAIL),
         ]
-        for lines, tier, warn_win, fail_win in tiers:
+        for prefix, lines, tier, warn_win, fail_win in tiers:
             # 语言专属窗覆盖(cantonese 短句 tier 1.5-2.0s 定档,2026-09-12)
             if tier == 1 and "win" in cfg:
                 warn_win, fail_win = cfg["win"]
-            for i, text in enumerate(lines, 1):
-                name = f"{lang}-{i:02d}.wav" if tier == 1 else f"{lang}-{10 + i}.wav"
+            for i, item in enumerate(lines, 1):
+                # (text, cat) 元组:cat=分类器场景标签(2026-09-16 入 dict,随
+                # manifest 产出;旧纯 str 行视为无标签进整池)。
+                text, cat = item if isinstance(item, tuple) else (item, "")
+                name = f"{lang}-{prefix}{i:02d}.wav"
                 if args.dry_run:
-                    print(f"[plan] {name}: {text!r} voice={cfg['voice']} speed={cfg['speed']}")
+                    print(f"[plan] {name}: {text!r} voice={cfg['voice']} speed={cfg['speed']} cat={cat or '-'}")
                     continue
                 target = OUT_DIR / name
                 if target.exists() and not args.force:
                     with wave.open(str(target), "rb") as w:
                         dur = w.getnframes() / w.getframerate()
                     print(f"SKIP {name}: {dur:.2f}s (已存在)")
-                    entries.append({"text": text, "file": name, "dur_s": round(dur, 2)})
+                    entries.append(
+                        {"text": text, "file": name, "dur_s": round(dur, 2), **({"cat": cat} if cat else {})}
+                    )
                     continue
                 pcm = synth_pcm(key, base, text, cfg["voice"], cfg["speed"], cfg["pitch"])
                 pcm = trim_silence(pcm)
@@ -277,7 +315,9 @@ def main() -> int:
                     failures.append(f"{name} {dur:.2f}s 超窗 {text!r}")
                     continue
                 write_wav(target, pcm)
-                entries.append({"text": text, "file": name, "dur_s": round(dur, 2)})
+                entries.append(
+                    {"text": text, "file": name, "dur_s": round(dur, 2), **({"cat": cat} if cat else {})}
+                )
         manifest[lang] = entries
         import time as _t
 
