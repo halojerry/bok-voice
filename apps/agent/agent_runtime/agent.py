@@ -3019,7 +3019,7 @@ async def entrypoint(ctx):
 
             # judge 路由字段(漏斗 v2,spec §3.2):BOK_ROUTE_JUDGE=1 才喺 judge
             # prompt 加 route/conf 段并解析落账;默认 0=旧 prompt 零行为漂移。
-            route_enabled = os.environ.get("BOK_ROUTE_JUDGE", "0") == "1"
+            route_enabled = os.environ.get("BOK_ROUTE_JUDGE", "1") == "1"  # 探针验收过(2026-09-18),0=回退
 
             # judge 专线优先(FLOW_JUDGE_*,bok.py 注入指向 :1237 9B——后台判定
             # 是 fire-and-forget 重活,大模型判定质量↑且与活通话回复的 :1235
@@ -3112,7 +3112,7 @@ async def entrypoint(ctx):
             # created:false = 同 call 同 kind 已有 open 单 → 唔重复播确认。
             if (
                 route_enabled
-                and os.environ.get("BOK_TOOLS_FOLLOWUP", "0") == "1"
+                and os.environ.get("BOK_TOOLS_FOLLOWUP", "1") == "1"  # 探针验收过(2026-09-18),0=纯话术
                 and _judge_route["step"] == step_at
                 and _judge_route["route"] == "register_followup"
                 and _judge_route["conf"] >= FOLLOWUP_CONF_MIN
@@ -3657,7 +3657,7 @@ async def entrypoint(ctx):
             # 账本记账喺上方 flow try 内已完成,此轮 verdict 唔係 UNCLEAR 时 streak
             # 已被清零,车道自然唔触发。BOK_STALL_LADDER=0 回退(合入初版默认关)。
             if (
-                os.environ.get("BOK_STALL_LADDER", "0") == "1"
+                os.environ.get("BOK_STALL_LADDER", "1") == "1"  # 探针验收过(2026-09-18),0=回退
                 and flow_ctrl.has_steps
                 and not flow_ctrl.done
                 and not flow_ctrl.closing
