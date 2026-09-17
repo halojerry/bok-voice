@@ -440,11 +440,67 @@ def test_interp_env_sentence_commit_on():
     """
     env = bok._interp_env({"PASSTHROUGH": "1"})
     assert env.get("QWEN3_ASR_SENTENCE_COMMIT") == "1"
+    assert env.get("QWEN3_ASR_CLAUSE_COMMIT") == "1"  # B 线子句级提交默认开(2026-09-16)
     assert env["PASSTHROUGH"] == "1"  # agent_env 透传不受影响
 
     # 应急逃生口：用户显式 0 > setdefault
     env2 = bok._interp_env({"QWEN3_ASR_SENTENCE_COMMIT": "0"})
     assert env2["QWEN3_ASR_SENTENCE_COMMIT"] == "0"
+    env3 = bok._interp_env({"QWEN3_ASR_CLAUSE_COMMIT": "0"})
+    assert env3["QWEN3_ASR_CLAUSE_COMMIT"] == "0"
+
+
+def test_interp_direction_env_rev_overrides(monkeypatch):
+    """方向级服务覆盖（全双工分 GPU 钩子）：REV 方向认 *_REV env 指第二套
+    ASR/MT 端点；fwd 恒走默认。"""
+    monkeypatch.setenv("QWEN3_ASR_BASE_URL_REV", "http://127.0.0.1:8789")
+    monkeypatch.setenv("MT_LLM_BASE_URL_REV", "http://127.0.0.1:1237/v1")
+
+    rev_env = dict(bok._interp_env({}))
+    rev_env["INTERP_DIRECTION"] = "rev"
+    bok._apply_interp_direction_env(rev_env, "rev")
+    assert rev_env["QWEN3_ASR_BASE_URL"] == "http://127.0.0.1:8789"
+    assert rev_env["MT_LLM_BASE_URL"] == "http://127.0.0.1:1237/v1"
+
+    fwd_env = dict(bok._interp_env({}))
+    fwd_env["INTERP_DIRECTION"] = "fwd"
+    bok._apply_interp_direction_env(fwd_env, "fwd")
+    assert fwd_env.get("QWEN3_ASR_BASE_URL") != "http://127.0.0.1:8789"
+    assert fwd_env.get("MT_LLM_BASE_URL") != "http://127.0.0.1:1237/v1"
+
+
+def test_interp_env_passthrough_switches(monkeypatch):
+    """B 线开关经 _interp_env 显式透传——_agent_worker_env 是白名单 env 不带
+    os.environ,不透传的话 BOK_INTERP_* 逃生门在 dev/prod 栈都是死的
+    （2026-09-16 探针 A/B 实证后补）。"""
+    monkeypatch.setenv("BOK_INTERP_MT_CONTEXT", "2")
+    monkeypatch.setenv("BOK_INTERP_REV_AUDIO", "1")
+    monkeypatch.setenv("BOK_INTERP_BACKLOG", "0")
+    monkeypatch.setenv("BOK_INTERP_MAX_BACKLOG_S", "4")
+    monkeypatch.setenv("BOK_INTERP_VOICE_TAGS", "0")
+    monkeypatch.setenv("MINIMAX_MODEL", "speech-2.8-turbo")
+    env = bok._interp_env({})
+    assert env["BOK_INTERP_MT_CONTEXT"] == "2"
+    assert env["BOK_INTERP_REV_AUDIO"] == "1"
+    assert env["BOK_INTERP_BACKLOG"] == "0"
+    assert env["BOK_INTERP_MAX_BACKLOG_S"] == "4"
+    assert env["BOK_INTERP_VOICE_TAGS"] == "0"
+    assert env["MINIMAX_MODEL"] == "speech-2.8-turbo"
+    # BOK_INTERP_INTERRUPT 已随 P2 manual 架构废止,不再透传
+    monkeypatch.setenv("BOK_INTERP_INTERRUPT", "1")
+    monkeypatch.delenv("BOK_INTERP_MT_CONTEXT", raising=False)
+    monkeypatch.delenv("BOK_INTERP_REV_AUDIO", raising=False)
+    monkeypatch.delenv("BOK_INTERP_BACKLOG", raising=False)
+    monkeypatch.delenv("BOK_INTERP_MAX_BACKLOG_S", raising=False)
+    monkeypatch.delenv("BOK_INTERP_VOICE_TAGS", raising=False)
+    monkeypatch.delenv("MINIMAX_MODEL", raising=False)
+    env = bok._interp_env({})
+    assert "BOK_INTERP_MT_CONTEXT" not in env
+    assert "BOK_INTERP_BACKLOG" not in env
+    assert "BOK_INTERP_MAX_BACKLOG_S" not in env
+    assert "BOK_INTERP_VOICE_TAGS" not in env
+    assert "MINIMAX_MODEL" not in env
+    assert "BOK_INTERP_INTERRUPT" not in env
 
 
 def test_interp_sentence_commit_pairing(monkeypatch):
@@ -1411,3 +1467,158 @@ def test_pure_hesitation_gate():
     assert not _pure_hesitation("通知你。")
     assert not _pure_hesitation("呃")  # 单犹豫字保守放行
     assert not _pure_hesitation("")
+
+
+# ---- 子句级提交（B 线同传档，QWEN3_ASR_CLAUSE_COMMIT）----
+
+
+def test_clause_commit_splits_at_comma(monkeypatch):
+    """B 线子句级提交：逗号/顿号/分号也作边界（门槛 8 字），长句唔使等句号——
+    译员按子句跟，说话中译文就开跑（体感「说话时间+生成时间」的主刀）。"""
+    _default_gates(monkeypatch)
+    monkeypatch.setenv("QWEN3_ASR_CLAUSE_COMMIT", "1")
+
+    async def scenario():
+        stream = _make_stream()
+        try:
+            return stream._sentence_boundary(
+                "我们公司在深圳南山区科技园，大概有三百多名员工。",
+                "我们公司在深圳南山区科技园，大概有三百多名员工。",
+            )
+        finally:
+            await _close(stream)
+
+    sent, idx = asyncio.run(scenario())
+    assert sent == "我们公司在深圳南山区科技园，" and idx == len(sent)
+
+
+def test_clause_commit_off_by_default(monkeypatch):
+    """默认关（A 线零变化）：同一段文本只认句号边界。"""
+    _default_gates(monkeypatch)
+    monkeypatch.delenv("QWEN3_ASR_CLAUSE_COMMIT", raising=False)
+
+    async def scenario():
+        stream = _make_stream()
+        try:
+            return stream._sentence_boundary(
+                "我们公司在深圳南山区科技园，大概有三百多名员工。",
+                "我们公司在深圳南山区科技园，大概有三百多名员工。",
+            )
+        finally:
+            await _close(stream)
+
+    sent, idx = asyncio.run(scenario())
+    assert sent == "我们公司在深圳南山区科技园，大概有三百多名员工。"
+
+
+def test_clause_commit_gates(monkeypatch):
+    """子句门照走全套：6 字子句（<8）唔提交；数字 run 子句跳过留给停嘴兜底。"""
+    _default_gates(monkeypatch)
+    monkeypatch.setenv("QWEN3_ASR_CLAUSE_COMMIT", "1")
+
+    async def scenario():
+        stream = _make_stream()
+        try:
+            short = stream._sentence_boundary("好的好的呀，麻烦你了。", "好的好的呀，麻烦你了。")
+            # 6 字子句唔够格 → 逗号跳过；句号段「好的好的呀，麻烦你了。」14 字
+            # 无数字 run 且稳定 → 退回句号边界（子句并入下一边界,唔丢）
+            digit = stream._sentence_boundary("我的号码12345，请再讲一遍。", "我的号码12345，请再讲一遍。")
+            return short, digit
+        finally:
+            await _close(stream)
+
+    (short, digit) = asyncio.run(scenario())
+    assert short == ("好的好的呀，麻烦你了。", len("好的好的呀，麻烦你了。"))
+    assert digit is None  # 数字 run 整段拦下,留给停嘴整句兜底
+
+
+# ---- 长度触发子句提交(B 线边说边译档,2026-09-17)---------------------------
+# 标点档靠逗号、停顿档靠 VAD 0.45s——连续语流两者都哑火,译文等 EOS。长度档:
+# 滑窗未提交前缀攒够字数且跨窗稳定(AlignAtt/LocalAgreement「稳定前缀才出」)
+# 即就地切句。门:切点不劈 ASCII run(单号/英文词完整);中英判(CJK 主导门槛
+# 12,英/数字主导翻倍 24);1.5s 限速共用标点档那把阀。
+
+
+def test_length_commit_cut_unit():
+    """切点纯函数:12 字稳定切 / 未跨窗稳定 None / 数字 run 不劈 / 英文门槛翻倍。"""
+    t = "我想问一下我昨天买的那批货几时可以送到呀麻烦你帮我看看"
+    assert lp._length_commit_cut(t, 0, t, 12) == 12  # CJK 全稳定 → 12 字切
+    # 未跨窗稳定(prev 短于候选/前缀有改写) → None 等下窗
+    assert lp._length_commit_cut(t, 0, t[:11], 12) is None
+    assert lp._length_commit_cut(t, 0, t[:11] + "X", 12) is None
+    # 数字 run 不劈:切点避开 1234567,号码完整留在切段内
+    d = "我的快递单号是1234567麻烦你帮我查一下到哪了"
+    cut = lp._length_commit_cut(d, 0, d, 12)
+    assert cut == 14, f"号码后第一个 CJK 边界: {cut}"
+    assert "1234567" in d[:cut]
+    # 英文主导段:门槛翻倍 24,且只切词边界(唔劈 where)
+    e = "I would like to check where my package is now please help me"
+    cut_e = lp._length_commit_cut(e, 0, e, 12)
+    assert cut_e == 27, f"词边界切点: {cut_e}"
+    assert e[:cut_e] == "I would like to check where"
+
+
+def test_length_commit_mid_speech_runon(monkeypatch):
+    """长度档说话中出稿:无标点连续语流,首窗候选未稳定唔提交,次窗稳定即
+    FINAL+EOS——译文开工唔使等 VAD 停嘴/EOS。"""
+    _default_gates(monkeypatch)
+    monkeypatch.setenv("QWEN3_ASR_CLAUSE_LEN_COMMIT", "1")
+    monkeypatch.delenv("QWEN3_ASR_CLAUSE_LEN_CHARS", raising=False)
+
+    async def scenario():
+        stream = _make_stream()
+        try:
+            ev1 = await _drive_window_events(
+                stream, {"text": "我想问一下我昨天买的那批货几时可以送到呀", "language": "cantonese"}
+            )
+            ev2 = await _drive_window_events(
+                stream, {"text": "我想问一下我昨天买的那批货几时可以送到呀麻烦你", "language": "cantonese"}
+            )
+            return ev1, ev2, stream._committed_text
+        finally:
+            await _close(stream)
+
+    ev1, ev2, committed = asyncio.run(scenario())
+    assert [n for (n, _t) in ev1] == ["INTERIM_TRANSCRIPT"], f"首窗未跨窗稳定唔提交: {ev1}"
+    names = [n for (n, _t) in ev2]
+    assert names == ["FINAL_TRANSCRIPT", "END_OF_SPEECH", "INTERIM_TRANSCRIPT"], ev2
+    assert committed == "我想问一下我昨天买的"  # 默认 10 字档(2026-09-17 二轮收紧)
+    finals = [t for (n, t) in ev2 if n == "FINAL_TRANSCRIPT"]
+    interims = [t for (n, t) in ev2 if n == "INTERIM_TRANSCRIPT"]
+    assert finals == [committed]
+    assert interims == ["那批货几时可以送到呀麻烦你"]  # 字幕续流只带剩余
+
+
+def test_length_commit_off_by_default_runon_waits_eos(monkeypatch):
+    """默认关(A 线零变化):同一段无标点连续语流唔提交,等 EOS/停嘴整句兜底。"""
+    _default_gates(monkeypatch)
+    monkeypatch.delenv("QWEN3_ASR_CLAUSE_LEN_COMMIT", raising=False)
+
+    async def scenario():
+        stream = _make_stream()
+        try:
+            ev1 = await _drive_window(
+                stream, {"text": "我想问一下我昨天买的那批货几时可以送到呀", "language": "cantonese"}
+            )
+            ev2 = await _drive_window(
+                stream, {"text": "我想问一下我昨天买的那批货几时可以送到呀麻烦你", "language": "cantonese"}
+            )
+            return ev1, ev2, stream._committed_text
+        finally:
+            await _close(stream)
+
+    ev1, ev2, committed = asyncio.run(scenario())
+    assert all(n != "FINAL_TRANSCRIPT" for n in ev1 + ev2), ev1 + ev2
+    assert committed == ""
+
+
+def test_interp_env_len_commit_on():
+    """B 线长度档默认开(_interp_env setdefault),显式 0 逃生不抢;
+    VAD 停嘴门槛 B 线收紧 0.35(A 线 0.45 不变)同样 setdefault+逃生。"""
+    env = bok._interp_env({})
+    assert env.get("QWEN3_ASR_CLAUSE_LEN_COMMIT") == "1"
+    assert env.get("VAD_MIN_SILENCE_DURATION") == "0.35"
+    env2 = bok._interp_env({"QWEN3_ASR_CLAUSE_LEN_COMMIT": "0"})
+    assert env2["QWEN3_ASR_CLAUSE_LEN_COMMIT"] == "0"
+    env3 = bok._interp_env({"VAD_MIN_SILENCE_DURATION": "0.45"})
+    assert env3["VAD_MIN_SILENCE_DURATION"] == "0.45"

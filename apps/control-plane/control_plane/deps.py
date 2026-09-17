@@ -197,11 +197,30 @@ def build_engine() -> Engine | None:
                     "glossary",
                     "glossary TEXT DEFAULT ''",
                 )
+                # B 线会话级音色(2026-09-17):同传页建单我方/对方各选一把音色的
+                # JSON map,token 分发进 dispatch metadata → interpret 优先消费。
+                _ensure_column(
+                    conn,
+                    "call_sessions",
+                    "voices_json",
+                    "voices_json TEXT DEFAULT ''",
+                )
                 _ensure_column(
                     conn,
                     "call_sessions",
                     "session_report",
                     "session_report TEXT",
+                )
+                # P1-A（2026-09-17 全量 debug）：B 线 fwd/rev 双 worker 各自上报
+                # SessionReport——主列 session_report 只留首份，per-worker 历史落
+                # JSON 数组列（元素 {"worker","report","ts"}，同 worker 重发=替换、
+                # 异 worker=追加）。DEFAULT '[]' 单引号字面量 SQLite/Postgres 双认
+                # （方言门禁 tests/test_db_portability.py）。
+                _ensure_column(
+                    conn,
+                    "call_sessions",
+                    "session_reports_json",
+                    "session_reports_json TEXT DEFAULT '[]'",
                 )
                 # turns 分析账本列（spec 2026-09-10 §6.1）：org/线别/说话人/生成源/
                 # 话术步/时间轴。缺省值兜底旧行，二启幂等（列在即跳过）。
