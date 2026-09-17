@@ -199,6 +199,11 @@ def main(argv: list[str] | None = None) -> int:
             "⑥b 同指纹重注册幂等复用 node_id",
             f"HTTP {status} {reg2.get('node_id') or body}（期望 {node_id}）",
         )
+        # ⑥a 的克隆自动吊销已作废旧 node_token；⑥b 复活响应换发了新票——
+        # 后续 ⑦⑧ 必须换用新票，沿用旧票=401（CI 首跑实证：⑦b/⑧b 整段红）。
+        revived_token = str(reg2.get("node_token") or "")
+        if revived_token:
+            node_token = revived_token
     else:
         print("[skip] ⑥ 非 license 流（auth-off CP），跳过克隆/复活断言", flush=True)
 
