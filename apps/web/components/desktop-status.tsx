@@ -2,6 +2,10 @@
 
 import { useEffect, useState } from "react";
 import { getAutostart, setAutostart } from "@/lib/tauri";
+import { startTrace } from "@/lib/logger";
+
+// 模块级 trace（环形缓存+TTL 有界，见 lib/logger.ts 头注释）。
+const log = startTrace({ operation: "web.desktop-status" });
 
 type ServiceStatus = { name: string; port: number; up: boolean };
 type HealthReport = { app_data_dir: string; services: ServiceStatus[] };
@@ -111,8 +115,9 @@ export default function DesktopStatus() {
             setAutostartBusy(true);
             try {
               setAutostartState(await setAutostart(next));
-            } catch {
+            } catch (e) {
               setAutostartState(false);
+              log.error("set autostart failed", e);
             } finally {
               setAutostartBusy(false);
             }

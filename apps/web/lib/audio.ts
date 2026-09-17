@@ -8,6 +8,10 @@
  * - 选择持久化到 localStorage（bok.audio.mic / bok.audio.out），重开 App 自动恢复。
  */
 import { isTauri, listAudioDevices, setSystemOutput, type AudioDevice } from "@/lib/tauri";
+import { startTrace } from "@/lib/logger";
+
+// 模块级 trace（环形缓存+TTL 有界，见 lib/logger.ts 头注释）。
+const log = startTrace({ operation: "web.audio" });
 
 export type AudioDeviceKind = "input" | "output";
 export interface AudioDeviceInfo {
@@ -103,8 +107,9 @@ export async function listAudioDevicesOf(kind: AudioDeviceKind): Promise<AudioDe
       if (Array.isArray(native) && native.length > 0) {
         return native.map((d) => ({ id: d.id, name: d.name, is_default: d.is_default, kind, groupId: "" }));
       }
-    } catch {
+    } catch (e) {
       /* 原生枚举失败（Windows 占位）时回退 web */
+      log.error("native audio device enumeration failed; falling back to web", e, { kind });
     }
   }
   // input 永远 web，且需要先请求麦克风权限（触发 TCC 授权框，才能拿到带 label 的设备）；
