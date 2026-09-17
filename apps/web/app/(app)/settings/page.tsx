@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Plus } from "lucide-react";
 import { api } from "@/lib/api";
 import { ErrorState, LoadingState } from "@/components/app-shell";
 import CannedAuditionCard from "@/components/canned-audition";
@@ -384,7 +385,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
                   setShowSiteForm((v) => !v);
                 }}
               >
-                {showSiteForm ? "取消新建" : "+ 新建站点"}
+                {showSiteForm ? "取消新建" : <><Plus className="h-3.5 w-3.5" /> 新建站点</>}
               </button>
               {showSiteForm && (
                 <div className="mt-2 rounded-lg border border-(--card-border) p-2">

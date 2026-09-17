@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { ArrowRight, Plus } from "lucide-react";
 import { api } from "@/lib/api";
 import { useAccount } from "@/components/account-context";
 import { CallStudio } from "@/components/CallStudio";
@@ -135,7 +136,7 @@ export default function CallsPage() {
             {clearing ? "清理中…" : "清空已结束历史"}
           </button>
           <Link href="/calls/new" className="btn-primary">
-            + 新建通话
+            <Plus className="h-3.5 w-3.5" /> 新建通话
           </Link>
         </div>
       </div>
@@ -226,7 +227,7 @@ export default function CallsPage() {
                         <span className={`h-2 w-2 rounded-full ${color}`} />
                         {label}
                       </span>
-                      <span className="text-(--live)">进入 →</span>
+                      <span className="text-(--live)">进入 <ArrowRight className="h-3.5 w-3.5" /></span>
                     </div>
                   </button>
                   <button

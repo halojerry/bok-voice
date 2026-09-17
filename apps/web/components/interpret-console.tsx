@@ -36,6 +36,7 @@ import {
   type RemoteTrackPublication,
 } from "livekit-client";
 import { useSession, useTranscriptions } from "@livekit/components-react";
+import { Ban, TriangleAlert } from "lucide-react";
 import { AgentSessionProvider } from "@/components/agents-ui/agent-session-provider";
 import { api, apiBase } from "@/lib/api";
 import { describeConnectError } from "@/lib/api-ready";
@@ -1250,7 +1251,7 @@ function ConsoleLive(p: LiveProps) {
           key={m}
           className="shrink-0 rounded-md border border-red-500/60 bg-red-500/10 px-3 py-2 text-xs leading-relaxed text-red-600"
         >
-          ⛔ {m}
+          <Ban className="h-3.5 w-3.5" /> {m}
           <span className="block text-red-600">这个组合下开传译只会产出错字幕，先改设备再启动。</span>
         </div>
       ))}
@@ -1259,7 +1260,7 @@ function ConsoleLive(p: LiveProps) {
           key={m}
           className="shrink-0 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-700"
         >
-          ⚠ {m}
+          <TriangleAlert className="h-3.5 w-3.5" /> {m}
         </div>
       ))}
       <div className="grid shrink-0 gap-4 md:grid-cols-2 xl:grid-cols-3">

@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Plus } from "lucide-react";
 import { savedMicDevice } from "@/lib/audio";
 
 const WS_URL = process.env.NEXT_PUBLIC_TRANSLATION_WS_URL || "ws://127.0.0.1:8790";
@@ -234,7 +235,7 @@ export default function TranslatePage() {
             <option value="dashscope">DashScope Qwen-MT</option>
           </select>
         </label>
-        <button className="btn-ghost" onClick={addChannel}>+ 添加通道</button>
+        <button className="btn-ghost" onClick={addChannel}><Plus className="h-3.5 w-3.5" /> 添加通道</button>
         <span className="ml-auto font-mono text-xs text-(--stage-muted)">{runningCount} 通道运行中</span>
       </div>
 

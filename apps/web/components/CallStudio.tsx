@@ -13,6 +13,7 @@ import {
   type UseSessionReturn,
 } from "@livekit/components-react";
 import { ConnectionState, TokenSource, Track, type Room } from "livekit-client";
+import { ArrowRight } from "lucide-react";
 import { api } from "@/lib/api";
 import { describeConnectError, friendlyErrorText, useControlPlaneReady } from "@/lib/api-ready";
 import { listAudioDevicesOf, requestMicPermission, saveMicDevice, savedMicDevice, savedOutputDevice, switchWebOutputDevice, webCanSwitchOutput, type AudioDeviceInfo } from "@/lib/audio";
@@ -1138,7 +1139,7 @@ function CallStudioInner({
                 if (oid) onReDialWithObject(oid);
               }}
             >
-              用该对象发起新通话 →
+              用该对象发起新通话 <ArrowRight className="h-3.5 w-3.5" />
             </button>
           </div>
         )}
@@ -1264,7 +1265,7 @@ function CallStudioInner({
                   className="mt-2 inline-block text-xs text-(--live)"
                   href={`/calls?call=${encodeURIComponent(lastFinishedCallId)}`}
                 >
-                  查看通话记录（转写/逐轮）→
+                  查看通话记录（转写/逐轮）<ArrowRight className="h-3.5 w-3.5" />
                 </a>
               )}
               <p className="mt-1 break-all text-xs muted">结算文档：{str(settlement.settlement_doc_path)}</p>

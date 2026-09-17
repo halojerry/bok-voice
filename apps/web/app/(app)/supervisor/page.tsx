@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { Check } from "lucide-react";
 import { api } from "@/lib/api";
 import { friendlyErrorText } from "@/lib/api-ready";
 import { useAccount } from "@/components/account-context";
@@ -266,7 +267,7 @@ export default function SupervisorPage() {
                     {isCaptured && num ? (
                       <p className="mt-0.5 font-mono text-lg tracking-wider text-(--foreground)">
                         {num}
-                        {copied === num && <span className="ml-2 text-xs text-emerald-600">已复制 ✓</span>}
+                        {copied === num && <span className="ml-2 text-xs text-emerald-600">已复制 <Check className="h-3.5 w-3.5" /></span>}
                       </p>
                     ) : (
                       <p className="mt-0.5 text-xs muted">客户应承咗加专员,等紧佢俾号码 / 由专员主动联系。</p>

@@ -5,6 +5,7 @@
 // root 账号只读展示（仅 root 可管理 root/admin），本页不提供跨主管操作。
 
 import { Fragment, useCallback, useEffect, useState } from "react";
+import { Plus } from "lucide-react";
 import { api, type UserRow } from "@/lib/api";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
 import { PAGE_KEYS, PAGE_LABELS, useSession, type PageKey } from "@/components/session-context";
@@ -236,7 +237,7 @@ export default function UsersPage() {
               setNotice("");
             }}
           >
-            + 新建员工
+            <Plus className="h-3.5 w-3.5" /> 新建员工
           </button>
         )}
       </div>

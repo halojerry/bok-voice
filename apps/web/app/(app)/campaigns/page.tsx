@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { ArrowRight, Plus } from "lucide-react";
 import { api } from "@/lib/api";
 import { LoadingState, EmptyState, ErrorState } from "@/components/app-shell";
 
@@ -231,7 +232,7 @@ function SchedulingEditor({ value, onChange }: { value: SchedValue; onChange: (v
           <p className="text-xs muted">不设置 = 全天可拨；最多 {MAX_WINDOWS} 组。</p>
         )}
         {value.call_windows.length < MAX_WINDOWS && (
-          <button className="btn-ghost text-xs" onClick={addWindow}>+ 添加时段</button>
+          <button className="btn-ghost text-xs" onClick={addWindow}><Plus className="h-3.5 w-3.5" /> 添加时段</button>
         )}
       </div>
 
@@ -794,7 +795,7 @@ export default function CampaignsPage() {
           <h1 className="page-title">外呼战役</h1>
           <p className="page-sub">批量外呼：建波次 → 启动 → 盯进度；名单项可直达对应通话工作台</p>
         </div>
-        <button className="btn-primary" onClick={() => { setForm(EMPTY_FORM); setWizardOpen(true); }}>+ 新建战役</button>
+        <button className="btn-primary" onClick={() => { setForm(EMPTY_FORM); setWizardOpen(true); }}><Plus className="h-3.5 w-3.5" /> 新建战役</button>
       </div>
 
       {err && <ErrorState message={err} />}
@@ -847,7 +848,7 @@ export default function CampaignsPage() {
                     {c.status !== "running" && (
                       <button className="btn-ghost text-xs text-red-600/80 hover:text-red-600" disabled={busy} onClick={() => removeCampaign(c)}>删除</button>
                     )}
-                    <button className="btn-ghost text-xs" onClick={() => setOpenId(c.id)}>详情 →</button>
+                    <button className="btn-ghost text-xs" onClick={() => setOpenId(c.id)}>详情 <ArrowRight className="h-3.5 w-3.5" /></button>
                   </div>
                 </div>
                 <ProgressBar progress={c.progress} />
