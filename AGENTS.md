@@ -124,6 +124,42 @@ scripts/build_node_pkg.sh <version>     # 发版：节点代码包（+ build_run
 - Update `docs/RUNTIME_TOPOLOGY.md` / `docs/REPO_MAP.md` whenever ports, paths, or data flow change.
 - **Do not tag or release until full local acceptance passes** (project policy; releases are CI-gated and user-verified).
 
+## Multi-Session Git Discipline（多会话并行纪律）
+
+本仓库为多 Agent 会话并行开发：多个会话共享同一 Git 存储。任何会话触碰仓库一律走本节隔离流程（2026-09-18 起强制；违反红线视为错误）。
+
+**会话启动：**
+1. 每次会话生成唯一 `SESSION_ID` 作为隔离标识（如 `$(date +%Y%m%d-%H%M%S)-$(openssl rand -hex 2)`）；绝不直接操作 main/master 主分支。
+2. 基于 `origin/main` 最新创建专属临时分支与独立 worktree（先 `git fetch origin main`）：
+   ```bash
+   git fetch origin main
+   git worktree add -b session-${SESSION_ID} ./work-session-${SESSION_ID} origin/main
+   ```
+   worktree/分支已存在则直接复用，不重复创建。所有代码修改、编辑、`git add` 全部在 worktree 目录内完成，禁止在仓库根目录直接修改文件。
+3. **输出要求**：每次涉及 git 操作，输出前先声明三件事——①当前会话ID；②当前使用的 worktree 路径；③目标分支名称。所有 git 命令必须完整可直接运行（变量用 `${SESSION_ID}`）。
+
+**提交幂等（防重复提交）：**
+- commit message 必带标记 `[${SESSION_ID}]`；
+- 提交前先 `git log --grep="${SESSION_ID}"`——已存在本会话 commit 则跳过本次提交，不重复提交；
+- 提交前 `git diff --cached` 判断是否存在真实变更；没有变更严禁 `git commit`（禁空 commit、禁不带会话ID的匿名自动 commit）。
+
+**推送：**
+- 只 push 当前会话专属分支 `origin/session-${SESSION_ID}`；禁止直接 push main/master；
+- 禁止对主分支使用 `git push --force`；如需强制仅允许 `--force-with-lease` 且只作用于自己的临时会话分支；不允许多会话并行抢写同一远端共享分支。
+
+**任务收尾：**
+- 输出 MR/PR 创建指令，提示合并到主分支；保留远端分支等待合并；
+- 清理 worktree：`git worktree remove ./work-session-${SESSION_ID}`（仅构建产物拒删时，允许对自己 worktree 加 `--force`）。
+
+**红线（违反即错误）：**
+- 禁止多个会话共用同一个工作目录进行 `git add` / `git commit`；
+- 禁止直接在 main/master 分支上修改提交；
+- 禁止跳过幂等检查直接提交；
+- 禁止删除、修改其他会话的 worktree 和分支；
+- 禁止 `git reset --hard` / `git clean`——只允许操作本会话自己的 worktree。
+
+不需要修改代码的任务，明确说明「无需执行 git 流程」。本流程不允许省略步骤，不允许「简化处理」「为了方便跳过校验」。
+
 ## Operational Constraints
 
 - Never reintroduce Ollama, Docker, or CosyVoice runtime paths (removed by design).
