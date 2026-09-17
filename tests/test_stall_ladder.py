@@ -33,12 +33,14 @@ def test_note_unclear_counts_and_dedupes_per_turn():
     assert fc.note_turn_outcome("unclear", 4, "k3") == 1
 
 
-def test_non_unclear_resets_step():
+def test_question_neutral_objection_resets():
     fc = _fc()
     fc.note_turn_outcome("unclear", 3, "k1")
     fc.note_turn_outcome("unclear", 3, "k2")
-    fc.note_turn_outcome("question", 3, "k3")  # 实质提问不算 stall,清零
-    assert fc.step_streak.get(3, 0) == 0
+    # QUESTION 中性:唔计唔清(否则 judge 攒的 streak 被提问轮抹平,阶梯失效)
+    assert fc.note_turn_outcome("question", 3, "k3") == 2
+    # 决定性 verdict(异议)先清零
+    assert fc.note_turn_outcome("objection", 3, "k4") == 0
 
 
 def test_advance_clears_streak():

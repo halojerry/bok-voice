@@ -957,10 +957,14 @@ class FlowController:
         """每轮判决记账(漏斗 v2,spec §3.1):UNCLEAR 且步未变 +1,其余清该步计数。
 
         同一轮 rule 与 background judge 双路都报 → 按 (step, turn_key) 去重只计 1
-        (judge 迟到返回同轮同 key 直接跳过)。非 UNCLEAR 判决(实质提问/应承/
-        异议/道别/拖延)唔算 stall → 清该步计数;去重键只喺 UNCLEAR 计数时登记,
-        judge 改判 unclear 仍可补计(spec「双路计数」语义:任一路判 unclear 即计)。
+        (judge 迟到返回同轮同 key 直接跳过)。非 UNCLEAR 判决(实质应承/异议/
+        道别/拖延)唔算 stall → 清该步计数;QUESTION 中性(唔计唔清)——实质提问
+        =客户仲喺度倾偈,但相邻提问轮唔好抹平 judge 攒紧嘅 unclear streak
+        (否則阶梯永不触发,2026-09-18 off-detail 实弹);去重键只喺 UNCLEAR
+        计数时登记,judge 改判 unclear 仍可补计(spec「双路计数」语义)。
         """
+        if verdict == QUESTION:
+            return self.step_streak.get(step, 0)
         if verdict != UNCLEAR:
             self.step_streak.pop(step, None)
             return 0
@@ -1317,17 +1321,22 @@ _CONF_RE = re.compile(r"conf(?:idence)?\s*[=:]\s*([0-9](?:\.\d+)?)?")
 
 
 def parse_judge_route(text: str) -> tuple[str, float]:
-    """解析 judge 输出的路由字段(route/conf)。缺失/非法一律回落 ("keep", 0.0)
-    ——旧格式输出、4B 格式漂移、9B 拒答都零行为漂移。"""
+    """解析 judge 输出的路由字段(route/conf)。缺失/非法 route 回落 keep;
+    route 有值但 conf 缺失/非法 → 按门槛值 0.7 放行(显式 route 係强信号,
+    conf 只是修饰——实弹里 9B 偶发省略 conf,按 0.0 处理会静默杀掉整条链)。"""
     t = (text or "").strip().lower()
     m = _ROUTE_RE.search(t)
     route = m.group(1) if m and m.group(1) in JUDGE_ROUTES else "keep"
     c = _CONF_RE.search(t)
-    try:
-        conf = float(c.group(1)) if c and c.group(1) else 0.0
-    except ValueError:
-        conf = 0.0
-    return route, min(max(conf, 0.0), 1.0)
+    conf_val: float | None = None
+    if c and c.group(1):
+        try:
+            conf_val = float(c.group(1))
+        except ValueError:
+            conf_val = None
+    if conf_val is None:
+        conf_val = 0.0 if route == "keep" else 0.7
+    return route, min(max(conf_val, 0.0), 1.0)
 
 
 # 工单登记置信门槛(漏斗 v2,spec §3.3):judge conf ≥ 0.7 先触发建单——

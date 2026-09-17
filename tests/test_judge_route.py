@@ -25,6 +25,12 @@ def test_parse_route_invalid_falls_back():
     assert parse_judge_route("stay route=keep conf=abc")[1] == 0.0
 
 
+def test_route_without_conf_gets_threshold_default():
+    # 模型显式给 route 但省略 conf → 按门槛 0.7 放行(强信号不被静默杀,实弹 9B 偶发)
+    assert parse_judge_route("stay route=register_followup") == ("register_followup", 0.7)
+    assert parse_judge_route("stay route=keep") == ("keep", 0.0)
+
+
 def test_route_vocab():
     assert JUDGE_ROUTES == frozenset({"keep", "degrade_question", "capture_contact", "register_followup", "transfer_human"})
 
