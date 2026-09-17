@@ -368,3 +368,87 @@ def test_create_call_explicit_template_overrides_object_binding(monkeypatch):
         "account_id": "acc-001", "object_id": obj["id"],
     }).json()
     assert fallback["template_id"] == "tpl-object"
+
+
+def _create_campaign(client, repo, **over) -> dict:
+    """最小建波 helper：单对象 + `_campaign_body` 透传覆盖字段。"""
+    obj = repo.create_object("acc-001", {"display_name": "A", "phone": "+85211111111"})
+    return client.post("/api/campaigns", json=_campaign_body(obj, **over)).json()
+
+
+def _create_and_start(client, repo, **over) -> dict:
+    camp = _create_campaign(client, repo, **over)
+    r = client.post(f"/api/campaigns/{camp['id']}/start")
+    assert r.status_code == 200
+    return camp
+
+
+def test_create_campaign_with_scheduling_payload(monkeypatch):
+    """调度三字段（2026-09-17）：时段窗归一（非法窗丢/超 3 截断）、并发 0=不限、
+    重拨策略 on 白名单剔除。"""
+    client, repo = _client_and_repo(monkeypatch)
+    body = _campaign_body(
+        repo.create_object("acc-001", {"display_name": "A", "phone": "+85211111111"}),
+        call_windows=[{"days": [1, 2, 3, 4, 5], "start": "08:00", "end": "18:00"},
+                      {"days": [6], "start": "09:00", "end": "12:00"},
+                      {"days": [7], "start": "bad", "end": "x"},
+                      {"days": [1], "start": "10:00", "end": "11:00"}],
+        max_concurrency=0,
+        redispatch={"max_attempts": 2, "interval_minutes": 30,
+                    "on": ["no_answer", "junk"]},
+    )
+    camp = client.post("/api/campaigns", json=body).json()
+    assert len(camp["call_windows"]) == 3  # 非法窗丢、超 3 截断
+    assert camp["max_concurrency"] == 0
+    assert camp["redispatch"]["on"] == ["no_answer"]  # 非法结果名剔除
+
+
+def test_create_campaign_explicit_null_max_concurrency_defaults_to_one(monkeypatch):
+    """T1-M1 防呆：显式 `"max_concurrency": null` 不落 0（不限），按缺省 1（串行）。"""
+    client, repo = _client_and_repo(monkeypatch)
+    camp = _create_campaign(client, repo, max_concurrency=None)
+    assert camp["max_concurrency"] == 1
+
+
+def test_update_campaign_rejects_running(monkeypatch):
+    """运行中锁定（对齐竞品语义）：running 时段/并发不可改，先 pause。"""
+    client, repo = _client_and_repo(monkeypatch)
+    camp = _create_and_start(client, repo)
+    resp = client.put(f"/api/campaigns/{camp['id']}", json={"gap_seconds": 9})
+    assert resp.status_code == 409
+    assert repo.get_campaign(camp["id"])["gap_seconds"] == 5  # 拒改未落库
+
+
+def test_update_campaign_edits_paused(monkeypatch):
+    """draft/paused 可改：调度字段+基础字段白名单落库，响应回解析后形状。"""
+    client, repo = _client_and_repo(monkeypatch)
+    camp = _create_campaign(client, repo)
+    resp = client.put(
+        f"/api/campaigns/{camp['id']}",
+        json={"max_concurrency": 3,
+              "call_windows": [{"days": [1], "start": "08:00", "end": "12:00"}]},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["max_concurrency"] == 3
+    assert resp.json()["call_windows"] == [{"days": [1], "start": "08:00", "end": "12:00"}]
+    row = repo.get_campaign(camp["id"])
+    assert row["max_concurrency"] == 3
+
+
+def test_update_campaign_missing_is_404_and_audits(monkeypatch):
+    """PUT 404 同既有端点；成功编辑落 campaign.update 审计。"""
+    from bok_voice_obs.audit import AuditStore, audit_store
+
+    events: list[str] = []
+    original = audit_store()
+    monkeypatch.setattr(
+        "bok_voice_obs.audit._STORE",
+        AuditStore(original.directory, tap=lambda e: events.append(e.action)),
+    )
+    client, repo = _client_and_repo(monkeypatch)
+    assert client.put("/api/campaigns/camp-nope", json={"gap_seconds": 9}).status_code == 404
+    camp = _create_campaign(client, repo)
+    resp = client.put(f"/api/campaigns/{camp['id']}", json={"name": "改名波次"})
+    assert resp.status_code == 200
+    assert resp.json()["name"] == "改名波次"
+    assert "campaign.update" in events

@@ -36,6 +36,7 @@ from bok_voice_obs.context import get_correlation
 from bok_voice_obs.logging import configure_logging, get_logger
 from bok_voice_obs.middleware import CorrelationMiddleware
 
+from .campaign import parse_call_windows
 from .deps import build_engine, build_repository, build_session_factory
 from .dispatch_utils import cleanup_dispatch, has_active_dispatch
 from .nodes_store import HEARTBEAT_INTERVAL_S, LicenseError, NodeStore
@@ -1863,6 +1864,13 @@ class CampaignCreateRequest(BaseModel):
     # 8kHz 窄带档（T5 前置门）：mock 客户话音走电话频带，重验窄带下的 ASR。
     # 与句间隔同一份 scripts_json 保留键（`__narrowband__`），只加键不加列。
     narrowband: bool = False
+    # 调度三字段（2026-09-17）：时段窗（≤3 组，非法项由 parse_call_windows 静默
+    # 丢弃）、并发（0=不限，缺省 1=旧串行）、重拨策略（空=不重拨）。
+    call_windows: list[dict] = []
+    # `| None` 是 T1-M1 防呆：显式 `"max_concurrency": null` 收口为缺省 1（串行），
+    # 不落 0（不限）——端点在 `is None` 时传 1。
+    max_concurrency: int | None = 1
+    redispatch: dict = {}
 
 
 @app.post("/api/campaigns")
@@ -1907,6 +1915,10 @@ def create_campaign(req: CampaignCreateRequest, request: Request) -> dict:
         scenarios={k: v for k, v in req.scenarios.items() if v in _CAMPAIGN_SCENARIOS},
         scripts=scripts,
         site_id=req.site_id,
+        call_windows=parse_call_windows(req.call_windows),
+        # 显式 null / 缺省 → 1（旧串行）；绝不向 repo 传 None（T1-M1 防呆）。
+        max_concurrency=1 if req.max_concurrency is None else max(0, int(req.max_concurrency)),
+        redispatch=_clean_redispatch(req.redispatch),
     )
     _audit("campaign.create", subject_type="campaign", subject_id=camp["id"],
            account_id=req.account_id, detail={"objects": len(req.object_ids)})
@@ -1989,6 +2001,68 @@ def delete_campaign(campaign_id: str, request: Request) -> dict:
            account_id=str(camp.get("account_id") or ""),
            detail={"items": len(items), "status": status})
     return {"campaign_id": campaign_id, "deleted": True, "items_removed": len(items)}
+
+
+_REDISPATCH_OUTCOMES = ("no_answer", "rejected", "failed")
+
+
+def _clean_redispatch(raw: dict | None) -> dict:
+    """重拨策略清洗：max_attempts≥0、interval_minutes>0 才有意义、on 白名单剔除。"""
+    if not isinstance(raw, dict):
+        return {}
+    try:
+        max_attempts = max(0, int(raw.get("max_attempts") or 0))
+    except (TypeError, ValueError):
+        return {}
+    try:
+        interval = float(raw.get("interval_minutes") or 0)
+    except (TypeError, ValueError):
+        return {}
+    if max_attempts <= 0 or interval <= 0:
+        return {}
+    on = [str(x) for x in (raw.get("on") or []) if str(x) in _REDISPATCH_OUTCOMES]
+    return {"max_attempts": max_attempts, "interval_minutes": interval, "on": on}
+
+
+class CampaignUpdateRequest(BaseModel):
+    name: str | None = None
+    template_id: str | None = None
+    persona_id: str | None = None
+    language: str | None = None
+    gap_seconds: int | None = None
+    site_id: str | None = None
+    call_windows: list[dict] | None = None
+    max_concurrency: int | None = None
+    redispatch: dict | None = None
+
+
+@app.put("/api/campaigns/{campaign_id}")
+def update_campaign(campaign_id: str, req: CampaignUpdateRequest, request: Request) -> dict:
+    """改战役配置：running 拒改（409，运行中时段/并发锁定——对齐惜客通语义）；
+    draft/paused/stopped 可改。字段只增不改默认语义（None=不碰该字段）。"""
+    _gate_page(request, "campaigns")
+    camp = deny_cross_account(request, _repo().get_campaign(campaign_id))
+    if not camp:
+        raise HTTPException(404, "campaign not found")
+    if str(camp.get("status") or "") == "running":
+        raise HTTPException(409, "campaign is running — pause it first")
+    fields: dict = {k: v for k, v in {
+        "name": req.name, "template_id": req.template_id, "persona_id": req.persona_id,
+        "language": req.language, "gap_seconds": req.gap_seconds, "site_id": req.site_id,
+    }.items() if v is not None}
+    if req.call_windows is not None:
+        fields["call_windows_json"] = json.dumps(
+            parse_call_windows(req.call_windows), ensure_ascii=False)
+    if req.max_concurrency is not None:
+        fields["max_concurrency"] = max(0, int(req.max_concurrency))
+    if req.redispatch is not None:
+        cleaned = _clean_redispatch(req.redispatch)
+        fields["redispatch_json"] = json.dumps(cleaned, ensure_ascii=False) if cleaned else ""
+    updated = _repo().update_campaign(campaign_id, **fields) or camp
+    _audit("campaign.update", subject_type="campaign", subject_id=campaign_id,
+           account_id=str(camp.get("account_id") or ""),
+           detail={"fields": sorted(fields)})
+    return updated
 
 
 def _progress(items: list[dict]) -> dict:
