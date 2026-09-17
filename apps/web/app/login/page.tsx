@@ -73,7 +73,7 @@ export default function LoginPage() {
             </label>
 
             {error && (
-              <p className="rounded-lg bg-red-500/10 p-2.5 text-sm text-red-300">{error}</p>
+              <p className="rounded-lg bg-red-500/10 p-2.5 text-sm text-red-600">{error}</p>
             )}
 
             <button

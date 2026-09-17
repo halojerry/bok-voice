@@ -118,9 +118,9 @@ export default function ListenPanel({
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <span className={`inline-flex items-center gap-1.5 text-xs ${status === "live" ? "text-emerald-400" : "muted"}`}>
+          <span className={`inline-flex items-center gap-1.5 text-xs ${status === "live" ? "text-emerald-600" : "muted"}`}>
             <span
-              className={`h-2 w-2 rounded-full ${status === "live" ? "animate-pulse bg-emerald-400" : "bg-neutral-500"}`}
+              className={`h-2 w-2 rounded-full ${status === "live" ? "animate-pulse bg-emerald-500" : "bg-neutral-500"}`}
             />
             {status === "live" ? "旁听中" : status === "connecting" ? "连接中…" : "已结束"}
           </span>
@@ -130,7 +130,7 @@ export default function ListenPanel({
         </div>
       </div>
 
-      {err && <p className="rounded-lg bg-red-500/10 p-2 text-xs text-red-300">{err}</p>}
+      {err && <p className="rounded-lg bg-red-500/10 p-2 text-xs text-red-600">{err}</p>}
       {!token && !err && <p className="text-xs muted">正在获取旁听凭证…</p>}
 
       {token && (

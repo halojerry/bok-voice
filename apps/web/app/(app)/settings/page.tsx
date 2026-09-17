@@ -191,7 +191,7 @@ function VoicePreview({ provider, fieldKey, voice }: { provider: string; fieldKe
         {busy ? "合成中…" : url ? "试听已选音色" : "试听"}
       </button>
       {url && <audio controls src={url} className="h-6 w-44" />}
-      {err && <span className="text-[11px] text-red-300">{err}</span>}
+      {err && <span className="text-[11px] text-red-600">{err}</span>}
     </div>
   );
 }
@@ -425,10 +425,10 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
                 {trunkBusy ? "注册中…" : "注册 trunk"}
               </button>
               {trunkNote && (
-                <p className={`mt-1 text-[11px] ${trunkNote.error ? "text-red-300" : "muted"}`}>{trunkNote.text}</p>
+                <p className={`mt-1 text-[11px] ${trunkNote.error ? "text-red-600" : "muted"}`}>{trunkNote.text}</p>
               )}
               {siteNote && (
-                <p className={`mt-1 text-[11px] ${siteNote.error ? "text-red-300" : "muted"}`}>{siteNote.text}</p>
+                <p className={`mt-1 text-[11px] ${siteNote.error ? "text-red-600" : "muted"}`}>{siteNote.text}</p>
               )}
             </div>
           </>
@@ -521,7 +521,7 @@ function AudioDevicesCard() {
             </button>
           </div>
           {mic.length === 0 && (
-            <p className="mt-1 text-xs text-red-300">
+            <p className="mt-1 text-xs text-red-600">
               未检测到麦克风或未授权。请先点击「刷新」授权；若仍为空，到系统设置开启麦克风权限后重启应用。
             </p>
           )}
@@ -728,13 +728,13 @@ function MinimaxClonePanel({ clones, onChange }: { clones: MinimaxClone[]; onCha
               <span className="muted">{c.voice_id}</span>
               <button className="btn-ghost px-1 py-0 text-xs" disabled={busy}
                 onClick={() => preview(c.voice_id, c.sample_lang || "zh")}>试听（激活）</button>
-              <button className="btn-ghost px-1 py-0 text-xs text-red-400" disabled={busy}
+              <button className="btn-ghost px-1 py-0 text-xs text-red-600" disabled={busy}
                 onClick={() => remove(c.voice_id)}>删除</button>
             </li>
           ))}
         </ul>
       )}
-      {err && <p className="mt-2 text-xs text-red-400">{err}</p>}
+      {err && <p className="mt-2 text-xs text-red-600">{err}</p>}
     </details>
   );
 }
@@ -921,7 +921,7 @@ export default function SettingsPage() {
             <button className="btn-primary" onClick={save}>保存设置</button>
             <button className="btn-ghost" onClick={() => testHealth("asr")}>测试 ASR</button>
             <button className="btn-ghost" onClick={() => testHealth("tts")}>测试 TTS</button>
-            {ok && <span className="text-sm text-emerald-400">已保存。</span>}
+            {ok && <span className="text-sm text-emerald-600">已保存。</span>}
             {health && <span className="text-sm muted">{health}</span>}
           </div>
           {err && <div className="lg:col-span-2"><ErrorState message={err} /></div>}

@@ -542,7 +542,7 @@ function CampaignWizard({
         </div>
       )}
 
-      {err && <p className="mt-2 text-xs text-red-300">{err}</p>}
+      {err && <p className="mt-2 text-xs text-red-600">{err}</p>}
 
       <div className="mt-4 flex items-center gap-2">
         {step > 1 && <button className="btn-ghost text-xs" onClick={() => setStep(step - 1)}>上一步</button>}
@@ -845,7 +845,7 @@ export default function CampaignsPage() {
                       <button className="btn-ghost text-xs" disabled={busy} onClick={() => stopCampaign(c)}>停止</button>
                     )}
                     {c.status !== "running" && (
-                      <button className="btn-ghost text-xs text-red-300/80 hover:text-red-300" disabled={busy} onClick={() => removeCampaign(c)}>删除</button>
+                      <button className="btn-ghost text-xs text-red-600/80 hover:text-red-600" disabled={busy} onClick={() => removeCampaign(c)}>删除</button>
                     )}
                     <button className="btn-ghost text-xs" onClick={() => setOpenId(c.id)}>详情 →</button>
                   </div>

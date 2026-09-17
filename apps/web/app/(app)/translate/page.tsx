@@ -209,7 +209,7 @@ export default function TranslatePage() {
             独立于客服 Agent 的 B 线：ASR → 原文字幕 → 翻译 → Qwen3-TTS → 播放/字幕
           </p>
         </div>
-        <span className={`font-mono text-xs ${wsState === "open" ? "text-(--stage-value)" : "text-red-300"}`}>
+        <span className={`font-mono text-xs ${wsState === "open" ? "text-(--stage-value)" : "text-red-600"}`}>
           WS {wsState.toUpperCase()} · {WS_URL}
         </span>
       </div>
@@ -275,7 +275,7 @@ export default function TranslatePage() {
                 <span>backlog <b className="text-(--stage-value)">{ch.metrics.playableBacklogMs}ms</b></span>
                 <span>chase <b className="text-(--stage-value)">{ch.metrics.chaseState} ×{ch.metrics.chaseSpeed.toFixed(2)}</b></span>
                 <span>queued <b className="text-(--stage-value)">{ch.metrics.queuedAudioMs}ms</b></span>
-                <span>dropped <b className="text-red-300">{ch.metrics.droppedBlocks}块/{ch.metrics.droppedMs}ms</b></span>
+                <span>dropped <b className="text-red-600">{ch.metrics.droppedBlocks}块/{ch.metrics.droppedMs}ms</b></span>
               </div>
             )}
           </div>

@@ -431,7 +431,7 @@ export default function PersonasPage() {
                     </div>
                     <div className="flex shrink-0 gap-2">
                       <button className="btn-ghost text-xs" onClick={() => edit(row)}>编辑</button>
-                      <button className="btn-ghost text-xs text-red-300" onClick={() => remove(id)}>删除</button>
+                      <button className="btn-ghost text-xs text-red-600" onClick={() => remove(id)}>删除</button>
                     </div>
                   </div>
                 );
@@ -583,7 +583,7 @@ export default function PersonasPage() {
             <div className="rounded-lg border border-(--card-border) p-2">
               <div className="flex items-center gap-2">
                 <button
-                  className={`btn-ghost flex-1 text-xs ${recording ? "text-red-300!" : ""}`}
+                  className={`btn-ghost flex-1 text-xs ${recording ? "text-red-600!" : ""}`}
                   onClick={toggleRecording}
                 >
                   {recording ? `● 停止录音（${recSec}s）` : "🎙 录音（用麦克风录一段）"}
@@ -593,7 +593,7 @@ export default function PersonasPage() {
                 )}
               </div>
               {recording && (
-                <p className="mt-1 text-xs text-red-300">正在录音…请对着麦克风说参考语料（建议 5-10 秒，可含目标语言特征）。</p>
+                <p className="mt-1 text-xs text-red-600">正在录音…请对着麦克风说参考语料（建议 5-10 秒，可含目标语言特征）。</p>
               )}
               {recBlobUrl && (
                 <div className="mt-2">
@@ -656,7 +656,7 @@ export default function PersonasPage() {
                           试听
                         </button>
                         <button
-                          className="text-red-300 hover:text-red-200"
+                          className="text-red-600 hover:text-red-700"
                           onClick={async () => {
                             if (!window.confirm(`确认删除克隆音色「${cv.id}」？\n已绑定该音色的人设会自动改为不绑定。`)) return;
                             setErr(null);
@@ -687,7 +687,7 @@ export default function PersonasPage() {
           <button className="btn-primary w-full" onClick={save}>
             {editingId ? "保存修改" : "新建人设"}
           </button>
-          {ok && <p className="text-sm text-emerald-400">已保存。</p>}
+          {ok && <p className="text-sm text-emerald-600">已保存。</p>}
         </section>
       </div>
     </div>

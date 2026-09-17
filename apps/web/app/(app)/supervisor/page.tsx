@@ -223,14 +223,14 @@ export default function SupervisorPage() {
           进行中 <b className="text-(--stage-value)">{activeCount}</b>
         </span>
         <span className="card px-4 py-2">
-          已暂停 <b className={pausedCount ? "text-amber-400" : "muted"}>{pausedCount}</b>
+          已暂停 <b className={pausedCount ? "text-amber-700" : "muted"}>{pausedCount}</b>
         </span>
         <span className="card px-4 py-2">
           WhatsApp 待对接 <b className={pending.length ? "text-accent" : "muted"}>{pending.length}</b>
         </span>
       </div>
 
-      {err && <p className="mb-4 rounded-lg bg-red-500/10 p-3 text-sm text-red-300">{err}</p>}
+      {err && <p className="mb-4 rounded-lg bg-red-500/10 p-3 text-sm text-red-600">{err}</p>}
 
       {listenId && (
         <div className="mb-6">
@@ -266,7 +266,7 @@ export default function SupervisorPage() {
                     {isCaptured && num ? (
                       <p className="mt-0.5 font-mono text-lg tracking-wider text-(--foreground)">
                         {num}
-                        {copied === num && <span className="ml-2 text-xs text-emerald-400">已复制 ✓</span>}
+                        {copied === num && <span className="ml-2 text-xs text-emerald-600">已复制 ✓</span>}
                       </p>
                     ) : (
                       <p className="mt-0.5 text-xs muted">客户应承咗加专员,等紧佢俾号码 / 由专员主动联系。</p>
@@ -330,10 +330,10 @@ export default function SupervisorPage() {
                     </div>
                     <span
                       className={`inline-flex shrink-0 items-center gap-1.5 text-xs ${
-                        paused ? "text-amber-400" : "text-emerald-400"
+                        paused ? "text-amber-700" : "text-emerald-600"
                       }`}
                     >
-                      <span className={`h-2 w-2 rounded-full animate-pulse ${paused ? "bg-amber-400" : "bg-emerald-400"}`} />
+                      <span className={`h-2 w-2 rounded-full animate-pulse ${paused ? "bg-amber-400" : "bg-emerald-500"}`} />
                       {paused ? "AI 已暂停" : "进行中"}
                     </span>
                   </div>
@@ -370,7 +370,7 @@ export default function SupervisorPage() {
                       转人工
                     </button>
                     <button
-                      className="btn-ghost text-xs text-red-300/80 hover:text-red-300"
+                      className="btn-ghost text-xs text-red-600/80 hover:text-red-600"
                       disabled={isBusy}
                       onClick={() => confirmAct(c, "hangup", api.hangup, `确认挂断「${labelOf(c)}」？通话将结束并触发结算。`)}
                     >

@@ -15,7 +15,7 @@ import { friendlyErrorText } from "@/lib/api-ready";
 function StatusBadge() {
   const { health, settingsLoading } = useAccount();
   if (settingsLoading) return <span className="font-mono">loading</span>;
-  if (health === false) return <span className="text-xs text-red-300">控制面离线</span>;
+  if (health === false) return <span className="text-xs text-red-600">控制面离线</span>;
   return (
     <span className="hidden items-center gap-2 text-xs text-(--stage-muted) sm:inline-flex">
       <span className="h-2 w-2 rounded-full bg-(--stage-value)" />
@@ -96,7 +96,7 @@ export function EmptyState({ label = "暂无数据" }: { label?: string }) {
 
 export function ErrorState({ message }: { message: string }) {
   return (
-    <p className="rounded-lg bg-red-500/10 p-3 text-sm text-red-300">
+    <p className="rounded-lg bg-red-500/10 p-3 text-sm text-red-600">
       {friendlyErrorText(message)}
     </p>
   );

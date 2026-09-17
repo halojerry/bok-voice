@@ -7,7 +7,7 @@ import { useAccount } from "@/components/account-context";
 import { CallStudio } from "@/components/CallStudio";
 
 const STATUS: Record<string, [string, string]> = {
-  active: ["进行中", "bg-emerald-400"],
+  active: ["进行中", "bg-emerald-500"],
   ringing: ["振铃", "bg-amber-400"],
   paused: ["已暂停", "bg-sky-400"],
   ended: ["已结束", "bg-neutral-500"],
@@ -140,7 +140,7 @@ export default function CallsPage() {
         </div>
       </div>
 
-      {err && <p className="mb-4 text-sm text-red-300">{err}</p>}
+      {err && <p className="mb-4 text-sm text-red-600">{err}</p>}
       {loading && <p className="text-sm muted">加载中…</p>}
 
       {openId && (
@@ -230,7 +230,7 @@ export default function CallsPage() {
                     </div>
                   </button>
                   <button
-                    className="btn-ghost shrink-0 text-xs text-red-300/80 hover:text-red-300"
+                    className="btn-ghost shrink-0 text-xs text-red-600/80 hover:text-red-600"
                     onClick={() => removeOne(id)}
                     title="删除该通话记录"
                   >

@@ -14,8 +14,8 @@ const DEFAULT_PERMISSIONS: string[] = PAGE_KEYS.filter((k) => k !== "reports");
 
 const ROLE_LABEL: Record<string, string> = { root: "超级管理员", admin: "管理员", user: "话务员" };
 const ROLE_BADGE: Record<string, string> = {
-  root: "bg-amber-400/15 text-amber-300",
-  admin: "bg-sky-400/15 text-sky-300",
+  root: "bg-amber-100 text-amber-700",
+  admin: "bg-sky-100 text-sky-700",
   user: "bg-muted muted",
 };
 
@@ -242,7 +242,7 @@ export default function UsersPage() {
       </div>
 
       {err && <ErrorState message={err} />}
-      {notice && <p className="text-sm text-emerald-400">{notice}</p>}
+      {notice && <p className="text-sm text-emerald-600">{notice}</p>}
 
       {createOpen && (
         <section className="card space-y-3">
@@ -315,7 +315,7 @@ export default function UsersPage() {
                 : "管理员默认拥有全部页面权限，无需勾选。"}
             </p>
           </div>
-          {createErr && <p className="text-xs text-red-300">{createErr}</p>}
+          {createErr && <p className="text-xs text-red-600">{createErr}</p>}
           <div className="flex items-center gap-2">
             <button className="btn-primary text-xs" disabled={createBusy} onClick={() => void create()}>
               {createBusy ? "创建中…" : "创建员工"}
@@ -358,7 +358,7 @@ export default function UsersPage() {
                         </span>
                       </td>
                       <td>
-                        <span className={u.status === "disabled" ? "text-xs text-amber-300/80" : "text-xs muted"}>
+                        <span className={u.status === "disabled" ? "text-xs text-amber-700" : "text-xs muted"}>
                           {u.status === "disabled" ? "停用" : "正常"}
                         </span>
                       </td>
@@ -450,7 +450,7 @@ export default function UsersPage() {
                             <button className="btn-ghost text-xs" onClick={() => { setPwEditId(""); setPwDraft(""); setPwErr(""); }}>
                               取消
                             </button>
-                            {pwErr && <span className="text-xs text-red-300">{pwErr}</span>}
+                            {pwErr && <span className="text-xs text-red-600">{pwErr}</span>}
                           </div>
                         </td>
                       </tr>

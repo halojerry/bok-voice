@@ -32,7 +32,7 @@ function AgentStateLabel({ state }: { state: string }) {
     "pre-connect-buffering": { label: "预连接缓冲", color: "bg-amber-400" },
     connecting: { label: "连接中", color: "bg-neutral-400" },
     initializing: { label: "初始化", color: "bg-amber-400" },
-    listening: { label: "聆听中", color: "bg-emerald-400" },
+    listening: { label: "聆听中", color: "bg-emerald-500" },
     thinking: { label: "思考中", color: "bg-sky-400" },
     speaking: { label: "说话中", color: "bg-fuchsia-400" },
     disconnected: { label: "已断开", color: "bg-neutral-600" },
@@ -232,13 +232,13 @@ function MicLevelMeter({ room }: { room: Room | null }) {
     <div className="mt-2">
       <div className="flex items-center justify-between">
         <span className="text-[10px] muted">麦克风输入波形</span>
-        <span className={`text-[10px] ${active ? "text-emerald-400" : "muted"}`}>
+        <span className={`text-[10px] ${active ? "text-emerald-600" : "muted"}`}>
           {active ? `● 采集中 ${level > 3 ? `音量 ${level}` : "(静音)"}` : error ? "无法分析" : "未采集"}
         </span>
       </div>
       <canvas ref={canvasRef} width={260} height={40} className="mt-1 w-full rounded-sm bg-muted" />
       {trackInfo && <p className="mt-0.5 truncate text-[9px] muted" title={trackInfo}>{trackInfo}</p>}
-      {error && <p className="mt-1 text-[10px] text-red-300">{error}</p>}
+      {error && <p className="mt-1 text-[10px] text-red-600">{error}</p>}
     </div>
   );
 }
@@ -338,7 +338,7 @@ function AudioDevicesCard({ room }: { room: Room | null }) {
             </button>
           </div>
         </div>
-        {micDevices.length === 0 && micNote && <p className="text-red-300">{micNote}</p>}
+        {micDevices.length === 0 && micNote && <p className="text-red-600">{micNote}</p>}
         <div className="flex items-center justify-between gap-2">
           <span className="muted">扬声器</span>
           {outputCanSwitch ? (
@@ -1081,7 +1081,7 @@ function CallStudioInner({
                             : "接通"}
                   </button>
                   {connecting && (
-                    <p className="animate-pulse text-[11px] text-sky-300">
+                    <p className="animate-pulse text-[11px] text-sky-700">
                       正在创建会话并接通…（约几秒，随后显示「初始化中」）
                     </p>
                   )}
@@ -1089,7 +1089,7 @@ function CallStudioInner({
               ) : (
                 <div className="flex items-center gap-2">
                   {initHintUntil > 0 && Date.now() < initHintUntil && (
-                    <span className="animate-pulse text-[11px] text-sky-300" data-tick={nowTick}>
+                    <span className="animate-pulse text-[11px] text-sky-700" data-tick={nowTick}>
                       AI 初始化中…
                     </span>
                   )}
@@ -1122,7 +1122,7 @@ function CallStudioInner({
         </div>
 
         {error && (
-          <div className="rounded-lg bg-red-500/10 p-3 text-sm text-red-300">
+          <div className="rounded-lg bg-red-500/10 p-3 text-sm text-red-600">
             <p>{error}</p>
           </div>
         )}
@@ -1226,8 +1226,8 @@ function CallStudioInner({
             {PROVIDER_FIELDS.map(([kind, label]) => (
               <p key={kind} className="flex justify-between">
                 <span className="muted">{label}</span>
-                <span className="inline-flex items-center gap-1.5 text-emerald-400">
-                  <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                <span className="inline-flex items-center gap-1.5 text-emerald-600">
+                  <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
                   已连接
                 </span>
               </p>
@@ -1241,7 +1241,7 @@ function CallStudioInner({
             <>
               <p className="flex justify-between">
                 <span className="muted">状态</span>
-                <span className="text-emerald-400">{str(settlement.status)}</span>
+                <span className="text-emerald-600">{str(settlement.status)}</span>
               </p>
               {str(settlement.summary) && (
                 <p className="mt-2 border-t border-(--card-border) pt-2 text-xs leading-relaxed muted">

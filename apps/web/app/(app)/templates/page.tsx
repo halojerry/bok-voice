@@ -415,7 +415,7 @@ export default function TemplatesPage() {
                           {String(row.name ?? "-")}
                           <span
                             className={`rounded-sm px-1.5 py-0.5 text-[10px] font-normal ${
-                              ownerId === "" ? "bg-muted muted" : "bg-sky-400/15 text-sky-300"
+                              ownerId === "" ? "bg-muted muted" : "bg-sky-100 text-sky-700"
                             }`}
                           >
                             {ownerLabel}
@@ -440,7 +440,7 @@ export default function TemplatesPage() {
                           编辑
                         </button>
                         <button
-                          className="btn-ghost text-xs text-red-300"
+                          className="btn-ghost text-xs text-red-600"
                           disabled={!canEdit}
                           title={canEdit ? undefined : "共享话术由主管维护"}
                           onClick={() => remove(id)}
@@ -520,7 +520,7 @@ export default function TemplatesPage() {
                     <div className="flex gap-1">
                       <button className="btn-ghost px-1.5 py-0 text-xs" disabled={i === 0} onClick={() => setSteps((s) => { const n = [...s]; [n[i - 1], n[i]] = [n[i], n[i - 1]]; return n; })}>↑</button>
                       <button className="btn-ghost px-1.5 py-0 text-xs" disabled={i === steps.length - 1} onClick={() => setSteps((s) => { const n = [...s]; [n[i + 1], n[i]] = [n[i], n[i + 1]]; return n; })}>↓</button>
-                      <button className="btn-ghost px-1.5 py-0 text-xs text-red-300" onClick={() => setSteps((s) => s.filter((_, j) => j !== i))}>删</button>
+                      <button className="btn-ghost px-1.5 py-0 text-xs text-red-600" onClick={() => setSteps((s) => s.filter((_, j) => j !== i))}>删</button>
                     </div>
                   </div>
                   <input
@@ -659,7 +659,7 @@ export default function TemplatesPage() {
           <div className="flex items-center gap-3">
             <button className="btn-primary" onClick={save}>{editingId ? "保存修改" : "创建模板"}</button>
             {editingId && <button className="btn-ghost" onClick={() => { setEditingId(null); setForm(EMPTY); setSteps([]); }}>取消</button>}
-            {ok && <span className="text-sm text-emerald-400">已保存。</span>}
+            {ok && <span className="text-sm text-emerald-600">已保存。</span>}
           </div>
         </section>
       </div>

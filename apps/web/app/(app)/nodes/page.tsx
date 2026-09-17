@@ -12,9 +12,9 @@ import { friendlyErrorText } from "@/lib/api-ready";
 
 const STATUS_LABEL: Record<string, string> = { online: "在线", offline: "离线", revoked: "已吊销" };
 const STATUS_BADGE: Record<string, string> = {
-  online: "bg-emerald-400/15 text-emerald-300",
+  online: "bg-emerald-100 text-emerald-700",
   offline: "bg-muted muted",
-  revoked: "bg-red-500/15 text-red-300",
+  revoked: "bg-red-500/15 text-red-600",
 };
 
 /** 吊销来源：root=人工停栈（粘性）；auto_clone=克隆/挪机自动吊销（重注册可复活）。 */
@@ -142,7 +142,7 @@ export default function NodesPage() {
       </div>
 
       {err && <ErrorState message={err} />}
-      {notice && <p className="text-sm text-emerald-400">{notice}</p>}
+      {notice && <p className="text-sm text-emerald-600">{notice}</p>}
 
       <section className="card">
         {rows === null ? (
@@ -197,7 +197,7 @@ export default function NodesPage() {
                           解除吊销
                         </button>
                       ) : (
-                        <button className="btn-ghost text-xs text-red-300" disabled={rowBusy} onClick={() => void revoke(n)}>
+                        <button className="btn-ghost text-xs text-red-600" disabled={rowBusy} onClick={() => void revoke(n)}>
                           吊销
                         </button>
                       )}

@@ -267,7 +267,7 @@ export default function ObjectsPage() {
             </div>
           )}
           {err && <ErrorState message={err} />}
-          {bulkErr && <p className="mb-2 text-xs text-red-300">{bulkErr}</p>}
+          {bulkErr && <p className="mb-2 text-xs text-red-600">{bulkErr}</p>}
           {dialMsg && (
             <p className="mb-2 text-xs muted">
               {dialMsg} · <Link href="/calls" className="text-accent">查看通话</Link>
@@ -291,7 +291,7 @@ export default function ObjectsPage() {
                 </label>
                 <span className="muted">已选 {selected.size}</span>
                 {selected.size > 0 && (
-                  <button className="btn-ghost text-red-300" onClick={deleteSelected}>
+                  <button className="btn-ghost text-red-600" onClick={deleteSelected}>
                     删除所选（{selected.size}）
                   </button>
                 )}
@@ -339,7 +339,7 @@ export default function ObjectsPage() {
                         发起新通话
                       </Link>
                       <button className="btn-ghost text-xs" onClick={() => edit(r as unknown as ObjectRow)}>编辑</button>
-                      <button className="btn-ghost text-xs text-red-300" onClick={() => remove(id)}>删除</button>
+                      <button className="btn-ghost text-xs text-red-600" onClick={() => remove(id)}>删除</button>
                     </div>
                     </div>
                   );

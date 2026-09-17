@@ -103,7 +103,7 @@ export default function KnowledgePage() {
                       <p className="text-xs muted">{String(doc.path ?? doc.source ?? "片段")}</p>
                       <p className="mt-1 line-clamp-3 text-sm">{String(doc.text ?? doc.content ?? "")}</p>
                     </div>
-                    <button className="shrink-0 text-xs text-red-300" onClick={() => remove(id)}>删除</button>
+                    <button className="shrink-0 text-xs text-red-600" onClick={() => remove(id)}>删除</button>
                   </div>
                 );
               })}
@@ -160,7 +160,7 @@ export default function KnowledgePage() {
                 填入示例
               </button>
             </div>
-            {ok && <p className="mt-2 text-sm text-emerald-400">导入成功。</p>}
+            {ok && <p className="mt-2 text-sm text-emerald-600">导入成功。</p>}
           </div>
 
           <div className="card">
