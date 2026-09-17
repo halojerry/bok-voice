@@ -13,8 +13,32 @@ import weakref
 from dataclasses import dataclass
 
 import httpx
-from livekit.agents import APIConnectOptions, NOT_GIVEN, llm, stt, tts, utils, vad
+from livekit.agents import (
+    APIConnectOptions,
+    DEFAULT_API_CONNECT_OPTIONS,
+    NOT_GIVEN,
+    llm,
+    stt,
+    tts,
+    utils,
+    vad,
+)
 from livekit.plugins.openai import LLM as _OpenAICompatBase
+
+# 后台任务强引用池(2026-09-17 全量 debug P2-A):事件循环对 task 只持弱引用,
+# GC 可中途回收仍在跑的 fire-and-forget 任务——与本仓 _duration_fuse 注释、
+# MiniMax 孤儿 invalidate、agent.py _SETTLE_TASKS 是同一实证 bug 类。本模块无
+# entrypoint 闭包,用模块级 set + done-callback 自清;两处调用点(MiniMax 池
+# 连接弃置 / ASR partial 调档)本就是 best-effort,只补引用零行为改动。
+_BACKGROUND_TASKS: set = set()
+
+
+def _spawn_bg(coro) -> None:
+    """fire-and-forget 但不裸奔:入强引用池,done-callback 自清(防池无界增长)。"""
+    task = asyncio.ensure_future(coro)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
 
 # 粤语特征字/词：Qwen3-ASR 对粤语偶发判成 Chinese（语言标签不稳），
 # 若文本命中这些地道粤语用字则按粤语处理，避免 LLM 被误判成普通话后回普。
@@ -386,6 +410,364 @@ class MlxLlmLLM(_OpenAICompatBase):
             timeout=httpx.Timeout(connect=5.0, read=30.0, write=5.0, pool=5.0),
         )
 
+    # ---- 主回复 deadline + 兜底直念（2026-09-17,治「LLM 卡死整轮哑火」）----
+    # 客服口径（用户拍板 2.5s,可再收紧）:等 8s/重试链=这通电话已废。三层:
+    # ①首 token 截止——_LlmFallbackStream 对第一块 ChatChunk 计时
+    #   （LLM_FIRST_TOKEN_TIMEOUT_S 默认 2.0,0=关）,超时立即出三语兜底句,
+    #   但**唔弃流**:后台 drain 继续消费本流收晚到真答案(次级截止
+    #   LLM_LATE_ANSWER_DEADLINE_S 默认 8s,0=回 aclose+regen 旧行为)——
+    #   aclose 弃流换不来服务端停解码(mlx 无断连中止),二发只排其后抬 TTFT;
+    # ②插件级重试默认归零（LLM_REQUEST_RETRIES 默认 0——官方 _main_task
+    #   默认 3 次重试×10s=最坏 46s 静默,兜底壳取代它做恢复,更快且有声）;
+    # ③传输层 read-gap（LLM_REQUEST_TIMEOUT_S 默认 8）只作字节流死流的粗后盾,
+    #   首包后的流中卡死由它兜。
+    # 兜底文本由 agent 装配时按通话语言注入(set_fallback_text);未注入的
+    # worker(B 线 MT 等)零跨线影响。BOK_LLM_FALLBACK=0=整闸关(回旧行为)。
+    # prefix_prewarm 等自带 conn_options 的调用方不受覆写影响(只认框架默认值身份)。
+    _conn_opts: APIConnectOptions | None = None
+    _fallback_text: str = ""
+    _late_answer_cb = None  # Callable[[str], Awaitable[None]] | None(agent 注入)
+    _fallback_gate = None  # Callable[[], bool] | None:True=本轮垫话已盖耳,抑制流内兜底
+
+    def set_late_answer_cb(self, cb) -> None:
+        """晚到答案交付回调(装配时注入):弃流兜底后后台重生成功 → cb(text) 补答。
+        None(B 线等)=不重生。"""
+        self._late_answer_cb = cb
+
+    def set_fallback_text(self, text: str) -> None:
+        """装配时注入兜底直念文本(空串=兜底关闭,超时行为回到整轮失败)。"""
+        self._fallback_text = (text or "").strip()
+
+    def set_fallback_gate(self, cb) -> None:
+        """装配时注入「兜底抑制闸」(2026-09-17 call-11132bdd):cb()=True 表示
+        本轮垫话已出声盖耳——2s 首 token 超时的道歉句再出声=「垫话+道歉+晚到
+        真答案」三连叠音。闸合时跳过流内兜底 chunk,靠 drain/晚到补答交付;
+        drain 无产出落 watchdog 兜底(顺延过,6s)。None=不抑制(旧行为)。"""
+        self._fallback_gate = cb
+
+    @staticmethod
+    def _request_conn_options() -> APIConnectOptions:
+        try:
+            timeout = float(os.environ.get("LLM_REQUEST_TIMEOUT_S", "8") or 0)
+        except ValueError:  # pragma: no cover - 配错回默认
+            timeout = 8.0
+        try:
+            max_retry = int(os.environ.get("LLM_REQUEST_RETRIES", "0"))
+        except ValueError:  # pragma: no cover - 配错回默认
+            max_retry = 0
+        if max_retry < 0:
+            max_retry = 0
+        if timeout <= 0:
+            # 0=回官方默认(旧行为逃生口,连覆写都唔要)
+            return DEFAULT_API_CONNECT_OPTIONS
+        return APIConnectOptions(timeout=timeout, max_retry=max_retry)
+
+    @staticmethod
+    def _first_token_timeout_s() -> float:
+        try:
+            return float(os.environ.get("LLM_FIRST_TOKEN_TIMEOUT_S", "2.0") or 0)
+        except ValueError:  # pragma: no cover - 配错回默认
+            return 2.0
+
+    def chat(
+        self,
+        *,
+        chat_ctx,
+        tools=None,
+        conn_options=None,
+        parallel_tool_calls=None,
+        tool_choice=None,
+        extra_kwargs=NOT_GIVEN,
+    ):
+        if self._conn_opts is None:
+            self._conn_opts = self._request_conn_options()
+        injected = conn_options is None or conn_options is DEFAULT_API_CONNECT_OPTIONS
+        if injected:
+            conn_options = self._conn_opts
+        stream = super().chat(
+            chat_ctx=chat_ctx,
+            tools=tools,
+            conn_options=conn_options,
+            parallel_tool_calls=parallel_tool_calls,
+            tool_choice=tool_choice,
+            extra_kwargs=extra_kwargs,
+        )
+        # 兜底壳只包主回复路径(注入档);自带 conn_options 的调用方
+        # (prefix_prewarm 30s 档等)失败照旧被调用方吞,唔出兜底句。
+        if injected and self._fallback_text and isinstance(stream, llm.LLMStream):
+            # 弃流重生工厂:同参重建内芯流(官方流,唔套兜底壳),单次后台补答。
+            def _stream_factory(_ctx=chat_ctx, _tools=tools, _co=conn_options,
+                                _ptc=parallel_tool_calls, _tc=tool_choice,
+                                _ek=extra_kwargs):
+                return _OpenAICompatBase.chat(
+                    self, chat_ctx=_ctx, tools=_tools, conn_options=_co,
+                    parallel_tool_calls=_ptc, tool_choice=_tc, extra_kwargs=_ek,
+                )
+
+            return _LlmFallbackStream(
+                self, stream, self._fallback_text,
+                first_token_timeout_s=self._first_token_timeout_s(),
+                stream_factory=_stream_factory,
+                late_answer_cb=self._late_answer_cb,
+                fallback_gate=self._fallback_gate,
+            )
+        return stream
+
+
+def _late_answer_deadline_s() -> float:
+    """drain(原流续读)次级截止秒数:首 token 超时出兜底后,本流最多再等多久。
+
+    默认 8s(mlx 4B 出满答案远快于此;超时基本=真死流)。0=关 → 回立即
+    aclose+factory 重生旧行为(kill-switch)。"""
+    try:
+        return float(os.environ.get("LLM_LATE_ANSWER_DEADLINE_S", "8") or 0)
+    except ValueError:  # pragma: no cover - 配错回默认
+        return 8.0
+
+
+class _LlmFallbackStream(llm.LLMStream):
+    """主回复出口闸：首 token 截止 + 失败兜底直念（LLM 出口单点拦截）。
+
+    三条路都汇到同一句本地兜底（零模型调用）:
+    - 首 token 超时（LLM_FIRST_TOKEN_TIMEOUT_S,客服拍板默认 2.5s）:
+      首 chunk 计时到点立即出兜底句——但**唔弃流**(2026-09-17 RC4):
+      mlx 服务端无断连中止,被 aclose 的请求照解码到完才放锁,二发重生只排其后
+      (僵尸解码税,实测 [watchdog] 后紧跟 TTFT 3872ms)。改为后台 drain 继续消费
+      本流收集剩余文本,晚到真答案经回调补答;次级截止
+      （LLM_LATE_ANSWER_DEADLINE_S,默认 8s,0=关→回立即 aclose+factory 重生
+      旧行为）仍无产出才真弃流重生(最后手段);
+    - 传输层超时/重试耗尽仍失败（APIError 浮出）;
+    - 首 token 后流中卡死被传输层掐断（部分真答案已在途→兜底句跟在后面,
+      好过死寂）。
+    哨兵标记 LLM_FIRST_TOKEN_TIMEOUT / LLM_FALLBACK_TEXT / LLM_LATE_ANSWER
+    供日志/探针归因(晚到答案 source=drain 原流续读 / source=regen factory 二发)。
+    壳照抄 _StripTailAnchorStream:metrics 由内芯层转发,此处只排空监视分支。
+    """
+
+    def __init__(self, plugin, inner: "llm.LLMStream", fallback_text: str,
+                 first_token_timeout_s: float = 0.0, stream_factory=None,
+                 late_answer_cb=None, late_deadline_s: float | None = None,
+                 fallback_gate=None):
+        super().__init__(llm=plugin, chat_ctx=llm.ChatContext(), tools=[], conn_options=APIConnectOptions())
+        self._plugin_ref = plugin  # 基类不保底存 plugin:重生任务强引用集挂它身上
+        self._inner = inner
+        self._fallback = fallback_text
+        self._first_deadline = first_token_timeout_s
+        self._stream_factory = stream_factory
+        self._late_answer_cb = late_answer_cb
+        self._fallback_gate = fallback_gate
+        self._late_deadline = (
+            _late_answer_deadline_s() if late_deadline_s is None else late_deadline_s
+        )
+        self._got_first = False
+
+    async def _metrics_monitor_task(self, event_aiter) -> None:
+        # 内芯官方流自带 metrics(或失败时无 metrics),转发链上层负责;本壳只排空。
+        async for _ in event_aiter:
+            pass
+
+    def _emit_fallback(self) -> None:
+        print(f"LLM_FALLBACK_TEXT text={self._fallback!r}", flush=True)
+        self._event_ch.send_nowait(
+            llm.ChatChunk(
+                id="llm-fallback",
+                delta=llm.ChoiceDelta(content=self._fallback, role="assistant"),
+            )
+        )
+
+    async def _aclose_inner(self) -> None:
+        """真弃流(限时 1s):失败唔阻兜底/重生。"""
+        try:
+            await asyncio.wait_for(self._inner.aclose(), timeout=1.0)
+        except Exception:  # noqa: BLE001 - 弃流失败唔阻后续
+            pass
+
+    async def _regen_late_answer(self) -> None:
+        """弃流重生(单次,后台):drain 截止/内芯异常后的最后手段——同参二发新
+        请求,成功即经 agent 注入的回调走正常 speech 队列补答(客户插话可打断)。
+        服务端此刻多半已空闲(旧请求解码尾+垫话/兜底句吃掉几秒),二发命中率可观。"""
+        if self._stream_factory is None or self._late_answer_cb is None:
+            return
+        if os.environ.get("BOK_LLM_REGEN", "1") != "1":
+            return
+        try:
+            parts: list[str] = []
+            async for ev in self._stream_factory():
+                delta = getattr(ev, "delta", None)
+                content = getattr(delta, "content", None) if delta is not None else None
+                if isinstance(content, str) and content:
+                    parts.append(content)
+            text = "".join(parts).strip()
+            if not text:
+                print("LLM_LATE_ANSWER source=regen empty — skip", flush=True)
+                return
+            print(f"LLM_LATE_ANSWER source=regen chars={len(text)} — 补答", flush=True)
+            await self._late_answer_cb(text)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 重生失败:兜底句已在,唔追二发
+            print(f"LLM_LATE_ANSWER source=regen failed: {exc!r}", flush=True)
+
+    async def _drain_late_answer(self, first_task: "asyncio.Task") -> None:
+        """原流续读(单次,后台):首 token 超时后唔 aclose,继续消费本流收集剩余
+        文本(复用 _regen_late_answer 骨架,数据源=现成内芯而非 factory 二发)——
+        服务端本就解得完,白收。first_task=超时分支留下的活首 chunk 任务
+        (绝不 cancel——内芯 tee_peer 对 cancellation 不免疫,peer 一死后续
+        chunk 结构性拿唔到),本任务先收佢再续 async-for。次级截止
+        (self._late_deadline)仍无产出 → 真弃流 aclose + factory 重生(最后
+        手段);内芯中途抛异常同落 regen;已收到的部分文本优先交付(salvage,
+        regen 会重复问同一条=又一轮僵尸解码)。"""
+        if self._late_answer_cb is None:  # pragma: no cover - spawn 点已闸
+            first_task.cancel()
+            return
+        parts: list[str] = []
+
+        def _take(ev) -> None:
+            delta = getattr(ev, "delta", None)
+            content = getattr(delta, "content", None) if delta is not None else None
+            if isinstance(content, str) and content:
+                parts.append(content)
+
+        async def _collect() -> str:
+            try:
+                _take(await first_task)
+            except asyncio.CancelledError:
+                raise
+            except StopAsyncIteration:
+                pass  # 内芯一个 chunk 都冇就收线:落 clean-empty 分支
+            async for ev in self._inner:
+                _take(ev)
+            return "".join(parts)
+
+        note = ""
+        try:
+            text = (await asyncio.wait_for(_collect(), timeout=self._late_deadline)).strip()
+        except asyncio.TimeoutError:
+            note = f"deadline={self._late_deadline:g}s"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 内芯中途死(含 boom 异常透传)
+            note = f"err={exc!r}"
+        await self._reap_first_task(first_task)
+        await self._aclose_inner()
+        salvage = "".join(parts).strip()
+        if note:
+            if salvage:
+                print(
+                    f"LLM_LATE_ANSWER source=drain chars={len(salvage)} — 补答"
+                    f"(partial {note} salvage)",
+                    flush=True,
+                )
+                await self._late_answer_cb(salvage)
+                return
+            print(f"LLM_LATE_ANSWER source=drain {note} 无产出 — aclose+regen", flush=True)
+            self._spawn_regen()
+            return
+        if not text:
+            print("LLM_LATE_ANSWER source=drain empty — aclose+regen", flush=True)
+            self._spawn_regen()
+            return
+        print(f"LLM_LATE_ANSWER source=drain chars={len(text)} — 补答", flush=True)
+        await self._late_answer_cb(text)
+
+    @staticmethod
+    async def _reap_first_task(first_task: "asyncio.Task") -> None:
+        """收尾首 chunk 任务(取消+取回结果)防 Task exception was never retrieved。"""
+        if not first_task.done():
+            first_task.cancel()
+        try:
+            await first_task
+        except BaseException:  # noqa: BLE001 - 收尾取回,结果唔关心
+            pass
+
+    def _spawn_attached(self, coro) -> None:
+        """后台任务挂 plugin 长寿命强引用集(裸 create_task 事件循环只持弱引用,
+        会被 GC 中途回收——本仓 dial fuse/bidi invalidate 同款教训);完成自弃。"""
+        plugin = self._plugin_ref
+        if plugin is None:
+            coro.close()  # 防裸协程 never-awaited 警告
+            return
+        if not hasattr(plugin, "_bg_regen_tasks"):
+            plugin._bg_regen_tasks = set()
+        tasks = plugin._bg_regen_tasks
+        t = asyncio.create_task(coro)
+        tasks.add(t)
+        t.add_done_callback(tasks.discard)
+
+    def _spawn_regen(self) -> None:
+        self._spawn_attached(self._regen_late_answer())
+
+    async def _run(self):
+        timeout = self._first_deadline
+        first_task: asyncio.Task | None = None
+        drain_owns = False
+        try:
+            # 首 chunk 任务化(RC4):截止计时用 asyncio.wait(唔 cancel 任务)——
+            # wait_for(__anext__) 超时会 cancel 掉内芯 tee_peer(async generator
+            # 对 cancellation 不免疫,peer 一死=原流续读结构性拿唔到后续 chunk)。
+            # 任务留活,drain 接手先收佢再续读;kill-switch 分支才真取消。
+            first_task = asyncio.ensure_future(self._inner.__anext__())
+            if timeout > 0:
+                done, _pending = await asyncio.wait({first_task}, timeout=timeout)
+                if first_task not in done:
+                    if self._late_deadline > 0 and self._late_answer_cb is not None:
+                        # 原流续读:唔 aclose——服务端无断连中止,弃流只换僵尸
+                        # 解码税。兜底先出声,后台 drain 收晚到真答案;截止无
+                        # 产出才真弃流重生。
+                        print(
+                            f"LLM_FIRST_TOKEN_TIMEOUT deadline={timeout}s — 兜底先出,"
+                            f"原流续读(drain deadline={self._late_deadline:g}s)",
+                            flush=True,
+                        )
+                        if self._fallback_gate is not None:
+                            try:
+                                if self._fallback_gate():
+                                    # 垫话已盖耳:道歉句係叠床架屋(call-11132bdd
+                                    # 「垫话+道歉+晚到真答案」三连),抑制后客户
+                                    # 听到垫话→(静)→晚到真答案;drain 无产出落
+                                    # watchdog 兜底(已被垫话开播顺延)。
+                                    print(
+                                        "LLM_FALLBACK suppressed (filler covered)"
+                                        " — 靠 drain/晚到补答",
+                                        flush=True,
+                                    )
+                                    drain_owns = True
+                                    self._spawn_attached(self._drain_late_answer(first_task))
+                                    return
+                            except Exception:  # noqa: BLE001 - 闸回调失败=照常兜底
+                                pass
+                        self._emit_fallback()
+                        drain_owns = True
+                        self._spawn_attached(self._drain_late_answer(first_task))
+                    else:
+                        # 旧行为(kill-switch LLM_LATE_ANSWER_DEADLINE_S=0,或无
+                        # 交付回调):立即 aclose 弃流 + factory 重生。
+                        print(
+                            f"LLM_FIRST_TOKEN_TIMEOUT deadline={timeout}s — 弃流出兜底(aclose+regen)",
+                            flush=True,
+                        )
+                        await self._reap_first_task(first_task)
+                        first_task = None
+                        await self._aclose_inner()
+                        self._emit_fallback()
+                        self._spawn_regen()
+                    return
+            self._got_first = True
+            self._event_ch.send_nowait(await first_task)
+            first_task = None
+            async for ev in self._inner:
+                self._event_ch.send_nowait(ev)
+        except asyncio.CancelledError:
+            if first_task is not None and not first_task.done() and not drain_owns:
+                first_task.cancel()
+            raise
+        except Exception as exc:  # noqa: BLE001 - 重试耗尽/流中卡死:兜底句接住
+            print(f"LLM_FALLBACK_TEXT err={exc!r} text={self._fallback!r}", flush=True)
+            self._emit_fallback()
+            if not self._got_first:
+                # 首字都未出:重生有意义(传输层瞬断族)。已出过部分真答案就唔重念。
+                self._spawn_regen()
+
 
 class DeepSeekLLM(_OpenAICompatBase):
     """DeepSeek 云端（OpenAI 兼容契约，与本地 MlxLlmLLM 同一官方内芯）。"""
@@ -434,18 +816,22 @@ def _mt_prompt(text: str, target_lang: str, glossary: str = "") -> str:
     glossary 非空时在模板前插一行术语块(会话级常量 → 每轮请求前缀稳定,KV
     缓存友好);缺省空串=逐字节同旧模板,零行为变化。术语走 prompt 唔改解码
     ——glossary 走 prompt 是工程界共识(SimulStreaming static_init_prompt /
-    WhisperLive hotwords 同路,2026-09-16 B 线 P0-2 调研定案)。"""
+    WhisperLive hotwords 同路,2026-09-16 B 线 P0-2 调研定案)。
+
+    语气词标记(2026-09-16 实测)不走 prompt:Hy-MT2 是翻译特化模型,模板外的
+    指示一概无视(前缀位/后缀位都试过,规则行原样无视或被当内容翻译),交给
+    interpret._apply_voice_tags 在 say 前做确定性替换。"""
     name = _MT_PROMPT_NAMES.get(target_lang, target_lang)
     prefix = f"术语表（保持一致）：{glossary}\n\n" if glossary else ""
     return f"{prefix}将以下文本翻译为 `{name}`，注意只需要输出翻译后的结果，不要额外解释：\n\n`{text}`"
 
 
-# MT 输出包裹引号(Hy-MT2 偶发给整段译文裹引号,2026-09-16 E2E 实证
-# 「“你好，我想了解更多…”」):TTS 读引号=怪停顿、字幕带杂质。
-# 首尾独立剥——整段包裹场景全覆盖;译文内容本身以引号开头的罕见场景会被误剥
-# (spoken-style MT 输出几乎不含内容引号,可接受)。
-_MT_QUOTES_OPEN = "\"“「『'"
-_MT_QUOTES_CLOSE = "\"”」』'"
+# MT 输出包裹引号(2026-09-16 实证两类):①弯引号「“…”」(E2E call 实证);
+# ②反引号「`…`」(模型镜像模板的 ` 包裹,:1236 直打 100% 复现)——比弯引号更高频。
+# TTS 读引号=怪停顿、字幕带杂质。首尾独立剥——整段包裹场景全覆盖;译文内容
+# 本身以引号开头的罕见场景会被误剥(spoken-style MT 输出几乎不含,可接受)。
+_MT_QUOTES_OPEN = "\"“「『'`"
+_MT_QUOTES_CLOSE = "\"”」』'`"
 
 
 class _StripMTQuoteStream(llm.LLMStream):
@@ -616,7 +1002,10 @@ class StatelessMTLLM(llm.LLM):
             tool_choice=tool_choice,
             extra_kwargs=_forward_extra_kwargs(extra_kwargs),
         )
-        return _StripMTQuoteStream(self, inner_stream)
+        # 非流结果(测试假内芯/异常防御)原样透传,不硬包 LLMStream
+        if isinstance(inner_stream, llm.LLMStream):
+            return _StripMTQuoteStream(self, inner_stream)
+        return inner_stream
 
     async def _prewarm_impl(self) -> None:
         # 委托内芯:MT 模型同样吃 1-token 真生成的暖机收益(对齐 MlxLlmLLM)。
@@ -1357,6 +1746,7 @@ class ContextAwareLLM(llm.LLM):
         super().__init__()
         self._inner = inner
         self._ctx = context_state
+        self._partial_capture: dict | None = None
         _bind_metrics_forward(inner, self)
 
     def chat(
@@ -1490,11 +1880,56 @@ class ContextAwareLLM(llm.LLM):
             ):
                 # 出口复读防线(2026-09-12):逐句比对上一句回复,拟声复读句剥掉
                 # (call-8fa17d2b 两轮一字不差实证);客户要求重讲轮放行。
-                return _RepeatSelfGuardStream(
+                out = _RepeatSelfGuardStream(
                     self, _stripped, self._ctx.last_reply, bypass=self._ctx.repeat_requested
                 )
-            return _stripped
+            else:
+                out = _stripped
+            # 部分文本 tee(2026-09-17,治「打断轮零账本」):把本回复已生成的文本
+            # 逐段记进 agent 注入的 capture dict——回复被框架打断时(item 永不
+            # added)agent 侧 speech watcher 用佢补记 gen=interrupted 账本行;
+            # 正常走完自动清空(item_added 照常上报,零双记)。
+            if self._partial_capture is not None:
+                out = _PartialCaptureStream(self, out, self._partial_capture)
+            return out
         return inner_stream
+
+    def set_partial_capture(self, capture: dict | None) -> None:
+        """注入 per-turn 部分文本 tee({"text": str})。None=关闭。"""
+        self._partial_capture = capture
+
+
+class _PartialCaptureStream(llm.LLMStream):
+    """记下本回复已生成的文本（打断轮补记账本的数据源，agent.py 注入）。
+
+    正常走完 → 清空 capture(item_added 照常上报);异常/取消(=框架打断)→
+    保留已生成文本供 speech watcher 补记 gen=interrupted 行。壳照抄
+    _StripTailAnchorStream:metrics 由内芯转发,此处只排空监视分支。
+    """
+
+    def __init__(self, plugin, inner: "llm.LLMStream", capture: dict):
+        super().__init__(llm=plugin, chat_ctx=llm.ChatContext(), tools=[], conn_options=APIConnectOptions())
+        self._inner = inner
+        self._capture = capture
+
+    async def _metrics_monitor_task(self, event_aiter) -> None:
+        async for _ in event_aiter:
+            pass
+
+    async def _run(self):
+        try:
+            async for ev in self._inner:
+                delta = getattr(ev, "delta", None)
+                if delta is not None:
+                    content = getattr(delta, "content", None)
+                    if isinstance(content, str) and content:
+                        self._capture["text"] = (self._capture.get("text") or "") + content
+                self._event_ch.send_nowait(ev)
+        except BaseException:
+            # 取消(=打断)/异常:保留部分文本,agent 侧 watcher 决定补记。
+            raise
+        else:
+            self._capture["text"] = ""
 
 
 def _truncate_chat_items(items: list, max_turns: int = 4) -> list:
@@ -2122,13 +2557,38 @@ async def _minimax_ws_silent_close(ws) -> None:
         pass
 
 
+async def _minimax_classic_reconnect(tts, key: str, old_ws, handshake, sent_all: list) -> object:
+    """classic 流 STALL 重连动作序列：闭旧连 → 新连 → 握手 → 按序重发已发文本。
+
+    抽成模块级函数以便单测（synthesize 闭包内不可测）。任何一步抛错原样上抛——
+    调用方（_stall_watch）必须 try/finally 清 _reconnecting 闸：闸悬挂会让所有
+    发送点 `await _reconnecting.wait()` 永挂、整轮静默（2026-09-17 全量 debug
+    F1/F2——classic 流缺 bidi 三件自愈的同款守卫，此处补齐动作序列单点）。
+    """
+    import websockets  # 与 synthesize 内一致:局部导入(websockets 启动重)
+
+    await _minimax_ws_silent_close(old_ws)
+    ws = await websockets.connect(
+        tts._endpoint_ws(),
+        additional_headers={"Authorization": f"Bearer {key}"},
+        open_timeout=10,
+        max_size=20_000_000,
+    )
+    await handshake(ws)
+    for s in sent_all:
+        await ws.send(json.dumps({"event": "task_continue", "text": s}))
+    return ws
+
+
 def _minimax_pool_discard(ws) -> None:
     """后台弃置池连接；无事件循环时直接放手（GC 兜底回收 socket）。"""
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
     except RuntimeError:
         return
-    loop.create_task(_minimax_ws_silent_close(ws))
+    # 强引用入池(P2-A,2026-09-17):裸 create_task 只被事件循环弱引用,GC 中途
+    # 回收=弃置关闭静默丢失、池连接半开残留。
+    _spawn_bg(_minimax_ws_silent_close(ws))
 
 
 def _minimax_pool_pop(endpoint: str, key: str):
@@ -2664,26 +3124,21 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                     stalled = True
                     _reconnecting.set()
                     try:
-                        await _minimax_ws_silent_close(ws)
-                    except Exception:  # pragma: no cover
-                        pass
-                    recv_task.cancel()
-                    ws = await websockets.connect(
-                        self._tts_._endpoint_ws(),
-                        additional_headers={"Authorization": f"Bearer {key}"},
-                        open_timeout=10,
-                        max_size=20_000_000,
-                    )
-                    await _handshake(ws)
-                    t_task = time.monotonic()
-                    t_start = t_task
-                    init_done = False
-                    first_pushed = False
-                    for s in sent_all:
-                        await ws.send(json.dumps({"event": "task_continue", "text": s}))
-                    t_first_text = time.monotonic()
-                    _reconnecting.clear()
-                    recv_task = asyncio.create_task(_recv_loop())
+                        ws = await _minimax_classic_reconnect(
+                            self._tts_, key, ws, _handshake, sent_all)
+                        t_task = time.monotonic()
+                        t_start = t_task
+                        init_done = False
+                        first_pushed = False
+                        t_first_text = time.monotonic()
+                        recv_task = asyncio.create_task(_recv_loop())
+                    except Exception as exc:
+                        # 重连失败也必须清闸:不清则发送点 await _reconnecting.wait()
+                        # 永挂整轮静默;清闸后旧 ws send 抛 ConnectionClosed,走既有
+                        # WS_ERR 有界收尾(轮次失败 ≠ 进程 hang)。
+                        print(f"MINIMAX_TTS_STALL reconnect_failed {exc!r}", flush=True)
+                    finally:
+                        _reconnecting.clear()
                     return
 
             stall_task = asyncio.create_task(_stall_watch())
@@ -2824,6 +3279,18 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
         except Exception as exc:
             print("MINIMAX_TTS_WS_ERR", repr(exc), flush=True)
         finally:
+            # 停看门狗:closed_ws 此前从未被 set(死代码),且 stall_task 从不 cancel
+            # ——barge-in 提前结束流后看门狗存活,4s 后重开 WS 重发文本,孤儿合成
+            # 会话白烧云配额(2026-09-17 全量 debug F2)。双保险:set 停判定 + cancel。
+            closed_ws.set()
+            if stall_task:
+                stall_task.cancel()
+                try:
+                    await stall_task
+                except asyncio.CancelledError:
+                    pass  # 自己 cancel 嘅——继续收尾
+                except Exception:
+                    pass
             if recv_task:
                 recv_task.cancel()
                 try:
@@ -3190,6 +3657,16 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
         except Exception:  # pragma: no cover
             return 6.0
 
+    @staticmethod
+    def _stall_max_heals() -> int:
+        """一流看门狗自愈上限(2026-09-17):旧版一流只自愈一次,第二次僵死要干等
+        30s recv 超时=整轮静默。默认 2(第二次自愈失败才落回既有 fail-fast);
+        "0"=旧一次行为;配错回 2。"""
+        try:
+            return max(1, int(os.environ.get("MINIMAX_BIDI_STALL_MAX_HEALS", "2")))
+        except Exception:  # pragma: no cover
+            return 2
+
     async def _cancel_on_server(self, ws) -> None:
         """打断：task_cancel 丢服务端缓冲+停当前合成;连接保留,下轮继续用。"""
         if ws is None:
@@ -3242,6 +3719,7 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                 "stale_msgs": 0,
                 "stale_bytes": 0,
                 "sentences": 0,
+                "stall_heals": 0,
             }
             t_flush = 0.0
             # 重连窗口发送闸(看门狗换连接期间):输入循环若继续 task_continue 会发到
@@ -3396,10 +3874,12 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                 async def _stall_watch() -> None:
                     """首段文本发出后 N 秒无首包 → 判连接僵死:弃连接重连+重发已发文本。
                     classic MINIMAX_FIRST_AUDIO_TIMEOUT_S 同语义移植(_stall_watch);bidi
-                    无此看门狗时只能干等 30s recv 超时(整轮回复静默)。一流一次自愈
-                    (重连后唔重臂)——对端持续僵死时 6s 一轮的重连风暴比 30s 干等更伤,
-                    后续轮自会撞死亡路径(invalidate+重预热)。"""
-                    nonlocal ws, reused, connect_ms
+                    无此看门狗时只能干等 30s recv 超时(整轮回复静默)。一流自愈上限
+                    MINIMAX_BIDI_STALL_MAX_HEALS(默认 2,2026-09-17 由硬编码 1 放宽):
+                    旧版第二次僵死干等 30s recv——重连后唔重臂是防「6s 一轮的重连
+                    风暴」,上限 2 保留该防线又给二次僵死一条自愈路;超限回落既有
+                    fail-fast(后续轮自会撞死亡路径 invalidate+重预热)。"""
+                    nonlocal ws, reused, connect_ms, stall_task
                     timeout = self._first_audio_timeout_s()
                     if timeout <= 0:
                         return
@@ -3433,6 +3913,11 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                         state["first_pushed"] = False
                         session.active_epoch = my_epoch  # 认领纪元:重发即本流首个 continue,同发送分支
                         _start_loops()  # 新连接新收发协程(ws 已重绑进闭包)
+                        # 自愈预算内 → 重臂看门狗(新连接再僵死再救一次);超限即止
+                        # (落回 30s recv fail-fast,防对端持续僵死时的重连风暴)。
+                        state["stall_heals"] = int(state.get("stall_heals", 0)) + 1
+                        if state["stall_heals"] < self._stall_max_heals():
+                            stall_task = asyncio.create_task(_stall_watch())
                     except Exception as exc:  # noqa: BLE001 - 重连失败:闸清后下一发撞死连接走既有收摊
                         print(f"MINIMAX_TTS_BIDI_STALL_FAIL {exc!r}", flush=True)
                         self._flushed_evt.set()  # 流已救唔返:收尾 flush 唔好白等 15s
@@ -4409,6 +4894,48 @@ _ASR_SENTENCE_MIN_CHARS = 6
 # 限速:两次句级提交最少间隔(「好。係。唔該。」连珠句防机关枪式连发,
 # 排队语义=剩余文本并入下一边界或 VAD 停嘴整句兜底)。
 _ASR_SENTENCE_MIN_INTERVAL_S = 1.5
+# 子句级提交(B 线同传档,2026-09-16):次级标点也作提交边界——译员按子句跟,
+# 唔等整句讲完才翻。A 线 worker 唔带此 env,客服轮次仍按句。
+_SENTENCE_WEAK_PUNCT = "，、；,;"
+
+
+def _clause_commit_enabled() -> bool:
+    """子句级提交总门:QWEN3_ASR_CLAUSE_COMMIT(默认 0,A 线零变化;B 线
+    _interp_env setdefault 1)。关=行为逐字节同旧。"""
+    return os.environ.get("QWEN3_ASR_CLAUSE_COMMIT", "0") == "1"
+
+
+def _clause_commit_min_chars() -> int:
+    """子句提交字数下限(默认 8>标点路径 6):逗号比句号密得多,6 字门槛会把
+    说话切成机关枪碎片,TTS 段间开销反而拖慢整体;8 字≈一个自然短语组。
+    QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS 可调。"""
+    try:
+        return int(os.environ.get("QWEN3_ASR_CLAUSE_COMMIT_MIN_CHARS", "8"))
+    except ValueError:
+        return 8
+
+
+def _clause_len_commit_enabled() -> bool:
+    """长度触发子句提交(B 线「边说边译」档,2026-09-17):QWEN3_ASR_CLAUSE_LEN_COMMIT
+    (默认 0,A 线零变化;B 线 _interp_env setdefault 1)。
+
+    三个提交事件源的补位:标点档靠说话人打逗号、停顿档靠 VAD 0.45s 停嘴——
+    连续语流(一口气不带标点不带停顿)两者都哑火,译文要等 EOS 才开工。长度档
+    在滑窗里盯未提交前缀:攒够字数且跨窗稳定就就地切句,译出声不等人讲完
+    (SimulStreaming AlignAtt/LocalAgreement「稳定前缀才出」思想的工程化)。
+    """
+    return os.environ.get("QWEN3_ASR_CLAUSE_LEN_COMMIT", "0") == "1"
+
+
+def _clause_len_commit_chars() -> int:
+    """长度档切段字数(默认 10:4 字/秒语速≈2.5s 话音一翻;2026-09-17 二轮从 12
+    收到 10——真人语音子句普遍 5-12 字,12 字门槛在停顿到来前常常攒不够,长度档
+    空转;10 字+1.5s 限速的提交节奏仍对得上 TTS 串行播报)。QWEN3_ASR_CLAUSE_LEN_CHARS
+    可调,地板 8(与标点档下限对齐)。"""
+    try:
+        return max(8, int(os.environ.get("QWEN3_ASR_CLAUSE_LEN_CHARS", "10")))
+    except ValueError:
+        return 10
 
 
 def _pause_commit_min_chars() -> int:
@@ -4602,6 +5129,38 @@ def _has_latin_or_digit_run(text: str, min_len: int = 2) -> bool:
         else:
             run = 0
     return False
+
+
+def _length_commit_cut(text: str, start: int, prev_full: str, min_chars: int) -> int | None:
+    """说话中长度触发切点(纯函数,单测用):返回可提交边界(排他索引)或 None。
+
+    门(缺一不可):
+    - 切段 ≥ min_chars 字数口径按下述中英判;
+    - 切点不劈 ASCII 字母/数字 run——单号/英文词保持完整(数字零降级铁律的
+      B 线化身;整段含数字 run 唔再拦:B 线无 WhatsApp 捕获语义,号码子句照翻
+      係译员本分,这是与标点档 `_has_latin_or_digit_run` 整段门的唯一分歧点);
+    - 中英判:切段 CJK 字 ≥ ASCII 字母数字 → 门槛 = min_chars(中文 4 字/秒,
+      12 字≈3s 话音一翻);否则(英/数字主导)门槛翻倍 2×min_chars(英文 ~5 字/词,
+      防两词一翻的机关枪碎片);
+    - 跨窗稳定:prev_full[start:cut] 与 text[start:cut] 逐字相同(滑窗 ~300ms
+      一窗,提交的字至少已稳定一窗)。前缀不稳则更长前缀必不稳,直接 None 等
+      下窗,唔使继续扫。
+    """
+    n = len(text)
+    for cut in range(start + min_chars, n + 1):
+        prev_ch = text[cut - 1]
+        next_ch = text[cut] if cut < n else ""
+        if prev_ch.isascii() and prev_ch.isalnum() and next_ch.isascii() and next_ch.isalnum():
+            continue  # ASCII run 中间,不劈
+        seg = text[start:cut]
+        cjk = sum(1 for ch in seg if "\u3400" <= ch <= "\u9fff")
+        latin = sum(1 for ch in seg if ch.isascii() and ch.isalnum())
+        if cut - start < (min_chars if cjk >= latin else min_chars * 2):
+            continue
+        if prev_full[start:cut] != text[start:cut]:
+            return None  # 该前缀未跨窗稳定,更长前缀必同 → 等下窗
+        return cut
+    return None
 
 
 class _Qwen3ASRLiveStream(stt.RecognizeStream):
@@ -4985,7 +5544,14 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
             commit = self._sentence_boundary(text, prev_full)
             if commit is not None:
                 sentence, end_idx = commit
-                self._emit_sentence_commit(sentence, end_idx, lang, now, source="partial-punct")
+                # source 判别:标点档边界必终止于标点字符;长度档切在正字上。
+                # 日志可分辨(QWEN3_ASR_SENTENCE_COMMIT source=partial-len)。
+                _commit_src = (
+                    "partial-punct"
+                    if sentence and sentence[-1] in _SENTENCE_STRONG_PUNCT + _SENTENCE_WEAK_PUNCT
+                    else "partial-len"
+                )
+                self._emit_sentence_commit(sentence, end_idx, lang, now, source=_commit_src)
                 # 每句事件序：FINAL(句子) → END_OF_SPEECH（框架 EOS 才置 committed
                 # + _run_eou_detection(trigger="stt")，见 _sentence_boundary 文档）。
                 # EOS 带停嘴时钟锚点：句子音频最迟在 chunk POST 发出（本窗音频
@@ -5136,7 +5702,31 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                     return sentence, j
                 # 呢个边界唔够格（太短/数字 run/未稳定）→ 唔喺度提交，继续扫下一
                 # 个边界（短句排队累积；未稳定边界下窗自然变稳定）。
+            elif _clause_commit_enabled() and text[i] in _SENTENCE_WEAK_PUNCT:
+                # 子句边界(同传档):逗号/顿号/分号即提交——同一套门(长度/数字 run/
+                # 稳定性/限速)全部照走,门槛用 _clause_commit_min_chars。唔够格照例
+                # 继续扫(短子句并入下个边界,数字子句留给停嘴整句兜底)。
+                j = i + 1
+                while j < len(text) and text[j] in _SENTENCE_WEAK_PUNCT:
+                    j += 1
+                sentence = text[start:j]
+                if (
+                    len(sentence) >= _clause_commit_min_chars()
+                    and not _has_latin_or_digit_run(sentence)
+                    and prev_full[start:j] == sentence
+                ):
+                    return sentence, j
             i += 1
+        # 长度档(边说边译,B 线):标点档哑火(连续语流无逗号)时的第三事件源——
+        # 未提交前缀攒够字数且跨窗稳定即就地切句,唔使等 VAD 停嘴/EOS。切点保护
+        # (不劈数字/英文词)在 _length_commit_cut 内;限速门在函数头已挡(与标点
+        # 档同一把 1.5s 节流阀,提交节奏对齐 TTS 串行播报)。
+        if _clause_len_commit_enabled():
+            cut = _length_commit_cut(
+                text, start, prev_full, max(_clause_len_commit_chars(), _clause_commit_min_chars())
+            )
+            if cut is not None:
+                return text[start:cut], cut
         if allow_eos:
             sentence = text[start:].rstrip(_PAUSE_TRAILING_WEAK_PUNCT)
             prev_rem = prev_full[start:].rstrip(_PAUSE_TRAILING_WEAK_PUNCT)
@@ -5335,6 +5925,7 @@ class Qwen3ASRLiveSTT(stt.STT):
         self._stt._partial_ms_override = ms
         for s in list(self._live_streams):
             try:
-                asyncio.ensure_future(s._apply_partial_ms(ms))
+                # 强引用入池(P2-A,2026-09-17):裸 ensure_future 同受 GC 弱引用回收。
+                _spawn_bg(s._apply_partial_ms(ms))
             except RuntimeError:
                 pass

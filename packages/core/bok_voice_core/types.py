@@ -69,6 +69,11 @@ class SessionManifest:
     # 随建单存 call_sessions.glossary,token 分发进 dispatch metadata → agent
     # 装配 ASR 热词 + MT prompt 术语槽;客服通话恒空。
     glossary: str = ""
+    # B 线会话级音色(2026-09-17):同传页建单时我方/对方语言各选一把 MiniMax
+    # 音色的 JSON map `{"zh":"voice_id",...}`。随建单存 call_sessions.voices_json,
+    # token 分发进 dispatch metadata → interpret._build_tts_provider 组 voice_map
+    # 时最优先(> 设置三键 > 硬编码默认)。空=跟随设置。客服通话恒空。
+    voices_json: str = ""
     # 通话绑定节点(site-delivery M1,2026-09-16 thin-node 拓扑):建单钉死承载节点,
     # /api/token 签发前校验其未吊销。''=无绑定(单机全栈形态),行为零变化。
     node_id: str = ""

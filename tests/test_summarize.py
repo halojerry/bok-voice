@@ -126,3 +126,40 @@ def test_settle_uses_thread_offload_not_inline_llm_call(monkeypatch):
     src = inspect.getsource(cp_main.settle)
     assert "asyncio.to_thread" in src
     assert src.count("Summarizer().build") == 1  # 二次同步重试一并移除（重试=双倍停摆）
+
+
+def test_interp_call_uses_interp_system_prompt(monkeypatch):
+    """kind=interpret → 同传纪要 system（双语对照/我方对方框架），A 线仍用质检 system。
+
+    Good-Interpreter 调研项（2026-09-16 P1）：赛后总结喂「原文/译文对照」——
+    B 线 turns 天然双语分行，缺的只是纪要框架对口。"""
+    monkeypatch.delenv("MLX_LLM_BASE_URL", raising=False)
+    monkeypatch.setenv("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1")
+    monkeypatch.setenv("MLX_LLM_MODEL", "/models/Huihui-Qwen3.5-9B")
+    settings = {"llm": {"provider": "local_openai", "base_url": "", "model": "local"}}
+
+    captured = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": [{"message": {"content": '{"summary":"s","new_topics":[],"insight":null}'}}]}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["system"] = json["messages"][0]["content"]
+        return _Resp()
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    from control_plane.summarize import _SYSTEM, _SYSTEM_INTERP
+
+    # 同传会话：system 切同传纪要框架
+    Summarizer().build(_TURNS, {"object_id": "", "kind": "interpret"}, settings)
+    assert captured["system"] == _SYSTEM_INTERP
+    assert "原文" in captured["system"] and "我方" in captured["system"]
+
+    # A 线客服通话：system 不变
+    Summarizer().build(_TURNS, {"object_id": "obj-1", "kind": ""}, settings)
+    assert captured["system"] == _SYSTEM

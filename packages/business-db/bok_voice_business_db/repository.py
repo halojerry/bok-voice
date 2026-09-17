@@ -88,6 +88,7 @@ class SqlAlchemyBusinessRepository:
             kind=getattr(manifest, "kind", "") or "",
             target_lang=getattr(manifest, "target_lang", "") or "",
             glossary=getattr(manifest, "glossary", "") or "",
+            voices_json=getattr(manifest, "voices_json", "") or "",
             node_id=getattr(manifest, "node_id", "") or "",
         )
         self.session.add(call)
@@ -150,12 +151,14 @@ class SqlAlchemyBusinessRepository:
         self.session.commit()
         return True
 
-    def list_calls(self, account_id: str, status: str = "") -> list[dict]:
+    def list_calls(self, account_id: str, status: str = "", node_id: str = "") -> list[dict]:
         stmt = select(models.CallSession)
         if account_id:
             stmt = stmt.filter_by(account_id=account_id)
         if status:
             stmt = stmt.filter_by(status=status)
+        if node_id:
+            stmt = stmt.filter_by(node_id=node_id)
         return [self._call_to_dict(c) for c in self.session.scalars(stmt)]
 
     def create_turn(self, turn: TurnEvent) -> dict:
@@ -1203,6 +1206,7 @@ class InMemoryBusinessRepository:
             "kind": getattr(manifest, "kind", "") or "",
             "target_lang": getattr(manifest, "target_lang", "") or "",
             "glossary": getattr(manifest, "glossary", "") or "",
+            "voices_json": getattr(manifest, "voices_json", "") or "",
             "node_id": getattr(manifest, "node_id", "") or "",
         }
         return self.calls[call_id]
@@ -1234,10 +1238,11 @@ class InMemoryBusinessRepository:
         self.settlements.pop(call_id, None)
         return True
 
-    def list_calls(self, account_id: str, status: str = "") -> list[dict]:
+    def list_calls(self, account_id: str, status: str = "", node_id: str = "") -> list[dict]:
         return [
             c for c in self.calls.values()
             if (not account_id or c["account_id"] == account_id) and (not status or c["status"] == status)
+            and (not node_id or c.get("node_id", "") == node_id)
         ]
 
     def create_turn(self, turn: TurnEvent) -> dict:

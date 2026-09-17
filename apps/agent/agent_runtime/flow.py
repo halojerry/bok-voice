@@ -50,6 +50,11 @@ class FlowStep:
     # 每轮换措辞(call-2cae7769 同一段通知三种说法念了三遍)。开场身份步不标
     # (opening 机制已覆盖 step 0)。
     say: bool = False
+    # 行级情绪(say 步可选,2026-09-16 罐头带情绪):模板 steps_json `emotion`
+    # 字段(如 sad/calm,MiniMax 枚举)。只在 pregen 物化时烧进音频——探针实证
+    # bidi 中途换挡被服务端无视,运行时永不逐轮切(轮间语气稳定铁律);
+    # 空=不下发,模型按文本自动匹配(与实时线同语义)。
+    emotion: str = ""
 
 
 def parse_steps(steps_json: str) -> list[FlowStep]:
@@ -65,7 +70,14 @@ def parse_steps(steps_json: str) -> list[FlowStep]:
     out: list[FlowStep] = []
     for s in arr:
         if isinstance(s, dict):
-            out.append(FlowStep(goal=str(s.get("goal") or ""), ref=str(s.get("ref") or ""), say=bool(s.get("say"))))
+            out.append(
+                FlowStep(
+                    goal=str(s.get("goal") or ""),
+                    ref=str(s.get("ref") or ""),
+                    say=bool(s.get("say")),
+                    emotion=str(s.get("emotion") or "").strip().lower(),
+                )
+            )
         elif isinstance(s, str):
             out.append(FlowStep(goal="", ref=s))
     return [s for s in out if s.goal.strip() or s.ref.strip()]
@@ -801,6 +813,31 @@ def _is_identity_verification_step(goal: str, ref: str) -> bool:
     return any(h in text for h in _VERIFY_HINTS)
 
 
+# 共享应答规则（2026-09-17，5 通×50 轮话术外问题实证）：
+# ① 身份/防诈质疑整场得不到正面处理——4B 流程引力反复绕回当前步（「係邊個平台
+#    買㗎？」5 通重复 10+ 次）；② 赔偿档位数字在投诉/找主管/打错电话等非赔偿
+#    语境被自由复述——合规上档位只准在赔偿语境出口。
+# 落点约束：这两条必须进【整场静态前缀】（KV-cache 稳定区，零逐轮成本），不准放
+# 逐轮尾部。准则字面（【应答准则】等）在 providers/livekit_plugins.py 的
+# ContextState.render_instruction_prefix()；flow 侧进静态前缀的唯一通道是
+# flow_overview()（agent 装配时 set_flow 一次定格、整场字节不变，严格前缀安全，
+# 一次性 prefill 由 LLM_PREFIX_PREWARM 首轮预热吸收）——故随总览尾部附加。
+# 措辞纪律：此块无条件进每通通话（普通话/粤语/英文通话同款），必须全部标准书面
+# 中文（tests/test_zh_prompt_purity_no_cantonese_marks 扫粤语特征字）；指令句
+# 风格与【应答准则】一致；不写具体公司名/号码（渠道一律「官方渠道」）。
+_SHARED_RESPONSE_RULES = (
+    "【身份与来电质疑】客户质疑来电真实性、怀疑是诈骗、追问你是谁/为什么有他的电话号码/"
+    "是不是机器人、要求出示证明时：应先简短安抚，如实重申身份（集运中转仓的客服，"
+    "通过官方渠道联系客户，来电可回拨核实），此类详细说明每通电话最多说明一次；"
+    "客户重复质疑时只作简短重申，随即自然把话题带回办理流程（确认平台、单号、赔偿事项），"
+    "不得借回应质疑反复追问平台，也不得与客户争辩或承诺无法兑现的证明。"
+    "\n【赔偿数字纪律】赔偿档位、金额、倍数等具体数字，只有在客户主动询问赔偿、"
+    "或当前正处于赔偿告知环节时才可以讲；其余任何轮次（投诉、要求转人工、质疑来电、"
+    "闲聊等）一律不报具体数字，可以用「具体赔偿方案会按流程向您确认」这类表述带过；"
+    "已经讲过的档位数字，也不得在无关轮次复述。"
+)
+
+
 @dataclass
 class FlowController:
     """一通通话内的流程状态:载入步骤、按客户话推进。"""
@@ -953,6 +990,27 @@ class FlowController:
             return ""
         return self.step_say_text(self.current)
 
+    def step_say_emotion(self, idx: int, *, force: bool = False) -> str:
+        """直念步行级情绪(2026-09-16 罐头带情绪):emotion 字段原样返回。
+
+        与 step_say_text 同门槛(非 say 步除 force 外空串);空=不下发,物化/
+        运行时按自动匹配语义处理。pregen `_say_step_lines` 同源读同一字段。
+        """
+        if not self.has_steps or not (0 <= idx < len(self.steps)):
+            return ""
+        s = self.steps[idx]
+        if not s.say and not force:
+            return ""
+        return s.emotion
+
+    def pending_say_emotion(self) -> str:
+        """当前步 pending 直念的情绪(与 pending_say_text 同门槛,配套查询)。"""
+        if not self.has_steps or self.done or self.closing:
+            return ""
+        if self.current in self.said_steps:
+            return ""
+        return self.step_say_emotion(self.current)
+
     def note_step_said(self) -> None:
         """直念步念完记账(幂等)。"""
         self.said_steps.add(self.current)
@@ -1084,6 +1142,8 @@ class FlowController:
         灵活回应」主因）。现在每步带 ref 首行（该步真正要讲的内容，截 60 字），
         +400-700 token 属每通一次 prefill（LLM_PREFIX_PREWARM 首轮预热吸收，
         之后缓存命中）。总览装配时一次定格、整场字节不变——严格前缀安全。
+        2026-09-17 起总览尾部附加共享应答规则（_SHARED_RESPONSE_RULES：身份质疑
+        正面处理 + 赔偿数字纪律），随总览同走静态前缀通道，规则细节见该常量注释。
         """
         if not self.has_steps:
             return ""
@@ -1095,6 +1155,7 @@ class FlowController:
             if fact:
                 line += f"——{fact}"
             lines.append(line)
+        lines.extend(_SHARED_RESPONSE_RULES.splitlines())
         return "\n".join(lines)
 
     def _step_fact_line(self, s: "FlowStep") -> str:
