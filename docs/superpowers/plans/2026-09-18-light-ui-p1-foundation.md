@@ -460,6 +460,7 @@ bg-white/5→bg-muted/60、bg-white/10→bg-muted、hover→bg-accent、
 **Interfaces:**
 - Consumes: Task 1 浅色底（这些字色只在浅底上才需要换档）。
 - Produces: 全站 grep `text-(red|emerald|amber|sky|green|rose|orange|yellow)-[23]00` 归零。
+- **豁免（与 Task 2 同一豁免区）**：`components/interpret-console.tsx:1617` 的 `text-sky-300`/`text-emerald-300` 位于大字幕浮窗**黑底**上，浅色字正确，**不改**；grep 门禁同样排除 1560-1629 行段。
 
 **映射表：**
 
@@ -481,10 +482,10 @@ cd apps/web && grep -rEn "text-(red|emerald|amber|sky|green|rose|orange|yellow)-
 ```
 逐条替换；badge 对（`bg-*-400/15 … text-*-300` 同一元素）成对改，防止单改一半出现浅底浅字。
 
-- [ ] **Step 2: 门禁 grep 归零**
+- [ ] **Step 2: 门禁 grep 归零（字幕机豁免段除外）**
 
 ```bash
-cd apps/web && grep -rEn "text-(red|emerald|amber|sky|green|rose|orange|yellow)-[23]00" app components --include="*.tsx"
+cd apps/web && grep -rEn "text-(red|emerald|amber|sky|green|rose|orange|yellow)-[23]00" app components --include="*.tsx" | grep -v "interpret-console.tsx:16[0-2][0-9]"
 ```
 预期：零输出。
 
@@ -663,8 +664,8 @@ git commit -m "feat(web): P1 图标——独立字形位换 lucide（散文/句�
 cd apps/web
 echo "--- 裸透明（豁免 5 行外应为 0）---"
 grep -rn "bg-white/\|bg-black/\|border-white/" app components --include="*.tsx" | grep -vc "interpret-console.tsx:15[6-9][0-9]\|interpret-console.tsx:16[0-2][0-9]"
-echo "--- 暗底浅字（应为 0）---"
-grep -rEn "text-(red|emerald|amber|sky|green|rose|orange|yellow)-[23]00" app components --include="*.tsx" | wc -l
+echo "--- 暗底浅字（字幕机豁免段外应为 0）---"
+grep -rEn "text-(red|emerald|amber|sky|green|rose|orange|yellow)-[23]00" app components --include="*.tsx" | grep -v "interpret-console.tsx:16[0-2][0-9]" | wc -l
 echo "--- accent 残留（应为 0）---"
 grep -rn "text-accent\|accent-soft\|accent-ink" app components --include="*.tsx" | wc -l
 echo "--- globals 内 hex 残留（应为 0）---"
