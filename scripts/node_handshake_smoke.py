@@ -199,6 +199,11 @@ def main(argv: list[str] | None = None) -> int:
             "⑥b 同指纹重注册幂等复用 node_id",
             f"HTTP {status} {reg2.get('node_id') or body}（期望 {node_id}）",
         )
+        # 重注册=换新 token（旧 token 随覆盖失效）——后续 ⑦⑧ 步必须拿新 token，
+        # 否则心跳全 401（CI 首跑实爆，2026-09-18）。
+        new_token = str(reg2.get("node_token") or "")
+        if status == 200 and new_token:
+            node_token = new_token
     else:
         print("[skip] ⑥ 非 license 流（auth-off CP），跳过克隆/复活断言", flush=True)
 
