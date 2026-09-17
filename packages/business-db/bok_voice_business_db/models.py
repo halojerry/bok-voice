@@ -294,8 +294,10 @@ class GlobalSetting(Base):
     sip_json: Mapped[str] = mapped_column(Text, default="")
     # 全局外呼时段窗段（2026-09-17 T3b）：{"call_windows": [...]}，形状归一见
     # campaign.parse_call_windows；空串/空 dict=不限时段。迁移 DDL 与
-    # deps._ensure_column 同形。
-    campaign_json: Mapped[str] = mapped_column(Text, default="")
+    # deps._ensure_column 同形。server_default 必须带上：dump_postgres_ddl 从
+    # 模型生成 Supabase 引导件，ORM-only default 不进 DDL → 裸 INSERT 直撞
+    # NotNullViolation（CI postgres-smoke 实证）。
+    campaign_json: Mapped[str] = mapped_column(Text, default="", server_default="")
     policy: Mapped[str] = mapped_column(String(64), default="offline_first")
     updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
 

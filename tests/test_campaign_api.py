@@ -535,7 +535,10 @@ def test_settings_campaign_section_roundtrip_and_tick_gating(monkeypatch):
     from control_plane.campaign import campaign_tick
 
     client, repo = _client_and_repo(monkeypatch)
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    # 时钟钉到半点：窗端点秒级含端（HH:59 之后的 HH:59:xx 已出窗），真实钟
+    # 撞 59 分档=1/60 概率红（CI 18:59:01 实证）。钉半点后与分/秒彻底脱钩。
+    now = datetime.now(timezone.utc).replace(tzinfo=None, minute=30,
+                                             second=0, microsecond=0)
 
     # 窗内窗（覆盖 now）+ 一条垃圾窗：归一落库应剔除垃圾、保留正常窗。
     # end 用同小时 :59（恒 start<end）：旧 (hour+1)%24 在 23 点档变跨零点窗

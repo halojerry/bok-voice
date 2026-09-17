@@ -261,7 +261,7 @@ CREATE TABLE public.global_settings (
     tts_json text NOT NULL,
     vad_json text NOT NULL,
     sip_json text NOT NULL,
-    campaign_json text NOT NULL,
+    campaign_json text DEFAULT ''::text NOT NULL,
     policy character varying(64) NOT NULL,
     updated_at timestamp without time zone NOT NULL
 );
