@@ -71,6 +71,9 @@ _MIGRATION_COLUMNS: dict[str, tuple[str, ...]] = {
     "call_sessions": (
         "template_id", "whatsapp_status", "customer_whatsapp", "kind",
         "target_lang", "session_report", "created_by",
+        # 仪表盘时长统计（2026-09-17 campaign-scheduling-dashboard Task 1）：
+        # TIMESTAMP 列的真库 ALTER 路径只有这里验得到。
+        "started_at", "ended_at", "duration_s",
     ),
     "settlements": ("summary",),
     "turns": (
@@ -78,7 +81,8 @@ _MIGRATION_COLUMNS: dict[str, tuple[str, ...]] = {
         "template_step", "started_ms", "ended_ms", "perceived_ms",
     ),
     "global_settings": ("sip_json",),
-    "campaigns": ("scripts_json",),
+    # 战役调度三字段（2026-09-17 campaign-scheduling-dashboard Task 1）。
+    "campaigns": ("scripts_json", "call_windows_json", "max_concurrency", "redispatch_json"),
     "qa_entries": ("owner_user_id",),
     "users": ("permissions_json",),
 }

@@ -257,6 +257,25 @@ def build_engine() -> Engine | None:
                 _ensure_column(conn, "nodes", "revoked_at", "revoked_at VARCHAR(32) DEFAULT ''")
                 # 通话绑定节点(thin-node 拓扑):建单钉死承载节点,token 签发前校验。
                 _ensure_column(conn, "call_sessions", "node_id", "node_id VARCHAR(64) DEFAULT ''")
+                # 战役调度三字段（2026-09-17 竞品对齐）：时段窗/任务级并发/自动重拨。
+                # server_default 同形（DEFAULT '[]'/1/''，单引号字面量 SQLite/PG 双认）。
+                _ensure_column(conn, "campaigns", "call_windows_json",
+                               "call_windows_json TEXT DEFAULT '[]'")
+                _ensure_column(conn, "campaigns", "max_concurrency",
+                               "max_concurrency INTEGER DEFAULT 1")
+                _ensure_column(conn, "campaigns", "redispatch_json",
+                               "redispatch_json TEXT DEFAULT ''")
+                # 仪表盘时长统计（2026-09-17）：started_at/ended_at=接通与终态时刻，
+                # duration_s=接通秒数。DateTime 列迁移 DDL 用 TIMESTAMP——PG 无
+                # DATETIME 类型（实测 ERROR: type "datetime" does not exist），SQLite
+                # 双认（类型名任意）；与 ORM DateTime 列（PG 编译 TIMESTAMP WITHOUT
+                # TIME ZONE）同域。
+                _ensure_column(conn, "call_sessions", "started_at",
+                               "started_at TIMESTAMP")
+                _ensure_column(conn, "call_sessions", "ended_at",
+                               "ended_at TIMESTAMP")
+                _ensure_column(conn, "call_sessions", "duration_s",
+                               "duration_s INTEGER DEFAULT 0")
                 # 节点鉴权(P1,深测): (license_id, fingerprint) 部分唯一索引——多实例
                 # 部署下配额竞态的库级兜底(进程内由 NodeStore.register_licensed 的
                 # 锁收口)。只约束 license 绑定行:开放模式存量空值行不受影响。

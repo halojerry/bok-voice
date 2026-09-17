@@ -128,6 +128,11 @@ class CallSession(Base):
     # (重试)替换、异 worker 追加。server_default 与 deps.build_engine 迁移 DDL
     # 同形（DEFAULT '[]'，单引号字面量 SQLite/Postgres 双认）。
     session_reports_json: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
+    # 仪表盘时长统计（2026-09-17）：started_at=首次接通时刻；ended_at=终态时刻；
+    # duration_s=接通秒数（未接通=0）。DateTime nullable 与 campaigns.finished_at 同形。
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, default=None, nullable=True)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime, default=None, nullable=True)
+    duration_s: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     # 通话绑定节点(site-delivery M1,2026-09-16 thin-node 拓扑):建单时钉死承载节点,
     # /api/token 签发前校验其未吊销——root 熔断对「坐席 JWT 建单」路径同样生效。
     # ''=无绑定(单机全栈形态),行为零变化。server_default 与迁移 DDL 同形（DEFAULT ''）。
@@ -174,6 +179,14 @@ class Campaign(Base):
     # 电话边缘站点（spec 2026-09-13 P1.5）：空串=未挂站点，dial 块回退 settings
     # `sip`（单站点旧行为零变化）；挂站点时 trunk 取站点注册值、settings 兜底。
     site_id: Mapped[str] = mapped_column(String(64), default="")
+    # 外呼时段窗（2026-09-17 竞品对齐）：JSON 数组 [{"days":[1..7],"start":"HH:MM","end":"HH:MM"}]，
+    # days=ISO 星期(1=周一)；空数组=不限。≤3 组，解析归一见 campaign.parse_call_windows。
+    # server_default 与 deps._ensure_column 迁移 DDL 同形。
+    call_windows_json: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
+    # 任务级最大并发：0=不限；≥1=同刻至多 N 通在途。缺省 1=旧串行行为。
+    max_concurrency: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    # 未接通自动重拨：{"max_attempts":2,"interval_minutes":30,"on":["no_answer"]}；空串=不重拨（旧行为）。
+    redispatch_json: Mapped[str] = mapped_column(Text, default="", server_default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(default=None)
 

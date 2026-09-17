@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -9,6 +11,8 @@ from bok_voice_business_db.repository import (
     InMemoryBusinessRepository,
     SqlAlchemyBusinessRepository,
 )
+from bok_voice_core.policies import select_session_manifest
+from bok_voice_core.types import CallMode
 
 
 def _repo_with_object():
@@ -183,3 +187,65 @@ def test_find_item_by_call_sql(sql_repo):
     assert sql_repo.find_item_by_call("call-x") is None
     sql_repo.update_item(item["id"], status="in_call", call_id="call-x")
     assert sql_repo.find_item_by_call("call-x")["id"] == item["id"]
+
+
+# ---- 战役调度三字段 + 通话时长列（2026-09-17 campaign-scheduling-dashboard Task 1）----
+
+def _manifest():
+    """最小建通话 manifest（本文件此前无建通话用例，按 test_business_repo 姿势补）。"""
+    return select_session_manifest(
+        session_id="call-sched-1",
+        account_id="acc-001",
+        object_id="obj-1",
+        persona_id="",
+        mode=CallMode.LIVE,
+    )
+
+
+def _dt(offset_s: int) -> datetime:
+    """brief 口径：naive UTC datetime（与 created_at 同域）。"""
+    return datetime(2026, 9, 17, 0, 0, 0) + timedelta(seconds=offset_s)
+
+
+@pytest.fixture(params=["memory", "sql"])
+def repo(request, sql_repo):
+    """双仓参数化（沿用本文件两既有风格：内存直造 + sql_repo fixture）。"""
+    if request.param == "memory":
+        return InMemoryBusinessRepository()
+    return sql_repo
+
+
+class TestCampaignSchedulingFields:
+    """战役调度三字段（2026-09-17）：双仓 roundtrip + 白名单 + 缺省旧行为。"""
+
+    def test_create_with_scheduling_fields(self, repo):
+        camp = repo.create_campaign(
+            "acc-001", name="t", template_id="", persona_id="", language="zh",
+            gap_seconds=5, object_ids=[], call_windows=[{"days": [1, 2], "start": "08:00", "end": "18:00"}],
+            max_concurrency=3, redispatch={"max_attempts": 2, "interval_minutes": 30, "on": ["no_answer"]},
+        )
+        assert camp["call_windows"] == [{"days": [1, 2], "start": "08:00", "end": "18:00"}]
+        assert camp["max_concurrency"] == 3
+        assert camp["redispatch"] == {"max_attempts": 2, "interval_minutes": 30, "on": ["no_answer"]}
+
+    def test_create_defaults_are_legacy(self, repo):
+        camp = repo.create_campaign("acc-001", name="t", template_id="", persona_id="",
+                                    language="zh", gap_seconds=5, object_ids=[])
+        assert camp["call_windows"] == []
+        assert camp["max_concurrency"] == 1
+        assert camp["redispatch"] == {}
+
+    def test_update_whitelist_accepts_scheduling_fields(self, repo):
+        camp = repo.create_campaign("acc-001", name="t", template_id="", persona_id="",
+                                    language="zh", gap_seconds=5, object_ids=[])
+        updated = repo.update_campaign(camp["id"], max_concurrency=0,
+                                       call_windows_json='[{"days":[6],"start":"09:00","end":"12:00"}]',
+                                       redispatch_json='{"max_attempts":2,"interval_minutes":15,"on":["no_answer"]}')
+        assert updated["max_concurrency"] == 0
+        assert updated["call_windows"] == [{"days": [6], "start": "09:00", "end": "12:00"}]
+        assert updated["redispatch"]["max_attempts"] == 2
+
+    def test_update_call_time_columns(self, repo):
+        call = repo.create_call(_manifest())  # 沿用文件内既有建通话 helper/fixture
+        updated = repo.update_call(call["id"], started_at=_dt(0), ended_at=_dt(95), duration_s=95)
+        assert updated["duration_s"] == 95 and updated["started_at"] is not None
