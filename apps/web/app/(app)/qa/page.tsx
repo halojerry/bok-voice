@@ -4,12 +4,37 @@
 // 话务员（user）=「我的 / 共享」两 tab，只能改自己的；主管（admin/root/本地匿名）=全部列表
 // + 归属列与归属转移。命中判定按字面措辞，所以条目的问题文本要按客户实际说法写。
 
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { api, type UserRow } from "@/lib/api";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import dynamic from "next/dynamic";
+import { api, authHeaders, type UserRow } from "@/lib/api";
 import { resolveClusterTarget, revertCluster } from "@/lib/qa-canvas";
+import type { TemplateRow } from "@/components/qa-canvas-view";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
 import { useSession } from "@/components/session-context";
 import { useAccount } from "@/components/account-context";
+
+// 画布视图懒加载(@xyflow/react 仅进画布 chunk,列表视图零负担;spec §4.2)。
+const QaCanvasView = dynamic(() => import("@/components/qa-canvas-view"), {
+  ssr: false,
+  loading: () => <LoadingState />,
+});
+
+/** 画布边右键/Delete 上抛的边载荷(与组件 CanvasEdgeHit 同构)。 */
+type CanvasEdgeHit = { id: string; source: string; target: string; data?: { kind?: string } };
+
+/** 播放一段音频 blob(罐头回放/现场合成共用);开始播放即返回,结束后回收 objectURL。 */
+async function playBlob(blob: Blob): Promise<void> {
+  const url = URL.createObjectURL(blob);
+  const audio = new Audio(url);
+  try {
+    await audio.play();
+    audio.onended = () => URL.revokeObjectURL(url);
+    audio.onerror = () => URL.revokeObjectURL(url);
+  } catch (e) {
+    URL.revokeObjectURL(url);
+    throw e;
+  }
+}
 
 const LANGS = [
   ["zh", "普通话"],
@@ -74,12 +99,32 @@ export default function QaPage() {
   const [err, setErr] = useState("");
   const [formErr, setFormErr] = useState("");
   const [ok, setOk] = useState(false);
-  // 画布选中话术:挂步骤时随 PATCH 下发;Task 7 挂画布后经 onTemplateChange 写入,本任务先占位。
+  // 画布视图(qa-canvas Phase1 Task7):「列表|画布」切换 + 画布派生输入。
+  const [view, setView] = useState<"list" | "canvas">("list");
+  const [templates, setTemplates] = useState<TemplateRow[]>([]);
+  // 模板下拉只作画布步骤脊柱的派生输入(spec §4.2);已绑模板的显示/写入属 Phase 2,此处不做。
   const [templateId, setTemplateId] = useState("");
+  // 罐头物化状态面(spec §5):entry_id → ok|missing;拉取失败=空表(徽标降级,§8)。
+  const [canned, setCanned] = useState<Record<string, { state: "ok" | "missing" }>>({});
+  const cannedPollRef = useRef<ReturnType<typeof setTimeout>[]>([]);
+  // 右键菜单(节点/边):{x,y}=视口坐标,fixed 定位直用。
+  const [menu, setMenu] = useState<{ row: QaRow; x: number; y: number } | null>(null);
+  const [edgeMenu, setEdgeMenu] = useState<{ edge: CanvasEdgeHit; x: number; y: number } | null>(null);
 
   /** 主管模式：匿名本地会话（auth-off 单机形态）与 admin/root 一律全量管理。 */
   const isManager = Boolean(
     session && (session.anonymous || session.role === "admin" || session.role === "root"),
+  );
+
+  // 行编辑权(与列表逐字同规;useCallback 稳定引用——画布组件 nodes useMemo 依赖它,
+  // 每 render 新建闭包会击穿 memo 全节点重建)。
+  const canEditRow = useCallback(
+    (row: QaRow) => {
+      if (isManager) return true;
+      const uid = session?.user_id ?? "";
+      return uid !== "" && String(row.owner_user_id ?? "") === uid;
+    },
+    [isManager, session],
   );
 
   const refresh = useCallback(async () => {
@@ -96,6 +141,65 @@ export default function QaPage() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // 罐头状态面:CP 侧 60s TTL(spec §5),补料触发后经 scheduleCannedRefresh 轮询刷新。
+  const refreshCanned = useCallback(async () => {
+    try {
+      const res = await api.qaCannedStatus(accountId);
+      setCanned(res?.statuses ?? {});
+    } catch {
+      setCanned({}); // 拉取失败=无徽标降级(spec §8),不阻塞画布渲染
+    }
+  }, [accountId]);
+
+  useEffect(() => {
+    void refreshCanned();
+  }, [refreshCanned]);
+
+  // 补料后轮询:物化是后台子进程(条目多时数十秒),且 CP 状态缓存 60s TTL——
+  // 单次 setTimeout 3s 结构性看不见新料;改 3s/15s/40s/65s 四次间隔轮询,
+  // 末次跨过 TTL 窗口;重复触发先清旧定时器。卸载清理防 setState-after-unmount。
+  const scheduleCannedRefresh = useCallback(() => {
+    for (const t of cannedPollRef.current) clearTimeout(t);
+    cannedPollRef.current = [3000, 15000, 40000, 65000].map((ms) =>
+      setTimeout(() => void refreshCanned(), ms),
+    );
+  }, [refreshCanned]);
+
+  useEffect(
+    () => () => {
+      for (const t of cannedPollRef.current) clearTimeout(t);
+    },
+    [],
+  );
+
+  // 话术表(画布步骤脊柱输入):话务员 403/拉取失败=静默空表(脊柱消失仍可用);账号变化重拉。
+  useEffect(() => {
+    let alive = true;
+    setTemplates([]);
+    setTemplateId(""); // 旧账号选中不再有效
+    void (async () => {
+      try {
+        const raw = (await api.listTemplates(accountId)) as Record<string, unknown>[];
+        const list = (Array.isArray(raw) ? raw : [])
+          .map((t) => ({
+            id: String(t.id ?? ""),
+            name: typeof t.name === "string" ? t.name : undefined,
+            steps_json: typeof t.steps_json === "string" ? t.steps_json : undefined,
+            language: typeof t.language === "string" ? t.language : undefined,
+          }))
+          .filter((t) => t.id);
+        if (!alive) return;
+        setTemplates(list);
+        setTemplateId((prev) => prev || (list[0]?.id ?? "")); // spec §4.2 默认第一个模板
+      } catch {
+        if (alive) setTemplates([]);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [accountId]);
 
   // 成员表只服务主管面（归属列 + 转移下拉）；话务员无权访问 /api/users，别请求。
   useEffect(() => {
@@ -257,8 +361,57 @@ export default function QaPage() {
     }
   }
 
-  // ---- 画布编辑处理器(qa-canvas Phase1 Task6):Task 7 挂载 QaCanvasView 时经 props 接线;
-  //      先落逻辑保证本提交自洽。校验/回滚纯函数在 lib/qa-canvas.ts。----
+  // ---- 画布罐头面(qa-canvas Phase1 Task7):补料/试听,随画布挂载接线 ----
+
+  /** 补料(一键=全量幂等,单条=右键「重新物化」):admin/root 闸,按钮仅主管渲染。
+   *  already_running 静默(单飞进行中,轮询会自然取到结果);script_missing 才报错。 */
+  async function pregenQa(ids: string[]) {
+    setBusy("pregen");
+    setErr("");
+    try {
+      const res = await api.pregenQa(ids);
+      if (res?.status === "script_missing") setErr("补料失败：物化脚本缺失。");
+      scheduleCannedRefresh();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  /** 试听(spec §5):先播罐头缓存(零云费,auth-on 经 fetch-blob+Bearer,<audio> 带不了鉴权头);
+   *  缺料(404)/播放失败回退现场合成——烧云配额仅主管可用,user 见提示待物化。 */
+  async function audition(row: QaRow) {
+    const id = String(row.id ?? "");
+    setBusy(`${id}:audition`);
+    try {
+      const res = await fetch(api.cannedAudioUrl(id), { headers: authHeaders() });
+      if (!res.ok) throw new Error(String(res.status));
+      await playBlob(await res.blob());
+    } catch {
+      if (isManager) {
+        try {
+          await playBlob(
+            await api.previewTts({
+              provider: "minimax",
+              text: String(row.answer_text ?? ""),
+              voice: String(row.voice_id ?? ""),
+              language: String(row.lang ?? "zh"),
+              sample_rate: 24000,
+            }),
+          );
+        } catch (e) {
+          setErr(`试听失败：${String(e)}`);
+        }
+      } else {
+        window.alert("该条目罐头未物化，请联系主管在画布上「重新物化」。");
+      }
+    } finally {
+      setBusy("");
+    }
+  }
+
+  // ---- 连簇/挂步骤/断线处理器(Task6 落逻辑,Task7 随画布挂载接线);校验/回滚纯函数在 lib/qa-canvas.ts ----
 
   /** 连簇(spec §4.4):校验→乐观写 cluster_head_id→PATCH,失败 revertCluster 回滚后 refresh。 */
   async function connectCluster(fromId: string, toId: string) {
@@ -329,6 +482,7 @@ export default function QaPage() {
       : "暂无共享条目。";
   const textarea = "w-full resize-none rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)";
   const selectCls = "w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)";
+  const menuItemCls = "block w-full px-3 py-1.5 text-left text-xs hover:bg-white/10";
 
   return (
     <div className="space-y-4">
@@ -337,27 +491,69 @@ export default function QaPage() {
           <h1 className="page-title">快答库</h1>
           <p className="page-sub">常见问法的即答条目 · 命中即播标准回答，跳过模型生成</p>
         </div>
-        {!isManager && (
+        <div className="flex items-center gap-3">
+          {/* 画布不套用 mine/shared 过滤(spec §4.3:画布=全部可见条目),画布视图藏归属 tab。 */}
+          {!isManager && view === "list" && (
+            <div className="flex items-center gap-1">
+              {([
+                ["mine", `我的（${mineCount}）`],
+                ["shared", `共享（${sharedCount}）`],
+              ] as const).map(([key, label]) => (
+                <button
+                  key={key}
+                  className={`btn-ghost text-xs ${tab === key ? "border-(--accent) text-accent" : "muted"}`}
+                  onClick={() => setTab(key)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          )}
           <div className="flex items-center gap-1">
-            {([
-              ["mine", `我的（${mineCount}）`],
-              ["shared", `共享（${sharedCount}）`],
-            ] as const).map(([key, label]) => (
+            {([["list", "列表"], ["canvas", "画布"]] as const).map(([k, label]) => (
               <button
-                key={key}
-                className={`btn-ghost text-xs ${tab === key ? "border-(--accent) text-accent" : "muted"}`}
-                onClick={() => setTab(key)}
+                key={k}
+                className={`btn-ghost text-xs ${view === k ? "border-(--accent) text-accent" : "muted"}`}
+                onClick={() => setView(k)}
               >
                 {label}
               </button>
             ))}
           </div>
-        )}
+        </div>
       </div>
 
       {err && <ErrorState message={err} />}
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_420px]">
+        {view === "canvas" ? (
+          <section className="card">
+            {rows === null ? (
+              <LoadingState />
+            ) : rows.length === 0 ? (
+              <EmptyState label="暂无快答条目，可在右侧新建后回到画布。" />
+            ) : (
+              <QaCanvasView
+                accountId={accountId}
+                rows={rows}
+                templates={templates}
+                templateId={templateId}
+                onTemplateChange={setTemplateId}
+                canned={canned}
+                canEditRow={canEditRow}
+                onNodeClick={edit}
+                onPaneDoubleClick={() => resetForm()}
+                onNodeContextMenu={(row, e) => setMenu({ row, x: e.clientX, y: e.clientY })}
+                onEdgeContextMenu={(edge, e) => setEdgeMenu({ edge, x: e.clientX, y: e.clientY })}
+                onConnectCluster={connectCluster}
+                onStepConnect={stepConnect}
+                onDisconnect={disconnect}
+                onPregenAll={isManager ? () => void pregenQa([]) : undefined}
+                pregenBusy={busy === "pregen"}
+              />
+            )}
+          </section>
+        ) : (
         <section className="card">
           {rows === null ? (
             <LoadingState />
@@ -438,6 +634,7 @@ export default function QaPage() {
             </div>
           )}
         </section>
+        )}
 
         <section className="card space-y-3">
           <div className="flex items-center justify-between">
@@ -535,6 +732,23 @@ export default function QaPage() {
             <button className="btn-primary" disabled={busy === "save"} onClick={() => void save()}>
               {editingId ? "保存修改" : "创建条目"}
             </button>
+            {editingId && (
+              <button
+                className="btn-ghost"
+                disabled={busy === `${editingId}:audition`}
+                title="先播罐头缓存；缺料时主管侧现场合成"
+                onClick={() =>
+                  void audition({
+                    id: editingId,
+                    answer_text: form.answer_text,
+                    lang: form.lang,
+                    voice_id: form.voice_id,
+                  })
+                }
+              >
+                {busy === `${editingId}:audition` ? "合成中…" : "试听"}
+              </button>
+            )}
             {ok && <span className="text-sm text-emerald-400">已保存。</span>}
           </div>
           {!isManager && !editingId && (
@@ -544,6 +758,60 @@ export default function QaPage() {
           )}
         </section>
       </div>
+
+      {/* 右键菜单(spec §4.4):节点=编辑/启停/试听/重新物化[主管]/删除(只读行仅试听);
+          边=解除连线(簇边=散簇、步骤边=解挂,page.disconnect 按 kind 分路)。 */}
+      {menu && (
+        <div
+          className="fixed inset-0 z-50"
+          onClick={() => setMenu(null)}
+          onContextMenu={(e) => { e.preventDefault(); setMenu(null); }}
+        >
+          <div
+            className="absolute min-w-[112px] rounded-lg border border-(--card-border) bg-(--card) py-1 shadow-xl"
+            style={{ left: menu.x, top: menu.y }}
+          >
+            {canEditRow(menu.row) && (
+              <button className={menuItemCls} onClick={() => { setMenu(null); edit(menu.row); }}>编辑</button>
+            )}
+            {canEditRow(menu.row) && (
+              <button className={menuItemCls} onClick={() => { setMenu(null); void toggleEnabled(menu.row); }}>
+                {menu.row.enabled === false ? "启用" : "停用"}
+              </button>
+            )}
+            <button className={menuItemCls} onClick={() => { setMenu(null); void audition(menu.row); }}>试听</button>
+            {isManager && (
+              <button className={menuItemCls} onClick={() => { setMenu(null); void pregenQa([String(menu.row.id)]); }}>
+                重新物化
+              </button>
+            )}
+            {canEditRow(menu.row) && (
+              <button className={`${menuItemCls} text-red-300`} onClick={() => { setMenu(null); void remove(menu.row); }}>
+                删除
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+      {edgeMenu && (
+        <div
+          className="fixed inset-0 z-50"
+          onClick={() => setEdgeMenu(null)}
+          onContextMenu={(e) => { e.preventDefault(); setEdgeMenu(null); }}
+        >
+          <div
+            className="absolute min-w-[112px] rounded-lg border border-(--card-border) bg-(--card) py-1 shadow-xl"
+            style={{ left: edgeMenu.x, top: edgeMenu.y }}
+          >
+            <button
+              className={menuItemCls}
+              onClick={() => { const hit = edgeMenu.edge; setEdgeMenu(null); void disconnect(hit); }}
+            >
+              {edgeMenu.edge.data?.kind === "cluster" ? "解除变体归属" : "解除步骤挂载"}
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

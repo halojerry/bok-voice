@@ -1,7 +1,7 @@
 "use client";
 
 // QA 画布视图(spec §4.3/§4.4,2026-09-17 Phase1)。渲染+编辑交互在本文件:
-// 连线(onConnect)/右键/双击/断线点击一律上抛,page.tsx 持数据与 PATCH。
+// 连线(onConnect)/右键/双击/断线(Delete 键或边右键)一律上抛,page.tsx 持数据与 PATCH。
 // 布局=lib/qa-canvas.deriveGraph(确定性);拖动位置 localStorage;MiniMap 常开。
 
 import {
@@ -10,7 +10,7 @@ import {
 } from "react";
 import {
   Background, Controls, Handle, MiniMap, Position, ReactFlow,
-  type Edge, type Node, type NodeChange, type NodeProps,
+  type Edge, type EdgeChange, type Node, type NodeChange, type NodeProps,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import {
@@ -77,7 +77,11 @@ function QaStepNode({ data }: NodeProps) {
 
 const NODE_TYPES = { qaEntry: QaEntryNode, qaStep: QaStepNode };
 
+// 上抛边载荷的结构收窄(仅取 page 关心的字段,不 as never 逃逸)。
+export type CanvasEdgeHit = { id: string; source: string; target: string; data?: { kind?: string } };
+
 export default function QaCanvasView(props: {
+  accountId: string;
   rows: QaRow[];
   templates: TemplateRow[];
   templateId: string;
@@ -86,16 +90,23 @@ export default function QaCanvasView(props: {
   canEditRow: (row: QaRow) => boolean;
   onNodeClick: (row: QaRow) => void;
   onPaneDoubleClick: (pt: { x: number; y: number }) => void;
-  /** 右键条目(Task 7 提供菜单);不给时仅吞掉浏览器默认菜单。 */
+  /** 右键条目(page 提供菜单:编辑/启停/删除/试听/重新物化[manager]);不给时仅吞掉浏览器默认菜单。 */
   onNodeContextMenu?: (row: QaRow, e: ReactMouseEvent) => void;
+  /** 右键边(page 提供菜单:解除连线,spec §4.4「右键解除」)。 */
+  onEdgeContextMenu?: (edge: CanvasEdgeHit, e: ReactMouseEvent) => void;
   onConnectCluster: (fromId: string, toId: string) => void;
-  onDisconnect: (edge: { id: string; data?: { kind?: string }; source: string; target: string }) => void;
+  onDisconnect: (edge: CanvasEdgeHit) => void;
   onStepConnect: (entryId: string, stepIndex: number) => void;
+  /** 一键补料(仅主管注入;不给=按钮不渲染,user 的 403 由闸兜底)。 */
+  onPregenAll?: () => void;
+  pregenBusy?: boolean;
 }) {
-  const { rows, templates, templateId, canned, canEditRow } = props;
+  const { rows, templates, templateId, canned, canEditRow, accountId } = props;
   const [langFilter, setLangFilter] = useState("all");
   const [positions, setPositions] = useState<Record<string, Pt>>({});
-  const accountId = "acc-001"; // 与页面 useAccount 同源,Task 7 接线时由 props 传入替换。
+  // 边选中态本地持有(spec §4.4:点选边→Delete 键或右键解除):受控图里 RF 的
+  // select/remove 变更一律吞掉,删除必须经 page PATCH+refresh 落库。
+  const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
 
   useEffect(() => {
     try {
@@ -118,9 +129,12 @@ export default function QaCanvasView(props: {
 
   const nodes: Node[] = useMemo(
     () => [
-      ...graph.stepNodes.map((n) => ({ ...n, data: { ...n.data } })),
+      ...graph.stepNodes.map((n) => ({ ...n, deletable: false, data: { ...n.data } })),
       ...graph.qaNodes.map((n) => ({
         ...n,
+        // deletable=false:节点不是可删对象(删除走右键菜单→page),防 Backspace 误删
+        // 连带把其连线拉进 getElementsToRemove 的删除集。
+        deletable: false,
         data: { ...n.data, canned: canned[String(n.id)]?.state, canEdit: canEditRow(n.data) },
       })),
     ],
@@ -128,15 +142,20 @@ export default function QaCanvasView(props: {
   );
   const edges: Edge[] = useMemo(
     () =>
-      graph.edges.map((e) => ({
-        ...e,
-        animated: e.data.kind === "step",
-        style: e.data.kind === "cluster"
-          ? { stroke: "var(--accent)", strokeWidth: 1.5 }
-          : { stroke: "#888", strokeDasharray: "4 3" },
-        labelStyle: { fontSize: 10 },
-      })),
-    [graph],
+      graph.edges.map((e) => {
+        const sel = e.id === selectedEdgeId;
+        return {
+          ...e,
+          selected: sel,
+          animated: e.data.kind === "step",
+          // 内联 style 会盖掉 RF 的 .selected 高亮,选中反馈在此显式给出。
+          style: e.data.kind === "cluster"
+            ? { stroke: "var(--accent)", strokeWidth: sel ? 3 : 1.5 }
+            : { stroke: sel ? "var(--accent)" : "#888", strokeDasharray: "4 3", strokeWidth: sel ? 2 : 1 },
+          labelStyle: { fontSize: 10 },
+        };
+      }),
+    [graph, selectedEdgeId],
   );
 
   const onNodeDragStop = useCallback(
@@ -168,6 +187,10 @@ export default function QaCanvasView(props: {
     });
   }, []);
 
+  // 受控边:select/remove 变更一律不落内部状态(选中态=selectedEdgeId 本地持有,
+  // 删除经 onEdgesDelete 上抛 page PATCH+refresh;静默吞掉防受控图分叉)。
+  const onEdgesChange = useCallback((_changes: EdgeChange[]) => {}, []);
+
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-center gap-2">
@@ -198,9 +221,15 @@ export default function QaCanvasView(props: {
         >
           重置布局
         </button>
+        {props.onPregenAll && (
+          <button className="btn-ghost text-xs" disabled={props.pregenBusy} onClick={props.onPregenAll}>
+            {props.pregenBusy ? "补料中…" : "一键补料"}
+          </button>
+        )}
       </div>
-      {/* 双击空白新建入口(Task 7 消费坐标):@xyflow 12.11 无 onPaneDoubleClick,
-          用包裹层 onDoubleClick + 落点判 pane 兜出,并关掉双击缩放避免手势打架。 */}
+      {/* 双击空白新建(spec §4.4):@xyflow 12.11 无 onPaneDoubleClick,
+          用包裹层 onDoubleClick + 落点判 pane 兜出,并关掉双击缩放避免手势打架;
+          坐标上抛 page,Phase1 仅开新建表单(落点插入待 Phase2)。 */}
       <div
         className="h-[600px] rounded-lg border border-(--card-border)"
         onDoubleClick={(e) => {
@@ -217,9 +246,13 @@ export default function QaCanvasView(props: {
           fitView
           minZoom={0.2}
           zoomOnDoubleClick={false}
+          deleteKeyCode={["Backspace", "Delete"]}
           onNodesChange={onNodesChange}
+          onEdgesChange={onEdgesChange}
           onNodeDragStop={onNodeDragStop}
+          onPaneClick={() => setSelectedEdgeId(null)}
           onNodeClick={(_, node) => {
+            setSelectedEdgeId(null); // 点节点=去选边,防 Backspace 误触发边解除
             const row = rows.find((r) => String(r.id) === node.id);
             if (row) props.onNodeClick(row);
           }}
@@ -227,6 +260,20 @@ export default function QaCanvasView(props: {
             e.preventDefault();
             const row = rows.find((r) => String(r.id) === node.id);
             row && props.onNodeContextMenu?.(row, e);
+          }}
+          onEdgeClick={(_, edge) => {
+            // spec §4.4:点选边=仅选中,解除走 Delete 键或右键菜单(Task 6 的点击 confirm 已收口)。
+            setSelectedEdgeId(edge.id);
+          }}
+          onEdgeContextMenu={(e, edge) => {
+            e.preventDefault();
+            const hit = edge as CanvasEdgeHit;
+            setSelectedEdgeId(edge.id);
+            props.onEdgeContextMenu?.(hit, e);
+          }}
+          onEdgesDelete={(deleted) => {
+            for (const edge of deleted) props.onDisconnect(edge as CanvasEdgeHit);
+            setSelectedEdgeId(null);
           }}
           onConnect={(conn) => {
             if (!conn.source || !conn.target) return;
@@ -239,11 +286,6 @@ export default function QaCanvasView(props: {
               return;
             }
             props.onConnectCluster(conn.source, target);
-          }}
-          onEdgeClick={(_, edge) => {
-            // Edge→上抛载荷的结构收窄(仅取本页关心的字段,不再 as never 逃逸)。
-            const hit = edge as { id: string; data?: { kind?: string }; source: string; target: string };
-            if (confirm("解除这条连线？")) props.onDisconnect(hit);
           }}
         >
           <Background gap={24} />
