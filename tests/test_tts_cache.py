@@ -97,6 +97,32 @@ def test_pinned_entries_survive_eviction(tmp_path):
     assert c.get(dyn[2]) is not None
 
 
+def test_key_emotion_dimension_sparse():
+    base = cache_key("好的", voice_id="v1", model="m", sample_rate=24000)
+    # 空 emotion=旧键语义零变化(向后兼容,存量条目零失效;2026-09-16 罐头带情绪)
+    assert cache_key("好的", voice_id="v1", model="m", sample_rate=24000, emotion="") == base
+    # 非空 emotion 产生独立条目(情绪烧在音频里,同文本不同情绪必须不同条目)
+    assert cache_key("好的", voice_id="v1", model="m", sample_rate=24000, emotion="sad") != base
+    # 大小写/空白归一
+    assert (
+        cache_key("好的", voice_id="v1", model="m", sample_rate=24000, emotion="SAD ")
+        == cache_key("好的", voice_id="v1", model="m", sample_rate=24000, emotion="sad")
+    )
+
+
+def test_store_lookup_emotion_roundtrip(tmp_path):
+    c = _cache(tmp_path)
+    text = "抱歉让您久等了"
+    assert c.store(
+        c.key_for(text, voice="v1", model="m", speed=1.2, emotion="sad"),
+        b"\xe8\x03" * 4800,
+        text=text, voice="v1", model="m", pin=True, speed=1.2, emotion="sad",
+    )
+    assert c.lookup(text, voice="v1", model="m", speed=1.2, emotion="sad") is not None
+    # 无情绪查找不吃情绪条目(实时线/其他罐头线不误播情绪版)
+    assert c.lookup(text, voice="v1", model="m", speed=1.2) is None
+
+
 def test_unpinned_default_stays_evictable(tmp_path):
     """运行时 tee 落盘(session.say 直念线)不传 pin=默认可逐出。"""
     c = _cache(tmp_path, max_entries=1)
