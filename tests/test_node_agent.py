@@ -139,6 +139,9 @@ def test_perform_update_rejects_bad_sha_and_bad_version(tmp_path, monkeypatch):
     cfg = _cfg(version="v0.1.0")
     assert na.perform_update(cfg, "", root=tmp_path) == "update: empty version"
     assert na.perform_update(cfg, "v0.1.0", root=tmp_path) == "update: already at v0.1.0"
+    # 非法版本号（URL 路径段白名单外）——防御性拒绝，不发起任何请求
+    assert "invalid version" in na.perform_update(cfg, "../etc", root=tmp_path)
+    assert "invalid version" in na.perform_update(cfg, "a/b", root=tmp_path)
 
     def fake_download(url, token, dest, timeout=300):
         Path(dest).write_bytes(b"tampered" if str(dest).endswith(".tar.gz")
