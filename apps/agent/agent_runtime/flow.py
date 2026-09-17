@@ -1307,3 +1307,17 @@ def parse_judge_route(text: str) -> tuple[str, float]:
     except ValueError:
         conf = 0.0
     return route, min(max(conf, 0.0), 1.0)
+
+
+# 工单登记置信门槛(漏斗 v2,spec §3.3):judge conf ≥ 0.7 先触发建单——
+# 低置信轮宁可不动作,唔好乱开单打扰人工。
+FOLLOWUP_CONF_MIN = 0.7
+
+
+def degrade_boost(streak: int, route: str, conf: float) -> int:
+    """degrade 早触发(漏斗 v2,spec §3.1):judge 高置信 degrade_question →
+    streak 直接抬到降级门槛(STALL_DEGRADE_N),下一轮规则路车道立即出降级
+    问法,免硬数 3 轮。其它 route / 低置信一律原样返回。纯函数,离线可测。"""
+    if route == "degrade_question" and conf >= 0.7:
+        return max(streak, STALL_DEGRADE_N)
+    return streak

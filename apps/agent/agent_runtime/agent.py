@@ -705,6 +705,33 @@ def _pause_ack_line(lang: str) -> str:
     return "好的，您稍等一下。"
 
 
+_FOLLOWUP_COMPLAINT_RE = re.compile(r"投[訴诉]|complain", re.IGNORECASE)
+_FOLLOWUP_TRACK_RE = re.compile(
+    r"查[下睇]?.{0,6}(?:單|单|件|货|貨)|(?:單|单)[號号]|追蹤|跟踪|进度|進度|track", re.IGNORECASE
+)
+
+
+def _followup_kind_from_text(text: str) -> str:
+    """judge route=register_followup 时给工单定 kind(spec §3.3 白名单三值)。
+    纯分类用途,唔做闸门——闸门喺 judge conf,唔喺关键词。"""
+    t = text or ""
+    if _FOLLOWUP_COMPLAINT_RE.search(t):
+        return "complaint"
+    if _FOLLOWUP_TRACK_RE.search(t):
+        return "track_order"
+    return "followup"
+
+
+def _followup_ack_line(lang: str) -> str:
+    """建单成功确认语(三语直念):诚实降级——登记+专人跟进+SLA,绝不装查。
+    call-91a6b8c9 教训:系统冇查单能力就唔好令客户以为查紧。"""
+    if lang == "cantonese":
+        return "好，我幫你登記咗跟進㗎啦，會有專人24小時內覆你，你放心。"
+    if lang == "en":
+        return "All right, I've logged this for follow-up. A specialist will get back to you within 24 hours."
+    return "好的，我已经帮您登记跟进了，会有专人在24小时内回复您，请放心。"
+
+
 def _wa_number_line(lang: str, num: str) -> str:
     """碎片暂存超时 flush 嘅脚本直念(session.say,零 TTFT/零前缀断裂):captured →
     复述确认;唔系号码 → 请客户继续。三语骨架,风格同 _nudge_line。"""
@@ -2982,7 +3009,13 @@ async def entrypoint(ctx):
             # 让路节流:主回复刚提交,先等一拍再喺同一 mlx server(:1235)跑 judge——
             # judge 与主回复抢 prefill 会推高本轮 TTFT;judge 判定本来就下一轮先生效,迟几秒冇损失。
             await asyncio.sleep(float(os.environ.get("FLOW_JUDGE_DELAY", "3")))
-            from .flow import build_judge_messages, parse_judge_output, parse_judge_route
+            from .flow import (
+                build_judge_messages,
+                degrade_boost,
+                FOLLOWUP_CONF_MIN,
+                parse_judge_output,
+                parse_judge_route,
+            )
 
             # judge 路由字段(漏斗 v2,spec §3.2):BOK_ROUTE_JUDGE=1 才喺 judge
             # prompt 加 route/conf 段并解析落账;默认 0=旧 prompt 零行为漂移。
@@ -3031,6 +3064,15 @@ async def entrypoint(ctx):
             # 非 unclear(实质应承/提问/异议)= 客户唔係卡死 → 清该步计数。
             if turn_key and flow_ctrl.current == step_at:
                 flow_ctrl.note_turn_outcome(jv, step_at, turn_key)
+            # degrade 早触发(漏斗 v2,spec §3.1):judge 高置信 degrade_question →
+            # streak 抬到降级门槛,下一轮规则路 stall 车道立即出降级问法,
+            # 免硬数 3 轮——客户明确「听唔明你讲咩」时每轮都係损耗。
+            if route_enabled and _judge_route["step"] == step_at and flow_ctrl.current == step_at:
+                flow_ctrl.step_streak[step_at] = degrade_boost(
+                    flow_ctrl.step_streak.get(step_at, 0),
+                    _judge_route["route"],
+                    _judge_route["conf"],
+                )
             if (
                 flow_ctrl.current == step_at
                 and flow_ctrl.has_steps
@@ -3064,6 +3106,31 @@ async def entrypoint(ctx):
                         print(f"[flow] judge(bg)=confirm blocked (wa step, not captured) step={step_at + 1} (call {room_name}){_route_log}", flush=True)
                 else:
                     print(f"[flow] judge(bg)={jv} step={step_at + 1} (call {room_name}){_route_log}", flush=True)
+            # 跟进工单消费(漏斗 v2,spec §3.3):judge 高置信 register_followup →
+            # CP 建单 + 诚实确认语直念(登记+专人跟进+SLA,绝不装查)。背景任务
+            # 内执行唔进关键路径;speech 队列天然串行,确认语排在在途回复后出声。
+            # created:false = 同 call 同 kind 已有 open 单 → 唔重复播确认。
+            if (
+                route_enabled
+                and os.environ.get("BOK_TOOLS_FOLLOWUP", "0") == "1"
+                and _judge_route["step"] == step_at
+                and _judge_route["route"] == "register_followup"
+                and _judge_route["conf"] >= FOLLOWUP_CONF_MIN
+                and not closed.is_set()
+            ):
+                _fu = await cp.create_followup(
+                    call_id, kind=_followup_kind_from_text(utt), note=utt[:200]
+                )
+                if _fu and _fu.get("created"):
+                    _fu_ack = _followup_ack_line(language_state.lang)
+                    context_state.set_last_reply(_fu_ack)
+                    await _say_script(session, tts_provider, _tts_cache, _fu_ack)
+                    print(
+                        f"[followup] created via judge route id={_fu.get('id', '')} (call {room_name})",
+                        flush=True,
+                    )
+                elif _fu:
+                    print(f"[followup] idempotent hit, no re-ack (call {room_name})", flush=True)
         except Exception as exc:  # pragma: no cover - 背景判定失敗唔影響回覆
             print(f"[flow] judge(bg) failed: {exc!r} (call {room_name})", flush=True)
         finally:
