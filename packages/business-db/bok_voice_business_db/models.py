@@ -375,6 +375,9 @@ class QaEntry(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     hit_count: Mapped[int] = mapped_column(Integer, default=0)
     source: Mapped[str] = mapped_column(String(16), default="curated")
+    # 同义簇(spec 2026-09-17 Phase1):非空=本条是指向条目的变体(一层星形)。
+    # 纯展示/组织字段——qa_gate 匹配/罐头 key 均不读它。
+    cluster_head_id: Mapped[str] = mapped_column(String(64), default="")
     template_id: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
