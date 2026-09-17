@@ -61,6 +61,14 @@ const WHATSAPP_LABELS: Record<string, string> = {
   handled: "已对接",
 };
 
+// 待办事项（2026-09-18 用户补卡）：运行中战役四桶账；契约外未知键原样显示。
+const TODO_LABELS: Record<string, string> = {
+  to_call: "待外呼",
+  waiting_redispatch: "等重拨（间隔中）",
+  due_redispatch: "重拨到期",
+  exhausted: "重拨耗尽 · 需人工",
+};
+
 // 时长分布五桶固定顺序（后端契约键名）；契约外未知键追加在尾部。
 const DURATION_BUCKET_ORDER = ["0-15", "15-30", "30-60", "60-90", "90+"];
 
@@ -163,6 +171,7 @@ function DashboardContent() {
   const tags = asRecord(stats?.tags);
   const disposition = asCountMap(tags?.disposition);
   const whatsapp = asCountMap(tags?.whatsapp);
+  const todo = asCountMap(stats?.todo);
   const tagsTotal = tags
     ? disposition.reduce((sum, [, n]) => sum + n, 0) + whatsapp.reduce((sum, [, n]) => sum + n, 0)
     : null;
@@ -256,6 +265,14 @@ function DashboardContent() {
               )}
             </section>
           </div>
+
+          {/* 待办事项：运行中战役的待外呼/重拨/耗尽四桶（2026-09-18 用户补卡） */}
+          <section className="card mt-6">
+            <span className="label">待办事项</span>
+            <div className="mt-3">
+              <TagTable title="运行中战役" rows={todo} labels={TODO_LABELS} />
+            </div>
+          </section>
 
           {/* 标记统计：通话结果 / WhatsApp 双表 */}
           <section className="card mt-6">

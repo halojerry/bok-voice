@@ -36,7 +36,13 @@ from bok_voice_obs.context import get_correlation
 from bok_voice_obs.logging import configure_logging, get_logger
 from bok_voice_obs.middleware import CorrelationMiddleware
 
-from .campaign import parse_call_windows, redispatch_harvest_updates, _utcnow_naive
+from .campaign import (
+    parse_call_windows,
+    redispatch_due,
+    redispatch_harvest_updates,
+    redispatch_policy,
+    _utcnow_naive,
+)
 from .deps import build_engine, build_repository, build_session_factory
 from .dispatch_utils import cleanup_dispatch, has_active_dispatch
 from .nodes_store import HEARTBEAT_INTERVAL_S, LicenseError, NodeStore
@@ -3682,6 +3688,42 @@ def _local_midnight_utc_boundary() -> datetime:
     return midnight_local.astimezone(timezone.utc).replace(tzinfo=None)
 
 
+_TODO_FAIL_STATUSES = ("no_answer", "rejected", "failed")
+
+
+def _dashboard_todo(repo, now: datetime | None = None) -> dict:
+    """待办事项（2026-09-18 用户补卡）：运行中战役的「接下来要处理什么」四桶账。
+
+    - to_call: 首拨待外呼（pending 且 attempts<=1）——排期内该拨的名单量；
+    - waiting_redispatch: 已拨过、在等重拨间隔走完（redispatch_due=True=未到期）；
+    - due_redispatch: 间隔已到、下一轮 campaign_tick 即拨（redispatch_due=False；
+      未配重拨策略的 attempts>=2 pending 也落这桶——机制上它下一轮就会被拨）；
+    - exhausted: 重拨预算打满仍终态失败（no_answer/rejected/failed 且
+      attempts>=max_attempts）——转人工跟进。
+
+    非运行中战役不进待办（draft/paused/done 都不是「接下来」）。now 注入同
+    campaign_tick 语义（UTC naive），测试钉钟用。
+    """
+    to_call = waiting = due = exhausted = 0
+    for campaign in repo.list_campaigns("", status="running"):
+        max_attempts = int(redispatch_policy(campaign)["max_attempts"])
+        for item in repo.list_items(str(campaign["id"])):
+            status = str(item.get("status") or "")
+            attempts = int(item.get("attempts") or 1)
+            if status == "pending":
+                if attempts <= 1:
+                    to_call += 1
+                elif redispatch_due(item, campaign, now):
+                    waiting += 1
+                else:
+                    due += 1
+            elif (status in _TODO_FAIL_STATUSES and max_attempts > 0
+                  and attempts >= max_attempts):
+                exhausted += 1
+    return {"to_call": to_call, "waiting_redispatch": waiting,
+            "due_redispatch": due, "exhausted": exhausted}
+
+
 @app.get("/api/stats/dashboard")
 def stats_dashboard(request: Request, account_id: str = "acc-001") -> dict:
     """工作台仪表盘单端点（2026-09-17）。口径见 plan Task 5；P0 全量 Python 聚合。
@@ -3744,6 +3786,7 @@ def stats_dashboard(request: Request, account_id: str = "acc-001") -> dict:
         "duration_buckets": buckets,
         "agents": sorted(by_agent.values(), key=lambda a: (-a["calls"], a["user_id"]))[:8],
         "tags": {"disposition": disposition_counts, "whatsapp": whatsapp_counts},
+        "todo": _dashboard_todo(_repo()),
     }
 
 
