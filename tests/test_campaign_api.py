@@ -467,9 +467,11 @@ def test_settings_campaign_section_roundtrip_and_tick_gating(monkeypatch):
     client, repo = _client_and_repo(monkeypatch)
     now = datetime.now(timezone.utc).replace(tzinfo=None)
 
-    # 窗内窗（覆盖 now）+ 一条垃圾窗：归一落库应剔除垃圾、保留正常窗
+    # 窗内窗（覆盖 now）+ 一条垃圾窗：归一落库应剔除垃圾、保留正常窗。
+    # end 用同小时 :59（恒 start<end）：旧 (hour+1)%24 在 23 点档变跨零点窗
+    # 被 parse_call_windows 静默丢弃，断言确定性红（T3b-Important flake 修复）。
     inside = [{"days": [now.isoweekday()], "start": f"{now.hour:02d}:00",
-               "end": f"{(now.hour + 1) % 24:02d}:58"},
+               "end": f"{now.hour:02d}:59"},
               {"days": [1], "start": "08:00", "end": "99:99"}]
     resp = client.put("/api/settings", json={"campaign": {"call_windows": inside}})
     assert resp.status_code == 200

@@ -278,9 +278,11 @@ def build_engine() -> Engine | None:
                                "duration_s INTEGER DEFAULT 0")
                 # 全局外呼时段窗段（2026-09-17 T3b）：settings.campaign 落库列。
                 # 空 blob=不限时段；与 models.GlobalSetting.campaign_json server 侧
-                # 同形（TEXT DEFAULT ''，SQLite/PG 双认）。
+                # 同形（TEXT NOT NULL DEFAULT ''，SQLite/PG 双认；NOT NULL 对齐
+                # 同函数 sip_json 先例与 ORM create_all 产物，旧库 ADD COLUMN
+                # 带 DEFAULT 合法）。
                 _ensure_column(conn, "global_settings", "campaign_json",
-                               "campaign_json TEXT DEFAULT ''")
+                               "campaign_json TEXT NOT NULL DEFAULT ''")
                 # 节点鉴权(P1,深测): (license_id, fingerprint) 部分唯一索引——多实例
                 # 部署下配额竞态的库级兜底(进程内由 NodeStore.register_licensed 的
                 # 锁收口)。只约束 license 绑定行:开放模式存量空值行不受影响。
