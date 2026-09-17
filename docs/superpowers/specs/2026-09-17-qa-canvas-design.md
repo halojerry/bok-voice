@@ -48,6 +48,12 @@ archify（tt-a1i/archify）是只读「图表即代码」文档工具，不作�
 - 惜客通数据结构（已验证）：`tbl_ai_knowledge.Question` 为 `&` 分隔多问法串；`Answer/Answer2-5` 多答案；
   `AfterAnswerMode/AfterAnswerSceneId/SceneStep` 答后跳转；`tbl_dialog_actions_local_v2` 画布节点含 X/Y；
   画布库同为 React Flow。
+- **官方组件优先核查（2026-09-17，docs MCP）**：LiveKit @agents-ui（18 组件）与 components-react **无任何
+  画布/节点图/编排类组件**；官方 agent 配置面=LiveKit Cloud Agent Builder/Console（云 SaaS，不可嵌入），
+  仅印证画布式 agent 配置页的方向。画布按判据②（业务工作台 UI=官方授权自定义层）采用 `@xyflow/react`。
+  @agents-ui 可复用件（AgentSessionView/AgentChatTranscript/五种可视化器/ControlBar）全部属通话前端
+  （CallStudio 升级，独立项目，shadcn registry 可增量拉），与本期零交集；NextJS Token Route 不适用
+  （token 走 CP `/api/token`）。
 
 ## 4. 子特性 A：QA 画布
 
