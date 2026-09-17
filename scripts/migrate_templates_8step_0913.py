@@ -29,7 +29,7 @@ SAY_LIMIT_EN_WORDS = 28  # 英文词(≈9-10s)
 TEMPLATES: dict[str, dict] = {
     # ---- zh b0d50586a040 ----
     "b0d50586a040": {
-        "hotwords": "拼多多,淘宝,京东,小红书,微信小店,银联,中转仓,货件遗失申请理赔",
+        "hotwords": "拼多多,淘宝,京东,抖音,小红书,微信小店,银联,中转仓,货件遗失申请理赔",
         "steps": [
             {"goal": "身份确认", "say": False, "ref": (
                 "您好，请问是{姓名}吗？\n"
@@ -47,7 +47,7 @@ TEMPLATES: dict[str, dict] = {
                 "如果客户问你们是不是骗子/为什么知道我电话 → 说明是集运仓按收件登记信息来电核实，语气诚恳不争辩；答完带回货品问题。"
             )},
             {"goal": "核实购买平台", "say": False, "ref": (
-                "那您是在拼多多、淘宝还是京东买的？您在您的订单里就可以看到。\n"
+                "那您是在哪个平台买的呢——拼多多、淘宝、京东还是其他平台？您可以打开订单，看状态显示「已入仓/运输中」但还没有签收的那一笔。\n"
                 "如果客户说不记得哪个平台 → 提示客户看手机里最近的购物订单。\n"
                 "如果客户问为什么要核对 → 说要确认清楚是哪件遗失才赔得准。\n"
                 "如果客户问怎么赔偿 → 简单说按香港速递条例标准赔、最低 300 元起，细节到赔偿方案那一步讲；答完继续问平台。\n"
@@ -55,9 +55,10 @@ TEMPLATES: dict[str, dict] = {
             )},
             {"goal": "通知：赔偿方案确认", "say": True, "ref": (
                 "我们会按香港速递条例给您赔偿，最低 300 元起。您看这个方案可以接受吗？\n"
-                "如果客户问具体怎么赔/赔多少 → 逐档讲：金额不足 100 元，申请 300 到 600 元赔偿；大于 200 元，按货价 2 至 3 倍；超过 1000 元，按原价赔再加 300 元快递保险补偿。\n"
+                "如果客户问具体怎么赔/赔多少 → 逐档讲：金额不足 100 元，申请 300 到 600 元赔偿；100 元或以上，按货价 2 至 3 倍；超过 1000 元，按原价赔再加 300 元快递保险补偿。\n"
                 "如果客户问为什么这样赔 → 简单说是按香港速递条例和快递保险标准。\n"
                 "如果客户嫌少/不接受 → 不承诺额外金额，说会帮客户争取最高标准，记录意见。\n"
+                "如果客户说不知道是哪一单/不敢肯定/说接受不了 → 不急着要客户决定，说先帮客户核对清楚是哪件货：请客户说在哪个平台买、打开订单找已入仓还未签收的那一笔，核对清楚之后再讲赔偿。\n"
                 "如果客户问什么时候收到 → 核实好订单金额之后就办理。\n"
                 "注意:三档金额跟足这个标准讲，不要自创金额。\n"
                 "注意:这步只讲赔偿方案，不用收号码，号码在下一步办理才收。"
@@ -78,7 +79,8 @@ TEMPLATES: dict[str, dict] = {
                 "两点提前说清楚：专员加上您之后，把对应的商品订单发给他核对；发完之后打字回复「貨件遺失申請理賠」登记。\n"
                 "如果客户问要等多久 → 说大约一分钟，专员收到资料会直接在{联系方式}打语音通话给您，您接听就可以。\n"
                 "如果客户说记不住口令 → 放慢再说一遍「貨件遺失申請理賠」，提醒照原样打字回复。\n"
-                "注意:口令字面三语统一用「貨件遺失申請理賠」，不要换成简体或英文。"
+                "注意:口令字面三语统一用「貨件遺失申請理賠」，不要换成简体或英文。\n"
+                "注意:交代完两点就约收线——告诉客户专员大约一分钟内会通过{联系方式}加他，不需要在电话里等客户加好友或发口令，道别收线。"
             )},
             {"goal": "收线道别", "say": False, "ref": (
                 "好的，感谢您今天的时间，再见！\n"
@@ -90,7 +92,7 @@ TEMPLATES: dict[str, dict] = {
     },
     # ---- cantonese febeeeebac97 ----
     "febeeeebac97": {
-        "hotwords": "拼多多,淘寶,京東,小紅書,微信小店,銀聯,中轉倉,貨件遺失申請理賠",
+        "hotwords": "拼多多,淘寶,京東,抖音,小紅書,微信小店,銀聯,中轉倉,集運,貨件遺失申請理賠",
         "steps": [
             {"goal": "身份確認", "say": False, "ref": (
                 "你好，請問係{姓名}嗎？\n"
@@ -108,7 +110,7 @@ TEMPLATES: dict[str, dict] = {
                 "如果客户问你哋係咪呃人/点解有佢电话 → 话係集运仓按收件登记资料来电核实，语气诚恳唔好驳；答完带返货品问题。"
             )},
             {"goal": "核實購買平台", "say": False, "ref": (
-                "咁你係喺拼多多、淘寶定京東買㗎？你喺你嘅訂單入面就可以睇到。\n"
+                "咁你係喺邊個平台買㗎——拼多多、淘寶、京東定係第啲平台？你可以打開訂單，睇下狀態顯示「已入倉／運輸中」但係未簽收嗰一筆。\n"
                 "如果客户话唔记得边个平台 → 提佢睇下手机入面最近嘅购物订单。\n"
                 "如果客户问点解要核对 → 话要确认清楚係边件遗失先赔得准。\n"
                 "如果客户问点样赔偿 → 简单话按香港速递条例标准赔、最低 300 蚊起，细节到赔偿方案嗰步讲；答完继续问平台。\n"
@@ -116,9 +118,10 @@ TEMPLATES: dict[str, dict] = {
             )},
             {"goal": "通知：賠償方案確認", "say": True, "ref": (
                 "我哋會按香港速遞條例賠償俾你，最低 300 蚊起。你睇呢個方案可以接受嗎？\n"
-                "如果客户问具体点赔/赔几多 → 逐档讲：金额不足 100 蚊，申请 300 到 600 蚊赔偿；大于 200 蚊，按货价 2 至 3 倍；超过 1000 蚊，按原价赔再加 300 蚊速递保险补偿。\n"
+                "如果客户问具体点赔/赔几多 → 逐档讲：金额不足 100 蚊，申请 300 到 600 蚊赔偿；100 蚊或以上，按货价 2 至 3 倍；超过 1000 蚊，按原价赔再加 300 蚊速递保险补偿。\n"
                 "如果客户问点解咁赔 → 简单讲係按香港速递条例同速递保险标准。\n"
                 "如果客户嫌少/唔接受 → 唔好承诺额外金额，话会帮你争取最高标准，记录意见。\n"
+                "如果客户话唔知係邊一單/唔敢肯定/話接受唔到 → 唔好急住要客戶決定，話先幫客戶核對清楚係邊件貨：問客戶喺邊個平台買、打開訂單搵已入倉仲未簽收嗰一筆，核對清楚先再講賠償。\n"
                 "如果客户问几时收到 → 核实好订单金额之后就办理。\n"
                 "注意:三档金额跟足呢个标准讲，唔好自创金额。\n"
                 "注意:呢步只讲赔偿方案，唔使收号码，号码喺下一步办理先收。"
@@ -139,7 +142,8 @@ TEMPLATES: dict[str, dict] = {
                 "兩點預先講清楚：專員加咗你之後，將對應嘅商品訂單發俾佢核對；發完之後打字回覆「貨件遺失申請理賠」登記。\n"
                 "如果客户问要等几耐 → 话大约一分钟，专员收到资料会直接喺{聯絡方式}打语音通话俾你，你接听就得。\n"
                 "如果客户话记唔住口令 → 放慢再讲一遍「貨件遺失申請理賠」，提醒照原样打字回复。\n"
-                "注意:口令字面三语统一用「貨件遺失申請理賠」，唔好换成简体或者英文。"
+                "注意:口令字面三语统一用「貨件遺失申請理賠」，唔好换成简体或者英文。\n"
+                "注意:交代完兩點就約收線——話俾客戶聽專員大約一分鐘內會經{聯絡方式}加返佢，唔使喺電話度等客戶加好友或者等佢發口令，道別收線。"
             )},
             {"goal": "收線道別", "say": False, "ref": (
                 "好嘅，唔該晒你今日嘅時間，再見！\n"
@@ -151,7 +155,7 @@ TEMPLATES: dict[str, dict] = {
     },
     # ---- en 80afec7f2f92 ----
     "80afec7f2f92": {
-        "hotwords": "Amazon,Temu,eBay,UnionPay,claims,screenshot,小红书",
+        "hotwords": "Amazon,Temu,eBay,TikTok,UnionPay,claims,screenshot,小红书",
         "steps": [
             {"goal": "Confirm identity", "say": False, "ref": (
                 "Hello, may I speak to {name}?\n"
@@ -169,7 +173,7 @@ TEMPLATES: dict[str, dict] = {
                 "If the customer asks if this is a scam / how you got their number → say we're calling on the registered recipient details to verify, stay sincere, don't argue; then bring the conversation back."
             )},
             {"goal": "Verify the shopping platform", "say": False, "ref": (
-                "May I ask where you bought it — Amazon, Temu, or eBay? You can check it in your orders.\n"
+                "May I ask where you bought it — Amazon, Temu, eBay, or another platform? You can open your orders and look for the one that shows \"arrived at warehouse\" but hasn't been delivered yet.\n"
                 "If the customer doesn't remember the platform → suggest checking recent orders in the shopping apps.\n"
                 "If the customer asks why we need this → say we must confirm which parcel was lost to compensate accurately.\n"
                 "If the customer asks how the compensation works → briefly say it follows the Hong Kong courier regulations, starting from 300 dollars; details come at the compensation step.\n"
@@ -177,9 +181,10 @@ TEMPLATES: dict[str, dict] = {
             )},
             {"goal": "Notice: compensation plan", "say": True, "ref": (
                 "We'll compensate you under the Hong Kong courier regulations, starting from 300 dollars. Does this plan sound acceptable to you?\n"
-                "If the customer asks exactly how it works → walk through the tiers: under 100 dollars, 300 to 600 dollars; over 200 dollars, 2 to 3 times the item price; over 1,000 dollars, the original price plus an extra 300 dollars of courier insurance.\n"
+                "If the customer asks exactly how it works → walk through the tiers: under 100 dollars, 300 to 600 dollars; 100 dollars or more, 2 to 3 times the item price; over 1,000 dollars, the original price plus an extra 300 dollars of courier insurance.\n"
                 "If the customer asks why → briefly say it follows the Hong Kong courier regulations and the insurance standard.\n"
                 "If the customer says it's too little → don't promise extra amounts, say we'll seek the highest standard and note the feedback.\n"
+                "If the customer says they don't know which order this is about / isn't sure / can't accept it → don't push for a decision; say you'll help verify which item it is first: ask which platform they bought on and have them find the arrived-but-not-yet-delivered order, then talk about the compensation once it's confirmed.\n"
                 "If the customer asks when they'll get it → after the order value is verified, we'll process it.\n"
                 "Note: quote exactly these three tiers, never invent amounts.\n"
                 "Note: this step only explains compensation, don't collect any number yet, that's the next step."
@@ -200,7 +205,8 @@ TEMPLATES: dict[str, dict] = {
                 "Two things to note: once the specialist adds you, send them your order for verification; then reply with the text 「貨件遺失申請理賠」 to register.\n"
                 "If the customer asks how long → about a minute; once the specialist receives the details they will call you directly on {contact}, just answer.\n"
                 "If the customer can't remember the phrase → say 「貨件遺失申請理賠」 again slowly, ask them to reply with exactly the same text.\n"
-                "Note: the registration phrase is exactly 「貨件遺失申請理賠」 for all languages, never translate or simplify it."
+                "Note: the registration phrase is exactly 「貨件遺失申請理賠」 for all languages, never translate or simplify it.\n"
+                "Note: once the two points are delivered, arrange to close the call — tell the customer the specialist will add them on {contact} within about a minute; there's no need to stay on the line waiting for them to add or send the message, say goodbye."
             )},
             {"goal": "Closing farewell", "say": False, "ref": (
                 "Thank you for your time today, goodbye!\n"

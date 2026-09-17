@@ -15,7 +15,7 @@ import {
 import { ConnectionState, TokenSource, Track, type Room } from "livekit-client";
 import { api } from "@/lib/api";
 import { describeConnectError, friendlyErrorText, useControlPlaneReady } from "@/lib/api-ready";
-import { applyOutputDevice, listAudioDevicesOf, requestMicPermission, saveMicDevice, savedMicDevice, savedOutputDevice, switchWebOutputDevice, webCanSwitchOutput, isTauriShell, type AudioDeviceInfo } from "@/lib/audio";
+import { listAudioDevicesOf, requestMicPermission, saveMicDevice, savedMicDevice, savedOutputDevice, switchWebOutputDevice, webCanSwitchOutput, type AudioDeviceInfo } from "@/lib/audio";
 import { AgentChatIndicator } from "@/components/agents-ui/agent-chat-indicator";
 import { AgentChatTranscript } from "@/components/agents-ui/agent-chat-transcript";
 import { AgentSessionProvider } from "@/components/agents-ui/agent-session-provider";
@@ -245,7 +245,7 @@ function AudioDevicesCard({ room }: { room: Room | null }) {
   const [outputCanSwitch, setOutputCanSwitch] = useState(false);
   const [outId, setOutId] = useState("");
   useEffect(() => {
-    setOutputCanSwitch(isTauriShell() || webCanSwitchOutput());
+    setOutputCanSwitch(webCanSwitchOutput());
     setOutId(savedOutputDevice());
   }, []);
 
@@ -278,9 +278,7 @@ function AudioDevicesCard({ room }: { room: Room | null }) {
     } catch {
       /* ignore */
     }
-    if (isTauriShell()) {
-      await applyOutputDevice(id);
-    } else if (room) {
+    if (room) {
       await switchWebOutputDevice(room, id);
     }
   };
@@ -828,15 +826,12 @@ function CallStudioInner({
       setConnecting(false);
       phase = "join-session";
       // 应用用户选择的音频设备：麦克风先设默认采集设备（session.start 开麦时会采用），
-      // 扬声器：桌面壳切系统默认输出；浏览器经 livekit setSinkId。
+      // 扬声器：浏览器经 livekit setSinkId（Chromium；Safari 回退系统默认）。
       const micDeviceId = savedMicDevice();
       const outputDeviceId = savedOutputDevice();
       // 非 exact：设备不存在/已插拔时回退默认，避免采集失败（exact 会 reject）。
       if (micDeviceId) await session.room.switchActiveDevice("audioinput", micDeviceId, false).catch(() => {});
-      if (outputDeviceId) {
-        if (isTauriShell()) await applyOutputDevice(outputDeviceId).catch(() => {});
-        else if (webCanSwitchOutput()) await switchWebOutputDevice(session.room, outputDeviceId).catch(() => {});
-      }
+      if (outputDeviceId && webCanSwitchOutput()) await switchWebOutputDevice(session.room, outputDeviceId).catch(() => {});
       // 连接前预缓冲 + 接通一步到位:麦克风采集放进 session.start 的 tracks
       // (与 token/连房并行,gum 即刻返回,连接完成后发布落地)。旧写法先在
       // 未连接的房间上 await setMicrophoneEnabled(preConnectBuffer)——发布要等

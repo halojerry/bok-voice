@@ -5,6 +5,7 @@ import InterpretConsole from "@/components/interpret-console";
 import { useAccount } from "@/components/account-context";
 import { api } from "@/lib/api";
 import { friendlyErrorText } from "@/lib/api-ready";
+import { minimaxVoiceOptionsFor } from "@/lib/minimax-voices";
 
 /**
  * 双端同声传译(B 线 v2)——坐席一体台单模式(2026-09-12 用户拍板:同传只保留
@@ -21,10 +22,18 @@ const LANGS = [
   { value: "en", label: "English" },
 ];
 
+/** 会话级音色下拉：首项=跟随设置（settings 三键/硬编码默认）。 */
+function voiceOptions(lang: string) {
+  return [{ value: "", label: "（默认，跟随设置）" }, ...minimaxVoiceOptionsFor(lang)];
+}
+
 export default function InterpretPage() {
   const { accountId: ACCOUNT } = useAccount();
   const [myLang, setMyLang] = useState("zh");
   const [otherLang, setOtherLang] = useState("en");
+  // 会话级音色(2026-09-17):我方/对方语言各选一把 MiniMax 音色,空=跟随设置。
+  const [myVoice, setMyVoice] = useState("");
+  const [otherVoice, setOtherVoice] = useState("");
   const [glossary, setGlossary] = useState("");
   const [callId, setCallId] = useState("");
   const [busy, setBusy] = useState(false);
@@ -34,6 +43,9 @@ export default function InterpretPage() {
     setError(null);
     setBusy(true);
     try {
+      const voices: Record<string, string> = {};
+      if (myVoice) voices[myLang] = myVoice;
+      if (otherVoice) voices[otherLang] = otherVoice;
       const created = await api.createCall({
         account_id: ACCOUNT,
         object_id: "",
@@ -43,6 +55,7 @@ export default function InterpretPage() {
         language: myLang,
         target_lang: otherLang,
         glossary,
+        voices_json: Object.keys(voices).length ? JSON.stringify(voices) : "",
       });
       const id = String((created as { id?: string }).id ?? "");
       if (!id) {
@@ -80,7 +93,14 @@ export default function InterpretPage() {
         <div className="flex gap-3">
           <label className="flex flex-1 flex-col gap-1 text-xs">
             <span className="text-(--stage-muted)">我方讲</span>
-            <select className="select" value={myLang} onChange={(e) => setMyLang(e.target.value)}>
+            <select
+              className="select"
+              value={myLang}
+              onChange={(e) => {
+                setMyLang(e.target.value);
+                setMyVoice(""); // 语言换了,音色目录跟着换,旧选择重置
+              }}
+            >
               {LANGS.map((l) => (
                 <option key={l.value} value={l.value}>
                   {l.label}
@@ -90,10 +110,39 @@ export default function InterpretPage() {
           </label>
           <label className="flex flex-1 flex-col gap-1 text-xs">
             <span className="text-(--stage-muted)">对方讲</span>
-            <select className="select" value={otherLang} onChange={(e) => setOtherLang(e.target.value)}>
+            <select
+              className="select"
+              value={otherLang}
+              onChange={(e) => {
+                setOtherLang(e.target.value);
+                setOtherVoice("");
+              }}
+            >
               {LANGS.map((l) => (
                 <option key={l.value} value={l.value}>
                   {l.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <div className="flex gap-3">
+          <label className="flex flex-1 flex-col gap-1 text-xs">
+            <span className="text-(--stage-muted)">我方音色（可选，rev 双向出声开启时为我方译文声）</span>
+            <select className="select" value={myVoice} onChange={(e) => setMyVoice(e.target.value)}>
+              {voiceOptions(myLang).map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="flex flex-1 flex-col gap-1 text-xs">
+            <span className="text-(--stage-muted)">对方音色（可选，对方听到的译文声）</span>
+            <select className="select" value={otherVoice} onChange={(e) => setOtherVoice(e.target.value)}>
+              {voiceOptions(otherLang).map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
                 </option>
               ))}
             </select>
@@ -113,6 +162,8 @@ export default function InterpretPage() {
           <strong>对方听到我方译文的 TTS</strong>，<strong>我方听到对方原声</strong>（像直接通话），
           对方→我方的译文只显示文字不出声；我方译文播报时自动暂让对方麦克风防串译。
           说话中按句出译文（不必等停嘴）。语言对在建房时钉死——请先选好再创建。进房后按「启动传译」才开始。
+          音色可按语言另选（MiniMax 云端音色）；不选则用设置页「分语言音色」。我方音色仅在 rev
+          双向出声开启时用于我方译文（默认我方纯字幕）。
         </p>
         <button className="stage-btn-primary w-fit" disabled={busy} onClick={startConsole}>
           创建一体台会话

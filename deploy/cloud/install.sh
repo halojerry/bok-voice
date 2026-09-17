@@ -121,20 +121,30 @@ else
   say "提醒：root 登录未通过（账号可能此前已存在、密码是旧值）——非致命，可用面板路径自行验证。"
 fi
 
-# ---- 6) 打印节点装机一条龙（交给客户机房照抄）----
+# ---- 6) 打印节点装机一条龙（交给客户机房照抄；全程零 GitHub——脚本与包都从本 CP 拉）----
 CP_TOKEN_OUT="$(grep -E '^BOK_CP_TOKEN=' "$ENV_FILE" | cut -d= -f2)"
 cat <<EOF
 
 ══════════════════════════════════════════════════════════════
  云端就绪。下一步（每客户）：
+   0) 发版工件就位（装机前一次性）：打包机跑
+        scripts/build_node_pkg.sh <版本> && scripts/build_runtime_pkg.sh <版本>
+      云主机 deploy/cloud/ 内跑
+        ./publish_node_pkg.sh <版本>
    1) root 登录管理台建客户 admin 账号 + 签发节点 license：
       curl -X POST http://HOST:${PORT}/api/nodes/licenses \\
         -H "Authorization: Bearer <root JWT 或 ${CP_TOKEN_OUT:0:6}…机器token>" \\
         -H 'Content-Type: application/json' -d '{"max_nodes":<盒数>,"note":"<客户>"}'
-   2) 把下面命令交客户机房（填 license key 与节点内网 IP）照抄执行：
-      curl -fsSL https://raw.githubusercontent.com/halojerry/bok-voice/main/scripts/bootstrap-node.sh | bash -s -- \\
+   2) 把下面命令交客户机房（Linux/bash 节点；填 license key 与节点内网 IP）：
+      curl -fsSL -H "Authorization: Bearer bokn_xxx" \\
+        https://<云域名>/api/nodes/downloads/bootstrap/latest/bootstrap-node.sh | bash -s -- \\
         --cp-url https://<云域名> \\
         --license-key bokn_xxx \\
         --livekit-url ws://<节点内网IP>:7880
+      Windows 节点（管理员 PowerShell，自举+装常驻服务）：
+        curl -fsSL -H "Authorization: Bearer bokn_xxx" \\
+          https://<云域名>/api/nodes/downloads/bootstrap/latest/install-node.ps1 -o install-node.ps1
+        .\\install-node.ps1 -CpUrl https://<云域名> -LicenseKey bokn_xxx \\
+          -LivekitUrl ws://<节点内网IP>:7880 -Fetch -InstallService
 ══════════════════════════════════════════════════════════════
 EOF

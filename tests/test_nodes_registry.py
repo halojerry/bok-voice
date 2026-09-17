@@ -92,3 +92,143 @@ def test_node_heartbeat_bypasses_cp_token_gate_register_does_not(monkeypatch):
         )
         assert hb.status_code == 200  # node_token 直达心跳，不被 CP 门禁拦
         assert hb.json() == {"ok": True, "commands": []}
+
+
+def test_commands_channel_enqueue_dispatch_convergence(monkeypatch):
+    """P3 commands 全链（内存 store + auth-off root 直通）：入队 → 心跳领走（不重发）
+    → 心跳 version 收敛自动关单 → nodes.version 写回。"""
+    from fastapi.testclient import TestClient
+
+    from control_plane.main import app
+
+    monkeypatch.setenv("DATABASE_URL", "")  # 内存 store/repo，确定性
+    monkeypatch.delenv("BOK_CP_TOKEN", raising=False)
+    with TestClient(app) as client:
+        reg = client.post("/api/nodes/register", json={"name": "n", "platform": "cuda-win"})
+        node_id, token = reg.json()["node_id"], reg.json()["node_token"]
+        hb_headers = {"Authorization": f"Bearer {token}"}
+        # 白名单外动作 / update 缺 version → 400
+        assert client.post(f"/api/nodes/{node_id}/commands",
+                           json={"action": "rm -rf /"}).status_code == 400
+        assert client.post(f"/api/nodes/{node_id}/commands",
+                           json={"action": "update"}).status_code == 400
+        r = client.post(f"/api/nodes/{node_id}/commands",
+                        json={"action": "update", "version": "v0.3.0"})
+        assert r.status_code == 200 and r.json()["status"] == "pending"
+        cmd_id = r.json()["id"]
+        # 心跳领走；下一跳不重发（delivered）
+        hb = client.post("/api/nodes/heartbeat", json={}, headers=hb_headers)
+        assert [c["id"] for c in hb.json()["commands"]] == [cmd_id]
+        hb2 = client.post("/api/nodes/heartbeat", json={}, headers=hb_headers)
+        assert hb2.json()["commands"] == []
+        # version 收敛 → done；nodes.version 写回
+        client.post("/api/nodes/heartbeat", json={"version": "v0.3.0"}, headers=hb_headers)
+        ledger = client.get(f"/api/nodes/{node_id}/commands").json()["commands"]
+        assert ledger[0]["status"] == "done" and ledger[0]["target_version"] == "v0.3.0"
+        rows = client.get("/api/nodes").json()
+        assert rows[0]["version"] == "v0.3.0"
+
+
+def test_command_inflight_call_guard(monkeypatch):
+    """无 force 时节点有在途通话 → 409 拒发；force=True 越过（强更是显式决定）。"""
+    import control_plane.main as cp_main
+    from fastapi.testclient import TestClient
+
+    from control_plane.main import app
+
+    monkeypatch.setenv("DATABASE_URL", "")
+    monkeypatch.delenv("BOK_CP_TOKEN", raising=False)
+    with TestClient(app) as client:
+        reg = client.post("/api/nodes/register", json={"name": "n", "platform": "cuda-win"})
+        node_id = reg.json()["node_id"]
+        monkeypatch.setattr(cp_main, "_node_active_calls",
+                            lambda nid: [{"id": "call-1", "status": "active"}])
+        blocked = client.post(f"/api/nodes/{node_id}/commands",
+                              json={"action": "update", "version": "v0.3.0"})
+        assert blocked.status_code == 409
+        forced = client.post(f"/api/nodes/{node_id}/commands",
+                             json={"action": "update", "version": "v0.3.0", "force": True})
+        assert forced.status_code == 200
+        # shutdown 不做在途检查（熔断语义高于通话）
+        shutdown = client.post(f"/api/nodes/{node_id}/commands",
+                               json={"action": "shutdown"})
+        assert shutdown.status_code == 200
+
+
+def test_commands_channel_sql_mode(tmp_path):
+    """SQL 分支：NodeCommand 落库、delivered 不重发、version 收敛关单双模同形。"""
+    from bok_voice_business_db import models
+    from sqlalchemy import create_engine
+
+    from control_plane.nodes_store import NodeStore
+
+    engine = create_engine(f"sqlite:///{tmp_path}/nodes.db", future=True)
+    models.create_all(engine)
+    store = NodeStore(engine)
+    node_id, token = store.register(name="n", platform="cuda-win", org_id="")
+    cmd = store.enqueue_command(node_id, "update", args={"version": "v9"}, created_by="root")
+    assert cmd["status"] == "pending"
+    try:
+        store.enqueue_command(node_id, "arbitrary")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("whitelist must reject unknown actions")
+    got = store.pop_commands(node_id)
+    assert [c["id"] for c in got] == [cmd["id"]]
+    assert store.pop_commands(node_id) == []  # delivered 不重发
+    ok, _ = store.heartbeat(token, metrics={}, version="v9")
+    assert ok is True
+    ledger = store.list_commands(node_id)
+    assert ledger[0]["status"] == "done"
+    rows = store.list_nodes()
+    assert rows[0]["version"] == "v9"
+
+
+def test_node_artifact_download_auth_and_traversal(monkeypatch, tmp_path):
+    """工件下载：node_token/license 自证、路径段白名单（穿越/编码绕行 404）、
+    auth-on 加固态同样可达（端点内自证 + 中间件前缀豁免）。"""
+    import hashlib
+
+    from fastapi.testclient import TestClient
+
+    import control_plane.main as cp_main
+    from control_plane.main import app
+
+    monkeypatch.setenv("DATABASE_URL", "")
+    monkeypatch.setenv("BOK_CP_TOKEN", "cp-secret-1")  # 加固态：验证前缀豁免链路
+    art = tmp_path / "downloads"
+    pkg_dir = art / "pkg" / "v0.3.0"
+    pkg_dir.mkdir(parents=True)
+    body = b"bok-node-bytes"
+    (pkg_dir / "bok-node-v0.3.0.tar.gz").write_bytes(body)
+    (pkg_dir / "bok-node-v0.3.0.tar.gz.sha256").write_text(
+        hashlib.sha256(body).hexdigest() + "  bok-node-v0.3.0.tar.gz\n")
+    monkeypatch.setattr(cp_main, "BOK_NODE_ARTIFACTS_DIR_OVERRIDE", str(art), raising=False)
+    # 端点读 env——monkeypatch 环境变量（app 已实例化但端点每次现读）。
+    monkeypatch.setenv("BOK_NODE_ARTIFACTS_DIR", str(art))
+    with TestClient(app) as client:
+        cp = {"Authorization": "Bearer cp-secret-1"}
+        lic = client.post("/api/nodes/licenses", json={"max_nodes": 1}, headers=cp).json()
+        reg = client.post("/api/nodes/register", json={
+            "name": "n", "platform": "cuda-win",
+            "license_key": lic["license_key"], "fingerprint": "fp-a"}, headers=cp)
+        node_token = reg.json()["node_token"]
+        url = "/api/nodes/downloads/pkg/v0.3.0/bok-node-v0.3.0.tar.gz"
+        # node_token 自证可下
+        r = client.get(url, headers={"Authorization": f"Bearer {node_token}"})
+        assert r.status_code == 200 and r.content == body
+        # license key 自证可下
+        r = client.get(url, headers={"Authorization": f"Bearer {lic['license_key']}"})
+        assert r.status_code == 200
+        # 无凭据 401；错凭据 401
+        assert client.get(url).status_code == 401
+        assert client.get(url, headers={"Authorization": "Bearer bogus"}).status_code == 401
+        # 路径段穿越/非常规字符 → 404（白名单拒绝，不触达文件系统）
+        for bad in (
+            "/api/nodes/downloads/pkg/..%2F..%2Fetc/bok-node-v0.3.0.tar.gz",
+            "/api/nodes/downloads/pkg/v0.3.0/..%2Fsecret.txt",
+            "/api/nodes/downloads/other/v0.3.0/bok-node-v0.3.0.tar.gz",
+        ):
+            got = client.get(bad, headers={"Authorization": f"Bearer {node_token}"})
+            assert got.status_code in (403, 404), (bad, got.status_code)

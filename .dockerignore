@@ -24,7 +24,6 @@ release-artifacts
 .env*
 
 # 与云端 CP 无关的子系统（agent runtime 跑在客户节点，不进云端镜像）
-desktop/
 services/
 tests/
 docs/

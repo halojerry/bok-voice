@@ -36,6 +36,7 @@ interface FlowStep {
   goal: string;
   ref: string;
   say?: boolean;
+  emotion?: string;
 }
 
 const EMPTY = {
@@ -49,14 +50,23 @@ const EMPTY = {
   hotwords: "",
 };
 
-const STEPS_HINT = "可用变量:{姓名} {快递单号} {快递尾号} {物流公司} {收货地址}。\n参考说法是给 AI 的要点参考,不是逐字稿——AI 会结合客户原话用自己的话讲。\n勾选「直念」的步骤:进入该步的当轮 AI 逐字念参考说法首行,适合通知/道歉等要逐字一致的内容。";
+const STEPS_HINT = "可用变量:{姓名} {快递单号} {快递尾号} {物流公司} {收货地址}。\n参考说法是给 AI 的要点参考,不是逐字稿——AI 会结合客户原话用自己的话讲。\n勾选「直念」的步骤:进入该步的当轮 AI 逐字念参考说法首行,适合通知/道歉等要逐字一致的内容。\n直念步可选「情绪」:只在罐头物化时烧进音频(如致歉步选低沉柔和),实时生成的回复保持语气稳定不受影响;改情绪/参考说法后需重跑 tts-pregen。";
 
-/** 把 steps 序列化/反序列化为 steps_json(存库)。say 只在 true 时写出(省体积)。 */
+/** 把 steps 序列化/反序列化为 steps_json(存库)。say 只在 true 时写出(省体积);
+ * emotion 只在直念步且非空时写出(2026-09-16 罐头带情绪,pregen 物化烧进音频)。 */
 function stepsToJson(steps: FlowStep[]): string {
   return JSON.stringify(
     steps
       .filter((s) => s.goal.trim() || s.ref.trim())
-      .map((s) => (s.say ? { goal: s.goal, ref: s.ref, say: 1 } : { goal: s.goal, ref: s.ref })),
+      .map((s) => {
+        const base = { goal: s.goal, ref: s.ref };
+        if (!s.say) return base;
+        return {
+          ...base,
+          say: 1,
+          ...(s.emotion ? { emotion: s.emotion } : {}),
+        };
+      }),
   );
 }
 function jsonToSteps(raw: unknown): FlowStep[] {
@@ -69,6 +79,10 @@ function jsonToSteps(raw: unknown): FlowStep[] {
         goal: String((s as { goal?: unknown }).goal ?? ""),
         ref: String((s as { ref?: unknown }).ref ?? ""),
         say: Boolean((s as { say?: unknown }).say),
+        emotion:
+          typeof (s as { emotion?: unknown }).emotion === "string"
+            ? String((s as { emotion?: unknown }).emotion).toLowerCase()
+            : "",
       }));
   } catch {
     return [];
@@ -530,6 +544,23 @@ export default function TemplatesPage() {
                     />
                     直念(进入该步的当轮逐字念首行,适合通知/道歉等合规内容)
                   </label>
+                  {Boolean(st.say) && (
+                    <label className="mt-1 flex items-center gap-1.5 text-[11px] muted">
+                      情绪
+                      <select
+                        className="rounded-lg border border-(--card-border) bg-transparent px-1.5 py-0.5 text-xs outline-hidden focus:border-(--accent)"
+                        value={st.emotion ?? ""}
+                        onChange={(e) => setSteps((s) => s.map((x, j) => (j === i ? { ...x, emotion: e.target.value } : x)))}
+                      >
+                        <option value="">自动(不下发,按文本匹配)</option>
+                        <option value="calm">平稳自然</option>
+                        <option value="sad">低沉柔和(致歉/安抚)</option>
+                        <option value="happy">轻快亲切</option>
+                        <option value="surprised">惊讶上扬</option>
+                      </select>
+                      <span className="text-[10px]">罐头物化时烧进音频;实时回复不受影响</span>
+                    </label>
+                  )}
                 </div>
               ))}
             </div>

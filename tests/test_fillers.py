@@ -582,3 +582,52 @@ def test_backfill_env_off(tmp_path, monkeypatch):
         assert recorder.texts == [], "env 关不触发云合成补物化"
 
     _run(_case())
+
+
+# ---- 2026-09-17 call-11132bdd 判污:让话家族清污 + 连轮冷却 ----
+
+
+def test_filter_deflect_entries_drops_keep_talk_family():
+    from agent_runtime.fillers import filter_deflect_entries
+
+    entries = [
+        {"text": "好嘅，你稍等一陣，我即刻幫你核實。", "file": "a"},
+        {"text": "明白，你繼續講，我聽緊。", "file": "b"},
+        {"text": "嗯好，你繼續講，我聽住。", "file": "c"},
+        {"text": "Got it please go ahead I am listening.", "file": "d"},
+        {"text": "嗯嗯好嘅，我記住喇。", "file": "e"},
+        {"text": "Understood I am noting that down.", "file": "f"},
+    ]
+    kept = filter_deflect_entries(entries)
+    assert [e["file"] for e in kept] == ["a", "e", "f"]
+
+
+def test_load_manifest_filters_deflect_family(tmp_path):
+    assets = _make_assets(
+        tmp_path,
+        {"cantonese": ["好嘅，你等我。", "嗯好，你繼續講，我聽住。"]},
+        cats={"cantonese": ["check", "minimal"]},
+    )
+    m = load_manifest(assets)
+    assert [e["text"] for e in m["cantonese"]] == ["好嘅，你等我。"]
+
+
+def test_consecutive_round_cooldown(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOK_FILLER_DELAY_MS", "0")
+
+    async def _case():
+        d, player = _director(tmp_path)
+        d.arm()  # r1
+        await d._fire(0)
+        d._handle = None
+        assert len(player.plays) == 1
+        assert d.fired_this_round() is True
+        d.arm()  # r2:相邻轮 → 冷却跳过
+        await d._fire(0)
+        assert len(player.plays) == 1, "相邻轮必须歇一轮(8轮垫6轮=轰炸感)"
+        assert d.fired_this_round() is False
+        d.arm()  # r3:隔开 → 放行
+        await d._fire(0)
+        assert len(player.plays) == 2
+
+    _run(_case())
