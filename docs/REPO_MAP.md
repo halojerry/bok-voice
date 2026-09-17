@@ -12,7 +12,7 @@
 | `scripts/` | CI 构建、E2E、延迟测量、smoke、sidecar 启动（见下「脚本」） | dev/CI |
 | `apps/agent/` | LiveKit agent 运行时（A 线客服 + B 线同传 worker） | both |
 | `apps/control-plane/` | FastAPI 业务服务 :8000（对象/人设/知识/话术/通话/审计/token/webhook/名册/外呼战役） | both |
-| `apps/web/` | Next.js 静态导出（纯浏览器 UI，节点 :3000 / 云 CP 托管：calls/interpret/supervisor/objects/personas/settings/roster/campaigns/nodes（root 停机开关）…；统一链路 logger：`lib/logger.ts`（traceId/环形缓存/脱敏/全局兜底，error 自动上报 CP `/api/web_logs`，装配点 `lib/log-bootstrap.ts` + `session-context`）；`test/*.test.mjs` node --test 单测，CI web job `npm test`） | both |
+| `apps/web/` | Next.js 静态导出（纯浏览器 UI，节点 :3000 / 云 CP 托管：calls/interpret/supervisor/objects/personas/settings/roster/campaigns/nodes（root 停机开关）/qa（快答库：列表+画布双视图，画布新件见下「apps/web」节）…；统一链路 logger：`lib/logger.ts`（traceId/环形缓存/脱敏/全局兜底，error 自动上报 CP `/api/web_logs`，装配点 `lib/log-bootstrap.ts` + `session-context`）；`test/*.test.mjs` node --test 单测，CI web job `npm test`） | both |
 | `packages/core/` | 领域模型 + 策略（`bok_voice_core`：policies/types） | both |
 | `packages/business-db/` | SQLAlchemy 仓库（`bok_voice_business_db`：global_settings 默认等） | both |
 | `packages/knowledge/` | 知识服务 / Markdown / 向量（沉淀知识库） | both |
@@ -23,7 +23,7 @@
 | `services/realtime-translation/` | B 线 v1 同传 :8790（Node，冻结留 POC） | both(旧) |
 | `services/livekit-server/` | `livekit.yaml`（self-host 配置，钉端口/prometheus/json 日志） | both |
 | `desktop/` | Tauri 桌壳 + runtime 装配（src-tauri Rust / runtime symlink；前端经 `apps/web/lib/tauri.ts` 直连 invoke，`desktop/src/` 前端桥已删） | packaged |
-| `tests/` | pytest 全量（含 `fixtures/audio/{zh,cantonese,en}.wav` E2E 音频 + 术语门禁 + `test_prod_windows.py` Windows prod 生命周期/安装器单测） | dev/CI |
+| `tests/` | pytest 全量（含 `fixtures/audio/{zh,cantonese,en}.wav` E2E 音频 + 术语门禁 + `test_prod_windows.py` Windows prod 生命周期/安装器单测 + qa-canvas Phase 1 四件：`test_qa_cluster_field.py` 簇列数据层/级联、`test_pregen_qa_status.py` pregen --qa-status、`test_qa_canned_status.py` CP 罐头状态/试听/补料端点、`test_import_xkt_qa.py` 惜客通导入器纯函数） | dev/CI |
 | `docs/` | RUNTIME_TOPOLOGY / REPO_MAP / CONTRACTS / DEV_TOOLS / archive 决策归档 | dev |
 | `dev/docker/` | 可选 Docker 开发栈（归档，不进 CI） | dev-only |
 
@@ -48,7 +48,7 @@
 - E2E：`e2e_trilingual_livekit.py`（三语，真 /api/token，一案一通话）`e2e_flow_scenario.py` `e2e_multi_turn.py` `e2e_http.py` `e2e_pipeline.py`
 - 测量/探针：`measure_latency.py`（需真栈）`measure_prompt.py`（本地）`probe_cantonese_digits.py` `smoke_sidecars.py` `pad_test_audio.py` `test_deepseek.py` `test_volcano_v3.py`
 - 站点交付探针（2026-09-16）：`probe_killswitch.py`（kill-switch 目标语义：吊销 sticky→通话面 403 窒息→unrevoke 复活全链，CI `node-handshake.yml` linux 对真 CP 实跑）`probe_windows_lifecycle.py`（down 树杀语义 A 段全平台 + schtasks 契约 B 段仅 Windows 实跑、runner 无提权按 access-denied 优雅 skip，CI windows job）`probe_thin_client_static.py`（静态导出注入链形状 + 无烤死 localhost，CI web job，需先 `apps/web && npm run build`）
-- TTS 缓存/快答库：`pregen_tts.py`（`bok.py tts-pregen` 执行体：--greetings/--objects/--fillers/--qa 离线预合成，写 app-data/tts-cache；也被 CP 人设保存点自动触发，见 `apps/control-plane/control_plane/pregen.py`）`mine_qa.py`（`bok.py tts-mine` 执行体：高频问答对报告 + --apply 入库 / --sync 自动学习闭环：挖掘→质量闸→入库→按语言物化）
+- TTS 缓存/快答库：`pregen_tts.py`（`bok.py tts-pregen` 执行体：--greetings/--objects/--fillers/--qa 离线预合成（--qa-status 出罐头物化状态 JSON），写 app-data/tts-cache；也被 CP 人设保存点自动触发，见 `apps/control-plane/control_plane/pregen.py`）`mine_qa.py`（`bok.py tts-mine` 执行体：高频问答对报告 + --apply 入库 / --sync 自动学习闭环：挖掘→质量闸→入库→按语言物化）`import_xkt_qa.py`（惜客通 `tbl_ai_knowledge.json` → qa_entries 导入器：Question 按 `&` 拆主条目+变体（`cluster_head_id` 指针）、lang 启发式、默认 dry-run、`--apply` 经 POST /api/qa-entries 落地；AfterAnswer* 等外部字段不搬、dry-run 报告列示）
 - 真实客户多轮 E2E：`e2e_real_customer.py`（三语三音色多轮真问题连聊，模板绑定走对象 template_id）
 - 延迟测试台：`probe_latency_soak.py`（多轮多样话术逐轮「推完→首声」+PERCEIVED 三段对照+拆轮/打断风暴/哑轮哨兵+p50/p95+JSON 报告 `reports/latency-soak/`；配套政策表 `docs/LATENCY_BUDGETS.md`）
 - 话术外问题集锦：`probe_offscript_soak.py`（防诈/转人工/追问/推搪/普通话混合 5 套×10 轮实录对照+质量旗，`reports/offscript-soak/`）；热词 A/B：`probe_hotword_ab.py`（ASR sidecar 直打 none/current/extended 三档量词表收益与 prefill 成本）
@@ -84,7 +84,14 @@
 | `campaign.py` | 外呼战役串行循环（5s 巡检：终态收割 / 串行起下一通 / 名单尽判 done；gap 冷却；dispatcher 可注入） |
 | `deps.py` | 引擎装配 + 幂等 DB 迁移唯一入口（新建列/数据迁移都在 `build_engine()`） |
 | `schemas.py` | 请求/响应模型（含 `SipSettingsModel`） |
-| `pregen.py` | 人设保存点自动物化（detached 子进程跑 pregen_tts.py） |
+| `pregen.py` | 人设保存点自动物化（detached 子进程跑 pregen_tts.py）+ QA 罐头状态面（`qa_canned_status`/`cache_root`，供 `GET /api/qa/canned-status`·`GET /api/qa/{id}/canned-audio`·`POST /api/qa/pregen`） |
+
+## apps/web（快答库画布 Phase 1 新件）
+
+| 文件 | 职责 |
+|---|---|
+| `components/qa-canvas-view.tsx` | React Flow 画布（步骤脊柱+QA 卫星簇渲染、拖线挂簇/挂步与断边、乐观回滚、右键菜单回调、罐头徽标✓/缺料；只读条目双向闸不出柄） |
+| `lib/qa-canvas.ts` | 画布纯函数唯一数据面（parseTemplateSteps/deriveGraph 布局契约、resolveClusterTarget 簇校验、revertCluster、localStorage 位置键；签名勿动，`test/qa-canvas.test.mjs` 钉住） |
 
 ## 数据表（packages/business-db，新表须方言可移植）
 

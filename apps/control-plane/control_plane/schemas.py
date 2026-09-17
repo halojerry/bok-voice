@@ -363,6 +363,8 @@ class QaEntryCreate(BaseModel):
     step_index: int = -1
     voice_id: str = ""
     template_id: str = ""
+    # 同义簇(qa-canvas Phase1):非空=本条是指向条目的变体(一层星形)。
+    cluster_head_id: str = ""
     account_id: str = "acc-001"
     # 话务员级归属(B3):''=账号共享 / user_id=话务员个人;user 建的 CP 强制盖章本人。
     owner_user_id: str = ""
@@ -378,5 +380,7 @@ class QaEntryPatch(BaseModel):
     step_index: Optional[int] = None
     voice_id: Optional[str] = None
     enabled: Optional[bool] = None
+    # 同义簇(qa-canvas Phase1):断簇=写空串('' 不被 None 过滤剥掉)。
+    cluster_head_id: Optional[str] = None
     # 所有权转移只归 admin/root(user 的 patch 由 CP 剥掉)。
     owner_user_id: Optional[str] = None

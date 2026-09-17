@@ -9,6 +9,12 @@
 fail-dead:任何 spawn 失败只回状态绝不阻人设落库;杀开关
 `BOK_PERSONA_AUTO_PREGEN=0` 全关。单飞:同一人设上一发未跑完不再叠发
 (MiniMax 60 RPM 限流,叠发只会双双失败)。
+
+罐头状态面(2026-09-17 qa-canvas Phase 1 Task 3):`qa_status_json` spawn
+`pregen_tts.py --qa-status` 取逐条目物化状态(子进程=与物化同一条代码路径,
+零重复);`qa_canned_status` 做 TTL 缓存、spawn 失败降级 available=False;
+`cache_root` 供 canned-audio 回放 {key}.pcm;`qa_pregen_spawn` 手动触发
+--qa 物化(单飞锁与 persona 自动物化共用)。
 """
 
 from __future__ import annotations
@@ -164,3 +170,90 @@ def persona_pregen_status(
         return {"status": "queued", "persona_id": pid, "log": str(log)}
     except Exception as exc:  # noqa: BLE001 - 提醒面永不阻人设保存
         return {"status": "failed", "error": repr(exc)[:200]}
+
+
+# ---- 罐头状态面(qa-canvas Phase 1 Task 3) ----
+
+_STATUS_TTL_S = 60.0
+_status_cache: tuple[float, dict | None] = (0.0, None)
+
+
+def _repo_root_script() -> Path:
+    return _repo_root() / "scripts" / "pregen_tts.py"
+
+
+def qa_status_json(base_url: str) -> dict:
+    """spawn pregen_tts.py --qa-status 取状态(子进程=与物化同一条代码路径,零重复)。"""
+    script = _repo_root_script()
+    if not script.exists():
+        return {"available": False}
+    env = {**os.environ, "PYTHONUNBUFFERED": "1", "BOK_CP_URL": base_url}
+    _bake_ssl_cert_file(env)
+    proc = subprocess.run(  # noqa: S603 - 固定脚本+参数,无 shell
+        [sys.executable, str(script), "--qa-status", "--cp", base_url],
+        cwd=str(_repo_root()), env=env, capture_output=True, text=True, timeout=120,
+    )
+    for line in reversed((proc.stdout or "").splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            parsed = json.loads(line)
+            if "qa_status" in parsed:
+                return {"available": True, "qa_status": parsed["qa_status"]}
+    return {"available": False}
+
+
+def qa_canned_status(base_url: str, *, force: bool = False) -> dict:
+    """TTL 缓存的罐头状态;spawn 失败降级 available=False(spec §8)。"""
+    import time as _time
+
+    now = _time.monotonic()
+    if not force and _status_cache[1] is not None and now - _status_cache[0] < _STATUS_TTL_S:
+        return _status_cache[1]  # type: ignore[return-value]
+    try:
+        data = qa_status_json(base_url)
+        out = {
+            "available": bool(data.get("available")),
+            "statuses": dict(data.get("qa_status") or {}),
+            "generated_at": int(_time.time()),
+        }
+    except Exception:  # noqa: BLE001 - 状态面永不炸端点
+        out = {"available": False, "statuses": {}, "generated_at": int(_time.time())}
+    globals()["_status_cache"] = (now, out)
+    return out
+
+
+def cache_root() -> Path:
+    """tts-cache 根目录(canned-audio 读 {key}.pcm 用)。
+
+    与 agent_runtime.tts_cache.default_cache_dir 同布局——依赖方向禁止 CP
+    import agent 包,目录推导照抄;布局是稳定契约,改动须双侧同步。
+    """
+    explicit = os.environ.get("BOK_TTS_CACHE_DIR", "").strip()
+    if explicit:
+        return Path(explicit) / "tts-cache"
+    if sys.platform == "darwin":
+        base = Path.home() / "Library/Application Support"
+    elif os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData/Local"))
+    else:
+        base = Path.home() / ".local/share"
+    return base / "BokVoice" / "tts-cache"
+
+
+def qa_pregen_spawn(base_url: str, entry_ids: list[str]) -> dict:
+    """触发 --qa 物化(可限 ids);与 persona 自动物化共用单飞锁语义。"""
+    script = _repo_root_script()
+    if not script.exists():
+        return {"status": "script_missing"}
+    with _SPAWN_LOCK:
+        running = _PREGEN_PROCS.get("__qa__")
+        if running is not None and running.poll() is None:
+            return {"status": "already_running"}
+        env = {**os.environ, "PYTHONUNBUFFERED": "1", "BOK_CP_URL": base_url}
+        _bake_ssl_cert_file(env)
+        cmd = [sys.executable, str(script), "--qa", "--cp", base_url]
+        for eid in entry_ids or []:
+            cmd += ["--entry-id", str(eid)]
+        proc = _spawn_detached(cmd, env, _log_path())
+        _PREGEN_PROCS["__qa__"] = proc
+    return {"status": "queued", "pid": proc.pid, "log": str(_log_path())}
