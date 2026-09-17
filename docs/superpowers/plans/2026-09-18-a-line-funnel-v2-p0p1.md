@@ -16,7 +16,7 @@
 - venv 复用主仓：`../voice-assistant/.venv312/bin/python`（worktree 位于主仓同级目录）。
 - 测试自举模式照 `tests/test_flow_controller.py`：`sys.path.insert(0, ...)` 后直接 import。
 - Conventional commits（scope: `feat(agent)` / `feat(cp)`），body 带根因/证据；每 task 至少一 commit。
-- 术语门禁：禁新增 `yue` 字面量（`tests/test_cantonese_terminology.py`）；cantonese 全小写。
+- 术语门禁：禁新增旧粤语拼写字面量（`tests/test_cantonese_terminology.py` 门禁）；cantonese 全小写。
 - DB 方言可移植：新表禁 sqlite 专有语法（`tests/test_db_portability.py` 门禁）。
 - **勿动 `apps/control-plane/control_plane/schemas.py`**（主仓有未提交 WIP，避免合并冲突）；请求模型 inline 在 main.py 端点旁。
 - P2 脊柱收编不在本计划（spec 分期约束：P0/P1 先在旧结构验证）。
