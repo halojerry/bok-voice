@@ -55,7 +55,7 @@ from agent_runtime.providers.livekit_plugins import (  # noqa: E402
 from agent_runtime.tts_cache import TtsAudioCache, default_cache_dir  # noqa: E402
 
 # 物化 job=(persona, lang, text);persona=None=无对应人设(回落设置默认音色)。
-Job = tuple[dict | None, str, str]
+Job = tuple[dict | None, str, str, str]  # (persona, lang, text, emotion)
 # 物化结果记录=(persona, lang, voice, "new"|"skip"|"fail"),逐 job 一条。
 Record = tuple[dict | None, str, str, str]
 
@@ -208,13 +208,15 @@ def _opening_line(tpl: dict | None, obj: dict, lang: str) -> str:
     return ""
 
 
-def _say_step_lines(tpl: dict | None) -> list[str]:
+def _say_step_lines(tpl: dict | None) -> list[tuple[str, str]]:
     """直念步(say=1)ref 首行(2026-09-12 开场白三段拆分):通知/道歉类文本
     无变量,agent 走 _say_script 脚本线——与本脚本同一条缓存线物化后即点即播。
-    与 FlowController.step_say_text 同首行规则。"""
+    与 FlowController.step_say_text 同首行规则。返回 (text, emotion):
+    emotion=步级行级情绪(模板 steps_json `emotion` 字段,2026-09-16 罐头带
+    情绪——物化时经 MINIMAX_EMOTION 烧进音频;空=不下发自动匹配)。"""
     if not tpl:
         return []
-    out: list[str] = []
+    out: list[tuple[str, str]] = []
     for s in parse_steps(str(tpl.get("steps_json") or "")):
         if not s.say:
             continue
@@ -222,7 +224,7 @@ def _say_step_lines(tpl: dict | None) -> list[str]:
         for line in rendered.splitlines():
             line = line.strip()
             if line and not re.search(r"\{[^{}]+\}", line):
-                out.append(line)
+                out.append((line, s.emotion))
                 break
     return out
 
@@ -261,7 +263,7 @@ def _fillers_jobs(
         for t in texts:
             # text 原样透传(含 MiniMax <#x#> 停顿标记)——运行时 lookup/backfill
             # 都用 manifest 原文,key 必须同文。
-            jobs.append((persona, lang, t))
+            jobs.append((persona, lang, t, ""))
     return jobs
 
 
@@ -292,9 +294,9 @@ def _qa_jobs(
             for persona in persona_pool:
                 if not _persona_resolved_voice(persona, lang, tts_cfg, voice_mode):
                     continue
-                jobs.append((persona, lang, text))
+                jobs.append((persona, lang, text, ""))
         else:
-            jobs.append((lang_personas.get(lang), lang, text))
+            jobs.append((lang_personas.get(lang), lang, text, ""))
     return jobs
 
 
@@ -313,30 +315,32 @@ async def _materialize(
     """合成+落盘主循环(greetings/objects/fillers/qa 四条物化线共用)。
 
     voice 按 (persona, lang) 运行时同源解析(map 组装带备忘,同人设同语言只算
-    一次);(persona, lang, text) 三元组去重;已在缓存(同 text+voice+model)的
-    条目 skip 不重合成。dry_run=True 只按同口径分类计数,绝不碰云 API。
+    一次);(persona, lang, text, emotion) 四元组去重;已在缓存(同 text+voice+
+    model+emotion)的条目 skip 不重合成。dry_run=True 只按同口径分类计数,绝不
+    碰云 API。
 
     pin=True 落盘打钉不逐出(罐头集:静态直念线/垫话/QA——无界的逐对象
     开场白别传,否则 LRU 失去意义)。
 
     返回 (generated, skipped, failed, records)。
     """
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, str, str, str]] = set()
     uniq: list[Job] = []
-    for persona, lang, text in jobs:
+    for persona, lang, text, emotion in jobs:
         text = str(text or "").strip()
+        emotion = str(emotion or "").strip().lower()
         if not text:
             continue
-        k = (_persona_key(persona), lang, text)
+        k = (_persona_key(persona), lang, text, emotion)
         if k in seen:
             continue
         seen.add(k)
-        uniq.append((persona, lang, text))
+        uniq.append((persona, lang, text, emotion))
 
     map_cache: dict[tuple[str, str], dict] = {}
     ok = skip = fail = 0
     records: list[Record] = []
-    for persona, lang, text in uniq:
+    for persona, lang, text, emotion in uniq:
         pk = (_persona_key(persona), lang)
         voice_map = map_cache.get(pk)
         if voice_map is None:
@@ -353,7 +357,7 @@ async def _materialize(
         # 语速维度(W2):与运行时同一条语言档规则(zh/粤 1.2)——合成(provider 的
         # language_state 已按 lang 构造)与缓存键同步带 speed,速度烧在音频里。
         speed = minimax_speed_for(lang)
-        key = cache.key_for(text, voice=voice, model=model, speed=speed)
+        key = cache.key_for(text, voice=voice, model=model, speed=speed, emotion=emotion)
         if cache.get(key) is not None:
             skip += 1
             records.append((persona, lang, voice, "skip"))
@@ -364,13 +368,25 @@ async def _materialize(
             continue
         provider = _provider_for(lang, voice_map, api_key, sample_rate)
         try:
-            pcm = await _synth(provider, text)
+            # 情绪维度(2026-09-16 罐头带情绪):行级 emotion 经 MINIMAX_EMOTION
+            # 注入,_resolve_emotion 在 task_start 时直透。批量线单进程串行、
+            # 逐 job 建 provider——env 注入无并发竞态;空=不下发(模型按文本
+            # 自动匹配,与运行时实时线同语义,轮间语气稳定)。
+            if emotion:
+                os.environ["MINIMAX_EMOTION"] = emotion
+            try:
+                pcm = await _synth(provider, text)
+            finally:
+                if emotion:
+                    os.environ.pop("MINIMAX_EMOTION", None)
         except Exception as exc:  # noqa: BLE001 - 单条失败唔阻整体
             fail += 1
             records.append((persona, lang, voice, "fail"))
             print(f"FAIL lang={lang} chars={len(text)} err={exc!r}", flush=True)
             continue
-        stored = cache.store(key, pcm, text=text, voice=voice, model=model, pin=pin, speed=speed)
+        stored = cache.store(
+            key, pcm, text=text, voice=voice, model=model, pin=pin, speed=speed, emotion=emotion
+        )
         if stored:
             ok += 1
             records.append((persona, lang, voice, "new"))
@@ -469,12 +485,12 @@ async def main_async() -> int:
     object_jobs: list[Job] = []
     if args.greetings:
         for lang, text in GENERIC_GREETINGS.items():
-            greet_jobs.append((lang_personas.get(lang), lang, text))
+            greet_jobs.append((lang_personas.get(lang), lang, text, ""))
         for lang in ("zh", "cantonese", "en"):
             for i in range(3):
-                greet_jobs.append((lang_personas.get(lang), lang, _nudge_line("", lang, i)))
-            greet_jobs.append((lang_personas.get(lang), lang, _farewell_line("", lang)))
-            greet_jobs.append((lang_personas.get(lang), lang, _wa_number_line(lang, "")))
+                greet_jobs.append((lang_personas.get(lang), lang, _nudge_line("", lang, i), ""))
+            greet_jobs.append((lang_personas.get(lang), lang, _farewell_line("", lang), ""))
+            greet_jobs.append((lang_personas.get(lang), lang, _wa_number_line(lang, ""), ""))
         # 直念步(say=1)文本线:通知/道歉类合规内容,agent 走 _say_script 脚本线
         # ——同一条缓存线物化(钉住)。按语言去重(同语言模板共用同一段通知)。
         _seen_notice: set[tuple[str, str]] = set()
@@ -482,11 +498,11 @@ async def main_async() -> int:
             _tlang = _normalize_lang((tpl or {}).get("language"), default="") or ""
             if not _tlang:
                 continue
-            for text in _say_step_lines(tpl):
+            for text, emotion in _say_step_lines(tpl):
                 if (_tlang, text) in _seen_notice:
                     continue
                 _seen_notice.add((_tlang, text))
-                greet_jobs.append((lang_personas.get(_tlang), _tlang, text))
+                greet_jobs.append((lang_personas.get(_tlang), _tlang, text, emotion))
 
     if args.objects:
         only_id = str(args.object_id or "").strip()
@@ -498,11 +514,13 @@ async def main_async() -> int:
             tpl = _template_for(templates, obj)
             opening = _opening_line(tpl, obj, lang)
             if opening:
-                object_jobs.append((lang_personas.get(lang), lang, opening))
+                object_jobs.append((lang_personas.get(lang), lang, opening, ""))
             if name:
-                object_jobs.append((lang_personas.get(lang), lang, _farewell_line(name, lang)))
+                object_jobs.append((lang_personas.get(lang), lang, _farewell_line(name, lang), ""))
                 for i in range(3):
-                    object_jobs.append((lang_personas.get(lang), lang, _nudge_line(name, lang, i)))
+                    object_jobs.append(
+                        (lang_personas.get(lang), lang, _nudge_line(name, lang, i), "")
+                    )
 
     for jobs, pin in ((greet_jobs, True), (object_jobs, False)):
         if not jobs:

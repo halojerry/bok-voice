@@ -17,7 +17,7 @@ from typing import Any
 import httpx
 from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 from bok_voice_core.providers import BusinessRepository
@@ -134,8 +134,14 @@ async def optional_bearer_auth(request: Request, call_next):
         # token 二选一）；本中间件若照旧比对 CP token 会把用户 JWT 误杀在门外。
         return await call_next(request)
     expected = os.environ.get("BOK_CP_TOKEN", "").strip()
+    _prefix_exempt = any(request.url.path.startswith(p)
+                         for p in ("/api/nodes/downloads/",))
     if expected and request.url.path not in (
-            "/health", "/api/nodes/heartbeat", "/api/nodes/register"):
+            "/health", "/api/nodes/heartbeat", "/api/nodes/register",
+            "/api/webhook/livekit") and not _prefix_exempt:
+        # webhook 豁免与 identity_gate _EXEMPT_PATHS 对齐:LiveKit 签名 webhook
+        # 不带 CP token,CP-token-only 模式曾在此 401——agent 崩溃重派队静默死
+        # (端点内另有签名校验,豁免的只是机器 token 门,2026-09-17 全量 debug F2 修)。
         # 静态站 GET/HEAD 同豁免（同 identity_gate：登录页不得被机器 token 门拦死，
         # 特权数据全在 /api/* 后面）。
         static_get = (request.method in ("GET", "HEAD")
@@ -439,7 +445,10 @@ def _mask_secrets(config: dict) -> dict:
 
 
 @app.get("/api/asr/health")
-async def asr_health() -> dict:
+async def asr_health(request: Request) -> dict:
+    # P3-A（2026-09-17 全量 debug）：sidecar 诊断读面归管理面（settings 键）——
+    # auth-on 下任意 user JWT 曾可探 sidecar 健康/读克隆音色清单。auth-off 直通。
+    _gate_page(request, "settings")
     try:
         async with httpx.AsyncClient(timeout=3) as client:
             resp = await client.get(f"{_qwen3_asr_url()}/health")
@@ -450,7 +459,8 @@ async def asr_health() -> dict:
 
 
 @app.get("/api/tts/health")
-async def tts_health() -> dict:
+async def tts_health(request: Request) -> dict:
+    _gate_page(request, "settings")  # P3-A：诊断读面归管理面
     try:
         async with httpx.AsyncClient(timeout=3) as client:
             resp = await client.get(f"{_qwen3_tts_url()}/health")
@@ -461,7 +471,8 @@ async def tts_health() -> dict:
 
 
 @app.get("/api/tts/speakers")
-async def tts_speakers() -> list[str]:
+async def tts_speakers(request: Request) -> list[str]:
+    _gate_page(request, "settings")  # P3-A：诊断读面归管理面
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.get(f"{_qwen3_tts_url()}/v1/speakers")
@@ -472,7 +483,8 @@ async def tts_speakers() -> list[str]:
 
 
 @app.get("/api/tts/voices")
-async def tts_voices() -> list[dict]:
+async def tts_voices(request: Request) -> list[dict]:
+    _gate_page(request, "settings")  # P3-A：诊断读面归管理面（克隆音色清单不外泄）
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.get(f"{_qwen3_tts_url()}/v1/voices")
@@ -565,12 +577,192 @@ async def tts_register_voice(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+# ---- MiniMax 云端声音克隆（路线 B，2026-09-18）----
+# 官方两步：/v1/files/upload(purpose=voice_clone) → /v1/voice_clone。克隆音色与
+# 系统音色走同一 voice_setting.voice_id 通道（t2a_v2 / bidi 双支持）——运行时
+# 零改动，B 线会话级音色选择器/设置页三键天然可挂。
+# 拍板「先克隆不激活」（2026-09-18）：克隆请求不带 text/model（不触发合成=
+# 0 费用）；MiniMax 规则——克隆后 7 天内未用于合成会被删除、首次用于合成才收
+# ¥9.9/音色复刻费，即试听或首次会话使用即激活计费。账号需实名/企业认证（未
+# 认证 2038）。清单存 tts.minimax_clones_json（settings blob，免 DB 迁移）。
+
+
+def _minimax_clone_base() -> str:
+    """克隆端点基址（…/v1）：MINIMAX_BASE_URL 覆盖优先（容忍 /v1/t2a_v2 全形态，
+    剥回 /v1）；否则按 region——cn=api.minimax.cn（现行国内）；intl 沿用 TTS 同款
+    遗留域 api.minimax.chat（海外现行文档为 api.minimax.io，账号区不通时 env 覆盖）。"""
+    base = os.environ.get("MINIMAX_BASE_URL", "").strip().rstrip("/")
+    if base:
+        return base[: -len("/t2a_v2")] if base.endswith("/t2a_v2") else base
+    region = os.environ.get("MINIMAX_REGION", "cn").strip().lower()
+    return "https://api.minimax.chat/v1" if region in {"intl", "global", "chat"} else "https://api.minimax.cn/v1"
+
+
+def _minimax_api_key() -> str:
+    """照 /api/tts/preview 同源：settings 持久化 tts.api_key 优先，env 兜底。"""
+    tts_settings = (_repo().get_settings() or {}).get("tts") or {}
+    return (str(tts_settings.get("api_key") or "").strip()) or os.environ.get("MINIMAX_API_KEY", "")
+
+
+def _minimax_clones_list(tts_settings: dict) -> list[dict]:
+    raw = str(tts_settings.get("minimax_clones_json") or "[]")
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _save_minimax_clones(clones: list[dict]) -> None:
+    # save_settings 是整段替换语义——读全量、只改 tts 段、原样回写其余 sections。
+    settings = _repo().get_settings() or {}
+    tts_blob = dict(settings.get("tts") or {})
+    tts_blob["minimax_clones_json"] = json.dumps(clones, ensure_ascii=False)
+    settings["tts"] = tts_blob
+    _repo().save_settings(settings)
+
+
+@app.get("/api/tts/minimax-voices")
+async def tts_minimax_voices_list(request: Request) -> list[dict]:
+    # 克隆清单是本地面板数据（settings blob），读面归管理面（同 tts_voices）。
+    _gate_page(request, "settings")
+    return _minimax_clones_list((_repo().get_settings() or {}).get("tts") or {})
+
+
+@app.post("/api/tts/minimax-voices")
+async def tts_minimax_voice_clone(
+    request: Request,
+    file: UploadFile = File(...),
+    label: str = Form(""),
+    sample_lang: str = Form("zh"),
+) -> dict:
+    """参考音频 → MiniMax 云端克隆 voice_id（不激活、0 费用；见节首注释）。"""
+    require_role(request, "admin", "root")
+    label = label.strip()[:64]
+    sample_lang = (sample_lang.strip().lower() or "zh")[:16]
+    audio = await file.read()
+    if not audio:
+        raise HTTPException(status_code=400, detail="参考音频为空")
+    if len(audio) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="参考音频超过 20MB 上限（官方规则 ≤20MB，10s~5min）")
+    api_key = _minimax_api_key()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="MiniMax API Key 未配置：请到「设置 → TTS 语音合成」填写 API Key 并保存")
+    base = _minimax_clone_base()
+    headers = {"Authorization": f"Bearer {api_key}"}
+    # 命名规则（官方）：[8,256]、首字符字母、仅字母/数字/-/_、尾字符不可 -/_；
+    # bokclone 前缀避开本地 Qwen3 克隆前缀 agent-/acceptance-（B/A 线
+    # _cloud_voice 过滤闸会把它当本地音色剔除，2054 防线不受影响）。
+    voice_id = f"bokclone{uuid.uuid4().hex[:8]}"
+
+    def _audit_clone(outcome: str = "ok", **extra: Any) -> None:
+        _audit("voice.clone", subject_type="minimax_voice", subject_id=voice_id,
+               outcome=outcome, detail={"label": label, "sample_lang": sample_lang, **extra})
+
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            up = await client.post(
+                f"{base}/files/upload",
+                headers=headers,
+                data={"purpose": "voice_clone"},
+                files={"file": (file.filename or "reference.wav", audio)},
+            )
+            up.raise_for_status()
+            up_body = up.json()
+            file_id = ((up_body.get("file") or {}) if isinstance(up_body, dict) else {}).get("file_id")
+            if not file_id:
+                _audit_clone("error", step="files.upload")
+                raise HTTPException(status_code=502, detail=f"MiniMax 参考音频上传失败: {json.dumps(up_body, ensure_ascii=False)[:256]}")
+            clone = await client.post(
+                f"{base}/voice_clone",
+                headers={**headers, "Content-Type": "application/json"},
+                json={"file_id": file_id, "voice_id": voice_id},
+            )
+            clone.raise_for_status()
+            clone_body = clone.json()
+            base_resp = clone_body.get("base_resp") or {}
+            code = base_resp.get("status_code")
+            if code != 0:
+                msg = str(base_resp.get("status_msg") or f"status_code={code}")
+                _audit_clone("error", step="voice_clone", minimax_code=code)
+                if code == 2038:
+                    raise HTTPException(status_code=403, detail="MiniMax 账号无复刻权限（2038）：请先在 MiniMax 平台完成实名/企业认证")
+                raise HTTPException(status_code=502, detail=f"MiniMax voice_clone 失败: {msg}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _audit_clone("error", step="http", error=str(exc)[:256])
+        raise HTTPException(status_code=502, detail=f"MiniMax 克隆请求失败: {exc}") from exc
+
+    clones = _minimax_clones_list((_repo().get_settings() or {}).get("tts") or {})
+    clones.append({
+        "voice_id": voice_id,
+        "label": label or voice_id,
+        "sample_lang": sample_lang,
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        # 未激活：7 天内首次合成（试听/会话）才计费 ¥9.9 并正式生效。
+        "activated": False,
+    })
+    _save_minimax_clones(clones)
+    _audit_clone()
+    return {"voice_id": voice_id, "label": label or voice_id, "sample_lang": sample_lang,
+            "activated": False, "note": "未激活：7 天内首次合成（试听/会话使用）即激活并计费 ¥9.9/音色"}
+
+
+@app.delete("/api/tts/minimax-voices/{voice_id}")
+async def tts_minimax_voice_delete(voice_id: str, request: Request) -> dict:
+    require_role(request, "admin", "root")
+    api_key = _minimax_api_key()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="MiniMax API Key 未配置：请到「设置 → TTS 语音合成」填写 API Key 并保存")
+    base = _minimax_clone_base()
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{base}/delete_voice",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"voice_type": "voice_cloning", "voice_id": voice_id},
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            base_resp = body.get("base_resp") or {}
+            if base_resp.get("status_code") != 0:
+                raise HTTPException(status_code=502, detail=f"MiniMax delete_voice 失败: {base_resp.get('status_msg') or base_resp}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"MiniMax 删除音色失败: {exc}") from exc
+    # 本地清单移除 + 人设引用清理（reference_audio 是 {lang: voice_id} JSON）。
+    clones = [c for c in _minimax_clones_list((_repo().get_settings() or {}).get("tts") or {})
+              if str(c.get("voice_id")) != voice_id]
+    _save_minimax_clones(clones)
+    for p in _repo().list_personas(""):
+        raw = p.get("reference_audio") or ""
+        if voice_id not in raw:
+            continue
+        try:
+            mapping = json.loads(raw)
+            if isinstance(mapping, dict):
+                before = dict(mapping)
+                mapping = {k: v for k, v in mapping.items() if v != voice_id}
+                if mapping != before:
+                    _repo().update_persona(p["id"], {"reference_audio": json.dumps(mapping, ensure_ascii=False)})
+        except Exception:
+            continue
+    _audit("voice.delete", subject_type="minimax_voice", subject_id=voice_id, detail={"voice_id": voice_id})
+    return {"ok": True, "voice_id": voice_id}
+
+
 @app.get("/api/tts/filler-preview")
-def tts_filler_preview(lang: str = "zh", i: int = 0) -> Response:
+def tts_filler_preview(lang: str = "zh", i: int = 0, request: Request = None) -> Response:
     """垫话资产试听（2026-09-11 症状④）：直接吐源码 wav（随包分发,零云调用）。
 
     i=池内索引(取模轮换),web 端随机传即「换一句试听」。浏览器按 wav 头原生
     播放=正确速率;房间内 48k 混音器错配是 agent 播放路径问题,与此端点无关。"""
+    # P3-A（2026-09-17 全量 debug）：资产文件读面归管理面（settings 键）；
+    # request 默认 None 兜底（历史直接调用不炸）——FastAPI 路由恒注入。
+    if request is not None:
+        _gate_page(request, "settings")
     from fastapi.responses import FileResponse
 
     assets = Path(__file__).resolve().parents[2] / "agent" / "agent_runtime" / "assets" / "fillers"
@@ -604,6 +796,10 @@ async def tts_preview(payload: dict, request: Request) -> Response:
     text = str(payload.get("text") or "")
     voice = str(payload.get("voice") or "")
     language = str(payload.get("language") or "zh")
+    # 试听烧真金(MiniMax 云配额)却从不留痕——voice.clone/delete 同族操作都审计
+    # (2026-09-17 全量 debug F10 补齐)。
+    _audit("tts.preview", subject_type="tts_voice", subject_id=voice[:128],
+           detail={"provider": provider, "language": language, "chars": len(text)})
     if not voice and provider in ("minimax", "minimax_streaming"):
         # qa_entries.voice_id 可空(罐头物化时音色取自人设而非词条字段)——试听
         # 按语言回落 agent 同一套默认音色(_MINIMAX_DEFAULT_VOICES 同步,2026-09-12
@@ -747,8 +943,48 @@ def _validate_user_permissions(target_role: str, permissions: list[str] | None) 
         raise HTTPException(400, f"未知权限键: {', '.join(unknown)}")
 
 
+def _hardened_auth() -> bool:
+    """加固模式判定:auth-on 或 BOK_CP_TOKEN 单设任一(node_license_required 同判据)。"""
+    return auth_required() or bool(os.environ.get("BOK_CP_TOKEN", "").strip())
+
+
+# P1-C（2026-09-17 全量 debug）：/api/token 按调用方身份频控——防「持 calls 页键
+# 的 user JWT 批量签发/撞房间名」资源滥用。30 次/分钟/身份，进程内滑动窗口
+# （CP 单进程形态够用）；身份键=user:<id>/machine/anon，互不挤占（P3-A web_logs
+# 全局窗教训同族：单 deque 全局共享时一个调用方可压干所有调用方的额度）。
+_TOKEN_RATE_LIMIT = 30
+_TOKEN_RATE_WINDOW_S = 60.0
+_token_issue_times: dict[str, deque] = {}
+
+
+def _token_rate_limit(request: Request) -> None:
+    """/api/token per-identity 滑动窗口频控：超限 429，放行记时间戳。"""
+    ident = current_identity(request)
+    if ident is not None:
+        key = f"user:{ident.user_id}"
+    elif getattr(request.state, "machine", False):
+        key = "machine"
+    else:
+        key = "anon"
+    import time as _time
+
+    now = _time.monotonic()
+    dq = _token_issue_times.setdefault(key, deque())
+    while dq and now - dq[0] >= _TOKEN_RATE_WINDOW_S:
+        dq.popleft()
+    if len(dq) >= _TOKEN_RATE_LIMIT:
+        raise HTTPException(status_code=429, detail="token issuance rate limited (30/min per identity)")
+    dq.append(now)
+
+
 def _require_user_admin(identity: Identity | None, target_role: str, target_account: str) -> None:
     if identity is None:
+        # 加固模式下 identity=None=机器通道(BOK_CP_TOKEN 持有者)——账号管理面
+        # 不得放行,否则任意 agent worker 进程可铸 root/改 root 密码(2026-09-17
+        # 全量 debug F1 修复;require_role 的机器直通语义只该覆盖业务工作台,
+        # 不该覆盖 users 管理面)。真 auth-off(双关,本机单用户)原样直通。
+        if _hardened_auth():
+            raise HTTPException(403, "machine channel not allowed on user admin")
         return
     if identity.role == "root":
         return
@@ -849,7 +1085,11 @@ def create_user(req: CreateUserRequest, request: Request) -> dict:
 @app.get("/api/users")
 def list_users(request: Request, account_id: str = "") -> dict:
     identity = current_identity(request)
-    if identity and identity.role == "user":
+    if identity is None:
+        # 加固模式下机器通道/裸 token 不得列全账号用户(与 _require_user_admin 同洞)。
+        if _hardened_auth():
+            raise HTTPException(403, "machine channel not allowed on user admin")
+    elif identity.role == "user":
         raise HTTPException(403, "无账号管理权限")
     # admin 强制本账号视角；root/auth-off 按参过滤（空=全部）。
     acct = identity.account_id if (identity and identity.role == "admin") else account_id
@@ -859,6 +1099,9 @@ def list_users(request: Request, account_id: str = "") -> dict:
 @app.patch("/api/users/{user_id}")
 def update_user(user_id: str, req: UpdateUserRequest, request: Request) -> dict:
     identity = current_identity(request)
+    if identity is None and _hardened_auth():
+        # identity=None 在加固模式下=机器通道:不得改任意用户(root 密码重置路径)。
+        raise HTTPException(403, "machine channel not allowed on user admin")
     target = _repo().get_user(user_id)
     if not target:
         raise HTTPException(404, "user not found")
@@ -927,6 +1170,9 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
     room = (req.room_name or req.call_id or "").strip()
     if not room:
         raise HTTPException(status_code=400, detail="room_name (or call_id) is required")
+    # P1-C 频控插在凭据校验之后：缺凭据 503 行为不被频控扰动（load_cp_concurrency
+    # 场景 D 依赖「无凭据稳定 503」），频控只保护真实签发路径。
+    _token_rate_limit(request)
     import datetime
     from livekit import api
 
@@ -972,12 +1218,29 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
         else f"supervisor-{room}" if role == "supervisor"
         else f"operator-{req.account_id}-{room}"
     )
+    # P1-C（2026-09-17 全量 debug）：先取通话记录，记录缺失（新建流/竞态/编造
+    # 房间名）的房间降为 subscribe-only 且不挂 agent dispatch——旧版对任意编造
+    # room 名签 can_publish=True token 并触发 CP 创建真实 dispatch（资源空转、
+    # 幽灵房 reaper 不可见——无 call 记录可循）。改前 grep scripts/ 全量核查 E2E
+    # 依赖：三套 E2E（trilingual/barge-in/edge_cases）与全部 probe/soak/acceptance
+    # 都是先 POST /api/calls 建单、再拿 call["id"] 当房名取 token——记录恒存在，
+    # 发布+dispatch 语义不变；唯一无记录用例是 scripts/load_cp_concurrency.py
+    # 场景 D（load-{i}×50）：其自起 CP 无 LiveKit 凭据、依赖缺凭据 503（该检查
+    # 在频控之前，行为不变），有凭据下拿 subscribe-only token 也只是不出 500，
+    # 脚本断言不受扰；doctor 的 token 探针只验三段式 JWT，同样不受扰。
+    _call: dict = {}
+    try:
+        _call = _repo().get_call(room) or {}
+    except Exception:
+        _call = {}
+    _recordless = not _call
     # 旁听专线 grants：can_publish/can_publish_data 全关——主管旁听绝不向通话
-    # 注入音频或数据；can_subscribe 保证能收双方音轨与字幕流。
+    # 注入音频或数据；can_subscribe 保证能收双方音轨与字幕流。P1-C：无记录房间
+    # 同款 subscribe-only（is_listen 本来就是零发布，两档合一）。
     _grants = (
         api.VideoGrants(room_join=True, room=room, can_publish=False,
                         can_subscribe=True, can_publish_data=False)
-        if is_listen
+        if (is_listen or _recordless)
         else api.VideoGrants(room_join=True, room=room, can_publish=True,
                              can_subscribe=True, can_publish_data=True)
     )
@@ -993,12 +1256,6 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
     # 业务维度放 participant attributes(官方机制):agent/前端按属性判定角色,
     # 替代对 identity 前缀的字符串嗅探;SIP 接入时同通道补 bok.* 属性。
     at = at.with_attributes({"bok.role": role, "bok.account_id": req.account_id})
-
-    _call: dict = {}
-    try:
-        _call = _repo().get_call(room) or {}
-    except Exception:
-        _call = {}
     # 熔断产品路径（site-delivery M1）：通话建单时绑定了承载节点（call.node_id）
     # → 签发房 token 前校验该节点未吊销——覆盖「坐席 JWT 建单、非 node_token 通道」
     # 的 thin-node 拓扑（窒息点中间件只拦 node_token Bearer，这条拦通话绑定）。
@@ -1036,12 +1293,17 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
     # 同传房间:我方端是创建者,token 里挂 RoomConfiguration 显式分发两个方向的
     # interpreter agent(RoomAgentDispatch 只在首个参与者建房时生效,所以只挂 me 端)。
     # metadata 带精确 identity(CP 已知房间名,不再让 agent 拼前缀)与语言对。
-    if kind == "interpret" and role == "me":
+    # P1-C：`not _recordless` 收口——无记录房间一律不挂 dispatch（kind 派生自
+    # _call,此分支对 recordless 结构性不可达,显式钉死防未来改动破闸）。
+    if kind == "interpret" and role == "me" and not _recordless:
         src = (_call.get("language") or "zh").strip() or "zh"
         tgt = (_call.get("target_lang") or "en").strip() or "en"
         # 术语表随 dispatch metadata 下发(P0-2):建单已截 1000 字,这里原样透传
         # (双向同带——fwd 译给对方、rev 译给我方,各自按源语词条取用)。
         glossary = str(_call.get("glossary") or "")
+        # 会话级音色(2026-09-17)同管道透传:双向同带 JSON map,fwd/rev 各按自己
+        # target_lang 取键(_build_tts_provider 最优先档);空=跟随设置。
+        voices_json = str(_call.get("voices_json") or "")
         from livekit.api import RoomAgentDispatch, RoomConfiguration
 
         at = at.with_room_config(
@@ -1055,6 +1317,7 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
                             "source_lang": src,
                             "target_lang": tgt,
                             "glossary": glossary,
+                            "voices": voices_json,
                         }),
                     ),
                     RoomAgentDispatch(
@@ -1065,14 +1328,17 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
                             "source_lang": tgt,
                             "target_lang": src,
                             "glossary": glossary,
+                            "voices": voices_json,
                         }),
                     ),
                 ]
             )
         )
-    elif not is_listen and kind != "interpret" and role in ("operator", "supervisor"):
+    elif not is_listen and kind != "interpret" and role in ("operator", "supervisor") and not _recordless:
         # 旁听 token 不加 RoomConfiguration：主管通常后于坐席进房（无副作用），
         # 但若先到，挂 dispatch 会替房间建房并拉起 agent——旁听必须零副作用。
+        # P1-C：无记录房间同样零副作用（不建房不拉 agent，只发 subscribe-only
+        # token——连不连得上取决于 LiveKit 房间是否真有人建）。
         # A 线显式分发(官方推荐,隐式 dispatch 已废除):worker 以 agent_name="bok-voice"
         # 注册,只有挂了本 dispatch 的房间会拉起客服 agent——顺带杜绝「同传房被
         # A 线 agent 隐式抢派」。metadata 带 call_id,取代已删除的 AGENT_CALL_ID env 旁路。
@@ -1108,6 +1374,12 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
     _audit("token.issue", subject_type="call", subject_id=req.call_id or "",
            account_id=req.account_id, call_id=req.call_id or "",
            detail={"role": role, "purpose": _purpose})
+    if _recordless:
+        # P1-C 审计：无记录房间签发降级单独留痕（room+调用方身份），与上面的
+        # token.issue 全量行互补——降级路径可独立检索（查滥用/查幽灵房来源）。
+        _audit("token.issued", subject_type="room", subject_id=room,
+               detail={"recordless": True, "role": role, "purpose": _purpose,
+                       "caller": _ident.user_id if _ident else ("machine" if _machine else "anon")})
     return TokenResponse(serverUrl=url, participantToken=participant_token)
 
 
@@ -1179,6 +1451,9 @@ def _create_call_in(repo, req: CreateCallRequest, created_by: str = "") -> dict:
         # B 线同传术语表(P0-2,2026-09-16):1000 字硬截(防 metadata/prefill 膨胀,
         # agent 侧另有 400 字 prompt 护栏);A 线建单恒空。
         glossary=(req.glossary or "")[:1000],
+        # B 线会话级音色(2026-09-17):我方/对方各一把的 JSON map,512 字硬截
+        # (两只音色 ID 富余);空=跟随设置页三键/硬编码默认。A 线建单恒空。
+        voices_json=(req.voices_json or "")[:512],
     )
     call = repo.create_call(manifest)
     _audit("call.create", subject_type="call", subject_id=call.get("id", ""),
@@ -2102,8 +2377,15 @@ def spawn_mock_callee(req: MockCalleeRequest, request: Request) -> dict:
     import threading
 
     threading.Thread(target=proc.wait, daemon=True, name=f"mock-callee-reap-{proc.pid}").start()
+    # P3-B（2026-09-17 全量 debug）：审计账号按 room 对应通话的真实归属盖章——
+    # 旧硬编码 "acc-001" 会把任意账号的 mock 派发记错账；记录查不到（演练房无
+    # 建单）落空串，绝不回退硬编码 id。
+    try:
+        _mock_acct = str((_repo().get_call(req.room) or {}).get("account_id") or "")
+    except Exception:  # pragma: no cover - 读不到归属宁可空串不阻主链
+        _mock_acct = ""
     _audit("sip.mock_callee_spawn", subject_type="room", subject_id=req.room,
-           account_id="acc-001",
+           account_id=_mock_acct,
            detail={"scenario": req.scenario, "pid": proc.pid, "identity": identity,
                    "narrowband": req.narrowband})
     return {"ok": True, "pid": proc.pid, "identity": identity}
@@ -2123,6 +2405,21 @@ class NodeRegisterRequest(BaseModel):
 class NodeHeartbeatRequest(BaseModel):
     metrics: dict = {}
     fingerprint: str = ""
+    # P3 commands 通道（2026-09-17）：version=节点当前包版本（写回 nodes.version
+    # + update 指令收敛关单）；acks=已领指令的执行回执 [{id, ok, result}]。
+    version: str = ""
+    acks: list = []
+
+
+class NodeCommandRequest(BaseModel):
+    """root 下发节点指令入参：action 白名单（update/restart/shutdown）。
+
+    update 必带 version（目标包版本，工件须已上传 CP downloads）；force=True
+    跳过「该节点有在途通话」的拒绝检查（默认拒绝——强更会掐活通话）。"""
+
+    action: str
+    version: str = ""
+    force: bool = False
 
 
 class NodeLicenseCreateRequest(BaseModel):
@@ -2207,10 +2504,13 @@ def register_node(req: NodeRegisterRequest) -> dict:
 def node_heartbeat(req: NodeHeartbeatRequest, authorization: str = Header(default="")) -> dict:
     token = authorization.removeprefix("Bearer ").strip()
     ok, reason = (False, "unknown_token")
+    node = None
     if token:
+        node = _node_store().resolve_node_token(token)
         ok, reason = _node_store().heartbeat(
             token, req.metrics, fingerprint=(req.fingerprint or "").strip(),
-            require_license=node_license_required())
+            require_license=node_license_required(),
+            version=(req.version or "").strip())
     if not ok:
         # 克隆/吊销是安全事件（节点已被 store 自动吊销），一次性落审计；普通
         # 凭据错误只 401 不刷审计（防心跳重试刷屏）。
@@ -2229,14 +2529,134 @@ def node_heartbeat(req: NodeHeartbeatRequest, authorization: str = Header(defaul
             if node is not None and (node.get("revoked_source") or "") == "root":
                 detail = {"reason": "node revoked", "action": "shutdown"}
         raise HTTPException(401, detail or "unknown node token")
-    return {"ok": True, "commands": []}
+    # 指令分发（P3）：先落回执（失败/异常类），再派发 pending→delivered。
+    # 成功的 update 不等 ack——version 收敛时 store 自动关单。
+    for ack in (req.acks or []):
+        if not isinstance(ack, dict) or not str(ack.get("id", "")):
+            continue
+        _node_store().ack_command(str(node["node_id"]), str(ack["id"]),
+                                  bool(ack.get("ok")), str(ack.get("result", ""))[:200])
+    commands = _node_store().pop_commands(str(node["node_id"])) if node else []
+    if commands:
+        print(f"[node] dispatched {len(commands)} command(s) -> {node['node_id']}: "
+              f"{[c['action'] for c in commands]}", flush=True)
+    return {"ok": True, "commands": commands}
+
+
+def _node_active_calls(node_id: str) -> list[dict]:
+    """该节点上「在途」的通话（update/restart 前拒绝检查用）。
+
+    终态=completed/failed/cancelled/handled/idle——其余（active/paused/
+    escalated_to_human 等）都算在途：宁可多拒，root 有 force。逐账号扫太散，
+    直接跨账号按 node 过滤（list_calls 账号传空=全账号）。"""
+    terminal = {"", "idle", "completed", "failed", "cancelled", "canceled", "handled"}
+    try:
+        calls = _repo().list_calls("", node_id=node_id)
+    except TypeError:
+        # 旧 repo 实现不认 node_id 参数（第三方/测试桩）——守卫降级为不拦。
+        return []
+    return [c for c in calls if str(c.get("status", "")) not in terminal]
+
+
+@app.post("/api/nodes/{node_id}/commands")
+def create_node_command(node_id: str, req: NodeCommandRequest, request: Request) -> dict:
+    """root 下发节点指令（P3 commands 通道入口）。
+
+    白名单外 action → 400；update 必带 version（工件须在 downloads）；默认
+    该节点有在途通话时拒绝（force=True 越过——强更掐通话是显式决定）。执行
+    结果不在此同步返回：节点心跳领走后按 version 收敛（update）/ 节点 status
+    变化（shutdown/restart）间接可见，台账 GET /api/nodes/{id}/commands。"""
+    ident = require_role(request, "root")
+    created_by = ident.user_id if ident is not None else "machine"
+    store = _node_store()
+    if store.node_by_id(node_id) is None:
+        raise HTTPException(404, "node not found")
+    args: dict = {}
+    if req.action == "update":
+        version = (req.version or "").strip()
+        if not version:
+            raise HTTPException(400, "update command requires version")
+        args["version"] = version
+        args["force"] = bool(req.force)
+    elif req.action in ("restart", "shutdown"):
+        args["force"] = bool(req.force)
+    else:
+        raise HTTPException(400, f"unsupported action: {req.action}")
+    if req.action in ("update", "restart") and not req.force:
+        inflight = _node_active_calls(node_id)
+        if inflight:
+            raise HTTPException(409, f"node has {len(inflight)} in-flight call(s); "
+                                     "retry with force=true to override")
+    try:
+        cmd = store.enqueue_command(node_id, req.action, args=args,
+                                    created_by=created_by)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    _audit("node.command_queued", subject_type="node", subject_id=node_id,
+           detail={"action": req.action, "args": args, "command_id": cmd["id"]})
+    return cmd
+
+
+@app.get("/api/nodes/{node_id}/commands")
+def list_node_commands(node_id: str, request: Request) -> dict:
+    """指令台账（root 面排障/舰队版本面板数据源）。"""
+    require_role(request, "root")
+    if _node_store().node_by_id(node_id) is None:
+        raise HTTPException(404, "node not found")
+    return {"node_id": node_id, "commands": _node_store().list_commands(node_id)}
 
 
 @app.get("/api/nodes")
 def list_nodes(request: Request) -> list[dict]:
     # 节点注册表=平台面（root）。
     require_role(request, "root")
-    return _node_store().list_nodes()
+    rows = _node_store().list_nodes()
+    # P3 舰队面板：pending 指令数就地 enrich（默认 0，不查库时省一跳）。
+    for r in rows:
+        try:
+            r["pending_commands"] = _node_store().pending_command_count(r["node_id"])
+        except Exception:  # pragma: no cover - 面板增强不阻列表
+            r["pending_commands"] = 0
+    return rows
+
+
+@app.get("/api/nodes/downloads/{kind}/{version}/{filename}")
+def download_node_artifact(kind: str, version: str, filename: str,
+                           authorization: str = Header(default="")) -> FileResponse:
+    """节点工件下载（P3/去 GitHub 化交付链）：pkg=代码包，runtime=预构建运行时，
+    bootstrap=装机引导脚本（install-node.sh/.ps1、bootstrap-node.sh——客户链路
+    唯一入口，永久挂 pkg/latest 别名）。
+
+    鉴权=端点内自证（同 register/heartbeat 模式，中间件前缀豁免）：Bearer
+    node_token（拒 revoked）或 license key（须 active）——客户链路只见本 CP
+    域名，仓库上游不可见。路径三段白名单校验（字母数字._- 且不点开头），
+    文件必须真实落在工件目录内——穿越/编码绕行一律 404。"""
+    token = authorization.removeprefix("Bearer ").strip()
+    store = _node_store()
+    if token:
+        node = store.resolve_node_token(token)
+        if node is not None and node.get("revoked"):
+            raise HTTPException(403, "node revoked")
+        if node is None:
+            lic = store.find_license(token)
+            if lic is None or lic.get("status") != "active":
+                raise HTTPException(401, "node token or license key required")
+    else:
+        raise HTTPException(401, "node token or license key required")
+    if kind not in ("pkg", "runtime", "bootstrap"):
+        raise HTTPException(404, "not found")
+    import re
+
+    for seg in (version, filename):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", seg):
+            raise HTTPException(404, "not found")
+    artifacts = Path(os.environ.get("BOK_NODE_ARTIFACTS_DIR", "/app/downloads"))
+    target = (artifacts / kind / version / filename).resolve()
+    if not target.is_file() or artifacts.resolve() not in target.parents:
+        raise HTTPException(404, "not found")
+    _audit("node.artifact_downloaded", subject_type="artifact",
+           subject_id=f"{kind}/{version}/{filename}")
+    return FileResponse(target, filename=filename)
 
 
 def node_license_required() -> bool:
@@ -2523,15 +2943,16 @@ async def settle(call_id: str, request: Request) -> dict:
     # session_report 的真实 llm_usage(有)或轮数估算(无),重复 settle 幂等跳过
     # ——写失败只告警不阻结算。
     try:
-        import json as _json
         from bok_voice_business_db.models import UsageRecord
 
-        sr_raw = call.get("session_report") or ""
+        # P1-A：跨「主列 + per-worker 历史列」逐份累加 llm_usage.total_tokens
+        # （B 线双 worker 各一份；单份旧数据行为不变）。坏 report 只丢该份不炸。
         tokens = 0
-        try:
-            tokens = int((_json.loads(sr_raw) or {}).get("llm_usage", {}).get("total_tokens") or 0)
-        except Exception:
-            tokens = 0
+        for _report in _iter_call_reports(call):
+            try:
+                tokens += int((_report.get("llm_usage") or {}).get("total_tokens") or 0)
+            except Exception:
+                continue
         if not tokens:
             tokens = len(turns) * 300
         if not _repo().get_usage_record(call_id):
@@ -3123,47 +3544,133 @@ def list_object_topics(object_id: str, request: Request) -> list[dict]:
     return _repo().list_object_topics(object_id)
 
 
+def _iter_call_reports(call: dict) -> list[dict]:
+    """P1-A 报告合并视图：主列 session_report + per-worker 历史列 session_reports_json。
+
+    顺序=主列在前（旧读点单报告语义不变），每元素是完整 report dict；坏 JSON/
+    异形元素跳过不炸（读路径不得因脏数据 500）。usage 类读点（/api/reports/usage、
+    settle 的 usage_record）对数值字段逐份累加。主列与某条历史**同文**（P1-A 镜像
+    写入的场合）时去重——数值累加读点否则会把同一份报告算两遍。
+    """
+    entries: list[dict] = []
+    arr_raw = str((call or {}).get("session_reports_json") or "").strip()
+    if arr_raw:
+        try:
+            arr = json.loads(arr_raw)
+            if isinstance(arr, list):
+                for entry in arr:
+                    if isinstance(entry, dict) and isinstance(entry.get("report"), dict):
+                        entries.append(entry["report"])
+        except Exception:
+            pass
+    out: list[dict] = []
+    raw = str((call or {}).get("session_report") or "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict) and not any(r == parsed for r in entries):
+                out.append(parsed)
+        except Exception:
+            pass
+    return out + entries
+
+
 @app.post("/api/calls/{call_id}/session-report")
 async def ingest_session_report(call_id: str, request: Request) -> dict:
     """Agent shutdown 上报官方 SessionReport（真实逐模型 usage + 权威 chat_history 快照）。
 
     存 call_sessions.session_report(JSON)；结算/报表优先吃这里的真数据，
     没有上报的旧通话才回退估算口径。
+
+    P1-B（2026-09-17 全量 debug，同批与 P1-A 一次改到位）：写入主体收紧——报告
+    是 worker 产物不是操作台输入。机器通道（auth-on 下 state.machine 的 CP token、
+    或加固模式 identity=None 的裸 token 通道）与 admin/root 放行；role=user 一律
+    403（否则持 calls 页键的 user JWT 可改写活跃通话报告=报表可伪造）；真 auth-off
+    （双关、无身份无 token）零变化。
+
+    P1-A（同批）：body 增可选 `worker`（B 线 interp fwd/rev 双 worker 共享同一
+    call_id，各自产出一份 report；interp-fwd.log 实证后收尾方向曾整份被 409 丢）。
+    worker=""（旧 A 线 agent）语义零变化——首写进主列、ended+已有 report → 409
+    幽灵守卫；worker 非空走 per-worker 历史（call_sessions.session_reports_json
+    JSON 数组，元素 {"worker","report","ts"}）：同 worker 重发（重试）=替换其条目、
+    异 worker=追加；ended 后不同 worker 的第二份照收（合并返回 200，不再 409）。
+    该份同时仅在主列仍为空时镜像进主列（backfill/旧读点向后兼容）。
     """
+    _ident = current_identity(request)
+    if _ident is not None and _ident.role not in ("admin", "root"):
+        # 身份三态穷尽：user → 403；admin/root → 放行；identity=None（机器通道
+        # state.machine / 加固模式裸 CP token / 双关 auth-off）→ 下方直通。
+        raise HTTPException(status_code=403, detail="session report is worker-authored")
     _gate_page(request, "calls")
     deny_cross_account(request, _repo().get_call(call_id))
     try:
         payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="invalid json body")
+    worker = str((payload or {}).get("worker") or "").strip()
     # C2 闸2·幽灵覆盖防护(2026-09-13,call-6bd59b40):挂断后重连产生的幽灵 job
     # 会用自己的 report 覆盖真实通话的 session_report。ended 且已有 report →
     # 409 拒绝(首个 report 在 ended 后仍收——agent 收尾顺序是先 ended 后上报,
-    # 只挡「第二次覆盖」)。caller 已容错(报表失败不阻结算)。
+    # 只挡「第二次覆盖」)。P1-A 起该守卫只对 worker="" 旧语义生效；worker 非空
+    # 是 per-worker 历史,异 worker 在 ended 后追加照收（不 409）。
     try:
         _cur = _repo().get_call(call_id) or {}
     except Exception:  # pragma: no cover - 读取失败按旧行为放行
         _cur = {}
-    if (
-        str(_cur.get("status") or "") == "ended"
-        and str(_cur.get("session_report") or "").strip()
-    ):
-        _audit(
-            "call.session_report_rejected",
-            subject_type="call",
-            subject_id=call_id,
-            account_id=_cur.get("account_id", ""),
-            outcome="ghost_overwrite",
-        )
-        raise HTTPException(
-            status_code=409,
-            detail="call ended with existing session_report — ghost overwrite rejected",
-        )
-    row = _repo().update_call(call_id, session_report=json.dumps(payload, ensure_ascii=False, default=str))
+    if not worker:
+        if (
+            str(_cur.get("status") or "") == "ended"
+            and str(_cur.get("session_report") or "").strip()
+        ):
+            _audit(
+                "call.session_report_rejected",
+                subject_type="call",
+                subject_id=call_id,
+                account_id=_cur.get("account_id", ""),
+                outcome="ghost_overwrite",
+            )
+            raise HTTPException(
+                status_code=409,
+                detail="call ended with existing session_report — ghost overwrite rejected",
+            )
+        row = _repo().update_call(call_id, session_report=json.dumps(payload, ensure_ascii=False, default=str))
+        if not row:
+            raise HTTPException(status_code=404, detail="call not found")
+        _audit("call.session_report", subject_type="call", subject_id=call_id, account_id=row.get("account_id", ""))
+        return {"call_id": call_id, "stored": True}
+    # ---- worker 非空：per-worker 历史 upsert（P1-A） ----
+    try:
+        arr = json.loads(str(_cur.get("session_reports_json") or "") or "[]")
+        if not isinstance(arr, list):
+            arr = []
+    except Exception:
+        arr = []
+    entry = {"worker": worker, "report": payload, "ts": _utcnow_iso()}
+    replaced = False
+    for i, old in enumerate(arr):
+        if isinstance(old, dict) and str(old.get("worker") or "") == worker:
+            arr[i] = entry  # 同 worker 重发（重试）=替换，不累积重复条目
+            replaced = True
+            break
+    if not replaced:
+        arr.append(entry)
+    fields: dict = {"session_reports_json": json.dumps(arr, ensure_ascii=False, default=str)}
+    if not str(_cur.get("session_report") or "").strip():
+        # 镜像仅当主列仍为空：首个 worker 顺手喂饱 backfill/旧读点，后续方向不动主列。
+        fields["session_report"] = json.dumps(payload, ensure_ascii=False, default=str)
+    row = _repo().update_call(call_id, **fields)
     if not row:
         raise HTTPException(status_code=404, detail="call not found")
-    _audit("call.session_report", subject_type="call", subject_id=call_id, account_id=row.get("account_id", ""))
-    return {"call_id": call_id, "stored": True}
+    _audit(
+        "call.session_report",
+        subject_type="call",
+        subject_id=call_id,
+        account_id=row.get("account_id", ""),
+        detail={"worker": worker[:64], "replaced": replaced,
+                "ended_merge": str(_cur.get("status") or "") == "ended"},
+    )
+    return {"call_id": call_id, "stored": True, "merged": True,
+            "worker": worker, "replaced": replaced}
 
 
 # 重派防复活门:终态通话(或记录已删)不得重派——为死通话新建的 dispatch 无
@@ -3178,18 +3685,46 @@ _redispatch_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 # web_logs 上报滑动窗口限速（2026-09-16 深测 P3）：/api/web_logs 曾无限速，
 # 匿名/任意身份可高频刷盘（logs/web-client.log 无界增长）。600 行/分钟封顶。
-_weblog_times: deque = deque(maxlen=600)
+# P3-A（2026-09-17 全量 debug）改 per-identity：旧版单 deque 全局共享——一个
+# 身份打满 600/min 即压掉所有调用方的诊断通道；改 dict[identity]→deque，
+# 身份键=user:<id>/machine/anon，容量与窗口继承原值。
+_weblog_times: dict[str, deque] = {}
+
+
+# P3-C（2026-09-17 全量 debug）：加固模式漏配 LIVEKIT_API_SECRET 的首次告警旗标
+# （进程内一次即可——每次请求都告警会刷屏）。
+_webhook_secret_warned = False
 
 
 def _verify_livekit_webhook(request: Request, body: bytes) -> bool:
     """LiveKit webhook 官方验签：Authorization Bearer JWT（HS256/LIVEKIT_API_SECRET）
-    + video.webhook grant + sha256(body) 摘要（2026-09-16 深测 P2）。"""
+    + video.webhook grant + sha256(body) 摘要（2026-09-16 深测 P2）。
+
+    P3-C：auth-on（BOK_AUTH_REQUIRED=1）下 secret 为空=配置事故——伪造
+    participant_left 可触发 LiveKit 云 API 放大调用，不再 fail-open，401 拒收
+    （detail 指明漏配项）；双关 auth-off 与 CP-token-only 保留放行+打点（后者
+    行为被 tests/test_debug_sweep.py::test_webhook_bypasses_cp_token_gate 钉死
+    ——F2 修复语义「中间件/端点不得拦无 LiveKit 联调形态的 webhook」优先）。
+    """
     import hashlib
 
     import jwt as _pyjwt
 
+    global _webhook_secret_warned
     secret = getattr(app.state, "lk_secret", "") or os.environ.get("LIVEKIT_API_SECRET", "")
     if not secret:
+        if auth_required():
+            if not _webhook_secret_warned:
+                _webhook_secret_warned = True
+                control_log.warning(
+                    "webhook_secret_missing_hardened",
+                    extra={"event": "webhook.secret_missing",
+                           "data": {"hint": "auth-on 要求 LIVEKIT_API_SECRET，未配置前 webhook 一律 401"}},
+                )
+            raise HTTPException(
+                status_code=401,
+                detail="webhook secret not configured — LIVEKIT_API_SECRET is required when auth is hardened",
+            )
         control_log.warning("webhook_unsigned_accepted", extra={"event": "webhook.unsigned"})
         return True
     token = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
@@ -3223,7 +3758,8 @@ async def livekit_webhook(request: Request) -> dict:
     # participant_left 会触发最多 3 轮 LiveKit 云 API 放大调用 + _redispatch_locks
     # 无界增长。官方姿势：LiveKit server 以 LIVEKIT_API_SECRET 签 JWT（HS256，
     # video.webhook grant）并在 claim 里带 sha256(body) 摘要——双验。
-    # LIVEKIT_API_SECRET 未配置（本地无 LiveKit 联调）→ 放行并打点，生产必配。
+    # LIVEKIT_API_SECRET 未配置：双关 auth-off（本地无 LiveKit 联调）放行并打点；
+    # 加固模式属配置事故 → P3-C 起 401 拒收（详见 _verify_livekit_webhook）。
     raw = await request.body()
     if not _verify_livekit_webhook(request, raw):
         raise HTTPException(status_code=401, detail="invalid webhook signature")
@@ -3423,20 +3959,18 @@ def reports_usage(request: Request, account_id: str = "acc-001") -> dict:
     _gate_page(request, "reports")
     account_id = scoped_account(request, account_id)
     calls = _repo().list_calls(account_id, "")
-    # 真实用量优先：官方 SessionReport 的逐模型 input/output tokens；
-    # 没有上报的旧通话才回退「轮次数」估算（口径见字段名后缀）。
+    # 真实用量优先：官方 SessionReport 的逐模型 input/output tokens；P1-A 起
+    # 一通通话可能有多份报告（B 线 fwd/rev 双 worker 各一份，_iter_call_reports
+    # 合并视图）——数值逐份累加；没有上报的旧通话才回退「轮次数」估算（口径见
+    # 字段名后缀）。
     llm_tokens = 0
     estimated_calls = 0
     for c in calls:
-        raw = c.get("session_report") or ""
         tokens = 0
-        if raw:
-            try:
-                for u in json.loads(raw).get("usage") or []:
-                    if u.get("type") == "llm_usage":
-                        tokens += int(u.get("input_tokens") or 0) + int(u.get("output_tokens") or 0)
-            except Exception:
-                tokens = 0
+        for report in _iter_call_reports(c):
+            for u in report.get("usage") or []:
+                if u.get("type") == "llm_usage":
+                    tokens += int(u.get("input_tokens") or 0) + int(u.get("output_tokens") or 0)
         if tokens:
             llm_tokens += tokens
         else:
@@ -3566,6 +4100,9 @@ def supervisor_listen(call_id: str, request: Request) -> dict:
 def supervisor_listen_stop(call_id: str, req: ListenStopRequest, request: Request) -> dict:
     """旁听结束回执：补一条带时长的审计（纯留痕，不改通话状态）。"""
     require_role(request, "admin", "root")
+    # 与 join/listen/pause/resume 同款越权口径:404 不泄露他账号通话存在性
+    # (2026-09-17 全量 debug F8——此前可对他账号 call_id 注入审计行)。
+    deny_cross_account(request, _repo().get_call(call_id))
     call = _repo().get_call(call_id) or {}
     _audit("supervisor.listen.stop", subject_type="call", subject_id=call_id,
            account_id=str(call.get("account_id") or ""), call_id=call_id,
@@ -3574,7 +4111,7 @@ def supervisor_listen_stop(call_id: str, req: ListenStopRequest, request: Reques
 
 
 @app.post("/api/web_logs")
-async def web_logs(payload: dict) -> dict:
+async def web_logs(payload: dict, request: Request) -> dict:
     """web 客户端(浏览器侧)关键事件落盘——同传控制台的设备枚举/自动分配/sink 路由/
     麦克风开关等决策只发生在浏览器里,服务端日志全然看不见(2026-09-12 同传输出
     路由排障多轮全靠排除法实证)。JSON 行追加 logs/web-client.log,与 agent.log 同
@@ -3583,10 +4120,19 @@ async def web_logs(payload: dict) -> dict:
 
     import time as _t
 
+    # P3-A：限速窗 per-identity（user:<id>/machine/anon）——web 端诊断保留 user
+    # 可写，但一个身份打满窗口不再挤占其他调用方额度。
+    _wl_ident = current_identity(request)
+    _wl_key = (
+        f"user:{_wl_ident.user_id}" if _wl_ident is not None
+        else "machine" if getattr(request.state, "machine", False)
+        else "anon"
+    )
     now = _t.time()
-    if len(_weblog_times) >= 600 and now - _weblog_times[0] < 60:
+    dq = _weblog_times.setdefault(_wl_key, deque(maxlen=600))
+    if len(dq) >= 600 and now - dq[0] < 60:
         return {"ok": False, "reason": "rate_limited"}  # 600 行/分钟上限,防刷盘
-    _weblog_times.append(now)
+    dq.append(now)
 
     event = str(payload.get("event") or "")[:80]
     if not event:

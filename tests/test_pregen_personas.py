@@ -81,11 +81,12 @@ def test_fillers_jobs_per_persona_own_language_pool():
         {"id": "pen", "language": "en", "reference_audio": '{"en":"Ven"}'},
     ]
     jobs = pregen_tts._fillers_jobs(personas, _MANIFEST, {}, "single")
-    # 每人设只取其语言对应池;text 原样透传(含 <#x#> 停顿标记)。
+    # 每人设只取其语言对应池;text 原样透传(含 <#x#> 停顿标记);emotion 空=
+    # 垫话不下发情绪(2026-09-16 Job 四元组:persona, lang, text, emotion)。
     assert jobs == [
-        (personas[0], "zh", "好的，您稍等。"),
-        (personas[0], "zh", "嗯<#0.3#>让我看下。"),
-        (personas[1], "en", "Sure, one moment."),
+        (personas[0], "zh", "好的，您稍等。", ""),
+        (personas[0], "zh", "嗯<#0.3#>让我看下。", ""),
+        (personas[1], "en", "Sure, one moment.", ""),
     ]
 
 
@@ -126,8 +127,8 @@ def test_qa_jobs_default_one_persona_per_lang():
         _QA_ROWS, [], lang_personas, all_personas=False, tts_cfg={}, voice_mode="single"
     )
     assert jobs == [
-        (lang_personas["zh"], "zh", "我们九点上班。"),
-        (lang_personas["cantonese"], "cantonese", "我哋九點開工。"),
+        (lang_personas["zh"], "zh", "我们九点上班。", ""),
+        (lang_personas["cantonese"], "cantonese", "我哋九點開工。", ""),
     ]
 
 
@@ -144,9 +145,9 @@ def test_qa_jobs_all_personas_covers_every_persona_with_voice():
     # cantonese 条目:pcanto 直取;pzh 缺 cantonese 键回落 zh 键=运行时同款回落
     # (运行时同人设同语言解析出同一音色,该组合物化后照样命中)。
     assert jobs == [
-        (personas[0], "zh", "我们九点上班。"),
-        (personas[0], "cantonese", "我哋九點開工。"),
-        (personas[1], "cantonese", "我哋九點開工。"),
+        (personas[0], "zh", "我们九点上班。", ""),
+        (personas[0], "cantonese", "我哋九點開工。", ""),
+        (personas[1], "cantonese", "我哋九點開工。", ""),
     ]
 
 

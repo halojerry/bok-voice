@@ -1,23 +1,22 @@
-"""fire-and-forget 任务强引用池(task_pool)与调用点收编单测。
+"""fire-and-forget 任务收编回归门禁(2026-09-18,A-F4 收编)。
 
-debug 收编 A-F4 缓项(2026-09-18):裸 `create_task` 的任务只被事件循环弱引用,
-GC/teardown 可在中途掐掉("Task was destroyed")=静默丢轮。结算域此前已用
-`_SETTLE_TASKS`/`_spawn_report` 的「模块级 set + 完成自清」姿势修过同族问题
-(AGENTS.md debug 收编 ⑦);本档钉死剩余调用点的收编:
+背景:裸 `create_task` 的任务只被事件循环弱引用,GC/teardown 可在中途掐掉
+("Task was destroyed")=静默丢轮。结算域与 2026-09-17 全量 debug F4/P2-A 已把
+apps/agent 全部调用点收编进强引用池(`_spawn_report`/`_SETTLE_TASKS`/
+`_spawn_pooled_task`/`_spawn_bg`)。本档钉住两件不随实现漂移的事:
 
-- spawn 的任务在完成前一直被模块级 `_BACKGROUND_TASKS` 持有,完成后自清;
-- 异常任务打点 BACKGROUND_TASK_ERR 不外抛、照样自清;
-- 无事件循环(同步测试上下文)spawn 返回 None 且协程被关闭(不炸不警告);
-- 取消路径:CancelledError 是 BaseException,`except Exception` 接不住——
-  WA 上报的取消路径必须回滚 `_wa_reported` 键(否则该号永远不再补报);
-- 源码扫描:apps/agent 内不得再有「结果不持有」的裸 create_task
-  (test_cantonese_terminology 同款全仓扫描口径)。
+- 源码扫描:apps/agent 不得再有「结果不持有」的裸 create_task——新调用点必须
+  走既有池化 helper / 持有结果 / 带 FIRE_FORGET_EXEMPT: 标记(test_cantonese_
+  terminology 同款全仓扫描口径);
+- WA 上报 `_report_whatsapp_once` 的取消/失败回滚语义:CancelledError 是
+  BaseException,`except Exception` 接不住——teardown 掐杀在途请求时若无独立
+  捕获回滚,`_wa_reported` 键被永久占用=这个号永远不再补报(AGENTS.md ⑦)。
+  上报体从 entrypoint 内联闭包抽出为模块级函数,离线单测钉死。
 """
 
 from __future__ import annotations
 
 import asyncio
-import inspect
 import re
 import sys
 from pathlib import Path
@@ -25,93 +24,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps" / "agent"))
 
 import pytest  # noqa: E402
-
-from agent_runtime import task_pool  # noqa: E402
-
-
-# ---------------------------------------------------------------------------
-# task_pool.spawn 基础语义
-# ---------------------------------------------------------------------------
-
-
-def test_spawn_holds_task_until_done_then_discards():
-    """完成前一直被模块级强引用池持有(裸 create_task 的根因=只有弱引用)。"""
-
-    async def main():
-        started = asyncio.Event()
-        release = asyncio.Event()
-
-        async def work():
-            started.set()
-            await release.wait()
-
-        task = task_pool.spawn(work(), label="held")
-        assert task is not None
-        await started.wait()
-        assert task in task_pool._BACKGROUND_TASKS
-        release.set()
-        await task
-        for _ in range(3):  # 让 done 回调(自清)在循环里跑完
-            await asyncio.sleep(0)
-        assert task not in task_pool._BACKGROUND_TASKS
-
-    asyncio.run(main())
-
-
-def test_spawn_discards_after_exception_and_logs(capsys):
-    """异常任务打点不外抛(fire-and-forget 失败不阻主流程)且照样自清。"""
-
-    async def main():
-        async def boom():
-            raise RuntimeError("boom-x")
-
-        task = task_pool.spawn(boom(), label="boom-label")
-        assert task is not None
-        with pytest.raises(RuntimeError):
-            await task
-        for _ in range(3):
-            await asyncio.sleep(0)
-        assert task not in task_pool._BACKGROUND_TASKS
-        assert "BACKGROUND_TASK_ERR boom-label" in capsys.readouterr().out
-
-    asyncio.run(main())
-
-
-def test_spawn_discards_after_cancel():
-    """取消路径同样自清——池不积账(取消不是池要保的东西,只是别中途 GC)。"""
-
-    async def main():
-        started = asyncio.Event()
-
-        async def hang():
-            started.set()
-            await asyncio.sleep(60)
-
-        task = task_pool.spawn(hang(), label="hang")
-        assert task is not None
-        await started.wait()
-        assert task in task_pool._BACKGROUND_TASKS
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        for _ in range(3):
-            await asyncio.sleep(0)
-        assert task not in task_pool._BACKGROUND_TASKS
-
-    asyncio.run(main())
-
-
-def test_spawn_without_loop_returns_none_and_closes_coro():
-    """无事件循环(测试/同步上下文)安全:返回 None 且协程被关闭,不留
-    never-awaited 警告——旧调用点的 try/except 兜底由此内聚进 spawn。"""
-
-    async def work():
-        pytest.fail("coro must not run without a loop")
-
-    coro = work()
-    assert inspect.getcoroutinestate(coro) == "CORO_CREATED"
-    assert task_pool.spawn(coro, label="noloop") is None
-    assert inspect.getcoroutinestate(coro) == "CORO_CLOSED"
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +59,7 @@ def test_wa_report_cancelled_rolls_back_reported_key():
 
 
 def test_wa_report_failure_rolls_back_and_logs(capsys):
-    """失败路径维持旧行为:回滚键 + 打点(server 幂等,后续轮补报)。"""
+    """失败路径:回滚键 + 打点(server 幂等,后续轮补报)。"""
 
     from agent_runtime.agent import _report_whatsapp_once
 
@@ -186,6 +98,16 @@ def test_wa_report_success_keeps_key(capsys):
     assert "[whatsapp] report failed" not in capsys.readouterr().out
 
 
+def test_wa_report_site_wires_module_function():
+    """entrypoint 的 WA 上报调用点必须走 _report_whatsapp_once(语义单测才有意义)。
+    防内联闭包复活:闭包版行为相同但不可测,F4 语义会重新退化成无钉状态。"""
+    src = (Path(__file__).resolve().parents[1] / "apps" / "agent" / "agent_runtime"
+           / "agent.py").read_text(encoding="utf-8")
+    assert src.count("_report_whatsapp_once(") >= 2  # 定义 + 调用点
+    call_site = src[src.index("async def entrypoint"):]
+    assert "_report_whatsapp_once(" in call_site
+
+
 # ---------------------------------------------------------------------------
 # 源码扫描:apps/agent 不得再有裸 fire-and-forget create_task
 # ---------------------------------------------------------------------------
@@ -195,53 +117,61 @@ _ASSIGN_RE = re.compile(r"(?:^|[^=!<>+\-*/%])=(?!=)")
 _EXEMPT_MARKER = "FIRE_FORGET_EXEMPT:"
 
 
-def _bare_create_task_offenders() -> list[str]:
-    """扫 apps/agent 全部源码:每个 create_task 调用点必须「结果被持有」
-    (赋值/入池/列表)或带 FIRE_FORGET_EXEMPT: 标记;task_pool.py 是唯一包装点。
-    """
+def _bare_create_task_offenders(root: Path) -> list[str]:
+    """扫目录内全部源码:每个 create_task 调用点必须「结果被持有」
+    (赋值/入池/列表)或带 FIRE_FORGET_EXEMPT: 标记(行内/上一行注释均可)。"""
     offenders: list[str] = []
-    for path in sorted(AGENT_ROOT.rglob("*.py")):
-        rel = path.relative_to(AGENT_ROOT.parent).as_posix()
-        if rel.endswith("task_pool.py"):
-            continue
-        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    for path in sorted(root.rglob("*.py")):
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for lineno, line in enumerate(lines, start=1):
             stripped = line.strip()
             if stripped.startswith("#") or "create_task(" not in line:
                 continue
-            if _EXEMPT_MARKER in line:
+            prev = lines[lineno - 2].strip() if lineno >= 2 else ""
+            if _EXEMPT_MARKER in line or _EXEMPT_MARKER in prev:
                 continue
             before = line.split("create_task(")[0]
             if _ASSIGN_RE.search(before):
                 continue
+            rel = path.relative_to(root.parent).as_posix()
             offenders.append(f"{rel}:{lineno}: {stripped}")
     return offenders
 
 
 def test_no_bare_fire_and_forget_in_agent_runtime():
-    offenders = _bare_create_task_offenders()
+    offenders = _bare_create_task_offenders(AGENT_ROOT)
     assert not offenders, (
         "裸 create_task(结果不持有)只被事件循环弱引用,GC/teardown 中途可掐掉=静默丢轮。"
-        "改用 agent_runtime.task_pool.spawn() 入模块级强引用池;确属有意 detach 的"
-        f"加 FIRE_FORGET_EXEMPT: 标记说明理由:\n" + "\n".join(offenders)
+        "改用既有池化 helper(_spawn_report/_SETTLE_TASKS/_spawn_pooled_task/_spawn_bg)"
+        f"或持有结果;确属有意 detach 的加 FIRE_FORGET_EXEMPT: 标记说明理由:\n"
+        + "\n".join(offenders)
     )
 
 
 def test_scanner_catches_bare_call(tmp_path):
-    """扫描器本身要能抓裸调用(防扫描器退化成恒绿)。"""
+    """扫描器本身要能抓裸调用(防扫描器退化成恒绿);持有/豁免形态正确放行。"""
 
     bare = tmp_path / "x.py"
     bare.write_text("async def f():\n    asyncio.create_task(g())\n", encoding="utf-8")
     held = tmp_path / "y.py"
     held.write_text("async def f():\n    t = asyncio.create_task(g())\n", encoding="utf-8")
+    exempt = tmp_path / "z.py"
+    exempt.write_text(
+        "async def f():\n"
+        "    asyncio.create_task(g())  # FIRE_FORGET_EXEMPT: held downstream\n",
+        encoding="utf-8",
+    )
 
     def scan(root: Path) -> list[str]:
         out = []
         for path in sorted(root.rglob("*.py")):
-            for lineno, line in enumerate(
-                path.read_text(encoding="utf-8").splitlines(), start=1
-            ):
+            lines = path.read_text(encoding="utf-8").splitlines()
+            for lineno, line in enumerate(lines, start=1):
                 stripped = line.strip()
                 if stripped.startswith("#") or "create_task(" not in line:
+                    continue
+                prev = lines[lineno - 2].strip() if lineno >= 2 else ""
+                if _EXEMPT_MARKER in line or _EXEMPT_MARKER in prev:
                     continue
                 before = line.split("create_task(")[0]
                 if _ASSIGN_RE.search(before):

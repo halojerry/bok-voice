@@ -1,15 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { ErrorState, LoadingState } from "@/components/app-shell";
 import CannedAuditionCard from "@/components/canned-audition";
-import DesktopStatus from "@/components/desktop-status";
 import { SETTING_CARDS, POLICY_META, DEFAULT_PROVIDER, type ProviderKind, type FieldMeta } from "@/lib/settings-meta";
 import { previewLangForVoice } from "@/lib/minimax-voices";
+import { startRecording, type RecorderHandle } from "@/lib/recorder";
 import {
-  applyOutputDevice,
-  isTauriShell,
   listAudioDevicesOf,
   requestMicPermission,
   savedMicDevice,
@@ -26,7 +24,7 @@ type ProviderForm = Record<string, unknown> & { provider?: string };
 const EMPTY_FORM: Record<ProviderKind, ProviderForm> & { policy: string } & { sip: ProviderForm } = {
   asr: { provider: DEFAULT_PROVIDER.asr, language_mode: "auto", language: "" },
   llm: { provider: DEFAULT_PROVIDER.llm, local_model: "" },
-  tts: { provider: DEFAULT_PROVIDER.tts, voice_mode: "single", speaker: "", sample_rate: 24000 },
+  tts: { provider: DEFAULT_PROVIDER.tts, voice_mode: "single", speaker: "", sample_rate: 24000, minimax_clones_json: "[]" },
   vad: { provider: DEFAULT_PROVIDER.vad, max_buffered_speech: 15, min_speech_duration: 0.15, min_silence_duration: 0.45, sensitivity: 0.75, interruption: true },
   // 外呼（SIP）段：与 business-db default_settings()["sip"] 逐键同形。
   sip: { mode: "mock", trunk_id: "", address: "", auth_username: "", auth_password: "", numbers: [], ringing_timeout_s: 30, max_call_duration_s: 600 },
@@ -489,15 +487,13 @@ function AudioDevicesCard() {
     void refresh();
   }, [refresh]);
 
-  const canSetOutput = isTauriShell() || webCanSwitchOutput();
+  const canSetOutput = webCanSwitchOutput();
 
   return (
     <section className="card">
       <span className="label">音频设备</span>
       <p className="mt-1 text-xs muted">
-        {isTauriShell()
-          ? "桌面版扬声器切换的是系统默认输出设备（A 线通话与 B 线同传都会跟随）。"
-          : "浏览器模式下仅 Chromium 内核支持切换扬声器输出。"}
+        浏览器模式下仅 Chromium 内核支持切换扬声器输出；所选输出在接通通话时应用。
       </p>
       <div className="mt-3 space-y-3">
         <div>
@@ -540,8 +536,9 @@ function AudioDevicesCard() {
               onChange={(e) => {
                 const id = e.target.value;
                 setOutId(id);
+                // 纯持久化：setSinkId 需要 room 已连接，接通通话时自动应用
+                //（CallStudio join-time / interpret 一体台按端恢复）。
                 saveOutputDevice(id);
-                void applyOutputDevice(id);
               }}
             >
               {outs.length === 0 && <option value="">未检测到输出设备</option>}
@@ -589,6 +586,159 @@ function FieldRow({
   );
 }
 
+/** MiniMax 云端克隆清单条目（tts.minimax_clones_json，路线 B）。 */
+type MinimaxClone = { voice_id: string; label?: string; sample_lang?: string; created_at?: string; activated?: boolean };
+
+function parseClones(raw: unknown): MinimaxClone[] {
+  try {
+    const data = JSON.parse(String(raw ?? "[]"));
+    return Array.isArray(data) ? (data as MinimaxClone[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 「克隆我的声音」面板（MiniMax 云端 voice clone）：录音/上传参考音频（官方要求
+ * ≥10s）→ CP 两步克隆（files/upload → voice_clone）。拍板「先克隆不激活」：
+ * 克隆 0 费用；MiniMax 规则 7 天内未用于合成会删、首次合成收 ¥9.9/音色——
+ * 试听/首次会话使用即激活。
+ */
+function MinimaxClonePanel({ clones, onChange }: { clones: MinimaxClone[]; onChange: (next: MinimaxClone[]) => void }) {
+  const [label, setLabel] = useState("");
+  const [refFile, setRefFile] = useState<File | null>(null);
+  const [recording, setRecording] = useState(false);
+  const [recSec, setRecSec] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const recRef = useRef<RecorderHandle | null>(null);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  async function toggleRecording() {
+    setErr("");
+    if (recording) {
+      const handle = recRef.current;
+      recRef.current = null;
+      if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+      setRecording(false);
+      setRecSec(0);
+      if (!handle) return;
+      try {
+        const wav = await handle.stop();
+        if (wav.size < 4096) { setErr("录音太短，官方要求参考音频至少 10 秒。"); return; }
+        setRefFile(new File([wav], `clone-ref-${Date.now()}.wav`, { type: "audio/wav" }));
+      } catch (e) { setErr(`录音失败：${String(e)}`); }
+      return;
+    }
+    try {
+      recRef.current = await startRecording(60000);
+      setRecording(true);
+      setRecSec(0);
+      timerRef.current = setInterval(() => setRecSec((s) => s + 1), 1000);
+    } catch (e) { setErr(`无法开始录音：${String(e)}`); }
+  }
+
+  async function submit() {
+    setErr("");
+    if (!refFile) { setErr("请先录音或上传参考音频（≥10 秒，wav/mp3/m4a）。"); return; }
+    setBusy(true);
+    try {
+      const body = new FormData();
+      body.append("file", refFile);
+      body.append("label", label || `我的声音-${new Date().toLocaleDateString()}`);
+      body.append("sample_lang", "zh");
+      const created = await api.registerMinimaxVoice(body);
+      onChange([...clones, {
+        voice_id: String(created.voice_id ?? ""),
+        label: String(created.label ?? label ?? ""),
+        sample_lang: String(created.sample_lang ?? "zh"),
+        created_at: String(created.created_at ?? ""),
+        activated: false,
+      }]);
+      setRefFile(null);
+      setLabel("");
+    } catch (e) {
+      setErr(friendlyErrorText(String(e)));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove(voiceId: string) {
+    setErr("");
+    setBusy(true);
+    try {
+      await api.deleteMinimaxVoice(voiceId);
+      onChange(clones.filter((c) => c.voice_id !== voiceId));
+    } catch (e) {
+      setErr(friendlyErrorText(String(e)));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function preview(voiceId: string, lang: string) {
+    setErr("");
+    setBusy(true);
+    try {
+      const text = lang === "en" ? "Hello, this is my cloned voice." : "你好，这是用我的声音克隆的音色。";
+      const blob = await api.previewTts({ provider: "minimax", text, voice: voiceId, language: lang || "zh", sample_rate: 24000 });
+      new Audio(URL.createObjectURL(blob)).play().catch(() => {});
+    } catch (e) {
+      setErr(friendlyErrorText(String(e)));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <details className="rounded-lg border border-(--card-border) p-2 text-sm">
+      <summary className="cursor-pointer text-xs muted hover:text-accent">克隆我的声音（MiniMax 云端）</summary>
+      <p className="mt-2 text-xs muted">
+        念 10 秒~1 分钟干净人声（普通话/粤语样本均可），克隆成云端音色后可在分语言音色与
+        同传会话中选用。<strong>克隆本身免费</strong>；MiniMax 规则：7 天内未用于合成会过期，
+        首次合成（试听/会话使用）激活并计费约 ¥9.9/音色。需账号完成实名认证。
+      </p>
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <button className="btn-ghost text-xs" disabled={busy} onClick={toggleRecording}>
+          {recording ? `停止录音（${recSec}s）` : "录音 10 秒+"}
+        </button>
+        <label className="btn-ghost cursor-pointer text-xs">
+          上传音频
+          <input type="file" accept="audio/wav,audio/mpeg,audio/mp4" className="hidden"
+            onChange={(e) => { const f = e.target.files?.[0]; if (f) setRefFile(f); }} />
+        </label>
+        <input
+          className="w-40 rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--accent)"
+          placeholder="标签（如：我的声音）"
+          value={label}
+          onChange={(e) => setLabel(e.target.value)}
+        />
+        <button className="btn-primary text-xs" disabled={busy || !refFile} onClick={submit}>
+          {busy ? "处理中…" : "克隆到 MiniMax"}
+        </button>
+        {refFile && <span className="text-xs muted">{refFile.name}</span>}
+      </div>
+      {clones.length > 0 && (
+        <ul className="mt-2 space-y-1">
+          {clones.map((c) => (
+            <li key={c.voice_id} className="flex flex-wrap items-center gap-2 text-xs">
+              <span className="font-medium">{c.label || c.voice_id}</span>
+              {!c.activated && <span className="rounded bg-amber-500/15 px-1 text-amber-500">未激活</span>}
+              <span className="muted">{c.voice_id}</span>
+              <button className="btn-ghost px-1 py-0 text-xs" disabled={busy}
+                onClick={() => preview(c.voice_id, c.sample_lang || "zh")}>试听（激活）</button>
+              <button className="btn-ghost px-1 py-0 text-xs text-red-400" disabled={busy}
+                onClick={() => remove(c.voice_id)}>删除</button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {err && <p className="mt-2 text-xs text-red-400">{err}</p>}
+    </details>
+  );
+}
+
 /**
  * 语音与凭据卡（主视图唯一保留的引擎卡）：provider + Key + 默认音色 + 语气指令。
  * 分发形态下这些凭据由云端下发（spec §9）；单机形态仍从这里改。
@@ -601,6 +751,16 @@ function VoiceCard({ value, onChange }: { value: ProviderForm; onChange: (next: 
   const simple = visible.filter((f) => VOICE_SIMPLE_KEYS.includes(f.key));
   const rest = visible.filter((f) => !VOICE_SIMPLE_KEYS.includes(f.key));
   const advanced = meta.fields.filter((f) => f.advanced && (!f.providers || f.providers.includes(provider)));
+  // MiniMax 云端克隆清单（存 tts.minimax_clones_json）——合并进分语言三键下拉，
+  // 全语言槽可选（克隆音色无语言绑定，language_boost 按请求生效）。
+  const clones = parseClones(value.minimax_clones_json);
+  const cloneOptions = clones.map((c) => ({ value: String(c.voice_id), label: `克隆 · ${c.label || c.voice_id}` }));
+  const withClones = (field: FieldMeta): FieldMeta =>
+    cloneOptions.length > 0 && field.key.startsWith("speaker_")
+      ? { ...field, options: [...(field.options ?? []), ...cloneOptions] }
+      : field;
+  const setClones = (next: MinimaxClone[]) =>
+    onChange({ ...value, minimax_clones_json: JSON.stringify(next) });
   return (
     <section className="card">
       <span className="label">语音与凭据</span>
@@ -625,7 +785,7 @@ function VoiceCard({ value, onChange }: { value: ProviderForm; onChange: (next: 
         {simple.map((field) => (
           <FieldRow
             key={field.key}
-            field={field}
+            field={withClones(field)}
             kind="tts"
             provider={provider}
             value={value[field.key]}
@@ -639,7 +799,7 @@ function VoiceCard({ value, onChange }: { value: ProviderForm; onChange: (next: 
               {[...rest, ...advanced].map((field) => (
                 <FieldRow
                   key={field.key}
-                  field={field}
+                  field={withClones(field)}
                   kind="tts"
                   provider={provider}
                   value={value[field.key]}
@@ -649,6 +809,7 @@ function VoiceCard({ value, onChange }: { value: ProviderForm; onChange: (next: 
             </div>
           </details>
         )}
+        <MinimaxClonePanel clones={clones} onChange={setClones} />
       </div>
     </section>
   );
@@ -717,7 +878,7 @@ export default function SettingsPage() {
     <div>
       <div className="mb-8">
         <h1 className="page-title">设置</h1>
-        <p className="page-sub">语音与凭据 · 音频设备 · 外呼 · 本机服务</p>
+        <p className="page-sub">语音与凭据 · 音频设备 · 外呼</p>
       </div>
 
       {loading ? (
@@ -728,9 +889,6 @@ export default function SettingsPage() {
           <AudioDevicesCard />
           <SipCard value={form.sip ?? {}} onChange={(next) => setForm({ ...form, sip: next })} />
           <CannedAuditionCard />
-          <div className="lg:col-span-2">
-            <DesktopStatus />
-          </div>
           <details className="rounded-xl border border-(--card-border) bg-(--card) p-4 lg:col-span-2">
             <summary className="cursor-pointer text-sm font-medium">
               开发者参数（ASR / LLM / VAD / 运行策略）

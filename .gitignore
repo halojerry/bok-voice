@@ -9,10 +9,6 @@ node_modules
 apps/web/out/
 release-artifacts/
 dist/
-desktop/runtime/
-desktop/src-tauri/binaries/
-!desktop/dist/
-!desktop/dist/index.html
 build/
 *.egg-info/
 .env
@@ -45,3 +41,13 @@ tests/fixtures/audio/e2e_multi/
 decks/
 .mimosa/
 .v2c/
+
+# 本地运行时产物（2026-09-17 会话整理）：CP 运行数据/报表/探针输出/话术包/
+# 可视化检查产物——本机工作面，公开仓不进库。
+apps/control-plane/data/
+reports/
+scripts/.probe_*.json
+docs/*.tar.gz
+docs/runtime-architecture*.html
+docs/runtime-architecture*.png
+docs/runtime-architecture*.json

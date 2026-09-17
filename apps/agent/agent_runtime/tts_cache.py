@@ -22,7 +22,7 @@ import os
 import re
 import sys
 import time
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, Callable
 from pathlib import Path
 
 from livekit.agents import APIConnectOptions, tts, utils
@@ -63,7 +63,10 @@ def normalize_cache_text(text: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
-def cache_key(text: str, *, voice_id: str, model: str, sample_rate: int, speed: float = 1.0) -> str:
+def cache_key(
+    text: str, *, voice_id: str, model: str, sample_rate: int, speed: float = 1.0,
+    emotion: str = "",
+) -> str:
     norm = normalize_cache_text(text)
     raw = f"{norm}\x1f{voice_id}\x1f{model}\x1f{int(sample_rate)}"
     # 语速维度(W2,2026-09-11):speed≠1.0 才进 key——存量 1.0 条目(en/旧 zh)键
@@ -71,6 +74,13 @@ def cache_key(text: str, *, voice_id: str, model: str, sample_rate: int, speed: 
     # 同文本不同速度必须不同条目)。
     if abs(float(speed) - 1.0) > 1e-6:
         raw = f"{raw}\x1f{float(speed):g}"
+    # 情绪维度(2026-09-16 罐头带情绪):emotion 非空才进 key(sparse,同 speed
+    # 先例)——存量无情绪条目键不变零失效;pregen 物化的行级情绪(sad/calm…)
+    # 烧在音频里,同文本不同情绪必须不同条目。探针实证 emotion 属合成期参数
+    # (bidi task_continue 中途换挡被服务端静默无视),故只存在于物化时刻。
+    emo = str(emotion or "").strip().lower()
+    if emo:
+        raw = f"{raw}\x1fe{emo}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
@@ -127,9 +137,12 @@ class TtsAudioCache:
         env_max = os.environ.get(_MAX_ENTRIES_ENV, "").strip()
         self.max_entries = int(env_max) if env_max else (max_entries or _DEFAULT_MAX_ENTRIES)
 
-    def key_for(self, text: str, *, voice: str, model: str, speed: float = 1.0) -> str:
+    def key_for(
+        self, text: str, *, voice: str, model: str, speed: float = 1.0, emotion: str = ""
+    ) -> str:
         return cache_key(
-            text, voice_id=voice or "", model=model or "", sample_rate=self.sample_rate, speed=speed
+            text, voice_id=voice or "", model=model or "", sample_rate=self.sample_rate,
+            speed=speed, emotion=emotion,
         )
 
     def _pcm_path(self, key: str) -> Path:
@@ -152,12 +165,14 @@ class TtsAudioCache:
         except OSError:
             return None
 
-    def lookup(self, text: str, *, voice: str, model: str, speed: float = 1.0) -> bytes | None:
-        return self.get(self.key_for(text, voice=voice, model=model, speed=speed))
+    def lookup(
+        self, text: str, *, voice: str, model: str, speed: float = 1.0, emotion: str = ""
+    ) -> bytes | None:
+        return self.get(self.key_for(text, voice=voice, model=model, speed=speed, emotion=emotion))
 
     def store(
         self, key: str, pcm: bytes, *, text: str, voice: str, model: str, pin: bool = False,
-        speed: float = 1.0,
+        speed: float = 1.0, emotion: str = "",
     ) -> bool:
         """原子写入+LRU 淘汰;任何失败静默 False(缓存永不影响播放)。
 
@@ -184,6 +199,7 @@ class TtsAudioCache:
                 "model": model or "",
                 "sample_rate": self.sample_rate,
                 "speed": float(speed),
+                "emotion": str(emotion or "").strip().lower(),
                 "bytes": len(pcm),
                 "stored_at": time.time(),
             }
@@ -232,11 +248,21 @@ def _trim_lead_silence_safe(pcm: bytes, sample_rate: int) -> bytes:
 
 
 class _CachedChunkedStream(tts.ChunkedStream):
-    """缓存命中:本地 PCM 组流,零云调用。"""
+    """缓存命中:本地 PCM 组流,零云调用。
 
-    def __init__(self, *, tts_: tts.TTS, text: str, pcm: bytes):
+    on_first_audio(2026-09-17 RC2 watchdog 盲区修复):首帧推流时 fire 恰好一次
+    (幂等旗标,同 _RelaySynthesizeStream 姿势)——watchdog 拆弹/垫话排序只认首
+    音频回调,缓存命中直念若不 fire,watchdog 对该轮回复隐身,4s 到点
+    force-interrupt 会掐死在途真回复(实测账本只剩 watchdog-ack 行)。客户
+    听不到的纯后台读(垫话 backfill tee 等)不传回调,零行为变化。
+    """
+
+    def __init__(self, *, tts_: tts.TTS, text: str, pcm: bytes,
+                 on_first_audio: Callable[[], None] | None = None):
         super().__init__(tts=tts_, input_text=text, conn_options=APIConnectOptions(max_retry=0))
         self._pcm = pcm
+        self._on_first_audio = on_first_audio
+        self._fired = False
 
     async def _run(self, output_emitter) -> None:
         output_emitter.initialize(
@@ -248,6 +274,13 @@ class _CachedChunkedStream(tts.ChunkedStream):
         )
         frame_bytes = int(self._tts.sample_rate / 5) * 2
         for off in range(0, len(self._pcm), frame_bytes):
+            if not self._fired:
+                self._fired = True
+                if self._on_first_audio is not None:
+                    try:
+                        self._on_first_audio()
+                    except Exception:  # noqa: BLE001 - 回调失败唔阻播放
+                        pass
             output_emitter.push(bytes(self._pcm[off : off + frame_bytes]))
         output_emitter.flush()
 
@@ -476,7 +509,11 @@ class CachedTTS(tts.TTS):
         pcm = self._cache.get(key)
         if pcm is not None:
             print(f"TTS_CACHE hit=1 key={key[:10]} chars={len(text)}", flush=True)
-            return _CachedChunkedStream(tts_=self, text=text, pcm=pcm)
+            # 命中直念同直播出首音频回调(RC2):watchdog/垫话排序靠它拆弹,盲区
+            # 会让 4s force-interrupt 掐死在途真回复。
+            return _CachedChunkedStream(
+                tts_=self, text=text, pcm=pcm, on_first_audio=self._fire_first_audio
+            )
         print(f"TTS_CACHE hit=0 key={key[:10]} chars={len(text)}", flush=True)
         voice = self.resolved_voice()
         if not voice:

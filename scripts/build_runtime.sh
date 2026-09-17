@@ -2,26 +2,25 @@
 # build_runtime.sh — assemble the self-contained runtime that ships in the app.
 #
 # Layout produced:
-#   desktop/runtime/python/            standalone CPython + platform deps
-#   desktop/runtime/llama/             Windows: llama-server.exe + cudart DLLs
-#   desktop/runtime/bline-node_modules/  B-line worker deps (ws)
-#   desktop/src-tauri/binaries/        externalBin: livekit-server, node
-#                                      (<name>-<target-triple>[.exe])
+#   runtime/python/                    standalone CPython + platform deps
+#   runtime/llama/                     Windows: llama-server.exe + cudart DLLs
+#   runtime/bline-node_modules/        B-line worker deps (ws)
+#   desktop/src-tauri/binaries/        Tauri externalBin staging: livekit-server,
+#                                      node (<name>-<target-triple>[.exe])
+#                                      (退役注：Tauri 拆除后此 staging 由
+#                                       runtime/ 直收，见 build_node_pkg 链)
 #
 # The staging dir is wiped first so cached/stale layouts (e.g. an old .venv)
 # can never leak into a release bundle.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-RUNTIME="$ROOT/desktop/runtime"
-BINARIES="$ROOT/desktop/src-tauri/binaries"
+RUNTIME="$ROOT/runtime"
 cd "$ROOT"
 
 echo "==> [runtime] cleaning staging dirs (avoid cache pollution)"
 rm -rf "$RUNTIME"
 mkdir -p "$RUNTIME"
-rm -rf "$BINARIES"
-mkdir -p "$BINARIES"
 
 # --- Detect platform -------------------------------------------------------
 case "$(uname -s)" in
@@ -103,13 +102,17 @@ fi
   apps/control-plane "apps/agent[livekit]"
 
 # --- Node (B-line worker) --------------------------------------------------
+# 退役注（2026-09-17）：原打进 Tauri externalBin staging，现按 bok.py
+# bundled_node() 的 runtime 契约直放 runtime/（win: node/node.exe，
+# mac/linux: node/bin/node）。
 NODE_VERSION="${NODE_VERSION:-22.23.2}"
 echo "==> [runtime] bundling Node ${NODE_VERSION}"
 if [ "$OS" = "win" ]; then
   NODE_URL="https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-win-x64.zip"
   curl -fsSL "$NODE_URL" -o "$RUNTIME/node.zip"
   (cd "$RUNTIME" && unzip -q node.zip && rm -f node.zip)
-  cp "$RUNTIME/node-v${NODE_VERSION}-win-x64/node.exe" "$BINARIES/node-${TRIPLE}.exe"
+  mkdir -p "$RUNTIME/node"
+  mv "$RUNTIME/node-v${NODE_VERSION}-win-x64/node.exe" "$RUNTIME/node/node.exe"
   rm -rf "$RUNTIME/node-v${NODE_VERSION}-win-x64"
 else
   NODE_ARCH="$ARCH"
@@ -120,18 +123,19 @@ else
   curl -fsSL "$NODE_URL" -o "$RUNTIME/node.tar.gz"
   tar -xzf "$RUNTIME/node.tar.gz" -C "$RUNTIME"
   rm -f "$RUNTIME/node.tar.gz"
-  if [ "$OS" = "mac" ]; then
-    cp "$RUNTIME/node-v${NODE_VERSION}-darwin-${NODE_ARCH}/bin/node" "$BINARIES/node-${TRIPLE}"
-    rm -rf "$RUNTIME/node-v${NODE_VERSION}-darwin-${NODE_ARCH}"
-  else
-    cp "$RUNTIME/node-v${NODE_VERSION}-linux-${NODE_ARCH}/bin/node" "$BINARIES/node-${TRIPLE}"
-    rm -rf "$RUNTIME/node-v${NODE_VERSION}-linux-${NODE_ARCH}"
-  fi
-  chmod +x "$BINARIES/node-${TRIPLE}"
+  mv "$RUNTIME/node-v${NODE_VERSION}-darwin-${NODE_ARCH}" "$RUNTIME/node" 2>/dev/null \
+    || mv "$RUNTIME/node-v${NODE_VERSION}-linux-${NODE_ARCH}" "$RUNTIME/node"
+  chmod +x "$RUNTIME/node/bin/node"
 fi
 
 # --- LiveKit server (official binary where available) ---------------------
-bash "$ROOT/scripts/build_livekit.sh" "$OS" "$TRIPLE" "$BINARIES"
+# 直放 runtime/livekit-server[.exe]（bok.py _embedded_livekit 契约路径）。
+bash "$ROOT/scripts/build_livekit.sh" "$OS" "$TRIPLE" "$RUNTIME"
+if [ "$OS" = "win" ]; then
+  mv -f "$RUNTIME/livekit-server-${TRIPLE}.exe" "$RUNTIME/livekit-server.exe"
+else
+  mv -f "$RUNTIME/livekit-server-${TRIPLE}" "$RUNTIME/livekit-server"
+fi
 
 # --- llama.cpp (Windows only) ----------------------------------------------
 if [ "$OS" = "win" ]; then
@@ -160,9 +164,6 @@ fi
 echo "==> [runtime] pruning bytecode caches (__pycache__ / *.pyc) …"
 find "$RUNTIME" -name "__pycache__" -type d -prune -exec rm -rf {} +
 find "$RUNTIME" \( -name "*.pyc" -o -name "*.pyo" \) -delete
-find "$BINARIES" -name "__pycache__" -type d -prune -exec rm -rf {} + 2>/dev/null || true
 
 echo "==> [runtime] done. runtime/ ="
 du -sh "$RUNTIME" 2>/dev/null || true
-echo "==> [runtime] externalBin/ ="
-ls -la "$BINARIES"

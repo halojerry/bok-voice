@@ -1,14 +1,12 @@
 "use client";
 
 /**
- * 音频输入/输出设备管理。
- * - 桌面壳（Tauri）：输入走 Web enumerateDevices（需先授权麦克风），输出走原生
- *   CoreAudio 系统默认输出切换（listAudioDevices/setSystemOutput）。
- * - 浏览器：输入走 enumerateDevices；输出仅在支持 setSinkId 的 Chromium 内核可用。
- * - 选择持久化到 localStorage（bok.audio.mic / bok.audio.out），重开 App 自动恢复。
+ * 音频输入/输出设备管理（纯浏览器；Tauri 桌面壳已退役，2026-09-17）。
+ * - 输入：enumerateDevices（需先授权麦克风）；采集用 WebRTC deviceId。
+ * - 输出：livekit switchActiveDevice("audiooutput")=setSinkId，仅 Chromium 内核
+ *   可靠（Safari/WKWebView 回退系统默认输出）。
+ * - 选择持久化到 localStorage（bok.audio.mic / bok.audio.out），接通时自动恢复。
  */
-import { isTauri, listAudioDevices, setSystemOutput, type AudioDevice } from "@/lib/tauri";
-
 export type AudioDeviceKind = "input" | "output";
 export interface AudioDeviceInfo {
   id: string;
@@ -18,7 +16,7 @@ export interface AudioDeviceInfo {
   /**
    * Chrome 的物理设备组 id：同一台设备的输入与输出**共用**一个 groupId，且不随 id 轮换
    * （蓝牙重连后 deviceId 会换、groupId 不变）。用于「两个角色是不是同一台物理设备」的
-   * 判定——只比设备名会把同型号的两支麦误判成同一台。原生枚举（Tauri）没有这个概念，传空串。
+   * 判定——只比设备名会把同型号的两支麦误判成同一台。
    */
   groupId: string;
 }
@@ -32,10 +30,6 @@ function micKey(key?: string): string {
 }
 function outKey(key?: string): string {
   return key ? `bok.audio.out.${key}` : OUT_KEY;
-}
-
-export function isTauriShell(): boolean {
-  return typeof window !== "undefined" && isTauri();
 }
 
 function storage(): Storage | null {
@@ -89,40 +83,12 @@ async function listWebDevices(kind: AudioDeviceKind, granted: boolean): Promise<
 
 /**
  * 列出设备。
- * - 输入（麦克风）：**一律走 Web enumerateDevices** —— 采集（getUserMedia）用的是
- *   WebRTC deviceId，原生 CoreAudio UID 与之不匹配，混用会导致「选了却无法输入」。
- *   列出前先请求一次麦克风权限（触发 TCC 授权框，拿到带 label 的设备）。
- * - 输出（扬声器）：桌面壳走原生 CoreAudio（uid 用于切系统默认输出）；浏览器回退
- *   Web 枚举（仅 Chromium 支持 setSinkId）。
+ * - 输入（麦克风）：列出前先请求一次麦克风权限（拿到带 label 的设备）。
+ * - 输出（扬声器）：Web 枚举不弹授权。
  * 无授权/无设备时返回 []，交由 UI 提示去系统设置开启麦克风。
  */
 export async function listAudioDevicesOf(kind: AudioDeviceKind): Promise<AudioDeviceInfo[]> {
-  if (kind === "output" && isTauriShell()) {
-    try {
-      const native = await listAudioDevices("output");
-      if (Array.isArray(native) && native.length > 0) {
-        return native.map((d) => ({ id: d.id, name: d.name, is_default: d.is_default, kind, groupId: "" }));
-      }
-    } catch {
-      /* 原生枚举失败（Windows 占位）时回退 web */
-    }
-  }
-  // input 永远 web，且需要先请求麦克风权限（触发 TCC 授权框，才能拿到带 label 的设备）；
-  // output 的 web 枚举不弹麦克风授权。
-  return listWebDevices(kind, kind === "output");
-}
-
-/** 桌面壳切换系统默认输出；浏览器环境（Chromium）由调用方自行 setSinkId。 */
-export async function applyOutputDevice(deviceId: string): Promise<void> {
-  if (!deviceId) return;
-  if (isTauriShell()) {
-    try {
-      await setSystemOutput(deviceId);
-      saveOutputDevice(deviceId);
-    } catch (e) {
-      console.warn("set system output failed", e);
-    }
-  }
+  return listWebDevices(kind, kind === "input");
 }
 
 /**
@@ -150,7 +116,7 @@ export async function switchWebOutputDevice(room: { switchActiveDevice: (kind: s
 /** Chromium 浏览器才支持网页 setSinkId（livekit 对 Safari/WKWebView 内核禁用了输出切换）。
  * 仅检测 setSinkId 存在会把 WKWebView/Safari 误判成可用——它们有这 API 但 livekit 内部
  * 对远端 audio 设 sinkId 会抛 "Failed to set sink id on remote audio track"。排除非 Chrome 的
- * WebKit(含 Tauri 桌面 WKWebView):桌面走 CoreAudio 切系统输出,不走 setSinkId。 */
+ * WebKit（Tauri 桌面 WKWebView 已随壳退役）。 */
 export function webCanSwitchOutput(): boolean {
   if (typeof document === "undefined" || typeof navigator === "undefined") return false;
   const ua = navigator.userAgent || "";

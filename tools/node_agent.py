@@ -3,8 +3,10 @@
 P0 职责：①向云 CP 心跳上报（失联 ≥max_missed 置 refuse_jobs 旗标，日志可见；
 拒派发的执行端是 livekit load_threshold，P3 接 commands 通道后由指令精确控制）
 ②可选拉起全栈（复用 bok.cmd_up/cmd_down）③把 cpUrl/livekitUrl 注入 web 产物
-（runtime-config.js），使同一份静态导出可作节点本地坐席工作台。
-④服从远程停机开关（site-delivery Task 6）：root 吊销的心跳 401 detail 携带
+（runtime-config.js），使同一份静态导出可作节点本地坐席工作台；④**节点本地
+托管坐席 UI**（--ui-dir 给定即 stdlib 静态服务 :3000，话务员浏览器零安装访问；
+2026-09-17 起 runbook 的「http://<节点IP>:3000」由本进程兑现，不再依赖桌面壳）
+⑤服从远程停机开关（site-delivery Task 6）：root 吊销的心跳 401 detail 携带
 机器可执行 action:"shutdown" → 停栈退出（绝不 self-heal）；license 吊销=永久
 → 连续 3 次后退避停栈；auto_clone 克隆吊销保留重注册复活路径。
 """
@@ -13,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import http.server
 import json
 import os
 import subprocess
@@ -23,9 +26,11 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from urllib.parse import urlparse
 
 TOOLS_DIR = Path(__file__).resolve().parent
+ROOT_DIR = TOOLS_DIR.parent
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
@@ -37,6 +42,16 @@ class NodeConfig:
     heartbeat_interval_s: int = 60
     max_missed: int = 3
     fingerprint: str = ""
+    version: str = ""
+
+
+def read_version(root: Path | None = None) -> str:
+    """读包版本（build_node_pkg 注入的 VERSION 文件；dev 仓无此文件=空串）。"""
+    root = Path(root) if root is not None else ROOT_DIR
+    try:
+        return (root / "VERSION").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
 def collect_fingerprint() -> str:
@@ -129,7 +144,7 @@ def register_once(cp_url: str, license_key: str, fingerprint: str, *,
 
 
 def ensure_token(cp_url: str, license_key: str, fingerprint: str,
-                 state_file: Path) -> str:
+                 state_file: Path, version: str = "") -> str:
     """license 流的 token 生命周期：状态文件缓存 → 心跳探测 401 分诊 → 幂等重注册。
 
     同 (license, fingerprint) 重注册在 CP 侧复用 node_id 换新 token——机器
@@ -161,7 +176,7 @@ def ensure_token(cp_url: str, license_key: str, fingerprint: str,
                 "[node-agent] FATAL: cached-token probe reports license revoked "
                 "— revocation is permanent; re-registration cannot revive. Exiting.")
         print(f"[node-agent] cached token rejected ({code}) — re-registering", flush=True)
-    node_id, token = register_once(cp_url, license_key, fingerprint)
+    node_id, token = register_once(cp_url, license_key, fingerprint, version=version)
     state_file.parent.mkdir(parents=True, exist_ok=True)
     # 先 0600 建档再写（write_text+chmod 有 0644 窗口）：token=本机凭据。
     fd = os.open(str(state_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -172,8 +187,10 @@ def ensure_token(cp_url: str, license_key: str, fingerprint: str,
     return token
 
 
-def heartbeat_once(cfg: NodeConfig, metrics: dict | None = None) -> tuple[bool, dict]:
-    body = json.dumps({"metrics": metrics or {}, "fingerprint": cfg.fingerprint}).encode()
+def heartbeat_once(cfg: NodeConfig, metrics: dict | None = None,
+                   acks: list | None = None) -> tuple[bool, dict]:
+    body = json.dumps({"metrics": metrics or {}, "fingerprint": cfg.fingerprint,
+                       "version": cfg.version, "acks": acks or []}).encode()
     req = urllib.request.Request(
         f"{cfg.cp_url.rstrip('/')}/api/nodes/heartbeat",
         data=body,
@@ -213,6 +230,55 @@ def write_ui_config(out_dir: Path, cp_url: str, livekit_url: str) -> Path:
     return target
 
 
+# ---- 节点本地 UI 托管（2026-09-17：runbook「话务员浏览器开 :3000」的实现载体）----
+
+class _SpaStaticHandler(http.server.SimpleHTTPRequestHandler):
+    """静态托管 + SPA 路由回退。
+
+    Next 静态导出的客户端路由（/calls /settings 等无扩展名路径）磁盘上不存在
+    对应文件 → 回 index.html 由前端路由接管；带扩展名的真实资产（/_next/*、
+    *.js/*.png）缺失仍 404，不吞真 404。目录遍历防护由 SimpleHTTPRequestHandler
+    自带。访问日志静默（守护进程日志只留心跳/异常主线），错误日志保留。
+    """
+
+    def send_head(self):  # noqa: D102 - 语义见类 docstring
+        route = urlparse(self.path).path
+        resolved = self.translate_path(self.path)
+        if not os.path.exists(resolved) and "." not in PurePosixPath(route).name:
+            self.path = "/index.html"
+        return super().send_head()
+
+    def log_message(self, format: str, *args) -> None:  # noqa: A002 - stdlib 签名
+        pass  # 静默逐请求访问日志（错误走 log_error，仍可见）
+
+
+def build_ui_server(ui_dir: Path, bind: str = "0.0.0.0", port: int = 3000
+                    ) -> http.server.ThreadingHTTPServer:
+    """构造 UI 静态服务（可测缝：测试拿 server 对象自查端口/发请求后 shutdown）。"""
+    ui_dir = Path(ui_dir).resolve()
+    if not (ui_dir / "index.html").is_file():
+        raise FileNotFoundError(f"ui-dir 缺 index.html（先构建 apps/web out/）: {ui_dir}")
+    handler = functools.partial(_SpaStaticHandler, directory=str(ui_dir))
+    return http.server.ThreadingHTTPServer((bind, port), handler)
+
+
+def serve_ui(ui_dir: Path, bind: str = "0.0.0.0", port: int = 3000) -> None:
+    """阻塞式托管循环（放守护线程跑）：绑定失败/资产缺失只降级不杀心跳——
+    守护的本职是心跳与栈托管，UI 端口被占（如同机 dev web :3000）时让位。"""
+    try:
+        server = build_ui_server(ui_dir, bind, port)
+    except Exception as exc:  # noqa: BLE001 - UI 托管失败绝不拖垮守护
+        print(f"[node-agent] ui serve skipped ({exc!r})", flush=True)
+        return
+    print(f"[node-agent] ui serving http://{bind}:{port} <- {ui_dir}", flush=True)
+    try:
+        server.serve_forever(poll_interval=0.5)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[node-agent] ui serve stopped: {exc!r}", flush=True)
+    finally:
+        server.server_close()
+
+
 # ---- 远程停机开关（site-delivery Task 6，wire 契约见 control_plane/main.py
 # node_heartbeat 的 401 detail 塑形 + scripts/probe_killswitch.py ④⑤⑦⑨）----
 
@@ -232,9 +298,15 @@ _SELF_HEAL_KINDS = ("token_stale", "unlicensed", "auto_clone_revoked")
 @dataclass
 class HeartbeatState:
     """心跳循环跨轮计数：missed=失联计数（REFUSE_JOBS，语义不变）；
-    license_revoked_streak=license 吊销连续命中计数（≥3 走 kill，成功清零）。"""
+    license_revoked_streak=license 吊销连续命中计数（≥3 走 kill，成功清零）；
+    pending_acks=待回执指令（下轮心跳带给 CP，update 失败回执用）。"""
     missed: int = 0
     license_revoked_streak: int = 0
+    pending_acks: list | None = None
+
+    def __post_init__(self) -> None:
+        if self.pending_acks is None:
+            self.pending_acks = []
 
 
 def _wire_detail_text(body: dict | None) -> str:
@@ -301,6 +373,174 @@ def _kill_on_revoke(message: str) -> None:
     raise SystemExit(0)
 
 
+# ---- commands 通道执行侧（P3，2026-09-17）----
+
+# 重启/更新完成后的退出码：非零 → schtasks RestartOnFailure / launchd KeepAlive
+# 拉回进程 = 重启语义（cmd_up 随启动拉全栈）。0=干净退出（kill-switch 专用——
+# RestartOnFailure 不拉回，节点保持死亡）。
+_RESTART_EXIT_CODE = 75
+
+# worker 线程请求的进程退出码（线程里 raise SystemExit 只死线程不传主进程——
+# main 循环结束后读取；heartbeat-only 模式直接在主线程传播，不经此）。
+_requested_exit_code: list[int] = []
+
+
+def _request_exit(code: int) -> None:
+    """请求进程退出码并让当前「线程」终止（full 模式 worker 线程由此退场，
+    main 轮询收尾；heartbeat-only 模式在主线程直接 SystemExit 传播）。"""
+    _requested_exit_code.append(code)
+    raise SystemExit(code)
+
+
+def _stop_stack_quiet(reason: str) -> None:
+    print(f"[node-agent] {reason} — stopping stack", flush=True)
+    if _kill_stack_hook is not None:
+        try:
+            _kill_stack_hook()
+        except Exception as exc:  # noqa: BLE001 - 停栈失败不阻断退出路径
+            print(f"[node-agent] stack stop error: {exc!r}", flush=True)
+
+
+def dispatch_commands(cfg: NodeConfig, commands: list, *,
+                      hb: HeartbeatState | None = None,
+                      stop_stack: bool = True) -> None:
+    """执行心跳响应里的指令（动作到处置的映射，绝不执行任意 shell）。
+
+    - shutdown：停栈 + exit(0)——与 kill-switch 同路（非零才拉回，0=保持死亡）。
+    - restart：停栈 + exit(75)——守护拉回进程，cmd_up 随启动带回全栈。
+    - update：perform_update 成功 → exit(75)（CP 由 version 收敛关单，无需 ack）；
+      失败 → ack 回执（ok=false），继续以旧版本服务，绝不带伤退出。
+    未知动作：大声记录 + 忽略（新动作两端未同步时旧节点不炸）。
+    """
+    for cmd in commands or []:
+        action = str((cmd or {}).get("action", ""))
+        cid = str((cmd or {}).get("id", ""))
+        args = (cmd or {}).get("args") or {}
+        if action == "shutdown":
+            _stop_stack_quiet("shutdown command from control plane")
+            _request_exit(0)
+        elif action == "restart":
+            if stop_stack:
+                _stop_stack_quiet("restart command from control plane")
+            _request_exit(_RESTART_EXIT_CODE)
+        elif action == "update":
+            version = str(args.get("version", ""))
+            err = perform_update(cfg, version, stop_stack=stop_stack)
+            if err:
+                print(f"[node-agent] update -> {version} FAILED: {err}", flush=True)
+                if hb is not None and hb.pending_acks is not None:
+                    hb.pending_acks.append(
+                        {"id": cid, "ok": False, "result": err[:200]})
+            else:
+                if stop_stack:
+                    _stop_stack_quiet(f"updated -> {version}")
+                print(f"[node-agent] update -> {version} done; exiting for relaunch",
+                      flush=True)
+                _request_exit(_RESTART_EXIT_CODE)
+        else:
+            print(f"[node-agent] ignoring unknown command action={action!r} "
+                  f"(id={cid})", flush=True)
+
+
+def _http_download(url: str, token: str, dest: Path, timeout: int = 300) -> None:
+    """流式下载（Bearer node_token 自证，与心跳同凭据面）。非 200 抛 RuntimeError。"""
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as f:
+        while True:
+            chunk = resp.read(1 << 20)
+            if not chunk:
+                break
+            f.write(chunk)
+
+
+def perform_update(cfg: NodeConfig, version: str, *,
+                   root: Path | None = None, stop_stack: bool = True) -> str:
+    """update 指令执行体：CP 拉包 → sha256 校验 → 覆盖代码树 → 重装 → 停栈。
+
+    返回 ""=成功（调用方 exit(75) 交守护拉起新版）；失败返回原因文本（调用方
+    ack 回执、原地继续旧版本）。
+
+    机制要点：生产栈的业务代码跑在 runtime python 的 site-packages（非
+    editable 安装）——只换代码树不生效，必须跟 pip 重装。runtime/（python/
+    livekit/node/llama，GB 级）与模型（app-data）不在包内、跨版本复用，
+    覆盖时原样保留。诚实边界：copytree 覆盖不删除「新版已移除」的旧文件
+    （残留物不在运行导入路径上，风险≈0；全量干净换目录方案受 Windows
+    目录锁限制，留 P2）。"""
+    version = version.strip()
+    if not version:
+        return "update: empty version"
+    if version == cfg.version:
+        return f"update: already at {version}"
+    # 与 CP 下载端点同款白名单：version 进 URL 路径前先本地校验（防御性——
+    # 正常 CP 不会发怪版本号，被劫持的指令面也不该能在节点上拼路径）。
+    import re
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", version):
+        return f"update: invalid version {version!r}"
+    root = Path(root) if root is not None else ROOT_DIR
+    base = cfg.cp_url.rstrip("/")
+    import hashlib
+    import shutil
+    import tarfile
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="bok-update-") as td:
+        tgz = Path(td) / f"bok-node-{version}.tar.gz"
+        sha_path = Path(td) / "artifact.sha256"
+        try:
+            _http_download(f"{base}/api/nodes/downloads/pkg/{version}/"
+                           f"bok-node-{version}.tar.gz", cfg.node_token, tgz)
+            _http_download(f"{base}/api/nodes/downloads/pkg/{version}/"
+                           f"bok-node-{version}.tar.gz.sha256", cfg.node_token, sha_path)
+        except Exception as exc:  # noqa: BLE001 - 下载失败=可回执的普通失败
+            return f"download failed: {exc}"
+        expected = sha_path.read_text(encoding="utf-8").strip().split()[0].lower()
+        digest = hashlib.sha256(tgz.read_bytes()).hexdigest()
+        if digest != expected:
+            return f"sha256 mismatch (expected {expected[:12]}…, got {digest[:12]}…)"
+        extract = Path(td) / "x"
+        with tarfile.open(tgz, "r:gz") as tar:
+            try:
+                tar.extractall(extract, filter="data")  # py3.12+ 防路径穿越
+            except TypeError:  # 旧解释器无 filter 参数
+                tar.extractall(extract)
+        # 包内顶层目录归一（git archive 前缀 / 直接打包根都接受）。
+        src = extract
+        entries = list(extract.iterdir())
+        if len(entries) == 1 and entries[0].is_dir():
+            src = entries[0]
+        if not (src / "tools" / "node_agent.py").is_file():
+            return "artifact layout unexpected (tools/node_agent.py missing)"
+        print(f"[node-agent] update: verified {version}, overlaying {root}", flush=True)
+        shutil.copytree(src, root, dirs_exist_ok=True)
+
+    # runtime python 在盘才重装（dev 仓/裸心跳面优雅跳过）；栈先停（Windows
+    # 下运行中的 .pyd 锁会让 pip 覆盖失败）。
+    rt_py = (root / "runtime" / "python" / "bin" / "python3")
+    if os.name == "nt":
+        rt_py = root / "runtime" / "python" / "python.exe"
+    if stop_stack and _kill_stack_hook is not None:
+        _stop_stack_quiet(f"update -> {version}")
+    if rt_py.exists():
+        req_file = "requirements-runtime-win.txt" if os.name == "nt" \
+            else "requirements-runtime-mac.txt"
+        print(f"[node-agent] update: reinstalling packages ({rt_py.name})", flush=True)
+        projects = ["packages/core", "packages/business-db", "packages/knowledge",
+                    "packages/observability", "apps/control-plane",
+                    "apps/agent[livekit]"]
+        rc = subprocess.run([str(rt_py), "-m", "pip", "install", "--no-cache-dir",
+                             "-r", str(root / req_file)],
+                            cwd=str(root)).returncode
+        if rc == 0:
+            rc = subprocess.run([str(rt_py), "-m", "pip", "install", "--no-cache-dir",
+                                 *projects],
+                                cwd=str(root)).returncode
+        if rc != 0:
+            return f"pip reinstall failed rc={rc} (code tree updated; retry update)"
+    else:
+        print("[node-agent] update: runtime python not found — code tree only", flush=True)
+    return ""
+
+
 def heartbeat_tick(cfg: NodeConfig, missed: int, *, license_key: str = "",
                    state_file: Path | None = None,
                    hb: HeartbeatState | None = None) -> int:
@@ -314,10 +554,18 @@ def heartbeat_tick(cfg: NodeConfig, missed: int, *, license_key: str = "",
       （克隆检出恢复路径保留；每轮至多一次，无风暴）；
     - network/其他：失联计数（REFUSE_JOBS 语义不变）。
     返回新 missed 计数。"""
-    ok, body = heartbeat_once(cfg, metrics={"missed": missed})
+    ok, body = heartbeat_once(cfg, metrics={"missed": missed},
+                              acks=(hb.pending_acks if hb is not None else None))
+    if hb is not None and hb.pending_acks:
+        hb.pending_acks.clear()
     if ok:
         if hb is not None:
             hb.license_revoked_streak = 0
+        commands = body.get("commands") or []
+        if commands:
+            print(f"[node-agent] received {len(commands)} command(s): "
+                  f"{[c.get('action') for c in commands]}", flush=True)
+            dispatch_commands(cfg, commands, hb=hb)
         return 0
     kind = classify_heartbeat_failure(body)
     if kind == "root_revoked":
@@ -380,7 +628,13 @@ def main(argv=None) -> int:
                     help="license 流 token 状态文件（默认 ~/.bok/node-state.json，chmod 600）")
     ap.add_argument("--name", default="", help="节点名（缺省 CP 侧默认）")
     ap.add_argument("--heartbeat-only", action="store_true", help="不拉起全栈，只跑心跳")
-    ap.add_argument("--ui-dir", default="", help="web 静态产物目录（提供则写 runtime-config.js）")
+    ap.add_argument("--ui-dir", default="", help="web 静态产物目录（提供则写 runtime-config.js；"
+                    "非 --heartbeat-only 时同时本地托管 :3000）")
+    ap.add_argument("--ui-port", type=int, default=3000, help="UI 托管端口（默认 3000）")
+    ap.add_argument("--ui-bind", default="0.0.0.0",
+                    help="UI 托管绑定地址（默认 0.0.0.0=内网话务员可访问；仅本机用 127.0.0.1）")
+    ap.add_argument("--no-ui", action="store_true",
+                    help="不托管 UI（仍写 runtime-config.js）——端口冲突让位/特殊拓扑逃生口")
     ap.add_argument("--livekit-url", default="ws://127.0.0.1:7880")
     ap.add_argument("--interval", type=int, default=60)
     args = ap.parse_args(argv)
@@ -388,18 +642,26 @@ def main(argv=None) -> int:
         ap.error("--node-token 或 --license-key 至少给一个")
 
     fingerprint = collect_fingerprint()
+    version = read_version()
     token = args.node_token
     state_file = None
     if not token:
         state_file = (Path(args.state_file) if args.state_file
                       else Path.home() / ".bok" / "node-state.json")
-        token = ensure_token(args.cp_url, args.license_key, fingerprint, state_file)
+        token = ensure_token(args.cp_url, args.license_key, fingerprint, state_file,
+                             version=version)
 
     cfg = NodeConfig(cp_url=args.cp_url, node_token=token,
-                     heartbeat_interval_s=args.interval, fingerprint=fingerprint)
+                     heartbeat_interval_s=args.interval, fingerprint=fingerprint,
+                     version=version)
+    if version:
+        print(f"[node-agent] node package version: {version}", flush=True)
     if args.ui_dir:
         target = write_ui_config(Path(args.ui_dir), cfg.cp_url, args.livekit_url)
         print(f"[node-agent] ui config -> {target}", flush=True)
+        if not args.no_ui and not args.heartbeat_only:
+            threading.Thread(target=serve_ui, args=(Path(args.ui_dir), args.ui_bind, args.ui_port),
+                             daemon=True, name="ui-serve").start()
 
     if args.heartbeat_only:
         stop = threading.Event()
@@ -439,7 +701,9 @@ def main(argv=None) -> int:
     finally:
         stop.set()
         _stop_stack_once()
-    return 0
+    # worker 线程经 _request_exit 终场时（restart/update=75）把退出码带给进程
+    # ——非零交 schtasks RestartOnFailure / launchd KeepAlive 拉回即重启/上新版。
+    return _requested_exit_code[-1] if _requested_exit_code else 0
 
 
 if __name__ == "__main__":

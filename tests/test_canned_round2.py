@@ -51,8 +51,10 @@ class _RecCache:
         self.pcm = pcm
         self.lookups: list[dict] = []
 
-    def lookup(self, text, *, voice, model, speed=1.0):
-        self.lookups.append({"text": text, "voice": voice, "model": model, "speed": speed})
+    def lookup(self, text, *, voice, model, speed=1.0, emotion=""):
+        self.lookups.append(
+            {"text": text, "voice": voice, "model": model, "speed": speed, "emotion": emotion}
+        )
         return self.pcm
 
 
@@ -84,6 +86,19 @@ def test_say_script_lookup_carries_speed():
     session = _SessionFake()
     asyncio.run(asyncio.wait_for(_say_script(session, _TTSFake(), cache, "您好"), 5))
     assert cache.lookups and cache.lookups[0]["speed"] == 1.2
+    assert cache.lookups[0]["emotion"] == ""  # 无情绪直念线(心跳/收线等)空串=自动匹配键
+    assert session.said and session.said[0]["audio"] is True
+
+
+def test_say_script_lookup_carries_emotion():
+    """say 步行级情绪(2026-09-16 罐头带情绪):emotion 进缓存查找键——命中
+    pregen 情绪版条目;miss 路径同键查找后退化无情绪合成(运行时不逐次切换)。"""
+    cache = _RecCache(pcm=b"\x01\x00" * 4800)
+    session = _SessionFake()
+    asyncio.run(
+        asyncio.wait_for(_say_script(session, _TTSFake(), cache, "您好", emotion="sad"), 5)
+    )
+    assert cache.lookups[0]["emotion"] == "sad"
     assert session.said and session.said[0]["audio"] is True
 
 

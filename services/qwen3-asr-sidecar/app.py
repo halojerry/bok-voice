@@ -167,10 +167,38 @@ def _finish_language_hint(start_lang: str | None) -> str | None:
 
 
 class ASRService:
+    # 会话 TTL 与总量上限(2026-09-17 全量 debug F5):sidecar 是长命进程服务所有
+    # 通话,_sessions 只在 /api/finish 时 pop——client 取消/崩溃致 finish 永不到达
+    # 时,会话连同累积 PCM bytearray 永久驻留,跨通话无界泄漏。懒清扫(每次 start
+    # 顺带跑)零新增任务;TTL 180s 远超最长轮窗(≤12s 滑窗+hold flush 余量)。
+    SESSION_TTL_S = 180.0
+    SESSION_MAX = 512
+
     def __init__(self) -> None:
         self._model: Any | None = None
         self._sessions: dict[str, dict[str, Any]] = {}
         self._load_error: str | None = None
+
+    def _sweep_sessions(self, now: float | None = None) -> None:
+        """过期/超量会话清扫:TTL 到期先清,总量超限再按 created_at 清最旧。
+
+        调用方必须在插入新会话**之后**调用(保证 len ≤ SESSION_MAX 的不变量:
+        先插再清,溢出数含新会话;先清再插会收敛到 SESSION_MAX+1)。"""
+        now = time.time() if now is None else now
+        stale = [
+            sid for sid, s in self._sessions.items()
+            if now - float(s.get("created_at") or 0.0) > self.SESSION_TTL_S
+        ]
+        for sid in stale:
+            self._sessions.pop(sid, None)
+        overflow = len(self._sessions) - self.SESSION_MAX
+        if overflow > 0:
+            oldest = sorted(
+                self._sessions.items(),
+                key=lambda kv: float(kv[1].get("created_at") or 0.0),
+            )[:overflow]
+            for sid, _s in oldest:
+                self._sessions.pop(sid, None)
 
     def load(self) -> None:
         if os.environ.get("QWEN3_ASR_DISABLE_LOAD") == "1":
@@ -252,6 +280,8 @@ class ASRService:
             "partials_done": False,
             "inf_lock": threading.Lock(),
         }
+        # 懒清扫在插入后跑(不变量见 _sweep_sessions docstring)。
+        self._sweep_sessions()
         return session_id
 
     def chunk(self, session_id: str, pcm: bytes) -> dict[str, str | bool]:
