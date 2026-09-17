@@ -2,18 +2,20 @@
 # build_runtime.sh — assemble the self-contained runtime that ships in the app.
 #
 # Layout produced:
-#   desktop/runtime/python/            standalone CPython + platform deps
-#   desktop/runtime/llama/             Windows: llama-server.exe + cudart DLLs
-#   desktop/runtime/bline-node_modules/  B-line worker deps (ws)
-#   desktop/src-tauri/binaries/        externalBin: livekit-server, node
-#                                      (<name>-<target-triple>[.exe])
+#   runtime/python/                    standalone CPython + platform deps
+#   runtime/llama/                     Windows: llama-server.exe + cudart DLLs
+#   runtime/bline-node_modules/        B-line worker deps (ws)
+#   desktop/src-tauri/binaries/        Tauri externalBin staging: livekit-server,
+#                                      node (<name>-<target-triple>[.exe])
+#                                      (退役注：Tauri 拆除后此 staging 由
+#                                       runtime/ 直收，见 build_node_pkg 链)
 #
 # The staging dir is wiped first so cached/stale layouts (e.g. an old .venv)
 # can never leak into a release bundle.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-RUNTIME="$ROOT/desktop/runtime"
+RUNTIME="$ROOT/runtime"
 BINARIES="$ROOT/desktop/src-tauri/binaries"
 cd "$ROOT"
 
