@@ -13,7 +13,7 @@
 - **纯浅色单主题**：删除 `.dark` 块与暗色值；不新增主题切换入口。
 - **零运行时行为改动**：不碰 `lib/api.ts`、连接流程、`setSinkId`、回声守卫、`localStorage` 既有键（`bok_token`/`bok.audio.*`）；P1 不新增任何 localStorage 键（侧栏偏好是 P2 的事）。
 - **色彩语义**（来自 spec §1/§2，逐字执行）：主按钮=近黑（`bg-primary`）；`--live`（cyan-600 级）只做活信号（链接强调/进度/图表/在通徽标）；正文对比度 ≥4.5:1。
-- **豁免清单**（唯一允许残留白/黑透明的区域）：`components/interpret-console.tsx:1560-1625` 大字幕浮窗区（`bg-black/85`、`border-white/20|30`、`text-white/70|80|90`、`bg-white/90`）——字幕机本色，逐行点名豁免。
+- **豁免清单**（唯一允许残留白/黑透明的区域）：`components/interpret-console.tsx:1606-1673`（现场定位为准）大字幕浮窗区（`bg-black/85`、`border-white/20|30`、`text-white/70|80|90`、`bg-white/90`）——字幕机本色，逐行点名豁免。
 - **Aura/mood 不在 P1 动**：`components/agents-ui/*` 的 `DEFAULT_COLOR '#1FD5F9'`、`hooks/use-mood-color.ts` 色板留给 P3/P4；P1 后它们在浅底上偏亮是已知中间态，不算 FAIL。
 - **PR #100 注意**：若 #100 已合入当前分支，本计划 sweep 自然覆盖其文件；若未合，#100 合入后需对 `dashboard-page.tsx`/`campaigns/page.tsx` 重跑 Task 2-4 的 grep 门禁补 sweep。
 - **门禁**（每个 Task 收尾必跑）：`cd apps/web && npx tsc --noEmit && npm run build`。
@@ -485,9 +485,9 @@ cd apps/web && grep -rEn "text-(red|emerald|amber|sky|green|rose|orange|yellow)-
 - [ ] **Step 2: 门禁 grep 归零（字幕机豁免段除外）**
 
 ```bash
-cd apps/web && grep -rEn "text-(red|emerald|amber|sky|green|rose|orange|yellow)-[23]00" app components --include="*.tsx" | grep -v "interpret-console.tsx:16[0-5][0-9]"
+cd apps/web && grep -rEn "text-(red|emerald|amber|sky|green|rose|orange|yellow)-[23]00" app components --include="*.tsx" | grep -vE "interpret-console.tsx:16(0[5-9]|[1-6][0-9]|7[0-2])"
 ```
-预期：零输出（豁免区间以现场 overlay 块为准，上式覆盖 1600-1659；若有出区间命中且确实在黑底浮窗内，按块豁免并在报告点名）。
+预期：零输出（豁免区间以现场 grep `bg-black/85` 定位为准，本分支实测 1606-1673，上式覆盖 1605-1672；若有出区间命中且确实在黑底浮窗内，按块豁免并在报告点名）。
 
 - [ ] **Step 3: 构建门禁**
 
@@ -545,7 +545,7 @@ cd apps/web && grep -rn "text-accent\|accent-soft\|accent-ink" app components --
 - [ ] **Step 2: 门禁 grep 归零**
 
 ```bash
-cd apps/web && grep -rn "text-accent\|accent-soft\|accent-ink\|#01191c\|#4adcfa\|#2c2d2d\|#141515" app components --include="*.tsx"; grep -rn "(--accent)" app components --include="*.tsx"
+cd apps/web && grep -rnE "text-accent($|[^-a-zA-Z])|accent-soft|accent-ink|#01191c|#4adcfa|#2c2d2d|#141515" app components --include="*.tsx"; grep -rn "(--accent)" app components --include="*.tsx"
 ```
 预期：两组均零输出。
 
@@ -569,7 +569,7 @@ setup 下载按钮顺手修 text-(--bg) 坏变量；logo 反白字 token 化。"
 
 ---
 
-### Task 5: shadcn 补件（12 件，P2/P3 消费）
+### Task 5: shadcn 补件（13 件，P2/P3 消费）
 
 **Files:**
 - Create: `apps/web/components/ui/{input,label,textarea,checkbox,switch,dialog,dropdown-menu,table,tabs,badge,card,tooltip,skeleton}.tsx`（shadcn CLI 生成）
@@ -599,7 +599,7 @@ cd apps/web && npx tsc --noEmit && npm run build
 ```bash
 cd /Users/halo/Documents/bok/voice-assistant
 git add apps/web
-git commit -m "feat(web): P1 补件——shadcn 原语 12 件入 components/ui
+git commit -m "feat(web): P1 补件——shadcn 原语 13 件入 components/ui
 
 input/label/textarea/checkbox/switch/dialog/dropdown-menu/table/tabs/
 badge/card/tooltip/skeleton；不覆盖既有 button/select/toggle/separator。"
@@ -665,12 +665,12 @@ git commit -m "feat(web): P1 图标——独立字形位换 lucide（散文/句�
 
 ```bash
 cd apps/web
-echo "--- 裸透明（字幕机浮窗块外应为 0；浮窗区间以现场 bg-black/85 overlay 为准，约 1608-1654）---"
-grep -rn "bg-white/\|bg-black/\|border-white/" app components --include="*.tsx" | grep -vc "interpret-console.tsx:16[0-5][0-9]"
+echo "--- 裸透明（字幕机浮窗块外应为 0；豁免区间以现场 grep bg-black/85 定位为准，本分支实测 1606-1673）---"
+grep -rn "bg-white/\|bg-black/\|border-white/" app components --include="*.tsx" | grep -vcE "interpret-console.tsx:16(0[5-9]|[1-6][0-9]|7[0-2])"
 echo "--- 暗底浅字（字幕机浮窗块外应为 0）---"
-grep -rEn "text-(red|emerald|amber|sky|green|rose|orange|yellow)-[23]00" app components --include="*.tsx" | grep -v "interpret-console.tsx:16[0-5][0-9]" | wc -l
+grep -rEn "text-(red|emerald|amber|sky|green|rose|orange|yellow)-[23]00" app components --include="*.tsx" | grep -vE "interpret-console.tsx:16(0[5-9]|[1-6][0-9]|7[0-2])" | wc -l
 echo "--- accent 残留（应为 0）---"
-grep -rn "text-accent\|accent-soft\|accent-ink" app components --include="*.tsx" | wc -l
+grep -rnE "text-accent($|[^-a-zA-Z])|accent-soft|accent-ink" app components --include="*.tsx" | wc -l
 echo "--- globals 内 hex 残留（应为 0）---"
 grep -n "#070707\|#0d0e0e\|#1fd5f9\|#4adcfa\|#01191c\|#2c2d2d\|#141515\|#012a32\|#ff6b6b" app/globals.css | wc -l
 ```
@@ -681,7 +681,7 @@ grep -n "#070707\|#0d0e0e\|#1fd5f9\|#4adcfa\|#01191c\|#2c2d2d\|#141515\|#012a32\
 ```bash
 cd apps/web && npx tsc --noEmit && npm run build && du -sh out
 ```
-对比 Task 1 Step 1 基线：涨幅 >15% 需排查说明（预期变化来自 shadcn 12 件 + lucide 图标，应在个位数百分比）。
+对比 Task 1 Step 1 基线：涨幅 >15% 需排查说明（预期变化来自 shadcn 13 件 + lucide 图标，应在个位数百分比）。
 
 - [ ] **Step 3: 20 页视觉走查（`cd out && python3 -m http.server 4173`）**
 

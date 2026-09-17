@@ -725,7 +725,7 @@ function MinimaxClonePanel({ clones, onChange }: { clones: MinimaxClone[]; onCha
           {clones.map((c) => (
             <li key={c.voice_id} className="flex flex-wrap items-center gap-2 text-xs">
               <span className="font-medium">{c.label || c.voice_id}</span>
-              {!c.activated && <span className="rounded bg-amber-500/15 px-1 text-amber-500">未激活</span>}
+              {!c.activated && <span className="rounded bg-amber-100 px-1 text-amber-700">未激活</span>}
               <span className="muted">{c.voice_id}</span>
               <button className="btn-ghost px-1 py-0 text-xs" disabled={busy}
                 onClick={() => preview(c.voice_id, c.sample_lang || "zh")}>试听（激活）</button>

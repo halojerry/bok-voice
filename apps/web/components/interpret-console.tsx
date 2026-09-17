@@ -1252,7 +1252,7 @@ function ConsoleLive(p: LiveProps) {
           className="shrink-0 rounded-md border border-red-500/60 bg-red-500/10 px-3 py-2 text-xs leading-relaxed text-red-600"
         >
           <Ban className="h-3.5 w-3.5" /> {m}
-          <span className="block text-red-600">这个组合下开传译只会产出错字幕，先改设备再启动。</span>
+          <span className="block text-red-600/80">这个组合下开传译只会产出错字幕，先改设备再启动。</span>
         </div>
       ))}
       {scriptWarnings.map((m) => (

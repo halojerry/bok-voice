@@ -31,7 +31,7 @@ const ITEM_LABEL: Record<string, string> = {
 const SEGMENTS: { key: string; label: string; cls: string }[] = [
   { key: "done", label: "完成", cls: "bg-emerald-400" },
   { key: "in_call", label: "通话中", cls: "bg-sky-400" },
-  { key: "dialing", label: "拨号中", cls: "bg-sky-300" },
+  { key: "dialing", label: "拨号中", cls: "bg-sky-400" },
   { key: "no_answer", label: "无人接", cls: "bg-neutral-400" },
   { key: "rejected", label: "拒接", cls: "bg-amber-400" },
   { key: "failed", label: "失败", cls: "bg-red-400" },
