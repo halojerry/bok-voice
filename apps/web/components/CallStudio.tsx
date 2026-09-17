@@ -15,12 +15,16 @@ import {
 import { ConnectionState, TokenSource, Track, type Room } from "livekit-client";
 import { api } from "@/lib/api";
 import { describeConnectError, friendlyErrorText, useControlPlaneReady } from "@/lib/api-ready";
-import { applyOutputDevice, listAudioDevicesOf, requestMicPermission, saveMicDevice, savedMicDevice, savedOutputDevice, switchWebOutputDevice, webCanSwitchOutput, isTauriShell, type AudioDeviceInfo } from "@/lib/audio";
+import { listAudioDevicesOf, requestMicPermission, saveMicDevice, savedMicDevice, savedOutputDevice, switchWebOutputDevice, webCanSwitchOutput, type AudioDeviceInfo } from "@/lib/audio";
+import { startTrace } from "@/lib/logger";
 import { AgentChatIndicator } from "@/components/agents-ui/agent-chat-indicator";
 import { AgentChatTranscript } from "@/components/agents-ui/agent-chat-transcript";
 import { AgentSessionProvider } from "@/components/agents-ui/agent-session-provider";
 import { VoiceAgentInterface } from "@/components/VoiceAgentInterface";
 import { useAccount } from "@/components/account-context";
+
+// 模块级 trace（环形缓存+TTL 有界，见 lib/logger.ts 头注释）：数据加载/设备应用失败不再静默。
+const log = startTrace({ operation: "web.call-studio" });
 
 function AgentStateLabel({ state }: { state: string }) {
   const map: Record<string, { label: string; color: string }> = {
@@ -216,7 +220,11 @@ function MicLevelMeter({ room }: { room: Room | null }) {
     return () => {
       cancelAnimationFrame(raf);
       room.localParticipant.off("trackPublished", onTrack);
-      if (ctx) void ctx.close().catch(() => {});
+      if (ctx) {
+        void ctx.close().catch((e: unknown) =>
+          log.warn("mic meter ctx close failed", { err: e instanceof Error ? e.message : String(e) }),
+        );
+      }
     };
   }, [room]);
 
@@ -245,7 +253,7 @@ function AudioDevicesCard({ room }: { room: Room | null }) {
   const [outputCanSwitch, setOutputCanSwitch] = useState(false);
   const [outId, setOutId] = useState("");
   useEffect(() => {
-    setOutputCanSwitch(isTauriShell() || webCanSwitchOutput());
+    setOutputCanSwitch(webCanSwitchOutput());
     setOutId(savedOutputDevice());
   }, []);
 
@@ -259,7 +267,9 @@ function AudioDevicesCard({ room }: { room: Room | null }) {
     setMicId(next);
     if (next) saveMicDevice(next);
     if (next && next !== savedMic && room) {
-      room.switchActiveDevice("audioinput", next, false).catch(() => {});
+      room.switchActiveDevice("audioinput", next, false).catch((e: unknown) =>
+        log.error("restore saved mic hot-switch failed", e, { id: next.slice(0, 12) }),
+      );
     }
   };
   useEffect(() => {
@@ -267,7 +277,11 @@ function AudioDevicesCard({ room }: { room: Room | null }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [room]);
   useEffect(() => {
-    if (outputCanSwitch) listAudioDevicesOf("output").then(setOutputDevices).catch(() => {});
+    if (outputCanSwitch) {
+      listAudioDevicesOf("output").then(setOutputDevices).catch((e: unknown) =>
+        log.error("list output devices failed", e),
+      );
+    }
   }, [outputCanSwitch]);
 
   const changeOutput = async (id: string) => {
@@ -275,12 +289,11 @@ function AudioDevicesCard({ room }: { room: Room | null }) {
     setOutId(id);
     try {
       localStorage.setItem("bok.audio.out", id);
-    } catch {
+    } catch (e) {
       /* ignore */
+      log.warn("persist output device failed", { err: e instanceof Error ? e.message : String(e) });
     }
-    if (isTauriShell()) {
-      await applyOutputDevice(id);
-    } else if (room) {
+    if (room) {
       await switchWebOutputDevice(room, id);
     }
   };
@@ -300,7 +313,9 @@ function AudioDevicesCard({ room }: { room: Room | null }) {
                 if (!id) return;
                 setMicId(id);
                 saveMicDevice(id);
-                void room?.switchActiveDevice("audioinput", id, false).catch(() => {});
+                void room?.switchActiveDevice("audioinput", id, false).catch((e: unknown) =>
+                  log.error("switch mic failed", e, { id: id.slice(0, 12) }),
+                );
               }}
             >
               {micDevices.length === 0 && <option value="">未检测到麦克风</option>}
@@ -372,8 +387,9 @@ function HistoryTranscript({ callId }: { callId: string }) {
       try {
         const rows = await api.getTurns(callId);
         if (!stopped) setTurns(Array.isArray(rows) ? rows : []);
-      } catch {
+      } catch (e) {
         /* CP 一时不可达等下轮 */
+        log.warn("load turns failed; will retry", { err: e instanceof Error ? e.message : String(e) });
       }
     };
     void load();
@@ -516,8 +532,9 @@ function CallStudioInner({
   const lsSet = (k: string, v: string) => {
     try {
       window.localStorage.setItem(k, v);
-    } catch {
+    } catch (e) {
       /* ignore */
+      log.warn("persist last-selection failed", { key: k, err: e instanceof Error ? e.message : String(e) });
     }
   };
   const [stateCallId, setStateCallId] = useState(callId);
@@ -609,8 +626,9 @@ function CallStudioInner({
         if (stopped) return;
         setWaStatus(String(c.whatsapp_status ?? ""));
         setWaNum(String(c.customer_whatsapp ?? ""));
-      } catch {
+      } catch (e) {
         /* control-plane 一時唔得就等下輪 */
+        log.warn("poll call status failed; wait next tick", { err: e instanceof Error ? e.message : String(e) });
       }
     };
     load();
@@ -726,7 +744,9 @@ function CallStudioInner({
   // 拉取全局设置：右栏 Provider 卡显示实际生效的 provider(而非硬编码)。
   useEffect(() => {
     let cancelled = false;
-    api.getSettings().then((s) => { if (!cancelled) setSettings(s); }).catch(() => {});
+    api.getSettings().then((s) => { if (!cancelled) setSettings(s); }).catch((e: unknown) =>
+      log.error("load settings failed", e),
+    );
     return () => { cancelled = true; };
   }, [cp.attempt]);
 
@@ -753,13 +773,19 @@ function CallStudioInner({
   // Fetch object / persona when selected or resolved from a call.
   useEffect(() => {
     if (!objId) return;
-    api.getObject(objId).then(setObject).catch(() => {});
+    api.getObject(objId).then(setObject).catch((e: unknown) =>
+      log.error("load object failed", e, { objId }),
+    );
     // 该对象历史沉淀主题（结算时 Summarizer 蒸馏写入），用于左栏展示。
-    api.getObjectTopics(objId).then(setObjectTopics).catch(() => {});
+    api.getObjectTopics(objId).then(setObjectTopics).catch((e: unknown) =>
+      log.error("load object topics failed", e, { objId }),
+    );
   }, [objId]);
   useEffect(() => {
     if (!personaId) return;
-    api.getPersona(personaId).then(setPersona).catch(() => {});
+    api.getPersona(personaId).then(setPersona).catch((e: unknown) =>
+      log.error("load persona failed", e, { personaId }),
+    );
   }, [personaId]);
 
   // 记住每次选择：新建通话/挂断後还原到上次用的人设与对象。
@@ -828,14 +854,19 @@ function CallStudioInner({
       setConnecting(false);
       phase = "join-session";
       // 应用用户选择的音频设备：麦克风先设默认采集设备（session.start 开麦时会采用），
-      // 扬声器：桌面壳切系统默认输出；浏览器经 livekit setSinkId。
+      // 扬声器：浏览器经 livekit setSinkId（Chromium；Safari 回退系统默认）。
       const micDeviceId = savedMicDevice();
       const outputDeviceId = savedOutputDevice();
       // 非 exact：设备不存在/已插拔时回退默认，避免采集失败（exact 会 reject）。
-      if (micDeviceId) await session.room.switchActiveDevice("audioinput", micDeviceId, false).catch(() => {});
-      if (outputDeviceId) {
-        if (isTauriShell()) await applyOutputDevice(outputDeviceId).catch(() => {});
-        else if (webCanSwitchOutput()) await switchWebOutputDevice(session.room, outputDeviceId).catch(() => {});
+      if (micDeviceId) {
+        await session.room.switchActiveDevice("audioinput", micDeviceId, false).catch((e: unknown) =>
+          log.error("apply saved mic before connect failed", e, { id: micDeviceId.slice(0, 12) }),
+        );
+      }
+      if (outputDeviceId && webCanSwitchOutput()) {
+        await switchWebOutputDevice(session.room, outputDeviceId).catch((e: unknown) =>
+          log.error("apply output device (web sink) failed", e, { id: outputDeviceId.slice(0, 12) }),
+        );
       }
       // 连接前预缓冲 + 接通一步到位:麦克风采集放进 session.start 的 tracks
       // (与 token/连房并行,gum 即刻返回,连接完成后发布落地)。旧写法先在
@@ -861,7 +892,13 @@ function CallStudioInner({
         setConnecting(false);
         return;
       }
-      if (!canPlayAudio) startAudio().catch(() => {});
+      if (!canPlayAudio) {
+        startAudio().catch((e: unknown) =>
+          log.warn("startAudio rejected (autoplay policy?) — 点击页面后可用", {
+            err: e instanceof Error ? e.message : String(e),
+          }),
+        );
+      }
     } catch (e) {
       console.error("connect failed", e);
       setError(describeConnectError(e, phase));
@@ -874,8 +911,9 @@ function CallStudioInner({
     // 先断开官方会话，再挂断 + 结算（业务流保留）。
     try {
       await session.end();
-    } catch {
+    } catch (e) {
       /* ignore */
+      log.error("session end failed on leave", e);
     }
     if (stateCallId) {
       try {
@@ -891,8 +929,9 @@ function CallStudioInner({
           const s = await api.getSettlement(stateCallId);
           setSettlement(s);
           break;
-        } catch {
+        } catch (e) {
           /* 404=在途,继续重试 */
+          log.warn("settlement not ready; retry", { attempt: i + 1, err: e instanceof Error ? e.message : String(e) });
         }
       }
     }

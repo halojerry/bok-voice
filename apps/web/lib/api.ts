@@ -82,6 +82,14 @@ export const api = {
       if (!res.ok) throw await toError(res);
       return res.json() as Promise<Record<string, unknown>>;
     }),
+  // ---- MiniMax 云端声音克隆（路线 B）：清单存 tts.minimax_clones_json ----
+  listMinimaxVoices: () => request<Record<string, unknown>[]>("/api/tts/minimax-voices"),
+  registerMinimaxVoice: (body: FormData) =>
+    fetch(`${apiBase()}/api/tts/minimax-voices`, { method: "POST", body, headers: authHeaders() }).then(async (res) => {
+      if (!res.ok) throw await toError(res);
+      return res.json() as Promise<Record<string, unknown>>;
+    }),
+  deleteMinimaxVoice: (voiceId: string) => request<Record<string, unknown>>(`/api/tts/minimax-voices/${encodeURIComponent(voiceId)}`, { method: "DELETE" }),
   previewTts: async (body: { text: string; voice?: string; language?: string; instruct?: string; sample_rate?: number; provider?: string }) => {
     const res = await fetch(`${apiBase()}/api/tts/preview`, {
       method: "POST",

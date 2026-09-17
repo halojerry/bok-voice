@@ -583,6 +583,182 @@ async def tts_register_voice(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+# ---- MiniMax 云端声音克隆（路线 B，2026-09-18）----
+# 官方两步：/v1/files/upload(purpose=voice_clone) → /v1/voice_clone。克隆音色与
+# 系统音色走同一 voice_setting.voice_id 通道（t2a_v2 / bidi 双支持）——运行时
+# 零改动，B 线会话级音色选择器/设置页三键天然可挂。
+# 拍板「先克隆不激活」（2026-09-18）：克隆请求不带 text/model（不触发合成=
+# 0 费用）；MiniMax 规则——克隆后 7 天内未用于合成会被删除、首次用于合成才收
+# ¥9.9/音色复刻费，即试听或首次会话使用即激活计费。账号需实名/企业认证（未
+# 认证 2038）。清单存 tts.minimax_clones_json（settings blob，免 DB 迁移）。
+
+
+def _minimax_clone_base() -> str:
+    """克隆端点基址（…/v1）：MINIMAX_BASE_URL 覆盖优先（容忍 /v1/t2a_v2 全形态，
+    剥回 /v1）；否则按 region——cn=api.minimax.cn（现行国内）；intl 沿用 TTS 同款
+    遗留域 api.minimax.chat（海外现行文档为 api.minimax.io，账号区不通时 env 覆盖）。"""
+    base = os.environ.get("MINIMAX_BASE_URL", "").strip().rstrip("/")
+    if base:
+        return base[: -len("/t2a_v2")] if base.endswith("/t2a_v2") else base
+    region = os.environ.get("MINIMAX_REGION", "cn").strip().lower()
+    return "https://api.minimax.chat/v1" if region in {"intl", "global", "chat"} else "https://api.minimax.cn/v1"
+
+
+def _minimax_api_key() -> str:
+    """照 /api/tts/preview 同源：settings 持久化 tts.api_key 优先，env 兜底。"""
+    tts_settings = (_repo().get_settings() or {}).get("tts") or {}
+    return (str(tts_settings.get("api_key") or "").strip()) or os.environ.get("MINIMAX_API_KEY", "")
+
+
+def _minimax_clones_list(tts_settings: dict) -> list[dict]:
+    raw = str(tts_settings.get("minimax_clones_json") or "[]")
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _save_minimax_clones(clones: list[dict]) -> None:
+    # save_settings 是整段替换语义——读全量、只改 tts 段、原样回写其余 sections。
+    settings = _repo().get_settings() or {}
+    tts_blob = dict(settings.get("tts") or {})
+    tts_blob["minimax_clones_json"] = json.dumps(clones, ensure_ascii=False)
+    settings["tts"] = tts_blob
+    _repo().save_settings(settings)
+
+
+@app.get("/api/tts/minimax-voices")
+async def tts_minimax_voices_list(request: Request) -> list[dict]:
+    # 克隆清单是本地面板数据（settings blob），读面归管理面（同 tts_voices）。
+    _gate_page(request, "settings")
+    return _minimax_clones_list((_repo().get_settings() or {}).get("tts") or {})
+
+
+@app.post("/api/tts/minimax-voices")
+async def tts_minimax_voice_clone(
+    request: Request,
+    file: UploadFile = File(...),
+    label: str = Form(""),
+    sample_lang: str = Form("zh"),
+) -> dict:
+    """参考音频 → MiniMax 云端克隆 voice_id（不激活、0 费用；见节首注释）。"""
+    require_role(request, "admin", "root")
+    label = label.strip()[:64]
+    sample_lang = (sample_lang.strip().lower() or "zh")[:16]
+    audio = await file.read()
+    if not audio:
+        raise HTTPException(status_code=400, detail="参考音频为空")
+    if len(audio) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="参考音频超过 20MB 上限（官方规则 ≤20MB，10s~5min）")
+    api_key = _minimax_api_key()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="MiniMax API Key 未配置：请到「设置 → TTS 语音合成」填写 API Key 并保存")
+    base = _minimax_clone_base()
+    headers = {"Authorization": f"Bearer {api_key}"}
+    # 命名规则（官方）：[8,256]、首字符字母、仅字母/数字/-/_、尾字符不可 -/_；
+    # bokclone 前缀避开本地 Qwen3 克隆前缀 agent-/acceptance-（B/A 线
+    # _cloud_voice 过滤闸会把它当本地音色剔除，2054 防线不受影响）。
+    voice_id = f"bokclone{uuid.uuid4().hex[:8]}"
+
+    def _audit_clone(outcome: str = "ok", **extra: Any) -> None:
+        _audit("voice.clone", subject_type="minimax_voice", subject_id=voice_id,
+               outcome=outcome, detail={"label": label, "sample_lang": sample_lang, **extra})
+
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            up = await client.post(
+                f"{base}/files/upload",
+                headers=headers,
+                data={"purpose": "voice_clone"},
+                files={"file": (file.filename or "reference.wav", audio)},
+            )
+            up.raise_for_status()
+            up_body = up.json()
+            file_id = ((up_body.get("file") or {}) if isinstance(up_body, dict) else {}).get("file_id")
+            if not file_id:
+                _audit_clone("error", step="files.upload")
+                raise HTTPException(status_code=502, detail=f"MiniMax 参考音频上传失败: {json.dumps(up_body, ensure_ascii=False)[:256]}")
+            clone = await client.post(
+                f"{base}/voice_clone",
+                headers={**headers, "Content-Type": "application/json"},
+                json={"file_id": file_id, "voice_id": voice_id},
+            )
+            clone.raise_for_status()
+            clone_body = clone.json()
+            base_resp = clone_body.get("base_resp") or {}
+            code = base_resp.get("status_code")
+            if code != 0:
+                msg = str(base_resp.get("status_msg") or f"status_code={code}")
+                _audit_clone("error", step="voice_clone", minimax_code=code)
+                if code == 2038:
+                    raise HTTPException(status_code=403, detail="MiniMax 账号无复刻权限（2038）：请先在 MiniMax 平台完成实名/企业认证")
+                raise HTTPException(status_code=502, detail=f"MiniMax voice_clone 失败: {msg}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _audit_clone("error", step="http", error=str(exc)[:256])
+        raise HTTPException(status_code=502, detail=f"MiniMax 克隆请求失败: {exc}") from exc
+
+    clones = _minimax_clones_list((_repo().get_settings() or {}).get("tts") or {})
+    clones.append({
+        "voice_id": voice_id,
+        "label": label or voice_id,
+        "sample_lang": sample_lang,
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        # 未激活：7 天内首次合成（试听/会话）才计费 ¥9.9 并正式生效。
+        "activated": False,
+    })
+    _save_minimax_clones(clones)
+    _audit_clone()
+    return {"voice_id": voice_id, "label": label or voice_id, "sample_lang": sample_lang,
+            "activated": False, "note": "未激活：7 天内首次合成（试听/会话使用）即激活并计费 ¥9.9/音色"}
+
+
+@app.delete("/api/tts/minimax-voices/{voice_id}")
+async def tts_minimax_voice_delete(voice_id: str, request: Request) -> dict:
+    require_role(request, "admin", "root")
+    api_key = _minimax_api_key()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="MiniMax API Key 未配置：请到「设置 → TTS 语音合成」填写 API Key 并保存")
+    base = _minimax_clone_base()
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{base}/delete_voice",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"voice_type": "voice_cloning", "voice_id": voice_id},
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            base_resp = body.get("base_resp") or {}
+            if base_resp.get("status_code") != 0:
+                raise HTTPException(status_code=502, detail=f"MiniMax delete_voice 失败: {base_resp.get('status_msg') or base_resp}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"MiniMax 删除音色失败: {exc}") from exc
+    # 本地清单移除 + 人设引用清理（reference_audio 是 {lang: voice_id} JSON）。
+    clones = [c for c in _minimax_clones_list((_repo().get_settings() or {}).get("tts") or {})
+              if str(c.get("voice_id")) != voice_id]
+    _save_minimax_clones(clones)
+    for p in _repo().list_personas(""):
+        raw = p.get("reference_audio") or ""
+        if voice_id not in raw:
+            continue
+        try:
+            mapping = json.loads(raw)
+            if isinstance(mapping, dict):
+                before = dict(mapping)
+                mapping = {k: v for k, v in mapping.items() if v != voice_id}
+                if mapping != before:
+                    _repo().update_persona(p["id"], {"reference_audio": json.dumps(mapping, ensure_ascii=False)})
+        except Exception:
+            continue
+    _audit("voice.delete", subject_type="minimax_voice", subject_id=voice_id, detail={"voice_id": voice_id})
+    return {"ok": True, "voice_id": voice_id}
+
+
 @app.get("/api/tts/filler-preview")
 def tts_filler_preview(lang: str = "zh", i: int = 0, request: Request = None) -> Response:
     """垫话资产试听（2026-09-11 症状④）：直接吐源码 wav（随包分发,零云调用）。
@@ -3671,6 +3847,7 @@ async def ingest_session_report(call_id: str, request: Request) -> dict:
                 subject_id=call_id,
                 account_id=_cur.get("account_id", ""),
                 outcome="ghost_overwrite",
+                call_id=call_id,
             )
             raise HTTPException(
                 status_code=409,
@@ -3679,7 +3856,7 @@ async def ingest_session_report(call_id: str, request: Request) -> dict:
         row = _repo().update_call(call_id, session_report=json.dumps(payload, ensure_ascii=False, default=str))
         if not row:
             raise HTTPException(status_code=404, detail="call not found")
-        _audit("call.session_report", subject_type="call", subject_id=call_id, account_id=row.get("account_id", ""))
+        _audit("call.session_report", subject_type="call", subject_id=call_id, account_id=row.get("account_id", ""), call_id=call_id)
         return {"call_id": call_id, "stored": True}
     # ---- worker 非空：per-worker 历史 upsert（P1-A） ----
     try:
@@ -3709,6 +3886,7 @@ async def ingest_session_report(call_id: str, request: Request) -> dict:
         subject_type="call",
         subject_id=call_id,
         account_id=row.get("account_id", ""),
+        call_id=call_id,
         detail={"worker": worker[:64], "replaced": replaced,
                 "ended_merge": str(_cur.get("status") or "") == "ended"},
     )

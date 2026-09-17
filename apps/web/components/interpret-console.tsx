@@ -40,6 +40,7 @@ import { AgentSessionProvider } from "@/components/agents-ui/agent-session-provi
 import { api, apiBase } from "@/lib/api";
 import { describeConnectError } from "@/lib/api-ready";
 import { wlog, wlogBindCall } from "@/lib/weblog";
+import { startTrace } from "@/lib/logger";
 import {
   deviceRoleIssues,
   expectedScript,
@@ -48,7 +49,6 @@ import {
   type RoleSlot,
 } from "@/lib/device-roles";
 import {
-  applyOutputDevice,
   listAudioDevicesOf,
   requestMicPermission,
   savedMicDevice,
@@ -60,6 +60,9 @@ import {
 } from "@/lib/audio";
 
 const LANG_SHORT: Record<string, string> = { zh: "中", cantonese: "粤", en: "EN" };
+
+// 模块级 trace（环形缓存+TTL 有界，见 lib/logger.ts 头注释）：设备/路由失败不再静默。
+const log = startTrace({ operation: "web.interpret-console" });
 
 export type ConsoleProps = {
   account: string;
@@ -152,10 +155,14 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
               setOthMicId(oth);
               // me 会话可能已在连/已用默认麦:当即切换(已发布轨热切,未发布走
               // audioCaptureDefaults);other 房尚未连接,连接 effect 会读到新值。
-              meRoomRef.current?.switchActiveDevice("audioinput", me, true).catch(() => {});
+              meRoomRef.current?.switchActiveDevice("audioinput", me, true).catch((e: unknown) =>
+                log.error("auto-assign mic hot-switch failed (me)", e, { id: me.slice(0, 12) }),
+              );
               // other 房可能已连(权限弹窗令枚举晚于连接,review P1):连接期的
               // switchActiveDevice 已跑过,不补切会停留在默认麦而下拉显示已分配。
-              otherRoomRef.current?.switchActiveDevice("audioinput", oth, true).catch(() => {});
+              otherRoomRef.current?.switchActiveDevice("audioinput", oth, true).catch((e: unknown) =>
+                log.error("auto-assign mic hot-switch failed (other)", e, { id: oth.slice(0, 12) }),
+              );
             }
           }
         }
@@ -522,8 +529,9 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
     setHearOrigState(v);
     try {
       localStorage.setItem("bok_interp_hear_orig", v ? "1" : "0");
-    } catch {
+    } catch (e) {
       /* 隐私模式等场景持久化失败不阻功能 */
+      log.warn("persist hear-orig pref failed", { err: e instanceof Error ? e.message : String(e) });
     }
   }, []);
   useEffect(() => {
@@ -593,7 +601,9 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
         }
         await room.connect(tok.serverUrl, tok.participantToken);
         if (cancelled) {
-          room.disconnect().catch(() => {});
+          room.disconnect().catch((e: unknown) =>
+            log.warn("other room disconnect after cancel failed", { err: e instanceof Error ? e.message : String(e) }),
+          );
           return;
         }
         await room.localParticipant.setMicrophoneEnabled(othMicOn && interpOnRef.current);
@@ -602,7 +612,9 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
         wlog("other_connected");
         setOtherConnected(true);
         setOtherRoomVersion((v) => v + 1);
-        await room.startAudio().catch(() => {});
+        await room.startAudio().catch((e: unknown) =>
+          log.warn("other room startAudio failed (autoplay policy?)", { err: e instanceof Error ? e.message : String(e) }),
+        );
       } catch (e) {
         if (!cancelled) {
           const raw = e instanceof Error ? e.message : String(e ?? "");
@@ -618,7 +630,11 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
       cancelled = true;
       const r = otherRoomRef.current;
       otherRoomRef.current = null;
-      if (r) r.disconnect().catch(() => {});
+      if (r) {
+        r.disconnect().catch((e: unknown) =>
+          log.warn("other room disconnect on unmount failed", { err: e instanceof Error ? e.message : String(e) }),
+        );
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [callId, meConnected]);
@@ -643,11 +659,20 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
       if (ok) return;
       console.warn(`mic hot-switch failed: ${who} -> ${id}, rolling back to ${prevId || "default"}`);
       try {
-        if (prevId) await room.switchActiveDevice("audioinput", prevId, true).catch(() => {});
-        await room.localParticipant.setMicrophoneEnabled(false).catch(() => {});
-        await room.localParticipant.setMicrophoneEnabled(true).catch(() => {});
-      } catch {
+        if (prevId) {
+          await room.switchActiveDevice("audioinput", prevId, true).catch((e: unknown) =>
+            log.error("mic rollback: switch back failed", e, { who, id: prevId.slice(0, 12) }),
+          );
+        }
+        await room.localParticipant.setMicrophoneEnabled(false).catch((e: unknown) =>
+          log.warn("mic rollback: mute failed", { who, err: e instanceof Error ? e.message : String(e) }),
+        );
+        await room.localParticipant.setMicrophoneEnabled(true).catch((e: unknown) =>
+          log.warn("mic rollback: unmute failed", { who, err: e instanceof Error ? e.message : String(e) }),
+        );
+      } catch (e) {
         /* 回滚尽力而为 */
+        log.warn("mic rollback step threw", { who, err: e instanceof Error ? e.message : String(e) });
       }
       revert();
       setError(
@@ -675,11 +700,10 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
       // 真实放音在 AudioContext router(元素级 sink 已被 crbug 40647375 废掉,
       // 旧 applyDualOutput→room.switchActiveDevice 是证伪死路径,选了等于没选)。
       // 即刻直投 router,不等 effect 链/连房状态;失败经 onSinkError 浮 UI。
+      // WebKit(Safari/WKWebView)无 ctx.setSinkId → 回退系统默认输出(持久化仅存档)。
       void getRouter("me").setSink(id || "default");
-      // 非 Chromium 壳(WKWebView):ctx.setSinkId 不存在 → 走桌面壳原生系统输出。
-      if (!canDual) void applyOutputDevice(id).catch(() => {});
     },
-    [getRouter, canDual],
+    [getRouter],
   );
   const pickOthMic = useCallback(
     (id: string) => {
@@ -698,9 +722,9 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
     setOthOutId(id);
     saveOutputDevice(id, "other");
     // 同 pickMeOut:直投 ctx router(真实放音路径),不走已证伪的元素级死路径。
+    // WebKit 无 ctx.setSinkId → 回退系统默认输出(持久化仅存档)。
     void getRouter("oth").setSink(id || "default");
-    if (!canDual) void applyOutputDevice(id).catch(() => {});
-  }, [getRouter, canDual]);
+  }, [getRouter]);
 
   // ---- 麦克风开关:按钮只改人工意图,生效值由本 effect 统一投到房间 ----
   // 生效值 = 人工开关 && !自动暂让——暂让结束后按人工意图恢复,人工静音始终优先。
@@ -708,13 +732,17 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   const toggleOthMic = useCallback(() => setOthMicOn((v) => !v), []);
   useEffect(() => {
     if (!meConnected) return;
-    meRoom.localParticipant.setMicrophoneEnabled(meMicOn && !meHeld && !voiceHoldMe && interpOn).catch(() => {});
+    meRoom.localParticipant.setMicrophoneEnabled(meMicOn && !meHeld && !voiceHoldMe && interpOn).catch((e: unknown) =>
+      log.warn("apply me mic enabled state failed", { on: meMicOn, err: e instanceof Error ? e.message : String(e) }),
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [meMicOn, meHeld, voiceHoldMe, meConnected, interpOn]);
   useEffect(() => {
     const r = otherRoomRef.current;
     if (!otherConnected || !r) return;
-    r.localParticipant.setMicrophoneEnabled(othMicOn && !othHeld && !voiceHoldOth && interpOn).catch(() => {});
+    r.localParticipant.setMicrophoneEnabled(othMicOn && !othHeld && !voiceHoldOth && interpOn).catch((e: unknown) =>
+      log.warn("apply other mic enabled state failed", { on: othMicOn, err: e instanceof Error ? e.message : String(e) }),
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [othMicOn, othHeld, voiceHoldOth, otherConnected, interpOn]);
 
@@ -861,9 +889,17 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   // 切回共享扬声器:显式回系统默认输出(sinkId="default"),避免残留上一档路由。
   useEffect(() => {
     if (outputMode !== "shared" || !canDual) return;
-    if (meConnected) meRoom.switchActiveDevice("audiooutput", "default", false).catch(() => {});
+    if (meConnected) {
+      meRoom.switchActiveDevice("audiooutput", "default", false).catch((e: unknown) =>
+        log.warn("reset me output to default failed", { err: e instanceof Error ? e.message : String(e) }),
+      );
+    }
     const r = otherRoomRef.current;
-    if (otherConnected && r) r.switchActiveDevice("audiooutput", "default", false).catch(() => {});
+    if (otherConnected && r) {
+      r.switchActiveDevice("audiooutput", "default", false).catch((e: unknown) =>
+        log.warn("reset other output to default failed", { err: e instanceof Error ? e.message : String(e) }),
+      );
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [outputMode, meConnected, otherConnected, canDual]);
 
@@ -954,12 +990,17 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
     try {
       try {
         await Promise.race([meSession.end(), new Promise((r) => setTimeout(r, 5000))]);
-      } catch {
+      } catch (e) {
         /* ignore */
+        log.error("me session end failed on leave", e);
       }
       const r = otherRoomRef.current;
       otherRoomRef.current = null;
-      if (r) await Promise.race([r.disconnect(), new Promise((res) => setTimeout(res, 3000))]).catch(() => {});
+      if (r) {
+        await Promise.race([r.disconnect(), new Promise((res) => setTimeout(res, 3000))]).catch((e: unknown) =>
+          log.error("other room disconnect failed on leave", e),
+        );
+      }
       await api.hangup(callId).catch((e) => {
         if (!String(e).includes("404")) console.warn("hangup failed", e);
       });
@@ -1602,7 +1643,11 @@ function ConsoleLive(p: LiveProps) {
             <span className="flex-1" />
             <button
               className="rounded-full border border-white/30 px-2.5 py-1 text-white/70"
-              onClick={() => popRef.current?.requestFullscreen?.().catch(() => {})}
+              onClick={() =>
+                popRef.current?.requestFullscreen?.().catch((e: unknown) =>
+                  log.warn("requestFullscreen rejected", { err: e instanceof Error ? e.message : String(e) }),
+                )
+              }
             >
               全屏
             </button>
@@ -1746,7 +1791,11 @@ function createMicMeter() {
       if (track !== wired) {
         try {
           ctx = ctx ?? new AudioContext();
-          if (ctx.state === "suspended") void ctx.resume().catch(() => {});
+          if (ctx.state === "suspended") {
+            void ctx.resume().catch((e: unknown) =>
+              log.warn("mic meter ctx resume failed", { err: e instanceof Error ? e.message : String(e) }),
+            );
+          }
           src?.disconnect();
           an = ctx.createAnalyser();
           an.fftSize = 1024;
@@ -1766,13 +1815,16 @@ function createMicMeter() {
     dispose() {
       try {
         src?.disconnect();
-      } catch {
+      } catch (e) {
         /* 已断 */
+        log.warn("mic meter dispose disconnect failed", { err: e instanceof Error ? e.message : String(e) });
       }
       src = null;
       an = null;
       wired = null;
-      ctx?.close().catch(() => {});
+      ctx?.close().catch((e: unknown) =>
+        log.warn("mic meter ctx close failed", { err: e instanceof Error ? e.message : String(e) }),
+      );
       ctx = null;
     },
   };
@@ -1785,7 +1837,11 @@ function createAudioRouter(who: string, onSinkError?: (id: string, err: unknown)
   const sources = new Map<string, { src: MediaStreamAudioSourceNode; primer: HTMLAudioElement }>();
   const ensure = () => {
     ctx = ctx ?? new AudioContext();
-    if (ctx.state === "suspended") ctx.resume().catch(() => {});
+    if (ctx.state === "suspended") {
+      ctx.resume().catch((e: unknown) =>
+        log.warn("audio router ctx resume failed", { who, err: e instanceof Error ? e.message : String(e) }),
+      );
+    }
     return ctx;
   };
   const applySink = async (id: string) => {
@@ -1795,8 +1851,12 @@ function createAudioRouter(who: string, onSinkError?: (id: string, err: unknown)
     if (c.state !== "running") {
       try {
         await c.resume();
-      } catch {
+      } catch (e) {
         /* 手势缺失:维持现状,后续 resume() 补投 */
+        log.warn("audio router pre-sink resume failed; resume() will retry", {
+          who,
+          err: e instanceof Error ? e.message : String(e),
+        });
       }
     }
     const sinkCtx = c as AudioContext & { setSinkId?: (id: string) => Promise<void>; sinkId?: string };
@@ -1822,7 +1882,9 @@ function createAudioRouter(who: string, onSinkError?: (id: string, err: unknown)
         primer.autoplay = true;
         primer.style.display = "none";
         document.body.appendChild(primer);
-        primer.play().catch(() => {});
+        primer.play().catch((e: unknown) =>
+          log.warn("primer element play rejected (autoplay policy?)", { who, err: e instanceof Error ? e.message : String(e) }),
+        );
         const src = c.createMediaStreamSource(new MediaStream([mediaTrack]));
         src.connect(c.destination);
         sources.set(trackSid, { src, primer });
@@ -1836,8 +1898,9 @@ function createAudioRouter(who: string, onSinkError?: (id: string, err: unknown)
       if (s) {
         try {
           s.src.disconnect();
-        } catch {
+        } catch (e) {
           /* 已断 */
+          log.warn("audio router source disconnect failed", { who, err: e instanceof Error ? e.message : String(e) });
         }
         s.primer.srcObject = null;
         s.primer.remove();
@@ -1864,23 +1927,36 @@ function createAudioRouter(who: string, onSinkError?: (id: string, err: unknown)
       if (ctx && ctx.state === "suspended") {
         ctx.resume()
           .then(() => {
-            if (lastSink) void applySink(lastSink).catch(() => {});
+            if (lastSink) {
+              void applySink(lastSink).catch((e: unknown) =>
+                log.warn("audio router re-apply sink after resume failed", {
+                  who,
+                  sink: lastSink.slice(0, 12),
+                  err: e instanceof Error ? e.message : String(e),
+                }),
+              );
+            }
           })
-          .catch(() => {});
+          .catch((e: unknown) =>
+            log.warn("audio router resume failed", { who, err: e instanceof Error ? e.message : String(e) }),
+          );
       }
     },
     dispose() {
       for (const s of sources.values()) {
         try {
           s.src.disconnect();
-        } catch {
+        } catch (e) {
           /* 已断 */
+          log.warn("audio router dispose disconnect failed", { who, err: e instanceof Error ? e.message : String(e) });
         }
         s.primer.srcObject = null;
         s.primer.remove();
       }
       sources.clear();
-      ctx?.close().catch(() => {});
+      ctx?.close().catch((e: unknown) =>
+        log.warn("audio router ctx close failed", { who, err: e instanceof Error ? e.message : String(e) }),
+      );
       ctx = null;
     },
   };
@@ -1895,14 +1971,21 @@ function watchTransAudio(room: Room | null, setHeld: (v: boolean) => void): () =
     if (!String(pub.trackName ?? "").startsWith("trans-")) return;
     try {
       ctx = ctx ?? new AudioContext();
-      if (ctx.state === "suspended") ctx.resume().catch(() => {});
+      if (ctx.state === "suspended") {
+        ctx.resume().catch((e: unknown) =>
+          log.warn("trans audio ctx resume failed", { err: e instanceof Error ? e.message : String(e) }),
+        );
+      }
       const source = ctx.createMediaStreamSource(new MediaStream([track.mediaStreamTrack]));
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 1024;
       source.connect(analyser);
       nodes.set(track.sid, { source, analyser });
-    } catch {
+    } catch (e) {
       /* ignore */
+      log.warn("trans audio analyser attach failed — half-duplex degraded for this track", {
+        err: e instanceof Error ? e.message : String(e),
+      });
     }
   };
   const detach = (track: RemoteTrack) => {
@@ -1923,13 +2006,25 @@ function watchTransAudio(room: Room | null, setHeld: (v: boolean) => void): () =
   let busyUntil = 0;
   let heldSince = 0;
   let quietUntil = 0;
+  // resume 失败打点节流:本 tick 120ms 一次,suspended 持续被拒时 5s 一条足够。
+  let lastResumeWarnAt = 0;
   const timer = window.setInterval(() => {
     // 看门狗(2026-09-11 审计 P0-3):AudioContext 被系统挂起(WKWebView 切后台/
     // 长会话音频路由切换)时 analyser 数据会冻结在最后一帧——冻结在响段令
     // busyUntil 无限续期、对向麦克风被永久暂让(fail-closed = 零翻译)。持续
     // resume + 单次连续 hold 超 10s 强制释放并给 5s 说话冷却窗(fail-open 串译
     // 优于永久压麦,用户可用手动静音按钮兜底)。
-    if (ctx && ctx.state !== "running") ctx.resume().catch(() => {});
+    if (ctx && ctx.state !== "running") {
+      ctx.resume().catch((e: unknown) => {
+        const at = Date.now();
+        if (at - lastResumeWarnAt > 5000) {
+          lastResumeWarnAt = at;
+          log.warn("trans audio ctx resume keeps failing (half-duplex at risk)", {
+            err: e instanceof Error ? e.message : String(e),
+          });
+        }
+      });
+    }
     const now = Date.now();
     let loud = false;
     if (now >= quietUntil) {
@@ -1962,12 +2057,17 @@ function watchTransAudio(room: Room | null, setHeld: (v: boolean) => void): () =
     for (const { source } of nodes.values()) {
       try {
         source.disconnect();
-      } catch {
+      } catch (e) {
         /* ignore */
+        log.warn("trans audio source disconnect failed on cleanup", { err: e instanceof Error ? e.message : String(e) });
       }
     }
     nodes.clear();
-    if (ctx) ctx.close().catch(() => {});
+    if (ctx) {
+      ctx.close().catch((e: unknown) =>
+        log.warn("trans audio ctx close failed on cleanup", { err: e instanceof Error ? e.message : String(e) }),
+      );
+    }
   };
 }
 

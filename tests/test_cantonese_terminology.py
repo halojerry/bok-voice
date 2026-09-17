@@ -39,6 +39,9 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     "tests/test_interpret_tts_provider.py": re.compile(r"Chinese,Yue"),
     "tests/test_fixed_language_call.py": re.compile(r"Chinese,Yue"),
     "scripts/test_volcano_v3.py": None,
+    # 计划文档里的粤语文本检测示例代码（_YUE_MARKS 正则只是「识别粤语字」的
+    # 变量名，非语言字段赋值）——4b0dd6b 存量，按门禁政策文档白名单收口。
+    "docs/superpowers/plans/2026-09-17-qa-canvas-phase1.md": re.compile(r"_YUE_MARKS"),
     # MiniMax ASR BCP-47 语言头外部枚举(粤语=yue,asr-1.0 /v1/speech_to_text 真字面量,
     # 同 language_boost 政策):只豁免带该枚举值的行,探针内部语言字段一律 cantonese。
     "scripts/probe_cloud_asr_ab.py": re.compile(r'"yue"'),
