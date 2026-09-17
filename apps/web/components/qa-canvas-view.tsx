@@ -1,12 +1,15 @@
 "use client";
 
-// QA 画布视图(spec §4.3/§4.4,2026-09-17 Phase1)。只读渲染在本文件;
-// 连线/断线编辑回调经 props 上抛(page.tsx 持数据与 PATCH)。
+// QA 画布视图(spec §4.3/§4.4,2026-09-17 Phase1)。渲染+编辑交互在本文件:
+// 连线(onConnect)/右键/双击/断线点击一律上抛,page.tsx 持数据与 PATCH。
 // 布局=lib/qa-canvas.deriveGraph(确定性);拖动位置 localStorage;MiniMap 常开。
 
-import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  Background, Controls, MiniMap, ReactFlow,
+  useCallback, useEffect, useMemo, useState,
+  type CSSProperties, type MouseEvent as ReactMouseEvent,
+} from "react";
+import {
+  Background, Controls, Handle, MiniMap, Position, ReactFlow,
   type Edge, type Node, type NodeChange, type NodeProps,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
@@ -20,6 +23,11 @@ export type TemplateRow = { id: string; name?: string; steps_json?: string; lang
 const LANG_LABEL: Record<string, string> = { zh: "普", cantonese: "粤", en: "EN" };
 const SOURCE_LABEL: Record<string, string> = { curated: "精选", mined: "挖掘", imported: "导入" };
 
+// 拖拽柄外观(源=左/目标=右;边由柄锚定,无柄时 v12 报 008 且边不渲染)。
+const HANDLE_STYLE: CSSProperties = {
+  width: 8, height: 8, background: "var(--accent)", border: "1px solid var(--card-border)",
+};
+
 function QaEntryNode({ data }: NodeProps) {
   const d = data as QaRow & { isHead: boolean; canned?: "ok" | "missing"; canEdit: boolean };
   const dim = d.enabled === false;
@@ -28,6 +36,10 @@ function QaEntryNode({ data }: NodeProps) {
       className={`w-[260px] rounded-lg border bg-white/5 p-3 text-xs ${dim ? "opacity-50" : ""} ${d.isHead ? "border-(--accent)" : "border-(--card-border)"}`}
       title={d.canEdit ? undefined : "共享条目由主管维护"}
     >
+      {/* 柄始终渲染(v12 边锚定柄,缺柄=008 且簇/步骤边整体消失),编辑权走 isConnectable:
+          只读条目拖不出也接不进,共享行写权限仍由 CP 兜底。 */}
+      <Handle type="target" position={Position.Right} isConnectable={d.canEdit} style={HANDLE_STYLE} />
+      <Handle type="source" position={Position.Left} isConnectable={d.canEdit} style={HANDLE_STYLE} />
       <p className="line-clamp-2 font-medium">{String(d.question_text ?? "(无问法)")}</p>
       <p className="mt-1 line-clamp-1 muted">{String(d.answer_text ?? "")}</p>
       <div className="mt-2 flex flex-wrap items-center gap-1">
@@ -47,6 +59,8 @@ function QaStepNode({ data }: NodeProps) {
   const d = data as { index: number; goal: string; refFirstLine: string; virtual: boolean };
   return (
     <div className={`w-[200px] rounded-lg border p-3 text-xs ${d.virtual ? "border-dashed border-(--card-border) muted" : "border-(--accent) bg-(--accent)/5"}`}>
+      {/* 只作连线落点(挂步骤),不给 source 柄(连线只准从条目拖出);虚拟「全程通用」不接。 */}
+      <Handle type="target" position={Position.Right} isConnectable={!d.virtual} style={HANDLE_STYLE} />
       <p className="font-medium">{d.virtual ? "全程通用" : `第 ${d.index + 1} 步 · ${d.goal}`}</p>
       {!d.virtual && <p className="mt-1 line-clamp-2 muted">{d.refFirstLine}</p>}
     </div>
@@ -64,6 +78,8 @@ export default function QaCanvasView(props: {
   canEditRow: (row: QaRow) => boolean;
   onNodeClick: (row: QaRow) => void;
   onPaneDoubleClick: (pt: { x: number; y: number }) => void;
+  /** 右键条目(Task 7 提供菜单);不给时仅吞掉浏览器默认菜单。 */
+  onNodeContextMenu?: (row: QaRow, e: ReactMouseEvent) => void;
   onConnectCluster: (fromId: string, toId: string) => void;
   onDisconnect: (edge: { id: string; data?: { kind?: string }; source: string; target: string }) => void;
   onStepConnect: (entryId: string, stepIndex: number) => void;
@@ -175,18 +191,46 @@ export default function QaCanvasView(props: {
           重置布局
         </button>
       </div>
-      <div className="h-[600px] rounded-lg border border-(--card-border)">
+      {/* 双击空白新建入口(Task 7 消费坐标):@xyflow 12.11 无 onPaneDoubleClick,
+          用包裹层 onDoubleClick + 落点判 pane 兜出,并关掉双击缩放避免手势打架。 */}
+      <div
+        className="h-[600px] rounded-lg border border-(--card-border)"
+        onDoubleClick={(e) => {
+          const t = e.target as HTMLElement | null;
+          if (t?.classList?.contains("react-flow__pane")) {
+            props.onPaneDoubleClick({ x: e.clientX, y: e.clientY });
+          }
+        }}
+      >
         <ReactFlow
           nodes={nodes}
           edges={edges}
           nodeTypes={NODE_TYPES}
           fitView
           minZoom={0.2}
+          zoomOnDoubleClick={false}
           onNodesChange={onNodesChange}
           onNodeDragStop={onNodeDragStop}
           onNodeClick={(_, node) => {
             const row = rows.find((r) => String(r.id) === node.id);
             if (row) props.onNodeClick(row);
+          }}
+          onNodeContextMenu={(e, node) => {
+            e.preventDefault();
+            const row = rows.find((r) => String(r.id) === node.id);
+            row && props.onNodeContextMenu?.(row, e);
+          }}
+          onConnect={(conn) => {
+            if (!conn.source || !conn.target) return;
+            const srcIsQa = conn.source.indexOf("step:") !== 0;
+            if (!srcIsQa) return; // 只允许从条目拖出
+            const target = conn.target;
+            if (target.startsWith("step:")) {
+              const idx = Number(target.slice(5));
+              if (!Number.isNaN(idx)) props.onStepConnect(conn.source, idx === -1 ? -1 : idx);
+              return;
+            }
+            props.onConnectCluster(conn.source, target);
           }}
           onEdgeClick={(_, edge) => {
             // Edge→上抛载荷的结构收窄(仅取本页关心的字段,不再 as never 逃逸)。

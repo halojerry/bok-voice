@@ -172,3 +172,8 @@ export function resolveClusterTarget(
   if (targetHead === fromId) return { ok: false, headId: "", reason: "主条目不能挂到自己的变体" };
   return { ok: true, headId: targetHead, reason: "" };
 }
+
+/** PATCH 失败回滚:返回剔除乐观变更后的行集(spec §8:不保留脏边)。 */
+export function revertCluster(rows: QaRow[], childId: string, prevHeadId: string): QaRow[] {
+  return rows.map((r) => (String(r.id) === childId ? { ...r, cluster_head_id: prevHeadId } : r));
+}

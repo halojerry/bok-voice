@@ -93,6 +93,11 @@ test("deriveGraph col0 与 col1 条目位置不重合（global 独立 x 泳道�
   assert.ok(byId.h.x > byId.s.x);             // global 泳道在 step 泳道右侧
 });
 
+test("revertCluster 回滚断簇", () => {
+  const rows = [{ id: "v", cluster_head_id: "h2" }];
+  assert.equal(qa.revertCluster(rows, "v", "h1")[0].cluster_head_id, "h1");
+});
+
 test("LOCAL_POS_KEY 形态", () => {
   assert.equal(qa.LOCAL_POS_KEY("acc-001", "tpl-1"), "qa-canvas-pos:acc-001:tpl-1");
 });

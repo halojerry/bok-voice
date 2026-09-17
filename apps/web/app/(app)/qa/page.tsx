@@ -6,6 +6,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, type UserRow } from "@/lib/api";
+import { resolveClusterTarget, revertCluster } from "@/lib/qa-canvas";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
 import { useSession } from "@/components/session-context";
 import { useAccount } from "@/components/account-context";
@@ -29,6 +30,8 @@ type QaRow = {
   voice_id?: string;
   enabled?: boolean;
   hit_count?: number;
+  /** 同义簇(qa-canvas Phase1):""=独立条目,非空=挂在 head 行之下。 */
+  cluster_head_id?: string;
   created_at?: string;
 };
 
@@ -71,6 +74,8 @@ export default function QaPage() {
   const [err, setErr] = useState("");
   const [formErr, setFormErr] = useState("");
   const [ok, setOk] = useState(false);
+  // 画布选中话术:挂步骤时随 PATCH 下发;Task 7 挂画布后经 onTemplateChange 写入,本任务先占位。
+  const [templateId, setTemplateId] = useState("");
 
   /** 主管模式：匿名本地会话（auth-off 单机形态）与 admin/root 一律全量管理。 */
   const isManager = Boolean(
@@ -250,6 +255,69 @@ export default function QaPage() {
     } finally {
       setBusy("");
     }
+  }
+
+  // ---- 画布编辑处理器(qa-canvas Phase1 Task6):Task 7 挂载 QaCanvasView 时经 props 接线;
+  //      先落逻辑保证本提交自洽。校验/回滚纯函数在 lib/qa-canvas.ts。----
+
+  /** 连簇(spec §4.4):校验→乐观写 cluster_head_id→PATCH,失败 revertCluster 回滚后 refresh。 */
+  async function connectCluster(fromId: string, toId: string) {
+    const verdict = resolveClusterTarget(rows ?? [], fromId, toId);
+    if (!verdict.ok) {
+      setErr(verdict.reason);
+      return;
+    }
+    const prev = String((rows ?? []).find((r) => String(r.id) === fromId)?.cluster_head_id ?? "");
+    if (verdict.headId === prev) return; // 同簇兄弟变体/幂等重挂:no-op 静默,避免无意义 PATCH
+    setRows((rs) =>
+      (rs ?? []).map((r) => (String(r.id) === fromId ? { ...r, cluster_head_id: verdict.headId } : r)),
+    ); // 乐观
+    try {
+      await api.patchQa(fromId, { cluster_head_id: verdict.headId });
+      setErr("");
+    } catch (e) {
+      setErr(String(e));
+      setRows((rs) => revertCluster(rs ?? [], fromId, prev)); // 回滚,spec §8
+      await refresh();
+    }
+  }
+
+  /** 挂步骤:stepIndex=-1=解挂回全程通用;失败 refresh 回真值(无乐观写)。 */
+  async function stepConnect(entryId: string, stepIndex: number) {
+    const patch =
+      stepIndex < 0
+        ? { scope: "global", step_index: -1, template_id: "" }
+        : { scope: "step", step_index: stepIndex, template_id: templateId };
+    try {
+      await api.patchQa(entryId, patch);
+      setErr("");
+      await refresh();
+    } catch (e) {
+      setErr(String(e));
+      await refresh();
+    }
+  }
+
+  /** 断线:簇边=变体回归独立(乐观写+回滚,与连簇对称);步骤边=解挂回全程通用。 */
+  async function disconnect(edge: { source: string; target: string; data?: { kind?: string } }) {
+    const fromId = String(edge.source ?? "");
+    if (!fromId) return;
+    if (edge.data?.kind === "cluster") {
+      const prev = String((rows ?? []).find((r) => String(r.id) === fromId)?.cluster_head_id ?? "");
+      setRows((rs) =>
+        (rs ?? []).map((r) => (String(r.id) === fromId ? { ...r, cluster_head_id: "" } : r)),
+      ); // 乐观
+      try {
+        await api.patchQa(fromId, { cluster_head_id: "" });
+        setErr("");
+      } catch (e) {
+        setErr(String(e));
+        setRows((rs) => revertCluster(rs ?? [], fromId, prev));
+        await refresh();
+      }
+      return;
+    }
+    await stepConnect(fromId, -1);
   }
 
   if (!session) return <LoadingState label="正在读取会话…" />;
