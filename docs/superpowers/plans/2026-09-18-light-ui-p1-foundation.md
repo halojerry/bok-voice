@@ -460,7 +460,7 @@ bg-white/5→bg-muted/60、bg-white/10→bg-muted、hover→bg-accent、
 **Interfaces:**
 - Consumes: Task 1 浅色底（这些字色只在浅底上才需要换档）。
 - Produces: 全站 grep `text-(red|emerald|amber|sky|green|rose|orange|yellow)-[23]00` 归零。
-- **豁免（与 Task 2 同一豁免区）**：`components/interpret-console.tsx:1617` 的 `text-sky-300`/`text-emerald-300` 位于大字幕浮窗**黑底**上，浅色字正确，**不改**；grep 门禁同样排除 1560-1629 行段。
+- **豁免（与 Task 2 同一豁免区）**：`components/interpret-console.tsx` 大字幕浮窗块（以现场 grep `bg-black/85` 定位 overlay 行区间为准，rebase 后约 1608-1654）内的 `text-sky-300`/`text-emerald-300` 位于**黑底**上，浅色字正确，**不改**；grep 门禁按现场行区间排除，勿信陈旧行号。
 
 **映射表：**
 
@@ -485,9 +485,9 @@ cd apps/web && grep -rEn "text-(red|emerald|amber|sky|green|rose|orange|yellow)-
 - [ ] **Step 2: 门禁 grep 归零（字幕机豁免段除外）**
 
 ```bash
-cd apps/web && grep -rEn "text-(red|emerald|amber|sky|green|rose|orange|yellow)-[23]00" app components --include="*.tsx" | grep -v "interpret-console.tsx:16[0-2][0-9]"
+cd apps/web && grep -rEn "text-(red|emerald|amber|sky|green|rose|orange|yellow)-[23]00" app components --include="*.tsx" | grep -v "interpret-console.tsx:16[0-5][0-9]"
 ```
-预期：零输出。
+预期：零输出（豁免区间以现场 overlay 块为准，上式覆盖 1600-1659；若有出区间命中且确实在黑底浮窗内，按块豁免并在报告点名）。
 
 - [ ] **Step 3: 构建门禁**
 
@@ -530,6 +530,7 @@ text-*-300/400 → -600/-700；alpha badge 对 → 实色浅底+深字。"
 | `border-(--accent)`（qa/templates tab 选中态） | `border-(--live)` |
 | `bg-(--accent) … text-(--bg)`（setup:65 下载按钮） | `bg-(--live) … text-white` |
 | `var(--accent, #22d3ee)`（CallStudio:190 波形 stroke） | `var(--live, #0891b2)` |
+| `bg-accent`（dashboard:215 时长条形图**填充**，Task 1 后浅灰隐形） | `bg-live`（图表填充=活信号；轨道保持 `bg-muted/60` 形成对比） |
 | `text-[#01191c]`（logo 方块字，login:43/StageHeader:100） | `text-white`（方块底色 `bg-(--stage-value)` 已是 cyan-600） |
 
 - [ ] **Step 1: 列出命中并按映射表替换**
@@ -662,10 +663,10 @@ git commit -m "feat(web): P1 图标——独立字形位换 lucide（散文/句�
 
 ```bash
 cd apps/web
-echo "--- 裸透明（豁免 5 行外应为 0）---"
-grep -rn "bg-white/\|bg-black/\|border-white/" app components --include="*.tsx" | grep -vc "interpret-console.tsx:15[6-9][0-9]\|interpret-console.tsx:16[0-2][0-9]"
-echo "--- 暗底浅字（字幕机豁免段外应为 0）---"
-grep -rEn "text-(red|emerald|amber|sky|green|rose|orange|yellow)-[23]00" app components --include="*.tsx" | grep -v "interpret-console.tsx:16[0-2][0-9]" | wc -l
+echo "--- 裸透明（字幕机浮窗块外应为 0；浮窗区间以现场 bg-black/85 overlay 为准，约 1608-1654）---"
+grep -rn "bg-white/\|bg-black/\|border-white/" app components --include="*.tsx" | grep -vc "interpret-console.tsx:16[0-5][0-9]"
+echo "--- 暗底浅字（字幕机浮窗块外应为 0）---"
+grep -rEn "text-(red|emerald|amber|sky|green|rose|orange|yellow)-[23]00" app components --include="*.tsx" | grep -v "interpret-console.tsx:16[0-5][0-9]" | wc -l
 echo "--- accent 残留（应为 0）---"
 grep -rn "text-accent\|accent-soft\|accent-ink" app components --include="*.tsx" | wc -l
 echo "--- globals 内 hex 残留（应为 0）---"
