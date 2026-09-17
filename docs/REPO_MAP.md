@@ -50,6 +50,8 @@
 - 站点交付探针（2026-09-16）：`probe_killswitch.py`（kill-switch 目标语义：吊销 sticky→通话面 403 窒息→unrevoke 复活全链，CI `node-handshake.yml` linux 对真 CP 实跑）`probe_windows_lifecycle.py`（down 树杀语义 A 段全平台 + schtasks 契约 B 段仅 Windows 实跑、runner 无提权按 access-denied 优雅 skip，CI windows job）`probe_thin_client_static.py`（静态导出注入链形状 + 无烤死 localhost，CI web job，需先 `apps/web && npm run build`）
 - TTS 缓存/快答库：`pregen_tts.py`（`bok.py tts-pregen` 执行体：--greetings/--objects/--fillers/--qa 离线预合成，写 app-data/tts-cache；也被 CP 人设保存点自动触发，见 `apps/control-plane/control_plane/pregen.py`）`mine_qa.py`（`bok.py tts-mine` 执行体：高频问答对报告 + --apply 入库 / --sync 自动学习闭环：挖掘→质量闸→入库→按语言物化）
 - 真实客户多轮 E2E：`e2e_real_customer.py`（三语三音色多轮真问题连聊，模板绑定走对象 template_id）
+- 延迟测试台：`probe_latency_soak.py`（多轮多样话术逐轮「推完→首声」+PERCEIVED 三段对照+拆轮/打断风暴/哑轮哨兵+p50/p95+JSON 报告 `reports/latency-soak/`；配套政策表 `docs/LATENCY_BUDGETS.md`）
+- 话术外问题集锦：`probe_offscript_soak.py`（防诈/转人工/追问/推搪/普通话混合 5 套×10 轮实录对照+质量旗，`reports/offscript-soak/`）；热词 A/B：`probe_hotword_ab.py`（ASR sidecar 直打 none/current/extended 三档量词表收益与 prefill 成本）
 - 外呼战役 E2E：`e2e_campaign.py`（mock 档全链路：3 对象战役串行自动下一通 + 终态三态 + captured 入名册；C4 号码容差=「含脚本号码的 ≥7 位**连续子串**」——live 链路号码句**头段**会被 ASR 多解一个音，定责与证据见脚本内注释）
 - 8kHz 窄带重验：`probe_8khz_asr.py`（宽/窄对照 + 号码逐位 + 窄带档真伪核验，真栈探针；前置门见 spec §6.1）
 - mock SIP 被叫：`mock_callee.py`（CP 派生的真语音被叫子进程：answer/no_answer/reject/hangup_mid 四剧本；台词/句间隔由 dial 块下发，会等 AI 讲完再出声）
