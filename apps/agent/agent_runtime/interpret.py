@@ -26,6 +26,8 @@ import json
 import os
 import re
 
+from .task_pool import spawn
+
 
 def _norm_lang(raw: str, default: str = "zh") -> str:
     key = (raw or "").strip().lower()
@@ -458,6 +460,19 @@ async def entrypoint(ctx) -> None:
         except Exception as exc:  # pragma: no cover - 落库失败不阻翻译
             print(f"[interp] add_turn failed: {exc!r}", flush=True)
 
+    # 在途原文/译文落库任务(强引用):_shutdown 结算前排空(A 线 _close 的
+    # _report_tasks 同款姿势)——teardown 杀任务前最后几句照常入库。
+    _turn_report_tasks: set[asyncio.Task] = set()
+
+    def _spawn_add_turn(text: str, language: str, latency: int = 0) -> None:
+        # 强引用池收编(2026-09-18,AGENTS.md A-F4「interpret 落库」):裸
+        # create_task 只被事件循环弱引用,GC/teardown 中途掐掉=原文/译文轮静默
+        # 丢失。spawn 入池保活;这里另留一份在 _turn_report_tasks 供结算前排空。
+        task = spawn(_add_turn(text, language, latency), label="interp-turn")
+        if task is not None:
+            _turn_report_tasks.add(task)
+            task.add_done_callback(_turn_report_tasks.discard)
+
     def _on_item(ev) -> None:
         item = getattr(ev, "item", None)
         role = getattr(item, "role", None)
@@ -466,10 +481,10 @@ async def entrypoint(ctx) -> None:
             return
         if role == "user":
             last_user["text"] = text
-            asyncio.create_task(_add_turn(f"原文：{text}", source_lang))
+            _spawn_add_turn(f"原文：{text}", source_lang)
         elif role == "assistant":
             latency = int(_turn_metrics.get("llm_ttft_ms") or 0)
-            asyncio.create_task(_add_turn(f"译文：{text}", target_lang, latency))
+            _spawn_add_turn(f"译文：{text}", target_lang, latency)
 
     session.on("conversation_item_added", _on_item)
 
@@ -480,6 +495,17 @@ async def entrypoint(ctx) -> None:
             await cp.post_session_report(call_id, report.to_dict())
         except Exception as exc:
             print(f"[interp] session report failed: {exc!r}", flush=True)
+        # 在途原文/译文落库先排空再结算(2026-09-18 收编配套):挂断瞬间最后几句
+        # 的 add_turn 可能仍在途,直接退出会被 teardown 杀掉=轮静默丢失
+        # (A 线 _close 的 _report_tasks 同款姿势,10s 宽窗)。
+        if _turn_report_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*list(_turn_report_tasks), return_exceptions=True),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                pass
         try:
             await cp.settle(call_id)
             print(f"[interp] settled {call_id}", flush=True)

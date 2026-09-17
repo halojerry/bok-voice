@@ -18,6 +18,7 @@ from .providers.registry import build_provider_registry
 from .control_plane import ControlPlaneClient
 from .fillers import FillerDirector
 from .qa_gate import QaIndex, qa_exclude_reason as _qa_exclude_reason, qa_fastpath_enabled
+from .task_pool import spawn
 from .tts_cache import CachedTTS, TtsAudioCache, default_cache_dir, frames_aiter, pcm_to_frames, tts_cache_enabled
 # 模块级引 flow(纯 stdlib 依赖,无环):_wa_numberish/_wa_number_line 等模块级
 # helper 用;entrypoint 内的 function-scoped import 属历史样式,不冲突。
@@ -423,6 +424,28 @@ _WA_QUESTION_MARKERS = re.compile(
 def _wa_questionish(text: str) -> bool:
     """疑问/算式句:含提问或算术标记 ⇒ 不暂存、不 StopResponse,走正常轮次。"""
     return bool(_WA_QUESTION_MARKERS.search(text))
+
+
+async def _report_whatsapp_once(
+    cp, call_id: str, num: str, channel: str,
+    reported: set[str], key: str, *, where: str = "",
+) -> None:
+    """WhatsApp 信号上报一次;失败或被取消都回滚 `reported` 键(AGENTS.md ⑦)。
+
+    - 失败回滚:server 幂等,后续轮再侦测到同键会补报(重复 POST 无重复爆闪)。
+    - 取消回滚:CancelledError 是 BaseException,`except Exception` 接不住——
+      teardown 掐杀在途请求时若无独立捕获,键被永久占用=这个号永远不再补报。
+      与「裸任务被 GC/teardown 掐掉」是同一族丢上报问题,此处一并钉死。
+    """
+    tag = f" (call {where})" if where else ""
+    try:
+        await cp.report_whatsapp(call_id, num, channel=channel)
+    except asyncio.CancelledError:
+        reported.discard(key)
+        raise
+    except Exception as exc:  # pragma: no cover - 上报失败唔阻确认
+        reported.discard(key)
+        print(f"[whatsapp] report failed, will retry on next signal: {exc!r}{tag}", flush=True)
 
 
 def _wa_accum_merge(stashed: str, incoming: str) -> str:
@@ -2039,10 +2062,10 @@ async def entrypoint(ctx):
             except Exception:  # noqa: BLE001
                 pass
 
-        try:
-            asyncio.create_task(_go())
-        except Exception:  # noqa: BLE001 - 无事件循环(测试)=丢弃计数
-            pass
+        # 强引用池收编(2026-09-18):裸 create_task 的计数上报只被事件循环弱引用,
+        # GC/teardown 中途掐掉=罐头命中数静默丢失;spawn 入池+自清,无事件循环
+        # (测试)返回 None——旧 try/except 兜底已内聚进 spawn。
+        spawn(_go(), label="filler-hit")
 
     _filler = FillerDirector(
         session,
@@ -2323,7 +2346,9 @@ async def entrypoint(ctx):
                     context_state.set_last_reply(_clean_transcript(guarded))
                 except Exception:  # pragma: no cover - 锚失败唔阻主流程
                     pass
-            asyncio.create_task(_async_update_context(role, text))
+            # 强引用池收编(2026-09-18,AGENTS.md A-F4「context 更新」):更新含
+            # RAG/摘要 await 数拍,裸任务只被事件循环弱引用,GC 掐掉=记忆/锚静默缺失。
+            spawn(_async_update_context(role, text), label="context-update")
 
     # 会话关闭事件：置位后 supervisor watcher 退出、结算触发。
     closed = asyncio.Event()
@@ -2434,8 +2459,13 @@ async def entrypoint(ctx):
         def _close_done(_task: asyncio.Task) -> None:
             _close_flushed.set()
 
-        _close_task = asyncio.create_task(_close())
-        _close_task.add_done_callback(_close_done)
+        # 强引用池收编(2026-09-18):_close_task 此前只被本同步函数局部变量持有,
+        # _on_close 返回后即只剩事件循环弱引用——结算前可被 GC 中途回收
+        # ("Task was destroyed",settle 请求从未发出)。spawn 入池保活;
+        # _close_flushed 事件仍由 done 回调置位(entrypoint 返回前等它)。
+        _close_task = spawn(_close(), label="session-close")
+        if _close_task is not None:
+            _close_task.add_done_callback(_close_done)
 
     # 明确拒绝收尾:礼貌告别讲完(一句 TTS+余量)后主动结束通话——
     # end_call 置 ENDED 并断房,结算由 _on_close 幂等触发。
@@ -2464,7 +2494,10 @@ async def entrypoint(ctx):
             except Exception as exc:  # pragma: no cover - 已结束/断房失败都不致命
                 print(f"[flow] end_call skipped: {exc!r} (call {room_name})", flush=True)
 
-        asyncio.create_task(_end())
+        # 强引用池收编(2026-09-18):_end 睡 14s 期间裸任务只被事件循环弱引用,
+        # GC 中途回收=end_call 不发、通话不收线(_SETTLE_TASKS 同款姿势)。
+        # 幂等闸 _end_scheduled 不受影响。
+        spawn(_end(), label="delayed-end")
 
     async def _end_on_shutdown(_reason: str = "") -> None:
         # job 进程在 delayed _end() 睡眠期间就会被拆除(2026-09-10 静音收线实测:
@@ -2799,16 +2832,17 @@ async def entrypoint(ctx):
                         if _key not in _wa_reported:
                             _wa_reported.add(_key)
 
-                            async def _report():
-                                try:
-                                    await cp.report_whatsapp(call_id, _num, channel=_wa_ch)
-                                except Exception as exc:  # pragma: no cover
-                                    # 上报失败唔好永久丢:清 key,後續輪再偵測到會補報
-                                    # (server 幂等,重複 POST 唔會造成重複爆閃)。
-                                    _wa_reported.discard(_key)
-                                    print(f"[whatsapp] report failed, will retry on next signal: {exc!r} (call {room_name})", flush=True)
-
-                            asyncio.create_task(_report())
+                            # 强引用池收编(2026-09-18,AGENTS.md ⑦):上报入池保活,
+                            # 失败/被取消都在 _report_whatsapp_once 内回滚
+                            # _wa_reported 键——teardown 掐杀不走 except Exception,
+                            # 无独立捕获=键永久占用、这个号永远不再补报。
+                            spawn(
+                                _report_whatsapp_once(
+                                    cp, call_id, _num, _wa_ch, _wa_reported, _key,
+                                    where=room_name,
+                                ),
+                                label="wa-report",
+                            )
                             if _kind == "captured_implicit" or (_num and _num != "offered"):
                                 context_state.set_whatsapp_note(_num)
                             print(f"[whatsapp] {_kind} num={_num or '-'} (call {room_name})", flush=True)
@@ -2928,7 +2962,14 @@ async def entrypoint(ctx):
                             _step_at = flow_ctrl.current
                             if _judge_inflight["step"] != _step_at:
                                 _judge_inflight["step"] = _step_at
-                                asyncio.create_task(_background_flow_judge(_step_at, user_text))
+                                # 强引用池收编(2026-09-18):judge 睡 FLOW_JUDGE_DELAY
+                                # + LLM 往返期间裸任务只被事件循环弱引用,GC 掐掉=模糊轮
+                                # 推进判定静默丢失。_judge_inflight 回滚靠 finally
+                                # (取消也会跑),不受收编影响。
+                                spawn(
+                                    _background_flow_judge(_step_at, user_text),
+                                    label="flow-judge",
+                                )
                     context_state.set_flow_current(flow_ctrl.current_step_text())
                 except Exception:  # pragma: no cover - 流程推进失败不阻断回复
                     pass
@@ -3084,7 +3125,12 @@ async def entrypoint(ctx):
                                 )
                             except Exception:  # noqa: BLE001
                                 pass
-                            asyncio.create_task(cp.qa_hit(str(_qa_entry.get("id") or "")))
+                            # 强引用池收编(2026-09-18):QA 命中计数上报的裸任务只被
+                            # 事件循环弱引用,GC 掐掉=词库命中数据静默缺失。
+                            spawn(
+                                cp.qa_hit(str(_qa_entry.get("id") or "")),
+                                label="qa-hit",
+                            )
                             # ⑤ 播预生成音频
                             await session.say(
                                 _qa_answer,
@@ -3286,6 +3332,9 @@ async def entrypoint(ctx):
 
         session.on("agent_state_changed", _on_spec_state)
 
+    # watcher 不入强引用池:本同步帧(await closed.wait() 挂起期间)一直持有
+    # 强引用,finally cancel + 收尾——detach 语义无 GC 风险,池化反而要在
+    # _on_close 里补取消(多一份账)。
     watch_task = asyncio.create_task(_supervisor_watch())
     # AgentSession 内部已注册 job shutdown callback（自动 aclose），
     # 这里不能提前 close，否则会话在接通后立刻被销毁。
@@ -3346,7 +3395,9 @@ async def entrypoint(ctx):
         # 7-11s),预热被拖到最后,客户在开场白中途插话的 turn-1 只能全量 prefill
         # (~2-4s TTFT)。paused(无开场白)分支在下方立即发(无开场白形状)。
         if _prefix_prewarm_armed:
-            asyncio.create_task(_prefix_prewarm_task(agent, greeting_text))
+            # 强引用池收编(2026-09-18):预热(prefill 往返 + 兜底抓开场白可轮询 3s)
+            # 裸任务只被事件循环弱引用,GC 掐掉=turn-1 全量 prefill 回归(TTFT +2-4s)。
+            spawn(_prefix_prewarm_task(agent, greeting_text), label="prefix-prewarm")
         _turn_origin["gen"] = "script"  # 开场白=脚本直念
         await _say_script(session, tts_provider, _tts_cache, greeting_text)
         # say() 返回=整段念完(playout end),唔係出声时刻——TTS 首包在 say 调用后
@@ -3354,7 +3405,8 @@ async def entrypoint(ctx):
         _log_stage("greeting_playout_done")
     elif _prefix_prewarm_armed:
         # paused 起动无开场白:立即按「无开场白」形状预热(任务体回退抓 chat_ctx)。
-        asyncio.create_task(_prefix_prewarm_task(agent, ""))
+        # 强引用池收编同上(2026-09-18)。
+        spawn(_prefix_prewarm_task(agent, ""), label="prefix-prewarm")
 
     # session.start 只负责拉起流水线（返回后会话在后台运行）。保持 entrypoint
     # 存活直到房间关闭，supervisor watcher 在此期间持续轮询；_on_close 置位

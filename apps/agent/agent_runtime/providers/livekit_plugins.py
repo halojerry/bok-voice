@@ -16,6 +16,8 @@ import httpx
 from livekit.agents import APIConnectOptions, NOT_GIVEN, llm, stt, tts, utils, vad
 from livekit.plugins.openai import LLM as _OpenAICompatBase
 
+from ..task_pool import spawn
+
 # 粤语特征字/词：Qwen3-ASR 对粤语偶发判成 Chinese（语言标签不稳），
 # 若文本命中这些地道粤语用字则按粤语处理，避免 LLM 被误判成普通话后回普。
 # 只用「普通话里基本不出现」的粤语专用字/词；普粤共用字（下、咁、系等）不作为特征。
@@ -2125,10 +2127,12 @@ async def _minimax_ws_silent_close(ws) -> None:
 def _minimax_pool_discard(ws) -> None:
     """后台弃置池连接；无事件循环时直接放手（GC 兜底回收 socket）。"""
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
     except RuntimeError:
         return
-    loop.create_task(_minimax_ws_silent_close(ws))
+    # 强引用池收编(2026-09-18):裸 create_task 的静默关闭只被事件循环弱引用,
+    # GC 中途回收=半开连接挂着等 socket 终结器兜底;spawn 入池+自清。
+    spawn(_minimax_ws_silent_close(ws), label="minimax-ws-close")
 
 
 def _minimax_pool_pop(endpoint: str, key: str):
