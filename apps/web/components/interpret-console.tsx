@@ -1065,7 +1065,7 @@ type LiveProps = {
 
 function Stat({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="rounded-md border border-(--card-border) bg-white/5 px-2 py-1.5">
+    <div className="rounded-md border border-(--card-border) bg-muted/60 px-2 py-1.5">
       <div className="text-[10px] uppercase tracking-wide text-(--stage-muted)">{label}</div>
       <div className="mt-0.5 flex items-center font-mono text-[12px]">{children}</div>
     </div>
@@ -1326,7 +1326,7 @@ function ConsoleLive(p: LiveProps) {
               ).map(([who, lvl]) => (
                 <span key={who} className="inline-flex items-center gap-1">
                   {who}
-                  <span className="inline-block h-1.5 w-14 overflow-hidden rounded bg-white/10 align-middle">
+                  <span className="inline-block h-1.5 w-14 overflow-hidden rounded bg-muted align-middle">
                     <span
                       className={`block h-full transition-[width] duration-150 ${lvl >= 0.02 ? "bg-emerald-400" : "bg-neutral-500"}`}
                       style={{ width: `${lvl > 0 ? Math.min(100, Math.round(lvl * 900)) : 0}%` }}
@@ -1573,7 +1573,7 @@ function ConsoleLive(p: LiveProps) {
                 <div
                   className={`max-w-[85%] rounded-lg px-3 py-2 text-[13px] leading-relaxed ${
                     who.kind === "dst"
-                      ? "border border-(--card-border) bg-white/5 text-(--foreground)"
+                      ? "border border-(--card-border) bg-muted/60 text-(--foreground)"
                       : "bg-(--accent) text-(--accent-ink)"
                   }`}
                 >

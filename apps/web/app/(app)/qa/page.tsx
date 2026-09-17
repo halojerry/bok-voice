@@ -570,7 +570,7 @@ export default function QaPage() {
                 const canEdit = isManager || mine;
                 const rowBusy = busy.startsWith(`${id}:`);
                 return (
-                  <div key={id} className="rounded-lg bg-white/5 p-4">
+                  <div key={id} className="rounded-lg bg-muted/60 p-4">
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
                         <p className="font-medium">{String(row.question_text ?? "(无问法)")}</p>
@@ -598,7 +598,7 @@ export default function QaPage() {
                             </button>
                           </>
                         ) : (
-                          <span className="rounded-sm bg-white/10 px-1.5 py-0.5 text-[10px] muted">共享</span>
+                          <span className="rounded-sm bg-muted px-1.5 py-0.5 text-[10px] muted">共享</span>
                         )}
                       </div>
                     </div>

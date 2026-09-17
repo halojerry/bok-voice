@@ -16,7 +16,7 @@ const ROLE_LABEL: Record<string, string> = { root: "超级管理员", admin: "�
 const ROLE_BADGE: Record<string, string> = {
   root: "bg-amber-400/15 text-amber-300",
   admin: "bg-sky-400/15 text-sky-300",
-  user: "bg-white/10 muted",
+  user: "bg-muted muted",
 };
 
 type CreateForm = {
@@ -353,7 +353,7 @@ export default function UsersPage() {
                       <td className="py-1.5 font-mono text-xs">{u.username}</td>
                       <td>{u.display_name || "—"}</td>
                       <td>
-                        <span className={`rounded-sm px-1.5 py-0.5 text-[10px] ${ROLE_BADGE[u.role] ?? "bg-white/10 muted"}`}>
+                        <span className={`rounded-sm px-1.5 py-0.5 text-[10px] ${ROLE_BADGE[u.role] ?? "bg-muted muted"}`}>
                           {ROLE_LABEL[u.role] ?? u.role}
                         </span>
                       </td>
@@ -368,7 +368,7 @@ export default function UsersPage() {
                             <span className="text-xs muted">无</span>
                           ) : (
                             perms.map((k) => (
-                              <span key={k} className="rounded-sm bg-white/10 px-1.5 py-0.5 text-[10px] muted">
+                              <span key={k} className="rounded-sm bg-muted px-1.5 py-0.5 text-[10px] muted">
                                 {PAGE_LABELS[k as PageKey] ?? k}
                               </span>
                             ))
@@ -414,7 +414,7 @@ export default function UsersPage() {
                       </td>
                     </tr>
                     {permEditId === u.id && (
-                      <tr className="border-t border-(--card-border) bg-white/5">
+                      <tr className="border-t border-(--card-border) bg-muted/60">
                         <td colSpan={7} className="py-2">
                           <span className="label">页面权限 · {u.username}</span>
                           <div className="mt-1.5">
@@ -430,7 +430,7 @@ export default function UsersPage() {
                       </tr>
                     )}
                     {pwEditId === u.id && (
-                      <tr className="border-t border-(--card-border) bg-white/5">
+                      <tr className="border-t border-(--card-border) bg-muted/60">
                         <td colSpan={7} className="py-2">
                           <span className="label">重置密码 · {u.username}</span>
                           <div className="mt-1.5 flex flex-wrap items-center gap-2">

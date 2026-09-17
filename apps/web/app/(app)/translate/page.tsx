@@ -262,7 +262,7 @@ export default function TranslatePage() {
             <div className="max-h-56 space-y-2 overflow-y-auto">
               {ch.subtitles.length === 0 && <p className="text-xs text-(--stage-muted)">等待字幕…</p>}
               {ch.subtitles.map((s, i) => (
-                <div key={`${s.sourceSeqId}-${i}`} className="rounded-lg border border-(--card-border) bg-black/20 p-3">
+                <div key={`${s.sourceSeqId}-${i}`} className="rounded-lg border border-(--card-border) bg-muted p-3">
                   <p className="text-sm text-(--stage-muted)">{s.source}</p>
                   <p className="mt-1 text-sm text-(--stage-value)">{s.translated}</p>
                 </div>

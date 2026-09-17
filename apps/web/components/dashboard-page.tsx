@@ -221,7 +221,7 @@ function DashboardContent() {
               <div className="mt-3 space-y-2.5">
                 {buckets.map(([name, count]) => (
                   <div key={name} className="flex items-center gap-3">
-                    <div className="h-2 flex-1 rounded bg-white/5">
+                    <div className="h-2 flex-1 rounded bg-muted/60">
                       <div
                         className="h-2 rounded bg-accent"
                         style={{ width: `${Math.round((count / maxBucket) * 100)}%` }}
@@ -296,7 +296,7 @@ function DashboardContent() {
                     // 静态导出无法为真实 call id 生成 /calls/<id> 路由：统一去 /calls 列表，
                     // 在列表里点「进入」会内嵌工作台打开该会话。
                     href="/calls"
-                    className="flex items-center justify-between rounded-lg bg-white/5 px-4 py-3 hover:bg-white/10"
+                    className="flex items-center justify-between rounded-lg bg-muted/60 px-4 py-3 hover:bg-accent"
                   >
                     <div className="min-w-0">
                       <p className="truncate text-sm font-medium">{String(call.object_id ?? "-")}</p>
@@ -320,7 +320,7 @@ function DashboardContent() {
                 <Link href="/supervisor" className="btn-ghost w-full">主管台</Link>
                 <Link href="/settings" className="btn-ghost w-full">设置</Link>
               </div>
-              <div className="mt-4 rounded-lg bg-white/5 p-3 text-xs muted">
+              <div className="mt-4 rounded-lg bg-muted/60 p-3 text-xs muted">
                 控制面状态：{health === false ? "离线" : health === true ? "在线" : "未知"}
               </div>
             </section>

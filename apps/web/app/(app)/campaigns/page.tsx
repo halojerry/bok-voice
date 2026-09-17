@@ -35,7 +35,7 @@ const SEGMENTS: { key: string; label: string; cls: string }[] = [
   { key: "rejected", label: "拒接", cls: "bg-amber-400" },
   { key: "failed", label: "失败", cls: "bg-red-400" },
   { key: "skipped", label: "跳过", cls: "bg-neutral-600" },
-  { key: "pending", label: "待拨", cls: "bg-white/20" },
+  { key: "pending", label: "待拨", cls: "bg-muted" },
 ];
 
 const LANG_LABEL: Record<string, string> = { zh: "中文", cantonese: "粤语", en: "英语" };
@@ -145,9 +145,9 @@ const EMPTY_FORM: Form = {
 
 function ProgressBar({ progress }: { progress?: Progress }) {
   const total = progress?.total ?? 0;
-  if (!total) return <div className="h-1.5 w-full rounded-full bg-white/10" />;
+  if (!total) return <div className="h-1.5 w-full rounded-full bg-muted" />;
   return (
-    <div className="flex h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+    <div className="flex h-1.5 w-full overflow-hidden rounded-full bg-muted">
       {SEGMENTS.map((s) => {
         const n = progress?.[s.key] ?? 0;
         if (!n) return null;
@@ -205,7 +205,7 @@ function SchedulingEditor({ value, onChange }: { value: SchedValue; onChange: (v
           <div key={idx} className="flex flex-wrap items-center gap-2">
             <div className="flex flex-wrap items-center gap-1">
               {WEEK_DAYS.map((d) => (
-                <label key={d.value} className="flex cursor-pointer items-center gap-1 rounded px-1 py-0.5 text-xs hover:bg-white/5">
+                <label key={d.value} className="flex cursor-pointer items-center gap-1 rounded px-1 py-0.5 text-xs hover:bg-muted/60">
                   <input type="checkbox" checked={w.days.includes(d.value)} onChange={() => toggleWindowDay(idx, d.value)} />
                   {d.label}
                 </label>
@@ -481,7 +481,7 @@ function CampaignWizard({
           <div className="max-h-64 space-y-1 overflow-auto rounded-lg border border-(--card-border) p-2">
             {filtered.length === 0 && <p className="p-2 text-xs muted">没有可拨对象（对象需在「对象」页填电话）。</p>}
             {filtered.map((o) => (
-              <label key={o.id} className="flex cursor-pointer items-center gap-2 rounded px-1 py-1 text-sm hover:bg-white/5">
+              <label key={o.id} className="flex cursor-pointer items-center gap-2 rounded px-1 py-1 text-sm hover:bg-muted/60">
                 <input type="checkbox" checked={selectedSet.has(o.id)} onChange={() => toggle(o.id)} />
                 <span className="min-w-0 flex-1 truncate">{o.display_name || o.id}</span>
                 <span className="font-mono text-xs muted">{o.phone}</span>
@@ -529,7 +529,7 @@ function CampaignWizard({
               </div>
             ))}
           </div>
-          <div className="rounded-lg bg-white/5 p-3 text-xs">
+          <div className="rounded-lg bg-muted/60 p-3 text-xs">
             <p>
               {form.name || "（未命名）"} · {LANG_LABEL[form.language] ?? form.language} ·{" "}
               {form.object_ids.length} 个对象 · 间隔 {form.gap_seconds}s

@@ -421,7 +421,7 @@ export default function PersonasPage() {
               {rows.map((row) => {
                 const id = String(row.id ?? "");
                 return (
-                  <div key={id} className="flex items-start justify-between gap-3 rounded-lg bg-white/5 px-4 py-3">
+                  <div key={id} className="flex items-start justify-between gap-3 rounded-lg bg-muted/60 px-4 py-3">
                     <div className="min-w-0">
                       <p className="font-medium">{String(row.name ?? "-")}</p>
                       <p className="mt-1 text-xs muted">
@@ -611,7 +611,7 @@ export default function PersonasPage() {
                 setRecBlobUrl("");
               }}
             />
-            <p className="rounded-lg bg-white/5 p-2 text-[11px] leading-relaxed muted">
+            <p className="rounded-lg bg-muted/60 p-2 text-[11px] leading-relaxed muted">
               克隆出来的音色会讲什么语言/口音，由你录的参考音频决定：想让 AI 讲<b className="text-(--foreground)">粤语</b>，就对着麦用粤语说一段参考语料（如上方的粤语示例）；用普通话参考音频克隆出的音色，读粤语文字也会带普通话音。克隆会存为独立音色，可随时回来试听。
             </p>
             <div className="flex gap-2">

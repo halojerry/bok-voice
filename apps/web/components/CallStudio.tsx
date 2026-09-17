@@ -236,7 +236,7 @@ function MicLevelMeter({ room }: { room: Room | null }) {
           {active ? `● 采集中 ${level > 3 ? `音量 ${level}` : "(静音)"}` : error ? "无法分析" : "未采集"}
         </span>
       </div>
-      <canvas ref={canvasRef} width={260} height={40} className="mt-1 w-full rounded-sm bg-black/20" />
+      <canvas ref={canvasRef} width={260} height={40} className="mt-1 w-full rounded-sm bg-muted" />
       {trackInfo && <p className="mt-0.5 truncate text-[9px] muted" title={trackInfo}>{trackInfo}</p>}
       {error && <p className="mt-1 text-[10px] text-red-300">{error}</p>}
     </div>
@@ -299,7 +299,7 @@ function AudioDevicesCard({ room }: { room: Room | null }) {
   };
 
   return (
-    <div className="rounded-lg bg-white/5 p-3">
+    <div className="rounded-lg bg-muted/60 p-3">
       <span className="label mb-2 block">音频设备</span>
       <div className="space-y-2 text-xs">
         <div className="flex items-center justify-between gap-2">
@@ -421,7 +421,7 @@ function HistoryTranscript({ callId }: { callId: string }) {
             <p
               key={String(t.id ?? i)}
               className={`rounded-lg px-3 py-1.5 text-sm leading-relaxed ${
-                role === "user" ? "bg-(--accent)/10" : "bg-white/5"
+                role === "user" ? "bg-(--accent)/10" : "bg-muted/60"
               }`}
             >
               <span className="mr-2 text-[10px] font-medium muted">
@@ -1012,10 +1012,10 @@ function CallStudioInner({
           </p>
         )}
         {object?.background && (
-          <p className="rounded-lg bg-white/5 p-3 text-sm muted">{String(object.background)}</p>
+          <p className="rounded-lg bg-muted/60 p-3 text-sm muted">{String(object.background)}</p>
         )}
 
-        <div className="rounded-lg bg-white/5 p-3 text-sm">
+        <div className="rounded-lg bg-muted/60 p-3 text-sm">
           <span className="label mb-1 block">历史主题</span>
           {objectTopics.length === 0 ? (
             <p className="muted">暂无（挂断结算后自动沉淀）</p>
@@ -1030,7 +1030,7 @@ function CallStudioInner({
             </ul>
           )}
         </div>
-        <div className="rounded-lg bg-white/5 p-3 text-sm">
+        <div className="rounded-lg bg-muted/60 p-3 text-sm">
           <span className="label mb-1 block">我方人设</span>
           {persona ? (
             <>
@@ -1128,7 +1128,7 @@ function CallStudioInner({
         )}
         {/* ended 通话面板(hydrate 即亮,不必先点一次接通吃报错):一句交代+直达发起新通话 */}
         {endedBlock && !roomConnected && (
-          <div className="rounded-lg bg-white/5 p-3 text-sm">
+          <div className="rounded-lg bg-muted/60 p-3 text-sm">
             <p className="muted">该通话已结束（房间已关闭），无法重新接通。可直接用该对象发起新通话。</p>
             <button
               className="btn-ghost mt-2 text-xs"
@@ -1143,12 +1143,12 @@ function CallStudioInner({
           </div>
         )}
         {!error && !cp.ready && (
-          <p className="rounded-lg bg-white/5 p-3 text-sm muted">
+          <p className="rounded-lg bg-muted/60 p-3 text-sm muted">
             本地服务启动中…（Control Plane / ASR / TTS），就绪后会自动加载对象与人设，请稍候。
           </p>
         )}
         {!stateCallId && objects.length === 0 && (
-          <p className="mb-3 rounded-lg bg-white/5 p-3 text-sm muted">
+          <p className="mb-3 rounded-lg bg-muted/60 p-3 text-sm muted">
             请先在「对象」页建档一个对象，再回到这里接通。
           </p>
         )}
@@ -1220,7 +1220,7 @@ function CallStudioInner({
 
       {/* 右：Provider / 音频 / 结算 */}
       <section className="card flex min-h-0 flex-col gap-4 overflow-y-auto">
-        <div className="rounded-lg bg-white/5 p-3">
+        <div className="rounded-lg bg-muted/60 p-3">
           <span className="label">Provider 服务状态</span>
           <div className="mt-2 space-y-1 text-sm">
             {PROVIDER_FIELDS.map(([kind, label]) => (
@@ -1235,7 +1235,7 @@ function CallStudioInner({
           </div>
         </div>
         <AudioDevicesCard room={session.room} />
-        <div className="rounded-lg bg-white/5 p-3 text-sm">
+        <div className="rounded-lg bg-muted/60 p-3 text-sm">
           <span className="label mb-1 block">结算</span>
           {settlement ? (
             <>

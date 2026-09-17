@@ -98,7 +98,7 @@ export default function KnowledgePage() {
               {docs.slice(0, showAllDocs ? docs.length : 50).map((doc) => {
                 const id = String(doc.id ?? "");
                 return (
-                  <div key={id} className="flex items-start justify-between gap-3 rounded-lg bg-white/5 px-4 py-3">
+                  <div key={id} className="flex items-start justify-between gap-3 rounded-lg bg-muted/60 px-4 py-3">
                     <div className="min-w-0">
                       <p className="text-xs muted">{String(doc.path ?? doc.source ?? "片段")}</p>
                       <p className="mt-1 line-clamp-3 text-sm">{String(doc.text ?? doc.content ?? "")}</p>
@@ -132,7 +132,7 @@ export default function KnowledgePage() {
             <div className="mt-4 space-y-2">
               {results.length === 0 && <p className="text-sm muted">输入关键词检索当前账号知识库。</p>}
               {results.map((r, i) => (
-                <div key={i} className="rounded-lg bg-white/5 p-3 text-sm">
+                <div key={i} className="rounded-lg bg-muted/60 p-3 text-sm">
                   <p className="muted">{String(r.source ?? r.title ?? "片段")}</p>
                   <p className="mt-1 line-clamp-3">{String(r.text ?? r.content ?? r.snippet ?? "")}</p>
                 </div>

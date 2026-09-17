@@ -19,7 +19,7 @@ function Captions() {
   const transcriptions = useTranscriptions();
   const tail = transcriptions.slice(-6);
   return (
-    <div className="max-h-44 space-y-1 overflow-auto rounded-lg bg-black/20 p-2 text-xs">
+    <div className="max-h-44 space-y-1 overflow-auto rounded-lg bg-muted p-2 text-xs">
       {tail.length === 0 && <p className="muted">等待实时字幕…（旁听中不发声、不打断通话）</p>}
       {tail.map((t, i) => (
         <p key={`${String(t.participantInfo?.identity ?? "p")}-${i}`} className="leading-snug">

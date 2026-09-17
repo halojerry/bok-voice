@@ -408,14 +408,14 @@ export default function TemplatesPage() {
                         ? "我的"
                         : "他人";
                 return (
-                  <div key={id} className="rounded-lg bg-white/5 p-4">
+                  <div key={id} className="rounded-lg bg-muted/60 p-4">
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
                         <p className="flex flex-wrap items-center gap-2 font-medium">
                           {String(row.name ?? "-")}
                           <span
                             className={`rounded-sm px-1.5 py-0.5 text-[10px] font-normal ${
-                              ownerId === "" ? "bg-white/10 muted" : "bg-sky-400/15 text-sky-300"
+                              ownerId === "" ? "bg-muted muted" : "bg-sky-400/15 text-sky-300"
                             }`}
                           >
                             {ownerLabel}
@@ -514,7 +514,7 @@ export default function TemplatesPage() {
             )}
             <div className="mt-2 space-y-3">
               {steps.map((st, i) => (
-                <div key={i} className="rounded-lg border border-(--card-border) bg-white/5 p-2">
+                <div key={i} className="rounded-lg border border-(--card-border) bg-muted/60 p-2">
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-bold text-accent">第 {i + 1} 步</span>
                     <div className="flex gap-1">

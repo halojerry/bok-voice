@@ -300,7 +300,7 @@ export default function ObjectsPage() {
                 {filtered.map((r) => {
                   const id = String(r.id ?? r.object_id ?? "");
                   return (
-                    <div key={id} className="flex items-center gap-3 rounded-lg bg-white/5 px-4 py-3">
+                    <div key={id} className="flex items-center gap-3 rounded-lg bg-muted/60 px-4 py-3">
                       <input
                         type="checkbox"
                         className="shrink-0 accent-(--accent)"

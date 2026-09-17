@@ -309,7 +309,7 @@ export default function SupervisorPage() {
               const lastLine = lastCustomerLine(turns[id]);
               const isBusy = busy.startsWith(`${id}:`);
               return (
-                <div key={id} className={`rounded-lg p-4 ${waPending ? "wa-flash bg-white/5" : "bg-white/5"}`}>
+                <div key={id} className={`rounded-lg p-4 ${waPending ? "wa-flash bg-muted/60" : "bg-muted/60"}`}>
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
                       <p className="truncate font-medium">

@@ -114,7 +114,7 @@ function ProviderCard({
           {providerMeta?.hint && <p className="mt-1 text-xs muted">{providerMeta.hint}</p>}
         </div>
         {kind === "llm" && (provider === "local_openai" || provider === "mlx") && value.local_model ? (
-          <p className="rounded-lg bg-white/5 p-2 text-[11px] muted">
+          <p className="rounded-lg bg-muted/60 p-2 text-[11px] muted">
             本地模型切换需<b className="text-(--foreground)">重启本地服务</b>生效（`bok serve` 或点「本机桌面服务」重启）；重启后通话与蒸馏都用所选模型。
           </p>
         ) : null}

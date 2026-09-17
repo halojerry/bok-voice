@@ -189,8 +189,8 @@ export default function CallsPage() {
               return (
                 <div
                   key={id}
-                  className={`flex items-center justify-between gap-2 rounded-lg px-2 py-1 transition hover:bg-white/10 ${
-                    waPending ? "wa-flash bg-white/5" : "bg-white/5"
+                  className={`flex items-center justify-between gap-2 rounded-lg px-2 py-1 transition hover:bg-accent ${
+                    waPending ? "wa-flash bg-muted/60" : "bg-muted/60"
                   }`}
                 >
                   <button

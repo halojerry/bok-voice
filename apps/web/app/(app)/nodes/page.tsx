@@ -13,7 +13,7 @@ import { friendlyErrorText } from "@/lib/api-ready";
 const STATUS_LABEL: Record<string, string> = { online: "在线", offline: "离线", revoked: "已吊销" };
 const STATUS_BADGE: Record<string, string> = {
   online: "bg-emerald-400/15 text-emerald-300",
-  offline: "bg-white/10 muted",
+  offline: "bg-muted muted",
   revoked: "bg-red-500/15 text-red-300",
 };
 
@@ -179,7 +179,7 @@ export default function NodesPage() {
                     </td>
                     <td>
                       <span
-                        className={`rounded-sm px-1.5 py-0.5 text-[10px] ${STATUS_BADGE[n.status] ?? "bg-white/10 muted"}`}
+                        className={`rounded-sm px-1.5 py-0.5 text-[10px] ${STATUS_BADGE[n.status] ?? "bg-muted muted"}`}
                       >
                         {STATUS_LABEL[n.status] ?? n.status}
                       </span>
