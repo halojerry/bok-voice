@@ -37,17 +37,22 @@ export type CanvasEdge = {
   id: string;
   source: string; target: string;
   sourceHandle: string | null; targetHandle: string | null;
-  data: { kind: "cluster" | "step" };
+  data: { kind: "cluster" | "step" | "spine" };
   animated?: boolean;
   label?: string;
 };
 
-export const COL_W = 300;
-export const ROW_H = 150;
-// global（col0）条目的独立 x 泳道间距：col0 与 col1 的 y 基准同为 40（global 节点
-// y=0+40 偏移、step:0 节点 y=40），无独立泳道时两列条目像素级全同重叠——global 列
-// 右移让出独立车道，确定性契约不变（纯常量偏移，同输入同输出）。
-const GLOBAL_COL_GAP = 80;
+// 布局几何 v1.1（用户实测反馈「画面太挤、没读出关联」后重排）：
+// 脊柱=左侧流程主线（步骤间顺序连线读出走向）；卫星道外推拉开大走廊；
+// global 泳道甩到脊柱左侧，与步骤卫星彻底分居；簇间留白防止扎堆墙。
+export const SPINE_X = 0;          // 步骤脊柱列 x
+export const STEP_GAP_Y = 280;     // 相邻步骤节点的垂直间距
+export const SAT_X = 620;          // 卫星道距脊柱的水平走廊（给步骤边标签留位）
+export const ENTRY_PITCH_Y = 180;  // 条目纵向节距
+export const CLUSTER_GAP_Y = 80;   // 簇边界（非变体条目入列前）的额外留白
+export const WRAP_AFTER = 10;      // 每条卫星子道的条目容量，超出换下一子道
+export const LANE_X = 320;         // 子道水平间距
+export const GLOBAL_X = -560;      // global（全程通用）泳道 x：脊柱左侧，分居减密度
 
 export function parseTemplateSteps(stepsJson: string): FlowStep[] {
   try {
@@ -82,7 +87,7 @@ export function deriveGraph(
   const stepNodes: CanvasStepNode[] = steps.map((s, i) => ({
     id: `step:${i}`,
     type: "qaStep" as const,
-    position: { x: 0, y: 40 + i * (ROW_H + 60) },
+    position: { x: SPINE_X, y: 80 + i * STEP_GAP_Y },
     data: {
       index: i,
       goal: String(s.goal || ""),
@@ -90,30 +95,35 @@ export function deriveGraph(
       virtual: false,
     },
   }));
-  // 虚拟「全程通用」节点在列首上方。
+  // 虚拟「全程通用」节点在脊柱顶端；其卫星在左侧独立泳道（GLOBAL_X）。
   stepNodes.unshift({
     id: "step:global",
-    type: "qaStep",
-    position: { x: 0, y: 0 },
+    type: "qaStep" as const,
+    position: { x: SPINE_X, y: 0 },
     data: { index: -1, goal: "全程通用", refFirstLine: "不挂步骤的条目归此列", virtual: true },
   });
 
   const heads = new Set(filtered.map((r) => String(r.cluster_head_id || "")).filter(Boolean));
   const qaNodes: CanvasQaNode[] = [];
-  const cursor = new Map<number, number>(); // 列内游标（确定性行序：创建序=输入序）
+  // 每列游标：nextY=下一个条目的 y；lane=子道序号；count=已排条目数。
+  const colState = new Map<number, { nextY: number; lane: number; count: number }>();
   for (const r of filtered) {
     const col = colOf(r, steps.length);
+    const st = colState.get(col) ?? { nextY: col === 0 ? 0 : 80, lane: 0, count: 0 };
     const isHead = heads.has(String(r.id));
-    // 星形侧分支：head 行首，变体缩进挂其右下。
     const headId = String(r.cluster_head_id || "");
-    const indent = headId ? 120 : 0;
-    const rowIdx = cursor.get(col) ?? 0;
-    const base = stepNodes.find((n) => n.id === `step:${col === 0 ? "global" : col - 1}`)!.position;
+    // 星形侧分支：head 行首，变体缩进挂其右下；簇边界（非变体条目入列）加留白。
+    const indent = headId ? 140 : 0;
+    let y = st.nextY;
+    if (st.count > 0 && !headId) y += CLUSTER_GAP_Y;
+    // 容量换道：每 WRAP_AFTER 条换一条子道（确定性，纯几何）。
+    const lane = Math.floor(st.count / WRAP_AFTER);
+    const anchorX = col === 0 ? GLOBAL_X : SPINE_X + SAT_X;
     const pos = opts.positions[String(r.id)] ?? {
-      x: base.x + COL_W + indent + (col === 0 ? GLOBAL_COL_GAP : 0),
-      y: base.y + rowIdx * (ROW_H - 30) + (col === 0 ? 40 : 0),
+      x: anchorX + lane * LANE_X + indent,
+      y,
     };
-    cursor.set(col, rowIdx + 1);
+    colState.set(col, { nextY: y + ENTRY_PITCH_Y, lane, count: st.count + 1 });
     qaNodes.push({
       id: String(r.id),
       type: "qaEntry",
@@ -122,6 +132,15 @@ export function deriveGraph(
     });
   }
   const edges: CanvasEdge[] = [];
+  // 脊柱顺序连线（展示性：读出「第1步→第2步→…」流程走向；不可删、右键不响应）。
+  for (let i = 0; i + 1 < steps.length; i++) {
+    edges.push({
+      id: `spine:${i}`,
+      source: `step:${i}`, target: `step:${i + 1}`,
+      sourceHandle: null, targetHandle: null,
+      data: { kind: "spine" },
+    });
+  }
   for (const r of filtered) {
     const headId = String(r.cluster_head_id || "");
     if (headId && filtered.some((x) => String(x.id) === headId)) {

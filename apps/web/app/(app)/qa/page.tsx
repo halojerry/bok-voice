@@ -22,7 +22,7 @@ const QaCanvasView = dynamic(() => import("@/components/qa-canvas-view"), {
 /** 画布边右键/Delete 上抛的边载荷(与组件 CanvasEdgeHit 同构)。 */
 type CanvasEdgeHit = { id: string; source: string; target: string; data?: { kind?: string } };
 
-/** 播放一段音频 blob(罐头回放/现场合成共用);开始播放即返回,结束后回收 objectURL。 */
+/** 播放一段音频 blob(录音回放/现场合成共用);开始播放即返回,结束后回收 objectURL。 */
 async function playBlob(blob: Blob): Promise<void> {
   const url = URL.createObjectURL(blob);
   const audio = new Audio(url);
@@ -104,7 +104,7 @@ export default function QaPage() {
   const [templates, setTemplates] = useState<TemplateRow[]>([]);
   // 模板下拉只作画布步骤脊柱的派生输入(spec §4.2);已绑模板的显示/写入属 Phase 2,此处不做。
   const [templateId, setTemplateId] = useState("");
-  // 罐头物化状态面(spec §5):entry_id → ok|missing;拉取失败=空表(徽标降级,§8)。
+  // 录音状态面(spec §5):entry_id → ok|missing;拉取失败=空表(徽标降级,§8)。
   const [canned, setCanned] = useState<Record<string, { state: "ok" | "missing" }>>({});
   const cannedPollRef = useRef<ReturnType<typeof setTimeout>[]>([]);
   // 右键菜单(节点/边):{x,y}=视口坐标,fixed 定位直用。
@@ -142,7 +142,7 @@ export default function QaPage() {
     void refresh();
   }, [refresh]);
 
-  // 罐头状态面:CP 侧 60s TTL(spec §5),补料触发后经 scheduleCannedRefresh 轮询刷新。
+  // 录音状态面:CP 侧 60s TTL(spec §5),补录音触发后经 scheduleCannedRefresh 轮询刷新。
   const refreshCanned = useCallback(async () => {
     try {
       const res = await api.qaCannedStatus(accountId);
@@ -156,7 +156,7 @@ export default function QaPage() {
     void refreshCanned();
   }, [refreshCanned]);
 
-  // 补料后轮询:物化是后台子进程(条目多时数十秒),且 CP 状态缓存 60s TTL——
+  // 补录音后轮询:生成是后台子进程(条目多时数十秒),且 CP 状态缓存 60s TTL——
   // 单次 setTimeout 3s 结构性看不见新料;改 3s/15s/40s/65s 四次间隔轮询,
   // 末次跨过 TTL 窗口;重复触发先清旧定时器。卸载清理防 setState-after-unmount。
   const scheduleCannedRefresh = useCallback(() => {
@@ -361,16 +361,16 @@ export default function QaPage() {
     }
   }
 
-  // ---- 画布罐头面(qa-canvas Phase1 Task7):补料/试听,随画布挂载接线 ----
+  // ---- 画布录音面(qa-canvas Phase1 Task7):补录音/试听,随画布挂载接线 ----
 
-  /** 补料(一键=全量幂等,单条=右键「重新物化」):admin/root 闸,按钮仅主管渲染。
+  /** 补录音(一键=全量幂等,单条=右键「重新录音」):admin/root 闸,按钮仅主管渲染。
    *  already_running 静默(单飞进行中,轮询会自然取到结果);script_missing 才报错。 */
   async function pregenQa(ids: string[]) {
     setBusy("pregen");
     setErr("");
     try {
       const res = await api.pregenQa(ids);
-      if (res?.status === "script_missing") setErr("补料失败：物化脚本缺失。");
+      if (res?.status === "script_missing") setErr("重新录音失败：录音生成脚本缺失。");
       scheduleCannedRefresh();
     } catch (e) {
       setErr(String(e));
@@ -379,8 +379,8 @@ export default function QaPage() {
     }
   }
 
-  /** 试听(spec §5):先播罐头缓存(零云费,auth-on 经 fetch-blob+Bearer,<audio> 带不了鉴权头);
-   *  缺料(404)/播放失败回退现场合成——烧云配额仅主管可用,user 见提示待物化。 */
+  /** 试听(spec §5):先播录音缓存(零云费,auth-on 经 fetch-blob+Bearer,<audio> 带不了鉴权头);
+   *  缺录音(404)/播放失败回退现场合成——烧云配额仅主管可用,user 见提示待生成。 */
   async function audition(row: QaRow) {
     const id = String(row.id ?? "");
     setBusy(`${id}:audition`);
@@ -404,7 +404,7 @@ export default function QaPage() {
           setErr(`试听失败：${String(e)}`);
         }
       } else {
-        window.alert("该条目罐头未物化，请联系主管在画布上「重新物化」。");
+        window.alert("该条目还没有录音，请联系主管在画布上「重新录音」。");
       }
     } finally {
       setBusy("");
@@ -451,10 +451,12 @@ export default function QaPage() {
     }
   }
 
-  /** 断线:簇边=变体回归独立(乐观写+回滚,与连簇对称);步骤边=解挂回全程通用。 */
+  /** 断线:簇边=变体回归独立(乐观写+回滚,与连簇对称);步骤边=解挂回全程通用;
+   *  脊柱顺序线(spine)是展示性元素,不可解除。 */
   async function disconnect(edge: { source: string; target: string; data?: { kind?: string } }) {
     const fromId = String(edge.source ?? "");
     if (!fromId) return;
+    if (edge.data?.kind === "spine") return;
     if (edge.data?.kind === "cluster") {
       const prev = String((rows ?? []).find((r) => String(r.id) === fromId)?.cluster_head_id ?? "");
       setRows((rs) =>
@@ -736,7 +738,7 @@ export default function QaPage() {
               <button
                 className="btn-ghost"
                 disabled={busy === `${editingId}:audition`}
-                title="先播罐头缓存；缺料时主管侧现场合成"
+                title="先播录音缓存；缺录音时主管侧现场合成"
                 onClick={() =>
                   void audition({
                     id: editingId,
@@ -759,7 +761,7 @@ export default function QaPage() {
         </section>
       </div>
 
-      {/* 右键菜单(spec §4.4):节点=编辑/启停/试听/重新物化[主管]/删除(只读行仅试听);
+      {/* 右键菜单(spec §4.4):节点=编辑/启停/试听/重新录音[主管]/删除(只读行仅试听);
           边=解除连线(簇边=散簇、步骤边=解挂,page.disconnect 按 kind 分路)。 */}
       {menu && (
         <div
@@ -782,7 +784,7 @@ export default function QaPage() {
             <button className={menuItemCls} onClick={() => { setMenu(null); void audition(menu.row); }}>试听</button>
             {isManager && (
               <button className={menuItemCls} onClick={() => { setMenu(null); void pregenQa([String(menu.row.id)]); }}>
-                重新物化
+                重新录音
               </button>
             )}
             {canEditRow(menu.row) && (

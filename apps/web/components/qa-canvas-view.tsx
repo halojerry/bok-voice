@@ -33,7 +33,7 @@ function QaEntryNode({ data }: NodeProps) {
   const dim = d.enabled === false;
   return (
     <div
-      className={`w-[260px] rounded-lg border bg-white/5 p-3 text-xs ${dim ? "opacity-50" : ""} ${d.isHead ? "border-(--accent)" : "border-(--card-border)"}`}
+      className={`w-[280px] rounded-lg border bg-white/5 p-3 text-xs ${dim ? "opacity-50" : ""} ${d.isHead ? "border-(--accent)" : "border-(--card-border)"}`}
       title={d.canEdit ? undefined : "共享条目由主管维护"}
     >
       {/* 柄始终渲染(v12 边锚定柄,缺柄=008 且簇/步骤边整体消失)。只读条目双向闸:
@@ -54,8 +54,8 @@ function QaEntryNode({ data }: NodeProps) {
         <span className="rounded-sm bg-white/10 px-1 text-[10px]">{LANG_LABEL[String(d.lang ?? "zh")] ?? d.lang}</span>
         <span className="rounded-sm bg-white/10 px-1 text-[10px]">命中 {Number(d.hit_count ?? 0)}</span>
         {d.source && <span className="rounded-sm bg-white/10 px-1 text-[10px]">{SOURCE_LABEL[d.source] ?? d.source}</span>}
-        {d.canned === "missing" && <span className="rounded-sm bg-amber-400/20 px-1 text-[10px] text-amber-300">缺料</span>}
-        {d.canned === "ok" && <span className="rounded-sm bg-emerald-400/20 px-1 text-[10px] text-emerald-300">罐头✓</span>}
+        {d.canned === "missing" && <span className="rounded-sm bg-amber-400/20 px-1 text-[10px] text-amber-300">缺录音</span>}
+        {d.canned === "ok" && <span className="rounded-sm bg-emerald-400/20 px-1 text-[10px] text-emerald-300">录音✓</span>}
         {d.enabled === false && <span className="rounded-sm bg-white/10 px-1 text-[10px]">停用</span>}
         {!d.canEdit && <span className="rounded-sm bg-white/10 px-1 text-[10px]" title="共享只读">🔒</span>}
       </div>
@@ -90,14 +90,14 @@ export default function QaCanvasView(props: {
   canEditRow: (row: QaRow) => boolean;
   onNodeClick: (row: QaRow) => void;
   onPaneDoubleClick: (pt: { x: number; y: number }) => void;
-  /** 右键条目(page 提供菜单:编辑/启停/删除/试听/重新物化[manager]);不给时仅吞掉浏览器默认菜单。 */
+  /** 右键条目(page 提供菜单:编辑/启停/删除/试听/重新录音[manager]);不给时仅吞掉浏览器默认菜单。 */
   onNodeContextMenu?: (row: QaRow, e: ReactMouseEvent) => void;
   /** 右键边(page 提供菜单:解除连线,spec §4.4「右键解除」)。 */
   onEdgeContextMenu?: (edge: CanvasEdgeHit, e: ReactMouseEvent) => void;
   onConnectCluster: (fromId: string, toId: string) => void;
   onDisconnect: (edge: CanvasEdgeHit) => void;
   onStepConnect: (entryId: string, stepIndex: number) => void;
-  /** 一键补料(仅主管注入;不给=按钮不渲染,user 的 403 由闸兜底)。 */
+  /** 补齐录音(仅主管注入;不给=按钮不渲染,user 的 403 由闸兜底)。 */
   onPregenAll?: () => void;
   pregenBusy?: boolean;
 }) {
@@ -144,6 +144,15 @@ export default function QaCanvasView(props: {
     () =>
       graph.edges.map((e) => {
         const sel = e.id === selectedEdgeId;
+        if (e.data.kind === "spine") {
+          // 脊柱顺序连线（展示性）：细实线读流程走向，不可选/不可删/不响应右键。
+          return {
+            ...e,
+            selectable: false,
+            deletable: false,
+            style: { stroke: "#b6bfcc", strokeWidth: 2 },
+          };
+        }
         return {
           ...e,
           selected: sel,
@@ -223,7 +232,7 @@ export default function QaCanvasView(props: {
         </button>
         {props.onPregenAll && (
           <button className="btn-ghost text-xs" disabled={props.pregenBusy} onClick={props.onPregenAll}>
-            {props.pregenBusy ? "补料中…" : "一键补料"}
+            {props.pregenBusy ? "录音生成中…" : "补齐录音"}
           </button>
         )}
       </div>
@@ -267,12 +276,16 @@ export default function QaCanvasView(props: {
           }}
           onEdgeContextMenu={(e, edge) => {
             e.preventDefault();
+            if ((edge.data as { kind?: string } | undefined)?.kind === "spine") return; // 脊柱线不可解除
             const hit = edge as CanvasEdgeHit;
             setSelectedEdgeId(edge.id);
             props.onEdgeContextMenu?.(hit, e);
           }}
           onEdgesDelete={(deleted) => {
-            for (const edge of deleted) props.onDisconnect(edge as CanvasEdgeHit);
+            for (const edge of deleted) {
+              if ((edge.data as { kind?: string } | undefined)?.kind === "spine") continue;
+              props.onDisconnect(edge as CanvasEdgeHit);
+            }
             setSelectedEdgeId(null);
           }}
           onConnect={(conn) => {

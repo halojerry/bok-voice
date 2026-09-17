@@ -53,16 +53,36 @@ test("parseTemplateSteps 解析 steps_json", () => {
   assert.equal(qa.parseTemplateSteps("").length, 0);
 });
 
-test("deriveGraph 步骤脊柱+簇边+步骤边", () => {
+test("deriveGraph 步骤脊柱+簇边+步骤边+顺序线", () => {
   const g = qa.deriveGraph(ROWS, STEPS, { langFilter: "all", positions: {} });
   assert.equal(g.stepNodes.filter((n) => n.data.virtual !== true).length, 2);
   const kinds = g.edges.map((e) => e.data.kind).sort();
-  assert.deepEqual(kinds, ["cluster", "step", "step"]);
+  assert.deepEqual(kinds, ["cluster", "spine", "step", "step"]); // spine=步骤间顺序线
   const cluster = g.edges.find((e) => e.data.kind === "cluster");
   assert.equal(cluster.source, "v"); assert.equal(cluster.target, "h");
+  const spine = g.edges.find((e) => e.data.kind === "spine");
+  assert.equal(spine.source, "step:0"); assert.equal(spine.target, "step:1");
   // 布局确定性:同输入两次全同
   assert.deepEqual(qa.deriveGraph(ROWS, STEPS, { langFilter: "all", positions: {} }),
                    qa.deriveGraph(ROWS, STEPS, { langFilter: "all", positions: {} }));
+});
+
+test("deriveGraph 布局 v1.1——节距/簇留白/global 左泳道", () => {
+  // A(step0 独立) → B(step0, A 的变体) → C(step0 独立)：簇边界前应有额外留白。
+  const rows = [
+    { id: "A", question_text: "q1", answer_text: "a", lang: "zh", scope: "step", step_index: 0, cluster_head_id: "", enabled: true },
+    { id: "B", question_text: "q2", answer_text: "a", lang: "zh", scope: "step", step_index: 0, cluster_head_id: "A", enabled: true },
+    { id: "C", question_text: "q3", answer_text: "a", lang: "zh", scope: "step", step_index: 0, cluster_head_id: "", enabled: true },
+  ];
+  const g = qa.deriveGraph(rows, STEPS, { langFilter: "all", positions: {} });
+  const byId = Object.fromEntries(g.qaNodes.map((n) => [n.id, n.position]));
+  assert.equal(byId.B.y - byId.A.y, qa.ENTRY_PITCH_Y);          // 常规节距
+  assert.ok(byId.C.y - byId.B.y >= qa.ENTRY_PITCH_Y + qa.CLUSTER_GAP_Y); // 簇边界留白
+  // 变体缩进：B 在 A 右侧。
+  assert.ok(byId.B.x > byId.A.x);
+  // global 条目在脊柱左侧独立泳道。
+  const gh = qa.deriveGraph([ROWS[0]], STEPS, { langFilter: "all", positions: {} });
+  assert.ok(gh.qaNodes[0].position.x < 0);
 });
 
 test("resolveClusterTarget 星形校验", () => {
@@ -85,12 +105,14 @@ test("resolveClusterTarget 已带变体的主条目作 source 整类拒绝（防
   assert.equal(qa.resolveClusterTarget(R2, "h2", "v").ok, true);
 });
 
-test("deriveGraph col0 与 col1 条目位置不重合（global 独立 x 泳道）", () => {
+test("deriveGraph col0 与 col1 条目位置不重合（global 左泳道 vs 卫星右道）", () => {
   // 曾有缺陷：col0（global）与 col1（step 0）条目 x、y 全同像素级重叠。
+  // v1.1 后 global 泳道在脊柱左侧（负 x），卫星道在右侧（+SAT_X）。
   const g = qa.deriveGraph(ROWS, STEPS, { langFilter: "all", positions: {} });
   const byId = Object.fromEntries(g.qaNodes.map((n) => [n.id, n.position]));
-  assert.notDeepEqual(byId.h, byId.s);        // h=col0 行首, s=col1 行首（同 rowIdx）
-  assert.ok(byId.h.x > byId.s.x);             // global 泳道在 step 泳道右侧
+  assert.notDeepEqual(byId.h, byId.s);        // h=global 泳道, s=step0 泳道
+  assert.ok(byId.h.x < 0);                    // global 甩到脊柱左侧
+  assert.ok(byId.s.x > 0);                    // 卫星在脊柱右侧走廊
 });
 
 test("revertCluster 回滚断簇", () => {
