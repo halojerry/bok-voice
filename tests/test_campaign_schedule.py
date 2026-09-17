@@ -65,3 +65,33 @@ def test_concurrency_cap():
     assert concurrency_cap({"max_concurrency": 4}) == 4
     assert concurrency_cap({}) == 1
     assert concurrency_cap({"max_concurrency": "x"}) == 1
+
+
+def test_within_call_windows_rejects_garbage_hhmm_fastpath():
+    """M1（Task 3 评审遗留）：fast-path 直收「已像窗」dict 绕过 parse_call_windows
+    归一——_hhmm_to_minute 必须自带 0-23/0-59 值域校验，垃圾窗不放行。"""
+    assert within_call_windows(NOW, [{"days": [4], "start": "08:00", "end": "99:99"}]) is False
+    assert within_call_windows(NOW, [{"days": [4], "start": "25:00", "end": "26:00"}]) is False
+    assert within_call_windows(NOW, [{"days": [4], "start": "08:00", "end": "08:60"}]) is False
+    # 正常窗不受值域校验影响（回归对照）
+    assert within_call_windows(NOW, [{"days": [4], "start": "08:00", "end": "18:00"}]) is True
+
+
+def test_within_call_windows_cross_midnight_formal():
+    """跨零点窗正式 pytest（Task 2 评审遗留：此前只有 ad-hoc 探针）。
+
+    now=周五 03:00、窗=[{"days":[4],"start":"22:00","end":"06:00"}]
+    （周四 22:00 → 周五 06:00）：前半段看起点日周四、后半段看昨日是否起点日。
+    """
+    friday_3am = datetime(2026, 9, 18, 3, 0, 0)   # 周五
+    window = [{"days": [4], "start": "22:00", "end": "06:00"}]
+    assert within_call_windows(friday_3am, window) is True                       # 次日清晨段
+    assert within_call_windows(friday_3am.replace(hour=5, minute=59), window) is True
+    # end 端点含（与普通窗 18:00 端点含同口径），06:00:01 起出窗
+    assert within_call_windows(friday_3am.replace(hour=6, minute=0), window) is True
+    assert within_call_windows(friday_3am.replace(hour=6, minute=0, second=1), window) is False
+    assert within_call_windows(friday_3am.replace(hour=21, minute=59), window) is False
+    assert within_call_windows(datetime(2026, 9, 17, 23, 0, 0), window) is True  # 周四深夜段
+    assert within_call_windows(datetime(2026, 9, 17, 21, 59, 0), window) is False
+    # 起点日之外的同时刻不放行（周三 23:00 不在窗）
+    assert within_call_windows(datetime(2026, 9, 16, 23, 0, 0), window) is False

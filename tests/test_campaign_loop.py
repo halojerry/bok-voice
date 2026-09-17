@@ -10,12 +10,43 @@ os.environ.setdefault("LIVEKIT_URL", "ws://127.0.0.1:7880")
 import asyncio
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps" / "control-plane"))
 
 from bok_voice_business_db.repository import InMemoryBusinessRepository
 from control_plane.campaign import campaign_tick, item_status_for_call
+
+# 调度循环测试的注入时钟（2026-09-17 Task 3）：取真实 UTC now 的 naive 形态——
+# 收割落库的 updated_at 是真实 UTC 墙钟（_utcnow_iso），注入 now 必须与它同一条
+# 时间线，重拨间隔断言才确定（固定历史时刻会与真实钟差出半个 interval）。
+# 窗口断言不依赖绝对时刻：窗的 days/起止全部由 NOW 动态构造。
+NOW = datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _window_inside_now() -> list[dict]:
+    """覆盖 NOW 的任务窗：[NOW 整点, 下一整点+58m)。任一秒都保证含 NOW。"""
+    return [{"days": [NOW.isoweekday()], "start": f"{NOW.hour:02d}:00",
+             "end": f"{(NOW.hour + 1) % 24:02d}:58"}]
+
+
+def _window_outside_now() -> list[dict]:
+    """同日但绝不含 NOW 的窗：[NOW+1h, NOW+2h]（模 24，含跨零点形态）。"""
+    return [{"days": [NOW.isoweekday()], "start": f"{(NOW.hour + 1) % 24:02d}:00",
+             "end": f"{(NOW.hour + 2) % 24:02d}:59"}]
+
+
+def _ending_dispatch(repo, record: list):
+    """fake dispatcher：记录派发并立刻把通话置 ENDED+no_answer（模拟未接通即挂）。
+
+    room 即 call_id（_start_call 以 call_id 作 room 派发），直接落 repo。
+    """
+    async def dispatch(room: str, metadata: str) -> None:
+        record.append(room)
+        repo.update_call(room, status="ended", disposition="no_answer")
+
+    return dispatch
 
 
 def _manifest(session_id: str):
@@ -318,5 +349,187 @@ def test_tick_snapshots_campaign_template_into_call():
 
 async def _noop_dispatch(room: str, metadata: str) -> None:  # pragma: no cover
     raise AssertionError("不应派发")
+
+
+# ---- 调度循环接线（2026-09-17 campaign-scheduling-dashboard Task 3）：
+# 双层时段窗（全局 ∩ 任务）/ 任务级并发槽位 / 未接通自动重拨。全部注入 now。----
+
+def test_tick_no_dispatch_outside_window():
+    """任务窗不含 now → 不起拨、item 不离开 pending、campaign 不误判 done。"""
+    repo = InMemoryBusinessRepository()
+    obj = repo.create_object("acc-001", {"display_name": "A", "phone": "+85211111111"})
+    c = repo.create_campaign("acc-001", name="t", template_id="", persona_id="",
+                             language="zh", gap_seconds=5,
+                             call_windows=_window_outside_now(),
+                             object_ids=[obj["id"]])
+    repo.update_campaign(c["id"], status="running")
+    dispatched: list[str] = []
+    out = asyncio.run(campaign_tick(repo, dispatcher=_ending_dispatch(repo, dispatched),
+                                    now=NOW))
+    assert out["started"] == 0 and out["finished"] == 0
+    assert dispatched == []
+    assert repo.list_items(c["id"])[0]["status"] == "pending"
+    assert repo.get_campaign(c["id"])["status"] == "running"
+
+
+def test_tick_dispatch_inside_window():
+    """同窗、now 落窗内 → 起拨。"""
+    repo = InMemoryBusinessRepository()
+    obj = repo.create_object("acc-001", {"display_name": "A", "phone": "+85211111111"})
+    c = repo.create_campaign("acc-001", name="t", template_id="", persona_id="",
+                             language="zh", gap_seconds=5,
+                             call_windows=_window_inside_now(),
+                             object_ids=[obj["id"]])
+    repo.update_campaign(c["id"], status="running")
+    dispatched: list[str] = []
+    out = asyncio.run(campaign_tick(repo, dispatcher=_ending_dispatch(repo, dispatched),
+                                    now=NOW))
+    assert out["started"] == 1
+    assert len(dispatched) == 1
+    assert repo.list_items(c["id"])[0]["status"] == "dialing"
+
+
+def test_global_window_intersects_task_window():
+    """全局窗（settings.campaign.call_windows）∩ 任务窗，两层都过才起拨。"""
+    repo = InMemoryBusinessRepository()
+    obj = repo.create_object("acc-001", {"display_name": "A", "phone": "+85211111111"})
+    c = repo.create_campaign("acc-001", name="t", template_id="", persona_id="",
+                             language="zh", gap_seconds=5,
+                             call_windows=_window_inside_now(),
+                             object_ids=[obj["id"]])
+    repo.update_campaign(c["id"], status="running")
+    # 全局窗=now 窗外 → 任务窗虽全开也不起拨。（save_settings 白名单不收 campaign
+    # 段——全局窗写侧端点不在本计划内——测试直接改内存仓 settings dict。）
+    repo.settings["campaign"] = {"call_windows": _window_outside_now()}
+    dispatched: list[str] = []
+    out = asyncio.run(campaign_tick(repo, dispatcher=_ending_dispatch(repo, dispatched),
+                                    now=NOW))
+    assert out["started"] == 0
+    assert repo.list_items(c["id"])[0]["status"] == "pending"
+    # 全局窗空 → 只看任务窗（空=不限）
+    repo.settings["campaign"] = {"call_windows": []}
+    out2 = asyncio.run(campaign_tick(repo, dispatcher=_ending_dispatch(repo, dispatched),
+                                     now=NOW))
+    assert out2["started"] == 1
+    assert repo.list_items(c["id"])[0]["status"] == "dialing"
+
+
+def test_concurrency_two_slots():
+    """max_concurrency=2：一轮至多补一通、下一轮巡检再补位到 2 槽；在途满员第 3 条不起；
+    释放一槽后下一轮补位。"""
+    repo = InMemoryBusinessRepository()
+    objs = [repo.create_object("acc-001", {"display_name": f"A{i}",
+                                           "phone": f"+8521111111{i}"})
+            for i in range(3)]
+    c = repo.create_campaign("acc-001", name="t", template_id="", persona_id="",
+                             language="zh", gap_seconds=0, max_concurrency=2,
+                             object_ids=[o["id"] for o in objs])
+    repo.update_campaign(c["id"], status="running")
+    dispatched: list[str] = []
+    dispatch = _ending_dispatch(repo, dispatched)
+
+    # 第一轮：在途 0 < cap 2 → 起 1 通（fake dispatcher 把通话置 ENDED，item=dialing）
+    out1 = asyncio.run(campaign_tick(repo, dispatcher=dispatch, now=NOW))
+    assert out1["started"] == 1
+    items = repo.list_items(c["id"])
+    assert items[0]["status"] == "dialing" and items[1]["status"] == "pending"
+
+    # 手工把已拨 item 置 in_call（通话同步回 active，否则下一轮会被收割）
+    repo.update_item(items[0]["id"], status="in_call")
+    repo.update_call(items[0]["call_id"], status="active")
+
+    # 第二轮：在途 1 < 2 → 再补 1 通 → 在途=2
+    out2 = asyncio.run(campaign_tick(repo, dispatcher=dispatch, now=NOW))
+    assert out2["started"] == 1
+    items = repo.list_items(c["id"])
+    assert sum(1 for i in items if i["status"] in ("dialing", "in_call")) == 2
+
+    repo.update_item(items[1]["id"], status="in_call")
+    repo.update_call(items[1]["call_id"], status="active")
+
+    # 第三轮：在途 2 >= cap 2 → 第 3 条不起
+    out3 = asyncio.run(campaign_tick(repo, dispatcher=dispatch, now=NOW))
+    assert out3["started"] == 0
+    assert repo.list_items(c["id"])[2]["status"] == "pending"
+
+    # 释放一槽：第一通挂断 → 同轮收割；gap 冷却挡同轮补位（gap_seconds=0 兜 5s）
+    repo.update_call(items[0]["call_id"], status="ended", disposition="completed")
+    out4 = asyncio.run(campaign_tick(repo, dispatcher=dispatch, now=NOW))
+    assert out4["harvested"] == 1 and out4["started"] == 0
+    past = (datetime.now(timezone.utc) - timedelta(seconds=31)).replace(tzinfo=None).isoformat()
+    repo.update_item(items[0]["id"], updated_at=past)
+    # 冷却过后 → 补位起第 3 条
+    out5 = asyncio.run(campaign_tick(repo, dispatcher=dispatch, now=NOW))
+    assert out5["started"] == 1
+    assert repo.list_items(c["id"])[2]["status"] == "dialing"
+
+
+def test_redispatch_cycle():
+    """未接通自动重拨全周期：收割回 pending（attempts 预约=2）→ 间隔内不起拨 →
+    到点重拨（attempts=2）→ 再 no_answer（attempts=max）终态不回 pending → done。"""
+    repo = InMemoryBusinessRepository()
+    obj = repo.create_object("acc-001", {"display_name": "A", "phone": "+85211111111"})
+    c = repo.create_campaign("acc-001", name="t", template_id="", persona_id="",
+                             language="zh", gap_seconds=0,
+                             redispatch={"max_attempts": 2, "interval_minutes": 30,
+                                         "on": ["no_answer"]},
+                             object_ids=[obj["id"]])
+    repo.update_campaign(c["id"], status="running")
+    dispatched: list[str] = []
+    dispatch = _ending_dispatch(repo, dispatched)
+
+    # 首拨（attempts=1）
+    out1 = asyncio.run(campaign_tick(repo, dispatcher=dispatch, now=NOW))
+    assert out1["started"] == 1
+    item = repo.list_items(c["id"])[0]
+    # 未接通收割 → 回 pending 等重拨；attempts 不重置、预约下一次尝试编号=2
+    out2 = asyncio.run(campaign_tick(repo, dispatcher=dispatch, now=NOW))
+    item = repo.get_item(item["id"])
+    assert out2["harvested"] == 1
+    assert item["status"] == "pending" and item["attempts"] == 2
+
+    # 30 分钟内：等待重拨，不起拨、不判 done
+    repo.update_item(item["id"], updated_at=(NOW - timedelta(minutes=10)).isoformat())
+    out3 = asyncio.run(campaign_tick(repo, dispatcher=dispatch, now=NOW))
+    assert out3["started"] == 0 and out3["finished"] == 0
+    assert repo.get_campaign(c["id"])["status"] == "running"
+
+    # 把 updated_at 拨早 31 分钟 → 到点重拨；attempts 保持 2（本轮起的就是第 2 次）
+    repo.update_item(item["id"], updated_at=(NOW - timedelta(minutes=31)).isoformat())
+    out4 = asyncio.run(campaign_tick(repo, dispatcher=dispatch, now=NOW))
+    assert out4["started"] == 1
+    item = repo.get_item(item["id"])
+    assert item["status"] == "dialing" and item["attempts"] == 2
+
+    # 再次 no_answer：attempts 已=2=max → 终态不回 pending；名单尽 → done
+    out5 = asyncio.run(campaign_tick(repo, dispatcher=dispatch, now=NOW))
+    item = repo.get_item(item["id"])
+    assert out5["harvested"] == 1
+    assert item["status"] == "no_answer" and item["attempts"] == 2
+    assert repo.get_campaign(c["id"])["status"] == "done"
+
+
+def test_waiting_redispatch_keeps_campaign_open():
+    """名单全在等重拨期间：campaign 不置 done（等钟到点继续拨）。"""
+    repo = InMemoryBusinessRepository()
+    obj = repo.create_object("acc-001", {"display_name": "A", "phone": "+85211111111"})
+    c = repo.create_campaign("acc-001", name="t", template_id="", persona_id="",
+                             language="zh", gap_seconds=0,
+                             redispatch={"max_attempts": 2, "interval_minutes": 30,
+                                         "on": ["no_answer"]},
+                             object_ids=[obj["id"]])
+    repo.update_campaign(c["id"], status="running")
+    dispatched: list[str] = []
+    dispatch = _ending_dispatch(repo, dispatched)
+
+    asyncio.run(campaign_tick(repo, dispatcher=dispatch, now=NOW))          # 首拨
+    asyncio.run(campaign_tick(repo, dispatcher=dispatch, now=NOW))          # 收割回 pending
+    item = repo.list_items(c["id"])[0]
+    assert item["status"] == "pending" and item["attempts"] == 2
+    # 等待重拨的 tick：finished==0、campaign 保持 running
+    out = asyncio.run(campaign_tick(repo, dispatcher=dispatch, now=NOW))
+    assert out["finished"] == 0
+    assert repo.get_campaign(c["id"])["status"] == "running"
+    assert repo.list_items(c["id"])[0]["status"] == "pending"
 
 
