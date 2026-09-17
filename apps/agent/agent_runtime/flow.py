@@ -536,6 +536,21 @@ def should_auto_advance(*, current: int, goal: str, ref: str, user_text: str, ve
     if ("平台" in ctx or "platform" in low_ctx) and _PLATFORM_RE.search(user_text):
         return True
     return False
+
+
+# ---- stall 升级阶梯(漏斗 v2,spec §3.1):同 step 连续 UNCLEAR 有出口 ----
+STALL_DEGRADE_N, STALL_BYPASS_N, STALL_CLOSE_N = 3, 5, 8
+
+
+def stall_ladder_level(streak: int) -> str:
+    """同 step 连续 UNCLEAR 数 → 阶梯级别(spec §3.1: 3 降级问法/5 绕过留号/8 收线)。"""
+    if streak >= STALL_CLOSE_N:
+        return "close"
+    if streak >= STALL_BYPASS_N:
+        return "bypass"
+    if streak >= STALL_DEGRADE_N:
+        return "degrade"
+    return ""
 # 已知资料键:若号码 run 命中佢哋 → 唔当新 WhatsApp(覆述单号/电话)
 _KNOWN_NUM_KEYS = ("快递单号", "快递单號", "快递尾号", "電話", "电话", "電話號碼")
 
@@ -862,6 +877,9 @@ class FlowController:
     # (同一串数字两窗两解,2026-09-07 日志实证),AI 拿到错号从不复核。
     # current_step_text 据此渲染「逐位复述核对」指引。agent.py 钩子每轮写入。
     last_digits: list[str] = field(default_factory=list)
+    # stall 升级账本(漏斗 v2,spec §3.1):同 step 连续 UNCLEAR 数;按 (step, turn_key)
+    # 去重——rule 与 background judge 双路报同一轮只计 1。
+    step_streak: dict[int, int] = field(default_factory=dict)
 
     @classmethod
     def from_template(cls, template: dict | None, object_card: dict | None) -> "FlowController":
@@ -877,6 +895,8 @@ class FlowController:
         # 渐进披露渲染账本:每步第一次渲染(装配/推进后首轮)才注入底稿,
         # 此后转分支模式(正稿已入对话史,重发只喂复制引力)。
         self._last_render_step = -1
+        # stall 账本轮去重键(漏斗 v2):rule 与 judge 双路报同一轮只计 1。
+        self._streak_seen: set[str] = set()
 
     @property
     def has_steps(self) -> bool:
@@ -898,6 +918,7 @@ class FlowController:
         """客户明确拒绝/告别 → 进入收尾态:之后只讲收尾话术,唔再推进/唔再按步走。"""
         self.closing = True
         self._just_advanced = False
+        self.step_streak.clear()  # 收尾态唔再计 stall(漏斗 v2,spec §3.1)
 
     def closing_text(self) -> str:
         """收尾态注入:一句礼貌告别,唔推销、唔挽留、唔转话题、唔问问题。"""
@@ -923,11 +944,33 @@ class FlowController:
 
     def advance(self) -> None:
         """推进到下一步(最后一步确认后即完成,唔越界)。"""
+        # 步切换 → 清旧步 stall 计数(漏斗 v2,spec §3.1):推进本身就係「唔卡」的证明。
+        # 首行执行(守卫之前):冇流程的控制器也照清,账本语义与流程解耦。
+        self.step_streak.pop(self.current, None)
         if not self.has_steps or self.done:
             return
         if self.current < len(self.steps):
             self.current += 1
             self._just_advanced = True
+
+    def note_turn_outcome(self, verdict: str, step: int, turn_key: str) -> int:
+        """每轮判决记账(漏斗 v2,spec §3.1):UNCLEAR 且步未变 +1,其余清该步计数。
+
+        同一轮 rule 与 background judge 双路都报 → 按 (step, turn_key) 去重只计 1
+        (judge 迟到返回同轮同 key 直接跳过)。非 UNCLEAR 判决(实质提问/应承/
+        异议/道别/拖延)唔算 stall → 清该步计数;去重键只喺 UNCLEAR 计数时登记,
+        judge 改判 unclear 仍可补计(spec「双路计数」语义:任一路判 unclear 即计)。
+        """
+        if verdict != UNCLEAR:
+            self.step_streak.pop(step, None)
+            return 0
+        key = f"{step}:{turn_key}"
+        if key in self._streak_seen:
+            return self.step_streak.get(step, 0)
+        self._streak_seen.add(key)
+        n = self.step_streak.get(step, 0) + 1
+        self.step_streak[step] = n
+        return n
 
     def apply_judge_verdict(self, verdict: str) -> None:
         """LLM 语义判定结果落状态(advance→推进;其它唔郁)。"""

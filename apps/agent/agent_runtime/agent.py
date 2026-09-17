@@ -21,7 +21,7 @@ from .qa_gate import QaIndex, qa_exclude_reason as _qa_exclude_reason, qa_fastpa
 from .tts_cache import CachedTTS, TtsAudioCache, default_cache_dir, frames_aiter, pcm_to_frames, tts_cache_enabled
 # 模块级引 flow(纯 stdlib 依赖,无环):_wa_numberish/_wa_number_line 等模块级
 # helper 用;entrypoint 内的 function-scoped import 属历史样式,不冲突。
-from .flow import _digit_normalize, digits_to_cantonese
+from .flow import _digit_normalize, digits_to_cantonese, stall_ladder_level
 
 try:
     from bok_voice_obs.logging import configure_logging, get_logger
@@ -948,6 +948,25 @@ def _farewell_line(name: str, lang: str) -> str:
     if lang == "en":
         return f"{name or 'Goodbye'}, I'll try again later. Thanks and goodbye."
     return f"{who}那我稍后再联系您，谢谢您，再见"
+
+
+def _stall_ladder_line(lang: str, level: str) -> str:
+    """stall 阶梯直念行(spec §3.1)。degrade=封闭问句引导;bypass=绕过留号。
+    v1 无模板 degrade_hint 字段,通用罐头;三语,cantonese 全小写。"""
+    _LINES = {
+        "degrade": {
+            "zh": "这样吧，您不用想那么多——我就问您一句，您答个「是」或者「不是」就行。",
+            "cantonese": "噉啦，唔使諗咁多——我就問你一句，你答「係」定「唔係」就得㗎啦。",
+            "en": "Let me keep this simple — a yes or no will do.",
+        },
+        "bypass": {
+            "zh": "要不这样，您留个 WhatsApp 给我们，我们安排专人帮您跟进，好吗？",
+            "cantonese": "不如噉，你留个 WhatsApp 俾我哋，我哋安排专人帮你跟进，好唔好？",
+            "en": "How about you leave us your WhatsApp, and we'll have a specialist follow up with you?",
+        },
+    }
+    table = _LINES.get(level) or _LINES["degrade"]
+    return table.get(lang) or table["cantonese"]
 
 
 def _normalize_lang(raw, default: str = "") -> str:
@@ -2952,10 +2971,12 @@ async def entrypoint(ctx):
 
     ctx.add_shutdown_callback(_wait_close_flush)
 
-    async def _background_flow_judge(step_at: int, utt: str) -> None:
+    async def _background_flow_judge(step_at: int, utt: str, turn_key: str = "") -> None:
         """背景跑 LLM 推進判定:唔好喺開聲前同步等(會每輪拖慢),判定完喺下一輪先生效。
 
         唔會 double-advance:只喺 flow 仲喺 judge 嗰步(step_at)時先落 advance。
+        turn_key(stall 账本用,漏斗 v2):同轮 rule 路已按此 key 记账,judge 返回后
+        带同 key 落账——unclear 去重只计 1,judge 改判非 unclear 则清该步计数。
         """
         try:
             # 让路节流:主回复刚提交,先等一拍再喺同一 mlx server(:1235)跑 judge——
@@ -3005,6 +3026,11 @@ async def entrypoint(ctx):
                 if route_enabled
                 else ""
             )
+            # stall 账本 judge 路(漏斗 v2,spec §3.1):仍喺 judge 嗰步先落账——
+            # unclear 同轮 rule 路已计过(同 turn_key 去重只计 1);judge 改判
+            # 非 unclear(实质应承/提问/异议)= 客户唔係卡死 → 清该步计数。
+            if turn_key and flow_ctrl.current == step_at:
+                flow_ctrl.note_turn_outcome(jv, step_at, turn_key)
             if (
                 flow_ctrl.current == step_at
                 and flow_ctrl.has_steps
@@ -3439,6 +3465,11 @@ async def entrypoint(ctx):
                     from .flow import should_auto_advance, _digit_runs_in
 
                     verdict = flow_ctrl.rule_verdict(user_text)
+                    # stall 账本轮键(漏斗 v2,spec §3.1):rule 与 judge 双路对同一轮
+                    # 记账的去重凭据,spawn judge 时透传。用本轮单调时刻而非 _t0
+                    # (那是通话起点常量)——同文重复轮(「你说什么」连问两遍)唔会
+                    # 撞 key,阶梯计数先涨得起来。
+                    _turn_key = f"{user_text}:{time.monotonic():.6f}"
                     # verdict 进尾部:规则判定结果此前只用于推进、从不进提示词,
                     # 客户提问/答非所问时模型冇「该怎么答」指引 → 复读当前步。
                     flow_ctrl.last_verdict = verdict
@@ -3540,10 +3571,66 @@ async def entrypoint(ctx):
                                 _judge_inflight["step"] = _step_at
                                 # 池化(2026-09-17 全量 debug P2-A):judge 任务丢失=
                                 # 该轮不推进(下轮规则补位)——强引用+失败打点防静默。
-                                _spawn_report(_background_flow_judge(_step_at, user_text))
+                                _spawn_report(_background_flow_judge(_step_at, user_text, turn_key=_turn_key))
+                    # stall 账本规则路(漏斗 v2,spec §3.1):每轮判决记账——UNCLEAR
+                    # 且步未变 +1(下方 judge 路同 key 去重只计 1);推进/其它 verdict
+                    # 清该步计数(清零语义在方法内)。推进轮 verdict 以 "" 记
+                    # (advance 已清旧步;UNCLEAR 借宽松语义推进如身份步,唔算新步 stall)。
+                    flow_ctrl.note_turn_outcome(
+                        "" if flow_ctrl.current != _flow_step_before else verdict,
+                        flow_ctrl.current,
+                        _turn_key,
+                    )
                     context_state.set_flow_current(flow_ctrl.current_step_text())
                 except Exception:  # pragma: no cover - 流程推进失败不阻断回复
                     pass
+            # ---- stall 升级阶梯(漏斗 v2,spec §3.1):同 step 连续 UNCLEAR 有出口。
+            # 3 降级问法 / 5 绕过留号 / 8 主动收线——全部 _say_script 直念零 TTFT。
+            # bypass 在号码已在手时直升 close(留号无意义)。插喺 DEFER 车道之前:
+            # 账本记账喺上方 flow try 内已完成,此轮 verdict 唔係 UNCLEAR 时 streak
+            # 已被清零,车道自然唔触发。BOK_STALL_LADDER=0 回退(合入初版默认关)。
+            if (
+                os.environ.get("BOK_STALL_LADDER", "0") == "1"
+                and flow_ctrl.has_steps
+                and not flow_ctrl.done
+                and not flow_ctrl.closing
+                and not closed.is_set()
+            ):
+                _lvl = stall_ladder_level(flow_ctrl.step_streak.get(flow_ctrl.current, 0))
+                if _lvl == "bypass" and _wa_captured["on"]:
+                    _lvl = "close"  # 号码已在手,留号无意义 → 直接收线
+                if _lvl:
+                    print(
+                        f"[stall-ladder] step={flow_ctrl.current + 1} level={_lvl} "
+                        f"streak={flow_ctrl.step_streak.get(flow_ctrl.current, 0)} (call {room_name})",
+                        flush=True,
+                    )
+                    if _lvl == "close":
+                        flow_ctrl.enter_closing()
+                        _invalidate_stale_preemptive("stall 收线 → 收尾")
+                        _line = _farewell_line(
+                            str((object_card or {}).get("display_name") or "").strip(),
+                            language_state.lang,
+                        )
+                        _schedule_call_end(8.0, disposition="polite_close")
+                    else:
+                        _line = _stall_ladder_line(language_state.lang, _lvl)
+                    context_state.set_last_reply(_line)
+                    _turn_origin["gen"] = "script"
+                    _turn_origin["provider"] = f"stall-{_lvl}"
+                    try:
+                        _sl_ms = int((time.monotonic() - _t0) * 1000)
+                        await cp.add_turn(
+                            call_id, "user", user_text, language=language_state.lang,
+                            line="a", speaker="customer",
+                            template_step=(int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0,
+                            started_ms=_sl_ms, ended_ms=_sl_ms,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    _cancel_response_watchdog()
+                    await _say_script(session, tts_provider, _tts_cache, _line)
+                    raise StopResponse()
             # ---- DEFER 短应承车道(2026-09-12 P0「会说话」) ----
             # 客户社交拖延(「我先查一下/有了再通知你/稍等我看看」)→ 三语短应承
             # 脚本直念(零 TTFT/零照本),不推进/不 judge/不走 LLM——call-8fa17d2b
