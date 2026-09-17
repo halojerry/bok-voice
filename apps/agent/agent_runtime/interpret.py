@@ -296,6 +296,19 @@ def _direction_audio_enabled(speaker_role: str) -> bool:
     return os.environ.get("BOK_INTERP_REV_AUDIO", "0") == "1"
 
 
+def _mark_session_report(report: dict, speaker_role: str) -> dict:
+    """SessionReport 打 reporter 标记（纯函数，单测钉住）。
+
+    fwd/rev 双 worker 同 call 各自上报 SessionReport，CP 按 reporter 标记把兄弟
+    报告幂等合并进已存 blob（2026-09-18 缓项收编）——不打标记会撞「ended 且已有
+    report」的幽灵覆盖闸 409 被当失败丢弃，双语纪要静默缺半边。标记恒非空：
+    CP 以非空标记作为合并门槛；同标记重复（幽灵重派同 worker 线）仍维持 409。
+    """
+    payload = dict(report or {})
+    payload["reporter"] = f"interp-{speaker_role or 'unknown'}"
+    return payload
+
+
 async def entrypoint(ctx) -> None:
     from livekit import rtc
     from livekit.agents import (
@@ -477,7 +490,7 @@ async def entrypoint(ctx) -> None:
     async def _shutdown() -> None:
         try:
             report = ctx.make_session_report(session)
-            await cp.post_session_report(call_id, report.to_dict())
+            await cp.post_session_report(call_id, _mark_session_report(report.to_dict(), speaker_role))
         except Exception as exc:
             print(f"[interp] session report failed: {exc!r}", flush=True)
         try:

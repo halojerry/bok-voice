@@ -2445,6 +2445,56 @@ async def _write_distill_knowledge(call: dict, result: dict) -> dict | None:
         return None
 
 
+def _session_report_reporter(payload: dict) -> str:
+    """报告者标记（agent 侧 interpret._mark_session_report 写入；A 线报告无此字段）。"""
+    try:
+        return str((payload or {}).get("reporter") or "").strip()
+    except Exception:  # pragma: no cover - 非 dict payload 按无标记处理
+        return ""
+
+
+def _merge_sibling_session_report(stored_raw: str, incoming: dict) -> str | None:
+    """B 线 fwd/rev 双 worker 同 call 各自上报 SessionReport 的幂等合并。
+
+    首个报告照存；后到的兄弟报告（reporter 标记不同）把 chat_history.items 与
+    usage 追加进已存 blob（两 worker 快照按收听方向天然不相交），其余字段保持
+    首写者原值——job_id/options 等身份字段不被后者顶掉。返回合并后的 JSON 串；
+    无标记（A 线）/同标记重复（幽灵重派同 worker 线）或已存 blob 不可解析时
+    返回 None（调用方维持 409 幽灵覆盖防护，首个报告永不覆盖）。
+    """
+    try:
+        stored = json.loads(stored_raw or "{}")
+    except Exception:
+        return None
+    if not isinstance(stored, dict) or not isinstance(incoming, dict):
+        return None
+    reporter = _session_report_reporter(incoming)
+    if not reporter:
+        return None
+    seen = {r for r in (stored.get("reporters") or []) if isinstance(r, str) and r.strip()}
+    first = _session_report_reporter(stored)
+    if first:
+        seen.add(first)
+    if reporter in seen:
+        return None
+    merged = dict(stored)
+    in_ch = incoming.get("chat_history")
+    in_items = in_ch.get("items") if isinstance(in_ch, dict) else None
+    st_ch = stored.get("chat_history")
+    st_items = st_ch.get("items") if isinstance(st_ch, dict) else None
+    if isinstance(in_items, list):
+        if isinstance(st_items, list):
+            merged["chat_history"] = {**st_ch, "items": [*st_items, *in_items]}
+        else:
+            merged["chat_history"] = in_ch
+    in_usage = incoming.get("usage")
+    st_usage = stored.get("usage")
+    if isinstance(in_usage, list) and in_usage:
+        merged["usage"] = [*st_usage, *in_usage] if isinstance(st_usage, list) else in_usage
+    merged["reporters"] = sorted(seen | {reporter})
+    return json.dumps(merged, ensure_ascii=False, default=str)
+
+
 def _backfill_turns_from_report(call_id: str, report_raw: str) -> int:
     """SessionReport.chat_history → turns 回填（幂等：仅当该通话零轮次时调用）。
 
@@ -3148,6 +3198,21 @@ async def ingest_session_report(call_id: str, request: Request) -> dict:
         str(_cur.get("status") or "") == "ended"
         and str(_cur.get("session_report") or "").strip()
     ):
+        # B 线双 worker(fwd/rev)同 call 各自上报(2026-09-18 缓项收编):不同
+        # reporter 标记的兄弟报告幂等合并进已存 blob(chat_history/usage 追加),
+        # 返回 200+merged——双语纪要不丢且审计可观测,不再静默;同标记重复
+        # (幽灵重派同 worker 线)与无标记(A 线单 worker)维持 409 幽灵覆盖防护。
+        _merged = _merge_sibling_session_report(str(_cur.get("session_report") or ""), payload)
+        if _merged is not None:
+            row = _repo().update_call(call_id, session_report=_merged)
+            _audit(
+                "call.session_report_merged",
+                subject_type="call",
+                subject_id=call_id,
+                account_id=(row or {}).get("account_id", ""),
+                call_id=call_id,
+            )
+            return {"call_id": call_id, "stored": True, "merged": True}
         _audit(
             "call.session_report_rejected",
             subject_type="call",
