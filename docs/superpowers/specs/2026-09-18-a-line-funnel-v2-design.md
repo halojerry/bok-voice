@@ -1,7 +1,7 @@
 # A 线漏斗 v2 设计（Funnel v2）
 
 - 日期：2026-09-18
-- 状态：待评审
+- 状态：已实施并验收（P0+P1 全量落地；P2 脊柱收编待后续周期）。验收证据：三套 E2E 全绿（trilingual-canto PASS/barge-in PASS/edge 8/8）、offscript-soak 50 轮哑 1（历史基线哑 9、watchdog 15→0）、latency-soak PASS（哑 0 零哨兵）、实弹全链路取证 judge route=register_followup conf=0.70→CP 工单落单（fu:8e226d9b16e0）→stall-ladder degrade 接管（agent.log call-a8a1c354）。
 - 证据锚点：call-af30d9de（2026-09-17 13:43 赔偿外呼）、call-91a6b8c9（2026-09-17 08:32 入线查单）；诊断过程见当日 agent.log 与 turns 账本
 - 关联：`docs/S2S_ROADMAP.md`（不换架构）、AGENTS.md「官方组件优先三档判据」
 
