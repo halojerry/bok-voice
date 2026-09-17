@@ -8,6 +8,10 @@
  * 相比 MediaRecorder 的 webm/opus，WAV/PCM 在 clone 侧解码最稳（webm 常不被支持）。
  * WKWebView 下 ScriptProcessor 已废弃但可用（同传页同款采集路径）。
  */
+import { startTrace } from "@/lib/logger";
+
+// 模块级 trace（环形缓存+TTL 有界，见 lib/logger.ts 头注释）。
+const log = startTrace({ operation: "web.recorder" });
 
 export interface RecorderHandle {
   stop: () => Promise<Blob>;
@@ -92,8 +96,8 @@ export async function startRecording(maxMs = 30000): Promise<RecorderHandle> {
       source.disconnect();
       mute.disconnect();
       await ctx.close();
-    } catch {
-      /* ignore */
+    } catch (e) {
+      log.warn("recorder teardown failed", { err: e instanceof Error ? e.message : String(e) });
     }
     stream.getTracks().forEach((t) => t.stop());
     return encodeWav(all, sampleRate);
@@ -115,8 +119,8 @@ export async function startRecording(maxMs = 30000): Promise<RecorderHandle> {
         source.disconnect();
         mute.disconnect();
         void ctx.close();
-      } catch {
-        /* ignore */
+      } catch (e) {
+        log.warn("recorder cancel teardown failed", { err: e instanceof Error ? e.message : String(e) });
       }
       stream.getTracks().forEach((t) => t.stop());
     },

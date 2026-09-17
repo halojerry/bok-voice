@@ -4,6 +4,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { LiveKitRoom, RoomAudioRenderer, useTranscriptions } from "@livekit/components-react";
 import { api } from "@/lib/api";
 import { friendlyErrorText } from "@/lib/api-ready";
+import { startTrace } from "@/lib/logger";
+
+// 模块级 trace（环形缓存+TTL 有界，见 lib/logger.ts 头注释）。
+const log = startTrace({ operation: "web.listen-panel" });
 
 type TokenInfo = { serverUrl: string; participantToken: string };
 
@@ -56,8 +60,13 @@ export default function ListenPanel({
     const seconds = startedRef.current ? Math.round((Date.now() - startedRef.current) / 1000) : 0;
     try {
       await api.supervisorListenStop(callId, seconds);
-    } catch {
-      /* 审计回执尽力而为 */
+    } catch (e) {
+      /* 审计回执尽力而为：不阻面板关闭，但失败要留痕（审计断档可查） */
+      log.warn("supervisor listen stop audit failed", {
+        callId,
+        seconds,
+        err: e instanceof Error ? e.message : String(e),
+      });
     }
   }, [callId]);
 

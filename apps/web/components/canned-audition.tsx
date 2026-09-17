@@ -9,6 +9,10 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, apiBase } from "@/lib/api";
+import { startTrace } from "@/lib/logger";
+
+// 模块级 trace（环形缓存+TTL 有界，见 lib/logger.ts 头注释）。
+const log = startTrace({ operation: "web.canned-audition" });
 
 const LANGS = [
   { value: "zh", label: "普通话" },
@@ -83,8 +87,9 @@ export default function CannedAuditionCard() {
     try {
       const rows = (await api.listQaEntries(1)) as QaEntry[];
       setEntries((Array.isArray(rows) ? rows : []).filter((e) => (e.lang ?? "") === lang).slice(0, 8));
-    } catch {
+    } catch (e) {
       setEntries([]);
+      log.error("load qa entries failed", e);
     } finally {
       setBusy("");
     }
