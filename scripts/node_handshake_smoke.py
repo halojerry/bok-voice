@@ -202,6 +202,57 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print("[skip] ⑥ 非 license 流（auth-off CP），跳过克隆/复活断言", flush=True)
 
+    # ⑦ commands 通道（P3，2026-09-17）：入队 → 心跳领走 → version 收敛关单。
+    target_ver = f"smoke-{ts}"
+    if jwt and node_id and node_token:
+        status, body = _request(
+            "POST", f"{base}/api/nodes/{node_id}/commands", token=jwt,
+            body={"action": "update", "version": target_ver}, timeout=args.timeout)
+        cmd_ok = status == 200 and isinstance(body, dict) and str(body.get("id", "")).startswith("cmd-")
+        cmd_id = str(body.get("id") or "") if isinstance(body, dict) else ""
+        _record(cmd_ok, "⑦a root 入队 update 指令", f"HTTP {status} {body}")
+        if cmd_ok:
+            hb_body2: dict[str, Any] = {"metrics": {}}
+            if license_used:
+                hb_body2["fingerprint"] = fingerprint
+            status, body = _request(
+                "POST", f"{base}/api/nodes/heartbeat", token=node_token,
+                body=hb_body2, timeout=args.timeout)
+            got = body.get("commands", []) if isinstance(body, dict) else []
+            _record(
+                status == 200 and any(str(c.get("id")) == cmd_id for c in got),
+                "⑦b 心跳领走指令（pending→delivered）",
+                f"HTTP {status} commands={[c.get('action') for c in got]}",
+            )
+            status, body = _request(
+                "POST", f"{base}/api/nodes/heartbeat", token=node_token,
+                body={**hb_body2, "version": target_ver}, timeout=args.timeout)
+            status2, body2 = _request(
+                "GET", f"{base}/api/nodes/{node_id}/commands", token=jwt,
+                timeout=args.timeout)
+            ledger = body2.get("commands", []) if isinstance(body2, dict) else []
+            row = next((c for c in ledger if str(c.get("id")) == cmd_id), {})
+            _record(
+                status == 200 and status2 == 200 and row.get("status") == "done",
+                "⑦c 心跳 version 收敛 → 指令自动关单 done",
+                f"HTTP {status}/{status2} status={row.get('status')}",
+            )
+    else:
+        print("[skip] ⑦ 无 root 凭据/节点身份，跳过 commands 通道断言", flush=True)
+
+    # ⑧ 工件下载鉴权（去 GitHub 化交付链）：无凭据 401、有凭据缺工件 404——
+    # 401 与 404 的区分证明「鉴权在端点内真实发生」而非路径直达。
+    dl_url = f"{base}/api/nodes/downloads/pkg/latest/bok-node-latest.tar.gz"
+    status, _body = _request("GET", dl_url, timeout=args.timeout)
+    _record(status == 401, "⑧a 无凭据工件下载被拒", f"HTTP {status}（期望 401）")
+    status, _body = _request(
+        "GET", dl_url, token=node_token or f"smoke-fake-{ts}", timeout=args.timeout)
+    if node_token:
+        _record(status == 404, "⑧b node_token 过鉴权（缺工件=404 非 401）",
+                f"HTTP {status}")
+    else:
+        print("[skip] ⑧b 无节点 token（开放流裸注册失败时），跳过", flush=True)
+
     failed = [label for ok, label in _RESULTS if not ok]
     print(flush=True)
     if failed:
