@@ -36,10 +36,16 @@ def plan_import(
     existing: set[str],
     lang_mode: str,
 ) -> tuple[list[dict], dict]:
-    """dry-run 可测核心。creates 变体行带 _head_question(apply 时解析为真实 id)。"""
+    """dry-run 可测核心。creates 变体行带 _head_question(apply 时解析为真实 id)。
+
+    去重两层:existing=CP 存量(计 skipped_dup);批内另维护 seen 集合(主条目与
+    变体同查,后到重复计 skipped_inbatch)——qa_gate 0.90 字面匹配下同文双条会
+    双双满分、命中播哪条由遍历序决定,故同批重复归一化问法只建先到一条。
+    """
     creates: list[dict] = []
-    report = {"created": 0, "variants": 0, "skipped_dup": 0, "disabled": 0,
-              "alt_answers_seen": 0, "invalid": 0, "skipped_fields": set()}
+    report = {"created": 0, "variants": 0, "skipped_dup": 0, "skipped_inbatch": 0,
+              "disabled": 0, "alt_answers_seen": 0, "invalid": 0, "skipped_fields": set()}
+    seen: set[str] = set()  # 本批已建归一化问法(主+变体)
     for row in rows or []:
         raw_q = str(row.get("Question") or "").strip()
         answer = str(row.get("Answer") or "").strip()
@@ -51,8 +57,12 @@ def plan_import(
             report["invalid"] += 1
             continue
         head_q = variants[0]
-        if normalize_q(head_q) in existing:
+        nq_head = normalize_q(head_q)
+        if nq_head in existing:
             report["skipped_dup"] += 1
+            continue
+        if nq_head in seen:
+            report["skipped_inbatch"] += 1
             continue
         # Status=0=停用(0 是 falsy,不能用 or 1 兜缺省——会把停用行翻成启用)。
         raw_status = row.get("Status")
@@ -69,13 +79,19 @@ def plan_import(
         if not enabled:
             report["disabled"] += 1
         creates.append({"question_text": head_q, "cluster_head_id": "", **base})
+        seen.add(nq_head)
         report["created"] += 1
         for v in variants[1:]:
-            if normalize_q(v) in existing:
+            nq_v = normalize_q(v)
+            if nq_v in existing:
                 report["skipped_dup"] += 1
+                continue
+            if nq_v in seen:
+                report["skipped_inbatch"] += 1
                 continue
             creates.append({**base, "question_text": v, "cluster_head_id": None,
                             "_head_question": head_q})
+            seen.add(nq_v)
             report["variants"] += 1
             report["created"] += 1
         alt = sum(1 for k in row.keys() if re.fullmatch(r"Answer[2-5]", k) and str(row.get(k) or "").strip())
@@ -119,7 +135,8 @@ def main() -> int:
         c.setdefault("owner_user_id", args.owner)
     # created=计划总条数(主条目+变体,与 len(creates) 同步);variants 是其中变体子集。
     print(f"计划:新建 {report['created']} 条(变体 {report['variants']}、含停用 {report['disabled']})"
-          f" | 去重跳过 {report['skipped_dup']} | 非法行 {report['invalid']}"
+          f" | 去重跳过 {report['skipped_dup']} | 批内重复 {report['skipped_inbatch']}"
+          f" | 非法行 {report['invalid']}"
           f" | 备选答案计数(不搬) {report['alt_answers_seen']}")
     if report["skipped_fields"]:
         print(f"未搬字段: {sorted(report['skipped_fields'])}")
@@ -130,15 +147,22 @@ def main() -> int:
         return 0
     head_ids: dict[str, str] = {}
     done = 0
+    failed = 0
     for c in creates:
         head_q = c.pop("_head_question", None)
         if head_q:
             c["cluster_head_id"] = head_ids.get(head_q, "")
-        row = _cp_request(args.cp, "/api/qa-entries", token, method="POST", payload=c)
+        try:
+            row = _cp_request(args.cp, "/api/qa-entries", token, method="POST", payload=c)
+        except Exception as exc:  # 单条失败不裸中止;head 失败时其变体经 get 默认回落独立条目
+            failed += 1
+            print(f"  [失败] {c.get('question_text')} -> {exc}")
+            continue
         if not head_q:
             head_ids[str(c["question_text"])] = str(row.get("id"))
         done += 1
-    print(f"已入库 {done} 条。下一步: python scripts/pregen_tts.py --qa 物化罐头；步骤挂载请在画布拖线。")
+    fail_note = f"，失败 {failed} 条" if failed else ""
+    print(f"已入库 {done} 条{fail_note}。下一步: python scripts/pregen_tts.py --qa 物化罐头；步骤挂载请在画布拖线。")
     return 0
 
 
