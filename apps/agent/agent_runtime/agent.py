@@ -1967,6 +1967,9 @@ async def entrypoint(ctx):
 
     # 背景 flow judge 防疊:記錄而家 judge 緊邊一步(-1=冇)。推進唔可以同時兩個 judge。
     _judge_inflight: dict = {"step": -1}
+    # judge 路由字段账本(漏斗 v2,spec §3.2):最近一次 judge 的 route/conf。
+    # 只写入不消费(Task 4 工具层/升级器接线);BOK_ROUTE_JUDGE=0 时保持初值。
+    _judge_route: dict = {"route": "keep", "conf": 0.0, "step": -1}
     # 沉默心跳:AI 講完話客戶耐冇出聲 → 主動確認「仲喺度嗎」並帶返當前步。
     # count 會喺客戶真開口(on_user_turn_completed)時歸零。last_user_ts/last_reply_ts
     # 記錄「客戶最後開聲」與「AI 最後講完」時刻(秒),心跳只在兩者都足夠舊先開火
@@ -2958,7 +2961,11 @@ async def entrypoint(ctx):
             # 让路节流:主回复刚提交,先等一拍再喺同一 mlx server(:1235)跑 judge——
             # judge 与主回复抢 prefill 会推高本轮 TTFT;judge 判定本来就下一轮先生效,迟几秒冇损失。
             await asyncio.sleep(float(os.environ.get("FLOW_JUDGE_DELAY", "3")))
-            from .flow import build_judge_messages, parse_judge_output
+            from .flow import build_judge_messages, parse_judge_output, parse_judge_route
+
+            # judge 路由字段(漏斗 v2,spec §3.2):BOK_ROUTE_JUDGE=1 才喺 judge
+            # prompt 加 route/conf 段并解析落账;默认 0=旧 prompt 零行为漂移。
+            route_enabled = os.environ.get("BOK_ROUTE_JUDGE", "0") == "1"
 
             # judge 专线优先(FLOW_JUDGE_*,bok.py 注入指向 :1237 9B——后台判定
             # 是 fire-and-forget 重活,大模型判定质量↑且与活通话回复的 :1235
@@ -2985,8 +2992,19 @@ async def entrypoint(ctx):
                 next_goal=flow_ctrl.next_goal(),
                 user_text=utt,
                 facts=flow_ctrl.vars_map,
+                route_enabled=route_enabled,
             )
-            jv = parse_judge_output(await _llm_judge(jbase, jmodel, msgs))
+            _raw = await _llm_judge(jbase, jmodel, msgs)
+            jv = parse_judge_output(_raw)
+            if route_enabled:
+                _rr, _cc = parse_judge_route(_raw)
+                _judge_route.update(route=_rr, conf=_cc, step=step_at)
+            # judge 打点尾注(仅 route_enabled):route/conf 供漏斗 v2 观测对账。
+            _route_log = (
+                f" route={_judge_route['route']} conf={_judge_route['conf']:.2f}"
+                if route_enabled
+                else ""
+            )
             if (
                 flow_ctrl.current == step_at
                 and flow_ctrl.has_steps
@@ -3009,17 +3027,17 @@ async def entrypoint(ctx):
                     # 客户话里有实质应承特征,长句无特征拦下。
                     if not judge_confirm_advance_allowed(goal=_gj, ref=_rj, user_text=utt):
                         print(
-                            f"[flow] judge(bg)=confirm blocked (no ack signal) step={step_at + 1} (call {room_name})",
+                            f"[flow] judge(bg)=confirm blocked (no ack signal) step={step_at + 1} (call {room_name}){_route_log}",
                             flush=True,
                         )
                     elif wa_confirm_advance_allowed(goal=_gj, ref=_rj, captured=_wa_captured["on"]):
                         flow_ctrl.advance()
                         context_state.set_flow_current(flow_ctrl.current_step_text())
-                        print(f"[flow] judge(bg)=confirm step={flow_ctrl.current + 1} (call {room_name})", flush=True)
+                        print(f"[flow] judge(bg)=confirm step={flow_ctrl.current + 1} (call {room_name}){_route_log}", flush=True)
                     else:
-                        print(f"[flow] judge(bg)=confirm blocked (wa step, not captured) step={step_at + 1} (call {room_name})", flush=True)
+                        print(f"[flow] judge(bg)=confirm blocked (wa step, not captured) step={step_at + 1} (call {room_name}){_route_log}", flush=True)
                 else:
-                    print(f"[flow] judge(bg)={jv} step={step_at + 1} (call {room_name})", flush=True)
+                    print(f"[flow] judge(bg)={jv} step={step_at + 1} (call {room_name}){_route_log}", flush=True)
         except Exception as exc:  # pragma: no cover - 背景判定失敗唔影響回覆
             print(f"[flow] judge(bg) failed: {exc!r} (call {room_name})", flush=True)
         finally:

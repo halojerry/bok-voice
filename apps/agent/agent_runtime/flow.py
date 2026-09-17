@@ -1193,6 +1193,7 @@ def build_judge_messages(
     next_goal: str,
     user_text: str,
     facts: dict | None,
+    route_enabled: bool = False,
 ) -> list[dict]:
     """组推进判定器嘅 messages:简短 + 少少例子,4B 先跟得準(太長會亂答)。"""
     sys = (
@@ -1218,6 +1219,13 @@ def build_judge_messages(
         "客户：「我冇訂單，唔記得喺邊買」且当前係引導核實(要答平台先過) -> stay\n"
         "客户：「我唔記得買咗咩」且当前係開場問記憶、下一步係引導核實 -> advance"
     )
+    if route_enabled:
+        sys += (
+            "\n若客户呢句含实质诉求，喺 verdict 后面补一段：route=X conf=0.0~1.0。"
+            "route 只准係：register_followup（要查单/查进度/跟进登记）/"
+            "capture_contact（愿意留联系方式）/transfer_human（指名要真人）/"
+            "degrade_question（答非所问、听唔明客户讲咩）。冇诉求就输出 route=keep。"
+        )
     if facts:
         known = " ".join(f"{k}={v}" for k, v in facts.items() if v)
         sys += f"\n已知客戶資料:{known}"
@@ -1235,3 +1243,24 @@ def parse_judge_output(text: str) -> str:
     if "objection" in t:
         return OBJECTION
     return UNCLEAR
+
+
+JUDGE_ROUTES = frozenset(
+    {"keep", "degrade_question", "capture_contact", "register_followup", "transfer_human"}
+)
+_ROUTE_RE = re.compile(r"route\s*[=:]\s*([a-z_]+)")
+_CONF_RE = re.compile(r"conf(?:idence)?\s*[=:]\s*([0-9](?:\.\d+)?)?")
+
+
+def parse_judge_route(text: str) -> tuple[str, float]:
+    """解析 judge 输出的路由字段(route/conf)。缺失/非法一律回落 ("keep", 0.0)
+    ——旧格式输出、4B 格式漂移、9B 拒答都零行为漂移。"""
+    t = (text or "").strip().lower()
+    m = _ROUTE_RE.search(t)
+    route = m.group(1) if m and m.group(1) in JUDGE_ROUTES else "keep"
+    c = _CONF_RE.search(t)
+    try:
+        conf = float(c.group(1)) if c and c.group(1) else 0.0
+    except ValueError:
+        conf = 0.0
+    return route, min(max(conf, 0.0), 1.0)
