@@ -292,6 +292,10 @@ class GlobalSetting(Base):
     # 外呼（SIP）配置段（spec 2026-09-12 Wave2）：mode/trunk/主叫号/超时/许可号码。
     # 空串=老库尚未补列或从未保存 → 读侧回落 default_settings()["sip"]。
     sip_json: Mapped[str] = mapped_column(Text, default="")
+    # 全局外呼时段窗段（2026-09-17 T3b）：{"call_windows": [...]}，形状归一见
+    # campaign.parse_call_windows；空串/空 dict=不限时段。迁移 DDL 与
+    # deps._ensure_column 同形。
+    campaign_json: Mapped[str] = mapped_column(Text, default="")
     policy: Mapped[str] = mapped_column(String(64), default="offline_first")
     updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
 

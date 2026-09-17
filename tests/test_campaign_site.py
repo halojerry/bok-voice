@@ -246,3 +246,30 @@ def test_migration_adds_campaign_site_id_column(tmp_path, monkeypatch):
     cols = [r[1] for r in c.execute("PRAGMA table_info(campaigns)")]
     c.close()
     assert "site_id" in cols, cols
+
+
+def test_migration_adds_global_settings_campaign_json_column(tmp_path, monkeypatch):
+    """T3b：存量库 global_settings 无 campaign_json 列 → CP 启动补列；二启幂等不报错。"""
+    import sqlite3
+
+    db = tmp_path / "global_settings_campaign.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        "CREATE TABLE global_settings (id VARCHAR(64) PRIMARY KEY, "
+        "asr_json TEXT DEFAULT '{}', llm_json TEXT DEFAULT '{}', "
+        "tts_json TEXT DEFAULT '{}', vad_json TEXT DEFAULT '{}', "
+        "sip_json TEXT DEFAULT '', policy VARCHAR(64) DEFAULT 'offline_first', "
+        "updated_at DATETIME);"
+    )
+    conn.close()
+
+    from control_plane.deps import build_engine
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db}")
+    build_engine()  # 首启：补列
+    build_engine()  # 二启：幂等不报错
+
+    c = sqlite3.connect(db)
+    cols = [r[1] for r in c.execute("PRAGMA table_info(global_settings)")]
+    c.close()
+    assert "campaign_json" in cols, cols

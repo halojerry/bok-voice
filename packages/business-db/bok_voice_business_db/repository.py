@@ -679,6 +679,9 @@ class SqlAlchemyBusinessRepository:
             "vad": json.loads(row.vad_json or "{}"),
             # 空 blob（老库补列后未保存）回落默认段，否则 dialer 拿不到 mode。
             "sip": json.loads(row.sip_json or "{}") or self.default_settings()["sip"],
+            # 全局外呼时段窗段（T3b）：空 blob=不限时段（campaign._global_call_windows
+            # 消费 settings.campaign.call_windows，读侧缺省 []）。
+            "campaign": json.loads(row.campaign_json or "{}"),
             "policy": row.policy,
         }
 
@@ -694,6 +697,10 @@ class SqlAlchemyBusinessRepository:
         row.sip_json = json.dumps(
             settings.get("sip") or self.default_settings()["sip"], ensure_ascii=False
         )
+        # campaign 段（T3b）：缺键=保留既有（同 policy 的缺键保留语义，PUT 不传段
+        # 不清运营已配的全局窗）；传空 dict=清空（不限时段）。
+        if "campaign" in settings:
+            row.campaign_json = json.dumps(settings.get("campaign") or {}, ensure_ascii=False)
         row.policy = settings.get("policy", row.policy or "offline_first")
         self.session.commit()
         return self.get_settings()
@@ -1181,6 +1188,8 @@ class SqlAlchemyBusinessRepository:
                 "ringing_timeout_s": 30,
                 "max_call_duration_s": 600,
             },
+            # 全局外呼时段窗段（T3b）：空=不限时段；GET 端点照常回显该键。
+            "campaign": {"call_windows": []},
             "policy": "offline_first",
         }
 
@@ -1586,6 +1595,7 @@ class InMemoryBusinessRepository:
         return self.settings
 
     def save_settings(self, settings: dict) -> dict:
+        old = self.settings
         self.settings = {
             "asr": settings.get("asr", {}),
             "llm": settings.get("llm", {}),
@@ -1593,6 +1603,9 @@ class InMemoryBusinessRepository:
             "vad": settings.get("vad", {}),
             # 缺键/空值回落默认段（与 SQL 后端同语义：不允许把 sip 段清成空）。
             "sip": settings.get("sip") or SqlAlchemyBusinessRepository.default_settings()["sip"],
+            # campaign 段（T3b）：缺键=保留既有（与 SQL 侧同语义）；传空=清空（不限）。
+            "campaign": settings["campaign"] if "campaign" in settings
+            else old.get("campaign", {}),
             "policy": settings.get("policy", "offline_first"),
         }
         return self.settings

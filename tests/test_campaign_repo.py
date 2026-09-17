@@ -249,3 +249,33 @@ class TestCampaignSchedulingFields:
         call = repo.create_call(_manifest())  # 沿用文件内既有建通话 helper/fixture
         updated = repo.update_call(call["id"], started_at=_dt(0), ended_at=_dt(95), duration_s=95)
         assert updated["duration_s"] == 95 and updated["started_at"] is not None
+
+
+class TestCampaignSettingsSection:
+    """全局外呼时段窗 settings.campaign 段（2026-09-17 T3b）：双仓白名单 roundtrip。
+
+    语义：保存含 campaign 键 → 落库（空 dict=清空=不限时段）；保存不含 campaign 键
+    → 既有 campaign 段保留（同 policy 段的缺键保留语义，旧行为零变化）。
+    """
+
+    def test_default_settings_has_campaign_section(self, repo):
+        section = repo.get_settings().get("campaign")
+        assert section is not None and section.get("call_windows") == []
+
+    def test_save_and_get_campaign_roundtrip(self, repo):
+        windows = [{"days": [1, 2], "start": "08:00", "end": "18:00"}]
+        saved = repo.save_settings({"campaign": {"call_windows": windows}})
+        assert saved["campaign"] == {"call_windows": windows}
+        assert repo.get_settings()["campaign"] == {"call_windows": windows}
+
+    def test_save_without_campaign_key_preserves_section(self, repo):
+        windows = [{"days": [6], "start": "09:00", "end": "12:00"}]
+        repo.save_settings({"campaign": {"call_windows": windows}})
+        repo.save_settings({"sip": {"mode": "real"}})  # 不带 campaign 键
+        assert repo.get_settings()["campaign"] == {"call_windows": windows}
+
+    def test_save_empty_campaign_clears_windows(self, repo):
+        repo.save_settings({"campaign": {"call_windows": [
+            {"days": [1], "start": "08:00", "end": "09:00"}]}})
+        repo.save_settings({"campaign": {"call_windows": []}})
+        assert repo.get_settings()["campaign"] == {"call_windows": []}

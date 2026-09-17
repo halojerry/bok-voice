@@ -427,6 +427,11 @@ def put_settings(req: SettingsRequest, request: Request) -> dict:
             if not new.get(key) and old.get(key):
                 new[key] = old[key]
         new_values[kind] = new
+    if req.campaign is not None:
+        # 全局外呼时段窗（T3b）：归一后落库（非法项静默丢弃、≤3 组），
+        # 空/全非法=不限时段。请求未带 campaign 键（None）→ 段不动（仓库层
+        # 缺键保留语义接管，不清运营已配的全局窗）。
+        new_values["campaign"] = {"call_windows": parse_call_windows(req.campaign.call_windows)}
     raw = new_values
     saved = _repo().save_settings(raw)
     _audit("settings.save", subject_type="global_settings", subject_id="global", detail={"llm_provider": raw.get("llm", {}).get("provider", "")})

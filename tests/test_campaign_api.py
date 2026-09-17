@@ -452,3 +452,59 @@ def test_update_campaign_missing_is_404_and_audits(monkeypatch):
     assert resp.status_code == 200
     assert resp.json()["name"] == "改名波次"
     assert "campaign.update" in events
+
+
+# ---- 全局外呼时段窗 settings.campaign 段（2026-09-17 T3b）----
+
+def test_settings_campaign_section_roundtrip_and_tick_gating(monkeypatch):
+    """/api/settings 收 campaign 段：归一落库、GET 回显、不传保留既有；
+    保存的全局窗对 campaign_tick 生效（窗内起拨/窗外不起拨）。"""
+    import asyncio
+    from datetime import datetime, timezone
+
+    from control_plane.campaign import campaign_tick
+
+    client, repo = _client_and_repo(monkeypatch)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    # 窗内窗（覆盖 now）+ 一条垃圾窗：归一落库应剔除垃圾、保留正常窗
+    inside = [{"days": [now.isoweekday()], "start": f"{now.hour:02d}:00",
+               "end": f"{(now.hour + 1) % 24:02d}:58"},
+              {"days": [1], "start": "08:00", "end": "99:99"}]
+    resp = client.put("/api/settings", json={"campaign": {"call_windows": inside}})
+    assert resp.status_code == 200
+    assert resp.json()["campaign"]["call_windows"] == [inside[0]]
+    # GET 照常回显 campaign 段
+    assert client.get("/api/settings").json()["campaign"]["call_windows"] == [inside[0]]
+
+    # 行为：全局窗覆盖 now、任务窗空（不限）→ tick 起拨
+    dispatched: list[str] = []
+
+    async def fake_dispatch(room: str, metadata: str) -> None:
+        dispatched.append(room)
+        repo.update_call(room, status="ended", disposition="no_answer")
+
+    obj = repo.create_object("acc-001", {"display_name": "A", "phone": "+85211111111"})
+    camp = repo.create_campaign("acc-001", name="t", template_id="", persona_id="",
+                                language="zh", gap_seconds=0, object_ids=[obj["id"]])
+    repo.update_campaign(camp["id"], status="running")
+    out = asyncio.run(campaign_tick(repo, dispatcher=fake_dispatch, now=now))
+    assert out["started"] == 1
+
+    # 换窗外窗（days=明天，任一时刻都不命中今天）→ 新战役 tick 不起拨
+    tomorrow = (now.isoweekday() % 7) + 1
+    outside = [{"days": [tomorrow], "start": "00:00", "end": "23:59"}]
+    resp2 = client.put("/api/settings", json={"campaign": {"call_windows": outside}})
+    assert resp2.status_code == 200
+    obj2 = repo.create_object("acc-001", {"display_name": "B", "phone": "+85222222222"})
+    camp2 = repo.create_campaign("acc-001", name="t2", template_id="", persona_id="",
+                                 language="zh", gap_seconds=0, object_ids=[obj2["id"]])
+    repo.update_campaign(camp2["id"], status="running")
+    out2 = asyncio.run(campaign_tick(repo, dispatcher=fake_dispatch, now=now))
+    assert out2["started"] == 0
+    assert repo.list_items(camp2["id"])[0]["status"] == "pending"
+
+    # 不传 campaign 键的 PUT → 既有段保留（旧行为零变化）
+    resp3 = client.put("/api/settings", json={"policy": "offline_first"})
+    assert resp3.status_code == 200
+    assert resp3.json()["campaign"]["call_windows"] == outside
