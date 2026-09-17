@@ -7,6 +7,8 @@
   python scripts/pregen_tts.py --fillers              # 垫话按人设音色物化(全部启用人设)
   python scripts/pregen_tts.py --fillers --persona X  # 只给一个人设补物化垫话
   python scripts/pregen_tts.py --qa --all-personas    # QA 罐头 × 全部启用人设
+  python scripts/pregen_tts.py --qa-status            # 逐条目物化状态 JSON(stdout,不合成不碰云)
+  python scripts/pregen_tts.py --qa --entry-id X      # 只物化指定 qa 条目 id(--entry-id 可重复)
   任意组合 + --dry-run                                # 只打印 (persona,lang,voice,条数) 计划清单
 
 语音解析与运行时同源:CP /api/settings(internal=true 拿明文 api_key)+
@@ -21,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -300,6 +303,68 @@ def _qa_jobs(
     return jobs
 
 
+def _qa_status(
+    qa_rows: list[dict],
+    persona_pool: list[dict],
+    lang_personas: dict[str, dict | None],
+    *,
+    all_personas: bool,
+    tts_cfg: dict,
+    voice_mode: str,
+    model: str,
+    sample_rate: int,
+    cache: TtsAudioCache,
+    entry_ids: set[str] | None = None,
+) -> dict[str, dict]:
+    """--qa-status 可测核心:与 _materialize 同口径逐条目算 key、查缓存。
+
+    条目状态:任一计划音色版本在缓存=ok,否则 missing。停用/空答案不进结果。
+    音色解析走 _persona_resolved_voice(_assemble_minimax_voice_map+
+    _resolve_voice_map 运行时同源)、语速走 minimax_speed_for、键走
+    cache.key_for(text, voice, model, speed, emotion="")——与 _materialize 逐项
+    同一口径,零第二套解析;不合成故无人设 map 备忘(逐条目现算,纯查询)。
+    sample_rate 入参仅与 _materialize 签名对齐(键的采样率维度经 cache.key_for
+    取 cache.sample_rate,调用方以同一 sample_rate 构造 cache)。
+    """
+    out: dict[str, dict] = {}
+    for e in qa_rows:
+        eid = str(e.get("id") or "")
+        if not eid or (entry_ids and eid not in entry_ids):
+            continue
+        if not bool(e.get("enabled", True)):
+            continue
+        text = str(e.get("answer_text") or "").strip()
+        if not text:
+            continue
+        lang = _normalize_lang((e or {}).get("lang"), default="zh") or "zh"
+        voices: list[str] = []
+        if all_personas:
+            for persona in persona_pool:
+                v = _persona_resolved_voice(persona, lang, tts_cfg, voice_mode)
+                if v:
+                    voices.append(v)
+        else:
+            persona = lang_personas.get(lang)
+            v = _persona_resolved_voice(persona, lang, tts_cfg, voice_mode)
+            if v:
+                voices.append(v)
+        if not voices:
+            out[eid] = {"state": "missing", "voice": "", "key": ""}
+            continue
+        speed = minimax_speed_for(lang)
+        state = "missing"
+        voice_used = ""
+        key_used = ""
+        for voice in voices:
+            key = cache.key_for(text, voice=voice, model=model, speed=speed, emotion="")
+            if cache.get(key) is not None:
+                state, voice_used, key_used = "ok", voice, key
+                break
+            state, voice_used, key_used = "missing", voice_used or voice, key_used or key
+        out[eid] = {"state": state, "voice": voice_used, "key": key_used}
+    return out
+
+
 async def _materialize(
     cache: TtsAudioCache,
     model: str,
@@ -428,6 +493,8 @@ async def main_async() -> int:
     ap.add_argument("--objects", action="store_true", help="逐对象渲染开场白/收线/心跳并预合成")
     ap.add_argument("--fillers", action="store_true", help="垫话 manifest 按人设音色物化进 tts-cache(默认全部启用人设;--persona 限单人人设)")
     ap.add_argument("--qa", action="store_true", help="Q→A 快路启用条目的应答预合成(闸门只认缓存有音频的条目)")
+    ap.add_argument("--qa-status", action="store_true", help="不合成:逐条目输出物化状态 JSON(stdout),供 CP canned-status 端点消费")
+    ap.add_argument("--entry-id", action="append", default=[], help="只处理指定 qa 条目 id(可重复;--qa/--qa-status 共用过滤)")
     ap.add_argument("--all-personas", action="store_true", help="--qa 配套:条目 × 每个启用人设各物化一版(缺省每语言只取该语言人设)")
     ap.add_argument("--dry-run", action="store_true", help="只打印将物化的 (persona,lang,voice,条数) 计划清单,不合成")
     ap.add_argument("--cp", default=os.environ.get("BOK_CP_URL", "http://127.0.0.1:8000"))
@@ -435,7 +502,7 @@ async def main_async() -> int:
     ap.add_argument("--object-id", default="", help="只为指定对象预生成开场白/收线/心跳(配合 --objects)")
     ap.add_argument("--model", default="", help="MINIMAX_MODEL 覆盖(默认 env/2.8-hd,须与运行时一致)")
     args = ap.parse_args()
-    if not (args.greetings or args.objects or args.fillers or args.qa):
+    if not (args.greetings or args.objects or args.fillers or args.qa or args.qa_status):
         args.greetings = True
 
     if os.environ.get("MINIMAX_API_KEY", ""):
@@ -446,7 +513,8 @@ async def main_async() -> int:
     settings, personas, objects, templates = _fetch_cp(args.cp, token)
     tts_cfg = settings.get("tts") or {}
     api_key = api_key or str(tts_cfg.get("api_key") or "")
-    if not api_key and not args.dry_run:
+    # --qa-status 纯状态面零合成(dry-run 同理):无 key 也放行。
+    if not api_key and not (args.dry_run or args.qa_status):
         print("MINIMAX_API_KEY missing (settings tts.api_key/env) — cannot synthesize", flush=True)
         return 1
     if args.model:
@@ -474,6 +542,37 @@ async def main_async() -> int:
 
     cache = TtsAudioCache(root=default_cache_dir(), sample_rate=sample_rate)
     model = os.environ.get("MINIMAX_MODEL", "speech-2.8-hd")
+
+    # ---- Q→A 条目拉取(--qa 物化与 --qa-status 共用)+ --entry-id 过滤 ----
+    # 提前到一切物化段之前:--qa-status 在任何合成开始前 return,绝不建 provider。
+    qa_rows: list[dict] = []
+    if args.qa or args.qa_status:
+        # Q→A 快路启用条目:应答文本按条目语言取对应 persona 音色物化——运行时
+        # 闸门按 (answer_text, resolved_voice, model) 查缓存,音色必须同源。
+        # 空表/拉取失败静默(库未建=无物化需求)。
+        try:
+            qa_rows = _cp_get(args.cp, "/api/qa-entries?enabled=1", token) or []
+        except Exception as exc:  # noqa: BLE001 - 库未建/CP 不可达唔阻其他预合成
+            print(f"qa entries fetch failed: {exc!r}", flush=True)
+            qa_rows = []
+        if args.entry_id:
+            _want = {str(x) for x in args.entry_id}
+            qa_rows = [r for r in qa_rows if str((r or {}).get("id") or "") in _want]
+
+    if args.qa_status:
+        # 状态面:零合成零云——逐条目按物化同口径算 key、查缓存,stdout 单行 JSON
+        # 供 CP canned-status 端点(Task 3)消费。音色解析链上的偶发诊断打印
+        # ([agent] minimax default/skip local)重定向到 stderr,保 stdout 纯 JSON。
+        with contextlib.redirect_stdout(sys.stderr):
+            status = _qa_status(
+                qa_rows, persona_pool, lang_personas,
+                all_personas=args.all_personas, tts_cfg=tts_cfg, voice_mode=voice_mode,
+                model=model, sample_rate=sample_rate, cache=cache,
+                entry_ids=set(args.entry_id) if args.entry_id else None,
+            )
+        print(json.dumps({"qa_status": status}, ensure_ascii=False), flush=True)
+        return 0
+
     # 缓存目录须与运行时同根:BOK_TTS_CACHE_DIR 由 bok.py/调用方透传。
     print(f"cache dir={cache.root} model={model} sample_rate={sample_rate}", flush=True)
 
@@ -572,16 +671,8 @@ async def main_async() -> int:
             total += ok + sk + fl
             _print_group_counts("fillers", records, with_total=args.dry_run)
 
-    # ---- Q→A 快路条目物化 ----
+    # ---- Q→A 快路条目物化(条目已在上方拉取并过 --entry-id 过滤) ----
     if args.qa:
-        # Q→A 快路启用条目:应答文本按条目语言取对应 persona 音色物化——运行时
-        # 闸门按 (answer_text, resolved_voice, model) 查缓存,音色必须同源。
-        # 空表/拉取失败静默(库未建=无物化需求)。
-        try:
-            qa_rows = _cp_get(args.cp, "/api/qa-entries?enabled=1", token) or []
-        except Exception as exc:  # noqa: BLE001 - 库未建/CP 不可达唔阻其他预合成
-            print(f"qa entries fetch failed: {exc!r}", flush=True)
-            qa_rows = []
         qa_job_list = _qa_jobs(
             qa_rows, persona_pool, lang_personas,
             all_personas=args.all_personas, tts_cfg=tts_cfg, voice_mode=voice_mode,
