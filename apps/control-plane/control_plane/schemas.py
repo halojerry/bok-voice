@@ -93,6 +93,9 @@ class CreateCallRequest(BaseModel):
     # B 线同传术语表(P0-2):「源=译」或纯词条,逗号/分号/换行分隔;1000 字上限
     # 在 _create_call_in 截断(agent 侧另有 400 字 prompt 护栏)。客服通话忽略。
     glossary: str = ""
+    # B 线会话级音色(2026-09-17):同传页建单我方/对方语言各选一把 MiniMax 音色,
+    # JSON map `{"zh":"voice_id",...}`;512 字上限在 _create_call_in 截断。空=跟随设置。
+    voices_json: str = ""
 
 
 class CreateObjectRequest(BaseModel):

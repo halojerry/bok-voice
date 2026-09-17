@@ -39,11 +39,18 @@ services:
       # 首次启动幂等种子 root 账号（同名已存在=跳过，改这里不会重置已有密码）。
       BOK_ROOT_USERNAME: ${BOK_ROOT_USERNAME:-}
       BOK_ROOT_PASSWORD: ${BOK_ROOT_PASSWORD:-}
+      # 节点工件目录（P3 交付链，2026-09-17）：pkg/runtime/bootstrap 三类，由
+      # deploy/cloud/publish_node_pkg.sh 从打包机推送；节点经 license/node_token
+      # 鉴权下载（/api/nodes/downloads/...）——客户链路只见本 CP 域名，零 GitHub。
+      BOK_NODE_ARTIFACTS_DIR: /app/downloads
     volumes:
       # vault：人设参考音频（TTS 克隆注册）+ 知识库 markdown 源文件。镜像内
       # VAULT_ROOT=/app/data/vault，属主 appuser；首挂载时 Docker 把镜像内目录
       # 内容连属主复制进空卷。**容器重建/升级镜像数据不丢，删卷才丢。**
       - cp-vault:/app/data/vault
+      # 节点工件卷：发版工件落这里（publish 脚本 docker compose cp 进卷），
+      # 容器重建不丢；属主沿用镜像内 /app 属主（appuser 可读即可，写只经 publish）。
+      - cp-downloads:/app/downloads
     # 排练/本机联调时 compose 会用 host-gateway 把 host.docker.internal 指到宿主
     # （DATABASE_URL 指宿主上的 postgres 服务容器用）；生产指 Supabase 时无用无害。
     extra_hosts:
@@ -55,3 +62,4 @@ services:
 
 volumes:
   cp-vault:
+  cp-downloads:

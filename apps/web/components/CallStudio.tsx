@@ -15,7 +15,7 @@ import {
 import { ConnectionState, TokenSource, Track, type Room } from "livekit-client";
 import { api } from "@/lib/api";
 import { describeConnectError, friendlyErrorText, useControlPlaneReady } from "@/lib/api-ready";
-import { applyOutputDevice, listAudioDevicesOf, requestMicPermission, saveMicDevice, savedMicDevice, savedOutputDevice, switchWebOutputDevice, webCanSwitchOutput, isTauriShell, type AudioDeviceInfo } from "@/lib/audio";
+import { listAudioDevicesOf, requestMicPermission, saveMicDevice, savedMicDevice, savedOutputDevice, switchWebOutputDevice, webCanSwitchOutput, type AudioDeviceInfo } from "@/lib/audio";
 import { startTrace } from "@/lib/logger";
 import { AgentChatIndicator } from "@/components/agents-ui/agent-chat-indicator";
 import { AgentChatTranscript } from "@/components/agents-ui/agent-chat-transcript";
@@ -253,7 +253,7 @@ function AudioDevicesCard({ room }: { room: Room | null }) {
   const [outputCanSwitch, setOutputCanSwitch] = useState(false);
   const [outId, setOutId] = useState("");
   useEffect(() => {
-    setOutputCanSwitch(isTauriShell() || webCanSwitchOutput());
+    setOutputCanSwitch(webCanSwitchOutput());
     setOutId(savedOutputDevice());
   }, []);
 
@@ -293,9 +293,7 @@ function AudioDevicesCard({ room }: { room: Room | null }) {
       /* ignore */
       log.warn("persist output device failed", { err: e instanceof Error ? e.message : String(e) });
     }
-    if (isTauriShell()) {
-      await applyOutputDevice(id);
-    } else if (room) {
+    if (room) {
       await switchWebOutputDevice(room, id);
     }
   };
@@ -856,7 +854,7 @@ function CallStudioInner({
       setConnecting(false);
       phase = "join-session";
       // 应用用户选择的音频设备：麦克风先设默认采集设备（session.start 开麦时会采用），
-      // 扬声器：桌面壳切系统默认输出；浏览器经 livekit setSinkId。
+      // 扬声器：浏览器经 livekit setSinkId（Chromium；Safari 回退系统默认）。
       const micDeviceId = savedMicDevice();
       const outputDeviceId = savedOutputDevice();
       // 非 exact：设备不存在/已插拔时回退默认，避免采集失败（exact 会 reject）。
@@ -865,16 +863,10 @@ function CallStudioInner({
           log.error("apply saved mic before connect failed", e, { id: micDeviceId.slice(0, 12) }),
         );
       }
-      if (outputDeviceId) {
-        if (isTauriShell()) {
-          await applyOutputDevice(outputDeviceId).catch((e: unknown) =>
-            log.error("apply output device (tauri) failed", e, { id: outputDeviceId.slice(0, 12) }),
-          );
-        } else if (webCanSwitchOutput()) {
-          await switchWebOutputDevice(session.room, outputDeviceId).catch((e: unknown) =>
-            log.error("apply output device (web sink) failed", e, { id: outputDeviceId.slice(0, 12) }),
-          );
-        }
+      if (outputDeviceId && webCanSwitchOutput()) {
+        await switchWebOutputDevice(session.room, outputDeviceId).catch((e: unknown) =>
+          log.error("apply output device (web sink) failed", e, { id: outputDeviceId.slice(0, 12) }),
+        );
       }
       // 连接前预缓冲 + 接通一步到位:麦克风采集放进 session.start 的 tracks
       // (与 token/连房并行,gum 即刻返回,连接完成后发布落地)。旧写法先在

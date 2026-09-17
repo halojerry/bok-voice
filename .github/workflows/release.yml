@@ -1,5 +1,10 @@
 name: Release
 
+# 发版管线（2026-09-17 Tauri 退役后）：tag 触发 → 双平台组装 runtime + 打
+# 代码包/运行时包 → 冒烟 → GitHub Release（私有仓=私有资产）。操作员随后
+# `deploy/cloud/publish_node_pkg.sh <版本>` 推到云 CP 工件卷，客户节点经
+# license/node_token 鉴权下载——交付链零 GitHub、零桌面安装包。
+
 on:
   push:
     tags:
@@ -13,8 +18,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: Package
+  node-pkg:
+    name: Node package (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
@@ -23,10 +28,8 @@ jobs:
         include:
           - os: macos-14
             target: mac
-            artifact: mac
           - os: windows-latest
             target: windows
-            artifact: exe
     steps:
       - uses: actions/checkout@v4
 
@@ -38,123 +41,66 @@ jobs:
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: desktop/package-lock.json
+          cache-dependency-path: services/realtime-translation/package-lock.json
 
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo + rust
+      - name: Cache runtime + dependency caches
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            desktop/src-tauri/target
-          key: ${{ runner.os }}-tauri-${{ hashFiles('desktop/src-tauri/Cargo.lock') }}
-
-      - name: Cache bundled runtime + dependency caches
-        uses: actions/cache@v4
-        with:
-          path: |
-            desktop/runtime
-            desktop/src-tauri/binaries
+            runtime
             ~/.cache/pip
             services/realtime-translation/node_modules
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: ${{ runner.os }}-runtime-v3-${{ hashFiles('requirements-runtime-*.txt','packages/**/pyproject.toml','apps/**/pyproject.toml','services/realtime-translation/package-lock.json') }}
+          key: ${{ runner.os }}-runtime-v4-${{ hashFiles('requirements-runtime-*.txt','packages/**/pyproject.toml','apps/**/pyproject.toml','services/realtime-translation/package-lock.json') }}
 
-      - name: Install Python deps (runner, for tests/manifest)
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt
-          pip install -e packages/core -e packages/business-db -e packages/knowledge -e packages/observability
-          pip install -e "apps/control-plane" -e "apps/agent[livekit]"
-
-      - name: Build release assets (web export + icons + manifest; tests already ran in CI)
-        shell: bash
-        env:
-          SKIP_TESTS: "1"
-        run: bash scripts/build_release.sh
-
-      - name: Build bundled runtime (Python/Node/LiveKit/llama)
+      - name: Assemble bundled runtime (Python/Node/LiveKit/llama)
         shell: bash
         run: bash scripts/build_runtime.sh
 
-      - name: Install Tauri CLI
-        run: cd desktop && npm ci
-
-      - name: Derive platform icons
-        run: cd desktop && npx tauri icon src-tauri/icons/icon.png
-
-      - name: Clean stale MSI (Windows; cache residue)
-        # cargo/tauri target 缓存可能携带旧版本 MSI——不清掉会出现双版本 MSI：
-        # test 裸 glob 多参数报错 + 旧 MSI 被上传进 release（v0.2.0 首发实证）。
-        if: runner.os == 'Windows'
-        shell: bash
-        run: rm -fv desktop/src-tauri/target/release/bundle/msi/*.msi
-
-      - name: Build desktop app
+      - name: Verify runtime staging
         shell: bash
         run: |
-          cd desktop
           if [ "$RUNNER_OS" = "Windows" ]; then
-            # NSIS (makensis 32-bit) 无法处理 >2GB payload（torch+llama cudart），
-            # 改用 WiX MSI（支持多 CAB 的大体积安装包）。
-            npx tauri build --bundles msi
+            test -f runtime/python/python.exe
+            test -f runtime/llama/llama-server.exe
+            runtime/llama/llama-server.exe --version
           else
-            npx tauri build --bundles app
-            zip -r -y "BokVoice-mac.zip" "src-tauri/target/release/bundle/macos/BokVoice.app" >/dev/null
+            test -x runtime/python/bin/python3
+            test -n "$(ls runtime/livekit-server* 2>/dev/null || ls runtime/ 2>/dev/null)"
           fi
 
-      - name: Verify bundle (staging)
-        shell: bash
-        run: bash scripts/verify_bundle.sh --staging
-
-      - name: Verify built app + bundled doctor (macOS)
-        if: runner.os == 'macOS'
+      - name: Build node packages (code + runtime)
         shell: bash
         run: |
-          bash scripts/verify_bundle.sh --app desktop/src-tauri/target/release/bundle/macos/BokVoice.app
-          bash scripts/verify_bundle.sh --doctor desktop/src-tauri/target/release/bundle/macos/BokVoice.app
+          VER="${GITHUB_REF_NAME#v}"
+          bash scripts/build_node_pkg.sh "$VER"
+          bash scripts/build_runtime_pkg.sh "$VER"
 
-      - name: Verify Windows artifacts (llama-server CUDA + MSI)
-        if: runner.os == 'Windows'
+      - name: Smoke node package (layout + version injection)
         shell: bash
         run: |
-          ls -la desktop/runtime/llama/ | head -20
-          desktop/runtime/llama/llama-server.exe --version
-          # 版本一致性门禁：tauri.conf.json 版本必须与 tag 一致（防 0.1.0 MSI 混进
-          # 0.2.0 release 的发布卫生事故），且精确文件名必须存在（裸 glob 会把
-          # 多文件喂给 test 报 binary operator expected）。
-          # Windows Python 默认 cp1252 读 UTF-8（tauri.conf.json 含中文）→ charmap
-          # UnicodeDecodeError——必须显式 encoding='utf-8'（v0.2.0 第四次构建实证）。
-          ver="$(python -c "import json;print(json.load(open('desktop/src-tauri/tauri.conf.json',encoding='utf-8'))['version'])")"
-          echo "tauri version: ${ver}  tag: ${GITHUB_REF_NAME}"
-          if [ "${GITHUB_REF_NAME#v}" != "$ver" ]; then
-            echo "::error::tag/tauri version mismatch: ${GITHUB_REF_NAME} vs ${ver}"; exit 1
-          fi
-          msi="desktop/src-tauri/target/release/bundle/msi/BokVoice_${ver}_x64_zh-CN.msi"
-          test -f "$msi" && echo "MSI present (${ver})"
-          echo "msi dir file count: $(ls desktop/src-tauri/target/release/bundle/msi/*.msi 2>/dev/null | wc -l)"
+          VER="${GITHUB_REF_NAME#v}"
+          mkdir -p smoke && tar -xzf "release-artifacts/bok-node-${VER}.tar.gz" -C smoke
+          test -f "smoke/bok-node-${VER}/tools/node_agent.py"
+          test -f "smoke/bok-node-${VER}/scripts/install-node.sh"
+          echo "VERSION in package: $(cat smoke/bok-node-${VER}/VERSION)"
+          [ "$(cat smoke/bok-node-${VER}/VERSION)" = "$VER" ]
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: bok-voice-${{ matrix.target }}
-          path: |
-            desktop/BokVoice-mac.zip
-            desktop/src-tauri/target/release/bundle/msi/*.msi
-            models.sha256.json
+          name: node-pkg-${{ matrix.target }}
+          path: release-artifacts/*
           retention-days: 7
+          if-no-files-found: error
 
   manifest:
     name: Manifest
-    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -173,7 +119,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: [build, manifest]
+    needs: [node-pkg, manifest]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -196,11 +142,11 @@ jobs:
           echo "==> creating release for tag ${TAG} (version ${VERSION})"
           gh release delete "${TAG}" --yes 2>/dev/null || true
           ASSETS=()
-          for f in $(find release-assets -type f \( -name '*.dmg' -o -name '*.exe' -o -name '*.msi' -o -name '*.zip' -o -name 'models.sha256.json' \)); do
+          for f in $(find release-assets -type f \( -name '*.tar.gz' -o -name '*.sha256' -o -name 'models.sha256.json' \)); do
             ASSETS+=("$f")
           done
           gh release create "${TAG}" \
             --title "Bok Voice ${VERSION}" \
-            --notes "自包含桌面发行：内嵌前端/运行时/二进制；模型首启下载；零 Ollama/零 Docker。" \
+            --notes "节点分发行：代码包 + 预构建运行时（经云 CP 鉴权分发，客户侧零 GitHub）。升级走 commands 通道（update <version>）。" \
             "${ASSETS[@]}"
           echo "==> release created"

@@ -18,8 +18,8 @@
 
 | 组件 | 端口/协议 | 职责 | 运行时 | 数据落点 |
 |---|---|---|---|---|
-| Tauri Shell (Rust) | — | 打开窗口、拉起 `bok.py serve`、托管静态前端 | 打包内 | — |
 | `bok.py serve` | — | 编排：启动顺序、健康、模型下载 | 打包 Python | pid 文件 → app-data/run；日志 → app-data/logs |
+| node-agent | 心跳出站 + UI :3000 HTTP | 薄节点守护（心跳/commands/全栈拉起/**坐席 UI 静态托管**，2026-09-17 Tauri 退役后 `--ui-dir` 即自动起 ：3000） | 打包 Python（stdlib-only 面） | node-state → ~/.bok/node-state.json |
 | control-plane | :8000 HTTP | 业务 API、知识、设置、审计、LiveKit token | 打包 Python | SQLite → app-data/bok_voice.db |
 | ASR sidecar | :8787 HTTP | 三语转写（zh/cantonese/en） | Mac=mlx_audio；Win=qwen-asr+CUDA | 模型 → app-data/models |
 | TTS sidecar | :8788 HTTP | 合成 / 克隆 / 试听 | Mac=mlx_audio；Win=qwen-tts | 模型 → app-data/models |
@@ -29,6 +29,13 @@
 | LiveKit server | :7880 WS/WebRTC | RTC 信令与媒体（7881/7882 RTC 端口） | 内嵌二进制 | keys → 内嵌 livekit.yaml |
 | agent worker | 进程（健康 :8081/worker） | A 线智能体（VAD/对话/情绪/打断） | 打包 Python | 调 8787/8788/1235/8000；TTS=MiniMax 云（`tts_cache` 本地音频缓存叠加） |
 | interpreter worker ×2 | 进程（健康 :8082 fwd / :8083 rev） | B 线双 AgentSession 同传（`bok-interp-fwd/rev` 显式分发） | 打包 Python | 调 8787/8788/1236(MT,回退 1235)/8000；TTS=MiniMax 云(或本地 8788) |
+
+> 健康探针（2026-09-17）：三 worker 的 `/worker` 是 livekit-agents 内建真端点
+> （agent_name/worker_load/sdk_version），`bok.py status/doctor/prod status`
+> 统一读端点本体而非 TCP UP；LLM 另有 max_tokens=1 功能探针（端口 UP ≠ 能用，
+> `BOK_DOCTOR_LLM_PROBE_TIMEOUT_S` 默认 10s）；b-line :8790 无明文 /health，
+> 非 upgrade 请求恒 426=本体作答判活。常量单点 `CORE_PORTS`/`WORKER_PORTS`/
+> `PROD_HTTP_CHECKS`（tools/bok.py），契约钉在 `tests/test_health_surface.py`。
 
 ### 本地 TTS 音频缓存 + 垫话 + Q→A 快路（2026-09-09，`docs/superpowers/specs/2026-09-08-*-design.md`）
 
@@ -73,17 +80,14 @@
   开关 `BOK_QA_FASTPATH=0`。B3：装配取数钉本通账号+`owner_scope=created_by`
   （共享+建单人个人条目；战役等无主通话='' 仅共享），不再硬编码 acc-001。
 
-### 音频设备（设置页）
+### 音频设备（设置页，2026-09-17 Tauri 退役后=纯浏览器）
 
-- 桌面壳（macOS）通过 Tauri `list_audio_devices` / `set_system_output`（CoreAudio）
-  枚举并切换**系统默认输出设备** —— A 线远端 `<audio>` 与 B 线 WebAudio 都跟随。
-- 麦克风：macOS 打包需 `NSMicrophoneUsageDescription`（Tauri 合并
-  `desktop/src-tauri/Info.plist`）与 `com.apple.security.device.audio-input`
-  entitlements，否则 TCC 静默拒绝 → 设备列表为空。
-- 选择持久化在 localStorage（`bok.audio.mic` / `bok.audio.out`），接通/开始采集时应用。
-- **CoreAudio 注意**：CFString 属性（设备 UID/名称）由 CoreAudio 以「对象指针写入
-  outData」返回，须用 `CFStringRef*` 接收并 `CFRelease`；按字节缓冲解引用会
-  SIGSEGV（设置页打开即崩）。`cargo test` 有真机枚举回归用例。
+- **输入（麦克风）**：`enumerateDevices`（授权后出 label）；采集走 WebRTC deviceId。
+- **输出（扬声器）**：仅 Chromium 内核可靠（livekit `switchActiveDevice("audiooutput")`
+  =`setSinkId`；一体台 B 线走 `AudioContext.setSinkId` router）；Safari/WKWebView
+  **不支持**网页切输出——跟随系统默认（原 Tauri/CoreAudio 系统级切换随壳退役）。
+- 选择持久化在 localStorage（`bok.audio.mic` / `bok.audio.out` 按角色 `.me`/`.other`
+  变体），接通/开始采集时自动应用；浏览器权限走标准 getUserMedia 流程。
 
 ## 2. 数据流
 
@@ -97,15 +101,15 @@
 同时：通话/转写/结算/审计 → control-plane :8000 → SQLite（对象、人设、知识、模板、设置、审计）
 ```
 
-> **前端就绪自愈**：桌面壳异步拉起整栈服务，WebView 先于服务就绪加载。前端
-> `lib/api-ready.ts` 的 `useControlPlaneReady` 轮询 `/health`，Control Plane 就绪后
+> **前端就绪自愈**：服务未就绪时先开页面（节点 node_agent 拉起全栈有秒级时差）。
+> 前端 `lib/api-ready.ts` 的 `useControlPlaneReady` 轮询 `/health`，Control Plane 就绪后
 > 自动重拉对象/人设等数据；`TypeError: Load failed` 不再直接上屏，而是映射为
 > 中文提示「本地服务启动中/无法连接」。
 >
 > **URL 归一**：前端 API 基址、B 线 WS、LiveKit、agent 的 CONTROL_PLANE_URL 一律
 > 默认 `127.0.0.1`（服务只绑 IPv4；避免 macOS localhost 优先解析 ::1 导致
-> fetch 恒定失败）。构建/打包（verify_bundle.sh）会校验 `out/` 不含
-> `http://localhost:8000`。
+> fetch 恒定失败）。节点拓扑由 `runtime-config.js` 注入 cpUrl/livekitUrl；
+> `scripts/probe_thin_client_static.py` 校验 `out/` 不含烤死的 `http://localhost:8000`。
 
 ### Supervisor（主管台）
 
@@ -333,7 +337,7 @@ WorkerOptions.port)——默认同为 8081 会竞态,后绑者 Errno 48 即崩
 
 ### 关闭（`bok.py down`）
 
-按 pid 文件逐个 SIGTERM（run/*.pid）。Tauri 退出时调用 `stop`。
+按 pid 文件逐个 SIGTERM（run/*.pid）；node_agent full 模式退出/收到 shutdown 指令时经 cmd_down 收栈。
 
 ### 失败处理
 
@@ -416,7 +420,7 @@ Windows 站点机的常驻等价物（对照 mac launchd RunAtLoad + KeepAlive�
 
 | 路径 | 可写 | 用途 |
 |---|---|---|
-| bundle（`.app/Contents/Resources`） | 否（只读） | 代码、Python 运行时、二进制、静态前端 |
+| 节点安装树（`~/bok-voice` / `%USERPROFILE%\bok-voice`） | 代码可更新 | 代码、runtime/（Python/二进制复用）、静态前端 |
 | `~/Library/Application Support/BokVoice`（win `%LOCALAPPDATA%\BokVoice`） | 是 | models / vault / logs / run / bok_voice.db / audit / bline.json |
 | `~/.lmstudio/models` | 只读引用 | 本机开发/软链复用（`--` 目录名映射） |
 

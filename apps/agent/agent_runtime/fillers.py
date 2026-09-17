@@ -202,12 +202,32 @@ def filler_backfill_enabled() -> bool:
     return os.environ.get("BOK_FILLER_BACKFILL", "1") == "1"
 
 
+_FILLER_DEFLECT_RE = re.compile(
+    r"(繼續講|继续讲|聽住|听住|聽緊|听紧|聽著|听著|慢慢講|慢慢讲|慢慢說|慢慢说|"
+    r"你講先|你讲先|go ahead|please\s+continue)",
+    re.IGNORECASE,
+)
+
+
+def filter_deflect_entries(entries: list[dict]) -> list[dict]:
+    """剔除「让话」语义条目(2026-09-17 call-11132bdd 用户听感判污):垫话岗位=
+    生成间隙买时间/确认接收;「你继续讲我听住」係风暴/starve 让话语义——客户
+    报完号码答「继续讲」、应承轮答「继续讲」全部语境错位(实测:ack/minimal
+    桶被该家族占半壁,分类器归对了类也选不出人话)。池小过秽,选池整体剔除;
+    资产文件保留不删(防误删后无得回滚)。纯函数,单测用。"""
+    kept = [e for e in entries if not _FILLER_DEFLECT_RE.search(str(e.get("text") or ""))]
+    dropped = len(entries) - len(kept)
+    if dropped:
+        print(f"BOK_FILLER pool hygiene: dropped {dropped} deflect-family entries", flush=True)
+    return kept
+
+
 def load_manifest(assets_dir: Path) -> dict[str, list[dict]]:
-    """manifest.json → {lang: [{text, file, dur_s}, ...]}。"""
+    """manifest.json → {lang: [{text, file, dur_s}, ...]}(让话家族剔除后)。"""
     p = Path(assets_dir) / "manifest.json"
     data = json.loads(p.read_text(encoding="utf-8"))
     return {
-        str(lang): [e for e in entries if e.get("file")]
+        str(lang): filter_deflect_entries([e for e in entries if e.get("file")])
         for lang, entries in data.items()
         if entries
     }
@@ -240,6 +260,7 @@ class FillerEntryIndex:
         from bok_voice_core.embeddings import HybridLexicalEmbedding
         from bok_voice_core.qa_text import normalize_question
 
+        entries = filter_deflect_entries(list(entries or []))  # 让话家族不入罐头索引
         self._embed = HybridLexicalEmbedding(512)
         self._norm = normalize_question
         self._items: list[dict] = []
@@ -392,17 +413,26 @@ class FillerDirector:
         self._handle = None
         self._cur_dur = 0.0
         self._play_started = 0.0
+        # 「垫话真正开播」回调(2026-09-17 RC3,agent 侧 set_on_fired 注入):
+        # 垫话 out-of-band 出声框架/watchdog 感知不到,开播即通知顺延响应看门狗。
+        # None=零行为变化。签名 ();异常由触发点吞掉,绝不阻垫话。
+        self._on_fired = None
         self._fired_lines: list[str] = []  # 已实际播放(审计/探针断言用)
         self._recent: list[str] = []  # 已选取(含未播出),防相邻重复
         self._count = 0
         self._chain_task: asyncio.Task | None = None
         self._chain_depth = 0  # 本轮已链发次数(每轮封顶 1)
         self._reply_audio_seen = False  # on_reply_first_audio 置位,新轮/arm 重置
+        # 连轮冷却(2026-09-17 call-11132bdd:8 轮垫 6 轮=轰炸感):相邻轮只垫
+        # 一轮歇一轮,除非客户连讲跨轮(arm 序号差 >1 自然放行)。
+        self._turn_seq = 0
+        self._last_fire_seq = -2
 
     # ---- 生命周期 ----
 
     def arm(self) -> None:
         """轮提交、确认走 LLM 正常路径后调用;重复 arm 先作废旧定时器/链发。"""
+        self._turn_seq += 1
         self._cancel_timer()
         self._cancel_chain()
         if not filler_enabled() or self._count >= filler_max_per_call():
@@ -423,6 +453,19 @@ class FillerDirector:
         """
         self._reply_audio_seen = True
         self._cancel_timer()
+
+    def set_on_fired(self, cb) -> None:
+        """注册「垫话真正开播」回调(2026-09-17 RC3):agent 侧把响应看门狗顺延
+        接到这里——垫话走 BackgroundAudioPlayer out-of-band 音轨,框架与 watchdog
+        均不可见,开播即通知顺延一次,免「垫话盖耳+系统慢」轮被 4s 闸误伤。
+        cb 在事件循环内被调(签名 ();链发第二发起播同样触发);cb 异常在触发点
+        吞掉,绝不阻垫话出声。None=清除。"""
+        self._on_fired = cb
+
+    def fired_this_round(self) -> bool:
+        """本轮(当前 arm 序号)是否已垫过——LLM 兜底闸用:垫话已盖耳的轮,
+        2s 超时的「系统慢了少少」道歉句係叠床架屋,抑制后靠 drain/晚到补答。"""
+        return self._turn_seq > 0 and self._last_fire_seq == self._turn_seq
 
     def hold_if_playing(self) -> float:
         """回复首帧应扣压的秒数:垫话时间轴(开播+时长+gap)内=剩余量。
@@ -663,6 +706,16 @@ class FillerDirector:
                 return
             if self._guards() or filler_max_per_call() <= self._count:
                 return
+            if (
+                self._turn_seq > 0
+                and self._chain_depth == 0
+                and self._turn_seq - self._last_fire_seq <= 1
+            ):
+                # 连轮冷却(2026-09-17 call-11132bdd:8 轮垫 6 轮=轰炸):相邻轮
+                # 歇一轮;链发(同轮第二发)豁免。_turn_seq=0=无 arm 的直调(旧测试
+                # /嵌入方)不适用冷却语义。客户隔多轮再讲(序号差 >1)放行。
+                print("BOK_FILLER skip cooldown (上一轮已垫,防连轮轰炸)", flush=True)
+                return
             state = str(getattr(self._session, "agent_state", "") or "")
             if state not in ("listening", "thinking", ""):
                 return  # 别的东西在播/状态不明,唔叠音
@@ -721,6 +774,7 @@ class FillerDirector:
             # 24k 直进=2 倍速升调「机器人声」);时长口径仍按源速率算。
             frames = pcm_to_frames(resample_pcm(pcm, rate, BACKGROUND_PLAYER_RATE), BACKGROUND_PLAYER_RATE)
             self._count += 1
+            self._last_fire_seq = self._turn_seq
             self._fired_lines.append(entry["text"])
             print(f"BOK_FILLER fired count={self._count} line={entry['text']!r} {voice_mark}", flush=True)
             # 展示/账本文本剥 MiniMax 停顿标记——<#0.3#> 是合成指令,原样进字幕
@@ -761,6 +815,13 @@ class FillerDirector:
                 source = frames_aiter(frames)
             self._play_started = time.monotonic()
             self._handle = self._player.play(source)
+            if self._on_fired is not None:
+                # RC3:真正开播(play 已提交)即通知——watchdog 顺延口。异常吞掉,
+                # 顺延失败绝不阻垫话出声。
+                try:
+                    self._on_fired()
+                except Exception:  # noqa: BLE001
+                    pass
             self._spawn_chain()  # 挂播完观察者:回复没来就链发第二发
         except asyncio.CancelledError:
             raise

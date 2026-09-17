@@ -1005,3 +1005,19 @@ def test_judge_confirm_gate_blocks_ackless_long_utt():
     assert judge_confirm_advance_allowed(goal=g4, ref=r4, user_text="行") is True  # 短句
     g2 = "来电通知:自报家门,通知货件遗失"  # 非问句步(无？)
     assert judge_confirm_advance_allowed(goal=g2, ref="我哋係集運中轉倉…", user_text="随便讲点什么都很长的一段话") is True
+
+
+def test_parse_steps_emotion_field():
+    # 2026-09-16 罐头带情绪:模板 steps_json `emotion` 字段进 FlowStep(归一小写),
+    # 只在 pregen 物化时烧进音频;空=不下发(模型按文本自动匹配,轮间语气稳定)。
+    import json as _json
+
+    from agent_runtime.flow import parse_steps
+
+    steps = parse_steps(
+        _json.dumps([{"goal": "通知", "ref": "你好,係張先生嗎?", "say": True, "emotion": "SAD"}])
+    )
+    assert steps[0].say is True
+    assert steps[0].emotion == "sad"
+    assert parse_steps(_json.dumps([{"goal": "g", "ref": "r"}]))[0].emotion == ""
+    assert parse_steps("") == []

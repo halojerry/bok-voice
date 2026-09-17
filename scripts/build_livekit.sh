@@ -24,9 +24,9 @@ case "$OS" in
     OUT="$BINARIES/livekit-server-${TRIPLE}.exe"
     if [ ! -x "$OUT" ]; then
       echo "==> [livekit] downloading official Windows binary $LK_VERSION"
-      curl -fsSL "https://github.com/livekit/livekit/releases/download/${LK_VERSION}/livekit_${LK_VERSION#v}_windows_amd64.zip" -o "$ROOT/desktop/runtime/lk.zip"
-      (cd "$ROOT/desktop/runtime" && unzip -qo lk.zip && rm -f lk.zip)
-      find "$ROOT/desktop/runtime" -iname "livekit-server.exe" -exec cp {} "$OUT" \;
+      curl -fsSL "https://github.com/livekit/livekit/releases/download/${LK_VERSION}/livekit_${LK_VERSION#v}_windows_amd64.zip" -o "$ROOT/runtime/lk.zip"
+      (cd "$ROOT/runtime" && unzip -qo lk.zip && rm -f lk.zip)
+      find "$ROOT/runtime" -iname "livekit-server.exe" -exec cp {} "$OUT" \;
       chmod +x "$OUT"
     fi
     echo "    livekit-server: $OUT ($(ls -lh "$OUT" | awk '{print $5}'))"
@@ -54,9 +54,9 @@ case "$OS" in
     OUT="$BINARIES/livekit-server-${TRIPLE}"
     if [ ! -x "$OUT" ]; then
       echo "==> [livekit] downloading official Linux binary $LK_VERSION"
-      curl -fsSL "https://github.com/livekit/livekit/releases/download/${LK_VERSION}/livekit_${LK_VERSION#v}_linux_amd64.tar.gz" -o "$ROOT/desktop/runtime/lk.tar.gz"
-      (cd "$ROOT/desktop/runtime" && tar -xzf lk.tar.gz && rm -f lk.tar.gz)
-      find "$ROOT/desktop/runtime" -iname "livekit-server" -exec cp {} "$OUT" \;
+      curl -fsSL "https://github.com/livekit/livekit/releases/download/${LK_VERSION}/livekit_${LK_VERSION#v}_linux_amd64.tar.gz" -o "$ROOT/runtime/lk.tar.gz"
+      (cd "$ROOT/runtime" && tar -xzf lk.tar.gz && rm -f lk.tar.gz)
+      find "$ROOT/runtime" -iname "livekit-server" -exec cp {} "$OUT" \;
       chmod +x "$OUT"
     fi
     echo "    livekit-server: $OUT ($(ls -lh "$OUT" | awk '{print $5}'))"
