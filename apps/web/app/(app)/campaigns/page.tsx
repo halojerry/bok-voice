@@ -102,7 +102,12 @@ const EMPTY_SCHED: SchedValue = {
   redispatch_outcomes: ["no_answer"],
 };
 
-/** POST/PUT 提交体（同构）：call_windows 过滤 days 空行；并发钳 ≥0；重拨关=不传键。 */
+/**
+ * POST/PUT 提交体（同构）：call_windows 过滤 days 空行；并发钳 ≥0。
+ * 重拨三态显式化：开且勾选了结果 → 传策略；关/无勾选 → 传 `{}`——PUT 端点
+ * None=保留旧值，只有显式 `{}`（清洗后为空）才落 `redispatch_json=''` 清除，
+ * 否则用户关掉开关保存「成功」、重拨实际还在（T7-I1 行为缺陷）。
+ */
 function buildSchedBody(s: SchedValue): Record<string, unknown> {
   const body: Record<string, unknown> = {
     call_windows: s.call_windows
@@ -110,13 +115,16 @@ function buildSchedBody(s: SchedValue): Record<string, unknown> {
       .filter((w) => w.days.length > 0 && Boolean(w.start) && Boolean(w.end)),
     max_concurrency: Math.max(0, Math.floor(Number(s.max_concurrency) || 0)),
   };
-  if (s.redispatch_on) {
-    body.redispatch = {
-      max_attempts: Math.min(5, Math.max(1, Math.floor(Number(s.redispatch_max) || 0))),
-      interval_minutes: Math.max(1, Number(s.redispatch_interval) || 0),
-      on: REDISPATCH_OUTCOMES.map((o) => o.value).filter((v) => s.redispatch_outcomes.includes(v)),
-    };
-  }
+  const on = s.redispatch_on
+    ? REDISPATCH_OUTCOMES.map((o) => o.value).filter((v) => s.redispatch_outcomes.includes(v))
+    : [];
+  body.redispatch = s.redispatch_on && on.length > 0
+    ? {
+        max_attempts: Math.min(5, Math.max(1, Math.floor(Number(s.redispatch_max) || 0))),
+        interval_minutes: Math.max(1, Number(s.redispatch_interval) || 0),
+        on,
+      }
+    : {};
   return body;
 }
 

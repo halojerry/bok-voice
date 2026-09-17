@@ -130,7 +130,16 @@ function DashboardContent() {
     setLoading(true);
     Promise.all([
       // 仪表盘端点未上线（旧 CP 404）时不拖垮整页：stats 落 null，全部 KPI 兜底「—」。
-      api.statsDashboard().catch(() => null),
+      // 404/网络中断静默降级；其余错误 warn 一声再降级——P0 信息面，别整页报错。
+      api
+        .statsDashboard()
+        .catch((e: unknown) => {
+          const msg = String(e);
+          if (!/\b404\b/.test(msg) && !(e instanceof TypeError)) {
+            console.warn("statsDashboard degraded:", msg);
+          }
+          return null;
+        }),
       api.listCalls(accountId, ""),
     ])
       .then(([s, c]) => {
@@ -157,7 +166,8 @@ function DashboardContent() {
   const tagsTotal = tags
     ? disposition.reduce((sum, [, n]) => sum + n, 0) + whatsapp.reduce((sum, [, n]) => sum + n, 0)
     : null;
-  const agents = asRows(stats?.agents);
+  // 坐席排行：端点已截 8，这里对异常形状（旧 CP/篡改响应）再兜一层，防长表撑爆卡片。
+  const agents = asRows(stats?.agents).slice(0, 8);
   const buckets = bucketRows(asRecord(stats?.duration_buckets));
   const maxBucket = Math.max(1, ...buckets.map(([, n]) => n));
 
@@ -166,7 +176,9 @@ function DashboardContent() {
     ["当前并发", fmtCount(concurrency?.current)],
     ["今日呼叫", fmtCount(callsAgg?.today), `累计 ${fmtCount(callsAgg?.total)}`],
     ["客户接通率", fmtPercent(callsAgg?.answer_rate), `接通 ${fmtCount(callsAgg?.answered)}`],
-    ["今日接通量", fmtCount(callsAgg?.answered), `通话中 ${fmtCount(concurrency?.current)}`],
+    // 今日接通量：新 CP 用 answered_today；旧 CP 无该字段回退全时段 answered（T5-M3）。
+    // 卡 3 副行「接通」保持全时段 answered 不动——answer_rate 分母是全时段口径。
+    ["今日接通量", fmtCount(callsAgg?.answered_today ?? callsAgg?.answered), `通话中 ${fmtCount(concurrency?.current)}`],
     ["标记总数", tagsTotal === null ? "—" : String(tagsTotal)],
     ["最近会话", String(calls.length)],
   ];
