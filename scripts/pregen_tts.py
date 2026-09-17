@@ -536,7 +536,8 @@ async def main_async() -> int:
     if args.persona:
         persona_pool = [x for x in personas if str(x.get("id")) == args.persona]
         if not persona_pool:
-            print(f"persona {args.persona} not found in CP /api/personas", flush=True)
+            # stderr：--qa-status 的 stdout 是纯 JSON 契约（CP canned-status 逐行解析）。
+            print(f"persona {args.persona} not found in CP /api/personas", file=sys.stderr, flush=True)
     else:
         persona_pool = list(personas)
 
@@ -553,7 +554,8 @@ async def main_async() -> int:
         try:
             qa_rows = _cp_get(args.cp, "/api/qa-entries?enabled=1", token) or []
         except Exception as exc:  # noqa: BLE001 - 库未建/CP 不可达唔阻其他预合成
-            print(f"qa entries fetch failed: {exc!r}", flush=True)
+            # stderr：--qa-status 的 stdout 是纯 JSON 契约（CP canned-status 逐行解析）。
+            print(f"qa entries fetch failed: {exc!r}", file=sys.stderr, flush=True)
             qa_rows = []
         if args.entry_id:
             _want = {str(x) for x in args.entry_id}
