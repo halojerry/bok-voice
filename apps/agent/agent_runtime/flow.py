@@ -1245,8 +1245,22 @@ def build_judge_messages(
     )
     if next_goal:
         sys += f"。下一步（若推进）：{next_goal}"
+    # 输出契约(route 模式下整体替换,唔做后置追加——「只输出三个词之一」係
+    # 硬指令,后补弱指令会被模型一致无视,2026-09-18 9B 实测零 compliant)。
+    if route_enabled:
+        sys += (
+            "。客户说完一句话，先判断该不该进入下一步，再判断佢有没有实质诉求。"
+            "第一行只输出 advance / stay / objection 之一。\n"
+            "第二行输出 route=X conf=0.0~1.0。route 只准五个值："
+            "register_followup（要查单/查进度/跟进登记/投诉要求处理）/"
+            "capture_contact（愿意留联系方式）/transfer_human（指名要真人）/"
+            "degrade_question（听唔明客户讲咩/答非所问）/keep（冇任何诉求）。\n"
+        )
+    else:
+        sys += (
+            "。客户说完一句话，判断客服是否该进入下一步。只输出三个词之一：advance / stay / objection。\n"
+        )
     sys += (
-        "。客户说完一句话，判断客服是否该进入下一步。只输出三个词之一：advance / stay / objection。\n"
         "advance=客户已答完/确认当前步，或客户问/讲的正正是下一步内容，"
         "或当前步在引导核实资料而客户已答出关键资料（例如讲到在哪个平台买，即使商品/金额未完全对上提示）"
         "且下一步正是承接这个答案的动作；或当前步在向客户提问而他给了明确答案"
@@ -1255,6 +1269,8 @@ def build_judge_messages(
         "objection=客户否认/拒绝/不关事/想挂线。\n"
         "全程是AI客服自己和客户聊，客户答不出不等于要转真人，判断只管推进流程。\n"
         "例子：\n"
+        "客户：「我要投诉件货延误」且当前係核实 -> stay\n"
+        "route=register_followup conf=0.8\n"
         "客户：「好，没问题，係我嘅」-> advance\n"
         "客户：「你哋係邊間公司㗎？」-> stay\n"
         "客户：「唔好再打嚟！」-> objection\n"
@@ -1264,17 +1280,21 @@ def build_judge_messages(
     )
     if route_enabled:
         sys += (
-            "\n若客户呢句含实质诉求，喺 verdict 后面补一段：route=X conf=0.0~1.0。"
-            "route 只准係：register_followup（要查单/查进度/跟进登记）/"
-            "capture_contact（愿意留联系方式）/transfer_human（指名要真人）/"
-            "degrade_question（答非所问、听唔明客户讲咩）。冇诉求就输出 route=keep。"
+            "\n客户：「我要投诉件货延误」且当前係核实 -> stay\n"
+            "route=register_followup conf=0.8\n"
+            "客户：「你哋係咪呃人㗎」-> stay\n"
+            "route=keep conf=0.6"
         )
     if facts:
         known = " ".join(f"{k}={v}" for k, v in facts.items() if v)
         sys += f"\n已知客戶資料:{known}"
+    if route_enabled:
+        user_msg = f"客戶:「{user_text}」\n第一行輸出 advance/stay/objection，第二行輸出 route=X conf=0.0~1.0。"
+    else:
+        user_msg = f"客戶:「{user_text}」\n淨係輸出 advance / stay / objection 其中一個字。"
     return [
         {"role": "system", "content": sys},
-        {"role": "user", "content": f"客戶:「{user_text}」\n淨係輸出 advance / stay / objection 其中一個字。"},
+        {"role": "user", "content": user_msg},
     ]
 
 
