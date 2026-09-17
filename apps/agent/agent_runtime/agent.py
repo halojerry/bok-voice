@@ -428,6 +428,31 @@ def _wa_questionish(text: str) -> bool:
     return bool(_WA_QUESTION_MARKERS.search(text))
 
 
+async def _report_whatsapp_once(
+    cp, call_id: str, num: str, channel: str,
+    reported: set[str], key: str, *, where: str = "",
+) -> None:
+    """WhatsApp 信号上报一次;失败或被取消都回滚 `reported` 键(AGENTS.md ⑦)。
+
+    从 entrypoint 内联闭包抽出为模块级函数:行为与 2026-09-17 全量 debug F4
+    的内联版逐字一致,但可离线单测钉死语义(tests/test_fire_forget_pool.py)——
+    CancelledError 是 BaseException,`except Exception` 接不住,teardown 掐杀
+    在途请求时若无独立捕获回滚,键被永久占用=这个号永远不再补报。
+    """
+    tag = f" (call {where})" if where else ""
+    try:
+        await cp.report_whatsapp(call_id, num, channel=channel)
+    except asyncio.CancelledError:
+        # teardown 掐杀不走 except Exception——key 留池=该捕获永不补报。回滚后重抛。
+        reported.discard(key)
+        raise
+    except Exception as exc:  # pragma: no cover - 上报失败唔阻确认
+        # 上报失败唔好永久丢:清 key,後續輪再偵測到會補報
+        # (server 幂等,重複 POST 唔會造成重複爆閃)。
+        reported.discard(key)
+        print(f"[whatsapp] report failed, will retry on next signal: {exc!r}{tag}", flush=True)
+
+
 def _wa_accum_merge(stashed: str, incoming: str) -> str:
     """累积合并:「结合上下文」的正确姿势(call-5f8bef6b 实证)。
 
@@ -1960,7 +1985,10 @@ async def entrypoint(ctx):
         ext = _response_watchdog_filler_ext_s() if extra_s is None else extra_s
         _watchdog_extend(
             _watchdog,
-            lambda d: asyncio.create_task(_watchdog_fire(d)),
+            # lambda 产物被 _watchdog_extend 内 state["task"] = spawn(...) 强引用
+            # 持有(重武装取消旧 timer 同款),非 detach——扫描器看不见下游赋值,
+            # 靠行尾标记豁免。
+            lambda d: asyncio.create_task(_watchdog_fire(d)),  # FIRE_FORGET_EXEMPT: 结果被 state["task"] 持有
             ext,
             time.monotonic(),
         )
@@ -3384,23 +3412,17 @@ async def entrypoint(ctx):
                         if _key not in _wa_reported:
                             _wa_reported.add(_key)
 
-                            async def _report():
-                                try:
-                                    await cp.report_whatsapp(call_id, _num, channel=_wa_ch)
-                                except asyncio.CancelledError:
-                                    # teardown 掐杀不走 except Exception——key 留池=该
-                                    # 捕获永不补报(2026-09-17 全量 debug F4)。回滚后重抛。
-                                    _wa_reported.discard(_key)
-                                    raise
-                                except Exception as exc:  # pragma: no cover
-                                    # 上报失败唔好永久丢:清 key,後續輪再偵測到會補報
-                                    # (server 幂等,重複 POST 唔會造成重複爆閃)。
-                                    _wa_reported.discard(_key)
-                                    print(f"[whatsapp] report failed, will retry on next signal: {exc!r} (call {room_name})", flush=True)
-
                             # 入池持引用:裸 create_task 会被 job teardown 杀掉且无 flush
-                            # 窗口(同 _spawn_report 注释)。
-                            _spawn_report(_report())
+                            # 窗口(同 _spawn_report 注释)。上报体抽成模块级
+                            # _report_whatsapp_once:失败/被取消都回滚 _wa_reported 键
+                            # (CancelledError 是 BaseException,except Exception 接不住),
+                            # 语义离线单测钉死(tests/test_fire_forget_pool.py)。
+                            _spawn_report(
+                                _report_whatsapp_once(
+                                    cp, call_id, _num, _wa_ch, _wa_reported, _key,
+                                    where=room_name,
+                                )
+                            )
                             if _kind == "captured_implicit" or (_num and _num != "offered"):
                                 context_state.set_whatsapp_note(_num)
                             print(f"[whatsapp] {_kind} num={_num or '-'} (call {room_name})", flush=True)
