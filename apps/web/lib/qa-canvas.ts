@@ -44,6 +44,10 @@ export type CanvasEdge = {
 
 export const COL_W = 300;
 export const ROW_H = 150;
+// global（col0）条目的独立 x 泳道间距：col0 与 col1 的 y 基准同为 40（global 节点
+// y=0+40 偏移、step:0 节点 y=40），无独立泳道时两列条目像素级全同重叠——global 列
+// 右移让出独立车道，确定性契约不变（纯常量偏移，同输入同输出）。
+const GLOBAL_COL_GAP = 80;
 
 export function parseTemplateSteps(stepsJson: string): FlowStep[] {
   try {
@@ -106,7 +110,7 @@ export function deriveGraph(
     const rowIdx = cursor.get(col) ?? 0;
     const base = stepNodes.find((n) => n.id === `step:${col === 0 ? "global" : col - 1}`)!.position;
     const pos = opts.positions[String(r.id)] ?? {
-      x: base.x + COL_W + indent,
+      x: base.x + COL_W + indent + (col === 0 ? GLOBAL_COL_GAP : 0),
       y: base.y + rowIdx * (ROW_H - 30) + (col === 0 ? 40 : 0),
     };
     cursor.set(col, rowIdx + 1);
@@ -147,14 +151,19 @@ export function deriveGraph(
 
 /**
  * 连簇校验（spec §4.4）：一层星形；目标是变体→重定向其 head；自连拒绝。
- * 变体重挂自己已挂的 head=幂等成功（headId 仍返回该 head，调用方落库为 no-op）；
- * 主条目挂到自己簇内变体已被 targetHead===fromId 拦截，无需额外的同簇分支
- * （brief 实现草稿的「两条目已在同一簇」分支会误杀幂等重挂，已按测试语义收窄）。
+ * source 侧：已带变体的主条目整类拒绝（H1→H2 / H1→V2 / H1→S 都会令其变体链
+ * V1→H1→H2 变两层）——一层星形是数据不变量，CP 侧零校验后盾，纯函数层把死。
+ * target 侧：主条目挂到自己簇内变体被 targetHead===fromId 拦截。
+ * 变体重挂自己已挂的 head=幂等成功（headId 仍返回该 head，调用方落库为 no-op）。
+ * （brief 实现草稿的「两条目已在同一簇」分支会误杀幂等重挂，已按测试语义收窄。）
  */
 export function resolveClusterTarget(
   rows: QaRow[], fromId: string, toId: string,
 ): { ok: boolean; headId: string; reason: string } {
   if (fromId === toId) return { ok: false, headId: "", reason: "不能连接到自己" };
+  if (rows.some((x) => String(x.cluster_head_id || "") === fromId)) {
+    return { ok: false, headId: "", reason: "主条目已带变体，先解除其变体再挂" };
+  }
   const headOf = (id: string): string => {
     const r = rows.find((x) => String(x.id) === id);
     return String(r?.cluster_head_id || "") || id;
