@@ -1128,6 +1128,9 @@ class SqlAlchemyBusinessRepository:
                 "speaker_zh": "",
                 "speaker_cantonese": "",
                 "speaker_en": "",
+                # MiniMax 云端克隆音色清单（路线 B）：[{voice_id,label,sample_lang,
+                # created_at,activated}] JSON 数组，CP minimax-voices 三端点读写。
+                "minimax_clones_json": "[]",
                 "instruct": "",
                 "sample_rate": 24000,
             },

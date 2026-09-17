@@ -471,6 +471,11 @@ def perform_update(cfg: NodeConfig, version: str, *,
         return "update: empty version"
     if version == cfg.version:
         return f"update: already at {version}"
+    # 与 CP 下载端点同款白名单：version 进 URL 路径前先本地校验（防御性——
+    # 正常 CP 不会发怪版本号，被劫持的指令面也不该能在节点上拼路径）。
+    import re
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", version):
+        return f"update: invalid version {version!r}"
     root = Path(root) if root is not None else ROOT_DIR
     base = cfg.cp_url.rstrip("/")
     import hashlib
