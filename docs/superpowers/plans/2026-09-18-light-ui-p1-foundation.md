@@ -531,6 +531,8 @@ text-*-300/400 → -600/-700；alpha badge 对 → 实色浅底+深字。"
 | `bg-(--accent) … text-(--bg)`（setup:65 下载按钮） | `bg-(--live) … text-white` |
 | `var(--accent, #22d3ee)`（CallStudio:190 波形 stroke） | `var(--live, #0891b2)` |
 | `bg-accent`（dashboard:215 时长条形图**填充**，Task 1 后浅灰隐形） | `bg-live`（图表填充=活信号；轨道保持 `bg-muted/60` 形成对比） |
+| `bg-(--accent)`（interpret-console:1577 src 字幕气泡底） | `bg-(--live-soft)`；同元素 `text-(--accent-ink)` → `text-(--live-ink)`（顺带消化 Task 1 deferred：该行引用已删变量） |
+| campaigns SEGMENTS 待拨段 `bg-muted`（Task 2 映射碰撞：与空轨道不可分辨） | `bg-foreground/10`（深一档中性，与 `bg-muted/60` 轨道拉开） |
 | `text-[#01191c]`（logo 方块字，login:43/StageHeader:100） | `text-white`（方块底色 `bg-(--stage-value)` 已是 cyan-600） |
 
 - [ ] **Step 1: 列出命中并按映射表替换**
