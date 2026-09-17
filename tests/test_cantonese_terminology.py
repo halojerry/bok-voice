@@ -48,6 +48,9 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     "docs/superpowers/plans/2026-09-10-kb-incremental-indexing.md": re.compile(r"yue"),
     "docs/superpowers/plans/2026-09-10-smart-turn-cantonese-spike.md": re.compile(r"yue"),
     "docs/superpowers/plans/2026-09-16-security-remediation.md": re.compile(r"yue"),
+    # qa-canvas phase1 plan（4b0dd6b）：粤语文本识别代码片段的 `_YUE_MARKS` 变量名
+    # （大写，IGNORECASE 才罩得住），决策记录非运行时语言字段——按行豁免，新文件仍全禁。
+    "docs/superpowers/plans/2026-09-17-qa-canvas-phase1.md": re.compile(r"yue", re.IGNORECASE),
     "scripts/probe_smart_turn.py": re.compile(r"yue"),
     # P0 真库烟测做 yue→cantonese 数据迁移演练(铺旧值行验证 build_engine 改写)，
     # 同 deps.py 类：旧拼写是演练夹具非运行时语言字段，按行豁免。
