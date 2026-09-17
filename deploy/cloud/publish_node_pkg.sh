@@ -47,8 +47,13 @@ for rt in "$ARTIFACTS"/runtime-*-"$VERSION".tar.gz; do
   push "$rt.sha256"                     "runtime/$VERSION/$rt_base.sha256"
 done
 # runtime latest 别名（bootstrap 固定拉 runtime/latest/runtime-latest.tar.gz）。
-if ls "$ARTIFACTS"/runtime-*-"$VERSION".tar.gz >/dev/null 2>&1; then
+# 多平台时优先 win（客户机队全 Windows；多 OS 机队并存时再演进按平台别名）。
+if ls "$ARTIFACTS"/runtime-win*-"$VERSION".tar.gz >/dev/null 2>&1; then
+  FIRST_RT="$(ls "$ARTIFACTS"/runtime-win*-"$VERSION".tar.gz | head -1)"
+elif ls "$ARTIFACTS"/runtime-*-"$VERSION".tar.gz >/dev/null 2>&1; then
   FIRST_RT="$(ls "$ARTIFACTS"/runtime-*-"$VERSION".tar.gz | head -1)"
+fi
+if [ -n "${FIRST_RT:-}" ]; then
   push "$FIRST_RT"        "runtime/latest/runtime-latest.tar.gz"
   push "$FIRST_RT.sha256" "runtime/latest/runtime-latest.tar.gz.sha256"
 fi
