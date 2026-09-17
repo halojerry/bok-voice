@@ -48,7 +48,6 @@ import {
   type RoleSlot,
 } from "@/lib/device-roles";
 import {
-  applyOutputDevice,
   listAudioDevicesOf,
   requestMicPermission,
   savedMicDevice,
@@ -675,11 +674,10 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
       // 真实放音在 AudioContext router(元素级 sink 已被 crbug 40647375 废掉,
       // 旧 applyDualOutput→room.switchActiveDevice 是证伪死路径,选了等于没选)。
       // 即刻直投 router,不等 effect 链/连房状态;失败经 onSinkError 浮 UI。
+      // WebKit(Safari/WKWebView)无 ctx.setSinkId → 回退系统默认输出(持久化仅存档)。
       void getRouter("me").setSink(id || "default");
-      // 非 Chromium 壳(WKWebView):ctx.setSinkId 不存在 → 走桌面壳原生系统输出。
-      if (!canDual) void applyOutputDevice(id).catch(() => {});
     },
-    [getRouter, canDual],
+    [getRouter],
   );
   const pickOthMic = useCallback(
     (id: string) => {
@@ -698,9 +696,9 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
     setOthOutId(id);
     saveOutputDevice(id, "other");
     // 同 pickMeOut:直投 ctx router(真实放音路径),不走已证伪的元素级死路径。
+    // WebKit 无 ctx.setSinkId → 回退系统默认输出(持久化仅存档)。
     void getRouter("oth").setSink(id || "default");
-    if (!canDual) void applyOutputDevice(id).catch(() => {});
-  }, [getRouter, canDual]);
+  }, [getRouter]);
 
   // ---- 麦克风开关:按钮只改人工意图,生效值由本 effect 统一投到房间 ----
   // 生效值 = 人工开关 && !自动暂让——暂让结束后按人工意图恢复,人工静音始终优先。

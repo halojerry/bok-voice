@@ -3,13 +3,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, SetupStatus } from "@/lib/api";
 
-type TauriInvoke = (cmd: string, args?: unknown) => Promise<unknown>;
-
-function tauriInvoke(): TauriInvoke | null {
-  if (typeof window === "undefined") return null;
-  return (window as unknown as { __TAURI_INTERNALS__?: { invoke: TauriInvoke } }).__TAURI_INTERNALS__?.invoke ?? null;
-}
-
 export default function SetupPage() {
   const [status, setStatus] = useState<SetupStatus | null>(null);
   const [downloading, setDownloading] = useState(false);
@@ -17,13 +10,7 @@ export default function SetupPage() {
 
   const refresh = useCallback(async () => {
     try {
-      const invoke = tauriInvoke();
-      if (invoke) {
-        const raw = (await invoke("setup_status")) as string;
-        setStatus(JSON.parse(raw) as SetupStatus);
-      } else {
-        setStatus(await api.setupStatus());
-      }
+      setStatus(await api.setupStatus());
     } catch (e) {
       setError(String(e));
     }
@@ -39,12 +26,7 @@ export default function SetupPage() {
     setDownloading(true);
     setError("");
     try {
-      const invoke = tauriInvoke();
-      if (invoke) {
-        await invoke("setup_download");
-      } else {
-        await api.setupDownload();
-      }
+      await api.setupDownload();
     } catch (e) {
       setError(String(e));
       setDownloading(false);
