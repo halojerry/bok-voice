@@ -301,3 +301,4 @@ def _entry_priority(entry: dict) -> int:
 ## Self-Review
 
 - Spec §1 覆盖：列/钳制→T1/T2；排序键+kill→T3；表单/徽标→T4；探针→T5；验收含 Supabase→T6。零变化铁律有专测（`test_match_default_all_identical_to_legacy` + 现有 9 用例零改动）。无占位符。类型一致：`_entry_priority`/`qa_priority_enabled`/`duel_verdicts` 各任务间签名一致。
+- **执行勘误（2026-09-18 inline 执行实录）**：Task 3 Step 3 的胜者循环初版是「选完再过阈」——实测打脸（低分高优先级条目抢走胜者帽后双双落 None）。正确形状=**阈值先行**（`score < thr` 直接 continue，优先级只在过关者中排）+ `top_score` 分离保留未过关时的最高分诊断返回（旧档 `(None, best)` 语义）。夹具同步改诚实形状：同问法平分用优先级破局、垃圾问法（不过阈）永不出线、kill 档回插入序。
