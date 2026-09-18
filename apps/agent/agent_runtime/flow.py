@@ -13,6 +13,8 @@ import json
 import re
 from dataclasses import dataclass, field
 
+from bok_voice_core.flow_graph import FlowGraphDoc, parse_flow_graph
+
 # 客户状态判定结果
 CONFIRM = "confirm"       # 确认/认可当前步 → 可推进下一步
 OBJECTION = "objection"   # 有异议/否认/不配合 → 停留本步应对
@@ -862,6 +864,12 @@ class FlowController:
     # (同一串数字两窗两解,2026-09-07 日志实证),AI 拿到错号从不复核。
     # current_step_text 据此渲染「逐位复述核对」指引。agent.py 钩子每轮写入。
     last_digits: list[str] = field(default_factory=list)
+    # 话术图(2026-09-18 Phase 2):意图节点+绑定边;空图=零变化。from_template
+    # 宽容解析 template["graph_json"](坏 JSON/坏版本→空图,spec §3 校验双轨)。
+    graph: FlowGraphDoc = field(default_factory=FlowGraphDoc)
+    # 本通已成功执行的绑定 id(jump 实际位移 / play_qa 实际播出才记;once 绑定
+    # 依此每通至多一次,spec §4.3)。agent.py graph 块写入。
+    graph_fired: set[str] = field(default_factory=set)
 
     @classmethod
     def from_template(cls, template: dict | None, object_card: dict | None) -> "FlowController":
@@ -869,6 +877,7 @@ class FlowController:
         steps = template_to_steps(template)
         fc = cls(steps=steps)
         fc.vars_map = object_vars(object_card)
+        fc.graph = parse_flow_graph(str((template or {}).get("graph_json") or ""))
         return fc
 
     def __post_init__(self) -> None:
@@ -928,6 +937,18 @@ class FlowController:
         if self.current < len(self.steps):
             self.current += 1
             self._just_advanced = True
+
+    def jump_to(self, idx: int) -> None:
+        """跳到任意步(话术图 jump_step,spec §4.2)。镜像 advance 的副作用包
+        (置 _just_advanced → 【新一步】/底稿首轮重渲染),外加钳制与冻结:
+        closing 后流程不再被图移动;同位跳转 no-op;允许跳到 done(== len(steps))。"""
+        if not self.has_steps or self.closing:
+            return
+        target = max(0, min(int(idx), len(self.steps)))
+        if target == self.current:
+            return
+        self.current = target
+        self._just_advanced = True
 
     def apply_judge_verdict(self, verdict: str) -> None:
         """LLM 语义判定结果落状态(advance→推进;其它唔郁)。"""
