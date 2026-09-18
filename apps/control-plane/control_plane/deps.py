@@ -291,6 +291,14 @@ def build_engine() -> Engine | None:
                     "cluster_head_id",
                     "cluster_head_id VARCHAR(64) DEFAULT ''",
                 )
+                # 匹配优先级(2026-09-18 Phase 3.1):小者先,默认 10;INTEGER NOT
+                # NULL+DEFAULT 10 方言安全,旧库补列即全员默认=零变化。
+                _ensure_column(
+                    conn,
+                    "qa_entries",
+                    "priority",
+                    "priority INTEGER NOT NULL DEFAULT 10",
+                )
                 # 话术图(2026-09-18 Phase 2):模板可选携带意图节点+绑定边 JSON,
                 # ''=未启用(旧库补列即空串,装配零变化)。TEXT+DEFAULT '' 方言安全。
                 _ensure_column(

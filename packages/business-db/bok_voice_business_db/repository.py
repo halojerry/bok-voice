@@ -256,6 +256,7 @@ class SqlAlchemyBusinessRepository:
             "hit_count": int(row.hit_count or 0),
             "source": row.source,
             "cluster_head_id": getattr(row, "cluster_head_id", "") or "",
+            "priority": int(row.priority) if row.priority is not None else 10,
             "template_id": row.template_id,
             "created_at": row.created_at.isoformat() if row.created_at else "",
         }
@@ -289,6 +290,7 @@ class SqlAlchemyBusinessRepository:
             enabled=bool(data.get("enabled", True)),
             source=data.get("source") or "curated",
             cluster_head_id=data.get("cluster_head_id") or "",
+            priority=int(data["priority"]) if data.get("priority") is not None else 10,
             template_id=data.get("template_id") or "",
         )
         self.session.add(row)
@@ -317,6 +319,8 @@ class SqlAlchemyBusinessRepository:
             row.owner_user_id = str(patch["owner_user_id"])
         if "cluster_head_id" in patch and patch["cluster_head_id"] is not None:
             row.cluster_head_id = str(patch["cluster_head_id"])
+        if "priority" in patch and patch["priority"] is not None:
+            row.priority = int(patch["priority"])
         self.session.commit()
         return self._qa_to_dict(row)
 
@@ -1398,6 +1402,7 @@ class InMemoryBusinessRepository:
             "hit_count": int(data.get("hit_count") or 0),
             "source": data.get("source") or "curated",
             "cluster_head_id": data.get("cluster_head_id") or "",
+            "priority": int(data["priority"]) if data.get("priority") is not None else 10,
             "template_id": data.get("template_id") or "",
             "created_at": data.get("created_at") or "",
         }
@@ -1408,7 +1413,7 @@ class InMemoryBusinessRepository:
         row = getattr(self, "qa_entries", {}).get(entry_id)
         if row is None:
             return None
-        for k in ("question_text", "answer_text", "lang", "scope", "step_index", "voice_id", "enabled", "owner_user_id"):
+        for k in ("question_text", "answer_text", "lang", "scope", "step_index", "voice_id", "enabled", "owner_user_id", "priority"):
             if k in patch and patch[k] is not None:
                 row[k] = patch[k]
         if "cluster_head_id" in patch and patch["cluster_head_id"] is not None:

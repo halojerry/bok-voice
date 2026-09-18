@@ -56,6 +56,9 @@ function QaEntryNode({ data }: NodeProps) {
         <span className="rounded-sm bg-muted px-1 text-[10px]">{LANG_LABEL[String(d.lang ?? "zh")] ?? d.lang}</span>
         <span className="rounded-sm bg-muted px-1 text-[10px]">命中 {Number(d.hit_count ?? 0)}</span>
         {d.source && <span className="rounded-sm bg-muted px-1 text-[10px]">{SOURCE_LABEL[d.source] ?? d.source}</span>}
+        {Number(d.priority ?? 10) !== 10 && (
+          <span className="rounded-sm bg-sky-100 px-1 text-[10px] text-sky-700" title="匹配优先级：小者先">P{Number(d.priority ?? 10)}</span>
+        )}
         {d.canned === "missing" && <span className="rounded-sm bg-amber-100 px-1 text-[10px] text-amber-700">缺录音</span>}
         {d.canned === "ok" && <span className="rounded-sm bg-emerald-100 px-1 text-[10px] text-emerald-700">录音✓</span>}
         {d.enabled === false && <span className="rounded-sm bg-muted px-1 text-[10px]">停用</span>}

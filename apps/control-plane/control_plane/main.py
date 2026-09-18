@@ -3449,16 +3449,25 @@ def list_qa_entries(request: Request, account_id: str = "acc-001", enabled: int 
     )
 
 
+def _clamp_priority(value: int | None) -> int:
+    """QA 优先级钳制(Phase 3.1):[0,1000],缺省 10。0 是合法值不回退默认。"""
+    if value is None:
+        return 10
+    return max(0, min(int(value), 1000))
+
+
 @app.post("/api/qa-entries")
 def create_qa_entry(req: QaEntryCreate, request: Request) -> dict:
     _gate_page(request, "qa")
     identity = current_identity(request)
     if identity is not None and identity.role != "root":
         # B3：user 建的自动归自己（body 的 owner 无效）；admin 建默认共享、可显式指派。
-        updates: dict = {"account_id": identity.account_id}
+        updates: dict = {"account_id": identity.account_id, "priority": _clamp_priority(req.priority)}
         if identity.role == "user":
             updates["owner_user_id"] = identity.user_id
         req = req.model_copy(update=updates)
+    else:
+        req = req.model_copy(update={"priority": _clamp_priority(req.priority)})
     row = _repo().create_qa_entry(req.model_dump())
     _audit("qa_entry.create", subject_type="qa_entry", subject_id=row.get("id", ""), account_id=req.account_id,
            detail={"owner_user_id": row.get("owner_user_id", "")})
@@ -3474,6 +3483,8 @@ def update_qa_entry(entry_id: str, req: QaEntryPatch, request: Request) -> dict:
     ident = current_identity(request)
     if ident is not None and ident.role == "user":
         patch.pop("owner_user_id", None)
+    if "priority" in patch:
+        patch["priority"] = _clamp_priority(patch["priority"])
     row = _repo().update_qa_entry(entry_id, patch)
     if row is None:
         from fastapi import HTTPException

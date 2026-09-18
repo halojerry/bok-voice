@@ -374,6 +374,8 @@ class QaEntryCreate(BaseModel):
     owner_user_id: str = ""
     source: str = "curated"
     enabled: bool = True
+    # 匹配优先级(2026-09-18 Phase 3.1):阈值过关者中小者先;默认 10=零变化,CP 落库前钳 [0,1000]。
+    priority: int = 10
 
 
 class QaEntryPatch(BaseModel):
@@ -388,3 +390,4 @@ class QaEntryPatch(BaseModel):
     cluster_head_id: Optional[str] = None
     # 所有权转移只归 admin/root(user 的 patch 由 CP 剥掉)。
     owner_user_id: Optional[str] = None
+    priority: Optional[int] = None

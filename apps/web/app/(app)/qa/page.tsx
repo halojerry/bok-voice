@@ -60,6 +60,8 @@ type QaRow = {
   hit_count?: number;
   /** 同义簇(qa-canvas Phase1):""=独立条目,非空=挂在 head 行之下。 */
   cluster_head_id?: string;
+  /** 匹配优先级(Phase 3.1):小者先,默认 10;≠10 时列表/画布出徽标。 */
+  priority?: number;
   created_at?: string;
 };
 
@@ -72,6 +74,8 @@ type QaForm = {
   step: number;
   voice_id: string;
   enabled: boolean;
+  /** 匹配优先级（Phase 3.1）：小者先，[0,1000]，默认 10。 */
+  priority: string;
 };
 
 const EMPTY_FORM: QaForm = {
@@ -82,6 +86,7 @@ const EMPTY_FORM: QaForm = {
   step: 1,
   voice_id: "",
   enabled: true,
+  priority: "10",
 };
 
 /** step_index → 界面步骤号（-1/未设 = 第 1 步）。 */
@@ -468,6 +473,7 @@ export default function QaPage() {
       step: displayStep(row),
       voice_id: String(row.voice_id ?? ""),
       enabled: row.enabled !== false,
+      priority: String(row.priority ?? 10),
     });
     setFormErr("");
     setOk(false);
@@ -481,6 +487,9 @@ export default function QaPage() {
       return;
     }
     const step = Math.max(1, Math.round(Number(form.step) || 1));
+    // 优先级钳 [0,1000]（CP 同款）；空串/NaN 回默认 10。0 是合法值。
+    const prioRaw = form.priority.trim() === "" ? 10 : Math.round(Number(form.priority));
+    const priority = Number.isFinite(prioRaw) ? Math.max(0, Math.min(prioRaw, 1000)) : 10;
     const payload: Record<string, unknown> = {
       question_text: question,
       answer_text: answer,
@@ -489,6 +498,7 @@ export default function QaPage() {
       step_index: form.scope === "step" ? step - 1 : -1,
       voice_id: form.voice_id.trim(),
       enabled: form.enabled,
+      priority,
     };
     setBusy("save");
     setErr("");
@@ -964,6 +974,7 @@ export default function QaPage() {
                       {" · "}
                       {SCOPE_LABEL[String(row.scope ?? "global")] ?? String(row.scope ?? "global")}
                       {String(row.scope ?? "") === "step" && ` 第 ${displayStep(row)} 步`}
+                      {Number(row.priority ?? 10) !== 10 && ` · P${Number(row.priority ?? 10)}`}
                       {String(row.voice_id ?? "") && ` · 音色 ${String(row.voice_id)}`}
                       {" · "}命中 {Number(row.hit_count ?? 0)} 次
                       {String(row.created_at ?? "") && ` · 创建 ${String(row.created_at).slice(0, 10)}`}
@@ -1074,6 +1085,21 @@ export default function QaPage() {
               onChange={(e) => setForm({ ...form, voice_id: e.target.value })}
               placeholder="留空 = 当前人设音色"
             />
+          </label>
+
+          <label className="block">
+            <span className="text-xs text-muted-foreground">匹配优先级</span>
+            <input
+              type="number"
+              min={0}
+              max={1000}
+              className={`mt-1 ${selectCls}`}
+              value={form.priority}
+              onChange={(e) => setForm({ ...form, priority: e.target.value })}
+            />
+            <span className="mt-1 block text-[11px] leading-relaxed muted">
+              数字越小越优先（0-1000，默认 10）。只在同轮多条命中时决定谁答；不影响匹配阈值。
+            </span>
           </label>
 
           <label className="flex items-center gap-1.5 text-[11px] muted">
