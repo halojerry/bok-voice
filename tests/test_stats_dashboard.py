@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -266,3 +267,77 @@ def test_supervisor_end_stamps_ended_fields(client_with_repo):
     call = repo.get_call(cid)
     assert call["status"] == "ended" and call["disposition"] == "declined"
     assert call["ended_at"] is not None and call["duration_s"] >= 10
+
+
+def _seed_running_campaign(repo, *, object_count: int, redispatch: dict | None = None) -> str:
+    """待办事项测试造数：running 战役 + N 个对象（每对象一条 pending item）。"""
+    obj_ids = [
+        repo.create_object("acc-001", {"display_name": f"T{i}", "phone": f"+8520000000{i}"})["id"]
+        for i in range(object_count)
+    ]
+    camp = repo.create_campaign("acc-001", name="t", template_id="", persona_id="",
+                                language="zh", gap_seconds=0, object_ids=obj_ids)
+    updates: dict = {"status": "running"}
+    if redispatch is not None:
+        # repo 层白名单吃存储键 redispatch_json（dict→JSON 是 API 层
+        # _clean_redispatch 的职责）；直接传 redispatch= 会被白名单静默忽略。
+        updates["redispatch_json"] = json.dumps(redispatch)
+    repo.update_campaign(camp["id"], **updates)
+    return str(camp["id"])
+
+
+def test_dashboard_todo_four_buckets(client_with_repo):
+    """待办事项四桶（2026-09-18 补卡）：首拨待外呼/等重拨/重拨到期/重拨耗尽。
+
+    updated_at 相对实钟造（5min=间隔未走完→waiting；2h=走完→due），分钟级
+    差相对 30min 间隔余量充足，任意时区/任意时刻跑都稳定。
+    """
+    repo = client_with_repo.repo
+    camp_id = _seed_running_campaign(
+        repo, object_count=4,
+        redispatch={"max_attempts": 2, "interval_minutes": 30, "on": ["no_answer"]},
+    )
+    items = repo.list_items(camp_id)
+    repo.update_item(items[1]["id"], attempts=2,
+                     updated_at=(datetime.utcnow() - timedelta(minutes=5)).isoformat())
+    repo.update_item(items[2]["id"], attempts=2,
+                     updated_at=(datetime.utcnow() - timedelta(hours=2)).isoformat())
+    repo.update_item(items[3]["id"], status="no_answer", attempts=2,
+                     updated_at=(datetime.utcnow() - timedelta(hours=3)).isoformat())
+    # items[0] 不动 = 首拨待外呼（attempts=1 pending）。
+
+    r = client_with_repo.client.get("/api/stats/dashboard")
+    assert r.status_code == 200
+    assert r.json()["todo"] == {"to_call": 1, "waiting_redispatch": 1,
+                                "due_redispatch": 1, "exhausted": 1}
+
+
+def test_dashboard_todo_ignores_draft_and_policyless_exhaustion(client_with_repo):
+    """draft 战役不进待办；未配重拨策略时终态失败不判耗尽（无「耗尽」语义）。"""
+    repo = client_with_repo.repo
+    obj = repo.create_object("acc-001", {"display_name": "D", "phone": "+85200000009"})
+    camp = repo.create_campaign("acc-001", name="draft", template_id="", persona_id="",
+                                language="zh", gap_seconds=0, object_ids=[obj["id"]])
+    item = repo.list_items(str(camp["id"]))[0]
+    repo.update_item(item["id"], status="failed", attempts=2)
+
+    r = client_with_repo.client.get("/api/stats/dashboard")
+    assert r.status_code == 200
+    assert r.json()["todo"] == {"to_call": 0, "waiting_redispatch": 0,
+                                "due_redispatch": 0, "exhausted": 0}
+
+
+def test_dashboard_todo_policyless_pending_counts_due(client_with_repo):
+    """未配重拨策略的 attempts>=2 pending：下一轮 tick 就会被拨 → 落 due 桶。"""
+    repo = client_with_repo.repo
+    camp_id = _seed_running_campaign(repo, object_count=1, redispatch=None)
+    item = repo.list_items(camp_id)[0]
+    repo.update_item(item["id"], attempts=2,
+                     updated_at=(datetime.utcnow() - timedelta(minutes=1)).isoformat())
+    # 防空洞：attempts 必须真被 update_item 落库，否则 due 判定是真空绿。
+    assert repo.list_items(camp_id)[0]["attempts"] == 2
+
+    r = client_with_repo.client.get("/api/stats/dashboard")
+    assert r.status_code == 200
+    assert r.json()["todo"] == {"to_call": 0, "waiting_redispatch": 0,
+                                "due_redispatch": 1, "exhausted": 0}

@@ -1376,7 +1376,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
-_YUE_MARKS = re.compile(r"[唔該係嘅咗哋啲冇乜嚟]")
+_CANTO_MARKS = re.compile(r"[唔該係嘅咗哋啲冇乜嚟]")
 
 # 惜客通未搬运字段前缀(外部真字面量,报告列示用)。
 _SKIPPED_PREFIXES = ("AfterAnswer", "Priority", "Trigger", "Interrupt", "LabelId", "Intention", "Force")
@@ -1387,7 +1387,7 @@ def normalize_q(text: str) -> str:
 
 
 def detect_lang(question: str) -> str:
-    return "cantonese" if _YUE_MARKS.search(question or "") else "zh"
+    return "cantonese" if _CANTO_MARKS.search(question or "") else "zh"
 
 
 def plan_import(

@@ -128,6 +128,16 @@ export const api = {
   patchQa: (id: string, body: unknown) =>
     request<Record<string, unknown>>(`/api/qa-entries/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteQa: (id: string) => request<Record<string, unknown>>(`/api/qa-entries/${id}`, { method: "DELETE" }),
+  // 画布罐头面（qa-canvas Phase 1 Task 4）：状态透传 pregen --qa-status（TTL 缓存）；
+  // pregen 手动触发物化（CP 侧 admin/root 闸+审计）；试听=wav 回放流端点，调用方
+  // 直接喂 <audio src>（404=缺料，回退 preview），不经 JSON request。
+  qaCannedStatus: (accountId = "acc-001") =>
+    request<{ available: boolean; statuses: Record<string, { state: "ok" | "missing"; voice: string; key: string }> }>(
+      `/api/qa/canned-status?account_id=${encodeURIComponent(accountId)}`,
+    ),
+  pregenQa: (ids: string[]) =>
+    request<{ status: string }>("/api/qa/pregen", { method: "POST", body: JSON.stringify({ ids }) }),
+  cannedAudioUrl: (id: string) => `${apiBase()}/api/qa/${id}/canned-audio`,
   getSettings: () => request<Record<string, unknown>>("/api/settings"),
   saveSettings: (body: unknown) => request<Record<string, unknown>>("/api/settings", { method: "PUT", body: JSON.stringify(body) }),
   // 电话边缘站点（P1.5）：站点下拉 + 一次性把 SIP 供应商凭据注册成 outbound trunk。

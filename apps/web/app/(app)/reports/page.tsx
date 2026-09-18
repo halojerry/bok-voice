@@ -110,7 +110,7 @@ export default function ReportsPage() {
               ) : (
                 <div className="mt-3 space-y-2">
                   {insights.map((ins, i) => (
-                    <div key={String(ins.id ?? i)} className="rounded-lg bg-white/5 p-3 text-sm">
+                    <div key={String(ins.id ?? i)} className="rounded-lg bg-muted/60 p-3 text-sm">
                       <p>{String(ins.statement ?? "")}</p>
                       <p className="mt-1 text-xs muted">
                         置信度 {String(ins.confidence ?? "-")} · {String(ins.language ?? "zh")}

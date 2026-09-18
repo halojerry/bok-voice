@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -254,6 +255,7 @@ class SqlAlchemyBusinessRepository:
             "enabled": bool(row.enabled),
             "hit_count": int(row.hit_count or 0),
             "source": row.source,
+            "cluster_head_id": getattr(row, "cluster_head_id", "") or "",
             "template_id": row.template_id,
             "created_at": row.created_at.isoformat() if row.created_at else "",
         }
@@ -286,6 +288,7 @@ class SqlAlchemyBusinessRepository:
             voice_id=data.get("voice_id") or "",
             enabled=bool(data.get("enabled", True)),
             source=data.get("source") or "curated",
+            cluster_head_id=data.get("cluster_head_id") or "",
             template_id=data.get("template_id") or "",
         )
         self.session.add(row)
@@ -312,6 +315,8 @@ class SqlAlchemyBusinessRepository:
             row.enabled = bool(patch["enabled"])
         if "owner_user_id" in patch and patch["owner_user_id"] is not None:
             row.owner_user_id = str(patch["owner_user_id"])
+        if "cluster_head_id" in patch and patch["cluster_head_id"] is not None:
+            row.cluster_head_id = str(patch["cluster_head_id"])
         self.session.commit()
         return self._qa_to_dict(row)
 
@@ -320,6 +325,12 @@ class SqlAlchemyBusinessRepository:
         if row is None:
             return False
         self.session.delete(row)
+        # 级联:head 删除后变体的簇指针清空(防孤儿引用,spec §4.1)。
+        self.session.execute(
+            sa_update(models.QaEntry)
+            .where(models.QaEntry.cluster_head_id == entry_id)
+            .values(cluster_head_id="")
+        )
         self.session.commit()
         return True
 
@@ -1385,6 +1396,7 @@ class InMemoryBusinessRepository:
             "enabled": bool(data.get("enabled", True)),
             "hit_count": int(data.get("hit_count") or 0),
             "source": data.get("source") or "curated",
+            "cluster_head_id": data.get("cluster_head_id") or "",
             "template_id": data.get("template_id") or "",
             "created_at": data.get("created_at") or "",
         }
@@ -1398,9 +1410,15 @@ class InMemoryBusinessRepository:
         for k in ("question_text", "answer_text", "lang", "scope", "step_index", "voice_id", "enabled", "owner_user_id"):
             if k in patch and patch[k] is not None:
                 row[k] = patch[k]
+        if "cluster_head_id" in patch and patch["cluster_head_id"] is not None:
+            row["cluster_head_id"] = str(patch["cluster_head_id"])
         return dict(row)
 
     def delete_qa_entry(self, entry_id: str) -> bool:
+        # 级联:head 删除后变体的簇指针清空(防孤儿引用,spec §4.1)。
+        for other in getattr(self, "qa_entries", {}).values():
+            if other.get("cluster_head_id") == entry_id:
+                other["cluster_head_id"] = ""
         return getattr(self, "qa_entries", {}).pop(entry_id, None) is not None
 
     def incr_qa_hit(self, entry_id: str, n: int = 1) -> None:

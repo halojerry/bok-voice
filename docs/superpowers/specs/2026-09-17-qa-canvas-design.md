@@ -99,6 +99,7 @@ archify（tt-a1i/archify）是只读「图表即代码」文档工具，不作�
     （目标自身已是变体 → 改挂其 head 或拒绝，实现取「重挂到目标的 head」）；禁止自连。
   - 条目→步骤节点 = `PATCH {scope:"step", step_index:N-1, template_id:当前模板}`；拖到通用节点 =
     `PATCH {scope:"global", step_index:-1}`。
+  - **勘误（Task 6 裁定，Phase 1）**：`template_id` 写入被裁定 Phase 2（`QaEntryPatch` 无该字段、运行时零消费）——步骤边只落 `scope+step_index`，PATCH 里的 `template_id` 被 CP 静默忽略。
 - **断边**：点选边 → Delete 键或右键「解除」；簇边=清 `cluster_head_id`，步骤边=回 global。
 - **编辑**：单击节点 → 右侧滑出与列表视图同款表单（复用现有 `QaForm` 状态与保存逻辑）；双击空白 = 新建
   （落点处插入，保存后按自动布局归位）；节点右键菜单 = 编辑/启停/删除/试听/重新物化（+manager: 归属转移在侧栏表单）。

@@ -85,7 +85,7 @@ export default function AuditPage() {
           通话
           <input className="rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm" placeholder="call-xxx" value={callId} onChange={(e) => setCallId(e.target.value)} />
         </label>
-        <button className="rounded-lg border border-(--card-border) px-4 py-2 text-sm hover:border-(--accent)" onClick={() => load()}>
+        <button className="rounded-lg border border-(--card-border) px-4 py-2 text-sm hover:border-(--live)" onClick={() => load()}>
           查询
         </button>
       </div>
@@ -108,7 +108,7 @@ export default function AuditPage() {
               {rows.map((r, i) => (
                 <tr key={r.id ?? i} className="border-b border-(--card-border) last:border-0">
                   <td className="px-4 py-2 font-mono text-xs">{r.ts}</td>
-                  <td className="px-4 py-2 font-mono text-xs text-accent">{r.action}</td>
+                  <td className="px-4 py-2 font-mono text-xs text-(--live-ink)">{r.action}</td>
                   <td className="px-4 py-2 text-xs">{r.subject_type}:<span className="font-mono">{r.subject_id}</span></td>
                   <td className="px-4 py-2 font-mono text-xs">{r.account_id || "—"} / {r.call_id || "—"}</td>
                   <td className="px-4 py-2 text-xs">{r.actor}</td>

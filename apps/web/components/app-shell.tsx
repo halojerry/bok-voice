@@ -2,8 +2,14 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useRef, useState } from "react";
+import { AlertCircle, Inbox } from "lucide-react";
 import { AccountProvider, useAccount } from "@/components/account-context";
-import { StageHeader, gateForPath } from "@/components/StageHeader";
+import { Sidebar } from "@/components/layout/sidebar";
+import { Topbar } from "@/components/layout/topbar";
+import { Skeleton } from "@/components/ui/skeleton";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { gateForPath } from "@/lib/navigation";
 import {
   SessionProvider,
   hasPage,
@@ -15,10 +21,10 @@ import { friendlyErrorText } from "@/lib/api-ready";
 function StatusBadge() {
   const { health, settingsLoading } = useAccount();
   if (settingsLoading) return <span className="font-mono">loading</span>;
-  if (health === false) return <span className="text-xs text-red-300">控制面离线</span>;
+  if (health === false) return <span className="text-xs text-red-600">控制面离线</span>;
   return (
-    <span className="hidden items-center gap-2 text-xs text-(--stage-muted) sm:inline-flex">
-      <span className="h-2 w-2 rounded-full bg-(--stage-value)" />
+    <span className="hidden items-center gap-2 text-xs text-muted-foreground sm:inline-flex">
+      <span className="h-2 w-2 rounded-full bg-(--live)" />
       <span className="font-mono">v0.1.0</span>
     </span>
   );
@@ -27,7 +33,7 @@ function StatusBadge() {
 /** 会话加载中的轻量占位：不渲染导航，避免权限面闪跳。 */
 function SessionLoading() {
   return (
-    <div className="stage-shell flex min-h-screen w-full items-center justify-center">
+    <div className="flex min-h-screen w-full items-center justify-center bg-background">
       <p className="text-sm muted">正在加载会话…</p>
     </div>
   );
@@ -69,35 +75,78 @@ function RouteGuard({ children }: { children: React.ReactNode }) {
 }
 
 export function AppShell({ children }: { children: React.ReactNode }) {
+  // 移动端导航抽屉开关：壳持有（Task 2 契约），Sidebar 受控、Topbar 汉堡触发。
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  // 汉堡按钮 ref：抽屉（dialog）关闭后 Sidebar 把焦点还到打开者。
+  const mobileTriggerRef = useRef<HTMLButtonElement | null>(null);
   // 会话在最外层：AccountProvider（账号归属）与导航/守卫都读 SessionProvider。
   return (
     <SessionProvider>
       <SessionReady>
         <AccountProvider>
-          <div className="stage-shell min-h-screen w-full">
-            <StageHeader status={<StatusBadge />} />
-            <main className="mx-auto w-full max-w-7xl px-6 pb-10 pt-2 lg:px-10">
-              <RouteGuard>{children}</RouteGuard>
-            </main>
-          </div>
+          {/* TooltipProvider 全站单例：折叠态导航 Tooltip 等都在此伞下。 */}
+          <TooltipProvider>
+            <div className="flex min-h-screen w-full bg-background">
+              <Sidebar
+                mobileOpen={mobileNavOpen}
+                onMobileClose={() => setMobileNavOpen(false)}
+                mobileTriggerRef={mobileTriggerRef}
+              />
+              <div className="flex min-w-0 flex-1 flex-col">
+                <Topbar
+                  onMobileOpen={() => setMobileNavOpen(true)}
+                  mobileTriggerRef={mobileTriggerRef}
+                  status={<StatusBadge />}
+                />
+                <main className="mx-auto w-full max-w-6xl flex-1 px-6 pb-12 pt-6 lg:px-8">
+                  <RouteGuard>{children}</RouteGuard>
+                </main>
+              </div>
+            </div>
+          </TooltipProvider>
         </AccountProvider>
       </SessionReady>
     </SessionProvider>
   );
 }
 
-export function LoadingState({ label = "加载中…" }: { label?: string }) {
-  return <p className="text-sm muted">{label}</p>;
+/** 加载态：Skeleton 骨架行 + 原文案（P4 浅色改版；文案一字不动，只换视觉）。 */
+export function LoadingState({
+  label = "加载中…",
+  skeletonLines = 3,
+}: {
+  label?: string;
+  skeletonLines?: number;
+}) {
+  const lines = Math.max(1, skeletonLines);
+  return (
+    <div className="space-y-2" role="status">
+      <div aria-hidden="true" className="space-y-2">
+        {Array.from({ length: lines }, (_, i) => (
+          <Skeleton key={i} className={i === lines - 1 ? "h-4 w-2/3" : "h-4 w-full"} />
+        ))}
+      </div>
+      <p className="text-sm muted">{label}</p>
+    </div>
+  );
 }
 
+/** 空态：lucide 图标 + 原文案（文案一字不动）。 */
 export function EmptyState({ label = "暂无数据" }: { label?: string }) {
-  return <p className="text-sm muted">{label}</p>;
+  return (
+    <div className="flex flex-col items-center gap-2 py-10 text-muted-foreground">
+      <Inbox className="h-8 w-8" aria-hidden="true" />
+      <p className="text-sm muted">{label}</p>
+    </div>
+  );
 }
 
+/** 错误态：lucide 图标 + 友好文案；红底红字样式保留。 */
 export function ErrorState({ message }: { message: string }) {
   return (
-    <p className="rounded-lg bg-red-500/10 p-3 text-sm text-red-300">
-      {friendlyErrorText(message)}
-    </p>
+    <div className="flex items-start gap-2 rounded-lg bg-red-500/10 p-3 text-sm text-red-600">
+      <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+      <p>{friendlyErrorText(message)}</p>
+    </div>
   );
 }

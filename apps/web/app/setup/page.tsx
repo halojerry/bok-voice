@@ -41,12 +41,12 @@ export default function SetupPage() {
       <div className="w-full rounded-2xl border border-(--card-border) bg-(--card) p-6">
         <h1 className="mb-2 text-2xl font-semibold">首次设置</h1>
         <p className="mb-4 text-sm muted">正在检查本机模型。所需模型约 13GB，仅在缺失时下载。</p>
-        {error && <p className="mb-4 text-sm text-red-300">{error}</p>}
+        {error && <p className="mb-4 text-sm text-red-600">{error}</p>}
         {!status && !error && <p className="text-sm muted">读取模型状态…</p>}
         {status && (
           <>
             <div className="mb-4 flex items-center gap-2 text-sm">
-              <span className={status.ready ? "text-emerald-400" : "text-amber-400"}>
+              <span className={status.ready ? "text-emerald-600" : "text-amber-700"}>
                 {status.ready ? "已就绪" : `已就绪 ${present}/${total}`}
               </span>
               {downloading && <span className="muted">下载中…</span>}
@@ -56,13 +56,13 @@ export default function SetupPage() {
                 <li key={m.name} className="flex items-center justify-between rounded-lg border border-(--card-border) px-3 py-2 text-xs">
                   <span className="font-mono">{m.name}</span>
                   <span className="muted">{m.repo}</span>
-                  <span className={m.present ? "text-emerald-400" : "text-rose-400"}>{m.present ? "已就绪" : "待下载"}</span>
+                  <span className={m.present ? "text-emerald-600" : "text-red-600"}>{m.present ? "已就绪" : "待下载"}</span>
                 </li>
               ))}
             </ul>
             {!status.ready && (
               <button
-                className="rounded-lg bg-(--accent) px-4 py-2 text-sm font-semibold text-(--bg) disabled:opacity-50"
+                className="rounded-lg bg-(--live) px-4 py-2 text-sm font-semibold text-white disabled:opacity-50"
                 disabled={downloading}
                 onClick={() => startDownload()}
               >

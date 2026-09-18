@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
+import { ArrowRight, Plus } from "lucide-react";
 import { api } from "@/lib/api";
 import { AppShell, ErrorState, LoadingState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
@@ -61,6 +62,14 @@ const WHATSAPP_LABELS: Record<string, string> = {
   handled: "已对接",
 };
 
+// 待办事项（2026-09-18 用户补卡）：运行中战役四桶账；契约外未知键原样显示。
+const TODO_LABELS: Record<string, string> = {
+  to_call: "待外呼",
+  waiting_redispatch: "等重拨（间隔中）",
+  due_redispatch: "重拨到期",
+  exhausted: "重拨耗尽 · 需人工",
+};
+
 // 时长分布五桶固定顺序（后端契约键名）；契约外未知键追加在尾部。
 const DURATION_BUCKET_ORDER = ["0-15", "15-30", "30-60", "60-90", "90+"];
 
@@ -93,7 +102,7 @@ function TagTable({
             {rows.map(([key, count]) => (
               <tr key={key} className="border-t border-(--card-border) first:border-t-0">
                 <td className="py-1.5">{labels[key] ?? key}</td>
-                <td className="py-1.5 text-right muted">{count}</td>
+                <td className="py-1.5 text-right text-(--live-ink)">{count}</td>
               </tr>
             ))}
           </tbody>
@@ -163,6 +172,7 @@ function DashboardContent() {
   const tags = asRecord(stats?.tags);
   const disposition = asCountMap(tags?.disposition);
   const whatsapp = asCountMap(tags?.whatsapp);
+  const todo = asCountMap(stats?.todo);
   const tagsTotal = tags
     ? disposition.reduce((sum, [, n]) => sum + n, 0) + whatsapp.reduce((sum, [, n]) => sum + n, 0)
     : null;
@@ -199,7 +209,7 @@ function DashboardContent() {
             {kpis.map(([k, v, sub]) => (
               <div key={k} className="card">
                 <p className="label">{k}</p>
-                <p className="mt-2 text-2xl font-semibold">{v}</p>
+                <p className="mt-2 text-2xl font-semibold text-(--live-ink)">{v}</p>
                 {sub && <p className="mt-1 text-xs muted">{sub}</p>}
               </div>
             ))}
@@ -212,9 +222,9 @@ function DashboardContent() {
               <div className="mt-3 space-y-2.5">
                 {buckets.map(([name, count]) => (
                   <div key={name} className="flex items-center gap-3">
-                    <div className="h-2 flex-1 rounded bg-white/5">
+                    <div className="h-2 flex-1 rounded bg-muted">
                       <div
-                        className="h-2 rounded bg-accent"
+                        className="h-2 rounded bg-live"
                         style={{ width: `${Math.round((count / maxBucket) * 100)}%` }}
                       />
                     </div>
@@ -245,8 +255,8 @@ function DashboardContent() {
                       <tr key={String(a.user_id ?? i)} className="border-t border-(--card-border)">
                         <td className="py-1.5 muted">{i + 1}</td>
                         <td className="py-1.5">{String(a.name || a.user_id || "—")}</td>
-                        <td className="py-1.5">{fmtCount(a.calls)}</td>
-                        <td className="py-1.5">{fmtCount(a.answered)}</td>
+                        <td className="py-1.5 text-(--live-ink)">{fmtCount(a.calls)}</td>
+                        <td className="py-1.5 text-(--live-ink)">{fmtCount(a.answered)}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -256,6 +266,14 @@ function DashboardContent() {
               )}
             </section>
           </div>
+
+          {/* 待办事项：运行中战役的待外呼/重拨/耗尽四桶（2026-09-18 用户补卡） */}
+          <section className="card mt-6">
+            <span className="label">待办事项</span>
+            <div className="mt-3">
+              <TagTable title="运行中战役" rows={todo} labels={TODO_LABELS} />
+            </div>
+          </section>
 
           {/* 标记统计：通话结果 / WhatsApp 双表 */}
           <section className="card mt-6">
@@ -270,7 +288,7 @@ function DashboardContent() {
             <section className="card">
               <div className="flex items-center justify-between">
                 <span className="label">最近会话</span>
-                <Link href="/calls" className="text-xs text-accent">查看全部 →</Link>
+                <Link href="/calls" className="text-xs text-(--live)">查看全部 <ArrowRight className="h-3.5 w-3.5" /></Link>
               </div>
               <div className="mt-3 space-y-2">
                 {calls.slice(0, 6).map((call) => (
@@ -279,7 +297,7 @@ function DashboardContent() {
                     // 静态导出无法为真实 call id 生成 /calls/<id> 路由：统一去 /calls 列表，
                     // 在列表里点「进入」会内嵌工作台打开该会话。
                     href="/calls"
-                    className="flex items-center justify-between rounded-lg bg-white/5 px-4 py-3 hover:bg-white/10"
+                    className="flex items-center justify-between rounded-lg bg-muted/60 px-4 py-3 hover:bg-accent"
                   >
                     <div className="min-w-0">
                       <p className="truncate text-sm font-medium">{String(call.object_id ?? "-")}</p>
@@ -287,7 +305,7 @@ function DashboardContent() {
                         {String(call.status ?? "-")} · {String(call.mode ?? "-")} · {String(call.language ?? "-")}
                       </p>
                     </div>
-                    <span className="text-accent">查看 →</span>
+                    <span className="text-(--live)">查看 <ArrowRight className="h-3.5 w-3.5" /></span>
                   </Link>
                 ))}
                 {calls.length === 0 && <p className="text-sm muted">暂无会话，从「新建通话」开始。</p>}
@@ -297,13 +315,13 @@ function DashboardContent() {
             <section className="card">
               <span className="label">快捷入口</span>
               <div className="mt-3 grid grid-cols-1 gap-2">
-                <Link href="/calls/new" className="btn-primary w-full">+ 新建通话</Link>
+                <Link href="/calls/new" className="btn-primary w-full"><Plus className="h-3.5 w-3.5" /> 新建通话</Link>
                 <Link href="/objects" className="btn-ghost w-full">对象管理</Link>
                 <Link href="/knowledge" className="btn-ghost w-full">知识库</Link>
                 <Link href="/supervisor" className="btn-ghost w-full">主管台</Link>
                 <Link href="/settings" className="btn-ghost w-full">设置</Link>
               </div>
-              <div className="mt-4 rounded-lg bg-white/5 p-3 text-xs muted">
+              <div className="mt-4 rounded-lg bg-muted/60 p-3 text-xs muted">
                 控制面状态：{health === false ? "离线" : health === true ? "在线" : "未知"}
               </div>
             </section>

@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { Check } from "lucide-react";
 import { api } from "@/lib/api";
 import { friendlyErrorText } from "@/lib/api-ready";
 import { useAccount } from "@/components/account-context";
@@ -220,17 +221,17 @@ export default function SupervisorPage() {
 
       <div className="mb-6 flex flex-wrap gap-3 text-sm">
         <span className="card px-4 py-2">
-          进行中 <b className="text-(--stage-value)">{activeCount}</b>
+          进行中 <b className="text-(--live)">{activeCount}</b>
         </span>
         <span className="card px-4 py-2">
-          已暂停 <b className={pausedCount ? "text-amber-400" : "muted"}>{pausedCount}</b>
+          已暂停 <b className={pausedCount ? "text-amber-700" : "muted"}>{pausedCount}</b>
         </span>
         <span className="card px-4 py-2">
-          WhatsApp 待对接 <b className={pending.length ? "text-accent" : "muted"}>{pending.length}</b>
+          WhatsApp 待对接 <b className={pending.length ? "text-(--live)" : "muted"}>{pending.length}</b>
         </span>
       </div>
 
-      {err && <p className="mb-4 rounded-lg bg-red-500/10 p-3 text-sm text-red-300">{err}</p>}
+      {err && <p className="mb-4 rounded-lg bg-red-500/10 p-3 text-sm text-red-600">{err}</p>}
 
       {listenId && (
         <div className="mb-6">
@@ -251,12 +252,12 @@ export default function SupervisorPage() {
             const num = waNum(c);
             const isCaptured = st === "captured";
             return (
-              <div key={`banner-${id}`} className="wa-flash rounded-lg border border-(--accent) bg-(--card) p-4">
+              <div key={`banner-${id}`} className="wa-flash rounded-lg border border-(--live) bg-(--card) p-4">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div className="min-w-0">
-                    <p className="text-sm font-semibold text-accent">
+                    <p className="text-sm font-semibold text-(--live)">
                       📱 WhatsApp 待对接
-                      <span className="ml-2 rounded-sm bg-(--accent)/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider">
+                      <span className="ml-2 rounded-sm bg-(--live-soft) px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-(--live-ink)">
                         {isCaptured ? "已拿到号码" : "客户已应承加"}
                       </span>
                     </p>
@@ -266,7 +267,7 @@ export default function SupervisorPage() {
                     {isCaptured && num ? (
                       <p className="mt-0.5 font-mono text-lg tracking-wider text-(--foreground)">
                         {num}
-                        {copied === num && <span className="ml-2 text-xs text-emerald-400">已复制 ✓</span>}
+                        {copied === num && <span className="ml-2 text-xs text-emerald-600">已复制 <Check className="h-3.5 w-3.5" /></span>}
                       </p>
                     ) : (
                       <p className="mt-0.5 text-xs muted">客户应承咗加专员,等紧佢俾号码 / 由专员主动联系。</p>
@@ -309,13 +310,13 @@ export default function SupervisorPage() {
               const lastLine = lastCustomerLine(turns[id]);
               const isBusy = busy.startsWith(`${id}:`);
               return (
-                <div key={id} className={`rounded-lg p-4 ${waPending ? "wa-flash bg-white/5" : "bg-white/5"}`}>
+                <div key={id} className={`rounded-lg p-4 ${waPending ? "wa-flash bg-muted/60" : "bg-muted/60"}`}>
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
                       <p className="truncate font-medium">
                         {labelOf(c)}
                         {waPending && (
-                          <span className="ml-2 rounded-sm bg-(--accent)/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-accent">
+                          <span className="ml-2 rounded-sm bg-(--live-soft) px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-(--live-ink)">
                             WhatsApp {wa === "captured" && waNum(c) ? waNum(c) : "待对接"}
                           </span>
                         )}
@@ -330,10 +331,10 @@ export default function SupervisorPage() {
                     </div>
                     <span
                       className={`inline-flex shrink-0 items-center gap-1.5 text-xs ${
-                        paused ? "text-amber-400" : "text-emerald-400"
+                        paused ? "text-amber-700" : "text-emerald-600"
                       }`}
                     >
-                      <span className={`h-2 w-2 rounded-full animate-pulse ${paused ? "bg-amber-400" : "bg-emerald-400"}`} />
+                      <span className={`h-2 w-2 rounded-full animate-pulse ${paused ? "bg-amber-400" : "bg-emerald-500"}`} />
                       {paused ? "AI 已暂停" : "进行中"}
                     </span>
                   </div>
@@ -370,13 +371,13 @@ export default function SupervisorPage() {
                       转人工
                     </button>
                     <button
-                      className="btn-ghost text-xs text-red-300/80 hover:text-red-300"
+                      className="btn-ghost text-xs text-red-600/80 hover:text-red-600"
                       disabled={isBusy}
                       onClick={() => confirmAct(c, "hangup", api.hangup, `确认挂断「${labelOf(c)}」？通话将结束并触发结算。`)}
                     >
                       挂断
                     </button>
-                    <Link href={`/calls?call=${encodeURIComponent(id)}`} className="btn-ghost text-xs text-accent">
+                    <Link href={`/calls?call=${encodeURIComponent(id)}`} className="btn-ghost text-xs text-(--live)">
                       进入工作台
                     </Link>
                   </div>

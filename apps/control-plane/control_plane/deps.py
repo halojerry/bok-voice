@@ -283,6 +283,14 @@ def build_engine() -> Engine | None:
                 # 带 DEFAULT 合法）。
                 _ensure_column(conn, "global_settings", "campaign_json",
                                "campaign_json TEXT NOT NULL DEFAULT ''")
+                # 同义簇(qa-canvas Phase1,spec 2026-09-17):qa_entries 变体指向
+                # 簇头条目——''=独立条目/簇头本体,非空=本条是指向条目的变体。
+                _ensure_column(
+                    conn,
+                    "qa_entries",
+                    "cluster_head_id",
+                    "cluster_head_id VARCHAR(64) DEFAULT ''",
+                )
                 # 节点鉴权(P1,深测): (license_id, fingerprint) 部分唯一索引——多实例
                 # 部署下配额竞态的库级兜底(进程内由 NodeStore.register_licensed 的
                 # 锁收口)。只约束 license 绑定行:开放模式存量空值行不受影响。

@@ -2,14 +2,16 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { ArrowRight, Plus } from "lucide-react";
 import { api } from "@/lib/api";
 import { useAccount } from "@/components/account-context";
 import { CallStudio } from "@/components/CallStudio";
+import { LoadingState } from "@/components/app-shell";
 
 const STATUS: Record<string, [string, string]> = {
-  active: ["进行中", "bg-emerald-400"],
+  active: ["进行中", "bg-emerald-500"],
   ringing: ["振铃", "bg-amber-400"],
-  paused: ["已暂停", "bg-sky-400"],
+  paused: ["已暂停", "bg-blue-400"],
   ended: ["已结束", "bg-neutral-500"],
   failed: ["失败", "bg-red-400"],
 };
@@ -135,13 +137,13 @@ export default function CallsPage() {
             {clearing ? "清理中…" : "清空已结束历史"}
           </button>
           <Link href="/calls/new" className="btn-primary">
-            + 新建通话
+            <Plus className="h-3.5 w-3.5" /> 新建通话
           </Link>
         </div>
       </div>
 
-      {err && <p className="mb-4 text-sm text-red-300">{err}</p>}
-      {loading && <p className="text-sm muted">加载中…</p>}
+      {err && <p className="mb-4 text-sm text-red-600">{err}</p>}
+      {loading && <LoadingState />}
 
       {openId && (
         <section className="mb-6">
@@ -172,7 +174,7 @@ export default function CallsPage() {
               <p className="px-2 text-xs muted">
                 共 {rows.length} 通 · 按最新优先显示 {visibleRows.length} 通
                 {sortedRows.length > visibleRows.length && (
-                  <button className="ml-2 text-accent" onClick={() => setLimit((v) => v + 100)}>
+                  <button className="ml-2 text-(--live)" onClick={() => setLimit((v) => v + 100)}>
                     显示更多
                   </button>
                 )}
@@ -189,8 +191,8 @@ export default function CallsPage() {
               return (
                 <div
                   key={id}
-                  className={`flex items-center justify-between gap-2 rounded-lg px-2 py-1 transition hover:bg-white/10 ${
-                    waPending ? "wa-flash bg-white/5" : "bg-white/5"
+                  className={`flex items-center justify-between gap-2 rounded-lg px-2 py-1 transition hover:bg-accent ${
+                    waPending ? "wa-flash bg-muted/60" : "bg-muted/60"
                   }`}
                 >
                   <button
@@ -202,7 +204,7 @@ export default function CallsPage() {
                       <p className="truncate font-medium">
                         {objectName(c.object_id)}
                         {waPending && (
-                          <span className="ml-2 rounded-sm bg-(--accent)/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-accent">
+                          <span className="ml-2 rounded-sm bg-(--live-soft) px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-(--live-ink)">
                             WhatsApp {wa === "captured" && waNum ? waNum : "待对接"}
                           </span>
                         )}
@@ -226,11 +228,11 @@ export default function CallsPage() {
                         <span className={`h-2 w-2 rounded-full ${color}`} />
                         {label}
                       </span>
-                      <span className="text-accent">进入 →</span>
+                      <span className="text-(--live)">进入 <ArrowRight className="h-3.5 w-3.5" /></span>
                     </div>
                   </button>
                   <button
-                    className="btn-ghost shrink-0 text-xs text-red-300/80 hover:text-red-300"
+                    className="btn-ghost shrink-0 text-xs text-red-600/80 hover:text-red-600"
                     onClick={() => removeOne(id)}
                     title="删除该通话记录"
                   >
@@ -239,7 +241,7 @@ export default function CallsPage() {
                   {status === "ended" && String(c.object_id ?? "") && (
                     <Link
                       href={`/calls/new?object=${encodeURIComponent(String(c.object_id))}`}
-                      className="btn-ghost shrink-0 text-xs text-accent"
+                      className="btn-ghost shrink-0 text-xs text-(--live)"
                       title="用同一对象发起新通话（工作台预选该对象）"
                     >
                       再拨

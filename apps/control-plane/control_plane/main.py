@@ -36,12 +36,19 @@ from bok_voice_obs.context import get_correlation
 from bok_voice_obs.logging import configure_logging, get_logger
 from bok_voice_obs.middleware import CorrelationMiddleware
 
-from .campaign import parse_call_windows, redispatch_harvest_updates, _utcnow_naive
+from .campaign import (
+    parse_call_windows,
+    redispatch_due,
+    redispatch_harvest_updates,
+    redispatch_policy,
+    _utcnow_naive,
+)
 from .deps import build_engine, build_repository, build_session_factory
 from .dispatch_utils import cleanup_dispatch, has_active_dispatch
 from .nodes_store import HEARTBEAT_INTERVAL_S, LicenseError, NodeStore
 from .permissions import GRANTABLE_PERMISSIONS, PAGE_PERMISSIONS, effective_permissions
 from .pregen import persona_pregen_status
+from . import pregen as pregen_mod
 from .auth import (
     Identity,
     JWT_TTL_S,
@@ -3397,6 +3404,57 @@ def hit_qa_entry(entry_id: str, request: Request) -> dict:
     return {"id": entry_id}
 
 
+# ---- 罐头状态面(2026-09-17 qa-canvas Phase 1 Task 3) ----
+
+
+@app.get("/api/qa/canned-status")
+def qa_canned_status_ep(request: Request, account_id: str = "acc-001") -> dict:
+    """QA 条目罐头物化状态(透传 pregen_tts --qa-status,TTL 缓存;画布状态面用)。"""
+    _gate_page(request, "qa")
+    scoped_account(request, account_id)
+    out = pregen_mod.qa_canned_status(str(request.base_url).rstrip("/"))
+    return {
+        "available": out["available"],
+        "statuses": out["statuses"],
+        "generated_at": out["generated_at"],
+    }
+
+
+@app.get("/api/qa/{entry_id}/canned-audio")
+def qa_canned_audio(entry_id: str, request: Request) -> Response:
+    """试听=罐头缓存回放,零云费,qa 页面权限即可;404=缺料(前端回退 preview,烧云归 admin)。"""
+    _gate_page(request, "qa")
+    deny_cross_account(request, _repo().get_qa_entry(entry_id))
+    out = pregen_mod.qa_canned_status(str(request.base_url).rstrip("/"))
+    info = (out.get("statuses") or {}).get(entry_id) or {}
+    key = str(info.get("key") or "")
+    if info.get("state") != "ok" or not re.fullmatch(r"[0-9a-f]{40}", key):
+        raise HTTPException(status_code=404, detail="canned audio not materialized")
+    try:
+        pcm = (pregen_mod.cache_root() / f"{key}.pcm").read_bytes()
+    except OSError:
+        # 缓存被逐出/目录漂移=罐头缺料,按 404 交前端回退,不当 500。
+        raise HTTPException(status_code=404, detail="canned audio not materialized")
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(24000)
+        w.writeframes(pcm)
+    return Response(content=buf.getvalue(), media_type="audio/wav")
+
+
+@app.post("/api/qa/pregen")
+def qa_pregen_ep(payload: dict, request: Request) -> dict:
+    """手动触发 --qa 物化(可限 ids);烧云配额操作,与 /api/tts/preview 同闸同审计。"""
+    require_role(request, "admin", "root")
+    ids = [str(x) for x in (payload.get("ids") or [])]
+    out = pregen_mod.qa_pregen_spawn(str(request.base_url).rstrip("/"), ids)
+    _audit("qa.pregen", subject_type="qa_entry", subject_id=",".join(ids)[:128],
+           detail={"count": len(ids), "status": out.get("status")})
+    return out
+
+
 # ---- 垫话罐头库(2026-09-13 乙节):确定性语境命中,镜像 qa_entries ----
 
 
@@ -3682,6 +3740,42 @@ def _local_midnight_utc_boundary() -> datetime:
     return midnight_local.astimezone(timezone.utc).replace(tzinfo=None)
 
 
+_TODO_FAIL_STATUSES = ("no_answer", "rejected", "failed")
+
+
+def _dashboard_todo(repo, now: datetime | None = None) -> dict:
+    """待办事项（2026-09-18 用户补卡）：运行中战役的「接下来要处理什么」四桶账。
+
+    - to_call: 首拨待外呼（pending 且 attempts<=1）——排期内该拨的名单量；
+    - waiting_redispatch: 已拨过、在等重拨间隔走完（redispatch_due=True=未到期）；
+    - due_redispatch: 间隔已到、下一轮 campaign_tick 即拨（redispatch_due=False；
+      未配重拨策略的 attempts>=2 pending 也落这桶——机制上它下一轮就会被拨）；
+    - exhausted: 重拨预算打满仍终态失败（no_answer/rejected/failed 且
+      attempts>=max_attempts）——转人工跟进。
+
+    非运行中战役不进待办（draft/paused/done 都不是「接下来」）。now 注入同
+    campaign_tick 语义（UTC naive），测试钉钟用。
+    """
+    to_call = waiting = due = exhausted = 0
+    for campaign in repo.list_campaigns("", status="running"):
+        max_attempts = int(redispatch_policy(campaign)["max_attempts"])
+        for item in repo.list_items(str(campaign["id"])):
+            status = str(item.get("status") or "")
+            attempts = int(item.get("attempts") or 1)
+            if status == "pending":
+                if attempts <= 1:
+                    to_call += 1
+                elif redispatch_due(item, campaign, now):
+                    waiting += 1
+                else:
+                    due += 1
+            elif (status in _TODO_FAIL_STATUSES and max_attempts > 0
+                  and attempts >= max_attempts):
+                exhausted += 1
+    return {"to_call": to_call, "waiting_redispatch": waiting,
+            "due_redispatch": due, "exhausted": exhausted}
+
+
 @app.get("/api/stats/dashboard")
 def stats_dashboard(request: Request, account_id: str = "acc-001") -> dict:
     """工作台仪表盘单端点（2026-09-17）。口径见 plan Task 5；P0 全量 Python 聚合。
@@ -3744,6 +3838,7 @@ def stats_dashboard(request: Request, account_id: str = "acc-001") -> dict:
         "duration_buckets": buckets,
         "agents": sorted(by_agent.values(), key=lambda a: (-a["calls"], a["user_id"]))[:8],
         "tags": {"disposition": disposition_counts, "whatsapp": whatsapp_counts},
+        "todo": _dashboard_todo(_repo()),
     }
 
 
