@@ -3841,13 +3841,18 @@ async def entrypoint(ctx):
                     # 由 format_qa_summary 求差)。
                     _qa_bump("match0" if _qa_entry is None else "hit")
                     if _qa_entry is not None:
-                        # 多答案轮换(Phase 3.2 spec §2):match 胜者已折组到簇头 →
-                        # 簇内按「本通最少播放」取出场成员,用它自己的 answer/PCM 播
-                        # (qa_hit 记实际播出嘅 member id);首员无 PCM 沿轮换序下移,
-                        # 全组无 PCM 才落 no_audio 走 LLM。无簇/单成员/kill-switch=0
-                        # → members 空 → _qa_play 恒 [_qa_entry],逐字节原路(台账照记)。
+                        # 多答案轮换(Phase 3.2 spec §2):match 胜者已折组到簇内首个
+                        # 幸存成员(按本通 lang/step 过滤,C1)→ 簇内按「本通最少播放」
+                        # 取出场成员,用它自己的 answer/PCM 播(qa_hit 记实际播出嘅
+                        # member id);首员无 PCM 沿轮换序下移,全组无 PCM 才落
+                        # no_audio 走 LLM。无簇/单成员/kill-switch=0 → members 空 →
+                        # _qa_play 恒 [_qa_entry],逐字节原路(台账照记)。
                         _qa_members = (
-                            _qa_index.cluster_members(str(_qa_entry.get("id") or ""))
+                            _qa_index.cluster_members(
+                                str(_qa_entry.get("id") or ""),
+                                lang=language_state.lang,
+                                step_index=(flow_ctrl.current if flow_ctrl.has_steps else None),
+                            )
                             if qa_rotation_enabled()
                             else []
                         )
@@ -3862,7 +3867,7 @@ async def entrypoint(ctx):
                                 if _qa_rotating:
                                     print(
                                         f"QA_FASTPATH rotation_skip entry={_qa_member.get('id')} "
-                                        f"reason=no_audio",
+                                        "reason=no_audio",
                                         flush=True,
                                     )
                                 continue

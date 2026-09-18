@@ -183,6 +183,71 @@ def test_no_clusters_rotation_on_off_identical(monkeypatch):
     assert on == off
 
 
+# ---- C1(终审 Critical):折组/轮换必须遵守 match 的 lang/scope 过滤 ----
+
+def test_fold_and_rotation_obey_step_scope(monkeypatch):
+    """C1(a) 跨 scope:head(global)+变体(scope=step,step_index=3)。
+
+    第 5 步时变体必须被滤出折组/轮换池(否则第 3 步答案在第 5 步播);
+    第 3 步才纳入。无步骤上下文(过滤档 step_index=None)=步作用域成员滤出。
+    """
+    monkeypatch.delenv("BOK_QA_ROTATION", raising=False)
+    from agent_runtime.qa_gate import QaIndex
+
+    idx = QaIndex([
+        _e("head", "怎么退款"),
+        _e("v3", "怎么退款啊", head="head", scope="step", step_index=3),
+    ])
+    assert [m["id"] for m in idx.cluster_members("head", step_index=5)] == ["head"]
+    assert [m["id"] for m in idx.cluster_members("head", step_index=3)] == ["head", "v3"]
+    assert [m["id"] for m in idx.cluster_members("head", lang="zh", step_index=None)] == ["head"]
+
+    hit5, _ = idx.match("怎么退款啊", lang="zh", step_index=5, threshold=0.3)  # 变体不在命中面
+    assert hit5["id"] == "head"
+    assert [m["id"] for m in idx.cluster_members(hit5["id"], lang="zh", step_index=5)] == ["head"]
+
+    hit3, _ = idx.match("怎么退款啊", lang="zh", step_index=3, threshold=0.3)  # 变体满分胜 → 折组
+    assert hit3["id"] == "head"
+    assert [m["id"] for m in idx.cluster_members(hit3["id"], lang="zh", step_index=3)] == ["head", "v3"]
+
+
+def test_fold_obeys_lang_filter(monkeypatch):
+    """C1(b) 跨语言:head(en)+变体(zh)——zh 通话折到 zh 变体(非 en head);
+    en 通话折到 en head(zh 变体被语言闸滤出)。"""
+    monkeypatch.delenv("BOK_QA_ROTATION", raising=False)
+    from agent_runtime.qa_gate import QaIndex
+
+    idx = QaIndex([
+        _e("head_en", "how to refund", lang="en"),
+        _e("v_zh", "怎么退款", lang="zh", head="head_en"),
+    ])
+    hit_zh, _ = idx.match("怎么退款", lang="zh")
+    assert hit_zh["id"] == "v_zh"        # en head 被语言闸滤掉 → 代表=zh 变体
+    assert [m["id"] for m in idx.cluster_members("head_en", lang="zh")] == ["v_zh"]
+    hit_en, _ = idx.match("how to refund", lang="en")
+    assert hit_en["id"] == "head_en"     # en 通话:head 幸存居首
+    assert [m["id"] for m in idx.cluster_members("head_en", lang="en")] == ["head_en"]
+
+
+def test_all_members_filtered_returns_naked_winner(monkeypatch):
+    """C1(c) 全滤光 → 裸胜者(防御契约)。
+
+    合法流中胜者必是成员(它自己就幸存),「簇全滤光」只在过滤面/命中面分家
+    时出现;压 _team_head=None 验证 match 的兜底守卫——裸胜者原样返回,绝不
+    静默丢弃。附带真实过滤路径佐证:全成员异语 → 过滤后空簇。
+    """
+    monkeypatch.delenv("BOK_QA_ROTATION", raising=False)
+    from agent_runtime.qa_gate import QaIndex
+
+    idx = QaIndex([_e("head", "怎么退款"), _e("v1", "怎么退款啊", head="head")])
+    monkeypatch.setattr(QaIndex, "_team_head", lambda self, *a, **k: None)
+    hit, score = idx.match("怎么退款啊")
+    assert hit["id"] == "v1" and score > 0
+
+    idx2 = QaIndex([_e("h2", "怎么退款", lang="en"), _e("v2", "怎么退款啊", lang="en", head="h2")])
+    assert idx2.cluster_members("h2", lang="zh") == []
+
+
 # ---- 轮换序(命中恒 head,出场成员轮换)——spec §2 验收的纯函数版 ----
 
 def test_rotation_sequence_head_stable_members_rotate(monkeypatch):
@@ -268,3 +333,5 @@ def test_agent_wiring_gates_rotation_and_leaves_graph_branch_alone():
     assert "cluster_members" not in graph_block
     assert "_qa_rotation_plan" not in graph_block
     assert "_qa_note_played" not in graph_block
+    assert "qa_played" not in graph_block          # M-r1:轮换账本/取员禁入 graph 分支
+    assert "pick_rotation_member" not in graph_block

@@ -8,9 +8,13 @@ HybridLexicalEmbedding(CJK 逐字+bigram 哈希,零外部依赖)。阈值默认 
 宁缺毋滥;语义向量(MlxEmbedding)与步骤作用域条目放量为 v2。
 
 命中语义(Phase 3.2,spec 2026-09-18-flow-graph-phase3 §2):同义簇
-(cluster_head_id)在装配时折组——变体命中由簇头代表出场,簇内按「本通最少
+(cluster_head_id)在装配时折组——变体命中由簇内代表出场,簇内按「本通最少
 播放」轮换(账本在 FlowController.qa_played)。不折分数:胜者键与分数逐字节
 不变(BOK_QA_ROTATION=0 回裸索引竞争者档)。
+
+折组/轮换池**绝不比 match 的命中面宽**(C1,2026-09-18 终审):代表与成员表
+都按本通 `lang`/`step_index` 过滤(= match 同款判据 `_survives_turn`),跨
+scope 变体唔会在异步出线、跨语言成员唔会在本语通话播——整簇滤光回裸胜者。
 """
 
 from __future__ import annotations
@@ -55,6 +59,21 @@ def _entry_priority(entry: dict) -> int:
         return max(0, min(int(raw), 1000))
     except (TypeError, ValueError):
         return 10
+
+
+def _survives_turn(entry: dict, *, lang: str | None, step_index: int | None) -> bool:
+    """条目是否通过本轮语言/步骤过滤——与 `match()` 逐字同判据(单点防漂移)。
+
+    lang 空/None=不滤语言(同 match `if lang and …`);`scope=="step"` 条目:
+    step_index 为 None(=本轮无步骤上下文)或与条目 step_index 不等 → 滤出。
+    """
+    if lang and str(entry.get("lang") or "") and str(entry["lang"]) != lang:
+        return False
+    if str(entry.get("scope") or "global") == "step":
+        if step_index is None or int(entry.get("step_index") or -1) != int(step_index):
+            return False
+    return True
+
 
 
 def _cos(a: list[float], b: list[float]) -> float:
@@ -133,6 +152,12 @@ class QaIndex:
         # 折进 head 的候选组——head 居首、其后按索引插入序(=created_at);head 唔在
         # 索引(删/禁/空问法/自指 id)的变体退独立条目(旧行为,优雅降级)。
         # _cluster_of 是变体 id → 簇头 id 的归一面(cluster_members 传变体 id 时用)。
+        #
+        # 单层折(M-r4,2026-09-18 终审勘误):本循环按「变体的目标是不是一个在场
+        # 条目」建组,唔追链——链式簇 v2→v1→head 产出**重叠池**
+        # {head:[head,v1], v1:[v1,v2]}:v2 命中折到 v1(不是 head)、head 经孙辈
+        # 命中不可达,且 v1 在两个池都可播(重复出线)。两层是 web 簇守卫/导入器
+        # 的既定上限(CP 不校验);真要根治需建组时归一链根,非本增量范围。
         self._clusters: dict[str, list[dict]] = {}
         self._cluster_of: dict[str, str] = {}
         self._build_clusters()
@@ -153,24 +178,40 @@ class QaIndex:
     def __len__(self) -> int:
         return len(self._items)
 
-    def cluster_members(self, head_id: str) -> list[dict]:
+    def cluster_members(
+        self,
+        head_id: str,
+        *,
+        lang: str | None = None,
+        step_index: int | None = None,
+    ) -> list[dict]:
         """簇成员表(head 自身+在场变体,插入序;副本)。
 
         传簇头 id 或组内任一成员 id 都归一到同一簇(变体 id 经折组后唔会出线,
         但 by_id/探针等调用面可能直传变体)。无簇条目 → 其自身单元素表(调用方
         按 len>1 判独立档);完全唔在场嘅 id → []。mutate 返回值唔会影响索引。
+
+        过滤(C1,2026-09-18 终审):给 `lang` 或 `step_index`(任一非 None)即进
+        过滤档,成员按 `_survives_turn`(= match 同款判据)筛——轮换池绝不比
+        本轮命中面宽(跨 scope 变体唔会在异步出线、跨语言成员唔会在本语通话
+        播)。`step_index=None` 在过滤档=本轮无步骤上下文 → 步作用域成员滤出。
+        两参全 None = 旧调用形态,整簇原样返回(向后兼容)。
         """
         wanted = str(head_id or "")
         if not wanted:
             return []
-        members = self._clusters.get(wanted)
-        if members is not None:
-            return list(members)
-        owner = self._cluster_of.get(wanted)
-        if owner:
-            return list(self._clusters.get(owner) or [])
-        entry = self.by_id(wanted)
-        return [entry] if entry is not None else []
+        if wanted in self._clusters:
+            resolved = list(self._clusters[wanted])
+        else:
+            owner = self._cluster_of.get(wanted)
+            if owner:
+                resolved = list(self._clusters.get(owner) or [])
+            else:
+                entry = self.by_id(wanted)
+                resolved = [entry] if entry is not None else []
+        if lang is None and step_index is None:
+            return resolved
+        return [m for m in resolved if _survives_turn(m, lang=lang or "", step_index=step_index)]
 
     def match(
         self,
@@ -180,7 +221,13 @@ class QaIndex:
         step_index: int | None = None,
         threshold: float | None = None,
     ) -> tuple[dict | None, float]:
-        """返回 (命中条目, 得分);未过阈值/作用域不符/语言不符 → (None, best)。"""
+        """返回 (命中代表条目, 得分);未过阈值/作用域不符/语言不符 → (None, best)。
+
+        折组开(qa_rotation_enabled)且胜者属簇:代表 = 簇内**首个幸存成员**
+        (按本轮 lang/step 过滤;可能 head,也可能 head 被滤掉后的另一变体——
+        它正是本轮的合法命中面);整簇滤光 → 裸胜者(旧行为)。kill 档=裸胜者
+        逐字节旧档。
+        """
         q = normalize_question(user_text)
         if not q or not self._items:
             return None, 0.0
@@ -196,11 +243,8 @@ class QaIndex:
         # 逐字节同。kill-switch BOK_QA_PRIORITY=0 回纯分数档。
         use_priority = qa_priority_enabled()
         for entry, e_q, e_vec in self._items:
-            if lang and str(entry.get("lang") or "") and str(entry["lang"]) != lang:
+            if not _survives_turn(entry, lang=lang, step_index=step_index):
                 continue
-            if str(entry.get("scope") or "global") == "step":
-                if step_index is None or int(entry.get("step_index") or -1) != int(step_index):
-                    continue
             score = 0.6 * _cos(qv, e_vec)
             # 子串长度比(照抄 InMemoryVectorStore:包含才计,长串含短串占比)
             if q_low in e_q.lower():
@@ -212,23 +256,38 @@ class QaIndex:
             key = (_entry_priority(entry), -score) if use_priority else (-score,)
             if best_key is None or key < best_key:
                 best, best_key, best_score = entry, key, score
-        # 折组(Phase 3.2):胜者是变体 → 由簇头代表出场;胜者键与分数逐字节不变
-        # (只换出场代表,3.1 优先级键语义零改动)。kill-switch=0 时逐字节同旧档。
+        # 折组(Phase 3.2):胜者是变体 → 由簇内**首个幸存成员**代表出场(按本通
+        # lang/step 过滤,绝不比 match 命中面宽——C1);胜者键与分数逐字节不变
+        # (只换出场代表,3.1 优先级键语义零改动)。整簇滤光 → 裸胜者。kill=0 同旧档。
         if best is not None and qa_rotation_enabled():
-            head = self._team_head(best)
+            head = self._team_head(best, lang=lang, step_index=step_index)
             if head is not None:
                 return head, best_score
         if best is not None:
             return best, best_score
         return None, top_score
 
-    def _team_head(self, entry: dict) -> dict | None:
-        """胜者所属簇的 head 条目(无簇/孤儿/自指 → None,即原样返回胜者)。"""
+    def _team_head(
+        self,
+        entry: dict,
+        *,
+        lang: str = "",
+        step_index: int | None = None,
+    ) -> dict | None:
+        """胜者所属簇的**首个幸存成员**(按本通 lang/step 过滤)。
+
+        折组只在成员通过本轮过滤时换代表——head 被滤掉而变体幸存 → 代表=该
+        变体(它正是本轮的合法命中面);整簇滤光 → None(调用方裸胜者旧行为)。
+        无簇/孤儿/自指 → None。
+        """
         hid = self._cluster_of.get(str(entry.get("id") or ""))
         if not hid:
             return None
-        members = self._clusters.get(hid)
-        return members[0] if members else None
+        survivors = [
+            m for m in (self._clusters.get(hid) or [])
+            if _survives_turn(m, lang=lang, step_index=step_index)
+        ]
+        return survivors[0] if survivors else None
 
     def by_id(self, entry_id: str) -> dict | None:
         """按条目 id 直取(话术图 play_qa 绑定,spec §4.1);无命中返回 None。"""

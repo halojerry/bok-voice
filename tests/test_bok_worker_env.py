@@ -13,6 +13,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
 import bok  # noqa: E402
@@ -57,3 +59,38 @@ def test_apply_flow_graph_env_is_pure_dict_fill(monkeypatch):
     env: dict[str, str] = {}
     bok._apply_flow_graph_env(env)
     assert env == {"BOK_FLOW_GRAPH": "0"}
+
+
+@pytest.mark.parametrize("key", ["BOK_QA_ROTATION", "BOK_QA_PRIORITY", "BOK_QA_FASTPATH"])
+def test_qa_switch_env_reaches_dev_and_prod_workers(monkeypatch, key):
+    """I1（终审）:QA 三逃生门（轮换/优先级/快路）同款透传——dev `_agent_worker_env`
+    与 prod `_agent_prod_env` 任一漏列即「文档广告死开关」（3.1 PRIORITY 曾同病）。
+
+    设定值 → 两表都在；未设/空串 → 两表都不注入（worker 侧按默认跑，零变化）。
+    """
+    monkeypatch.setenv(key, "0")
+    assert bok._agent_worker_env(bok.repo_python()).get(key) == "0"
+    assert bok._agent_prod_env().get(key) == "0"
+
+    monkeypatch.delenv(key, raising=False)
+    assert key not in bok._agent_worker_env(bok.repo_python())
+    assert key not in bok._agent_prod_env()
+
+    monkeypatch.setenv(key, "")
+    assert key not in bok._agent_worker_env(bok.repo_python())
+    assert key not in bok._agent_prod_env()
+
+    monkeypatch.setenv(key, "1")  # 显式开档（A/B 来回切同一入口）也照传
+    assert bok._agent_worker_env(bok.repo_python()).get(key) == "1"
+    assert bok._agent_prod_env().get(key) == "1"
+
+
+def test_apply_bok_passthrough_env_forwards_all_keys(monkeypatch):
+    """helper 单点:四枚逃生门一次填;未设的键不出现。"""
+    monkeypatch.setenv("BOK_FLOW_GRAPH", "0")
+    monkeypatch.setenv("BOK_QA_ROTATION", "0")
+    monkeypatch.delenv("BOK_QA_PRIORITY", raising=False)
+    monkeypatch.delenv("BOK_QA_FASTPATH", raising=False)
+    env: dict[str, str] = {}
+    bok._apply_bok_passthrough_env(env)
+    assert env == {"BOK_FLOW_GRAPH": "0", "BOK_QA_ROTATION": "0"}
