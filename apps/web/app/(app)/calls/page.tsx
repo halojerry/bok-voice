@@ -6,11 +6,12 @@ import { ArrowRight, Plus } from "lucide-react";
 import { api } from "@/lib/api";
 import { useAccount } from "@/components/account-context";
 import { CallStudio } from "@/components/CallStudio";
+import { LoadingState } from "@/components/app-shell";
 
 const STATUS: Record<string, [string, string]> = {
   active: ["进行中", "bg-emerald-500"],
   ringing: ["振铃", "bg-amber-400"],
-  paused: ["已暂停", "bg-sky-400"],
+  paused: ["已暂停", "bg-blue-400"],
   ended: ["已结束", "bg-neutral-500"],
   failed: ["失败", "bg-red-400"],
 };
@@ -142,7 +143,7 @@ export default function CallsPage() {
       </div>
 
       {err && <p className="mb-4 text-sm text-red-600">{err}</p>}
-      {loading && <p className="text-sm muted">加载中…</p>}
+      {loading && <LoadingState />}
 
       {openId && (
         <section className="mb-6">

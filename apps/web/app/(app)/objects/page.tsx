@@ -417,7 +417,7 @@ export default function ObjectsPage() {
               onChange={(e) => setForm({ ...form, background: e.target.value })}
             />
             <label className="block">
-              <span className="text-xs text-(--stage-muted)">绑定话术模板</span>
+              <span className="text-xs muted">绑定话术模板</span>
               <select
                 className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden"
                 value={form.template_id}

@@ -221,7 +221,7 @@ export default function SupervisorPage() {
 
       <div className="mb-6 flex flex-wrap gap-3 text-sm">
         <span className="card px-4 py-2">
-          进行中 <b className="text-(--stage-value)">{activeCount}</b>
+          进行中 <b className="text-(--live)">{activeCount}</b>
         </span>
         <span className="card px-4 py-2">
           已暂停 <b className={pausedCount ? "text-amber-700" : "muted"}>{pausedCount}</b>

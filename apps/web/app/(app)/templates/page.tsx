@@ -606,14 +606,14 @@ export default function TemplatesPage() {
           {/* 旧式四段(兼容折叠):历史模板仍可编辑;新模板建议直接用分步 */}
           <div className="rounded-lg border border-(--card-border) p-3">
             <button className="flex w-full items-center justify-between text-left" onClick={() => setShowLegacy((v) => !v)}>
-              <span className="text-xs text-(--stage-muted)">旧式四段话术（开场/核心/异议/收尾 — 兼容历史模板，保存时自动转步骤）</span>
+              <span className="text-xs muted">旧式四段话术（开场/核心/异议/收尾 — 兼容历史模板，保存时自动转步骤）</span>
               <span className="text-xs muted">{showLegacy ? "收起 ▲" : "展开 ▼"}</span>
             </button>
             {showLegacy && (
               <div className="mt-2 space-y-2">
                 {TEMPLATE_FIELDS.map((k) => (
                   <label key={k} className="block">
-                    <span className="text-xs text-(--stage-muted)">{FIELD_LABELS[k]}</span>
+                    <span className="text-xs muted">{FIELD_LABELS[k]}</span>
                     <textarea
                       className={`mt-1 h-16 ${textarea} text-xs`}
                       value={form[k]}
@@ -626,7 +626,7 @@ export default function TemplatesPage() {
             )}
           </div>
           <label className="block">
-            <span className="text-xs text-(--stage-muted)">语气覆盖（可选，优先于人设）</span>
+            <span className="text-xs muted">语气覆盖（可选，优先于人设）</span>
             <input
               className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               value={form.tone_override}
@@ -635,7 +635,7 @@ export default function TemplatesPage() {
             />
           </label>
           <label className="block">
-            <span className="text-xs text-(--stage-muted)">识别热词（可选，本套话术专属）</span>
+            <span className="text-xs muted">识别热词（可选，本套话术专属）</span>
             <input
               className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               value={form.hotwords}
@@ -647,7 +647,7 @@ export default function TemplatesPage() {
             </span>
           </label>
           <label className="block">
-            <span className="text-xs text-(--stage-muted)">语言</span>
+            <span className="text-xs muted">语言</span>
             <select
               className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm"
               value={form.language}

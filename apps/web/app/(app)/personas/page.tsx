@@ -503,7 +503,7 @@ export default function PersonasPage() {
             {engineIsCloud ? (
               <>
                 {/* 云端引擎：整场固定一个音色（不随语言换声）。 */}
-                <span className="text-xs text-(--stage-muted)">AI 音色（整场同声 · 不随语言切换）</span>
+                <span className="text-xs muted">AI 音色（整场同声 · 不随语言切换）</span>
                 <p className="text-[11px] muted">
                   只列与当前人设语言匹配的音色（英文人设显示英文音色，对应语言显示对应音色），不会混在一起挑错。
                 </p>
@@ -544,7 +544,7 @@ export default function PersonasPage() {
             ) : (
               <>
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-xs text-(--stage-muted)">为该语言选音色：</span>
+                  <span className="text-xs muted">为该语言选音色：</span>
                   {LANGS.map(([lang, label]) => (
                     <button
                       key={lang}
@@ -621,7 +621,7 @@ export default function PersonasPage() {
             {previewUrl && <audio controls autoPlay src={previewUrl} className="mt-2 w-full" />}
             {clonedVoices.length > 0 && (
               <div className="rounded-lg border border-(--card-border) p-2">
-                <span className="text-xs text-(--stage-muted)">已克隆音色</span>
+                <span className="text-xs muted">已克隆音色</span>
                 <ul className="mt-1.5 space-y-1">
                   {clonedVoices.map((cv) => (
                     <li key={cv.id} className="flex items-center justify-between gap-2 text-xs">

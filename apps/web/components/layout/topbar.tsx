@@ -13,7 +13,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useMemo, type ReactNode } from "react";
+import { useMemo, type ReactNode, type Ref } from "react";
 import { Menu } from "lucide-react";
 import { useSession, useSessionActions } from "@/components/session-context";
 import { FLAT_NAV, GUARD_ONLY, matchesPath } from "@/lib/navigation";
@@ -21,6 +21,8 @@ import { FLAT_NAV, GUARD_ONLY, matchesPath } from "@/lib/navigation";
 export type TopbarProps = {
   /** 打开移动端导航抽屉（<md 汉堡按钮回调；抽屉状态由壳持有）。 */
   onMobileOpen: () => void;
+  /** 汉堡按钮 ref（壳层接线）：抽屉关闭后 Sidebar 把焦点还到这里。 */
+  mobileTriggerRef?: Ref<HTMLButtonElement>;
   /** 右侧状态区（壳传 StatusBadge）；未提供时（undefined/null）不渲染容器。 */
   status?: ReactNode;
 };
@@ -39,7 +41,7 @@ function pageTitle(pathname: string): string {
     .label;
 }
 
-export function Topbar({ onMobileOpen, status }: TopbarProps) {
+export function Topbar({ onMobileOpen, mobileTriggerRef, status }: TopbarProps) {
   const pathname = usePathname();
   const session = useSession();
   const { logout } = useSessionActions();
@@ -54,8 +56,10 @@ export function Topbar({ onMobileOpen, status }: TopbarProps) {
     <header className="sticky top-0 z-30 flex h-14 items-center justify-between gap-4 border-b border-border bg-background/85 px-4 backdrop-blur lg:px-6">
       <div className="flex min-w-0 items-center gap-3">
         <button
+          ref={mobileTriggerRef}
           type="button"
           aria-label="打开导航"
+          aria-haspopup="dialog"
           onClick={onMobileOpen}
           className="flex size-9 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground md:hidden"
         >

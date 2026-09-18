@@ -103,7 +103,7 @@ export default function InterpretPage() {
         <span className="label">坐席一体台 · 单页双通道</span>
         <div className="flex gap-3">
           <label className="flex flex-1 flex-col gap-1 text-xs">
-            <span className="text-(--stage-muted)">我方讲</span>
+            <span className="muted">我方讲</span>
             <select
               className="select"
               value={myLang}
@@ -120,7 +120,7 @@ export default function InterpretPage() {
             </select>
           </label>
           <label className="flex flex-1 flex-col gap-1 text-xs">
-            <span className="text-(--stage-muted)">对方讲</span>
+            <span className="muted">对方讲</span>
             <select
               className="select"
               value={otherLang}
@@ -139,7 +139,7 @@ export default function InterpretPage() {
         </div>
         <div className="flex gap-3">
           <label className="flex flex-1 flex-col gap-1 text-xs">
-            <span className="text-(--stage-muted)">我方音色（可选，rev 双向出声开启时为我方译文声）</span>
+            <span className="muted">我方音色（可选，rev 双向出声开启时为我方译文声）</span>
             <select className="select" value={myVoice} onChange={(e) => setMyVoice(e.target.value)}>
               {voiceOptions(myLang).map((o) => (
                 <option key={o.value} value={o.value}>
@@ -149,7 +149,7 @@ export default function InterpretPage() {
             </select>
           </label>
           <label className="flex flex-1 flex-col gap-1 text-xs">
-            <span className="text-(--stage-muted)">对方音色（可选，对方听到的译文声）</span>
+            <span className="muted">对方音色（可选，对方听到的译文声）</span>
             <select className="select" value={otherVoice} onChange={(e) => setOtherVoice(e.target.value)}>
               {voiceOptions(otherLang).map((o) => (
                 <option key={o.value} value={o.value}>
@@ -160,7 +160,7 @@ export default function InterpretPage() {
           </label>
         </div>
         <label className="flex flex-col gap-1 text-xs">
-          <span className="text-(--stage-muted)">术语表（可选，治专名误听与译名漂移）</span>
+          <span className="muted">术语表（可选，治专名误听与译名漂移）</span>
           <textarea
             className="textarea min-h-20"
             value={glossary}
@@ -168,7 +168,7 @@ export default function InterpretPage() {
             placeholder={"每条「源词=译文」或纯词条，逗号/分号/换行分隔。如：\n顺丰=SF Express；拼多多=Pinduoduo\n林总（纯词条=原样保留）"}
           />
         </label>
-        <p className="text-xs leading-relaxed text-(--stage-muted)">
+        <p className="text-xs leading-relaxed muted">
           两人各一支麦：一个页面同时接入本会话两端，同页看双向原文+译文字幕。听感拓扑——
           <strong>对方听到我方译文的 TTS</strong>，<strong>我方听到对方原声</strong>（像直接通话），
           对方→我方的译文只显示文字不出声；我方译文播报时自动暂让对方麦克风防串译。

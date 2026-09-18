@@ -262,7 +262,7 @@ export default function UsersPage() {
           </div>
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <label className="block">
-              <span className="text-xs text-(--stage-muted)">用户名（登录名）</span>
+              <span className="text-xs muted">用户名（登录名）</span>
               <input
                 className={`mt-1 ${input}`}
                 value={cf.username}
@@ -271,7 +271,7 @@ export default function UsersPage() {
               />
             </label>
             <label className="block">
-              <span className="text-xs text-(--stage-muted)">姓名</span>
+              <span className="text-xs muted">姓名</span>
               <input
                 className={`mt-1 ${input}`}
                 value={cf.display_name}
@@ -280,7 +280,7 @@ export default function UsersPage() {
               />
             </label>
             <label className="block">
-              <span className="text-xs text-(--stage-muted)">初始密码</span>
+              <span className="text-xs muted">初始密码</span>
               <input
                 type="password"
                 className={`mt-1 ${input}`}
@@ -290,7 +290,7 @@ export default function UsersPage() {
               />
             </label>
             <label className="block">
-              <span className="text-xs text-(--stage-muted)">角色</span>
+              <span className="text-xs muted">角色</span>
               <select
                 className={`mt-1 ${input}`}
                 value={cf.role}
