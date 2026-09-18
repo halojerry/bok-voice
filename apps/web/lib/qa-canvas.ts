@@ -17,6 +17,8 @@ export type QaRow = {
   hit_count?: number;
   source?: string;
   cluster_head_id?: string;
+  /** 匹配优先级（Phase 3.1）：小者先，默认 10；≠10 时画布出徽标。 */
+  priority?: number;
   created_at?: string;
 };
 
