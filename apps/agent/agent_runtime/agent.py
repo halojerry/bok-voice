@@ -3678,11 +3678,13 @@ async def entrypoint(ctx):
 
             # ---- 话术图引擎(spec 2026-09-18;插在 say 直念步之后、QA 快路之前,
             # precedence: REFUSE>DEFER>say>graph>QA 快路;BOK_FLOW_GRAPH=0 整闸,
-            # 空图零成本零变化)----
+            # 空图零成本零变化;closing 后收线优先——REFUSE 分支已置 closing 且
+            # 唔 raise,图唔可以抢走告别轮(与 QA 快路 closing 旁路同源)----
             _gbinding = None
             if (
                 os.environ.get("BOK_FLOW_GRAPH", "1") == "1"
                 and flow_ctrl.graph.intents
+                and not flow_ctrl.closing
                 and user_text
             ):
                 _gbinding = pick_graph_action(
@@ -3693,11 +3695,14 @@ async def entrypoint(ctx):
                 )
             if _gbinding is not None:
                 if _gbinding.action == "jump_step":
-                    # 1-based 存储转 0-based;同位跳转 no-op 不记账(spec §4.3 防环)
+                    # 1-based 存储转 0-based;先跳、按**实际位移**记账(2026-09-18
+                    # review R1):jump_to 内部还会 no-op(无步骤/done 钳制),未位移
+                    # 就唔可以烧 once 绑定/宣告 provider/打 jump 日志(spec §4.3 防环)。
                     _gtarget = int(_gbinding.step or 1) - 1
-                    if _gtarget != flow_ctrl.current:
+                    _gcur = flow_ctrl.current
+                    flow_ctrl.jump_to(_gtarget)
+                    if flow_ctrl.current != _gcur:
                         flow_ctrl.graph_fired.add(_gbinding.id)
-                        flow_ctrl.jump_to(_gtarget)
                         _invalidate_stale_preemptive(
                             f"流程跳转 → 第 {flow_ctrl.current + 1} 步"
                         )
