@@ -1058,6 +1058,7 @@ def _apply_judge_env(env: dict[str, str], _cur: dict[str, str]) -> None:
 # BOK_QA_* 三键同病(3.1 的 PRIORITY 曾经也是死开关)——一并收进来。
 _BOK_PASSTHROUGH_KEYS = (
     "BOK_FLOW_GRAPH",
+    "BOK_FLOW_GRAPH_JUDGE",
     "BOK_QA_ROTATION",
     "BOK_QA_PRIORITY",
     "BOK_QA_FASTPATH",

@@ -11,7 +11,7 @@
 3. 推非触发语「好的好的」→ 断言该窗口内**零**新增 `FLOW_GRAPH` 行。
 4. （有绑定 qa_id 时）推「我要退款」→ 信息位：`play` 或 `play_miss`，不进主判据。
 4b. `--then-jump` 档（Phase 3.3 追问链）：轮次表换成「播」+「跳后」两轮，「我要退款」
-   触发 `play_qa`（绑定带 `then_jump=4`）→ 罐头播完**当场**跳步；硬判据 =
+   触发 `play_qa`（绑定带 then_jump=4）→ 罐头播完**当场**跳步；硬判据 =
    ① play 窗口内 `FLOW_GRAPH play`（`play_miss` → FAIL）② **OR**（同轮
    `FLOW_GRAPH jump … via=then_jump` 日志 · 跳后轮 assistant 行
    `template_step == 4`）。**为什么要两轮**（勘误预检 2）：播放轮本体行在**跳之前**
@@ -19,9 +19,24 @@
    上看到；跳后轮话术默认 `AFTER_TEXT`（刻意避开 `_CONFIRM_RE` 单字确认/收线/异议/
    提问七族词）只为信息位服务。**无 QA 条目 → 腿显式跳过**（报告
    `{"skipped": "no_qa_or_audio"}`、退出码 1，未评估 ≠ PASS）；**条目在场但音频未物化
-   → 腿照跑**，运行时落 `FLOW_GRAPH play_miss`，`play_logged` 硬 FAIL、退出码 1
+   → 腿照跑**，运行时落 `FLOW_GRAPH play_miss`，play_logged 硬 FAIL、退出码 1
    （先 `python tools/bok.py tts-pregen --qa` 物化音频再来）。kill 腿同旧：
    `--then-jump --expect-off`，须先以 `BOK_FLOW_GRAPH=0` 重启 serve。
+4c. `--intent-judge` 档（Phase 3.4 意图引擎，judge 判据补模糊轮）：轮次表 =
+   「fuzzy」+「consume」两轮。fuzzy 轮推 `FUZZY_TEXT`（**刻意不含任何触发关键词**的
+   强不满抱怨）→ 关键词未中 → 当轮同步打 `FLOW_GRAPH judge_scheduled`（落 fuzzy
+   窗口，确定性）；背景任务经 FLOW_JUDGE_DELAY(3s)+9B 判定后打 `judge_hit`（落点
+   跨窗口边界，**全腿日志尾全局扫**）。consume 轮（fuzzy 与 consume 之间插入
+   `--judge-soak-s`（默认 6s）等候判定落账）推中性话 → 图块求值时 pop pending →
+   `judge_pending_fired` + 同轮 `jump step=4` + turn 行 `graph-jump@4`。硬判据：
+   judge_scheduled（fuzzy 窗口）+ judge_hit_logged（全局）+ judge_effective
+   （`judge_pending_fired` 全局 **且** consume 窗口 jump@4 ∨ turn 行 graph-jump@4）。
+   无 QA 依赖（jump_step 绑定）→ 无跳过路径。kill 腿：
+   `--intent-judge --expect-off`，须先以 `BOK_FLOW_GRAPH_JUDGE=0` 重启 serve——
+   断言全局零 judge_* 打点 + 零图轮 + 零图打点（judge 日志族不进 RE_FLOW_GRAPH，
+   kill 断言面必须**单独**把 judge 事件并入，否则 judge 残留会逃过 no_logs）。
+   A/B 口径：keyword 腿（默认档 trigger 直中，同轮 jump）vs judge 腿（fuzzy 下一轮
+   jump）——同一图、同一目标步，只换触发话语与通路。
 5. `--expect-off` 档 = kill-switch 腿：**须先以 `BOK_FLOW_GRAPH=0` 重启 serve**
    （env 在 worker 进程启动时定死，探针不能自己重启；A/B 前后 `ps aux | grep
    agent_runtime` 必须为 0 再 serve，防殭尸 worker 跑旧代码污染结论）→ 同表场景推
@@ -41,6 +56,7 @@
 用法：<python> scripts/probe_flow_graph.py [--expect-off] [--lang zh]
       [--trigger-text 我要投诉] [--no-play-round] [--keep-template]
       [--then-jump] [--after-text 我知道了，你说]
+      [--intent-judge] [--fuzzy-text …] [--judge-soak-s 6]
       <python> scripts/probe_flow_graph.py --selftest   # 无栈纯函数自检
 前置：`python tools/bok.py serve`（CP 8000 / LiveKit 7880 / ASR 8787 / TTS 8788）。
 报告：reports/flow-graph/<ts>-<leg>.json。
@@ -100,6 +116,23 @@ PLAYOUT_POLL_S = 0.2
 # 到转写而不是图引擎——见 trigger_transcribed 检查与诊断输出）。
 TRIGGER_KEYWORDS = ["投诉", "投訴", "我要投诉", "举报", "索赔"]
 PLAY_KEYWORDS = ["退款", "退钱", "退費", "退费", "Refund"]
+# ---- 意图 judge 腿（Phase 3.4）------------------------------------------------
+# fuzzy 轮话术：**不含任何触发/play 关键词**（图上关键词确定性命中恒先行——命中了就
+# 走不到 judge，腿就白跑），但语义是强不满抱怨（判据要能贴上）。声明式短句，避开
+# 提问词族（原地答不推进不影响本腿，但话面干净利于归因）。
+FUZZY_TEXT = "你们拖了半个月都不处理，太不像话了，我都快气死了"
+# 判据（进 graph_json intents[].judge.prompt）：正反例都写清——9B 判定器按此单选。
+# 正例锚「强烈不满/抱怨/发脾气/要讨说法（无原词也算）」、反例锚「单纯询问进度/确认
+# 信息不算」——fuzzy 转写只要保住抱怨语气即可命中（ASR 碎字容忍度高）。
+JUDGE_PROMPT = (
+    "客户表达强烈不满：在抱怨、发脾气、质问为什么拖着不处理、要讨个说法，"
+    "话里没有说出「投诉」「举报」「索赔」这些原词也算命中；"
+    "单纯询问进度、确认信息、客气地催一下不算命中。"
+)
+# fuzzy→consume 之间的等候（真实秒）：judge 任务 = FLOW_JUDGE_DELAY(3s) + 9B 判定
+# 往返（中型判据集 1-3s）——round 的 reply 播放只保证 ~2-6s，判定可能晚于 consume 轮
+# 起推才落账 → pending 未存 → consume 轮 pop 空。默认 6s 盖住 delay+往返，env 可调。
+JUDGE_SOAK_S = float(os.environ.get("BOK_PROBE_JUDGE_SOAK_S", "6"))
 
 # 探针模板（6 步，纯 goal/ref，无 say 直念步——直念步会在 graph 块之前抢走本轮）。
 PROBE_STEPS: list[dict] = [
@@ -113,6 +146,14 @@ PROBE_STEPS: list[dict] = [
 
 # FLOW_GRAPH 打点四词汇（长词在前防前缀误吃；\b 兜底）
 RE_FLOW_GRAPH = re.compile(r"FLOW_GRAPH\s+(play_miss|jump_noop|jump|play)\b(.*)$")
+# 意图 judge 打点族（Phase 3.4；**不在** RE_FLOW_GRAPH 里——默认/then-jump 腿的事件集
+# 逐字节同旧，judge 事件只由 parse_judge_events 单独收，intent-judge 腿/其 kill 腿用）。
+RE_FLOW_GRAPH_JUDGE = re.compile(
+    r"FLOW_GRAPH\s+(judge_scheduled|judge_pending_fired|judge_pending_expired"
+    r"|judge_hit|judge_miss|judge_skipped|judge\ failed)\b(.*)$"
+)
+JUDGE_EVENT_KINDS = ("judge_scheduled", "judge_pending_fired", "judge_pending_expired",
+                     "judge_hit", "judge_miss", "judge_skipped", "judge failed")
 GRAPH_PROVIDERS = ("graph-jump", "graph-play")
 
 
@@ -214,6 +255,51 @@ def parse_graph_events(lines: list[str]) -> list[dict]:
     return events
 
 
+def parse_judge_events(lines: list[str]) -> list[dict]:
+    """抽 `FLOW_GRAPH judge_*` 打点为事件字典（纯函数，保序；与 parse_graph_events
+    同款 k=v 展开）。默认/then-jump 腿**不调用**（事件集零变化）。"""
+    events: list[dict] = []
+    for raw in lines:
+        m = RE_FLOW_GRAPH_JUDGE.search(str(raw))
+        if not m:
+            continue
+        ev: dict = {"kind": m.group(1)}
+        for token in m.group(2).split():
+            if "=" in token:
+                key, value = token.split("=", 1)
+                ev[key] = value
+        events.append(ev)
+    return events
+
+
+async def fetch_turns_authed(call_id: str, settle_s: float = 12.0) -> list[dict]:
+    """`erc.fetch_turns` 的 auth-on 档：CP 请求带 `_CP_HEADERS`（机器通道 Bearer）。
+
+    2026-09-19 实弹：erc 骨架的 fetch_turns 裸 `httpx.get`——auth-on 栈下 401 落
+    `{"detail":…}` dict，下游 `graph_turn_rows` 的 `t.get` 直接 AttributeError 炸腿。
+    未设 BOK_CP_TOKEN 时 headers 空=行为与 erc 裸跑逐字节同。轮询形状同 erc（挂断后
+    拉到条数稳定）；非列表响应当零行继续轮询，唔向上层传 dict。"""
+    last: list[dict] = []
+    stable = 0
+    deadline = time.perf_counter() + settle_s
+    while time.perf_counter() < deadline:
+        rows = httpx.get(
+            f"{erc.CONTROL_PLANE_URL}/api/calls/{call_id}/turns",
+            headers=_CP_HEADERS, timeout=10,
+        ).json()
+        if not isinstance(rows, list):
+            rows = []
+        if rows and len(rows) == len(last):
+            stable += 1
+            if stable >= 2:
+                return rows
+        else:
+            stable = 0
+        last = rows
+        await asyncio.sleep(1.5)
+    return last
+
+
 def graph_turn_rows(turns: list[dict]) -> list[dict]:
     """assistant 轮里 provider 属图执行的两类（纯函数，时间序保序）。"""
     rows: list[dict] = []
@@ -257,19 +343,28 @@ def plan_rounds(
     play_text: str,
     after_text: str,
     play_round: bool,
+    intent_judge: bool = False,
+    fuzzy_text: str = FUZZY_TEXT,
 ) -> list[tuple[str, str]]:
     """本腿轮次表 `[(窗口名, 话术)]`（纯函数）。
 
     - **then-jump 档**（`then_jump` 非 None，Phase 3.3 追问链）：`has_qa` 真 →
       `[("play", play_text), ("after", after_text)]`——「播」轮就是**触发轮**（推
-      `play_text` 命中 play_qa 绑定）。跳后步号只能在**下一轮**的 turns 行看到
+      `play_text` 命中 play_qa 绑定）。跳后步号只能在**下一轮**的 turns 行上看到
       （勘误预检 2：播放轮本体行在跳前落库），故必须两轮。`has_qa` 假（**无 QA 条目**，
       即 `qa_id` 为空；条目在场而音频未物化不在此列——那种情况腿照跑、`play_miss` 由
       `play_logged` 硬 FAIL）→ **空表**：调用方须显式判「腿跳过」，绝不许以「没跑出
       东西」空过成 PASS。
       `play_round` 在本档**不适用**（「播」轮是触发轮，关掉即零触发语空跑）。
+    - **intent-judge 档**（`intent_judge` 真，Phase 3.4）：`[("fuzzy", fuzzy_text),
+      ("consume", after_text)]`——fuzzy 轮=无关键词的模糊抱怨（judge_scheduled 当轮
+      同步落 fuzzy 窗口）；consume 轮复用 `after_text`（中性话，已避开七族词+触发词，
+      只为「pop pending→绑定触发」服务）。无 QA 依赖（jump_step 绑定）→ 永不空表。
+      `play_round` 在本档**不适用**。
     - **默认档**：`trigger`/`nontrigger`（+ `play` 信息位轮）逐字节同旧。
     """
+    if intent_judge:
+        return [("fuzzy", fuzzy_text), ("consume", after_text)]
     if then_jump is not None:
         if not has_qa:
             return []
@@ -346,6 +441,10 @@ def evaluate_leg(
     evidence: dict,
     then_jump: int | None = None,
     after_events: list[dict] | None = None,
+    intent_judge: bool = False,
+    fuzzy_events: list[dict] | None = None,
+    consume_events: list[dict] | None = None,
+    judge_events: list[dict] | None = None,
 ) -> dict:
     """主判据（纯函数）。expect_off=False=图开启腿；True=kill-switch 腿。
 
@@ -386,7 +485,19 @@ def evaluate_leg(
         "nontrigger": nontrigger_events,
         "play": play_events,
     }
-    if expect_off:
+    if expect_off and intent_judge:
+        # kill 面（Phase 3.4）：judge 日志族**不在** RE_FLOW_GRAPH——不单独并入的话
+        # judge 残留会逃过 no_logs（judge_scheduled 只须 env 关=零调度，absence 判据
+        # 照旧吃 evidence 闸防假绿）。
+        judges = list(judge_events or [])
+        checks = {
+            "evidence_ok": ev_ok,
+            "killswitch_no_logs": ev_ok and not all_events,
+            "killswitch_no_graph_turns": ev_ok and not grows,
+            "killswitch_no_judge_logs": ev_ok and not judges,
+        }
+        events["judge"] = judges
+    elif expect_off:
         checks = {
             "evidence_ok": ev_ok,
             "killswitch_no_logs": ev_ok and not all_events,
@@ -413,6 +524,39 @@ def evaluate_leg(
             "evidence_ok": ev_ok,
             "play_logged": any(k == "play" for k in play_kinds),
             "then_jump_effective": bool(logged or next_seen),
+        }
+    elif intent_judge:
+        # Phase 3.4 意图 judge 腿：fuzzy 轮（无关键词）→ judge_scheduled 当轮同步落
+        # fuzzy 窗口（确定性）；judge_hit/judge_pending_fired 落点跨窗口边界（3s 让路
+        # delay + 9B 往返 vs reply 播放时长）→ **全局**日志尾扫。judge_effective 双锚：
+        # pending_fired（消费+触发）**且**（consume 窗口 jump@target ∨ turn 行
+        # graph-jump@target）——fired 日志在 pick 之后打，jump 分支同轮必跟。
+        fuzzy = list(fuzzy_events or [])
+        consume = list(consume_events or [])
+        judges = list(judge_events or [])
+        scheduled = any(str(e.get("kind")) == "judge_scheduled" for e in fuzzy)
+        hit = any(str(e.get("kind")) == "judge_hit" for e in judges)
+        fired = any(str(e.get("kind")) == "judge_pending_fired" for e in judges)
+        consume_jump = any(
+            str(e.get("kind")) == "jump" and _as_int(e.get("step"), -1) == target_step
+            for e in consume
+        ) or any(
+            g["provider"] == "graph-jump" and g["template_step"] == target_step
+            for g in grows
+        )
+        info.update({
+            "judge_kinds": [str(e.get("kind")) for e in judges],
+            "judge_scheduled": scheduled,
+            "judge_hit": hit,
+            "judge_pending_fired": fired,
+            "consume_jump": consume_jump,
+        })
+        events.update({"fuzzy": fuzzy, "consume": consume, "judge": judges})
+        checks = {
+            "evidence_ok": ev_ok,
+            "judge_scheduled": scheduled,
+            "judge_hit_logged": hit,
+            "judge_effective": bool(fired and consume_jump),
         }
     else:
         jumps = [e for e in trigger_events if str(e.get("kind")) == "jump"]
@@ -444,11 +588,13 @@ def _cp(path: str, *, method: str = "GET", **kw) -> httpx.Response:
     )
 
 
-def build_graph_json(qa_id: str, *, then_jump: int | None = None) -> str:
+def build_graph_json(qa_id: str, *, then_jump: int | None = None, judge: bool = False) -> str:
     """图契约（spec §3）：投诉→jump_step 4；退款→play_qa（有 qa_id 才挂该腿）。
 
     `then_jump`（Phase 3.3 追问链，1-based）：非空且挂了 play_qa 绑定时给该绑定加
     `"then_jump": N`；默认 `None` 时输出与今逐字节同（旧腿/旧断言零变化）。
+    `judge`（Phase 3.4 意图引擎）：真时给「投诉」意图挂 `judge.prompt=JUDGE_PROMPT`
+    （关键词照旧必填——judge 只补关键词未中的模糊轮）；默认 False 逐字节同旧。
     """
     bindings = [{
         "id": "bnd_7e8f9a0b",
@@ -465,6 +611,8 @@ def build_graph_json(qa_id: str, *, then_jump: int | None = None) -> str:
         "keywords": list(TRIGGER_KEYWORDS),
         "steps": [],
         "enabled": True,
+        # 判据只在显式开 judge 腿时写键（CP 严格校验面：prompt 必须 1-400 字符串）。
+        **({"judge": {"prompt": JUDGE_PROMPT}} if judge else {}),
     }]
     if qa_id:
         intents.append({
@@ -579,19 +727,24 @@ def log_windows(marks: list[int]) -> list[list[str]]:
 async def run_leg(*, expect_off: bool, lang: str, voice: str, trigger_text: str,
                   nontrigger_text: str, play_text: str, play_round: bool,
                   keep_template: bool, budgets: dict[str, float],
-                  then_jump: int | None = None, after_text: str = AFTER_TEXT) -> dict:
+                  then_jump: int | None = None, after_text: str = AFTER_TEXT,
+                  intent_judge: bool = False, fuzzy_text: str = FUZZY_TEXT,
+                  judge_soak_s: float = JUDGE_SOAK_S) -> dict:
     leg_name = "killswitch-off" if expect_off else "graph-on"
     if then_jump is not None:
         leg_name = "then-jump-killswitch-off" if expect_off else "then-jump"
+    if intent_judge:
+        leg_name = "intent-judge-killswitch-off" if expect_off else "intent-judge"
     qa_id = pick_qa_id(lang)
-    graph_json = build_graph_json(qa_id, then_jump=then_jump)
+    graph_json = build_graph_json(qa_id, then_jump=then_jump, judge=intent_judge)
     rounds = plan_rounds(
         then_jump=then_jump, has_qa=bool(qa_id), trigger_text=trigger_text,
         nontrigger_text=nontrigger_text, play_text=play_text, after_text=after_text,
-        play_round=play_round,
+        play_round=play_round, intent_judge=intent_judge, fuzzy_text=fuzzy_text,
     )
     print(f"\n[flow-graph] 腿={leg_name} lang={lang} qa_id={qa_id or '(无QA条目, play 腿跳过)'}"
-          f" then_jump={then_jump} rounds={[n for n, _ in rounds]}", flush=True)
+          f" then_jump={then_jump} intent_judge={intent_judge} rounds={[n for n, _ in rounds]}",
+          flush=True)
     if then_jump is not None and not rounds:
         # 未评估 ≠ PASS：**无 QA 条目**时链腿结构性跑不起来（触发语必然 play_miss），
         # 必须显式跳过并以退出码 1 收尾（空表跑出的「零痕迹」是没观测，不是证据）。
@@ -616,7 +769,7 @@ async def run_leg(*, expect_off: bool, lang: str, voice: str, trigger_text: str,
             expect_off=expect_off, leg_name=leg_name, lang=lang, qa_id=qa_id,
             graph_json=graph_json, template_id=template_id, voice=voice,
             rounds=rounds, then_jump=then_jump, after_text=after_text,
-            budgets=budgets,
+            budgets=budgets, intent_judge=intent_judge, judge_soak_s=judge_soak_s,
         )
     finally:
         # 清理探针模板：名字含 probe=不会被 E2E 自动挑中，但跑完仍应不留痕（--keep-template 留档用）。
@@ -627,7 +780,9 @@ async def run_leg(*, expect_off: bool, lang: str, voice: str, trigger_text: str,
 async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_id: str,
                               graph_json: str, template_id: str, voice: str,
                               rounds: list[tuple[str, str]], then_jump: int | None,
-                              after_text: str, budgets: dict[str, float]) -> dict:
+                              after_text: str, budgets: dict[str, float],
+                              intent_judge: bool = False,
+                              judge_soak_s: float = JUDGE_SOAK_S) -> dict:
     # 轮次表由 `plan_rounds` 单点产出（默认档=触发/非触发/play 信息位轮；then-jump 档=
     # 播 + 跳后两轮），这里只负责跑表与按窗口切日志。
     pcms = {name: erc.tts_pcm(text, lang) for name, text in rounds}
@@ -710,6 +865,12 @@ async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_
             print(f"    {name:>10} 「{text}」 → 首声 {first} · 语音 {m.get('speech_s', 0):.1f}s · "
                   f"{'✓' if m.get('answered') else '✗哑'} · log+{marks[-1] - marks[-2]}B", flush=True)
             await asyncio.sleep(0.3)
+            if intent_judge and name == "fuzzy":
+                # Phase 3.4:judge 任务 = FLOW_JUDGE_DELAY(3s) 让路 + 9B 往返——reply
+                # 播放只盖 ~2-6s，判定可能晚于 consume 起推才落账（pending 未存 =
+                # consume 轮 pop 空、judge_effective 假 FAIL）。显式浸泡等判定落账。
+                print(f"    {'judge-soak':>10} 等候判定落账 {judge_soak_s:.1f}s", flush=True)
+                await asyncio.sleep(judge_soak_s)
     except Exception as exc:  # noqa: BLE001 - 单腿异常照常收尾并出报告
         print(f"[flow-graph] 腿 {leg_name} 异常中断: {exc!r}", flush=True)
     finally:
@@ -725,7 +886,7 @@ async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_
         except Exception:  # noqa: BLE001
             pass
 
-    turns = await erc.fetch_turns(call_id)
+    turns = await fetch_turns_authed(call_id)
     evidence = probe_evidence(
         log_exists=erc.LOG_PATH.exists(),
         marks=marks,
@@ -739,6 +900,25 @@ async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_
     nontrigger_events = parse_graph_events(name_to_window.get("nontrigger", []))
     play_events = parse_graph_events(name_to_window.get("play", []))
     after_events = parse_graph_events(name_to_window.get("after", []))
+    # fuzzy/consume 窗叠加 judge 解析（2026-09-19 实弹：judge_scheduled 落 fuzzy 窗
+    # 但旧 parse 只用图四词正则=结构性捞不到 → judge_scheduled 恒 FAIL 假阴）。
+    fuzzy_events = (
+        parse_graph_events(name_to_window.get("fuzzy", []))
+        + parse_judge_events(name_to_window.get("fuzzy", []))
+    )
+    consume_events = parse_graph_events(name_to_window.get("consume", []))
+    # judge 打点全局尾扫（Phase 3.4）：judge_hit/judge_pending_fired 的落点跨窗口边界
+    # （3s 让路 + 9B 往返 vs reply 播放时长，可能落 fuzzy 窗、soak 间隙=consume 窗头、
+    # 甚至 settle 后），窗口归属只作信息位——判据用 marks[0]:EOF 全量。
+    judge_events: list[dict] = []
+    if intent_judge:
+        try:
+            tail = erc.LOG_PATH.read_bytes()[max(0, marks[0]):]
+            judge_events = parse_judge_events(
+                [ln.decode("utf-8", errors="replace") for ln in tail.splitlines()]
+            )
+        except Exception:  # noqa: BLE001 - 日志缺失=零 judge 事件（判据如实报缺）
+            judge_events = []
     if not evidence["ok"]:
         print(f"[flow-graph] 观测面不足 → absence 判据不计 PASS：{evidence}", flush=True)
 
@@ -769,6 +949,10 @@ async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_
         evidence=evidence,
         then_jump=then_jump,
         after_events=after_events,
+        intent_judge=intent_judge,
+        fuzzy_events=fuzzy_events,
+        consume_events=consume_events,
+        judge_events=judge_events,
     )
     # 归因用关键词：then-jump 腿的触发语是 `play_text`（退款 系），默认腿是「投诉」系。
     understood_keywords = PLAY_KEYWORDS if then_jump is not None else TRIGGER_KEYWORDS
@@ -783,6 +967,7 @@ async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_
         "qa_id": qa_id,
         "graph_json": graph_json,
         "then_jump": then_jump,
+        "intent_judge": intent_judge,
         "rounds": [name for name, _ in rounds],
         "after_text": after_text if then_jump is not None else "",
         "setup_ok": setup_ok,
@@ -985,6 +1170,71 @@ def selftest() -> int:
         ("graph_json then-jump 档挂在 play_qa 绑定上",
          next(b for b in json.loads(build_graph_json("qa-1", then_jump=TARGET_STEP))["bindings"]
               if b["action"] == "play_qa")["then_jump"], TARGET_STEP),
+        # ---- Phase 3.4 意图 judge 腿（fuzzy+consume / kill / 判定面）----
+        ("intent-judge 正例：scheduled+hit+fired+consume jump", evaluate_leg(
+            expect_off=False, target_step=TARGET_STEP, intent_judge=True,
+            trigger_events=[], nontrigger_events=[], play_events=[],
+            fuzzy_events=[{"kind": "judge_scheduled", "intents": "1", "step": "1"}],
+            consume_events=[{"kind": "jump", "binding": "bnd_7e8f9a0b", "step": "4"}],
+            judge_events=[{"kind": "judge_hit", "intent": "int_1a2b3c4d", "step": "1"},
+                          {"kind": "judge_pending_fired", "binding": "bnd_7e8f9a0b", "step": "1"}],
+            turns=_turns("graph-jump", TARGET_STEP), evidence=_ev())["pass"], True),
+        ("intent-judge 反例：judge_miss（9B 不贴合）", evaluate_leg(
+            expect_off=False, target_step=TARGET_STEP, intent_judge=True,
+            trigger_events=[], nontrigger_events=[], play_events=[],
+            fuzzy_events=[{"kind": "judge_scheduled", "intents": "1", "step": "1"}],
+            consume_events=[], judge_events=[{"kind": "judge_miss", "step": "1"}],
+            turns=_turns("", 2), evidence=_ev())["pass"], False),
+        ("intent-judge 反例：hit 了但 pending 没消费（consume 轮缺失）", evaluate_leg(
+            expect_off=False, target_step=TARGET_STEP, intent_judge=True,
+            trigger_events=[], nontrigger_events=[], play_events=[],
+            fuzzy_events=[{"kind": "judge_scheduled", "intents": "1", "step": "1"}],
+            consume_events=[], judge_events=[{"kind": "judge_hit", "intent": "x", "step": "1"}],
+            turns=_turns("", 2), evidence=_ev())["pass"], False),
+        ("intent-judge 反例：scheduled 都没打（关键词命中/图未开）", evaluate_leg(
+            expect_off=False, target_step=TARGET_STEP, intent_judge=True,
+            trigger_events=[], nontrigger_events=[], play_events=[],
+            fuzzy_events=[], consume_events=[], judge_events=[],
+            turns=_turns("", 2), evidence=_ev())["pass"], False),
+        ("intent-judge kill 腿正例：零图+零 judge 痕迹", evaluate_leg(
+            expect_off=True, target_step=TARGET_STEP, intent_judge=True,
+            trigger_events=[], nontrigger_events=[], play_events=[],
+            fuzzy_events=[], consume_events=[], judge_events=[],
+            turns=[], evidence=_ev())["pass"], True),
+        ("intent-judge kill 腿反例：judge_scheduled 残留（no_judge_logs 逮到）", evaluate_leg(
+            expect_off=True, target_step=TARGET_STEP, intent_judge=True,
+            trigger_events=[], nontrigger_events=[], play_events=[],
+            fuzzy_events=[], consume_events=[],
+            judge_events=[{"kind": "judge_scheduled", "intents": "1", "step": "1"}],
+            turns=[], evidence=_ev())["pass"], False),
+        ("intent-judge kill 腿假绿闸：日志缺失 → 零痕迹不成立", evaluate_leg(
+            expect_off=True, target_step=TARGET_STEP, intent_judge=True,
+            trigger_events=[], nontrigger_events=[], play_events=[],
+            fuzzy_events=[], consume_events=[], judge_events=[],
+            turns=[], evidence=_ev(log=False))["pass"], False),
+        ("plan_rounds intent-judge 档=fuzzy+consume 两轮（无 QA 依赖）", plan_rounds(
+            then_jump=None, has_qa=False, intent_judge=True,
+            trigger_text=TRIGGER_TEXT, nontrigger_text=NONTRIGGER_TEXT,
+            play_text=PLAY_TEXT, after_text=AFTER_TEXT, play_round=True
+        ) == [("fuzzy", FUZZY_TEXT), ("consume", AFTER_TEXT)], True),
+        ("graph_json 默认/then-jump 档不带 judge 键",
+         all("judge" not in i for i in json.loads(build_graph_json("qa-1"))["intents"])
+         and all("judge" not in i
+                 for i in json.loads(build_graph_json("qa-1", then_jump=TARGET_STEP))["intents"]), True),
+        ("graph_json intent-judge 档判据挂投诉意图（prompt 1-400）",
+         1 <= len(next(i for i in json.loads(build_graph_json("qa-1", judge=True))["intents"]
+                       if i["id"] == "int_1a2b3c4d")["judge"]["prompt"]) <= 400, True),
+        ("parse_judge_events 拆词（含 reason/intent 字段）", parse_judge_events([
+            "FLOW_GRAPH judge_scheduled intents=1 step=1 (call c-1)",
+            "FLOW_GRAPH judge_skipped reason=stale (call c-1)",
+            "FLOW_GRAPH jump binding=bnd_7e8f9a0b step=4",  # 非judge行必须不收
+        ]) == [
+            {"kind": "judge_scheduled", "intents": "1", "step": "1"},
+            {"kind": "judge_skipped", "reason": "stale"},
+        ], True),
+        ("FUZZY_TEXT 不含任何图触发/play 关键词（腿前提）",
+         not any(k.lower() in FUZZY_TEXT.lower()
+                 for k in TRIGGER_KEYWORDS + PLAY_KEYWORDS), True),
     ]
 
     failed = 0
@@ -1013,6 +1263,13 @@ async def main() -> int:
                              "轮次表=播+跳后两轮；跳后步号与同轮 jump 日志取 OR 判据")
     parser.add_argument("--after-text", default=AFTER_TEXT,
                         help="--then-jump 的跳后轮话术（须避开确认/收线/异议/提问七族词与图触发词）")
+    parser.add_argument("--intent-judge", action="store_true",
+                        help="意图判据腿（Phase 3.4）：投诉意图挂 judge.prompt，轮次表=fuzzy+consume"
+                             " 两轮（fuzzy 刻意不含关键词）；kill 腿须先以 BOK_FLOW_GRAPH_JUDGE=0 重启 serve")
+    parser.add_argument("--fuzzy-text", default=FUZZY_TEXT,
+                        help="--intent-judge 的模糊触发轮话术（须避开图全部触发/play 关键词，保持抱怨语义）")
+    parser.add_argument("--judge-soak-s", type=float, default=JUDGE_SOAK_S,
+                        help="fuzzy→consume 之间等候判定落账的真实秒数（盖 FLOW_JUDGE_DELAY+9B 往返）")
     parser.add_argument("--keep-template", action="store_true", help="保留探针模板（默认跑完删）")
     parser.add_argument("--budget-first-ms", type=float, default=2500.0)
     parser.add_argument("--budget-perceived-ms", type=float, default=3000.0)
@@ -1031,6 +1288,8 @@ async def main() -> int:
         keep_template=args.keep_template, budgets=budgets,
         then_jump=TARGET_STEP if args.then_jump else None,
         after_text=args.after_text,
+        intent_judge=args.intent_judge, fuzzy_text=args.fuzzy_text,
+        judge_soak_s=args.judge_soak_s,
     )
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1049,9 +1308,11 @@ async def main() -> int:
           " ".join(f"{k}={'1' if v else '0'}" for k, v in checks.items()) +
           f" → {'PASS' if res['verdict']['pass'] else 'FAIL'}", flush=True)
     if args.expect_off:
-        print("（kill-switch 腿：须以 BOK_FLOW_GRAPH=0 重启 serve，探针不代重启；env 经 bok.py "
-              "_agent_worker_env 白名单透传（2026-09-18 实弹修复）——若本腿仍 FAIL，先核对 "
-              "worker 进程 env 里到底有没有 BOK_FLOW_GRAPH，再怀疑引擎）", flush=True)
+        kill_env = "BOK_FLOW_GRAPH_JUDGE" if args.intent_judge else "BOK_FLOW_GRAPH"
+        print(f"（kill-switch 腿：须以 {kill_env}=0 重启 serve，探针不代重启；env 经 bok.py "
+              "_BOK_PASSTHROUGH_KEYS 白名单透传（dev serve merge os.environ，白名单真正兜底 "
+              "prod 封闭 env 面）——若本腿仍 FAIL，先核对 worker 进程 env 里到底有没有 "
+              f"{kill_env}，再怀疑引擎）", flush=True)
     return 0 if res["verdict"]["pass"] else 1
 
 

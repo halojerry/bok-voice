@@ -7,7 +7,13 @@ import re
 import time
 from typing import Optional
 
-from bok_voice_core.flow_graph import ACTION_PLAY_QA, pick_graph_action
+from bok_voice_core.flow_graph import (
+    ACTION_PLAY_QA,
+    FlowGraphDoc,
+    FlowIntent,
+    eligible_judge_intents,
+    pick_graph_action,
+)
 from bok_voice_core.policies import ProviderRegistry, ProviderState, select_session_manifest
 from bok_voice_core.testdata import is_test_object_name as _is_test_object_name
 from bok_voice_core.types import CallMode
@@ -172,21 +178,27 @@ async def _strip_expr_markup(text):
         yield ""
 
 
-async def _llm_judge(base_url: str, model: str, messages: list) -> str:
+async def _llm_judge(
+    base_url: str, model: str, messages: list, *, max_tokens: int = 8, timeout: float = 5.0
+) -> str:
     """流程推进判定器:对本地 MLX LLM 发一个 max_tokens 极短请求,取回一个字。失败返空(唔推进)。
 
     参数面与主回复同源(stop/温度语义),走 openai SDK(自动重试/超时),唔再手搓 HTTP。
+    `max_tokens` 具名参数缺省 8=推进判定器原值(既有调用点零变化);意图判据判定
+    (3.4)输出 intent id,长过 8 token,调用点显式传大值。`timeout` 缺省 5.0 同理
+    (review N9:非流式单请求的总预算——9B 判据集 prefill 慢,意图判定调用点显式放宽,
+    超时返空=静默永久 miss,唔可以两边共用 5s 硬码)。
     """
     if not base_url or not model:
         return ""
     from openai import AsyncOpenAI
 
     try:
-        client = AsyncOpenAI(api_key="mlx", base_url=base_url, timeout=5, max_retries=1)
+        client = AsyncOpenAI(api_key="mlx", base_url=base_url, timeout=timeout, max_retries=1)
         r = await client.chat.completions.create(
             model=model,
             messages=messages,
-            max_tokens=8,
+            max_tokens=max_tokens,
             temperature=0,
             # 本地 MLX 對話模板會 append <|im_end|>,停喺呢度,回應淨係 verdict 字。
             stop=["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
@@ -197,6 +209,33 @@ async def _llm_judge(base_url: str, model: str, messages: list) -> str:
     except Exception as exc:  # pragma: no cover - 判定失败唔推进,唔阻断通话
         print(f"[flow] llm judge failed: {exc!r}", flush=True)
         return ""
+
+
+def _intent_judge_candidates(
+    graph: FlowGraphDoc,
+    *,
+    step_1based: int,
+    fired: set[str],
+    closing: bool,
+    inflight: bool,
+    pending: bool,
+) -> list[FlowIntent]:
+    """3.4 判据判定**调度门**(模块级,便于单测):返回要送去判定的候选意图。
+
+    六闸全过才有候选:kill-switch 开 + 图引擎开(图关=冇消费点,判定=空跑烧 9B)
+    + 非收线 + 无在途判定(单飞) + 无待生效 pending(single-shot 未消费) + 资格
+    预筛非空(`eligible_judge_intents`:有判据/在 scope/有可触发绑定)。
+
+    任一不过 → 空列表,调用方**静默**(关键词未中是热路径,唔打日志)。**零回归
+    保证**:没有任何意图带判据时预筛恒空 → 零任务零专线调用,与 Phase 3.3 逐字节同。
+    """
+    if os.environ.get("BOK_FLOW_GRAPH_JUDGE", "1") != "1":
+        return []
+    if os.environ.get("BOK_FLOW_GRAPH", "1") != "1":
+        return []
+    if closing or inflight or pending or not graph.intents:
+        return []
+    return eligible_judge_intents(graph, step_1based=step_1based, fired=fired)
 
 
 def _parse_voice_map(raw) -> dict:
@@ -2033,6 +2072,11 @@ async def entrypoint(ctx):
 
     # 背景 flow judge 防疊:記錄而家 judge 緊邊一步(-1=冇)。推進唔可以同時兩個 judge。
     _judge_inflight: dict = {"step": -1}
+    # 3.4 意图判据 judge 账本:on=背景批量判定在途(单飞,防同一模糊轮连开);
+    # pending=已判定命中、等下一次图引擎求值消费(single-shot:消费即清,唔理绑定
+    # 真触发与否——消费点 pick 会重过全部守卫,过期就打 judge_pending_expired)。
+    _gjudge_inflight: dict = {"on": False}
+    _gjudge_pending: dict = {"intent": ""}
     # 沉默心跳:AI 講完話客戶耐冇出聲 → 主動確認「仲喺度嗎」並帶返當前步。
     # count 會喺客戶真開口(on_user_turn_completed)時歸零。last_user_ts/last_reply_ts
     # 記錄「客戶最後開聲」與「AI 最後講完」時刻(秒),心跳只在兩者都足夠舊先開火
@@ -3107,6 +3151,104 @@ async def entrypoint(ctx):
         finally:
             _judge_inflight["step"] = -1
 
+    async def _background_intent_judge(step_at: int, utt: str, candidates: list[FlowIntent]) -> None:
+        """3.4 意图判据:背景一次批量评估全部候选意图(让路 delay → FLOW_JUDGE_* 9B 专线)。
+
+        形态复用 `_background_flow_judge`:判定唔喺开声前同步等(每轮拖慢),命中只落
+        `_gjudge_pending`,**下一轮图引擎求值时先生效**。候选快照喺调度时算好(scoped+
+        有可触发绑定),本任务唔再重算资格(单次调用=一次 LLM call,绝不 N 次)。
+        """
+        try:
+            # 让路节流同 flow judge:主回复刚提交,先等一拍再跑判定(同一 env 旋钮)。
+            await asyncio.sleep(float(os.environ.get("FLOW_JUDGE_DELAY", "3")))
+            from .flow import build_intent_judge_messages, parse_intent_judge_output
+
+            # 判定专线解析与 _background_flow_judge 逐字同源(FLOW_JUDGE_* → llm 卡 → MLX)。
+            jbase = (
+                os.environ.get("FLOW_JUDGE_LLM_BASE_URL", "").strip()
+                or (llm_cfg.get("base_url") or "")
+                or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1")
+            ).rstrip("/")
+            jmodel = (
+                os.environ.get("FLOW_JUDGE_LLM_MODEL", "").strip()
+                or llm_cfg.get("model")
+                or os.environ.get("MLX_LLM_MODEL", "")
+            )
+            if not jbase or not jmodel:
+                # review N11:endpoint 缺席静默 return 会让 judge_scheduled 后无下文
+                # (日志面断裂,排查会以为任务丢咗)——补 skipped 打点。
+                print(
+                    f"FLOW_GRAPH judge_skipped reason=no_endpoint (call {room_name})",
+                    flush=True,
+                )
+                return
+            _gjgoal, _gjref = flow_ctrl.current_goal_ref()
+            msgs = build_intent_judge_messages(
+                intents=[
+                    {"id": i.id, "label": i.label, "prompt": i.judge_prompt}
+                    for i in candidates
+                ],
+                user_text=utt,
+                step_1based=step_at + 1,
+                goal=_gjgoal or _gjref,
+            )
+            # max_tokens=32:intent id 长过 8 token,唔够会截到半个 id(判定返空)。
+            # timeout=20(review N9):非流式总预算,9B 判据集 prefill ~0.6k tok/s 档,
+            # 中型候选集(4-7k tok)5s 必超时=静默永久 miss;背景任务延迟不敏感
+            # (3s 让路 delay 都喺度),放宽到 20s 换「中型判据集可用」。
+            _gjtext = await _llm_judge(jbase, jmodel, msgs, max_tokens=32, timeout=20.0)
+            _gjhit = parse_intent_judge_output(_gjtext, [i.id for i in candidates])
+            # store 守卫(与 flow judge 换步守卫同源):判定期间已换步/暂停/收线/开关
+            # 被关 → 迟到的命中唔准注入(下一轮已唔同语境,注入=错步触发)。closing
+            # 也拦:收线后图引擎整块旁路,pending 永无消费点(结构性泄漏)。
+            if not _gjhit:
+                print(f"FLOW_GRAPH judge_miss step={step_at + 1} (call {room_name})", flush=True)
+            elif (
+                flow_ctrl.current != step_at
+                or agent.paused
+                or flow_ctrl.closing
+                or os.environ.get("BOK_FLOW_GRAPH_JUDGE", "1") != "1"
+            ):
+                print(
+                    f"FLOW_GRAPH judge_skipped reason=stale (call {room_name})",
+                    flush=True,
+                )
+            else:
+                _gjudge_pending["intent"] = _gjhit
+                print(
+                    f"FLOW_GRAPH judge_hit intent={_gjhit} step={step_at + 1} (call {room_name})",
+                    flush=True,
+                )
+        except Exception as exc:  # pragma: no cover - 背景判定失败唔影响回复
+            print(f"FLOW_GRAPH judge failed: {exc!r} (call {room_name})", flush=True)
+        finally:
+            _gjudge_inflight["on"] = False
+
+    def _maybe_schedule_intent_judge(utt: str) -> None:
+        """3.4 意图判据调度门(关键词未中时唯一入口)。
+
+        门控全在模块级 `_intent_judge_candidates`(便于单测);此处只做装配:拿到
+        非空候选才置在途标志+起任务+打点。**零回归保证**:冇任何意图带判断时候选
+        恒空 → 零任务、零专线调用、零日志(功能随数据 opt-in)。
+        """
+        candidates = _intent_judge_candidates(
+            flow_ctrl.graph,
+            step_1based=int(flow_ctrl.current) + 1,
+            fired=flow_ctrl.graph_fired,
+            closing=flow_ctrl.closing,
+            inflight=bool(_gjudge_inflight["on"]),
+            pending=bool(_gjudge_pending.get("intent")),
+        )
+        if not candidates:
+            return
+        _gjudge_inflight["on"] = True
+        # 池化(同 _background_flow_judge):强引用防 GC 中途回收,失败走 REPORT_TASK_ERR。
+        _spawn_report(_background_intent_judge(flow_ctrl.current, utt, candidates))
+        print(
+            f"FLOW_GRAPH judge_scheduled intents={len(candidates)} step={flow_ctrl.current + 1}",
+            flush=True,
+        )
+
     class PausableAgent(Agent):
         """可被主管台暂停/接管/恢复的 Agent：暂停期间抑制自动回复，但保留转写与历史。
 
@@ -3740,12 +3882,40 @@ async def entrypoint(ctx):
                 and not flow_ctrl.closing
                 and user_text
             ):
+                # 3.4 意图 judge 消费点:上一轮背景判定的命中在此**先取即清**
+                # (single-shot TTL——无论绑定最终是否真触发都算消费掉;pick 内对
+                # 该 id 重过 enabled/步 scope/绑定资格全部守卫,判据唔豁免任何闸)。
+                _gjudge_hit = _gjudge_pending.get("intent", "")
+                if _gjudge_hit:
+                    _gjudge_pending["intent"] = ""
                 _gbinding = pick_graph_action(
                     flow_ctrl.graph,
                     user_text,
                     step_1based=(int(flow_ctrl.current) + 1),
                     fired=flow_ctrl.graph_fired,
+                    # kill-switch 消费位配对(review F5):=0 时 pending 照清(TTL 唔悬挂)
+                    # 但唔再喂 judge_hit——中程翻闸唔会有「store 关了 consume 还在开」的半开态。
+                    judge_hit=(
+                        _gjudge_hit
+                        if _gjudge_hit
+                        and os.environ.get("BOK_FLOW_GRAPH_JUDGE", "1") == "1"
+                        else None
+                    ),
                 )
+                if _gjudge_hit:
+                    if _gbinding is not None:
+                        print(
+                            f"FLOW_GRAPH judge_pending_fired binding={_gbinding.id} "
+                            f"step={flow_ctrl.current + 1}",
+                            flush=True,
+                        )
+                    else:
+                        # 无资格绑定/意图已禁/已出 scope/once 已烧 → 作废(唔重试:
+                        # 判据判定结果只对当时语境有效,下一轮重新判)。
+                        print(
+                            f"FLOW_GRAPH judge_pending_expired intent={_gjudge_hit}",
+                            flush=True,
+                        )
             if _gbinding is not None:
                 if _gbinding.action == "jump_step":
                     # 1-based 存储转 0-based;先跳、按**实际位移**记账(2026-09-18
@@ -3828,6 +3998,14 @@ async def entrypoint(ctx):
                         f"qa={_gbinding.qa_id}",
                         flush=True,
                     )
+            elif user_text:
+                # 关键词未中才让判据判定补位——确定性关键词恒同步先行,judge 只做兜底
+                # (spec §4)。**elif 钉死在图块真求值过的分支**(review F1:旧 else 与
+                # 图块平级,空转写轮 user_text 为空令图块整体跳过时仍会漏进调度——
+                # 白烧一次 9B 之外,挂上的 pending 喺下一轮无话语支撑地触发绑定;
+                # say/收线/图关各路径 `_intent_judge_candidates` 门已覆盖,唯
+                # user_text 唔喺门参数里,这里结构上补死)。
+                _maybe_schedule_intent_judge(user_text)
             # ---- Q→A 检索快路(PR-3):四道闸全过 + 应答音频已预生成才命中 ----
             # 命中 → 跳过 LLM 直接播缓存音频(~50ms);任一闸不过 → 照旧走 LLM。
             # 位置在流程推进块之后:推进/收尾判定已落定,闸门让位(refuse/closing/

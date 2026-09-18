@@ -50,6 +50,21 @@
 - kill-switch `BOK_FLOW_GRAPH_JUDGE=0`；探针腿：同话语 keyword 腿 vs judge 腿 A/B
 - 最大件——必须等 3.1-3.3 落地后的真实话术反馈再立项（路线图原约束）
 
+**状态：已实施并验收（2026-09-19，用户拍板开闸）**。实施偏离 spec 的三处定案：
+①「同话语 A/B」落地为「同图同目标步、keyword 腿直中 vs judge 腿下一轮中」两条腿各跑
+（同话语无法既含关键词又不含关键词）；②消费语义钉死 single-shot TTL（pending 先取即清，
+无资格绑定=过期不重试）；③调度钉死 `elif user_text:`（空转写轮不进判定）。落地件：
+`flow_graph.py`（`judge_prompt`/校验/`pick_graph_action(judge_hit=)`/`eligible_judge_intents`）
++ `flow.py`（`build_intent_judge_messages`/`parse_intent_judge_output`）+ `agent.py`
+（六闸调度/背景批量判定/store 守卫/TTL 消费）+ 画布判据文本域 + 探针
+`--intent-judge` 腿。审查修掉 F1（调度漏空轮）/F5（消费位 kill 配对）/N9（9B 调用
+timeout=20+措辞禁序号+parse 剥中文标点）。证据（2026-09-19 实弹，reports/flow-graph/）：
+pytest 1606 全绿；`--intent-judge` 正腿 4/4（judge_scheduled+judge_hit+judge_effective，
+call-b24ab5d0/1789752590——fuzzy 话语被 ASR 劈两段，**第二段当场消费 pending 触发跳步**，
+劈轮鲁棒性顺带实证）；keyword A/B 腿 4/4（1789752688，同图同目标步同步直中零回归）；
+`--intent-judge --expect-off` 4/4（1789752836，`BOK_FLOW_GRAPH_JUDGE=0` 经
+`ps -wwE` 实证到 worker 进程 env）。
+
 ## 5. 非目标与既挂账
 
 - Phase 2 遗留 I3（跳步话面：4B 总览引力）——prompt 域专项，不属本四连；运营启用 graph 前实测
