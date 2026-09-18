@@ -54,11 +54,17 @@ def test_flow_graph_env_explicit_one_also_propagates(monkeypatch):
 
 
 def test_apply_flow_graph_env_is_pure_dict_fill(monkeypatch):
-    """helper 本身：只填 dict，不读不写别的键。"""
+    """helper 本身：只透传白名单键（absent 不注入），不写别的键。
+
+    清光白名单外环境（别名现透传 QA 三键，ambient env 会令精确等值断言变脆
+    ——重审实锤：BOK_QA_ROTATION=0 跑测即假红）。
+    """
     monkeypatch.setenv("BOK_FLOW_GRAPH", "0")
-    env: dict[str, str] = {}
+    for key in ("BOK_QA_ROTATION", "BOK_QA_PRIORITY", "BOK_QA_FASTPATH"):
+        monkeypatch.delenv(key, raising=False)
+    env: dict[str, str] = {"KEEP": "1"}
     bok._apply_flow_graph_env(env)
-    assert env == {"BOK_FLOW_GRAPH": "0"}
+    assert env == {"KEEP": "1", "BOK_FLOW_GRAPH": "0"}
 
 
 @pytest.mark.parametrize("key", ["BOK_QA_ROTATION", "BOK_QA_PRIORITY", "BOK_QA_FASTPATH"])
