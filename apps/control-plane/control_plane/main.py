@@ -2809,7 +2809,12 @@ _LOG_TTL_DAYS_DEFAULT = 7
 def _node_logs_dir(node_id: str) -> Path:
     base = (Path(os.environ.get("BOK_NODE_ARTIFACTS_DIR", "/app/downloads"))
             / "logs" / node_id)
-    base.mkdir(parents=True, exist_ok=True)
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        # 缺省 /app/downloads 是容器内路径；裸机/CI 上未配 env 时 mkdir 即失败
+        # ——503 明文（节点 ack ok=false 带原因）而非裸 500（CI ⑨ 步首跑实证）。
+        raise HTTPException(503, f"node log storage unavailable: {exc}") from exc
     return base
 
 
