@@ -387,12 +387,14 @@ function AudioDevicesCard({ room }: { room: Room | null }) {
   );
 }
 
-/** 未接通空态：官方点阵（connecting 演示态）替代手绘 canvas */
+/** 未接通空态：官方 Aura（idle 静态）替代手绘 canvas */
 function IdleStage() {
   return (
     <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
-      {/* themeMode=light 白底渲染；color 用官方默认 #1FD5F9（青系，与 --live 同族） */}
-      <AgentAudioVisualizerAura state="connecting" size="md" themeMode="light" />
+      {/* themeMode=light 白底渲染；color 用官方默认 #1FD5F9（青系，与 --live 同族）。
+          state 用 idle（亮度恒 1.0 静态光晕）——connecting 演示态是 0.5↔2.5 无限
+          亮度脉冲（use-agent-audio-visualizer-aura），uMix 直通 alpha，白底下呈频闪。 */}
+      <AgentAudioVisualizerAura state="idle" size="md" themeMode="light" />
       <p className="stage-value stage-glow mt-2">Live Agent</p>
       <p className="text-sm text-(--foreground)">点击「接通」开始与 AI 助手对话</p>
       <p className="text-xs muted">浏览器将请求麦克风权限</p>
