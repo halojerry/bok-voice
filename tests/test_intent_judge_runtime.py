@@ -50,8 +50,10 @@ def test_build_includes_all_candidates_and_user_text():
     for token in (_ID_A, _ID_B, "投诉", "退款", "客户明确要求投诉或转人工", "退回款项", "第2步", "核实下单平台"):
         assert token in sys_text, token
     assert "你们这个件拖了半个月了" in msgs[1]["content"]
-    # 单选输出契约(一个 id 或 NONE),防模型自由发挥
-    assert "NONE" in sys_text and "只输出一个意图编号" in sys_text
+    # 单选输出契约(一个 id 或 NONE),防模型自由发挥;review N9 后措辞钉「原样照抄
+    # id」且明确禁序号——「编号」旧措辞会诱导 9B 回 1/2/3 序号(parse 只认 id 原文)。
+    assert "NONE" in sys_text and "原样照抄" in sys_text and "不要输出序号" in sys_text
+    assert "编号" not in sys_text
     assert "NONE" in msgs[1]["content"]
 
 
@@ -91,6 +93,10 @@ def test_build_is_standard_written_chinese():
         f"'{_ID_A}'",
         f'"{_ID_A}"',
         f"\n\n{_ID_A}\n",
+        # review N9:9B 收尾带中文标点(句号/感叹号)旧版唔剥=永久 miss
+        f"{_ID_A}。",
+        f"{_ID_A}！",
+        f"「{_ID_A}」",
     ],
 )
 def test_parse_plain_and_fenced_variants(raw):

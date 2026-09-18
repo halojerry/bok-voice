@@ -1323,15 +1323,18 @@ def build_intent_judge_messages(
         "\n候选意图："
     )
     for item in intents:
-        sys += f"\n- 编号 {item.get('id')}｜名称 {item.get('label') or '(无)'}｜判据 {item.get('prompt')}"
+        sys += f"\n- id {item.get('id')}｜名称 {item.get('label') or '(无)'}｜判据 {item.get('prompt')}"
     sys += (
-        "\n判定规则：只按判据判断，不要凭编号或名称猜测；"
+        "\n判定规则：只按判据判断，不要凭名称猜测；"
         "命中多个时选判据最贴合的一个；全部不贴合就输出 NONE。"
-        "\n只输出一个意图编号，或 NONE。不要输出任何其它文字。"
+        # review N9:「编号」措辞会诱导 9B 回序号(1/2/3)——parse 只认候选表 id 原文,
+        # 回序号=永久 miss。措辞钉死「原样照抄 id」。
+        "\n答案只输出命中意图的 id：从候选表里原样照抄（形如 int_ 开头的完整 id），"
+        "不要输出序号、名称或任何其它文字；全部不贴合时只输出 NONE。"
     )
     return [
         {"role": "system", "content": sys},
-        {"role": "user", "content": f"客户：「{user_text}」\n只输出一个意图编号或 NONE。"},
+        {"role": "user", "content": f"客户：「{user_text}」\n只输出命中意图的 id（原样照抄）或 NONE。"},
     ]
 
 
@@ -1343,7 +1346,8 @@ def parse_intent_judge_output(text: str, valid_ids: list[str]) -> str:
     都唔可以喺模糊轮乱触发绑定)。
     """
     for raw_line in (text or "").splitlines():
-        token = raw_line.strip().strip("`'\"\u201c\u201d\u2018\u2019").strip()
+        # review N9:句尾中文标点(「int_xxx。」)旧版唔剥=miss——9B 收尾带句号/角引号唔罕见。
+        token = raw_line.strip().strip("`'\"\u201c\u201d\u2018\u2019「」『』。，！？、；：").strip()
         if not token:
             continue  # 围栏行「```」剥完即空:继续看下一行(```\nid\n``` 形态)
         return token if token in valid_ids else ""

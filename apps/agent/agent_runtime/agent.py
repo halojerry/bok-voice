@@ -178,19 +178,23 @@ async def _strip_expr_markup(text):
         yield ""
 
 
-async def _llm_judge(base_url: str, model: str, messages: list, *, max_tokens: int = 8) -> str:
+async def _llm_judge(
+    base_url: str, model: str, messages: list, *, max_tokens: int = 8, timeout: float = 5.0
+) -> str:
     """流程推进判定器:对本地 MLX LLM 发一个 max_tokens 极短请求,取回一个字。失败返空(唔推进)。
 
     参数面与主回复同源(stop/温度语义),走 openai SDK(自动重试/超时),唔再手搓 HTTP。
     `max_tokens` 具名参数缺省 8=推进判定器原值(既有调用点零变化);意图判据判定
-    (3.4)输出 intent id,长过 8 token,调用点显式传大值。
+    (3.4)输出 intent id,长过 8 token,调用点显式传大值。`timeout` 缺省 5.0 同理
+    (review N9:非流式单请求的总预算——9B 判据集 prefill 慢,意图判定调用点显式放宽,
+    超时返空=静默永久 miss,唔可以两边共用 5s 硬码)。
     """
     if not base_url or not model:
         return ""
     from openai import AsyncOpenAI
 
     try:
-        client = AsyncOpenAI(api_key="mlx", base_url=base_url, timeout=5, max_retries=1)
+        client = AsyncOpenAI(api_key="mlx", base_url=base_url, timeout=timeout, max_retries=1)
         r = await client.chat.completions.create(
             model=model,
             messages=messages,
@@ -3171,6 +3175,12 @@ async def entrypoint(ctx):
                 or os.environ.get("MLX_LLM_MODEL", "")
             )
             if not jbase or not jmodel:
+                # review N11:endpoint 缺席静默 return 会让 judge_scheduled 后无下文
+                # (日志面断裂,排查会以为任务丢咗)——补 skipped 打点。
+                print(
+                    f"FLOW_GRAPH judge_skipped reason=no_endpoint (call {room_name})",
+                    flush=True,
+                )
                 return
             _gjgoal, _gjref = flow_ctrl.current_goal_ref()
             msgs = build_intent_judge_messages(
@@ -3183,7 +3193,10 @@ async def entrypoint(ctx):
                 goal=_gjgoal or _gjref,
             )
             # max_tokens=32:intent id 长过 8 token,唔够会截到半个 id(判定返空)。
-            _gjtext = await _llm_judge(jbase, jmodel, msgs, max_tokens=32)
+            # timeout=20(review N9):非流式总预算,9B 判据集 prefill ~0.6k tok/s 档,
+            # 中型候选集(4-7k tok)5s 必超时=静默永久 miss;背景任务延迟不敏感
+            # (3s 让路 delay 都喺度),放宽到 20s 换「中型判据集可用」。
+            _gjtext = await _llm_judge(jbase, jmodel, msgs, max_tokens=32, timeout=20.0)
             _gjhit = parse_intent_judge_output(_gjtext, [i.id for i in candidates])
             # store 守卫(与 flow judge 换步守卫同源):判定期间已换步/暂停/收线/开关
             # 被关 → 迟到的命中唔准注入(下一轮已唔同语境,注入=错步触发)。closing
@@ -3880,7 +3893,14 @@ async def entrypoint(ctx):
                     user_text,
                     step_1based=(int(flow_ctrl.current) + 1),
                     fired=flow_ctrl.graph_fired,
-                    judge_hit=_gjudge_hit or None,
+                    # kill-switch 消费位配对(review F5):=0 时 pending 照清(TTL 唔悬挂)
+                    # 但唔再喂 judge_hit——中程翻闸唔会有「store 关了 consume 还在开」的半开态。
+                    judge_hit=(
+                        _gjudge_hit
+                        if _gjudge_hit
+                        and os.environ.get("BOK_FLOW_GRAPH_JUDGE", "1") == "1"
+                        else None
+                    ),
                 )
                 if _gjudge_hit:
                     if _gbinding is not None:
@@ -3978,9 +3998,13 @@ async def entrypoint(ctx):
                         f"qa={_gbinding.qa_id}",
                         flush=True,
                     )
-            else:
-                # 关键词未中(含图引擎关/收线/空轮):模糊轮才让判据判定补位——
-                # 确定性关键词恒同步先行,judge 只做兜底(spec §4)。
+            elif user_text:
+                # 关键词未中才让判据判定补位——确定性关键词恒同步先行,judge 只做兜底
+                # (spec §4)。**elif 钉死在图块真求值过的分支**(review F1:旧 else 与
+                # 图块平级,空转写轮 user_text 为空令图块整体跳过时仍会漏进调度——
+                # 白烧一次 9B 之外,挂上的 pending 喺下一轮无话语支撑地触发绑定;
+                # say/收线/图关各路径 `_intent_judge_candidates` 门已覆盖,唯
+                # user_text 唔喺门参数里,这里结构上补死)。
                 _maybe_schedule_intent_judge(user_text)
             # ---- Q→A 检索快路(PR-3):四道闸全过 + 应答音频已预生成才命中 ----
             # 命中 → 跳过 LLM 直接播缓存音频(~50ms);任一闸不过 → 照旧走 LLM。
