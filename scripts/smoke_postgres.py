@@ -84,7 +84,8 @@ _MIGRATION_COLUMNS: dict[str, tuple[str, ...]] = {
     "global_settings": ("sip_json",),
     # 战役调度三字段（2026-09-17 campaign-scheduling-dashboard Task 1）。
     "campaigns": ("scripts_json", "call_windows_json", "max_concurrency", "redispatch_json"),
-    "qa_entries": ("owner_user_id",),
+    # cluster_head_id：同义簇（qa-canvas Phase 1）；priority：匹配优先级（Phase 3.1）。
+    "qa_entries": ("owner_user_id", "cluster_head_id", "priority"),
     "users": ("permissions_json",),
 }
 

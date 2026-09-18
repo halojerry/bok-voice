@@ -382,6 +382,9 @@ class QaEntry(Base):
     # 同义簇(spec 2026-09-17 Phase1):非空=本条是指向条目的变体(一层星形)。
     # 纯展示/组织字段——qa_gate 匹配/罐头 key 均不读它。
     cluster_head_id: Mapped[str] = mapped_column(String(64), default="")
+    # 匹配优先级(2026-09-18 Phase 3.1):阈值过关者中小者先;默认 10=与 graph
+    # DEFAULT_PRIORITY 同约定,全默认时胜者与旧纯分数档逐字节同。
+    priority: Mapped[int] = mapped_column(Integer, default=10)
     template_id: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 

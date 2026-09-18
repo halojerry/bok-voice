@@ -425,7 +425,8 @@ CREATE TABLE public.qa_entries (
     source character varying(16) NOT NULL,
     cluster_head_id character varying(64) NOT NULL,
     template_id character varying(64) NOT NULL,
-    created_at timestamp without time zone NOT NULL
+    created_at timestamp without time zone NOT NULL,
+    priority integer DEFAULT 10 NOT NULL
 );
 
 
