@@ -334,12 +334,18 @@ test("page.tsx 接线：判据草稿进状态、判据文本域在场、保存�
   const src = readFileSync(path.join(WEB_ROOT, "app", "(app)", "qa", "page.tsx"), "utf8");
   assert.match(src, /useState\(intent\.judge\?\.prompt \?\? ""\)/); // 加载侧进草稿
   assert.match(src, /judge:\s*intentJudgeField\(judgeText\)/); // 保存侧唯一投影
-  assert.match(src, /JUDGE_PROMPT_MAX_CHARS/); // 超长可见报错（不静默截断）
+  // I1 修正(review)：裸 JUDGE_PROMPT_MAX_CHARS 会被 import 行喂饱(恒绿)——钉比较本身，
+  // 删掉整段超长检查块此断言必红。
+  assert.match(src, /judgePrompt\.length\s*>\s*JUDGE_PROMPT_MAX_CHARS/); // 超长可见报错（不静默截断）
+  assert.match(src, /判据最长 /); // 报错文案在场（与上一条双锚，防只留比较删报错）
   assert.match(src, /判据（可选）/); // 文本域标签
   assert.match(
     src,
     /判据即 prompt 片段：写清什么算命中、什么不算（正反例）。留空=仅关键词确定性命中。关键词未中时由后台大模型按判据评估，命中下一轮生效。/,
   );
   assert.doesNotMatch(src, /judge:\s*\{\s*prompt/); // 不许第二处自拼 judge 对象
+  // N1 修正(review)：形状特定负守卫测不到 judge: intentJudgeField(other) 类第二投影——
+  // count 锚直钉「全文件 judge: 字面量恰一处」。
+  assert.equal((src.match(/judge:/g) ?? []).length, 1); // 唯一保存路径投影（count 锚）
 });
 

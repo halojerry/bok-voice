@@ -1292,7 +1292,8 @@ function IntentEditorModal(props: {
   const [label, setLabel] = useState(intent.label);
   const [keywordsText, setKeywordsText] = useState(intent.keywords.join("，"));
   // 判据（Phase 3.4）：关键词未中时的背景 LLM 判定 prompt 片段；空=仅关键词确定性命中。
-  // 加载侧直读 `judge?.prompt`（坏形状在 lib 层已宽容解析丢弃，编辑器只面对合法 doc）。
+  // 加载侧 `?.` 容错直读（lib 层 parseGraphDoc 不消毒存量坏形状——存坏的 judge 在下次
+  // 保存时经 intentJudgeField 重建即被丢弃，编辑器存活期只展示其 prompt 字符串）。
   const [judgeText, setJudgeText] = useState(intent.judge?.prompt ?? "");
   const [allSteps, setAllSteps] = useState(intent.steps.length === 0);
   // 越界步号(话术步数被改小后)不进编辑态:chips 只画真实步,保存时随之剔除(下方提示)。
@@ -1412,7 +1413,8 @@ function IntentEditorModal(props: {
           <div>
             <span className="label">{isDraft ? "新建意图" : "编辑意图"}</span>
             <p className="mt-1 text-[11px] leading-relaxed muted">
-              客户话里命中任一关键词即触发，按优先级从小到大取第一条绑定执行。
+              客户话里命中任一关键词即触发，按优先级从小到大取第一条绑定执行；配了判据时，
+              关键词未中的模糊表达由后台大模型按判据评估，命中下一轮生效。
             </p>
           </div>
           <button className="btn-ghost text-xs" onClick={props.onCancel}>关闭</button>

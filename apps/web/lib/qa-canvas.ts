@@ -186,7 +186,8 @@ export function bindingFromDraft(
 // **逐字节同**；清空既有判据也走这里覆盖掉原值（缺这条=打开旧判据删掉保存仍在）。
 // 超长（>400 字）由编辑器表单**可见报错**拦下，纯函数不截断（静默截断=偷偷改客户判据）。
 
-/** CP `flow_graph.JUDGE_PROMPT_MAX_CHARS`：judge.prompt 的合法上界，表单校验同源引用。 */
+/** judge.prompt 合法上界。与 CP `flow_graph.JUDGE_PROMPT_MAX_CHARS` **同值但手工同步**
+ *  （跨语言无生成器；双侧测试各钉 400——改 CP 常量须同步改这里，否则表单会错拦合法值）。 */
 export const JUDGE_PROMPT_MAX_CHARS = 400;
 
 /**
