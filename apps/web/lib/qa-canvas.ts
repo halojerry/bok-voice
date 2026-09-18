@@ -23,15 +23,16 @@ export type QaRow = {
 export type FlowStep = { goal: string; ref: string };
 export type Pt = { x: number; y: number };
 
+// 三类节点 data 均带 `kind` 判别面（step/qaEntry/intent），CanvasNode 联合因此可判别。
 export type CanvasStepNode = {
   id: string; type: "qaStep";
   position: Pt;
-  data: { index: number; goal: string; refFirstLine: string; virtual: boolean };
+  data: { kind: "step"; index: number; goal: string; refFirstLine: string; virtual: boolean };
 };
 export type CanvasQaNode = {
   id: string; type: "qaEntry";
   position: Pt;
-  data: QaRow & { isHead: boolean; canned?: "ok" | "missing" };
+  data: QaRow & { kind: "qaEntry"; isHead: boolean; canned?: "ok" | "missing" };
 };
 export type CanvasEdge = {
   id: string;
@@ -140,6 +141,7 @@ export function deriveGraph(
     type: "qaStep" as const,
     position: { x: SPINE_X, y: 80 + i * STEP_GAP_Y },
     data: {
+      kind: "step",
       index: i,
       goal: String(s.goal || ""),
       refFirstLine: String(s.ref || "").split("\n")[0].slice(0, 40),
@@ -151,7 +153,7 @@ export function deriveGraph(
     id: "step:global",
     type: "qaStep" as const,
     position: { x: SPINE_X, y: 0 },
-    data: { index: -1, goal: "全程通用", refFirstLine: "不挂步骤的条目归此列", virtual: true },
+    data: { kind: "step", index: -1, goal: "全程通用", refFirstLine: "不挂步骤的条目归此列", virtual: true },
   });
 
   const heads = new Set(filtered.map((r) => String(r.cluster_head_id || "")).filter(Boolean));
@@ -179,7 +181,7 @@ export function deriveGraph(
       id: String(r.id),
       type: "qaEntry",
       position: pos,
-      data: { ...r, isHead },
+      data: { ...r, kind: "qaEntry", isHead },
     });
   }
   // 意图节点（话术图 Phase 2）：锚定首个生效步（全程锚第 1 步），同锚点纵向堆叠；

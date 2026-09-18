@@ -179,3 +179,15 @@ test("graph absent = zero intent nodes/edges", () => {
   assert.equal(graph.nodes.filter((n) => n.type === "intent").length, 0);
   assert.equal(graph.edges.filter((e) => e.data?.kind === "binding").length, 0);
 });
+
+test("deriveGraph 三类节点 data.kind 判别面（step/qaEntry/intent 同面可判别）", () => {
+  const graph = qa.deriveGraph(ROWS, STEPS, {
+    langFilter: "all", positions: {}, graph: qa.parseGraphDoc(JSON.stringify(GRAPH_DOC)),
+  });
+  // 判别面必须每个节点都在（Task 7/8 靠 data.kind 分派渲染/交互，虚拟 step:global 不例外）。
+  assert.ok(graph.nodes.every((n) => typeof n.data.kind === "string"));
+  assert.deepEqual([...new Set(graph.nodes.map((n) => n.data.kind))].sort(), ["intent", "qaEntry", "step"]);
+  assert.equal(graph.nodes.find((n) => n.id === "step:global").data.kind, "step");
+  assert.equal(graph.nodes.find((n) => n.id === "h").data.kind, "qaEntry");
+  assert.equal(graph.nodes.find((n) => n.id === "intent:int_1a2b3c4d").data.kind, "intent");
+});
