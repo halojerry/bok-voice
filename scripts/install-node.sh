@@ -112,7 +112,7 @@ else
 fi
 
 # ---------- [4/6] 模型下载（--skip-models 可跳） ----------
-if [[ $SKIP_MODES -eq 0 ]]; then
+if [[ $SKIP_MODELS -eq 0 ]]; then
   step "模型下载（幂等续传）"
   run "$PY" "$REPO_ROOT/tools/bok.py" download
 fi
