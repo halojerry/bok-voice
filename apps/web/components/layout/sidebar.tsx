@@ -23,7 +23,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
 import { useSession } from "@/components/session-context";
 import {
@@ -48,7 +48,18 @@ export type SidebarProps = {
   mobileOpen: boolean;
   /** 请求收起移动端抽屉（遮罩点击 / 路由变化时回调壳）。 */
   onMobileClose: () => void;
+  /** 顶栏汉堡按钮 ref（壳层接线）：抽屉关闭后焦点还到打开者（dialog 模式惯例）。 */
+  mobileTriggerRef?: RefObject<HTMLButtonElement | null>;
 };
+
+/** 抽屉内可聚焦元素选择器（dialog 焦点圈定用；inert/隐藏项运行时再滤）。 */
+const FOCUSABLE_SELECTOR =
+  'a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"]), input, select, textarea';
+
+/** 元素当前可聚焦（抽屉在 display:none 容器里时 offsetParent 为 null）。 */
+function isFocusable(el: HTMLElement): boolean {
+  return el.offsetParent !== null;
+}
 
 /** 单条导航链接：激活=青底青字，折叠=图标居中+Tooltip+左缘竖条。 */
 function SidebarNavLink({
@@ -165,7 +176,11 @@ function SidebarContent({
   );
 }
 
-export function Sidebar({ mobileOpen, onMobileClose }: SidebarProps) {
+export function Sidebar({
+  mobileOpen,
+  onMobileClose,
+  mobileTriggerRef,
+}: SidebarProps) {
   const pathname = usePathname();
   const onStage = isStageRoute(pathname);
   // 存储偏好：初渲染恒展开（与 static export 服务端 HTML 一致），mount 后应用存储值。
@@ -211,20 +226,64 @@ export function Sidebar({ mobileOpen, onMobileClose }: SidebarProps) {
     }
   }, [pathname]);
 
-  // 抽屉打开时：Esc 关闭 + 锁 body 滚动（遮罩外的背景页不跟滚）。
+  // 抽屉打开时（dialog 模式）：Esc 关闭 + 焦点圈定（Tab 循环锁抽屉内，含把
+  // 意外落在外面的焦点拉回）+ 进场聚焦首项 + 关闭后焦点还到顶栏汉堡按钮
+  // （打开者）；并锁 body 滚动（遮罩外的背景页不跟滚）。
+  const drawerRef = useRef<HTMLElement | null>(null);
   useEffect(() => {
     if (!mobileOpen) return;
+    const drawer = drawerRef.current;
+    const focusInDrawer = () => {
+      if (!drawer) return false;
+      return (
+        document.activeElement instanceof Node &&
+        drawer.contains(document.activeElement)
+      );
+    };
+    const drawerFocusables = () => {
+      if (!drawer) return [];
+      return Array.from(
+        drawer.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR),
+      ).filter(isFocusable);
+    };
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") closeRef.current();
+      if (event.key === "Escape") {
+        closeRef.current();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const items = drawerFocusables();
+      if (items.length === 0) return;
+      const active = document.activeElement;
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (event.shiftKey) {
+        if (!focusInDrawer() || active === first) {
+          event.preventDefault();
+          last.focus();
+        }
+        return;
+      }
+      if (!focusInDrawer() || active === last) {
+        event.preventDefault();
+        first.focus();
+      }
     };
     document.addEventListener("keydown", onKey);
+    // 进场聚焦抽屉首项（无项则聚焦抽屉本身；桌面宽度下抽屉 display:none，聚焦
+    // 自然 no-op 不产生副作用）。
+    const firstItem = drawerFocusables()[0];
+    (firstItem ?? drawer)?.focus();
     const prevOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     return () => {
       document.removeEventListener("keydown", onKey);
       document.body.style.overflow = prevOverflow;
+      // 关闭（Esc/遮罩/路由变化）后焦点还给汉堡按钮——否则焦点留在已 inert 的
+      // 抽屉里（aria-hidden 元素持有焦点是 a11y 缺陷）。
+      mobileTriggerRef?.current?.focus();
     };
-  }, [mobileOpen]);
+  }, [mobileOpen, mobileTriggerRef]);
 
   const toggleCollapsed = () => {
     if (onStage) {
@@ -247,10 +306,10 @@ export function Sidebar({ mobileOpen, onMobileClose }: SidebarProps) {
 
   return (
     <>
-      {/* 桌面恒驻（≥md）：文档流内 sticky 左栏，不遮内容。 */}
+      {/* 桌面恒驻（≥md）：文档流内 sticky 左栏，不遮内容。折叠/展开宽度 200ms 过渡。 */}
       <aside
         className={cn(
-          "sticky top-0 hidden h-screen shrink-0 flex-col border-r border-border bg-background md:flex",
+          "sticky top-0 hidden h-screen shrink-0 flex-col border-r border-border bg-background transition-[width] duration-200 md:flex",
           widthClass,
         )}
       >
@@ -261,14 +320,18 @@ export function Sidebar({ mobileOpen, onMobileClose }: SidebarProps) {
         />
       </aside>
 
-      {/* 移动端抽屉（<md）：off-canvas + 半透明遮罩，translate-x / opacity 过渡。
-          抽屉恒展开（折叠只属桌面恒驻栏），关闭走遮罩/Esc/路由变化。
-          遮罩常挂（opacity + pointer-events 过渡）：关闭时抽屉 200ms 滑出期间
-          遮罩同步渐隐，不再条件渲染瞬拆闪断；关闭态 inert + 透明不可交互。 */}
+      {/* 移动端抽屉（<md）：off-canvas + 半透明遮罩，translate-x / opacity 过渡
+          （同为 duration-200 默认缓动，滑出与渐隐时序对齐）。
+          打开态 = dialog 语义：role="dialog" + aria-modal="true" + aria-label，
+          焦点圈定与还焦见上方 effect；抽屉恒展开（折叠只属桌面恒驻栏），关闭走
+          遮罩/Esc/路由变化。遮罩常挂（opacity + pointer-events 过渡）：关闭时
+          抽屉 200ms 滑出期间遮罩同步渐隐，不再条件渲染瞬拆闪断；关闭态 inert +
+          透明不可交互（遮罩自身 tabIndex=-1 不进 Tab 序，键盘经 Esc 关闭）。 */}
       <div className="md:hidden">
         <button
           type="button"
           aria-label="关闭导航"
+          tabIndex={-1}
           onClick={onMobileClose}
           inert={!mobileOpen}
           className={cn(
@@ -277,6 +340,11 @@ export function Sidebar({ mobileOpen, onMobileClose }: SidebarProps) {
           )}
         />
         <aside
+          ref={drawerRef}
+          role="dialog"
+          aria-modal={mobileOpen || undefined}
+          aria-label="导航"
+          tabIndex={-1}
           inert={!mobileOpen}
           className={cn(
             "fixed inset-y-0 left-0 z-50 flex w-60 flex-col border-r border-border bg-background transition-transform duration-200",

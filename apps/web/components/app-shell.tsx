@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { AlertCircle, Inbox } from "lucide-react";
 import { AccountProvider, useAccount } from "@/components/account-context";
 import { Sidebar } from "@/components/layout/sidebar";
@@ -77,6 +77,8 @@ function RouteGuard({ children }: { children: React.ReactNode }) {
 export function AppShell({ children }: { children: React.ReactNode }) {
   // 移动端导航抽屉开关：壳持有（Task 2 契约），Sidebar 受控、Topbar 汉堡触发。
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  // 汉堡按钮 ref：抽屉（dialog）关闭后 Sidebar 把焦点还到打开者。
+  const mobileTriggerRef = useRef<HTMLButtonElement | null>(null);
   // 会话在最外层：AccountProvider（账号归属）与导航/守卫都读 SessionProvider。
   return (
     <SessionProvider>
@@ -88,10 +90,12 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               <Sidebar
                 mobileOpen={mobileNavOpen}
                 onMobileClose={() => setMobileNavOpen(false)}
+                mobileTriggerRef={mobileTriggerRef}
               />
               <div className="flex min-w-0 flex-1 flex-col">
                 <Topbar
                   onMobileOpen={() => setMobileNavOpen(true)}
+                  mobileTriggerRef={mobileTriggerRef}
                   status={<StatusBadge />}
                 />
                 <main className="mx-auto w-full max-w-6xl flex-1 px-6 pb-12 pt-6 lg:px-8">
