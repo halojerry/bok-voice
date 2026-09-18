@@ -1399,7 +1399,7 @@ function IntentEditorModal(props: {
               placeholder="投诉，我要投诉，找主管"
             />
             <span className="mt-1 block text-[11px] leading-relaxed muted">
-              客户原话里按字面出现任一关键词即命中（不认同义改写，按客户实际说法写）；最多 32 个、单个 ≤64 字。
+              客户原话里按字面出现任一关键词即命中（不认同义改写，按客户实际说法写）；标点与空格不影响匹配；最多 32 个、单个 ≤64 字。
             </span>
           </label>
 

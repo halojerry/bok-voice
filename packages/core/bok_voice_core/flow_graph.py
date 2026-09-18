@@ -3,7 +3,9 @@
 模板可选携带 graph_json:意图节点(确定性关键词触发)+绑定边(play_qa 播罐头 /
 jump_step 跳步)。CP 保存走 validate_flow_graph(严格,错误列表→400);运行时走
 parse_flow_graph(宽容,坏数据→空图零变化)与 pick_graph_action(每轮至多一个动作,
-priority 小者先)。设计契约见 spec §3/§4;消费方:control_plane.main(保存校验)、
+priority 小者先)。关键词命中=**双侧归一**(剥空白与中英标点 → casefold)后子串判定
+——ASR 转写常带标点(实测「我要。投诉。」),归一后多字关键词才命中(I2,2026-09-18)。
+设计契约见 spec §3/§4;消费方:control_plane.main(保存校验)、
 agent_runtime.flow(装配解析)、agent_runtime.agent(每轮命中)。
 """
 
@@ -28,6 +30,23 @@ ACTION_PLAY_QA = "play_qa"
 ACTION_JUMP_STEP = "jump_step"
 ACTIONS = {ACTION_PLAY_QA, ACTION_JUMP_STEP}
 _ID_RE = re.compile(r"^(?:int|bnd)_[0-9a-f]{8}$")
+
+# 关键词匹配噪声(I2,2026-09-18):ASR 转写窗口带标点/空格(实测「我要。投诉。」
+# 「我 要 投 诉」),运营写的关键词恒为连写形态 → 双侧剥噪声再 casefold 子串。
+# 字符集经 re.escape 包成字符类,方括号/反斜杠/引号都唔会漏转义。
+_PUNCT_NOISE_CHARS = (
+    "，。！？、；：～…·—"
+    "\u201c\u201d\u2018\u2019"
+    "「」『』（）〈〉《》【】〔〕"
+    ",.!?;:'\"()[]{}<>"
+    "/\\|+*=^`#@$%&_-"
+)
+_PUNCT_NOISE_RE = re.compile(f"[{re.escape(_PUNCT_NOISE_CHARS)}\\s]+")
+
+
+def normalize_graph_text(value: object) -> str:
+    """关键词/用户话命中归一(纯函数):剥空白与中英标点 → casefold;空值安全。"""
+    return _PUNCT_NOISE_RE.sub("", str(value or "")).casefold()
 
 
 @dataclass
@@ -131,7 +150,7 @@ def parse_flow_graph(raw: str | bytes | None) -> FlowGraphDoc:
         return FlowGraphDoc()
     try:
         data = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):  # RecursionError:深嵌套体唔准逃逸 never-raise
         return FlowGraphDoc()
     if not isinstance(data, dict) or _as_int(data.get("version"), 0) != GRAPH_VERSION:
         return FlowGraphDoc()
@@ -162,14 +181,17 @@ def validate_flow_graph(raw: str | bytes) -> list[str]:
     errors: list[str] = []
     if len(text.encode("utf-8")) > GRAPH_MAX_BYTES:
         errors.append(f"graph_json exceeds {GRAPH_MAX_BYTES} bytes")
+        return errors  # 超限体唔再 json.loads:巨体/深嵌套解析白费,错误已定
     try:
         data = json.loads(text)
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:  # 深嵌套体同走错误列表契约
         errors.append(f"invalid json: {exc}")
         return errors
     if not isinstance(data, dict):
         return ["graph_json must be a json object"]
-    if data.get("version") != GRAPH_VERSION:
+    # version 必须**恰为** int 1:bool 是 int 子类,`True != 1` 为假会静默放行。
+    version = data.get("version")
+    if not isinstance(version, int) or isinstance(version, bool) or version != GRAPH_VERSION:
         errors.append(f"version must be {GRAPH_VERSION}")
     raw_intents = data.get("intents")
     raw_bindings = data.get("bindings")
@@ -211,6 +233,9 @@ def validate_flow_graph(raw: str | bytes) -> list[str]:
             not isinstance(s, int) or isinstance(s, bool) or s < 1 or s > STEP_MAX for s in steps
         ):
             errors.append(f"intents[{idx}].steps must be ints in [1,{STEP_MAX}]")
+        # enabled 与绑定边同档(bool 才收;非 bool 静默当默认值=运营勾选失效)。
+        if "enabled" in item and not isinstance(item["enabled"], bool):
+            errors.append(f"intents[{idx}].enabled must be bool")
     seen_bindings: set[str] = set()
     for idx, item in enumerate(raw_bindings):
         if not isinstance(item, dict):
@@ -250,11 +275,12 @@ def pick_graph_action(
     step_1based: int,
     fired: set[str],
 ) -> GraphBinding | None:
-    """确定性命中:enabled 意图 + 关键词 casefold 子串 + 步号 scope;绑定按
-    (priority, id) 升序取首个,once 且已 fired 的跳过。无命中返回 None。"""
+    """确定性命中:enabled 意图 + 关键词归一化子串(双侧剥标点/空格+casefold)
+    + 步号 scope;绑定按 (priority, id) 升序取首个,once 且已 fired 的跳过。
+    无命中返回 None。"""
     if not doc.intents or not user_text:
         return None
-    text = user_text.lower()
+    text = normalize_graph_text(user_text)
     hit_ids: set[str] = set()
     for intent in doc.intents:
         if not intent.enabled:
@@ -262,7 +288,7 @@ def pick_graph_action(
         if intent.steps and step_1based not in intent.steps:
             continue
         for kw in intent.keywords:
-            token = kw.strip().lower()
+            token = normalize_graph_text(kw)
             if token and token in text:
                 hit_ids.add(intent.id)
                 break

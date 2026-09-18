@@ -144,6 +144,7 @@ class ConversationTemplate:
     language: str = "zh"
     steps_json: str = ""
     hotwords: str = ""
+    graph_json: str = ""
     # 话务员级归属(B3):''=账号共享 / user_id=话务员个人(InMemory 建行回程用)。
     owner_user_id: str = ""
 

@@ -120,6 +120,99 @@ def test_validate_size_cap():
     assert any("bytes" in e for e in validate_flow_graph("x" * (GRAPH_MAX_BYTES + 1)))
 
 
+def test_validate_size_cap_returns_only_size_error():
+    """m2:超限体唔再 json.loads——错误表恰好一条 size 错,唔叠 json 解析错。"""
+    errs = validate_flow_graph("x" * (GRAPH_MAX_BYTES + 1))
+    assert len(errs) == 1 and "bytes" in errs[0]
+    # 超限但 JSON 合法(巨数组)同档:仍然只报 size
+    errs2 = validate_flow_graph('{"version":1,"pad":"' + "x" * (GRAPH_MAX_BYTES + 1) + '"}')
+    assert errs2 == [f"graph_json exceeds {GRAPH_MAX_BYTES} bytes"]
+
+
+def test_deeply_nested_json_never_raises():
+    """m2:深嵌套体 RecursionError 唔准逃逸 never-raise / 错误列表契约。"""
+    deep = "[" * 50000 + "]" * 50000
+    assert parse_flow_graph(deep).intents == []  # 宽容路径:空图,不抛
+    assert validate_flow_graph(deep)  # 严格路径:错误列表,不抛(超限先报 size)
+    # 未超限但嵌套远超递归上限:必须走到 RecursionError 捕获分支
+    under_cap = "[" * 10000 + "]" * 10000
+    assert len(under_cap) < GRAPH_MAX_BYTES
+    assert parse_flow_graph(under_cap).intents == []
+    errs = validate_flow_graph(under_cap)
+    assert errs and "json" in errs[0]
+
+
+def test_validate_version_must_be_exactly_int_one():
+    """m3:version 必须恰为 int 1——bool/float/str 全部拒收(bool 是 int 子类)。"""
+    ok = '{"version":1,"intents":[],"bindings":[]}'
+    assert validate_flow_graph(ok) == []
+    for bad in ("true", "false", '"1"', "1.0", "null"):
+        errs = validate_flow_graph('{"version":%s,"intents":[],"bindings":[]}' % bad)
+        assert any("version" in e for e in errs), bad
+
+
+def test_validate_intent_enabled_must_be_bool():
+    """m3:intents[].enabled 与绑定同档(bool 才收,非 bool=运营勾选静默失效)。"""
+
+    def _doc(enabled: object) -> str:
+        return json.dumps(
+            {
+                "version": 1,
+                "intents": [{"id": "int_1a2b3c4d", "label": "x", "keywords": ["k"], "steps": [], "enabled": enabled}],
+                "bindings": [],
+            }
+        )
+
+    assert validate_flow_graph(_doc(True)) == []
+    assert validate_flow_graph(_doc(False)) == []
+    for bad in (1, 0, "true", None):
+        errs = validate_flow_graph(_doc(bad))
+        assert any("enabled" in e for e in errs), bad
+    # 缺省=默认启用,唔报错(与 _as_bool 默认同向)
+    assert (
+        validate_flow_graph(
+            '{"version":1,"intents":[{"id":"int_1a2b3c4d","label":"x","keywords":["k"],"steps":[]}],"bindings":[]}'
+        )
+        == []
+    )
+
+
+def test_pick_keyword_matches_through_punctuation_and_spaces():
+    """I2:ASR 转写带标点/空格(实测「我要。投诉。」)→ 双侧归一后多字关键词照命中。"""
+    doc = parse_flow_graph(_good_doc())
+    for text in ("我要。投诉。", "我 要 投 诉", "我要投诉！", "（我要投诉）", "我要\u3000投诉", "我要，投诉。"):
+        hit = pick_graph_action(doc, text, step_1based=2, fired=set())
+        assert hit is not None and hit.action == "jump_step", text
+    # 关键词侧同样归一:运营写带标点的关键词也命中连写原话
+    kw_doc = parse_flow_graph(
+        json.dumps(
+            {
+                "version": 1,
+                "intents": [{"id": "int_5e6f7a8b", "label": "投诉", "keywords": ["我要投诉！"], "steps": []}],
+                "bindings": [
+                    {"id": "bnd_8f9a0b1c", "intent": "int_5e6f7a8b", "action": "jump_step", "step": 2}
+                ],
+            },
+            ensure_ascii=False,
+        )
+    )
+    assert pick_graph_action(kw_doc, "我要投诉", step_1based=1, fired=set()) is not None
+    # 负向对照:字面唔重合唔可以因剥标点变成命中
+    assert pick_graph_action(doc, "我要退钱", step_1based=2, fired=set()) is None
+    assert pick_graph_action(doc, "我要。退钱。", step_1based=2, fired=set()) is None
+
+
+def test_normalize_graph_text_pure():
+    """I2 归一纯函数:剥空白+中英标点、casefold;空值安全(绝不抛)。"""
+    from bok_voice_core.flow_graph import normalize_graph_text
+
+    assert normalize_graph_text(" 我要。投诉！ ") == "我要投诉"
+    assert normalize_graph_text("A B, C.") == "abc"
+    assert normalize_graph_text("「標點」…—·（）") == "標點"
+    assert normalize_graph_text(None) == ""
+    assert normalize_graph_text(123) == "123"
+
+
 def test_pick_priority_scope_casefold_once():
     doc = parse_flow_graph(_good_doc())
     # step=3:两意图均命中(step 空=全程 / steps=[3]);priority 5 先于 10

@@ -1,7 +1,8 @@
 """worker env 白名单透传单测（2026-09-18 实弹发现）。
 
-`_agent_worker_env`/`_agent_prod_env` 是**白名单 env**（不带 `os.environ`）——
-命令行 `BOK_FLOW_GRAPH=0 python tools/bok.py serve` 到不了 agent worker，
+`_agent_worker_env`/`_agent_prod_env` 是**白名单 env**：**prod** launchd/schtasks
+单元只带这份表（dev `serve`/`monitor` 走 `_start_proc`，本就 merge `os.environ`
+在前）——不列进表，prod 命令行 `BOK_FLOW_GRAPH=0` 到不了 agent worker，
 kill 腿「全程零 FLOW_GRAPH」结构性测不出（探针实弹：worker pid env 无该键，
 jump/play 照发 → 腿 FAIL）。本测钉住透传面，防同类逃生门再成死门
 （同款教训：`_interp_env` 的 B 线逃生门，2026-09-16）。

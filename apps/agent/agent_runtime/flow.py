@@ -883,6 +883,10 @@ class FlowController:
     def __post_init__(self) -> None:
         self.vars_map: dict[str, str] = {}
         self._just_advanced = False  # 上一轮确认推进咗 → 注入「新一步」提示,提醒 LLM 换步
+        # 本步係图 jump_to 跳入(客户从未确认被跳过嘅步骤)→ 尾部改注入
+        # 【跳转进入】(I3,2026-09-18):讲「客户刚刚确认了上一步」与事实相反,
+        # 4B 会回头追问被跳过嘅步。advance()/enter_closing() 清零。
+        self._entered_by_jump = False
         # 渐进披露渲染账本:每步第一次渲染(装配/推进后首轮)才注入底稿,
         # 此后转分支模式(正稿已入对话史,重发只喂复制引力)。
         self._last_render_step = -1
@@ -907,6 +911,7 @@ class FlowController:
         """客户明确拒绝/告别 → 进入收尾态:之后只讲收尾话术,唔再推进/唔再按步走。"""
         self.closing = True
         self._just_advanced = False
+        self._entered_by_jump = False  # 收尾态尾部走 closing_text,跳转标记无意义
 
     def closing_text(self) -> str:
         """收尾态注入:一句礼貌告别,唔推销、唔挽留、唔转话题、唔问问题。"""
@@ -937,11 +942,14 @@ class FlowController:
         if self.current < len(self.steps):
             self.current += 1
             self._just_advanced = True
+            # 常规推进=客户真确认 → 尾部回到【新一步】(跳转标记只活到下一次推进)。
+            self._entered_by_jump = False
 
     def jump_to(self, idx: int) -> None:
         """跳到任意步(话术图 jump_step,spec §4.2)。镜像 advance 的副作用包
-        (置 _just_advanced → 【新一步】/底稿首轮重渲染),外加钳制与冻结:
-        closing 后流程不再被图移动;同位跳转 no-op;允许跳到 done(== len(steps))。"""
+        (置 _just_advanced → 首轮重渲染),外加钳制与冻结:closing 后流程不再被图
+        移动;同位跳转 no-op;允许跳到 done(== len(steps))。**实际位移**另置
+        _entered_by_jump —— 尾部要讲清「本步係跳入、客户冇确认过被跳过嘅步」(I3)。"""
         if not self.has_steps or self.closing:
             return
         target = max(0, min(int(idx), len(self.steps)))
@@ -949,6 +957,7 @@ class FlowController:
             return
         self.current = target
         self._just_advanced = True
+        self._entered_by_jump = True
 
     def apply_judge_verdict(self, verdict: str) -> None:
         """LLM 语义判定结果落状态(advance→推进;其它唔郁)。"""
@@ -1098,13 +1107,21 @@ class FlowController:
                 "客户明确要求重讲时除外（那要放慢再讲一遍关键内容）。"
             )
         if _new_step:
-            lines.append(
-                "【新一步】客户刚刚确认了上一步，现在已经进入这一步。"
-                "立即按这一步的目标来讲——不要讲「等我查下再答复你」「几分钟内答复你」这类拖延话术"
-                "（你手上已经有足够资料讲这一步），也不要延续上一步话题或继续自己刚才应承过的事。"
-                "未经客户要求，不要复读你上一句回复：客户已听过一遍，换本步话术的措辞重新开头"
-                "（客户明确说没听清、要求重复时除外——那要把关键内容再讲一遍）。"
-            )
+            if self._entered_by_jump:
+                # 图 jump 进入(I3,2026-09-18):【新一步】讲「客户刚刚确认了上一步」
+                # 与事实相反 —— 客户从未确认被跳过嘅步,照讲 4B 会回头追问嗰步。
+                lines.append(
+                    "【跳转进入】本流程由配置跳转进入本步（客户并未确认被跳过的步骤）。"
+                    "直接按本步目标推进，不要再追问被跳过步骤的问题。"
+                )
+            else:
+                lines.append(
+                    "【新一步】客户刚刚确认了上一步，现在已经进入这一步。"
+                    "立即按这一步的目标来讲——不要讲「等我查下再答复你」「几分钟内答复你」这类拖延话术"
+                    "（你手上已经有足够资料讲这一步），也不要延续上一步话题或继续自己刚才应承过的事。"
+                    "未经客户要求，不要复读你上一句回复：客户已听过一遍，换本步话术的措辞重新开头"
+                    "（客户明确说没听清、要求重复时除外——那要把关键内容再讲一遍）。"
+                )
         verdict_line = self._verdict_guidance()
         if verdict_line:
             lines.append(verdict_line)

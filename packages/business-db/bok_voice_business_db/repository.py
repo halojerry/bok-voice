@@ -1559,11 +1559,11 @@ class InMemoryBusinessRepository:
             language=data.get("language", "zh"),
             steps_json=data.get("steps_json", ""),
             hotwords=data.get("hotwords", ""),
+            # 话术图(2026-09-18 Phase 2):镜像已进 core dataclass(types.py),
+            # 直接走 kwargs 回程(空串=未启用,与 SQL 列 default '' 同形)。
+            graph_json=data.get("graph_json", ""),
             owner_user_id=data.get("owner_user_id") or "",
         ).__dict__
-        # 话术图(2026-09-18 Phase 2):core dataclass 的构造签名按 SQL 侧旧字段固定,
-        # 无 graph_json 形参——建行后补键透传(空串=未启用,与 SQL 列 default '' 同形)。
-        tpl["graph_json"] = data.get("graph_json", "")
         self.templates[tpl["id"]] = tpl
         return tpl
 

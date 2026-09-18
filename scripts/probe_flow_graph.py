@@ -14,8 +14,9 @@
    （env 在 worker 进程启动时定死，探针不能自己重启；A/B 前后 `ps aux | grep
    agent_runtime` 必须为 0 再 serve，防殭尸 worker 跑旧代码污染结论）→ 同表场景推
    同样触发语 → 断言全程零 `FLOW_GRAPH` 行、零 `graph-jump`/`graph-play` 轮。
-   该 env 经 `bok.py` `_agent_worker_env` 白名单透传（2026-09-18 实弹发现并修复：
-   白名单 env 不带 `os.environ`，未入表时命令行 kill-switch 到不了 worker）——
+   该 env 经 `bok.py` `_agent_worker_env` 白名单透传（2026-09-18 实弹发现并修复）：
+   dev `serve` 本身就 merge `os.environ`，该白名单真正兜底的是 prod
+   launchd/schtasks 的封闭 env 面——未入表时 prod 命令行 kill-switch 到不了 worker。
    腿 FAIL 时先核对 worker pid env 有没有这个键，再怀疑引擎。
 
 退出码：主判据（②③，`--expect-off` 时⑤）全过 → 0；否则 1。哑轮/play_miss/首声预算

@@ -7,7 +7,7 @@ import re
 import time
 from typing import Optional
 
-from bok_voice_core.flow_graph import pick_graph_action
+from bok_voice_core.flow_graph import ACTION_PLAY_QA, pick_graph_action
 from bok_voice_core.policies import ProviderRegistry, ProviderState, select_session_manifest
 from bok_voice_core.testdata import is_test_object_name as _is_test_object_name
 from bok_voice_core.types import CallMode
@@ -2560,16 +2560,32 @@ async def entrypoint(ctx):
     # 空表 → 闸门整体惰性(零行为变化);命中还需应答音频已在本地缓存,
     # 未物化的条目自动视为未命中走 LLM(闸门绝不触发云合成)。
     _qa_index = None
+    # 索引构建面=快路开 **或** 图里有启用嘅 play_qa 绑定(I1,2026-09-18):kill-switch
+    # BOK_QA_FASTPATH=0 只关轮级兜底,唔可以连图嘅罐头播放一齐静默掐死(图有自己嘅
+    # 开关 BOK_FLOW_GRAPH,两闸各管各的);无 TTS 缓存两条路都播唔出声,照关。
+    _qa_fastpath_on = qa_fastpath_enabled()
+    _graph_qa_bindings = any(
+        b.enabled and b.action == ACTION_PLAY_QA for b in flow_ctrl.graph.bindings
+    )
     # disabled 打点(task-9):快路整体关闭(env 关/无 TTS 缓存/空表/装配失败)每通
     # 记一次——放装配点不放轮级,轮级会重复计。
-    if qa_fastpath_enabled() and _tts_cache is not None:
+    if _tts_cache is not None and (_qa_fastpath_on or _graph_qa_bindings):
         try:
             _qa_rows = await cp.list_qa_entries(account_id=_ctx_account, owner_scope=_ctx_qa_owner)
             if _qa_rows:
                 from .qa_gate import QaIndex
 
                 _qa_index = QaIndex(_qa_rows)
-                print(f"[agent] qa fastpath on entries={len(_qa_rows)} (call {room_name})", flush=True)
+                if _qa_fastpath_on:
+                    print(f"[agent] qa fastpath on entries={len(_qa_rows)} (call {room_name})", flush=True)
+                else:
+                    # 只为图建的索引:运维一眼睇出「快路关咗、图仍可播罐头」;快路
+                    # 口径照记 disabled(该计数器语义=快路本轮不可用,env 关恒成立)。
+                    _qa_bump("disabled")
+                    print(
+                        f"[agent] QA_INDEX built_for=graph entries={len(_qa_rows)} (call {room_name})",
+                        flush=True,
+                    )
             else:
                 _qa_bump("disabled")  # 空表:闸门整体惰性,等同关闭
         except Exception as exc:  # noqa: BLE001 - 快答库不可用零影响
@@ -3707,6 +3723,9 @@ async def entrypoint(ctx):
                             f"流程跳转 → 第 {flow_ctrl.current + 1} 步"
                         )
                         context_state.set_flow_current(flow_ctrl.current_step_text())
+                        # 跳步轮强制 advanced=True → QA 快路让位(spec precedence graph>QA):
+                        # 同轮规则推进+图后退跳可令净位移为零,不置哨兵快路会照抢本轮。
+                        _flow_step_before = -1
                         print(
                             f"FLOW_GRAPH jump binding={_gbinding.id} "
                             f"step={flow_ctrl.current + 1}",
@@ -3748,7 +3767,9 @@ async def entrypoint(ctx):
             # 命中 → 跳过 LLM 直接播缓存音频(~50ms);任一闸不过 → 照旧走 LLM。
             # 位置在流程推进块之后:推进/收尾判定已落定,闸门让位(refuse/closing/
             # advanced 全部旁路);又在 paused 检查之前:与手动补 user 轮同姿势。
-            if _qa_index is not None and _tts_cache is not None:
+            # 门闸显式带 _qa_fastpath_on(I1):索引可能只为图建(I1),kill-switch
+            # 关时唔可以经呢条路复活轮级快路。
+            if _qa_fastpath_on and _qa_index is not None and _tts_cache is not None:
                 from .flow import _looks_like_whatsapp_step as _llws
 
                 try:

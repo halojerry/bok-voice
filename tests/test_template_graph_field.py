@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import tempfile
 
 os.environ.setdefault("LIVEKIT_API_KEY", "devkey")
 os.environ.setdefault("LIVEKIT_API_SECRET", "devsecret")
