@@ -4,8 +4,8 @@
 // 吊销 / 解除吊销。吊销=粘性停栈指令（token 即刻失效、节点 agent 收到 shutdown 停栈），
 // 唯一恢复路径是「解除吊销」后重新注册换发 token。结构对齐员工管理页（users/page.tsx）。
 
-import { useCallback, useEffect, useState } from "react";
-import { api, type NodeRow } from "@/lib/api";
+import { Fragment, useCallback, useEffect, useState } from "react";
+import { api, type NodeLogFile, type NodeRow } from "@/lib/api";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
 import { useSession } from "@/components/session-context";
 import { friendlyErrorText } from "@/lib/api-ready";
@@ -47,12 +47,22 @@ function nodeActionError(raw: string): string {
   return friendlyErrorText(text);
 }
 
+function fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
 export default function NodesPage() {
   const session = useSession();
   const [rows, setRows] = useState<NodeRow[] | null>(null);
   const [err, setErr] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState("");
+  // 远程日志通道（W2）：展开行缓存 + 取日志指令闭环。
+  const [logsOpen, setLogsOpen] = useState<Record<string, boolean>>({});
+  const [logs, setLogs] = useState<Record<string, NodeLogFile[] | null>>({});
+  const [logsErr, setLogsErr] = useState<Record<string, string>>({});
 
   /** 平台面：仅登录 root 可用（匿名本地会话不算 root）。 */
   const isRoot = Boolean(session && !session.anonymous && session.role === "root");
@@ -118,6 +128,56 @@ export default function NodesPage() {
     }
   }
 
+  /** 取日志：下发 upload_logs 指令，节点下个心跳周期上传（默认 ≤60s）。 */
+  async function requestLogs(row: NodeRow) {
+    setBusy(`${row.node_id}:reqlog`);
+    setErr("");
+    setNotice("");
+    try {
+      await api.enqueueNodeCommand(row.node_id, { action: "upload_logs" });
+      setNotice("已下发取日志指令；节点下个心跳周期内上报（默认 ≤60 秒），稍后展开「日志」并刷新。");
+    } catch (e) {
+      setErr(nodeActionError(String(e)));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function toggleLogs(row: NodeRow) {
+    const id = row.node_id;
+    if (logsOpen[id]) {
+      setLogsOpen((m) => ({ ...m, [id]: false }));
+      return;
+    }
+    setLogsOpen((m) => ({ ...m, [id]: true }));
+    setLogsErr((m) => ({ ...m, [id]: "" }));
+    if (logs[id]) return;
+    try {
+      const list = await api.listNodeLogs(id);
+      setLogs((m) => ({ ...m, [id]: list }));
+    } catch (e) {
+      setLogsErr((m) => ({ ...m, [id]: nodeActionError(String(e)) }));
+    }
+  }
+
+  async function downloadLog(row: NodeRow, file: string) {
+    setBusy(`${row.node_id}:log`);
+    setErr("");
+    try {
+      const blob = await api.downloadNodeLog(row.node_id, file);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = file;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setErr(nodeActionError(String(e)));
+    } finally {
+      setBusy("");
+    }
+  }
+
   if (!session) return <LoadingState label="正在读取会话…" />;
   if (!isRoot) {
     return (
@@ -168,7 +228,8 @@ export default function NodesPage() {
                 const source = revokedSourceLabel(n);
                 const lid = n.license_id || "";
                 return (
-                  <tr key={n.node_id} className="border-t border-(--card-border) align-top">
+                  <Fragment key={n.node_id}>
+                  <tr className="border-t border-(--card-border) align-top">
                     <td className="py-1.5">
                       <div>{n.name || "—"}</div>
                       <div className="font-mono text-[11px] muted">{n.node_id}</div>
@@ -192,17 +253,63 @@ export default function NodesPage() {
                       {relativeTime(n.last_seen_at)}
                     </td>
                     <td className="whitespace-nowrap">
-                      {revoked ? (
-                        <button className="btn-ghost text-xs" disabled={rowBusy} onClick={() => void unrevoke(n)}>
-                          解除吊销
+                      <div className="flex flex-col items-start gap-1">
+                        {revoked ? (
+                          <button className="btn-ghost text-xs" disabled={rowBusy} onClick={() => void unrevoke(n)}>
+                            解除吊销
+                          </button>
+                        ) : (
+                          <button className="btn-ghost text-xs text-red-600" disabled={rowBusy} onClick={() => void revoke(n)}>
+                            吊销
+                          </button>
+                        )}
+                        <button
+                          className="btn-ghost text-xs"
+                          disabled={busy === `${n.node_id}:reqlog` || revoked}
+                          title={revoked ? "节点已吊销，无法接收指令" : "下发 upload_logs 指令，节点下个心跳周期上传日志"}
+                          onClick={() => void requestLogs(n)}
+                        >
+                          取日志
                         </button>
-                      ) : (
-                        <button className="btn-ghost text-xs text-red-600" disabled={rowBusy} onClick={() => void revoke(n)}>
-                          吊销
+                        <button className="btn-ghost text-xs" onClick={() => void toggleLogs(n)}>
+                          {logsOpen[n.node_id] ? "收起日志" : "日志"}
                         </button>
-                      )}
+                      </div>
                     </td>
                   </tr>
+                  {logsOpen[n.node_id] && (
+                    <tr className="border-t border-(--card-border)">
+                      <td colSpan={6} className="py-2">
+                        {logsErr[n.node_id] ? (
+                          <span className="text-xs text-red-600">{logsErr[n.node_id]}</span>
+                        ) : !logs[n.node_id] ? (
+                          <span className="text-xs muted">读取中…</span>
+                        ) : (logs[n.node_id] ?? []).length === 0 ? (
+                          <span className="text-xs muted">
+                            暂无日志束；点「取日志」下发指令，节点上报后这里会出现近期日志（含轮转分卷与栈日志）。
+                          </span>
+                        ) : (
+                          <div className="space-y-1">
+                            {(logs[n.node_id] ?? []).map((f) => (
+                              <div key={f.file} className="flex flex-wrap items-center gap-3 text-xs">
+                                <span className="font-mono">{f.file}</span>
+                                <span className="muted">{fmtBytes(f.bytes)}</span>
+                                <span className="muted" title={f.uploaded_at}>{relativeTime(f.uploaded_at)}</span>
+                                <button
+                                  className="btn-ghost text-xs"
+                                  disabled={busy === `${n.node_id}:log`}
+                                  onClick={() => void downloadLog(n, f.file)}
+                                >
+                                  下载
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </td>
+                    </tr>
+                  )}
+                  </Fragment>
                 );
               })}
             </tbody>
