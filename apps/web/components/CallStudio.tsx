@@ -35,7 +35,7 @@ function AgentStateLabel({ state }: { state: string }) {
     connecting: { label: "连接中", color: "bg-neutral-400" },
     initializing: { label: "初始化", color: "bg-amber-400" },
     listening: { label: "聆听中", color: "bg-emerald-500" },
-    thinking: { label: "思考中", color: "bg-sky-400" },
+    thinking: { label: "思考中", color: "bg-blue-400" },
     speaking: { label: "说话中", color: "bg-fuchsia-400" },
     disconnected: { label: "已断开", color: "bg-neutral-600" },
     failed: { label: "失败", color: "bg-red-500" },
@@ -1106,7 +1106,7 @@ function CallStudioInner({
                             : "接通"}
                   </button>
                   {connecting && (
-                    <p className="animate-pulse text-[11px] text-sky-700">
+                    <p className="animate-pulse text-[11px] text-blue-700">
                       正在创建会话并接通…（约几秒，随后显示「初始化中」）
                     </p>
                   )}
@@ -1114,7 +1114,7 @@ function CallStudioInner({
               ) : (
                 <div className="flex items-center gap-2">
                   {initHintUntil > 0 && Date.now() < initHintUntil && (
-                    <span className="animate-pulse text-[11px] text-sky-700" data-tick={nowTick}>
+                    <span className="animate-pulse text-[11px] text-blue-700" data-tick={nowTick}>
                       AI 初始化中…
                     </span>
                   )}

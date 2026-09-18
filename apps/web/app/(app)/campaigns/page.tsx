@@ -30,8 +30,8 @@ const ITEM_LABEL: Record<string, string> = {
 /** 进度条分段（顺序即堆叠顺序）：接通 / 在途 / 无人接 / 拒接 / 失败 / 跳过 / 待拨。 */
 const SEGMENTS: { key: string; label: string; cls: string }[] = [
   { key: "done", label: "完成", cls: "bg-emerald-400" },
-  { key: "in_call", label: "通话中", cls: "bg-sky-400" },
-  { key: "dialing", label: "拨号中", cls: "bg-sky-400" },
+  { key: "in_call", label: "通话中", cls: "bg-emerald-500" },
+  { key: "dialing", label: "拨号中", cls: "bg-blue-500" },
   { key: "no_answer", label: "无人接", cls: "bg-neutral-400" },
   { key: "rejected", label: "拒接", cls: "bg-amber-400" },
   { key: "failed", label: "失败", cls: "bg-red-400" },
@@ -201,7 +201,7 @@ function SchedulingEditor({ value, onChange }: { value: SchedValue; onChange: (v
   return (
     <div className="space-y-3">
       <div className="space-y-2">
-        <span className="text-xs text-(--stage-muted)">外呼时段</span>
+        <span className="text-xs muted">外呼时段</span>
         {value.call_windows.map((w, idx) => (
           <div key={idx} className="flex flex-wrap items-center gap-2">
             <div className="flex flex-wrap items-center gap-1">
@@ -237,7 +237,7 @@ function SchedulingEditor({ value, onChange }: { value: SchedValue; onChange: (v
       </div>
 
       <label className="block max-w-52">
-        <span className="text-xs text-(--stage-muted)">最大并发</span>
+        <span className="text-xs muted">最大并发</span>
         <input
           type="number"
           min={0}
@@ -255,7 +255,7 @@ function SchedulingEditor({ value, onChange }: { value: SchedValue; onChange: (v
             checked={value.redispatch_on}
             onChange={(e) => onChange({ ...value, redispatch_on: e.target.checked })}
           />
-          <span className="text-xs text-(--stage-muted)">自动重拨</span>
+          <span className="text-xs muted">自动重拨</span>
           <span className="text-xs muted">未接通时按策略回队重拨</span>
         </label>
         {value.redispatch_on && (
@@ -385,7 +385,7 @@ function CampaignWizard({
         <span className="label">新建战役</span>
         <div className="flex items-center gap-2 text-xs muted">
           {[1, 2, 3].map((n) => (
-            <span key={n} className={n === step ? "text-(--stage-value)" : ""}>
+            <span key={n} className={n === step ? "text-(--live)" : ""}>
               {n === 1 ? "① 基本" : n === 2 ? "② 名单" : "③ 演练"}
             </span>
           ))}
@@ -395,7 +395,7 @@ function CampaignWizard({
       {step === 1 && (
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <label className="block">
-            <span className="text-xs text-(--stage-muted)">战役名称</span>
+            <span className="text-xs muted">战役名称</span>
             <input
               className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               value={form.name}
@@ -404,7 +404,7 @@ function CampaignWizard({
             />
           </label>
           <label className="block">
-            <span className="text-xs text-(--stage-muted)">通话语言</span>
+            <span className="text-xs muted">通话语言</span>
             <select
               className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               value={form.language}
@@ -416,7 +416,7 @@ function CampaignWizard({
             </select>
           </label>
           <label className="block">
-            <span className="text-xs text-(--stage-muted)">话术</span>
+            <span className="text-xs muted">话术</span>
             <select
               className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               value={form.template_id}
@@ -428,7 +428,7 @@ function CampaignWizard({
             <p className="mt-1 text-xs muted">选定后整波通话用该话术（建单即快照）；留空则各自用对象卡绑定的话术。</p>
           </label>
           <label className="block">
-            <span className="text-xs text-(--stage-muted)">人设</span>
+            <span className="text-xs muted">人设</span>
             <select
               className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               value={form.persona_id}
@@ -439,7 +439,7 @@ function CampaignWizard({
             </select>
           </label>
           <label className="block">
-            <span className="text-xs text-(--stage-muted)">站点</span>
+            <span className="text-xs muted">站点</span>
             <select
               className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               value={form.site_id}
@@ -451,7 +451,7 @@ function CampaignWizard({
             <p className="mt-1 text-xs muted">挂站点后拨号 trunk 用站点注册值，未挂用 settings 兜底。</p>
           </label>
           <label className="block">
-            <span className="text-xs text-(--stage-muted)">两通间隔（秒）</span>
+            <span className="text-xs muted">两通间隔（秒）</span>
             <input
               type="number"
               min={1}
@@ -498,7 +498,7 @@ function CampaignWizard({
             演练设置只对 mock 外呼（本机派生被叫）生效，真 SIP 拨号自动忽略；不填则被叫按语言默认接听。
           </p>
           <label className="block max-w-52">
-            <span className="text-xs text-(--stage-muted)">被叫句间隔（秒，0=默认）</span>
+            <span className="text-xs muted">被叫句间隔（秒，0=默认）</span>
             <input
               type="number"
               min={0}

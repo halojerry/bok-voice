@@ -102,7 +102,7 @@ function TagTable({
             {rows.map(([key, count]) => (
               <tr key={key} className="border-t border-(--card-border) first:border-t-0">
                 <td className="py-1.5">{labels[key] ?? key}</td>
-                <td className="py-1.5 text-right muted">{count}</td>
+                <td className="py-1.5 text-right text-(--live-ink)">{count}</td>
               </tr>
             ))}
           </tbody>
@@ -209,7 +209,7 @@ function DashboardContent() {
             {kpis.map(([k, v, sub]) => (
               <div key={k} className="card">
                 <p className="label">{k}</p>
-                <p className="mt-2 text-2xl font-semibold">{v}</p>
+                <p className="mt-2 text-2xl font-semibold text-(--live-ink)">{v}</p>
                 {sub && <p className="mt-1 text-xs muted">{sub}</p>}
               </div>
             ))}
@@ -222,7 +222,7 @@ function DashboardContent() {
               <div className="mt-3 space-y-2.5">
                 {buckets.map(([name, count]) => (
                   <div key={name} className="flex items-center gap-3">
-                    <div className="h-2 flex-1 rounded bg-muted/60">
+                    <div className="h-2 flex-1 rounded bg-muted">
                       <div
                         className="h-2 rounded bg-live"
                         style={{ width: `${Math.round((count / maxBucket) * 100)}%` }}
@@ -255,8 +255,8 @@ function DashboardContent() {
                       <tr key={String(a.user_id ?? i)} className="border-t border-(--card-border)">
                         <td className="py-1.5 muted">{i + 1}</td>
                         <td className="py-1.5">{String(a.name || a.user_id || "—")}</td>
-                        <td className="py-1.5">{fmtCount(a.calls)}</td>
-                        <td className="py-1.5">{fmtCount(a.answered)}</td>
+                        <td className="py-1.5 text-(--live-ink)">{fmtCount(a.calls)}</td>
+                        <td className="py-1.5 text-(--live-ink)">{fmtCount(a.answered)}</td>
                       </tr>
                     ))}
                   </tbody>

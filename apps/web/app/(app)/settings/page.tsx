@@ -121,7 +121,7 @@ function ProviderCard({
         ) : null}
         {meta.fields.filter((f) => !f.advanced && (!f.providers || f.providers.includes(provider))).map((field) => (
           <label key={field.key} className="block">
-            <span className="text-xs text-(--stage-muted)">{field.label}</span>
+            <span className="text-xs muted">{field.label}</span>
             <FieldInput field={field} value={value[field.key]} onChange={(v) => onChange({ ...value, [field.key]: v })} />
             {field.hint && <p className="mt-1 text-xs muted">{field.hint}</p>}
             {field.preview && kind === "tts" && (
@@ -137,7 +137,7 @@ function ProviderCard({
             <div className="mt-2 space-y-2">
               {meta.fields.filter((f) => f.advanced && (!f.providers || f.providers.includes(provider))).map((field) => (
                 <label key={field.key} className="block">
-                  <span className="text-xs text-(--stage-muted)">{field.label}</span>
+                  <span className="text-xs muted">{field.label}</span>
                   <FieldInput field={field} value={value[field.key]} onChange={(v) => onChange({ ...value, [field.key]: v })} />
                   {field.hint && <p className="mt-1 text-xs muted">{field.hint}</p>}
                   {field.preview && kind === "tts" && (
@@ -292,7 +292,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
       </p>
       <div className="mt-3 space-y-2">
         <label className="block">
-          <span className="text-xs text-(--stage-muted)">拨号后端</span>
+          <span className="text-xs muted">拨号后端</span>
           <select className={base} value={mode} onChange={(e) => set("mode", e.target.value)}>
             <option value="mock">mock（本机派生被叫）</option>
             <option value="real">real（SIP trunk 真拨号）</option>
@@ -301,7 +301,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
         {mode === "real" && (
           <>
             <label className="block">
-              <span className="text-xs text-(--stage-muted)">Trunk ID</span>
+              <span className="text-xs muted">Trunk ID</span>
               <input
                 className={base}
                 placeholder="ST_xxxxxxxx"
@@ -311,7 +311,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
               <p className="mt-1 text-xs muted">LiveKit SIP trunk 的 ID（sip_trunk_id）。</p>
             </label>
             <label className="block">
-              <span className="text-xs text-(--stage-muted)">SIP 地址 / 网关</span>
+              <span className="text-xs muted">SIP 地址 / 网关</span>
               <input
                 className={base}
                 placeholder="sip.example.com"
@@ -320,7 +320,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
               />
             </label>
             <label className="block">
-              <span className="text-xs text-(--stage-muted)">鉴权用户名</span>
+              <span className="text-xs muted">鉴权用户名</span>
               <input
                 className={base}
                 value={String(value.auth_username ?? "")}
@@ -328,7 +328,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
               />
             </label>
             <label className="block">
-              <span className="text-xs text-(--stage-muted)">鉴权密码</span>
+              <span className="text-xs muted">鉴权密码</span>
               <input
                 type="password"
                 className={base}
@@ -339,7 +339,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
               <p className="mt-1 text-xs muted">留空保存=保留已存密码。</p>
             </label>
             <label className="block">
-              <span className="text-xs text-(--stage-muted)">许可主叫号（逗号分隔）</span>
+              <span className="text-xs muted">许可主叫号（逗号分隔）</span>
               <input
                 className={base}
                 placeholder="+8613800138000, +8613800138001"
@@ -356,7 +356,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
               />
             </label>
             <div className="rounded-lg border border-(--card-border) p-2">
-              <span className="text-xs text-(--stage-muted)">注册 trunk 到站点</span>
+              <span className="text-xs muted">注册 trunk 到站点</span>
               <p className="mt-1 text-xs muted">
                 用上面的地址/主叫号/鉴权在当前站点创建 LiveKit outbound trunk，成功后 Trunk ID 自动回填
                 （campaign 按站点取 trunk；密码不会回显）。
@@ -390,7 +390,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
               {showSiteForm && (
                 <div className="mt-2 rounded-lg border border-(--card-border) p-2">
                   <label className="block">
-                    <span className="text-xs text-(--stage-muted)">站点名</span>
+                    <span className="text-xs muted">站点名</span>
                     <input
                       className={base}
                       placeholder="hk-edge"
@@ -399,7 +399,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
                     />
                   </label>
                   <label className="mt-2 block">
-                    <span className="text-xs text-(--stage-muted)">LiveKit 地址</span>
+                    <span className="text-xs muted">LiveKit 地址</span>
                     <input
                       className={base}
                       placeholder="wss://vps.example:7880"
@@ -436,7 +436,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
         )}
         <div className="grid grid-cols-2 gap-2">
           <label className="block">
-            <span className="text-xs text-(--stage-muted)">振铃超时（秒）</span>
+            <span className="text-xs muted">振铃超时（秒）</span>
             <input
               type="number"
               className={base}
@@ -445,7 +445,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
             />
           </label>
           <label className="block">
-            <span className="text-xs text-(--stage-muted)">单通最长时长（秒）</span>
+            <span className="text-xs muted">单通最长时长（秒）</span>
             <input
               type="number"
               className={base}
@@ -498,7 +498,7 @@ function AudioDevicesCard() {
       </p>
       <div className="mt-3 space-y-3">
         <div>
-          <span className="text-xs text-(--stage-muted)">麦克风（输入）</span>
+          <span className="text-xs muted">麦克风（输入）</span>
           <div className="mt-1 flex gap-2">
             <select
               className="flex-1 rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
@@ -529,7 +529,7 @@ function AudioDevicesCard() {
         </div>
 
         <div>
-          <span className="text-xs text-(--stage-muted)">扬声器 / 输出</span>
+          <span className="text-xs muted">扬声器 / 输出</span>
           {canSetOutput ? (
             <select
               className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
@@ -577,7 +577,7 @@ function FieldRow({
 }) {
   return (
     <label className="block">
-      <span className="text-xs text-(--stage-muted)">{field.label}</span>
+      <span className="text-xs muted">{field.label}</span>
       <FieldInput field={field} value={value} onChange={onChange} />
       {field.hint && <p className="mt-1 text-xs muted">{field.hint}</p>}
       {field.preview && kind === "tts" && (

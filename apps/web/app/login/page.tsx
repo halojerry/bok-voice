@@ -40,7 +40,7 @@ export default function LoginPage() {
     <main className="stage-shell flex min-h-screen w-full items-center justify-center px-6">
       <div className="w-full max-w-sm">
         <div className="mb-5 flex items-center gap-2.5">
-          <span className="flex h-9 w-9 items-center justify-center rounded-sm bg-(--stage-value) font-mono text-base font-bold text-white">
+          <span className="flex h-9 w-9 items-center justify-center rounded-sm bg-(--live) font-mono text-base font-bold text-white">
             B
           </span>
           <span className="text-[15px] font-medium tracking-tight">Bok Voice</span>
