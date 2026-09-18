@@ -17,8 +17,10 @@
    `template_step == 4`）。**为什么要两轮**（勘误预检 2）：播放轮本体行在**跳之前**
    落库（`_qa_canned_say` 内上报，步号=跳前步），跳后步号只能在**下一轮**的 turns 行
    上看到；跳后轮话术默认 `AFTER_TEXT`（刻意避开 `_CONFIRM_RE` 单字确认/收线/异议/
-   提问四族词）只为信息位服务。无 QA 条目（或未物化）→ 腿**显式跳过**、报告
-   `{"skipped": "no_qa_or_audio"}`、退出码 1（未评估 ≠ PASS）。kill 腿同旧：
+   提问七族词）只为信息位服务。**无 QA 条目 → 腿显式跳过**（报告
+   `{"skipped": "no_qa_or_audio"}`、退出码 1，未评估 ≠ PASS）；**条目在场但音频未物化
+   → 腿照跑**，运行时落 `FLOW_GRAPH play_miss`，`play_logged` 硬 FAIL、退出码 1
+   （先 `python tools/bok.py tts-pregen --qa` 物化音频再来）。kill 腿同旧：
    `--then-jump --expect-off`，须先以 `BOK_FLOW_GRAPH=0` 重启 serve。
 5. `--expect-off` 档 = kill-switch 腿：**须先以 `BOK_FLOW_GRAPH=0` 重启 serve**
    （env 在 worker 进程启动时定死，探针不能自己重启；A/B 前后 `ps aux | grep
@@ -76,7 +78,7 @@ TRIGGER_TEXT = "我要投诉"
 NONTRIGGER_TEXT = "好的好的"
 PLAY_TEXT = "我要退款"
 # 追问链（Phase 3.3）跳后轮话术（勘误预检 2）：只为「跳后步号」信息位服务，刻意避开
-# 规则判定的四族词——`_CONFIRM_RE` 单字（好/是/对/嗯/系/係，命中即规则推进 4→5，把
+# 规则判定的七族词——`_CONFIRM_RE` 单字（好/是/对/嗯/系/係，命中即规则推进 4→5，把
 # after 轮步号判据污染成 5）、`_QUESTION_RE`（提问轮原地答不推进但语义漂移）、
 # `_DEFER_RE`（社交拖延直念短应承）、`_REFUSE_RE`/`_FAREWELL_RE`/`_HANGUP_RE`（收线
 # 冻结后跳步失效）、`_DENY_RE`（异议分支），以及图的两个触发意图词（退款/投诉——撞上
@@ -261,8 +263,10 @@ def plan_rounds(
     - **then-jump 档**（`then_jump` 非 None，Phase 3.3 追问链）：`has_qa` 真 →
       `[("play", play_text), ("after", after_text)]`——「播」轮就是**触发轮**（推
       `play_text` 命中 play_qa 绑定）。跳后步号只能在**下一轮**的 turns 行看到
-      （勘误预检 2：播放轮本体行在跳前落库），故必须两轮。`has_qa` 假（无 QA 条目/
-      未物化）→ **空表**：调用方须显式判「腿跳过」，绝不许以「没跑出东西」空过成 PASS。
+      （勘误预检 2：播放轮本体行在跳前落库），故必须两轮。`has_qa` 假（**无 QA 条目**，
+      即 `qa_id` 为空；条目在场而音频未物化不在此列——那种情况腿照跑、`play_miss` 由
+      `play_logged` 硬 FAIL）→ **空表**：调用方须显式判「腿跳过」，绝不许以「没跑出
+      东西」空过成 PASS。
       `play_round` 在本档**不适用**（「播」轮是触发轮，关掉即零触发语空跑）。
     - **默认档**：`trigger`/`nontrigger`（+ `play` 信息位轮）逐字节同旧。
     """
@@ -282,6 +286,14 @@ def post_jump_step_seen(turns: list[dict], then_jump: int) -> bool:
     只看 assistant 转写行，且 `provider != "graph-play"`——**播放轮本体行在跳之前
     落库**（`_qa_canned_say` 内上报，步号=跳前步），哪怕步号撞上 `then_jump` 也恒不
     计入（否则「播了」会被当成「跳了」的假绿）。
+
+    **无假正例不变量（review R1，M3）**：该判据把「after 轮出现 step=N」读成「链生效」，
+    成立前提是 **N 只可能由本体位移到达**——本腿装配下它由三件事共同保证：① 起始步号
+    0/1；② 每轮至多推进一次；③ play 轮是首轮、其本体行被排除，故触发前不存在把步号
+    推到 N 的轮次。它**不是**结构不变量：若将来本腿在前面加轮次（pre-trigger rounds）、
+    改目标步，或让规则推进能从别的步顺推到 N，判据就会退化成假正例面。届时应改为
+    **只扫 after 窗口的 turns 切片**（现在传的是全量 turns），或加轮次锚；默认档
+    `AFTER_TEXT` 的洁净性专测只钉默认话术，`--after-text` 自定义时责任在调用方。
     """
     target = _as_int(then_jump, -1)
     for t in turns:
@@ -391,6 +403,9 @@ def evaluate_leg(
             for e in play_events
         )
         next_seen = post_jump_step_seen(turns, target)
+        # 信息位归因（M4）：`next_turn_step=False` = after 轮**无新步号**——可能是该轮被
+        # QA 快路/规则吞掉（步号根本没重渲染）、ASR 没吐出该轮、或链没跳；此时归因落到
+        # 同轮 `then_jump_logged` 分量（两分量各自可读，故不影响 OR 判据）。
         info.update({"then_jump": target, "then_jump_logged": logged,
                      "next_turn_step": next_seen})
         events["after"] = after
@@ -578,10 +593,12 @@ async def run_leg(*, expect_off: bool, lang: str, voice: str, trigger_text: str,
     print(f"\n[flow-graph] 腿={leg_name} lang={lang} qa_id={qa_id or '(无QA条目, play 腿跳过)'}"
           f" then_jump={then_jump} rounds={[n for n, _ in rounds]}", flush=True)
     if then_jump is not None and not rounds:
-        # 未评估 ≠ PASS：无 QA 条目/音频未物化时链腿结构性跑不起来，必须显式跳过并
-        # 以退出码 1 收尾（空表跑出的「零痕迹」是没观测，不是证据）。
-        print("[flow-graph] then-jump 腿跳过：无 QA 条目或音频未物化"
-              "（先 python tools/bok.py tts-pregen --qa）", flush=True)
+        # 未评估 ≠ PASS：**无 QA 条目**时链腿结构性跑不起来（触发语必然 play_miss），
+        # 必须显式跳过并以退出码 1 收尾（空表跑出的「零痕迹」是没观测，不是证据）。
+        # 注意：条目在场但音频未物化**不**走这里——腿照跑、`play_miss` 由 play_logged
+        # 硬 FAIL。报告键 `no_qa_or_audio` 是历史 token（schema 稳定，不再新增含义）。
+        print("[flow-graph] then-jump 腿跳过：无 QA 条目"
+              "（先建 QA 条目，再 python tools/bok.py tts-pregen --qa 物化音频）", flush=True)
         return {
             "leg": leg_name,
             "skipped": "no_qa_or_audio",
@@ -813,8 +830,14 @@ def print_leg(res: dict, budgets: dict[str, float]) -> None:
         first = f"{m['first_audio_ms'] / 1000:.2f}s" if m.get("first_audio_ms") is not None else "无"
         print(f"  {m['name']:>10} 首声={first:>7} 语音={m.get('speech_s', 0):.1f}s "
               f"{'' if m.get('answered') else '✗哑'}  「{m['text']}」", flush=True)
+    # 窗口行只渲染**本腿真跑过的轮次**（M5）：`evaluate_leg` 恒建 trigger/nontrigger/
+    # play 三键，then-jump 档没跑 trigger/nontrigger——不按轮次表过滤就会打出
+    # 「trigger FLOW_GRAPH 行：（零）」这种对不存在的轮做的空断言。
+    ran_rounds = set(res.get("rounds") or [])
     for label in ("trigger", "nontrigger", "play", "after"):
         if label not in v["events"]:
+            continue
+        if ran_rounds and label not in ran_rounds:
             continue
         evs = v["events"][label]
         print(f"  {label:>10} FLOW_GRAPH 行：{evs if evs else '（零）'}", flush=True)
@@ -989,7 +1012,7 @@ async def main() -> int:
                         help=f"追问链腿（Phase 3.3）：play_qa 绑定带 then_jump={TARGET_STEP}，"
                              "轮次表=播+跳后两轮；跳后步号与同轮 jump 日志取 OR 判据")
     parser.add_argument("--after-text", default=AFTER_TEXT,
-                        help="--then-jump 的跳后轮话术（须避开确认/收线/异议/提问四族词与图触发词）")
+                        help="--then-jump 的跳后轮话术（须避开确认/收线/异议/提问七族词与图触发词）")
     parser.add_argument("--keep-template", action="store_true", help="保留探针模板（默认跑完删）")
     parser.add_argument("--budget-first-ms", type=float, default=2500.0)
     parser.add_argument("--budget-perceived-ms", type=float, default=3000.0)
@@ -1015,10 +1038,11 @@ async def main() -> int:
     out.write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n[flow-graph] JSON 报告 → {out}", flush=True)
     if res.get("skipped"):
-        # 未评估 ≠ PASS：无 QA 条目/未物化时链腿跑不起来，显式跳过并以退出码 1 收尾
-        # （不许把「没跑出东西」读成「零痕迹=PASS」）。
+        # 未评估 ≠ PASS：无 QA 条目时链腿跑不起来，显式跳过并以退出码 1 收尾
+        # （不许把「没跑出东西」读成「零痕迹=PASS」；音频未物化不走这条——见 run_leg）。
         print(f"FLOW_GRAPH_PROBE leg={res['leg']} SKIPPED ({res['skipped']}) → FAIL"
-              "（腿未评估；先 python tools/bok.py tts-pregen --qa 物化 QA 罐头）", flush=True)
+              "（腿未评估；无 QA 条目——先建条目，再 python tools/bok.py tts-pregen --qa）",
+              flush=True)
         return 1
     checks = res["verdict"]["checks"]
     print("FLOW_GRAPH_PROBE leg=" + res["leg"] + " " +
