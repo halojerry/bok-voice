@@ -8,7 +8,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { api, authHeaders, type UserRow } from "@/lib/api";
 import {
-  bindingThenJumpField, bindingThenJumpToDraft,
+  bindingFromDraft, bindingThenJumpToDraft,
   parseGraphDoc, parseTemplateSteps, resolveClusterTarget, revertCluster,
   type FlowStep, type GraphBinding, type GraphDoc, type GraphIntent,
 } from "@/lib/qa-canvas";
@@ -102,10 +102,10 @@ function displayStep(row: QaRow): number {
 // 满足同一组约束（label 1-64 字、keywords 非空 ≤32 项且每项 ≤64 字、step 1-999、
 // priority 0-1000、play_qa 必带 qa_id、id 形如 int_/bnd_+8 位小写 hex），否则 PUT 必 400。
 // Phase 3.3 追问链（then_jump）同表加一条：**仅 play_qa 可带**（jump_step 带=400）、int 且
-// 1-999（越界=400）——故保存侧只在 play_qa 且值 >0 时写键（lib/qa-canvas.ts
-// bindingThenJumpField 把死这两条），加载侧按真实步数收口（bindingThenJumpToDraft）。
-// 编辑是**逐字段重建**落库（submit 里 nextBindings 只放显式字段）：不进草稿的键=保存即蒸发，
-// 所以 then_jump 必须走草稿（勘误预检 4：打开既有追问链改个名字保存=静默删链）。
+// 1-999（越界=400）——故保存侧只在 play_qa 且值 >0 时写键（lib/qa-canvas.ts bindingFromDraft
+// → bindingThenJumpField 把死这两条），加载侧按真实步数收口（bindingThenJumpToDraft）。
+// 编辑是**逐字段重建**落库：submit 对两种动作都只调 bindingFromDraft（唯一重建入口），
+// 不进草稿的键=保存即蒸发（勘误预检 4：打开既有追问链改个名字保存=静默删链）。
 
 /** 模板行（画布脊柱输入 + 意图图归属判定）：owner_user_id 由 CP 列表带出（B3 owner 语义）。 */
 type QaTemplateRow = TemplateRow & { owner_user_id?: string };
@@ -1359,25 +1359,16 @@ function IntentEditorModal(props: {
     const nextBindings: GraphBinding[] = [];
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
-      const common = {
-        id: row.id,
-        intent: intent.id,
-        priority: clampInt(row.priority, 0, 1000),
-        once: row.once,
-        enabled: row.enabled,
-      };
       if (row.action === "play_qa") {
         if (!qaRows.some((q) => String(q.id) === row.qa_id)) {
           return setError(`第 ${i + 1} 条绑定还没有选择要播的快答条目。`);
         }
-        // 追问链只在 >0 时写键（0 值/sparse 缺省=无链）；jump_step 行经同一函数恒得 {}
-        // ——带上该键 CP 严格校验必 400（Phase 3.3）。
-        const chain = bindingThenJumpField(row.action, row.then_jump, stepCount);
-        nextBindings.push({ ...common, action: "play_qa", qa_id: row.qa_id, ...chain });
-      } else {
-        if (stepCount < 1) return setError("该话术还没有步骤，无法使用「跳到某一步」。");
-        nextBindings.push({ ...common, action: "jump_step", step: clampInt(row.step, 1, stepCount) });
+      } else if (stepCount < 1) {
+        return setError("该话术还没有步骤，无法使用「跳到某一步」。");
       }
+      // 逐字段重建的唯一入口（勘误预检 4）：两种动作都走纯函数，页面不再自拼字段——
+      // then_jump 的写键规则（仅 play_qa 且 >0）在 bindingFromDraft 内，漏键面被测试钉死。
+      nextBindings.push(bindingFromDraft(row, intent.id, stepCount));
     }
     setSaving(true);
     const ok = await props.onConfirm(
