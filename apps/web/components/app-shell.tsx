@@ -2,8 +2,12 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useState } from "react";
 import { AccountProvider, useAccount } from "@/components/account-context";
-import { StageHeader, gateForPath } from "@/components/StageHeader";
+import { Sidebar } from "@/components/layout/sidebar";
+import { Topbar } from "@/components/layout/topbar";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { gateForPath } from "@/lib/navigation";
 import {
   SessionProvider,
   hasPage,
@@ -17,8 +21,8 @@ function StatusBadge() {
   if (settingsLoading) return <span className="font-mono">loading</span>;
   if (health === false) return <span className="text-xs text-red-600">控制面离线</span>;
   return (
-    <span className="hidden items-center gap-2 text-xs text-(--stage-muted) sm:inline-flex">
-      <span className="h-2 w-2 rounded-full bg-(--stage-value)" />
+    <span className="hidden items-center gap-2 text-xs text-muted-foreground sm:inline-flex">
+      <span className="h-2 w-2 rounded-full bg-(--live)" />
       <span className="font-mono">v0.1.0</span>
     </span>
   );
@@ -27,7 +31,7 @@ function StatusBadge() {
 /** 会话加载中的轻量占位：不渲染导航，避免权限面闪跳。 */
 function SessionLoading() {
   return (
-    <div className="stage-shell flex min-h-screen w-full items-center justify-center">
+    <div className="flex min-h-screen w-full items-center justify-center bg-background">
       <p className="text-sm muted">正在加载会话…</p>
     </div>
   );
@@ -69,17 +73,31 @@ function RouteGuard({ children }: { children: React.ReactNode }) {
 }
 
 export function AppShell({ children }: { children: React.ReactNode }) {
+  // 移动端导航抽屉开关：壳持有（Task 2 契约），Sidebar 受控、Topbar 汉堡触发。
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   // 会话在最外层：AccountProvider（账号归属）与导航/守卫都读 SessionProvider。
   return (
     <SessionProvider>
       <SessionReady>
         <AccountProvider>
-          <div className="stage-shell min-h-screen w-full">
-            <StageHeader status={<StatusBadge />} />
-            <main className="mx-auto w-full max-w-7xl px-6 pb-10 pt-2 lg:px-10">
-              <RouteGuard>{children}</RouteGuard>
-            </main>
-          </div>
+          {/* TooltipProvider 全站单例：折叠态导航 Tooltip 等都在此伞下。 */}
+          <TooltipProvider>
+            <div className="flex min-h-screen w-full bg-background">
+              <Sidebar
+                mobileOpen={mobileNavOpen}
+                onMobileClose={() => setMobileNavOpen(false)}
+              />
+              <div className="flex min-w-0 flex-1 flex-col">
+                <Topbar
+                  onMobileOpen={() => setMobileNavOpen(true)}
+                  status={<StatusBadge />}
+                />
+                <main className="mx-auto w-full max-w-6xl flex-1 px-6 pb-12 pt-6 lg:px-8">
+                  <RouteGuard>{children}</RouteGuard>
+                </main>
+              </div>
+            </div>
+          </TooltipProvider>
         </AccountProvider>
       </SessionReady>
     </SessionProvider>
