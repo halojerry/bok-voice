@@ -92,11 +92,21 @@ export function parseGraphDoc(raw: string | null | undefined): GraphDoc {
   }
 }
 
-// —— 追问链（Phase 3.3，spec §3）草稿读写双向纯函数 ——
-// 编辑器的加载/保存两侧都只经这两个函数碰 then_jump：加载把 `[1,max]` 收口成草稿值
+// —— 追问链（Phase 3.3，spec §3）草稿读写纯函数 ——
+// 编辑器的加载/保存两侧都只经这三个函数碰 then_jump：加载把 `[1,max]` 收口成草稿值
 // （0=不跳），保存只在「play_qa 且 >0」时吐键。CP 严格校验（`validate_flow_graph`）对
 // jump_step 行带该键、非 int、越界 [1,999] 一律 400——保存侧绝不产这两种形状。
 // 纯函数层持有这对契约=node 测试面（page.tsx 的 BindingDraft 只是它的 UI 载体）。
+
+/** CP `flow_graph.STEP_MAX`：then_jump 的合法上界，保存侧自守（超 999 步话术也不越界）。 */
+const THEN_JUMP_MAX = 999;
+
+/** [min,max] 整数钳位（与 page.tsx clampInt 同语义；本文件自持一份，避免跨文件耦合）。 */
+function clampInt(value: number, min: number, max: number): number {
+  const n = Math.round(Number(value));
+  if (!Number.isFinite(n)) return min;
+  return Math.min(Math.max(n, min), max);
+}
 
 /** 绑定 → 草稿值：`0`=不跳；越界/坏值按当前真实步数收口（同 step 的 M28 姿势）。 */
 export function bindingThenJumpToDraft(raw: unknown, stepCount: number): number {
@@ -109,6 +119,7 @@ export function bindingThenJumpToDraft(raw: unknown, stepCount: number): number 
 /**
  * 草稿 → 落库片段：仅 `action === "play_qa"` 且值 `>0` 时产出 `{ then_jump }`。
  * 其余一切（jump_step 行、0/空/NaN）= `{}`——绝不写键，写了两条中任一条 CP 必 400。
+ * 上界取 `min(stepCount, 999)`：真实步数收口之外再压 CP 合同上界（步骤数 >999 也不越界）。
  */
 export function bindingThenJumpField(
   action: "play_qa" | "jump_step",
@@ -116,8 +127,50 @@ export function bindingThenJumpField(
   stepCount: number,
 ): { then_jump?: number } {
   if (action !== "play_qa") return {};
-  const v = bindingThenJumpToDraft(thenJump, stepCount); // 坏值/0 → 0
+  const v = bindingThenJumpToDraft(thenJump, Math.min(Number(stepCount), THEN_JUMP_MAX)); // 坏值/0 → 0
   return v > 0 ? { then_jump: v } : {};
+}
+
+/** 编辑器草稿行（page.tsx `BindingDraft` 的结构面）：仅列出重建绑定所需字段。 */
+export type GraphBindingDraftInput = {
+  id: string;
+  action: "play_qa" | "jump_step";
+  qa_id?: string;
+  step?: number;
+  then_jump?: number;
+  priority?: number;
+  once?: boolean;
+  enabled?: boolean;
+};
+
+/**
+ * 草稿行 → 落库绑定（**保存路径唯一入口**，勘误预检 4）：page.tsx submit 对两种动作都调它，
+ * 不再自拼 `nextBindings.push({...})`——字段逐笔重建，漏一个键=保存即蒸发（then_jump 静默
+ * 删链就是这么来的）。字段顺序=id/intent/priority/once/enabled → action → 动作专属负载，
+ * 故未改字段档的序列化与既有 doc 逐字节同（测试整串比对）。
+ * 调用方负责前置校验（play_qa 的 qa_id 存在性、jump_step 需 stepCount≥1 的报错文案）。
+ */
+export function bindingFromDraft(
+  row: GraphBindingDraftInput,
+  intentId: string,
+  stepCount: number,
+): GraphBinding {
+  const common = {
+    id: String(row.id),
+    intent: intentId,
+    priority: clampInt(Number(row.priority ?? 10), 0, 1000),
+    once: row.once === true,
+    enabled: row.enabled !== false,
+  };
+  if (row.action === "jump_step") {
+    // step 上界=真实步数（CP 合同 [1,999] 的 999 面为既有暴露，未在本次收口——见 review R1 M2）。
+    return {
+      ...common, action: "jump_step",
+      step: clampInt(Number(row.step ?? 1), 1, Math.max(stepCount, 1)),
+    };
+  }
+  const chain = bindingThenJumpField("play_qa", row.then_jump, stepCount);
+  return { ...common, action: "play_qa", qa_id: String(row.qa_id ?? ""), ...chain };
 }
 
 export type CanvasIntentNode = {
