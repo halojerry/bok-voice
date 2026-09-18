@@ -14,6 +14,9 @@
    （env 在 worker 进程启动时定死，探针不能自己重启；A/B 前后 `ps aux | grep
    agent_runtime` 必须为 0 再 serve，防殭尸 worker 跑旧代码污染结论）→ 同表场景推
    同样触发语 → 断言全程零 `FLOW_GRAPH` 行、零 `graph-jump`/`graph-play` 轮。
+   该 env 经 `bok.py` `_agent_worker_env` 白名单透传（2026-09-18 实弹发现并修复：
+   白名单 env 不带 `os.environ`，未入表时命令行 kill-switch 到不了 worker）——
+   腿 FAIL 时先核对 worker pid env 有没有这个键，再怀疑引擎。
 
 退出码：主判据（②③，`--expect-off` 时⑤）全过 → 0；否则 1。哑轮/play_miss/首声预算
 均为信息位（本探针判的是「图跑没跑」，不是延迟/质量）。
@@ -819,8 +822,9 @@ async def main() -> int:
           " ".join(f"{k}={'1' if v else '0'}" for k, v in checks.items()) +
           f" → {'PASS' if res['verdict']['pass'] else 'FAIL'}", flush=True)
     if args.expect_off:
-        print("（kill-switch 腿：如果你没先以 BOK_FLOW_GRAPH=0 重启 serve，本腿 FAIL 是预期的——"
-              "A/B 必须重启 serve，探针不代重启）", flush=True)
+        print("（kill-switch 腿：须以 BOK_FLOW_GRAPH=0 重启 serve，探针不代重启；env 经 bok.py "
+              "_agent_worker_env 白名单透传（2026-09-18 实弹修复）——若本腿仍 FAIL，先核对 "
+              "worker 进程 env 里到底有没有 BOK_FLOW_GRAPH，再怀疑引擎）", flush=True)
     return 0 if res["verdict"]["pass"] else 1
 
 

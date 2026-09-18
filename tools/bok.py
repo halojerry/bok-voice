@@ -1053,6 +1053,20 @@ def _apply_judge_env(env: dict[str, str], _cur: dict[str, str]) -> None:
         env["FLOW_JUDGE_LLM_MODEL"] = _settle
 
 
+def _apply_flow_graph_env(env: dict[str, str]) -> None:
+    """话术图 kill-switch 透传（2026-09-18 实弹发现，与 `_interp_env` 同款教训）。
+
+    `_agent_worker_env`/`_agent_prod_env` 都是**白名单 env**（dict 里没写的键一律
+    不带 `os.environ`）——`BOK_FLOW_GRAPH=0 python tools/bok.py serve` 写在命令行上
+    **到不了 agent worker**，worker 按默认 `"1"` 跑：kill 腿「全程零 FLOW_GRAPH」
+    结构性测不出（实弹：worker pid env 只有 2 枚 BOK_ 键、无 BOK_FLOW_GRAPH，
+    jump/play 照发，探针如实报 FAIL）。文档里的逃生门必须真能走到 worker，故显式
+    带上；未设/空串不注入（默认档逐字节不变）。"""
+    value = os.environ.get("BOK_FLOW_GRAPH")
+    if value:
+        env["BOK_FLOW_GRAPH"] = value
+
+
 def _agent_worker_env(py) -> dict[str, str]:
     """A 线 main worker 的 env(serve 与 monitor 同源单点)。"""
     _cur = MODELS["mac"] if is_mac() else MODELS["windows"]
@@ -1067,6 +1081,7 @@ def _agent_worker_env(py) -> dict[str, str]:
         "MLX_LLM_MODEL": model_path({**_cur, "llm": resolve_llm_repo(_cur)}, "llm"),
     }
     _apply_judge_env(env, _cur)
+    _apply_flow_graph_env(env)
     # .venv312 OpenSSL 无默认 CA 束 → MiniMax WSS 必炸;固化 SSL_CERT_FILE。
     _bake_ssl_cert_file(env, py)
     return env
@@ -1968,6 +1983,7 @@ def _agent_prod_env() -> dict[str, str]:
         "MLX_LLM_MODEL": model_path({**_cur, "llm": resolve_llm_repo(_cur)}, "llm"),
     }
     _apply_judge_env(env, _cur)
+    _apply_flow_graph_env(env)
     # .venv312 OpenSSL 无默认 CA 束 → MiniMax WSS 必炸 SSLCertVerificationError；
     # 固化 SSL_CERT_FILE（P5 遗留项），interp 经 _interp_env 的 dict 拷贝继承。
     return _bake_ssl_cert_file(env, repo_python())
