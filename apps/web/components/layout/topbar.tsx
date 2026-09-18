@@ -4,7 +4,7 @@
  * P2 布局壳 · 细顶栏（Task 2 交付组件，Task 3 壳层接线）。
  *
  * 左 = 移动端汉堡（<md，开抽屉；状态由壳持有）+ 当前页标题（pathname 经
- * FLAT_NAV/GUARD_ONLY 最长前缀反查 label，未命中显示空串）。
+ * FLAT_NAV/GUARD_ONLY 最长前缀反查 label；首页给「工作台」，其余未命中显示空串）。
  * 右 = status slot（壳传 StatusBadge；undefined 不渲染容器）+ 账号区
  * （匿名=「本地模式」徽标+登录链接；登录=用户名+退出）+「进入工作台」
  * btn-primary CTA（入口非活状态 → 近黑，不用青）。
@@ -27,6 +27,9 @@ export type TopbarProps = {
 
 /** 路径 → 页标题：FLAT_NAV+GUARD_ONLY 内最长前缀命中项的 label。 */
 function pageTitle(pathname: string): string {
+  // 首页不在主导航（stage 工作台经 DashboardPage 内嵌壳内），但顶栏仍给页名
+  // （与页面 h1 一致）；其余未命中路径显示空串。
+  if (pathname === "/") return "工作台";
   const hits = [...FLAT_NAV, ...GUARD_ONLY].filter((n) =>
     matchesPath(pathname, n.href),
   );
