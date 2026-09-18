@@ -21,7 +21,7 @@ import { FLAT_NAV, GUARD_ONLY, matchesPath } from "@/lib/navigation";
 export type TopbarProps = {
   /** 打开移动端导航抽屉（<md 汉堡按钮回调；抽屉状态由壳持有）。 */
   onMobileOpen: () => void;
-  /** 右侧状态区（壳传 StatusBadge）；undefined 时不渲染容器。 */
+  /** 右侧状态区（壳传 StatusBadge）；未提供时（undefined/null）不渲染容器。 */
   status?: ReactNode;
 };
 
