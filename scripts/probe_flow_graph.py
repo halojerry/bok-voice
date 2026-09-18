@@ -18,6 +18,10 @@
 退出码：主判据（②③，`--expect-off` 时⑤）全过 → 0；否则 1。哑轮/play_miss/首声预算
 均为信息位（本探针判的是「图跑没跑」，不是延迟/质量）。
 
+起推节奏（2026-09-18 实弹修复）：每轮起推前都等 agent 音轨**真播完**（末尾静音窗 +
+累计语音下限；见 `wait_playout_end`）——旧版只等「首声」就推，触发器落进 9.2s 开场白
+第 0.5s、麦克风收开场白尾巴 → 转写无触发词 → jump 不触发（首声 0.00s 伪值同源）。
+
 用法：<python> scripts/probe_flow_graph.py [--expect-off] [--lang zh]
       [--trigger-text 我要投诉] [--no-play-round] [--keep-template]
       <python> scripts/probe_flow_graph.py --selftest   # 无栈纯函数自检
@@ -56,6 +60,18 @@ TARGET_STEP = 4  # 1-based：投诉 jump 的目标步
 TRIGGER_TEXT = "我要投诉"
 NONTRIGGER_TEXT = "好的好的"
 PLAY_TEXT = "我要退款"
+# ---- 起推前「播完」等候（2026-09-18 实弹修复）--------------------------------
+# 根因：旧版只等 `erc.wait_greeting`（首声+累计静音采样，其 silent 从不清零，
+# 开场白句间停顿会把采样凑满 → 早返）再 sleep 0.5s 就推触发语——9.2s 的 zh 开场白
+# 才念到第 0.5s，麦克风收开场白尾巴 → ASR 无「投诉」→ jump 不触发（首声 0.00s 同源，
+# 即开场白尾巴被当成本轮应答）。现在每轮起推前显式等「当前播出段真播完」。
+# 判据=末尾静音窗（真实秒）+ 累计语音下限；见 `wait_playout_end` 文档
+# （「无新帧」不可用：真栈空闲时音轨仍推帧，实测 ~2× 实时）。
+QUIET_GAP_S = float(os.environ.get("BOK_PROBE_QUIET_GAP_S", "1.5"))  # 停嘴判定窗(真实秒)
+PLAYOUT_TIMEOUT_S = float(os.environ.get("BOK_PROBE_PLAYOUT_TIMEOUT_S", "25"))
+PLAYOUT_MIN_SPEECH_S = float(os.environ.get("BOK_PROBE_PLAYOUT_MIN_SPEECH_S", "0.5"))
+PLAYOUT_STABLE_WINDOWS = 3  # 安静后还需连续 3 个采样窗（~0.6s）保持
+PLAYOUT_POLL_S = 0.2
 # 触发意图关键词：主词 + 同音/近形变体（ASR 是链路最弱环，触发起不来应归因
 # 到转写而不是图引擎——见 trigger_transcribed 检查与诊断输出）。
 TRIGGER_KEYWORDS = ["投诉", "投訴", "我要投诉", "举报", "索赔"]
@@ -84,6 +100,78 @@ def _as_int(value: object, default: int = 0) -> int:
         return int(str(value))
     except (TypeError, ValueError):
         return default
+
+
+PCM_FRAME_BYTES = 640  # 20ms @ 16kHz/16bit 单声道 = 16000×0.02×2
+PCM_BYTES_PER_S = 32000
+
+
+def trailing_silence_s(pcm: bytes, *, step: int = PCM_FRAME_BYTES, threshold: float = 200.0) -> float:
+    """缓冲区**末尾连续静音的真实秒数**（纯函数；RMS≥threshold 判语音，同
+    `erc.frame_rms` 口径）。从尾往前扫，撞到第一个语音帧即停——代价 O(尾静音帧数)；
+    空缓冲回 0（**不**把「还没出声」误判成「已安静」）。
+
+    注：`erc.speech_stats`/`e2e_edge_cases.wait_silence` 用 320B 步长却按 20ms/步
+    计秒，其「秒」实为 ~2× 真实值；本函数用 640B=20ms 真实秒，阈值语义无歧义。
+    """
+    frames = len(pcm) // step
+    silent = 0
+    for i in range(frames - 1, -1, -1):
+        if erc.frame_rms(pcm[i * step:(i + 1) * step]) >= threshold:
+            break
+        silent += 1
+    return silent * (step / PCM_BYTES_PER_S)
+
+
+def speech_seconds(pcm: bytes, processed: int = 0, *, step: int = PCM_FRAME_BYTES,
+                   threshold: float = 200.0) -> tuple[float, int]:
+    """增量统计累计语音秒数（纯函数）：只扫 `processed` 之后的新帧，返回 (新增秒, 新偏移)。"""
+    frames = len(pcm) // step
+    speech = 0
+    i = max(0, processed // step)
+    while i < frames:
+        if erc.frame_rms(pcm[i * step:(i + 1) * step]) >= threshold:
+            speech += 1
+        i += 1
+    return speech * (step / PCM_BYTES_PER_S), i * step
+
+
+async def wait_playout_end(
+    agent_audio: bytearray,
+    *,
+    quiet_s: float = QUIET_GAP_S,
+    min_speech_s: float = PLAYOUT_MIN_SPEECH_S,
+    timeout_s: float = PLAYOUT_TIMEOUT_S,
+) -> tuple[float, bool]:
+    """等 agent 音轨**当前播出段真播完**（不是「首声」）。返回 (实等秒数, 是否确认安静)。
+
+    机制同 `scripts/e2e_edge_cases.py` 的 `wait_silence`（增量扫帧 + 末尾静音窗），
+    外加两条防早返护栏：
+    ① 缓冲累计语音 ≥ `min_speech_s`（排除空轨/TTS 前导静音直接凑满静音窗）；
+    ② 末尾连续静音 ≥ `quiet_s`，且**连续 `PLAYOUT_STABLE_WINDOWS` 个采样窗保持**。
+
+    **为什么不用「无新帧」判停嘴（2026-09-18 实弹诊断）**：真栈上 agent 音轨空闲时
+    仍持续推帧（实测 ~2× 实时、纯静音，`background_audio`/`roomio_audio` 合成轨），
+    「字节数不再增长」结构性不可达——旧版据此判停嘴，每次等候都空烧满 25s 超时。
+    末尾静音窗是这里唯一可用的信号（E2E `wait_silence` 同款）。
+    空缓冲 → 末尾静音 0，必等。超时回 `(timeout_s, False)`——调用方照推但显式打印。
+    """
+    t0 = time.perf_counter()
+    state = {"processed": 0, "speech": 0.0}
+    stable = 0
+    while time.perf_counter() - t0 < timeout_s:
+        buf = bytes(agent_audio)
+        speech, state["processed"] = speech_seconds(buf, state["processed"])
+        state["speech"] += speech
+        tail = trailing_silence_s(buf)
+        if state["speech"] >= min_speech_s and tail >= quiet_s:
+            stable += 1
+            if stable >= PLAYOUT_STABLE_WINDOWS:
+                return time.perf_counter() - t0, True
+        else:
+            stable = 0
+        await asyncio.sleep(PLAYOUT_POLL_S)
+    return time.perf_counter() - t0, False
 
 
 def parse_graph_events(lines: list[str]) -> list[dict]:
@@ -433,6 +521,7 @@ async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_
 
     measures: list[dict] = []
     setup_ok = False
+    greeting_wait, greeting_quiet = 0.0, False
     marks: list[int] = [
         erc.LOG_PATH.stat().st_size if erc.LOG_PATH.exists() else 0
     ]
@@ -448,18 +537,30 @@ async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_
         setup_ok = await erc.wait_greeting(agent_audio)
         if not setup_ok:
             print("[flow-graph] WARN 开场白 45s×3 未出声，照常推进", flush=True)
-        agent_audio.clear()
-        await asyncio.sleep(0.5)
+        # wait_greeting 只保证「出过声」（其累计静音采样会因开场白句间停顿早返）→
+        # 必须再等真播完，否则触发器落进开场白尾巴（实弹根因）。
+        greeting_wait, greeting_quiet = await wait_playout_end(agent_audio)
+        print(f"[flow-graph] 开场白播完等候 {greeting_wait:.2f}s quiet_ok={greeting_quiet}",
+              flush=True)
+        # 不 clear：`play_and_listen` 自按 `mark=len(agent_audio)` 只量本轮新帧，
+        # 而累积语音保留才能让「安静」判据在空闲轮秒过（clear 后空闲轮无语音可累计
+        # → floor 永不满足 → 每轮空烧满超时，2026-09-18 实弹第二轮踩到）。
+        await asyncio.sleep(0.3)
 
         for name, text in rounds:
+            # 每轮起推前都等「上一条真播完」——12.9s 级回复同样会吞掉下一轮
+            # （首声 0.00s 伪值=上一条尾巴被当本轮应答）。
+            pre_wait, pre_quiet = await wait_playout_end(agent_audio)
+            print(f"    {name:>10} 起推前等候 {pre_wait:.2f}s quiet_ok={pre_quiet}", flush=True)
             m = await erc.play_and_listen(audio_source, agent_audio, pcms[name])
-            m.update({"name": name, "text": text})
+            m.update({"name": name, "text": text,
+                      "pre_push_wait_s": round(pre_wait, 2), "pre_push_quiet": pre_quiet})
             measures.append(m)
             marks.append(erc.LOG_PATH.stat().st_size if erc.LOG_PATH.exists() else marks[-1])
             first = f"{m['first_audio_ms'] / 1000:.2f}s" if m.get("first_audio_ms") is not None else "-"
             print(f"    {name:>10} 「{text}」 → 首声 {first} · 语音 {m.get('speech_s', 0):.1f}s · "
                   f"{'✓' if m.get('answered') else '✗哑'} · log+{marks[-1] - marks[-2]}B", flush=True)
-            await asyncio.sleep(0.8)
+            await asyncio.sleep(0.3)
     except Exception as exc:  # noqa: BLE001 - 单腿异常照常收尾并出报告
         print(f"[flow-graph] 腿 {leg_name} 异常中断: {exc!r}", flush=True)
     finally:
@@ -526,6 +627,17 @@ async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_
         "graph_json": graph_json,
         "setup_ok": setup_ok,
         "evidence": evidence,
+        # 起推前「播完」等候（2026-09-18 实弹修复）：开场白 + 逐轮，供事后归因
+        # 「首声 0.00s / 转写不含触发词」类伪值。
+        "pacing": {
+            "greeting_playout_s": round(greeting_wait, 2),
+            "greeting_quiet_ok": greeting_quiet,
+            "per_round": [
+                {"name": m["name"], "wait_s": m.get("pre_push_wait_s"),
+                 "quiet_ok": m.get("pre_push_quiet")}
+                for m in measures
+            ],
+        },
         "trigger_text": trigger_text,
         "nontrigger_text": nontrigger_text,
         "trigger_understood": understood,

@@ -7,6 +7,9 @@ review R1 的**观测前提**（absent 判据不许在没真观测时空过成 P
 
 from __future__ import annotations
 
+import json
+import math
+import struct
 import sys
 from pathlib import Path
 
@@ -197,8 +200,6 @@ def test_positive_checks_need_no_evidence_precondition():
 
 
 def test_build_graph_json_contract():
-    import json
-
     with_qa = json.loads(pfg.build_graph_json("qa-1"))
     assert with_qa["version"] == 1
     assert [i["label"] for i in with_qa["intents"]] == ["投诉", "退款"]
@@ -208,3 +209,76 @@ def test_build_graph_json_contract():
     no_qa = json.loads(pfg.build_graph_json(""))
     assert [b["action"] for b in no_qa["bindings"]] == ["jump_step"]
     assert "我要投诉" in pfg.build_graph_json("")  # 触发词覆盖主说法
+
+
+# ---------------------------------------------------------------------------
+# 起推前「播完」判据的纯函数（2026-09-18 实弹 pacing 修复）
+# ---------------------------------------------------------------------------
+def _tone(seconds: float, *, amp: int = 3000, sr: int = 16000) -> bytes:
+    n = int(sr * seconds)
+    return b"".join(struct.pack("<h", int(amp * math.sin(2 * math.pi * 440 * i / sr)))
+                    for i in range(n))
+
+
+def _silence(seconds: float, *, sr: int = 16000) -> bytes:
+    return b"\x00\x00" * int(sr * seconds)
+
+
+def test_trailing_silence_s_real_seconds():
+    """末尾静音按**真实秒**计（640B=20ms @16k/16bit）——阈值语义无 2× 歧义。"""
+    assert round(pfg.trailing_silence_s(_tone(1.0) + _silence(0.5)), 2) == 0.5
+    assert round(pfg.trailing_silence_s(_silence(2.0)), 2) == 2.0
+    # 全程语音 → 0；空缓冲 → 0（「还没出声」不许当成「已安静」）
+    assert pfg.trailing_silence_s(_tone(1.0)) == 0.0
+    assert pfg.trailing_silence_s(b"") == 0.0
+
+
+def test_speech_seconds_is_incremental():
+    pcm = _tone(1.0) + _silence(1.0)
+    speech, processed = pfg.speech_seconds(pcm, 0)
+    assert round(speech, 2) == 1.0
+    assert processed == len(pcm)
+    # 增量：无新帧 → 0 新增（不重复计费已扫段）
+    again, processed2 = pfg.speech_seconds(pcm, processed)
+    assert again == 0.0 and processed2 == processed
+    # 续加新语音照常计
+    more, _ = pfg.speech_seconds(pcm + _tone(0.5), processed)
+    assert round(more, 2) == 0.5
+
+
+def test_wait_playout_end_stops_at_tail_silence_not_frame_growth():
+    """实弹形状回归：音轨**空闲仍持续推帧**（纯静音，实测 ~2× 实时）——
+    旧版用「字节数不再增长」判停嘴结构性不可达，每轮空烧满超时。
+    现判据=末尾静音窗（+语音下限），帧一直长也照样停。"""
+    import asyncio
+
+    async def _run() -> tuple[float, bool]:
+        buf = bytearray(_tone(1.0))
+        stop = False
+
+        async def feed() -> None:
+            while not stop:
+                await asyncio.sleep(0.02)
+                buf.extend(_silence(0.05))  # 空闲仍推纯静音帧
+        feeder = asyncio.get_running_loop().create_task(feed())
+        try:
+            return await pfg.wait_playout_end(buf, quiet_s=0.3, min_speech_s=0.5,
+                                              timeout_s=8.0)
+        finally:
+            stop = True
+            feeder.cancel()
+
+    waited, ok = asyncio.run(_run())
+    assert ok is True, f"应靠末尾静音停住（实等 {waited:.2f}s）"
+    assert waited < 5.0, f"不该烧满超时（实等 {waited:.2f}s）"
+
+
+def test_wait_playout_end_empty_buffer_does_not_return_early():
+    """空缓冲（还没出声）→ 末尾静音 0，必须等满超时而不是秒过。"""
+    import asyncio
+
+    waited, ok = asyncio.run(
+        pfg.wait_playout_end(bytearray(), quiet_s=0.3, min_speech_s=0.5, timeout_s=1.0)
+    )
+    assert ok is False
+    assert waited >= 0.9, f"空缓冲不许秒过（实等 {waited:.2f}s）"
