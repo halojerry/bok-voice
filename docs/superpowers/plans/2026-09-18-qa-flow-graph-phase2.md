@@ -152,6 +152,12 @@ assert validate_flow_graph(json.dumps({"version": 1, "intents": [{"id": f"int_{i
 
 即真值断言（返回了错误）。若 lint 报「assert on list」可改 `assert len(...)>0`。
 
+> **勘误（2026-09-18 执行期）**：Step 1 fixture 里「退款」意图只带英文关键词 `["Refund"]`，
+> 与同文件断言 `pick_graph_action(doc, "我想退款", step_1based=3, fired=set())` 期望命中
+> **自相矛盾**（中文语料结构性匹配不上纯英文词）。执行时已修为 `["退款", "Refund"]`
+> （中文主词 + 英文变体），见 `tests/test_flow_graph_core.py`；本 plan 保留原样作执行档案，
+> 「契约以实现的测试为准」。
+
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `.venv312/bin/python -m pytest tests/test_flow_graph_core.py -v`

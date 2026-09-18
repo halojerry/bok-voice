@@ -101,6 +101,14 @@
 同时：通话/转写/结算/审计 → control-plane :8000 → SQLite（对象、人设、知识、模板、设置、审计）
 ```
 
+> **话术模板数据流（2026-09-18 话术图 Phase 2）**：`conversation_templates.steps_json`（分步）
+> + `graph_json`（意图关键词 → 绑定边 `play_qa`/`jump_step`；空串=未启用）→ 建单快照
+> `call_sessions.template_id` → agent 装配 `FlowController.from_template`（`parse_flow_graph`
+> 宽容解析，坏数据=空图）→ 每轮 `on_user_turn_completed` 的 graph 块（插在 say 直念之后、
+> QA 快路之前；`BOK_FLOW_GRAPH=0` 整闸）→ 动作落 agent.log 四打点
+> `FLOW_GRAPH jump|play|play_miss|jump_noop` 与 turns `provider=graph-jump|graph-play`
+> + `template_step`=跳后步号（探针 `scripts/probe_flow_graph.py`）。
+
 > **前端就绪自愈**：服务未就绪时先开页面（节点 node_agent 拉起全栈有秒级时差）。
 > 前端 `lib/api-ready.ts` 的 `useControlPlaneReady` 轮询 `/health`，Control Plane 就绪后
 > 自动重拉对象/人设等数据；`TypeError: Load failed` 不再直接上屏，而是映射为
