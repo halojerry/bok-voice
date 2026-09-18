@@ -3,19 +3,21 @@
 // QA 画布视图(spec §4.3/§4.4,2026-09-17 Phase1)。渲染+编辑交互在本文件:
 // 连线(onConnect)/右键/双击/断线(Delete 键或边右键)一律上抛,page.tsx 持数据与 PATCH。
 // 布局=lib/qa-canvas.deriveGraph(确定性);拖动位置 localStorage;MiniMap 常开。
+// 话术图 Phase2(spec §7,2026-09-18):意图节点(type="intent")+绑定边(kind="binding")
+// 的渲染/点选/删除/调色盘也在此;图数据(graphDoc)与落库归 page(Task 8)。
 
 import {
-  useCallback, useEffect, useMemo, useState,
-  type CSSProperties, type MouseEvent as ReactMouseEvent,
+  memo, useCallback, useEffect, useMemo, useRef, useState,
+  type CSSProperties, type MouseEvent as ReactMouseEvent, type RefObject,
 } from "react";
 import {
-  Background, Controls, Handle, MiniMap, Position, ReactFlow,
+  Background, Controls, Handle, MiniMap, Position, ReactFlow, useReactFlow,
   type Edge, type EdgeChange, type Node, type NodeChange, type NodeProps,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import {
   deriveGraph, LOCAL_POS_KEY, parseTemplateSteps,
-  type FlowStep, type Pt, type QaRow,
+  type CanvasIntentNode, type FlowStep, type GraphDoc, type GraphIntent, type Pt, type QaRow,
 } from "@/lib/qa-canvas";
 
 export type TemplateRow = { id: string; name?: string; steps_json?: string; language?: string };
@@ -75,7 +77,72 @@ function QaStepNode({ data }: NodeProps) {
   );
 }
 
-const NODE_TYPES = { qaEntry: QaEntryNode, qaStep: QaStepNode };
+/** 意图节点(话术图 Phase 2,spec §7):锚定话术步骤的意图卡,禁用态置灰照渲染。 */
+const IntentNode = memo(function IntentNode({ data, selected }: NodeProps) {
+  const d = data as { intent: GraphIntent };
+  return (
+    <div
+      className={`w-[220px] rounded-lg border px-3 py-2 shadow-sm ${
+        d.intent.enabled ? "border-amber-300 bg-amber-50" : "border-(--card-border) bg-muted/60 opacity-50"
+      } ${selected ? "ring-2 ring-amber-400" : ""}`}
+    >
+      {/* 柄恒渲染(v12 解析边端点时两端都要取到 Handle,缺=008 且边整体不渲染),
+          源柄在右(绑定边目标全是脊柱/卫星道,在意图道右侧)。
+          绑定关系只在意图编辑器里建,故两枚柄双闸钉死不可连——否则从条目拖到意图节点
+          会掉进 onConnect 的兜底分支、落成一条以 "intent:*" 为簇头的脏簇边。 */}
+      <Handle
+        type="target" position={Position.Left}
+        isConnectable={false} isConnectableStart={false} style={HANDLE_STYLE}
+      />
+      <Handle
+        type="source" position={Position.Right}
+        isConnectable={false} isConnectableStart={false} style={HANDLE_STYLE}
+      />
+      <div className="flex items-center gap-1.5 text-[13px] font-medium">
+        <span aria-hidden>🎯</span>
+        {/* min-w-0:flex 子项默认 min-width:auto=内容宽,不加则 truncate 对长 label 不生效 */}
+        <span className="min-w-0 truncate">{d.intent.label || "(未命名意图)"}</span>
+        {!d.intent.enabled && <span className="ml-auto shrink-0 text-[10px] muted">已停用</span>}
+      </div>
+      <div className="mt-1 truncate text-[11px] muted">{d.intent.keywords.join(" / ")}</div>
+    </div>
+  );
+});
+
+const NODE_TYPES = { qaEntry: QaEntryNode, qaStep: QaStepNode, intent: IntentNode };
+
+// 「＋ 意图」调色盘(spec §7):作为 <ReactFlow> 的子节点渲染——useReactFlow 的
+// screenToFlowPosition 要 provider(v12 的 ReactFlow 自带 provider 且 children 落在
+// 非变换层,与 MiniMap 同层),放外层 div 就得把整个画布包进 ReactFlowProvider。
+// 左下角让开 Controls(默认 bottom-left,26px×3 叠层):同行右移到 left-16。
+function IntentPalette({ wrapperRef, onAddIntent }: {
+  wrapperRef: RefObject<HTMLDivElement | null>;
+  onAddIntent?: (flowPos: Pt) => void;
+}) {
+  const { screenToFlowPosition } = useReactFlow();
+  return (
+    <div className="nodrag nopan absolute bottom-4 left-16 z-10 flex gap-2">
+      <button
+        type="button"
+        className="rounded-md border border-amber-300 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-800 hover:bg-amber-100"
+        onClick={() => {
+          const bounds = wrapperRef.current?.getBoundingClientRect();
+          onAddIntent?.(screenToFlowPosition({
+            x: (bounds?.left ?? 0) + (bounds?.width ?? 800) / 2,
+            y: (bounds?.top ?? 0) + (bounds?.height ?? 600) / 2,
+          }));
+        }}
+      >
+        ＋ 意图
+      </button>
+    </div>
+  );
+}
+
+/** 节点 id → 意图 id(Task 6 的 id 形态 "intent:<intentId>")。 */
+function intentIdOf(nodeId: string): string {
+  return nodeId.startsWith("intent:") ? nodeId.slice("intent:".length) : nodeId;
+}
 
 // 上抛边载荷的结构收窄(仅取 page 关心的字段,不 as never 逃逸)。
 export type CanvasEdgeHit = { id: string; source: string; target: string; data?: { kind?: string } };
@@ -100,8 +167,22 @@ export default function QaCanvasView(props: {
   /** 补齐录音(仅主管注入;不给=按钮不渲染,user 的 403 由闸兜底)。 */
   onPregenAll?: () => void;
   pregenBusy?: boolean;
+  /** 话术图(spec §7):意图节点+绑定边的派生输入;缺省=无图,Phase1 视图零变化。 */
+  graphDoc?: GraphDoc;
+  /** 意图图可编辑(归属判定归 Task 8):缺省/false=调色盘不渲染、意图节点不可删。 */
+  canEditGraph?: boolean;
+  /** 新建意图:落点=视口中心流坐标(page 落库后回传新 graphDoc 重渲染)。 */
+  onAddIntent?: (flowPos: Pt) => void;
+  /** 点选意图节点=开意图编辑器(intentId 已剥 "intent:" 前缀)。 */
+  onOpenIntentEditor?: (intentId: string) => void;
+  /** Delete 键删意图(page 落库时连带其绑定;仅 canEditGraph 时意图节点进删除集)。 */
+  onDeleteIntent?: (intentId: string) => void;
 }) {
-  const { rows, templates, templateId, canned, canEditRow, accountId } = props;
+  const { rows, templates, templateId, canned, canEditRow, accountId, graphDoc } = props;
+  // memo 依赖用的稳定布尔(直接依赖 props 对象会击穿 memo 全量重建)。
+  const canEditGraph = Boolean(props.canEditGraph);
+  // 画布外层 div:调色盘落点=该矩形中心(screenToFlowPosition 吃屏幕坐标)。
+  const wrapperRef = useRef<HTMLDivElement | null>(null);
   const [langFilter, setLangFilter] = useState("all");
   const [positions, setPositions] = useState<Record<string, Pt>>({});
   // 边选中态本地持有(spec §4.4:点选边→Delete 键或右键解除):受控图里 RF 的
@@ -123,8 +204,8 @@ export default function QaCanvasView(props: {
   }, [templates, templateId]);
 
   const graph = useMemo(
-    () => deriveGraph(rows, steps, { langFilter, positions }),
-    [rows, steps, langFilter, positions],
+    () => deriveGraph(rows, steps, { langFilter, positions, graph: graphDoc }),
+    [rows, steps, langFilter, positions, graphDoc],
   );
 
   const nodes: Node[] = useMemo(
@@ -137,8 +218,13 @@ export default function QaCanvasView(props: {
         deletable: false,
         data: { ...n.data, canned: canned[String(n.id)]?.state, canEdit: canEditRow(n.data) },
       })),
+      // 意图节点:图的可删对象(删除=从图移除意图+其绑定),故 deletable 跟 canEditGraph
+      // 走——不可编辑时 deletable=false,Backspace 结构性进不了删除集。
+      ...graph.nodes
+        .filter((n): n is CanvasIntentNode => n.type === "intent")
+        .map((n) => ({ ...n, deletable: canEditGraph, data: { ...n.data } })),
     ],
-    [graph, canned, canEditRow],
+    [graph, canned, canEditRow, canEditGraph],
   );
   const edges: Edge[] = useMemo(
     () =>
@@ -153,6 +239,23 @@ export default function QaCanvasView(props: {
             style: { stroke: "var(--muted-foreground)", strokeWidth: 2 },
           };
         }
+        if (e.data.kind === "binding") {
+          // 绑定边(意图→目标,spec §7):虚线 amber 与实线簇边/步骤边区分;可删跟 canEditGraph
+          // (删除=从图移除绑定,沿既有簇边删除模式经 onEdgesDelete/右键菜单上抛 page)。
+          return {
+            ...e,
+            selected: sel,
+            selectable: true,
+            deletable: canEditGraph,
+            style: {
+              stroke: sel ? "var(--live)" : "#d97706",
+              strokeWidth: sel ? 2.4 : 1.6,
+              strokeDasharray: "6 4",
+            },
+            labelStyle: { fill: "#92400e", fontSize: 11 },
+            labelBgStyle: { fill: "#fef3c7" },
+          };
+        }
         return {
           ...e,
           selected: sel,
@@ -164,7 +267,7 @@ export default function QaCanvasView(props: {
           labelStyle: { fontSize: 10 },
         };
       }),
-    [graph, selectedEdgeId],
+    [graph, selectedEdgeId, canEditGraph],
   );
 
   const onNodeDragStop = useCallback(
@@ -240,6 +343,7 @@ export default function QaCanvasView(props: {
           用包裹层 onDoubleClick + 落点判 pane 兜出,并关掉双击缩放避免手势打架;
           坐标上抛 page,Phase1 仅开新建表单(落点插入待 Phase2)。 */}
       <div
+        ref={wrapperRef}
         className="h-[600px] rounded-lg border border-(--card-border)"
         onDoubleClick={(e) => {
           const t = e.target as HTMLElement | null;
@@ -262,6 +366,10 @@ export default function QaCanvasView(props: {
           onPaneClick={() => setSelectedEdgeId(null)}
           onNodeClick={(_, node) => {
             setSelectedEdgeId(null); // 点节点=去选边,防 Backspace 误触发边解除
+            if (node.type === "intent") {
+              props.onOpenIntentEditor?.(intentIdOf(node.id)); // 点意图=开意图编辑器(spec §7)
+              return;
+            }
             const row = rows.find((r) => String(r.id) === node.id);
             if (row) props.onNodeClick(row);
           }}
@@ -280,6 +388,27 @@ export default function QaCanvasView(props: {
             const hit = edge as CanvasEdgeHit;
             setSelectedEdgeId(edge.id);
             props.onEdgeContextMenu?.(hit, e);
+          }}
+          onBeforeDelete={async ({ nodes: delNodes, edges: delEdges }) => {
+            // 删意图节点:RF 会把挂在它身上的绑定边一并放进删除集(deleteElements 里
+            // onEdgesDelete 先于 onNodesDelete 触发),那条绑定边就会既走 onDisconnect 又走
+            // onDeleteIntent 的「连带绑定」=同一批上抛两次(page 两次读改写会互相打架)。
+            // 意图删除语义已含连带绑定,故把源节点是本次被删意图的绑定边从删除集摘掉。
+            const intentIds = new Set(delNodes.filter((n) => n.type === "intent").map((n) => n.id));
+            if (intentIds.size === 0) return { nodes: delNodes, edges: delEdges };
+            return {
+              nodes: delNodes,
+              edges: delEdges.filter(
+                (e) => !((e.data as { kind?: string } | undefined)?.kind === "binding" && intentIds.has(e.source)),
+              ),
+            };
+          }}
+          onNodesDelete={(deleted) => {
+            // 意图节点删除(spec §7):deletable 已按 canEditGraph 钉死,能进删除集即已过闸。
+            for (const node of deleted) {
+              if (node.type !== "intent") continue;
+              props.onDeleteIntent?.(intentIdOf(node.id));
+            }
           }}
           onEdgesDelete={(deleted) => {
             for (const edge of deleted) {
@@ -304,6 +433,8 @@ export default function QaCanvasView(props: {
           <Background gap={24} />
           <Controls />
           <MiniMap pannable zoomable />
+          {/* 调色盘浮层(spec §7):不可编辑图时不渲染。 */}
+          {canEditGraph && <IntentPalette wrapperRef={wrapperRef} onAddIntent={props.onAddIntent} />}
         </ReactFlow>
       </div>
     </div>
