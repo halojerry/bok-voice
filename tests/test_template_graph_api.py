@@ -53,3 +53,20 @@ def test_put_partial_update_semantics(monkeypatch):
     bad = client.put(f"/api/templates/{tpl['id']}", json={"graph_json": '{"version":9}'})
     assert bad.status_code == 400
     assert repo.get_template(tpl["id"])["graph_json"] == json.dumps(_GOOD)
+
+
+def test_invalid_put_writes_no_revision_row(monkeypatch):
+    """被拒的保存连版本行都不准写:append_template_revision 自带 commit,
+    校验若晚于它,每个非法图都会白吃一个版本号并留下与现状等同的历史行
+    (autosave 编辑器可刷满历史)——review R1。"""
+    client, repo = _client_and_repo(monkeypatch)
+    tpl = client.post("/api/templates", json={"name": "t", "graph_json": json.dumps(_GOOD)}).json()
+    before_rows = len(repo.list_template_revisions(tpl["id"]))
+    bad = client.put(f"/api/templates/{tpl['id']}", json={"graph_json": '{"version":9}'})
+    assert bad.status_code == 400
+    assert len(repo.list_template_revisions(tpl["id"])) == before_rows
+    assert repo.get_template(tpl["id"])["graph_json"] == json.dumps(_GOOD)
+    # 计数灵敏度自证:合法保存照旧 +1(否则上面的相等断言恒真=空断言)。
+    ok = client.put(f"/api/templates/{tpl['id']}", json={"name": "t2"})
+    assert ok.status_code == 200
+    assert len(repo.list_template_revisions(tpl["id"])) == before_rows + 1
