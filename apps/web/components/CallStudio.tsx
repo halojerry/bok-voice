@@ -2,8 +2,6 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  StartAudio,
-  VoiceAssistantControlBar,
   useAgent,
   useAgentExpression,
   useAudioPlayback,
@@ -18,10 +16,13 @@ import { api } from "@/lib/api";
 import { describeConnectError, friendlyErrorText, useControlPlaneReady } from "@/lib/api-ready";
 import { listAudioDevicesOf, requestMicPermission, saveMicDevice, savedMicDevice, savedOutputDevice, switchWebOutputDevice, webCanSwitchOutput, type AudioDeviceInfo } from "@/lib/audio";
 import { startTrace } from "@/lib/logger";
+import { AgentAudioVisualizerAura } from "@/components/agents-ui/agent-audio-visualizer-aura";
 import { AgentChatIndicator } from "@/components/agents-ui/agent-chat-indicator";
 import { AgentChatTranscript } from "@/components/agents-ui/agent-chat-transcript";
+import { AgentControlBar } from "@/components/agents-ui/agent-control-bar";
 import { AgentSessionProvider } from "@/components/agents-ui/agent-session-provider";
-import { VoiceAgentInterface } from "@/components/VoiceAgentInterface";
+import { StartAudioButton } from "@/components/agents-ui/start-audio-button";
+import { useMoodColor } from "@/hooks/use-mood-color";
 import { useAccount } from "@/components/account-context";
 
 // 模块级 trace（环形缓存+TTL 有界，见 lib/logger.ts 头注释）：数据加载/设备应用失败不再静默。
@@ -58,6 +59,8 @@ function AgentStateLabel({ state }: { state: string }) {
 function LiveAgentPanel({ room, session }: { room: Room | null; session: UseSessionReturn }) {
   const { state, microphoneTrack, failureReasons } = useAgent();
   const { mood } = useAgentExpression();
+  // 情绪驱动色（官方 Expressive 接线保留）：中性=青系 #1FD5F9，与 --live 同族、白底可见。
+  const moodColor = useMoodColor(mood);
   const transcriptions = useTranscriptions();
   const { messages } = useSessionMessages(session);
   const agentState = state ?? "connecting";
@@ -84,23 +87,32 @@ function LiveAgentPanel({ room, session }: { room: Room | null; session: UseSess
       <div className="relative flex min-h-[280px] flex-1 flex-col overflow-hidden">
         <AgentChatTranscript agentState={agentState} messages={messages} className="px-1 py-2" />
         {messages.length === 0 && (
-          <div className="pointer-events-none absolute inset-0 flex items-center justify-center font-mono text-[10px] font-bold uppercase tracking-[0.16em] text-(--stage-muted)">
+          <div className="pointer-events-none absolute inset-0 flex items-center justify-center font-mono text-[10px] font-bold uppercase tracking-[0.16em] text-(--muted-foreground)">
             等待对话…
           </div>
         )}
       </div>
 
-      {/* 中央：官方点阵可视化（mood 驱动色）；sm 尺寸并 shrink-0，把纵向空间让给转写 */}
+      {/* 中央：官方 Aura 可视化（themeMode=light 白底渲染；mood 驱动色接线保留，中性色 =
+          useMoodColor 的青系 #1FD5F9，与 --live 同族）；sm 尺寸并 shrink-0，把纵向空间让给转写 */}
       <div className="flex shrink-0 flex-col items-center justify-center gap-1 py-2">
         <div className="flex items-center gap-4">
           <AgentStateLabel state={agentState} />
-          <VoiceAgentInterface
-            size="sm"
-            state={agentState}
-            mood={mood}
-            audioTrack={microphoneTrack}
-            showMoodLabel
-          />
+          <div className="relative inline-flex">
+            <AgentAudioVisualizerAura
+              size="sm"
+              state={agentState}
+              color={moodColor}
+              themeMode="light"
+              audioTrack={microphoneTrack}
+            />
+            <span
+              className="pointer-events-none absolute inset-0 flex items-center justify-center font-mono text-sm capitalize"
+              style={{ color: moodColor }}
+            >
+              {mood ?? "neutral"}
+            </span>
+          </div>
         </div>
         {/* 官方失败态显性化:agent/会话失败不能只显示一个「失败」点,把原因亮出来。
             useAgent 未连接会话时 failureReasons 可能为 null——空值守卫,避免开页即崩。 */}
@@ -121,11 +133,23 @@ function LiveAgentPanel({ room, session }: { room: Room | null; session: UseSess
         </div>
       )}
 
-      {/* 控制条（AgentSessionProvider 已内置音频渲染）；设备切换已移到右侧「音频设备」卡片 */}
+      {/* 控制条（AgentSessionProvider 已内置音频渲染）；设备切换已移到右侧「音频设备」卡片。
+          官方 AgentControlBar 按 CallStudio 能力裁剪=只留麦克风开关（旧实验控制条的 mic toggle +
+          audioinput 设备菜单同款，摄像头/屏幕/文字聊天本就没有）。
+          saveUserChoices=false：设备偏好仍归 CallStudio 的 bok.audio.* 单轨，禁官方写 livekit
+          标准 localStorage 键（spec §7 零新增存储键）。
+          leave=false（挂断行为保真取舍）：CallStudio 挂断是复合路径 leave()=session.end()→
+          api.hangup 上报→结算轮询→重挂；官方 AgentDisconnectButton 在 onClick 后恒再调
+          session.end()（useSessionContext），接入会双触发且官方件无处安放后续清理——挂断
+          仍由顶部「挂断」按钮（同款 leave()）承担，本条不渲染 leave 控件。 */}
       <div className="flex shrink-0 flex-col items-center gap-2 border-t border-(--card-border) py-2">
         <div className="flex items-center justify-center gap-3">
-          <StartAudio label="点击开启声音" />
-          <VoiceAssistantControlBar />
+          <StartAudioButton label="点击开启声音" />
+          <AgentControlBar
+            saveUserChoices={false}
+            isConnected
+            controls={{ leave: false, camera: false, microphone: true, screenShare: false, chat: false }}
+          />
         </div>
       </div>
     </div>
@@ -368,7 +392,8 @@ function AudioDevicesCard({ room }: { room: Room | null }) {
 function IdleStage() {
   return (
     <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
-      <VoiceAgentInterface state="connecting" size="md" />
+      {/* themeMode=light 白底渲染；color 用官方默认 #1FD5F9（青系，与 --live 同族） */}
+      <AgentAudioVisualizerAura state="connecting" size="md" themeMode="light" />
       <p className="stage-value stage-glow mt-2">Live Agent</p>
       <p className="text-sm text-(--foreground)">点击「接通」开始与 AI 助手对话</p>
       <p className="text-xs muted">浏览器将请求麦克风权限</p>
@@ -410,7 +435,7 @@ function HistoryTranscript({ callId }: { callId: string }) {
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       <div className="flex-1 space-y-1.5 overflow-y-auto p-2">
-        <p className="text-center text-[10px] font-bold uppercase tracking-[0.16em] text-(--stage-muted)">
+        <p className="text-center text-[10px] font-bold uppercase tracking-[0.16em] text-(--muted-foreground)">
           本通对话记录
         </p>
         {turns.length === 0 && <p className="text-center text-xs muted">暂无转写落库</p>}
