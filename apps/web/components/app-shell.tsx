@@ -3,9 +3,11 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useState } from "react";
+import { AlertCircle, Inbox } from "lucide-react";
 import { AccountProvider, useAccount } from "@/components/account-context";
 import { Sidebar } from "@/components/layout/sidebar";
 import { Topbar } from "@/components/layout/topbar";
+import { Skeleton } from "@/components/ui/skeleton";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { gateForPath } from "@/lib/navigation";
 import {
@@ -104,18 +106,43 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   );
 }
 
-export function LoadingState({ label = "加载中…" }: { label?: string }) {
-  return <p className="text-sm muted">{label}</p>;
+/** 加载态：Skeleton 骨架行 + 原文案（P4 浅色改版；文案一字不动，只换视觉）。 */
+export function LoadingState({
+  label = "加载中…",
+  skeletonLines = 3,
+}: {
+  label?: string;
+  skeletonLines?: number;
+}) {
+  const lines = Math.max(1, skeletonLines);
+  return (
+    <div className="space-y-2" role="status">
+      <div aria-hidden="true" className="space-y-2">
+        {Array.from({ length: lines }, (_, i) => (
+          <Skeleton key={i} className={i === lines - 1 ? "h-4 w-2/3" : "h-4 w-full"} />
+        ))}
+      </div>
+      <p className="text-sm muted">{label}</p>
+    </div>
+  );
 }
 
+/** 空态：lucide 图标 + 原文案（文案一字不动）。 */
 export function EmptyState({ label = "暂无数据" }: { label?: string }) {
-  return <p className="text-sm muted">{label}</p>;
+  return (
+    <div className="flex flex-col items-center gap-2 py-10 text-muted-foreground">
+      <Inbox className="h-8 w-8" aria-hidden="true" />
+      <p className="text-sm muted">{label}</p>
+    </div>
+  );
 }
 
+/** 错误态：lucide 图标 + 友好文案；红底红字样式保留。 */
 export function ErrorState({ message }: { message: string }) {
   return (
-    <p className="rounded-lg bg-red-500/10 p-3 text-sm text-red-600">
-      {friendlyErrorText(message)}
-    </p>
+    <div className="flex items-start gap-2 rounded-lg bg-red-500/10 p-3 text-sm text-red-600">
+      <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+      <p>{friendlyErrorText(message)}</p>
+    </div>
   );
 }
