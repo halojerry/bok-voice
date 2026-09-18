@@ -93,6 +93,22 @@ export const GUARD_ONLY: NavItem[] = [
   { href: "/translate", label: "同传", key: "interpret", icon: AudioLines },
 ];
 
+/**
+ * 舞台路由（沉浸工作面）：进入时桌面侧栏自动收成图标轨——**临时态**，不写
+ * `bok_sidebar_collapsed` 用户偏好键（离开舞台路由即恢复存储偏好；舞台页上的
+ * 手动切换仅当轮路由生效）。/translate 取自 GUARD_ONLY 单一事实源，本表不重复拼写。
+ */
+export const STAGE_ROUTE_PREFIXES = [
+  "/calls/new",
+  "/interpret",
+  ...GUARD_ONLY.map((item) => item.href),
+];
+
+/** 舞台路由判定（前缀语义同 matchesPath：/calls/new 命中 /calls/new/**，不命中 /calls）。 */
+export function isStageRoute(pathname: string): boolean {
+  return STAGE_ROUTE_PREFIXES.some((prefix) => matchesPath(pathname, prefix));
+}
+
 /** 路由访问门（契约 §4）：open=放行；page=按权限键；manager=主管专属；root=root 专属。 */
 export type RouteGate =
   | { kind: "open" }
