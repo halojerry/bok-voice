@@ -1,11 +1,11 @@
-# Linux bundled runtime deps (NVIDIA CUDA path，GPU 节点主力档)。
-# 与 requirements-runtime-win.txt 同源：torch>=2.5 默认轮子即 cu12x（含
-# Turing sm_75 → Ada sm_89 全谱），transformers 4.57.6 由 qwen-asr 钉死。
-# - ASR: Qwen3-ASR (qwen-asr 0.0.6 pins transformers==4.57.6) -> installed by
-#   build_runtime.sh after this file.
-# - TTS: 走 MiniMax 云端（本地 qwen-tts 不进 Linux 包，需要时另行评估）。
-# - LLM: llama.cpp CUDA binary 或 vLLM（sm_80+ 卡），均非本清单范畴（二进制/
-#   独立安装，requirements-runtime 面只管 python 依赖）。
+# Linux bundled runtime deps (NVIDIA CUDA path，GPU 节点主力档)——**基础面**。
+# CUDA 栈（torch/transformers/accelerate/gradio/qwen-asr）不进运行时包：
+#   ① GitHub Release 单资产上限 2GB，CUDA 全家桶打进 tarball 必超
+#     （v0.4.0 linux runner 实证 422 size must be less than 2147483648）；
+#   ② 租用 GPU 箱平台镜像多带 PyTorch/CUDA，打进包是重复运输。
+# CUDA 栈在节点装机时由 install-node.sh 幂等装入 runtime python
+# （requirements-runtime-linux-cuda.txt；已可 import torch 即跳过；
+#   pip 镜像经标准 PIP_INDEX_URL/PIP_EXTRA_INDEX_URL env 透传）。
 fastapi>=0.110,<1
 uvicorn[standard]>=0.29,<1
 python-multipart>=0.0.9
@@ -17,11 +17,6 @@ pydantic>=2.6
 sqlalchemy>=2.0,<3
 huggingface_hub>=0.26
 hf_transfer>=0.1
-transformers==4.57.6
-accelerate>=1.0
-einops>=0.8
-gradio>=5.0
 onnxruntime>=1.18
 sox>=1.5
-torch>=2.5
-torchaudio>=2.5
+sentencepiece>=0.2
