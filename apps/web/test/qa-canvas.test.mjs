@@ -293,3 +293,59 @@ test("page.tsx 接线：草稿进 then_jump、submit 用真实重建函数且结
   assert.match(src, /nextBindings\.push\(\s*bindingFromDraft\(row,\s*intent\.id,\s*stepCount\)/);
   assert.doesNotMatch(src, /nextBindings\.push\(\s*\{\s*\.\.\.common/);
 });
+
+// —— Phase 3.4 判据（judge.prompt）——
+// 空判据必须**字节级**同旧 JSON：靠 `intentJudgeField` 空值返 undefined + JSON.stringify
+// 省键，故下面用真 JSON.stringify 对照（不是 deepEqual——键在场值 undefined 也该消失）。
+test("判据投影：空/纯空白省键（JSON 逐字节同旧文档），非空 trim 后落 prompt", () => {
+  assert.equal(qa.JUDGE_PROMPT_MAX_CHARS, 400);
+  assert.equal(qa.intentJudgeField(""), undefined);
+  assert.equal(qa.intentJudgeField("   \n\t "), undefined);
+  assert.equal(qa.intentJudgeField(undefined), undefined);
+  assert.deepEqual(qa.intentJudgeField("  客户表达不满时算命中  "), { prompt: "客户表达不满时算命中" });
+
+  // 保存路径投影形状（page.tsx onConfirm 字面量同形：...intent + judge: intentJudgeField(...)）。
+  const base = { id: "int_1", label: "投诉", keywords: ["投诉"], steps: [], enabled: true };
+  const projected = {
+    ...base, label: "投诉", keywords: ["投诉"], steps: [], enabled: true,
+    judge: qa.intentJudgeField("  "),
+  };
+  assert.equal(JSON.stringify(projected), JSON.stringify(base)); // 空判据：零字节变化
+  // 清空既有判据（编辑旧意图删掉判据后保存）：也回到旧文档字节。
+  const hadJudge = { ...base, judge: { prompt: "旧判据" } };
+  assert.equal(
+    JSON.stringify({ ...hadJudge, judge: qa.intentJudgeField("") }),
+    JSON.stringify(base),
+  );
+  // 非空判据：键在场且只有 prompt（形状与 CP 契约一致）。
+  const withJudge = { ...base, judge: qa.intentJudgeField("客户要求赔偿但没说出关键词") };
+  assert.equal(
+    JSON.stringify(withJudge),
+    '{"id":"int_1","label":"投诉","keywords":["投诉"],"steps":[],"enabled":true,'
+      + '"judge":{"prompt":"客户要求赔偿但没说出关键词"}}',
+  );
+});
+
+// 接线守门（同 Phase 3.3 bindingFromDraft 的源码扫描）：纯函数测得到投影，却测不到「草稿有没有
+// 进编辑器状态、保存字面量有没有折入 judge」。judge 只有唯一保存路径投影，源码扫描钉死。
+test("page.tsx 接线：判据草稿进状态、判据文本域在场、保存字面量折入唯一投影", () => {
+  const canvasSrc = readFileSync(path.join(WEB_ROOT, "lib", "qa-canvas.ts"), "utf8");
+  assert.match(canvasSrc, /judge\?:\s*\{\s*prompt:\s*string\s*\}/); // 模型面
+  const src = readFileSync(path.join(WEB_ROOT, "app", "(app)", "qa", "page.tsx"), "utf8");
+  assert.match(src, /useState\(intent\.judge\?\.prompt \?\? ""\)/); // 加载侧进草稿
+  assert.match(src, /judge:\s*intentJudgeField\(judgeText\)/); // 保存侧唯一投影
+  // I1 修正(review)：裸 JUDGE_PROMPT_MAX_CHARS 会被 import 行喂饱(恒绿)——钉比较本身，
+  // 删掉整段超长检查块此断言必红。
+  assert.match(src, /judgePrompt\.length\s*>\s*JUDGE_PROMPT_MAX_CHARS/); // 超长可见报错（不静默截断）
+  assert.match(src, /判据最长 /); // 报错文案在场（与上一条双锚，防只留比较删报错）
+  assert.match(src, /判据（可选）/); // 文本域标签
+  assert.match(
+    src,
+    /判据即 prompt 片段：写清什么算命中、什么不算（正反例）。留空=仅关键词确定性命中。关键词未中时由后台大模型按判据评估，命中下一轮生效。/,
+  );
+  assert.doesNotMatch(src, /judge:\s*\{\s*prompt/); // 不许第二处自拼 judge 对象
+  // N1 修正(review)：形状特定负守卫测不到 judge: intentJudgeField(other) 类第二投影——
+  // count 锚直钉「全文件 judge: 字面量恰一处」。
+  assert.equal((src.match(/judge:/g) ?? []).length, 1); // 唯一保存路径投影（count 锚）
+});
+
