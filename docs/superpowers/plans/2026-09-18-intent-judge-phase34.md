@@ -52,4 +52,28 @@ env：`BOK_FLOW_GRAPH_JUDGE` 入 `tools/bok.py` `_BOK_PASSTHROUGH_KEYS`（dev+pr
 4. 无 DB 迁移（本期不适用公约 #4）。
 
 ## 勘误
-（实施中追加）
+1. **（T1 review F1）调度 else 与图块平级**：空转写轮（user_text 为空令图块整体跳过）
+   仍会漏进调度——白烧一次 9B 之外，挂上的 pending 在下一轮无话语支撑地触发绑定。
+   修=调度钉死 `elif user_text:`；接线测试 test_intent_judge_wiring.py 源级锚钉死。
+2. **（T1 review F5）消费位缺 kill 配对**：=0 时 pending 必须照清（TTL 不悬挂）但不再
+   喂 judge_hit——中程翻闸无半开态。
+3. **（T1 review N9）`_llm_judge` timeout=5 硬码对 9B 判据集是静默永久 miss**：非流式
+   总预算 5s、9B prefill ~0.6k tok/s，中型候选集必超时。修=timeout 具名参数（缺省 5.0
+   零变化），judge 调用传 20；同批修 prompt「编号」措辞（诱导回序号=parse 恒 miss）
+   与 parse 不剥句尾中文标点。
+4. **（T3 实弹）探针 fuzzy 窗用错解析器**：judge_scheduled 落 fuzzy 窗（字节偏移实证
+   15107513 ∈ window0），但窗解析只用图四词正则 `parse_graph_events`=结构性捞不到、
+   judge_scheduled 恒 FAIL 假阴。修=fuzzy 窗叠加 `parse_judge_events`。
+5. **（T3 实弹）erc.fetch_turns 裸 httpx 在 auth-on 栈 401**：`{"detail":…}` dict 令
+   `graph_turn_rows` 的 `t.get` AttributeError 炸腿。修=探针内 `fetch_turns_authed`
+   （带 `_CP_HEADERS`、非列表响应当零行；未设 token 逐字节同 erc 裸跑）。e2e-auth
+   未并分支（fix/e2e-trilingual-auth）同病，各修各的。
+6. **（T3 环境）worktree 起真栈需三链接**：`runtime`（sidecar 打包 python/livekit）、
+   `services/realtime-translation/node_modules`（bline）符号链接主树——bok.py 的
+   sidecar_python/write_bline_config 都按 ROOT 相对路径解析，worktree 缺未跟踪目录即
+   serve exit 2/1。非代码问题，验收跑法记档。
+7. **（T3 实弹）fuzzy 话语被 ASR 劈两段不破坏腿**：首段调度+判定、次段消费 pending
+   触发跳步（turn 行 template_step=4）——judge 消费语义对劈轮鲁棒，顺带实证。
+8. **（T2 review I1/N1-N4）**：web 接线守卫的 JUDGE_PROMPT_MAX_CHARS 裸 token 断言被
+   import 行喂饱（恒绿）→ 钉比较本体+报错文案双锚；judge: 唯一投影 count 锚；两处
+   注释 truthing（parseGraphDoc 不消毒坏形状/常量手工同步）；表头文案补判据语义。

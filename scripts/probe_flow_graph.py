@@ -272,6 +272,34 @@ def parse_judge_events(lines: list[str]) -> list[dict]:
     return events
 
 
+async def fetch_turns_authed(call_id: str, settle_s: float = 12.0) -> list[dict]:
+    """`erc.fetch_turns` 的 auth-on 档：CP 请求带 `_CP_HEADERS`（机器通道 Bearer）。
+
+    2026-09-19 实弹：erc 骨架的 fetch_turns 裸 `httpx.get`——auth-on 栈下 401 落
+    `{"detail":…}` dict，下游 `graph_turn_rows` 的 `t.get` 直接 AttributeError 炸腿。
+    未设 BOK_CP_TOKEN 时 headers 空=行为与 erc 裸跑逐字节同。轮询形状同 erc（挂断后
+    拉到条数稳定）；非列表响应当零行继续轮询，唔向上层传 dict。"""
+    last: list[dict] = []
+    stable = 0
+    deadline = time.perf_counter() + settle_s
+    while time.perf_counter() < deadline:
+        rows = httpx.get(
+            f"{erc.CONTROL_PLANE_URL}/api/calls/{call_id}/turns",
+            headers=_CP_HEADERS, timeout=10,
+        ).json()
+        if not isinstance(rows, list):
+            rows = []
+        if rows and len(rows) == len(last):
+            stable += 1
+            if stable >= 2:
+                return rows
+        else:
+            stable = 0
+        last = rows
+        await asyncio.sleep(1.5)
+    return last
+
+
 def graph_turn_rows(turns: list[dict]) -> list[dict]:
     """assistant 轮里 provider 属图执行的两类（纯函数，时间序保序）。"""
     rows: list[dict] = []
@@ -858,7 +886,7 @@ async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_
         except Exception:  # noqa: BLE001
             pass
 
-    turns = await erc.fetch_turns(call_id)
+    turns = await fetch_turns_authed(call_id)
     evidence = probe_evidence(
         log_exists=erc.LOG_PATH.exists(),
         marks=marks,
@@ -872,7 +900,12 @@ async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_
     nontrigger_events = parse_graph_events(name_to_window.get("nontrigger", []))
     play_events = parse_graph_events(name_to_window.get("play", []))
     after_events = parse_graph_events(name_to_window.get("after", []))
-    fuzzy_events = parse_graph_events(name_to_window.get("fuzzy", []))
+    # fuzzy/consume 窗叠加 judge 解析（2026-09-19 实弹：judge_scheduled 落 fuzzy 窗
+    # 但旧 parse 只用图四词正则=结构性捞不到 → judge_scheduled 恒 FAIL 假阴）。
+    fuzzy_events = (
+        parse_graph_events(name_to_window.get("fuzzy", []))
+        + parse_judge_events(name_to_window.get("fuzzy", []))
+    )
     consume_events = parse_graph_events(name_to_window.get("consume", []))
     # judge 打点全局尾扫（Phase 3.4）：judge_hit/judge_pending_fired 的落点跨窗口边界
     # （3s 让路 + 9B 往返 vs reply 播放时长，可能落 fuzzy 窗、soak 间隙=consume 窗头、
