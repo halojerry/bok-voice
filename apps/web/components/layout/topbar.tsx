@@ -66,21 +66,21 @@ export function Topbar({ onMobileOpen, status }: TopbarProps) {
         {/* —— 账号区 —— */}
         {session?.anonymous && (
           <span className="flex items-center gap-2">
-            <span className="rounded-sm border border-(--card-border) px-2 py-0.5 text-[11px] text-(--stage-muted)">
+            <span className="rounded-sm border border-(--card-border) px-2 py-0.5 text-[11px] text-muted-foreground">
               本地模式
             </span>
             {/* 匿名=auth-off 单机形态的兜底会话，但登录入口必须可达（2026-09-15
                 用户实测「看不到登录页」）——已配 BOK_JWT_SECRET 的部署点此进入账号态。 */}
             <Link
               href="/login/"
-              className="transition hover:text-(--foreground) text-xs text-(--stage-muted)"
+              className="transition text-xs text-muted-foreground hover:text-foreground"
             >
               登录
             </Link>
           </span>
         )}
         {session && !session.anonymous && (
-          <span className="flex items-center gap-2 text-xs text-(--stage-muted)">
+          <span className="flex items-center gap-2 text-xs text-muted-foreground">
             <span className="max-w-24 truncate">
               {session.display_name || session.username}
             </span>

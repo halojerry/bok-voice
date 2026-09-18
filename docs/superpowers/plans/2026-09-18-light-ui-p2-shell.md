@@ -8,7 +8,9 @@ Base: `feat/light-ui-p2-shell` @ `cc0119e`（= P1 地基头，浅色 token + sha
 把 `(app)` 组 17 页的「顶部平铺 15 链接导航（StageHeader）+ 居中 max-w-7xl 主列」换成
 brainstorm 拍板的 **布局壳 A：分组侧边栏（可折叠成图标轨）+ 细顶栏**。
 权限判定语义（`gateForPath`/`navVisible`/`RouteGuard`）原样搬家，一行不改判定。
-首页 `(stage)` 与 `/login`、`/setup` 本相不动（P3 舞台相处理）。
+`/login`、`/setup` 本相不动（P3 舞台相处理）；`(stage)` 首页经 `DashboardPage`
+内嵌 `<AppShell>`（dashboard-page.tsx:111，摸底勘误：初版计划误记首页无壳），
+随壳一并换新——正合「全浅一体」拍板。
 
 ## Global Constraints（对每个 task 生效）
 
