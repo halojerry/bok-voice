@@ -234,16 +234,76 @@ def test_default_after_text_avoids_rule_families():
     污染（本腿硬判据因此取 OR 语义，但默认文本仍须尽量干净）；命中 REFUSE/FAREWELL
     → 收线冻结；命中提问/拖延 → 语义漂移。
 
-    这里对着 `agent_runtime.flow` 的真 regex 逐族钉（只读其正则，不引入 agent.py）。
+    这里对着 `agent_runtime.flow` 的真 regex 逐族钉（只读其正则，不引入 agent.py）：
+    基础七族（`_CONFIRM`/`_QUESTION`/`_DEFER`/`_REFUSE`/`_FAREWELL`/`_DENY`/
+    `_HANGUP`）+ final-wave 补的三族（`_STRONG_AFFIRM`/`_CONFIRM_TURN`/`_REPEAT`——
+    强肯定词、断句确认轮、复述请求轮都会令 after 轮语义漂移/推进/复读）。
     """
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps" / "agent"))
     from agent_runtime import flow  # noqa: PLC0415
 
     text = pfg.AFTER_TEXT
     for name in ("_CONFIRM_RE", "_QUESTION_RE", "_DEFER_RE", "_REFUSE_RE",
-                 "_FAREWELL_RE", "_DENY_RE", "_HANGUP_RE"):
+                 "_FAREWELL_RE", "_DENY_RE", "_HANGUP_RE",
+                 "_STRONG_AFFIRM_RE", "_CONFIRM_TURN_RE", "_REPEAT_RE"):
         rx = getattr(flow, name)
         assert not rx.search(text), f"{name} 命中了 after 话术 {text!r}"
     # 也不得撞上图的两个触发意图词（退款/投诉）——撞了 after 轮会再触发一次图动作
     for word in pfg.PLAY_KEYWORDS + pfg.TRIGGER_KEYWORDS:
         assert not re.search(re.escape(word), text, re.IGNORECASE), word
+
+
+# ---------------------------------------------------------------------------
+# print_leg 轮次过滤（review R1 M5 + final-wave pin）
+# ---------------------------------------------------------------------------
+def _window_line(label: str) -> str:
+    """`print_leg` 窗口行的逐字形状（`f"  {label:>10} FLOW_GRAPH 行"`）。
+
+    必须连右侧对齐空格一起比：`"trigger"` 是 `"nontrigger"` 的子串，裸子串断言
+    在 nontrigger 渲染时会假命中。
+    """
+    return f"  {label:>10} FLOW_GRAPH 行"
+
+
+def _print_res(verdict: dict, rounds: list[str]) -> dict:
+    """`print_leg` 的最小 res 形状（只喂它真读的键；计数位全给零避免触预算分支）。"""
+    return {
+        "leg": "then-jump",
+        "call_id": "call-print-leg",
+        "template_id": "tpl-print-leg",
+        "measures": [],
+        "verdict": verdict,
+        "rounds": rounds,
+        "trigger_understood": True,
+        "evidence": {"ok": True, "log_exists": True, "rounds_complete": True,
+                     "grew_each_round": True, "marks": 3, "expected_rounds": 2},
+        "summary": {"first_audio": {"n": 0}, "perceived": {"n": 0}},
+    }
+
+
+def test_print_leg_renders_only_ran_rounds(capsys):
+    """`print_leg` 只渲染**本腿真跑过的轮次**（M5）：`evaluate_leg` 恒建
+    trigger/nontrigger/play 三键，then-jump 档没跑 trigger/nontrigger——不过滤就会
+    打出「trigger FLOW_GRAPH 行：（零）」这种对不存在的轮做的空断言。"""
+    tj = pfg.evaluate_leg(expect_off=False, target_step=4, then_jump=4, trigger_events=[],
+                          nontrigger_events=[], play_events=[], after_events=[], turns=[],
+                          evidence=_EV_OK)
+    pfg.print_leg(_print_res(tj, ["play", "after"]), {"first_ms": 2500})
+    out = capsys.readouterr().out
+    assert _window_line("play") in out and _window_line("after") in out
+    assert _window_line("trigger") not in out
+    assert _window_line("nontrigger") not in out
+    # 空轮次表 = 不按轮次过滤（旧调用方/嵌入方直调 print_leg 的兼容路径）→ 键在就渲染
+    pfg.print_leg(_print_res(tj, []), {"first_ms": 2500})
+    out_no_rounds = capsys.readouterr().out
+    for label in ("trigger", "nontrigger", "play", "after"):
+        assert _window_line(label) in out_no_rounds, label
+    # 默认档（无 then_jump）三轮全在表、无 after 键 → 三行照旧（零变化）
+    plain = pfg.evaluate_leg(expect_off=False, target_step=4, trigger_events=[_JUMP],
+                             nontrigger_events=[], play_events=[],
+                             turns=_turns("graph-jump", 4), evidence=_EV_OK)
+    pfg.print_leg(_print_res(plain, ["trigger", "nontrigger", "play"]), {"first_ms": 2500})
+    out_plain = capsys.readouterr().out
+    for label in ("trigger", "nontrigger", "play"):
+        assert _window_line(label) in out_plain, label
+    assert _window_line("after") not in out_plain

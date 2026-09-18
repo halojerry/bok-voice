@@ -30,6 +30,7 @@
 6. **无 Supabase/DB 改动**：`then_jump` 不落列（spec §3 否决项），spec §6.4「Supabase 列直连 apply」本增量不适用（与 3.2 同款）。
 7. **T4 离线面实施注记（2026-09-18，真栈两腿未跑=控制器合并后执行）**：① then-jump 档轮次表**不含** `trigger`/`nontrigger` → `plan_rounds` 在该档忽略 `play_round`（「播」轮就是触发轮；`--no-play-round` 与之组合会零触发语空跑，已单测钉死）；② `evaluate_leg` 的 `all_events` **纳入 `after_events`**，故 kill 腿 absence 扫描覆盖跳后窗口（after 轮冒 `FLOW_GRAPH` 行同属越闸，已有专测）；③ 腿跳过判定放在 `run_leg` 建探针模板**之前**（无 QA 条目时连模板都不建），报告落 `{"skipped": "no_qa_or_audio"}` 且退出码 1；④ 离线测试落在独立文件 `tests/test_flow_graph_probe_then_jump.py`（协调口径，brief Step 1 原写「追加到 `tests/test_flow_graph_probe.py`」），另加一例对着 `agent_runtime.flow` 真 regex 逐族钉 `AFTER_TEXT` 的洁净性（默认话术不含确认/收线/异议/提问/挂断七族词与图触发词）；⑤ `print_leg` 窗口行按事件键存在性渲染（默认档仍 trigger/nontrigger/play 三行不变），归因关键词 then-jump 档切 `PLAY_KEYWORDS`。
 8. **勘误 #8（2026-09-18 T4 fix-wave，review R1 Important）：「无 QA 条目/未物化 → 显式跳过」与实现不符，已真值化**——跳过只在**无 QA 条目**时发生（`plan_rounds` 的 `has_qa = bool(qa_id)`；无条目则触发语必然 `play_miss`，腿结构性空跑）；**条目在场但音频未物化时腿照跑**，运行时落 `FLOW_GRAPH play_miss`，`play_logged` 硬 FAIL、退出码 1（先 `tts-pregen --qa` 再来）。已同步修正三处文档表述：探针模块 docstring、`run_leg` 跳过打印 + `main` 跳过分支注释、`AGENTS.md`「话术图」条；报告键 `no_qa_or_audio` 保留为历史 token（语义收窄为「无条目」，不新增含义；新增键会破报告 schema 稳定性）。同波并入 review minors：M2（after 窗口 absence 面同受 `evidence_ok` 闸的补测）、M3（`post_jump_step_seen` 无假正例不变量入 docstring）、M4（`next_turn_step=False` 归因注释）、M5（`print_leg` 只渲染本腿真跑过的轮次）、M7（「四族词」→「七族词」，实为 `_CONFIRM`/`_QUESTION`/`_DEFER`/`_REFUSE`/`_FAREWELL`/`_DENY`/`_HANGUP` 七族）。
+9. **勘误 #9（2026-09-18 final-review wave，T2-R1 裁定入档）：then_jump 位移分支不渲染当前步（跳时渲染=死+有害，R1 已删）**——原实现在 `apply_then_jump` 返 True 时调 `context_state.set_flow_current(flow_ctrl.current_step_text())`，R1 判定该调用两重错：①**死**——本分支紧接着 `raise StopResponse()`，本轮结构性无 `chat` 调用，`render_context_tail()` 永不跑，`set_flow_current` 只把一段无人消费的尾部写进 `ContextState`；②**有害**——它把 `_last_render_step`/`_just_advanced` 烧在**未被请求消费**的目标步上，于是**下一轮**流程块重渲染判定「已渲染过」→ 退成分支模式，目标步底稿（正稿）与【跳转进入】标记结构性失落。离线段实测（同调用序列，T2 报告 §4/§7.2）：带渲染行时下一轮尾部 225 字且底稿 False/【跳转进入】False；删除后 327 字两者皆 True。**修复=删除该行**，跳转承重件收敛为 `jump_to` 置的私有位移状态（`current`/`_entered_by_jump`）+ `_invalidate_stale_preemptive` spec marker（marker 随本轮 `turn_ctx` 副本蒸发，照调但**勿当抢跑失效保证读**）+ `FLOW_GRAPH jump … via=then_jump`/`jump_noop` 日志；渲染唯一落点=下一轮流程块首渲染。源级钉住同步**反转**：`tests/test_flow_graph_then_jump.py::test_agent_play_branch_wires_then_jump_before_stop_response` 由 `assert "context_state.set_flow_current(" in seg` 改为 `assert "current_step_text()" not in seg`（docstring 写明「位移同轮、渲染推迟」）。**Task 2 Step 3 的历史代码块保留原样**（历史不复写），仅在其顶加「勘误 #9」行标注；本文件 Task 4 Step 1 注释与 Step 4 实施项 4 两处「无 QA 条目或未物化 → 跳过」的陈旧表述已按勘误 #8 真值化改写。
 
 ---
 
@@ -276,6 +277,8 @@ flow.py（`jump_to` 之后）：
 
 agent.py 播放分支（把 3779-3802 的后半段替换为）：
 
+> **勘误 #9**：本块渲染行 `context_state.set_flow_current(flow_ctrl.current_step_text())` 已在 R1 删除（跳时渲染=死+有害，见勘误 #9）；下块保留为历史原文，勿照抄。
+
 ```python
                     if (
                         _ge is not None
@@ -461,7 +464,8 @@ def test_plan_rounds_then_jump_leg_and_default_zero_change():
               after_text="我知道了，你说")
     assert pfg.plan_rounds(then_jump=4, has_qa=True, play_round=True, **kw) == [
         ("play", "我要退款"), ("after", "我知道了，你说")]
-    # 无 QA 条目（或未物化）→ 空表：腿跳过必须显式，不许以「没跑出东西」空过成 PASS
+    # 无 QA 条目 → 空表：腿跳过必须显式，不许以「没跑出东西」空过成 PASS
+    # （勘误 #8 真值化：音频未物化不在此列——条目在场则腿照跑，play_miss 由 play_logged 硬 FAIL，先 tts-pregen --qa）
     assert pfg.plan_rounds(then_jump=4, has_qa=False, play_round=True, **kw) == []
     # 默认档（无 then_jump）逐字节同旧
     assert pfg.plan_rounds(then_jump=None, has_qa=True, play_round=True, **kw) == [
@@ -536,7 +540,7 @@ def test_build_graph_json_then_jump_binding():
   1. `build_graph_json(..., then_jump=None)`：`bindings.append({... "qa_id": qa_id, **({"then_jump": int(then_jump)} if then_jump else {}), ...})`。
   2. `plan_rounds` + `post_jump_step_seen` 两个纯函数（放纯函数区，`--selftest` 可直测）。
   3. `evaluate_leg` 新形参 + `elif then_jump is not None:` 分支（`all_events` 纳入 `after_events`）。
-  4. `_run_leg_with_stack`：轮次表改走 `plan_rounds(...)`；`name_to_window` 按轮次名通用化（新增 `after` 窗口）；`after_events` 传入 `evaluate_leg`；**`then_jump` 腿且 `plan_rounds` 为空时**打印 `[flow-graph] then-jump 腿跳过：无 QA 条目或音频未物化（先 python tools/bok.py tts-pregen --qa）`，报告落 `{"skipped": "no_qa_or_audio"}` 并**退出码 1**（未评估 ≠ PASS）。
+  4. `_run_leg_with_stack`：轮次表改走 `plan_rounds(...)`；`name_to_window` 按轮次名通用化（新增 `after` 窗口）；`after_events` 传入 `evaluate_leg`；**`then_jump` 腿且 `plan_rounds` 为空时**（勘误 #8 真值化：只在**无 QA 条目**时；条目在场但音频未物化走腿本体、`play_miss` 硬 FAIL）打印 `[flow-graph] then-jump 腿跳过：无 QA 条目（先建 QA 条目，再 python tools/bok.py tts-pregen --qa 物化音频）`，报告落 `{"skipped": "no_qa_or_audio"}` 并**退出码 1**（未评估 ≠ PASS）。
   5. `main`：`--then-jump`（store_true，`then_jump=TARGET_STEP`）、`--after-text`（默认 `"我知道了，你说"`——刻意避开七族词：`_CONFIRM_RE` 单字（好/是/对/嗯/系/係，命中即规则推进 4→5）、`_QUESTION_RE`、`_DEFER_RE`、`_REFUSE_RE`/`_FAREWELL_RE`/`_DENY_RE`/`_HANGUP_RE`，以及图触发词（退款/投诉 类）——见勘误预检 2；after 轮只为信息位，硬判据可回落同轮日志）；`selftest` 补 3 例（then-jump 正例 / play_miss 反例 / 无跳反例）。
 - [ ] **Step 4: 纯函数绿 + selftest** — `pytest tests/test_flow_graph_probe.py tests/test_flow_graph_core.py tests/test_flow_graph_then_jump.py -v`；`python scripts/probe_flow_graph.py --selftest`（exit 0）
 - [ ] **Step 5: 实弹两腿**（真栈）：

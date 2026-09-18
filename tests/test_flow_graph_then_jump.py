@@ -69,9 +69,14 @@ def test_validate_then_jump_accepted_on_play_qa():
 
 
 def test_validate_then_jump_range_and_type():
+    """消息前缀钉住（final-wave pin）：存在性断言会放过「报了个别的错但恰好含
+    then_jump 字样」的漂移，故钉到 `bindings[<idx>].then_jump must be int in [1,999]`
+    这段稳定前缀（`: {action!r}` 那类尾部修饰只在 `jump_step` 分支的合法性消息上，
+    不在本条上——刻意不钉尾部，防将来加修饰破测试）。"""
+    stable = f"then_jump must be int in [1,{STEP_MAX}]"
     for bad in (0, -3, STEP_MAX + 1, "4", True, False, None, 4.5, [4]):
         errs = validate_flow_graph(_doc(then_jump=bad))
-        assert any("then_jump" in e for e in errs), bad
+        assert any(e.startswith("bindings[") and stable in e for e in errs), (bad, errs)
 
 
 def test_validate_then_jump_rejected_on_jump_step():
