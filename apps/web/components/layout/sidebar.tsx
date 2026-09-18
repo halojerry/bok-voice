@@ -7,9 +7,10 @@
  *   localStorage `bok_sidebar_collapsed`（"1"=折叠）；初渲染恒按展开渲染、
  *   mount 后再读存储——static export 的服务端 HTML 与客户端首帧保持一致，
  *   防水合 mismatch。
- * - 移动（<md）：受控 off-canvas 抽屉 + 半透明遮罩（点击关闭），translate-x
- *   过渡；抽屉开关状态由壳持有（props 受控），路由变化自动收起。抽屉内容与
- *   桌面共用同一 SidebarContent 渲染函数。
+ * - 移动（<md）：受控 off-canvas 抽屉 + 半透明遮罩（点击/Esc 关闭），translate-x
+ *   过渡；抽屉开关状态由壳持有（props 受控），路由变化自动收起，打开期间锁
+ *   body 滚动。抽屉恒展开（折叠偏好只作用于桌面恒驻栏），内容与桌面共用
+ *   SidebarContent 渲染函数。
  * - 分组/权限判定全走 lib/navigation 单一事实源：组内条目经 navVisible 过滤
  *   后为空则整组（含 eyebrow 组头）不渲染；第一组无上边框，组间 border-t。
  * - 激活态（matchesPath）= 品牌青 --live 族（bg-(--live-soft) /
@@ -90,15 +91,18 @@ function SidebarNavLink({
   );
 }
 
-/** 抽屉与桌面共用的侧栏内容：分组导航 + 底部折叠开关。 */
+/** 抽屉与桌面共用的侧栏内容：分组导航 + 底部折叠开关（抽屉不显示开关）。 */
 function SidebarContent({
   collapsed,
   onToggleCollapsed,
   pathname,
+  showToggle = true,
 }: {
   collapsed: boolean;
   onToggleCollapsed: () => void;
   pathname: string;
+  /** 移动端抽屉恒展开、关闭即走，不提供折叠开关。 */
+  showToggle?: boolean;
 }) {
   const session = useSession();
 
@@ -135,7 +139,7 @@ function SidebarContent({
         ))}
       </nav>
 
-      <div className="mt-auto shrink-0 p-2">
+      <div className={cn("mt-auto shrink-0 p-2", !showToggle && "hidden")}>
         <button
           type="button"
           onClick={onToggleCollapsed}
@@ -171,13 +175,34 @@ export function Sidebar({ mobileOpen, onMobileClose }: SidebarProps) {
     }
   }, []);
 
-  // 路由变化自动收起移动端抽屉。经 ref 取最新回调，父组件传内联箭头时
-  // effect 也不会逐渲染重放。
+  // 路由变化自动收起移动端抽屉。回调经 effect 写入 ref（不在渲染期改 ref，
+  // 并发渲染下丢弃的渲染不带副作用）；记录上一个 pathname，mount 首帧不触发。
   const closeRef = useRef(onMobileClose);
-  closeRef.current = onMobileClose;
   useEffect(() => {
-    closeRef.current();
+    closeRef.current = onMobileClose;
+  }, [onMobileClose]);
+  const pathnameRef = useRef(pathname);
+  useEffect(() => {
+    if (pathnameRef.current !== pathname) {
+      pathnameRef.current = pathname;
+      closeRef.current();
+    }
   }, [pathname]);
+
+  // 抽屉打开时：Esc 关闭 + 锁 body 滚动（遮罩外的背景页不跟滚）。
+  useEffect(() => {
+    if (!mobileOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeRef.current();
+    };
+    document.addEventListener("keydown", onKey);
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.body.style.overflow = prevOverflow;
+    };
+  }, [mobileOpen]);
 
   const toggleCollapsed = () => {
     setCollapsed((prev) => {
@@ -209,7 +234,8 @@ export function Sidebar({ mobileOpen, onMobileClose }: SidebarProps) {
         />
       </aside>
 
-      {/* 移动端抽屉（<md）：off-canvas + 半透明遮罩，translate-x 过渡。 */}
+      {/* 移动端抽屉（<md）：off-canvas + 半透明遮罩，translate-x 过渡。
+          抽屉恒展开（折叠只属桌面恒驻栏），关闭走遮罩/Esc/路由变化。 */}
       <div className="md:hidden">
         {mobileOpen && (
           <button
@@ -222,15 +248,15 @@ export function Sidebar({ mobileOpen, onMobileClose }: SidebarProps) {
         <aside
           inert={!mobileOpen}
           className={cn(
-            "fixed inset-y-0 left-0 z-50 flex flex-col border-r border-border bg-background transition-transform duration-200",
-            widthClass,
+            "fixed inset-y-0 left-0 z-50 flex w-60 flex-col border-r border-border bg-background transition-transform duration-200",
             mobileOpen ? "translate-x-0" : "-translate-x-full",
           )}
         >
           <SidebarContent
-            collapsed={collapsed}
+            collapsed={false}
             onToggleCollapsed={toggleCollapsed}
             pathname={pathname}
+            showToggle={false}
           />
         </aside>
       </div>
