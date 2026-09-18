@@ -12,8 +12,8 @@
 
 - **零变化铁律**：无 `then_jump` 的图（存量全部）解析结果、校验结论、播放行为逐字节同——`parse_flow_graph` 产物多一个 `None` 默认字段、`validate_flow_graph` 不新增错误、agent 播放分支多一个 `if` 且条件恒假。单测钉死。
 - **双轨分工**：`validate_flow_graph`（严格，CP 保存路径）三态：play_qa 带 `then_jump` 非 int（含 bool/字符串/None）→ 错；int 越界 [1,999] → 错；`jump_step` 绑带该键 → 错。`parse_flow_graph`（宽容，运行时）**只丢字段不清退绑定**、绝不抛。
-- **无新 kill-switch、无新 env**：整闸就是既有的 `os.environ.get("BOK_FLOW_GRAPH", "1") == "1"`（agent.py:3700-3705 图块闸），`then_jump` 与图同生共死。`bok.py` 的 `BOK_FLOW_GRAPH` 白名单透传（tools/bok.py:1065-1067）已就位，零新增。
-- **记账纪律**：play 成功才烧 `graph_fired`（既有行为，agent.py:3754 不动）；`then_jump` **不另立账本条目**——它是同一绑定的动作后缀；跳转**实际位移才**打 `jump` 日志 / 置 `set_flow_current`，无位移（同位 / closing 冻结 / 钳到同位）走既有 `FLOW_GRAPH jump_noop` 词表且不消耗任何额外额度。
+- **无新 kill-switch、无新 env**：整闸就是既有的 `os.environ.get("BOK_FLOW_GRAPH", "1") == "1"`（agent.py:3736-3741 图块闸），`then_jump` 与图同生共死。`bok.py` 的 `BOK_FLOW_GRAPH` 白名单透传（tools/bok.py:1065-1067 已泛化为 `_apply_bok_passthrough_env`）已就位，零新增。
+- **记账纪律**：play 成功才烧 `graph_fired`（既有行为，agent.py:3791 不动）；`then_jump` **不另立账本条目**——它是同一绑定的动作后缀；跳转**实际位移才**打 `jump` 日志 / 置 `set_flow_current`，无位移（同位 / closing 冻结 / 钳到同位）走既有 `FLOW_GRAPH jump_noop` 词表且不消耗任何额外额度。
 - 术语门禁：唯一合法拼写 `cantonese`；`tests/test_cantonese_terminology.py` 扫全仓。
 - Conventional commits scope **`qa-chain`**；一逻辑变更一提交。
 - 每任务收尾：该任务测试绿 + `python -m compileall -q apps packages`（web 任务 `npx tsc --noEmit`）。
@@ -22,8 +22,8 @@
 
 ## 勘误预检（读码实证，2026-09-18 —— 与 spec 逐条核对，先记不偷改）
 
-1. **播放分支的 `_invalidate_stale_preemptive()` 在请求流上打不到任何东西（非冲突，但语义要写清）**：钩子拿到的是 `temp_mutable_chat_ctx`（每轮副本，livekit-agents `agent_activity.py:2599-2613`），`except StopResponse: return` —— 副本连同标记一起丢弃。跳步分支（jump_step）因**本轮继续走 LLM**才有失效效果；播放分支在 trio 之后立即 `raise StopResponse()`（agent.py:3760），标记进不了任何请求也会随副本蒸发。**结论：trio 照 spec 调（零成本、将来分支不再 raise 时正确），但承重件是 `jump_to` + `set_flow_current()`（后者才是下一轮 KV 前缀与【跳转进入】尾部的来源）；不要把本路径的 marker 当「抢跑已失效」的保证读。**
-2. **spec §3 的探针判据「play 轮后下一轮 `template_step == then_jump`」需要一条额外轮次**：播放轮本体行在跳**之前**落库（`_qa_canned_say` 内 `cp.add_turn(..., template_step=flow_ctrl.current + 1)`，agent.py:3676-3682），所以跳后步号只能在**下一轮**的 turns 行上看到。故 then-jump 腿 = 两轮（`play` + `after`），且 after 轮话术必须停在 UNCLEAR——`_CONFIRM_RE`（flow.py:310-314）含单字 `好/是/对/嗯/系/係`，after 轮一旦被判 CONFIRM 规则推进会把步号变成 5。**因此硬判据取 spec 指令里的「或」：同轮 `jump … via=then_jump` 日志** · **或** after 轮步号命中（前者确定性、后者受 ASR 影响），两个分量各自进报告信息位。
+1. **播放分支的 `_invalidate_stale_preemptive()` 在请求流上打不到任何东西（非冲突，但语义要写清）**：钩子拿到的是 `temp_mutable_chat_ctx`（每轮副本，livekit-agents `agent_activity.py:2599-2613`），`except StopResponse: return` —— 副本连同标记一起丢弃。跳步分支（jump_step）因**本轮继续走 LLM**才有失效效果；播放分支在 trio 之后立即 `raise StopResponse()`（agent.py:3797），标记进不了任何请求也会随副本蒸发。**结论：trio 照 spec 调（零成本、将来分支不再 raise 时正确），但承重件是 `jump_to` + `set_flow_current()`（后者才是下一轮 KV 前缀与【跳转进入】尾部的来源）；不要把本路径的 marker 当「抢跑已失效」的保证读。**
+2. **spec §3 的探针判据「play 轮后下一轮 `template_step == then_jump`」需要一条额外轮次**：播放轮本体行在跳**之前**落库（`_qa_canned_say` 内 `cp.add_turn(..., template_step=flow_ctrl.current + 1)`，agent.py:3724），所以跳后步号只能在**下一轮**的 turns 行上看到。故 then-jump 腿 = 两轮（`play` + `after`），且 after 轮话术必须停在 UNCLEAR——`_CONFIRM_RE`（flow.py:310-314）含单字 `好/是/对/嗯/系/係`，after 轮一旦被判 CONFIRM 规则推进会把步号变成 5。**因此硬判据取 spec 指令里的「或」：同轮 `jump … via=then_jump` 日志** · **或** after 轮步号命中（前者确定性、后者受 ASR 影响），两个分量各自进报告信息位。
 3. **`step` 钳制 vs `then_jump` 丢弃的不对称是刻意的**：`step` 是 `jump_step` 的必填字段（解析期 `max(1, min(..., STEP_MAX))` 钳制，flow_graph.py:137），`then_jump` 是可选链（坏值丢弃 = 退回 Phase 2 行为，最保守，且绝不把运营写的越界目标静默改成别的步）。若评审要求改为钳制，只动 `_then_jump_of()` 一处，其余契约（validate 严格、probe 判据、web 钳制）全不动。
 4. **web 编辑器保存是「逐字段重建」而非整体透传**（page.tsx:1347-1366，`common` 只含 id/intent/priority/once/enabled）——**任何不进 `BindingDraft` 的字段编辑一次就蒸发**。故 T3 的 `then_jump` 必须进草稿类型，否则「打开既有追问链→改个名字保存」等于静默删链。
 5. **`evaluate_leg` 现有图开启腿判据含 `nontrigger_silent`**（probe_flow_graph.py:307），then-jump 腿没有非触发轮 → 必须走独立 `elif` 判据分支，否则结构性 FAIL。
@@ -174,8 +174,8 @@ def _then_jump_of(raw: dict, action: str) -> int | None:
 ### Task 2: 运行时 — 播放成功后同步跳（位移三件套 + 记账纪律）
 
 **Files:**
-- Modify: `apps/agent/agent_runtime/flow.py`（`FlowController` 加 `apply_then_jump()`，紧邻 `jump_to` 948-960 之后）
-- Modify: `apps/agent/agent_runtime/agent.py`（graph 播放分支 3742-3765：`graph_fired.add` + `FLOW_GRAPH play` 打印之后、`raise StopResponse()` 之前插跳转块）
+- Modify: `apps/agent/agent_runtime/flow.py`（`FlowController` 加 `apply_then_jump()`，紧邻 `jump_to`（flow.py:952-964）之后）
+- Modify: `apps/agent/agent_runtime/agent.py`（graph 播放分支 3779-3802：`graph_fired.add` + `FLOW_GRAPH play` 打印之后、`raise StopResponse()` 之前插跳转块）
 - Test: `tests/test_flow_graph_then_jump.py`（追加；含源级接线钉住，姿势同 `tests/test_flow_graph_runtime.py:86-99`）
 
 **Interfaces（T4/审查依赖，逐字）:**
@@ -272,7 +272,7 @@ flow.py（`jump_to` 之后）：
         return self.current != before
 ```
 
-agent.py 播放分支（把 3742-3765 的后半段替换为）：
+agent.py 播放分支（把 3779-3802 的后半段替换为）：
 
 ```python
                     if (
