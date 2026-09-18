@@ -3794,6 +3794,31 @@ async def entrypoint(ctx):
                             f"qa={_gbinding.qa_id}",
                             flush=True,
                         )
+                        # ---- 追问链（Phase 3.3，spec §3）：罐头播完当场同步跳，下一轮
+                        # 按新步走。复用 Phase 2 位移三件套与记账纪律：实际位移才置
+                        # 上下文/打 jump 日志；同位/closing/钳到同位 → jump_noop 且零额外
+                        # 消耗（then_jump 是同一绑定的动作后缀，不另立 once 账本条目）。
+                        # 注：本分支以 StopResponse 收尾，_invalidate_stale_preemptive 的
+                        # 标记随本轮 turn_ctx 副本蒸发（承重件是 set_flow_current——下一轮
+                        # KV 前缀与【跳转进入】尾部的来源）；照 spec 调用，零成本。
+                        if _gbinding.then_jump:
+                            _tj_target = int(_gbinding.then_jump) - 1
+                            if flow_ctrl.apply_then_jump(_gbinding.then_jump):
+                                _invalidate_stale_preemptive(
+                                    f"流程跳转 → 第 {flow_ctrl.current + 1} 步"
+                                )
+                                context_state.set_flow_current(flow_ctrl.current_step_text())
+                                print(
+                                    f"FLOW_GRAPH jump binding={_gbinding.id} "
+                                    f"step={flow_ctrl.current + 1} via=then_jump",
+                                    flush=True,
+                                )
+                            else:
+                                print(
+                                    f"FLOW_GRAPH jump_noop binding={_gbinding.id} "
+                                    f"step={_tj_target + 1} via=then_jump",
+                                    flush=True,
+                                )
                         raise StopResponse()  # 压掉本轮 LLM(WA 累积同款)
                     print(
                         f"FLOW_GRAPH play_miss binding={_gbinding.id} "

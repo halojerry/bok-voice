@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
+from agent_runtime.flow import FlowController
 from bok_voice_core.flow_graph import STEP_MAX, parse_flow_graph, validate_flow_graph
 
 _INTENT = {"id": "int_2b3c4d5e", "label": "退款", "keywords": ["退款"], "steps": [], "enabled": True}
@@ -77,3 +79,65 @@ def test_validate_then_jump_rejected_on_jump_step():
     assert any("then_jump" in e and "jump_step" in e for e in errs), errs
     # 连带对照：step 合法只报 then_jump 一条，不叠无关错
     assert len([e for e in errs if "then_jump" in e]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 2（运行时）：play_qa 罐头播完当场同步跳（位移三件套 + 记账纪律）
+# ---------------------------------------------------------------------------
+
+_TEMPLATE = {
+    "steps_json": json.dumps(
+        [{"goal": f"第{i}步", "ref": f"第{i}步说法"} for i in range(1, 7)], ensure_ascii=False
+    ),
+    "graph_json": json.dumps(
+        {
+            "version": 1,
+            "intents": [{"id": "int_2b3c4d5e", "label": "退款", "keywords": ["退款"],
+                         "steps": [], "enabled": True}],
+            "bindings": [{"id": "bnd_c1d2e3f4", "intent": "int_2b3c4d5e", "action": "play_qa",
+                          "qa_id": "qa-1", "then_jump": 4, "priority": 10, "once": False,
+                          "enabled": True}],
+        },
+        ensure_ascii=False,
+    ),
+}
+
+
+def test_apply_then_jump_moves_and_marks_entry():
+    fc = FlowController.from_template(_TEMPLATE, None)
+    assert fc.graph.bindings[0].then_jump == 4     # 解析面先过（T1 契约）
+    assert fc.apply_then_jump(4) is True           # 实际位移
+    assert fc.current == 3                         # 1-based 4 → 0-based 3
+    assert fc._entered_by_jump is True             # 走 jump_to → 尾部【跳转进入】(I3)
+    assert "跳转进入" in fc.current_step_text()
+
+
+def test_apply_then_jump_noop_family_zero_side_effect():
+    fc = FlowController.from_template(_TEMPLATE, None)
+    assert fc.apply_then_jump(None) is False and fc.current == 0 and fc._entered_by_jump is False
+    assert fc.apply_then_jump(1) is False and fc.current == 0   # 同位 no-op
+    assert fc._entered_by_jump is False and fc._just_advanced is False
+    fc.enter_closing()
+    assert fc.apply_then_jump(4) is False and fc.current == 0   # closing 冻结
+    empty = FlowController.from_template({"steps_json": "[]"}, None)
+    assert empty.apply_then_jump(4) is False                    # 无步骤话术
+
+
+def test_apply_then_jump_clamps_to_done():
+    fc = FlowController.from_template(_TEMPLATE, None)
+    assert fc.apply_then_jump(99) is True   # 越界钳到 len(steps)（jump_to 内既有钳制）
+    assert fc.current == 6 and fc.done
+
+
+def test_agent_play_branch_wires_then_jump_before_stop_response():
+    """源级钉住（播放分支在 entrypoint 闭包内，离线起不了真栈；姿势同 I1 装配面测试）：
+    play 成功 → 位移三件套必须在 **本轮收尾 raise** 之前（同一轮内同步跳）。"""
+    src = (Path(__file__).resolve().parents[1] / "apps" / "agent" / "agent_runtime" / "agent.py").read_text(encoding="utf-8")
+    start = src.index("flow_ctrl.apply_then_jump(")
+    stop = src.index("raise StopResponse()", start)   # 播放分支收尾 raise（注释无关锚）
+    seg = src[start:stop]
+    assert "_gbinding.then_jump" in src
+    assert "_invalidate_stale_preemptive(" in seg
+    assert "context_state.set_flow_current(" in seg
+    assert "via=then_jump" in src
+    assert "FLOW_GRAPH jump_noop" in seg   # 无位移档不吞日志
