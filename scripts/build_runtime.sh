@@ -123,6 +123,9 @@ else
   NODE_ARCH="$ARCH"
   NODE_URL="https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-darwin-${NODE_ARCH}.tar.gz"
   if [ "$OS" = "linux" ]; then
+    # nodejs.org 官方命名：x86_64 档叫 linux-x64（不是 linux-x86_64，CI 首跑 404 实证）。
+    NODE_ARCH="$ARCH"
+    [ "$ARCH" = "x86_64" ] && NODE_ARCH="x64"
     NODE_URL="https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.gz"
   fi
   curl -fsSL "$NODE_URL" -o "$RUNTIME/node.tar.gz"
