@@ -2,7 +2,8 @@
 
 真栈两腿（`--then-jump` / `--then-jump --expect-off`）由控制器合并后实跑，这里只钉：
 
-- `plan_rounds`：then-jump 档 =「播」+「跳后」两轮（无 QA 条目/未物化 → 空表=腿跳过）；
+- `plan_rounds`：then-jump 档 =「播」+「跳后」两轮（**无 QA 条目** → 空表=腿跳过；
+  条目在场而音频未物化**不**跳过——腿照跑、`play_miss` 由 `play_logged` 硬 FAIL）；
   默认档轮次表逐字节同旧。
 - `post_jump_step_seen`：跳后步号只看**非** `graph-play` 的转写行（播放轮本体行在跳前
   落库，步号是跳前步，天然不能充当跳后证据；哪怕步号撞上也恒不计入）。
@@ -57,7 +58,8 @@ def test_plan_rounds_then_jump_leg_and_default_zero_change():
               after_text="我知道了，你说")
     assert pfg.plan_rounds(then_jump=4, has_qa=True, play_round=True, **kw) == [
         ("play", "我要退款"), ("after", "我知道了，你说")]
-    # 无 QA 条目（或未物化）→ 空表：腿跳过必须显式，不许以「没跑出东西」空过成 PASS
+    # 无 QA 条目 → 空表：腿跳过必须显式，不许以「没跑出东西」空过成 PASS
+    # （音频未物化不在此列：条目在场则腿照跑，play_miss 由 play_logged 硬 FAIL）
     assert pfg.plan_rounds(then_jump=4, has_qa=False, play_round=True, **kw) == []
     # 默认档（无 then_jump）逐字节同旧
     assert pfg.plan_rounds(then_jump=None, has_qa=True, play_round=True, **kw) == [
@@ -173,6 +175,42 @@ def test_evaluate_leg_then_jump_kill_leg_and_default_shape():
     assert set(tj["events"]) == {"trigger", "nontrigger", "play", "after"}
 
 
+def test_evaluate_leg_then_jump_kill_leg_after_absence_is_evidence_gated():
+    """review R1 / M2：kill 腿的 after 窗口 absence 面同样受观测前提闸（`evidence_ok`）。
+
+    after 窗口冒 `via=then_jump` 图痕迹 + 日志缺失 → 两条 kill 判据都不得 PASS：
+    没有真观测时「零痕迹」不成立，而「有痕迹」也不该被当成结论（同一把闸，两个方向
+    一致 fail-closed）。这条钉住 after 窗口新 surface 与旧窗口同闸，防将来把
+    after_events 单独接出闸外。
+    """
+    v = pfg.evaluate_leg(
+        expect_off=True, target_step=4, then_jump=4,
+        trigger_events=[], nontrigger_events=[], play_events=[],
+        after_events=[{"kind": "jump", "binding": "bnd_c1d2e3f4", "step": "4",
+                       "via": "then_jump"}],
+        turns=[], evidence=_ev(log=False))
+    assert v["checks"]["killswitch_no_logs"] is False
+    assert v["checks"]["killswitch_no_graph_turns"] is False
+    assert v["pass"] is False
+    # 同一输入换诚实观测（after 窗口有痕迹 + 真有图轮行）→ 两判据各自独立 FAIL，
+    # 证明上面两条 False 里至少一条不是被 evidence 闸顺手带下来的
+    v2 = pfg.evaluate_leg(
+        expect_off=True, target_step=4, then_jump=4,
+        trigger_events=[], nontrigger_events=[], play_events=[],
+        after_events=[{"kind": "jump", "binding": "bnd_c1d2e3f4", "step": "4",
+                       "via": "then_jump"}],
+        turns=_turns("graph-play", 4), evidence=_EV_OK)
+    assert v2["checks"]["killswitch_no_logs"] is False
+    assert v2["checks"]["killswitch_no_graph_turns"] is False
+    # 观测面坏但 after 窗口干净（无痕迹）→ absence 判据仍不得空过成 PASS
+    v3 = pfg.evaluate_leg(
+        expect_off=True, target_step=4, then_jump=4,
+        trigger_events=[], nontrigger_events=[], play_events=[],
+        after_events=[], turns=[], evidence=_ev(log=False))
+    assert v3["checks"]["killswitch_no_logs"] is False
+    assert v3["checks"]["killswitch_no_graph_turns"] is False
+
+
 def test_build_graph_json_then_jump_binding():
     with_tj = json.loads(pfg.build_graph_json("qa-1", then_jump=4))
     play = next(b for b in with_tj["bindings"] if b["action"] == "play_qa")
@@ -188,7 +226,7 @@ def test_build_graph_json_then_jump_binding():
 
 
 # ---------------------------------------------------------------------------
-# 勘误预检 2：after 轮话术必须停在 UNCLEAR（避开规则推进/收线/异议四族词）
+# 勘误预检 2：after 轮话术必须停在 UNCLEAR（避开规则推进/收线/异议七族词）
 # ---------------------------------------------------------------------------
 def test_default_after_text_avoids_rule_families():
     """默认 `--after-text` 是硬判据的观测前提（勘误预检 2）：命中 `_CONFIRM_RE`
