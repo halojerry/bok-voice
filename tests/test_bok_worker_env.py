@@ -60,17 +60,21 @@ def test_apply_flow_graph_env_is_pure_dict_fill(monkeypatch):
     ——重审实锤：BOK_QA_ROTATION=0 跑测即假红）。
     """
     monkeypatch.setenv("BOK_FLOW_GRAPH", "0")
-    for key in ("BOK_QA_ROTATION", "BOK_QA_PRIORITY", "BOK_QA_FASTPATH"):
+    for key in ("BOK_QA_ROTATION", "BOK_QA_PRIORITY", "BOK_QA_FASTPATH", "BOK_FLOW_GRAPH_JUDGE"):
         monkeypatch.delenv(key, raising=False)
     env: dict[str, str] = {"KEEP": "1"}
     bok._apply_flow_graph_env(env)
     assert env == {"KEEP": "1", "BOK_FLOW_GRAPH": "0"}
 
 
-@pytest.mark.parametrize("key", ["BOK_QA_ROTATION", "BOK_QA_PRIORITY", "BOK_QA_FASTPATH"])
+@pytest.mark.parametrize(
+    "key",
+    ["BOK_QA_ROTATION", "BOK_QA_PRIORITY", "BOK_QA_FASTPATH", "BOK_FLOW_GRAPH_JUDGE"],
+)
 def test_qa_switch_env_reaches_dev_and_prod_workers(monkeypatch, key):
-    """I1（终审）:QA 三逃生门（轮换/优先级/快路）同款透传——dev `_agent_worker_env`
-    与 prod `_agent_prod_env` 任一漏列即「文档广告死开关」（3.1 PRIORITY 曾同病）。
+    """I1（终审）:QA 三逃生门（轮换/优先级/快路）+ 3.4 判据判定开关同款透传——
+    dev `_agent_worker_env` 与 prod `_agent_prod_env` 任一漏列即「文档广告死开关」
+    （3.1 PRIORITY 曾同病）。
 
     设定值 → 两表都在；未设/空串 → 两表都不注入（worker 侧按默认跑，零变化）。
     """
@@ -92,11 +96,12 @@ def test_qa_switch_env_reaches_dev_and_prod_workers(monkeypatch, key):
 
 
 def test_apply_bok_passthrough_env_forwards_all_keys(monkeypatch):
-    """helper 单点:四枚逃生门一次填;未设的键不出现。"""
+    """helper 单点:五枚逃生门一次填;未设的键不出现。"""
     monkeypatch.setenv("BOK_FLOW_GRAPH", "0")
     monkeypatch.setenv("BOK_QA_ROTATION", "0")
     monkeypatch.delenv("BOK_QA_PRIORITY", raising=False)
     monkeypatch.delenv("BOK_QA_FASTPATH", raising=False)
+    monkeypatch.delenv("BOK_FLOW_GRAPH_JUDGE", raising=False)
     env: dict[str, str] = {}
     bok._apply_bok_passthrough_env(env)
     assert env == {"BOK_FLOW_GRAPH": "0", "BOK_QA_ROTATION": "0"}

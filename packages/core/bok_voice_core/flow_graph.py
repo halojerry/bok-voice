@@ -7,6 +7,9 @@ priority 小者先)。关键词命中=**双侧归一**(剥空白与中英标点 
 ——ASR 转写常带标点(实测「我要。投诉。」),归一后多字关键词才命中(I2,2026-09-18)。
 设计契约见 spec §3/§4;消费方:control_plane.main(保存校验)、
 agent_runtime.flow(装配解析)、agent_runtime.agent(每轮命中)。
+Phase 3.4 意图引擎:意图可携可选 `judge.prompt`(判据片段)——关键词未中时由背景
+9B 批量判定补位,命中 id 经 `judge_hit` 与关键词命中同权入裁决(见
+`eligible_judge_intents`/`pick_graph_action`)。
 """
 
 from __future__ import annotations
@@ -22,6 +25,8 @@ MAX_BINDINGS = 128
 MAX_KEYWORDS = 32
 KEYWORD_MAX_CHARS = 64
 LABEL_MAX_CHARS = 64
+# Phase 3.4 意图判据(judge prompt)长度窗:运营写的「什么算命中」片段,1..400 字。
+JUDGE_PROMPT_MAX_CHARS = 400
 PRIORITY_MIN = 0
 PRIORITY_MAX = 1000
 DEFAULT_PRIORITY = 10
@@ -56,6 +61,9 @@ class FlowIntent:
     keywords: list[str] = field(default_factory=list)
     steps: list[int] = field(default_factory=list)  # 1-based;空=全程生效
     enabled: bool = True
+    # Phase 3.4 意图引擎:运营写的判据片段(JSON `judge.prompt`)。空串=无判据=纯
+    # 关键词确定性命中(Phase 2/3.3 行为,缺省零变化);非空才参与背景批量判定。
+    judge_prompt: str = ""
 
 
 @dataclass
@@ -96,6 +104,22 @@ def _as_int(value: object, default: int) -> int:
         return default
 
 
+def _judge_prompt_of(raw: dict) -> str:
+    """意图判据(Phase 3.4)宽容取:`judge` 在场且 `prompt` 是非空 str 才收,否则丢字段。
+
+    与 `_then_jump_of` 同档——可选增强字段形状坏只丢字段,绝不清退整个意图(运营
+    的意图+关键词仍然可用=Phase 2 行为)。**刻意不截断**:运营写了 401 字是 CP
+    校验(严格)该拒的事,运行时静默砍掉尾部会静默改判据语义。
+    """
+    judge = raw.get("judge")
+    if not isinstance(judge, dict):
+        return ""
+    prompt = judge.get("prompt")
+    if not isinstance(prompt, str) or not prompt:
+        return ""
+    return prompt
+
+
 def _parse_intent(raw: object) -> FlowIntent | None:
     """单项宽容:缺 id/坏 id/非 dict/字段形状坏 → None(调用方跳过)。"""
     if not isinstance(raw, dict):
@@ -119,6 +143,7 @@ def _parse_intent(raw: object) -> FlowIntent | None:
         keywords=keywords,
         steps=steps,
         enabled=_as_bool(raw.get("enabled")),
+        judge_prompt=_judge_prompt_of(raw),
     )
 
 
@@ -254,6 +279,19 @@ def validate_flow_graph(raw: str | bytes) -> list[str]:
         # enabled 与绑定边同档(bool 才收;非 bool 静默当默认值=运营勾选失效)。
         if "enabled" in item and not isinstance(item["enabled"], bool):
             errors.append(f"intents[{idx}].enabled must be bool")
+        # Phase 3.4 判据:严格形状(CP 保存期拒)——运行时有宽容 parse 兜底,但运营面
+        # 唔准静默存坏数据(判据坏=意图退纯关键词,运营以为写了判据却没生效)。
+        if "judge" in item:
+            judge = item["judge"]
+            if (
+                not isinstance(judge, dict)
+                or "prompt" not in judge
+                or not isinstance(judge["prompt"], str)
+                or not (1 <= len(judge["prompt"]) <= JUDGE_PROMPT_MAX_CHARS)
+            ):
+                errors.append(
+                    f"intents[{idx}].judge.prompt must be a 1-{JUDGE_PROMPT_MAX_CHARS} char string"
+                )
     seen_bindings: set[str] = set()
     for idx, item in enumerate(raw_bindings):
         if not isinstance(item, dict):
@@ -302,10 +340,19 @@ def pick_graph_action(
     *,
     step_1based: int,
     fired: set[str],
+    judge_hit: str | None = None,
 ) -> GraphBinding | None:
-    """确定性命中:enabled 意图 + 关键词归一化子串(双侧剥标点/空格+casefold)
+    """图引擎每轮唯一裁决点:确定性命中 + (Phase 3.4)背景判据命中。
+
+    确定性命中:enabled 意图 + 关键词归一化子串(双侧剥标点/空格+casefold)
     + 步号 scope;绑定按 (priority, id) 升序取首个,once 且已 fired 的跳过。
-    无命中返回 None。"""
+
+    `judge_hit`(Phase 3.4):背景判据判定给出的意图 id,**与关键词命中同权**入
+    `hit_ids`——只补模糊轮(关键词未中),绝不豁免任何守卫:该意图照过 enabled +
+    步 scope 检查(逐个查 `doc.intents`,id 不在图里=no-op),绑定照过 enabled/once
+    资格与 (priority,id) 排序。`user_text` 为空时整体不裁决(判据语义依附于话语)。
+    无命中返回 None。
+    """
     if not doc.intents or not user_text:
         return None
     text = normalize_graph_text(user_text)
@@ -320,6 +367,16 @@ def pick_graph_action(
             if token and token in text:
                 hit_ids.add(intent.id)
                 break
+    if judge_hit:
+        # 与关键词路**同两道守卫**(enabled/步 scope);绑定资格与排序在下游统一收口
+        # ——判据结果只是「多了一个命中意图」,唔係特权通道。
+        jintent = doc.intent_by_id(judge_hit)
+        if (
+            jintent is not None
+            and jintent.enabled
+            and (not jintent.steps or step_1based in jintent.steps)
+        ):
+            hit_ids.add(jintent.id)
     if not hit_ids:
         return None
     candidates = [
@@ -331,3 +388,32 @@ def pick_graph_action(
         return None
     candidates.sort(key=lambda b: (b.priority, b.id))
     return candidates[0]
+
+
+def eligible_judge_intents(
+    doc: FlowGraphDoc,
+    *,
+    step_1based: int,
+    fired: set[str],
+) -> list[FlowIntent]:
+    """背景判据判定的候选意图(纯函数,Phase 3.4):**单点资格预筛**。
+
+    四条全过才算候选:①`enabled`;②`judge_prompt` 非空(运营写了判据);③步 scope
+    (空=全程);④至少一条可触发绑定(enabled + intent 对得上 + once 未 fired)。
+    空列表=冇嘢可判=调用方零调度——**无 judge 数据故恒空**=全默认档行为逐字节
+    唔变的结构性保证(判定任务零创建、9B 专线零调用)。
+    """
+    if not doc.intents:
+        return []
+    out: list[FlowIntent] = []
+    for intent in doc.intents:
+        if not intent.enabled or not intent.judge_prompt:
+            continue
+        if intent.steps and step_1based not in intent.steps:
+            continue
+        if any(
+            b.enabled and b.intent == intent.id and not (b.once and b.id in fired)
+            for b in doc.bindings
+        ):
+            out.append(intent)
+    return out

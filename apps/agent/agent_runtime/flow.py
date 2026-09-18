@@ -1295,3 +1295,56 @@ def parse_judge_output(text: str) -> str:
     if "objection" in t:
         return OBJECTION
     return UNCLEAR
+
+
+# ---- 意图判据判定器(Phase 3.4 意图引擎,spec §4)----
+# 关键词未中嘅模糊轮:一次批量调用评估「本通全部有判据且在 scope」嘅意图,多选一
+# 输出(一个 intent id 或 NONE)。绝不做 N 次调用——判据判定系让路背景活,唔可以
+# 逐个意图烧 9B 专线。命中下一轮先生效(见 agent.py _background_intent_judge)。
+# 文本一律标准书面中文(Prompt 语言纯度铁律,prompt 无条件进判定请求)。
+
+
+def build_intent_judge_messages(
+    *,
+    intents: list[dict],
+    user_text: str,
+    step_1based: int,
+    goal: str,
+) -> list[dict]:
+    """组意图判据批量判定器嘅 messages:intents 项形状 = {"id","label","prompt"}。
+
+    契约=**单选**:只输出候选表里的一个 id,或 NONE(全部判据都不贴合)。当前步
+    目标一并给出作语境(客户的话要在流程上下文中理解,例如「我一向都用这个」在
+    核实步才等于报平台)。
+    """
+    sys = (
+        "你是客服通话的意图判定器：根据客户刚才说的一句话，判断它命中了下面哪一个意图。"
+        f"\n当前通话在第{step_1based}步：{goal or '(无)'}"
+        "\n候选意图："
+    )
+    for item in intents:
+        sys += f"\n- 编号 {item.get('id')}｜名称 {item.get('label') or '(无)'}｜判据 {item.get('prompt')}"
+    sys += (
+        "\n判定规则：只按判据判断，不要凭编号或名称猜测；"
+        "命中多个时选判据最贴合的一个；全部不贴合就输出 NONE。"
+        "\n只输出一个意图编号，或 NONE。不要输出任何其它文字。"
+    )
+    return [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": f"客户：「{user_text}」\n只输出一个意图编号或 NONE。"},
+    ]
+
+
+def parse_intent_judge_output(text: str, valid_ids: list[str]) -> str:
+    """把判定器输出对返意图 id:剥空白/反引号/引号后取首个有内容行,精确匹配(区分大小写)。
+
+    认不出(含 NONE/未知 id/围着围栏但身份对不上)→ 空串=无命中。**只取首个
+    有内容行**——模型偶尔先吐一行说明再吐编号,唔准拿后文凑答案(宁可无命中,
+    都唔可以喺模糊轮乱触发绑定)。
+    """
+    for raw_line in (text or "").splitlines():
+        token = raw_line.strip().strip("`'\"\u201c\u201d\u2018\u2019").strip()
+        if not token:
+            continue  # 围栏行「```」剥完即空:继续看下一行(```\nid\n``` 形态)
+        return token if token in valid_ids else ""
+    return ""
