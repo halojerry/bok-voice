@@ -6,8 +6,8 @@
  * 左 = 移动端汉堡（<md，开抽屉；状态由壳持有）+ 当前页标题（pathname 经
  * FLAT_NAV/GUARD_ONLY 最长前缀反查 label，未命中显示空串）。
  * 右 = status slot（壳传 StatusBadge；undefined 不渲染容器）+ 账号区
- * （自 StageHeader.tsx 右区原样搬：匿名=「本地模式」徽标+登录链接；登录=
- * 用户名+退出）+「进入工作台」btn-primary CTA（入口非活状态 → 近黑，不用青）。
+ * （匿名=「本地模式」徽标+登录链接；登录=用户名+退出）+「进入工作台」
+ * btn-primary CTA（入口非活状态 → 近黑，不用青）。
  * 折叠开关归 Sidebar 底部，不进顶栏。
  */
 
@@ -63,7 +63,7 @@ export function Topbar({ onMobileOpen, status }: TopbarProps) {
 
       <div className="flex shrink-0 items-center gap-4">
         {status != null && <div className="shrink-0">{status}</div>}
-        {/* —— 账号区（自 StageHeader.tsx 右区原样搬；Task 3 退役 StageHeader）—— */}
+        {/* —— 账号区 —— */}
         {session?.anonymous && (
           <span className="flex items-center gap-2">
             <span className="rounded-sm border border-(--card-border) px-2 py-0.5 text-[11px] text-(--stage-muted)">

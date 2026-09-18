@@ -2,7 +2,7 @@
  * 导航单一事实源（P2 布局壳）：分组结构 + 权限门判定。
  *
  * 侧边栏/顶栏/路由守卫都从这里取数。权限判定语义
- * （matchesPath/gateForPath/navVisible/RouteGate）自 StageHeader.tsx **逐字搬家**
+ * （matchesPath/gateForPath/navVisible/RouteGate）自旧顶部导航组件 **逐字搬家**
  * ——零判定改动；只把扁平 NAV 重组为分组 NAV_GROUPS（工作台→运营→内容→管理，
  * 扁平顺序变化是产品预期）。分组前缀互不重叠，gateForPath 首匹配语义不受影响
  * （/calls/new 仍命中 /calls 的 calls 键）。
