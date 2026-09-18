@@ -123,3 +123,59 @@ test("revertCluster 回滚断簇", () => {
 test("LOCAL_POS_KEY 形态", () => {
   assert.equal(qa.LOCAL_POS_KEY("acc-001", "tpl-1"), "qa-canvas-pos:acc-001:tpl-1");
 });
+
+// ---- 话术图 Phase 2:意图节点/绑定边派生 ----
+const GRAPH_DOC = {
+  version: 1,
+  intents: [
+    { id: "int_1a2b3c4d", label: "投诉", keywords: ["投诉"], steps: [], enabled: true },
+    { id: "int_2b3c4d5e", label: "退款", keywords: ["退款"], steps: [3], enabled: false },
+  ],
+  bindings: [
+    { id: "bnd_7e8f9a0b", intent: "int_1a2b3c4d", action: "jump_step", step: 4, priority: 10, once: false, enabled: true },
+    { id: "bnd_c1d2e3f4", intent: "int_2b3c4d5e", action: "play_qa", qa_id: "nope", priority: 5, once: true, enabled: true },
+    { id: "bnd_d2e3f4a5", intent: "int_nope", action: "jump_step", step: 2, priority: 9, once: false, enabled: true }, // 悬空→不画
+  ],
+};
+
+test("parseGraphDoc tolerant", () => {
+  assert.deepEqual(qa.parseGraphDoc(""), { version: 1, intents: [], bindings: [] });
+  assert.deepEqual(qa.parseGraphDoc("garbage").intents, []);
+  assert.equal(qa.parseGraphDoc(JSON.stringify(GRAPH_DOC)).intents.length, 2);
+});
+
+test("deriveGraph intent nodes anchored to scope step", () => {
+  const steps = qa.parseTemplateSteps(JSON.stringify([{ goal: "g1", ref: "r1" }, { goal: "g2", ref: "r2" }, { goal: "g3", ref: "r3" }]));
+  const graph = qa.deriveGraph([], steps, { graph: qa.parseGraphDoc(JSON.stringify(GRAPH_DOC)) });
+  const intentNodes = graph.nodes.filter((n) => n.type === "intent");
+  assert.equal(intentNodes.length, 2); // 禁用意图照渲染(视图置灰)
+  const complain = intentNodes.find((n) => n.id === "intent:int_1a2b3c4d");
+  assert.equal(complain.position.x, qa.INTENT_X);
+  // 第 1 步 = step:0，其 y=80（脊柱基线 80+i*STEP_GAP_Y；y=0 属于 step:global 虚拟节点）。
+  // [task-6 勘误] plan 原断言写 0，与本文件既有脊柱基线常量不符。
+  assert.equal(complain.position.y, 80);
+  const refund = intentNodes.find((n) => n.id === "intent:int_2b3c4d5e");
+  assert.equal(refund.data.intent.enabled, false);
+});
+
+test("deriveGraph binding edges skip dangling and carry label", () => {
+  // [task-6 勘误] plan 夹具 3 步（step:0..2）与断言「1-based 第 4 步 → step:3」不符：3 步下
+  // step:4 越界被钳到 step:2。仅补第 4 步令原断言逐字成立，其余断言未改。
+  const steps = qa.parseTemplateSteps(
+    JSON.stringify([{ goal: "g1", ref: "r1" }, { goal: "g2", ref: "r2" }, { goal: "g3", ref: "r3" }, { goal: "g4", ref: "r4" }]),
+  );
+  const graph = qa.deriveGraph([], steps, { graph: qa.parseGraphDoc(JSON.stringify(GRAPH_DOC)) });
+  const bindEdges = graph.edges.filter((e) => e.data?.kind === "binding");
+  assert.equal(bindEdges.length, 1); // 悬空 intent 与悬空 qa_id 均不画
+  assert.equal(bindEdges[0].id, "bind:bnd_7e8f9a0b");
+  assert.equal(bindEdges[0].source, "intent:int_1a2b3c4d");
+  assert.equal(bindEdges[0].target, "step:3"); // 1-based 第 4 步 → 0-based step:3
+  assert.equal(bindEdges[0].label, "投诉");
+});
+
+test("graph absent = zero intent nodes/edges", () => {
+  const steps = qa.parseTemplateSteps(JSON.stringify([{ goal: "g", ref: "r" }]));
+  const graph = qa.deriveGraph([], steps, {});
+  assert.equal(graph.nodes.filter((n) => n.type === "intent").length, 0);
+  assert.equal(graph.edges.filter((e) => e.data?.kind === "binding").length, 0);
+});

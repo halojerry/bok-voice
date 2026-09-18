@@ -37,10 +37,57 @@ export type CanvasEdge = {
   id: string;
   source: string; target: string;
   sourceHandle: string | null; targetHandle: string | null;
-  data: { kind: "cluster" | "step" | "spine" };
+  data: { kind: "cluster" | "step" | "spine" | "binding" };
   animated?: boolean;
   label?: string;
 };
+
+// —— 话术图 Phase 2（spec §7，2026-09-18）：模板可选携带 graph_json = 意图节点 + 绑定边 ——
+// 运行时消费方=agent FlowController（Task 4）；此处只做画布展示派生（Task 7/8 接线交互）。
+export interface GraphIntent {
+  id: string;
+  label: string;
+  keywords: string[];
+  steps: number[]; // 1-based；空=全程
+  enabled: boolean;
+}
+export interface GraphBinding {
+  id: string;
+  intent: string;
+  action: "play_qa" | "jump_step";
+  qa_id?: string;
+  step?: number;
+  priority: number;
+  once: boolean;
+  enabled: boolean;
+}
+export interface GraphDoc {
+  version: number;
+  intents: GraphIntent[];
+  bindings: GraphBinding[];
+}
+
+/** 宽容解析（spec §7）：坏 JSON/版本不符/缺数组 → 空 doc，永不抛错。 */
+export function parseGraphDoc(raw: string | null | undefined): GraphDoc {
+  const empty: GraphDoc = { version: 1, intents: [], bindings: [] };
+  const text = String(raw || "").trim();
+  if (!text) return empty;
+  try {
+    const data = JSON.parse(text) as Partial<GraphDoc>;
+    if (!data || data.version !== 1 || !Array.isArray(data.intents) || !Array.isArray(data.bindings)) return empty;
+    return { version: 1, intents: data.intents, bindings: data.bindings };
+  } catch {
+    return empty;
+  }
+}
+
+export type CanvasIntentNode = {
+  id: string; type: "intent";
+  position: Pt;
+  data: { kind: "intent"; intent: GraphIntent };
+};
+/** 三类画布的判别联合（`deriveGraph().nodes` 的组合形态；qaNodes/stepNodes 子集保留兼容）。 */
+export type CanvasNode = CanvasStepNode | CanvasQaNode | CanvasIntentNode;
 
 // 布局几何 v1.1（用户实测反馈「画面太挤、没读出关联」后重排）：
 // 脊柱=左侧流程主线（步骤间顺序连线读出走向）；卫星道外推拉开大走廊；
@@ -53,6 +100,8 @@ export const CLUSTER_GAP_Y = 80;   // 簇边界（非变体条目入列前）的
 export const WRAP_AFTER = 10;      // 每条卫星子道的条目容量，超出换下一子道
 export const LANE_X = 320;         // 子道水平间距
 export const GLOBAL_X = -560;      // global（全程通用）泳道 x：脊柱左侧，分居减密度
+export const INTENT_X = -280;       // 意图节点道：脊柱左侧、全程通用泳道（-560）之右
+export const INTENT_STACK_Y = 140;  // 同锚点多个意图的纵向堆叠节距
 
 export function parseTemplateSteps(stepsJson: string): FlowStep[] {
   try {
@@ -79,8 +128,10 @@ function colOf(row: QaRow, stepCount: number): number {
 export function deriveGraph(
   rows: QaRow[],
   steps: FlowStep[],
-  opts: { langFilter: string; positions: Record<string, Pt> },
-): { qaNodes: CanvasQaNode[]; stepNodes: CanvasStepNode[]; edges: CanvasEdge[] } {
+  // langFilter/positions 都是可选覆盖：缺省=按语言全量 + 纯确定性布局（纯函数层不假设
+  // 调用方已备好覆盖表——既有调用传 positions，Phase 2 用例只传 `{ graph }`）。
+  opts: { langFilter: string; positions?: Record<string, Pt>; graph?: GraphDoc },
+): { nodes: CanvasNode[]; qaNodes: CanvasQaNode[]; stepNodes: CanvasStepNode[]; edges: CanvasEdge[] } {
   const filtered = (rows ?? []).filter(
     (r) => opts.langFilter === "all" || String(r.lang ?? "zh") === opts.langFilter,
   );
@@ -119,7 +170,7 @@ export function deriveGraph(
     // 容量换道：每 WRAP_AFTER 条换一条子道（确定性，纯几何）。
     const lane = Math.floor(st.count / WRAP_AFTER);
     const anchorX = col === 0 ? GLOBAL_X : SPINE_X + SAT_X;
-    const pos = opts.positions[String(r.id)] ?? {
+    const pos = opts.positions?.[String(r.id)] ?? {
       x: anchorX + lane * LANE_X + indent,
       y,
     };
@@ -129,6 +180,22 @@ export function deriveGraph(
       type: "qaEntry",
       position: pos,
       data: { ...r, isHead },
+    });
+  }
+  // 意图节点（话术图 Phase 2）：锚定首个生效步（全程锚第 1 步），同锚点纵向堆叠；
+  // 禁用意图照渲染（视图置灰）。位置优先取用户拖过的 localStorage 坐标。
+  const intentNodes: CanvasIntentNode[] = [];
+  const stackY = new Map<number, number>();
+  for (const intent of opts.graph?.intents ?? []) {
+    const stepIdx = Math.min(Math.max((intent.steps[0] ?? 1) - 1, 0), Math.max(steps.length - 1, 0));
+    const baseY = stepNodes.find((n) => n.id === `step:${stepIdx}`)?.position.y ?? 0;
+    const stack = stackY.get(stepIdx) ?? 0;
+    stackY.set(stepIdx, stack + INTENT_STACK_Y);
+    intentNodes.push({
+      id: `intent:${intent.id}`,
+      type: "intent" as const,
+      position: opts.positions?.[`intent:${intent.id}`] ?? { x: INTENT_X, y: baseY + stack },
+      data: { kind: "intent", intent },
     });
   }
   const edges: CanvasEdge[] = [];
@@ -165,7 +232,28 @@ export function deriveGraph(
       }
     }
   }
-  return { qaNodes, stepNodes, edges };
+  // 绑定边：意图 → 目标（play_qa→QA 条目节点 / jump_step→步骤节点）。
+  // 悬空引用不画（条目已删/步号越界），kind=binding，label=意图 label 退首关键词。
+  const nodeIds = new Set([...stepNodes, ...qaNodes, ...intentNodes].map((n) => n.id));
+  for (const b of opts.graph?.bindings ?? []) {
+    if (!b.enabled) continue;
+    const src = `intent:${b.intent}`;
+    const tgt = b.action === "jump_step"
+      ? `step:${Math.min(Math.max((b.step ?? 1) - 1, 0), Math.max(steps.length - 1, 0))}`
+      : String(b.qa_id || "");
+    if (!nodeIds.has(src) || !tgt || !nodeIds.has(tgt)) continue;
+    const intent = (opts.graph?.intents ?? []).find((i) => i.id === b.intent);
+    edges.push({
+      id: `bind:${b.id}`,
+      source: src,
+      target: tgt,
+      sourceHandle: null,
+      targetHandle: null,
+      label: intent?.label || intent?.keywords?.[0] || "",
+      data: { kind: "binding" },
+    });
+  }
+  return { nodes: [...stepNodes, ...qaNodes, ...intentNodes], qaNodes, stepNodes, edges };
 }
 
 /**
