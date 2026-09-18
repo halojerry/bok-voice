@@ -102,10 +102,37 @@ type QaTemplateRow = TemplateRow & { owner_user_id?: string };
 /** 未配置话术图的模板以此起步（与 parseGraphDoc 的坏数据兜底同形）。 */
 const EMPTY_GRAPH: GraphDoc = { version: 1, intents: [], bindings: [] };
 
+/**
+ * 原文是否**形状合法**的话术图（空串=未启用，合法）。
+ * 用于把「合法空图」与「坏 JSON / 版本不符」区分开：两者经 parseGraphDoc 都得到空图，
+ * 但后者意味着库里存着一份我们读不懂的配置——此时必须**禁止写入**（否则第一次编辑就把
+ * 那份配置覆盖成空 doc），并给出可解释的警告。合法空 doc（`{"version":1,"intents":[],…}`）
+ * 不在此列，清空全部意图后仍可继续编辑（不能把操作者锁死）。
+ */
+function graphRawValid(raw: string): boolean {
+  const text = String(raw ?? "").trim();
+  if (!text) return true;
+  try {
+    const data = JSON.parse(text) as Partial<GraphDoc>;
+    return Boolean(data) && data.version === 1 && Array.isArray(data.intents) && Array.isArray(data.bindings);
+  } catch {
+    return false;
+  }
+}
+
 /** 新增 id：CP `_ID_RE` 只收 `int_`/`bnd_` + 8 位小写 hex（crypto 随机，非 Math.random）。 */
 function genGraphId(prefix: "int_" | "bnd_"): string {
   const bytes = crypto.getRandomValues(new Uint8Array(4));
   return prefix + Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** 从图移除意图 + 其全部绑定（悬空绑定在 CP 侧必被拒：binding.intent 找不到意图）。 */
+function dropIntentFromDoc(doc: GraphDoc, intentId: string): GraphDoc {
+  return {
+    ...doc,
+    intents: doc.intents.filter((i) => i.id !== intentId),
+    bindings: doc.bindings.filter((b) => b.intent !== intentId),
+  };
 }
 
 /** 节点 id `intent:<intentId>` → 意图 id（Task 6 的 id 形态；非前缀形原样返回）。 */
@@ -180,6 +207,21 @@ export default function QaPage() {
   const [templateId, setTemplateId] = useState("");
   // 意图图(话术图 Phase 2 Task 8):选中模板的 graph_json 解析结果 + 编辑器开合。
   const [graphDoc, setGraphDoc] = useState<GraphDoc>(EMPTY_GRAPH);
+  // 在手的 graphDoc **属于哪个模板**(review R1 Fault 2):""=未加载/加载失败/坏数据。
+  // 只有 graphLoadedFor === templateId 才允许读写——切模板的当帧(旧图还在 state 里、新
+  // GET 未回来)与加载失败档都因此结构性不可写,不会把 A 模板的图移植到 B、也不会把
+  // 空图写回库覆盖已存配置。
+  const [graphLoadedFor, setGraphLoadedFor] = useState("");
+  // 图相关的独立错误面(与 QA 条目的 err 分开:err 会被 refresh/pregen 清掉,图警告必须留)。
+  const [graphErr, setGraphErr] = useState("");
+  // 在所有 graphDoc 数据路径上镜像同一份 doc(review R1 Fault 1):handler 不再读 render 期
+  // 闭包里的 graphDoc,而是读写这个 ref——同一 tick 内的多次变更(多选 Delete 一批边/节点+边)
+  // 逐个叠加,不会各自从同一份旧 doc 算,互相覆盖。
+  const graphDocRef = useRef<GraphDoc>(EMPTY_GRAPH);
+  const graphLoadedForRef = useRef("");
+  // 写队列:同一 tick 的多笔变更按提交顺序**串行** PUT(浏览器多连接下并发 PUT 的到达顺序
+  // 不受控,乱序会让服务端停在中间态=客户端显示已删、库里还在)。
+  const writeChainRef = useRef<Promise<void>>(Promise.resolve());
   // null=关；非空=正在编辑的意图 id。
   const [editorIntentId, setEditorIntentId] = useState<string | null>(null);
   // 新建草稿意图:{id,pos}。草稿**不落库**(空 label/空 keywords 必被 CP 400 拒),只在
@@ -216,10 +258,16 @@ export default function QaPage() {
   // 模板的 PUT 直接 403，前端放开只会让操作者白画一张图。uid 必须非空(匿名 user_id 恒 ""，
   // 不加这条会让 "共享模板 owner=''" 与匿名 uid 相等而误判为可编辑)。
   const activeTemplate = templates.find((t) => String(t.id) === templateId);
-  const canEditGraph = Boolean(activeTemplate) &&
+  const canEditTemplateGraph = Boolean(activeTemplate) &&
     (isManager ||
       ((session?.user_id ?? "") !== "" &&
         String(activeTemplate?.owner_user_id ?? "") === session?.user_id));
+
+  // 在手的图属于当前选中的模板(详情已取回且形状合法;review R1 Fault 2)。
+  const graphReady = graphLoadedFor !== "" && graphLoadedFor === templateId;
+  // **图可编辑** = 权限 × 在手图。缺任一即不可写:加载中/加载失败/坏数据档画布隐藏调色盘、
+  // 意图节点不可删、编辑器只读,写路径(orchestrator)另有 ref 级同款门(双保险)。
+  const canEditGraph = canEditTemplateGraph && graphReady;
 
   // 选中模板的步骤表：意图的生效步骤 chips 与 jump_step 目标下拉都按它的**真实步数**生成
   // (review M28:越界步号在画布上会被钳到末步、渲染成误导性落点)。
@@ -305,14 +353,21 @@ export default function QaPage() {
   }, [accountId]);
 
   // 意图图加载(话术图 Phase 2 Task 8):选中模板变化 → 拉详情取 graph_json → parseGraphDoc。
-  // 列表行虽带 graph_json,详情才是权威且最新(与写入同一端点);坏数据/无权限/404 一律退空图
-  // ——画布仍照常渲染条目脊柱,不阻塞页面。切模板同时关掉意图编辑器(旧意图不属于新图)。
+  // 列表行虽带 graph_json,详情才是权威且最新(与写入同一端点)。**三步防误写**(review R1 Fault 2):
+  // ①切模板的**当帧**就把 graphDoc 清空 + graphLoadedFor 置 ""——旧模板的图绝不留在手上被写进新模板;
+  // ②只有详情取回且原文形状合法,才把 graphLoadedFor 置为**该模板 id**(=允许读写);
+  // ③GET 失败 / 坏数据 → 保持 graphLoadedFor=""(写入被闸死)+ 独立 graphErr 警告,绝不静默放行
+  //   (否则第一次编辑就会把库里那份读不懂的配置覆盖成空 doc)。
   useEffect(() => {
     let alive = true;
     setEditorIntentId(null);
     setDraftIntent(null);
+    graphLoadedForRef.current = "";
+    setGraphLoadedFor("");
+    graphDocRef.current = EMPTY_GRAPH;
+    setGraphDoc(EMPTY_GRAPH);
+    setGraphErr("");
     if (!templateId) {
-      setGraphDoc(EMPTY_GRAPH);
       return () => {
         alive = false;
       };
@@ -321,9 +376,21 @@ export default function QaPage() {
       try {
         const tpl = (await api.getTemplate(templateId)) as Record<string, unknown>;
         if (!alive) return;
-        setGraphDoc(parseGraphDoc(typeof tpl.graph_json === "string" ? tpl.graph_json : ""));
-      } catch {
-        if (alive) setGraphDoc(EMPTY_GRAPH);
+        const raw = typeof tpl.graph_json === "string" ? tpl.graph_json : "";
+        if (!graphRawValid(raw)) {
+          setGraphErr(
+            "该话术的话术图数据无法解析（已存配置未被覆盖）。为避免误写，意图图编辑已暂停；请在话术里清空或重建后重试。",
+          );
+          return; // graphLoadedFor 保持 "":画布只读,写路径全闸死
+        }
+        const doc = parseGraphDoc(raw);
+        graphDocRef.current = doc;
+        setGraphDoc(doc);
+        graphLoadedForRef.current = templateId;
+        setGraphLoadedFor(templateId);
+      } catch (e) {
+        if (!alive) return;
+        setGraphErr(`读取话术图失败：${String(e)}；为避免覆盖已存配置，该话术的意图图编辑已暂停（可刷新重试）。`);
       }
     })();
     return () => {
@@ -542,28 +609,52 @@ export default function QaPage() {
   }
 
   // ---- 意图图编辑(话术图 Phase 2 Task 8):保存=PUT graph_json 单字段,乐观写+失败回滚 ----
+  // 全模块只有两个图写入口:**本地提交** `setGraphLocal`(state+ref 同步)与**落库** `mutateGraph`
+  // (读 ref 里的最新 doc → 算 next → 提交 → PUT)。handler 一律不许再直接读 render 期闭包里的
+  // graphDoc——那是「同一 tick 多笔变更互相覆盖」的根因(review R1 Fault 1)。
 
-  /** 保存整图(乐观+回滚,模式照 connectCluster)：PUT 只带 graph_json 一个键
-   *  (CP UpdateTemplateRequest 的 exclude_unset 语义:未出现的键不动,故不会顺手抹掉
-   *  话术正文/热词);失败回滚到调用前的图并报错。
-   *  回滚用「只回滚自己那次乐观写」的守卫——期间若已有更新的保存落地(cur !== next),
-   *  不拿旧快照把它盖回去(并发保存不留脏状态)。 */
-  const saveGraph = useCallback(
-    async (next: GraphDoc): Promise<boolean> => {
-      if (!templateId) return false;
-      const prev = graphDoc;
-      setGraphDoc(next); // 乐观
-      try {
-        await api.updateTemplate(templateId, { graph_json: JSON.stringify(next) });
-        setErr("");
-        return true;
-      } catch (e) {
-        setGraphDoc((cur) => (cur === next ? prev : cur)); // 回滚
-        setErr(`保存话术图失败：${String(e)}`);
-        return false;
-      }
+  /** 本地提交图(state + ref 同步;不联网)。 */
+  const setGraphLocal = useCallback((doc: GraphDoc) => {
+    graphDocRef.current = doc;
+    setGraphDoc(doc);
+  }, []);
+
+  /** 图变更的唯一落库入口:读**最新在手 doc**(ref)→ `fn` 算 next → 本地提交 → PUT。
+   *
+   *  - **同 tick 多笔**:画布多选 Delete 一批边会同步连调 N 次,每次都在**上一次的结果**上叠加
+   *    (读 ref 而非旧闭包),N 笔一条不丢;
+   *  - **写队列**:PUT 按提交顺序串行(浏览器多连接下并发 PUT 到达顺序不受控,乱序会让服务端
+   *    停在中间态——客户端显示已删、库里还在);
+   *  - **门**:只写**在手图属于当前模板**的那一份(graphLoadedForRef === templateId),加载中/
+   *    失败/坏数据档与切模板的当帧结构性写不进去(review R1 Fault 2);
+   *  - **回滚**:失败只回滚自己那次乐观写(期间若有更新的变更落地则 ref 已不是 next,不拿旧快照
+   *    盖回去;后一笔的 next 是从这一版算出来的,服务端最终仍收敛到最新版)。 */
+  const mutateGraph = useCallback(
+    (fn: (doc: GraphDoc) => GraphDoc): Promise<boolean> => {
+      const tid = templateId;
+      if (!tid || graphLoadedForRef.current !== tid) return Promise.resolve(false);
+      const prev = graphDocRef.current;
+      const next = fn(prev);
+      setGraphLocal(next); // 乐观
+      const run = writeChainRef.current.then(async () => {
+        try {
+          await api.updateTemplate(tid, { graph_json: JSON.stringify(next) });
+          setErr("");
+          return true;
+        } catch (e) {
+          if (graphDocRef.current === next) setGraphLocal(prev); // 回滚
+          setErr(`保存话术图失败：${String(e)}`);
+          return false;
+        }
+      });
+      // 链上吞错:某笔失败不能让后续写永久吊死(失败已单独上报/回滚)。
+      writeChainRef.current = run.then(
+        () => undefined,
+        () => undefined,
+      );
+      return run;
     },
-    [templateId, graphDoc],
+    [templateId, setGraphLocal],
   );
 
   /** 新建意图:先落**本地草稿**(不进库)+开编辑器。
@@ -579,73 +670,74 @@ export default function QaPage() {
         id: genGraphId("int_"), label: "", keywords: [], steps: [], enabled: true,
       };
       const staleDraftId = draftIntent?.id ?? "";
-      setGraphDoc((doc) => ({
+      const doc = graphDocRef.current;
+      setGraphLocal({
         ...doc,
         intents: [...doc.intents.filter((i) => i.id !== staleDraftId), intent],
-      }));
+      });
       setDraftIntent({ id: intent.id, pos });
       setEditorIntentId(intent.id);
     },
-    [canEditGraph, draftIntent],
+    [canEditGraph, draftIntent, setGraphLocal],
   );
 
   /** 删意图=连同它的绑定一起从图移除(悬空绑定在 CP 侧必被拒:binding.intent 找不到意图)。 */
   const deleteIntent = useCallback(
     (intentId: string) => {
       if (!canEditGraph) return;
-      const next: GraphDoc = {
-        ...graphDoc,
-        intents: graphDoc.intents.filter((i) => i.id !== intentId),
-        bindings: graphDoc.bindings.filter((b) => b.intent !== intentId),
-      };
       if (draftIntent?.id === intentId) {
-        setGraphDoc(next); // 草稿从未落库:纯本地剔除,零请求
+        setGraphLocal(dropIntentFromDoc(graphDocRef.current, intentId)); // 草稿从未落库:纯本地剔除,零请求
         return;
       }
-      void saveGraph(next);
+      void mutateGraph((doc) => dropIntentFromDoc(doc, intentId));
     },
-    [canEditGraph, graphDoc, draftIntent, saveGraph],
+    [canEditGraph, draftIntent, mutateGraph, setGraphLocal],
   );
 
   /** 删绑定(画布上 Delete 掉绑定边/或编辑器里删行后由 confirm 走整图 PUT)。 */
   const removeBinding = useCallback(
     (bindingId: string) => {
       if (!canEditGraph) return;
-      void saveGraph({ ...graphDoc, bindings: graphDoc.bindings.filter((b) => b.id !== bindingId) });
+      void mutateGraph((doc) => ({
+        ...doc,
+        bindings: doc.bindings.filter((b) => b.id !== bindingId),
+      }));
     },
-    [canEditGraph, graphDoc, saveGraph],
+    [canEditGraph, mutateGraph],
   );
 
   /** 编辑器确认:意图新值 + 该意图的绑定全集 → 整图 PUT。成功即关窗(失败留在窗内让操作者改)。 */
   const confirmIntentEditing = useCallback(
     async (nextIntent: GraphIntent, nextBindings: GraphBinding[]): Promise<boolean> => {
-      const intents = graphDoc.intents.some((i) => i.id === nextIntent.id)
-        ? graphDoc.intents.map((i) => (i.id === nextIntent.id ? nextIntent : i))
-        : [...graphDoc.intents, nextIntent];
-      const ok = await saveGraph({
-        version: graphDoc.version,
-        intents,
+      const ok = await mutateGraph((doc) => ({
+        version: doc.version,
+        intents: doc.intents.some((i) => i.id === nextIntent.id)
+          ? doc.intents.map((i) => (i.id === nextIntent.id ? nextIntent : i))
+          : [...doc.intents, nextIntent],
         bindings: [
-          ...graphDoc.bindings.filter((b) => b.intent !== nextIntent.id),
+          ...doc.bindings.filter((b) => b.intent !== nextIntent.id),
           ...nextBindings,
         ],
-      });
+      }));
       if (ok) {
         setEditorIntentId(null);
         setDraftIntent(null);
       }
       return ok;
     },
-    [graphDoc, saveGraph],
+    [mutateGraph],
   );
 
   /** 关编辑器:草稿(未落库)连带从本地图剔除;存量意图仅关窗,零请求。 */
   const closeIntentEditor = useCallback(() => {
     const draftId = draftIntent?.id ?? "";
-    if (draftId) setGraphDoc((doc) => ({ ...doc, intents: doc.intents.filter((i) => i.id !== draftId) }));
+    if (draftId) {
+      const doc = graphDocRef.current;
+      setGraphLocal({ ...doc, intents: doc.intents.filter((i) => i.id !== draftId) });
+    }
     setEditorIntentId(null);
     setDraftIntent(null);
-  }, [draftIntent]);
+  }, [draftIntent, setGraphLocal]);
 
   /** 绑定边右键 → 开其源意图的编辑器(绑定边 source 恒为 "intent:<id>")。 */
   const setEditingIntentForEdge = useCallback((edge: CanvasEdgeHit) => {
@@ -781,6 +873,9 @@ export default function QaPage() {
       </div>
 
       {err && <ErrorState message={err} />}
+      {/* 图专用警告(review R1 Fault 2):加载失败/坏数据时写入被闸死,必须让操作者看见原因,
+          不能静默退化成空图(否则下一笔编辑会把库里那份读不懂的配置覆盖掉)。 */}
+      {graphErr && <ErrorState message={graphErr} />}
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_420px]">
         {view === "canvas" ? (
@@ -1138,7 +1233,8 @@ export default function QaPage() {
  *
  * 校验口径与 CP validate_flow_graph 逐条对齐(label 1-64 / keywords 1-32 项且单项 ≤64 /
  * priority 0-1000 / jump_step 步号 1..真实步数 / play_qa 必带 qa_id):前端先拦,不让必 400 的
- * 请求上线。
+ * 请求上线。另有**第三态护栏**(review R1 Fault 3):「全程」未勾且一个步号都没勾 → 硬报错留窗,
+ * 绝不落库 `steps: []`(运行时把空 steps 读成**全程**,与操作者「收窄」的预期正好相反)。
  */
 function IntentEditorModal(props: {
   intent: GraphIntent;
@@ -1215,6 +1311,13 @@ function IntentEditorModal(props: {
     if (keywords.length > 32) return setError("触发关键词最多 32 个。");
     const overlong = keywords.find((k) => k.length > 64);
     if (overlong) return setError(`单个关键词最长 64 字，请改短：「${overlong.slice(0, 10)}…」`);
+    // 生效步骤第三态护栏(review R1 Fault 3):「全程」未勾且一个步骤都没勾 → 落库 steps=[]
+    // 会被运行时读成**全程**(pick_graph_action:空 steps=不限步),语义正好反了——操作者以为
+    // 收窄了,实际放开了。越界步号档同理:chips 不画那个步号 → 选择为空 → 同一错误,绝不静默
+    // 拓宽成全程(改个名字就把生效范围放大,是最隐蔽的一条)。
+    if (!allSteps && scopeSteps.length === 0) {
+      return setError("生效步骤一个都没选：请勾「全程」，或至少勾选一个步骤（空选择不生效）。");
+    }
     const nextBindings: GraphBinding[] = [];
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
@@ -1337,6 +1440,13 @@ function IntentEditorModal(props: {
             {droppedSteps > 0 && (
               <span className="mt-1 block text-[11px] text-amber-600">
                 原有 {droppedSteps} 个生效步号超出该话术的步数，已忽略（保存后移除）。
+              </span>
+            )}
+            {/* 第三态提前显形(review R1 Fault 3):空选择保存必被拦(见 submit),在这里先说清,
+                免操作者按了保存才知道——尤其越界步号档(看起来像"收窄过"的样子)。 */}
+            {!allSteps && scopeSteps.length === 0 && (
+              <span className="mt-1 block text-[11px] text-amber-600">
+                当前一个步骤都没选：勾「全程」或至少选一个步骤，否则无法保存（空选择不生效，不等于全程）。
               </span>
             )}
           </div>
