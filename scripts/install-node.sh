@@ -57,7 +57,7 @@ PY="$REPO_ROOT/.venv312/bin/python"
 
 STEP_NO=0
 STEP_TOTAL=6
-[[ $SKIP_MODES -eq 1 ]] && STEP_TOTAL=5
+[[ $SKIP_MODELS -eq 1 ]] && STEP_TOTAL=5
 AGENT_PID=""
 
 step() { STEP_NO=$((STEP_NO+1)); echo; echo "==> [${STEP_NO}/${STEP_TOTAL}] $*"; }
