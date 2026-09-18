@@ -1662,7 +1662,7 @@ async def _reap_stale_calls_once() -> dict:
                                 **_call_end_fields(c))
             out["ended"] += 1
             try:
-                await settle(c["id"])  # 幂等:已结算直接 existing 短路
+                await _settle_core(c["id"])  # 幂等:已结算直接 existing 短路
                 out["settled"] += 1
             except Exception as exc:  # pragma: no cover - 兜底结算失败不阻回收
                 print(f"[cp] reaper settle skipped ({c['id']}): {exc!r}", flush=True)
@@ -1679,7 +1679,7 @@ async def _reap_stale_calls_once() -> dict:
         if _repo().get_settlement(c["id"]):
             continue
         try:
-            await settle(c["id"])
+            await _settle_core(c["id"])
             patched += 1
             out["settled"] += 1
         except Exception as exc:  # pragma: no cover
@@ -3149,6 +3149,17 @@ def _backfill_turns_from_report(call_id: str, report_raw: str) -> int:
 async def settle(call_id: str, request: Request) -> dict:
     _gate_page(request, "calls")
     deny_cross_account(request, _repo().get_call(call_id))
+    return await _settle_core(call_id)
+
+
+async def _settle_core(call_id: str) -> dict:
+    """结算内核（无鉴权层）：HTTP 端点与 reaper 后台循环共用。
+
+    2026-09-18 修复：reaper 此前直调 settle(c["id"]) 缺 request 参数——TypeError
+    被兜底 except 吞掉，僵尸通话/存量补结算从上线起一直空转（每轮打印
+    reaper settle skipped 报 TypeError 即其痕迹）。鉴权留在端点壳，后台路径
+    走本内核。
+    """
     existing = _repo().get_settlement(call_id)
     if existing:
         return existing

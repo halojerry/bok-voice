@@ -72,6 +72,25 @@ class SqlAlchemyBusinessRepository:
     def __init__(self, session: Session):
         self.session = session
 
+    # ---- 会话生命周期（2026-09-18 连接池泄漏修复）----
+    # 读路径（list_campaigns/list_items/get_call…）从不 commit：autobegin 的
+    # 事务把一条池连接占住到 Session 被关闭为止。此前本类不提供 close，调用方
+    # 只能等 GC 归还——后台循环（campaign tick 5s 一轮）每轮新建 Session，
+    # DB 抖动时（生产实证 psycopg SSL EOF / server closed connection）钉住的
+    # 死连接在两次 GC 之间持续计入 QueuePool 容量，直至 5+10 全满、每轮 30s
+    # 超时。close()/上下文管理器让占用方确定性归还；注入 Session 的调用方
+    # （campaign_tick 注入路/请求路径）所有权仍归调用方。
+
+    def close(self) -> None:
+        """关闭底层 Session：回滚在途事务并把池连接归还（不依赖 GC）。"""
+        self.session.close()
+
+    def __enter__(self) -> "SqlAlchemyBusinessRepository":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
     # ---- calls ----
 
     def create_call(self, manifest: SessionManifest) -> dict:

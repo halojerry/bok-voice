@@ -29,6 +29,12 @@ LIVEKIT_KEY = "devkey"
 LIVEKIT_SECRET = "devsecret"
 CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
 TTS_URL = os.environ.get("TTS_URL", "http://127.0.0.1:8788")
+# auth-on 栈(2026-09-15 标准姿势)要求 CP 请求带机器通道 token——E2E 建单/取
+# token/收线/读 turns 全是机器语义,Bearer BOK_CP_TOKEN 直通(与 agent worker 同源)。
+# 未设 env(老 auth-off 栈)零变化。CP 之外(tts/asr sidecar)不带。
+_CP_HEADERS: dict[str, str] = {}
+if os.environ.get("BOK_CP_TOKEN", "").strip():
+    _CP_HEADERS["Authorization"] = f"Bearer {os.environ['BOK_CP_TOKEN'].strip()}"
 
 _ALL_CASES = [
     # 真人客户口吻（每语言一句域内话术,TTS 现场合成,弃 fixtures 灣仔問路句）。
@@ -251,6 +257,7 @@ async def _case_session(case: dict) -> dict:
     lang = case["lang"]
     obj = httpx.post(
         f"{CONTROL_PLANE_URL}/api/objects?account_id=acc-001",
+        headers=_CP_HEADERS,
         json={
             "display_name": f"E2E-{lang}-{int(time.time())}",
             "role_template": "buyer",
@@ -261,11 +268,13 @@ async def _case_session(case: dict) -> dict:
     ).json()
     persona = httpx.post(
         f"{CONTROL_PLANE_URL}/api/personas?account_id=acc-001",
+        headers=_CP_HEADERS,
         json={"name": "E2E客服", "language": lang, "tone": "礼貌专业"},
         timeout=10,
     ).json()
     call = httpx.post(
         f"{CONTROL_PLANE_URL}/api/calls",
+        headers=_CP_HEADERS,
         json={
             "account_id": "acc-001",
             "object_id": obj["id"],
@@ -287,6 +296,7 @@ async def _case_session(case: dict) -> dict:
     else:
         resp = httpx.post(
             f"{CONTROL_PLANE_URL}/api/token",
+            headers=_CP_HEADERS,
             json={"account_id": "acc-001", "call_id": room_name},
             timeout=10,
         )
@@ -318,7 +328,7 @@ async def _case_session(case: dict) -> dict:
     finally:
         await room.disconnect()
         try:
-            httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{room_name}/hangup", timeout=10)
+            httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{room_name}/hangup", headers=_CP_HEADERS, timeout=10)
         except Exception:
             pass
 

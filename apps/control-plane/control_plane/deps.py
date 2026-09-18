@@ -63,6 +63,14 @@ def build_engine() -> Engine | None:
 
             kwargs["poolclass"] = NullPool
             kwargs["connect_args"] = {"timeout": 30, "check_same_thread": False}
+        else:
+            # 远程 Postgres（云端 Supabase pooler 过 NAT/隧道）空闲连接会被中间
+            # 设备静默断开（2026-09-18 生产实证：psycopg "SSL error: unexpected
+            # eof while reading" / "server closed the connection unexpectedly"
+            # 持续成批出现）。checkout 前轻量 ping，死连接透明回收重连——防
+            # 「池里躺满僵尸连接」的首用失败连环 500。不放大池容量：占用泄漏
+            # 以修复占用方为准（campaign tick 每轮确定性 close，见 campaign.py）。
+            kwargs["pool_pre_ping"] = True
         engine = create_engine(url, **kwargs)
         from bok_voice_business_db import models
 
