@@ -14,7 +14,6 @@ import { Track, type Room } from 'livekit-client';
  * Props for the AgentSessionProvider component.
  * Combines SessionProviderProps with RoomAudioRendererProps.
  */
-
 export type AgentSessionProviderProps = SessionProviderProps &
   RoomAudioRendererProps & {
     /**

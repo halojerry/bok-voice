@@ -6,11 +6,13 @@
  * - 桌面（≥md）恒驻：展开 `w-60` / 折叠 `w-[3.5rem]` 图标轨。折叠偏好存
  *   localStorage `bok_sidebar_collapsed`（"1"=折叠）；初渲染恒按展开渲染、
  *   mount 后再读存储——static export 的服务端 HTML 与客户端首帧保持一致，
- *   防水合 mismatch。
- * - 移动（<md）：受控 off-canvas 抽屉 + 半透明遮罩（点击/Esc 关闭），translate-x
- *   过渡；抽屉开关状态由壳持有（props 受控），路由变化自动收起，打开期间锁
- *   body 滚动。抽屉恒展开（折叠偏好只作用于桌面恒驻栏），内容与桌面共用
- *   SidebarContent 渲染函数。
+ *   防水合 mismatch。舞台路由（/calls/new、/interpret、/translate，判定走
+ *   lib/navigation isStageRoute 单一事实源）自动折叠——临时态**不写偏好键**，
+ *   离开舞台路由恢复存储偏好；舞台页上的手动切换仅当页临时生效。
+ * - 移动（<md）：受控 off-canvas 抽屉 + 常挂半透明遮罩（opacity/pointer-events
+ *   过渡渐隐，点击/Esc 关闭），translate-x 过渡；抽屉开关状态由壳持有
+ *   （props 受控），路由变化自动收起，打开期间锁 body 滚动。抽屉恒展开
+ *   （折叠偏好只作用于桌面恒驻栏），内容与桌面共用 SidebarContent 渲染函数。
  * - 分组/权限判定全走 lib/navigation 单一事实源：组内条目经 navVisible 过滤
  *   后为空则整组（含 eyebrow 组头）不渲染；第一组无上边框，组间 border-t。
  * - 激活态（matchesPath）= 品牌青 --live 族（bg-(--live-soft) /
@@ -31,6 +33,7 @@ import {
 } from "@/components/ui/tooltip";
 import {
   NAV_GROUPS,
+  isStageRoute,
   matchesPath,
   navVisible,
   type NavItem,
@@ -164,16 +167,35 @@ function SidebarContent({
 
 export function Sidebar({ mobileOpen, onMobileClose }: SidebarProps) {
   const pathname = usePathname();
-  // 初渲染恒展开（与 static export 服务端 HTML 一致），mount 后应用存储值。
-  const [collapsed, setCollapsed] = useState(false);
+  const onStage = isStageRoute(pathname);
+  // 存储偏好：初渲染恒展开（与 static export 服务端 HTML 一致），mount 后应用存储值。
+  const [storedCollapsed, setStoredCollapsed] = useState(false);
+  // 舞台路由上的临时手动切换（null=跟随自动折叠）；换路由即清零，
+  // 重新进入舞台页重新自动折叠、离开即恢复存储偏好。
+  const [stageOverride, setStageOverride] = useState<boolean | null>(null);
 
   useEffect(() => {
     try {
-      setCollapsed(window.localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1");
+      setStoredCollapsed(
+        window.localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1",
+      );
     } catch {
       /* localStorage 不可用（隐私模式等）——保持展开 */
     }
   }, []);
+
+  // 换路由清舞台临时态：自动折叠是「进舞台页」的一次性行为，不跨路由续命。
+  // 渲染期同步重置（React 官方「props 变化重置派生态」模式）——舞台路由互跳
+  // （/interpret ↔ /translate）不残留上一页手动展开的一帧（effect 版会迟一帧）。
+  const [prevPathname, setPrevPathname] = useState(pathname);
+  if (prevPathname !== pathname) {
+    setPrevPathname(pathname);
+    setStageOverride(null);
+  }
+
+  // 生效折叠态：舞台路由=自动折叠（用户当页临时切换可覆写）；其余路由=存储偏好。
+  // 舞台判定只依赖 pathname（prerender 与客户端同源），不引入水合 mismatch。
+  const collapsed = onStage ? (stageOverride ?? true) : storedCollapsed;
 
   // 路由变化自动收起移动端抽屉。回调经 effect 写入 ref（不在渲染期改 ref，
   // 并发渲染下丢弃的渲染不带副作用）；记录上一个 pathname，mount 首帧不触发。
@@ -205,7 +227,12 @@ export function Sidebar({ mobileOpen, onMobileClose }: SidebarProps) {
   }, [mobileOpen]);
 
   const toggleCollapsed = () => {
-    setCollapsed((prev) => {
+    if (onStage) {
+      // 舞台路由上的手动切换仅临时生效——不写用户偏好键，离开路由即失效。
+      setStageOverride((prev) => !(prev ?? true));
+      return;
+    }
+    setStoredCollapsed((prev) => {
       const next = !prev;
       try {
         window.localStorage.setItem(SIDEBAR_COLLAPSED_KEY, next ? "1" : "0");
@@ -234,17 +261,21 @@ export function Sidebar({ mobileOpen, onMobileClose }: SidebarProps) {
         />
       </aside>
 
-      {/* 移动端抽屉（<md）：off-canvas + 半透明遮罩，translate-x 过渡。
-          抽屉恒展开（折叠只属桌面恒驻栏），关闭走遮罩/Esc/路由变化。 */}
+      {/* 移动端抽屉（<md）：off-canvas + 半透明遮罩，translate-x / opacity 过渡。
+          抽屉恒展开（折叠只属桌面恒驻栏），关闭走遮罩/Esc/路由变化。
+          遮罩常挂（opacity + pointer-events 过渡）：关闭时抽屉 200ms 滑出期间
+          遮罩同步渐隐，不再条件渲染瞬拆闪断；关闭态 inert + 透明不可交互。 */}
       <div className="md:hidden">
-        {mobileOpen && (
-          <button
-            type="button"
-            aria-label="关闭导航"
-            onClick={onMobileClose}
-            className="fixed inset-0 z-40 bg-foreground/10"
-          />
-        )}
+        <button
+          type="button"
+          aria-label="关闭导航"
+          onClick={onMobileClose}
+          inert={!mobileOpen}
+          className={cn(
+            "fixed inset-0 z-40 bg-foreground/10 transition-opacity duration-200",
+            mobileOpen ? "opacity-100" : "pointer-events-none opacity-0",
+          )}
+        />
         <aside
           inert={!mobileOpen}
           className={cn(
