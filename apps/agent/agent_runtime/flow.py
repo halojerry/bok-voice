@@ -870,6 +870,10 @@ class FlowController:
     # 本通已成功执行的绑定 id(jump 实际位移 / play_qa 实际播出才记;once 绑定
     # 依此每通至多一次,spec §4.3)。agent.py graph 块写入。
     graph_fired: set[str] = field(default_factory=set)
+    # 本通实际播出过的 QA 条目 id 序(多答案轮换账本,Phase 3.2 spec §2;真播出
+    # 才记,与 graph_fired 同纪律)。簇内轮换取「本通最少播放」成员,平则插入序;
+    # 容量 64 截断(agent.py 记账点 `_qa_note_played`)。
+    qa_played: list[str] = field(default_factory=list)
 
     @classmethod
     def from_template(cls, template: dict | None, object_card: dict | None) -> "FlowController":

@@ -6,6 +6,11 @@
 打分照抄知识库 InMemoryVectorStore:0.6×余弦 + 0.4×子串长度比,向量用
 HybridLexicalEmbedding(CJK 逐字+bigram 哈希,零外部依赖)。阈值默认 0.90
 宁缺毋滥;语义向量(MlxEmbedding)与步骤作用域条目放量为 v2。
+
+命中语义(Phase 3.2,spec 2026-09-18-flow-graph-phase3 §2):同义簇
+(cluster_head_id)在装配时折组——变体命中由簇头代表出场,簇内按「本通最少
+播放」轮换(账本在 FlowController.qa_played)。不折分数:胜者键与分数逐字节
+不变(BOK_QA_ROTATION=0 回裸索引竞争者档)。
 """
 
 from __future__ import annotations
@@ -36,6 +41,11 @@ def qa_priority_enabled() -> bool:
     return os.environ.get("BOK_QA_PRIORITY", "1") == "1"
 
 
+def qa_rotation_enabled() -> bool:
+    """多答案轮换开关(Phase 3.2):0=回裸索引竞争者档(变体自己赢、播自己的答案)。"""
+    return os.environ.get("BOK_QA_ROTATION", "1") == "1"
+
+
 def _entry_priority(entry: dict) -> int:
     """条目优先级(小者先);旧 CP 响应/坏值宽容回默认 10,域 [0,1000]。"""
     raw = entry.get("priority", 10)
@@ -52,6 +62,19 @@ def _cos(a: list[float], b: list[float]) -> float:
     na = sum(x * x for x in a) ** 0.5
     nb = sum(y * y for y in b) ** 0.5
     return num / max(1e-9, na * nb)
+
+
+def pick_rotation_member(members: list[dict], played: list[str]) -> dict:
+    """簇内轮换取员(纯函数,Phase 3.2):本通播放次数最小者先,平则插入序。
+
+    `played` 是已播出条目 id 序(`FlowController.qa_played`);只读不改。
+    空成员表=契约违约(上游 len>1 门已挡),响亮抛错而非静默回 None——
+    静默会让快路播空音频。
+    """
+    if not members:
+        raise ValueError("pick_rotation_member: members 不可为空")
+    # min 稳定:同计数时保留迭代序首(=插入序=created_at),正是轮换的平局语义。
+    return min(members, key=lambda m: played.count(str(m.get("id") or "")))
 
 
 def qa_exclude_reason(
@@ -106,9 +129,48 @@ class QaIndex:
             except Exception:  # noqa: BLE001 - 单条向量失败跳过该条
                 continue
             self._items.append((e, q, vec))
+        # 同义簇折组(Phase 3.2,spec §2):变体(cluster_head_id 非空且 head 在场可用)
+        # 折进 head 的候选组——head 居首、其后按索引插入序(=created_at);head 唔在
+        # 索引(删/禁/空问法/自指 id)的变体退独立条目(旧行为,优雅降级)。
+        # _cluster_of 是变体 id → 簇头 id 的归一面(cluster_members 传变体 id 时用)。
+        self._clusters: dict[str, list[dict]] = {}
+        self._cluster_of: dict[str, str] = {}
+        self._build_clusters()
+
+    def _build_clusters(self) -> None:
+        by_id = {str(e.get("id") or ""): e for e, _q, _v in self._items}
+        for e, _q, _v in self._items:
+            eid = str(e.get("id") or "")
+            hid = str(e.get("cluster_head_id") or "")
+            if not hid or hid == eid or hid not in by_id:
+                continue  # 无簇 / 自指 / 孤儿(head 不可命中)→ 独立条目
+            members = self._clusters.get(hid)
+            if members is None:
+                members = self._clusters[hid] = [by_id[hid]]  # head 恒居首
+            members.append(e)
+            self._cluster_of[eid] = hid
 
     def __len__(self) -> int:
         return len(self._items)
+
+    def cluster_members(self, head_id: str) -> list[dict]:
+        """簇成员表(head 自身+在场变体,插入序;副本)。
+
+        传簇头 id 或组内任一成员 id 都归一到同一簇(变体 id 经折组后唔会出线,
+        但 by_id/探针等调用面可能直传变体)。无簇条目 → 其自身单元素表(调用方
+        按 len>1 判独立档);完全唔在场嘅 id → []。mutate 返回值唔会影响索引。
+        """
+        wanted = str(head_id or "")
+        if not wanted:
+            return []
+        members = self._clusters.get(wanted)
+        if members is not None:
+            return list(members)
+        owner = self._cluster_of.get(wanted)
+        if owner:
+            return list(self._clusters.get(owner) or [])
+        entry = self.by_id(wanted)
+        return [entry] if entry is not None else []
 
     def match(
         self,
@@ -150,9 +212,23 @@ class QaIndex:
             key = (_entry_priority(entry), -score) if use_priority else (-score,)
             if best_key is None or key < best_key:
                 best, best_key, best_score = entry, key, score
+        # 折组(Phase 3.2):胜者是变体 → 由簇头代表出场;胜者键与分数逐字节不变
+        # (只换出场代表,3.1 优先级键语义零改动)。kill-switch=0 时逐字节同旧档。
+        if best is not None and qa_rotation_enabled():
+            head = self._team_head(best)
+            if head is not None:
+                return head, best_score
         if best is not None:
             return best, best_score
         return None, top_score
+
+    def _team_head(self, entry: dict) -> dict | None:
+        """胜者所属簇的 head 条目(无簇/孤儿/自指 → None,即原样返回胜者)。"""
+        hid = self._cluster_of.get(str(entry.get("id") or ""))
+        if not hid:
+            return None
+        members = self._clusters.get(hid)
+        return members[0] if members else None
 
     def by_id(self, entry_id: str) -> dict | None:
         """按条目 id 直取(话术图 play_qa 绑定,spec §4.1);无命中返回 None。"""

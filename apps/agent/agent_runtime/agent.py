@@ -18,7 +18,13 @@ from .plugins.settlement import SettlementTrigger
 from .providers.registry import build_provider_registry
 from .control_plane import ControlPlaneClient
 from .fillers import FillerDirector
-from .qa_gate import QaIndex, qa_exclude_reason as _qa_exclude_reason, qa_fastpath_enabled
+from .qa_gate import (
+    QaIndex,
+    pick_rotation_member,
+    qa_exclude_reason as _qa_exclude_reason,
+    qa_fastpath_enabled,
+    qa_rotation_enabled,
+)
 from .tts_cache import CachedTTS, TtsAudioCache, default_cache_dir, frames_aiter, pcm_to_frames, tts_cache_enabled
 # 模块级引 flow(纯 stdlib 依赖,无环):_wa_numberish/_wa_number_line 等模块级
 # helper 用;entrypoint 内的 function-scoped import 属历史样式,不冲突。
@@ -1246,6 +1252,37 @@ _MINIMAX_LOCAL_VOICES = frozenset(
     {"serena", "vivian", "uncle_fu", "ryan", "aiden", "ono_anna", "sohee", "eric", "dylan"}
 )
 _MINIMAX_LOCAL_VOICE_PREFIXES = ("agent-", "acceptance-")
+
+
+_QA_PLAYED_CAP = 64
+
+
+def _qa_note_played(played: list[str], entry_id) -> None:
+    """轮换账本记账(Phase 3.2 spec §2,就地改):真播出后才调(调用点在快路
+    出声后,与 graph_fired 同纪律)。容量 `_QA_PLAYED_CAP` 截断——单通几百轮时
+    账本无界,而轮换只需「本通最少播放」的相对计数(64 远超任何簇规模)。
+    """
+    played.append(str(entry_id or ""))
+    if len(played) > _QA_PLAYED_CAP:
+        del played[0]
+
+
+def _qa_rotation_plan(entry: dict, members: list[dict], played: list[str]) -> list[dict]:
+    """QA 快路出场序(Phase 3.2,纯函数)。
+
+    多成员簇 → 轮换序(本通最少播放先,平则插入序),反复取 pick_rotation_member
+    = 与接口同一序源(防两处排序逻辑漂移);调用方沿序下移跳过无 PCM 的成员。
+    无簇/单成员(= kill-switch 档调用点传 [])/孤儿 → `[entry]` 逐字节原路。
+    """
+    if len(members) <= 1:
+        return [entry]
+    remaining = list(members)
+    order: list[dict] = []
+    while remaining:
+        picked = pick_rotation_member(remaining, played)
+        order.append(picked)
+        remaining.remove(picked)
+    return order
 
 
 def _filter_cloud_voice_map(raw_map: dict) -> dict:
@@ -3804,12 +3841,41 @@ async def entrypoint(ctx):
                     # 由 format_qa_summary 求差)。
                     _qa_bump("match0" if _qa_entry is None else "hit")
                     if _qa_entry is not None:
-                        _qa_answer = str(_qa_entry.get("answer_text") or "").strip()
-                        _qa_pcm = _qa_pcm_for(_qa_answer)
-                        if _qa_pcm is not None:
-                            print(f"QA_FASTPATH hit=1 entry={_qa_entry.get('id')} score={_qa_score:.2f}", flush=True)
-                            if await _qa_canned_say(_qa_entry, _qa_pcm, provider="qa-fastpath"):
+                        # 多答案轮换(Phase 3.2 spec §2):match 胜者已折组到簇头 →
+                        # 簇内按「本通最少播放」取出场成员,用它自己的 answer/PCM 播
+                        # (qa_hit 记实际播出嘅 member id);首员无 PCM 沿轮换序下移,
+                        # 全组无 PCM 才落 no_audio 走 LLM。无簇/单成员/kill-switch=0
+                        # → members 空 → _qa_play 恒 [_qa_entry],逐字节原路(台账照记)。
+                        _qa_members = (
+                            _qa_index.cluster_members(str(_qa_entry.get("id") or ""))
+                            if qa_rotation_enabled()
+                            else []
+                        )
+                        _qa_play = _qa_rotation_plan(_qa_entry, _qa_members, flow_ctrl.qa_played)
+                        _qa_rotating = len(_qa_play) > 1
+                        for _qa_member in _qa_play:
+                            _qa_answer = str(_qa_member.get("answer_text") or "").strip()
+                            _qa_pcm = _qa_pcm_for(_qa_answer)
+                            if _qa_pcm is None:
+                                # 轮换档成员未物化 → 顺位下移下一个;单员档唔打呢行
+                                # (保持无簇配置日志逐字节同旧,no_audio 语义不变)。
+                                if _qa_rotating:
+                                    print(
+                                        f"QA_FASTPATH rotation_skip entry={_qa_member.get('id')} "
+                                        f"reason=no_audio",
+                                        flush=True,
+                                    )
+                                continue
+                            print(
+                                f"QA_FASTPATH hit=1 entry={_qa_member.get('id')} "
+                                f"score={_qa_score:.2f}",
+                                flush=True,
+                            )
+                            if await _qa_canned_say(_qa_member, _qa_pcm, provider="qa-fastpath"):
+                                # 成功才记账(label 纪律:真播出;容量截断防无界)
+                                _qa_note_played(flow_ctrl.qa_played, _qa_member.get("id"))
                                 raise StopResponse()
+                            break  # 罐头路拒播(非异常径):原语义落 no_audio
                         print(f"QA_FASTPATH hit=0 reason=no_audio entry={_qa_entry.get('id')}", flush=True)
                         _qa_bump("no_audio")
             # (旧 paused 分支已前移为 hook 顶部的 C1 暂停冻结——落库 gen=paused+
