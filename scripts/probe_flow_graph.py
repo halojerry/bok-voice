@@ -136,6 +136,35 @@ def transcript_has_keyword(turns: list[dict], keywords: list[str]) -> bool:
     return False
 
 
+def probe_evidence(*, log_exists: bool, marks: list[int], expected_rounds: int) -> dict:
+    """观测面可信度（纯函数，review R1）——**没有真观测，就没有「零 FLOW_GRAPH」结论**。
+
+    本探针两条主判据都是 absence-based（「窗口内零 `FLOW_GRAPH` 行」「零 graph 轮」）；
+    没有观测前提时它们会**空过**（假绿）。三件前提：
+
+    - `log_exists`：agent.log 在场。不在场=整通零可观测，「零命中」是空话。
+    - `rounds_complete`：`len(marks) == expected_rounds + 1`。marks 首元素在进房前落、
+      每跑完一轮追加一个 → 中途异常/提前退出必少 mark（mark 塌成一个=一轮未观测）。
+    - `grew_each_round`：相邻 mark 严格递增。每轮都真往日志写了字节；若某轮窗口
+      零字节，说明该轮根本没跑起来，该窗口的「零命中」不成立。
+
+    `ok` = 三件全真；`evaluate_leg` 用它闸 absent 判据。
+    """
+    grew = [b > a for a, b in zip(marks, marks[1:])]
+    rounds_complete = len(marks) == expected_rounds + 1
+    grew_each_round = bool(grew) and all(grew) and len(grew) == expected_rounds
+    ok = bool(log_exists and rounds_complete and grew_each_round)
+    return {
+        "ok": ok,
+        "log_exists": bool(log_exists),
+        "expected_rounds": int(expected_rounds),
+        "marks": list(marks),
+        "rounds_complete": rounds_complete,
+        "grew_each_round": grew_each_round,
+        "grew_flags": grew,
+    }
+
+
 def evaluate_leg(
     *,
     expect_off: bool,
@@ -144,17 +173,24 @@ def evaluate_leg(
     nontrigger_events: list[dict],
     play_events: list[dict],
     turns: list[dict],
+    evidence: dict,
 ) -> dict:
     """主判据（纯函数）。expect_off=False=图开启腿；True=kill-switch 腿。
 
     主判据（进退出码）：
+      两腿共用  evidence_ok（`probe_evidence` 的 ok——absence 判据的前提）
       图开启腿  jump_logged / trigger_turn_provider / nontrigger_silent
       kill 腿   killswitch_no_logs / killswitch_no_graph_turns
+    **absence-based 的三条（`nontrigger_silent`/`killswitch_no_logs`/
+    `killswitch_no_graph_turns`）在 `evidence_ok=False` 时恒 False**——否则
+    日志缺失/中途异常会以「窗口里什么都没有」空过成 PASS（review R1 假绿）。
+    正向判据（`jump_logged`/`trigger_turn_provider`）要真观测到事件才算，无需另加前提。
     信息位：play / play_miss / jump_noop 计数（罐头未物化是明确降级路径，不判 FAIL）。
     """
     all_events = trigger_events + nontrigger_events + play_events
     grows = graph_turn_rows(turns)
     play_kinds = [str(e.get("kind")) for e in play_events]
+    ev_ok = bool((evidence or {}).get("ok"))
     info = {
         "play_kinds": play_kinds,
         "play_miss": sum(1 for k in play_kinds if k == "play_miss"),
@@ -163,22 +199,25 @@ def evaluate_leg(
     }
     if expect_off:
         checks = {
-            "killswitch_no_logs": not all_events,
-            "killswitch_no_graph_turns": not grows,
+            "evidence_ok": ev_ok,
+            "killswitch_no_logs": ev_ok and not all_events,
+            "killswitch_no_graph_turns": ev_ok and not grows,
         }
     else:
         jumps = [e for e in trigger_events if str(e.get("kind")) == "jump"]
         checks = {
+            "evidence_ok": ev_ok,
             "jump_logged": any(_as_int(e.get("step"), -1) == target_step for e in jumps),
             "trigger_turn_provider": any(
                 g["provider"] == "graph-jump" and g["template_step"] == target_step
                 for g in grows
             ),
-            "nontrigger_silent": not nontrigger_events,
+            "nontrigger_silent": ev_ok and not nontrigger_events,
         }
     return {
         "checks": checks,
         "pass": all(checks.values()),
+        "evidence": evidence or {},
         "events": {
             "trigger": trigger_events,
             "nontrigger": nontrigger_events,
@@ -437,11 +476,18 @@ async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_
             pass
 
     turns = await erc.fetch_turns(call_id)
+    evidence = probe_evidence(
+        log_exists=erc.LOG_PATH.exists(),
+        marks=marks,
+        expected_rounds=len(rounds),
+    )
     windows = log_windows(marks)
     name_to_window = {name: windows[i] for i, (name, _) in enumerate(rounds) if i < len(windows)}
     trigger_events = parse_graph_events(name_to_window.get("trigger", []))
     nontrigger_events = parse_graph_events(name_to_window.get("nontrigger", []))
     play_events = parse_graph_events(name_to_window.get("play", []))
+    if not evidence["ok"]:
+        print(f"[flow-graph] 观测面不足 → absence 判据不计 PASS：{evidence}", flush=True)
 
     # 延迟/哑轮信息位（复用 soak 骨架，不进本探针退出码）。
     perceived: list[dict] = []
@@ -467,6 +513,7 @@ async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_
         nontrigger_events=nontrigger_events,
         play_events=play_events,
         turns=turns,
+        evidence=evidence,
     )
     understood = transcript_has_keyword(turns, TRIGGER_KEYWORDS)
     result = {
@@ -478,6 +525,7 @@ async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_
         "qa_id": qa_id,
         "graph_json": graph_json,
         "setup_ok": setup_ok,
+        "evidence": evidence,
         "trigger_text": trigger_text,
         "nontrigger_text": nontrigger_text,
         "trigger_understood": understood,
@@ -516,6 +564,10 @@ def print_leg(res: dict, budgets: dict[str, float]) -> None:
     print(f"  信息位：play_kinds={v['info']['play_kinds'] or '（无）'} "
           f"play_miss={v['info']['play_miss']} jump_noop={v['info']['jump_noop']}", flush=True)
     print(f"  触发转写可辨={res['trigger_understood']}", flush=True)
+    ev = res.get("evidence") or v.get("evidence") or {}
+    print(f"  观测面 evidence_ok={ev.get('ok')}（log_exists={ev.get('log_exists')} "
+          f"rounds_complete={ev.get('rounds_complete')} grew_each_round={ev.get('grew_each_round')} "
+          f"marks={ev.get('marks')}/{ev.get('expected_rounds')}轮）", flush=True)
     fa, pd = res["summary"]["first_audio"], res["summary"]["perceived"]
     if fa["n"]:
         print(f"  墙钟首声 n={fa['n']} p50={fa['p50']:.0f}ms max={fa['max']:.0f}ms "
@@ -540,6 +592,14 @@ def selftest() -> int:
              "gen": "llm", "template_step": step},
         ]
 
+    def _ev(*, log: bool = True, marks: list[int] | None = None) -> dict:
+        # 诚实路径：2 轮 → 3 个 mark（进房前 + 每轮后），每轮窗口都有新字节。
+        return probe_evidence(
+            log_exists=log,
+            marks=[100, 200, 300] if marks is None else marks,
+            expected_rounds=2,
+        )
+
     jump_ev = {"kind": "jump", "binding": "bnd_7e8f9a0b", "step": str(TARGET_STEP)}
     parsed = parse_graph_events([
         "2026-09-18 10:00:00,000 [INFO] FLOW_GRAPH jump binding=bnd_7e8f9a0b step=4",
@@ -551,25 +611,42 @@ def selftest() -> int:
             expect_off=False, target_step=TARGET_STEP,
             trigger_events=[jump_ev], nontrigger_events=[],
             play_events=[{"kind": "play_miss", "binding": "bnd_c1d2e3f4"}],
-            turns=_turns("graph-jump", TARGET_STEP))["pass"], True),
+            turns=_turns("graph-jump", TARGET_STEP), evidence=_ev())["pass"], True),
         ("graph-on 反例：无 jump 日志/无 provider", evaluate_leg(
             expect_off=False, target_step=TARGET_STEP,
             trigger_events=[], nontrigger_events=[], play_events=[],
-            turns=_turns("", TARGET_STEP))["pass"], False),
+            turns=_turns("", TARGET_STEP), evidence=_ev())["pass"], False),
         ("graph-on 反例：非触发轮出现 FLOW_GRAPH 行", evaluate_leg(
             expect_off=False, target_step=TARGET_STEP,
             trigger_events=[jump_ev],
             nontrigger_events=[{"kind": "jump_noop", "binding": "x"}],
-            play_events=[], turns=_turns("graph-jump", TARGET_STEP))["pass"], False),
+            play_events=[], turns=_turns("graph-jump", TARGET_STEP), evidence=_ev())["pass"], False),
         ("kill 腿正例：全程零图痕迹", evaluate_leg(
             expect_off=True, target_step=TARGET_STEP,
             trigger_events=[], nontrigger_events=[], play_events=[],
             turns=[{"role": "assistant", "provider": "", "gen": "llm",
-                    "template_step": 2, "transcript": "好的"}])["pass"], True),
+                    "template_step": 2, "transcript": "好的"}], evidence=_ev())["pass"], True),
         ("kill 腿反例：仍有图痕迹", evaluate_leg(
             expect_off=True, target_step=TARGET_STEP,
             trigger_events=[jump_ev], nontrigger_events=[], play_events=[],
-            turns=_turns("graph-jump", TARGET_STEP))["pass"], False),
+            turns=_turns("graph-jump", TARGET_STEP), evidence=_ev())["pass"], False),
+        # ---- review R1：absence-based 判据的观测前提（无观测不成 PASS）----
+        ("假绿闸：日志缺失 → kill 腿零痕迹不成立", evaluate_leg(
+            expect_off=True, target_step=TARGET_STEP,
+            trigger_events=[], nontrigger_events=[], play_events=[],
+            turns=[], evidence=_ev(log=False))["pass"], False),
+        ("假绿闸：marks 塌成一个（一轮未观测）→ kill 腿不成立", evaluate_leg(
+            expect_off=True, target_step=TARGET_STEP,
+            trigger_events=[], nontrigger_events=[], play_events=[],
+            turns=[], evidence=_ev(marks=[100]))["pass"], False),
+        ("假绿闸：中途异常少 mark → 非触发轮静默空过不成立", evaluate_leg(
+            expect_off=False, target_step=TARGET_STEP,
+            trigger_events=[jump_ev], nontrigger_events=[],
+            play_events=[], turns=_turns("graph-jump", TARGET_STEP),
+            evidence=_ev(marks=[100, 200]))["pass"], False),
+        ("probe_evidence 诚实路径 ok", _ev()["ok"], True),
+        ("probe_evidence 某轮零字节 → ok=False",
+         _ev(marks=[100, 100, 300])["ok"], False),
         ("parse_graph_events 拆词（play_miss 不误吃成 play）", parsed == [
             {"kind": "jump", "binding": "bnd_7e8f9a0b", "step": "4"},
             {"kind": "play_miss", "binding": "bnd_c1d2e3f4", "qa": "qa-1"},
