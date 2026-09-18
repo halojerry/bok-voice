@@ -395,7 +395,9 @@ export default function QaCanvasView(props: {
             // onDeleteIntent 的「连带绑定」=同一批上抛两次(page 两次读改写会互相打架)。
             // 意图删除语义已含连带绑定,故把源节点是本次被删意图的绑定边从删除集摘掉。
             const intentIds = new Set(delNodes.filter((n) => n.type === "intent").map((n) => n.id));
-            if (intentIds.size === 0) return { nodes: delNodes, edges: delEdges };
+            // 半接线护栏(Task 8 review):没有 onDeleteIntent 时意图删除语义不存在,摘绑定边会
+            // 让那批边既不走 onDisconnect 也不走 onDeleteIntent=静默丢;原样放行交给框架处理。
+            if (intentIds.size === 0 || !props.onDeleteIntent) return { nodes: delNodes, edges: delEdges };
             return {
               nodes: delNodes,
               edges: delEdges.filter(
