@@ -60,6 +60,8 @@ export interface GraphBinding {
   action: "play_qa" | "jump_step";
   qa_id?: string;
   step?: number;
+  /** Phase 3.3 追问链：仅 play_qa；1-based 步号，播完罐头当场跳到该步；缺省=无链。 */
+  then_jump?: number;
   priority: number;
   once: boolean;
   enabled: boolean;
@@ -69,6 +71,12 @@ export interface GraphDoc {
   intents: GraphIntent[];
   bindings: GraphBinding[];
 }
+
+/**
+ * 追问链第二边（Phase 3.3）画布展示开关：**默认关**——关=零视觉零行为变化（链只在
+ * 绑定行里读写）。开启前先按 deriveGraph 处的注释同步 qa-canvas-view 的 deletable 收窄。
+ */
+const THEN_JUMP_EDGE_ENABLED = false;
 
 /** 宽容解析（spec §7）：坏 JSON/版本不符/缺数组 → 空 doc，永不抛错。 */
 export function parseGraphDoc(raw: string | null | undefined): GraphDoc {
@@ -82,6 +90,34 @@ export function parseGraphDoc(raw: string | null | undefined): GraphDoc {
   } catch {
     return empty;
   }
+}
+
+// —— 追问链（Phase 3.3，spec §3）草稿读写双向纯函数 ——
+// 编辑器的加载/保存两侧都只经这两个函数碰 then_jump：加载把 `[1,max]` 收口成草稿值
+// （0=不跳），保存只在「play_qa 且 >0」时吐键。CP 严格校验（`validate_flow_graph`）对
+// jump_step 行带该键、非 int、越界 [1,999] 一律 400——保存侧绝不产这两种形状。
+// 纯函数层持有这对契约=node 测试面（page.tsx 的 BindingDraft 只是它的 UI 载体）。
+
+/** 绑定 → 草稿值：`0`=不跳；越界/坏值按当前真实步数收口（同 step 的 M28 姿势）。 */
+export function bindingThenJumpToDraft(raw: unknown, stepCount: number): number {
+  const n = Math.round(Number(raw));
+  const max = Math.max(Math.round(Number(stepCount)) || 0, 1);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(n, max);
+}
+
+/**
+ * 草稿 → 落库片段：仅 `action === "play_qa"` 且值 `>0` 时产出 `{ then_jump }`。
+ * 其余一切（jump_step 行、0/空/NaN）= `{}`——绝不写键，写了两条中任一条 CP 必 400。
+ */
+export function bindingThenJumpField(
+  action: "play_qa" | "jump_step",
+  thenJump: unknown,
+  stepCount: number,
+): { then_jump?: number } {
+  if (action !== "play_qa") return {};
+  const v = bindingThenJumpToDraft(thenJump, stepCount); // 坏值/0 → 0
+  return v > 0 ? { then_jump: v } : {};
 }
 
 export type CanvasIntentNode = {
@@ -256,6 +292,26 @@ export function deriveGraph(
       label: intent?.label || intent?.keywords?.[0] || "",
       data: { kind: "binding" },
     });
+    // 追问链第二边（Phase 3.3，可选展示，**默认关**）：play_qa 播完 → 跳到第 N 步。
+    // 关闭时 deriveGraph 输出与今逐字节同（test/qa-canvas.test.mjs 边缘数量断言不动）。
+    // id 前缀 thenjump: 令 bindingIdOfEdge 返 ""（删除路径安全 no-op）；开启时须把
+    // qa-canvas-view 的绑定边样式分支加 `deletable: canEditGraph && !String(e.id).startsWith("thenjump:")`
+    // ——链在绑定行里改，展示边不承担删除语义。
+    if (THEN_JUMP_EDGE_ENABLED && b.action === "play_qa" && Number(b.then_jump ?? 0) > 0) {
+      const jumpTo = Math.min(Math.max(Number(b.then_jump) - 1, 0), Math.max(steps.length - 1, 0));
+      const jumpId = `step:${jumpTo}`;
+      if (nodeIds.has(jumpId)) {
+        edges.push({
+          id: `thenjump:${b.id}`,
+          source: src,
+          target: jumpId,
+          sourceHandle: null,
+          targetHandle: null,
+          label: `播完→第 ${jumpTo + 1} 步`,
+          data: { kind: "binding" },
+        });
+      }
+    }
   }
   return { nodes: [...stepNodes, ...qaNodes, ...intentNodes], qaNodes, stepNodes, edges };
 }
