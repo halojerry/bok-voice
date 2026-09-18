@@ -25,7 +25,7 @@ const SOURCE_LABEL: Record<string, string> = { curated: "精选", mined: "挖掘
 
 // 拖拽柄外观(源=左/目标=右;边由柄锚定,无柄时 v12 报 008 且边不渲染)。
 const HANDLE_STYLE: CSSProperties = {
-  width: 8, height: 8, background: "var(--accent)", border: "1px solid var(--card-border)",
+  width: 8, height: 8, background: "var(--live)", border: "1px solid var(--card-border)",
 };
 
 function QaEntryNode({ data }: NodeProps) {
@@ -33,7 +33,7 @@ function QaEntryNode({ data }: NodeProps) {
   const dim = d.enabled === false;
   return (
     <div
-      className={`w-[280px] rounded-lg border bg-white/5 p-3 text-xs ${dim ? "opacity-50" : ""} ${d.isHead ? "border-(--accent)" : "border-(--card-border)"}`}
+      className={`w-[280px] rounded-lg border bg-muted/60 p-3 text-xs ${dim ? "opacity-50" : ""} ${d.isHead ? "border-(--live)" : "border-(--card-border)"}`}
       title={d.canEdit ? undefined : "共享条目由主管维护"}
     >
       {/* 柄始终渲染(v12 边锚定柄,缺柄=008 且簇/步骤边整体消失)。只读条目双向闸:
@@ -51,13 +51,13 @@ function QaEntryNode({ data }: NodeProps) {
       <p className="line-clamp-2 font-medium">{String(d.question_text ?? "(无问法)")}</p>
       <p className="mt-1 line-clamp-1 muted">{String(d.answer_text ?? "")}</p>
       <div className="mt-2 flex flex-wrap items-center gap-1">
-        <span className="rounded-sm bg-white/10 px-1 text-[10px]">{LANG_LABEL[String(d.lang ?? "zh")] ?? d.lang}</span>
-        <span className="rounded-sm bg-white/10 px-1 text-[10px]">命中 {Number(d.hit_count ?? 0)}</span>
-        {d.source && <span className="rounded-sm bg-white/10 px-1 text-[10px]">{SOURCE_LABEL[d.source] ?? d.source}</span>}
-        {d.canned === "missing" && <span className="rounded-sm bg-amber-400/20 px-1 text-[10px] text-amber-300">缺录音</span>}
-        {d.canned === "ok" && <span className="rounded-sm bg-emerald-400/20 px-1 text-[10px] text-emerald-300">录音✓</span>}
-        {d.enabled === false && <span className="rounded-sm bg-white/10 px-1 text-[10px]">停用</span>}
-        {!d.canEdit && <span className="rounded-sm bg-white/10 px-1 text-[10px]" title="共享只读">🔒</span>}
+        <span className="rounded-sm bg-muted px-1 text-[10px]">{LANG_LABEL[String(d.lang ?? "zh")] ?? d.lang}</span>
+        <span className="rounded-sm bg-muted px-1 text-[10px]">命中 {Number(d.hit_count ?? 0)}</span>
+        {d.source && <span className="rounded-sm bg-muted px-1 text-[10px]">{SOURCE_LABEL[d.source] ?? d.source}</span>}
+        {d.canned === "missing" && <span className="rounded-sm bg-amber-100 px-1 text-[10px] text-amber-700">缺录音</span>}
+        {d.canned === "ok" && <span className="rounded-sm bg-emerald-100 px-1 text-[10px] text-emerald-700">录音✓</span>}
+        {d.enabled === false && <span className="rounded-sm bg-muted px-1 text-[10px]">停用</span>}
+        {!d.canEdit && <span className="rounded-sm bg-muted px-1 text-[10px]" title="共享只读">🔒</span>}
       </div>
     </div>
   );
@@ -66,7 +66,7 @@ function QaEntryNode({ data }: NodeProps) {
 function QaStepNode({ data }: NodeProps) {
   const d = data as { index: number; goal: string; refFirstLine: string; virtual: boolean };
   return (
-    <div className={`w-[200px] rounded-lg border p-3 text-xs ${d.virtual ? "border-dashed border-(--card-border) muted" : "border-(--accent) bg-(--accent)/5"}`}>
+    <div className={`w-[200px] rounded-lg border p-3 text-xs ${d.virtual ? "border-dashed border-(--card-border) muted" : "border-(--live) bg-(--live-soft)"}`}>
       {/* 只作连线落点(挂步骤),不给 source 柄(连线只准从条目拖出);虚拟「全程通用」不接。 */}
       <Handle type="target" position={Position.Right} isConnectable={!d.virtual} style={HANDLE_STYLE} />
       <p className="font-medium">{d.virtual ? "全程通用" : `第 ${d.index + 1} 步 · ${d.goal}`}</p>
@@ -150,7 +150,7 @@ export default function QaCanvasView(props: {
             ...e,
             selectable: false,
             deletable: false,
-            style: { stroke: "#b6bfcc", strokeWidth: 2 },
+            style: { stroke: "var(--muted-foreground)", strokeWidth: 2 },
           };
         }
         return {
@@ -159,8 +159,8 @@ export default function QaCanvasView(props: {
           animated: e.data.kind === "step",
           // 内联 style 会盖掉 RF 的 .selected 高亮,选中反馈在此显式给出。
           style: e.data.kind === "cluster"
-            ? { stroke: "var(--accent)", strokeWidth: sel ? 3 : 1.5 }
-            : { stroke: sel ? "var(--accent)" : "#888", strokeDasharray: "4 3", strokeWidth: sel ? 2 : 1 },
+            ? { stroke: "var(--live)", strokeWidth: sel ? 3 : 1.5 }
+            : { stroke: sel ? "var(--live)" : "var(--muted-foreground)", strokeDasharray: "4 3", strokeWidth: sel ? 2 : 1 },
           labelStyle: { fontSize: 10 },
         };
       }),
@@ -204,7 +204,7 @@ export default function QaCanvasView(props: {
     <div className="space-y-2">
       <div className="flex flex-wrap items-center gap-2">
         <select
-          className="rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--accent)"
+          className="rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--live)"
           value={templateId}
           onChange={(e) => props.onTemplateChange(e.target.value)}
         >
@@ -215,7 +215,7 @@ export default function QaCanvasView(props: {
         {(["all", "zh", "cantonese", "en"] as const).map((k) => (
           <button
             key={k}
-            className={`btn-ghost text-xs ${langFilter === k ? "border-(--accent) text-accent" : "muted"}`}
+            className={`btn-ghost text-xs ${langFilter === k ? "border-(--live) text-(--live-ink)" : "muted"}`}
             onClick={() => setLangFilter(k)}
           >
             {k === "all" ? "全部" : LANG_LABEL[k]}
