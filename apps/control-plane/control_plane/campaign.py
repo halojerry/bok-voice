@@ -152,11 +152,13 @@ async def campaign_tick(repo=None, *, dispatcher: Dispatcher | None = None,
     # repo 归属（2026-09-18 连接池泄漏修复）：自建=本函数收口，注入=调用方所有
     # （既有单测跨轮复用同一注入 repo，不能替人 close）。
     owns_repo = repo is None
-    if owns_repo:
-        repo = _repo()
     dispatcher = dispatcher or _default_dispatcher
     out = {"harvested": 0, "started": 0, "finished": 0}
     try:
+        # 自建 repo 放 try 首行：_repo() 若抛（引擎劣化等）也落在 close-finally
+        # 管辖内，不留「建了没关」的死角（评审 Minor 收口）。
+        if owns_repo:
+            repo = _repo()
         for campaign in repo.list_campaigns("", status="running"):
             try:
                 await _tick_campaign(repo, campaign, dispatcher, out, now=now)
