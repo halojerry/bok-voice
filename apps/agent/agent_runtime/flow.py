@@ -963,6 +963,24 @@ class FlowController:
         self._just_advanced = True
         self._entered_by_jump = True
 
+    def apply_then_jump(self, then_jump_1based: int | None) -> bool:
+        """play_qa 绑定的答后跳转(spec Phase 3.3 §3):播完当场跳到 then_jump 步。
+
+        返回**是否实际位移**——调用方只在实际位移时打 `FLOW_GRAPH jump` 日志 + 调 spec
+        marker `_invalidate_stale_preemptive()`（未位移=零副作用，与 jump_step 分支
+        「未位移不烧 once」同纪律）。位移本身已由 `jump_to` 置好（`current`/
+        `_entered_by_jump`），**调用方不再渲染当前步**：播放分支以 `StopResponse` 收尾、
+        本轮冇 LLM 请求，渲染只会烧掉目标步首渲染账本（`_last_render_step`/
+        `_just_advanced`）令下一轮流程块退分支模式——渲染留给下一轮流程块首渲染
+        （底稿+【跳转进入】真被请求消费，2026-09-18 T2-R1）。
+        None/无步骤/closing/同位/越界钳到同位 全返 False。
+        """
+        if then_jump_1based is None:
+            return False
+        before = self.current
+        self.jump_to(int(then_jump_1based) - 1)   # 1-based → 0-based；钳制/closing 冻结在 jump_to 内
+        return self.current != before
+
     def apply_judge_verdict(self, verdict: str) -> None:
         """LLM 语义判定结果落状态(advance→推进;其它唔郁)。"""
         if verdict == CONFIRM:
