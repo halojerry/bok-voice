@@ -34,7 +34,8 @@ _JWT_ALGO = "HS256"
 JWT_TTL_S = 8 * 3600
 _SCRYPT_N, _SCRYPT_R, _SCRYPT_P = 2**14, 8, 1
 
-# 豁免路径：健康检查 / 登录本身 / 节点心跳与注册自鉴权 / LiveKit 服务端 webhook
+# 豁免路径：健康检查 / 登录本身 / 节点心跳与注册自鉴权 / 节点日志上报自鉴权 /
+# LiveKit 服务端 webhook
 #（webhook 由 LiveKit server 直调 CP，无用户也无机器 env，属基础设施通道；
 # API 文档不再豁免——auth-on 生产由 FastAPI 条件参数直接关闭）。
 _EXEMPT_PATHS = (
@@ -45,6 +46,9 @@ _EXEMPT_PATHS = (
     # 加固模式下由端点内的 license 闸把关（无 key 即 401），与 heartbeat 用
     # node_token 自鉴权同构——中间件不重复预拦。
     "/api/nodes/register",
+    # 日志上报（W2）同 heartbeat 自证模式：Bearer node_token，端点内 resolve。
+    # 仅精确路径——root 查看/下载端点（/api/nodes/{id}/logs）仍在 JWT 门禁内。
+    "/api/nodes/logs",
     "/api/webhook/livekit",
 )
 

@@ -18,6 +18,8 @@ build/
 data/vault/
 data/uploads/
 data/models/
+# 节点守护本地日志（node-agent W1 落盘；dev 误跑不进库）。
+logs/
 data/smoke-out/
 data/sidecar-*.log
 data/sidecar-*.pid

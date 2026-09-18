@@ -83,17 +83,22 @@ echo "==> [runtime] installing deps into standalone python ($RUNTIME_PY) …"
 "$RUNTIME_PY" -m pip install --upgrade pip
 REQ="requirements-runtime-mac.txt"
 EXTRA_INDEX=""
-if [ "$OS" = "win" ]; then
-  REQ="requirements-runtime-win.txt"
+if [ "$OS" = "win" ] || [ "$OS" = "linux" ]; then
+  # Linux 与 Windows 同走 CUDA torch 面（requirements-runtime-linux.txt）；
+  # 节点推理引擎（llama.cpp/vLLM）不在 pip 面内。
+  if [ "$OS" = "win" ]; then REQ="requirements-runtime-win.txt"; else REQ="requirements-runtime-linux.txt"; fi
   EXTRA_INDEX="--extra-index-url https://download.pytorch.org/whl/cu124"
 fi
 # shellcheck disable=SC2086
 "$RUNTIME_PY" -m pip install --no-cache-dir $EXTRA_INDEX -r "$REQ"
-if [ "$OS" = "win" ]; then
+if [ "$OS" = "win" ] || [ "$OS" = "linux" ]; then
   # qwen-asr pins transformers==4.57.6 (matches the file); qwen-tts pins
   # 4.57.3, so install it with --no-deps to break the unresolvable conflict.
+  # Linux 节点 qwen-asr 照装（CUDA ASR sidecar 用）；qwen-tts 不装（TTS 走云端）。
   "$RUNTIME_PY" -m pip install --no-cache-dir $EXTRA_INDEX "qwen-asr>=0.0.6"
-  "$RUNTIME_PY" -m pip install --no-cache-dir --no-deps $EXTRA_INDEX "qwen-tts>=0.1.1"
+  if [ "$OS" = "win" ]; then
+    "$RUNTIME_PY" -m pip install --no-cache-dir --no-deps $EXTRA_INDEX "qwen-tts>=0.1.1"
+  fi
 fi
 # Non-editable project installs (no CI-absolute .pth files; bundled source is
 # also reachable via PYTHONPATH).
