@@ -52,6 +52,45 @@ def test_parse_tolerant_skips_bad_items():
     assert doc.bindings == []  # 引用不存在的意图→解析期丢弃（运行时宽容优先于数据保真）
 
 
+def test_parse_tolerant_non_iterable_fields():
+    """字段形状坏（数字/布尔/对象等非 list）→ 整项跳过，绝不 TypeError（never-raise 契约）。"""
+    doc = parse_flow_graph(
+        '{"version":1,"intents":['
+        '{"id":"int_1a2b3c4d","keywords":5},'
+        '{"id":"int_2b3c4d5e","label":"ok","keywords":["k"],"steps":5}'
+        '],"bindings":[]}'
+    )
+    assert doc.intents == []  # 首项 keywords 非 list / 次项 steps 非 list → 两项各自整项跳过
+    # 布尔与对象同档（bool 是 int 子类，单列一条）
+    assert (
+        parse_flow_graph(
+            '{"version":1,"intents":[{"id":"int_3c4d5e6f","label":"b","keywords":true,"steps":[]}],"bindings":[]}'
+        ).intents
+        == []
+    )
+    assert (
+        parse_flow_graph(
+            '{"version":1,"intents":[{"id":"int_3c4d5e6f","label":"o","keywords":{"a":1},"steps":{"b":2}}],"bindings":[]}'
+        ).intents
+        == []
+    )
+    # 反向对照：字段缺省 / 为 null 属「空值」而非坏形状 → 保留该项，steps 空=全程生效
+    kept = parse_flow_graph('{"version":1,"intents":[{"id":"int_4d5e6f70","label":"ok","keywords":["k"]}],"bindings":[]}')
+    assert [i.id for i in kept.intents] == ["int_4d5e6f70"]
+    assert kept.intents[0].steps == []
+
+
+def test_parse_bytes_matches_str_form():
+    raw = _good_doc()
+    str_doc = parse_flow_graph(raw)
+    bytes_doc = parse_flow_graph(raw.encode("utf-8"))
+    assert bytes_doc == str_doc
+    assert [i.id for i in bytes_doc.intents] == ["int_1a2b3c4d", "int_2b3c4d5e"]
+    assert [b.id for b in bytes_doc.bindings] == ["bnd_7e8f9a0b", "bnd_c1d2e3f4"]
+    # 坏编码仍走宽容路径（替换字符→非 JSON→空图），绝不抛错
+    assert parse_flow_graph(b'\xff\xfe{"version":1}').intents == []
+
+
 def test_validate_strict_good_and_errors():
     assert validate_flow_graph(_good_doc()) == []
     assert validate_flow_graph("") == []  # 空串=未启用,合法

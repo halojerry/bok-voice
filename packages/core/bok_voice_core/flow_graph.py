@@ -75,14 +75,22 @@ def _as_int(value: object, default: int) -> int:
 
 
 def _parse_intent(raw: object) -> FlowIntent | None:
-    """单项宽容:缺 id/坏 id/非 dict → None(调用方跳过)。"""
+    """单项宽容:缺 id/坏 id/非 dict/字段形状坏 → None(调用方跳过)。"""
     if not isinstance(raw, dict):
         return None
     intent_id = str(raw.get("id") or "")
     if not _ID_RE.match(intent_id):
         return None
-    keywords = [str(k) for k in raw.get("keywords") or [] if str(k or "").strip()]
-    steps = sorted({_as_int(s, -1) for s in raw.get("steps") or [] if _as_int(s, -1) >= 1})
+    raw_keywords = raw.get("keywords")
+    raw_steps = raw.get("steps")
+    # 形状坏(存在的非 list:数字/布尔/对象等 truthy 非可迭代)→ 整项跳过,
+    # 与其它坏项同档;缺失/None 视为空值照旧(绝不抛 TypeError)
+    if raw_keywords is not None and not isinstance(raw_keywords, list):
+        return None
+    if raw_steps is not None and not isinstance(raw_steps, list):
+        return None
+    keywords = [str(k) for k in raw_keywords or [] if str(k or "").strip()]
+    steps = sorted({_as_int(s, -1) for s in raw_steps or [] if _as_int(s, -1) >= 1})
     return FlowIntent(
         id=intent_id,
         label=str(raw.get("label") or "")[:LABEL_MAX_CHARS],
@@ -116,6 +124,8 @@ def _parse_binding(raw: object) -> GraphBinding | None:
 
 def parse_flow_graph(raw: str | bytes | None) -> FlowGraphDoc:
     """宽容解析:永不抛错。整体坏(空/非 dict/版本不符)→空图;单项坏→逐项跳过。"""
+    if isinstance(raw, bytes):  # 与 validate_flow_graph 同款解码,bytes 形参不虚设
+        raw = raw.decode("utf-8", errors="replace")
     text = str(raw or "").strip()
     if not text:
         return FlowGraphDoc()
