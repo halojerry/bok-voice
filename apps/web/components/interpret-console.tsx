@@ -36,6 +36,7 @@ import {
   type RemoteTrackPublication,
 } from "livekit-client";
 import { useSession, useTranscriptions } from "@livekit/components-react";
+import { Ban, TriangleAlert } from "lucide-react";
 import { AgentSessionProvider } from "@/components/agents-ui/agent-session-provider";
 import { api, apiBase } from "@/lib/api";
 import { describeConnectError } from "@/lib/api-ready";
@@ -1065,7 +1066,7 @@ type LiveProps = {
 
 function Stat({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="rounded-md border border-(--card-border) bg-white/5 px-2 py-1.5">
+    <div className="rounded-md border border-(--card-border) bg-muted/60 px-2 py-1.5">
       <div className="text-[10px] uppercase tracking-wide text-(--stage-muted)">{label}</div>
       <div className="mt-0.5 flex items-center font-mono text-[12px]">{children}</div>
     </div>
@@ -1073,7 +1074,7 @@ function Stat({ label, children }: { label: string; children: React.ReactNode })
 }
 
 function Dot({ on }: { on: boolean }) {
-  return <span className={`mr-1.5 inline-block h-1.5 w-1.5 rounded-full ${on ? "bg-emerald-400" : "bg-neutral-500"}`} />;
+  return <span className={`mr-1.5 inline-block h-1.5 w-1.5 rounded-full ${on ? "bg-emerald-500" : "bg-neutral-500"}`} />;
 }
 
 function SessionClock({ startedAt }: { startedAt: number | null }) {
@@ -1248,18 +1249,18 @@ function ConsoleLive(p: LiveProps) {
       {p.roleFatal.map((m) => (
         <div
           key={m}
-          className="shrink-0 rounded-md border border-red-500/60 bg-red-500/10 px-3 py-2 text-xs leading-relaxed text-red-300"
+          className="shrink-0 rounded-md border border-red-500/60 bg-red-500/10 px-3 py-2 text-xs leading-relaxed text-red-600"
         >
-          ⛔ {m}
-          <span className="block text-red-200/80">这个组合下开传译只会产出错字幕，先改设备再启动。</span>
+          <Ban className="h-3.5 w-3.5" /> {m}
+          <span className="block text-red-600/80">这个组合下开传译只会产出错字幕，先改设备再启动。</span>
         </div>
       ))}
       {scriptWarnings.map((m) => (
         <div
           key={m}
-          className="shrink-0 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-200"
+          className="shrink-0 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-700"
         >
-          ⚠ {m}
+          <TriangleAlert className="h-3.5 w-3.5" /> {m}
         </div>
       ))}
       <div className="grid shrink-0 gap-4 md:grid-cols-2 xl:grid-cols-3">
@@ -1304,7 +1305,7 @@ function ConsoleLive(p: LiveProps) {
                 const fellBack = Boolean(sel) && sel !== live;
                 return (
                   <span key={who}>
-                    {who}→<span className={fellBack ? "text-amber-300" : ""}>{name}</span>
+                    {who}→<span className={fellBack ? "text-amber-700" : ""}>{name}</span>
                     {fellBack ? "（已回退系统默认）" : ""}
                     {"  "}
                   </span>
@@ -1326,7 +1327,7 @@ function ConsoleLive(p: LiveProps) {
               ).map(([who, lvl]) => (
                 <span key={who} className="inline-flex items-center gap-1">
                   {who}
-                  <span className="inline-block h-1.5 w-14 overflow-hidden rounded bg-white/10 align-middle">
+                  <span className="inline-block h-1.5 w-14 overflow-hidden rounded bg-muted align-middle">
                     <span
                       className={`block h-full transition-[width] duration-150 ${lvl >= 0.02 ? "bg-emerald-400" : "bg-neutral-500"}`}
                       style={{ width: `${lvl > 0 ? Math.min(100, Math.round(lvl * 900)) : 0}%` }}
@@ -1344,7 +1345,7 @@ function ConsoleLive(p: LiveProps) {
             <div className="grid grid-cols-2 gap-2">
               <label
                 className={`flex items-center gap-1.5 rounded-md border border-(--card-border) px-2 py-1.5 ${
-                  p.outputMode === "shared" ? "ring-1 ring-(--accent)" : ""
+                  p.outputMode === "shared" ? "ring-1 ring-(--live)" : ""
                 }`}
               >
                 <input type="radio" name="out-mode" checked={p.outputMode === "shared"} onChange={() => p.setOutputMode("shared")} />
@@ -1352,7 +1353,7 @@ function ConsoleLive(p: LiveProps) {
               </label>
               <label
                 className={`flex items-center gap-1.5 rounded-md border border-(--card-border) px-2 py-1.5 ${
-                  p.outputMode === "dual" ? "ring-1 ring-(--accent)" : ""
+                  p.outputMode === "dual" ? "ring-1 ring-(--live)" : ""
                 } ${p.canDual ? "" : "opacity-50"}`}
                 title={p.canDual ? "两人各戴一副耳机,分路独立输出" : "需要桌面 Chrome(setSinkId)"}
               >
@@ -1369,10 +1370,10 @@ function ConsoleLive(p: LiveProps) {
             {p.outputMode === "shared" ? (
               <p className="text-[10px] leading-relaxed text-(--stage-muted)">
                 双向译文都从<b>系统当前默认输出</b>出声;任何内核可用(Mac/Windows),跟系统走。当前=
-                <span className="text-amber-200">
+                <span className="text-amber-700">
                   {p.outDevices.find((d) => d.is_default)?.name ?? "未知设备"}
                 </span>
-                <span className="block text-amber-300/90">
+                <span className="block text-amber-700">
                   注意:这是 macOS/Windows 的默认输出，不是你在这里选的设备——蓝牙设备进出会让它自己跳走；
                   双音箱场景请改用「独立双输出」逐路指定。
                 </span>
@@ -1425,7 +1426,7 @@ function ConsoleLive(p: LiveProps) {
                 当前路由：我方→{p.outDevices.find((d) => d.id === p.meOutId)?.name ?? "系统默认"}（放对方原声）
                 · 对方→{p.outDevices.find((d) => d.id === p.othOutId)?.name ?? "系统默认"}（放我方译文）。
                 {(!p.meOutId || !p.othOutId) && (
-                  <span className="text-amber-300"> 有输出未指定＝该路走系统默认，两路会混进同一台设备！</span>
+                  <span className="text-amber-700"> 有输出未指定＝该路走系统默认，两路会混进同一台设备！</span>
                 )}
                 <span className="block">我方建议戴耳机：Chrome 回声消除只覆盖默认输出，双输出档外放对方原声可能串进我方麦。</span>
               </p>
@@ -1520,7 +1521,7 @@ function ConsoleLive(p: LiveProps) {
             清空字幕
           </button>
           {/* 结束按钮只在「已在退出中」时禁用(防 7 连发),连接/busy 中都保持可点。 */}
-          <button className="stage-btn-secondary mt-auto text-red-300" onClick={p.leave} disabled={p.leaving}>
+          <button className="stage-btn-secondary mt-auto text-red-600" onClick={p.leave} disabled={p.leaving}>
             {p.leaving ? "结束中…" : "结束一体台会话"}
           </button>
         </section>
@@ -1541,7 +1542,7 @@ function ConsoleLive(p: LiveProps) {
                 onClick={() => setFilter(v)}
                 className={`rounded-full px-2.5 py-1 text-[11px] ${
                   filter === v
-                    ? "bg-(--accent) font-medium text-(--accent-ink)"
+                    ? "bg-(--live-soft) font-medium text-(--live-ink)"
                     : "border border-(--card-border) text-(--stage-muted)"
                 }`}
               >
@@ -1573,8 +1574,8 @@ function ConsoleLive(p: LiveProps) {
                 <div
                   className={`max-w-[85%] rounded-lg px-3 py-2 text-[13px] leading-relaxed ${
                     who.kind === "dst"
-                      ? "border border-(--card-border) bg-white/5 text-(--foreground)"
-                      : "bg-(--accent) text-(--accent-ink)"
+                      ? "border border-(--card-border) bg-muted/60 text-(--foreground)"
+                      : "bg-(--live-soft) text-(--live-ink)"
                   }`}
                 >
                   <span className="mr-1.5 font-mono text-[10px] font-bold uppercase opacity-70">{who.text}</span>
@@ -1585,19 +1586,19 @@ function ConsoleLive(p: LiveProps) {
           })}
         </div>
         {liveBusy && (
-          <p className="shrink-0 text-[11px] text-amber-300">
+          <p className="shrink-0 text-[11px] text-amber-700">
             {p.othHeld ? "我方译文播报中 · 对方麦克风暂让" : "对方译文播报中 · 我方麦克风暂让"}
           </p>
         )}
-        {p.sameDeviceWarning && <p className="shrink-0 text-xs text-amber-300">{p.sameDeviceWarning}</p>}
+        {p.sameDeviceWarning && <p className="shrink-0 text-xs text-amber-700">{p.sameDeviceWarning}</p>}
         {(p.micSilent.me || p.micSilent.oth) && (
-          <p className="shrink-0 text-[11px] leading-relaxed text-amber-300">
+          <p className="shrink-0 text-[11px] leading-relaxed text-amber-700">
             {p.micSilent.me && p.micSilent.oth ? "两侧麦克风" : p.micSilent.me ? "我方麦克风" : "对方麦克风"}
             连续 5 秒没有电平——这支设备可能被别的页面/程序占用（蓝牙麦同一时刻只能给一个程序用），或它根本没在拾音。换一支设备，
             或关掉占用它的窗口/程序再试。
           </p>
         )}
-        {p.error && <p className="shrink-0 text-xs text-red-400">{p.error}</p>}
+        {p.error && <p className="shrink-0 text-xs text-red-600">{p.error}</p>}
       </section>
 
       {/* 大字幕窗(Windows 版 SubtitleWindow 的浏览器形态):置顶浮动、可拖动、

@@ -40,7 +40,7 @@ export default function LoginPage() {
     <main className="stage-shell flex min-h-screen w-full items-center justify-center px-6">
       <div className="w-full max-w-sm">
         <div className="mb-5 flex items-center gap-2.5">
-          <span className="flex h-9 w-9 items-center justify-center rounded-sm bg-(--stage-value) font-mono text-base font-bold text-[#01191c]">
+          <span className="flex h-9 w-9 items-center justify-center rounded-sm bg-(--stage-value) font-mono text-base font-bold text-white">
             B
           </span>
           <span className="text-[15px] font-medium tracking-tight">Bok Voice</span>
@@ -73,7 +73,7 @@ export default function LoginPage() {
             </label>
 
             {error && (
-              <p className="rounded-lg bg-red-500/10 p-2.5 text-sm text-red-300">{error}</p>
+              <p className="rounded-lg bg-red-500/10 p-2.5 text-sm text-red-600">{error}</p>
             )}
 
             <button
@@ -88,7 +88,7 @@ export default function LoginPage() {
 
         <p className="mt-4 text-center text-xs muted">
           本机单用户模式无需登录，
-          <Link href="/" className="text-accent hover:underline">
+          <Link href="/" className="text-(--live) hover:underline">
             直接返回首页
           </Link>
           。

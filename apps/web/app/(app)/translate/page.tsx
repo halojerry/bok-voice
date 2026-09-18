@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Plus } from "lucide-react";
 import { savedMicDevice } from "@/lib/audio";
 
 const WS_URL = process.env.NEXT_PUBLIC_TRANSLATION_WS_URL || "ws://127.0.0.1:8790";
@@ -209,7 +210,7 @@ export default function TranslatePage() {
             独立于客服 Agent 的 B 线：ASR → 原文字幕 → 翻译 → Qwen3-TTS → 播放/字幕
           </p>
         </div>
-        <span className={`font-mono text-xs ${wsState === "open" ? "text-(--stage-value)" : "text-red-300"}`}>
+        <span className={`font-mono text-xs ${wsState === "open" ? "text-(--stage-value)" : "text-red-600"}`}>
           WS {wsState.toUpperCase()} · {WS_URL}
         </span>
       </div>
@@ -234,7 +235,7 @@ export default function TranslatePage() {
             <option value="dashscope">DashScope Qwen-MT</option>
           </select>
         </label>
-        <button className="btn-ghost" onClick={addChannel}>+ 添加通道</button>
+        <button className="btn-ghost" onClick={addChannel}><Plus className="h-3.5 w-3.5" /> 添加通道</button>
         <span className="ml-auto font-mono text-xs text-(--stage-muted)">{runningCount} 通道运行中</span>
       </div>
 
@@ -262,7 +263,7 @@ export default function TranslatePage() {
             <div className="max-h-56 space-y-2 overflow-y-auto">
               {ch.subtitles.length === 0 && <p className="text-xs text-(--stage-muted)">等待字幕…</p>}
               {ch.subtitles.map((s, i) => (
-                <div key={`${s.sourceSeqId}-${i}`} className="rounded-lg border border-(--card-border) bg-black/20 p-3">
+                <div key={`${s.sourceSeqId}-${i}`} className="rounded-lg border border-(--card-border) bg-muted p-3">
                   <p className="text-sm text-(--stage-muted)">{s.source}</p>
                   <p className="mt-1 text-sm text-(--stage-value)">{s.translated}</p>
                 </div>
@@ -275,7 +276,7 @@ export default function TranslatePage() {
                 <span>backlog <b className="text-(--stage-value)">{ch.metrics.playableBacklogMs}ms</b></span>
                 <span>chase <b className="text-(--stage-value)">{ch.metrics.chaseState} ×{ch.metrics.chaseSpeed.toFixed(2)}</b></span>
                 <span>queued <b className="text-(--stage-value)">{ch.metrics.queuedAudioMs}ms</b></span>
-                <span>dropped <b className="text-red-300">{ch.metrics.droppedBlocks}块/{ch.metrics.droppedMs}ms</b></span>
+                <span>dropped <b className="text-red-600">{ch.metrics.droppedBlocks}块/{ch.metrics.droppedMs}ms</b></span>
               </div>
             )}
           </div>

@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Plus } from "lucide-react";
 import { api } from "@/lib/api";
 import { ErrorState, LoadingState } from "@/components/app-shell";
 import CannedAuditionCard from "@/components/canned-audition";
@@ -41,7 +42,7 @@ function FieldInput({
   onChange: (v: unknown) => void;
 }) {
   const base =
-    "w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)";
+    "w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)";
   if (field.type === "select") {
     const options = field.options ?? [];
     const isBool = options.some((o) => o.value === "true" || o.value === "false");
@@ -101,7 +102,7 @@ function ProviderCard({
       <div className="mt-3 space-y-2">
         <div>
           <select
-            className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+            className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
             value={provider}
             onChange={(e) => onChange({ ...value, provider: e.target.value })}
           >
@@ -114,7 +115,7 @@ function ProviderCard({
           {providerMeta?.hint && <p className="mt-1 text-xs muted">{providerMeta.hint}</p>}
         </div>
         {kind === "llm" && (provider === "local_openai" || provider === "mlx") && value.local_model ? (
-          <p className="rounded-lg bg-white/5 p-2 text-[11px] muted">
+          <p className="rounded-lg bg-muted/60 p-2 text-[11px] muted">
             本地模型切换需<b className="text-(--foreground)">重启本地服务</b>生效（`bok serve` 或点「本机桌面服务」重启）；重启后通话与蒸馏都用所选模型。
           </p>
         ) : null}
@@ -130,7 +131,7 @@ function ProviderCard({
         ))}
         {meta.fields.some((f) => f.advanced) && (
           <details className="rounded-lg border border-(--card-border) p-2 text-sm">
-            <summary className="cursor-pointer text-xs muted hover:text-accent">
+            <summary className="cursor-pointer text-xs muted hover:text-(--live)">
               高级（旧按语言分音色，仅兼容旧数据）
             </summary>
             <div className="mt-2 space-y-2">
@@ -191,7 +192,7 @@ function VoicePreview({ provider, fieldKey, voice }: { provider: string; fieldKe
         {busy ? "合成中…" : url ? "试听已选音色" : "试听"}
       </button>
       {url && <audio controls src={url} className="h-6 w-44" />}
-      {err && <span className="text-[11px] text-red-300">{err}</span>}
+      {err && <span className="text-[11px] text-red-600">{err}</span>}
     </div>
   );
 }
@@ -199,7 +200,7 @@ function VoicePreview({ provider, fieldKey, voice }: { provider: string; fieldKe
 /** 外呼（SIP）卡片：mode 决定后端；real 档才显示 trunk/鉴权字段组。 */
 function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: ProviderForm) => void }) {
   const base =
-    "mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)";
+    "mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)";
   const mode = String(value.mode ?? "mock");
   const set = (key: string, v: unknown) => onChange({ ...value, [key]: v });
   const numbers = Array.isArray(value.numbers) ? (value.numbers as string[]) : [];
@@ -367,7 +368,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
                 disabled={sites.length === 0}
               >
                 {sites.length === 0 ? (
-                  <option value="">（暂无站点——用下方「+ 新建站点」建一个）</option>
+                  <option value="">（暂无站点——用下方「新建站点」建一个）</option>
                 ) : (
                   sites.map((s) => (
                     <option key={String(s.id)} value={String(s.id)}>
@@ -384,7 +385,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
                   setShowSiteForm((v) => !v);
                 }}
               >
-                {showSiteForm ? "取消新建" : "+ 新建站点"}
+                {showSiteForm ? "取消新建" : <><Plus className="h-3.5 w-3.5" /> 新建站点</>}
               </button>
               {showSiteForm && (
                 <div className="mt-2 rounded-lg border border-(--card-border) p-2">
@@ -425,10 +426,10 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
                 {trunkBusy ? "注册中…" : "注册 trunk"}
               </button>
               {trunkNote && (
-                <p className={`mt-1 text-[11px] ${trunkNote.error ? "text-red-300" : "muted"}`}>{trunkNote.text}</p>
+                <p className={`mt-1 text-[11px] ${trunkNote.error ? "text-red-600" : "muted"}`}>{trunkNote.text}</p>
               )}
               {siteNote && (
-                <p className={`mt-1 text-[11px] ${siteNote.error ? "text-red-300" : "muted"}`}>{siteNote.text}</p>
+                <p className={`mt-1 text-[11px] ${siteNote.error ? "text-red-600" : "muted"}`}>{siteNote.text}</p>
               )}
             </div>
           </>
@@ -500,7 +501,7 @@ function AudioDevicesCard() {
           <span className="text-xs text-(--stage-muted)">麦克风（输入）</span>
           <div className="mt-1 flex gap-2">
             <select
-              className="flex-1 rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+              className="flex-1 rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               value={micId}
               onChange={(e) => { setMicId(e.target.value); saveMicDevice(e.target.value); }}
             >
@@ -521,7 +522,7 @@ function AudioDevicesCard() {
             </button>
           </div>
           {mic.length === 0 && (
-            <p className="mt-1 text-xs text-red-300">
+            <p className="mt-1 text-xs text-red-600">
               未检测到麦克风或未授权。请先点击「刷新」授权；若仍为空，到系统设置开启麦克风权限后重启应用。
             </p>
           )}
@@ -531,7 +532,7 @@ function AudioDevicesCard() {
           <span className="text-xs text-(--stage-muted)">扬声器 / 输出</span>
           {canSetOutput ? (
             <select
-              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               value={outId}
               onChange={(e) => {
                 const id = e.target.value;
@@ -693,7 +694,7 @@ function MinimaxClonePanel({ clones, onChange }: { clones: MinimaxClone[]; onCha
 
   return (
     <details className="rounded-lg border border-(--card-border) p-2 text-sm">
-      <summary className="cursor-pointer text-xs muted hover:text-accent">克隆我的声音（MiniMax 云端）</summary>
+      <summary className="cursor-pointer text-xs muted hover:text-(--live)">克隆我的声音（MiniMax 云端）</summary>
       <p className="mt-2 text-xs muted">
         念 10 秒~1 分钟干净人声（普通话/粤语样本均可），克隆成云端音色后可在分语言音色与
         同传会话中选用。<strong>克隆本身免费</strong>；MiniMax 规则：7 天内未用于合成会过期，
@@ -709,7 +710,7 @@ function MinimaxClonePanel({ clones, onChange }: { clones: MinimaxClone[]; onCha
             onChange={(e) => { const f = e.target.files?.[0]; if (f) setRefFile(f); }} />
         </label>
         <input
-          className="w-40 rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--accent)"
+          className="w-40 rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--live)"
           placeholder="标签（如：我的声音）"
           value={label}
           onChange={(e) => setLabel(e.target.value)}
@@ -724,17 +725,17 @@ function MinimaxClonePanel({ clones, onChange }: { clones: MinimaxClone[]; onCha
           {clones.map((c) => (
             <li key={c.voice_id} className="flex flex-wrap items-center gap-2 text-xs">
               <span className="font-medium">{c.label || c.voice_id}</span>
-              {!c.activated && <span className="rounded bg-amber-500/15 px-1 text-amber-500">未激活</span>}
+              {!c.activated && <span className="rounded bg-amber-100 px-1 text-amber-700">未激活</span>}
               <span className="muted">{c.voice_id}</span>
               <button className="btn-ghost px-1 py-0 text-xs" disabled={busy}
                 onClick={() => preview(c.voice_id, c.sample_lang || "zh")}>试听（激活）</button>
-              <button className="btn-ghost px-1 py-0 text-xs text-red-400" disabled={busy}
+              <button className="btn-ghost px-1 py-0 text-xs text-red-600" disabled={busy}
                 onClick={() => remove(c.voice_id)}>删除</button>
             </li>
           ))}
         </ul>
       )}
-      {err && <p className="mt-2 text-xs text-red-400">{err}</p>}
+      {err && <p className="mt-2 text-xs text-red-600">{err}</p>}
     </details>
   );
 }
@@ -770,7 +771,7 @@ function VoiceCard({ value, onChange }: { value: ProviderForm; onChange: (next: 
       <div className="mt-3 space-y-2">
         <div>
           <select
-            className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+            className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
             value={provider}
             onChange={(e) => onChange({ ...value, provider: e.target.value })}
           >
@@ -794,7 +795,7 @@ function VoiceCard({ value, onChange }: { value: ProviderForm; onChange: (next: 
         ))}
         {(rest.length > 0 || advanced.length > 0) && (
           <details className="rounded-lg border border-(--card-border) p-2 text-sm">
-            <summary className="cursor-pointer text-xs muted hover:text-accent">更多语音参数（服务地址 / 采样率 / 分语言音色）</summary>
+            <summary className="cursor-pointer text-xs muted hover:text-(--live)">更多语音参数（服务地址 / 采样率 / 分语言音色）</summary>
             <div className="mt-2 space-y-2">
               {[...rest, ...advanced].map((field) => (
                 <FieldRow
@@ -904,7 +905,7 @@ export default function SettingsPage() {
               <section className="card">
                 <span className="label">{POLICY_META.title}</span>
                 <select
-                  className="mt-3 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+                  className="mt-3 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
                   value={policyValue}
                   onChange={(e) => setForm({ ...form, policy: e.target.value })}
                 >
@@ -921,7 +922,7 @@ export default function SettingsPage() {
             <button className="btn-primary" onClick={save}>保存设置</button>
             <button className="btn-ghost" onClick={() => testHealth("asr")}>测试 ASR</button>
             <button className="btn-ghost" onClick={() => testHealth("tts")}>测试 TTS</button>
-            {ok && <span className="text-sm text-emerald-400">已保存。</span>}
+            {ok && <span className="text-sm text-emerald-600">已保存。</span>}
             {health && <span className="text-sm muted">{health}</span>}
           </div>
           {err && <div className="lg:col-span-2"><ErrorState message={err} /></div>}

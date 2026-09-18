@@ -482,9 +482,9 @@ export default function QaPage() {
     : tab === "mine"
       ? "你还没有个人条目，可在右侧新建。"
       : "暂无共享条目。";
-  const textarea = "w-full resize-none rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)";
-  const selectCls = "w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)";
-  const menuItemCls = "block w-full px-3 py-1.5 text-left text-xs hover:bg-white/10";
+  const textarea = "w-full resize-none rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)";
+  const selectCls = "w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)";
+  const menuItemCls = "block w-full px-3 py-1.5 text-left text-xs hover:bg-accent";
 
   return (
     <div className="space-y-4">
@@ -503,7 +503,7 @@ export default function QaPage() {
               ] as const).map(([key, label]) => (
                 <button
                   key={key}
-                  className={`btn-ghost text-xs ${tab === key ? "border-(--accent) text-accent" : "muted"}`}
+                  className={`btn-ghost text-xs ${tab === key ? "border-(--live) text-(--live-ink)" : "muted"}`}
                   onClick={() => setTab(key)}
                 >
                   {label}
@@ -515,7 +515,7 @@ export default function QaPage() {
             {([["list", "列表"], ["canvas", "画布"]] as const).map(([k, label]) => (
               <button
                 key={k}
-                className={`btn-ghost text-xs ${view === k ? "border-(--accent) text-accent" : "muted"}`}
+                className={`btn-ghost text-xs ${view === k ? "border-(--live) text-(--live-ink)" : "muted"}`}
                 onClick={() => setView(k)}
               >
                 {label}
@@ -570,7 +570,7 @@ export default function QaPage() {
                 const canEdit = isManager || mine;
                 const rowBusy = busy.startsWith(`${id}:`);
                 return (
-                  <div key={id} className="rounded-lg bg-white/5 p-4">
+                  <div key={id} className="rounded-lg bg-muted/60 p-4">
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
                         <p className="font-medium">{String(row.question_text ?? "(无问法)")}</p>
@@ -590,7 +590,7 @@ export default function QaPage() {
                               {row.enabled === false ? "启用" : "停用"}
                             </button>
                             <button
-                              className="btn-ghost text-xs text-red-300"
+                              className="btn-ghost text-xs text-red-600"
                               disabled={rowBusy}
                               onClick={() => void remove(row)}
                             >
@@ -598,7 +598,7 @@ export default function QaPage() {
                             </button>
                           </>
                         ) : (
-                          <span className="rounded-sm bg-white/10 px-1.5 py-0.5 text-[10px] muted">共享</span>
+                          <span className="rounded-sm bg-muted px-1.5 py-0.5 text-[10px] muted">共享</span>
                         )}
                       </div>
                     </div>
@@ -610,13 +610,13 @@ export default function QaPage() {
                       {String(row.voice_id ?? "") && ` · 音色 ${String(row.voice_id)}`}
                       {" · "}命中 {Number(row.hit_count ?? 0)} 次
                       {String(row.created_at ?? "") && ` · 创建 ${String(row.created_at).slice(0, 10)}`}
-                      {row.enabled === false && <span className="ml-2 text-amber-300/80">已停用</span>}
+                      {row.enabled === false && <span className="ml-2 text-amber-600">已停用</span>}
                     </p>
                     {isManager && (
                       <div className="mt-2 flex items-center gap-2 text-xs">
                         <span className="label">归属</span>
                         <select
-                          className="rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--accent)"
+                          className="rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--live)"
                           value={ownerId}
                           disabled={rowBusy}
                           title="归属：共享=全账号可用；选成员=仅该话务员可见"
@@ -647,7 +647,7 @@ export default function QaPage() {
           </div>
 
           <label className="block">
-            <span className="text-xs text-(--stage-muted)">客户问法</span>
+            <span className="text-xs text-muted-foreground">客户问法</span>
             <textarea
               className={`mt-1 h-20 ${textarea}`}
               value={form.question_text}
@@ -660,7 +660,7 @@ export default function QaPage() {
           </label>
 
           <label className="block">
-            <span className="text-xs text-(--stage-muted)">标准回答</span>
+            <span className="text-xs text-muted-foreground">标准回答</span>
             <textarea
               className={`mt-1 h-24 ${textarea}`}
               value={form.answer_text}
@@ -671,7 +671,7 @@ export default function QaPage() {
 
           <div className="grid grid-cols-2 gap-3">
             <label className="block">
-              <span className="text-xs text-(--stage-muted)">语言</span>
+              <span className="text-xs text-muted-foreground">语言</span>
               <select
                 className={`mt-1 ${selectCls}`}
                 value={form.lang}
@@ -681,7 +681,7 @@ export default function QaPage() {
               </select>
             </label>
             <label className="block">
-              <span className="text-xs text-(--stage-muted)">生效范围</span>
+              <span className="text-xs text-muted-foreground">生效范围</span>
               <select
                 className={`mt-1 ${selectCls}`}
                 value={form.scope}
@@ -695,7 +695,7 @@ export default function QaPage() {
 
           {form.scope === "step" && (
             <label className="block">
-              <span className="text-xs text-(--stage-muted)">第几步</span>
+              <span className="text-xs text-muted-foreground">第几步</span>
               <input
                 type="number"
                 min={1}
@@ -710,7 +710,7 @@ export default function QaPage() {
           )}
 
           <label className="block">
-            <span className="text-xs text-(--stage-muted)">音色覆盖（可选）</span>
+            <span className="text-xs text-muted-foreground">音色覆盖（可选）</span>
             <input
               className={`mt-1 ${selectCls}`}
               value={form.voice_id}
@@ -722,14 +722,14 @@ export default function QaPage() {
           <label className="flex items-center gap-1.5 text-[11px] muted">
             <input
               type="checkbox"
-              className="size-3 accent-(--accent)"
+              className="size-3 accent-(--live)"
               checked={form.enabled}
               onChange={(e) => setForm({ ...form, enabled: e.target.checked })}
             />
             启用（停用后通话不再命中该条目）
           </label>
 
-          {formErr && <p className="text-xs text-red-300">{formErr}</p>}
+          {formErr && <p className="text-xs text-red-600">{formErr}</p>}
           <div className="flex items-center gap-3">
             <button className="btn-primary" disabled={busy === "save"} onClick={() => void save()}>
               {editingId ? "保存修改" : "创建条目"}
@@ -751,7 +751,7 @@ export default function QaPage() {
                 {busy === `${editingId}:audition` ? "合成中…" : "试听"}
               </button>
             )}
-            {ok && <span className="text-sm text-emerald-400">已保存。</span>}
+            {ok && <span className="text-sm text-emerald-600">已保存。</span>}
           </div>
           {!isManager && !editingId && (
             <p className="text-[11px] leading-relaxed muted">
@@ -788,7 +788,7 @@ export default function QaPage() {
               </button>
             )}
             {canEditRow(menu.row) && (
-              <button className={`${menuItemCls} text-red-300`} onClick={() => { setMenu(null); void remove(menu.row); }}>
+              <button className={`${menuItemCls} text-red-600`} onClick={() => { setMenu(null); void remove(menu.row); }}>
                 删除
               </button>
             )}

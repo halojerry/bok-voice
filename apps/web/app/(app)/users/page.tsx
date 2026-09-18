@@ -5,6 +5,7 @@
 // root 账号只读展示（仅 root 可管理 root/admin），本页不提供跨主管操作。
 
 import { Fragment, useCallback, useEffect, useState } from "react";
+import { Plus } from "lucide-react";
 import { api, type UserRow } from "@/lib/api";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
 import { PAGE_KEYS, PAGE_LABELS, useSession, type PageKey } from "@/components/session-context";
@@ -14,9 +15,9 @@ const DEFAULT_PERMISSIONS: string[] = PAGE_KEYS.filter((k) => k !== "reports");
 
 const ROLE_LABEL: Record<string, string> = { root: "超级管理员", admin: "管理员", user: "话务员" };
 const ROLE_BADGE: Record<string, string> = {
-  root: "bg-amber-400/15 text-amber-300",
-  admin: "bg-sky-400/15 text-sky-300",
-  user: "bg-white/10 muted",
+  root: "bg-amber-100 text-amber-700",
+  admin: "bg-sky-100 text-sky-700",
+  user: "bg-muted muted",
 };
 
 type CreateForm = {
@@ -51,7 +52,7 @@ function PermissionChecks({
         <label key={k} className={`flex items-center gap-1.5 text-xs ${disabled ? "muted" : ""}`}>
           <input
             type="checkbox"
-            className="size-3 accent-(--accent)"
+            className="size-3 accent-(--live)"
             checked={value.includes(k)}
             disabled={disabled}
             onChange={(e) => onChange(e.target.checked ? [...value, k] : value.filter((x) => x !== k))}
@@ -218,7 +219,7 @@ export default function UsersPage() {
     );
   }
 
-  const input = "w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)";
+  const input = "w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)";
 
   return (
     <div className="space-y-4">
@@ -236,13 +237,13 @@ export default function UsersPage() {
               setNotice("");
             }}
           >
-            + 新建员工
+            <Plus className="h-3.5 w-3.5" /> 新建员工
           </button>
         )}
       </div>
 
       {err && <ErrorState message={err} />}
-      {notice && <p className="text-sm text-emerald-400">{notice}</p>}
+      {notice && <p className="text-sm text-emerald-600">{notice}</p>}
 
       {createOpen && (
         <section className="card space-y-3">
@@ -315,7 +316,7 @@ export default function UsersPage() {
                 : "管理员默认拥有全部页面权限，无需勾选。"}
             </p>
           </div>
-          {createErr && <p className="text-xs text-red-300">{createErr}</p>}
+          {createErr && <p className="text-xs text-red-600">{createErr}</p>}
           <div className="flex items-center gap-2">
             <button className="btn-primary text-xs" disabled={createBusy} onClick={() => void create()}>
               {createBusy ? "创建中…" : "创建员工"}
@@ -353,12 +354,12 @@ export default function UsersPage() {
                       <td className="py-1.5 font-mono text-xs">{u.username}</td>
                       <td>{u.display_name || "—"}</td>
                       <td>
-                        <span className={`rounded-sm px-1.5 py-0.5 text-[10px] ${ROLE_BADGE[u.role] ?? "bg-white/10 muted"}`}>
+                        <span className={`rounded-sm px-1.5 py-0.5 text-[10px] ${ROLE_BADGE[u.role] ?? "bg-muted muted"}`}>
                           {ROLE_LABEL[u.role] ?? u.role}
                         </span>
                       </td>
                       <td>
-                        <span className={u.status === "disabled" ? "text-xs text-amber-300/80" : "text-xs muted"}>
+                        <span className={u.status === "disabled" ? "text-xs text-amber-700" : "text-xs muted"}>
                           {u.status === "disabled" ? "停用" : "正常"}
                         </span>
                       </td>
@@ -368,7 +369,7 @@ export default function UsersPage() {
                             <span className="text-xs muted">无</span>
                           ) : (
                             perms.map((k) => (
-                              <span key={k} className="rounded-sm bg-white/10 px-1.5 py-0.5 text-[10px] muted">
+                              <span key={k} className="rounded-sm bg-muted px-1.5 py-0.5 text-[10px] muted">
                                 {PAGE_LABELS[k as PageKey] ?? k}
                               </span>
                             ))
@@ -414,7 +415,7 @@ export default function UsersPage() {
                       </td>
                     </tr>
                     {permEditId === u.id && (
-                      <tr className="border-t border-(--card-border) bg-white/5">
+                      <tr className="border-t border-(--card-border) bg-muted/60">
                         <td colSpan={7} className="py-2">
                           <span className="label">页面权限 · {u.username}</span>
                           <div className="mt-1.5">
@@ -430,13 +431,13 @@ export default function UsersPage() {
                       </tr>
                     )}
                     {pwEditId === u.id && (
-                      <tr className="border-t border-(--card-border) bg-white/5">
+                      <tr className="border-t border-(--card-border) bg-muted/60">
                         <td colSpan={7} className="py-2">
                           <span className="label">重置密码 · {u.username}</span>
                           <div className="mt-1.5 flex flex-wrap items-center gap-2">
                             <input
                               type="password"
-                              className="w-56 rounded-lg border border-(--card-border) bg-transparent px-3 py-1.5 text-sm outline-hidden focus:border-(--accent)"
+                              className="w-56 rounded-lg border border-(--card-border) bg-transparent px-3 py-1.5 text-sm outline-hidden focus:border-(--live)"
                               value={pwDraft}
                               onChange={(e) => {
                                 setPwDraft(e.target.value);
@@ -450,7 +451,7 @@ export default function UsersPage() {
                             <button className="btn-ghost text-xs" onClick={() => { setPwEditId(""); setPwDraft(""); setPwErr(""); }}>
                               取消
                             </button>
-                            {pwErr && <span className="text-xs text-red-300">{pwErr}</span>}
+                            {pwErr && <span className="text-xs text-red-600">{pwErr}</span>}
                           </div>
                         </td>
                       </tr>

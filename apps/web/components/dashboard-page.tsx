@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
+import { ArrowRight, Plus } from "lucide-react";
 import { api } from "@/lib/api";
 import { AppShell, ErrorState, LoadingState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
@@ -221,9 +222,9 @@ function DashboardContent() {
               <div className="mt-3 space-y-2.5">
                 {buckets.map(([name, count]) => (
                   <div key={name} className="flex items-center gap-3">
-                    <div className="h-2 flex-1 rounded bg-white/5">
+                    <div className="h-2 flex-1 rounded bg-muted/60">
                       <div
-                        className="h-2 rounded bg-accent"
+                        className="h-2 rounded bg-live"
                         style={{ width: `${Math.round((count / maxBucket) * 100)}%` }}
                       />
                     </div>
@@ -287,7 +288,7 @@ function DashboardContent() {
             <section className="card">
               <div className="flex items-center justify-between">
                 <span className="label">最近会话</span>
-                <Link href="/calls" className="text-xs text-accent">查看全部 →</Link>
+                <Link href="/calls" className="text-xs text-(--live)">查看全部 <ArrowRight className="h-3.5 w-3.5" /></Link>
               </div>
               <div className="mt-3 space-y-2">
                 {calls.slice(0, 6).map((call) => (
@@ -296,7 +297,7 @@ function DashboardContent() {
                     // 静态导出无法为真实 call id 生成 /calls/<id> 路由：统一去 /calls 列表，
                     // 在列表里点「进入」会内嵌工作台打开该会话。
                     href="/calls"
-                    className="flex items-center justify-between rounded-lg bg-white/5 px-4 py-3 hover:bg-white/10"
+                    className="flex items-center justify-between rounded-lg bg-muted/60 px-4 py-3 hover:bg-accent"
                   >
                     <div className="min-w-0">
                       <p className="truncate text-sm font-medium">{String(call.object_id ?? "-")}</p>
@@ -304,7 +305,7 @@ function DashboardContent() {
                         {String(call.status ?? "-")} · {String(call.mode ?? "-")} · {String(call.language ?? "-")}
                       </p>
                     </div>
-                    <span className="text-accent">查看 →</span>
+                    <span className="text-(--live)">查看 <ArrowRight className="h-3.5 w-3.5" /></span>
                   </Link>
                 ))}
                 {calls.length === 0 && <p className="text-sm muted">暂无会话，从「新建通话」开始。</p>}
@@ -314,13 +315,13 @@ function DashboardContent() {
             <section className="card">
               <span className="label">快捷入口</span>
               <div className="mt-3 grid grid-cols-1 gap-2">
-                <Link href="/calls/new" className="btn-primary w-full">+ 新建通话</Link>
+                <Link href="/calls/new" className="btn-primary w-full"><Plus className="h-3.5 w-3.5" /> 新建通话</Link>
                 <Link href="/objects" className="btn-ghost w-full">对象管理</Link>
                 <Link href="/knowledge" className="btn-ghost w-full">知识库</Link>
                 <Link href="/supervisor" className="btn-ghost w-full">主管台</Link>
                 <Link href="/settings" className="btn-ghost w-full">设置</Link>
               </div>
-              <div className="mt-4 rounded-lg bg-white/5 p-3 text-xs muted">
+              <div className="mt-4 rounded-lg bg-muted/60 p-3 text-xs muted">
                 控制面状态：{health === false ? "离线" : health === true ? "在线" : "未知"}
               </div>
             </section>

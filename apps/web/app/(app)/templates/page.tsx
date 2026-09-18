@@ -355,7 +355,7 @@ export default function TemplatesPage() {
       ? rows
       : rows.filter((r) => (scopeTab === "mine" ? ownerIdOf(r) === session.user_id : ownerIdOf(r) === ""));
 
-  const textarea = "w-full resize-none rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)";
+  const textarea = "w-full resize-none rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)";
 
   return (
     <div>
@@ -373,7 +373,7 @@ export default function TemplatesPage() {
             ] as const).map(([key, label]) => (
               <button
                 key={key}
-                className={`btn-ghost text-xs ${scopeTab === key ? "border-(--accent) text-accent" : "muted"}`}
+                className={`btn-ghost text-xs ${scopeTab === key ? "border-(--live) text-(--live-ink)" : "muted"}`}
                 onClick={() => setScopeTab(key)}
               >
                 {label}
@@ -408,14 +408,14 @@ export default function TemplatesPage() {
                         ? "我的"
                         : "他人";
                 return (
-                  <div key={id} className="rounded-lg bg-white/5 p-4">
+                  <div key={id} className="rounded-lg bg-muted/60 p-4">
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
                         <p className="flex flex-wrap items-center gap-2 font-medium">
                           {String(row.name ?? "-")}
                           <span
                             className={`rounded-sm px-1.5 py-0.5 text-[10px] font-normal ${
-                              ownerId === "" ? "bg-white/10 muted" : "bg-sky-400/15 text-sky-300"
+                              ownerId === "" ? "bg-muted muted" : "bg-sky-100 text-sky-700"
                             }`}
                           >
                             {ownerLabel}
@@ -440,7 +440,7 @@ export default function TemplatesPage() {
                           编辑
                         </button>
                         <button
-                          className="btn-ghost text-xs text-red-300"
+                          className="btn-ghost text-xs text-red-600"
                           disabled={!canEdit}
                           title={canEdit ? undefined : "共享话术由主管维护"}
                           onClick={() => remove(id)}
@@ -457,7 +457,7 @@ export default function TemplatesPage() {
                             <div className="space-y-1">
                               {s.map((st, i) => (
                                 <p key={i} className="muted">
-                                  <span className="font-bold text-accent">{i + 1}.</span>{" "}
+                                  <span className="font-bold text-(--live-ink)">{i + 1}.</span>{" "}
                                   {st.goal || "(无目标)"}
                                 </p>
                               ))}
@@ -486,14 +486,14 @@ export default function TemplatesPage() {
         <section className="card space-y-3">
           <span className="label">{editingId ? "编辑模板" : "新建模板"}</span>
           <input
-            className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+            className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
             value={form.name}
             onChange={(e) => setForm({ ...form, name: e.target.value })}
             placeholder="模板名，例如：顺丰理赔·分步（粤语）"
           />
 
           {/* 分步话术(主编辑方式):1.2.3.4 逐步推进,每步填 目标 + 参考说法 */}
-          <div className="rounded-lg border border-(--accent)/40 p-3">
+          <div className="rounded-lg border border-(--live)/40 p-3">
             <div className="flex items-center justify-between">
               <span className="label">分步话术（推荐 · 通话按步骤逐步推进，不会一口气讲完）</span>
               <button
@@ -505,7 +505,7 @@ export default function TemplatesPage() {
             </div>
             <p className="mt-1 whitespace-pre-line text-[11px] leading-relaxed muted">{STEPS_HINT}</p>
             <p className="mt-1 text-[11px] leading-relaxed muted">
-              参考说法可分行写分支：<span className="text-accent">如果客户… → 就…</span>，AI 会看客户实际反应挑对应分支回答。
+              参考说法可分行写分支：<span className="text-(--live-ink)">如果客户… → 就…</span>，AI 会看客户实际反应挑对应分支回答。
             </p>
             {steps.length === 0 && (
               <p className="mt-1 text-[11px] muted">
@@ -514,17 +514,17 @@ export default function TemplatesPage() {
             )}
             <div className="mt-2 space-y-3">
               {steps.map((st, i) => (
-                <div key={i} className="rounded-lg border border-(--card-border) bg-white/5 p-2">
+                <div key={i} className="rounded-lg border border-(--card-border) bg-muted/60 p-2">
                   <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-accent">第 {i + 1} 步</span>
+                    <span className="text-xs font-bold text-(--live-ink)">第 {i + 1} 步</span>
                     <div className="flex gap-1">
                       <button className="btn-ghost px-1.5 py-0 text-xs" disabled={i === 0} onClick={() => setSteps((s) => { const n = [...s]; [n[i - 1], n[i]] = [n[i], n[i - 1]]; return n; })}>↑</button>
                       <button className="btn-ghost px-1.5 py-0 text-xs" disabled={i === steps.length - 1} onClick={() => setSteps((s) => { const n = [...s]; [n[i + 1], n[i]] = [n[i], n[i + 1]]; return n; })}>↓</button>
-                      <button className="btn-ghost px-1.5 py-0 text-xs text-red-300" onClick={() => setSteps((s) => s.filter((_, j) => j !== i))}>删</button>
+                      <button className="btn-ghost px-1.5 py-0 text-xs text-red-600" onClick={() => setSteps((s) => s.filter((_, j) => j !== i))}>删</button>
                     </div>
                   </div>
                   <input
-                    className="mt-1.5 w-full rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--accent)"
+                    className="mt-1.5 w-full rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--live)"
                     placeholder="这一步要达成的目标(如:确认包裹是不是{姓名}本人的)"
                     value={st.goal}
                     onChange={(e) => setSteps((s) => s.map((x, j) => (j === i ? { ...x, goal: e.target.value } : x)))}
@@ -538,7 +538,7 @@ export default function TemplatesPage() {
                   <label className="mt-1 flex items-center gap-1.5 text-[11px] muted">
                     <input
                       type="checkbox"
-                      className="size-3 accent-(--accent)"
+                      className="size-3 accent-(--live)"
                       checked={Boolean(st.say)}
                       onChange={(e) => setSteps((s) => s.map((x, j) => (j === i ? { ...x, say: e.target.checked } : x)))}
                     />
@@ -548,7 +548,7 @@ export default function TemplatesPage() {
                     <label className="mt-1 flex items-center gap-1.5 text-[11px] muted">
                       情绪
                       <select
-                        className="rounded-lg border border-(--card-border) bg-transparent px-1.5 py-0.5 text-xs outline-hidden focus:border-(--accent)"
+                        className="rounded-lg border border-(--card-border) bg-transparent px-1.5 py-0.5 text-xs outline-hidden focus:border-(--live)"
                         value={st.emotion ?? ""}
                         onChange={(e) => setSteps((s) => s.map((x, j) => (j === i ? { ...x, emotion: e.target.value } : x)))}
                       >
@@ -587,7 +587,7 @@ export default function TemplatesPage() {
                 <p className="text-[11px] leading-relaxed muted">
                   从表格（Excel/Google Sheets/CSV）粘贴：<b>每行一步</b>，第一列=目标，第二列=参考说法。
                   支持带表头（列名：目标/参考说法）或不带表头（直接两列）。参考说法里可写
-                  <span className="text-accent">如果客户… → 就…</span>分支与{"{变量}"}。
+                  <span className="text-(--live-ink)">如果客户… → 就…</span>分支与{"{变量}"}。
                 </p>
                 <textarea
                   className={`mt-1.5 h-24 ${textarea} text-xs`}
@@ -628,7 +628,7 @@ export default function TemplatesPage() {
           <label className="block">
             <span className="text-xs text-(--stage-muted)">语气覆盖（可选，优先于人设）</span>
             <input
-              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               value={form.tone_override}
               onChange={(e) => setForm({ ...form, tone_override: e.target.value })}
               placeholder="如：专业、温和、简洁"
@@ -637,7 +637,7 @@ export default function TemplatesPage() {
           <label className="block">
             <span className="text-xs text-(--stage-muted)">识别热词（可选，本套话术专属）</span>
             <input
-              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               value={form.hotwords}
               onChange={(e) => setForm({ ...form, hotwords: e.target.value })}
               placeholder="如：順豐速運, 集運, 理賠（逗号/顿号分隔）"
@@ -659,7 +659,7 @@ export default function TemplatesPage() {
           <div className="flex items-center gap-3">
             <button className="btn-primary" onClick={save}>{editingId ? "保存修改" : "创建模板"}</button>
             {editingId && <button className="btn-ghost" onClick={() => { setEditingId(null); setForm(EMPTY); setSteps([]); }}>取消</button>}
-            {ok && <span className="text-sm text-emerald-400">已保存。</span>}
+            {ok && <span className="text-sm text-emerald-600">已保存。</span>}
           </div>
         </section>
       </div>

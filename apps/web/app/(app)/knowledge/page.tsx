@@ -98,12 +98,12 @@ export default function KnowledgePage() {
               {docs.slice(0, showAllDocs ? docs.length : 50).map((doc) => {
                 const id = String(doc.id ?? "");
                 return (
-                  <div key={id} className="flex items-start justify-between gap-3 rounded-lg bg-white/5 px-4 py-3">
+                  <div key={id} className="flex items-start justify-between gap-3 rounded-lg bg-muted/60 px-4 py-3">
                     <div className="min-w-0">
                       <p className="text-xs muted">{String(doc.path ?? doc.source ?? "片段")}</p>
                       <p className="mt-1 line-clamp-3 text-sm">{String(doc.text ?? doc.content ?? "")}</p>
                     </div>
-                    <button className="shrink-0 text-xs text-red-300" onClick={() => remove(id)}>删除</button>
+                    <button className="shrink-0 text-xs text-red-600" onClick={() => remove(id)}>删除</button>
                   </div>
                 );
               })}
@@ -121,7 +121,7 @@ export default function KnowledgePage() {
             <span className="label">语义检索</span>
             <div className="mt-3 flex gap-2">
               <input
-                className="flex-1 rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+                className="flex-1 rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
                 placeholder="检索产品知识…"
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
@@ -132,7 +132,7 @@ export default function KnowledgePage() {
             <div className="mt-4 space-y-2">
               {results.length === 0 && <p className="text-sm muted">输入关键词检索当前账号知识库。</p>}
               {results.map((r, i) => (
-                <div key={i} className="rounded-lg bg-white/5 p-3 text-sm">
+                <div key={i} className="rounded-lg bg-muted/60 p-3 text-sm">
                   <p className="muted">{String(r.source ?? r.title ?? "片段")}</p>
                   <p className="mt-1 line-clamp-3">{String(r.text ?? r.content ?? r.snippet ?? "")}</p>
                 </div>
@@ -143,7 +143,7 @@ export default function KnowledgePage() {
           <div className="card">
             <span className="label">导入 Markdown</span>
             <textarea
-              className="mt-3 h-44 w-full resize-none rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+              className="mt-3 h-44 w-full resize-none rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               placeholder="粘贴文档 / 产品资料…"
               value={content}
               onChange={(e) => setContent(e.target.value)}
@@ -160,7 +160,7 @@ export default function KnowledgePage() {
                 填入示例
               </button>
             </div>
-            {ok && <p className="mt-2 text-sm text-emerald-400">导入成功。</p>}
+            {ok && <p className="mt-2 text-sm text-emerald-600">导入成功。</p>}
           </div>
 
           <div className="card">

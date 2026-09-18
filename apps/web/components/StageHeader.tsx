@@ -97,7 +97,7 @@ export function StageHeader({ status }: { status?: ReactNode }) {
   return (
     <header className="mx-auto flex h-16 w-full max-w-7xl items-center justify-between gap-4 px-6 lg:px-10">
       <Link href="/" className="flex shrink-0 items-center gap-2.5">
-        <span className="flex h-9 w-9 items-center justify-center rounded-sm bg-(--stage-value) font-mono text-base font-bold text-[#01191c]">
+        <span className="flex h-9 w-9 items-center justify-center rounded-sm bg-(--stage-value) font-mono text-base font-bold text-white">
           B
         </span>
         <span className="text-[15px] font-medium tracking-tight">Bok Voice</span>

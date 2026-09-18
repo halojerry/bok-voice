@@ -240,7 +240,7 @@ export default function ObjectsPage() {
         <section className="card">
           <div className="mb-4 flex items-center gap-2">
             <input
-              className="min-w-0 flex-1 rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+              className="min-w-0 flex-1 rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               placeholder="搜索对象…"
               value={q}
               onChange={(e) => setQ(e.target.value)}
@@ -255,7 +255,7 @@ export default function ObjectsPage() {
                 粘贴表格(支持 CSV/制表符,首行为表头):<b>姓名</b>、<b>快递单号</b>、<b>物流公司</b>、<b>收货地址</b>、电话(后两列可选)
               </p>
               <textarea
-                className="mt-2 h-28 w-full resize-none rounded-lg border border-(--card-border) bg-transparent px-3 py-2 font-mono text-xs outline-hidden focus:border-(--accent)"
+                className="mt-2 h-28 w-full resize-none rounded-lg border border-(--card-border) bg-transparent px-3 py-2 font-mono text-xs outline-hidden focus:border-(--live)"
                 placeholder={"姓名,快递单号,物流公司,收货地址,电话\n张三,SF1234567890,顺丰,广东省深圳市南山区科技园路1号,13800000000\n李四,YT9988776655,圆通,广州市天河区体育西路100号"} 
                 value={importText}
                 onChange={(e) => setImportText(e.target.value)}
@@ -267,10 +267,10 @@ export default function ObjectsPage() {
             </div>
           )}
           {err && <ErrorState message={err} />}
-          {bulkErr && <p className="mb-2 text-xs text-red-300">{bulkErr}</p>}
+          {bulkErr && <p className="mb-2 text-xs text-red-600">{bulkErr}</p>}
           {dialMsg && (
             <p className="mb-2 text-xs muted">
-              {dialMsg} · <Link href="/calls" className="text-accent">查看通话</Link>
+              {dialMsg} · <Link href="/calls" className="text-(--live)">查看通话</Link>
             </p>
           )}
           {loading ? (
@@ -283,7 +283,7 @@ export default function ObjectsPage() {
                 <label className="flex cursor-pointer items-center gap-1.5 muted">
                   <input
                     type="checkbox"
-                    className="accent-(--accent)"
+                    className="accent-(--live)"
                     checked={filtered.every((r) => selected.has(String(r.id ?? r.object_id ?? "")))}
                     onChange={toggleAllVisible}
                   />
@@ -291,7 +291,7 @@ export default function ObjectsPage() {
                 </label>
                 <span className="muted">已选 {selected.size}</span>
                 {selected.size > 0 && (
-                  <button className="btn-ghost text-red-300" onClick={deleteSelected}>
+                  <button className="btn-ghost text-red-600" onClick={deleteSelected}>
                     删除所选（{selected.size}）
                   </button>
                 )}
@@ -300,10 +300,10 @@ export default function ObjectsPage() {
                 {filtered.map((r) => {
                   const id = String(r.id ?? r.object_id ?? "");
                   return (
-                    <div key={id} className="flex items-center gap-3 rounded-lg bg-white/5 px-4 py-3">
+                    <div key={id} className="flex items-center gap-3 rounded-lg bg-muted/60 px-4 py-3">
                       <input
                         type="checkbox"
-                        className="shrink-0 accent-(--accent)"
+                        className="shrink-0 accent-(--live)"
                         checked={selected.has(id)}
                         onChange={() => toggleOne(id)}
                       />
@@ -323,7 +323,7 @@ export default function ObjectsPage() {
                     <div className="flex shrink-0 gap-2">
                       {String(r.phone ?? "").trim() !== "" && (
                         <button
-                          className="btn-ghost text-xs text-accent"
+                          className="btn-ghost text-xs text-(--live)"
                           disabled={dialingId === id}
                           onClick={() => dialNow(id)}
                           title="用该对象的电话立即外呼（建 outbound 通话并派 AI 客服，用设置里的 SIP/SIP 站点）"
@@ -333,13 +333,13 @@ export default function ObjectsPage() {
                       )}
                       <Link
                         href={`/calls/new?object=${encodeURIComponent(String(r.id))}`}
-                        className="btn-ghost text-xs text-accent"
+                        className="btn-ghost text-xs text-(--live)"
                         title="用该对象发起一通新通话（工作台预选）"
                       >
                         发起新通话
                       </Link>
                       <button className="btn-ghost text-xs" onClick={() => edit(r as unknown as ObjectRow)}>编辑</button>
-                      <button className="btn-ghost text-xs text-red-300" onClick={() => remove(id)}>删除</button>
+                      <button className="btn-ghost text-xs text-red-600" onClick={() => remove(id)}>删除</button>
                     </div>
                     </div>
                   );
@@ -353,7 +353,7 @@ export default function ObjectsPage() {
           <span className="label">{editingId ? "编辑对象" : "新建对象"}</span>
           <div className="mt-3 space-y-3">
             <input
-              className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+              className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               placeholder="姓名"
               value={form.display_name}
               onChange={(e) => setForm({ ...form, display_name: e.target.value })}
@@ -379,39 +379,39 @@ export default function ObjectsPage() {
               </select>
             </div>
             <input
-              className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+              className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               placeholder="电话（可选）"
               value={form.phone}
               onChange={(e) => setForm({ ...form, phone: e.target.value })}
             />
             <input
-              className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+              className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               placeholder="联系渠道（微信 / WhatsApp，留空按语言默认；话术里用 {聯絡方式} 引用）"
               value={form.contact_channel}
               onChange={(e) => setForm({ ...form, contact_channel: e.target.value })}
             />
             <div className="grid grid-cols-2 gap-3">
               <input
-                className="rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+                className="rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
                 placeholder="快递单号"
                 value={form.tracking_no}
                 onChange={(e) => setForm({ ...form, tracking_no: e.target.value })}
               />
               <input
-                className="rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+                className="rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
                 placeholder="物流公司"
                 value={form.courier}
                 onChange={(e) => setForm({ ...form, courier: e.target.value })}
               />
             </div>
             <input
-              className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+              className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               placeholder="收货地址（可选，话术里可用 {收货地址} 引用）"
               value={form.address}
               onChange={(e) => setForm({ ...form, address: e.target.value })}
             />
             <textarea
-              className="h-28 w-full resize-none rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+              className="h-28 w-full resize-none rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               placeholder="背景 / 角色说明…"
               value={form.background}
               onChange={(e) => setForm({ ...form, background: e.target.value })}
