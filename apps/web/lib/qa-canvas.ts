@@ -53,6 +53,12 @@ export interface GraphIntent {
   keywords: string[];
   steps: number[]; // 1-based；空=全程
   enabled: boolean;
+  /**
+   * 判据（Phase 3.4，spec §4）：关键词未中时的背景 LLM 判定 prompt 片段。写清什么算命中、
+   * 什么不算（正反例）；命中下一轮激活该意图的绑定。空/缺省=仅关键词确定性命中（落库 JSON
+   * 与 3.4 之前逐字节同）。prompt 长度 1..400 字（上界=CP `JUDGE_PROMPT_MAX_CHARS`）。
+   */
+  judge?: { prompt: string };
 }
 export interface GraphBinding {
   id: string;
@@ -171,6 +177,26 @@ export function bindingFromDraft(
   }
   const chain = bindingThenJumpField("play_qa", row.then_jump, stepCount);
   return { ...common, action: "play_qa", qa_id: String(row.qa_id ?? ""), ...chain };
+}
+
+// —— 判据（Phase 3.4，spec §4）草稿读写纯函数 ——
+// 编辑器保存路径的唯一投影：`intentJudgeField` 把判据文本域的原文折成 `judge` 值（trim 后
+// 空 → `undefined`），调用方在意图对象字面量里写 `judge: intentJudgeField(judgeText)`——
+// JSON.stringify 会省掉值为 undefined 的键，故无判据意图落库的 graph_json 与 3.4 之前
+// **逐字节同**；清空既有判据也走这里覆盖掉原值（缺这条=打开旧判据删掉保存仍在）。
+// 超长（>400 字）由编辑器表单**可见报错**拦下，纯函数不截断（静默截断=偷偷改客户判据）。
+
+/** CP `flow_graph.JUDGE_PROMPT_MAX_CHARS`：judge.prompt 的合法上界，表单校验同源引用。 */
+export const JUDGE_PROMPT_MAX_CHARS = 400;
+
+/**
+ * 判据文本域草稿 → `judge` 值：trim 后非空才产出 `{ prompt }`，空/纯空白 = `undefined`
+ * （落库时该键整个消失）。prompt 不做截断——上界由表单按 `JUDGE_PROMPT_MAX_CHARS` 报错
+ * 把关，越界值绝不静默改写。
+ */
+export function intentJudgeField(judgeText: unknown): { prompt: string } | undefined {
+  const prompt = String(judgeText ?? "").trim();
+  return prompt ? { prompt } : undefined;
 }
 
 export type CanvasIntentNode = {

@@ -8,7 +8,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { api, authHeaders, type UserRow } from "@/lib/api";
 import {
-  bindingFromDraft, bindingThenJumpToDraft,
+  bindingFromDraft, bindingThenJumpToDraft, intentJudgeField, JUDGE_PROMPT_MAX_CHARS,
   parseGraphDoc, parseTemplateSteps, resolveClusterTarget, revertCluster,
   type FlowStep, type GraphBinding, type GraphDoc, type GraphIntent,
 } from "@/lib/qa-canvas";
@@ -106,6 +106,8 @@ function displayStep(row: QaRow): number {
 // → bindingThenJumpField 把死这两条），加载侧按真实步数收口（bindingThenJumpToDraft）。
 // 编辑是**逐字段重建**落库：submit 对两种动作都只调 bindingFromDraft（唯一重建入口），
 // 不进草稿的键=保存即蒸发（勘误预检 4：打开既有追问链改个名字保存=静默删链）。
+// Phase 3.4 判据（judge.prompt）同表加一条：≤400 字、在场必须是 `{prompt:string}`（否则 400）——
+// 保存侧走 `intentJudgeField`（trim 后空 → undefined=JSON 省键），空判据意图零字节变化。
 
 /** 模板行（画布脊柱输入 + 意图图归属判定）：owner_user_id 由 CP 列表带出（B3 owner 语义）。 */
 type QaTemplateRow = TemplateRow & { owner_user_id?: string };
@@ -1269,7 +1271,7 @@ export default function QaPage() {
  * 二者缺一即「开着窗、画布上意图节点还选中着 → 一个退格静默删掉意图+绑定」。
  *
  * 校验口径与 CP validate_flow_graph 逐条对齐(label 1-64 / keywords 1-32 项且单项 ≤64 /
- * priority 0-1000 / jump_step 步号 1..真实步数 / play_qa 必带 qa_id):前端先拦,不让必 400 的
+ * judge.prompt 1-400 字 / priority 0-1000 / jump_step 步号 1..真实步数 / play_qa 必带 qa_id):前端先拦,不让必 400 的
  * 请求上线。另有**第三态护栏**(review R1 Fault 3):「全程」未勾且一个步号都没勾 → 硬报错留窗,
  * 绝不落库 `steps: []`(运行时把空 steps 读成**全程**,与操作者「收窄」的预期正好相反)。
  */
@@ -1289,6 +1291,9 @@ function IntentEditorModal(props: {
   const stepCount = steps.length;
   const [label, setLabel] = useState(intent.label);
   const [keywordsText, setKeywordsText] = useState(intent.keywords.join("，"));
+  // 判据（Phase 3.4）：关键词未中时的背景 LLM 判定 prompt 片段；空=仅关键词确定性命中。
+  // 加载侧直读 `judge?.prompt`（坏形状在 lib 层已宽容解析丢弃，编辑器只面对合法 doc）。
+  const [judgeText, setJudgeText] = useState(intent.judge?.prompt ?? "");
   const [allSteps, setAllSteps] = useState(intent.steps.length === 0);
   // 越界步号(话术步数被改小后)不进编辑态:chips 只画真实步,保存时随之剔除(下方提示)。
   const [scopeSteps, setScopeSteps] = useState<number[]>(() =>
@@ -1349,6 +1354,12 @@ function IntentEditorModal(props: {
     if (keywords.length > 32) return setError("触发关键词最多 32 个。");
     const overlong = keywords.find((k) => k.length > 64);
     if (overlong) return setError(`单个关键词最长 64 字，请改短：「${overlong.slice(0, 10)}…」`);
+    // 判据（Phase 3.4）：最长 400 字（与 CP `JUDGE_PROMPT_MAX_CHARS` 同源契约）——超长**可见
+    // 报错**、不静默截断；空/纯空白合法（=仅关键词确定性命中，落库省掉 judge 键）。
+    const judgePrompt = judgeText.trim();
+    if (judgePrompt.length > JUDGE_PROMPT_MAX_CHARS) {
+      return setError(`判据最长 ${JUDGE_PROMPT_MAX_CHARS} 字（当前 ${judgePrompt.length} 字），请精简。`);
+    }
     // 生效步骤第三态护栏(review R1 Fault 3):「全程」未勾且一个步骤都没勾 → 落库 steps=[]
     // 会被运行时读成**全程**(pick_graph_action:空 steps=不限步),语义正好反了——操作者以为
     // 收窄了,实际放开了。越界步号档同理:chips 不画那个步号 → 选择为空 → 同一错误,绝不静默
@@ -1372,7 +1383,13 @@ function IntentEditorModal(props: {
     }
     setSaving(true);
     const ok = await props.onConfirm(
-      { ...intent, label: name.slice(0, 64), keywords, steps: allSteps ? [] : scopeSteps, enabled },
+      {
+        ...intent,
+        label: name.slice(0, 64), keywords, steps: allSteps ? [] : scopeSteps, enabled,
+        // 判据（Phase 3.4）：唯一保存路径投影——trim 后空产出 undefined，JSON.stringify 省掉
+        // 该键（无判据意图与 3.4 之前逐字节同）；清空既有判据=在此覆盖掉原值。
+        judge: intentJudgeField(judgeText),
+      },
       nextBindings,
     );
     setSaving(false);
@@ -1432,6 +1449,22 @@ function IntentEditorModal(props: {
             />
             <span className="mt-1 block text-[11px] leading-relaxed muted">
               客户原话里按字面出现任一关键词即命中（不认同义改写，按客户实际说法写）；标点与空格不影响匹配；最多 32 个、单个 ≤64 字。
+            </span>
+          </label>
+
+          {/* 判据（Phase 3.4）：关键词未中时的背景 LLM 判定片段——模糊轮补充，不替代关键词
+              （keywords 仍必填非空）。空=仅关键词确定性命中；超长由 submit 可见报错拦下。 */}
+          <label className="block">
+            <span className="text-xs text-muted-foreground">判据（可选）</span>
+            <textarea
+              className="textarea mt-1 min-h-[72px] text-xs"
+              value={judgeText}
+              disabled={readOnly}
+              onChange={(e) => { setJudgeText(e.target.value); setError(""); }}
+              placeholder="如：客户表达不满或要求说法，但没说出上面的关键词时算命中；客户只是催件、问进度不算。"
+            />
+            <span className="mt-1 block text-[11px] leading-relaxed muted">
+              判据即 prompt 片段：写清什么算命中、什么不算（正反例）。留空=仅关键词确定性命中。关键词未中时由后台大模型按判据评估，命中下一轮生效。
             </span>
           </label>
 
