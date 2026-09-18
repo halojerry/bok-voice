@@ -145,8 +145,8 @@ class QaIndex:
                 score += 0.4 * (len(q_low) / max(1, len(e_q)))
             if score > top_score:
                 top_score = score
-            if score < thr:
-                continue  # 阈值先行——优先级只在过关者中排,不过关永不出线
+            if score <= 0.0 or score < thr:
+                continue  # 阈值先行(且零分永不入选,保 thr=0 边角与旧档逐字节同)——优先级只在过关者中排
             key = (_entry_priority(entry), -score) if use_priority else (-score,)
             if best_key is None or key < best_key:
                 best, best_key, best_score = entry, key, score

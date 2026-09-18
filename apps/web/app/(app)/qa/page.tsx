@@ -487,8 +487,8 @@ export default function QaPage() {
       return;
     }
     const step = Math.max(1, Math.round(Number(form.step) || 1));
-    // 优先级钳 [0,1000]（CP 同款）；NaN 回默认 10。0 是合法值。
-    const prioRaw = Math.round(Number(form.priority));
+    // 优先级钳 [0,1000]（CP 同款）；空串/NaN 回默认 10。0 是合法值。
+    const prioRaw = form.priority.trim() === "" ? 10 : Math.round(Number(form.priority));
     const priority = Number.isFinite(prioRaw) ? Math.max(0, Math.min(prioRaw, 1000)) : 10;
     const payload: Record<string, unknown> = {
       question_text: question,
