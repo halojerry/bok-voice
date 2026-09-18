@@ -65,6 +65,9 @@ class GraphBinding:
     action: str = ""
     qa_id: str = ""  # action=play_qa
     step: int = 0  # action=jump_step,1-based
+    # Phase 3.3 追问链:play_qa 播完当场跳到的步(1-based);None=无链(Phase 2 行为)。
+    # 与 step 的钳制不同——可选字段,坏值丢字段不清退绑定(见 _then_jump_of 注释)。
+    then_jump: int | None = None
     priority: int = DEFAULT_PRIORITY  # 小者先
     once: bool = False
     enabled: bool = True
@@ -119,6 +122,20 @@ def _parse_intent(raw: object) -> FlowIntent | None:
     )
 
 
+def _then_jump_of(raw: dict, action: str) -> int | None:
+    """追问链目标(1-based):仅 play_qa 收;非 int(bool 是 int 子类要单列)/越界 → None。
+
+    形态坏=丢字段(绑定本体退 Phase 2 行为)——最保守且绝无静默改目标;`step` 走钳制是
+    因为它是 jump_step 的必填字段(钳制保可用性),两者不对称是刻意的。
+    """
+    if action != ACTION_PLAY_QA or "then_jump" not in raw:
+        return None
+    value = raw.get("then_jump")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 1 <= value <= STEP_MAX else None
+
+
 def _parse_binding(raw: object) -> GraphBinding | None:
     if not isinstance(raw, dict):
         return None
@@ -135,6 +152,7 @@ def _parse_binding(raw: object) -> GraphBinding | None:
         action=action,
         qa_id=str(raw.get("qa_id") or ""),
         step=max(1, min(_as_int(raw.get("step"), 0), STEP_MAX)),
+        then_jump=_then_jump_of(raw, action),
         priority=max(PRIORITY_MIN, min(_as_int(raw.get("priority"), DEFAULT_PRIORITY), PRIORITY_MAX)),
         once=_as_bool(raw.get("once"), default=False),
         enabled=_as_bool(raw.get("enabled")),
@@ -255,6 +273,16 @@ def validate_flow_graph(raw: str | bytes) -> list[str]:
             errors.append(f"bindings[{idx}].action must be one of {sorted(ACTIONS)}: {action!r}")
         if action == ACTION_PLAY_QA and not str(item.get("qa_id") or "").strip():
             errors.append(f"bindings[{idx}] action=play_qa requires qa_id")
+        # Phase 3.3 追问链:then_jump 仅 play_qa 合法;[1,999] 闭区间;非 int(含 bool)拒。
+        if action in (ACTION_PLAY_QA, ACTION_JUMP_STEP) and "then_jump" in item:
+            if action != ACTION_PLAY_QA:
+                errors.append(
+                    f"bindings[{idx}].then_jump is only valid for action=play_qa: {action!r}"
+                )
+            else:
+                _tj = item["then_jump"]
+                if isinstance(_tj, bool) or not isinstance(_tj, int) or not (1 <= _tj <= STEP_MAX):
+                    errors.append(f"bindings[{idx}].then_jump must be int in [1,{STEP_MAX}]")
         if action == ACTION_JUMP_STEP:
             step = item.get("step")
             if not isinstance(step, int) or isinstance(step, bool) or step < 1 or step > STEP_MAX:

@@ -8,6 +8,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { api, authHeaders, type UserRow } from "@/lib/api";
 import {
+  bindingFromDraft, bindingThenJumpToDraft,
   parseGraphDoc, parseTemplateSteps, resolveClusterTarget, revertCluster,
   type FlowStep, type GraphBinding, type GraphDoc, type GraphIntent,
 } from "@/lib/qa-canvas";
@@ -100,6 +101,11 @@ function displayStep(row: QaRow): number {
 // packages/core/flow_graph.py validate_flow_graph（保存严格校验）——前端必须在**保存前**
 // 满足同一组约束（label 1-64 字、keywords 非空 ≤32 项且每项 ≤64 字、step 1-999、
 // priority 0-1000、play_qa 必带 qa_id、id 形如 int_/bnd_+8 位小写 hex），否则 PUT 必 400。
+// Phase 3.3 追问链（then_jump）同表加一条：**仅 play_qa 可带**（jump_step 带=400）、int 且
+// 1-999（越界=400）——故保存侧只在 play_qa 且值 >0 时写键（lib/qa-canvas.ts bindingFromDraft
+// → bindingThenJumpField 把死这两条），加载侧按真实步数收口（bindingThenJumpToDraft）。
+// 编辑是**逐字段重建**落库：submit 对两种动作都只调 bindingFromDraft（唯一重建入口），
+// 不进草稿的键=保存即蒸发（勘误预检 4：打开既有追问链改个名字保存=静默删链）。
 
 /** 模板行（画布脊柱输入 + 意图图归属判定）：owner_user_id 由 CP 列表带出（B3 owner 语义）。 */
 type QaTemplateRow = TemplateRow & { owner_user_id?: string };
@@ -174,6 +180,8 @@ type BindingDraft = {
   action: "play_qa" | "jump_step";
   qa_id: string;
   step: number;
+  /** 追问链（Phase 3.3）：0=不跳（仅 play_qa 有意义；jump_step 行恒 0，落库也不写键）。 */
+  then_jump: number;
   priority: number;
   once: boolean;
   enabled: boolean;
@@ -186,6 +194,9 @@ function bindingToDraft(b: GraphBinding, stepCount: number): BindingDraft {
     action,
     qa_id: String(b.qa_id ?? ""),
     step: clampInt(Number(b.step ?? 1), 1, Math.max(stepCount, 1)),
+    // 追问链（Phase 3.3）：0=不跳；越界按当前真实步数收口（同 step 的 M28 姿势）。
+    // 这条是勘误预检 4 的承重件——缺了它，打开既有链保存一次=静默删链。
+    then_jump: bindingThenJumpToDraft(b.then_jump, stepCount),
     priority: clampInt(Number(b.priority ?? 10), 0, 1000),
     once: b.once === true,
     enabled: b.enabled !== false,
@@ -1313,6 +1324,7 @@ function IntentEditorModal(props: {
         action: "play_qa", // 默认动作=播快答(不依赖步数,零步骤话术也能建)
         qa_id: "",
         step: clampInt(1, 1, Math.max(stepCount, 1)),
+        then_jump: 0, // 追问链默认不跳（Phase 3.3）
         priority: 10, // spec:优先级默认 10(小者先)
         once: false,
         enabled: true,
@@ -1347,22 +1359,16 @@ function IntentEditorModal(props: {
     const nextBindings: GraphBinding[] = [];
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
-      const common = {
-        id: row.id,
-        intent: intent.id,
-        priority: clampInt(row.priority, 0, 1000),
-        once: row.once,
-        enabled: row.enabled,
-      };
       if (row.action === "play_qa") {
         if (!qaRows.some((q) => String(q.id) === row.qa_id)) {
           return setError(`第 ${i + 1} 条绑定还没有选择要播的快答条目。`);
         }
-        nextBindings.push({ ...common, action: "play_qa", qa_id: row.qa_id });
-      } else {
-        if (stepCount < 1) return setError("该话术还没有步骤，无法使用「跳到某一步」。");
-        nextBindings.push({ ...common, action: "jump_step", step: clampInt(row.step, 1, stepCount) });
+      } else if (stepCount < 1) {
+        return setError("该话术还没有步骤，无法使用「跳到某一步」。");
       }
+      // 逐字段重建的唯一入口（勘误预检 4）：两种动作都走纯函数，页面不再自拼字段——
+      // then_jump 的写键规则（仅 play_qa 且 >0）在 bindingFromDraft 内，漏键面被测试钉死。
+      nextBindings.push(bindingFromDraft(row, intent.id, stepCount));
     }
     setSaving(true);
     const ok = await props.onConfirm(
@@ -1506,19 +1512,43 @@ function IntentEditorModal(props: {
                       <option value="jump_step">跳到某步</option>
                     </select>
                     {row.action === "play_qa" ? (
-                      <select
-                        className="select min-w-[180px] flex-1 text-xs"
-                        value={row.qa_id}
-                        disabled={readOnly}
-                        onChange={(e) => { patchRow(row.id, { qa_id: e.target.value }); setError(""); }}
-                      >
-                        <option value="">选择快答条目…</option>
-                        {qaRows.map((q) => (
-                          <option key={String(q.id)} value={String(q.id)}>
-                            {String(q.question_text ?? "(无问法)")}
-                          </option>
-                        ))}
-                      </select>
+                      <>
+                        <select
+                          className="select min-w-[180px] flex-1 text-xs"
+                          value={row.qa_id}
+                          disabled={readOnly}
+                          onChange={(e) => { patchRow(row.id, { qa_id: e.target.value }); setError(""); }}
+                        >
+                          <option value="">选择快答条目…</option>
+                          {qaRows.map((q) => (
+                            <option key={String(q.id)} value={String(q.id)}>
+                              {String(q.question_text ?? "(无问法)")}
+                            </option>
+                          ))}
+                        </select>
+                        {/* 追问链（Phase 3.3）：播完罐头当场跳到第 N 步；空=不跳（不写键）。 */}
+                        {stepCount >= 1 && (
+                          <label className="flex items-center gap-1 text-[11px] muted">
+                            播完后跳到
+                            <input
+                              type="number"
+                              min={1}
+                              max={stepCount}
+                              placeholder="不跳"
+                              className="input w-16 px-1.5 py-0.5 text-xs"
+                              value={row.then_jump === 0 ? "" : row.then_jump}
+                              disabled={readOnly}
+                              onChange={(e) => {
+                                // 输入中途（空串/单减号）Number() 可能出 NaN——受控 number 收到
+                                // NaN 会打 React 警告并清空显示，这里统一落回 0（不跳）。
+                                const n = Number(e.target.value);
+                                patchRow(row.id, { then_jump: Number.isFinite(n) ? n : 0 });
+                              }}
+                            />
+                            步
+                          </label>
+                        )}
+                      </>
                     ) : (
                       <select
                         className="select text-xs"
