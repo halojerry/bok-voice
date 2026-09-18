@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
+from bok_voice_core.flow_graph import validate_flow_graph
 from bok_voice_core.providers import BusinessRepository
 from bok_voice_core.policies import select_session_manifest
 from bok_voice_core.qa_text import mine_qa_pairs
@@ -3686,6 +3687,13 @@ def delete_persona(persona_id: str, request: Request) -> dict:
     return {"persona_id": persona_id, "deleted": True}
 
 
+def _validate_graph_field(raw: str) -> list[str]:
+    """模板 graph_json 保存校验:空串=未启用放行;非法返回错误列表(→400)。"""
+    if not str(raw or "").strip():
+        return []
+    return validate_flow_graph(str(raw))
+
+
 @app.get("/api/templates")
 def list_templates(request: Request, account_id: str = "acc-001", owner_scope: str | None = None) -> list[dict]:
     # B3 owner 维度同 qa-entries：user=自己的+共享，admin/root/无身份不过滤。
@@ -3713,9 +3721,13 @@ def create_template(req: TemplateRequest, request: Request) -> dict:
         if identity.role == "user":
             updates["owner_user_id"] = identity.user_id
         req = req.model_copy(update=updates)
+    _graph_errors = _validate_graph_field(req.graph_json)
+    if _graph_errors:
+        raise HTTPException(400, {"error": "invalid_graph_json", "detail": _graph_errors[:5]})
     tpl = _repo().create_template(req.model_dump())
     _audit("template.create", subject_type="template", subject_id=tpl.get("id", ""), account_id=tpl.get("account_id", ""),
-           detail={"name": tpl.get("name", ""), "owner_user_id": tpl.get("owner_user_id", "")})
+           detail={"name": tpl.get("name", ""), "owner_user_id": tpl.get("owner_user_id", ""),
+                   "graph_saved": bool(req.graph_json)})
     return tpl
 
 
@@ -3725,6 +3737,18 @@ def update_template(template_id: str, req: UpdateTemplateRequest, request: Reque
     before = deny_foreign_owner(request, deny_cross_account(request, _repo().get_template(template_id)), edit=True)
     if not before:
         raise HTTPException(404, "template not found")
+    # exclude_unset:部分更新只写请求里显式出现的键——schema 全字段带默认值
+    # (language 默认 zh/name 默认空),整包 dump 会把未传字段抹掉(2026-09-09
+    # QA「PUT 抹字段」实锤;前端 save 恒传全字段,行为不变,API 语义修正)。
+    payload = req.model_dump(exclude_unset=True)
+    # 话术图校验只对显式携带的键生效(exclude_unset:未传=不动存量图)。
+    # 必须排在 revision 快照之前:append_template_revision 自带 commit,
+    # 校验晚于它会令每个被拒的保存都白写一条与现状等同的版本行并吃掉版本号
+    # (autosave 编辑器可刷满历史),「拒绝对数据无副作用」才成立(review R1)。
+    if "graph_json" in payload:
+        _graph_errors = _validate_graph_field(str(payload.get("graph_json") or ""))
+        if _graph_errors:
+            raise HTTPException(400, {"error": "invalid_graph_json", "detail": _graph_errors[:5]})
     # 话术版本化（2026-09-07 专项 B3）:update 即快照旧版——「哪版话术转化更好」
     # 从数据上可答;call_sessions.template_id 快照指向的版本内容不再随更新漂移。
     # default=str:SQL repo 的 before 含 datetime(created_at),不转直接 500——
@@ -3734,10 +3758,6 @@ def update_template(template_id: str, req: UpdateTemplateRequest, request: Reque
     import json as _revjson
 
     _repo().append_template_revision(template_id, revision, _revjson.dumps(before, ensure_ascii=False, default=str))
-    # exclude_unset:部分更新只写请求里显式出现的键——schema 全字段带默认值
-    # (language 默认 zh/name 默认空),整包 dump 会把未传字段抹掉(2026-09-09
-    # QA「PUT 抹字段」实锤;前端 save 恒传全字段,行为不变,API 语义修正)。
-    payload = req.model_dump(exclude_unset=True)
     # 归属字段冻结（B3 堵洞）：非 root 不得经 body 改 account_id（update 白名单曾放行，
     # 可把模板挪去别账号）；所有权转移（owner_user_id）只归 admin/root。
     ident = current_identity(request)
@@ -3751,7 +3771,7 @@ def update_template(template_id: str, req: UpdateTemplateRequest, request: Reque
         subject_type="template",
         subject_id=template_id,
         account_id=tpl.get("account_id", ""),
-        detail={"name": tpl.get("name", ""), "revision": revision,
+        detail={"name": tpl.get("name", ""), "revision": revision, "graph_saved": bool(payload.get("graph_json")),
                 "changed": sorted(k for k in req.model_dump() if req.model_dump().get(k) not in (None, "") and before.get(k) != req.model_dump().get(k))},
     )
     return tpl

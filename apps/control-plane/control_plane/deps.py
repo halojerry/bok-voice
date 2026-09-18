@@ -291,6 +291,11 @@ def build_engine() -> Engine | None:
                     "cluster_head_id",
                     "cluster_head_id VARCHAR(64) DEFAULT ''",
                 )
+                # 话术图(2026-09-18 Phase 2):模板可选携带意图节点+绑定边 JSON,
+                # ''=未启用(旧库补列即空串,装配零变化)。TEXT+DEFAULT '' 方言安全。
+                _ensure_column(
+                    conn, "conversation_templates", "graph_json", "graph_json TEXT DEFAULT ''"
+                )
                 # 节点鉴权(P1,深测): (license_id, fingerprint) 部分唯一索引——多实例
                 # 部署下配额竞态的库级兜底(进程内由 NodeStore.register_licensed 的
                 # 锁收口)。只约束 license 绑定行:开放模式存量空值行不受影响。

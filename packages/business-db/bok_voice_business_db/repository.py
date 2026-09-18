@@ -608,6 +608,7 @@ class SqlAlchemyBusinessRepository:
             language=data.get("language", "zh"),
             steps_json=data.get("steps_json", ""),
             hotwords=data.get("hotwords", ""),
+            graph_json=data.get("graph_json", ""),
             owner_user_id=data.get("owner_user_id") or "",
         )
         self.session.add(tpl)
@@ -622,7 +623,7 @@ class SqlAlchemyBusinessRepository:
         tpl = self.session.get(models.ConversationTemplate, template_id)
         if not tpl:
             return None
-        allowed = {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json", "hotwords", "owner_user_id"}
+        allowed = {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json", "hotwords", "graph_json", "owner_user_id"}
         for key, value in data.items():
             if key in allowed and hasattr(tpl, key):
                 setattr(tpl, key, value)
@@ -1558,6 +1559,9 @@ class InMemoryBusinessRepository:
             language=data.get("language", "zh"),
             steps_json=data.get("steps_json", ""),
             hotwords=data.get("hotwords", ""),
+            # 话术图(2026-09-18 Phase 2):镜像已进 core dataclass(types.py),
+            # 直接走 kwargs 回程(空串=未启用,与 SQL 列 default '' 同形)。
+            graph_json=data.get("graph_json", ""),
             owner_user_id=data.get("owner_user_id") or "",
         ).__dict__
         self.templates[tpl["id"]] = tpl
@@ -1569,7 +1573,7 @@ class InMemoryBusinessRepository:
     def update_template(self, template_id: str, data: dict) -> dict | None:
         if template_id not in self.templates:
             return None
-        self.templates[template_id].update({k: v for k, v in data.items() if k in {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json", "hotwords", "owner_user_id"}})
+        self.templates[template_id].update({k: v for k, v in data.items() if k in {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json", "hotwords", "graph_json", "owner_user_id"}})
         return self.templates[template_id]
 
     def delete_template(self, template_id: str) -> bool:

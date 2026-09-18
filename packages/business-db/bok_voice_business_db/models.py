@@ -74,6 +74,10 @@ class ConversationTemplate(Base):
     # 本套话术专属 ASR 热词(2026-09-08):逗号/顿号/分号/换行分隔,随会话装配并入
     # asr_hotword_context 下发 /api/start context(数字主导词会被过滤,防幻听号码)。
     hotwords: Mapped[str] = mapped_column(Text, default="")
+    # 话术图(2026-09-18 Phase 2):意图节点+绑定边 JSON(spec
+    # docs/superpowers/specs/2026-09-18-qa-flow-graph.md);空串=未启用,
+    # 运行时零变化。校验/解析见 packages/core/bok_voice_core/flow_graph.py。
+    graph_json: Mapped[str] = mapped_column(Text, default="")
     # 话务员级归属(B3):''=账号共享 / user_id=话务员个人——user 只见自己的+共享。
     owner_user_id: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)

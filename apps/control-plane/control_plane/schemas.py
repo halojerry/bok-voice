@@ -144,6 +144,8 @@ class TemplateRequest(BaseModel):
     language: str = "zh"
     steps_json: str = ""
     hotwords: str = ""
+    # 话术图(flow graph)JSON;空串=未启用,保存前走 validate_flow_graph 严格校验。
+    graph_json: str = ""
 
 
 class UpdateTemplateRequest(BaseModel):
@@ -159,6 +161,8 @@ class UpdateTemplateRequest(BaseModel):
     language: str = "zh"
     steps_json: str = ""
     hotwords: str = ""
+    # 话术图(flow graph)JSON;空串=未启用,保存前走 validate_flow_graph 严格校验。
+    graph_json: str = ""
 
 
 class PersonaRequest(BaseModel):

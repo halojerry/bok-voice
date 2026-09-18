@@ -210,6 +210,7 @@ CREATE TABLE public.conversation_templates (
     language character varying(16) NOT NULL,
     steps_json text NOT NULL,
     hotwords text NOT NULL,
+    graph_json text NOT NULL,
     owner_user_id character varying(64) NOT NULL,
     created_at timestamp without time zone NOT NULL
 );

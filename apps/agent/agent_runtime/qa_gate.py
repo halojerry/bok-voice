@@ -126,3 +126,13 @@ class QaIndex:
         if best is not None and best_score >= thr:
             return best, best_score
         return None, best_score
+
+    def by_id(self, entry_id: str) -> dict | None:
+        """按条目 id 直取(话术图 play_qa 绑定,spec §4.1);无命中返回 None。"""
+        wanted = str(entry_id or "")
+        if not wanted:
+            return None
+        for entry, _q, _v in self._items:
+            if str(entry.get("id") or "") == wanted:
+                return entry
+        return None

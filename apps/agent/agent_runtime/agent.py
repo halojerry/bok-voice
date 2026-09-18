@@ -7,6 +7,7 @@ import re
 import time
 from typing import Optional
 
+from bok_voice_core.flow_graph import ACTION_PLAY_QA, pick_graph_action
 from bok_voice_core.policies import ProviderRegistry, ProviderState, select_session_manifest
 from bok_voice_core.testdata import is_test_object_name as _is_test_object_name
 from bok_voice_core.types import CallMode
@@ -2559,16 +2560,32 @@ async def entrypoint(ctx):
     # 空表 → 闸门整体惰性(零行为变化);命中还需应答音频已在本地缓存,
     # 未物化的条目自动视为未命中走 LLM(闸门绝不触发云合成)。
     _qa_index = None
+    # 索引构建面=快路开 **或** 图里有启用嘅 play_qa 绑定(I1,2026-09-18):kill-switch
+    # BOK_QA_FASTPATH=0 只关轮级兜底,唔可以连图嘅罐头播放一齐静默掐死(图有自己嘅
+    # 开关 BOK_FLOW_GRAPH,两闸各管各的);无 TTS 缓存两条路都播唔出声,照关。
+    _qa_fastpath_on = qa_fastpath_enabled()
+    _graph_qa_bindings = any(
+        b.enabled and b.action == ACTION_PLAY_QA for b in flow_ctrl.graph.bindings
+    )
     # disabled 打点(task-9):快路整体关闭(env 关/无 TTS 缓存/空表/装配失败)每通
     # 记一次——放装配点不放轮级,轮级会重复计。
-    if qa_fastpath_enabled() and _tts_cache is not None:
+    if _tts_cache is not None and (_qa_fastpath_on or _graph_qa_bindings):
         try:
             _qa_rows = await cp.list_qa_entries(account_id=_ctx_account, owner_scope=_ctx_qa_owner)
             if _qa_rows:
                 from .qa_gate import QaIndex
 
                 _qa_index = QaIndex(_qa_rows)
-                print(f"[agent] qa fastpath on entries={len(_qa_rows)} (call {room_name})", flush=True)
+                if _qa_fastpath_on:
+                    print(f"[agent] qa fastpath on entries={len(_qa_rows)} (call {room_name})", flush=True)
+                else:
+                    # 只为图建的索引:运维一眼睇出「快路关咗、图仍可播罐头」;快路
+                    # 口径照记 disabled(该计数器语义=快路本轮不可用,env 关恒成立)。
+                    _qa_bump("disabled")
+                    print(
+                        f"[agent] QA_INDEX built_for=graph entries={len(_qa_rows)} (call {room_name})",
+                        flush=True,
+                    )
             else:
                 _qa_bump("disabled")  # 空表:闸门整体惰性,等同关闭
         except Exception as exc:  # noqa: BLE001 - 快答库不可用零影响
@@ -3628,11 +3645,131 @@ async def entrypoint(ctx):
                 _cancel_response_watchdog()  # 直念步即出声
                 await _say_script(session, tts_provider, _tts_cache, _say_now, emotion=_say_emo)
                 raise StopResponse()
+            # ---- 罐头播放共用件(2026-09-18 话术图 Phase 2):QA 快路与
+            # graph play_qa 同一条出口,抽自 QA 快路原位(行为逐字节不变)。
+            def _qa_pcm_for(text: str) -> bytes | None:
+                voice = getattr(tts_provider, "resolved_voice", lambda: "")()
+                model = getattr(tts_provider, "resolved_model", lambda: "")()
+                if not text or _tts_cache is None:
+                    return None
+                return _tts_cache.lookup(
+                    text, voice=voice, model=model,
+                    speed=getattr(tts_provider, "resolved_speed", lambda: 1.0)(),
+                )
+
+            async def _qa_canned_say(entry: dict, pcm, *, provider: str) -> bool:
+                answer = str(entry.get("answer_text") or "").strip()
+                try:
+                    await session.interrupt()  # ① 作废停着的抢跑快照(幻影账本条目下轮 rebase 自愈)
+                except Exception:  # noqa: BLE001
+                    pass
+                # ② 手动补 user 轮(StopResponse 轮 item_added 唔会触发;
+                # C5 官方姿势:旧 chat_ctx.items.append 打只读上下文恒失败)
+                await self._try_append_user_message(new_message)
+                # ③ 回声守卫预锚(正常 playout 完才置,快路要立即生效)
+                context_state.set_last_reply(answer)
+                _turn_origin["gen"] = "qa_fastpath"
+                _turn_origin["provider"] = provider
+                # ④ 落库 user 轮(paused 分支同款手动补轮);assistant 轮由 say() 的
+                # item_added 统一上报——勿再直报(旧 ④ 直报+item_added 双报同文两行)。
+                try:
+                    _step = (int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0
+                    _now = int((time.monotonic() - _t0) * 1000)
+                    await cp.add_turn(
+                        call_id, "user", user_text, language=language_state.lang,
+                        line="a", speaker="customer",
+                        template_step=_step, started_ms=_now, ended_ms=_now,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                # 池化(2026-09-17 全量 debug P2-A):命中计数指标位,
+                # 强引用防 GC 丢任务(裸 create_task 会被回收)。
+                _spawn_report(cp.qa_hit(str(entry.get("id") or "")))
+                # ⑤ 快路不经 tts_provider,首音频回调唔会拆看门狗——显式拆
+                _cancel_response_watchdog()
+                await session.say(
+                    answer, audio=frames_aiter(pcm_to_frames(pcm, _tts_cache.sample_rate))
+                )
+                return True
+
+            # ---- 话术图引擎(spec 2026-09-18;插在 say 直念步之后、QA 快路之前,
+            # precedence: REFUSE>DEFER>say>graph>QA 快路;BOK_FLOW_GRAPH=0 整闸,
+            # 空图零成本零变化;closing 后收线优先——REFUSE 分支已置 closing 且
+            # 唔 raise,图唔可以抢走告别轮(与 QA 快路 closing 旁路同源)----
+            _gbinding = None
+            if (
+                os.environ.get("BOK_FLOW_GRAPH", "1") == "1"
+                and flow_ctrl.graph.intents
+                and not flow_ctrl.closing
+                and user_text
+            ):
+                _gbinding = pick_graph_action(
+                    flow_ctrl.graph,
+                    user_text,
+                    step_1based=(int(flow_ctrl.current) + 1),
+                    fired=flow_ctrl.graph_fired,
+                )
+            if _gbinding is not None:
+                if _gbinding.action == "jump_step":
+                    # 1-based 存储转 0-based;先跳、按**实际位移**记账(2026-09-18
+                    # review R1):jump_to 内部还会 no-op(无步骤/done 钳制),未位移
+                    # 就唔可以烧 once 绑定/宣告 provider/打 jump 日志(spec §4.3 防环)。
+                    _gtarget = int(_gbinding.step or 1) - 1
+                    _gcur = flow_ctrl.current
+                    flow_ctrl.jump_to(_gtarget)
+                    if flow_ctrl.current != _gcur:
+                        flow_ctrl.graph_fired.add(_gbinding.id)
+                        _invalidate_stale_preemptive(
+                            f"流程跳转 → 第 {flow_ctrl.current + 1} 步"
+                        )
+                        context_state.set_flow_current(flow_ctrl.current_step_text())
+                        # 跳步轮强制 advanced=True → QA 快路让位(spec precedence graph>QA):
+                        # 同轮规则推进+图后退跳可令净位移为零,不置哨兵快路会照抢本轮。
+                        _flow_step_before = -1
+                        print(
+                            f"FLOW_GRAPH jump binding={_gbinding.id} "
+                            f"step={flow_ctrl.current + 1}",
+                            flush=True,
+                        )
+                        # 本轮继续回答(新步指引);provider 标记 assistant 轮
+                        _turn_origin["provider"] = "graph-jump"
+                    else:
+                        print(
+                            f"FLOW_GRAPH jump_noop binding={_gbinding.id} "
+                            f"step={_gtarget + 1}",
+                            flush=True,
+                        )
+                else:  # play_qa:条目在场且音频已物化才播;miss 放行 LLM 不消耗 once
+                    _ge = (
+                        _qa_index.by_id(_gbinding.qa_id)
+                        if _qa_index is not None and _gbinding.qa_id
+                        else None
+                    )
+                    _gp = _qa_pcm_for(str((_ge or {}).get("answer_text") or ""))
+                    if (
+                        _ge is not None
+                        and _gp is not None
+                        and await _qa_canned_say(_ge, _gp, provider="graph-play")
+                    ):
+                        flow_ctrl.graph_fired.add(_gbinding.id)
+                        print(
+                            f"FLOW_GRAPH play binding={_gbinding.id} "
+                            f"qa={_gbinding.qa_id}",
+                            flush=True,
+                        )
+                        raise StopResponse()  # 压掉本轮 LLM(WA 累积同款)
+                    print(
+                        f"FLOW_GRAPH play_miss binding={_gbinding.id} "
+                        f"qa={_gbinding.qa_id}",
+                        flush=True,
+                    )
             # ---- Q→A 检索快路(PR-3):四道闸全过 + 应答音频已预生成才命中 ----
             # 命中 → 跳过 LLM 直接播缓存音频(~50ms);任一闸不过 → 照旧走 LLM。
             # 位置在流程推进块之后:推进/收尾判定已落定,闸门让位(refuse/closing/
             # advanced 全部旁路);又在 paused 检查之前:与手动补 user 轮同姿势。
-            if _qa_index is not None and _tts_cache is not None:
+            # 门闸显式带 _qa_fastpath_on(I1):索引可能只为图建(I1),kill-switch
+            # 关时唔可以经呢条路复活轮级快路。
+            if _qa_fastpath_on and _qa_index is not None and _tts_cache is not None:
                 from .flow import _looks_like_whatsapp_step as _llws
 
                 try:
@@ -3668,56 +3805,11 @@ async def entrypoint(ctx):
                     _qa_bump("match0" if _qa_entry is None else "hit")
                     if _qa_entry is not None:
                         _qa_answer = str(_qa_entry.get("answer_text") or "").strip()
-                        _qa_voice = getattr(tts_provider, "resolved_voice", lambda: "")()
-                        _qa_model = getattr(tts_provider, "resolved_model", lambda: "")()
-                        _qa_pcm = (
-                            _tts_cache.lookup(
-                                _qa_answer, voice=_qa_voice, model=_qa_model,
-                                speed=getattr(tts_provider, "resolved_speed", lambda: 1.0)(),
-                            )
-                            if _qa_answer
-                            else None
-                        )
+                        _qa_pcm = _qa_pcm_for(_qa_answer)
                         if _qa_pcm is not None:
                             print(f"QA_FASTPATH hit=1 entry={_qa_entry.get('id')} score={_qa_score:.2f}", flush=True)
-                            # ① 作废停着的抢跑快照(其幻影账本条目下轮 rebase 自愈)
-                            try:
-                                await session.interrupt()
-                            except Exception:  # noqa: BLE001
-                                pass
-                            # ② 手动补 user 轮(paused 分支同款):否则记忆/落库收不到这句
-                            # C5:官方姿势(旧 chat_ctx.items.append 打只读上下文恒失败)。
-                            await self._try_append_user_message(new_message)
-                            # ③ 回声守卫预锚(正常要 playout 完才自动置,快路要立即生效)
-                            context_state.set_last_reply(_qa_answer)
-                            # ④ 落库 user 轮(paused 分支同款手动补轮,item_added
-                            # 唔会为 StopResponse 轮触发);assistant 轮由 say() 的
-                            # item_added 统一上报——旧 ④ 直报+item_added 双报同文
-                            # 两行,顺手收编。origin 标记 gen/provider 供账本。
-                            _turn_origin["gen"] = "qa_fastpath"
-                            _turn_origin["provider"] = "qa-fastpath"
-                            try:
-                                _qa_step = (int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0
-                                _qa_now = int((time.monotonic() - _t0) * 1000)
-                                await cp.add_turn(
-                                    call_id, "user", user_text, language=language_state.lang,
-                                    line="a", speaker="customer",
-                                    template_step=_qa_step, started_ms=_qa_now, ended_ms=_qa_now,
-                                )
-                            except Exception:  # noqa: BLE001
-                                pass
-                            # 池化(2026-09-17 全量 debug P2-A):QA 命中计数指标位,
-                            # 强引用防 GC 丢任务。
-                            _spawn_report(cp.qa_hit(str(_qa_entry.get("id") or "")))
-                            # ⑤ 播预生成音频(QA 快路唔经 tts_provider,首音频回调
-                            # 唔会拆看门狗——这里显式拆)
-                            _cancel_response_watchdog()
-                            await session.say(
-                                _qa_answer,
-                                audio=frames_aiter(pcm_to_frames(_qa_pcm, _tts_cache.sample_rate)),
-                            )
-                            # ⑥ 压掉本轮 LLM(WA 累积同款;必须在 except-pass 之外)
-                            raise StopResponse()
+                            if await _qa_canned_say(_qa_entry, _qa_pcm, provider="qa-fastpath"):
+                                raise StopResponse()
                         print(f"QA_FASTPATH hit=0 reason=no_audio entry={_qa_entry.get('id')}", flush=True)
                         _qa_bump("no_audio")
             # (旧 paused 分支已前移为 hook 顶部的 C1 暂停冻结——落库 gen=paused+
