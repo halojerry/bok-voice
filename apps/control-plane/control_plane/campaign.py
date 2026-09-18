@@ -149,18 +149,44 @@ async def campaign_tick(repo=None, *, dispatcher: Dispatcher | None = None,
     """
     from .main import _repo
 
-    repo = repo if repo is not None else _repo()
+    # repo 归属（2026-09-18 连接池泄漏修复）：自建=本函数收口，注入=调用方所有
+    # （既有单测跨轮复用同一注入 repo，不能替人 close）。
+    owns_repo = repo is None
     dispatcher = dispatcher or _default_dispatcher
     out = {"harvested": 0, "started": 0, "finished": 0}
-    for campaign in repo.list_campaigns("", status="running"):
-        try:
-            await _tick_campaign(repo, campaign, dispatcher, out, now=now)
-        except Exception as exc:  # noqa: BLE001 - 单条战役失败不阻其余
-            log.warning(
-                "campaign_tick_failed",
-                extra={"event": "campaign.tick.error",
-                       "data": {"campaign": campaign.get("id", ""), "error": str(exc)}},
-            )
+    try:
+        # 自建 repo 放 try 首行：_repo() 若抛（引擎劣化等）也落在 close-finally
+        # 管辖内，不留「建了没关」的死角（评审 Minor 收口）。
+        if owns_repo:
+            repo = _repo()
+        for campaign in repo.list_campaigns("", status="running"):
+            try:
+                await _tick_campaign(repo, campaign, dispatcher, out, now=now)
+            except Exception as exc:  # noqa: BLE001 - 单条战役失败不阻其余
+                log.warning(
+                    "campaign_tick_failed",
+                    extra={"event": "campaign.tick.error",
+                           "data": {"campaign": campaign.get("id", ""), "error": str(exc)}},
+                )
+    finally:
+        # SQL 仓的 Session 从不 commit 的读（list_campaigns/list_items/get_call…）
+        # autobegin 后即占住一条池连接，此前只靠 GC 归还——本循环 5s 一轮每轮
+        # 新建 Session，DB 抖动时（生产实证 psycopg SSL EOF）钉住的死连接在
+        # GC 间隔内持续计入 QueuePool 容量直至 5+10 全满：每轮 30s 池超时
+        # （campaign_tick_failed），巡检的同步 DB 调用跑在事件循环上，30s 阻塞
+        # 连带 /health 超时。finally 收口让连接确定性归还，一轮一清。
+        # 内存仓/测试 fake 无 close，duck-typing 跳过。
+        if owns_repo:
+            closer = getattr(repo, "close", None)
+            if closer is not None:
+                try:
+                    closer()
+                except Exception as exc:  # noqa: BLE001 - 收口失败不杀巡检循环
+                    log.warning(
+                        "campaign_repo_close_failed",
+                        extra={"event": "campaign.repo.close.error",
+                               "data": {"error": str(exc)}},
+                    )
     return out
 
 

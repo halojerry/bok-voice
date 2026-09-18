@@ -118,14 +118,18 @@ def test_explicit_settings_used(monkeypatch):
 
 def test_settle_uses_thread_offload_not_inline_llm_call(monkeypatch):
     """P1-4：settle 不得在事件循环里同步 httpx 调用——黑洞 LLM 曾致 /health
-    59.4s 全局停摆。静态锁死调用形态：settle 源码必须经 asyncio.to_thread。"""
+    59.4s 全局停摆。静态锁死调用形态：结算内核（2026-09-18 起 HTTP 端点与
+    reaper 共用 _settle_core）源码必须经 asyncio.to_thread。"""
     import inspect
 
     from control_plane import main as cp_main
 
-    src = inspect.getsource(cp_main.settle)
+    src = inspect.getsource(cp_main._settle_core)
     assert "asyncio.to_thread" in src
     assert src.count("Summarizer().build") == 1  # 二次同步重试一并移除（重试=双倍停摆）
+    # 端点壳保持薄委托（鉴权 + 内核），不得回吞结算体。
+    endpoint = inspect.getsource(cp_main.settle)
+    assert "_settle_core" in endpoint and "Summarizer" not in endpoint
 
 
 def test_interp_call_uses_interp_system_prompt(monkeypatch):

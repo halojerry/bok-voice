@@ -430,7 +430,8 @@ def test_reaper_ended_branch_cleans_up_dispatch(monkeypatch):
 
     monkeypatch.setattr(m, "_repo", lambda: FakeRepo())
     monkeypatch.setattr(m, "_room_has_participants", AsyncMock(return_value=False))
-    monkeypatch.setattr(m, "settle", AsyncMock(return_value={}))
+    # 2026-09-18 起 reaper 直调结算内核 _settle_core（settle 端点壳只管鉴权）。
+    monkeypatch.setattr(m, "_settle_core", AsyncMock(return_value={}))
     lkapi = _lkapi_dummy()
     monkeypatch.setattr(m, "_lkapi_client", lambda: lkapi)
     cleanup = AsyncMock(return_value=1)
@@ -461,7 +462,8 @@ def test_reaper_skips_dispatch_cleanup_without_credentials(monkeypatch):
 
     monkeypatch.setattr(m, "_repo", lambda: FakeRepo())
     monkeypatch.setattr(m, "_room_has_participants", AsyncMock(return_value=False))
-    monkeypatch.setattr(m, "settle", AsyncMock(return_value={}))
+    # 2026-09-18 起 reaper 直调结算内核 _settle_core（settle 端点壳只管鉴权）。
+    monkeypatch.setattr(m, "_settle_core", AsyncMock(return_value={}))
     monkeypatch.setattr(m, "_lkapi_client", lambda: None)
     cleanup = AsyncMock(return_value=0)
     monkeypatch.setattr(m, "cleanup_dispatch", cleanup)
