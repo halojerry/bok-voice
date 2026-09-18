@@ -10,6 +10,18 @@
    `provider=graph-jump` / `template_step=4`。
 3. 推非触发语「好的好的」→ 断言该窗口内**零**新增 `FLOW_GRAPH` 行。
 4. （有绑定 qa_id 时）推「我要退款」→ 信息位：`play` 或 `play_miss`，不进主判据。
+4b. `--then-jump` 档（Phase 3.3 追问链）：轮次表换成「播」+「跳后」两轮，「我要退款」
+   触发 `play_qa`（绑定带 `then_jump=4`）→ 罐头播完**当场**跳步；硬判据 =
+   ① play 窗口内 `FLOW_GRAPH play`（`play_miss` → FAIL）② **OR**（同轮
+   `FLOW_GRAPH jump … via=then_jump` 日志 · 跳后轮 assistant 行
+   `template_step == 4`）。**为什么要两轮**（勘误预检 2）：播放轮本体行在**跳之前**
+   落库（`_qa_canned_say` 内上报，步号=跳前步），跳后步号只能在**下一轮**的 turns 行
+   上看到；跳后轮话术默认 `AFTER_TEXT`（刻意避开 `_CONFIRM_RE` 单字确认/收线/异议/
+   提问七族词）只为信息位服务。**无 QA 条目 → 腿显式跳过**（报告
+   `{"skipped": "no_qa_or_audio"}`、退出码 1，未评估 ≠ PASS）；**条目在场但音频未物化
+   → 腿照跑**，运行时落 `FLOW_GRAPH play_miss`，`play_logged` 硬 FAIL、退出码 1
+   （先 `python tools/bok.py tts-pregen --qa` 物化音频再来）。kill 腿同旧：
+   `--then-jump --expect-off`，须先以 `BOK_FLOW_GRAPH=0` 重启 serve。
 5. `--expect-off` 档 = kill-switch 腿：**须先以 `BOK_FLOW_GRAPH=0` 重启 serve**
    （env 在 worker 进程启动时定死，探针不能自己重启；A/B 前后 `ps aux | grep
    agent_runtime` 必须为 0 再 serve，防殭尸 worker 跑旧代码污染结论）→ 同表场景推
@@ -28,6 +40,7 @@
 
 用法：<python> scripts/probe_flow_graph.py [--expect-off] [--lang zh]
       [--trigger-text 我要投诉] [--no-play-round] [--keep-template]
+      [--then-jump] [--after-text 我知道了，你说]
       <python> scripts/probe_flow_graph.py --selftest   # 无栈纯函数自检
 前置：`python tools/bok.py serve`（CP 8000 / LiveKit 7880 / ASR 8787 / TTS 8788）。
 报告：reports/flow-graph/<ts>-<leg>.json。
@@ -64,6 +77,13 @@ TARGET_STEP = 4  # 1-based：投诉 jump 的目标步
 TRIGGER_TEXT = "我要投诉"
 NONTRIGGER_TEXT = "好的好的"
 PLAY_TEXT = "我要退款"
+# 追问链（Phase 3.3）跳后轮话术（勘误预检 2）：只为「跳后步号」信息位服务，刻意避开
+# 规则判定的七族词——`_CONFIRM_RE` 单字（好/是/对/嗯/系/係，命中即规则推进 4→5，把
+# after 轮步号判据污染成 5）、`_QUESTION_RE`（提问轮原地答不推进但语义漂移）、
+# `_DEFER_RE`（社交拖延直念短应承）、`_REFUSE_RE`/`_FAREWELL_RE`/`_HANGUP_RE`（收线
+# 冻结后跳步失效）、`_DENY_RE`（异议分支），以及图的两个触发意图词（退款/投诉——撞上
+# 会再触发一次图动作）。`tests/test_flow_graph_probe_then_jump.py` 对着真 regex 逐族钉。
+AFTER_TEXT = "我知道了，你说"
 # ---- 起推前「播完」等候（2026-09-18 实弹修复）--------------------------------
 # 根因：旧版只等 `erc.wait_greeting`（首声+累计静音采样，其 silent 从不清零，
 # 开场白句间停顿会把采样凑满 → 早返）再 sleep 0.5s 就推触发语——9.2s 的 zh 开场白
@@ -228,6 +248,64 @@ def transcript_has_keyword(turns: list[dict], keywords: list[str]) -> bool:
     return False
 
 
+def plan_rounds(
+    *,
+    then_jump: int | None,
+    has_qa: bool,
+    trigger_text: str,
+    nontrigger_text: str,
+    play_text: str,
+    after_text: str,
+    play_round: bool,
+) -> list[tuple[str, str]]:
+    """本腿轮次表 `[(窗口名, 话术)]`（纯函数）。
+
+    - **then-jump 档**（`then_jump` 非 None，Phase 3.3 追问链）：`has_qa` 真 →
+      `[("play", play_text), ("after", after_text)]`——「播」轮就是**触发轮**（推
+      `play_text` 命中 play_qa 绑定）。跳后步号只能在**下一轮**的 turns 行看到
+      （勘误预检 2：播放轮本体行在跳前落库），故必须两轮。`has_qa` 假（**无 QA 条目**，
+      即 `qa_id` 为空；条目在场而音频未物化不在此列——那种情况腿照跑、`play_miss` 由
+      `play_logged` 硬 FAIL）→ **空表**：调用方须显式判「腿跳过」，绝不许以「没跑出
+      东西」空过成 PASS。
+      `play_round` 在本档**不适用**（「播」轮是触发轮，关掉即零触发语空跑）。
+    - **默认档**：`trigger`/`nontrigger`（+ `play` 信息位轮）逐字节同旧。
+    """
+    if then_jump is not None:
+        if not has_qa:
+            return []
+        return [("play", play_text), ("after", after_text)]
+    rounds: list[tuple[str, str]] = [("trigger", trigger_text), ("nontrigger", nontrigger_text)]
+    if play_round and has_qa:
+        rounds.append(("play", play_text))
+    return rounds
+
+
+def post_jump_step_seen(turns: list[dict], then_jump: int) -> bool:
+    """跳后步号是否在**跳后轮**的转写行上出现（纯函数）。
+
+    只看 assistant 转写行，且 `provider != "graph-play"`——**播放轮本体行在跳之前
+    落库**（`_qa_canned_say` 内上报，步号=跳前步），哪怕步号撞上 `then_jump` 也恒不
+    计入（否则「播了」会被当成「跳了」的假绿）。
+
+    **无假正例不变量（review R1，M3）**：该判据把「after 轮出现 step=N」读成「链生效」，
+    成立前提是 **N 只可能由本体位移到达**——本腿装配下它由三件事共同保证：① 起始步号
+    0/1；② 每轮至多推进一次；③ play 轮是首轮、其本体行被排除，故触发前不存在把步号
+    推到 N 的轮次。它**不是**结构不变量：若将来本腿在前面加轮次（pre-trigger rounds）、
+    改目标步，或让规则推进能从别的步顺推到 N，判据就会退化成假正例面。届时应改为
+    **只扫 after 窗口的 turns 切片**（现在传的是全量 turns），或加轮次锚；默认档
+    `AFTER_TEXT` 的洁净性专测只钉默认话术，`--after-text` 自定义时责任在调用方。
+    """
+    target = _as_int(then_jump, -1)
+    for t in turns:
+        if str(t.get("role") or "") != "assistant":
+            continue
+        if str(t.get("provider") or "").strip() == "graph-play":
+            continue
+        if _as_int(t.get("template_step"), -1) == target:
+            return True
+    return False
+
+
 def probe_evidence(*, log_exists: bool, marks: list[int], expected_rounds: int) -> dict:
     """观测面可信度（纯函数，review R1）——**没有真观测，就没有「零 FLOW_GRAPH」结论**。
 
@@ -266,20 +344,34 @@ def evaluate_leg(
     play_events: list[dict],
     turns: list[dict],
     evidence: dict,
+    then_jump: int | None = None,
+    after_events: list[dict] | None = None,
 ) -> dict:
     """主判据（纯函数）。expect_off=False=图开启腿；True=kill-switch 腿。
 
     主判据（进退出码）：
       两腿共用  evidence_ok（`probe_evidence` 的 ok——absence 判据的前提）
       图开启腿  jump_logged / trigger_turn_provider / nontrigger_silent
+      then_jump 腿  play_logged / then_jump_effective（Phase 3.3 追问链，见下）
       kill 腿   killswitch_no_logs / killswitch_no_graph_turns
     **absence-based 的三条（`nontrigger_silent`/`killswitch_no_logs`/
     `killswitch_no_graph_turns`）在 `evidence_ok=False` 时恒 False**——否则
     日志缺失/中途异常会以「窗口里什么都没有」空过成 PASS（review R1 假绿）。
-    正向判据（`jump_logged`/`trigger_turn_provider`）要真观测到事件才算，无需另加前提。
+    正向判据（`jump_logged`/`trigger_turn_provider`/`play_logged`/`then_jump_effective`）
+    要真观测到事件才算，无需另加前提。
     信息位：play / play_miss / jump_noop 计数（罐头未物化是明确降级路径，不判 FAIL）。
+
+    **then_jump 腿独立判据分支**（勘误预检 5：无非触发轮，走既有分支会结构性 FAIL）：
+      - `play_logged`（硬）：play 窗口内有 `kind=="play"`——`play_miss`（罐头未物化）
+        → FAIL，本腿主判据就是「播+跳」。
+      - `then_jump_effective`（硬）：**OR** 语义（勘误预检 2）——同轮
+        `jump` 且 `step == then_jump` 且 `via == "then_jump"`（确定性）**或** 跳后轮
+        转写行步号命中（`post_jump_step_seen`，受 ASR 影响）。
+      信息位：`then_jump_logged` / `next_turn_step`（两分量各自可读，便于归因）。
+    **默认档（`then_jump is None`）判据集/事件键集逐字节同旧**（零变化铁律）。
     """
-    all_events = trigger_events + nontrigger_events + play_events
+    after = list(after_events or [])
+    all_events = trigger_events + nontrigger_events + play_events + after
     grows = graph_turn_rows(turns)
     play_kinds = [str(e.get("kind")) for e in play_events]
     ev_ok = bool((evidence or {}).get("ok"))
@@ -289,11 +381,38 @@ def evaluate_leg(
         "jump_noop": sum(1 for e in all_events if str(e.get("kind")) == "jump_noop"),
         "graph_turns": grows,
     }
+    events = {
+        "trigger": trigger_events,
+        "nontrigger": nontrigger_events,
+        "play": play_events,
+    }
     if expect_off:
         checks = {
             "evidence_ok": ev_ok,
             "killswitch_no_logs": ev_ok and not all_events,
             "killswitch_no_graph_turns": ev_ok and not grows,
+        }
+    elif then_jump is not None:
+        target = _as_int(then_jump, -1)
+        # 跳日志落在**播放轮**窗口（T2 在 `_qa_canned_say` 返回后、本轮收尾 raise 之前
+        # 同步打点；播报完成先于该轮 mark）。
+        logged = any(
+            str(e.get("kind")) == "jump"
+            and _as_int(e.get("step"), -1) == target
+            and str(e.get("via") or "").strip() == "then_jump"
+            for e in play_events
+        )
+        next_seen = post_jump_step_seen(turns, target)
+        # 信息位归因（M4）：`next_turn_step=False` = after 轮**无新步号**——可能是该轮被
+        # QA 快路/规则吞掉（步号根本没重渲染）、ASR 没吐出该轮、或链没跳；此时归因落到
+        # 同轮 `then_jump_logged` 分量（两分量各自可读，故不影响 OR 判据）。
+        info.update({"then_jump": target, "then_jump_logged": logged,
+                     "next_turn_step": next_seen})
+        events["after"] = after
+        checks = {
+            "evidence_ok": ev_ok,
+            "play_logged": any(k == "play" for k in play_kinds),
+            "then_jump_effective": bool(logged or next_seen),
         }
     else:
         jumps = [e for e in trigger_events if str(e.get("kind")) == "jump"]
@@ -310,11 +429,7 @@ def evaluate_leg(
         "checks": checks,
         "pass": all(checks.values()),
         "evidence": evidence or {},
-        "events": {
-            "trigger": trigger_events,
-            "nontrigger": nontrigger_events,
-            "play": play_events,
-        },
+        "events": events,
         "info": info,
     }
 
@@ -329,8 +444,12 @@ def _cp(path: str, *, method: str = "GET", **kw) -> httpx.Response:
     )
 
 
-def build_graph_json(qa_id: str) -> str:
-    """图契约（spec §3）：投诉→jump_step 4；退款→play_qa（有 qa_id 才挂该腿）。"""
+def build_graph_json(qa_id: str, *, then_jump: int | None = None) -> str:
+    """图契约（spec §3）：投诉→jump_step 4；退款→play_qa（有 qa_id 才挂该腿）。
+
+    `then_jump`（Phase 3.3 追问链，1-based）：非空且挂了 play_qa 绑定时给该绑定加
+    `"then_jump": N`；默认 `None` 时输出与今逐字节同（旧腿/旧断言零变化）。
+    """
     bindings = [{
         "id": "bnd_7e8f9a0b",
         "intent": "int_1a2b3c4d",
@@ -360,6 +479,9 @@ def build_graph_json(qa_id: str) -> str:
             "intent": "int_2b3c4d5e",
             "action": "play_qa",
             "qa_id": qa_id,
+            # 链只在显式给了目标步时写键（`then_jump=0`/None 都不写——CP 严格校验面
+            # 拒非 [1,999] 值，写 0 会 400）。
+            **({"then_jump": int(then_jump)} if then_jump else {}),
             "priority": 20,
             "once": False,
             "enabled": True,
@@ -456,20 +578,45 @@ def log_windows(marks: list[int]) -> list[list[str]]:
 # ---------------------------------------------------------------------------
 async def run_leg(*, expect_off: bool, lang: str, voice: str, trigger_text: str,
                   nontrigger_text: str, play_text: str, play_round: bool,
-                  keep_template: bool, budgets: dict[str, float]) -> dict:
+                  keep_template: bool, budgets: dict[str, float],
+                  then_jump: int | None = None, after_text: str = AFTER_TEXT) -> dict:
     leg_name = "killswitch-off" if expect_off else "graph-on"
+    if then_jump is not None:
+        leg_name = "then-jump-killswitch-off" if expect_off else "then-jump"
     qa_id = pick_qa_id(lang)
-    graph_json = build_graph_json(qa_id)
-    print(f"\n[flow-graph] 腿={leg_name} lang={lang} qa_id={qa_id or '(无QA条目, play 腿跳过)'}",
-          flush=True)
+    graph_json = build_graph_json(qa_id, then_jump=then_jump)
+    rounds = plan_rounds(
+        then_jump=then_jump, has_qa=bool(qa_id), trigger_text=trigger_text,
+        nontrigger_text=nontrigger_text, play_text=play_text, after_text=after_text,
+        play_round=play_round,
+    )
+    print(f"\n[flow-graph] 腿={leg_name} lang={lang} qa_id={qa_id or '(无QA条目, play 腿跳过)'}"
+          f" then_jump={then_jump} rounds={[n for n, _ in rounds]}", flush=True)
+    if then_jump is not None and not rounds:
+        # 未评估 ≠ PASS：**无 QA 条目**时链腿结构性跑不起来（触发语必然 play_miss），
+        # 必须显式跳过并以退出码 1 收尾（空表跑出的「零痕迹」是没观测，不是证据）。
+        # 注意：条目在场但音频未物化**不**走这里——腿照跑、`play_miss` 由 play_logged
+        # 硬 FAIL。报告键 `no_qa_or_audio` 是历史 token（schema 稳定，不再新增含义）。
+        print("[flow-graph] then-jump 腿跳过：无 QA 条目"
+              "（先建 QA 条目，再 python tools/bok.py tts-pregen --qa 物化音频）", flush=True)
+        return {
+            "leg": leg_name,
+            "skipped": "no_qa_or_audio",
+            "expect_off": expect_off,
+            "lang": lang,
+            "qa_id": qa_id,
+            "graph_json": graph_json,
+            "then_jump": then_jump,
+            "ts": int(time.time()),
+        }
     template_id = create_probe_template(lang, graph_json)
     print(f"[flow-graph] template={template_id} graph={graph_json}", flush=True)
     try:
         return await _run_leg_with_stack(
             expect_off=expect_off, leg_name=leg_name, lang=lang, qa_id=qa_id,
             graph_json=graph_json, template_id=template_id, voice=voice,
-            trigger_text=trigger_text, nontrigger_text=nontrigger_text,
-            play_text=play_text, play_round=play_round, budgets=budgets,
+            rounds=rounds, then_jump=then_jump, after_text=after_text,
+            budgets=budgets,
         )
     finally:
         # 清理探针模板：名字含 probe=不会被 E2E 自动挑中，但跑完仍应不留痕（--keep-template 留档用）。
@@ -479,12 +626,10 @@ async def run_leg(*, expect_off: bool, lang: str, voice: str, trigger_text: str,
 
 async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_id: str,
                               graph_json: str, template_id: str, voice: str,
-                              trigger_text: str, nontrigger_text: str, play_text: str,
-                              play_round: bool, budgets: dict[str, float]) -> dict:
-    # 轮次表：触发 → 非触发 →（有 qa 绑定且未禁）play 信息位轮。
-    rounds: list[tuple[str, str]] = [("trigger", trigger_text), ("nontrigger", nontrigger_text)]
-    if play_round and qa_id:
-        rounds.append(("play", play_text))
+                              rounds: list[tuple[str, str]], then_jump: int | None,
+                              after_text: str, budgets: dict[str, float]) -> dict:
+    # 轮次表由 `plan_rounds` 单点产出（默认档=触发/非触发/play 信息位轮；then-jump 档=
+    # 播 + 跳后两轮），这里只负责跑表与按窗口切日志。
     pcms = {name: erc.tts_pcm(text, lang) for name, text in rounds}
 
     call_id, resolved_voice = create_probe_call(lang, template_id, voice)
@@ -587,10 +732,13 @@ async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_
         expected_rounds=len(rounds),
     )
     windows = log_windows(marks)
+    # 按**轮次名**通用切窗（默认档 trigger/nontrigger/play；then-jump 档 play/after）——
+    # 不再硬编码窗口名，新增轮次只需在 `plan_rounds` 里加一行。
     name_to_window = {name: windows[i] for i, (name, _) in enumerate(rounds) if i < len(windows)}
     trigger_events = parse_graph_events(name_to_window.get("trigger", []))
     nontrigger_events = parse_graph_events(name_to_window.get("nontrigger", []))
     play_events = parse_graph_events(name_to_window.get("play", []))
+    after_events = parse_graph_events(name_to_window.get("after", []))
     if not evidence["ok"]:
         print(f"[flow-graph] 观测面不足 → absence 判据不计 PASS：{evidence}", flush=True)
 
@@ -619,8 +767,13 @@ async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_
         play_events=play_events,
         turns=turns,
         evidence=evidence,
+        then_jump=then_jump,
+        after_events=after_events,
     )
-    understood = transcript_has_keyword(turns, TRIGGER_KEYWORDS)
+    # 归因用关键词：then-jump 腿的触发语是 `play_text`（退款 系），默认腿是「投诉」系。
+    understood_keywords = PLAY_KEYWORDS if then_jump is not None else TRIGGER_KEYWORDS
+    understood = transcript_has_keyword(turns, understood_keywords)
+    round_text = dict(rounds)
     result = {
         "leg": leg_name,
         "expect_off": expect_off,
@@ -629,6 +782,9 @@ async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_
         "call_id": call_id,
         "qa_id": qa_id,
         "graph_json": graph_json,
+        "then_jump": then_jump,
+        "rounds": [name for name, _ in rounds],
+        "after_text": after_text if then_jump is not None else "",
         "setup_ok": setup_ok,
         "evidence": evidence,
         # 起推前「播完」等候（2026-09-18 实弹修复）：开场白 + 逐轮，供事后归因
@@ -642,8 +798,9 @@ async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_
                 for m in measures
             ],
         },
-        "trigger_text": trigger_text,
-        "nontrigger_text": nontrigger_text,
+        "trigger_text": round_text.get("trigger", ""),
+        "nontrigger_text": round_text.get("nontrigger", ""),
+        "play_text": round_text.get("play", ""),
         "trigger_understood": understood,
         "measures": measures,
         "summary": summary,
@@ -673,12 +830,24 @@ def print_leg(res: dict, budgets: dict[str, float]) -> None:
         first = f"{m['first_audio_ms'] / 1000:.2f}s" if m.get("first_audio_ms") is not None else "无"
         print(f"  {m['name']:>10} 首声={first:>7} 语音={m.get('speech_s', 0):.1f}s "
               f"{'' if m.get('answered') else '✗哑'}  「{m['text']}」", flush=True)
-    for label in ("trigger", "nontrigger", "play"):
+    # 窗口行只渲染**本腿真跑过的轮次**（M5）：`evaluate_leg` 恒建 trigger/nontrigger/
+    # play 三键，then-jump 档没跑 trigger/nontrigger——不按轮次表过滤就会打出
+    # 「trigger FLOW_GRAPH 行：（零）」这种对不存在的轮做的空断言。
+    ran_rounds = set(res.get("rounds") or [])
+    for label in ("trigger", "nontrigger", "play", "after"):
+        if label not in v["events"]:
+            continue
+        if ran_rounds and label not in ran_rounds:
+            continue
         evs = v["events"][label]
         print(f"  {label:>10} FLOW_GRAPH 行：{evs if evs else '（零）'}", flush=True)
     print(f"  graph 轮：{v['info']['graph_turns'] or '（无）'}", flush=True)
     print(f"  信息位：play_kinds={v['info']['play_kinds'] or '（无）'} "
           f"play_miss={v['info']['play_miss']} jump_noop={v['info']['jump_noop']}", flush=True)
+    if "then_jump_logged" in v["info"]:
+        print(f"  追问链信息位：then_jump={v['info'].get('then_jump')} "
+              f"同轮 jump 日志={v['info']['then_jump_logged']} "
+              f"跳后轮步号命中={v['info']['next_turn_step']}", flush=True)
     print(f"  触发转写可辨={res['trigger_understood']}", flush=True)
     ev = res.get("evidence") or v.get("evidence") or {}
     print(f"  观测面 evidence_ok={ev.get('ok')}（log_exists={ev.get('log_exists')} "
@@ -691,7 +860,8 @@ def print_leg(res: dict, budgets: dict[str, float]) -> None:
     if pd["n"]:
         print(f"  PERCEIVED n={pd['n']} p50={pd['p50']:.0f}ms（信息位）", flush=True)
     if not res["trigger_understood"]:
-        print("  ⚠ 转写未见触发词：本腿 jump 断言不可归因于图引擎（ASR 侧问题）", flush=True)
+        what = "退款(play_qa)" if v["info"].get("then_jump") else "投诉"
+        print(f"  ⚠ 转写未见 {what} 触发词：本腿断言不可归因于图引擎（ASR 侧问题）", flush=True)
     for name, ok in v["checks"].items():
         print(f"  [{'PASS' if ok else 'FAIL'}] {name}", flush=True)
     print(f"  腿结论：{'PASS' if v['pass'] else 'FAIL'}", flush=True)
@@ -773,6 +943,48 @@ def selftest() -> int:
         ("transcript_has_keyword 忽略机制行", not transcript_has_keyword(
             [{"role": "user", "transcript": "我要投诉", "provider": "starve-ack"}],
             TRIGGER_KEYWORDS), True),
+        # ---- Phase 3.3 追问链腿（play+跳 / 无跳 / 罐头未物化）----
+        ("then-jump 正例：同轮 via=then_jump 日志", evaluate_leg(
+            expect_off=False, target_step=TARGET_STEP, then_jump=TARGET_STEP,
+            trigger_events=[], nontrigger_events=[],
+            play_events=[{"kind": "play", "binding": "bnd_c1d2e3f4", "qa": "qa-1"},
+                         {"kind": "jump", "binding": "bnd_c1d2e3f4",
+                          "step": str(TARGET_STEP), "via": "then_jump"}],
+            after_events=[], turns=_turns("graph-play", 2), evidence=_ev())["pass"], True),
+        ("then-jump 正例：跳后轮步号命中（无同轮日志）", evaluate_leg(
+            expect_off=False, target_step=TARGET_STEP, then_jump=TARGET_STEP,
+            trigger_events=[], nontrigger_events=[],
+            play_events=[{"kind": "play", "binding": "bnd_c1d2e3f4", "qa": "qa-1"}],
+            after_events=[], turns=_turns("", TARGET_STEP), evidence=_ev())["pass"], True),
+        ("then-jump 反例：罐头未物化（play_miss）→ 播都没播", evaluate_leg(
+            expect_off=False, target_step=TARGET_STEP, then_jump=TARGET_STEP,
+            trigger_events=[], nontrigger_events=[],
+            play_events=[{"kind": "play_miss", "binding": "bnd_c1d2e3f4"}],
+            after_events=[], turns=_turns("graph-play", 2), evidence=_ev())["pass"], False),
+        ("then-jump 反例：播了但没跳（无日志/无步号）", evaluate_leg(
+            expect_off=False, target_step=TARGET_STEP, then_jump=TARGET_STEP,
+            trigger_events=[], nontrigger_events=[],
+            play_events=[{"kind": "play", "binding": "bnd_c1d2e3f4", "qa": "qa-1"}],
+            after_events=[], turns=_turns("graph-play", 2), evidence=_ev())["pass"], False),
+        ("then-jump kill 腿：after 窗口图痕迹也算越闸", evaluate_leg(
+            expect_off=True, target_step=TARGET_STEP, then_jump=TARGET_STEP,
+            trigger_events=[], nontrigger_events=[], play_events=[],
+            after_events=[{"kind": "jump", "binding": "bnd_c1d2e3f4",
+                           "step": str(TARGET_STEP), "via": "then_jump"}],
+            turns=[], evidence=_ev())["pass"], False),
+        ("plan_rounds then-jump 档=播+跳后两轮", plan_rounds(
+            then_jump=TARGET_STEP, has_qa=True, trigger_text=TRIGGER_TEXT,
+            nontrigger_text=NONTRIGGER_TEXT, play_text=PLAY_TEXT, after_text=AFTER_TEXT,
+            play_round=True) == [("play", PLAY_TEXT), ("after", AFTER_TEXT)], True),
+        ("plan_rounds then-jump 档无 QA → 空表（腿跳过≠空过成 PASS）", plan_rounds(
+            then_jump=TARGET_STEP, has_qa=False, trigger_text=TRIGGER_TEXT,
+            nontrigger_text=NONTRIGGER_TEXT, play_text=PLAY_TEXT, after_text=AFTER_TEXT,
+            play_round=True) == [], True),
+        ("graph_json 默认档不带 then_jump 键",
+         all("then_jump" not in b for b in json.loads(build_graph_json("qa-1"))["bindings"]), True),
+        ("graph_json then-jump 档挂在 play_qa 绑定上",
+         next(b for b in json.loads(build_graph_json("qa-1", then_jump=TARGET_STEP))["bindings"]
+              if b["action"] == "play_qa")["then_jump"], TARGET_STEP),
     ]
 
     failed = 0
@@ -796,6 +1008,11 @@ async def main() -> int:
     parser.add_argument("--nontrigger-text", default=NONTRIGGER_TEXT)
     parser.add_argument("--play-text", default=PLAY_TEXT)
     parser.add_argument("--no-play-round", action="store_true", help="不推 play_qa 信息位轮")
+    parser.add_argument("--then-jump", action="store_true",
+                        help=f"追问链腿（Phase 3.3）：play_qa 绑定带 then_jump={TARGET_STEP}，"
+                             "轮次表=播+跳后两轮；跳后步号与同轮 jump 日志取 OR 判据")
+    parser.add_argument("--after-text", default=AFTER_TEXT,
+                        help="--then-jump 的跳后轮话术（须避开确认/收线/异议/提问七族词与图触发词）")
     parser.add_argument("--keep-template", action="store_true", help="保留探针模板（默认跑完删）")
     parser.add_argument("--budget-first-ms", type=float, default=2500.0)
     parser.add_argument("--budget-perceived-ms", type=float, default=3000.0)
@@ -812,12 +1029,21 @@ async def main() -> int:
         trigger_text=args.trigger_text, nontrigger_text=args.nontrigger_text,
         play_text=args.play_text, play_round=not args.no_play_round,
         keep_template=args.keep_template, budgets=budgets,
+        then_jump=TARGET_STEP if args.then_jump else None,
+        after_text=args.after_text,
     )
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     out = REPORT_DIR / f"{int(time.time())}-{res['leg']}.json"
     out.write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n[flow-graph] JSON 报告 → {out}", flush=True)
+    if res.get("skipped"):
+        # 未评估 ≠ PASS：无 QA 条目时链腿跑不起来，显式跳过并以退出码 1 收尾
+        # （不许把「没跑出东西」读成「零痕迹=PASS」；音频未物化不走这条——见 run_leg）。
+        print(f"FLOW_GRAPH_PROBE leg={res['leg']} SKIPPED ({res['skipped']}) → FAIL"
+              "（腿未评估；无 QA 条目——先建条目，再 python tools/bok.py tts-pregen --qa）",
+              flush=True)
+        return 1
     checks = res["verdict"]["checks"]
     print("FLOW_GRAPH_PROBE leg=" + res["leg"] + " " +
           " ".join(f"{k}={'1' if v else '0'}" for k, v in checks.items()) +

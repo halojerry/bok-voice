@@ -11,7 +11,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -190,4 +190,106 @@ test("deriveGraph 三类节点 data.kind 判别面（step/qaEntry/intent 同面�
   assert.equal(graph.nodes.find((n) => n.id === "step:global").data.kind, "step");
   assert.equal(graph.nodes.find((n) => n.id === "h").data.kind, "qaEntry");
   assert.equal(graph.nodes.find((n) => n.id === "intent:int_1a2b3c4d").data.kind, "intent");
+});
+
+// ---- Phase 3.3 追问链 then_jump：加载/保存往返 + 默认关（勘误预检 4 的守门测试）----
+// 勘误预检 4：page.tsx 的保存是**逐字段重建**——不进 BindingDraft 的键编辑一次即蒸发。
+// 故往返测试必须跑**真代码**（qa.bindingFromDraft=submit 对两种动作的唯一重建入口），
+// 不得在测试里复刻一份投影（复刻=并行实现，改坏生产却照样绿：review R1 I1 的变异实验）。
+// 加载侧 bindingThenJumpToDraft 进草稿，保存侧 bindingFromDraft/bindingThenJumpField 出键。
+
+/** 夹具按 bindingFromDraft 的**字段发射顺序**书写（id/intent/priority/once/enabled →
+ *  action → qa_id → then_jump），故可用整串比对断言「保存后逐字节不变」，而非仅比值。 */
+const CHAIN_DOC = {
+  version: 1,
+  intents: [{ id: "int_1a2b3c4d", label: "退款", keywords: ["退款"], steps: [], enabled: true }],
+  bindings: [
+    {
+      id: "bnd_7e8f9a0b", intent: "int_1a2b3c4d", priority: 10, once: false, enabled: true,
+      action: "play_qa", qa_id: "qa-1", then_jump: 4,
+    },
+    { id: "bnd_c1d2e3f4", intent: "int_1a2b3c4d", action: "jump_step", step: 2, priority: 10, once: false, enabled: true },
+  ],
+};
+
+test("then_jump 往返：打开既有追问链→改名保存→链逐字节存活（勘误预检 4）", () => {
+  const doc = qa.parseGraphDoc(JSON.stringify(CHAIN_DOC));
+  const original = doc.bindings[0];
+  assert.equal(original.then_jump, 4);
+  // 加载：then_jump 进草稿（缺这一步=打开即丢链）
+  const draft = qa.bindingThenJumpToDraft(original.then_jump, 5);
+  assert.equal(draft, 4);
+  // 保存：走 page.tsx submit 的真实重建函数（改优先级，其余原样）
+  const saved = qa.bindingFromDraft({ ...original, then_jump: draft, priority: 3 }, original.intent, 5);
+  // 链存活且值不变；再经一次 parse 仍读得回（落库文本→运行时解析同路）
+  assert.equal(saved.then_jump, 4);
+  assert.equal(saved.priority, 3);
+  assert.equal(qa.parseGraphDoc(JSON.stringify({ version: 1, intents: CHAIN_DOC.intents, bindings: [saved] }))
+    .bindings[0].then_jump, 4);
+  // 未改字段时逐字节同（含键序）——真代码不许顺手重排/丢键
+  const untouched = qa.bindingFromDraft(original, original.intent, 5);
+  assert.equal(JSON.stringify(untouched), JSON.stringify(original));
+});
+
+test("then_jump 保存侧：0 / jump_step / 坏值绝不写键（CP 严格校验会 400）", () => {
+  const base = CHAIN_DOC.bindings[0];
+  // 清空→不写键（键缺席=无链）；经真实重建函数同样不带键
+  assert.deepEqual(qa.bindingThenJumpField("play_qa", 0, 5), {});
+  assert.deepEqual(qa.bindingFromDraft({ ...base, then_jump: 0 }, base.intent, 5), {
+    id: base.id, intent: base.intent, priority: 10, once: false, enabled: true, action: "play_qa", qa_id: "qa-1",
+  });
+  // jump_step 行带 then_jump → 恒 {}
+  assert.deepEqual(qa.bindingThenJumpField("jump_step", 4, 5), {});
+  // …且草稿行即使带着 then_jump，重建出的 jump_step 绑定也不许出现该键
+  assert.deepEqual(
+    qa.bindingFromDraft(
+      { id: "bnd_x", action: "jump_step", step: 2, then_jump: 4, priority: 10, once: false, enabled: true },
+      "int_1a2b3c4d", 5,
+    ),
+    { id: "bnd_x", intent: "int_1a2b3c4d", priority: 10, once: false, enabled: true, action: "jump_step", step: 2 },
+  );
+  for (const bad of [NaN, Infinity, -1, 0, null, undefined, ""]) {
+    assert.deepEqual(qa.bindingThenJumpField("play_qa", bad, 5), {}, String(bad));
+  }
+  // 越界按真实步数收口（同 step 的 M28 姿势）
+  assert.deepEqual(qa.bindingThenJumpField("play_qa", 99, 5), { then_jump: 5 });
+  // review R1 M2：上界再压 CP 合同 999（>999 步的话术也不吐越界键）
+  assert.deepEqual(qa.bindingThenJumpField("play_qa", 4, 5000), { then_jump: 4 });
+  assert.deepEqual(qa.bindingThenJumpField("play_qa", 5000, 10000), { then_jump: 999 });
+  assert.equal(qa.bindingFromDraft({ ...base, then_jump: 5000 }, base.intent, 10000).then_jump, 999);
+});
+
+test("then_jump 加载侧：缺省/坏值落 0（不跳），越界按真实步数钳位", () => {
+  assert.equal(qa.bindingThenJumpToDraft(undefined, 5), 0); // 存量图无键
+  assert.equal(qa.bindingThenJumpToDraft(null, 5), 0);
+  assert.equal(qa.bindingThenJumpToDraft("x", 5), 0);
+  assert.equal(qa.bindingThenJumpToDraft(0, 5), 0);
+  assert.equal(qa.bindingThenJumpToDraft(4, 5), 4);
+  assert.equal(qa.bindingThenJumpToDraft(9, 5), 5); // 步数被改小后越界 → 收口
+  assert.equal(qa.bindingThenJumpToDraft(4, 0), 1); // 零步骤话术不产生 <1 值
+});
+
+test("then_jump 画布第二边默认关：带链的图不多出任何边（零视觉变化）", () => {
+  const steps = qa.parseTemplateSteps(JSON.stringify(
+    [{ goal: "g1", ref: "r1" }, { goal: "g2", ref: "r2" }, { goal: "g3", ref: "r3" }, { goal: "g4", ref: "r4" }],
+  ));
+  // 目标快答条目在位（否则 play_qa 边悬空不画，证明不了「不额外画边」）。
+  const rows = [{ id: "qa-1", question_text: "怎么退", answer_text: "点这里", lang: "zh", scope: "global", step_index: -1, cluster_head_id: "", enabled: true }];
+  const graph = qa.deriveGraph(rows, steps, {
+    langFilter: "all", graph: qa.parseGraphDoc(JSON.stringify(CHAIN_DOC)),
+  });
+  const bindEdges = graph.edges.filter((e) => e.data?.kind === "binding").map((e) => e.id).sort();
+  assert.deepEqual(bindEdges, ["bind:bnd_7e8f9a0b", "bind:bnd_c1d2e3f4"]); // 链图仍只有一对绑定边
+  assert.equal(graph.edges.filter((e) => String(e.id).startsWith("thenjump:")).length, 0);
+});
+
+// 接线守门（review R1 I1 的补强）：纯函数测得到重建逻辑，却测不到「page.tsx 有没有调它、
+// 调用结果有没有被 push 进落库数组」。逐字段重建的丢键风险恰在这两行，故源码扫描钉死。
+test("page.tsx 接线：草稿进 then_jump、submit 用真实重建函数且结果直接入 nextBindings", () => {
+  const src = readFileSync(path.join(WEB_ROOT, "app", "(app)", "qa", "page.tsx"), "utf8");
+  assert.match(src, /then_jump:\s*number;/); // 草稿类型带 then_jump（不进草稿=保存即蒸发）
+  assert.match(src, /then_jump:\s*bindingThenJumpToDraft\(/); // 加载侧走纯函数
+  // 保存侧：重建结果必须直接进落库数组（不许再自拼 { ...common, ... }）
+  assert.match(src, /nextBindings\.push\(\s*bindingFromDraft\(row,\s*intent\.id,\s*stepCount\)/);
+  assert.doesNotMatch(src, /nextBindings\.push\(\s*\{\s*\.\.\.common/);
 });

@@ -3794,6 +3794,34 @@ async def entrypoint(ctx):
                             f"qa={_gbinding.qa_id}",
                             flush=True,
                         )
+                        # ---- 追问链（Phase 3.3，spec §3）：罐头播完当场同步跳，下一轮
+                        # 按新步走。本分支以 StopResponse 收尾，冇任何 LLM 请求——唔喺本
+                        # 分支渲染当前步（渲染只会烧掉该步首渲染账本 _last_render_step/
+                        # _just_advanced，令下一轮流程块重渲染退成分支模式，底稿与
+                        # 【跳转进入】结构性失落）；位移状态已由 jump_to 置好，下一轮流程块
+                        # 首渲染即该步正稿+【跳转进入】，且真被请求消费。复用 Phase 2 位移
+                        # 记账纪律：实际位移才打 jump 日志；同位/closing/钳到同位 → jump_noop
+                        # 且零额外消耗（then_jump 是同一绑定的动作后缀，不另立 once 账本条目）。
+                        # 注：_invalidate_stale_preemptive 的标记随本轮 turn_ctx 副本蒸发
+                        # （承重件是 jump_to 置的位移状态）；照 spec 调用，零成本。
+                        # 0/False 为静默 no-op（T1 parse 丢 bool/拒 0——未来若扩「0=跳回首步」语义勿沿用真值门）。
+                        if _gbinding.then_jump:
+                            _tj_target = int(_gbinding.then_jump) - 1
+                            if flow_ctrl.apply_then_jump(_gbinding.then_jump):
+                                _invalidate_stale_preemptive(
+                                    f"流程跳转 → 第 {flow_ctrl.current + 1} 步"
+                                )
+                                print(
+                                    f"FLOW_GRAPH jump binding={_gbinding.id} "
+                                    f"step={flow_ctrl.current + 1} via=then_jump",
+                                    flush=True,
+                                )
+                            else:
+                                print(
+                                    f"FLOW_GRAPH jump_noop binding={_gbinding.id} "
+                                    f"step={_tj_target + 1} via=then_jump",
+                                    flush=True,
+                                )
                         raise StopResponse()  # 压掉本轮 LLM(WA 累积同款)
                     print(
                         f"FLOW_GRAPH play_miss binding={_gbinding.id} "
