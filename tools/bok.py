@@ -1053,18 +1053,37 @@ def _apply_judge_env(env: dict[str, str], _cur: dict[str, str]) -> None:
         env["FLOW_JUDGE_LLM_MODEL"] = _settle
 
 
-def _apply_flow_graph_env(env: dict[str, str]) -> None:
-    """话术图 kill-switch 透传（2026-09-18 实弹发现，与 `_interp_env` 同款教训）。
+# A 线「文档里广告过的 kill-switch」白名单透传单点(2026-09-18 终审 I1 收编):
+# 新开关只加这里,dev(_agent_worker_env)与 prod(_agent_prod_env)同源生效。
+# BOK_QA_* 三键同病(3.1 的 PRIORITY 曾经也是死开关)——一并收进来。
+_BOK_PASSTHROUGH_KEYS = (
+    "BOK_FLOW_GRAPH",
+    "BOK_QA_ROTATION",
+    "BOK_QA_PRIORITY",
+    "BOK_QA_FASTPATH",
+)
+
+
+def _apply_bok_passthrough_env(env: dict[str, str]) -> None:
+    """A 线逃生门透传（2026-09-18 实弹发现，与 `_interp_env` 同款教训）。
 
     `_agent_worker_env`/`_agent_prod_env` 都是**白名单 env**（dict 里没写的键一律
     不带 `os.environ`）——`BOK_FLOW_GRAPH=0 python tools/bok.py serve` 写在命令行上
     **到不了 agent worker**，worker 按默认 `"1"` 跑：kill 腿「全程零 FLOW_GRAPH」
     结构性测不出（实弹：worker pid env 只有 2 枚 BOK_ 键、无 BOK_FLOW_GRAPH，
-    jump/play 照发，探针如实报 FAIL）。文档里的逃生门必须真能走到 worker，故显式
-    带上；未设/空串不注入（默认档逐字节不变）。"""
-    value = os.environ.get("BOK_FLOW_GRAPH")
-    if value:
-        env["BOK_FLOW_GRAPH"] = value
+    jump/play 照发，探针如实报 FAIL）。QA 三开关（ROTATION/PRIORITY/FASTPATH）
+    同病：AGENTS/文档广告的逃生门必须真能走到 worker。故显式带上；未设/空串不
+    注入（默认档逐字节不变）。"""
+    for key in _BOK_PASSTHROUGH_KEYS:
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+
+
+def _apply_flow_graph_env(env: dict[str, str]) -> None:
+    """历史名（单测/旧调用面）：passthrough 透传的薄别名。"""
+    _apply_bok_passthrough_env(env)
+
 
 
 def _agent_worker_env(py) -> dict[str, str]:
@@ -1081,7 +1100,7 @@ def _agent_worker_env(py) -> dict[str, str]:
         "MLX_LLM_MODEL": model_path({**_cur, "llm": resolve_llm_repo(_cur)}, "llm"),
     }
     _apply_judge_env(env, _cur)
-    _apply_flow_graph_env(env)
+    _apply_bok_passthrough_env(env)
     # .venv312 OpenSSL 无默认 CA 束 → MiniMax WSS 必炸;固化 SSL_CERT_FILE。
     _bake_ssl_cert_file(env, py)
     return env
@@ -1983,7 +2002,7 @@ def _agent_prod_env() -> dict[str, str]:
         "MLX_LLM_MODEL": model_path({**_cur, "llm": resolve_llm_repo(_cur)}, "llm"),
     }
     _apply_judge_env(env, _cur)
-    _apply_flow_graph_env(env)
+    _apply_bok_passthrough_env(env)
     # .venv312 OpenSSL 无默认 CA 束 → MiniMax WSS 必炸 SSLCertVerificationError；
     # 固化 SSL_CERT_FILE（P5 遗留项），interp 经 _interp_env 的 dict 拷贝继承。
     return _bake_ssl_cert_file(env, repo_python())
