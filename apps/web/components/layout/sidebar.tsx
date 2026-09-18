@@ -185,9 +185,13 @@ export function Sidebar({ mobileOpen, onMobileClose }: SidebarProps) {
   }, []);
 
   // 换路由清舞台临时态：自动折叠是「进舞台页」的一次性行为，不跨路由续命。
-  useEffect(() => {
+  // 渲染期同步重置（React 官方「props 变化重置派生态」模式）——舞台路由互跳
+  // （/interpret ↔ /translate）不残留上一页手动展开的一帧（effect 版会迟一帧）。
+  const [prevPathname, setPrevPathname] = useState(pathname);
+  if (prevPathname !== pathname) {
+    setPrevPathname(pathname);
     setStageOverride(null);
-  }, [pathname]);
+  }
 
   // 生效折叠态：舞台路由=自动折叠（用户当页临时切换可覆写）；其余路由=存储偏好。
   // 舞台判定只依赖 pathname（prerender 与客户端同源），不引入水合 mismatch。

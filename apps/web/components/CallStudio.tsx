@@ -147,7 +147,6 @@ function LiveAgentPanel({ room, session }: { room: Room | null; session: UseSess
           <StartAudioButton label="点击开启声音" />
           <AgentControlBar
             saveUserChoices={false}
-            isConnected
             controls={{ leave: false, camera: false, microphone: true, screenShare: false, chat: false }}
           />
         </div>
