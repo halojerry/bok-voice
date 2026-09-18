@@ -46,7 +46,7 @@ export type NavItem = {
   icon: LucideIcon;
 };
 
-/** 主导航分组（顺序即侧边栏顺序；组内相对顺序=原扁平 NAV）。 */
+/** 主导航分组（顺序即侧边栏顺序；分组序取代旧扁平 NAV 序，权限语义不受顺序影响）。 */
 export const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
   {
     label: "工作台",
