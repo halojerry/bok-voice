@@ -232,3 +232,49 @@ def test_node_artifact_download_auth_and_traversal(monkeypatch, tmp_path):
         ):
             got = client.get(bad, headers={"Authorization": f"Bearer {node_token}"})
             assert got.status_code in (403, 404), (bad, got.status_code)
+
+
+def test_node_logs_upload_list_download(monkeypatch, tmp_path):
+    """W2 远程日志通道：node_token 上传 gzip 束（自证+魔数+限额）→ root 清单/
+    下载回读；无凭据 401、非 gzip 415、超限 413、坏文件名 404。"""
+    import gzip as _gzip
+
+    from fastapi.testclient import TestClient
+
+    from control_plane.main import app
+
+    monkeypatch.setenv("DATABASE_URL", "")
+    monkeypatch.delenv("BOK_CP_TOKEN", raising=False)
+    monkeypatch.setenv("BOK_NODE_ARTIFACTS_DIR", str(tmp_path / "dl"))
+    with TestClient(app) as client:
+        reg = client.post("/api/nodes/register", json={"name": "n", "platform": "cuda-linux"})
+        node_id, token = reg.json()["node_id"], reg.json()["node_token"]
+        headers = {"Authorization": f"Bearer {token}"}
+        payload = _gzip.compress(b"fake-log-bundle")
+        # 无凭据 401（豁免只是免中间件，端点内 node_token 闸真实在岗）
+        assert client.post("/api/nodes/logs", content=payload).status_code == 401
+        assert client.post("/api/nodes/logs", content=payload,
+                           headers={"Authorization": "Bearer bogus"}).status_code == 401
+        # 非 gzip 415
+        assert client.post("/api/nodes/logs", content=b"not-gzip",
+                           headers=headers).status_code == 415
+        # 超限 413（体首两字节是 gzip 魔数，验证限额先于魔数挡下）
+        big = b"\x1f\x8b" + b"0" * (9 * 1024 * 1024)
+        assert client.post("/api/nodes/logs", content=big,
+                           headers=headers).status_code == 413
+        # 正常上传（同秒两发不互覆——文件名带体长+短随机）
+        r1 = client.post("/api/nodes/logs", content=payload,
+                         headers={**headers, "Content-Type": "application/gzip"})
+        r2 = client.post("/api/nodes/logs", content=payload,
+                         headers={**headers, "Content-Type": "application/gzip"})
+        assert r1.status_code == 200 and r1.json()["ok"] is True
+        assert r2.json()["file"] != r1.json()["file"]
+        # 清单新→旧、体长如实；下载回读逐字节一致
+        listing = client.get(f"/api/nodes/{node_id}/logs").json()
+        assert len(listing) == 2 and all(x["bytes"] == len(payload) for x in listing)
+        got = client.get(f"/api/nodes/{node_id}/logs/{listing[0]['file']}")
+        assert got.status_code == 200 and got.content == payload
+        # 坏文件名（白名单外/不存在）→ 404
+        assert client.get(f"/api/nodes/{node_id}/logs/nope.tar.gz").status_code == 404
+        assert client.get(
+            f"/api/nodes/{node_id}/logs/..%2F..%2Fsecret.tar.gz").status_code == 404

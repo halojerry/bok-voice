@@ -272,6 +272,27 @@ export const api = {
       `/api/nodes/${encodeURIComponent(nodeId)}/unrevoke`,
       { method: "POST" },
     ),
+  // 远程日志通道（W2）：下发取日志指令 → 节点下个心跳周期上传 → root 查看下载。
+  enqueueNodeCommand: (
+    nodeId: string,
+    body: { action: string; version?: string; force?: boolean },
+  ) =>
+    request<{ id: string; status: string }>(
+      `/api/nodes/${encodeURIComponent(nodeId)}/commands`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+  listNodeLogs: (nodeId: string) =>
+    request<NodeLogFile[]>(
+      `/api/nodes/${encodeURIComponent(nodeId)}/logs`,
+    ),
+  downloadNodeLog: (nodeId: string, file: string) =>
+    fetch(
+      `${apiBase()}/api/nodes/${encodeURIComponent(nodeId)}/logs/${encodeURIComponent(file)}`,
+      { headers: authHeaders() },
+    ).then(async (res) => {
+      if (!res.ok) throw await toError(res);
+      return res.blob();
+    }),
   setupStatus: () => request<SetupStatus>("/api/setup"),
   setupDownload: () => fetch(`${apiBase()}/api/setup/download`, { method: "POST", headers: authHeaders() }).then(async (res) => {
     if (!res.ok) throw await toError(res);
@@ -332,4 +353,11 @@ export type NodeRow = {
   license_id?: string;
   /** 指纹只出前 12 位 hex（可辨识、不可还原） */
   fingerprint_prefix?: string;
+};
+
+/** 节点已上报的日志束（W2）：新→旧，bytes=gzip 体长。 */
+export type NodeLogFile = {
+  file: string;
+  bytes: number;
+  uploaded_at: string;
 };

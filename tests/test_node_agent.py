@@ -136,9 +136,11 @@ def test_perform_update_rejects_bad_sha_and_bad_version(tmp_path, monkeypatch):
 
     import node_agent as na
 
-    cfg = _cfg(version="v0.1.0")
+    # 版本恒无 v 形态（VERSION 文件契约）；命令随手带 v 也归一判 already-at。
+    cfg = _cfg(version="0.1.0")
     assert na.perform_update(cfg, "", root=tmp_path) == "update: empty version"
-    assert na.perform_update(cfg, "v0.1.0", root=tmp_path) == "update: already at v0.1.0"
+    assert na.perform_update(cfg, "0.1.0", root=tmp_path) == "update: already at 0.1.0"
+    assert na.perform_update(cfg, "v0.1.0", root=tmp_path) == "update: already at 0.1.0"
     # 非法版本号（URL 路径段白名单外）——防御性拒绝，不发起任何请求
     assert "invalid version" in na.perform_update(cfg, "../etc", root=tmp_path)
     assert "invalid version" in na.perform_update(cfg, "a/b", root=tmp_path)
@@ -216,3 +218,133 @@ def test_build_ui_server_requires_entry_html(tmp_path):
         assert "index.html" in str(exc)
     else:
         raise AssertionError("empty ui-dir should refuse to serve")
+
+
+# ---- W1 双面日志 + W2 upload_logs（2026-09-18）----
+
+import logging  # noqa: E402
+
+from node_agent import (  # noqa: E402
+    HeartbeatState,
+    LOG,
+    setup_logging,
+    upload_recent_logs,
+)
+
+
+def _detach_file_handlers() -> None:
+    """LOG 是模块级单例：测试后摘掉 FileHandler 并 close，避免握着已删的
+    tmp_path 文件（Windows 上会让 pytest 清理报 PermissionError）。"""
+    for h in list(LOG.handlers):
+        if isinstance(h, logging.FileHandler):
+            LOG.removeHandler(h)
+            h.close()
+
+
+def test_setup_logging_writes_file_and_is_idempotent(tmp_path):
+    log_dir = tmp_path / "logs"
+    try:
+        path = setup_logging(log_dir)
+        assert path is not None and path.is_file()
+        LOG.warning("hello-w1")
+        for h in LOG.handlers:
+            h.flush()
+        assert "hello-w1" in path.read_text(encoding="utf-8")
+        handlers_before = list(LOG.handlers)
+        setup_logging(log_dir)
+        assert LOG.handlers == handlers_before  # 幂等：不叠加 handler
+    finally:
+        _detach_file_handlers()
+
+
+def test_setup_logging_unwritable_dir_degrades(tmp_path):
+    # 「路径是文件」制造 mkdir 必败（跨平台比 chmod 稳）：降级 console-only。
+    blocker = tmp_path / "blocked"
+    blocker.write_text("x", encoding="utf-8")
+    try:
+        assert setup_logging(blocker) is None
+        assert not any(isinstance(h, logging.FileHandler) for h in LOG.handlers)
+    finally:
+        _detach_file_handlers()
+
+
+def test_upload_recent_logs_bundles_and_posts(tmp_path, monkeypatch):
+    import io
+    import tarfile
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "node-agent.log").write_text("line-1\n", encoding="utf-8")
+    stack_dir = tmp_path / "stack"
+    stack_dir.mkdir()
+    (stack_dir / "agent.log").write_text("stack-1\n", encoding="utf-8")
+    cfg = NodeConfig(cp_url="http://cp.test", node_token="tok-1",
+                     fingerprint="fp", version="1.0.0")
+    captured: dict = {}
+
+    class FakeResp:
+        def read(self):
+            return b'{"ok": true}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(req, timeout=0):
+        captured["url"] = req.full_url
+        captured["auth"] = req.headers.get("Authorization")
+        captured["payload"] = req.data
+        return FakeResp()
+
+    monkeypatch.setattr("node_agent.urllib.request.urlopen", fake_urlopen)
+    err = upload_recent_logs(cfg, log_dir=log_dir, stack_dir=stack_dir)
+    assert err == ""
+    assert captured["url"] == "http://cp.test/api/nodes/logs"
+    assert captured["auth"] == "Bearer tok-1"
+    with tarfile.open(fileobj=io.BytesIO(captured["payload"])) as tar:
+        names = sorted(tar.getnames())
+    assert names == ["node-agent.log", "stack/agent.log"]
+
+
+def test_upload_recent_logs_budget_skips_and_reports_empty(tmp_path):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "node-agent.log").write_text("x" * 64, encoding="utf-8")
+    cfg = NodeConfig(cp_url="http://cp.test", node_token="tok-1",
+                     fingerprint="fp", version="1.0.0")
+    # 全部货源超预算 → 明文失败，不发空包
+    err = upload_recent_logs(cfg, log_dir=log_dir, max_bytes=16)
+    assert err == "no log files to upload"
+
+
+def test_upload_recent_logs_http_error_returns_reason(tmp_path, monkeypatch):
+    import urllib.error
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "node-agent.log").write_text("line\n", encoding="utf-8")
+    cfg = NodeConfig(cp_url="http://cp.test", node_token="tok-1",
+                     fingerprint="fp", version="1.0.0")
+
+    def raise_http(req, timeout=0):
+        raise urllib.error.HTTPError(req.full_url, 413, "too large", None, None)
+
+    monkeypatch.setattr("node_agent.urllib.request.urlopen", raise_http)
+    err = upload_recent_logs(cfg, log_dir=log_dir)
+    assert err == "upload failed: HTTP 413"
+
+
+def test_dispatch_upload_logs_acks(monkeypatch):
+    cfg = NodeConfig(cp_url="http://cp.test", node_token="tok-1",
+                     fingerprint="fp", version="1.0.0")
+    hb = HeartbeatState()
+    monkeypatch.setattr("node_agent.upload_recent_logs", lambda cfg, **kw: "")
+    dispatch_commands(cfg, [{"id": "cmd-u1", "action": "upload_logs"}], hb=hb)
+    assert hb.pending_acks == [{"id": "cmd-u1", "ok": True, "result": "logs uploaded"}]
+
+    hb2 = HeartbeatState()
+    monkeypatch.setattr("node_agent.upload_recent_logs", lambda cfg, **kw: "boom")
+    dispatch_commands(cfg, [{"id": "cmd-u2", "action": "upload_logs"}], hb=hb2)
+    assert hb2.pending_acks == [{"id": "cmd-u2", "ok": False, "result": "boom"}]

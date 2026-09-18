@@ -163,7 +163,12 @@ def test_root_revoked_kills_without_license_flow(monkeypatch, tmp_path):
 
 
 def test_root_revoked_observe_only_env_disables_kill(monkeypatch, tmp_path, capsys):
-    """BOK_NODE_KILL_ON_REVOKE=0 观察档：逐轮大声日志、不停栈不退出、按失联计数。"""
+    """BOK_NODE_KILL_ON_REVOKE=0 观察档：逐轮大声日志、不停栈不退出、按失联计数。
+
+    W1 起输出走 LOG（console handler 在 setup_logging 才挂）——本测显式挂
+    console-only handler 让 capsys 捕获，测后摘除（LOG 是模块级单例）。"""
+    import logging
+
     cfg = _cfg(tmp_path)
     monkeypatch.setenv("BOK_NODE_KILL_ON_REVOKE", "0")
     monkeypatch.setattr(node_agent, "heartbeat_once",
@@ -172,10 +177,21 @@ def test_root_revoked_observe_only_env_disables_kill(monkeypatch, tmp_path, caps
     monkeypatch.setattr(node_agent, "_kill_stack_hook", lambda: stops.append(1))
     monkeypatch.setattr(node_agent, "ensure_token",
                         lambda *a, **k: registers.append(1) or ("node-x", "tok-x"))
-    assert node_agent.heartbeat_tick(cfg, 0, license_key="bokn_k",
-                                     state_file=tmp_path / "state.json") == 1
-    assert node_agent.heartbeat_tick(cfg, 1, license_key="bokn_k",
-                                     state_file=tmp_path / "state.json") == 2
+    # LOG 是模块级单例：先前测试可能留有指向旧 stdout capture 的 handler——
+    # 全清后重挂 console-only，本测的 capsys 才捕获得到。
+    for h in list(node_agent.LOG.handlers):
+        node_agent.LOG.removeHandler(h)
+    node_agent.setup_logging(None)
+    try:
+        assert node_agent.heartbeat_tick(cfg, 0, license_key="bokn_k",
+                                         state_file=tmp_path / "state.json") == 1
+        assert node_agent.heartbeat_tick(cfg, 1, license_key="bokn_k",
+                                         state_file=tmp_path / "state.json") == 2
+    finally:
+        for h in list(node_agent.LOG.handlers):
+            node_agent.LOG.removeHandler(h)
+            h.close()
+        assert not any(isinstance(h, logging.FileHandler) for h in node_agent.LOG.handlers)
     assert stops == [] and registers == []
     assert capsys.readouterr().out.count("KILLSWITCH (observe-only)") == 2
 

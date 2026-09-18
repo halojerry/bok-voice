@@ -78,15 +78,37 @@ if [ -d "$STAGE/$FIRST" ]; then SRC="$STAGE/$FIRST"; fi
 say "代码包 -> $TARGET（覆盖式更新，runtime/ 与本地数据保留）"
 cp -R "$SRC/." "$TARGET/"
 
-# ---- 预构建运行时包（可选；404=云侧未发布，报清原因）----
+# ---- 预构建运行时包（可选；per-OS 别名优先，绝不跨平台误装）----
+# 别名由 publish_node_pkg.sh 按工件名落卷：runtime/latest-<os>-<arch>/。
+# 通用 runtime/latest 恒为 win 优先（存量客户机队契约），仅未知平台兜底——
+# 已识别平台拿不到本平台包时宁可不装（架构不符的运行时比没有更糟）。
 if [[ $WITH_RUNTIME -eq 1 ]]; then
-  if curl -fsSL -H "Authorization: Bearer $CRED" \
+  RT_ALIAS=""
+  case "$(uname -s)-$(uname -m)" in
+    Darwin-arm64)  RT_ALIAS="latest-mac-arm64" ;;
+    Darwin-x86_64) RT_ALIAS="latest-mac-x86_64" ;;
+    Linux-x86_64)  RT_ALIAS="latest-linux-x86_64" ;;
+    Linux-aarch64) RT_ALIAS="latest-linux-aarch64" ;;
+    MINGW*|MSYS*)  RT_ALIAS="latest-win" ;;
+  esac
+  fetched=""
+  if [[ -n "$RT_ALIAS" ]]; then
+    if curl -fsSL -H "Authorization: Bearer $CRED" \
+        "$BASE/runtime/$RT_ALIAS/runtime-latest.tar.gz" -o "$TMP/rt.tar.gz"; then
+      fetched="$RT_ALIAS"
+    else
+      say "本平台运行时包 runtime/$RT_ALIAS 未发布——跳过（不落其他平台包，以免架构不符）；操作员 publish 后重跑"
+    fi
+  elif curl -fsSL -H "Authorization: Bearer $CRED" \
       "$BASE/runtime/latest/runtime-latest.tar.gz" -o "$TMP/rt.tar.gz"; then
-    say "拉取运行时包 runtime/latest …"
-    mkdir -p "$TARGET/runtime"
-    tar -xzf "$TMP/rt.tar.gz" -C "$TARGET/runtime"
+    fetched="latest"
   else
     say "运行时包未发布（runtime/latest 404）——需要全栈时由操作员 publish 后重跑"
+  fi
+  if [[ -n "$fetched" ]]; then
+    say "拉取运行时包 runtime/$fetched …"
+    mkdir -p "$TARGET/runtime"
+    tar -xzf "$TMP/rt.tar.gz" -C "$TARGET/runtime"
   fi
 fi
 
