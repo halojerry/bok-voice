@@ -3,79 +3,14 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
-import {
-  hasPage,
-  isManager,
-  useSession,
-  useSessionActions,
-  type PageKey,
-  type Session,
-} from "@/components/session-context";
+import { useSession, useSessionActions } from "@/components/session-context";
+import { FLAT_NAV as NAV, matchesPath, navVisible } from "@/lib/navigation";
 
-type NavItem = {
-  href: string;
-  label: string;
-  /** 页面权限键（契约 §1；user 需有效集含该键才可见）。 */
-  key?: PageKey;
-  /** 主管专属（不可授予 user，见契约 §1）；管理员/匿名本地模式可见。 */
-  admin?: boolean;
-  /** root 专属（平台面，如 /nodes 节点吊销）；管理员与匿名本地模式也不可见。 */
-  rootOnly?: boolean;
-};
-
-/** 主导航（user 项在前、主管管理区在后；顺序即契约 §4 的最终顺序）。 */
-const NAV: NavItem[] = [
-  { href: "/calls", label: "会话", key: "calls" },
-  { href: "/roster", label: "名册", key: "roster" },
-  { href: "/campaigns", label: "外呼", key: "campaigns" },
-  { href: "/objects", label: "对象", key: "objects" },
-  { href: "/qa", label: "快答库", key: "qa" },
-  { href: "/templates", label: "话术", key: "templates" },
-  { href: "/interpret", label: "同传", key: "interpret" },
-  { href: "/reports", label: "报表", key: "reports" },
-  { href: "/supervisor", label: "主管台", admin: true },
-  { href: "/users", label: "员工", admin: true },
-  { href: "/nodes", label: "节点", rootOnly: true },
-  { href: "/knowledge", label: "知识库", admin: true },
-  { href: "/personas", label: "人设", admin: true },
-  { href: "/audit", label: "审计", admin: true },
-  { href: "/settings", label: "设置", admin: true },
-];
-
-/** 不在主导航中但需路由守卫的页面：/translate（与同传同键）。 */
-const GUARD_ONLY: NavItem[] = [
-  { href: "/translate", label: "同传", key: "interpret" },
-];
-
-/** 路由访问门（契约 §4）：open=放行；page=按权限键；manager=主管专属；root=root 专属。 */
-export type RouteGate =
-  | { kind: "open" }
-  | { kind: "page"; key: PageKey }
-  | { kind: "manager" }
-  | { kind: "root" };
-
-/** 前缀匹配：/calls 命中 /calls 与 /calls/**（静态导出尾斜杠兼容），不命中 /callsXYZ。 */
-function matchesPath(pathname: string, prefix: string): boolean {
-  return pathname === prefix || pathname.startsWith(`${prefix}/`);
-}
-
-/** 路径 → 访问门；未匹配任何前缀的路径一律放行（如 "/"、"/setup"）。 */
-export function gateForPath(pathname: string): RouteGate {
-  const hit = [...NAV, ...GUARD_ONLY].find((n) => matchesPath(pathname, n.href));
-  if (!hit) return { kind: "open" };
-  if (hit.rootOnly) return { kind: "root" };
-  if (hit.admin) return { kind: "manager" };
-  return hit.key ? { kind: "page", key: hit.key } : { kind: "open" };
-}
-
-/** 导航项可见性：root 专属项仅登录 root 可见；匿名本地模式/admin=主管项全可见；user=权限键 ∩ 有效集。 */
-function navVisible(item: NavItem, session: Session | null): boolean {
-  if (!session) return false;
-  if (item.rootOnly) return !session.anonymous && session.role === "root";
-  if (isManager(session)) return true;
-  if (item.admin) return false;
-  return item.key ? hasPage(session, item.key) : true;
-}
+// 导航事实源已迁 @/lib/navigation（P2 Task 1，分组侧边栏地基）；本组件渲染行为
+// 零变化。gateForPath/RouteGate 原地转出口——app-shell 等既有 import 面不变
+// （Task 3 退役本组件时随壳一并改源）。
+export { gateForPath } from "@/lib/navigation";
+export type { RouteGate } from "@/lib/navigation";
 
 /**
  * 全站统一顶部导航（取自首页舞台顶栏）。所有页面共用，保证整套版式一致。
