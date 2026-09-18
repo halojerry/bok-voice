@@ -131,13 +131,18 @@ def test_apply_then_jump_clamps_to_done():
 
 def test_agent_play_branch_wires_then_jump_before_stop_response():
     """源级钉住（播放分支在 entrypoint 闭包内，离线起不了真栈；姿势同 I1 装配面测试）：
-    play 成功 → 位移三件套必须在 **本轮收尾 raise** 之前（同一轮内同步跳）。"""
+    play 成功 → 位移必须在 **本轮收尾 raise** 之前（同一轮内同步跳）；但**不渲染**目标步
+    ——本分支 StopResponse 收尾、无 LLM 请求消费，渲染只会烧掉该步首渲染账本
+    （_last_render_step/_just_advanced），令下一轮流程块重渲染退成分支模式，底稿与
+    【跳转进入】结构性失落；渲染留给下一轮流程块首渲染（真被请求消费）。"""
     src = (Path(__file__).resolve().parents[1] / "apps" / "agent" / "agent_runtime" / "agent.py").read_text(encoding="utf-8")
     start = src.index("flow_ctrl.apply_then_jump(")
     stop = src.index("raise StopResponse()", start)   # 播放分支收尾 raise（注释无关锚）
     seg = src[start:stop]
     assert "_gbinding.then_jump" in src
     assert "_invalidate_stale_preemptive(" in seg
-    assert "context_state.set_flow_current(" in seg
+    assert "current_step_text()" not in seg   # 渲染推迟到下一轮（R1，勿在本分支烧首渲染账本）
     assert "via=then_jump" in src
     assert "FLOW_GRAPH jump_noop" in seg   # 无位移档不吞日志
+    # 跳转块在播放成功分支内：play_miss 路径（条目/音频缺失）结构性永不跳
+    assert stop < src.index("FLOW_GRAPH play_miss")
