@@ -146,7 +146,7 @@ async def optional_bearer_auth(request: Request, call_next):
                          for p in ("/api/nodes/downloads/",))
     if expected and request.url.path not in (
             "/health", "/api/nodes/heartbeat", "/api/nodes/register",
-            "/api/webhook/livekit") and not _prefix_exempt:
+            "/api/nodes/logs", "/api/webhook/livekit") and not _prefix_exempt:
         # webhook 豁免与 identity_gate _EXEMPT_PATHS 对齐:LiveKit 签名 webhook
         # 不带 CP token,CP-token-only 模式曾在此 401——agent 崩溃重派队静默死
         # (端点内另有签名校验,豁免的只是机器 token 门,2026-09-17 全量 debug F2 修)。
@@ -2795,6 +2795,96 @@ def download_node_artifact(kind: str, version: str, filename: str,
     _audit("node.artifact_downloaded", subject_type="artifact",
            subject_id=f"{kind}/{version}/{filename}")
     return FileResponse(target, filename=filename)
+
+
+# ---- 节点日志上报/查看（W2 远程日志通道，2026-09-18）----
+# 零入站模型：CP 不拉，节点领 upload_logs 指令后主动 POST gzip 束到本端点。
+# 存储=工件卷 logs/ 命名空间（downloads 端点只放行 pkg/runtime/bootstrap 三段，
+# 互不可见）；TTL 到期顺手清。root 查看/下载走 JWT 门禁（不入豁免表）。
+
+_LOG_UPLOAD_MAX_BYTES = 8 * 1024 * 1024
+_LOG_TTL_DAYS_DEFAULT = 7
+
+
+def _node_logs_dir(node_id: str) -> Path:
+    base = (Path(os.environ.get("BOK_NODE_ARTIFACTS_DIR", "/app/downloads"))
+            / "logs" / node_id)
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _sweep_node_logs(base: Path, ttl_days: int) -> None:
+    cutoff = datetime.now(timezone.utc).timestamp() - ttl_days * 86400
+    for p in base.glob("*.tar.gz"):
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+        except OSError:  # pragma: no cover - 单文件清理失败不阻上传
+            continue
+
+
+@app.post("/api/nodes/logs")
+async def upload_node_logs(request: Request,
+                           authorization: str = Header(default="")) -> dict:
+    """节点日志束上报（node_token 端点内自证，同 heartbeat 模式）。
+
+    体=原始 gzip（魔数验证，Content-Type 可伪造）；封顶 8MB（413）；
+    文件名带 UTC 时间戳+体长+短随机——同秒重复上传不互相覆盖。"""
+    token = authorization.removeprefix("Bearer ").strip()
+    node = _node_store().resolve_node_token(token) if token else None
+    if node is None:
+        raise HTTPException(401, "node token required")
+    node_id = str(node.get("node_id", ""))
+    body = await request.body()
+    if not body:
+        raise HTTPException(400, "empty body")
+    if len(body) > _LOG_UPLOAD_MAX_BYTES:
+        raise HTTPException(413, "log bundle too large")
+    if body[:2] != b"\x1f\x8b":
+        raise HTTPException(415, "expected gzip payload")
+    base = _node_logs_dir(node_id)
+    _sweep_node_logs(base, int(os.environ.get(
+        "BOK_NODE_LOG_TTL_DAYS", str(_LOG_TTL_DAYS_DEFAULT))))
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    target = base / f"{stamp}-{len(body)}-{uuid.uuid4().hex[:6]}.tar.gz"
+    tmp = target.with_name(target.name + ".part")
+    tmp.write_bytes(body)
+    tmp.replace(target)
+    _audit("node.logs_uploaded", subject_type="node", subject_id=node_id,
+           detail={"bytes": len(body), "file": target.name})
+    return {"ok": True, "node_id": node_id, "file": target.name, "bytes": len(body)}
+
+
+@app.get("/api/nodes/{node_id}/logs")
+def list_node_logs(node_id: str, request: Request) -> list[dict]:
+    """节点日志束清单（root 专属）：新→旧，含体长与上传时刻。"""
+    require_role(request, "root")
+    base = _node_logs_dir(node_id)
+    out: list[dict] = []
+    for p in sorted(base.glob("*.tar.gz"), reverse=True):
+        try:
+            st = p.stat()
+        except OSError:  # pragma: no cover - 并发清扫竞态
+            continue
+        out.append({"file": p.name, "bytes": st.st_size,
+                    "uploaded_at": datetime.fromtimestamp(
+                        st.st_mtime, tz=timezone.utc).isoformat()})
+    return out
+
+
+@app.get("/api/nodes/{node_id}/logs/{filename}")
+def download_node_logs(node_id: str, filename: str, request: Request) -> FileResponse:
+    """下载单个日志束（root 专属）：文件名白名单 + 目录收敛校验（同工件下载）。"""
+    require_role(request, "root")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.tar\.gz", filename):
+        raise HTTPException(404, "not found")
+    base = _node_logs_dir(node_id)
+    target = (base / filename).resolve()
+    if not target.is_file() or base.resolve() not in target.parents:
+        raise HTTPException(404, "not found")
+    _audit("node.logs_downloaded", subject_type="node", subject_id=node_id,
+           detail={"file": filename})
+    return FileResponse(target, filename=filename, media_type="application/gzip")
 
 
 def node_license_required() -> bool:
