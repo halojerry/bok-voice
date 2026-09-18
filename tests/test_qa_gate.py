@@ -234,3 +234,59 @@ def test_cp_qa_pairs_exclude_test_objects(tmp_path, monkeypatch):
             normalize_question("幫我查下測試單號"),
             normalize_question("冇對象嘅單點查"),
         }
+
+
+# ---- 匹配优先级(Phase 3.1):阈值过关者中小者先,全默认=旧档逐字节同 ----
+
+def _e(qid: str, q: str, a: str = "ans", **kw):
+    return {"id": qid, "question_text": q, "answer_text": a, "lang": "zh", "scope": "global", **kw}
+
+
+def test_match_priority_decides_among_passers(monkeypatch):
+    monkeypatch.delenv("BOK_QA_PRIORITY", raising=False)
+    from agent_runtime import qa_gate
+
+    # 同问法平分(分数并列),priority 1 破平 → pinned 胜
+    entries = [
+        _e("old", "怎么退款", priority=10),
+        _e("pinned", "怎么退款", a="pinned-ans", priority=1),
+    ]
+    hit, _score = qa_gate.QaIndex(entries).match("怎么退款")
+    assert hit is not None and hit["id"] == "pinned"
+    # 阈值先行:垃圾问法条目 prio 1 也不会把胜者帽抢走(不过关永不出线)
+    entries2 = [_e("old", "怎么退款", priority=10), _e("noise", "今天天气怎么样", priority=1)]
+    hit2, _ = qa_gate.QaIndex(entries2).match("怎么退款")
+    assert hit2 is not None and hit2["id"] == "old"
+
+
+def test_match_default_all_identical_to_legacy(monkeypatch):
+    monkeypatch.delenv("BOK_QA_PRIORITY", raising=False)
+    from agent_runtime import qa_gate
+
+    # 全默认(无 priority 键)→ 纯分数档,高分胜;同分平局 → 插入序(=created_at 语义)老先
+    entries_default = [_e("old", "怎么退款"), _e("pinned", "退款要怎么弄啊")]
+    assert qa_gate.QaIndex(entries_default).match("怎么退款")[0]["id"] == "old"
+    entries_tie = [_e("a", "查询物流"), _e("b", "查一下物流")]
+    assert qa_gate.QaIndex(entries_tie).match("查询物流")[0]["id"] == "a"
+
+
+def test_match_priority_killswitch_restores_legacy(monkeypatch):
+    monkeypatch.setenv("BOK_QA_PRIORITY", "0")
+    from agent_runtime import qa_gate
+
+    entries = [
+        _e("old", "怎么退款", priority=10),
+        _e("pinned", "怎么退款", a="pinned-ans", priority=1),
+    ]
+    # kill 档回纯分数:平分吃插入序 → old
+    assert qa_gate.QaIndex(entries).match("怎么退款")[0]["id"] == "old"
+
+
+def test_match_priority_missing_key_treated_as_default(monkeypatch):
+    monkeypatch.delenv("BOK_QA_PRIORITY", raising=False)
+    from agent_runtime import qa_gate
+
+    # 旧 CP 响应无 priority 键 → 按 10 参战,pinned(prio 1)仍胜
+    entries = [{"id": "nokey", "question_text": "怎么退款", "answer_text": "a", "lang": "zh", "scope": "global"},
+               _e("pinned", "怎么退款", a="pinned-ans", priority=1)]
+    assert qa_gate.QaIndex(entries).match("怎么退款")[0]["id"] == "pinned"

@@ -31,6 +31,22 @@ def qa_threshold() -> float:
         return 0.90
 
 
+def qa_priority_enabled() -> bool:
+    """优先级档开关(Phase 3.1):0=回纯分数档(旧胜者键)。"""
+    return os.environ.get("BOK_QA_PRIORITY", "1") == "1"
+
+
+def _entry_priority(entry: dict) -> int:
+    """条目优先级(小者先);旧 CP 响应/坏值宽容回默认 10,域 [0,1000]。"""
+    raw = entry.get("priority", 10)
+    if raw is None:
+        return 10
+    try:
+        return max(0, min(int(raw), 1000))
+    except (TypeError, ValueError):
+        return 10
+
+
 def _cos(a: list[float], b: list[float]) -> float:
     num = sum(x * y for x, y in zip(a, b))
     na = sum(x * x for x in a) ** 0.5
@@ -110,7 +126,13 @@ class QaIndex:
         q_low = q.lower()
         thr = qa_threshold() if threshold is None else threshold
         best: dict | None = None
-        best_score = 0.0
+        best_key: tuple | None = None
+        best_score = 0.0  # 胜者分数(过关者中按序取)
+        top_score = 0.0   # 全场最高分(未过关时的诊断返回,旧档语义)
+        # 优先级档(Phase 3.1):阈值过关者中小者先,同优先级分数降序,再平吃插入序
+        # (=created_at,与旧档平局语义一致);全默认(都 10)时胜者与旧纯分数档
+        # 逐字节同。kill-switch BOK_QA_PRIORITY=0 回纯分数档。
+        use_priority = qa_priority_enabled()
         for entry, e_q, e_vec in self._items:
             if lang and str(entry.get("lang") or "") and str(entry["lang"]) != lang:
                 continue
@@ -121,11 +143,16 @@ class QaIndex:
             # 子串长度比(照抄 InMemoryVectorStore:包含才计,长串含短串占比)
             if q_low in e_q.lower():
                 score += 0.4 * (len(q_low) / max(1, len(e_q)))
-            if score > best_score:
-                best, best_score = entry, score
-        if best is not None and best_score >= thr:
+            if score > top_score:
+                top_score = score
+            if score < thr:
+                continue  # 阈值先行——优先级只在过关者中排,不过关永不出线
+            key = (_entry_priority(entry), -score) if use_priority else (-score,)
+            if best_key is None or key < best_key:
+                best, best_key, best_score = entry, key, score
+        if best is not None:
             return best, best_score
-        return None, best_score
+        return None, top_score
 
     def by_id(self, entry_id: str) -> dict | None:
         """按条目 id 直取(话术图 play_qa 绑定,spec §4.1);无命中返回 None。"""
