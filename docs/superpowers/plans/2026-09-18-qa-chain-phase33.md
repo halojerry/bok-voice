@@ -28,6 +28,7 @@
 4. **web 编辑器保存是「逐字段重建」而非整体透传**（page.tsx:1347-1366，`common` 只含 id/intent/priority/once/enabled）——**任何不进 `BindingDraft` 的字段编辑一次就蒸发**。故 T3 的 `then_jump` 必须进草稿类型，否则「打开既有追问链→改个名字保存」等于静默删链。
 5. **`evaluate_leg` 现有图开启腿判据含 `nontrigger_silent`**（probe_flow_graph.py:307），then-jump 腿没有非触发轮 → 必须走独立 `elif` 判据分支，否则结构性 FAIL。
 6. **无 Supabase/DB 改动**：`then_jump` 不落列（spec §3 否决项），spec §6.4「Supabase 列直连 apply」本增量不适用（与 3.2 同款）。
+7. **T4 离线面实施注记（2026-09-18，真栈两腿未跑=控制器合并后执行）**：① then-jump 档轮次表**不含** `trigger`/`nontrigger` → `plan_rounds` 在该档忽略 `play_round`（「播」轮就是触发轮；`--no-play-round` 与之组合会零触发语空跑，已单测钉死）；② `evaluate_leg` 的 `all_events` **纳入 `after_events`**，故 kill 腿 absence 扫描覆盖跳后窗口（after 轮冒 `FLOW_GRAPH` 行同属越闸，已有专测）；③ 腿跳过判定放在 `run_leg` 建探针模板**之前**（无 QA 条目时连模板都不建），报告落 `{"skipped": "no_qa_or_audio"}` 且退出码 1；④ 离线测试落在独立文件 `tests/test_flow_graph_probe_then_jump.py`（协调口径，brief Step 1 原写「追加到 `tests/test_flow_graph_probe.py`」），另加一例对着 `agent_runtime.flow` 真 regex 逐族钉 `AFTER_TEXT` 的洁净性（默认话术不含确认/收线/异议/提问/挂断六族词与图触发词）；⑤ `print_leg` 窗口行按事件键存在性渲染（默认档仍 trigger/nontrigger/play 三行不变），归因关键词 then-jump 档切 `PLAY_KEYWORDS`。
 
 ---
 
