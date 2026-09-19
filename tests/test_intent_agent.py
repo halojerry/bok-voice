@@ -358,9 +358,9 @@ def test_end_wiring_pinned_to_schedule_call_end():
     assert "evaluate_intent_disposition(" in sched_seg
     assert '_end_scheduled["intent_code"]' in sched_seg
     assert "wa_captured=bool(_wa_captured[\"on\"])" in sched_seg  # wa 直接读账本
-    # 三个经 _schedule_call_end 的既有收线点仍在(REFUSE/FAREWELL/心跳);
-    # 时长 fuse 直调 cp.end_call,新参 intent_code 缺省空=逐字节同旧。
-    assert _SRC.count("_schedule_call_end(") == 4  # 定义+REFUSE+FAREWELL+心跳
+    # 四个经 _schedule_call_end 的既有收线点仍在(REFUSE/FAREWELL/心跳/漏斗 v2
+    # stall 收线);时长 fuse 直调 cp.end_call,新参 intent_code 缺省空=逐字节同旧。
+    assert _SRC.count("_schedule_call_end(") == 5  # 定义+REFUSE+FAREWELL+心跳+stall收线
     assert 'await cp.end_call(call_id, disposition="completed")' in _SRC  # fuse 零变化
 
 

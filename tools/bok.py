@@ -1214,6 +1214,12 @@ _FORWARD_ENV = (
     "BOK_WA_ACCUM_TIMEOUT_S",
     "BOK_WA_LEN_CHECK",
     "BOK_WORKER_PORT_GUARD",
+    # 单机多栈并存（并行会话/多 worktree 验收）错开 A 线 worker 端口，默认 8081 零漂移。
+    "BOK_WORKER_PORT",
+    # —— 漏斗 v2（stall 升级阶梯/judge route 路由/跟进工单；合入默认全开，0=回退） ——
+    "BOK_STALL_LADDER",
+    "BOK_ROUTE_JUDGE",
+    "BOK_TOOLS_FOLLOWUP",
     # —— ASR（agent 侧读的运维档；sidecar 专属键走 asr_env 另注入） ——
     "BOK_ASR_HOTWORDS",
     "BOK_ASR_PARTIAL_SLOW_MS",
