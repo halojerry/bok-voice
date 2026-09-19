@@ -2014,6 +2014,11 @@ def cmd_doctor() -> int:
             if not mt_ok:
                 print("    (mt 端口 UP 但 prefill 探针失败——B 线同传会挂死/退主 LLM;"
                       "重跑 doctor 区分冷启动)")
+        else:
+            # 评审 P2-2:serve 侧「:1236 健康即下发 MT_*」会把非法 model 透传给
+            # worker(interpret 守卫兜底回退主 LLM)——诊断面对同一错配不能零输出。
+            print(f"  mt 功能探针: SKIP (MT 模型缺失/非法: {mt_model[:60] or 'unset'})"
+                  " — B 线已回退主 LLM,查 MT_LLM_MODEL/MODELS 表")
 
     # /api/token 必须是真 JWT（三段式）；否则 A 线 UI 永远“接通失败”。
     if healthy(8000):
