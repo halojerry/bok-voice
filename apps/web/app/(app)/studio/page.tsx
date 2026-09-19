@@ -26,6 +26,9 @@ import StudyTab from "@/components/study-tab";
 import TemplateVarsTab from "@/components/template-vars";
 import CannedAuditionCard from "@/components/canned-audition";
 import IntentRulesCard from "@/components/intent-rules-card";
+import IntentManager from "@/components/intent-manager";
+import QaLibrary from "@/components/qa-library";
+import { seedPackFor } from "@/lib/seed-pack";
 
 // 通话行状态徽标（照 calls 页惯例搬一份,页面文件不可导入）。
 const CALL_STATUS: Record<string, [string, string]> = {
@@ -154,20 +157,23 @@ export default function StudioPage() {
   // 意图图与步骤脊柱（graph_json 解析一律走 lib/qa-canvas.parseGraphDoc 现成实现）。
   const graph = useMemo(() => parseGraphDoc(tplRow?.graph_json ?? ""), [tplRow]);
   const stepsList = useMemo(() => parseTemplateSteps(tplRow?.steps_json ?? ""), [tplRow]);
+  // 内容只读判定（B4 owner 口径，与 FlowCanvas/TemplateEditor 同款）：共享话术非主管=只读。
+  const contentReadOnly = Boolean(selId) && !isManager && !(uid !== "" && String(tplRow?.owner_user_id ?? "") === uid);
 
   // ---- tab 切换（qa 页 view chips 同款写法）；学习报告 tab 仅对有 reports 键的人出现 ----
   const [tab, setTab] = useState("flow");
-  // 话术流程 tab 双视图（W2 流程画布）：表单=共用编辑器,画布=步骤工作流+答法抽屉。
+  // 主流程 tab 双视图（W2 流程画布）：表单=共用编辑器,画布=步骤工作流+答法抽屉。
   const [flowView, setFlowView] = useState<"form" | "canvas">("form");
   const tabs: [string, string][] = [
-    ["flow", "话术流程"],
+    ["flow", "主流程"],
     ["intent", "意图管理"],
-    ["vars", "变量"],
+    ["qa", "问答库"],
+    ["vars", "变量设定"],
     ["disposition", "客户意向"],
     ["canned", "录音沉淀"],
     ["calls", "通话日志"],
   ];
-  if (canReports) tabs.push(["reports", "学习报告"]);
+  if (canReports) tabs.push(["reports", "场景学习"]);
 
   // ---- 罐头录音 tab：挂该模板步骤的 QA 词条 + 罐头物化状态 ----
   const [qaRows, setQaRows] = useState<Record<string, unknown>[]>([]);
@@ -397,80 +403,27 @@ export default function StudioPage() {
             </div>
           )}
 
-          {/* 2. 意图管理（第一层识别：关键词/judge 判据/绑定动作；编辑进问答画布） */}
-          {tab === "intent" && (
-            <section className="card space-y-4">
-              {graph.intents.length === 0 ? (
-                <EmptyState label="该模板未配置话术图意图。" />
-              ) : (
-                <div className="space-y-3">
-                  {graph.intents.map((it) => {
-                    const binds = graph.bindings.filter((b) => b.intent === it.id);
-                    return (
-                      <div key={it.id} className="rounded-lg bg-muted/60 p-3">
-                        <p className="flex flex-wrap items-center gap-2 font-medium">
-                          {String(it.label || "(未命名意图)")}
-                          {it.enabled === false && (
-                            <span className="rounded-sm bg-muted px-1 text-[10px]">已停用</span>
-                          )}
-                          {it.judge?.prompt && (
-                            <span
-                              className="rounded-sm bg-amber-100 px-1 text-[10px] text-amber-700"
-                              title={it.judge.prompt}
-                            >
-                              LLM 判据
-                            </span>
-                          )}
-                        </p>
-                        <p className="mt-1 text-xs muted">关键词：{it.keywords.join(", ") || "-"}</p>
-                        <p className="mt-0.5 text-xs muted">
-                          生效范围：{it.steps.length === 0 ? "全程" : `第 ${it.steps.join("、")} 步`}
-                        </p>
-                        {binds.length > 0 ? (
-                          <div className="mt-2 space-y-1">
-                            {binds.map((b) => (
-                              <p key={b.id} className="text-xs muted">
-                                {b.action === "play_qa"
-                                  ? `播快答 ${String(b.qa_id ?? "-")}`
-                                  : b.action === "notify_human"
-                                    ? "通知人工"
-                                    : `跳到第 ${Number(b.step ?? 1)} 步`}
-                                {b.action === "play_qa" && Number(b.then_jump ?? 0) > 0 && ` · 播完跳第 ${Number(b.then_jump)} 步`}
-                                {` · P${Number(b.priority ?? 10)}`}
-                                {b.once && " · 只执行一次"}
-                                {b.enabled === false && " · 已停用"}
-                              </p>
-                            ))}
-                          </div>
-                        ) : (
-                          <p className="mt-2 text-xs muted">无绑定动作</p>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-              <div className="rounded-lg border border-(--card-border) p-3">
-                <span className="label">步骤脊柱（{stepsList.length} 步）</span>
-                {stepsList.length === 0 ? (
-                  <p className="mt-1 text-xs muted">尚无步骤。</p>
-                ) : (
-                  <div className="mt-1 space-y-1">
-                    {stepsList.map((s, i) => (
-                      <p key={i} className="text-xs muted">
-                        <span className="font-bold text-(--live-ink)">第 {i + 1} 步</span> · {String(s.goal || "(无目标)")}
-                      </p>
-                    ))}
-                  </div>
-                )}
-              </div>
-              <button
-                className="btn-primary"
-                onClick={() => window.location.assign(`/qa/?template=${encodeURIComponent(selId)}&view=canvas`)}
-              >
-                打开意图画布编辑（关键词 / 判据 / 绑定）
-              </button>
-            </section>
+          {/* 2. 意图管理（PRD 3.3）：第一层识别——表格+弹窗直编 graph_json；种子包一键导入 */}
+          {tab === "intent" && tplRow && (
+            <IntentManager
+              tpl={tplRow}
+              accountId={accountId}
+              readOnly={contentReadOnly}
+              onSaved={() => setTplRev((v) => v + 1)}
+              seedIntents={seedPackFor(String(tplRow.language ?? "zh")).intents}
+            />
+          )}
+
+          {/* 2b. 问答库（PRD 3.4）：表格+弹窗；多轮行为（播完跳转/通知人工）在意图管理挂 play_qa 绑定 */}
+          {tab === "qa" && tplRow && (
+            <QaLibrary
+              accountId={accountId}
+              templateId={selId}
+              lang={String(tplRow.language ?? "zh")}
+              stepCount={Math.max(stepsList.length, 1)}
+              readOnly={contentReadOnly}
+              seedPack={seedPackFor(String(tplRow.language ?? "zh")).qa}
+            />
           )}
 
           {/* 3. 客户意向（挂断判定 intent_rules）：与 /calls 页同一张卡（账号级规则面） */}
