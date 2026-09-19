@@ -8,7 +8,7 @@
 // （学习报告/聚类采纳在 components/study-tab.tsx,变量目录与预览在 components/template-vars.tsx）。
 // 深链先例：/calls?call= / /supervisor?listen= —— 静态导出用 query，不开动态路由。
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { api, type UserRow } from "@/lib/api";
 import { parseGraphDoc, parseTemplateSteps } from "@/lib/qa-canvas";
@@ -18,10 +18,14 @@ import { hasPage, useSession } from "@/components/session-context";
 import TemplateEditor, {
   LANGS,
   PublishBadge,
+  jsonToSteps,
+  stepsToJson,
   toTemplateRow,
+  type FlowStep,
   type TemplateRow,
 } from "@/components/template-editor";
 import FlowCanvas from "@/components/flow-canvas";
+import StepsListEditor from "@/components/steps-list-editor";
 import StudyTab from "@/components/study-tab";
 import TemplateVarsTab from "@/components/template-vars";
 import CannedAuditionCard from "@/components/canned-audition";
@@ -160,10 +164,88 @@ export default function StudioPage() {
   // 内容只读判定（B4 owner 口径，与 FlowCanvas/TemplateEditor 同款）：共享话术非主管=只读。
   const contentReadOnly = Boolean(selId) && !isManager && !(uid !== "" && String(tplRow?.owner_user_id ?? "") === uid);
 
+  // ---- 步骤草稿（工作站层唯一持有；画布与列表编辑同一份——切换视图不丢修改） ----
+  const [stepsDraft, setStepsDraft] = useState<FlowStep[]>([]);
+  const [stepsDirty, setStepsDirty] = useState(false);
+  const [applying, setApplying] = useState(false);
+  const [applyErr, setApplyErr] = useState("");
+  const [applyNote, setApplyNote] = useState("");
+  const [publishing, setPublishing] = useState(false);
+
+  // 锚定：模板行变化（进入工作台/应用成功重拉/保存设置重拉）→ 草稿=落库值、清脏。
+  // **脏修改在途时模板行重拉不重锚**（保存「模板设置」会触发重拉——重置草稿=冲掉
+  // 未应用的步骤修改,正是本次改版要消灭的丢编辑陷阱）；换模板必重锚。
+  const anchoredSelRef = useRef(selId);
+  useEffect(() => {
+    const changedTemplate = anchoredSelRef.current !== selId;
+    anchoredSelRef.current = selId;
+    if (!changedTemplate && stepsDirty) return;
+    setStepsDraft(jsonToSteps(tpl?.steps_json));
+    setStepsDirty(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selId, tpl]);
+
+  const changeSteps = useCallback((next: FlowStep[]) => {
+    setStepsDraft(next);
+    setStepsDirty(true);
+    setApplyNote("");
+  }, []);
+
+  /** 全局「应用」：唯一保存入口（只写 steps_json 单键,PUT exclude_unset 部分更新）。 */
+  async function applySteps() {
+    if (!selId || applying) return;
+    setApplying(true);
+    setApplyErr("");
+    try {
+      await api.updateTemplate(selId, { steps_json: stepsToJson(stepsDraft) });
+      const dropped = stepsDraft.filter((s) => !s.goal.trim() && !s.ref.trim()).length;
+      setApplyNote(dropped > 0 ? `已应用（忽略了 ${dropped} 个空白步）` : "已应用");
+      // 应用后即清脏（重拉到达前用户可见状态正确;锚定效应随后重锚为同一份落库值）。
+      setStepsDirty(false);
+      setTplRev((v) => v + 1); // 重拉模板行（发布徽标等随之取权威数据）
+    } catch (e) {
+      setApplyErr(String(e));
+    } finally {
+      setApplying(false);
+    }
+  }
+
+  /** 发布（新通话用冻结版）：有未应用修改先提醒——发布的是已保存版本。 */
+  async function publishNow() {
+    if (!selId) return;
+    if (stepsDirty && !window.confirm("还有未应用的修改：发布的是「已保存」的版本。建议先点「应用」。\n\n仍要直接发布？")) return;
+    if (!window.confirm("发布后，之后拨出的电话都按这个版本讲。确定发布？")) return;
+    setPublishing(true);
+    try {
+      await api.publishTemplate(selId);
+      setTplRev((v) => v + 1);
+    } catch (e) {
+      setApplyErr(String(e));
+    } finally {
+      setPublishing(false);
+    }
+  }
+
+  // 有未应用修改时拦浏览器关闭/刷新（站点内导航走「返回列表」的确认）。
+  useEffect(() => {
+    if (!stepsDirty) return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [stepsDirty]);
+
+  /** 返回列表：脏=确认（未应用的修改会丢——页面态不跨模板保留）。 */
+  function backToList() {
+    if (stepsDirty && !window.confirm("主流程的修改还没应用，返回会丢失。仍要返回？")) return;
+    window.location.assign("/studio/");
+  }
+
   // ---- tab 切换（qa 页 view chips 同款写法）；学习报告 tab 仅对有 reports 键的人出现 ----
   const [tab, setTab] = useState("flow");
-  // 主流程 tab 双视图（W2 流程画布）：表单=共用编辑器,画布=步骤工作流+答法抽屉。
-  const [flowView, setFlowView] = useState<"form" | "canvas">("form");
+  // 主流程 tab 双视图：画布=推荐默认（普通人视角：看到流程再点步骤）；列表=批量编辑。
+  const [flowView, setFlowView] = useState<"form" | "canvas">("canvas");
   const tabs: [string, string][] = [
     ["flow", "主流程"],
     ["intent", "意图管理"],
@@ -355,14 +437,45 @@ export default function StudioPage() {
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-3">
-        <button className="btn-ghost text-xs" onClick={() => window.location.assign("/studio/")}>
+        <button className="btn-ghost text-xs" onClick={backToList}>
           ← 返回列表
         </button>
         <h1 className="page-title">{String(tplRow?.name ?? selId)}</h1>
         <span className="rounded-sm bg-muted px-1.5 py-0.5 text-[10px]">
           {langText(String(tplRow?.language ?? "zh"))}
         </span>
+        {/* 全局状态（右上角）：主流程步骤草稿的未保存/应用/发布——唯一保存入口 */}
+        <div className="ml-auto flex items-center gap-2">
+          {stepsDirty ? (
+            <span className="flex items-center gap-1.5 text-xs text-amber-700">
+              <span className="h-2 w-2 animate-pulse rounded-full bg-amber-500" />
+              未保存
+            </span>
+          ) : (
+            <span className="text-xs text-emerald-600">已保存 ✓</span>
+          )}
+          {applyNote && !stepsDirty && <span className="text-xs text-emerald-600">{applyNote}</span>}
+          {!contentReadOnly && (
+            <>
+              <button
+                className="btn-primary px-3 py-1 text-xs"
+                disabled={!stepsDirty || applying || !selId}
+                onClick={() => void applySteps()}
+              >
+                {applying ? "应用中…" : "应用"}
+              </button>
+              <button
+                className="btn-ghost px-2 py-1 text-xs"
+                disabled={publishing || !selId}
+                onClick={() => void publishNow()}
+              >
+                {publishing ? "发布中…" : "发布"}
+              </button>
+            </>
+          )}
+        </div>
       </div>
+      {applyErr && <ErrorState message={applyErr} />}
 
       {tplErr && <ErrorState message={tplErr} />}
       {tplLoading && <LoadingState />}
@@ -381,11 +494,11 @@ export default function StudioPage() {
             ))}
           </div>
 
-          {/* 1. 话术流程：表单=共用编辑器 / 画布=场景泳道+答法抽屉（保存成功重拉模板行,各 tab 随之取到权威数据） */}
+          {/* 1. 主流程：画布（默认）/ 列表编辑——同一份工作站层草稿,右上角「应用」统一保存 */}
           {tab === "flow" && (
             <div className="space-y-2">
               <div className="flex items-center gap-1">
-                {([["form", "表单"], ["canvas", "画布"]] as const).map(([k, label]) => (
+                {([["canvas", "画布（推荐）"], ["form", "列表编辑"]] as const).map(([k, label]) => (
                   <button
                     key={k}
                     className={`btn-ghost text-xs ${flowView === k ? "border-(--live) text-(--live-ink)" : "muted"}`}
@@ -395,10 +508,26 @@ export default function StudioPage() {
                   </button>
                 ))}
               </div>
-              {flowView === "form" ? (
-                <TemplateEditor tpl={tplRow} onSaved={() => setTplRev((v) => v + 1)} />
+              {flowView === "canvas" ? (
+                <FlowCanvas tpl={tplRow} graph={graph} draft={stepsDraft} onDraftChange={changeSteps} />
               ) : (
-                <FlowCanvas tpl={tplRow} graph={graph} onSaved={() => setTplRev((v) => v + 1)} />
+                <>
+                  <StepsListEditor
+                    value={stepsDraft}
+                    onChange={changeSteps}
+                    readOnly={contentReadOnly}
+                    lang={String(tplRow?.language ?? "zh")}
+                  />
+                  {/* 模板设置（名称/语言/语气/热词）：独立保存,不碰步骤草稿 */}
+                  <details className="card">
+                    <summary className="cursor-pointer text-sm font-medium">
+                      模板设置 <span className="ml-1 text-xs muted">（名称 / 语言 / 语气 / 热词——本块有独立保存按钮）</span>
+                    </summary>
+                    <div className="mt-3">
+                      <TemplateEditor tpl={tplRow} variant="meta" onSaved={() => setTplRev((v) => v + 1)} />
+                    </div>
+                  </details>
+                </>
               )}
             </div>
           )}
