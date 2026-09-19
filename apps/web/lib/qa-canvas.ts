@@ -22,7 +22,7 @@ export type QaRow = {
   created_at?: string;
 };
 
-export type FlowStep = { goal: string; ref: string };
+export type FlowStep = { goal: string; ref: string; scene?: string };
 export type Pt = { x: number; y: number };
 
 // 三类节点 data 均带 `kind` 判别面（step/qaEntry/intent），CanvasNode 联合因此可判别。
@@ -63,7 +63,8 @@ export interface GraphIntent {
 export interface GraphBinding {
   id: string;
   intent: string;
-  action: "play_qa" | "jump_step";
+  /** notify_human（W4）：转接坐席=打铃——CP 打标 + 主管台提醒，AI 照常服务零空档；无负载。 */
+  action: "play_qa" | "jump_step" | "notify_human";
   qa_id?: string;
   step?: number;
   /** Phase 3.3 追问链：仅 play_qa；1-based 步号，播完罐头当场跳到该步；缺省=无链。 */
@@ -128,7 +129,7 @@ export function bindingThenJumpToDraft(raw: unknown, stepCount: number): number 
  * 上界取 `min(stepCount, 999)`：真实步数收口之外再压 CP 合同上界（步骤数 >999 也不越界）。
  */
 export function bindingThenJumpField(
-  action: "play_qa" | "jump_step",
+  action: "play_qa" | "jump_step" | "notify_human",
   thenJump: unknown,
   stepCount: number,
 ): { then_jump?: number } {
@@ -140,7 +141,7 @@ export function bindingThenJumpField(
 /** 编辑器草稿行（page.tsx `BindingDraft` 的结构面）：仅列出重建绑定所需字段。 */
 export type GraphBindingDraftInput = {
   id: string;
-  action: "play_qa" | "jump_step";
+  action: "play_qa" | "jump_step" | "notify_human";
   qa_id?: string;
   step?: number;
   then_jump?: number;
@@ -150,11 +151,12 @@ export type GraphBindingDraftInput = {
 };
 
 /**
- * 草稿行 → 落库绑定（**保存路径唯一入口**，勘误预检 4）：page.tsx submit 对两种动作都调它，
+ * 草稿行 → 落库绑定（**保存路径唯一入口**，勘误预检 4）：page.tsx submit 对各种动作都调它，
  * 不再自拼 `nextBindings.push({...})`——字段逐笔重建，漏一个键=保存即蒸发（then_jump 静默
  * 删链就是这么来的）。字段顺序=id/intent/priority/once/enabled → action → 动作专属负载，
  * 故未改字段档的序列化与既有 doc 逐字节同（测试整串比对）。
  * 调用方负责前置校验（play_qa 的 qa_id 存在性、jump_step 需 stepCount≥1 的报错文案）。
+ * notify_human（W4）无负载：qa_id/step/then_jump 全不吐（CP 严格校验对带键行 400）。
  */
 export function bindingFromDraft(
   row: GraphBindingDraftInput,
@@ -174,6 +176,9 @@ export function bindingFromDraft(
       ...common, action: "jump_step",
       step: clampInt(Number(row.step ?? 1), 1, Math.max(stepCount, 1)),
     };
+  }
+  if (row.action === "notify_human") {
+    return { ...common, action: "notify_human" };
   }
   const chain = bindingThenJumpField("play_qa", row.then_jump, stepCount);
   return { ...common, action: "play_qa", qa_id: String(row.qa_id ?? ""), ...chain };

@@ -1139,28 +1139,111 @@ def _apply_judge_env(env: dict[str, str], _cur: dict[str, str]) -> None:
         env["FLOW_JUDGE_LLM_MODEL"] = _settle
 
 
-# A 线「文档里广告过的 kill-switch」白名单透传单点(2026-09-18 终审 I1 收编):
-# 新开关只加这里,dev(_agent_worker_env)与 prod(_agent_prod_env)同源生效。
-# BOK_QA_* 三键同病(3.1 的 PRIORITY 曾经也是死开关)——一并收进来。
-_BOK_PASSTHROUGH_KEYS = (
+# ---------------------------------------------------------------------------
+# _FORWARD_ENV 立法（2026-09-19，spec §5 卫生项）：agent/interp worker 运行时
+# 读的**运营可调 env** 全集单点表。此前 agent 实读 87 键只有 5 键进表——dev
+# 靠 `_start_proc` merge `os.environ` 全活着，prod（launchd/schtasks 封闭白名单）
+# 69 键全死（BOK_FLOW_GRAPH prod kill-switch、BOK_CP_TOKEN auth-on worker 上报
+# 两次实弹同病）。**新增 env 开关的立法动作 = 在此表加一行**：
+# `tests/test_forward_env.py` 扫 agent_runtime 全部 `os.environ` 读取面，未登记
+# （本表/bok 既有注入/豁免清单）即测试失败——死门在 CI 层根治，唔靠人记。
+# 豁免（测试侧 `_EXEMPT`）：SCRIPTED_LLM*/USE_FAKE_MEDIA（E2E 测试腿专用）、
+# LOCALAPPDATA（Windows OS 变量，tts_cache 有 home 回退）。
+_FORWARD_ENV = (
+    # —— 话术图引擎 + QA 命中语义 ——
     "BOK_FLOW_GRAPH",
     "BOK_FLOW_GRAPH_JUDGE",
+    # —— 意向规则挂断评估(W4-T2,2026-09-19:0=关,挂断走原 disposition) ——
+    "BOK_INTENT_RULES",
     "BOK_QA_ROTATION",
     "BOK_QA_PRIORITY",
     "BOK_QA_FASTPATH",
+    "BOK_QA_MATCH_THRESHOLD",
+    # —— 垫话/罐头/TTS 缓存 ——
+    "BOK_FILLER",
+    "BOK_FILLER_DELAY_MS",
+    "BOK_FILLER_GAP_MS",
+    "BOK_FILLER_CHAIN",
+    "BOK_FILLER_MAX",
+    "BOK_FILLER_MATCH",
+    "BOK_FILLER_MATCH_THRESHOLD",
+    "BOK_FILLER_BACKFILL",
+    "BOK_TTS_FALLBACK",
+    # —— LLM 生成链（兜底/投机/预热/超时预算） ——
+    "BOK_LLM_FALLBACK",
+    "BOK_PREFILL_SPEC",
+    "BOK_PREFILL_SPEC_DEBUG",
+    "BOK_PREEMPTIVE_DEBUG",
+    "LLM_PREFIX_PREWARM",
+    "PREEMPTIVE_GENERATION",
+    "PREEMPTIVE_TTS",
+    "PREEMPTIVE_MAX_RETRIES",
+    "PREEMPTIVE_DISABLE_ON_MARKER",
+    "FLOW_JUDGE_DELAY",
+    "FLOW_LLM_ADVANCE",
+    "BOK_PERCEIVED_BUDGET_MS",
+    "BOK_MAX_CALL_DURATION_S",
+    "DEEPSEEK_BASE_URL",
+    "DEEPSEEK_MODEL",
+    "DEEPSEEK_API_KEY",
+    # —— 轮次/打断/心跳 ——
+    "TURN_DETECTION",
+    "ENDPOINT_MIN_DELAY",
+    "ENDPOINT_MAX_DELAY",
+    "INTERRUPT_MIN_DURATION",
+    "RESUME_FALSE_INTERRUPTION",
+    "FALSE_INTERRUPTION_TIMEOUT",
+    "BOK_INTERRUPT_STORM_BACKOFF",
+    "BOK_INTERRUPT_STORM_WINDOW_S",
+    "BOK_INTERRUPT_STORM_THRESHOLD",
+    "BOK_INTERRUPT_STORM_QUIET_S",
+    "BOK_INTERRUPT_STORM_MAX_ROUNDS",
+    "BOK_INTERRUPT_LEDGER",
+    "SILENCE_NUDGE_SECONDS",
+    "SILENCE_NUDGE_MAX",
+    "BOK_E2E_NUDGE_IMMUNE",
+    "BOK_STARVE_ACK",
+    "BOK_PAUSE_ACK",
+    "BOK_DEFER_ACK",
+    "BOK_SAY_STEP_LIMIT",
+    # —— 看门狗/流程守卫 ——
+    "BOK_RESPONSE_WATCHDOG_S",
+    "BOK_RESPONSE_WATCHDOG_FILLER_EXT_S",
+    "BOK_DIGIT_ACCUMULATE",
+    "BOK_WA_ACCUMULATE",
+    "BOK_WA_ACCUM_TIMEOUT_S",
+    "BOK_WA_LEN_CHECK",
+    "BOK_WORKER_PORT_GUARD",
+    # —— ASR（agent 侧读的运维档；sidecar 专属键走 asr_env 另注入） ——
+    "BOK_ASR_HOTWORDS",
+    "BOK_ASR_PARTIAL_SLOW_MS",
+    "QWEN3_ASR_STREAM",
+    "QWEN3_ECHO_GUARD",
+    "QWEN3_HOTWORD_ECHO_GUARD",
+    # —— 知识/检索/TTS 语言 ——
+    "CONTEXT_RAG",
+    "WEB_SEARCH",
+    "MINIMAX_LANGUAGE_BOOST",
+    "EMOTION_TAG_PILOT",
+    # —— 机器通道凭据（auth-on 部署 worker 上报 turns/QA/设置全靠它） ——
+    "BOK_CP_TOKEN",
+    # —— 日志面 ——
+    "BOK_LOG_LEVEL",
 )
+# 历史名（2026-09-18 终审 I1 起的既有调用面/单测锚）：表本体唯一，别名防散。
+_BOK_PASSTHROUGH_KEYS = _FORWARD_ENV
 
 
 def _apply_bok_passthrough_env(env: dict[str, str]) -> None:
-    """A 线逃生门透传（2026-09-18 实弹发现，与 `_interp_env` 同款教训）。
+    """运营 env 透传（2026-09-18 实弹发现；2026-09-19 `_FORWARD_ENV` 立法收编全集）。
 
     `_agent_worker_env`/`_agent_prod_env` 都是**白名单 env**（dict 里没写的键一律
     不带 `os.environ`）——`BOK_FLOW_GRAPH=0 python tools/bok.py serve` 写在命令行上
     **到不了 agent worker**，worker 按默认 `"1"` 跑：kill 腿「全程零 FLOW_GRAPH」
     结构性测不出（实弹：worker pid env 只有 2 枚 BOK_ 键、无 BOK_FLOW_GRAPH，
-    jump/play 照发，探针如实报 FAIL）。QA 三开关（ROTATION/PRIORITY/FASTPATH）
-    同病：AGENTS/文档广告的逃生门必须真能走到 worker。故显式带上；未设/空串不
-    注入（默认档逐字节不变）。"""
+    jump/play 照发，探针如实报 FAIL）。dev 靠 `_start_proc` merge `os.environ` 一直
+    全活、prod 封闭白名单全死——表见 `_FORWARD_ENV`；未设/空串不注入（默认档
+    逐字节不变）。"""
     for key in _BOK_PASSTHROUGH_KEYS:
         value = os.environ.get(key)
         if value:

@@ -67,8 +67,9 @@ _MIGRATION_COLUMNS: dict[str, tuple[str, ...]] = {
     "object_profiles": (
         "template_id", "digest", "tracking_no", "courier", "contact_channel", "address",
     ),
-    # graph_json：话术图（2026-09-18 qa-flow-graph Phase 2）。
-    "conversation_templates": ("steps_json", "hotwords", "owner_user_id", "graph_json"),
+    # graph_json：话术图（2026-09-18 qa-flow-graph Phase 2）；
+    # published_json：发布冻结快照（2026-09-19 W2-T1 模板发布两态）。
+    "conversation_templates": ("steps_json", "hotwords", "owner_user_id", "graph_json", "published_json"),
     "call_sessions": (
         "template_id", "whatsapp_status", "customer_whatsapp", "kind",
         "target_lang", "session_report", "created_by",

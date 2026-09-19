@@ -6,7 +6,9 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
-import { api, authHeaders, type UserRow } from "@/lib/api";
+import { api, type UserRow } from "@/lib/api";
+import { decideAuditionPath } from "@/lib/voice-options";
+import { previewVoice } from "@/lib/preview";
 import {
   bindingFromDraft, bindingThenJumpToDraft, intentJudgeField, JUDGE_PROMPT_MAX_CHARS,
   parseGraphDoc, parseTemplateSteps, resolveClusterTarget, revertCluster,
@@ -179,7 +181,7 @@ function clampInt(value: number, min: number, max: number): number {
  *  被 deriveGraph 钳到末步、显示成一条误导性的边，故进编辑器先归一到合法区间）。 */
 type BindingDraft = {
   id: string;
-  action: "play_qa" | "jump_step";
+  action: "play_qa" | "jump_step" | "notify_human";
   qa_id: string;
   step: number;
   /** 追问链（Phase 3.3）：0=不跳（仅 play_qa 有意义；jump_step 行恒 0，落库也不写键）。 */
@@ -190,7 +192,9 @@ type BindingDraft = {
 };
 
 function bindingToDraft(b: GraphBinding, stepCount: number): BindingDraft {
-  const action = b.action === "jump_step" ? "jump_step" : "play_qa";
+  // notify_human（W4）原样带；存量坏 action 落 play_qa（宽容解析与画布同款）。
+  const action =
+    b.action === "jump_step" ? "jump_step" : b.action === "notify_human" ? "notify_human" : "play_qa";
   return {
     id: b.id,
     action,
@@ -369,6 +373,18 @@ export default function QaPage() {
       alive = false;
     };
   }, [accountId]);
+
+  // 深链（W1 AI 工作站）：/qa/?template=<id>&view=canvas → 直达该模板的画布视图。
+  // 静态导出用 query 不开动态路由（先例 /calls?call=、/supervisor?listen=）；
+  // 置于话术表 effect 之后，mount 时其同步 setTemplateId 覆盖该 effect 的清空，
+  // 异步回填的 `prev || 第一个` 会保留深链 id。
+  useEffect(() => {
+    const m = window.location.search.match(/[?&]template=([^&]+)/);
+    if (!m) return;
+    setTemplateId(decodeURIComponent(m[1]));
+    const v = window.location.search.match(/[?&]view=([^&]+)/);
+    if (v && decodeURIComponent(v[1]) === "canvas") setView("canvas");
+  }, []);
 
   // 意图图加载(话术图 Phase 2 Task 8):选中模板变化 → 拉详情取 graph_json → parseGraphDoc。
   // 列表行虽带 graph_json,详情才是权威且最新(与写入同一端点)。**三步防误写**(review R1 Fault 2):
@@ -599,32 +615,37 @@ export default function QaPage() {
     }
   }
 
-  /** 试听(spec §5):先播录音缓存(零云费,auth-on 经 fetch-blob+Bearer,<audio> 带不了鉴权头);
-   *  缺录音(404)/播放失败回退现场合成——烧云配额仅主管可用,user 见提示待生成。 */
+  /** 试听(spec §5):路由判定单点 decideAuditionPath(状态面缺录音=非主管直接拦截),
+   *  取料走 lib/preview.previewVoice(缓存优先 cannedEntryId→404 降级现场合成,
+   *  全部 fetch 带 Bearer)——烧云配额仅主管可用,user 见提示待生成。 */
   async function audition(row: QaRow) {
     const id = String(row.id ?? "");
     setBusy(`${id}:audition`);
+    const path = decideAuditionPath(canned[id], isManager);
     try {
-      const res = await fetch(api.cannedAudioUrl(id), { headers: authHeaders() });
-      if (!res.ok) throw new Error(String(res.status));
-      await playBlob(await res.blob());
-    } catch {
-      if (isManager) {
-        try {
-          await playBlob(
-            await api.previewTts({
-              provider: "minimax",
-              text: String(row.answer_text ?? ""),
-              voice: String(row.voice_id ?? ""),
-              language: String(row.lang ?? "zh"),
-              sample_rate: 24000,
-            }),
-          );
-        } catch (e) {
+      if (path === "blocked") {
+        window.alert("该条目还没有录音，请联系主管在画布上「重新录音」。");
+        return;
+      }
+      try {
+        await playBlob(
+          await previewVoice({
+            provider: "minimax",
+            text: String(row.answer_text ?? ""),
+            voice: String(row.voice_id ?? ""),
+            language: String(row.lang ?? "zh"),
+            sample_rate: 24000,
+            cannedEntryId: id || undefined,
+            allowLive: isManager,
+          }),
+        );
+      } catch (e) {
+        if (!isManager) {
+          // 状态面滞后(标 ok 实际 404)或无录音:user 一律提示待生成,不烧云。
+          window.alert("该条目还没有录音，请联系主管在画布上「重新录音」。");
+        } else {
           setErr(`试听失败：${String(e)}`);
         }
-      } else {
-        window.alert("该条目还没有录音，请联系主管在画布上「重新录音」。");
       }
     } finally {
       setBusy("");
@@ -1261,7 +1282,7 @@ export default function QaPage() {
  * 意图编辑器模态(话术图 Phase 2 Task 8)。
  *
  * 受控表单:名称 / 关键词(逗号分隔 ↔ 数组) / 生效步骤(全程 checkbox + 步号 chips,1-based) /
- * 绑定列表(动作 play_qa→选快答条目, jump_step→选步号；每行优先级/只执行一次/启用/删除) /
+ * 绑定列表(动作 play_qa→选快答条目, jump_step→选步号, notify_human→无参数；每行优先级/只执行一次/启用/删除) /
  * 意图级启用 / 删除意图。确认=A. 空草稿放弃(B. 校验失败留窗报错) / C. 整图 PUT 落库。
  *
  * **Backspace 契约(必须保持)**:ReactFlow 的 deleteKeyCode 是 ["Backspace","Delete"],
@@ -1371,11 +1392,12 @@ function IntentEditorModal(props: {
     const nextBindings: GraphBinding[] = [];
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
+      // 三分校验（W4 notify_human 无负载=直接合法，不要求条目/步号）。
       if (row.action === "play_qa") {
         if (!qaRows.some((q) => String(q.id) === row.qa_id)) {
           return setError(`第 ${i + 1} 条绑定还没有选择要播的快答条目。`);
         }
-      } else if (stepCount < 1) {
+      } else if (row.action === "jump_step" && stepCount < 1) {
         return setError("该话术还没有步骤，无法使用「跳到某一步」。");
       }
       // 逐字段重建的唯一入口（勘误预检 4）：两种动作都走纯函数，页面不再自拼字段——
@@ -1539,12 +1561,17 @@ function IntentEditorModal(props: {
                       disabled={readOnly}
                       onChange={(e) =>
                         patchRow(row.id, {
-                          action: e.target.value === "jump_step" ? "jump_step" : "play_qa",
+                          action: e.target.value === "jump_step"
+                            ? "jump_step"
+                            : e.target.value === "notify_human"
+                              ? "notify_human"
+                              : "play_qa",
                         })
                       }
                     >
                       <option value="play_qa">播快答</option>
                       <option value="jump_step">跳到某步</option>
+                      <option value="notify_human">通知人工</option>
                     </select>
                     {row.action === "play_qa" ? (
                       <>
@@ -1584,7 +1611,7 @@ function IntentEditorModal(props: {
                           </label>
                         )}
                       </>
-                    ) : (
+                    ) : row.action === "jump_step" ? (
                       <select
                         className="select text-xs"
                         value={String(row.step)}
@@ -1599,6 +1626,9 @@ function IntentEditorModal(props: {
                           ))
                         )}
                       </select>
+                    ) : (
+                      // notify_human（W4）无负载：不要求条目/步号，专属编辑区整体隐藏。
+                      <span className="text-[11px] muted">无参数：提醒主管台，AI 照常应答。</span>
                     )}
                     <label className="flex items-center gap-1 text-[11px] muted">
                       优先级

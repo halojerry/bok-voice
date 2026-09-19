@@ -77,22 +77,28 @@ def build_engine() -> Engine | None:
         models.create_all(engine)
         # create_all 不会给已存在的表加列 —— 幂等补上新增列。注意 SQLite 不支持
         # `ADD COLUMN IF NOT EXISTS`（MySQL 语法，会抛错被吞），必须先查列是否存在。
+        # W2-T1：published_json 本次是否刚建列（一次性回填存量行的闸）。
+        _published_created = False
         try:
             from sqlalchemy import inspect as sa_inspect
             from sqlalchemy import text
 
-            def _ensure_column(conn, table: str, column: str, ddl: str) -> None:
+            def _ensure_column(conn, table: str, column: str, ddl: str) -> bool:
                 # 存在性探测走 SQLAlchemy inspector：方言无关（sqlite/postgres 同一套），
                 # 且由方言把范围限定到当前 schema。旧实现用不带 schema 过滤的
                 # information_schema 查询，多 schema 库（共享 PG 实例、Supabase 的
                 # auth/storage schema、并排 staging schema）里有同名表就被误判「列已存在」
                 # → ALTER 跳过、存量库升级静默丢列（2026-09-15 真 Postgres 冒烟实证）。
                 # 表不存在=跳过该列（半旧库不再让整块补列中断）。
+                # 返回值=本次是否「刚建列」（W2-T1 一次性回填用：仅刚建列才跑存量
+                # 数据迁移；既有调用点全部忽略返回值，零影响）。
                 insp = sa_inspect(conn)
                 if not insp.has_table(table):
-                    return
+                    return False
                 if column not in {c["name"] for c in insp.get_columns(table)}:
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
+                    return True
+                return False
 
             with engine.begin() as conn:
                 _ensure_column(
@@ -265,6 +271,12 @@ def build_engine() -> Engine | None:
                 _ensure_column(conn, "nodes", "revoked_at", "revoked_at VARCHAR(32) DEFAULT ''")
                 # 通话绑定节点(thin-node 拓扑):建单钉死承载节点,token 签发前校验。
                 _ensure_column(conn, "call_sessions", "node_id", "node_id VARCHAR(64) DEFAULT ''")
+                # 意向规则引擎(W4-T1,2026-09-19):人工协助面状态 + 挂断意向码。
+                # server_default 与 models.CallSession 同形（DEFAULT ''，方言安全）。
+                _ensure_column(conn, "call_sessions", "assist_status",
+                               "assist_status VARCHAR(16) DEFAULT ''")
+                _ensure_column(conn, "call_sessions", "intent_code",
+                               "intent_code VARCHAR(32) DEFAULT ''")
                 # 战役调度三字段（2026-09-17 竞品对齐）：时段窗/任务级并发/自动重拨。
                 # server_default 同形（DEFAULT '[]'/1/''，单引号字面量 SQLite/PG 双认）。
                 _ensure_column(conn, "campaigns", "call_windows_json",
@@ -291,6 +303,11 @@ def build_engine() -> Engine | None:
                 # 带 DEFAULT 合法）。
                 _ensure_column(conn, "global_settings", "campaign_json",
                                "campaign_json TEXT NOT NULL DEFAULT ''")
+                # 通知域（W5-T1）：settings.sms 段（webhook provider 骨架）落库列。
+                # 空 blob=未配置 → 读侧回落 default_settings()["sms"]；DDL 与
+                # models.GlobalSetting.sms_json server 侧同形（同 campaign_json 先例）。
+                _ensure_column(conn, "global_settings", "sms_json",
+                               "sms_json TEXT NOT NULL DEFAULT ''")
                 # 同义簇(qa-canvas Phase1,spec 2026-09-17):qa_entries 变体指向
                 # 簇头条目——''=独立条目/簇头本体,非空=本条是指向条目的变体。
                 _ensure_column(
@@ -311,6 +328,17 @@ def build_engine() -> Engine | None:
                 # ''=未启用(旧库补列即空串,装配零变化)。TEXT+DEFAULT '' 方言安全。
                 _ensure_column(
                     conn, "conversation_templates", "graph_json", "graph_json TEXT DEFAULT ''"
+                )
+                # 模板发布两态(W2-T1,2026-09-19):发布冻结快照九键 JSON,''=从未发布。
+                # 「本次刚建列」记录到外层标志——只有刚建列才跑下方存量回填
+                # (幂等铁律:二启/新建模板重启都不得再回填,否则未发布模板被误标已发布)。
+                _published_created = bool(
+                    _ensure_column(
+                        conn,
+                        "conversation_templates",
+                        "published_json",
+                        "published_json TEXT DEFAULT ''",
+                    )
                 )
                 # 节点鉴权(P1,深测): (license_id, fingerprint) 部分唯一索引——多实例
                 # 部署下配额竞态的库级兜底(进程内由 NodeStore.register_licensed 的
@@ -406,6 +434,56 @@ def build_engine() -> Engine | None:
                             )
         except Exception as exc:  # pragma: no cover - 数据迁移失败不阻断启动
             print(f"[deps] data migration (yue→cantonese) skipped: {exc}")
+        # ---- 模板发布两态一次性回填(W2-T1)：仅当 published_json 列本次启动刚创建。
+        # 存量行视为已发布——冻结当时 live 九键,保证迁移后运行时(机器通道 overlay)
+        # 读到=原 live,零行为变化。排在 yue→cantonese 数据迁移之后:冻结的 language
+        # 必须是规范值,否则冻结串与迁移后 live 恒不一致(假 has_changes + overlay
+        # 回吐旧值)。每次启动都跑=错误:新建未发布模板重启即被「视为已发布」。
+        if _published_created:
+            try:
+                import json as _pubjson
+
+                with engine.begin() as conn:
+                    _rows = conn.execute(
+                        text(
+                            "SELECT id, steps_json, graph_json, hotwords, tone_override,"
+                            " opening, core, objection, closing, language"
+                            " FROM conversation_templates WHERE published_json=''"
+                        )
+                    ).fetchall()
+                    _backfilled = 0
+                    for _row in _rows:
+                        (
+                            _rid, _steps, _graph, _hot, _tone,
+                            _opening, _core, _obj, _closing, _lang,
+                        ) = _row
+                        # 回填判据(任务书口径):steps_json/opening/core 任一非空——
+                        # 空壳模板(九键全空)不回填,保持「从未发布」语义。
+                        if not (_steps or _opening or _core):
+                            continue
+                        _payload = {
+                            "steps_json": _steps or "",
+                            "graph_json": _graph or "",
+                            "hotwords": _hot or "",
+                            "tone_override": _tone or "",
+                            "opening": _opening or "",
+                            "core": _core or "",
+                            "objection": _obj or "",
+                            "closing": _closing or "",
+                            "language": _lang or "",
+                        }
+                        conn.execute(
+                            text("UPDATE conversation_templates SET published_json=:v WHERE id=:id"),
+                            {"v": _pubjson.dumps(_payload, ensure_ascii=False), "id": _rid},
+                        )
+                        _backfilled += 1
+                if _backfilled:
+                    print(
+                        "[deps] conversation_templates published_json backfilled "
+                        f"rows={_backfilled} (one-shot on column creation)"
+                    )
+            except Exception as exc:  # pragma: no cover - 回填失败不阻断启动
+                print(f"[deps] published_json backfill skipped: {exc}")
         # pgvector: create the extension + knowledge_chunks table (best-effort SQLite-safe).
         try:
             from sqlalchemy import text

@@ -110,18 +110,38 @@ class ControlPlaneClient:
         r = await self._client.post(f"/api/calls/{call_id}/session-report", json=report)
         r.raise_for_status()
 
-    async def end_call(self, call_id: str, disposition: str = "declined") -> dict:
+    async def end_call(
+        self, call_id: str, disposition: str = "declined", intent_code: str = ""
+    ) -> dict:
         """AI 收尾后主动结束通话:置 ENDED 并断房。
 
         disposition=declined(客户拒绝,默认)| no_response(沉默心跳两次无回应)。
+        intent_code=W4 意向规则命中码(2026-09-19):仅非空才带——未命中规则时请求
+        URL 与旧版逐字节相同(四个既有收线调用点零语义变化)。CP 侧截 32 落列。
         失败(404 已结束/网络抖动)由 caller 打日志即可,结算另有 _on_close 幂等兜底。
         """
+        params: dict = {"disposition": disposition}
+        if intent_code:
+            params["intent_code"] = intent_code
         r = await self._client.post(
             f"/api/supervisor/{call_id}/end",
-            params={"disposition": disposition},
+            params=params,
         )
         r.raise_for_status()
         return r.json()
+
+    async def report_assist(self, call_id: str, status: str = "notified", source: str = "intent") -> None:
+        """上報人工協助打鈴(W4 notify_human 動作,fire-and-forget)。
+
+        status=notified(打鈴)| done(坐席已接管,CP takeover 端點置);source=觸發源
+        (intent=話術圖 notify_human 綁定)。server 幂等(done 不降級 notified),
+        raise_for_status 俾 caller 知失敗——失敗回滚 once 鍵,後續輪信號補報。
+        """
+        r = await self._client.post(
+            f"/api/calls/{call_id}/assist",
+            json={"status": status, "source": source},
+        )
+        r.raise_for_status()
 
     async def report_whatsapp(self, call_id: str, number: str = "", channel: str = "") -> None:
         """上報偵測到客戶俾 WhatsApp。number 有值=captured,空=offered。fire-and-forget。
@@ -175,6 +195,19 @@ class ControlPlaneClient:
         B3:account_id 必传本通账号(垫话罐头保持账号级,无 owner 维度)。
         """
         r = await self._client.get("/api/fillers", params={"account_id": account_id, "enabled": 1})
+        r.raise_for_status()
+        data = r.json()
+        return list(data) if isinstance(data, list) else []
+
+    async def list_intent_rules(self, account_id: str = "acc-001") -> list[dict]:
+        """意向规则行(W4-T2,2026-09-19):每通装配拉一次,挂断时评估 disposition
+        覆盖+intent_code。
+
+        account_id 传本通账号;CP 返回两级行合并(全局 ''∪本账号,disabled 行由
+        eval 端按 enabled 跳过)。失败由 caller 兜底空表——挂断走原 disposition,
+        零行为变化。
+        """
+        r = await self._client.get("/api/intent-rules", params={"account_id": account_id})
         r.raise_for_status()
         data = r.json()
         return list(data) if isinstance(data, list) else []

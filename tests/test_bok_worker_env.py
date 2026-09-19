@@ -56,12 +56,13 @@ def test_flow_graph_env_explicit_one_also_propagates(monkeypatch):
 def test_apply_flow_graph_env_is_pure_dict_fill(monkeypatch):
     """helper 本身：只透传白名单键（absent 不注入），不写别的键。
 
-    清光白名单外环境（别名现透传 QA 三键，ambient env 会令精确等值断言变脆
-    ——重审实锤：BOK_QA_ROTATION=0 跑测即假红）。
+    清光 `_FORWARD_ENV` 全表环境（2026-09-19 立法后表大——ambient env 会令精确
+    等值断言变脆，逐键 delenv；旧版只清 4 键的重审实锤同款教训）。
     """
     monkeypatch.setenv("BOK_FLOW_GRAPH", "0")
-    for key in ("BOK_QA_ROTATION", "BOK_QA_PRIORITY", "BOK_QA_FASTPATH", "BOK_FLOW_GRAPH_JUDGE"):
-        monkeypatch.delenv(key, raising=False)
+    for key in bok._FORWARD_ENV:
+        if key != "BOK_FLOW_GRAPH":
+            monkeypatch.delenv(key, raising=False)
     env: dict[str, str] = {"KEEP": "1"}
     bok._apply_flow_graph_env(env)
     assert env == {"KEEP": "1", "BOK_FLOW_GRAPH": "0"}
@@ -96,12 +97,12 @@ def test_qa_switch_env_reaches_dev_and_prod_workers(monkeypatch, key):
 
 
 def test_apply_bok_passthrough_env_forwards_all_keys(monkeypatch):
-    """helper 单点:五枚逃生门一次填;未设的键不出现。"""
+    """helper 单点:表内设了的键照值填、未设的键不出现（2026-09-19 立法后全表口径，
+    全表批量流到两表的端到端档在 tests/test_forward_env.py）。"""
+    for key in bok._FORWARD_ENV:
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("BOK_FLOW_GRAPH", "0")
     monkeypatch.setenv("BOK_QA_ROTATION", "0")
-    monkeypatch.delenv("BOK_QA_PRIORITY", raising=False)
-    monkeypatch.delenv("BOK_QA_FASTPATH", raising=False)
-    monkeypatch.delenv("BOK_FLOW_GRAPH_JUDGE", raising=False)
     env: dict[str, str] = {}
     bok._apply_bok_passthrough_env(env)
     assert env == {"BOK_FLOW_GRAPH": "0", "BOK_QA_ROTATION": "0"}

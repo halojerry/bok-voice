@@ -258,6 +258,22 @@ class CampaignSettingsModel(BaseModel):
     call_windows: list[dict] = []
 
 
+class SmsSettingsModel(BaseModel):
+    """通知域（W5-T1）：settings.sms 段——webhook provider 骨架。
+
+    真实短信网关未来对接，webhook_url 即对接点。secret 走 secret 掩码
+    （GET 返回空串+has_secret 标记，PUT 传空=保留旧值，与 sip.auth_password
+    同档）。enabled=False 总闸；hangup_enabled=挂断结算后自动发（默认关）；
+    hangup_template 支持 {contact} 占位=收件号码。
+    """
+
+    webhook_url: str = ""
+    secret: str = ""
+    enabled: bool = False
+    hangup_enabled: bool = False
+    hangup_template: str = ""
+
+
 class SettingsRequest(BaseModel):
     asr: ProviderSettings = ProviderSettings()
     llm: ProviderSettings = ProviderSettings()
@@ -267,7 +283,15 @@ class SettingsRequest(BaseModel):
     # None=请求未带 campaign 键 → 保留既有段（不清运营已配的全局窗）；
     # 传 {} / call_windows=[] = 清空（不限时段）。
     campaign: CampaignSettingsModel | None = None
+    # None=请求未带 sms 键 → 保留既有段（不清已配 webhook，照 campaign 先例）。
+    sms: SmsSettingsModel | None = None
     policy: str = "offline_first"
+
+
+class TransferSipRequest(BaseModel):
+    """SIP REFER 试点（W5-T1）：转接目标（坐席手机号 / SIP URI），必填。"""
+
+    transfer_to: str = ""
 
 
 class SupervisorCommand(BaseModel):
@@ -391,3 +415,57 @@ class QaEntryPatch(BaseModel):
     # 所有权转移只归 admin/root(user 的 patch 由 CP 剥掉)。
     owner_user_id: Optional[str] = None
     priority: Optional[int] = None
+
+
+class QaClusterSelectItem(BaseModel):
+    """聚类采纳选择项(W3-T1):kind=variant|fresh,i=计划对应数组的下标。"""
+
+    kind: str  # "variant" | "fresh"
+    i: int
+
+
+class QaClusterRequest(BaseModel):
+    """QA 自学习聚类(W3-T1):dry=挖掘→LLM 三列计划;apply=true 按 select 采纳入库。
+
+    limit 钳 ≤100(CP 侧);select 缺省=全部 variants+fresh。dry 计划有 600s
+    per-account 缓存,apply 优先吃新鲜缓存免二次 LLM。
+    """
+
+    min_calls: int = 5
+    limit: int = 60
+    apply: bool = False
+    select: Optional[list[QaClusterSelectItem]] = None
+
+
+class IntentRuleCreate(BaseModel):
+    """意向规则条目(W4-T1,2026-09-19)。conditions 形状(fact∈INTENT_FACTS/op/value)
+    走 core.validate_conditions 严格轨,CP 保存前校验。"""
+
+    name: str
+    intent_code: str
+    label: str = ""
+    disposition: str = ""
+    conditions: list[dict[str, Any]] = []
+    priority: int = 10
+    enabled: bool = True
+    # 作用域:''=全局行仅 root 可建;非 root 由 CP 强制本账号(body 值无效)。
+    account_id: str = "acc-001"
+
+
+class IntentRulePatch(BaseModel):
+    """意向规则部分更新(W4-T1)。None=不修改;conditions 整组替换(CP 转 JSON 落列)。"""
+
+    name: Optional[str] = None
+    intent_code: Optional[str] = None
+    label: Optional[str] = None
+    disposition: Optional[str] = None
+    conditions: Optional[list[dict[str, Any]]] = None
+    priority: Optional[int] = None
+    enabled: Optional[bool] = None
+
+
+class AssistRequest(BaseModel):
+    """人工协助通知(W4-T1):notified=已打铃 / done=人工已接手(幂等:done 不降级)。"""
+
+    status: str  # notified | done(枚举外 400)
+    source: str = ""  # intent | whatsapp | wechat | ""

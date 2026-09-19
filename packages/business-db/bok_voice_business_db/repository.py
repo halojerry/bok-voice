@@ -421,6 +421,63 @@ class SqlAlchemyBusinessRepository:
             row.hit_count = int(row.hit_count or 0) + int(n)
             self.session.commit()
 
+    # ---- 意向规则(W4-T1,2026-09-19):挂断评估条件规则,两级作用域 ----
+
+    @staticmethod
+    def _intent_rule_to_dict(row) -> dict:
+        # 全列反射(同 _call_to_dict):conditions_json 原样出仓,对象化由 CP 端点收口。
+        return {c.name: getattr(row, c.name) for c in models.IntentRule.__table__.columns}
+
+    def list_intent_rules(self, account_id: str = "") -> list[dict]:
+        """两级作用域合并:''=全局行 + 本账号行,created_at 升序(owner_scope IN 先例)。"""
+        stmt = (
+            select(models.IntentRule)
+            .filter(models.IntentRule.account_id.in_(["", account_id]))
+            .order_by(models.IntentRule.created_at.asc())
+        )
+        return [self._intent_rule_to_dict(r) for r in self.session.scalars(stmt)]
+
+    def get_intent_rule(self, rule_id: str) -> dict | None:
+        row = self.session.get(models.IntentRule, rule_id) if rule_id else None
+        return self._intent_rule_to_dict(row) if row else None
+
+    def create_intent_rule(self, data: dict) -> dict:
+        row = models.IntentRule(
+            id=data.get("id") or f"rule:{uuid.uuid4().hex[:12]}",
+            account_id=data.get("account_id") or "",
+            name=data.get("name") or "",
+            intent_code=data.get("intent_code") or "",
+            label=data.get("label") or "",
+            disposition=data.get("disposition") or "",
+            conditions_json=data.get("conditions_json") or "[]",
+            # priority=0 是合法值(小者先),不回退默认——None 才落默认 10。
+            priority=int(data["priority"]) if data.get("priority") is not None else 10,
+            enabled=bool(data.get("enabled", True)),
+        )
+        self.session.add(row)
+        self.session.commit()
+        return self._intent_rule_to_dict(row)
+
+    def update_intent_rule(self, rule_id: str, fields: dict) -> dict | None:
+        row = self.session.get(models.IntentRule, rule_id) if rule_id else None
+        if not row:
+            return None
+        # 白名单照 update_site:未知键(id/account_id/created_at)忽略——作用域/归属
+        # 不可经 PATCH 漂移。
+        for key in ("name", "intent_code", "label", "disposition", "conditions_json", "priority", "enabled"):
+            if key in fields:
+                setattr(row, key, fields[key])
+        self.session.commit()
+        return self._intent_rule_to_dict(row)
+
+    def delete_intent_rule(self, rule_id: str) -> bool:
+        row = self.session.get(models.IntentRule, rule_id) if rule_id else None
+        if not row:
+            return False
+        self.session.delete(row)
+        self.session.commit()
+        return True
+
     def iter_call_conversations(self, account_id: str = "", exclude_test_objects: bool = False) -> list[list[dict]]:
         """跨通话按序轮次(高频问答对挖掘用):join calls 过账号,created_at 排序。
 
@@ -646,7 +703,9 @@ class SqlAlchemyBusinessRepository:
         tpl = self.session.get(models.ConversationTemplate, template_id)
         if not tpl:
             return None
-        allowed = {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json", "hotwords", "graph_json", "owner_user_id"}
+        # published_json(W2-T1 发布两态)只由 publish 端点写入;CP PUT 的 payload
+        # 经 UpdateTemplateRequest 过滤永不携带该键——白名单放行仅服务发布路径。
+        allowed = {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json", "hotwords", "graph_json", "owner_user_id", "published_json"}
         for key, value in data.items():
             if key in allowed and hasattr(tpl, key):
                 setattr(tpl, key, value)
@@ -714,6 +773,9 @@ class SqlAlchemyBusinessRepository:
             "vad": json.loads(row.vad_json or "{}"),
             # 空 blob（老库补列后未保存）回落默认段，否则 dialer 拿不到 mode。
             "sip": json.loads(row.sip_json or "{}") or self.default_settings()["sip"],
+            # 通知域（W5-T1）：settings.sms 段；空 blob=未配置回落默认段
+            # （enabled=False 总闸，读侧语义与 sip 同族）。
+            "sms": json.loads(row.sms_json or "{}") or self.default_settings()["sms"],
             # 全局外呼时段窗段（T3b）：空 blob=不限时段（campaign._global_call_windows
             # 消费 settings.campaign.call_windows，读侧缺省 []）。
             "campaign": json.loads(row.campaign_json or "{}"),
@@ -736,6 +798,12 @@ class SqlAlchemyBusinessRepository:
         # 不清运营已配的全局窗）；传空 dict=清空（不限时段）。
         if "campaign" in settings:
             row.campaign_json = json.dumps(settings.get("campaign") or {}, ensure_ascii=False)
+        # sms 段（W5-T1）：缺键=保留既有（PUT 不传段不动已配 webhook）；传空值
+        # 回落默认段（与 sip 同语义：不允许把段清成空 dict）。
+        if "sms" in settings:
+            row.sms_json = json.dumps(
+                settings.get("sms") or self.default_settings()["sms"], ensure_ascii=False
+            )
         row.policy = settings.get("policy", row.policy or "offline_first")
         self.session.commit()
         return self.get_settings()
@@ -1226,6 +1294,17 @@ class SqlAlchemyBusinessRepository:
                 "ringing_timeout_s": 30,
                 "max_call_duration_s": 600,
             },
+            # 通知域（W5-T1）：webhook provider 骨架——真实短信网关未来对接，
+            # webhook_url 即对接点；secret 走 secret 掩码（GET 不回显原文）。
+            # enabled=False 总闸；hangup_enabled=挂断后自动发（默认关），
+            # hangup_template 支持 {contact} 占位=收件号码。
+            "sms": {
+                "webhook_url": "",
+                "secret": "",
+                "enabled": False,
+                "hangup_enabled": False,
+                "hangup_template": "",
+            },
             # 全局外呼时段窗段（T3b）：空=不限时段；GET 端点照常回显该键。
             "campaign": {"call_windows": []},
             "policy": "offline_first",
@@ -1261,6 +1340,7 @@ class InMemoryBusinessRepository:
         self.campaign_items: dict[str, dict] = {}
         self.sites: dict[str, dict] = {}
         self.filler_entries: dict[str, dict] = {}
+        self.intent_rules: dict[str, dict] = {}
         self.settings: dict = SqlAlchemyBusinessRepository.default_settings()
         self.users: dict[str, dict] = {}
 
@@ -1282,6 +1362,9 @@ class InMemoryBusinessRepository:
             "glossary": getattr(manifest, "glossary", "") or "",
             "voices_json": getattr(manifest, "voices_json", "") or "",
             "node_id": getattr(manifest, "node_id", "") or "",
+            # 意向规则引擎(W4-T1):人工协助面/挂断意向码,缺省与 SQL 侧列默认同形。
+            "assist_status": "",
+            "intent_code": "",
             # 仪表盘时长统计（2026-09-17）：缺省与 SQL 侧列默认值同形
             # （_call_to_dict 全列返回 started_at=None/ended_at=None/duration_s=0），
             # update_call 白名单外透传写入（datetime 直通）。
@@ -1403,6 +1486,56 @@ class InMemoryBusinessRepository:
         row = getattr(self, "filler_entries", {}).get(entry_id)
         if row is not None:
             row["hit_count"] = int(row.get("hit_count") or 0) + int(n)
+
+    # ---- 意向规则(W4-T1,2026-09-19,镜像 SQL 姿势) ----
+
+    def list_intent_rules(self, account_id: str = "") -> list[dict]:
+        # 两级作用域合并:''=全局行 + 本账号行(与 SQL 后端同语义),created_at 升序。
+        rows = [
+            v
+            for v in getattr(self, "intent_rules", {}).values()
+            if str(v.get("account_id") or "") in ("", account_id)
+        ]
+        return sorted(rows, key=lambda v: v.get("created_at") or "")
+
+    def get_intent_rule(self, rule_id: str) -> dict | None:
+        row = getattr(self, "intent_rules", {}).get(rule_id)
+        return dict(row) if row else None
+
+    def create_intent_rule(self, data: dict) -> dict:
+        if not hasattr(self, "intent_rules"):
+            self.intent_rules = {}
+        row = {
+            "id": data.get("id") or f"rule:{uuid.uuid4().hex[:12]}",
+            "account_id": data.get("account_id") or "",
+            "name": data.get("name") or "",
+            "intent_code": data.get("intent_code") or "",
+            "label": data.get("label") or "",
+            "disposition": data.get("disposition") or "",
+            "conditions_json": data.get("conditions_json") or "[]",
+            "priority": int(data["priority"]) if data.get("priority") is not None else 10,
+            "enabled": bool(data.get("enabled", True)),
+            "created_at": data.get("created_at") or "",
+        }
+        self.intent_rules[row["id"]] = row
+        return dict(row)
+
+    def update_intent_rule(self, rule_id: str, fields: dict) -> dict | None:
+        row = getattr(self, "intent_rules", {}).get(rule_id)
+        if row is None:
+            return None
+        # 白名单与 SQL 后端同款:未知键(id/account_id/created_at)忽略。
+        for key in ("name", "intent_code", "label", "disposition", "conditions_json", "priority", "enabled"):
+            if key in fields:
+                row[key] = fields[key]
+        return dict(row)
+
+    def delete_intent_rule(self, rule_id: str) -> bool:
+        rows = getattr(self, "intent_rules", {})
+        if rule_id not in rows:
+            return False
+        del rows[rule_id]
+        return True
 
     def create_qa_entry(self, data: dict) -> dict:
         if not hasattr(self, "qa_entries"):
@@ -1588,6 +1721,10 @@ class InMemoryBusinessRepository:
             graph_json=data.get("graph_json", ""),
             owner_user_id=data.get("owner_user_id") or "",
         ).__dict__
+        # 发布冻结快照(W2-T1):dataclass(types.py)未含该字段,以 dict 键补缺省
+        # ——与 SQL 列 published_json TEXT DEFAULT '' 同形(''=从未发布)。
+        # POST 建单永不携带(由 CP 层保证),此处兜底缺省防 KeyError。
+        tpl["published_json"] = data.get("published_json", "")
         self.templates[tpl["id"]] = tpl
         return tpl
 
@@ -1597,7 +1734,9 @@ class InMemoryBusinessRepository:
     def update_template(self, template_id: str, data: dict) -> dict | None:
         if template_id not in self.templates:
             return None
-        self.templates[template_id].update({k: v for k, v in data.items() if k in {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json", "hotwords", "graph_json", "owner_user_id"}})
+        # published_json(W2-T1)入白名单同 SQL 后端:仅供 publish 端点写冻结快照,
+        # CP PUT 的 payload 经 UpdateTemplateRequest 过滤永不携带。
+        self.templates[template_id].update({k: v for k, v in data.items() if k in {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json", "hotwords", "graph_json", "owner_user_id", "published_json"}})
         return self.templates[template_id]
 
     def delete_template(self, template_id: str) -> bool:
@@ -1645,16 +1784,20 @@ class InMemoryBusinessRepository:
 
     def save_settings(self, settings: dict) -> dict:
         old = self.settings
+        defaults = SqlAlchemyBusinessRepository.default_settings()
         self.settings = {
             "asr": settings.get("asr", {}),
             "llm": settings.get("llm", {}),
             "tts": settings.get("tts", {}),
             "vad": settings.get("vad", {}),
             # 缺键/空值回落默认段（与 SQL 后端同语义：不允许把 sip 段清成空）。
-            "sip": settings.get("sip") or SqlAlchemyBusinessRepository.default_settings()["sip"],
+            "sip": settings.get("sip") or defaults["sip"],
             # campaign 段（T3b）：缺键=保留既有（与 SQL 侧同语义）；传空=清空（不限）。
             "campaign": settings["campaign"] if "campaign" in settings
             else old.get("campaign", {}),
+            # sms 段（W5-T1）：缺键=保留既有；空值回落默认段（与 SQL 侧同语义）。
+            "sms": (settings.get("sms") or defaults["sms"]) if "sms" in settings
+            else (old.get("sms") or defaults["sms"]),
             "policy": settings.get("policy", "offline_first"),
         }
         return self.settings
