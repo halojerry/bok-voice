@@ -173,11 +173,12 @@ IPv6，SQLAlchemy 连接失败，容器 crash-loop。事故同链还有第二坑
 
 ```bash
 cd deploy/cloud
-# 首选：up.sh 幂等施加双覆盖（池器域名→IPv4 + 端口 18010；host 已是 IP 原样通过）
+# 首选：up.sh 幂等施加双覆盖（池器域名→IPv4 现场解析,漂移自动跟随 + 端口 18010；host 已是 IP 原样通过）
 ./up.sh                          # 日常重启；可透传 compose 参数，如 ./up.sh --force-recreate
 curl -fsS http://127.0.0.1:18010/health   # 应含 "ok":true
 
-# 显式双覆盖（与事故修复姿势同款；IP 漂移时改 sed 里的地址或用 up.sh 的 BOK_SUPABASE_IP）
+# 显式双覆盖（与事故修复姿势同款；池器 IP 以现场解析为准,解析失败落兜底字面量
+# 52.77.146.31——若 Supabase 已轮换,以 Dashboard 池器地址为准或用 BOK_SUPABASE_IP 钉定）
 BOK_CP_PORT=18010 \
 DATABASE_URL="$(grep -E '^(export )?DATABASE_URL=' .env | tail -n1 | cut -d= -f2- \
   | sed -E 's|@[^@/:]+\.pooler\.supabase\.com|@52.77.146.31|')" \
