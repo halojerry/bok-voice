@@ -45,7 +45,19 @@ from .tts_cache import (
 )
 # 模块级引 flow(纯 stdlib 依赖,无环):_wa_numberish/_wa_number_line 等模块级
 # helper 用;entrypoint 内的 function-scoped import 属历史样式,不冲突。
-from .flow import _digit_normalize, digits_to_cantonese, stall_ladder_level
+# 分支罐头快路(branch_canned_pick)用:match_step_branch/parse_step_ref 与
+# 提示词注入同源匹配器、REFUSE/FAREWELL 收线专线让位闸。
+from .flow import (  # noqa: F401 - 部分名字只被 branch_canned_pick 使用
+    FAREWELL,
+    REFUSE,
+    _digit_normalize,
+    _looks_like_whatsapp_step,
+    digits_to_cantonese,
+    match_step_branch,
+    parse_step_ref,
+    render_template_text,
+    stall_ladder_level,
+)
 
 try:
     from bok_voice_obs.logging import configure_logging, get_logger
@@ -400,6 +412,48 @@ async def _say_script(session, tts_provider, cache, text: str, emotion: str = ""
         if not played["frames"]:
             return await session.say(text)
         return None
+
+
+def branch_canned_pick(
+    *,
+    enabled: bool,
+    closing: bool,
+    paused: bool,
+    user_text: str,
+    goal: str,
+    ref: str,
+    wa_captured: bool,
+    verdict: str,
+    vars_map: dict[str, str] | None = None,
+) -> tuple[str, str] | None:
+    """分支罐头快路挑选(2026-09-20 路线 A-①,纯函数,单测直接喂)。
+
+    当前步 ref 带「如果客户X→就Y」分支且 match_step_branch 命中(与提示词
+    注入同源:verdict 家族+客户原话 bigram)→ 返回 (渲染后应答, 分支条件),
+    调用方查 tts_cache 命中即播录音跳过 LLM。任一闸不过/未命中/应答渲染后
+    仍有 {占位} 残留(变量缺失,pregen 同规则不会物化)→ None,调用方照旧
+    落穿 graph/QA/LLM——提示词注入行为不变。ref 空=无流程/行完/无分支步,
+    零开销直落。闸门与漏斗既有专线对齐:REFUSE/FAREWELL 让位收线、WA 步
+    未捕获跳过(与 QA 快路 wa_step_locked 同语义)、closing/paused 不截。
+    """
+    if not enabled or closing or paused or not str(user_text or "").strip():
+        return None
+    if verdict in (REFUSE, FAREWELL):
+        return None
+    if not str(ref or "").strip():
+        return None
+    if _looks_like_whatsapp_step(goal, ref) and not wa_captured:
+        return None
+    parts = parse_step_ref(ref)
+    if not parts.branches:
+        return None
+    m = match_step_branch(parts, user_text, verdict)
+    if not m:
+        return None
+    rendered = render_template_text(m[1], vars_map or {})
+    if not rendered.strip() or re.search(r"\{[^{}]+\}", rendered):
+        return None
+    return rendered, m[0]
 
 
 def _nudge_should_fire(now: float, last_reply_ts: float, last_user_ts: float, nudge_delay: float) -> bool:
@@ -4208,6 +4262,74 @@ async def entrypoint(ctx):
                     answer, audio=frames_aiter(pcm_to_frames(pcm, _tts_cache.sample_rate))
                 )
                 return True
+
+            # ---- 分支罐头快路(2026-09-20 路线 A-①):当前步 ref 的「如果客户X→
+            # 就Y」分支命中(match_step_branch 与提示词注入同源)且应答已物化录音
+            # → 直接播录音跳过 LLM(零 TTFT、措辞逐字一致);未命中/未物化照旧
+            # 落穿 graph/QA/LLM——提示词注入行为不变。不推进流程:分支应答留在
+            # 本步,与注入语义一致。闸门在 branch_canned_pick(纯函数):总开关+
+            # 非 closing+非暂停+user_text 非空+有分支+WA 步未捕获跳过+REFUSE/
+            # FAREWELL 让位收线专线。缓存键与 _say_script 同源(resp 渲染文本+
+            # 运行时 voice/model/speed,emotion 空)。BOK_BRANCH_CANNED=0 关。
+            try:
+                _bc_g, _bc_r = flow_ctrl.current_goal_ref()
+                _bc_step = (int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0
+                _bc_pick = branch_canned_pick(
+                    enabled=os.environ.get("BOK_BRANCH_CANNED", "1") == "1",
+                    closing=bool(flow_ctrl.closing),
+                    paused=bool(self.paused),
+                    user_text=user_text,
+                    goal=_bc_g,
+                    ref=_bc_r,
+                    wa_captured=bool(_wa_captured["on"]),
+                    verdict=str(flow_ctrl.last_verdict or ""),
+                    vars_map=flow_ctrl.vars_map,
+                )
+            except Exception:  # noqa: BLE001 - 挑选异常当未命中,照旧落穿
+                _bc_pick = None
+            if _bc_pick is not None:
+                _bc_resp, _bc_cond = _bc_pick
+                _bc_pcm = _qa_pcm_for(_bc_resp)
+                if _bc_pcm is not None:
+                    try:
+                        await session.interrupt()  # ① 作废停着的抢跑快照(同 _qa_canned_say)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    # ② 手动补 user 轮(StopResponse 轮 item_added 唔会触发;
+                    # C5 官方姿势:旧 chat_ctx.items.append 打只读上下文恒失败)
+                    await self._try_append_user_message(new_message)
+                    # ③ 回声守卫预锚(正常 playout 完才置,快路要立即生效)
+                    context_state.set_last_reply(_bc_resp)
+                    _turn_origin["gen"] = "script"
+                    _turn_origin["provider"] = "branch-canned"
+                    try:
+                        _bc_ms = int((time.monotonic() - _t0) * 1000)
+                        await cp.add_turn(
+                            call_id, "user", user_text, language=language_state.lang,
+                            line="a", speaker="customer",
+                            template_step=_bc_step, started_ms=_bc_ms, ended_ms=_bc_ms,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    print(
+                        f"BRANCH_CANNED hit step={_bc_step} "
+                        f"branch_len={len(_bc_resp)} (call {room_name})",
+                        flush=True,
+                    )
+                    # ④ 快路不经 tts_provider,首音频回调唔会拆看门狗——显式拆
+                    _cancel_response_watchdog()
+                    await session.say(
+                        _bc_resp,
+                        audio=frames_aiter(pcm_to_frames(_bc_pcm, _tts_cache.sample_rate)),
+                    )
+                    # 必须在 except-pass try 之外 raise(同 say-step/WA 累积/QA 快路)
+                    raise StopResponse()
+                # 命中分支但应答未物化 → 照旧落穿(注入提示词走 LLM,现状不变)
+                print(
+                    f"BRANCH_CANNED miss step={_bc_step} "
+                    f"branch_len={len(_bc_resp)} (call {room_name})",
+                    flush=True,
+                )
 
             # ---- 话术图引擎(spec 2026-09-18;插在 say 直念步之后、QA 快路之前,
             # precedence: REFUSE>DEFER>say>graph[notify/jump/play]>QA 快路;BOK_FLOW_GRAPH=0 整闸,

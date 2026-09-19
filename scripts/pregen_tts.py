@@ -7,6 +7,7 @@
   python scripts/pregen_tts.py --fillers              # 垫话按人设音色物化(全部启用人设)
   python scripts/pregen_tts.py --fillers --persona X  # 只给一个人设补物化垫话
   python scripts/pregen_tts.py --qa --all-personas    # QA 罐头 × 全部启用人设
+  python scripts/pregen_tts.py --branches             # 话术分支应答物化(步骤 ref「如果客户X→就Y」)
   python scripts/pregen_tts.py --qa-status            # 逐条目物化状态 JSON(stdout,不合成不碰云)
   python scripts/pregen_tts.py --qa --entry-id X      # 只物化指定 qa 条目 id(--entry-id 可重复)
   任意组合 + --dry-run                                # 只打印 (persona,lang,voice,条数) 计划清单
@@ -49,7 +50,12 @@ from agent_runtime.agent import (  # noqa: E402
     _wa_number_line,
 )
 from agent_runtime.fillers import FILLER_ASSETS_DIR, load_manifest  # noqa: E402
-from agent_runtime.flow import object_vars, parse_steps, render_template_text  # noqa: E402
+from agent_runtime.flow import (  # noqa: E402
+    object_vars,
+    parse_step_ref,
+    parse_steps,
+    render_template_text,
+)
 from agent_runtime.providers.livekit_plugins import (  # noqa: E402
     LanguageState,
     MiniMaxTTS,
@@ -230,6 +236,34 @@ def _say_step_lines(tpl: dict | None) -> list[tuple[str, str]]:
                 out.append((line, s.emotion))
                 break
     return out
+
+
+def _branch_jobs(
+    templates: list[dict],
+    lang_personas: dict[str, dict | None],
+) -> list[Job]:
+    """话术分支应答物化计划(2026-09-20 路线 A-① 分支罐头快路配套)。
+
+    逐模板逐步 parse_step_ref 解析 ref 的「如果客户X→就Y」分支(与运行时
+    agent.branch_canned_pick 同一解析器),取每个分支 resp 渲染后文本。
+    渲染后仍有 {占位} 残留的条目跳过——运行时分支快路同规则不认(查不到
+    同文缓存,宁落 LLM 不念占位符)。同 (persona, lang, text) 重复 resp 由
+    _materialize 的 seen 去重,不重复合成。分支快路闸门只认缓存有音频的
+    应答——这里物化即开闸,键与 _say_script 同源(text+voice+model+speed,
+    emotion 空)。
+    """
+    jobs: list[Job] = []
+    for tpl in templates or []:
+        lang = _normalize_lang((tpl or {}).get("language"), default="") or ""
+        if not lang:
+            continue
+        for s in parse_steps(str(tpl.get("steps_json") or "")):
+            for _cond, resp in parse_step_ref(s.ref or "").branches:
+                rendered = render_template_text(resp, {})
+                if not rendered.strip() or re.search(r"\{[^{}]+\}", rendered):
+                    continue
+                jobs.append((lang_personas.get(lang), lang, rendered, ""))
+    return jobs
 
 
 def _fillers_jobs(
@@ -493,6 +527,7 @@ async def main_async() -> int:
     ap.add_argument("--objects", action="store_true", help="逐对象渲染开场白/收线/心跳并预合成")
     ap.add_argument("--fillers", action="store_true", help="垫话 manifest 按人设音色物化进 tts-cache(默认全部启用人设;--persona 限单人人设)")
     ap.add_argument("--qa", action="store_true", help="Q→A 快路启用条目的应答预合成(闸门只认缓存有音频的条目)")
+    ap.add_argument("--branches", action="store_true", help="话术分支应答预合成(步骤 ref「如果客户X→就Y」的 Y,渲染后无占位才物化;分支罐头快路只认缓存有音频)")
     ap.add_argument("--qa-status", action="store_true", help="不合成:逐条目输出物化状态 JSON(stdout),供 CP canned-status 端点消费")
     ap.add_argument("--entry-id", action="append", default=[], help="只处理指定 qa 条目 id(可重复;--qa/--qa-status 共用过滤)")
     ap.add_argument("--all-personas", action="store_true", help="--qa 配套:条目 × 每个启用人设各物化一版(缺省每语言只取该语言人设)")
@@ -502,7 +537,7 @@ async def main_async() -> int:
     ap.add_argument("--object-id", default="", help="只为指定对象预生成开场白/收线/心跳(配合 --objects)")
     ap.add_argument("--model", default="", help="MINIMAX_MODEL 覆盖(默认 env/2.8-hd,须与运行时一致)")
     args = ap.parse_args()
-    if not (args.greetings or args.objects or args.fillers or args.qa or args.qa_status):
+    if not (args.greetings or args.objects or args.fillers or args.qa or args.branches or args.qa_status):
         args.greetings = True
 
     if os.environ.get("MINIMAX_API_KEY", ""):
@@ -691,6 +726,23 @@ async def main_async() -> int:
             total += ok + sk + fl
             if args.all_personas:
                 _print_group_counts("qa", records, with_total=args.dry_run)
+
+    # ---- 话术分支应答物化(2026-09-20 路线 A-①;模板已在上方拉取) ----
+    # 分支罐头快路闸门只认缓存有音频——物化即开闸;pin=True 罐头集永不逐出
+    # (与 qa/greetings 直念线同纪律)。重复 resp 由 _materialize seen 去重。
+    if args.branches:
+        branch_job_list = _branch_jobs(templates, lang_personas)
+        if branch_job_list:
+            ok, sk, fl, records = await _materialize(
+                cache, model, branch_job_list,
+                api_key=api_key, sample_rate=sample_rate, tts_cfg=tts_cfg,
+                voice_mode=voice_mode, dry_run=args.dry_run, pin=True,
+            )
+            gen += ok
+            skip += sk
+            fail += fl
+            total += ok + sk + fl
+            _print_group_counts("branches", records, with_total=args.dry_run)
 
     print(f"pregen done total={total} generated={gen} skipped={skip} failed={fail}", flush=True)
     return 0 if fail == 0 else 2

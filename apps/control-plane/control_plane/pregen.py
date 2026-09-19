@@ -2,7 +2,7 @@
 
 「如果上线新人设没有 QA 罐头/垫话应该提醒,并自动触发全部生成」:
 人设 create/update 命中音色变化 → 后台 detached 子进程跑
-`scripts/pregen_tts.py --greetings --fillers --qa --persona <id>`
+`scripts/pregen_tts.py --greetings --fillers --qa --branches --persona <id>`
 (幂等:已在缓存的 key 跳过,重跑零云调用)。响应带 `tts_pregen` 状态字段
 =提醒面;运行时逐轮提醒仍是 agent.log 的 `BOK_FILLER voice_fallback`。
 
@@ -157,6 +157,8 @@ def persona_pregen_status(
                 "--greetings",
                 "--fillers",
                 "--qa",
+                # 分支罐头快路(2026-09-20 路线 A-①):分支应答随人设音色一并物化
+                "--branches",
                 "--persona",
                 pid,
             ]

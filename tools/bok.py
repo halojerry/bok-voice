@@ -1158,6 +1158,8 @@ _FORWARD_ENV = (
     "BOK_QA_ROTATION",
     "BOK_QA_PRIORITY",
     "BOK_QA_FASTPATH",
+    # —— 分支罐头快路(2026-09-20 路线 A-①:步骤分支命中+应答已物化→播录音跳 LLM) ——
+    "BOK_BRANCH_CANNED",
     "BOK_QA_MATCH_THRESHOLD",
     # —— 垫话/罐头/TTS 缓存 ——
     "BOK_FILLER",
