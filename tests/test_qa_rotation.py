@@ -332,6 +332,7 @@ def test_agent_wiring_gates_rotation_and_leaves_graph_branch_alone():
     graph_block = src.split("# ---- 话术图引擎", 1)[1].split("# ---- Q→A 检索快路", 1)[0]
     assert "cluster_members" not in graph_block
     assert "_qa_rotation_plan" not in graph_block
-    assert "_qa_note_played" not in graph_block
-    assert "qa_played" not in graph_block          # M-r1:轮换账本/取员禁入 graph 分支
+    # 2026-09-19 审计 P2-12:记账解禁——图 by_id 播放真出声后补记 qa_played
+    # (旧版连记账一并禁入,同簇条目再被快路轮换选中=同通同段罐头播两遍);
+    # 取员/出场序仍禁入,轮换选取语义(spec §2 graph 分支零轮换)原样钉死。
     assert "pick_rotation_member" not in graph_block

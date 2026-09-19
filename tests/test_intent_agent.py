@@ -358,10 +358,18 @@ def test_end_wiring_pinned_to_schedule_call_end():
     assert "evaluate_intent_disposition(" in sched_seg
     assert '_end_scheduled["intent_code"]' in sched_seg
     assert "wa_captured=bool(_wa_captured[\"on\"])" in sched_seg  # wa 直接读账本
-    # 四个经 _schedule_call_end 的既有收线点仍在(REFUSE/FAREWELL/心跳/漏斗 v2
-    # stall 收线);时长 fuse 直调 cp.end_call,新参 intent_code 缺省空=逐字节同旧。
-    assert _SRC.count("_schedule_call_end(") == 5  # 定义+REFUSE+FAREWELL+心跳+stall收线
-    assert 'await cp.end_call(call_id, disposition="completed")' in _SRC  # fuse 零变化
+    # 五个经 _schedule_call_end 的收线点(REFUSE/FAREWELL/心跳/stall 收线/时长
+    # fuse)——2026-09-19 审计 P1-5:fuse 从直调 cp.end_call 改走统一收线单点,
+    # 白吃 fired 幂等与 W4 意向评估,并消灭「与 delayed end 双发 /end、CP 侧
+    # 后写者覆盖」的终态错配。计数=定义1+收线点5+fuse 注释字面提及1。
+    assert _SRC.count("_schedule_call_end(") == 7
+    assert 'await cp.end_call(call_id, disposition="completed")' not in _SRC  # fuse 直调已废
+    # 客户先挂断的通话在 close 路径补评估(P1-6):agent 未收线(fired 未烧)才评,
+    # 规则命中(码+档双非空)才上报,失败唔阻结算;step_max 快照改读账本(P1-4)。
+    close_seg = _SRC[_SRC.index("async def _close(") : _SRC.index("def _close_done(")]
+    assert "evaluate_intent_disposition(" in close_seg
+    assert 'not _end_scheduled["fired"]' in close_seg
+    assert "max_step_reached" in sched_seg or "max_step_reached" in close_seg
 
 
 def test_facts_ledger_and_hooks_pinned():
