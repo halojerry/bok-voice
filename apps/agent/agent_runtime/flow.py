@@ -898,6 +898,11 @@ class FlowController:
     # 才记,与 graph_fired 同纪律)。簇内轮换取「本通最少播放」成员,平则插入序;
     # 容量 64 截断(agent.py 记账点 `_qa_note_played`)。
     qa_played: list[str] = field(default_factory=list)
+    # 到达过的最大话术步(1-based,单调只增)。挂断快照 step_max 读这里——旧版
+    # 用 current+1:走完全部步时 current==len(steps) 报 len+1(不存在的步)、
+    # 图后退跳后报回退后的步,以 step_max 为条件的意向规则双向错判(2026-09-19
+    # 审计 P1-4)。advance/jump_to 实际位移才更新。
+    max_step_reached: int = 1
 
     @classmethod
     def from_template(cls, template: dict | None, object_card: dict | None) -> "FlowController":
@@ -979,6 +984,8 @@ class FlowController:
             return
         if self.current < len(self.steps):
             self.current += 1
+            # 到达步(1-based):指向真步=current+1;指向 done 位=最后一步步号。
+            self.max_step_reached = max(self.max_step_reached, min(self.current + 1, len(self.steps)))
             self._just_advanced = True
             # 常规推进=客户真确认 → 尾部回到【新一步】(跳转标记只活到下一次推进)。
             self._entered_by_jump = False
@@ -997,6 +1004,7 @@ class FlowController:
             return
         before = self.current
         self.current = target
+        self.max_step_reached = max(self.max_step_reached, min(target + 1, len(self.steps)))
         self._just_advanced = True
         self._entered_by_jump = True
         # 前向跳:起点步之后、目标步之前的全部被跳过(1-based);后退跳无「被跳过」

@@ -214,6 +214,42 @@ async def _llm_judge(
         return ""
 
 
+# judge 专线健康回退(2026-09-19 审计 P2-11):FLOW_JUDGE_* env 在即锁死端点,
+# 9B sidecar 挂掉时异常被 _llm_judge 吞掉返空=整通模糊轮推进/判据补位静默失效,
+# 只余失败打点冇降级路径。连续失败 ≥2 次=本进程内回落主 LLM 链并打点。降级
+# 不回头:恢复不自动升回(端点健康探测唔做,判定路径宁可粗糙不可静默死),重启
+# 由守护拉起新进程自然复位。
+_judge_health = {"streak": 0, "fell_back": False}
+
+
+def _judge_base_url(llm_cfg: dict) -> str:
+    """判定端点解析单点(FLOW_JUDGE_* → 主 LLM 链),原两处逐字同源逻辑收编。"""
+    dedicated = os.environ.get("FLOW_JUDGE_LLM_BASE_URL", "").strip()
+    if not dedicated or _judge_health["fell_back"]:
+        return (
+            (llm_cfg.get("base_url") or "")
+            or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1")
+        ).rstrip("/")
+    return dedicated.rstrip("/")
+
+
+def _note_judge_outcome(ok: bool) -> None:
+    """判定调用后记账:专线端点连续空回/异常 ≥2 次即降级主 LLM(打点一次)。"""
+    if _judge_health["fell_back"]:
+        return
+    if ok:
+        _judge_health["streak"] = 0
+        return
+    _judge_health["streak"] += 1
+    if _judge_health["streak"] >= 2:
+        _judge_health["fell_back"] = True
+        print(
+            "FLOW_JUDGE_FALLBACK dedicated judge endpoint failing; "
+            "demoting judge traffic to main LLM chain",
+            flush=True,
+        )
+
+
 def _intent_judge_candidates(
     graph: FlowGraphDoc,
     *,
@@ -1886,8 +1922,20 @@ async def entrypoint(ctx):
             async def _duration_fuse() -> None:
                 await asyncio.sleep(_fuse_s)
                 print(f"[dial] duration fuse fired (call {room_name})", flush=True)
+                # 统一收线单点(2026-09-19 审计 P1-5):旧版直调 cp.end_call,绕过
+                # _schedule_call_end 的 fired 幂等与 W4 意向评估,且与已排定的
+                # delayed end 各自发 /end——CP 侧后写者覆盖,disposition 与
+                # intent_code 出现不配套终态。闭包晚绑定:fuse 最短数百秒后才跑,
+                # entrypoint 此时早装配好 _schedule_call_end(同作用域)。先排定
+                # (算好覆盖 disposition/intent_code)再幂等直烧,排定腿被并发
+                # 抢先时本轮 no-op,零双发。
                 try:
-                    await cp.end_call(call_id, disposition="completed")
+                    _schedule_call_end(delay=0.0, disposition="completed")
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[dial] fuse schedule end failed: {exc!r} (call {room_name})",
+                          flush=True)
+                try:
+                    await _fire_end_call(_end_scheduled["disposition"])
                 except Exception as exc:  # noqa: BLE001
                     print(f"[dial] fuse end_call failed: {exc!r} (call {room_name})",
                           flush=True)
@@ -3148,6 +3196,44 @@ async def entrypoint(ctx):
                     )
                 except asyncio.TimeoutError:
                     pass
+            # W4 意向评估补位(2026-09-19 审计 P1-6):评估只挂在 agent 主动收线
+            # (_schedule_call_end 四调用点),客户先挂断的通话只结算不评估——
+            # confirm_count/duration_s 类条件规则对「有意向」人群结构性失明,
+            # 而嗰批人恰恰集中在客户先挂的样本里。与收线路径共用同一评估函数;
+            # 幂等:agent 已收线(fired)不重评,close 自身以 evaluated 键防二入。
+            # 命中才上报(规则未命中不覆盖 webhook 已落的 disposition);评估失败
+            # 唔阻结算。
+            if not _end_scheduled["fired"] and not _end_scheduled.get("close_evaluated"):
+                _end_scheduled["close_evaluated"] = True
+                try:
+                    _t_close = time.time()
+                    _close_snap = _intent_facts_snapshot(
+                        _facts,
+                        wa_captured=bool(_wa_captured["on"]),
+                        duration_s=int(_t_close - float(_facts.get("t_start_wall") or _t_close)),
+                        step_max=int(getattr(flow_ctrl, "max_step_reached", 0)
+                                     or int(flow_ctrl.current or 0) + 1),
+                    )
+                    _close_hit = evaluate_intent_disposition(
+                        _close_snap, _intent_rules, ""
+                    )
+                    # 元组 (disposition, intent_code);双非空才上报——client 的 /end
+                    # 恒带 disposition 参数,空串会把 webhook 已落的值洗掉;只打码
+                    # 不覆盖 disposition 的规则在 close 路径保守跳过(收线路径不受限)。
+                    _close_disp, _close_code = _close_hit
+                    if _close_code and _close_disp:
+                        await cp.end_call(
+                            call_id,
+                            disposition=str(_close_disp),
+                            intent_code=str(_close_code),
+                        )
+                        print(
+                            f"[flow] intent evaluated on customer-hangup "
+                            f"code={_close_code} disp={_close_disp} (call {room_name})",
+                            flush=True,
+                        )
+                except Exception as exc:  # noqa: BLE001 - 评估/上报失败唔阻结算
+                    print(f"[agent] close-path intent eval failed: {exc!r} (call {room_name})", flush=True)
             await cp.settle(call_id)
             # QA 快路每通汇总(task-9):每通一行 PERF 风格,打完即清零(job 进程
             # 一通一命,清零属防御);打点失败绝不影响结算。
@@ -3197,7 +3283,7 @@ async def entrypoint(ctx):
             _facts,
             wa_captured=bool(_wa_captured["on"]),
             duration_s=int(_t_now - float(_facts.get("t_start_wall") or _t_now)),
-            step_max=int(flow_ctrl.current or 0) + 1,
+            step_max=int(getattr(flow_ctrl, "max_step_reached", 0) or int(flow_ctrl.current or 0) + 1),
         )
         _final_disp, _intent_code = evaluate_intent_disposition(
             _facts_snap, _intent_rules, disposition
@@ -3275,12 +3361,8 @@ async def entrypoint(ctx):
 
             # judge 专线优先(FLOW_JUDGE_*,bok.py 注入指向 :1237 9B——后台判定
             # 是 fire-and-forget 重活,大模型判定质量↑且与活通话回复的 :1235
-            # 完全隔离;env 缺席=原链路,零配置零变化)。
-            jbase = (
-                os.environ.get("FLOW_JUDGE_LLM_BASE_URL", "").strip()
-                or (llm_cfg.get("base_url") or "")
-                or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1")
-            ).rstrip("/")
+            # 完全隔离;env 缺席=原链路,零配置零变化)。健康回退见 _judge_base_url。
+            jbase = _judge_base_url(llm_cfg)
             jmodel = (
                 os.environ.get("FLOW_JUDGE_LLM_MODEL", "").strip()
                 or llm_cfg.get("model")
@@ -3301,6 +3383,7 @@ async def entrypoint(ctx):
                 route_enabled=route_enabled,
             )
             _raw = await _llm_judge(jbase, jmodel, msgs)
+            _note_judge_outcome(bool(_raw))
             jv = parse_judge_output(_raw)
             if route_enabled:
                 _rr, _cc = parse_judge_route(_raw)
@@ -3329,6 +3412,11 @@ async def entrypoint(ctx):
                 flow_ctrl.current == step_at
                 and flow_ctrl.has_steps
                 and not flow_ctrl.done
+                # closing 冻结(2026-09-19 审计 P1-9):REFUSE 收尾后起跑在前的
+                # bg judge 返回 confirm 仍会把 current+1——收尾讲著告别词流程
+                # 又前移,template_step/步指引起点漂移。与意图 judge store 守卫
+                # 同款收口。
+                and not flow_ctrl.closing
                 # C1 暂停冻结(2026-09-13):暂停前起跑的 judge 完成时若在暂停中,
                 # 不推进不注入(旧版 call-15a2f586:暂停期 judge=confirm 静默推
                 # step4→6,恢复后错步)。judge 结果丢弃,resume 后重新判。
@@ -3400,12 +3488,9 @@ async def entrypoint(ctx):
             await asyncio.sleep(float(os.environ.get("FLOW_JUDGE_DELAY", "3")))
             from .flow import build_intent_judge_messages, parse_intent_judge_output
 
-            # 判定专线解析与 _background_flow_judge 逐字同源(FLOW_JUDGE_* → llm 卡 → MLX)。
-            jbase = (
-                os.environ.get("FLOW_JUDGE_LLM_BASE_URL", "").strip()
-                or (llm_cfg.get("base_url") or "")
-                or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1")
-            ).rstrip("/")
+            # 判定专线解析与 _background_flow_judge 同源(收编进 _judge_base_url,
+            # 健康回退两路共享)。
+            jbase = _judge_base_url(llm_cfg)
             jmodel = (
                 os.environ.get("FLOW_JUDGE_LLM_MODEL", "").strip()
                 or llm_cfg.get("model")
@@ -3434,6 +3519,7 @@ async def entrypoint(ctx):
             # 中型候选集(4-7k tok)5s 必超时=静默永久 miss;背景任务延迟不敏感
             # (3s 让路 delay 都喺度),放宽到 20s 换「中型判据集可用」。
             _gjtext = await _llm_judge(jbase, jmodel, msgs, max_tokens=32, timeout=20.0)
+            _note_judge_outcome(bool(_gjtext))
             _gjhit = parse_intent_judge_output(_gjtext, [i.id for i in candidates])
             # store 守卫(与 flow judge 换步守卫同源):判定期间已换步/暂停/收线/开关
             # 被关 → 迟到的命中唔准注入(下一轮已唔同语境,注入=错步触发)。closing
@@ -4219,35 +4305,53 @@ async def entrypoint(ctx):
                             flush=True,
                         )
             if _gbinding is not None:
+                # WA 收号码护栏(2026-09-19 审计 P1-10):rule/judge/QA 三路推进都有
+                # wa_confirm_advance_allowed,唯 graph 位移零守卫——运营配全步 scope
+                # 跳转时客户在收号码步说中关键词即被跳过,captured 结构性永不置位
+                # (c4f6e4f1 同族)。只拦**位移动作**(jump_step 与 play_qa 的 then_jump
+                # 跳转腿):notify 不位移、play 播报腿只是答话,照走。
+                _gwa_locked = False
+                if _gbinding.action in ("jump_step", "play_qa"):
+                    _gwa_goal, _gwa_ref = flow_ctrl.current_goal_ref()
+                    _gwa_locked = not wa_confirm_advance_allowed(
+                        goal=_gwa_goal, ref=_gwa_ref, captured=_wa_captured["on"]
+                    )
                 if _gbinding.action == "jump_step":
                     # 1-based 存储转 0-based;先跳、按**实际位移**记账(2026-09-18
                     # review R1):jump_to 内部还会 no-op(无步骤/done 钳制),未位移
                     # 就唔可以烧 once 绑定/宣告 provider/打 jump 日志(spec §4.3 防环)。
                     _gtarget = int(_gbinding.step or 1) - 1
-                    _gcur = flow_ctrl.current
-                    flow_ctrl.jump_to(_gtarget)
-                    if flow_ctrl.current != _gcur:
-                        flow_ctrl.graph_fired.add(_gbinding.id)
-                        _invalidate_stale_preemptive(
-                            f"流程跳转 → 第 {flow_ctrl.current + 1} 步"
-                        )
-                        context_state.set_flow_current(flow_ctrl.current_step_text())
-                        # 跳步轮强制 advanced=True → QA 快路让位(spec precedence graph>QA):
-                        # 同轮规则推进+图后退跳可令净位移为零,不置哨兵快路会照抢本轮。
-                        _flow_step_before = -1
+                    if _gwa_locked:
                         print(
-                            f"FLOW_GRAPH jump binding={_gbinding.id} "
-                            f"step={flow_ctrl.current + 1}",
+                            f"FLOW_GRAPH wa_guard_skip binding={_gbinding.id} "
+                            f"step={flow_ctrl.current + 1} (wa step, not captured)",
                             flush=True,
                         )
-                        # 本轮继续回答(新步指引);provider 标记 assistant 轮
-                        _turn_origin["provider"] = "graph-jump"
                     else:
-                        print(
-                            f"FLOW_GRAPH jump_noop binding={_gbinding.id} "
-                            f"step={_gtarget + 1}",
-                            flush=True,
-                        )
+                        _gcur = flow_ctrl.current
+                        flow_ctrl.jump_to(_gtarget)
+                        if flow_ctrl.current != _gcur:
+                            flow_ctrl.graph_fired.add(_gbinding.id)
+                            _invalidate_stale_preemptive(
+                                f"流程跳转 → 第 {flow_ctrl.current + 1} 步"
+                            )
+                            context_state.set_flow_current(flow_ctrl.current_step_text())
+                            # 跳步轮强制 advanced=True → QA 快路让位(spec precedence graph>QA):
+                            # 同轮规则推进+图后退跳可令净位移为零,不置哨兵快路会照抢本轮。
+                            _flow_step_before = -1
+                            print(
+                                f"FLOW_GRAPH jump binding={_gbinding.id} "
+                                f"step={flow_ctrl.current + 1}",
+                                flush=True,
+                            )
+                            # 本轮继续回答(新步指引);provider 标记 assistant 轮
+                            _turn_origin["provider"] = "graph-jump"
+                        else:
+                            print(
+                                f"FLOW_GRAPH jump_noop binding={_gbinding.id} "
+                                f"step={_gtarget + 1}",
+                                flush=True,
+                            )
                 elif _gbinding.action == ACTION_NOTIFY_HUMAN:
                     # W4-T2 notify_human 第三臂:打铃不抢话——CP assist 置 notified
                     # (坐席台见「人工求助」),本轮 LLM 照常兜话,坐席旁听后手动接管;
@@ -4277,6 +4381,11 @@ async def entrypoint(ctx):
                         and await _qa_canned_say(_ge, _gp, provider="graph-play")
                     ):
                         flow_ctrl.graph_fired.add(_gbinding.id)
+                        # 轮换账本补记(2026-09-19 审计 P2-12):图 by_id 播放曾不进
+                        # qa_played——同簇条目既被图钉死播放、又被快路轮换选中时,
+                        # 「本通最少播放」选员见唔到图播的那次,同段罐头同通两遍。
+                        # 只补记账,不改图钉死选员语义(test_qa_rotation M-r1)。
+                        _qa_note_played(flow_ctrl.qa_played, _gbinding.qa_id)
                         print(
                             f"FLOW_GRAPH play binding={_gbinding.id} "
                             f"qa={_gbinding.qa_id}",
@@ -4295,7 +4404,15 @@ async def entrypoint(ctx):
                         # 0/False 为静默 no-op（T1 parse 丢 bool/拒 0——未来若扩「0=跳回首步」语义勿沿用真值门）。
                         if _gbinding.then_jump:
                             _tj_target = int(_gbinding.then_jump) - 1
-                            if flow_ctrl.apply_then_jump(_gbinding.then_jump):
+                            if _gwa_locked:
+                                # then_jump 跳转腿同受 WA 护栏:答照播(答话无害),
+                                # 位移唔准——收号码步未被跳过。
+                                print(
+                                    f"FLOW_GRAPH wa_guard_skip binding={_gbinding.id} "
+                                    f"step={_tj_target + 1} via=then_jump (wa step, not captured)",
+                                    flush=True,
+                                )
+                            elif flow_ctrl.apply_then_jump(_gbinding.then_jump):
                                 _invalidate_stale_preemptive(
                                     f"流程跳转 → 第 {flow_ctrl.current + 1} 步"
                                 )
