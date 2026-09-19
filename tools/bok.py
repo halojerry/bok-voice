@@ -28,6 +28,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 
@@ -479,12 +480,22 @@ def _relaxed_healthy(port: int, timeout_s: float = 5.0) -> bool:
         return False
 
 
-def _ports_down_after_grace(targets, probe=None) -> list[int]:
+def _ports_down_after_grace(
+    targets: Sequence[int], probe: Callable[[int], bool] | None = None
+) -> list[int]:
     """等待环超时前的宽松终检（纯函数便于单测）：对每个 target 用放宽超时逐口
     复检一次，返回仍探不活的端口列表（空=其实全部健康，别急着宣判超时）。"""
     if probe is None:
         probe = _relaxed_healthy
     return [p for p in targets if not probe(p)]
+
+
+_OPTIONAL_LLM_PORTS = (1236, 1237)  # mt/settle:模型缺失即跳过,缺它们不拖垮整栈
+
+
+def _only_optional_ports(down: list[int]) -> bool:
+    """宽松终检缺口全落在可选线(MT :1236/settle :1237)→ True(整栈照常放行)。"""
+    return bool(down) and all(p in _OPTIONAL_LLM_PORTS for p in down)
 
 
 def _repo_pythonpath() -> str:
@@ -1091,6 +1102,12 @@ def cmd_up() -> int:
     if not still_down:
         print(f"[bok] ready (relaxed recheck): asr=8787 tts=8788 llm=1235 b-line=8790{mt_ready_suffix}")
         return 0
+    if _only_optional_ports(still_down):
+        # 可选线豁免与上方 1s 档的 MT 语义对齐:宽松终检只剩可选缺口也放行
+        # (B 线回退主 LLM/settle 回退 :1235),唔令 serve 在 agent worker 拉起前
+        # 退出——评审:宽松路径原先漏掉这层豁免,会假超时退出留下加载中子代。
+        print(f"[bok] optional llm ports still down: {still_down} — continue (falls back)", file=sys.stderr)
+        return 0
     print(f"[bok] timeout waiting for services — still down: {still_down} (see app-data/logs)", file=sys.stderr)
     return 1
 
@@ -1448,9 +1465,12 @@ def cmd_serve() -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    # 起栈前端口预清（2026-09-17 殭尸专项）：上一轮 serve 暴毙的 spawn 子代/
-    # sidecar 殘留还占着 8081-8083/8787-8788 时，新 worker 会因单例守卫良性退出
-    # ——殭尸赢、栈「UP」但服务旧代码（A/B 污染实锤）。身份复核不过的一律不动。
+    # 起栈前端口预清（2026-09-17 殭尸专项 → 2026-09-19 健康闸修订）：身份复核
+    # 不过的一律不动；身份匹配且「健康」的在听进程也放行（防 CPU 风暴下把上一
+    # 轮 serve 存活子代当孤儿误杀的互杀循环）。代价：健康闸分不清「本栈存活
+    # 子代」与「健康但跑旧代码的殭尸/另一 worktree 的活栈」——后者会被后续
+    # spawn 门（if not healthy(port)）静默复用（A/B 污染面）。清扫日志逐口提示
+    # left alone；见非本栈期望的复用，先 bok.py down 再起。
     stale = _sweep_orphan_listeners()
     for port, cmd, pid in stale:
         print(f"[serve] swept stale listener :{port} (pid {pid}, {cmd})")
@@ -1730,7 +1750,11 @@ def _sweep_orphan_listeners(kill: bool = True,
             # down 的拆除契约要求连「pidfile 够不着但健康」的残留一并收掉——
             # pidfile 被覆写成死 pid 时这是唯一回收路径（评审 P1-1）。
             if healthy_ok and _relaxed_healthy(port):
-                print(f"[sweep] port {port}: pid {pid} healthy — left alone", file=sys.stderr)
+                print(
+                    f"[sweep] port {port}: pid {pid} healthy — left alone"
+                    "（serve 将复用该进程；多 worktree/旧代码疑虑先 down 再起）",
+                    file=sys.stderr,
+                )
                 continue
             swept.append((port, cmd[:60], pid))
             if not kill:

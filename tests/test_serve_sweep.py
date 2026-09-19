@@ -241,3 +241,13 @@ def test_sweep_down_semantics_harvests_even_healthy(monkeypatch):
     assert swept == [(8000, "python -m uvicorn control_plane.main:app --port 8000"[:60], _FAKE_PID)]
     assert killed == [("killpg", 7000 + _FAKE_PID)]
     assert probed == []  # down 档根本不做健康探测
+
+
+def test_only_optional_ports_gate():
+    """宽松终检可选线豁免（纯函数）：缺口全落 1236/1237 → 放行；掺任何核心
+    端口/空列表 → 唔放行（空=全绿走 ready 分支,轮不到本闸）。"""
+    assert bok._only_optional_ports([1236])
+    assert bok._only_optional_ports([1236, 1237])
+    assert not bok._only_optional_ports([8787])
+    assert not bok._only_optional_ports([8787, 1236])
+    assert not bok._only_optional_ports([])
