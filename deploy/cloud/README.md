@@ -46,6 +46,12 @@
 - 先在文件管理器里 `cp .env.example .env` 并填好（密钥生成命令见模板注释）；
 - 点「部署/启动」。后续看日志、重启都在面板里操作。
 
+> ⚠ 面板的「部署/重建」按钮等价裸 `docker compose up`——`.env` 里 `DATABASE_URL`
+> 保持池器**域名**形态时，无 IPv6 出口的主机会 crash-loop（§9 铁律）。面板用户
+> 稳妥姿势：填 `.env` 时把 `DATABASE_URL` 的 host 段**直接写成 IPv4**（与
+> `up.sh` 的 `BOK_SUPABASE_IP` 同值），此后面板重启/重建都安全；或改走路 B，
+> 重启/重拉一律 `./up.sh`。
+
 **路 B：SSH 命令行（推荐，输出更直观）**
 
 ```bash
