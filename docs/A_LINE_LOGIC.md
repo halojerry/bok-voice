@@ -120,13 +120,15 @@ REFUSE `_REFUSE_RE`+`_HANGUP_RE`（软守卫「唔使担心」否决 366-369）�
 
 ### D 级：本轮代码追踪新发现的真问题（带行号，按严重度）
 
+> 修复状态（2026-09-20 波1）：D1/D2/D3/D5 已修（全量 pytest 1786 passed）；其余待排期。
+
 | # | 问题 | 证据 | 影响 |
 |---|---|---|---|
-| D1 | **发布冻结在开发态被静默违反**：`_template_machine_overlay` 只在 `request.state.machine` 时生效，而该标记只在 auth-on 且 Bearer==BOK_CP_TOKEN 时由 identity_gate 打——auth-off 开发栈与 CP-token-only 形态下 agent 装配拿到 **live 草稿**，不是 published_json | CP:4117 + auth.py:291-296 | 本地/E2E 全量测的「不是发布行为」，冻结不变量零覆盖 |
-| D2 | **看门狗/垫话可整通静默关闭**：`_arm_response_watchdog` 只在 TTS 被包成 CachedTTS 时武装；装配缓存失败（_tts_cache=None 且 FallbackAdapter 未包）→看门狗+垫话拆弹+垫话功能全关，仅一行日志 | AG:2188-2190、2423-2425 | 云 TTS 卡死时「每问无答」自我修复失效且无告警面 |
-| D3 | **campaign 接通率口径与仪表盘自相矛盾**：progress 的 answered=done+no_answer+rejected，把未接通也算接通；dashboard 用严格排除口径 | CP:2485 vs 4269-4271 | 战役 UI 接通率虚高，误导外呼策略 |
+| D1 ✅已修 | **发布冻结在开发态被静默违反**：`_template_machine_overlay` 只在 `request.state.machine` 时生效，而该标记只在 auth-on 且 Bearer==BOK_CP_TOKEN 时由 identity_gate 打——auth-off 开发栈与 CP-token-only 形态下 agent 装配拿到 **live 草稿**，不是 published_json | CP:4117 + auth.py:291-296 | 本地/E2E 全量测的「不是发布行为」，冻结不变量零覆盖 |
+| D2 ✅已修 | **看门狗/垫话可整通静默关闭**：`_arm_response_watchdog` 只在 TTS 被包成 CachedTTS 时武装；装配缓存失败（_tts_cache=None 且 FallbackAdapter 未包）→看门狗+垫话拆弹+垫话功能全关，仅一行日志 | AG:2188-2190、2423-2425 | 云 TTS 卡死时「每问无答」自我修复失效且无告警面 |
+| D3 ✅已修 | **campaign 接通率口径与仪表盘自相矛盾**：progress 的 answered=done+no_answer+rejected，把未接通也算接通；dashboard 用严格排除口径 | CP:2485 vs 4269-4271 | 战役 UI 接通率虚高，误导外呼策略 |
 | D4 | **ASR chunk POST 先清后发**：`_maybe_partial` 先 `_pending.clear()` 再 POST，异常静默 return——该窗 PCM 永久丢 | LKP:5531、5549-5550 | sidecar 瞬时不可用时丢转写且无痕 |
-| D5 | **judge conf 缺失按 0.7 放行=自动够建单线**：`parse_judge_route` 对 route 有值但 conf 缺失默认 0.7，`FOLLOWUP_CONF_MIN=0.7` 且比较用 ≥ | FL:1451-1452、1458 | 9B 偶发省略 conf 即自动开跟进单，打扰人工 |
+| D5 ✅已修 | **judge conf 缺失按 0.7 放行=自动够建单线**：`parse_judge_route` 对 route 有值但 conf 缺失默认 0.7，`FOLLOWUP_CONF_MIN=0.7` 且比较用 ≥ | FL:1451-1452、1458 | 9B 偶发省略 conf 即自动开跟进单，打扰人工 |
 | D6 | **WA 步误捕获面宽**：裸词「号码」即 WA 语境+任意 4-13 位 run 即 captured，已知号过滤只兜整串/≥8位尾 | FL:710-717、660-671 | 客户报 4 位碎片（验证码式）被当 WhatsApp 号上报 |
 | D7 | **结算窗掐死慢 judge**：`_close` gather 上报任务 10s，意图 judge timeout 20s 且同池——慢判定轮静默丢失 | AG:3144-3150 vs 3436 | 判定结果丢、仅一行 REPORT_TASK_ERR |
 | D8 | **CP 抖动→跨账号污染**：上下文解析异常吞成 call=None 照跑，账号兜底 acc-001——垫话/QA 罐头从错误账号拉 | AG:1793-1794、2762-2763 | 多账号下串资产+幽灵 job 拒接被旁路 |

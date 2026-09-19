@@ -23,3 +23,20 @@ def test_cp_client_without_token_unchanged(monkeypatch):
 
     c = ControlPlaneClient("http://127.0.0.1:8000")
     assert not c._client.headers.get("authorization")
+
+
+def test_cp_client_always_carries_agent_channel_header(monkeypatch):
+    """D1 修复：纯 auth-off 形态 CP 无凭据可判通道，agent 全量请求自带
+    X-Bok-Channel: agent——模板详情据此吃发布冻结版 overlay。有无 CP token
+    均携带（auth-on 下 CP 不认该头，携带无害）。"""
+    monkeypatch.delenv("BOK_CP_TOKEN", raising=False)
+    from agent_runtime.control_plane import ControlPlaneClient
+
+    c = ControlPlaneClient("http://127.0.0.1:8000", call_id="call-x")
+    assert c._client.headers.get("x-bok-channel") == "agent"
+    assert c._client.headers.get("x-call-id") == "call-x"
+
+    monkeypatch.setenv("BOK_CP_TOKEN", "mach-token-123")
+    c2 = ControlPlaneClient("http://127.0.0.1:8000")
+    assert c2._client.headers.get("x-bok-channel") == "agent"
+    assert c2._client.headers.get("authorization") == "Bearer mach-token-123"

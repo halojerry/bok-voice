@@ -164,12 +164,17 @@ async def optional_bearer_auth(request: Request, call_next):
         static_get = (request.method in ("GET", "HEAD")
                       and not request.url.path.startswith("/api/"))
         provided = request.headers.get("authorization", "")
-        if not static_get and not (
-            provided.startswith("Bearer ")
-            and hmac.compare_digest(provided[7:].strip(), expected)
-        ):
+        token_ok = provided.startswith("Bearer ") and hmac.compare_digest(
+            provided[7:].strip(), expected)
+        if not static_get and not token_ok:
             return Response(status_code=401, content=b'{"detail":"unauthorized"}',
                              media_type="application/json")
+        if token_ok:
+            # 机器通道标记（D1 修复，镜像 identity_gate 语义）：CP-token-only
+            # 形态（BOK_CP_TOKEN 设、BOK_AUTH_REQUIRED 未设）此前不打
+            # state.machine——模板详情冻结 overlay / require_role 机器直通 /
+            # 审计 actor 全部失明。auth-on 时由 identity_gate 打同一标记。
+            request.state.machine = True
     return await call_next(request)
 
 
@@ -2477,12 +2482,18 @@ def _call_end_fields(call: dict) -> dict:
 
 
 def _progress(items: list[dict]) -> dict:
-    """名单进度汇总：8 个状态计数 + answered 粗口径（拨出去有结果的三态之和）。"""
+    """名单进度汇总：8 个状态计数 + answered 严格口径（D3 修复，与仪表盘
+    `_ANSWERED_EXCLUDED` 同源——只认真接通）。
+
+    item 桶没有 disposition 维度，但终态由 campaign.item_status_for_call 单点
+    从通话 disposition 派生：`done` ⇔ 通话 ENDED 且 disposition 不在
+    {no_answer, rejected, failed}；`no_answer`/`rejected`/`failed` 三桶=未接通，
+    不计入 answered（旧口径 done+no_answer+rejected 把未接通也算了接通）。"""
     p = {"total": len(items)}
     for key in ("pending", "dialing", "in_call", "done", "no_answer", "rejected",
                 "failed", "skipped"):
         p[key] = sum(1 for i in items if i.get("status") == key)
-    p["answered"] = p["done"] + p["no_answer"] + p["rejected"]
+    p["answered"] = p["done"]
     return p
 
 
@@ -4107,6 +4118,21 @@ def list_templates(request: Request, account_id: str = "acc-001", owner_scope: s
     ]
 
 
+def _template_machine_channel(request: Request) -> bool:
+    """模板详情 overlay 通道判定（D1 修复）：机器通道吃发布冻结版，人类通道恒
+    live 草稿。三种机器形态——①auth-on CP token（identity_gate 打
+    state.machine）；②CP-token-only（optional_bearer_auth 打同一标记）；
+    ③auth-off 纯本机（无任何凭据可判）→ agent 客户端全量请求自带
+    X-Bok-Channel: agent 自报通道。auth-on 下该头**单独存在不给 overlay**——
+    登录的人可能正在编辑，冻结判定只认机器凭据（防伪装约束）。auth-off 判定
+    与 identity_gate 同源（auth.py auth_required()，勿另立判定）。"""
+    if getattr(request.state, "machine", False):
+        return True
+    if auth_required():
+        return False
+    return (request.headers.get("x-bok-channel") or "").strip().lower() == "agent"
+
+
 @app.get("/api/templates/{template_id}")
 def get_template(template_id: str, request: Request) -> dict:
     _gate_page(request, "templates")
@@ -4114,7 +4140,7 @@ def get_template(template_id: str, request: Request) -> dict:
     if not tpl:
         raise HTTPException(404, "template not found")
     # 机器通道(agent 装配)恒吃发布冻结版;人类通道恒 live(编辑器要见草稿)。
-    if getattr(request.state, "machine", False):
+    if _template_machine_channel(request):
         tpl = _template_machine_overlay(tpl)
     return {**tpl, **_template_published_flags(tpl)}
 

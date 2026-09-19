@@ -1436,8 +1436,11 @@ _CONF_RE = re.compile(r"conf(?:idence)?\s*[=:]\s*([0-9](?:\.\d+)?)?")
 
 def parse_judge_route(text: str) -> tuple[str, float]:
     """解析 judge 输出的路由字段(route/conf)。缺失/非法 route 回落 keep;
-    route 有值但 conf 缺失/非法 → 按门槛值 0.7 放行(显式 route 係强信号,
-    conf 只是修饰——实弹里 9B 偶发省略 conf,按 0.0 处理会静默杀掉整条链)。"""
+    conf 缺失/解析失败 → 0.0(保守,无置信信号=不动作)。route 语义本身不受
+    conf 影响(advance 判定只看 verdict,conf 只有两个消费端:建单闸
+    FOLLOWUP_CONF_MIN 与 degrade 早触发 degrade_boost)。旧版对非 keep route
+    按 0.7 兜底——9B 偶发省略 conf 即自动够到建单线,多开单打扰人工;低置信
+    动作宁缺勿滥,省略 conf 不得视为高置信(2026-09-20 修订)。"""
     t = (text or "").strip().lower()
     m = _ROUTE_RE.search(t)
     route = m.group(1) if m and m.group(1) in JUDGE_ROUTES else "keep"
@@ -1449,7 +1452,7 @@ def parse_judge_route(text: str) -> tuple[str, float]:
         except ValueError:
             conf_val = None
     if conf_val is None:
-        conf_val = 0.0 if route == "keep" else 0.7
+        conf_val = 0.0
     return route, min(max(conf_val, 0.0), 1.0)
 
 

@@ -541,3 +541,102 @@ class CachedTTS(tts.TTS):
     async def aclose(self) -> None:
         self._wrapped.off("metrics_collected", self._forward_metric)
         await self._wrapped.aclose()
+
+
+class _FirstAudioTTS(tts.TTS):
+    """薄透传首音频层(D2,2026-09-20):缓存缺席时包住裸 provider 的最小信号源。
+
+    看门狗拆弹/垫话撤表与扣压依赖 add_first_audio_listener/set_hold_provider
+    契约,此前只有 CachedTTS 提供——_tts_cache=None(BOK_TTS_CACHE=0 或
+    TtsAudioCache 装配失败)时 provider 是裸 FallbackAdapter/裸 MiniMax,整通
+    静默失去联动(看门狗永不武装、垫话永不接线,仅一行日志零告警)。本层零
+    缓存逻辑:
+    - stream() 复用 _RelaySynthesizeStream:首个音频帧 fire 一次回调+询问
+      hold_provider(垫话播完→gap→回复契约与 CachedTTS 逐字节同);
+    - synthesize() 纯透传不 fire——直念族各调用点都先显式 cancel/disarm
+      看门狗,后台补物化(_filler_backfill)也走这,在此 fire 会拿后台合成
+      误拆在途轮(与 CachedTTS tee-miss 不 fire 同语义);
+    - metrics_collected 转发(会话账本 tts 段不哑),model/provider/prewarm/
+      aclose 透传内芯。
+    """
+
+    def __init__(self, wrapped: tts.TTS) -> None:
+        caps = wrapped.capabilities
+        super().__init__(
+            capabilities=tts.TTSCapabilities(
+                streaming=caps.streaming, aligned_transcript=caps.aligned_transcript
+            ),
+            sample_rate=wrapped.sample_rate,
+            num_channels=wrapped.num_channels,
+        )
+        self._wrapped = wrapped
+        self._first_audio_cbs: list = []
+        self._hold_provider = None  # 垫话扣压(FillerDirector.hold_if_playing),agent 侧注入
+        wrapped.on("metrics_collected", self._forward_metric)
+
+    @property
+    def model(self) -> str:
+        return self._wrapped.model
+
+    @property
+    def provider(self) -> str:
+        return self._wrapped.provider
+
+    def add_first_audio_listener(self, cb) -> None:
+        self._first_audio_cbs.append(cb)
+
+    def set_hold_provider(self, cb) -> None:
+        """注入垫话扣压询问(FillerDirector.hold_if_playing)——同 CachedTTS 契约。"""
+        self._hold_provider = cb
+
+    def _fire_first_audio(self) -> None:
+        for cb in list(self._first_audio_cbs):
+            try:
+                cb()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _forward_metric(self, *args, **kwargs) -> None:
+        self.emit("metrics_collected", *args, **kwargs)
+
+    def _norm_conn_options(self, conn_options):
+        """conn_options 归一(与 CachedTTS._norm_conn_options 同款):内芯是官方
+        FallbackAdapter 时,其流会读 conn_options.max_retry——透传 None 直接
+        AttributeError。"""
+        if conn_options is None:
+            from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS
+
+            return DEFAULT_API_CONNECT_OPTIONS
+        return conn_options
+
+    def synthesize(self, text: str, *, conn_options=None) -> tts.ChunkedStream:
+        # 纯透传不 fire:见类 docstring(直念族先显式拆弹/后台 backfill 不可误拆)。
+        return self._wrapped.synthesize(text, conn_options=self._norm_conn_options(conn_options))
+
+    def stream(self, *, conn_options=None) -> tts.SynthesizeStream:
+        inner = self._wrapped.stream(conn_options=self._norm_conn_options(conn_options))
+        return _RelaySynthesizeStream(
+            tts_=self, inner=inner, on_first_audio=self._fire_first_audio,
+            hold_provider=self._hold_provider,
+        )
+
+    def prewarm(self) -> None:
+        self._wrapped.prewarm()
+
+    async def aclose(self) -> None:
+        self._wrapped.off("metrics_collected", self._forward_metric)
+        await self._wrapped.aclose()
+
+
+def wrap_first_audio_tts(provider: tts.TTS | None, cache: TtsAudioCache | None) -> tts.TTS | None:
+    """装配点唯一入口(D2,2026-09-20):缓存缺席时给裸 provider 包首音频薄透传。
+
+    cache 在场(上游已包 CachedTTS,信号口由缓存层提供)或 provider 已带首音频
+    接口(幂等)→ 原样返回;其余 → _FirstAudioTTS 包装。调用方只限云端 MiniMax
+    链(本地 Qwen3/volcano/fake 保持裸装=旧行为:无首音频口,watchdog 不武装)。
+    """
+    if provider is None or cache is not None:
+        return provider
+    if hasattr(provider, "add_first_audio_listener"):
+        return provider
+    return _FirstAudioTTS(provider)

@@ -242,3 +242,94 @@ def test_parse_steps_scene_tolerant():
     assert parse_steps("") == []
     assert parse_steps("{not json") == []
     assert FlowStep().scene == ""
+
+
+# ---- ⑦ D1 修复:三种鉴权形态 overlay 真值表 ----
+# 背景:state.machine 原本只有 identity_gate(auth-on)打标——CP-token-only 与
+# 纯 auth-off 两种形态 agent 拿到 live 草稿而非冻结版。修复后:
+# ①auth-on CP token → overlay(既有);②CP-token-only Bearer → overlay(中间件
+# 打同标);③auth-off + agent 自报 X-Bok-Channel → overlay;④auth-off 无头 → live;
+# ⑤auth-on 用户 JWT(哪怕自带通道头)→ live(防伪装:冻结判定只认机器凭据)。
+
+
+def _machine_env_token_only(monkeypatch):
+    """CP-token-only 形态:BOK_CP_TOKEN 设、BOK_AUTH_REQUIRED 未设。"""
+    monkeypatch.delenv("BOK_AUTH_REQUIRED", raising=False)
+    monkeypatch.setenv("BOK_CP_TOKEN", _MACHINE_TOKEN)
+
+
+def _agent_header():
+    return {"X-Bok-Channel": "agent"}
+
+
+def _published_with_draft(client):
+    """最小现场:建模板→发布→PUT 改稿(冻结≠live)。全部在 auth-off 下做。"""
+    tpl = _make_template(client)
+    assert client.post(f"/api/templates/{tpl['id']}/publish").status_code == 200
+    live_steps = json.dumps([{"goal": "新草稿步", "ref": "改稿内容"}], ensure_ascii=False)
+    assert client.put(
+        f"/api/templates/{tpl['id']}", json={"steps_json": live_steps}
+    ).status_code == 200
+    return tpl, live_steps
+
+
+def test_overlay_auth_off_with_agent_header(monkeypatch):
+    """auth-off + X-Bok-Channel: agent → 冻结 overlay(agent 自报通道)。"""
+    client, repo = _client_and_repo(monkeypatch)
+    tpl, _live = _published_with_draft(client)
+    row = client.get(f"/api/templates/{tpl['id']}", headers=_agent_header()).json()
+    assert row["steps_json"] == tpl["steps_json"]
+    assert row["published"] is True
+
+
+def test_overlay_auth_off_without_header_is_live(monkeypatch):
+    """auth-off 无通道头(web 编辑器/浏览器) → live 草稿。"""
+    client, repo = _client_and_repo(monkeypatch)
+    tpl, live_steps = _published_with_draft(client)
+    row = client.get(f"/api/templates/{tpl['id']}").json()
+    assert row["steps_json"] == live_steps
+    # 假通道值不认
+    row2 = client.get(f"/api/templates/{tpl['id']}",
+                      headers={"X-Bok-Channel": "browser"}).json()
+    assert row2["steps_json"] == live_steps
+
+
+def test_overlay_cp_token_only(monkeypatch):
+    """CP-token-only(BOK_CP_TOKEN 设、auth 未开)+ Bearer → 冻结 overlay。"""
+    client, repo = _client_and_repo(monkeypatch)
+    tpl, _live = _published_with_draft(client)
+    _machine_env_token_only(monkeypatch)
+    row = client.get(f"/api/templates/{tpl['id']}", headers=_machine_headers()).json()
+    assert row["steps_json"] == tpl["steps_json"]
+    # 同形态无 Bearer → 401(单 token 中间件照旧拦),不存在"无凭据拿 live"的歧义
+    assert client.get(f"/api/templates/{tpl['id']}").status_code == 401
+
+
+def test_overlay_auth_on_machine_token(monkeypatch):
+    """auth-on + Bearer==BOK_CP_TOKEN → 冻结 overlay(identity_gate 既有路径不回归)。"""
+    client, repo = _client_and_repo(monkeypatch)
+    tpl, _live = _published_with_draft(client)
+    _machine_env(monkeypatch)
+    row = client.get(f"/api/templates/{tpl['id']}", headers=_machine_headers()).json()
+    assert row["steps_json"] == tpl["steps_json"]
+
+
+def test_no_overlay_auth_on_user_jwt_with_agent_header(monkeypatch):
+    """auth-on + 普通用户 JWT:自带 X-Bok-Channel: agent 也不给 overlay(防伪装)。"""
+    client, repo = _client_and_repo(monkeypatch)
+    tpl, live_steps = _published_with_draft(client)
+    human = _admin_headers(client, repo)
+    _machine_env(monkeypatch)
+    row = client.get(f"/api/templates/{tpl['id']}",
+                     headers={**human, **_agent_header()}).json()
+    assert row["steps_json"] == live_steps
+
+
+def test_no_overlay_auth_on_user_jwt_plain(monkeypatch):
+    """auth-on + 普通用户 JWT(无头) → live(人类编辑通道既有行为)。"""
+    client, repo = _client_and_repo(monkeypatch)
+    tpl, live_steps = _published_with_draft(client)
+    human = _admin_headers(client, repo)
+    _machine_env(monkeypatch)
+    row = client.get(f"/api/templates/{tpl['id']}", headers=human).json()
+    assert row["steps_json"] == live_steps

@@ -34,7 +34,15 @@ from .qa_gate import (
     qa_fastpath_enabled,
     qa_rotation_enabled,
 )
-from .tts_cache import CachedTTS, TtsAudioCache, default_cache_dir, frames_aiter, pcm_to_frames, tts_cache_enabled
+from .tts_cache import (
+    CachedTTS,
+    TtsAudioCache,
+    default_cache_dir,
+    frames_aiter,
+    pcm_to_frames,
+    tts_cache_enabled,
+    wrap_first_audio_tts,
+)
 # 模块级引 flow(纯 stdlib 依赖,无环):_wa_numberish/_wa_number_line 等模块级
 # helper 用;entrypoint 内的 function-scoped import 属历史样式,不冲突。
 from .flow import _digit_normalize, digits_to_cantonese, stall_ladder_level
@@ -783,6 +791,14 @@ def _watchdog_extend(state: dict, spawn, extra_s: float, now: float) -> bool:
         task.cancel()
     state["task"] = spawn(max(0.05, deadline + extra_s - now))
     return True
+
+
+def _has_first_audio_signal(provider: object) -> bool:
+    """provider 是否带首音频信号口(D2,2026-09-20):看门狗拆弹与垫话撤表/扣压
+    接线都挂这个接口——CachedTTS 与薄透传 _FirstAudioTTS 都有,裸 MiniMax/
+    FallbackAdapter/本地 TTS 冇。取代旧 isinstance(…, CachedTTS) 单判:缓存
+    装配失败不再令整通看门狗/垫话联动哑掉(D2),本地链无信号口照旧不武装。"""
+    return hasattr(provider, "add_first_audio_listener")
 
 
 # ---- 通用单号句判定(B2 数字句跨步累积,2026-09-17)----
@@ -2185,8 +2201,10 @@ async def entrypoint(ctx):
     def _arm_response_watchdog() -> None:
         if _response_watchdog_s() <= 0:
             return
-        if not isinstance(tts_provider, CachedTTS):
-            # 非缓存透传层冇首音频信号,看门狗无法拆弹 → 不武装(保旧行为)
+        if not _has_first_audio_signal(tts_provider):
+            # 冇首音频信号口的裸 provider(本地 Qwen3/volcano/fake 链)无法拆弹
+            # → 不武装(保旧行为)。云端链恒带该口(CachedTTS 或 D2 薄透传
+            # _FirstAudioTTS)——缓存装配失败/关闭不再哑掉看门狗。
             return
         _cancel_response_watchdog()
         _watchdog["disarmed"] = False
@@ -2309,6 +2327,10 @@ async def entrypoint(ctx):
     tts_provider_name = persona_tts_provider or global_tts_provider
     if persona_tts_provider:
         print(f"[agent] persona tts_provider={persona_tts_provider!r} overrides global {global_tts_provider!r}", flush=True)
+    # 云端 MiniMax 链标记:minimax 分支赋主实例,其余分支保持 None。D2 前置
+    # 修复:此前只在 minimax 分支赋值、下方缓存块无条件读——qwen3/volcano/
+    # fake 分支一进缓存块即 UnboundLocalError,纯靠线上恒配 minimax 掩盖。
+    _tts_primary: MiniMaxTTS | None = None
     if use_fake or tts_provider_name in ("fake", "fake_tts"):
         # fake = 静音测试音（FakeLiveKitTTS）；绝不落入 Volcano 的 beep 分支。
         tts_provider = FakeLiveKitTTS()
@@ -2423,6 +2445,19 @@ async def entrypoint(ctx):
         except Exception as exc:  # noqa: BLE001 - 缓存装配失败零影响
             _tts_cache = None
             print(f"[agent] tts audio cache init failed: {exc!r} (call {room_name})", flush=True)
+
+    # D2(2026-09-20):缓存缺席(BOK_TTS_CACHE=0/TtsAudioCache 装配失败)时
+    # provider 是裸 FallbackAdapter/裸 MiniMax——首音频信号整通哑掉(看门狗
+    # 永不武装、垫话撤表/扣压永不接线,只剩一行 init failed 日志零告警)。
+    # 包一层零缓存逻辑的薄透传恢复同一契约;CachedTTS 在场时本步零变化。
+    if _tts_primary is not None:
+        _bare_provider = tts_provider
+        tts_provider = wrap_first_audio_tts(tts_provider, _tts_cache)
+        if tts_provider is not _bare_provider:
+            print(
+                f"[agent] tts first-audio passthrough on (cache unavailable) (call {room_name})",
+                flush=True,
+            )
 
     llm_provider_name = llm_cfg.get("provider") or "local_openai"
     if os.environ.get("SCRIPTED_LLM") == "1":
@@ -2626,8 +2661,9 @@ async def entrypoint(ctx):
     # (官方组件,独立 track 即刻出声)——旧 session.say() 走 speech 队列,1.8 调度
     # 严格串行,垫话必然排在回复 speech 后面:多数被首音频回调静默吞掉(慢轮照样
     # 纯静音),拥塞时竞态漏出=垫话在回复后才响(实机实证,call-065a1a12)。
-    # arm/cancel 由 on_user_turn_completed 驱动;首音频回调挂在 CachedTTS 透传层
-    # (未包缓存时挂不上,垫话自动失效——纯透传无回调)。start 在 session.start 之后。
+    # arm/cancel 由 on_user_turn_completed 驱动;首音频回调挂在带信号口的
+    # provider 透传层(CachedTTS 或 D2 薄透传 _FirstAudioTTS;裸 provider 挂不上,
+    # 垫话自动失效——纯透传无回调)。start 在 session.start 之后。
     try:
         from livekit.agents import BackgroundAudioPlayer
 
@@ -2774,7 +2810,7 @@ async def entrypoint(ctx):
         _filler._user_text_provider = lambda: flow_ctrl.last_user_text
         _filler._entry_hit = _filler_entry_hit
         print(f"[agent] filler canned on entries={len(_filler_index)} (call {room_name})", flush=True)
-    if isinstance(tts_provider, CachedTTS):
+    if _has_first_audio_signal(tts_provider):
         tts_provider.add_first_audio_listener(_filler.on_reply_first_audio)
         # 真回复首音频=看门狗拆弹信号(垫话/兜底/直念族经同一 provider 透传层)。
         tts_provider.add_first_audio_listener(lambda: _disarm_response_watchdog())
