@@ -50,12 +50,6 @@ export type NavItem = {
 /** 主导航分组（顺序即侧边栏顺序；分组序取代旧扁平 NAV 序，权限语义不受顺序影响）。 */
 export const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
   {
-    label: "工作站",
-    items: [
-      { href: "/studio", label: "AI 工作站", key: "templates", icon: Workflow },
-    ],
-  },
-  {
     label: "工作台",
     items: [
       { href: "/calls", label: "会话", key: "calls", icon: PhoneCall },
@@ -72,10 +66,11 @@ export const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
     ],
   },
   {
-    label: "内容",
+    // 2026-09-20 重组：话术+问答+意图已全部整合进 AI 工作站（/studio），
+    // 旧「内容」组的 /templates、/qa 导航项移除（路由保留守卫，见 GUARD_ONLY）。
+    label: "AI 设置",
     items: [
-      { href: "/templates", label: "话术", key: "templates", icon: FileText },
-      { href: "/qa", label: "快答库", key: "qa", icon: MessageCircleQuestion },
+      { href: "/studio", label: "AI 工作站", key: "templates", icon: Workflow },
       { href: "/knowledge", label: "知识库", admin: true, icon: Library },
       { href: "/personas", label: "人设", admin: true, icon: UserRound },
     ],
@@ -92,12 +87,16 @@ export const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
   },
 ];
 
-/** 扁平导航（派生，不手写）：工作站→工作台→运营→内容→管理。 */
+/** 扁平导航（派生，不手写）：工作台→运营→AI 设置→管理。 */
 export const FLAT_NAV: NavItem[] = NAV_GROUPS.flatMap((g) => g.items);
 
-/** 不在主导航中但需路由守卫的页面：/translate（与同传同键）。 */
+/** 不在主导航中但需路由守卫/顶栏标题的页面（深链可达）：
+ *  /translate（同传同键）；/templates、/qa（2026-09-20 移出导航——内容整合进 AI 工作站，
+ *  工作站「意图管理」tab 与问答画布深链仍落到这两页，守卫键原样保留）。 */
 export const GUARD_ONLY: NavItem[] = [
   { href: "/translate", label: "同传", key: "interpret", icon: AudioLines },
+  { href: "/templates", label: "话术", key: "templates", icon: FileText },
+  { href: "/qa", label: "快答库", key: "qa", icon: MessageCircleQuestion },
 ];
 
 /**

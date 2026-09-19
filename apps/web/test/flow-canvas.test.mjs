@@ -1,6 +1,7 @@
-// lib/flow-canvas.ts 纯函数单测（W2 T2 流程画布）：step.ref 三件拆装 round-trip
+// lib/flow-canvas.ts 纯函数单测（W2 T2 流程画布;2026-09-20 纵向工作流改版）：
+// step.ref 三件拆装 round-trip
 // （语义镜像 agent flow.py _BRANCH_LINE_RE/_NOTE_LINE_RE/parse_step_ref）、flow.py
-// 边角语法、scene 经 jsonToSteps/stepsToJson 往返不丢、场景泳道分桶、布局确定性。
+// 边角语法、scene 经 jsonToSteps/stepsToJson 往返不丢、纵向布局确定性。
 //
 // 装配照 qa-canvas.test.mjs：lib/flow-canvas.ts 零 import,单文件转译直载。
 // 另加一份 components/template-editor.tsx 的真实代码装载（scene 往返守卫要跑
@@ -235,84 +236,76 @@ test("scene 往返：jsonToSteps→stepsToJson 不丢 scene；空 scene 不写�
   assert.equal(te.jsonToSteps(te.stepsToJson(back))[0].scene, "开场");
 });
 
-// ---- ④ sceneLanes 泳道分桶 ----
-test("sceneLanes：空 scene=未分组、连续同 scene 归并、交错按首次出现归并保序", () => {
-  const steps = [
-    { goal: "a", ref: "r", scene: "开场" },
-    { goal: "b", ref: "r" }, // 空 scene
-    { goal: "c", ref: "r", scene: "开场" }, // 交错:与 a 同泳道
-    { goal: "d", ref: "r", scene: "谈赔" },
-  ];
-  const lanes = fc.sceneLanes(steps);
-  assert.deepEqual(
-    lanes.map((l) => l.name),
-    ["开场", "未分组", "谈赔"], // 首次出现序;空 scene 殿后于「开场」、先于「谈赔」（保持原位）
-  );
-  assert.deepEqual(lanes[0].steps.map((s) => s.goal), ["a", "c"]);
-  assert.deepEqual(lanes[1].steps.map((s) => s.goal), ["b"]);
-  assert.deepEqual(lanes[2].steps.map((s) => s.goal), ["d"]);
-  // 全空 scene → 单条未分组泳道。
-  assert.deepEqual(
-    fc.sceneLanes([{ goal: "x", ref: "r" }, { goal: "y", ref: "r" }]).map((l) => [l.name, l.steps.length]),
-    [[fc.UNGROUPED_LANE, 2]],
-  );
-  assert.deepEqual(fc.sceneLanes([]), []);
-});
-
-// ---- 布局（layoutFlow）：确定性/泳道几何/意图 overlay ----
+// ---- ④ 布局（layoutFlow,2026-09-20 纵向工作流）：确定性/脊柱/意图左栏条件边 ----
 const GRAPH = {
   version: 1,
   intents: [
-    { id: "int_a", label: "投诉", keywords: ["投诉"], steps: [], enabled: true, judge: { prompt: "客户表达不满" } },
+    { id: "int_a", label: "投诉", keywords: ["投诉", "骗人"], steps: [], enabled: true, judge: { prompt: "客户表达不满" } },
     { id: "int_b", label: "退款", keywords: ["退款"], steps: [3], enabled: false },
   ],
   bindings: [
     { id: "bnd_1", intent: "int_a", action: "jump_step", step: 3, priority: 10, once: false, enabled: true },
-    { id: "bnd_2", intent: "int_a", action: "play_qa", qa_id: "qa-1", priority: 10, once: true, enabled: true },
+    { id: "bnd_2", intent: "int_a", action: "play_qa", qa_id: "qa-1", then_jump: 2, priority: 10, once: true, enabled: true },
     { id: "bnd_3", intent: "int_b", action: "jump_step", step: 99, priority: 10, once: false, enabled: false }, // 停用:不画
     { id: "bnd_4", intent: "int_ghost", action: "jump_step", step: 1, priority: 10, once: false, enabled: true }, // 悬空意图:不画
   ],
 };
 
-test("layoutFlow：泳道纵向、步脊柱、意图侧栏/jumpIn/徽标、确定性", () => {
+test("layoutFlow：纵向脊柱全相邻对、意图左栏条件边/分支 chip/确定性", () => {
   const steps = [
     { goal: "s1", ref: "正稿一", scene: "开场" },
-    { goal: "s2", ref: "如果客户问 → 答", scene: "开场" },
+    { goal: "s2", ref: "正稿二\n如果客户问 → 答\n如果客户疑 → 再答\n如果客户骂 → 安抚\n如果客户挂 → 收线", scene: "开场" },
     { goal: "s3", ref: "正稿三" },
   ];
   const g1 = fc.layoutFlow(steps, GRAPH);
   const g2 = fc.layoutFlow(steps, GRAPH);
   assert.deepEqual(g1, g2); // 确定性:同输入同输出
 
-  const lanes = g1.nodes.filter((n) => n.kind === "lane");
-  assert.deepEqual(lanes.map((n) => n.name), ["开场", fc.UNGROUPED_LANE]);
-  const laneY = Object.fromEntries(lanes.map((n) => [n.name, n.y]));
-  assert.ok(laneY[fc.UNGROUPED_LANE] > laneY["开场"]); // 泳道纵向排布
-
+  // 无泳道节点;步节点按全局下标纵向排布（y 递增、同列）。
   const stepNodes = g1.nodes.filter((n) => n.kind === "step");
+  assert.equal(g1.nodes.filter((n) => n.kind === "lane").length, 0);
   assert.equal(stepNodes.length, 3);
   const byId = Object.fromEntries(stepNodes.map((n) => [n.id, n]));
-  assert.ok(byId["fstep:1"].scriptFirst.includes("如果客户问")); // 正稿首行（无正稿步显示分支首行）
+  assert.ok(byId["fstep:0"].y < byId["fstep:1"].y && byId["fstep:1"].y < byId["fstep:2"].y);
   assert.equal(byId["fstep:2"].x, byId["fstep:0"].x); // 同一脊柱列
+  assert.equal(byId["fstep:0"].scene, "开场");
+
+  // 步节点数据：正稿首行/分支 chip 上限折叠（4 分支=3 chip+1 折叠）/意图跳入计数。
+  assert.ok(byId["fstep:1"].scriptFirst.includes("正稿二"));
+  assert.equal(byId["fstep:1"].branches.length, fc.BRANCH_CHIP_LIMIT);
+  assert.equal(byId["fstep:1"].branchMore, 1);
   assert.equal(byId["fstep:2"].jumpIn, 1); // int_a jump_step→第 3 步
 
-  // 意图节点：jump 边（启用的）1 条,目标=fstep:2;play_qa/judge/停用徽标进 data。
+  // 脊柱=全部相邻对（跨场景不断线）,标签「默认推进」。
+  const spines = g1.edges.filter((e) => e.kind === "spine");
+  assert.deepEqual(spines.map((e) => [e.source, e.target]), [
+    ["fstep:0", "fstep:1"],
+    ["fstep:1", "fstep:2"],
+  ]);
+  assert.ok(spines.every((e) => e.label === "默认推进"));
+
+  // 意图节点：停用意图照渲染;jump 边（启用的）1 条,标签=意图名+前两关键词;
+  // play_qa+then_jump 画「播完跳转」边。
   const intents = g1.nodes.filter((n) => n.kind === "intent");
-  assert.equal(intents.length, 2); // 停用意图照渲染
+  assert.equal(intents.length, 2);
   const jumps = g1.edges.filter((e) => e.kind === "jump");
   assert.equal(jumps.length, 1);
   assert.equal(jumps[0].source, "fintent:int_a");
   assert.equal(jumps[0].target, "fstep:2");
+  assert.equal(jumps[0].label, "投诉（投诉、骗人）");
+  const thenJumps = g1.edges.filter((e) => e.kind === "thenjump");
+  assert.equal(thenJumps.length, 1);
+  assert.equal(thenJumps[0].source, "fintent:int_a");
+  assert.equal(thenJumps[0].target, "fstep:1");
+  assert.equal(thenJumps[0].label, "播完跳转");
   assert.equal(intents.find((n) => n.intentId === "int_a").playQa, true);
   assert.equal(intents.find((n) => n.intentId === "int_a").judge, true);
   assert.equal(intents.find((n) => n.intentId === "int_b").enabled, false);
 
-  // 泳道内脊柱线（开场两条步之间）；跨泳道不拉线。
-  const spines = g1.edges.filter((e) => e.kind === "spine");
-  assert.deepEqual(spines.map((e) => [e.source, e.target]), [["fstep:0", "fstep:1"]]);
-
-  // 无图:零意图零 jump 边。
+  // 无图:零意图零条件边,脊柱仍在。
   const bare = fc.layoutFlow(steps);
   assert.equal(bare.nodes.filter((n) => n.kind === "intent").length, 0);
   assert.equal(bare.edges.filter((e) => e.kind === "jump").length, 0);
+  assert.equal(bare.edges.filter((e) => e.kind === "thenjump").length, 0);
+  assert.equal(bare.edges.filter((e) => e.kind === "spine").length, 2);
 });

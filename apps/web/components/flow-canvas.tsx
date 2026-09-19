@@ -1,11 +1,12 @@
 "use client";
 
-// 流程画布（W2 T2）：话术步的场景泳道可视化 + 答法抽屉 + steps_json 保存。
+// 流程画布（W2 T2；2026-09-20 重设计为纵向步骤工作流）：步骤脊柱纵向瀑布 +
+// 意图左栏条件边 + 答法抽屉 + steps_json 保存。
 // 三层范式照 qa-canvas-view：节点/抽屉纯渲染上抛,本组件（宿主）独占 draft 状态与写路径;
-// 布局与 ref 拆装在 lib/flow-canvas（纯函数）。意图=只读 overlay（jump_step→跳转边、
-// play_qa→「播快答」徽标、judge→「判据」徽标）,编辑深链问答画布,W2 不搬图写路径。
-// 保存=serialize 全部步（含 scene）→ stepsToJson → updateTemplate({steps_json})
-// （CP PUT exclude_unset 部分更新,只动 steps_json 不抹其余字段）。
+// 布局与 ref 拆装在 lib/flow-canvas（纯函数）。意图=只读 overlay（左栏卡片,
+// jump_step→「意图（关键词）」跳转边、play_qa+then_jump→「播完跳转」边）,
+// 编辑深链问答画布。保存=serialize 全部步（含 scene）→ stepsToJson →
+// updateTemplate({steps_json})（CP PUT exclude_unset 部分更新,只动 steps_json）。
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
@@ -17,10 +18,11 @@ import { api } from "@/lib/api";
 import { ErrorState } from "@/components/app-shell";
 import { useSession } from "@/components/session-context";
 import { jsonToSteps, stepsToJson, type FlowStep, type TemplateRow } from "@/components/template-editor";
+import { VarTextarea } from "@/components/var-insert";
 import type { GraphDoc } from "@/lib/qa-canvas";
 import {
-  layoutFlow, parseStepRefParts, serializeStepRef,
-  type FlowNode, type StepRefParts, type StepBranch, UNGROUPED_LANE,
+  layoutFlow, parseStepRefParts, serializeStepRef, UNGROUPED_LANE,
+  type FlowNode, type StepRefParts, type StepBranch,
 } from "@/lib/flow-canvas";
 
 // 情绪下拉选项与 template-editor 表单同款（罐头物化烧进音频,实时回复不受影响）。
@@ -42,56 +44,64 @@ const inputCls =
   "w-full rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--live)";
 
 // —— 纯渲染节点 ——
-// 步节点：goal + 正稿首行截断 + 徽标（直念/情绪/意图跳入数）;点击开答法抽屉。
+// 步节点（工作流卡）：目标 + 正稿首行 + 徽标（直念/情绪/场景/意图跳入）+
+// 答法分支 chip（「如果客户…」条件,上限外折叠 +N）;点击开答法抽屉。
 function FlowStepNode({ data }: NodeProps) {
   const d = data as Extract<FlowNode, { kind: "step" }> & { onOpen: (index: number) => void };
   return (
     <div
-      className="w-[260px] cursor-pointer rounded-lg border border-(--live) bg-(--live-soft) p-3 text-xs hover:bg-accent"
+      className="w-[300px] cursor-pointer rounded-lg border border-(--live) bg-(--live-soft) p-3 text-xs hover:bg-accent"
       title="点击编辑这一步的答法"
       onClick={() => d.onOpen(d.index)}
     >
+      {/* 脊柱入边（上）+ 意图跳转入边（左）+ 脊柱出边（下） */}
       <Handle type="target" position={Position.Top} id="t" isConnectable={false} style={HANDLE_STYLE} />
+      <Handle type="target" position={Position.Left} id="l" isConnectable={false} style={HANDLE_STYLE} />
       <Handle type="source" position={Position.Bottom} id="b" isConnectable={false} style={HANDLE_STYLE} />
-      <p className="line-clamp-2 font-medium">
-        第 {d.index + 1} 步 · {d.goal || "(无目标)"}
+      <p className="flex items-center gap-1.5 font-medium">
+        <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-(--live) px-1 text-[10px] font-bold text-white">
+          {d.index + 1}
+        </span>
+        <span className="min-w-0 flex-1 truncate">{d.goal || "(无目标)"}</span>
       </p>
-      <p className="mt-1 line-clamp-1 muted">{d.scriptFirst || "(无正稿)"}</p>
+      {d.index === 0 && (
+        <p className="mt-0.5 text-[10px] text-(--live-ink)">● 通话开场（接通即进入第 1 步）</p>
+      )}
+      <p className="mt-1 line-clamp-2 muted">{d.scriptFirst || "(无正稿)"}</p>
       <div className="mt-2 flex flex-wrap items-center gap-1">
         {d.say && <span className="rounded-sm bg-sky-100 px-1 text-[10px] text-sky-700">直念</span>}
         {d.say && d.emotion && (
           <span className="rounded-sm bg-muted px-1 text-[10px]">{EMOTION_LABEL[d.emotion] ?? d.emotion}</span>
         )}
+        {d.scene && <span className="rounded-sm bg-violet-100 px-1 text-[10px] text-violet-700">{d.scene}</span>}
         {d.jumpIn > 0 && (
           <span className="rounded-sm bg-amber-100 px-1 text-[10px] text-amber-700">{d.jumpIn} 意图跳入</span>
         )}
       </div>
+      {(d.branches.length > 0 || d.branchMore > 0) && (
+        <div className="mt-1.5 border-t border-(--card-border) pt-1.5">
+          <p className="text-[9px] muted">答法分支（客户这样说→应答）</p>
+          <div className="mt-0.5 flex flex-wrap gap-1">
+            {d.branches.map((b, i) => (
+              <span
+                key={i}
+                className="rounded-full border border-(--card-border) bg-background px-1.5 py-0.5 text-[10px]"
+                title={`如果客户${b.cond} → ${b.resp}`}
+              >
+                {b.cond || "(空)"}
+              </span>
+            ))}
+            {d.branchMore > 0 && (
+              <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] muted">+{d.branchMore}</span>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
-// 场景泳道头：名字行内可编辑（受控上抛 onChangeScene(prev,new);逐键重映射同名步）。
-function LaneHeaderNode({ data }: NodeProps) {
-  const d = data as Extract<FlowNode, { kind: "lane" }> & {
-    canEdit: boolean;
-    onChangeScene: (prev: string, next: string) => void;
-  };
-  return (
-    <div className="w-[180px] rounded-lg border border-dashed border-(--card-border) bg-muted/60 p-2">
-      <p className="mb-1 text-[10px] muted">场景</p>
-      <input
-        className={`${inputCls} nodrag font-medium`}
-        value={d.name}
-        disabled={!d.canEdit}
-        placeholder="未分组"
-        title={d.canEdit ? "改场景名：该泳道全部步随之改名" : undefined}
-        onChange={(e) => d.onChangeScene(d.name, e.target.value)}
-      />
-    </div>
-  );
-}
-
-// 意图节点（只读 overlay）：跳转边在布局层派生;徽标=播快答/判据/停用。
+// 意图节点（只读 overlay,左栏）：跳转边在布局层派生;徽标=播快答/判据/停用。
 function FlowIntentNode({ data }: NodeProps) {
   const d = data as Extract<FlowNode, { kind: "intent" }>;
   return (
@@ -100,7 +110,6 @@ function FlowIntentNode({ data }: NodeProps) {
         d.enabled ? "border-amber-300 bg-amber-50" : "border-(--card-border) bg-muted/60 opacity-50"
       }`}
     >
-      <Handle type="target" position={Position.Left} id="l" isConnectable={false} style={HANDLE_STYLE} />
       <Handle type="source" position={Position.Right} id="r" isConnectable={false} style={HANDLE_STYLE} />
       <p className="flex items-center gap-1.5 font-medium">
         <span aria-hidden>🎯</span>
@@ -110,7 +119,10 @@ function FlowIntentNode({ data }: NodeProps) {
       <div className="mt-1.5 flex flex-wrap gap-1">
         {d.playQa && <span className="rounded-sm bg-emerald-100 px-1 text-[10px] text-emerald-700">播快答</span>}
         {d.judge && (
-          <span className="rounded-sm bg-amber-100 px-1 text-[10px] text-amber-700" title="关键词未中时由后台 LLM 按判据评估">
+          <span
+            className="rounded-sm bg-amber-100 px-1 text-[10px] text-amber-700"
+            title="关键词未中时由后台 LLM 按判据评估"
+          >
             判据
           </span>
         )}
@@ -120,7 +132,7 @@ function FlowIntentNode({ data }: NodeProps) {
   );
 }
 
-const NODE_TYPES = { flowStep: FlowStepNode, laneHeader: LaneHeaderNode, flowIntent: FlowIntentNode };
+const NODE_TYPES = { flowStep: FlowStepNode, flowIntent: FlowIntentNode };
 
 // —— 答法抽屉（右侧固定面板,非 modal）：全部字段受控,写路径归宿主 ——
 function AnswerDrawer(props: {
@@ -157,7 +169,7 @@ function AnswerDrawer(props: {
         />
       </label>
       <label className="block">
-        <span className="text-xs muted">场景（纯分组,不影响推进顺序）</span>
+        <span className="text-xs muted">场景（纯分组徽标,不影响推进顺序）</span>
         <select
           className={`mt-0.5 ${inputCls}`}
           value={props.step.scene ?? ""}
@@ -196,15 +208,17 @@ function AnswerDrawer(props: {
           <span className="text-[10px]">罐头物化时烧进音频</span>
         </label>
       )}
-      <label className="block">
+      <div>
         <span className="text-xs muted">正稿（首个非空行=本步首轮说的话;未知格式行也留在这里,保存原样回写）</span>
-        <textarea
-          className={`mt-0.5 h-24 resize-none ${inputCls}`}
-          value={parts.script}
-          disabled={readOnly}
-          onChange={(e) => props.onParts({ ...parts, script: e.target.value })}
-        />
-      </label>
+        <div className="mt-0.5">
+          <VarTextarea
+            className={`h-24 resize-none ${inputCls}`}
+            value={parts.script}
+            disabled={readOnly}
+            onChange={(v) => props.onParts({ ...parts, script: v })}
+          />
+        </div>
+      </div>
       <div>
         <span className="text-xs muted">分支（如果客户…→应答;运行时按客户回应只命中一条）</span>
         <div className="mt-1 space-y-1">
@@ -324,20 +338,6 @@ export default function FlowCanvas(props: {
     const ref = serializeStepRef(next);
     setDraft((d) => d.map((s, i) => (i === drawerIdx ? { ...s, ref } : s)));
   }
-  // 泳道头改名：该场景全部步随之重映射（scene 空的「未分组」泳道头不可改,canEdit 已闸）。
-  const renameScene = useCallback((prev: string, next: string) => {
-    const name = next.trim();
-    if (!name || name === prev) return;
-    setDraft((d) => d.map((s) => ((s.scene ?? "") === prev ? { ...s, scene: name } : s)));
-  }, []);
-  // 新建场景：落一个带场景的空白步并直接开抽屉（空白步保存时被 stepsToJson 过滤,不产生垃圾行）。
-  const addScene = useCallback(() => {
-    const name = (window.prompt("新场景名称（如：开场 / 谈赔偿 / 收尾）") ?? "").trim();
-    if (!name) return;
-    if (draft.some((s) => (s.scene ?? "") === name)) return;
-    setDraft((d) => (d.some((s) => (s.scene ?? "") === name) ? d : [...d, { goal: "", ref: "", scene: name }]));
-    setDrawerIdx(draft.length);
-  }, [draft]);
 
   async function save() {
     if (!tplId) return;
@@ -364,12 +364,6 @@ export default function FlowCanvas(props: {
     () =>
       layout.nodes.map((n) => {
         const position = positions[n.id] ?? { x: n.x, y: n.y };
-        if (n.kind === "lane") {
-          return {
-            id: n.id, type: "laneHeader" as const, position, deletable: false,
-            data: { ...n, canEdit: !readOnly && n.name !== UNGROUPED_LANE, onChangeScene: renameScene },
-          };
-        }
         if (n.kind === "step") {
           return {
             id: n.id, type: "flowStep" as const, position, deletable: false,
@@ -378,7 +372,7 @@ export default function FlowCanvas(props: {
         }
         return { id: n.id, type: "flowIntent" as const, position, deletable: false, data: { ...n } };
       }),
-    [layout, positions, readOnly, renameScene, openDrawer],
+    [layout, positions, openDrawer],
   );
   const edges: Edge[] = useMemo(
     () =>
@@ -388,15 +382,28 @@ export default function FlowCanvas(props: {
             id: e.id, source: e.source, target: e.target,
             sourceHandle: "b", targetHandle: "t",
             selectable: false, deletable: false,
+            label: e.label,
             style: { stroke: "var(--muted-foreground)", strokeWidth: 2 },
+            labelStyle: { fontSize: 10 },
+          };
+        }
+        if (e.kind === "thenjump") {
+          return {
+            id: e.id, source: e.source, target: e.target,
+            sourceHandle: "r", targetHandle: "l",
+            selectable: false, deletable: false,
+            label: e.label,
+            style: { stroke: "#059669", strokeWidth: 1.6, strokeDasharray: "2 4" },
+            labelStyle: { fill: "#065f46", fontSize: 10 },
+            labelBgStyle: { fill: "#d1fae5" },
           };
         }
         return {
           id: e.id, source: e.source, target: e.target,
-          sourceHandle: "r", targetHandle: "t",
+          sourceHandle: "r", targetHandle: "l",
           selectable: false, deletable: false,
-          label: "跳转",
-          style: { stroke: "#d97706", strokeWidth: 1.6, strokeDasharray: "6 4" },
+          label: e.label,
+          style: { stroke: "#d97706", strokeWidth: 1.8, strokeDasharray: "6 4" },
           labelStyle: { fill: "#92400e", fontSize: 10 },
           labelBgStyle: { fill: "#fef3c7" },
         };
@@ -424,13 +431,10 @@ export default function FlowCanvas(props: {
     <section className="card space-y-2">
       <div className="flex flex-wrap items-center gap-2">
         <span className="label">流程画布</span>
-        <span className="text-[11px] muted">点步节点编辑答法；场景=泳道纯分组，不改推进顺序</span>
+        <span className="text-[11px] muted">
+          纵向=通话推进顺序（实线=默认推进）;左栏意图卡虚线=关键词命中后跳到哪一步;点步节点编辑答法
+        </span>
         <div className="ml-auto flex items-center gap-2">
-          {!readOnly && (
-            <button className="btn-ghost text-xs" disabled={!tplId} onClick={addScene}>
-              ＋ 新建场景
-            </button>
-          )}
           {!readOnly && (
             <button className="btn-primary px-3 py-1 text-xs" disabled={saving || !tplId} onClick={save}>
               {saving ? "保存中…" : "保存"}
@@ -452,6 +456,7 @@ export default function FlowCanvas(props: {
             edges={edges}
             nodeTypes={NODE_TYPES}
             fitView
+            fitViewOptions={{ padding: 0.15 }}
             minZoom={0.2}
             deleteKeyCode={null}
             onNodesChange={onNodesChange}
@@ -479,7 +484,7 @@ export default function FlowCanvas(props: {
         )}
       </div>
       {draft.length === 0 && (
-        <p className="text-xs muted">该模板还没有步骤——回「表单」页签配置或填入示例后，这里会按场景分泳道展示。</p>
+        <p className="text-xs muted">该模板还没有步骤——回「表单」页签配置或填入示例后，这里会按纵向工作流展示。</p>
       )}
     </section>
   );

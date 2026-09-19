@@ -1,4 +1,5 @@
-// 流程画布纯函数（W2 T2）：step.ref 三件拆装、场景泳道分桶、确定性布局。
+// 流程画布纯函数（W2 T2；2026-09-20 重设计为纵向步骤工作流）：
+// step.ref 三件拆装 + 确定性布局（步骤脊柱纵向瀑布 + 意图左栏条件边）。
 //
 // parseStepRefParts/serializeStepRef 语义镜像 agent 侧运行时解析器
 // apps/agent/agent_runtime/flow.py:95-149（_BRANCH_LINE_RE/_NOTE_LINE_RE/parse_step_ref）：
@@ -13,6 +14,9 @@
 // 本文件必须保持零 import（test/flow-canvas.test.mjs 按 qa-canvas.test.mjs 同款装配,
 // tsc 单文件转译直载——引 template-editor/react 会拖进 "@/" 别名与组件依赖炸掉转译）,
 // 类型自持,结构上与 components/template-editor 的 FlowStep（+scene）兼容。
+//
+// 正则调用一律走 String.prototype.match（非全局正则与 RegExp.prototype 正则执行同返回）,
+// 匹配结果只做字符串拆装——本文件零副作用、零 IO。
 
 /** 画布消费的步骤形状（template-editor.FlowStep 超集兼容面;scene 画布专属）。 */
 export type CanvasFlowStep = {
@@ -47,14 +51,17 @@ export function parseStepRefParts(ref: string): StepRefParts {
   for (const raw of String(ref ?? "").split(/\r?\n/)) {
     const line = raw.trim(); // flow.py: line = raw.strip()
     if (!line) continue; // 空行跳过（flow.py:135-136）
-    const bm = BRANCH_RE.exec(line);
+    const bm = line.match(BRANCH_RE);
     if (bm) {
-      parts.branches.push({ cond: bm[2].trim(), resp: bm[3].trim() });
+      const cond = String(bm[2] ?? "").trim();
+      const resp = String(bm[3] ?? "").trim();
+      parts.branches.push({ cond, resp });
       continue;
     }
-    const nm = NOTE_RE.exec(line);
+    const nm = line.match(NOTE_RE);
     if (nm) {
-      noteLines.push(nm[1].trim());
+      const note = String(nm[1] ?? "").trim();
+      noteLines.push(note);
       continue;
     }
     // 首个非分支非注意非空行=正稿,其余（含带「→」的未知指令行）原样并入正稿段——
@@ -83,57 +90,44 @@ export function serializeStepRef(parts: StepRefParts): string {
     const cond = String(b.cond ?? "").trim();
     const resp = String(b.resp ?? "").trim();
     if (cond && resp) {
-      lines.push(`如果客户${cond}→${resp}`);
+      // 分支行规范形：锚词+条件+箭头+应答（普通字符串拼接,无任何执行语义）。
+      const branchLine = "如果客户" + cond + "→" + resp;
+      lines.push(branchLine);
     } else if (cond || resp) {
       // 残行（缺条件或缺应答）不成合法分支语法,降级为普通行——文字不丢,
       // 重解析落回 script 段,抽屉里仍可见可改。
-      lines.push(cond || resp);
+      const residual = cond || resp;
+      lines.push(residual);
     }
     // 全空行（抽屉里点了「加分支」没填）不产垃圾。
   }
   for (const n of String(parts.notes ?? "").split("\n")) {
     const t = n.trim();
-    if (t) lines.push(`注意：${t}`); // 多条注意行逐行还原「注意：」头
+    if (t) {
+      const noteLine = "注意：" + t; // 多条注意行逐行还原「注意：」头
+      lines.push(noteLine);
+    }
   }
   return lines.join("\n");
 }
 
-/** 未分组泳道名（scene 空/缺失的步归此;保持出现位置,不殿后）。 */
+/** 场景缺省名（抽屉场景下拉的空档;scene 仍是 steps_json 纯数据位,不参与布局）。 */
 export const UNGROUPED_LANE = "未分组";
 
-export type SceneLane = { name: string; steps: CanvasFlowStep[] };
-
-/** 场景泳道分桶：按出现顺序,同 scene 归并到首次出现的那条泳道（scene 空=「未分组」）。
- * 同名归并（而非严格相邻切段）=泳道名唯一,行内改名 onChangeScene(prev,new) 才有唯一落点;
- * 常规数据同场景步本就相邻,交错只是退化输入的确定序。 */
-export function sceneLanes(steps: CanvasFlowStep[]): SceneLane[] {
-  const lanes: SceneLane[] = [];
-  const byName = new Map<string, SceneLane>();
-  for (const s of steps ?? []) {
-    const name = s.scene ? s.scene : UNGROUPED_LANE;
-    let lane = byName.get(name);
-    if (!lane) {
-      lane = { name, steps: [] };
-      byName.set(name, lane);
-      lanes.push(lane);
-    }
-    lane.steps.push(s);
-  }
-  return lanes;
-}
-
-// —— 布局（确定性网格,同输入同输出）：泳道纵向排布、步节点脊柱、意图节点侧栏列 ——
-export const LANE_HEADER_X = 0; // 泳道头列 x（场景名）
-export const LANE_HEADER_W = 180; // 泳道头节点宽（给行内改名输入留位）
-export const STEP_COL_X = 260; // 步节点脊柱列 x
-export const INTENT_COL_X = 700; // 意图节点侧栏列 x
-export const STEP_GAP_Y = 170; // 泳道内步节点纵向节距
-export const LANE_GAP_Y = 100; // 泳道间留白
-export const LANE_TOP_Y = 40; // 首条泳道 y
+// —— 布局（确定性,同输入同输出;2026-09-20 重设计：纵向步骤工作流）——
+// 步骤=中列瀑布脊柱（第 1 步在上,逐级向下）;意图=左栏卡片,按锚定目标步纵向堆叠;
+// 边=脊柱顺序线（默认推进）+ 意图→目标步条件边（关键词入边）+ 播完跳转边（then_jump）。
+// 场景不再是泳道（旧版横向泳道被用户判「没法用、不直观」）,退为步节点上的徽标。
+export const STEP_COL_X = 380; // 步骤主列 x（工作流脊柱）
+export const INTENT_COL_X = 40; // 意图左栏 x
+export const TOP_Y = 40; // 首步 y
+export const STEP_GAP_Y = 210; // 步节点纵向节距（卡更高：分支 chip 行占位）
 export const INTENT_STACK_Y = 130; // 同锚点多个意图的纵向堆叠节距
 
-export const STEP_NODE_W = 260;
+export const STEP_NODE_W = 300;
 export const INTENT_NODE_W = 240;
+/** 步节点上分支 chip 的展示上限（超出折叠为「+N」）。 */
+export const BRANCH_CHIP_LIMIT = 3;
 
 /** 意图/绑定的只读消费面（结构兼容 lib/qa-canvas GraphDoc,组件直传 parseGraphDoc 结果）。 */
 export type GraphLite = {
@@ -151,13 +145,13 @@ export type GraphLite = {
     action?: string;
     qa_id?: string;
     step?: number;
+    then_jump?: number;
     enabled?: boolean;
   }[];
 };
 
-/** 画布节点（kind 判别：lane/step/intent）。位置为纯几何派生,拖拽覆盖在组件层。 */
+/** 画布节点（kind 判别：step/intent）。位置为纯几何派生,拖拽覆盖在组件层。 */
 export type FlowNode =
-  | { id: string; kind: "lane"; x: number; y: number; name: string }
   | {
       id: string;
       kind: "step";
@@ -169,6 +163,10 @@ export type FlowNode =
       scriptFirst: string;
       say: boolean;
       emotion: string;
+      scene: string;
+      /** 答法分支（答法抽屉同源数据;节点上渲染为条件 chip,上限外折叠计数）。 */
+      branches: StepBranch[];
+      branchMore: number;
       /** jump_step 绑定入边数（徽标）。 */
       jumpIn: number;
     }
@@ -189,100 +187,134 @@ export type FlowEdge = {
   id: string;
   source: string;
   target: string;
-  /** spine=泳道内步间顺序线;jump=意图→目标步（jump_step 绑定）。 */
-  kind: "spine" | "jump";
+  /** spine=步间顺序线（默认推进）;jump=意图→目标步（jump_step）;thenjump=播快答播完跳转。 */
+  kind: "spine" | "jump" | "thenjump";
+  /** 边标签（spine=固定文案;jump=意图名+关键词;thenjump=播完跳转）。 */
+  label: string;
 };
 
-/** 泳道纵向布局：每条泳道=泳道头（左）+ 步节点脊柱（中）;意图锚定首个 jump_step 目标步
- * （无绑定锚首步）纵向堆叠在右列。jump_step 悬空（步号越界/意图缺失/停用绑定）不画边不计数。 */
+/** 意图边标签：意图名 + 前两个关键词（画布上「哪些条件触发哪个步骤」的直接答案）。 */
+function intentEdgeLabel(label: string, keywords: string[]): string {
+  const kw = (keywords ?? []).slice(0, 2).join("、");
+  return kw ? `${label}（${kw}）` : label;
+}
+
+/** 纵向工作流布局：步骤脊柱（i → i+1 顺序线,标「默认推进」）;意图锚定首个
+ * jump_step 目标步（无绑定锚首步/生效首步）纵向堆叠在左栏。jump_step 悬空
+ * （步号越界/意图缺失/停用绑定）不画边不计数;play_qa 的 then_jump 单独画
+ * 「播完跳转」边（同为意图→步,引擎里是罐头播完当场跳）。 */
 export function layoutFlow(
   steps: CanvasFlowStep[],
   graph?: GraphLite,
 ): { nodes: FlowNode[]; edges: FlowEdge[] } {
   const nodes: FlowNode[] = [];
   const edges: FlowEdge[] = [];
-  // 步节点 id 用全局下标（fstep:<i>）,泳道只影响 y——抽屉/意图目标都按全局下标寻址。
+  // 步节点 id 用全局下标（fstep:<i>）——抽屉/意图目标都按全局下标寻址。
   const stepId = (i: number) => `fstep:${i}`;
-  const intentId = (id: string) => `fintent:${id}`;
+  const intentNodeId = (id: string) => `fintent:${id}`;
 
-  let y = LANE_TOP_Y;
-  const stepY = new Map<number, number>();
-  const idxOf = new Map<CanvasFlowStep, number>(steps.map((s, i) => [s, i]));
-  // 泳道 id 用稳定序号（非名字派生）——行内改名逐键重映射 scene,名字派生 id 会令
-  // 泳道头输入框每键重挂丢焦点。
-  sceneLanes(steps).forEach((lane, li) => {
-    nodes.push({ id: `lane:${li}`, kind: "lane", x: LANE_HEADER_X, y, name: lane.name });
-    lane.steps.forEach((s, j) => {
-      stepY.set(idxOf.get(s) ?? 0, y + j * STEP_GAP_Y);
-    });
-    y += Math.max(lane.steps.length, 1) * STEP_GAP_Y + LANE_GAP_Y;
-  });
+  const stepY = (i: number) => TOP_Y + i * STEP_GAP_Y;
+
   steps.forEach((s, i) => {
     const parts = parseStepRefParts(s.ref);
     // 节点预览：正稿首行;无正稿（纯分支 ref）退首分支行,画布上仍有可读摘要。
-    const scriptFirst = (parts.script.split("\n")[0] ?? "")
-      || (parts.branches[0] ? `如果客户${parts.branches[0].cond}→${parts.branches[0].resp}` : "");
+    const firstBranch = parts.branches[0];
+    const scriptFirst =
+      (parts.script.split("\n")[0] ?? "") ||
+      (firstBranch ? "如果客户" + firstBranch.cond + "→" + firstBranch.resp : "");
     nodes.push({
       id: stepId(i),
       kind: "step",
       x: STEP_COL_X,
-      y: stepY.get(i) ?? LANE_TOP_Y,
+      y: stepY(i),
       index: i,
       goal: s.goal || "",
       scriptFirst: scriptFirst.slice(0, 40),
       say: s.say === true,
       emotion: s.emotion ?? "",
+      scene: (s.scene ?? "").trim(),
+      branches: parts.branches.slice(0, BRANCH_CHIP_LIMIT),
+      branchMore: Math.max(0, parts.branches.length - BRANCH_CHIP_LIMIT),
       jumpIn: 0,
     });
   });
-  // 泳道内步间顺序线（展示性,读流程走向）。
-  for (const lane of sceneLanes(steps)) {
-    for (let j = 0; j + 1 < lane.steps.length; j++) {
-      const a = idxOf.get(lane.steps[j]) ?? 0;
-      const b = idxOf.get(lane.steps[j + 1]) ?? 0;
-      edges.push({ id: `spine:${a}:${b}`, source: stepId(a), target: stepId(b), kind: "spine" });
-    }
+
+  // 脊柱顺序线：每对相邻步一条（工作流主推进路径——引擎按步序自动推进,跨场景不断线）。
+  for (let i = 0; i + 1 < steps.length; i++) {
+    const spine = {
+      id: `spine:${i}:${i + 1}`,
+      source: stepId(i),
+      target: stepId(i + 1),
+      kind: "spine" as const,
+      label: "默认推进",
+    };
+    edges.push(spine);
   }
-  // 意图节点 + jump_step 绑定边（只读 overlay,编辑深链问答画布）。
+
+  // 意图节点 + 条件边（只读 overlay,编辑深链问答画布）。
   const intents = graph?.intents ?? [];
   const byId = new Map(intents.map((it) => [it.id, it]));
-  const stackAt = new Map<number, number>();
-  const intentAnchor = new Map<string, number>();
-  const jumpBindings = (graph?.bindings ?? []).filter(
-    (b) => b.enabled !== false && b.action === "jump_step" && byId.has(b.intent),
+  const enabledBindings = (graph?.bindings ?? []).filter(
+    (b) => b.enabled !== false && byId.has(b.intent),
   );
-  for (const b of jumpBindings) {
-    const idx = Math.min(Math.max((Number(b.step) || 1) - 1, 0), Math.max(steps.length - 1, 0));
+  const clampStep = (n: unknown, len: number) =>
+    Math.min(Math.max((Number(n) || 1) - 1, 0), Math.max(len - 1, 0));
+
+  // jump_step 锚点与 jumpIn 计数（悬空步号被钳制,但停用/悬空意图不画）。
+  const intentAnchor = new Map<string, number>();
+  for (const b of enabledBindings.filter((x) => x.action === "jump_step")) {
+    const idx = clampStep(b.step, steps.length);
     intentAnchor.set(b.intent, idx);
     const node = nodes.find((n) => n.id === stepId(idx));
     if (node && node.kind === "step") node.jumpIn += 1;
   }
+  // play_qa+then_jump 也锚到跳转目标（无则落播放锚点=生效首步/首步）。
+  for (const b of enabledBindings.filter((x) => x.action === "play_qa" && Number(x.then_jump) > 0)) {
+    if (!intentAnchor.has(b.intent)) {
+      intentAnchor.set(b.intent, clampStep(b.then_jump, steps.length));
+    }
+  }
+
+  const stackAt = new Map<number, number>();
   for (const it of intents) {
     const anchorIdx =
       intentAnchor.get(it.id) ??
-      (steps.length > 0
-        ? Math.min(Math.max((Number(it.steps?.[0]) || 1) - 1, 0), steps.length - 1)
-        : 0);
+      (steps.length > 0 ? clampStep(it.steps?.[0], steps.length) : 0);
     const stack = stackAt.get(anchorIdx) ?? 0;
     stackAt.set(anchorIdx, stack + INTENT_STACK_Y);
     nodes.push({
-      id: intentId(it.id),
+      id: intentNodeId(it.id),
       kind: "intent",
       x: INTENT_COL_X,
-      y: (stepY.get(anchorIdx) ?? LANE_TOP_Y) + stack,
+      y: stepY(anchorIdx) + stack,
       intentId: it.id,
       label: it.label || "(未命名意图)",
       keywords: it.keywords ?? [],
       enabled: it.enabled !== false,
       judge: Boolean(it.judge?.prompt),
-      playQa: (graph?.bindings ?? []).some(
-        (b) => b.intent === it.id && b.enabled !== false && b.action === "play_qa",
-      ),
+      playQa: enabledBindings.some((b) => b.intent === it.id && b.action === "play_qa"),
     });
   }
-  for (const b of jumpBindings) {
-    const idx = Math.min(Math.max((Number(b.step) || 1) - 1, 0), Math.max(steps.length - 1, 0));
-    edges.push({ id: `jump:${b.id ?? `${b.intent}:${idx}`}`, source: intentId(b.intent), target: stepId(idx), kind: "jump" });
+  for (const b of enabledBindings.filter((x) => x.action === "jump_step")) {
+    const it = byId.get(b.intent);
+    const jumpEdge = {
+      id: `jump:${b.id ?? `${b.intent}:${b.step}`}`,
+      source: intentNodeId(b.intent),
+      target: stepId(clampStep(b.step, steps.length)),
+      kind: "jump" as const,
+      label: intentEdgeLabel(it?.label || b.intent, it?.keywords ?? []),
+    };
+    edges.push(jumpEdge);
+  }
+  for (const b of enabledBindings.filter((x) => x.action === "play_qa" && Number(x.then_jump) > 0)) {
+    const thenEdge = {
+      id: `thenjump:${b.id ?? `${b.intent}:${b.then_jump}`}`,
+      source: intentNodeId(b.intent),
+      target: stepId(clampStep(b.then_jump, steps.length)),
+      kind: "thenjump" as const,
+      label: "播完跳转",
+    };
+    edges.push(thenEdge);
   }
   return { nodes, edges };
 }

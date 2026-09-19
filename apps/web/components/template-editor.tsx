@@ -13,6 +13,7 @@ import { api } from "@/lib/api";
 import { ErrorState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
 import { useSession } from "@/components/session-context";
+import { VarTextarea } from "@/components/var-insert";
 
 export const LANGS = [
   ["zh", "普通话"],
@@ -478,13 +479,15 @@ export default function TemplateEditor(props: {
                 disabled={readOnly}
                 onChange={(e) => setSteps((s) => s.map((x, j) => (j === i ? { ...x, goal: e.target.value } : x)))}
               />
-              <textarea
-                className={`mt-1.5 h-20 ${textarea} text-xs`}
-                placeholder={"参考说法(要点+分支;AI 结合客户原话用自己的话讲)\n例:你好,请问係咪{姓名}?我哋係{物流公司}…\n如果客户唔记得 → 提佢下单填嘅地址帮佢回忆"}
-                value={st.ref}
-                disabled={readOnly}
-                onChange={(e) => setSteps((s) => s.map((x, j) => (j === i ? { ...x, ref: e.target.value } : x)))}
-              />
+              <div className="mt-1.5">
+                <VarTextarea
+                  className={`h-24 ${textarea} text-xs`}
+                  placeholder={"参考说法(要点+分支;AI 结合客户原话用自己的话讲)\n例:你好,请问係咪{姓名}?我哋係{物流公司}…\n如果客户唔记得 → 提佢下单填嘅地址帮佢回忆"}
+                  value={st.ref}
+                  disabled={readOnly}
+                  onChange={(v) => setSteps((s) => s.map((x, j) => (j === i ? { ...x, ref: v } : x)))}
+                />
+              </div>
               <label className="mt-1 flex items-center gap-1.5 text-[11px] muted">
                 <input
                   type="checkbox"

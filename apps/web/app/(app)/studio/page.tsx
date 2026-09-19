@@ -1,8 +1,10 @@
 "use client";
 
-// AI 工作站（W1）：以话术模板为入口的集中工作台。
-// 列表态（无 ?t=）：全部模板概览（步数/意图数为行内现算,仅展示、权威以详情为准）；
-// 工作台态（?t=<id>）：话术流程编辑 + 意图与问答 + 变量 + 罐头录音 + 通话日志 + 学习报告 六个 tab
+// AI 工作站（W1；2026-09-20 重设计）：以话术模板为入口的集中工作台。
+// 列表态（无 ?t=）：全部模板概览 + 新建话术（话术/快答内容全部整合在此，
+// /templates、/qa 移出主导航后这里成为唯一内容入口）；
+// 工作台态（?t=<id>）：话术流程 + 意图管理 + 变量 + 客户意向 + 录音沉淀 +
+// 通话日志 + 学习报告 tab（对齐参考产品的主流程/意图管理/变量设定/客户意向/录音管理 tab 面）。
 // （学习报告/聚类采纳在 components/study-tab.tsx,变量目录与预览在 components/template-vars.tsx）。
 // 深链先例：/calls?call= / /supervisor?listen= —— 静态导出用 query，不开动态路由。
 
@@ -22,6 +24,8 @@ import TemplateEditor, {
 import FlowCanvas from "@/components/flow-canvas";
 import StudyTab from "@/components/study-tab";
 import TemplateVarsTab from "@/components/template-vars";
+import CannedAuditionCard from "@/components/canned-audition";
+import IntentRulesCard from "@/components/intent-rules-card";
 
 // 通话行状态徽标（照 calls 页惯例搬一份,页面文件不可导入）。
 const CALL_STATUS: Record<string, [string, string]> = {
@@ -61,6 +65,10 @@ export default function StudioPage() {
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState("");
   const [userNames, setUserNames] = useState<Record<string, string>>({});
+  // 新建话术面板（2026-09-20：/templates 移出主导航，这里成为唯一内容入口）。
+  const [creating, setCreating] = useState(false);
+  // 列表刷新序号：新建保存成功后 +1 重拉列表。
+  const [listRev, setListRev] = useState(0);
 
   useEffect(() => {
     if (selId) return; // 工作台态不拉列表
@@ -81,7 +89,7 @@ export default function StudioPage() {
     return () => {
       alive = false;
     };
-  }, [selId, accountId]);
+  }, [selId, accountId, listRev]);
 
   // 主管面归属徽标要显示成员姓名（话务员无权访问 /api/users，不请求；照 templates 页惯例）。
   useEffect(() => {
@@ -149,13 +157,14 @@ export default function StudioPage() {
 
   // ---- tab 切换（qa 页 view chips 同款写法）；学习报告 tab 仅对有 reports 键的人出现 ----
   const [tab, setTab] = useState("flow");
-  // 话术流程 tab 双视图（W2 流程画布）：表单=共用编辑器,画布=场景泳道+答法抽屉。
+  // 话术流程 tab 双视图（W2 流程画布）：表单=共用编辑器,画布=步骤工作流+答法抽屉。
   const [flowView, setFlowView] = useState<"form" | "canvas">("form");
   const tabs: [string, string][] = [
     ["flow", "话术流程"],
-    ["intent", "意图与问答"],
+    ["intent", "意图管理"],
     ["vars", "变量"],
-    ["canned", "罐头录音"],
+    ["disposition", "客户意向"],
+    ["canned", "录音沉淀"],
     ["calls", "通话日志"],
   ];
   if (canReports) tabs.push(["reports", "学习报告"]);
@@ -243,16 +252,42 @@ export default function StudioPage() {
   if (!selId) {
     return (
       <div>
-        <div className="mb-8">
-          <h1 className="page-title">AI 工作站</h1>
-          <p className="page-sub">按话术模板集中作业：流程编辑 · 意图问答 · 变量 · 罐头录音 · 通话日志 · 学习报告</p>
+        <div className="mb-8 flex items-start justify-between gap-3">
+          <div>
+            <h1 className="page-title">AI 工作站</h1>
+            <p className="page-sub">按话术模板集中作业：话术流程 · 意图管理 · 变量 · 客户意向 · 录音沉淀 · 通话日志 · 学习报告</p>
+          </div>
+          {!creating && (
+            <button className="btn-primary shrink-0" onClick={() => setCreating(true)}>
+              ＋ 新建话术
+            </button>
+          )}
         </div>
+
+        {creating && (
+          <section className="mb-6 space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-medium">新建话术模板</span>
+              <button className="btn-ghost text-xs" onClick={() => setCreating(false)}>
+                收起 ✕
+              </button>
+            </div>
+            <TemplateEditor
+              tpl={null}
+              onSaved={() => {
+                setCreating(false);
+                setListRev((v) => v + 1);
+              }}
+            />
+          </section>
+        )}
+
         <section className="card">
           {err && <ErrorState message={err} />}
           {loading ? (
             <LoadingState />
           ) : rows.length === 0 ? (
-            <EmptyState label="暂无话术模板，请先到「话术」页新建。" />
+            <EmptyState label="暂无话术模板，点右上角「新建话术」创建。" />
           ) : (
             <div className="space-y-3">
               {rows.map((row) => {
@@ -362,7 +397,7 @@ export default function StudioPage() {
             </div>
           )}
 
-          {/* 2. 意图与问答：只读摘要（编辑请进问答画布） */}
+          {/* 2. 意图管理（第一层识别：关键词/judge 判据/绑定动作；编辑进问答画布） */}
           {tab === "intent" && (
             <section className="card space-y-4">
               {graph.intents.length === 0 ? (
@@ -433,14 +468,26 @@ export default function StudioPage() {
                 className="btn-primary"
                 onClick={() => window.location.assign(`/qa/?template=${encodeURIComponent(selId)}&view=canvas`)}
               >
-                打开问答画布
+                打开意图画布编辑（关键词 / 判据 / 绑定）
               </button>
             </section>
           )}
 
-          {/* 3. 罐头录音：挂步骤词条的物化状态面（补录/试听归问答库） */}
+          {/* 3. 客户意向（挂断判定 intent_rules）：与 /calls 页同一张卡（账号级规则面） */}
+          {tab === "disposition" && (
+            <section className="space-y-2">
+              <p className="text-xs muted">
+                挂断时按通话事实（时长/轮数/到达步数/是否捕获号码等）判定客户意向码与处置，命中即写进通话记录。
+              </p>
+              <IntentRulesCard accountId={accountId} />
+            </section>
+          )}
+
+          {/* 4. 录音沉淀：罐头音资产试听（垫话/QA 罐头） + 挂步骤词条的物化状态面 */}
           {tab === "canned" && (
-            <section className="card space-y-3">
+            <section className="space-y-3">
+              <CannedAuditionCard />
+              <div className="card space-y-3">
               {cannedErr && <ErrorState message={cannedErr} />}
               {cannedLoading ? (
                 <LoadingState />
@@ -472,9 +519,10 @@ export default function StudioPage() {
                 </div>
               )}
               <div className="rounded-lg border border-dashed border-(--card-border) p-3 text-xs muted">
-                补录 / 试听请前往
-                <Link href="/qa/" className="text-(--live)">问答库</Link>
+                补录 / 重新录音请前往
+                <Link href="/qa/" className="text-(--live)">问答画布</Link>
                 （画布视图可右键条目重新录音）。
+              </div>
               </div>
             </section>
           )}
