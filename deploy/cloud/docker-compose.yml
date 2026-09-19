@@ -46,6 +46,11 @@ services:
       # deploy/cloud/publish_node_pkg.sh 从打包机推送；节点经 license/node_token
       # 鉴权下载（/api/nodes/downloads/...）——客户链路只见本 CP 域名，零 GitHub。
       BOK_NODE_ARTIFACTS_DIR: /app/downloads
+      # 云托管管理台的对外可达地址（2026-09-19 模拟拓扑实测缺口）：设置时 CP 启动
+      # 幂等写 /app/web-out/runtime-config.js，管理台 apiBase() 第一优先读它——
+      # 不设则静态台回落构建期烤死的 127.0.0.1:8000，云端口形态下登录必 401 弹回。
+      # 例：https://cp.example.com 或 http://203.0.113.5:18010（有反代填反代域名）。
+      BOK_CP_PUBLIC_URL: ${BOK_CP_PUBLIC_URL:-}
     volumes:
       # vault：人设参考音频（TTS 克隆注册）+ 知识库 markdown 源文件。镜像内
       # VAULT_ROOT=/app/data/vault，属主 appuser；首挂载时 Docker 把镜像内目录

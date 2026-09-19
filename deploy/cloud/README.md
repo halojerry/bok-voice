@@ -162,3 +162,9 @@ docker compose down -v         # ⚠ 连 vault 卷一起删（人设参考音频
 > 定义不变时可用；任何 `up`（含 `--force-recreate`）**必须走 `./up.sh`**——裸 up 会
 > 把 DATABASE_URL 回退 `.env` 的 IPv6-only 池器域名，容器 crash-loop（实案
 > restarts=8）。详见 `docs/DEPLOY_SAAS_RUNBOOK.md`「重启/重拉铁律」。
+
+> **管理台对外地址**：`.env` 配 `BOK_CP_PUBLIC_URL`（话务员浏览器可达的 CP 地址，
+> 如 `https://cp.example.com` 或 `http://IP:18010`）——CP 启动自动写
+> `runtime-config.js` 供管理台运行时取址；**不配则管理台回落构建期默认
+> `127.0.0.1:8000`，云端口/域名形态下登录必 401 弹回**（2026-09-19 模拟拓扑
+> 实测缺口）。
