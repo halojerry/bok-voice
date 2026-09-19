@@ -164,6 +164,9 @@ def test_cmd_down_posix_stdout_contract(monkeypatch, tmp_path: Path, capsys) -> 
     tmp = _make_run_dir(tmp_path, {"good.pid": "111\n", "dead.pid": "222\n", "bad.pid": "not-a-pid"})
     monkeypatch.setattr(bok, "app_data_dir", lambda: tmp)
     monkeypatch.setattr(bok, "_sweep_orphan_workers", lambda: [])
+    # 端口级清扫必须一并打桩(2026-09-19 二次灭栈实案):healthy_ok=False 的
+    # down 档会真杀本机活栈——本测试只测 pidfile stdout 契约,不吃真 lsof。
+    monkeypatch.setattr(bok, "_sweep_orphan_listeners", lambda **_kw: [])
 
     killed: list[int] = []
 
