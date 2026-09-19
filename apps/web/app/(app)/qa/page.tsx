@@ -241,6 +241,10 @@ export default function QaPage() {
   // 逐个叠加,不会各自从同一份旧 doc 算,互相覆盖。
   const graphDocRef = useRef<GraphDoc>(EMPTY_GRAPH);
   const graphLoadedForRef = useRef("");
+  // 并发编辑基线(2026-09-19 审计 W3-18):本会话拉详情时的服务端 graph_json 原文。
+  // 保存前重拉详情比对——被他人改过即中止(本地编辑保留),消灭「最后者胜」静默
+  // 互相覆盖。保存成功后基线推进为自己的新串;切模板/清图时置 ""(基线失效)。
+  const graphBaselineRef = useRef<string | null>(null);
   // 写队列:同一 tick 的多笔变更按提交顺序**串行** PUT(浏览器多连接下并发 PUT 的到达顺序
   // 不受控,乱序会让服务端停在中间态=客户端显示已删、库里还在)。
   const writeChainRef = useRef<Promise<void>>(Promise.resolve());
@@ -398,6 +402,7 @@ export default function QaPage() {
     setDraftIntent(null);
     graphLoadedForRef.current = "";
     setGraphLoadedFor("");
+    graphBaselineRef.current = null;
     graphDocRef.current = EMPTY_GRAPH;
     setGraphDoc(EMPTY_GRAPH);
     setGraphErr("");
@@ -420,6 +425,7 @@ export default function QaPage() {
         const doc = parseGraphDoc(raw);
         graphDocRef.current = doc;
         setGraphDoc(doc);
+        graphBaselineRef.current = raw;
         graphLoadedForRef.current = templateId;
         setGraphLoadedFor(templateId);
       } catch (e) {
@@ -682,7 +688,20 @@ export default function QaPage() {
       setGraphLocal(next); // 乐观
       const run = writeChainRef.current.then(async () => {
         try {
+          // 并发编辑 CAS-lite:落库前重拉详情,服务端图 ≠ 本会话基线=他人已改,
+          // 中止保存(本次乐观写回滚,本地画布编辑保留,提示刷新对照)。null 基线
+          // (旧会话/加载前)跳过比对,保底走原语义。
+          if (graphBaselineRef.current !== null) {
+            const cur = (await api.getTemplate(tid)) as Record<string, unknown>;
+            const curRaw = typeof cur.graph_json === "string" ? cur.graph_json : "";
+            if (curRaw !== graphBaselineRef.current) {
+              if (graphDocRef.current === next) setGraphLocal(prev); // 回滚本次
+              setErr("话术图已被他人修改，保存已中止——请刷新对照后再改（本地编辑仍在画布上）。");
+              return false;
+            }
+          }
           await api.updateTemplate(tid, { graph_json: JSON.stringify(next) });
+          graphBaselineRef.current = JSON.stringify(next); // 基线推进为本次新串
           setErr("");
           return true;
         } catch (e) {

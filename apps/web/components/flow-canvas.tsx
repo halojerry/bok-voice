@@ -20,6 +20,7 @@ import { jsonToSteps, stepsToJson, type FlowStep, type TemplateRow } from "@/com
 import type { GraphDoc } from "@/lib/qa-canvas";
 import {
   layoutFlow, parseStepRefParts, serializeStepRef,
+  findUnparsedDirectives,
   type FlowNode, type StepRefParts, type StepBranch, UNGROUPED_LANE,
 } from "@/lib/flow-canvas";
 
@@ -205,6 +206,17 @@ function AnswerDrawer(props: {
           onChange={(e) => props.onParts({ ...parts, script: e.target.value })}
         />
       </label>
+      {findUnparsedDirectives(parts.script).length > 0 && (
+        <div className="rounded border border-amber-500/40 bg-amber-500/10 p-1.5 text-[11px] text-amber-300">
+          {findUnparsedDirectives(parts.script).length} 行指令引擎不会执行
+          （只认「如果客户…→…」与「注意：」；这些行会原样保存，但运行时忽略）：
+          <ul className="mt-0.5 list-disc pl-4">
+            {findUnparsedDirectives(parts.script).map((l, i) => (
+              <li key={i} className="line-clamp-1">{l}</li>
+            ))}
+          </ul>
+        </div>
+      )}
       <div>
         <span className="text-xs muted">分支（如果客户…→应答;运行时按客户回应只命中一条）</span>
         <div className="mt-1 space-y-1">

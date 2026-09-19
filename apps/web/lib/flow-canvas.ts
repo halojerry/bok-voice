@@ -98,6 +98,24 @@ export function serializeStepRef(parts: StepRefParts): string {
   return lines.join("\n");
 }
 
+/** 运行时会忽略的「未知指令行」：含「→」但既非合法分支行、也非注意行的非空行
+ * （例：「客户报出号码(数字串)→复述确认」——运行时 parse_step_ref 告警一次后把
+ * 该行从注入中丢弃）。画布侧把这些行原样保留进正稿（不丟字），但「画布上看得见」
+ * ≠「引擎会执行」——抽屉按本函数出警示（2026-09-19 审计 W3-17；0913 EN 模板
+ * 分支整层静默失效同族）。 */
+export function findUnparsedDirectives(ref: string): string[] {
+  const hits: string[] = [];
+  for (const raw of String(ref ?? "").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.includes("→") && !BRANCH_RE.test(line) && !NOTE_RE.test(line)) {
+      hits.push(line);
+    }
+  }
+  return hits;
+}
+
+
 /** 未分组泳道名（scene 空/缺失的步归此;保持出现位置,不殿后）。 */
 export const UNGROUPED_LANE = "未分组";
 

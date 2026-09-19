@@ -316,3 +316,21 @@ test("layoutFlow：泳道纵向、步脊柱、意图侧栏/jumpIn/徽标、确�
   assert.equal(bare.nodes.filter((n) => n.kind === "intent").length, 0);
   assert.equal(bare.edges.filter((e) => e.kind === "jump").length, 0);
 });
+
+// ---- ⑥ 未解析指令行检测（2026-09-19 审计 W3-17 抽屉警示的数据面） ----
+test("findUnparsedDirectives：带→的非语法行逐条收集；分支/注意/正稿行不误报", () => {
+  const ref = [
+    "您好，请问是{姓名}吗？",                          // 正稿行（无→）不报
+    "如果客户问是谁→说明来意",                          // 合法分支行不报
+    "注意：全程语速放慢",                               // 注意行不报
+    "客户报出号码(数字串)→复述确认",                     // 未知指令行 → 报
+    "When the customer asks → answer briefly",        // EN 锚合法分支不报
+    "小写锚词 x → y",                                  // 无锚词 → 报
+  ].join("\n");
+  assert.deepEqual(fc.findUnparsedDirectives(ref), [
+    "客户报出号码(数字串)→复述确认",
+    "小写锚词 x → y",
+  ]);
+  assert.deepEqual(fc.findUnparsedDirectives(""), []);
+  assert.deepEqual(fc.findUnparsedDirectives(null), []);
+});
