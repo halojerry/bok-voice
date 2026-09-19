@@ -90,9 +90,15 @@ def test_mt_prompt_glossary_slot_and_byte_identity():
     assert with_g.endswith(old)
 
 
-def test_build_llm_provider_passes_glossary(monkeypatch):
+def test_build_llm_provider_passes_glossary(monkeypatch, tmp_path):
     from agent_runtime.providers.livekit_plugins import StatelessMTLLM
 
+    # MT 门禁(2026-09-19):模型必须为在盘绝对路径——空值/repo-id 属挂死类输入,
+    # _build_llm_provider 会回退主 LLM(见 tests/test_mt_model_guard.py);fixture
+    # 必须给真实存在路径才进 MT 分支。
+    mt_model = tmp_path / "Hy-MT2-8bit"
+    mt_model.mkdir()
+    monkeypatch.setenv("MT_LLM_MODEL", str(mt_model))
     monkeypatch.setenv("MT_LLM_BASE_URL", "http://127.0.0.1:1236/v1")
     provider = interpret._build_llm_provider({}, "en", glossary="顺丰=SF Express")
     assert isinstance(provider, StatelessMTLLM)

@@ -117,8 +117,10 @@ def test_build_tts_provider_session_voice_filters_local_qwen3(monkeypatch):
     assert p2._resolve_voice() == "Cantonese_crisp_news_anchor_vv2"
 
 
-def test_build_llm_provider_mt_branch(monkeypatch):
-    """MT_LLM_BASE_URL 有值 → StatelessMTLLM 包 MlxLlmLLM(:1236) + 官方推荐采样。"""
+def test_build_llm_provider_mt_branch(monkeypatch, tmp_path):
+    """MT_LLM_BASE_URL 有值 + model 为真实本地绝对路径 → StatelessMTLLM 包 MlxLlmLLM(:1236)
+    + 官方推荐采样。(repo-id 等非本地路径会被 mlx_lm server 挂死,已由 _mt_model_valid
+    门禁拦下走回退——见 test_mt_model_guard.py。)"""
     from agent_runtime.providers.livekit_plugins import MlxLlmLLM, StatelessMTLLM
 
     for key in (
@@ -131,8 +133,10 @@ def test_build_llm_provider_mt_branch(monkeypatch):
         "LLM_MAX_TOKENS",
     ):
         monkeypatch.delenv(key, raising=False)
+    mt_model = tmp_path / "Hy-MT2-8bit"
+    mt_model.mkdir()
     monkeypatch.setenv("MT_LLM_BASE_URL", "http://127.0.0.1:1236/v1")
-    monkeypatch.setenv("MT_LLM_MODEL", "mlx-community/Hy-MT2-1.8B-Abliterated-8bit")
+    monkeypatch.setenv("MT_LLM_MODEL", str(mt_model))
 
     provider = interpret._build_llm_provider({}, "cantonese")
     assert isinstance(provider, StatelessMTLLM)
@@ -142,7 +146,7 @@ def test_build_llm_provider_mt_branch(monkeypatch):
     assert isinstance(inner, MlxLlmLLM)
     # base_url 落在官方内芯的 AsyncClient 上（_opts 不存它;httpx 会补尾斜杠）。
     assert str(inner._client.base_url).rstrip("/") == "http://127.0.0.1:1236/v1"
-    assert inner._opts.model == "mlx-community/Hy-MT2-1.8B-Abliterated-8bit"
+    assert inner._opts.model == str(mt_model)
     # 官方推荐采样经 env 落进 extra_body（MlxLlmLLM 构造时读）。
     body = inner._opts.extra_body or {}
     assert body["top_p"] == 0.6

@@ -277,6 +277,13 @@ class MlxLlmLLM(_OpenAICompatBase):
         # only a last-resort placeholder when no env/settings provide one.
         if model in (None, "", "local"):
             model = os.environ.get("MLX_LLM_MODEL") or "local"
+        if model == "local":
+            # 占位符发 server 会被当 repo-id 走 HF hub 解析,断网时持锁挂死整个
+            # server——A 线正常装配恒解析出真实路径,落到占位符即装配配置异常。
+            print(
+                "[mlx-llm] WARNING: model placeholder 'local' — server may hang on HF resolution",
+                flush=True,
+            )
         extra_body = {
             "max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "160")),
             # Qwen3 对话模板以 <|im_end|> 收尾:唔传 stop 个 server 会当文字输出

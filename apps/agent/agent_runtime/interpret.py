@@ -28,6 +28,7 @@ import os
 import re
 import time
 from collections import deque
+from pathlib import Path
 
 
 def _norm_lang(raw: str, default: str = "zh") -> str:
@@ -257,6 +258,16 @@ def _sidecar_url(cfg_value: str, env_key: str, default: str) -> str:
     return (cfg_value or os.environ.get(env_key) or default).rstrip("/")
 
 
+def _mt_model_valid(p: str) -> bool:
+    """MT 模型路径门禁(纯函数,单测直喂):必须是真实存在的本地绝对路径。
+
+    mlx_lm server 收到 repo-id/占位符等非本地路径会当 HF hub id 解析,断网时
+    持锁挂死整个 server(B 线同传 2/8 FAIL 实弹,MT :1236 全灭)——非绝对路径
+    或不在盘一律 False,装配侧跳过 MT 分支走既有回退链。"""
+    path = Path((p or "").strip())
+    return path.is_absolute() and path.exists()
+
+
 def _build_llm_provider(llm_cfg: dict, target_lang: str, glossary: str = ""):
     """组装 B 线翻译 LLM:MT 小模型(:1236)优先,回退 DeepSeek 云端 / 主 LLM(:1235)。
 
@@ -264,13 +275,17 @@ def _build_llm_provider(llm_cfg: dict, target_lang: str, glossary: str = ""):
     构造时读进 extra_body;StatelessMTLLM 负责逐句无状态模板化,glossary 非空时
     进 _mt_prompt 术语槽(会话级常量,前缀稳定)。回退开关 = unset MT_LLM_BASE_URL,
     老 DeepSeek/主 LLM 路径原样保留(术语一致性由 instructions 的 glossary 行兜)。
+    MT_LLM_MODEL 须经 _mt_model_valid(本地绝对路径且在盘)才进 MT 分支——非法值
+    原样透传会让 mlx_lm server 挂死,跳过 MT 走回退链 + 日志留值。
     """
     from .providers.livekit_plugins import DeepSeekLLM, MlxLlmLLM, StatelessMTLLM
 
     mt_base = os.environ.get("MT_LLM_BASE_URL", "").strip()
-    if mt_base:
+    mt_model = os.environ.get("MT_LLM_MODEL", "").strip()
+    if mt_base and _mt_model_valid(mt_model):
         # Hy-MT2 官方推荐采样:temperature 0.7 / top_p 0.6 / top_k 20 / 重复惩罚
-        # 1.05——翻译要贴原文,采样收窄防小模型自由发挥/复读。
+        # 1.05——翻译要贴原文,采样收窄防小模型自由发挥/复读。(只在 MT 真正生效
+        # 时 setdefault:非法 model 跳 MT 走回退时,采样档唔好污染主 LLM。)
         os.environ.setdefault("LLM_TEMPERATURE", "0.7")
         os.environ.setdefault("LLM_TOP_P", "0.6")
         os.environ.setdefault("LLM_TOP_K", "20")
@@ -282,11 +297,17 @@ def _build_llm_provider(llm_cfg: dict, target_lang: str, glossary: str = ""):
         # scripts/probe_interpret_latency.py 实测后再定默认。
         context_turns = int(os.environ.get("BOK_INTERP_MT_CONTEXT", "0") or 0)
         return StatelessMTLLM(
-            MlxLlmLLM(base_url=mt_base, model=os.environ.get("MT_LLM_MODEL", "")),
+            MlxLlmLLM(base_url=mt_base, model=mt_model),
             target_lang,
             glossary=glossary,
             context_turns=context_turns,
         )
+
+    if mt_base:
+        # 挂死防线:base 有值但 model 非法(repo-id/占位符/空)——跳过 MT 走既有
+        # 回退链(DeepSeek/主 LLM 原逻辑不动),日志留值方便查 env(超 60 字截断)。
+        shown = mt_model[:60] + ("…" if len(mt_model) > 60 else "")
+        print(f"[interp] mt model invalid ('{shown}') — fallback main LLM", flush=True)
 
     if (llm_cfg.get("provider") or "local_openai") == "deepseek" and (
         llm_cfg.get("api_key") or os.environ.get("DEEPSEEK_API_KEY")
