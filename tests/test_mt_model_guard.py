@@ -12,7 +12,8 @@ import os
 
 from agent_runtime import interpret
 
-# 官方推荐采样 env（MT 分支 setdefault；跳 MT 档不得执行）。
+# 官方推荐采样 env（MT 分支经 MlxLlmLLM 构造参数下发、唔写进程 env——评审 P2-3；
+# 跳 MT 档同样唔得沾这些键，采样档属 MT 专有唔好污染回退主 LLM）。
 _MT_SAMPLING_ENVS = ("LLM_TEMPERATURE", "LLM_TOP_P", "LLM_TOP_K", "LLM_REPETITION_PENALTY")
 
 _MT_ENV_KEYS = ("MT_LLM_BASE_URL", "MT_LLM_MODEL", "MLX_LLM_MODEL") + _MT_SAMPLING_ENVS
@@ -34,8 +35,8 @@ def test_build_llm_provider_invalid_mt_model_falls_back(monkeypatch, tmp_path, c
     """base 有值但 model 非法（repo-id/空）→ 唔走 MT，落既有回退链。
 
     DeepSeek 回退可能因缺 key 再落主 LLM 分支——只断言「不是 MT 内芯」，
-    唔钉死具体回退档。采样 setdefault 只在 MT 真正生效时执行，非法跳过档
-    唔得污染回退 LLM。"""
+    唔钉死具体回退档。采样档只在 MT 真正生效时经构造参数下发（唔写 env），
+    非法跳过档唔得污染回退 LLM。"""
     from agent_runtime.providers.livekit_plugins import StatelessMTLLM
 
     for key in _MT_ENV_KEYS:

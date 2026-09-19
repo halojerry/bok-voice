@@ -147,12 +147,50 @@ def test_build_llm_provider_mt_branch(monkeypatch, tmp_path):
     # base_url 落在官方内芯的 AsyncClient 上（_opts 不存它;httpx 会补尾斜杠）。
     assert str(inner._client.base_url).rstrip("/") == "http://127.0.0.1:1236/v1"
     assert inner._opts.model == str(mt_model)
-    # 官方推荐采样经 env 落进 extra_body（MlxLlmLLM 构造时读）。
+    # 官方推荐采样经构造参数落进 extra_body/温度（评审 P2-3:唔再写进程 env——
+    # setdefault 会跨会话驻留,MT 失效落回主 LLM 时采样档跟着泄漏）。
+    body = inner._opts.extra_body or {}
+    assert body["top_p"] == 0.6
+    assert body["top_k"] == 20 and isinstance(body["top_k"], int)
+    assert body["repetition_penalty"] == 1.05
+    assert inner._opts.temperature == 0.7
+    # 四键不得出现在进程 env（泄漏防线,monkeypatch 终了自动还原）。
+    for key in ("LLM_TEMPERATURE", "LLM_TOP_P", "LLM_TOP_K", "LLM_REPETITION_PENALTY"):
+        assert key not in os.environ
+
+
+def test_build_llm_provider_mt_env_override(monkeypatch, tmp_path):
+    """用户显式 env 优先于 MT 推荐默认（保持旧行为）,但同样唔写回 env。
+
+    LLM_TEMPERATURE=0.1 → 内芯温度 0.1;未设的其余三键仍落 MT 推荐档。"""
+    from agent_runtime.providers.livekit_plugins import MlxLlmLLM, StatelessMTLLM
+
+    for key in (
+        "MT_LLM_BASE_URL",
+        "MT_LLM_MODEL",
+        "LLM_TOP_P",
+        "LLM_TOP_K",
+        "LLM_REPETITION_PENALTY",
+        "LLM_TEMPERATURE",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    mt_model = tmp_path / "Hy-MT2-8bit"
+    mt_model.mkdir()
+    monkeypatch.setenv("MT_LLM_BASE_URL", "http://127.0.0.1:1236/v1")
+    monkeypatch.setenv("MT_LLM_MODEL", str(mt_model))
+    monkeypatch.setenv("LLM_TEMPERATURE", "0.1")
+
+    provider = interpret._build_llm_provider({}, "cantonese")
+    assert isinstance(provider, StatelessMTLLM)
+    inner = provider._inner
+    assert isinstance(inner, MlxLlmLLM)
+    assert inner._opts.temperature == 0.1
     body = inner._opts.extra_body or {}
     assert body["top_p"] == 0.6
     assert body["top_k"] == 20
     assert body["repetition_penalty"] == 1.05
-    assert os.environ["LLM_TEMPERATURE"] == "0.7"
+    # 显式 env 同样唔落进程 env 残留。
+    assert "LLM_TOP_P" not in os.environ
 
 
 def test_build_llm_provider_mt_unset_or_empty_falls_back(monkeypatch):

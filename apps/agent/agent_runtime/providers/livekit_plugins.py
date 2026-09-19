@@ -263,6 +263,10 @@ class MlxLlmLLM(_OpenAICompatBase):
     解析、APIError 重试、error 事件、TTFT/usage 官方 metrics；原先手写的流解析/
     重试/秒表已删。stop/max_tokens 走 extra_body（本地服务吃经典参数，不吃新的
     max_completion_tokens）；温度 LLM_TEMPERATURE 默认 0.35（4B 小模型防飘/复读）。
+
+    采样档显式传参（temperature/top_p/top_k/repetition_penalty）优先，None 回落
+    env 现状——调用方（B 线 MT 分支）显式传值时不再依赖写进程 env 下发（评审
+    P2-3：env setdefault 会在同 worker 跨会话驻留，泄漏给回退主 LLM）。
     """
 
     provider = "mlx"
@@ -272,6 +276,10 @@ class MlxLlmLLM(_OpenAICompatBase):
         api_key="mlx",
         model=None,
         base_url="http://127.0.0.1:1235/v1",
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        repetition_penalty: float | None = None,
     ):
         # mlx_lm server requires the real model path in requests; "local" is
         # only a last-resort placeholder when no env/settings provide one.
@@ -290,14 +298,17 @@ class MlxLlmLLM(_OpenAICompatBase):
             # (转录/TTS 见住 <|im_end|>),喺源头截停最干净;下游再剥多一重保险。
             "stop": ["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
         }
-        # 定制采样(env 未设时不进请求,A 线默认路径零变化):B 线 MT 档要
-        # top_p/top_k/重复惩罚收窄采样,防翻译小模型自由发挥/复读。top_k 收
-        # 整数(mlx_lm server 按 int 校验),其余收浮点。
-        for key, env_key in (
-            ("top_p", "LLM_TOP_P"),
-            ("top_k", "LLM_TOP_K"),
-            ("repetition_penalty", "LLM_REPETITION_PENALTY"),
+        # 定制采样(显式传参直接进 extra_body;None 回落 env,env 未设不进请求,
+        # A 线默认路径零变化):B 线 MT 档要 top_p/top_k/重复惩罚收窄采样,防翻译
+        # 小模型自由发挥/复读。top_k 收整数(mlx_lm server 按 int 校验),其余收浮点。
+        for key, env_key, explicit in (
+            ("top_p", "LLM_TOP_P", top_p),
+            ("top_k", "LLM_TOP_K", top_k),
+            ("repetition_penalty", "LLM_REPETITION_PENALTY", repetition_penalty),
         ):
+            if explicit is not None:
+                extra_body[key] = int(explicit) if key == "top_k" else float(explicit)
+                continue
             raw = os.environ.get(env_key, "").strip()
             if not raw:
                 continue
@@ -310,7 +321,9 @@ class MlxLlmLLM(_OpenAICompatBase):
             api_key=api_key,
             base_url=base_url
             or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
-            temperature=float(os.environ.get("LLM_TEMPERATURE", "0.35")),
+            temperature=float(
+                temperature if temperature is not None else os.environ.get("LLM_TEMPERATURE", 0.35)
+            ),
             extra_body=extra_body,
         )
         # BOK_LLM_MSG_DEBUG=1：逐请求消息指纹（sha1+长度+头尾片段），定位

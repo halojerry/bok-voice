@@ -268,15 +268,30 @@ def _mt_model_valid(p: str) -> bool:
     return path.is_absolute() and path.exists()
 
 
+def _mt_sampling(env_key: str, mt_default: float) -> float:
+    """MT 采样档解析(单测直喂):用户显式 env 优先,缺省/非法回落 MT 推荐值。
+
+    旧版用 os.environ.setdefault 下发采样档再由 MlxLlmLLM 构造时读回——同
+    worker 先服务过 MT 有效会话后 env 永久驻留,后续会话 MT 失效落回主 LLM
+    会带着 MT 采样档跑(主 LLM 期望 0.35,评审 P2-3 跨会话 env 泄漏)。现只在
+    构造参数处解析,唔写回进程 env。"""
+    raw = (os.environ.get(env_key) or "").strip()
+    try:
+        return float(raw) if raw else mt_default
+    except ValueError:
+        return mt_default
+
+
 def _build_llm_provider(llm_cfg: dict, target_lang: str, glossary: str = ""):
     """组装 B 线翻译 LLM:MT 小模型(:1236)优先,回退 DeepSeek 云端 / 主 LLM(:1235)。
 
-    MT 分支按官方 Hy-MT2 推荐采样收窄(setdefault 不抢用户显式 env),MlxLlmLLM
-    构造时读进 extra_body;StatelessMTLLM 负责逐句无状态模板化,glossary 非空时
-    进 _mt_prompt 术语槽(会话级常量,前缀稳定)。回退开关 = unset MT_LLM_BASE_URL,
-    老 DeepSeek/主 LLM 路径原样保留(术语一致性由 instructions 的 glossary 行兜)。
-    MT_LLM_MODEL 须经 _mt_model_valid(本地绝对路径且在盘)才进 MT 分支——非法值
-    原样透传会让 mlx_lm server 挂死,跳过 MT 走回退链 + 日志留值。
+    MT 分支按官方 Hy-MT2 推荐采样收窄,MlxLlmLLM 构造时显式传参(用户显式 env
+    优先、唔写回进程 env,防跨会话泄漏——见 _mt_sampling);StatelessMTLLM 负责
+    逐句无状态模板化,glossary 非空时进 _mt_prompt 术语槽(会话级常量,前缀稳定)。
+    回退开关 = unset MT_LLM_BASE_URL,老 DeepSeek/主 LLM 路径原样保留(术语一致
+    性由 instructions 的 glossary 行兜)。MT_LLM_MODEL 须经 _mt_model_valid(本地
+    绝对路径且在盘)才进 MT 分支——非法值原样透传会让 mlx_lm server 挂死,跳过
+    MT 走回退链 + 日志留值。
     """
     from .providers.livekit_plugins import DeepSeekLLM, MlxLlmLLM, StatelessMTLLM
 
@@ -284,12 +299,9 @@ def _build_llm_provider(llm_cfg: dict, target_lang: str, glossary: str = ""):
     mt_model = os.environ.get("MT_LLM_MODEL", "").strip()
     if mt_base and _mt_model_valid(mt_model):
         # Hy-MT2 官方推荐采样:temperature 0.7 / top_p 0.6 / top_k 20 / 重复惩罚
-        # 1.05——翻译要贴原文,采样收窄防小模型自由发挥/复读。(只在 MT 真正生效
-        # 时 setdefault:非法 model 跳 MT 走回退时,采样档唔好污染主 LLM。)
-        os.environ.setdefault("LLM_TEMPERATURE", "0.7")
-        os.environ.setdefault("LLM_TOP_P", "0.6")
-        os.environ.setdefault("LLM_TOP_K", "20")
-        os.environ.setdefault("LLM_REPETITION_PENALTY", "1.05")
+        # 1.05——翻译要贴原文,采样收窄防小模型自由发挥/复读。经构造参数显式下发
+        # (用户显式 env 优先),唔再用 env setdefault——那会在同 worker 跨会话驻留,
+        # MT 失效落回主 LLM 时采样档跟着泄漏(评审 P2-3)。
         print(f"[interp] llm=hy-mt2 base={mt_base}", flush=True)
         # 滚动上下文(默认 0=关,治代词/指代断裂的 A/B 档):非零=带最近 N 对
         # 「源→译」进 MT prompt 上文参考块(LLMA 式)。代价=参考段逐轮位移,
@@ -297,7 +309,14 @@ def _build_llm_provider(llm_cfg: dict, target_lang: str, glossary: str = ""):
         # scripts/probe_interpret_latency.py 实测后再定默认。
         context_turns = int(os.environ.get("BOK_INTERP_MT_CONTEXT", "0") or 0)
         return StatelessMTLLM(
-            MlxLlmLLM(base_url=mt_base, model=mt_model),
+            MlxLlmLLM(
+                base_url=mt_base,
+                model=mt_model,
+                temperature=_mt_sampling("LLM_TEMPERATURE", 0.7),
+                top_p=_mt_sampling("LLM_TOP_P", 0.6),
+                top_k=int(_mt_sampling("LLM_TOP_K", 20)),
+                repetition_penalty=_mt_sampling("LLM_REPETITION_PENALTY", 1.05),
+            ),
             target_lang,
             glossary=glossary,
             context_turns=context_turns,
