@@ -8,12 +8,15 @@ import time
 from typing import Optional
 
 from bok_voice_core.flow_graph import (
+    ACTION_NOTIFY_HUMAN,
     ACTION_PLAY_QA,
     FlowGraphDoc,
     FlowIntent,
     eligible_judge_intents,
     pick_graph_action,
 )
+# W4-T2 意向规则评估(挂断 disposition 覆盖+intent_code;共享契约主会话写死,只消费)
+from bok_voice_core.intent_rules import eval_intent_rules
 from bok_voice_core.policies import ProviderRegistry, ProviderState, select_session_manifest
 from bok_voice_core.testdata import is_test_object_name as _is_test_object_name
 from bok_voice_core.types import CallMode
@@ -497,6 +500,84 @@ async def _report_whatsapp_once(
         # (server 幂等,重複 POST 唔會造成重複爆閃)。
         reported.discard(key)
         print(f"[whatsapp] report failed, will retry on next signal: {exc!r}{tag}", flush=True)
+
+
+# ---- W4-T2 意向事实账本(2026-09-19,挂断评估):快照与评估纯函数,离线单测直连 ----
+# verdict 键字面量与 flow.py 常量同源(CONFIRM="confirm" 等);刻意用字面量保持纯
+# 函数零依赖——flow 常量若改名,tests/test_intent_agent.py 快照矩阵会红。
+_VERDICT_FACT_KEYS = {
+    "repeat": "repeat_count",
+    "refuse": "refuse_count",
+    "objection": "objection_count",
+    "confirm": "confirm_count",
+    "question": "question_count",
+}
+
+
+def _intent_facts_snapshot(
+    ledger: dict, wa_captured: bool, *, duration_s: int, step_max: int
+) -> dict:
+    """内存账本 → INTENT_FACTS 12 键快照(intent_rules.eval_intent_rules 输入)。
+
+    缺键一律归零/False——旧账本形状(未来加键)回放时保守不命中,绝不含糊。
+    """
+    counts = ledger.get("verdict_counts") or {}
+    snap: dict = {
+        "duration_s": int(duration_s),
+        "nudge_fired": int(ledger.get("nudge_fired") or 0),
+        "watchdog_fired": int(ledger.get("watchdog_fired") or 0),
+        "storm_rounds": int(ledger.get("storm_rounds") or 0),
+        "step_max": int(step_max),
+        "wa_captured": bool(wa_captured),
+        "graph_notifies": int(ledger.get("graph_notifies") or 0),
+    }
+    for verdict_name, fact_key in _VERDICT_FACT_KEYS.items():
+        snap[fact_key] = int(counts.get(verdict_name) or 0)
+    return snap
+
+
+def evaluate_intent_disposition(
+    facts: dict, rules: list, default_disposition: str
+) -> tuple[str, str]:
+    """挂断快照 × 规则集 → (final_disposition, intent_code)。
+
+    kill-switch BOK_INTENT_RULES=0 或无命中 → (default_disposition, "")——四个
+    既有收线调用点(REFUSE/FAREWELL/心跳/时长 fuse)未命中时逐字节同旧行为;
+    命中 → 规则 disposition 非空才覆盖,intent_code 恒带(规则只打码不覆盖时
+    disposition 仍走原值)。坏规则行由 eval_intent_rules 内部跳过。
+    """
+    if os.environ.get("BOK_INTENT_RULES", "1") != "1":
+        return default_disposition, ""
+    hit = eval_intent_rules(facts, rules or [])
+    if hit is None:
+        return default_disposition, ""
+    disposition = str(hit.get("disposition") or "") or default_disposition
+    return disposition, str(hit.get("intent_code") or "")
+
+
+async def _report_notify_once(
+    cp, call_id: str, binding_id: str, fired: set, facts: dict, *, where: str = ""
+) -> None:
+    """notify_human 打铃上报一次;失败或被取消都回滚 `fired` 键(照
+    _report_whatsapp_once 回滚语义,AGENTS.md ⑦)。
+
+    打铃不抢话:上报入队成功才烧 once + 记账 graph_notifies;CancelledError 是
+    BaseException,`except Exception` 接不住——teardown 掐杀在途请求时若无独立
+    捕获回滚,绑定被永久占用=这个求助信号永远不再补报。server 幂等(done 不降级
+    notified),重複 POST 唔會重複打鈴。
+    """
+    tag = f" (call {where})" if where else ""
+    try:
+        await cp.report_assist(call_id, status="notified", source="intent")
+    except asyncio.CancelledError:
+        fired.discard(binding_id)
+        raise
+    except Exception as exc:  # pragma: no cover - 上报失败唔阻通话
+        fired.discard(binding_id)
+        print(f"[flow-graph] notify report failed, will retry on next signal: {exc!r}{tag}", flush=True)
+        return
+    fired.add(binding_id)
+    facts["graph_notifies"] = int(facts.get("graph_notifies") or 0) + 1
 
 
 def _wa_accum_merge(stashed: str, incoming: str) -> str:
@@ -1860,6 +1941,17 @@ async def entrypoint(ctx):
     # 本通已捕获过号码(captured/captured_implicit 任一):之後 WhatsApp 步嘅純短應承
     # 唔再判 offered(確認輪鎖死→逐字重複根因,detect_whatsapp_signal 文檔)。
     _wa_captured: dict = {"on": False}
+    # W4-T2 意向事实账本(2026-09-19):逐埋点累加(nudge/watchdog/storm/verdict/
+    # graph notify),挂断时 _intent_facts_snapshot 快照评估意向规则——verdict 计数
+    # 只在 agent 内存账本(方案 A),/end 带 intent_code+disposition 覆盖。
+    _facts: dict = {
+        "nudge_fired": 0,
+        "watchdog_fired": 0,
+        "storm_rounds": 0,
+        "graph_notifies": 0,
+        "verdict_counts": {},
+        "t_start_wall": time.time(),  # 挂断时长=wall-clock 差(duration_s)
+    }
     # WA 号码碎片累积:客户逐位/逐段报号时暂存半截句(见 on_user_turn_completed
     # 内 _WA_ACCUM 注释)。text=暂存拼接,ts=最后一段时刻,task=超时 flush 任务。
     _wa_accum: dict = {"text": "", "ts": 0.0, "task": None}
@@ -2023,6 +2115,8 @@ async def entrypoint(ctx):
         await asyncio.sleep(delay)
         if closed.is_set() or agent.paused or _watchdog["disarmed"]:
             return
+        # W4-T2 意向账本:真触发才计数(拆弹/未武装不计)——「哑轮频发」信号。
+        _facts["watchdog_fired"] += 1
         print(
             f"[watchdog] no assistant audio {_response_watchdog_s():.0f}s after commit "
             f"-> force-interrupt + ack (call {room_name})",
@@ -2674,6 +2768,16 @@ async def entrypoint(ctx):
             print(f"[agent] qa fastpath load failed: {exc!r} (call {room_name})", flush=True)
     else:
         _qa_bump("disabled")  # env 关/无 TTS 缓存:无应答音频可播,快路整体关闭
+    # 意向规则(W4-T2):装配拉一次(两级行合并由 CP 出仓),挂断时评估 disposition
+    # 覆盖+intent_code。拉取失败/空表 → 挂断走原 disposition(零行为变化);
+    # BOK_INTENT_RULES=0 整闸关(评估与拉取都不跑)。
+    _intent_rules: list = []
+    if os.environ.get("BOK_INTENT_RULES", "1") == "1":
+        try:
+            _intent_rules = await cp.list_intent_rules(account_id=_ctx_account)
+        except Exception as exc:  # noqa: BLE001 - 规则库不可用零影响
+            _intent_rules = []
+            print(f"[agent] intent rules load failed: {exc!r} (call {room_name})", flush=True)
     # 会话首轮真实前缀预热（LLM_PREFIX_PREWARM，默认 1）——触发点在开场白之后
     # （见下方 greeting 块），这里只定義任务体。
     if _prefix_prewarm_enabled() and isinstance(_raw_llm, MlxLlmLLM) and instructions:
@@ -3016,27 +3120,48 @@ async def entrypoint(ctx):
     # 明确拒绝收尾:礼貌告别讲完(一句 TTS+余量)后主动结束通话——
     # end_call 置 ENDED 并断房,结算由 _on_close 幂等触发。
     # disposition: declined=客户拒绝 / no_response=静音收线(心跳两次无回应)。
-    _end_scheduled = {"on": False, "fired": False, "disposition": "declined"}
+    # intent_code=W4 意向规则命中码(空=未命中,请求 URL 与旧版逐字节相同)。
+    _end_scheduled = {"on": False, "fired": False, "disposition": "declined", "intent_code": ""}
 
     async def _fire_end_call(disposition: str) -> None:
         # 幂等:delayed task 与 shutdown 回调两边都可能触发,只放行第一发。
         if _end_scheduled["fired"]:
             return
         _end_scheduled["fired"] = True
-        await cp.end_call(call_id, disposition=disposition)
+        await cp.end_call(
+            call_id,
+            disposition=disposition,
+            intent_code=str(_end_scheduled.get("intent_code") or ""),
+        )
         print(f"[flow] call ended by agent ({disposition}) (call {room_name})", flush=True)
 
     def _schedule_call_end(delay: float = 14.0, disposition: str = "declined") -> None:
         if _end_scheduled["on"]:
             return
         _end_scheduled["on"] = True
-        _end_scheduled["disposition"] = disposition
+        # W4-T2 挂断意向评估:账本快照 × 规则集 → 规则命中才覆盖 disposition/带
+        # intent_code;未命中=(原 disposition, "")——REFUSE/FAREWELL/心跳/时长
+        # fuse 四调用点零语义变化。时长=挂断时 wall-clock 差。
+        _t_now = time.time()
+        _facts_snap = _intent_facts_snapshot(
+            _facts,
+            wa_captured=bool(_wa_captured["on"]),
+            duration_s=int(_t_now - float(_facts.get("t_start_wall") or _t_now)),
+            step_max=int(flow_ctrl.current or 0) + 1,
+        )
+        _final_disp, _intent_code = evaluate_intent_disposition(
+            _facts_snap, _intent_rules, disposition
+        )
+        _end_scheduled["disposition"] = _final_disp
+        _end_scheduled["intent_code"] = _intent_code
 
         async def _end():
             try:
                 await asyncio.sleep(delay)
-                await _fire_end_call(disposition)
-                print(f"[flow] delayed end task done ({disposition}) (call {room_name})", flush=True)
+                # 用账面 final disposition(规则覆盖后),唔用闭包原值——
+                # 二者仅在规则命中时不同,未命中逐字节同旧。
+                await _fire_end_call(_end_scheduled["disposition"])
+                print(f"[flow] delayed end task done ({_end_scheduled['disposition']}) (call {room_name})", flush=True)
             except Exception as exc:  # pragma: no cover - 已结束/断房失败都不致命
                 print(f"[flow] end_call skipped: {exc!r} (call {room_name})", flush=True)
 
@@ -3408,6 +3533,7 @@ async def entrypoint(ctx):
                     # 唔 raise——落穿回正常轮路径,本轮客户开口先拿真回复。
                 else:
                     _cancel_response_watchdog()  # 风暴静听=有意静默/短承接即出声
+                    _facts["storm_rounds"] += 1  # W4-T2 意向账本:静听轮消费(ack/listen 均)
                     _sm_rounds = int(_storm.get("rounds", 0))
                     if _verdict == "ack":
                         _ack = _starve_ack_line(language_state.lang)
@@ -3642,6 +3768,9 @@ async def entrypoint(ctx):
                     # verdict 进尾部:规则判定结果此前只用于推进、从不进提示词,
                     # 客户提问/答非所问时模型冇「该怎么答」指引 → 复读当前步。
                     flow_ctrl.last_verdict = verdict
+                    # W4-T2 意向账本:verdict 计数只进内存账本,挂断时评估规则。
+                    if verdict:
+                        _facts["verdict_counts"][verdict] = int(_facts["verdict_counts"].get(verdict, 0)) + 1
                     # 客户原话进尾部账本:渐进披露按 verdict+原话命中单分支
                     # (只给 verdict 时「问为什么赔/问什么时候到」同族分不开)。
                     flow_ctrl.last_user_text = user_text
@@ -3872,7 +4001,7 @@ async def entrypoint(ctx):
                 return True
 
             # ---- 话术图引擎(spec 2026-09-18;插在 say 直念步之后、QA 快路之前,
-            # precedence: REFUSE>DEFER>say>graph>QA 快路;BOK_FLOW_GRAPH=0 整闸,
+            # precedence: REFUSE>DEFER>say>graph[notify/jump/play]>QA 快路;BOK_FLOW_GRAPH=0 整闸,
             # 空图零成本零变化;closing 后收线优先——REFUSE 分支已置 closing 且
             # 唔 raise,图唔可以抢走告别轮(与 QA 快路 closing 旁路同源)----
             _gbinding = None
@@ -3946,6 +4075,22 @@ async def entrypoint(ctx):
                             f"step={_gtarget + 1}",
                             flush=True,
                         )
+                elif _gbinding.action == ACTION_NOTIFY_HUMAN:
+                    # W4-T2 notify_human 第三臂:打铃不抢话——CP assist 置 notified
+                    # (坐席台见「人工求助」),本轮 LLM 照常兜话,坐席旁听后手动接管;
+                    # **不 raise StopResponse**(jump 同构先例),落回后续 LLM 生成。
+                    # 上报 fire-and-forget,入队成功才烧 once/记 graph_notifies
+                    # (失败回滚 once,下一轮信号补报——_report_notify_once 文档)。
+                    _invalidate_stale_preemptive("人工协助已通知")
+                    print(f"FLOW_GRAPH notify binding={_gbinding.id}", flush=True)
+                    # provider 标记 assistant 轮(本轮仍由 LLM 生成,item_added 落库)
+                    _turn_origin["provider"] = "graph-notify"
+                    _spawn_report(
+                        _report_notify_once(
+                            cp, call_id, _gbinding.id, flow_ctrl.graph_fired, _facts,
+                            where=room_name,
+                        )
+                    )
                 else:  # play_qa:条目在场且音频已物化才播;miss 放行 LLM 不消耗 once
                     _ge = (
                         _qa_index.by_id(_gbinding.qa_id)
@@ -4227,6 +4372,7 @@ async def entrypoint(ctx):
                 _schedule_call_end(12.0, disposition="no_response")
                 return
             _nudge_state["count"] += 1
+            _facts["nudge_fired"] += 1  # W4-T2 意向账本:沉默心跳已发
             print(f"[heartbeat] silent {nudge_delay:.0f}s -> nudge {_nudge_state['count']}/{nudge_max} (call {room_name})", flush=True)
             try:
                 _turn_origin["gen"] = "script"  # 心跳补位=脚本直念

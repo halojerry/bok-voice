@@ -9,9 +9,9 @@
 --
 -- 生成日期: 2026-09-19
 -- 源镜像:   pgvector/pgvector:pg16
--- 源命令:   docker exec pg-ddl pg_dump -U postgres --schema-only --no-owner --no-privileges postgres
+-- 源命令:   docker exec pg-ddl-w4t1 pg_dump -U postgres --schema-only --no-owner --no-privileges postgres
 -- 回环校验: pgvector/pgvector:pg16 上应用本文件 + 重跑 build_engine() = 零 DDL 变更(生成时实测)
--- 规模:     CREATE TABLE 25 张 / CREATE INDEX 36 条 / 数据语句 0 条
+-- 规模:     CREATE TABLE 26 张 / CREATE INDEX 37 条 / 数据语句 0 条
 --           (--schema-only:正常应 0 条数据语句;带 DEFAULT/COMMENT 属 schema 本身)
 --
 -- 目标: 全新 Supabase(Postgres)项目首次引导。应用方式(Main 线程):
@@ -135,6 +135,8 @@ CREATE TABLE public.call_sessions (
     ended_at timestamp without time zone,
     duration_s integer DEFAULT 0 NOT NULL,
     node_id character varying(64) DEFAULT ''::character varying NOT NULL,
+    assist_status character varying(16) DEFAULT ''::character varying NOT NULL,
+    intent_code character varying(32) DEFAULT ''::character varying NOT NULL,
     created_at timestamp without time zone NOT NULL
 );
 
@@ -266,6 +268,24 @@ CREATE TABLE public.global_settings (
     campaign_json text DEFAULT ''::text NOT NULL,
     policy character varying(64) NOT NULL,
     updated_at timestamp without time zone NOT NULL
+);
+
+
+--
+-- Name: intent_rules; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.intent_rules (
+    id character varying(64) NOT NULL,
+    account_id character varying(64) NOT NULL,
+    name character varying(64) NOT NULL,
+    intent_code character varying(32) NOT NULL,
+    label character varying(64) NOT NULL,
+    disposition character varying(32) NOT NULL,
+    conditions_json text DEFAULT '[]'::text NOT NULL,
+    priority integer DEFAULT 10 NOT NULL,
+    enabled boolean NOT NULL,
+    created_at timestamp without time zone NOT NULL
 );
 
 
@@ -633,6 +653,14 @@ ALTER TABLE ONLY public.global_settings
 
 
 --
+-- Name: intent_rules intent_rules_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.intent_rules
+    ADD CONSTRAINT intent_rules_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: knowledge_chunks knowledge_chunks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -834,6 +862,13 @@ CREATE INDEX ix_conversation_templates_account_id ON public.conversation_templat
 --
 
 CREATE INDEX ix_filler_entries_account_id ON public.filler_entries USING btree (account_id);
+
+
+--
+-- Name: ix_intent_rules_account_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_intent_rules_account_id ON public.intent_rules USING btree (account_id);
 
 
 --

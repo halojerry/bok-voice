@@ -1067,6 +1067,8 @@ _FORWARD_ENV = (
     # —— 话术图引擎 + QA 命中语义 ——
     "BOK_FLOW_GRAPH",
     "BOK_FLOW_GRAPH_JUDGE",
+    # —— 意向规则挂断评估(W4-T2,2026-09-19:0=关,挂断走原 disposition) ——
+    "BOK_INTENT_RULES",
     "BOK_QA_ROTATION",
     "BOK_QA_PRIORITY",
     "BOK_QA_FASTPATH",

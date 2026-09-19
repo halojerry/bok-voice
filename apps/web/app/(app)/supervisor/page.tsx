@@ -12,6 +12,8 @@ type CallRow = Record<string, unknown> & { id?: string; call_id?: string; status
 type TurnRow = Record<string, unknown>;
 
 const PENDING_WA = ["offered", "captured"];
+/** 人工求助 pending（W4 notify_human/WA 打铃共用呈现链）：assist_status='notified' 即待处理。 */
+const assistPending = (c: CallRow) => String(c.assist_status ?? "") === "notified";
 const LANG_LABEL: Record<string, string> = { zh: "中文", cantonese: "粤语", en: "英语" };
 /** 实时字段（话术步/最近一句）每条通话要拉一次 turns，设上限防 N 路打爆 CP。 */
 const MAX_ENRICH = 8;
@@ -136,7 +138,9 @@ export default function SupervisorPage() {
   // 避免水合 mismatch（同 sidebar.tsx 的存储偏好模式）。
   const [bellOn, setBellOn] = useState(true);
   // 打铃账本：上一帧 whatsapp_status 快照 + 已响铃键（callId:状态），防同一次跳变重复响。
+  // assist 维度同款：上一帧 assist_status 快照（响铃键 `${id}:assist:notified` 与 WA 同账本）。
   const waPrevRef = useRef<Map<string, string>>(new Map());
+  const assistPrevRef = useRef<Map<string, string>>(new Map());
   const belledRef = useRef<Set<string>>(new Set());
 
   const refresh = useCallback(async () => {
@@ -267,32 +271,45 @@ export default function SupervisorPage() {
   const waNum = (c: CallRow) => String(c.customer_whatsapp ?? "");
 
   const pending = rows.filter((c) => PENDING_WA.includes(waStatus(c)));
+  const assistRows = rows.filter(assistPending);
   const activeCount = rows.filter((c) => String(c.status ?? "active") === "active").length;
   const pausedCount = rows.length - activeCount;
 
-  // 跳变检测：whatsapp_status 进入 PENDING_WA（含首帧即 pending）或 offered→captured 升级 → 打铃一次。
+  // 跳变检测：whatsapp_status 进入 PENDING_WA（含首帧即 pending）或 offered→captured 升级，
+  // 或 assist_status 变 notified（含首帧）→ 打铃一次。两条铃共用同一次蜂鸣与账本。
   // 已知局限：4s 轮询窗内挂断的通话已不在 active-calls 里（漏铃）+ 后台标签页轮询被浏览器节流；
-  // 名册页（/calls）是持久兜底，根治在后续 assist 列。
+  // 名册页（/calls）是持久兜底。
   useEffect(() => {
     const prev = waPrevRef.current;
+    const assistPrev = assistPrevRef.current;
     const belled = belledRef.current;
     const seen = new Set<string>();
+    const ring = (key: string, statusZh: string, c: CallRow) => {
+      if (belled.has(key)) return;
+      // 铃关时跳变检测照跑、不积累响铃账本（重开不补响旧跳变）
+      if (!bellOn) return;
+      belled.add(key); // 每 callId 每个到达状态只响一次
+      playCaptureBell();
+      notifyCapture(labelOf(c), statusZh);
+    };
     for (const c of rows) {
       const id = idOf(c);
       if (!id) continue;
       seen.add(id);
+      // WA 维度：进入 pending 或 offered→captured 升级
       const st = waStatus(c);
       const old = prev.get(id) ?? "";
       prev.set(id, st);
       const entered = PENDING_WA.includes(st) && !PENDING_WA.includes(old);
       const upgraded = old === "offered" && st === "captured";
-      const key = `${id}:${st}`;
-      if (!(entered || upgraded) || belled.has(key)) continue;
-      // 铃关时跳变检测照跑、不积累响铃账本（重开不补响旧跳变）
-      if (!bellOn) continue;
-      belled.add(key); // 每 callId 每个到达状态只响一次
-      playCaptureBell();
-      notifyCapture(labelOf(c), WA_STATUS_ZH[st] ?? st);
+      if (entered || upgraded) ring(`${id}:${st}`, WA_STATUS_ZH[st] ?? st, c);
+      // assist 维度：非 notified → notified（含首帧即 notified）
+      const assistSt = assistPending(c) ? "notified" : "";
+      const assistOld = assistPrev.get(id) ?? "";
+      assistPrev.set(id, assistSt);
+      if (assistSt === "notified" && assistOld !== "notified") {
+        ring(`${id}:assist:notified`, "人工求助", c);
+      }
     }
     // 通话从列表消失：清理快照与响铃账本，防泄漏与复活误响
     for (const gone of [...prev.keys()]) {
@@ -300,6 +317,8 @@ export default function SupervisorPage() {
       prev.delete(gone);
       belled.delete(`${gone}:offered`);
       belled.delete(`${gone}:captured`);
+      belled.delete(`${gone}:assist:notified`);
+      assistPrev.delete(gone);
     }
   }, [rows, bellOn, labelOf, waStatus]);
 
@@ -362,6 +381,9 @@ export default function SupervisorPage() {
         <span className="card px-4 py-2">
           WhatsApp 待对接 <b className={pending.length ? "text-(--live)" : "muted"}>{pending.length}</b>
         </span>
+        <span className="card px-4 py-2">
+          人工求助 <b className={assistRows.length ? "text-amber-700" : "muted"}>{assistRows.length}</b>
+        </span>
         <label className="card flex cursor-pointer select-none items-center gap-2 px-4 py-2">
           <input type="checkbox" className="accent-(--live)" checked={bellOn} onChange={toggleBell} />
           捕获提醒音
@@ -380,8 +402,8 @@ export default function SupervisorPage() {
         </div>
       )}
 
-      {/* WhatsApp 對接橫幅區:有待對接 call 先顯示,撳「已對接」就收起 */}
-      {pending.length > 0 && (
+      {/* 待處理橫幅區（WA 對接 ∪ 人工求助）:有待處理 call 先顯示;撳「已對接」/「接管」就收起 */}
+      {(pending.length > 0 || assistRows.length > 0) && (
         <section className="mb-6 space-y-3">
           {pending.map((c) => {
             const id = idOf(c);
@@ -425,6 +447,48 @@ export default function SupervisorPage() {
               </div>
             );
           })}
+          {/* 人工求助横幅（W4 notify_human）：amber 区分 WA；接管直调既有 takeover 确认链 */}
+          {assistRows.map((c) => {
+            const id = idOf(c);
+            const code = String(c.intent_code ?? "");
+            const alreadyTaken = Boolean(c.escalated_to_human);
+            return (
+              <div key={`assist-${id}`} className="wa-flash rounded-lg border border-amber-400 bg-(--card) p-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="text-sm font-semibold text-amber-700">
+                      🙋 人工求助
+                      {code && (
+                        <span className="ml-2 rounded-sm bg-amber-100 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-amber-700">
+                          {code}
+                        </span>
+                      )}
+                    </p>
+                    <p className="mt-1 text-sm text-(--foreground)">
+                      {labelOf(c)} <span className="muted">· {id}</span>
+                    </p>
+                    <p className="mt-0.5 text-xs muted">客户需要人工服务，AI 照常应答；坐席就位后接管。</p>
+                  </div>
+                  <div className="flex shrink-0 flex-wrap gap-2">
+                    {!alreadyTaken && (
+                      <button
+                        className="btn-primary text-xs"
+                        disabled={busy.startsWith(`${id}:`)}
+                        onClick={() =>
+                          confirmAct(c, "takeover", api.supervisorTakeover, `确认接管「${labelOf(c)}」？接管后 AI 停止自动应答。`)
+                        }
+                      >
+                        接管
+                      </button>
+                    )}
+                    <Link href={`/calls?call=${encodeURIComponent(id)}`} className="btn-ghost text-xs">
+                      进入工作台
+                    </Link>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
         </section>
       )}
 
@@ -455,6 +519,11 @@ export default function SupervisorPage() {
                         {waPending && (
                           <span className="ml-2 rounded-sm bg-(--live-soft) px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-(--live-ink)">
                             WhatsApp {wa === "captured" && waNum(c) ? waNum(c) : "待对接"}
+                          </span>
+                        )}
+                        {assistPending(c) && (
+                          <span className="ml-2 rounded-sm bg-amber-100 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-amber-700">
+                            人工求助
                           </span>
                         )}
                       </p>

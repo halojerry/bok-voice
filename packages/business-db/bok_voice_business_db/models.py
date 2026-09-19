@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, func
@@ -8,6 +9,10 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def uuid_hex() -> str:
+    return uuid.uuid4().hex
 
 
 class Base(DeclarativeBase):
@@ -147,6 +152,39 @@ class CallSession(Base):
     # /api/token 签发前校验其未吊销——root 熔断对「坐席 JWT 建单」路径同样生效。
     # ''=无绑定(单机全栈形态),行为零变化。server_default 与迁移 DDL 同形（DEFAULT ''）。
     node_id: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # 人工协助面(W4-T1,2026-09-19 意向规则引擎):''=无 / notified=已通知人工
+    # (WhatsApp 捕获顺手置入或 /api/calls/{id}/assist 打铃) / done=人工已接手
+    # (takeover 顺手置入或 assist done)。写者=CP 侧 whatsapp capture / assist /
+    # takeover 端点;幂等纪律:done 不降级 notified。server_default 与迁移 DDL 同形。
+    assist_status: Mapped[str] = mapped_column(String(16), default="", server_default="")
+    # 挂断意向码(W4-T2 agent 评估回写):挂断快照命中意向规则时随 end_call 落列,
+    # ''=未命中(默认 disposition 语义零变化)。
+    intent_code: Mapped[str] = mapped_column(String(32), default="", server_default="")
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class IntentRule(Base):
+    """意向规则（W4-T1，2026-09-19）：挂断评估的条件规则，命中 → intent_code/disposition。
+
+    两级作用域：account_id ''=全局行（admin/root 写）、账号行=话务员写；
+    读=两级行合并（``account_id IN ('', acct)``，owner_scope IN 同款先例）。
+    条件形状（fact/op/value，INTENT_FACTS 12 键）与评估纯函数见共享契约
+    packages/core/bok_voice_core/intent_rules.py（CLI/CP/agent 三方共用，CP 只消费）。
+    """
+
+    __tablename__ = "intent_rules"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=uuid_hex)
+    # ''=全局行 admin 写、账号行话务员写、读=两级行合并。
+    account_id: Mapped[str] = mapped_column(String(64), index=True, default="")
+    name: Mapped[str] = mapped_column(String(64), default="")
+    intent_code: Mapped[str] = mapped_column(String(32), default="")
+    label: Mapped[str] = mapped_column(String(64), default="")
+    disposition: Mapped[str] = mapped_column(String(32), default="")
+    # 条件数组 JSON（validate_conditions 严格轨校验后才落库）；坏 JSON 读侧=空数组。
+    conditions_json: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
+    # 小者先（与 qa_entries.priority 同约定）；eval 侧 (priority, id) 升序取首条命中。
+    priority: Mapped[int] = mapped_column(Integer, default=10, server_default="10")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 

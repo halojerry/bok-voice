@@ -179,7 +179,7 @@ function clampInt(value: number, min: number, max: number): number {
  *  被 deriveGraph 钳到末步、显示成一条误导性的边，故进编辑器先归一到合法区间）。 */
 type BindingDraft = {
   id: string;
-  action: "play_qa" | "jump_step";
+  action: "play_qa" | "jump_step" | "notify_human";
   qa_id: string;
   step: number;
   /** 追问链（Phase 3.3）：0=不跳（仅 play_qa 有意义；jump_step 行恒 0，落库也不写键）。 */
@@ -190,7 +190,9 @@ type BindingDraft = {
 };
 
 function bindingToDraft(b: GraphBinding, stepCount: number): BindingDraft {
-  const action = b.action === "jump_step" ? "jump_step" : "play_qa";
+  // notify_human（W4）原样带；存量坏 action 落 play_qa（宽容解析与画布同款）。
+  const action =
+    b.action === "jump_step" ? "jump_step" : b.action === "notify_human" ? "notify_human" : "play_qa";
   return {
     id: b.id,
     action,
@@ -1273,7 +1275,7 @@ export default function QaPage() {
  * 意图编辑器模态(话术图 Phase 2 Task 8)。
  *
  * 受控表单:名称 / 关键词(逗号分隔 ↔ 数组) / 生效步骤(全程 checkbox + 步号 chips,1-based) /
- * 绑定列表(动作 play_qa→选快答条目, jump_step→选步号；每行优先级/只执行一次/启用/删除) /
+ * 绑定列表(动作 play_qa→选快答条目, jump_step→选步号, notify_human→无参数；每行优先级/只执行一次/启用/删除) /
  * 意图级启用 / 删除意图。确认=A. 空草稿放弃(B. 校验失败留窗报错) / C. 整图 PUT 落库。
  *
  * **Backspace 契约(必须保持)**:ReactFlow 的 deleteKeyCode 是 ["Backspace","Delete"],
@@ -1383,11 +1385,12 @@ function IntentEditorModal(props: {
     const nextBindings: GraphBinding[] = [];
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
+      // 三分校验（W4 notify_human 无负载=直接合法，不要求条目/步号）。
       if (row.action === "play_qa") {
         if (!qaRows.some((q) => String(q.id) === row.qa_id)) {
           return setError(`第 ${i + 1} 条绑定还没有选择要播的快答条目。`);
         }
-      } else if (stepCount < 1) {
+      } else if (row.action === "jump_step" && stepCount < 1) {
         return setError("该话术还没有步骤，无法使用「跳到某一步」。");
       }
       // 逐字段重建的唯一入口（勘误预检 4）：两种动作都走纯函数，页面不再自拼字段——
@@ -1551,12 +1554,17 @@ function IntentEditorModal(props: {
                       disabled={readOnly}
                       onChange={(e) =>
                         patchRow(row.id, {
-                          action: e.target.value === "jump_step" ? "jump_step" : "play_qa",
+                          action: e.target.value === "jump_step"
+                            ? "jump_step"
+                            : e.target.value === "notify_human"
+                              ? "notify_human"
+                              : "play_qa",
                         })
                       }
                     >
                       <option value="play_qa">播快答</option>
                       <option value="jump_step">跳到某步</option>
+                      <option value="notify_human">通知人工</option>
                     </select>
                     {row.action === "play_qa" ? (
                       <>
@@ -1596,7 +1604,7 @@ function IntentEditorModal(props: {
                           </label>
                         )}
                       </>
-                    ) : (
+                    ) : row.action === "jump_step" ? (
                       <select
                         className="select text-xs"
                         value={String(row.step)}
@@ -1611,6 +1619,9 @@ function IntentEditorModal(props: {
                           ))
                         )}
                       </select>
+                    ) : (
+                      // notify_human（W4）无负载：不要求条目/步号，专属编辑区整体隐藏。
+                      <span className="text-[11px] muted">无参数：提醒主管台，AI 照常应答。</span>
                     )}
                     <label className="flex items-center gap-1 text-[11px] muted">
                       优先级
