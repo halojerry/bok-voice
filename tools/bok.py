@@ -438,6 +438,47 @@ def _probe_llm(base_url: str = "http://127.0.0.1:1235/v1",
         return False, (f"FAIL ({exc}; >{timeout_s:.0f}s 疑似 wedge 或冷启动页入,重跑一次区分)")
 
 
+# 放宽健康探测的端口→HTTP 面映射（_relaxed_healthy 优先 HTTP 用）。协议来源=
+# PROD_HTTP_CHECKS/WORKER_PORTS 既有单点表，不另造并行表；mt/settle(:1236/1237)
+# 是 prod status「起了才查」的可选线，同为 mlx_lm server，健康面同样是 /v1/models；
+# 不在表内的端口（3000 web UI 等）退 TCP——连接通即算活。
+_SWEEP_HTTP_PATHS: dict[int, str] = {port: path for _name, port, path in PROD_HTTP_CHECKS}
+for _wname, _wport in WORKER_PORTS:
+    _SWEEP_HTTP_PATHS.setdefault(_wport, "/worker")
+_SWEEP_HTTP_PATHS.setdefault(1236, "/v1/models")
+_SWEEP_HTTP_PATHS.setdefault(1237, "/v1/models")
+
+
+def _relaxed_healthy(port: int, timeout_s: float = 5.0) -> bool:
+    """放宽超时（默认 5s）的健康探测：宿主 CPU 风暴/模型加载下 1s TCP 探测会
+    假死（2026-09-19 互杀事故），5s 窗口吸收调度延迟。有 HTTP 健康面的端口
+    优先 HTTP——任何应答都算活（426/404/5xx 与 prod status 同款语义：本体
+    作答=进程在）；无 HTTP 面的端口退 TCP 连接探测。"""
+    path = _SWEEP_HTTP_PATHS.get(port)
+    if path:
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=timeout_s):
+                pass
+            return True
+        except urllib.error.HTTPError:
+            return True  # 有 HTTP 应答=活（b-line :8790 无明文 /health 恒 426 同款）
+        except Exception:  # noqa: BLE001 - 探针只判定，不抛
+            return False
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
+
+
+def _ports_down_after_grace(targets, probe=None) -> list[int]:
+    """等待环超时前的宽松终检（纯函数便于单测）：对每个 target 用放宽超时逐口
+    复检一次，返回仍探不活的端口列表（空=其实全部健康，别急着宣判超时）。"""
+    if probe is None:
+        probe = _relaxed_healthy
+    return [p for p in targets if not probe(p)]
+
+
 def _repo_pythonpath() -> str:
     parts = [
         ROOT / "packages" / "core",
@@ -1034,7 +1075,15 @@ def cmd_up() -> int:
         # MT 是可选增强:主栈齐而独缺 mt 不拖垮整栈(B 线 interpret 回退主 LLM)。
         print("[bok] mt llm :1236 not ready — continue (B-line falls back to :1235)", file=sys.stderr)
         return 0
-    print("[bok] timeout waiting for services (see app-data/logs)", file=sys.stderr)
+    # 宽松终检（2026-09-19 互杀事故收编）：宿主 CPU 风暴下 1s TCP 探测可整轮
+    # 假死，180s 走完≠服务真死——宣判超时前逐口 5s 复检，全绿即 ready；仍有
+    # 真死端口才退出并列出缺口（便于排障）。退出会留下加载中的子代给下一轮
+    # serve 的孤儿清扫当孤儿杀（互杀循环根因），能不退就不退。
+    still_down = _ports_down_after_grace(targets)
+    if not still_down:
+        print(f"[bok] ready (relaxed recheck): asr=8787 tts=8788 llm=1235 b-line=8790{mt_ready_suffix}")
+        return 0
+    print(f"[bok] timeout waiting for services — still down: {still_down} (see app-data/logs)", file=sys.stderr)
     return 1
 
 
@@ -1496,7 +1545,14 @@ def cmd_serve() -> int:
                     pass
             return 0
         time.sleep(1)
-    print("[bok] timeout waiting for desktop stack (see app-data/logs)", file=sys.stderr)
+    # 宽松终检（2026-09-19 互杀事故收编）：CPU 风暴下 1s 探测可整轮假死，
+    # 120s 走完≠栈真死——逐口 5s 复检再宣判；serve 在这里退出会把健康子代
+    # 留给下一轮 serve 的孤儿清扫误杀（互杀循环根因），能不退就不退。
+    still_down = _ports_down_after_grace(targets)
+    if not still_down:
+        print("[bok] desktop ready (relaxed recheck): control-plane=8000 asr=8787 tts=8788 llm=1235 b-line=8790")
+        return 0
+    print(f"[bok] timeout waiting for desktop stack — still down: {still_down} (see app-data/logs)", file=sys.stderr)
     return 1
 
 
@@ -1619,9 +1675,14 @@ def _sweep_orphan_listeners(kill: bool = True) -> list[tuple[int, str, int]]:
     """端口级孤儿兜底（2026-09-17 殭尸专项）：按 bok 端口表逐口查 LISTEN 进程，
     命令行身份复核通过才收割；身份不符（他人物理占用）只报警不动手。
 
-    _sweep_orphan_workers 按命令行特征只能扫 agent_runtime/mock_callee 两类，
-    spawn 子进程与 sidecar/livekit/uvicorn 殘留是其盲区——「殭尸跑旧代码服务
-    新请求」的 A/B 污染由此而来。kill=False 只探测不动手（自检/测试用）。
+    健康即非孤儿（2026-09-19 互杀事故收编）：宿主 CPU 风暴（Parallels 141%）
+    下 serve 的 1s 健康探测假死 → 180s 等待超时退出、留下正在加载模型的健康
+    子代 → 下一轮 serve 本函数把它们当孤儿杀掉 → 互杀循环、栈永远起不来。
+    身份复核只证明「这是 bok 家的进程」，不证明它已死——现动手前先做一次
+    放宽超时（5s）的健康探测（_relaxed_healthy：有 HTTP 健康面走 HTTP、无的
+    退 TCP），探测健康 → 跳过收割（left alone），不健康才照旧收割；返回值
+    swept 只含真正收割的条目（left-alone 的不进）。
+    kill=False 只探测+报告不动手（健康的同样报 left alone；干跑/测试用）。
     Windows 明跳（同 _sweep_orphan_workers：无安全身份来源，宁可少清不误杀）。"""
     swept: list[tuple[int, str, int]] = []
     if os.name == "nt":
@@ -1650,6 +1711,12 @@ def _sweep_orphan_listeners(kill: bool = True) -> list[tuple[int, str, int]]:
                 cmd = ""
             if not any(m in cmd for m in markers):
                 print(f"[sweep] port {port}: pid {pid} 身份不符（{cmd[:80] or '未知'}），不动", file=sys.stderr)
+                continue
+            # 健康即非孤儿（2026-09-19 互杀事故）：动手前放宽超时（5s）复检一次，
+            # 活的放行——CPU 风暴下上一轮 serve 探测假死退出留下的健康子代，
+            # 不能在这里被当孤儿误杀。
+            if _relaxed_healthy(port):
+                print(f"[sweep] port {port}: pid {pid} healthy — left alone", file=sys.stderr)
                 continue
             swept.append((port, cmd[:60], pid))
             if not kill:
