@@ -259,6 +259,9 @@ export const api = {
   createTemplate: (body: unknown) => request<Record<string, unknown>>("/api/templates", { method: "POST", body: JSON.stringify(body) }),
   updateTemplate: (id: string, body: unknown) =>
     request<Record<string, unknown>>(`/api/templates/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  // 发布当前版本（W2 发布两态）：冻结当时 live 九键写 published_json；返回更新行（含派生 published/has_changes）。
+  publishTemplate: (id: string) =>
+    request<Record<string, unknown>>(`/api/templates/${id}/publish`, { method: "POST" }),
   deleteTemplate: (id: string) => request<Record<string, unknown>>(`/api/templates/${id}`, { method: "DELETE" }),
   listAudit: (accountId = "", action = "", callId = "") =>
     request<Record<string, unknown>[]>(

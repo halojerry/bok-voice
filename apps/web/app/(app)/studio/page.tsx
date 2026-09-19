@@ -12,7 +12,13 @@ import { parseGraphDoc, parseTemplateSteps } from "@/lib/qa-canvas";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
 import { hasPage, useSession } from "@/components/session-context";
-import TemplateEditor, { LANGS, toTemplateRow, type TemplateRow } from "@/components/template-editor";
+import TemplateEditor, {
+  LANGS,
+  PublishBadge,
+  toTemplateRow,
+  type TemplateRow,
+} from "@/components/template-editor";
+import FlowCanvas from "@/components/flow-canvas";
 
 // 通话行状态徽标（照 calls 页惯例搬一份,页面文件不可导入）。
 const CALL_STATUS: Record<string, [string, string]> = {
@@ -140,6 +146,8 @@ export default function StudioPage() {
 
   // ---- tab 切换（qa 页 view chips 同款写法）；学习报告 tab 仅对有 reports 键的人出现 ----
   const [tab, setTab] = useState("flow");
+  // 话术流程 tab 双视图（W2 流程画布）：表单=共用编辑器,画布=场景泳道+答法抽屉。
+  const [flowView, setFlowView] = useState<"form" | "canvas">("form");
   const tabs: [string, string][] = [
     ["flow", "话术流程"],
     ["intent", "意图与问答"],
@@ -306,6 +314,7 @@ export default function StudioPage() {
                       <div className="min-w-0">
                         <p className="flex flex-wrap items-center gap-2 font-medium">
                           {String(row.name ?? "-")}
+                          <PublishBadge row={row} />
                           <span
                             className={`rounded-sm px-1.5 py-0.5 text-[10px] font-normal ${
                               ownerId === "" ? "bg-muted muted" : "bg-sky-100 text-sky-700"
@@ -362,9 +371,26 @@ export default function StudioPage() {
             ))}
           </div>
 
-          {/* 1. 话术流程：共用编辑器（保存成功重拉模板行,各 tab 随之取到权威数据） */}
+          {/* 1. 话术流程：表单=共用编辑器 / 画布=场景泳道+答法抽屉（保存成功重拉模板行,各 tab 随之取到权威数据） */}
           {tab === "flow" && (
-            <TemplateEditor tpl={tplRow} onSaved={() => setTplRev((v) => v + 1)} />
+            <div className="space-y-2">
+              <div className="flex items-center gap-1">
+                {([["form", "表单"], ["canvas", "画布"]] as const).map(([k, label]) => (
+                  <button
+                    key={k}
+                    className={`btn-ghost text-xs ${flowView === k ? "border-(--live) text-(--live-ink)" : "muted"}`}
+                    onClick={() => setFlowView(k)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              {flowView === "form" ? (
+                <TemplateEditor tpl={tplRow} onSaved={() => setTplRev((v) => v + 1)} />
+              ) : (
+                <FlowCanvas tpl={tplRow} graph={graph} onSaved={() => setTplRev((v) => v + 1)} />
+              )}
+            </div>
           )}
 
           {/* 2. 意图与问答：只读摘要（编辑请进问答画布） */}

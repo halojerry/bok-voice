@@ -22,7 +22,7 @@ export type QaRow = {
   created_at?: string;
 };
 
-export type FlowStep = { goal: string; ref: string };
+export type FlowStep = { goal: string; ref: string; scene?: string };
 export type Pt = { x: number; y: number };
 
 // 三类节点 data 均带 `kind` 判别面（step/qaEntry/intent），CanvasNode 联合因此可判别。

@@ -3716,12 +3716,75 @@ def _validate_graph_field(raw: str) -> list[str]:
     return validate_flow_graph(str(raw))
 
 
+# ---- 模板发布两态(W2-T1,2026-09-19):保存=草稿、发布=冻结即生效 ----
+# 冻结 payload 九键(接口冻结):发布时按当时 live 值原样收进 published_json;
+# 「已发布」≡published_json 非空,「有未发布改动」≡九键逐一比对 live≠冻结
+# (服务端派生布尔,不落列——消灭 status 与快照的双列状态同步漂移)。
+_TEMPLATE_PUBLISH_KEYS = (
+    "steps_json",
+    "graph_json",
+    "hotwords",
+    "tone_override",
+    "opening",
+    "core",
+    "objection",
+    "closing",
+    "language",
+)
+
+
+def _template_published_flags(row: dict) -> dict:
+    """派生发布态布尔(单点助手,列表与详情共用):published + has_changes。
+
+    冻结 payload 解析失败/非 object 视为 has_changes=False(无法比对时保守报
+    「无改动」)且照常返回 published——坏快照不得炸掉读端点。"""
+    frozen_raw = str(row.get("published_json") or "")
+    published = bool(frozen_raw.strip())
+    has_changes = False
+    if published:
+        try:
+            frozen = json.loads(frozen_raw)
+        except Exception:
+            frozen = None
+        if isinstance(frozen, dict):
+            has_changes = any(
+                str(row.get(key) or "") != str(frozen.get(key) or "")
+                for key in _TEMPLATE_PUBLISH_KEYS
+            )
+    return {"published": published, "has_changes": has_changes}
+
+
+def _template_machine_overlay(row: dict) -> dict:
+    """机器通道 GET 详情 overlay:已发布模板把冻结九键覆盖进行 dict 后返回
+    (agent 建单装配恒吃发布冻结版,编辑中的 live 草稿不影响在途话术)。
+
+    payload 解析失败回退 live(宽容 try,不炸读路径);未发布(空串)原样返回。
+    人类通道不调用本函数——恒读 live。列表端点不 overlay。"""
+    frozen_raw = str(row.get("published_json") or "")
+    if not frozen_raw.strip():
+        return row
+    try:
+        frozen = json.loads(frozen_raw)
+    except Exception:
+        return row
+    if not isinstance(frozen, dict):
+        return row
+    merged = dict(row)
+    for key in _TEMPLATE_PUBLISH_KEYS:
+        if key in frozen:
+            merged[key] = frozen[key]
+    return merged
+
+
 @app.get("/api/templates")
 def list_templates(request: Request, account_id: str = "acc-001", owner_scope: str | None = None) -> list[dict]:
     # B3 owner 维度同 qa-entries：user=自己的+共享，admin/root/无身份不过滤。
     _gate_page(request, "templates")
     account_id = scoped_account(request, account_id)
-    return _repo().list_templates(account_id, owner_scope=owner_scope_filter(request, owner_scope))
+    return [
+        {**row, **_template_published_flags(row)}
+        for row in _repo().list_templates(account_id, owner_scope=owner_scope_filter(request, owner_scope))
+    ]
 
 
 @app.get("/api/templates/{template_id}")
@@ -3730,7 +3793,10 @@ def get_template(template_id: str, request: Request) -> dict:
     tpl = deny_foreign_owner(request, deny_cross_account(request, _repo().get_template(template_id)))
     if not tpl:
         raise HTTPException(404, "template not found")
-    return tpl
+    # 机器通道(agent 装配)恒吃发布冻结版;人类通道恒 live(编辑器要见草稿)。
+    if getattr(request.state, "machine", False):
+        tpl = _template_machine_overlay(tpl)
+    return {**tpl, **_template_published_flags(tpl)}
 
 
 @app.post("/api/templates")
@@ -3797,6 +3863,32 @@ def update_template(template_id: str, req: UpdateTemplateRequest, request: Reque
                 "changed": sorted(k for k in req.model_dump() if req.model_dump().get(k) not in (None, "") and before.get(k) != req.model_dump().get(k))},
     )
     return tpl
+
+
+@app.post("/api/templates/{template_id}/publish")
+def publish_template(template_id: str, request: Request) -> dict:
+    """发布=冻结当时 live 九键写 published_json(模板发布两态 W2-T1)。
+
+    闸链逐字与 PUT 同族:gate_page + deny_cross_account + deny_foreign_owner(edit)
+    ——共享基线只归 admin/root。PUT 永不触碰 published_json,发布是唯一写入口;
+    建单装配(agent 机器通道 GET)恒吃冻结版,草稿(live)随后怎么改都不影响在途话术。
+    """
+    _gate_page(request, "templates")
+    tpl = deny_foreign_owner(request, deny_cross_account(request, _repo().get_template(template_id)), edit=True)
+    if not tpl:
+        raise HTTPException(404, "template not found")
+    frozen = {key: str(tpl.get(key) or "") for key in _TEMPLATE_PUBLISH_KEYS}
+    updated = _repo().update_template(
+        template_id, {"published_json": json.dumps(frozen, ensure_ascii=False)}
+    )
+    _audit(
+        "template.publish",
+        subject_type="template",
+        subject_id=template_id,
+        account_id=updated.get("account_id", ""),
+        detail={"name": updated.get("name", ""), "language": frozen.get("language", "")},
+    )
+    return {**updated, **_template_published_flags(updated)}
 
 
 @app.get("/api/templates/{template_id}/revisions")

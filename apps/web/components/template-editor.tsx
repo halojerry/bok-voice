@@ -34,6 +34,9 @@ export type TemplateRow = {
   core?: string;
   objection?: string;
   closing?: string;
+  /** 发布两态派生布尔（W2，CP 列表/详情附)；旧 CP 行无此字段=undefined → 按「未发布」呈现。 */
+  published?: boolean;
+  has_changes?: boolean;
 };
 
 /** CP 裸 dict 行 → TemplateRow（防御式收窄；templates/studio 两页共用）。 */
@@ -52,6 +55,8 @@ export function toTemplateRow(row: Record<string, unknown>): TemplateRow {
     core: str(row.core),
     objection: str(row.objection),
     closing: str(row.closing),
+    published: row.published === true,
+    has_changes: row.has_changes === true,
   };
 }
 
@@ -80,6 +85,8 @@ export interface FlowStep {
   ref: string;
   say?: boolean;
   emotion?: string;
+  /** 场景（W2 流程画布泳道,纯分组不改推进语义）；缺失/空=""。表单 UI 不渲染,画布专属。 */
+  scene?: string;
 }
 
 type TplForm = {
@@ -107,18 +114,20 @@ const EMPTY_FORM: TplForm = {
 const STEPS_HINT = "可用变量:{姓名} {快递单号} {快递尾号} {物流公司} {收货地址}。\n参考说法是给 AI 的要点参考,不是逐字稿——AI 会结合客户原话用自己的话讲。\n勾选「直念」的步骤:进入该步的当轮 AI 逐字念参考说法首行,适合通知/道歉等要逐字一致的内容。\n直念步可选「情绪」:只在罐头物化时烧进音频(如致歉步选低沉柔和),实时生成的回复保持语气稳定不受影响;改情绪/参考说法后需重跑 tts-pregen。";
 
 /** 把 steps 序列化/反序列化为 steps_json(存库)。say 只在 true 时写出(省体积);
- * emotion 只在直念步且非空时写出(2026-09-16 罐头带情绪,pregen 物化烧进音频)。 */
+ * emotion 只在直念步且非空时写出(2026-09-16 罐头带情绪,pregen 物化烧进音频);
+ * scene 只在非空时写出(W2 画布泳道,旧数据无键零变化——往返不丢,画布保存键死)。 */
 export function stepsToJson(steps: FlowStep[]): string {
   return JSON.stringify(
     steps
       .filter((s) => s.goal.trim() || s.ref.trim())
       .map((s) => {
         const base = { goal: s.goal, ref: s.ref };
-        if (!s.say) return base;
+        if (!s.say) return s.scene ? { ...base, scene: s.scene } : base;
         return {
           ...base,
           say: 1,
           ...(s.emotion ? { emotion: s.emotion } : {}),
+          ...(s.scene ? { scene: s.scene } : {}),
         };
       }),
   );
@@ -137,6 +146,7 @@ export function jsonToSteps(raw: unknown): FlowStep[] {
           typeof (s as { emotion?: unknown }).emotion === "string"
             ? String((s as { emotion?: unknown }).emotion).toLowerCase()
             : "",
+        scene: typeof (s as { scene?: unknown }).scene === "string" ? String((s as { scene?: unknown }).scene) : "",
       }));
   } catch {
     return [];
@@ -252,6 +262,20 @@ export function parseStepsFromTable(text: string): { steps: FlowStep[]; error: s
   return { steps, error: "" };
 }
 
+/** 发布态徽标三态（W2，编辑器头部与 studio 列表行共用）：
+ * 行无 published 字段（旧 CP 兼容）或 false=灰「未发布」；published 且无改动=绿「已发布」；
+ * 有未发布改动=琥珀「有未发布改动」。行数据是 CP 裸 dict，字段按 unknown 防御收窄。 */
+export function PublishBadge(props: { row: { published?: unknown; has_changes?: unknown } }) {
+  const published = props.row.published === true;
+  const hasChanges = props.row.has_changes === true;
+  const [cls, label] = !published
+    ? ["bg-muted muted", "未发布"]
+    : hasChanges
+      ? ["bg-amber-100 text-amber-700", "有未发布改动"]
+      : ["bg-emerald-100 text-emerald-700", "已发布"];
+  return <span className={`rounded-sm px-1.5 py-0.5 text-[10px] font-normal ${cls}`}>{label}</span>;
+}
+
 export default function TemplateEditor(props: {
   /** 编辑的模板行；null/无 id = 新建态。 */
   tpl: TemplateRow | null;
@@ -273,6 +297,8 @@ export default function TemplateEditor(props: {
   const [tableMsg, setTableMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [ok, setOk] = useState(false);
+  const [pubErr, setPubErr] = useState<string | null>(null);
+  const [publishing, setPublishing] = useState(false);
 
   const tpl = props.tpl;
   const tplId = String(tpl?.id ?? "");
@@ -293,6 +319,7 @@ export default function TemplateEditor(props: {
     const saved = jsonToSteps(tpl?.steps_json);
     setSteps(saved.length > 0 ? saved : fourSectionsToSteps(f));
     setErr(null);
+    setPubErr(null);
     // 只跟 tpl.id 走：对象引用换新但同 id（保存后重拉）不重锚。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tplId]);
@@ -329,6 +356,22 @@ export default function TemplateEditor(props: {
       props.onSaved?.();
     } catch (e) {
       setErr(String(e));
+    }
+  }
+
+  /** 发布当前版本（W2）：confirm 后冻结当时 live 九键 → 外层 onSaved 重拉行刷新徽标。
+   * 只读（共享话术非主管）与新建态不出按钮——发布闸链与 PUT 同（CP 侧兜底）。 */
+  async function publish() {
+    if (!tplId || !window.confirm("发布后新通话将使用此版本？")) return;
+    setPublishing(true);
+    setPubErr(null);
+    try {
+      await api.publishTemplate(tplId);
+      props.onSaved?.();
+    } catch (e) {
+      setPubErr(String(e));
+    } finally {
+      setPublishing(false);
     }
   }
 
@@ -369,7 +412,20 @@ export default function TemplateEditor(props: {
 
   return (
     <section className="card space-y-3">
-      <span className="label">{editing ? "编辑模板" : "新建模板"}</span>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="label">{editing ? "编辑模板" : "新建模板"}</span>
+        {editing && (
+          <div className="flex items-center gap-2">
+            <PublishBadge row={tpl ?? {}} />
+            {!readOnly && (
+              <button className="btn-ghost px-2 py-0.5 text-xs" disabled={publishing} onClick={publish}>
+                {publishing ? "发布中…" : "发布当前版本"}
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+      {pubErr && <ErrorState message={pubErr} />}
       {readOnly && (
         <p className="rounded-lg bg-amber-50 px-3 py-2 text-[11px] text-amber-700">
           共享话术由主管维护；你可以查看但不能修改。

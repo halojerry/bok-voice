@@ -646,7 +646,9 @@ class SqlAlchemyBusinessRepository:
         tpl = self.session.get(models.ConversationTemplate, template_id)
         if not tpl:
             return None
-        allowed = {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json", "hotwords", "graph_json", "owner_user_id"}
+        # published_json(W2-T1 发布两态)只由 publish 端点写入;CP PUT 的 payload
+        # 经 UpdateTemplateRequest 过滤永不携带该键——白名单放行仅服务发布路径。
+        allowed = {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json", "hotwords", "graph_json", "owner_user_id", "published_json"}
         for key, value in data.items():
             if key in allowed and hasattr(tpl, key):
                 setattr(tpl, key, value)
@@ -1588,6 +1590,10 @@ class InMemoryBusinessRepository:
             graph_json=data.get("graph_json", ""),
             owner_user_id=data.get("owner_user_id") or "",
         ).__dict__
+        # 发布冻结快照(W2-T1):dataclass(types.py)未含该字段,以 dict 键补缺省
+        # ——与 SQL 列 published_json TEXT DEFAULT '' 同形(''=从未发布)。
+        # POST 建单永不携带(由 CP 层保证),此处兜底缺省防 KeyError。
+        tpl["published_json"] = data.get("published_json", "")
         self.templates[tpl["id"]] = tpl
         return tpl
 
@@ -1597,7 +1603,9 @@ class InMemoryBusinessRepository:
     def update_template(self, template_id: str, data: dict) -> dict | None:
         if template_id not in self.templates:
             return None
-        self.templates[template_id].update({k: v for k, v in data.items() if k in {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json", "hotwords", "graph_json", "owner_user_id"}})
+        # published_json(W2-T1)入白名单同 SQL 后端:仅供 publish 端点写冻结快照,
+        # CP PUT 的 payload 经 UpdateTemplateRequest 过滤永不携带。
+        self.templates[template_id].update({k: v for k, v in data.items() if k in {"account_id", "name", "opening", "core", "objection", "closing", "tone_override", "language", "steps_json", "hotwords", "graph_json", "owner_user_id", "published_json"}})
         return self.templates[template_id]
 
     def delete_template(self, template_id: str) -> bool:

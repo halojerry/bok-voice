@@ -57,6 +57,9 @@ class FlowStep:
     # bidi 中途换挡被服务端无视,运行时永不逐轮切(轮间语气稳定铁律);
     # 空=不下发,模型按文本自动匹配(与实时线同语义)。
     emotion: str = ""
+    # 场景分组(W2,纯数据位):模板 steps_json 可选 `scene` 字符串——画布泳道/
+    # 分幕命名跳转目标用,引擎推进语义零消费(缺省空串=未分组)。
+    scene: str = ""
 
 
 def parse_steps(steps_json: str) -> list[FlowStep]:
@@ -72,12 +75,15 @@ def parse_steps(steps_json: str) -> list[FlowStep]:
     out: list[FlowStep] = []
     for s in arr:
         if isinstance(s, dict):
+            # scene 宽容收键(W2):非 str/缺失→""(纯分组数据位,不碰引擎语义)。
+            _scene = s.get("scene")
             out.append(
                 FlowStep(
                     goal=str(s.get("goal") or ""),
                     ref=str(s.get("ref") or ""),
                     say=bool(s.get("say")),
                     emotion=str(s.get("emotion") or "").strip().lower(),
+                    scene=_scene if isinstance(_scene, str) else "",
                 )
             )
         elif isinstance(s, str):
