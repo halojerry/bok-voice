@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Check } from "lucide-react";
 import { api } from "@/lib/api";
 import { friendlyErrorText } from "@/lib/api-ready";
@@ -66,6 +66,63 @@ function currentStep(turns?: TurnRow[]): number {
   return 0;
 }
 
+// ===== 捕获提醒音（whatsapp_status 跳变打铃）=====
+const BELL_KEY = "bok_supervisor_bell";
+const WA_STATUS_ZH: Record<string, string> = {
+  captured: "已捕获号码",
+  offered: "愿意加联系方式",
+};
+
+// 提醒音：WebAudio 双音蜂鸣。AudioContext 必须等首次用户手势后才创建（浏览器自动播放策略），
+// suspended / 不可用则本次静默跳过不报错。
+let bellCtx: AudioContext | null = null;
+
+function unlockBellAudio() {
+  try {
+    if (typeof window === "undefined" || !("AudioContext" in window)) return;
+    if (!bellCtx) bellCtx = new AudioContext();
+    void bellCtx.resume().catch(() => {});
+  } catch {
+    /* 环境不支持 WebAudio——提醒音静默禁用 */
+  }
+}
+
+function bellTone(ctx: AudioContext, freq: number, startAt: number, durS: number) {
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = "sine";
+  osc.frequency.value = freq;
+  // gain 包络：快起音 + 收音到零，避免爆音
+  gain.gain.setValueAtTime(0.0001, startAt);
+  gain.gain.linearRampToValueAtTime(0.18, startAt + 0.015);
+  gain.gain.setValueAtTime(0.18, startAt + durS - 0.03);
+  gain.gain.linearRampToValueAtTime(0.0001, startAt + durS);
+  osc.connect(gain).connect(ctx.destination);
+  osc.start(startAt);
+  osc.stop(startAt + durS + 0.02);
+}
+
+function playCaptureBell() {
+  if (!bellCtx) return;
+  if (bellCtx.state !== "running") {
+    void bellCtx.resume().catch(() => {}); // 唤醒留到下一次手势生效，本次静默跳过
+    return;
+  }
+  const t0 = bellCtx.currentTime + 0.02;
+  bellTone(bellCtx, 660, t0, 0.12);
+  bellTone(bellCtx, 880, t0 + 0.14, 0.12);
+}
+
+/** 系统通知：只在用户已授权（granted）时发；绝不自动请求权限（请求只发生在提醒音开关关→开的点击里）。 */
+function notifyCapture(label: string, statusZh: string) {
+  try {
+    if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
+    new Notification("捕获提醒", { body: `${label} · ${statusZh}` });
+  } catch {
+    /* 通知失败静默，不影响提醒音 */
+  }
+}
+
 export default function SupervisorPage() {
   const { accountId } = useAccount();
   const [rows, setRows] = useState<CallRow[]>([]);
@@ -75,6 +132,12 @@ export default function SupervisorPage() {
   const [copied, setCopied] = useState<string | null>(null);
   const [listenId, setListenId] = useState<string | null>(null);
   const [busy, setBusy] = useState("");
+  // 捕获提醒音偏好：首帧用默认值（开，与 static export 的 HTML 一致），mount 后再读 localStorage，
+  // 避免水合 mismatch（同 sidebar.tsx 的存储偏好模式）。
+  const [bellOn, setBellOn] = useState(true);
+  // 打铃账本：上一帧 whatsapp_status 快照 + 已响铃键（callId:状态），防同一次跳变重复响。
+  const waPrevRef = useRef<Map<string, string>>(new Map());
+  const belledRef = useRef<Set<string>>(new Set());
 
   const refresh = useCallback(async () => {
     try {
@@ -91,6 +154,43 @@ export default function SupervisorPage() {
     const t = setInterval(refresh, 4000);
     return () => clearInterval(t);
   }, [refresh]);
+
+  // mount 后读存储偏好：显式 "0" 才算关（默认开，与键名语义一致）。
+  useEffect(() => {
+    try {
+      setBellOn(window.localStorage.getItem(BELL_KEY) !== "0");
+    } catch {
+      /* localStorage 不可用（隐私模式等）——保持默认开 */
+    }
+  }, []);
+
+  // 首次任意点击即解锁 AudioContext（音频上下文必须在用户手势后创建）。
+  useEffect(() => {
+    const unlock = () => unlockBellAudio();
+    document.addEventListener("click", unlock, { once: true });
+    return () => document.removeEventListener("click", unlock);
+  }, []);
+
+  // 开关点击（关→开）：顺带解锁提醒音；仅在此处、且权限还是 default 时问一次系统通知授权。
+  const toggleBell = () => {
+    const next = !bellOn;
+    setBellOn(next);
+    try {
+      window.localStorage.setItem(BELL_KEY, next ? "1" : "0");
+    } catch {
+      /* 存不进就只对本次会话生效 */
+    }
+    if (next) {
+      unlockBellAudio();
+      try {
+        if (typeof Notification !== "undefined" && Notification.permission === "default") {
+          void Notification.requestPermission();
+        }
+      } catch {
+        /* 通知不可用不影响提醒音 */
+      }
+    }
+  };
 
   useEffect(() => {
     (async () => {
@@ -170,6 +270,39 @@ export default function SupervisorPage() {
   const activeCount = rows.filter((c) => String(c.status ?? "active") === "active").length;
   const pausedCount = rows.length - activeCount;
 
+  // 跳变检测：whatsapp_status 进入 PENDING_WA（含首帧即 pending）或 offered→captured 升级 → 打铃一次。
+  // 已知局限：4s 轮询窗内挂断的通话已不在 active-calls 里（漏铃）+ 后台标签页轮询被浏览器节流；
+  // 名册页（/calls）是持久兜底，根治在后续 assist 列。
+  useEffect(() => {
+    const prev = waPrevRef.current;
+    const belled = belledRef.current;
+    const seen = new Set<string>();
+    for (const c of rows) {
+      const id = idOf(c);
+      if (!id) continue;
+      seen.add(id);
+      const st = waStatus(c);
+      const old = prev.get(id) ?? "";
+      prev.set(id, st);
+      const entered = PENDING_WA.includes(st) && !PENDING_WA.includes(old);
+      const upgraded = old === "offered" && st === "captured";
+      const key = `${id}:${st}`;
+      if (!(entered || upgraded) || belled.has(key)) continue;
+      // 铃关时跳变检测照跑、不积累响铃账本（重开不补响旧跳变）
+      if (!bellOn) continue;
+      belled.add(key); // 每 callId 每个到达状态只响一次
+      playCaptureBell();
+      notifyCapture(labelOf(c), WA_STATUS_ZH[st] ?? st);
+    }
+    // 通话从列表消失：清理快照与响铃账本，防泄漏与复活误响
+    for (const gone of [...prev.keys()]) {
+      if (seen.has(gone)) continue;
+      prev.delete(gone);
+      belled.delete(`${gone}:offered`);
+      belled.delete(`${gone}:captured`);
+    }
+  }, [rows, bellOn, labelOf, waStatus]);
+
   async function copyNum(num: string) {
     try {
       await navigator.clipboard.writeText(num);
@@ -229,6 +362,10 @@ export default function SupervisorPage() {
         <span className="card px-4 py-2">
           WhatsApp 待对接 <b className={pending.length ? "text-(--live)" : "muted"}>{pending.length}</b>
         </span>
+        <label className="card flex cursor-pointer select-none items-center gap-2 px-4 py-2">
+          <input type="checkbox" className="accent-(--live)" checked={bellOn} onChange={toggleBell} />
+          捕获提醒音
+        </label>
       </div>
 
       {err && <p className="mb-4 rounded-lg bg-red-500/10 p-3 text-sm text-red-600">{err}</p>}

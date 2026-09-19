@@ -6,7 +6,7 @@ Contributor guide for **Bok Voice**, a local-first voice customer-service assist
 
 - `apps/agent` — LiveKit agent runtime (VAD → ASR → LLM → TTS orchestration and providers).
 - `apps/control-plane` — FastAPI API (:8000): objects, personas, knowledge, templates, calls, audit, tokens.
-- `apps/web` — Next.js static export（纯浏览器 UI：节点 node_agent :3000 / 云 CP 托管）。
+- `apps/web` — Next.js static export（纯浏览器 UI：节点 node_agent :3000 / 云 CP 托管）。**AI 工作站 `/studio`（2026-09-19 W1）**：模板列表 → `/studio/?t=<id>` 工作台五 tab（话术流程=共用编辑器 `components/template-editor.tsx`（自 /templates 原样提取、双页共用）/ 意图与问答只读摘要+深链 `/qa/?template=<id>&view=canvas` / 罐头录音状态面 / 通话日志按模板过滤 / 学习报告（reports 键门控））；静态导出零动态段，深链一律 query 参数。**主管台捕获打铃 v0**：`whatsapp_status` 跳变（4s 轮询 diff）→ WebAudio 蜂鸣+可选通知，开关 `bok_supervisor_bell`；已知漏铃窗口（轮询窗内挂断/后台标签节流）由名册兜底，根治=W4 `assist_status` 列（WA 捕获铃与图意图 `notify_human` 铃届时共用呈现链）。总路线与分期定案：`docs/superpowers/plans/2026-09-19-ai-studio.md`。
 - `packages/` — shared Python: core models, SQLite repository, knowledge, observability.
 - `services/` — local sidecars: Qwen3-ASR (:8787), Qwen3-TTS (:8788), realtime-translation worker (:8790), LiveKit server config.
 - `tools/node_agent.py` — 薄节点守护（心跳/commands/UI :3000 托管/全栈拉起）。

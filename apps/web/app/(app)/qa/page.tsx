@@ -370,6 +370,18 @@ export default function QaPage() {
     };
   }, [accountId]);
 
+  // 深链（W1 AI 工作站）：/qa/?template=<id>&view=canvas → 直达该模板的画布视图。
+  // 静态导出用 query 不开动态路由（先例 /calls?call=、/supervisor?listen=）；
+  // 置于话术表 effect 之后，mount 时其同步 setTemplateId 覆盖该 effect 的清空，
+  // 异步回填的 `prev || 第一个` 会保留深链 id。
+  useEffect(() => {
+    const m = window.location.search.match(/[?&]template=([^&]+)/);
+    if (!m) return;
+    setTemplateId(decodeURIComponent(m[1]));
+    const v = window.location.search.match(/[?&]view=([^&]+)/);
+    if (v && decodeURIComponent(v[1]) === "canvas") setView("canvas");
+  }, []);
+
   // 意图图加载(话术图 Phase 2 Task 8):选中模板变化 → 拉详情取 graph_json → parseGraphDoc。
   // 列表行虽带 graph_json,详情才是权威且最新(与写入同一端点)。**三步防误写**(review R1 Fault 2):
   // ①切模板的**当帧**就把 graphDoc 清空 + graphLoadedFor 置 ""——旧模板的图绝不留在手上被写进新模板;
