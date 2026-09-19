@@ -225,3 +225,19 @@ def test_ports_down_after_grace_default_probe():
     finally:
         bok._relaxed_healthy = orig
     assert monkey_hits == [8000, 8787]
+
+
+def test_sweep_down_semantics_harvests_even_healthy(monkeypatch):
+    """down 拆除语义（评审 P1-1,2026-09-19）:healthy_ok=False 时健康监听也照收
+    ——pidfile 被覆写成死 pid 时,端口级清扫是 down 唯一的回收路径;健康闸只
+    服务 serve 预清扫(保护加载中子代),不得削弱 down 契约。"""
+    killed, probed = _patch_stack_io(
+        monkeypatch,
+        lsof_out={8000: f"{_FAKE_PID}\n"},
+        ps_cmd="python -m uvicorn control_plane.main:app --port 8000",
+        healthy=True,
+    )
+    swept = bok._sweep_orphan_listeners(kill=True, healthy_ok=False)
+    assert swept == [(8000, "python -m uvicorn control_plane.main:app --port 8000"[:60], _FAKE_PID)]
+    assert killed == [("killpg", 7000 + _FAKE_PID)]
+    assert probed == []  # down 档根本不做健康探测

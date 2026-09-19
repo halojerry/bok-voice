@@ -1605,7 +1605,10 @@ def cmd_down() -> int:
         print(f"[down] swept orphan worker (pid {pid}, {label})")
     # 端口级兜底（2026-09-17 殭尸专项）:spawn 子代/sidecar/livekit/uvicorn 殘留
     # 是命令行特征清扫的盲区,按 bok 端口表+身份复核双条件收割。
-    for port, cmd, pid in _sweep_orphan_listeners():
+    # healthy_ok=False:down 是拆除语义,pidfile SIGTERM 已先送达,「健康残留」
+    # 也必须收走——否则 pidfile 覆写成死 pid 时 down 返回 0 但栈仍在跑
+    # （旧代码被静默采纳=A/B 污染复活,评审 P1-1）。
+    for port, cmd, pid in _sweep_orphan_listeners(healthy_ok=False):
         print(f"[down] swept orphan listener :{port} (pid {pid}, {cmd})")
     return 1 if stop_failures else 0
 
@@ -1679,7 +1682,8 @@ _ORPHAN_PORT_OWNERS: tuple[tuple[int, tuple[str, ...]], ...] = (
 )
 
 
-def _sweep_orphan_listeners(kill: bool = True) -> list[tuple[int, str, int]]:
+def _sweep_orphan_listeners(kill: bool = True,
+                            healthy_ok: bool = True) -> list[tuple[int, str, int]]:
     """端口级孤儿兜底（2026-09-17 殭尸专项）：按 bok 端口表逐口查 LISTEN 进程，
     命令行身份复核通过才收割；身份不符（他人物理占用）只报警不动手。
 
@@ -1722,8 +1726,10 @@ def _sweep_orphan_listeners(kill: bool = True) -> list[tuple[int, str, int]]:
                 continue
             # 健康即非孤儿（2026-09-19 互杀事故）：动手前放宽超时（5s）复检一次，
             # 活的放行——CPU 风暴下上一轮 serve 探测假死退出留下的健康子代，
-            # 不能在这里被当孤儿误杀。
-            if _relaxed_healthy(port):
+            # 不能在这里被当孤儿误杀。healthy_ok=False（cmd_down 专用）跳过该闸：
+            # down 的拆除契约要求连「pidfile 够不着但健康」的残留一并收掉——
+            # pidfile 被覆写成死 pid 时这是唯一回收路径（评审 P1-1）。
+            if healthy_ok and _relaxed_healthy(port):
                 print(f"[sweep] port {port}: pid {pid} healthy — left alone", file=sys.stderr)
                 continue
             swept.append((port, cmd[:60], pid))
