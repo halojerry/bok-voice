@@ -345,9 +345,9 @@ def plan_rounds(
     play_round: bool,
     intent_judge: bool = False,
     fuzzy_text: str = FUZZY_TEXT,
+    jump_speech: bool = False,
 ) -> list[tuple[str, str]]:
     """本腿轮次表 `[(窗口名, 话术)]`（纯函数）。
-
     - **then-jump 档**（`then_jump` 非 None，Phase 3.3 追问链）：`has_qa` 真 →
       `[("play", play_text), ("after", after_text)]`——「播」轮就是**触发轮**（推
       `play_text` 命中 play_qa 绑定）。跳后步号只能在**下一轮**的 turns 行上看到
@@ -363,6 +363,10 @@ def plan_rounds(
       `play_round` 在本档**不适用**。
     - **默认档**：`trigger`/`nontrigger`（+ `play` 信息位轮）逐字节同旧。
     """
+    if jump_speech:
+        # 话面档（I3）：单触发轮——判据不在图引擎而在跳步轮**回复的词面**
+        # （含本步事实词 / 不含被跳步问句词），transcript 由 turns 行直接读。
+        return [("trigger", trigger_text)]
     if intent_judge:
         return [("fuzzy", fuzzy_text), ("consume", after_text)]
     if then_jump is not None:
@@ -445,6 +449,9 @@ def evaluate_leg(
     fuzzy_events: list[dict] | None = None,
     consume_events: list[dict] | None = None,
     judge_events: list[dict] | None = None,
+    jump_speech: bool = False,
+    expect_words: list[str] | None = None,
+    forbid_words: list[str] | None = None,
 ) -> dict:
     """主判据（纯函数）。expect_off=False=图开启腿；True=kill-switch 腿。
 
@@ -557,6 +564,31 @@ def evaluate_leg(
             "judge_scheduled": scheduled,
             "judge_hit_logged": hit,
             "judge_effective": bool(fired and consume_jump),
+        }
+    elif jump_speech:
+        # 话面档（I3,2026-09-19）：判据=跳步轮（provider=graph-jump）回复的词面——
+        # 含本步事实词（expect）且不含被跳步问句词（forbid）。修复前实弹基线
+        # call-790fd558 原样复排第 2/3 步台词（「需要跟您确认」「哪个平台购买」）
+        # =判据可分辨（forbid 命中即 FAIL）；transcript 全文进 info 供人工复盘。
+        gj_texts = [
+            str(t.get("transcript") or "")
+            for t in turns
+            if str(t.get("role") or "") == "assistant"
+            and str(t.get("provider") or "").strip() == "graph-jump"
+        ]
+        blob = "\n".join(gj_texts)
+        expect = [w.strip() for w in (expect_words or []) if str(w or "").strip()]
+        forbid = [w.strip() for w in (forbid_words or []) if str(w or "").strip()]
+        info.update({
+            "jump_speech_texts": gj_texts,
+            "expect_words": expect,
+            "forbid_words": forbid,
+        })
+        checks = {
+            "evidence_ok": ev_ok,
+            "jump_turn_present": bool(gj_texts),
+            "jump_hits_current_step": bool(gj_texts) and all(w in blob for w in expect),
+            "jump_avoids_skipped": bool(gj_texts) and not any(w in blob for w in forbid),
         }
     else:
         jumps = [e for e in trigger_events if str(e.get("kind")) == "jump"]
@@ -729,18 +761,24 @@ async def run_leg(*, expect_off: bool, lang: str, voice: str, trigger_text: str,
                   keep_template: bool, budgets: dict[str, float],
                   then_jump: int | None = None, after_text: str = AFTER_TEXT,
                   intent_judge: bool = False, fuzzy_text: str = FUZZY_TEXT,
-                  judge_soak_s: float = JUDGE_SOAK_S) -> dict:
+                  judge_soak_s: float = JUDGE_SOAK_S,
+                  jump_speech: bool = False,
+                  expect_words: list[str] | None = None,
+                  forbid_words: list[str] | None = None) -> dict:
     leg_name = "killswitch-off" if expect_off else "graph-on"
     if then_jump is not None:
         leg_name = "then-jump-killswitch-off" if expect_off else "then-jump"
     if intent_judge:
         leg_name = "intent-judge-killswitch-off" if expect_off else "intent-judge"
+    if jump_speech:
+        leg_name = "jump-speech"
     qa_id = pick_qa_id(lang)
     graph_json = build_graph_json(qa_id, then_jump=then_jump, judge=intent_judge)
     rounds = plan_rounds(
         then_jump=then_jump, has_qa=bool(qa_id), trigger_text=trigger_text,
         nontrigger_text=nontrigger_text, play_text=play_text, after_text=after_text,
         play_round=play_round, intent_judge=intent_judge, fuzzy_text=fuzzy_text,
+        jump_speech=jump_speech,
     )
     print(f"\n[flow-graph] 腿={leg_name} lang={lang} qa_id={qa_id or '(无QA条目, play 腿跳过)'}"
           f" then_jump={then_jump} intent_judge={intent_judge} rounds={[n for n, _ in rounds]}",
@@ -770,6 +808,7 @@ async def run_leg(*, expect_off: bool, lang: str, voice: str, trigger_text: str,
             graph_json=graph_json, template_id=template_id, voice=voice,
             rounds=rounds, then_jump=then_jump, after_text=after_text,
             budgets=budgets, intent_judge=intent_judge, judge_soak_s=judge_soak_s,
+            jump_speech=jump_speech, expect_words=expect_words, forbid_words=forbid_words,
         )
     finally:
         # 清理探针模板：名字含 probe=不会被 E2E 自动挑中，但跑完仍应不留痕（--keep-template 留档用）。
@@ -782,7 +821,10 @@ async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_
                               rounds: list[tuple[str, str]], then_jump: int | None,
                               after_text: str, budgets: dict[str, float],
                               intent_judge: bool = False,
-                              judge_soak_s: float = JUDGE_SOAK_S) -> dict:
+                              judge_soak_s: float = JUDGE_SOAK_S,
+                              jump_speech: bool = False,
+                              expect_words: list[str] | None = None,
+                              forbid_words: list[str] | None = None) -> dict:
     # 轮次表由 `plan_rounds` 单点产出（默认档=触发/非触发/play 信息位轮；then-jump 档=
     # 播 + 跳后两轮），这里只负责跑表与按窗口切日志。
     pcms = {name: erc.tts_pcm(text, lang) for name, text in rounds}
@@ -953,6 +995,9 @@ async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_
         fuzzy_events=fuzzy_events,
         consume_events=consume_events,
         judge_events=judge_events,
+        jump_speech=jump_speech,
+        expect_words=expect_words,
+        forbid_words=forbid_words,
     )
     # 归因用关键词：then-jump 腿的触发语是 `play_text`（退款 系），默认腿是「投诉」系。
     understood_keywords = PLAY_KEYWORDS if then_jump is not None else TRIGGER_KEYWORDS
@@ -1063,12 +1108,14 @@ def selftest() -> int:
              "gen": "llm", "template_step": step},
         ]
 
-    def _ev(*, log: bool = True, marks: list[int] | None = None) -> dict:
+    def _ev(*, log: bool = True, marks: list[int] | None = None, expected: int = 2) -> dict:
         # 诚实路径：2 轮 → 3 个 mark（进房前 + 每轮后），每轮窗口都有新字节。
+        # jump-speech 档单轮 → expected=1 → [100, 200]。
+        _marks = [100, 200, 300][: expected + 1] if marks is None else marks
         return probe_evidence(
             log_exists=log,
-            marks=[100, 200, 300] if marks is None else marks,
-            expected_rounds=2,
+            marks=_marks,
+            expected_rounds=expected,
         )
 
     jump_ev = {"kind": "jump", "binding": "bnd_7e8f9a0b", "step": str(TARGET_STEP)}
@@ -1235,6 +1282,41 @@ def selftest() -> int:
         ("FUZZY_TEXT 不含任何图触发/play 关键词（腿前提）",
          not any(k.lower() in FUZZY_TEXT.lower()
                  for k in TRIGGER_KEYWORDS + PLAY_KEYWORDS), True),
+        # ---- I3 话面档（jump-speech：跳步轮词面判据）----
+        ("jump-speech 正例：跳步轮讲本步事实、不碰被跳步问句", evaluate_leg(
+            expect_off=False, target_step=TARGET_STEP, jump_speech=True,
+            expect_words=["赔付"], forbid_words=["哪个平台", "需要跟您确认"],
+            trigger_events=[jump_ev], nontrigger_events=[], play_events=[],
+            turns=[{"role": "assistant", "provider": "graph-jump",
+                    "gen": "llm", "template_step": TARGET_STEP,
+                    "transcript": "明白，您这单如果确认丢件，会按平台规则赔付。"}],
+            evidence=_ev(expected=1))["pass"], True),
+        ("jump-speech 反例：复排被跳步台词（790fd558 形态）", evaluate_leg(
+            expect_off=False, target_step=TARGET_STEP, jump_speech=True,
+            expect_words=["赔付"], forbid_words=["哪个平台", "需要跟您确认"],
+            trigger_events=[jump_ev], nontrigger_events=[], play_events=[],
+            turns=[{"role": "assistant", "provider": "graph-jump",
+                    "gen": "llm", "template_step": TARGET_STEP,
+                    "transcript": "我这边有一件快递需要跟您确认一下。请问在哪个平台购买？"}],
+            evidence=_ev(expected=1))["pass"], False),
+        ("jump-speech 反例：缺本步事实词（讲了但没讲到位）", evaluate_leg(
+            expect_off=False, target_step=TARGET_STEP, jump_speech=True,
+            expect_words=["赔付"], forbid_words=["哪个平台"],
+            trigger_events=[jump_ev], nontrigger_events=[], play_events=[],
+            turns=[{"role": "assistant", "provider": "graph-jump",
+                    "gen": "llm", "template_step": TARGET_STEP,
+                    "transcript": "好的，我帮您登记。"}],
+            evidence=_ev(expected=1))["pass"], False),
+        ("jump-speech 反例：无跳步轮（图没触发）", evaluate_leg(
+            expect_off=False, target_step=TARGET_STEP, jump_speech=True,
+            expect_words=["赔付"], forbid_words=["哪个平台"],
+            trigger_events=[], nontrigger_events=[], play_events=[],
+            turns=[], evidence=_ev(expected=1))["pass"], False),
+        ("plan_rounds jump-speech 档=单触发轮", plan_rounds(
+            then_jump=None, has_qa=False, jump_speech=True,
+            trigger_text=TRIGGER_TEXT, nontrigger_text=NONTRIGGER_TEXT,
+            play_text=PLAY_TEXT, after_text=AFTER_TEXT, play_round=True
+        ) == [("trigger", TRIGGER_TEXT)], True),
     ]
 
     failed = 0
@@ -1270,6 +1352,13 @@ async def main() -> int:
                         help="--intent-judge 的模糊触发轮话术（须避开图全部触发/play 关键词，保持抱怨语义）")
     parser.add_argument("--judge-soak-s", type=float, default=JUDGE_SOAK_S,
                         help="fuzzy→consume 之间等候判定落账的真实秒数（盖 FLOW_JUDGE_DELAY+9B 往返）")
+    parser.add_argument("--jump-speech", action="store_true",
+                        help="话面腿（I3）：单触发轮，判据=跳步轮回复词面（含本步事实词、"
+                             "不含被跳步问句词）——修的是 4B 被总览引力拉回线性剧本的问题")
+    parser.add_argument("--expect-words", default="赔付,理赔",
+                        help="--jump-speech 跳步轮回复必须包含的本步事实词（逗号分隔，任序全含）")
+    parser.add_argument("--forbid-words", default="哪个平台,需要跟您确认",
+                        help="--jump-speech 跳步轮回复不得包含的被跳步问句词（逗号分隔，任一命中即 FAIL）")
     parser.add_argument("--keep-template", action="store_true", help="保留探针模板（默认跑完删）")
     parser.add_argument("--budget-first-ms", type=float, default=2500.0)
     parser.add_argument("--budget-perceived-ms", type=float, default=3000.0)
@@ -1290,6 +1379,9 @@ async def main() -> int:
         after_text=args.after_text,
         intent_judge=args.intent_judge, fuzzy_text=args.fuzzy_text,
         judge_soak_s=args.judge_soak_s,
+        jump_speech=args.jump_speech,
+        expect_words=str(args.expect_words or "").split(","),
+        forbid_words=str(args.forbid_words or "").split(","),
     )
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)

@@ -891,7 +891,10 @@ class FlowController:
         # 【跳转进入】(I3,2026-09-18):讲「客户刚刚确认了上一步」与事实相反,
         # 4B 会回头追问被跳过嘅步。advance()/enter_closing() 清零。
         self._entered_by_jump = False
-        # 渐进披露渲染账本:每步第一次渲染(装配/推进后首轮)才注入底稿,
+        # I3 二修(2026-09-19):正向跳转被跳过的步号(1-based,标记点名用——
+        # call-790fd558 实证单句「不要追问」压不过总览逐字引力,要点名先够力)。
+        self._jump_skipped: list[int] = []
+        # 渐进披露渲染账本:每步的第一次渲染(装配/推进后首轮)才注入底稿,
         # 此后转分支模式(正稿已入对话史,重发只喂复制引力)。
         self._last_render_step = -1
 
@@ -916,6 +919,7 @@ class FlowController:
         self.closing = True
         self._just_advanced = False
         self._entered_by_jump = False  # 收尾态尾部走 closing_text,跳转标记无意义
+        self._jump_skipped = []
 
     def closing_text(self) -> str:
         """收尾态注入:一句礼貌告别,唔推销、唔挽留、唔转话题、唔问问题。"""
@@ -948,20 +952,26 @@ class FlowController:
             self._just_advanced = True
             # 常规推进=客户真确认 → 尾部回到【新一步】(跳转标记只活到下一次推进)。
             self._entered_by_jump = False
+            self._jump_skipped = []
 
     def jump_to(self, idx: int) -> None:
         """跳到任意步(话术图 jump_step,spec §4.2)。镜像 advance 的副作用包
         (置 _just_advanced → 首轮重渲染),外加钳制与冻结:closing 后流程不再被图
         移动;同位跳转 no-op;允许跳到 done(== len(steps))。**实际位移**另置
-        _entered_by_jump —— 尾部要讲清「本步係跳入、客户冇确认过被跳过嘅步」(I3)。"""
+        _entered_by_jump —— 尾部要讲清「本步係跳入、客户冇确认过被跳过嘅步」(I3);
+        正向跳转同步记被跳步号(`_jump_skipped`,1-based)供标记点名(I3 二修)。"""
         if not self.has_steps or self.closing:
             return
         target = max(0, min(int(idx), len(self.steps)))
         if target == self.current:
             return
+        before = self.current
         self.current = target
         self._just_advanced = True
         self._entered_by_jump = True
+        # 前向跳:起点步之后、目标步之前的全部被跳过(1-based);后退跳无「被跳过」
+        # 语义(嗰啲步客户早已听过),留空走「回到本步」措辞。
+        self._jump_skipped = list(range(before + 2, target + 1)) if target > before else []
 
     def apply_then_jump(self, then_jump_1based: int | None) -> bool:
         """play_qa 绑定的答后跳转(spec Phase 3.3 §3):播完当场跳到 then_jump 步。
@@ -1132,9 +1142,22 @@ class FlowController:
             if self._entered_by_jump:
                 # 图 jump 进入(I3,2026-09-18):【新一步】讲「客户刚刚确认了上一步」
                 # 与事实相反 —— 客户从未确认被跳过嘅步,照讲 4B 会回头追问嗰步。
+                # I3 二修(2026-09-19):单句「不要追问」唔够压过总览逐字引力
+                # (call-790fd558 跳第 4 步回复原样复排第 2/3 步台词+补问平台;
+                # call-f13c3c06 先讲对本步尾句又回头补问)——要点名被跳步号+
+                # 明令禁「按总览顺序从头开始」先拉得住。
+                _skip_txt = (
+                    "第" + "、".join(str(n) for n in self._jump_skipped) + "步已被跳过"
+                    if self._jump_skipped
+                    else "流程已直接回到本步"
+                )
                 lines.append(
-                    "【跳转进入】本流程由配置跳转进入本步（客户并未确认被跳过的步骤）。"
-                    "直接按本步目标推进，不要再追问被跳过步骤的问题。"
+                    f"【跳转进入】客户的话已经直接进入第 {self.current + 1} 步"
+                    f"（共 {len(self.steps)} 步），{_skip_txt}——被跳过的步骤客户没确认过、"
+                    "也不需要再听。本轮只讲第 "
+                    f"{self.current + 1} 步的内容：绝不按流程总览的顺序从头重新开始，"
+                    "也绝不再问被跳过步骤里的任何问题（例如那些步骤里的核对、询问类问题），"
+                    "除非客户主动问。"
                 )
             else:
                 lines.append(
@@ -1215,6 +1238,15 @@ class FlowController:
             if fact:
                 line += f"——{fact}"
             lines.append(line)
+        # I3 跳步话面(2026-09-19):总览每步带事实行=逐字复制素材,4B 在跳步轮会被
+        # 拉回线性剧本(call-790fd558 原样复排第 2/3 步)。图模板专用规则行随总览进
+        # 静态前缀教「跳转係常态」;非图模板零渲染=字节不变。
+        if self.graph.intents:
+            lines.append(
+                "本流程允许按客户话题直接跳入后面某一步（例如客户直接投诉就直达处理步）。"
+                "一旦跳入：只讲当前这一步的内容；被跳过的步骤不再补讲、不再追问，"
+                "也不要按本总览的顺序从头重新开始。"
+            )
         lines.extend(_SHARED_RESPONSE_RULES.splitlines())
         return "\n".join(lines)
 
