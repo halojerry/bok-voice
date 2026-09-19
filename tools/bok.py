@@ -710,9 +710,18 @@ def _start_proc(args: list[str], pidfile: Path, logfile: Path, env: dict | None 
     merged.setdefault("PYTHONUNBUFFERED", "1")
     if env:
         merged.update(env)
+    # 来源 stamp（2026-09-19 provenance 完整版）：子代 env 钉本树 ROOT（Linux
+    # /proc/<pid>/environ 可读回）；macOS ps 不吐环境，另落 pid 作用域标记文件
+    # （root + 子代 lstart，清扫时精确比对防 pid 复用串号）。端口清扫据此区分
+    # 本树子代与他树进程，他树永不误杀（跨树互杀根因/多会话纪律）。
+    merged["BOK_SERVE_ROOT"] = str(ROOT)
     with logfile.open("ab") as log:
         proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, env=merged, cwd=str(cwd) if cwd else None, **_spawn_kwargs())
     pidfile.write_text(str(proc.pid))
+    try:
+        (pidfile.parent / f"proc-{proc.pid}.root").write_text(f"{ROOT}\t{_ps_field(proc.pid, 'lstart=')}\n")
+    except Exception:
+        pass  # 标记写不出=来源未知，清扫走原语义；绝不影响起进程
     return proc.pid
 
 
@@ -1468,12 +1477,12 @@ def cmd_serve() -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    # 起栈前端口预清（2026-09-17 殭尸专项 → 2026-09-19 健康闸修订）：身份复核
-    # 不过的一律不动；身份匹配且「健康」的在听进程也放行（防 CPU 风暴下把上一
-    # 轮 serve 存活子代当孤儿误杀的互杀循环）。代价：健康闸分不清「本栈存活
-    # 子代」与「健康但跑旧代码的殭尸/另一 worktree 的活栈」——后者会被后续
-    # spawn 门（if not healthy(port)）静默复用（A/B 污染面）。清扫日志逐口提示
-    # left alone；见非本栈期望的复用，先 bok.py down 再起。
+    # 起栈前端口预清（2026-09-17 殭尸专项 → 2026-09-19 健康闸+来源鉴定）：身份
+    # 复核不过的一律不动；他树 stamp 的 bok 栈永不收割（跨树互杀/多会话纪律）；
+    # 本树与无戳的再过健康闸——「健康」放行（防 CPU 风暴把加载中子代当孤儿误
+    # 杀的互杀循环）。残留面：同树「健康但旧代码」的进程无法从外部判定所载代
+    # 码版本，会被 spawn 门复用（A/B 污染面）——清扫日志逐口提示 left alone，
+    # 改完代码要吃新代码先 down 再起。
     stale = _sweep_orphan_listeners()
     for port, cmd, pid in stale:
         print(f"[serve] swept stale listener :{port} (pid {pid}, {cmd})")
@@ -1684,6 +1693,75 @@ def _sweep_orphan_workers() -> list[tuple[int, str]]:
     return swept
 
 
+def _ps_field(pid: int, field: str) -> str:
+    """ps 单字段取值（lstart 身份比对用），失败返回空串（fail-closed）。"""
+    try:
+        return subprocess.run(
+            ["ps", "-p", str(pid), "-o", field],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+    except Exception:
+        return ""
+
+
+def _process_serve_root(pid: int) -> str:
+    """来源鉴定（评审 A-P2 完整版）：该 pid 由哪棵代码树拉起。载体优先级：
+    ① app-data run/proc-<pid>.root（_start_proc 落笔「ROOT<TAB>子代lstart」，
+    lstart 与 ps 现值精确比对——pid 复用必然对不上，标记作废）；
+    ② Linux /proc/<pid>/environ 的 BOK_SERVE_ROOT（补标记缺席路径；macOS ps
+    不吐环境，故落盘标记是 mac 主载体）。
+    读不到/对不上返回空串=来源未知，调用方按未知走原语义；任何异常同空串。"""
+    if os.name == "nt":
+        return ""
+    try:
+        marker = app_data_dir() / "run" / f"proc-{pid}.root"
+        if marker.exists():
+            parts = marker.read_text().strip().split("\t")
+            if len(parts) == 2 and parts[1]:
+                cur = _ps_field(pid, "lstart=")
+                return parts[0] if cur and cur == parts[1] else ""
+            return ""
+    except Exception:
+        pass
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+        for item in raw.split(b"\0"):
+            if item.startswith(b"BOK_SERVE_ROOT="):
+                return item.decode("utf-8", "replace").split("=", 1)[1]
+    except Exception:
+        pass
+    return ""
+
+
+def _sweep_stale_root_markers() -> None:
+    """清 proc-<pid>.root 残留：ps 探不到的 pid 视为死，标记删除（防标记文件
+    无限积累）；ps 探测失败=未知一律保留。"""
+    try:
+        markers = list((app_data_dir() / "run").glob("proc-*.root"))
+    except Exception:
+        return
+    for marker in markers:
+        try:
+            pid = int(marker.stem.removeprefix("proc-"))
+        except ValueError:
+            try:
+                marker.unlink()
+            except Exception:
+                pass
+            continue
+        try:
+            alive = subprocess.run(
+                ["ps", "-p", str(pid)], capture_output=True, text=True, timeout=5,
+            ).returncode == 0
+        except Exception:
+            continue
+        if not alive:
+            try:
+                marker.unlink()
+            except Exception:
+                pass
+
+
 # 端口 → 命令行身份标记（_sweep_orphan_listeners 双条件收割用）。端口是 bok
 # 固定拓扑（见 CORE_PORTS/WORKER_PORTS 语义）；身份复核防误杀同端口无关服务。
 # 8081-8083 额外认 multiprocessing.spawn：livekit-agents worker 的 spawn 子代
@@ -1717,11 +1795,16 @@ def _sweep_orphan_listeners(kill: bool = True,
     放宽超时（5s）的健康探测（_relaxed_healthy：有 HTTP 健康面走 HTTP、无的
     退 TCP），探测健康 → 跳过收割（left alone），不健康才照旧收割；返回值
     swept 只含真正收割的条目（left-alone 的不进）。
+    来源鉴定（2026-09-19 provenance 完整版，评审 A-P2）：marker//proc stamp
+    读得出「拉起树」时，他树的 bok 栈永不收割——它可能正在加载模型（跨树互杀
+    同款根因），多会话纪律也禁碰他树进程；down 同样不收他树。读不出 stamp
+    （旧版进程/ps 失败）按来源未知走原健康闸/收割语义，旧行为兜底不变。
     kill=False 只探测+报告不动手（健康的同样报 left alone；干跑/测试用）。
     Windows 明跳（同 _sweep_orphan_workers：无安全身份来源，宁可少清不误杀）。"""
     swept: list[tuple[int, str, int]] = []
     if os.name == "nt":
         return swept
+    _sweep_stale_root_markers()
     for port, markers in _ORPHAN_PORT_OWNERS:
         try:
             out = subprocess.run(
@@ -1746,6 +1829,19 @@ def _sweep_orphan_listeners(kill: bool = True,
                 cmd = ""
             if not any(m in cmd for m in markers):
                 print(f"[sweep] port {port}: pid {pid} 身份不符（{cmd[:80] or '未知'}），不动", file=sys.stderr)
+                continue
+            # 来源鉴定（2026-09-19 provenance 完整版，评审 A-P2）：stamp 读得出
+            # 「拉起树」且 ≠ 本树 → 他会话/他树的 bok 栈，永不收割——它可能正在
+            # 加载模型（跨树互杀同款根因），多会话纪律也禁碰他树进程；down 同样
+            # 不收他树（down=停本树+无戳遗留）。stamp 读不出按来源未知走下面
+            # 原健康闸/收割语义，旧行为兜底不变。
+            proc_root = _process_serve_root(pid)
+            if proc_root and os.path.realpath(proc_root) != os.path.realpath(str(ROOT)):
+                print(
+                    f"[sweep] port {port}: pid {pid} 属另一代码树（{proc_root}）——不动"
+                    "（他树进程永不收割；要切换先在对方 down）",
+                    file=sys.stderr,
+                )
                 continue
             # 健康即非孤儿（2026-09-19 互杀事故）：动手前放宽超时（5s）复检一次，
             # 活的放行——CPU 风暴下上一轮 serve 探测假死退出留下的健康子代，
