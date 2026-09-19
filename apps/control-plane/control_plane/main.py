@@ -65,6 +65,7 @@ from .auth import (
     identity_gate,
     owner_scope_filter,
     require_role,
+    same_account,
     scoped_account,
     verify_password,
 )
@@ -205,6 +206,18 @@ async def node_revoked_gate(request: Request, call_next):
 
 control_log = get_logger("control-plane", component="control-plane", service="control-plane")
 
+# 常驻后台 task 强引用池：事件循环只持 task 弱引用，create_task 返回值即弃会被
+# GC 中途掐杀——知识库重建/僵尸 reaper/外呼循环/webhook 补派曾四处同病（agent 侧
+# _spawn_report 同款教训，interpret.py 池化形态移植）。done 回调摘除防池无限膨胀。
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
+
 
 def _repo() -> BusinessRepository:
     # SQL 路径：每个 _repo() 调用都拿独立 Session（已提交数据对所有新 Session 可见），
@@ -310,12 +323,12 @@ def _startup() -> None:
     if isinstance(vector, InMemoryVectorStore):
         # SQLite 路径：业务数据落盘，知识向量启动时从 vault 重建（幂等）。
         try:
-            asyncio.get_event_loop().create_task(_rebuild_in_memory_knowledge(vector, vault))
+            _spawn_background(_rebuild_in_memory_knowledge(vector, vault))
         except Exception as exc:  # pragma: no cover
             control_log.warning("knowledge_rebuild_failed", extra={"data": {"error": str(exc)}})
     # 僵尸通话回收(QA B4):启动先扫一遍,再 60s 周期。
     try:
-        asyncio.get_event_loop().create_task(_reaper_loop())
+        _spawn_background(_reaper_loop())
     except Exception as exc:  # pragma: no cover
         control_log.warning("reaper_start_failed", extra={"data": {"error": str(exc)}})
     # 外呼战役串行循环(spec 2026-09-12 Wave3):5s 巡检收割终态→起下一通→判 done。
@@ -324,7 +337,7 @@ def _startup() -> None:
     try:
         from .campaign import _campaign_loop
 
-        asyncio.get_event_loop().create_task(_campaign_loop())
+        _spawn_background(_campaign_loop())
     except Exception as exc:  # pragma: no cover
         control_log.warning("campaign_start_failed", extra={"data": {"error": str(exc)}})
     app.state.settlement = SettlementTrigger()
@@ -1478,7 +1491,13 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
             # started_at 落点（2026-09-17 仪表盘口径）:真翻成功才补——首次转 ACTIVE
             # 时刻；已有值（dial-result 先行）不覆盖，读改写竞态最坏=挂断后补写
             # started_at 而 duration_s 停留 0（仪表盘不进时长桶，无害）。
-            if _repo().mark_active_if_live(req.call_id):
+            # 归属校验（审计 P2-5）：req.call_id 由调用方自由填写，房主账号可以
+            # 塞别账号通话 id——不校验则 ringing/paused → active 的合法翻转被借道
+            # 成跨账号状态污染（主管台/仪表盘/reaper 全吃假 ACTIVE）。他账号通话
+            # 静默跳过激活：404 会泄露存在性，按「不动」处理；same_account 的
+            # root/无身份恒真语义=auth-off 与机器通道行为零变化。
+            _tok_call = _repo().get_call(req.call_id)
+            if _tok_call is not None and same_account(request, _tok_call) and _repo().mark_active_if_live(req.call_id):
                 _cur = _repo().get_call(req.call_id) or {}
                 if not _cur.get("started_at"):
                     _repo().update_call(req.call_id, started_at=_utcnow_naive())
@@ -4502,29 +4521,18 @@ async def ingest_session_report(call_id: str, request: Request) -> dict:
             raise HTTPException(status_code=404, detail="call not found")
         _audit("call.session_report", subject_type="call", subject_id=call_id, account_id=row.get("account_id", ""), call_id=call_id)
         return {"call_id": call_id, "stored": True}
-    # ---- worker 非空：per-worker 历史 upsert（P1-A） ----
-    try:
-        arr = json.loads(str(_cur.get("session_reports_json") or "") or "[]")
-        if not isinstance(arr, list):
-            arr = []
-    except Exception:
-        arr = []
+    # ---- worker 非空：per-worker 历史 upsert（P1-A；并发合并 2026-09-19 审计） ----
+    # fwd/rev 挂断几乎同时上报：旧读-改-写整列覆盖在并发窗内互相吞（后写者拿旧
+    # 基数覆盖前写者，整份纪要静默丢）。合并移入仓储层 CAS upsert（同 worker 替换/
+    # 异 worker 追加+旧值等值条件重试），端点只管镜像与审计。
     entry = {"worker": worker, "report": payload, "ts": _utcnow_iso()}
-    replaced = False
-    for i, old in enumerate(arr):
-        if isinstance(old, dict) and str(old.get("worker") or "") == worker:
-            arr[i] = entry  # 同 worker 重发（重试）=替换，不累积重复条目
-            replaced = True
-            break
-    if not replaced:
-        arr.append(entry)
-    fields: dict = {"session_reports_json": json.dumps(arr, ensure_ascii=False, default=str)}
-    if not str(_cur.get("session_report") or "").strip():
-        # 镜像仅当主列仍为空：首个 worker 顺手喂饱 backfill/旧读点，后续方向不动主列。
-        fields["session_report"] = json.dumps(payload, ensure_ascii=False, default=str)
-    row = _repo().update_call(call_id, **fields)
+    row, replaced = _repo().upsert_session_report(call_id, worker, entry)
     if not row:
         raise HTTPException(status_code=404, detail="call not found")
+    if not str(row.get("session_report") or "").strip():
+        # 镜像仅当主列仍为空：首个 worker 顺手喂饱 backfill/旧读点，后续方向不动主列。
+        # 双 worker 同窗都见空时后写镜像者胜——镜像只是兼容读点，权威数据在历史列。
+        _repo().update_call(call_id, session_report=json.dumps(payload, ensure_ascii=False, default=str))
     _audit(
         "call.session_report",
         subject_type="call",
@@ -4754,7 +4762,9 @@ async def livekit_webhook(request: Request) -> dict:
             # 没回房则清扫幽灵 dispatch 再补派(#57 之前 created 即收口,漏掉
             # 「无 worker 时创建的 PENDING dispatch 不被新 worker 拾取」的死局)。
 
-    asyncio.create_task(_redispatch())
+    # 补派含 0/10/25s 三轮 sleep 重试，全程暴露在 GC 窗口——无引用 task 会被
+    # 中途掐杀令 agent 崩溃自愈静默丢失，必须入池持引用。
+    _spawn_background(_redispatch())
     return {"handled": True, "redispatch": identity}
 
 
@@ -4981,6 +4991,9 @@ async def web_logs(payload: dict, request: Request) -> dict:
     麦克风开关等决策只发生在浏览器里,服务端日志全然看不见(2026-09-12 同传输出
     路由排障多轮全靠排除法实证)。JSON 行追加 logs/web-client.log,与 agent.log 同
     目录;行限长防刷爆。上报失败静默(诊断通道永不影响功能)。"""
+    # 同族 diag 读面(asr/tts health/speakers/voices)同款 settings 键——否则
+    # auth-on 下任意 user JWT/机器通道可长期写 web-client.log(审计 P2-4)。
+    _gate_page(request, "settings")
     from datetime import datetime, timezone
 
     import time as _t

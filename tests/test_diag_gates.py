@@ -101,24 +101,28 @@ def test_diag_routes_admin_allowed(monkeypatch):
 
 
 def test_weblog_limiter_per_identity(monkeypatch, tmp_path):
+    """限速窗仍护机器通道。2026-09-19 审计 P2-4 起端点挂 settings 闸:任意 user
+    恒 403（见 test_cp_wave1）、anon 在 auth-on 下 401——per-identity 面收敛到
+    machine 一档,限速语义原样保留(600 行/分钟防刷盘)。"""
     import control_plane.main as cp_main
 
     client, repo = _client_and_repo(monkeypatch)
     monkeypatch.setenv("BOK_APP_DATA", str(tmp_path))  # 日志写进临时目录,不碰真实 app-data
     monkeypatch.setattr(cp_main, "_weblog_times", {})  # 隔离进程内已有窗口
-    # anon 打满 600/min 窗
-    cp_main._weblog_times["anon"] = deque([time.time()] * 600, maxlen=600)
-    r = client.post("/api/web_logs", json={"event": "flood"})
+    # auth-on:state.machine 只由 identity_gate 置位(CP-token-only 中间件只验不标)
+    # ——不置位则限速键落 "anon",种子打不中。
+    monkeypatch.setenv("BOK_AUTH_REQUIRED", "1")
+    monkeypatch.setenv("BOK_JWT_SECRET", "diag-gates-fixture-secret-0123456789abcdef")
+    monkeypatch.setenv("BOK_CP_TOKEN", "diag-machine-token")
+    machine_h = {"Authorization": "Bearer diag-machine-token"}
+    # machine 打满 600/min 窗
+    cp_main._weblog_times["machine"] = deque([time.time()] * 600, maxlen=600)
+    r = client.post("/api/web_logs", json={"event": "flood"}, headers=machine_h)
     assert r.status_code == 200
     assert r.json() == {"ok": False, "reason": "rate_limited"}
-    # user 身份独立窗口：anon 打满不挤占 user 额度
-    _mk_user(repo, "wl-user")
-    tok = _login(client, "wl-user")
-    r2 = client.post("/api/web_logs", json={"event": "from-user"}, headers=_auth(tok))
-    assert r2.json() == {"ok": True}
-    # anon 窗口释放后恢复
-    cp_main._weblog_times["anon"].clear()
-    r3 = client.post("/api/web_logs", json={"event": "after-window"})
+    # 窗口释放后恢复
+    cp_main._weblog_times["machine"].clear()
+    r3 = client.post("/api/web_logs", json={"event": "after-window"}, headers=machine_h)
     assert r3.json() == {"ok": True}
 
 

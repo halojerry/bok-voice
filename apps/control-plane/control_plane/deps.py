@@ -340,13 +340,21 @@ def build_engine() -> Engine | None:
                         "published_json TEXT DEFAULT ''",
                     )
                 )
-                # 节点鉴权(P1,深测): (license_id, fingerprint) 部分唯一索引——多实例
-                # 部署下配额竞态的库级兜底(进程内由 NodeStore.register_licensed 的
-                # 锁收口)。只约束 license 绑定行:开放模式存量空值行不受影响。
-                # 部分索引 WHERE 语法 SQLite/Postgres 双支持。
-                # 建索引前先去重(终审修复):历史竞态可能已留下同 (license_id,
-                # fingerprint) 重复行,直接 CREATE UNIQUE INDEX 会失败。每组保留
-                # MAX(id) 一行——方言可移植写法(SQLite/Postgres 通用,禁 rowid)。
+        except Exception as exc:  # pragma: no cover - sqlite / duplicate column
+            print(f"[deps] idempotent column migration skipped: {exc}")
+
+        # 节点鉴权(P1,深测): (license_id, fingerprint) 部分唯一索引——多实例部署下
+        # 配额竞态的库级兜底(进程内由 NodeStore.register_licensed 的锁收口)。只约束
+        # license 绑定行:开放模式存量空值行不受影响。部分索引 WHERE 语法
+        # SQLite/Postgres 双支持。建索引前先去重(终审修复):历史竞态可能已留下同
+        # (license_id, fingerprint) 重复行,直接 CREATE UNIQUE INDEX 会失败。每组保留
+        # MAX(id) 一行——方言可移植写法(SQLite/Postgres 通用,禁 rowid)。
+        # 独立事务(2026-09-19 审计 P2-6):曾与上面补列同块——多实例并发冷启输掉
+        # ALTER 竞态的一方抛异常后整块跳过,连这份库级兜底索引都没建,节点注册只剩
+        # 进程内锁。拆出后该块失败不影响列迁移,自身失败下次启动重试(CREATE INDEX
+        # IF NOT EXISTS 幂等)。
+        try:
+            with engine.begin() as conn:
                 _deduped = conn.execute(text(NODES_FP_DEDUPE_SQL))
                 if _deduped.rowcount > 0:
                     print(
@@ -363,8 +371,8 @@ def build_engine() -> Engine | None:
                     # 专属告警(终审修复):不再落泛化的 migration skipped 文案,
                     # 索引建不起来(如仍有个别脏行)必须可定位。
                     print(f"[deps] uq_nodes_license_fingerprint create skipped: {exc}")
-        except Exception as exc:  # pragma: no cover - sqlite / duplicate column
-            print(f"[deps] idempotent column migration skipped: {exc}")
+        except Exception as exc:  # pragma: no cover - 并发冷启 ALTER 竞态等
+            print(f"[deps] nodes fingerprint index migration skipped: {exc}")
 
         # ---- 数据迁移：语言值 yue → cantonese 全栈统一（幂等，SQLite/Postgres 通用）。
         # 这是全仓唯一的旧值兼容点：旧库在 CP 启动时一次性落成规范值 cantonese，

@@ -157,6 +157,60 @@ class SqlAlchemyBusinessRepository:
         self.session.commit()
         return bool(res.rowcount)
 
+    def upsert_session_report(self, call_id: str, worker: str, entry: dict) -> tuple[dict | None, bool]:
+        """per-worker 会话纪要 upsert：同 worker 重发=替换，异 worker=追加。
+
+        fwd/rev 双 worker 挂断几乎同时上报——旧的「读整列→内存合并→整列覆盖」
+        在并发窗内互相吞（后写者拿旧基数覆盖前写者，整份纪要静默丢；session-report
+        409 修复 P1-A 留下的并发变体）。这里单事务内读旧值→合并→「旧值等值」
+        条件 UPDATE（纯字符串 WHERE，SQLite/Postgres 双方言可移植），0 行受影响
+        =基数已被并发改写 → 重读重试（封顶 3 次）。返回 (行字典|None, 是否替换)。
+        """
+        import json as _json
+
+        from sqlalchemy import and_
+        from sqlalchemy import update as _sa_update
+
+        replaced = False
+        for _ in range(3):
+            row = self.session.get(models.CallSession, call_id)
+            if not row:
+                return None, False
+            try:
+                arr = _json.loads(str(getattr(row, "session_reports_json", "") or "") or "[]")
+            except ValueError:
+                arr = []
+            if not isinstance(arr, list):
+                arr = []
+            merged = list(arr)
+            replaced = False
+            for i, old in enumerate(merged):
+                if isinstance(old, dict) and str(old.get("worker") or "") == worker:
+                    merged[i] = entry
+                    replaced = True
+                    break
+            if not replaced:
+                merged.append(entry)
+            old_raw = str(getattr(row, "session_reports_json", "") or "")
+            new_raw = _json.dumps(merged, ensure_ascii=False, default=str)
+            stmt = (
+                _sa_update(models.CallSession)
+                .where(
+                    and_(
+                        models.CallSession.id == call_id,
+                        models.CallSession.session_reports_json == old_raw,
+                    )
+                )
+                .values(session_reports_json=new_raw)
+            )
+            res = self.session.execute(stmt)
+            self.session.commit()
+            if res.rowcount:
+                return self._call_to_dict(self.session.get(models.CallSession, call_id)), replaced
+            # 并发抢先：旧值条件没打中，重读新基数再来一轮。
+        row = self.session.get(models.CallSession, call_id)
+        return (self._call_to_dict(row) if row else None), replaced
+
     def delete_call(self, call_id: str) -> bool:
         """删除通话及连带数据(turns/settlements)。审计事件保留(只读历史)。"""
         row = self.session.get(models.CallSession, call_id)
@@ -1442,6 +1496,31 @@ class InMemoryBusinessRepository:
             return False
         cur["status"] = CallStatus.ACTIVE.value
         return True
+
+    def upsert_session_report(self, call_id: str, worker: str, entry: dict) -> tuple[dict | None, bool]:
+        """见 SqlAlchemyBusinessRepository.upsert_session_report。内存替身活在
+        单事件循环，无并发写者，直接合并（无 CAS 必要）。"""
+        import json as _json
+
+        cur = self.calls.get(call_id)
+        if cur is None:
+            return None, False
+        try:
+            arr = _json.loads(str(cur.get("session_reports_json") or "") or "[]")
+        except ValueError:
+            arr = []
+        if not isinstance(arr, list):
+            arr = []
+        replaced = False
+        for i, old in enumerate(arr):
+            if isinstance(old, dict) and str(old.get("worker") or "") == worker:
+                arr[i] = entry
+                replaced = True
+                break
+        if not replaced:
+            arr.append(entry)
+        cur["session_reports_json"] = _json.dumps(arr, ensure_ascii=False, default=str)
+        return cur, replaced
 
     def delete_call(self, call_id: str) -> bool:
         if call_id not in self.calls:
