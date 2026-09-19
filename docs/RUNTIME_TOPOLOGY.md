@@ -25,9 +25,10 @@
 | TTS sidecar | :8788 HTTP | 合成 / 克隆 / 试听 | Mac=mlx_audio；Win=qwen-tts | 模型 → app-data/models |
 | LLM | :1235 OpenAI 兼容 | A 线对话（flow judge、CP 摘要同源）；B 线翻译回退 | Mac=mlx_lm；Win=llama-server CUDA | 模型 → app-data/models |
 | MT LLM（可选） | :1236 OpenAI 兼容 | B 线同传专用翻译（Hy-MT2 小模型，逐句无状态；模型缺失自动跳过 → B 线回退 :1235） | Mac=mlx_lm | 模型 → app-data/models |
-| B-line worker | :8790 WS | 同传通道：ASR→翻译→TTS 队列 / 背压 | 内嵌 Node | 指标 → app-data/translation-metrics.jsonl |
+| settle LLM（可选） | :1237 OpenAI 兼容 | 延迟不敏感后台专线：CP 纪要/知识蒸馏（`BOK_SETTLE_*`）+ flow judge（`FLOW_JUDGE_*`）指向 9B；**缺盘自动回退 :1235**（`Path.exists` 预检，env 不照发=打死端点） | Mac=mlx_lm | 模型 → app-data/models |
+| B-line worker | :8790 WS | **冻结 v1 POC**（2026-09-16 起 v2=fwd/rev 双 worker，本服务仅 web `/translate` 页消费；仍被 `cmd_up` 每次拉起）：ASR→翻译→TTS 队列 / 背压 | 内嵌 Node | 指标 → app-data/translation-metrics.jsonl |
 | LiveKit server | :7880 WS/WebRTC | RTC 信令与媒体（7881/7882 RTC 端口） | 内嵌二进制 | keys → 内嵌 livekit.yaml |
-| agent worker | 进程（健康 :8081/worker） | A 线智能体（VAD/对话/情绪/打断） | 打包 Python | 调 8787/8788/1235/8000；TTS=MiniMax 云（`tts_cache` 本地音频缓存叠加） |
+| agent worker | 进程（健康 :8081/worker） | A 线智能体（VAD/对话/情绪/打断） | 打包 Python | 调 8787/8788/1235(:1237 judge)/8000；**TTS 出厂默认本地 :8788**，`settings.tts.provider=minimax` 切云 bidi（`tts_cache` 音频缓存只包 MiniMax） |
 | interpreter worker ×2 | 进程（健康 :8082 fwd / :8083 rev） | B 线双 AgentSession 同传（`bok-interp-fwd/rev` 显式分发） | 打包 Python | 调 8787/8788/1236(MT,回退 1235)/8000；TTS=MiniMax 云(或本地 8788) |
 
 > 健康探针（2026-09-17）：三 worker 的 `/worker` 是 livekit-agents 内建真端点
@@ -397,7 +398,10 @@ Windows 站点机的常驻等价物（对照 mac launchd RunAtLoad + KeepAlive�
   **诚实边界**：RestartOnFailure 是有限次拉回（3 次），不等价 launchd
   KeepAlive 的无限 KeepAlive。
 - **`--node-agent` 单任务模式**（节点包拓扑）：只注册 `bok-node-agent` 一个
-  任务，node_agent 内部经 cmd_up 拉全栈，心跳/凭据参数原样透传
+  任务，node_agent 内部经 `cmd_up` 拉模型栈（ASR :8787 / TTS :8788 / LLM :1235·:1236·:1237 / b-line :8790），心跳/凭据参数原样透传。
+  **已知 gap（2026-09-19 审计）**：`cmd_up` 不含 CP :8000、LiveKit :7880、三个 livekit-agents
+  worker 与 web UI——「全栈拉起」的旧表述与代码不符；单任务 Windows 节点要跑 A/B 线需补拉起逻辑，
+  拍板前照现行为部署
   （`bok.py prod install --node-agent --cp-url <url> --license-key bokn_…`）。
 - Task Scheduler XML 没有 env 元素：action 用 cmd.exe 前缀链
   （`cd /d … && set "K=V" && … && "exe" args`）注入 env，env dict 与 mac plist
