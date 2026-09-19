@@ -94,6 +94,7 @@
 | `lib/qa-canvas.ts` | 画布纯函数唯一数据面（parseTemplateSteps/deriveGraph 布局契约、resolveClusterTarget 簇校验、revertCluster、localStorage 位置键；签名勿动，`test/qa-canvas.test.mjs` 钉住） |
 | `components/template-editor.tsx` | 话术模板编辑表单（2026-09-19 W1 自 /templates 原样提取：分步 goal/ref/直念/情绪/TSV 导入/热词/保存逻辑；/templates 列表页与 /studio 工作台「话术流程」tab 双页共用，提取前后渲染输出一致） |
 | `app/(app)/studio/page.tsx` | AI 工作站（列表态+`?t=<id>` 工作台态五 tab；静态导出零动态段，深链 query 参数形态） |
+| `lib/flow-canvas.ts` + `components/flow-canvas.tsx` | 流程画布（W2：场景泳道/步节点/答法抽屉/意图只读 overlay/发布徽标；纯函数 parse-serialize 镜像 flow.py 分支语法、round-trip 无损，`test/flow-canvas.test.mjs` 钉住——**改 flow.py 分支/注意正则两处必须同步**） |
 
 ## 数据表（packages/business-db，新表须方言可移植）
 

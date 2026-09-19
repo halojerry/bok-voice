@@ -7,7 +7,7 @@
 --   schema 唯一真源 = packages/business-db ORM 模型 + deps.build_engine() 的幂等迁移;
 --   **改表后必须重跑本脚本重新生成**,再应用到 Supabase。
 --
--- 生成日期: 2026-09-18
+-- 生成日期: 2026-09-19
 -- 源镜像:   pgvector/pgvector:pg16
 -- 源命令:   docker exec pg-ddl pg_dump -U postgres --schema-only --no-owner --no-privileges postgres
 -- 回环校验: pgvector/pgvector:pg16 上应用本文件 + 重跑 build_engine() = 零 DDL 变更(生成时实测)
@@ -211,6 +211,7 @@ CREATE TABLE public.conversation_templates (
     steps_json text NOT NULL,
     hotwords text NOT NULL,
     graph_json text NOT NULL,
+    published_json text NOT NULL,
     owner_user_id character varying(64) NOT NULL,
     created_at timestamp without time zone NOT NULL
 );

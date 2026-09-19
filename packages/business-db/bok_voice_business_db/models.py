@@ -78,6 +78,12 @@ class ConversationTemplate(Base):
     # docs/superpowers/specs/2026-09-18-qa-flow-graph.md);空串=未启用,
     # 运行时零变化。校验/解析见 packages/core/bok_voice_core/flow_graph.py。
     graph_json: Mapped[str] = mapped_column(Text, default="")
+    # 发布冻结快照(W2-T1 模板发布两态,2026-09-19):发布时把九键
+    # (steps_json/graph_json/hotwords/tone_override/opening/core/objection/
+    # closing/language)的 live 值原样收进 JSON dict;空串=从未发布。
+    # 「已发布」≡本列非空,「有未发布改动」≡ live 与冻结不一致(CP 派生布尔)。
+    # 建单装配经机器通道 overlay 恒吃冻结版;编辑保存(PUT)永不触碰本列。
+    published_json: Mapped[str] = mapped_column(Text, default="")
     # 话务员级归属(B3):''=账号共享 / user_id=话务员个人——user 只见自己的+共享。
     owner_user_id: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
