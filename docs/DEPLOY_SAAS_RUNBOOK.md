@@ -159,6 +159,35 @@ POST https://<云域名>/api/nodes/<node_id>/commands
 
 升级节点（旧法，仍可用）：重跑 ④ 装机命令（自举覆盖代码树、保留 runtime/ 数据）。
 
+## 重启/重拉铁律（2026-09-19 crash-loop 事故）
+
+**裸 `docker compose up -d cp` 永远会复现事故——重启/重拉一律走 `./up.sh`。**
+
+2026-09-19 bok-cloud-cp-1 实案（`docker compose ps` 见 `restarts=8`）：裸
+`up -d`（含 `--force-recreate`）不带 shell 覆盖时，`DATABASE_URL` 回退 `.env` 里的
+IPv6-only 池器域名（`aws-0-ap-southeast-1.pooler.supabase.com`）——容器出网无
+IPv6，SQLAlchemy 连接失败，容器 crash-loop。事故同链还有第二坑：不带
+`BOK_CP_PORT` 时宿主口回退 8000，与宿主上的本地开发栈抢 `:8000`。
+
+正确姿势二选一（脚本不可用时才用第二条）：
+
+```bash
+cd deploy/cloud
+# 首选：up.sh 幂等施加双覆盖（池器域名→IPv4 + 端口 18010；host 已是 IP 原样通过）
+./up.sh                          # 日常重启；可透传 compose 参数，如 ./up.sh --force-recreate
+curl -fsS http://127.0.0.1:18010/health   # 应含 "ok":true
+
+# 显式双覆盖（与事故修复姿势同款；IP 漂移时改 sed 里的地址或用 up.sh 的 BOK_SUPABASE_IP）
+BOK_CP_PORT=18010 \
+DATABASE_URL="$(grep -E '^(export )?DATABASE_URL=' .env | tail -n1 | cut -d= -f2- \
+  | sed -E 's|@[^@/:]+\.pooler\.supabase\.com|@52.77.146.31|')" \
+docker compose up -d cp
+```
+
+端口分工恒定：**云 prod 宿主口=18010**（`BOK_CP_PORT`，`up.sh` 默认已带；宝塔/反代
+指 `127.0.0.1:18010`）、**本地 dev 栈=8000**（`tools/bok.py serve`）。云机若同时跑
+dev，靠这个分工互不抢占——事故第一坑正是裸 up 把 18010 退回 8000 撞上 dev 栈。
+
 ## 验收与排障对照
 
 | 症状 | 先查 |
