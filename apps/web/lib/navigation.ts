@@ -25,6 +25,7 @@ import {
   Settings,
   UserRound,
   Users,
+  Workflow,
 } from "lucide-react";
 import {
   hasPage,
@@ -48,6 +49,12 @@ export type NavItem = {
 
 /** 主导航分组（顺序即侧边栏顺序；分组序取代旧扁平 NAV 序，权限语义不受顺序影响）。 */
 export const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
+  {
+    label: "工作站",
+    items: [
+      { href: "/studio", label: "AI 工作站", key: "templates", icon: Workflow },
+    ],
+  },
   {
     label: "工作台",
     items: [
@@ -85,7 +92,7 @@ export const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
   },
 ];
 
-/** 扁平导航（派生，不手写）：工作台→运营→内容→管理。 */
+/** 扁平导航（派生，不手写）：工作站→工作台→运营→内容→管理。 */
 export const FLAT_NAV: NavItem[] = NAV_GROUPS.flatMap((g) => g.items);
 
 /** 不在主导航中但需路由守卫的页面：/translate（与同传同键）。 */

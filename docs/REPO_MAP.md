@@ -12,7 +12,7 @@
 | `scripts/` | CI 构建、E2E、延迟测量、smoke、sidecar 启动（见下「脚本」） | dev/CI |
 | `apps/agent/` | LiveKit agent 运行时（A 线客服 + B 线同传 worker） | both |
 | `apps/control-plane/` | FastAPI 业务服务 :8000（对象/人设/知识/话术/通话/审计/token/webhook/名册/外呼战役） | both |
-| `apps/web/` | Next.js 静态导出（纯浏览器 UI，节点 :3000 / 云 CP 托管：calls/interpret/supervisor/objects/personas/settings/roster/campaigns/nodes（root 停机开关）/qa（快答库：列表+画布双视图，画布新件见下「apps/web」节）…；统一链路 logger：`lib/logger.ts`（traceId/环形缓存/脱敏/全局兜底，error 自动上报 CP `/api/web_logs`，装配点 `lib/log-bootstrap.ts` + `session-context`）；`test/*.test.mjs` node --test 单测，CI web job `npm test`） | both |
+| `apps/web/` | Next.js 静态导出（纯浏览器 UI，节点 :3000 / 云 CP 托管：calls/interpret/supervisor/objects/personas/settings/roster/campaigns/nodes（root 停机开关）/qa（快答库：列表+画布双视图，画布新件见下「apps/web」节）/**studio（AI 工作站 W1：`/studio/?t=<id>` 五 tab=话术流程/意图与问答/罐头录音/通话日志/学习报告，编辑器与 /templates 共用 `components/template-editor.tsx`；主管台含捕获打铃 v0）**…；统一链路 logger：`lib/logger.ts`（traceId/环形缓存/脱敏/全局兜底，error 自动上报 CP `/api/web_logs`，装配点 `lib/log-bootstrap.ts` + `session-context`）；`test/*.test.mjs` node --test 单测，CI web job `npm test`） | both |
 | `packages/core/` | 领域模型 + 策略（`bok_voice_core`：policies/types） | both |
 | `packages/business-db/` | SQLAlchemy 仓库（`bok_voice_business_db`：global_settings 默认等） | both |
 | `packages/knowledge/` | 知识服务 / Markdown / 向量（沉淀知识库） | both |
@@ -92,6 +92,8 @@
 |---|---|
 | `components/qa-canvas-view.tsx` | React Flow 画布（步骤脊柱+QA 卫星簇渲染、拖线挂簇/挂步与断边、乐观回滚、右键菜单回调、罐头徽标✓/缺料；只读条目双向闸不出柄） |
 | `lib/qa-canvas.ts` | 画布纯函数唯一数据面（parseTemplateSteps/deriveGraph 布局契约、resolveClusterTarget 簇校验、revertCluster、localStorage 位置键；签名勿动，`test/qa-canvas.test.mjs` 钉住） |
+| `components/template-editor.tsx` | 话术模板编辑表单（2026-09-19 W1 自 /templates 原样提取：分步 goal/ref/直念/情绪/TSV 导入/热词/保存逻辑；/templates 列表页与 /studio 工作台「话术流程」tab 双页共用，提取前后渲染输出一致） |
+| `app/(app)/studio/page.tsx` | AI 工作站（列表态+`?t=<id>` 工作台态五 tab；静态导出零动态段，深链 query 参数形态） |
 
 ## 数据表（packages/business-db，新表须方言可移植）
 

@@ -245,6 +245,11 @@ export const api = {
   updateCampaign: (id: string, body: Record<string, unknown>) =>
     request<Record<string, unknown>>(`/api/campaigns/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   reportsSummary: () => request<Record<string, unknown>>("/api/reports/summary"),
+  // 学习报告（W1 AI 工作站）：话术优化分析（高频问题 TOP N）+ 高频问答对挖掘。
+  scriptInsights: (accountId = "acc-001") =>
+    request<Record<string, unknown>>(`/api/reports/script-insights?account_id=${encodeURIComponent(accountId)}`),
+  qaPairs: (accountId = "acc-001", limit = 20) =>
+    request<Record<string, unknown>[]>(`/api/reports/qa-pairs?account_id=${encodeURIComponent(accountId)}&limit=${limit}`),
   // 工作台仪表盘聚合（2026-09-17）：并发/呼叫量/接通率/时长分布/坐席排行/标记。
   statsDashboard: () => request<Record<string, unknown>>("/api/stats/dashboard"),
   reportsCalls: () => request<Record<string, unknown>[]>("/api/reports/calls"),
