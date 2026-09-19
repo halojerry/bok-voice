@@ -94,6 +94,16 @@ def _voice_tags_supported(model: str) -> bool:
     return "2.8" in (model or "")
 
 
+def _resolve_minimax_model() -> str:
+    """B 线 MiniMax 合成档解析(纯读 env,单测直喂):显式 env > B 线默认 2.8-turbo。
+
+    旧契约是 _build_tts_provider 里 setdefault 写 MINIMAX_MODEL 再全链读 env——
+    常驻 worker 写入即驻留,且 voice_tags 门读的是同一键;现单点解析、构造经
+    model_override 下发,进程 env 零写入(评审 follow-up,与采样档 P2-3 同治理)。
+    """
+    return (os.environ.get("MINIMAX_MODEL") or "").strip() or "speech-2.8-turbo"
+
+
 def _apply_voice_tags(text: str) -> str:
     """句首语气引导词 → MiniMax 2.8 语气标记(纯函数,单测直喂)。
 
@@ -440,19 +450,23 @@ def _build_tts_provider(tts_cfg: dict, target_lang: str, session_voices=None):
         # B 线默认 2026-09-16 起 2.8-turbo(原 2.6-turbo):语气词标记 (laughs)/
         # (coughs)/(sighs) 仅 2.8 系支持——真人感需求拍板上 2.8,实测代价 ~0.2s
         # 感知 lag(2532→2721ms,预算 3500 内);要快可 MINIMAX_MODEL=speech-2.6-
-        # turbo 回退(标记自动熄火)或 BOK_INTERP_VOICE_TAGS=0 只关标记。
-        os.environ.setdefault("MINIMAX_MODEL", "speech-2.8-turbo")
+        # turbo 回退(标记自动熄火)或 BOK_INTERP_VOICE_TAGS=0 只关标记。合成档
+        # 经 model_override 构造下发(_resolve_minimax_model 读 env 不写)——旧
+        # setdefault 写进程 env,常驻 worker 跨会话驻留(评审 follow-up,与采样
+        # 档 P2-3 同治理)。
         # language_boost 锁目标语,防源语音夹词时合成语种漂移;值是 MiniMax API
-        # 的外部枚举字面量(术语门禁白名单单点),唔系语言字段命名。
+        # 的外部枚举字面量(术语门禁白名单单点),唔系语言字段命名。同经构造参数
+        # 下发:同 worker 先 zh 后 en 的会话,旧 setdefault 会让 boost 停在首通
+        # 的值(合成语种漂移),现逐会话解析零驻留。
         boost_map = {"zh": "Chinese", "cantonese": "Chinese,Yue", "en": "English"}
         boost = boost_map.get(target_lang, "")
-        if boost:
-            os.environ.setdefault("MINIMAX_LANGUAGE_BOOST", boost)
         tts = MiniMaxTTS(
             voice=voice_map,
             language_state=tts_ls,
             sample_rate=int(tts_cfg.get("sample_rate") or 24000),
             api_key=str(tts_cfg.get("api_key") or ""),
+            model_override=_resolve_minimax_model(),
+            language_boost=boost or None,
         )
         # keep-warm 预连(同 A 线):无事件循环时静默跳过,失败零影响。
         try:
@@ -731,7 +745,13 @@ async def entrypoint(ctx) -> None:
     # 叹),不再是假人念稿。双门控:模型档(仅 2.8 系支持,非 2.8 会把标记念出来)
     # + env 总闸(BOK_INTERP_VOICE_TAGS=0 关)。标记进 say() 文本,字幕/落库由
     # _strip_voice_tags(译文行)与前端 stripVoiceTags(字幕)剥掉,只活合成层。
-    tts_model = os.environ.get("MINIMAX_MODEL", "")
+    # 模型档只认 MiniMax 分支(旧版靠 _build_tts_provider 的 setdefault 副作用
+    # 传递;本地 Qwen3 兜底档标记会被当文本念出来,必须保持熄火)。
+    _tts_is_minimax = (tts_cfg.get("provider") or "qwen3_tts").lower() in (
+        "minimax",
+        "minimax_streaming",
+    )
+    tts_model = _resolve_minimax_model() if _tts_is_minimax else ""
     voice_tags = os.environ.get("BOK_INTERP_VOICE_TAGS", "1") == "1" and _voice_tags_supported(tts_model)
     if tts_model:
         print(f"[interp] voice_tags {'on' if voice_tags else 'off'} (tts={tts_model})", flush=True)

@@ -2337,6 +2337,7 @@ class MiniMaxTTS(tts.TTS):
         api_key: str = "",
         emotion_state=None,
         model_override: str = "",
+        language_boost: str | None = None,
     ):
         super().__init__(
             # 真流式：声明 streaming=True，voice 管线调 stream() 走 SynthesizeStream，
@@ -2352,8 +2353,11 @@ class MiniMaxTTS(tts.TTS):
         self._key = api_key
         self._emotion_state = emotion_state
         # 回退链第二实例用(tts.FallbackAdapter hd→turbo 同音色换档):空=读 env,
-        # 与主实例同 env 会拿同一档,回退链就失去意义。
+        # 与主实例同 env 会拿同一档,回退链就失去意义。B 线主实例亦经它显式下发
+        # 合成档(唔写进程 env,评审 follow-up)。
         self._model_override = model_override
+        # 目标语 language_boost 显式档(None=未传→透传 env;空串=显式禁用)。
+        self._language_boost_override = language_boost
 
     def _resolve_emotion(self) -> str | None:
         """emotion 策略(2026-09-07 翻默认):不指定 → MiniMax 按文本自动匹配。
@@ -2427,11 +2431,17 @@ class MiniMaxTTS(tts.TTS):
         return self._model_override or os.environ.get("MINIMAX_MODEL", "speech-2.8-hd")
 
     def _language_boost(self) -> str:
-        """目标语 language_boost(env 注入,B 线同传按 target_lang 钉死;空=不下发)。
+        """目标语 language_boost(B 线构造经 language_boost 显式下发;未传=env 透传,
+        空=不下发)。
 
-        枚举值由 interpret 侧写入 MINIMAX_LANGUAGE_BOOST,这里只透传——
-        A 线没设该 env,请求里就完全不带这个键,行为零变化。
+        枚举值是 MiniMax API 外部字面量(术语门禁白名单单点)。旧契约=interpret
+        侧写 MINIMAX_LANGUAGE_BOOST、这里只透传——常驻 worker 里写入即跨会话
+        驻留(先 zh 后 en 的会话 boost 停在首通的值),改构造显式传参唔写 env
+        (评审 follow-up,与采样档 P2-3 同治理);未传参的 A 线 env 注入链路
+        (job 进程隔离,agent.py 有留档)零变化。
         """
+        if self._language_boost_override is not None:
+            return self._language_boost_override.strip()
         return os.environ.get("MINIMAX_LANGUAGE_BOOST", "").strip()
 
     def _resolve_voice(self) -> str:
