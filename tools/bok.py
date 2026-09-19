@@ -1371,14 +1371,16 @@ class _KillTreeError(RuntimeError):
     （旧版 os.killpg 在 nt 抛 AttributeError 被外层 except 吞掉 = down 静默失效）。"""
 
 
-def _kill_proc_tree(pid: int) -> None:
+def _kill_proc_tree(pid: int, force: bool = False) -> None:
     """按 _start_proc 的会话/进程组语义终止整棵进程树。
 
-    POSIX：与旧代码逐字节同款——killpg(SIGTERM)，(ProcessLookupError,
-    PermissionError, OSError) 时回退单杀；异常照旧上抛给调用方。
+    POSIX：与旧代码逐字节同款——killpg(SIGTERM)；force=True 升级 SIGKILL
+    （2026-09-19 审计 P2-13:down 只发 TERM 即返回,加载模型中/卡原生扩展的
+    进程唔死仍占端口=down 返 0 但栈未停,A/B 基线被旧代码污染的复活路径）。
+    (ProcessLookupError, PermissionError, OSError) 时回退单杀;异常照旧上抛。
     Windows：taskkill /T /F 沿父子树收割（_start_proc 用 CREATE_NEW_PROCESS_GROUP
-    建组，见 _spawn_kwargs）。rc=128（进程已不在）等价 ProcessLookupError，静默
-    放行；其余失败抛 _KillTreeError——真失败必须浮出，绝不重演静默吞。
+    建组，见 _spawn_kwargs）——Windows 恒 force（taskkill 无软杀形态）。rc=128
+    （进程已不在）等价 ProcessLookupError，静默放行；其余失败抛 _KillTreeError。
     """
     if os.name == "nt":
         try:
@@ -1397,9 +1399,9 @@ def _kill_proc_tree(pid: int) -> None:
                 f"taskkill /PID {pid} /T /F rc={r.returncode} {detail}")
         return
     try:
-        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        os.killpg(os.getpgid(pid), signal.SIGKILL if force else signal.SIGTERM)
     except (ProcessLookupError, PermissionError, OSError):
-        os.kill(pid, signal.SIGTERM)
+        os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
 
 
 def _kill_pidfile(pidfile: Path) -> None:
@@ -1731,6 +1733,44 @@ def cmd_down() -> int:
     # （旧代码被静默采纳=A/B 污染复活,评审 P1-1）。
     for port, cmd, pid in _sweep_orphan_listeners(healthy_ok=False):
         print(f"[down] swept orphan listener :{port} (pid {pid}, {cmd})")
+    # 收割验证（2026-09-19 审计 P2-13）:上面各路只发 TERM——正在加载模型/卡在
+    # 原生扩展的进程 TERM 唔死仍占端口,down 返 0 但栈未停(下一轮 serve 的
+    # sweep 才兜,窗口内 A/B 基线照样被旧代码污染)。轮询 bok 端口表至多 8s,
+    # 仍占位者升级 SIGKILL。
+    _busy_deadline = time.time() + 8.0
+    while time.time() < _busy_deadline:
+        if not _sweep_orphan_listeners(healthy_ok=False):
+            break
+        time.sleep(0.5)
+    for port, cmd, pid in _sweep_orphan_listeners(healthy_ok=False):
+        print(f"[down] escalating force-kill on :{port} (pid {pid}, {cmd})")
+        try:
+            _kill_proc_tree(pid, force=True)
+        except Exception as exc:
+            print(f"[down] force-kill failed :{port} (pid {pid}): {exc}", file=sys.stderr)
+            stop_failures += 1
+    # prod 常驻单元互搏提示（审计 P2-13b）:launchd KeepAlive 会把 down 刚杀掉
+    # 的服务原样拉回——装了 bok-* prod 单元的机器 down 完即刻复活,必须先
+    # `python tools/bok.py prod uninstall`。只提示不代做（拆常驻是显式意图）。
+    if sys.platform == "darwin":
+        try:
+            _lc = subprocess.run(
+                ["launchctl", "list"], capture_output=True, text=True, timeout=5
+            )
+            _units = [
+                line.rsplit("\t", 1)[-1]
+                for line in (_lc.stdout or "").splitlines()
+                if line.rsplit("\t", 1)[-1].startswith("bok-")
+            ]
+            if _units:
+                print(
+                    "[down] WARNING: prod launchd units still installed: "
+                    + ", ".join(sorted(_units))
+                    + " — KeepAlive will resurrect the stack; run "
+                    "`python tools/bok.py prod uninstall` first"
+                )
+        except Exception:
+            pass  # launchctl 缺席/超时唔阻 down
     return 1 if stop_failures else 0
 
 
