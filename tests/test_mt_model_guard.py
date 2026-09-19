@@ -84,3 +84,24 @@ def test_build_llm_provider_valid_mt_model_uses_mt(monkeypatch, tmp_path):
     assert isinstance(provider, StatelessMTLLM)
     assert isinstance(provider._inner, MlxLlmLLM)
     assert provider._inner._opts.model == str(mt_model)
+
+
+def test_mt_model_valid_rejects_existing_relative_path(tmp_path, monkeypatch):
+    """钉死 is_absolute 半边：相对路径即使真实存在也唔算——纯存在性实现会放行,
+    而「相对但存在」(cd 到模型目录跑 worker)正是 HF hub 解析挂死类输入。"""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "rel-mt").mkdir()
+    assert interpret._mt_model_valid("rel-mt") is False
+
+
+def test_mt_sampling_nonfinite_falls_back(monkeypatch):
+    """inf/nan/1e400 过得了 float() 但属非法采样档——回落推荐值,防 int(top_k)
+    在装配期 OverflowError/ValueError 崩掉整条 B 线 job;合法显式 env 照常优先。"""
+    monkeypatch.setenv("LLM_TEMPERATURE", "inf")
+    assert interpret._mt_sampling("LLM_TEMPERATURE", 0.7) == 0.7
+    monkeypatch.setenv("LLM_TOP_K", "nan")
+    assert interpret._mt_sampling("LLM_TOP_K", 20) == 20
+    monkeypatch.setenv("LLM_REPETITION_PENALTY", "1e400")
+    assert interpret._mt_sampling("LLM_REPETITION_PENALTY", 1.05) == 1.05
+    monkeypatch.setenv("LLM_TEMPERATURE", "0.5")
+    assert interpret._mt_sampling("LLM_TEMPERATURE", 0.7) == 0.5

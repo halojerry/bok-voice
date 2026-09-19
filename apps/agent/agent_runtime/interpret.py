@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import math
 import os
 import re
 import time
@@ -277,9 +278,12 @@ def _mt_sampling(env_key: str, mt_default: float) -> float:
     构造参数处解析,唔写回进程 env。"""
     raw = (os.environ.get(env_key) or "").strip()
     try:
-        return float(raw) if raw else mt_default
+        v = float(raw) if raw else mt_default
     except ValueError:
         return mt_default
+    # inf/nan/1e400 过得了 float() 但会炸 int(top_k) 或序列化成 Infinity/NaN
+    # ——非有限值一律当非法档回落推荐值（评审：原实现可穿透,装配期崩整条 job）。
+    return v if math.isfinite(v) else mt_default
 
 
 def _build_llm_provider(llm_cfg: dict, target_lang: str, glossary: str = ""):
@@ -326,7 +330,7 @@ def _build_llm_provider(llm_cfg: dict, target_lang: str, glossary: str = ""):
         # 挂死防线:base 有值但 model 非法(repo-id/占位符/空)——跳过 MT 走既有
         # 回退链(DeepSeek/主 LLM 原逻辑不动),日志留值方便查 env(超 60 字截断)。
         shown = mt_model[:60] + ("…" if len(mt_model) > 60 else "")
-        print(f"[interp] mt model invalid ('{shown}') — fallback main LLM", flush=True)
+        print(f"[interp] mt model invalid ('{shown}') — fallback (deepseek/main LLM 链)", flush=True)
 
     if (llm_cfg.get("provider") or "local_openai") == "deepseek" and (
         llm_cfg.get("api_key") or os.environ.get("DEEPSEEK_API_KEY")
