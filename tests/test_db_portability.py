@@ -19,6 +19,8 @@ EXPECTED_TABLES = {
     "roster_entries", "campaigns", "campaign_items",
     # 电话边缘站点（spec 2026-09-13 P1.5）：同上，缺表即门禁失败。
     "sip_sites",
+    # 跟进工单（漏斗 v2 P1，spec §3.3）：同上，缺表即门禁失败。
+    "call_followups",
 }
 
 

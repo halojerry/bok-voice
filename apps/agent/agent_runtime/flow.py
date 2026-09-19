@@ -544,6 +544,21 @@ def should_auto_advance(*, current: int, goal: str, ref: str, user_text: str, ve
     if ("平台" in ctx or "platform" in low_ctx) and _PLATFORM_RE.search(user_text):
         return True
     return False
+
+
+# ---- stall 升级阶梯(漏斗 v2,spec §3.1):同 step 连续 UNCLEAR 有出口 ----
+STALL_DEGRADE_N, STALL_BYPASS_N, STALL_CLOSE_N = 3, 5, 8
+
+
+def stall_ladder_level(streak: int) -> str:
+    """同 step 连续 UNCLEAR 数 → 阶梯级别(spec §3.1: 3 降级问法/5 绕过留号/8 收线)。"""
+    if streak >= STALL_CLOSE_N:
+        return "close"
+    if streak >= STALL_BYPASS_N:
+        return "bypass"
+    if streak >= STALL_DEGRADE_N:
+        return "degrade"
+    return ""
 # 已知资料键:若号码 run 命中佢哋 → 唔当新 WhatsApp(覆述单号/电话)
 _KNOWN_NUM_KEYS = ("快递单号", "快递单號", "快递尾号", "電話", "电话", "電話號碼")
 
@@ -870,6 +885,9 @@ class FlowController:
     # (同一串数字两窗两解,2026-09-07 日志实证),AI 拿到错号从不复核。
     # current_step_text 据此渲染「逐位复述核对」指引。agent.py 钩子每轮写入。
     last_digits: list[str] = field(default_factory=list)
+    # stall 升级账本(漏斗 v2,spec §3.1):同 step 连续 UNCLEAR 数;按 (step, turn_key)
+    # 去重——rule 与 background judge 双路报同一轮只计 1。
+    step_streak: dict[int, int] = field(default_factory=dict)
     # 话术图(2026-09-18 Phase 2):意图节点+绑定边;空图=零变化。from_template
     # 宽容解析 template["graph_json"](坏 JSON/坏版本→空图,spec §3 校验双轨)。
     graph: FlowGraphDoc = field(default_factory=FlowGraphDoc)
@@ -903,6 +921,8 @@ class FlowController:
         # 渐进披露渲染账本:每步的第一次渲染(装配/推进后首轮)才注入底稿,
         # 此后转分支模式(正稿已入对话史,重发只喂复制引力)。
         self._last_render_step = -1
+        # stall 账本轮去重键(漏斗 v2):rule 与 judge 双路报同一轮只计 1。
+        self._streak_seen: set[str] = set()
 
     @property
     def has_steps(self) -> bool:
@@ -924,6 +944,7 @@ class FlowController:
         """客户明确拒绝/告别 → 进入收尾态:之后只讲收尾话术,唔再推进/唔再按步走。"""
         self.closing = True
         self._just_advanced = False
+        self.step_streak.clear()  # 收尾态唔再计 stall(漏斗 v2,spec §3.1)
         self._entered_by_jump = False  # 收尾态尾部走 closing_text,跳转标记无意义
         self._jump_skipped = []
 
@@ -951,6 +972,9 @@ class FlowController:
 
     def advance(self) -> None:
         """推进到下一步(最后一步确认后即完成,唔越界)。"""
+        # 步切换 → 清旧步 stall 计数(漏斗 v2,spec §3.1):推进本身就係「唔卡」的证明。
+        # 首行执行(守卫之前):冇流程的控制器也照清,账本语义与流程解耦。
+        self.step_streak.pop(self.current, None)
         if not self.has_steps or self.done:
             return
         if self.current < len(self.steps):
@@ -996,6 +1020,29 @@ class FlowController:
         before = self.current
         self.jump_to(int(then_jump_1based) - 1)   # 1-based → 0-based；钳制/closing 冻结在 jump_to 内
         return self.current != before
+
+    def note_turn_outcome(self, verdict: str, step: int, turn_key: str) -> int:
+        """每轮判决记账(漏斗 v2,spec §3.1):UNCLEAR 且步未变 +1,其余清该步计数。
+
+        同一轮 rule 与 background judge 双路都报 → 按 (step, turn_key) 去重只计 1
+        (judge 迟到返回同轮同 key 直接跳过)。非 UNCLEAR 判决(实质应承/异议/
+        道别/拖延)唔算 stall → 清该步计数;QUESTION 中性(唔计唔清)——实质提问
+        =客户仲喺度倾偈,但相邻提问轮唔好抹平 judge 攒紧嘅 unclear streak
+        (否則阶梯永不触发,2026-09-18 off-detail 实弹);去重键只喺 UNCLEAR
+        计数时登记,judge 改判 unclear 仍可补计(spec「双路计数」语义)。
+        """
+        if verdict == QUESTION:
+            return self.step_streak.get(step, 0)
+        if verdict != UNCLEAR:
+            self.step_streak.pop(step, None)
+            return 0
+        key = f"{step}:{turn_key}"
+        if key in self._streak_seen:
+            return self.step_streak.get(step, 0)
+        self._streak_seen.add(key)
+        n = self.step_streak.get(step, 0) + 1
+        self.step_streak[step] = n
+        return n
 
     def apply_judge_verdict(self, verdict: str) -> None:
         """LLM 语义判定结果落状态(advance→推进;其它唔郁)。"""
@@ -1307,6 +1354,7 @@ def build_judge_messages(
     next_goal: str,
     user_text: str,
     facts: dict | None,
+    route_enabled: bool = False,
 ) -> list[dict]:
     """组推进判定器嘅 messages:简短 + 少少例子,4B 先跟得準(太長會亂答)。"""
     sys = (
@@ -1315,8 +1363,22 @@ def build_judge_messages(
     )
     if next_goal:
         sys += f"。下一步（若推进）：{next_goal}"
+    # 输出契约(route 模式下整体替换,唔做后置追加——「只输出三个词之一」係
+    # 硬指令,后补弱指令会被模型一致无视,2026-09-18 9B 实测零 compliant)。
+    if route_enabled:
+        sys += (
+            "。客户说完一句话，先判断该不该进入下一步，再判断佢有没有实质诉求。"
+            "第一行只输出 advance / stay / objection 之一。\n"
+            "第二行输出 route=X conf=0.0~1.0。route 只准五个值："
+            "register_followup（要查单/查进度/跟进登记/投诉要求处理）/"
+            "capture_contact（愿意留联系方式）/transfer_human（指名要真人）/"
+            "degrade_question（听唔明客户讲咩/答非所问）/keep（冇任何诉求）。\n"
+        )
+    else:
+        sys += (
+            "。客户说完一句话，判断客服是否该进入下一步。只输出三个词之一：advance / stay / objection。\n"
+        )
     sys += (
-        "。客户说完一句话，判断客服是否该进入下一步。只输出三个词之一：advance / stay / objection。\n"
         "advance=客户已答完/确认当前步，或客户问/讲的正正是下一步内容，"
         "或当前步在引导核实资料而客户已答出关键资料（例如讲到在哪个平台买，即使商品/金额未完全对上提示）"
         "且下一步正是承接这个答案的动作；或当前步在向客户提问而他给了明确答案"
@@ -1324,7 +1386,17 @@ def build_judge_messages(
         "stay=客户答/问的仍是当前步要处理的（关键资料还没给到，如在核实步未讲到平台、在问当前步该交代的事）。\n"
         "objection=客户否认/拒绝/不关事/想挂线。\n"
         "全程是AI客服自己和客户聊，客户答不出不等于要转真人，判断只管推进流程。\n"
-        "例子：\n"
+    )
+    ex_head = "例子：\n"
+    if route_enabled:
+        # route 示例置顶(primacy):放例尾会被前 6 条稀释,9B 实测投诉例置顶后 5/5 compliant。
+        ex_head += (
+            "客户：「我要投诉件货延误」且当前係核实 -> stay\n"
+            "route=register_followup conf=0.8\n"
+            "客户：「你哋係咪呃人㗎」-> stay\n"
+            "route=keep conf=0.6\n"
+        )
+    sys += ex_head + (
         "客户：「好，没问题，係我嘅」-> advance\n"
         "客户：「你哋係邊間公司㗎？」-> stay\n"
         "客户：「唔好再打嚟！」-> objection\n"
@@ -1335,9 +1407,13 @@ def build_judge_messages(
     if facts:
         known = " ".join(f"{k}={v}" for k, v in facts.items() if v)
         sys += f"\n已知客戶資料:{known}"
+    if route_enabled:
+        user_msg = f"客戶:「{user_text}」\n第一行輸出 advance/stay/objection，第二行輸出 route=X conf=0.0~1.0。"
+    else:
+        user_msg = f"客戶:「{user_text}」\n淨係輸出 advance / stay / objection 其中一個字。"
     return [
         {"role": "system", "content": sys},
-        {"role": "user", "content": f"客戶:「{user_text}」\n淨係輸出 advance / stay / objection 其中一個字。"},
+        {"role": "user", "content": user_msg},
     ]
 
 
@@ -1351,6 +1427,44 @@ def parse_judge_output(text: str) -> str:
     return UNCLEAR
 
 
+JUDGE_ROUTES = frozenset(
+    {"keep", "degrade_question", "capture_contact", "register_followup", "transfer_human"}
+)
+_ROUTE_RE = re.compile(r"route\s*[=:]\s*([a-z_]+)")
+_CONF_RE = re.compile(r"conf(?:idence)?\s*[=:]\s*([0-9](?:\.\d+)?)?")
+
+
+def parse_judge_route(text: str) -> tuple[str, float]:
+    """解析 judge 输出的路由字段(route/conf)。缺失/非法 route 回落 keep;
+    route 有值但 conf 缺失/非法 → 按门槛值 0.7 放行(显式 route 係强信号,
+    conf 只是修饰——实弹里 9B 偶发省略 conf,按 0.0 处理会静默杀掉整条链)。"""
+    t = (text or "").strip().lower()
+    m = _ROUTE_RE.search(t)
+    route = m.group(1) if m and m.group(1) in JUDGE_ROUTES else "keep"
+    c = _CONF_RE.search(t)
+    conf_val: float | None = None
+    if c and c.group(1):
+        try:
+            conf_val = float(c.group(1))
+        except ValueError:
+            conf_val = None
+    if conf_val is None:
+        conf_val = 0.0 if route == "keep" else 0.7
+    return route, min(max(conf_val, 0.0), 1.0)
+
+
+# 工单登记置信门槛(漏斗 v2,spec §3.3):judge conf ≥ 0.7 先触发建单——
+# 低置信轮宁可不动作,唔好乱开单打扰人工。
+FOLLOWUP_CONF_MIN = 0.7
+
+
+def degrade_boost(streak: int, route: str, conf: float) -> int:
+    """degrade 早触发(漏斗 v2,spec §3.1):judge 高置信 degrade_question →
+    streak 直接抬到降级门槛(STALL_DEGRADE_N),下一轮规则路车道立即出降级
+    问法,免硬数 3 轮。其它 route / 低置信一律原样返回。纯函数,离线可测。"""
+    if route == "degrade_question" and conf >= 0.7:
+        return max(streak, STALL_DEGRADE_N)
+    return streak
 # ---- 意图判据判定器(Phase 3.4 意图引擎,spec §4)----
 # 关键词未中嘅模糊轮:一次批量调用评估「本通全部有判据且在 scope」嘅意图,多选一
 # 输出(一个 intent id 或 NONE)。绝不做 N 次调用——判据判定系让路背景活,唔可以

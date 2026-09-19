@@ -37,7 +37,7 @@ from .qa_gate import (
 from .tts_cache import CachedTTS, TtsAudioCache, default_cache_dir, frames_aiter, pcm_to_frames, tts_cache_enabled
 # 模块级引 flow(纯 stdlib 依赖,无环):_wa_numberish/_wa_number_line 等模块级
 # helper 用;entrypoint 内的 function-scoped import 属历史样式,不冲突。
-from .flow import _digit_normalize, digits_to_cantonese
+from .flow import _digit_normalize, digits_to_cantonese, stall_ladder_level
 
 try:
     from bok_voice_obs.logging import configure_logging, get_logger
@@ -857,6 +857,33 @@ def _pause_ack_line(lang: str) -> str:
     return "好的，您稍等一下。"
 
 
+_FOLLOWUP_COMPLAINT_RE = re.compile(r"投[訴诉]|complain", re.IGNORECASE)
+_FOLLOWUP_TRACK_RE = re.compile(
+    r"查[下睇]?.{0,6}(?:單|单|件|货|貨)|(?:單|单)[號号]|追蹤|跟踪|进度|進度|track", re.IGNORECASE
+)
+
+
+def _followup_kind_from_text(text: str) -> str:
+    """judge route=register_followup 时给工单定 kind(spec §3.3 白名单三值)。
+    纯分类用途,唔做闸门——闸门喺 judge conf,唔喺关键词。"""
+    t = text or ""
+    if _FOLLOWUP_COMPLAINT_RE.search(t):
+        return "complaint"
+    if _FOLLOWUP_TRACK_RE.search(t):
+        return "track_order"
+    return "followup"
+
+
+def _followup_ack_line(lang: str) -> str:
+    """建单成功确认语(三语直念):诚实降级——登记+专人跟进+SLA,绝不装查。
+    call-91a6b8c9 教训:系统冇查单能力就唔好令客户以为查紧。"""
+    if lang == "cantonese":
+        return "好，我幫你登記咗跟進㗎啦，會有專人24小時內覆你，你放心。"
+    if lang == "en":
+        return "All right, I've logged this for follow-up. A specialist will get back to you within 24 hours."
+    return "好的，我已经帮您登记跟进了，会有专人在24小时内回复您，请放心。"
+
+
 def _wa_number_line(lang: str, num: str) -> str:
     """碎片暂存超时 flush 嘅脚本直念(session.say,零 TTFT/零前缀断裂):captured →
     复述确认;唔系号码 → 请客户继续。三语骨架,风格同 _nudge_line。"""
@@ -1100,6 +1127,25 @@ def _farewell_line(name: str, lang: str) -> str:
     if lang == "en":
         return f"{name or 'Goodbye'}, I'll try again later. Thanks and goodbye."
     return f"{who}那我稍后再联系您，谢谢您，再见"
+
+
+def _stall_ladder_line(lang: str, level: str) -> str:
+    """stall 阶梯直念行(spec §3.1)。degrade=封闭问句引导;bypass=绕过留号。
+    v1 无模板 degrade_hint 字段,通用罐头;三语,cantonese 全小写。"""
+    _LINES = {
+        "degrade": {
+            "zh": "这样吧，您不用想那么多——我就问您一句，您答个「是」或者「不是」就行。",
+            "cantonese": "噉啦，唔使諗咁多——我就問你一句，你答「係」定「唔係」就得㗎啦。",
+            "en": "Let me keep this simple — a yes or no will do.",
+        },
+        "bypass": {
+            "zh": "要不这样，您留个 WhatsApp 给我们，我们安排专人帮您跟进，好吗？",
+            "cantonese": "不如噉，你留个 WhatsApp 俾我哋，我哋安排专人帮你跟进，好唔好？",
+            "en": "How about you leave us your WhatsApp, and we'll have a specialist follow up with you?",
+        },
+    }
+    table = _LINES.get(level) or _LINES["degrade"]
+    return table.get(lang) or table["cantonese"]
 
 
 def _normalize_lang(raw, default: str = "") -> str:
@@ -2167,6 +2213,9 @@ async def entrypoint(ctx):
 
     # 背景 flow judge 防疊:記錄而家 judge 緊邊一步(-1=冇)。推進唔可以同時兩個 judge。
     _judge_inflight: dict = {"step": -1}
+    # judge 路由字段账本(漏斗 v2,spec §3.2):最近一次 judge 的 route/conf。
+    # 只写入不消费(Task 4 工具层/升级器接线);BOK_ROUTE_JUDGE=0 时保持初值。
+    _judge_route: dict = {"route": "keep", "conf": 0.0, "step": -1}
     # 3.4 意图判据 judge 账本:on=背景批量判定在途(单飞,防同一模糊轮连开);
     # pending=已判定命中、等下一次图引擎求值消费(single-shot:消费即清,唔理绑定
     # 真触发与否——消费点 pick 会重过全部守卫,过期就打 judge_pending_expired)。
@@ -3201,16 +3250,28 @@ async def entrypoint(ctx):
 
     ctx.add_shutdown_callback(_wait_close_flush)
 
-    async def _background_flow_judge(step_at: int, utt: str) -> None:
+    async def _background_flow_judge(step_at: int, utt: str, turn_key: str = "") -> None:
         """背景跑 LLM 推進判定:唔好喺開聲前同步等(會每輪拖慢),判定完喺下一輪先生效。
 
         唔會 double-advance:只喺 flow 仲喺 judge 嗰步(step_at)時先落 advance。
+        turn_key(stall 账本用,漏斗 v2):同轮 rule 路已按此 key 记账,judge 返回后
+        带同 key 落账——unclear 去重只计 1,judge 改判非 unclear 则清该步计数。
         """
         try:
             # 让路节流:主回复刚提交,先等一拍再喺同一 mlx server(:1235)跑 judge——
             # judge 与主回复抢 prefill 会推高本轮 TTFT;judge 判定本来就下一轮先生效,迟几秒冇损失。
             await asyncio.sleep(float(os.environ.get("FLOW_JUDGE_DELAY", "3")))
-            from .flow import build_judge_messages, parse_judge_output
+            from .flow import (
+                build_judge_messages,
+                degrade_boost,
+                FOLLOWUP_CONF_MIN,
+                parse_judge_output,
+                parse_judge_route,
+            )
+
+            # judge 路由字段(漏斗 v2,spec §3.2):BOK_ROUTE_JUDGE=1 才喺 judge
+            # prompt 加 route/conf 段并解析落账;默认 0=旧 prompt 零行为漂移。
+            route_enabled = os.environ.get("BOK_ROUTE_JUDGE", "1") == "1"  # 探针验收过(2026-09-18),0=回退
 
             # judge 专线优先(FLOW_JUDGE_*,bok.py 注入指向 :1237 9B——后台判定
             # 是 fire-and-forget 重活,大模型判定质量↑且与活通话回复的 :1235
@@ -3237,8 +3298,33 @@ async def entrypoint(ctx):
                 next_goal=flow_ctrl.next_goal(),
                 user_text=utt,
                 facts=flow_ctrl.vars_map,
+                route_enabled=route_enabled,
             )
-            jv = parse_judge_output(await _llm_judge(jbase, jmodel, msgs))
+            _raw = await _llm_judge(jbase, jmodel, msgs)
+            jv = parse_judge_output(_raw)
+            if route_enabled:
+                _rr, _cc = parse_judge_route(_raw)
+                _judge_route.update(route=_rr, conf=_cc, step=step_at)
+            # judge 打点尾注(仅 route_enabled):route/conf 供漏斗 v2 观测对账。
+            _route_log = (
+                f" route={_judge_route['route']} conf={_judge_route['conf']:.2f}"
+                if route_enabled
+                else ""
+            )
+            # stall 账本 judge 路(漏斗 v2,spec §3.1):仍喺 judge 嗰步先落账——
+            # unclear 同轮 rule 路已计过(同 turn_key 去重只计 1);judge 改判
+            # 非 unclear(实质应承/提问/异议)= 客户唔係卡死 → 清该步计数。
+            if turn_key and flow_ctrl.current == step_at:
+                flow_ctrl.note_turn_outcome(jv, step_at, turn_key)
+            # degrade 早触发(漏斗 v2,spec §3.1):judge 高置信 degrade_question →
+            # streak 抬到降级门槛,下一轮规则路 stall 车道立即出降级问法,
+            # 免硬数 3 轮——客户明确「听唔明你讲咩」时每轮都係损耗。
+            if route_enabled and _judge_route["step"] == step_at and flow_ctrl.current == step_at:
+                flow_ctrl.step_streak[step_at] = degrade_boost(
+                    flow_ctrl.step_streak.get(step_at, 0),
+                    _judge_route["route"],
+                    _judge_route["conf"],
+                )
             if (
                 flow_ctrl.current == step_at
                 and flow_ctrl.has_steps
@@ -3261,17 +3347,42 @@ async def entrypoint(ctx):
                     # 客户话里有实质应承特征,长句无特征拦下。
                     if not judge_confirm_advance_allowed(goal=_gj, ref=_rj, user_text=utt):
                         print(
-                            f"[flow] judge(bg)=confirm blocked (no ack signal) step={step_at + 1} (call {room_name})",
+                            f"[flow] judge(bg)=confirm blocked (no ack signal) step={step_at + 1} (call {room_name}){_route_log}",
                             flush=True,
                         )
                     elif wa_confirm_advance_allowed(goal=_gj, ref=_rj, captured=_wa_captured["on"]):
                         flow_ctrl.advance()
                         context_state.set_flow_current(flow_ctrl.current_step_text())
-                        print(f"[flow] judge(bg)=confirm step={flow_ctrl.current + 1} (call {room_name})", flush=True)
+                        print(f"[flow] judge(bg)=confirm step={flow_ctrl.current + 1} (call {room_name}){_route_log}", flush=True)
                     else:
-                        print(f"[flow] judge(bg)=confirm blocked (wa step, not captured) step={step_at + 1} (call {room_name})", flush=True)
+                        print(f"[flow] judge(bg)=confirm blocked (wa step, not captured) step={step_at + 1} (call {room_name}){_route_log}", flush=True)
                 else:
-                    print(f"[flow] judge(bg)={jv} step={step_at + 1} (call {room_name})", flush=True)
+                    print(f"[flow] judge(bg)={jv} step={step_at + 1} (call {room_name}){_route_log}", flush=True)
+            # 跟进工单消费(漏斗 v2,spec §3.3):judge 高置信 register_followup →
+            # CP 建单 + 诚实确认语直念(登记+专人跟进+SLA,绝不装查)。背景任务
+            # 内执行唔进关键路径;speech 队列天然串行,确认语排在在途回复后出声。
+            # created:false = 同 call 同 kind 已有 open 单 → 唔重复播确认。
+            if (
+                route_enabled
+                and os.environ.get("BOK_TOOLS_FOLLOWUP", "1") == "1"  # 探针验收过(2026-09-18),0=纯话术
+                and _judge_route["step"] == step_at
+                and _judge_route["route"] == "register_followup"
+                and _judge_route["conf"] >= FOLLOWUP_CONF_MIN
+                and not closed.is_set()
+            ):
+                _fu = await cp.create_followup(
+                    call_id, kind=_followup_kind_from_text(utt), note=utt[:200]
+                )
+                if _fu and _fu.get("created"):
+                    _fu_ack = _followup_ack_line(language_state.lang)
+                    context_state.set_last_reply(_fu_ack)
+                    await _say_script(session, tts_provider, _tts_cache, _fu_ack)
+                    print(
+                        f"[followup] created via judge route id={_fu.get('id', '')} (call {room_name})",
+                        flush=True,
+                    )
+                elif _fu:
+                    print(f"[followup] idempotent hit, no re-ack (call {room_name})", flush=True)
         except Exception as exc:  # pragma: no cover - 背景判定失敗唔影響回覆
             print(f"[flow] judge(bg) failed: {exc!r} (call {room_name})", flush=True)
         finally:
@@ -3766,6 +3877,11 @@ async def entrypoint(ctx):
                     from .flow import should_auto_advance, _digit_runs_in
 
                     verdict = flow_ctrl.rule_verdict(user_text)
+                    # stall 账本轮键(漏斗 v2,spec §3.1):rule 与 judge 双路对同一轮
+                    # 记账的去重凭据,spawn judge 时透传。用本轮单调时刻而非 _t0
+                    # (那是通话起点常量)——同文重复轮(「你说什么」连问两遍)唔会
+                    # 撞 key,阶梯计数先涨得起来。
+                    _turn_key = f"{user_text}:{time.monotonic():.6f}"
                     # verdict 进尾部:规则判定结果此前只用于推进、从不进提示词,
                     # 客户提问/答非所问时模型冇「该怎么答」指引 → 复读当前步。
                     flow_ctrl.last_verdict = verdict
@@ -3870,10 +3986,66 @@ async def entrypoint(ctx):
                                 _judge_inflight["step"] = _step_at
                                 # 池化(2026-09-17 全量 debug P2-A):judge 任务丢失=
                                 # 该轮不推进(下轮规则补位)——强引用+失败打点防静默。
-                                _spawn_report(_background_flow_judge(_step_at, user_text))
+                                _spawn_report(_background_flow_judge(_step_at, user_text, turn_key=_turn_key))
+                    # stall 账本规则路(漏斗 v2,spec §3.1):每轮判决记账——UNCLEAR
+                    # 且步未变 +1(下方 judge 路同 key 去重只计 1);推进/其它 verdict
+                    # 清该步计数(清零语义在方法内)。推进轮 verdict 以 "" 记
+                    # (advance 已清旧步;UNCLEAR 借宽松语义推进如身份步,唔算新步 stall)。
+                    flow_ctrl.note_turn_outcome(
+                        "" if flow_ctrl.current != _flow_step_before else verdict,
+                        flow_ctrl.current,
+                        _turn_key,
+                    )
                     context_state.set_flow_current(flow_ctrl.current_step_text())
                 except Exception:  # pragma: no cover - 流程推进失败不阻断回复
                     pass
+            # ---- stall 升级阶梯(漏斗 v2,spec §3.1):同 step 连续 UNCLEAR 有出口。
+            # 3 降级问法 / 5 绕过留号 / 8 主动收线——全部 _say_script 直念零 TTFT。
+            # bypass 在号码已在手时直升 close(留号无意义)。插喺 DEFER 车道之前:
+            # 账本记账喺上方 flow try 内已完成,此轮 verdict 唔係 UNCLEAR 时 streak
+            # 已被清零,车道自然唔触发。BOK_STALL_LADDER=0 回退(合入初版默认关)。
+            if (
+                os.environ.get("BOK_STALL_LADDER", "1") == "1"  # 探针验收过(2026-09-18),0=回退
+                and flow_ctrl.has_steps
+                and not flow_ctrl.done
+                and not flow_ctrl.closing
+                and not closed.is_set()
+            ):
+                _lvl = stall_ladder_level(flow_ctrl.step_streak.get(flow_ctrl.current, 0))
+                if _lvl == "bypass" and _wa_captured["on"]:
+                    _lvl = "close"  # 号码已在手,留号无意义 → 直接收线
+                if _lvl:
+                    print(
+                        f"[stall-ladder] step={flow_ctrl.current + 1} level={_lvl} "
+                        f"streak={flow_ctrl.step_streak.get(flow_ctrl.current, 0)} (call {room_name})",
+                        flush=True,
+                    )
+                    if _lvl == "close":
+                        flow_ctrl.enter_closing()
+                        _invalidate_stale_preemptive("stall 收线 → 收尾")
+                        _line = _farewell_line(
+                            str((object_card or {}).get("display_name") or "").strip(),
+                            language_state.lang,
+                        )
+                        _schedule_call_end(8.0, disposition="polite_close")
+                    else:
+                        _line = _stall_ladder_line(language_state.lang, _lvl)
+                    context_state.set_last_reply(_line)
+                    _turn_origin["gen"] = "script"
+                    _turn_origin["provider"] = f"stall-{_lvl}"
+                    try:
+                        _sl_ms = int((time.monotonic() - _t0) * 1000)
+                        await cp.add_turn(
+                            call_id, "user", user_text, language=language_state.lang,
+                            line="a", speaker="customer",
+                            template_step=(int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0,
+                            started_ms=_sl_ms, ended_ms=_sl_ms,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    _cancel_response_watchdog()
+                    await _say_script(session, tts_provider, _tts_cache, _line)
+                    raise StopResponse()
             # ---- DEFER 短应承车道(2026-09-12 P0「会说话」) ----
             # 客户社交拖延(「我先查一下/有了再通知你/稍等我看看」)→ 三语短应承
             # 脚本直念(零 TTFT/零照本),不推进/不 judge/不走 LLM——call-8fa17d2b
@@ -4625,5 +4797,8 @@ def run_agent() -> None:
     # /api/token 挂 RoomAgentDispatch 精确派发;不再隐式接所有房间(含同传房)。
     # port 显式钉 8081(prod status 探活 :8081/worker):A/B 线三个 worker 并存,
     # 不分端口会同抢默认 8081,后绑者 Errno 48 即崩("Agent did not join the
-    # room" 根因,2026-09-06 实证)。
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name="bok-voice", port=8081))
+    # room" 根因,2026-09-06 实证)。BOK_WORKER_PORT 可覆盖(默认 8081 零漂移):
+    # 单机多栈并存(并行会话/多 worktree 验收)时错开端口,免被对方端口预清
+    # 当殭尸杀(2026-09-18 漏斗 v2 隔离 E2E 实证)。
+    _worker_port = int(os.environ.get("BOK_WORKER_PORT", "8081") or 8081)
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name="bok-voice", port=_worker_port))

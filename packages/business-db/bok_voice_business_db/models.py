@@ -468,6 +468,25 @@ class FillerEntry(Base):
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
+class CallFollowup(Base):
+    """跟进工单(漏斗 v2 工具层,spec §3.3):查单/投诉/跟进登记 → 人工跟办。
+
+    v1 只有「登记+人工跟进」一档(无真实订单数据源,接入后插同一 action 槽位)。
+    status: open=待跟办 / done=已办结 / cancelled=作废。kind 白名单三值。
+    """
+
+    __tablename__ = "call_followups"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    call_id: Mapped[str] = mapped_column(String(64), index=True)
+    account_id: Mapped[str] = mapped_column(String(64), index=True, default="acc-001")
+    object_id: Mapped[str] = mapped_column(String(64), default="")
+    kind: Mapped[str] = mapped_column(String(16), default="followup")
+    note: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(16), default="open")
+    created_by: Mapped[str] = mapped_column(String(64), default="")  # ''=机器通道
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
 class Org(Base):
     """租户（P0 骨架：身份体系 P1 落地，先立 org 缝）。"""
     __tablename__ = "orgs"

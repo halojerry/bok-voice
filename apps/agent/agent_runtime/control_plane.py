@@ -168,6 +168,22 @@ class ControlPlaneClient:
         )
         r.raise_for_status()
 
+    async def create_followup(self, call_id: str, kind: str = "followup", note: str = "") -> dict | None:
+        """跟进工单登记(漏斗 v2 工具层,spec §3.3):judge route=register_followup
+        或规则命中后落单。CP 侧幂等(同 call 同 kind 已有 open 单 → created:false
+        原样返回原单)。失败返回 None(fire-with-log,唔阻 judge 任务/通话)。
+        """
+        try:
+            r = await self._client.post(
+                f"/api/calls/{call_id}/followups",
+                json={"kind": kind, "note": note},
+            )
+            r.raise_for_status()
+            return r.json()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[followup] create failed: {exc!r} (call {call_id})", flush=True)
+            return None
+
     async def list_qa_entries(self, account_id: str = "acc-001", owner_scope: str | None = None) -> list[dict]:
         """快答库启用条目(Q→A 快路,PR-3):每通装配拉一次,变更下一通生效。
 

@@ -421,6 +421,55 @@ class SqlAlchemyBusinessRepository:
             row.hit_count = int(row.hit_count or 0) + int(n)
             self.session.commit()
 
+    # ---- 跟进工单(漏斗 v2 工具层,spec §3.3:查单/投诉/跟进登记 → 人工跟办) ----
+
+    @staticmethod
+    def _followup_to_dict(row) -> dict:
+        return {
+            "id": row.id,
+            "call_id": row.call_id,
+            "account_id": row.account_id,
+            "object_id": row.object_id,
+            "kind": row.kind,
+            "note": row.note,
+            "status": row.status,
+            "created_by": row.created_by,
+            "created_at": row.created_at.isoformat() if row.created_at else "",
+        }
+
+    def create_followup(self, *, call_id: str, account_id: str, object_id: str = "", kind: str = "followup", note: str = "", created_by: str = "") -> dict:
+        row = models.CallFollowup(
+            id=f"fu:{uuid.uuid4().hex[:12]}",
+            call_id=call_id,
+            account_id=account_id or "acc-001",
+            object_id=object_id or "",
+            kind=kind or "followup",
+            note=note or "",
+            created_by=created_by or "",
+        )
+        self.session.add(row)
+        self.session.commit()
+        return self._followup_to_dict(row)
+
+    def find_open_followup(self, call_id: str, kind: str) -> dict | None:
+        """同 call 同 kind 的 open 单(幂等防叠按 (call, kind) 维度)。"""
+        stmt = (
+            select(models.CallFollowup)
+            .filter_by(call_id=call_id, kind=kind, status="open")
+            .order_by(models.CallFollowup.created_at)
+            .limit(1)
+        )
+        row = self.session.scalars(stmt).first()
+        return self._followup_to_dict(row) if row else None
+
+    def list_followups(self, account_id: str = "", call_id: str = "", limit: int = 100) -> list[dict]:
+        stmt = select(models.CallFollowup).order_by(models.CallFollowup.created_at)
+        if account_id:
+            stmt = stmt.filter_by(account_id=account_id)
+        if call_id:
+            stmt = stmt.filter_by(call_id=call_id)
+        stmt = stmt.limit(max(1, min(int(limit), 1000)))
+        return [self._followup_to_dict(r) for r in self.session.scalars(stmt)]
     # ---- 意向规则(W4-T1,2026-09-19):挂断评估条件规则,两级作用域 ----
 
     @staticmethod
@@ -1340,6 +1389,7 @@ class InMemoryBusinessRepository:
         self.campaign_items: dict[str, dict] = {}
         self.sites: dict[str, dict] = {}
         self.filler_entries: dict[str, dict] = {}
+        self.followups: dict[str, dict] = {}
         self.intent_rules: dict[str, dict] = {}
         self.settings: dict = SqlAlchemyBusinessRepository.default_settings()
         self.users: dict[str, dict] = {}
@@ -1583,6 +1633,47 @@ class InMemoryBusinessRepository:
         row = getattr(self, "qa_entries", {}).get(entry_id)
         if row is not None:
             row["hit_count"] = int(row.get("hit_count") or 0) + int(n)
+
+    # ---- 跟进工单(漏斗 v2 工具层,镜像 qa_entries 姿势,与 SQL 后端同语义) ----
+
+    def create_followup(self, *, call_id: str, account_id: str, object_id: str = "", kind: str = "followup", note: str = "", created_by: str = "") -> dict:
+        from datetime import datetime, timezone
+
+        if not hasattr(self, "followups"):
+            self.followups = {}
+        row = {
+            "id": f"fu:{uuid.uuid4().hex[:12]}",
+            "call_id": call_id,
+            "account_id": account_id or "acc-001",
+            "object_id": object_id or "",
+            "kind": kind or "followup",
+            "note": note or "",
+            "status": "open",
+            "created_by": created_by or "",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.followups[row["id"]] = row
+        return dict(row)
+
+    def find_open_followup(self, call_id: str, kind: str) -> dict | None:
+        rows = [
+            v
+            for v in getattr(self, "followups", {}).values()
+            if v.get("call_id") == call_id and v.get("kind") == kind and v.get("status") == "open"
+        ]
+        if not rows:
+            return None
+        return dict(min(rows, key=lambda v: v.get("created_at") or ""))
+
+    def list_followups(self, account_id: str = "", call_id: str = "", limit: int = 100) -> list[dict]:
+        rows = [
+            v
+            for v in getattr(self, "followups", {}).values()
+            if (not account_id or v.get("account_id") == account_id)
+            and (not call_id or v.get("call_id") == call_id)
+        ]
+        rows.sort(key=lambda v: v.get("created_at") or "")
+        return [dict(r) for r in rows[: max(1, min(int(limit), 1000))]]
 
     def iter_call_conversations(self, account_id: str = "", exclude_test_objects: bool = False) -> list[list[dict]]:
         out: list[list[dict]] = []

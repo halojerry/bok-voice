@@ -2089,6 +2089,54 @@ def mark_whatsapp_handled(call_id: str, req: WhatsAppHandledRequest, request: Re
     return updated
 
 
+class CreateFollowupRequest(BaseModel):
+    """跟进工单建单请求（漏斗 v2 工具层，spec §3.3）。
+
+    inline 在本文件勿进 schemas.py（主仓该文件有未提交 WIP，合并防撞）。
+    kind 白名单三值在端点内校验：track_order / complaint / followup。
+    """
+
+    kind: str = "followup"
+    note: str = ""
+
+
+@app.post("/api/calls/{call_id}/followups")
+def create_followup(call_id: str, req: CreateFollowupRequest, request: Request) -> dict:
+    """登记跟进工单（查单/投诉/跟进登记 → 人工跟办）。
+
+    v1 无真实订单数据源，只有「登记+人工跟进」一档，不装查。幂等防叠：
+    同 call 同 kind 已有 open 单 → 原样返回 created:false（agent 侧重试/
+    规则+judge 双路触发不叠单、不重播确认语）。鉴权块照 /api/calls/{id} 族：
+    页面闸 + 跨账号 404；机器通道直通、user 盖 created_by、工单账号随通话。
+    """
+    _gate_page(request, "calls")
+    deny_cross_account(request, _repo().get_call(call_id))
+    call = _repo().get_call(call_id)
+    if not call:
+        raise HTTPException(404, "call not found")
+    kind = (req.kind or "").strip()
+    if kind not in {"track_order", "complaint", "followup"}:
+        raise HTTPException(400, "invalid kind")
+    account_id = str(call.get("account_id") or "acc-001")
+    identity = current_identity(request)
+    created_by = identity.user_id if identity is not None else ""
+    existing = _repo().find_open_followup(call_id, kind)
+    if existing is not None:
+        return {"created": False, **existing}
+    row = _repo().create_followup(
+        call_id=call_id,
+        account_id=account_id,
+        object_id=str(call.get("object_id") or ""),
+        kind=kind,
+        note=req.note or "",
+        created_by=created_by,
+    )
+    _audit("followup.create", subject_type="call", subject_id=call_id,
+           account_id=account_id, call_id=call_id,
+           detail={"kind": kind, "followup_id": row.get("id", "")})
+    return {"created": True, **row}
+
+
 @app.get("/api/roster")
 def list_roster(request: Request, account_id: str = "acc-001", status: str = "", channel: str = "") -> list[dict]:
     """名册认领池列表；status/channel 空=不过滤。"""
