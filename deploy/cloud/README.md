@@ -152,7 +152,13 @@ docker run --rm -v bok-cloud_cp-vault:/data -v /www/backup:/backup \
 ```bash
 docker compose ps              # 容器状态 + 健康
 docker compose logs -f cp      # 跟日志
-docker compose restart cp      # 重启
-docker compose down            # 停止并删容器（vault 卷保留）
+./up.sh                        # 重启/重拉唯一入口（幂等施加 DATABASE_URL IP 覆盖+端口 18010；
+                               #   可透传 compose 参数，如 ./up.sh --force-recreate）
+docker compose down            # 停止并删容器（vault 卷保留；down 不吃 DATABASE_URL，可裸跑）
 docker compose down -v         # ⚠ 连 vault 卷一起删（人设参考音频会丢，慎用）
 ```
+
+> **铁律（2026-09-19 crash-loop 事故）**：`docker compose restart cp` 只在容器
+> 定义不变时可用；任何 `up`（含 `--force-recreate`）**必须走 `./up.sh`**——裸 up 会
+> 把 DATABASE_URL 回退 `.env` 的 IPv6-only 池器域名，容器 crash-loop（实案
+> restarts=8）。详见 `docs/DEPLOY_SAAS_RUNBOOK.md`「重启/重拉铁律」。

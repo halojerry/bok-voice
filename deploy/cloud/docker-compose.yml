@@ -5,7 +5,10 @@
 #   **不含** agent runtime（VAD/ASR/LLM/TTS 管线跑在客户节点 GPU 机器上，见
 #   docs/RUNTIME_TOPOLOGY.md §0 分发型拓扑）——本编排只起云侧控制面一个服务。
 #
-# 使用：cp .env.example .env → 填好 → docker compose up -d（详见同目录 README.md）。
+# 使用：cp .env.example .env → 填好 → **重启/重拉一律 ./up.sh**（幂等施加
+#   DATABASE_URL 池器域名→IPv4 覆盖+宿主口 18010；裸 docker compose up -d 会把
+#   DATABASE_URL 回退 IPv6-only 池器域名 crash-loop,2026-09-19 实案 restarts=8。
+#   详见同目录 README.md §9 与 docs/DEPLOY_SAAS_RUNBOOK.md「重启/重拉铁律」）。
 # 数据：业务库在 Supabase Postgres（DATABASE_URL）；知识库 vault（人设参考音频等
 #   文件）落命名卷 cp-vault——容器重建/镜像升级不丢。
 
