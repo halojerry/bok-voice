@@ -58,8 +58,26 @@ def test_forward_jump_marker_names_skipped_steps():
     assert "第 4 步" in txt and "共 4 步" in txt
     assert "绝不按流程总览的顺序从头重新开始" in txt
     assert "绝不再问被跳过步骤里的任何问题" in txt
+    assert "只准问本步的问题" in txt  # 替代提问出口（防借被跳步问句提问）
     # 底稿照进首轮（跳步轮手上有本步正稿——引力竞争的本钱）
     assert "按平台规则赔付" in txt
+
+
+def test_forward_jump_forbidden_quotes_last_line():
+    """禁讲清单：被跳步原话照录（=总览事实行同文，复制源点名）、且是尾部最后一行
+    （正稿在前禁句在后——生成前最后看到的是禁令）。仅跳转首轮渲染。"""
+    fc = _fc()
+    fc.jump_to(3)
+    txt = fc.current_step_text()
+    assert "【禁讲清单】" in txt
+    assert "「我们这边有一件快递需要跟您确认一下。」" in txt  # 第 2 步原话
+    assert "「请问这件商品是在哪个平台购买的呢？」" in txt  # 第 3 步原话
+    # 清单是最后一个非空行块（禁令收尾）
+    last_line = [l for l in txt.splitlines() if l.strip()][-1]
+    assert last_line.startswith("【禁讲清单】")
+    # 二轮渲染（同步再取）不再带清单（只跳转首轮）
+    txt2 = fc.current_step_text()
+    assert "【禁讲清单】" not in txt2
 
 
 def test_backward_jump_marker_uses_return_wording():

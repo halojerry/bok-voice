@@ -30,10 +30,10 @@ _BASE = dict(expect_off=False, target_step=pfg.TARGET_STEP, jump_speech=True,
 
 
 def test_jump_speech_positive_and_negative_paths():
-    kw = dict(expect_words=["赔付"], forbid_words=["哪个平台", "需要跟您确认"])
+    kw = dict(expect_words=["赔付"], forbid_words=["需要跟您确认"])
     # 正例：讲本步事实、不碰被跳步
     assert pfg.evaluate_leg(turns=_turn("明白，您这单如果确认丢件，会按平台规则赔付。"), **kw, **_BASE)["pass"]
-    # 790fd558 形态：原样复排被跳步台词 → FAIL（判据可分辨的锚）
+    # 790fd558 形态：原样复排被跳步通知稿 → FAIL（判据可分辨的锚）
     assert not pfg.evaluate_leg(
         turns=_turn("我这边有一件快递需要跟您确认一下。请问在哪个平台购买？"),
         **kw, **_BASE)["pass"]
@@ -41,10 +41,17 @@ def test_jump_speech_positive_and_negative_paths():
     assert not pfg.evaluate_leg(turns=_turn("好的，我帮您登记。"), **kw, **_BASE)["pass"]
     # 无跳步轮（图没触发）
     assert not pfg.evaluate_leg(turns=[], **kw, **_BASE)["pass"]
-    # f13c3c06 形态：先讲对本步、尾句回头补问（「平台购买」）→ forbid 命中 FAIL
-    assert not pfg.evaluate_leg(
+    # f13c3c06 形态（2026-09-19 定案翻案）：先讲对本步、尾句回补前置问题——目标步
+    # 内容（按平台规则赔付）依赖该答案，回补係合理行为，**不入默认硬判据**
+    # （prompt 侧仍推「只准问本步问题」，判据侧放行）。
+    assert pfg.evaluate_leg(
         turns=_turn("明白，您这单如果确认丢件，会按平台规则赔付。\n那您是在哪个平台买的？"),
         **kw, **_BASE)["pass"]
+    # 自定义 forbid（真模板运营按需收紧）：回补问题照样逮得住
+    strict = dict(expect_words=["赔付"], forbid_words=["哪个平台"])
+    assert not pfg.evaluate_leg(
+        turns=_turn("明白，会按平台规则赔付。\n那您是在哪个平台买的？"),
+        **strict, **_BASE)["pass"]
 
 
 def test_jump_speech_evidence_gate():
@@ -52,7 +59,7 @@ def test_jump_speech_evidence_gate():
     bad_ev = pfg.probe_evidence(log_exists=False, marks=[100, 200], expected_rounds=1)
     v = pfg.evaluate_leg(
         expect_off=False, target_step=pfg.TARGET_STEP, jump_speech=True,
-        expect_words=["赔付"], forbid_words=["哪个平台"],
+        expect_words=["赔付"], forbid_words=["需要跟您确认"],
         trigger_events=[], nontrigger_events=[], play_events=[],
         turns=_turn("会按平台规则赔付。"), evidence=bad_ev)
     assert not v["pass"] and not v["checks"]["evidence_ok"]

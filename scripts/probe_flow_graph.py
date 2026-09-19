@@ -567,9 +567,11 @@ def evaluate_leg(
         }
     elif jump_speech:
         # 话面档（I3,2026-09-19）：判据=跳步轮（provider=graph-jump）回复的词面——
-        # 含本步事实词（expect）且不含被跳步问句词（forbid）。修复前实弹基线
-        # call-790fd558 原样复排第 2/3 步台词（「需要跟您确认」「哪个平台购买」）
-        # =判据可分辨（forbid 命中即 FAIL）；transcript 全文进 info 供人工复盘。
+        # 含本步事实词（expect）且不含被跳步台词词（forbid）。修复前实弹基线
+        # call-790fd558 原样复排第 2 步通知稿（「需要跟您确认」）=判据可分辨；
+        # 「哪个平台」类前置回补问题**不入默认硬判据**（目标步「按平台规则赔付」
+        # 依赖该答案，先讲对本步再回补=合理行为，prompt 侧推、判据侧放）；
+        # transcript 全文进 info 供人工复盘。
         gj_texts = [
             str(t.get("transcript") or "")
             for t in turns
@@ -1285,7 +1287,7 @@ def selftest() -> int:
         # ---- I3 话面档（jump-speech：跳步轮词面判据）----
         ("jump-speech 正例：跳步轮讲本步事实、不碰被跳步问句", evaluate_leg(
             expect_off=False, target_step=TARGET_STEP, jump_speech=True,
-            expect_words=["赔付"], forbid_words=["哪个平台", "需要跟您确认"],
+            expect_words=["赔付"], forbid_words=["需要跟您确认"],
             trigger_events=[jump_ev], nontrigger_events=[], play_events=[],
             turns=[{"role": "assistant", "provider": "graph-jump",
                     "gen": "llm", "template_step": TARGET_STEP,
@@ -1293,7 +1295,7 @@ def selftest() -> int:
             evidence=_ev(expected=1))["pass"], True),
         ("jump-speech 反例：复排被跳步台词（790fd558 形态）", evaluate_leg(
             expect_off=False, target_step=TARGET_STEP, jump_speech=True,
-            expect_words=["赔付"], forbid_words=["哪个平台", "需要跟您确认"],
+            expect_words=["赔付"], forbid_words=["需要跟您确认"],
             trigger_events=[jump_ev], nontrigger_events=[], play_events=[],
             turns=[{"role": "assistant", "provider": "graph-jump",
                     "gen": "llm", "template_step": TARGET_STEP,
@@ -1301,7 +1303,7 @@ def selftest() -> int:
             evidence=_ev(expected=1))["pass"], False),
         ("jump-speech 反例：缺本步事实词（讲了但没讲到位）", evaluate_leg(
             expect_off=False, target_step=TARGET_STEP, jump_speech=True,
-            expect_words=["赔付"], forbid_words=["哪个平台"],
+            expect_words=["赔付"], forbid_words=["需要跟您确认"],
             trigger_events=[jump_ev], nontrigger_events=[], play_events=[],
             turns=[{"role": "assistant", "provider": "graph-jump",
                     "gen": "llm", "template_step": TARGET_STEP,
@@ -1309,7 +1311,7 @@ def selftest() -> int:
             evidence=_ev(expected=1))["pass"], False),
         ("jump-speech 反例：无跳步轮（图没触发）", evaluate_leg(
             expect_off=False, target_step=TARGET_STEP, jump_speech=True,
-            expect_words=["赔付"], forbid_words=["哪个平台"],
+            expect_words=["赔付"], forbid_words=["需要跟您确认"],
             trigger_events=[], nontrigger_events=[], play_events=[],
             turns=[], evidence=_ev(expected=1))["pass"], False),
         ("plan_rounds jump-speech 档=单触发轮", plan_rounds(
@@ -1357,8 +1359,10 @@ async def main() -> int:
                              "不含被跳步问句词）——修的是 4B 被总览引力拉回线性剧本的问题")
     parser.add_argument("--expect-words", default="赔付,理赔",
                         help="--jump-speech 跳步轮回复必须包含的本步事实词（逗号分隔，任序全含）")
-    parser.add_argument("--forbid-words", default="哪个平台,需要跟您确认",
-                        help="--jump-speech 跳步轮回复不得包含的被跳步问句词（逗号分隔，任一命中即 FAIL）")
+    parser.add_argument("--forbid-words", default="需要跟您确认",
+                        help="--jump-speech 跳步轮回复不得包含的被跳步台词词（逗号分隔，任一命中即 FAIL）。"
+                             "默认只钉无争议退化（第 2 步通知稿复播）；「哪个平台」类前置回补问题不入硬判据"
+                             "——目标步内容依赖它时回补係合理行为（2026-09-19 实弹定案），真模板按需自加")
     parser.add_argument("--keep-template", action="store_true", help="保留探针模板（默认跑完删）")
     parser.add_argument("--budget-first-ms", type=float, default=2500.0)
     parser.add_argument("--budget-perceived-ms", type=float, default=3000.0)

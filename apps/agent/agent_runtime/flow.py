@@ -1157,7 +1157,8 @@ class FlowController:
                     "也不需要再听。本轮只讲第 "
                     f"{self.current + 1} 步的内容：绝不按流程总览的顺序从头重新开始，"
                     "也绝不再问被跳过步骤里的任何问题（例如那些步骤里的核对、询问类问题），"
-                    "除非客户主动问。"
+                    "除非客户主动问。要提问的话只准问本步的问题"
+                    "（例如就本步的方案征求客户确认），不准借被跳过步骤的问句来提问。"
                 )
             else:
                 lines.append(
@@ -1214,6 +1215,21 @@ class FlowController:
                 "用订单平台/截图等引导（问在哪个平台买、请他打开订单、发最近未收到货的截图）；"
                 "中途问任何事→简短答完带回当前步。金额未核实前不要讲死具体赔多少。"
             )
+        # I3 二修·具体禁讲清单(2026-09-19):抽象「不要追问被跳步骤」实测(3 跑 1 过)
+        # 压不过总览事实行的逐字引力——FAIL 两发全是第 3 步问句原话复刻。把被跳步的
+        # **原话照录**成对照清单放尾部**最后一行**(正稿在前、禁句在后,生成前最后
+        # 看到的是禁令),4B 对具体反例的服从远好过抽象规则。仅跳转首轮渲染。
+        if _new_step and self._entered_by_jump and self._jump_skipped:
+            _quotes = "、".join(
+                "「" + (self._step_fact_line(self.steps[n - 1]) or "") + "」"
+                for n in self._jump_skipped[:3]
+                if self._step_fact_line(self.steps[n - 1])
+            )
+            if _quotes:
+                lines.append(
+                    "【禁讲清单】下面这些是被跳过步骤的原话（仅供对照，不是给你用的），"
+                    "本轮回复里一个字都不准出现、也不准换个说法问同一件事：" + _quotes
+                )
         return "\n".join(lines)
 
     def flow_overview(self) -> str:
