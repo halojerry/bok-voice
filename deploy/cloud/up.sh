@@ -8,7 +8,7 @@
 #   SQLAlchemy 连接失败，容器 crash-loop。同一次事故链还有第二坑：不带
 #   BOK_CP_PORT 时宿主口回退 8000，与宿主上的本地开发栈抢 :8000。
 #   修复姿势 = 双覆盖（shell env 优先级高于 .env，compose 原生支持）：
-#     ① BOK_CP_PORT=18010（云 prod 恒 18010，本地 dev 才用 8000）；
+#     ① BOK_CP_PORT（shell env > .env > 缺省 18010；本地排练想用 8000 显式设）；
 #     ② DATABASE_URL 的 @*.pooler.supabase.com host 段替换为
 #        ${BOK_SUPABASE_IP:-52.77.146.31}（host 已是裸 IP 则原样通过=幂等；
 #        aws-0- 前缀变化不影响匹配，只认 *.pooler.supabase.com 后缀）。
@@ -59,6 +59,17 @@ else
 fi
 
 export DATABASE_URL="$_db_after"
+
+# ── 宿主口解析：shell env 优先（与 compose 优先级一致），否则读 .env，缺省 18010
+# （评审修复：原先无视 .env 的显式改口——反代/防火墙钉好的口会被静默改道）。
+if [[ -z "${BOK_CP_PORT:-}" ]]; then
+  _port_line="$(grep -E '^[[:space:]]*(export[[:space:]]+)?BOK_CP_PORT=' "$HERE/.env" 2>/dev/null | tail -n 1 || true)"
+  if [[ -n "${_port_line:-}" ]]; then
+    BOK_CP_PORT="${_port_line#*=}"
+    BOK_CP_PORT="${BOK_CP_PORT%\"}"; BOK_CP_PORT="${BOK_CP_PORT#\"}"
+    BOK_CP_PORT="${BOK_CP_PORT%\'}"; BOK_CP_PORT="${BOK_CP_PORT#\'}"
+  fi
+fi
 export BOK_CP_PORT="${BOK_CP_PORT:-18010}"
 
 echo "[up.sh] docker compose up -d cp $*  （宿主口 ${BOK_CP_PORT} → 容器 8000）"

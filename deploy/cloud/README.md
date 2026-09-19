@@ -52,7 +52,7 @@
 cd /www/bok-cloud            # 即 deploy/cloud 目录
 cp .env.example .env
 vim .env                     # 填 DATABASE_URL / BOK_JWT_SECRET / BOK_CP_TOKEN / root 种子
-docker compose up -d
+./up.sh                      # 起容器（重启/重拉唯一入口,见 §9 铁律）
 ```
 
 ## 3. 首次启动：数据库自动建齐，无需手工跑 SQL
@@ -75,17 +75,17 @@ docker compose logs -f cp
 
 ```bash
 # ① 存活（豁免鉴权，裸 curl 即可）
-curl -s http://127.0.0.1:${BOK_CP_PORT:-8000}/health
+curl -s http://127.0.0.1:${BOK_CP_PORT:-18010}/health
 # 期望：{"ok":true,"service":"bok-voice-control-plane"}
 
 # ② root 种子成功 + 登录链路（返回 JSON 里应有 token 字段）
-curl -s -X POST http://127.0.0.1:${BOK_CP_PORT:-8000}/api/auth/login \
+curl -s -X POST http://127.0.0.1:${BOK_CP_PORT:-18010}/api/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"username":"<BOK_ROOT_USERNAME>","password":"<BOK_ROOT_PASSWORD>"}'
 
 # ③ 管理台静态站已随镜像就位（机器通道身份取页面）
 curl -s -H "Authorization: Bearer <BOK_CP_TOKEN>" \
-     -o /dev/null -w '%{http_code}\n' http://127.0.0.1:${BOK_CP_PORT:-8000}/
+     -o /dev/null -w '%{http_code}\n' http://127.0.0.1:${BOK_CP_PORT:-18010}/
 # 期望：200
 ```
 
@@ -104,12 +104,12 @@ curl -s -H "Authorization: Bearer <BOK_CP_TOKEN>" \
 ```bash
 cd /www/bok-cloud
 docker compose pull          # 拉新 latest（或改 .env 里 BOK_CP_IMAGE 钉版本）
-docker compose up -d         # 重建容器；vault 卷与 Supabase 数据都保留
+./up.sh                      # 重建容器；vault 卷与 Supabase 数据都保留
 docker image prune -f        # 清旧镜像层（可选）
 ```
 
 升级后回到 §4 复验 `/health`。回滚 = 把 `.env` 里 `BOK_CP_IMAGE` 钉到旧
-`sha-xxxxxxx` tag（GHCR 每次发布都留）再 `up -d`。
+`sha-xxxxxxx` tag（GHCR 每次发布都留）再 `./up.sh`。
 
 ## 6. 宝塔面板自身的安全（必读）
 
@@ -125,7 +125,7 @@ docker image prune -f        # 清旧镜像层（可选）
 
 1. 宝塔 → 网站 → 添加站点（域名填管理台域名，纯静态、不建 FTP/PHP）；
 2. 站点设置 → SSL → Let's Encrypt 申请证书，开「强制 HTTPS」；
-3. 站点设置 → 反向代理 → 目标 URL `http://127.0.0.1:8000`（改过
+3. 站点设置 → 反向代理 → 目标 URL `http://127.0.0.1:18010`（缺省口；改过
    `BOK_CP_PORT` 就填改后的），发送域名 `$host`。
 
 注意：

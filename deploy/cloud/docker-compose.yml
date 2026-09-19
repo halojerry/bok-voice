@@ -18,10 +18,11 @@ services:
   cp:
     # 默认拉 CI 发布的 latest；排练/灰度可用 BOK_CP_IMAGE 覆盖（shell env 或 .env）。
     image: ${BOK_CP_IMAGE:-ghcr.io/halojerry/bok-voice:latest}
-    # 宿主端口可用 BOK_CP_PORT 改口（如 18010 避让宿主上已有服务）；容器口固定
-    # 8000——镜像的 EXPOSE/HEALTHCHECK/CMD 都按 8000 写死，勿改右侧。
+    # 宿主端口缺省 18010（避让宿主上可能的本地开发栈 :8000；本地排练想用 8000
+    # 显式设 BOK_CP_PORT=8000）。容器口固定 8000——镜像的 EXPOSE/HEALTHCHECK/
+    # CMD 都按 8000 写死，勿改右侧。
     ports:
-      - "${BOK_CP_PORT:-8000}:8000"
+      - "${BOK_CP_PORT:-18010}:8000"
     # .env 承载全部变量（见 .env.example）；文件不存在 compose 直接报错——
     # 刻意 fail-fast：裸 up 起来的 CP 要么连不上库要么裸奔，不如起不来。
     env_file:
