@@ -71,8 +71,10 @@ call-b24ab5d0/1789752590——fuzzy 话语被 ASR 劈两段，**第二段当场�
   禁讲清单（被跳步原话照录）+总览图模板跳转常态规则；实弹 6 发零复排、目标步落地 ~4/6，
   残留=讲成下一步措辞的步定位方差（观察项）。**定案**：前置回补问题（目标步内容依赖被跳步
   答案时先讲对本步再回补）係合理行为，不入 `--jump-speech` 硬判据。详见 AGENTS.md 话术图条目。
-- `_FORWARD_ENV` 立法（45 BOK_* prod 透传面）——独立卫生项
-- `_FORWARD_ENV` 立法（45 BOK_* prod 透传面）——独立卫生项
+- `_FORWARD_ENV` 立法（45 BOK_* prod 透传面）——**已立法（2026-09-19）**：agent 实读 87 键
+  收编 69 进 `tools/bok.py` `_FORWARD_ENV` 单点表（dev/prod 同源），门禁
+  `tests/test_forward_env.py` 扫 agent_runtime 读取面强制登记（未登记即红，mutation
+  实证抽表键必红）；豁免清单带理由（测试腿/OS 变量）。量化修正：实际面 87 键非 45。
 - hit_count 参与排序——否决（分析位与控制位分离；想要权重就写 priority）
 
 ## 6. 验收公约（每增量）
