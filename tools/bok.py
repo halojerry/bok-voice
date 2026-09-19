@@ -413,6 +413,9 @@ def _probe_llm(base_url: str = "http://127.0.0.1:1235/v1",
     权重页入 ~40s 会一次假警,重跑一次区分:冷启动第二次会快)。
     model 缺省取 /v1/models 的绝对路径 id——repo id 会触发 HF hub 解析;
     显式传 model(:1236 MT 探针)则忽略扫描结果直接用,同样必须是本地路径。
+    显式档仍先 GET /v1/models 属有意保留(评审 P2-1):同一 mlx_lm 进程同时
+    服务两端点,/models 探不动即进程不可用,短路 FAIL 语义正确,省一次
+    information GET 的重构不值当。
     prompt 对 MT 档必须传代表性长句(如「Translate to English: 你好世界」)——
     Hy-MT2 的 chat template 对超短 ASCII 输入会 list index out of range 404
     (2026-09-19 实测,生产链路恒走 _mt_prompt 长模板不受影响)。"""
