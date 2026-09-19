@@ -99,6 +99,7 @@
 | `components/study-tab.tsx` | 学习 tab（W3：话术优化/问答对报告 + AI 聚类采纳面板——dry/apply 必须同参 limit，CP 勾选守卫按参数找计划缓存） |
 | `packages/core/bok_voice_core/intent_rules.py` | 意向规则共享契约（W4：INTENT_FACTS 12 键白名单/eval_intent_rules 确定性评估/validate_conditions——CP 保存校验、agent 挂断评估、测试三方共用，**改事实键集三处同步**） |
 | `tests/test_intent_rules.py` / `tests/test_intent_agent.py` | W4 钉面：两级规则 CRUD/RBAC/assist 幂等/挂断评估矩阵/notify 分支 wiring |
+| `lib/voice-options.ts` + `lib/preview.ts` | W5 卫生收编：音色三源统一装配/试听语言解析/罐头优先决策（纯函数，`test/voice-options.test.mjs` 钉住）+ 试听播放单点（全 fetch 带 authHeaders、objectURL revoke 单点——**新增试听一律走这两个 lib，勿再页面内联**） |
 
 ## 数据表（packages/business-db，新表须方言可移植）
 

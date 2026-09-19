@@ -76,28 +76,9 @@ export const MINIMAX_VOICE_LANG_LABEL: Record<MinimaxVoiceLang, string> = {
   en: "英语",
 };
 
-/** 旧用法：按语言筛可选音色（返回 {value,label}，符合设置页 FieldMeta options）。 */
+/** 按语言筛可选音色（返回 {value,label}，符合设置页 FieldMeta options）。
+ *  下拉装配/试听语言已统一收编到 lib/voice-options.ts（W5-T2）：多来源合并用
+ *  buildVoiceSelectOptions、试听语言用 resolvePreviewLang——本文件只留目录本体。 */
 export function minimaxVoiceOptionsFor(lang: MinimaxVoiceLang | string) {
   return MINIMAX_VOICE_ENTRIES.filter((v) => v.lang === lang).map((v) => ({ value: v.id, label: v.label }));
-}
-
-/** 单音色（全场同声）下拉：列出全部音色并带语言标签。 */
-export function allMinimaxVoiceOptions() {
-  return MINIMAX_VOICE_ENTRIES.map((v) => ({
-    value: v.id,
-    label: `${MINIMAX_VOICE_LANG_LABEL[v.lang]} · ${v.label}`,
-  }));
-}
-
-/**
- * 试听用哪种语言/文本：按音色 ID 判定，而不是按字段标签。
- * 粤语音色（Cantonese_*）即使被设成「整场同声」，试听也该用粤语示例文本，
- * 否则 MiniMax 会用粤语音色念普通话文字 → 广式普通话。
- * 返回 "cantonese" | "en" | "zh"。
- */
-export function previewLangForVoice(voice: string): MinimaxVoiceLang {
-  const v = String(voice || "");
-  if (/^Cantonese_/i.test(v)) return "cantonese";
-  if (/^(English_|socialmedia_)/i.test(v)) return "en";
-  return "zh";
 }

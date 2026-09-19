@@ -773,6 +773,9 @@ class SqlAlchemyBusinessRepository:
             "vad": json.loads(row.vad_json or "{}"),
             # 空 blob（老库补列后未保存）回落默认段，否则 dialer 拿不到 mode。
             "sip": json.loads(row.sip_json or "{}") or self.default_settings()["sip"],
+            # 通知域（W5-T1）：settings.sms 段；空 blob=未配置回落默认段
+            # （enabled=False 总闸，读侧语义与 sip 同族）。
+            "sms": json.loads(row.sms_json or "{}") or self.default_settings()["sms"],
             # 全局外呼时段窗段（T3b）：空 blob=不限时段（campaign._global_call_windows
             # 消费 settings.campaign.call_windows，读侧缺省 []）。
             "campaign": json.loads(row.campaign_json or "{}"),
@@ -795,6 +798,12 @@ class SqlAlchemyBusinessRepository:
         # 不清运营已配的全局窗）；传空 dict=清空（不限时段）。
         if "campaign" in settings:
             row.campaign_json = json.dumps(settings.get("campaign") or {}, ensure_ascii=False)
+        # sms 段（W5-T1）：缺键=保留既有（PUT 不传段不动已配 webhook）；传空值
+        # 回落默认段（与 sip 同语义：不允许把段清成空 dict）。
+        if "sms" in settings:
+            row.sms_json = json.dumps(
+                settings.get("sms") or self.default_settings()["sms"], ensure_ascii=False
+            )
         row.policy = settings.get("policy", row.policy or "offline_first")
         self.session.commit()
         return self.get_settings()
@@ -1285,6 +1294,17 @@ class SqlAlchemyBusinessRepository:
                 "ringing_timeout_s": 30,
                 "max_call_duration_s": 600,
             },
+            # 通知域（W5-T1）：webhook provider 骨架——真实短信网关未来对接，
+            # webhook_url 即对接点；secret 走 secret 掩码（GET 不回显原文）。
+            # enabled=False 总闸；hangup_enabled=挂断后自动发（默认关），
+            # hangup_template 支持 {contact} 占位=收件号码。
+            "sms": {
+                "webhook_url": "",
+                "secret": "",
+                "enabled": False,
+                "hangup_enabled": False,
+                "hangup_template": "",
+            },
             # 全局外呼时段窗段（T3b）：空=不限时段；GET 端点照常回显该键。
             "campaign": {"call_windows": []},
             "policy": "offline_first",
@@ -1764,16 +1784,20 @@ class InMemoryBusinessRepository:
 
     def save_settings(self, settings: dict) -> dict:
         old = self.settings
+        defaults = SqlAlchemyBusinessRepository.default_settings()
         self.settings = {
             "asr": settings.get("asr", {}),
             "llm": settings.get("llm", {}),
             "tts": settings.get("tts", {}),
             "vad": settings.get("vad", {}),
             # 缺键/空值回落默认段（与 SQL 后端同语义：不允许把 sip 段清成空）。
-            "sip": settings.get("sip") or SqlAlchemyBusinessRepository.default_settings()["sip"],
+            "sip": settings.get("sip") or defaults["sip"],
             # campaign 段（T3b）：缺键=保留既有（与 SQL 侧同语义）；传空=清空（不限）。
             "campaign": settings["campaign"] if "campaign" in settings
             else old.get("campaign", {}),
+            # sms 段（W5-T1）：缺键=保留既有；空值回落默认段（与 SQL 侧同语义）。
+            "sms": (settings.get("sms") or defaults["sms"]) if "sms" in settings
+            else (old.get("sms") or defaults["sms"]),
             "policy": settings.get("policy", "offline_first"),
         }
         return self.settings

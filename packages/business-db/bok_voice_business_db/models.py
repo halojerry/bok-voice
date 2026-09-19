@@ -346,6 +346,12 @@ class GlobalSetting(Base):
     # 模型生成 Supabase 引导件，ORM-only default 不进 DDL → 裸 INSERT 直撞
     # NotNullViolation（CI postgres-smoke 实证）。
     campaign_json: Mapped[str] = mapped_column(Text, default="", server_default="")
+    # 通知域（W5-T1）：settings.sms 段（webhook provider 骨架）——{webhook_url,
+    # secret, enabled, hangup_enabled, hangup_template}，真实短信网关未来对接，
+    # webhook_url 即对接点。空串=老库尚未补列或从未保存 → 读侧回落
+    # default_settings()["sms"]。迁移 DDL 与 deps._ensure_column 同形；
+    # server_default 必须带上（同上 campaign_json 注释）。
+    sms_json: Mapped[str] = mapped_column(Text, default="", server_default="")
     policy: Mapped[str] = mapped_column(String(64), default="offline_first")
     updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
 

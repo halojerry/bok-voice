@@ -419,6 +419,8 @@ export default function CallsPage() {
   // 列表上限递增（QA 2026-09-13）：CP 全量返回 1000+ 通且最老在前——刚挂断的通话
   // 沉底=切换客户闭环断头；改客户端最新优先排序 + 只渲染最近 limit 通。
   const [limit, setLimit] = useState(50);
+  // 正在补结算的通话 id（行级 busy，防重复点击）。
+  const [settlingId, setSettlingId] = useState("");
   const sortedRows = useMemo(() => {
     const arr = [...rows];
     arr.sort((a, b) =>
@@ -427,6 +429,23 @@ export default function CallsPage() {
     return arr;
   }, [rows]);
   const visibleRows = sortedRows.slice(0, limit);
+
+  /** 补结算（W5-T2 孤儿 API 收编：api.settle 此前无 UI 消费点）：漏走挂断结算的
+   *  ended 通话手动补一次（纪要/知识沉淀）；成功本地刷新列表，失败亮错误行。 */
+  async function settleOne(id: string) {
+    if (!window.confirm("为这通通话补一次挂断结算？（生成纪要/知识沉淀）")) return;
+    setSettlingId(id);
+    try {
+      await api.settle(id);
+      setErr(null);
+      const c = await api.listCalls(accountId, "");
+      setRows(Array.isArray(c) ? c : []);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setSettlingId("");
+    }
+  }
 
   async function removeOne(id: string) {
     if (!window.confirm("确认删除该通话记录？（转写与结算一并删除）")) return;
@@ -615,6 +634,16 @@ export default function CallsPage() {
                   >
                     删除
                   </button>
+                  {status === "ended" && (
+                    <button
+                      className="btn-ghost shrink-0 text-xs"
+                      disabled={settlingId === id}
+                      onClick={() => settleOne(id)}
+                      title="补一次挂断结算（纪要/知识沉淀）"
+                    >
+                      {settlingId === id ? "结算中…" : "补结算"}
+                    </button>
+                  )}
                   {status === "ended" && String(c.object_id ?? "") && (
                     <Link
                       href={`/calls/new?object=${encodeURIComponent(String(c.object_id))}`}
