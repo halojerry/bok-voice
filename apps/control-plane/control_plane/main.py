@@ -50,6 +50,7 @@ from .nodes_store import HEARTBEAT_INTERVAL_S, LicenseError, NodeStore
 from .permissions import GRANTABLE_PERMISSIONS, PAGE_PERMISSIONS, effective_permissions
 from .pregen import persona_pregen_status
 from . import pregen as pregen_mod
+from . import qa_cluster as qa_cluster_mod
 from .auth import (
     Identity,
     JWT_TTL_S,
@@ -77,6 +78,7 @@ from .schemas import (
     CreateUserRequest,
     UpdateUserRequest,
     PersonaRequest,
+    QaClusterRequest,
     QaEntryCreate,
     QaEntryPatch,
     RosterClaimRequest,
@@ -3571,6 +3573,42 @@ def qa_pregen_ep(payload: dict, request: Request) -> dict:
     _audit("qa.pregen", subject_type="qa_entry", subject_id=",".join(ids)[:128],
            detail={"count": len(ids), "status": out.get("status")})
     return out
+
+
+@app.post("/api/qa/cluster")
+def qa_cluster_ep(req: QaClusterRequest, request: Request, account_id: str = "acc-001") -> dict:
+    """自学习聚类(W3-T1,2026-09-19):dry=挖掘→LLM 三列计划;apply=true 按 select 采纳入库。
+
+    逻辑全在 qa_cluster runner(端点瘦):挖掘与 /api/reports/qa-pairs 同源
+    (mine_qa_pairs);纯函数与 tts-mine --cluster 同源(bok_voice_core.qa_cluster);
+    dry 计划 600s per-account 缓存,apply 优先吃新鲜缓存免二次 LLM。
+    LLM 网络/解析失败 503(文案带原因);单飞冲突 409。junk 只展示不入库。
+    """
+    _gate_page(request, "qa")
+    account_id = scoped_account(request, account_id)
+    limit = max(1, min(int(req.limit), 100))
+    min_calls = max(1, int(req.min_calls))
+    select = (
+        [{"kind": str(s.kind), "i": int(s.i)} for s in req.select]
+        if req.select is not None
+        else None
+    )
+    # 勾选采纳守卫(主会话审计修复):select 下标只在「与 dry 同参数的新鲜缓存」上有效,
+    # 缓存过期/参数不符时静默重算=下标可能对到另一份计划采错条目——409 让前端重新
+    # 生成;select=None 的「采纳全部」可安全重算(语义=采纳当前计划全量)。
+    if req.apply and select is not None and not qa_cluster_mod.has_fresh_plan(account_id, min_calls, limit):
+        raise HTTPException(status_code=409, detail="聚类计划已过期或参数不符，请重新生成计划后再采纳")
+    try:
+        plan = qa_cluster_mod.run_cluster(_repo(), account_id, min_calls=min_calls, limit=limit)
+        if not req.apply:
+            return plan
+        return qa_cluster_mod.apply_cluster(
+            _repo(), request, account_id, plan, select, audit=_audit
+        )
+    except qa_cluster_mod.AlreadyRunning as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except qa_cluster_mod.ClusterError as exc:
+        raise HTTPException(status_code=503, detail=f"聚类 LLM 不可用: {exc}") from exc
 
 
 # ---- 垫话罐头库(2026-09-13 乙节):确定性语境命中,镜像 qa_entries ----

@@ -95,6 +95,8 @@
 | `components/template-editor.tsx` | 话术模板编辑表单（2026-09-19 W1 自 /templates 原样提取：分步 goal/ref/直念/情绪/TSV 导入/热词/保存逻辑；/templates 列表页与 /studio 工作台「话术流程」tab 双页共用，提取前后渲染输出一致） |
 | `app/(app)/studio/page.tsx` | AI 工作站（列表态+`?t=<id>` 工作台态五 tab；静态导出零动态段，深链 query 参数形态） |
 | `lib/flow-canvas.ts` + `components/flow-canvas.tsx` | 流程画布（W2：场景泳道/步节点/答法抽屉/意图只读 overlay/发布徽标；纯函数 parse-serialize 镜像 flow.py 分支语法、round-trip 无损，`test/flow-canvas.test.mjs` 钉住——**改 flow.py 分支/注意正则两处必须同步**） |
+| `lib/var-panel.ts` + `components/template-vars.tsx` | 变量 tab（W3：占位符目录/扫描/预览渲染镜像 flow.py `object_vars`/`render_template_text`——空串保留占位、digitsToCn 双轨、contact 语言缺省、say 行丢行警示；`test/var-panel.test.mjs` 钉住——**改 flow.py 变量语义两处必须同步**） |
+| `components/study-tab.tsx` | 学习 tab（W3：话术优化/问答对报告 + AI 聚类采纳面板——dry/apply 必须同参 limit，CP 勾选守卫按参数找计划缓存） |
 
 ## 数据表（packages/business-db，新表须方言可移植）
 

@@ -2,7 +2,8 @@
 
 // AI 工作站（W1）：以话术模板为入口的集中工作台。
 // 列表态（无 ?t=）：全部模板概览（步数/意图数为行内现算,仅展示、权威以详情为准）；
-// 工作台态（?t=<id>）：话术流程编辑 + 意图与问答 + 罐头录音 + 通话日志 + 学习报告 五个 tab。
+// 工作台态（?t=<id>）：话术流程编辑 + 意图与问答 + 变量 + 罐头录音 + 通话日志 + 学习报告 六个 tab
+// （学习报告/聚类采纳在 components/study-tab.tsx,变量目录与预览在 components/template-vars.tsx）。
 // 深链先例：/calls?call= / /supervisor?listen= —— 静态导出用 query，不开动态路由。
 
 import { useEffect, useMemo, useState } from "react";
@@ -19,6 +20,8 @@ import TemplateEditor, {
   type TemplateRow,
 } from "@/components/template-editor";
 import FlowCanvas from "@/components/flow-canvas";
+import StudyTab from "@/components/study-tab";
+import TemplateVarsTab from "@/components/template-vars";
 
 // 通话行状态徽标（照 calls 页惯例搬一份,页面文件不可导入）。
 const CALL_STATUS: Record<string, [string, string]> = {
@@ -151,6 +154,7 @@ export default function StudioPage() {
   const tabs: [string, string][] = [
     ["flow", "话术流程"],
     ["intent", "意图与问答"],
+    ["vars", "变量"],
     ["canned", "罐头录音"],
     ["calls", "通话日志"],
   ];
@@ -231,42 +235,7 @@ export default function StudioPage() {
   }, [callRows, selId]);
   const visibleCalls = tplCalls.slice(0, 50);
 
-  // ---- 学习报告 tab：话术优化分析 + 高频问答对挖掘（任一失败各自 ErrorState 降级） ----
-  const [insights, setInsights] = useState<Record<string, unknown> | null>(null);
-  const [insightsErr, setInsightsErr] = useState("");
-  const [pairs, setPairs] = useState<Record<string, unknown>[]>([]);
-  const [pairsErr, setPairsErr] = useState("");
-  const [reportsLoading, setReportsLoading] = useState(false);
-  useEffect(() => {
-    if (tab !== "reports" || !canReports || !selId) return;
-    let alive = true;
-    setReportsLoading(true);
-    void (async () => {
-      const [r1, r2] = await Promise.allSettled([
-        api.scriptInsights(accountId),
-        api.qaPairs(accountId, 20),
-      ]);
-      if (!alive) return;
-      if (r1.status === "fulfilled") {
-        setInsights((r1.value ?? null) as Record<string, unknown>);
-        setInsightsErr("");
-      } else {
-        setInsights(null);
-        setInsightsErr(String(r1.reason));
-      }
-      if (r2.status === "fulfilled") {
-        setPairs(Array.isArray(r2.value) ? r2.value : []);
-        setPairsErr(Array.isArray(r2.value) ? "" : "问答对报告响应形状异常。");
-      } else {
-        setPairs([]);
-        setPairsErr(String(r2.reason));
-      }
-      setReportsLoading(false);
-    })();
-    return () => {
-      alive = false;
-    };
-  }, [tab, canReports, selId, accountId]);
+  // ---- 学习报告 tab：渲染迁入 components/study-tab.tsx（W3：+AI 聚类采纳面板） ----
 
   const langText = (raw: string) => LANGS.find((l) => l[0] === raw)?.[1] ?? raw;
 
@@ -276,7 +245,7 @@ export default function StudioPage() {
       <div>
         <div className="mb-8">
           <h1 className="page-title">AI 工作站</h1>
-          <p className="page-sub">按话术模板集中作业：流程编辑 · 意图问答 · 罐头录音 · 通话日志 · 学习报告</p>
+          <p className="page-sub">按话术模板集中作业：流程编辑 · 意图问答 · 变量 · 罐头录音 · 通话日志 · 学习报告</p>
         </div>
         <section className="card">
           {err && <ErrorState message={err} />}
@@ -564,61 +533,11 @@ export default function StudioPage() {
             </section>
           )}
 
-          {/* 5. 学习报告（reports 键可见）：话术优化分析 + 高频问答对挖掘,只读 */}
-          {tab === "reports" && canReports && (
-            <section className="card space-y-4">
-              {reportsLoading && <LoadingState />}
-              {!reportsLoading && (
-                <>
-                  {insightsErr && <ErrorState message={insightsErr} />}
-                  {pairsErr && <ErrorState message={pairsErr} />}
-                  {insights && (
-                    <div className="rounded-lg border border-(--card-border) p-3">
-                      <span className="label">高频问题（对象议题聚合）</span>
-                      {(() => {
-                        const issues = Array.isArray(insights.top_issues)
-                          ? (insights.top_issues as Record<string, unknown>[])
-                          : [];
-                        if (issues.length === 0) return <p className="mt-1 text-xs muted">暂无数据。</p>;
-                        return (
-                          <div className="mt-1 space-y-1">
-                            {issues.map((it, i) => (
-                              <p key={i} className="text-xs muted">
-                                <span className="font-bold text-(--live-ink)">{i + 1}.</span>{" "}
-                                {String(it.topic ?? "-")} · 提及 {Number(it.mentions ?? 0)} 次
-                              </p>
-                            ))}
-                          </div>
-                        );
-                      })()}
-                      <p className="mt-2 text-[11px] muted">
-                        共 {Number(insights.calls ?? 0)} 通通话 · {Number(insights.turns_total ?? 0)} 轮对话
-                      </p>
-                    </div>
-                  )}
-                  {pairs.length > 0 && (
-                    <div className="rounded-lg border border-(--card-border) p-3">
-                      <span className="label">高频问答对挖掘（TOP {pairs.length}）</span>
-                      <div className="mt-1 space-y-2">
-                        {pairs.map((p, i) => (
-                          <div key={i} className="rounded-lg bg-muted/60 p-2 text-xs">
-                            <p className="font-medium">{String(p.question ?? "-")}</p>
-                            <p className="mt-0.5 line-clamp-2 muted">{String(p.answer ?? "")}</p>
-                            <p className="mt-0.5 muted">
-                              {LANG_LABEL[String(p.lang ?? "")] ?? String(p.lang ?? "-")} · {Number(p.calls ?? 0)} 通命中
-                            </p>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                  {!insights && !insightsErr && pairs.length === 0 && !pairsErr && (
-                    <EmptyState label="暂无学习报告数据。" />
-                  )}
-                </>
-              )}
-            </section>
-          )}
+          {/* 5. 变量：占位符目录 + 无效占位告警 + 对象预览（渲染语义 lib/var-panel.ts） */}
+          {tab === "vars" && <TemplateVarsTab tpl={tplRow} accountId={accountId} />}
+
+          {/* 6. 学习报告（reports 键可见）：话术优化分析 + 高频问答对 + AI 聚类采纳 */}
+          {tab === "reports" && canReports && <StudyTab />}
         </>
       )}
     </div>

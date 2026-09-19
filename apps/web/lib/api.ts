@@ -138,6 +138,17 @@ export const api = {
   pregenQa: (ids: string[]) =>
     request<{ status: string }>("/api/qa/pregen", { method: "POST", body: JSON.stringify({ ids }) }),
   cannedAudioUrl: (id: string) => `${apiBase()}/api/qa/${id}/canned-audio`,
+  // AI 聚类采纳（W3 自学习闭环）：apply=false 生成聚类计划（variants/fresh/junk 三组）；
+  // apply=true 时 select=[{kind:"variant"|"fresh", i}] 指定采纳子集（缺省=全部）。
+  // 账号经 query 传（与 canned-status 同款 scoped_account 口径）。
+  qaCluster: (
+    accountId: string,
+    body: { min_calls?: number; limit?: number; apply?: boolean; select?: { kind: string; i: number }[] } = {},
+  ) =>
+    request<Record<string, unknown>>(`/api/qa/cluster?account_id=${encodeURIComponent(accountId)}`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
   getSettings: () => request<Record<string, unknown>>("/api/settings"),
   saveSettings: (body: unknown) => request<Record<string, unknown>>("/api/settings", { method: "PUT", body: JSON.stringify(body) }),
   // 电话边缘站点（P1.5）：站点下拉 + 一次性把 SIP 供应商凭据注册成 outbound trunk。
