@@ -50,6 +50,7 @@ class TimedSide(e2e.Side):
         data = httpx.post(
             f"{e2e.CONTROL_PLANE_URL}/api/token",
             json={"account_id": "acc-001", "call_id": self.call_id, "participant_identity": self.identity},
+            headers=e2e._CP_HEADERS,
             timeout=15,
         ).json()
         await self.room.connect(data["serverUrl"], data["participantToken"])
@@ -122,6 +123,7 @@ async def main() -> int:
         f"{e2e.CONTROL_PLANE_URL}/api/calls",
         json={"account_id": "acc-001", "kind": "interpret", "mode": "live", "direction": "interpret",
               "language": src_lang, "target_lang": tgt_lang, "object_id": "", "glossary": glossary},
+        headers=e2e._CP_HEADERS,
         timeout=15,
     ).json()
     call_id = created["id"]
@@ -157,7 +159,8 @@ async def main() -> int:
         await me.close()
         await other.close()
         try:
-            e2e.httpx.post(f"{e2e.CONTROL_PLANE_URL}/api/calls/{call_id}/hangup", timeout=10)
+            e2e.httpx.post(f"{e2e.CONTROL_PLANE_URL}/api/calls/{call_id}/hangup",
+                           headers=e2e._CP_HEADERS, timeout=10)
         except Exception:
             pass
 

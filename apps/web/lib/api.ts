@@ -82,6 +82,14 @@ export const api = {
       if (!res.ok) throw await toError(res);
       return res.json() as Promise<Record<string, unknown>>;
     }),
+  // ---- MiniMax 云端声音克隆（路线 B）：清单存 tts.minimax_clones_json ----
+  listMinimaxVoices: () => request<Record<string, unknown>[]>("/api/tts/minimax-voices"),
+  registerMinimaxVoice: (body: FormData) =>
+    fetch(`${apiBase()}/api/tts/minimax-voices`, { method: "POST", body, headers: authHeaders() }).then(async (res) => {
+      if (!res.ok) throw await toError(res);
+      return res.json() as Promise<Record<string, unknown>>;
+    }),
+  deleteMinimaxVoice: (voiceId: string) => request<Record<string, unknown>>(`/api/tts/minimax-voices/${encodeURIComponent(voiceId)}`, { method: "DELETE" }),
   previewTts: async (body: { text: string; voice?: string; language?: string; instruct?: string; sample_rate?: number; provider?: string }) => {
     const res = await fetch(`${apiBase()}/api/tts/preview`, {
       method: "POST",
@@ -120,6 +128,27 @@ export const api = {
   patchQa: (id: string, body: unknown) =>
     request<Record<string, unknown>>(`/api/qa-entries/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteQa: (id: string) => request<Record<string, unknown>>(`/api/qa-entries/${id}`, { method: "DELETE" }),
+  // 画布罐头面（qa-canvas Phase 1 Task 4）：状态透传 pregen --qa-status（TTL 缓存）；
+  // pregen 手动触发物化（CP 侧 admin/root 闸+审计）；试听=wav 回放流端点，调用方
+  // 直接喂 <audio src>（404=缺料，回退 preview），不经 JSON request。
+  qaCannedStatus: (accountId = "acc-001") =>
+    request<{ available: boolean; statuses: Record<string, { state: "ok" | "missing"; voice: string; key: string }> }>(
+      `/api/qa/canned-status?account_id=${encodeURIComponent(accountId)}`,
+    ),
+  pregenQa: (ids: string[]) =>
+    request<{ status: string }>("/api/qa/pregen", { method: "POST", body: JSON.stringify({ ids }) }),
+  cannedAudioUrl: (id: string) => `${apiBase()}/api/qa/${id}/canned-audio`,
+  // AI 聚类采纳（W3 自学习闭环）：apply=false 生成聚类计划（variants/fresh/junk 三组）；
+  // apply=true 时 select=[{kind:"variant"|"fresh", i}] 指定采纳子集（缺省=全部）。
+  // 账号经 query 传（与 canned-status 同款 scoped_account 口径）。
+  qaCluster: (
+    accountId: string,
+    body: { min_calls?: number; limit?: number; apply?: boolean; select?: { kind: string; i: number }[] } = {},
+  ) =>
+    request<Record<string, unknown>>(`/api/qa/cluster?account_id=${encodeURIComponent(accountId)}`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
   getSettings: () => request<Record<string, unknown>>("/api/settings"),
   saveSettings: (body: unknown) => request<Record<string, unknown>>("/api/settings", { method: "PUT", body: JSON.stringify(body) }),
   // 电话边缘站点（P1.5）：站点下拉 + 一次性把 SIP 供应商凭据注册成 outbound trunk。
@@ -188,11 +217,9 @@ export const api = {
   updatePersona: (id: string, body: unknown) =>
     request<Record<string, unknown>>(`/api/personas/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   deletePersona: (id: string) => request<Record<string, unknown>>(`/api/personas/${id}`, { method: "DELETE" }),
-  updatePersonas: (body: unknown) => request<Record<string, unknown>>("/api/personas", { method: "PUT", body: JSON.stringify(body) }),
   getTurns: (id: string) => request<Record<string, unknown>[]>(`/api/calls/${id}/turns`),
   getSettlement: (id: string) => request<Record<string, unknown>>(`/api/calls/${id}/settlement`),
   activeCalls: () => request<Record<string, unknown>[]>("/api/supervisor/active-calls"),
-  supervisorJoin: (id: string) => request<Record<string, unknown>>(`/api/supervisor/${id}/join`, { method: "POST" }),
   supervisorPause: (id: string) => request<Record<string, unknown>>(`/api/supervisor/${id}/pause-agent`, { method: "POST" }),
   supervisorResume: (id: string) => request<Record<string, unknown>>(`/api/supervisor/${id}/resume-agent`, { method: "POST" }),
   supervisorTakeover: (id: string) => request<Record<string, unknown>>(`/api/supervisor/${id}/takeover`, { method: "POST" }),
@@ -223,7 +250,30 @@ export const api = {
   pauseCampaign: (id: string) => request<Record<string, unknown>>(`/api/campaigns/${id}/pause`, { method: "POST" }),
   stopCampaign: (id: string) => request<Record<string, unknown>>(`/api/campaigns/${id}/stop`, { method: "POST" }),
   deleteCampaign: (id: string) => request<Record<string, unknown>>(`/api/campaigns/${id}`, { method: "DELETE" }),
+  // 改战役配置（2026-09-17 调度三字段）：running 服务端 409 锁定，字段全 optional。
+  updateCampaign: (id: string, body: Record<string, unknown>) =>
+    request<Record<string, unknown>>(`/api/campaigns/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  // 意向规则（W4）：两级行（account_id=''=全局 admin 写 / 账号行）；
+  // 行形状 {id,account_id,name,intent_code,label,disposition,priority,enabled,conditions:[{fact,op,value}]}。
+  listIntentRules: (accountId = "acc-001") =>
+    request<Record<string, unknown>[]>(`/api/intent-rules?account_id=${encodeURIComponent(accountId)}`),
+  createIntentRule: (body: Record<string, unknown>) =>
+    request<Record<string, unknown>>("/api/intent-rules", { method: "POST", body: JSON.stringify(body) }),
+  updateIntentRule: (id: string, body: Record<string, unknown>) =>
+    request<Record<string, unknown>>(`/api/intent-rules/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) }),
+  deleteIntentRule: (id: string) =>
+    request<Record<string, unknown>>(`/api/intent-rules/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  // 通话人工求助打标（W4 notify_human/WA 打铃共用）：{status:"notified"|"done", source}。
+  reportAssist: (callId: string, body: { status: string; source?: string }) =>
+    request<Record<string, unknown>>(`/api/calls/${encodeURIComponent(callId)}/assist`, { method: "POST", body: JSON.stringify(body) }),
   reportsSummary: () => request<Record<string, unknown>>("/api/reports/summary"),
+  // 学习报告（W1 AI 工作站）：话术优化分析（高频问题 TOP N）+ 高频问答对挖掘。
+  scriptInsights: (accountId = "acc-001") =>
+    request<Record<string, unknown>>(`/api/reports/script-insights?account_id=${encodeURIComponent(accountId)}`),
+  qaPairs: (accountId = "acc-001", limit = 20) =>
+    request<Record<string, unknown>[]>(`/api/reports/qa-pairs?account_id=${encodeURIComponent(accountId)}&limit=${limit}`),
+  // 工作台仪表盘聚合（2026-09-17）：并发/呼叫量/接通率/时长分布/坐席排行/标记。
+  statsDashboard: () => request<Record<string, unknown>>("/api/stats/dashboard"),
   reportsCalls: () => request<Record<string, unknown>[]>("/api/reports/calls"),
   reportsUsage: () => request<Record<string, unknown>>("/api/reports/usage"),
   listTemplates: (accountId = "acc-001") => request<Record<string, unknown>[]>(`/api/templates?account_id=${accountId}`),
@@ -231,6 +281,9 @@ export const api = {
   createTemplate: (body: unknown) => request<Record<string, unknown>>("/api/templates", { method: "POST", body: JSON.stringify(body) }),
   updateTemplate: (id: string, body: unknown) =>
     request<Record<string, unknown>>(`/api/templates/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  // 发布当前版本（W2 发布两态）：冻结当时 live 九键写 published_json；返回更新行（含派生 published/has_changes）。
+  publishTemplate: (id: string) =>
+    request<Record<string, unknown>>(`/api/templates/${id}/publish`, { method: "POST" }),
   deleteTemplate: (id: string) => request<Record<string, unknown>>(`/api/templates/${id}`, { method: "DELETE" }),
   listAudit: (accountId = "", action = "", callId = "") =>
     request<Record<string, unknown>[]>(
@@ -249,6 +302,27 @@ export const api = {
       `/api/nodes/${encodeURIComponent(nodeId)}/unrevoke`,
       { method: "POST" },
     ),
+  // 远程日志通道（W2）：下发取日志指令 → 节点下个心跳周期上传 → root 查看下载。
+  enqueueNodeCommand: (
+    nodeId: string,
+    body: { action: string; version?: string; force?: boolean },
+  ) =>
+    request<{ id: string; status: string }>(
+      `/api/nodes/${encodeURIComponent(nodeId)}/commands`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+  listNodeLogs: (nodeId: string) =>
+    request<NodeLogFile[]>(
+      `/api/nodes/${encodeURIComponent(nodeId)}/logs`,
+    ),
+  downloadNodeLog: (nodeId: string, file: string) =>
+    fetch(
+      `${apiBase()}/api/nodes/${encodeURIComponent(nodeId)}/logs/${encodeURIComponent(file)}`,
+      { headers: authHeaders() },
+    ).then(async (res) => {
+      if (!res.ok) throw await toError(res);
+      return res.blob();
+    }),
   setupStatus: () => request<SetupStatus>("/api/setup"),
   setupDownload: () => fetch(`${apiBase()}/api/setup/download`, { method: "POST", headers: authHeaders() }).then(async (res) => {
     if (!res.ok) throw await toError(res);
@@ -309,4 +383,11 @@ export type NodeRow = {
   license_id?: string;
   /** 指纹只出前 12 位 hex（可辨识、不可还原） */
   fingerprint_prefix?: string;
+};
+
+/** 节点已上报的日志束（W2）：新→旧，bytes=gzip 体长。 */
+export type NodeLogFile = {
+  file: string;
+  bytes: number;
+  uploaded_at: string;
 };

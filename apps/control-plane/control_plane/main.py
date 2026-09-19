@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import io
 import json
@@ -20,6 +21,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
+from bok_voice_core.flow_graph import validate_flow_graph
+from bok_voice_core.intent_rules import validate_conditions
 from bok_voice_core.providers import BusinessRepository
 from bok_voice_core.policies import select_session_manifest
 from bok_voice_core.qa_text import mine_qa_pairs
@@ -36,11 +39,20 @@ from bok_voice_obs.context import get_correlation
 from bok_voice_obs.logging import configure_logging, get_logger
 from bok_voice_obs.middleware import CorrelationMiddleware
 
+from .campaign import (
+    parse_call_windows,
+    redispatch_due,
+    redispatch_harvest_updates,
+    redispatch_policy,
+    _utcnow_naive,
+)
 from .deps import build_engine, build_repository, build_session_factory
 from .dispatch_utils import cleanup_dispatch, has_active_dispatch
 from .nodes_store import HEARTBEAT_INTERVAL_S, LicenseError, NodeStore
 from .permissions import GRANTABLE_PERMISSIONS, PAGE_PERMISSIONS, effective_permissions
 from .pregen import persona_pregen_status
+from . import pregen as pregen_mod
+from . import qa_cluster as qa_cluster_mod
 from .auth import (
     Identity,
     JWT_TTL_S,
@@ -57,17 +69,21 @@ from .auth import (
     verify_password,
 )
 from .schemas import (
+    AssistRequest,
     CreateCallRequest,
     CreateObjectRequest,
     DialNowRequest,
     ImportRequest,
     DialResultRequest,
+    IntentRuleCreate,
+    IntentRulePatch,
     ListenStopRequest,
     LoginRequest,
     ChangePasswordRequest,
     CreateUserRequest,
     UpdateUserRequest,
     PersonaRequest,
+    QaClusterRequest,
     QaEntryCreate,
     QaEntryPatch,
     RosterClaimRequest,
@@ -80,6 +96,7 @@ from .schemas import (
     SiteCreateRequest,
     TokenRequest,
     TokenResponse,
+    TransferSipRequest,
     TrunkRegisterRequest,
     WhatsAppCaptureRequest,
     WhatsAppHandledRequest,
@@ -138,7 +155,7 @@ async def optional_bearer_auth(request: Request, call_next):
                          for p in ("/api/nodes/downloads/",))
     if expected and request.url.path not in (
             "/health", "/api/nodes/heartbeat", "/api/nodes/register",
-            "/api/webhook/livekit") and not _prefix_exempt:
+            "/api/nodes/logs", "/api/webhook/livekit") and not _prefix_exempt:
         # webhook 豁免与 identity_gate _EXEMPT_PATHS 对齐:LiveKit 签名 webhook
         # 不带 CP token,CP-token-only 模式曾在此 401——agent 崩溃重派队静默死
         # (端点内另有签名校验,豁免的只是机器 token 门,2026-09-17 全量 debug F2 修)。
@@ -245,6 +262,11 @@ def _seed_root_user() -> None:
 @app.on_event("startup")
 def _startup() -> None:
     configure_logging(level=os.environ.get("BOK_LOG_LEVEL", "INFO"))
+    # 云托管管理台运行时 CP 地址注入（见 _write_web_runtime_config docstring）：
+    # 在首个请求前落盘，缺省/本地形态零动作。
+    _public_cp_url = (os.environ.get("BOK_CP_PUBLIC_URL") or "").strip()
+    if _public_cp_url:
+        _write_web_runtime_config(_public_cp_url, _web_static_dir)
     engine = build_engine()
     app.state.repo = build_repository(engine)
     app.state.node_store = NodeStore(engine)  # 与 repo 同一 engine；None → 内存双模
@@ -418,14 +440,26 @@ def put_settings(req: SettingsRequest, request: Request) -> dict:
         "sip": req.sip.model_dump(),
         "policy": req.policy,
     }
-    secret_keys = {"api_key", "access_token", "token", "auth_password"}
-    for kind in ("asr", "llm", "tts", "vad", "sip"):
+    secret_keys = {"api_key", "access_token", "token", "auth_password", "secret"}
+    if req.sms is not None:
+        # 通知域（W5-T1）：请求未带 sms 键 → 段不动（照 campaign 先例，
+        # 仓库层缺键保留语义接管）。先入 new_values 再走下面 secret 保留循环，
+        # PUT 传空 secret=保留旧值。
+        new_values["sms"] = req.sms.model_dump()
+    for kind in ("asr", "llm", "tts", "vad", "sip", "sms"):
+        if kind not in new_values:
+            continue  # 段未随请求带上（sms=None 等）→ 不动，secret 保留语义也不适用
         old = existing.get(kind, {})
         new = new_values[kind]
         for key in secret_keys:
             if not new.get(key) and old.get(key):
                 new[key] = old[key]
         new_values[kind] = new
+    if req.campaign is not None:
+        # 全局外呼时段窗（T3b）：归一后落库（非法项静默丢弃、≤3 组），
+        # 空/全非法=不限时段。请求未带 campaign 键（None）→ 段不动（仓库层
+        # 缺键保留语义接管，不清运营已配的全局窗）。
+        new_values["campaign"] = {"call_windows": parse_call_windows(req.campaign.call_windows)}
     raw = new_values
     saved = _repo().save_settings(raw)
     _audit("settings.save", subject_type="global_settings", subject_id="global", detail={"llm_provider": raw.get("llm", {}).get("provider", "")})
@@ -436,12 +470,85 @@ def put_settings(req: SettingsRequest, request: Request) -> dict:
 
 def _mask_secrets(config: dict) -> dict:
     out = dict(config)
-    secret_keys = {"api_key", "access_token", "token", "auth_password"}
+    secret_keys = {"api_key", "access_token", "token", "auth_password", "secret"}
     for key in secret_keys:
         if out.get(key):
             out[key] = ""
             out[f"has_{key}"] = True
     return out
+
+
+def _sms_settings() -> dict:
+    """settings.sms 段读取（W5-T1）：端点与挂断钩子共用，缺段=空 dict=未配置。"""
+    return (_repo().get_settings() or {}).get("sms") or {}
+
+
+def _sms_configured(cfg: dict) -> bool:
+    """webhook provider 三要素齐备才算配置：总闸开 + webhook_url + secret。"""
+    return bool(
+        cfg.get("enabled")
+        and str(cfg.get("webhook_url") or "").strip()
+        and str(cfg.get("secret") or "").strip()
+    )
+
+
+async def _send_sms_webhook(cfg: dict, to: str, text: str) -> int:
+    """webhook provider 发送内核（W5-T1 骨架，真实网关未来对接）。
+
+    POST settings.sms.webhook_url，body={"to","text"}；secret 非空时附
+    `X-Bok-Signature: hmac_sha256(secret, body)` hex 摘要（接收方以同一密钥
+    重算校验，参照 CP webhook 验签的「摘要绑定 body」思路反向运用）。
+    返回上游 status_code；网络/HTTP 失败抛异常由调用方收敛（端点 502 /
+    挂断钩子打点吞掉）。
+    """
+    url = str(cfg.get("webhook_url") or "").strip()
+    secret = str(cfg.get("secret") or "")
+    body = json.dumps({"to": to, "text": text}, ensure_ascii=False).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if secret:
+        headers["X-Bok-Signature"] = hmac.new(
+            secret.encode("utf-8"), body, hashlib.sha256
+        ).hexdigest()
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(url, content=body, headers=headers)
+        resp.raise_for_status()
+        return resp.status_code
+
+
+@app.post("/api/notify/sms")
+async def notify_sms(payload: dict, request: Request) -> dict:
+    """短信 webhook provider（W5-T1 骨架）：真实网关未来对接，webhook_url 即对接点。
+
+    发送烧真实外部配额，auth-on 时归管理面（同 tts.preview 判据）。
+    body {call_id, to, text}：to 空=按 call_id 反查 contact_phone，都空 400；
+    未配置（disabled/空 webhook_url/空 secret）→ 503；上游失败一律 502。
+    审计 sms.send（detail 带 chars/status_code，secret/webhook_url 永不落审计）。
+    """
+    require_role(request, "admin", "root")
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(400, "text 必填")
+    to = str(payload.get("to") or "").strip()
+    call_id = str(payload.get("call_id") or "").strip()
+    if not to and call_id:
+        call = _repo().get_call(call_id)
+        if not call:
+            raise HTTPException(404, "call not found")
+        to = str(call.get("contact_phone") or "").strip()
+    if not to:
+        raise HTTPException(400, "to 与 call_id 至少给一个（且该通话须有 contact_phone）")
+    cfg = _sms_settings()
+    if not _sms_configured(cfg):
+        raise HTTPException(503, "短信 webhook 未配置：请到「设置 → 通知」填写 webhook URL 与 secret 并启用")
+    try:
+        status_code = await _send_sms_webhook(cfg, to, text)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, f"webhook 发送失败: {exc}") from exc
+    _audit("sms.send", subject_type="sms", subject_id=(call_id or to)[:64],
+           call_id=call_id, detail={"chars": len(text), "status_code": status_code, "source": "api"})
+    return {"ok": True, "provider": "webhook", "status_code": status_code}
 
 
 @app.get("/api/asr/health")
@@ -1368,7 +1475,13 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
             # 重签读到旧状态、写在提交之后，把终态翻回 active；下游 webhook 崩溃
             # 补位据此往已挂断空房补派幽灵 agent（白跑 64s、预热开场白烧 TTS）。
             # 改仓储层单条条件 UPDATE，终态判定与写入同语句求值，并发签发不可复活。
-            _repo().mark_active_if_live(req.call_id)
+            # started_at 落点（2026-09-17 仪表盘口径）:真翻成功才补——首次转 ACTIVE
+            # 时刻；已有值（dial-result 先行）不覆盖，读改写竞态最坏=挂断后补写
+            # started_at 而 duration_s 停留 0（仪表盘不进时长桶，无害）。
+            if _repo().mark_active_if_live(req.call_id):
+                _cur = _repo().get_call(req.call_id) or {}
+                if not _cur.get("started_at"):
+                    _repo().update_call(req.call_id, started_at=_utcnow_naive())
         except Exception:
             pass
     _audit("token.issue", subject_type="call", subject_id=req.call_id or "",
@@ -1631,16 +1744,18 @@ async def _reap_stale_calls_once() -> dict:
     out = {"failed": 0, "ended": 0, "settled": 0}
     for c in _repo().list_calls("", status=CallStatus.RINGING.value):
         if _created_before(c, _STALE_RINGING_S):
-            _repo().update_call(c["id"], status=CallStatus.FAILED.value, disposition="abandoned")
+            _repo().update_call(c["id"], status=CallStatus.FAILED.value, disposition="abandoned",
+                                **_call_end_fields(c))
             out["failed"] += 1
     for st in (CallStatus.ACTIVE.value, CallStatus.PAUSED.value):
         for c in _repo().list_calls("", status=st):
             if await _room_has_participants(c["id"]):
                 continue
-            _repo().update_call(c["id"], status=CallStatus.ENDED.value, disposition="abandoned")
+            _repo().update_call(c["id"], status=CallStatus.ENDED.value, disposition="abandoned",
+                                **_call_end_fields(c))
             out["ended"] += 1
             try:
-                await settle(c["id"])  # 幂等:已结算直接 existing 短路
+                await _settle_core(c["id"])  # 幂等:已结算直接 existing 短路
                 out["settled"] += 1
             except Exception as exc:  # pragma: no cover - 兜底结算失败不阻回收
                 print(f"[cp] reaper settle skipped ({c['id']}): {exc!r}", flush=True)
@@ -1657,7 +1772,7 @@ async def _reap_stale_calls_once() -> dict:
         if _repo().get_settlement(c["id"]):
             continue
         try:
-            await settle(c["id"])
+            await _settle_core(c["id"])
             patched += 1
             out["settled"] += 1
         except Exception as exc:  # pragma: no cover
@@ -1696,8 +1811,12 @@ def _disconnect_room_background(room_name: str) -> None:
 @app.post("/api/calls/{call_id}/hangup")
 async def hangup(call_id: str, request: Request) -> dict:
     _gate_page(request, "calls")
-    deny_cross_account(request, _repo().get_call(call_id))
-    call = _repo().update_call(call_id, status=CallStatus.ENDED.value)
+    existing = _repo().get_call(call_id)
+    deny_cross_account(request, existing)
+    if not existing:
+        raise HTTPException(404, "call not found")
+    call = _repo().update_call(call_id, status=CallStatus.ENDED.value,
+                               **_call_end_fields(existing))
     if not call:
         raise HTTPException(404, "call not found")
     # 真正断开 LiveKit 房间：主管台/任意端挂断后 agent 与监听端都会被服务端踢出，
@@ -1811,6 +1930,10 @@ def report_whatsapp(call_id: str, req: WhatsAppCaptureRequest, request: Request)
         fields = {"whatsapp_status": "captured" if number else "offered"}
         if number:
             fields["customer_whatsapp"] = number
+    # 意向规则引擎(W4-T1):WhatsApp 对接触发=人工协助信号——assist_status 为空
+    # 顺手置 notified(不改已有值;同一次 update_call,不走第二条写路径)。
+    if not str(call.get("assist_status") or ""):
+        fields["assist_status"] = "notified"
     updated = _repo().update_call(call_id, **fields) or call
     if number:
         # 名册自动入册（Wave1）：captured 带号码 → upsert；channel 归一——
@@ -1853,6 +1976,31 @@ def report_whatsapp(call_id: str, req: WhatsAppCaptureRequest, request: Request)
     return updated
 
 
+@app.post("/api/calls/{call_id}/assist")
+def assist_notify(call_id: str, req: AssistRequest, request: Request) -> dict:
+    """人工协助通知面(W4-T1,2026-09-19):意向规则命中/WhatsApp 捕获 → 打铃
+    (notified);人工接手 → done。幂等:当前 done 不降级 notified(其余覆盖)。
+    闸链照 whatsapp capture 端点:机器通道直通(无身份不过 _gate_page)、
+    跨账号 deny_cross_account。审计 call.assist_notify。
+    """
+    _gate_page(request, "calls")
+    deny_cross_account(request, _repo().get_call(call_id))
+    call = _repo().get_call(call_id)
+    if not call:
+        raise HTTPException(404, "call not found")
+    status = (req.status or "").strip().lower()
+    if status not in ("notified", "done"):
+        raise HTTPException(status_code=400, detail="status must be 'notified' or 'done'")
+    if str(call.get("assist_status") or "") == "done" and status != "done":
+        return call  # 幂等:人工已接手,notified 不降级
+    source = (req.source or "").strip()[:16]
+    updated = _repo().update_call(call_id, assist_status=status) or call
+    _audit("call.assist_notify", subject_type="call", subject_id=call_id,
+           account_id=call.get("account_id", "acc-001"),
+           detail={"status": status, "source": source})
+    return updated
+
+
 @app.post("/api/calls/{call_id}/dial-result")
 def report_dial_result(call_id: str, req: DialResultRequest, request: Request) -> dict:
     """Agent 外呼拨号结果上报:answered→ACTIVE;三失败态→ENDED+disposition。
@@ -1870,10 +2018,16 @@ def report_dial_result(call_id: str, req: DialResultRequest, request: Request) -
         return call
     status = str(req.status or "").strip()
     if status == "answered":
-        updated = _repo().update_call(call_id, status=CallStatus.ACTIVE.value) or call
+        # 接通即首次转 ACTIVE：started_at 落点（仪表盘 duration 口径起点）。
+        # coalesce（T5-M1）：重复上报/重派不重置起点（与 resume-agent 路径同款）。
+        updated = _repo().update_call(
+            call_id, status=CallStatus.ACTIVE.value,
+            started_at=call.get("started_at") or _utcnow_naive(),
+        ) or call
     elif status in ("no_answer", "rejected", "failed"):
         updated = _repo().update_call(call_id, status=CallStatus.ENDED.value,
-                                      disposition=status) or call
+                                      disposition=status,
+                                      **_call_end_fields(call)) or call
     else:
         updated = call
     # 战役名单联动（Wave3）：通话若由某个 campaign item 拨出（call_id 反查），把
@@ -1882,12 +2036,34 @@ def report_dial_result(call_id: str, req: DialResultRequest, request: Request) -
     if status in ("answered", "no_answer", "rejected", "failed"):
         item = _repo().find_item_by_call(call_id)
         if item and str(item.get("status") or "") in ("dialing", "in_call"):
-            _repo().update_item(
-                str(item["id"]),
-                status="in_call" if status == "answered" else status,
-                last_error=(req.detail or "")[:250],
-                updated_at=_utcnow_iso(),
-            )
+            if status == "answered":
+                _repo().update_item(
+                    str(item["id"]),
+                    status="in_call",
+                    last_error=(req.detail or "")[:250],
+                    updated_at=_utcnow_iso(),
+                )
+            else:
+                # 失败三态先过重联回队判定（终审 C-1）：命中（result ∈ policy.on 且
+                # attempts < max）回 pending 等 interval——旧版直写终态令收割段（只扫
+                # 在途 item）永远等不到它，重拨在生产主路静默 no-op。last_error 与
+                # 收割路同源=通话 disposition；不命中维持终态直写（last_error 仍带
+                # agent detail）。
+                campaign = _repo().get_campaign(str(item.get("campaign_id") or ""))
+                redispatch = redispatch_harvest_updates(item, status, campaign or {})
+                if redispatch:
+                    _repo().update_item(
+                        str(item["id"]),
+                        **redispatch,
+                        last_error=str(updated.get("disposition") or status)[:250],
+                    )
+                else:
+                    _repo().update_item(
+                        str(item["id"]),
+                        status=status,
+                        last_error=(req.detail or "")[:250],
+                        updated_at=_utcnow_iso(),
+                    )
     _audit("call.dial_result", subject_type="call", subject_id=call_id,
            account_id=str(call.get("account_id", "acc-001")),
            detail={"status": status, "detail": (req.detail or "")[:120]})
@@ -2087,6 +2263,13 @@ class CampaignCreateRequest(BaseModel):
     # 8kHz 窄带档（T5 前置门）：mock 客户话音走电话频带，重验窄带下的 ASR。
     # 与句间隔同一份 scripts_json 保留键（`__narrowband__`），只加键不加列。
     narrowband: bool = False
+    # 调度三字段（2026-09-17）：时段窗（≤3 组，非法项由 parse_call_windows 静默
+    # 丢弃）、并发（0=不限，缺省 1=旧串行）、重拨策略（空=不重拨）。
+    call_windows: list[dict] = []
+    # `| None` 是 T1-M1 防呆：显式 `"max_concurrency": null` 收口为缺省 1（串行），
+    # 不落 0（不限）——端点在 `is None` 时传 1。
+    max_concurrency: int | None = 1
+    redispatch: dict = {}
 
 
 @app.post("/api/campaigns")
@@ -2131,6 +2314,10 @@ def create_campaign(req: CampaignCreateRequest, request: Request) -> dict:
         scenarios={k: v for k, v in req.scenarios.items() if v in _CAMPAIGN_SCENARIOS},
         scripts=scripts,
         site_id=req.site_id,
+        call_windows=parse_call_windows(req.call_windows),
+        # 显式 null / 缺省 → 1（旧串行）；绝不向 repo 传 None（T1-M1 防呆）。
+        max_concurrency=1 if req.max_concurrency is None else max(0, int(req.max_concurrency)),
+        redispatch=_clean_redispatch(req.redispatch),
     )
     _audit("campaign.create", subject_type="campaign", subject_id=camp["id"],
            account_id=req.account_id, detail={"objects": len(req.object_ids)})
@@ -2213,6 +2400,80 @@ def delete_campaign(campaign_id: str, request: Request) -> dict:
            account_id=str(camp.get("account_id") or ""),
            detail={"items": len(items), "status": status})
     return {"campaign_id": campaign_id, "deleted": True, "items_removed": len(items)}
+
+
+_REDISPATCH_OUTCOMES = ("no_answer", "rejected", "failed")
+
+
+def _clean_redispatch(raw: dict | None) -> dict:
+    """重拨策略清洗：max_attempts≥0、interval_minutes>0 才有意义、on 白名单剔除。"""
+    if not isinstance(raw, dict):
+        return {}
+    try:
+        max_attempts = max(0, int(raw.get("max_attempts") or 0))
+    except (TypeError, ValueError):
+        return {}
+    try:
+        interval = float(raw.get("interval_minutes") or 0)
+    except (TypeError, ValueError):
+        return {}
+    if max_attempts <= 0 or interval <= 0:
+        return {}
+    on = [str(x) for x in (raw.get("on") or []) if str(x) in _REDISPATCH_OUTCOMES]
+    return {"max_attempts": max_attempts, "interval_minutes": interval, "on": on}
+
+
+class CampaignUpdateRequest(BaseModel):
+    name: str | None = None
+    template_id: str | None = None
+    persona_id: str | None = None
+    language: str | None = None
+    gap_seconds: int | None = None
+    site_id: str | None = None
+    call_windows: list[dict] | None = None
+    max_concurrency: int | None = None
+    redispatch: dict | None = None
+
+
+@app.put("/api/campaigns/{campaign_id}")
+def update_campaign(campaign_id: str, req: CampaignUpdateRequest, request: Request) -> dict:
+    """改战役配置：running 拒改（409，运行中时段/并发锁定——对齐惜客通语义）；
+    draft/paused/stopped 可改。字段只增不改默认语义（None=不碰该字段）。"""
+    _gate_page(request, "campaigns")
+    camp = deny_cross_account(request, _repo().get_campaign(campaign_id))
+    if not camp:
+        raise HTTPException(404, "campaign not found")
+    if str(camp.get("status") or "") == "running":
+        raise HTTPException(409, "campaign is running — pause it first")
+    fields: dict = {k: v for k, v in {
+        "name": req.name, "template_id": req.template_id, "persona_id": req.persona_id,
+        "language": req.language, "gap_seconds": req.gap_seconds, "site_id": req.site_id,
+    }.items() if v is not None}
+    if req.call_windows is not None:
+        fields["call_windows_json"] = json.dumps(
+            parse_call_windows(req.call_windows), ensure_ascii=False)
+    if req.max_concurrency is not None:
+        fields["max_concurrency"] = max(0, int(req.max_concurrency))
+    if req.redispatch is not None:
+        cleaned = _clean_redispatch(req.redispatch)
+        fields["redispatch_json"] = json.dumps(cleaned, ensure_ascii=False) if cleaned else ""
+    updated = _repo().update_campaign(campaign_id, **fields) or camp
+    _audit("campaign.update", subject_type="campaign", subject_id=campaign_id,
+           account_id=str(camp.get("account_id") or ""),
+           detail={"fields": sorted(fields)})
+    return updated
+
+
+def _call_end_fields(call: dict) -> dict:
+    """通话终态时间戳落点（2026-09-17 仪表盘口径）：ended_at=now、duration_s=ended-started。
+
+    started_at 为空（未接通/从未 ACTIVE）→ duration_s=0。全部 UTC naive，与 created_at 同域。
+    """
+    from .campaign import _parse_updated_at, _utcnow_naive
+    ended = _utcnow_naive()
+    started = _parse_updated_at(call.get("started_at"))
+    duration = int((ended - started).total_seconds()) if started and ended >= started else 0
+    return {"ended_at": ended, "duration_s": duration}
 
 
 def _progress(items: list[dict]) -> dict:
@@ -2707,6 +2968,101 @@ def download_node_artifact(kind: str, version: str, filename: str,
     return FileResponse(target, filename=filename)
 
 
+# ---- 节点日志上报/查看（W2 远程日志通道，2026-09-18）----
+# 零入站模型：CP 不拉，节点领 upload_logs 指令后主动 POST gzip 束到本端点。
+# 存储=工件卷 logs/ 命名空间（downloads 端点只放行 pkg/runtime/bootstrap 三段，
+# 互不可见）；TTL 到期顺手清。root 查看/下载走 JWT 门禁（不入豁免表）。
+
+_LOG_UPLOAD_MAX_BYTES = 8 * 1024 * 1024
+_LOG_TTL_DAYS_DEFAULT = 7
+
+
+def _node_logs_dir(node_id: str) -> Path:
+    base = (Path(os.environ.get("BOK_NODE_ARTIFACTS_DIR", "/app/downloads"))
+            / "logs" / node_id)
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        # 缺省 /app/downloads 是容器内路径；裸机/CI 上未配 env 时 mkdir 即失败
+        # ——503 明文（节点 ack ok=false 带原因）而非裸 500（CI ⑨ 步首跑实证）。
+        raise HTTPException(503, f"node log storage unavailable: {exc}") from exc
+    return base
+
+
+def _sweep_node_logs(base: Path, ttl_days: int) -> None:
+    cutoff = datetime.now(timezone.utc).timestamp() - ttl_days * 86400
+    for p in base.glob("*.tar.gz"):
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+        except OSError:  # pragma: no cover - 单文件清理失败不阻上传
+            continue
+
+
+@app.post("/api/nodes/logs")
+async def upload_node_logs(request: Request,
+                           authorization: str = Header(default="")) -> dict:
+    """节点日志束上报（node_token 端点内自证，同 heartbeat 模式）。
+
+    体=原始 gzip（魔数验证，Content-Type 可伪造）；封顶 8MB（413）；
+    文件名带 UTC 时间戳+体长+短随机——同秒重复上传不互相覆盖。"""
+    token = authorization.removeprefix("Bearer ").strip()
+    node = _node_store().resolve_node_token(token) if token else None
+    if node is None:
+        raise HTTPException(401, "node token required")
+    node_id = str(node.get("node_id", ""))
+    body = await request.body()
+    if not body:
+        raise HTTPException(400, "empty body")
+    if len(body) > _LOG_UPLOAD_MAX_BYTES:
+        raise HTTPException(413, "log bundle too large")
+    if body[:2] != b"\x1f\x8b":
+        raise HTTPException(415, "expected gzip payload")
+    base = _node_logs_dir(node_id)
+    _sweep_node_logs(base, int(os.environ.get(
+        "BOK_NODE_LOG_TTL_DAYS", str(_LOG_TTL_DAYS_DEFAULT))))
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    target = base / f"{stamp}-{len(body)}-{uuid.uuid4().hex[:6]}.tar.gz"
+    tmp = target.with_name(target.name + ".part")
+    tmp.write_bytes(body)
+    tmp.replace(target)
+    _audit("node.logs_uploaded", subject_type="node", subject_id=node_id,
+           detail={"bytes": len(body), "file": target.name})
+    return {"ok": True, "node_id": node_id, "file": target.name, "bytes": len(body)}
+
+
+@app.get("/api/nodes/{node_id}/logs")
+def list_node_logs(node_id: str, request: Request) -> list[dict]:
+    """节点日志束清单（root 专属）：新→旧，含体长与上传时刻。"""
+    require_role(request, "root")
+    base = _node_logs_dir(node_id)
+    out: list[dict] = []
+    for p in sorted(base.glob("*.tar.gz"), reverse=True):
+        try:
+            st = p.stat()
+        except OSError:  # pragma: no cover - 并发清扫竞态
+            continue
+        out.append({"file": p.name, "bytes": st.st_size,
+                    "uploaded_at": datetime.fromtimestamp(
+                        st.st_mtime, tz=timezone.utc).isoformat()})
+    return out
+
+
+@app.get("/api/nodes/{node_id}/logs/{filename}")
+def download_node_logs(node_id: str, filename: str, request: Request) -> FileResponse:
+    """下载单个日志束（root 专属）：文件名白名单 + 目录收敛校验（同工件下载）。"""
+    require_role(request, "root")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.tar\.gz", filename):
+        raise HTTPException(404, "not found")
+    base = _node_logs_dir(node_id)
+    target = (base / filename).resolve()
+    if not target.is_file() or base.resolve() not in target.parents:
+        raise HTTPException(404, "not found")
+    _audit("node.logs_downloaded", subject_type="node", subject_id=node_id,
+           detail={"file": filename})
+    return FileResponse(target, filename=filename, media_type="application/gzip")
+
+
 def node_license_required() -> bool:
     """加固模式判定：任一强制凭据开启即要求节点 license（本地双关全空=开放）。"""
     return auth_required() or bool(os.environ.get("BOK_CP_TOKEN", "").strip())
@@ -2963,6 +3319,17 @@ def _backfill_turns_from_report(call_id: str, report_raw: str) -> int:
 async def settle(call_id: str, request: Request) -> dict:
     _gate_page(request, "calls")
     deny_cross_account(request, _repo().get_call(call_id))
+    return await _settle_core(call_id)
+
+
+async def _settle_core(call_id: str) -> dict:
+    """结算内核（无鉴权层）：HTTP 端点与 reaper 后台循环共用。
+
+    2026-09-18 修复：reaper 此前直调 settle(c["id"]) 缺 request 参数——TypeError
+    被兜底 except 吞掉，僵尸通话/存量补结算从上线起一直空转（每轮打印
+    reaper settle skipped 报 TypeError 即其痕迹）。鉴权留在端点壳，后台路径
+    走本内核。
+    """
     existing = _repo().get_settlement(call_id)
     if existing:
         return existing
@@ -3074,6 +3441,25 @@ async def settle(call_id: str, request: Request) -> dict:
         subject_id=call_id,
         detail={"status": result.get("status", ""), "turns": len(turns), "has_summary": bool(result.get("summary"))},
     )
+    # 挂断自动短信（W5-T1 骨架，默认关）：enabled+hangup_enabled 且有号码才发；
+    # 号码=call.contact_phone，空则 object.phone 兜底（同 digest 段读法）。模板
+    # hangup_template 支持 {contact} 占位=收件号码。二次 settle 在函数头被
+    # existing 短路，天然不重发。失败只打点绝不破 settle（照 summarizer 段
+    # 「must not break settle」先例）。
+    try:
+        sms_cfg = _sms_settings()
+        if _sms_configured(sms_cfg) and sms_cfg.get("hangup_enabled"):
+            phone = str(call.get("contact_phone") or "").strip()
+            if not phone and call.get("object_id"):
+                obj = _repo().get_object(call["object_id"])
+                phone = str((obj or {}).get("phone") or "").strip()
+            template = str(sms_cfg.get("hangup_template") or "").strip()
+            if phone and template:
+                status_code = await _send_sms_webhook(sms_cfg, phone, template.replace("{contact}", phone))
+                _audit("sms.send", subject_type="sms", subject_id=call_id,
+                       call_id=call_id, detail={"chars": len(template), "status_code": status_code, "source": "hangup"})
+    except Exception as exc:  # pragma: no cover - sms hook must not break settle
+        print(f"[settle] sms hook failed: {exc!r}", flush=True)
     return _repo().get_settlement(call_id) or result
 
 
@@ -3263,16 +3649,25 @@ def list_qa_entries(request: Request, account_id: str = "acc-001", enabled: int 
     )
 
 
+def _clamp_priority(value: int | None) -> int:
+    """QA 优先级钳制(Phase 3.1):[0,1000],缺省 10。0 是合法值不回退默认。"""
+    if value is None:
+        return 10
+    return max(0, min(int(value), 1000))
+
+
 @app.post("/api/qa-entries")
 def create_qa_entry(req: QaEntryCreate, request: Request) -> dict:
     _gate_page(request, "qa")
     identity = current_identity(request)
     if identity is not None and identity.role != "root":
         # B3：user 建的自动归自己（body 的 owner 无效）；admin 建默认共享、可显式指派。
-        updates: dict = {"account_id": identity.account_id}
+        updates: dict = {"account_id": identity.account_id, "priority": _clamp_priority(req.priority)}
         if identity.role == "user":
             updates["owner_user_id"] = identity.user_id
         req = req.model_copy(update=updates)
+    else:
+        req = req.model_copy(update={"priority": _clamp_priority(req.priority)})
     row = _repo().create_qa_entry(req.model_dump())
     _audit("qa_entry.create", subject_type="qa_entry", subject_id=row.get("id", ""), account_id=req.account_id,
            detail={"owner_user_id": row.get("owner_user_id", "")})
@@ -3288,6 +3683,8 @@ def update_qa_entry(entry_id: str, req: QaEntryPatch, request: Request) -> dict:
     ident = current_identity(request)
     if ident is not None and ident.role == "user":
         patch.pop("owner_user_id", None)
+    if "priority" in patch:
+        patch["priority"] = _clamp_priority(patch["priority"])
     row = _repo().update_qa_entry(entry_id, patch)
     if row is None:
         from fastapi import HTTPException
@@ -3312,6 +3709,188 @@ def hit_qa_entry(entry_id: str, request: Request) -> dict:
     deny_cross_account(request, _repo().get_qa_entry(entry_id))
     _repo().incr_qa_hit(entry_id)
     return {"id": entry_id}
+
+
+# ---- 意向规则(W4-T1,2026-09-19):条件规则 → 挂断意向码/处置,两级作用域 ----
+# 作用域语义:account_id ''=全局行(admin/root 写)∪账号行(话务员写),读=两级行合并。
+# 条件形状与评估纯函数=packages/core/bok_voice_core/intent_rules.py(CP 只消费)。
+
+
+def _intent_rule_out(row: dict) -> dict:
+    """出仓形状:conditions_json → conditions 对象数组(宽容 json.loads,坏=空数组)。"""
+    out = dict(row)
+    raw = out.pop("conditions_json", "[]")
+    try:
+        conds = json.loads(raw if isinstance(raw, str) else "[]")
+    except Exception:
+        conds = None
+    out["conditions"] = conds if isinstance(conds, list) else []
+    return out
+
+
+def _forbid_user_on_global_rule(request: Request, row: dict) -> None:
+    """全局行(account_id=='')只归 admin/root——user/普通身份 403(机器通道无身份直通)。"""
+    if str(row.get("account_id") or "") != "":
+        return
+    ident = current_identity(request)
+    if ident is not None and ident.role not in ("admin", "root"):
+        raise HTTPException(status_code=403, detail="global intent rule requires admin/root")
+
+
+def _gate_intent_rule_row(request: Request, row: dict | None) -> dict:
+    """by-ID 规则闸链(W4-T1):404 不泄露存在性;全局行走角色闸、账号行走跨账号闸。
+
+    全局行不进 deny_cross_account——admin 属某账号,按账号闸会把他该管的全局行
+    误杀成 404;角色闸(user→403)已先行收窄到 admin/root/机器。
+    """
+    if row is None:
+        raise HTTPException(status_code=404, detail="intent rule not found")
+    if str(row.get("account_id") or "") == "":
+        _forbid_user_on_global_rule(request, row)
+    else:
+        deny_cross_account(request, row)
+    return row
+
+
+@app.get("/api/intent-rules")
+def list_intent_rules(request: Request, account_id: str = "acc-001") -> list[dict]:
+    _gate_page(request, "calls")
+    account_id = scoped_account(request, account_id)
+    return [_intent_rule_out(r) for r in _repo().list_intent_rules(account_id)]
+
+
+@app.post("/api/intent-rules")
+def create_intent_rule(req: IntentRuleCreate, request: Request) -> dict:
+    _gate_page(request, "calls")
+    errs = validate_conditions(req.conditions)
+    if errs:
+        raise HTTPException(status_code=400, detail="; ".join(errs))
+    identity = current_identity(request)
+    if identity is not None and identity.role != "root":
+        # 非 root 强制本账号行(body 的 account_id 无效;''=全局行仅 root 可建)。
+        req = req.model_copy(update={"account_id": identity.account_id})
+    payload = req.model_dump()
+    payload["conditions_json"] = json.dumps(payload.pop("conditions"), ensure_ascii=False)
+    row = _repo().create_intent_rule(payload)
+    _audit("intent.rule.create", subject_type="intent_rule", subject_id=row.get("id", ""),
+           account_id=row.get("account_id", ""),
+           detail={"intent_code": row.get("intent_code", ""), "account_id": row.get("account_id", "")})
+    return _intent_rule_out(row)
+
+
+@app.patch("/api/intent-rules/{rule_id}")
+def update_intent_rule(rule_id: str, req: IntentRulePatch, request: Request) -> dict:
+    _gate_page(request, "calls")
+    row = _gate_intent_rule_row(request, _repo().get_intent_rule(rule_id))
+    patch = {k: v for k, v in req.model_dump().items() if v is not None}
+    if "conditions" in patch:
+        errs = validate_conditions(patch["conditions"])
+        if errs:
+            raise HTTPException(status_code=400, detail="; ".join(errs))
+        patch["conditions_json"] = json.dumps(patch.pop("conditions"), ensure_ascii=False)
+    updated = _repo().update_intent_rule(rule_id, patch)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="intent rule not found")
+    _audit("intent.rule.update", subject_type="intent_rule", subject_id=rule_id,
+           account_id=row.get("account_id", ""), detail={"keys": sorted(patch.keys())})
+    return _intent_rule_out(updated)
+
+
+@app.delete("/api/intent-rules/{rule_id}")
+def delete_intent_rule(rule_id: str, request: Request) -> dict:
+    _gate_page(request, "calls")
+    row = _gate_intent_rule_row(request, _repo().get_intent_rule(rule_id))
+    ok = _repo().delete_intent_rule(rule_id)
+    _audit("intent.rule.delete", subject_type="intent_rule", subject_id=rule_id,
+           account_id=row.get("account_id", ""), outcome="ok" if ok else "not_found")
+    return {"deleted": ok, "id": rule_id}
+
+
+# ---- 罐头状态面(2026-09-17 qa-canvas Phase 1 Task 3) ----
+
+
+@app.get("/api/qa/canned-status")
+def qa_canned_status_ep(request: Request, account_id: str = "acc-001") -> dict:
+    """QA 条目罐头物化状态(透传 pregen_tts --qa-status,TTL 缓存;画布状态面用)。"""
+    _gate_page(request, "qa")
+    scoped_account(request, account_id)
+    out = pregen_mod.qa_canned_status(str(request.base_url).rstrip("/"))
+    return {
+        "available": out["available"],
+        "statuses": out["statuses"],
+        "generated_at": out["generated_at"],
+    }
+
+
+@app.get("/api/qa/{entry_id}/canned-audio")
+def qa_canned_audio(entry_id: str, request: Request) -> Response:
+    """试听=罐头缓存回放,零云费,qa 页面权限即可;404=缺料(前端回退 preview,烧云归 admin)。"""
+    _gate_page(request, "qa")
+    deny_cross_account(request, _repo().get_qa_entry(entry_id))
+    out = pregen_mod.qa_canned_status(str(request.base_url).rstrip("/"))
+    info = (out.get("statuses") or {}).get(entry_id) or {}
+    key = str(info.get("key") or "")
+    if info.get("state") != "ok" or not re.fullmatch(r"[0-9a-f]{40}", key):
+        raise HTTPException(status_code=404, detail="canned audio not materialized")
+    try:
+        pcm = (pregen_mod.cache_root() / f"{key}.pcm").read_bytes()
+    except OSError:
+        # 缓存被逐出/目录漂移=罐头缺料,按 404 交前端回退,不当 500。
+        raise HTTPException(status_code=404, detail="canned audio not materialized")
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(24000)
+        w.writeframes(pcm)
+    return Response(content=buf.getvalue(), media_type="audio/wav")
+
+
+@app.post("/api/qa/pregen")
+def qa_pregen_ep(payload: dict, request: Request) -> dict:
+    """手动触发 --qa 物化(可限 ids);烧云配额操作,与 /api/tts/preview 同闸同审计。"""
+    require_role(request, "admin", "root")
+    ids = [str(x) for x in (payload.get("ids") or [])]
+    out = pregen_mod.qa_pregen_spawn(str(request.base_url).rstrip("/"), ids)
+    _audit("qa.pregen", subject_type="qa_entry", subject_id=",".join(ids)[:128],
+           detail={"count": len(ids), "status": out.get("status")})
+    return out
+
+
+@app.post("/api/qa/cluster")
+def qa_cluster_ep(req: QaClusterRequest, request: Request, account_id: str = "acc-001") -> dict:
+    """自学习聚类(W3-T1,2026-09-19):dry=挖掘→LLM 三列计划;apply=true 按 select 采纳入库。
+
+    逻辑全在 qa_cluster runner(端点瘦):挖掘与 /api/reports/qa-pairs 同源
+    (mine_qa_pairs);纯函数与 tts-mine --cluster 同源(bok_voice_core.qa_cluster);
+    dry 计划 600s per-account 缓存,apply 优先吃新鲜缓存免二次 LLM。
+    LLM 网络/解析失败 503(文案带原因);单飞冲突 409。junk 只展示不入库。
+    """
+    _gate_page(request, "qa")
+    account_id = scoped_account(request, account_id)
+    limit = max(1, min(int(req.limit), 100))
+    min_calls = max(1, int(req.min_calls))
+    select = (
+        [{"kind": str(s.kind), "i": int(s.i)} for s in req.select]
+        if req.select is not None
+        else None
+    )
+    # 勾选采纳守卫(主会话审计修复):select 下标只在「与 dry 同参数的新鲜缓存」上有效,
+    # 缓存过期/参数不符时静默重算=下标可能对到另一份计划采错条目——409 让前端重新
+    # 生成;select=None 的「采纳全部」可安全重算(语义=采纳当前计划全量)。
+    if req.apply and select is not None and not qa_cluster_mod.has_fresh_plan(account_id, min_calls, limit):
+        raise HTTPException(status_code=409, detail="聚类计划已过期或参数不符，请重新生成计划后再采纳")
+    try:
+        plan = qa_cluster_mod.run_cluster(_repo(), account_id, min_calls=min_calls, limit=limit)
+        if not req.apply:
+            return plan
+        return qa_cluster_mod.apply_cluster(
+            _repo(), request, account_id, plan, select, audit=_audit
+        )
+    except qa_cluster_mod.AlreadyRunning as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except qa_cluster_mod.ClusterError as exc:
+        raise HTTPException(status_code=503, detail=f"聚类 LLM 不可用: {exc}") from exc
 
 
 # ---- 垫话罐头库(2026-09-13 乙节):确定性语境命中,镜像 qa_entries ----
@@ -3450,12 +4029,82 @@ def delete_persona(persona_id: str, request: Request) -> dict:
     return {"persona_id": persona_id, "deleted": True}
 
 
+def _validate_graph_field(raw: str) -> list[str]:
+    """模板 graph_json 保存校验:空串=未启用放行;非法返回错误列表(→400)。"""
+    if not str(raw or "").strip():
+        return []
+    return validate_flow_graph(str(raw))
+
+
+# ---- 模板发布两态(W2-T1,2026-09-19):保存=草稿、发布=冻结即生效 ----
+# 冻结 payload 九键(接口冻结):发布时按当时 live 值原样收进 published_json;
+# 「已发布」≡published_json 非空,「有未发布改动」≡九键逐一比对 live≠冻结
+# (服务端派生布尔,不落列——消灭 status 与快照的双列状态同步漂移)。
+_TEMPLATE_PUBLISH_KEYS = (
+    "steps_json",
+    "graph_json",
+    "hotwords",
+    "tone_override",
+    "opening",
+    "core",
+    "objection",
+    "closing",
+    "language",
+)
+
+
+def _template_published_flags(row: dict) -> dict:
+    """派生发布态布尔(单点助手,列表与详情共用):published + has_changes。
+
+    冻结 payload 解析失败/非 object 视为 has_changes=False(无法比对时保守报
+    「无改动」)且照常返回 published——坏快照不得炸掉读端点。"""
+    frozen_raw = str(row.get("published_json") or "")
+    published = bool(frozen_raw.strip())
+    has_changes = False
+    if published:
+        try:
+            frozen = json.loads(frozen_raw)
+        except Exception:
+            frozen = None
+        if isinstance(frozen, dict):
+            has_changes = any(
+                str(row.get(key) or "") != str(frozen.get(key) or "")
+                for key in _TEMPLATE_PUBLISH_KEYS
+            )
+    return {"published": published, "has_changes": has_changes}
+
+
+def _template_machine_overlay(row: dict) -> dict:
+    """机器通道 GET 详情 overlay:已发布模板把冻结九键覆盖进行 dict 后返回
+    (agent 建单装配恒吃发布冻结版,编辑中的 live 草稿不影响在途话术)。
+
+    payload 解析失败回退 live(宽容 try,不炸读路径);未发布(空串)原样返回。
+    人类通道不调用本函数——恒读 live。列表端点不 overlay。"""
+    frozen_raw = str(row.get("published_json") or "")
+    if not frozen_raw.strip():
+        return row
+    try:
+        frozen = json.loads(frozen_raw)
+    except Exception:
+        return row
+    if not isinstance(frozen, dict):
+        return row
+    merged = dict(row)
+    for key in _TEMPLATE_PUBLISH_KEYS:
+        if key in frozen:
+            merged[key] = frozen[key]
+    return merged
+
+
 @app.get("/api/templates")
 def list_templates(request: Request, account_id: str = "acc-001", owner_scope: str | None = None) -> list[dict]:
     # B3 owner 维度同 qa-entries：user=自己的+共享，admin/root/无身份不过滤。
     _gate_page(request, "templates")
     account_id = scoped_account(request, account_id)
-    return _repo().list_templates(account_id, owner_scope=owner_scope_filter(request, owner_scope))
+    return [
+        {**row, **_template_published_flags(row)}
+        for row in _repo().list_templates(account_id, owner_scope=owner_scope_filter(request, owner_scope))
+    ]
 
 
 @app.get("/api/templates/{template_id}")
@@ -3464,7 +4113,10 @@ def get_template(template_id: str, request: Request) -> dict:
     tpl = deny_foreign_owner(request, deny_cross_account(request, _repo().get_template(template_id)))
     if not tpl:
         raise HTTPException(404, "template not found")
-    return tpl
+    # 机器通道(agent 装配)恒吃发布冻结版;人类通道恒 live(编辑器要见草稿)。
+    if getattr(request.state, "machine", False):
+        tpl = _template_machine_overlay(tpl)
+    return {**tpl, **_template_published_flags(tpl)}
 
 
 @app.post("/api/templates")
@@ -3477,9 +4129,13 @@ def create_template(req: TemplateRequest, request: Request) -> dict:
         if identity.role == "user":
             updates["owner_user_id"] = identity.user_id
         req = req.model_copy(update=updates)
+    _graph_errors = _validate_graph_field(req.graph_json)
+    if _graph_errors:
+        raise HTTPException(400, {"error": "invalid_graph_json", "detail": _graph_errors[:5]})
     tpl = _repo().create_template(req.model_dump())
     _audit("template.create", subject_type="template", subject_id=tpl.get("id", ""), account_id=tpl.get("account_id", ""),
-           detail={"name": tpl.get("name", ""), "owner_user_id": tpl.get("owner_user_id", "")})
+           detail={"name": tpl.get("name", ""), "owner_user_id": tpl.get("owner_user_id", ""),
+                   "graph_saved": bool(req.graph_json)})
     return tpl
 
 
@@ -3489,6 +4145,18 @@ def update_template(template_id: str, req: UpdateTemplateRequest, request: Reque
     before = deny_foreign_owner(request, deny_cross_account(request, _repo().get_template(template_id)), edit=True)
     if not before:
         raise HTTPException(404, "template not found")
+    # exclude_unset:部分更新只写请求里显式出现的键——schema 全字段带默认值
+    # (language 默认 zh/name 默认空),整包 dump 会把未传字段抹掉(2026-09-09
+    # QA「PUT 抹字段」实锤;前端 save 恒传全字段,行为不变,API 语义修正)。
+    payload = req.model_dump(exclude_unset=True)
+    # 话术图校验只对显式携带的键生效(exclude_unset:未传=不动存量图)。
+    # 必须排在 revision 快照之前:append_template_revision 自带 commit,
+    # 校验晚于它会令每个被拒的保存都白写一条与现状等同的版本行并吃掉版本号
+    # (autosave 编辑器可刷满历史),「拒绝对数据无副作用」才成立(review R1)。
+    if "graph_json" in payload:
+        _graph_errors = _validate_graph_field(str(payload.get("graph_json") or ""))
+        if _graph_errors:
+            raise HTTPException(400, {"error": "invalid_graph_json", "detail": _graph_errors[:5]})
     # 话术版本化（2026-09-07 专项 B3）:update 即快照旧版——「哪版话术转化更好」
     # 从数据上可答;call_sessions.template_id 快照指向的版本内容不再随更新漂移。
     # default=str:SQL repo 的 before 含 datetime(created_at),不转直接 500——
@@ -3498,10 +4166,6 @@ def update_template(template_id: str, req: UpdateTemplateRequest, request: Reque
     import json as _revjson
 
     _repo().append_template_revision(template_id, revision, _revjson.dumps(before, ensure_ascii=False, default=str))
-    # exclude_unset:部分更新只写请求里显式出现的键——schema 全字段带默认值
-    # (language 默认 zh/name 默认空),整包 dump 会把未传字段抹掉(2026-09-09
-    # QA「PUT 抹字段」实锤;前端 save 恒传全字段,行为不变,API 语义修正)。
-    payload = req.model_dump(exclude_unset=True)
     # 归属字段冻结（B3 堵洞）：非 root 不得经 body 改 account_id（update 白名单曾放行，
     # 可把模板挪去别账号）；所有权转移（owner_user_id）只归 admin/root。
     ident = current_identity(request)
@@ -3515,10 +4179,36 @@ def update_template(template_id: str, req: UpdateTemplateRequest, request: Reque
         subject_type="template",
         subject_id=template_id,
         account_id=tpl.get("account_id", ""),
-        detail={"name": tpl.get("name", ""), "revision": revision,
+        detail={"name": tpl.get("name", ""), "revision": revision, "graph_saved": bool(payload.get("graph_json")),
                 "changed": sorted(k for k in req.model_dump() if req.model_dump().get(k) not in (None, "") and before.get(k) != req.model_dump().get(k))},
     )
     return tpl
+
+
+@app.post("/api/templates/{template_id}/publish")
+def publish_template(template_id: str, request: Request) -> dict:
+    """发布=冻结当时 live 九键写 published_json(模板发布两态 W2-T1)。
+
+    闸链逐字与 PUT 同族:gate_page + deny_cross_account + deny_foreign_owner(edit)
+    ——共享基线只归 admin/root。PUT 永不触碰 published_json,发布是唯一写入口;
+    建单装配(agent 机器通道 GET)恒吃冻结版,草稿(live)随后怎么改都不影响在途话术。
+    """
+    _gate_page(request, "templates")
+    tpl = deny_foreign_owner(request, deny_cross_account(request, _repo().get_template(template_id)), edit=True)
+    if not tpl:
+        raise HTTPException(404, "template not found")
+    frozen = {key: str(tpl.get(key) or "") for key in _TEMPLATE_PUBLISH_KEYS}
+    updated = _repo().update_template(
+        template_id, {"published_json": json.dumps(frozen, ensure_ascii=False)}
+    )
+    _audit(
+        "template.publish",
+        subject_type="template",
+        subject_id=template_id,
+        account_id=updated.get("account_id", ""),
+        detail={"name": updated.get("name", ""), "language": frozen.get("language", "")},
+    )
+    return {**updated, **_template_published_flags(updated)}
 
 
 @app.get("/api/templates/{template_id}/revisions")
@@ -3574,6 +4264,131 @@ def reports_summary(request: Request, account_id: str = "acc-001") -> dict:
 def reports_calls(request: Request, account_id: str = "acc-001") -> list[dict]:
     _gate_page(request, "reports")
     return _repo().list_calls(scoped_account(request, account_id), "")
+
+
+_DURATION_BUCKETS: tuple[tuple[str, int, int | None], ...] = (
+    ("0-15", 0, 15), ("15-30", 15, 30), ("30-60", 30, 60), ("60-90", 60, 90), ("90+", 90, None))
+_ANSWERED_EXCLUDED = {"no_answer", "rejected", "failed"}
+
+
+def _duration_bucket(duration_s: int) -> str | None:
+    for name, low, high in _DURATION_BUCKETS:
+        if duration_s >= low and (high is None or duration_s < high):
+            return name
+    return None
+
+
+def _local_midnight_utc_boundary() -> datetime:
+    """今日边界（T5-M3）：本地午夜对应的 UTC naive 时刻（单一公式，测试同源现算）。
+
+    today 判定=created_at（经 _parse_updated_at 归一为 naive UTC）≥ 该边界；
+    旧「存储串 startswith 本地日期前缀」把 UTC 串与本地日错配（正时区 UTC 深夜
+    时段本地已是明天 → 漏计；负时区反向多计）。
+    """
+    midnight_local = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight_local.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+_TODO_FAIL_STATUSES = ("no_answer", "rejected", "failed")
+
+
+def _dashboard_todo(repo, now: datetime | None = None) -> dict:
+    """待办事项（2026-09-18 用户补卡）：运行中战役的「接下来要处理什么」四桶账。
+
+    - to_call: 首拨待外呼（pending 且 attempts<=1）——排期内该拨的名单量；
+    - waiting_redispatch: 已拨过、在等重拨间隔走完（redispatch_due=True=未到期）；
+    - due_redispatch: 间隔已到、下一轮 campaign_tick 即拨（redispatch_due=False；
+      未配重拨策略的 attempts>=2 pending 也落这桶——机制上它下一轮就会被拨）；
+    - exhausted: 重拨预算打满仍终态失败（no_answer/rejected/failed 且
+      attempts>=max_attempts）——转人工跟进。
+
+    非运行中战役不进待办（draft/paused/done 都不是「接下来」）。now 注入同
+    campaign_tick 语义（UTC naive），测试钉钟用。
+    """
+    to_call = waiting = due = exhausted = 0
+    for campaign in repo.list_campaigns("", status="running"):
+        max_attempts = int(redispatch_policy(campaign)["max_attempts"])
+        for item in repo.list_items(str(campaign["id"])):
+            status = str(item.get("status") or "")
+            attempts = int(item.get("attempts") or 1)
+            if status == "pending":
+                if attempts <= 1:
+                    to_call += 1
+                elif redispatch_due(item, campaign, now):
+                    waiting += 1
+                else:
+                    due += 1
+            elif (status in _TODO_FAIL_STATUSES and max_attempts > 0
+                  and attempts >= max_attempts):
+                exhausted += 1
+    return {"to_call": to_call, "waiting_redispatch": waiting,
+            "due_redispatch": due, "exhausted": exhausted}
+
+
+@app.get("/api/stats/dashboard")
+def stats_dashboard(request: Request, account_id: str = "acc-001") -> dict:
+    """工作台仪表盘单端点（2026-09-17）。口径见 plan Task 5；P0 全量 Python 聚合。
+
+    修复波 T5-M2/M3（2026-09-17）：answered 只认 status==ENDED 且 disposition 不在
+    排除集——FAILED+abandoned（reaper 振铃超时，从未接通）不算接通，但仍计入
+    answer_rate 分母（拨出有结果）；today/answered_today=created_at ≥ 本地午夜
+    的 UTC 边界（`_local_midnight_utc_boundary`）。
+    """
+    from .campaign import _parse_updated_at
+    _gate_page(request, "calls")
+    account_id = scoped_account(request, account_id)
+    calls = _repo().list_calls(account_id)
+    today_boundary = _local_midnight_utc_boundary()
+
+    def _is_today(call: dict) -> bool:
+        created = _parse_updated_at(call.get("created_at"))
+        return created is not None and created >= today_boundary
+
+    ended = [c for c in calls if str(c.get("status") or "") in
+             (CallStatus.ENDED.value, CallStatus.FAILED.value)]
+    answered = [c for c in ended
+                if str(c.get("status") or "") == CallStatus.ENDED.value
+                and str(c.get("disposition") or "") not in _ANSWERED_EXCLUDED]
+    answered_ids = {c.get("id") for c in answered}
+    buckets = {name: 0 for name, _, _ in _DURATION_BUCKETS}
+    for call in answered:
+        duration = int(call.get("duration_s") or 0)
+        if duration <= 0:
+            continue  # 时长桶只统计 duration_s>0 的通话（未接通/边角零时长不进桶）。
+        bucket = _duration_bucket(duration)
+        if bucket:
+            buckets[bucket] += 1
+    by_agent: dict[str, dict] = {}
+    for call in calls:
+        uid = str(call.get("created_by") or "")
+        if not uid:
+            continue
+        slot = by_agent.setdefault(uid, {"user_id": uid, "name": uid, "calls": 0, "answered": 0})
+        slot["calls"] += 1
+        if call.get("id") in answered_ids:
+            slot["answered"] += 1
+    for user in _repo().list_users():
+        slot = by_agent.get(str(user.get("id") or ""))
+        if slot:
+            slot["name"] = str(user.get("display_name") or user.get("username") or slot["name"])
+    disposition_counts: dict[str, int] = {}
+    whatsapp_counts: dict[str, int] = {}
+    for call in calls:
+        if d := str(call.get("disposition") or ""):
+            disposition_counts[d] = disposition_counts.get(d, 0) + 1
+        if w := str(call.get("whatsapp_status") or ""):
+            whatsapp_counts[w] = whatsapp_counts.get(w, 0) + 1
+    return {
+        "concurrency": {"current": sum(1 for c in calls if str(c.get("status") or "") == CallStatus.ACTIVE.value)},
+        "calls": {"today": sum(1 for c in calls if _is_today(c)),
+                  "total": len(calls), "answered": len(answered),
+                  "answered_today": sum(1 for c in answered if _is_today(c)),
+                  "answer_rate": round(len(answered) / len(ended), 4) if ended else 0.0},
+        "duration_buckets": buckets,
+        "agents": sorted(by_agent.values(), key=lambda a: (-a["calls"], a["user_id"]))[:8],
+        "tags": {"disposition": disposition_counts, "whatsapp": whatsapp_counts},
+        "todo": _dashboard_todo(_repo()),
+    }
 
 
 @app.get("/api/insights")
@@ -3676,6 +4491,7 @@ async def ingest_session_report(call_id: str, request: Request) -> dict:
                 subject_id=call_id,
                 account_id=_cur.get("account_id", ""),
                 outcome="ghost_overwrite",
+                call_id=call_id,
             )
             raise HTTPException(
                 status_code=409,
@@ -3684,7 +4500,7 @@ async def ingest_session_report(call_id: str, request: Request) -> dict:
         row = _repo().update_call(call_id, session_report=json.dumps(payload, ensure_ascii=False, default=str))
         if not row:
             raise HTTPException(status_code=404, detail="call not found")
-        _audit("call.session_report", subject_type="call", subject_id=call_id, account_id=row.get("account_id", ""))
+        _audit("call.session_report", subject_type="call", subject_id=call_id, account_id=row.get("account_id", ""), call_id=call_id)
         return {"call_id": call_id, "stored": True}
     # ---- worker 非空：per-worker 历史 upsert（P1-A） ----
     try:
@@ -3714,6 +4530,7 @@ async def ingest_session_report(call_id: str, request: Request) -> dict:
         subject_type="call",
         subject_id=call_id,
         account_id=row.get("account_id", ""),
+        call_id=call_id,
         detail={"worker": worker[:64], "replaced": replaced,
                 "ended_merge": str(_cur.get("status") or "") == "ended"},
     )
@@ -4221,7 +5038,14 @@ def resume_agent(call_id: str, request: Request) -> dict:
     """恢复 AI 自动应答：解除人工接管并把通话置回 active（agent 轮询到后恢复）。"""
     require_role(request, "admin", "root")
     deny_cross_account(request, _repo().get_call(call_id))
-    call = _repo().update_call(call_id, escalated_to_human=False, status=CallStatus.ACTIVE.value)
+    existing = _repo().get_call(call_id)
+    if not existing:
+        raise HTTPException(404, "call not found")
+    # 恢复 ACTIVE 不覆盖 started_at（首转 ACTIVE 时刻口径）；从未接过的边角
+    # （ringing 直接被 pause/resume）就地补起点，避免 duration 永远 0。
+    call = _repo().update_call(call_id, escalated_to_human=False,
+                               started_at=existing.get("started_at") or _utcnow_naive(),
+                               status=CallStatus.ACTIVE.value)
     if not call:
         raise HTTPException(404, "call not found")
     _audit("supervisor.resume", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""), call_id=call_id)
@@ -4232,7 +5056,9 @@ def resume_agent(call_id: str, request: Request) -> dict:
 def takeover(call_id: str, request: Request) -> dict:
     require_role(request, "admin", "root")
     deny_cross_account(request, _repo().get_call(call_id))
-    call = _repo().update_call(call_id, escalated_to_human=True, status=CallStatus.PAUSED.value)
+    # 人工接手=协助面终态:assist_status 顺手置 done(W4-T1)。
+    call = _repo().update_call(call_id, escalated_to_human=True, status=CallStatus.PAUSED.value,
+                               assist_status="done")
     if not call:
         raise HTTPException(404, "call not found")
     _audit("supervisor.takeover", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""), call_id=call_id)
@@ -4243,7 +5069,11 @@ def takeover(call_id: str, request: Request) -> dict:
 async def transfer(call_id: str, request: Request) -> dict:
     require_role(request, "admin", "root")
     deny_cross_account(request, _repo().get_call(call_id))
-    call = _repo().update_call(call_id, escalated_to_human=True, disposition="transferred", status=CallStatus.ENDED.value)
+    existing = _repo().get_call(call_id)
+    if not existing:
+        raise HTTPException(404, "call not found")
+    call = _repo().update_call(call_id, escalated_to_human=True, disposition="transferred",
+                               status=CallStatus.ENDED.value, **_call_end_fields(existing))
     if not call:
         raise HTTPException(404, "call not found")
     _disconnect_room_background(call_id)
@@ -4251,11 +5081,60 @@ async def transfer(call_id: str, request: Request) -> dict:
     return {"call_id": call_id, "action": "transfer", "status": call["status"], "disconnected": True}
 
 
+@app.post("/api/supervisor/{call_id}/transfer-sip")
+async def transfer_sip(call_id: str, req: TransferSipRequest, request: Request) -> dict:
+    """SIP REFER 试点骨架（W5-T1）：把通话电话腿直接转给坐席手机号/SIP URI。
+
+    trunk 的 REFER 支持未验证——settings.sip.mode=="mock"（默认）一律短路返回
+    {"mocked": True}（默认安全，不触 LiveKit）；真路径只在显式 real 档执行，
+    姿势照 trunk register 先例（一次性客户端 finally aclose、失败 502）。
+    participant_identity 按 LiveKit SIP 参与者命名约定取 `sip-{contact_phone}`
+    （call 行无号码 400——mock 档同样先验，语义不随档位漂移）。
+    """
+    require_role(request, "admin", "root")
+    deny_cross_account(request, _repo().get_call(call_id))
+    call = _repo().get_call(call_id)
+    if not call:
+        raise HTTPException(404, "call not found")
+    transfer_to = (req.transfer_to or "").strip()
+    if not transfer_to:
+        raise HTTPException(400, "transfer_to 必填")
+    contact_phone = str(call.get("contact_phone") or "").strip()
+    if not contact_phone:
+        raise HTTPException(400, "该通话无 contact_phone，无法定位 SIP 参与者")
+    sip_cfg = (_repo().get_settings() or {}).get("sip") or {}
+    mocked = str(sip_cfg.get("mode") or "mock") != "real"
+    if not mocked:
+        client = _lkapi_client()
+        if client is None:
+            raise HTTPException(502, "LiveKit 凭据未配置——livekit-sip 未部署或不可达")
+        from livekit.api import TransferSIPParticipantRequest
+
+        try:
+            await client.sip.transfer_sip_participant(
+                TransferSIPParticipantRequest(
+                    room_name=call_id,
+                    participant_identity=f"sip-{contact_phone}",
+                    transfer_to=transfer_to,
+                )
+            )
+        except Exception as exc:
+            raise HTTPException(502, f"SIP transfer 失败——livekit-sip 未部署或不可达: {exc}") from exc
+        finally:
+            await client.aclose()  # 一次性客户端（自带 aiohttp session）必须关
+    _audit("supervisor.transfer_sip", subject_type="call", subject_id=call_id,
+           account_id=str(call.get("account_id") or ""), call_id=call_id,
+           detail={"transfer_to": transfer_to, "mocked": mocked})
+    return {"call_id": call_id, "mocked": mocked, "transfer_to": transfer_to}
+
+
 @app.post("/api/supervisor/{call_id}/end")
-async def supervisor_end(call_id: str, request: Request, disposition: str = "declined") -> dict:
+async def supervisor_end(call_id: str, request: Request, disposition: str = "declined",
+                         intent_code: str = "") -> dict:
     """AI 收尾后主动结束通话:置 ENDED 并断房。
 
     disposition=declined(客户明确拒绝/告别,默认)| no_response(沉默心跳两次无回应)。
+    intent_code=W4-T2 意向规则引擎命中码(agent 挂断评估回写,可选;空=未命中不落列)。
     agent 讲完一句礼貌再见后调用;结算由 agent 侧 _on_close 幂等触发,这里只负责
     归档 disposition + 踢出房间。房间不存在/服务不可用不阻塞(DB 已置 ENDED)。
     """
@@ -4265,11 +5144,22 @@ async def supervisor_end(call_id: str, request: Request, disposition: str = "dec
         raise HTTPException(status_code=403, detail="forbidden")
     deny_cross_account(request, _repo().get_call(call_id))
     disposition = (disposition or "declined").strip()[:64] or "declined"
-    call = _repo().update_call(call_id, escalated_to_human=False, disposition=disposition, status=CallStatus.ENDED.value)
+    intent_code = (intent_code or "").strip()[:32]
+    existing = _repo().get_call(call_id)
+    if not existing:
+        raise HTTPException(404, "call not found")
+    end_fields: dict = dict(_call_end_fields(existing))
+    if intent_code:
+        end_fields["intent_code"] = intent_code  # 非空才落列(''=零写入,方言/历史行零扰动)
+    call = _repo().update_call(call_id, escalated_to_human=False, disposition=disposition,
+                               status=CallStatus.ENDED.value, **end_fields)
     if not call:
         raise HTTPException(404, "call not found")
     _disconnect_room_background(call_id)
-    _audit("supervisor.end", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""), call_id=call_id, detail={"disposition": disposition})
+    end_detail: dict = {"disposition": disposition}
+    if intent_code:
+        end_detail["intent_code"] = intent_code
+    _audit("supervisor.end", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""), call_id=call_id, detail=end_detail)
     return {"call_id": call_id, "action": "end", "status": call["status"], "disconnected": True}
 
 
@@ -4277,6 +5167,34 @@ async def supervisor_end(call_id: str, request: Request, disposition: str = "dec
 # 必须**放在全部 API 路由之后**——FastAPI 按注册顺序匹配，路由先于挂载命中，
 # `/api/*` 与 `/health` 不受影响；目录缺失(本地仓库/测试)整段跳过，连 import 都不发生。
 _web_static_dir = Path(os.environ.get("BOK_WEB_STATIC_DIR", "/app/web-out"))
+
+
+def _write_web_runtime_config(public_url: str, web_root: Path) -> Path | None:
+    """云托管管理台的运行时 CP 地址注入（2026-09-19 Docker 模拟拓扑实测缺口）。
+
+    静态台 apiBase() 第一优先 window.__BOK_CONFIG__.cpUrl（节点托管形态由
+    node_agent 写同一文件），未注入则回落构建期烤死的 127.0.0.1:8000——云端口
+    形态（如 prod 18010）下该回落指向访问者本机，登录必 401 弹回、控制台不可用。
+    BOK_CP_PUBLIC_URL 设置时幂等写 runtime-config.js；未设置不写（节点托管自己
+    写，双写会互相踩）。URL 只收 http(s) 且禁引号/尖括号/反斜杠（进 JS 字符串
+    与 HTML 上下文）；写失败（只读挂载等）只警告绝不阻启动。
+    """
+    url = (public_url or "").strip().rstrip("/")
+    if not (url.startswith("http://") or url.startswith("https://")) or any(
+        ch in url for ch in ("'", '"', "<", ">", "\\")
+    ):
+        print(f"[web-config] BOK_CP_PUBLIC_URL 非法（须 http(s) 且无特殊字符），跳过注入: {url[:60]!r}")
+        return None
+    target = web_root / "runtime-config.js"
+    payload = "window.__BOK_CONFIG__ = " + json.dumps({"cpUrl": url}) + ";\n"
+    try:
+        target.write_text(payload, encoding="utf-8")
+    except OSError as exc:
+        print(f"[web-config] runtime-config.js 写入失败（控制台将回落构建期地址）: {exc}")
+        return None
+    return target
+
+
 if _web_static_dir.is_dir():
     from fastapi.staticfiles import StaticFiles
 

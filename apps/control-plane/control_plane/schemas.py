@@ -144,6 +144,8 @@ class TemplateRequest(BaseModel):
     language: str = "zh"
     steps_json: str = ""
     hotwords: str = ""
+    # 话术图(flow graph)JSON;空串=未启用,保存前走 validate_flow_graph 严格校验。
+    graph_json: str = ""
 
 
 class UpdateTemplateRequest(BaseModel):
@@ -159,6 +161,8 @@ class UpdateTemplateRequest(BaseModel):
     language: str = "zh"
     steps_json: str = ""
     hotwords: str = ""
+    # 话术图(flow graph)JSON;空串=未启用,保存前走 validate_flow_graph 严格校验。
+    graph_json: str = ""
 
 
 class PersonaRequest(BaseModel):
@@ -199,6 +203,12 @@ class ProviderSettings(BaseModel):
     speaker_zh: str = ""
     speaker_cantonese: str = ""
     speaker_en: str = ""
+    # MiniMax 云端克隆音色清单（路线 B，2026-09-18）：[{voice_id,label,sample_lang,
+    # created_at,activated}] JSON 数组。CP /api/tts/minimax-voices 三端点读写；
+    # web 设置页/同传页音色下拉合并显示。不属 secret（_mask_secrets 不掩），免 DB
+    # 迁移（settings JSON blob）。未声明此键的 ProviderSettings 会在 PUT
+    # model_dump 时把它蒸发掉——必须显式声明。
+    minimax_clones_json: str = "[]"
     instruct: str = ""
     resource_id: str = ""
     app_id: str = ""
@@ -237,13 +247,51 @@ class SipSettingsModel(BaseModel):
     max_call_duration_s: int = 600
 
 
+class CampaignSettingsModel(BaseModel):
+    """全局外呼时段窗段（2026-09-17 T3b）：settings.campaign。
+
+    call_windows 形状 [{"days":[1..7],"start":"HH:MM","end":"HH:MM"}]（≤3 组，
+    归一见 campaign.parse_call_windows，非法项静默丢弃）；空=不限时段。与任务级
+    call_windows 取交集（campaign._tick_campaign 双层都过才起拨）。
+    """
+
+    call_windows: list[dict] = []
+
+
+class SmsSettingsModel(BaseModel):
+    """通知域（W5-T1）：settings.sms 段——webhook provider 骨架。
+
+    真实短信网关未来对接，webhook_url 即对接点。secret 走 secret 掩码
+    （GET 返回空串+has_secret 标记，PUT 传空=保留旧值，与 sip.auth_password
+    同档）。enabled=False 总闸；hangup_enabled=挂断结算后自动发（默认关）；
+    hangup_template 支持 {contact} 占位=收件号码。
+    """
+
+    webhook_url: str = ""
+    secret: str = ""
+    enabled: bool = False
+    hangup_enabled: bool = False
+    hangup_template: str = ""
+
+
 class SettingsRequest(BaseModel):
     asr: ProviderSettings = ProviderSettings()
     llm: ProviderSettings = ProviderSettings()
     tts: ProviderSettings = ProviderSettings()
     vad: ProviderSettings = ProviderSettings()
     sip: SipSettingsModel = SipSettingsModel()
+    # None=请求未带 campaign 键 → 保留既有段（不清运营已配的全局窗）；
+    # 传 {} / call_windows=[] = 清空（不限时段）。
+    campaign: CampaignSettingsModel | None = None
+    # None=请求未带 sms 键 → 保留既有段（不清已配 webhook，照 campaign 先例）。
+    sms: SmsSettingsModel | None = None
     policy: str = "offline_first"
+
+
+class TransferSipRequest(BaseModel):
+    """SIP REFER 试点（W5-T1）：转接目标（坐席手机号 / SIP URI），必填。"""
+
+    transfer_to: str = ""
 
 
 class SupervisorCommand(BaseModel):
@@ -343,11 +391,15 @@ class QaEntryCreate(BaseModel):
     step_index: int = -1
     voice_id: str = ""
     template_id: str = ""
+    # 同义簇(qa-canvas Phase1):非空=本条是指向条目的变体(一层星形)。
+    cluster_head_id: str = ""
     account_id: str = "acc-001"
     # 话务员级归属(B3):''=账号共享 / user_id=话务员个人;user 建的 CP 强制盖章本人。
     owner_user_id: str = ""
     source: str = "curated"
     enabled: bool = True
+    # 匹配优先级(2026-09-18 Phase 3.1):阈值过关者中小者先;默认 10=零变化,CP 落库前钳 [0,1000]。
+    priority: int = 10
 
 
 class QaEntryPatch(BaseModel):
@@ -358,5 +410,62 @@ class QaEntryPatch(BaseModel):
     step_index: Optional[int] = None
     voice_id: Optional[str] = None
     enabled: Optional[bool] = None
+    # 同义簇(qa-canvas Phase1):断簇=写空串('' 不被 None 过滤剥掉)。
+    cluster_head_id: Optional[str] = None
     # 所有权转移只归 admin/root(user 的 patch 由 CP 剥掉)。
     owner_user_id: Optional[str] = None
+    priority: Optional[int] = None
+
+
+class QaClusterSelectItem(BaseModel):
+    """聚类采纳选择项(W3-T1):kind=variant|fresh,i=计划对应数组的下标。"""
+
+    kind: str  # "variant" | "fresh"
+    i: int
+
+
+class QaClusterRequest(BaseModel):
+    """QA 自学习聚类(W3-T1):dry=挖掘→LLM 三列计划;apply=true 按 select 采纳入库。
+
+    limit 钳 ≤100(CP 侧);select 缺省=全部 variants+fresh。dry 计划有 600s
+    per-account 缓存,apply 优先吃新鲜缓存免二次 LLM。
+    """
+
+    min_calls: int = 5
+    limit: int = 60
+    apply: bool = False
+    select: Optional[list[QaClusterSelectItem]] = None
+
+
+class IntentRuleCreate(BaseModel):
+    """意向规则条目(W4-T1,2026-09-19)。conditions 形状(fact∈INTENT_FACTS/op/value)
+    走 core.validate_conditions 严格轨,CP 保存前校验。"""
+
+    name: str
+    intent_code: str
+    label: str = ""
+    disposition: str = ""
+    conditions: list[dict[str, Any]] = []
+    priority: int = 10
+    enabled: bool = True
+    # 作用域:''=全局行仅 root 可建;非 root 由 CP 强制本账号(body 值无效)。
+    account_id: str = "acc-001"
+
+
+class IntentRulePatch(BaseModel):
+    """意向规则部分更新(W4-T1)。None=不修改;conditions 整组替换(CP 转 JSON 落列)。"""
+
+    name: Optional[str] = None
+    intent_code: Optional[str] = None
+    label: Optional[str] = None
+    disposition: Optional[str] = None
+    conditions: Optional[list[dict[str, Any]]] = None
+    priority: Optional[int] = None
+    enabled: Optional[bool] = None
+
+
+class AssistRequest(BaseModel):
+    """人工协助通知(W4-T1):notified=已打铃 / done=人工已接手(幂等:done 不降级)。"""
+
+    status: str  # notified | done(枚举外 400)
+    source: str = ""  # intent | whatsapp | wechat | ""

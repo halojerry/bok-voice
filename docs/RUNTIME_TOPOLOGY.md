@@ -101,6 +101,14 @@
 同时：通话/转写/结算/审计 → control-plane :8000 → SQLite（对象、人设、知识、模板、设置、审计）
 ```
 
+> **话术模板数据流（2026-09-18 话术图 Phase 2）**：`conversation_templates.steps_json`（分步）
+> + `graph_json`（意图关键词 → 绑定边 `play_qa`/`jump_step`；空串=未启用）→ 建单快照
+> `call_sessions.template_id` → agent 装配 `FlowController.from_template`（`parse_flow_graph`
+> 宽容解析，坏数据=空图）→ 每轮 `on_user_turn_completed` 的 graph 块（插在 say 直念之后、
+> QA 快路之前；`BOK_FLOW_GRAPH=0` 整闸）→ 动作落 agent.log 四打点
+> `FLOW_GRAPH jump|play|play_miss|jump_noop` 与 turns `provider=graph-jump|graph-play`
+> + `template_step`=跳后步号（探针 `scripts/probe_flow_graph.py`）。
+
 > **前端就绪自愈**：服务未就绪时先开页面（节点 node_agent 拉起全栈有秒级时差）。
 > 前端 `lib/api-ready.ts` 的 `useControlPlaneReady` 轮询 `/health`，Control Plane 就绪后
 > 自动重拉对象/人设等数据；`TypeError: Load failed` 不再直接上屏，而是映射为
@@ -337,7 +345,7 @@ WorkerOptions.port)——默认同为 8081 会竞态,后绑者 Errno 48 即崩
 
 ### 关闭（`bok.py down`）
 
-按 pid 文件逐个 SIGTERM（run/*.pid）。Tauri 退出时调用 `stop`。
+按 pid 文件逐个 SIGTERM（run/*.pid）；node_agent full 模式退出/收到 shutdown 指令时经 cmd_down 收栈。
 
 ### 失败处理
 
@@ -420,7 +428,7 @@ Windows 站点机的常驻等价物（对照 mac launchd RunAtLoad + KeepAlive�
 
 | 路径 | 可写 | 用途 |
 |---|---|---|
-| bundle（`.app/Contents/Resources`） | 否（只读） | 代码、Python 运行时、二进制、静态前端 |
+| 节点安装树（`~/bok-voice` / `%USERPROFILE%\bok-voice`） | 代码可更新 | 代码、runtime/（Python/二进制复用）、静态前端 |
 | `~/Library/Application Support/BokVoice`（win `%LOCALAPPDATA%\BokVoice`） | 是 | models / vault / logs / run / bok_voice.db / audit / bline.json |
 | `~/.lmstudio/models` | 只读引用 | 本机开发/软链复用（`--` 目录名映射） |
 

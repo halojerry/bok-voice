@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { applyOutputDevice, savedMicDevice, savedOutputDevice } from "@/lib/audio";
+import { Plus } from "lucide-react";
+import { savedMicDevice } from "@/lib/audio";
 
 const WS_URL = process.env.NEXT_PUBLIC_TRANSLATION_WS_URL || "ws://127.0.0.1:8790";
 const LANGS = [
@@ -140,9 +141,7 @@ export default function TranslatePage() {
   }
 
   async function startCapture(channelId: string) {
-    // 输出跟随用户在设置里选的设备（桌面壳切系统默认输出 / Chromium setSinkId）。
-    const outId = savedOutputDevice();
-    if (outId) applyOutputDevice(outId).catch(() => {});
+    // 输出跟随系统默认（legacy v1 页：无元素级 sink 路由，设备选择只作用于 A 线/一体台）。
     const micId = savedMicDevice();
     const audioConstraints: MediaTrackConstraints = { channelCount: 1 };
     // 非 exact：保存的麦克风失效/已插拔时回退系统默认，避免 getUserMedia reject。
@@ -207,50 +206,50 @@ export default function TranslatePage() {
         <div>
           <p className="stage-eyebrow">REALTIME TRANSLATION</p>
           <h1 className="text-2xl font-semibold tracking-tight">同声传译</h1>
-          <p className="mt-1 text-sm text-(--stage-muted)">
+          <p className="mt-1 text-sm muted">
             独立于客服 Agent 的 B 线：ASR → 原文字幕 → 翻译 → Qwen3-TTS → 播放/字幕
           </p>
         </div>
-        <span className={`font-mono text-xs ${wsState === "open" ? "text-(--stage-value)" : "text-red-300"}`}>
+        <span className={`font-mono text-xs ${wsState === "open" ? "text-(--live)" : "text-red-600"}`}>
           WS {wsState.toUpperCase()} · {WS_URL}
         </span>
       </div>
 
       <div className="flex flex-wrap items-end gap-3 rounded-xl border border-(--card-border) bg-(--card)/60 p-4">
         <label className="text-sm">
-          <span className="block text-xs text-(--stage-muted)">源语言</span>
+          <span className="block text-xs muted">源语言</span>
           <select className="mt-1 rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm" value={form.sourceLang} onChange={(e) => setForm({ ...form, sourceLang: e.target.value })}>
             {LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
           </select>
         </label>
         <label className="text-sm">
-          <span className="block text-xs text-(--stage-muted)">目标语言</span>
+          <span className="block text-xs muted">目标语言</span>
           <select className="mt-1 rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm" value={form.targetLang} onChange={(e) => setForm({ ...form, targetLang: e.target.value })}>
             {LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
           </select>
         </label>
         <label className="text-sm">
-          <span className="block text-xs text-(--stage-muted)">翻译引擎</span>
+          <span className="block text-xs muted">翻译引擎</span>
           <select className="mt-1 rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm" value={form.provider} onChange={(e) => setForm({ ...form, provider: e.target.value as Channel["provider"] })}>
             <option value="local_openai">本地 LLM</option>
             <option value="dashscope">DashScope Qwen-MT</option>
           </select>
         </label>
-        <button className="btn-ghost" onClick={addChannel}>+ 添加通道</button>
-        <span className="ml-auto font-mono text-xs text-(--stage-muted)">{runningCount} 通道运行中</span>
+        <button className="btn-ghost" onClick={addChannel}><Plus className="h-3.5 w-3.5" /> 添加通道</button>
+        <span className="ml-auto font-mono text-xs muted">{runningCount} 通道运行中</span>
       </div>
 
-      {channels.length === 0 && <p className="text-sm text-(--stage-muted)">还没有通道。选择语言对后点「添加通道」，再点「开始」。</p>}
+      {channels.length === 0 && <p className="text-sm muted">还没有通道。选择语言对后点「添加通道」，再点「开始」。</p>}
 
       <div className="grid gap-4 lg:grid-cols-2">
         {channels.map((ch) => (
           <div key={ch.id} className="rounded-xl border border-(--card-border) bg-(--card)/60 p-4">
             <div className="mb-3 flex items-center justify-between">
               <div className="font-mono text-sm">
-                <span className="text-(--stage-value)">{LANGS.find((l) => l.code === ch.sourceLang)?.label}</span>
-                <span className="mx-2 text-(--stage-muted)">→</span>
+                <span className="text-(--live)">{LANGS.find((l) => l.code === ch.sourceLang)?.label}</span>
+                <span className="mx-2 muted">→</span>
                 <span>{LANGS.find((l) => l.code === ch.targetLang)?.label}</span>
-                <span className="ml-3 rounded-sm bg-(--stage-muted)/10 px-2 py-0.5 text-xs">{ch.provider}</span>
+                <span className="ml-3 rounded-sm bg-muted-foreground/10 px-2 py-0.5 text-xs">{ch.provider}</span>
               </div>
               {ch.running ? (
                 <button className="btn-ghost" onClick={() => stopChannel(ch)}>停止</button>
@@ -259,25 +258,25 @@ export default function TranslatePage() {
               )}
             </div>
 
-            <p className="mb-3 text-xs text-(--stage-muted)">{ch.status}</p>
+            <p className="mb-3 text-xs muted">{ch.status}</p>
 
             <div className="max-h-56 space-y-2 overflow-y-auto">
-              {ch.subtitles.length === 0 && <p className="text-xs text-(--stage-muted)">等待字幕…</p>}
+              {ch.subtitles.length === 0 && <p className="text-xs muted">等待字幕…</p>}
               {ch.subtitles.map((s, i) => (
-                <div key={`${s.sourceSeqId}-${i}`} className="rounded-lg border border-(--card-border) bg-black/20 p-3">
-                  <p className="text-sm text-(--stage-muted)">{s.source}</p>
-                  <p className="mt-1 text-sm text-(--stage-value)">{s.translated}</p>
+                <div key={`${s.sourceSeqId}-${i}`} className="rounded-lg border border-(--card-border) bg-muted p-3">
+                  <p className="text-sm muted">{s.source}</p>
+                  <p className="mt-1 text-sm text-(--live)">{s.translated}</p>
                 </div>
               ))}
             </div>
 
             {ch.metrics && (
               <div className="mt-3 grid grid-cols-3 gap-2 border-t border-(--card-border) pt-3 font-mono text-xs">
-                <span>queueDepth <b className="text-(--stage-value)">{ch.metrics.queueDepth}</b></span>
-                <span>backlog <b className="text-(--stage-value)">{ch.metrics.playableBacklogMs}ms</b></span>
-                <span>chase <b className="text-(--stage-value)">{ch.metrics.chaseState} ×{ch.metrics.chaseSpeed.toFixed(2)}</b></span>
-                <span>queued <b className="text-(--stage-value)">{ch.metrics.queuedAudioMs}ms</b></span>
-                <span>dropped <b className="text-red-300">{ch.metrics.droppedBlocks}块/{ch.metrics.droppedMs}ms</b></span>
+                <span>queueDepth <b className="text-(--live)">{ch.metrics.queueDepth}</b></span>
+                <span>backlog <b className="text-(--live)">{ch.metrics.playableBacklogMs}ms</b></span>
+                <span>chase <b className="text-(--live)">{ch.metrics.chaseState} ×{ch.metrics.chaseSpeed.toFixed(2)}</b></span>
+                <span>queued <b className="text-(--live)">{ch.metrics.queuedAudioMs}ms</b></span>
+                <span>dropped <b className="text-red-600">{ch.metrics.droppedBlocks}块/{ch.metrics.droppedMs}ms</b></span>
               </div>
             )}
           </div>

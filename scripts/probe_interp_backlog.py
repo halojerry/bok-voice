@@ -24,6 +24,13 @@ import httpx
 from e2e_edge_cases import tts_pcm
 from e2e_interpret import CONTROL_PLANE_URL, Side
 
+# auth-on 栈(2026-09-15 标准姿势)要求 CP 请求带机器通道 token——E2E 建单/取
+# token/收线/读 turns 全是机器语义,Bearer BOK_CP_TOKEN 直通(与 agent worker 同源)。
+# 未设 env(老 auth-off 栈)零变化。CP 之外(asr sidecar)不带。
+_CP_HEADERS: dict[str, str] = {}
+if os.environ.get("BOK_CP_TOKEN", "").strip():
+    _CP_HEADERS["Authorization"] = f"Bearer {os.environ['BOK_CP_TOKEN'].strip()}"
+
 SENTENCES = [
     # 长句先行(无逗号——话音句带逗号会被 vad-pause 劈轮,E2E 铁律):译文播
     # 5-7s,期间短句涌入 → say 队列堆深。门槛 1.0s 需 ≥3 并存句才弃(队头+最新
@@ -74,6 +81,7 @@ async def main() -> int:
         f"{CONTROL_PLANE_URL}/api/calls",
         json={"account_id": "acc-001", "kind": "interpret", "mode": "live", "direction": "interpret",
               "language": "zh", "target_lang": "en", "object_id": ""},
+        headers=_CP_HEADERS,
         timeout=15,
     ).json()
     call_id = call["id"]
@@ -91,11 +99,11 @@ async def main() -> int:
         await me.close()
         await other.close()
         try:
-            httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/hangup", timeout=10)
+            httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/hangup", headers=_CP_HEADERS, timeout=10)
         except Exception:
             pass
 
-    turns = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", timeout=10).json()
+    turns = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", headers=_CP_HEADERS, timeout=10).json()
     orig = [t for t in turns if str(t.get("transcript") or "").startswith("原文：")]
     tran = [t for t in turns if str(t.get("transcript") or "").startswith("译文：")]
     events, drops = (count_drops(call_id) if require_drop else (0, 0))

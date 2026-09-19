@@ -1,0 +1,13 @@
+# Linux CUDA 栈（节点侧装入，不进运行时包——见 requirements-runtime-linux.txt 头注）。
+# install-node.sh 在 Linux 节点上装入 runtime python（幂等：import torch 成功即跳过）。
+# torch>=2.5 PyPI 默认 linux 轮子即 CUDA 构建（cu12x，Turing sm_75→Ada sm_89 全谱）；
+# 国内网络用标准 PIP_INDEX_URL/PIP_EXTRA_INDEX_URL env 配镜像，脚本原样透传。
+# - ASR: qwen-asr 0.0.6 pins transformers==4.57.6（与下钉一致，正常装不冲突）。
+# - TTS: 走 MiniMax 云端（本地 qwen-tts 不进 Linux 面）。
+transformers==4.57.6
+accelerate>=1.0
+einops>=0.8
+gradio>=5.0
+qwen-asr>=0.0.6
+torch>=2.5
+torchaudio>=2.5

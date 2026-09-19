@@ -263,6 +263,10 @@ class MlxLlmLLM(_OpenAICompatBase):
     解析、APIError 重试、error 事件、TTFT/usage 官方 metrics；原先手写的流解析/
     重试/秒表已删。stop/max_tokens 走 extra_body（本地服务吃经典参数，不吃新的
     max_completion_tokens）；温度 LLM_TEMPERATURE 默认 0.35（4B 小模型防飘/复读）。
+
+    采样档显式传参（temperature/top_p/top_k/repetition_penalty）优先，None 回落
+    env 现状——调用方（B 线 MT 分支）显式传值时不再依赖写进程 env 下发（评审
+    P2-3：env setdefault 会在同 worker 跨会话驻留，泄漏给回退主 LLM）。
     """
 
     provider = "mlx"
@@ -272,25 +276,39 @@ class MlxLlmLLM(_OpenAICompatBase):
         api_key="mlx",
         model=None,
         base_url="http://127.0.0.1:1235/v1",
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        repetition_penalty: float | None = None,
     ):
         # mlx_lm server requires the real model path in requests; "local" is
         # only a last-resort placeholder when no env/settings provide one.
         if model in (None, "", "local"):
             model = os.environ.get("MLX_LLM_MODEL") or "local"
+        if model == "local":
+            # 占位符发 server 会被当 repo-id 走 HF hub 解析,断网时持锁挂死整个
+            # server——A 线正常装配恒解析出真实路径,落到占位符即装配配置异常。
+            print(
+                "[mlx-llm] WARNING: model placeholder 'local' — server may hang on HF resolution",
+                flush=True,
+            )
         extra_body = {
             "max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "160")),
             # Qwen3 对话模板以 <|im_end|> 收尾:唔传 stop 个 server 会当文字输出
             # (转录/TTS 见住 <|im_end|>),喺源头截停最干净;下游再剥多一重保险。
             "stop": ["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
         }
-        # 定制采样(env 未设时不进请求,A 线默认路径零变化):B 线 MT 档要
-        # top_p/top_k/重复惩罚收窄采样,防翻译小模型自由发挥/复读。top_k 收
-        # 整数(mlx_lm server 按 int 校验),其余收浮点。
-        for key, env_key in (
-            ("top_p", "LLM_TOP_P"),
-            ("top_k", "LLM_TOP_K"),
-            ("repetition_penalty", "LLM_REPETITION_PENALTY"),
+        # 定制采样(显式传参直接进 extra_body;None 回落 env,env 未设不进请求,
+        # A 线默认路径零变化):B 线 MT 档要 top_p/top_k/重复惩罚收窄采样,防翻译
+        # 小模型自由发挥/复读。top_k 收整数(mlx_lm server 按 int 校验),其余收浮点。
+        for key, env_key, explicit in (
+            ("top_p", "LLM_TOP_P", top_p),
+            ("top_k", "LLM_TOP_K", top_k),
+            ("repetition_penalty", "LLM_REPETITION_PENALTY", repetition_penalty),
         ):
+            if explicit is not None:
+                extra_body[key] = int(explicit) if key == "top_k" else float(explicit)
+                continue
             raw = os.environ.get(env_key, "").strip()
             if not raw:
                 continue
@@ -303,7 +321,9 @@ class MlxLlmLLM(_OpenAICompatBase):
             api_key=api_key,
             base_url=base_url
             or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
-            temperature=float(os.environ.get("LLM_TEMPERATURE", "0.35")),
+            temperature=float(
+                temperature if temperature is not None else os.environ.get("LLM_TEMPERATURE", 0.35)
+            ),
             extra_body=extra_body,
         )
         # BOK_LLM_MSG_DEBUG=1：逐请求消息指纹（sha1+长度+头尾片段），定位
@@ -2317,6 +2337,7 @@ class MiniMaxTTS(tts.TTS):
         api_key: str = "",
         emotion_state=None,
         model_override: str = "",
+        language_boost: str | None = None,
     ):
         super().__init__(
             # 真流式：声明 streaming=True，voice 管线调 stream() 走 SynthesizeStream，
@@ -2332,8 +2353,11 @@ class MiniMaxTTS(tts.TTS):
         self._key = api_key
         self._emotion_state = emotion_state
         # 回退链第二实例用(tts.FallbackAdapter hd→turbo 同音色换档):空=读 env,
-        # 与主实例同 env 会拿同一档,回退链就失去意义。
+        # 与主实例同 env 会拿同一档,回退链就失去意义。B 线主实例亦经它显式下发
+        # 合成档(唔写进程 env,评审 follow-up)。
         self._model_override = model_override
+        # 目标语 language_boost 显式档(None=未传→透传 env;空串=显式禁用)。
+        self._language_boost_override = language_boost
 
     def _resolve_emotion(self) -> str | None:
         """emotion 策略(2026-09-07 翻默认):不指定 → MiniMax 按文本自动匹配。
@@ -2407,11 +2431,17 @@ class MiniMaxTTS(tts.TTS):
         return self._model_override or os.environ.get("MINIMAX_MODEL", "speech-2.8-hd")
 
     def _language_boost(self) -> str:
-        """目标语 language_boost(env 注入,B 线同传按 target_lang 钉死;空=不下发)。
+        """目标语 language_boost(B 线构造经 language_boost 显式下发;未传=env 透传,
+        空=不下发)。
 
-        枚举值由 interpret 侧写入 MINIMAX_LANGUAGE_BOOST,这里只透传——
-        A 线没设该 env,请求里就完全不带这个键,行为零变化。
+        枚举值是 MiniMax API 外部字面量(术语门禁白名单单点)。旧契约=interpret
+        侧写 MINIMAX_LANGUAGE_BOOST、这里只透传——常驻 worker 里写入即跨会话
+        驻留(先 zh 后 en 的会话 boost 停在首通的值),改构造显式传参唔写 env
+        (评审 follow-up,与采样档 P2-3 同治理);未传参的 A 线 env 注入链路
+        (job 进程隔离,agent.py 有留档)零变化。
         """
+        if self._language_boost_override is not None:
+            return self._language_boost_override.strip()
         return os.environ.get("MINIMAX_LANGUAGE_BOOST", "").strip()
 
     def _resolve_voice(self) -> str:

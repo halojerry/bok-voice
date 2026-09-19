@@ -6,6 +6,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { api, type SessionInfo } from "@/lib/api";
+import { bindSessionLogging, setupClientLogging } from "@/lib/log-bootstrap";
 
 /** 权限目录 8 键（与后端 permissions.py 逐字对齐；顺序=导航顺序）。 */
 export const PAGE_KEYS = [
@@ -85,6 +86,17 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // 统一 Logger 装配（2026-09-18）：挂全局兜底（window.onerror/unhandledrejection）
+  // 与 error 自动上报通道；会话解析后把用户身份挂进 logger（上报带用户上下文）。
+  // logger 内部全程 try-catch 自隔离，装配故障不影响业务渲染。
+  useEffect(() => {
+    setupClientLogging();
+  }, []);
+
+  useEffect(() => {
+    bindSessionLogging(session);
+  }, [session]);
 
   const value = useMemo(() => ({ session, refresh, logout }), [session, refresh, logout]);
 

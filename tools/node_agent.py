@@ -17,6 +17,7 @@ import argparse
 import functools
 import http.server
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -26,6 +27,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
+from logging.handlers import RotatingFileHandler
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
@@ -33,6 +35,52 @@ TOOLS_DIR = Path(__file__).resolve().parent
 ROOT_DIR = TOOLS_DIR.parent
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
+
+
+# ---- 日志（W1，2026-09-18）：console + 轮转文件双面 ----
+# 文件侧是 upload_logs 远程通道（W2）的货源，也是无 SSH 节点排障的唯一抓手；
+# 落盘失败优雅降级 console-only——守护的本职是心跳，日志绝不是启动前提。
+
+LOG = logging.getLogger("bok.node_agent")
+LOG.propagate = False
+
+LOG_ROTATE_BYTES = 5 * 1024 * 1024
+LOG_ROTATE_BACKUPS = 5
+
+
+def setup_logging(log_dir: str | Path | None = None, *,
+                  max_bytes: int = LOG_ROTATE_BYTES,
+                  backups: int = LOG_ROTATE_BACKUPS) -> Path | None:
+    """console（stdout，供 schtasks/systemd 采集）+ RotatingFileHandler 双面日志。
+
+    幂等（重复调用不叠加 handler）；目录不可写（只读盘/权限）返回 None、
+    console-only 继续。返回启用时的日志文件路径（upload_logs 的默认货源）。
+    """
+    LOG.setLevel(logging.INFO)
+    if not any(isinstance(h, logging.StreamHandler)
+               and not isinstance(h, logging.FileHandler)
+               for h in LOG.handlers):
+        console = logging.StreamHandler(sys.stdout)
+        console.setFormatter(logging.Formatter("[node-agent] %(message)s"))
+        LOG.addHandler(console)
+    if log_dir is None:
+        return None
+    existing = next((h for h in LOG.handlers if isinstance(h, RotatingFileHandler)),
+                    None)
+    if existing is not None:
+        return Path(existing.baseFilename)
+    try:
+        log_dir = Path(log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        fh = RotatingFileHandler(log_dir / "node-agent.log",
+                                 maxBytes=max_bytes, backupCount=backups,
+                                 encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        LOG.addHandler(fh)
+        return log_dir / "node-agent.log"
+    except OSError as exc:
+        LOG.warning("file logging disabled (%s) — console only", exc)
+        return None
 
 
 @dataclass
@@ -175,7 +223,7 @@ def ensure_token(cp_url: str, license_key: str, fingerprint: str,
             raise RegisterRevoked(
                 "[node-agent] FATAL: cached-token probe reports license revoked "
                 "— revocation is permanent; re-registration cannot revive. Exiting.")
-        print(f"[node-agent] cached token rejected ({code}) — re-registering", flush=True)
+        LOG.warning("cached token rejected (%s) — re-registering", code)
     node_id, token = register_once(cp_url, license_key, fingerprint, version=version)
     state_file.parent.mkdir(parents=True, exist_ok=True)
     # 先 0600 建档再写（write_text+chmod 有 0644 窗口）：token=本机凭据。
@@ -183,7 +231,7 @@ def ensure_token(cp_url: str, license_key: str, fingerprint: str,
     os.fchmod(fd, 0o600)  # O_TRUNC 对已存在文件保留旧 mode——旧版 0644 残档在此扳回
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(json.dumps({"node_id": node_id, "node_token": token}, ensure_ascii=False))
-    print(f"[node-agent] registered as {node_id} (state -> {state_file})", flush=True)
+    LOG.info("registered as %s (state -> %s)", node_id, state_file)
     return token
 
 
@@ -207,10 +255,10 @@ def heartbeat_once(cfg: NodeConfig, metrics: dict | None = None,
             detail = json.loads(exc.read().decode())
         except Exception:  # noqa: BLE001
             detail = {}
-        print(f"[node-agent] heartbeat failed: {exc!r} {detail}", flush=True)
+        LOG.warning("heartbeat failed: %r %s", exc, detail)
         return False, detail
     except Exception as exc:  # 失联不抛——计数交给调用方
-        print(f"[node-agent] heartbeat failed: {exc!r}", flush=True)
+        LOG.warning("heartbeat failed: %r", exc)
         return False, {}
 
 
@@ -268,13 +316,13 @@ def serve_ui(ui_dir: Path, bind: str = "0.0.0.0", port: int = 3000) -> None:
     try:
         server = build_ui_server(ui_dir, bind, port)
     except Exception as exc:  # noqa: BLE001 - UI 托管失败绝不拖垮守护
-        print(f"[node-agent] ui serve skipped ({exc!r})", flush=True)
+        LOG.warning("ui serve skipped (%r)", exc)
         return
-    print(f"[node-agent] ui serving http://{bind}:{port} <- {ui_dir}", flush=True)
+    LOG.info("ui serving http://%s:%s <- %s", bind, port, ui_dir)
     try:
         server.serve_forever(poll_interval=0.5)
     except Exception as exc:  # noqa: BLE001
-        print(f"[node-agent] ui serve stopped: {exc!r}", flush=True)
+        LOG.warning("ui serve stopped: %r", exc)
     finally:
         server.server_close()
 
@@ -364,12 +412,12 @@ def _kill_on_revoke(message: str) -> None:
     CP 吊销，继续跑只会持续 401，退出本身必须完成。heartbeat-only 模式该
     SystemExit 直接传导为进程退出；full-stack 模式 worker 线程随之终止，main
     的存循轮询 ~1s 内收尾（finally 的幂等停栈此时是 no-op）。"""
-    print(f"[node-agent] KILLSWITCH: {message}", flush=True)
+    LOG.critical("KILLSWITCH: %s", message)
     if _kill_stack_hook is not None:
         try:
             _kill_stack_hook()
         except Exception as exc:  # noqa: BLE001 - 停栈失败不阻断退出
-            print(f"[node-agent] stack stop error: {exc!r}", flush=True)
+            LOG.error("stack stop error: %r", exc)
     raise SystemExit(0)
 
 
@@ -393,12 +441,12 @@ def _request_exit(code: int) -> None:
 
 
 def _stop_stack_quiet(reason: str) -> None:
-    print(f"[node-agent] {reason} — stopping stack", flush=True)
+    LOG.info("%s — stopping stack", reason)
     if _kill_stack_hook is not None:
         try:
             _kill_stack_hook()
         except Exception as exc:  # noqa: BLE001 - 停栈失败不阻断退出路径
-            print(f"[node-agent] stack stop error: {exc!r}", flush=True)
+            LOG.error("stack stop error: %r", exc)
 
 
 def dispatch_commands(cfg: NodeConfig, commands: list, *,
@@ -427,19 +475,33 @@ def dispatch_commands(cfg: NodeConfig, commands: list, *,
             version = str(args.get("version", ""))
             err = perform_update(cfg, version, stop_stack=stop_stack)
             if err:
-                print(f"[node-agent] update -> {version} FAILED: {err}", flush=True)
+                LOG.error("update -> %s FAILED: %s", version, err)
                 if hb is not None and hb.pending_acks is not None:
                     hb.pending_acks.append(
                         {"id": cid, "ok": False, "result": err[:200]})
             else:
                 if stop_stack:
                     _stop_stack_quiet(f"updated -> {version}")
-                print(f"[node-agent] update -> {version} done; exiting for relaunch",
-                      flush=True)
+                LOG.info("update -> %s done; exiting for relaunch", version)
                 _request_exit(_RESTART_EXIT_CODE)
+        elif action == "upload_logs":
+            stack: Path | None = None
+            try:
+                import bok
+                stack = bok.app_data_dir() / "logs"
+            except Exception:  # noqa: BLE001 - 栈日志是增强不是前提
+                stack = None
+            err = upload_recent_logs(cfg, stack_dir=stack)
+            if err:
+                LOG.warning("upload_logs FAILED: %s", err)
+                if hb is not None and hb.pending_acks is not None:
+                    hb.pending_acks.append({"id": cid, "ok": False, "result": err[:200]})
+            else:
+                LOG.info("upload_logs done (%s)", cid)
+                if hb is not None and hb.pending_acks is not None:
+                    hb.pending_acks.append({"id": cid, "ok": True, "result": "logs uploaded"})
         else:
-            print(f"[node-agent] ignoring unknown command action={action!r} "
-                  f"(id={cid})", flush=True)
+            LOG.warning("ignoring unknown command action=%r (id=%s)", action, cid)
 
 
 def _http_download(url: str, token: str, dest: Path, timeout: int = 300) -> None:
@@ -469,6 +531,9 @@ def perform_update(cfg: NodeConfig, version: str, *,
     version = version.strip()
     if not version:
         return "update: empty version"
+    # 前导 v 归一（tag=v0.4.0、命令随手写 v0.4.0/0.4.0 两态）：工件卷存储
+    # 与 VERSION 文件恒为无 v 形态，URL 一律按无 v 拼。
+    version = version[1:] if version.startswith("v") else version
     if version == cfg.version:
         return f"update: already at {version}"
     # 与 CP 下载端点同款白名单：version 进 URL 路径前先本地校验（防御性——
@@ -510,7 +575,7 @@ def perform_update(cfg: NodeConfig, version: str, *,
             src = entries[0]
         if not (src / "tools" / "node_agent.py").is_file():
             return "artifact layout unexpected (tools/node_agent.py missing)"
-        print(f"[node-agent] update: verified {version}, overlaying {root}", flush=True)
+        LOG.info("update: verified %s, overlaying %s", version, root)
         shutil.copytree(src, root, dirs_exist_ok=True)
 
     # runtime python 在盘才重装（dev 仓/裸心跳面优雅跳过）；栈先停（Windows
@@ -521,9 +586,13 @@ def perform_update(cfg: NodeConfig, version: str, *,
     if stop_stack and _kill_stack_hook is not None:
         _stop_stack_quiet(f"update -> {version}")
     if rt_py.exists():
-        req_file = "requirements-runtime-win.txt" if os.name == "nt" \
-            else "requirements-runtime-mac.txt"
-        print(f"[node-agent] update: reinstalling packages ({rt_py.name})", flush=True)
+        if os.name == "nt":
+            req_file = "requirements-runtime-win.txt"
+        elif sys.platform == "darwin":
+            req_file = "requirements-runtime-mac.txt"
+        else:
+            req_file = "requirements-runtime-linux.txt"
+        LOG.info("update: reinstalling packages (%s)", rt_py.name)
         projects = ["packages/core", "packages/business-db", "packages/knowledge",
                     "packages/observability", "apps/control-plane",
                     "apps/agent[livekit]"]
@@ -537,8 +606,83 @@ def perform_update(cfg: NodeConfig, version: str, *,
         if rc != 0:
             return f"pip reinstall failed rc={rc} (code tree updated; retry update)"
     else:
-        print("[node-agent] update: runtime python not found — code tree only", flush=True)
+        LOG.warning("update: runtime python not found — code tree only")
     return ""
+
+
+# ---- 远程日志通道（W2，2026-09-18）：upload_logs 指令 → 打包上报 ----
+# 零入站模型不破：节点领到指令后主动 POST，CP 无法反向拉。无 SSH 的客户
+# 节点排障全靠这条通道——包内日志丢了，远程就只剩心跳数字可看。
+
+_LOG_UPLOAD_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _collect_log_files(log_dir: Path, stack_dir: Path | None) -> list[Path]:
+    """货源收集：node-agent 日志（含轮转分卷）+ 栈日志目录（bok app-data/logs）。
+
+    栈目录由调用方惰性解析（full 模式 import bok 才有；心跳-only/导入失败
+    优雅跳过）。去重保序，缺文件自然跳过。
+    """
+    files = sorted(log_dir.glob("node-agent.log*")) if log_dir.is_dir() else []
+    if stack_dir is not None and stack_dir.is_dir():
+        files.extend(sorted(p for p in stack_dir.iterdir() if p.is_file()))
+    seen: set[str] = set()
+    out: list[Path] = []
+    for p in files:
+        key = str(p)
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out
+
+
+def upload_recent_logs(cfg: NodeConfig, *, log_dir: Path | None = None,
+                       stack_dir: Path | None = None,
+                       max_bytes: int = _LOG_UPLOAD_MAX_BYTES) -> str:
+    """upload_logs 执行体：近期日志 tar.gz → POST /api/nodes/logs。
+
+    返回 ""=成功；非空=失败原因（调用方 ack ok=false 回执）。
+    预算封顶 max_bytes，超出预算的文件整只跳过不截断（半截日志误导排障）。
+    """
+    import tarfile
+    import tempfile
+
+    ldir = Path(log_dir) if log_dir is not None else (ROOT_DIR / "logs")
+    sources = _collect_log_files(ldir, stack_dir)
+    budget = max_bytes
+    picked: list[Path] = []
+    for p in sources:
+        try:
+            size = p.stat().st_size
+        except OSError:
+            continue
+        if size > budget:
+            continue
+        budget -= size
+        picked.append(p)
+    if not picked:
+        return "no log files to upload"
+    try:
+        with tempfile.TemporaryDirectory(prefix="bok-logup-") as td:
+            bundle = Path(td) / "logs.tar.gz"
+            with tarfile.open(bundle, "w:gz") as tar:
+                for p in picked:
+                    # node-agent 卷落包根，栈日志落 stack/ 前缀——两目录同名不打架。
+                    arcname = p.name if p.parent == ldir else f"stack/{p.name}"
+                    tar.add(p, arcname=arcname)
+            payload = bundle.read_bytes()
+        req = urllib.request.Request(
+            f"{cfg.cp_url.rstrip('/')}/api/nodes/logs",
+            data=payload, method="POST",
+            headers={"Authorization": f"Bearer {cfg.node_token}",
+                     "Content-Type": "application/gzip"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            body = json.loads(resp.read().decode())
+        return "" if body.get("ok") else f"cp rejected: {body}"
+    except urllib.error.HTTPError as exc:
+        return f"upload failed: HTTP {exc.code}"
+    except Exception as exc:  # noqa: BLE001 - 可回执的普通失败，绝不炸心跳循环
+        return f"upload failed: {exc!r}"
 
 
 def heartbeat_tick(cfg: NodeConfig, missed: int, *, license_key: str = "",
@@ -563,17 +707,17 @@ def heartbeat_tick(cfg: NodeConfig, missed: int, *, license_key: str = "",
             hb.license_revoked_streak = 0
         commands = body.get("commands") or []
         if commands:
-            print(f"[node-agent] received {len(commands)} command(s): "
-                  f"{[c.get('action') for c in commands]}", flush=True)
+            LOG.info("received %d command(s): %s", len(commands),
+                     [c.get('action') for c in commands])
             dispatch_commands(cfg, commands, hb=hb)
         return 0
     kind = classify_heartbeat_failure(body)
     if kind == "root_revoked":
         if _kill_enabled():
             _kill_on_revoke("revoked by control plane — stack stopped")
-        print("[node-agent] KILLSWITCH (observe-only): control plane revoked this "
-              "node (action=shutdown) — BOK_NODE_KILL_ON_REVOKE=0, stack NOT stopped",
-              flush=True)
+        LOG.warning("KILLSWITCH (observe-only): control plane revoked this "
+                    "node (action=shutdown) — BOK_NODE_KILL_ON_REVOKE=0, "
+                    "stack NOT stopped")
         return missed + 1
     if kind == "license_revoked":
         streak = (hb.license_revoked_streak if hb is not None else 0) + 1
@@ -582,11 +726,10 @@ def heartbeat_tick(cfg: NodeConfig, missed: int, *, license_key: str = "",
         if streak >= _LICENSE_REVOKE_KILL_AFTER and _kill_enabled():
             _kill_on_revoke("license revoked by control plane — stack stopped")
         observe = (streak >= _LICENSE_REVOKE_KILL_AFTER and not _kill_enabled())
-        print(f"[node-agent] license revoked (streak {streak}/"
-              f"{_LICENSE_REVOKE_KILL_AFTER}) — no self-heal: license revocation "
-              f"is permanent, re-registration cannot revive"
-              + (" [observe-only: BOK_NODE_KILL_ON_REVOKE=0]" if observe else ""),
-              flush=True)
+        LOG.warning("license revoked (streak %d/%d) — no self-heal: license "
+                    "revocation is permanent, re-registration cannot revive%s",
+                    streak, _LICENSE_REVOKE_KILL_AFTER,
+                    " [observe-only: BOK_NODE_KILL_ON_REVOKE=0]" if observe else "")
         return missed + 1
     if license_key and state_file is not None and kind in _SELF_HEAL_KINDS:
         try:
@@ -598,9 +741,9 @@ def heartbeat_tick(cfg: NodeConfig, missed: int, *, license_key: str = "",
         except RegisterRevoked:
             raise  # sticky 拒绝（node/license revoked）——致命，绝不吞成失联计数
         except SystemExit as exc:
-            print(f"[node-agent] re-register failed: {exc}", flush=True)
+            LOG.warning("re-register failed: %s", exc)
         except Exception as exc:  # noqa: BLE001 - 网络抖动不令守护进程死亡
-            print(f"[node-agent] re-register failed: {exc!r}", flush=True)
+            LOG.warning("re-register failed: %r", exc)
     return missed + 1
 
 
@@ -611,7 +754,7 @@ def heartbeat_loop(cfg: NodeConfig, stop: threading.Event, *,
         hb.missed = heartbeat_tick(cfg, hb.missed, license_key=license_key,
                                    state_file=state_file, hb=hb)
         if should_refuse_jobs(hb.missed, cfg.max_missed):
-            print(f"[node-agent] missed={hb.missed} >= {cfg.max_missed}: REFUSE_JOBS (L1)", flush=True)
+            LOG.warning("missed=%d >= %d: REFUSE_JOBS (L1)", hb.missed, cfg.max_missed)
 
 
 def main(argv=None) -> int:
@@ -635,11 +778,19 @@ def main(argv=None) -> int:
                     help="UI 托管绑定地址（默认 0.0.0.0=内网话务员可访问；仅本机用 127.0.0.1）")
     ap.add_argument("--no-ui", action="store_true",
                     help="不托管 UI（仍写 runtime-config.js）——端口冲突让位/特殊拓扑逃生口")
+    ap.add_argument("--log-dir", default=os.environ.get("BOK_NODE_LOG_DIR", ""),
+                    help="日志目录（默认 <包根>/logs；env BOK_NODE_LOG_DIR；"
+                         "显式传 none=仅 console）")
     ap.add_argument("--livekit-url", default="ws://127.0.0.1:7880")
     ap.add_argument("--interval", type=int, default=60)
     args = ap.parse_args(argv)
     if not args.node_token and not args.license_key:
         ap.error("--node-token 或 --license-key 至少给一个")
+
+    log_dir = None if args.log_dir == "none" else (args.log_dir or ROOT_DIR / "logs")
+    log_file = setup_logging(log_dir)
+    if log_file:
+        LOG.info("logging to %s", log_file)
 
     fingerprint = collect_fingerprint()
     version = read_version()
@@ -655,17 +806,17 @@ def main(argv=None) -> int:
                      heartbeat_interval_s=args.interval, fingerprint=fingerprint,
                      version=version)
     if version:
-        print(f"[node-agent] node package version: {version}", flush=True)
+        LOG.info("node package version: %s", version)
     if args.ui_dir:
         target = write_ui_config(Path(args.ui_dir), cfg.cp_url, args.livekit_url)
-        print(f"[node-agent] ui config -> {target}", flush=True)
+        LOG.info("ui config -> %s", target)
         if not args.no_ui and not args.heartbeat_only:
             threading.Thread(target=serve_ui, args=(Path(args.ui_dir), args.ui_bind, args.ui_port),
                              daemon=True, name="ui-serve").start()
 
     if args.heartbeat_only:
         stop = threading.Event()
-        print(f"[node-agent] heartbeat loop start (interval={cfg.heartbeat_interval_s}s)", flush=True)
+        LOG.info("heartbeat loop start (interval=%ds)", cfg.heartbeat_interval_s)
         try:
             heartbeat_loop(cfg, stop, license_key=args.license_key, state_file=state_file)
         except KeyboardInterrupt:

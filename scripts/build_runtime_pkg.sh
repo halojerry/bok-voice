@@ -31,6 +31,17 @@ tarball="$OUT_DIR/runtime-$OS-$ARCH-$VERSION.tar.gz"
 echo "==> [runtime-pkg] packing $tarball (logs excluded)"
 tar -czf "$tarball" -C "$RUNTIME" --exclude='./logs' .
 
+# GitHub Release 单资产上限 2GB——超限在打包机就炸（错误可归因），别等到
+# CI publish 步 422 才发现（v0.4.0 linux CUDA 全家桶实证）。1.9GB 留传输余量。
+SIZE_BYTES="$(wc -c < "$tarball" | tr -d ' ')"
+if [ "$SIZE_BYTES" -gt 1900000000 ]; then
+  echo "!! runtime 包 ${SIZE_BYTES} 字节 > 1.9GB 护栏（GitHub 单资产 2GB 上限）" >&2
+  echo "   拆法：重依赖移节点侧装（参照 requirements-runtime-linux.txt 基础面/" >&2
+  echo "   -cuda.txt 节点侧两分法），勿打超限包。" >&2
+  rm -f "$tarball"
+  exit 1
+fi
+
 HASH="$(sha256sum "$tarball" 2>/dev/null | cut -d' ' -f1 || shasum -a 256 "$tarball" | cut -d' ' -f1)"
 printf '%s  %s\n' "$HASH" "$(basename "$tarball")" > "$tarball.sha256"
 

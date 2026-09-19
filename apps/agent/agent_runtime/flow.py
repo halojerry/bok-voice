@@ -13,6 +13,8 @@ import json
 import re
 from dataclasses import dataclass, field
 
+from bok_voice_core.flow_graph import FlowGraphDoc, parse_flow_graph
+
 # 客户状态判定结果
 CONFIRM = "confirm"       # 确认/认可当前步 → 可推进下一步
 OBJECTION = "objection"   # 有异议/否认/不配合 → 停留本步应对
@@ -55,6 +57,9 @@ class FlowStep:
     # bidi 中途换挡被服务端无视,运行时永不逐轮切(轮间语气稳定铁律);
     # 空=不下发,模型按文本自动匹配(与实时线同语义)。
     emotion: str = ""
+    # 场景分组(W2,纯数据位):模板 steps_json 可选 `scene` 字符串——画布泳道/
+    # 分幕命名跳转目标用,引擎推进语义零消费(缺省空串=未分组)。
+    scene: str = ""
 
 
 def parse_steps(steps_json: str) -> list[FlowStep]:
@@ -70,12 +75,15 @@ def parse_steps(steps_json: str) -> list[FlowStep]:
     out: list[FlowStep] = []
     for s in arr:
         if isinstance(s, dict):
+            # scene 宽容收键(W2):非 str/缺失→""(纯分组数据位,不碰引擎语义)。
+            _scene = s.get("scene")
             out.append(
                 FlowStep(
                     goal=str(s.get("goal") or ""),
                     ref=str(s.get("ref") or ""),
                     say=bool(s.get("say")),
                     emotion=str(s.get("emotion") or "").strip().lower(),
+                    scene=_scene if isinstance(_scene, str) else "",
                 )
             )
         elif isinstance(s, str):
@@ -880,6 +888,16 @@ class FlowController:
     # stall 升级账本(漏斗 v2,spec §3.1):同 step 连续 UNCLEAR 数;按 (step, turn_key)
     # 去重——rule 与 background judge 双路报同一轮只计 1。
     step_streak: dict[int, int] = field(default_factory=dict)
+    # 话术图(2026-09-18 Phase 2):意图节点+绑定边;空图=零变化。from_template
+    # 宽容解析 template["graph_json"](坏 JSON/坏版本→空图,spec §3 校验双轨)。
+    graph: FlowGraphDoc = field(default_factory=FlowGraphDoc)
+    # 本通已成功执行的绑定 id(jump 实际位移 / play_qa 实际播出才记;once 绑定
+    # 依此每通至多一次,spec §4.3)。agent.py graph 块写入。
+    graph_fired: set[str] = field(default_factory=set)
+    # 本通实际播出过的 QA 条目 id 序(多答案轮换账本,Phase 3.2 spec §2;真播出
+    # 才记,与 graph_fired 同纪律)。簇内轮换取「本通最少播放」成员,平则插入序;
+    # 容量 64 截断(agent.py 记账点 `_qa_note_played`)。
+    qa_played: list[str] = field(default_factory=list)
 
     @classmethod
     def from_template(cls, template: dict | None, object_card: dict | None) -> "FlowController":
@@ -887,12 +905,20 @@ class FlowController:
         steps = template_to_steps(template)
         fc = cls(steps=steps)
         fc.vars_map = object_vars(object_card)
+        fc.graph = parse_flow_graph(str((template or {}).get("graph_json") or ""))
         return fc
 
     def __post_init__(self) -> None:
         self.vars_map: dict[str, str] = {}
         self._just_advanced = False  # 上一轮确认推进咗 → 注入「新一步」提示,提醒 LLM 换步
-        # 渐进披露渲染账本:每步第一次渲染(装配/推进后首轮)才注入底稿,
+        # 本步係图 jump_to 跳入(客户从未确认被跳过嘅步骤)→ 尾部改注入
+        # 【跳转进入】(I3,2026-09-18):讲「客户刚刚确认了上一步」与事实相反,
+        # 4B 会回头追问被跳过嘅步。advance()/enter_closing() 清零。
+        self._entered_by_jump = False
+        # I3 二修(2026-09-19):正向跳转被跳过的步号(1-based,标记点名用——
+        # call-790fd558 实证单句「不要追问」压不过总览逐字引力,要点名先够力)。
+        self._jump_skipped: list[int] = []
+        # 渐进披露渲染账本:每步的第一次渲染(装配/推进后首轮)才注入底稿,
         # 此后转分支模式(正稿已入对话史,重发只喂复制引力)。
         self._last_render_step = -1
         # stall 账本轮去重键(漏斗 v2):rule 与 judge 双路报同一轮只计 1。
@@ -919,6 +945,8 @@ class FlowController:
         self.closing = True
         self._just_advanced = False
         self.step_streak.clear()  # 收尾态唔再计 stall(漏斗 v2,spec §3.1)
+        self._entered_by_jump = False  # 收尾态尾部走 closing_text,跳转标记无意义
+        self._jump_skipped = []
 
     def closing_text(self) -> str:
         """收尾态注入:一句礼貌告别,唔推销、唔挽留、唔转话题、唔问问题。"""
@@ -952,6 +980,46 @@ class FlowController:
         if self.current < len(self.steps):
             self.current += 1
             self._just_advanced = True
+            # 常规推进=客户真确认 → 尾部回到【新一步】(跳转标记只活到下一次推进)。
+            self._entered_by_jump = False
+            self._jump_skipped = []
+
+    def jump_to(self, idx: int) -> None:
+        """跳到任意步(话术图 jump_step,spec §4.2)。镜像 advance 的副作用包
+        (置 _just_advanced → 首轮重渲染),外加钳制与冻结:closing 后流程不再被图
+        移动;同位跳转 no-op;允许跳到 done(== len(steps))。**实际位移**另置
+        _entered_by_jump —— 尾部要讲清「本步係跳入、客户冇确认过被跳过嘅步」(I3);
+        正向跳转同步记被跳步号(`_jump_skipped`,1-based)供标记点名(I3 二修)。"""
+        if not self.has_steps or self.closing:
+            return
+        target = max(0, min(int(idx), len(self.steps)))
+        if target == self.current:
+            return
+        before = self.current
+        self.current = target
+        self._just_advanced = True
+        self._entered_by_jump = True
+        # 前向跳:起点步之后、目标步之前的全部被跳过(1-based);后退跳无「被跳过」
+        # 语义(嗰啲步客户早已听过),留空走「回到本步」措辞。
+        self._jump_skipped = list(range(before + 2, target + 1)) if target > before else []
+
+    def apply_then_jump(self, then_jump_1based: int | None) -> bool:
+        """play_qa 绑定的答后跳转(spec Phase 3.3 §3):播完当场跳到 then_jump 步。
+
+        返回**是否实际位移**——调用方只在实际位移时打 `FLOW_GRAPH jump` 日志 + 调 spec
+        marker `_invalidate_stale_preemptive()`（未位移=零副作用，与 jump_step 分支
+        「未位移不烧 once」同纪律）。位移本身已由 `jump_to` 置好（`current`/
+        `_entered_by_jump`），**调用方不再渲染当前步**：播放分支以 `StopResponse` 收尾、
+        本轮冇 LLM 请求，渲染只会烧掉目标步首渲染账本（`_last_render_step`/
+        `_just_advanced`）令下一轮流程块退分支模式——渲染留给下一轮流程块首渲染
+        （底稿+【跳转进入】真被请求消费，2026-09-18 T2-R1）。
+        None/无步骤/closing/同位/越界钳到同位 全返 False。
+        """
+        if then_jump_1based is None:
+            return False
+        before = self.current
+        self.jump_to(int(then_jump_1based) - 1)   # 1-based → 0-based；钳制/closing 冻结在 jump_to 内
+        return self.current != before
 
     def note_turn_outcome(self, verdict: str, step: int, turn_key: str) -> int:
         """每轮判决记账(漏斗 v2,spec §3.1):UNCLEAR 且步未变 +1,其余清该步计数。
@@ -1124,13 +1192,35 @@ class FlowController:
                 "客户明确要求重讲时除外（那要放慢再讲一遍关键内容）。"
             )
         if _new_step:
-            lines.append(
-                "【新一步】客户刚刚确认了上一步，现在已经进入这一步。"
-                "立即按这一步的目标来讲——不要讲「等我查下再答复你」「几分钟内答复你」这类拖延话术"
-                "（你手上已经有足够资料讲这一步），也不要延续上一步话题或继续自己刚才应承过的事。"
-                "未经客户要求，不要复读你上一句回复：客户已听过一遍，换本步话术的措辞重新开头"
-                "（客户明确说没听清、要求重复时除外——那要把关键内容再讲一遍）。"
-            )
+            if self._entered_by_jump:
+                # 图 jump 进入(I3,2026-09-18):【新一步】讲「客户刚刚确认了上一步」
+                # 与事实相反 —— 客户从未确认被跳过嘅步,照讲 4B 会回头追问嗰步。
+                # I3 二修(2026-09-19):单句「不要追问」唔够压过总览逐字引力
+                # (call-790fd558 跳第 4 步回复原样复排第 2/3 步台词+补问平台;
+                # call-f13c3c06 先讲对本步尾句又回头补问)——要点名被跳步号+
+                # 明令禁「按总览顺序从头开始」先拉得住。
+                _skip_txt = (
+                    "第" + "、".join(str(n) for n in self._jump_skipped) + "步已被跳过"
+                    if self._jump_skipped
+                    else "流程已直接回到本步"
+                )
+                lines.append(
+                    f"【跳转进入】客户的话已经直接进入第 {self.current + 1} 步"
+                    f"（共 {len(self.steps)} 步），{_skip_txt}——被跳过的步骤客户没确认过、"
+                    "也不需要再听。本轮只讲第 "
+                    f"{self.current + 1} 步的内容：绝不按流程总览的顺序从头重新开始，"
+                    "也绝不再问被跳过步骤里的任何问题（例如那些步骤里的核对、询问类问题），"
+                    "除非客户主动问。要提问的话只准问本步的问题"
+                    "（例如就本步的方案征求客户确认），不准借被跳过步骤的问句来提问。"
+                )
+            else:
+                lines.append(
+                    "【新一步】客户刚刚确认了上一步，现在已经进入这一步。"
+                    "立即按这一步的目标来讲——不要讲「等我查下再答复你」「几分钟内答复你」这类拖延话术"
+                    "（你手上已经有足够资料讲这一步），也不要延续上一步话题或继续自己刚才应承过的事。"
+                    "未经客户要求，不要复读你上一句回复：客户已听过一遍，换本步话术的措辞重新开头"
+                    "（客户明确说没听清、要求重复时除外——那要把关键内容再讲一遍）。"
+                )
         verdict_line = self._verdict_guidance()
         if verdict_line:
             lines.append(verdict_line)
@@ -1178,6 +1268,21 @@ class FlowController:
                 "用订单平台/截图等引导（问在哪个平台买、请他打开订单、发最近未收到货的截图）；"
                 "中途问任何事→简短答完带回当前步。金额未核实前不要讲死具体赔多少。"
             )
+        # I3 二修·具体禁讲清单(2026-09-19):抽象「不要追问被跳步骤」实测(3 跑 1 过)
+        # 压不过总览事实行的逐字引力——FAIL 两发全是第 3 步问句原话复刻。把被跳步的
+        # **原话照录**成对照清单放尾部**最后一行**(正稿在前、禁句在后,生成前最后
+        # 看到的是禁令),4B 对具体反例的服从远好过抽象规则。仅跳转首轮渲染。
+        if _new_step and self._entered_by_jump and self._jump_skipped:
+            _quotes = "、".join(
+                "「" + (self._step_fact_line(self.steps[n - 1]) or "") + "」"
+                for n in self._jump_skipped[:3]
+                if self._step_fact_line(self.steps[n - 1])
+            )
+            if _quotes:
+                lines.append(
+                    "【禁讲清单】下面这些是被跳过步骤的原话（仅供对照，不是给你用的），"
+                    "本轮回复里一个字都不准出现、也不准换个说法问同一件事：" + _quotes
+                )
         return "\n".join(lines)
 
     def flow_overview(self) -> str:
@@ -1202,6 +1307,15 @@ class FlowController:
             if fact:
                 line += f"——{fact}"
             lines.append(line)
+        # I3 跳步话面(2026-09-19):总览每步带事实行=逐字复制素材,4B 在跳步轮会被
+        # 拉回线性剧本(call-790fd558 原样复排第 2/3 步)。图模板专用规则行随总览进
+        # 静态前缀教「跳转係常态」;非图模板零渲染=字节不变。
+        if self.graph.intents:
+            lines.append(
+                "本流程允许按客户话题直接跳入后面某一步（例如客户直接投诉就直达处理步）。"
+                "一旦跳入：只讲当前这一步的内容；被跳过的步骤不再补讲、不再追问，"
+                "也不要按本总览的顺序从头重新开始。"
+            )
         lines.extend(_SHARED_RESPONSE_RULES.splitlines())
         return "\n".join(lines)
 
@@ -1351,3 +1465,58 @@ def degrade_boost(streak: int, route: str, conf: float) -> int:
     if route == "degrade_question" and conf >= 0.7:
         return max(streak, STALL_DEGRADE_N)
     return streak
+# ---- 意图判据判定器(Phase 3.4 意图引擎,spec §4)----
+# 关键词未中嘅模糊轮:一次批量调用评估「本通全部有判据且在 scope」嘅意图,多选一
+# 输出(一个 intent id 或 NONE)。绝不做 N 次调用——判据判定系让路背景活,唔可以
+# 逐个意图烧 9B 专线。命中下一轮先生效(见 agent.py _background_intent_judge)。
+# 文本一律标准书面中文(Prompt 语言纯度铁律,prompt 无条件进判定请求)。
+
+
+def build_intent_judge_messages(
+    *,
+    intents: list[dict],
+    user_text: str,
+    step_1based: int,
+    goal: str,
+) -> list[dict]:
+    """组意图判据批量判定器嘅 messages:intents 项形状 = {"id","label","prompt"}。
+
+    契约=**单选**:只输出候选表里的一个 id,或 NONE(全部判据都不贴合)。当前步
+    目标一并给出作语境(客户的话要在流程上下文中理解,例如「我一向都用这个」在
+    核实步才等于报平台)。
+    """
+    sys = (
+        "你是客服通话的意图判定器：根据客户刚才说的一句话，判断它命中了下面哪一个意图。"
+        f"\n当前通话在第{step_1based}步：{goal or '(无)'}"
+        "\n候选意图："
+    )
+    for item in intents:
+        sys += f"\n- id {item.get('id')}｜名称 {item.get('label') or '(无)'}｜判据 {item.get('prompt')}"
+    sys += (
+        "\n判定规则：只按判据判断，不要凭名称猜测；"
+        "命中多个时选判据最贴合的一个；全部不贴合就输出 NONE。"
+        # review N9:「编号」措辞会诱导 9B 回序号(1/2/3)——parse 只认候选表 id 原文,
+        # 回序号=永久 miss。措辞钉死「原样照抄 id」。
+        "\n答案只输出命中意图的 id：从候选表里原样照抄（形如 int_ 开头的完整 id），"
+        "不要输出序号、名称或任何其它文字；全部不贴合时只输出 NONE。"
+    )
+    return [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": f"客户：「{user_text}」\n只输出命中意图的 id（原样照抄）或 NONE。"},
+    ]
+
+
+def parse_intent_judge_output(text: str, valid_ids: list[str]) -> str:
+    """把判定器输出对返意图 id:剥空白/反引号/引号后取首个有内容行,精确匹配(区分大小写)。
+
+    认不出(含 NONE/未知 id/围着围栏但身份对不上)→ 空串=无命中。**只取首个
+    有内容行**——模型偶尔先吐一行说明再吐编号,唔准拿后文凑答案(宁可无命中,
+    都唔可以喺模糊轮乱触发绑定)。
+    """
+    for raw_line in (text or "").splitlines():
+        # review N9:句尾中文标点(「int_xxx。」)旧版唔剥=miss——9B 收尾带句号/角引号唔罕见。
+        token = raw_line.strip().strip("`'\"\u201c\u201d\u2018\u2019「」『』。，！？、；：").strip()
+        if not token:
+            continue  # 围栏行「```」剥完即空:继续看下一行(```\nid\n``` 形态)
+        return token if token in valid_ids else ""
+    return ""

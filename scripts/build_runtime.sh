@@ -86,12 +86,18 @@ EXTRA_INDEX=""
 if [ "$OS" = "win" ]; then
   REQ="requirements-runtime-win.txt"
   EXTRA_INDEX="--extra-index-url https://download.pytorch.org/whl/cu124"
+elif [ "$OS" = "linux" ]; then
+  # Linux 只装基础面（requirements-runtime-linux.txt 头注）：CUDA 栈入包必超
+  # GitHub 单资产 2GB 上限（v0.4.0 实证），由 install-node.sh 节点侧幂等装入
+  # （requirements-runtime-linux-cuda.txt）。
+  REQ="requirements-runtime-linux.txt"
 fi
 # shellcheck disable=SC2086
 "$RUNTIME_PY" -m pip install --no-cache-dir $EXTRA_INDEX -r "$REQ"
 if [ "$OS" = "win" ]; then
   # qwen-asr pins transformers==4.57.6 (matches the file); qwen-tts pins
   # 4.57.3, so install it with --no-deps to break the unresolvable conflict.
+  # Linux：qwen-asr 随 CUDA 栈节点侧装（见上），此处不动。
   "$RUNTIME_PY" -m pip install --no-cache-dir $EXTRA_INDEX "qwen-asr>=0.0.6"
   "$RUNTIME_PY" -m pip install --no-cache-dir --no-deps $EXTRA_INDEX "qwen-tts>=0.1.1"
 fi
@@ -118,6 +124,9 @@ else
   NODE_ARCH="$ARCH"
   NODE_URL="https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-darwin-${NODE_ARCH}.tar.gz"
   if [ "$OS" = "linux" ]; then
+    # nodejs.org 官方命名：x86_64 档叫 linux-x64（不是 linux-x86_64，CI 首跑 404 实证）。
+    NODE_ARCH="$ARCH"
+    [ "$ARCH" = "x86_64" ] && NODE_ARCH="x64"
     NODE_URL="https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.gz"
   fi
   curl -fsSL "$NODE_URL" -o "$RUNTIME/node.tar.gz"

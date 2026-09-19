@@ -46,11 +46,20 @@ def _request(
     *,
     token: str = "",
     body: dict[str, Any] | None = None,
+    raw: bytes | None = None,
+    content_type: str = "application/json",
     timeout: float = 10.0,
 ) -> tuple[int, Any]:
-    """返回 (http_status, 解析后的 JSON 体)；连接级失败 status=0。"""
-    data = json.dumps(body).encode() if body is not None else None
-    headers = {"Content-Type": "application/json"}
+    """返回 (http_status, 解析后的 JSON 体)；连接级失败 status=0。
+
+    raw=非 JSON 体（W2 日志束 gzip 直传），content_type 随体声明。"""
+    if raw is not None:
+        data = raw
+    elif body is not None:
+        data = json.dumps(body).encode()
+    else:
+        data = None
+    headers = {"Content-Type": content_type}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
@@ -199,6 +208,11 @@ def main(argv: list[str] | None = None) -> int:
             "⑥b 同指纹重注册幂等复用 node_id",
             f"HTTP {status} {reg2.get('node_id') or body}（期望 {node_id}）",
         )
+        # 重注册=换新 token（旧 token 随覆盖失效）——后续 ⑦⑧ 步必须拿新 token，
+        # 否则心跳全 401（CI 首跑实爆，2026-09-18）。
+        new_token = str(reg2.get("node_token") or "")
+        if status == 200 and new_token:
+            node_token = new_token
     else:
         print("[skip] ⑥ 非 license 流（auth-off CP），跳过克隆/复活断言", flush=True)
 
@@ -252,6 +266,29 @@ def main(argv: list[str] | None = None) -> int:
                 f"HTTP {status}")
     else:
         print("[skip] ⑧b 无节点 token（开放流裸注册失败时），跳过", flush=True)
+
+    # ⑨ 远程日志通道（W2，2026-09-18）：node_token 上传 gzip 束 → root 清单可见。
+    # 与 ⑧ 同理证明「豁免表不等于无门」——上传端点内 node_token 闸真实在岗。
+    if node_token:
+        import gzip as _gzip
+
+        payload = _gzip.compress(f"[smoke] log bundle {ts}".encode())
+        up_status, up_body = _request(
+            "POST", f"{base}/api/nodes/logs", token=node_token,
+            raw=payload, content_type="application/gzip", timeout=args.timeout)
+        listed: list = []
+        if up_status == 200 and jwt and node_id:
+            status, body = _request(
+                "GET", f"{base}/api/nodes/{node_id}/logs", token=jwt,
+                timeout=args.timeout)
+            if status == 200 and isinstance(body, list):
+                listed = body
+        _record(up_status == 200 and isinstance(up_body, dict)
+                and up_body.get("ok") is True and (not jwt or len(listed) >= 1),
+                "⑨ 节点日志上报→root 清单可见",
+                f"HTTP {up_status} files={len(listed)}")
+    else:
+        print("[skip] ⑨ 无节点 token，跳过日志通道断言", flush=True)
 
     failed = [label for ok, label in _RESULTS if not ok]
     print(flush=True)

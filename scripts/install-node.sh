@@ -5,7 +5,9 @@
 # 行为约定：
 #   - 步骤计划器：每步带编号执行，任一步失败立即停机并报告第几步；
 #   - --dry-run 只打印计划，零副作用（不建 venv、不下载、不碰 CP、不写 UI 配置）；
-#   - [4/5] 握手探活：单发心跳探针（node_token 自鉴权，心跳端点豁免 CP 门禁）
+#   - [2/6] bootstrap venv；[3/6] Linux CUDA 栈幂等装入 runtime python
+#     （基础面包不含 CUDA 栈——GitHub 单资产 2GB 上限；已装即跳过）；
+#   - [5/6] 握手探活：单发心跳探针（node_token 自鉴权，心跳端点豁免 CP 门禁）
 #     → node_agent --heartbeat-only 后台跑 3s → 查 CP 节点列表确认到达 → 清理。
 #     节点列表在 auth-on CP 受 root 门禁保护（401），此时优雅降级——探针 200
 #     已是「心跳到达」的权威证据（NodeStore 按 token sha256 命中并更新 last_seen）。
@@ -54,8 +56,8 @@ REPO_ROOT="${REPO_ROOT_ARG:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 PY="$REPO_ROOT/.venv312/bin/python"
 
 STEP_NO=0
-STEP_TOTAL=5
-[[ $SKIP_MODELS -eq 1 ]] && STEP_TOTAL=4
+STEP_TOTAL=6
+[[ $SKIP_MODELS -eq 1 ]] && STEP_TOTAL=5
 AGENT_PID=""
 
 step() { STEP_NO=$((STEP_NO+1)); echo; echo "==> [${STEP_NO}/${STEP_TOTAL}] $*"; }
@@ -90,13 +92,32 @@ fi
 step "Python venv + 依赖"
 run "$REPO_ROOT/scripts/bootstrap.sh"
 
-# ---------- [3/5] 模型下载（--skip-models 可跳） ----------
+# ---------- [3/6] CUDA 栈入 runtime python（Linux；幂等跳过） ----------
+step "CUDA 依赖装入 runtime python（Linux 基础面包的节点侧补齐）"
+CUDA_REQ="$REPO_ROOT/requirements-runtime-linux-cuda.txt"
+RT_PY="$REPO_ROOT/runtime/python/bin/python3"
+if [[ "$(uname -s)" != "Linux" || ! -f "$CUDA_REQ" || ! -x "$RT_PY" ]]; then
+  note "非 Linux / 无 runtime python / 无 cuda requirements —— 本步跳过（mac-win 包自带全量）"
+elif [[ $DRY_RUN -eq 1 ]]; then
+  echo "    (dry-run) $RT_PY -m pip install -r $CUDA_REQ"
+else
+  # 幂等门：runtime python 已能 import torch 即视为 CUDA 栈在位（平台镜像预装/
+  # 重复装机都走这条快路）。镜像经标准 PIP_INDEX_URL/PIP_EXTRA_INDEX_URL 透传。
+  if "$RT_PY" -c 'import torch' >/dev/null 2>&1; then
+    note "runtime python 已有 torch —— CUDA 栈在位，跳过（$("$RT_PY" -c 'import torch; print(torch.__version__)' 2>/dev/null || echo '?')）"
+  else
+    note "装入 CUDA 栈（torch/transformers/qwen-asr…，下载约 3GB，耐心）"
+    run "$RT_PY" -m pip install --no-cache-dir -r "$CUDA_REQ"
+  fi
+fi
+
+# ---------- [4/6] 模型下载（--skip-models 可跳） ----------
 if [[ $SKIP_MODELS -eq 0 ]]; then
   step "模型下载（幂等续传）"
   run "$PY" "$REPO_ROOT/tools/bok.py" download
 fi
 
-# ---------- [4/5] 节点握手探活 ----------
+# ---------- [4/6] 节点握手探活 ----------
 step_handshake() {
   if [[ $DRY_RUN -eq 1 ]]; then
     note "(dry-run) ① 单发心跳探针 node_agent.heartbeat_once -> $CP_URL"
@@ -190,7 +211,7 @@ for r in json.loads(sys.argv[1]):
 step "节点握手探活: 心跳探针 → node_agent 后台 → CP 节点列表确认 → 清理"
 step_handshake
 
-# ---------- [5/5] doctor 终检（报告性，不阻断——正式版将作硬门禁） ----------
+# ---------- [5/6] doctor 终检（报告性，不阻断——正式版将作硬门禁） ----------
 step "doctor 终检（报告性，不阻断）"
 if [[ $DRY_RUN -eq 1 ]]; then
   echo "    (dry-run) $PY $REPO_ROOT/tools/bok.py doctor"

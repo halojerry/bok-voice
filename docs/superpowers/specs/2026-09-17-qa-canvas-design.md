@@ -99,6 +99,7 @@ archify（tt-a1i/archify）是只读「图表即代码」文档工具，不作�
     （目标自身已是变体 → 改挂其 head 或拒绝，实现取「重挂到目标的 head」）；禁止自连。
   - 条目→步骤节点 = `PATCH {scope:"step", step_index:N-1, template_id:当前模板}`；拖到通用节点 =
     `PATCH {scope:"global", step_index:-1}`。
+  - **勘误（Task 6 裁定，Phase 1）**：`template_id` 写入被裁定 Phase 2（`QaEntryPatch` 无该字段、运行时零消费）——步骤边只落 `scope+step_index`，PATCH 里的 `template_id` 被 CP 静默忽略。
 - **断边**：点选边 → Delete 键或右键「解除」；簇边=清 `cluster_head_id`，步骤边=回 global。
 - **编辑**：单击节点 → 右侧滑出与列表视图同款表单（复用现有 `QaForm` 状态与保存逻辑）；双击空白 = 新建
   （落点处插入，保存后按自动布局归位）；节点右键菜单 = 编辑/启停/删除/试听/重新物化（+manager: 归属转移在侧栏表单）。
@@ -190,5 +191,9 @@ archify（tt-a1i/archify）是只读「图表即代码」文档工具，不作�
 - **Phase 2：统一 Agent 页**——步骤节点升级为可编辑（拖拽建步、分支/直念/开场白编辑，吸收 /templates 的
   步表单能力），`/templates` 与 `/qa` 画布合并为单页；服务端坐标落定（布局归谁：每用户 or 共享，
   届时拍板）；话术画布可参考 archify 的分层/路由契约做静态总览导出（可选）。
+  **升格（2026-09-18）**：本条 Phase 2 的**「画布画的=引擎跑的」运行时语义部分**已由
+  [2026-09-18-qa-flow-graph.md](2026-09-18-qa-flow-graph.md) 立项为「话术图执行引擎」
+  （`graph_json` 意图关键词 → `play_qa`/`jump_step` 绑定边，引擎每轮读图）——现状=画布可编意图节点与
+  绑定边、引擎真执行；本条的「统一 Agent 页 / 服务端坐标」仍留本文档路线图。
 - **Phase 3：运行时语义逐项上**——优先级 → 多答案轮换 → 追问链 → 意图引擎，一次一项，
   每项配 `probe_qa_hit`/`probe_offscript_soak`/E2E A/B 验证后才能进默认档；kill-switch 配对照 A 线惯例。

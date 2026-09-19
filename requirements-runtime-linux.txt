@@ -1,0 +1,22 @@
+# Linux bundled runtime deps (NVIDIA CUDA path，GPU 节点主力档)——**基础面**。
+# CUDA 栈（torch/transformers/accelerate/gradio/qwen-asr）不进运行时包：
+#   ① GitHub Release 单资产上限 2GB，CUDA 全家桶打进 tarball 必超
+#     （v0.4.0 linux runner 实证 422 size must be less than 2147483648）；
+#   ② 租用 GPU 箱平台镜像多带 PyTorch/CUDA，打进包是重复运输。
+# CUDA 栈在节点装机时由 install-node.sh 幂等装入 runtime python
+# （requirements-runtime-linux-cuda.txt；已可 import torch 即跳过；
+#   pip 镜像经标准 PIP_INDEX_URL/PIP_EXTRA_INDEX_URL env 透传）。
+fastapi>=0.110,<1
+uvicorn[standard]>=0.29,<1
+python-multipart>=0.0.9
+numpy>=1.26,<3
+soundfile>=0.12
+librosa>=0.10
+httpx>=0.27,<1
+pydantic>=2.6
+sqlalchemy>=2.0,<3
+huggingface_hub>=0.26
+hf_transfer>=0.1
+onnxruntime>=1.18
+sox>=1.5
+sentencepiece>=0.2

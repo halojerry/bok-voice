@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, func
@@ -8,6 +9,10 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def uuid_hex() -> str:
+    return uuid.uuid4().hex
 
 
 class Base(DeclarativeBase):
@@ -74,6 +79,16 @@ class ConversationTemplate(Base):
     # 本套话术专属 ASR 热词(2026-09-08):逗号/顿号/分号/换行分隔,随会话装配并入
     # asr_hotword_context 下发 /api/start context(数字主导词会被过滤,防幻听号码)。
     hotwords: Mapped[str] = mapped_column(Text, default="")
+    # 话术图(2026-09-18 Phase 2):意图节点+绑定边 JSON(spec
+    # docs/superpowers/specs/2026-09-18-qa-flow-graph.md);空串=未启用,
+    # 运行时零变化。校验/解析见 packages/core/bok_voice_core/flow_graph.py。
+    graph_json: Mapped[str] = mapped_column(Text, default="")
+    # 发布冻结快照(W2-T1 模板发布两态,2026-09-19):发布时把九键
+    # (steps_json/graph_json/hotwords/tone_override/opening/core/objection/
+    # closing/language)的 live 值原样收进 JSON dict;空串=从未发布。
+    # 「已发布」≡本列非空,「有未发布改动」≡ live 与冻结不一致(CP 派生布尔)。
+    # 建单装配经机器通道 overlay 恒吃冻结版;编辑保存(PUT)永不触碰本列。
+    published_json: Mapped[str] = mapped_column(Text, default="")
     # 话务员级归属(B3):''=账号共享 / user_id=话务员个人——user 只见自己的+共享。
     owner_user_id: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
@@ -128,10 +143,48 @@ class CallSession(Base):
     # (重试)替换、异 worker 追加。server_default 与 deps.build_engine 迁移 DDL
     # 同形（DEFAULT '[]'，单引号字面量 SQLite/Postgres 双认）。
     session_reports_json: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
+    # 仪表盘时长统计（2026-09-17）：started_at=首次接通时刻；ended_at=终态时刻；
+    # duration_s=接通秒数（未接通=0）。DateTime nullable 与 campaigns.finished_at 同形。
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, default=None, nullable=True)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime, default=None, nullable=True)
+    duration_s: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     # 通话绑定节点(site-delivery M1,2026-09-16 thin-node 拓扑):建单时钉死承载节点,
     # /api/token 签发前校验其未吊销——root 熔断对「坐席 JWT 建单」路径同样生效。
     # ''=无绑定(单机全栈形态),行为零变化。server_default 与迁移 DDL 同形（DEFAULT ''）。
     node_id: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # 人工协助面(W4-T1,2026-09-19 意向规则引擎):''=无 / notified=已通知人工
+    # (WhatsApp 捕获顺手置入或 /api/calls/{id}/assist 打铃) / done=人工已接手
+    # (takeover 顺手置入或 assist done)。写者=CP 侧 whatsapp capture / assist /
+    # takeover 端点;幂等纪律:done 不降级 notified。server_default 与迁移 DDL 同形。
+    assist_status: Mapped[str] = mapped_column(String(16), default="", server_default="")
+    # 挂断意向码(W4-T2 agent 评估回写):挂断快照命中意向规则时随 end_call 落列,
+    # ''=未命中(默认 disposition 语义零变化)。
+    intent_code: Mapped[str] = mapped_column(String(32), default="", server_default="")
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class IntentRule(Base):
+    """意向规则（W4-T1，2026-09-19）：挂断评估的条件规则，命中 → intent_code/disposition。
+
+    两级作用域：account_id ''=全局行（admin/root 写）、账号行=话务员写；
+    读=两级行合并（``account_id IN ('', acct)``，owner_scope IN 同款先例）。
+    条件形状（fact/op/value，INTENT_FACTS 12 键）与评估纯函数见共享契约
+    packages/core/bok_voice_core/intent_rules.py（CLI/CP/agent 三方共用，CP 只消费）。
+    """
+
+    __tablename__ = "intent_rules"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=uuid_hex)
+    # ''=全局行 admin 写、账号行话务员写、读=两级行合并。
+    account_id: Mapped[str] = mapped_column(String(64), index=True, default="")
+    name: Mapped[str] = mapped_column(String(64), default="")
+    intent_code: Mapped[str] = mapped_column(String(32), default="")
+    label: Mapped[str] = mapped_column(String(64), default="")
+    disposition: Mapped[str] = mapped_column(String(32), default="")
+    # 条件数组 JSON（validate_conditions 严格轨校验后才落库）；坏 JSON 读侧=空数组。
+    conditions_json: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
+    # 小者先（与 qa_entries.priority 同约定）；eval 侧 (priority, id) 升序取首条命中。
+    priority: Mapped[int] = mapped_column(Integer, default=10, server_default="10")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
@@ -174,6 +227,14 @@ class Campaign(Base):
     # 电话边缘站点（spec 2026-09-13 P1.5）：空串=未挂站点，dial 块回退 settings
     # `sip`（单站点旧行为零变化）；挂站点时 trunk 取站点注册值、settings 兜底。
     site_id: Mapped[str] = mapped_column(String(64), default="")
+    # 外呼时段窗（2026-09-17 竞品对齐）：JSON 数组 [{"days":[1..7],"start":"HH:MM","end":"HH:MM"}]，
+    # days=ISO 星期(1=周一)；空数组=不限。≤3 组，解析归一见 campaign.parse_call_windows。
+    # server_default 与 deps._ensure_column 迁移 DDL 同形。
+    call_windows_json: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
+    # 任务级最大并发：0=不限；≥1=同刻至多 N 通在途。缺省 1=旧串行行为。
+    max_concurrency: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    # 未接通自动重拨：{"max_attempts":2,"interval_minutes":30,"on":["no_answer"]}；空串=不重拨（旧行为）。
+    redispatch_json: Mapped[str] = mapped_column(Text, default="", server_default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(default=None)
 
@@ -279,6 +340,18 @@ class GlobalSetting(Base):
     # 外呼（SIP）配置段（spec 2026-09-12 Wave2）：mode/trunk/主叫号/超时/许可号码。
     # 空串=老库尚未补列或从未保存 → 读侧回落 default_settings()["sip"]。
     sip_json: Mapped[str] = mapped_column(Text, default="")
+    # 全局外呼时段窗段（2026-09-17 T3b）：{"call_windows": [...]}，形状归一见
+    # campaign.parse_call_windows；空串/空 dict=不限时段。迁移 DDL 与
+    # deps._ensure_column 同形。server_default 必须带上：dump_postgres_ddl 从
+    # 模型生成 Supabase 引导件，ORM-only default 不进 DDL → 裸 INSERT 直撞
+    # NotNullViolation（CI postgres-smoke 实证）。
+    campaign_json: Mapped[str] = mapped_column(Text, default="", server_default="")
+    # 通知域（W5-T1）：settings.sms 段（webhook provider 骨架）——{webhook_url,
+    # secret, enabled, hangup_enabled, hangup_template}，真实短信网关未来对接，
+    # webhook_url 即对接点。空串=老库尚未补列或从未保存 → 读侧回落
+    # default_settings()["sms"]。迁移 DDL 与 deps._ensure_column 同形；
+    # server_default 必须带上（同上 campaign_json 注释）。
+    sms_json: Mapped[str] = mapped_column(Text, default="", server_default="")
     policy: Mapped[str] = mapped_column(String(64), default="offline_first")
     updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
 
@@ -356,6 +429,14 @@ class QaEntry(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     hit_count: Mapped[int] = mapped_column(Integer, default=0)
     source: Mapped[str] = mapped_column(String(16), default="curated")
+    # 同义簇(spec 2026-09-17 Phase1):非空=本条是指向条目的变体(一层星形)。
+    # 纯展示/组织字段——qa_gate 匹配/罐头 key 均不读它。
+    cluster_head_id: Mapped[str] = mapped_column(String(64), default="")
+    # 匹配优先级(2026-09-18 Phase 3.1):阈值过关者中小者先;默认 10=与 graph
+    # DEFAULT_PRIORITY 同约定,全默认时胜者与旧纯分数档逐字节同。
+    # server_default 与 _ensure_column 的 DDL DEFAULT 10 镜像(models.py 惯例:
+    # create_all 路径与 ALTER 路径必须同形,否则 schema-drift 门禁红)。
+    priority: Mapped[int] = mapped_column(Integer, default=10, server_default="10")
     template_id: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 

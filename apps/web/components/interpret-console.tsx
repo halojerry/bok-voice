@@ -36,10 +36,12 @@ import {
   type RemoteTrackPublication,
 } from "livekit-client";
 import { useSession, useTranscriptions } from "@livekit/components-react";
+import { Ban, TriangleAlert } from "lucide-react";
 import { AgentSessionProvider } from "@/components/agents-ui/agent-session-provider";
-import { api, apiBase } from "@/lib/api";
+import { api, apiBase, authHeaders } from "@/lib/api";
 import { describeConnectError } from "@/lib/api-ready";
 import { wlog, wlogBindCall } from "@/lib/weblog";
+import { startTrace } from "@/lib/logger";
 import {
   deviceRoleIssues,
   expectedScript,
@@ -48,7 +50,6 @@ import {
   type RoleSlot,
 } from "@/lib/device-roles";
 import {
-  applyOutputDevice,
   listAudioDevicesOf,
   requestMicPermission,
   savedMicDevice,
@@ -60,6 +61,9 @@ import {
 } from "@/lib/audio";
 
 const LANG_SHORT: Record<string, string> = { zh: "中", cantonese: "粤", en: "EN" };
+
+// 模块级 trace（环形缓存+TTL 有界，见 lib/logger.ts 头注释）：设备/路由失败不再静默。
+const log = startTrace({ operation: "web.interpret-console" });
 
 export type ConsoleProps = {
   account: string;
@@ -152,10 +156,14 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
               setOthMicId(oth);
               // me 会话可能已在连/已用默认麦:当即切换(已发布轨热切,未发布走
               // audioCaptureDefaults);other 房尚未连接,连接 effect 会读到新值。
-              meRoomRef.current?.switchActiveDevice("audioinput", me, true).catch(() => {});
+              meRoomRef.current?.switchActiveDevice("audioinput", me, true).catch((e: unknown) =>
+                log.error("auto-assign mic hot-switch failed (me)", e, { id: me.slice(0, 12) }),
+              );
               // other 房可能已连(权限弹窗令枚举晚于连接,review P1):连接期的
               // switchActiveDevice 已跑过,不补切会停留在默认麦而下拉显示已分配。
-              otherRoomRef.current?.switchActiveDevice("audioinput", oth, true).catch(() => {});
+              otherRoomRef.current?.switchActiveDevice("audioinput", oth, true).catch((e: unknown) =>
+                log.error("auto-assign mic hot-switch failed (other)", e, { id: oth.slice(0, 12) }),
+              );
             }
           }
         }
@@ -522,8 +530,9 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
     setHearOrigState(v);
     try {
       localStorage.setItem("bok_interp_hear_orig", v ? "1" : "0");
-    } catch {
+    } catch (e) {
       /* 隐私模式等场景持久化失败不阻功能 */
+      log.warn("persist hear-orig pref failed", { err: e instanceof Error ? e.message : String(e) });
     }
   }, []);
   useEffect(() => {
@@ -593,7 +602,9 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
         }
         await room.connect(tok.serverUrl, tok.participantToken);
         if (cancelled) {
-          room.disconnect().catch(() => {});
+          room.disconnect().catch((e: unknown) =>
+            log.warn("other room disconnect after cancel failed", { err: e instanceof Error ? e.message : String(e) }),
+          );
           return;
         }
         await room.localParticipant.setMicrophoneEnabled(othMicOn && interpOnRef.current);
@@ -602,7 +613,9 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
         wlog("other_connected");
         setOtherConnected(true);
         setOtherRoomVersion((v) => v + 1);
-        await room.startAudio().catch(() => {});
+        await room.startAudio().catch((e: unknown) =>
+          log.warn("other room startAudio failed (autoplay policy?)", { err: e instanceof Error ? e.message : String(e) }),
+        );
       } catch (e) {
         if (!cancelled) {
           const raw = e instanceof Error ? e.message : String(e ?? "");
@@ -618,7 +631,11 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
       cancelled = true;
       const r = otherRoomRef.current;
       otherRoomRef.current = null;
-      if (r) r.disconnect().catch(() => {});
+      if (r) {
+        r.disconnect().catch((e: unknown) =>
+          log.warn("other room disconnect on unmount failed", { err: e instanceof Error ? e.message : String(e) }),
+        );
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [callId, meConnected]);
@@ -643,11 +660,20 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
       if (ok) return;
       console.warn(`mic hot-switch failed: ${who} -> ${id}, rolling back to ${prevId || "default"}`);
       try {
-        if (prevId) await room.switchActiveDevice("audioinput", prevId, true).catch(() => {});
-        await room.localParticipant.setMicrophoneEnabled(false).catch(() => {});
-        await room.localParticipant.setMicrophoneEnabled(true).catch(() => {});
-      } catch {
+        if (prevId) {
+          await room.switchActiveDevice("audioinput", prevId, true).catch((e: unknown) =>
+            log.error("mic rollback: switch back failed", e, { who, id: prevId.slice(0, 12) }),
+          );
+        }
+        await room.localParticipant.setMicrophoneEnabled(false).catch((e: unknown) =>
+          log.warn("mic rollback: mute failed", { who, err: e instanceof Error ? e.message : String(e) }),
+        );
+        await room.localParticipant.setMicrophoneEnabled(true).catch((e: unknown) =>
+          log.warn("mic rollback: unmute failed", { who, err: e instanceof Error ? e.message : String(e) }),
+        );
+      } catch (e) {
         /* 回滚尽力而为 */
+        log.warn("mic rollback step threw", { who, err: e instanceof Error ? e.message : String(e) });
       }
       revert();
       setError(
@@ -675,11 +701,10 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
       // 真实放音在 AudioContext router(元素级 sink 已被 crbug 40647375 废掉,
       // 旧 applyDualOutput→room.switchActiveDevice 是证伪死路径,选了等于没选)。
       // 即刻直投 router,不等 effect 链/连房状态;失败经 onSinkError 浮 UI。
+      // WebKit(Safari/WKWebView)无 ctx.setSinkId → 回退系统默认输出(持久化仅存档)。
       void getRouter("me").setSink(id || "default");
-      // 非 Chromium 壳(WKWebView):ctx.setSinkId 不存在 → 走桌面壳原生系统输出。
-      if (!canDual) void applyOutputDevice(id).catch(() => {});
     },
-    [getRouter, canDual],
+    [getRouter],
   );
   const pickOthMic = useCallback(
     (id: string) => {
@@ -698,9 +723,9 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
     setOthOutId(id);
     saveOutputDevice(id, "other");
     // 同 pickMeOut:直投 ctx router(真实放音路径),不走已证伪的元素级死路径。
+    // WebKit 无 ctx.setSinkId → 回退系统默认输出(持久化仅存档)。
     void getRouter("oth").setSink(id || "default");
-    if (!canDual) void applyOutputDevice(id).catch(() => {});
-  }, [getRouter, canDual]);
+  }, [getRouter]);
 
   // ---- 麦克风开关:按钮只改人工意图,生效值由本 effect 统一投到房间 ----
   // 生效值 = 人工开关 && !自动暂让——暂让结束后按人工意图恢复,人工静音始终优先。
@@ -708,13 +733,17 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   const toggleOthMic = useCallback(() => setOthMicOn((v) => !v), []);
   useEffect(() => {
     if (!meConnected) return;
-    meRoom.localParticipant.setMicrophoneEnabled(meMicOn && !meHeld && !voiceHoldMe && interpOn).catch(() => {});
+    meRoom.localParticipant.setMicrophoneEnabled(meMicOn && !meHeld && !voiceHoldMe && interpOn).catch((e: unknown) =>
+      log.warn("apply me mic enabled state failed", { on: meMicOn, err: e instanceof Error ? e.message : String(e) }),
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [meMicOn, meHeld, voiceHoldMe, meConnected, interpOn]);
   useEffect(() => {
     const r = otherRoomRef.current;
     if (!otherConnected || !r) return;
-    r.localParticipant.setMicrophoneEnabled(othMicOn && !othHeld && !voiceHoldOth && interpOn).catch(() => {});
+    r.localParticipant.setMicrophoneEnabled(othMicOn && !othHeld && !voiceHoldOth && interpOn).catch((e: unknown) =>
+      log.warn("apply other mic enabled state failed", { on: othMicOn, err: e instanceof Error ? e.message : String(e) }),
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [othMicOn, othHeld, voiceHoldOth, otherConnected, interpOn]);
 
@@ -861,9 +890,17 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   // 切回共享扬声器:显式回系统默认输出(sinkId="default"),避免残留上一档路由。
   useEffect(() => {
     if (outputMode !== "shared" || !canDual) return;
-    if (meConnected) meRoom.switchActiveDevice("audiooutput", "default", false).catch(() => {});
+    if (meConnected) {
+      meRoom.switchActiveDevice("audiooutput", "default", false).catch((e: unknown) =>
+        log.warn("reset me output to default failed", { err: e instanceof Error ? e.message : String(e) }),
+      );
+    }
     const r = otherRoomRef.current;
-    if (otherConnected && r) r.switchActiveDevice("audiooutput", "default", false).catch(() => {});
+    if (otherConnected && r) {
+      r.switchActiveDevice("audiooutput", "default", false).catch((e: unknown) =>
+        log.warn("reset other output to default failed", { err: e instanceof Error ? e.message : String(e) }),
+      );
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [outputMode, meConnected, otherConnected, canDual]);
 
@@ -954,12 +991,17 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
     try {
       try {
         await Promise.race([meSession.end(), new Promise((r) => setTimeout(r, 5000))]);
-      } catch {
+      } catch (e) {
         /* ignore */
+        log.error("me session end failed on leave", e);
       }
       const r = otherRoomRef.current;
       otherRoomRef.current = null;
-      if (r) await Promise.race([r.disconnect(), new Promise((res) => setTimeout(res, 3000))]).catch(() => {});
+      if (r) {
+        await Promise.race([r.disconnect(), new Promise((res) => setTimeout(res, 3000))]).catch((e: unknown) =>
+          log.error("other room disconnect failed on leave", e),
+        );
+      }
       await api.hangup(callId).catch((e) => {
         if (!String(e).includes("404")) console.warn("hangup failed", e);
       });
@@ -1024,15 +1066,15 @@ type LiveProps = {
 
 function Stat({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="rounded-md border border-(--card-border) bg-white/5 px-2 py-1.5">
-      <div className="text-[10px] uppercase tracking-wide text-(--stage-muted)">{label}</div>
+    <div className="rounded-md border border-(--card-border) bg-muted/60 px-2 py-1.5">
+      <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{label}</div>
       <div className="mt-0.5 flex items-center font-mono text-[12px]">{children}</div>
     </div>
   );
 }
 
 function Dot({ on }: { on: boolean }) {
-  return <span className={`mr-1.5 inline-block h-1.5 w-1.5 rounded-full ${on ? "bg-emerald-400" : "bg-neutral-500"}`} />;
+  return <span className={`mr-1.5 inline-block h-1.5 w-1.5 rounded-full ${on ? "bg-emerald-500" : "bg-neutral-500"}`} />;
 }
 
 function SessionClock({ startedAt }: { startedAt: number | null }) {
@@ -1063,7 +1105,7 @@ function ConsoleLive(p: LiveProps) {
     try {
       const r = await fetch(`${apiBase()}/api/tts/preview`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ provider: "qwen3_tts", voice: "Vivian", language: "zh", text: label }),
       });
       if (!r.ok) throw new Error(`preview ${r.status}`);
@@ -1207,18 +1249,18 @@ function ConsoleLive(p: LiveProps) {
       {p.roleFatal.map((m) => (
         <div
           key={m}
-          className="shrink-0 rounded-md border border-red-500/60 bg-red-500/10 px-3 py-2 text-xs leading-relaxed text-red-300"
+          className="shrink-0 rounded-md border border-red-500/60 bg-red-500/10 px-3 py-2 text-xs leading-relaxed text-red-600"
         >
-          ⛔ {m}
-          <span className="block text-red-200/80">这个组合下开传译只会产出错字幕，先改设备再启动。</span>
+          <Ban className="h-3.5 w-3.5" /> {m}
+          <span className="block text-red-600/80">这个组合下开传译只会产出错字幕，先改设备再启动。</span>
         </div>
       ))}
       {scriptWarnings.map((m) => (
         <div
           key={m}
-          className="shrink-0 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-200"
+          className="shrink-0 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-700"
         >
-          ⚠ {m}
+          <TriangleAlert className="h-3.5 w-3.5" /> {m}
         </div>
       ))}
       <div className="grid shrink-0 gap-4 md:grid-cols-2 xl:grid-cols-3">
@@ -1226,7 +1268,7 @@ function ConsoleLive(p: LiveProps) {
         <section className="card flex flex-col gap-3 p-4">
           <span className="label">声音设备</span>
           <label className="flex flex-col gap-1 text-xs">
-            <span className="text-(--stage-muted)">我方麦克风</span>
+            <span className="text-muted-foreground">我方麦克风</span>
             <select className="select" value={p.meMicId} onChange={(e) => p.pickMeMic(e.target.value)}>
               <option value="">系统默认</option>
               {p.micDevices.map((d) => (
@@ -1237,7 +1279,7 @@ function ConsoleLive(p: LiveProps) {
             </select>
           </label>
           <label className="flex flex-col gap-1 text-xs">
-            <span className="text-(--stage-muted)">对方麦克风</span>
+            <span className="text-muted-foreground">对方麦克风</span>
             <select className="select" value={p.othMicId} onChange={(e) => p.pickOthMic(e.target.value)}>
               <option value="">系统默认</option>
               {p.micDevices.map((d) => (
@@ -1251,7 +1293,7 @@ function ConsoleLive(p: LiveProps) {
               这里显示各房**实际**在用的麦，配置与真实分叉时点名（2026-09-12 双麦同源
               事故现场是「下拉说 HUAWEI、房间其实在用对方那支 AirPods」）。 */}
           {(p.meMicLive || p.othMicLive) && (
-            <p className="-mt-1 text-[10px] leading-relaxed text-(--stage-muted)">
+            <p className="-mt-1 text-[10px] leading-relaxed text-muted-foreground">
               实际在用：
               {(
                 [
@@ -1263,7 +1305,7 @@ function ConsoleLive(p: LiveProps) {
                 const fellBack = Boolean(sel) && sel !== live;
                 return (
                   <span key={who}>
-                    {who}→<span className={fellBack ? "text-amber-300" : ""}>{name}</span>
+                    {who}→<span className={fellBack ? "text-amber-700" : ""}>{name}</span>
                     {fellBack ? "（已回退系统默认）" : ""}
                     {"  "}
                   </span>
@@ -1275,7 +1317,7 @@ function ConsoleLive(p: LiveProps) {
               （2026-09-12 实测:两个采集同时开着,后开的那个恒 0）。进房即显示，未开麦
               时标「未开麦」——启动传译前后都能立刻确认这支麦是否真的在拾音。 */}
           {(p.meConnected || p.otherConnected) && (
-            <p className="-mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] leading-relaxed text-(--stage-muted)">
+            <p className="-mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] leading-relaxed text-muted-foreground">
               <span>输入电平：</span>
               {(
                 [
@@ -1285,7 +1327,7 @@ function ConsoleLive(p: LiveProps) {
               ).map(([who, lvl]) => (
                 <span key={who} className="inline-flex items-center gap-1">
                   {who}
-                  <span className="inline-block h-1.5 w-14 overflow-hidden rounded bg-white/10 align-middle">
+                  <span className="inline-block h-1.5 w-14 overflow-hidden rounded bg-muted align-middle">
                     <span
                       className={`block h-full transition-[width] duration-150 ${lvl >= 0.02 ? "bg-emerald-400" : "bg-neutral-500"}`}
                       style={{ width: `${lvl > 0 ? Math.min(100, Math.round(lvl * 900)) : 0}%` }}
@@ -1299,11 +1341,11 @@ function ConsoleLive(p: LiveProps) {
             </p>
           )}
           <div className="flex flex-col gap-1.5 text-xs">
-            <span className="text-(--stage-muted)">扬声器输出</span>
+            <span className="text-muted-foreground">扬声器输出</span>
             <div className="grid grid-cols-2 gap-2">
               <label
                 className={`flex items-center gap-1.5 rounded-md border border-(--card-border) px-2 py-1.5 ${
-                  p.outputMode === "shared" ? "ring-1 ring-(--accent)" : ""
+                  p.outputMode === "shared" ? "ring-1 ring-(--live)" : ""
                 }`}
               >
                 <input type="radio" name="out-mode" checked={p.outputMode === "shared"} onChange={() => p.setOutputMode("shared")} />
@@ -1311,7 +1353,7 @@ function ConsoleLive(p: LiveProps) {
               </label>
               <label
                 className={`flex items-center gap-1.5 rounded-md border border-(--card-border) px-2 py-1.5 ${
-                  p.outputMode === "dual" ? "ring-1 ring-(--accent)" : ""
+                  p.outputMode === "dual" ? "ring-1 ring-(--live)" : ""
                 } ${p.canDual ? "" : "opacity-50"}`}
                 title={p.canDual ? "两人各戴一副耳机,分路独立输出" : "需要桌面 Chrome(setSinkId)"}
               >
@@ -1326,12 +1368,12 @@ function ConsoleLive(p: LiveProps) {
               </label>
             </div>
             {p.outputMode === "shared" ? (
-              <p className="text-[10px] leading-relaxed text-(--stage-muted)">
+              <p className="text-[10px] leading-relaxed text-muted-foreground">
                 双向译文都从<b>系统当前默认输出</b>出声;任何内核可用(Mac/Windows),跟系统走。当前=
-                <span className="text-amber-200">
+                <span className="text-amber-700">
                   {p.outDevices.find((d) => d.is_default)?.name ?? "未知设备"}
                 </span>
-                <span className="block text-amber-300/90">
+                <span className="block text-amber-700">
                   注意:这是 macOS/Windows 的默认输出，不是你在这里选的设备——蓝牙设备进出会让它自己跳走；
                   双音箱场景请改用「独立双输出」逐路指定。
                 </span>
@@ -1340,7 +1382,7 @@ function ConsoleLive(p: LiveProps) {
               <>
               <div className="grid grid-cols-2 gap-2">
                 <label className="flex flex-col gap-1">
-                  <span className="text-(--stage-muted)">我方扬声器</span>
+                  <span className="text-muted-foreground">我方扬声器</span>
                   <div className="flex gap-1">
                     <select className="select min-w-0 flex-1" value={p.meOutId} onChange={(e) => p.pickMeOut(e.target.value)}>
                       <option value="" disabled>系统默认（双输出档需指定）</option>
@@ -1360,7 +1402,7 @@ function ConsoleLive(p: LiveProps) {
                   </div>
                 </label>
                 <label className="flex flex-col gap-1">
-                  <span className="text-(--stage-muted)">对方扬声器</span>
+                  <span className="text-muted-foreground">对方扬声器</span>
                   <div className="flex gap-1">
                     <select className="select min-w-0 flex-1" value={p.othOutId} onChange={(e) => p.pickOthOut(e.target.value)}>
                       <option value="" disabled>系统默认（双输出档需指定）</option>
@@ -1380,18 +1422,18 @@ function ConsoleLive(p: LiveProps) {
                   </div>
                 </label>
               </div>
-              <p className="text-[10px] leading-relaxed text-(--stage-muted)">
+              <p className="text-[10px] leading-relaxed text-muted-foreground">
                 当前路由：我方→{p.outDevices.find((d) => d.id === p.meOutId)?.name ?? "系统默认"}（放对方原声）
                 · 对方→{p.outDevices.find((d) => d.id === p.othOutId)?.name ?? "系统默认"}（放我方译文）。
                 {(!p.meOutId || !p.othOutId) && (
-                  <span className="text-amber-300"> 有输出未指定＝该路走系统默认，两路会混进同一台设备！</span>
+                  <span className="text-amber-700"> 有输出未指定＝该路走系统默认，两路会混进同一台设备！</span>
                 )}
                 <span className="block">我方建议戴耳机：Chrome 回声消除只覆盖默认输出，双输出档外放对方原声可能串进我方麦。</span>
               </p>
               </>
             )}
             {!p.canDual && (
-              <p className="text-[10px] text-(--stage-muted)">独立双输出需桌面 Chrome;当前内核走共享扬声器。</p>
+              <p className="text-[10px] text-muted-foreground">独立双输出需桌面 Chrome;当前内核走共享扬声器。</p>
             )}
           </div>
         </section>
@@ -1426,7 +1468,7 @@ function ConsoleLive(p: LiveProps) {
               <span className="truncate" title={p.callId}>{p.callId}</span>
             </Stat>
           </div>
-          <p className="text-xs leading-relaxed text-(--stage-muted)">
+          <p className="text-xs leading-relaxed text-muted-foreground">
             语言对:我方 {LANG_SHORT[p.myLang] ?? p.myLang} ⇄ 对方 {LANG_SHORT[p.otherLang] ?? p.otherLang}
             (建房时已钉死,换语言对需结束并重建房间)。
           </p>
@@ -1443,7 +1485,7 @@ function ConsoleLive(p: LiveProps) {
           >
             {p.interpOn ? "■ 停止传译" : "▶ 启动传译"}
           </button>
-          <p className="-mt-1 text-[10px] leading-relaxed text-(--stage-muted)">
+          <p className="-mt-1 text-[10px] leading-relaxed text-muted-foreground">
             传译{p.interpOn ? "进行中" : "未启动"}——停止后两端静默,字幕与译文暂停,在播译文念完即止。
           </p>
           <div className="grid grid-cols-2 gap-2">
@@ -1479,7 +1521,7 @@ function ConsoleLive(p: LiveProps) {
             清空字幕
           </button>
           {/* 结束按钮只在「已在退出中」时禁用(防 7 连发),连接/busy 中都保持可点。 */}
-          <button className="stage-btn-secondary mt-auto text-red-300" onClick={p.leave} disabled={p.leaving}>
+          <button className="stage-btn-secondary mt-auto text-red-600" onClick={p.leave} disabled={p.leaving}>
             {p.leaving ? "结束中…" : "结束一体台会话"}
           </button>
         </section>
@@ -1500,8 +1542,8 @@ function ConsoleLive(p: LiveProps) {
                 onClick={() => setFilter(v)}
                 className={`rounded-full px-2.5 py-1 text-[11px] ${
                   filter === v
-                    ? "bg-(--accent) font-medium text-(--accent-ink)"
-                    : "border border-(--card-border) text-(--stage-muted)"
+                    ? "bg-(--live-soft) font-medium text-(--live-ink)"
+                    : "border border-(--card-border) text-muted-foreground"
                 }`}
               >
                 {label}
@@ -1509,7 +1551,7 @@ function ConsoleLive(p: LiveProps) {
             ))}
             <button
               onClick={() => setPopOpen(true)}
-              className="rounded-full border border-(--card-border) px-2.5 py-1 text-[11px] text-(--stage-muted) hover:text-(--foreground)"
+              className="rounded-full border border-(--card-border) px-2.5 py-1 text-[11px] text-muted-foreground hover:text-(--foreground)"
               title="大字幕窗:置顶大字号,可拖动/全屏,投屏用"
             >
               大字幕
@@ -1518,7 +1560,7 @@ function ConsoleLive(p: LiveProps) {
         </div>
         <div ref={listRef} className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-1 py-2">
           {items.length === 0 && (
-            <div className="flex flex-1 items-center justify-center font-mono text-[10px] uppercase tracking-[0.16em] text-(--stage-muted)">
+            <div className="flex flex-1 items-center justify-center font-mono text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
               等说话…开口即译
             </div>
           )}
@@ -1527,16 +1569,20 @@ function ConsoleLive(p: LiveProps) {
             if (idx < clearedCount) return null;
             const who = whoIs(t, p.room, p.myLang, p.otherLang);
             if (filter !== "both" && who.flow !== filter) return null;
+            // Elements Conversation 形态：气泡化，我方右/对方左；色按 side 分——
+            // 我方（我方说的+发给我方的译文）青软底，对方（对方说的+发对方的译文）
+            // 灰底；角色标签出泡外 muted 小字。归属判定（whoIs）与文本处理零变化。
+            const mine = who.side === "right";
             return (
-              <div key={`${who.text}-${idx}`} className={`flex ${who.side === "right" ? "justify-end" : "justify-start"}`}>
+              <div key={`${who.text}-${idx}`} className={`flex flex-col ${mine ? "items-end" : "items-start"}`}>
+                <span className="mb-0.5 px-1 font-mono text-[10px] font-bold uppercase tracking-wide text-muted-foreground">
+                  {who.text}
+                </span>
                 <div
-                  className={`max-w-[85%] rounded-lg px-3 py-2 text-[13px] leading-relaxed ${
-                    who.kind === "dst"
-                      ? "border border-(--card-border) bg-white/5 text-(--foreground)"
-                      : "bg-(--accent) text-(--accent-ink)"
+                  className={`max-w-[85%] rounded-2xl px-3 py-2 text-[13px] leading-relaxed ${
+                    mine ? "bg-(--live-soft) text-(--live-ink)" : "bg-muted text-(--foreground)"
                   }`}
                 >
-                  <span className="mr-1.5 font-mono text-[10px] font-bold uppercase opacity-70">{who.text}</span>
                   {stripVoiceTags(String(t.text ?? ""))}
                 </div>
               </div>
@@ -1544,19 +1590,19 @@ function ConsoleLive(p: LiveProps) {
           })}
         </div>
         {liveBusy && (
-          <p className="shrink-0 text-[11px] text-amber-300">
+          <p className="shrink-0 text-[11px] text-amber-700">
             {p.othHeld ? "我方译文播报中 · 对方麦克风暂让" : "对方译文播报中 · 我方麦克风暂让"}
           </p>
         )}
-        {p.sameDeviceWarning && <p className="shrink-0 text-xs text-amber-300">{p.sameDeviceWarning}</p>}
+        {p.sameDeviceWarning && <p className="shrink-0 text-xs text-amber-700">{p.sameDeviceWarning}</p>}
         {(p.micSilent.me || p.micSilent.oth) && (
-          <p className="shrink-0 text-[11px] leading-relaxed text-amber-300">
+          <p className="shrink-0 text-[11px] leading-relaxed text-amber-700">
             {p.micSilent.me && p.micSilent.oth ? "两侧麦克风" : p.micSilent.me ? "我方麦克风" : "对方麦克风"}
             连续 5 秒没有电平——这支设备可能被别的页面/程序占用（蓝牙麦同一时刻只能给一个程序用），或它根本没在拾音。换一支设备，
             或关掉占用它的窗口/程序再试。
           </p>
         )}
-        {p.error && <p className="shrink-0 text-xs text-red-400">{p.error}</p>}
+        {p.error && <p className="shrink-0 text-xs text-red-600">{p.error}</p>}
       </section>
 
       {/* 大字幕窗(Windows 版 SubtitleWindow 的浏览器形态):置顶浮动、可拖动、
@@ -1602,7 +1648,11 @@ function ConsoleLive(p: LiveProps) {
             <span className="flex-1" />
             <button
               className="rounded-full border border-white/30 px-2.5 py-1 text-white/70"
-              onClick={() => popRef.current?.requestFullscreen?.().catch(() => {})}
+              onClick={() =>
+                popRef.current?.requestFullscreen?.().catch((e: unknown) =>
+                  log.warn("requestFullscreen rejected", { err: e instanceof Error ? e.message : String(e) }),
+                )
+              }
             >
               全屏
             </button>
@@ -1746,7 +1796,11 @@ function createMicMeter() {
       if (track !== wired) {
         try {
           ctx = ctx ?? new AudioContext();
-          if (ctx.state === "suspended") void ctx.resume().catch(() => {});
+          if (ctx.state === "suspended") {
+            void ctx.resume().catch((e: unknown) =>
+              log.warn("mic meter ctx resume failed", { err: e instanceof Error ? e.message : String(e) }),
+            );
+          }
           src?.disconnect();
           an = ctx.createAnalyser();
           an.fftSize = 1024;
@@ -1766,13 +1820,16 @@ function createMicMeter() {
     dispose() {
       try {
         src?.disconnect();
-      } catch {
+      } catch (e) {
         /* 已断 */
+        log.warn("mic meter dispose disconnect failed", { err: e instanceof Error ? e.message : String(e) });
       }
       src = null;
       an = null;
       wired = null;
-      ctx?.close().catch(() => {});
+      ctx?.close().catch((e: unknown) =>
+        log.warn("mic meter ctx close failed", { err: e instanceof Error ? e.message : String(e) }),
+      );
       ctx = null;
     },
   };
@@ -1785,7 +1842,11 @@ function createAudioRouter(who: string, onSinkError?: (id: string, err: unknown)
   const sources = new Map<string, { src: MediaStreamAudioSourceNode; primer: HTMLAudioElement }>();
   const ensure = () => {
     ctx = ctx ?? new AudioContext();
-    if (ctx.state === "suspended") ctx.resume().catch(() => {});
+    if (ctx.state === "suspended") {
+      ctx.resume().catch((e: unknown) =>
+        log.warn("audio router ctx resume failed", { who, err: e instanceof Error ? e.message : String(e) }),
+      );
+    }
     return ctx;
   };
   const applySink = async (id: string) => {
@@ -1795,8 +1856,12 @@ function createAudioRouter(who: string, onSinkError?: (id: string, err: unknown)
     if (c.state !== "running") {
       try {
         await c.resume();
-      } catch {
+      } catch (e) {
         /* 手势缺失:维持现状,后续 resume() 补投 */
+        log.warn("audio router pre-sink resume failed; resume() will retry", {
+          who,
+          err: e instanceof Error ? e.message : String(e),
+        });
       }
     }
     const sinkCtx = c as AudioContext & { setSinkId?: (id: string) => Promise<void>; sinkId?: string };
@@ -1822,7 +1887,9 @@ function createAudioRouter(who: string, onSinkError?: (id: string, err: unknown)
         primer.autoplay = true;
         primer.style.display = "none";
         document.body.appendChild(primer);
-        primer.play().catch(() => {});
+        primer.play().catch((e: unknown) =>
+          log.warn("primer element play rejected (autoplay policy?)", { who, err: e instanceof Error ? e.message : String(e) }),
+        );
         const src = c.createMediaStreamSource(new MediaStream([mediaTrack]));
         src.connect(c.destination);
         sources.set(trackSid, { src, primer });
@@ -1836,8 +1903,9 @@ function createAudioRouter(who: string, onSinkError?: (id: string, err: unknown)
       if (s) {
         try {
           s.src.disconnect();
-        } catch {
+        } catch (e) {
           /* 已断 */
+          log.warn("audio router source disconnect failed", { who, err: e instanceof Error ? e.message : String(e) });
         }
         s.primer.srcObject = null;
         s.primer.remove();
@@ -1864,23 +1932,36 @@ function createAudioRouter(who: string, onSinkError?: (id: string, err: unknown)
       if (ctx && ctx.state === "suspended") {
         ctx.resume()
           .then(() => {
-            if (lastSink) void applySink(lastSink).catch(() => {});
+            if (lastSink) {
+              void applySink(lastSink).catch((e: unknown) =>
+                log.warn("audio router re-apply sink after resume failed", {
+                  who,
+                  sink: lastSink.slice(0, 12),
+                  err: e instanceof Error ? e.message : String(e),
+                }),
+              );
+            }
           })
-          .catch(() => {});
+          .catch((e: unknown) =>
+            log.warn("audio router resume failed", { who, err: e instanceof Error ? e.message : String(e) }),
+          );
       }
     },
     dispose() {
       for (const s of sources.values()) {
         try {
           s.src.disconnect();
-        } catch {
+        } catch (e) {
           /* 已断 */
+          log.warn("audio router dispose disconnect failed", { who, err: e instanceof Error ? e.message : String(e) });
         }
         s.primer.srcObject = null;
         s.primer.remove();
       }
       sources.clear();
-      ctx?.close().catch(() => {});
+      ctx?.close().catch((e: unknown) =>
+        log.warn("audio router ctx close failed", { who, err: e instanceof Error ? e.message : String(e) }),
+      );
       ctx = null;
     },
   };
@@ -1895,14 +1976,21 @@ function watchTransAudio(room: Room | null, setHeld: (v: boolean) => void): () =
     if (!String(pub.trackName ?? "").startsWith("trans-")) return;
     try {
       ctx = ctx ?? new AudioContext();
-      if (ctx.state === "suspended") ctx.resume().catch(() => {});
+      if (ctx.state === "suspended") {
+        ctx.resume().catch((e: unknown) =>
+          log.warn("trans audio ctx resume failed", { err: e instanceof Error ? e.message : String(e) }),
+        );
+      }
       const source = ctx.createMediaStreamSource(new MediaStream([track.mediaStreamTrack]));
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 1024;
       source.connect(analyser);
       nodes.set(track.sid, { source, analyser });
-    } catch {
+    } catch (e) {
       /* ignore */
+      log.warn("trans audio analyser attach failed — half-duplex degraded for this track", {
+        err: e instanceof Error ? e.message : String(e),
+      });
     }
   };
   const detach = (track: RemoteTrack) => {
@@ -1923,13 +2011,25 @@ function watchTransAudio(room: Room | null, setHeld: (v: boolean) => void): () =
   let busyUntil = 0;
   let heldSince = 0;
   let quietUntil = 0;
+  // resume 失败打点节流:本 tick 120ms 一次,suspended 持续被拒时 5s 一条足够。
+  let lastResumeWarnAt = 0;
   const timer = window.setInterval(() => {
     // 看门狗(2026-09-11 审计 P0-3):AudioContext 被系统挂起(WKWebView 切后台/
     // 长会话音频路由切换)时 analyser 数据会冻结在最后一帧——冻结在响段令
     // busyUntil 无限续期、对向麦克风被永久暂让(fail-closed = 零翻译)。持续
     // resume + 单次连续 hold 超 10s 强制释放并给 5s 说话冷却窗(fail-open 串译
     // 优于永久压麦,用户可用手动静音按钮兜底)。
-    if (ctx && ctx.state !== "running") ctx.resume().catch(() => {});
+    if (ctx && ctx.state !== "running") {
+      ctx.resume().catch((e: unknown) => {
+        const at = Date.now();
+        if (at - lastResumeWarnAt > 5000) {
+          lastResumeWarnAt = at;
+          log.warn("trans audio ctx resume keeps failing (half-duplex at risk)", {
+            err: e instanceof Error ? e.message : String(e),
+          });
+        }
+      });
+    }
     const now = Date.now();
     let loud = false;
     if (now >= quietUntil) {
@@ -1962,12 +2062,17 @@ function watchTransAudio(room: Room | null, setHeld: (v: boolean) => void): () =
     for (const { source } of nodes.values()) {
       try {
         source.disconnect();
-      } catch {
+      } catch (e) {
         /* ignore */
+        log.warn("trans audio source disconnect failed on cleanup", { err: e instanceof Error ? e.message : String(e) });
       }
     }
     nodes.clear();
-    if (ctx) ctx.close().catch(() => {});
+    if (ctx) {
+      ctx.close().catch((e: unknown) =>
+        log.warn("trans audio ctx close failed on cleanup", { err: e instanceof Error ? e.message : String(e) }),
+      );
+    }
   };
 }
 

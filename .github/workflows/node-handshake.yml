@@ -70,7 +70,10 @@ jobs:
           # argparse 当 flag（CI 首跑实证）；hex 无连字符一劳永逸。
           ROOT_PASS="$(python -c 'import secrets; print(secrets.token_hex(16))')"
           echo "ROOT_PASS=$ROOT_PASS" >> "$GITHUB_ENV"
-          # root 密码只进 uvicorn 进程 env，不落 GITHUB_ENV 之外的日志面
+          # root 密码只进 uvicorn 进程 env，不落 GITHUB_ENV 之外的日志面；
+          # 工件/日志卷指 runner 临时目录（缺省 /app/downloads 是容器内路径，
+          # runner 上 mkdir 即 500——⑨ 日志通道步首跑实证）。
+          BOK_NODE_ARTIFACTS_DIR="$RUNNER_TEMP/bok-downloads" \
           BOK_ROOT_PASSWORD="$ROOT_PASS" nohup python -m uvicorn control_plane.main:app \
             --host 127.0.0.1 --port 18011 > /tmp/cp.log 2>&1 &
           echo $! > /tmp/cp.pid

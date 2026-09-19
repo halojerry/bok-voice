@@ -4,15 +4,11 @@
 /*
   ---break---
 */
+/* 纯浅色单主题：dark 兼容变体保留给 vendored 组件的 dark: 类，全站不再有 .dark 根 */
 @custom-variant dark (&:is(.dark *));
 
 /*
-  The default border color has changed to `currentcolor` in Tailwind CSS v4,
-  so we've added these compatibility styles to make sure everything still
-  looks the same as it did with Tailwind CSS v3.
-
-  If we ever want to remove these styles, we need to add an explicit border
-  color utility to any element that depends on these defaults.
+  Tailwind v4 默认 border-color 兼容层（照官方模板保留）。
 */
 @layer base {
   *,
@@ -30,13 +26,19 @@
   }
 }
 
+/* ============================================================
+   自定义 utility（浅色版）。类名与旧版一一对应，页面 JSX 零改动。
+   语义变化：文字灰一律 --muted-foreground（--muted 现在是浅灰表面色）；
+   品牌青迁 --live 家族（活信号专用）；主按钮近黑。
+   ============================================================ */
+
 @utility card {
-  /* 面板卡片：细边 + 小圆角 + 近黑面板（对齐官方 agents 页 bg-bg1 面板语言） */
+  /* 面板卡片：细边 + 小圆角 + 白卡 */
   @apply rounded-lg border border-(--card-border) bg-(--card) p-4;
 }
 
 @utility soft {
-  /* 半透明软面板（列表/标签块） */
+  /* 软面板（列表/标签块）：极浅灰 */
   @apply rounded-lg bg-(--card-soft);
 }
 
@@ -45,14 +47,14 @@
   font-family:
     ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, 'Liberation Mono',
     monospace;
-  @apply text-[10px] font-bold uppercase tracking-[0.16em] text-(--muted);
+  @apply text-[10px] font-bold uppercase tracking-[0.16em] text-(--muted-foreground);
 }
 
 @utility label {
   font-family:
     ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, 'Liberation Mono',
     monospace;
-  @apply text-[10px] font-bold uppercase tracking-[0.16em] text-(--muted);
+  @apply text-[10px] font-bold uppercase tracking-[0.16em] text-(--muted-foreground);
 }
 
 @utility page-title {
@@ -61,11 +63,11 @@
 }
 
 @utility page-sub {
-  @apply mt-1.5 text-sm text-(--muted);
+  @apply mt-1.5 text-sm text-(--muted-foreground);
 }
 
 @utility muted {
-  color: var(--muted);
+  color: var(--muted-foreground);
 }
 
 @utility btn {
@@ -74,25 +76,26 @@
 }
 
 @utility btn-primary {
-  @apply btn h-7 px-3 bg-(--accent) text-(--accent-ink) hover:bg-[#4adcfa];
+  /* 主按钮 = 近黑（spec §1：中性骨架）；青色不进按钮 */
+  @apply btn h-7 px-3 bg-primary text-primary-foreground hover:bg-primary/90;
 }
 
 @utility btn-ghost {
-  @apply btn h-7 px-3 border border-(--card-border) bg-transparent text-(--foreground) hover:bg-(--card);
+  @apply btn h-7 px-3 border border-(--card-border) bg-transparent text-(--foreground) hover:bg-accent;
 }
 
 @utility input {
-  /* 输入框 / 下拉：细边 + 小圆角 + 近黑底 */
-  @apply w-full rounded-lg border border-(--card-border) bg-(--background) px-3 py-1.5 text-sm text-(--foreground) outline-hidden placeholder:text-(--muted) focus:border-(--accent);
+  /* 输入框 / 下拉：细边 + 小圆角 + 白底；focus 用 --live（活信号） */
+  @apply w-full rounded-lg border border-(--card-border) bg-(--background) px-3 py-1.5 text-sm text-(--foreground) outline-hidden placeholder:text-(--muted-foreground) focus:border-(--live);
 }
 
 @utility select {
-  @apply rounded-lg border border-(--card-border) bg-(--background) px-3 py-1.5 text-sm text-(--foreground) outline-hidden focus:border-(--accent);
+  @apply rounded-lg border border-(--card-border) bg-(--background) px-3 py-1.5 text-sm text-(--foreground) outline-hidden focus:border-(--live);
 }
 
 @utility textarea {
   /* 多行输入(同传术语表/QA 问答对):input 同款细边,可纵向拉伸 */
-  @apply w-full resize-y rounded-lg border border-(--card-border) bg-(--background) px-3 py-1.5 text-sm text-(--foreground) outline-hidden placeholder:text-(--muted) focus:border-(--accent);
+  @apply w-full resize-y rounded-lg border border-(--card-border) bg-(--background) px-3 py-1.5 text-sm text-(--foreground) outline-hidden placeholder:text-(--muted-foreground) focus:border-(--live);
 }
 
 @utility dot {
@@ -101,21 +104,15 @@
 }
 
 @utility stage-shell {
-  /* —— LiveKit 舞台（对齐官方 agents 页主题与元素）—— */
-  /* 全幅近黑舞台底：径向微光 + 深青渗透 */
+  /* —— 舞台浅色变体：#fafafa 底 + 极淡青晕（spec §2）—— */
   background:
-    radial-gradient(
-      60% 55% at 50% 40%,
-      rgba(31, 213, 249, 0.12),
-      transparent 72%
-    ),
-    radial-gradient(120% 90% at 50% 0%, var(--stage-bg-2), transparent 60%),
+    radial-gradient(60% 55% at 50% 40%, var(--live-soft-bg), transparent 72%),
     var(--stage-bg);
   color: var(--foreground);
 }
 
 @utility stage-col {
-  /* 遥测列容器：bg-bg1 微抬升面板（官方）；内部用细分隔线而非外框 */
+  /* 遥测列容器：白面板；内部用细分隔线而非外框 */
   @apply flex w-full flex-col rounded-sm bg-(--card);
 }
 
@@ -124,7 +121,7 @@
 }
 
 @utility stage-title {
-  /* 分区标题：text-fg0 亮色，mono 大写，text-xs bold（官方 text-mono-caps） */
+  /* 分区标题：mono 大写，text-xs bold */
   @apply pb-2 font-mono text-xs font-bold uppercase tracking-[0.16em] text-(--foreground);
 }
 
@@ -134,7 +131,7 @@
 }
 
 @utility stage-row {
-  /* 「灰色标签 → 青色值」遥测行（官方 text-xxs mono bold uppercase） */
+  /* 「灰标签 → 青值」遥测行 */
   @apply flex w-full items-baseline justify-between gap-4 pb-1;
 }
 
@@ -147,7 +144,7 @@
 }
 
 @utility stage-glow {
-  text-shadow: 0 0 14px rgba(31, 213, 249, 0.35);
+  text-shadow: 0 0 14px rgb(8 145 178 / 0.35);
 }
 
 @utility stage-btn {
@@ -156,11 +153,12 @@
 }
 
 @utility stage-btn-primary {
-  @apply stage-btn h-7 px-3 bg-(--stage-value) text-[#01191c] hover:bg-[#4adcfa];
+  /* 舞台内主按钮 = --live（舞台是「活」区域，与全局近黑主按钮的区分是刻意的） */
+  @apply stage-btn h-7 px-3 bg-(--live) text-white hover:bg-(--live-strong);
 }
 
 @utility stage-btn-ghost {
-  @apply stage-btn h-7 px-3 border border-(--card-border) bg-(--card) text-(--foreground) hover:border-[#2c2d2d] hover:bg-[#141515];
+  @apply stage-btn h-7 px-3 border border-(--card-border) bg-(--card) text-(--foreground) hover:bg-accent;
 }
 
 @utility stage-btn-secondary {
@@ -168,37 +166,9 @@
   @apply stage-btn-ghost;
 }
 
-@utility text-accent {
-  color: var(--accent);
-}
+/* 注：旧 @utility text-accent 已删除——品牌青迁 --live，Task 4 全量 sweep */
 
 @layer utilities {
-  /* LiveKit 品牌视觉：近黑底 + 亮青强调 + 中性灰 mono 眉标。取自官方页面 token
-   （#070707 / #1FD5F9 / #999999），统一全站视觉语言（舞台主页与工作台页同源）。 */
-  :root {
-    --background: #070707;
-    --foreground: #eef7f7;
-    --muted: #999999;
-    --card: #0d0e0e;
-    --card-soft: rgba(255, 255, 255, 0.05);
-    --card-border: rgba(255, 255, 255, 0.08);
-    --accent: #1fd5f9;
-    --accent-soft: rgba(31, 213, 249, 0.15);
-    --accent-ink: #01191c;
-    --danger: #ff6b6b;
-
-    /* 官方 LiveKit「舞台」token：近黑底 + 亮青强调 + 中性灰眉标 */
-    --stage-bg: #070707;
-    --stage-bg-2: #012a32;
-    --stage-panel: rgba(255, 255, 255, 0.03);
-    --stage-panel-2: rgba(255, 255, 255, 0.05);
-    --stage-border: rgba(28, 213, 249, 0.14);
-    --stage-border-soft: rgba(255, 255, 255, 0.08);
-    --stage-muted: #999999;
-    --stage-value: #1fd5f9;
-    --stage-value-dim: rgba(31, 213, 249, 0.45);
-  }
-
   * {
     box-sizing: border-box;
   }
@@ -226,16 +196,16 @@
   }
 }
 
-/* WhatsApp 對接通知爆閃:call 行 / 橫幅 邊框+底色閃,醒目但唔刺眼(AI 通話唔受影響)。 */
+/* WhatsApp 對接通知爆閃:call 行 / 橫幅 邊框+底色閃（浅色重校：青色信号） */
 @keyframes wa-flash-kf {
   0%,
   100% {
-    box-shadow: 0 0 0 1px rgba(31, 213, 249, 0.15), 0 0 0 rgba(31, 213, 249, 0);
-    background-color: rgba(31, 213, 249, 0.06);
+    box-shadow: 0 0 0 1px rgb(8 145 178 / 0.2), 0 0 0 rgb(8 145 178 / 0);
+    background-color: rgb(8 145 178 / 0.06);
   }
   50% {
-    box-shadow: 0 0 0 1px var(--accent), 0 0 18px rgba(31, 213, 249, 0.45);
-    background-color: rgba(31, 213, 249, 0.16);
+    box-shadow: 0 0 0 1px var(--live), 0 0 18px rgb(8 145 178 / 0.35);
+    background-color: rgb(8 145 178 / 0.14);
   }
 }
 .wa-flash {
@@ -276,6 +246,13 @@
   --color-card: var(--card);
   --color-foreground: var(--foreground);
   --color-background: var(--background);
+  /* Bok 扩展：--live 家族 + danger（bg-live / text-live-ink / bg-live-soft …） */
+  --color-live: var(--live);
+  --color-live-strong: var(--live-strong);
+  --color-live-soft: var(--live-soft);
+  --color-live-soft-bg: var(--live-soft-bg);
+  --color-live-ink: var(--live-ink);
+  --color-danger: var(--danger);
   --radius-sm: calc(var(--radius) * 0.6);
   --radius-md: calc(var(--radius) * 0.8);
   --radius-lg: var(--radius);
@@ -286,79 +263,67 @@
 }
 /*
   ---break---
-  shadcn token 调色板（radix-nova / neutral）。放进 @layer base：
-  本应用是常暗主题，:root 直接采用 .dark 档值；既有 app token（--background/
-  --foreground/--muted/--card/--accent）在下方 @layer utilities 的 :root 里
-  定义，按层序覆盖这里的同名变量——官方组件(bg-background/text-foreground/
-  hover:bg-accent…)因此自动继承本站暗色 + 青色视觉。勿移出 layer（会把
-  全站底色/强调色打回 shadcn 浅色默认）。
+  shadcn token（官方 neutral 浅色基准）+ Bok 扩展（--live 活信号 / stage 浅色变体）。
+  纯浅色单主题：全站只有 :root 一档，.dark 已删。
+  语义注意：--muted 是浅灰表面（配 bg-muted）；文字灰用 --muted-foreground；
+  --accent 回归 shadcn 本义（hover 浅灰底），品牌青在 --live。
 */
 @layer base {
   :root {
-    --background: oklch(0.145 0 0);
-    --foreground: oklch(0.985 0 0);
-    --card: oklch(0.205 0 0);
-    --card-foreground: oklch(0.985 0 0);
-    --popover: oklch(0.205 0 0);
-    --popover-foreground: oklch(0.985 0 0);
-    --primary: oklch(0.922 0 0);
-    --primary-foreground: oklch(0.205 0 0);
-    --secondary: oklch(0.269 0 0);
-    --secondary-foreground: oklch(0.985 0 0);
-    --muted: oklch(0.269 0 0);
-    --muted-foreground: oklch(0.708 0 0);
-    --accent: oklch(0.269 0 0);
-    --accent-foreground: oklch(0.985 0 0);
-    --destructive: oklch(0.704 0.191 22.216);
-    --border: oklch(1 0 0 / 10%);
-    --input: oklch(1 0 0 / 15%);
-    --ring: oklch(0.556 0 0);
-    --chart-1: oklch(0.87 0 0);
-    --chart-2: oklch(0.556 0 0);
-    --chart-3: oklch(0.439 0 0);
-    --chart-4: oklch(0.371 0 0);
-    --chart-5: oklch(0.269 0 0);
+    --background: oklch(1 0 0);
+    --foreground: oklch(0.145 0 0);
+    --card: oklch(1 0 0);
+    --card-foreground: oklch(0.145 0 0);
+    --popover: oklch(1 0 0);
+    --popover-foreground: oklch(0.145 0 0);
+    --primary: oklch(0.205 0 0);
+    --primary-foreground: oklch(0.985 0 0);
+    --secondary: oklch(0.97 0 0);
+    --secondary-foreground: oklch(0.205 0 0);
+    --muted: oklch(0.97 0 0);
+    --muted-foreground: oklch(0.556 0 0);
+    --accent: oklch(0.97 0 0);
+    --accent-foreground: oklch(0.205 0 0);
+    --destructive: oklch(0.577 0.245 27.325);
+    --border: oklch(0.922 0 0);
+    --input: oklch(0.922 0 0);
+    --ring: oklch(0.708 0 0);
+    --chart-1: oklch(0.646 0.222 41.116);
+    --chart-2: oklch(0.6 0.118 184.704);
+    --chart-3: oklch(0.398 0.07 227.392);
+    --chart-4: oklch(0.828 0.189 84.429);
+    --chart-5: oklch(0.769 0.188 70.08);
     --radius: 0.625rem;
-    --sidebar: oklch(0.205 0 0);
-    --sidebar-foreground: oklch(0.985 0 0);
-    --sidebar-primary: oklch(0.488 0.243 264.376);
+    --sidebar: oklch(0.985 0 0);
+    --sidebar-foreground: oklch(0.145 0 0);
+    --sidebar-primary: oklch(0.205 0 0);
     --sidebar-primary-foreground: oklch(0.985 0 0);
-    --sidebar-accent: oklch(0.269 0 0);
-    --sidebar-accent-foreground: oklch(0.985 0 0);
-    --sidebar-border: oklch(1 0 0 / 10%);
-    --sidebar-ring: oklch(0.556 0 0);
-  }
-  .dark {
-    --background: oklch(0.145 0 0);
-    --foreground: oklch(0.985 0 0);
-    --card: oklch(0.205 0 0);
-    --card-foreground: oklch(0.985 0 0);
-    --popover: oklch(0.205 0 0);
-    --popover-foreground: oklch(0.985 0 0);
-    --primary: oklch(0.922 0 0);
-    --primary-foreground: oklch(0.205 0 0);
-    --secondary: oklch(0.269 0 0);
-    --secondary-foreground: oklch(0.985 0 0);
-    --muted: oklch(0.269 0 0);
-    --muted-foreground: oklch(0.708 0 0);
-    --accent: oklch(0.269 0 0);
-    --accent-foreground: oklch(0.985 0 0);
-    --destructive: oklch(0.704 0.191 22.216);
-    --border: oklch(1 0 0 / 10%);
-    --input: oklch(1 0 0 / 15%);
-    --ring: oklch(0.556 0 0);
-    --chart-1: oklch(0.87 0 0);
-    --chart-2: oklch(0.556 0 0);
-    --chart-3: oklch(0.439 0 0);
-    --chart-4: oklch(0.371 0 0);
-    --chart-5: oklch(0.269 0 0);
-    --sidebar: oklch(0.205 0 0);
-    --sidebar-foreground: oklch(0.985 0 0);
-    --sidebar-primary: oklch(0.488 0.243 264.376);
-    --sidebar-primary-foreground: oklch(0.985 0 0);
-    --sidebar-accent: oklch(0.269 0 0);
-    --sidebar-accent-foreground: oklch(0.985 0 0);
-    --sidebar-border: oklch(1 0 0 / 10%);
-    --sidebar-ring: oklch(0.556 0 0);
+    --sidebar-accent: oklch(0.97 0 0);
+    --sidebar-accent-foreground: oklch(0.205 0 0);
+    --sidebar-border: oklch(0.922 0 0);
+    --sidebar-ring: oklch(0.708 0 0);
+
+    /* Bok 扩展（旧名保留、值换浅）：页面/表格直接引用这些变量 */
+    --card-soft: oklch(0.985 0 0);
+    --card-border: oklch(0.922 0 0);
+    --danger: oklch(0.577 0.245 27.325);
+
+    /* 品牌活信号（spec §2 全表）：cyan-600 起步保白底对比度 */
+    --live: oklch(0.715 0.143 215.221); /* cyan-600 ≈ #0891b2 */
+    --live-strong: oklch(0.609 0.126 221.723); /* cyan-700 ≈ #0e7490 */
+    --live-soft: oklch(0.956 0.045 203.388); /* cyan-100 ≈ #cffafe */
+    --live-soft-bg: oklch(0.984 0.019 200.873); /* cyan-50 ≈ #ecfeff */
+    --live-ink: oklch(0.398 0.07 223.393); /* cyan-900 ≈ #155e75 */
+
+    /* 官方「舞台」token 浅色变体 */
+    --stage-bg: oklch(0.985 0 0);
+    --stage-bg-2: var(--live-soft-bg);
+    --stage-panel: oklch(1 0 0);
+    --stage-panel-2: oklch(0.97 0 0);
+    --stage-border: oklch(0.922 0 0);
+    --stage-border-soft: oklch(0.961 0 0);
+    --stage-muted: oklch(0.556 0 0);
+    --stage-value: var(--live);
+    --stage-value-dim: oklch(0.715 0.143 215.221 / 45%);
   }
 }

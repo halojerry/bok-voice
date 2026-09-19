@@ -368,3 +368,218 @@ def test_create_call_explicit_template_overrides_object_binding(monkeypatch):
         "account_id": "acc-001", "object_id": obj["id"],
     }).json()
     assert fallback["template_id"] == "tpl-object"
+
+
+def _create_campaign(client, repo, **over) -> dict:
+    """最小建波 helper：单对象 + `_campaign_body` 透传覆盖字段。"""
+    obj = repo.create_object("acc-001", {"display_name": "A", "phone": "+85211111111"})
+    return client.post("/api/campaigns", json=_campaign_body(obj, **over)).json()
+
+
+def _create_and_start(client, repo, **over) -> dict:
+    camp = _create_campaign(client, repo, **over)
+    r = client.post(f"/api/campaigns/{camp['id']}/start")
+    assert r.status_code == 200
+    return camp
+
+
+def test_create_campaign_with_scheduling_payload(monkeypatch):
+    """调度三字段（2026-09-17）：时段窗归一（非法窗丢/超 3 截断）、并发 0=不限、
+    重拨策略 on 白名单剔除。"""
+    client, repo = _client_and_repo(monkeypatch)
+    body = _campaign_body(
+        repo.create_object("acc-001", {"display_name": "A", "phone": "+85211111111"}),
+        call_windows=[{"days": [1, 2, 3, 4, 5], "start": "08:00", "end": "18:00"},
+                      {"days": [6], "start": "09:00", "end": "12:00"},
+                      {"days": [7], "start": "bad", "end": "x"},
+                      {"days": [1], "start": "10:00", "end": "11:00"}],
+        max_concurrency=0,
+        redispatch={"max_attempts": 2, "interval_minutes": 30,
+                    "on": ["no_answer", "junk"]},
+    )
+    camp = client.post("/api/campaigns", json=body).json()
+    assert len(camp["call_windows"]) == 3  # 非法窗丢、超 3 截断
+    assert camp["max_concurrency"] == 0
+    assert camp["redispatch"]["on"] == ["no_answer"]  # 非法结果名剔除
+
+
+def test_create_campaign_explicit_null_max_concurrency_defaults_to_one(monkeypatch):
+    """T1-M1 防呆：显式 `"max_concurrency": null` 不落 0（不限），按缺省 1（串行）。"""
+    client, repo = _client_and_repo(monkeypatch)
+    camp = _create_campaign(client, repo, max_concurrency=None)
+    assert camp["max_concurrency"] == 1
+
+
+def test_update_campaign_rejects_running(monkeypatch):
+    """运行中锁定（对齐竞品语义）：running 时段/并发不可改，先 pause。"""
+    client, repo = _client_and_repo(monkeypatch)
+    camp = _create_and_start(client, repo)
+    resp = client.put(f"/api/campaigns/{camp['id']}", json={"gap_seconds": 9})
+    assert resp.status_code == 409
+    assert repo.get_campaign(camp["id"])["gap_seconds"] == 5  # 拒改未落库
+
+
+def test_update_campaign_edits_paused(monkeypatch):
+    """draft/paused 可改：调度字段+基础字段白名单落库，响应回解析后形状。"""
+    client, repo = _client_and_repo(monkeypatch)
+    camp = _create_campaign(client, repo)
+    resp = client.put(
+        f"/api/campaigns/{camp['id']}",
+        json={"max_concurrency": 3,
+              "call_windows": [{"days": [1], "start": "08:00", "end": "12:00"}]},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["max_concurrency"] == 3
+    assert resp.json()["call_windows"] == [{"days": [1], "start": "08:00", "end": "12:00"}]
+    row = repo.get_campaign(camp["id"])
+    assert row["max_concurrency"] == 3
+
+
+def test_update_campaign_redispatch_three_states(monkeypatch):
+    """T7-I1 服务端契约（web 开关依赖）：PUT redispatch 显式 `{}`=清除；
+    缺键=保留旧值；合法策略=覆盖。关开关只 save 不传键曾致「关不掉」。"""
+    client, repo = _client_and_repo(monkeypatch)
+    camp = _create_campaign(client, repo)
+    policy = {"max_attempts": 2, "interval_minutes": 30, "on": ["no_answer"]}
+    # 1) 设置策略
+    assert client.put(f"/api/campaigns/{camp['id']}",
+                      json={"redispatch": policy}).status_code == 200
+    assert repo.get_campaign(camp["id"])["redispatch"] == policy
+    # 2) 不传键 → 保留旧值
+    client.put(f"/api/campaigns/{camp['id']}", json={"gap_seconds": 9})
+    assert repo.get_campaign(camp["id"])["redispatch"] == policy
+    # 3) 显式 `{}` → 清除（web 重拨开关关闭的落点）
+    client.put(f"/api/campaigns/{camp['id']}", json={"redispatch": {}})
+    assert repo.get_campaign(camp["id"])["redispatch"] == {}
+    assert repo.get_campaign(camp["id"])["redispatch_json"] == ""
+
+
+def test_dial_result_redispatch_returns_item_to_pending(monkeypatch):
+    """终审 C-1（HTTP 级集成）：dial-result 失败三态直写路径同样过重联回队判定。
+
+    旧版 report_dial_result 把失败三态 item 直写终态，而收割段只扫在途
+    （dialing/in_call）item——终态 item 永不进收割，attempts 永不加、自动重拨在
+    生产主路静默 no-op。现命中（result ∈ policy.on 且 attempts<max）回
+    pending+attempts+1，与循环收割共用 redispatch_harvest_updates。
+    """
+    from bok_voice_core.types import CallMode, SessionManifest
+
+    client, repo = _client_and_repo(monkeypatch)
+    obj = repo.create_object("acc-001", {"display_name": "A", "phone": "+85211111111"})
+    camp = client.post("/api/campaigns", json=_campaign_body(
+        obj, redispatch={"max_attempts": 2, "interval_minutes": 30,
+                         "on": ["no_answer"]})).json()
+    assert client.post(f"/api/campaigns/{camp['id']}/start").status_code == 200
+    item = repo.list_items(camp["id"])[0]
+    assert item["status"] == "pending" and item["attempts"] == 1
+
+    def _dialing_call(seq: int) -> dict:
+        """模拟 _start_call 产物：建通话 + item 置 dialing 并钉 call_id。"""
+        call = repo.create_call(SessionManifest(
+            session_id=f"call-c1-{seq}-{obj['id']}", account_id="acc-001",
+            object_id=obj["id"], persona_id="", mode=CallMode.LIVE,
+            direction="outbound", language="zh", providers={},
+        ))
+        repo.update_item(item["id"], status="dialing", call_id=call["id"])
+        return call
+
+    # 命中路：no_answer ∈ policy.on 且 attempts=1 < max=2 → 回 pending 等 interval。
+    call = _dialing_call(1)
+    assert client.post(f"/api/calls/{call['id']}/dial-result",
+                       json={"status": "no_answer"}).status_code == 200
+    item = repo.list_items(camp["id"])[0]
+    assert item["status"] == "pending" and item["attempts"] == 2
+    assert item["last_error"] == "no_answer"  # 与收割路同源=通话 disposition
+
+    # 不命中①：result 不在 policy.on（rejected）→ 维持终态直写（attempts 不动）。
+    call2 = _dialing_call(2)
+    client.post(f"/api/calls/{call2['id']}/dial-result", json={"status": "rejected"})
+    item = repo.list_items(camp["id"])[0]
+    assert item["status"] == "rejected" and item["attempts"] == 2
+
+    # 不命中②：attempts 已 = max，再报 no_answer 也不回队（重拨上限封死）。
+    call3 = _dialing_call(3)
+    repo.update_item(item["id"], attempts=2)
+    client.post(f"/api/calls/{call3['id']}/dial-result", json={"status": "no_answer"})
+    item = repo.list_items(camp["id"])[0]
+    assert item["status"] == "no_answer" and item["attempts"] == 2
+
+
+def test_update_campaign_missing_is_404_and_audits(monkeypatch):
+    """PUT 404 同既有端点；成功编辑落 campaign.update 审计。"""
+    from bok_voice_obs.audit import AuditStore, audit_store
+
+    events: list[str] = []
+    original = audit_store()
+    monkeypatch.setattr(
+        "bok_voice_obs.audit._STORE",
+        AuditStore(original.directory, tap=lambda e: events.append(e.action)),
+    )
+    client, repo = _client_and_repo(monkeypatch)
+    assert client.put("/api/campaigns/camp-nope", json={"gap_seconds": 9}).status_code == 404
+    camp = _create_campaign(client, repo)
+    resp = client.put(f"/api/campaigns/{camp['id']}", json={"name": "改名波次"})
+    assert resp.status_code == 200
+    assert resp.json()["name"] == "改名波次"
+    assert "campaign.update" in events
+
+
+# ---- 全局外呼时段窗 settings.campaign 段（2026-09-17 T3b）----
+
+def test_settings_campaign_section_roundtrip_and_tick_gating(monkeypatch):
+    """/api/settings 收 campaign 段：归一落库、GET 回显、不传保留既有；
+    保存的全局窗对 campaign_tick 生效（窗内起拨/窗外不起拨）。"""
+    import asyncio
+    from datetime import datetime, timezone
+
+    from control_plane.campaign import campaign_tick
+
+    client, repo = _client_and_repo(monkeypatch)
+    # 时钟钉到半点：窗端点秒级含端（HH:59 之后的 HH:59:xx 已出窗），真实钟
+    # 撞 59 分档=1/60 概率红（CI 18:59:01 实证）。钉半点后与分/秒彻底脱钩。
+    now = datetime.now(timezone.utc).replace(tzinfo=None, minute=30,
+                                             second=0, microsecond=0)
+
+    # 窗内窗（覆盖 now）+ 一条垃圾窗：归一落库应剔除垃圾、保留正常窗。
+    # end 用同小时 :59（恒 start<end）：旧 (hour+1)%24 在 23 点档变跨零点窗
+    # 被 parse_call_windows 静默丢弃，断言确定性红（T3b-Important flake 修复）。
+    inside = [{"days": [now.isoweekday()], "start": f"{now.hour:02d}:00",
+               "end": f"{now.hour:02d}:59"},
+              {"days": [1], "start": "08:00", "end": "99:99"}]
+    resp = client.put("/api/settings", json={"campaign": {"call_windows": inside}})
+    assert resp.status_code == 200
+    assert resp.json()["campaign"]["call_windows"] == [inside[0]]
+    # GET 照常回显 campaign 段
+    assert client.get("/api/settings").json()["campaign"]["call_windows"] == [inside[0]]
+
+    # 行为：全局窗覆盖 now、任务窗空（不限）→ tick 起拨
+    dispatched: list[str] = []
+
+    async def fake_dispatch(room: str, metadata: str) -> None:
+        dispatched.append(room)
+        repo.update_call(room, status="ended", disposition="no_answer")
+
+    obj = repo.create_object("acc-001", {"display_name": "A", "phone": "+85211111111"})
+    camp = repo.create_campaign("acc-001", name="t", template_id="", persona_id="",
+                                language="zh", gap_seconds=0, object_ids=[obj["id"]])
+    repo.update_campaign(camp["id"], status="running")
+    out = asyncio.run(campaign_tick(repo, dispatcher=fake_dispatch, now=now))
+    assert out["started"] == 1
+
+    # 换窗外窗（days=明天，任一时刻都不命中今天）→ 新战役 tick 不起拨
+    tomorrow = (now.isoweekday() % 7) + 1
+    outside = [{"days": [tomorrow], "start": "00:00", "end": "23:59"}]
+    resp2 = client.put("/api/settings", json={"campaign": {"call_windows": outside}})
+    assert resp2.status_code == 200
+    obj2 = repo.create_object("acc-001", {"display_name": "B", "phone": "+85222222222"})
+    camp2 = repo.create_campaign("acc-001", name="t2", template_id="", persona_id="",
+                                 language="zh", gap_seconds=0, object_ids=[obj2["id"]])
+    repo.update_campaign(camp2["id"], status="running")
+    out2 = asyncio.run(campaign_tick(repo, dispatcher=fake_dispatch, now=now))
+    assert out2["started"] == 0
+    assert repo.list_items(camp2["id"])[0]["status"] == "pending"
+
+    # 不传 campaign 键的 PUT → 既有段保留（旧行为零变化）
+    resp3 = client.put("/api/settings", json={"policy": "offline_first"})
+    assert resp3.status_code == 200
+    assert resp3.json()["campaign"]["call_windows"] == outside

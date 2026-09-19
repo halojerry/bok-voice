@@ -109,9 +109,9 @@ export const SETTING_CARDS: ProviderMeta[] = [
       { key: "speaker", label: "AI 默认音色（整场同声）", type: "text", preview: true, hint: "客户讲粤语/普通话/英文都用它发声（人设若单独绑定则以人设优先）。MiniMax 可直接粘贴音色 ID（推荐粤语播报音色，可到人设页列表挑）；Qwen3 填本地音色如 vivian。留空则用下方分语言音色或系统默认。", placeholder: "如 Cantonese_crisp_news_anchor_vv2" },
       { key: "instruct", label: "语气指令（可选）", type: "text", hint: "附加到每次合成的情绪指令之前。", placeholder: "如：温和、耐心" },
       { key: "sample_rate", label: "采样率", type: "number", hint: "输出 PCM 采样率，通常保持 24000。", min: 8000, max: 48000, step: 1000 },
-      { key: "speaker_zh", label: "普通话音色", type: "select", preview: true, advanced: true, hint: "按语言分音色的普通话音色；「整场同声」模式下仅当默认音色留空时回落。B 线同传译文声也按语言取这三键（会话级另选的优先）。留空时 A 线默认 moss（moss_audio_aaa1346a…），B 线默认 News_Anchor。", options: [{ value: "", label: "（不单独设，跟随默认音色）" }, ...minimaxVoiceOptionsFor("zh")] },
-      { key: "speaker_cantonese", label: "粤语音色", type: "select", preview: true, advanced: true, hint: "按语言分音色的粤语音色；「整场同声」模式下仅当默认音色留空时回落。B 线同传译文声也按语言取这三键（会话级另选的优先）。", options: [{ value: "", label: "（不单独设，跟随默认音色）" }, ...minimaxVoiceOptionsFor("cantonese")] },
-      { key: "speaker_en", label: "英语音色", type: "select", preview: true, advanced: true, hint: "按语言分音色的英语音色；「整场同声」模式下仅当默认音色留空时回落。B 线同传译文声也按语言取这三键（会话级另选的优先）。留空时默认 English_magnetic_voiced_man。", options: [{ value: "", label: "（不单独设，跟随默认音色）" }, ...minimaxVoiceOptionsFor("en")] },
+      { key: "speaker_zh", label: "普通话音色", type: "select", preview: true, advanced: true, hint: "按语言分音色的普通话音色；「整场同声」模式下仅当默认音色留空时回落。B 线同传译文声也按语言取这三键（会话级另选的优先）。留空时 A 线默认 moss（moss_audio_aaa1346a…），B 线默认 News_Anchor。「克隆我的声音」面板生成的云端克隆音色会追加在本下拉末尾。", options: [{ value: "", label: "（不单独设，跟随默认音色）" }, ...minimaxVoiceOptionsFor("zh")] },
+      { key: "speaker_cantonese", label: "粤语音色", type: "select", preview: true, advanced: true, hint: "按语言分音色的粤语音色；「整场同声」模式下仅当默认音色留空时回落。B 线同传译文声也按语言取这三键（会话级另选的优先）。云端克隆音色会追加在本下拉末尾。", options: [{ value: "", label: "（不单独设，跟随默认音色）" }, ...minimaxVoiceOptionsFor("cantonese")] },
+      { key: "speaker_en", label: "英语音色", type: "select", preview: true, advanced: true, hint: "按语言分音色的英语音色；「整场同声」模式下仅当默认音色留空时回落。B 线同传译文声也按语言取这三键（会话级另选的优先）。留空时默认 English_magnetic_voiced_man。云端克隆音色会追加在本下拉末尾。", options: [{ value: "", label: "（不单独设，跟随默认音色）" }, ...minimaxVoiceOptionsFor("en")] },
     ],
   },
   {

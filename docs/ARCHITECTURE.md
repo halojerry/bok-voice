@@ -33,25 +33,28 @@ Agent Worker (livekit-agents) ── ControlPlaneClient ── ContextInjector �
 
 ---
 
-## 桌面分发与可观测性（v0.2）
+## 分发与可观测性（2026-09-17 修订：Tauri 退役，浏览器化）
 
-### 桌面壳（Tauri）
+### 节点分发（原桌面壳章节）
 
-- **位置**：`desktop/`，Tauri v2 应用：`desktop/src-tauri`（Rust 编排）；前端不设独立桥文件，`apps/web/lib/tauri.ts` 按需直连 `invoke`（非 Tauri 环境优雅失败态）。
-- **启动模型**：打开应用即拉起本机服务；默认不开机自启，可选自启经设置页开关
-  （`set_autostart`，注意注册的是运行中二进制路径，见 `desktop/README.md`「自启与常驻」）。Rust 侧 `setup` 调用
-  `python tools/bok.py serve`，随后轮询 `:3000/:8000/:8787/:8788/:1235/:8790` 健康度并推送事件。
-- **主窗口**：指向 `http://localhost:3000`（网页工作台）；Web 端在浏览器模式会自动回退为普通页面。
-- **命令**：invoke 命令面 `health` / `start` / `stop` / `open_logs` / `setup_status` / `setup_download` / `list_audio_devices` / `set_system_output` / `set_autostart` / `get_autostart`，供前端设置页「本机桌面服务」与音频设备卡调用。
-- **仓库根解析**：`BOK_ROOT` 环境变量 → Tauri `resource_dir` → `CARGO_MANIFEST_DIR` 上溯（dev）。
+- **Tauri 桌面壳已退役**（2026-09-17，`desktop/` 已删除）：分发改为「节点安装脚本
+  （从云 CP 鉴权下载，客户链路零 GitHub）+ schtasks/launchd 常驻 + 纯浏览器 UI」。
+- **装机入口**：Windows=`scripts/install-node.ps1 -Fetch -InstallService`（自举拉包+
+  Task Scheduler 常驻）；bash=`scripts/bootstrap-node.sh`。两者的包/脚本都经
+  `GET /api/nodes/downloads/{pkg|runtime|bootstrap}/…`（license/node_token 端点内自证）。
+- **UI 托管**：`tools/node_agent.py` 内嵌 stdlib 静态服务（`--ui-dir` 给定即自动起
+  :3000，SPA 404 回 index.html）；话务员浏览器直达，刷新即新版，无客户端版本断层。
+- **原 Tauri 设备层**（macOS CoreAudio 系统输出切换）随壳退役；输出切换统一走浏览器
+  `setSinkId`（Chromium；Safari 回退系统默认）。
+- **仓库根解析**：`BOK_ROOT` 环境变量 → 仓库根上溯（`runtime_root()` 兼容祖先查找）。
 
 ### 平台模型与首启下载
 
 - 模型权重**不进入仓库**。`tools/bok.py download` 用 `huggingface_hub.snapshot_download`
-  拉取到平台级 `app-data/models`，支持断点续传。
+  拉取到平台级 `app-data/models`，支持断点续传（中国网络可配 `HF_ENDPOINT` 镜像）。
 - app-data：macOS `~/Library/Application Support/BokVoice`，Windows `%LOCALAPPDATA%\BokVoice`。
 - `tools/bok.py manifest` 输出 JSON：平台、app-data、端口、每模型 repo + 字节 + sha256 前缀，
-  供 CI 生成 `models.sha256.json` 与桌面「已安装清单」。
+  供 CI 生成 `models.sha256.json`。
 
 ### 可追溯 / 可审计日志
 
@@ -61,14 +64,18 @@ Agent Worker (livekit-agents) ── ControlPlaneClient ── ContextInjector �
 - **关联注入**：`CorrelationMiddleware` 读取/生成 `x-request-id/x-call-id/x-account-id/...`
   header，并写入响应头；Agent 通过 `call_id` 建立自己的关联。
 - **落盘**：`app-data/logs/app.jsonl`（按组件、20MB × 10 滚动）；审计写入 `app-data/audit/YYYY-MM-DD.jsonl`（只追加）。
-- **审计事件**：`voice.clone / settle.create / template.create|update|delete / object.* / persona.* / knowledge.import / settings.save`；
+- **审计事件**：`voice.clone / settle.create / template.create|update|delete / object.* / persona.* / knowledge.import / settings.save / node.command_queued / node.artifact_downloaded`；
   `GET /api/audit` 支持按 `account_id / action / call_id` 过滤。有数据库时同步 `audit_events` 表。
 
 ### CI/CD
 
 - **CI**（`.github/workflows/ci.yml`）：Python `compileall+pytest`、Node `realtime-translation` 测试、
-  Web `tsc --noEmit` + `npm test` + 瘦客户端静态探针、`bok manifest/status` 冒烟、Tauri 桌壳 cargo test/check；
-  节点侧 `node-handshake.yml`：Linux 真 CP 握手 + kill-switch 探针 / Windows ps1 干跑 + 生命周期探针。
+  Web `tsc --noEmit` + `npm test` + 瘦客户端静态探针、`bok manifest/status` 冒烟
+  （`Desktop shell (Rust)` 必检上下文已随 Tauri 退役移除——GitHub branch protection 同步删）；
+  节点侧 `node-handshake.yml`：Linux 真 CP 握手（含 commands 通道+工件下载鉴权步）+
+  kill-switch 探针 / Windows ps1 干跑 + 生命周期探针。
 - **Release**（`.github/workflows/release.yml`）：tag `v*` 触发矩阵
-  macos-14(dmg) / windows-latest(msi)；`build_release.sh` 构建 web、跑测试、派生图标、
-  生成 `models.sha256.json`；`tauri build` 产安装包并上传 artifact。
+  macos-14 / windows-latest：组装 runtime（`build_runtime.sh`）→
+  `build_node_pkg.sh` + `build_runtime_pkg.sh` 产代码包/运行时包 → 冒烟（解包+布局+
+  版本注入）→ 挂 GitHub Release（私有仓=私有资产）。操作员 `publish_node_pkg.sh`
+  推云 CP 工件卷；客户升级走 commands 通道。

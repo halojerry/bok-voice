@@ -7,6 +7,16 @@ import re
 import time
 from typing import Optional
 
+from bok_voice_core.flow_graph import (
+    ACTION_NOTIFY_HUMAN,
+    ACTION_PLAY_QA,
+    FlowGraphDoc,
+    FlowIntent,
+    eligible_judge_intents,
+    pick_graph_action,
+)
+# W4-T2 意向规则评估(挂断 disposition 覆盖+intent_code;共享契约主会话写死,只消费)
+from bok_voice_core.intent_rules import eval_intent_rules
 from bok_voice_core.policies import ProviderRegistry, ProviderState, select_session_manifest
 from bok_voice_core.testdata import is_test_object_name as _is_test_object_name
 from bok_voice_core.types import CallMode
@@ -17,7 +27,13 @@ from .plugins.settlement import SettlementTrigger
 from .providers.registry import build_provider_registry
 from .control_plane import ControlPlaneClient
 from .fillers import FillerDirector
-from .qa_gate import QaIndex, qa_exclude_reason as _qa_exclude_reason, qa_fastpath_enabled
+from .qa_gate import (
+    QaIndex,
+    pick_rotation_member,
+    qa_exclude_reason as _qa_exclude_reason,
+    qa_fastpath_enabled,
+    qa_rotation_enabled,
+)
 from .tts_cache import CachedTTS, TtsAudioCache, default_cache_dir, frames_aiter, pcm_to_frames, tts_cache_enabled
 # 模块级引 flow(纯 stdlib 依赖,无环):_wa_numberish/_wa_number_line 等模块级
 # helper 用;entrypoint 内的 function-scoped import 属历史样式,不冲突。
@@ -165,21 +181,27 @@ async def _strip_expr_markup(text):
         yield ""
 
 
-async def _llm_judge(base_url: str, model: str, messages: list) -> str:
+async def _llm_judge(
+    base_url: str, model: str, messages: list, *, max_tokens: int = 8, timeout: float = 5.0
+) -> str:
     """流程推进判定器:对本地 MLX LLM 发一个 max_tokens 极短请求,取回一个字。失败返空(唔推进)。
 
     参数面与主回复同源(stop/温度语义),走 openai SDK(自动重试/超时),唔再手搓 HTTP。
+    `max_tokens` 具名参数缺省 8=推进判定器原值(既有调用点零变化);意图判据判定
+    (3.4)输出 intent id,长过 8 token,调用点显式传大值。`timeout` 缺省 5.0 同理
+    (review N9:非流式单请求的总预算——9B 判据集 prefill 慢,意图判定调用点显式放宽,
+    超时返空=静默永久 miss,唔可以两边共用 5s 硬码)。
     """
     if not base_url or not model:
         return ""
     from openai import AsyncOpenAI
 
     try:
-        client = AsyncOpenAI(api_key="mlx", base_url=base_url, timeout=5, max_retries=1)
+        client = AsyncOpenAI(api_key="mlx", base_url=base_url, timeout=timeout, max_retries=1)
         r = await client.chat.completions.create(
             model=model,
             messages=messages,
-            max_tokens=8,
+            max_tokens=max_tokens,
             temperature=0,
             # 本地 MLX 對話模板會 append <|im_end|>,停喺呢度,回應淨係 verdict 字。
             stop=["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
@@ -190,6 +212,33 @@ async def _llm_judge(base_url: str, model: str, messages: list) -> str:
     except Exception as exc:  # pragma: no cover - 判定失败唔推进,唔阻断通话
         print(f"[flow] llm judge failed: {exc!r}", flush=True)
         return ""
+
+
+def _intent_judge_candidates(
+    graph: FlowGraphDoc,
+    *,
+    step_1based: int,
+    fired: set[str],
+    closing: bool,
+    inflight: bool,
+    pending: bool,
+) -> list[FlowIntent]:
+    """3.4 判据判定**调度门**(模块级,便于单测):返回要送去判定的候选意图。
+
+    六闸全过才有候选:kill-switch 开 + 图引擎开(图关=冇消费点,判定=空跑烧 9B)
+    + 非收线 + 无在途判定(单飞) + 无待生效 pending(single-shot 未消费) + 资格
+    预筛非空(`eligible_judge_intents`:有判据/在 scope/有可触发绑定)。
+
+    任一不过 → 空列表,调用方**静默**(关键词未中是热路径,唔打日志)。**零回归
+    保证**:没有任何意图带判据时预筛恒空 → 零任务零专线调用,与 Phase 3.3 逐字节同。
+    """
+    if os.environ.get("BOK_FLOW_GRAPH_JUDGE", "1") != "1":
+        return []
+    if os.environ.get("BOK_FLOW_GRAPH", "1") != "1":
+        return []
+    if closing or inflight or pending or not graph.intents:
+        return []
+    return eligible_judge_intents(graph, step_1based=step_1based, fired=fired)
 
 
 def _parse_voice_map(raw) -> dict:
@@ -426,6 +475,109 @@ _WA_QUESTION_MARKERS = re.compile(
 def _wa_questionish(text: str) -> bool:
     """疑问/算式句:含提问或算术标记 ⇒ 不暂存、不 StopResponse,走正常轮次。"""
     return bool(_WA_QUESTION_MARKERS.search(text))
+
+
+async def _report_whatsapp_once(
+    cp, call_id: str, num: str, channel: str,
+    reported: set[str], key: str, *, where: str = "",
+) -> None:
+    """WhatsApp 信号上报一次;失败或被取消都回滚 `reported` 键(AGENTS.md ⑦)。
+
+    从 entrypoint 内联闭包抽出为模块级函数:行为与 2026-09-17 全量 debug F4
+    的内联版逐字一致,但可离线单测钉死语义(tests/test_fire_forget_pool.py)——
+    CancelledError 是 BaseException,`except Exception` 接不住,teardown 掐杀
+    在途请求时若无独立捕获回滚,键被永久占用=这个号永远不再补报。
+    """
+    tag = f" (call {where})" if where else ""
+    try:
+        await cp.report_whatsapp(call_id, num, channel=channel)
+    except asyncio.CancelledError:
+        # teardown 掐杀不走 except Exception——key 留池=该捕获永不补报。回滚后重抛。
+        reported.discard(key)
+        raise
+    except Exception as exc:  # pragma: no cover - 上报失败唔阻确认
+        # 上报失败唔好永久丢:清 key,後續輪再偵測到會補報
+        # (server 幂等,重複 POST 唔會造成重複爆閃)。
+        reported.discard(key)
+        print(f"[whatsapp] report failed, will retry on next signal: {exc!r}{tag}", flush=True)
+
+
+# ---- W4-T2 意向事实账本(2026-09-19,挂断评估):快照与评估纯函数,离线单测直连 ----
+# verdict 键字面量与 flow.py 常量同源(CONFIRM="confirm" 等);刻意用字面量保持纯
+# 函数零依赖——flow 常量若改名,tests/test_intent_agent.py 快照矩阵会红。
+_VERDICT_FACT_KEYS = {
+    "repeat": "repeat_count",
+    "refuse": "refuse_count",
+    "objection": "objection_count",
+    "confirm": "confirm_count",
+    "question": "question_count",
+}
+
+
+def _intent_facts_snapshot(
+    ledger: dict, wa_captured: bool, *, duration_s: int, step_max: int
+) -> dict:
+    """内存账本 → INTENT_FACTS 12 键快照(intent_rules.eval_intent_rules 输入)。
+
+    缺键一律归零/False——旧账本形状(未来加键)回放时保守不命中,绝不含糊。
+    """
+    counts = ledger.get("verdict_counts") or {}
+    snap: dict = {
+        "duration_s": int(duration_s),
+        "nudge_fired": int(ledger.get("nudge_fired") or 0),
+        "watchdog_fired": int(ledger.get("watchdog_fired") or 0),
+        "storm_rounds": int(ledger.get("storm_rounds") or 0),
+        "step_max": int(step_max),
+        "wa_captured": bool(wa_captured),
+        "graph_notifies": int(ledger.get("graph_notifies") or 0),
+    }
+    for verdict_name, fact_key in _VERDICT_FACT_KEYS.items():
+        snap[fact_key] = int(counts.get(verdict_name) or 0)
+    return snap
+
+
+def evaluate_intent_disposition(
+    facts: dict, rules: list, default_disposition: str
+) -> tuple[str, str]:
+    """挂断快照 × 规则集 → (final_disposition, intent_code)。
+
+    kill-switch BOK_INTENT_RULES=0 或无命中 → (default_disposition, "")——四个
+    既有收线调用点(REFUSE/FAREWELL/心跳/时长 fuse)未命中时逐字节同旧行为;
+    命中 → 规则 disposition 非空才覆盖,intent_code 恒带(规则只打码不覆盖时
+    disposition 仍走原值)。坏规则行由 eval_intent_rules 内部跳过。
+    """
+    if os.environ.get("BOK_INTENT_RULES", "1") != "1":
+        return default_disposition, ""
+    hit = eval_intent_rules(facts, rules or [])
+    if hit is None:
+        return default_disposition, ""
+    disposition = str(hit.get("disposition") or "") or default_disposition
+    return disposition, str(hit.get("intent_code") or "")
+
+
+async def _report_notify_once(
+    cp, call_id: str, binding_id: str, fired: set, facts: dict, *, where: str = ""
+) -> None:
+    """notify_human 打铃上报一次;失败或被取消都回滚 `fired` 键(照
+    _report_whatsapp_once 回滚语义,AGENTS.md ⑦)。
+
+    打铃不抢话:上报入队成功才烧 once + 记账 graph_notifies;CancelledError 是
+    BaseException,`except Exception` 接不住——teardown 掐杀在途请求时若无独立
+    捕获回滚,绑定被永久占用=这个求助信号永远不再补报。server 幂等(done 不降级
+    notified),重複 POST 唔會重複打鈴。
+    """
+    tag = f" (call {where})" if where else ""
+    try:
+        await cp.report_assist(call_id, status="notified", source="intent")
+    except asyncio.CancelledError:
+        fired.discard(binding_id)
+        raise
+    except Exception as exc:  # pragma: no cover - 上报失败唔阻通话
+        fired.discard(binding_id)
+        print(f"[flow-graph] notify report failed, will retry on next signal: {exc!r}{tag}", flush=True)
+        return
+    fired.add(binding_id)
+    facts["graph_notifies"] = int(facts.get("graph_notifies") or 0) + 1
 
 
 def _wa_accum_merge(stashed: str, incoming: str) -> str:
@@ -1268,6 +1420,37 @@ _MINIMAX_LOCAL_VOICES = frozenset(
 _MINIMAX_LOCAL_VOICE_PREFIXES = ("agent-", "acceptance-")
 
 
+_QA_PLAYED_CAP = 64
+
+
+def _qa_note_played(played: list[str], entry_id) -> None:
+    """轮换账本记账(Phase 3.2 spec §2,就地改):真播出后才调(调用点在快路
+    出声后,与 graph_fired 同纪律)。容量 `_QA_PLAYED_CAP` 截断——单通几百轮时
+    账本无界,而轮换只需「本通最少播放」的相对计数(64 远超任何簇规模)。
+    """
+    played.append(str(entry_id or ""))
+    if len(played) > _QA_PLAYED_CAP:
+        del played[0]
+
+
+def _qa_rotation_plan(entry: dict, members: list[dict], played: list[str]) -> list[dict]:
+    """QA 快路出场序(Phase 3.2,纯函数)。
+
+    多成员簇 → 轮换序(本通最少播放先,平则插入序),反复取 pick_rotation_member
+    = 与接口同一序源(防两处排序逻辑漂移);调用方沿序下移跳过无 PCM 的成员。
+    无簇/单成员(= kill-switch 档调用点传 [])/孤儿 → `[entry]` 逐字节原路。
+    """
+    if len(members) <= 1:
+        return [entry]
+    remaining = list(members)
+    order: list[dict] = []
+    while remaining:
+        picked = pick_rotation_member(remaining, played)
+        order.append(picked)
+        remaining.remove(picked)
+    return order
+
+
 def _filter_cloud_voice_map(raw_map: dict) -> dict:
     """丢掉空值与本地 Qwen3 音色，云端引擎只收云端音色 ID。"""
     voice_map: dict = {}
@@ -1377,8 +1560,9 @@ def _language_boost_for(call_lang: str) -> str:
 
 
 def _apply_minimax_language_boost(call_lang: str) -> str:
-    """MiniMaxTTS 只从 env 读 boost（`_language_boost()` per-request 透传），
-    构造函数无 boost 参数——A 线在构造 provider 前把本通语言写入进程 env。
+    """MiniMaxTTS 的 boost 读取顺序=构造参数 > env（`_language_boost()` per-request
+    解析；B 线经构造参数逐会话下发，唔写 env）。A 线构造处无逐会话参数可传，沿用
+    env 注入把本通语言写入进程 env。
 
     部署覆盖优先：env 里已有 MINIMAX_LANGUAGE_BOOST（部署显式预设，含空串=
     有意禁用 boost）→ 本函数不动它，按通话语言注入仅在 env 缺失时发生。
@@ -1804,6 +1988,17 @@ async def entrypoint(ctx):
     # 本通已捕获过号码(captured/captured_implicit 任一):之後 WhatsApp 步嘅純短應承
     # 唔再判 offered(確認輪鎖死→逐字重複根因,detect_whatsapp_signal 文檔)。
     _wa_captured: dict = {"on": False}
+    # W4-T2 意向事实账本(2026-09-19):逐埋点累加(nudge/watchdog/storm/verdict/
+    # graph notify),挂断时 _intent_facts_snapshot 快照评估意向规则——verdict 计数
+    # 只在 agent 内存账本(方案 A),/end 带 intent_code+disposition 覆盖。
+    _facts: dict = {
+        "nudge_fired": 0,
+        "watchdog_fired": 0,
+        "storm_rounds": 0,
+        "graph_notifies": 0,
+        "verdict_counts": {},
+        "t_start_wall": time.time(),  # 挂断时长=wall-clock 差(duration_s)
+    }
     # WA 号码碎片累积:客户逐位/逐段报号时暂存半截句(见 on_user_turn_completed
     # 内 _WA_ACCUM 注释)。text=暂存拼接,ts=最后一段时刻,task=超时 flush 任务。
     _wa_accum: dict = {"text": "", "ts": 0.0, "task": None}
@@ -1967,6 +2162,8 @@ async def entrypoint(ctx):
         await asyncio.sleep(delay)
         if closed.is_set() or agent.paused or _watchdog["disarmed"]:
             return
+        # W4-T2 意向账本:真触发才计数(拆弹/未武装不计)——「哑轮频发」信号。
+        _facts["watchdog_fired"] += 1
         print(
             f"[watchdog] no assistant audio {_response_watchdog_s():.0f}s after commit "
             f"-> force-interrupt + ack (call {room_name})",
@@ -2006,7 +2203,10 @@ async def entrypoint(ctx):
         ext = _response_watchdog_filler_ext_s() if extra_s is None else extra_s
         _watchdog_extend(
             _watchdog,
-            lambda d: asyncio.create_task(_watchdog_fire(d)),
+            # lambda 产物被 _watchdog_extend 内 state["task"] = spawn(...) 强引用
+            # 持有(重武装取消旧 timer 同款),非 detach——扫描器看不见下游赋值,
+            # 靠行尾标记豁免。
+            lambda d: asyncio.create_task(_watchdog_fire(d)),  # FIRE_FORGET_EXEMPT: 结果被 state["task"] 持有
             ext,
             time.monotonic(),
         )
@@ -2016,6 +2216,11 @@ async def entrypoint(ctx):
     # judge 路由字段账本(漏斗 v2,spec §3.2):最近一次 judge 的 route/conf。
     # 只写入不消费(Task 4 工具层/升级器接线);BOK_ROUTE_JUDGE=0 时保持初值。
     _judge_route: dict = {"route": "keep", "conf": 0.0, "step": -1}
+    # 3.4 意图判据 judge 账本:on=背景批量判定在途(单飞,防同一模糊轮连开);
+    # pending=已判定命中、等下一次图引擎求值消费(single-shot:消费即清,唔理绑定
+    # 真触发与否——消费点 pick 会重过全部守卫,过期就打 judge_pending_expired)。
+    _gjudge_inflight: dict = {"on": False}
+    _gjudge_pending: dict = {"intent": ""}
     # 沉默心跳:AI 講完話客戶耐冇出聲 → 主動確認「仲喺度嗎」並帶返當前步。
     # count 會喺客戶真開口(on_user_turn_completed)時歸零。last_user_ts/last_reply_ts
     # 記錄「客戶最後開聲」與「AI 最後講完」時刻(秒),心跳只在兩者都足夠舊先開火
@@ -2580,16 +2785,32 @@ async def entrypoint(ctx):
     # 空表 → 闸门整体惰性(零行为变化);命中还需应答音频已在本地缓存,
     # 未物化的条目自动视为未命中走 LLM(闸门绝不触发云合成)。
     _qa_index = None
+    # 索引构建面=快路开 **或** 图里有启用嘅 play_qa 绑定(I1,2026-09-18):kill-switch
+    # BOK_QA_FASTPATH=0 只关轮级兜底,唔可以连图嘅罐头播放一齐静默掐死(图有自己嘅
+    # 开关 BOK_FLOW_GRAPH,两闸各管各的);无 TTS 缓存两条路都播唔出声,照关。
+    _qa_fastpath_on = qa_fastpath_enabled()
+    _graph_qa_bindings = any(
+        b.enabled and b.action == ACTION_PLAY_QA for b in flow_ctrl.graph.bindings
+    )
     # disabled 打点(task-9):快路整体关闭(env 关/无 TTS 缓存/空表/装配失败)每通
     # 记一次——放装配点不放轮级,轮级会重复计。
-    if qa_fastpath_enabled() and _tts_cache is not None:
+    if _tts_cache is not None and (_qa_fastpath_on or _graph_qa_bindings):
         try:
             _qa_rows = await cp.list_qa_entries(account_id=_ctx_account, owner_scope=_ctx_qa_owner)
             if _qa_rows:
                 from .qa_gate import QaIndex
 
                 _qa_index = QaIndex(_qa_rows)
-                print(f"[agent] qa fastpath on entries={len(_qa_rows)} (call {room_name})", flush=True)
+                if _qa_fastpath_on:
+                    print(f"[agent] qa fastpath on entries={len(_qa_rows)} (call {room_name})", flush=True)
+                else:
+                    # 只为图建的索引:运维一眼睇出「快路关咗、图仍可播罐头」;快路
+                    # 口径照记 disabled(该计数器语义=快路本轮不可用,env 关恒成立)。
+                    _qa_bump("disabled")
+                    print(
+                        f"[agent] QA_INDEX built_for=graph entries={len(_qa_rows)} (call {room_name})",
+                        flush=True,
+                    )
             else:
                 _qa_bump("disabled")  # 空表:闸门整体惰性,等同关闭
         except Exception as exc:  # noqa: BLE001 - 快答库不可用零影响
@@ -2597,6 +2818,16 @@ async def entrypoint(ctx):
             print(f"[agent] qa fastpath load failed: {exc!r} (call {room_name})", flush=True)
     else:
         _qa_bump("disabled")  # env 关/无 TTS 缓存:无应答音频可播,快路整体关闭
+    # 意向规则(W4-T2):装配拉一次(两级行合并由 CP 出仓),挂断时评估 disposition
+    # 覆盖+intent_code。拉取失败/空表 → 挂断走原 disposition(零行为变化);
+    # BOK_INTENT_RULES=0 整闸关(评估与拉取都不跑)。
+    _intent_rules: list = []
+    if os.environ.get("BOK_INTENT_RULES", "1") == "1":
+        try:
+            _intent_rules = await cp.list_intent_rules(account_id=_ctx_account)
+        except Exception as exc:  # noqa: BLE001 - 规则库不可用零影响
+            _intent_rules = []
+            print(f"[agent] intent rules load failed: {exc!r} (call {room_name})", flush=True)
     # 会话首轮真实前缀预热（LLM_PREFIX_PREWARM，默认 1）——触发点在开场白之后
     # （见下方 greeting 块），这里只定義任务体。
     if _prefix_prewarm_enabled() and isinstance(_raw_llm, MlxLlmLLM) and instructions:
@@ -2939,27 +3170,48 @@ async def entrypoint(ctx):
     # 明确拒绝收尾:礼貌告别讲完(一句 TTS+余量)后主动结束通话——
     # end_call 置 ENDED 并断房,结算由 _on_close 幂等触发。
     # disposition: declined=客户拒绝 / no_response=静音收线(心跳两次无回应)。
-    _end_scheduled = {"on": False, "fired": False, "disposition": "declined"}
+    # intent_code=W4 意向规则命中码(空=未命中,请求 URL 与旧版逐字节相同)。
+    _end_scheduled = {"on": False, "fired": False, "disposition": "declined", "intent_code": ""}
 
     async def _fire_end_call(disposition: str) -> None:
         # 幂等:delayed task 与 shutdown 回调两边都可能触发,只放行第一发。
         if _end_scheduled["fired"]:
             return
         _end_scheduled["fired"] = True
-        await cp.end_call(call_id, disposition=disposition)
+        await cp.end_call(
+            call_id,
+            disposition=disposition,
+            intent_code=str(_end_scheduled.get("intent_code") or ""),
+        )
         print(f"[flow] call ended by agent ({disposition}) (call {room_name})", flush=True)
 
     def _schedule_call_end(delay: float = 14.0, disposition: str = "declined") -> None:
         if _end_scheduled["on"]:
             return
         _end_scheduled["on"] = True
-        _end_scheduled["disposition"] = disposition
+        # W4-T2 挂断意向评估:账本快照 × 规则集 → 规则命中才覆盖 disposition/带
+        # intent_code;未命中=(原 disposition, "")——REFUSE/FAREWELL/心跳/时长
+        # fuse 四调用点零语义变化。时长=挂断时 wall-clock 差。
+        _t_now = time.time()
+        _facts_snap = _intent_facts_snapshot(
+            _facts,
+            wa_captured=bool(_wa_captured["on"]),
+            duration_s=int(_t_now - float(_facts.get("t_start_wall") or _t_now)),
+            step_max=int(flow_ctrl.current or 0) + 1,
+        )
+        _final_disp, _intent_code = evaluate_intent_disposition(
+            _facts_snap, _intent_rules, disposition
+        )
+        _end_scheduled["disposition"] = _final_disp
+        _end_scheduled["intent_code"] = _intent_code
 
         async def _end():
             try:
                 await asyncio.sleep(delay)
-                await _fire_end_call(disposition)
-                print(f"[flow] delayed end task done ({disposition}) (call {room_name})", flush=True)
+                # 用账面 final disposition(规则覆盖后),唔用闭包原值——
+                # 二者仅在规则命中时不同,未命中逐字节同旧。
+                await _fire_end_call(_end_scheduled["disposition"])
+                print(f"[flow] delayed end task done ({_end_scheduled['disposition']}) (call {room_name})", flush=True)
             except Exception as exc:  # pragma: no cover - 已结束/断房失败都不致命
                 print(f"[flow] end_call skipped: {exc!r} (call {room_name})", flush=True)
 
@@ -3136,6 +3388,104 @@ async def entrypoint(ctx):
         finally:
             _judge_inflight["step"] = -1
 
+    async def _background_intent_judge(step_at: int, utt: str, candidates: list[FlowIntent]) -> None:
+        """3.4 意图判据:背景一次批量评估全部候选意图(让路 delay → FLOW_JUDGE_* 9B 专线)。
+
+        形态复用 `_background_flow_judge`:判定唔喺开声前同步等(每轮拖慢),命中只落
+        `_gjudge_pending`,**下一轮图引擎求值时先生效**。候选快照喺调度时算好(scoped+
+        有可触发绑定),本任务唔再重算资格(单次调用=一次 LLM call,绝不 N 次)。
+        """
+        try:
+            # 让路节流同 flow judge:主回复刚提交,先等一拍再跑判定(同一 env 旋钮)。
+            await asyncio.sleep(float(os.environ.get("FLOW_JUDGE_DELAY", "3")))
+            from .flow import build_intent_judge_messages, parse_intent_judge_output
+
+            # 判定专线解析与 _background_flow_judge 逐字同源(FLOW_JUDGE_* → llm 卡 → MLX)。
+            jbase = (
+                os.environ.get("FLOW_JUDGE_LLM_BASE_URL", "").strip()
+                or (llm_cfg.get("base_url") or "")
+                or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1")
+            ).rstrip("/")
+            jmodel = (
+                os.environ.get("FLOW_JUDGE_LLM_MODEL", "").strip()
+                or llm_cfg.get("model")
+                or os.environ.get("MLX_LLM_MODEL", "")
+            )
+            if not jbase or not jmodel:
+                # review N11:endpoint 缺席静默 return 会让 judge_scheduled 后无下文
+                # (日志面断裂,排查会以为任务丢咗)——补 skipped 打点。
+                print(
+                    f"FLOW_GRAPH judge_skipped reason=no_endpoint (call {room_name})",
+                    flush=True,
+                )
+                return
+            _gjgoal, _gjref = flow_ctrl.current_goal_ref()
+            msgs = build_intent_judge_messages(
+                intents=[
+                    {"id": i.id, "label": i.label, "prompt": i.judge_prompt}
+                    for i in candidates
+                ],
+                user_text=utt,
+                step_1based=step_at + 1,
+                goal=_gjgoal or _gjref,
+            )
+            # max_tokens=32:intent id 长过 8 token,唔够会截到半个 id(判定返空)。
+            # timeout=20(review N9):非流式总预算,9B 判据集 prefill ~0.6k tok/s 档,
+            # 中型候选集(4-7k tok)5s 必超时=静默永久 miss;背景任务延迟不敏感
+            # (3s 让路 delay 都喺度),放宽到 20s 换「中型判据集可用」。
+            _gjtext = await _llm_judge(jbase, jmodel, msgs, max_tokens=32, timeout=20.0)
+            _gjhit = parse_intent_judge_output(_gjtext, [i.id for i in candidates])
+            # store 守卫(与 flow judge 换步守卫同源):判定期间已换步/暂停/收线/开关
+            # 被关 → 迟到的命中唔准注入(下一轮已唔同语境,注入=错步触发)。closing
+            # 也拦:收线后图引擎整块旁路,pending 永无消费点(结构性泄漏)。
+            if not _gjhit:
+                print(f"FLOW_GRAPH judge_miss step={step_at + 1} (call {room_name})", flush=True)
+            elif (
+                flow_ctrl.current != step_at
+                or agent.paused
+                or flow_ctrl.closing
+                or os.environ.get("BOK_FLOW_GRAPH_JUDGE", "1") != "1"
+            ):
+                print(
+                    f"FLOW_GRAPH judge_skipped reason=stale (call {room_name})",
+                    flush=True,
+                )
+            else:
+                _gjudge_pending["intent"] = _gjhit
+                print(
+                    f"FLOW_GRAPH judge_hit intent={_gjhit} step={step_at + 1} (call {room_name})",
+                    flush=True,
+                )
+        except Exception as exc:  # pragma: no cover - 背景判定失败唔影响回复
+            print(f"FLOW_GRAPH judge failed: {exc!r} (call {room_name})", flush=True)
+        finally:
+            _gjudge_inflight["on"] = False
+
+    def _maybe_schedule_intent_judge(utt: str) -> None:
+        """3.4 意图判据调度门(关键词未中时唯一入口)。
+
+        门控全在模块级 `_intent_judge_candidates`(便于单测);此处只做装配:拿到
+        非空候选才置在途标志+起任务+打点。**零回归保证**:冇任何意图带判断时候选
+        恒空 → 零任务、零专线调用、零日志(功能随数据 opt-in)。
+        """
+        candidates = _intent_judge_candidates(
+            flow_ctrl.graph,
+            step_1based=int(flow_ctrl.current) + 1,
+            fired=flow_ctrl.graph_fired,
+            closing=flow_ctrl.closing,
+            inflight=bool(_gjudge_inflight["on"]),
+            pending=bool(_gjudge_pending.get("intent")),
+        )
+        if not candidates:
+            return
+        _gjudge_inflight["on"] = True
+        # 池化(同 _background_flow_judge):强引用防 GC 中途回收,失败走 REPORT_TASK_ERR。
+        _spawn_report(_background_intent_judge(flow_ctrl.current, utt, candidates))
+        print(
+            f"FLOW_GRAPH judge_scheduled intents={len(candidates)} step={flow_ctrl.current + 1}",
+            flush=True,
+        )
+
     class PausableAgent(Agent):
         """可被主管台暂停/接管/恢复的 Agent：暂停期间抑制自动回复，但保留转写与历史。
 
@@ -3295,6 +3645,7 @@ async def entrypoint(ctx):
                     # 唔 raise——落穿回正常轮路径,本轮客户开口先拿真回复。
                 else:
                     _cancel_response_watchdog()  # 风暴静听=有意静默/短承接即出声
+                    _facts["storm_rounds"] += 1  # W4-T2 意向账本:静听轮消费(ack/listen 均)
                     _sm_rounds = int(_storm.get("rounds", 0))
                     if _verdict == "ack":
                         _ack = _starve_ack_line(language_state.lang)
@@ -3495,23 +3846,17 @@ async def entrypoint(ctx):
                         if _key not in _wa_reported:
                             _wa_reported.add(_key)
 
-                            async def _report():
-                                try:
-                                    await cp.report_whatsapp(call_id, _num, channel=_wa_ch)
-                                except asyncio.CancelledError:
-                                    # teardown 掐杀不走 except Exception——key 留池=该
-                                    # 捕获永不补报(2026-09-17 全量 debug F4)。回滚后重抛。
-                                    _wa_reported.discard(_key)
-                                    raise
-                                except Exception as exc:  # pragma: no cover
-                                    # 上报失败唔好永久丢:清 key,後續輪再偵測到會補報
-                                    # (server 幂等,重複 POST 唔會造成重複爆閃)。
-                                    _wa_reported.discard(_key)
-                                    print(f"[whatsapp] report failed, will retry on next signal: {exc!r} (call {room_name})", flush=True)
-
                             # 入池持引用:裸 create_task 会被 job teardown 杀掉且无 flush
-                            # 窗口(同 _spawn_report 注释)。
-                            _spawn_report(_report())
+                            # 窗口(同 _spawn_report 注释)。上报体抽成模块级
+                            # _report_whatsapp_once:失败/被取消都回滚 _wa_reported 键
+                            # (CancelledError 是 BaseException,except Exception 接不住),
+                            # 语义离线单测钉死(tests/test_fire_forget_pool.py)。
+                            _spawn_report(
+                                _report_whatsapp_once(
+                                    cp, call_id, _num, _wa_ch, _wa_reported, _key,
+                                    where=room_name,
+                                )
+                            )
                             if _kind == "captured_implicit" or (_num and _num != "offered"):
                                 context_state.set_whatsapp_note(_num)
                             print(f"[whatsapp] {_kind} num={_num or '-'} (call {room_name})", flush=True)
@@ -3540,6 +3885,9 @@ async def entrypoint(ctx):
                     # verdict 进尾部:规则判定结果此前只用于推进、从不进提示词,
                     # 客户提问/答非所问时模型冇「该怎么答」指引 → 复读当前步。
                     flow_ctrl.last_verdict = verdict
+                    # W4-T2 意向账本:verdict 计数只进内存账本,挂断时评估规则。
+                    if verdict:
+                        _facts["verdict_counts"][verdict] = int(_facts["verdict_counts"].get(verdict, 0)) + 1
                     # 客户原话进尾部账本:渐进披露按 verdict+原话命中单分支
                     # (只给 verdict 时「问为什么赔/问什么时候到」同族分不开)。
                     flow_ctrl.last_user_text = user_text
@@ -3778,11 +4126,211 @@ async def entrypoint(ctx):
                 _cancel_response_watchdog()  # 直念步即出声
                 await _say_script(session, tts_provider, _tts_cache, _say_now, emotion=_say_emo)
                 raise StopResponse()
+            # ---- 罐头播放共用件(2026-09-18 话术图 Phase 2):QA 快路与
+            # graph play_qa 同一条出口,抽自 QA 快路原位(行为逐字节不变)。
+            def _qa_pcm_for(text: str) -> bytes | None:
+                voice = getattr(tts_provider, "resolved_voice", lambda: "")()
+                model = getattr(tts_provider, "resolved_model", lambda: "")()
+                if not text or _tts_cache is None:
+                    return None
+                return _tts_cache.lookup(
+                    text, voice=voice, model=model,
+                    speed=getattr(tts_provider, "resolved_speed", lambda: 1.0)(),
+                )
+
+            async def _qa_canned_say(entry: dict, pcm, *, provider: str) -> bool:
+                answer = str(entry.get("answer_text") or "").strip()
+                try:
+                    await session.interrupt()  # ① 作废停着的抢跑快照(幻影账本条目下轮 rebase 自愈)
+                except Exception:  # noqa: BLE001
+                    pass
+                # ② 手动补 user 轮(StopResponse 轮 item_added 唔会触发;
+                # C5 官方姿势:旧 chat_ctx.items.append 打只读上下文恒失败)
+                await self._try_append_user_message(new_message)
+                # ③ 回声守卫预锚(正常 playout 完才置,快路要立即生效)
+                context_state.set_last_reply(answer)
+                _turn_origin["gen"] = "qa_fastpath"
+                _turn_origin["provider"] = provider
+                # ④ 落库 user 轮(paused 分支同款手动补轮);assistant 轮由 say() 的
+                # item_added 统一上报——勿再直报(旧 ④ 直报+item_added 双报同文两行)。
+                try:
+                    _step = (int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0
+                    _now = int((time.monotonic() - _t0) * 1000)
+                    await cp.add_turn(
+                        call_id, "user", user_text, language=language_state.lang,
+                        line="a", speaker="customer",
+                        template_step=_step, started_ms=_now, ended_ms=_now,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                # 池化(2026-09-17 全量 debug P2-A):命中计数指标位,
+                # 强引用防 GC 丢任务(裸 create_task 会被回收)。
+                _spawn_report(cp.qa_hit(str(entry.get("id") or "")))
+                # ⑤ 快路不经 tts_provider,首音频回调唔会拆看门狗——显式拆
+                _cancel_response_watchdog()
+                await session.say(
+                    answer, audio=frames_aiter(pcm_to_frames(pcm, _tts_cache.sample_rate))
+                )
+                return True
+
+            # ---- 话术图引擎(spec 2026-09-18;插在 say 直念步之后、QA 快路之前,
+            # precedence: REFUSE>DEFER>say>graph[notify/jump/play]>QA 快路;BOK_FLOW_GRAPH=0 整闸,
+            # 空图零成本零变化;closing 后收线优先——REFUSE 分支已置 closing 且
+            # 唔 raise,图唔可以抢走告别轮(与 QA 快路 closing 旁路同源)----
+            _gbinding = None
+            if (
+                os.environ.get("BOK_FLOW_GRAPH", "1") == "1"
+                and flow_ctrl.graph.intents
+                and not flow_ctrl.closing
+                and user_text
+            ):
+                # 3.4 意图 judge 消费点:上一轮背景判定的命中在此**先取即清**
+                # (single-shot TTL——无论绑定最终是否真触发都算消费掉;pick 内对
+                # 该 id 重过 enabled/步 scope/绑定资格全部守卫,判据唔豁免任何闸)。
+                _gjudge_hit = _gjudge_pending.get("intent", "")
+                if _gjudge_hit:
+                    _gjudge_pending["intent"] = ""
+                _gbinding = pick_graph_action(
+                    flow_ctrl.graph,
+                    user_text,
+                    step_1based=(int(flow_ctrl.current) + 1),
+                    fired=flow_ctrl.graph_fired,
+                    # kill-switch 消费位配对(review F5):=0 时 pending 照清(TTL 唔悬挂)
+                    # 但唔再喂 judge_hit——中程翻闸唔会有「store 关了 consume 还在开」的半开态。
+                    judge_hit=(
+                        _gjudge_hit
+                        if _gjudge_hit
+                        and os.environ.get("BOK_FLOW_GRAPH_JUDGE", "1") == "1"
+                        else None
+                    ),
+                )
+                if _gjudge_hit:
+                    if _gbinding is not None:
+                        print(
+                            f"FLOW_GRAPH judge_pending_fired binding={_gbinding.id} "
+                            f"step={flow_ctrl.current + 1}",
+                            flush=True,
+                        )
+                    else:
+                        # 无资格绑定/意图已禁/已出 scope/once 已烧 → 作废(唔重试:
+                        # 判据判定结果只对当时语境有效,下一轮重新判)。
+                        print(
+                            f"FLOW_GRAPH judge_pending_expired intent={_gjudge_hit}",
+                            flush=True,
+                        )
+            if _gbinding is not None:
+                if _gbinding.action == "jump_step":
+                    # 1-based 存储转 0-based;先跳、按**实际位移**记账(2026-09-18
+                    # review R1):jump_to 内部还会 no-op(无步骤/done 钳制),未位移
+                    # 就唔可以烧 once 绑定/宣告 provider/打 jump 日志(spec §4.3 防环)。
+                    _gtarget = int(_gbinding.step or 1) - 1
+                    _gcur = flow_ctrl.current
+                    flow_ctrl.jump_to(_gtarget)
+                    if flow_ctrl.current != _gcur:
+                        flow_ctrl.graph_fired.add(_gbinding.id)
+                        _invalidate_stale_preemptive(
+                            f"流程跳转 → 第 {flow_ctrl.current + 1} 步"
+                        )
+                        context_state.set_flow_current(flow_ctrl.current_step_text())
+                        # 跳步轮强制 advanced=True → QA 快路让位(spec precedence graph>QA):
+                        # 同轮规则推进+图后退跳可令净位移为零,不置哨兵快路会照抢本轮。
+                        _flow_step_before = -1
+                        print(
+                            f"FLOW_GRAPH jump binding={_gbinding.id} "
+                            f"step={flow_ctrl.current + 1}",
+                            flush=True,
+                        )
+                        # 本轮继续回答(新步指引);provider 标记 assistant 轮
+                        _turn_origin["provider"] = "graph-jump"
+                    else:
+                        print(
+                            f"FLOW_GRAPH jump_noop binding={_gbinding.id} "
+                            f"step={_gtarget + 1}",
+                            flush=True,
+                        )
+                elif _gbinding.action == ACTION_NOTIFY_HUMAN:
+                    # W4-T2 notify_human 第三臂:打铃不抢话——CP assist 置 notified
+                    # (坐席台见「人工求助」),本轮 LLM 照常兜话,坐席旁听后手动接管;
+                    # **不 raise StopResponse**(jump 同构先例),落回后续 LLM 生成。
+                    # 上报 fire-and-forget,入队成功才烧 once/记 graph_notifies
+                    # (失败回滚 once,下一轮信号补报——_report_notify_once 文档)。
+                    _invalidate_stale_preemptive("人工协助已通知")
+                    print(f"FLOW_GRAPH notify binding={_gbinding.id}", flush=True)
+                    # provider 标记 assistant 轮(本轮仍由 LLM 生成,item_added 落库)
+                    _turn_origin["provider"] = "graph-notify"
+                    _spawn_report(
+                        _report_notify_once(
+                            cp, call_id, _gbinding.id, flow_ctrl.graph_fired, _facts,
+                            where=room_name,
+                        )
+                    )
+                else:  # play_qa:条目在场且音频已物化才播;miss 放行 LLM 不消耗 once
+                    _ge = (
+                        _qa_index.by_id(_gbinding.qa_id)
+                        if _qa_index is not None and _gbinding.qa_id
+                        else None
+                    )
+                    _gp = _qa_pcm_for(str((_ge or {}).get("answer_text") or ""))
+                    if (
+                        _ge is not None
+                        and _gp is not None
+                        and await _qa_canned_say(_ge, _gp, provider="graph-play")
+                    ):
+                        flow_ctrl.graph_fired.add(_gbinding.id)
+                        print(
+                            f"FLOW_GRAPH play binding={_gbinding.id} "
+                            f"qa={_gbinding.qa_id}",
+                            flush=True,
+                        )
+                        # ---- 追问链（Phase 3.3，spec §3）：罐头播完当场同步跳，下一轮
+                        # 按新步走。本分支以 StopResponse 收尾，冇任何 LLM 请求——唔喺本
+                        # 分支渲染当前步（渲染只会烧掉该步首渲染账本 _last_render_step/
+                        # _just_advanced，令下一轮流程块重渲染退成分支模式，底稿与
+                        # 【跳转进入】结构性失落）；位移状态已由 jump_to 置好，下一轮流程块
+                        # 首渲染即该步正稿+【跳转进入】，且真被请求消费。复用 Phase 2 位移
+                        # 记账纪律：实际位移才打 jump 日志；同位/closing/钳到同位 → jump_noop
+                        # 且零额外消耗（then_jump 是同一绑定的动作后缀，不另立 once 账本条目）。
+                        # 注：_invalidate_stale_preemptive 的标记随本轮 turn_ctx 副本蒸发
+                        # （承重件是 jump_to 置的位移状态）；照 spec 调用，零成本。
+                        # 0/False 为静默 no-op（T1 parse 丢 bool/拒 0——未来若扩「0=跳回首步」语义勿沿用真值门）。
+                        if _gbinding.then_jump:
+                            _tj_target = int(_gbinding.then_jump) - 1
+                            if flow_ctrl.apply_then_jump(_gbinding.then_jump):
+                                _invalidate_stale_preemptive(
+                                    f"流程跳转 → 第 {flow_ctrl.current + 1} 步"
+                                )
+                                print(
+                                    f"FLOW_GRAPH jump binding={_gbinding.id} "
+                                    f"step={flow_ctrl.current + 1} via=then_jump",
+                                    flush=True,
+                                )
+                            else:
+                                print(
+                                    f"FLOW_GRAPH jump_noop binding={_gbinding.id} "
+                                    f"step={_tj_target + 1} via=then_jump",
+                                    flush=True,
+                                )
+                        raise StopResponse()  # 压掉本轮 LLM(WA 累积同款)
+                    print(
+                        f"FLOW_GRAPH play_miss binding={_gbinding.id} "
+                        f"qa={_gbinding.qa_id}",
+                        flush=True,
+                    )
+            elif user_text:
+                # 关键词未中才让判据判定补位——确定性关键词恒同步先行,judge 只做兜底
+                # (spec §4)。**elif 钉死在图块真求值过的分支**(review F1:旧 else 与
+                # 图块平级,空转写轮 user_text 为空令图块整体跳过时仍会漏进调度——
+                # 白烧一次 9B 之外,挂上的 pending 喺下一轮无话语支撑地触发绑定;
+                # say/收线/图关各路径 `_intent_judge_candidates` 门已覆盖,唯
+                # user_text 唔喺门参数里,这里结构上补死)。
+                _maybe_schedule_intent_judge(user_text)
             # ---- Q→A 检索快路(PR-3):四道闸全过 + 应答音频已预生成才命中 ----
             # 命中 → 跳过 LLM 直接播缓存音频(~50ms);任一闸不过 → 照旧走 LLM。
             # 位置在流程推进块之后:推进/收尾判定已落定,闸门让位(refuse/closing/
             # advanced 全部旁路);又在 paused 检查之前:与手动补 user 轮同姿势。
-            if _qa_index is not None and _tts_cache is not None:
+            # 门闸显式带 _qa_fastpath_on(I1):索引可能只为图建(I1),kill-switch
+            # 关时唔可以经呢条路复活轮级快路。
+            if _qa_fastpath_on and _qa_index is not None and _tts_cache is not None:
                 from .flow import _looks_like_whatsapp_step as _llws
 
                 try:
@@ -3817,57 +4365,46 @@ async def entrypoint(ctx):
                     # 由 format_qa_summary 求差)。
                     _qa_bump("match0" if _qa_entry is None else "hit")
                     if _qa_entry is not None:
-                        _qa_answer = str(_qa_entry.get("answer_text") or "").strip()
-                        _qa_voice = getattr(tts_provider, "resolved_voice", lambda: "")()
-                        _qa_model = getattr(tts_provider, "resolved_model", lambda: "")()
-                        _qa_pcm = (
-                            _tts_cache.lookup(
-                                _qa_answer, voice=_qa_voice, model=_qa_model,
-                                speed=getattr(tts_provider, "resolved_speed", lambda: 1.0)(),
+                        # 多答案轮换(Phase 3.2 spec §2):match 胜者已折组到簇内首个
+                        # 幸存成员(按本通 lang/step 过滤,C1)→ 簇内按「本通最少播放」
+                        # 取出场成员,用它自己的 answer/PCM 播(qa_hit 记实际播出嘅
+                        # member id);首员无 PCM 沿轮换序下移,全组无 PCM 才落
+                        # no_audio 走 LLM。无簇/单成员/kill-switch=0 → members 空 →
+                        # _qa_play 恒 [_qa_entry],逐字节原路(台账照记)。
+                        _qa_members = (
+                            _qa_index.cluster_members(
+                                str(_qa_entry.get("id") or ""),
+                                lang=language_state.lang,
+                                step_index=(flow_ctrl.current if flow_ctrl.has_steps else None),
                             )
-                            if _qa_answer
-                            else None
+                            if qa_rotation_enabled()
+                            else []
                         )
-                        if _qa_pcm is not None:
-                            print(f"QA_FASTPATH hit=1 entry={_qa_entry.get('id')} score={_qa_score:.2f}", flush=True)
-                            # ① 作废停着的抢跑快照(其幻影账本条目下轮 rebase 自愈)
-                            try:
-                                await session.interrupt()
-                            except Exception:  # noqa: BLE001
-                                pass
-                            # ② 手动补 user 轮(paused 分支同款):否则记忆/落库收不到这句
-                            # C5:官方姿势(旧 chat_ctx.items.append 打只读上下文恒失败)。
-                            await self._try_append_user_message(new_message)
-                            # ③ 回声守卫预锚(正常要 playout 完才自动置,快路要立即生效)
-                            context_state.set_last_reply(_qa_answer)
-                            # ④ 落库 user 轮(paused 分支同款手动补轮,item_added
-                            # 唔会为 StopResponse 轮触发);assistant 轮由 say() 的
-                            # item_added 统一上报——旧 ④ 直报+item_added 双报同文
-                            # 两行,顺手收编。origin 标记 gen/provider 供账本。
-                            _turn_origin["gen"] = "qa_fastpath"
-                            _turn_origin["provider"] = "qa-fastpath"
-                            try:
-                                _qa_step = (int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0
-                                _qa_now = int((time.monotonic() - _t0) * 1000)
-                                await cp.add_turn(
-                                    call_id, "user", user_text, language=language_state.lang,
-                                    line="a", speaker="customer",
-                                    template_step=_qa_step, started_ms=_qa_now, ended_ms=_qa_now,
-                                )
-                            except Exception:  # noqa: BLE001
-                                pass
-                            # 池化(2026-09-17 全量 debug P2-A):QA 命中计数指标位,
-                            # 强引用防 GC 丢任务。
-                            _spawn_report(cp.qa_hit(str(_qa_entry.get("id") or "")))
-                            # ⑤ 播预生成音频(QA 快路唔经 tts_provider,首音频回调
-                            # 唔会拆看门狗——这里显式拆)
-                            _cancel_response_watchdog()
-                            await session.say(
-                                _qa_answer,
-                                audio=frames_aiter(pcm_to_frames(_qa_pcm, _tts_cache.sample_rate)),
+                        _qa_play = _qa_rotation_plan(_qa_entry, _qa_members, flow_ctrl.qa_played)
+                        _qa_rotating = len(_qa_play) > 1
+                        for _qa_member in _qa_play:
+                            _qa_answer = str(_qa_member.get("answer_text") or "").strip()
+                            _qa_pcm = _qa_pcm_for(_qa_answer)
+                            if _qa_pcm is None:
+                                # 轮换档成员未物化 → 顺位下移下一个;单员档唔打呢行
+                                # (保持无簇配置日志逐字节同旧,no_audio 语义不变)。
+                                if _qa_rotating:
+                                    print(
+                                        f"QA_FASTPATH rotation_skip entry={_qa_member.get('id')} "
+                                        "reason=no_audio",
+                                        flush=True,
+                                    )
+                                continue
+                            print(
+                                f"QA_FASTPATH hit=1 entry={_qa_member.get('id')} "
+                                f"score={_qa_score:.2f}",
+                                flush=True,
                             )
-                            # ⑥ 压掉本轮 LLM(WA 累积同款;必须在 except-pass 之外)
-                            raise StopResponse()
+                            if await _qa_canned_say(_qa_member, _qa_pcm, provider="qa-fastpath"):
+                                # 成功才记账(label 纪律:真播出;容量截断防无界)
+                                _qa_note_played(flow_ctrl.qa_played, _qa_member.get("id"))
+                                raise StopResponse()
+                            break  # 罐头路拒播(非异常径):原语义落 no_audio
                         print(f"QA_FASTPATH hit=0 reason=no_audio entry={_qa_entry.get('id')}", flush=True)
                         _qa_bump("no_audio")
             # (旧 paused 分支已前移为 hook 顶部的 C1 暂停冻结——落库 gen=paused+
@@ -4008,6 +4545,7 @@ async def entrypoint(ctx):
                 _schedule_call_end(12.0, disposition="no_response")
                 return
             _nudge_state["count"] += 1
+            _facts["nudge_fired"] += 1  # W4-T2 意向账本:沉默心跳已发
             print(f"[heartbeat] silent {nudge_delay:.0f}s -> nudge {_nudge_state['count']}/{nudge_max} (call {room_name})", flush=True)
             try:
                 _turn_origin["gen"] = "script"  # 心跳补位=脚本直念

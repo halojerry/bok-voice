@@ -1,15 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Plus } from "lucide-react";
 import { api } from "@/lib/api";
 import { ErrorState, LoadingState } from "@/components/app-shell";
 import CannedAuditionCard from "@/components/canned-audition";
-import DesktopStatus from "@/components/desktop-status";
 import { SETTING_CARDS, POLICY_META, DEFAULT_PROVIDER, type ProviderKind, type FieldMeta } from "@/lib/settings-meta";
-import { previewLangForVoice } from "@/lib/minimax-voices";
+import { buildVoiceSelectOptions, previewSampleText, resolvePreviewLang } from "@/lib/voice-options";
+import { playAudioBlob, previewVoice } from "@/lib/preview";
+import { startRecording, type RecorderHandle } from "@/lib/recorder";
 import {
-  applyOutputDevice,
-  isTauriShell,
   listAudioDevicesOf,
   requestMicPermission,
   savedMicDevice,
@@ -26,7 +26,7 @@ type ProviderForm = Record<string, unknown> & { provider?: string };
 const EMPTY_FORM: Record<ProviderKind, ProviderForm> & { policy: string } & { sip: ProviderForm } = {
   asr: { provider: DEFAULT_PROVIDER.asr, language_mode: "auto", language: "" },
   llm: { provider: DEFAULT_PROVIDER.llm, local_model: "" },
-  tts: { provider: DEFAULT_PROVIDER.tts, voice_mode: "single", speaker: "", sample_rate: 24000 },
+  tts: { provider: DEFAULT_PROVIDER.tts, voice_mode: "single", speaker: "", sample_rate: 24000, minimax_clones_json: "[]" },
   vad: { provider: DEFAULT_PROVIDER.vad, max_buffered_speech: 15, min_speech_duration: 0.15, min_silence_duration: 0.45, sensitivity: 0.75, interruption: true },
   // 外呼（SIP）段：与 business-db default_settings()["sip"] 逐键同形。
   sip: { mode: "mock", trunk_id: "", address: "", auth_username: "", auth_password: "", numbers: [], ringing_timeout_s: 30, max_call_duration_s: 600 },
@@ -43,7 +43,7 @@ function FieldInput({
   onChange: (v: unknown) => void;
 }) {
   const base =
-    "w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)";
+    "w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)";
   if (field.type === "select") {
     const options = field.options ?? [];
     const isBool = options.some((o) => o.value === "true" || o.value === "false");
@@ -103,7 +103,7 @@ function ProviderCard({
       <div className="mt-3 space-y-2">
         <div>
           <select
-            className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+            className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
             value={provider}
             onChange={(e) => onChange({ ...value, provider: e.target.value })}
           >
@@ -116,13 +116,13 @@ function ProviderCard({
           {providerMeta?.hint && <p className="mt-1 text-xs muted">{providerMeta.hint}</p>}
         </div>
         {kind === "llm" && (provider === "local_openai" || provider === "mlx") && value.local_model ? (
-          <p className="rounded-lg bg-white/5 p-2 text-[11px] muted">
+          <p className="rounded-lg bg-muted/60 p-2 text-[11px] muted">
             本地模型切换需<b className="text-(--foreground)">重启本地服务</b>生效（`bok serve` 或点「本机桌面服务」重启）；重启后通话与蒸馏都用所选模型。
           </p>
         ) : null}
         {meta.fields.filter((f) => !f.advanced && (!f.providers || f.providers.includes(provider))).map((field) => (
           <label key={field.key} className="block">
-            <span className="text-xs text-(--stage-muted)">{field.label}</span>
+            <span className="text-xs muted">{field.label}</span>
             <FieldInput field={field} value={value[field.key]} onChange={(v) => onChange({ ...value, [field.key]: v })} />
             {field.hint && <p className="mt-1 text-xs muted">{field.hint}</p>}
             {field.preview && kind === "tts" && (
@@ -132,13 +132,13 @@ function ProviderCard({
         ))}
         {meta.fields.some((f) => f.advanced) && (
           <details className="rounded-lg border border-(--card-border) p-2 text-sm">
-            <summary className="cursor-pointer text-xs muted hover:text-accent">
+            <summary className="cursor-pointer text-xs muted hover:text-(--live)">
               高级（旧按语言分音色，仅兼容旧数据）
             </summary>
             <div className="mt-2 space-y-2">
               {meta.fields.filter((f) => f.advanced && (!f.providers || f.providers.includes(provider))).map((field) => (
                 <label key={field.key} className="block">
-                  <span className="text-xs text-(--stage-muted)">{field.label}</span>
+                  <span className="text-xs muted">{field.label}</span>
                   <FieldInput field={field} value={value[field.key]} onChange={(v) => onChange({ ...value, [field.key]: v })} />
                   {field.hint && <p className="mt-1 text-xs muted">{field.hint}</p>}
                   {field.preview && kind === "tts" && (
@@ -165,17 +165,11 @@ function VoicePreview({ provider, fieldKey, voice }: { provider: string; fieldKe
     setBusy(true);
     setErr("");
     try {
-      // 云端音色：试听语言按音色 ID 判定（Cantonese_*→粤语示例），否则粤语音色会被用来
-      // 念普通话文字 → 广式普通话。本地 Qwen3（serena/vivian…）仍是多语本地音色，按字段语言。
-      const isCloud = provider === "minimax" || provider === "minimax_streaming" || provider === "volcano_streaming";
-      const lang = isCloud ? previewLangForVoice(voice) : fieldKey === "speaker_cantonese" ? "cantonese" : fieldKey === "speaker_en" ? "en" : "zh";
-      const text =
-        lang === "cantonese"
-          ? "你好，我係想問下件貨而家到咗邊度？唔該幫我 check 下 status 呀。"
-          : lang === "en"
-            ? "Hello, I'd like to ask about your delivery."
-            : "你好，我想了解一下你们的产品和服务。";
-      const blob = await api.previewTts({ provider, text, voice, language: lang, sample_rate: 24000 });
+      // 试听语言单点 resolvePreviewLang：音色 ID 正则优先（Cantonese_*→粤语示例，
+      // 否则粤语音色会被用来念普通话文字 → 广式普通话），不中按字段键回落
+      // （本地 Qwen3 多语音色 serena/vivian…走 speaker_cantonese/speaker_en 链）。
+      const lang = resolvePreviewLang(voice, { fieldKey });
+      const blob = await previewVoice({ provider, text: previewSampleText(lang), voice, language: lang, sample_rate: 24000 });
       if (url) URL.revokeObjectURL(url);
       const u = URL.createObjectURL(blob);
       setUrl(u);
@@ -193,7 +187,7 @@ function VoicePreview({ provider, fieldKey, voice }: { provider: string; fieldKe
         {busy ? "合成中…" : url ? "试听已选音色" : "试听"}
       </button>
       {url && <audio controls src={url} className="h-6 w-44" />}
-      {err && <span className="text-[11px] text-red-300">{err}</span>}
+      {err && <span className="text-[11px] text-red-600">{err}</span>}
     </div>
   );
 }
@@ -201,7 +195,7 @@ function VoicePreview({ provider, fieldKey, voice }: { provider: string; fieldKe
 /** 外呼（SIP）卡片：mode 决定后端；real 档才显示 trunk/鉴权字段组。 */
 function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: ProviderForm) => void }) {
   const base =
-    "mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)";
+    "mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)";
   const mode = String(value.mode ?? "mock");
   const set = (key: string, v: unknown) => onChange({ ...value, [key]: v });
   const numbers = Array.isArray(value.numbers) ? (value.numbers as string[]) : [];
@@ -293,7 +287,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
       </p>
       <div className="mt-3 space-y-2">
         <label className="block">
-          <span className="text-xs text-(--stage-muted)">拨号后端</span>
+          <span className="text-xs muted">拨号后端</span>
           <select className={base} value={mode} onChange={(e) => set("mode", e.target.value)}>
             <option value="mock">mock（本机派生被叫）</option>
             <option value="real">real（SIP trunk 真拨号）</option>
@@ -302,7 +296,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
         {mode === "real" && (
           <>
             <label className="block">
-              <span className="text-xs text-(--stage-muted)">Trunk ID</span>
+              <span className="text-xs muted">Trunk ID</span>
               <input
                 className={base}
                 placeholder="ST_xxxxxxxx"
@@ -312,7 +306,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
               <p className="mt-1 text-xs muted">LiveKit SIP trunk 的 ID（sip_trunk_id）。</p>
             </label>
             <label className="block">
-              <span className="text-xs text-(--stage-muted)">SIP 地址 / 网关</span>
+              <span className="text-xs muted">SIP 地址 / 网关</span>
               <input
                 className={base}
                 placeholder="sip.example.com"
@@ -321,7 +315,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
               />
             </label>
             <label className="block">
-              <span className="text-xs text-(--stage-muted)">鉴权用户名</span>
+              <span className="text-xs muted">鉴权用户名</span>
               <input
                 className={base}
                 value={String(value.auth_username ?? "")}
@@ -329,7 +323,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
               />
             </label>
             <label className="block">
-              <span className="text-xs text-(--stage-muted)">鉴权密码</span>
+              <span className="text-xs muted">鉴权密码</span>
               <input
                 type="password"
                 className={base}
@@ -340,7 +334,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
               <p className="mt-1 text-xs muted">留空保存=保留已存密码。</p>
             </label>
             <label className="block">
-              <span className="text-xs text-(--stage-muted)">许可主叫号（逗号分隔）</span>
+              <span className="text-xs muted">许可主叫号（逗号分隔）</span>
               <input
                 className={base}
                 placeholder="+8613800138000, +8613800138001"
@@ -357,7 +351,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
               />
             </label>
             <div className="rounded-lg border border-(--card-border) p-2">
-              <span className="text-xs text-(--stage-muted)">注册 trunk 到站点</span>
+              <span className="text-xs muted">注册 trunk 到站点</span>
               <p className="mt-1 text-xs muted">
                 用上面的地址/主叫号/鉴权在当前站点创建 LiveKit outbound trunk，成功后 Trunk ID 自动回填
                 （campaign 按站点取 trunk；密码不会回显）。
@@ -369,7 +363,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
                 disabled={sites.length === 0}
               >
                 {sites.length === 0 ? (
-                  <option value="">（暂无站点——用下方「+ 新建站点」建一个）</option>
+                  <option value="">（暂无站点——用下方「新建站点」建一个）</option>
                 ) : (
                   sites.map((s) => (
                     <option key={String(s.id)} value={String(s.id)}>
@@ -386,12 +380,12 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
                   setShowSiteForm((v) => !v);
                 }}
               >
-                {showSiteForm ? "取消新建" : "+ 新建站点"}
+                {showSiteForm ? "取消新建" : <><Plus className="h-3.5 w-3.5" /> 新建站点</>}
               </button>
               {showSiteForm && (
                 <div className="mt-2 rounded-lg border border-(--card-border) p-2">
                   <label className="block">
-                    <span className="text-xs text-(--stage-muted)">站点名</span>
+                    <span className="text-xs muted">站点名</span>
                     <input
                       className={base}
                       placeholder="hk-edge"
@@ -400,7 +394,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
                     />
                   </label>
                   <label className="mt-2 block">
-                    <span className="text-xs text-(--stage-muted)">LiveKit 地址</span>
+                    <span className="text-xs muted">LiveKit 地址</span>
                     <input
                       className={base}
                       placeholder="wss://vps.example:7880"
@@ -427,17 +421,17 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
                 {trunkBusy ? "注册中…" : "注册 trunk"}
               </button>
               {trunkNote && (
-                <p className={`mt-1 text-[11px] ${trunkNote.error ? "text-red-300" : "muted"}`}>{trunkNote.text}</p>
+                <p className={`mt-1 text-[11px] ${trunkNote.error ? "text-red-600" : "muted"}`}>{trunkNote.text}</p>
               )}
               {siteNote && (
-                <p className={`mt-1 text-[11px] ${siteNote.error ? "text-red-300" : "muted"}`}>{siteNote.text}</p>
+                <p className={`mt-1 text-[11px] ${siteNote.error ? "text-red-600" : "muted"}`}>{siteNote.text}</p>
               )}
             </div>
           </>
         )}
         <div className="grid grid-cols-2 gap-2">
           <label className="block">
-            <span className="text-xs text-(--stage-muted)">振铃超时（秒）</span>
+            <span className="text-xs muted">振铃超时（秒）</span>
             <input
               type="number"
               className={base}
@@ -446,7 +440,7 @@ function SipCard({ value, onChange }: { value: ProviderForm; onChange: (next: Pr
             />
           </label>
           <label className="block">
-            <span className="text-xs text-(--stage-muted)">单通最长时长（秒）</span>
+            <span className="text-xs muted">单通最长时长（秒）</span>
             <input
               type="number"
               className={base}
@@ -489,22 +483,20 @@ function AudioDevicesCard() {
     void refresh();
   }, [refresh]);
 
-  const canSetOutput = isTauriShell() || webCanSwitchOutput();
+  const canSetOutput = webCanSwitchOutput();
 
   return (
     <section className="card">
       <span className="label">音频设备</span>
       <p className="mt-1 text-xs muted">
-        {isTauriShell()
-          ? "桌面版扬声器切换的是系统默认输出设备（A 线通话与 B 线同传都会跟随）。"
-          : "浏览器模式下仅 Chromium 内核支持切换扬声器输出。"}
+        浏览器模式下仅 Chromium 内核支持切换扬声器输出；所选输出在接通通话时应用。
       </p>
       <div className="mt-3 space-y-3">
         <div>
-          <span className="text-xs text-(--stage-muted)">麦克风（输入）</span>
+          <span className="text-xs muted">麦克风（输入）</span>
           <div className="mt-1 flex gap-2">
             <select
-              className="flex-1 rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+              className="flex-1 rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               value={micId}
               onChange={(e) => { setMicId(e.target.value); saveMicDevice(e.target.value); }}
             >
@@ -525,23 +517,24 @@ function AudioDevicesCard() {
             </button>
           </div>
           {mic.length === 0 && (
-            <p className="mt-1 text-xs text-red-300">
+            <p className="mt-1 text-xs text-red-600">
               未检测到麦克风或未授权。请先点击「刷新」授权；若仍为空，到系统设置开启麦克风权限后重启应用。
             </p>
           )}
         </div>
 
         <div>
-          <span className="text-xs text-(--stage-muted)">扬声器 / 输出</span>
+          <span className="text-xs muted">扬声器 / 输出</span>
           {canSetOutput ? (
             <select
-              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+              className="mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
               value={outId}
               onChange={(e) => {
                 const id = e.target.value;
                 setOutId(id);
+                // 纯持久化：setSinkId 需要 room 已连接，接通通话时自动应用
+                //（CallStudio join-time / interpret 一体台按端恢复）。
                 saveOutputDevice(id);
-                void applyOutputDevice(id);
               }}
             >
               {outs.length === 0 && <option value="">未检测到输出设备</option>}
@@ -579,13 +572,171 @@ function FieldRow({
 }) {
   return (
     <label className="block">
-      <span className="text-xs text-(--stage-muted)">{field.label}</span>
+      <span className="text-xs muted">{field.label}</span>
       <FieldInput field={field} value={value} onChange={onChange} />
       {field.hint && <p className="mt-1 text-xs muted">{field.hint}</p>}
       {field.preview && kind === "tts" && (
         <VoicePreview provider={provider} fieldKey={field.key} voice={String(value ?? "")} />
       )}
     </label>
+  );
+}
+
+/** MiniMax 云端克隆清单条目（tts.minimax_clones_json，路线 B）。 */
+type MinimaxClone = { voice_id: string; label?: string; sample_lang?: string; created_at?: string; activated?: boolean };
+
+function parseClones(raw: unknown): MinimaxClone[] {
+  try {
+    const data = JSON.parse(String(raw ?? "[]"));
+    return Array.isArray(data) ? (data as MinimaxClone[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 「克隆我的声音」面板（MiniMax 云端 voice clone）：录音/上传参考音频（官方要求
+ * ≥10s）→ CP 两步克隆（files/upload → voice_clone）。拍板「先克隆不激活」：
+ * 克隆 0 费用；MiniMax 规则 7 天内未用于合成会删、首次合成收 ¥9.9/音色——
+ * 试听/首次会话使用即激活。
+ */
+function MinimaxClonePanel({ clones, onChange }: { clones: MinimaxClone[]; onChange: (next: MinimaxClone[]) => void }) {
+  const [label, setLabel] = useState("");
+  const [refFile, setRefFile] = useState<File | null>(null);
+  const [recording, setRecording] = useState(false);
+  const [recSec, setRecSec] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const recRef = useRef<RecorderHandle | null>(null);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  async function toggleRecording() {
+    setErr("");
+    if (recording) {
+      const handle = recRef.current;
+      recRef.current = null;
+      if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+      setRecording(false);
+      setRecSec(0);
+      if (!handle) return;
+      try {
+        const wav = await handle.stop();
+        if (wav.size < 4096) { setErr("录音太短，官方要求参考音频至少 10 秒。"); return; }
+        setRefFile(new File([wav], `clone-ref-${Date.now()}.wav`, { type: "audio/wav" }));
+      } catch (e) { setErr(`录音失败：${String(e)}`); }
+      return;
+    }
+    try {
+      recRef.current = await startRecording(60000);
+      setRecording(true);
+      setRecSec(0);
+      timerRef.current = setInterval(() => setRecSec((s) => s + 1), 1000);
+    } catch (e) { setErr(`无法开始录音：${String(e)}`); }
+  }
+
+  async function submit() {
+    setErr("");
+    if (!refFile) { setErr("请先录音或上传参考音频（≥10 秒，wav/mp3/m4a）。"); return; }
+    setBusy(true);
+    try {
+      const body = new FormData();
+      body.append("file", refFile);
+      body.append("label", label || `我的声音-${new Date().toLocaleDateString()}`);
+      body.append("sample_lang", "zh");
+      const created = await api.registerMinimaxVoice(body);
+      onChange([...clones, {
+        voice_id: String(created.voice_id ?? ""),
+        label: String(created.label ?? label ?? ""),
+        sample_lang: String(created.sample_lang ?? "zh"),
+        created_at: String(created.created_at ?? ""),
+        activated: false,
+      }]);
+      setRefFile(null);
+      setLabel("");
+    } catch (e) {
+      setErr(friendlyErrorText(String(e)));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove(voiceId: string) {
+    setErr("");
+    setBusy(true);
+    try {
+      await api.deleteMinimaxVoice(voiceId);
+      onChange(clones.filter((c) => c.voice_id !== voiceId));
+    } catch (e) {
+      setErr(friendlyErrorText(String(e)));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function preview(voiceId: string, lang: string) {
+    setErr("");
+    setBusy(true);
+    try {
+      const text =
+        lang === "en"
+          ? "Hello, this is my cloned voice."
+          : lang === "cantonese"
+            ? "你好，我係用我把聲克隆出嚟嘅音色，唔該聽下。"
+            : "你好，这是用我的声音克隆的音色。";
+      const blob = await previewVoice({ provider: "minimax", text, voice: voiceId, language: lang || "zh", sample_rate: 24000 });
+      await playAudioBlob(blob);
+    } catch (e) {
+      setErr(friendlyErrorText(String(e)));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <details className="rounded-lg border border-(--card-border) p-2 text-sm">
+      <summary className="cursor-pointer text-xs muted hover:text-(--live)">克隆我的声音（MiniMax 云端）</summary>
+      <p className="mt-2 text-xs muted">
+        念 10 秒~1 分钟干净人声（普通话/粤语样本均可），克隆成云端音色后可在分语言音色与
+        同传会话中选用。<strong>克隆本身免费</strong>；MiniMax 规则：7 天内未用于合成会过期，
+        首次合成（试听/会话使用）激活并计费约 ¥9.9/音色。需账号完成实名认证。
+      </p>
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <button className="btn-ghost text-xs" disabled={busy} onClick={toggleRecording}>
+          {recording ? `停止录音（${recSec}s）` : "录音 10 秒+"}
+        </button>
+        <label className="btn-ghost cursor-pointer text-xs">
+          上传音频
+          <input type="file" accept="audio/wav,audio/mpeg,audio/mp4" className="hidden"
+            onChange={(e) => { const f = e.target.files?.[0]; if (f) setRefFile(f); }} />
+        </label>
+        <input
+          className="w-40 rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--live)"
+          placeholder="标签（如：我的声音）"
+          value={label}
+          onChange={(e) => setLabel(e.target.value)}
+        />
+        <button className="btn-primary text-xs" disabled={busy || !refFile} onClick={submit}>
+          {busy ? "处理中…" : "克隆到 MiniMax"}
+        </button>
+        {refFile && <span className="text-xs muted">{refFile.name}</span>}
+      </div>
+      {clones.length > 0 && (
+        <ul className="mt-2 space-y-1">
+          {clones.map((c) => (
+            <li key={c.voice_id} className="flex flex-wrap items-center gap-2 text-xs">
+              <span className="font-medium">{c.label || c.voice_id}</span>
+              {!c.activated && <span className="rounded bg-amber-100 px-1 text-amber-700">未激活</span>}
+              <span className="muted">{c.voice_id}</span>
+              <button className="btn-ghost px-1 py-0 text-xs" disabled={busy}
+                onClick={() => preview(c.voice_id, c.sample_lang || "zh")}>试听（激活）</button>
+              <button className="btn-ghost px-1 py-0 text-xs text-red-600" disabled={busy}
+                onClick={() => remove(c.voice_id)}>删除</button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {err && <p className="mt-2 text-xs text-red-600">{err}</p>}
+    </details>
   );
 }
 
@@ -601,6 +752,20 @@ function VoiceCard({ value, onChange }: { value: ProviderForm; onChange: (next: 
   const simple = visible.filter((f) => VOICE_SIMPLE_KEYS.includes(f.key));
   const rest = visible.filter((f) => !VOICE_SIMPLE_KEYS.includes(f.key));
   const advanced = meta.fields.filter((f) => f.advanced && (!f.providers || f.providers.includes(provider)));
+  // MiniMax 云端克隆清单（存 tts.minimax_clones_json）——合并进分语言三键下拉，
+  // 全语言槽可选（克隆音色无语言绑定，language_boost 按请求生效）；克隆段标签/
+  // 去重/置顶统一走 lib/voice-options.buildVoiceSelectOptions。
+  const clones = parseClones(value.minimax_clones_json);
+  const withClones = (field: FieldMeta): FieldMeta => {
+    if (!field.key.startsWith("speaker_")) return field;
+    const cloneOpts = buildVoiceSelectOptions({
+      slotLang: field.key === "speaker_cantonese" ? "cantonese" : field.key === "speaker_en" ? "en" : "zh",
+      minimaxClones: clones,
+    });
+    return cloneOpts.length > 0 ? { ...field, options: [...(field.options ?? []), ...cloneOpts] } : field;
+  };
+  const setClones = (next: MinimaxClone[]) =>
+    onChange({ ...value, minimax_clones_json: JSON.stringify(next) });
   return (
     <section className="card">
       <span className="label">语音与凭据</span>
@@ -610,7 +775,7 @@ function VoiceCard({ value, onChange }: { value: ProviderForm; onChange: (next: 
       <div className="mt-3 space-y-2">
         <div>
           <select
-            className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+            className="w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
             value={provider}
             onChange={(e) => onChange({ ...value, provider: e.target.value })}
           >
@@ -625,7 +790,7 @@ function VoiceCard({ value, onChange }: { value: ProviderForm; onChange: (next: 
         {simple.map((field) => (
           <FieldRow
             key={field.key}
-            field={field}
+            field={withClones(field)}
             kind="tts"
             provider={provider}
             value={value[field.key]}
@@ -634,12 +799,12 @@ function VoiceCard({ value, onChange }: { value: ProviderForm; onChange: (next: 
         ))}
         {(rest.length > 0 || advanced.length > 0) && (
           <details className="rounded-lg border border-(--card-border) p-2 text-sm">
-            <summary className="cursor-pointer text-xs muted hover:text-accent">更多语音参数（服务地址 / 采样率 / 分语言音色）</summary>
+            <summary className="cursor-pointer text-xs muted hover:text-(--live)">更多语音参数（服务地址 / 采样率 / 分语言音色）</summary>
             <div className="mt-2 space-y-2">
               {[...rest, ...advanced].map((field) => (
                 <FieldRow
                   key={field.key}
-                  field={field}
+                  field={withClones(field)}
                   kind="tts"
                   provider={provider}
                   value={value[field.key]}
@@ -649,6 +814,7 @@ function VoiceCard({ value, onChange }: { value: ProviderForm; onChange: (next: 
             </div>
           </details>
         )}
+        <MinimaxClonePanel clones={clones} onChange={setClones} />
       </div>
     </section>
   );
@@ -717,7 +883,7 @@ export default function SettingsPage() {
     <div>
       <div className="mb-8">
         <h1 className="page-title">设置</h1>
-        <p className="page-sub">语音与凭据 · 音频设备 · 外呼 · 本机服务</p>
+        <p className="page-sub">语音与凭据 · 音频设备 · 外呼</p>
       </div>
 
       {loading ? (
@@ -728,9 +894,6 @@ export default function SettingsPage() {
           <AudioDevicesCard />
           <SipCard value={form.sip ?? {}} onChange={(next) => setForm({ ...form, sip: next })} />
           <CannedAuditionCard />
-          <div className="lg:col-span-2">
-            <DesktopStatus />
-          </div>
           <details className="rounded-xl border border-(--card-border) bg-(--card) p-4 lg:col-span-2">
             <summary className="cursor-pointer text-sm font-medium">
               开发者参数（ASR / LLM / VAD / 运行策略）
@@ -746,7 +909,7 @@ export default function SettingsPage() {
               <section className="card">
                 <span className="label">{POLICY_META.title}</span>
                 <select
-                  className="mt-3 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--accent)"
+                  className="mt-3 w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)"
                   value={policyValue}
                   onChange={(e) => setForm({ ...form, policy: e.target.value })}
                 >
@@ -763,7 +926,7 @@ export default function SettingsPage() {
             <button className="btn-primary" onClick={save}>保存设置</button>
             <button className="btn-ghost" onClick={() => testHealth("asr")}>测试 ASR</button>
             <button className="btn-ghost" onClick={() => testHealth("tts")}>测试 TTS</button>
-            {ok && <span className="text-sm text-emerald-400">已保存。</span>}
+            {ok && <span className="text-sm text-emerald-600">已保存。</span>}
             {health && <span className="text-sm muted">{health}</span>}
           </div>
           {err && <div className="lg:col-span-2"><ErrorState message={err} /></div>}

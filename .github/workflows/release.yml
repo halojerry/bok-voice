@@ -30,6 +30,8 @@ jobs:
             target: mac
           - os: windows-latest
             target: windows
+          - os: ubuntu-22.04
+            target: linux
     steps:
       - uses: actions/checkout@v4
 
