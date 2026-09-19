@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # 云端控制面一键部署（thin-node SaaS 云侧）——宝塔/任意 Docker 主机通用。
 #
-# 干什么：前置检查 → 生成 .env（密钥自动随机，绝不覆盖既有文件）→ docker compose up
-#        → 轮询健康 → 三项验收（health/静态站豁免/root 登录）→ 打印节点装机一条龙。
+# 干什么：前置检查 → 生成 .env（密钥自动随机，绝不覆盖既有文件）→ up.sh 起容器
+#        （幂等双覆盖）→ 轮询健康 → 三项验收（health/静态站豁免/root 登录）→ 打印节点装机一条龙。
 #
 # 用法（在本目录或任意位置执行均可）：
 #   ./install.sh --database-url 'postgresql+psycopg://postgres.REF:PWD@aws-0-REGION.pooler.supabase.com:5432/postgres'
@@ -13,7 +13,7 @@
 #     --cp-token S         机器通道 token（缺省自动 openssl rand -hex 24；agent worker 需同值）
 #     --root-user NAME     root 用户名（默认 admin）
 #     --root-pass S        root 密码（缺省自动生成并打印一次）
-#     --port N             宿主端口（默认 8000；或 env BOK_CP_PORT）
+#     --port N             宿主端口（默认 18010；或 env BOK_CP_PORT）
 #     --image REF          镜像引用（默认 ghcr.io/halojerry/bok-voice:latest，可钉 v0.2.0）
 #     --dry-run            只生成/校验配置，不起容器
 #
@@ -25,7 +25,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$HERE/.env"
 DATABASE_URL="${DATABASE_URL:-}"; JWT_SECRET="${BOK_JWT_SECRET:-}"
 CP_TOKEN="${BOK_CP_TOKEN:-}"; ROOT_USER="${BOK_ROOT_USERNAME:-admin}"
-ROOT_PASS="${BOK_ROOT_PASSWORD:-}"; PORT="${BOK_CP_PORT:-8000}"
+ROOT_PASS="${BOK_ROOT_PASSWORD:-}"; PORT="${BOK_CP_PORT:-18010}"
 IMAGE="${BOK_CP_IMAGE:-ghcr.io/halojerry/bok-voice:latest}"
 DRY_RUN=0
 
@@ -97,8 +97,8 @@ say "compose 配置校验通过（端口 $PORT / 镜像 ${IMAGE}）"
 [[ $DRY_RUN -eq 1 ]] && { say "--dry-run：未起容器，配置已就绪。"; exit 0; }
 
 # ---- 4) 起容器并轮询健康（docker-proxy 先于 uvicorn 监听是已知时差，必须显式轮询）----
-say "拉镜像+起容器（国内拉 GHCR 慢见 README §1 镜像加速/搬运两条路）……"
-docker compose -f "$HERE/docker-compose.yml" --env-file "$ENV_FILE" up -d
+say "拉镜像+起容器（经 up.sh：池器域名→IPv4 + 宿主口覆盖，幂等；国内拉 GHCR 慢见 README §1）……"
+"$HERE/up.sh"
 HEALTH=""
 for i in $(seq 1 60); do
   HEALTH="$(curl -fsS "http://127.0.0.1:${PORT}/health" 2>/dev/null || true)"

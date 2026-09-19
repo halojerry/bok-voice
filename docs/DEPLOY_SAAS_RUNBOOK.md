@@ -45,7 +45,7 @@ cd deploy/cloud
 ```
 
 脚本自动：生成密钥（JWT/CP token/root 密码，`.env` 0600，重跑不覆盖）→
-`docker compose up` → 轮询 `/health`（首启含 Supabase 幂等迁移建表，无需手工 SQL）
+`up.sh` 起容器（幂等双覆盖，见「重启/重拉铁律」）→ 轮询 `/health`（首启含 Supabase 幂等迁移建表，无需手工 SQL）
 → 三项验收（health ok / 静态站豁免非 401 / root 登录真 JWT）→ 打印节点装机一条龙
 （**零 GitHub**：脚本与包都从本 CP 域名拉）。
 
@@ -55,7 +55,7 @@ cd deploy/cloud
 - root 登录 → 返回三段式 JWT
 
 深度文档（HTTPS 反代/宝塔面板安全/升级回滚/备份/GHCR 私有镜像登录/搬运法）：
-`deploy/cloud/README.md`。**生产必须 HTTPS**（宝塔网站反代 127.0.0.1:8000 + 证书），
+`deploy/cloud/README.md`。**生产必须 HTTPS**（宝塔网站反代 127.0.0.1:18010 + 证书），
 节点与浏览器都按域名访问。
 
 ## ② 发版工件（每次发版）
@@ -187,6 +187,11 @@ docker compose up -d cp
 端口分工恒定：**云 prod 宿主口=18010**（`BOK_CP_PORT`，`up.sh` 默认已带；宝塔/反代
 指 `127.0.0.1:18010`）、**本地 dev 栈=8000**（`tools/bok.py serve`）。云机若同时跑
 dev，靠这个分工互不抢占——事故第一坑正是裸 up 把 18010 退回 8000 撞上 dev 栈。
+
+**管理台对外地址（合并本分支后云端一次性配置）**：`.env` 补一行
+`BOK_CP_PUBLIC_URL=https://<云域名或IP>:18010`（有反代填反代域名）再 `./up.sh`——
+CP 启动自动写 `runtime-config.js`，话务员浏览器管理台按它取 CP 地址；不配则回落
+构建期默认 `127.0.0.1:8000`，云端口形态下登录必 401 弹回（2026-09-19 模拟拓扑实测）。
 
 ## 验收与排障对照
 
