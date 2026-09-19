@@ -33,8 +33,13 @@ INTENT_FACTS: dict[str, str] = {
 _OPS = ("gte", "lte", "eq")
 
 
-def parse_rule_row(row: dict[str, Any]) -> dict[str, Any]:
-    """表行 → 宽容规则视图（坏 conditions 逐条丢弃；结构坏=空规则永不命中）。"""
+def parse_rule_row(row: dict[str, Any]) -> dict[str, Any] | None:
+    """表行 → 宽容规则视图；结构坏/空条件 = None（调用方跳过该行，绝不放行）。
+
+    空条件兜成 `[]` 曾是 catch-all：`all([])` 恒真令该规则命中每一通挂断，把
+    全账号通话盖同一个 intent_code（2026-09-19 审计 P1-3；test 注释「agent 侧
+    永不命中」与实现相反）。fail-closed：没写条件的规则不是「无条件命中」而是
+    「不生效」。坏 JSON 同罪同办。"""
     raw_conds = row.get("conditions")
     conds: list[dict[str, Any]] = []
     if isinstance(raw_conds, str):
@@ -48,6 +53,8 @@ def parse_rule_row(row: dict[str, Any]) -> dict[str, Any]:
         for c in raw_conds:
             if isinstance(c, dict):
                 conds.append(c)
+    if not conds:
+        return None
     return {
         "id": str(row.get("id") or ""),
         "account_id": str(row.get("account_id") or ""),
@@ -97,7 +104,7 @@ def eval_intent_rules(facts: dict[str, Any], rules: list[dict[str, Any]]) -> dic
     返回 {intent_code, label, disposition}；disposition 可能空串（只打意向码
     不覆盖 disposition）。bad row（缺 intent_code）跳过。
     """
-    parsed = [parse_rule_row(r) for r in rules or []]
+    parsed = [p for p in (parse_rule_row(r) for r in rules or []) if p is not None]
     parsed.sort(key=lambda r: (r["priority"], r["id"]))
     for rule in parsed:
         if not rule["enabled"] or not rule["intent_code"]:
@@ -112,10 +119,15 @@ def eval_intent_rules(facts: dict[str, Any], rules: list[dict[str, Any]]) -> dic
 
 
 def validate_conditions(raw: Any) -> list[str]:
-    """CP 保存校验（严格轨）：conditions 必须是条件数组，返回错误串列表（空=合法）。"""
+    """CP 保存校验（严格轨）：conditions 必须是非空条件数组，返回错误串列表（空=合法）。
+
+    空数组=catch-all 曾被放行（eval 侧 all([]) 恒真命中所有通话）——保存期即拒，
+    与 parse_rule_row 的 fail-closed 双保险。"""
     errs: list[str] = []
     if not isinstance(raw, list):
         return ["conditions must be an array"]
+    if not raw:
+        return ["conditions must have at least 1 item"]
     if len(raw) > 12:
         return ["conditions must have at most 12 items"]
     for i, c in enumerate(raw):

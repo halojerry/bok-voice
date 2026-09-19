@@ -74,10 +74,19 @@ def test_core_eval_matrix():
 
 
 def test_core_parse_rule_row_tolerant():
-    # 坏 conditions 串=空条件数组（结构不炸）；缺字段逐项兜底
-    row = parse_rule_row({"id": "x", "conditions": "{oops", "priority": "7", "enabled": None})
-    assert row["conditions"] == [] and row["priority"] == 7 and row["enabled"] is True
-    assert parse_rule_row({})["id"] == ""
+    # 坏 conditions 串/空条件=None（fail-closed：空条件曾是 all([]) 恒真的
+    # catch-all，命中每通挂断——2026-09-19 审计 P1-3 收口）；缺字段逐项兜底。
+    assert parse_rule_row({"id": "x", "conditions": "{oops", "priority": "7", "enabled": None}) is None
+    assert parse_rule_row({}) is None
+    ok = parse_rule_row({"id": "x", "conditions": [{"fact": "duration_s", "op": "gte", "value": 60}], "priority": "7"})
+    assert ok["priority"] == 7 and ok["enabled"] is True
+
+
+def test_core_empty_conditions_never_match():
+    # eval 侧双保险：空条件/坏行规则整体跳过，绝不命中。
+    assert eval_intent_rules({"duration_s": 999}, [{"id": "r1", "intent_code": "INTERESTED", "conditions": []}]) is None
+    assert eval_intent_rules({"duration_s": 999}, [{"id": "r1", "intent_code": "INTERESTED", "conditions": "{bad"}]) is None
+    assert eval_intent_rules({"duration_s": 999}, [{"id": "r1", "intent_code": "INTERESTED", "conditions": [{"fact": "duration_s", "op": "gte", "value": 60}]}]) is not None
 
 
 def test_core_validate_conditions_errors():
@@ -85,7 +94,8 @@ def test_core_validate_conditions_errors():
     assert validate_conditions(ok) == []
     assert validate_conditions(ok + [{"fact": "wa_captured", "op": "eq", "value": False}]) == []
     assert validate_conditions("nope") == ["conditions must be an array"]
-    assert validate_conditions([]) == []  # 空数组合法（agent 侧永不命中，但结构合法）
+    # 空数组=catch-all（eval 侧 all([]) 恒真命中所有通话）——保存期即拒，不再放行。
+    assert validate_conditions([]) == ["conditions must have at least 1 item"]
     errs = validate_conditions([{"fact": "bogus", "op": "gt", "value": "s"}])
     assert len(errs) == 3
     assert any(".fact" in e for e in errs) and any(".op" in e for e in errs) and any(".value" in e for e in errs)
