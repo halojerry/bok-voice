@@ -1,0 +1,148 @@
+# A 线完整工作逻辑（代码级追踪版）
+
+> 2026-09-20。本文不是 AGENTS.md 军规复读，而是对 A 线源码的**逐行追踪综合**：四路并行深读
+> （agent.py 4804 行 / flow.py 1522 行 / qa_gate.py / fillers.py / livekit_plugins.py 5961 行 /
+> control_plane main.py / repository.py），全部结论带 `文件:行号` 证据。全局组件拓扑见
+> `bok-architecture.json`（archify），本文专注**运行逻辑**：什么节点做什么事、意图识别怎么判别、
+> 数据在哪一列。
+>
+> 路径缩写：`AG`=apps/agent/agent_runtime/agent.py；`FL`=…/flow.py；`LKP`=…/providers/livekit_plugins.py；
+> `QG`=…/qa_gate.py；`FD`=…/fillers.py；`CP`=apps/control-plane/control_plane/main.py；
+> `RP`=packages/business-db/bok_voice_business_db/repository.py。
+> 注：上一会话修复分支 `session-20260919-232858-4eb7`（max_step_reached/_judge_health 降级/
+> session_report CAS 等 18 项）**尚未合并**，本文行号基于 origin/main@3385529 + 本会话 web 分支。
+
+## 0. 全景：一通电话的六个阶段
+
+```mermaid
+flowchart LR
+    A[①建单<br/>POST /api/calls<br/>template_id快照] --> B[②签发token<br/>RoomAgentDispatch<br/>mark_active_if_live]
+    B --> C[③agent装配<br/>语言/话术/热词/账本<br/>一次钉死]
+    C --> D[④通话<br/>开场白直念 → 每轮17道漏斗<br/>§2]
+    D --> E[⑤收线<br/>_schedule_call_end<br/>意向规则评估]
+    E --> F[⑥结算+学习<br/>纪要/知识/turns flush<br/>挖掘→采纳→物化]
+```
+
+| 进程 | 端口 | 在通话里的职责 |
+|---|---|---|
+| CP (FastAPI) | :8000 | 建单/token/turns 收账/wa/assist/dial-result/settle/模板发布两态 |
+| LiveKit | :7880 | 房间信令；token 挂 `RoomAgentDispatch(agent_name="bok-voice")` 派 worker（CP:1452-1463） |
+| agent worker | :8081 | 装配+每轮漏斗+收线+turns 上报（AG `entrypoint` 1727） |
+| ASR sidecar | :8787 | PCM→文本：句级提交/join-hold/热词；会话 TTL 180s（sidecar app.py:174-201） |
+| TTS | MiniMax 云 / :8788 | bidi 长连接+看门狗；`CachedTTS` 键=text+voice+model 精确 sha1（TC:66-84） |
+| LLM 4B | :1235 | 实时回复；KV 严格前缀契约（LKP:1772-1915） |
+| LLM 9B | :1237 | 后台岗：flow judge / 意图判据 / 结算纪要（缺盘回退 :1235） |
+
+## 1. 装配阶段（AG:1727-2830，会话级钉死）
+
+| 钉死项 | 实现 | 证据 |
+|---|---|---|
+| 话术来源 | call.template_id 快照 > 对象卡绑定；机器通道 GET 模板 → `_template_machine_overlay` **冻结 published_json 覆盖 live** | AG:1777-1783；CP:4110-4119、4077-4096 |
+| 语言 | `PinnedLanguageState`+`set_user_language` 一次写入，整通不切换 | AG:1976-1985 |
+| 流程引擎 | `FlowController.from_template`：steps_json（空则旧四段转步）+ object_vars（单号逐位转汉字）+ graph 宽容解析 | FL:902-909、233-249、252-288 |
+| 热词 | 模板+行业+对象三层 ≤200 字，随 /api/start 下发 sidecar | AG:2269；LKP:5486-5495 |
+| 对象档案 | `_wire_object_brief` ≤2 行静态进前缀 | AG:1790、1612-1630 |
+| 意向规则 | `cp.list_intent_rules` 拉到 worker 内存（评估在 agent，CP 只存） | AG:2824-2830 |
+| QA 索引 | 有 TTS 缓存且（快路开 或 图有 play_qa 绑定）才建 `QaIndex` | AG:2787-2820 |
+| 钩子注册 | metrics/item_added×2/close/shutdown×2/心跳×2/partial 闸/spec busy/speech_created——**全部先于 session.start**（start 在 4683） | AG:3122-4677 |
+| 开场白 | 第 1 步 ref 首行直念（变量缺失退通用语）；`_prefix_prewarm_task` 用 turn-1 同构形状与 TTS **并行**预热 | AG:4716-4748、2835-2869 |
+
+## 2. 每轮意图漏斗（AG `on_user_turn_completed` :3500 起，**按代码实际执行顺序**）
+
+前置：框架 turn commit（STT 句级 FINAL 路径，见 §4）→ 钩子。17 道闸，前者命中即短路：
+
+| # | 闸门 | 证据 | 命中行为 | 推进 |
+|---|---|---|---|---|
+| 0 | 心跳归零/disarm/filler.cancel/看门狗武装 | AG:3511-3518 | — | — |
+| 1 | 回声自听守卫：speaking 中+两边≥6字+相似≥0.9 | AG:3558-3567、1092-1112 | 整轮丢弃 | 否 |
+| 2 | 热词词表回声守卫（剥尾保头） | AG:3578-3596 | 丢弃或改写文本 | 否 |
+| 3 | 暂停冻结 | AG:3607-3620 | 落库 gen=paused | 冻结 |
+| 4 | 打断风暴静听（resume/ack/silent） | AG:3629-3686、694-718 | ack=直念短承接 / listen=静默 | 否 |
+| 5 | 饿死兜底（连续2轮零输出） | AG:3694-3726 | 直念 starve_ack | 否 |
+| 6 | WA 收号碎片累积（<8位数字主导/自报头→stash+5s flush） | AG:3727-3777、2029-2085 | stash：不回复不推进 | 否 |
+| 7 | 通用单号累积（非 WA 步） | AG:3783-3824、2093-2138 | 同上 | 否 |
+| 8 | WhatsApp 信号检测（captured/captured_implicit/offered；already_captured 防确认轮锁死） | AG:3825-3864；FL:674-739 | 静默记账+上报 | 否 |
+| 9 | 事实沉淀 extract_call_facts→尾部 | AG:3868-3872 | — | 否 |
+| 10 | **规则 verdict**（顺序：REFUSE→FAREWELL→auto/CONFIRM→UNCLEAR/QUESTION） | AG:3873-3999；词表见 §3.1 | **REFUSE→closing+14s 收线；FAREWELL→closing+8s**（两者仍落穿 LLM 念收尾稿） | REFUSE/FAREWELL/CONFIRM 是 |
+| 11 | stall 阶梯（同一步 UNCLEAR 3/5/8 次→degrade/bypass/close） | AG:4007-4048；FL:550-561 | 罐头直念；close=告别+8s 收线 | close 置 closing |
+| 12 | DEFER 短应承（社交拖延，先于 CONFIREM 判） | AG:4055-4077；FL:814-815 | 直念 defer_ack | 否 |
+| 13 | **say 直念步待念门**（#10 前已采样防被规则推进吞掉） | AG:4085-4128；FL:1096-1106 | 直念正稿首行+interrupt+官方 C5 补轮 | 记账不推进 |
+| 14 | **graph 意图块**（gate：开关+有 intents+非 closing+有文本）：judge pending **先取即清** → jump_step（位移才烧 once，置 `_flow_step_before=-1` 压 QA）→ notify_human（打铃不抢话）→ play_qa（条目+PCM 双在才罐头；miss 不烧 once 放行）→ 关键词未中才调度意图 judge | AG:4180-4326 | jump/then_jump 推进；play=罐头出口 | jump 是 |
+| 15 | **QA fastpath**（graph 之后）：四道闸 → match → 簇轮换 → `_qa_canned_say` | AG:4333-4409；闸表 §3.3 | 罐头 ~50ms | 否（advanced 闸挡） |
+| 16 | paused 兜底 | AG:4412-4413 | — | — |
+| 17 | **filler.arm()**（只在确定走 LLM 的轮 arm；真回复首音频撤表） | AG:4417；FD:433-445 | 之后框架 generate_reply | — |
+
+LLM 轮的兜底链：首 token 2s→流内道歉句（垫话已盖耳则抑制，AG:2753-2755）→弃流重生 late-answer→4s 响应看门狗 force interrupt+兜底直念（AG:2161-2212）。垫话本身走 `BackgroundAudioPlayer` 独立音轨（不经 speech 队列——session.say 串行会令轮提交停摆，FD:481-488 实证注释），回复首帧按「垫话剩余+gap」扣压实现播放排序（TC:379-390；FD:470-479）。
+
+**用真实例子走一遍漏斗**（第 1 步「你好，請問係{姓名}嗎？」的三条分支）：
+
+| 客户说 | 实际路径 | 走 LLM？ |
+|---|---|---|
+| 「咩話？你再講一次」 | #10 verdict=UNCLEAR/QUESTION→#11 计数→#17→LLM（分支「听唔清」可能被 bigram 命中注入提示词） | **走**（分支只是提示词素材，FL:1244-1252） |
+| 「打錯電話／唔係本人」 | #10 `_REFUSE_RE`（FL:356-362）→closing→LLM 念收尾稿→14s 收线 | 走（收尾直念的是脚本 farewell 轮才零 LLM） |
+| 「你係邊個？」 | #10 QUESTION→背景 9B judge（3s delay）→#17→LLM | 走（QA 库恰有同说法词条才 ~50ms 罐头） |
+
+**结论：现状漏斗里真正零 LLM 的只有 say 直念步/脚本直念族/graph play_qa/QA 字面命中四条路；步骤分支命中**永远**走 LLM**——这就是「高命中场景直接走录音」要做的路线 A（分支命中+物化→`_qa_canned_say` 同款出口）的切入点：插在 #13 与 #14 之间或 #14 内。
+
+## 3. 判定器明细
+
+### 3.1 verdict 词表（FL:316-389）
+REFUSE `_REFUSE_RE`+`_HANGUP_RE`（软守卫「唔使担心」否决 366-369）｜FAREWELL `_FAREWELL_RE`｜OBJECTION `_DENY_RE`｜REPEAT（≤12 字）｜QUESTION `_QUESTION_RE`（需无 `_STRONG_AFFIRM_RE` 多字确认）｜DEFER `_DEFER_RE`（先于 CONFIRM 判，防「好的我查一下」抢跑）｜CONFIRM `_CONFIRM_RE`/`_STRONG_AFFIRM_RE`/答对资料。步语义：身份步(0)非拦即推；say 步非问即推；WA 步 captured 才推（`wa_confirm_advance_allowed` FL:590-595，rule/judge 两路共用）；平台步 `_PLATFORM_RE` 命中即推（FL:500-546）。
+
+### 3.2 背景 judge 双管线
+- **flow judge**（推进判定）：UNCLEAR/QUESTION 且 `FLOW_LLM_ADVANCE=1`→3s 让路→9B :1237（timeout 5s，AG:184-186）→守卫链（同同步+非 done+非暂停+非 say 待念）+双闸（judge_confirm/WA）→`advance()`（AG:3253-3389）。同一步同时只允许一个 judge（`_judge_inflight` AG:2215、3985-3986）。
+- **意图 judge**（关键词补位）：图块求值且关键词未中→六闸（开关×2/非 closing/有文本/单飞/无 pending）→批量单次调用（max_tokens=32、**timeout 20s** AG:3436）→写 `_gjudge_pending`，**下一轮图块先取即清**（single-shot，过期打 judge_pending_expired，AG:4190-4220）。
+
+### 3.3 QA 快路数学（QG）
+匹配只吃 `question_text` 归一化（QG:139-150）；分数=0.6×余弦+0.4×(q⊂e_q 长度比)（QG:248-251）；阈值 0.90（QG:36-40）；胜者键=(priority, -score) 取 min（QG:256-258）。**四道闸** `qa_exclude_reason`（QG:99-133）：advanced（本轮已推进）> closing/done > wa_signal > wa_step_locked > digits(≥4位) > refuse > verdict∉{确认,模糊,提问}。簇轮换：cluster_head_id 折组→head 代表出场→簇内最少播放者先（QG:165-176、86-96；账本 `qa_played` 真播出才记 AG:1424-1432）。
+
+### 3.4 分支注入（渐进披露，FL:136-155、167-202、1177-1254）
+`parse_step_ref`：正稿=首个非空行；分支=「如果客户…→…」；注意=「注意：」。轮渲染时：正稿只进本步**首轮**（`_last_render_step` 账本），此后分支按 verdict+客户原话**只命中单条**（同族词表优先，bigram≥2 跨族兜底，全不中不注入），注意恒注入前 2 条。**渲染账本靠调用纪律保命**：`current_step_text` 全仓 6 个调用点每次都烧账本——新增调用点=渐进披露静默退化（FL:1177-1180）。
+
+### 3.5 KV 前缀契约（LKP:1549-1915）
+请求=静态前缀（语言/节奏/准则/总览/对象档案，整场字节不变）+历史+每条 user 拼当时的易变尾部并由 `_applied_tails` 账本**冻结重放**；末条 user 在 revision 变化（推进/捕获号码）或转写修正时重锚（LKP:1841-1872）。框架的 `[流程状态]` 标记出请求流剥离。铁律=上一轮请求是下一轮严格前缀。
+
+## 4. 语音层（LKP `_Qwen3ASRLiveStream` :5196 起）
+
+音频→VAD→事件链：START（pre-roll 并入 `_pending`）→ INTERIM（300ms 节流滑窗）→ PREFLIGHT（稳定前缀≥6字，喂字幕+PrefillSpeculator）→ **句级 FINAL**（三档：强标点 ≥6 字+无 ASCII run+跨窗稳定 / vad-pause ≥10 字 / B 线子句·长度档默认关；限速 1.5s）→ END_OF_SPEECH（join-hold 抑制时不出）→ finish 整句修正。**join-hold**（LKP:5330-5350）：EOS 时尾部像「没说完」（数字≥2位/系词/热词前缀）→ 不发 EOS，800ms 窗等续段并入同一会话。**重解丢弃**：finish 与已提交不构成前缀且相似≥0.55 → 判同段更好重解丢弃（LKP:5772-5845）。**回声双闸**：STT 流层 `_vocab_echo_guard`（剥尾保头，四闸口 LKP:5250-5270）+ 框架层自听守卫（AG:#1）。会话级 partial 抑制：thinking/speaking 时 partial 间隔抬到 3s（AG:4579-4590），治 GPU 争用拖慢 TTFT。
+
+## 5. 收线 / 结算 / 意向归因
+
+**收线五源**（全部汇入 `_schedule_call_end` AG:3188-3225，幂等闸 `_end_scheduled`）：REFUSE(14s)/FAREWELL(8s)/stall-close(8s)/心跳 farewell(12s, no_response)/时长熔断+拨号失败(直接 cp.end_call)。**客户挂断**走 session close→`_close()`（AG:3134-3158）：session_report→gather 上报任务池 10s→`cp.settle`。**意向评估在 agent**：`_schedule_call_end` 内 `_intent_facts_snapshot`（12 键账本 AG:517-536）×内存规则表→`evaluate_intent_disposition`（(priority,id) 首中、conditions AND、缺键保守）→`cp.end_call` 带 intent_code/disposition（CP:113-131 落列）。**CP 结算** `_settle_core`（CP:3325-3463）：幂等短路→零轮回填→usage 累加→Summarizer 纪要（9B）→对象 digest→知识蒸馏入库（审计 knowledge.distill）→挂断 SMS 钩子（默认关）。
+
+**turns 账本**（CP:1855-1903）：统一经 `conversation_item_added`（AG:2880-2933）。`gen` 全集：`llm`｜`script`（直念族：开场白/心跳/farewell/watchdog/late-answer/starve/stall/defer/say 步/WA flush）｜`qa_fastpath`｜`filler`｜`paused`｜`interrupted`；`provider` 细分归因（graph-play/graph-jump/graph-notify/qa-fastpath/storm-ack/…）。user 轮 gen 恒空。**这就是快路覆盖率的原始数据。**
+
+## 6. 学习回路（现状 + 已拍板扩展）
+
+现状：真实 turns → `mine_qa_pairs` → `POST /api/qa/cluster` dry（LLM 三列：变体/新/垃圾；缓存键 (account,min_calls,limit) TTL 600s；单飞 409）→ 人工勾选 apply（owner 盖章+逐行审计；created>0 清全账号缓存）→ `tts-pregen --qa` 物化（pin=True 永不逐出 TC:173-237）→ 下通电话快路生效。已拍板（2026-09-20）：**路线 A**（分支一等出口：命中+物化→罐头不过 LLM；动作=留步/跳步/收线/转人工）；挖掘源扩**漏网轮**（gen=llm 且说法重复）；提案扩**图词/分支/知识盲区**；**改答案/删词条→走通知，人工确认后自动填入**；变体自动入库先不开；增量自动挖掘等 A 落地。
+
+## 7. 问题清单（代码追踪产出，分三级）
+
+### D 级：本轮代码追踪新发现的真问题（带行号，按严重度）
+
+| # | 问题 | 证据 | 影响 |
+|---|---|---|---|
+| D1 | **发布冻结在开发态被静默违反**：`_template_machine_overlay` 只在 `request.state.machine` 时生效，而该标记只在 auth-on 且 Bearer==BOK_CP_TOKEN 时由 identity_gate 打——auth-off 开发栈与 CP-token-only 形态下 agent 装配拿到 **live 草稿**，不是 published_json | CP:4117 + auth.py:291-296 | 本地/E2E 全量测的「不是发布行为」，冻结不变量零覆盖 |
+| D2 | **看门狗/垫话可整通静默关闭**：`_arm_response_watchdog` 只在 TTS 被包成 CachedTTS 时武装；装配缓存失败（_tts_cache=None 且 FallbackAdapter 未包）→看门狗+垫话拆弹+垫话功能全关，仅一行日志 | AG:2188-2190、2423-2425 | 云 TTS 卡死时「每问无答」自我修复失效且无告警面 |
+| D3 | **campaign 接通率口径与仪表盘自相矛盾**：progress 的 answered=done+no_answer+rejected，把未接通也算接通；dashboard 用严格排除口径 | CP:2485 vs 4269-4271 | 战役 UI 接通率虚高，误导外呼策略 |
+| D4 | **ASR chunk POST 先清后发**：`_maybe_partial` 先 `_pending.clear()` 再 POST，异常静默 return——该窗 PCM 永久丢 | LKP:5531、5549-5550 | sidecar 瞬时不可用时丢转写且无痕 |
+| D5 | **judge conf 缺失按 0.7 放行=自动够建单线**：`parse_judge_route` 对 route 有值但 conf 缺失默认 0.7，`FOLLOWUP_CONF_MIN=0.7` 且比较用 ≥ | FL:1451-1452、1458 | 9B 偶发省略 conf 即自动开跟进单，打扰人工 |
+| D6 | **WA 步误捕获面宽**：裸词「号码」即 WA 语境+任意 4-13 位 run 即 captured，已知号过滤只兜整串/≥8位尾 | FL:710-717、660-671 | 客户报 4 位碎片（验证码式）被当 WhatsApp 号上报 |
+| D7 | **结算窗掐死慢 judge**：`_close` gather 上报任务 10s，意图 judge timeout 20s 且同池——慢判定轮静默丢失 | AG:3144-3150 vs 3436 | 判定结果丢、仅一行 REPORT_TASK_ERR |
+| D8 | **CP 抖动→跨账号污染**：上下文解析异常吞成 call=None 照跑，账号兜底 acc-001——垫话/QA 罐头从错误账号拉 | AG:1793-1794、2762-2763 | 多账号下串资产+幽灵 job 拒接被旁路 |
+| D9 | ** turns 双记**：WA/单号碎片 stash 轮 + flush 合并轮各落一行 | AG:3755/3802 vs 2050/2112 | 分析侧不去重则轮次虚高（快路覆盖率被稀释） |
+| D10 | **意向 duration_s 含拨号等待**：t_start_wall 在装配打点，非接通时刻 | AG:2000、3199 | 「通话时长≤10s」类意向规则系统性偏大 |
+| D11 | **并发非原子窗口**：session-report 幽灵守卫与 whatsapp 状态机均为读-判-写非原子（`mark_active_if_live` 已示范正确做法未复用） | CP:4479-4499、1914-1937 | 并发双写 last-writer-wins |
+| D12 | **auth-off 下 turns/qa-hit 无防**：add_turn 无长度/角色/审计；qa `/hit` 无闸（filler 版补了，qa 版漏配） | CP:1855-1903、3706-3711 | 匿名可灌轮次污染挖掘语料与指标 |
+| D13 | 卫生组：死 API（flow.on_user_turn/apply_judge_verdict 零调用）、_judge_route 只写不读、每 300ms 冷建 httpx client、热词走 URL query、账本集无界、pregen 状态缓存全局单份跨账号、settle 穿透仓储、update_call 零枚举 setattr、redispatch 锁 TOCTOU、投机预热尾部必然分叉 | FL:935/1047；AG:2216；LKP:5538/5493；FL:925；pregen.py:177；CP:3373/1430/4631；spec.py:100-109 | 单列待清 |
+
+### A 级：架构级（用户视角「串不上」的根源，已拍板路线）
+
+| # | 问题 | 路线 |
+|---|---|---|
+| A1 | 步骤分支命中只改提示词、永远走 LLM（§2 例子表实证） | **路线 A-①**：分支命中+物化→罐头出口，插 #13/#14 之间 |
+| A2 | REFUSE/FAREWELL 语义内置、界面无配置口 | 路线 A-②：分支动作集（留步/跳步/收线/转人工）落地后「打错电话→道歉收线」可配 |
+| A3 | 一个心智模型（这步客户这样说怎么办）碎在三个配置面（分支/问答/意图） | 路线 A-③：画布分支编辑器统一；口径=分支=步内应对，QA=跨步通用，意图=复杂路由 |
+| A4 | 学习回路只产词条；图词/分支/改答案无产出 | L-①②③：漏网轮挖掘+图词提案+改答案走通知确认后自动填入 |
+| A5 | 总览把每步 ref 首行常驻静态前缀 vs 渐进披露对抗逐字引力——叠提示词补丁而非数据面解法（模板越长越脆） | 待议：总览只给目标不给事实行 |
+| A6 | 快路覆盖率无指标（gen 数据全在、无人消费） | L-① 驾驶舱首指标 |
