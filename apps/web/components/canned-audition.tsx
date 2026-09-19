@@ -8,7 +8,8 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, apiBase } from "@/lib/api";
+import { api, apiBase, authHeaders } from "@/lib/api";
+import { previewVoice } from "@/lib/preview";
 import { startTrace } from "@/lib/logger";
 
 // 模块级 trace（环形缓存+TTL 有界，见 lib/logger.ts 头注释）。
@@ -77,7 +78,10 @@ export default function CannedAuditionCard() {
   const previewFiller = useCallback(() => {
     const i = Math.floor(Math.random() * 13);
     void playBlob(
-      fetch(`${apiBase()}/api/tts/filler-preview?lang=${lang}&i=${i}`).then((r) => (r.ok ? r.blob() : null)),
+      // auth-on 下节点/云端部署都要 Bearer——裸 fetch 曾 401（W5-T2 收编）。
+      fetch(`${apiBase()}/api/tts/filler-preview?lang=${lang}&i=${i}`, { headers: authHeaders() }).then((r) =>
+        r.ok ? r.blob() : null,
+      ),
       `filler-${lang}`,
     );
   }, [lang, playBlob]);
@@ -103,18 +107,18 @@ export default function CannedAuditionCard() {
     (e: QaEntry) => {
       let why = "";
       void playBlob(
-        api
-          .previewTts({
-            provider: "minimax",
-            text: String(e.answer_text ?? ""),
-            voice: String(e.voice_id ?? ""),
-            language: lang,
-            sample_rate: 24000,
-          })
-          .catch((err: unknown) => {
-            why = String(err ?? "");
-            return null;
-          }),
+        previewVoice({
+          provider: "minimax",
+          text: String(e.answer_text ?? ""),
+          voice: String(e.voice_id ?? ""),
+          language: lang,
+          sample_rate: 24000,
+          // 缓存优先：已物化罐头音直接回放（零云费），404/失败降级现场合成。
+          cannedEntryId: String(e.id ?? "") || undefined,
+        }).catch((err: unknown) => {
+          why = String(err ?? "");
+          return null;
+        }),
         `qa-${e.id ?? ""}`,
         () => why,
       );

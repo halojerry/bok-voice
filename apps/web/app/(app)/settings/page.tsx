@@ -6,7 +6,8 @@ import { api } from "@/lib/api";
 import { ErrorState, LoadingState } from "@/components/app-shell";
 import CannedAuditionCard from "@/components/canned-audition";
 import { SETTING_CARDS, POLICY_META, DEFAULT_PROVIDER, type ProviderKind, type FieldMeta } from "@/lib/settings-meta";
-import { previewLangForVoice } from "@/lib/minimax-voices";
+import { buildVoiceSelectOptions, previewSampleText, resolvePreviewLang } from "@/lib/voice-options";
+import { playAudioBlob, previewVoice } from "@/lib/preview";
 import { startRecording, type RecorderHandle } from "@/lib/recorder";
 import {
   listAudioDevicesOf,
@@ -164,17 +165,11 @@ function VoicePreview({ provider, fieldKey, voice }: { provider: string; fieldKe
     setBusy(true);
     setErr("");
     try {
-      // 云端音色：试听语言按音色 ID 判定（Cantonese_*→粤语示例），否则粤语音色会被用来
-      // 念普通话文字 → 广式普通话。本地 Qwen3（serena/vivian…）仍是多语本地音色，按字段语言。
-      const isCloud = provider === "minimax" || provider === "minimax_streaming" || provider === "volcano_streaming";
-      const lang = isCloud ? previewLangForVoice(voice) : fieldKey === "speaker_cantonese" ? "cantonese" : fieldKey === "speaker_en" ? "en" : "zh";
-      const text =
-        lang === "cantonese"
-          ? "你好，我係想問下件貨而家到咗邊度？唔該幫我 check 下 status 呀。"
-          : lang === "en"
-            ? "Hello, I'd like to ask about your delivery."
-            : "你好，我想了解一下你们的产品和服务。";
-      const blob = await api.previewTts({ provider, text, voice, language: lang, sample_rate: 24000 });
+      // 试听语言单点 resolvePreviewLang：音色 ID 正则优先（Cantonese_*→粤语示例，
+      // 否则粤语音色会被用来念普通话文字 → 广式普通话），不中按字段键回落
+      // （本地 Qwen3 多语音色 serena/vivian…走 speaker_cantonese/speaker_en 链）。
+      const lang = resolvePreviewLang(voice, { fieldKey });
+      const blob = await previewVoice({ provider, text: previewSampleText(lang), voice, language: lang, sample_rate: 24000 });
       if (url) URL.revokeObjectURL(url);
       const u = URL.createObjectURL(blob);
       setUrl(u);
@@ -682,9 +677,14 @@ function MinimaxClonePanel({ clones, onChange }: { clones: MinimaxClone[]; onCha
     setErr("");
     setBusy(true);
     try {
-      const text = lang === "en" ? "Hello, this is my cloned voice." : "你好，这是用我的声音克隆的音色。";
-      const blob = await api.previewTts({ provider: "minimax", text, voice: voiceId, language: lang || "zh", sample_rate: 24000 });
-      new Audio(URL.createObjectURL(blob)).play().catch(() => {});
+      const text =
+        lang === "en"
+          ? "Hello, this is my cloned voice."
+          : lang === "cantonese"
+            ? "你好，我係用我把聲克隆出嚟嘅音色，唔該聽下。"
+            : "你好，这是用我的声音克隆的音色。";
+      const blob = await previewVoice({ provider: "minimax", text, voice: voiceId, language: lang || "zh", sample_rate: 24000 });
+      await playAudioBlob(blob);
     } catch (e) {
       setErr(friendlyErrorText(String(e)));
     } finally {
@@ -753,13 +753,17 @@ function VoiceCard({ value, onChange }: { value: ProviderForm; onChange: (next: 
   const rest = visible.filter((f) => !VOICE_SIMPLE_KEYS.includes(f.key));
   const advanced = meta.fields.filter((f) => f.advanced && (!f.providers || f.providers.includes(provider)));
   // MiniMax 云端克隆清单（存 tts.minimax_clones_json）——合并进分语言三键下拉，
-  // 全语言槽可选（克隆音色无语言绑定，language_boost 按请求生效）。
+  // 全语言槽可选（克隆音色无语言绑定，language_boost 按请求生效）；克隆段标签/
+  // 去重/置顶统一走 lib/voice-options.buildVoiceSelectOptions。
   const clones = parseClones(value.minimax_clones_json);
-  const cloneOptions = clones.map((c) => ({ value: String(c.voice_id), label: `克隆 · ${c.label || c.voice_id}` }));
-  const withClones = (field: FieldMeta): FieldMeta =>
-    cloneOptions.length > 0 && field.key.startsWith("speaker_")
-      ? { ...field, options: [...(field.options ?? []), ...cloneOptions] }
-      : field;
+  const withClones = (field: FieldMeta): FieldMeta => {
+    if (!field.key.startsWith("speaker_")) return field;
+    const cloneOpts = buildVoiceSelectOptions({
+      slotLang: field.key === "speaker_cantonese" ? "cantonese" : field.key === "speaker_en" ? "en" : "zh",
+      minimaxClones: clones,
+    });
+    return cloneOpts.length > 0 ? { ...field, options: [...(field.options ?? []), ...cloneOpts] } : field;
+  };
   const setClones = (next: MinimaxClone[]) =>
     onChange({ ...value, minimax_clones_json: JSON.stringify(next) });
   return (

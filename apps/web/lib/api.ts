@@ -217,11 +217,9 @@ export const api = {
   updatePersona: (id: string, body: unknown) =>
     request<Record<string, unknown>>(`/api/personas/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   deletePersona: (id: string) => request<Record<string, unknown>>(`/api/personas/${id}`, { method: "DELETE" }),
-  updatePersonas: (body: unknown) => request<Record<string, unknown>>("/api/personas", { method: "PUT", body: JSON.stringify(body) }),
   getTurns: (id: string) => request<Record<string, unknown>[]>(`/api/calls/${id}/turns`),
   getSettlement: (id: string) => request<Record<string, unknown>>(`/api/calls/${id}/settlement`),
   activeCalls: () => request<Record<string, unknown>[]>("/api/supervisor/active-calls"),
-  supervisorJoin: (id: string) => request<Record<string, unknown>>(`/api/supervisor/${id}/join`, { method: "POST" }),
   supervisorPause: (id: string) => request<Record<string, unknown>>(`/api/supervisor/${id}/pause-agent`, { method: "POST" }),
   supervisorResume: (id: string) => request<Record<string, unknown>>(`/api/supervisor/${id}/resume-agent`, { method: "POST" }),
   supervisorTakeover: (id: string) => request<Record<string, unknown>>(`/api/supervisor/${id}/takeover`, { method: "POST" }),

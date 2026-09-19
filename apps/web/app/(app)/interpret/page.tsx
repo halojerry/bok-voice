@@ -5,7 +5,8 @@ import InterpretConsole from "@/components/interpret-console";
 import { useAccount } from "@/components/account-context";
 import { api } from "@/lib/api";
 import { friendlyErrorText } from "@/lib/api-ready";
-import { minimaxVoiceOptionsFor } from "@/lib/minimax-voices";
+import { MINIMAX_VOICE_ENTRIES } from "@/lib/minimax-voices";
+import { buildVoiceSelectOptions } from "@/lib/voice-options";
 
 /**
  * 双端同声传译(B 线 v2)——坐席一体台单模式(2026-09-12 用户拍板:同传只保留
@@ -41,13 +42,15 @@ export default function InterpretPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  /** 会话级音色下拉：首项=跟随设置 + MiniMax 静态目录 + 云端克隆（全语言槽）。 */
+  /** 会话级音色下拉：首项=跟随设置 + MiniMax 静态目录 + 云端克隆（全语言槽可选，
+   *  匹配槽位语言的克隆置顶）——装配统一走 lib/voice-options.buildVoiceSelectOptions。 */
   function voiceOptions(lang: string) {
-    return [
-      { value: "", label: "（默认，跟随设置）" },
-      ...minimaxVoiceOptionsFor(lang),
-      ...cloneVoices.map((c) => ({ value: c.voice_id, label: `克隆 · ${c.label || c.voice_id}` })),
-    ];
+    return buildVoiceSelectOptions({
+      catalog: MINIMAX_VOICE_ENTRIES,
+      slotLang: lang,
+      minimaxClones: cloneVoices,
+      firstOption: { value: "", label: "（默认，跟随设置）" },
+    });
   }
 
   async function startConsole() {

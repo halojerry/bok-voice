@@ -38,7 +38,7 @@ import {
 import { useSession, useTranscriptions } from "@livekit/components-react";
 import { Ban, TriangleAlert } from "lucide-react";
 import { AgentSessionProvider } from "@/components/agents-ui/agent-session-provider";
-import { api, apiBase } from "@/lib/api";
+import { api, apiBase, authHeaders } from "@/lib/api";
 import { describeConnectError } from "@/lib/api-ready";
 import { wlog, wlogBindCall } from "@/lib/weblog";
 import { startTrace } from "@/lib/logger";
@@ -1105,7 +1105,7 @@ function ConsoleLive(p: LiveProps) {
     try {
       const r = await fetch(`${apiBase()}/api/tts/preview`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ provider: "qwen3_tts", voice: "Vivian", language: "zh", text: label }),
       });
       if (!r.ok) throw new Error(`preview ${r.status}`);

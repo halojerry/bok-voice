@@ -6,7 +6,9 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
-import { api, authHeaders, type UserRow } from "@/lib/api";
+import { api, type UserRow } from "@/lib/api";
+import { decideAuditionPath } from "@/lib/voice-options";
+import { previewVoice } from "@/lib/preview";
 import {
   bindingFromDraft, bindingThenJumpToDraft, intentJudgeField, JUDGE_PROMPT_MAX_CHARS,
   parseGraphDoc, parseTemplateSteps, resolveClusterTarget, revertCluster,
@@ -613,32 +615,37 @@ export default function QaPage() {
     }
   }
 
-  /** 试听(spec §5):先播录音缓存(零云费,auth-on 经 fetch-blob+Bearer,<audio> 带不了鉴权头);
-   *  缺录音(404)/播放失败回退现场合成——烧云配额仅主管可用,user 见提示待生成。 */
+  /** 试听(spec §5):路由判定单点 decideAuditionPath(状态面缺录音=非主管直接拦截),
+   *  取料走 lib/preview.previewVoice(缓存优先 cannedEntryId→404 降级现场合成,
+   *  全部 fetch 带 Bearer)——烧云配额仅主管可用,user 见提示待生成。 */
   async function audition(row: QaRow) {
     const id = String(row.id ?? "");
     setBusy(`${id}:audition`);
+    const path = decideAuditionPath(canned[id], isManager);
     try {
-      const res = await fetch(api.cannedAudioUrl(id), { headers: authHeaders() });
-      if (!res.ok) throw new Error(String(res.status));
-      await playBlob(await res.blob());
-    } catch {
-      if (isManager) {
-        try {
-          await playBlob(
-            await api.previewTts({
-              provider: "minimax",
-              text: String(row.answer_text ?? ""),
-              voice: String(row.voice_id ?? ""),
-              language: String(row.lang ?? "zh"),
-              sample_rate: 24000,
-            }),
-          );
-        } catch (e) {
+      if (path === "blocked") {
+        window.alert("该条目还没有录音，请联系主管在画布上「重新录音」。");
+        return;
+      }
+      try {
+        await playBlob(
+          await previewVoice({
+            provider: "minimax",
+            text: String(row.answer_text ?? ""),
+            voice: String(row.voice_id ?? ""),
+            language: String(row.lang ?? "zh"),
+            sample_rate: 24000,
+            cannedEntryId: id || undefined,
+            allowLive: isManager,
+          }),
+        );
+      } catch (e) {
+        if (!isManager) {
+          // 状态面滞后(标 ok 实际 404)或无录音:user 一律提示待生成,不烧云。
+          window.alert("该条目还没有录音，请联系主管在画布上「重新录音」。");
+        } else {
           setErr(`试听失败：${String(e)}`);
         }
-      } else {
-        window.alert("该条目还没有录音，请联系主管在画布上「重新录音」。");
       }
     } finally {
       setBusy("");

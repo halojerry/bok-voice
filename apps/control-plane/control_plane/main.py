@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import io
 import json
@@ -95,6 +96,7 @@ from .schemas import (
     SiteCreateRequest,
     TokenRequest,
     TokenResponse,
+    TransferSipRequest,
     TrunkRegisterRequest,
     WhatsAppCaptureRequest,
     WhatsAppHandledRequest,
@@ -433,8 +435,15 @@ def put_settings(req: SettingsRequest, request: Request) -> dict:
         "sip": req.sip.model_dump(),
         "policy": req.policy,
     }
-    secret_keys = {"api_key", "access_token", "token", "auth_password"}
-    for kind in ("asr", "llm", "tts", "vad", "sip"):
+    secret_keys = {"api_key", "access_token", "token", "auth_password", "secret"}
+    if req.sms is not None:
+        # 通知域（W5-T1）：请求未带 sms 键 → 段不动（照 campaign 先例，
+        # 仓库层缺键保留语义接管）。先入 new_values 再走下面 secret 保留循环，
+        # PUT 传空 secret=保留旧值。
+        new_values["sms"] = req.sms.model_dump()
+    for kind in ("asr", "llm", "tts", "vad", "sip", "sms"):
+        if kind not in new_values:
+            continue  # 段未随请求带上（sms=None 等）→ 不动，secret 保留语义也不适用
         old = existing.get(kind, {})
         new = new_values[kind]
         for key in secret_keys:
@@ -456,12 +465,85 @@ def put_settings(req: SettingsRequest, request: Request) -> dict:
 
 def _mask_secrets(config: dict) -> dict:
     out = dict(config)
-    secret_keys = {"api_key", "access_token", "token", "auth_password"}
+    secret_keys = {"api_key", "access_token", "token", "auth_password", "secret"}
     for key in secret_keys:
         if out.get(key):
             out[key] = ""
             out[f"has_{key}"] = True
     return out
+
+
+def _sms_settings() -> dict:
+    """settings.sms 段读取（W5-T1）：端点与挂断钩子共用，缺段=空 dict=未配置。"""
+    return (_repo().get_settings() or {}).get("sms") or {}
+
+
+def _sms_configured(cfg: dict) -> bool:
+    """webhook provider 三要素齐备才算配置：总闸开 + webhook_url + secret。"""
+    return bool(
+        cfg.get("enabled")
+        and str(cfg.get("webhook_url") or "").strip()
+        and str(cfg.get("secret") or "").strip()
+    )
+
+
+async def _send_sms_webhook(cfg: dict, to: str, text: str) -> int:
+    """webhook provider 发送内核（W5-T1 骨架，真实网关未来对接）。
+
+    POST settings.sms.webhook_url，body={"to","text"}；secret 非空时附
+    `X-Bok-Signature: hmac_sha256(secret, body)` hex 摘要（接收方以同一密钥
+    重算校验，参照 CP webhook 验签的「摘要绑定 body」思路反向运用）。
+    返回上游 status_code；网络/HTTP 失败抛异常由调用方收敛（端点 502 /
+    挂断钩子打点吞掉）。
+    """
+    url = str(cfg.get("webhook_url") or "").strip()
+    secret = str(cfg.get("secret") or "")
+    body = json.dumps({"to": to, "text": text}, ensure_ascii=False).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if secret:
+        headers["X-Bok-Signature"] = hmac.new(
+            secret.encode("utf-8"), body, hashlib.sha256
+        ).hexdigest()
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(url, content=body, headers=headers)
+        resp.raise_for_status()
+        return resp.status_code
+
+
+@app.post("/api/notify/sms")
+async def notify_sms(payload: dict, request: Request) -> dict:
+    """短信 webhook provider（W5-T1 骨架）：真实网关未来对接，webhook_url 即对接点。
+
+    发送烧真实外部配额，auth-on 时归管理面（同 tts.preview 判据）。
+    body {call_id, to, text}：to 空=按 call_id 反查 contact_phone，都空 400；
+    未配置（disabled/空 webhook_url/空 secret）→ 503；上游失败一律 502。
+    审计 sms.send（detail 带 chars/status_code，secret/webhook_url 永不落审计）。
+    """
+    require_role(request, "admin", "root")
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(400, "text 必填")
+    to = str(payload.get("to") or "").strip()
+    call_id = str(payload.get("call_id") or "").strip()
+    if not to and call_id:
+        call = _repo().get_call(call_id)
+        if not call:
+            raise HTTPException(404, "call not found")
+        to = str(call.get("contact_phone") or "").strip()
+    if not to:
+        raise HTTPException(400, "to 与 call_id 至少给一个（且该通话须有 contact_phone）")
+    cfg = _sms_settings()
+    if not _sms_configured(cfg):
+        raise HTTPException(503, "短信 webhook 未配置：请到「设置 → 通知」填写 webhook URL 与 secret 并启用")
+    try:
+        status_code = await _send_sms_webhook(cfg, to, text)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, f"webhook 发送失败: {exc}") from exc
+    _audit("sms.send", subject_type="sms", subject_id=(call_id or to)[:64],
+           call_id=call_id, detail={"chars": len(text), "status_code": status_code, "source": "api"})
+    return {"ok": True, "provider": "webhook", "status_code": status_code}
 
 
 @app.get("/api/asr/health")
@@ -3306,6 +3388,25 @@ async def _settle_core(call_id: str) -> dict:
         subject_id=call_id,
         detail={"status": result.get("status", ""), "turns": len(turns), "has_summary": bool(result.get("summary"))},
     )
+    # 挂断自动短信（W5-T1 骨架，默认关）：enabled+hangup_enabled 且有号码才发；
+    # 号码=call.contact_phone，空则 object.phone 兜底（同 digest 段读法）。模板
+    # hangup_template 支持 {contact} 占位=收件号码。二次 settle 在函数头被
+    # existing 短路，天然不重发。失败只打点绝不破 settle（照 summarizer 段
+    # 「must not break settle」先例）。
+    try:
+        sms_cfg = _sms_settings()
+        if _sms_configured(sms_cfg) and sms_cfg.get("hangup_enabled"):
+            phone = str(call.get("contact_phone") or "").strip()
+            if not phone and call.get("object_id"):
+                obj = _repo().get_object(call["object_id"])
+                phone = str((obj or {}).get("phone") or "").strip()
+            template = str(sms_cfg.get("hangup_template") or "").strip()
+            if phone and template:
+                status_code = await _send_sms_webhook(sms_cfg, phone, template.replace("{contact}", phone))
+                _audit("sms.send", subject_type="sms", subject_id=call_id,
+                       call_id=call_id, detail={"chars": len(template), "status_code": status_code, "source": "hangup"})
+    except Exception as exc:  # pragma: no cover - sms hook must not break settle
+        print(f"[settle] sms hook failed: {exc!r}", flush=True)
     return _repo().get_settlement(call_id) or result
 
 
@@ -4925,6 +5026,53 @@ async def transfer(call_id: str, request: Request) -> dict:
     _disconnect_room_background(call_id)
     _audit("supervisor.transfer", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""), call_id=call_id)
     return {"call_id": call_id, "action": "transfer", "status": call["status"], "disconnected": True}
+
+
+@app.post("/api/supervisor/{call_id}/transfer-sip")
+async def transfer_sip(call_id: str, req: TransferSipRequest, request: Request) -> dict:
+    """SIP REFER 试点骨架（W5-T1）：把通话电话腿直接转给坐席手机号/SIP URI。
+
+    trunk 的 REFER 支持未验证——settings.sip.mode=="mock"（默认）一律短路返回
+    {"mocked": True}（默认安全，不触 LiveKit）；真路径只在显式 real 档执行，
+    姿势照 trunk register 先例（一次性客户端 finally aclose、失败 502）。
+    participant_identity 按 LiveKit SIP 参与者命名约定取 `sip-{contact_phone}`
+    （call 行无号码 400——mock 档同样先验，语义不随档位漂移）。
+    """
+    require_role(request, "admin", "root")
+    deny_cross_account(request, _repo().get_call(call_id))
+    call = _repo().get_call(call_id)
+    if not call:
+        raise HTTPException(404, "call not found")
+    transfer_to = (req.transfer_to or "").strip()
+    if not transfer_to:
+        raise HTTPException(400, "transfer_to 必填")
+    contact_phone = str(call.get("contact_phone") or "").strip()
+    if not contact_phone:
+        raise HTTPException(400, "该通话无 contact_phone，无法定位 SIP 参与者")
+    sip_cfg = (_repo().get_settings() or {}).get("sip") or {}
+    mocked = str(sip_cfg.get("mode") or "mock") != "real"
+    if not mocked:
+        client = _lkapi_client()
+        if client is None:
+            raise HTTPException(502, "LiveKit 凭据未配置——livekit-sip 未部署或不可达")
+        from livekit.api import TransferSIPParticipantRequest
+
+        try:
+            await client.sip.transfer_sip_participant(
+                TransferSIPParticipantRequest(
+                    room_name=call_id,
+                    participant_identity=f"sip-{contact_phone}",
+                    transfer_to=transfer_to,
+                )
+            )
+        except Exception as exc:
+            raise HTTPException(502, f"SIP transfer 失败——livekit-sip 未部署或不可达: {exc}") from exc
+        finally:
+            await client.aclose()  # 一次性客户端（自带 aiohttp session）必须关
+    _audit("supervisor.transfer_sip", subject_type="call", subject_id=call_id,
+           account_id=str(call.get("account_id") or ""), call_id=call_id,
+           detail={"transfer_to": transfer_to, "mocked": mocked})
+    return {"call_id": call_id, "mocked": mocked, "transfer_to": transfer_to}
 
 
 @app.post("/api/supervisor/{call_id}/end")

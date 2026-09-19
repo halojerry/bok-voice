@@ -9,7 +9,7 @@
 --
 -- 生成日期: 2026-09-19
 -- 源镜像:   pgvector/pgvector:pg16
--- 源命令:   docker exec pg-ddl-w4t1 pg_dump -U postgres --schema-only --no-owner --no-privileges postgres
+-- 源命令:   docker exec pg-ddl pg_dump -U postgres --schema-only --no-owner --no-privileges postgres
 -- 回环校验: pgvector/pgvector:pg16 上应用本文件 + 重跑 build_engine() = 零 DDL 变更(生成时实测)
 -- 规模:     CREATE TABLE 26 张 / CREATE INDEX 37 条 / 数据语句 0 条
 --           (--schema-only:正常应 0 条数据语句;带 DEFAULT/COMMENT 属 schema 本身)
@@ -266,6 +266,7 @@ CREATE TABLE public.global_settings (
     vad_json text NOT NULL,
     sip_json text NOT NULL,
     campaign_json text DEFAULT ''::text NOT NULL,
+    sms_json text DEFAULT ''::text NOT NULL,
     policy character varying(64) NOT NULL,
     updated_at timestamp without time zone NOT NULL
 );

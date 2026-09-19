@@ -258,6 +258,22 @@ class CampaignSettingsModel(BaseModel):
     call_windows: list[dict] = []
 
 
+class SmsSettingsModel(BaseModel):
+    """通知域（W5-T1）：settings.sms 段——webhook provider 骨架。
+
+    真实短信网关未来对接，webhook_url 即对接点。secret 走 secret 掩码
+    （GET 返回空串+has_secret 标记，PUT 传空=保留旧值，与 sip.auth_password
+    同档）。enabled=False 总闸；hangup_enabled=挂断结算后自动发（默认关）；
+    hangup_template 支持 {contact} 占位=收件号码。
+    """
+
+    webhook_url: str = ""
+    secret: str = ""
+    enabled: bool = False
+    hangup_enabled: bool = False
+    hangup_template: str = ""
+
+
 class SettingsRequest(BaseModel):
     asr: ProviderSettings = ProviderSettings()
     llm: ProviderSettings = ProviderSettings()
@@ -267,7 +283,15 @@ class SettingsRequest(BaseModel):
     # None=请求未带 campaign 键 → 保留既有段（不清运营已配的全局窗）；
     # 传 {} / call_windows=[] = 清空（不限时段）。
     campaign: CampaignSettingsModel | None = None
+    # None=请求未带 sms 键 → 保留既有段（不清已配 webhook，照 campaign 先例）。
+    sms: SmsSettingsModel | None = None
     policy: str = "offline_first"
+
+
+class TransferSipRequest(BaseModel):
+    """SIP REFER 试点（W5-T1）：转接目标（坐席手机号 / SIP URI），必填。"""
+
+    transfer_to: str = ""
 
 
 class SupervisorCommand(BaseModel):

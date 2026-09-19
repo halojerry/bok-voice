@@ -13,9 +13,10 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useMemo, type ReactNode, type Ref } from "react";
+import { useMemo, useState, type ReactNode, type Ref } from "react";
 import { Menu } from "lucide-react";
 import { useSession, useSessionActions } from "@/components/session-context";
+import { api } from "@/lib/api";
 import { FLAT_NAV, GUARD_ONLY, matchesPath } from "@/lib/navigation";
 
 export type TopbarProps = {
@@ -41,11 +42,117 @@ function pageTitle(pathname: string): string {
     .label;
 }
 
+/**
+ * 改密对话框（W5-T2 孤儿 API 收编：api.changeMyPassword 此前无任何消费点）。
+ * 自绘覆盖层照 qa 页 IntentEditorModal 手法：fixed 全屏遮罩点击关窗、内层
+ * stopPropagation；新密码 ≥8 位前端先拦；成功=关窗+logout+跳登录页重新登录。
+ */
+function ChangePasswordDialog({ onClose }: { onClose: () => void }) {
+  const { logout } = useSessionActions();
+  const [oldPw, setOldPw] = useState("");
+  const [newPw, setNewPw] = useState("");
+  const [confirmPw, setConfirmPw] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  async function submit() {
+    if (newPw.length < 8) {
+      setErr("新密码至少 8 位。");
+      return;
+    }
+    if (newPw !== confirmPw) {
+      setErr("两次输入的新密码不一致。");
+      return;
+    }
+    setBusy(true);
+    setErr("");
+    try {
+      await api.changeMyPassword(oldPw, newPw);
+      // 成功即失效旧会话：关框 → 登出 → 回登录页重新登录。
+      onClose();
+      logout();
+      window.location.href = "/login/";
+    } catch (e) {
+      setErr(String(e));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+      onClick={onClose}
+      onContextMenu={(e) => e.preventDefault()}
+    >
+      <div
+        className="w-full max-w-sm rounded-xl border border-(--card-border) bg-(--card) p-5 shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between gap-3">
+          <span className="label">修改密码</span>
+          <button type="button" className="btn-ghost text-xs" onClick={onClose}>
+            关闭
+          </button>
+        </div>
+        <div className="mt-3 space-y-3">
+          <label className="block">
+            <span className="text-xs text-muted-foreground">当前密码</span>
+            <input
+              autoFocus
+              type="password"
+              className="input mt-1"
+              value={oldPw}
+              onChange={(e) => {
+                setOldPw(e.target.value);
+                setErr("");
+              }}
+            />
+          </label>
+          <label className="block">
+            <span className="text-xs text-muted-foreground">新密码（至少 8 位）</span>
+            <input
+              type="password"
+              className="input mt-1"
+              value={newPw}
+              onChange={(e) => {
+                setNewPw(e.target.value);
+                setErr("");
+              }}
+            />
+          </label>
+          <label className="block">
+            <span className="text-xs text-muted-foreground">确认新密码</span>
+            <input
+              type="password"
+              className="input mt-1"
+              value={confirmPw}
+              onChange={(e) => {
+                setConfirmPw(e.target.value);
+                setErr("");
+              }}
+            />
+          </label>
+          {err && <p className="text-sm text-red-600">{err}</p>}
+          <button
+            type="button"
+            className="btn-primary w-full"
+            disabled={busy || !oldPw || !newPw}
+            onClick={() => void submit()}
+          >
+            {busy ? "提交中…" : "修改并重新登录"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function Topbar({ onMobileOpen, mobileTriggerRef, status }: TopbarProps) {
   const pathname = usePathname();
   const session = useSession();
   const { logout } = useSessionActions();
   const title = useMemo(() => pageTitle(pathname), [pathname]);
+  const [pwOpen, setPwOpen] = useState(false);
 
   function handleLogout() {
     logout();
@@ -94,6 +201,13 @@ export function Topbar({ onMobileOpen, mobileTriggerRef, status }: TopbarProps) 
             <button
               type="button"
               className="transition hover:text-(--foreground)"
+              onClick={() => setPwOpen(true)}
+            >
+              改密
+            </button>
+            <button
+              type="button"
+              className="transition hover:text-(--foreground)"
               onClick={handleLogout}
             >
               退出
@@ -104,6 +218,7 @@ export function Topbar({ onMobileOpen, mobileTriggerRef, status }: TopbarProps) 
           进入工作台
         </Link>
       </div>
+      {pwOpen && <ChangePasswordDialog onClose={() => setPwOpen(false)} />}
     </header>
   );
 }

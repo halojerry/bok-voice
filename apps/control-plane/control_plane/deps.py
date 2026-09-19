@@ -303,6 +303,11 @@ def build_engine() -> Engine | None:
                 # 带 DEFAULT 合法）。
                 _ensure_column(conn, "global_settings", "campaign_json",
                                "campaign_json TEXT NOT NULL DEFAULT ''")
+                # 通知域（W5-T1）：settings.sms 段（webhook provider 骨架）落库列。
+                # 空 blob=未配置 → 读侧回落 default_settings()["sms"]；DDL 与
+                # models.GlobalSetting.sms_json server 侧同形（同 campaign_json 先例）。
+                _ensure_column(conn, "global_settings", "sms_json",
+                               "sms_json TEXT NOT NULL DEFAULT ''")
                 # 同义簇(qa-canvas Phase1,spec 2026-09-17):qa_entries 变体指向
                 # 簇头条目——''=独立条目/簇头本体,非空=本条是指向条目的变体。
                 _ensure_column(
