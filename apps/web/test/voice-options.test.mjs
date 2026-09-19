@@ -72,13 +72,13 @@ test("克隆置顶：匹配 slotLang 的克隆排目录与预置之前", () => {
     slotLang: "cantonese",
     minimaxClones: [
       { voice_id: "clone-en", label: "英克隆", sample_lang: "en" },
-      { voice_id: "clone-yue", label: "粤克隆", sample_lang: "cantonese" },
+      { voice_id: "clone-canto", label: "粤克隆", sample_lang: "cantonese" },
     ],
-    localClones: [{ id: "local-yue", lang: "cantonese" }],
+    localClones: [{ id: "local-canto", lang: "cantonese" }],
     localSpeakers: ["serena", "vivian"],
   });
   assert.deepEqual(opts.map((o) => o.value), [
-    "clone-yue", "local-yue", // 匹配语言克隆置顶（云端→本地）
+    "clone-canto", "local-canto", // 匹配语言克隆置顶（云端→本地）
     "canto-a", // 目录过滤到粤语
     "serena", "vivian", // 预置 speaker（不过滤）
     "clone-en", // 其余克隆垫底
