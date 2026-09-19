@@ -49,7 +49,15 @@ from .campaign import (
 from .deps import build_engine, build_repository, build_session_factory
 from .dispatch_utils import cleanup_dispatch, has_active_dispatch
 from .nodes_store import HEARTBEAT_INTERVAL_S, LicenseError, NodeStore
-from .permissions import GRANTABLE_PERMISSIONS, PAGE_PERMISSIONS, effective_permissions
+from .permissions import (
+    DEFAULT_ADMIN_PERMISSIONS,
+    GRANTABLE_PERMISSIONS,
+    MANAGEMENT_GRANTABLE,
+    MANAGEMENT_PERMISSIONS,
+    PAGE_PERMISSIONS,
+    effective_admin_permissions,
+    effective_permissions,
+)
 from .pregen import persona_pregen_status
 from . import pregen as pregen_mod
 from . import qa_cluster as qa_cluster_mod
@@ -418,10 +426,15 @@ def health() -> dict:
 
 @app.get("/api/settings")
 def get_settings(request: Request, internal: bool = False) -> dict:
-    # 设置=节点运维面（含云端凭据），话务员不可见；agent 机器通道直通。
-    require_role(request, "admin", "root")
+    # 设置=节点运维面（含云端凭据），话务员不可见；agent 机器通道直通（下发制键闸）。
+    _gate_management(request, "settings")
     raw = _repo().get_settings()
     if internal:
+        # 密钥面收口（2026-09-20 下发制）：明文回源只认 root 与机器通道——
+        # admin 浏览器面恒掩码，被盗 admin 凭据拉不走云凭据（MiniMax key 等）。
+        ident = current_identity(request)
+        if ident is not None and ident.role != "root":
+            raise HTTPException(403, "明文设置仅平台方（root）可读")
         return raw
     masked = {k: _mask_secrets(v) for k, v in raw.items() if k != "policy"}
     masked["policy"] = raw.get("policy", "offline_first")
@@ -430,7 +443,7 @@ def get_settings(request: Request, internal: bool = False) -> dict:
 
 @app.put("/api/settings")
 def put_settings(req: SettingsRequest, request: Request) -> dict:
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     existing = _repo().get_settings()
     new_values = {
         "asr": req.asr.model_dump(),
@@ -524,7 +537,7 @@ async def notify_sms(payload: dict, request: Request) -> dict:
     未配置（disabled/空 webhook_url/空 secret）→ 503；上游失败一律 502。
     审计 sms.send（detail 带 chars/status_code，secret/webhook_url 永不落审计）。
     """
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     text = str(payload.get("text") or "").strip()
     if not text:
         raise HTTPException(400, "text 必填")
@@ -603,7 +616,7 @@ async def tts_voices(request: Request) -> list[dict]:
 
 @app.delete("/api/tts/voices/{voice_id}")
 async def tts_delete_voice(voice_id: str, request: Request) -> dict:
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     """删除已克隆音色（preset 不可删；同步清理 registry/缓存/参考音频）。"""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -650,7 +663,7 @@ async def tts_register_voice(
     ref_text: str = Form(...),
     language: str = Form("zh"),
 ) -> dict:
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     try:
         files = {"file": (file.filename or "reference.wav", await file.read())}
         data = {
@@ -744,7 +757,7 @@ async def tts_minimax_voice_clone(
     sample_lang: str = Form("zh"),
 ) -> dict:
     """参考音频 → MiniMax 云端克隆 voice_id（不激活、0 费用；见节首注释）。"""
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     label = label.strip()[:64]
     sample_lang = (sample_lang.strip().lower() or "zh")[:16]
     audio = await file.read()
@@ -818,7 +831,7 @@ async def tts_minimax_voice_clone(
 
 @app.delete("/api/tts/minimax-voices/{voice_id}")
 async def tts_minimax_voice_delete(voice_id: str, request: Request) -> dict:
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     api_key = _minimax_api_key()
     if not api_key:
         raise HTTPException(status_code=503, detail="MiniMax API Key 未配置：请到「设置 → TTS 语音合成」填写 API Key 并保存")
@@ -895,7 +908,7 @@ def tts_filler_preview(lang: str = "zh", i: int = 0, request: Request = None) ->
 @app.post("/api/tts/preview")
 async def tts_preview(payload: dict, request: Request) -> Response:
     # 试听会真实消耗云端 TTS 配额（MiniMax），auth-on 时归管理面。
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     """试听一段 TTS。provider=qwen3_tts 走本地 sidecar；provider=minimax 走云端 MiniMax
     （voice 是 MiniMax 音色 ID，如 Cantonese_Male_news_anchor_vv2）。返回 WAV。"""
     provider = str(payload.get("provider") or "qwen3_tts").lower()
@@ -1028,26 +1041,109 @@ def _gate_page(request: Request, key: str) -> None:
         raise HTTPException(status_code=403, detail="forbidden")
 
 
+# 管理面路径→下发键（单一映射表）：auto_gate_management 按请求路径前缀取键。
+# 口径：TTS 声纹/预览、SIP 站点、短信、setup 归 settings；知识库/人设/审计/
+# 主管台各归其键；qa 预生成与垫话罐头归 qa 页键；对象写门归 objects 页键；
+# insights 归 reports 页键（报表洞察域）；通话删除归 supervisor（处置域）。
+# 仅曾以 require_role(admin,root) 把闸的管理面换装到此表——话务员工作面
+# （_gate_page）不经此表。
+_AUTO_GATE_KEY_BY_PREFIX: tuple[tuple[str, str], ...] = (
+    ("/api/settings", "settings"),
+    ("/api/setup", "settings"),
+    ("/api/notify/sms", "settings"),
+    ("/api/tts/", "settings"),
+    ("/api/sip/", "settings"),
+    ("/api/knowledge", "knowledge"),
+    ("/api/personas", "personas"),
+    ("/api/audit", "audit"),
+    ("/api/qa/pregen", "qa"),
+    ("/api/fillers", "qa"),
+    ("/api/objects", "objects"),
+    ("/api/insights", "reports"),
+    ("/api/supervisor", "supervisor"),
+    ("/api/calls/", "supervisor"),  # 仅管理面删单闸走此表（建单/工作面走 _gate_page）
+)
+
+
+def auto_gate_management(request: Request) -> None:
+    """路径自感知的管理面键闸（2026-09-20 下发制换装）：前缀表→_gate_management。"""
+    path = request.url.path
+    for prefix, key in _AUTO_GATE_KEY_BY_PREFIX:
+        if path.startswith(prefix):
+            _gate_management(request, key)
+            return
+    # 无映射：保守回旧角色闸（表应覆盖全部换装点；此处兜底不放大权限面）。
+    auto_gate_management(request)
+
+
+def _gate_management(request: Request, key: str) -> None:
+    """管理面键闸（2026-09-20 下发制）：root/机器通道/auth-off 直通；admin 逐请求
+    查库验下发集（管理键目录为主，页键双查兼容 qa/fillers/reports/objects 等
+    运营写门同闸换装）；user 恒 403；auth-on 无身份 401。
+
+    「root 没下发就用不了」：被盗/越权 admin 凭据只享受被授予的子集，权限行
+    改动即时生效（逐请求查库，不吃 JWT 缓存）。
+    """
+    ident = current_identity(request)
+    if ident is None:
+        if getattr(request.state, "machine", False):
+            return
+        if auth_required():
+            raise HTTPException(status_code=401, detail="unauthorized")
+        return
+    if ident.role == "root":
+        return
+    if ident.role != "admin":
+        raise HTTPException(status_code=403, detail="forbidden")
+    user = _repo().get_user(ident.user_id) or {}
+    if key not in effective_admin_permissions(str(user.get("permissions_json") or "")):
+        label = (MANAGEMENT_PERMISSIONS.get(key) or PAGE_PERMISSIONS.get(key) or {}).get("label", key)
+        raise HTTPException(status_code=403, detail=f"未获「{label}」权限，请联系平台管理员")
+
+
 def _permissions_payload(permissions: list[str] | None) -> str:
     """写入形态：None → ''（默认集）；list → 目录序去重的 JSON 数组串（'[]'=全关）。
 
-    校验（键白名单 / 目标角色）在 `_validate_user_permissions`，调用方先过闸。
+    校验（键白名单 / 目标角色 / 授予包含）在 `_validate_user_permissions`，调用方先过闸。
+    目录序 = 页面目录在前、管理目录在后（与 effective_admin_permissions 输出同序）。
     """
     if permissions is None:
         return ""
     wanted = {str(k) for k in permissions}
-    return json.dumps([k for k in PAGE_PERMISSIONS if k in wanted], ensure_ascii=False)
+    ordered = [k for k in PAGE_PERMISSIONS if k in wanted]
+    ordered += [k for k in MANAGEMENT_PERMISSIONS if k in wanted]
+    return json.dumps(ordered, ensure_ascii=False)
 
 
 def _validate_user_permissions(target_role: str, permissions: list[str] | None) -> None:
-    """B4 权限写入校验：只对 role=user 目标；键必须 ⊆ grantable（主管专属永不进目录）。"""
+    """B4 权限写入校验：user 目标 ⊆ grantable 页面键；admin 目标（下发制）⊆
+    grantable+管理键，且仅 root 能建/改 admin（角色闸在 _require_user_admin）。"""
     if permissions is None:
         return
-    if target_role != "user":
-        raise HTTPException(400, "permissions 仅适用于 role=user 的账号")
-    unknown = sorted({str(k) for k in permissions} - GRANTABLE_PERMISSIONS)
+    if target_role == "user":
+        allowed = GRANTABLE_PERMISSIONS
+    elif target_role == "admin":
+        allowed = GRANTABLE_PERMISSIONS | MANAGEMENT_GRANTABLE
+    else:
+        raise HTTPException(400, "permissions 仅适用于 user/admin 目标的账号")
+    unknown = sorted({str(k) for k in permissions} - allowed)
     if unknown:
         raise HTTPException(400, f"未知权限键: {', '.join(unknown)}")
+
+
+def _ensure_grant_within_creator(
+    identity: Identity | None, target_role: str, permissions: list[str] | None
+) -> None:
+    """权限包含（2026-09-20 下发制配套）：admin 授予 user 页面键时不得越过自己
+    被下发的集——「授不出自己没有的」。root/auth-off/机器通道不适用（机器通道
+    在 users 管理面已被 _require_user_admin 拒绝，到不了这里）。"""
+    if identity is None or identity.role != "admin" or target_role != "user" or permissions is None:
+        return
+    row = _repo().get_user(identity.user_id) or {}
+    held = set(effective_admin_permissions(str(row.get("permissions_json") or "")))
+    beyond = sorted({str(k) for k in permissions} - held)
+    if beyond:
+        raise HTTPException(400, f"无权授予未持有的权限: {', '.join(beyond)}")
 
 
 def _hardened_auth() -> bool:
@@ -1096,6 +1192,11 @@ def _require_user_admin(identity: Identity | None, target_role: str, target_acco
     if identity.role == "root":
         return
     if identity.role == "admin":
+        # 下发制（2026-09-20）：admin 动员工面先验「员工管理」键——root 没下发就
+        # 用不了（新建 admin 缺省无此键；存量 ''=全量不受影响）。逐请求查库。
+        row = _repo().get_user(identity.user_id) or {}
+        if "users" not in effective_admin_permissions(str(row.get("permissions_json") or "")):
+            raise HTTPException(403, "未获「员工管理」权限，请联系平台管理员")
         if target_role != "user":
             raise HTTPException(403, "admin 只能创建/管理 user 角色")
         if target_account and target_account != identity.account_id:
@@ -1170,10 +1271,20 @@ def create_user(req: CreateUserRequest, request: Request) -> dict:
     if len(req.password) < 8:
         raise HTTPException(400, "密码至少 8 位")
     _require_user_admin(identity, req.role, req.account_id)
-    # B4 页面权限：仅 role=user 目标可带，键 ⊆ grantable；缺省=None → 存 ''（默认集）。
+    # B4 权限：user 目标 ⊆ 页面键；admin 目标（下发制）⊆ 页面键+管理键（仅 root 建得了）。
     _validate_user_permissions(req.role, req.permissions)
+    # 权限包含：admin 授不出自己没有的键（root/auth-off 不受限）。
+    _ensure_grant_within_creator(identity, req.role, req.permissions)
     if _repo().get_user_by_username(req.username.strip()):
         raise HTTPException(409, "用户名已存在")
+    if req.permissions is not None:
+        perm_json = _permissions_payload(req.permissions)
+    elif req.role == "admin":
+        # 下发制默认章：新建 admin = 运营默认集 + 管理键全关（'' 保留给存量全量
+        # 语义，升级零变化；root 之后逐键下发）。2026-09-20。
+        perm_json = json.dumps(DEFAULT_ADMIN_PERMISSIONS, ensure_ascii=False)
+    else:
+        perm_json = _permissions_payload(None)
     user = _repo().create_user(
         username=req.username.strip(),
         password_hash=hash_password(req.password),
@@ -1182,7 +1293,7 @@ def create_user(req: CreateUserRequest, request: Request) -> dict:
         # admin 建话务员：不传 account 时默认落 admin 本账号。
         account_id=req.account_id or (identity.account_id if identity and identity.role == "admin" else ""),
         display_name=req.display_name,
-        permissions_json=_permissions_payload(req.permissions),
+        permissions_json=perm_json,
     )
     _audit("user.create", subject_type="user", subject_id=str(user["id"]),
            account_id=str(user.get("account_id") or ""))
@@ -1198,9 +1309,24 @@ def list_users(request: Request, account_id: str = "") -> dict:
             raise HTTPException(403, "machine channel not allowed on user admin")
     elif identity.role == "user":
         raise HTTPException(403, "无账号管理权限")
+    # 空账号 admin fail-closed（2026-09-20）：仓库层把过滤值 '' 当 match-all，
+    # 通配符漂移同族于 scoped_account F7 修复——admin 行没落账号=配置错误，
+    # 宁可 403 不给全账号用户视图（含 root 行）。机器通道不受影响。
+    if identity and identity.role == "admin":
+        if not identity.account_id:
+            raise HTTPException(403, "admin account unassigned — 请平台管理员补齐账号归属")
+        # 下发制：列员工也需「员工管理」键（与 POST/PATCH 同闸，逐请求查库）。
+        row = _repo().get_user(identity.user_id) or {}
+        if "users" not in effective_admin_permissions(str(row.get("permissions_json") or "")):
+            raise HTTPException(403, "未获「员工管理」权限，请联系平台管理员")
     # admin 强制本账号视角；root/auth-off 按参过滤（空=全部）。
     acct = identity.account_id if (identity and identity.role == "admin") else account_id
-    return {"users": [_user_public(u) for u in _repo().list_users(acct)]}
+    rows = _repo().list_users(acct)
+    # root 行对一切非 root 身份不可见（纵深防御：即便 admin 被映射进 root 所在
+    # 账号，也不出现 root 行——root 名录只归 root）。auth-off 无身份保持全通。
+    if identity is not None and identity.role != "root":
+        rows = [u for u in rows if str(u.get("role") or "") != "root"]
+    return {"users": [_user_public(u) for u in rows]}
 
 
 @app.patch("/api/users/{user_id}")
@@ -1214,8 +1340,17 @@ def update_user(user_id: str, req: UpdateUserRequest, request: Request) -> dict:
         raise HTTPException(404, "user not found")
     if identity:
         if identity.role == "admin":
-            if target.get("account_id") != identity.account_id or target.get("role") == "root":
-                raise HTTPException(403, "admin 只能管理本账号的非 root 成员")
+            # 下发制 2026-09-20 收敛 C：admin 行（含他人）仅 root 可管理；自身资料
+            # （display_name 等）保留自助；user 成员照旧 B4 管理（含改其页面权限）。
+            is_self = str(target.get("id") or "") == identity.user_id
+            if target.get("role") in ("root", "admin"):
+                if not is_self:
+                    raise HTTPException(403, "admin 行仅平台方可管理")
+                if req.permissions is not None:
+                    # 权限（含自我提权）一律只归 root——admin 不能给自己加键。
+                    raise HTTPException(403, "admin 不可改动权限下发，请联系平台管理员")
+            if target.get("account_id") != identity.account_id:
+                raise HTTPException(403, "admin 只能管理本账号成员")
         elif identity.role != "root":
             raise HTTPException(403, "无账号管理权限")
     if req.role:
@@ -1238,8 +1373,10 @@ def update_user(user_id: str, req: UpdateUserRequest, request: Request) -> dict:
         fields["role"] = req.role
     if req.permissions is not None:
         # B4：目标角色取**现存**角色（改角色与改权限同 request 时以旧角色判，
-        # 免一次请求内绕过「permissions 仅限 user 目标」）；None=不改。
+        # 免一次请求内绕过「permissions 仅限 user/admin 目标」）；None=不改。
+        # 下发制：admin 授不出自己没有的键（2026-09-20）。
         _validate_user_permissions(str(target.get("role") or ""), req.permissions)
+        _ensure_grant_within_creator(identity, str(target.get("role") or ""), req.permissions)
         fields["permissions_json"] = _permissions_payload(req.permissions)
     updated = _repo().update_user(user_id, **fields)
     _audit("user.update", subject_type="user", subject_id=user_id,
@@ -1610,7 +1747,7 @@ def get_call(call_id: str, request: Request) -> dict:
 
 @app.delete("/api/calls/{call_id}")
 def delete_call(call_id: str, request: Request) -> dict:
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     _gate_page(request, "calls")
     deny_cross_account(request, _repo().get_call(call_id))
     if not _repo().delete_call(call_id):
@@ -1622,7 +1759,7 @@ def delete_call(call_id: str, request: Request) -> dict:
 @app.delete("/api/calls")
 def clear_ended_calls(request: Request, account_id: str = "acc-001") -> dict:
     """清空该账号下已结束(ended)的通话历史。活跃/进行中的通话不删。"""
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     _gate_page(request, "calls")
     account_id = scoped_account(request, account_id)
     calls = _repo().list_calls(account_id, status=CallStatus.ENDED.value)
@@ -2508,7 +2645,7 @@ def create_sip_site(req: SiteCreateRequest, request: Request) -> dict:
     if sip_edge not in ("none", "local", "cloud"):
         raise HTTPException(400, f"sip_edge 只支持 none|local|cloud（收到：{sip_edge}）")
     # 建站=基础设施引导（B2 管理面语义）：user 不可建；admin 非 root 强制本账号。
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     account_id = (req.account_id or "acc-001").strip() or "acc-001"
     identity = current_identity(request)
     if identity is not None and identity.role != "root":
@@ -2554,7 +2691,7 @@ async def register_sip_trunk(site_id: str, req: TrunkRegisterRequest, request: R
     site.trunk_id——宁可报错也不静默清空站点已注册的 trunk。
     """
     # trunk 注册携带 SIP 凭据=基础设施动作（B2 管理面）；跨账号站点一律 404。
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     site = deny_cross_account(request, _repo().get_site(site_id))
     if not site:
         raise HTTPException(404, "site not found")
@@ -2626,7 +2763,7 @@ def spawn_mock_callee(req: MockCalleeRequest, request: Request) -> dict:
     """
     import subprocess
 
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     if not req.room or not req.number:
         raise HTTPException(400, "room and number are required")
     identity = req.identity or f"sip-mock-{req.number}"
@@ -3484,7 +3621,7 @@ def get_object(object_id: str, request: Request) -> dict:
 @app.post("/api/objects")
 def create_object(request: Request, account_id: str, req: CreateObjectRequest) -> dict:
     # 对象=客户资料，话务员只读（页面矩阵）；建/改/删归 admin/root。
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     account_id = scoped_account(request, account_id)
     obj = _repo().create_object(account_id, req.model_dump())
     _audit("object.create", subject_type="object", subject_id=obj.get("id", ""), account_id=account_id, detail={"display_name": obj.get("display_name", "")})
@@ -3493,7 +3630,7 @@ def create_object(request: Request, account_id: str, req: CreateObjectRequest) -
 
 @app.patch("/api/objects/{object_id}")
 def update_object(object_id: str, req: UpdateObjectRequest, request: Request) -> dict:
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     deny_cross_account(request, _repo().get_object(object_id))
     existing = _repo().get_object(object_id)
     obj = _repo().update_object(object_id, req.model_dump())
@@ -3505,7 +3642,7 @@ def update_object(object_id: str, req: UpdateObjectRequest, request: Request) ->
 
 @app.delete("/api/objects/{object_id}")
 def delete_object(object_id: str, request: Request) -> dict:
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     deny_cross_account(request, _repo().get_object(object_id))
     existing = _repo().get_object(object_id)
     if not _repo().delete_object(object_id):
@@ -3580,7 +3717,7 @@ async def dial_now(object_id: str, req: DialNowRequest, request: Request) -> dic
 
 @app.post("/api/objects/import")
 def import_objects(request: Request, account_id: str, rows: list[CreateObjectRequest] = Body(...)) -> dict:
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     if len(rows) > 500:
         raise HTTPException(400, "单次导入上限 500 行")
     account_id = scoped_account(request, account_id)
@@ -3593,21 +3730,21 @@ def import_objects(request: Request, account_id: str, rows: list[CreateObjectReq
 @app.get("/api/knowledge/search")
 async def search_knowledge(request: Request, query: str, account_id: str = "acc-001", limit: int = 5) -> list[dict]:
     # 知识库=org 资产，话务员不可见（页面矩阵）。
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     account_id = scoped_account(request, account_id)
     return await app.state.knowledge.search(query, account_id, limit)
 
 
 @app.get("/api/knowledge")
 async def list_knowledge(request: Request, account_id: str = "acc-001") -> list[dict]:
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     account_id = scoped_account(request, account_id)
     return await app.state.knowledge.list(account_id)
 
 
 @app.delete("/api/knowledge")
 async def delete_knowledge(request: Request, knowledge_id: str, account_id: str = "acc-001") -> dict:
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     account_id = scoped_account(request, account_id)
     # id 形如 md:accounts/acc-001/knowledge/probe.md（含斜杠），放 path 参数会被
     # Starlette 路由层以 %2F 拒掉（404）——改走 query 参数最稳。
@@ -3618,7 +3755,7 @@ async def delete_knowledge(request: Request, knowledge_id: str, account_id: str 
 
 @app.post("/api/knowledge/import")
 async def import_knowledge(req: ImportRequest, request: Request) -> dict:
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     # 账号收窄（2026-09-16 深测 P2）：读侧 search/list/delete 都过 scoped_account，
     # 写侧曾原样收 body account_id——admin 可写穿他账号知识命名空间（读写口径分裂）。
     account_id = scoped_account(request, req.account_id)
@@ -3849,7 +3986,7 @@ def qa_canned_audio(entry_id: str, request: Request) -> Response:
 @app.post("/api/qa/pregen")
 def qa_pregen_ep(payload: dict, request: Request) -> dict:
     """手动触发 --qa 物化(可限 ids);烧云配额操作,与 /api/tts/preview 同闸同审计。"""
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     ids = [str(x) for x in (payload.get("ids") or [])]
     out = pregen_mod.qa_pregen_spawn(str(request.base_url).rstrip("/"), ids)
     _audit("qa.pregen", subject_type="qa_entry", subject_id=",".join(ids)[:128],
@@ -3899,7 +4036,7 @@ def qa_cluster_ep(req: QaClusterRequest, request: Request, account_id: str = "ac
 @app.get("/api/fillers")
 def list_filler_entries(request: Request, account_id: str = "acc-001", enabled: int | None = None, lang: str = "") -> list[dict]:
     # 垫话罐头=运营配置面（agent 机器通道直通），话务员不可见。
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     account_id = scoped_account(request, account_id)
     return _repo().list_filler_entries(
         account_id, enabled=None if enabled is None else bool(enabled), lang=lang
@@ -3947,14 +4084,14 @@ def report_qa_pairs(
 @app.get("/api/personas")
 def list_personas(request: Request, account_id: str = "acc-001") -> list[dict]:
     # 人设=管理面（页面矩阵：话务员不可见）。
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     account_id = scoped_account(request, account_id)
     return _repo().list_personas(account_id)
 
 
 @app.get("/api/personas/{persona_id}")
 def get_persona(persona_id: str, request: Request) -> dict:
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     persona = deny_cross_account(request, _repo().get_persona(persona_id))
     if not persona:
         raise HTTPException(404, "persona not found")
@@ -3963,7 +4100,7 @@ def get_persona(persona_id: str, request: Request) -> dict:
 
 @app.post("/api/personas")
 def create_persona(req: PersonaRequest, request: Request) -> dict:
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     identity = current_identity(request)
     if identity is not None and identity.role != "root":
         # admin 建人设强制本账号（深测：曾可建进/挪进任意账号）。
@@ -3981,7 +4118,7 @@ def create_persona(req: PersonaRequest, request: Request) -> dict:
 
 @app.put("/api/personas/{persona_id}")
 def update_persona(persona_id: str, req: UpdatePersonaRequest, request: Request) -> dict:
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     # 冻结更新前快照(内存 repo 返回活引用,update 原地改会令 existing==persona,
     # 音色变化判定恒 False);audit 与物化触发都以此为准。
     existing = dict(_repo().get_persona(persona_id) or {})
@@ -4004,7 +4141,7 @@ def update_persona(persona_id: str, req: UpdatePersonaRequest, request: Request)
 
 @app.put("/api/personas")
 def upsert_persona(req: PersonaRequest, request: Request) -> dict:
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     identity = current_identity(request)
     if identity is not None and identity.role != "root":
         # admin 建人设强制本账号（深测：曾可建进/挪进任意账号）。
@@ -4021,7 +4158,7 @@ def upsert_persona(req: PersonaRequest, request: Request) -> dict:
 
 @app.delete("/api/personas/{persona_id}")
 def delete_persona(persona_id: str, request: Request) -> dict:
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     existing = deny_cross_account(request, _repo().get_persona(persona_id))
     if not _repo().delete_persona(persona_id):
         raise HTTPException(404, "persona not found")
@@ -4232,7 +4369,7 @@ def delete_template(template_id: str, request: Request) -> dict:
 def active_calls(request: Request) -> list[dict]:
     """主管台可见通话：进行中(active) + 已暂停(paused / 人工接管)。"""
     # 主管台=管理面（话务员不可见），且按账号收窄。
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     calls = _repo().list_calls(scoped_account(request, ""), "") if hasattr(_repo(), "list_calls") else []
     return [c for c in calls if c.get("status") in (CallStatus.ACTIVE.value, CallStatus.PAUSED.value)]
 
@@ -4395,7 +4532,7 @@ def stats_dashboard(request: Request, account_id: str = "acc-001") -> dict:
 def list_insights(request: Request) -> list[dict]:
     """全局洞察（结算蒸馏产出）。跨账号内容（GlobalInsight 无 account 维度，
     深测 P2）→ 收管理面；账号维度化留待 schema 加列（见计划尾部延后项）。"""
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     return _repo().list_global_insights(kind="insight")
 
 
@@ -4853,7 +4990,7 @@ def reports_usage(request: Request, account_id: str = "acc-001") -> dict:
 @app.get("/api/audit")
 def list_audit(request: Request, account_id: str = "", action: str = "", call_id: str = "", limit: int = 200) -> list[dict]:
     # 审计=管理面（主管操作留痕的查看口），话务员不可见。
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     limit = max(1, min(int(limit or 200), 1000))  # 巨值 limit 曾直透 SQL（全表进内存）
     account_id = scoped_account(request, account_id)
     repo = _repo()
@@ -4865,7 +5002,7 @@ def list_audit(request: Request, account_id: str = "", action: str = "", call_id
 @app.get("/api/setup")
 def setup_status(request: Request) -> dict:
     """Report first-run model readiness for the desktop setup wizard."""
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     try:
         import subprocess
 
@@ -4884,7 +5021,7 @@ def setup_status(request: Request) -> dict:
 @app.post("/api/setup/download")
 def setup_download(request: Request) -> dict:
     """Trigger model download (best-effort; UI polls /api/setup for progress)."""
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     try:
         import subprocess
 
@@ -4916,7 +5053,7 @@ def supervisor_join(call_id: str, request: Request) -> dict:
     与 /api/token 同一条签发链路(identity=supervisor-<room>,挂 bok.role 属性,
     A 线 dispatch 由 token 端点统一处理)。
     """
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     deny_cross_account(request, _repo().get_call(call_id))
     call = _repo().get_call(call_id)
     if not call:
@@ -4941,7 +5078,7 @@ def supervisor_listen(call_id: str, request: Request) -> dict:
     从 token 层保证「只听不说」，且不翻通话状态；被听方无任何提示（产品拍板），
     但每次旁听都在审计留痕（此处记 start，前端结束回执 stop 补时长）。
     """
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     deny_cross_account(request, _repo().get_call(call_id))
     call = _repo().get_call(call_id)
     if not call:
@@ -4964,7 +5101,7 @@ def supervisor_listen(call_id: str, request: Request) -> dict:
 @app.post("/api/supervisor/{call_id}/listen/stop")
 def supervisor_listen_stop(call_id: str, req: ListenStopRequest, request: Request) -> dict:
     """旁听结束回执：补一条带时长的审计（纯留痕，不改通话状态）。"""
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     # 与 join/listen/pause/resume 同款越权口径:404 不泄露他账号通话存在性
     # (2026-09-17 全量 debug F8——此前可对他账号 call_id 注入审计行)。
     deny_cross_account(request, _repo().get_call(call_id))
@@ -5024,7 +5161,7 @@ async def web_logs(payload: dict, request: Request) -> dict:
 
 @app.post("/api/supervisor/{call_id}/pause-agent")
 def pause_agent(call_id: str, request: Request) -> dict:
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     deny_cross_account(request, _repo().get_call(call_id))
     call = _repo().update_call(call_id, status=CallStatus.PAUSED.value)
     if not call:
@@ -5036,7 +5173,7 @@ def pause_agent(call_id: str, request: Request) -> dict:
 @app.post("/api/supervisor/{call_id}/resume-agent")
 def resume_agent(call_id: str, request: Request) -> dict:
     """恢复 AI 自动应答：解除人工接管并把通话置回 active（agent 轮询到后恢复）。"""
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     deny_cross_account(request, _repo().get_call(call_id))
     existing = _repo().get_call(call_id)
     if not existing:
@@ -5054,7 +5191,7 @@ def resume_agent(call_id: str, request: Request) -> dict:
 
 @app.post("/api/supervisor/{call_id}/takeover")
 def takeover(call_id: str, request: Request) -> dict:
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     deny_cross_account(request, _repo().get_call(call_id))
     # 人工接手=协助面终态:assist_status 顺手置 done(W4-T1)。
     call = _repo().update_call(call_id, escalated_to_human=True, status=CallStatus.PAUSED.value,
@@ -5067,7 +5204,7 @@ def takeover(call_id: str, request: Request) -> dict:
 
 @app.post("/api/supervisor/{call_id}/transfer")
 async def transfer(call_id: str, request: Request) -> dict:
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     deny_cross_account(request, _repo().get_call(call_id))
     existing = _repo().get_call(call_id)
     if not existing:
@@ -5091,7 +5228,7 @@ async def transfer_sip(call_id: str, req: TransferSipRequest, request: Request) 
     participant_identity 按 LiveKit SIP 参与者命名约定取 `sip-{contact_phone}`
     （call 行无号码 400——mock 档同样先验，语义不随档位漂移）。
     """
-    require_role(request, "admin", "root")
+    auto_gate_management(request)
     deny_cross_account(request, _repo().get_call(call_id))
     call = _repo().get_call(call_id)
     if not call:

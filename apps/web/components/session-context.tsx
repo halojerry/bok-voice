@@ -33,6 +33,34 @@ export const PAGE_LABELS: Record<PageKey, string> = {
   reports: "报表",
 };
 
+/** 管理面键目录（2026-09-20 下发制；与后端 permissions.py MANAGEMENT_PERMISSIONS 逐字对齐）。 */
+export const MANAGEMENT_KEYS = [
+  "settings",
+  "knowledge",
+  "personas",
+  "audit",
+  "users",
+  "supervisor",
+] as const;
+
+export type ManagementKey = (typeof MANAGEMENT_KEYS)[number];
+
+export const MANAGEMENT_LABELS: Record<ManagementKey, string> = {
+  settings: "设置",
+  knowledge: "知识库",
+  personas: "人设",
+  audit: "审计",
+  users: "员工管理",
+  supervisor: "主管台",
+};
+
+/** 权限键显示名（页面键+管理键合并查询；未知键回原样）。 */
+export function permLabel(key: string): string {
+  return (
+    PAGE_LABELS[key as PageKey] ?? MANAGEMENT_LABELS[key as ManagementKey] ?? key
+  );
+}
+
 export type Session = SessionInfo & { anonymous: boolean };
 
 /** 匿名本地会话（无 token / me 401）：单机形态，全部页面 + acc-001。 */
@@ -114,11 +142,23 @@ export function useSessionActions(): SessionActions {
   return useContext(SessionContext) ?? NOOP_ACTIONS;
 }
 
-/** 页面键可见性：匿名=全可见；admin/root=全可见；user=有效集含 key。 */
+/** 页面键可见性：匿名=全可见；root=全可见；admin/user=有效集含键（下发制：admin
+ * 的 permissions 来自 /api/auth/me 的下发集，'' 存量后端回全量，零变化）。 */
 export function hasPage(session: Session | null, key: PageKey): boolean {
   if (!session) return false;
   if (session.anonymous) return true;
-  if (session.role === "admin" || session.role === "root") return true;
+  if (session.role === "root") return true;
+  return session.permissions.includes(key);
+}
+
+/** 管理键持有（下发制 2026-09-20）：匿名=全持有；root=全持有；admin/user=有效集含键。 */
+export function hasManagement(
+  session: Session | null,
+  key: ManagementKey,
+): boolean {
+  if (!session) return false;
+  if (session.anonymous) return true;
+  if (session.role === "root") return true;
   return session.permissions.includes(key);
 }
 

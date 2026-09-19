@@ -352,7 +352,7 @@ export type SessionInfo = {
   role: "root" | "admin" | "user";
   org_id?: string;
   account_id: string;
-  /** 有效权限键（目录 8 键，见 CONTRACT.md；admin/root=全部 grantable） */
+  /** 有效权限键（页面 8 键+管理 6 键，下发制见 permissions.py；root=全量，admin='' 存量=全量） */
   permissions: string[];
 };
 
@@ -363,7 +363,7 @@ export type UserRow = {
   role: string;
   status: string;
   account_id?: string;
-  /** 有效权限（user 角色）；admin/root 为全部 grantable 键 */
+  /** 出仓有效集（user=admin 勾选；admin=下发集含管理键） */
   permissions?: string[];
   created_at?: string;
 };
