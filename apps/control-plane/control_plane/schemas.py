@@ -391,3 +391,23 @@ class QaEntryPatch(BaseModel):
     # 所有权转移只归 admin/root(user 的 patch 由 CP 剥掉)。
     owner_user_id: Optional[str] = None
     priority: Optional[int] = None
+
+
+class QaClusterSelectItem(BaseModel):
+    """聚类采纳选择项(W3-T1):kind=variant|fresh,i=计划对应数组的下标。"""
+
+    kind: str  # "variant" | "fresh"
+    i: int
+
+
+class QaClusterRequest(BaseModel):
+    """QA 自学习聚类(W3-T1):dry=挖掘→LLM 三列计划;apply=true 按 select 采纳入库。
+
+    limit 钳 ≤100(CP 侧);select 缺省=全部 variants+fresh。dry 计划有 600s
+    per-account 缓存,apply 优先吃新鲜缓存免二次 LLM。
+    """
+
+    min_calls: int = 5
+    limit: int = 60
+    apply: bool = False
+    select: Optional[list[QaClusterSelectItem]] = None
