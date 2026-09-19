@@ -5,7 +5,10 @@
 #   **不含** agent runtime（VAD/ASR/LLM/TTS 管线跑在客户节点 GPU 机器上，见
 #   docs/RUNTIME_TOPOLOGY.md §0 分发型拓扑）——本编排只起云侧控制面一个服务。
 #
-# 使用：cp .env.example .env → 填好 → docker compose up -d（详见同目录 README.md）。
+# 使用：cp .env.example .env → 填好 → **重启/重拉一律 ./up.sh**（幂等施加
+#   DATABASE_URL 池器域名→IPv4 覆盖+宿主口 18010；裸 docker compose up -d 会把
+#   DATABASE_URL 回退 IPv6-only 池器域名 crash-loop,2026-09-19 实案 restarts=8。
+#   详见同目录 README.md §9 与 docs/DEPLOY_SAAS_RUNBOOK.md「重启/重拉铁律」）。
 # 数据：业务库在 Supabase Postgres（DATABASE_URL）；知识库 vault（人设参考音频等
 #   文件）落命名卷 cp-vault——容器重建/镜像升级不丢。
 
@@ -15,10 +18,11 @@ services:
   cp:
     # 默认拉 CI 发布的 latest；排练/灰度可用 BOK_CP_IMAGE 覆盖（shell env 或 .env）。
     image: ${BOK_CP_IMAGE:-ghcr.io/halojerry/bok-voice:latest}
-    # 宿主端口可用 BOK_CP_PORT 改口（如 18010 避让宿主上已有服务）；容器口固定
-    # 8000——镜像的 EXPOSE/HEALTHCHECK/CMD 都按 8000 写死，勿改右侧。
+    # 宿主端口缺省 18010（避让宿主上可能的本地开发栈 :8000；本地排练想用 8000
+    # 显式设 BOK_CP_PORT=8000）。容器口固定 8000——镜像的 EXPOSE/HEALTHCHECK/
+    # CMD 都按 8000 写死，勿改右侧。
     ports:
-      - "${BOK_CP_PORT:-8000}:8000"
+      - "${BOK_CP_PORT:-18010}:8000"
     # .env 承载全部变量（见 .env.example）；文件不存在 compose 直接报错——
     # 刻意 fail-fast：裸 up 起来的 CP 要么连不上库要么裸奔，不如起不来。
     env_file:
@@ -43,6 +47,11 @@ services:
       # deploy/cloud/publish_node_pkg.sh 从打包机推送；节点经 license/node_token
       # 鉴权下载（/api/nodes/downloads/...）——客户链路只见本 CP 域名，零 GitHub。
       BOK_NODE_ARTIFACTS_DIR: /app/downloads
+      # 云托管管理台的对外可达地址（2026-09-19 模拟拓扑实测缺口）：设置时 CP 启动
+      # 幂等写 /app/web-out/runtime-config.js，管理台 apiBase() 第一优先读它——
+      # 不设则静态台回落构建期烤死的 127.0.0.1:8000，云端口形态下登录必 401 弹回。
+      # 例：https://cp.example.com 或 http://203.0.113.5:18010（有反代填反代域名）。
+      BOK_CP_PUBLIC_URL: ${BOK_CP_PUBLIC_URL:-}
     volumes:
       # vault：人设参考音频（TTS 克隆注册）+ 知识库 markdown 源文件。镜像内
       # VAULT_ROOT=/app/data/vault，属主 appuser；首挂载时 Docker 把镜像内目录

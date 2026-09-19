@@ -28,6 +28,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 
@@ -403,27 +404,38 @@ def _probe_worker(port: int, timeout: float = 3.0) -> tuple[bool, str]:
 
 
 def _probe_llm(base_url: str = "http://127.0.0.1:1235/v1",
-               timeout_s: float | None = None) -> tuple[bool, str]:
+               timeout_s: float | None = None,
+               model: str = "",
+               prompt: str = "hi") -> tuple[bool, str]:
     """LLM 功能探针:端口 UP ≠ 能用——mlx_lm 被 wedge(解码排队/缓存坍缩)时
     /v1/models 照开 200,通话顿成狗而健康面全绿。发 max_tokens=1 真 prefill
     测往返;超时预算 BOK_DOCTOR_LLM_PROBE_TIMEOUT_S(默认 10s;空闲 >2h 后
     权重页入 ~40s 会一次假警,重跑一次区分:冷启动第二次会快)。
-    model 字段取 /v1/models 的绝对路径 id——repo id 会触发 HF hub 解析。"""
+    model 缺省取 /v1/models 的绝对路径 id——repo id 会触发 HF hub 解析;
+    显式传 model(:1236 MT 探针)则忽略扫描结果直接用,同样必须是本地路径。
+    显式档仍先 GET /v1/models 属有意保留(评审 P2-1):同一 mlx_lm 进程同时
+    服务两端点,/models 探不动即进程不可用,短路 FAIL 语义正确,省一次
+    information GET 的重构不值当。
+    prompt 对 MT 档必须传代表性长句(如「Translate to English: 你好世界」)——
+    Hy-MT2 的 chat template 对超短 ASCII 输入会 list index out of range 404
+    (2026-09-19 实测,生产链路恒走 _mt_prompt 长模板不受影响)。"""
     if timeout_s is None or timeout_s <= 0:
         try:
             timeout_s = float(os.environ.get("BOK_DOCTOR_LLM_PROBE_TIMEOUT_S", "10") or 10)
         except ValueError:
             timeout_s = 10.0
+    model = str(model or "").strip()
     try:
         with urllib.request.urlopen(f"{base_url.rstrip('/')}/models", timeout=timeout_s) as r:
             ids = [str(m.get("id") or "")
                    for m in json.loads(r.read().decode()).get("data", [])]
-        model = next((i for i in ids if i.startswith("/")), ids[0] if ids else "")
         if not model:
-            return False, "FAIL (/v1/models 空列表)"
+            model = next((i for i in ids if i.startswith("/")), ids[0] if ids else "")
+            if not model:
+                return False, "FAIL (/v1/models 空列表)"
         body = json.dumps({"model": model, "stream": False, "temperature": 0,
                            "max_tokens": 1,
-                           "messages": [{"role": "user", "content": "hi"}]}).encode()
+                           "messages": [{"role": "user", "content": prompt}]}).encode()
         req = urllib.request.Request(f"{base_url.rstrip('/')}/chat/completions",
                                      data=body,
                                      headers={"Content-Type": "application/json"},
@@ -436,6 +448,57 @@ def _probe_llm(base_url: str = "http://127.0.0.1:1235/v1",
         return True, f"{verdict} {ms:.0f}ms (model={Path(model).name})"
     except Exception as exc:  # noqa: BLE001 - 探针只报告,不抛
         return False, (f"FAIL ({exc}; >{timeout_s:.0f}s 疑似 wedge 或冷启动页入,重跑一次区分)")
+
+
+# 放宽健康探测的端口→HTTP 面映射（_relaxed_healthy 优先 HTTP 用）。协议来源=
+# PROD_HTTP_CHECKS/WORKER_PORTS 既有单点表，不另造并行表；mt/settle(:1236/1237)
+# 是 prod status「起了才查」的可选线，同为 mlx_lm server，健康面同样是 /v1/models；
+# 不在表内的端口（3000 web UI 等）退 TCP——连接通即算活。
+_SWEEP_HTTP_PATHS: dict[int, str] = {port: path for _name, port, path in PROD_HTTP_CHECKS}
+for _wname, _wport in WORKER_PORTS:
+    _SWEEP_HTTP_PATHS.setdefault(_wport, "/worker")
+_SWEEP_HTTP_PATHS.setdefault(1236, "/v1/models")
+_SWEEP_HTTP_PATHS.setdefault(1237, "/v1/models")
+
+
+def _relaxed_healthy(port: int, timeout_s: float = 5.0) -> bool:
+    """放宽超时（默认 5s）的健康探测：宿主 CPU 风暴/模型加载下 1s TCP 探测会
+    假死（2026-09-19 互杀事故），5s 窗口吸收调度延迟。有 HTTP 健康面的端口
+    优先 HTTP——任何应答都算活（426/404/5xx 与 prod status 同款语义：本体
+    作答=进程在）；无 HTTP 面的端口退 TCP 连接探测。"""
+    path = _SWEEP_HTTP_PATHS.get(port)
+    if path:
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=timeout_s):
+                pass
+            return True
+        except urllib.error.HTTPError:
+            return True  # 有 HTTP 应答=活（b-line :8790 无明文 /health 恒 426 同款）
+        except Exception:  # noqa: BLE001 - 探针只判定，不抛
+            return False
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
+
+
+def _ports_down_after_grace(
+    targets: Sequence[int], probe: Callable[[int], bool] | None = None
+) -> list[int]:
+    """等待环超时前的宽松终检（纯函数便于单测）：对每个 target 用放宽超时逐口
+    复检一次，返回仍探不活的端口列表（空=其实全部健康，别急着宣判超时）。"""
+    if probe is None:
+        probe = _relaxed_healthy
+    return [p for p in targets if not probe(p)]
+
+
+_OPTIONAL_LLM_PORTS = (1236, 1237)  # mt/settle:模型缺失即跳过,缺它们不拖垮整栈
+
+
+def _only_optional_ports(down: list[int]) -> bool:
+    """宽松终检缺口全落在可选线(MT :1236/settle :1237)→ True(整栈照常放行)。"""
+    return bool(down) and all(p in _OPTIONAL_LLM_PORTS for p in down)
 
 
 def _repo_pythonpath() -> str:
@@ -647,9 +710,18 @@ def _start_proc(args: list[str], pidfile: Path, logfile: Path, env: dict | None 
     merged.setdefault("PYTHONUNBUFFERED", "1")
     if env:
         merged.update(env)
+    # 来源 stamp（2026-09-19 provenance 完整版）：子代 env 钉本树 ROOT（Linux
+    # /proc/<pid>/environ 可读回）；macOS ps 不吐环境，另落 pid 作用域标记文件
+    # （root + 子代 lstart，清扫时精确比对防 pid 复用串号）。端口清扫据此区分
+    # 本树子代与他树进程，他树永不误杀（跨树互杀根因/多会话纪律）。
+    merged["BOK_SERVE_ROOT"] = str(ROOT)
     with logfile.open("ab") as log:
         proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, env=merged, cwd=str(cwd) if cwd else None, **_spawn_kwargs())
     pidfile.write_text(str(proc.pid))
+    try:
+        (pidfile.parent / f"proc-{proc.pid}.root").write_text(f"{ROOT}\t{_ps_field(proc.pid, 'lstart=')}\n")
+    except Exception:
+        pass  # 标记写不出=来源未知，清扫走原语义；绝不影响起进程
     return proc.pid
 
 
@@ -1034,7 +1106,21 @@ def cmd_up() -> int:
         # MT 是可选增强:主栈齐而独缺 mt 不拖垮整栈(B 线 interpret 回退主 LLM)。
         print("[bok] mt llm :1236 not ready — continue (B-line falls back to :1235)", file=sys.stderr)
         return 0
-    print("[bok] timeout waiting for services (see app-data/logs)", file=sys.stderr)
+    # 宽松终检（2026-09-19 互杀事故收编）：宿主 CPU 风暴下 1s TCP 探测可整轮
+    # 假死，180s 走完≠服务真死——宣判超时前逐口 5s 复检，全绿即 ready；仍有
+    # 真死端口才退出并列出缺口（便于排障）。退出会留下加载中的子代给下一轮
+    # serve 的孤儿清扫当孤儿杀（互杀循环根因），能不退就不退。
+    still_down = _ports_down_after_grace(targets)
+    if not still_down:
+        print(f"[bok] ready (relaxed recheck): asr=8787 tts=8788 llm=1235 b-line=8790{mt_ready_suffix}")
+        return 0
+    if _only_optional_ports(still_down):
+        # 可选线豁免与上方 1s 档的 MT 语义对齐:宽松终检只剩可选缺口也放行
+        # (B 线回退主 LLM/settle 回退 :1235),唔令 serve 在 agent worker 拉起前
+        # 退出——评审:宽松路径原先漏掉这层豁免,会假超时退出留下加载中子代。
+        print(f"[bok] optional llm ports still down: {still_down} — continue (falls back)", file=sys.stderr)
+        return 0
+    print(f"[bok] timeout waiting for services — still down: {still_down} (see app-data/logs)", file=sys.stderr)
     return 1
 
 
@@ -1474,9 +1560,12 @@ def cmd_serve() -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    # 起栈前端口预清（2026-09-17 殭尸专项）：上一轮 serve 暴毙的 spawn 子代/
-    # sidecar 殘留还占着 8081-8083/8787-8788 时，新 worker 会因单例守卫良性退出
-    # ——殭尸赢、栈「UP」但服务旧代码（A/B 污染实锤）。身份复核不过的一律不动。
+    # 起栈前端口预清（2026-09-17 殭尸专项 → 2026-09-19 健康闸+来源鉴定）：身份
+    # 复核不过的一律不动；他树 stamp 的 bok 栈永不收割（跨树互杀/多会话纪律）；
+    # 本树与无戳的再过健康闸——「健康」放行（防 CPU 风暴把加载中子代当孤儿误
+    # 杀的互杀循环）。残留面：同树「健康但旧代码」的进程无法从外部判定所载代
+    # 码版本，会被 spawn 门复用（A/B 污染面）——清扫日志逐口提示 left alone，
+    # 改完代码要吃新代码先 down 再起。
     stale = _sweep_orphan_listeners()
     for port, cmd, pid in stale:
         print(f"[serve] swept stale listener :{port} (pid {pid}, {cmd})")
@@ -1579,7 +1668,14 @@ def cmd_serve() -> int:
                     pass
             return 0
         time.sleep(1)
-    print("[bok] timeout waiting for desktop stack (see app-data/logs)", file=sys.stderr)
+    # 宽松终检（2026-09-19 互杀事故收编）：CPU 风暴下 1s 探测可整轮假死，
+    # 120s 走完≠栈真死——逐口 5s 复检再宣判；serve 在这里退出会把健康子代
+    # 留给下一轮 serve 的孤儿清扫误杀（互杀循环根因），能不退就不退。
+    still_down = _ports_down_after_grace(targets)
+    if not still_down:
+        print("[bok] desktop ready (relaxed recheck): control-plane=8000 asr=8787 tts=8788 llm=1235 b-line=8790")
+        return 0
+    print(f"[bok] timeout waiting for desktop stack — still down: {still_down} (see app-data/logs)", file=sys.stderr)
     return 1
 
 
@@ -1624,7 +1720,10 @@ def cmd_down() -> int:
         print(f"[down] swept orphan worker (pid {pid}, {label})")
     # 端口级兜底（2026-09-17 殭尸专项）:spawn 子代/sidecar/livekit/uvicorn 殘留
     # 是命令行特征清扫的盲区,按 bok 端口表+身份复核双条件收割。
-    for port, cmd, pid in _sweep_orphan_listeners():
+    # healthy_ok=False:down 是拆除语义,pidfile SIGTERM 已先送达,「健康残留」
+    # 也必须收走——否则 pidfile 覆写成死 pid 时 down 返回 0 但栈仍在跑
+    # （旧代码被静默采纳=A/B 污染复活,评审 P1-1）。
+    for port, cmd, pid in _sweep_orphan_listeners(healthy_ok=False):
         print(f"[down] swept orphan listener :{port} (pid {pid}, {cmd})")
     return 1 if stop_failures else 0
 
@@ -1677,6 +1776,75 @@ def _sweep_orphan_workers() -> list[tuple[int, str]]:
     return swept
 
 
+def _ps_field(pid: int, field: str) -> str:
+    """ps 单字段取值（lstart 身份比对用），失败返回空串（fail-closed）。"""
+    try:
+        return subprocess.run(
+            ["ps", "-p", str(pid), "-o", field],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+    except Exception:
+        return ""
+
+
+def _process_serve_root(pid: int) -> str:
+    """来源鉴定（评审 A-P2 完整版）：该 pid 由哪棵代码树拉起。载体优先级：
+    ① app-data run/proc-<pid>.root（_start_proc 落笔「ROOT<TAB>子代lstart」，
+    lstart 与 ps 现值精确比对——pid 复用必然对不上，标记作废）；
+    ② Linux /proc/<pid>/environ 的 BOK_SERVE_ROOT（补标记缺席路径；macOS ps
+    不吐环境，故落盘标记是 mac 主载体）。
+    读不到/对不上返回空串=来源未知，调用方按未知走原语义；任何异常同空串。"""
+    if os.name == "nt":
+        return ""
+    try:
+        marker = app_data_dir() / "run" / f"proc-{pid}.root"
+        if marker.exists():
+            parts = marker.read_text().strip().split("\t")
+            if len(parts) == 2 and parts[1]:
+                cur = _ps_field(pid, "lstart=")
+                return parts[0] if cur and cur == parts[1] else ""
+            return ""
+    except Exception:
+        pass
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+        for item in raw.split(b"\0"):
+            if item.startswith(b"BOK_SERVE_ROOT="):
+                return item.decode("utf-8", "replace").split("=", 1)[1]
+    except Exception:
+        pass
+    return ""
+
+
+def _sweep_stale_root_markers() -> None:
+    """清 proc-<pid>.root 残留：ps 探不到的 pid 视为死，标记删除（防标记文件
+    无限积累）；ps 探测失败=未知一律保留。"""
+    try:
+        markers = list((app_data_dir() / "run").glob("proc-*.root"))
+    except Exception:
+        return
+    for marker in markers:
+        try:
+            pid = int(marker.stem.removeprefix("proc-"))
+        except ValueError:
+            try:
+                marker.unlink()
+            except Exception:
+                pass
+            continue
+        try:
+            alive = subprocess.run(
+                ["ps", "-p", str(pid)], capture_output=True, text=True, timeout=5,
+            ).returncode == 0
+        except Exception:
+            continue
+        if not alive:
+            try:
+                marker.unlink()
+            except Exception:
+                pass
+
+
 # 端口 → 命令行身份标记（_sweep_orphan_listeners 双条件收割用）。端口是 bok
 # 固定拓扑（见 CORE_PORTS/WORKER_PORTS 语义）；身份复核防误杀同端口无关服务。
 # 8081-8083 额外认 multiprocessing.spawn：livekit-agents worker 的 spawn 子代
@@ -1698,17 +1866,28 @@ _ORPHAN_PORT_OWNERS: tuple[tuple[int, tuple[str, ...]], ...] = (
 )
 
 
-def _sweep_orphan_listeners(kill: bool = True) -> list[tuple[int, str, int]]:
+def _sweep_orphan_listeners(kill: bool = True,
+                            healthy_ok: bool = True) -> list[tuple[int, str, int]]:
     """端口级孤儿兜底（2026-09-17 殭尸专项）：按 bok 端口表逐口查 LISTEN 进程，
     命令行身份复核通过才收割；身份不符（他人物理占用）只报警不动手。
 
-    _sweep_orphan_workers 按命令行特征只能扫 agent_runtime/mock_callee 两类，
-    spawn 子进程与 sidecar/livekit/uvicorn 殘留是其盲区——「殭尸跑旧代码服务
-    新请求」的 A/B 污染由此而来。kill=False 只探测不动手（自检/测试用）。
+    健康即非孤儿（2026-09-19 互杀事故收编）：宿主 CPU 风暴（Parallels 141%）
+    下 serve 的 1s 健康探测假死 → 180s 等待超时退出、留下正在加载模型的健康
+    子代 → 下一轮 serve 本函数把它们当孤儿杀掉 → 互杀循环、栈永远起不来。
+    身份复核只证明「这是 bok 家的进程」，不证明它已死——现动手前先做一次
+    放宽超时（5s）的健康探测（_relaxed_healthy：有 HTTP 健康面走 HTTP、无的
+    退 TCP），探测健康 → 跳过收割（left alone），不健康才照旧收割；返回值
+    swept 只含真正收割的条目（left-alone 的不进）。
+    来源鉴定（2026-09-19 provenance 完整版，评审 A-P2）：marker//proc stamp
+    读得出「拉起树」时，他树的 bok 栈永不收割——它可能正在加载模型（跨树互杀
+    同款根因），多会话纪律也禁碰他树进程；down 同样不收他树。读不出 stamp
+    （旧版进程/ps 失败）按来源未知走原健康闸/收割语义，旧行为兜底不变。
+    kill=False 只探测+报告不动手（健康的同样报 left alone；干跑/测试用）。
     Windows 明跳（同 _sweep_orphan_workers：无安全身份来源，宁可少清不误杀）。"""
     swept: list[tuple[int, str, int]] = []
     if os.name == "nt":
         return swept
+    _sweep_stale_root_markers()
     for port, markers in _ORPHAN_PORT_OWNERS:
         try:
             out = subprocess.run(
@@ -1733,6 +1912,31 @@ def _sweep_orphan_listeners(kill: bool = True) -> list[tuple[int, str, int]]:
                 cmd = ""
             if not any(m in cmd for m in markers):
                 print(f"[sweep] port {port}: pid {pid} 身份不符（{cmd[:80] or '未知'}），不动", file=sys.stderr)
+                continue
+            # 来源鉴定（2026-09-19 provenance 完整版，评审 A-P2）：stamp 读得出
+            # 「拉起树」且 ≠ 本树 → 他会话/他树的 bok 栈，永不收割——它可能正在
+            # 加载模型（跨树互杀同款根因），多会话纪律也禁碰他树进程；down 同样
+            # 不收他树（down=停本树+无戳遗留）。stamp 读不出按来源未知走下面
+            # 原健康闸/收割语义，旧行为兜底不变。
+            proc_root = _process_serve_root(pid)
+            if proc_root and os.path.realpath(proc_root) != os.path.realpath(str(ROOT)):
+                print(
+                    f"[sweep] port {port}: pid {pid} 属另一代码树（{proc_root}）——不动"
+                    "（他树进程永不收割；要切换先在对方 down）",
+                    file=sys.stderr,
+                )
+                continue
+            # 健康即非孤儿（2026-09-19 互杀事故）：动手前放宽超时（5s）复检一次，
+            # 活的放行——CPU 风暴下上一轮 serve 探测假死退出留下的健康子代，
+            # 不能在这里被当孤儿误杀。healthy_ok=False（cmd_down 专用）跳过该闸：
+            # down 的拆除契约要求连「pidfile 够不着但健康」的残留一并收掉——
+            # pidfile 被覆写成死 pid 时这是唯一回收路径（评审 P1-1）。
+            if healthy_ok and _relaxed_healthy(port):
+                print(
+                    f"[sweep] port {port}: pid {pid} healthy — left alone"
+                    "（serve 将复用该进程；多 worktree/旧代码疑虑先 down 再起）",
+                    file=sys.stderr,
+                )
                 continue
             swept.append((port, cmd[:60], pid))
             if not kill:
@@ -2002,6 +2206,25 @@ def cmd_doctor() -> int:
         print(f"  llm 功能探针: {llm_detail}")
         if not llm_ok:
             print("    (llm 端口 UP 但 prefill 探针失败——通话会顿;重跑 doctor 区分冷启动)")
+    # MT 功能探针(:1236,2026-09-19 同传 2/8 FAIL 实案):mlx_lm 被 repo-id 请求
+    # wedge 时 TCP/健康面全绿、生成永挂——模型在盘才探,informational 不进 fails
+    # (与 :1235 同款冷启动页入假警语义)。显式传在盘路径(忽略 /v1/models 扫描
+    # 结果),prompt 用代表性长句(见 _probe_llm docstring 的 Hy-MT2 短输入坑)。
+    if healthy(1236):
+        mt_model = _mt_llm_model(current)
+        if mt_model and Path(mt_model).exists():
+            mt_ok, mt_detail = _probe_llm(
+                "http://127.0.0.1:1236/v1", model=mt_model,
+                prompt="Translate to English: 你好世界")
+            print(f"  mt 功能探针: {mt_detail}")
+            if not mt_ok:
+                print("    (mt 端口 UP 但 prefill 探针失败——B 线同传会挂死/退主 LLM;"
+                      "重跑 doctor 区分冷启动)")
+        else:
+            # 评审 P2-2:serve 侧「:1236 健康即下发 MT_*」会把非法 model 透传给
+            # worker(interpret 守卫兜底回退主 LLM)——诊断面对同一错配不能零输出。
+            print(f"  mt 功能探针: SKIP (MT 模型缺失/非法: {mt_model[:60] or 'unset'})"
+                  " — B 线已回退主 LLM,查 MT_LLM_MODEL/MODELS 表")
 
     # /api/token 必须是真 JWT（三段式）；否则 A 线 UI 永远“接通失败”。
     if healthy(8000):

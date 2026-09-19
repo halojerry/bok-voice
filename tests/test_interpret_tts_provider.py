@@ -32,15 +32,20 @@ def test_build_tts_provider_minimax_branch(monkeypatch):
     assert provider._resolve_voice() == "Cantonese_GentleLady"
     assert provider._language_state.lang == "cantonese"
     # B 线默认 2.8-turbo 档(2026-09-16 起:语气词标记仅 2.8 系支持;原 2.6-turbo)
-    # + language_boost 锁目标语。
-    assert os.environ["MINIMAX_MODEL"] == "speech-2.8-turbo"
-    assert os.environ["MINIMAX_LANGUAGE_BOOST"] == _MINIMAX_BOOST
+    # + language_boost 锁目标语——经构造参数下发,唔写进程 env(setdefault 跨会话
+    # 驻留已废,评审 follow-up,与采样档 P2-3 同治理)。
+    assert provider._model() == "speech-2.8-turbo"
     assert provider._language_boost() == _MINIMAX_BOOST
     assert provider._api_key() == "k-test"
+    assert "MINIMAX_MODEL" not in os.environ
+    assert "MINIMAX_LANGUAGE_BOOST" not in os.environ
 
 
 def test_build_tts_provider_minimax_boost_and_voice_per_target(monkeypatch):
-    """zh/en 目标语各锁各的 boost 与音色键；设置页没配的键落验证过的默认。"""
+    """zh/en 目标语各锁各的 boost 与音色键；设置页没配的键落验证过的默认。
+
+    同 worker 连续装配 zh→en 两通:boost 逐会话解析,唔得停在首通的 Chinese
+    （旧 setdefault 跨会话泄漏的回归断言）。"""
     from agent_runtime.providers.livekit_plugins import MiniMaxTTS
 
     for key in ("MINIMAX_MODEL", "MINIMAX_LANGUAGE_BOOST"):
@@ -48,13 +53,13 @@ def test_build_tts_provider_minimax_boost_and_voice_per_target(monkeypatch):
     cfg = {"provider": "minimax_streaming", "speaker_en": "my-en-voice"}
 
     zh = interpret._build_tts_provider(cfg, "zh")
-    assert os.environ["MINIMAX_LANGUAGE_BOOST"] == "Chinese"
+    assert zh._language_boost() == "Chinese"
     assert zh._resolve_voice() == "Chinese (Mandarin)_News_Anchor"
 
-    monkeypatch.delenv("MINIMAX_LANGUAGE_BOOST", raising=False)
     en = interpret._build_tts_provider(cfg, "en")
-    assert os.environ["MINIMAX_LANGUAGE_BOOST"] == "English"
+    assert en._language_boost() == "English"
     assert en._resolve_voice() == "my-en-voice"
+    assert "MINIMAX_LANGUAGE_BOOST" not in os.environ
 
 
 def test_build_tts_provider_qwen3_fallback(monkeypatch):
@@ -82,6 +87,33 @@ def test_parse_session_voices_shapes():
     # 空音色值丢弃；键经 _norm_lang 归一（未知语言键丢弃,唔进 map）。
     assert interpret._parse_session_voices('{"zh":"v-zh","en":""}') == {"zh": "v-zh"}
     assert interpret._parse_session_voices('{"EN":" v-en "}') == {"en": "v-en"}
+
+
+def test_resolve_minimax_model_env_priority_and_default(monkeypatch):
+    """合成档单点解析(纯读 env):显式 env 优先(2.6 回退档→voice_tags 门熄火);
+    缺省 B 线 2.8-turbo;解析结果经 model_override 落进实例(_model() 生效)。"""
+    monkeypatch.delenv("MINIMAX_MODEL", raising=False)
+    assert interpret._resolve_minimax_model() == "speech-2.8-turbo"
+    assert interpret._voice_tags_supported(interpret._resolve_minimax_model()) is True
+
+    monkeypatch.setenv("MINIMAX_MODEL", "speech-2.6-turbo")
+    assert interpret._resolve_minimax_model() == "speech-2.6-turbo"
+    assert interpret._voice_tags_supported(interpret._resolve_minimax_model()) is False
+    provider = interpret._build_tts_provider({"provider": "minimax", "api_key": "k"}, "zh")
+    assert provider._model() == "speech-2.6-turbo"
+    assert "MINIMAX_MODEL" in os.environ  # 只读,唔删用户显式部署档
+
+
+def test_minimax_tts_language_boost_param_precedence(monkeypatch):
+    """构造 language_boost 参数优先于 env;未传(None)透传 env;env 也没有=不下发。"""
+    from agent_runtime.providers.livekit_plugins import MiniMaxTTS
+
+    monkeypatch.setenv("MINIMAX_LANGUAGE_BOOST", "Chinese")
+    assert MiniMaxTTS(voice="v", language_boost="English")._language_boost() == "English"
+    passthrough = MiniMaxTTS(voice="v")
+    assert passthrough._language_boost() == "Chinese"
+    monkeypatch.delenv("MINIMAX_LANGUAGE_BOOST", raising=False)
+    assert passthrough._language_boost() == ""
 
 
 def test_build_tts_provider_session_voice_overrides_settings_and_defaults(monkeypatch):
@@ -117,8 +149,10 @@ def test_build_tts_provider_session_voice_filters_local_qwen3(monkeypatch):
     assert p2._resolve_voice() == "Cantonese_crisp_news_anchor_vv2"
 
 
-def test_build_llm_provider_mt_branch(monkeypatch):
-    """MT_LLM_BASE_URL 有值 → StatelessMTLLM 包 MlxLlmLLM(:1236) + 官方推荐采样。"""
+def test_build_llm_provider_mt_branch(monkeypatch, tmp_path):
+    """MT_LLM_BASE_URL 有值 + model 为真实本地绝对路径 → StatelessMTLLM 包 MlxLlmLLM(:1236)
+    + 官方推荐采样。(repo-id 等非本地路径会被 mlx_lm server 挂死,已由 _mt_model_valid
+    门禁拦下走回退——见 test_mt_model_guard.py。)"""
     from agent_runtime.providers.livekit_plugins import MlxLlmLLM, StatelessMTLLM
 
     for key in (
@@ -131,8 +165,10 @@ def test_build_llm_provider_mt_branch(monkeypatch):
         "LLM_MAX_TOKENS",
     ):
         monkeypatch.delenv(key, raising=False)
+    mt_model = tmp_path / "Hy-MT2-8bit"
+    mt_model.mkdir()
     monkeypatch.setenv("MT_LLM_BASE_URL", "http://127.0.0.1:1236/v1")
-    monkeypatch.setenv("MT_LLM_MODEL", "mlx-community/Hy-MT2-1.8B-Abliterated-8bit")
+    monkeypatch.setenv("MT_LLM_MODEL", str(mt_model))
 
     provider = interpret._build_llm_provider({}, "cantonese")
     assert isinstance(provider, StatelessMTLLM)
@@ -142,13 +178,51 @@ def test_build_llm_provider_mt_branch(monkeypatch):
     assert isinstance(inner, MlxLlmLLM)
     # base_url 落在官方内芯的 AsyncClient 上（_opts 不存它;httpx 会补尾斜杠）。
     assert str(inner._client.base_url).rstrip("/") == "http://127.0.0.1:1236/v1"
-    assert inner._opts.model == "mlx-community/Hy-MT2-1.8B-Abliterated-8bit"
-    # 官方推荐采样经 env 落进 extra_body（MlxLlmLLM 构造时读）。
+    assert inner._opts.model == str(mt_model)
+    # 官方推荐采样经构造参数落进 extra_body/温度（评审 P2-3:唔再写进程 env——
+    # setdefault 会跨会话驻留,MT 失效落回主 LLM 时采样档跟着泄漏）。
+    body = inner._opts.extra_body or {}
+    assert body["top_p"] == 0.6
+    assert body["top_k"] == 20 and isinstance(body["top_k"], int)
+    assert body["repetition_penalty"] == 1.05
+    assert inner._opts.temperature == 0.7
+    # 四键不得出现在进程 env（泄漏防线,monkeypatch 终了自动还原）。
+    for key in ("LLM_TEMPERATURE", "LLM_TOP_P", "LLM_TOP_K", "LLM_REPETITION_PENALTY"):
+        assert key not in os.environ
+
+
+def test_build_llm_provider_mt_env_override(monkeypatch, tmp_path):
+    """用户显式 env 优先于 MT 推荐默认（保持旧行为）,但同样唔写回 env。
+
+    LLM_TEMPERATURE=0.1 → 内芯温度 0.1;未设的其余三键仍落 MT 推荐档。"""
+    from agent_runtime.providers.livekit_plugins import MlxLlmLLM, StatelessMTLLM
+
+    for key in (
+        "MT_LLM_BASE_URL",
+        "MT_LLM_MODEL",
+        "LLM_TOP_P",
+        "LLM_TOP_K",
+        "LLM_REPETITION_PENALTY",
+        "LLM_TEMPERATURE",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    mt_model = tmp_path / "Hy-MT2-8bit"
+    mt_model.mkdir()
+    monkeypatch.setenv("MT_LLM_BASE_URL", "http://127.0.0.1:1236/v1")
+    monkeypatch.setenv("MT_LLM_MODEL", str(mt_model))
+    monkeypatch.setenv("LLM_TEMPERATURE", "0.1")
+
+    provider = interpret._build_llm_provider({}, "cantonese")
+    assert isinstance(provider, StatelessMTLLM)
+    inner = provider._inner
+    assert isinstance(inner, MlxLlmLLM)
+    assert inner._opts.temperature == 0.1
     body = inner._opts.extra_body or {}
     assert body["top_p"] == 0.6
     assert body["top_k"] == 20
     assert body["repetition_penalty"] == 1.05
-    assert os.environ["LLM_TEMPERATURE"] == "0.7"
+    # 显式 env 同样唔落进程 env 残留。
+    assert "LLM_TOP_P" not in os.environ
 
 
 def test_build_llm_provider_mt_unset_or_empty_falls_back(monkeypatch):

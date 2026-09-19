@@ -32,6 +32,13 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import e2e_interpret as e2e  # noqa: E402
 from probe_interpret_latency import TimedSide, speech_onset_after  # noqa: E402
 
+# auth-on 栈(2026-09-15 标准姿势)要求 CP 请求带机器通道 token——E2E 建单/取
+# token/收线/读 turns 全是机器语义,Bearer BOK_CP_TOKEN 直通(与 agent worker 同源)。
+# 未设 env(老 auth-off 栈)零变化。CP 之外(asr sidecar)不带。
+_CP_HEADERS: dict[str, str] = {}
+if os.environ.get("BOK_CP_TOKEN", "").strip():
+    _CP_HEADERS["Authorization"] = f"Bearer {os.environ['BOK_CP_TOKEN'].strip()}"
+
 FWD_SEG_S = 4.0
 GAP_S = 0.7
 REV_SEG_S = 4.5
@@ -57,6 +64,7 @@ async def main() -> int:
         f"{e2e.CONTROL_PLANE_URL}/api/calls",
         json={"account_id": "acc-001", "kind": "interpret", "mode": "live", "direction": "interpret",
               "language": "zh", "target_lang": "en", "object_id": ""},
+        headers=_CP_HEADERS,
         timeout=15,
     ).json()
     call_id = created["id"]
@@ -94,11 +102,11 @@ async def main() -> int:
         await me.close()
         await other.close()
         try:
-            e2e.httpx.post(f"{e2e.CONTROL_PLANE_URL}/api/calls/{call_id}/hangup", timeout=10)
+            e2e.httpx.post(f"{e2e.CONTROL_PLANE_URL}/api/calls/{call_id}/hangup", headers=_CP_HEADERS, timeout=10)
         except Exception:
             pass
 
-    rows = e2e.httpx.get(f"{e2e.CONTROL_PLANE_URL}/api/calls/{call_id}/turns", timeout=10).json()
+    rows = e2e.httpx.get(f"{e2e.CONTROL_PLANE_URL}/api/calls/{call_id}/turns", headers=_CP_HEADERS, timeout=10).json()
 
     def _row_epoch(r: dict) -> float:
         # CP created_at 是 UTC naive ISO(实证:与 utcnow 同域)→ 补 UTC 归一 epoch。

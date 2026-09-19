@@ -262,6 +262,11 @@ def _seed_root_user() -> None:
 @app.on_event("startup")
 def _startup() -> None:
     configure_logging(level=os.environ.get("BOK_LOG_LEVEL", "INFO"))
+    # 云托管管理台运行时 CP 地址注入（见 _write_web_runtime_config docstring）：
+    # 在首个请求前落盘，缺省/本地形态零动作。
+    _public_cp_url = (os.environ.get("BOK_CP_PUBLIC_URL") or "").strip()
+    if _public_cp_url:
+        _write_web_runtime_config(_public_cp_url, _web_static_dir)
     engine = build_engine()
     app.state.repo = build_repository(engine)
     app.state.node_store = NodeStore(engine)  # 与 repo 同一 engine；None → 内存双模
@@ -5114,6 +5119,34 @@ async def supervisor_end(call_id: str, request: Request, disposition: str = "dec
 # 必须**放在全部 API 路由之后**——FastAPI 按注册顺序匹配，路由先于挂载命中，
 # `/api/*` 与 `/health` 不受影响；目录缺失(本地仓库/测试)整段跳过，连 import 都不发生。
 _web_static_dir = Path(os.environ.get("BOK_WEB_STATIC_DIR", "/app/web-out"))
+
+
+def _write_web_runtime_config(public_url: str, web_root: Path) -> Path | None:
+    """云托管管理台的运行时 CP 地址注入（2026-09-19 Docker 模拟拓扑实测缺口）。
+
+    静态台 apiBase() 第一优先 window.__BOK_CONFIG__.cpUrl（节点托管形态由
+    node_agent 写同一文件），未注入则回落构建期烤死的 127.0.0.1:8000——云端口
+    形态（如 prod 18010）下该回落指向访问者本机，登录必 401 弹回、控制台不可用。
+    BOK_CP_PUBLIC_URL 设置时幂等写 runtime-config.js；未设置不写（节点托管自己
+    写，双写会互相踩）。URL 只收 http(s) 且禁引号/尖括号/反斜杠（进 JS 字符串
+    与 HTML 上下文）；写失败（只读挂载等）只警告绝不阻启动。
+    """
+    url = (public_url or "").strip().rstrip("/")
+    if not (url.startswith("http://") or url.startswith("https://")) or any(
+        ch in url for ch in ("'", '"', "<", ">", "\\")
+    ):
+        print(f"[web-config] BOK_CP_PUBLIC_URL 非法（须 http(s) 且无特殊字符），跳过注入: {url[:60]!r}")
+        return None
+    target = web_root / "runtime-config.js"
+    payload = "window.__BOK_CONFIG__ = " + json.dumps({"cpUrl": url}) + ";\n"
+    try:
+        target.write_text(payload, encoding="utf-8")
+    except OSError as exc:
+        print(f"[web-config] runtime-config.js 写入失败（控制台将回落构建期地址）: {exc}")
+        return None
+    return target
+
+
 if _web_static_dir.is_dir():
     from fastapi.staticfiles import StaticFiles
 

@@ -1514,8 +1514,9 @@ def _language_boost_for(call_lang: str) -> str:
 
 
 def _apply_minimax_language_boost(call_lang: str) -> str:
-    """MiniMaxTTS 只从 env 读 boost（`_language_boost()` per-request 透传），
-    构造函数无 boost 参数——A 线在构造 provider 前把本通语言写入进程 env。
+    """MiniMaxTTS 的 boost 读取顺序=构造参数 > env（`_language_boost()` per-request
+    解析；B 线经构造参数逐会话下发，唔写 env）。A 线构造处无逐会话参数可传，沿用
+    env 注入把本通语言写入进程 env。
 
     部署覆盖优先：env 里已有 MINIMAX_LANGUAGE_BOOST（部署显式预设，含空串=
     有意禁用 boost）→ 本函数不动它，按通话语言注入仅在 env 缺失时发生。

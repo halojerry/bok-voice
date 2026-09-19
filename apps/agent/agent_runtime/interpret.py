@@ -24,10 +24,12 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import math
 import os
 import re
 import time
 from collections import deque
+from pathlib import Path
 
 
 def _norm_lang(raw: str, default: str = "zh") -> str:
@@ -90,6 +92,16 @@ _VOICE_TAG_LEAD_RE = re.compile(
 def _voice_tags_supported(model: str) -> bool:
     """语气词标记仅 2.8 系合成模型支持(纯函数,单测直喂)。"""
     return "2.8" in (model or "")
+
+
+def _resolve_minimax_model() -> str:
+    """B 线 MiniMax 合成档解析(纯读 env,单测直喂):显式 env > B 线默认 2.8-turbo。
+
+    旧契约是 _build_tts_provider 里 setdefault 写 MINIMAX_MODEL 再全链读 env——
+    常驻 worker 写入即驻留,且 voice_tags 门读的是同一键;现单点解析、构造经
+    model_override 下发,进程 env 零写入(评审 follow-up,与采样档 P2-3 同治理)。
+    """
+    return (os.environ.get("MINIMAX_MODEL") or "").strip() or "speech-2.8-turbo"
 
 
 def _apply_voice_tags(text: str) -> str:
@@ -257,24 +269,53 @@ def _sidecar_url(cfg_value: str, env_key: str, default: str) -> str:
     return (cfg_value or os.environ.get(env_key) or default).rstrip("/")
 
 
+def _mt_model_valid(p: str) -> bool:
+    """MT 模型路径门禁(纯函数,单测直喂):必须是真实存在的本地绝对路径。
+
+    mlx_lm server 收到 repo-id/占位符等非本地路径会当 HF hub id 解析,断网时
+    持锁挂死整个 server(B 线同传 2/8 FAIL 实弹,MT :1236 全灭)——非绝对路径
+    或不在盘一律 False,装配侧跳过 MT 分支走既有回退链。"""
+    path = Path((p or "").strip())
+    return path.is_absolute() and path.exists()
+
+
+def _mt_sampling(env_key: str, mt_default: float) -> float:
+    """MT 采样档解析(单测直喂):用户显式 env 优先,缺省/非法回落 MT 推荐值。
+
+    旧版用 os.environ.setdefault 下发采样档再由 MlxLlmLLM 构造时读回——同
+    worker 先服务过 MT 有效会话后 env 永久驻留,后续会话 MT 失效落回主 LLM
+    会带着 MT 采样档跑(主 LLM 期望 0.35,评审 P2-3 跨会话 env 泄漏)。现只在
+    构造参数处解析,唔写回进程 env。"""
+    raw = (os.environ.get(env_key) or "").strip()
+    try:
+        v = float(raw) if raw else mt_default
+    except ValueError:
+        return mt_default
+    # inf/nan/1e400 过得了 float() 但会炸 int(top_k) 或序列化成 Infinity/NaN
+    # ——非有限值一律当非法档回落推荐值（评审：原实现可穿透,装配期崩整条 job）。
+    return v if math.isfinite(v) else mt_default
+
+
 def _build_llm_provider(llm_cfg: dict, target_lang: str, glossary: str = ""):
     """组装 B 线翻译 LLM:MT 小模型(:1236)优先,回退 DeepSeek 云端 / 主 LLM(:1235)。
 
-    MT 分支按官方 Hy-MT2 推荐采样收窄(setdefault 不抢用户显式 env),MlxLlmLLM
-    构造时读进 extra_body;StatelessMTLLM 负责逐句无状态模板化,glossary 非空时
-    进 _mt_prompt 术语槽(会话级常量,前缀稳定)。回退开关 = unset MT_LLM_BASE_URL,
-    老 DeepSeek/主 LLM 路径原样保留(术语一致性由 instructions 的 glossary 行兜)。
+    MT 分支按官方 Hy-MT2 推荐采样收窄,MlxLlmLLM 构造时显式传参(用户显式 env
+    优先、唔写回进程 env,防跨会话泄漏——见 _mt_sampling);StatelessMTLLM 负责
+    逐句无状态模板化,glossary 非空时进 _mt_prompt 术语槽(会话级常量,前缀稳定)。
+    回退开关 = unset MT_LLM_BASE_URL,老 DeepSeek/主 LLM 路径原样保留(术语一致
+    性由 instructions 的 glossary 行兜)。MT_LLM_MODEL 须经 _mt_model_valid(本地
+    绝对路径且在盘)才进 MT 分支——非法值原样透传会让 mlx_lm server 挂死,跳过
+    MT 走回退链 + 日志留值。
     """
     from .providers.livekit_plugins import DeepSeekLLM, MlxLlmLLM, StatelessMTLLM
 
     mt_base = os.environ.get("MT_LLM_BASE_URL", "").strip()
-    if mt_base:
+    mt_model = os.environ.get("MT_LLM_MODEL", "").strip()
+    if mt_base and _mt_model_valid(mt_model):
         # Hy-MT2 官方推荐采样:temperature 0.7 / top_p 0.6 / top_k 20 / 重复惩罚
-        # 1.05——翻译要贴原文,采样收窄防小模型自由发挥/复读。
-        os.environ.setdefault("LLM_TEMPERATURE", "0.7")
-        os.environ.setdefault("LLM_TOP_P", "0.6")
-        os.environ.setdefault("LLM_TOP_K", "20")
-        os.environ.setdefault("LLM_REPETITION_PENALTY", "1.05")
+        # 1.05——翻译要贴原文,采样收窄防小模型自由发挥/复读。经构造参数显式下发
+        # (用户显式 env 优先),唔再用 env setdefault——那会在同 worker 跨会话驻留,
+        # MT 失效落回主 LLM 时采样档跟着泄漏(评审 P2-3)。
         print(f"[interp] llm=hy-mt2 base={mt_base}", flush=True)
         # 滚动上下文(默认 0=关,治代词/指代断裂的 A/B 档):非零=带最近 N 对
         # 「源→译」进 MT prompt 上文参考块(LLMA 式)。代价=参考段逐轮位移,
@@ -282,11 +323,24 @@ def _build_llm_provider(llm_cfg: dict, target_lang: str, glossary: str = ""):
         # scripts/probe_interpret_latency.py 实测后再定默认。
         context_turns = int(os.environ.get("BOK_INTERP_MT_CONTEXT", "0") or 0)
         return StatelessMTLLM(
-            MlxLlmLLM(base_url=mt_base, model=os.environ.get("MT_LLM_MODEL", "")),
+            MlxLlmLLM(
+                base_url=mt_base,
+                model=mt_model,
+                temperature=_mt_sampling("LLM_TEMPERATURE", 0.7),
+                top_p=_mt_sampling("LLM_TOP_P", 0.6),
+                top_k=int(_mt_sampling("LLM_TOP_K", 20)),
+                repetition_penalty=_mt_sampling("LLM_REPETITION_PENALTY", 1.05),
+            ),
             target_lang,
             glossary=glossary,
             context_turns=context_turns,
         )
+
+    if mt_base:
+        # 挂死防线:base 有值但 model 非法(repo-id/占位符/空)——跳过 MT 走既有
+        # 回退链(DeepSeek/主 LLM 原逻辑不动),日志留值方便查 env(超 60 字截断)。
+        shown = mt_model[:60] + ("…" if len(mt_model) > 60 else "")
+        print(f"[interp] mt model invalid ('{shown}') — fallback (deepseek/main LLM 链)", flush=True)
 
     if (llm_cfg.get("provider") or "local_openai") == "deepseek" and (
         llm_cfg.get("api_key") or os.environ.get("DEEPSEEK_API_KEY")
@@ -396,19 +450,23 @@ def _build_tts_provider(tts_cfg: dict, target_lang: str, session_voices=None):
         # B 线默认 2026-09-16 起 2.8-turbo(原 2.6-turbo):语气词标记 (laughs)/
         # (coughs)/(sighs) 仅 2.8 系支持——真人感需求拍板上 2.8,实测代价 ~0.2s
         # 感知 lag(2532→2721ms,预算 3500 内);要快可 MINIMAX_MODEL=speech-2.6-
-        # turbo 回退(标记自动熄火)或 BOK_INTERP_VOICE_TAGS=0 只关标记。
-        os.environ.setdefault("MINIMAX_MODEL", "speech-2.8-turbo")
+        # turbo 回退(标记自动熄火)或 BOK_INTERP_VOICE_TAGS=0 只关标记。合成档
+        # 经 model_override 构造下发(_resolve_minimax_model 读 env 不写)——旧
+        # setdefault 写进程 env,常驻 worker 跨会话驻留(评审 follow-up,与采样
+        # 档 P2-3 同治理)。
         # language_boost 锁目标语,防源语音夹词时合成语种漂移;值是 MiniMax API
-        # 的外部枚举字面量(术语门禁白名单单点),唔系语言字段命名。
+        # 的外部枚举字面量(术语门禁白名单单点),唔系语言字段命名。同经构造参数
+        # 下发:同 worker 先 zh 后 en 的会话,旧 setdefault 会让 boost 停在首通
+        # 的值(合成语种漂移),现逐会话解析零驻留。
         boost_map = {"zh": "Chinese", "cantonese": "Chinese,Yue", "en": "English"}
         boost = boost_map.get(target_lang, "")
-        if boost:
-            os.environ.setdefault("MINIMAX_LANGUAGE_BOOST", boost)
         tts = MiniMaxTTS(
             voice=voice_map,
             language_state=tts_ls,
             sample_rate=int(tts_cfg.get("sample_rate") or 24000),
             api_key=str(tts_cfg.get("api_key") or ""),
+            model_override=_resolve_minimax_model(),
+            language_boost=boost or None,
         )
         # keep-warm 预连(同 A 线):无事件循环时静默跳过,失败零影响。
         try:
@@ -687,7 +745,13 @@ async def entrypoint(ctx) -> None:
     # 叹),不再是假人念稿。双门控:模型档(仅 2.8 系支持,非 2.8 会把标记念出来)
     # + env 总闸(BOK_INTERP_VOICE_TAGS=0 关)。标记进 say() 文本,字幕/落库由
     # _strip_voice_tags(译文行)与前端 stripVoiceTags(字幕)剥掉,只活合成层。
-    tts_model = os.environ.get("MINIMAX_MODEL", "")
+    # 模型档只认 MiniMax 分支(旧版靠 _build_tts_provider 的 setdefault 副作用
+    # 传递;本地 Qwen3 兜底档标记会被当文本念出来,必须保持熄火)。
+    _tts_is_minimax = (tts_cfg.get("provider") or "qwen3_tts").lower() in (
+        "minimax",
+        "minimax_streaming",
+    )
+    tts_model = _resolve_minimax_model() if _tts_is_minimax else ""
     voice_tags = os.environ.get("BOK_INTERP_VOICE_TAGS", "1") == "1" and _voice_tags_supported(tts_model)
     if tts_model:
         print(f"[interp] voice_tags {'on' if voice_tags else 'off'} (tts={tts_model})", flush=True)

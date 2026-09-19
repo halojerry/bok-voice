@@ -123,6 +123,32 @@ def test_probe_llm_timeout_env_and_fail_wording(monkeypatch):
     assert "wedge" in detail  # 冷启动页入与 wedge 的区分提示必须带
 
 
+def test_probe_llm_explicit_model_beats_models_scan(monkeypatch):
+    """显式传 model(:1236 MT 探针,2026-09-19 同传挂死实案):必须以传入路径为准、
+    忽略 /v1/models 扫描结果——扫描列表含外来 repo-id,MT 专用 server 上被采信
+    即挂死;prompt 必须透传(Hy-MT2 对超短 ASCII 输入会 template 404)。"""
+    seen: dict = {}
+
+    def fake_urlopen(arg, timeout=None):
+        # /models 只回 repo-id(无绝对路径)——缺省路径会 FAIL,显式 model 必须无视它
+        if isinstance(arg, str):
+            return _FakeResp(json.dumps({"data": [
+                {"id": "mlx-community/Hy-MT2-1.8B-Abliterated-8bit"},
+            ]}).encode())
+        seen["body"] = json.loads(arg.data.decode())
+        return _FakeResp(b'{"choices":[{"message":{"content":"a"}}]}')
+
+    monkeypatch.setattr(bok.urllib.request, "urlopen", fake_urlopen)
+    ok, detail = bok._probe_llm(
+        "http://127.0.0.1:1236/v1",
+        model="/Users/x/Hy-MT2-1.8B-8bit",
+        prompt="Translate to English: 你好世界")
+    assert ok
+    assert seen["body"]["model"] == "/Users/x/Hy-MT2-1.8B-8bit"
+    assert seen["body"]["messages"][0]["content"] == "Translate to English: 你好世界"
+    assert "Hy-MT2-1.8B-8bit" in detail  # model 名取 Path(...).name 进输出
+
+
 def test_model_present_recognizes_lmstudio_layout(monkeypatch, tmp_path):
     """9B settle 只以 lmstudio 布局在盘时 doctor 不得报 MISSING(与 cmd_download
     的 ensure 同款判定;app-data 布局优先不变)。"""

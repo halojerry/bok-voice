@@ -46,13 +46,19 @@
 - 先在文件管理器里 `cp .env.example .env` 并填好（密钥生成命令见模板注释）；
 - 点「部署/启动」。后续看日志、重启都在面板里操作。
 
+> ⚠ 面板的「部署/重建」按钮等价裸 `docker compose up`——`.env` 里 `DATABASE_URL`
+> 保持池器**域名**形态时，无 IPv6 出口的主机会 crash-loop（§9 铁律）。面板用户
+> 稳妥姿势：填 `.env` 时把 `DATABASE_URL` 的 host 段**直接写成 IPv4**（与
+> `up.sh` 的 `BOK_SUPABASE_IP` 同值），此后面板重启/重建都安全；或改走路 B，
+> 重启/重拉一律 `./up.sh`。
+
 **路 B：SSH 命令行（推荐，输出更直观）**
 
 ```bash
 cd /www/bok-cloud            # 即 deploy/cloud 目录
 cp .env.example .env
 vim .env                     # 填 DATABASE_URL / BOK_JWT_SECRET / BOK_CP_TOKEN / root 种子
-docker compose up -d
+./up.sh                      # 起容器（重启/重拉唯一入口,见 §9 铁律）
 ```
 
 ## 3. 首次启动：数据库自动建齐，无需手工跑 SQL
@@ -75,17 +81,17 @@ docker compose logs -f cp
 
 ```bash
 # ① 存活（豁免鉴权，裸 curl 即可）
-curl -s http://127.0.0.1:${BOK_CP_PORT:-8000}/health
+curl -s http://127.0.0.1:${BOK_CP_PORT:-18010}/health
 # 期望：{"ok":true,"service":"bok-voice-control-plane"}
 
 # ② root 种子成功 + 登录链路（返回 JSON 里应有 token 字段）
-curl -s -X POST http://127.0.0.1:${BOK_CP_PORT:-8000}/api/auth/login \
+curl -s -X POST http://127.0.0.1:${BOK_CP_PORT:-18010}/api/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"username":"<BOK_ROOT_USERNAME>","password":"<BOK_ROOT_PASSWORD>"}'
 
 # ③ 管理台静态站已随镜像就位（机器通道身份取页面）
 curl -s -H "Authorization: Bearer <BOK_CP_TOKEN>" \
-     -o /dev/null -w '%{http_code}\n' http://127.0.0.1:${BOK_CP_PORT:-8000}/
+     -o /dev/null -w '%{http_code}\n' http://127.0.0.1:${BOK_CP_PORT:-18010}/
 # 期望：200
 ```
 
@@ -104,12 +110,12 @@ curl -s -H "Authorization: Bearer <BOK_CP_TOKEN>" \
 ```bash
 cd /www/bok-cloud
 docker compose pull          # 拉新 latest（或改 .env 里 BOK_CP_IMAGE 钉版本）
-docker compose up -d         # 重建容器；vault 卷与 Supabase 数据都保留
+./up.sh                      # 重建容器；vault 卷与 Supabase 数据都保留
 docker image prune -f        # 清旧镜像层（可选）
 ```
 
 升级后回到 §4 复验 `/health`。回滚 = 把 `.env` 里 `BOK_CP_IMAGE` 钉到旧
-`sha-xxxxxxx` tag（GHCR 每次发布都留）再 `up -d`。
+`sha-xxxxxxx` tag（GHCR 每次发布都留）再 `./up.sh`。
 
 ## 6. 宝塔面板自身的安全（必读）
 
@@ -125,7 +131,7 @@ docker image prune -f        # 清旧镜像层（可选）
 
 1. 宝塔 → 网站 → 添加站点（域名填管理台域名，纯静态、不建 FTP/PHP）；
 2. 站点设置 → SSL → Let's Encrypt 申请证书，开「强制 HTTPS」；
-3. 站点设置 → 反向代理 → 目标 URL `http://127.0.0.1:8000`（改过
+3. 站点设置 → 反向代理 → 目标 URL `http://127.0.0.1:18010`（缺省口；改过
    `BOK_CP_PORT` 就填改后的），发送域名 `$host`。
 
 注意：
@@ -152,7 +158,20 @@ docker run --rm -v bok-cloud_cp-vault:/data -v /www/backup:/backup \
 ```bash
 docker compose ps              # 容器状态 + 健康
 docker compose logs -f cp      # 跟日志
-docker compose restart cp      # 重启
-docker compose down            # 停止并删容器（vault 卷保留）
+./up.sh                        # 重启/重拉唯一入口（幂等施加 DATABASE_URL 池器 IP 覆盖
+                               #   [现场解析优先,漂移自动跟随] + 端口 18010；
+                               #   可透传 compose 参数，如 ./up.sh --force-recreate）
+docker compose down            # 停止并删容器（vault 卷保留；down 不吃 DATABASE_URL，可裸跑）
 docker compose down -v         # ⚠ 连 vault 卷一起删（人设参考音频会丢，慎用）
 ```
+
+> **铁律（2026-09-19 crash-loop 事故）**：`docker compose restart cp` 只在容器
+> 定义不变时可用；任何 `up`（含 `--force-recreate`）**必须走 `./up.sh`**——裸 up 会
+> 把 DATABASE_URL 回退 `.env` 的 IPv6-only 池器域名，容器 crash-loop（实案
+> restarts=8）。详见 `docs/DEPLOY_SAAS_RUNBOOK.md`「重启/重拉铁律」。
+
+> **管理台对外地址**：`.env` 配 `BOK_CP_PUBLIC_URL`（话务员浏览器可达的 CP 地址，
+> 如 `https://cp.example.com` 或 `http://IP:18010`）——CP 启动自动写
+> `runtime-config.js` 供管理台运行时取址；**不配则管理台回落构建期默认
+> `127.0.0.1:8000`，云端口/域名形态下登录必 401 弹回**（2026-09-19 模拟拓扑
+> 实测缺口）。
