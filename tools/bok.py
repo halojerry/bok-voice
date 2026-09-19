@@ -403,27 +403,35 @@ def _probe_worker(port: int, timeout: float = 3.0) -> tuple[bool, str]:
 
 
 def _probe_llm(base_url: str = "http://127.0.0.1:1235/v1",
-               timeout_s: float | None = None) -> tuple[bool, str]:
+               timeout_s: float | None = None,
+               model: str = "",
+               prompt: str = "hi") -> tuple[bool, str]:
     """LLM 功能探针:端口 UP ≠ 能用——mlx_lm 被 wedge(解码排队/缓存坍缩)时
     /v1/models 照开 200,通话顿成狗而健康面全绿。发 max_tokens=1 真 prefill
     测往返;超时预算 BOK_DOCTOR_LLM_PROBE_TIMEOUT_S(默认 10s;空闲 >2h 后
     权重页入 ~40s 会一次假警,重跑一次区分:冷启动第二次会快)。
-    model 字段取 /v1/models 的绝对路径 id——repo id 会触发 HF hub 解析。"""
+    model 缺省取 /v1/models 的绝对路径 id——repo id 会触发 HF hub 解析;
+    显式传 model(:1236 MT 探针)则忽略扫描结果直接用,同样必须是本地路径。
+    prompt 对 MT 档必须传代表性长句(如「Translate to English: 你好世界」)——
+    Hy-MT2 的 chat template 对超短 ASCII 输入会 list index out of range 404
+    (2026-09-19 实测,生产链路恒走 _mt_prompt 长模板不受影响)。"""
     if timeout_s is None or timeout_s <= 0:
         try:
             timeout_s = float(os.environ.get("BOK_DOCTOR_LLM_PROBE_TIMEOUT_S", "10") or 10)
         except ValueError:
             timeout_s = 10.0
+    model = str(model or "").strip()
     try:
         with urllib.request.urlopen(f"{base_url.rstrip('/')}/models", timeout=timeout_s) as r:
             ids = [str(m.get("id") or "")
                    for m in json.loads(r.read().decode()).get("data", [])]
-        model = next((i for i in ids if i.startswith("/")), ids[0] if ids else "")
         if not model:
-            return False, "FAIL (/v1/models 空列表)"
+            model = next((i for i in ids if i.startswith("/")), ids[0] if ids else "")
+            if not model:
+                return False, "FAIL (/v1/models 空列表)"
         body = json.dumps({"model": model, "stream": False, "temperature": 0,
                            "max_tokens": 1,
-                           "messages": [{"role": "user", "content": "hi"}]}).encode()
+                           "messages": [{"role": "user", "content": prompt}]}).encode()
         req = urllib.request.Request(f"{base_url.rstrip('/')}/chat/completions",
                                      data=body,
                                      headers={"Content-Type": "application/json"},
@@ -1986,6 +1994,20 @@ def cmd_doctor() -> int:
         print(f"  llm 功能探针: {llm_detail}")
         if not llm_ok:
             print("    (llm 端口 UP 但 prefill 探针失败——通话会顿;重跑 doctor 区分冷启动)")
+    # MT 功能探针(:1236,2026-09-19 同传 2/8 FAIL 实案):mlx_lm 被 repo-id 请求
+    # wedge 时 TCP/健康面全绿、生成永挂——模型在盘才探,informational 不进 fails
+    # (与 :1235 同款冷启动页入假警语义)。显式传在盘路径(忽略 /v1/models 扫描
+    # 结果),prompt 用代表性长句(见 _probe_llm docstring 的 Hy-MT2 短输入坑)。
+    if healthy(1236):
+        mt_model = _mt_llm_model(current)
+        if mt_model and Path(mt_model).exists():
+            mt_ok, mt_detail = _probe_llm(
+                "http://127.0.0.1:1236/v1", model=mt_model,
+                prompt="Translate to English: 你好世界")
+            print(f"  mt 功能探针: {mt_detail}")
+            if not mt_ok:
+                print("    (mt 端口 UP 但 prefill 探针失败——B 线同传会挂死/退主 LLM;"
+                      "重跑 doctor 区分冷启动)")
 
     # /api/token 必须是真 JWT（三段式）；否则 A 线 UI 永远“接通失败”。
     if healthy(8000):
