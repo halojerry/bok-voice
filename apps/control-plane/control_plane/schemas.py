@@ -411,3 +411,37 @@ class QaClusterRequest(BaseModel):
     limit: int = 60
     apply: bool = False
     select: Optional[list[QaClusterSelectItem]] = None
+
+
+class IntentRuleCreate(BaseModel):
+    """意向规则条目(W4-T1,2026-09-19)。conditions 形状(fact∈INTENT_FACTS/op/value)
+    走 core.validate_conditions 严格轨,CP 保存前校验。"""
+
+    name: str
+    intent_code: str
+    label: str = ""
+    disposition: str = ""
+    conditions: list[dict[str, Any]] = []
+    priority: int = 10
+    enabled: bool = True
+    # 作用域:''=全局行仅 root 可建;非 root 由 CP 强制本账号(body 值无效)。
+    account_id: str = "acc-001"
+
+
+class IntentRulePatch(BaseModel):
+    """意向规则部分更新(W4-T1)。None=不修改;conditions 整组替换(CP 转 JSON 落列)。"""
+
+    name: Optional[str] = None
+    intent_code: Optional[str] = None
+    label: Optional[str] = None
+    disposition: Optional[str] = None
+    conditions: Optional[list[dict[str, Any]]] = None
+    priority: Optional[int] = None
+    enabled: Optional[bool] = None
+
+
+class AssistRequest(BaseModel):
+    """人工协助通知(W4-T1):notified=已打铃 / done=人工已接手(幂等:done 不降级)。"""
+
+    status: str  # notified | done(枚举外 400)
+    source: str = ""  # intent | whatsapp | wechat | ""

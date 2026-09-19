@@ -97,6 +97,8 @@
 | `lib/flow-canvas.ts` + `components/flow-canvas.tsx` | 流程画布（W2：场景泳道/步节点/答法抽屉/意图只读 overlay/发布徽标；纯函数 parse-serialize 镜像 flow.py 分支语法、round-trip 无损，`test/flow-canvas.test.mjs` 钉住——**改 flow.py 分支/注意正则两处必须同步**） |
 | `lib/var-panel.ts` + `components/template-vars.tsx` | 变量 tab（W3：占位符目录/扫描/预览渲染镜像 flow.py `object_vars`/`render_template_text`——空串保留占位、digitsToCn 双轨、contact 语言缺省、say 行丢行警示；`test/var-panel.test.mjs` 钉住——**改 flow.py 变量语义两处必须同步**） |
 | `components/study-tab.tsx` | 学习 tab（W3：话术优化/问答对报告 + AI 聚类采纳面板——dry/apply 必须同参 limit，CP 勾选守卫按参数找计划缓存） |
+| `packages/core/bok_voice_core/intent_rules.py` | 意向规则共享契约（W4：INTENT_FACTS 12 键白名单/eval_intent_rules 确定性评估/validate_conditions——CP 保存校验、agent 挂断评估、测试三方共用，**改事实键集三处同步**） |
+| `tests/test_intent_rules.py` / `tests/test_intent_agent.py` | W4 钉面：两级规则 CRUD/RBAC/assist 幂等/挂断评估矩阵/notify 分支 wiring |
 
 ## 数据表（packages/business-db，新表须方言可移植）
 

@@ -283,6 +283,45 @@ test("then_jump 画布第二边默认关：带链的图不多出任何边（零�
   assert.equal(graph.edges.filter((e) => String(e.id).startsWith("thenjump:")).length, 0);
 });
 
+// —— W4-T3 notify_human 第三动作 ——
+// 往返：草稿→真重建函数→无负载绑定（CP validate_flow_graph 对 notify_human 带键行 400，
+// 故 qa_id/step/then_jump 三个专属键一个都不许吐——即使草稿行被脏数据污染）。
+test("bindingFromDraft notify_human 往返：无负载字段（草稿带 qa_id/step/then_jump 也不吐键）", () => {
+  const saved = qa.bindingFromDraft(
+    {
+      id: "bnd_n1", action: "notify_human",
+      qa_id: "qa-1", step: 2, then_jump: 3, // 脏键：专属负载必须全被剥掉
+      priority: 7, once: true, enabled: true,
+    },
+    "int_1a2b3c4d", 5,
+  );
+  assert.deepEqual(saved, {
+    id: "bnd_n1", intent: "int_1a2b3c4d", priority: 7, once: true, enabled: true, action: "notify_human",
+  });
+  assert.equal("qa_id" in saved, false);
+  assert.equal("then_jump" in saved, false);
+  // 落库文本→运行时解析同路仍读得回
+  const doc = qa.parseGraphDoc(JSON.stringify({ version: 1, intents: CHAIN_DOC.intents, bindings: [saved] }));
+  assert.equal(doc.bindings[0].action, "notify_human");
+});
+
+test("then_jump 非法组合仍拦：notify_human 即使草稿带链值也不写键", () => {
+  // 与「jump_step 行带 then_jump → 恒 {}」同款铁律——CP 严格校验对越权键 400。
+  assert.deepEqual(qa.bindingThenJumpField("notify_human", 4, 5), {});
+});
+
+test("notify_human 绑定不画绑定边（无目标节点，画布零新边）", () => {
+  const doc = qa.parseGraphDoc(JSON.stringify({
+    version: 1,
+    intents: CHAIN_DOC.intents,
+    bindings: [
+      { id: "bnd_n1", intent: "int_1a2b3c4d", action: "notify_human", priority: 10, once: false, enabled: true },
+    ],
+  }));
+  const graph = qa.deriveGraph([], qa.parseTemplateSteps(JSON.stringify(STEPS)), { langFilter: "all", graph: doc });
+  assert.equal(graph.edges.filter((e) => e.data?.kind === "binding").length, 0);
+});
+
 // 接线守门（review R1 I1 的补强）：纯函数测得到重建逻辑，却测不到「page.tsx 有没有调它、
 // 调用结果有没有被 push 进落库数组」。逐字段重建的丢键风险恰在这两行，故源码扫描钉死。
 test("page.tsx 接线：草稿进 then_jump、submit 用真实重建函数且结果直接入 nextBindings", () => {

@@ -271,6 +271,12 @@ def build_engine() -> Engine | None:
                 _ensure_column(conn, "nodes", "revoked_at", "revoked_at VARCHAR(32) DEFAULT ''")
                 # 通话绑定节点(thin-node 拓扑):建单钉死承载节点,token 签发前校验。
                 _ensure_column(conn, "call_sessions", "node_id", "node_id VARCHAR(64) DEFAULT ''")
+                # 意向规则引擎(W4-T1,2026-09-19):人工协助面状态 + 挂断意向码。
+                # server_default 与 models.CallSession 同形（DEFAULT ''，方言安全）。
+                _ensure_column(conn, "call_sessions", "assist_status",
+                               "assist_status VARCHAR(16) DEFAULT ''")
+                _ensure_column(conn, "call_sessions", "intent_code",
+                               "intent_code VARCHAR(32) DEFAULT ''")
                 # 战役调度三字段（2026-09-17 竞品对齐）：时段窗/任务级并发/自动重拨。
                 # server_default 同形（DEFAULT '[]'/1/''，单引号字面量 SQLite/PG 双认）。
                 _ensure_column(conn, "campaigns", "call_windows_json",

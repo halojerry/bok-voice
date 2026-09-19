@@ -397,7 +397,9 @@ export default function StudioPage() {
                               <p key={b.id} className="text-xs muted">
                                 {b.action === "play_qa"
                                   ? `播快答 ${String(b.qa_id ?? "-")}`
-                                  : `跳到第 ${Number(b.step ?? 1)} 步`}
+                                  : b.action === "notify_human"
+                                    ? "通知人工"
+                                    : `跳到第 ${Number(b.step ?? 1)} 步`}
                                 {b.action === "play_qa" && Number(b.then_jump ?? 0) > 0 && ` · 播完跳第 ${Number(b.then_jump)} 步`}
                                 {` · P${Number(b.priority ?? 10)}`}
                                 {b.once && " · 只执行一次"}

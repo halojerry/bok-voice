@@ -255,6 +255,19 @@ export const api = {
   // 改战役配置（2026-09-17 调度三字段）：running 服务端 409 锁定，字段全 optional。
   updateCampaign: (id: string, body: Record<string, unknown>) =>
     request<Record<string, unknown>>(`/api/campaigns/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  // 意向规则（W4）：两级行（account_id=''=全局 admin 写 / 账号行）；
+  // 行形状 {id,account_id,name,intent_code,label,disposition,priority,enabled,conditions:[{fact,op,value}]}。
+  listIntentRules: (accountId = "acc-001") =>
+    request<Record<string, unknown>[]>(`/api/intent-rules?account_id=${encodeURIComponent(accountId)}`),
+  createIntentRule: (body: Record<string, unknown>) =>
+    request<Record<string, unknown>>("/api/intent-rules", { method: "POST", body: JSON.stringify(body) }),
+  updateIntentRule: (id: string, body: Record<string, unknown>) =>
+    request<Record<string, unknown>>(`/api/intent-rules/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) }),
+  deleteIntentRule: (id: string) =>
+    request<Record<string, unknown>>(`/api/intent-rules/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  // 通话人工求助打标（W4 notify_human/WA 打铃共用）：{status:"notified"|"done", source}。
+  reportAssist: (callId: string, body: { status: string; source?: string }) =>
+    request<Record<string, unknown>>(`/api/calls/${encodeURIComponent(callId)}/assist`, { method: "POST", body: JSON.stringify(body) }),
   reportsSummary: () => request<Record<string, unknown>>("/api/reports/summary"),
   // 学习报告（W1 AI 工作站）：话术优化分析（高频问题 TOP N）+ 高频问答对挖掘。
   scriptInsights: (accountId = "acc-001") =>

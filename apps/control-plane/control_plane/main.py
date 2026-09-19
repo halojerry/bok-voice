@@ -21,6 +21,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 from bok_voice_core.flow_graph import validate_flow_graph
+from bok_voice_core.intent_rules import validate_conditions
 from bok_voice_core.providers import BusinessRepository
 from bok_voice_core.policies import select_session_manifest
 from bok_voice_core.qa_text import mine_qa_pairs
@@ -67,11 +68,14 @@ from .auth import (
     verify_password,
 )
 from .schemas import (
+    AssistRequest,
     CreateCallRequest,
     CreateObjectRequest,
     DialNowRequest,
     ImportRequest,
     DialResultRequest,
+    IntentRuleCreate,
+    IntentRulePatch,
     ListenStopRequest,
     LoginRequest,
     ChangePasswordRequest,
@@ -1839,6 +1843,10 @@ def report_whatsapp(call_id: str, req: WhatsAppCaptureRequest, request: Request)
         fields = {"whatsapp_status": "captured" if number else "offered"}
         if number:
             fields["customer_whatsapp"] = number
+    # 意向规则引擎(W4-T1):WhatsApp 对接触发=人工协助信号——assist_status 为空
+    # 顺手置 notified(不改已有值;同一次 update_call,不走第二条写路径)。
+    if not str(call.get("assist_status") or ""):
+        fields["assist_status"] = "notified"
     updated = _repo().update_call(call_id, **fields) or call
     if number:
         # 名册自动入册（Wave1）：captured 带号码 → upsert；channel 归一——
@@ -1878,6 +1886,31 @@ def report_whatsapp(call_id: str, req: WhatsAppCaptureRequest, request: Request)
     _audit("call.whatsapp_captured", subject_type="call", subject_id=call_id,
            account_id=call.get("account_id", "acc-001"),
            detail={"status": fields["whatsapp_status"], "number": (number or "")[:3] + "***"})
+    return updated
+
+
+@app.post("/api/calls/{call_id}/assist")
+def assist_notify(call_id: str, req: AssistRequest, request: Request) -> dict:
+    """人工协助通知面(W4-T1,2026-09-19):意向规则命中/WhatsApp 捕获 → 打铃
+    (notified);人工接手 → done。幂等:当前 done 不降级 notified(其余覆盖)。
+    闸链照 whatsapp capture 端点:机器通道直通(无身份不过 _gate_page)、
+    跨账号 deny_cross_account。审计 call.assist_notify。
+    """
+    _gate_page(request, "calls")
+    deny_cross_account(request, _repo().get_call(call_id))
+    call = _repo().get_call(call_id)
+    if not call:
+        raise HTTPException(404, "call not found")
+    status = (req.status or "").strip().lower()
+    if status not in ("notified", "done"):
+        raise HTTPException(status_code=400, detail="status must be 'notified' or 'done'")
+    if str(call.get("assist_status") or "") == "done" and status != "done":
+        return call  # 幂等:人工已接手,notified 不降级
+    source = (req.source or "").strip()[:16]
+    updated = _repo().update_call(call_id, assist_status=status) or call
+    _audit("call.assist_notify", subject_type="call", subject_id=call_id,
+           account_id=call.get("account_id", "acc-001"),
+           detail={"status": status, "source": source})
     return updated
 
 
@@ -3524,6 +3557,101 @@ def hit_qa_entry(entry_id: str, request: Request) -> dict:
     return {"id": entry_id}
 
 
+# ---- 意向规则(W4-T1,2026-09-19):条件规则 → 挂断意向码/处置,两级作用域 ----
+# 作用域语义:account_id ''=全局行(admin/root 写)∪账号行(话务员写),读=两级行合并。
+# 条件形状与评估纯函数=packages/core/bok_voice_core/intent_rules.py(CP 只消费)。
+
+
+def _intent_rule_out(row: dict) -> dict:
+    """出仓形状:conditions_json → conditions 对象数组(宽容 json.loads,坏=空数组)。"""
+    out = dict(row)
+    raw = out.pop("conditions_json", "[]")
+    try:
+        conds = json.loads(raw if isinstance(raw, str) else "[]")
+    except Exception:
+        conds = None
+    out["conditions"] = conds if isinstance(conds, list) else []
+    return out
+
+
+def _forbid_user_on_global_rule(request: Request, row: dict) -> None:
+    """全局行(account_id=='')只归 admin/root——user/普通身份 403(机器通道无身份直通)。"""
+    if str(row.get("account_id") or "") != "":
+        return
+    ident = current_identity(request)
+    if ident is not None and ident.role not in ("admin", "root"):
+        raise HTTPException(status_code=403, detail="global intent rule requires admin/root")
+
+
+def _gate_intent_rule_row(request: Request, row: dict | None) -> dict:
+    """by-ID 规则闸链(W4-T1):404 不泄露存在性;全局行走角色闸、账号行走跨账号闸。
+
+    全局行不进 deny_cross_account——admin 属某账号,按账号闸会把他该管的全局行
+    误杀成 404;角色闸(user→403)已先行收窄到 admin/root/机器。
+    """
+    if row is None:
+        raise HTTPException(status_code=404, detail="intent rule not found")
+    if str(row.get("account_id") or "") == "":
+        _forbid_user_on_global_rule(request, row)
+    else:
+        deny_cross_account(request, row)
+    return row
+
+
+@app.get("/api/intent-rules")
+def list_intent_rules(request: Request, account_id: str = "acc-001") -> list[dict]:
+    _gate_page(request, "calls")
+    account_id = scoped_account(request, account_id)
+    return [_intent_rule_out(r) for r in _repo().list_intent_rules(account_id)]
+
+
+@app.post("/api/intent-rules")
+def create_intent_rule(req: IntentRuleCreate, request: Request) -> dict:
+    _gate_page(request, "calls")
+    errs = validate_conditions(req.conditions)
+    if errs:
+        raise HTTPException(status_code=400, detail="; ".join(errs))
+    identity = current_identity(request)
+    if identity is not None and identity.role != "root":
+        # 非 root 强制本账号行(body 的 account_id 无效;''=全局行仅 root 可建)。
+        req = req.model_copy(update={"account_id": identity.account_id})
+    payload = req.model_dump()
+    payload["conditions_json"] = json.dumps(payload.pop("conditions"), ensure_ascii=False)
+    row = _repo().create_intent_rule(payload)
+    _audit("intent.rule.create", subject_type="intent_rule", subject_id=row.get("id", ""),
+           account_id=row.get("account_id", ""),
+           detail={"intent_code": row.get("intent_code", ""), "account_id": row.get("account_id", "")})
+    return _intent_rule_out(row)
+
+
+@app.patch("/api/intent-rules/{rule_id}")
+def update_intent_rule(rule_id: str, req: IntentRulePatch, request: Request) -> dict:
+    _gate_page(request, "calls")
+    row = _gate_intent_rule_row(request, _repo().get_intent_rule(rule_id))
+    patch = {k: v for k, v in req.model_dump().items() if v is not None}
+    if "conditions" in patch:
+        errs = validate_conditions(patch["conditions"])
+        if errs:
+            raise HTTPException(status_code=400, detail="; ".join(errs))
+        patch["conditions_json"] = json.dumps(patch.pop("conditions"), ensure_ascii=False)
+    updated = _repo().update_intent_rule(rule_id, patch)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="intent rule not found")
+    _audit("intent.rule.update", subject_type="intent_rule", subject_id=rule_id,
+           account_id=row.get("account_id", ""), detail={"keys": sorted(patch.keys())})
+    return _intent_rule_out(updated)
+
+
+@app.delete("/api/intent-rules/{rule_id}")
+def delete_intent_rule(rule_id: str, request: Request) -> dict:
+    _gate_page(request, "calls")
+    row = _gate_intent_rule_row(request, _repo().get_intent_rule(rule_id))
+    ok = _repo().delete_intent_rule(rule_id)
+    _audit("intent.rule.delete", subject_type="intent_rule", subject_id=rule_id,
+           account_id=row.get("account_id", ""), outcome="ok" if ok else "not_found")
+    return {"deleted": ok, "id": rule_id}
+
+
 # ---- 罐头状态面(2026-09-17 qa-canvas Phase 1 Task 3) ----
 
 
@@ -4774,7 +4902,9 @@ def resume_agent(call_id: str, request: Request) -> dict:
 def takeover(call_id: str, request: Request) -> dict:
     require_role(request, "admin", "root")
     deny_cross_account(request, _repo().get_call(call_id))
-    call = _repo().update_call(call_id, escalated_to_human=True, status=CallStatus.PAUSED.value)
+    # 人工接手=协助面终态:assist_status 顺手置 done(W4-T1)。
+    call = _repo().update_call(call_id, escalated_to_human=True, status=CallStatus.PAUSED.value,
+                               assist_status="done")
     if not call:
         raise HTTPException(404, "call not found")
     _audit("supervisor.takeover", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""), call_id=call_id)
@@ -4798,10 +4928,12 @@ async def transfer(call_id: str, request: Request) -> dict:
 
 
 @app.post("/api/supervisor/{call_id}/end")
-async def supervisor_end(call_id: str, request: Request, disposition: str = "declined") -> dict:
+async def supervisor_end(call_id: str, request: Request, disposition: str = "declined",
+                         intent_code: str = "") -> dict:
     """AI 收尾后主动结束通话:置 ENDED 并断房。
 
     disposition=declined(客户明确拒绝/告别,默认)| no_response(沉默心跳两次无回应)。
+    intent_code=W4-T2 意向规则引擎命中码(agent 挂断评估回写,可选;空=未命中不落列)。
     agent 讲完一句礼貌再见后调用;结算由 agent 侧 _on_close 幂等触发,这里只负责
     归档 disposition + 踢出房间。房间不存在/服务不可用不阻塞(DB 已置 ENDED)。
     """
@@ -4811,15 +4943,22 @@ async def supervisor_end(call_id: str, request: Request, disposition: str = "dec
         raise HTTPException(status_code=403, detail="forbidden")
     deny_cross_account(request, _repo().get_call(call_id))
     disposition = (disposition or "declined").strip()[:64] or "declined"
+    intent_code = (intent_code or "").strip()[:32]
     existing = _repo().get_call(call_id)
     if not existing:
         raise HTTPException(404, "call not found")
+    end_fields: dict = dict(_call_end_fields(existing))
+    if intent_code:
+        end_fields["intent_code"] = intent_code  # 非空才落列(''=零写入,方言/历史行零扰动)
     call = _repo().update_call(call_id, escalated_to_human=False, disposition=disposition,
-                               status=CallStatus.ENDED.value, **_call_end_fields(existing))
+                               status=CallStatus.ENDED.value, **end_fields)
     if not call:
         raise HTTPException(404, "call not found")
     _disconnect_room_background(call_id)
-    _audit("supervisor.end", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""), call_id=call_id, detail={"disposition": disposition})
+    end_detail: dict = {"disposition": disposition}
+    if intent_code:
+        end_detail["intent_code"] = intent_code
+    _audit("supervisor.end", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""), call_id=call_id, detail=end_detail)
     return {"call_id": call_id, "action": "end", "status": call["status"], "disconnected": True}
 
 

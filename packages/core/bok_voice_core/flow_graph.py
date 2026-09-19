@@ -1,10 +1,11 @@
 """话术图(flow graph)纯函数:解析/校验/命中裁决(spec docs/superpowers/specs/2026-09-18-qa-flow-graph.md)。
 
 模板可选携带 graph_json:意图节点(确定性关键词触发)+绑定边(play_qa 播罐头 /
-jump_step 跳步)。CP 保存走 validate_flow_graph(严格,错误列表→400);运行时走
-parse_flow_graph(宽容,坏数据→空图零变化)与 pick_graph_action(每轮至多一个动作,
-priority 小者先)。关键词命中=**双侧归一**(剥空白与中英标点 → casefold)后子串判定
-——ASR 转写常带标点(实测「我要。投诉。」),归一后多字关键词才命中(I2,2026-09-18)。
+jump_step 跳步 / notify_human 打铃,W4-T2 无负载)。CP 保存走 validate_flow_graph
+(严格,错误列表→400);运行时走 parse_flow_graph(宽容,坏数据→空图零变化)与
+pick_graph_action(每轮至多一个动作,priority 小者先)。关键词命中=**双侧归一**
+(剥空白与中英标点 → casefold)后子串判定——ASR 转写常带标点(实测「我要。投诉。」),
+归一后多字关键词才命中(I2,2026-09-18)。
 设计契约见 spec §3/§4;消费方:control_plane.main(保存校验)、
 agent_runtime.flow(装配解析)、agent_runtime.agent(每轮命中)。
 Phase 3.4 意图引擎:意图可携可选 `judge.prompt`(判据片段)——关键词未中时由背景
@@ -33,7 +34,10 @@ DEFAULT_PRIORITY = 10
 STEP_MAX = 999
 ACTION_PLAY_QA = "play_qa"
 ACTION_JUMP_STEP = "jump_step"
-ACTIONS = {ACTION_PLAY_QA, ACTION_JUMP_STEP}
+# W4-T2(2026-09-19):notify_human 打铃——CP assist 置 notified(坐席台「人工求助」),
+# 无负载(不要求 qa_id/step);agent 侧不抢话,LLM 照常兜话,坐席旁听后手动接管。
+ACTION_NOTIFY_HUMAN = "notify_human"
+ACTIONS = {ACTION_PLAY_QA, ACTION_JUMP_STEP, ACTION_NOTIFY_HUMAN}
 _ID_RE = re.compile(r"^(?:int|bnd)_[0-9a-f]{8}$")
 
 # 关键词匹配噪声(I2,2026-09-18):ASR 转写窗口带标点/空格(实测「我要。投诉。」
