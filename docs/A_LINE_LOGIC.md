@@ -193,16 +193,32 @@ REFUSE `_REFUSE_RE`+`_HANGUP_RE`（软守卫「唔使担心」否决 366-369）�
 - 录音沉淀 tab：空态 + 新增引导「分支录音…在主流程画布的答法抽屉里查看/补录」在位。
 - 全程控制台 0 报错、0 未捕获异常、CP 侧 **0 条非 2xx**。
 
-### 8.4 验收发现（新，未修——按优先级）
+### 8.4 验收发现（F1-F8，**全部已修**——修复与复验见 §8.5）
 
-| # | 发现 | 影响 | 建议 |
+| # | 发现 | 影响 | 状态 |
 |---|---|---|---|
-| F1 | **人设 account_id 取 body 不取 query**：`POST /api/personas` 不带 account_id 时落 `account_id=""`，`/api/personas` 列表看不到它 → `pregen_tts --persona` 找不到人设 → 回落默认音色 `moss_audio_*` → 缓存键与运行时错位（`--branch-status` 报「假 ok」）。探针首轮即被此坑：以为物化好了、运行时却 miss | 运营补录录音可能「看起来 ok、实际永远不播」；`probe_flow_graph.create_probe_call` 同款隐患 | 人设端点按 `scoped_account` 兜底 body/query；状态端点把「音色与运行时不同源」判为 `ph`/warning |
-| F2 | **迟到 ASR 修正轮掐断快路回复**：裸句尾推流时 sidecar 整窗重解在句尾幻听「那。」→ 迟到 FINAL 修正轮 interrupt 掉正在播的罐头（0.4s 掐断、assistant item 不落库、`_turn_origin` 戳被后续轮消费） | 快路/直念线在「迟到修正」竞态下丢轮次行 + 听感截断 | 归档到 STT 修正判定面（与 D4 同族） |
-| F3 | **`_turn_origin` consume-once 戳在 late-answer 兜底下必丢**：LLM 慢轮（>2s）触发 late-answer 时，早段盖的 `provider=branch-notify` 被兜底轮消费/覆盖 → 真答案行 provider 为空 | branch-notify/handoff 的**归因面**（turns provider）在慢 LLM 下不可靠（行为本身正确） | 观察项；若要硬归因，戳应随轮次 id 绑定而非 consume-once |
-| F4 | **热词偏置抄词**：「…我还想想」的弱尾音节被 ASR 直接抄成词表里的「打错电话」→ 意外命中【收线】分支并收线 | 与既有「极低内容音频抄词表」同类；分支动作让后果更重（误收线） | 已在 AGENTS 记录过；分支动作侧可考虑 refuse 前要求非 REFUSE 轮也过一次 verdict 一致性 |
-| F5 | 画布默认缩放太小（8 步拥挤，文字需放大才读得清） | 普通人第一眼「看不清」，与「易用性为主」冲突 | 默认 fitView 后给最小缩放或让画布更高 |
-| F6 | 引导语写「左边意图卡=听到某些话就跳到箭头指的步骤」，但库中 7 个模板 `graph_json` 全空 → 左栏永远为空 | 引导与现实不符，用户以为坏了 | 空图时隐藏该半句或给「还没有意图，去意图管理添加」空态 |
-| F7 | 点「应用」保存后**答法抽屉自动收起**（选中态被重置） | 连续改多条分支要重开抽屉 | 视觉/交互体验项 |
-| F8 | 保存会把整步分支行的「 → 」归一成「→」（无丢字，但运营未编辑的行也被改写） | 审计/版本 diff 出现非本意变更 | 序列化时保留箭头原空格（可让分支行保存原文） |
+| F1 | **人设 account_id 取 body 不取 query**：`POST /api/personas` 不带 account_id 时落 `account_id=""`，`/api/personas` 列表看不到它 → `pregen_tts --persona` 找不到人设 → 回落默认音色 `moss_audio_*` → 缓存键与运行时错位（`--branch-status` 报「假 ok」） | 运营补录录音可能「看起来 ok、实际永远不播」 | ✅已修：建人设 body 缺账号兜底 `acc-001`（非 root 仍强制本账号）、`update_persona` 不再把账号洗空；`pregen_tts --persona` 找不到 → `PERSONA_MISSING` + **exit 3、零缓存写入**；状态面加 `voice_source` 信息位（三态语义未动） |
+| F2 | **迟到 ASR 修正轮掐断快路回复**：裸句尾推流时 sidecar 整窗重解在句尾幻听「那。」→ 迟到 FINAL 成新用户轮 → 打断正在播的罐头/直念（0.4s 截断、assistant item 不落库、turns 丢行） | 快路/直念线在「迟到修正」竞态下丢轮次行 + 听感截断 | ✅已修：`late_final_is_new_speech`（AI 忙 + 极短尾巴 ≤2 字 → 丢；数字/字母 run 永远成轮）；**新增「收线/告别直念窗」不打断**（告别说完优先）；`BOK_LATE_FINAL_GUARD` / `BOK_LATE_FINAL_MAX_TAIL_CHARS` |
+| F3 | **`_turn_origin` consume-once 戳在 late-answer 兜底下必丢**：LLM 慢轮（>2s）触发 late-answer 时，早段盖的 `provider=branch-notify` 被兜底轮消费/覆盖 → 真答案行 provider 为空 | branch-notify/handoff 的**归因面**在慢 LLM 下不可靠（行为本身正确） | 未修（观察项）：要硬归因须把戳绑到轮次 id 而非 consume-once |
+| F4 | **热词偏置抄词 → 误触发【收线】把电话挂了**：客户说「…我还想想」，ASR 把弱尾音节抄成词表里的「打错电话」→ 命中【收线】分支真挂断 | 误收线（比单纯复读严重一档） | ✅已修（两条独立护栏）：①破坏性动作要求**条件字面命中 或 内置 verdict=REFUSE**（纯家族/bigram 模糊命中不再能挂断），多选条件（`/`、`、`、`或`）任一项命中即可；②**热词幻觉最终否决**——整轮/末子句剥词表词后为空或剩余过短 → `refuse_skipped reason=hotword_only`；`BOK_BRANCH_REFUSE_CONFIRM` / `BOK_BRANCH_REFUSE_HOTWORD_GUARD` 可回退 |
+| F5 | 画布默认缩放太小（8 步拥挤，文字 ~3px） | 第一眼看不清，与「易用性为主」冲突 | ✅已修：fitView 夹逼 `[0.75, 1]`（`CANVAS_MIN_ZOOM`），真浏览器实测视口 scale=0.75 |
+| F6 | 引导语写「左边意图卡…」但库中模板 `intent` 全空 → 左栏永远空 | 用户以为坏了 | ✅已修：空图时引导语只留「从上到下=通话顺序；点步骤卡即可编辑」+ 空态行「这个话术还没有设置意图…」+ 一键去「意图管理」 |
+| F7 | 点「应用」后答法抽屉自动收起 | 连续改多条要反复重开 | ✅已修：根因是重拉期间 `tplLoading` 门控整块卸载；现只在首次加载转圈、重拉沿用屏上内容，抽屉仅在步号真越界时收起 |
+| F8 | 保存把未编辑行的「 → 」归一成「→」 | 审计/版本 diff 出现非本意变更 | ✅已修：`StepBranch.arrow` 记住原始分隔形态原样回写（新加分支用规范形）；真库实测 26 个「 → 」零改写 |
+
+### 8.5 修复后的真栈复验（2026-09-20 二轮）
+
+| 项 | 证据 |
+|---|---|
+| 探针 `canned` | PASS（`canned_materialized` / `canned_hit_logged` / `turn_gen_script_provider` / `text_exact` 全 1） |
+| 探针 `handoff` / `jump` | PASS（`assist_status=notified` 真落库；`jump` 同轮 provider=branch-jump + 同位 `jump_noop`） |
+| 探针 `refuse` | **修复前 FAIL → 修复后 PASS**：修复前 `turn_gen_script_text_exact=0`/`no_llm_after_refuse=0`（第二片段成新轮把收线台词截断成「不好意思打扰了，」并落 LLM 兜话）；修复后六项判据全 1（台词完整、之后零 LLM、提交→挂断 14s） |
+| 探针 `hold` | PASS（`no_advance`/`stay_step2`/`trigger_answered` 全 1）；中途一次 FAIL 经查是**探针切窗 race**（warmup 轮身份步的 `rule=auto step=2` 串进触发窗）→ 修 harness（取 mark 前等日志落盘稳定），判据语义未动 |
+| 真打断回归 | `scripts/e2e_barge_in.py`：**BARGEIN PASS interrupted=yes stop_ms=2399 resumed=yes resume_ms=6006**（≈基线；两条 F2 护栏未挡真插话） |
+| F1 真验 | body 不带 account_id 建人设 → 真落 `acc-001`（修复前为 `""`）；`branch-canned-status` 返 `voice_source={"zh":"persona:…"}`（修复前无该键） |
+| F5/F6 真验（浏览器） | 视口 scale=**0.75**；引导语=「从上到下=通话顺序；点步骤卡即可编辑」+ 空态行「这个话术还没有设置意图（听到哪些话就跳步或播快答）。去「意图管理」添加 →」 |
+| F7 真验（浏览器） | 抽屉里改一条分支 → 点「应用」→ `已保存 ✓` 且**抽屉仍开着**（3 条分支的下拉都在、改动值保留） |
+| F8 真验（真库） | 改 step3 一条分支加 `【收线】` 后：全模板仍 `「 → 」26 / 无空格 0`（未编辑行逐字节未动） |
+| 全量回归 | `pytest -q` **1924 passed**；web `tsc` 0 错 + `node --test` 95/95 + 静态导出通过 |
+
 
