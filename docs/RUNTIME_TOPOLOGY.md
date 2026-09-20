@@ -405,6 +405,33 @@ Windows 站点机的常驻等价物（对照 mac launchd RunAtLoad + KeepAlive�
   存放在任务 XML 与 plist env 中等价。
 - `prod uninstall` 对称卸载（mac launchd bootout + 删 plist / Windows
   `schtasks /delete`；装过 `--node-agent` 的机器连 bok-node-agent 一把清）。
+
+### Ubuntu 节点形态（2026-09-20 接线补齐）
+
+- **进程面**：节点 = node_agent（systemd 常驻，Restart=on-failure）→ cmd_up =
+  服务面（ASR:8787 / TTS:8788 / LLM:1235[/MT:1236/settle:1237] / b-line:8790）
+  **+ 通话面**（LiveKit:7880 + agent/interp worker:8081-8083 + monitor）。旧版
+  cmd_up 只起服务面，通话面只在 dev `serve` 内联——节点装完打不了电话（本版把
+  通话面提取为 `_start_call_plane`，serve 与 node_agent 同源）。
+- **平台路径**：app-data = Linux `$XDG_DATA_HOME`（缺省 `~/.local/share`）/BokVoice
+  （旧版非 nt 恒落 `~/Library/Application Support`）；模型表非 mac 走
+  `MODELS["windows"]`（llama.cpp GGUF + transformers 后端，`platform_key()` 仅
+  Darwin=mac）。
+- **媒体/回调寻址（env，经单元文件透传）**：`BOK_LIVEKIT_BIND`（默认
+  127.0.0.1；内网多话务员填本机内网 IP，逗号多址）、`BOK_LIVEKIT_WEBHOOK_URL`
+  （默认 CP_URL/api/webhook/livekit——节点形态必须指云 CP）；`LIVEKIT_API_KEY/
+  SECRET` 与 CP 签发 token 同源（`_livekit_config_path` 行级补丁生成
+  app-data/run/livekit.yaml，无 env 时逐字节沿用仓内文件）。
+- **模型档位**：`BOK_LLM_TIER=4b` 时取表内 `llm_4b`（空=未配置→告警回退默认档）；
+  装机脚本按 VRAM 给建议档（<10GB=min / 10-19GB=a / ≥20GB=all），`--models`
+  显式覆盖；`download --only` 支持子集下载。
+- **装机七步**（`scripts/install-node.sh`）：环境体检（VRAM 分档/端口预检/可达性）
+  → venv+CUDA 栈 → **license 注册（提前，坏 key 秒失败）** → 模型选型+下载 →
+  systemd 安装 → 拉起+**六点硬自检**（控制面/主模型/识别/合成/媒体/工作进程，
+  不过=装机失败）→ 成功摘要（内网 IP 探测 + 双入口 URL，中性词、不打印凭据）。
+- **systemd 语义**（`tools/systemd_units.py`，纯文本模块）：`Restart=on-failure`
+  精确复刻更新退出码 75=拉回上新版、熔断退出码 0=保持停止；模块零 subprocess
+  （装载由安装脚本/操作者以 root 执行）。
 - `--open-firewall`（netsh 放行 :8000/:7880 TCP+UDP）**默认只打印计划不
   执行**，显式 flag + 管理员权限才落防火墙。**:8000 规则只有 CP 以
   `BOK_BIND_HOST=0.0.0.0` 显式 opt-in 对外监听时才有意义**——CP 缺省恒绑

@@ -123,6 +123,14 @@ MODELS: dict[str, dict[str, str]] = {
         "tts_clone": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
         # GGUF for llama.cpp; only the Q4_K_M file is downloaded (see patterns).
         "llm": "lukey03/Qwen3.5-9B-abliterated-GGUF",
+        # 4B 档（2026-09-20 装机分档机制；口径「配置够 9B / 不够 4B」）：**repo id
+        # 留空 = 档位未配置**——install-node.sh 按 VRAM 探测给建议档，空值明确
+        # 告警并回退 9B（resolve_llm_repo 同判）。运维选定 4B GGUF 权重后填此键
+        # 即生效，勿臆造仓库。
+        "llm_4b": "",
+        # B 线 MT / settle 专线在非 mac 表当前缺项（缺=对应功能回退主 LLM :1235，
+        # 与 OPTIONAL_MODELS 语义一致）；补权重后填 "mt"/"settle" 键即被选型/
+        # 下载/启动三面自动识别。
     },
 }
 
@@ -203,9 +211,23 @@ def _settings_llm_local_model() -> str:
 
 
 def resolve_llm_repo(current: dict[str, str]) -> str:
-    """选定要启动/注入的本地 LLM repo:设置页 local_model 优先,空用默认 current."""
+    """选定要启动/注入的本地 LLM repo：设置页 local_model 优先 → 档位 env
+    （`BOK_LLM_TIER=4b` 且表内 `llm_4b` 非空）→ 表默认 `llm`。
+
+    档位（2026-09-20 装机分档，口径「配置够 9B / 不够 4B」）：4b 档未配置时
+    明确告警一次并回退默认档——绝不静默去起一个不存在的仓库。
+    """
     override = _settings_llm_local_model()
-    return override or (current.get("llm") or "")
+    if override:
+        return override
+    tier = (os.environ.get("BOK_LLM_TIER") or "").strip().lower()
+    if tier in ("4b", "small"):
+        repo_4b = (current.get("llm_4b") or "").strip()
+        if repo_4b:
+            return repo_4b
+        print("[bok] BOK_LLM_TIER=4b 但当前平台表未配置 llm_4b —— 回退默认档",
+              file=sys.stderr)
+    return current.get("llm") or ""
 
 
 def _mt_llm_model(current: dict[str, str]) -> str:
@@ -707,16 +729,28 @@ def _enable_hf_transfer() -> None:
         pass
 
 
-def cmd_download() -> int:
+def cmd_download(only: set[str] | None = None) -> int:
+    """下载平台模型表里的模型（幂等：已在盘跳过；`only` 限定子集——装机选型用）。
+
+    `only` 提到表内不存在的键（如非 mac 表的 mt/settle）→ 逐项说明「未配置，
+    对应功能回退主 LLM」，不算失败（与 OPTIONAL_MODELS 语义一致）。
+    """
     key = platform_key()
+    table = MODELS[key]
+    requested = set(only) if only else None
+    if requested:
+        for name in sorted(requested - set(table)):
+            print(f"  [skip] {name} 当前平台表未配置（可选档；对应功能回退主 LLM :1235）")
     try:
         from huggingface_hub import snapshot_download
     except Exception as exc:  # pragma: no cover
         print(f"[download] huggingface_hub missing: {exc}", file=sys.stderr)
         return 2
     _enable_hf_transfer()
-    for name, repo in MODELS[key].items():
+    for name, repo in table.items():
         if not repo:
+            continue
+        if requested is not None and name not in requested:
             continue
         target = model_dir(repo)
         if target.exists() and any(target.iterdir()):
@@ -2577,10 +2611,17 @@ def cmd_prod_install(node_agent: bool = False, node_args: list[str] | None = Non
                       "[--license-key KEY] [--ui-dir DIR] ...",
                       file=sys.stderr)
                 return 2
+            # 拓扑 env 透传（内网 bind / 云 CP webhook / LLM 档位）——装机脚本导出
+            # 后经此进单元文件；凭据类（BOK_CP_TOKEN 等）不在此列（落盘明文面，
+            # 归凭据治理议题，勿顺手加）。
+            passthrough = {
+                k: v for k in ("BOK_LIVEKIT_BIND", "BOK_LIVEKIT_WEBHOOK_URL", "BOK_LLM_TIER")
+                if (v := os.environ.get(k))
+            }
             units = [(
                 "node-agent",
                 [str(repo_python()), str(ROOT / "tools" / "node_agent.py"), *node_args],
-                {"PYTHONUNBUFFERED": "1"},
+                {"PYTHONUNBUFFERED": "1", **passthrough},
                 "薄节点守护（全栈拉起 + 心跳；参数原样透传）",
             )]
         else:
@@ -2787,8 +2828,11 @@ def cmd_prod(cmd: str, node_agent: bool = False,
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="bok", description="Bok voice stack launcher (no Docker)")
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("catalog", "manifest", "download", "status", "up", "serve", "down", "doctor", "tts-mine", "clean-testdata", "monitor"):
+    for name in ("catalog", "manifest", "status", "up", "serve", "down", "doctor", "tts-mine", "clean-testdata", "monitor"):
         sub.add_parser(name)
+    p_dl = sub.add_parser("download", help="下载平台模型表（--only 子集=装机选型）")
+    p_dl.add_argument("--only", nargs="*", default=None,
+                      help="只下载指定模型键（asr tts_preset tts_clone llm llm_4b mt settle）")
     sub.add_parser("tts-pregen", help="离线预合成 TTS 本地缓存(参数透传:--greetings/--objects/--fillers/--cp/--model)")
     p_prod = sub.add_parser("prod", help="生产常驻单元与健康面")
     p_prod.add_argument("action", nargs="?", default="status",
@@ -2905,7 +2949,10 @@ def main(argv=None) -> int:
         return cmd_tts_mine(getattr(args, "extra", None))
     if args.cmd == "monitor":
         return cmd_monitor()
-    return {"catalog": cmd_catalog, "manifest": cmd_manifest, "download": cmd_download, "status": cmd_status,
+    if args.cmd == "download":
+        only = set(getattr(args, "only", None) or []) or None
+        return cmd_download(only=only)
+    return {"catalog": cmd_catalog, "manifest": cmd_manifest, "status": cmd_status,
             "up": cmd_up, "serve": cmd_serve, "down": cmd_down, "doctor": cmd_doctor}[args.cmd]()
 
 
