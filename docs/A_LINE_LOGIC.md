@@ -120,7 +120,35 @@ REFUSE `_REFUSE_RE`+`_HANGUP_RE`（软守卫「唔使担心」否决 366-369）�
 
 现状：真实 turns → `mine_qa_pairs` → `POST /api/qa/cluster` dry（LLM 三列：变体/新/垃圾；缓存键 (account,min_calls,limit) TTL 600s；单飞 409）→ 人工勾选 apply（owner 盖章+逐行审计；created>0 清全账号缓存）→ `tts-pregen --qa` 物化（pin=True 永不逐出 TC:173-237）→ 下通电话快路生效。
 
-**L-① 已落地（2026-09-20）：漏网轮挖掘 + 快路覆盖率驾驶舱**。`GET /api/stats/llm-gaps`（`_gate_page("reports")`+`scoped_account`；CP 新模块 `gap_mining.py`，零 SQL 全走仓储公开方法）返回 `{coverage, gaps}`：coverage 只数 A 线**回复轮**（gen∈{filler,interrupted} 剔除，`gen∈{script,qa_fastpath}` 判快路，provider 只进 `by_provider` 细分——**注意 provider=graph-jump/branch-jump/branch-notify/stall-N 的轮回复仍由 LLM 产出，不能按 provider 判快路**）；gaps = 「AI 轮走了 LLM」的前一条客户轮文本，归一化聚合（复用 `qa_text.normalize_question`；排除 <3 字/应承语族/数字主导/测试对象）后按 count 降序 + `min_calls` 门槛，带 `sample_answer`（当时 LLM 实际说的）+ `lang`。`POST /api/stats/llm-gaps/adopt` 复用 `POST /api/qa-entries` 同一条仓储/盖章/审计路径（审计 `qa_entry.create` detail.source=gap-adopt，同 question+lang 幂等）——**人工确认（answer 可编辑）后才入库**。web 在 studio「场景学习」tab 的 `components/gap-mining.tsx`（覆盖率大数 + 漏网轮候选表 + 采集）。已知口径：adopt 恒落 `scope=global/step_index=-1`，因为 `qa_gate` 里 `int(step_index or -1)` 的 falsy 奇点会让 `step_index=0` 永不命中（见 D14）。
+**L-① 已落地（2026-09-20）：漏网轮挖掘 + 快路覆盖率驾驶舱**。`GET /api/stats/llm-gaps`（`_gate_page("reports")`+`scoped_account`；CP 新模块 `gap_mining.py`，零 SQL 全走仓储公开方法）返回 `{coverage, gaps}`：coverage 只数 A 线**回复轮**（gen∈{filler,interrupted} 剔除，`gen∈{script,qa_fastpath}` 判快路，provider 只进 `by_provider` 细分——**注意 provider=graph-jump/branch-jump/branch-notify/stall-N 的轮回复仍由 LLM 产出，不能按 provider 判快路**）；gaps = 「AI 轮走了 LLM」的前一条客户轮文本，归一化聚合（复用 `qa_text.normalize_question`；排除 <3 字/应承语族/数字主导/测试对象）后按 count 降序 + `min_calls` 门槛，带 `sample_answer`（当时 LLM 实际说的）+ `lang`。`POST /api/stats/llm-gaps/adopt` 复用 `POST /api/qa-entries` 同一条仓储/盖章/审计路径（审计 `qa_entry.create` detail.source=gap-adopt，同 question+lang 幂等）——**人工确认（answer 可编辑）后才入库**。web 在 studio「场景学习」tab 的 `components/gap-mining.tsx`（覆盖率大数 + 漏网轮候选表 + 采集）。已知口径：adopt 恒落 `scope=global/step_index=-1`，因为 `qa_gate` 里 `int(step_index or -1)` 的 falsy 奇点会让 `step_index=0` 永不命中（见 D14）。**客户端读取口已并入 L-② 的 `templateProposals`（超集），`api.llmGaps` 按孤儿 API 处置删除；CP 端点保留**。
+
+**L-② 已落地（2026-09-20）：图词/分支提案**。同一批漏网轮再对**目标模板的 steps_json / graph_json** 提另外两条数据面杠杆，纯函数模块 `control_plane/gap_proposals.py`（查询面复用 `gap_mining.build_llm_gap_report`，不重走 turns）：
+- **branch（分支提案）**：漏网轮发生在某套模板的已知步 → 提议在该步 ref 追加一条 `如果客户{cond}→{resp}` 行。运行时 `FlowController.parse_step_ref` 本来就从 ref 解析这种行，故 **CP 只生成该语法的规范锚形、不发明语法**（`_BRANCH_COND_RE` 与 `flow.py:102` `_BRANCH_LINE_RE` **逐字节同款镜像**，报告实测 `pattern == original` 为 True；CP 不 import agent_runtime——云端镜像不含 apps/agent）。resp 默认值=当时 LLM 实际答的那句，**运营可先改再存**（人工确认是这一步的全部意义）。
+- **intent_keyword（意图词提案）**：漏网提法不在任何意图关键词覆盖内 → 提议给「词面最相关」的意图（enabled + 有 enabled 绑定边 + 步 scope 含漏网步优先；亲和=整词包含 + 2-gram 重叠，并列取 id 字典序）追加一个关键词。
+- **条件卫生**：漏网原话是转写原文，直接拼会得到「如果客户拼多多。→…」——`sanitize_branch_cond` 在 `sanitize_branch_text` 之上再**剥首尾句末标点、保留内部逗号**（内部停顿词对运行时 bigram 条件匹配是信号）；纯标点条件退 `empty_text` 不可采纳。
+- **去重即「不可采纳」而非从列表消失**：等价分支已存在 / 关键词已被覆盖 → 照常出提案但 `available=false` + 人话 `blocked_label`（驾驶舱要「看得见为什么不行」），adopt 对这些键走幂等 `created=false`。
+- `GET /api/stats/template-proposals`（`_gate_page("reports")`；coverage/gaps 与 L-① 逐字节同源同形，驾驶舱一张画面）→ `POST /api/stats/template-proposals/adopt`（**闸链与 `PUT /api/templates/{id}` 逐字对齐**：`_gate_page("templates")` + `deny_cross_account` + `deny_foreign_owner(edit=True)`；落库前 `append_template_revision` 版本快照，校验/键检查全部先于快照=「拒绝对数据无副作用」；审计 `template.branch_adopt`/`template.intent_keyword_adopt` 仅记真实写入项）。
+- **`published_json` 永不被触碰**（发布两态 W2：publish 端点是它唯一写入口）——adopt 只改 live 草稿，生效仍需运营去话术页发布；驾驶舱成功提示明说这一点，模板列表随即显示「有未发布改动」（真栈实证）。
+- **键校验**：key=`branch|{tid}|{step}|{sha1(norm)[:10]}` / `intent|{tid}|{iid}|{sha1(norm)[:10]}`，服务端按 item 自带字段重算比对，不一致 400「提案内容与键不一致」（改了内容还拿旧键提交/伪造键都被拒）；模板/步号/意图失配 404/400 + 人话 detail，绝不静默 no-op。
+- 画布即分支唯一编辑口的既有定位不变：**画布答法抽屉仍可手写分支**，本提案把「客户真这么说」的那批自动喂到运营面前。
+
+**L-③ 已落地（2026-09-20）：在库词条体检（改答案/删词条走通知）**。反过来体检**已经在库的快答词条**，纯函数模块 `control_plane/qa_drift.py`（零 SQL，只走仓储公开方法；不新增表/列/迁移）。判据全来自 turns 分析账本，**零 LLM 零猜测**——同通内逐轮配对「客户问 → AI 答」：
+
+| kind | reason | 触发 | 结论 |
+|---|---|---|---|
+| retire | `never_asked` | occurrences==0 | 最近 N 通没人这么问过 |
+| retire | `digits_bypass` | 问法含 ≥4 位数字 run | 带数字的轮运行时被四道闸旁路，词条永远命中不了 |
+| reanswer | `repeat_after_play` | repeats>0 | 播了快答客户又问一遍 |
+| reanswer | `never_fired` | occurrences≥3 且 fired==0 | 反复出现但快答一次没用上（多半没录音） |
+
+`occurrences>0 且 fired==occurrences` → 健康词条不出提案（不打扰）。关键计量：`fired` 只在紧接其后的 AI 轮 `gen=="qa_fastpath"`（罐头出口）时记——**垫话/打断账本行不是「对这条的回复」，既不记 fired 也不消费待配对客户轮**（垫话恰好落在问句与真快答之间，吃掉配对会把真快答误记成 miss）。
+
+- **两条保守闸（真栈 150 通实弹后补）**：①**建议答案必须与词条同语言**——`llm_answer` 记的是「当时 AI 自己答的那句」，可能来自别的语言通话（实弹：中文词条被建议成粤语答案，罐头化后会播出错语言的录音）→ 跨语言一律不采用（留空交运营自己写，提示语相应变成「请自己写一句更贴题的」）；②**`never_fired` 要求 occurrences≥`NEVER_FIRED_MIN_OCCURRENCES`(3)**（实弹里 occ=1 的两条正是噪声）。建议不可用时 `repeat_after_play` 照常出提案（客户复问本身就是铁证）、`never_fired` 退化为「先补录音」提示——两者都不因缺建议而静默。
+- **窗口=最近 `max_calls`(默认 200) 通非测试对象通话**，报告出 `window_calls` 让结论口径透明（「没人问过」是这个口径下的结论）；排序键**必须带 id 兜底**——`created_at` 缺失/并列时（内存仓恒 None、SQL 同刻并列）只按 `created_at` 的稳定排序会按 list_calls 原序截断=把**最旧**的 N 通当「最近 N 通」（方向反了且不可复现；本会话实测踩到）。测试对象过滤与 `gap_mining` 同口径（两张报表的分析面必须一致）。
+- **通知形状**：每条提案自带 `headline`（发现了什么）+ `detail`（建议做什么）的人话字段，运营看得懂再决定；`counts` 给驾驶舱铃铛/徽标数字。
+- `GET /api/stats/qa-drift`（`_gate_page("reports")`；与 L-① 同 tab）→ `POST /api/stats/qa-drift/adopt`（**闸链与 `PATCH`/`DELETE /api/qa-entries/{id}` 逐字对齐**：`_gate_page("qa")` + `deny_cross_account` + `deny_foreign_owner(edit=True)`；审计沿用 `qa_entry.update`/`qa_entry.delete` 带 `detail.source=qa-drift`，与 L-① 的 `qa_entry.create`+`source=gap-adopt` 同族；幂等 no-op 不审计）。整批 Pass1 全校验后才 Pass2 落库，**绝不出半批写入**。
+- **改答案顺带补录音**：罐头音频键=文本，改了答案旧音频立即失效——调用方是 admin/root（本可直调 `POST /api/qa/pregen`，烧云配额的闸就在那里）时按批一次触发物化，让改动真的生效；**非 admin 返回 `needs_pregen=true` 且不触发**（不因一次改答案绕过既有配额闸），前端提示找管理员补录。
+- 只体检 `enabled=True` 的词条（停用是运营的明确意图，不去打扰）；已知残余：`never_fired` 的**两个成因判据分不清**（罐头缺料 vs 被更高优先级词条/同义簇代表抢了出场，Phase 3.1/3.2 语义）——报告不猜，两个可能都写进 `detail`，`hits` 列只作旁证。
 
 
 ## 7. 问题清单（代码追踪产出，分三级）
@@ -138,7 +166,7 @@ REFUSE `_REFUSE_RE`+`_HANGUP_RE`（软守卫「唔使担心」否决 366-369）�
 | D5 ✅已修 | **judge conf 缺失按 0.7 放行=自动够建单线**：`parse_judge_route` 对 route 有值但 conf 缺失默认 0.7，`FOLLOWUP_CONF_MIN=0.7` 且比较用 ≥ | FL:1451-1452、1458 | 9B 偶发省略 conf 即自动开跟进单，打扰人工 |
 | D6 | **WA 步误捕获面宽**：裸词「号码」即 WA 语境+任意 4-13 位 run 即 captured，已知号过滤只兜整串/≥8位尾 | FL:710-717、660-671 | 客户报 4 位碎片（验证码式）被当 WhatsApp 号上报 |
 | D7 ✅已修 | **结算窗掐死慢 judge**：`_close` gather 上报任务 10s，意图 judge timeout 20s 且同池——慢判定轮静默丢失 | AG:3326-3344 vs `_background_intent_judge` | 窗口自适应：无慢任务仍 10s（收线不被拖慢）；有在途 judge（`_spawn_report(..., slow_s=20.0)`）抬到 `max(10, 20+5)`；超时打 `SETTLE_WAIT_TIMEOUT`（任务名+等待）；`BOK_SETTLE_WAIT_S` 覆盖 |
-| D14（新） | **env 白名单扫描面非递归**：`tests/test_forward_env.py` 用 `_AGENT_DIR.glob("*.py")`，`agent_runtime/providers/**` 的读取面从未被扫——实测 `providers/livekit_plugins.py` 有 **61 个键**（`MINIMAX_*`/`QWEN3_ASR_*`/`LLM_*`/`VOLC_*`/`BOK_REPEAT_GUARD` 等）不在 `_FORWARD_ENV`/bok 注入面/豁免清单；这些「运营逃生门」在 dev 靠 `os.environ` merge 活着、prod 封闭 env 下**结构性不可设**（同 2026-09-19 `BOK_FLOW_GRAPH` 实弹教训） | tests/test_forward_env.py:41；`providers/livekit_plugins.py` | 把扫描改 `rglob` 后需一次性审计 61 键：真运营开关进 `_FORWARD_ENV`、纯内部回退（`FAKE_STT_TEXT`/`MINIMAX_API_KEY` 等）带理由进豁免；**未做**（避免顺手扩大面），待排期 |
+| D14 ✅已修 | **env 白名单扫描面非递归**：`tests/test_forward_env.py` 用 `_AGENT_DIR.glob("*.py")`，`agent_runtime/providers/**` 的读取面从未被扫——实测 `providers/livekit_plugins.py` 有 **61 个键** 不在 `_FORWARD_ENV`/bok 注入面/豁免清单 | tests/test_forward_env.py:41；`providers/livekit_plugins.py` | ✅已修（2026-09-20）：扫描改 `rglob`（+ 显式跳过 `__pycache__`），实测读取面 16→26 文件、97→166 键、未登记 61→0。**逐键读读点分类**：60 个运营键进 `_FORWARD_ENV`（LLM 生成链 `LLM_*`/`BOK_LLM_*`/`BOK_REPEAT_GUARD`/`BOK_TAIL_SLIM`；MiniMax 凭据端点+自愈+语速/音量 `MINIMAX_*` 全集；Volcano `VOLC_*`；Qwen3 插件侧 `QWEN3_ASR_*`/`QWEN3_TTS_*`），`FAKE_STT_TEXT` 进豁免（`FakeLiveKitSTT` 仅 CP 设置 `asr.provider=fake` 时构造，生产永不用假 ASR，与 `USE_FAKE_MEDIA` 同族）。prod 可达性由 `test_forward_env_keys_all_flow_to_dev_and_prod` 全表兜底 + 手工双表抽查 |
 | D8 | **CP 抖动→跨账号污染**：上下文解析异常吞成 call=None 照跑，账号兜底 acc-001——垫话/QA 罐头从错误账号拉 | AG:1793-1794、2762-2763 | 多账号下串资产+幽灵 job 拒接被旁路 |
 | D9 | ** turns 双记**：WA/单号碎片 stash 轮 + flush 合并轮各落一行 | AG:3755/3802 vs 2050/2112 | 分析侧不去重则轮次虚高（快路覆盖率被稀释） |
 | D10 | **意向 duration_s 含拨号等待**：t_start_wall 在装配打点，非接通时刻 | AG:2000、3199 | 「通话时长≤10s」类意向规则系统性偏大 |
@@ -153,7 +181,7 @@ REFUSE `_REFUSE_RE`+`_HANGUP_RE`（软守卫「唔使担心」否决 366-369）�
 | A1 ✅已落地 | 步骤分支命中只改提示词、永远走 LLM（§2 例子表实证）→ **分支罐头快路已实现**（2026-09-20 波2）：say 直念门之后、graph 块之前插入——分支匹配+应答已物化（tts 缓存键与 _say_script 同源）→ 播录音不过 LLM（gen=script/provider=branch-canned，不推进流程）；未物化落穿照旧。开关 BOK_BRANCH_CANNED（默认 1，入 _FORWARD_ENV）；物化走 pregen_tts --branches（人设保存自动物化已带上）；11 用例钉住。**波4 起位置随 A-② 前移**（见 A2），`BOK_BRANCH_ACTION=0` 时回原姿势 | — |
 | A2 ✅已落地 | REFUSE/FAREWELL 语义内置、界面无配置口 → **分支动作集已落地**（2026-09-20 波4）：`【收线】/【转人工】/【跳第N步】/【留本步】` 应答前缀，`branch_hit_plan` 早段求值（先于 verdict 车道）+`_branch_hold` 抑制本轮规则推进；画布答法抽屉下拉+步号输入+分支 chip 徽标；`BOK_BRANCH_ACTION` 总闸；「打错电话→做客服道歉收线」现在可配（模板写「如果客户打错电话→【收线】…」） | 遗留：动作分支的多语言/多模板批量配置靠运营逐条写 |
 | A3 部分落地 | 一个心智模型（这步客户这样说怎么办）碎在三个配置面（分支/问答/意图）→ **画布已成为分支的唯一编辑口**（动作+台词+录音状态+补录都在答法抽屉），QA/意图仍是独立 tab 但画布步节点有 jump 入边/徽标 overlay + 深链；口径=分支=步内应对，QA=跨步通用，意图=复杂路由 | 遗留：意图只在画布只读（编辑仍在 /studio 意图管理 tab） |
-| A4 部分落地 | 学习回路只产词条；图词/分支/改答案无产出 → **L-① 漏网轮挖掘 + 快路覆盖率已落地**（§6）；图词/分支提案（L-②）与「改答案/删词条走通知、人工确认后自动填入」（L-③）待做 | 遗留 L-②③ |
+| A4 ✅已落地 | 学习回路只产词条；图词/分支/改答案无产出 → **L-① 漏网轮挖掘 + 快路覆盖率**（§6）+ **L-② 图词/分支提案**（§6，含 `available=false` 的人话拦截原因）+ **L-③ 在库词条体检（改答案/删词条走通知）**（§6，含同语言/最少次数两条保守闸）三块**全部落地**；三条路都走「人工确认后才写库」 | — |
 | A5 | 总览把每步 ref 首行常驻静态前缀 vs 渐进披露对抗逐字引力——叠提示词补丁而非数据面解法（模板越长越脆） | 待议：总览只给目标不给事实行 |
 | A6 ✅已落地 | 快路覆盖率无指标（gen 数据全在、无人消费）→ `GET /api/stats/llm-gaps` + studio「场景学习」tab 驾驶舱（L-①，§6） | — |
 
@@ -220,5 +248,49 @@ REFUSE `_REFUSE_RE`+`_HANGUP_RE`（软守卫「唔使担心」否决 366-369）�
 | F7 真验（浏览器） | 抽屉里改一条分支 → 点「应用」→ `已保存 ✓` 且**抽屉仍开着**（3 条分支的下拉都在、改动值保留） |
 | F8 真验（真库） | 改 step3 一条分支加 `【收线】` 后：全模板仍 `「 → 」26 / 无空格 0`（未编辑行逐字节未动） |
 | 全量回归 | `pytest -q` **1924 passed**；web `tsc` 0 错 + `node --test` 95/95 + 静态导出通过 |
+
+## 9. 真栈实弹验收（2026-09-20 第二轮，L-②/L-③ + D14）
+
+**隔离姿势（多会话纪律）**：不碰对等会话的栈（8000/3000/8787/8788/1235/1236/1237/7880/8081/8082/8083 全程未动，pids 与会话开始时逐一相同），自起 **CP :8010 + 静态站 :3010**，`DATABASE_URL` 指向**真实库的副本**（`cp` 到 /tmp，真库只读；验收前后真库 mtime 未变）。浏览器经 `runtime-config.js` 注入 `cpUrl` 指到 :8010。
+
+### 9.1 真实数据面（1503 通 / 9372 轮 / 12 模板 / 103 词条）
+
+| 项 | 证据 |
+|---|---|
+| `GET /api/stats/template-proposals` | `coverage.turns=210 fastpath_ratio=0.5`；gaps 2 条 → proposals 4 条（每 gap 各一条 branch + 一条 intent_keyword）；branch `available=true` 且 `branch_line` 可直接被运行时解析 |
+| `GET /api/stats/qa-drift` | `window_calls=150 entries_scanned=103`；收紧前 `{reanswer:2, retire:8}` → **收紧后 `{reanswer:0, retire:12}`**（两条 reanswer 被两条保守闸正确拦掉，见 9.3） |
+| 键校验（真 HTTP） | 伪造/过期键 → **400**「提案内容与键不一致」；未知 qa_id → **404** |
+| 权限分面（真 JWT） | `user` 身份 GET qa-drift → **403**（reports 默认关）；同一身份 POST adopt → **201**（qa 在默认集） |
+
+### 9.2 真实写入链（真 HTTP + 真库副本 + 真浏览器点击）
+
+| 链 | 证据 |
+|---|---|
+| **L-② 分支写入（CLI）** | `POST template-proposals/adopt` **201 created=true**；step3 ref 真追加 `如果客户拼多多→…`（含运营改后的文本）；`published_json` sha256 **前后一致**（431f840e…）；revision 8→9；审计 `template.branch_adopt`（detail 带 step/cond/resp/revision/source=gap-proposal）；**真 agent 解析器 `parse_step_ref` 读到该分支** |
+| **L-② 幂等** | 同键二投 → **200 created=false**「提案内容已存在（幂等，不重复写入）」；revision 仍 9 |
+| **L-③ retire（CLI）** | 201 created=true；词条真删（103→102）；审计 `qa_entry.delete` detail.source=qa-drift |
+| **L-③ reanswer（非 admin，真 JWT）** | 201 created=true、**`needs_pregen=true` 且 `pregen=null`**（零云调用，配额闸未被绕过）；answer_text 真改；审计 `qa_entry.update`（old_chars 49→new_chars 23） |
+| **浏览器点击（L-③ 删词条）** | 点「删掉这条」→ 展开确认面板 → 点「确认删掉」→ 成功提示「已删掉这条快速回答，以后不会再播了。」；**真库 102→101**、「是什么标准」真消失、审计落 `source=qa-drift` |
+| **浏览器点击（L-② 分支）** | 点「做成话术分支（第 3 步）」→ 面板显示条件「拼多多」（**无尾句号**）+ 默认答案=当时 LLM 那句 + 实时预览「将写入：…」→ 运营改写成自己的措辞 → 点「确认写入话术」→ 成功提示「已写进话术第 3 步的分支。改动存的是草稿，记得去话术页发布才会生效。」；真库 step3 写入**改写后**文本、`published_json` sha256 仍 431f840e…、revision 9→10、审计 + 运行时解析器皆通过 |
+
+### 9.3 真栈暴露并已修的产品缺陷（**离线单测测不出**）
+
+| # | 缺陷（首次在真数据/真界面暴露） | 修法 |
+|---|---|---|
+| G1 | **分支条件带转写原文标点**：真库漏网原话是「拼多多。」→ 生成「如果客户拼多多。→…」，运营看着别扭且给运行时 bigram 条件匹配添噪声 | 新增 `sanitize_branch_cond`（在 `sanitize_branch_text` 之上剥首尾句末标点、**保留内部逗号**）；纯标点条件退 `empty_text`；GET/写助手/Pass1 校验/审计四处同源；单测对真 `parse_step_ref` 钉住 |
+| G2 | **建议答案是错语言**：两条中文词条被建议粤语答案（llm_answer 来自粤语通话）→ 罐头化会让词条播出错语言的录音 | 记录 `llm_answer_lang`，跨语言一律不采用（留空 + 提示「请自己写一句更贴题的」）；`repeat_after_play` 照常出提案（复问是铁证），`never_fired` 退化为补录音提示 |
+| G3 | **`never_fired` 在 occ=1 上误报**：只出现一次就断言「快答没用上」= 噪声（实弹 12 条 retire 里混着两条） | `NEVER_FIRED_MIN_OCCURRENCES=3` 门槛 |
+| G4 | **窗口排序在 created_at 并列时方向反了**：内存仓 `created_at` 恒 None、SQL 同刻并列，只按 `created_at` 的稳定排序按原序截断=把**最旧** N 通当「最近 N 通」（不可复现） | 排序键改 `(created_at, id)` 双键降序；测试用显式时间戳 + 并列两档钉住 |
+| G5 | **触发按钮与确认按钮同名**：两处都写「确认删掉」——运营看不出有没有点到（自动化也分不清），是本次真点击时先撞上的 | 触发改「删掉这条」/「改这条答案」，确认按钮保留「确认删掉」/「确认改答案」 |
+| G6 | **扫到的垫话行吃掉待配对客户轮**：`_walk_turns` 初版遇 `gen=filler` 就清 `prev` → 垫话恰好落在客户问句与真快答之间时，真快答被误记为 **miss**（fired=0） | 非回复账本行（filler/interrupted）改为 `continue`：不记 fired、**也不消费待配对客户轮**；单测钉住 |
+
+### 9.4 离线面
+
+| 项 | 证据 |
+|---|---|
+| 新增测试 | `tests/test_template_proposals.py`（28）+ `tests/test_qa_drift.py`（35，含 G2/G3/G4/G6 的判据与互斥）+ `test_forward_env.py` 追加 D14 覆盖；web `test/gap-proposals.test.mjs` + `test/qa-drift.test.mjs`（真 `tsc` 转译直载） |
+| 全量回归 | `pytest -q` **1987 passed**；web `npm test` **112/112** + `tsc --noEmit` 0 错 + 静态导出通过 |
+| 逐键审计 | D14：61 键分类见 §7 D14 行（60 进 `_FORWARD_ENV`、1 进 `_EXEMPT`），`test_forward_env.py` 5/5 |
+
 
 
