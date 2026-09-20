@@ -54,6 +54,8 @@ from .pregen import persona_pregen_status
 from . import pregen as pregen_mod
 from . import qa_cluster as qa_cluster_mod
 from . import gap_mining
+from . import gap_proposals
+from . import qa_drift
 from .auth import (
     Identity,
     JWT_TTL_S,
@@ -4578,6 +4580,406 @@ def adopt_llm_gap(req: GapAdoptRequest, request: Request) -> JSONResponse:
     return JSONResponse(
         status_code=201,
         content={"id": str(row.get("id") or ""), "created": True},
+    )
+
+
+# ---- 话术分支/意图词提案(L-②,2026-09-20):L-① 驾驶舱的另外两条数据面杠杆 ----
+# 逻辑全在 gap_proposals runner(端点瘦,同 gap_mining 分工);分支行语法镜像
+# flow.py _BRANCH_LINE_RE、意图词命中语义镜像 flow_graph.normalize_graph_text,
+# 证据行号见该模块 docstring。两条都是提案:写入必须人工确认,落库走既有模板
+# 写链(PUT 同闸链+版本快照),published_json 永不触碰。
+
+
+class TemplateProposalAdoptItem(BaseModel):
+    """提案采纳项:web 把 GET 的 proposal 字段原样回传,text 是人工改后的内容。"""
+
+    key: str
+    kind: str = "branch"  # branch | intent_keyword
+    template_id: str = ""
+    norm: str = ""  # 归一客户话(键材料,GET 原样回传)
+    step: int = 0  # branch: 1-based 目标步
+    cond: str = ""  # branch: 分支条件(GET 的 branch_cond)
+    text: str = ""  # branch: 应答文本(可改) / intent_keyword: 关键词(可改)
+    intent_id: str = ""  # intent_keyword: 目标意图
+
+
+class TemplateProposalAdoptRequest(BaseModel):
+    items: list[TemplateProposalAdoptItem] = []
+
+
+@app.get("/api/stats/template-proposals")
+def stats_template_proposals(
+    request: Request,
+    account_id: str = "acc-001",
+    template_id: str = "",
+    min_calls: int = 3,
+    limit: int = 30,
+) -> dict:
+    """漏网轮 → 话术分支/意图词提案(只读,零 LLM 零写入)。
+
+    闸链与 GET /api/stats/llm-gaps 逐字对齐:同服务 studio「场景学习」tab
+    (reports 键门控)+ scoped_account 收窄;coverage/gaps 与 L-① 同源同形,
+    proposals 每 gap 至多两条(branch + intent_keyword),available=false 的
+    提案带人话 blocked_label(去重即「不可采纳」,不从画面消失)。
+    """
+    _gate_page(request, "reports")
+    account_id = scoped_account(request, account_id)
+    return gap_proposals.build_template_proposal_report(
+        _repo(),
+        account_id=account_id,
+        template_id=template_id.strip(),
+        min_calls=max(1, int(min_calls)),
+        limit=max(1, min(int(limit), 200)),
+    )
+
+
+@app.post("/api/stats/template-proposals/adopt")
+def adopt_template_proposals(req: TemplateProposalAdoptRequest, request: Request) -> JSONResponse:
+    """人工确认后把提案写进模板草稿(201=至少一项写入,200=全部幂等/无写入)。
+
+    闸链与 PUT /api/templates/{id} 逐字对齐:_gate_page("templates")(写的是
+    模板,不是报表面)+ deny_cross_account + deny_foreign_owner(edit=True,
+    共享基线只归 admin/root);落库前 append_template_revision 版本快照与 PUT
+    同款(拒绝对数据无副作用:校验/键检查全部先于快照);审计
+    template.branch_adopt / template.intent_keyword_adopt(仅真实写入项,
+    幂等 no-op 不审计,与 L-① adopt 同纪律)。published_json 不在写键面,
+    永不触碰;graph_json 写入经 validate_flow_graph(校验错误原文 400 透出,
+    与 PUT invalid_graph_json 同形)。
+
+    键校验:服务端按 item 自带字段(template_id/step/intent_id/norm)重算 key,
+    不一致 400——内容与键对不上(改了内容还拿旧键提交/伪造键)直接拒;
+    模板 404 / 步号越界 400 / 意图失配 404 + 人话 detail,绝不静默 no-op。
+    """
+    _gate_page(request, "templates")
+    items = list(req.items or [])
+    if not items:
+        raise HTTPException(status_code=400, detail="没有选择任何提案")
+    if len(items) > gap_proposals.ADOPT_MAX_ITEMS:
+        raise HTTPException(status_code=400, detail=f"一次最多采纳 {gap_proposals.ADOPT_MAX_ITEMS} 条提案")
+
+    # Pass 1 逐项静态校验(键一致性/字段齐备/键不重复)——任何一项非法整批拒。
+    seen_keys: set[str] = set()
+    for item in items:
+        if item.kind not in gap_proposals.KINDS:
+            raise HTTPException(status_code=400, detail=f"未知提案类型：{item.kind}")
+        if not str(item.key or "").strip() or not str(item.template_id or "").strip():
+            raise HTTPException(status_code=400, detail="提案缺少 key 或 template_id")
+        if str(item.key) in seen_keys:
+            raise HTTPException(status_code=400, detail=f"同一提案在一次请求里重复：{item.key}")
+        seen_keys.add(str(item.key))
+        expected = (
+            gap_proposals.branch_proposal_key(item.template_id, int(item.step or 0), item.norm)
+            if item.kind == gap_proposals.KIND_BRANCH
+            else gap_proposals.intent_proposal_key(item.template_id, item.intent_id, item.norm)
+        )
+        if str(item.key).strip() != expected:
+            raise HTTPException(
+                status_code=400,
+                detail="提案内容与键不一致（可能已过期），请刷新学习页后重新采纳",
+            )
+        if item.kind == gap_proposals.KIND_BRANCH:
+            if int(item.step or 0) < 1:
+                raise HTTPException(status_code=400, detail="分支提案缺少目标步号")
+            if not gap_proposals.sanitize_branch_cond(item.cond):
+                raise HTTPException(status_code=400, detail="分支条件不能为空")
+            if not str(item.text or "").strip():
+                raise HTTPException(status_code=400, detail="回答内容不能为空")
+            # 条件必须与键材料同源(norm=GET 时 candidate_norm(原话);条件被截断到
+            # 120 字时归一是其前缀,同样放行)——改了条件拿旧键提交在此被拒。
+            cond_norm = gap_mining.candidate_norm(item.cond)
+            if not cond_norm or not str(item.norm or "").startswith(cond_norm):
+                raise HTTPException(
+                    status_code=400,
+                    detail="提案内容与键不一致（可能已过期），请刷新学习页后重新采纳",
+                )
+        else:
+            if not str(item.intent_id or "").strip():
+                raise HTTPException(status_code=400, detail="意图词提案缺少目标意图")
+            if not str(item.text or "").strip():
+                raise HTTPException(status_code=400, detail="关键词不能为空")
+
+    # 按模板分组(保序);先过全部闸链与写前计算(Pass 2),任何模板/任何提案
+    # 不过关就整批拒——绝不出「半批写入」。都过关才进 Pass 3 落库。
+    grouped: dict[str, list[TemplateProposalAdoptItem]] = {}
+    for item in items:
+        grouped.setdefault(item.template_id, []).append(item)
+
+    before_by_tpl: dict[str, dict] = {}
+    for template_id in grouped:
+        row = deny_foreign_owner(
+            request, deny_cross_account(request, _repo().get_template(template_id)), edit=True
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail=f"话术模板不存在：{template_id}")
+        before_by_tpl[template_id] = dict(row)
+
+    plan: dict[str, dict] = {}
+    for template_id, group in grouped.items():
+        before = before_by_tpl[template_id]
+        new_steps = str(before.get("steps_json") or "")
+        new_graph = str(before.get("graph_json") or "")
+        steps_changed = graph_changed = False
+        changed_by_key: dict[str, bool] = {}
+        for item in group:
+            try:
+                if item.kind == gap_proposals.KIND_BRANCH:
+                    new_steps, changed = gap_proposals.append_branch_to_steps(
+                        new_steps, int(item.step), item.cond, item.text
+                    )
+                    steps_changed = steps_changed or changed
+                else:
+                    new_graph, _kw, changed = gap_proposals.append_keyword_to_graph(
+                        new_graph, item.intent_id, item.text
+                    )
+                    graph_changed = graph_changed or changed
+            except gap_proposals.ProposalError as exc:
+                # 含 validate_flow_graph 校验器原文(PUT invalid_graph_json 同门):
+                # 会产出非法数据/图与提案失配 → 400,绝不写坏数据。
+                raise HTTPException(
+                    status_code=400, detail={"error": "proposal_conflict", "detail": str(exc)}
+                )
+            changed_by_key[item.key] = changed
+        plan[template_id] = {
+            "items": group,
+            "steps_json": new_steps if steps_changed else None,
+            "graph_json": new_graph if graph_changed else None,
+            "changed_by_key": changed_by_key,
+        }
+
+    # Pass 3 落库:每模板一次版本快照 + 一次 update;审计只记真实写入项
+    # (幂等 no-op 不审计,与 L-① adopt 同纪律)。
+    results: list[dict] = []
+    any_created = False
+    for template_id, entry in plan.items():
+        changed_by_key: dict[str, bool] = entry["changed_by_key"]
+        if not any(changed_by_key.values()):
+            results.extend(
+                {
+                    "key": item.key,
+                    "kind": item.kind,
+                    "template_id": template_id,
+                    "id": template_id,
+                    "created": False,
+                    "detail": "提案内容已存在（幂等，不重复写入）",
+                }
+                for item in entry["items"]
+            )
+            continue
+        revision = len(_repo().list_template_revisions(template_id)) + 1
+        _repo().append_template_revision(
+            template_id, revision, json.dumps(before_by_tpl[template_id], ensure_ascii=False, default=str)
+        )
+        payload: dict = {}
+        if entry["steps_json"] is not None:
+            payload["steps_json"] = entry["steps_json"]
+        if entry["graph_json"] is not None:
+            payload["graph_json"] = entry["graph_json"]
+        updated = _repo().update_template(template_id, payload)
+        for item in entry["items"]:
+            changed = changed_by_key[item.key]
+            any_created = any_created or changed
+            if changed and item.kind == gap_proposals.KIND_BRANCH:
+                _audit(
+                    "template.branch_adopt",
+                    subject_type="template",
+                    subject_id=template_id,
+                    account_id=str(updated.get("account_id") or ""),
+                    detail={
+                        "key": item.key,
+                        "step": int(item.step or 0),
+                        "cond": gap_proposals.sanitize_branch_cond(item.cond)[:60],
+                        "resp": str(item.text or "").strip()[:120],
+                        "revision": revision,
+                        "source": "gap-proposal",
+                    },
+                )
+            elif changed:
+                _audit(
+                    "template.intent_keyword_adopt",
+                    subject_type="template",
+                    subject_id=template_id,
+                    account_id=str(updated.get("account_id") or ""),
+                    detail={
+                        "key": item.key,
+                        "intent_id": item.intent_id,
+                        "keyword": str(item.text or "").strip()[:64],
+                        "revision": revision,
+                        "source": "gap-proposal",
+                    },
+                )
+            results.append(
+                {
+                    "key": item.key,
+                    "kind": item.kind,
+                    "template_id": template_id,
+                    "id": template_id,
+                    "created": bool(changed),
+                    "detail": "" if changed else "提案内容已存在（幂等，不重复写入）",
+                }
+            )
+    return JSONResponse(
+        status_code=201 if any_created else 200,
+        content={"results": results, "adopted": sum(1 for r in results if r["created"])},
+    )
+
+
+# ---- 问答词条漂移提案(L-③,2026-09-20):改答案/删词条以通知形式送达,人工确认后自动填入 ----
+# 逻辑全在 qa_drift runner(端点瘦,同 gap_mining/gap_proposals 分工);判据全部来自
+# turns 分析账本(qa_fastpath 真播出账 + 客户复问 + LLM 实际答的那句),零 LLM 零猜测。
+# 只读面挂 reports(与 L-① 驾驶舱同一个「场景学习」tab);写入面挂 qa(动的是问答
+# 词条,与 PATCH/DELETE /api/qa-entries 同闸链)。
+
+
+class QaDriftAdoptItem(BaseModel):
+    """体检提案采纳项:web 把 GET 的 proposal 字段回传,text 是人工改后的新答案。"""
+
+    key: str
+    kind: str = qa_drift.KIND_REANSWER
+    qa_id: str = ""
+    text: str = ""  # reanswer: 新答案文本(retire 不用)
+
+
+class QaDriftAdoptRequest(BaseModel):
+    items: list[QaDriftAdoptItem] = []
+
+
+@app.get("/api/stats/qa-drift")
+def stats_qa_drift(
+    request: Request,
+    account_id: str = "acc-001",
+    max_calls: int = qa_drift.DEFAULT_MAX_CALLS,
+    limit: int = 30,
+) -> dict:
+    """在库快答词条体检:哪条答了客户不认、哪条压根没人问(只读,零 LLM 零写入)。
+
+    闸链与 GET /api/stats/llm-gaps 对齐(_gate_page("reports") + scoped_account);
+    每条提案自带 headline(发现了什么)+ detail(建议做什么)的人话结论,运营看得懂
+    再决定。结论基于最近 max_calls 通非测试对象通话(报告出 window_calls)。
+    """
+    _gate_page(request, "reports")
+    account_id = scoped_account(request, account_id)
+    return qa_drift.build_qa_drift_report(
+        _repo(),
+        account_id=account_id,
+        max_calls=max(1, int(max_calls)),
+        limit=max(1, min(int(limit), 200)),
+    )
+
+
+@app.post("/api/stats/qa-drift/adopt")
+def adopt_qa_drift(req: QaDriftAdoptRequest, request: Request) -> JSONResponse:
+    """人工确认后改答案/删词条(201=至少一项真实动作,200=全部幂等)。
+
+    闸链与 PATCH/DELETE /api/qa-entries 逐字对齐:_gate_page("qa") +
+    deny_cross_account + deny_foreign_owner(edit=True;共享词条仍只归 admin/root)。
+    reanswer=写 answer_text,retire=删条目;审计沿用 qa_entry.update/qa_entry.delete
+    带 detail.source=qa-drift(与 L-① adopt 的 qa_entry.create+source=gap-adopt
+    同族);幂等 no-op 不审计(同 L-①②纪律)。
+
+    **改答案顺带补录音**:罐头音频键=文本,改了答案旧音频立即失效——调用方是
+    admin/root(本可直调 POST /api/qa/pregen,烧云配额的闸就在那里)时按批一次
+    触发物化,让改动真的生效;非 admin 返回 needs_pregen=true + 人话提示,交管理员
+    补录(不因为一次改答案绕过既有的配额闸)。
+
+    键校验:key 必须等于 runner 的提案键(动作直接作用于 qa_id,身份=行 id);
+    条目不存在/不属于本账号 404,绝不静默 no-op。
+    """
+    _gate_page(request, "qa")
+    items = list(req.items or [])
+    if not items:
+        raise HTTPException(status_code=400, detail="没有选择任何提案")
+    if len(items) > qa_drift.ADOPT_MAX_ITEMS:
+        raise HTTPException(
+            status_code=400, detail=f"一次最多采纳 {qa_drift.ADOPT_MAX_ITEMS} 条提案"
+        )
+    ident = current_identity(request)
+    # 无身份(auth-off 开发形态/机器通道)按可补录算——与 require_role 的直通语义同款。
+    may_pregen = ident is None or ident.role in ("admin", "root")
+
+    # Pass 1 逐项校验(类型/键一致/字段齐备/条目归属)——任何一项非法整批拒,
+    # 绝不出「半批写入」(同 L-② adopt 纪律)。
+    seen: set[str] = set()
+    rows: dict[str, dict] = {}
+    for item in items:
+        if item.kind not in qa_drift.KINDS:
+            raise HTTPException(status_code=400, detail=f"未知提案类型：{item.kind}")
+        qa_id = str(item.qa_id or "").strip()
+        if not qa_id or not str(item.key or "").strip():
+            raise HTTPException(status_code=400, detail="提案缺少 key 或 qa_id")
+        if str(item.key) != qa_drift.proposal_key(item.kind, qa_id):
+            raise HTTPException(
+                status_code=400, detail="提案内容与键不一致（可能已过期），请刷新学习页后重新采纳"
+            )
+        if str(item.key) in seen:
+            raise HTTPException(status_code=400, detail=f"同一提案在一次请求里重复：{item.key}")
+        seen.add(str(item.key))
+        if item.kind == qa_drift.KIND_REANSWER and not str(item.text or "").strip():
+            raise HTTPException(status_code=400, detail="新答案不能为空")
+        row = deny_foreign_owner(
+            request, deny_cross_account(request, _repo().get_qa_entry(qa_id)), edit=True
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail=f"问答词条不存在：{qa_id}")
+        rows[str(item.key)] = dict(row)
+
+    # Pass 2 落库:改答案写 answer_text、删词条删行;审计只记真实动作。
+    results: list[dict] = []
+    any_created = False
+    pregen_ids: list[str] = []
+    for item in items:
+        key = str(item.key)
+        qa_id = str(item.qa_id or "").strip()
+        before = rows[key]
+        account = str(before.get("account_id") or "")
+        if item.kind == qa_drift.KIND_REANSWER:
+            text = str(item.text or "").strip()
+            if str(before.get("answer_text") or "").strip() == text:
+                results.append({
+                    "key": key, "kind": item.kind, "qa_id": qa_id,
+                    "created": False, "needs_pregen": False, "pregen": None,
+                    "detail": "答案已经是这句了（幂等，不重复写）",
+                })
+                continue
+            _repo().update_qa_entry(qa_id, {"answer_text": text})
+            _audit(
+                "qa_entry.update", subject_type="qa_entry", subject_id=qa_id, account_id=account,
+                detail={"source": "qa-drift", "old_chars": len(str(before.get("answer_text") or "")),
+                        "new_chars": len(text)},
+            )
+            any_created = True
+            pregen_ids.append(qa_id)
+            results.append({
+                "key": key, "kind": item.kind, "qa_id": qa_id,
+                "created": True, "needs_pregen": not may_pregen, "pregen": None, "detail": "",
+            })
+        else:
+            ok = bool(_repo().delete_qa_entry(qa_id))
+            _audit(
+                "qa_entry.delete", subject_type="qa_entry", subject_id=qa_id, account_id=account,
+                outcome="ok" if ok else "not_found",
+                detail={"source": "qa-drift", "question": str(before.get("question_text") or "")[:80]},
+            )
+            any_created = any_created or ok
+            results.append({
+                "key": key, "kind": item.kind, "qa_id": qa_id,
+                "created": ok, "needs_pregen": False, "pregen": None, "detail": "",
+            })
+
+    # 改答案后新文本没有罐头音频:admin/root 批一次物化(烧云配额闸=本分支),
+    # 非 admin 留 needs_pregen 由前端提示找管理员补录。
+    if pregen_ids and may_pregen:
+        try:
+            out = pregen_mod.qa_pregen_spawn(str(request.base_url).rstrip("/"), pregen_ids)
+        except Exception as exc:  # noqa: BLE001 - 物化是这个 detached 子进程的事,
+            # 失败了也不该把已经改好的答案回滚(改答案本身已成功且已审计)。
+            out = {"status": "failed", "detail": str(exc)}
+        for r in results:
+            if r["created"] and r["qa_id"] in pregen_ids:
+                r["pregen"] = out
+                r["needs_pregen"] = False
+    return JSONResponse(
+        status_code=201 if any_created else 200,
+        content={"results": results, "adopted": sum(1 for r in results if r["created"])},
     )
 
 
