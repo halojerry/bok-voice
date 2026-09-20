@@ -11,6 +11,10 @@ kill-switch、BOK_CP_TOKEN auth-on worker 上报，两次实弹同病）。
      `_interp_env` B 线注入）——静态扫 bok.py 全部 env 写入点自动认；
   ③ 进本文件 `_EXEMPT` 且写明理由（测试腿专用/OS 变量带回退）。
 三处都不沾 → 本测试红——死门在 CI 层根治，唔靠人记。
+
+扫描面（2026-09-20 D14 修正）：`rglob` **递归覆盖子包**（plugins/、providers/ 等
+——旧 `glob("*.py")` 非递归，`providers/livekit_plugins.py` 的 61 键整包漏扫）；
+`__pycache__` 等非源码目录显式跳过。
 """
 from __future__ import annotations
 
@@ -32,13 +36,25 @@ _EXEMPT: dict[str, str] = {
     "SCRIPTED_LLM_OUTPUT": "同上（SCRIPTED_LLM 固定输出）",
     "USE_FAKE_MEDIA": "E2E 测试腿假媒体 shim，生产永设不了",
     "LOCALAPPDATA": "Windows OS 变量（tts_cache 数据目录，Path.home() 回退在手）",
+    "FAKE_STT_TEXT": (
+        "E2E 测试腿假 ASR 文案：providers/livekit_plugins.py FakeLiveKitSTT(:2077) 读，"
+        "该类仅 CP 设置 asr.provider=fake/fake_stt 时构造（agent.py :2493，use_fake 同源），"
+        "生产节点永不用假 ASR——与 USE_FAKE_MEDIA 同族测试 shim"
+    ),
 }
 
 
 def _agent_env_reads() -> set[str]:
-    """agent_runtime 全部 `os.environ.get("KEY"`/`os.getenv("KEY"` 读取面（静态扫）。"""
+    """agent_runtime 全部 `os.environ.get("KEY"`/`os.getenv("KEY"` 读取面（静态扫）。
+
+    递归扫全部子包（plugins/、providers/ 等，2026-09-20 D14 修正：旧
+    `glob("*.py")` 非递归，providers/ 整包 61 键漏扫）；`__pycache__` 显式跳过
+    （rglob 只匹配 `*.py`，常规不会命中，防有人把源码误拷进缓存目录时误扫）。
+    """
     reads: set[str] = set()
-    for path in sorted(_AGENT_DIR.glob("*.py")):
+    for path in sorted(_AGENT_DIR.rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
         src = path.read_text(encoding="utf-8")
         reads |= set(re.findall(r'os\.environ\.get\(\s*"([A-Z][A-Z0-9_]+)"', src))
         reads |= set(re.findall(r'os\.getenv\(\s*"([A-Z][A-Z0-9_]+)"', src))
