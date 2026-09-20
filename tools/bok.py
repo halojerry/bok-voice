@@ -45,11 +45,29 @@ def is_mac() -> bool:
     return _platform.system() == "Darwin"
 
 
+def is_linux() -> bool:
+    """Linux 档判定（Ubuntu 节点形态，2026-09-20）。按真实 OS 判定而非
+    `not is_mac() and os.name != "nt"`——Windows 单测以 is_mac=False+os.name
+    打桩模拟 Windows，过度宽松的判定会把桩吃掉（test_prod_windows 实证）。"""
+    return _platform.system() == "Linux"
+
+
 def app_data_dir() -> Path:
+    """app-data 根（…/BokVoice）：SQLite/vault/logs/units/models 全落这里。
+
+    平台分档（2026-09-20 Ubuntu 节点形态补齐）：nt=LOCALAPPDATA；Darwin=
+    ~/Library/Application Support；Linux=XDG_DATA_HOME 或 ~/.local/share——
+    旧版非 nt 恒落 mac 路径，Ubuntu 上会把数据写到不存在的 Library 目录树。
+    """
     if os.name == "nt":
         base = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
-    else:
+    elif is_mac():
         base = Path(os.environ.get("HOME", ".")) / "Library" / "Application Support"
+    else:
+        base = Path(
+            os.environ.get("XDG_DATA_HOME")
+            or str(Path(os.environ.get("HOME", ".")) / ".local" / "share")
+        )
     return base / "BokVoice"
 
 
@@ -117,7 +135,10 @@ OPTIONAL_MODELS = {"mt", "settle"}
 
 
 def platform_key() -> str:
-    return "windows" if os.name == "nt" else "mac"
+    """模型表键：Darwin=mac（mlx 栈）；其余（Windows/Linux）=windows（llama.cpp
+    GGUF + transformers ASR/TTS）。旧版非 nt 恒回 "mac"，Linux 会去下 mlx 模型
+    并在 :1235 起 mlx_lm——Ubuntu 节点形态修复（2026-09-20）。"""
+    return "mac" if is_mac() else "windows"
 
 
 def model_dir(repo_id: str) -> Path:
@@ -323,10 +344,21 @@ def node_env() -> dict[str, str]:
 
 
 def bundled_llama() -> Path | None:
-    """Windows llama-server binary (CUDA build + cudart DLLs beside it)."""
-    if os.name != "nt":
+    """打包内嵌 llama-server：Windows=llama-server.exe；Linux=llama-server
+    （2026-09-20 Ubuntu 节点：runtime/llama/ 或 runtime/llama/linux/ 放置；
+    找不到时 _start_llm 回退 PATH 的 llama-server）。"""
+    if os.name == "nt":
+        for c in (runtime_root() / "llama" / "llama-server.exe", runtime_root() / "llama-server.exe"):
+            if c.exists():
+                return c
         return None
-    for c in (runtime_root() / "llama" / "llama-server.exe", runtime_root() / "llama-server.exe"):
+    if is_mac():
+        return None
+    for c in (
+        runtime_root() / "llama" / "llama-server",
+        runtime_root() / "llama" / "linux" / "llama-server",
+        runtime_root() / "llama-server",
+    ):
         if c.exists():
             return c
     return None
@@ -344,6 +376,63 @@ def _embedded_livekit() -> Path | None:
         if c and c.exists():
             return c
     return None
+
+
+def _livekit_config_path() -> Path:
+    """LiveKit 生效配置路径（2026-09-20 Ubuntu 节点形态）：
+
+    无 env 覆盖 → 原样返回仓内 services/livekit-server/livekit.yaml（dev 形态
+    逐字节零变化）；有覆盖 → 生成补丁副本到 app-data/run/livekit.yaml：
+      - `BOK_LIVEKIT_BIND`：bind_addresses（逗号分隔多址）——内网多话务员形态
+        填本机内网 IP（默认 127.0.0.1 只有节点本机能连房）；
+      - `BOK_LIVEKIT_WEBHOOK_URL`：webhook urls[0]——节点形态指向**云 CP**
+        （仓内默认 http://127.0.0.1:8000/api/webhook/livekit 在节点上指向不存
+        在的本地 CP，崩溃补位重派会断）；
+      - `LIVEKIT_API_KEY/SECRET`：keys 段——生产键与 CP 签发 token 用的 env
+        同源（旧版 keys 恒为 devkey/devsecret 而 CP 读 env，分布式部署必错配）。
+    打补丁用行级替换（不引 yaml 依赖；仓内文件结构由本模块测试钉住）。
+    """
+    base = ROOT / "services" / "livekit-server" / "livekit.yaml"
+    bind = (os.environ.get("BOK_LIVEKIT_BIND") or "").strip()
+    webhook = (os.environ.get("BOK_LIVEKIT_WEBHOOK_URL") or "").strip()
+    key = (os.environ.get("LIVEKIT_API_KEY") or "").strip()
+    secret = (os.environ.get("LIVEKIT_API_SECRET") or "").strip()
+    if not bind and not webhook and not (key and secret):
+        return base
+    lines = base.read_text(encoding="utf-8").splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if stripped.startswith("bind_addresses:") and bind:
+            out.append("bind_addresses:")
+            for addr in [a.strip() for a in bind.split(",") if a.strip()]:
+                out.append(f"  - {addr}")
+            i += 1
+            while i < len(lines) and lines[i].startswith("  - "):
+                i += 1
+            continue
+        if stripped == "urls:" and webhook:
+            out.append(line)
+            out.append(f"    - {webhook}")
+            i += 1
+            while i < len(lines) and lines[i].startswith("    - "):
+                i += 1
+            continue
+        if stripped == "keys:" and key and secret:
+            out.append(line)
+            out.append(f"  {key}: {secret}")
+            i += 1
+            while i < len(lines) and lines[i].startswith("  ") and ":" in lines[i]:
+                i += 1
+            continue
+        out.append(line)
+        i += 1
+    target = app_data_dir() / "run" / "livekit.yaml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return target
 
 
 def healthy(port: int) -> bool:
@@ -933,10 +1022,12 @@ def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
             log_dir / "llm.log",
         )
         return
-    # Windows: llama.cpp CUDA (GPU 必选；无 GPU 由 doctor 门禁阻止).
+    # 非 mac（Windows/Linux）：llama.cpp 后端（GPU 必选；无 GPU 由 doctor 门禁阻止）。
+    # Linux 档（2026-09-20 Ubuntu 节点）：runtime/llama/llama-server 或 PATH 提供。
     llama_bin = bundled_llama() or shutil_which("llama-server")
     if not llama_bin:
-        print("[bok] llama-server 不可用（Windows 需 NVIDIA GPU 且打包内嵌 CUDA 版）", file=sys.stderr)
+        print("[bok] llama-server 不可用（需 GPU；Windows 打包内嵌 CUDA 版 / "
+              "Linux 需 runtime/llama/llama-server 或 PATH 安装 llama.cpp）", file=sys.stderr)
         return
     _start_proc(
         [str(llama_bin),
@@ -1005,7 +1096,69 @@ def _start_settle_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> 
     return True
 
 
+def _start_call_plane(py) -> bool:
+    """通话面拉起（LiveKit + 三个 agent worker + 常驻监控），serve/node 全栈共用。
+
+    2026-09-20 Ubuntu 节点补齐：本块原只活在 dev `serve` 内联——node_agent 经
+    cmd_up 拉全栈时 LiveKit/worker 缺位，节点装完打不了电话。提取为单点后
+    serve 与 cmd_up 同源（幂等：health 门保证重复调用不叠进程）。
+    返回 LiveKit 是否就绪；未就绪不拉 worker，由调用方就绪等待如实失败。
+    """
+    run_dir = app_data_dir() / "run"
+    log_dir = app_data_dir() / "logs"
+    livekit_cfg = _livekit_config_path()
+    livekit_bin = _embedded_livekit() or shutil_which("livekit-server") or (ROOT / "services" / "livekit-server" / "livekit-server")
+    if not healthy(7880) and livekit_bin and Path(livekit_bin).exists():
+        _start_proc(
+            [str(livekit_bin), "--config", str(livekit_cfg)],
+            run_dir / "livekit.pid",
+            log_dir / "livekit.log",
+        )
+    _lk_respawned = False
+    _lk_deadline = time.monotonic() + 30.0
+    while not healthy(7880):
+        if time.monotonic() >= _lk_deadline:
+            if livekit_bin and Path(livekit_bin).exists() and not _lk_respawned:
+                _start_proc(
+                    [str(livekit_bin), "--config", str(livekit_cfg)],
+                    run_dir / "livekit.pid",
+                    log_dir / "livekit.log",
+                )
+                _lk_respawned = True
+                _lk_deadline = time.monotonic() + 15.0
+                print("[bok] livekit went down during startup — respawned a fresh instance")
+                continue
+            print("[bok] livekit :7880 not ready — agent workers NOT started", file=sys.stderr)
+            return False
+        time.sleep(0.5)
+    for _spec in _worker_specs(py):
+        if not healthy(_spec["port"]):
+            _start_proc(_spec["argv"], _spec["pidfile"], _spec["logfile"], env=_spec["env"])
+        else:
+            print(f"[bok] {_spec['name']} worker already listening :{_spec['port']} (run bok.py down first to restart it)")
+    # 常驻监控环：LiveKit 重启后 worker 注册全丢（历史实证「no worker is available」
+    # 连 4 通 0 轮），serve 一次性起完没人补拉——monitor 做 down→up 全量 respawn。
+    _ensure_monitor(py)
+    return True
+
+
 def cmd_up() -> int:
+    """全栈拉起（node_agent 与 serve 共用）：服务面 + 通话面。
+
+    Ubuntu 节点形态修复（2026-09-20）：旧 cmd_up 只起服务面（sidecar/LLM/b-line），
+    LiveKit 与三个 agent worker 只在 dev `serve` 里起——节点装完打不了电话。
+    通话面现已提取为 _start_call_plane（与 serve 同源）。返回码沿用服务面语义：
+    通话面未齐只打 stderr 不篡改服务面结果（由调用方就绪等待如实失败，健康面
+    doctor 呈现 degrad）。
+    """
+    rc = _cmd_up_services()
+    if rc:
+        return rc
+    _start_call_plane(repo_python())
+    return 0
+
+
+def _cmd_up_services() -> int:
     run_dir = app_data_dir() / "run"
     log_dir = app_data_dir() / "logs"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1602,55 +1755,11 @@ def cmd_serve() -> int:
             cwd=str(ROOT / "apps" / "web"),
         )
 
-    # LiveKit should come up before the agent worker.
-    livekit_bin = _embedded_livekit() or shutil_which("livekit-server") or (ROOT / "services" / "livekit-server" / "livekit-server")
-    if not healthy(7880) and livekit_bin and Path(livekit_bin).exists():
-        _start_proc(
-            [str(livekit_bin), "--config", str(ROOT / "services" / "livekit-server" / "livekit.yaml")],
-            run_dir / "livekit.pid",
-            log_dir / "livekit.log",
-        )
-
+    # 通话面（LiveKit + agent worker + 常驻监控）由 cmd_up→_start_call_plane 单点
+    # 拉起（2026-09-20 提取，serve 与 node_agent 全栈同源）；本函数只做就绪等待。
     rc = cmd_up()
     if rc:
         return rc
-
-    # Agent worker registers to the embedded/local LiveKit server.
-    # livekit 就绪等待(2026-09-12):livekit 刚被上方 spawn 时 7880 尚未 bind,
-    # 旧版一次性 healthy(7880) 探测在 down→serve 快速循环时恒 False → 三个
-    # worker 静默跳过、还照打 desktop ready(当日两次实证:8081-8083 全空、
-    # 对话/同传全灭)。改轮询等待;等不到时若上方因「入口探测健康而跳过 spawn」
-    # (down 后优雅关停中的 livekit 仍监听、却被残留房间连接拖住几分钟才真退,
-    # 实证 20:11 才放端口)则补拉一次;再等不到就明确报错,由下方 targets 如实失败。
-    _lk_respawned = False
-    _lk_deadline = time.monotonic() + 30.0
-    while not healthy(7880):
-        if time.monotonic() >= _lk_deadline:
-            if livekit_bin and Path(livekit_bin).exists() and not _lk_respawned:
-                _start_proc(
-                    [str(livekit_bin), "--config", str(ROOT / "services" / "livekit-server" / "livekit.yaml")],
-                    run_dir / "livekit.pid",
-                    log_dir / "livekit.log",
-                )
-                _lk_respawned = True
-                _lk_deadline = time.monotonic() + 15.0
-                print("[bok] livekit went down during startup — respawned a fresh instance")
-                continue
-            print("[bok] livekit :7880 not ready — agent workers NOT started", file=sys.stderr)
-            break
-        time.sleep(0.5)
-    if healthy(7880):
-        # C6:三个 worker 统一走 _worker_specs(env 构造/spawn 单点,与 monitor 同源)。
-        for _spec in _worker_specs(py):
-            if not healthy(_spec["port"]):
-                _start_proc(_spec["argv"], _spec["pidfile"], _spec["logfile"], env=_spec["env"])
-            else:
-                print(f"[bok] {_spec['name']} worker already listening :{_spec['port']} (run bok.py down first to restart it)")
-        # C6-1 常驻监控环(2026-09-13):LiveKit 重启后 worker 注册全丢(9/12
-        # 11:52-12:05 「no worker is available」连 4 通 0 轮实证)——serve 是
-        # 一次性的,没人补拉。起 detached monitor:livekit down→up 转换即全量
-        # respawn(重注册),单 worker 掉线补拉;单例(pidfile 存活检查)。
-        _ensure_monitor(py)
 
     print("[bok] waiting for desktop stack…")
     targets = [8000, 8787, 8788, 8790, 1235, 7880, 8081, 8082, 8083]
@@ -2389,7 +2498,7 @@ def _prod_units() -> list[tuple[str, list[str], dict[str, str], str]]:
     # unit 定义:name → (args, 附加 env)。agent/interp 共用 agent_env。
     return [
         ("bok-control-plane", [str(py), "-m", "uvicorn", "control_plane.main:app", "--host", _cp_bind_host(), "--port", "8000"], _control_plane_env((app_data_dir() / "bok_voice.db").as_posix()), "Bok 控制面 API"),
-        ("bok-livekit", [livekit_bin, "--config", str(ROOT / "services" / "livekit-server" / "livekit.yaml")], {}, "LiveKit 信令/媒体"),
+        ("bok-livekit", [livekit_bin, "--config", str(_livekit_config_path())], {}, "实时语音信令/媒体"),
         ("bok-agent", [str(py), "-m", "agent_runtime.main"], agent_env, "A 线客服 agent worker"),
         ("bok-interp-fwd", [str(py), "-m", "agent_runtime.interpret"], {**_interp_env(agent_env), "BOK_SERVICE": "interp-fwd", "INTERP_DIRECTION": "fwd"}, "B 线同传 fwd"),
         ("bok-interp-rev", [str(py), "-m", "agent_runtime.interpret"], {**_interp_env(agent_env), "BOK_SERVICE": "interp-rev", "INTERP_DIRECTION": "rev"}, "B 线同传 rev"),
@@ -2450,6 +2559,39 @@ def cmd_prod_install(node_agent: bool = False, node_args: list[str] | None = Non
         print("mac 装载(KeepAlive 自动拉起):  launchctl bootstrap gui/$(id -u) " + str(unit_dir) + "/*.plist")
         print("mac 卸载:                      bok.py prod uninstall（或 launchctl bootout gui/$(id -u)/com.bokvoice.bok-control-plane 等）")
         print("livekit 生产键/端口见 services/livekit-server/livekit.yaml")
+        return 0
+
+    if is_linux():
+        # Linux（Ubuntu 节点形态，2026-09-20）：systemd system units。
+        # 语义映射见 tools/systemd_units.py docstring——Restart=on-failure 精确
+        # 复刻「更新(75)拉回上新版 / 熔断(0)保持死亡」。本函数只生成落盘（零特权
+        # 动作）；装载由安装脚本或操作者以 root 执行（复制 /etc/systemd/system →
+        # daemon-reload → enable --now，指引见 write_units 输出）。
+        import systemd_units as _sd
+
+        if node_agent:
+            node_args = list(node_args or [])
+            if "--cp-url" not in node_args:
+                print("[prod] --node-agent 需要 node_agent 参数（--cp-url 必填）："
+                      "bok.py prod install --node-agent --cp-url <url> "
+                      "[--license-key KEY] [--ui-dir DIR] ...",
+                      file=sys.stderr)
+                return 2
+            units = [(
+                "node-agent",
+                [str(repo_python()), str(ROOT / "tools" / "node_agent.py"), *node_args],
+                {"PYTHONUNBUFFERED": "1"},
+                "薄节点守护（全栈拉起 + 心跳；参数原样透传）",
+            )]
+        else:
+            units = _prod_units()
+        _sd.write_units(units, unit_dir, str(ROOT), str(log_dir))
+        print(f"\nunits 目录: {unit_dir}")
+        print("linux 装载（root）: 复制 units 下 *.service 到 /etc/systemd/system"
+              " → systemctl daemon-reload → 逐单元 systemctl enable --now")
+        print("linux 卸载: bok.py prod uninstall（系统目录需 root 清理）")
+        print("媒体监听/外部地址: BOK_LIVEKIT_BIND / BOK_LIVEKIT_WEBHOOK_URL 覆盖"
+              "（默认沿用 services/livekit-server/livekit.yaml）")
         return 0
 
     # Windows：Task Scheduler 真注册（BootTrigger=开机自起 + RestartOnFailure=
@@ -2533,6 +2675,17 @@ def cmd_prod_uninstall() -> int:
                 print(f"[uninstall] {label}: bootout rc={r.returncode} {tail}")
             plist.unlink(missing_ok=True)
             print(f"[uninstall] removed {plist.relative_to(app_data_dir())}")
+        return 0
+
+    if is_linux():
+        # Linux（2026-09-20）：删 app-data 单元副本；系统单元需 root 停用删除
+        # 后 daemon-reload（本函数不代跑特权命令，见 systemd_units 模块 docstring）。
+        import systemd_units as _sd
+
+        names = [u[0] for u in _prod_units()] + ["node-agent"]
+        _sd.remove_units(names, unit_dir)
+        print("[uninstall] 系统单元（/etc/systemd/system/bok-*.service）需以 root 停用"
+              "并删除后 systemctl daemon-reload")
         return 0
 
     import schtasks_units as _sch
