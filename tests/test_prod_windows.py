@@ -25,6 +25,10 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
+# 平台模拟约定（2026-09-20）：本文件用例模拟 Windows，需同时打 is_mac=False 与
+# is_linux=False 两桩——只关 is_mac 时，真 Linux 主机（CI=ubuntu-latest）会让
+# cmd_prod_install 走进 systemd 分支把用例截胡（容器实测 6 红）。
+
 import bok  # noqa: E402
 import schtasks_units  # noqa: E402
 
@@ -431,6 +435,7 @@ def _fake_schtasks_factory(rc: int = 0, record: list | None = None):
 def test_prod_install_windows_registers_five_units(monkeypatch, tmp_path: Path) -> None:
     calls: list[list[str]] = []
     monkeypatch.setattr(bok, "is_mac", lambda: False)
+    monkeypatch.setattr(bok, "is_linux", lambda: False)
     monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(0, calls))
     rc = bok.cmd_prod_install()
@@ -452,6 +457,7 @@ def test_prod_install_windows_registers_five_units(monkeypatch, tmp_path: Path) 
 def test_prod_install_windows_node_agent_single_task_passthrough(monkeypatch, tmp_path: Path) -> None:
     calls: list[list[str]] = []
     monkeypatch.setattr(bok, "is_mac", lambda: False)
+    monkeypatch.setattr(bok, "is_linux", lambda: False)
     monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(0, calls))
     node_args = ["--cp-url", "http://127.0.0.1:8000", "--node-token", "tok",
@@ -471,6 +477,7 @@ def test_prod_install_windows_node_agent_single_task_passthrough(monkeypatch, tm
 
 def test_prod_install_windows_node_agent_requires_cp_url(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(bok, "is_mac", lambda: False)
+    monkeypatch.setattr(bok, "is_linux", lambda: False)
     monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
     rc = bok.cmd_prod_install(node_agent=True, node_args=["--license-key", "bokn_x"])
     assert rc == 2
@@ -478,6 +485,7 @@ def test_prod_install_windows_node_agent_requires_cp_url(monkeypatch, tmp_path: 
 
 def test_prod_install_windows_schtasks_failure_rc1(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(bok, "is_mac", lambda: False)
+    monkeypatch.setattr(bok, "is_linux", lambda: False)
     monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(1))
     assert bok.cmd_prod_install() == 1
@@ -494,6 +502,7 @@ def test_prod_install_mac_node_agent_rejected(monkeypatch, tmp_path: Path) -> No
 def test_prod_uninstall_windows_removes_tasks_and_xml(monkeypatch, tmp_path: Path) -> None:
     calls: list[list[str]] = []
     monkeypatch.setattr(bok, "is_mac", lambda: False)
+    monkeypatch.setattr(bok, "is_linux", lambda: False)
     monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(0, calls))
     (tmp_path / "units").mkdir()
@@ -510,6 +519,7 @@ def test_prod_uninstall_windows_removes_tasks_and_xml(monkeypatch, tmp_path: Pat
 
 def test_prod_uninstall_windows_not_installed_is_idempotent(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(bok, "is_mac", lambda: False)
+    monkeypatch.setattr(bok, "is_linux", lambda: False)
     monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
 
     def fake_run(argv, timeout=60.0):
@@ -522,6 +532,7 @@ def test_prod_uninstall_windows_not_installed_is_idempotent(monkeypatch, tmp_pat
 
 def test_prod_uninstall_windows_hard_failure_rc1(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(bok, "is_mac", lambda: False)
+    monkeypatch.setattr(bok, "is_linux", lambda: False)
     monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(1))
     assert bok.cmd_prod_uninstall() == 1
@@ -614,6 +625,7 @@ def test_prod_uninstall_windows_survivor_cleanup(monkeypatch, tmp_path: Path, ca
     全部 /delete（先停动作进程→清子进程→再删注册）。"""
     calls: list[list[str]] = []
     monkeypatch.setattr(bok, "is_mac", lambda: False)
+    monkeypatch.setattr(bok, "is_linux", lambda: False)
     monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(0, calls))
     monkeypatch.setattr(bok, "_pid_alive", lambda pf: True)
@@ -637,6 +649,7 @@ def test_prod_uninstall_windows_survivor_cleanup(monkeypatch, tmp_path: Path, ca
 def test_prod_uninstall_windows_no_survivors_skips_down(monkeypatch, tmp_path: Path, capsys) -> None:
     """无 pidfile 存活：不打 WARNING、不跑 cmd_down（silence = 没有要 surface 的东西）。"""
     monkeypatch.setattr(bok, "is_mac", lambda: False)
+    monkeypatch.setattr(bok, "is_linux", lambda: False)
     monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(schtasks_units, "run_schtasks", _fake_schtasks_factory(0, []))
     monkeypatch.setattr(bok, "_pid_alive", lambda pf: False)

@@ -2595,12 +2595,15 @@ def cmd_prod_install(node_agent: bool = False, node_args: list[str] | None = Non
         print("livekit 生产键/端口见 services/livekit-server/livekit.yaml")
         return 0
 
-    if is_linux():
+    if is_linux() and os.name != "nt":
         # Linux（Ubuntu 节点形态，2026-09-20）：systemd system units。
         # 语义映射见 tools/systemd_units.py docstring——Restart=on-failure 精确
         # 复刻「更新(75)拉回上新版 / 熔断(0)保持死亡」。本函数只生成落盘（零特权
         # 动作）；装载由安装脚本或操作者以 root 执行（复制 /etc/systemd/system →
         # daemon-reload → enable --now，指引见 write_units 输出）。
+        # `os.name != "nt"` 与 is_linux() 双条件：test_prod_windows 以
+        # os.name="nt" 打桩模拟 Windows，而 CI 跑在 ubuntu-latest（is_linux 真）——
+        # 只看 is_linux 会在 Linux 上把模拟 Windows 的用例截胡（容器实测 6 红）。
         import systemd_units as _sd
 
         if node_agent:
@@ -2718,9 +2721,10 @@ def cmd_prod_uninstall() -> int:
             print(f"[uninstall] removed {plist.relative_to(app_data_dir())}")
         return 0
 
-    if is_linux():
+    if is_linux() and os.name != "nt":
         # Linux（2026-09-20）：删 app-data 单元副本；系统单元需 root 停用删除
         # 后 daemon-reload（本函数不代跑特权命令，见 systemd_units 模块 docstring）。
+        # 双条件同 install：CI 在 ubuntu-latest 上跑「模拟 Windows」的用例。
         import systemd_units as _sd
 
         names = [u[0] for u in _prod_units()] + ["node-agent"]
