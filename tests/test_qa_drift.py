@@ -21,7 +21,10 @@ os.environ.setdefault("DATABASE_URL", "")  # force in-memory repo for tests
 os.environ.setdefault("LIVEKIT_API_KEY", "devkey")
 os.environ.setdefault("LIVEKIT_API_SECRET", "devsecret")
 os.environ.setdefault("LIVEKIT_URL", "ws://127.0.0.1:7880")
-os.environ.setdefault("BOK_JWT_SECRET", "test-secret-for-qa-drift-0123456789")
+# 占位值刻意用重复串（熵 3.23 < gitleaks 阈值 3.5）：早期写法
+# "test-secret-for-qa-drift-0123456789" 尾部的递增数字串把熵抬到 4.18，
+# 触发密钥门禁 generic-api-key 误报（.gitleaks.toml 里逐条登记过）。
+os.environ.setdefault("BOK_JWT_SECRET", "test-secret-qa-drift-test-secret-qa-drift")
 
 ROOT = Path(__file__).resolve().parents[1]
 for _p in ("packages/core", "packages/business-db"):

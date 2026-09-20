@@ -1,0 +1,31 @@
+# gitleaks 配置：在官方默认规则之上，逐条放行「确认为测试夹具」的已知占位值。
+#
+# 为什么需要这层：CI 的 gitleaks 用 `--verbose` 扫**全部 refs**（fetch-depth: 0 会把
+# 所有远端分支一并拉下来给容器扫，不只扫当前分支的历史）。因此任何**别人分支上尚未
+# 合并的提交**里的命中，都会把当前 PR 的门禁打红——改文件修不掉，因为命中挂在那个
+# 历史提交上。两个历史命中都不是真实凭据：
+#   tests/test_qa_drift.py (commit 661c22a)      "test-secret-for-qa-drift-0123456789"
+#   tests/test_diag_gates.py (commit cf6fac9)    "diag-gates-fixture-secret-0123456789abcdef"
+# 两者都是 `BOK_JWT_SECRET` 的测试占位值，尾部递增数字串把香农熵抬到 4.18 / 4.37，
+# 越过 generic-api-key 的 3.5 阈值。
+#
+# 为什么用**精确字面量**而不是模式：零额外放宽面。模式放行（例如「值里含 test 就放行」）
+# 会让任何形如 xxxxtestxxxx 的真实密钥漏网；精确登记只中和这两个已知值，其它高熵串
+# 照旧拦截。新增夹具若再触发，请按同样方式在此逐条登记——这条摩擦是门禁的本意。
+#
+# 注：规则对相似值的取舍并不只由熵决定（实测同为 4.3 级的
+# "test-secret-for-gap-mining-0123456789" 未被命中，而 4.18 的 qa-drift 被命中），
+# 机制未完全解释；所以新夹具请用重复串形状（见 tests/test_qa_drift.py 的注释），
+# 别依赖「换个词就躲过」的经验。
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+  [[rules.allowlists]]
+  description = "已知测试夹具占位值（非凭据），逐条精确登记"
+  regexes = [
+    '''test-secret-for-qa-drift-0123456789''',
+    '''diag-gates-fixture-secret-0123456789abcdef''',
+  ]
