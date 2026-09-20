@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, field
 
 from bok_voice_core.flow_graph import FlowGraphDoc, parse_flow_graph
@@ -253,6 +254,128 @@ def match_step_branch(
         best = max(kw_hits, key=lambda t: t[2])
         return (best[0], best[1])
     return None
+
+
+# ---- 破坏性动作确定性命中 + 热词幻觉护栏（F4，2026-09-20 验收实证）----------
+# 分支动作（A-②）的匹配沿用模糊匹配（verdict 家族词优先 + bigram 兜底）——对
+# 「提示词素材」无害，但用来驱动【收线】这类破坏性动作就危险：call-23516077
+# 实弹，客户说「这个事情嘛你等等先我还想想」，ASR 把弱尾音节抄成热词表里的
+# 「打错电话」（模板 hotwords 偏置）→ 家族+bigram 命中「说打错电话了」分支
+# →【收线】真把客户挂了。两道护栏（只作用于 refuse 动作；handoff/jump/hold/
+# 无动作分支维持现有匹配语义，改动面最小）：
+# ① 确定性子串命中：收线派发前，条件核心词（剥引导动词/尾语气词，拆
+#    「/」「、」「,」「或」多选）必须【字面】出现在客户原话里；纯家族/bigram
+#    模糊命中不足以收线（不派发，落回后续 LLM 或内置 REFUSE 车道）。
+# ② 热词幻觉护栏：本轮文本剥掉词表词（模板 hotwords + 行业词 + 对象字段，
+#    与 ASR context 软偏置同一份，agent.py asr_hotword_context 组装、
+#    livekit_plugins._parse_vocab_terms 反解）后剩余过短/为空——整轮就是
+#    「打错电话」，或末子句整体是词表词（「我还想。打错电话。」=call-23516077
+#    实弹形态）→ 判 ASR 抄词表，不收线。词表取不到时退化为长度近似
+#    （hotword_only_by_length：条件核心词命中且整轮净长 ≤ 核心词长+N）。
+# 两个纯函数都在本层（无 providers 依赖）；agent.py branch_hit_plan 消费。
+_COND_OPT_SPLIT_RE = re.compile(r"[/、,，]|\bor\b|或", re.IGNORECASE)
+# 条件引导动词（「如果客户说打错电话了」的「说」）/ 尾语气助词（「了」「先」）：
+# 剥掉才是可与客户原话字面对齐的「核心词」。与 _cond_bigram_hits 的 ^[说问]
+# 同族、略宽（要/查/嫌/催 係真实模板条件的常见引导）。
+_COND_OPT_LEAD_RE = re.compile(r"^(?:说|講|讲|问|要|查|嫌|催)+")
+_COND_OPT_TRAIL_RE = re.compile(r"(?:了|啦|喽|哦|喔|呀|呢|吧|嘛|吗|么|的|時|时|先)+$")
+
+
+def _cond_norm_text(s: str) -> str:
+    """去标点与空白只留正字——条件/原话的字面对齐归一化（纯函数）。"""
+    return "".join(
+        ch
+        for ch in str(s or "")
+        if not ch.isspace() and not unicodedata.category(ch).startswith("P")
+    )
+
+
+def refuse_condition_options(cond: str) -> tuple[str, ...]:
+    """条件核心词列表（纯函数）：拆多选 + 剥引导动词/尾语气词。
+
+    「说打错电话了」→ ("打错电话",)；「打错电话/不是本人」→
+    ("打错电话", "不是本人")；「说等等先」→ ("等等",)。剥完不足 2 字的选项
+    回退用未剥原串（过短核心词宁可字面严格些）；全空返回空 tuple。"""
+    opts: list[str] = []
+    for raw in _COND_OPT_SPLIT_RE.split(str(cond or "")):
+        raw = raw.strip()
+        if not raw:
+            continue
+        core = _COND_OPT_TRAIL_RE.sub("", _COND_OPT_LEAD_RE.sub("", raw)).strip()
+        core = core or raw
+        pick = core if len(core) >= 2 else raw
+        if len(pick) >= 2 and pick not in opts:
+            opts.append(pick)
+    return tuple(opts)
+
+
+def refuse_condition_confirmed(cond: str, user_text: str) -> bool:
+    """收线派发的确定性命中判定（纯函数）：任一条件核心词【字面】出现即 True。
+
+    对客户原话做原始串与去标点归一串两级 casefold 子串比对（「打错、电话」
+    这类转写夹标点不断开字面命中）；多选任一项命中即可。家族/bigram 模糊
+    命中在此不过关——模糊命中只配当提示词素材，唔配驱动破坏性动作。"""
+    text = str(user_text or "")
+    if not text:
+        return False
+    flat = _cond_norm_text(text)
+    for opt in refuse_condition_options(cond):
+        low = opt.casefold()
+        if low in text.casefold() or low in flat.casefold():
+            return True
+    return False
+
+
+def hotword_only_utterance(
+    user_text: str, vocab_terms, *, min_rest_chars: int = 2
+) -> bool:
+    """整轮基本就是词表词 → True（判 ASR 抄词表；纯函数，单测用）。
+
+    三层：①整轮剥词表词后为空（整轮就是「打错电话」）→ True；②末子句剥
+    词表词后为空且该子句原本非空（「你等等先，我还想。打错电话。」——弱尾
+    音节被整句抄成词表词的实弹形态 call-23516077）→ True；③剥词表后剩余
+    ≤min_rest_chars 字（「打错电话啊」的「啊」）→ True。词表空 → False
+    （退化近似由调用方走 hotword_only_by_length）。"""
+    text = str(user_text or "")
+    terms = sorted(
+        {str(t).strip() for t in (vocab_terms or ()) if len(str(t).strip()) >= 2},
+        key=len,
+        reverse=True,
+    )
+    if not text.strip() or not terms:
+        return False
+
+    def _rest(s: str) -> str:
+        out = s
+        for t in terms:
+            out = out.replace(t, "")
+        return _cond_norm_text(out)
+
+    rest_all = _rest(text)
+    if not rest_all:
+        return True
+    segments = [seg for seg in re.split(r"[。！？!?；;，,、\n]", text) if seg.strip()]
+    if segments:
+        last = segments[-1]
+        if _cond_norm_text(last) and not _rest(last):
+            return True
+    return len(rest_all) <= min_rest_chars
+
+
+def hotword_only_by_length(user_text: str, cond: str, *, slack: int = 1) -> bool:
+    """词表取不到时的退化近似（纯函数）：条件核心词命中且整轮净长 ≤ 核心词长+N。
+
+    「打错电话啊」(5) ≤ 4+1 → True；「我还想打错电话」(7) > 5 → False；
+    「你打错电话了」(6) > 5 → False（带主语+语气的完整轮仍照常收线——词表
+    缺位时从宽，宁可少拦勿误拦，真护栏要喂词表）。
+    注：只量长度唔剥词表——长轮里的弱尾抄词查不出。"""
+    opts = refuse_condition_options(cond)
+    text = _cond_norm_text(user_text)
+    if not opts or not text:
+        return False
+    if not any(opt.casefold() in text.casefold() for opt in opts):
+        return False
+    return len(text) <= max(len(opt) for opt in opts) + slack
 
 
 # 粤语数字逐个读法:0 读「零」;1-9 对应汉字。数字串/单号要逐个读,

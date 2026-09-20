@@ -630,6 +630,26 @@ def materialize_branches(persona_id: str, raw_texts: list[str]) -> dict[str, str
 # ---------------------------------------------------------------------------
 # 跑一腿
 # ---------------------------------------------------------------------------
+async def wait_log_stable(*, poll_s: float = 0.3, max_wait_s: float = 6.0) -> int:
+    """轮询 agent.log 大小直到连续两次读数相同（间隔 poll_s），返回当前大小。
+
+    切窗前必须等日志落盘稳定（hold 腿窗界 race 收口）：`play_and_listen` 按
+    静默返回时，该轮的推进/分支日志可能还在「端点 min_delay + 轮处理」的路上
+    ——不等稳就切 mark，上一轮的 `[flow] rule=auto step=2`（warmup 身份步合法
+    推进）会串进 trigger 窗口，令 `no_advance` 误判推进。这不改任何判据语义，
+    只保证「每轮的日志落在该轮自己的窗口内」。日志持续增长超 max_wait_s 时按
+    当前大小返回（不无限等）。"""
+    deadline = time.perf_counter() + max_wait_s
+    prev = erc.LOG_PATH.stat().st_size if erc.LOG_PATH.exists() else 0
+    while time.perf_counter() < deadline:
+        await asyncio.sleep(poll_s)
+        cur = erc.LOG_PATH.stat().st_size if erc.LOG_PATH.exists() else 0
+        if cur == prev:
+            return cur
+        prev = cur
+    return prev
+
+
 async def run_leg(*, leg: str, lang: str, voice: str, keep_template: bool) -> dict:
     rounds = LEG_ROUNDS[leg]
     print(f"\n[branch-action] 腿={leg} lang={lang} rounds={[n for n, _ in rounds]}",
@@ -730,7 +750,9 @@ async def _run_leg_with_stack(*, leg: str, lang: str, template_id: str, call_id:
             m.update({"name": name, "text": text,
                       "pre_push_wait_s": round(pre_wait, 2), "pre_push_quiet": pre_quiet})
             measures.append(m)
-            marks.append(erc.LOG_PATH.stat().st_size if erc.LOG_PATH.exists() else marks[-1])
+            # 切窗前等日志落盘稳定（见 wait_log_stable）：上一轮的推进/分支日志
+            # 必须落在本轮窗口内，防跨窗串行误判。
+            marks.append(await wait_log_stable())
             first = f"{m['first_audio_ms'] / 1000:.2f}s" if m.get("first_audio_ms") is not None else "-"
             print(f"    {name:>8} 「{text}」 → 首声 {first} · 语音 {m.get('speech_s', 0):.1f}s · "
                   f"{'✓' if m.get('answered') else '✗哑'} · log+{marks[-1] - marks[-2]}B",

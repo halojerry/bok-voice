@@ -1162,6 +1162,14 @@ _FORWARD_ENV = (
     #    LLM;应答首部【收线】/【转人工】/【跳第N步】/【留本步】动作前缀=引擎一等出口) ——
     "BOK_BRANCH_ACTION",
     "BOK_BRANCH_CANNED",
+    # —— F4 破坏性动作双护栏(2026-09-20:refuse 派发前条件核心词须字面命中;
+    #    整轮/末子句剥词表词后过短=ASR 抄词表不收线) ——
+    "BOK_BRANCH_REFUSE_CONFIRM",
+    "BOK_BRANCH_REFUSE_HOTWORD_GUARD",
+    # —— F2 迟到 FINAL 尾巴护栏(2026-09-20:AI 生成/播报中相对已提交文本的
+    #    极短追加 finish 尾巴=重解幻听,不成轮不打断快路/直念回复) ——
+    "BOK_LATE_FINAL_GUARD",
+    "BOK_LATE_FINAL_MAX_TAIL_CHARS",
     "BOK_QA_MATCH_THRESHOLD",
     # —— 垫话/罐头/TTS 缓存 ——
     "BOK_FILLER",

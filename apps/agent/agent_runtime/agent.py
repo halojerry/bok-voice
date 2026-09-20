@@ -55,12 +55,16 @@ from .flow import (  # noqa: F401 - 部分名字只被 branch_hit_plan 使用
     BRANCH_ACTION_REFUSE,
     FAREWELL,
     REFUSE,
+    _cond_norm_text,
     _digit_normalize,
     _looks_like_whatsapp_step,
     digits_to_cantonese,
+    hotword_only_by_length,
+    hotword_only_utterance,
     match_step_branch,
     parse_branch_action,
     parse_step_ref,
+    refuse_condition_confirmed,
     render_template_text,
     stall_ladder_level,
 )
@@ -434,6 +438,7 @@ def branch_hit_plan(
     wa_captured: bool,
     verdict: str,
     vars_map: dict[str, str] | None = None,
+    hotword_terms: tuple[str, ...] = (),
 ) -> dict | None:
     """分支命中规划(2026-09-20 路线 A-②,纯函数,单测直接喂)。
 
@@ -466,6 +471,50 @@ def branch_hit_plan(
         return None
     # ④ 动作前缀拆解:识别到标记一律消费,余下文本才是应答
     action, jump_step, clean = parse_branch_action(m[1])
+    # ④' 破坏性动作双护栏(F4,2026-09-20 实弹 call-23516077:弱尾音节被 ASR 抄成
+    #     词表里的「打错电话」→ 家族+bigram 模糊命中【收线】分支→真挂了客户;
+    #     call-179c7608 二修:ASR 自打标点把一句拒绝切成两片段时,后半「我不是
+    #     这个人。」不含条件词,纯字面门会把它挡去 LLM——收线台词播半句被打断、
+    #     后半走 gen=llm,探针 no_llm_after_refuse/turn_gen_script_text_exact FAIL)。
+    #     只作用于 refuse 动作;handoff/jump/hold/无动作分支维持现有模糊匹配语义。
+    #     ① 确定性命中【或 内置明确拒绝】:条件核心词(拆「/」「、」「,」「或」
+    #        多选)字面出现在客户原话里,或内置 rule_verdict 本轮已判 REFUSE——
+    #        客户明确拒绝(内置规则独立判定)时,允许用运营为这条分支写的收线
+    #        台词(比通用收尾稿更贴语境);而仅模糊相似、无内置拒绝依据不足以
+    #        让 AI 挂客户电话(热词抄词之外的误收线面就此保住)
+    #        (BOK_BRANCH_REFUSE_CONFIRM=0 回退);
+    #     ② 热词幻觉【最终否决】:即使字面/verdict==REFUSE 过了①,整轮(或末
+    #        子句)剥词表词后剩余过短/为空 → 仍判 ASR 抄词表,不收线(实弹误收
+    #        线轮「你等等先,我还想。打错电话。」必须继续被拦)
+    #        (BOK_BRANCH_REFUSE_HOTWORD_GUARD=0 回退)。词表=模板 hotwords+
+    #        行业词+对象字段(asr_hotword_context 组装,_parse_vocab_terms 反解),
+    #        取不到退化为长度近似(核心词命中且整轮 ≤ 核心词长+1)。
+    #     两道都不过 → None 落回后续 LLM 或内置 REFUSE 车道(内置车道还在,
+    #     verdict==REFUSE 照收线),并打 refuse_skipped 归因日志。
+    if action == BRANCH_ACTION_REFUSE:
+        _literal_or_refuse = refuse_condition_confirmed(m[0], user_text) or verdict == REFUSE
+        if (
+            os.environ.get("BOK_BRANCH_REFUSE_CONFIRM", "1") == "1"
+            and not _literal_or_refuse
+        ):
+            print(
+                f"BRANCH_ACTION refuse_skipped reason=not_literal cond={m[0]!r} "
+                f"text={user_text!r}",
+                flush=True,
+            )
+            return None
+        if os.environ.get("BOK_BRANCH_REFUSE_HOTWORD_GUARD", "1") == "1":
+            if hotword_terms:
+                _hw_only = hotword_only_utterance(user_text, hotword_terms)
+            else:
+                _hw_only = hotword_only_by_length(user_text, m[0])
+            if _hw_only:
+                print(
+                    f"BRANCH_ACTION refuse_skipped reason=hotword_only cond={m[0]!r} "
+                    f"text={user_text!r}",
+                    flush=True,
+                )
+                return None
     # ⑤ 第 1 步限制(仅动作腿生效):身份步「任何非拒绝回应都推进」铁律不许
     #    被分支抢走(留本步/跳步会把开场钉死/跳飞);收线与打铃不推进流程,
     #    放行
@@ -1193,6 +1242,15 @@ def partial_ms_for_state(state: str, slow_ms: int) -> int | None:
     return slow_ms if state in ("thinking", "speaking") else None
 
 
+def agent_busy_for_state(state: str) -> bool:
+    """状态→「回复在途」旗(纯函数,单测用;F2 迟到 FINAL 尾巴护栏消费)。
+
+    thinking(LLM 生成中)/speaking(播报中)=True——快路罐头/直念回复正在出声、
+    或回复文本在途,此刻迟到的 finish 幻听尾巴唔该成新轮掐断它;listening=
+    False——AI 空闲,短尾豁免旧行为全保留。"""
+    return state in ("thinking", "speaking")
+
+
 _ECHO_SIM_RATIO = 0.9
 _ECHO_MIN_CHARS = 6
 
@@ -1203,7 +1261,7 @@ def _hotword_echo_guard_enabled() -> bool:
 
 # 幻听判定单一实现喺 livekit_plugins(STT 源头闸与 hook 双层共用,防漂移)。
 from .providers.livekit_plugins import _is_hotword_vocab_echo as _is_hotword_echo  # noqa: E402
-from .providers.livekit_plugins import _strip_vocab_echo_tail, _vocab_echo_guard  # noqa: E402
+from .providers.livekit_plugins import _parse_vocab_terms, _strip_vocab_echo_tail, _vocab_echo_guard  # noqa: E402
 
 
 def _is_echo_self_heard(user_text: str, last_reply: str, agent_speaking: bool) -> bool:
@@ -4133,6 +4191,9 @@ async def entrypoint(ctx):
                                 wa_captured=bool(_wa_captured["on"]),
                                 verdict=str(flow_ctrl.last_verdict or ""),
                                 vars_map=flow_ctrl.vars_map,
+                                # F4 热词幻觉护栏词表:与 ASR context 软偏置同一份
+                                # (模板 hotwords+行业词+对象字段),反解回词列表。
+                                hotword_terms=_parse_vocab_terms(_hotword_ctx),
                             )
                         except Exception:  # noqa: BLE001 - 规划异常当未命中,零回归
                             _branch_plan = None
@@ -4343,10 +4404,21 @@ async def entrypoint(ctx):
             # 收线被跳过);收线是最高优先级车道,排在 stall/DEFER/say 之前。
             if _branch_refuse_say:
                 _cancel_response_watchdog()  # 收线台词即出声
-                await _say_script(
-                    session, tts_provider, _tts_cache, _branch_refuse_say,
-                    emotion=_branch_refuse_emo,
-                )
+                # F4 二修(call-179c7608):收线台词直念期间置「告别窗」旗——STT
+                # 在此窗内静默丢弃一切成轮事件(句级提交/EOS/FINAL,见
+                # livekit_plugins._closing_say_active),把告别说完;客户尾随片段
+                # 成新轮只会把台词掐成半句道歉、再落 LLM 兜话——电话本就要结束,
+                # 这是产品上更差的行为。念完(或被打断)即撤旗,非收线期零影响。
+                if _partial_gate_stt is not None:
+                    _partial_gate_stt.set_closing_say(True)
+                try:
+                    await _say_script(
+                        session, tts_provider, _tts_cache, _branch_refuse_say,
+                        emotion=_branch_refuse_emo,
+                    )
+                finally:
+                    if _partial_gate_stt is not None:
+                        _partial_gate_stt.set_closing_say(False)
                 raise StopResponse()
             # ---- stall 升级阶梯(漏斗 v2,spec §3.1):同 step 连续 UNCLEAR 有出口。
             # 3 降级问法 / 5 绕过留号 / 8 主动收线——全部 _say_script 直念零 TTFT。
@@ -4549,6 +4621,7 @@ async def entrypoint(ctx):
                         wa_captured=bool(_wa_captured["on"]),
                         verdict=str(flow_ctrl.last_verdict or ""),
                         vars_map=flow_ctrl.vars_map,
+                        hotword_terms=_parse_vocab_terms(_hotword_ctx),
                     )
                 _bc_step = (int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0
             except Exception:  # noqa: BLE001 - 挑选异常当未命中,照旧落穿
@@ -5004,14 +5077,17 @@ async def entrypoint(ctx):
     def _on_partial_gate(ev) -> None:
         # GPU 竞态专项:LLM 生成/播报中抬高 ASR partial 档,listening 恢复默认。
         # 打断係 VAD 判定,唔受此抑制影响;独立于心跳(nudge_max=0 也要生效)。
-        if _partial_gate_stt is not None:
-            _partial_gate_stt.set_partial_ms(
-                partial_ms_for_state(str(getattr(ev, "new_state", "") or ""), partial_slow_ms())
-            )
+        # F2:同一钩子顺手喂「回复在途」旗给迟到 FINAL 尾巴护栏(partial 抑制
+        # 档=0 时该路 no-op,旗照喂——两功能共用一条 agent_state_changed 线)。
+        state = str(getattr(ev, "new_state", "") or "")
+        _partial_gate_stt.set_partial_ms(partial_ms_for_state(state, partial_slow_ms()))
+        _partial_gate_stt.set_reply_busy(agent_busy_for_state(state))
 
-    if _partial_gate_stt is not None and partial_slow_ms() > 0:
+    if _partial_gate_stt is not None:
         # 与心跳钩子同规:必须先于 session.start 注册,错过初始 speaking 转换
-        # 会令开场白期间 partial 唔受抑制。
+        # 会令开场白期间 partial 唔受抑制。此前仅在 partial_slow_ms()>0 时注册
+        # ——F2 护栏旗也要这条线,改为恒注册(partial_ms_for_state 内部对
+        # slow_ms<=0 返回 None,行为同旧)。
         session.on("agent_state_changed", _on_partial_gate)
 
     if _prefill_spec is not None:

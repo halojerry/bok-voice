@@ -4785,6 +4785,12 @@ class Qwen3ASRSTT(stt.STT):
         # 会话级 partial 解码间隔档(GPU 竞态专项):agent 回复生成/播报中抬高,
         # listening 恢复 None=env 默认。getattr 鸭型访问,勿删(测试 fake 无此属性)。
         self._partial_ms_override: int | None = None
+        # 回复在途旗(F2 迟到 FINAL 尾巴护栏):thinking/speaking=True,listening=
+        # False。agent 经 Qwen3ASRLiveSTT.set_reply_busy 写;流在读判定时刻现取。
+        self._reply_busy = False
+        # 收线/告别直念窗旗(F4 二修):agent 播分支动作【收线】台词期间 True,
+        # 念完即撤。此窗内流静默丢弃一切成轮事件(句级提交/EOS/FINAL)。
+        self._closing_say = False
 
     def stream(self, *, language=None, conn_options=None):
         return _Qwen3ASRStream(self, conn_options or APIConnectOptions())
@@ -5022,6 +5028,81 @@ def _tail_carries_content(s: str) -> bool:
     if re.search(r"[0-9A-Za-z]{2,}", t):
         return True
     return any(ch not in _PURE_ACK_TAIL_CHARS for ch in t)
+
+
+# ---- 迟到 FINAL 尾巴护栏（F2，2026-09-20 验收实证）--------------------------
+# 现象：句级提交已发 FINAL、回复（快路罐头/直念/QA 罐头）开播后，停嘴 finish
+# 整窗重解在句尾幻听出「那。」级短碎片 → _uncommitted 的 startswith 分支把
+# 它当真尾巴原样返回（追加，唔係修正）→「带内容短尾豁免」放行（「那」是实词、
+# 唔在纯应承字表）→ 第二条 FINAL 成新用户轮 → 框架 _interrupt_by_audio_activity
+# 掐断在播回复（0.4s 截断、assistant item 唔落库）。
+# 既有两道闸为何没拦：
+# - 重解丢弃（_ASR_REDECODE_DROP_RATIO）：只管「坐标失配的修正」——本例同头
+#   「追加」，startswith 直接命中，相似度门结构性不进；
+# - 短尾不补发（_tail_carries_content）：只丢纯应承字，「那」算实词 → 豁免。
+# 新闸语义：AI 正在生成/播报（thinking/speaking）时，迟到 finish 尾巴相对已
+# 提交文本只是「极短追加」→ 判幻听碎片，唔补发、唔成轮、唔打断；真·新话
+# （足够长/含数字字母 run）与 AI 空闲轮照旧成轮——2026-09-07「带内容短尾
+# 豁免」（「我唔知」「四五七」补报）在 AI 空闲与长度门槛之上全保留。
+# BOK_LATE_FINAL_GUARD=0 回退旧行为；字数阈值 BOK_LATE_FINAL_MAX_TAIL_CHARS。
+def _late_final_guard_on() -> bool:
+    """迟到 finish 尾巴护栏总门（BOK_LATE_FINAL_GUARD，默认开；0=回退旧行为）。"""
+    return os.environ.get("BOK_LATE_FINAL_GUARD", "1") == "1"
+
+
+def _late_final_max_tail_chars() -> int:
+    """「极短追加」字数上限（BOK_LATE_FINAL_MAX_TAIL_CHARS，默认 2，地板 1）。
+
+    幻听碎片实测 1-2 字（「那」「嗰」）；2026-09-07 豁免的真实短应答普遍
+    ≥3 字（「我唔知」）——默认 2 正好夹住两者，唔后悔可调大。"""
+    try:
+        return max(1, int(os.environ.get("BOK_LATE_FINAL_MAX_TAIL_CHARS", "2")))
+    except ValueError:
+        return 2
+
+
+def late_final_is_new_speech(
+    payload: str,
+    committed: str,
+    *,
+    agent_busy: bool,
+    max_tail_chars: int = 2,
+    closing_say: bool = False,
+) -> bool:
+    """迟到 finish 尾巴是否够格当新客户话（纯函数，单测用）。
+
+    True=照发 FINAL（可打断在播回复——真插话/补报号码是本分）；False=判
+    finish 重解幻听尾巴，丢弃（快路/直念回复唔被打断）。`committed` 只进
+    文档语义（判定点已由 _uncommitted 保证 payload 相对它是尾部追加/高度
+    重叠），不参与运算——阈值判定只看尾巴自身形态：
+    - closing_say（收线/告别直念窗，F4 二修）→ False：任何长度、含数字字母
+      一律丢弃——电话本就要结束，把告别说完比什么都优先（半句道歉是最差
+      听感），数字零降级在此窗让位；
+    - 净文（去标点空白）为空 → False（空/纯标点永不成轮）；
+    - 数字/字母 run ≥2 → True（数字零降级：补报单号永远送达）；
+    - AI 未在生成/播报 → True（无回复可掐，维持带内容短尾豁免旧行为）；
+    - 净文长 > max_tail_chars → True（足够长=真新话）；
+    - 其余（AI 忙+极短追加）→ False。
+    """
+    norm = _strip_punct_space(payload)
+    if not norm:
+        return False
+    if closing_say:
+        return False
+    if re.search(r"[0-9A-Za-z]{2,}", norm):
+        return True
+    if not agent_busy:
+        return True
+    return len(norm) > max_tail_chars
+
+
+def _closing_say_active(stt_: "Qwen3ASRSTT") -> bool:
+    """收线/告别直念窗旗（F4 二修）：agent 在播分支动作【收线】台词期间置位。
+
+    此窗内流把一切成轮事件（句级提交/EOS/FINAL）静默丢弃——电话本就要结束，
+    半句道歉比什么都差。getattr 鸭型访问（测试 fake/未接线的 STT 无此属性时
+    同「旗未置」）。"""
+    return bool(getattr(stt_, "_closing_say", False))
 
 
 def sentence_commit_enabled() -> bool:
@@ -5362,6 +5443,18 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                 elif event.type == vad.VADEventType.END_OF_SPEECH:
                     if not started:
                         continue
+                    # ---- 收线/告别直念窗(F4 二修,call-179c7608):整段静默丢弃 --
+                    # 分支动作【收线】台词正在播时,客户尾随片段(「我不是这个人。」)
+                    # 成新轮会打断在播台词(半句道歉)+落 LLM 兜话。stt 模式下框架
+                    # 收到 EOS 就会 commit 轮(audio_recognition _run_eou_detection
+                    # trigger="stt"),所以此窗内 EOS 也不发——整段直接放弃:电话本
+                    # 就要结束,把告别说完比什么都优先。非此窗语义逐字节不变。
+                    if _late_final_guard_on() and _closing_say_active(self._stt_):
+                        started = False
+                        self._finishing = False
+                        self._reset()
+                        print("QWEN3_ASR_CLOSING_SAY_SUPPRESS src=segment_eos", flush=True)
+                        continue
                     # ---- 跨段拼接 hold(治报号句被微停顿切碎,2026-09-06)----
                     # 数字/字母句被句级门有意排除(防半截号码提前提交)→ 永远走逐段
                     # 整句路径,VAD 微停顿即拆轮。续接可能句喺呢度唔发 END_OF_SPEECH、
@@ -5448,6 +5541,26 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                     if payload and _hesitation_gate_on() and _pure_hesitation(payload):
                         print(f"QWEN3_ASR_HESITATION_DROP payload={payload!r}", flush=True)
                         payload = ""
+                    # 迟到 FINAL 尾巴护栏（F2）：AI 生成/播报中，相对已提交文本
+                    # 只是极短追加的 finish 尾巴 → 判重解幻听碎片，唔补发（否则
+                    # 新用户轮会把在播的快路罐头/直念回复掐断、assistant item
+                    # 不落库）。真·新话（足够长/含数字字母）照发可打断。
+                    # closing_say 窗（F4 二修）：在播的係收线台词时任何长度都丢弃。
+                    if payload and committed_before and _late_final_guard_on():
+                        _cs = _closing_say_active(self._stt_)
+                        if _cs or not late_final_is_new_speech(
+                            payload,
+                            committed_before,
+                            agent_busy=bool(getattr(self._stt_, "_reply_busy", False)),
+                            max_tail_chars=_late_final_max_tail_chars(),
+                        ):
+                            print(
+                                f"QWEN3_ASR_LATE_FINAL_DROP reason="
+                                f"{'closing_say' if _cs else 'tail_append'} "
+                                f"committed={committed_before!r} tail={payload!r}",
+                                flush=True,
+                            )
+                            payload = ""
                     started = False
                     self._finishing = False
                     self._reset()
@@ -5481,6 +5594,12 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         await asyncio.sleep(_join_hold_s())
         if not self._join_hold_active:
             return
+        # 收线/告别直念窗(F4 二修):held 段同样静默放弃(见 _run EOS 分支注)。
+        if _late_final_guard_on() and _closing_say_active(self._stt_):
+            self._join_hold_active = False
+            self._join_task = None
+            print("QWEN3_ASR_CLOSING_SAY_SUPPRESS src=join_flush", flush=True)
+            return
         self._join_hold_active = False
         self._join_task = None
         _epoch_at_hold = self._session_epoch
@@ -5503,6 +5622,24 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         if payload and _hesitation_gate_on() and _pure_hesitation(payload):
             print(f"QWEN3_ASR_HESITATION_DROP payload={payload!r}", flush=True)
             payload = ""
+        # 迟到 FINAL 尾巴护栏（F2）：与 _run 停嘴分支同一把尺（join-flush 路的
+        # finish 尾巴同样会成新轮掐断在播回复）。closing_say 窗（F4 二修）任何
+        # 长度都丢弃。
+        if payload and committed_before and _late_final_guard_on():
+            _cs = _closing_say_active(self._stt_)
+            if _cs or not late_final_is_new_speech(
+                payload,
+                committed_before,
+                agent_busy=bool(getattr(self._stt_, "_reply_busy", False)),
+                max_tail_chars=_late_final_max_tail_chars(),
+            ):
+                print(
+                    f"QWEN3_ASR_LATE_FINAL_DROP reason="
+                    f"{'closing_say' if _cs else 'tail_append'} "
+                    f"committed={committed_before!r} tail={payload!r}",
+                    flush=True,
+                )
+                payload = ""
         self._finishing = False
         if self._session_epoch == _epoch_at_hold:
             self._reset()
@@ -5640,7 +5777,9 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         # _audio_transcript + 喂抢跑；EOS 置 committed + _run_eou_detection(trigger
         # ="stt")（endpointing min_delay 仍适用）→ 按句建轮，LLM+TTS 与客户说话
         # 重叠。提交窗不发 PREFLIGHT（文本已权威提交，省一次投机预算）。
-        if sentence_commit_enabled():
+        # 收线/告别直念窗(F4 二修)跳过：提交伴发的 EOS 会令框架即刻 commit 轮、
+        # 打断在播收线台词。
+        if sentence_commit_enabled() and not _closing_say_active(self._stt_):
             commit = self._sentence_boundary(text, prev_full)
             if commit is not None:
                 sentence, end_idx = commit
@@ -6029,3 +6168,20 @@ class Qwen3ASRLiveSTT(stt.STT):
                 _spawn_bg(s._apply_partial_ms(ms))
             except RuntimeError:
                 pass
+
+    def set_reply_busy(self, busy: bool) -> None:
+        """回复在途旗(F2 迟到 FINAL 尾巴护栏,同步入口,agent_state_changed 钩子调)。
+
+        thinking/speaking=True、listening=False。旗落内芯即可:迟到尾巴判定
+        发生在停嘴 finish 路径,流读判定时刻现取(`getattr(self._stt_,…)`)，
+        无需转发到活流。护栏关(BOK_LATE_FINAL_GUARD=0)时旗没人读,零害。
+        """
+        self._stt._reply_busy = bool(busy)
+
+    def set_closing_say(self, on: bool) -> None:
+        """收线/告别直念窗旗(F4 二修,同步入口;agent 播【收线】台词前后置/撤)。
+
+        True 期间流把一切成轮事件(句级提交/EOS/FINAL)静默丢弃——把告别说完。
+        与 set_reply_busy 同款「旗落内芯、流读判定时刻现取」姿势。
+        """
+        self._stt._closing_say = bool(on)
