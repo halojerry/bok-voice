@@ -1,9 +1,12 @@
-"""分支罐头快路(2026-09-20 路线 A-①)单测:闸门/命中/落穿/pregen 分支物化。
+"""分支罐头快路(2026-09-20 路线 A-①,2026-09-20 A-② 收编 branch_hit_plan)
+单测:闸门/命中/落穿/pregen 分支物化。
 
 快路=当前步 ref 的「如果客户X→就Y」分支命中(match_step_branch 与提示词
 注入同源)且应答已物化录音 → 直接播录音跳过 LLM;未物化照旧落穿(注入
-提示词走 LLM,现状不变)。可测面三层:
-- `branch_canned_pick` 纯函数(闸门全量:开关/closing/paused/REFUSE/
+提示词走 LLM,现状不变)。A-② 起规划统一走 `branch_hit_plan`(本文件全部
+用例=纯罐头腿档 action_enabled=False,语义与 A-① 逐条等价);动作前缀
+(【收线】等)的解析与派发闸门在 tests/test_branch_actions.py。可测面三层:
+- `branch_hit_plan` 纯函数(闸门全量:开关/closing/paused/REFUSE/
   FAREWELL/WA 步未捕获/无分支/占位残留/不推进);
 - 漏斗接线源级断言(块位次在 say 直念门后、graph 意图块前;provider=
   branch-canned;命中 raise StopResponse、miss 落穿)——hook 闭包离线起不了,
@@ -24,7 +27,7 @@ for p in ("apps/agent", "packages/core", "scripts"):
     if sp not in sys.path:
         sys.path.insert(0, sp)
 
-from agent_runtime.agent import branch_canned_pick  # noqa: E402
+from agent_runtime.agent import branch_hit_plan  # noqa: E402
 from agent_runtime.flow import (  # noqa: E402
     FAREWELL,
     OBJECTION,
@@ -48,10 +51,15 @@ _REF_PLATFORM = (
 
 
 def _pick(**kw):
+    # A-① 旧姿势映射:纯罐头腿(enabled→canned_enabled),动作腿恒关;
+    # step_index=1(0-based 第 2 步)避开第 1 步动作腿限制,与旧语义等价。
     base = dict(
-        enabled=True,
+        action_enabled=False,
+        canned_enabled=True,
+        step_index=1,
         closing=False,
         paused=False,
+        done=False,
         user_text="为什么赔这么少",
         goal="核实购买平台",
         ref=_REF_PLATFORM,
@@ -60,18 +68,17 @@ def _pick(**kw):
         vars_map={},
     )
     base.update(kw)
-    return branch_canned_pick(**base)
+    return branch_hit_plan(**base)
 
 
-# ---- branch_canned_pick:命中与闸门 ----
+# ---- branch_hit_plan(罐头腿):命中与闸门(与 A-① 逐条等价) ----
 
 
 def test_pick_hit_by_verdict_family():
     out = _pick()
     assert out is not None
-    resp, cond = out
-    assert resp == "我哋會按平台規則盡量幫您爭取。"
-    assert cond == "嫌赔偿少"
+    assert out["text"] == "我哋會按平台規則盡量幫您爭取。"
+    assert out["cond"] == "嫌赔偿少"
 
 
 def test_pick_hit_unclear_family_and_kept_on_step():
@@ -79,11 +86,17 @@ def test_pick_hit_unclear_family_and_kept_on_step():
         user_text="我唔记得係边个平台买咯",
         verdict=UNCLEAR,
     )
-    assert out == ("唔緊要，打開訂單看看就有平台名。", "说不知道哪个平台")
+    assert out == {
+        "cond": "说不知道哪个平台",
+        "action": "",
+        "jump": 0,
+        "text": "唔緊要，打開訂單看看就有平台名。",
+        "hold": True,
+    }
 
 
 def test_pick_gates_switch_closing_paused_empty_text():
-    assert _pick(enabled=False) is None  # BOK_BRANCH_CANNED=0 → 不走
+    assert _pick(canned_enabled=False) is None  # BOK_BRANCH_CANNED=0 → 不走
     assert _pick(closing=True) is None
     assert _pick(paused=True) is None
     assert _pick(user_text="   ") is None
@@ -103,7 +116,7 @@ def test_pick_wa_step_not_captured_skips():
         goal="加客戶WhatsApp", ref=wa_ref, user_text="为什么要加我",
         verdict=QUESTION, wa_captured=True,
     )
-    assert out is not None and out[0] == "平台流程需要，纯记录用途。"
+    assert out is not None and out["text"] == "平台流程需要，纯记录用途。"
 
 
 def test_pick_no_branch_step_zero_cost():
@@ -115,7 +128,8 @@ def test_pick_no_branch_step_zero_cost():
 def test_pick_renders_vars_and_skips_placeholder_residual():
     ref = "正稿\n如果客户问运费→您的运费是{金额}元。"
     hit = _pick(ref=ref, user_text="运费是多少", verdict=QUESTION, vars_map={"金额": "三十"})
-    assert hit == ("您的运费是三十元。", "问运费")
+    assert hit is not None
+    assert hit["text"] == "您的运费是三十元。" and hit["cond"] == "问运费"
     # 变量缺失 → 占位残留 → 落穿 LLM(pregen 同规则不会物化此条)
     assert _pick(ref=ref, user_text="运费是多少", verdict=QUESTION, vars_map={}) is None
 
@@ -149,6 +163,8 @@ def test_funnel_block_position_and_wiring():
     region = src[i_bc:i_graph]
     assert "BOK_BRANCH_CANNED" in region  # 总开关在闸里
     assert 'os.environ.get("BOK_BRANCH_CANNED", "1") == "1"' in region  # 默认开
+    assert "_branch_plan" in region  # A-②:罐头腿消费早段评估计划
+    assert "action_enabled=False" in region  # BOK_BRANCH_ACTION=0 回退档=纯罐头腿
     assert '_turn_origin["gen"] = "script"' in region
     assert '_turn_origin["provider"] = "branch-canned"' in region
     assert "BRANCH_CANNED hit" in region

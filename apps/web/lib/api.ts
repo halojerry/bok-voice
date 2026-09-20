@@ -137,6 +137,18 @@ export const api = {
     ),
   pregenQa: (ids: string[]) =>
     request<{ status: string }>("/api/qa/pregen", { method: "POST", body: JSON.stringify({ ids }) }),
+  // 分支应答罐头状态（流程画布答法抽屉，2026-09-20）：statuses 键=分支 resp 原文
+  // （含动作标记，逐字节），值 ok=已物化 / missing=缺录音 / ph=占位符残留（补录
+  // 无效，先改话术）。补录=branchPregen 按 resp 原文一条一条传（texts 缺省=全量）。
+  branchCannedStatus: (accountId = "acc-001") =>
+    request<{ available: boolean; statuses: Record<string, "ok" | "missing" | "ph">; generated_at: number }>(
+      `/api/tts/branch-canned-status?account_id=${encodeURIComponent(accountId)}`,
+    ),
+  branchPregen: (accountId: string, texts?: string[]) =>
+    request<{ status: string; pid?: number; log?: string }>("/api/tts/branch-pregen", {
+      method: "POST",
+      body: JSON.stringify({ account_id: accountId, texts: texts ?? [] }),
+    }),
   cannedAudioUrl: (id: string) => `${apiBase()}/api/qa/${id}/canned-audio`,
   // AI 聚类采纳（W3 自学习闭环）：apply=false 生成聚类计划（variants/fresh/junk 三组）；
   // apply=true 时 select=[{kind:"variant"|"fresh", i}] 指定采纳子集（缺省=全部）。
@@ -274,6 +286,35 @@ export const api = {
     request<Record<string, unknown>[]>(`/api/reports/qa-pairs?account_id=${encodeURIComponent(accountId)}&limit=${limit}`),
   // 工作台仪表盘聚合（2026-09-17）：并发/呼叫量/接通率/时长分布/坐席排行/标记。
   statsDashboard: () => request<Record<string, unknown>>("/api/stats/dashboard"),
+  // 快路覆盖率 + 漏网轮候选（L-① 学习驾驶舱）：A 线回复轮里脚本/录音直接播 vs
+  // AI 现场组织的占比，以及反复出现、值得采集为问答词条的客户原话。
+  llmGaps: (accountId: string, opts: { templateId?: string; minCalls?: number; limit?: number } = {}) => {
+    const q = new URLSearchParams({ account_id: accountId });
+    if (opts.templateId) q.set("template_id", opts.templateId);
+    if (opts.minCalls) q.set("min_calls", String(opts.minCalls));
+    if (opts.limit) q.set("limit", String(opts.limit));
+    return request<LlmGapsReport>(`/api/stats/llm-gaps?${q.toString()}`);
+  },
+  // 漏网轮候选 → 问答词条（人工确认后）：同问法已有词条时幂等返回 created=false。
+  adoptGapEntry: (body: {
+    accountId: string;
+    questionText: string;
+    answerText: string;
+    lang?: string;
+    templateId?: string;
+    step?: number;
+  }) =>
+    request<{ id: string; created: boolean }>("/api/stats/llm-gaps/adopt", {
+      method: "POST",
+      body: JSON.stringify({
+        account_id: body.accountId,
+        question_text: body.questionText,
+        answer_text: body.answerText,
+        lang: body.lang ?? "zh",
+        template_id: body.templateId ?? "",
+        step: body.step ?? 0,
+      }),
+    }),
   reportsCalls: () => request<Record<string, unknown>[]>("/api/reports/calls"),
   reportsUsage: () => request<Record<string, unknown>>("/api/reports/usage"),
   listTemplates: (accountId = "acc-001") => request<Record<string, unknown>[]>(`/api/templates?account_id=${accountId}`),
@@ -342,6 +383,31 @@ export type SetupStatus = {
   ready: boolean;
   models: SetupModelStatus[];
   error?: string;
+};
+
+// ---- 快路覆盖率 + 漏网轮候选（L-① 学习驾驶舱，GET /api/stats/llm-gaps 契约形状） ----
+export type LlmGapRow = {
+  customer_text: string;
+  count: number;
+  calls: number;
+  template_id: string;
+  step: number;
+  lang: string;
+  sample_answer: string;
+  sample_call_id: string;
+};
+
+export type LlmGapsReport = {
+  coverage: {
+    turns: number;
+    fastpath: number;
+    llm: number;
+    fastpath_ratio: number;
+    by_gen: Record<string, number>;
+    by_provider: Record<string, number>;
+  };
+  gaps: LlmGapRow[];
+  generated_at: number;
 };
 
 // ---- B4 会话与权限类型（契约预埋） ----

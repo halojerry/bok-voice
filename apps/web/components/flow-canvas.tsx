@@ -18,7 +18,8 @@ import { VarTextarea } from "@/components/var-insert";
 import type { GraphDoc } from "@/lib/qa-canvas";
 import {
   layoutFlow, parseStepRefParts, serializeStepRef, UNGROUPED_LANE,
-  type FlowNode, type StepRefParts, type StepBranch,
+  parseBranchAction, composeBranchResp, branchActionBadge, branchCannedMeta, BRANCH_ACTIONS,
+  type FlowNode, type StepRefParts, type StepBranch, type BranchAction, type BranchCannedStatus,
 } from "@/lib/flow-canvas";
 
 // 情绪下拉选项与 template-editor 表单同款（罐头物化烧进音频,实时回复不受影响）。
@@ -40,6 +41,14 @@ const HANDLE_STYLE = {
 
 const inputCls =
   "w-full rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--live)";
+
+// 分支动作徽标配色（画布 chip 用;refuse=红(结束通话) handoff=蓝(人工) jump=琥珀(跳步) hold=紫(停留)）。
+const ACTION_BADGE_CLS: Record<string, string> = {
+  refuse: "bg-red-100 text-red-700",
+  handoff: "bg-sky-100 text-sky-700",
+  jump: "bg-amber-100 text-amber-700",
+  hold: "bg-violet-100 text-violet-700",
+};
 
 // —— 纯渲染节点 ——
 // 步节点（工作流卡）：目的 + AI 说的话预览 + 徽标 + 「客户这样说」chip；点击开抽屉。
@@ -79,15 +88,24 @@ function FlowStepNode({ data }: NodeProps) {
         <div className="mt-1.5 border-t border-(--card-border) pt-1.5">
           <p className="text-[9px] muted">客户这样说时有专门应对</p>
           <div className="mt-0.5 flex flex-wrap gap-1">
-            {d.branches.map((b, i) => (
-              <span
-                key={i}
-                className="rounded-full border border-(--card-border) bg-background px-1.5 py-0.5 text-[10px]"
-                title={`客户${b.cond} → ${b.resp}`}
-              >
-                {b.cond || "(空)"}
-              </span>
-            ))}
+            {d.branches.map((b, i) => {
+              // 动作徽标（收线/转人工/跳第N步/留本步）;悬浮提示剥标记,不露「【收线】」原始串。
+              const badge = b.action ? branchActionBadge(b.action, b.jump) : "";
+              return (
+                <span
+                  key={i}
+                  className="inline-flex max-w-full items-center gap-1 rounded-full border border-(--card-border) bg-background px-1.5 py-0.5 text-[10px]"
+                  title={`客户${b.cond} → ${badge ? badge + "：" : ""}${parseBranchAction(b.resp).text}`}
+                >
+                  <span className="max-w-[10em] truncate">{b.cond || "(空)"}</span>
+                  {badge && (
+                    <span className={`shrink-0 rounded-sm px-1 leading-4 ${ACTION_BADGE_CLS[b.action] ?? "bg-muted"}`}>
+                      {badge}
+                    </span>
+                  )}
+                </span>
+              );
+            })}
             {d.branchMore > 0 && (
               <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] muted">+{d.branchMore}</span>
             )}
@@ -138,6 +156,12 @@ function AnswerDrawer(props: {
   scenes: string[];
   parts: StepRefParts;
   readOnly: boolean;
+  /** 分支罐头录音状态（key=分支 resp 原文含标记,逐字节）;缺省=不显示状态点。 */
+  branchCanned?: Record<string, BranchCannedStatus>;
+  /** 点「补录」回调;未传（或只读）则按钮不渲染。 */
+  onPregenBranch?: (resp: string) => void;
+  /** 模板语言（预留文案提示位,当前不参与渲染）。 */
+  currentTemplateLanguage?: string;
   onGoal: (v: string) => void;
   onScene: (v: string) => void;
   onSay: (v: boolean) => void;
@@ -217,33 +241,105 @@ function AnswerDrawer(props: {
         </div>
       </div>
       <div>
-        <span className="text-xs muted">客户如果这样说 → 就这样答（每条一行）</span>
-        <div className="mt-1 space-y-1">
-          {parts.branches.map((b, i) => (
-            <div key={i} className="flex items-center gap-1">
-              <input
-                className={inputCls}
-                value={b.cond}
-                disabled={readOnly}
-                placeholder="客户说…（如：问为什么赔）"
-                onChange={(e) => setBranch(i, { cond: e.target.value })}
-              />
-              <input
-                className={inputCls}
-                value={b.resp}
-                disabled={readOnly}
-                placeholder="AI 就答…"
-                onChange={(e) => setBranch(i, { resp: e.target.value })}
-              />
-              <button
-                className="btn-ghost shrink-0 px-1.5 py-0 text-xs text-red-600"
-                disabled={readOnly}
-                onClick={() => props.onParts({ ...parts, branches: parts.branches.filter((_, j) => j !== i) })}
-              >
-                删
-              </button>
-            </div>
-          ))}
+        <span className="text-xs muted">客户如果这样说 → AI 怎么做（每条一个应对）</span>
+        <div className="mt-1 space-y-1.5">
+          {parts.branches.map((b, i) => {
+            // 编辑面三件拆装：条件 / 动作（+跳步步号）/ 纯文本——动作标记只活在 resp 原文里,
+            // 文本域恒显示剥标记后的内容,编辑时 composeBranchResp 重组回 resp（切动作不丢字）。
+            const info = parseBranchAction(b.resp);
+            const canned = props.branchCanned ? props.branchCanned[b.resp] : undefined;
+            const cannedMeta = canned ? branchCannedMeta(canned) : null;
+            return (
+              <div key={i} className="space-y-1 rounded-lg border border-(--card-border) bg-background p-1.5">
+                <input
+                  className={inputCls}
+                  value={b.cond}
+                  disabled={readOnly}
+                  placeholder="客户说…（如：问为什么赔）"
+                  onChange={(e) => setBranch(i, { cond: e.target.value })}
+                />
+                <div className="flex items-center gap-1">
+                  <select
+                    className={inputCls}
+                    value={info.action}
+                    disabled={readOnly}
+                    title="AI 听到这句话后要做什么"
+                    onChange={(e) => {
+                      const next = e.target.value as BranchAction;
+                      // 切动作不丢文本;jump 步号沿用旧值（原本无标记/非 jump 时默认 1）。
+                      const step = info.action === "jump" ? info.step : 1;
+                      setBranch(i, { resp: composeBranchResp(next, step, info.text) });
+                    }}
+                  >
+                    {BRANCH_ACTIONS.map((a) => (
+                      <option key={a.value} value={a.value}>{a.label}</option>
+                    ))}
+                  </select>
+                  {info.action === "jump" && (
+                    <input
+                      type="number"
+                      className="w-16 shrink-0 rounded-lg border border-(--card-border) bg-transparent px-1.5 py-1 text-xs outline-hidden focus:border-(--live)"
+                      min={1}
+                      max={999}
+                      value={info.step || 1}
+                      disabled={readOnly}
+                      title="跳到第几步（从 1 开始数）"
+                      onChange={(e) =>
+                        setBranch(i, { resp: composeBranchResp("jump", Number(e.target.value), info.text) })
+                      }
+                    />
+                  )}
+                </div>
+                <p className="text-[10px] muted">
+                  {BRANCH_ACTIONS.find((a) => a.value === info.action)?.hint}
+                </p>
+                <textarea
+                  className={`h-14 resize-none ${inputCls}`}
+                  value={info.text}
+                  disabled={readOnly}
+                  placeholder="AI 就答…（一两句话，写要点即可）"
+                  onChange={(e) =>
+                    // 分支应答是单行注入（序列化按行拼 ref）,换行折叠成空格防劈裂分支行。
+                    setBranch(i, {
+                      resp: composeBranchResp(
+                        info.action,
+                        info.action === "jump" ? info.step : 0,
+                        e.target.value.replace(/[\r\n]+/g, " "),
+                      ),
+                    })
+                  }
+                />
+                <div className="flex items-center justify-between">
+                  {cannedMeta ? (
+                    <span className="inline-flex items-center gap-1 text-[10px] muted" title={cannedMeta.title}>
+                      <span className={`inline-block size-1.5 rounded-full ${cannedMeta.dot}`} aria-hidden />
+                      {cannedMeta.title}
+                    </span>
+                  ) : (
+                    <span />
+                  )}
+                  <span className="flex shrink-0 items-center gap-1">
+                    {canned === "missing" && props.onPregenBranch && !readOnly && (
+                      <button
+                        className="btn-ghost px-1.5 py-0 text-[10px]"
+                        title="给这条应对补录罐头音频（客户这样说时直接播录音，更快更稳）"
+                        onClick={() => props.onPregenBranch?.(b.resp)}
+                      >
+                        补录
+                      </button>
+                    )}
+                    <button
+                      className="btn-ghost shrink-0 px-1.5 py-0 text-xs text-red-600"
+                      disabled={readOnly}
+                      onClick={() => props.onParts({ ...parts, branches: parts.branches.filter((_, j) => j !== i) })}
+                    >
+                      删
+                    </button>
+                  </span>
+                </div>
+              </div>
+            );
+          })}
           <button
             className="btn-ghost px-2 py-0.5 text-xs"
             disabled={readOnly}
@@ -275,6 +371,13 @@ export default function FlowCanvas(props: {
   /** 步骤草稿（工作站层持有）;本组件只上报变更,不做保存。 */
   draft: FlowStep[];
   onDraftChange: (next: FlowStep[]) => void;
+  /** 分支罐头录音状态（只读渲染,本组件不发请求;key=分支 resp 原文含标记,逐字节）。
+   * 缺省=不显示录音状态,旧调用零变化。 */
+  branchCanned?: Record<string, BranchCannedStatus>;
+  /** 点「补录」时回调（参数=该分支 resp 原文含标记）;未传则按钮不渲染。 */
+  onPregenBranch?: (resp: string) => void;
+  /** 模板语言（预留文案提示位,当前不参与渲染）。 */
+  currentTemplateLanguage?: string;
 }) {
   const { graph, draft } = props;
   const session = useSession();
@@ -436,6 +539,9 @@ export default function FlowCanvas(props: {
             scenes={scenes}
             parts={parts}
             readOnly={readOnly}
+            branchCanned={props.branchCanned}
+            onPregenBranch={props.onPregenBranch}
+            currentTemplateLanguage={props.currentTemplateLanguage}
             onGoal={(v) => updateStep(drawerIdx, { goal: v })}
             onScene={(v) => updateStep(drawerIdx, { scene: v })}
             onSay={(v) => updateStep(drawerIdx, { say: v })}

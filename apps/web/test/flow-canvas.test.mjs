@@ -1,7 +1,9 @@
 // lib/flow-canvas.ts 纯函数单测（W2 T2 流程画布;2026-09-20 纵向工作流改版）：
 // step.ref 三件拆装 round-trip
 // （语义镜像 agent flow.py _BRANCH_LINE_RE/_NOTE_LINE_RE/parse_step_ref）、flow.py
-// 边角语法、scene 经 jsonToSteps/stepsToJson 往返不丢、纵向布局确定性。
+// 边角语法、scene 经 jsonToSteps/stepsToJson 往返不丢、纵向布局确定性、
+// 分支动作前缀（_BRANCH_ACTION_RE/parse_branch_action 镜像:拆装/重组/往返不变量/
+// 带标记 ref 无损/布局 chip 动作派生/录音状态元数据）。
 //
 // 装配照 qa-canvas.test.mjs：lib/flow-canvas.ts 零 import,单文件转译直载。
 // 另加一份 components/template-editor.tsx 的真实代码装载（scene 往返守卫要跑
@@ -308,4 +310,126 @@ test("layoutFlow：纵向脊柱全相邻对、意图左栏条件边/分支 chip/
   assert.equal(bare.edges.filter((e) => e.kind === "jump").length, 0);
   assert.equal(bare.edges.filter((e) => e.kind === "thenjump").length, 0);
   assert.equal(bare.edges.filter((e) => e.kind === "spine").length, 2);
+});
+
+// ---- ⑥ 分支动作前缀（A-③;镜像 flow.py _BRANCH_ACTION_RE/parse_branch_action） ----
+test("parseBranchAction：五种动作标记 + 无标记/空串 + 空白容错 + 跳第0步回落 + 空文本", () => {
+  // 五种标记（挂断与收线同义=refuse;jump 的 step 只在 action==="jump" 时有意义）。
+  assert.deepEqual(fc.parseBranchAction("【收线】唔好意思打搅咗"), { action: "refuse", step: 0, text: "唔好意思打搅咗" });
+  assert.deepEqual(fc.parseBranchAction("【挂断】拜拜"), { action: "refuse", step: 0, text: "拜拜" });
+  assert.deepEqual(fc.parseBranchAction("【转人工】我帮您转接同事"), { action: "handoff", step: 0, text: "我帮您转接同事" });
+  assert.deepEqual(fc.parseBranchAction("【跳第3步】直接讲办理"), { action: "jump", step: 3, text: "直接讲办理" });
+  assert.deepEqual(fc.parseBranchAction("【留本步】好嘅，我哋慢慢嚟"), { action: "hold", step: 0, text: "好嘅，我哋慢慢嚟" });
+  // 无标记/空串：resp 原样（逐字节,不 trim——无标记分支零改写铁律）。
+  assert.deepEqual(fc.parseBranchAction("就正常答"), { action: "", step: 0, text: "就正常答" });
+  assert.deepEqual(fc.parseBranchAction("  前置空白也原样  "), { action: "", step: 0, text: "  前置空白也原样  " });
+  assert.deepEqual(fc.parseBranchAction(""), { action: "", step: 0, text: "" });
+  // 标记内空白容错（flow.py \s* 同款）。
+  assert.deepEqual(fc.parseBranchAction("【 收线 】 唔好意思"), { action: "refuse", step: 0, text: "唔好意思" });
+  assert.deepEqual(fc.parseBranchAction("【跳第 12 步】跳过去"), { action: "jump", step: 12, text: "跳过去" });
+  // 跳第0步：标记已消费但无动作。
+  assert.deepEqual(fc.parseBranchAction("【跳第0步】就在这步答"), { action: "", step: 0, text: "就在这步答" });
+  // 标记后空文本（「【收线】」单独作应答）。
+  assert.deepEqual(fc.parseBranchAction("【收线】"), { action: "refuse", step: 0, text: "" });
+  // 步号 1..999 闭区间;>3 位整体不认作标记,resp 原样保留。
+  assert.deepEqual(fc.parseBranchAction("【跳第999步】x"), { action: "jump", step: 999, text: "x" });
+  assert.deepEqual(fc.parseBranchAction("【跳第1234步】太远"), { action: "", step: 0, text: "【跳第1234步】太远" });
+});
+
+test("composeBranchResp：标记重组 + 空动作逐字节零改写 + jump 步号钳制", () => {
+  assert.equal(fc.composeBranchResp("", 0, "就正常答"), "就正常答");
+  // 空动作恒逐字节=输入 text（含空白,零改写——抽屉切回「按内容回答」剥标记保文本）。
+  assert.equal(fc.composeBranchResp("", 7, "  保留空白  "), "  保留空白  ");
+  assert.equal(fc.composeBranchResp("refuse", 0, "拜拜"), "【收线】拜拜");
+  assert.equal(fc.composeBranchResp("handoff", 0, "转接同事"), "【转人工】转接同事");
+  assert.equal(fc.composeBranchResp("hold", 0, "慢慢嚟"), "【留本步】慢慢嚟");
+  assert.equal(fc.composeBranchResp("jump", 3, "直接讲"), "【跳第3步】直接讲");
+  // jump 步号钳制：非 1..999 整数一律按 1。
+  assert.equal(fc.composeBranchResp("jump", 0, "x"), "【跳第1步】x");
+  assert.equal(fc.composeBranchResp("jump", 1000, "x"), "【跳第1步】x");
+  assert.equal(fc.composeBranchResp("jump", 999, "x"), "【跳第999步】x");
+  assert.equal(fc.composeBranchResp("jump", 5.5, "x"), "【跳第1步】x");
+  assert.equal(fc.composeBranchResp("jump", NaN, "x"), "【跳第1步】x");
+});
+
+test("compose↔parse 往返不变量：逐条 action 参数化（text 取 trim 后逐件相等）", () => {
+  const cases = [
+    ["", 0], ["refuse", 0], ["handoff", 0], ["hold", 0],
+    ["jump", 1], ["jump", 3], ["jump", 999],
+  ];
+  for (const [a, n] of cases) {
+    const t = "就这么答";
+    const info = fc.parseBranchAction(fc.composeBranchResp(a, n, t));
+    assert.deepEqual(info, { action: a, step: a === "jump" ? n : 0, text: t }, `action=${a}`);
+  }
+});
+
+test("round-trip ⑥：带动作标记的 ref 仍逐件无损（标记在 resp 原样回写,标记不进 script）", () => {
+  const ref = [
+    "正稿行不动",
+    "如果客户骂人 → 【收线】唔好意思打搅咗，祝您生活愉快",
+    "如果客户要人工 → 【转人工】我帮您转接同事处理",
+    "如果客户赶时间 → 【跳第3步】直接讲办理",
+    "如果客户重听 → 【留本步】好嘅，我哋慢慢嚟",
+    "如果客户不理 → 【挂断】拜拜",
+    "注意：收线前必须道歉一次",
+  ].join("\n");
+  const parts = fc.parseStepRefParts(ref);
+  assert.equal(parts.script, "正稿行不动");
+  assert.deepEqual(parts.branches.map((b) => b.resp), [
+    "【收线】唔好意思打搅咗，祝您生活愉快",
+    "【转人工】我帮您转接同事处理",
+    "【跳第3步】直接讲办理",
+    "【留本步】好嘅，我哋慢慢嚟",
+    "【挂断】拜拜",
+  ]);
+  assert.equal(parts.notes, "收线前必须道歉一次");
+  assertRoundTrip(ref);
+});
+
+test("layoutFlow：步节点分支 data 带 action/jump（带标记 ref 派生正确）", () => {
+  const steps = [
+    {
+      goal: "s",
+      ref: [
+        "正稿行",
+        "如果客户骂人 → 【收线】唔好意思打搅咗",
+        "如果客户要人工 → 【转人工】我帮您转接同事",
+        "如果客户赶时间 → 【跳第2步】直接讲办理",
+      ].join("\n"),
+    },
+  ];
+  const lay = fc.layoutFlow(steps);
+  const node = lay.nodes.find((n) => n.id === "fstep:0");
+  assert.deepEqual(node.branches, [
+    { cond: "骂人", resp: "【收线】唔好意思打搅咗", action: "refuse", jump: 0 },
+    { cond: "要人工", resp: "【转人工】我帮您转接同事", action: "handoff", jump: 0 },
+    { cond: "赶时间", resp: "【跳第2步】直接讲办理", action: "jump", jump: 2 },
+  ]);
+  // 有正稿：scriptFirst=正稿首行,不受分支标记影响;resp 恒为原文含标记。
+  assert.equal(node.scriptFirst, "正稿行");
+  // 无标记分支：action=""/jump=0,与旧形状兼容面（cond/resp 两键同值）。
+  const plain = fc.layoutFlow([{ goal: "s", ref: "正稿\n如果客户嫌慢 → 就安抚" }]).nodes.find((n) => n.id === "fstep:0");
+  assert.deepEqual(plain.branches, [{ cond: "嫌慢", resp: "就安抚", action: "", jump: 0 }]);
+});
+
+test("layoutFlow：无正稿时首分支摘要剥动作标记（画布不露「【收线】」原始串）", () => {
+  const node = fc.layoutFlow([{ goal: "s", ref: "如果客户挂电话 → 【收线】唔好意思打搅咗" }])
+    .nodes.find((n) => n.id === "fstep:0");
+  assert.equal(node.scriptFirst, "如果客户挂电话→唔好意思打搅咗");
+  // 标记后空文本：退动作徽标文案,仍是人话不是标记串。
+  const bare = fc.layoutFlow([{ goal: "s", ref: "如果客户唔讲 → 【收线】" }])
+    .nodes.find((n) => n.id === "fstep:0");
+  assert.equal(bare.scriptFirst, "如果客户唔讲→收线");
+});
+
+test("BRANCH_ACTIONS 下拉契约：首项=默认空动作、顺序即下拉序、文案齐;branchCannedMeta 三态", () => {
+  assert.equal(fc.BRANCH_ACTIONS.length, 5);
+  assert.deepEqual(fc.BRANCH_ACTIONS.map((a) => a.value), ["", "refuse", "handoff", "jump", "hold"]);
+  for (const a of fc.BRANCH_ACTIONS) {
+    assert.ok(a.label.length > 0 && a.hint.length > 0, `value=${a.value} 文案缺失`);
+  }
+  assert.deepEqual(fc.branchCannedMeta("ok"), { dot: "bg-emerald-500", title: "已有录音" });
+  assert.deepEqual(fc.branchCannedMeta("missing"), { dot: "bg-zinc-400", title: "未录" });
+  assert.deepEqual(fc.branchCannedMeta("ph"), { dot: "bg-amber-400", title: "含变量，无法预录" });
 });

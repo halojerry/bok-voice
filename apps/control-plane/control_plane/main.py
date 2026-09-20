@@ -53,6 +53,7 @@ from .permissions import GRANTABLE_PERMISSIONS, PAGE_PERMISSIONS, effective_perm
 from .pregen import persona_pregen_status
 from . import pregen as pregen_mod
 from . import qa_cluster as qa_cluster_mod
+from . import gap_mining
 from .auth import (
     Identity,
     JWT_TTL_S,
@@ -3868,6 +3869,42 @@ def qa_pregen_ep(payload: dict, request: Request) -> dict:
     return out
 
 
+@app.get("/api/tts/branch-canned-status")
+def branch_canned_status_ep(request: Request, account_id: str = "acc-001") -> dict:
+    """分支应答罐头物化状态(透传 pregen_tts --branch-status;流程画布答法抽屉用)。
+
+    与 qa_canned_status_ep 同款闸链(_gate_page+scoped_account);TTL 缓存按账号
+    分键(pregen.branch_canned_status)。statuses 键=分支 resp 原文(含动作标记,
+    逐字节),值 ok=已物化 / missing=缺录音 / ph=占位符残留(补录无效,先改话术)。
+    """
+    _gate_page(request, "templates")
+    account_id = scoped_account(request, account_id)
+    out = pregen_mod.branch_canned_status(
+        str(request.base_url).rstrip("/"), account_id=account_id
+    )
+    return {
+        "available": out["available"],
+        "statuses": out["statuses"],
+        "generated_at": out["generated_at"],
+    }
+
+
+@app.post("/api/tts/branch-pregen")
+def branch_pregen_ep(payload: dict, request: Request) -> dict:
+    """手动触发 --branches 分支应答物化(可限 texts,缺省=全量分支);烧云配额
+    操作,与 /api/qa/pregen 同闸同审计。texts 一条一条传分支 resp 原文(含动作
+    标记,即 branch-canned-status 的键)。"""
+    require_role(request, "admin", "root")
+    account_id = scoped_account(request, str(payload.get("account_id") or ""))
+    texts = [str(x) for x in (payload.get("texts") or []) if str(x or "").strip()]
+    out = pregen_mod.branch_pregen_spawn(
+        str(request.base_url).rstrip("/"), account_id, texts or None
+    )
+    _audit("branch.pregen", subject_type="template", account_id=account_id,
+           detail={"count": len(texts), "status": out.get("status")})
+    return out
+
+
 @app.post("/api/qa/cluster")
 def qa_cluster_ep(req: QaClusterRequest, request: Request, account_id: str = "acc-001") -> dict:
     """自学习聚类(W3-T1,2026-09-19):dry=挖掘→LLM 三列计划;apply=true 按 select 采纳入库。
@@ -4415,6 +4452,110 @@ def stats_dashboard(request: Request, account_id: str = "acc-001") -> dict:
         "tags": {"disposition": disposition_counts, "whatsapp": whatsapp_counts},
         "todo": _dashboard_todo(_repo()),
     }
+
+
+# ---- 快路覆盖率 + LLM 漏网轮(L-①,2026-09-20):只读驾驶舱 + 人工确认采集 ----
+# 逻辑全在 gap_mining runner(端点瘦,同 qa_cluster 分工);口径与 gen/provider
+# 取值面(含 graph-jump 係 LLM 轮的证据行号)见该模块 docstring。
+
+
+class GapAdoptRequest(BaseModel):
+    """漏网轮候选 → 问答词条(人工确认后)。step=1-based 话术步(溯源展示/审计)。"""
+
+    question_text: str
+    answer_text: str
+    lang: str = "zh"
+    template_id: str = ""
+    step: int = 0
+    account_id: str = "acc-001"
+
+
+@app.get("/api/stats/llm-gaps")
+def stats_llm_gaps(
+    request: Request,
+    account_id: str = "acc-001",
+    template_id: str = "",
+    min_calls: int = 3,
+    limit: int = 30,
+) -> dict:
+    """快路覆盖率 + 漏网轮候选(turns 账本只读聚合,零 LLM)。
+
+    闸键依据:现有 /api/stats/* 同族唯一端点 dashboard 用 _gate_page("calls"),
+    因其服务 /calls 工作台;本端点服务 studio「场景学习」tab(reports 键门控),
+    数据源与学习报告同族端点 /api/reports/qa-pairs(iter_call_conversations/
+    turns 账本挖掘)同源同页面——对齐 reports 键 + scoped_account 收窄。
+    """
+    _gate_page(request, "reports")
+    account_id = scoped_account(request, account_id)
+    return gap_mining.build_llm_gap_report(
+        _repo(),
+        account_id=account_id,
+        template_id=template_id.strip(),
+        min_calls=max(1, int(min_calls)),
+        limit=max(1, min(int(limit), 200)),
+    )
+
+
+@app.post("/api/stats/llm-gaps/adopt")
+def adopt_llm_gap(req: GapAdoptRequest, request: Request) -> JSONResponse:
+    """人工确认后把漏网轮候选采集为问答词条(201 created / 200 幂等既有)。
+
+    鉴权/盖章/审计与 POST /api/qa-entries 逐字对齐:_gate_page("qa") + B3
+    owner 盖章(user→本人、admin→共享、root 随 body)+ 审计 qa_entry.create,
+    detail.source="gap-adopt" 区分来路。幂等:同账号同 lang 归一同问法已存在
+    → 不重复创建,返回既有 id(created=false)。step 是 1-based 展示/审计值,
+    不转 step 作用域:运行时 qa 步过滤的 int(0 or -1) 特性会让 step_index=0
+    的词条永不命中,且同族挖掘入库(mine/cluster)条目一律 scope=global。
+    """
+    _gate_page(request, "qa")
+    question = req.question_text.strip()
+    answer = req.answer_text.strip()
+    if not question or not answer:
+        raise HTTPException(status_code=400, detail="问题与回答都不能为空")
+    identity = current_identity(request)
+    account_id = req.account_id
+    owner = ""
+    if identity is not None and identity.role != "root":
+        # B3 同款:非 root 强制本账号;user 建的 owner 强制本人(admin 默认共享)。
+        account_id = identity.account_id
+        if identity.role == "user":
+            owner = identity.user_id
+    existing = gap_mining.find_existing_qa_entry(_repo(), account_id, question, req.lang)
+    if existing is not None:
+        return JSONResponse(
+            status_code=200,
+            content={"id": str(existing.get("id") or ""), "created": False},
+        )
+    row = _repo().create_qa_entry(
+        {
+            "question_text": question,
+            "answer_text": answer,
+            "lang": req.lang or "zh",
+            "scope": "global",
+            "step_index": -1,
+            "template_id": req.template_id.strip(),
+            "account_id": account_id,
+            "owner_user_id": owner,
+            "source": "gap-adopt",
+            "enabled": True,
+        }
+    )
+    _audit(
+        "qa_entry.create",
+        subject_type="qa_entry",
+        subject_id=str(row.get("id") or ""),
+        account_id=account_id,
+        detail={
+            "owner_user_id": str(row.get("owner_user_id") or ""),
+            "source": "gap-adopt",
+            "step": max(0, int(req.step or 0)),
+            "template_id": req.template_id.strip(),
+        },
+    )
+    return JSONResponse(
+        status_code=201,
+        content={"id": str(row.get("id") or ""), "created": True},
+    )
 
 
 @app.get("/api/insights")

@@ -29,6 +29,9 @@ export type CanvasFlowStep = {
 
 export type StepBranch = { cond: string; resp: string };
 
+/** 步节点分支 chip 行 = StepBranch + 动作派生（resp 恒为原文含标记,抽屉同源）。 */
+export type StepNodeBranch = StepBranch & { action: BranchAction; jump: number };
+
 export type StepRefParts = {
   /** 正稿 + 并入的其余非分支非注意行（\n 连接,保序,未知行原样）。 */
   script: string;
@@ -111,6 +114,92 @@ export function serializeStepRef(parts: StepRefParts): string {
   return lines.join("\n");
 }
 
+// —— 分支动作前缀（2026-09-20 A-③;语义镜像 flow.py `_BRANCH_ACTION_RE`/`parse_branch_action`）——
+// 分支应答（resp）首部可选动作标记：【收线】/【挂断】=礼貌收线、【转人工】=打铃通知人工
+// （AI 照常兜话不打断）、【跳第N步】=跳到第 N 步（1-based）、【留本步】=明确留本步。
+// 标记只活在 branches[].resp 原文里（round-trip 无损依赖它）;抽屉编辑面拆成
+// 动作下拉+步号+纯文本 三件,编辑时重组回 resp——标记绝不进 script、不进画布摘要。
+
+/** 分支动作（""=按内容回答,resp 无标记）。 */
+export type BranchAction = "" | "hold" | "refuse" | "handoff" | "jump";
+
+export type BranchActionInfo = { action: BranchAction; step: number; text: string };
+
+/** flow.py `_BRANCH_ACTION_RE` 逐语义移植：^【\s*(kind)\s*】\s*;kind 内部自带空白容错
+ * （【 收线 】/【跳第 3 步】）;\d{1,3} 限 1..999——4 位以上步号整体不认作标记（原样保留）。 */
+const BRANCH_ACTION_RE = /^【\s*(收线|挂断|转人工|跳第\s*(\d{1,3})\s*步|留本步)\s*】\s*/;
+
+/** jump 步号钳制：非 1..999 整数一律按 1（引擎侧 jump_to 另有越界钳制,这里是编辑面保底）。 */
+function clampJumpStep(step: number): number {
+  const n = Number(step);
+  return Number.isInteger(n) && n >= 1 && n <= 999 ? n : 1;
+}
+
+/** 拆分支应答首部动作标记 → (action, step, 纯文本)。规则（与 flow.py 逐语义一致）：
+ * 收线|挂断→("refuse",0,余文);转人工→("handoff",0,余文);留本步→("hold",0,余文);
+ * 跳第N步 且 N≥1→("jump",N,余文);跳第0步→标记已消费但无动作("",0,余文);
+ * 无标记/空→("",0,resp 原样,逐字节不动)。step 只在 action==="jump" 时有意义。 */
+export function parseBranchAction(resp: string): BranchActionInfo {
+  const s = String(resp ?? "");
+  const m = s.match(BRANCH_ACTION_RE);
+  if (!m) return { action: "", step: 0, text: s };
+  const kind = String(m[1] ?? "");
+  const rest = s.slice(m[0].length);
+  if (kind === "收线" || kind === "挂断") return { action: "refuse", step: 0, text: rest };
+  if (kind === "转人工") return { action: "handoff", step: 0, text: rest };
+  if (kind === "留本步") return { action: "hold", step: 0, text: rest };
+  const n = Number(m[2] ?? "0");
+  if (!(n >= 1)) return { action: "", step: 0, text: rest }; // 跳第0步：标记消费、无动作
+  return { action: "jump", step: n, text: rest };
+}
+
+/** parseBranchAction 的逆操作：动作+步号+文本 重组 resp 原文。
+ * action==="" 恒逐字节等于 text（无标记分支零改写）;jump 步号非 1..999 整数按 1 钳制。
+ * 不变量：parseBranchAction(composeBranchResp(a,n,t)) 与
+ * {action:a, step:(a==="jump"?钳制后n:0), text:t.trim()} 一致（t 已 trim 时逐件相等）。 */
+export function composeBranchResp(action: BranchAction, step: number, text: string): string {
+  const t = String(text ?? "");
+  switch (action) {
+    case "refuse": return "【收线】" + t;
+    case "handoff": return "【转人工】" + t;
+    case "hold": return "【留本步】" + t;
+    case "jump": return "【跳第" + clampJumpStep(step) + "步】" + t;
+    default: return t;
+  }
+}
+
+/** 答法抽屉动作下拉（顺序即下拉顺序;首项=默认项）。 */
+export const BRANCH_ACTIONS: { value: BranchAction; label: string; hint: string }[] = [
+  { value: "", label: "按内容回答（默认）", hint: "AI 现场组织语言，命中率高的话可以补录成录音" },
+  { value: "refuse", label: "礼貌收线", hint: "道歉/再见一句，然后结束通话，不再推销" },
+  { value: "handoff", label: "通知人工", hint: "给人工坐席打铃，AI 继续照常应答，不打断通话" },
+  { value: "jump", label: "跳到第 N 步", hint: "直接切换到指定步骤继续，本轮不再按顺序推进" },
+  { value: "hold", label: "留在本步", hint: "本轮不往下推进，先处理客户这句话" },
+];
+
+/** 步节点分支 chip 的动作徽标文案（无动作=空串不渲染;jump 带「跳第N步」）。 */
+export function branchActionBadge(action: BranchAction, step: number): string {
+  switch (action) {
+    case "refuse": return "收线";
+    case "handoff": return "转人工";
+    case "hold": return "留本步";
+    case "jump": return "跳第" + clampJumpStep(step) + "步";
+    default: return "";
+  }
+}
+
+/** 分支罐头录音状态（组件只读渲染,不发请求;key=分支 resp 原文含标记,逐字节）。 */
+export type BranchCannedStatus = "ok" | "missing" | "ph";
+
+/** 录音状态展示元数据（点色类名+提示文案;抽纯函数便于单测）。 */
+export function branchCannedMeta(status: BranchCannedStatus): { dot: string; title: string } {
+  switch (status) {
+    case "ok": return { dot: "bg-emerald-500", title: "已有录音" };
+    case "missing": return { dot: "bg-zinc-400", title: "未录" };
+    default: return { dot: "bg-amber-400", title: "含变量，无法预录" };
+  }
+}
+
 /** 场景缺省名（抽屉场景下拉的空档;scene 仍是 steps_json 纯数据位,不参与布局）。 */
 export const UNGROUPED_LANE = "未分组";
 
@@ -164,8 +253,8 @@ export type FlowNode =
       say: boolean;
       emotion: string;
       scene: string;
-      /** 答法分支（答法抽屉同源数据;节点上渲染为条件 chip,上限外折叠计数）。 */
-      branches: StepBranch[];
+      /** 答法分支（答法抽屉同源数据;resp 原文含动作标记,节点上渲染为条件 chip,上限外折叠计数）。 */
+      branches: StepNodeBranch[];
       branchMore: number;
       /** jump_step 绑定入边数（徽标）。 */
       jumpIn: number;
@@ -217,11 +306,19 @@ export function layoutFlow(
 
   steps.forEach((s, i) => {
     const parts = parseStepRefParts(s.ref);
-    // 节点预览：正稿首行;无正稿（纯分支 ref）退首分支行,画布上仍有可读摘要。
+    // 分支 chip 行：动作标记拆成 action/jump 派生位（resp 原文不动,抽屉 round-trip 依赖）。
+    const branchNodes: StepNodeBranch[] = parts.branches.slice(0, BRANCH_CHIP_LIMIT).map((b) => {
+      const info = parseBranchAction(b.resp);
+      return { ...b, action: info.action, jump: info.step };
+    });
+    // 节点预览：正稿首行;无正稿（纯分支 ref）退首分支行,画布上仍有可读摘要——
+    // 动作标记剥掉不进摘要（画布上不出现「【收线】」原始标记串）,标记应答为空时退动作徽标文案。
     const firstBranch = parts.branches[0];
-    const scriptFirst =
-      (parts.script.split("\n")[0] ?? "") ||
-      (firstBranch ? "如果客户" + firstBranch.cond + "→" + firstBranch.resp : "");
+    let scriptFirst = parts.script.split("\n")[0] ?? "";
+    if (!scriptFirst && firstBranch) {
+      const info = parseBranchAction(firstBranch.resp);
+      scriptFirst = "如果客户" + firstBranch.cond + "→" + (info.text || branchActionBadge(info.action, info.step));
+    }
     nodes.push({
       id: stepId(i),
       kind: "step",
@@ -233,7 +330,7 @@ export function layoutFlow(
       say: s.say === true,
       emotion: s.emotion ?? "",
       scene: (s.scene ?? "").trim(),
-      branches: parts.branches.slice(0, BRANCH_CHIP_LIMIT),
+      branches: branchNodes,
       branchMore: Math.max(0, parts.branches.length - BRANCH_CHIP_LIMIT),
       jumpIn: 0,
     });

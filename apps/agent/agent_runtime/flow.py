@@ -104,6 +104,59 @@ _BRANCH_LINE_RE = re.compile(
 )
 _NOTE_LINE_RE = re.compile(r"^(?:注意|Notes?)\s*[:：]\s*(?P<note>.+)$", re.IGNORECASE)
 
+# ---- 分支动作前缀(2026-09-20 路线 A-②):应答首部可选的引擎动作标记 ----
+# 「如果客户打错电话→【收线】唔好意思打搅咗…」里应答首部的【…】不是台词,
+# 是给引擎的一等出口(收线/转人工/跳步/留本步)——匹配命中后由
+# parse_branch_action 把标记**消费掉**,余下文本才是可念/可播的应答。
+# 画布 round-trip 无损不靠这里:branches 仍存 (cond, resp) 原文(含标记),
+# 本层只在运行时拆动作,parse_step_ref/_BRANCH_LINE_RE 语义零改动。
+# 动作值与 agent.py 派发臂一一对应:
+#   hold    【留本步】  本轮流程不推进(规则推进让位)
+#   refuse  【收线】/【挂断】  进收尾态+定时挂断(与 verdict==REFUSE 车道同源)
+#   handoff 【转人工】  打铃不抢话(话术图 notify_human 同款,不抑制推进)
+#   jump    【跳第N步】 跳到第 N 步(镜像话术图 jump_step 副作用包)
+BRANCH_ACTION_HOLD = "hold"
+BRANCH_ACTION_REFUSE = "refuse"
+BRANCH_ACTION_HANDOFF = "handoff"
+BRANCH_ACTION_JUMP = "jump"
+# 标记内空白容错:【 收线 】/【跳第 3 步】都算命中(\s*);step 限 1-3 位数字,
+# 越界值(如「跳第0步」)在 parse_branch_action 里退回默认语义而非报错——
+# 运营手滑不该把整条分支变成引擎不认的死行,更不该把标记念出声。
+_BRANCH_ACTION_RE = re.compile(
+    r"^【\s*(?P<kind>收线|挂断|转人工|跳第\s*(?P<step>\d{1,3})\s*步|留本步)\s*】\s*"
+)
+
+
+def parse_branch_action(resp: str) -> tuple[str, int, str]:
+    """应答首部动作前缀 → (action, step, text)。识别到标记一律消费标记。
+
+    - 【收线】/【挂断】→ ("refuse", 0, 余下文本.strip())——收线台词走直念,
+      剥首尾空白
+    - 【转人工】→ ("handoff", 0, 余下文本)
+    - 【跳第N步】→ ("jump", N, 余下文本);N < 1(如「跳第0步」)→ ("", 0,
+      余下文本):标记已消费、退回默认语义——既不跳步,也不把「【跳第0步】」
+      念出声
+    - 【留本步】→ ("hold", 0, 余下文本)
+    - 无标记 / resp 为空 → ("", 0, resp 原样):逐字节不动(现状语义)
+    """
+    s = str(resp or "")
+    m = _BRANCH_ACTION_RE.match(s)
+    if not m:
+        return ("", 0, s)
+    kind = m.group("kind")
+    rest = s[m.end():]
+    if kind in ("收线", "挂断"):
+        return (BRANCH_ACTION_REFUSE, 0, rest.strip())
+    if kind == "转人工":
+        return (BRANCH_ACTION_HANDOFF, 0, rest)
+    if kind == "留本步":
+        return (BRANCH_ACTION_HOLD, 0, rest)
+    # 跳第N步:N<1(含 0/前导零以外的非法组合交给 \d{1,3} 已拦)退默认语义
+    step = int(m.group("step") or 0)
+    if step < 1:
+        return ("", 0, rest)
+    return (BRANCH_ACTION_JUMP, step, rest)
+
 # 未知指令行告警(2026-09-13):行内带「→」但行头不被识别(会被静默丢弃)时打一次
 # 告警——运营写了引擎不认的行式(如「客户报出号码(数字串)→复述确认」),静默丢弃
 # =指令悄悄失效(0913 审计:EN 模板 "If the customer…" 整层分支曾因此从未生效)。

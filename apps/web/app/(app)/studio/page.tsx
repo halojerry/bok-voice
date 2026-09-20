@@ -27,6 +27,7 @@ import TemplateEditor, {
 import FlowCanvas from "@/components/flow-canvas";
 import StepsListEditor from "@/components/steps-list-editor";
 import StudyTab from "@/components/study-tab";
+import GapMining from "@/components/gap-mining";
 import TemplateVarsTab from "@/components/template-vars";
 import CannedAuditionCard from "@/components/canned-audition";
 import IntentRulesCard from "@/components/intent-rules-card";
@@ -300,6 +301,48 @@ export default function StudioPage() {
     [qaRows, selId],
   );
 
+  // ---- 分支罐头状态（主流程画布答法抽屉，2026-09-20）：statuses 键=分支 resp
+  // 原文（含动作标记）。进主流程 tab / 换模板 / 换账号拉一次（TTL 缓存在 CP 侧，
+  // 补录后 branchRev+1 定点刷一次，不轮询）。拉取失败=无徽标降级，不阻塞画布。 ----
+  const [branchCanned, setBranchCanned] = useState<Record<string, "ok" | "missing" | "ph">>({});
+  const [branchRev, setBranchRev] = useState(0);
+  const [branchNote, setBranchNote] = useState("");
+  useEffect(() => {
+    if (tab !== "flow" || !selId) return;
+    let alive = true;
+    api.branchCannedStatus(accountId)
+      .then((res) => {
+        if (alive) setBranchCanned(res?.statuses ?? {});
+      })
+      .catch(() => {
+        if (alive) setBranchCanned({});
+      });
+    return () => {
+      alive = false;
+    };
+  }, [tab, selId, accountId, branchRev]);
+
+  /** 分支一键补录（答法抽屉「补录这条」）：queued→人话提示+5s 后刷一次状态。 */
+  async function pregenBranch(resp: string) {
+    setBranchNote("");
+    try {
+      const res = await api.branchPregen(accountId, [resp]);
+      if (res?.status === "queued") {
+        setBranchNote("补录任务已排队，AI 正在生成这条录音，稍后自动刷新状态。");
+        window.setTimeout(() => {
+          setBranchNote("");
+          setBranchRev((v) => v + 1);
+        }, 5000);
+      } else if (res?.status === "already_running") {
+        setBranchNote("上一批补录还在进行中，等它跑完再试。");
+      } else {
+        setBranchNote(`补录没有启动（${res?.status ?? "unknown"}）。`);
+      }
+    } catch (e) {
+      setBranchNote(`补录失败：${String(e)}`);
+    }
+  }
+
   // ---- 通话日志 tab：全量拉取后客户端按模板过滤（照 calls 页惯例） ----
   const [callRows, setCallRows] = useState<Record<string, unknown>[]>([]);
   const [callsLoading, setCallsLoading] = useState(false);
@@ -507,9 +550,17 @@ export default function StudioPage() {
                     {label}
                   </button>
                 ))}
+                {branchNote && <span className="ml-auto text-xs text-amber-700">{branchNote}</span>}
               </div>
               {flowView === "canvas" ? (
-                <FlowCanvas tpl={tplRow} graph={graph} draft={stepsDraft} onDraftChange={changeSteps} />
+                <FlowCanvas
+                  tpl={tplRow}
+                  graph={graph}
+                  draft={stepsDraft}
+                  onDraftChange={changeSteps}
+                  branchCanned={branchCanned}
+                  onPregenBranch={pregenBranch}
+                />
               ) : (
                 <>
                   <StepsListEditor
@@ -604,6 +655,7 @@ export default function StudioPage() {
                 补录 / 重新录音请前往
                 <Link href="/qa/" className="text-(--live)">问答画布</Link>
                 （画布视图可右键条目重新录音）。
+                分支录音（话术步的「如果客户…→就…」应对）在主流程画布的答法抽屉里查看/补录。
               </div>
               </div>
             </section>
@@ -668,8 +720,13 @@ export default function StudioPage() {
           {/* 5. 变量：占位符目录 + 无效占位告警 + 对象预览（渲染语义 lib/var-panel.ts） */}
           {tab === "vars" && <TemplateVarsTab tpl={tplRow} accountId={accountId} />}
 
-          {/* 6. 学习报告（reports 键可见）：话术优化分析 + 高频问答对 + AI 聚类采纳 */}
-          {tab === "reports" && canReports && <StudyTab />}
+          {/* 6. 学习报告（reports 键可见）：话术优化分析 + 高频问答对 + AI 聚类采纳 + 快路覆盖率/漏网轮采集 */}
+          {tab === "reports" && canReports && (
+            <>
+              <StudyTab />
+              <GapMining templateId={selId} />
+            </>
+          )}
         </>
       )}
     </div>

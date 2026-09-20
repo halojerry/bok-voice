@@ -1158,7 +1158,9 @@ _FORWARD_ENV = (
     "BOK_QA_ROTATION",
     "BOK_QA_PRIORITY",
     "BOK_QA_FASTPATH",
-    # —— 分支罐头快路(2026-09-20 路线 A-①:步骤分支命中+应答已物化→播录音跳 LLM) ——
+    # —— 分支罐头快路+分支动作(2026-09-20 路线 A-①/A-②:分支命中→物化录音跳
+    #    LLM;应答首部【收线】/【转人工】/【跳第N步】/【留本步】动作前缀=引擎一等出口) ——
+    "BOK_BRANCH_ACTION",
     "BOK_BRANCH_CANNED",
     "BOK_QA_MATCH_THRESHOLD",
     # —— 垫话/罐头/TTS 缓存 ——
@@ -1185,6 +1187,8 @@ _FORWARD_ENV = (
     "FLOW_LLM_ADVANCE",
     "BOK_PERCEIVED_BUDGET_MS",
     "BOK_MAX_CALL_DURATION_S",
+    # 结算 gather 等待窗(D7):0/缺省=自适应档(无慢任务 10s/有意图判据 25s)。
+    "BOK_SETTLE_WAIT_S",
     "DEEPSEEK_BASE_URL",
     "DEEPSEEK_MODEL",
     "DEEPSEEK_API_KEY",
@@ -1225,6 +1229,8 @@ _FORWARD_ENV = (
     # —— ASR（agent 侧读的运维档；sidecar 专属键走 asr_env 另注入） ——
     "BOK_ASR_HOTWORDS",
     "BOK_ASR_PARTIAL_SLOW_MS",
+    # chunk POST 失败保留(D4):0=回退旧「先清后发」档。
+    "QWEN3_ASR_CHUNK_KEEP",
     "QWEN3_ASR_STREAM",
     "QWEN3_ECHO_GUARD",
     "QWEN3_HOTWORD_ECHO_GUARD",
