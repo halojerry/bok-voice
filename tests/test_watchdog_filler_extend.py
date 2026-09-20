@@ -261,3 +261,44 @@ def test_filler_on_fired_exception_never_poisons_playback(tmp_path):
 
     _run(_case())
     assert fired == [1], fired
+
+
+# ---- 晚到补答投递点自拆看门狗(2026-09-21 实弹「答案已到、客户听不到」) ----
+
+
+def _function_body(src: str, marker: str) -> list[str]:
+    """截出 agent.py 里 marker 那个 def 的函数体(到下一条同缩进 def/class 为止)。"""
+    lines = src.splitlines()
+    start = next(i for i, ln in enumerate(lines) if marker in ln)
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    body = []
+    for ln in lines[start + 1:]:
+        stripped = ln.strip()
+        if stripped and (len(ln) - len(ln.lstrip())) <= indent and stripped.split()[0] in (
+            "def", "async", "class", "@",
+        ):
+            break
+        body.append(ln)
+    return body
+
+
+def test_late_answer_cancels_watchdog_before_saying():
+    """晚到补答走 _say_script,而 _say_script 两条腿都不产出首音频回调
+    (命中腿 session.say(audio=…) 直接绕过 TTS;未命中腿走 CachedTTS.synthesize
+    的 _StoreChunkedStream 也不 fire)→ 看门狗对补答完全隐身。不在投递点显式
+    拆弹,4s force-interrupt 就把真答案掐掉改念兜底句。
+
+    实弹账本(agent.log,2026-09-21):48 轮晚到补答里 17 轮被同轮看门狗掐掉,
+    17/17 都是 TTS_CACHE hit=0 的合成腿。本测钉住「补答投递点必须自拆」。
+    """
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "apps" / "agent" / "agent_runtime" / "agent.py").read_text(encoding="utf-8")
+    body = _function_body(src, "async def _late_answer_say")
+    joined = "\n".join(body)
+    assert "_say_script(" in joined, "补答仍走直念入口"
+    assert "_cancel_response_watchdog()" in joined, (
+        "晚到补答投递点必须自拆看门狗,否则 4s 闸掐掉在途真答案"
+    )
+    guard = next(i for i, ln in enumerate(body) if "_cancel_response_watchdog()" in ln)
+    say = next(i for i, ln in enumerate(body) if "_say_script(" in ln)
+    assert guard < say, "拆弹必须发生在出声之前(否则窗口内仍会被掐)"

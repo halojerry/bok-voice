@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, field
 
 from bok_voice_core.flow_graph import FlowGraphDoc, parse_flow_graph
@@ -103,6 +104,59 @@ _BRANCH_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 _NOTE_LINE_RE = re.compile(r"^(?:注意|Notes?)\s*[:：]\s*(?P<note>.+)$", re.IGNORECASE)
+
+# ---- 分支动作前缀(2026-09-20 路线 A-②):应答首部可选的引擎动作标记 ----
+# 「如果客户打错电话→【收线】唔好意思打搅咗…」里应答首部的【…】不是台词,
+# 是给引擎的一等出口(收线/转人工/跳步/留本步)——匹配命中后由
+# parse_branch_action 把标记**消费掉**,余下文本才是可念/可播的应答。
+# 画布 round-trip 无损不靠这里:branches 仍存 (cond, resp) 原文(含标记),
+# 本层只在运行时拆动作,parse_step_ref/_BRANCH_LINE_RE 语义零改动。
+# 动作值与 agent.py 派发臂一一对应:
+#   hold    【留本步】  本轮流程不推进(规则推进让位)
+#   refuse  【收线】/【挂断】  进收尾态+定时挂断(与 verdict==REFUSE 车道同源)
+#   handoff 【转人工】  打铃不抢话(话术图 notify_human 同款,不抑制推进)
+#   jump    【跳第N步】 跳到第 N 步(镜像话术图 jump_step 副作用包)
+BRANCH_ACTION_HOLD = "hold"
+BRANCH_ACTION_REFUSE = "refuse"
+BRANCH_ACTION_HANDOFF = "handoff"
+BRANCH_ACTION_JUMP = "jump"
+# 标记内空白容错:【 收线 】/【跳第 3 步】都算命中(\s*);step 限 1-3 位数字,
+# 越界值(如「跳第0步」)在 parse_branch_action 里退回默认语义而非报错——
+# 运营手滑不该把整条分支变成引擎不认的死行,更不该把标记念出声。
+_BRANCH_ACTION_RE = re.compile(
+    r"^【\s*(?P<kind>收线|挂断|转人工|跳第\s*(?P<step>\d{1,3})\s*步|留本步)\s*】\s*"
+)
+
+
+def parse_branch_action(resp: str) -> tuple[str, int, str]:
+    """应答首部动作前缀 → (action, step, text)。识别到标记一律消费标记。
+
+    - 【收线】/【挂断】→ ("refuse", 0, 余下文本.strip())——收线台词走直念,
+      剥首尾空白
+    - 【转人工】→ ("handoff", 0, 余下文本)
+    - 【跳第N步】→ ("jump", N, 余下文本);N < 1(如「跳第0步」)→ ("", 0,
+      余下文本):标记已消费、退回默认语义——既不跳步,也不把「【跳第0步】」
+      念出声
+    - 【留本步】→ ("hold", 0, 余下文本)
+    - 无标记 / resp 为空 → ("", 0, resp 原样):逐字节不动(现状语义)
+    """
+    s = str(resp or "")
+    m = _BRANCH_ACTION_RE.match(s)
+    if not m:
+        return ("", 0, s)
+    kind = m.group("kind")
+    rest = s[m.end():]
+    if kind in ("收线", "挂断"):
+        return (BRANCH_ACTION_REFUSE, 0, rest.strip())
+    if kind == "转人工":
+        return (BRANCH_ACTION_HANDOFF, 0, rest)
+    if kind == "留本步":
+        return (BRANCH_ACTION_HOLD, 0, rest)
+    # 跳第N步:N<1(含 0/前导零以外的非法组合交给 \d{1,3} 已拦)退默认语义
+    step = int(m.group("step") or 0)
+    if step < 1:
+        return ("", 0, rest)
+    return (BRANCH_ACTION_JUMP, step, rest)
 
 # 未知指令行告警(2026-09-13):行内带「→」但行头不被识别(会被静默丢弃)时打一次
 # 告警——运营写了引擎不认的行式(如「客户报出号码(数字串)→复述确认」),静默丢弃
@@ -200,6 +254,128 @@ def match_step_branch(
         best = max(kw_hits, key=lambda t: t[2])
         return (best[0], best[1])
     return None
+
+
+# ---- 破坏性动作确定性命中 + 热词幻觉护栏（F4，2026-09-20 验收实证）----------
+# 分支动作（A-②）的匹配沿用模糊匹配（verdict 家族词优先 + bigram 兜底）——对
+# 「提示词素材」无害，但用来驱动【收线】这类破坏性动作就危险：call-23516077
+# 实弹，客户说「这个事情嘛你等等先我还想想」，ASR 把弱尾音节抄成热词表里的
+# 「打错电话」（模板 hotwords 偏置）→ 家族+bigram 命中「说打错电话了」分支
+# →【收线】真把客户挂了。两道护栏（只作用于 refuse 动作；handoff/jump/hold/
+# 无动作分支维持现有匹配语义，改动面最小）：
+# ① 确定性子串命中：收线派发前，条件核心词（剥引导动词/尾语气词，拆
+#    「/」「、」「,」「或」多选）必须【字面】出现在客户原话里；纯家族/bigram
+#    模糊命中不足以收线（不派发，落回后续 LLM 或内置 REFUSE 车道）。
+# ② 热词幻觉护栏：本轮文本剥掉词表词（模板 hotwords + 行业词 + 对象字段，
+#    与 ASR context 软偏置同一份，agent.py asr_hotword_context 组装、
+#    livekit_plugins._parse_vocab_terms 反解）后剩余过短/为空——整轮就是
+#    「打错电话」，或末子句整体是词表词（「我还想。打错电话。」=call-23516077
+#    实弹形态）→ 判 ASR 抄词表，不收线。词表取不到时退化为长度近似
+#    （hotword_only_by_length：条件核心词命中且整轮净长 ≤ 核心词长+N）。
+# 两个纯函数都在本层（无 providers 依赖）；agent.py branch_hit_plan 消费。
+_COND_OPT_SPLIT_RE = re.compile(r"[/、,，]|\bor\b|或", re.IGNORECASE)
+# 条件引导动词（「如果客户说打错电话了」的「说」）/ 尾语气助词（「了」「先」）：
+# 剥掉才是可与客户原话字面对齐的「核心词」。与 _cond_bigram_hits 的 ^[说问]
+# 同族、略宽（要/查/嫌/催 係真实模板条件的常见引导）。
+_COND_OPT_LEAD_RE = re.compile(r"^(?:说|講|讲|问|要|查|嫌|催)+")
+_COND_OPT_TRAIL_RE = re.compile(r"(?:了|啦|喽|哦|喔|呀|呢|吧|嘛|吗|么|的|時|时|先)+$")
+
+
+def _cond_norm_text(s: str) -> str:
+    """去标点与空白只留正字——条件/原话的字面对齐归一化（纯函数）。"""
+    return "".join(
+        ch
+        for ch in str(s or "")
+        if not ch.isspace() and not unicodedata.category(ch).startswith("P")
+    )
+
+
+def refuse_condition_options(cond: str) -> tuple[str, ...]:
+    """条件核心词列表（纯函数）：拆多选 + 剥引导动词/尾语气词。
+
+    「说打错电话了」→ ("打错电话",)；「打错电话/不是本人」→
+    ("打错电话", "不是本人")；「说等等先」→ ("等等",)。剥完不足 2 字的选项
+    回退用未剥原串（过短核心词宁可字面严格些）；全空返回空 tuple。"""
+    opts: list[str] = []
+    for raw in _COND_OPT_SPLIT_RE.split(str(cond or "")):
+        raw = raw.strip()
+        if not raw:
+            continue
+        core = _COND_OPT_TRAIL_RE.sub("", _COND_OPT_LEAD_RE.sub("", raw)).strip()
+        core = core or raw
+        pick = core if len(core) >= 2 else raw
+        if len(pick) >= 2 and pick not in opts:
+            opts.append(pick)
+    return tuple(opts)
+
+
+def refuse_condition_confirmed(cond: str, user_text: str) -> bool:
+    """收线派发的确定性命中判定（纯函数）：任一条件核心词【字面】出现即 True。
+
+    对客户原话做原始串与去标点归一串两级 casefold 子串比对（「打错、电话」
+    这类转写夹标点不断开字面命中）；多选任一项命中即可。家族/bigram 模糊
+    命中在此不过关——模糊命中只配当提示词素材，唔配驱动破坏性动作。"""
+    text = str(user_text or "")
+    if not text:
+        return False
+    flat = _cond_norm_text(text)
+    for opt in refuse_condition_options(cond):
+        low = opt.casefold()
+        if low in text.casefold() or low in flat.casefold():
+            return True
+    return False
+
+
+def hotword_only_utterance(
+    user_text: str, vocab_terms, *, min_rest_chars: int = 2
+) -> bool:
+    """整轮基本就是词表词 → True（判 ASR 抄词表；纯函数，单测用）。
+
+    三层：①整轮剥词表词后为空（整轮就是「打错电话」）→ True；②末子句剥
+    词表词后为空且该子句原本非空（「你等等先，我还想。打错电话。」——弱尾
+    音节被整句抄成词表词的实弹形态 call-23516077）→ True；③剥词表后剩余
+    ≤min_rest_chars 字（「打错电话啊」的「啊」）→ True。词表空 → False
+    （退化近似由调用方走 hotword_only_by_length）。"""
+    text = str(user_text or "")
+    terms = sorted(
+        {str(t).strip() for t in (vocab_terms or ()) if len(str(t).strip()) >= 2},
+        key=len,
+        reverse=True,
+    )
+    if not text.strip() or not terms:
+        return False
+
+    def _rest(s: str) -> str:
+        out = s
+        for t in terms:
+            out = out.replace(t, "")
+        return _cond_norm_text(out)
+
+    rest_all = _rest(text)
+    if not rest_all:
+        return True
+    segments = [seg for seg in re.split(r"[。！？!?；;，,、\n]", text) if seg.strip()]
+    if segments:
+        last = segments[-1]
+        if _cond_norm_text(last) and not _rest(last):
+            return True
+    return len(rest_all) <= min_rest_chars
+
+
+def hotword_only_by_length(user_text: str, cond: str, *, slack: int = 1) -> bool:
+    """词表取不到时的退化近似（纯函数）：条件核心词命中且整轮净长 ≤ 核心词长+N。
+
+    「打错电话啊」(5) ≤ 4+1 → True；「我还想打错电话」(7) > 5 → False；
+    「你打错电话了」(6) > 5 → False（带主语+语气的完整轮仍照常收线——词表
+    缺位时从宽，宁可少拦勿误拦，真护栏要喂词表）。
+    注：只量长度唔剥词表——长轮里的弱尾抄词查不出。"""
+    opts = refuse_condition_options(cond)
+    text = _cond_norm_text(user_text)
+    if not opts or not text:
+        return False
+    if not any(opt.casefold() in text.casefold() for opt in opts):
+        return False
+    return len(text) <= max(len(opt) for opt in opts) + slack
 
 
 # 粤语数字逐个读法:0 读「零」;1-9 对应汉字。数字串/单号要逐个读,
@@ -1436,8 +1612,11 @@ _CONF_RE = re.compile(r"conf(?:idence)?\s*[=:]\s*([0-9](?:\.\d+)?)?")
 
 def parse_judge_route(text: str) -> tuple[str, float]:
     """解析 judge 输出的路由字段(route/conf)。缺失/非法 route 回落 keep;
-    route 有值但 conf 缺失/非法 → 按门槛值 0.7 放行(显式 route 係强信号,
-    conf 只是修饰——实弹里 9B 偶发省略 conf,按 0.0 处理会静默杀掉整条链)。"""
+    conf 缺失/解析失败 → 0.0(保守,无置信信号=不动作)。route 语义本身不受
+    conf 影响(advance 判定只看 verdict,conf 只有两个消费端:建单闸
+    FOLLOWUP_CONF_MIN 与 degrade 早触发 degrade_boost)。旧版对非 keep route
+    按 0.7 兜底——9B 偶发省略 conf 即自动够到建单线,多开单打扰人工;低置信
+    动作宁缺勿滥,省略 conf 不得视为高置信(2026-09-20 修订)。"""
     t = (text or "").strip().lower()
     m = _ROUTE_RE.search(t)
     route = m.group(1) if m and m.group(1) in JUDGE_ROUTES else "keep"
@@ -1449,7 +1628,7 @@ def parse_judge_route(text: str) -> tuple[str, float]:
         except ValueError:
             conf_val = None
     if conf_val is None:
-        conf_val = 0.0 if route == "keep" else 0.7
+        conf_val = 0.0
     return route, min(max(conf_val, 0.0), 1.0)
 
 

@@ -2,7 +2,7 @@
 
 「如果上线新人设没有 QA 罐头/垫话应该提醒,并自动触发全部生成」:
 人设 create/update 命中音色变化 → 后台 detached 子进程跑
-`scripts/pregen_tts.py --greetings --fillers --qa --persona <id>`
+`scripts/pregen_tts.py --greetings --fillers --qa --branches --persona <id>`
 (幂等:已在缓存的 key 跳过,重跑零云调用)。响应带 `tts_pregen` 状态字段
 =提醒面;运行时逐轮提醒仍是 agent.log 的 `BOK_FILLER voice_fallback`。
 
@@ -15,6 +15,11 @@ fail-dead:任何 spawn 失败只回状态绝不阻人设落库;杀开关
 零重复);`qa_canned_status` 做 TTL 缓存、spawn 失败降级 available=False;
 `cache_root` 供 canned-audio 回放 {key}.pcm;`qa_pregen_spawn` 手动触发
 --qa 物化(单飞锁与 persona 自动物化共用)。
+
+分支罐头状态面/一键补录(2026-09-20 流程画布答法抽屉):`branch_status_json`
+spawn `--branch-status`、`branch_canned_status` TTL 缓存**按账号分键**
+(QA 全局单份跨账号串状态是已知问题,不再复制)、`branch_pregen_spawn`
+触发 --branches(可限 --texts-file,单飞锁键 __branches__)。
 """
 
 from __future__ import annotations
@@ -157,6 +162,8 @@ def persona_pregen_status(
                 "--greetings",
                 "--fillers",
                 "--qa",
+                # 分支罐头快路(2026-09-20 路线 A-①):分支应答随人设音色一并物化
+                "--branches",
                 "--persona",
                 pid,
             ]
@@ -198,7 +205,11 @@ def qa_status_json(base_url: str) -> dict:
         if line.startswith("{"):
             parsed = json.loads(line)
             if "qa_status" in parsed:
-                return {"available": True, "qa_status": parsed["qa_status"]}
+                out: dict = {"available": True, "qa_status": parsed["qa_status"]}
+                # F1(2026-09-20)信息位:逐语言音色来源(旧版脚本无此键=缺省空表)。
+                if "voice_source" in parsed:
+                    out["voice_source"] = parsed["voice_source"]
+                return out
     return {"available": False}
 
 
@@ -215,9 +226,11 @@ def qa_canned_status(base_url: str, *, force: bool = False) -> dict:
             "available": bool(data.get("available")),
             "statuses": dict(data.get("qa_status") or {}),
             "generated_at": int(_time.time()),
+            # F1(2026-09-20)信息位:旧脚本无键=空表(端点侧再兜一次)。
+            "voice_source": dict(data.get("voice_source") or {}),
         }
     except Exception:  # noqa: BLE001 - 状态面永不炸端点
-        out = {"available": False, "statuses": {}, "generated_at": int(_time.time())}
+        out = {"available": False, "statuses": {}, "generated_at": int(_time.time()), "voice_source": {}}
     globals()["_status_cache"] = (now, out)
     return out
 
@@ -256,4 +269,99 @@ def qa_pregen_spawn(base_url: str, entry_ids: list[str]) -> dict:
             cmd += ["--entry-id", str(eid)]
         proc = _spawn_detached(cmd, env, _log_path())
         _PREGEN_PROCS["__qa__"] = proc
+    return {"status": "queued", "pid": proc.pid, "log": str(_log_path())}
+
+
+# ---- 分支罐头状态面/一键补录(2026-09-20 流程画布答法抽屉注线) ----
+
+# 按 (base_url, account_id) 分键的 TTL 缓存——QA 那份 _status_cache 是全局单份
+# (跨账号串状态是已知问题),分支这份不再复制该写法。
+_branch_status_cache: dict[tuple[str, str], tuple[float, dict]] = {}
+
+
+def branch_status_json(base_url: str, account_id: str = "") -> dict:
+    """spawn pregen_tts.py --branch-status 取分支物化状态(子进程=与物化同一条代码路径)。
+
+    stdout 倒找 JSON 行取 branch_status 键,与 qa_status_json 同姿态。
+    """
+    script = _repo_root_script()
+    if not script.exists():
+        return {"available": False}
+    env = {**os.environ, "PYTHONUNBUFFERED": "1", "BOK_CP_URL": base_url}
+    _bake_ssl_cert_file(env)
+    cmd = [sys.executable, str(script), "--branch-status", "--cp", base_url]
+    if account_id:
+        cmd += ["--account-id", str(account_id)]
+    proc = subprocess.run(  # noqa: S603 - 固定脚本+参数,无 shell
+        cmd, cwd=str(_repo_root()), env=env, capture_output=True, text=True, timeout=120,
+    )
+    for line in reversed((proc.stdout or "").splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            parsed = json.loads(line)
+            if "branch_status" in parsed:
+                out: dict = {"available": True, "branch_status": parsed["branch_status"]}
+                # F1(2026-09-20)信息位:逐语言音色来源(旧版脚本无此键=缺省空表)。
+                if "voice_source" in parsed:
+                    out["voice_source"] = parsed["voice_source"]
+                return out
+    return {"available": False}
+
+
+def branch_canned_status(base_url: str, *, account_id: str = "", force: bool = False) -> dict:
+    """TTL 缓存的分支罐头状态;缓存键含账号(不沿用 QA 全局单份的跨账号串状态
+    写法);spawn 失败降级 available=False(与 qa_canned_status 同姿态)。"""
+    import time as _time
+
+    key = (str(base_url), str(account_id or ""))
+    now = _time.monotonic()
+    cached = _branch_status_cache.get(key)
+    if not force and cached is not None and now - cached[0] < _STATUS_TTL_S:
+        return cached[1]
+    try:
+        data = branch_status_json(base_url, key[1])
+        out = {
+            "available": bool(data.get("available")),
+            "statuses": dict(data.get("branch_status") or {}),
+            "generated_at": int(_time.time()),
+            # F1(2026-09-20)信息位:旧脚本无键=空表(端点侧再兜一次)。
+            "voice_source": dict(data.get("voice_source") or {}),
+        }
+    except Exception:  # noqa: BLE001 - 状态面永不炸端点
+        out = {"available": False, "statuses": {}, "generated_at": int(_time.time()), "voice_source": {}}
+    _branch_status_cache[key] = (now, out)
+    return out
+
+
+def branch_pregen_spawn(base_url: str, account_id: str, texts: list[str] | None = None) -> dict:
+    """触发 --branches 分支物化(可限 --texts-file);单飞锁键 __branches__,
+    与 QA/persona 各持一把——分支批量跑得慢,不互相挤占也不阻塞 QA 补录。"""
+    script = _repo_root_script()
+    if not script.exists():
+        return {"status": "script_missing"}
+    with _SPAWN_LOCK:
+        running = _PREGEN_PROCS.get("__branches__")
+        if running is not None and running.poll() is None:
+            return {"status": "already_running"}
+        env = {**os.environ, "PYTHONUNBUFFERED": "1", "BOK_CP_URL": base_url}
+        _bake_ssl_cert_file(env)
+        cmd = [sys.executable, str(script), "--branches", "--cp", base_url]
+        if account_id:
+            cmd += ["--account-id", str(account_id)]
+        if texts:
+            # 文本经临时文件传子进程(一行一条=resp 原文含动作标记)——CLI 参数面
+            # 免转义/免长度上限;文件留在系统临时目录(子进程启动即读,OS 定期清理)。
+            import tempfile
+
+            tf = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", prefix="bok-branch-texts-",
+                delete=False, encoding="utf-8",
+            )
+            try:
+                tf.write("\n".join(str(t) for t in texts))
+            finally:
+                tf.close()
+            cmd += ["--texts-file", tf.name]
+        proc = _spawn_detached(cmd, env, _log_path())
+        _PREGEN_PROCS["__branches__"] = proc
     return {"status": "queued", "pid": proc.pid, "log": str(_log_path())}

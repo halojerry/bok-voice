@@ -358,9 +358,11 @@ def test_end_wiring_pinned_to_schedule_call_end():
     assert "evaluate_intent_disposition(" in sched_seg
     assert '_end_scheduled["intent_code"]' in sched_seg
     assert "wa_captured=bool(_wa_captured[\"on\"])" in sched_seg  # wa 直接读账本
-    # 四个经 _schedule_call_end 的既有收线点仍在(REFUSE/FAREWELL/心跳/漏斗 v2
-    # stall 收线);时长 fuse 直调 cp.end_call,新参 intent_code 缺省空=逐字节同旧。
-    assert _SRC.count("_schedule_call_end(") == 5  # 定义+REFUSE+FAREWELL+心跳+stall收线
+    # 五个经 _schedule_call_end 的收线点仍在(REFUSE/FAREWELL/心跳/漏斗 v2 stall
+    # 收线/分支动作【收线】);时长 fuse 直调 cp.end_call,新参 intent_code 缺省空
+    # =逐字节同旧。新增的第 6 处=路线 A-② 分支动作收线臂(早段派发,与 REFUSE
+    # 车道同源调用)——运营在话术分支写「如果客户打错电话→【收线】…」时的出口。
+    assert _SRC.count("_schedule_call_end(") == 6  # 定义+REFUSE+FAREWELL+心跳+stall收线+分支收线
     assert 'await cp.end_call(call_id, disposition="completed")' in _SRC  # fuse 零变化
 
 

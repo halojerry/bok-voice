@@ -137,6 +137,18 @@ export const api = {
     ),
   pregenQa: (ids: string[]) =>
     request<{ status: string }>("/api/qa/pregen", { method: "POST", body: JSON.stringify({ ids }) }),
+  // 分支应答罐头状态（流程画布答法抽屉，2026-09-20）：statuses 键=分支 resp 原文
+  // （含动作标记，逐字节），值 ok=已物化 / missing=缺录音 / ph=占位符残留（补录
+  // 无效，先改话术）。补录=branchPregen 按 resp 原文一条一条传（texts 缺省=全量）。
+  branchCannedStatus: (accountId = "acc-001") =>
+    request<{ available: boolean; statuses: Record<string, "ok" | "missing" | "ph">; generated_at: number }>(
+      `/api/tts/branch-canned-status?account_id=${encodeURIComponent(accountId)}`,
+    ),
+  branchPregen: (accountId: string, texts?: string[]) =>
+    request<{ status: string; pid?: number; log?: string }>("/api/tts/branch-pregen", {
+      method: "POST",
+      body: JSON.stringify({ account_id: accountId, texts: texts ?? [] }),
+    }),
   cannedAudioUrl: (id: string) => `${apiBase()}/api/qa/${id}/canned-audio`,
   // AI 聚类采纳（W3 自学习闭环）：apply=false 生成聚类计划（variants/fresh/junk 三组）；
   // apply=true 时 select=[{kind:"variant"|"fresh", i}] 指定采纳子集（缺省=全部）。
@@ -274,6 +286,61 @@ export const api = {
     request<Record<string, unknown>[]>(`/api/reports/qa-pairs?account_id=${encodeURIComponent(accountId)}&limit=${limit}`),
   // 工作台仪表盘聚合（2026-09-17）：并发/呼叫量/接通率/时长分布/坐席排行/标记。
   statsDashboard: () => request<Record<string, unknown>>("/api/stats/dashboard"),
+  // 快路覆盖率 + 漏网轮候选（L-① 学习驾驶舱）——客户端读取口已并入
+  // templateProposals（L-② 超集：coverage/gaps 同源同形 + 提案），本函数随
+  // 孤儿 API 处置删除（CP 端点 GET /api/stats/llm-gaps 保留，机器通道仍可用；
+  // 类型 LlmGapsReport/LlmGapRow 保留为契约形状源）。
+  // 漏网轮候选 → 问答词条（人工确认后）：同问法已有词条时幂等返回 created=false。
+  adoptGapEntry: (body: {
+    accountId: string;
+    questionText: string;
+    answerText: string;
+    lang?: string;
+    templateId?: string;
+    step?: number;
+  }) =>
+    request<{ id: string; created: boolean }>("/api/stats/llm-gaps/adopt", {
+      method: "POST",
+      body: JSON.stringify({
+        account_id: body.accountId,
+        question_text: body.questionText,
+        answer_text: body.answerText,
+        lang: body.lang ?? "zh",
+        template_id: body.templateId ?? "",
+        step: body.step ?? 0,
+      }),
+    }),
+  // 话术分支/意图词提案（L-② 学习驾驶舱）：coverage/gaps 与 L-① 同源同形，
+  // 另带每条漏网轮的分支/意图词提案（available=false 的带人话原因）。
+  templateProposals: (accountId: string, opts: { templateId?: string; minCalls?: number; limit?: number } = {}) => {
+    const q = new URLSearchParams({ account_id: accountId });
+    if (opts.templateId) q.set("template_id", opts.templateId);
+    if (opts.minCalls) q.set("min_calls", String(opts.minCalls));
+    if (opts.limit) q.set("limit", String(opts.limit));
+    return request<TemplateProposalsReport>(`/api/stats/template-proposals?${q.toString()}`);
+  },
+  // 在库快答词条体检（L-③ 学习驾驶舱）：哪条播了客户不认、哪条压根没人问。
+  // 通知形式送达（headline/detail 人话），确认后才动库（改答案顺带补录音）。
+  qaDrift: (accountId: string, opts: { maxCalls?: number; limit?: number } = {}) => {
+    const q = new URLSearchParams({ account_id: accountId });
+    if (opts.maxCalls) q.set("max_calls", String(opts.maxCalls));
+    if (opts.limit) q.set("limit", String(opts.limit));
+    return request<QaDriftReport>(`/api/stats/qa-drift?${q.toString()}`);
+  },
+  // 体检提案采纳：reanswer→写 answer_text（admin/root 顺带补录音）、retire→删词条。
+  // 幂等：内容已一致 → created=false；键与内容对不上 → 400。
+  adoptQaDrift: (body: { accountId: string; items: QaDriftAdoptItem[] }) =>
+    request<QaDriftAdoptResponse>("/api/stats/qa-drift/adopt", {
+      method: "POST",
+      body: JSON.stringify({ items: body.items }),
+    }),
+  // 提案采纳（人工确认后写进模板草稿）：分支写 steps_json、意图词写 graph_json；
+  // published_json 不动（发布两态：要生效还需去话术页发布）。幂等：已存在 → created=false。
+  adoptTemplateProposals: (body: { accountId: string; items: ProposalAdoptItem[] }) =>
+    request<ProposalAdoptResponse>("/api/stats/template-proposals/adopt", {
+      method: "POST",
+      body: JSON.stringify({ items: body.items }),
+    }),
   reportsCalls: () => request<Record<string, unknown>[]>("/api/reports/calls"),
   reportsUsage: () => request<Record<string, unknown>>("/api/reports/usage"),
   listTemplates: (accountId = "acc-001") => request<Record<string, unknown>[]>(`/api/templates?account_id=${accountId}`),
@@ -342,6 +409,145 @@ export type SetupStatus = {
   ready: boolean;
   models: SetupModelStatus[];
   error?: string;
+};
+
+// ---- 快路覆盖率 + 漏网轮候选（L-① 学习驾驶舱，GET /api/stats/llm-gaps 契约形状） ----
+export type LlmGapRow = {
+  customer_text: string;
+  count: number;
+  calls: number;
+  template_id: string;
+  step: number;
+  lang: string;
+  sample_answer: string;
+  sample_call_id: string;
+};
+
+export type LlmGapsReport = {
+  coverage: {
+    turns: number;
+    fastpath: number;
+    llm: number;
+    fastpath_ratio: number;
+    by_gen: Record<string, number>;
+    by_provider: Record<string, number>;
+  };
+  gaps: LlmGapRow[];
+  generated_at: number;
+};
+
+// ---- 话术分支/意图词提案（L-②，GET /api/stats/template-proposals 契约形状） ----
+// 形状镜像 lib/gap-proposals.ts（零 import 自持，那边给纯函数消费）；api.ts 按
+// 惯例自持契约类型、零 import（test/weblog.test.mjs 单文件转译本文件）。
+export type TemplateProposalsReport = {
+  coverage: LlmGapsReport["coverage"];
+  gaps: LlmGapRow[];
+  proposals: {
+    key: string;
+    kind: "branch" | "intent_keyword";
+    template_id: string;
+    template_name: string;
+    customer_text: string;
+    norm: string;
+    count: number;
+    calls: number;
+    lang: string;
+    sample_answer: string;
+    sample_call_id: string;
+    step: number;
+    step_goal: string;
+    branch_cond: string;
+    branch_resp: string;
+    branch_line: string;
+    intent_id: string;
+    intent_label: string;
+    keyword: string;
+    available: boolean;
+    blocked_reason: string;
+    blocked_label: string;
+  }[];
+  generated_at: number;
+};
+
+export type ProposalAdoptItem = {
+  key: string;
+  kind: "branch" | "intent_keyword";
+  template_id: string;
+  norm: string;
+  step: number;
+  cond: string;
+  text: string;
+  intent_id: string;
+};
+
+export type ProposalAdoptResponse = {
+  results: {
+    key: string;
+    kind: "branch" | "intent_keyword";
+    template_id: string;
+    id: string;
+    created: boolean;
+    detail: string;
+  }[];
+  adopted: number;
+};
+
+// ---- 在库快答词条体检（L-③，GET /api/stats/qa-drift 契约形状） ----
+// 形状与 lib/qa-drift.ts 逐字对齐（那边给纯函数消费）；api.ts 按惯例自持契约
+// 类型、零 import。
+export type QaDriftKind = "reanswer" | "retire";
+
+export type QaDriftProposal = {
+  key: string;
+  kind: QaDriftKind;
+  /** 机器原因码：never_asked / digits_bypass / repeat_after_play / never_fired */
+  reason: string;
+  qa_id: string;
+  question_text: string;
+  current_answer: string;
+  /** reanswer 才有：建议答案（当时 AI 自己说的那句），可改 */
+  suggested_answer: string;
+  lang: string;
+  scope: string;
+  occurrences: number;
+  fired: number;
+  repeats: number;
+  hits: number;
+  /** 人话：发现了什么 */
+  headline: string;
+  /** 人话：建议做什么 */
+  detail: string;
+};
+
+export type QaDriftReport = {
+  window_calls: number;
+  entries_scanned: number;
+  counts: { reanswer: number; retire: number };
+  proposals: QaDriftProposal[];
+  generated_at: number;
+};
+
+export type QaDriftAdoptItem = {
+  key: string;
+  kind: QaDriftKind;
+  qa_id: string;
+  text: string;
+};
+
+export type QaDriftAdoptResult = {
+  key: string;
+  kind: QaDriftKind;
+  qa_id: string;
+  created: boolean;
+  /** 改了答案但没补录音（调用方非 admin）→ 前端提示找管理员补录 */
+  needs_pregen: boolean;
+  pregen: Record<string, unknown> | null;
+  detail: string;
+};
+
+export type QaDriftAdoptResponse = {
+  results: QaDriftAdoptResult[];
+  adopted: number;
 };
 
 // ---- B4 会话与权限类型（契约预埋） ----

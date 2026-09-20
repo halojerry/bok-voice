@@ -13,6 +13,7 @@ import { api } from "@/lib/api";
 import { ErrorState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
 import { useSession } from "@/components/session-context";
+import { VarTextarea } from "@/components/var-insert";
 
 export const LANGS = [
   ["zh", "普通话"],
@@ -283,7 +284,15 @@ export default function TemplateEditor(props: {
   onSaved?: () => void;
   /** 「取消」回调：页面侧清掉选中回到新建态；不给时组件本地退回新建态。 */
   onCancel?: () => void;
+  /**
+   * meta=只编辑模板设置（名称/语言/语气/热词），不碰步骤（2026-09-20 易用性改版）：
+   * 工作站的步骤草稿上提到页面层（全局未保存/应用），本组件在 meta 档下隐藏步骤/四段
+   * 编辑面，保存 payload 也不带 steps_json/四段键（PUT exclude_unset 部分更新，
+   * 不会把工作站层的步骤草稿冲掉）。/templates 页保持 full 档零变化。
+   */
+  variant?: "full" | "meta";
 }) {
+  const meta = props.variant === "meta";
   const { accountId } = useAccount();
   const session = useSession();
   const [form, setForm] = useState<TplForm>(EMPTY_FORM);
@@ -340,6 +349,21 @@ export default function TemplateEditor(props: {
     setErr(null);
     setOk(false);
     try {
+      if (meta && editing) {
+        // meta 档=只写设置键（partial update，exclude_unset 语义）——步骤/四段不在
+        // payload 里，不会把工作站层（页面持有的步骤草稿）未应用的修改冲掉。
+        const settings = {
+          name: form.name,
+          language: form.language,
+          tone_override: form.tone_override,
+          hotwords: form.hotwords,
+          account_id: accountId,
+        };
+        await api.updateTemplate(String(tpl?.id ?? ""), settings);
+        setOk(true);
+        props.onSaved?.();
+        return;
+      }
       // 分步为主:没填步骤但有四段 → 自动转成步骤(统一存 steps_json,不再存四段)。
       const finalSteps = steps.length > 0 ? steps : fourSectionsToSteps(form);
       // 空白步(goal+ref 全空)会被 stepsToJson 静默过滤——计数提示,防「明明填了 N 步存出来少几步」困惑(2026-09-09 QA B2)。
@@ -439,6 +463,9 @@ export default function TemplateEditor(props: {
         placeholder="模板名，例如：顺丰理赔·分步（粤语）"
       />
 
+      {/* meta 档隐藏步骤/四段/导入（步骤归工作站层全局草稿管），只留名称/语言/语气/热词 */}
+      {!meta && (
+      <>
       {/* 分步话术(主编辑方式):1.2.3.4 逐步推进,每步填 目标 + 参考说法 */}
       <div className="rounded-lg border border-(--live)/40 p-3">
         <div className="flex items-center justify-between">
@@ -478,13 +505,15 @@ export default function TemplateEditor(props: {
                 disabled={readOnly}
                 onChange={(e) => setSteps((s) => s.map((x, j) => (j === i ? { ...x, goal: e.target.value } : x)))}
               />
-              <textarea
-                className={`mt-1.5 h-20 ${textarea} text-xs`}
-                placeholder={"参考说法(要点+分支;AI 结合客户原话用自己的话讲)\n例:你好,请问係咪{姓名}?我哋係{物流公司}…\n如果客户唔记得 → 提佢下单填嘅地址帮佢回忆"}
-                value={st.ref}
-                disabled={readOnly}
-                onChange={(e) => setSteps((s) => s.map((x, j) => (j === i ? { ...x, ref: e.target.value } : x)))}
-              />
+              <div className="mt-1.5">
+                <VarTextarea
+                  className={`h-24 ${textarea} text-xs`}
+                  placeholder={"参考说法(要点+分支;AI 结合客户原话用自己的话讲)\n例:你好,请问係咪{姓名}?我哋係{物流公司}…\n如果客户唔记得 → 提佢下单填嘅地址帮佢回忆"}
+                  value={st.ref}
+                  disabled={readOnly}
+                  onChange={(v) => setSteps((s) => s.map((x, j) => (j === i ? { ...x, ref: v } : x)))}
+                />
+              </div>
               <label className="mt-1 flex items-center gap-1.5 text-[11px] muted">
                 <input
                   type="checkbox"
@@ -555,8 +584,11 @@ export default function TemplateEditor(props: {
           </div>
         )}
       </div>
+      </>
+      )}
 
       {/* 旧式四段(兼容折叠):历史模板仍可编辑;新模板建议直接用分步 */}
+      {!meta && (
       <div className="rounded-lg border border-(--card-border) p-3">
         <button className="flex w-full items-center justify-between text-left" onClick={() => setShowLegacy((v) => !v)}>
           <span className="text-xs muted">旧式四段话术（开场/核心/异议/收尾 — 兼容历史模板，保存时自动转步骤）</span>
@@ -579,6 +611,7 @@ export default function TemplateEditor(props: {
           </div>
         )}
       </div>
+      )}
       <label className="block">
         <span className="text-xs muted">语气覆盖（可选，优先于人设）</span>
         <input
@@ -615,8 +648,12 @@ export default function TemplateEditor(props: {
       </label>
       {err && <ErrorState message={err} />}
       <div className="flex items-center gap-3">
-        {!readOnly && <button className="btn-primary" onClick={save}>{editing ? "保存修改" : "创建模板"}</button>}
-        {editing && !readOnly && <button className="btn-ghost" onClick={cancelEdit}>取消</button>}
+        {!readOnly && (
+          <button className="btn-primary" onClick={save}>
+            {editing ? (meta ? "保存模板设置" : "保存修改") : "创建模板"}
+          </button>
+        )}
+        {editing && !meta && !readOnly && <button className="btn-ghost" onClick={cancelEdit}>取消</button>}
         {ok && <span className="text-sm text-emerald-600">已保存。</span>}
       </div>
     </section>

@@ -1,4 +1,5 @@
-// 流程画布纯函数（W2 T2）：step.ref 三件拆装、场景泳道分桶、确定性布局。
+// 流程画布纯函数（W2 T2；2026-09-20 重设计为纵向步骤工作流）：
+// step.ref 三件拆装 + 确定性布局（步骤脊柱纵向瀑布 + 意图左栏条件边）。
 //
 // parseStepRefParts/serializeStepRef 语义镜像 agent 侧运行时解析器
 // apps/agent/agent_runtime/flow.py:95-149（_BRANCH_LINE_RE/_NOTE_LINE_RE/parse_step_ref）：
@@ -13,6 +14,9 @@
 // 本文件必须保持零 import（test/flow-canvas.test.mjs 按 qa-canvas.test.mjs 同款装配,
 // tsc 单文件转译直载——引 template-editor/react 会拖进 "@/" 别名与组件依赖炸掉转译）,
 // 类型自持,结构上与 components/template-editor 的 FlowStep（+scene）兼容。
+//
+// 正则调用一律走 String.prototype.match（非全局正则与 RegExp.prototype 正则执行同返回）,
+// 匹配结果只做字符串拆装——本文件零副作用、零 IO。
 
 /** 画布消费的步骤形状（template-editor.FlowStep 超集兼容面;scene 画布专属）。 */
 export type CanvasFlowStep = {
@@ -23,7 +27,14 @@ export type CanvasFlowStep = {
   scene?: string;
 };
 
-export type StepBranch = { cond: string; resp: string };
+/** 一条应对分支。arrow=解析时记下的箭头两侧原始写法（如「 → 」「  →  」「→」）,
+ * 序列化原样回写（F8 分隔符保真——运营没编辑的行空格形态不被改写）;
+ * 缺省/非法=抽屉新加的分支,用规范形「→」。 */
+export type StepBranch = { cond: string; resp: string; arrow?: string };
+
+
+/** 步节点分支 chip 行 = StepBranch + 动作派生（resp 恒为原文含标记,抽屉同源）。 */
+export type StepNodeBranch = StepBranch & { action: BranchAction; jump: number };
 
 export type StepRefParts = {
   /** 正稿 + 并入的其余非分支非注意行（\n 连接,保序,未知行原样）。 */
@@ -34,8 +45,10 @@ export type StepRefParts = {
 };
 
 // flow.py:96 `_BRANCH_LINE_RE` 的逐语义移植：锚词 | 条件(1..120 非贪婪) | \s*→\s* | 应答(\S.*)。
-// 捕获组 1=锚词原文（EN 大小写变体原样保留,序列化按原文回写,不做 EN→中改写）。
-const BRANCH_RE = /^(如果客户|(?:If|When)\s+the\s+customer)\s*(.{1,120}?)\s*→\s*(\S.*)$/i;
+// 捕获组 1=锚词原文（EN 大小写变体原样保留,序列化按原文回写,不做 EN→中改写）;
+// 组 3=箭头两侧原始分隔（F8 分隔符保真：解析记下、序列化原样回写,匹配行为与旧
+// `\s*→\s*` 逐字节一致,只是多捕获一份）。应答=箭头后首个非空白字符起。
+const BRANCH_RE = /^(如果客户|(?:If|When)\s+the\s+customer)\s*(.{1,120}?)(\s*→\s*)(\S.*)$/i;
 // flow.py:99 `_NOTE_LINE_RE` 的逐语义移植。
 const NOTE_RE = /^(?:注意|Notes?)\s*[:：]\s*(.+)$/i;
 
@@ -47,14 +60,20 @@ export function parseStepRefParts(ref: string): StepRefParts {
   for (const raw of String(ref ?? "").split(/\r?\n/)) {
     const line = raw.trim(); // flow.py: line = raw.strip()
     if (!line) continue; // 空行跳过（flow.py:135-136）
-    const bm = BRANCH_RE.exec(line);
+    const bm = line.match(BRANCH_RE);
     if (bm) {
-      parts.branches.push({ cond: bm[2].trim(), resp: bm[3].trim() });
+      const cond = String(bm[2] ?? "").trim();
+      const resp = String(bm[4] ?? "").trim();
+      // 箭头两侧原始分隔逐字记下（含空格）,序列化原样回写（F8：改一处不再牵动整步
+      // 其它行的空格形态）。恒含「→」,不存在空串。
+      const arrow = String(bm[3] ?? "→");
+      parts.branches.push({ cond, resp, arrow });
       continue;
     }
-    const nm = NOTE_RE.exec(line);
+    const nm = line.match(NOTE_RE);
     if (nm) {
-      noteLines.push(nm[1].trim());
+      const note = String(nm[1] ?? "").trim();
+      noteLines.push(note);
       continue;
     }
     // 首个非分支非注意非空行=正稿,其余（含带「→」的未知指令行）原样并入正稿段——
@@ -66,13 +85,15 @@ export function parseStepRefParts(ref: string): StepRefParts {
   return parts;
 }
 
-/** 与 parseStepRefParts 互逆：正稿行 + 每分支 `如果客户{cond}→{resp}` + 每注意行 `注意：{n}`。
- * 不变量：parse(serialize(parse(x))) deepEqual parse(x)（分支/注意/正稿逐件相等）。
+/** 与 parseStepRefParts 互逆：正稿行 + 每分支 `如果客户{cond}{arrow}{resp}` + 每注意行 `注意：{n}`。
+ * 不变量：parse(serialize(parse(x))) deepEqual parse(x)（分支/注意/正稿/箭头分隔逐件相等）。
  * 刻意偏差（对任务书 `→就{resp}` 字样）：不无条件补「就」——resp 是运行时逐字注入的
  * 应答内容（flow.py:96 从箭头后捕获、flow.py:1195-1197 原样注入 prompt）,现存语料分支
  * 普遍无「就」头（见 template-editor STEPS_EXAMPLES 三语样例）,补字=保存即改写运营内容,
  * 破坏无损往返;作者写了「就」的自然带出。EN 锚词分支序列化为规范中文锚（与任务书规范形一致,
- * 运行时两种锚等价）。解析不了的行（在 script 里）原样回写。 */
+ * 运行时两种锚等价）。解析不了的行（在 script 里）原样回写。
+ * F8 分隔符保真：箭头两侧空格按解析原样回写（新加分支无 arrow=规范形「→」）,
+ * 保存不再把「 → 」静默归一成「→」。 */
 export function serializeStepRef(parts: StepRefParts): string {
   const lines: string[] = [];
   for (const l of String(parts.script ?? "").split("\n")) {
@@ -83,57 +104,170 @@ export function serializeStepRef(parts: StepRefParts): string {
     const cond = String(b.cond ?? "").trim();
     const resp = String(b.resp ?? "").trim();
     if (cond && resp) {
-      lines.push(`如果客户${cond}→${resp}`);
+      // 分支行：锚词+条件+箭头+应答（普通字符串拼接,无任何执行语义）。
+      // 箭头分隔原样回写（F8 分隔符保真：解析记下的「 → 」「  →  」「→」逐字还原,
+      // 改一处分支不再把整步/整模板其它行的空格形态静默改写）;
+      // 抽屉新加的分支（无 arrow 字段）用规范形「→」。
+      const arrow = typeof b.arrow === "string" && b.arrow.includes("→") ? b.arrow : "→";
+      const branchLine = "如果客户" + cond + arrow + resp;
+      lines.push(branchLine);
     } else if (cond || resp) {
       // 残行（缺条件或缺应答）不成合法分支语法,降级为普通行——文字不丢,
       // 重解析落回 script 段,抽屉里仍可见可改。
-      lines.push(cond || resp);
+      const residual = cond || resp;
+      lines.push(residual);
     }
     // 全空行（抽屉里点了「加分支」没填）不产垃圾。
   }
   for (const n of String(parts.notes ?? "").split("\n")) {
     const t = n.trim();
-    if (t) lines.push(`注意：${t}`); // 多条注意行逐行还原「注意：」头
+    if (t) {
+      const noteLine = "注意：" + t; // 多条注意行逐行还原「注意：」头
+      lines.push(noteLine);
+    }
   }
   return lines.join("\n");
 }
 
-/** 未分组泳道名（scene 空/缺失的步归此;保持出现位置,不殿后）。 */
-export const UNGROUPED_LANE = "未分组";
+// —— 分支动作前缀（2026-09-20 A-③;语义镜像 flow.py `_BRANCH_ACTION_RE`/`parse_branch_action`）——
+// 分支应答（resp）首部可选动作标记：【收线】/【挂断】=礼貌收线、【转人工】=打铃通知人工
+// （AI 照常兜话不打断）、【跳第N步】=跳到第 N 步（1-based）、【留本步】=明确留本步。
+// 标记只活在 branches[].resp 原文里（round-trip 无损依赖它）;抽屉编辑面拆成
+// 动作下拉+步号+纯文本 三件,编辑时重组回 resp——标记绝不进 script、不进画布摘要。
 
-export type SceneLane = { name: string; steps: CanvasFlowStep[] };
+/** 分支动作（""=按内容回答,resp 无标记）。 */
+export type BranchAction = "" | "hold" | "refuse" | "handoff" | "jump";
 
-/** 场景泳道分桶：按出现顺序,同 scene 归并到首次出现的那条泳道（scene 空=「未分组」）。
- * 同名归并（而非严格相邻切段）=泳道名唯一,行内改名 onChangeScene(prev,new) 才有唯一落点;
- * 常规数据同场景步本就相邻,交错只是退化输入的确定序。 */
-export function sceneLanes(steps: CanvasFlowStep[]): SceneLane[] {
-  const lanes: SceneLane[] = [];
-  const byName = new Map<string, SceneLane>();
-  for (const s of steps ?? []) {
-    const name = s.scene ? s.scene : UNGROUPED_LANE;
-    let lane = byName.get(name);
-    if (!lane) {
-      lane = { name, steps: [] };
-      byName.set(name, lane);
-      lanes.push(lane);
-    }
-    lane.steps.push(s);
-  }
-  return lanes;
+export type BranchActionInfo = { action: BranchAction; step: number; text: string };
+
+/** flow.py `_BRANCH_ACTION_RE` 逐语义移植：^【\s*(kind)\s*】\s*;kind 内部自带空白容错
+ * （【 收线 】/【跳第 3 步】）;\d{1,3} 限 1..999——4 位以上步号整体不认作标记（原样保留）。 */
+const BRANCH_ACTION_RE = /^【\s*(收线|挂断|转人工|跳第\s*(\d{1,3})\s*步|留本步)\s*】\s*/;
+
+/** jump 步号钳制：非 1..999 整数一律按 1（引擎侧 jump_to 另有越界钳制,这里是编辑面保底）。 */
+function clampJumpStep(step: number): number {
+  const n = Number(step);
+  return Number.isInteger(n) && n >= 1 && n <= 999 ? n : 1;
 }
 
-// —— 布局（确定性网格,同输入同输出）：泳道纵向排布、步节点脊柱、意图节点侧栏列 ——
-export const LANE_HEADER_X = 0; // 泳道头列 x（场景名）
-export const LANE_HEADER_W = 180; // 泳道头节点宽（给行内改名输入留位）
-export const STEP_COL_X = 260; // 步节点脊柱列 x
-export const INTENT_COL_X = 700; // 意图节点侧栏列 x
-export const STEP_GAP_Y = 170; // 泳道内步节点纵向节距
-export const LANE_GAP_Y = 100; // 泳道间留白
-export const LANE_TOP_Y = 40; // 首条泳道 y
+/** 拆分支应答首部动作标记 → (action, step, 纯文本)。规则（与 flow.py 逐语义一致）：
+ * 收线|挂断→("refuse",0,余文);转人工→("handoff",0,余文);留本步→("hold",0,余文);
+ * 跳第N步 且 N≥1→("jump",N,余文);跳第0步→标记已消费但无动作("",0,余文);
+ * 无标记/空→("",0,resp 原样,逐字节不动)。step 只在 action==="jump" 时有意义。 */
+export function parseBranchAction(resp: string): BranchActionInfo {
+  const s = String(resp ?? "");
+  const m = s.match(BRANCH_ACTION_RE);
+  if (!m) return { action: "", step: 0, text: s };
+  const kind = String(m[1] ?? "");
+  const rest = s.slice(m[0].length);
+  if (kind === "收线" || kind === "挂断") return { action: "refuse", step: 0, text: rest };
+  if (kind === "转人工") return { action: "handoff", step: 0, text: rest };
+  if (kind === "留本步") return { action: "hold", step: 0, text: rest };
+  const n = Number(m[2] ?? "0");
+  if (!(n >= 1)) return { action: "", step: 0, text: rest }; // 跳第0步：标记消费、无动作
+  return { action: "jump", step: n, text: rest };
+}
+
+/** parseBranchAction 的逆操作：动作+步号+文本 重组 resp 原文。
+ * action==="" 恒逐字节等于 text（无标记分支零改写）;jump 步号非 1..999 整数按 1 钳制。
+ * 不变量：parseBranchAction(composeBranchResp(a,n,t)) 与
+ * {action:a, step:(a==="jump"?钳制后n:0), text:t.trim()} 一致（t 已 trim 时逐件相等）。 */
+export function composeBranchResp(action: BranchAction, step: number, text: string): string {
+  const t = String(text ?? "");
+  switch (action) {
+    case "refuse": return "【收线】" + t;
+    case "handoff": return "【转人工】" + t;
+    case "hold": return "【留本步】" + t;
+    case "jump": return "【跳第" + clampJumpStep(step) + "步】" + t;
+    default: return t;
+  }
+}
+
+/** 答法抽屉动作下拉（顺序即下拉顺序;首项=默认项）。 */
+export const BRANCH_ACTIONS: { value: BranchAction; label: string; hint: string }[] = [
+  { value: "", label: "按内容回答（默认）", hint: "AI 现场组织语言，命中率高的话可以补录成录音" },
+  { value: "refuse", label: "礼貌收线", hint: "道歉/再见一句，然后结束通话，不再推销" },
+  { value: "handoff", label: "通知人工", hint: "给人工坐席打铃，AI 继续照常应答，不打断通话" },
+  { value: "jump", label: "跳到第 N 步", hint: "直接切换到指定步骤继续，本轮不再按顺序推进" },
+  { value: "hold", label: "留在本步", hint: "本轮不往下推进，先处理客户这句话" },
+];
+
+/** 步节点分支 chip 的动作徽标文案（无动作=空串不渲染;jump 带「跳第N步」）。 */
+export function branchActionBadge(action: BranchAction, step: number): string {
+  switch (action) {
+    case "refuse": return "收线";
+    case "handoff": return "转人工";
+    case "hold": return "留本步";
+    case "jump": return "跳第" + clampJumpStep(step) + "步";
+    default: return "";
+  }
+}
+
+/** 分支罐头录音状态（组件只读渲染,不发请求;key=分支 resp 原文含标记,逐字节）。 */
+export type BranchCannedStatus = "ok" | "missing" | "ph";
+
+/** 录音状态展示元数据（点色类名+提示文案;抽纯函数便于单测）。 */
+export function branchCannedMeta(status: BranchCannedStatus): { dot: string; title: string } {
+  switch (status) {
+    case "ok": return { dot: "bg-emerald-500", title: "已有录音" };
+    case "missing": return { dot: "bg-zinc-400", title: "未录" };
+    default: return { dot: "bg-amber-400", title: "含变量，无法预录" };
+  }
+}
+
+/** 场景缺省名（抽屉场景下拉的空档;scene 仍是 steps_json 纯数据位,不参与布局）。 */
+export const UNGROUPED_LANE = "未分组";
+
+// —— 易用性三件（2026-09-20 真浏览器点击验收 F5/F6/F7）——
+
+/** F5 画布初始缩放下限：fitView 整图 8 步约 1700px 高塞进 560px 视口会缩到 ~0.25,
+ * 12px 文字缩成 ~3px 没法读。下限 0.75 保证首屏文字可读（12px→9px）,整图塞不下的
+ * 部分拖动画布/左侧控制器/小地图翻看,滚轮仍可缩小到画布 minZoom=0.2 看全貌。 */
+export const CANVAS_MIN_ZOOM = 0.75;
+
+/** 画布 fitView 选项（F5）：缩放夹在 [0.75, 1]——下限管「看得清」,上限 1 管步骤少的
+ * 模板不被放大成巨卡。超出视口靠平移/缩放控件,不靠眯眼。 */
+export function canvasFitViewOptions(): { padding: number; minZoom: number; maxZoom: number } {
+  return { padding: 0.15, minZoom: CANVAS_MIN_ZOOM, maxZoom: 1 };
+}
+
+/** 左栏是否存在意图卡（F6 空态引导;停用意图也渲染成卡,与 layoutFlow 口径一致）。 */
+export function graphHasIntents(graph?: GraphLite): boolean {
+  return (graph?.intents ?? []).length > 0;
+}
+
+/** 画布顶部引导语（F6）：库里还没有意图时不再承诺「左边意图卡」（空图左栏恒空,
+ * 引导与现实不符会让人以为页面坏了）。 */
+export function canvasGuideText(hasIntents: boolean): string {
+  return hasIntents
+    ? "从上到下=通话顺序；左边意图卡=听到某些话就跳到箭头指的步骤；点步骤卡即可编辑"
+    : "从上到下=通话顺序；点步骤卡即可编辑";
+}
+
+/** 无意图时的空态提示（人话;组件层在其后拼可点击的「去意图管理添加」）。 */
+export const CANVAS_INTENT_EMPTY_HINT = "这个话术还没有设置意图（听到某些话就跳步或播快答）。";
+
+/** F7 答法抽屉是否保持打开（纯函数便于单测）：抽屉开着且步号仍落在当前草稿范围=保持
+ * ——点「应用」保存（同模板重拉）不清抽屉,连续改多条分支不用重开;
+ * 步号越界（草稿里步骤真被换掉/删少）才收起。模板是否被换由调用方比对模板 id。 */
+export function drawerIndexValid(drawerIndex: number, stepCount: number): boolean {
+  return Number.isInteger(drawerIndex) && drawerIndex >= 0 && drawerIndex < stepCount;
+}
+
+// —— 布局（确定性,同输入同输出;2026-09-20 重设计：纵向步骤工作流）——
+// 步骤=中列瀑布脊柱（第 1 步在上,逐级向下）;意图=左栏卡片,按锚定目标步纵向堆叠;
+// 边=脊柱顺序线（默认推进）+ 意图→目标步条件边（关键词入边）+ 播完跳转边（then_jump）。
+// 场景不再是泳道（旧版横向泳道被用户判「没法用、不直观」）,退为步节点上的徽标。
+export const STEP_COL_X = 380; // 步骤主列 x（工作流脊柱）
+export const INTENT_COL_X = 40; // 意图左栏 x
+export const TOP_Y = 40; // 首步 y
+export const STEP_GAP_Y = 210; // 步节点纵向节距（卡更高：分支 chip 行占位）
 export const INTENT_STACK_Y = 130; // 同锚点多个意图的纵向堆叠节距
 
-export const STEP_NODE_W = 260;
+export const STEP_NODE_W = 300;
 export const INTENT_NODE_W = 240;
+/** 步节点上分支 chip 的展示上限（超出折叠为「+N」）。 */
+export const BRANCH_CHIP_LIMIT = 3;
 
 /** 意图/绑定的只读消费面（结构兼容 lib/qa-canvas GraphDoc,组件直传 parseGraphDoc 结果）。 */
 export type GraphLite = {
@@ -151,13 +285,13 @@ export type GraphLite = {
     action?: string;
     qa_id?: string;
     step?: number;
+    then_jump?: number;
     enabled?: boolean;
   }[];
 };
 
-/** 画布节点（kind 判别：lane/step/intent）。位置为纯几何派生,拖拽覆盖在组件层。 */
+/** 画布节点（kind 判别：step/intent）。位置为纯几何派生,拖拽覆盖在组件层。 */
 export type FlowNode =
-  | { id: string; kind: "lane"; x: number; y: number; name: string }
   | {
       id: string;
       kind: "step";
@@ -169,6 +303,10 @@ export type FlowNode =
       scriptFirst: string;
       say: boolean;
       emotion: string;
+      scene: string;
+      /** 答法分支（答法抽屉同源数据;resp 原文含动作标记,节点上渲染为条件 chip,上限外折叠计数）。 */
+      branches: StepNodeBranch[];
+      branchMore: number;
       /** jump_step 绑定入边数（徽标）。 */
       jumpIn: number;
     }
@@ -189,100 +327,143 @@ export type FlowEdge = {
   id: string;
   source: string;
   target: string;
-  /** spine=泳道内步间顺序线;jump=意图→目标步（jump_step 绑定）。 */
-  kind: "spine" | "jump";
+  /** spine=步间顺序线（默认推进）;jump=意图→目标步（jump_step）;thenjump=播快答播完跳转。 */
+  kind: "spine" | "jump" | "thenjump";
+  /** 边标签（spine=固定文案;jump=意图名+关键词;thenjump=播完跳转）。 */
+  label: string;
 };
 
-/** 泳道纵向布局：每条泳道=泳道头（左）+ 步节点脊柱（中）;意图锚定首个 jump_step 目标步
- * （无绑定锚首步）纵向堆叠在右列。jump_step 悬空（步号越界/意图缺失/停用绑定）不画边不计数。 */
+/** 意图边标签：意图名 + 前两个关键词（画布上「哪些条件触发哪个步骤」的直接答案）。 */
+function intentEdgeLabel(label: string, keywords: string[]): string {
+  const kw = (keywords ?? []).slice(0, 2).join("、");
+  return kw ? `${label}（${kw}）` : label;
+}
+
+/** 纵向工作流布局：步骤脊柱（i → i+1 顺序线,标「默认推进」）;意图锚定首个
+ * jump_step 目标步（无绑定锚首步/生效首步）纵向堆叠在左栏。jump_step 悬空
+ * （步号越界/意图缺失/停用绑定）不画边不计数;play_qa 的 then_jump 单独画
+ * 「播完跳转」边（同为意图→步,引擎里是罐头播完当场跳）。 */
 export function layoutFlow(
   steps: CanvasFlowStep[],
   graph?: GraphLite,
 ): { nodes: FlowNode[]; edges: FlowEdge[] } {
   const nodes: FlowNode[] = [];
   const edges: FlowEdge[] = [];
-  // 步节点 id 用全局下标（fstep:<i>）,泳道只影响 y——抽屉/意图目标都按全局下标寻址。
+  // 步节点 id 用全局下标（fstep:<i>）——抽屉/意图目标都按全局下标寻址。
   const stepId = (i: number) => `fstep:${i}`;
-  const intentId = (id: string) => `fintent:${id}`;
+  const intentNodeId = (id: string) => `fintent:${id}`;
 
-  let y = LANE_TOP_Y;
-  const stepY = new Map<number, number>();
-  const idxOf = new Map<CanvasFlowStep, number>(steps.map((s, i) => [s, i]));
-  // 泳道 id 用稳定序号（非名字派生）——行内改名逐键重映射 scene,名字派生 id 会令
-  // 泳道头输入框每键重挂丢焦点。
-  sceneLanes(steps).forEach((lane, li) => {
-    nodes.push({ id: `lane:${li}`, kind: "lane", x: LANE_HEADER_X, y, name: lane.name });
-    lane.steps.forEach((s, j) => {
-      stepY.set(idxOf.get(s) ?? 0, y + j * STEP_GAP_Y);
-    });
-    y += Math.max(lane.steps.length, 1) * STEP_GAP_Y + LANE_GAP_Y;
-  });
+  const stepY = (i: number) => TOP_Y + i * STEP_GAP_Y;
+
   steps.forEach((s, i) => {
     const parts = parseStepRefParts(s.ref);
-    // 节点预览：正稿首行;无正稿（纯分支 ref）退首分支行,画布上仍有可读摘要。
-    const scriptFirst = (parts.script.split("\n")[0] ?? "")
-      || (parts.branches[0] ? `如果客户${parts.branches[0].cond}→${parts.branches[0].resp}` : "");
+    // 分支 chip 行：动作标记拆成 action/jump 派生位（resp 原文不动,抽屉 round-trip 依赖;
+    // arrow 是序列化层的分隔符记账,不进节点数据——节点形状与旧版逐键一致）。
+    const branchNodes: StepNodeBranch[] = parts.branches.slice(0, BRANCH_CHIP_LIMIT).map((b) => {
+      const info = parseBranchAction(b.resp);
+      return { cond: b.cond, resp: b.resp, action: info.action, jump: info.step };
+    });
+    // 节点预览：正稿首行;无正稿（纯分支 ref）退首分支行,画布上仍有可读摘要——
+    // 动作标记剥掉不进摘要（画布上不出现「【收线】」原始标记串）,标记应答为空时退动作徽标文案。
+    const firstBranch = parts.branches[0];
+    let scriptFirst = parts.script.split("\n")[0] ?? "";
+    if (!scriptFirst && firstBranch) {
+      const info = parseBranchAction(firstBranch.resp);
+      scriptFirst = "如果客户" + firstBranch.cond + "→" + (info.text || branchActionBadge(info.action, info.step));
+    }
     nodes.push({
       id: stepId(i),
       kind: "step",
       x: STEP_COL_X,
-      y: stepY.get(i) ?? LANE_TOP_Y,
+      y: stepY(i),
       index: i,
       goal: s.goal || "",
       scriptFirst: scriptFirst.slice(0, 40),
       say: s.say === true,
       emotion: s.emotion ?? "",
+      scene: (s.scene ?? "").trim(),
+      branches: branchNodes,
+      branchMore: Math.max(0, parts.branches.length - BRANCH_CHIP_LIMIT),
       jumpIn: 0,
     });
   });
-  // 泳道内步间顺序线（展示性,读流程走向）。
-  for (const lane of sceneLanes(steps)) {
-    for (let j = 0; j + 1 < lane.steps.length; j++) {
-      const a = idxOf.get(lane.steps[j]) ?? 0;
-      const b = idxOf.get(lane.steps[j + 1]) ?? 0;
-      edges.push({ id: `spine:${a}:${b}`, source: stepId(a), target: stepId(b), kind: "spine" });
-    }
+
+  // 脊柱顺序线：每对相邻步一条（工作流主推进路径——引擎按步序自动推进,跨场景不断线）。
+  for (let i = 0; i + 1 < steps.length; i++) {
+    const spine = {
+      id: `spine:${i}:${i + 1}`,
+      source: stepId(i),
+      target: stepId(i + 1),
+      kind: "spine" as const,
+      label: "默认推进",
+    };
+    edges.push(spine);
   }
-  // 意图节点 + jump_step 绑定边（只读 overlay,编辑深链问答画布）。
+
+  // 意图节点 + 条件边（只读 overlay,编辑深链问答画布）。
   const intents = graph?.intents ?? [];
   const byId = new Map(intents.map((it) => [it.id, it]));
-  const stackAt = new Map<number, number>();
-  const intentAnchor = new Map<string, number>();
-  const jumpBindings = (graph?.bindings ?? []).filter(
-    (b) => b.enabled !== false && b.action === "jump_step" && byId.has(b.intent),
+  const enabledBindings = (graph?.bindings ?? []).filter(
+    (b) => b.enabled !== false && byId.has(b.intent),
   );
-  for (const b of jumpBindings) {
-    const idx = Math.min(Math.max((Number(b.step) || 1) - 1, 0), Math.max(steps.length - 1, 0));
+  const clampStep = (n: unknown, len: number) =>
+    Math.min(Math.max((Number(n) || 1) - 1, 0), Math.max(len - 1, 0));
+
+  // jump_step 锚点与 jumpIn 计数（悬空步号被钳制,但停用/悬空意图不画）。
+  const intentAnchor = new Map<string, number>();
+  for (const b of enabledBindings.filter((x) => x.action === "jump_step")) {
+    const idx = clampStep(b.step, steps.length);
     intentAnchor.set(b.intent, idx);
     const node = nodes.find((n) => n.id === stepId(idx));
     if (node && node.kind === "step") node.jumpIn += 1;
   }
+  // play_qa+then_jump 也锚到跳转目标（无则落播放锚点=生效首步/首步）。
+  for (const b of enabledBindings.filter((x) => x.action === "play_qa" && Number(x.then_jump) > 0)) {
+    if (!intentAnchor.has(b.intent)) {
+      intentAnchor.set(b.intent, clampStep(b.then_jump, steps.length));
+    }
+  }
+
+  const stackAt = new Map<number, number>();
   for (const it of intents) {
     const anchorIdx =
       intentAnchor.get(it.id) ??
-      (steps.length > 0
-        ? Math.min(Math.max((Number(it.steps?.[0]) || 1) - 1, 0), steps.length - 1)
-        : 0);
+      (steps.length > 0 ? clampStep(it.steps?.[0], steps.length) : 0);
     const stack = stackAt.get(anchorIdx) ?? 0;
     stackAt.set(anchorIdx, stack + INTENT_STACK_Y);
     nodes.push({
-      id: intentId(it.id),
+      id: intentNodeId(it.id),
       kind: "intent",
       x: INTENT_COL_X,
-      y: (stepY.get(anchorIdx) ?? LANE_TOP_Y) + stack,
+      y: stepY(anchorIdx) + stack,
       intentId: it.id,
       label: it.label || "(未命名意图)",
       keywords: it.keywords ?? [],
       enabled: it.enabled !== false,
       judge: Boolean(it.judge?.prompt),
-      playQa: (graph?.bindings ?? []).some(
-        (b) => b.intent === it.id && b.enabled !== false && b.action === "play_qa",
-      ),
+      playQa: enabledBindings.some((b) => b.intent === it.id && b.action === "play_qa"),
     });
   }
-  for (const b of jumpBindings) {
-    const idx = Math.min(Math.max((Number(b.step) || 1) - 1, 0), Math.max(steps.length - 1, 0));
-    edges.push({ id: `jump:${b.id ?? `${b.intent}:${idx}`}`, source: intentId(b.intent), target: stepId(idx), kind: "jump" });
+  for (const b of enabledBindings.filter((x) => x.action === "jump_step")) {
+    const it = byId.get(b.intent);
+    const jumpEdge = {
+      id: `jump:${b.id ?? `${b.intent}:${b.step}`}`,
+      source: intentNodeId(b.intent),
+      target: stepId(clampStep(b.step, steps.length)),
+      kind: "jump" as const,
+      label: intentEdgeLabel(it?.label || b.intent, it?.keywords ?? []),
+    };
+    edges.push(jumpEdge);
+  }
+  for (const b of enabledBindings.filter((x) => x.action === "play_qa" && Number(x.then_jump) > 0)) {
+    const thenEdge = {
+      id: `thenjump:${b.id ?? `${b.intent}:${b.then_jump}`}`,
+      source: intentNodeId(b.intent),
+      target: stepId(clampStep(b.then_jump, steps.length)),
+      kind: "thenjump" as const,
+      label: "播完跳转",
+    };
+    edges.push(thenEdge);
   }
   return { nodes, edges };
 }

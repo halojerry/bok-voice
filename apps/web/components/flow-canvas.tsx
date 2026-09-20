@@ -1,11 +1,10 @@
 "use client";
 
-// 流程画布（W2 T2）：话术步的场景泳道可视化 + 答法抽屉 + steps_json 保存。
-// 三层范式照 qa-canvas-view：节点/抽屉纯渲染上抛,本组件（宿主）独占 draft 状态与写路径;
-// 布局与 ref 拆装在 lib/flow-canvas（纯函数）。意图=只读 overlay（jump_step→跳转边、
-// play_qa→「播快答」徽标、judge→「判据」徽标）,编辑深链问答画布,W2 不搬图写路径。
-// 保存=serialize 全部步（含 scene）→ stepsToJson → updateTemplate({steps_json})
-// （CP PUT exclude_unset 部分更新,只动 steps_json 不抹其余字段）。
+// 流程画布（2026-09-20 易用性改版）：完全受控（draft/onDraftChange）——步骤草稿归
+// 工作站页面层，「未保存/应用」全局按钮是唯一保存入口；与步骤列表编辑同一份草稿，
+// 视图来回切不丢修改。画布=纵向步骤工作流：脊柱瀑布（实线=讲完默认进下一步）+
+// 左栏意图卡（虚线=听到关键词跳到对应步骤）+ 点步开「AI 怎么说」抽屉。
+// 意图=只读 overlay（编辑在「意图管理」tab）。
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
@@ -13,85 +12,116 @@ import {
   type Edge, type Node, type NodeChange, type NodeProps,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { api } from "@/lib/api";
-import { ErrorState } from "@/components/app-shell";
 import { useSession } from "@/components/session-context";
-import { jsonToSteps, stepsToJson, type FlowStep, type TemplateRow } from "@/components/template-editor";
+import type { FlowStep, TemplateRow } from "@/components/template-editor";
+import { VarTextarea } from "@/components/var-insert";
 import type { GraphDoc } from "@/lib/qa-canvas";
 import {
-  layoutFlow, parseStepRefParts, serializeStepRef,
-  type FlowNode, type StepRefParts, type StepBranch, UNGROUPED_LANE,
+  layoutFlow, parseStepRefParts, serializeStepRef, UNGROUPED_LANE,
+  parseBranchAction, composeBranchResp, branchActionBadge, branchCannedMeta, BRANCH_ACTIONS,
+  canvasFitViewOptions, canvasGuideText, graphHasIntents, CANVAS_INTENT_EMPTY_HINT, drawerIndexValid,
+  type FlowNode, type StepRefParts, type StepBranch, type BranchAction, type BranchCannedStatus,
 } from "@/lib/flow-canvas";
 
 // 情绪下拉选项与 template-editor 表单同款（罐头物化烧进音频,实时回复不受影响）。
 const EMOTIONS: [string, string][] = [
-  ["", "自动(不下发,按文本匹配)"],
+  ["", "自动"],
   ["calm", "平稳自然"],
-  ["sad", "低沉柔和(致歉/安抚)"],
+  ["sad", "低沉柔和（致歉/安抚）"],
   ["happy", "轻快亲切"],
   ["surprised", "惊讶上扬"],
 ];
-const EMOTION_LABEL: Record<string, string> = Object.fromEntries(EMOTIONS.filter(([v]) => v));
+const EMOTION_LABEL: Record<string, string> = {
+  calm: "平稳", sad: "柔和", happy: "亲切", surprised: "上扬",
+};
 
 // 拖拽柄外观（qa-canvas-view 同款;本画布边全部由布局派生,柄恒不可手连）。
 const HANDLE_STYLE = {
   width: 8, height: 8, background: "var(--live)", border: "1px solid var(--card-border)",
 };
 
+// F5 初始视图：缩放夹在 [0.75, 1]——8 步模板整图塞进 560px 视口不再缩到看不清,
+// 超出部分拖动/控制器/小地图翻看（模块级常量,避免每渲染新对象）。
+const FIT_VIEW_OPTIONS = canvasFitViewOptions();
+
 const inputCls =
   "w-full rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--live)";
 
+// 分支动作徽标配色（画布 chip 用;refuse=红(结束通话) handoff=蓝(人工) jump=琥珀(跳步) hold=紫(停留)）。
+const ACTION_BADGE_CLS: Record<string, string> = {
+  refuse: "bg-red-100 text-red-700",
+  handoff: "bg-sky-100 text-sky-700",
+  jump: "bg-amber-100 text-amber-700",
+  hold: "bg-violet-100 text-violet-700",
+};
+
 // —— 纯渲染节点 ——
-// 步节点：goal + 正稿首行截断 + 徽标（直念/情绪/意图跳入数）;点击开答法抽屉。
+// 步节点（工作流卡）：目的 + AI 说的话预览 + 徽标 + 「客户这样说」chip；点击开抽屉。
 function FlowStepNode({ data }: NodeProps) {
   const d = data as Extract<FlowNode, { kind: "step" }> & { onOpen: (index: number) => void };
   return (
     <div
-      className="w-[260px] cursor-pointer rounded-lg border border-(--live) bg-(--live-soft) p-3 text-xs hover:bg-accent"
-      title="点击编辑这一步的答法"
+      className="w-[300px] cursor-pointer rounded-lg border border-(--live) bg-(--live-soft) p-3 text-xs hover:bg-accent"
+      title="点这一步，编辑 AI 怎么说、怎么应对"
       onClick={() => d.onOpen(d.index)}
     >
+      {/* 脊柱入边（上）+ 意图跳转入边（左）+ 脊柱出边（下） */}
       <Handle type="target" position={Position.Top} id="t" isConnectable={false} style={HANDLE_STYLE} />
+      <Handle type="target" position={Position.Left} id="l" isConnectable={false} style={HANDLE_STYLE} />
       <Handle type="source" position={Position.Bottom} id="b" isConnectable={false} style={HANDLE_STYLE} />
-      <p className="line-clamp-2 font-medium">
-        第 {d.index + 1} 步 · {d.goal || "(无目标)"}
+      <p className="flex items-center gap-1.5 font-medium">
+        <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-(--live) px-1 text-[10px] font-bold text-white">
+          {d.index + 1}
+        </span>
+        <span className="min-w-0 flex-1 truncate">{d.goal || "(没写目的)"}</span>
       </p>
-      <p className="mt-1 line-clamp-1 muted">{d.scriptFirst || "(无正稿)"}</p>
+      {d.index === 0 && (
+        <p className="mt-0.5 text-[10px] text-(--live-ink)">● 电话接通先讲这一步</p>
+      )}
+      <p className="mt-1 line-clamp-2 muted">{d.scriptFirst || "(还没写内容)"}</p>
       <div className="mt-2 flex flex-wrap items-center gap-1">
-        {d.say && <span className="rounded-sm bg-sky-100 px-1 text-[10px] text-sky-700">直念</span>}
+        {d.say && <span className="rounded-sm bg-sky-100 px-1 text-[10px] text-sky-700">逐字照念</span>}
         {d.say && d.emotion && (
           <span className="rounded-sm bg-muted px-1 text-[10px]">{EMOTION_LABEL[d.emotion] ?? d.emotion}</span>
         )}
+        {d.scene && <span className="rounded-sm bg-violet-100 px-1 text-[10px] text-violet-700">{d.scene}</span>}
         {d.jumpIn > 0 && (
-          <span className="rounded-sm bg-amber-100 px-1 text-[10px] text-amber-700">{d.jumpIn} 意图跳入</span>
+          <span className="rounded-sm bg-amber-100 px-1 text-[10px] text-amber-700">{d.jumpIn} 个意图会跳到这</span>
         )}
       </div>
+      {(d.branches.length > 0 || d.branchMore > 0) && (
+        <div className="mt-1.5 border-t border-(--card-border) pt-1.5">
+          <p className="text-[9px] muted">客户这样说时有专门应对</p>
+          <div className="mt-0.5 flex flex-wrap gap-1">
+            {d.branches.map((b, i) => {
+              // 动作徽标（收线/转人工/跳第N步/留本步）;悬浮提示剥标记,不露「【收线】」原始串。
+              const badge = b.action ? branchActionBadge(b.action, b.jump) : "";
+              return (
+                <span
+                  key={i}
+                  className="inline-flex max-w-full items-center gap-1 rounded-full border border-(--card-border) bg-background px-1.5 py-0.5 text-[10px]"
+                  title={`客户${b.cond} → ${badge ? badge + "：" : ""}${parseBranchAction(b.resp).text}`}
+                >
+                  <span className="max-w-[10em] truncate">{b.cond || "(空)"}</span>
+                  {badge && (
+                    <span className={`shrink-0 rounded-sm px-1 leading-4 ${ACTION_BADGE_CLS[b.action] ?? "bg-muted"}`}>
+                      {badge}
+                    </span>
+                  )}
+                </span>
+              );
+            })}
+            {d.branchMore > 0 && (
+              <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] muted">+{d.branchMore}</span>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
-// 场景泳道头：名字行内可编辑（受控上抛 onChangeScene(prev,new);逐键重映射同名步）。
-function LaneHeaderNode({ data }: NodeProps) {
-  const d = data as Extract<FlowNode, { kind: "lane" }> & {
-    canEdit: boolean;
-    onChangeScene: (prev: string, next: string) => void;
-  };
-  return (
-    <div className="w-[180px] rounded-lg border border-dashed border-(--card-border) bg-muted/60 p-2">
-      <p className="mb-1 text-[10px] muted">场景</p>
-      <input
-        className={`${inputCls} nodrag font-medium`}
-        value={d.name}
-        disabled={!d.canEdit}
-        placeholder="未分组"
-        title={d.canEdit ? "改场景名：该泳道全部步随之改名" : undefined}
-        onChange={(e) => d.onChangeScene(d.name, e.target.value)}
-      />
-    </div>
-  );
-}
-
-// 意图节点（只读 overlay）：跳转边在布局层派生;徽标=播快答/判据/停用。
+// 意图节点（只读 overlay,左栏）：跳转边在布局层派生;编辑在「意图管理」tab。
 function FlowIntentNode({ data }: NodeProps) {
   const d = data as Extract<FlowNode, { kind: "intent" }>;
   return (
@@ -100,18 +130,20 @@ function FlowIntentNode({ data }: NodeProps) {
         d.enabled ? "border-amber-300 bg-amber-50" : "border-(--card-border) bg-muted/60 opacity-50"
       }`}
     >
-      <Handle type="target" position={Position.Left} id="l" isConnectable={false} style={HANDLE_STYLE} />
       <Handle type="source" position={Position.Right} id="r" isConnectable={false} style={HANDLE_STYLE} />
       <p className="flex items-center gap-1.5 font-medium">
         <span aria-hidden>🎯</span>
         <span className="min-w-0 truncate">{d.label}</span>
       </p>
-      <p className="mt-1 truncate muted">{d.keywords.join(" / ")}</p>
+      <p className="mt-1 truncate muted">听到：{d.keywords.join(" / ") || "—"}</p>
       <div className="mt-1.5 flex flex-wrap gap-1">
         {d.playQa && <span className="rounded-sm bg-emerald-100 px-1 text-[10px] text-emerald-700">播快答</span>}
         {d.judge && (
-          <span className="rounded-sm bg-amber-100 px-1 text-[10px] text-amber-700" title="关键词未中时由后台 LLM 按判据评估">
-            判据
+          <span
+            className="rounded-sm bg-amber-100 px-1 text-[10px] text-amber-700"
+            title="关键词没听清时，AI 会按这段描述再判断一次"
+          >
+            智能判定
           </span>
         )}
         {!d.enabled && <span className="rounded-sm bg-muted px-1 text-[10px]">已停用</span>}
@@ -120,15 +152,21 @@ function FlowIntentNode({ data }: NodeProps) {
   );
 }
 
-const NODE_TYPES = { flowStep: FlowStepNode, laneHeader: LaneHeaderNode, flowIntent: FlowIntentNode };
+const NODE_TYPES = { flowStep: FlowStepNode, flowIntent: FlowIntentNode };
 
-// —— 答法抽屉（右侧固定面板,非 modal）：全部字段受控,写路径归宿主 ——
+// —— 步骤编辑抽屉（右侧固定面板,非 modal）：全部字段受控,写路径归宿主 ——
 function AnswerDrawer(props: {
   index: number;
   step: FlowStep;
   scenes: string[];
   parts: StepRefParts;
   readOnly: boolean;
+  /** 分支罐头录音状态（key=分支 resp 原文含标记,逐字节）;缺省=不显示状态点。 */
+  branchCanned?: Record<string, BranchCannedStatus>;
+  /** 点「补录」回调;未传（或只读）则按钮不渲染。 */
+  onPregenBranch?: (resp: string) => void;
+  /** 模板语言（预留文案提示位,当前不参与渲染）。 */
+  currentTemplateLanguage?: string;
   onGoal: (v: string) => void;
   onScene: (v: string) => void;
   onSay: (v: boolean) => void;
@@ -142,29 +180,29 @@ function AnswerDrawer(props: {
   return (
     <aside className="w-[340px] shrink-0 space-y-2 self-start rounded-lg border border-(--card-border) bg-muted/40 p-3">
       <div className="flex items-center justify-between">
-        <span className="label">第 {props.index + 1} 步 · 答法</span>
+        <span className="label">第 {props.index + 1} 步：AI 怎么说</span>
         <button className="btn-ghost px-2 py-0.5 text-xs" onClick={props.onClose}>收起 ✕</button>
       </div>
-      <p className="text-[11px] muted">改动在画布顶部「保存」后落库。</p>
+      <p className="text-[11px] muted">改动记入右上角「未保存」，点「应用」才会生效。</p>
       <label className="block">
-        <span className="text-xs muted">目标</span>
+        <span className="text-xs muted">这一步的目的（给你自己看的备注）</span>
         <input
           className={`mt-0.5 ${inputCls}`}
           value={props.step.goal}
           disabled={readOnly}
-          placeholder="这一步要达成的目标"
+          placeholder="如：确认对方身份"
           onChange={(e) => props.onGoal(e.target.value)}
         />
       </label>
       <label className="block">
-        <span className="text-xs muted">场景（纯分组,不影响推进顺序）</span>
+        <span className="text-xs muted">分组标签（可选，只影响画布上的颜色归类）</span>
         <select
           className={`mt-0.5 ${inputCls}`}
           value={props.step.scene ?? ""}
           disabled={readOnly}
           onChange={(e) => props.onScene(e.target.value)}
         >
-          <option value="">{UNGROUPED_LANE}</option>
+          <option value="">不分组</option>
           {props.scenes.map((s) => (
             <option key={s} value={s}>{s}</option>
           ))}
@@ -178,11 +216,11 @@ function AnswerDrawer(props: {
           disabled={readOnly}
           onChange={(e) => props.onSay(e.target.checked)}
         />
-        直念(进入该步的当轮逐字念正稿首行)
+        逐字照念（AI 一字不差念下面第一行，不自由发挥）
       </label>
       {props.step.say === true && (
         <label className="flex items-center gap-1.5 text-[11px] muted">
-          情绪
+          念的语气
           <select
             className="rounded-lg border border-(--card-border) bg-transparent px-1.5 py-0.5 text-xs outline-hidden focus:border-(--live)"
             value={props.step.emotion ?? ""}
@@ -193,62 +231,136 @@ function AnswerDrawer(props: {
               <option key={v} value={v}>{l}</option>
             ))}
           </select>
-          <span className="text-[10px]">罐头物化时烧进音频</span>
+          <span className="text-[10px]">录音时用这个语气</span>
         </label>
       )}
-      <label className="block">
-        <span className="text-xs muted">正稿（首个非空行=本步首轮说的话;未知格式行也留在这里,保存原样回写）</span>
-        <textarea
-          className={`mt-0.5 h-24 resize-none ${inputCls}`}
-          value={parts.script}
-          disabled={readOnly}
-          onChange={(e) => props.onParts({ ...parts, script: e.target.value })}
-        />
-      </label>
       <div>
-        <span className="text-xs muted">分支（如果客户…→应答;运行时按客户回应只命中一条）</span>
-        <div className="mt-1 space-y-1">
-          {parts.branches.map((b, i) => (
-            <div key={i} className="flex items-center gap-1">
-              <input
-                className={inputCls}
-                value={b.cond}
-                disabled={readOnly}
-                placeholder="如果客户…"
-                onChange={(e) => setBranch(i, { cond: e.target.value })}
-              />
-              <input
-                className={inputCls}
-                value={b.resp}
-                disabled={readOnly}
-                placeholder="应答…"
-                onChange={(e) => setBranch(i, { resp: e.target.value })}
-              />
-              <button
-                className="btn-ghost shrink-0 px-1.5 py-0 text-xs text-red-600"
-                disabled={readOnly}
-                onClick={() => props.onParts({ ...parts, branches: parts.branches.filter((_, j) => j !== i) })}
-              >
-                删
-              </button>
-            </div>
-          ))}
+        <span className="text-xs muted">AI 主要说的话（写要点即可，AI 用自己的语气讲）</span>
+        <div className="mt-0.5">
+          <VarTextarea
+            className={`h-24 resize-none ${inputCls}`}
+            value={parts.script}
+            disabled={readOnly}
+            onChange={(v) => props.onParts({ ...parts, script: v })}
+          />
+        </div>
+      </div>
+      <div>
+        <span className="text-xs muted">客户如果这样说 → AI 怎么做（每条一个应对）</span>
+        <div className="mt-1 space-y-1.5">
+          {parts.branches.map((b, i) => {
+            // 编辑面三件拆装：条件 / 动作（+跳步步号）/ 纯文本——动作标记只活在 resp 原文里,
+            // 文本域恒显示剥标记后的内容,编辑时 composeBranchResp 重组回 resp（切动作不丢字）。
+            const info = parseBranchAction(b.resp);
+            const canned = props.branchCanned ? props.branchCanned[b.resp] : undefined;
+            const cannedMeta = canned ? branchCannedMeta(canned) : null;
+            return (
+              <div key={i} className="space-y-1 rounded-lg border border-(--card-border) bg-background p-1.5">
+                <input
+                  className={inputCls}
+                  value={b.cond}
+                  disabled={readOnly}
+                  placeholder="客户说…（如：问为什么赔）"
+                  onChange={(e) => setBranch(i, { cond: e.target.value })}
+                />
+                <div className="flex items-center gap-1">
+                  <select
+                    className={inputCls}
+                    value={info.action}
+                    disabled={readOnly}
+                    title="AI 听到这句话后要做什么"
+                    onChange={(e) => {
+                      const next = e.target.value as BranchAction;
+                      // 切动作不丢文本;jump 步号沿用旧值（原本无标记/非 jump 时默认 1）。
+                      const step = info.action === "jump" ? info.step : 1;
+                      setBranch(i, { resp: composeBranchResp(next, step, info.text) });
+                    }}
+                  >
+                    {BRANCH_ACTIONS.map((a) => (
+                      <option key={a.value} value={a.value}>{a.label}</option>
+                    ))}
+                  </select>
+                  {info.action === "jump" && (
+                    <input
+                      type="number"
+                      className="w-16 shrink-0 rounded-lg border border-(--card-border) bg-transparent px-1.5 py-1 text-xs outline-hidden focus:border-(--live)"
+                      min={1}
+                      max={999}
+                      value={info.step || 1}
+                      disabled={readOnly}
+                      title="跳到第几步（从 1 开始数）"
+                      onChange={(e) =>
+                        setBranch(i, { resp: composeBranchResp("jump", Number(e.target.value), info.text) })
+                      }
+                    />
+                  )}
+                </div>
+                <p className="text-[10px] muted">
+                  {BRANCH_ACTIONS.find((a) => a.value === info.action)?.hint}
+                </p>
+                <textarea
+                  className={`h-14 resize-none ${inputCls}`}
+                  value={info.text}
+                  disabled={readOnly}
+                  placeholder="AI 就答…（一两句话，写要点即可）"
+                  onChange={(e) =>
+                    // 分支应答是单行注入（序列化按行拼 ref）,换行折叠成空格防劈裂分支行。
+                    setBranch(i, {
+                      resp: composeBranchResp(
+                        info.action,
+                        info.action === "jump" ? info.step : 0,
+                        e.target.value.replace(/[\r\n]+/g, " "),
+                      ),
+                    })
+                  }
+                />
+                <div className="flex items-center justify-between">
+                  {cannedMeta ? (
+                    <span className="inline-flex items-center gap-1 text-[10px] muted" title={cannedMeta.title}>
+                      <span className={`inline-block size-1.5 rounded-full ${cannedMeta.dot}`} aria-hidden />
+                      {cannedMeta.title}
+                    </span>
+                  ) : (
+                    <span />
+                  )}
+                  <span className="flex shrink-0 items-center gap-1">
+                    {canned === "missing" && props.onPregenBranch && !readOnly && (
+                      <button
+                        className="btn-ghost px-1.5 py-0 text-[10px]"
+                        title="给这条应对补录罐头音频（客户这样说时直接播录音，更快更稳）"
+                        onClick={() => props.onPregenBranch?.(b.resp)}
+                      >
+                        补录
+                      </button>
+                    )}
+                    <button
+                      className="btn-ghost shrink-0 px-1.5 py-0 text-xs text-red-600"
+                      disabled={readOnly}
+                      onClick={() => props.onParts({ ...parts, branches: parts.branches.filter((_, j) => j !== i) })}
+                    >
+                      删
+                    </button>
+                  </span>
+                </div>
+              </div>
+            );
+          })}
           <button
             className="btn-ghost px-2 py-0.5 text-xs"
             disabled={readOnly}
             onClick={() => props.onParts({ ...parts, branches: [...parts.branches, { cond: "", resp: "" }] })}
           >
-            ＋ 加分支
+            ＋ 加一条应对
           </button>
         </div>
       </div>
       <label className="block">
-        <span className="text-xs muted">注意（操作事实,每轮注入;多条每行一条）</span>
+        <span className="text-xs muted">给 AI 的补充提醒（每次都记住的事实，如必讲的号码）</span>
         <textarea
           className={`mt-0.5 h-16 resize-none ${inputCls}`}
           value={parts.notes}
           disabled={readOnly}
-          placeholder="注意：…"
+          placeholder="如：赔付只能进微信零钱"
           onChange={(e) => props.onParts({ ...parts, notes: e.target.value })}
         />
       </label>
@@ -257,14 +369,24 @@ function AnswerDrawer(props: {
 }
 
 export default function FlowCanvas(props: {
-  /** 编辑的模板行（steps_json/graph_json/owner 判定源）;null=无可编辑内容。 */
+  /** 编辑的模板行（owner 判定源）;null=无可编辑内容。 */
   tpl: TemplateRow | null;
   /** 话术图（parseGraphDoc 结果）,只读 overlay 数据源。 */
   graph: GraphDoc;
-  /** 保存成功后回调：外层重拉模板行（徽标/各 tab 随之取权威数据）。 */
-  onSaved?: () => void;
+  /** 步骤草稿（工作站层持有）;本组件只上报变更,不做保存。 */
+  draft: FlowStep[];
+  onDraftChange: (next: FlowStep[]) => void;
+  /** 分支罐头录音状态（只读渲染,本组件不发请求;key=分支 resp 原文含标记,逐字节）。
+   * 缺省=不显示录音状态,旧调用零变化。 */
+  branchCanned?: Record<string, BranchCannedStatus>;
+  /** 点「补录」时回调（参数=该分支 resp 原文含标记）;未传则按钮不渲染。 */
+  onPregenBranch?: (resp: string) => void;
+  /** 模板语言（预留文案提示位,当前不参与渲染）。 */
+  currentTemplateLanguage?: string;
+  /** F6：画布没有意图时的空态引导点击回调（跳「意图管理」tab）;未传=只给文字提示。 */
+  onOpenIntents?: () => void;
 }) {
-  const { graph } = props;
+  const { graph, draft } = props;
   const session = useSession();
   const tplId = String(props.tpl?.id ?? "");
   // B4 owner 只读兜底（与 TemplateEditor 同款口径;CP PUT/publish 闸兜底）。
@@ -274,26 +396,19 @@ export default function FlowCanvas(props: {
   const uid = session?.user_id ?? "";
   const readOnly = Boolean(tplId) && !isManager && !(uid !== "" && String(props.tpl?.owner_user_id ?? "") === uid);
 
-  // 草稿步（含 scene）：tpl.id 变化才重锚（保存后外层重拉同 id 不冲掉编辑中状态）。
-  const [draft, setDraft] = useState<FlowStep[]>([]);
   const [drawerIdx, setDrawerIdx] = useState<number | null>(null);
   const [parts, setParts] = useState<StepRefParts | null>(null);
   const [positions, setPositions] = useState<Record<string, { x: number; y: number }>>({});
-  const [err, setErr] = useState<string | null>(null);
-  const [ok, setOk] = useState(false);
-  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    setDraft(jsonToSteps(props.tpl?.steps_json));
     setDrawerIdx(null);
     setPositions({});
-    setErr(null);
-    setOk(false);
-    // 只跟 tpl.id 走（TemplateEditor 同款锚定语义）。
+    // 只跟 tpl.id 走（换模板才收抽屉/重置拖动位置）。点「应用」保存=同 id 重拉,
+    // 这里的 tplId 字符串不变 → 抽屉与画布状态原样保留（F7：连续改多条分支不用重开）。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tplId]);
 
-  // 抽屉打开时把该步 ref 拆成正稿/分支/注意（之后逐键受控编辑,保存前实时序列化回 draft）。
+  // 抽屉打开时把该步 ref 拆成 主要内容/应对/提醒 三件（受控编辑实时序列化回草稿）。
   useEffect(() => {
     if (drawerIdx === null) {
       setParts(null);
@@ -304,58 +419,32 @@ export default function FlowCanvas(props: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [drawerIdx]);
 
+  // 抽屉步号越界（草稿里步骤真被换掉/删少）才自动收起;同模板保存重拉不清抽屉（F7）。
+  useEffect(() => {
+    if (drawerIdx !== null && !drawerIndexValid(drawerIdx, draft.length)) setDrawerIdx(null);
+  }, [drawerIdx, draft.length]);
+
   const layout = useMemo(() => layoutFlow(draft, graph), [draft, graph]);
+  // F6：左栏意图卡在不在（引导语与空态提示跟它走,停用意图也渲染成卡,与布局同口径）。
+  const hasIntents = graphHasIntents(graph);
   const scenes = useMemo(
     () => [...new Set(draft.map((s) => (s.scene ?? "").trim()).filter(Boolean))],
     [draft],
   );
 
-  // —— 写路径（宿主独占） ——
+  // —— 写路径（全部上报宿主草稿;保存=工作站层「应用」） ——
   const updateStep = useCallback(
     (idx: number, patch: Partial<FlowStep>) =>
-      setDraft((d) => d.map((s, i) => (i === idx ? { ...s, ...patch } : s))),
-    [],
+      props.onDraftChange(draft.map((s, i) => (i === idx ? { ...s, ...patch } : s))),
+    [draft, props.onDraftChange],
   );
-  // 抽屉三件编辑：parts 即时回显 + 序列化写回该步 ref（保存按钮永远拿到最新 draft）。
+  // 抽屉三件编辑：parts 即时回显 + 序列化写回该步 ref（草稿永远拿到最新值）。
   // 普通函数（非 useCallback）：闭包持当轮 drawerIdx,不在状态更新器里做副作用。
   function updateParts(next: StepRefParts) {
     setParts(next);
     if (drawerIdx === null) return;
     const ref = serializeStepRef(next);
-    setDraft((d) => d.map((s, i) => (i === drawerIdx ? { ...s, ref } : s)));
-  }
-  // 泳道头改名：该场景全部步随之重映射（scene 空的「未分组」泳道头不可改,canEdit 已闸）。
-  const renameScene = useCallback((prev: string, next: string) => {
-    const name = next.trim();
-    if (!name || name === prev) return;
-    setDraft((d) => d.map((s) => ((s.scene ?? "") === prev ? { ...s, scene: name } : s)));
-  }, []);
-  // 新建场景：落一个带场景的空白步并直接开抽屉（空白步保存时被 stepsToJson 过滤,不产生垃圾行）。
-  const addScene = useCallback(() => {
-    const name = (window.prompt("新场景名称（如：开场 / 谈赔偿 / 收尾）") ?? "").trim();
-    if (!name) return;
-    if (draft.some((s) => (s.scene ?? "") === name)) return;
-    setDraft((d) => (d.some((s) => (s.scene ?? "") === name) ? d : [...d, { goal: "", ref: "", scene: name }]));
-    setDrawerIdx(draft.length);
-  }, [draft]);
-
-  async function save() {
-    if (!tplId) return;
-    setSaving(true);
-    setErr(null);
-    setOk(false);
-    try {
-      await api.updateTemplate(tplId, { steps_json: stepsToJson(draft) });
-      // 空白步（goal+ref 全空）被 stepsToJson 静默过滤——计数提示,防「画了几步存出来少几步」困惑。
-      const dropped = draft.filter((s) => !s.goal.trim() && !s.ref.trim()).length;
-      if (dropped > 0) setErr(`已忽略 ${dropped} 个空白步（目标与参考说法都为空）。`);
-      setOk(true);
-      props.onSaved?.();
-    } catch (e) {
-      setErr(String(e));
-    } finally {
-      setSaving(false);
-    }
+    props.onDraftChange(draft.map((s, i) => (i === drawerIdx ? { ...s, ref } : s)));
   }
 
   // —— RF 受控图 ——
@@ -364,12 +453,6 @@ export default function FlowCanvas(props: {
     () =>
       layout.nodes.map((n) => {
         const position = positions[n.id] ?? { x: n.x, y: n.y };
-        if (n.kind === "lane") {
-          return {
-            id: n.id, type: "laneHeader" as const, position, deletable: false,
-            data: { ...n, canEdit: !readOnly && n.name !== UNGROUPED_LANE, onChangeScene: renameScene },
-          };
-        }
         if (n.kind === "step") {
           return {
             id: n.id, type: "flowStep" as const, position, deletable: false,
@@ -378,7 +461,7 @@ export default function FlowCanvas(props: {
         }
         return { id: n.id, type: "flowIntent" as const, position, deletable: false, data: { ...n } };
       }),
-    [layout, positions, readOnly, renameScene, openDrawer],
+    [layout, positions, openDrawer],
   );
   const edges: Edge[] = useMemo(
     () =>
@@ -388,15 +471,28 @@ export default function FlowCanvas(props: {
             id: e.id, source: e.source, target: e.target,
             sourceHandle: "b", targetHandle: "t",
             selectable: false, deletable: false,
+            label: e.label,
             style: { stroke: "var(--muted-foreground)", strokeWidth: 2 },
+            labelStyle: { fontSize: 10 },
+          };
+        }
+        if (e.kind === "thenjump") {
+          return {
+            id: e.id, source: e.source, target: e.target,
+            sourceHandle: "r", targetHandle: "l",
+            selectable: false, deletable: false,
+            label: e.label,
+            style: { stroke: "#059669", strokeWidth: 1.6, strokeDasharray: "2 4" },
+            labelStyle: { fill: "#065f46", fontSize: 10 },
+            labelBgStyle: { fill: "#d1fae5" },
           };
         }
         return {
           id: e.id, source: e.source, target: e.target,
-          sourceHandle: "r", targetHandle: "t",
+          sourceHandle: "r", targetHandle: "l",
           selectable: false, deletable: false,
-          label: "跳转",
-          style: { stroke: "#d97706", strokeWidth: 1.6, strokeDasharray: "6 4" },
+          label: e.label,
+          style: { stroke: "#d97706", strokeWidth: 1.8, strokeDasharray: "6 4" },
           labelStyle: { fill: "#92400e", fontSize: 10 },
           labelBgStyle: { fill: "#fef3c7" },
         };
@@ -424,27 +520,30 @@ export default function FlowCanvas(props: {
     <section className="card space-y-2">
       <div className="flex flex-wrap items-center gap-2">
         <span className="label">流程画布</span>
-        <span className="text-[11px] muted">点步节点编辑答法；场景=泳道纯分组，不改推进顺序</span>
-        <div className="ml-auto flex items-center gap-2">
-          {!readOnly && (
-            <button className="btn-ghost text-xs" disabled={!tplId} onClick={addScene}>
-              ＋ 新建场景
-            </button>
-          )}
-          {!readOnly && (
-            <button className="btn-primary px-3 py-1 text-xs" disabled={saving || !tplId} onClick={save}>
-              {saving ? "保存中…" : "保存"}
-            </button>
-          )}
-        </div>
+        <span className="text-[11px] muted">{canvasGuideText(hasIntents)}</span>
       </div>
       {readOnly && (
         <p className="rounded-lg bg-amber-50 px-3 py-2 text-[11px] text-amber-700">
           共享话术由主管维护；你可以查看但不能修改。
         </p>
       )}
-      {err && <ErrorState message={err} />}
-      {ok && !err && <span className="text-sm text-emerald-600">已保存。</span>}
+      {/* F6 空态：还没配意图时左栏本来就是空的,明说+给去处,不让人以为页面坏了。 */}
+      {!hasIntents && (
+        <p className="text-[11px] muted">
+          {CANVAS_INTENT_EMPTY_HINT}
+          {props.onOpenIntents && !readOnly ? (
+            <button
+              type="button"
+              className="ml-1 text-(--live) hover:underline"
+              onClick={props.onOpenIntents}
+            >
+              去「意图管理」添加 →
+            </button>
+          ) : (
+            <span className="ml-1">需要的话可以在「意图管理」里添加。</span>
+          )}
+        </p>
+      )}
       <div className="flex items-stretch gap-3">
         <div className="h-[560px] min-w-0 flex-1 rounded-lg border border-(--card-border)">
           <ReactFlow
@@ -452,6 +551,7 @@ export default function FlowCanvas(props: {
             edges={edges}
             nodeTypes={NODE_TYPES}
             fitView
+            fitViewOptions={FIT_VIEW_OPTIONS}
             minZoom={0.2}
             deleteKeyCode={null}
             onNodesChange={onNodesChange}
@@ -469,6 +569,9 @@ export default function FlowCanvas(props: {
             scenes={scenes}
             parts={parts}
             readOnly={readOnly}
+            branchCanned={props.branchCanned}
+            onPregenBranch={props.onPregenBranch}
+            currentTemplateLanguage={props.currentTemplateLanguage}
             onGoal={(v) => updateStep(drawerIdx, { goal: v })}
             onScene={(v) => updateStep(drawerIdx, { scene: v })}
             onSay={(v) => updateStep(drawerIdx, { say: v })}
@@ -479,7 +582,7 @@ export default function FlowCanvas(props: {
         )}
       </div>
       {draft.length === 0 && (
-        <p className="text-xs muted">该模板还没有步骤——回「表单」页签配置或填入示例后，这里会按场景分泳道展示。</p>
+        <p className="text-xs muted">这套话术还没有步骤——切到「列表编辑」点「+ 加一步」或「填示例」。</p>
       )}
     </section>
   );

@@ -1,12 +1,14 @@
 "use client";
 
-// AI 工作站（W1）：以话术模板为入口的集中工作台。
-// 列表态（无 ?t=）：全部模板概览（步数/意图数为行内现算,仅展示、权威以详情为准）；
-// 工作台态（?t=<id>）：话术流程编辑 + 意图与问答 + 变量 + 罐头录音 + 通话日志 + 学习报告 六个 tab
+// AI 工作站（W1；2026-09-20 重设计）：以话术模板为入口的集中工作台。
+// 列表态（无 ?t=）：全部模板概览 + 新建话术（话术/快答内容全部整合在此，
+// /templates、/qa 移出主导航后这里成为唯一内容入口）；
+// 工作台态（?t=<id>）：话术流程 + 意图管理 + 变量 + 客户意向 + 录音沉淀 +
+// 通话日志 + 学习报告 tab（对齐参考产品的主流程/意图管理/变量设定/客户意向/录音管理 tab 面）。
 // （学习报告/聚类采纳在 components/study-tab.tsx,变量目录与预览在 components/template-vars.tsx）。
 // 深链先例：/calls?call= / /supervisor?listen= —— 静态导出用 query，不开动态路由。
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { api, type UserRow } from "@/lib/api";
 import { parseGraphDoc, parseTemplateSteps } from "@/lib/qa-canvas";
@@ -16,12 +18,22 @@ import { hasPage, useSession } from "@/components/session-context";
 import TemplateEditor, {
   LANGS,
   PublishBadge,
+  jsonToSteps,
+  stepsToJson,
   toTemplateRow,
+  type FlowStep,
   type TemplateRow,
 } from "@/components/template-editor";
 import FlowCanvas from "@/components/flow-canvas";
+import StepsListEditor from "@/components/steps-list-editor";
 import StudyTab from "@/components/study-tab";
+import GapMining from "@/components/gap-mining";
 import TemplateVarsTab from "@/components/template-vars";
+import CannedAuditionCard from "@/components/canned-audition";
+import IntentRulesCard from "@/components/intent-rules-card";
+import IntentManager from "@/components/intent-manager";
+import QaLibrary from "@/components/qa-library";
+import { seedPackFor } from "@/lib/seed-pack";
 
 // 通话行状态徽标（照 calls 页惯例搬一份,页面文件不可导入）。
 const CALL_STATUS: Record<string, [string, string]> = {
@@ -61,6 +73,10 @@ export default function StudioPage() {
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState("");
   const [userNames, setUserNames] = useState<Record<string, string>>({});
+  // 新建话术面板（2026-09-20：/templates 移出主导航，这里成为唯一内容入口）。
+  const [creating, setCreating] = useState(false);
+  // 列表刷新序号：新建保存成功后 +1 重拉列表。
+  const [listRev, setListRev] = useState(0);
 
   useEffect(() => {
     if (selId) return; // 工作台态不拉列表
@@ -81,7 +97,7 @@ export default function StudioPage() {
     return () => {
       alive = false;
     };
-  }, [selId, accountId]);
+  }, [selId, accountId, listRev]);
 
   // 主管面归属徽标要显示成员姓名（话务员无权访问 /api/users，不请求；照 templates 页惯例）。
   useEffect(() => {
@@ -146,19 +162,101 @@ export default function StudioPage() {
   // 意图图与步骤脊柱（graph_json 解析一律走 lib/qa-canvas.parseGraphDoc 现成实现）。
   const graph = useMemo(() => parseGraphDoc(tplRow?.graph_json ?? ""), [tplRow]);
   const stepsList = useMemo(() => parseTemplateSteps(tplRow?.steps_json ?? ""), [tplRow]);
+  // 内容只读判定（B4 owner 口径，与 FlowCanvas/TemplateEditor 同款）：共享话术非主管=只读。
+  const contentReadOnly = Boolean(selId) && !isManager && !(uid !== "" && String(tplRow?.owner_user_id ?? "") === uid);
+
+  // ---- 步骤草稿（工作站层唯一持有；画布与列表编辑同一份——切换视图不丢修改） ----
+  const [stepsDraft, setStepsDraft] = useState<FlowStep[]>([]);
+  const [stepsDirty, setStepsDirty] = useState(false);
+  const [applying, setApplying] = useState(false);
+  const [applyErr, setApplyErr] = useState("");
+  const [applyNote, setApplyNote] = useState("");
+  const [publishing, setPublishing] = useState(false);
+
+  // 锚定：模板行变化（进入工作台/应用成功重拉/保存设置重拉）→ 草稿=落库值、清脏。
+  // **脏修改在途时模板行重拉不重锚**（保存「模板设置」会触发重拉——重置草稿=冲掉
+  // 未应用的步骤修改,正是本次改版要消灭的丢编辑陷阱）；换模板必重锚。
+  const anchoredSelRef = useRef(selId);
+  useEffect(() => {
+    const changedTemplate = anchoredSelRef.current !== selId;
+    anchoredSelRef.current = selId;
+    if (!changedTemplate && stepsDirty) return;
+    setStepsDraft(jsonToSteps(tpl?.steps_json));
+    setStepsDirty(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selId, tpl]);
+
+  const changeSteps = useCallback((next: FlowStep[]) => {
+    setStepsDraft(next);
+    setStepsDirty(true);
+    setApplyNote("");
+  }, []);
+
+  /** 全局「应用」：唯一保存入口（只写 steps_json 单键,PUT exclude_unset 部分更新）。 */
+  async function applySteps() {
+    if (!selId || applying) return;
+    setApplying(true);
+    setApplyErr("");
+    try {
+      await api.updateTemplate(selId, { steps_json: stepsToJson(stepsDraft) });
+      const dropped = stepsDraft.filter((s) => !s.goal.trim() && !s.ref.trim()).length;
+      setApplyNote(dropped > 0 ? `已应用（忽略了 ${dropped} 个空白步）` : "已应用");
+      // 应用后即清脏（重拉到达前用户可见状态正确;锚定效应随后重锚为同一份落库值）。
+      setStepsDirty(false);
+      setTplRev((v) => v + 1); // 重拉模板行（发布徽标等随之取权威数据）
+    } catch (e) {
+      setApplyErr(String(e));
+    } finally {
+      setApplying(false);
+    }
+  }
+
+  /** 发布（新通话用冻结版）：有未应用修改先提醒——发布的是已保存版本。 */
+  async function publishNow() {
+    if (!selId) return;
+    if (stepsDirty && !window.confirm("还有未应用的修改：发布的是「已保存」的版本。建议先点「应用」。\n\n仍要直接发布？")) return;
+    if (!window.confirm("发布后，之后拨出的电话都按这个版本讲。确定发布？")) return;
+    setPublishing(true);
+    try {
+      await api.publishTemplate(selId);
+      setTplRev((v) => v + 1);
+    } catch (e) {
+      setApplyErr(String(e));
+    } finally {
+      setPublishing(false);
+    }
+  }
+
+  // 有未应用修改时拦浏览器关闭/刷新（站点内导航走「返回列表」的确认）。
+  useEffect(() => {
+    if (!stepsDirty) return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [stepsDirty]);
+
+  /** 返回列表：脏=确认（未应用的修改会丢——页面态不跨模板保留）。 */
+  function backToList() {
+    if (stepsDirty && !window.confirm("主流程的修改还没应用，返回会丢失。仍要返回？")) return;
+    window.location.assign("/studio/");
+  }
 
   // ---- tab 切换（qa 页 view chips 同款写法）；学习报告 tab 仅对有 reports 键的人出现 ----
   const [tab, setTab] = useState("flow");
-  // 话术流程 tab 双视图（W2 流程画布）：表单=共用编辑器,画布=场景泳道+答法抽屉。
-  const [flowView, setFlowView] = useState<"form" | "canvas">("form");
+  // 主流程 tab 双视图：画布=推荐默认（普通人视角：看到流程再点步骤）；列表=批量编辑。
+  const [flowView, setFlowView] = useState<"form" | "canvas">("canvas");
   const tabs: [string, string][] = [
-    ["flow", "话术流程"],
-    ["intent", "意图与问答"],
-    ["vars", "变量"],
-    ["canned", "罐头录音"],
+    ["flow", "主流程"],
+    ["intent", "意图管理"],
+    ["qa", "问答库"],
+    ["vars", "变量设定"],
+    ["disposition", "客户意向"],
+    ["canned", "录音沉淀"],
     ["calls", "通话日志"],
   ];
-  if (canReports) tabs.push(["reports", "学习报告"]);
+  if (canReports) tabs.push(["reports", "场景学习"]);
 
   // ---- 罐头录音 tab：挂该模板步骤的 QA 词条 + 罐头物化状态 ----
   const [qaRows, setQaRows] = useState<Record<string, unknown>[]>([]);
@@ -203,6 +301,48 @@ export default function StudioPage() {
     [qaRows, selId],
   );
 
+  // ---- 分支罐头状态（主流程画布答法抽屉，2026-09-20）：statuses 键=分支 resp
+  // 原文（含动作标记）。进主流程 tab / 换模板 / 换账号拉一次（TTL 缓存在 CP 侧，
+  // 补录后 branchRev+1 定点刷一次，不轮询）。拉取失败=无徽标降级，不阻塞画布。 ----
+  const [branchCanned, setBranchCanned] = useState<Record<string, "ok" | "missing" | "ph">>({});
+  const [branchRev, setBranchRev] = useState(0);
+  const [branchNote, setBranchNote] = useState("");
+  useEffect(() => {
+    if (tab !== "flow" || !selId) return;
+    let alive = true;
+    api.branchCannedStatus(accountId)
+      .then((res) => {
+        if (alive) setBranchCanned(res?.statuses ?? {});
+      })
+      .catch(() => {
+        if (alive) setBranchCanned({});
+      });
+    return () => {
+      alive = false;
+    };
+  }, [tab, selId, accountId, branchRev]);
+
+  /** 分支一键补录（答法抽屉「补录这条」）：queued→人话提示+5s 后刷一次状态。 */
+  async function pregenBranch(resp: string) {
+    setBranchNote("");
+    try {
+      const res = await api.branchPregen(accountId, [resp]);
+      if (res?.status === "queued") {
+        setBranchNote("补录任务已排队，AI 正在生成这条录音，稍后自动刷新状态。");
+        window.setTimeout(() => {
+          setBranchNote("");
+          setBranchRev((v) => v + 1);
+        }, 5000);
+      } else if (res?.status === "already_running") {
+        setBranchNote("上一批补录还在进行中，等它跑完再试。");
+      } else {
+        setBranchNote(`补录没有启动（${res?.status ?? "unknown"}）。`);
+      }
+    } catch (e) {
+      setBranchNote(`补录失败：${String(e)}`);
+    }
+  }
+
   // ---- 通话日志 tab：全量拉取后客户端按模板过滤（照 calls 页惯例） ----
   const [callRows, setCallRows] = useState<Record<string, unknown>[]>([]);
   const [callsLoading, setCallsLoading] = useState(false);
@@ -243,16 +383,42 @@ export default function StudioPage() {
   if (!selId) {
     return (
       <div>
-        <div className="mb-8">
-          <h1 className="page-title">AI 工作站</h1>
-          <p className="page-sub">按话术模板集中作业：流程编辑 · 意图问答 · 变量 · 罐头录音 · 通话日志 · 学习报告</p>
+        <div className="mb-8 flex items-start justify-between gap-3">
+          <div>
+            <h1 className="page-title">AI 工作站</h1>
+            <p className="page-sub">按话术模板集中作业：话术流程 · 意图管理 · 变量 · 客户意向 · 录音沉淀 · 通话日志 · 学习报告</p>
+          </div>
+          {!creating && (
+            <button className="btn-primary shrink-0" onClick={() => setCreating(true)}>
+              ＋ 新建话术
+            </button>
+          )}
         </div>
+
+        {creating && (
+          <section className="mb-6 space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-medium">新建话术模板</span>
+              <button className="btn-ghost text-xs" onClick={() => setCreating(false)}>
+                收起 ✕
+              </button>
+            </div>
+            <TemplateEditor
+              tpl={null}
+              onSaved={() => {
+                setCreating(false);
+                setListRev((v) => v + 1);
+              }}
+            />
+          </section>
+        )}
+
         <section className="card">
           {err && <ErrorState message={err} />}
           {loading ? (
             <LoadingState />
           ) : rows.length === 0 ? (
-            <EmptyState label="暂无话术模板，请先到「话术」页新建。" />
+            <EmptyState label="暂无话术模板，点右上角「新建话术」创建。" />
           ) : (
             <div className="space-y-3">
               {rows.map((row) => {
@@ -314,19 +480,52 @@ export default function StudioPage() {
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-3">
-        <button className="btn-ghost text-xs" onClick={() => window.location.assign("/studio/")}>
+        <button className="btn-ghost text-xs" onClick={backToList}>
           ← 返回列表
         </button>
         <h1 className="page-title">{String(tplRow?.name ?? selId)}</h1>
         <span className="rounded-sm bg-muted px-1.5 py-0.5 text-[10px]">
           {langText(String(tplRow?.language ?? "zh"))}
         </span>
+        {/* 全局状态（右上角）：主流程步骤草稿的未保存/应用/发布——唯一保存入口 */}
+        <div className="ml-auto flex items-center gap-2">
+          {stepsDirty ? (
+            <span className="flex items-center gap-1.5 text-xs text-amber-700">
+              <span className="h-2 w-2 animate-pulse rounded-full bg-amber-500" />
+              未保存
+            </span>
+          ) : (
+            <span className="text-xs text-emerald-600">已保存 ✓</span>
+          )}
+          {applyNote && !stepsDirty && <span className="text-xs text-emerald-600">{applyNote}</span>}
+          {!contentReadOnly && (
+            <>
+              <button
+                className="btn-primary px-3 py-1 text-xs"
+                disabled={!stepsDirty || applying || !selId}
+                onClick={() => void applySteps()}
+              >
+                {applying ? "应用中…" : "应用"}
+              </button>
+              <button
+                className="btn-ghost px-2 py-1 text-xs"
+                disabled={publishing || !selId}
+                onClick={() => void publishNow()}
+              >
+                {publishing ? "发布中…" : "发布"}
+              </button>
+            </>
+          )}
+        </div>
       </div>
+      {applyErr && <ErrorState message={applyErr} />}
 
       {tplErr && <ErrorState message={tplErr} />}
-      {tplLoading && <LoadingState />}
+      {/* 首次加载才出转圈;点「应用」后的重拉沿用已在屏内容——整块卸载会把画布抽屉/
+          滚动位置一并冲掉（F7：保存后答法抽屉自动收起的根因）。 */}
+      {tplLoading && !tplRow && <LoadingState />}
 
-      {!tplLoading && tplRow && (
+      {tplRow && (
         <>
           <div className="flex items-center gap-1">
             {tabs.map(([k, label]) => (
@@ -340,11 +539,11 @@ export default function StudioPage() {
             ))}
           </div>
 
-          {/* 1. 话术流程：表单=共用编辑器 / 画布=场景泳道+答法抽屉（保存成功重拉模板行,各 tab 随之取到权威数据） */}
+          {/* 1. 主流程：画布（默认）/ 列表编辑——同一份工作站层草稿,右上角「应用」统一保存 */}
           {tab === "flow" && (
             <div className="space-y-2">
               <div className="flex items-center gap-1">
-                {([["form", "表单"], ["canvas", "画布"]] as const).map(([k, label]) => (
+                {([["canvas", "画布（推荐）"], ["form", "列表编辑"]] as const).map(([k, label]) => (
                   <button
                     key={k}
                     className={`btn-ghost text-xs ${flowView === k ? "border-(--live) text-(--live-ink)" : "muted"}`}
@@ -353,94 +552,78 @@ export default function StudioPage() {
                     {label}
                   </button>
                 ))}
+                {branchNote && <span className="ml-auto text-xs text-amber-700">{branchNote}</span>}
               </div>
-              {flowView === "form" ? (
-                <TemplateEditor tpl={tplRow} onSaved={() => setTplRev((v) => v + 1)} />
+              {flowView === "canvas" ? (
+                <FlowCanvas
+                  tpl={tplRow}
+                  graph={graph}
+                  draft={stepsDraft}
+                  onDraftChange={changeSteps}
+                  branchCanned={branchCanned}
+                  onPregenBranch={pregenBranch}
+                  onOpenIntents={() => setTab("intent")}
+                />
               ) : (
-                <FlowCanvas tpl={tplRow} graph={graph} onSaved={() => setTplRev((v) => v + 1)} />
+                <>
+                  <StepsListEditor
+                    value={stepsDraft}
+                    onChange={changeSteps}
+                    readOnly={contentReadOnly}
+                    lang={String(tplRow?.language ?? "zh")}
+                  />
+                  {/* 模板设置（名称/语言/语气/热词）：独立保存,不碰步骤草稿 */}
+                  <details className="card">
+                    <summary className="cursor-pointer text-sm font-medium">
+                      模板设置 <span className="ml-1 text-xs muted">（名称 / 语言 / 语气 / 热词——本块有独立保存按钮）</span>
+                    </summary>
+                    <div className="mt-3">
+                      <TemplateEditor tpl={tplRow} variant="meta" onSaved={() => setTplRev((v) => v + 1)} />
+                    </div>
+                  </details>
+                </>
               )}
             </div>
           )}
 
-          {/* 2. 意图与问答：只读摘要（编辑请进问答画布） */}
-          {tab === "intent" && (
-            <section className="card space-y-4">
-              {graph.intents.length === 0 ? (
-                <EmptyState label="该模板未配置话术图意图。" />
-              ) : (
-                <div className="space-y-3">
-                  {graph.intents.map((it) => {
-                    const binds = graph.bindings.filter((b) => b.intent === it.id);
-                    return (
-                      <div key={it.id} className="rounded-lg bg-muted/60 p-3">
-                        <p className="flex flex-wrap items-center gap-2 font-medium">
-                          {String(it.label || "(未命名意图)")}
-                          {it.enabled === false && (
-                            <span className="rounded-sm bg-muted px-1 text-[10px]">已停用</span>
-                          )}
-                          {it.judge?.prompt && (
-                            <span
-                              className="rounded-sm bg-amber-100 px-1 text-[10px] text-amber-700"
-                              title={it.judge.prompt}
-                            >
-                              LLM 判据
-                            </span>
-                          )}
-                        </p>
-                        <p className="mt-1 text-xs muted">关键词：{it.keywords.join(", ") || "-"}</p>
-                        <p className="mt-0.5 text-xs muted">
-                          生效范围：{it.steps.length === 0 ? "全程" : `第 ${it.steps.join("、")} 步`}
-                        </p>
-                        {binds.length > 0 ? (
-                          <div className="mt-2 space-y-1">
-                            {binds.map((b) => (
-                              <p key={b.id} className="text-xs muted">
-                                {b.action === "play_qa"
-                                  ? `播快答 ${String(b.qa_id ?? "-")}`
-                                  : b.action === "notify_human"
-                                    ? "通知人工"
-                                    : `跳到第 ${Number(b.step ?? 1)} 步`}
-                                {b.action === "play_qa" && Number(b.then_jump ?? 0) > 0 && ` · 播完跳第 ${Number(b.then_jump)} 步`}
-                                {` · P${Number(b.priority ?? 10)}`}
-                                {b.once && " · 只执行一次"}
-                                {b.enabled === false && " · 已停用"}
-                              </p>
-                            ))}
-                          </div>
-                        ) : (
-                          <p className="mt-2 text-xs muted">无绑定动作</p>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-              <div className="rounded-lg border border-(--card-border) p-3">
-                <span className="label">步骤脊柱（{stepsList.length} 步）</span>
-                {stepsList.length === 0 ? (
-                  <p className="mt-1 text-xs muted">尚无步骤。</p>
-                ) : (
-                  <div className="mt-1 space-y-1">
-                    {stepsList.map((s, i) => (
-                      <p key={i} className="text-xs muted">
-                        <span className="font-bold text-(--live-ink)">第 {i + 1} 步</span> · {String(s.goal || "(无目标)")}
-                      </p>
-                    ))}
-                  </div>
-                )}
-              </div>
-              <button
-                className="btn-primary"
-                onClick={() => window.location.assign(`/qa/?template=${encodeURIComponent(selId)}&view=canvas`)}
-              >
-                打开问答画布
-              </button>
+          {/* 2. 意图管理（PRD 3.3）：第一层识别——表格+弹窗直编 graph_json；种子包一键导入 */}
+          {tab === "intent" && tplRow && (
+            <IntentManager
+              tpl={tplRow}
+              accountId={accountId}
+              readOnly={contentReadOnly}
+              onSaved={() => setTplRev((v) => v + 1)}
+              seedIntents={seedPackFor(String(tplRow.language ?? "zh")).intents}
+            />
+          )}
+
+          {/* 2b. 问答库（PRD 3.4）：表格+弹窗；多轮行为（播完跳转/通知人工）在意图管理挂 play_qa 绑定 */}
+          {tab === "qa" && tplRow && (
+            <QaLibrary
+              accountId={accountId}
+              templateId={selId}
+              lang={String(tplRow.language ?? "zh")}
+              stepCount={Math.max(stepsList.length, 1)}
+              readOnly={contentReadOnly}
+              seedPack={seedPackFor(String(tplRow.language ?? "zh")).qa}
+            />
+          )}
+
+          {/* 3. 客户意向（挂断判定 intent_rules）：与 /calls 页同一张卡（账号级规则面） */}
+          {tab === "disposition" && (
+            <section className="space-y-2">
+              <p className="text-xs muted">
+                挂断时按通话事实（时长/轮数/到达步数/是否捕获号码等）判定客户意向码与处置，命中即写进通话记录。
+              </p>
+              <IntentRulesCard accountId={accountId} />
             </section>
           )}
 
-          {/* 3. 罐头录音：挂步骤词条的物化状态面（补录/试听归问答库） */}
+          {/* 4. 录音沉淀：罐头音资产试听（垫话/QA 罐头） + 挂步骤词条的物化状态面 */}
           {tab === "canned" && (
-            <section className="card space-y-3">
+            <section className="space-y-3">
+              <CannedAuditionCard />
+              <div className="card space-y-3">
               {cannedErr && <ErrorState message={cannedErr} />}
               {cannedLoading ? (
                 <LoadingState />
@@ -472,9 +655,11 @@ export default function StudioPage() {
                 </div>
               )}
               <div className="rounded-lg border border-dashed border-(--card-border) p-3 text-xs muted">
-                补录 / 试听请前往
-                <Link href="/qa/" className="text-(--live)">问答库</Link>
+                补录 / 重新录音请前往
+                <Link href="/qa/" className="text-(--live)">问答画布</Link>
                 （画布视图可右键条目重新录音）。
+                分支录音（话术步的「如果客户…→就…」应对）在主流程画布的答法抽屉里查看/补录。
+              </div>
               </div>
             </section>
           )}
@@ -538,8 +723,13 @@ export default function StudioPage() {
           {/* 5. 变量：占位符目录 + 无效占位告警 + 对象预览（渲染语义 lib/var-panel.ts） */}
           {tab === "vars" && <TemplateVarsTab tpl={tplRow} accountId={accountId} />}
 
-          {/* 6. 学习报告（reports 键可见）：话术优化分析 + 高频问答对 + AI 聚类采纳 */}
-          {tab === "reports" && canReports && <StudyTab />}
+          {/* 6. 学习报告（reports 键可见）：话术优化分析 + 高频问答对 + AI 聚类采纳 + 快路覆盖率/漏网轮采集 */}
+          {tab === "reports" && canReports && (
+            <>
+              <StudyTab />
+              <GapMining templateId={selId} />
+            </>
+          )}
         </>
       )}
     </div>

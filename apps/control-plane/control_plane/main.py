@@ -53,6 +53,9 @@ from .permissions import GRANTABLE_PERMISSIONS, PAGE_PERMISSIONS, effective_perm
 from .pregen import persona_pregen_status
 from . import pregen as pregen_mod
 from . import qa_cluster as qa_cluster_mod
+from . import gap_mining
+from . import gap_proposals
+from . import qa_drift
 from .auth import (
     Identity,
     JWT_TTL_S,
@@ -164,12 +167,17 @@ async def optional_bearer_auth(request: Request, call_next):
         static_get = (request.method in ("GET", "HEAD")
                       and not request.url.path.startswith("/api/"))
         provided = request.headers.get("authorization", "")
-        if not static_get and not (
-            provided.startswith("Bearer ")
-            and hmac.compare_digest(provided[7:].strip(), expected)
-        ):
+        token_ok = provided.startswith("Bearer ") and hmac.compare_digest(
+            provided[7:].strip(), expected)
+        if not static_get and not token_ok:
             return Response(status_code=401, content=b'{"detail":"unauthorized"}',
                              media_type="application/json")
+        if token_ok:
+            # 机器通道标记（D1 修复，镜像 identity_gate 语义）：CP-token-only
+            # 形态（BOK_CP_TOKEN 设、BOK_AUTH_REQUIRED 未设）此前不打
+            # state.machine——模板详情冻结 overlay / require_role 机器直通 /
+            # 审计 actor 全部失明。auth-on 时由 identity_gate 打同一标记。
+            request.state.machine = True
     return await call_next(request)
 
 
@@ -2477,12 +2485,18 @@ def _call_end_fields(call: dict) -> dict:
 
 
 def _progress(items: list[dict]) -> dict:
-    """名单进度汇总：8 个状态计数 + answered 粗口径（拨出去有结果的三态之和）。"""
+    """名单进度汇总：8 个状态计数 + answered 严格口径（D3 修复，与仪表盘
+    `_ANSWERED_EXCLUDED` 同源——只认真接通）。
+
+    item 桶没有 disposition 维度，但终态由 campaign.item_status_for_call 单点
+    从通话 disposition 派生：`done` ⇔ 通话 ENDED 且 disposition 不在
+    {no_answer, rejected, failed}；`no_answer`/`rejected`/`failed` 三桶=未接通，
+    不计入 answered（旧口径 done+no_answer+rejected 把未接通也算了接通）。"""
     p = {"total": len(items)}
     for key in ("pending", "dialing", "in_call", "done", "no_answer", "rejected",
                 "failed", "skipped"):
         p[key] = sum(1 for i in items if i.get("status") == key)
-    p["answered"] = p["done"] + p["no_answer"] + p["rejected"]
+    p["answered"] = p["done"]
     return p
 
 
@@ -3819,6 +3833,10 @@ def qa_canned_status_ep(request: Request, account_id: str = "acc-001") -> dict:
         "available": out["available"],
         "statuses": out["statuses"],
         "generated_at": out["generated_at"],
+        # F1(2026-09-20)信息位:逐语言音色来源("persona:<id>"/"personas_default")。
+        # 状态若按默认音色判 ok,与绑定了人设音色的运行时可能不同源(永远 miss)。
+        # 顶层附加字段,不改 statuses 三态语义(web 按三态渲染)。
+        "voice_source": out.get("voice_source") or {},
     }
 
 
@@ -3854,6 +3872,45 @@ def qa_pregen_ep(payload: dict, request: Request) -> dict:
     out = pregen_mod.qa_pregen_spawn(str(request.base_url).rstrip("/"), ids)
     _audit("qa.pregen", subject_type="qa_entry", subject_id=",".join(ids)[:128],
            detail={"count": len(ids), "status": out.get("status")})
+    return out
+
+
+@app.get("/api/tts/branch-canned-status")
+def branch_canned_status_ep(request: Request, account_id: str = "acc-001") -> dict:
+    """分支应答罐头物化状态(透传 pregen_tts --branch-status;流程画布答法抽屉用)。
+
+    与 qa_canned_status_ep 同款闸链(_gate_page+scoped_account);TTL 缓存按账号
+    分键(pregen.branch_canned_status)。statuses 键=分支 resp 原文(含动作标记,
+    逐字节),值 ok=已物化 / missing=缺录音 / ph=占位符残留(补录无效,先改话术)。
+    """
+    _gate_page(request, "templates")
+    account_id = scoped_account(request, account_id)
+    out = pregen_mod.branch_canned_status(
+        str(request.base_url).rstrip("/"), account_id=account_id
+    )
+    return {
+        "available": out["available"],
+        "statuses": out["statuses"],
+        "generated_at": out["generated_at"],
+        # F1(2026-09-20)信息位:逐语言音色来源,同 qa_canned_status_ep 注释。
+        # 顶层附加字段,不改 statuses 三态语义(web 按三态渲染)。
+        "voice_source": out.get("voice_source") or {},
+    }
+
+
+@app.post("/api/tts/branch-pregen")
+def branch_pregen_ep(payload: dict, request: Request) -> dict:
+    """手动触发 --branches 分支应答物化(可限 texts,缺省=全量分支);烧云配额
+    操作,与 /api/qa/pregen 同闸同审计。texts 一条一条传分支 resp 原文(含动作
+    标记,即 branch-canned-status 的键)。"""
+    require_role(request, "admin", "root")
+    account_id = scoped_account(request, str(payload.get("account_id") or ""))
+    texts = [str(x) for x in (payload.get("texts") or []) if str(x or "").strip()]
+    out = pregen_mod.branch_pregen_spawn(
+        str(request.base_url).rstrip("/"), account_id, texts or None
+    )
+    _audit("branch.pregen", subject_type="template", account_id=account_id,
+           detail={"count": len(texts), "status": out.get("status")})
     return out
 
 
@@ -3964,10 +4021,16 @@ def get_persona(persona_id: str, request: Request) -> dict:
 @app.post("/api/personas")
 def create_persona(req: PersonaRequest, request: Request) -> dict:
     require_role(request, "admin", "root")
+    # F1(2026-09-20):账号缺省兜底——body 不带 account_id 时落 acc-001(与列表端点
+    # 默认口径一致,照抄 /api/sip/sites 建站同款写法)。此前落 "" 令 /api/personas
+    # (acc-001) 看不到它 → pregen_tts --persona 找不到 → 静默回落默认音色,物化
+    # 缓存键与运行时错位。显式 account_id 维持原优先级(root/机器通道/无身份原样)。
+    account_id = (req.account_id or "acc-001").strip() or "acc-001"
     identity = current_identity(request)
     if identity is not None and identity.role != "root":
         # admin 建人设强制本账号（深测：曾可建进/挪进任意账号）。
-        req = req.model_copy(update={"account_id": identity.account_id})
+        account_id = identity.account_id or account_id
+    req = req.model_copy(update={"account_id": account_id})
     persona = _repo().create_persona(req.model_dump())
     _audit("persona.create", subject_type="persona", subject_id=persona.get("id", ""), account_id=persona.get("account_id", ""), detail={"name": persona.get("name", "")})
     # 新人设上线:无罐头即提醒+自动全量物化(W3,响应 tts_pregen=提醒面)。
@@ -3987,11 +4050,17 @@ def update_persona(persona_id: str, req: UpdatePersonaRequest, request: Request)
     existing = dict(_repo().get_persona(persona_id) or {})
     if existing:
         deny_cross_account(request, existing)
+    payload = req.model_dump()
+    if existing and "account_id" not in req.model_fields_set:
+        # F1(2026-09-20):整包 dump 会把未显式携带的 account_id 抹成 ""——账号被
+        # 洗掉后人设从 /api/personas(acc-001) 消失(与 POST 缺省同病)。未传=保留
+        # 原归属;显式携带仍走下方冻结/直通语义,不改变既有优先级。
+        payload["account_id"] = str(existing.get("account_id") or "")
     identity = current_identity(request)
     if existing and identity is not None and identity.role != "root":
         # 冻结归属：非 root 不得经 UpdatePersonaRequest.account_id 挪账号。
-        req = req.model_copy(update={"account_id": str(existing.get("account_id") or "")})
-    persona = _repo().update_persona(persona_id, req.model_dump())
+        payload["account_id"] = str(existing.get("account_id") or "")
+    persona = _repo().update_persona(persona_id, payload)
     if not persona:
         raise HTTPException(404, "persona not found")
     _audit("persona.update", subject_type="persona", subject_id=persona_id, account_id=(existing or {}).get("account_id", ""), detail={"name": persona.get("name", "")})
@@ -4005,10 +4074,14 @@ def update_persona(persona_id: str, req: UpdatePersonaRequest, request: Request)
 @app.put("/api/personas")
 def upsert_persona(req: PersonaRequest, request: Request) -> dict:
     require_role(request, "admin", "root")
+    # F1(2026-09-20):与 POST 同款账号缺省兜底(body 不带 account_id 落 acc-001,
+    # 不再落 ""),显式 account_id 原样直通。
+    account_id = (req.account_id or "acc-001").strip() or "acc-001"
     identity = current_identity(request)
     if identity is not None and identity.role != "root":
         # admin 建人设强制本账号（深测：曾可建进/挪进任意账号）。
-        req = req.model_copy(update={"account_id": identity.account_id})
+        account_id = identity.account_id or account_id
+    req = req.model_copy(update={"account_id": account_id})
     persona = _repo().create_persona(req.model_dump())
     _audit("persona.upsert", subject_type="persona", subject_id=persona.get("id", ""),
            account_id=req.account_id, detail={"name": req.name})
@@ -4107,6 +4180,21 @@ def list_templates(request: Request, account_id: str = "acc-001", owner_scope: s
     ]
 
 
+def _template_machine_channel(request: Request) -> bool:
+    """模板详情 overlay 通道判定（D1 修复）：机器通道吃发布冻结版，人类通道恒
+    live 草稿。三种机器形态——①auth-on CP token（identity_gate 打
+    state.machine）；②CP-token-only（optional_bearer_auth 打同一标记）；
+    ③auth-off 纯本机（无任何凭据可判）→ agent 客户端全量请求自带
+    X-Bok-Channel: agent 自报通道。auth-on 下该头**单独存在不给 overlay**——
+    登录的人可能正在编辑，冻结判定只认机器凭据（防伪装约束）。auth-off 判定
+    与 identity_gate 同源（auth.py auth_required()，勿另立判定）。"""
+    if getattr(request.state, "machine", False):
+        return True
+    if auth_required():
+        return False
+    return (request.headers.get("x-bok-channel") or "").strip().lower() == "agent"
+
+
 @app.get("/api/templates/{template_id}")
 def get_template(template_id: str, request: Request) -> dict:
     _gate_page(request, "templates")
@@ -4114,7 +4202,7 @@ def get_template(template_id: str, request: Request) -> dict:
     if not tpl:
         raise HTTPException(404, "template not found")
     # 机器通道(agent 装配)恒吃发布冻结版;人类通道恒 live(编辑器要见草稿)。
-    if getattr(request.state, "machine", False):
+    if _template_machine_channel(request):
         tpl = _template_machine_overlay(tpl)
     return {**tpl, **_template_published_flags(tpl)}
 
@@ -4389,6 +4477,510 @@ def stats_dashboard(request: Request, account_id: str = "acc-001") -> dict:
         "tags": {"disposition": disposition_counts, "whatsapp": whatsapp_counts},
         "todo": _dashboard_todo(_repo()),
     }
+
+
+# ---- 快路覆盖率 + LLM 漏网轮(L-①,2026-09-20):只读驾驶舱 + 人工确认采集 ----
+# 逻辑全在 gap_mining runner(端点瘦,同 qa_cluster 分工);口径与 gen/provider
+# 取值面(含 graph-jump 係 LLM 轮的证据行号)见该模块 docstring。
+
+
+class GapAdoptRequest(BaseModel):
+    """漏网轮候选 → 问答词条(人工确认后)。step=1-based 话术步(溯源展示/审计)。"""
+
+    question_text: str
+    answer_text: str
+    lang: str = "zh"
+    template_id: str = ""
+    step: int = 0
+    account_id: str = "acc-001"
+
+
+@app.get("/api/stats/llm-gaps")
+def stats_llm_gaps(
+    request: Request,
+    account_id: str = "acc-001",
+    template_id: str = "",
+    min_calls: int = 3,
+    limit: int = 30,
+) -> dict:
+    """快路覆盖率 + 漏网轮候选(turns 账本只读聚合,零 LLM)。
+
+    闸键依据:现有 /api/stats/* 同族唯一端点 dashboard 用 _gate_page("calls"),
+    因其服务 /calls 工作台;本端点服务 studio「场景学习」tab(reports 键门控),
+    数据源与学习报告同族端点 /api/reports/qa-pairs(iter_call_conversations/
+    turns 账本挖掘)同源同页面——对齐 reports 键 + scoped_account 收窄。
+    """
+    _gate_page(request, "reports")
+    account_id = scoped_account(request, account_id)
+    return gap_mining.build_llm_gap_report(
+        _repo(),
+        account_id=account_id,
+        template_id=template_id.strip(),
+        min_calls=max(1, int(min_calls)),
+        limit=max(1, min(int(limit), 200)),
+    )
+
+
+@app.post("/api/stats/llm-gaps/adopt")
+def adopt_llm_gap(req: GapAdoptRequest, request: Request) -> JSONResponse:
+    """人工确认后把漏网轮候选采集为问答词条(201 created / 200 幂等既有)。
+
+    鉴权/盖章/审计与 POST /api/qa-entries 逐字对齐:_gate_page("qa") + B3
+    owner 盖章(user→本人、admin→共享、root 随 body)+ 审计 qa_entry.create,
+    detail.source="gap-adopt" 区分来路。幂等:同账号同 lang 归一同问法已存在
+    → 不重复创建,返回既有 id(created=false)。step 是 1-based 展示/审计值,
+    不转 step 作用域:运行时 qa 步过滤的 int(0 or -1) 特性会让 step_index=0
+    的词条永不命中,且同族挖掘入库(mine/cluster)条目一律 scope=global。
+    """
+    _gate_page(request, "qa")
+    question = req.question_text.strip()
+    answer = req.answer_text.strip()
+    if not question or not answer:
+        raise HTTPException(status_code=400, detail="问题与回答都不能为空")
+    identity = current_identity(request)
+    account_id = req.account_id
+    owner = ""
+    if identity is not None and identity.role != "root":
+        # B3 同款:非 root 强制本账号;user 建的 owner 强制本人(admin 默认共享)。
+        account_id = identity.account_id
+        if identity.role == "user":
+            owner = identity.user_id
+    existing = gap_mining.find_existing_qa_entry(_repo(), account_id, question, req.lang)
+    if existing is not None:
+        return JSONResponse(
+            status_code=200,
+            content={"id": str(existing.get("id") or ""), "created": False},
+        )
+    row = _repo().create_qa_entry(
+        {
+            "question_text": question,
+            "answer_text": answer,
+            "lang": req.lang or "zh",
+            "scope": "global",
+            "step_index": -1,
+            "template_id": req.template_id.strip(),
+            "account_id": account_id,
+            "owner_user_id": owner,
+            "source": "gap-adopt",
+            "enabled": True,
+        }
+    )
+    _audit(
+        "qa_entry.create",
+        subject_type="qa_entry",
+        subject_id=str(row.get("id") or ""),
+        account_id=account_id,
+        detail={
+            "owner_user_id": str(row.get("owner_user_id") or ""),
+            "source": "gap-adopt",
+            "step": max(0, int(req.step or 0)),
+            "template_id": req.template_id.strip(),
+        },
+    )
+    return JSONResponse(
+        status_code=201,
+        content={"id": str(row.get("id") or ""), "created": True},
+    )
+
+
+# ---- 话术分支/意图词提案(L-②,2026-09-20):L-① 驾驶舱的另外两条数据面杠杆 ----
+# 逻辑全在 gap_proposals runner(端点瘦,同 gap_mining 分工);分支行语法镜像
+# flow.py _BRANCH_LINE_RE、意图词命中语义镜像 flow_graph.normalize_graph_text,
+# 证据行号见该模块 docstring。两条都是提案:写入必须人工确认,落库走既有模板
+# 写链(PUT 同闸链+版本快照),published_json 永不触碰。
+
+
+class TemplateProposalAdoptItem(BaseModel):
+    """提案采纳项:web 把 GET 的 proposal 字段原样回传,text 是人工改后的内容。"""
+
+    key: str
+    kind: str = "branch"  # branch | intent_keyword
+    template_id: str = ""
+    norm: str = ""  # 归一客户话(键材料,GET 原样回传)
+    step: int = 0  # branch: 1-based 目标步
+    cond: str = ""  # branch: 分支条件(GET 的 branch_cond)
+    text: str = ""  # branch: 应答文本(可改) / intent_keyword: 关键词(可改)
+    intent_id: str = ""  # intent_keyword: 目标意图
+
+
+class TemplateProposalAdoptRequest(BaseModel):
+    items: list[TemplateProposalAdoptItem] = []
+
+
+@app.get("/api/stats/template-proposals")
+def stats_template_proposals(
+    request: Request,
+    account_id: str = "acc-001",
+    template_id: str = "",
+    min_calls: int = 3,
+    limit: int = 30,
+) -> dict:
+    """漏网轮 → 话术分支/意图词提案(只读,零 LLM 零写入)。
+
+    闸链与 GET /api/stats/llm-gaps 逐字对齐:同服务 studio「场景学习」tab
+    (reports 键门控)+ scoped_account 收窄;coverage/gaps 与 L-① 同源同形,
+    proposals 每 gap 至多两条(branch + intent_keyword),available=false 的
+    提案带人话 blocked_label(去重即「不可采纳」,不从画面消失)。
+    """
+    _gate_page(request, "reports")
+    account_id = scoped_account(request, account_id)
+    return gap_proposals.build_template_proposal_report(
+        _repo(),
+        account_id=account_id,
+        template_id=template_id.strip(),
+        min_calls=max(1, int(min_calls)),
+        limit=max(1, min(int(limit), 200)),
+    )
+
+
+@app.post("/api/stats/template-proposals/adopt")
+def adopt_template_proposals(req: TemplateProposalAdoptRequest, request: Request) -> JSONResponse:
+    """人工确认后把提案写进模板草稿(201=至少一项写入,200=全部幂等/无写入)。
+
+    闸链与 PUT /api/templates/{id} 逐字对齐:_gate_page("templates")(写的是
+    模板,不是报表面)+ deny_cross_account + deny_foreign_owner(edit=True,
+    共享基线只归 admin/root);落库前 append_template_revision 版本快照与 PUT
+    同款(拒绝对数据无副作用:校验/键检查全部先于快照);审计
+    template.branch_adopt / template.intent_keyword_adopt(仅真实写入项,
+    幂等 no-op 不审计,与 L-① adopt 同纪律)。published_json 不在写键面,
+    永不触碰;graph_json 写入经 validate_flow_graph(校验错误原文 400 透出,
+    与 PUT invalid_graph_json 同形)。
+
+    键校验:服务端按 item 自带字段(template_id/step/intent_id/norm)重算 key,
+    不一致 400——内容与键对不上(改了内容还拿旧键提交/伪造键)直接拒;
+    模板 404 / 步号越界 400 / 意图失配 404 + 人话 detail,绝不静默 no-op。
+    """
+    _gate_page(request, "templates")
+    items = list(req.items or [])
+    if not items:
+        raise HTTPException(status_code=400, detail="没有选择任何提案")
+    if len(items) > gap_proposals.ADOPT_MAX_ITEMS:
+        raise HTTPException(status_code=400, detail=f"一次最多采纳 {gap_proposals.ADOPT_MAX_ITEMS} 条提案")
+
+    # Pass 1 逐项静态校验(键一致性/字段齐备/键不重复)——任何一项非法整批拒。
+    seen_keys: set[str] = set()
+    for item in items:
+        if item.kind not in gap_proposals.KINDS:
+            raise HTTPException(status_code=400, detail=f"未知提案类型：{item.kind}")
+        if not str(item.key or "").strip() or not str(item.template_id or "").strip():
+            raise HTTPException(status_code=400, detail="提案缺少 key 或 template_id")
+        if str(item.key) in seen_keys:
+            raise HTTPException(status_code=400, detail=f"同一提案在一次请求里重复：{item.key}")
+        seen_keys.add(str(item.key))
+        expected = (
+            gap_proposals.branch_proposal_key(item.template_id, int(item.step or 0), item.norm)
+            if item.kind == gap_proposals.KIND_BRANCH
+            else gap_proposals.intent_proposal_key(item.template_id, item.intent_id, item.norm)
+        )
+        if str(item.key).strip() != expected:
+            raise HTTPException(
+                status_code=400,
+                detail="提案内容与键不一致（可能已过期），请刷新学习页后重新采纳",
+            )
+        if item.kind == gap_proposals.KIND_BRANCH:
+            if int(item.step or 0) < 1:
+                raise HTTPException(status_code=400, detail="分支提案缺少目标步号")
+            if not gap_proposals.sanitize_branch_cond(item.cond):
+                raise HTTPException(status_code=400, detail="分支条件不能为空")
+            if not str(item.text or "").strip():
+                raise HTTPException(status_code=400, detail="回答内容不能为空")
+            # 条件必须与键材料同源(norm=GET 时 candidate_norm(原话);条件被截断到
+            # 120 字时归一是其前缀,同样放行)——改了条件拿旧键提交在此被拒。
+            cond_norm = gap_mining.candidate_norm(item.cond)
+            if not cond_norm or not str(item.norm or "").startswith(cond_norm):
+                raise HTTPException(
+                    status_code=400,
+                    detail="提案内容与键不一致（可能已过期），请刷新学习页后重新采纳",
+                )
+        else:
+            if not str(item.intent_id or "").strip():
+                raise HTTPException(status_code=400, detail="意图词提案缺少目标意图")
+            if not str(item.text or "").strip():
+                raise HTTPException(status_code=400, detail="关键词不能为空")
+
+    # 按模板分组(保序);先过全部闸链与写前计算(Pass 2),任何模板/任何提案
+    # 不过关就整批拒——绝不出「半批写入」。都过关才进 Pass 3 落库。
+    grouped: dict[str, list[TemplateProposalAdoptItem]] = {}
+    for item in items:
+        grouped.setdefault(item.template_id, []).append(item)
+
+    before_by_tpl: dict[str, dict] = {}
+    for template_id in grouped:
+        row = deny_foreign_owner(
+            request, deny_cross_account(request, _repo().get_template(template_id)), edit=True
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail=f"话术模板不存在：{template_id}")
+        before_by_tpl[template_id] = dict(row)
+
+    plan: dict[str, dict] = {}
+    for template_id, group in grouped.items():
+        before = before_by_tpl[template_id]
+        new_steps = str(before.get("steps_json") or "")
+        new_graph = str(before.get("graph_json") or "")
+        steps_changed = graph_changed = False
+        changed_by_key: dict[str, bool] = {}
+        for item in group:
+            try:
+                if item.kind == gap_proposals.KIND_BRANCH:
+                    new_steps, changed = gap_proposals.append_branch_to_steps(
+                        new_steps, int(item.step), item.cond, item.text
+                    )
+                    steps_changed = steps_changed or changed
+                else:
+                    new_graph, _kw, changed = gap_proposals.append_keyword_to_graph(
+                        new_graph, item.intent_id, item.text
+                    )
+                    graph_changed = graph_changed or changed
+            except gap_proposals.ProposalError as exc:
+                # 含 validate_flow_graph 校验器原文(PUT invalid_graph_json 同门):
+                # 会产出非法数据/图与提案失配 → 400,绝不写坏数据。
+                raise HTTPException(
+                    status_code=400, detail={"error": "proposal_conflict", "detail": str(exc)}
+                )
+            changed_by_key[item.key] = changed
+        plan[template_id] = {
+            "items": group,
+            "steps_json": new_steps if steps_changed else None,
+            "graph_json": new_graph if graph_changed else None,
+            "changed_by_key": changed_by_key,
+        }
+
+    # Pass 3 落库:每模板一次版本快照 + 一次 update;审计只记真实写入项
+    # (幂等 no-op 不审计,与 L-① adopt 同纪律)。
+    results: list[dict] = []
+    any_created = False
+    for template_id, entry in plan.items():
+        changed_by_key: dict[str, bool] = entry["changed_by_key"]
+        if not any(changed_by_key.values()):
+            results.extend(
+                {
+                    "key": item.key,
+                    "kind": item.kind,
+                    "template_id": template_id,
+                    "id": template_id,
+                    "created": False,
+                    "detail": "提案内容已存在（幂等，不重复写入）",
+                }
+                for item in entry["items"]
+            )
+            continue
+        revision = len(_repo().list_template_revisions(template_id)) + 1
+        _repo().append_template_revision(
+            template_id, revision, json.dumps(before_by_tpl[template_id], ensure_ascii=False, default=str)
+        )
+        payload: dict = {}
+        if entry["steps_json"] is not None:
+            payload["steps_json"] = entry["steps_json"]
+        if entry["graph_json"] is not None:
+            payload["graph_json"] = entry["graph_json"]
+        updated = _repo().update_template(template_id, payload)
+        for item in entry["items"]:
+            changed = changed_by_key[item.key]
+            any_created = any_created or changed
+            if changed and item.kind == gap_proposals.KIND_BRANCH:
+                _audit(
+                    "template.branch_adopt",
+                    subject_type="template",
+                    subject_id=template_id,
+                    account_id=str(updated.get("account_id") or ""),
+                    detail={
+                        "key": item.key,
+                        "step": int(item.step or 0),
+                        "cond": gap_proposals.sanitize_branch_cond(item.cond)[:60],
+                        "resp": str(item.text or "").strip()[:120],
+                        "revision": revision,
+                        "source": "gap-proposal",
+                    },
+                )
+            elif changed:
+                _audit(
+                    "template.intent_keyword_adopt",
+                    subject_type="template",
+                    subject_id=template_id,
+                    account_id=str(updated.get("account_id") or ""),
+                    detail={
+                        "key": item.key,
+                        "intent_id": item.intent_id,
+                        "keyword": str(item.text or "").strip()[:64],
+                        "revision": revision,
+                        "source": "gap-proposal",
+                    },
+                )
+            results.append(
+                {
+                    "key": item.key,
+                    "kind": item.kind,
+                    "template_id": template_id,
+                    "id": template_id,
+                    "created": bool(changed),
+                    "detail": "" if changed else "提案内容已存在（幂等，不重复写入）",
+                }
+            )
+    return JSONResponse(
+        status_code=201 if any_created else 200,
+        content={"results": results, "adopted": sum(1 for r in results if r["created"])},
+    )
+
+
+# ---- 问答词条漂移提案(L-③,2026-09-20):改答案/删词条以通知形式送达,人工确认后自动填入 ----
+# 逻辑全在 qa_drift runner(端点瘦,同 gap_mining/gap_proposals 分工);判据全部来自
+# turns 分析账本(qa_fastpath 真播出账 + 客户复问 + LLM 实际答的那句),零 LLM 零猜测。
+# 只读面挂 reports(与 L-① 驾驶舱同一个「场景学习」tab);写入面挂 qa(动的是问答
+# 词条,与 PATCH/DELETE /api/qa-entries 同闸链)。
+
+
+class QaDriftAdoptItem(BaseModel):
+    """体检提案采纳项:web 把 GET 的 proposal 字段回传,text 是人工改后的新答案。"""
+
+    key: str
+    kind: str = qa_drift.KIND_REANSWER
+    qa_id: str = ""
+    text: str = ""  # reanswer: 新答案文本(retire 不用)
+
+
+class QaDriftAdoptRequest(BaseModel):
+    items: list[QaDriftAdoptItem] = []
+
+
+@app.get("/api/stats/qa-drift")
+def stats_qa_drift(
+    request: Request,
+    account_id: str = "acc-001",
+    max_calls: int = qa_drift.DEFAULT_MAX_CALLS,
+    limit: int = 30,
+) -> dict:
+    """在库快答词条体检:哪条答了客户不认、哪条压根没人问(只读,零 LLM 零写入)。
+
+    闸链与 GET /api/stats/llm-gaps 对齐(_gate_page("reports") + scoped_account);
+    每条提案自带 headline(发现了什么)+ detail(建议做什么)的人话结论,运营看得懂
+    再决定。结论基于最近 max_calls 通非测试对象通话(报告出 window_calls)。
+    """
+    _gate_page(request, "reports")
+    account_id = scoped_account(request, account_id)
+    return qa_drift.build_qa_drift_report(
+        _repo(),
+        account_id=account_id,
+        max_calls=max(1, int(max_calls)),
+        limit=max(1, min(int(limit), 200)),
+    )
+
+
+@app.post("/api/stats/qa-drift/adopt")
+def adopt_qa_drift(req: QaDriftAdoptRequest, request: Request) -> JSONResponse:
+    """人工确认后改答案/删词条(201=至少一项真实动作,200=全部幂等)。
+
+    闸链与 PATCH/DELETE /api/qa-entries 逐字对齐:_gate_page("qa") +
+    deny_cross_account + deny_foreign_owner(edit=True;共享词条仍只归 admin/root)。
+    reanswer=写 answer_text,retire=删条目;审计沿用 qa_entry.update/qa_entry.delete
+    带 detail.source=qa-drift(与 L-① adopt 的 qa_entry.create+source=gap-adopt
+    同族);幂等 no-op 不审计(同 L-①②纪律)。
+
+    **改答案顺带补录音**:罐头音频键=文本,改了答案旧音频立即失效——调用方是
+    admin/root(本可直调 POST /api/qa/pregen,烧云配额的闸就在那里)时按批一次
+    触发物化,让改动真的生效;非 admin 返回 needs_pregen=true + 人话提示,交管理员
+    补录(不因为一次改答案绕过既有的配额闸)。
+
+    键校验:key 必须等于 runner 的提案键(动作直接作用于 qa_id,身份=行 id);
+    条目不存在/不属于本账号 404,绝不静默 no-op。
+    """
+    _gate_page(request, "qa")
+    items = list(req.items or [])
+    if not items:
+        raise HTTPException(status_code=400, detail="没有选择任何提案")
+    if len(items) > qa_drift.ADOPT_MAX_ITEMS:
+        raise HTTPException(
+            status_code=400, detail=f"一次最多采纳 {qa_drift.ADOPT_MAX_ITEMS} 条提案"
+        )
+    ident = current_identity(request)
+    # 无身份(auth-off 开发形态/机器通道)按可补录算——与 require_role 的直通语义同款。
+    may_pregen = ident is None or ident.role in ("admin", "root")
+
+    # Pass 1 逐项校验(类型/键一致/字段齐备/条目归属)——任何一项非法整批拒,
+    # 绝不出「半批写入」(同 L-② adopt 纪律)。
+    seen: set[str] = set()
+    rows: dict[str, dict] = {}
+    for item in items:
+        if item.kind not in qa_drift.KINDS:
+            raise HTTPException(status_code=400, detail=f"未知提案类型：{item.kind}")
+        qa_id = str(item.qa_id or "").strip()
+        if not qa_id or not str(item.key or "").strip():
+            raise HTTPException(status_code=400, detail="提案缺少 key 或 qa_id")
+        if str(item.key) != qa_drift.proposal_key(item.kind, qa_id):
+            raise HTTPException(
+                status_code=400, detail="提案内容与键不一致（可能已过期），请刷新学习页后重新采纳"
+            )
+        if str(item.key) in seen:
+            raise HTTPException(status_code=400, detail=f"同一提案在一次请求里重复：{item.key}")
+        seen.add(str(item.key))
+        if item.kind == qa_drift.KIND_REANSWER and not str(item.text or "").strip():
+            raise HTTPException(status_code=400, detail="新答案不能为空")
+        row = deny_foreign_owner(
+            request, deny_cross_account(request, _repo().get_qa_entry(qa_id)), edit=True
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail=f"问答词条不存在：{qa_id}")
+        rows[str(item.key)] = dict(row)
+
+    # Pass 2 落库:改答案写 answer_text、删词条删行;审计只记真实动作。
+    results: list[dict] = []
+    any_created = False
+    pregen_ids: list[str] = []
+    for item in items:
+        key = str(item.key)
+        qa_id = str(item.qa_id or "").strip()
+        before = rows[key]
+        account = str(before.get("account_id") or "")
+        if item.kind == qa_drift.KIND_REANSWER:
+            text = str(item.text or "").strip()
+            if str(before.get("answer_text") or "").strip() == text:
+                results.append({
+                    "key": key, "kind": item.kind, "qa_id": qa_id,
+                    "created": False, "needs_pregen": False, "pregen": None,
+                    "detail": "答案已经是这句了（幂等，不重复写）",
+                })
+                continue
+            _repo().update_qa_entry(qa_id, {"answer_text": text})
+            _audit(
+                "qa_entry.update", subject_type="qa_entry", subject_id=qa_id, account_id=account,
+                detail={"source": "qa-drift", "old_chars": len(str(before.get("answer_text") or "")),
+                        "new_chars": len(text)},
+            )
+            any_created = True
+            pregen_ids.append(qa_id)
+            results.append({
+                "key": key, "kind": item.kind, "qa_id": qa_id,
+                "created": True, "needs_pregen": not may_pregen, "pregen": None, "detail": "",
+            })
+        else:
+            ok = bool(_repo().delete_qa_entry(qa_id))
+            _audit(
+                "qa_entry.delete", subject_type="qa_entry", subject_id=qa_id, account_id=account,
+                outcome="ok" if ok else "not_found",
+                detail={"source": "qa-drift", "question": str(before.get("question_text") or "")[:80]},
+            )
+            any_created = any_created or ok
+            results.append({
+                "key": key, "kind": item.kind, "qa_id": qa_id,
+                "created": ok, "needs_pregen": False, "pregen": None, "detail": "",
+            })
+
+    # 改答案后新文本没有罐头音频:admin/root 批一次物化(烧云配额闸=本分支),
+    # 非 admin 留 needs_pregen 由前端提示找管理员补录。
+    if pregen_ids and may_pregen:
+        try:
+            out = pregen_mod.qa_pregen_spawn(str(request.base_url).rstrip("/"), pregen_ids)
+        except Exception as exc:  # noqa: BLE001 - 物化是这个 detached 子进程的事,
+            # 失败了也不该把已经改好的答案回滚(改答案本身已成功且已审计)。
+            out = {"status": "failed", "detail": str(exc)}
+        for r in results:
+            if r["created"] and r["qa_id"] in pregen_ids:
+                r["pregen"] = out
+                r["needs_pregen"] = False
+    return JSONResponse(
+        status_code=201 if any_created else 200,
+        content={"results": results, "adopted": sum(1 for r in results if r["created"])},
+    )
 
 
 @app.get("/api/insights")

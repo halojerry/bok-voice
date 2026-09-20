@@ -7,7 +7,10 @@
   python scripts/pregen_tts.py --fillers              # 垫话按人设音色物化(全部启用人设)
   python scripts/pregen_tts.py --fillers --persona X  # 只给一个人设补物化垫话
   python scripts/pregen_tts.py --qa --all-personas    # QA 罐头 × 全部启用人设
+  python scripts/pregen_tts.py --branches             # 话术分支应答物化(步骤 ref「如果客户X→就Y」)
+  python scripts/pregen_tts.py --branches --texts-file t.txt  # 只物化指定分支应答(CP 按条补录;一行一条,resp 原文含动作标记)
   python scripts/pregen_tts.py --qa-status            # 逐条目物化状态 JSON(stdout,不合成不碰云)
+  python scripts/pregen_tts.py --branch-status        # 逐分支应答物化状态 JSON(stdout,不合成;键=resp 原文含动作标记,值 ok/missing/ph)
   python scripts/pregen_tts.py --qa --entry-id X      # 只物化指定 qa 条目 id(--entry-id 可重复)
   任意组合 + --dry-run                                # 只打印 (persona,lang,voice,条数) 计划清单
 
@@ -32,6 +35,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parents[1]
 for _p in ("apps/agent", "packages/core"):
@@ -49,7 +53,13 @@ from agent_runtime.agent import (  # noqa: E402
     _wa_number_line,
 )
 from agent_runtime.fillers import FILLER_ASSETS_DIR, load_manifest  # noqa: E402
-from agent_runtime.flow import object_vars, parse_steps, render_template_text  # noqa: E402
+from agent_runtime.flow import (  # noqa: E402
+    object_vars,
+    parse_branch_action,
+    parse_step_ref,
+    parse_steps,
+    render_template_text,
+)
 from agent_runtime.providers.livekit_plugins import (  # noqa: E402
     LanguageState,
     MiniMaxTTS,
@@ -90,12 +100,15 @@ def _cp_get(base: str, path: str, token: str, *, opener=None) -> object:
     raise last_exc  # type: ignore[misc]
 
 
-def _fetch_cp(base: str, token: str) -> tuple[dict, list, list, list]:
+def _fetch_cp(base: str, token: str, *, account_id: str = "") -> tuple[dict, list, list, list]:
     settings = _cp_get(base, "/api/settings?internal=true", token)
     if not isinstance(settings, dict):
         settings = {}
     try:
-        personas = _cp_get(base, "/api/personas", token) or []
+        # F1(2026-09-20):account_id 显式置空=拉全部账号人设(CP 端点缺省 acc-001
+        # 会滤掉其它账号的人设)。--persona 的自动物化随人设保存触发,人设可能任
+        # 意账号;按人设物化/查找必须跨账号,单账号部署零变化(键去重天然幂等)。
+        personas = _cp_get(base, "/api/personas?account_id=", token) or []
     except Exception:
         personas = []
     try:
@@ -103,7 +116,12 @@ def _fetch_cp(base: str, token: str) -> tuple[dict, list, list, list]:
     except Exception:
         objects = []
     try:
-        templates = _cp_get(base, "/api/templates", token) or []
+        # 分支模式(--branches/--branch-status)可按账号过滤模板(CP 端点缺省
+        # acc-001);空=不带参,维持旧行为。
+        tpl_path = "/api/templates"
+        if account_id:
+            tpl_path = f"/api/templates?account_id={quote(account_id)}"
+        templates = _cp_get(base, tpl_path, token) or []
     except Exception:
         templates = []
     return settings, list(personas), list(objects), list(templates)
@@ -230,6 +248,60 @@ def _say_step_lines(tpl: dict | None) -> list[tuple[str, str]]:
                 out.append((line, s.emotion))
                 break
     return out
+
+
+def _strip_branch_action(resp: str) -> str:
+    """剥分支应答首部的动作标记(纯函数);无标记原样返回。
+
+    单源复用官方解析器 flow.parse_branch_action(2026-09-20 A-② 已落定):
+    (action, step, text) 的 text 即剥标记后的应答文本——与运行时出声文本
+    逐字节同源(含【 收线 】内空白容错/【跳第0步】退默认的边缘语义),缓存
+    键不会与运行时错位。标记语法只在 flow.py 一处定义。
+    """
+    return parse_branch_action(str(resp or ""))[2]
+
+
+def _load_texts_file(path: str) -> set[str] | None:
+    """--texts-file 读入(一行一条,空白行忽略);未给=None=不过滤。"""
+    p = str(path or "").strip()
+    if not p:
+        return None
+    lines = Path(p).read_text(encoding="utf-8").splitlines()
+    return {ln.strip() for ln in lines if ln.strip()}
+
+
+def _branch_jobs(
+    templates: list[dict],
+    lang_personas: dict[str, dict | None],
+    *,
+    texts: set[str] | None = None,
+) -> list[Job]:
+    """话术分支应答物化计划(2026-09-20 路线 A-① 分支罐头快路配套)。
+
+    逐模板逐步 parse_step_ref 解析 ref 的「如果客户X→就Y」分支(与运行时
+    agent.branch_canned_pick 同一解析器),取每个分支 resp 剥动作标记后渲染文本。
+    渲染后仍有 {占位} 残留的条目跳过——运行时分支快路同规则不认(查不到
+    同文缓存,宁落 LLM 不念占位符)。texts 给定时只做 raw resp(含标记,逐字节)
+    命中的分支(CP branch-pregen 按条补录通道)。同 (persona, lang, text) 重复
+    resp 由 _materialize 的 seen 去重,不重复合成。分支快路闸门只认缓存有音频的
+    应答——这里物化即开闸,键与 _say_script 同源(text+voice+model+speed,
+    emotion 空)。
+    """
+    jobs: list[Job] = []
+    for tpl in templates or []:
+        lang = _normalize_lang((tpl or {}).get("language"), default="") or ""
+        if not lang:
+            continue
+        for s in parse_steps(str(tpl.get("steps_json") or "")):
+            for _cond, resp in parse_step_ref(s.ref or "").branches:
+                raw = str(resp or "").strip()
+                if not raw or (texts is not None and raw not in texts):
+                    continue
+                rendered = render_template_text(_strip_branch_action(raw), {})
+                if not rendered.strip() or re.search(r"\{[^{}]+\}", rendered):
+                    continue
+                jobs.append((lang_personas.get(lang), lang, rendered, ""))
+    return jobs
 
 
 def _fillers_jobs(
@@ -365,6 +437,63 @@ def _qa_status(
     return out
 
 
+def _branch_status(
+    templates: list[dict],
+    lang_personas: dict[str, dict | None],
+    *,
+    tts_cfg: dict,
+    voice_mode: str,
+    model: str,
+    cache: TtsAudioCache,
+    texts: set[str] | None = None,
+) -> dict[str, str]:
+    """--branch-status 可测核心:逐分支应答产出 ok/missing/ph 三态(纯查询零合成)。
+
+    键=分支 resp 原文(含动作标记,逐字节——CP/web 拿它对画布答法抽屉);要物化
+    的音频文本=剥标记后渲染。渲染与 --branches 物化同口径(render_template_text+
+    空变量表):渲染后仍有 {占位} 残留 → "ph"——变量缺失时空变量渲染与运行时
+    对象变量渲染必不同文,缓存永远打不中,报 missing 会误导运营补录一条永远
+    无效的录音(应先改话术)。同一 raw resp 跨模板/跨语言出现时按语言集合逐上下文
+    探测:任一上下文缓存命中=ok;否则存在可合成上下文(渲染干净且解析出音色)=
+    missing;全部上下文都是占位残留/空文本=ph。音色/语速/键与 _branch_jobs 逐项
+    同源(_persona_resolved_voice+minimax_speed_for+cache.key_for)。
+    """
+    ctx_langs: dict[str, set[str]] = {}
+    for tpl in templates or []:
+        lang = _normalize_lang((tpl or {}).get("language"), default="") or ""
+        if not lang:
+            continue
+        for s in parse_steps(str(tpl.get("steps_json") or "")):
+            for _cond, resp in parse_step_ref(s.ref or "").branches:
+                raw = str(resp or "").strip()
+                if not raw or (texts is not None and raw not in texts):
+                    continue
+                ctx_langs.setdefault(raw, set()).add(lang)
+    out: dict[str, str] = {}
+    for raw, langs in ctx_langs.items():
+        hit = False
+        synthable = False
+        for lang in sorted(langs):
+            rendered = render_template_text(_strip_branch_action(raw), {})
+            if not rendered.strip() or re.search(r"\{[^{}]+\}", rendered):
+                continue  # ph 上下文:补录无效
+            voice = _persona_resolved_voice(
+                lang_personas.get(lang), lang, tts_cfg, voice_mode
+            )
+            if not voice:
+                continue  # 无音色:运行时同样不查缓存
+            synthable = True
+            key = cache.key_for(
+                rendered, voice=voice, model=model,
+                speed=minimax_speed_for(lang), emotion="",
+            )
+            if cache.get(key) is not None:
+                hit = True
+                break
+        out[raw] = "ok" if hit else ("missing" if synthable else "ph")
+    return out
+
+
 async def _materialize(
     cache: TtsAudioCache,
     model: str,
@@ -493,16 +622,21 @@ async def main_async() -> int:
     ap.add_argument("--objects", action="store_true", help="逐对象渲染开场白/收线/心跳并预合成")
     ap.add_argument("--fillers", action="store_true", help="垫话 manifest 按人设音色物化进 tts-cache(默认全部启用人设;--persona 限单人人设)")
     ap.add_argument("--qa", action="store_true", help="Q→A 快路启用条目的应答预合成(闸门只认缓存有音频的条目)")
+    ap.add_argument("--branches", action="store_true", help="话术分支应答预合成(步骤 ref「如果客户X→就Y」的 Y,剥动作标记渲染后无占位才物化;分支罐头快路只认缓存有音频)")
     ap.add_argument("--qa-status", action="store_true", help="不合成:逐条目输出物化状态 JSON(stdout),供 CP canned-status 端点消费")
+    ap.add_argument("--branch-status", action="store_true", help="不合成:逐分支应答输出物化状态 JSON(stdout,键=resp 原文含动作标记,值 ok/missing/ph),供 CP branch-canned-status 端点消费")
     ap.add_argument("--entry-id", action="append", default=[], help="只处理指定 qa 条目 id(可重复;--qa/--qa-status 共用过滤)")
+    ap.add_argument("--texts-file", default="", help="只处理指定文本(一行一条,--branches/--branch-status 共用过滤;供 CP 按分支补录/查询)")
     ap.add_argument("--all-personas", action="store_true", help="--qa 配套:条目 × 每个启用人设各物化一版(缺省每语言只取该语言人设)")
     ap.add_argument("--dry-run", action="store_true", help="只打印将物化的 (persona,lang,voice,条数) 计划清单,不合成")
     ap.add_argument("--cp", default=os.environ.get("BOK_CP_URL", "http://127.0.0.1:8000"))
+    ap.add_argument("--account-id", default="", help="分支模式(--branches/--branch-status)按账号过滤 CP 模板(缺省不带参,走 CP 端点默认账号)")
     ap.add_argument("--persona", default="", help="人设范围:指定 persona id(fillers/qa-all 只物化该人设;缺省按语言取该语言的 persona/全部人设)")
     ap.add_argument("--object-id", default="", help="只为指定对象预生成开场白/收线/心跳(配合 --objects)")
     ap.add_argument("--model", default="", help="MINIMAX_MODEL 覆盖(默认 env/2.8-hd,须与运行时一致)")
     args = ap.parse_args()
-    if not (args.greetings or args.objects or args.fillers or args.qa or args.qa_status):
+    if not (args.greetings or args.objects or args.fillers or args.qa or args.branches
+            or args.qa_status or args.branch_status):
         args.greetings = True
 
     if os.environ.get("MINIMAX_API_KEY", ""):
@@ -510,11 +644,14 @@ async def main_async() -> int:
     else:
         api_key = ""
     token = os.environ.get("BOK_CP_TOKEN", "")
-    settings, personas, objects, templates = _fetch_cp(args.cp, token)
+    settings, personas, objects, templates = _fetch_cp(
+        args.cp, token,
+        account_id=args.account_id if (args.branches or args.branch_status) else "",
+    )
     tts_cfg = settings.get("tts") or {}
     api_key = api_key or str(tts_cfg.get("api_key") or "")
-    # --qa-status 纯状态面零合成(dry-run 同理):无 key 也放行。
-    if not api_key and not (args.dry_run or args.qa_status):
+    # --qa-status/--branch-status 纯状态面零合成(dry-run 同理):无 key 也放行。
+    if not api_key and not (args.dry_run or args.qa_status or args.branch_status):
         print("MINIMAX_API_KEY missing (settings tts.api_key/env) — cannot synthesize", flush=True)
         return 1
     if args.model:
@@ -531,6 +668,18 @@ async def main_async() -> int:
                 (x for x in personas if _normalize_lang(x.get("language"), default="") == lang), None
             )
     voice_mode = _resolve_tts_voice_mode(tts_cfg)
+    # F1(2026-09-20)信息位:状态面所用音色的逐语言来源——"persona:<id>"=该语言
+    # 有人设供音色(与绑定该人设的运行时同源);"personas_default"=该语言无人设,
+    # 落设置页 speaker_*/内置默认音色(与绑定了人设的运行时不同源,判 ok 可能是
+    # 对错键的「假 ok」)。CP 端点顶层透传,不改 statuses 三态语义。
+    voice_source: dict[str, str] = {
+        lang: (
+            f"persona:{str((lang_personas.get(lang) or {}).get('id') or '')}"
+            if lang_personas.get(lang)
+            else "personas_default"
+        )
+        for lang in ("zh", "cantonese", "en")
+    }
     # 按人设物化的人设池(fillers / qa --all-personas 共用):--persona 限单人人设,
     # 缺省=CP 全部人设(人设无 enabled 字段,在册即启用;无音色/无池者在计划期跳过)。
     if args.persona:
@@ -538,6 +687,16 @@ async def main_async() -> int:
         if not persona_pool:
             # stderr：--qa-status 的 stdout 是纯 JSON 契约（CP canned-status 逐行解析）。
             print(f"persona {args.persona} not found in CP /api/personas", file=sys.stderr, flush=True)
+            # F1(2026-09-20):指定人设找不到时绝不静默回落默认音色——回落物化出的
+            # 缓存键与运行时人设音色错位(永远 miss),状态面还会对错键报「假 ok」。
+            # 响亮失败+非零退出(3),此刻零 provider 构造零缓存写,一个字节不落盘。
+            print(
+                "PERSONA_MISSING abort (no default-voice fallback, nothing written): "
+                f"--persona {args.persona}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 3
     else:
         persona_pool = list(personas)
 
@@ -572,7 +731,20 @@ async def main_async() -> int:
                 model=model, sample_rate=sample_rate, cache=cache,
                 entry_ids=set(args.entry_id) if args.entry_id else None,
             )
-        print(json.dumps({"qa_status": status}, ensure_ascii=False), flush=True)
+        print(json.dumps({"qa_status": status, "voice_source": voice_source}, ensure_ascii=False), flush=True)
+        return 0
+
+    if args.branch_status:
+        # 分支状态面:零合成零云——逐分支按物化同口径算 key、查缓存,stdout 单行
+        # JSON 供 CP branch-canned-status 端点消费。stdout 纯 JSON 契约与
+        # --qa-status 同款(诊断打印重定向 stderr)。
+        with contextlib.redirect_stdout(sys.stderr):
+            status = _branch_status(
+                templates, lang_personas,
+                tts_cfg=tts_cfg, voice_mode=voice_mode, model=model, cache=cache,
+                texts=_load_texts_file(args.texts_file),
+            )
+        print(json.dumps({"branch_status": status, "voice_source": voice_source}, ensure_ascii=False), flush=True)
         return 0
 
     # 缓存目录须与运行时同根:BOK_TTS_CACHE_DIR 由 bok.py/调用方透传。
@@ -691,6 +863,25 @@ async def main_async() -> int:
             total += ok + sk + fl
             if args.all_personas:
                 _print_group_counts("qa", records, with_total=args.dry_run)
+
+    # ---- 话术分支应答物化(2026-09-20 路线 A-①;模板已在上方拉取) ----
+    # 分支罐头快路闸门只认缓存有音频——物化即开闸;pin=True 罐头集永不逐出
+    # (与 qa/greetings 直念线同纪律)。重复 resp 由 _materialize seen 去重。
+    if args.branches:
+        branch_job_list = _branch_jobs(
+            templates, lang_personas, texts=_load_texts_file(args.texts_file)
+        )
+        if branch_job_list:
+            ok, sk, fl, records = await _materialize(
+                cache, model, branch_job_list,
+                api_key=api_key, sample_rate=sample_rate, tts_cfg=tts_cfg,
+                voice_mode=voice_mode, dry_run=args.dry_run, pin=True,
+            )
+            gen += ok
+            skip += sk
+            fail += fl
+            total += ok + sk + fl
+            _print_group_counts("branches", records, with_total=args.dry_run)
 
     print(f"pregen done total={total} generated={gen} skipped={skip} failed={fail}", flush=True)
     return 0 if fail == 0 else 2

@@ -1,6 +1,11 @@
-// lib/flow-canvas.ts 纯函数单测（W2 T2 流程画布）：step.ref 三件拆装 round-trip
+// lib/flow-canvas.ts 纯函数单测（W2 T2 流程画布;2026-09-20 纵向工作流改版）：
+// step.ref 三件拆装 round-trip
 // （语义镜像 agent flow.py _BRANCH_LINE_RE/_NOTE_LINE_RE/parse_step_ref）、flow.py
-// 边角语法、scene 经 jsonToSteps/stepsToJson 往返不丢、场景泳道分桶、布局确定性。
+// 边角语法、scene 经 jsonToSteps/stepsToJson 往返不丢、纵向布局确定性、
+// 分支动作前缀（_BRANCH_ACTION_RE/parse_branch_action 镜像:拆装/重组/往返不变量/
+// 带标记 ref 无损/布局 chip 动作派生/录音状态元数据）、易用性三件数据面
+// （2026-09-20 真浏览器验收 F5 初始缩放/F6 空图引导语/F7 抽屉保持判定）、
+// F8 箭头分隔保真（「 → 」等空格形态解析记下、序列化逐字回写）。
 //
 // 装配照 qa-canvas.test.mjs：lib/flow-canvas.ts 零 import,单文件转译直载。
 // 另加一份 components/template-editor.tsx 的真实代码装载（scene 往返守卫要跑
@@ -97,14 +102,14 @@ test("parseStepRefParts：正稿/分支/注意三件拆装（flow.py 真实语�
   const parts = fc.parseStepRefParts(REF_ZH);
   assert.equal(parts.script, "这是我们的责任，我们有购买运费保险，会以一赔二赔付给您，不用自己贴钱。");
   assert.deepEqual(parts.branches, [
-    { cond: "问为什么赔", resp: "说明是运输途中遗失，我方全责" },
-    { cond: "担心不到账", resp: "说明赔付会直接到微信零钱/钱包" },
-    { cond: "说要重新买", resp: "说明可以用赔付抵扣，不用自己再贴钱" },
+    { cond: "问为什么赔", resp: "说明是运输途中遗失，我方全责", arrow: " → " },
+    { cond: "担心不到账", resp: "说明赔付会直接到微信零钱/钱包", arrow: " → " },
+    { cond: "说要重新买", resp: "说明可以用赔付抵扣，不用自己再贴钱", arrow: " → " },
   ]);
   assert.equal(parts.notes, "");
   // 条件=锚词与箭头之间、应答=箭头后（flow.py:96 语义）：箭头后首个非空白起,原样保留「就」头。
   const jiu = fc.parseStepRefParts("正稿一行\n如果客户嫌慢 → 就安抚并报时效");
-  assert.deepEqual(jiu.branches, [{ cond: "嫌慢", resp: "就安抚并报时效" }]);
+  assert.deepEqual(jiu.branches, [{ cond: "嫌慢", resp: "就安抚并报时效", arrow: " → " }]);
 });
 
 test("round-trip ①：parse→serialize→parse 逐件相等（正稿多行/两分支/注意行）", () => {
@@ -117,13 +122,13 @@ test("round-trip ①：parse→serialize→parse 逐件相等（正稿多行/两
   const parts = assertRoundTrip(ref);
   assert.equal(parts.notes, "赔付会直接落微信零钱");
   assert.equal(parts.branches.length, 2);
-  // 序列化规范形：正稿行 + 每分支「如果客户{cond}→{resp}」+「注意：{note}」；
-  // 箭头两侧空白规范掉（解析层空白容差,flow.py:96 \s*→\s* 同款）。
+  // 序列化：正稿行 + 每分支「如果客户{cond}{arrow}{resp}」+「注意：{note}」；
+  // 箭头两侧空格按解析原样回写（F8 分隔符保真,解析层空白容差 flow.py:96 \s*→\s* 同款）。
   assert.equal(
     fc.serializeStepRef(parts),
     "係我哋责任,我哋有买运费保险,会以一赔二赔俾你,唔使自己蚀钱。\n"
-      + "如果客户问点解要赔→讲係运输途中遗失,顺丰全责\n"
-      + "如果客户担心唔到账→讲赔付会直接落微信零钱/钱包\n"
+      + "如果客户问点解要赔 → 讲係运输途中遗失,顺丰全责\n"
+      + "如果客户担心唔到账 → 讲赔付会直接落微信零钱/钱包\n"
       + "注意：赔付会直接落微信零钱",
   );
 });
@@ -140,17 +145,18 @@ test("round-trip ①b：多条注意行/空行/首行即分支/无正稿", () =>
 
 // ---- ② flow.py 边角语法（箭头空白变体/EN 锚词/注意冒号变体/解析不了→script） ----
 test("flow.py 边角：箭头两侧空白容差逐字对齐 _BRANCH_LINE_RE（flow.py:96）", () => {
+  // F8：解析除 cond/resp 外还记下箭头两侧原始分隔（arrow）,序列化按它回写。
   const cases = [
-    ["如果客户唔记得→提佢下单填嘅地址", "唔记得", "提佢下单填嘅地址"],
-    ["如果客户唔记得 → 提佢下单填嘅地址", "唔记得", "提佢下单填嘅地址"],
-    ["如果客户唔记得  →  提佢下单填嘅地址", "唔记得", "提佢下单填嘅地址"],
-    ["如果客户 唔记得→提佢", "唔记得", "提佢"],
+    ["如果客户唔记得→提佢下单填嘅地址", "唔记得", "提佢下单填嘅地址", "→"],
+    ["如果客户唔记得 → 提佢下单填嘅地址", "唔记得", "提佢下单填嘅地址", " → "],
+    ["如果客户唔记得  →  提佢下单填嘅地址", "唔记得", "提佢下单填嘅地址", "  →  "],
+    ["如果客户 唔记得→提佢", "唔记得", "提佢", "→"],
     // 应答含第二个箭头：非贪婪条件停在首箭头,余量全归应答。
-    ["如果客户A→B→C", "A", "B→C"],
+    ["如果客户A→B→C", "A", "B→C", "→"],
   ];
-  for (const [line, cond, resp] of cases) {
+  for (const [line, cond, resp, arrow] of cases) {
     const parts = fc.parseStepRefParts(line);
-    assert.deepEqual(parts.branches, [{ cond, resp }], line);
+    assert.deepEqual(parts.branches, [{ cond, resp, arrow }], line);
   }
 });
 
@@ -160,17 +166,17 @@ test("flow.py 边角：EN 锚词（If/When the customer,IGNORECASE）与 Note �
   );
   assert.equal(en.script, "Hello, is this {name}?");
   assert.deepEqual(en.branches, [
-    { cond: "is busy right now", resp: "ask when or how works best" },
-    { cond: "worries", resp: "reassure them" },
+    { cond: "is busy right now", resp: "ask when or how works best", arrow: " → " },
+    { cond: "worries", resp: "reassure them", arrow: " → " },
   ]);
   assert.equal(en.notes, "keep it short\n不用自己贴钱");
 });
 
 test("flow.py 边角：空条件行判定与解析不了的行兜底（逐字对齐 flow.py 正则行为）", () => {
-  // 「如果客户 → 就xxx」：锚后空白被 lazy cond 吃成「 」,正则仍命中=空条件分支——
+  // 「如果客户 → 就xxx」：锚后空白被锚词后的 \s* 吃掉,lazy cond 空,正则仍命中=空条件分支——
   // JS 与 Python 正则回溯序一致,flow.py 同样存 (cond="",resp="就xxx")。
   const emptyCond = fc.parseStepRefParts("如果客户 → 就xxx");
-  assert.deepEqual(emptyCond.branches, [{ cond: "", resp: "就xxx" }]);
+  assert.deepEqual(emptyCond.branches, [{ cond: "", resp: "就xxx", arrow: "→ " }]);
   // 序列化侧：空条件不成合法分支语法,降级普通行「就xxx」（文字不丢,重解析落 script）。
   assert.equal(fc.serializeStepRef(emptyCond), "就xxx");
   // 「客户报出号码(数字串)→复述确认」=flow.py:104 注释里的真实未知指令行：
@@ -211,6 +217,53 @@ test("serialize 退化分支：缺条件/缺应答降级普通行,文字不丢",
   assert.equal(out, "正稿\n孤应答\n孤条件\n如果客户好→应答");
 });
 
+// ---- ②b F8 箭头分隔保真（2026-09-20）：保存不再把「 → 」静默归一成「→」 ----
+test("F8 分隔符保真：「 → 」「→」「  →  」逐字回写,整步逐字节不动", () => {
+  const ref = [
+    "正稿行",
+    "如果客户问为什么赔 → 说明是运输途中遗失",
+    "如果客户担心不到账→说明会直接到账",
+    "如果客户说要重新买  →  说明可以用赔付抵扣",
+  ].join("\n");
+  const parts = fc.parseStepRefParts(ref);
+  // 三种空格形态逐字记下。
+  assert.deepEqual(parts.branches.map((b) => b.arrow), [" → ", "→", "  →  "]);
+  // 序列化整步逐字节等于原文——运营只改一处分支,其它行的空格形态不再被牵连改写。
+  assert.equal(fc.serializeStepRef(parts), ref);
+  // round-trip 不变量（含 arrow 逐件相等）仍然成立。
+  assertRoundTrip(ref);
+});
+
+test("F8 抽屉新加分支（无 arrow）用规范形「→」,不臆造空格;非法 arrow 回落规范形", () => {
+  // 「加一条应对」新行只有 cond/resp,无 arrow 字段 → 规范形。
+  const out = fc.serializeStepRef({
+    script: "正稿",
+    branches: [{ cond: "嫌慢", resp: "就安抚" }],
+    notes: "",
+  });
+  assert.equal(out, "正稿\n如果客户嫌慢→就安抚");
+  // 手工传的空串/不含箭头的 arrow 同样回落规范形。
+  assert.equal(
+    fc.serializeStepRef({ script: "", branches: [{ cond: "a", resp: "b", arrow: "" }], notes: "" }),
+    "如果客户a→b",
+  );
+  assert.equal(
+    fc.serializeStepRef({ script: "", branches: [{ cond: "a", resp: "b", arrow: "不是箭头" }], notes: "" }),
+    "如果客户a→b",
+  );
+});
+
+test("F8 分隔保真 × 动作标记：标记不丢不重,箭头形态原样", () => {
+  const line = "如果客户骂人 → 【收线】唔好意思打搅咗";
+  const parts = fc.parseStepRefParts(line);
+  assert.deepEqual(parts.branches, [{ cond: "骂人", resp: "【收线】唔好意思打搅咗", arrow: " → " }]);
+  // 逐字节回写：动作标记一次不丢、一次不重。
+  assert.equal(fc.serializeStepRef(parts), line);
+  // 编辑改条（抽屉 setBranch 走 spread,arrow 天然保留）后的序列化仍保形。
+  const edited = { ...parts, branches: [{ ...parts.branches[0], resp: "【收线】拜拜" }] };
+  assert.equal(fc.serializeStepRef(edited), "如果客户骂人 → 【收线】拜拜");
+});
+
 // ---- ③ scene 经 jsonToSteps→stepsToJson 往返不丢（真实生产代码） ----
 test("scene 往返：jsonToSteps→stepsToJson 不丢 scene；空 scene 不写键（旧数据零变化）", () => {
   const steps = [
@@ -235,84 +288,229 @@ test("scene 往返：jsonToSteps→stepsToJson 不丢 scene；空 scene 不写�
   assert.equal(te.jsonToSteps(te.stepsToJson(back))[0].scene, "开场");
 });
 
-// ---- ④ sceneLanes 泳道分桶 ----
-test("sceneLanes：空 scene=未分组、连续同 scene 归并、交错按首次出现归并保序", () => {
-  const steps = [
-    { goal: "a", ref: "r", scene: "开场" },
-    { goal: "b", ref: "r" }, // 空 scene
-    { goal: "c", ref: "r", scene: "开场" }, // 交错:与 a 同泳道
-    { goal: "d", ref: "r", scene: "谈赔" },
-  ];
-  const lanes = fc.sceneLanes(steps);
-  assert.deepEqual(
-    lanes.map((l) => l.name),
-    ["开场", "未分组", "谈赔"], // 首次出现序;空 scene 殿后于「开场」、先于「谈赔」（保持原位）
-  );
-  assert.deepEqual(lanes[0].steps.map((s) => s.goal), ["a", "c"]);
-  assert.deepEqual(lanes[1].steps.map((s) => s.goal), ["b"]);
-  assert.deepEqual(lanes[2].steps.map((s) => s.goal), ["d"]);
-  // 全空 scene → 单条未分组泳道。
-  assert.deepEqual(
-    fc.sceneLanes([{ goal: "x", ref: "r" }, { goal: "y", ref: "r" }]).map((l) => [l.name, l.steps.length]),
-    [[fc.UNGROUPED_LANE, 2]],
-  );
-  assert.deepEqual(fc.sceneLanes([]), []);
-});
-
-// ---- 布局（layoutFlow）：确定性/泳道几何/意图 overlay ----
+// ---- ④ 布局（layoutFlow,2026-09-20 纵向工作流）：确定性/脊柱/意图左栏条件边 ----
 const GRAPH = {
   version: 1,
   intents: [
-    { id: "int_a", label: "投诉", keywords: ["投诉"], steps: [], enabled: true, judge: { prompt: "客户表达不满" } },
+    { id: "int_a", label: "投诉", keywords: ["投诉", "骗人"], steps: [], enabled: true, judge: { prompt: "客户表达不满" } },
     { id: "int_b", label: "退款", keywords: ["退款"], steps: [3], enabled: false },
   ],
   bindings: [
     { id: "bnd_1", intent: "int_a", action: "jump_step", step: 3, priority: 10, once: false, enabled: true },
-    { id: "bnd_2", intent: "int_a", action: "play_qa", qa_id: "qa-1", priority: 10, once: true, enabled: true },
+    { id: "bnd_2", intent: "int_a", action: "play_qa", qa_id: "qa-1", then_jump: 2, priority: 10, once: true, enabled: true },
     { id: "bnd_3", intent: "int_b", action: "jump_step", step: 99, priority: 10, once: false, enabled: false }, // 停用:不画
     { id: "bnd_4", intent: "int_ghost", action: "jump_step", step: 1, priority: 10, once: false, enabled: true }, // 悬空意图:不画
   ],
 };
 
-test("layoutFlow：泳道纵向、步脊柱、意图侧栏/jumpIn/徽标、确定性", () => {
+test("layoutFlow：纵向脊柱全相邻对、意图左栏条件边/分支 chip/确定性", () => {
   const steps = [
     { goal: "s1", ref: "正稿一", scene: "开场" },
-    { goal: "s2", ref: "如果客户问 → 答", scene: "开场" },
+    { goal: "s2", ref: "正稿二\n如果客户问 → 答\n如果客户疑 → 再答\n如果客户骂 → 安抚\n如果客户挂 → 收线", scene: "开场" },
     { goal: "s3", ref: "正稿三" },
   ];
   const g1 = fc.layoutFlow(steps, GRAPH);
   const g2 = fc.layoutFlow(steps, GRAPH);
   assert.deepEqual(g1, g2); // 确定性:同输入同输出
 
-  const lanes = g1.nodes.filter((n) => n.kind === "lane");
-  assert.deepEqual(lanes.map((n) => n.name), ["开场", fc.UNGROUPED_LANE]);
-  const laneY = Object.fromEntries(lanes.map((n) => [n.name, n.y]));
-  assert.ok(laneY[fc.UNGROUPED_LANE] > laneY["开场"]); // 泳道纵向排布
-
+  // 无泳道节点;步节点按全局下标纵向排布（y 递增、同列）。
   const stepNodes = g1.nodes.filter((n) => n.kind === "step");
+  assert.equal(g1.nodes.filter((n) => n.kind === "lane").length, 0);
   assert.equal(stepNodes.length, 3);
   const byId = Object.fromEntries(stepNodes.map((n) => [n.id, n]));
-  assert.ok(byId["fstep:1"].scriptFirst.includes("如果客户问")); // 正稿首行（无正稿步显示分支首行）
+  assert.ok(byId["fstep:0"].y < byId["fstep:1"].y && byId["fstep:1"].y < byId["fstep:2"].y);
   assert.equal(byId["fstep:2"].x, byId["fstep:0"].x); // 同一脊柱列
+  assert.equal(byId["fstep:0"].scene, "开场");
+
+  // 步节点数据：正稿首行/分支 chip 上限折叠（4 分支=3 chip+1 折叠）/意图跳入计数。
+  assert.ok(byId["fstep:1"].scriptFirst.includes("正稿二"));
+  assert.equal(byId["fstep:1"].branches.length, fc.BRANCH_CHIP_LIMIT);
+  assert.equal(byId["fstep:1"].branchMore, 1);
   assert.equal(byId["fstep:2"].jumpIn, 1); // int_a jump_step→第 3 步
 
-  // 意图节点：jump 边（启用的）1 条,目标=fstep:2;play_qa/judge/停用徽标进 data。
+  // 脊柱=全部相邻对（跨场景不断线）,标签「默认推进」。
+  const spines = g1.edges.filter((e) => e.kind === "spine");
+  assert.deepEqual(spines.map((e) => [e.source, e.target]), [
+    ["fstep:0", "fstep:1"],
+    ["fstep:1", "fstep:2"],
+  ]);
+  assert.ok(spines.every((e) => e.label === "默认推进"));
+
+  // 意图节点：停用意图照渲染;jump 边（启用的）1 条,标签=意图名+前两关键词;
+  // play_qa+then_jump 画「播完跳转」边。
   const intents = g1.nodes.filter((n) => n.kind === "intent");
-  assert.equal(intents.length, 2); // 停用意图照渲染
+  assert.equal(intents.length, 2);
   const jumps = g1.edges.filter((e) => e.kind === "jump");
   assert.equal(jumps.length, 1);
   assert.equal(jumps[0].source, "fintent:int_a");
   assert.equal(jumps[0].target, "fstep:2");
+  assert.equal(jumps[0].label, "投诉（投诉、骗人）");
+  const thenJumps = g1.edges.filter((e) => e.kind === "thenjump");
+  assert.equal(thenJumps.length, 1);
+  assert.equal(thenJumps[0].source, "fintent:int_a");
+  assert.equal(thenJumps[0].target, "fstep:1");
+  assert.equal(thenJumps[0].label, "播完跳转");
   assert.equal(intents.find((n) => n.intentId === "int_a").playQa, true);
   assert.equal(intents.find((n) => n.intentId === "int_a").judge, true);
   assert.equal(intents.find((n) => n.intentId === "int_b").enabled, false);
 
-  // 泳道内脊柱线（开场两条步之间）；跨泳道不拉线。
-  const spines = g1.edges.filter((e) => e.kind === "spine");
-  assert.deepEqual(spines.map((e) => [e.source, e.target]), [["fstep:0", "fstep:1"]]);
-
-  // 无图:零意图零 jump 边。
+  // 无图:零意图零条件边,脊柱仍在。
   const bare = fc.layoutFlow(steps);
   assert.equal(bare.nodes.filter((n) => n.kind === "intent").length, 0);
   assert.equal(bare.edges.filter((e) => e.kind === "jump").length, 0);
+  assert.equal(bare.edges.filter((e) => e.kind === "thenjump").length, 0);
+  assert.equal(bare.edges.filter((e) => e.kind === "spine").length, 2);
+});
+
+// ---- ⑥ 分支动作前缀（A-③;镜像 flow.py _BRANCH_ACTION_RE/parse_branch_action） ----
+test("parseBranchAction：五种动作标记 + 无标记/空串 + 空白容错 + 跳第0步回落 + 空文本", () => {
+  // 五种标记（挂断与收线同义=refuse;jump 的 step 只在 action==="jump" 时有意义）。
+  assert.deepEqual(fc.parseBranchAction("【收线】唔好意思打搅咗"), { action: "refuse", step: 0, text: "唔好意思打搅咗" });
+  assert.deepEqual(fc.parseBranchAction("【挂断】拜拜"), { action: "refuse", step: 0, text: "拜拜" });
+  assert.deepEqual(fc.parseBranchAction("【转人工】我帮您转接同事"), { action: "handoff", step: 0, text: "我帮您转接同事" });
+  assert.deepEqual(fc.parseBranchAction("【跳第3步】直接讲办理"), { action: "jump", step: 3, text: "直接讲办理" });
+  assert.deepEqual(fc.parseBranchAction("【留本步】好嘅，我哋慢慢嚟"), { action: "hold", step: 0, text: "好嘅，我哋慢慢嚟" });
+  // 无标记/空串：resp 原样（逐字节,不 trim——无标记分支零改写铁律）。
+  assert.deepEqual(fc.parseBranchAction("就正常答"), { action: "", step: 0, text: "就正常答" });
+  assert.deepEqual(fc.parseBranchAction("  前置空白也原样  "), { action: "", step: 0, text: "  前置空白也原样  " });
+  assert.deepEqual(fc.parseBranchAction(""), { action: "", step: 0, text: "" });
+  // 标记内空白容错（flow.py \s* 同款）。
+  assert.deepEqual(fc.parseBranchAction("【 收线 】 唔好意思"), { action: "refuse", step: 0, text: "唔好意思" });
+  assert.deepEqual(fc.parseBranchAction("【跳第 12 步】跳过去"), { action: "jump", step: 12, text: "跳过去" });
+  // 跳第0步：标记已消费但无动作。
+  assert.deepEqual(fc.parseBranchAction("【跳第0步】就在这步答"), { action: "", step: 0, text: "就在这步答" });
+  // 标记后空文本（「【收线】」单独作应答）。
+  assert.deepEqual(fc.parseBranchAction("【收线】"), { action: "refuse", step: 0, text: "" });
+  // 步号 1..999 闭区间;>3 位整体不认作标记,resp 原样保留。
+  assert.deepEqual(fc.parseBranchAction("【跳第999步】x"), { action: "jump", step: 999, text: "x" });
+  assert.deepEqual(fc.parseBranchAction("【跳第1234步】太远"), { action: "", step: 0, text: "【跳第1234步】太远" });
+});
+
+test("composeBranchResp：标记重组 + 空动作逐字节零改写 + jump 步号钳制", () => {
+  assert.equal(fc.composeBranchResp("", 0, "就正常答"), "就正常答");
+  // 空动作恒逐字节=输入 text（含空白,零改写——抽屉切回「按内容回答」剥标记保文本）。
+  assert.equal(fc.composeBranchResp("", 7, "  保留空白  "), "  保留空白  ");
+  assert.equal(fc.composeBranchResp("refuse", 0, "拜拜"), "【收线】拜拜");
+  assert.equal(fc.composeBranchResp("handoff", 0, "转接同事"), "【转人工】转接同事");
+  assert.equal(fc.composeBranchResp("hold", 0, "慢慢嚟"), "【留本步】慢慢嚟");
+  assert.equal(fc.composeBranchResp("jump", 3, "直接讲"), "【跳第3步】直接讲");
+  // jump 步号钳制：非 1..999 整数一律按 1。
+  assert.equal(fc.composeBranchResp("jump", 0, "x"), "【跳第1步】x");
+  assert.equal(fc.composeBranchResp("jump", 1000, "x"), "【跳第1步】x");
+  assert.equal(fc.composeBranchResp("jump", 999, "x"), "【跳第999步】x");
+  assert.equal(fc.composeBranchResp("jump", 5.5, "x"), "【跳第1步】x");
+  assert.equal(fc.composeBranchResp("jump", NaN, "x"), "【跳第1步】x");
+});
+
+test("compose↔parse 往返不变量：逐条 action 参数化（text 取 trim 后逐件相等）", () => {
+  const cases = [
+    ["", 0], ["refuse", 0], ["handoff", 0], ["hold", 0],
+    ["jump", 1], ["jump", 3], ["jump", 999],
+  ];
+  for (const [a, n] of cases) {
+    const t = "就这么答";
+    const info = fc.parseBranchAction(fc.composeBranchResp(a, n, t));
+    assert.deepEqual(info, { action: a, step: a === "jump" ? n : 0, text: t }, `action=${a}`);
+  }
+});
+
+test("round-trip ⑥：带动作标记的 ref 仍逐件无损（标记在 resp 原样回写,标记不进 script）", () => {
+  const ref = [
+    "正稿行不动",
+    "如果客户骂人 → 【收线】唔好意思打搅咗，祝您生活愉快",
+    "如果客户要人工 → 【转人工】我帮您转接同事处理",
+    "如果客户赶时间 → 【跳第3步】直接讲办理",
+    "如果客户重听 → 【留本步】好嘅，我哋慢慢嚟",
+    "如果客户不理 → 【挂断】拜拜",
+    "注意：收线前必须道歉一次",
+  ].join("\n");
+  const parts = fc.parseStepRefParts(ref);
+  assert.equal(parts.script, "正稿行不动");
+  assert.deepEqual(parts.branches.map((b) => b.resp), [
+    "【收线】唔好意思打搅咗，祝您生活愉快",
+    "【转人工】我帮您转接同事处理",
+    "【跳第3步】直接讲办理",
+    "【留本步】好嘅，我哋慢慢嚟",
+    "【挂断】拜拜",
+  ]);
+  assert.equal(parts.notes, "收线前必须道歉一次");
+  assertRoundTrip(ref);
+});
+
+test("layoutFlow：步节点分支 data 带 action/jump（带标记 ref 派生正确）", () => {
+  const steps = [
+    {
+      goal: "s",
+      ref: [
+        "正稿行",
+        "如果客户骂人 → 【收线】唔好意思打搅咗",
+        "如果客户要人工 → 【转人工】我帮您转接同事",
+        "如果客户赶时间 → 【跳第2步】直接讲办理",
+      ].join("\n"),
+    },
+  ];
+  const lay = fc.layoutFlow(steps);
+  const node = lay.nodes.find((n) => n.id === "fstep:0");
+  assert.deepEqual(node.branches, [
+    { cond: "骂人", resp: "【收线】唔好意思打搅咗", action: "refuse", jump: 0 },
+    { cond: "要人工", resp: "【转人工】我帮您转接同事", action: "handoff", jump: 0 },
+    { cond: "赶时间", resp: "【跳第2步】直接讲办理", action: "jump", jump: 2 },
+  ]);
+  // 有正稿：scriptFirst=正稿首行,不受分支标记影响;resp 恒为原文含标记。
+  assert.equal(node.scriptFirst, "正稿行");
+  // 无标记分支：action=""/jump=0,与旧形状兼容面（cond/resp 两键同值）。
+  const plain = fc.layoutFlow([{ goal: "s", ref: "正稿\n如果客户嫌慢 → 就安抚" }]).nodes.find((n) => n.id === "fstep:0");
+  assert.deepEqual(plain.branches, [{ cond: "嫌慢", resp: "就安抚", action: "", jump: 0 }]);
+});
+
+test("layoutFlow：无正稿时首分支摘要剥动作标记（画布不露「【收线】」原始串）", () => {
+  const node = fc.layoutFlow([{ goal: "s", ref: "如果客户挂电话 → 【收线】唔好意思打搅咗" }])
+    .nodes.find((n) => n.id === "fstep:0");
+  assert.equal(node.scriptFirst, "如果客户挂电话→唔好意思打搅咗");
+  // 标记后空文本：退动作徽标文案,仍是人话不是标记串。
+  const bare = fc.layoutFlow([{ goal: "s", ref: "如果客户唔讲 → 【收线】" }])
+    .nodes.find((n) => n.id === "fstep:0");
+  assert.equal(bare.scriptFirst, "如果客户唔讲→收线");
+});
+
+test("BRANCH_ACTIONS 下拉契约：首项=默认空动作、顺序即下拉序、文案齐;branchCannedMeta 三态", () => {
+  assert.equal(fc.BRANCH_ACTIONS.length, 5);
+  assert.deepEqual(fc.BRANCH_ACTIONS.map((a) => a.value), ["", "refuse", "handoff", "jump", "hold"]);
+  for (const a of fc.BRANCH_ACTIONS) {
+    assert.ok(a.label.length > 0 && a.hint.length > 0, `value=${a.value} 文案缺失`);
+  }
+  assert.deepEqual(fc.branchCannedMeta("ok"), { dot: "bg-emerald-500", title: "已有录音" });
+  assert.deepEqual(fc.branchCannedMeta("missing"), { dot: "bg-zinc-400", title: "未录" });
+  assert.deepEqual(fc.branchCannedMeta("ph"), { dot: "bg-amber-400", title: "含变量，无法预录" });
+});
+
+// ---- ⑦ 易用性三件数据面（2026-09-20 真浏览器点击验收 F5/F6/F7） ----
+test("F5/F6/F7 数据面：初始缩放选项 / 引导语空态 / 抽屉保持判定", () => {
+  // F5：fitView 缩放夹在 [0.75, 1]——下限管首屏文字看得清（12px→9px）,
+  // 上限管步骤少的模板不被放大成巨卡;整图超出视口靠平移/小地图,不靠眯眼。
+  const opt = fc.canvasFitViewOptions();
+  assert.equal(opt.minZoom, fc.CANVAS_MIN_ZOOM);
+  assert.equal(opt.minZoom, 0.75);
+  assert.equal(opt.maxZoom, 1);
+  assert.equal(opt.padding, 0.15);
+  // F6：没意图时引导语不再承诺「左边意图卡」;空态提示是中文人话（不露内部词）。
+  assert.ok(fc.canvasGuideText(true).includes("意图卡"));
+  assert.ok(!fc.canvasGuideText(false).includes("意图卡"));
+  assert.ok(fc.CANVAS_INTENT_EMPTY_HINT.includes("意图"));
+  for (const t of [fc.canvasGuideText(true), fc.canvasGuideText(false), fc.CANVAS_INTENT_EMPTY_HINT]) {
+    for (const banned of ["ref", "resp", "graph_json"]) {
+      assert.ok(!t.includes(banned), `引导文案不得出现内部词 ${banned}`);
+    }
+  }
+  // F6 口径与布局一致：intents 非空即有卡（停用意图也照渲染成卡）。
+  assert.equal(fc.graphHasIntents(undefined), false);
+  assert.equal(fc.graphHasIntents({ intents: [], bindings: [] }), false);
+  assert.equal(fc.graphHasIntents({ intents: [{ id: "a" }], bindings: [] }), true);
+  assert.equal(fc.graphHasIntents({ intents: [{ id: "a", enabled: false }], bindings: [] }), true);
+  // F7：同模板保存（步号仍在范围）抽屉保持打开;越界/坏值才收起。
+  assert.equal(fc.drawerIndexValid(0, 8), true);
+  assert.equal(fc.drawerIndexValid(7, 8), true);
+  assert.equal(fc.drawerIndexValid(8, 8), false);
+  assert.equal(fc.drawerIndexValid(-1, 3), false);
+  assert.equal(fc.drawerIndexValid(1.5, 3), false);
 });

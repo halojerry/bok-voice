@@ -1147,8 +1147,8 @@ def _apply_judge_env(env: dict[str, str], _cur: dict[str, str]) -> None:
 # 两次实弹同病）。**新增 env 开关的立法动作 = 在此表加一行**：
 # `tests/test_forward_env.py` 扫 agent_runtime 全部 `os.environ` 读取面，未登记
 # （本表/bok 既有注入/豁免清单）即测试失败——死门在 CI 层根治，唔靠人记。
-# 豁免（测试侧 `_EXEMPT`）：SCRIPTED_LLM*/USE_FAKE_MEDIA（E2E 测试腿专用）、
-# LOCALAPPDATA（Windows OS 变量，tts_cache 有 home 回退）。
+# 豁免（测试侧 `_EXEMPT`）：SCRIPTED_LLM*/USE_FAKE_MEDIA/FAKE_STT_TEXT（E2E 测试腿
+# 专用）、LOCALAPPDATA（Windows OS 变量，tts_cache 有 home 回退）。
 _FORWARD_ENV = (
     # —— 话术图引擎 + QA 命中语义 ——
     "BOK_FLOW_GRAPH",
@@ -1158,6 +1158,18 @@ _FORWARD_ENV = (
     "BOK_QA_ROTATION",
     "BOK_QA_PRIORITY",
     "BOK_QA_FASTPATH",
+    # —— 分支罐头快路+分支动作(2026-09-20 路线 A-①/A-②:分支命中→物化录音跳
+    #    LLM;应答首部【收线】/【转人工】/【跳第N步】/【留本步】动作前缀=引擎一等出口) ——
+    "BOK_BRANCH_ACTION",
+    "BOK_BRANCH_CANNED",
+    # —— F4 破坏性动作双护栏(2026-09-20:refuse 派发前条件核心词须字面命中;
+    #    整轮/末子句剥词表词后过短=ASR 抄词表不收线) ——
+    "BOK_BRANCH_REFUSE_CONFIRM",
+    "BOK_BRANCH_REFUSE_HOTWORD_GUARD",
+    # —— F2 迟到 FINAL 尾巴护栏(2026-09-20:AI 生成/播报中相对已提交文本的
+    #    极短追加 finish 尾巴=重解幻听,不成轮不打断快路/直念回复) ——
+    "BOK_LATE_FINAL_GUARD",
+    "BOK_LATE_FINAL_MAX_TAIL_CHARS",
     "BOK_QA_MATCH_THRESHOLD",
     # —— 垫话/罐头/TTS 缓存 ——
     "BOK_FILLER",
@@ -1183,6 +1195,8 @@ _FORWARD_ENV = (
     "FLOW_LLM_ADVANCE",
     "BOK_PERCEIVED_BUDGET_MS",
     "BOK_MAX_CALL_DURATION_S",
+    # 结算 gather 等待窗(D7):0/缺省=自适应档(无慢任务 10s/有意图判据 25s)。
+    "BOK_SETTLE_WAIT_S",
     "DEEPSEEK_BASE_URL",
     "DEEPSEEK_MODEL",
     "DEEPSEEK_API_KEY",
@@ -1223,6 +1237,8 @@ _FORWARD_ENV = (
     # —— ASR（agent 侧读的运维档；sidecar 专属键走 asr_env 另注入） ——
     "BOK_ASR_HOTWORDS",
     "BOK_ASR_PARTIAL_SLOW_MS",
+    # chunk POST 失败保留(D4):0=回退旧「先清后发」档。
+    "QWEN3_ASR_CHUNK_KEEP",
     "QWEN3_ASR_STREAM",
     "QWEN3_ECHO_GUARD",
     "QWEN3_HOTWORD_ECHO_GUARD",
@@ -1235,6 +1251,74 @@ _FORWARD_ENV = (
     "BOK_CP_TOKEN",
     # —— 日志面 ——
     "BOK_LOG_LEVEL",
+    # —— providers/ 子包收编（2026-09-20 D14：test_forward_env 扫描改 rglob 递归，
+    #    providers/livekit_plugins.py 61 键此前整包漏扫——60 运营键进表，
+    #    FAKE_STT_TEXT 测试腿 shim 进豁免）。未设不注入，默认档零变化。 ——
+    # LLM 生成链调参/诊断（livekit_plugins.py MlxLlmLLM/ContextAwareLLM 读面）：
+    "BOK_LLM_MSG_DEBUG",
+    "BOK_LLM_REGEN",
+    "BOK_REPEAT_GUARD",
+    "BOK_TAIL_SLIM",
+    "EMOTION_TAG_PROMPT",
+    "LLM_FIRST_TOKEN_TIMEOUT_S",
+    "LLM_HISTORY_TURNS",
+    "LLM_LATE_ANSWER_DEADLINE_S",
+    "LLM_MAX_TOKENS",
+    "LLM_REQUEST_RETRIES",
+    "LLM_REQUEST_TIMEOUT_S",
+    "LLM_TEMPERATURE",
+    "LLM_WARMUP",
+    "REPLY_MEMORY_LINES",
+    # MiniMax TTS：凭据/端点 + bidi 自愈 + 语速/音调/音量 + 叠句增量（运营键全集）：
+    "MINIMAX_API_KEY",
+    "MINIMAX_BASE_URL",
+    "MINIMAX_WS_URL",
+    "MINIMAX_REGION",
+    "MINIMAX_BIDI_AUTO_REWARM",
+    "MINIMAX_BIDI_CANCEL_WAIT_S",
+    "MINIMAX_BIDI_FIRST_AUDIO_TIMEOUT_S",
+    "MINIMAX_BIDI_PING_MAX_MISS",
+    "MINIMAX_BIDI_PING_S",
+    "MINIMAX_BIDI_PREWARM_RETRY",
+    "MINIMAX_BIDI_STALL_MAX_HEALS",
+    "MINIMAX_BIDI_SYNTH_WARMUP",
+    "MINIMAX_CONTINUOUS_SOUND",
+    "MINIMAX_EMOTION",
+    "MINIMAX_FIRST_AUDIO_TIMEOUT_S",
+    "MINIMAX_PAUSE",
+    "MINIMAX_PAUSE_SECS",
+    "MINIMAX_PITCH",
+    "MINIMAX_SPEED",
+    "MINIMAX_TTS_OVERLAP",
+    "MINIMAX_TTS_OVERLAP_CHARS",
+    "MINIMAX_TTS_OVERLAP_MS",
+    "MINIMAX_VOL",
+    "MINIMAX_WS",
+    "MINIMAX_WS_MODE",
+    "MINIMAX_WS_POOL",
+    # Qwen3-ASR：agent 侧插件读面（sidecar 进程专属键另走 asr_env，不在此表）：
+    "QWEN3_ASR_CHUNK_MS",
+    "QWEN3_ASR_HESITATION_GATE",
+    "QWEN3_ASR_JOIN_HOLD_MS",
+    "QWEN3_ASR_JOIN_HOLD_VOCAB",
+    "QWEN3_ASR_PAUSE_COMMIT_MIN_CHARS",
+    "QWEN3_ASR_PREFLIGHT_LANG_GATE",
+    "QWEN3_ASR_SENTENCE_PAUSE_TRIGGER",
+    # Qwen3-TTS sidecar 客户端（插件侧）调参：
+    "QWEN3_TTS_MAX_TASK_AUDIO_SEC",
+    "QWEN3_TTS_OVERLAP",
+    "QWEN3_TTS_OVERLAP_CHARS",
+    "QWEN3_TTS_OVERLAP_MS",
+    # Volcano TTS：凭据/端点/voice 调参：
+    "VOLC_ACCESS_TOKEN",
+    "VOLC_APP_ID",
+    "VOLC_DIALECT",
+    "VOLC_LANGUAGE",
+    "VOLC_LOUDNESS_RATE",
+    "VOLC_RESOURCE_ID",
+    "VOLC_SPEAKER",
+    "VOLC_SPEECH_RATE",
+    "VOLC_TTS_ENDPOINT",
 )
 # 历史名（2026-09-18 终审 I1 起的既有调用面/单测锚）：表本体唯一，别名防散。
 _BOK_PASSTHROUGH_KEYS = _FORWARD_ENV

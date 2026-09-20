@@ -34,10 +34,40 @@ from .qa_gate import (
     qa_fastpath_enabled,
     qa_rotation_enabled,
 )
-from .tts_cache import CachedTTS, TtsAudioCache, default_cache_dir, frames_aiter, pcm_to_frames, tts_cache_enabled
+from .tts_cache import (
+    CachedTTS,
+    TtsAudioCache,
+    default_cache_dir,
+    frames_aiter,
+    pcm_to_frames,
+    tts_cache_enabled,
+    wrap_first_audio_tts,
+)
 # 模块级引 flow(纯 stdlib 依赖,无环):_wa_numberish/_wa_number_line 等模块级
 # helper 用;entrypoint 内的 function-scoped import 属历史样式,不冲突。
-from .flow import _digit_normalize, digits_to_cantonese, stall_ladder_level
+# 分支规划(branch_hit_plan,路线 A-①/A-②)用:match_step_branch/parse_step_ref
+# 与提示词注入同源匹配器、parse_branch_action 动作前缀拆解、BRANCH_ACTION_*
+# 动作常量、REFUSE/FAREWELL 收线专线让位闸。
+from .flow import (  # noqa: F401 - 部分名字只被 branch_hit_plan 使用
+    BRANCH_ACTION_HANDOFF,
+    BRANCH_ACTION_HOLD,
+    BRANCH_ACTION_JUMP,
+    BRANCH_ACTION_REFUSE,
+    FAREWELL,
+    REFUSE,
+    _cond_norm_text,
+    _digit_normalize,
+    _looks_like_whatsapp_step,
+    digits_to_cantonese,
+    hotword_only_by_length,
+    hotword_only_utterance,
+    match_step_branch,
+    parse_branch_action,
+    parse_step_ref,
+    refuse_condition_confirmed,
+    render_template_text,
+    stall_ladder_level,
+)
 
 try:
     from bok_voice_obs.logging import configure_logging, get_logger
@@ -392,6 +422,134 @@ async def _say_script(session, tts_provider, cache, text: str, emotion: str = ""
         if not played["frames"]:
             return await session.say(text)
         return None
+
+
+def branch_hit_plan(
+    *,
+    action_enabled: bool,
+    canned_enabled: bool,
+    step_index: int,
+    closing: bool,
+    paused: bool,
+    done: bool,
+    user_text: str,
+    goal: str,
+    ref: str,
+    wa_captured: bool,
+    verdict: str,
+    vars_map: dict[str, str] | None = None,
+    hotword_terms: tuple[str, ...] = (),
+) -> dict | None:
+    """分支命中规划(2026-09-20 路线 A-②,纯函数,单测直接喂)。
+
+    当前步 ref 带「如果客户X→就Y」分支且 match_step_branch 命中(与提示词
+    注入同源:verdict 家族+客户原话 bigram)→ 解析应答首部动作前缀
+    (parse_branch_action),返回 {"cond","action","jump","text","hold"}:
+    调用方按 action 派发引擎动作(收线/转人工/跳步/留本步),罐头腿查
+    tts_cache 命中即播录音跳过 LLM。任一闸不过/未命中/应答渲染后仍有
+    {占位} 残留(变量缺失,pregen 同规则不会物化)→ None,调用方照旧落穿
+    graph/QA/LLM——提示词注入行为不变。ref 空=无流程/行完/无分支步,
+    零开销直落。闸门与漏斗既有专线对齐:REFUSE/FAREWELL 让位收线、WA 步
+    未捕获跳过(与 QA 快路 wa_step_locked 同语义)、closing/paused 不截。
+    """
+    # ① 总闸:动作腿与罐头腿全关 → 零开销直落(BOK_BRANCH_ACTION=0 且
+    #    BOK_BRANCH_CANNED=0)
+    if not (action_enabled or canned_enabled):
+        return None
+    # ② 基本闸:暂停/流程行完/空话/空 ref——无上下文无从谈分支
+    if paused or done or not str(user_text).strip() or not str(ref).strip():
+        return None
+    # ③ WA 步未捕获不截轮(与 QA 快路 wa_step_locked 同语义):收号码步命中
+    #    分支会吞掉「请继续报号码」的引导,收号结构优先
+    if _looks_like_whatsapp_step(goal, ref) and not wa_captured:
+        return None
+    parts = parse_step_ref(ref)
+    if not parts.branches:
+        return None
+    m = match_step_branch(parts, user_text, verdict)
+    if not m:
+        return None
+    # ④ 动作前缀拆解:识别到标记一律消费,余下文本才是应答
+    action, jump_step, clean = parse_branch_action(m[1])
+    # ④' 破坏性动作双护栏(F4,2026-09-20 实弹 call-23516077:弱尾音节被 ASR 抄成
+    #     词表里的「打错电话」→ 家族+bigram 模糊命中【收线】分支→真挂了客户;
+    #     call-179c7608 二修:ASR 自打标点把一句拒绝切成两片段时,后半「我不是
+    #     这个人。」不含条件词,纯字面门会把它挡去 LLM——收线台词播半句被打断、
+    #     后半走 gen=llm,探针 no_llm_after_refuse/turn_gen_script_text_exact FAIL)。
+    #     只作用于 refuse 动作;handoff/jump/hold/无动作分支维持现有模糊匹配语义。
+    #     ① 确定性命中【或 内置明确拒绝】:条件核心词(拆「/」「、」「,」「或」
+    #        多选)字面出现在客户原话里,或内置 rule_verdict 本轮已判 REFUSE——
+    #        客户明确拒绝(内置规则独立判定)时,允许用运营为这条分支写的收线
+    #        台词(比通用收尾稿更贴语境);而仅模糊相似、无内置拒绝依据不足以
+    #        让 AI 挂客户电话(热词抄词之外的误收线面就此保住)
+    #        (BOK_BRANCH_REFUSE_CONFIRM=0 回退);
+    #     ② 热词幻觉【最终否决】:即使字面/verdict==REFUSE 过了①,整轮(或末
+    #        子句)剥词表词后剩余过短/为空 → 仍判 ASR 抄词表,不收线(实弹误收
+    #        线轮「你等等先,我还想。打错电话。」必须继续被拦)
+    #        (BOK_BRANCH_REFUSE_HOTWORD_GUARD=0 回退)。词表=模板 hotwords+
+    #        行业词+对象字段(asr_hotword_context 组装,_parse_vocab_terms 反解),
+    #        取不到退化为长度近似(核心词命中且整轮 ≤ 核心词长+1)。
+    #     两道都不过 → None 落回后续 LLM 或内置 REFUSE 车道(内置车道还在,
+    #     verdict==REFUSE 照收线),并打 refuse_skipped 归因日志。
+    if action == BRANCH_ACTION_REFUSE:
+        _literal_or_refuse = refuse_condition_confirmed(m[0], user_text) or verdict == REFUSE
+        if (
+            os.environ.get("BOK_BRANCH_REFUSE_CONFIRM", "1") == "1"
+            and not _literal_or_refuse
+        ):
+            print(
+                f"BRANCH_ACTION refuse_skipped reason=not_literal cond={m[0]!r} "
+                f"text={user_text!r}",
+                flush=True,
+            )
+            return None
+        if os.environ.get("BOK_BRANCH_REFUSE_HOTWORD_GUARD", "1") == "1":
+            if hotword_terms:
+                _hw_only = hotword_only_utterance(user_text, hotword_terms)
+            else:
+                _hw_only = hotword_only_by_length(user_text, m[0])
+            if _hw_only:
+                print(
+                    f"BRANCH_ACTION refuse_skipped reason=hotword_only cond={m[0]!r} "
+                    f"text={user_text!r}",
+                    flush=True,
+                )
+                return None
+    # ⑤ 第 1 步限制(仅动作腿生效):身份步「任何非拒绝回应都推进」铁律不许
+    #    被分支抢走(留本步/跳步会把开场钉死/跳飞);收线与打铃不推进流程,
+    #    放行
+    if (
+        action_enabled
+        and step_index == 0
+        and action not in (BRANCH_ACTION_REFUSE, BRANCH_ACTION_HANDOFF)
+    ):
+        return None
+    # ⑥ closing 让位:收线后只讲告别,罐头/跳步/留本步不许抢收线轮;refuse
+    #    动作本身是幂等收线,放行
+    if closing and action != BRANCH_ACTION_REFUSE:
+        return None
+    # ⑦ 无动作分支的收线让位门(A-① 原闸逐字节保留):客户明确拒绝/道别轮
+    #    不播分支录音,让给收线话术专线
+    if action == "" and verdict in (REFUSE, FAREWELL):
+        return None
+    rendered = render_template_text(clean, vars_map or {})
+    # ⑧ 无可播内容:渲染空/仍有 {占位} 残留(变量缺失)→ None,**且不许
+    #    hold**——「留本步」配空文本会把流程钉死(本轮无话可说又永推进不了);
+    #    refuse/handoff/jump 不受此闸(主效应在动作,文本缺失由调用方降级)
+    if action in ("", BRANCH_ACTION_HOLD) and (
+        not rendered.strip() or re.search(r"\{[^{}]+\}", rendered)
+    ):
+        return None
+    # ⑨ hold 语义:除 handoff(打铃不抢话=不抑制推进)外,分支命中轮抑制本轮
+    #    规则推进——分支应答就是本轮的「留本步」回答,再叠一次自动推进会把
+    #    应答与流程错位
+    return {
+        "cond": m[0],
+        "action": action,
+        "jump": jump_step,
+        "text": rendered,
+        "hold": action != BRANCH_ACTION_HANDOFF,
+    }
 
 
 def _nudge_should_fire(now: float, last_reply_ts: float, last_user_ts: float, nudge_delay: float) -> bool:
@@ -785,6 +943,14 @@ def _watchdog_extend(state: dict, spawn, extra_s: float, now: float) -> bool:
     return True
 
 
+def _has_first_audio_signal(provider: object) -> bool:
+    """provider 是否带首音频信号口(D2,2026-09-20):看门狗拆弹与垫话撤表/扣压
+    接线都挂这个接口——CachedTTS 与薄透传 _FirstAudioTTS 都有,裸 MiniMax/
+    FallbackAdapter/本地 TTS 冇。取代旧 isinstance(…, CachedTTS) 单判:缓存
+    装配失败不再令整通看门狗/垫话联动哑掉(D2),本地链无信号口照旧不武装。"""
+    return hasattr(provider, "add_first_audio_listener")
+
+
 # ---- 通用单号句判定(B2 数字句跨步累积,2026-09-17)----
 # 快递单号/电话不只在 WA 步报——理赔场景第 2/3 步就报单号;join-hold 只认
 # 「≥2 数字或系词尾」的续接,拆出的半截句 ≥10 字照成轮 → AI 答半句、后半截
@@ -1076,6 +1242,15 @@ def partial_ms_for_state(state: str, slow_ms: int) -> int | None:
     return slow_ms if state in ("thinking", "speaking") else None
 
 
+def agent_busy_for_state(state: str) -> bool:
+    """状态→「回复在途」旗(纯函数,单测用;F2 迟到 FINAL 尾巴护栏消费)。
+
+    thinking(LLM 生成中)/speaking(播报中)=True——快路罐头/直念回复正在出声、
+    或回复文本在途,此刻迟到的 finish 幻听尾巴唔该成新轮掐断它;listening=
+    False——AI 空闲,短尾豁免旧行为全保留。"""
+    return state in ("thinking", "speaking")
+
+
 _ECHO_SIM_RATIO = 0.9
 _ECHO_MIN_CHARS = 6
 
@@ -1086,7 +1261,7 @@ def _hotword_echo_guard_enabled() -> bool:
 
 # 幻听判定单一实现喺 livekit_plugins(STT 源头闸与 hook 双层共用,防漂移)。
 from .providers.livekit_plugins import _is_hotword_vocab_echo as _is_hotword_echo  # noqa: E402
-from .providers.livekit_plugins import _strip_vocab_echo_tail, _vocab_echo_guard  # noqa: E402
+from .providers.livekit_plugins import _parse_vocab_terms, _strip_vocab_echo_tail, _vocab_echo_guard  # noqa: E402
 
 
 def _is_echo_self_heard(user_text: str, last_reply: str, agent_speaking: bool) -> bool:
@@ -1354,6 +1529,46 @@ QA_COUNTERS: dict[str, int] = {}
 # _close_flushed 永不 set(12s 超时兜底空等)。与本仓 _duration_fuse 注释、MiniMax
 # 孤儿 invalidate 实证是同一 bug 类;done-callback 自清,job 进程一通一命无跨通话残留。
 _SETTLE_TASKS: set = set()
+
+# ---- 结算 gather 自适应等待窗(D7,2026-09-20) ----
+# 原硬码 10s 与意图判据 `_background_intent_judge` 的 LLM 总预算 timeout=20s
+# (review N9,9B 判据集 prefill ~0.6k tok/s 实测依据,**勿改 judge 语义**)同吃
+# `_report_tasks` 池——慢判定轮收线时 10s 窗先到,wait_for 掐死 gather,判定
+# 结果静默丢失(只剩一行 REPORT_TASK_ERR)。分档规则见 `_settle_wait_s`。
+_SETTLE_WAIT_BASE_S = 10.0
+_SETTLE_WAIT_MARGIN_S = 5.0
+
+
+def _settle_wait_s(slow_deadline_s: float = 0.0) -> float:
+    """结算 gather 的自适应等待窗(纯函数,离线可测 tests/test_settle_wait.py)。
+
+    分档依据:turns/perceived 等常规上报都是亚秒级,10s 基线保证快速收线不被
+    拖慢;**有在途慢任务**(如意图判据,LLM 预算 20s + 3s 让路 delay)时窗口抬到
+    `max(10, 慢任务预算 + 5s 余量)`——不满足「预算+余量」等于没修。gather 完成即
+    返回,抬窗只影响真正的慢轮,快路径零变化。`BOK_SETTLE_WAIT_S` 显式设置
+    (>0)优先,`0`/非法值=按上面规则算(逃生口而非常改口)。
+    """
+    if slow_deadline_s > 0:
+        rule = max(_SETTLE_WAIT_BASE_S, slow_deadline_s + _SETTLE_WAIT_MARGIN_S)
+    else:
+        rule = _SETTLE_WAIT_BASE_S
+    raw = (os.environ.get("BOK_SETTLE_WAIT_S") or "").strip()
+    if raw:
+        try:
+            v = float(raw)
+        except ValueError:
+            return rule
+        if v > 0:
+            return v
+    return rule
+
+
+def _task_label(task: "asyncio.Task") -> str:
+    """在途任务的可读名(SETTLE_WAIT_TIMEOUT 归因面;取不到回退 repr)。"""
+    try:
+        return str(task.get_coro().__name__)
+    except Exception:  # noqa: BLE001 - 归因失败不阻结算
+        return repr(task)
 
 
 def _qa_bump(key: str) -> None:
@@ -2185,8 +2400,10 @@ async def entrypoint(ctx):
     def _arm_response_watchdog() -> None:
         if _response_watchdog_s() <= 0:
             return
-        if not isinstance(tts_provider, CachedTTS):
-            # 非缓存透传层冇首音频信号,看门狗无法拆弹 → 不武装(保旧行为)
+        if not _has_first_audio_signal(tts_provider):
+            # 冇首音频信号口的裸 provider(本地 Qwen3/volcano/fake 链)无法拆弹
+            # → 不武装(保旧行为)。云端链恒带该口(CachedTTS 或 D2 薄透传
+            # _FirstAudioTTS)——缓存装配失败/关闭不再哑掉看门狗。
             return
         _cancel_response_watchdog()
         _watchdog["disarmed"] = False
@@ -2309,6 +2526,10 @@ async def entrypoint(ctx):
     tts_provider_name = persona_tts_provider or global_tts_provider
     if persona_tts_provider:
         print(f"[agent] persona tts_provider={persona_tts_provider!r} overrides global {global_tts_provider!r}", flush=True)
+    # 云端 MiniMax 链标记:minimax 分支赋主实例,其余分支保持 None。D2 前置
+    # 修复:此前只在 minimax 分支赋值、下方缓存块无条件读——qwen3/volcano/
+    # fake 分支一进缓存块即 UnboundLocalError,纯靠线上恒配 minimax 掩盖。
+    _tts_primary: MiniMaxTTS | None = None
     if use_fake or tts_provider_name in ("fake", "fake_tts"):
         # fake = 静音测试音（FakeLiveKitTTS）；绝不落入 Volcano 的 beep 分支。
         tts_provider = FakeLiveKitTTS()
@@ -2424,6 +2645,19 @@ async def entrypoint(ctx):
             _tts_cache = None
             print(f"[agent] tts audio cache init failed: {exc!r} (call {room_name})", flush=True)
 
+    # D2(2026-09-20):缓存缺席(BOK_TTS_CACHE=0/TtsAudioCache 装配失败)时
+    # provider 是裸 FallbackAdapter/裸 MiniMax——首音频信号整通哑掉(看门狗
+    # 永不武装、垫话撤表/扣压永不接线,只剩一行 init failed 日志零告警)。
+    # 包一层零缓存逻辑的薄透传恢复同一契约;CachedTTS 在场时本步零变化。
+    if _tts_primary is not None:
+        _bare_provider = tts_provider
+        tts_provider = wrap_first_audio_tts(tts_provider, _tts_cache)
+        if tts_provider is not _bare_provider:
+            print(
+                f"[agent] tts first-audio passthrough on (cache unavailable) (call {room_name})",
+                flush=True,
+            )
+
     llm_provider_name = llm_cfg.get("provider") or "local_openai"
     if os.environ.get("SCRIPTED_LLM") == "1":
         llm_provider = ScriptedLLM(
@@ -2501,7 +2735,17 @@ async def entrypoint(ctx):
 
     async def _late_answer_say(text: str) -> None:
         """弃流重生成功后的晚到真答案:走正常 speech 队列补答(客户插话可打断,
-        账本 gen=script/provider=late-answer 与心跳/WA 直念同姿势)。"""
+        账本 gen=script/provider=late-answer 与心跳/WA 直念同姿势)。
+
+        投递前必须 `_cancel_response_watchdog()`——与本钩子内 14 处直念族调用点
+        同款约定。漏了这一步就是「答案已到、客户听不到」:本路径两条腿都不产出
+        首音频回调(tts_cache 两处盲区),看门狗因此对补答完全隐身,4s 到点
+        force-interrupt 把正在念/待念的真答案掐掉,改念兜底句。
+        实弹账本(agent.log,2026-09-21):48 轮晚到补答里 17 轮被同轮看门狗掐掉
+        (17/17 都是 TTS_CACHE hit=0 的合成腿——命中腿与未命中腿都不 fire)。
+        残余取舍:若用户已开新轮(cancel 无法分辨归属轮),新轮的看门狗会一并
+        停摆——与直念族同一取舍,由新轮自身音频覆盖。"""
+        _cancel_response_watchdog()  # 晚到补答即出声(勿让 4s 闸掐掉在途真答案)
         try:
             _turn_origin["gen"] = "script"
             _turn_origin["provider"] = "late-answer"
@@ -2626,8 +2870,9 @@ async def entrypoint(ctx):
     # (官方组件,独立 track 即刻出声)——旧 session.say() 走 speech 队列,1.8 调度
     # 严格串行,垫话必然排在回复 speech 后面:多数被首音频回调静默吞掉(慢轮照样
     # 纯静音),拥塞时竞态漏出=垫话在回复后才响(实机实证,call-065a1a12)。
-    # arm/cancel 由 on_user_turn_completed 驱动;首音频回调挂在 CachedTTS 透传层
-    # (未包缓存时挂不上,垫话自动失效——纯透传无回调)。start 在 session.start 之后。
+    # arm/cancel 由 on_user_turn_completed 驱动;首音频回调挂在带信号口的
+    # provider 透传层(CachedTTS 或 D2 薄透传 _FirstAudioTTS;裸 provider 挂不上,
+    # 垫话自动失效——纯透传无回调)。start 在 session.start 之后。
     try:
         from livekit.agents import BackgroundAudioPlayer
 
@@ -2774,7 +3019,7 @@ async def entrypoint(ctx):
         _filler._user_text_provider = lambda: flow_ctrl.last_user_text
         _filler._entry_hit = _filler_entry_hit
         print(f"[agent] filler canned on entries={len(_filler_index)} (call {room_name})", flush=True)
-    if isinstance(tts_provider, CachedTTS):
+    if _has_first_audio_signal(tts_provider):
         tts_provider.add_first_audio_listener(_filler.on_reply_first_audio)
         # 真回复首音频=看门狗拆弹信号(垫话/兜底/直念族经同一 provider 透传层)。
         tts_provider.add_first_audio_listener(lambda: _disarm_response_watchdog())
@@ -2935,13 +3180,19 @@ async def entrypoint(ctx):
     # 在途 turn 上报任务:挂断时结算前要等佢哋落地(裸 create_task 会被 job
     # teardown 杀掉=整轮丢失)。
     _report_tasks: set = set()
+    # 慢任务登记(D7):task → 其内部 LLM 预算秒。只有预算可能超过 10s 基线的
+    # 后台判定任务才登记(当前唯一=意图判据 timeout=20);_close 按此抬等待窗。
+    _slow_report_tasks: dict = {}
 
-    def _spawn_report(coro):
+    def _spawn_report(coro, *, slow_s: float = 0.0):
         task = asyncio.create_task(coro)
         _report_tasks.add(task)
+        if slow_s > 0:
+            _slow_report_tasks[task] = slow_s
 
         def _done(t: asyncio.Task) -> None:
             _report_tasks.discard(t)
+            _slow_report_tasks.pop(t, None)
             if not t.cancelled() and t.exception() is not None:
                 # 上报/字幕任务失败不阻通话,但必须打点——静默 never-retrieved 会
                 # 掩盖「字幕没出/轮次丢报」这类缺口(2026-09-11 caption 实证)。
@@ -3141,13 +3392,24 @@ async def entrypoint(ctx):
             except Exception as exc:  # pragma: no cover - 报表失败唔阻结算
                 print(f"[agent] session report failed: {exc!r} (call {room_name})", flush=True)
             # 在途 turns 上报(含 perceived 等待窗)先落地再结算,防 teardown 杀任务丢轮。
+            # 等待窗自适应(D7):无在途慢任务保持 10s 快速收线;有(意图判据 LLM
+            # 预算 20s)抬到预算+5s 余量——否则慢判定轮被基线掐死、意向判定静默
+            # 丢失。gather 完成即返回,快路径零拖慢;超时仍发生必须归因留痕。
             if _report_tasks:
+                _slow_deadline = max(_slow_report_tasks.values(), default=0.0)
+                _wait = _settle_wait_s(_slow_deadline)
                 try:
                     await asyncio.wait_for(
-                        asyncio.gather(*list(_report_tasks), return_exceptions=True), timeout=10.0
+                        asyncio.gather(*list(_report_tasks), return_exceptions=True), timeout=_wait
                     )
                 except asyncio.TimeoutError:
-                    pass
+                    _left = [_task_label(t) for t in _report_tasks if not t.done()]
+                    print(
+                        f"SETTLE_WAIT_TIMEOUT wait_s={_wait:.1f} "
+                        f"slow_deadline_s={_slow_deadline:.1f} left={len(_left)} "
+                        f"tasks={_left}",
+                        flush=True,
+                    )
             await cp.settle(call_id)
             # QA 快路每通汇总(task-9):每通一行 PERF 风格,打完即清零(job 进程
             # 一通一命,清零属防御);打点失败绝不影响结算。
@@ -3480,7 +3742,10 @@ async def entrypoint(ctx):
             return
         _gjudge_inflight["on"] = True
         # 池化(同 _background_flow_judge):强引用防 GC 中途回收,失败走 REPORT_TASK_ERR。
-        _spawn_report(_background_intent_judge(flow_ctrl.current, utt, candidates))
+        # slow_s=20(D7):本任务 LLM 总预算 timeout=20(review N9,勿改)——登记给
+        # _close 抬结算等待窗,慢判定轮收线不再被 10s 基线掐死丢判定。
+        # 单行形态勿拆:test_intent_judge_wiring 源码 pin `_spawn_report(_background_intent_judge`。
+        _spawn_report(_background_intent_judge(flow_ctrl.current, utt, candidates), slow_s=20.0)
         print(
             f"FLOW_GRAPH judge_scheduled intents={len(candidates)} step={flow_ctrl.current + 1}",
             flush=True,
@@ -3871,6 +4136,14 @@ async def entrypoint(ctx):
             except Exception:  # pragma: no cover - 沉淀失败唔阻回复
                 pass
             _flow_step_before = flow_ctrl.current
+            # 分支动作规划状态(A-②,每轮重置防上一轮残留计划泄漏):
+            # _branch_plan  命中计划(None=未命中/已派发),罐头腿消费
+            # _branch_hold  分支命中轮抑制规则推进(留本步/跳步/无动作分支)
+            # _branch_refuse_say/emo  【收线】台词直念出口(raise 须在 try 外)
+            _branch_plan = None
+            _branch_hold = False
+            _branch_refuse_say = ""
+            _branch_refuse_emo = ""
             # 流程推进:读用户最新话,判定是否进入下一步,更新"当前步"约束注入。
             if flow_ctrl.has_steps:
                 try:
@@ -3906,6 +4179,136 @@ async def entrypoint(ctx):
                         _say_pending_before = flow_ctrl.pending_say_text() != ""
                     except Exception:  # noqa: BLE001
                         _say_pending_before = False
+                    # ---- 分支动作早段评估(A-②):插在 verdict 车道之前——分支
+                    # 【收线】/【跳第N步】是引擎一等出口,优先级高于规则车道;
+                    # say 直念步让位(待念锁在场不评估)。规划异常当未命中,零回归。
+                    if (
+                        os.environ.get("BOK_BRANCH_ACTION", "1") == "1"
+                        and not _say_pending_before
+                    ):
+                        try:
+                            _bp_g, _bp_r = flow_ctrl.current_goal_ref()
+                            _branch_plan = branch_hit_plan(
+                                action_enabled=True,
+                                canned_enabled=os.environ.get("BOK_BRANCH_CANNED", "1") == "1",
+                                step_index=int(flow_ctrl.current),
+                                closing=bool(flow_ctrl.closing),
+                                paused=bool(self.paused),
+                                done=bool(flow_ctrl.done),
+                                user_text=user_text,
+                                goal=_bp_g,
+                                ref=_bp_r,
+                                wa_captured=bool(_wa_captured["on"]),
+                                verdict=str(flow_ctrl.last_verdict or ""),
+                                vars_map=flow_ctrl.vars_map,
+                                # F4 热词幻觉护栏词表:与 ASR context 软偏置同一份
+                                # (模板 hotwords+行业词+对象字段),反解回词列表。
+                                hotword_terms=_parse_vocab_terms(_hotword_ctx),
+                            )
+                        except Exception:  # noqa: BLE001 - 规划异常当未命中,零回归
+                            _branch_plan = None
+                    if _branch_plan is not None:
+                        _bp_act = str(_branch_plan["action"])
+                        _bp_step = (int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0
+                        if _bp_act == BRANCH_ACTION_REFUSE:
+                            # 【收线】——与 verdict==REFUSE 车道逐款同源:进收尾态
+                            # (清 stall/跳转账本)+作废抢跑快照+定时挂断(默认
+                            # disposition,由意向规则评估覆盖;_schedule_call_end
+                            # 幂等,后续 REFUSE 车道同轮命中不再重复排程)。
+                            flow_ctrl.enter_closing()
+                            _invalidate_stale_preemptive("分支动作：收线")
+                            _schedule_call_end()
+                            print(
+                                f"BRANCH_ACTION refuse step={_bp_step} "
+                                f"text_len={len(_branch_plan['text'])}",
+                                flush=True,
+                            )
+                            if _branch_plan["text"]:
+                                # 带台词 → 直念该台词收线(镜像 say 直念步记账:
+                                # user 轮补记+回声锚预锚+账本 gen=script);实际
+                                # _say_script+raise StopResponse 在流程 try 之外
+                                # (StopResponse 是 Exception 子类,在 except-pass
+                                # try 内会被吞——同 say-step/WA 累积姿势)。
+                                try:
+                                    _branch_refuse_emo = flow_ctrl.step_say_emotion(
+                                        flow_ctrl.current, force=True
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    _branch_refuse_emo = ""
+                                _branch_refuse_say = str(_branch_plan["text"])
+                                _branch_plan = None
+                                try:
+                                    await session.interrupt()
+                                except Exception:  # noqa: BLE001
+                                    pass
+                                await self._try_append_user_message(new_message)
+                                context_state.set_last_reply(_branch_refuse_say)
+                                _turn_origin["gen"] = "script"
+                                _turn_origin["provider"] = "branch-refuse"
+                                try:
+                                    _bp_ms = int((time.monotonic() - _t0) * 1000)
+                                    await cp.add_turn(
+                                        call_id, "user", user_text, language=language_state.lang,
+                                        line="a", speaker="customer",
+                                        template_step=_bp_step, started_ms=_bp_ms, ended_ms=_bp_ms,
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    pass
+                            else:
+                                # 空台词 → 不 raise,交给后面 LLM 走收尾话术(与
+                                # verdict==REFUSE 同款);closing 轮不许再播分支罐头
+                                _branch_plan = None
+                        elif _bp_act == BRANCH_ACTION_HANDOFF:
+                            # 【转人工】——镜像话术图 ACTION_NOTIFY_HUMAN 臂:打铃
+                            # 不抢话,CP assist 置 notified(坐席台见「人工求助」),
+                            # 本轮照常兜话;**不 raise、不 hold**(规则推进照走)。
+                            # 上报 fire-and-forget,入队成功才烧 once(失败回滚,
+                            # 下一轮信号补报——_report_notify_once 文档)。
+                            _invalidate_stale_preemptive("人工协助已通知")
+                            _turn_origin["provider"] = "branch-notify"
+                            _spawn_report(
+                                _report_notify_once(
+                                    cp, call_id,
+                                    f"branch:{_bp_step}:{str(_branch_plan['cond'])[:16]}",
+                                    flow_ctrl.graph_fired, _facts, where=room_name,
+                                )
+                            )
+                            print(f"BRANCH_ACTION handoff step={_bp_step}", flush=True)
+                            _branch_plan = None
+                        elif _bp_act == BRANCH_ACTION_JUMP:
+                            # 【跳第N步】——镜像话术图 jump_step 臂三件套,按实际
+                            # 位移记账(未位移不宣告/provider/哨兵,只打 jump_noop)。
+                            # 分支跳转不烧图绑定账本(graph_fired 只属话术图 once)。
+                            _bp_gt = int(_branch_plan["jump"]) - 1
+                            _bp_cur = flow_ctrl.current
+                            flow_ctrl.jump_to(_bp_gt)
+                            if flow_ctrl.current != _bp_cur:
+                                _invalidate_stale_preemptive(
+                                    f"流程跳转 → 第 {flow_ctrl.current + 1} 步"
+                                )
+                                context_state.set_flow_current(flow_ctrl.current_step_text())
+                                # 跳步轮强制 advanced → QA 快路让位(同 graph 跳哨兵)
+                                _flow_step_before = -1
+                                _turn_origin["provider"] = "branch-jump"
+                                print(
+                                    f"BRANCH_ACTION jump step={flow_ctrl.current + 1}",
+                                    flush=True,
+                                )
+                            else:
+                                print(
+                                    f"BRANCH_ACTION jump_noop step={_bp_gt + 1}",
+                                    flush=True,
+                                )
+                            # 跳完不许后面的规则推进段再从新步推一次;本轮 LLM 按新步答
+                            _branch_hold = True
+                            _branch_plan = None
+                        else:
+                            # hold(【留本步】)/""(无动作):不派发,留本步——
+                            # 规则推进让位,计划保留给原位罐头腿消费。无标记不打日志
+                            # (每通都可能命中,避免刷屏)。
+                            if _bp_act == BRANCH_ACTION_HOLD:
+                                print(f"BRANCH_ACTION hold step={_bp_step}", flush=True)
+                            _branch_hold = True
                     if verdict == REFUSE:
                         # 客户明确拒绝/告别 → 收尾态:注入收尾话术(一句礼貌再见),
                         # 唔推进/唔 judge/唔按步走;讲完后 _schedule_call_end 主动结束通话
@@ -3929,7 +4332,14 @@ async def entrypoint(ctx):
                                 f"[flow] farewell -> closing, end scheduled disposition={_disp} (call {room_name})",
                                 flush=True,
                             )
-                    elif not flow_ctrl.done and not flow_ctrl.closing and not _say_pending_before:
+                    # 分支命中轮=留本步(_branch_hold,引擎不再自动推进——分支应答
+                    # 就是本轮的「留本步」回答,再叠一次自动推进会把应答与流程错位)
+                    elif (
+                        not flow_ctrl.done
+                        and not flow_ctrl.closing
+                        and not _say_pending_before
+                        and not _branch_hold
+                    ):
                         _g2, _r2 = flow_ctrl.current_goal_ref()
                         # 規則級必定推進 override(開場步客已回應 / 核實步答到平台):
                         # 唔靠 LLM judge,防止卡死(offered 應承加嗰輪除外——要等客俾號碼)。
@@ -3999,6 +4409,27 @@ async def entrypoint(ctx):
                     context_state.set_flow_current(flow_ctrl.current_step_text())
                 except Exception:  # pragma: no cover - 流程推进失败不阻断回复
                     pass
+            # ---- 分支【收线】台词直念出口(A-②):raise 必须在任何 except-pass
+            # try 之外(StopResponse 是 Exception 子类,try 内会被吞=台词不出声、
+            # 收线被跳过);收线是最高优先级车道,排在 stall/DEFER/say 之前。
+            if _branch_refuse_say:
+                _cancel_response_watchdog()  # 收线台词即出声
+                # F4 二修(call-179c7608):收线台词直念期间置「告别窗」旗——STT
+                # 在此窗内静默丢弃一切成轮事件(句级提交/EOS/FINAL,见
+                # livekit_plugins._closing_say_active),把告别说完;客户尾随片段
+                # 成新轮只会把台词掐成半句道歉、再落 LLM 兜话——电话本就要结束,
+                # 这是产品上更差的行为。念完(或被打断)即撤旗,非收线期零影响。
+                if _partial_gate_stt is not None:
+                    _partial_gate_stt.set_closing_say(True)
+                try:
+                    await _say_script(
+                        session, tts_provider, _tts_cache, _branch_refuse_say,
+                        emotion=_branch_refuse_emo,
+                    )
+                finally:
+                    if _partial_gate_stt is not None:
+                        _partial_gate_stt.set_closing_say(False)
+                raise StopResponse()
             # ---- stall 升级阶梯(漏斗 v2,spec §3.1):同 step 连续 UNCLEAR 有出口。
             # 3 降级问法 / 5 绕过留号 / 8 主动收线——全部 _say_script 直念零 TTFT。
             # bypass 在号码已在手时直升 close(留号无意义)。插喺 DEFER 车道之前:
@@ -4172,6 +4603,83 @@ async def entrypoint(ctx):
                     answer, audio=frames_aiter(pcm_to_frames(pcm, _tts_cache.sample_rate))
                 )
                 return True
+
+            # ---- 分支罐头快路(2026-09-20 路线 A-①/A-②):分支命中且应答已物化
+            # 录音 → 直接播录音跳过 LLM(零 TTFT、措辞逐字一致);未命中/未物化
+            # 照旧落穿 graph/QA/LLM——提示词注入行为不变。不推进流程:分支应答
+            # 留在本步。A-② 起本块**只消费**早段评估的 _branch_plan(动作派发
+            # 已在早段做,能到这里的只剩 hold/无动作计划);BOK_BRANCH_ACTION=0
+            # 时早段不评估,本块按 A-① 旧姿势自己求值一次(action_enabled=False
+            # 纯罐头腿),行为逐字节回退。缓存键与 _say_script 同源(resp 渲染
+            # 文本+运行时 voice/model/speed,emotion 空)。BOK_BRANCH_CANNED=0 关。
+            try:
+                if (
+                    _branch_plan is None
+                    and os.environ.get("BOK_BRANCH_ACTION", "1") != "1"
+                ):
+                    _bc_g, _bc_r = flow_ctrl.current_goal_ref()
+                    _branch_plan = branch_hit_plan(
+                        action_enabled=False,
+                        canned_enabled=os.environ.get("BOK_BRANCH_CANNED", "1") == "1",
+                        step_index=int(flow_ctrl.current),
+                        closing=bool(flow_ctrl.closing),
+                        paused=bool(self.paused),
+                        done=bool(flow_ctrl.done),
+                        user_text=user_text,
+                        goal=_bc_g,
+                        ref=_bc_r,
+                        wa_captured=bool(_wa_captured["on"]),
+                        verdict=str(flow_ctrl.last_verdict or ""),
+                        vars_map=flow_ctrl.vars_map,
+                        hotword_terms=_parse_vocab_terms(_hotword_ctx),
+                    )
+                _bc_step = (int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0
+            except Exception:  # noqa: BLE001 - 挑选异常当未命中,照旧落穿
+                _branch_plan = None
+            if _branch_plan is not None:
+                _bc_resp = str(_branch_plan["text"])
+                _bc_cond = str(_branch_plan["cond"])
+                _bc_pcm = _qa_pcm_for(_bc_resp)
+                if _bc_pcm is not None:
+                    try:
+                        await session.interrupt()  # ① 作废停着的抢跑快照(同 _qa_canned_say)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    # ② 手动补 user 轮(StopResponse 轮 item_added 唔会触发;
+                    # C5 官方姿势:旧 chat_ctx.items.append 打只读上下文恒失败)
+                    await self._try_append_user_message(new_message)
+                    # ③ 回声守卫预锚(正常 playout 完才置,快路要立即生效)
+                    context_state.set_last_reply(_bc_resp)
+                    _turn_origin["gen"] = "script"
+                    _turn_origin["provider"] = "branch-canned"
+                    try:
+                        _bc_ms = int((time.monotonic() - _t0) * 1000)
+                        await cp.add_turn(
+                            call_id, "user", user_text, language=language_state.lang,
+                            line="a", speaker="customer",
+                            template_step=_bc_step, started_ms=_bc_ms, ended_ms=_bc_ms,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    print(
+                        f"BRANCH_CANNED hit step={_bc_step} "
+                        f"branch_len={len(_bc_resp)} (call {room_name})",
+                        flush=True,
+                    )
+                    # ④ 快路不经 tts_provider,首音频回调唔会拆看门狗——显式拆
+                    _cancel_response_watchdog()
+                    await session.say(
+                        _bc_resp,
+                        audio=frames_aiter(pcm_to_frames(_bc_pcm, _tts_cache.sample_rate)),
+                    )
+                    # 必须在 except-pass try 之外 raise(同 say-step/WA 累积/QA 快路)
+                    raise StopResponse()
+                # 命中分支但应答未物化 → 照旧落穿(注入提示词走 LLM,现状不变)
+                print(
+                    f"BRANCH_CANNED miss step={_bc_step} "
+                    f"branch_len={len(_bc_resp)} (call {room_name})",
+                    flush=True,
+                )
 
             # ---- 话术图引擎(spec 2026-09-18;插在 say 直念步之后、QA 快路之前,
             # precedence: REFUSE>DEFER>say>graph[notify/jump/play]>QA 快路;BOK_FLOW_GRAPH=0 整闸,
@@ -4579,14 +5087,17 @@ async def entrypoint(ctx):
     def _on_partial_gate(ev) -> None:
         # GPU 竞态专项:LLM 生成/播报中抬高 ASR partial 档,listening 恢复默认。
         # 打断係 VAD 判定,唔受此抑制影响;独立于心跳(nudge_max=0 也要生效)。
-        if _partial_gate_stt is not None:
-            _partial_gate_stt.set_partial_ms(
-                partial_ms_for_state(str(getattr(ev, "new_state", "") or ""), partial_slow_ms())
-            )
+        # F2:同一钩子顺手喂「回复在途」旗给迟到 FINAL 尾巴护栏(partial 抑制
+        # 档=0 时该路 no-op,旗照喂——两功能共用一条 agent_state_changed 线)。
+        state = str(getattr(ev, "new_state", "") or "")
+        _partial_gate_stt.set_partial_ms(partial_ms_for_state(state, partial_slow_ms()))
+        _partial_gate_stt.set_reply_busy(agent_busy_for_state(state))
 
-    if _partial_gate_stt is not None and partial_slow_ms() > 0:
+    if _partial_gate_stt is not None:
         # 与心跳钩子同规:必须先于 session.start 注册,错过初始 speaking 转换
-        # 会令开场白期间 partial 唔受抑制。
+        # 会令开场白期间 partial 唔受抑制。此前仅在 partial_slow_ms()>0 时注册
+        # ——F2 护栏旗也要这条线,改为恒注册(partial_ms_for_state 内部对
+        # slow_ms<=0 返回 None,行为同旧)。
         session.on("agent_state_changed", _on_partial_gate)
 
     if _prefill_spec is not None:

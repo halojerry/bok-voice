@@ -14,6 +14,7 @@ from agent_runtime.agent import (  # noqa: E402
 from agent_runtime.flow import (  # noqa: E402
     FOLLOWUP_CONF_MIN,
     degrade_boost,
+    parse_judge_route,
 )
 
 
@@ -50,6 +51,15 @@ def test_degrade_boost_threshold():
     assert degrade_boost(2, "degrade_question", 0.5) == 2
     assert degrade_boost(2, "register_followup", 0.9) == 2
     assert degrade_boost(2, "keep", 0.9) == 2
+
+
+def test_degrade_boost_missing_conf_no_boost():
+    # conf 缺省档(parse_judge_route 落 0.0)不得借兜底放行 degrade 早触发——
+    # 提前降档只认显式高置信反对推进,模型省略 conf=无信号=走正常 streak 计数
+    route, conf = parse_judge_route("stay route=degrade_question")
+    assert route == "degrade_question" and conf == 0.0
+    assert conf < FOLLOWUP_CONF_MIN
+    assert degrade_boost(2, route, conf) == 2
 
 
 def test_conf_threshold_value():

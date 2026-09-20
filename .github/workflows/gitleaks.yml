@@ -38,8 +38,11 @@ jobs:
       - name: Scan git history with official gitleaks container
         # --redact：命中时输出打码（CI 日志本身也是泄漏面）。
         # 发现泄漏时 gitleaks 默认 exit code 1，step 直接失败。
+        # -c 显式指定仓库根配置（gitleaks 也会自动发现 .gitleaks.toml，但显式更确定，
+        #   且配置缺失时 fail-closed 而不是静默按默认规则扫过）。该配置只做一件事：
+        #   在默认规则之上，逐条精确放行两个已确认的测试夹具占位值（见文件头注释）。
         run: |
           docker run --rm \
             -v "${{ github.workspace }}:/repo" \
             -w /repo \
-            zricethezav/gitleaks:latest git --verbose --redact .
+            zricethezav/gitleaks:latest git --config /repo/.gitleaks.toml --verbose --redact .

@@ -125,10 +125,12 @@ def test_lifecycle_missing_campaign_is_404(monkeypatch):
 
 
 def test_progress_counts_and_answered(monkeypatch):
+    """D3 修复后口径：answered 只认 done（与仪表盘 _ANSWERED_EXCLUDED 同源——
+    no_answer/rejected/failed 三坏值是未接通，不得计入）。"""
     client, repo = _client_and_repo(monkeypatch)
     objs = [
         repo.create_object("acc-001", {"display_name": f"A{i}", "phone": f"+852111111{i}"})
-        for i in range(4)
+        for i in range(5)
     ]
     cid = client.post(
         "/api/campaigns", json=_campaign_body(objs[0], object_ids=[o["id"] for o in objs])
@@ -137,15 +139,17 @@ def test_progress_counts_and_answered(monkeypatch):
     repo.update_item(items[0]["id"], status="done")
     repo.update_item(items[1]["id"], status="no_answer")
     repo.update_item(items[2]["id"], status="rejected")
-    # items[3] 保持 pending
+    repo.update_item(items[3]["id"], status="failed")
+    # items[4] 保持 pending
 
     detail = client.get(f"/api/campaigns/{cid}").json()
     p = detail["progress"]
-    assert p["total"] == 4
+    assert p["total"] == 5
     assert (p["pending"], p["done"], p["no_answer"], p["rejected"]) == (1, 1, 1, 1)
-    assert p["dialing"] == p["in_call"] == p["failed"] == p["skipped"] == 0
-    assert p["answered"] == 3  # done + no_answer + rejected
-    assert len(detail["items"]) == 4
+    assert p["failed"] == 1
+    assert p["dialing"] == p["in_call"] == p["skipped"] == 0
+    assert p["answered"] == 1  # 仅 done；三坏值不计接通
+    assert len(detail["items"]) == 5
 
     rows = client.get("/api/campaigns").json()
     row = next(c for c in rows if c["id"] == cid)
