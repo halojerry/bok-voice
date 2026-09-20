@@ -156,3 +156,53 @@ REFUSE `_REFUSE_RE`+`_HANGUP_RE`（软守卫「唔使担心」否决 366-369）�
 | A4 部分落地 | 学习回路只产词条；图词/分支/改答案无产出 → **L-① 漏网轮挖掘 + 快路覆盖率已落地**（§6）；图词/分支提案（L-②）与「改答案/删词条走通知、人工确认后自动填入」（L-③）待做 | 遗留 L-②③ |
 | A5 | 总览把每步 ref 首行常驻静态前缀 vs 渐进披露对抗逐字引力——叠提示词补丁而非数据面解法（模板越长越脆） | 待议：总览只给目标不给事实行 |
 | A6 ✅已落地 | 快路覆盖率无指标（gen 数据全在、无人消费）→ `GET /api/stats/llm-gaps` + studio「场景学习」tab 驾驶舱（L-①，§6） | — |
+
+## 8. 真栈实弹验收（2026-09-20，A-①②③ + L-① + D4/D7）
+
+离线单测不算验收。本轮在**真栈**（真 LiveKit + 真 ASR/LLM + 真 MiniMax TTS，A 线 worker 换成施工分支代码）上跑真通话与真点击，证据落 `/tmp` 与 `reports/branch-action/`。
+
+### 8.1 探针 `scripts/probe_branch_action.py`（六腿，每腿一通真通话）
+
+建自己的模板（6 步中文，第 2 步五条动作分支）+ 真 `/api/token` 建单 + TTS 渲染客户语音推流 + 按字节偏移切 agent.log + 拉 turns + `call_sessions` 对账；`--selftest` 离线自检 40 例，`--expect-off` 为 kill 腿。
+
+| 腿 | 结果 | 硬证据（真通话） |
+|---|---|---|
+| `canned` | PASS | `BRANCH_CANNED hit step=2`；turns `gen=script provider=branch-canned`，文本与分支应答**逐字一致**；首声 1.21s（零 LLM） |
+| `refuse` | PASS | `BRANCH_ACTION refuse step=2`；turns `gen=script provider=branch-refuse` 文本=台词逐字；该行是全通最后一条 assistant 行（收线前零 LLM）；`status=ended disposition=declined`；提交→挂断正好 14.0s（与 `_schedule_call_end(14.0)` 一致） |
+| `handoff` | PASS | `BRANCH_ACTION handoff step=2`；`call_sessions.assist_status="notified"` 真落库；触发轮仍 `gen=llm`；后续中性轮正常应答（打铃不掐） |
+| `jump` | PASS | `BRANCH_ACTION jump step=5`；同轮 `provider=branch-jump`、回复已是第 5 步内容；下一轮同位自跳语 → `BRANCH_ACTION jump_noop step=5` 且窗口内零 `jump` |
+| `hold` | PASS | `BRANCH_ACTION hold step=2` + 同轮罐头「好的，您慢慢看」；触发与验证窗口零 `rule=auto/confirm`、验证轮 `template_step` 仍=2（**真·留本步**） |
+| `kill`（`BOK_BRANCH_ACTION=0`） | PASS | 窗口零 `BRANCH_ACTION`、零 `BRANCH_CANNED hit`（仅 `miss`）、零 branch-* 轮、零 `template_step=5`；恢复默认档后 canned 腿复现 → A/B 闭合 |
+
+物化：`pregen_tts.py --branches` 真云合成（`new=1` 首跑、`skip=1` 复跑）、音色与运行时 `MINIMAX_TTS_VOICE` 逐字同源、`--branch-status` 复核 `ok`。
+
+### 8.2 CP 新端点（真库副本 + 独立端口）
+
+- `branch-canned-status`：74 条真实分支键与 `/api/templates` 逐字双向零差异；65 missing / 9 ph（`{占位}` 残留）/ 0 ok＝**判定诚实**（当时确实没物化）；跨账号缓存分键实测不串；首打 1.3s（spawn）、缓存命中 ~2ms。
+- `llm-gaps`：`turns=190 fastpath=86 llm=104 ratio=0.4526`，与副本库 SQL 逐数复算一致；`gen=filler(436)/interrupted(2)` 真存在且**已被剔出分母**（口径生效）。
+- `gaps` 口径抽查 2/2：客户原话的下一条 AI 轮确为 `gen=llm` 且文本与 `sample_answer` 逐字一致（中间 filler 行被正确跳过）。
+- `llm-gaps/adopt`：201→同参 200 幂等同 id；副本库确认唯一一条 `source=gap-adopt`、`scope=global`；审计落 `qa_entry.create`。
+
+### 8.3 浏览器真点击（本分支静态导出 + 上面那台 CP）
+
+- 侧栏分组=「AI 设置」（AI 工作站/知识库/人设）**已生效**；8 个 tab、右上「已保存 ✓/应用/发布」在位。
+- 画布=纵向步骤工作流（第 1 步在上 +「● 电话接通先讲这一步」徽标 + 步间「默认推进」线 + 分支 chip）。
+- 答法抽屉真开：条件框 + **五项动作下拉**（按内容回答/礼貌收线/通知人工/跳到第 N 步/留在本步）+ 应答文本域（**不含标记**）+ **录音状态点「未录」** + 补录 + 删；变量按钮一排；「改动记入右上角未保存」提示在位。
+- **写回闭环**：抽屉里给「说出了货品」行选「礼貌收线」→ 应用 → 服务端 ref 真变 `→【收线】认真听，简单回应一声…`（文本零丢失），且 **`published_json` 未被改动**（发布冻结不变量在真栈成立）；重载后重开抽屉，该行下拉**回读为「礼貌收线」**；改回默认再应用 → 服务器标记剥掉、文本完好。往返无损。
+- 场景学习驾驶舱：界面 `46% / 39 脚本录音直出 / 46 AI 现场组织 / 85 回复轮合计` 与 UI 同参 API（`turns=85 fastpath=39 llm=46 ratio=0.4588`）**逐项一致**；候选行带「出现 3 轮 · 涉及 3 通 · 第 3 步 · AI 当时说 · 可回听通话 id」；点「采集为问答词条」→ 确认框预填当时那句 → 确认 → `✓ 已采集` + 幂等人话提示；`qa-entries` 复查同问法**仅 1 条**（无重复）。
+- 录音沉淀 tab：空态 + 新增引导「分支录音…在主流程画布的答法抽屉里查看/补录」在位。
+- 全程控制台 0 报错、0 未捕获异常、CP 侧 **0 条非 2xx**。
+
+### 8.4 验收发现（新，未修——按优先级）
+
+| # | 发现 | 影响 | 建议 |
+|---|---|---|---|
+| F1 | **人设 account_id 取 body 不取 query**：`POST /api/personas` 不带 account_id 时落 `account_id=""`，`/api/personas` 列表看不到它 → `pregen_tts --persona` 找不到人设 → 回落默认音色 `moss_audio_*` → 缓存键与运行时错位（`--branch-status` 报「假 ok」）。探针首轮即被此坑：以为物化好了、运行时却 miss | 运营补录录音可能「看起来 ok、实际永远不播」；`probe_flow_graph.create_probe_call` 同款隐患 | 人设端点按 `scoped_account` 兜底 body/query；状态端点把「音色与运行时不同源」判为 `ph`/warning |
+| F2 | **迟到 ASR 修正轮掐断快路回复**：裸句尾推流时 sidecar 整窗重解在句尾幻听「那。」→ 迟到 FINAL 修正轮 interrupt 掉正在播的罐头（0.4s 掐断、assistant item 不落库、`_turn_origin` 戳被后续轮消费） | 快路/直念线在「迟到修正」竞态下丢轮次行 + 听感截断 | 归档到 STT 修正判定面（与 D4 同族） |
+| F3 | **`_turn_origin` consume-once 戳在 late-answer 兜底下必丢**：LLM 慢轮（>2s）触发 late-answer 时，早段盖的 `provider=branch-notify` 被兜底轮消费/覆盖 → 真答案行 provider 为空 | branch-notify/handoff 的**归因面**（turns provider）在慢 LLM 下不可靠（行为本身正确） | 观察项；若要硬归因，戳应随轮次 id 绑定而非 consume-once |
+| F4 | **热词偏置抄词**：「…我还想想」的弱尾音节被 ASR 直接抄成词表里的「打错电话」→ 意外命中【收线】分支并收线 | 与既有「极低内容音频抄词表」同类；分支动作让后果更重（误收线） | 已在 AGENTS 记录过；分支动作侧可考虑 refuse 前要求非 REFUSE 轮也过一次 verdict 一致性 |
+| F5 | 画布默认缩放太小（8 步拥挤，文字需放大才读得清） | 普通人第一眼「看不清」，与「易用性为主」冲突 | 默认 fitView 后给最小缩放或让画布更高 |
+| F6 | 引导语写「左边意图卡=听到某些话就跳到箭头指的步骤」，但库中 7 个模板 `graph_json` 全空 → 左栏永远为空 | 引导与现实不符，用户以为坏了 | 空图时隐藏该半句或给「还没有意图，去意图管理添加」空态 |
+| F7 | 点「应用」保存后**答法抽屉自动收起**（选中态被重置） | 连续改多条分支要重开抽屉 | 视觉/交互体验项 |
+| F8 | 保存会把整步分支行的「 → 」归一成「→」（无丢字，但运营未编辑的行也被改写） | 审计/版本 diff 出现非本意变更 | 序列化时保留箭头原空格（可让分支行保存原文） |
+
