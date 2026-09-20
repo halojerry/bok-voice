@@ -1403,3 +1403,70 @@ CP 偏已验：本分支新增的 4 条路由在主仓 CP 上**全部 200**，�
 2. **§15 三条读数在真码上重算**（TTFT 分解 / 打断相关性 / 看门狗掐答案计数）——§15 全部数字
    来自旧码，需换基。
 3. **§16.6 那 7 处同族无守卫点位**是否真有害的取证。
+
+## 19. §16 修复的真栈复测：复现成功，但未干净隔离出修复的作用
+
+§18 的阻塞（worker 端口被并行会话 monitor 占）**已绕开而非解除**：仓库自己留了逃生口，
+不必动对方的进程。本轮据此做了真栈 A/B。
+
+### 19.1 绕开方式（零接触对方进程）
+
+`apps/agent/agent_runtime/agent.py:5311-5313` 注释写明的设计：`BOK_WORKER_PORT` 可覆盖，
+「单机多栈并存（并行会话/多 worktree 验收）时错开端口」。据此：
+
+- 我自己的 worker 起在 **:8091**（默认 8081 零漂移，不动）；
+- env 由 `bok.py` 的 `_agent_worker_env()` 构造（避免手搓漏掉模型路径/凭据），cwd 与
+  PYTHONPATH 锁主仓并加泄漏核验（PYTHONPATH 出现 `work-session-` 即中止）；
+- **归属靠日志文件判定**：我的 worker 日志写 `/tmp/retest_worker*.log`，对方的写
+  `app_data/logs/agent.log`，同一通只会在其中一处出现。**这一步不可省**——第一次跑
+  就落在了对方的 worker 上（agent.log 38 处 / 我的 0 处），差点把别人的代码当成自己的证据。
+- 全程未 kill/重启对方的 monitor（pid 48673 与三个 worker 端口自始至终未动）。
+
+**发现一个仓库缺陷（本轮实证）**：`BOK_WORKER_PORT` 是**双重半接线的**——
+`_worker_specs()` 里 `"port": 8081` 硬编码（`bok.py serve`/`monitor` 用不上它），
+`worker_port_singleton_guard(8081, "agent")` 也硬编码（worker 自己一查 8081 被占就
+`SystemExit(0)`）。所以那条注释承诺的「单机多栈并存」在 8081 被占时**走不通**；
+实际可用的姿势是再加 `BOK_WORKER_PORT_GUARD=0`（守卫 docstring 本就标注为诊断口）。
+三处硬编码是同一类问题，值得收口成单点。
+
+### 19.2 两次无效尝试（都靠自查拦下）
+
+| 尝试 | 现象 | 为何无效 |
+|---|---|---|
+| 第 1 次 | E2E PASS，但我的日志无该通话 | **落在对方 worker 上**——归属判定拦下 |
+| 第 2 次（timeout=0.05s） | **A/B 两臂读数完全相同** | timeout 早于垫话 500ms 延迟 → 永远走 `FALLBACK_TEXT` 分支 |
+
+第 2 次的「两臂全等」是关键红旗：**读不出差异时，先怀疑实验没打到靶，而不是「修复无效」。**
+根因随后查清：**`FALLBACK_TEXT` 分支会自我拆弹**——那句道歉词进 LLM 流、经 TTS `stream()`
+播出，首音频回调 fire → 看门狗在该轮被拆。这从机制上解释了代理 A 那条
+「suppressed 17/20 被掐 vs fallback 4/21」的分裂：**只有 suppressed 分支不产出任何文本、
+因而永不触发首音频回调、看门狗才武装得到开火的那一刻。**
+
+### 19.3 有效 A/B（进对了 suppressed 分支）
+
+参数：`BOK_FILLER_DELAY_MS=100 LLM_FIRST_TOKEN_TIMEOUT_S=0.5 BOK_RESPONSE_WATCHDOG_S=1.5
+BOK_RESPONSE_WATCHDOG_FILLER_EXT_S=0`（关顺延，否则垫话把闸推后 2s 盖过观察窗）。
+
+| 判据 | B 臂（摘掉修复） | A 臂（含修复） |
+|---|---|---|
+| 进入 `suppressed` 分支 | 1 | **6** |
+| **`[watchdog] no assistant audio`** | **1** | **1** |
+| `force-interrupt` | 1 | 1 |
+| `sentences=0 canceled=1` | 1 | （多来自用户抢话，非看门狗） |
+
+**B 臂复现了历史签名**：suppressed 轮 → 看门狗开火 → force-interrupt → 一条回复零句被取消。
+这是**该 bug 的首次真栈现场复现**（此前只有历史日志的统计相关）。
+
+### 19.4 结论：复现成功，隔离失败（如实）
+
+**修复的作用没有被干净隔离**：A 臂 6 个 suppressed 轮里仍有 **1 次**看门狗开火。
+原因不在修复而在**实验时间轴**：压缩后看门狗闸（1.5s）常常**早于补答到达**（约 1.2-2.0s），
+那一段窗口修复本就救不到（`_cancel` 只在补答投递时执行）。所以两臂都能开火，
+只是 B 臂样本太少（1 个 suppressed 轮）看不出比例。
+
+**下一次要怎么设计才干净**（本轮未做）：
+1. 先量准 `commit → 补答到达` 与 `commit → 首音频` 两条时间线的实测分布，
+   把 `BOK_RESPONSE_WATCHDOG_S` **落在两者之间**（生产里就是这个 ~300-800ms 的窄窗）；
+2. 或者按生产值复刻：看门狗保持 4s、刻意把 LLM 拖慢到 TTFT 2.5-3.6s（生产被掐轮的实测区间），
+   不要压缩时间轴；
+3. B 臂样本要堆到 ≥5 个 suppressed 轮才能比比例。
