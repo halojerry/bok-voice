@@ -1326,3 +1326,80 @@ ctx 在 `:794` 于 `insert_segments :796` **之前** put），progress 回调只
    且上抬必须与垫话顺延协同，避免双道歉。
 4. **§16.6 那 7 处同族无守卫点位**仍然未动。
 5. **§15 全部日志结论需在分支码上重测**（运行栈停在 3385529）——这是下一步的动作。
+
+## 18. 合并与切栈（2026-09-21）：一半验证完成，另一半被并行会话阻塞
+
+### 18.1 合并完成
+
+PR **#128** → `gh pr merge --merge` → main = **`e5fa60a`**。CI **十项全绿**（gitleaks / Python ×2 /
+Node ×2 / Web ×2 / Launcher smoke ×2 / Real Postgres / Supabase artifact / Handshake / CP image），
+本地 web 门禁另验（tsc 0 错、build 通过、npm test **112 pass 0 fail**）。
+
+### 18.2 途中一次真障碍：gitleaks 报红（含一条**不属于本分支**的命中）
+
+PR 首跑 `gitleaks` FAIL。本地用同版本（8.30.1）完整复现，JSON 报告的 `Commit` 字段给出归属：
+
+| 文件 | 提交 | 归属 |
+|---|---|---|
+| `tests/test_qa_drift.py` | `661c22a` | 本会话 |
+| `tests/test_diag_gates.py` | `cf6fac9` | **另一个会话的分支**（`session-20260919-232858-4eb7`） |
+
+**关键发现：gitleaks 扫的是全部 refs，不只当前分支的历史。** `cf6fac9` 只存在于远端那条
+兄弟分支（2026-09-19T16:10Z，晚于 main 上次 gitleaks 通过的时间），我的分支里根本没有它
+（`git merge-base --is-ancestor` 实测为否）——但 CI 的 `fetch-depth: 0` 把所有远端分支都拉下来
+给容器扫，于是**别人未合并分支上的命中会把当前 PR 打红**。这类命中改文件修不掉（挂在历史提交上）。
+
+处置：新增 `.gitleaks.toml`（`[extend] useDefault=true` 保留官方全部规则，只为
+`generic-api-key` 加**精确字面量**放行这两个已知夹具值）+ 工作流补 `--config /repo/.gitleaks.toml`
+（显式比自动发现确定，且配置缺失时 fail-closed）。**放宽面当场验证**：另造含真实样高熵密钥的
+探针仓库，用同一份配置扫描仍 findings=2/exit=1 → 只有两个精确字面量被中和。
+
+未解释项（已写进配置注释）：规则的取舍**不只由熵决定**——合成仓库同提交、同形写法、只换值的
+对照里，熵 4.3684 的 `…gap-mining…` 未被命中，熵 4.1830 的 `…qa-drift…` 被命中。机制未定，
+故新夹具改用重复串形状（熵 3.23），不依赖「换个词躲过」的经验。
+
+### 18.3 切栈执行
+
+主仓 `git pull --ff-only` → `e5fa60a`（修复代码在位，`agent.py:2748`）→ `bok.py down`
+（**殭尸 worker 扫描 = 0**，顺带清掉一个跑旧码的孤儿 worker）→ `bok.py serve` → **12 服务全 UP**，
+PID 全换（84291–84485 段）。
+
+### 18.4 ⚠️ 裂脑：worker 三端口被另一个会话的 monitor 占回
+
+`serve` 报「agent worker already listening :8081」。核查发现：
+
+| 服务 | cwd | 实际代码 |
+|---|---|---|
+| CP :8000 / Web :3000 | 主仓 | **e5fa60a（含修复）** |
+| **worker :8081/8082/8083** | **`work-session-20260919-232858-4eb7`** | **另一个会话的分支（不含修复，实测 0 处）** |
+
+成因：对方会话在本机留了一个 **monitor 进程**（pid 48673，20:35 启动，
+`work-session-20260919-232858-4eb7/tools/bok.py monitor`）。`bok.py down` 不杀它；
+我在主仓 `down` 之后，**它按自己的代码把三个 worker 端口重新占住**，所以我的 `serve` 拿不到。
+
+**后果**：§16 那个修复住在 agent worker 里，而 worker 跑的是对方代码 → **真栈复测 §16 在当前
+状态下做不出有效结论**。kill 对方 monitor 属「修改别的会话的栈」，本会话纪律明令禁止，未动。
+（旁证：对方 worktree 近 4 小时无 `.py` 改动，会话疑似空闲，但文件 mtime 不足以证明其进程无主。）
+
+### 18.5 当前能验证的部分（已做）
+
+CP 偏已验：本分支新增的 4 条路由在主仓 CP 上**全部 200**，且带真实数据——
+
+```
+/api/tts/branch-canned-status  200
+/api/stats/llm-gaps            200   {"turns":210,"fastpath_ratio":0.5,...}
+/api/stats/template-proposals  200
+/api/stats/qa-drift            200
+```
+
+说明合并后的 CP 半边在真栈上活着且非空壳。
+
+### 18.6 阻塞解除后要跑的三件事（已设计好，未执行）
+
+1. **§16 修复的真栈 A/B（强制路径）**：`LLM_FIRST_TOKEN_TIMEOUT_S=0.05 BOK_RESPONSE_WATCHDOG_S=1.2`
+   起栈 → 每轮必走 drain 路径 → 跑 `scripts/e2e_multi_turn.py`。判据：含修复时
+   `LLM_LATE_ANSWER` 后**不再**出现 `[watchdog] … force-interrupt` 与 `sentences=0 canceled=1`；
+   把 `_cancel_response_watchdog()` 那一行临时摘掉重跑作对照。两个 env 都已在 `_FORWARD_ENV`（实测）。
+2. **§15 三条读数在真码上重算**（TTFT 分解 / 打断相关性 / 看门狗掐答案计数）——§15 全部数字
+   来自旧码，需换基。
+3. **§16.6 那 7 处同族无守卫点位**是否真有害的取证。
