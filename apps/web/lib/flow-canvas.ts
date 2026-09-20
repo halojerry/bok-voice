@@ -27,7 +27,11 @@ export type CanvasFlowStep = {
   scene?: string;
 };
 
-export type StepBranch = { cond: string; resp: string };
+/** 一条应对分支。arrow=解析时记下的箭头两侧原始写法（如「 → 」「  →  」「→」）,
+ * 序列化原样回写（F8 分隔符保真——运营没编辑的行空格形态不被改写）;
+ * 缺省/非法=抽屉新加的分支,用规范形「→」。 */
+export type StepBranch = { cond: string; resp: string; arrow?: string };
+
 
 /** 步节点分支 chip 行 = StepBranch + 动作派生（resp 恒为原文含标记,抽屉同源）。 */
 export type StepNodeBranch = StepBranch & { action: BranchAction; jump: number };
@@ -41,8 +45,10 @@ export type StepRefParts = {
 };
 
 // flow.py:96 `_BRANCH_LINE_RE` 的逐语义移植：锚词 | 条件(1..120 非贪婪) | \s*→\s* | 应答(\S.*)。
-// 捕获组 1=锚词原文（EN 大小写变体原样保留,序列化按原文回写,不做 EN→中改写）。
-const BRANCH_RE = /^(如果客户|(?:If|When)\s+the\s+customer)\s*(.{1,120}?)\s*→\s*(\S.*)$/i;
+// 捕获组 1=锚词原文（EN 大小写变体原样保留,序列化按原文回写,不做 EN→中改写）;
+// 组 3=箭头两侧原始分隔（F8 分隔符保真：解析记下、序列化原样回写,匹配行为与旧
+// `\s*→\s*` 逐字节一致,只是多捕获一份）。应答=箭头后首个非空白字符起。
+const BRANCH_RE = /^(如果客户|(?:If|When)\s+the\s+customer)\s*(.{1,120}?)(\s*→\s*)(\S.*)$/i;
 // flow.py:99 `_NOTE_LINE_RE` 的逐语义移植。
 const NOTE_RE = /^(?:注意|Notes?)\s*[:：]\s*(.+)$/i;
 
@@ -57,8 +63,11 @@ export function parseStepRefParts(ref: string): StepRefParts {
     const bm = line.match(BRANCH_RE);
     if (bm) {
       const cond = String(bm[2] ?? "").trim();
-      const resp = String(bm[3] ?? "").trim();
-      parts.branches.push({ cond, resp });
+      const resp = String(bm[4] ?? "").trim();
+      // 箭头两侧原始分隔逐字记下（含空格）,序列化原样回写（F8：改一处不再牵动整步
+      // 其它行的空格形态）。恒含「→」,不存在空串。
+      const arrow = String(bm[3] ?? "→");
+      parts.branches.push({ cond, resp, arrow });
       continue;
     }
     const nm = line.match(NOTE_RE);
@@ -76,13 +85,15 @@ export function parseStepRefParts(ref: string): StepRefParts {
   return parts;
 }
 
-/** 与 parseStepRefParts 互逆：正稿行 + 每分支 `如果客户{cond}→{resp}` + 每注意行 `注意：{n}`。
- * 不变量：parse(serialize(parse(x))) deepEqual parse(x)（分支/注意/正稿逐件相等）。
+/** 与 parseStepRefParts 互逆：正稿行 + 每分支 `如果客户{cond}{arrow}{resp}` + 每注意行 `注意：{n}`。
+ * 不变量：parse(serialize(parse(x))) deepEqual parse(x)（分支/注意/正稿/箭头分隔逐件相等）。
  * 刻意偏差（对任务书 `→就{resp}` 字样）：不无条件补「就」——resp 是运行时逐字注入的
  * 应答内容（flow.py:96 从箭头后捕获、flow.py:1195-1197 原样注入 prompt）,现存语料分支
  * 普遍无「就」头（见 template-editor STEPS_EXAMPLES 三语样例）,补字=保存即改写运营内容,
  * 破坏无损往返;作者写了「就」的自然带出。EN 锚词分支序列化为规范中文锚（与任务书规范形一致,
- * 运行时两种锚等价）。解析不了的行（在 script 里）原样回写。 */
+ * 运行时两种锚等价）。解析不了的行（在 script 里）原样回写。
+ * F8 分隔符保真：箭头两侧空格按解析原样回写（新加分支无 arrow=规范形「→」）,
+ * 保存不再把「 → 」静默归一成「→」。 */
 export function serializeStepRef(parts: StepRefParts): string {
   const lines: string[] = [];
   for (const l of String(parts.script ?? "").split("\n")) {
@@ -93,8 +104,12 @@ export function serializeStepRef(parts: StepRefParts): string {
     const cond = String(b.cond ?? "").trim();
     const resp = String(b.resp ?? "").trim();
     if (cond && resp) {
-      // 分支行规范形：锚词+条件+箭头+应答（普通字符串拼接,无任何执行语义）。
-      const branchLine = "如果客户" + cond + "→" + resp;
+      // 分支行：锚词+条件+箭头+应答（普通字符串拼接,无任何执行语义）。
+      // 箭头分隔原样回写（F8 分隔符保真：解析记下的「 → 」「  →  」「→」逐字还原,
+      // 改一处分支不再把整步/整模板其它行的空格形态静默改写）;
+      // 抽屉新加的分支（无 arrow 字段）用规范形「→」。
+      const arrow = typeof b.arrow === "string" && b.arrow.includes("→") ? b.arrow : "→";
+      const branchLine = "如果客户" + cond + arrow + resp;
       lines.push(branchLine);
     } else if (cond || resp) {
       // 残行（缺条件或缺应答）不成合法分支语法,降级为普通行——文字不丢,
@@ -203,6 +218,42 @@ export function branchCannedMeta(status: BranchCannedStatus): { dot: string; tit
 /** 场景缺省名（抽屉场景下拉的空档;scene 仍是 steps_json 纯数据位,不参与布局）。 */
 export const UNGROUPED_LANE = "未分组";
 
+// —— 易用性三件（2026-09-20 真浏览器点击验收 F5/F6/F7）——
+
+/** F5 画布初始缩放下限：fitView 整图 8 步约 1700px 高塞进 560px 视口会缩到 ~0.25,
+ * 12px 文字缩成 ~3px 没法读。下限 0.75 保证首屏文字可读（12px→9px）,整图塞不下的
+ * 部分拖动画布/左侧控制器/小地图翻看,滚轮仍可缩小到画布 minZoom=0.2 看全貌。 */
+export const CANVAS_MIN_ZOOM = 0.75;
+
+/** 画布 fitView 选项（F5）：缩放夹在 [0.75, 1]——下限管「看得清」,上限 1 管步骤少的
+ * 模板不被放大成巨卡。超出视口靠平移/缩放控件,不靠眯眼。 */
+export function canvasFitViewOptions(): { padding: number; minZoom: number; maxZoom: number } {
+  return { padding: 0.15, minZoom: CANVAS_MIN_ZOOM, maxZoom: 1 };
+}
+
+/** 左栏是否存在意图卡（F6 空态引导;停用意图也渲染成卡,与 layoutFlow 口径一致）。 */
+export function graphHasIntents(graph?: GraphLite): boolean {
+  return (graph?.intents ?? []).length > 0;
+}
+
+/** 画布顶部引导语（F6）：库里还没有意图时不再承诺「左边意图卡」（空图左栏恒空,
+ * 引导与现实不符会让人以为页面坏了）。 */
+export function canvasGuideText(hasIntents: boolean): string {
+  return hasIntents
+    ? "从上到下=通话顺序；左边意图卡=听到某些话就跳到箭头指的步骤；点步骤卡即可编辑"
+    : "从上到下=通话顺序；点步骤卡即可编辑";
+}
+
+/** 无意图时的空态提示（人话;组件层在其后拼可点击的「去意图管理添加」）。 */
+export const CANVAS_INTENT_EMPTY_HINT = "这个话术还没有设置意图（听到某些话就跳步或播快答）。";
+
+/** F7 答法抽屉是否保持打开（纯函数便于单测）：抽屉开着且步号仍落在当前草稿范围=保持
+ * ——点「应用」保存（同模板重拉）不清抽屉,连续改多条分支不用重开;
+ * 步号越界（草稿里步骤真被换掉/删少）才收起。模板是否被换由调用方比对模板 id。 */
+export function drawerIndexValid(drawerIndex: number, stepCount: number): boolean {
+  return Number.isInteger(drawerIndex) && drawerIndex >= 0 && drawerIndex < stepCount;
+}
+
 // —— 布局（确定性,同输入同输出;2026-09-20 重设计：纵向步骤工作流）——
 // 步骤=中列瀑布脊柱（第 1 步在上,逐级向下）;意图=左栏卡片,按锚定目标步纵向堆叠;
 // 边=脊柱顺序线（默认推进）+ 意图→目标步条件边（关键词入边）+ 播完跳转边（then_jump）。
@@ -306,10 +357,11 @@ export function layoutFlow(
 
   steps.forEach((s, i) => {
     const parts = parseStepRefParts(s.ref);
-    // 分支 chip 行：动作标记拆成 action/jump 派生位（resp 原文不动,抽屉 round-trip 依赖）。
+    // 分支 chip 行：动作标记拆成 action/jump 派生位（resp 原文不动,抽屉 round-trip 依赖;
+    // arrow 是序列化层的分隔符记账,不进节点数据——节点形状与旧版逐键一致）。
     const branchNodes: StepNodeBranch[] = parts.branches.slice(0, BRANCH_CHIP_LIMIT).map((b) => {
       const info = parseBranchAction(b.resp);
-      return { ...b, action: info.action, jump: info.step };
+      return { cond: b.cond, resp: b.resp, action: info.action, jump: info.step };
     });
     // 节点预览：正稿首行;无正稿（纯分支 ref）退首分支行,画布上仍有可读摘要——
     // 动作标记剥掉不进摘要（画布上不出现「【收线】」原始标记串）,标记应答为空时退动作徽标文案。

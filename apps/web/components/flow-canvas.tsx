@@ -19,6 +19,7 @@ import type { GraphDoc } from "@/lib/qa-canvas";
 import {
   layoutFlow, parseStepRefParts, serializeStepRef, UNGROUPED_LANE,
   parseBranchAction, composeBranchResp, branchActionBadge, branchCannedMeta, BRANCH_ACTIONS,
+  canvasFitViewOptions, canvasGuideText, graphHasIntents, CANVAS_INTENT_EMPTY_HINT, drawerIndexValid,
   type FlowNode, type StepRefParts, type StepBranch, type BranchAction, type BranchCannedStatus,
 } from "@/lib/flow-canvas";
 
@@ -38,6 +39,10 @@ const EMOTION_LABEL: Record<string, string> = {
 const HANDLE_STYLE = {
   width: 8, height: 8, background: "var(--live)", border: "1px solid var(--card-border)",
 };
+
+// F5 初始视图：缩放夹在 [0.75, 1]——8 步模板整图塞进 560px 视口不再缩到看不清,
+// 超出部分拖动/控制器/小地图翻看（模块级常量,避免每渲染新对象）。
+const FIT_VIEW_OPTIONS = canvasFitViewOptions();
 
 const inputCls =
   "w-full rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--live)";
@@ -378,6 +383,8 @@ export default function FlowCanvas(props: {
   onPregenBranch?: (resp: string) => void;
   /** 模板语言（预留文案提示位,当前不参与渲染）。 */
   currentTemplateLanguage?: string;
+  /** F6：画布没有意图时的空态引导点击回调（跳「意图管理」tab）;未传=只给文字提示。 */
+  onOpenIntents?: () => void;
 }) {
   const { graph, draft } = props;
   const session = useSession();
@@ -396,7 +403,8 @@ export default function FlowCanvas(props: {
   useEffect(() => {
     setDrawerIdx(null);
     setPositions({});
-    // 只跟 tpl.id 走（应用保存后外层重拉同 id,画布布局重锚但草稿已=落库值）。
+    // 只跟 tpl.id 走（换模板才收抽屉/重置拖动位置）。点「应用」保存=同 id 重拉,
+    // 这里的 tplId 字符串不变 → 抽屉与画布状态原样保留（F7：连续改多条分支不用重开）。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tplId]);
 
@@ -411,7 +419,14 @@ export default function FlowCanvas(props: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [drawerIdx]);
 
+  // 抽屉步号越界（草稿里步骤真被换掉/删少）才自动收起;同模板保存重拉不清抽屉（F7）。
+  useEffect(() => {
+    if (drawerIdx !== null && !drawerIndexValid(drawerIdx, draft.length)) setDrawerIdx(null);
+  }, [drawerIdx, draft.length]);
+
   const layout = useMemo(() => layoutFlow(draft, graph), [draft, graph]);
+  // F6：左栏意图卡在不在（引导语与空态提示跟它走,停用意图也渲染成卡,与布局同口径）。
+  const hasIntents = graphHasIntents(graph);
   const scenes = useMemo(
     () => [...new Set(draft.map((s) => (s.scene ?? "").trim()).filter(Boolean))],
     [draft],
@@ -505,13 +520,28 @@ export default function FlowCanvas(props: {
     <section className="card space-y-2">
       <div className="flex flex-wrap items-center gap-2">
         <span className="label">流程画布</span>
-        <span className="text-[11px] muted">
-          从上到下=通话顺序；左边意图卡=听到某些话就跳到箭头指的步骤；点步骤卡即可编辑
-        </span>
+        <span className="text-[11px] muted">{canvasGuideText(hasIntents)}</span>
       </div>
       {readOnly && (
         <p className="rounded-lg bg-amber-50 px-3 py-2 text-[11px] text-amber-700">
           共享话术由主管维护；你可以查看但不能修改。
+        </p>
+      )}
+      {/* F6 空态：还没配意图时左栏本来就是空的,明说+给去处,不让人以为页面坏了。 */}
+      {!hasIntents && (
+        <p className="text-[11px] muted">
+          {CANVAS_INTENT_EMPTY_HINT}
+          {props.onOpenIntents && !readOnly ? (
+            <button
+              type="button"
+              className="ml-1 text-(--live) hover:underline"
+              onClick={props.onOpenIntents}
+            >
+              去「意图管理」添加 →
+            </button>
+          ) : (
+            <span className="ml-1">需要的话可以在「意图管理」里添加。</span>
+          )}
         </p>
       )}
       <div className="flex items-stretch gap-3">
@@ -521,7 +551,7 @@ export default function FlowCanvas(props: {
             edges={edges}
             nodeTypes={NODE_TYPES}
             fitView
-            fitViewOptions={{ padding: 0.15 }}
+            fitViewOptions={FIT_VIEW_OPTIONS}
             minZoom={0.2}
             deleteKeyCode={null}
             onNodesChange={onNodesChange}

@@ -521,9 +521,11 @@ export default function StudioPage() {
       {applyErr && <ErrorState message={applyErr} />}
 
       {tplErr && <ErrorState message={tplErr} />}
-      {tplLoading && <LoadingState />}
+      {/* 首次加载才出转圈;点「应用」后的重拉沿用已在屏内容——整块卸载会把画布抽屉/
+          滚动位置一并冲掉（F7：保存后答法抽屉自动收起的根因）。 */}
+      {tplLoading && !tplRow && <LoadingState />}
 
-      {!tplLoading && tplRow && (
+      {tplRow && (
         <>
           <div className="flex items-center gap-1">
             {tabs.map(([k, label]) => (
@@ -560,6 +562,7 @@ export default function StudioPage() {
                   onDraftChange={changeSteps}
                   branchCanned={branchCanned}
                   onPregenBranch={pregenBranch}
+                  onOpenIntents={() => setTab("intent")}
                 />
               ) : (
                 <>
