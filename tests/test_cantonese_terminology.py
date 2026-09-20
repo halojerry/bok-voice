@@ -7,6 +7,8 @@
   MiniMax language_boost 外部枚举（TTS 供应商 API 真字面量，粤=普+粤标记；
   B 线 interpret 与 A 线 entrypoint per-call 注入同源同值，值经 env 单点透传）
 - test_volcano_v3.py / ARCHITECTURE.md：Volcano API dialect 枚举（外部接口字面量）
+- docs/superpowers/plans/2026-09-21-a-line-speed-asr-decision-verification.md：
+  ASR 官方卡引述的外部数据集专名（Fleurs-yue / WenetSpeech-Yue / CV-yue）
 - docs/archive/**、AGENTS.md、AGENT.md、docs/CONTRACTS.md：历史档案与政策文档
 
 新增 yue 字面量 = 本测试失败。这是字段单轨化的防复发门禁：旧拼写只允许存在于
@@ -62,6 +64,13 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     # 同 deps.py 类：旧拼写是演练夹具非运行时语言字段，按行豁免。
     "scripts/smoke_postgres.py": re.compile(r"yue"),
     "docs/ARCHITECTURE.md": re.compile(r"VOLC_DIALECT"),
+    # 零代码验证计划（2026-09-21）引述 Qwen3-ASR 官方卡的外部**数据集专名**
+    # （Fleurs-yue / WenetSpeech-Yue / CV-yue）——「别人的接口」类不透明标识符，
+    # 同 zh-yue.wikipedia.org 政策。只豁免点名这三个数据集的行；文档里描述我们
+    # 自己的语言字段仍一律 cantonese。
+    "docs/superpowers/plans/2026-09-21-a-line-speed-asr-decision-verification.md": re.compile(
+        r"Fleurs-yue|WenetSpeech-Yue|CV-yue"
+    ),
     "AGENTS.md": None,
     "AGENT.md": None,
     "docs/CONTRACTS.md": None,

@@ -1085,3 +1085,107 @@ TTS_CACHE hit=1 chars=21                                ← 客户听到的是�
 **新增纪律（并入 §13 那条）**：**任何「A 导致了 B」的结论，对照组必须与实验组只差 A 一项。**
 V-9 的 C4 与 C1 差了「前一请求存在」+「取消」两项，所以它证明不了取消；
 V-11 的 C2 补上「前一请求存在」这一项后才成立。
+
+## 16. L3 落地：晚到补答被看门狗掐掉的根因与修复（V-14）
+
+### 16.1 证据：不是「慢」，是「拆弹信号缺失」
+
+§15.6 观察到 17 次「补答已到仍被掐」。交叉表把它钉死（按轮内首个 `TTS_CACHE hit=` 行分组）：
+
+| | 被看门狗掐 | 存活 |
+|---|---|---|
+| TTS 缓存 MISS（合成腿） | **17** | 23 |
+| TTS 缓存 HIT（命中腿） | **0** | 3 |
+
+现场 2 是决定性的——**音频早已就绪，仍被掐**：
+
+```
+LLM_LATE_ANSWER source=drain chars=43 — 补答
+TTS_CACHE hit=0 chars=43 / TTS_CACHE hit=0 key=a6cb692747 chars=43
+PERCEIVED_MS total=2880 (eou=483 llm=2074 tts=323)   ← TTS 首音仅 323ms
+TTS_CACHE stored=1 ok=1 key=a6cb692747 bytes=430090   ← 整段音频已合成落盘
+[watchdog] no assistant audio 4s after commit → force-interrupt   ← 照掐
+```
+
+### 16.2 根因：`_say_script` 两条腿都不产出首音频回调
+
+看门狗唯一的拆弹口是 `tts_provider.add_first_audio_listener(...)`（`agent.py` 装配点），
+它只认 TTS 图的首帧。而晚到补答走 `_late_answer_say → _say_script`，两条腿都绕开了它：
+
+| 腿 | 实际路径 | 是否 fire 首音频回调 |
+|---|---|---|
+| `_say_script` **命中** | `cache.lookup` → `session.say(text, audio=frames_aiter(...))` **直接喂 PCM，完全绕过 TTS** | ❌ 结构性不可能 |
+| `_say_script` **未命中** | `session.say(text)` → `CachedTTS.synthesize`（也 miss）→ `_StoreChunkedStream` | ❌ 该类**不收** `on_first_audio` 参数 |
+| （对照）`CachedTTS.synthesize` 命中 | `_CachedChunkedStream` | ✅ 2026-09-17 RC2 已修 |
+
+**直念族其余 14 处调用点靠「出声前显式 `_cancel_response_watchdog()`」绕过了这个盲区，
+唯独补答投递点没有。** 这就是 17 次净损失的成因。
+
+### 16.3 一次被推翻的修复方案（记录在案）
+
+**第一版修复（错误，已还原）**：给 `_StoreChunkedStream` 补上 `on_first_audio`，
+让 `CachedTTS.synthesize` 两条分支对称 fire。
+
+**为何是错的**：`synthesize()` 不是补答专用——**`_filler_backfill`（后台补物化垫话）
+走的正是 `tts_provider.synthesize(text)`**。让它无条件 fire，后台合成就会把
+**在途轮**的看门狗误拆掉，掩盖真正的「零音频」故障。本分支 `_FirstAudioTTS` 的
+docstring 早已写明这条边界（"在此 fire 会拿后台合成误拆在途轮"），我第一版违反了它。
+
+**发现的契机**：该补丁误落在主仓而非本会话 worktree，核对基线时发现
+worktree 比主仓多一整个 `_FirstAudioTTS` 类（本会话早前 D2 提交），进而查到
+docstring 的边界声明。**若没这条目录事故，错的补丁会直接进主干。**
+
+### 16.4 已实施修复
+
+在 `_late_answer_say` 投递点补一行 `_cancel_response_watchdog()`，与直念族 14 处同款约定：
+
+```python
+async def _late_answer_say(text: str) -> None:
+    _cancel_response_watchdog()  # 晚到补答即出声(勿让 4s 闸掐掉在途真答案)
+    try:
+        _turn_origin["gen"] = "script"
+        _turn_origin["provider"] = "late-answer"
+        await _say_script(session, tts_provider, _tts_cache, text)
+```
+
+选 `_cancel_*` 而非 `_extend_*`：补答**命中腿**永远不会有首帧信号（绕过 TTS），
+只顺延的话下一个 deadline 照样掐——必须真拆。
+
+**残余取舍**（已写进代码注释）：若用户已开新轮，`_cancel` 无法分辨归属轮，
+会把新轮的看门狗一并停摆——与直念族同一取舍，由新轮自身音频覆盖。
+
+### 16.5 验证
+
+| 项 | 证据 |
+|---|---|
+| 新增测试 | `tests/test_watchdog_filler_extend.py::test_late_answer_cancels_watchdog_before_saying`（源码契约：投递点必须自拆且拆在出声前） |
+| 非恒真证明 | 把 `_cancel_response_watchdog()` 从合成源码摘掉 → 断言 FAIL（实测 output: `去掉 cancel(应失败) -> 断言=FAIL`） |
+| 编译 | `compileall -q apps packages services tools scripts` 通过 |
+| 定向回归 | `test_watchdog_filler_extend.py` + `test_tts_cache_first_audio.py` **17 passed** |
+
+### 16.6 未修的同族点位（登记，**无证据不动**）
+
+`_say_script` 全量 15 处调用点中，7 处没有前置拆弹（L2296/L2349 号码 flush、
+L3641 follow-up ack、L5050 收线、L5060 心跳、L5157、L5253 开场白）。
+它们的语境与补答不同（开场白时看门狗未武装、收线/心跳在轮间），**本轮无实弹证据
+说明其有害**，故不动。补守卫在这些点位是「未武装时 no-op」的安全操作，
+但改行为前先取证。
+
+### 16.7 工作流发现（需要人决策，非技术问题）
+
+本轮核对基线时发现：**正在运行的 dev 栈跑的是 `3385529`（纯 origin/main），
+不含本会话任何改动**。本会话的分支早已领先 22 个提交（含 D1–D5 止血、
+分支罐头快路 A-①、学习回路 L-②/L-③、界面重设计三批……）。
+
+含义有两层：
+1. **§15 全部日志证据、以及 §16 的 17 次被掐，都是旧码产生的**——本分支上
+   部分问题可能已随 D1–D5 消失（D2 正是「看门狗防静默失效」）。**上机复验前，
+   §15 的结论不能直接当成主干现状。**
+2. 若要让本分支的修复真正生效，需要先合并/切栈再复验。
+
+### 16.8 本轮测量误差（续 §15.8）
+
+| # | 错误 | 后果 | 修法 |
+|---|---|---|---|
+| E5 | 交叉表按「轮内首个 `TTS_CACHE hit=`」分组，而该行是 `_say_script` 打的（无 `key=`），不是 `CachedTTS.synthesize` 打的（有 `key=`） | 分组标签写成「synthesize 未命中」，实际是「`_say_script` 查找未命中」 | 读源码区分两类日志行格式；结论方向未变（两者同轮同向） |
+| E6 | 修复方案未先查 `synthesize()` 的**其他消费者**就动手 | 差一步提交有害补丁（§16.3） | **新纪律：改共享方法前先列全部调用点，特别是有后台/非客户面消费者的** |

@@ -2735,7 +2735,17 @@ async def entrypoint(ctx):
 
     async def _late_answer_say(text: str) -> None:
         """弃流重生成功后的晚到真答案:走正常 speech 队列补答(客户插话可打断,
-        账本 gen=script/provider=late-answer 与心跳/WA 直念同姿势)。"""
+        账本 gen=script/provider=late-answer 与心跳/WA 直念同姿势)。
+
+        投递前必须 `_cancel_response_watchdog()`——与本钩子内 14 处直念族调用点
+        同款约定。漏了这一步就是「答案已到、客户听不到」:本路径两条腿都不产出
+        首音频回调(tts_cache 两处盲区),看门狗因此对补答完全隐身,4s 到点
+        force-interrupt 把正在念/待念的真答案掐掉,改念兜底句。
+        实弹账本(agent.log,2026-09-21):48 轮晚到补答里 17 轮被同轮看门狗掐掉
+        (17/17 都是 TTS_CACHE hit=0 的合成腿——命中腿与未命中腿都不 fire)。
+        残余取舍:若用户已开新轮(cancel 无法分辨归属轮),新轮的看门狗会一并
+        停摆——与直念族同一取舍,由新轮自身音频覆盖。"""
+        _cancel_response_watchdog()  # 晚到补答即出声(勿让 4s 闸掐掉在途真答案)
         try:
             _turn_origin["gen"] = "script"
             _turn_origin["provider"] = "late-answer"
