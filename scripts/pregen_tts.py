@@ -105,7 +105,10 @@ def _fetch_cp(base: str, token: str, *, account_id: str = "") -> tuple[dict, lis
     if not isinstance(settings, dict):
         settings = {}
     try:
-        personas = _cp_get(base, "/api/personas", token) or []
+        # F1(2026-09-20):account_id 显式置空=拉全部账号人设(CP 端点缺省 acc-001
+        # 会滤掉其它账号的人设)。--persona 的自动物化随人设保存触发,人设可能任
+        # 意账号;按人设物化/查找必须跨账号,单账号部署零变化(键去重天然幂等)。
+        personas = _cp_get(base, "/api/personas?account_id=", token) or []
     except Exception:
         personas = []
     try:
@@ -665,6 +668,18 @@ async def main_async() -> int:
                 (x for x in personas if _normalize_lang(x.get("language"), default="") == lang), None
             )
     voice_mode = _resolve_tts_voice_mode(tts_cfg)
+    # F1(2026-09-20)信息位:状态面所用音色的逐语言来源——"persona:<id>"=该语言
+    # 有人设供音色(与绑定该人设的运行时同源);"personas_default"=该语言无人设,
+    # 落设置页 speaker_*/内置默认音色(与绑定了人设的运行时不同源,判 ok 可能是
+    # 对错键的「假 ok」)。CP 端点顶层透传,不改 statuses 三态语义。
+    voice_source: dict[str, str] = {
+        lang: (
+            f"persona:{str((lang_personas.get(lang) or {}).get('id') or '')}"
+            if lang_personas.get(lang)
+            else "personas_default"
+        )
+        for lang in ("zh", "cantonese", "en")
+    }
     # 按人设物化的人设池(fillers / qa --all-personas 共用):--persona 限单人人设,
     # 缺省=CP 全部人设(人设无 enabled 字段,在册即启用;无音色/无池者在计划期跳过)。
     if args.persona:
@@ -672,6 +687,16 @@ async def main_async() -> int:
         if not persona_pool:
             # stderr：--qa-status 的 stdout 是纯 JSON 契约（CP canned-status 逐行解析）。
             print(f"persona {args.persona} not found in CP /api/personas", file=sys.stderr, flush=True)
+            # F1(2026-09-20):指定人设找不到时绝不静默回落默认音色——回落物化出的
+            # 缓存键与运行时人设音色错位(永远 miss),状态面还会对错键报「假 ok」。
+            # 响亮失败+非零退出(3),此刻零 provider 构造零缓存写,一个字节不落盘。
+            print(
+                "PERSONA_MISSING abort (no default-voice fallback, nothing written): "
+                f"--persona {args.persona}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 3
     else:
         persona_pool = list(personas)
 
@@ -706,7 +731,7 @@ async def main_async() -> int:
                 model=model, sample_rate=sample_rate, cache=cache,
                 entry_ids=set(args.entry_id) if args.entry_id else None,
             )
-        print(json.dumps({"qa_status": status}, ensure_ascii=False), flush=True)
+        print(json.dumps({"qa_status": status, "voice_source": voice_source}, ensure_ascii=False), flush=True)
         return 0
 
     if args.branch_status:
@@ -719,7 +744,7 @@ async def main_async() -> int:
                 tts_cfg=tts_cfg, voice_mode=voice_mode, model=model, cache=cache,
                 texts=_load_texts_file(args.texts_file),
             )
-        print(json.dumps({"branch_status": status}, ensure_ascii=False), flush=True)
+        print(json.dumps({"branch_status": status, "voice_source": voice_source}, ensure_ascii=False), flush=True)
         return 0
 
     # 缓存目录须与运行时同根:BOK_TTS_CACHE_DIR 由 bok.py/调用方透传。

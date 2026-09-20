@@ -205,7 +205,11 @@ def qa_status_json(base_url: str) -> dict:
         if line.startswith("{"):
             parsed = json.loads(line)
             if "qa_status" in parsed:
-                return {"available": True, "qa_status": parsed["qa_status"]}
+                out: dict = {"available": True, "qa_status": parsed["qa_status"]}
+                # F1(2026-09-20)信息位:逐语言音色来源(旧版脚本无此键=缺省空表)。
+                if "voice_source" in parsed:
+                    out["voice_source"] = parsed["voice_source"]
+                return out
     return {"available": False}
 
 
@@ -222,9 +226,11 @@ def qa_canned_status(base_url: str, *, force: bool = False) -> dict:
             "available": bool(data.get("available")),
             "statuses": dict(data.get("qa_status") or {}),
             "generated_at": int(_time.time()),
+            # F1(2026-09-20)信息位:旧脚本无键=空表(端点侧再兜一次)。
+            "voice_source": dict(data.get("voice_source") or {}),
         }
     except Exception:  # noqa: BLE001 - 状态面永不炸端点
-        out = {"available": False, "statuses": {}, "generated_at": int(_time.time())}
+        out = {"available": False, "statuses": {}, "generated_at": int(_time.time()), "voice_source": {}}
     globals()["_status_cache"] = (now, out)
     return out
 
@@ -294,7 +300,11 @@ def branch_status_json(base_url: str, account_id: str = "") -> dict:
         if line.startswith("{"):
             parsed = json.loads(line)
             if "branch_status" in parsed:
-                return {"available": True, "branch_status": parsed["branch_status"]}
+                out: dict = {"available": True, "branch_status": parsed["branch_status"]}
+                # F1(2026-09-20)信息位:逐语言音色来源(旧版脚本无此键=缺省空表)。
+                if "voice_source" in parsed:
+                    out["voice_source"] = parsed["voice_source"]
+                return out
     return {"available": False}
 
 
@@ -314,9 +324,11 @@ def branch_canned_status(base_url: str, *, account_id: str = "", force: bool = F
             "available": bool(data.get("available")),
             "statuses": dict(data.get("branch_status") or {}),
             "generated_at": int(_time.time()),
+            # F1(2026-09-20)信息位:旧脚本无键=空表(端点侧再兜一次)。
+            "voice_source": dict(data.get("voice_source") or {}),
         }
     except Exception:  # noqa: BLE001 - 状态面永不炸端点
-        out = {"available": False, "statuses": {}, "generated_at": int(_time.time())}
+        out = {"available": False, "statuses": {}, "generated_at": int(_time.time()), "voice_source": {}}
     _branch_status_cache[key] = (now, out)
     return out
 

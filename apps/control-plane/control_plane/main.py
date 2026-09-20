@@ -3831,6 +3831,10 @@ def qa_canned_status_ep(request: Request, account_id: str = "acc-001") -> dict:
         "available": out["available"],
         "statuses": out["statuses"],
         "generated_at": out["generated_at"],
+        # F1(2026-09-20)信息位:逐语言音色来源("persona:<id>"/"personas_default")。
+        # 状态若按默认音色判 ok,与绑定了人设音色的运行时可能不同源(永远 miss)。
+        # 顶层附加字段,不改 statuses 三态语义(web 按三态渲染)。
+        "voice_source": out.get("voice_source") or {},
     }
 
 
@@ -3886,6 +3890,9 @@ def branch_canned_status_ep(request: Request, account_id: str = "acc-001") -> di
         "available": out["available"],
         "statuses": out["statuses"],
         "generated_at": out["generated_at"],
+        # F1(2026-09-20)信息位:逐语言音色来源,同 qa_canned_status_ep 注释。
+        # 顶层附加字段,不改 statuses 三态语义(web 按三态渲染)。
+        "voice_source": out.get("voice_source") or {},
     }
 
 
@@ -4012,10 +4019,16 @@ def get_persona(persona_id: str, request: Request) -> dict:
 @app.post("/api/personas")
 def create_persona(req: PersonaRequest, request: Request) -> dict:
     require_role(request, "admin", "root")
+    # F1(2026-09-20):账号缺省兜底——body 不带 account_id 时落 acc-001(与列表端点
+    # 默认口径一致,照抄 /api/sip/sites 建站同款写法)。此前落 "" 令 /api/personas
+    # (acc-001) 看不到它 → pregen_tts --persona 找不到 → 静默回落默认音色,物化
+    # 缓存键与运行时错位。显式 account_id 维持原优先级(root/机器通道/无身份原样)。
+    account_id = (req.account_id or "acc-001").strip() or "acc-001"
     identity = current_identity(request)
     if identity is not None and identity.role != "root":
         # admin 建人设强制本账号（深测：曾可建进/挪进任意账号）。
-        req = req.model_copy(update={"account_id": identity.account_id})
+        account_id = identity.account_id or account_id
+    req = req.model_copy(update={"account_id": account_id})
     persona = _repo().create_persona(req.model_dump())
     _audit("persona.create", subject_type="persona", subject_id=persona.get("id", ""), account_id=persona.get("account_id", ""), detail={"name": persona.get("name", "")})
     # 新人设上线:无罐头即提醒+自动全量物化(W3,响应 tts_pregen=提醒面)。
@@ -4035,11 +4048,17 @@ def update_persona(persona_id: str, req: UpdatePersonaRequest, request: Request)
     existing = dict(_repo().get_persona(persona_id) or {})
     if existing:
         deny_cross_account(request, existing)
+    payload = req.model_dump()
+    if existing and "account_id" not in req.model_fields_set:
+        # F1(2026-09-20):整包 dump 会把未显式携带的 account_id 抹成 ""——账号被
+        # 洗掉后人设从 /api/personas(acc-001) 消失(与 POST 缺省同病)。未传=保留
+        # 原归属;显式携带仍走下方冻结/直通语义,不改变既有优先级。
+        payload["account_id"] = str(existing.get("account_id") or "")
     identity = current_identity(request)
     if existing and identity is not None and identity.role != "root":
         # 冻结归属：非 root 不得经 UpdatePersonaRequest.account_id 挪账号。
-        req = req.model_copy(update={"account_id": str(existing.get("account_id") or "")})
-    persona = _repo().update_persona(persona_id, req.model_dump())
+        payload["account_id"] = str(existing.get("account_id") or "")
+    persona = _repo().update_persona(persona_id, payload)
     if not persona:
         raise HTTPException(404, "persona not found")
     _audit("persona.update", subject_type="persona", subject_id=persona_id, account_id=(existing or {}).get("account_id", ""), detail={"name": persona.get("name", "")})
@@ -4053,10 +4072,14 @@ def update_persona(persona_id: str, req: UpdatePersonaRequest, request: Request)
 @app.put("/api/personas")
 def upsert_persona(req: PersonaRequest, request: Request) -> dict:
     require_role(request, "admin", "root")
+    # F1(2026-09-20):与 POST 同款账号缺省兜底(body 不带 account_id 落 acc-001,
+    # 不再落 ""),显式 account_id 原样直通。
+    account_id = (req.account_id or "acc-001").strip() or "acc-001"
     identity = current_identity(request)
     if identity is not None and identity.role != "root":
         # admin 建人设强制本账号（深测：曾可建进/挪进任意账号）。
-        req = req.model_copy(update={"account_id": identity.account_id})
+        account_id = identity.account_id or account_id
+    req = req.model_copy(update={"account_id": account_id})
     persona = _repo().create_persona(req.model_dump())
     _audit("persona.upsert", subject_type="persona", subject_id=persona.get("id", ""),
            account_id=req.account_id, detail={"name": req.name})
