@@ -1,10 +1,14 @@
 # A 线完整工作逻辑（代码级追踪版）
 
 > 2026-09-20。本文不是 AGENTS.md 军规复读，而是对 A 线源码的**逐行追踪综合**：四路并行深读
-> （agent.py 4804 行 / flow.py 1522 行 / qa_gate.py / fillers.py / livekit_plugins.py 5961 行 /
-> control_plane main.py / repository.py），全部结论带 `文件:行号` 证据。全局组件拓扑见
-> `bok-architecture.json`（archify），本文专注**运行逻辑**：什么节点做什么事、意图识别怎么判别、
-> 数据在哪一列。
+> （agent.py 5305 行 / flow.py 1701 行 / qa_gate.py 300 行 / fillers.py 853 行 /
+> livekit_plugins.py 6187 行 / control_plane main.py / repository.py），全部结论带 `文件:行号`
+> 证据。全局组件拓扑见 `bok-architecture.json`（archify），本文专注**运行逻辑**：什么节点做什么事、
+> 意图识别怎么判别、数据在哪一列。
+>
+> **行号权威性**：§1–§9 的行号随代码演进已部分漂移（本轮实测差 +58 到 +498 行，§2 的 #14 一行
+> 更是指向了隔壁的块）。若某处行号与 **§10.5「行号漂移校正表」** 不一致，**以 §10.5 为准**；
+> 闸门的**顺序**在各节之间一致，需要重取坐标时只看 §10.5。
 >
 > 路径缩写：`AG`=apps/agent/agent_runtime/agent.py；`FL`=…/flow.py；`LKP`=…/providers/livekit_plugins.py；
 > `QG`=…/qa_gate.py；`FD`=…/fillers.py；`CP`=apps/control-plane/control_plane/main.py；
@@ -291,6 +295,279 @@ REFUSE `_REFUSE_RE`+`_HANGUP_RE`（软守卫「唔使担心」否决 366-369）�
 | 新增测试 | `tests/test_template_proposals.py`（28）+ `tests/test_qa_drift.py`（35，含 G2/G3/G4/G6 的判据与互斥）+ `test_forward_env.py` 追加 D14 覆盖；web `test/gap-proposals.test.mjs` + `test/qa-drift.test.mjs`（真 `tsc` 转译直载） |
 | 全量回归 | `pytest -q` **1987 passed**；web `npm test` **112/112** + `tsc --noEmit` 0 错 + 静态导出通过 |
 | 逐键审计 | D14：61 键分类见 §7 D14 行（60 进 `_FORWARD_ENV`、1 进 `_EXEMPT`），`test_forward_env.py` 5/5 |
+
+---
+
+## §10 意图判定链路复盘（2026-09-20 固化，六层决策源 · 尾段真实序 · 逐层判定）
+
+> **本节性质**：不是新功能，是对 §1–§9 的**收敛与定案**。§10.1–§10.4 三张图 + §10.5 逐层判定表是
+> 后续「针对性修改」的唯一坐标起点；§10.7 起是三份判断（外部模型调研 / 分层与尾段合理性 /
+> 话术意图↔QA 配合性），全部锚定在被明确点名的三个缺口上：**回复准确度、速度、垫音合理性**。
+
+### 10.1 结论先行
+
+| # | 结论 | 依据 |
+|---|---|---|
+| C1 | **链路是稳定的，且「多层」不是因为设计混乱，是因为每层的输入不同**（确定性词面 / 话术语法 / 运营枚举 / 模糊语义 / 会话账本 / 挂断事实）。六层不是六选一的竞争关系，是**六种不同的可得信息**。 | §10.2、§10.3 |
+| C2 | **默认形态是安全的**：没有 `graph_json`、没有 `judge_prompt` 时，L4/L5 两片生成层**结构性惰性**（`eligible_judge_intents` 返 `[]` → 零任务零 9B 调用）。模糊意图识别是**按数据 opt-in**，不是默认负担。 | §10.5 L4/L5 行 |
+| C3 | **唯一真正有方差的地方是 L4/L5**（9B 自由文本 → 正则解析回），其余四层 + 全部前置闸是纯函数、零方差、离线钉住。**要提准确度，先分清「哪一层的错」**——多数真实翻车并非判错层，而是 ASR 转写把词送错了。 | §10.5、§10.8 |
+| C4 | **尾段执行序本身合理**（按「不可逆性 > 廉价性 > 已物化内容保护」三重排序），**但 L4/L5 的「迟一轮」是结构性语义洞**——判定在第 N 轮发生，动作在第 N+1 轮才生效。 | §10.3、§10.8 |
+| C5 | **话术与 QA 目前是两个不共享词表的系统**：话术按**意图**组织（步/分支/图意图），QA 按**字面措辞**组织（0.90 阈值），两者之间只有 `graph play_qa` 的 by_id 绑定这一座桥，且该桥**被刻意排除在轮换之外**。这是「本身话术就已经有意图了」这句直觉指向的真实摩擦。 | §10.9 |
+| C6 | **三个缺口的最高杠杆不是换判定模型，是提高零 LLM 快路覆盖率**：换判定模型只动 C3 那一小片；提覆盖率同时改善速度、准确度、垫音三项。**垫音只存在于「等 LLM」的地方**——每一个被移出 LLM 路径的轮次，既省时间又根本不会有垫音，且播出的内容由运营撰写=正确性天然保证。 | §10.10 |
+
+### 10.2 图一：六层决策源全景（谁在什么信息上做判断）
+
+```mermaid
+flowchart TD
+    IN["客户一轮话音"] --> ASR["ASR 转写<br/>唯一外部输入"]
+    ASR --> P["前置闸<br/>空转写 · 回声自听 · 犹豫残片 · WA 累积 · 暂停"]
+
+    subgraph DET["确定性层 · 纯函数 · 零方差 · 离线可钉"]
+        L1["L1 规则 verdict<br/>decide_advance<br/>REFUSE/FAREWELL/OBJECTION/REPEAT/QUESTION/DEFER/CONFIRM/UNCLEAR"]
+        L2["L2 步骤分支匹配<br/>match_step_branch<br/>话术里 如果客户X→就Y"]
+        L3["L3 图意图关键词<br/>pick_graph_action<br/>graph_json 双侧 casefold 子串"]
+        L6["L6 挂断意向规则<br/>eval_intent_rules<br/>INTENT_FACTS 12 键事实比对"]
+    end
+
+    subgraph GEN["生成层 · 9B LLM · 有方差 · 迟一轮 · 按数据 opt-in"]
+        L4["L4 图意图 judge<br/>eligible_judge_intents<br/>关键词没中时补位"]
+        L5["L5 步进 judge<br/>judge_confirm_advance_allowed<br/>UNCLEAR 轮判要不要推进"]
+    end
+
+    QA["召回层 · QA 快路<br/>0.6×余弦 + 0.4×子串<br/>阈值 0.90 只认字面措辞"]
+
+    P --> L1
+    P --> L2
+    P --> L3
+    P --> QA
+    L1 --> PRE
+    L2 --> PRE
+    L3 --> PRE
+    QA --> PRE
+    L4 -.->|"上一轮存下的命中"| PRE
+    L5 -.->|"上一轮存下的判定"| PRE
+
+    PRE["优先级仲裁<br/>REFUSE 收线 &gt; DEFER &gt; say 直念 &gt; graph &gt; QA 快路 &gt; 自由 LLM"] --> OUT["本轮动作"]
+    L6 --> SESS["会话级 · 挂断时定 disposition / intent_code<br/>不进每轮仲裁"]
+
+    style DET fill:#e8f5e9,stroke:#2e7d32
+    style GEN fill:#fff3e0,stroke:#ef6c00
+    style QA fill:#e3f2fd,stroke:#1565c0
+```
+
+**读图要点**：绿色三层是**同一份字面文本上的三种不同切法**（措辞分类 / 话术语法 / 运营枚举），互不依赖、可同时命中，靠 `PRE` 仲裁；橙色两片是**唯一会「想」的层**，且只补绿色层没中的位置；蓝色 QA 是**召回层**（治「客户换了种说法」），不治意图。L6 不在每轮链路上（挂断时一次性）。
+
+### 10.3 图二：尾段真实执行序（源码实测，非设计意图）
+
+```mermaid
+flowchart TD
+    A0["早段闸 · AG:3822/3846/3875<br/>空转写 / 回声 / 犹豫残片"] -->|StopResponse| X["本轮不回复"]
+    A0 --> L1["L1 rule_verdict · AG:4142"]
+    L1 --> SL{"say 锁检测<br/>_say_pending_before · AG:4169"}
+    SL --> BA["分支动作派发 · AG:4176-4300<br/>REFUSE 4203 / HANDOFF 4251 / JUMP 4268 / HOLD 4299"]
+    BA --> AA["规则步进 should_auto_advance · AG:4337"]
+    AA --> J5["【后台】L5 步进 judge 调度 · AG:4389<br/>fire-and-forget，本轮不等"]
+    J5 --> RF["【收线】台词直念 · AG:4405-4422"]
+    RF -->|StopResponse| X
+    RF --> ST["stall 挽留阶梯 · AG:4435-4469"]
+    ST -->|StopResponse| X
+    ST --> DF["DEFER 短应承直念 · AG:4478-4498"]
+    DF -->|StopResponse| X
+    DF --> SAY["say 直念步 · AG:4549<br/>合规内容，最高保护"]
+    SAY -->|StopResponse| X
+    SAY --> BC["分支罐头（hold/无动作计划残余）· AG:4601-4669"]
+    BC -->|StopResponse| X
+    BC --> GB["图块 · AG:4688-4824<br/>先取即清 L4 pending → pick_graph_action"]
+    GB -->|play_qa 命中| GP["graph 罐头 → StopResponse · AG:4775/4811"]
+    GB -->|play_miss| MISS["FLOW_GRAPH play_miss · AG:4813<br/>放行不消耗 once"]
+    GB --> J4["【后台】L4 意图 judge 调度 · AG:4824"]
+    MISS --> QF["QA 字面快路 · AG:4839-4904"]
+    J4 --> QF
+    QF -->|命中且有 PCM| QC["QA 罐头 → StopResponse · AG:4901"]
+    QF -->|未命中| FA["_filler.arm() · AG:4915<br/>⭐ 只在确定要进 LLM 的轮上武装"]
+    FA --> LLM["自由 LLM · AG:4940+"]
+
+    style GP fill:#e3f2fd
+    style QC fill:#e3f2fd
+    style J4 fill:#fff3e0
+    style J5 fill:#fff3e0
+    style FA fill:#fce4ec,stroke:#c2185b
+```
+
+**三个非显然但承重的性质**：
+
+1. **`_filler.arm()` 在所有快路之后（AG:4915）** —— 垫音只可能在**必定要等 LLM** 的轮上武装。这是当前设计的正确性保证：任何走 say / graph play / QA 快答 / 分支罐头的轮次**不会**有垫音，因为那些路径**立即出声**。
+2. **say 锁先于分支动作（AG:4169/4177）** —— 分支动作派发被 `not _say_pending_before` 门住，所以「轮开始时当前步是待念直念步 → 本轮先念、流程推进让位」这条铁律在尾段是**结构性**成立的，不是靠事后互斥。
+3. **L4/L5 的调度点都在快路之前、消费点在下一轮** —— L5 调度在 AG:4389（早于全部直念/罐头出口），L4 调度在 AG:4824（图块内部，图块真求值过才调度）。两者都是 fire-and-forget，本轮不等结果 → 见 §10.4。
+
+### 10.4 图三：为什么 L4/L5 是「迟一轮」的
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as 客户
+    participant A as agent（第 N 轮）
+    participant J as 9B judge（后台）
+    participant P as _gjudge_pending<br/>单槽 · 取即清 · TTL 一轮
+
+    C->>A: 第 N 轮 · 模糊话（关键词没中）
+    A->>A: 前置闸全过 → 图块求值 → 无命中
+    A->>J: 调度 evaluate（fire-and-forget）
+    A-->>C: 本轮照常走 QA 快路 / 自由 LLM 回复
+    Note over J: 9B prefill + 生成 + 解析回<br/>timeout=20s（共用 5s 必超时=静默永久 miss）
+    J->>J: 资格预筛 + 单飞 + 让路延迟
+    J->>P: store 守卫通过（仍在本步/非暂停/非收线）→ 写入
+    Note over P: 若守卫不过 → judge_miss / judge_pending_expired
+
+    C->>A: 第 N+1 轮
+    A->>P: 图块求值时「先取即清」（AG:4688-4690）
+    P-->>A: 命中绑定 id
+    A->>A: 再过 BOK_FLOW_GRAPH_JUDGE 配对 + pick 内全部守卫
+    A-->>C: 本轮才播那个罐头（provider=graph-jump / graph-play）
+```
+
+**这就是 C4 的「结构性语义洞」**：判定发生于第 N 轮，动作生效于第 N+1 轮。守卫做了力所能及的补救（仍在本步/非暂停/非收线/pending 空/单飞），但**无法消除「客户已经换话题 / 已经挂断」这个窗口**。与之对比，L1/L2/L3 是**同轮同步**的——这就是为什么外提「换个判定模型」这件事只在 L4/L5 上有意义（§10.7）。
+
+### 10.5 逐层判定表（含本轮实测行号）
+
+| 层 | 判据性质 | 输入信息 | 延迟 | 方差 | 开关 | 默认 | 本轮实测行号 |
+|---|---|---|---|---|---|---|---|
+| **前置闸** | 纯函数 | 转写文本 + 会话态 | 0 | 无 | 多个 | 开 | AG:3822 / 3846 / 3875 / 3941 / 3981 / 4023 / 4070 |
+| **L1 规则 verdict** | 纯函数 · 关键词/长度/语气 | 本轮转写 | 0 | 无 | — | 恒开 | AG:4142 调用 · FL:`rule_verdict` |
+| **L2 步骤分支** | 纯函数 · 家族优先 + bigram 兜底 | 话术本步 ref + L1 verdict + 原话 | 0 | 无 | `BOK_BRANCH_ACTION` / `BOK_BRANCH_CANNED` | 开 | AG:4176-4300（动作）· AG:4601-4669（罐头） |
+| **L3 图意图关键词** | 纯函数 · 双侧 casefold 子串 | `graph_json.intents` + 本轮转写 | 0 | 无 | `BOK_FLOW_GRAPH` | `"1"` | AG:4691 `pick_graph_action` · FLG:`pick_graph_action` |
+| **L4 图意图 judge** | **生成 · 9B 自由文本→解析** | 候选意图集 + 本轮转写 | **迟一轮** | **有** | `BOK_FLOW_GRAPH_JUDGE` | `"1"`（无 judge 数据=零调用） | 调度 AG:4824 · 消费 AG:4688 · 写入 AG:3706 · def AG:3716 |
+| **L5 步进 judge** | **生成 · 9B 自由文本→解析** | 当前步 + 本轮转写 + 上下文 | **迟一轮** | **有** | — | 开 | 调度 AG:4389 · `judge_confirm_advance_allowed` (FL) |
+| **L6 挂断意向规则** | 纯函数 · 12 键事实比对 | `_facts` 账本（nudge/watchdog/storm/verdict Counter/graph_notifies/t_start_wall） | 挂断时 | 无 | `BOK_INTENT_RULES` | 开 | `_intent_facts_snapshot` AG:675/3448 · `evaluate_intent_disposition` AG:697/3454 |
+| **QA 召回层** | 纯函数 · 0.6×余弦 + 0.4×子串 | `qa_entries` 库 + 本轮转写 | 0（~50ms 罐头） | 无 | `BOK_QA_FASTPATH` / `BOK_QA_PRIORITY` / `BOK_QA_ROTATION` | 开 | `_qa_exclude_reason` AG:4839 · `_qa_canned_say` AG:4562 |
+
+**逐层判定**：L1–L3 + L6 + 全部前置闸 = **确定性、可解释、亚毫秒**；L4/L5 = **有方差、迟一轮、但按数据 opt-in**；QA = **确定但只认字面，属召回不属于意图**。**没有一层是冗余的**：它们各自拿的是别的层拿不到的信息。真正的问题是 C3 —— 一旦某轮判错，排查时必须先问「是层判错，还是 ASR 把词送错了」。
+
+### 10.6 行号漂移校正表（**与 §1–§9 冲突时以本表为准**）
+
+| 对象 | 文档旧值 | 本轮实测 | 偏移 |
+|---|---|---|---|
+| `agent.py` 总行数 | 4804 | **5305** | +501 |
+| `flow.py` 总行数 | 1522 | **1701** | +179 |
+| `livekit_plugins.py` 总行数 | 5961 | **6187** | +226 |
+| `qa_gate.py` 总行数 | 未标 | **300** | — |
+| `fillers.py` 总行数 | 未标 | **853** | — |
+| §2 #14 图意图一行 | AG:4180-4326 | **AG:4691**（`pick_graph_action` 调用）；4180-4326 实际落在分支动作派发块 | — |
+
+**关键锚点（本轮源码实测，可直接 grep）**：
+
+| 锚点 | 行号 |
+|---|---|
+| `on_user_turn_completed` async def | AG:3755 |
+| `_background_intent_judge` def / `_maybe_schedule_intent_judge` def | AG:3643 / AG:3716 |
+| `_gjudge_pending["intent"]` 写入 / 消费 | AG:3706 / AG:4688-4690 |
+| L1 `rule_verdict` 调用 | AG:4142 |
+| `_say_pending_before` 检测点 | AG:4169 / 4177 / 4330 |
+| 分支动作 REFUSE / HANDOFF / JUMP / HOLD | AG:4203 / 4251 / 4268 / 4299 |
+| `should_auto_advance` 调用 | AG:4337 |
+| L5 judge `_spawn_report` | AG:4389 |
+| `_branch_refuse_say` 初始化 / 赋值 / 执行 | AG:4135 / 4228 / 4405-4416（raise 4422 在 try 外） |
+| stall 挽留阶梯 / DEFER 短应承 | AG:4435-4469 / 4478-4498 |
+| say 直念步出口 | AG:4549 |
+| `_qa_canned_say` def | AG:4562 |
+| 分支罐头 leg（hit / miss） | AG:4601-4669（hit 4655 / miss 4669） |
+| `pick_graph_action` 调用 / graph 罐头 / play_miss | AG:4691 / 4775 / 4813 |
+| QA 快路块 | AG:4839-4911 |
+| **`_filler.arm()`** | **AG:4915** |
+| `_intent_facts_snapshot` def / 调用 | AG:675 / 3448 |
+| `evaluate_intent_disposition` def / 调用 | AG:697 / 3454 |
+| `_intent_judge_candidates` def | AG:247 |
+| `_stall_ladder_line` def | AG:1307 |
+| `flow_graph.pick_graph_action` / `eligible_judge_intents` | FLG:341 / FLG:397（总 423 行） |
+| `fillers.BOK_FILLER_MAX` 默认 / `classify_filler_category` / `fired_this_round` | FD:126 / FD:171 / FD:465 |
+
+### 10.7 外部调研判定：LAYA / TypeSafe Jev 能帮上我们的意图识别吗
+
+**调研对象与事实（均取自模型卡原文，数字逐字引用）**：
+
+| 项 | LAYA（`convaiinnovations/laya`，2026-09-20 发布，apache-2.0） |
+|---|---|
+| 架构 | **非自回归**决策模型：骨干 ModernBERT-large（395M，双向，全量微调）+ 从零训的 decision head（2 层 transformer + option-marker scorer + act/escalate head）。选项在各自 `[MASK]` 位打分后在该问题的选项集上 softmax |
+| 参数量 / 上下文 | 421M（英文/typed-decisions）；多语版 mmBERT-base 322M。512 token/问题（英文），1024（多语版） |
+| **是否生成文本** | **不生成**——「It never generates text, so there is nothing to parse and nothing to hallucinate.」输出 typed answer（`choice` / `score` / `noul`）+ **数学标定概率** |
+| 延迟 | 单问 **39.5ms**（英）/ **32.8ms**（多语）；10 问批量 158.6ms / 72.3ms；单 T4 批量 **103–332 问/秒**；CPU 预载 193–464ms |
+| 准确率 | MASSIVE intent 英文 **0.783**、**其余 13 语种 0.451（routed）**；XNLI 英文 0.860 / 其余 14 语 0.731；typed-decisions 0.766（base checkpoint 仅 0.362）；AG News 0.950；DAIR Emotion 0.595 |
+| 标定 | ECE 0.081（温度缩放后）/ 原始 0.213 |
+| 训练法 | RLCD（Reinforcement Learning for Calibrated Decisions），奖励用严格 proper scoring rule（log + spherical），更新为 GRPO 式 REINFORCE 带组均值基线 |
+| 官方部署建议 | **Route Mode**（内置 router，<0.5ms 纯 Python 判语言后再前向）；懒路由不预载时**语言切换要 7-10s** |
+
+**「新的 jev 模型」是什么**：`TypeSafe Jev` **不是**该组织的模型，而是 LAYA 模型卡里反复引用的**闭源商业基线**（标注为 `TypeSafe Jev 1.13.0`，卡里明写「no TypeSafe API access」「Its figures are third-party published, never measured here」）。该组织下**没有**任何名为 jev / TypeSafe 的模型，只有 `laya` / `laya-typed-decisions` / `laya-multilingual` 三个。LAYA 自陈 Jev 领先之处：**高基数选项**（Banking77 72 标签 Jev 0.870 vs LAYA 0.425）、**软准确率**（typed-decisions 0.580 vs 0.471）、开箱支持 **255 选项**（LAYA 77 选项即跌到 0.425）；LAYA 领先之处：argmax 准确率（0.766 vs 0.727）、开权重、标定、延迟、成本。开源生态里另有社区对 Jev 路线的复现（`com-kotobalabs/open-jev-deberta-v3-large`、`mobarmg/jev-schema-scorer-deberta-v3-large`、`vagmi/jev-lite` 等），**均非官方权重**。
+
+**判定：架构上是对的，落地上不是我们这三项的杠杆。**
+
+| 问题 | 判断 |
+|---|---|
+| 能不能帮上意图识别？ | **能，但只对 L4/L5 两层。** 这两层恰好就是「生成自由文本 → 正则解析回」的模式，正是 LAYA 要消灭的东西。换成 typed decision 后：**解析面消失**（没有幻觉可 parse）、**概率有标定**（可设阈值而不是猜）、**32.8ms/问**（对比当前 9B judge 因 prefill 慢而被迫把 timeout 抬到 20s）。 |
+| 能不能消掉「迟一轮」？ | **能。** 30-40ms 量级意味着可以**同轮同步判定**，直接消灭 §10.4 的结构性语义洞——这是它最有价值的一点，比准确率提升更有价值。 |
+| 能不能提准确度？ | **不能零样本直接用。** MASSIVE intent **非英语 13 语种 routed 0.451** —— 我们三语（zh / cantonese / en）全部落在这一桶。我们的语料是粤语口语 + 快递/防诈域，必须**域内微调**，而微调需要标注数据（§9.1 的 1503 通 / 9372 轮是可用种子，但标签要么从 L1 规则派生、要么人工标）。 |
+| 能不能治我们的主导残留错误？ | **不能。** LAYA 是**纯文本**模型——如果客户说「你係咪騙人」而 ASR 出「你係咪田靜寧」（§7 已记录的同音字滑失），任何文本模型都救不回来。**我们的主导残留错误源在 ASR，不在判定。** |
+| 工程代价 | 本栈是本地优先 + MLX（macOS）形态；LAYA 是 PyTorch/transformers ModernBERT，模型卡未提供 MLX 路径。**引入它=给 A 线 worker 加第二套推理运行时**。CPU 预载 193-464ms 做后台 judge 够用，但那样「同轮同步」的收益就没了。 |
+| 会不会伤害可解释性？ | **会。** L1/L2/L3/L6 现在是运营可读的（关键词表、话术分支、规则行）——这是本产品的运营模型（运营自己写话术/关键词/QA）。把确定性层换成模型 = 从「可审计」退回「不可审计」，**属降级不属升级**。 |
+
+**结论**：**LAY A 值得作为 L4/L5 的候选替代方案跟踪，但不要用它去动 L1/L2/L3/L6，也不要指望它提准确度。** 真要上，正确姿势是「**先用现有 9B judge 的历史输出当弱标签，微调一个 421M typed-decision 模型，只替换 L4/L5 的判定，保留关键词层不变**」，收益是延迟与解析面，不是准确率。**对 C6 的三项缺口，这是低优先级项。**
+
+### 10.8 分层判定与尾段执行序的合理性评估
+
+**分层判定：合理，理由不是「层多所以细」，而是每层的输入信息不同且不可互相替代。**
+
+| 判断 | 说明 |
+|---|---|
+| ✅ **确定性优先的排序正确** | 先纯函数（L1/L2/L3）后生成（L4/L5），把方差和延迟都放在兜底位；且生成层**按数据 opt-in**（C2），绝大多数模板根本不触发。 |
+| ✅ **合规路径受保护** | `REFUSE 收线` 与 `say 直念` 在优先级链顶端，且 say 锁是**结构性**的（AG:4169/4177 门住后续全部派发），不是事后互斥。 |
+| ✅ **挂断语义与每轮语义分离** | L6 不在每轮链路上（挂断时一次性算 `disposition`/`intent_code`），避免把「整通结论」塞进「本轮动作」。 |
+| ✅ **每层都有 kill-switch 且在 `_FORWARD_ENV` 立法** | 单点表，测试扫源码读取面，未登记即 CI 红。 |
+| ⚠️ **同轮内 L4/L5 不同步** | 见 §10.4，这是设计上唯一真正的语义洞（守卫只能收窄窗口，不能消除）。 |
+| ⚠️ **存在两套并行的关键词编写面** | L2（话术 `如果客户X→就Y` 文本语法）与 L3（`graph_json.intents` 子串枚举）表达的是**同一件概念**（「客户说 X 就 Y」），但语法不同、存储不同、编辑器不同。运营要写两遍，且两者可以互相矛盾（也正是 §10.9 的摩擦源）。 |
+| ⚠️ **`rule_verdict` 内部有个反直觉次序** | **DEFER 检查在 CONFIRM 之前** ——「好的，我查一下」这类话会落 DEFER 而非 CONFIRM。语义上是对的（社交拖延），但运营不可能预测到，属**隐性行为分叉**。 |
+| ⚠️ **L5 在快路之前就被调度（AG:4389）** | 该轮若随后从 say / graph / QA 出口返回，已花的 9B 调用被 store 守卫丢弃。是**可接受的浪费**（单飞 + 让路已限流），但属可优化点。 |
+
+**尾段执行序：合理。三重排序原则自洽。**
+
+排序依据 = **① 不可逆性（收线/合规最高）→ ② 廉价性（纯函数先于模型）→ ③ 已物化内容保护（直念/罐头先于自由生成）**。三个非显然但承重的性质见 §10.3。**唯一的结构性气味**：图块（graph）在 QA 快路**之前**——即一个宽泛的图关键词可以静默地遮住一条字面 QA 命中。**方向上是对的**（意图应当压过措辞），但**静默**这一点不好：唯一能发现的方式是 §6 L-③ 的漂移报告。建议后续把「被 graph 遮蔽的 QA 命中」也纳入 L-① 的覆盖率驾驶舱。
+
+### 10.9 话术意图 ↔ QA 的配合性评估（「话术本身已经有意图了」）
+
+**这句直觉指向的摩擦是真实存在的，而且比表面更结构性。**
+
+| 面 | 组织方式 | 键 | 编写者 | 匹配方式 |
+|---|---|---|---|---|
+| **话术** | 步骤（有序目标）+ 分支（`如果客户X→就Y`）+ 图意图（`keyword → action`） | **意图** | 运营，在话术页 | 语法解析 / 子串 |
+| **QA 库** | 扁平词条 + 同义簇（`cluster_head_id`） | **字面措辞** | 运营，在快答库页 | 0.90 阈值，0.6×余弦 + 0.4×子串 |
+
+**结论：两个系统不共享词表。** 后果有三：
+
+1. **同一句客户话可能被两套独立系统各自路由，且它们没有共同词汇可以对齐。** 图意图判「这是不是 X 意图」，QA 判「这像不像某条措辞」——一个客户的「点解你哋咁慢」到底该走图意图还是走某条 QA，取决于两个互不知情的阈值。
+2. **`graph play_qa` 的 by_id 绑定是目前唯一的桥，而这桥被刻意排除在轮换之外** —— 运营把某条 QA 钉给某图意图后，**该词条退出簇内轮换**。运营的直觉是「我给它指定了答案」，实际效果是「我把它从轮换里摘出来了」，两者不一致。
+3. **覆盖率双向不可见**：从话术侧看不出「这个步骤有没有 QA 兜底」，从 QA 侧看不出「这条词条服务哪个意图/哪一步」。唯一线索是 §6 的学习回路报告。
+
+**建议方向（供后续决策，本轮不动手）**：
+
+| 方案 | 做法 | 代价 |
+|---|---|---|
+| **A（轻）** | `play_qa` 允许绑定**簇头**（`cluster_head_id`）而非固定 id，让轮换对图意图也生效 | 改 `_qa_rotation_plan` 的 by_id 豁免分支 + 画布绑定 UI；语义变化需在 UI 明示 |
+| **B（中）** | QA 词条加可选 `intent_id` 标签，图意图按**意图**绑定而非按 id | 加列 + 迁移 + 两个编辑面；收益是两套词表合一 |
+| **C（无论选哪个都该做）** | 把 L-① 的「漏网轮」与 L-③ 的「在库词条体检」**join 成一张「下一最佳动作」清单**：既报「这步没有 QA 覆盖但 LLM 轮量高」，也报「这条 QA 从没被图意图引用过 / 被图关键词静默遮蔽」 | 纯报表层，无运行时风险 |
+
+**同时必须说清一件事**：话术有意图 ≠ QA 应该由意图驱动。QA 快路的价值恰恰在于**它不认识意图、只认字面**——这是一个**独立的召回通道**，用意图去收编它会削弱它的正交性。**正确的目标不是「合并成一个系统」，而是「让两个系统共享同一个意图词表，同时各自保留自己的判据」。** 方案 B 是这条路线，A 是它的最小前置。
+
+### 10.10 三个缺口的杠杆映射（准确度 / 速度 / 垫音合理性）
+
+| 缺口 | 真正的根因（按优先级） | 最高杠杆 | 换判定模型有用吗 |
+|---|---|---|---|
+| **速度** | 走到「自由 LLM」的轮次占比过高。本通时间 = 命中轮（~0 秒生成）+ 未命中轮（4B 全量生成） | **提高零 LLM 快路覆盖率**（§10.3 的六条路径：say 直念 / 脚本直念族 / graph play_qa / QA 字面命中 / 分支罐头 / 收线直念）。这就是 §6 L-①/L-②/L-③ 三个回路在做的事：把真实通话语料**物化**成运营可审的罐头内容 | 否。LAY A 只加速 L4/L5 那两片，**不加速 LLM 本身** |
+| **准确度** | 两件完全不同的事：**(i) 意图判错**（哪一层赢）**(ii) 内容讲错**（4B 生成） | (ii) 是主要矛盾——AGENTS.md 记录的绝大多数真实翻车（尾部锚照抄 / 分支整段重念 / 平台问句重复 / 赔偿数字乱入）都是**生成侧**问题，修法都在 prompt 侧；(i) 的残留主导源是 **ASR 转写把词送错**，不在判定层 | 否。LAY A 只动 (i) 里模糊的那一小片，且治不了 ASR |
+| **垫音合理性** | 垫音**只存在于「等 LLM」的地方**（AG:4915 arm 在全部快路之后）——所以垫音问题的本质是**「被迫等 LLM 的轮次太多」**。次级因子才是：`classify_filler_category(user_text)` 在 ASR 文本上的分类准确率、每类每语言池深、时序（500ms 触发 / 300ms gap） | **同一个杠杆**：快路覆盖率上去 → 垫音轮次直接消失 → 既不会语境错位，也不会有叠音风险。这一项与「速度」**共用同一个修法** | 否，完全不相干 |
+
+**一句话**：**不要为了意图识别去换判定模型。当前三个缺口的共同解是「把覆盖率做上去」——让更多轮次不走 LLM，而走运营撰写、可审、即时出声的罐头内容。** 判定链路的六层结构是健康的（C1–C4）；要改的是**覆盖率**，不是**判定器**。
+
+---
+
+*本节为 2026-09-20 复盘定案。后续针对性修改请从 §10.5 逐层表 + §10.6 锚点表进入；§1–§9 的行号与 §10.6 冲突时以 §10.6 为准。*
 
 
 
