@@ -569,5 +569,167 @@ sequenceDiagram
 
 *本节为 2026-09-20 复盘定案。后续针对性修改请从 §10.5 逐层表 + §10.6 锚点表进入；§1–§9 的行号与 §10.6 冲突时以 §10.6 为准。*
 
+---
+
+## §11 修订与延伸（2026-09-21）：LAY A 选项集是动态的 + 画布作为意图词表单一来源
+
+> **本节性质**：推翻 §10.7 的**前提**（不是推翻全部结论）。§10.7 把 LAYA 当成「固定标签分类器、
+> 需域内微调、低优先级」来评估；实测模型卡与 README 后确认其**选项集是推理时随请求给的**，
+> 这把它从「训一个模型」变成「把我们已有的意图词喂进去」——与我方产品形态（运营自己写意图）
+> 高度同构。§10.7 保留原文不改以留审计轨迹，**冲突处以 §11 为准**。
+
+### 11.1 推翻 §10.7 前提的实测证据
+
+LAY A 的 `predict()` 接受 `questions` dict，**选项（`criteria`）逐次请求动态传**，不在训练时固定。
+README quickstart 原文（apache-2.0）：
+
+```python
+questions = {
+    "department": {
+        "type": "choice",
+        "instructions": "Which department should handle this request?",
+        "criteria": {                                  # ← 推理时给的选项集
+            "billing": "invoices, payments, refunds",   # ← 标签 : 描述
+            "technical": "bugs, outages, system errors",
+            "sales": "pricing, new contracts",
+            "other": "everything else",
+        },
+    },
+    "urgency":  {"type": "score", "criteria": ["not urgent", "soon", "critical deadline or blocking issue"]},
+    "churn_risk": {"type": "noul", "instructions": "Does the user threaten to cancel or leave?"},
+}
+```
+
+**三个决策原语与我方需求的对位**（这是最要紧的发现）：
+
+| 原语 | 语义 | 我方对位 |
+|---|---|---|
+| `choice` | 多选一的标签 + 每项概率 + 置信 | **图意图 / 本步归属** —— 运营的意图词就是 `criteria`，`instructions` 就是判据说明 |
+| `score` | 序数档位的期望值 + 分布 | **情绪强度 / 客户意向度** —— 我方目前**完全没有**这一维（§10.5 六层里没有任何一层量化情绪） |
+| `noul` | **P(true) ∈ [0,1] 的标定概率** | **合规/状态闸** —— `rule_verdict` 本质就是一组是/否判断（REFUSE 要收线？报号了吗？应承了吗？），今天全用正则拼出来 |
+
+**准确率数字必须换一栏读**：§10.7 引的 `MASSIVE intent 非英 13 语种 0.451` 是**固定 60 标签集**下的分数——
+选项集被冻结、模型没见过这些标签的描述。而动态 `criteria` + 描述的任务形态更接近**零样本 NLI**，
+卡上对应的是 `XNLI 英文 0.860 / 其余 14 语 0.731（routed）`。**两者不是同一件事，0.451 不能用来否定动态选项档。**
+
+`criteria` 的值是「标签 : 描述」，**描述就是意图词的天然容器**——运营写的一串近义说法直接放进去即可。
+
+**Router**：三档 checkpoint（`laya` 英文 / `laya-multilingual` 100+ 语 / `laya-typed-decisions`），
+router 亚毫秒判语言后分派，「dispatches to the optimal checkpoint in a single forward pass」。
+存在的理由即模型卡自陈的失败模式：英文 checkpoint 在非拉丁文字上**「stays confident while being wrong」**
+（高棉语 0.000 准确率 @ 0.952 置信）。**对我方的直接含义：zh / cantonese 一律必须走 `laya-multilingual`，
+绝不能让英文 checkpoint 碰。** `preload=True` 必须开（否则语言切换 7-10s 重载）。
+
+### 11.2 §10.7 结论的逐条修正
+
+| §10.7 原判断 | 修正后 | 依据 |
+|---|---|---|
+| 「非英 0.451 → 必须域内微调，是新工程线」 | **前提不成立**。动态 `criteria` 档对应的是零样本 NLI 口径（非英 0.731），且**选项集由运营给、不必训练** | §11.1 |
+| 「正确姿势是拿 9B judge 输出当弱标签微调」 | **降级为选项之一**。首选是**不训练**：把画布上的意图词直接当 `criteria` 跑零样本，够用就不训 | §11.1 |
+| 「低优先级项」 | **升为待验证的高优先级项**，因为成本结构变了——从「建标注+训练线」变成「喂一份现成词表 + 一次真机延迟实测」 | §11.1 |
+| 「不要用它动 L1/L2/L3/L6，属降级」 | **一半成立**：仍不应把确定性层**换成**模型（运营可读性是真资产）；但可以**加一层语义召回**进现有仲裁，确定性层保留否决权 | §10.3 尾段序、§11.4 |
+| 「治不了 ASR」 | **完全成立，不变**。纯文本模型，`你係咪騙人 → 田靜寧` 级滑失依旧无解 | §10.5 |
+| 「引入第二套运行时」 | **成立但成本重估**：`pip install laya`、apache-2.0，spike 成本低；真机延迟（T4 32.8ms / CPU 预载 193-464ms / 本机 Apple Silicon 未知）**必须实测** | §11.5 |
+
+### 11.3 画布现状：三类节点已经同处一图，但**真源分裂在三处**
+
+用户提出的「画布 = 话术流程（意图判断）= QA 条件判断」在**数据模型上已经走了一半**——QA 画布
+（`apps/web/lib/qa-canvas.ts`）的节点联合就是三类：
+
+```ts
+export type CanvasNode = CanvasStepNode | CanvasQaNode | CanvasIntentNode;
+export type CanvasEdge = { … data: { kind: "cluster" | "step" | "spine" | "binding" } … };
+```
+
+即 **步骤 / QA 条目 / 意图** 三类节点 + 四类边（簇成员 / 挂步 / 脊柱 / 图绑定）已在一张画布上。
+话术编辑器画布（`apps/web/lib/flow-canvas.ts`）则是另一套节点集：
+
+```ts
+export type FlowNode = { kind: "step"; … branches: StepNodeBranch[]; jumpIn: number } | { kind: "intent"; … };
+export type FlowEdge = { kind: "spine" | "jump" | "thenjump" };
+```
+
+**问题不在「有没有画布」，在于真源分裂在三处异构存储**：
+
+| 真源 | 内容 | 谁写 |
+|---|---|---|
+| `conversation_templates.steps_json` | 步骤（goal/ref/scene/say/emotion）+ 答法分支（`resp` 内嵌动作标记 = 收线/转人工/跳步/留步） | 话术编辑器画布 |
+| `conversation_templates.graph_json` | `GraphIntent`（keywords/steps/enabled/judge）+ `GraphBinding`（play_qa→`qa_id` / jump_step→`step` / notify_human / then_jump） | QA 画布意图节点 |
+| `qa_entries` 表行 | `scope` / `step_index` / `cluster_head_id` / `priority` / `hit_count` / `enabled` | QA 画布条目节点 |
+
+所以 `deriveGraph()`（qa-canvas.ts:252）是**在三种异构存储之上的装配视图**，不是权威图。两个后果：
+
+1. **两条到脊柱的连线机制不对称**：意图→步走 `graph_json` 的绑定边；QA→步走 `qa_entries.step_index`
+   这个**反向指针列**（画布渲染成 `kind:"step"` 边，但它不是一条能独立存在的边）。
+2. **两个编辑器各执半图**：话术画布看得见 jump/thenjump 边、看不见 QA 节点；QA 画布看得见 QA/意图/步三类、看不见答法分支与动作（收线/转人工）。**没有任何一个面能一次看全「这句话会触发什么」。**
+
+这就是「应该节点之间互相配合」这句话指向的真实缺口——**不是缺画布，是缺一个权威图。**
+
+### 11.4 统一形态提案：画布 = 意图词表的单一来源，同时驱动确定性层与语义层
+
+关键洞察：**运营在画布上写的那些「意图词」，恰好就是 LAY A 的 `criteria`。** 于是同一份词表
+可以同时喂两层，各取所长：
+
+```mermaid
+flowchart TD
+    CV["画布（权威图，运营写一次）<br/>步骤目标 · 答法分支条件 · 图意图词 · QA 词条问法"]
+    CV --> OW["意图词表<br/>label : 描述 / 近义说法列表"]
+
+    OW --> DET["确定性层（现有 L1/L2/L3）<br/>子串命中 · 零延迟零成本 · 合规否决权"]
+    OW --> SEM["语义层（LAY A criteria）<br/>choice: 归属 / noul: 二值闸 / score: 情绪强度<br/>~33ms · 治关键词命中不了的改写"]
+
+    DET --> ARB["现有优先级仲裁<br/>REFUSE 收线 &gt; DEFER &gt; say 直念 &gt; graph &gt; QA 快路 &gt; 自由 LLM"]
+    SEM -.->|"高阈值候选，不夺否决权"| ARB
+    ARB --> OUT["本轮动作"]
+
+    style CV fill:#e8f5e9,stroke:#2e7d32
+    style SEM fill:#fff3e0,stroke:#ef6c00
+```
+
+**三条设计纪律**（这是 §10.7「不要动 L1/L2/L3/L6」的精确化，不是推翻）：
+
+1. **确定性层保留否决权**。合规动作（收线）不可逆，不能让概率模型单独决定挂断。模型只在**高阈值**上
+   *追加*候选进仲裁——但**收线这一项要特别审慎**：误挂断比漏挂断严重得多，所以模型对收线的贡献
+   必须以「实测 precision 高于正则」为前提，**不能凭直觉加**（§11.5 列为待测项）。
+2. **选项集必须按步 scope**，不可全模板/全账号池化。模型卡上限证据：**77 选项即跌到 0.425**
+   （Jev 在 72 标签上 0.870）。我方按步 scoping 天然低基数，但**别把 12 模板 × 103 词条池成一个大选项集**。
+3. **运营可读性不丢**：词表仍是画布上的文字，模型只是**同一份文字的第二个消费者**。这与
+   「把关键词换成黑盒分类器」有本质区别——前者运营改词即改行为，后者不能。
+
+### 11.5 意图词预填充：来源清单（用户问「不是可以都给他预填充进去吗」）
+
+**可以，而且我们手上已经有一份被浪费掉的富矿。**
+
+| 来源 | 现成度 | 说明 |
+|---|---|---|
+| 话术步骤 `goal` + `ref` 首行 | **已在画布节点上**（`CanvasStepNode.data.goal` / `refFirstLine`） | 步骤目标本身就是意图描述 |
+| 答法分支 `cond` | **已解析**（`StepBranch.cond`，`如果客户X→就Y` 的 X） | 已经是「客户说什么」的字面条件 |
+| 图意图 `keywords` | 运营手写，通常几条 | 现有的确定性层主力 |
+| **QA 词条 `question_text`（103 条）** | **已在库，但今天只用于字面匹配** | ⭐ **最富矿**：`source=mined` 的那些是真实通话里挖出来的客户原话。它们今天**只**做 0.90 字面匹配，**从未被当成「该意图的示例说法」提供给意图层** |
+| L-① 漏网轮原话 | 已有回路（§6） | 关键词没中的真实轮次，正是语义层该补的位置 |
+| 三语种子包 | 已有 | 冷启动底料 |
+
+**预填充的正确形态**：不是「替运营写关键词」（运营仍可改），而是**把库里已有的真实措辞按意图聚合**，
+作为 `criteria` 的**描述**（LAY A 的 `criteria` 值是「标签 : 描述」，描述可以是近义说法串）。
+于是同一句客户原话在未来有两条路可用：走 L3 子串（精确、零延迟）或走 LAY A `choice`（容忍改写）。
+
+**这一条同时回答了 §10.9 的摩擦**：QA 词条的 `question_text` 一旦被当成「意图的示例说法」，
+话术意图与 QA 就**共享了同一个词表**——不需要把两个系统合成一个，只需要让 QA 的问法
+**同时**是意图层的语料。这与 §10.9 结论一致（共享词表、各留判据），并给出了**具体的第一刀**。
+
+### 11.6 下一步（最小验证，不含实现）
+
+| # | 动作 | 目的 | 成本 |
+|---|---|---|---|
+| V1 | `pip install laya`，**真机**（本机 Apple Silicon）实测单问延迟 + 内存 | §11.2 唯一未定的前提：T4 32.8ms / CPU 预载 193-464ms，本机未知 | 低 |
+| V2 | 取真库副本里 20-30 条真实转写（含 L-① 漏网轮），喂 `laya-multilingual`：`choice` 判图意图归属、`noul` 判 REFUSE/WA/CONFIRM，与现有 L1/L3 输出逐条对照 | 验证「动态 criteria 零样本」在**我方域与粤语**上到底能不能用 | 低 |
+| V3 | 同上数据测**收线**（REFUSE）的 precision/recall 对比正则 | §11.4 纪律 1 的前置：误挂断代价高，必须数据说话 | 低 |
+| V4 | 画布权威图：确定 `graph_json` 是否升为唯一真源（含 QA 挂步边），两个画布改为其两个透镜 | §11.3 缺口的真正修法 | 中高 |
+
+**V1-V3 都不改代码、不碰运行时**，可以在一轮内做完并给出「LAY A 到底能不能用、用在哪几层」的定论。
+
+*本节为 2026-09-21 修订。§10.7 在此被部分推翻（前提错误），但「治不了 ASR」「不应替换确定性层」
+「不要池化选项集」三条约束经修订后仍然成立。*
+
 
 
