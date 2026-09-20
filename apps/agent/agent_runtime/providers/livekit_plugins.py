@@ -5055,6 +5055,50 @@ def _hesitation_gate_on() -> bool:
     return os.environ.get("QWEN3_ASR_HESITATION_GATE", "1") == "1"
 
 
+def _chunk_keep_enabled() -> bool:
+    """D4 止血总门(QWEN3_ASR_CHUNK_KEEP,默认 1;0=回退旧「先清后发」档)。
+
+    旧档:`_maybe_partial` 先 `_pending.clear()` 再 POST sidecar——瞬时不可用
+    (连接拒/超时)时该窗 PCM 永久丢失且零日志。新档:「成功才清」,失败保留
+    (见 `_chunk_keep_plan` 与调用处注释)。
+    """
+    return os.environ.get("QWEN3_ASR_CHUNK_KEEP", "1") == "1"
+
+
+# D4 保留窗有界上限:12s(PCM16 单声道 16k)。对齐 sidecar partial 滑窗上限档
+# (PARTIAL_MAX_SEC)——超出后最老音频连 partial 都不再覆盖,finish 整句重解
+# 成本还线性涨,保留更老内容只有成本冇收益。有界截断丢最旧并打点,sidecar
+# 长时不可用时 _pending 绝不无界增长。
+_ASR_CHUNK_KEEP_MAX_BYTES = 16000 * 2 * 12
+
+
+def _pcm_window_ms(nbytes: int) -> int:
+    """PCM16 单声道 16k 字节数 → 毫秒(CHUNK_POST_ERR 打点可读面)。"""
+    return int(nbytes / 2 / 16000 * 1000)
+
+
+def _chunk_keep_plan(
+    pending_len: int, keep_max_bytes: int = _ASR_CHUNK_KEEP_MAX_BYTES
+) -> tuple[str, int]:
+    """D4 POST 失败后 `_pending` 处置计划(纯函数,离线可测 tests/test_asr_chunk_keep.py)。
+
+    返回 `(action, drop_bytes)`:action="keep"=整窗保留(drop=0);"trim"=超出
+    上限,需从 _pending 头部(最旧)丢 drop_bytes 字节再保留。调用方据返回值
+    `del self._pending[:drop]` 并打 action 点。
+
+    **重复提交结论(读码证据,services/qwen3-asr-sidecar/app.py)**:sidecar
+    `/api/chunk` 是**追加式**——`session["chunks"].extend(pcm)`,`/api/finish`
+    对**整段累积 buffer** 解码。同一段 PCM 提交两次 → chunks 里双份音频 →
+    转写重复。所以失败后**不主动重发**:保留在 _pending 头部,随下一窗
+    POST/finish 尾段**自然带上**即补齐(常见失败=连接拒/DNS,服务端从未收到,
+    带上恰好一份;「超时但服务端已收」的窄竞态下可能双写一次——概率与代价
+    远小于旧版整窗永久丢失,且无法从客户端可靠区分,取舍记此)。
+    """
+    if pending_len <= keep_max_bytes:
+        return "keep", 0
+    return "trim", pending_len - keep_max_bytes
+
+
 def _join_hold_s() -> float:
     """跨段拼接 hold 窗(秒):QWEN3_ASR_JOIN_HOLD_MS,默认 800;0=关(行为同旧)。
 
@@ -5528,7 +5572,13 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
             return
         self._last_post = now
         pcm = bytes(self._pending)
-        self._pending.clear()
+        if not _chunk_keep_enabled():
+            # 旧档(QWEN3_ASR_CHUNK_KEEP=0):先清后发——POST 失败整窗丢失(回退口)。
+            self._pending.clear()
+        # 新档(D4 止血,2026-09-20):「成功才清」。此处不删,POST 成功后再 del 已发
+        # 前缀(await 期间 INFERENCE_DONE 新到的音频留在尾部,不误删);失败保留整窗
+        # 随下一窗/finish 自然带上——sidecar /api/chunk 追加式,重复 POST 同段
+        # PCM 会重复转写,故不主动重发(取证与取舍见 _chunk_keep_plan 注释)。
         # 停嘴时钟锚点（2026-09-09 S5）:本窗音频在 POST 发出时刻已讲完,句级提交
         # 的 END_OF_SPEECH 带上它——框架 min_delay 锚定 speech_end_time（停嘴时刻,
         # audio_recognition.py:1332-1336/1679-1681）,锚点缺失会坍缩为 now,令
@@ -5546,8 +5596,28 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                 data = r.json()
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - partial 尽力而为,忙时/抖动静默跳过
+        except Exception as exc:  # noqa: BLE001 - partial 尽力而为,忙时/抖动不阻主链
+            # D4:失败必须可见(旧版静默 return=丢转写无痕);保留面有界截断。
+            if _chunk_keep_enabled():
+                action, drop = _chunk_keep_plan(len(self._pending))
+                if drop:
+                    del self._pending[:drop]
+                print(
+                    f"QWEN3_ASR_CHUNK_POST_ERR window_ms={_pcm_window_ms(len(pcm))} "
+                    f"kept_ms={_pcm_window_ms(len(self._pending))} action={action} "
+                    f"err={exc!r}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"QWEN3_ASR_CHUNK_POST_ERR window_ms={_pcm_window_ms(len(pcm))} "
+                    f"kept_ms=0 err={exc!r}",
+                    flush=True,
+                )
             return
+        if _chunk_keep_enabled():
+            # 成功才清:只删已发前缀(新档);旧档已在 POST 前清空,勿再删尾部新音频。
+            del self._pending[: len(pcm)]
         text = str(data.get("text") or "")
         if not text:
             return
