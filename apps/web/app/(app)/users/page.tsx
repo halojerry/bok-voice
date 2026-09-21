@@ -1,17 +1,30 @@
 "use client";
 
-// 员工管理（B4）：主管专属面——建号 / 启停 / 重置密码 / 8 键页面权限勾选。
-// 权限目录与后端 permissions.py 逐字对齐（见 components/session-context.tsx PAGE_KEYS）。
-// root 账号只读展示（仅 root 可管理 root/admin），本页不提供跨主管操作。
+// 员工管理（B4 + 2026-09-20 下发制）：主管专属面——建号 / 启停 / 重置密码 / 页面
+// 权限勾选（8 键）+ admin 管理键下发（6 键，仅 root：root 逐键授予 admin「没下发
+// 就用不了」的子集）。权限目录与后端 permissions.py 两表逐字对齐。
+// root 行只读展示（平台方角色固有，不经本页调整）。
 
 import { Fragment, useCallback, useEffect, useState } from "react";
 import { Plus } from "lucide-react";
 import { api, type UserRow } from "@/lib/api";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
-import { PAGE_KEYS, PAGE_LABELS, useSession, type PageKey } from "@/components/session-context";
+import {
+  MANAGEMENT_KEYS,
+  MANAGEMENT_LABELS,
+  PAGE_KEYS,
+  PAGE_LABELS,
+  hasManagement,
+  permLabel,
+  useSession,
+  type ManagementKey,
+  type PageKey,
+} from "@/components/session-context";
 
-/** 新话务员默认页面集：目录 8 键去掉「报表」（报表默认关，主管可按需开）。 */
+/** 新话务员默认页面集：页面目录 8 键去掉「报表」（报表默认关，主管按需开）。 */
 const DEFAULT_PERMISSIONS: string[] = PAGE_KEYS.filter((k) => k !== "reports");
+/** 新管理员默认下发集：页面默认集 + 管理键全关（root 逐键放行）——与后端建号默认章同源。 */
+const DEFAULT_ADMIN_GRANTS: string[] = [...DEFAULT_PERMISSIONS];
 
 const ROLE_LABEL: Record<string, string> = { root: "超级管理员", admin: "管理员", user: "话务员" };
 const ROLE_BADGE: Record<string, string> = {
@@ -36,7 +49,7 @@ const EMPTY_CREATE: CreateForm = {
   permissions: [...DEFAULT_PERMISSIONS],
 };
 
-/** 权限勾选组：8 键目录，标签取 PAGE_LABELS。 */
+/** 权限勾选组：页面 8 键目录，标签取 PAGE_LABELS。 */
 function PermissionChecks({
   value,
   onChange,
@@ -64,10 +77,39 @@ function PermissionChecks({
   );
 }
 
-/** 行权限（服务端返回有效集；缺省/'' 语义=默认集，[]=全关；admin/root=全部 grantable 键）。 */
+/** 管理键勾选组（下发制 2026-09-20）：6 键目录，仅 root 下发 admin 时出现。 */
+function ManagementChecks({
+  value,
+  onChange,
+  disabled = false,
+}: {
+  value: string[];
+  onChange: (next: string[]) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <div className="flex flex-wrap gap-x-4 gap-y-1.5">
+      {MANAGEMENT_KEYS.map((k) => (
+        <label key={k} className={`flex items-center gap-1.5 text-xs ${disabled ? "muted" : ""}`}>
+          <input
+            type="checkbox"
+            className="size-3 accent-(--live)"
+            checked={value.includes(k)}
+            disabled={disabled}
+            onChange={(e) => onChange(e.target.checked ? [...value, k] : value.filter((x) => x !== k))}
+          />
+          {MANAGEMENT_LABELS[k]}
+        </label>
+      ))}
+    </div>
+  );
+}
+
+/** 行权限（服务端出仓有效集；admin 行含管理键；缺省回默认集）。 */
 function rowPermissions(u: UserRow): string[] {
   if (Array.isArray(u.permissions)) return u.permissions;
-  if (u.role === "admin" || u.role === "root") return [...PAGE_KEYS];
+  if (u.role === "admin") return [...DEFAULT_ADMIN_GRANTS];
+  if (u.role === "root") return [...PAGE_KEYS, ...MANAGEMENT_KEYS];
   return DEFAULT_PERMISSIONS;
 }
 
@@ -87,10 +129,15 @@ export default function UsersPage() {
   const [pwDraft, setPwDraft] = useState("");
   const [pwErr, setPwErr] = useState("");
 
-  /** 主管面：匿名本地会话（auth-off 单机形态）与 admin/root 可用。 */
-  const isManager = Boolean(
-    session && (session.anonymous || session.role === "admin" || session.role === "root"),
+  /** 主管面（下发制 2026-09-20）：root 恒可；admin 需「员工管理」下发键；匿名=单机全权。 */
+  const canManage = Boolean(
+    session &&
+      (session.anonymous ||
+        session.role === "root" ||
+        (session.role === "admin" && hasManagement(session, "users"))),
   );
+  /** root 视角（可启停/改密/下发 admin 行；匿名本地模式视为单机 root）。 */
+  const isRoot = Boolean(session && (session.anonymous || session.role === "root"));
 
   const refresh = useCallback(async () => {
     try {
@@ -110,9 +157,9 @@ export default function UsersPage() {
   }, []);
 
   useEffect(() => {
-    if (!isManager) return;
+    if (!canManage) return;
     void refresh();
-  }, [isManager, refresh]);
+  }, [canManage, refresh]);
 
   async function create() {
     const username = cf.username.trim();
@@ -139,8 +186,8 @@ export default function UsersPage() {
         role: cf.role,
         display_name: cf.display_name.trim(),
       };
-      // permissions 仅对 role=user 目标有效（对 admin 目标传会被后端 400）。
-      if (cf.role === "user") body.permissions = cf.permissions;
+      // permissions：user 目标=页面键；admin 目标（下发制，仅 root 建）=页面键+管理键。
+      if (cf.role === "user" || (cf.role === "admin" && isRoot)) body.permissions = cf.permissions;
       await api.createUser(body);
       setCf(EMPTY_CREATE);
       setCreateOpen(false);
@@ -209,12 +256,12 @@ export default function UsersPage() {
   }
 
   if (!session) return <LoadingState label="正在读取会话…" />;
-  if (!isManager) {
+  if (!canManage) {
     return (
       <div className="card space-y-2">
         <span className="label">无权限</span>
         <p className="text-sm">员工管理仅主管（管理员 / 超级管理员）可用，请使用主管账号登录。</p>
-        <p className="text-xs muted">话务员如需调整账号信息，请联系主管。</p>
+        <p className="text-xs muted">话务员如需调整账号信息，请联系主管；主管未获「员工管理」下发时请联系平台管理员。</p>
       </div>
     );
   }
@@ -294,10 +341,16 @@ export default function UsersPage() {
               <select
                 className={`mt-1 ${input}`}
                 value={cf.role}
-                onChange={(e) => setCf({ ...cf, role: e.target.value })}
+                onChange={(e) =>
+                  setCf({
+                    ...cf,
+                    role: e.target.value,
+                    permissions: e.target.value === "admin" ? [...DEFAULT_ADMIN_GRANTS] : [...DEFAULT_PERMISSIONS],
+                  })
+                }
               >
                 <option value="user">话务员</option>
-                <option value="admin">管理员</option>
+                {isRoot && <option value="admin">管理员</option>}
               </select>
             </label>
           </div>
@@ -307,13 +360,34 @@ export default function UsersPage() {
               <PermissionChecks
                 value={cf.permissions}
                 onChange={(next) => setCf({ ...cf, permissions: next })}
-                disabled={cf.role !== "user"}
+                disabled={cf.role !== "user" && !(cf.role === "admin" && isRoot)}
               />
             </div>
+            {cf.role === "admin" && isRoot && (
+              <div className="mt-3">
+                <span className="label">管理权限下发（root 逐键授予；未下发即不可用）</span>
+                <div className="mt-1.5">
+                  <ManagementChecks
+                    value={cf.permissions.filter((k) => (MANAGEMENT_KEYS as readonly string[]).includes(k))}
+                    onChange={(mgmt) =>
+                      setCf({
+                        ...cf,
+                        permissions: [
+                          ...cf.permissions.filter((k) => !(MANAGEMENT_KEYS as readonly string[]).includes(k)),
+                          ...mgmt,
+                        ],
+                      })
+                    }
+                  />
+                </div>
+              </div>
+            )}
             <p className="mt-1 text-[11px] leading-relaxed muted">
               {cf.role === "user"
                 ? "勾选的页面才会出现在该话务员的导航里；报表默认关闭，按需勾选。"
-                : "管理员默认拥有全部页面权限，无需勾选。"}
+                : cf.role === "admin"
+                  ? "新建管理员：页面默认集 + 管理键全关——root 按需逐键下发，未下发即不可用。"
+                  : "管理员权限由平台方统一下发，本账号无需勾选。"}
             </p>
           </div>
           {createErr && <p className="text-xs text-red-600">{createErr}</p>}
@@ -364,17 +438,21 @@ export default function UsersPage() {
                         </span>
                       </td>
                       <td className="max-w-72">
-                        <div className="flex flex-wrap gap-1">
-                          {perms.length === 0 ? (
-                            <span className="text-xs muted">无</span>
-                          ) : (
-                            perms.map((k) => (
-                              <span key={k} className="rounded-sm bg-muted px-1.5 py-0.5 text-[10px] muted">
-                                {PAGE_LABELS[k as PageKey] ?? k}
-                              </span>
-                            ))
-                          )}
-                        </div>
+                        {u.role === "root" ? (
+                          <span className="text-xs muted">平台方 · 角色固有（不经本页调整）</span>
+                        ) : (
+                          <div className="flex flex-wrap gap-1">
+                            {perms.length === 0 ? (
+                              <span className="text-xs muted">无</span>
+                            ) : (
+                              perms.map((k) => (
+                                <span key={k} className="rounded-sm bg-muted px-1.5 py-0.5 text-[10px] muted">
+                                  {permLabel(k)}
+                                </span>
+                              ))
+                            )}
+                          </div>
+                        )}
                       </td>
                       <td className="whitespace-nowrap text-xs muted">
                         {String(u.created_at ?? "").slice(0, 10) || "—"}
@@ -409,8 +487,38 @@ export default function UsersPage() {
                               {pwEditId === u.id ? "收起密码" : "重置密码"}
                             </button>
                           </div>
+                        ) : u.role === "admin" && isRoot ? (
+                          // 下发制 2026-09-20：admin 行的管理（启停/改密/下发管理键）只归 root。
+                          <div className="flex flex-wrap items-center gap-2">
+                            <button className="btn-ghost text-xs" disabled={rowBusy} onClick={() => void toggleStatus(u)}>
+                              {u.status === "disabled" ? "启用" : "停用"}
+                            </button>
+                            <button
+                              className="btn-ghost text-xs"
+                              onClick={() => {
+                                setPermEditId(permEditId === u.id ? "" : u.id);
+                                setPermDraft([...perms]);
+                                setPwEditId("");
+                                setNotice("");
+                              }}
+                            >
+                              {permEditId === u.id ? "收起下发" : "下发权限"}
+                            </button>
+                            <button
+                              className="btn-ghost text-xs"
+                              onClick={() => {
+                                setPwEditId(pwEditId === u.id ? "" : u.id);
+                                setPwDraft("");
+                                setPwErr("");
+                                setPermEditId("");
+                                setNotice("");
+                              }}
+                            >
+                              {pwEditId === u.id ? "收起密码" : "重置密码"}
+                            </button>
+                          </div>
                         ) : (
-                          <span className="text-xs muted">仅 root 可管理</span>
+                          <span className="text-xs muted">仅平台方可管理</span>
                         )}
                       </td>
                     </tr>
@@ -421,6 +529,17 @@ export default function UsersPage() {
                           <div className="mt-1.5">
                             <PermissionChecks value={permDraft} onChange={setPermDraft} />
                           </div>
+                          {u.role === "admin" && (
+                            <div className="mt-3">
+                              <span className="label">管理权限下发 · {u.username}（root 逐键授予；未下发即不可用）</span>
+                              <div className="mt-1.5">
+                                <ManagementChecks value={permDraft} onChange={setPermDraft} />
+                              </div>
+                              <p className="mt-1 text-[11px] leading-relaxed muted">
+                                含规则：这里能授予的话务员页面键以该管理员自身被下发的集为上界。
+                              </p>
+                            </div>
+                          )}
                           <div className="mt-2 flex items-center gap-2">
                             <button className="btn-primary text-xs" disabled={rowBusy} onClick={() => void savePermissions(u)}>
                               保存权限
@@ -465,7 +584,7 @@ export default function UsersPage() {
       </section>
 
       <p className="text-xs muted">
-        角色说明：话务员只见被勾选的页面并维护自己的话术/快答；管理员可管理本账号全部资源；超级管理员权限不在本页调整。
+        角色说明：话务员只见被勾选的页面并维护自己的话术/快答；管理员按平台下发集工作（页面按有效集、管理面逐键授予，可再分配的页面以其自身被下发集为上界）；超级管理员为平台方角色，权限不在本页调整。
       </p>
     </div>
   );

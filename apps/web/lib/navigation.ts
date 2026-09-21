@@ -28,8 +28,9 @@ import {
   Workflow,
 } from "lucide-react";
 import {
+  hasManagement,
   hasPage,
-  isManager,
+  type ManagementKey,
   type PageKey,
   type Session,
 } from "@/components/session-context";
@@ -39,9 +40,11 @@ export type NavItem = {
   label: string;
   /** 页面权限键（契约 §1；user 需有效集含该键才可见）。 */
   key?: PageKey;
-  /** 主管专属（不可授予 user，见契约 §1）；管理员/匿名本地模式可见。 */
+  /** 管理权限键（下发制 2026-09-20；admin 需被下发该键才可见，root 恒可见）。 */
+  mkey?: ManagementKey;
+  /** 主管专属（不可授予 user，见契约 §1）；可见性按下发制逐键判。 */
   admin?: boolean;
-  /** root 专属（平台面，如 /nodes 节点吊销）；管理员与匿名本地模式也不可见。 */
+  /** root 专属（平台面，如 /nodes 节点治理）；仅 root 可见。 */
   rootOnly?: boolean;
   /** lucide-react 字形（侧边栏图标轨/折叠态提示用）。 */
   icon: LucideIcon;
@@ -71,18 +74,18 @@ export const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
     label: "AI 设置",
     items: [
       { href: "/studio", label: "AI 工作站", key: "templates", icon: Workflow },
-      { href: "/knowledge", label: "知识库", admin: true, icon: Library },
-      { href: "/personas", label: "人设", admin: true, icon: UserRound },
+      { href: "/knowledge", label: "知识库", admin: true, mkey: "knowledge", icon: Library },
+      { href: "/personas", label: "人设", admin: true, mkey: "personas", icon: UserRound },
     ],
   },
   {
     label: "管理",
     items: [
-      { href: "/supervisor", label: "主管台", admin: true, icon: Headphones },
-      { href: "/users", label: "员工", admin: true, icon: Users },
+      { href: "/supervisor", label: "主管台", admin: true, mkey: "supervisor", icon: Headphones },
+      { href: "/users", label: "员工", admin: true, mkey: "users", icon: Users },
       { href: "/nodes", label: "节点", rootOnly: true, icon: Server },
-      { href: "/audit", label: "审计", admin: true, icon: ScrollText },
-      { href: "/settings", label: "设置", admin: true, icon: Settings },
+      { href: "/audit", label: "审计", admin: true, mkey: "audit", icon: ScrollText },
+      { href: "/settings", label: "设置", admin: true, mkey: "settings", icon: Settings },
     ],
   },
 ];
@@ -136,11 +139,19 @@ export function gateForPath(pathname: string): RouteGate {
   return hit.key ? { kind: "page", key: hit.key } : { kind: "open" };
 }
 
-/** 导航项可见性：root 专属项仅登录 root 可见；匿名本地模式/admin=主管项全可见；user=权限键 ∩ 有效集。 */
+/** 导航项可见性（2026-09-20 三形态导航）：
+ * root=平台控制台——只出管理面/平台面（运营页对 root 隐藏；服务端仍全域放行，作排障通道）；
+ * admin=客户主管台——运营页按有效集、管理页按下发键（/nodes 平台资产恒不可见）；
+ * user=话务员台——权限键 ∩ 有效集；匿名本地模式=单机全权。 */
 export function navVisible(item: NavItem, session: Session | null): boolean {
   if (!session) return false;
   if (item.rootOnly) return !session.anonymous && session.role === "root";
-  if (isManager(session)) return true;
+  if (session.anonymous) return true;
+  if (session.role === "root") return Boolean(item.admin) || item.rootOnly === true;
+  if (session.role === "admin") {
+    if (item.admin) return item.mkey ? hasManagement(session, item.mkey) : true;
+    return item.key ? hasPage(session, item.key) : true;
+  }
   if (item.admin) return false;
   return item.key ? hasPage(session, item.key) : true;
 }

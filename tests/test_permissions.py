@@ -19,7 +19,10 @@ from control_plane.auth import hash_password
 from control_plane.permissions import (
     DEFAULT_USER_PERMISSIONS,
     GRANTABLE_PERMISSIONS,
+    MANAGEMENT_GRANTABLE,
+    MANAGEMENT_PERMISSIONS,
     PAGE_PERMISSIONS,
+    effective_admin_permissions,
     effective_permissions,
 )
 
@@ -85,9 +88,13 @@ def test_catalog_and_effective_permissions():
     ]
     assert GRANTABLE_PERMISSIONS == set(PAGE_PERMISSIONS)
 
-    # admin/root=全部 grantable 键；user=''/非法 JSON → 默认集；'[]' → 全关
-    assert effective_permissions("admin", "") == sorted(GRANTABLE_PERMISSIONS)
+    # root=全部 grantable 键；admin（下发制 2026-09-20）：''=存量全量（页面+管理 14 键），
+    # 显式数组=root 裁定集（目录序）；user=''/非法 JSON → 默认集；'[]' → 全关
     assert effective_permissions("root", "[]") == sorted(GRANTABLE_PERMISSIONS)
+    assert effective_permissions("admin", "") == list(PAGE_PERMISSIONS) + list(MANAGEMENT_PERMISSIONS)
+    assert effective_admin_permissions('["calls","users"]') == ["calls", "users"]
+    assert effective_admin_permissions("[]") == []
+    assert effective_admin_permissions("not-json") == list(PAGE_PERMISSIONS) + list(MANAGEMENT_PERMISSIONS)
     assert effective_permissions("user", "") == DEFAULT_USER_PERMISSIONS
     assert effective_permissions("user", "  ") == DEFAULT_USER_PERMISSIONS
     assert effective_permissions("user", "not-json") == DEFAULT_USER_PERMISSIONS
@@ -132,38 +139,45 @@ def test_patch_permissions_exact_set_and_immediate(monkeypatch):
 
 
 def test_permission_write_validation(monkeypatch):
-    """写入校验：未知键 400；admin/root 目标 400；建号可带权限；root 也能配。"""
+    """写入校验：未知键 400；建号可带权限；root 也能配；下发制下 admin 目标可被
+    root 授予页面键+管理键（未知键仍 400），admin 身份建 admin 仍拒。"""
     client, _repo, ids = _setup(monkeypatch)
-    # 未知键（含主管专属面）→ 400
+    # 未知键（含管理面）→ 400（user 目标）
     assert _patch_perms(client, ids["admin"], ids["op1_id"], ["calls", "nodes"]).status_code == 400
     assert _patch_perms(client, ids["admin"], ids["op1_id"], ["settings"]).status_code == 400
-    # admin 目标带 permissions → 400（root 操作 admin 目标同 400）
-    assert _patch_perms(client, ids["root"], ids["boss_id"], ["calls"]).status_code == 400
     # root 可正常配 user
     assert _patch_perms(client, ids["root"], ids["op1_id"], ["qa"]).status_code == 200
     assert client.get("/api/auth/me", headers=ids["op1"]).json()["permissions"] == ["qa"]
-    # 建号带权限；建 admin 带权限 → 400；建号未知键 → 400
+    # 建号带权限；建号未知键 → 400
     created = client.post("/api/users", headers=ids["admin"],
                           json={"username": "op2", "password": PW, "role": "user",
                                 "permissions": ["templates", "qa"]})
     assert created.status_code == 200, created.text
     assert created.json()["permissions"] == ["templates", "qa"]
     assert "permissions_json" not in created.json()  # 原始串不外泄
-    assert client.post("/api/users", headers=ids["root"],
-                       json={"username": "boss2", "password": PW, "role": "admin",
-                             "permissions": ["calls"]}).status_code == 400
     assert client.post("/api/users", headers=ids["admin"],
                        json={"username": "op3", "password": PW, "role": "user",
                              "permissions": ["supervisor"]}).status_code == 400
+    # 下发制 2026-09-20：root 建 admin 可带页面键+管理键（200）；未知键仍 400
+    r = client.post("/api/users", headers=ids["root"],
+                    json={"username": "boss2", "password": PW, "role": "admin",
+                          "account_id": "acc-001", "permissions": ["calls", "users"]})
+    assert r.status_code == 200, r.text
+    assert set(r.json()["permissions"]) == {"calls", "users"}
+    assert client.post("/api/users", headers=ids["root"],
+                       json={"username": "boss3", "password": PW, "role": "admin",
+                             "account_id": "acc-001", "permissions": ["calls", "nodes"]}).status_code == 400
     # 缺省=None 建号 → 默认集
     created2 = client.post("/api/users", headers=ids["admin"],
                            json={"username": "op4", "password": PW, "role": "user"})
     assert created2.json()["permissions"] == DEFAULT_USER_PERMISSIONS
-    # 登录响应/用户列表同样带有效集，且 admin 行=全部 grantable
+    # 登录响应/用户列表同样带有效集，且存量 admin 行=页面+管理全量
     login_user = client.post("/api/auth/login", json={"username": "op2", "password": PW}).json()["user"]
     assert login_user["permissions"] == ["templates", "qa"]
     rows = client.get("/api/users", headers=ids["admin"]).json()["users"]
-    assert set(next(r for r in rows if r["username"] == "boss1")["permissions"]) == GRANTABLE_PERMISSIONS
+    boss_row = next(r for r in rows if r["username"] == "boss1")
+    # 下发制：存量 boss1 ''=全量（页面+管理 14 键）；op2=精确集
+    assert set(boss_row["permissions"]) == GRANTABLE_PERMISSIONS | MANAGEMENT_GRANTABLE
     assert next(r for r in rows if r["username"] == "op2")["permissions"] == ["templates", "qa"]
 
 
@@ -403,3 +417,120 @@ def test_migration_adds_users_permissions_column(tmp_path, monkeypatch):
     cols = [r[1] for r in c.execute("PRAGMA table_info(users)")]
     c.close()
     assert "permissions_json" in cols, cols
+
+
+# ---- 下发制（2026-09-20）：root 逐键下发 admin 管理面 ----
+
+
+def test_admin_delegation_default_and_legacy(monkeypatch):
+    """存量 ''=全量（零变化）；root 新建 admin=默认章（页面默认集+管理键全关）。"""
+    client, _repo, ids = _setup(monkeypatch)
+    me = client.get("/api/auth/me", headers=ids["admin"]).json()
+    assert "settings" in me["permissions"] and "users" in me["permissions"]
+    assert client.get("/api/settings", headers=ids["admin"]).status_code == 200
+    assert client.get("/api/audit", headers=ids["admin"]).status_code == 200
+    # root 建新 admin（不带 permissions）→ 默认章
+    r = client.post("/api/users", headers=ids["root"],
+                    json={"username": "boss9", "password": PW, "role": "admin",
+                          "account_id": "acc-001"})
+    assert r.status_code == 200, r.text
+    boss9 = r.json()
+    assert "settings" not in boss9["permissions"] and "users" not in boss9["permissions"]
+    assert "calls" in boss9["permissions"] and "reports" not in boss9["permissions"]
+    login = client.post("/api/auth/login", json={"username": "boss9", "password": PW}).json()
+    h9 = {"Authorization": f"Bearer {login['token']}"}
+    assert client.get("/api/settings", headers=h9).status_code == 403
+    assert client.get("/api/users", headers=h9).status_code == 403
+    assert client.post("/api/users", headers=h9,
+                       json={"username": "x9", "password": PW, "role": "user"}).status_code == 403
+    assert client.get("/api/knowledge", headers=h9).status_code == 403
+    assert client.get("/api/audit", headers=h9).status_code == 403
+    assert client.get("/api/supervisor/active-calls", headers=h9).status_code == 403
+    # 运营面按页面默认集照常
+    assert client.get("/api/calls", headers=h9).status_code == 200
+
+
+def test_admin_delegation_grant_and_revoke(monkeypatch):
+    """root 逐键下发/收回即时生效（逐请求查库，旧 token 不必重签）。"""
+    client, _repo, ids = _setup(monkeypatch)
+    client.post("/api/users", headers=ids["root"],
+                json={"username": "boss8", "password": PW, "role": "admin",
+                      "account_id": "acc-001"})
+    boss8_id = next(u["id"] for u in client.get("/api/users", headers=ids["root"]).json()["users"]
+                    if u["username"] == "boss8")
+    login8 = client.post("/api/auth/login", json={"username": "boss8", "password": PW}).json()
+    h8 = {"Authorization": f"Bearer {login8['token']}"}
+    assert client.get("/api/settings", headers=h8).status_code == 403
+    assert client.patch(f"/api/users/{boss8_id}", headers=ids["root"],
+                        json={"permissions": ["calls", "settings", "users"]}).status_code == 200
+    assert client.get("/api/settings", headers=h8).status_code == 200
+    assert client.get("/api/users", headers=h8).status_code == 200
+    # 收回即时生效
+    assert client.patch(f"/api/users/{boss8_id}", headers=ids["root"],
+                        json={"permissions": ["calls"]}).status_code == 200
+    assert client.get("/api/settings", headers=h8).status_code == 403
+    assert client.get("/api/users", headers=h8).status_code == 403
+    # admin 即使持 users 键也建不了 admin（角色闸）
+    assert client.patch(f"/api/users/{boss8_id}", headers=ids["root"],
+                        json={"permissions": ["calls", "users"]}).status_code == 200
+    assert client.post("/api/users", headers=h8,
+                       json={"username": "nx", "password": PW, "role": "admin"}).status_code == 403
+
+
+def test_admin_users_key_gate_and_containment(monkeypatch):
+    """users 键缺 → users 面全 403；授出页面键以自身下发集为上界（授不出没有的）。"""
+    client, _repo, ids = _setup(monkeypatch)
+    # 页面集不含 reports——制造「admin 自身无 reports 键」的受控场景
+    pages = [k for k in PAGE_PERMISSIONS if k != "reports"]
+    assert client.patch(f"/api/users/{ids['boss_id']}", headers=ids["root"],
+                        json={"permissions": pages}).status_code == 200
+    me = client.get("/api/auth/me", headers=ids["admin"]).json()
+    assert "users" not in me["permissions"] and "settings" not in me["permissions"]
+    assert client.get("/api/users", headers=ids["admin"]).status_code == 403
+    assert client.post("/api/users", headers=ids["admin"],
+                       json={"username": "op9", "password": PW, "role": "user"}).status_code == 403
+    # 包含规则：boss1 无 reports 键 → 授不出 reports
+    assert _patch_perms(client, ids["admin"], ids["op1_id"], ["calls", "reports"]).status_code == 400
+    assert _patch_perms(client, ids["admin"], ids["op1_id"], ["calls"]).status_code == 200
+    # root 补发 reports 后 admin 可授
+    assert client.patch(f"/api/users/{ids['boss_id']}", headers=ids["root"],
+                        json={"permissions": pages + ["reports"]}).status_code == 200
+    assert _patch_perms(client, ids["admin"], ids["op1_id"], ["calls", "reports"]).status_code == 200
+
+
+def test_users_visibility_triad(monkeypatch):
+    """users 三缺陷收口：空账号 admin 403；admin 视角无 root 行；admin 管 admin 403。"""
+    client, repo, ids = _setup(monkeypatch)
+    # A. 空账号 admin fail-closed（不再当 match-all 全量泄露）
+    repo.create_user(username="boss0", password_hash=hash_password(PW), role="admin", account_id="")
+    login0 = client.post("/api/auth/login", json={"username": "boss0", "password": PW}).json()
+    assert client.get("/api/users", headers={"Authorization": f"Bearer {login0['token']}"}).status_code == 403
+    # B. admin 视角列表无 root 行（root 名录只归 root，纵深防御）
+    rows = client.get("/api/users", headers=ids["admin"]).json()["users"]
+    assert all(r["role"] != "root" for r in rows)
+    root_rows = client.get("/api/users", headers=ids["root"]).json()["users"]
+    assert any(r["username"] == "rooty" for r in root_rows)
+    # C. admin 不能管同账号其他 admin（对齐「仅 root 可管理」徽标）；自身资料保留自助
+    repo.create_user(username="boss2", password_hash=hash_password(PW), role="admin", account_id="acc-001")
+    boss2_id = repo.get_user_by_username("boss2")["id"]
+    assert client.patch(f"/api/users/{boss2_id}", headers=ids["admin"],
+                        json={"status": "disabled"}).status_code == 403
+    assert client.patch(f"/api/users/{boss2_id}", headers=ids["root"],
+                        json={"status": "disabled"}).status_code == 200
+    assert client.patch(f"/api/users/{boss2_id}", headers=ids["root"],
+                        json={"status": "active"}).status_code == 200
+    # 自助面：admin 改自己 display_name 照旧可用（access_gates 契约），但不能自改权限
+    assert client.patch(f"/api/users/{ids['boss_id']}", headers=ids["admin"],
+                        json={"display_name": "主管一号"}).status_code == 200
+    assert client.patch(f"/api/users/{ids['boss_id']}", headers=ids["admin"],
+                        json={"permissions": ["calls", "settings"]}).status_code == 403
+
+
+def test_settings_secret_surface_root_only(monkeypatch):
+    """settings?internal=1 明文回源：root/机器通道/auth-off 可读；admin 403；掩码面照常。"""
+    client, _repo, ids = _setup(monkeypatch)
+    assert client.get("/api/settings?internal=1", headers=ids["admin"]).status_code == 403
+    assert client.get("/api/settings?internal=1", headers=ids["root"]).status_code == 200
+    assert client.get("/api/settings", headers=ids["admin"]).status_code == 200
+    # auth-off（无身份非加固）保持可读——单机形态零变化
+    assert client.get("/api/settings?internal=1").status_code == 200
