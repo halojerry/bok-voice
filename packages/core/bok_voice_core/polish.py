@@ -302,16 +302,27 @@ def remove_fillers(text: str) -> str:
 # ---- 重复折叠 ----
 
 # 紧邻重复（段长 ≥2——单字叠词是构词、不折）；笑声/拟声（哈/嘿/嘻/呵）不折。
+# 两侧 ASCII 字母/数字边界（2026-09-21 批次 6 修）：`exceeded → exceed`、
+# `preceded → preced` 这类**把英文词尾当重复折掉**的破坏由这两枚 lookaround 拦住
+# （真库实测逼出；`_REPEAT_TRIPLE_RE` 同款见下）。
 _REPEAT_ADJACENT_RE = re.compile(
-    r"(?![哈嘿嘻呵])([^\s，,。！!？?、；;：:]{2,8})\1", re.IGNORECASE
+    r"(?<![A-Za-z0-9])(?![哈嘿嘻呵])([^\s，,。！!？?、；;：:]{2,8})\1(?![A-Za-z0-9])",
+    re.IGNORECASE,
 )
 # 逗号分隔的重复（段长 ≥2）。IGNORECASE 让 "Hello, hello" 也折叠（中文无大小写，无影响）。
 _REPEAT_COMMA_RE = re.compile(
-    r"(?![哈嘿嘻呵])([^\s，,。！!？?、；;：:]{2,8})[，,、]\s*\1", re.IGNORECASE
+    r"(?<![A-Za-z0-9])(?![哈嘿嘻呵])([^\s，,。！!？?、；;：:]{2,8})[，,、]\s*\1(?![A-Za-z0-9])",
+    re.IGNORECASE,
 )
 # 三连及以上的同一单字（我我我 → 我）；汉语双字叠词（看看/想想/谢谢）是构词、**不折**，
 # 故只收 ≥3 连；笑声/拟声（哈/嘿/嘻/呵）不折。
-_REPEAT_TRIPLE_RE = re.compile(r"(?![哈嘿嘻呵])(.)\1{2,}", re.DOTALL)
+#
+# ASCII 字母/数字同样不折（2026-09-21 批次 6 修，真库实测逼出）：`MT3000 → MT30`、
+# `soak111 → soak1` 这类**吃掉号码一位**的破坏原规则照做，而出 Guard **拦不住**
+# ——Guard 的硬保护 token 面只认「两侧皆非字母数字」的整数串，粘在字母上的数字串
+# 不产出保护 token。**数字是数据不是口水词**，故 ASCII run 一律不折
+# （判例见 tests/test_polish.py 的 test_ascii_runs_never_collapsed）。
+_REPEAT_TRIPLE_RE = re.compile(r"(?<![A-Za-z0-9])(?![哈嘿嘻呵A-Za-z0-9])(.)\1{2,}", re.DOTALL)
 
 
 def collapse_repetitions(text: str) -> str:

@@ -847,6 +847,15 @@ def _control_plane_env(db: Path | str) -> dict[str, str]:
     if _settle and Path(_settle).exists():
         env["BOK_SETTLE_LLM_BASE_URL"] = os.environ.get("BOK_SETTLE_LLM_BASE_URL", "http://127.0.0.1:1237/v1")
         env["BOK_SETTLE_LLM_MODEL"] = _settle
+    # E7 离线润色面 kill-switch（2026-09-21）：唯一消费者是 **CP**（挂断后纪要输入 /
+    # QA 挖掘 / L-① 漏网轮），故走这张 CP 面表显式下发（同 BOK_SETTLE_LLM_* 先例）——
+    # prod launchd/schtasks 封闭 env 面不注入即死门。**不进 _FORWARD_ENV**：那张表是
+    # A 线 agent worker 面，而润色绝不进实时轮（agent_runtime 不 import
+    # polish_wiring，tests/test_polish_wiring.py 结构化锚钉住）。未设/空串不注入
+    # （默认档=现状逐字节不变；开关默认关，见 polish_wiring 模块 docstring）。
+    _polish_offline = os.environ.get("BOK_POLISH_OFFLINE", "").strip()
+    if _polish_offline:
+        env["BOK_POLISH_OFFLINE"] = _polish_offline
     # .venv312 OpenSSL 无默认 CA 束：固化 SSL_CERT_FILE（P5 遗留项；CP 的
     # Summarizer/联网探针同食 TLS，注入失败零副作用）。
     return _bake_ssl_cert_file(env, repo_python())
