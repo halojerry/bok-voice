@@ -219,6 +219,10 @@ def test_protected_token_present_when_candidate_keeps_it():
 
 
 # ---- 6. 敏感新增（只在「引入」时拒） ----
+# 注：本节夹具含凭据形状的串（`api_key: …` 等）——这是**功能使然**：本模块的职责就是
+# 检出这类 token，负向判例必须真的给一个。`sk-abcdef123456` 因此被 gitleaks 的
+# generic-api-key 命中，已按 .gitleaks.toml 的既定程序**逐条精确登记**（该文件前言第三条
+# 有说明）。**勿为躲门禁把它改成「更高熵的形状」**——那条路只会让夹具更像真凭据。
 
 
 @pytest.mark.parametrize(

@@ -9,6 +9,13 @@
 # 两者都是 `BOK_JWT_SECRET` 的测试占位值，尾部递增数字串把香农熵抬到 4.18 / 4.37，
 # 越过 generic-api-key 的 3.5 阈值。
 #
+# 第三条（2026-09-21 批次 5）性质不同、**结构性必然**：
+#   tests/test_output_guard.py (commit 3a94023)  "sk-abcdef123456"
+# E3 OutputGuard 的功能就是「检出候选输出里新增的凭据形状 token」（`api_key: …` /
+# `Bearer …` / PEM 头等），所以**它的负向判例必须真的含凭据形状的串**——测试与门禁在
+# 这类模块上天然冲突，不是有人手滑写了真 key。这一条是**精确字面量**登记：只中和该
+# 夹具值，别的 `api_key: …` 形状照旧拦截。
+#
 # 为什么用**精确字面量**而不是模式：零额外放宽面。模式放行（例如「值里含 test 就放行」）
 # 会让任何形如 xxxxtestxxxx 的真实密钥漏网；精确登记只中和这两个已知值，其它高熵串
 # 照旧拦截。新增夹具若再触发，请按同样方式在此逐条登记——这条摩擦是门禁的本意。
@@ -28,4 +35,5 @@ id = "generic-api-key"
   regexes = [
     '''test-secret-for-qa-drift-0123456789''',
     '''diag-gates-fixture-secret-0123456789abcdef''',
+    '''sk-abcdef123456''',
   ]
