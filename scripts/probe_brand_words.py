@@ -8,8 +8,19 @@
          品牌词后 0.5s 微停顿）
   判定 = 提交的某个 user 轮文本完整包含品牌词（单轮内不拆）
 
+刺激源与读数可比性（2026-09-21，重要）
+--------------------------------------
+客户话音经 `probe_stimulus` 单点开关合成（`BOK_PROBE_STIMULUS=cloud` 走云端
+MiniMax）。**换话音源 = 换刺激 = 换读数**：本探针把整句按品牌词位置切成 2-3 段
+**分别合成**（`tts_pcm(前半) + 0.5s 静音 + tts_pcm(后半)`），所以云腿下每个短碎片
+是云端模型的独立整句渲染，韵律与本地 Qwen3-TTS 碎片不同——两档数字**不可直接对比**。
+云话音基线（2026-09-21）：`intact_single=12/16`；本地话音历史读数 10/16 → 14/16
+（词表前缀 hold 收编后）。云档 4 个 miss = 2×品牌词内部停顿 + 1×粤语连续句 +
+1×粤语品牌词后停顿，其中数条是碎片级 ASR 幻觉，不全是切分逻辑问题。
+
 用法：
   .venv312/bin/python scripts/probe_brand_words.py            # 基线
+  BOK_PROBE_STIMULUS=cloud PROBE_TAG=cloud .venv312/bin/python scripts/probe_brand_words.py
   结果落 JSON：scripts/.probe_brand_words.<tag>.json
 """
 from __future__ import annotations
