@@ -1752,3 +1752,93 @@ TTFT 分布（n=2607）：p50 943ms / p90 2487ms / p99 7041ms / max 20738ms；
      说法沉淀成词条，字面命中就不走自由生成。
 5. **主力缺口在 ASR 本体**（V-3 结论）：云端同族大杯（Qwen3-ASR-Flash）试点，
    针对热词救不动的硬混淆——**key 轮换后**做同音频 A/B（`probe_hotword_ab` 同款装置）。
+
+---
+
+## 25. 四仓外部调研（type4me / vocab-skill / VoxType / akang）：模式学习与计划修订（2026-09-21）
+
+两路并行代理调研（只读 GitHub），原文带出处全量在案。先说两条总纲：
+
+1. **云端 ASR 试点撤销（用户拍板）**：Qwen3-ASR-Flash 实测与本地差不多 →
+   §22 P2-6 删除，**专注本地 ASR**；已泄露的 DashScope key 仍建议轮换（与试点无关，
+   是泄露本身）。
+2. **四个外部项目没有任何电话信道（8kHz/双讲/AEC）与本地热词 context bias 的参考实现**
+   ——type4me/VoxType/akang 全是 16kHz 桌面听写；VoxType 本地 sherpa-onnx 路径完全无热词。
+   我们 A 线的独有难题它们给不了直接答案，但**工程护栏层高度可搬**。
+
+### 25.1 四仓一表
+
+| 仓 | 形态 | ASR | 「模式」 | 纠错架构 |
+|---|---|---|---|---|
+| type4me | macOS 听写 App（Swift） | 本地双引擎（SenseVoice 流式 partial + Qwen3-ASR 终稿）+15 云 | **8 默认模式**：快速（零 LLM）/智能感知（主力）/翻译/随便问/Mac 操作/语音润色/Prompt 优化/任务委派 + 自定义模板（`{text}/{selected}/{clipboard}`） | LLM 只润色不还原；**OutputGuard 硬护栏，拒绝即回退 ASR 原文**；词表=热词喂 ASR + **snippet 后置正则**（不进 LLM prompt） |
+| vocab-skill | type4me 配套 Claude Skill | — | — | 「某词识别错了」→ agent 推断 3-8 个 ASR 错形变体 → snippet(错→对) + 热词(有准入判据) → 热加载 |
+| VoxType | Windows 听写（C++/sherpa-onnx） | 本地 FireRed/SenseVoice + 6 云 | 无模式（标点三态=纠错开关） | LLM 校正**默认关**、失败回退原文、roadmap 自陈约束（change ratio/数字保护）；作者原话「标点模型改不了 ASR 错字」 |
+| akang | macOS+Win 听写 | 纯云 omni 单会话（qwen3.5-omni-flash） | 5 写作风格 profile + 语言偏好 | 方言→书面普通话归一；**词典真双轨**（FunASR vocabulary weight:4 + prompt 词典段 100 条上限带「不得改变原意」护栏）；`[EMPTY]` 哨兵 |
+
+### 25.2 外部佐证：我们的四个定案被三个独立项目复现
+
+| 我们的定案 | 外部对照 |
+|---|---|
+| LLM 不做「还原原话」主力（V-3.3/V-7/V-3.2 三连否决） | VoxType 作者同款结论；type4me 拒绝即回退原文、v2.9.0 删除 partial 上的投机 LLM 调用（=我们 `PREEMPTIVE_GENERATION=0`） |
+| 热词边际归零、不该继续堆 | type4me 热词准入白名单（自造词/新词下移 snippet 轨）；VoxType 本地路径干脆无热词 |
+| 低置信→显式澄清（V-5/R1） | akang `[EMPTY]` 哨兵（无法确认语义→不出稿）；type4me Guard 三态（accept/warn/reject） |
+| 词表不进 LLM prompt（type4me 明确不注入） | 与我们 B 线「术语进 MT prompt」是**相反取舍**——留作 A/B 试验项（25.4-E5），不是照搬 |
+
+### 25.3 新增执行项（并入 P1-P3）
+
+**E1（P1 新增，最高价值）snippet 后置正则轨——A 线**。位置=ASR final 之后、意图判定/QA
+匹配之前；语义照 type4me：trigger 去空白后插 `\s*`、仅 ASCII 词边界、caseInsensitive、
+用户条目覆盖内置。**为什么它是对「热词不够」的正确补位**：硬混淆（嬲/賠償/單號/倉类）
+的错形是**有限且重复的**——词级替换零 LLM、零信息销毁，比 QA 整句字面匹配粒度细、
+比 LLM 校正可靠；热词（bias）救不了的词，snippet（确定性替换）救得了。词表来源=
+L-① 漏网轮挖掘 + 人工确认（勿自动写全局）。验收：`probe_hotword_ab` 硬混淆句集 +
+snippet 轨 A/B；改 ASR/意图链后跑 `e2e_edge_cases`。
+
+**E2（P4→提前）热词准入与泄漏加固**。准入白名单（模型词表内/品牌/术语才进热词，
+其余下移 snippet）；**Qwen3 热词泄漏清洗器**（type4me `Qwen3HotwordLeakSanitizer`
+现成设计：剥 `Vocabulary:/词汇：` 标签+最长连续热词前缀，命中 ≥2 热词或标签即判泄漏、
+用 fallback）——我们已知该现象（AGENTS.md 记载极低内容音频会抄词表），现给防线加
+确定性判据。验收：静音探针复测（`probe_fast_speech` 同款刺激）。
+
+**E3（P1 新增）OutputGuard 确定性后验**。对意图判定结果/QA 候选/垫话触发前文本做
+后置断言：数字/日期/金额/单号 token 不得被改写、语义否定计数不减、语言不漂移；
+拒绝→**回退原文语义照走**（不销毁信息，与我们「宁可退原文」原则同源）。
+实现可挂在 QA 快路匹配前与意图判定后两个点。验收：单测（对照 type4me 硬拒绝清单
+逐条）+ offscript soak 无回归。
+
+**E4（P1 新增）改口检测规则进话术 verdict**。显式改口标记（不对/算了/改成/应该是/
+i mean/sorry）=高置信改口，区间后 token 为准；**「不是 A，是 B」裸对比不当改口**
+（除非有显式证据）；「不要改成 X」是真否定必须保留。直接映射到
+`FlowController` 的 CONFIRM/UNCLEAR 判定与 WA 累积轮。验收：`test_flow_controller.py`
+新增判例。
+
+**E5（P3 新增）B 线术语双轨 A/B**。臂 A=现状（术语进 ASR 热词+MT prompt 槽）；
+臂 B=type4me 形态（术语在 MT **前**做正则归一，MT prompt 保持纯净）。判据=
+`probe_interpret_latency` 延迟 + 术语命中率。附带搬 akang 的**读音提示字段**
+（term/pronunciation/replacement 三元组）进术语表 schema。
+
+**E6（P3 新增）词条沉淀闭环门槛**（type4me 参数直接可抄）：≥3 独立会话、跨 ≥2 自然日、
+同向占比 >80%、无等强冲突、每条记录最多贡献一次、90 天半衰期；状态机
+pending/accepted/ignored/conflicted/stale；**批量建议永不自动写全局词表**——
+与 L-① adopt 的人工确认原则一致，补上统计学门槛。
+
+### 25.4 对「最终要准确知道用户要表达什么」的校准（用户论点）
+
+**对，但准确度的靶子是「意图级」，不是「逐字级」**——四仓加我们自己的三次实测，
+五方一致：
+
+- **逐字还原**：已被我们的 V-3.3/V-7/V-3.2 与 VoxType 作者结论（标点模型改不了 ASR
+  错字）、type4me 的 Guard-回退设计共同否决。信息销毁处无解。
+- **意图级准确**的可行链条（投资顺序）：语言钉定 hint（已上线）→ 热词（边际已尽，
+  停止加码）→ **E1 snippet 词级修正（新，主力补位）** → QA 词条字面覆盖（L-① 挖掘，
+  E6 门槛）→ margin 低置信澄清（§23.5 已定规格）→ 垫话兜底。意图识别选对 QA/垫音，
+  受上游文本质量支配——所以钱花在出稿质量与词条覆盖上，判定层按 §23.5 已定稿的
+  规格（选项合并+softmax 口径+真实集阈值）执行即可。
+
+### 25.5 不搬清单（明确记录，防后人重查）
+
+- 电话信道（8kHz/双讲/AEC/PSTN）：四仓零覆盖，无参考。
+- 本地 ASR 热词 context bias 参考实现：VoxType 本地无热词、type4me 热词进
+  Python sidecar 的 `context=`（与我们同款）；无新东西。
+- 命令模式/意图路由：akang 主动禁止执行命令；无对应实现。我们的 FlowController
+  仍是自研独有层。
