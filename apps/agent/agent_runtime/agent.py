@@ -7,6 +7,9 @@ import re
 import time
 from typing import Optional
 
+# DeepSeek 端点的思考开关契约(判据/意图判据换云时缺省关思考,否则小 max_tokens
+# 预算被 reasoning 烧光、正文出空串=判据静默全 miss;理由与实测见该模块 docstring)
+from bok_voice_core.deepseek_llm import thinking_extra_body
 from bok_voice_core.flow_graph import (
     ACTION_NOTIFY_HUMAN,
     ACTION_PLAY_QA,
@@ -239,7 +242,11 @@ async def _llm_judge(
 
     `api_key` 缺省 `"mlx"`＝本地 mlx_lm server 不校验凭据（既有行为零变化）；判据走
     云端（`FLOW_JUDGE_LLM_API_KEY`）时由调用点传入——云端判定同时解掉「9B 占本地 GPU
-    抢 4B prefill」与「9B 常驻显存」两笔账（2026-09-22 probe_gpu_contention 实测 +1375ms）。
+    抢 4B prefill」与「9B 常驻显存」两笔账（2026-09-21 probe_gpu_contention 实测 +1375ms）。
+
+    端点换云（DeepSeek）时附「缺省关思考」：判据 max_tokens 只有 8-32，思考会把预算
+    整段烧在 reasoning 上、正文出空串——本判据换云首轮就是这么**静默全 miss** 的
+    （6/6 `unclear conf=0.00`）。非 DeepSeek 端点该字段为空 dict，本地 MLX 零变化。
     """
     if not base_url or not model:
         return ""
@@ -254,6 +261,9 @@ async def _llm_judge(
             messages=messages,
             max_tokens=max_tokens,
             temperature=0,
+            extra_body=thinking_extra_body(
+                base_url, os.environ.get("FLOW_JUDGE_LLM_THINKING", "")
+            ),
             # 本地 MLX 對話模板會 append <|im_end|>,停喺呢度,回應淨係 verdict 字。
             stop=["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
         )
@@ -3725,6 +3735,8 @@ async def entrypoint(ctx):
                 build_judge_messages,
                 degrade_boost,
                 FOLLOWUP_CONF_MIN,
+                JUDGE_MAX_TOKENS,
+                JUDGE_ROUTE_MAX_TOKENS,
                 parse_judge_output,
                 parse_judge_route,
             )
@@ -3761,7 +3773,13 @@ async def entrypoint(ctx):
                 route_enabled=route_enabled,
             )
             _raw = await _llm_judge(
-                jbase, jmodel, msgs, api_key=os.environ.get("FLOW_JUDGE_LLM_API_KEY", "mlx")
+                jbase,
+                jmodel,
+                msgs,
+                # route 模式契约是两行（verdict + route/conf），8 token 只够第一行加半个
+                # route 行——conf 结构性解析不出来，建单闸恒不触发（见 flow.py 常量注释）。
+                max_tokens=JUDGE_ROUTE_MAX_TOKENS if route_enabled else JUDGE_MAX_TOKENS,
+                api_key=os.environ.get("FLOW_JUDGE_LLM_API_KEY", "mlx"),
             )
             jv = parse_judge_output(_raw)
             if route_enabled:

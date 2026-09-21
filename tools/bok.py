@@ -1414,6 +1414,11 @@ _FORWARD_ENV = (
     "DEEPSEEK_BASE_URL",
     "DEEPSEEK_MODEL",
     "DEEPSEEK_API_KEY",
+    # DeepSeek 思考档位：官方默认 enabled，而我们的 max_tokens 都很小（对话 160 /
+    # 判据 8-32）——思考会把预算烧光、正文出空串（通话侧=静默哑火）。故 DeepSeek
+    # 端点缺省关思考（契约见 bok_voice_core.deepseek_llm），这两枚是显式开/覆盖口。
+    "DEEPSEEK_THINKING",
+    "FLOW_JUDGE_LLM_THINKING",
     # —— 轮次/打断/心跳 ——
     "TURN_DETECTION",
     "ENDPOINT_MIN_DELAY",

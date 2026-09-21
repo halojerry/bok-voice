@@ -3147,3 +3147,95 @@ partial 与句级提交点位移 → 读数位移。**这不是 agent 变慢/变
 **代码面（本轮落地，默认零变化）**：`_llm_judge` 加 `api_key` 参数（缺省 `"mlx"`＝本地不校验凭据，逐字节同旧），
 两个判据调用点读 `FLOW_JUDGE_LLM_API_KEY`；该 env 已按立法进 `_FORWARD_ENV`。
 **key 只走 env，不落任何文件、不入库。**
+
+> **本条 ①（云端判据 conf 恒 0.00）已被 §39 推翻**：那与云无关，是本机也一直在犯的
+> **token 预算截断**——而且它让漏斗 v2 的建单动作**在生产里从未触发过**。详见 §39。
+
+---
+
+## 39. 查官方文档之后的收口（2026-09-21）：DeepSeek 思考开关的官方姿势 + **本机 judge 预算截断**（建单从未触发）
+
+用户点了一句：「沉淀、纪要这些是要思考的因为不是实时，但对话 llm 可以关闭思考」——并且要求
+**先查官方文档**再动。以下是查证 → 实测 → 落地的完整链，以及查文档过程中**撞出来的一条生产缺陷**。
+
+### 39.1 官方事实（api-docs.deepseek.com，2026-09-21 查证）
+
+- **`thinking` 是 `/chat/completions` 的请求体字段**：`{"type": "enabled"|"disabled"}`，**默认 `enabled`**；
+  用 OpenAI SDK 时**必须放进 `extra_body`**（SDK 不认识该字段，直接传会丢）。
+- **`reasoning_effort` 是同一开关的另一入口**：`none`=关，`low`/`high`/`max`=开（默认 `high`）。
+- **模型名**：`deepseek-flash` / `deepseek-v4-pro`（实测 `GET /models` 只有这两个）；
+  旧名 `deepseek-chat` / `deepseek-reasoner` **2026-07-24 停用**，过渡期分别指向
+  `deepseek-v4-flash` 的非思考 / 思考模式——**我们代码里 `deepseek-chat` 是缺省名，等于押在一个已宣判的名字上**。
+- **磁盘前缀缓存自动生效**，无需改代码；但只有**从第 0 个 token 起严格前缀**才算命中
+  （中间部分匹配不算）——**这正是我们 A 线「静态前缀 + 跨轮纯追加」的形状**。
+  `usage.prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` 可读，命中断价与未命中差一个数量级。
+
+### 39.2 实测：关思考是**正确性**问题，不只是速度问题
+
+`scripts/probe_deepseek_thinking.py`（真 API，key 只走 env）——每模型三态：
+
+| 模型 / 档位 | 首个内容 token | content | reasoning_tokens |
+|---|---|---|---|
+| `deepseek-flash` **thinking=disabled** | **703ms** | 18 字 ✅ | 0 |
+| `deepseek-flash` 默认（思考开） | 无 | **空串** ❌ | 300（=预算全烧） |
+| `deepseek-flash` 显式 enabled | 无 | **空串** ❌ | 300 |
+| `deepseek-v4-pro` thinking=disabled | **915ms** | 13 字 ✅ | 0 |
+| `deepseek-v4-pro` 默认 | 3112ms | 25 字 | 195 |
+
+**通话侧端到端反证**（走真 `DeepSeekLLM` provider、真 `LLM_MAX_TOKENS=160`）：
+`deepseek-chat` ✅46 字 / `deepseek-flash` 缺省关思考 ✅222 字 / **`deepseek-flash` + `DEEPSEEK_THINKING=enabled` → `empty reply`**。
+即：**思考开 + 我们的小预算 = 静默哑火**，且 `finish_reason` 照常正常（上游看不出错）。
+
+**前缀缓存实测**：同前缀连打两发 → 第 1 发 `hit=0/miss=2418`，第 2 发 **`hit=2176/2418 = 90.0%`**。
+结论：官方磁盘缓存对我们的请求形状**天然生效**，无需任何代码——这也是换云的另一个隐性收益。
+
+### 39.3 撞出来的缺陷：judge 的 **8 token 预算**截断了 route 契约 → 建单从未触发
+
+查「云端 conf 为什么恒 0.00」（§38.6 的待查点 ①）时，用**真 judge messages** 打三个后端，
+结论是**与云无关**：
+
+| 后端 | `max_tokens=8`（当时的生产值） | `max_tokens=24` |
+|---|---|---|
+| 本机 9B（:1237） | `'stay\nroute=register_followup conf'` → conf **0.00** | `conf=0.8` |
+| `deepseek-flash` | `'stay\nroute=register_followup'` → conf **0.00** | `conf=0.8` |
+| `deepseek-v4-pro` | `'stay\nroute=register_followup'` → conf **0.00** | `conf=0.8` |
+
+route 模式（`BOK_ROUTE_JUDGE`，**缺省就是 `"1"`**）的输出契约是**两行**：
+`advance/stay/objection` + `route=X conf=0.0~1.0`；而 `_llm_judge` 的缺省预算是 **8**，
+route 调用点又没放宽——8 token 只够第一行加半个 route 行，**三后端一律截在 `conf` 之前**。
+
+链路后果（全部是静默的）：`conf` 解析不出 → 保守返 `0.0`（2026-09-20 的加固**本身是对的**）
+→ `conf < FOLLOWUP_CONF_MIN(0.7)` **恒成立** → **`register_followup` 建单动作在生产里从未触发过**；
+`degrade_boost` 的置信信号同时全丢。日志里 `route=register_followup` 照常打印，所以从观测面看不出异常。
+
+**为什么既有测试没抓到**：`tests/test_judge_route.py` 全部把**完整字符串**喂给解析器
+（`"stay route=register_followup conf=0.8"`）——测的是解析器那一侧，没人问「运行时模型真会吐出这一行吗」。
+缝到线的距离没人量。
+
+**修法与代价**：`flow.JUDGE_MAX_TOKENS=8` / `JUDGE_ROUTE_MAX_TOKENS=24`（常量注释记实测），
+route 调用点按 `route_enabled` 选档。本机 9B 代价实测 **369ms → 494ms（中位，+125ms）**，
+且这是后台 fire-and-forget 任务——可忽略。新回归 `tests/test_judge_token_budget.py`（5 条）把
+「截断面 → conf 0.00 → 过不了闸」这条链固化成证据，并结构化锚住调用点的选档。
+
+### 39.4 本轮落地的代码面
+
+| 面 | 改动 | 缺省行为 |
+|---|---|---|
+| 契约单点 | 新 `bok_voice_core/deepseek_llm.py`：`is_deepseek_endpoint` + `thinking_extra_body`（纯函数，零 I/O 零 env） | 非 DeepSeek 端点返 `{}` |
+| 对话 LLM | `DeepSeekLLM` 接 `thinking` 参数 + `DEEPSEEK_THINKING` 覆盖口；缺省名 `deepseek-chat` → **`deepseek-flash`** | DeepSeek 端点**缺省关思考** |
+| 判据 | `_llm_judge` 附 `extra_body`；覆盖口 `FLOW_JUDGE_LLM_THINKING` | 同上 |
+| 沉淀/纪要 | `summarize` 显式 `thinking=enabled`，**并把预算 512→2048**（思考与正文共用预算，512 不够会整段烧在 reasoning 上 → 静默退 `_fallback`） | 本地端点 payload 逐字节同旧 |
+| env 立法 | `DEEPSEEK_THINKING` / `FLOW_JUDGE_LLM_THINKING` 进 `_FORWARD_ENV` | — |
+
+用户口径落地成的不对称：**对话/判据关思考换延迟，沉淀/纪要保持思考开**（非实时，质量优先）。
+
+**验证层级**：全量 pytest 绿（2470 passed）＋ compileall 绿 ＋ 三后端真 API 实测。
+**没跑真通话**（判据 conf 走到建单闸的那一步需要真通话投诉轮 + `BOK_TOOLS_FOLLOWUP`）——
+调用点的选档是**结构化锚**而非行为验证，如实记在这里。
+
+### 39.5 对 P1（主回复换云）的影响
+
+原来说「主回复换云需要 provider 先支持 thinking 开关」——**现已支持且缺省就是对的档位**，
+`DeepSeekLLM` 现在可以直接上主回复（`llm.provider=deepseek` + `DEEPSEEK_MODEL=deepseek-flash`）。
+剩下的**唯一**前置仍是那个产品决策：**通话内容离开本机**（隐私口径），这不是工程问题。
+另外把「本地 4B 兜底链」想清楚再切——云端 4xx/超时会走 provider 的 fallback 路径。

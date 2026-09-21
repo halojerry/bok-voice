@@ -11,6 +11,7 @@ import httpx
 # （``_render_transcript``），落盘的 ``transcript.md`` 原件（main._write_settlement_docs）
 # 逐字不碰——那是原始证据面。kill-switch ``BOK_POLISH_OFFLINE`` 默认关（见
 # ``polish_wiring`` 模块 docstring 的实测理由）。
+from bok_voice_core.deepseek_llm import thinking_extra_body
 from bok_voice_core.polish_wiring import polish_offline_text
 
 
@@ -96,6 +97,15 @@ class Summarizer:
             "temperature": 0.2,
             "stream": False,
         }
+        # 沉淀/纪要是**非实时**后台重活：思考开着更准（2026-09-21 口径——对话侧关思考
+        # 换首字延迟，纪要侧不动它）。但思考与正文**共用** max_tokens 预算，512 不够时
+        # 会整段烧在 reasoning 上、content 出空串，而这里落地是静默 ``_fallback``
+        # （指标摘要，质量无声降级）——故思考档下把预算抬到容得下「思考 + JSON 正文」。
+        # 本地 MLX 端点该片段为空 dict，payload 逐字节同旧。
+        thinking_body = thinking_extra_body(base_url, "enabled")
+        if thinking_body:
+            payload.update(thinking_body)
+            payload["max_tokens"] = 2048
         r = httpx.post(f"{base_url}/chat/completions", json=payload, timeout=self.timeout)
         r.raise_for_status()
         content = r.json()["choices"][0]["message"].get("content", "")
