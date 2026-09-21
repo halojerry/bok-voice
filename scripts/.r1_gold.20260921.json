@@ -1,0 +1,1066 @@
+[
+ {
+  "src": "G",
+  "txt": "拼多多。",
+  "gold": "其他",
+  "step": 3,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "啊，我不记得了。",
+  "gold": "其他",
+  "step": 3,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "Because.",
+  "gold": "其他",
+  "step": 5,
+  "lang": "en"
+ },
+ {
+  "src": "G",
+  "txt": "But I mean, I but.",
+  "gold": "其他",
+  "step": 5,
+  "lang": "en"
+ },
+ {
+  "src": "G",
+  "txt": "Do you speak English?",
+  "gold": "其他",
+  "step": 2,
+  "lang": "en"
+ },
+ {
+  "src": "G",
+  "txt": "Ebay.",
+  "gold": "其他",
+  "step": 3,
+  "lang": "en"
+ },
+ {
+  "src": "G",
+  "txt": "Hello.",
+  "gold": "其他",
+  "step": 2,
+  "lang": "en"
+ },
+ {
+  "src": "G",
+  "txt": "My God, what's it going on?",
+  "gold": "其他",
+  "step": 3,
+  "lang": "en"
+ },
+ {
+  "src": "G",
+  "txt": "Not so sure.",
+  "gold": "其他",
+  "step": 4,
+  "lang": "en"
+ },
+ {
+  "src": "G",
+  "txt": "Okay.",
+  "gold": "其他",
+  "step": 4,
+  "lang": "en"
+ },
+ {
+  "src": "G",
+  "txt": "Seven five one, two two zero.",
+  "gold": "其他",
+  "step": 5,
+  "lang": "en"
+ },
+ {
+  "src": "G",
+  "txt": "Yeah.",
+  "gold": "其他",
+  "step": 5,
+  "lang": "en"
+ },
+ {
+  "src": "G",
+  "txt": "Yeah, hello.",
+  "gold": "其他",
+  "step": 2,
+  "lang": "en"
+ },
+ {
+  "src": "G",
+  "txt": "Yeah, of course.",
+  "gold": "其他",
+  "step": 5,
+  "lang": "en"
+ },
+ {
+  "src": "G",
+  "txt": "Yeah, of course. Should I hold up or I just over the phone and then someone will add my WhatsApp?",
+  "gold": "其他",
+  "step": 5,
+  "lang": "en"
+ },
+ {
+  "src": "G",
+  "txt": "hello。",
+  "gold": "其他",
+  "step": 2,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "什么东西？你说什么东西？",
+  "gold": "其他",
+  "step": 2,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "什么？什么货？",
+  "gold": "查件去向",
+  "step": 2,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "什么包裹？我。",
+  "gold": "查件去向",
+  "step": 2,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "什么？快递。",
+  "gold": "其他",
+  "step": 2,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "什么快递？呀～",
+  "gold": "查件去向",
+  "step": 1,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "何快递啊？啊！",
+  "gold": "其他",
+  "step": 1,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "你们是怎么赔偿方式啊？",
+  "gold": "问赔偿金额",
+  "step": 5,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "即系收。",
+  "gold": "其他",
+  "step": 4,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "呃呃呃呃",
+  "gold": "其他",
+  "step": 3,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "呃，我不记。记得啦。",
+  "gold": "其他",
+  "step": 2,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "呃，我好像没有。下单。",
+  "gold": "其他",
+  "step": 2,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "呃，我要回复什么？我。名字。",
+  "gold": "其他",
+  "step": 7,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "呃，自然多了",
+  "gold": "其他",
+  "step": 5,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "咩貨？好啊。",
+  "gold": "查件去向",
+  "step": 3,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "哦，你要怎么赔给我啊？",
+  "gold": "问赔偿金额",
+  "step": 3,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "哦，有时间。",
+  "gold": "其他",
+  "step": 5,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "啊，不记得。了。",
+  "gold": "其他",
+  "step": 3,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "啊，两百块。",
+  "gold": "其他",
+  "step": 4,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "啊，你可以说。说。",
+  "gold": "其他",
+  "step": 4,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "啊，可以接受。",
+  "gold": "其他",
+  "step": 5,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "啊。可以的。",
+  "gold": "其他",
+  "step": 5,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "啊，可以的。没问题。",
+  "gold": "其他",
+  "step": 4,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "啊嗯。点样安排？",
+  "gold": "其他",
+  "step": 2,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "啊，好啊。啊！",
+  "gold": "其他",
+  "step": 2,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "啊，对对对。",
+  "gold": "其他",
+  "step": 6,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "啊。怎么赔？",
+  "gold": "问赔偿金额",
+  "step": 2,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "啊，拼多多。",
+  "gold": "其他",
+  "step": 4,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "啊，有时间。",
+  "gold": "其他",
+  "step": 5,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "啊，没。咩号啊？",
+  "gold": "其他",
+  "step": 2,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "喂喂喂！",
+  "gold": "其他",
+  "step": 2,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "嗯，不记。就啦。",
+  "gold": "其他",
+  "step": 2,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "嗯嗯，好的，没问题。",
+  "gold": "其他",
+  "step": 6,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "嗯，好，嗯，好的。",
+  "gold": "其他",
+  "step": 7,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "嗯，好。好的。",
+  "gold": "其他",
+  "step": 5,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "嗯，好的，好的，那你加我吧。",
+  "gold": "其他",
+  "step": 7,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "嗯，好的，没问题。",
+  "gold": "其他",
+  "step": 5,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "嗯，对，这好像是我的快递。",
+  "gold": "其他",
+  "step": 2,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "好像拼多多有买过。顺豐速運，運通，理賠，京東，拼多多，單號，運單，賠償，運費，專員，集運，時效，上門，追蹤，核實，微信，顺丰物流。",
+  "gold": "其他",
+  "step": 5,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "好像是拼多多。",
+  "gold": "其他",
+  "step": 3,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "安排。系咪啊？",
+  "gold": "其他",
+  "step": 3,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "对。拼多多。",
+  "gold": "其他",
+  "step": 4,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "应该没有买。吧。",
+  "gold": "其他",
+  "step": 3,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "得了，我应该没有。购买吧。",
+  "gold": "其他",
+  "step": 2,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "忘记掉了。啊！",
+  "gold": "其他",
+  "step": 2,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "我不记得买什么货品呢。",
+  "gold": "其他",
+  "step": 3,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "我不记得了。啊。",
+  "gold": "其他",
+  "step": 2,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "我听到你说话了。",
+  "gold": "其他",
+  "step": 5,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "我喺WhatsApp。你够。",
+  "gold": "其他",
+  "step": 4,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "我要怎么截图发给你？",
+  "gold": "其他",
+  "step": 3,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "拼多多。我。",
+  "gold": "其他",
+  "step": 4,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "拼多多。顺豐速運，運通，理賠，京東，拼多多，單號，運單，賠償，運費，專員，集運，時效，上門，追蹤，核實，微信，顺丰物流。",
+  "gold": "其他",
+  "step": 3,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "拼拼多。多多。",
+  "gold": "其他",
+  "step": 3,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "是什么货？哇！",
+  "gold": "查件去向",
+  "step": 4,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "是什么货啊？",
+  "gold": "查件去向",
+  "step": 2,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "是什么货啊？啊。",
+  "gold": "查件去向",
+  "step": 2,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "要怎么赔偿？啊！",
+  "gold": "问赔偿金额",
+  "step": 3,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "记得了。顺豐速運，運通，理賠，京東，拼多多，單號，運單，賠償，運費，專員，集運，時效，上門，追蹤，核實，微信，顺丰物流。",
+  "gold": "其他",
+  "step": 2,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "赔多少钱？",
+  "gold": "问赔偿金额",
+  "step": 5,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "那你要怎么赔给我呢？",
+  "gold": "问赔偿金额",
+  "step": 4,
+  "lang": "cantonese"
+ },
+ {
+  "src": "G",
+  "txt": "那我查一下。下先。",
+  "gold": "其他",
+  "step": 3,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "那是什么标？标准呢？",
+  "gold": "其他",
+  "step": 6,
+  "lang": "zh"
+ },
+ {
+  "src": "G",
+  "txt": "都咩好啊？",
+  "gold": "其他",
+  "step": 2,
+  "lang": "cantonese"
+ },
+ {
+  "src": "T",
+  "txt": "Who are you?",
+  "gold": "诈骗质疑",
+  "step": 2,
+  "lang": "en"
+ },
+ {
+  "src": "T",
+  "txt": "Hello, hello, hello. Can you hear me talking?",
+  "gold": "其他",
+  "step": 2,
+  "lang": "en"
+ },
+ {
+  "src": "T",
+  "txt": "Wait. Wait.",
+  "gold": "其他",
+  "step": 2,
+  "lang": "en"
+ },
+ {
+  "src": "T",
+  "txt": "诶，好的，那你要怎么赔给我？",
+  "gold": "问赔偿金额",
+  "step": 3,
+  "lang": "cantonese"
+ },
+ {
+  "src": "T",
+  "txt": "啊啊对。",
+  "gold": "其他",
+  "step": 3,
+  "lang": "cantonese"
+ },
+ {
+  "src": "T",
+  "txt": "呃，我的微信是一二二三三四四五。",
+  "gold": "其他",
+  "step": 2,
+  "lang": "cantonese"
+ },
+ {
+  "src": "T",
+  "txt": "诶。呃，你好。",
+  "gold": "其他",
+  "step": 2,
+  "lang": "cantonese"
+ },
+ {
+  "src": "T",
+  "txt": "好好的，再见。",
+  "gold": "拒绝继续",
+  "step": 3,
+  "lang": "zh"
+ },
+ {
+  "src": "T",
+  "txt": "六六四三二零一一一。",
+  "gold": "其他",
+  "step": 3,
+  "lang": "zh"
+ },
+ {
+  "src": "T",
+  "txt": "啊，原来还跟我填哈先，喂六四三二零一一一。",
+  "gold": "其他",
+  "step": 1,
+  "lang": "zh"
+ },
+ {
+  "src": "T",
+  "txt": "喂，六四三二零一一一。",
+  "gold": "其他",
+  "step": 2,
+  "lang": "zh"
+ },
+ {
+  "src": "T",
+  "txt": "原来系咁，我听下先。",
+  "gold": "其他",
+  "step": 1,
+  "lang": "zh"
+ },
+ {
+  "src": "T",
+  "txt": "好的，好的，再见。",
+  "gold": "拒绝继续",
+  "step": 3,
+  "lang": "zh"
+ },
+ {
+  "src": "T",
+  "txt": "四三二零。一，一，一。",
+  "gold": "其他",
+  "step": 2,
+  "lang": "zh"
+ },
+ {
+  "src": "T",
+  "txt": "一类黑梗，我听了些。",
+  "gold": "其他",
+  "step": 1,
+  "lang": "zh"
+ },
+ {
+  "src": "T",
+  "txt": "四三二零一一一。",
+  "gold": "其他",
+  "step": 2,
+  "lang": "zh"
+ },
+ {
+  "src": "T",
+  "txt": "原来黑梗，我听了些。",
+  "gold": "其他",
+  "step": 1,
+  "lang": "zh"
+ },
+ {
+  "src": "T",
+  "txt": "八六四三二零一一一。",
+  "gold": "其他",
+  "step": 2,
+  "lang": "zh"
+ },
+ {
+  "src": "T",
+  "txt": "原来黑稿，我听了些。",
+  "gold": "其他",
+  "step": 1,
+  "lang": "zh"
+ },
+ {
+  "src": "T",
+  "txt": "好的，好的。再见。",
+  "gold": "拒绝继续",
+  "step": 1,
+  "lang": "zh"
+ },
+ {
+  "src": "T",
+  "txt": "拼多多、京东下单。",
+  "gold": "其他",
+  "step": 1,
+  "lang": "zh"
+ },
+ {
+  "src": "T",
+  "txt": "Okay. Bye bye.",
+  "gold": "拒绝继续",
+  "step": 1,
+  "lang": "en"
+ },
+ {
+  "src": "T",
+  "txt": "Let me check that for you.",
+  "gold": "其他",
+  "step": 1,
+  "lang": "en"
+ },
+ {
+  "src": "T",
+  "txt": "好，好，改再见。",
+  "gold": "拒绝继续",
+  "step": 2,
+  "lang": "cantonese"
+ },
+ {
+  "src": "T",
+  "txt": "六四三二零一一一。",
+  "gold": "其他",
+  "step": 2,
+  "lang": "cantonese"
+ },
+ {
+  "src": "T",
+  "txt": "Google。惨不黑。",
+  "gold": "其他",
+  "step": 1,
+  "lang": "cantonese"
+ },
+ {
+  "src": "T",
+  "txt": "好的。再见。",
+  "gold": "拒绝继续",
+  "step": 2,
+  "lang": "zh"
+ },
+ {
+  "src": "T",
+  "txt": "的专员。",
+  "gold": "其他",
+  "step": 2,
+  "lang": "zh"
+ },
+ {
+  "src": "T",
+  "txt": "你好，我是快递公司。",
+  "gold": "其他",
+  "step": 1,
+  "lang": "zh"
+ },
+ {
+  "src": "T",
+  "txt": "我网上赔。",
+  "gold": "其他",
+  "step": 1,
+  "lang": "cantonese"
+ },
+ {
+  "src": "T",
+  "txt": "好，好改，再见。",
+  "gold": "拒绝继续",
+  "step": 2,
+  "lang": "cantonese"
+ },
+ {
+  "src": "T",
+  "txt": "我。单号。",
+  "gold": "其他",
+  "step": 1,
+  "lang": "cantonese"
+ },
+ {
+  "src": "T",
+  "txt": "司的专员。",
+  "gold": "其他",
+  "step": 2,
+  "lang": "zh"
+ },
+ {
+  "src": "T",
+  "txt": "我。惨唔系。",
+  "gold": "其他",
+  "step": 1,
+  "lang": "cantonese"
+ },
+ {
+  "src": "T",
+  "txt": "好，好改再见。",
+  "gold": "拒绝继续",
+  "step": 2,
+  "lang": "cantonese"
+ },
+ {
+  "src": "T",
+  "txt": "过往惨不黑。",
+  "gold": "其他",
+  "step": 1,
+  "lang": "cantonese"
+ },
+ {
+  "src": "T",
+  "txt": "好好，改再见。",
+  "gold": "拒绝继续",
+  "step": 2,
+  "lang": "cantonese"
+ },
+ {
+  "src": "T",
+  "txt": "我我。惨不黑。",
+  "gold": "其他",
+  "step": 1,
+  "lang": "cantonese"
+ },
+ {
+  "src": "T",
+  "txt": "侯侯凯，再见。",
+  "gold": "拒绝继续",
+  "step": 1,
+  "lang": "cantonese"
+ },
+ {
+  "src": "T",
+  "txt": "专员。单号。",
+  "gold": "其他",
+  "step": 1,
+  "lang": "zh"
+ },
+ {
+  "src": "T",
+  "txt": "Okay. Bye. Bye.",
+  "gold": "拒绝继续",
+  "step": 1,
+  "lang": "en"
+ },
+ {
+  "src": "T",
+  "txt": "单号。单号。",
+  "gold": "其他",
+  "step": 1,
+  "lang": "zh"
+ },
+ {
+  "src": "T",
+  "txt": "元。单号。",
+  "gold": "其他",
+  "step": 1,
+  "lang": "zh"
+ },
+ {
+  "src": "T",
+  "txt": "他的。再见。",
+  "gold": "拒绝继续",
+  "step": 1,
+  "lang": "zh"
+ },
+ {
+  "src": "T",
+  "txt": "你好，我是快递公司的专员。",
+  "gold": "其他",
+  "step": 1,
+  "lang": "zh"
+ },
+ {
+  "src": "T",
+  "txt": "好的，再见。",
+  "gold": "拒绝继续",
+  "step": 1,
+  "lang": "zh"
+ },
+ {
+  "src": "T",
+  "txt": "好好的再见。",
+  "gold": "拒绝继续",
+  "step": 1,
+  "lang": "cantonese"
+ },
+ {
+  "src": "T",
+  "txt": "好，好嘅，再见。",
+  "gold": "拒绝继续",
+  "step": 2,
+  "lang": "cantonese"
+ },
+ {
+  "src": "T",
+  "txt": "我WhatsApp佢。",
+  "gold": "其他",
+  "step": 1,
+  "lang": "cantonese"
+ },
+ {
+  "src": "T",
+  "txt": "喂，件貨到咗未呀？",
+  "gold": "查件去向",
+  "step": 2,
+  "lang": "?"
+ },
+ {
+  "src": "T",
+  "txt": "一加一等于几？",
+  "gold": "其他",
+  "step": 3,
+  "lang": "cantonese"
+ },
+ {
+  "src": "K",
+  "txt": "好的，淘宝拼。单号。",
+  "gold": "其他",
+  "step": 0,
+  "lang": "zh"
+ },
+ {
+  "src": "K",
+  "txt": "顺豐速運，運通，理賠，京東，拼多多，單號，運單，賠償，運費，專員，集運，時效，上門，追蹤，核實，微信，顺丰物流。",
+  "gold": "其他",
+  "step": 5,
+  "lang": "zh"
+ },
+ {
+  "src": "K",
+  "txt": "那要怎么赔给我呢？",
+  "gold": "问赔偿金额",
+  "step": 5,
+  "lang": "zh"
+ },
+ {
+  "src": "K",
+  "txt": "你单号可以。发我一下。",
+  "gold": "问能否查单号",
+  "step": 3,
+  "lang": "cantonese"
+ },
+ {
+  "src": "K",
+  "txt": "什么货啊？顺豐速運，運通，理賠，京東，拼多多，单号，运单，赔偿，运费，专员，集运，时效，上门，追踪，核实，微信，顺丰物流。",
+  "gold": "其他",
+  "step": 0,
+  "lang": "zh"
+ },
+ {
+  "src": "K",
+  "txt": "是批。單號。",
+  "gold": "其他",
+  "step": 0,
+  "lang": "cantonese"
+ },
+ {
+  "src": "K",
+  "txt": "單號，運單，賠償，運費，專員，集運，時效，上門，追蹤，核實，WhatsApp，微信，顺丰速递",
+  "gold": "其他",
+  "step": 0,
+  "lang": "cantonese"
+ },
+ {
+  "src": "K",
+  "txt": "个单号系三七七八几零，唔该帮我查下。",
+  "gold": "问能否查单号",
+  "step": 0,
+  "lang": "cantonese"
+ },
+ {
+  "src": "K",
+  "txt": "我个单号系三七七八九零，唔该帮我查下。",
+  "gold": "问能否查单号",
+  "step": 0,
+  "lang": "cantonese"
+ },
+ {
+  "src": "K",
+  "txt": "我个单号系三七七八九零，你快帮我查下。",
+  "gold": "问能否查单号",
+  "step": 0,
+  "lang": "cantonese"
+ },
+ {
+  "src": "K",
+  "txt": "單號，運單，賠償，運費，專員，集運，時效，上門，追蹤，核實，WhatsApp，微信。",
+  "gold": "其他",
+  "step": 0,
+  "lang": "cantonese"
+ },
+ {
+  "src": "K",
+  "txt": "个单号系三车车八九零，唔该帮我查下。",
+  "gold": "问能否查单号",
+  "step": 0,
+  "lang": "cantonese"
+ },
+ {
+  "src": "K",
+  "txt": "个单号系三七七八九零，唔该帮我查下。",
+  "gold": "问能否查单号",
+  "step": 0,
+  "lang": "cantonese"
+ },
+ {
+  "src": "K",
+  "txt": "以后会赔两倍，有冇得保障？",
+  "gold": "问赔偿金额",
+  "step": 0,
+  "lang": "?"
+ },
+ {
+  "src": "K",
+  "txt": "我嘅单号系新车车八九零，唔该帮我查下。",
+  "gold": "问能否查单号",
+  "step": 0,
+  "lang": "?"
+ },
+ {
+  "src": "K",
+  "txt": "可以赔两倍，有冇得保证？",
+  "gold": "问赔偿金额",
+  "step": 0,
+  "lang": "?"
+ },
+ {
+  "src": "K",
+  "txt": "得，好的，那你要怎么赔给？",
+  "gold": "问赔偿金额",
+  "step": 0,
+  "lang": "?"
+ },
+ {
+  "src": "K",
+  "txt": "點樣賠給我？",
+  "gold": "问赔偿金额",
+  "step": 0,
+  "lang": "?"
+ },
+ {
+  "src": "K",
+  "txt": "会点么赔？陪我呢？",
+  "gold": "其他",
+  "step": 0,
+  "lang": "?"
+ },
+ {
+  "src": "K",
+  "txt": "哦，可以啊，可以啊，那你赔给我。",
+  "gold": "问赔偿金额",
+  "step": 0,
+  "lang": "?"
+ },
+ {
+  "src": "K",
+  "txt": "嗯，对的，对的，这个单号怎么？",
+  "gold": "问能否查单号",
+  "step": 0,
+  "lang": "?"
+ },
+ {
+  "src": "K",
+  "txt": "你要怎么赔？",
+  "gold": "问赔偿金额",
+  "step": 0,
+  "lang": "?"
+ },
+ {
+  "src": "K",
+  "txt": "查下我账单，玛莎，你帮我退下。",
+  "gold": "其他",
+  "step": 0,
+  "lang": "?"
+ }
+]
