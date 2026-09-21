@@ -3060,4 +3060,3 @@ partial 与句级提交点位移 → 读数位移。**这不是 agent 变慢/变
   ⑤Guard 挂 snippet 应用点；⑥`branch-pregen` 键归属；⑦Linux 基线（押后）；
   ⑧**新增**：词表价值的真实人声口径统计（turns 转写碎裂率，别再用合成腿定案）；
   ⑨**新增（可选）**：B 线若要吃云话音，需先决定是否重渲染 `tests/fixtures/audio/*.wav`。
-
