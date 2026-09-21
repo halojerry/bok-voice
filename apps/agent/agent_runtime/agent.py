@@ -20,6 +20,14 @@ from bok_voice_core.intent_rules import eval_intent_rules
 from bok_voice_core.policies import ProviderRegistry, ProviderState, select_session_manifest
 from bok_voice_core.testdata import is_test_object_name as _is_test_object_name
 from bok_voice_core.types import CallMode
+# E1 snippet 后置轨 + E2 热词泄漏清洗(2026-09-21,A 线 ASR 终稿消费点):两个
+# 纯函数模块只出确定性文本处理(移植规格见 docs/superpowers/plans/2026-09-21-
+# a-line-speed-asr-decision-verification.md §26.2-E1/E2);装配编译/每轮消费/
+# kill-switch 的接线在 agent 侧(见 _asr_postprocess)。
+from bok_voice_core.hotword_leak import sanitize as _hotword_leak_sanitize
+from bok_voice_core.snippets import apply_snippets as _apply_snippet_rules
+from bok_voice_core.snippets import compile_rules_with_skipped as _compile_snippet_rules
+from bok_voice_core.snippets import merge_rules as _merge_snippet_rules
 
 from .plugins.context import ContextInjector
 from .plugins.knowledge import KnowledgePlugin
@@ -1262,6 +1270,7 @@ def _hotword_echo_guard_enabled() -> bool:
 # 幻听判定单一实现喺 livekit_plugins(STT 源头闸与 hook 双层共用,防漂移)。
 from .providers.livekit_plugins import _is_hotword_vocab_echo as _is_hotword_echo  # noqa: E402
 from .providers.livekit_plugins import _parse_vocab_terms, _strip_vocab_echo_tail, _vocab_echo_guard  # noqa: E402
+from .providers.livekit_plugins import strip_tail_anchor_text as _strip_tail_anchor_text  # noqa: E402
 
 
 def _is_echo_self_heard(user_text: str, last_reply: str, agent_speaking: bool) -> bool:
@@ -1289,6 +1298,77 @@ def _is_echo_self_heard(user_text: str, last_reply: str, agent_speaking: bool) -
 
 def _echo_guard_enabled() -> bool:
     return os.environ.get("QWEN3_ECHO_GUARD", "1") == "1"
+
+
+# ---- E1 snippet 后置轨 + E2 热词泄漏清洗(2026-09-21) ----
+# 落点=ASR 终稿消费点、所有下游消费者(WA 侦测/图意图/QA 快路/规则推进/落库)之前;
+# 顺序钉死:先 E2 剥热词 dump、后 E1 词级替换(E2 出空串即短路,不跑 E1)。
+# E1 词表(MVP)= 空 seed:内容待人工确认后由 snippets 候选清单灌入——功能随数据
+# opt-in(同 BOK_FLOW_GRAPH_JUDGE 先例:无数据=零调用零变化)。
+_SNIPPET_SEED: list[dict] = []
+
+
+def _snippets_enabled() -> bool:
+    """E1 snippet 轨 kill-switch(默认开;BOK_SNIPPETS=0 回退零替换)。"""
+    return os.environ.get("BOK_SNIPPETS", "1") == "1"
+
+
+def _hotword_leak_sanitize_enabled() -> bool:
+    """E2 热词泄漏清洗 kill-switch(默认开;BOK_HOTWORD_LEAK_SANITIZE=0 回退)。"""
+    return os.environ.get("BOK_HOTWORD_LEAK_SANITIZE", "1") == "1"
+
+
+def compile_snippet_rules(seed: list | None = None) -> list:
+    """装配期合并(单点)+守卫审计一次;返回交给每轮 apply 的合并规则 list。
+
+    ``merge_rules`` 是词表合并唯一入口(本批只喂 _SNIPPET_SEED);``compile_rules
+    _with_skipped`` 在这里跑一次拿守卫审计面(数字/空 trigger/长度铁律拦下的规则),
+    有 skipped 就打一条 ``SNIPPET skipped=<n> reasons=...``。每轮消费直接把返回值
+    交给 ``apply_snippets``(其内部按模块设计再编译一次——规则数极小,合并与守卫
+    审计的重活只在装配期做一遍)。
+    """
+    merged = _merge_snippet_rules(_SNIPPET_SEED if seed is None else seed)
+    report = _compile_snippet_rules(merged)
+    if report.skipped:
+        reasons = ",".join(sorted({s.reason for s in report.skipped}))
+        print(f"SNIPPET skipped={len(report.skipped)} reasons={reasons}", flush=True)
+    return merged
+
+
+def _asr_postprocess(
+    text: str,
+    *,
+    snippet_rules: list | None,
+    hotword_terms,
+    fallback_text: str = "",
+) -> tuple[str, str, list]:
+    """E2 泄漏清洗 → E1 snippet 替换(顺序钉死,接线唯一实现,单测直打)。
+
+    返回 ``(text, leak_state, applied)``:
+    - ``leak_state``: ``""`` 无变化 / ``"dropped"`` 整段丢弃(纯热词 dump=空转写)
+      / ``"trimmed"`` 剥掉热词 dump 保留真实内容;
+    - ``applied``: E1 命中的 ``(trigger, replacement)`` 列表(kill-switch 关/未命中=空)。
+
+    两轨 kill-switch 独立(E2=BOK_HOTWORD_LEAK_SANITIZE / E1=BOK_SNIPPETS);
+    ``hotwords`` 必须传当通 ``asr_hotword_context`` 的同一份 effective 词表,否则
+    「泄漏」判定与真实喂给 ASR 的偏置面对不上。``fallback_text`` 传本轮最后一条
+    partial/interim(agent 侧拿不到时传空串,见 hook 注释)。
+    """
+    out = str(text or "")
+    leak_state = ""
+    if _hotword_leak_sanitize_enabled() and hotword_terms:
+        cleaned = _hotword_leak_sanitize(out, list(hotword_terms), fallback_text=fallback_text)
+        if cleaned != out:
+            leak_state = "dropped" if not cleaned else "trimmed"
+            out = cleaned
+    if not out:
+        return out, leak_state, []
+    applied: list[tuple[str, str]] = []
+    if _snippets_enabled() and snippet_rules:
+        res = _apply_snippet_rules(out, snippet_rules)
+        out = res.text
+        applied = list(res.applied)
+    return out, leak_state, applied
 
 
 def _farewell_line(name: str, lang: str) -> str:
@@ -2489,6 +2569,11 @@ async def entrypoint(ctx):
     # 词表回声事件账本(call-1043de7c):确认过一次剥尾/纯回声后,后续「词表单词残片」
     # (回声衰落成只抄出词表首词「顺豐速運」)也按回声丢弃——首现孤词保留(真人可讲「微信」)。
     _vocab_echo_seen: dict = {"on": False}
+    # E1/E2 接线(2026-09-21):E2 清洗必须用**当通同一份 effective 热词**——直接反解
+    # 上面那份 asr_hotword_context 产物(即随 STT /api/start 下发 sidecar 的词表),
+    # 保证「泄漏」判定与真实喂给 ASR 的偏置面对齐。E1 词表在装配期合并编译一次。
+    _hotword_terms = _parse_vocab_terms(_hotword_ctx)
+    _snippet_merged = compile_snippet_rules()
     if use_fake or asr_provider_name in ("fake", "fake_stt"):
         stt_provider = FakeLiveKitSTT()
     else:
@@ -2747,6 +2832,11 @@ async def entrypoint(ctx):
         停摆——与直念族同一取舍,由新轮自身音频覆盖。"""
         _cancel_response_watchdog()  # 晚到补答即出声(勿让 4s 闸掐掉在途真答案)
         try:
+            # L2(2026-09-21,§20.5/§22):补答由 tee 直投,结构性绕过主回复流出口的
+            # _StripTailAnchorStream/_RepeatSelfGuardStream——投递点先把尾部锚拟声
+            # 复刻剥掉(实测念出「【你上一句】「…」);复读防线暂不套(句级比对成本
+            # 高,后续先加「补答与上一句相似度」打点观测再决定)。
+            text = _strip_tail_anchor_text(text)
             _turn_origin["gen"] = "script"
             _turn_origin["provider"] = "late-answer"
             await _say_script(session, tts_provider, _tts_cache, text)
@@ -3160,6 +3250,20 @@ async def entrypoint(ctx):
                     return
                 if _u_text != text:
                     text = _u_text
+            # E2/E1 同链复算(2026-09-21):钩子侧净化后的文本才是下游用的,落库面
+            # 必须同文本(听 A 记 B 禁令)——框架 item 未被改写,这里独立跑同一条
+            # _asr_postprocess(与 on_user_turn_completed 逐字节同源)。纯热词 dump
+            # 返回空=空转写,不落库(同纯回声 TURN_HIDDEN 姿势)。
+            _u_clean, _u_leak, _u_snip = _asr_postprocess(
+                text,
+                snippet_rules=_snippet_merged,
+                hotword_terms=_hotword_terms,
+                fallback_text="",
+            )
+            if not _u_clean:
+                print(f"ASR_LEAK_SANITIZE_TURN_HIDDEN (call {room_name})", flush=True)
+                return
+            text = _u_clean
             _spawn_report(
                 cp.add_turn(
                     call_id, role, _clean_transcript(text), latency_ms=0,
@@ -3859,6 +3963,43 @@ async def entrypoint(ctx):
                         new_message.text_content = _stripped
                     except Exception:  # pragma: no cover - 历史消息改写失败只损显示一致性
                         pass
+            # ---- E2 热词泄漏清洗 + E1 snippet 后置轨(2026-09-21) ----
+            # 本行之后才是全部下游消费者(WA 侦测/图意图/QA 快路/规则推进/静听/落库):
+            # 顺序先 E2 剥热词 dump、后 E1 词级替换,下游读到的恒为净化文本。
+            # 框架侧 transcript item 不改(livekit 1.8 的 text_content 是只读 property,
+            # 上方 _stripped 写回实为被 except 吞掉的 no-op)——落库面在
+            # _on_conversation_item 用同一条链(_asr_postprocess)独立复算,两边同文本
+            # (听 A 记 B 禁令)。
+            # fallback_text:agent 侧拿不到本轮最后一条 partial/interim(它在
+            # Qwen3ASRLiveSTT 内层识别流的 _last_partial 上、不对外暴露;agent 无
+            # user interim 事件钩子)——按设计传空串。
+            _clean_text, _leak_state, _snip_applied = _asr_postprocess(
+                user_text,
+                snippet_rules=_snippet_merged,
+                hotword_terms=_hotword_terms,
+                fallback_text="",
+            )
+            if _leak_state == "dropped":
+                # 纯热词 dump = 空转写:复用既有静音分支(同纯回声丢弃:撤看门狗
+                # + StopResponse),不新造静音语义;框架忽略本轮回复且不落库。
+                _cancel_response_watchdog()
+                print(f"ASR_LEAK_SANITIZE dropped (call {room_name})", flush=True)
+                raise StopResponse()
+            if _leak_state == "trimmed":
+                print(
+                    f"ASR_LEAK_SANITIZE trimmed (call {room_name}) "
+                    f"heard={user_text!r} keep={_clean_text!r}",
+                    flush=True,
+                )
+            if _snip_applied:
+                _triggers = ",".join(_t for _t, _ in _snip_applied)
+                print(
+                    f"SNIPPET applied={len(_snip_applied)} triggers={_triggers} "
+                    f"(call {room_name})",
+                    flush=True,
+                )
+            if _clean_text != user_text:
+                user_text = _clean_text
             # 垫话罐头匹配的口粮(2026-09-13 实机实证):旧版只在 has_steps 块内
             # 赋值 → 无模板通话(E2E 腿)last_user_text 恒空,匹配层饿死
             # (BOK_FILLER_MATCH miss best=0.00)。无条件赋值——纯字段,无模板零副作用。

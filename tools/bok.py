@@ -1242,6 +1242,10 @@ _FORWARD_ENV = (
     "QWEN3_ASR_STREAM",
     "QWEN3_ECHO_GUARD",
     "QWEN3_HOTWORD_ECHO_GUARD",
+    # —— ASR 终稿后置轨(2026-09-21 E1/E2 接线:先热词泄漏清洗、后 snippet 词级
+    #    替换;两枚 kill-switch 默认 "1",=0 各自回退零变化) ——
+    "BOK_HOTWORD_LEAK_SANITIZE",
+    "BOK_SNIPPETS",
     # —— 知识/检索/TTS 语言 ——
     "CONTEXT_RAG",
     "WEB_SEARCH",

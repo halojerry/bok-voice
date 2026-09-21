@@ -2055,3 +2055,60 @@ qa_cluster 簇不纯的主因之一）。验收：对 R1 真实集 152 条跑 dr
 E1/E2 同一落点接 agent 收到 ASR 终稿处（意图判定/QA 匹配前，词表=当通
 `asr_hotword_context` 同一份）；E4 接 `judge_confirm_advance_allowed` + WA 累积
 分支；snippet 词表的 CP 存储与运营面（账号级/模板级、L-① 挖掘对接）待设计。
+
+---
+
+## 28. 实施批次 2（2026-09-21）：接线 + 两条数据改判 + L2 落地
+
+三路并行（频次扫描/词表挖掘/接线）+ 集成期主会话亲手做共享文件项 L2。
+**两条数据结论直接改判了计划——先测再接的价值当场兑现。**
+
+### 28.1 E4 改口频次：**降级为观测项，本轮不接线**
+
+全库只读扫描（`scripts/e4_frequency_scan.py`，474 合规轮/82 通话）：显式改口
+**2 轮/2 通话**——轮级 0.42%、通话级 2.44%，且仅由 2 次命中撑起（离低档线只差
+0.44pct）；标记类型只有「不对」「i mean」各 1；**`span_after` 含 ASCII 数字 0/2——
+「客户改口后重报号码」在存量数据里零证据**（WA 接线的收益假设落空）。
+→ 判读：观测项。模块与 16 判例保留，接线等频次涨了再说。
+
+### 28.2 E1 词表候选：**语言分域是硬缺口；4B 变体召回不足**
+
+挖掘管线（`scripts/snippet_seed_mining.py`：4B 生成变体 → 真实语料实证回查 →
+反向安全检查 → 守卫过滤）产出 **candidates=1 / discarded=77**：
+- 唯一候选 `集運→集运`（evidence=9）自带语言歧义警告——4/9 次出现在 cantonese
+  通话，而**繁体在 cantonee 通话是正确输出**；
+- discarded 主因：no_evidence 38（4B 幻想、语料零出现）、identity 16、
+  malformed_variant 14、contains_canonical 8（顺丰系衍生串会命中正确文本）、
+  `快遞→快递` 因 2/2 出现在 cantonese 通话被 `lang_context_correct` 扔。
+- **定案：`SnippetRule` 需加 `lang` 字段（按通话语言分域）才能安全装载繁简修正**——
+  进下一批；变体生成换 9B（:1237）或人工整理（4B 召回不足是瓶颈）。候选清单
+  `scripts/.snippet_candidates.20260921.json` 留人工确认，**未装载**。
+
+### 28.3 E1/E2 接线落地（agent 主链路）
+
+- 落点：`on_user_turn_completed` 内、既有热词幻听守卫之后、`flow_ctrl.last_user_text`
+  与全部下游（WA/图意图/QA 快路/规则推进/落库）之前；顺序钉死 **E2 泄漏清洗→E1
+  snippet 替换**；纯热词 dump → 复用既有静音分支（撤看门狗+StopResponse，不造新语义）。
+- 词表：E2 用当通 `asr_hotword_context` 同一份 effective 词表（反解保留引用）；
+  E1 走 `_SNIPPET_SEED`（**空**，功能随数据 opt-in，同 `BOK_FLOW_GRAPH_JUDGE` 先例）。
+- kill-switch：`BOK_SNIPPETS` / `BOK_HOTWORD_LEAK_SANITIZE`（默认 "1"），均已登记
+  `tools/bok.py` `_FORWARD_ENV`（立法动作）。
+- 两个实现发现（入档）：①livekit 1.8 的 `ChatMessage.text_content` 是**只读
+  property**——钩子里既有的 `new_message.text_content = ...` 写回是被 except 吞掉的
+  no-op，故落库面（`_on_conversation_item`）用同一条 `_asr_postprocess` **独立复算**
+  保「听 A 记 A」；②agent 侧拿不到本轮最后一条 partial（`_last_partial` 在 STT 内层
+  不暴露）→ E2 的 fallback 恒空串，**单词泄漏护栏弱化**（标签/≥2 词照拦）——后续
+  给 STT 加 partial 暴露口再补。
+- 测试：`tests/test_snippet_leak_wiring.py` 17 项（双 kill-switch/空词表零变化/
+  dropped+trimmed/替换记账/数字逐字不动/结构锚/立法锚）。
+
+### 28.4 L2 晚到补答防线落地（集成期主会话亲手做）
+
+`livekit_plugins.strip_tail_anchor_text()`（首个 `_TAIL_ANCHOR_LABEL` 起截断，正文
+保留，None/空白安全）+ `_late_answer_say` 投递点在 `_say_script` 之前调用 +
+`tests/test_late_answer_anchor_strip.py` 9 判例（含「拆看门狗→剥锚→出声」顺序的
+结构锚）。复读防线（句级比对）不套，先加相似度打点观测（§22 L2 原案）。
+
+### 28.5 集成验证
+
+全量 pytest **2106 passed**（批次 2 净增 26 项）；compileall 过；术语门禁绿。

@@ -1106,6 +1106,21 @@ class _ExprPrependStream(llm.LLMStream):
 # 尾部重复锚的标签原文（render_context_tail 渲染,4B 会拟声复刻进输出）。
 _TAIL_ANCHOR_LABEL = "【你上一句】"
 
+
+def strip_tail_anchor_text(text: str) -> str:
+    """整段文本版的尾部锚剥离（L2,2026-09-21）。
+
+    ``_StripTailAnchorStream`` 是流式状态机,只罩「框架消费的主回复流」;晚到补答
+    （``late_answer_cb`` 直投,§20.5 实证把 ``【你上一句】「…`` 念出声）结构性绕过
+    它——这里给完整文本一条单点纯函数:从**首个**标签出现处截到结尾。锚块是框架
+    注入的尾部模板,模型输出里出现标签本身即拟声复刻,不存在「合法包含」场景,
+    故首标签即截断点;只剥尾部（标签前若有正文,正文保留）。
+    """
+    idx = str(text or "").find(_TAIL_ANCHOR_LABEL)
+    if idx < 0:
+        return str(text or "")
+    return str(text or "")[:idx].rstrip()
+
 # 单字数字(汉字+阿拉伯)之间的顿/逗号——剥离后连续读;「拼多多、淘宝」等
 # 普通列表不含数字字,不受影响。(2026-09-12「普通话念数字很奇怪」:4B 爱写
 # 「一、一、二、二」,每个顿号一次 TTS 停顿=机器人感;MiniMax 对阿拉伯数字串
