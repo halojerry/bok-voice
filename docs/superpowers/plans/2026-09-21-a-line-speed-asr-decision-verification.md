@@ -2939,7 +2939,21 @@ key 从设置库 `tts_json` 读（不落明文），**空音频会抛错**（不
 - **收尾告警**：多通 teardown 报 `Task was destroyed but it is pending!`（`_VADSt…` 等），
   现象级、未见影响；留观察位。
 
-### 36.5 验证与队列
+### 36.5 顺手修掉第二条 flaky 判例（CI 一红一绿，与本次改动无关）
+
+PR #140 的 CI 两跑一红一绿，失败是
+`test_sentence_commit.py::test_join_hold_flush_does_not_clobber_new_session`（只出一条 FINAL）。
+机制读码可判：该判例在 `_n==3` 用**墙钟** `sleep(hold + 0.05)`（≈90ms）等 flush 开火，CI 的
+2vCPU 慢机上 hold 定时器回调晚于这 90ms → 新 START 先到 → flush 被取消。
+**本机 24 并行轮复现不出**（这点如实记，不冒充已复现）。
+
+修法：加 `entered` 事件位（flush 进 `/api/finish` 即 set），`_n==3` 改为
+`wait_for(entered)`——新 START 只在 flush 确实停住后才到，**与判例原文描述同义**
+（「等 flush 开火并阻塞喺 `/api/finish`，然后续讲 START」），断言不放松。
+验证：该文件 54 passed；单判例 40 轮串行 0 失败。这是继 §34.1 之后的**第二条** flaky
+（不同族：那条是原生崩溃，这条是测试自身的墙钟竞态）。
+
+### 36.6 验证与队列
 
 - 验证：全量 **2446 passed**（+6：模型路径 5 + sidecar 就绪前置 1；另 1 条旧判例按新语义收编）；
   本地 TTS 合成 3 语种非静音实测；A 线/B 线/打断/长跑四类实弹全绿。
