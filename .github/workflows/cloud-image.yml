@@ -34,7 +34,18 @@ jobs:
       - name: Smoke test (health + admin console)
         run: |
           set -euo pipefail
-          docker run -d --name cp-smoke -p 127.0.0.1:18000:8000 bok-cp:ci
+          # CP 启动锚（2026-09-21）：镜像 CMD --host 0.0.0.0 是非回环 bind，
+          # 认证双关会被拒绝启动——冒烟必须给一份最小加固配置（auth-on +
+          # 密钥分离：JWT secret ≥32 字节且与机器通道 CP token 异值）。
+          # 两枚密钥**运行时随机生成**而非写死占位值：①写死的 `*-0123456789*` 形状
+          # 会被 gitleaks 的 generic-api-key 命中（.gitleaks.toml 前言有实测记录），
+          # 那会逼我们去放宽密钥门禁——用随机值则门禁零放宽；②顺带更贴近真实部署
+          # 形态（真实密钥本来就是随机的）。
+          docker run -d --name cp-smoke -p 127.0.0.1:18000:8000 \
+            -e BOK_AUTH_REQUIRED=1 \
+            -e BOK_JWT_SECRET="$(head -c 48 /dev/urandom | base64 | tr -d '\n')" \
+            -e BOK_CP_TOKEN="$(head -c 24 /dev/urandom | base64 | tr -d '\n')" \
+            bok-cp:ci
           # 轮询等待 uvicorn 起监听：docker-proxy 秒级就绪而应用 ~1-2s 才 bind，
           # 该窗口 curl 会吃到 connection reset（exit 56）——旧 curl 不把它当
           # 瞬态错误重试（CI 首跑实证），必须显式循环兜住一切失败形态。

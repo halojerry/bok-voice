@@ -830,7 +830,7 @@ def _bind_metrics_forward(inner: llm.LLM, outer: llm.LLM) -> None:
     inner.on("metrics_collected", lambda *args, **kwargs: outer.emit("metrics_collected", *args, **kwargs))
 
 
-def _mt_prompt(text: str, target_lang: str, glossary: str = "") -> str:
+def _mt_prompt(text: str, target_lang: str, glossary: str = "", retry: bool = False) -> str:
     """官方 Hy-MT2 中文翻译模板:只要译文,不解释。
 
     glossary 非空时在模板前插一行术语块(会话级常量 → 每轮请求前缀稳定,KV
@@ -840,9 +840,21 @@ def _mt_prompt(text: str, target_lang: str, glossary: str = "") -> str:
 
     语气词标记(2026-09-16 实测)不走 prompt:Hy-MT2 是翻译特化模型,模板外的
     指示一概无视(前缀位/后缀位都试过,规则行原样无视或被当内容翻译),交给
-    interpret._apply_voice_tags 在 say 前做确定性替换。"""
+    interpret._apply_voice_tags 在 say 前做确定性替换。
+
+    ``retry=True``(E5 增补,仅语言校验失败后的单次重试用):按 type4me
+    TranslationOutputValidator 形态加 ``IMPORTANT RETRY:`` 前缀 + 强化指示,并把
+    最吃重的约束**写进模板句内**——Hy-MT2 对模板外文字大概率无视(上面的实测
+    结论),把「必须整句只用目标语、不得保留原文」塞进模板本身才有指望生效。
+    仅重试轮注入,正常轮逐字节不变(KV 前缀不受影响)。"""
     name = _MT_PROMPT_NAMES.get(target_lang, target_lang)
     prefix = f"术语表（保持一致）：{glossary}\n\n" if glossary else ""
+    if retry:
+        body = (
+            f"将以下文本翻译为 `{name}`（必须整句只用{name}输出，"
+            f"不得保留原文），注意只需要输出翻译后的结果，不要额外解释"
+        )
+        return f"IMPORTANT RETRY: {prefix}{body}：\n\n`{text}`"
     return f"{prefix}将以下文本翻译为 `{name}`，注意只需要输出翻译后的结果，不要额外解释：\n\n`{text}`"
 
 
@@ -988,6 +1000,53 @@ class StatelessMTLLM(llm.LLM):
         tool_choice=None,
         extra_kwargs=NOT_GIVEN,
     ):
+        return self._chat_impl(
+            chat_ctx,
+            tools=tools,
+            conn_options=conn_options,
+            parallel_tool_calls=parallel_tool_calls,
+            tool_choice=tool_choice,
+            extra_kwargs=extra_kwargs,
+            retry=False,
+        )
+
+    def chat_retry(
+        self,
+        *,
+        chat_ctx,
+        tools=None,
+        conn_options=None,
+        parallel_tool_calls=None,
+        tool_choice=None,
+        extra_kwargs=NOT_GIVEN,
+    ):
+        """E5 增补:语言校验失败后的**单次强化重试**入口(同模板+强化指示)。
+
+        与 ``chat`` 唯一差别=进 ``_mt_prompt(retry=True)``(IMPORTANT RETRY 前缀+
+        模板句内「整句只用目标语」约束)。签名/透传/引号剥离与 ``chat`` 逐字一致,
+        调用方(interpret._mt_once)照 ``chat`` 的 max_retry=1 + wait_for 超时纪律
+        用它——本方法自身**无循环**,重试次数由调用方控制在一次。"""
+        return self._chat_impl(
+            chat_ctx,
+            tools=tools,
+            conn_options=conn_options,
+            parallel_tool_calls=parallel_tool_calls,
+            tool_choice=tool_choice,
+            extra_kwargs=extra_kwargs,
+            retry=True,
+        )
+
+    def _chat_impl(
+        self,
+        chat_ctx,
+        *,
+        tools=None,
+        conn_options=None,
+        parallel_tool_calls=None,
+        tool_choice=None,
+        extra_kwargs=NOT_GIVEN,
+        retry: bool = False,
+    ):
         last_user = ""
         for item in reversed(getattr(chat_ctx, "items", []) or []):
             if getattr(item, "role", None) == "user":
@@ -1003,7 +1062,7 @@ class StatelessMTLLM(llm.LLM):
                 tool_choice=tool_choice,
                 extra_kwargs=_forward_extra_kwargs(extra_kwargs),
             )
-        content = _mt_prompt(last_user, self._target_lang, self._glossary)
+        content = _mt_prompt(last_user, self._target_lang, self._glossary, retry=retry)
         if self._context_turns:
             pairs = self._rolling_pairs(chat_ctx)
             if pairs:
