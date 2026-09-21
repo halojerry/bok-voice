@@ -1470,3 +1470,150 @@ BOK_RESPONSE_WATCHDOG_FILLER_EXT_S=0`（关顺延，否则垫话把闸推后 2s 
 2. 或者按生产值复刻：看门狗保持 4s、刻意把 LLM 拖慢到 TTFT 2.5-3.6s（生产被掐轮的实测区间），
    不要压缩时间轴；
 3. B 臂样本要堆到 ≥5 个 suppressed 轮才能比比例。
+
+---
+
+## 20. 真栈配对 A/B：把修复的作用干净隔离出来（确定性派单）
+
+§19.4 列的三条「下一次」全部做到了，而且换了更硬的路子：**不再赌派单**。
+
+### 20.1 为什么放弃「按日志归属过滤样本」的彩票协议
+
+共享 LiveKit 上同时注册着两个 `bok-voice` worker（并行会话的 :8081 与我的 :8091）：
+
+| 尝试 | 结果 |
+|---|---|
+| 顺序三连发（09:09-09:15） | 全落对方 worker（我的日志 0 行） |
+| 重叠两发（09:19） | 一发落我、一发落对方 |
+| 重叠两发（09:23，我重启 worker 后） | **两发全落对方** |
+
+根因是两处硬编码：CP 的 token 路径写死 `agent_name="bok-voice"`（`control_plane/main.py:1466`），
+worker 注册名也写死（`agent_runtime/agent.py:5315`）→ 同一个 agent_name 池里由 LiveKit 自行择优，
+**脚本侧无法指定**；而且选中谁实测不稳定。彩票协议还有个隐性代价：两臂样本的采集条件
+（是否与其他通话重叠）会漂移，正是 V-9 那次「一个实验差两件事」的坑。
+
+### 20.2 确定性装备（三件，两臂完全同构）
+
+1. **worker 注册名 env 化**（临时诊断补丁，收工已 `git checkout` 还原）：`agent.py:5315`
+   改读 `BOK_AGENT_NAME`（默认仍 `bok-voice`，零漂移）；
+2. 我的 worker 起在 :8091、注册名 `bok-voice-ab`，env 取 `_agent_worker_env()` 的**权威全集**
+   （含 `MLX_LLM_BASE_URL`/`MLX_LLM_MODEL` 与判据专线——20.4 那个坑就是漏了它）；
+3. 驱动 `/tmp/ab_drive.py`：CP 照旧建对象/人设/通话（turns 照落库），但 **token 自签**
+   （不带 `RoomConfiguration` → 不请求 peer 那次派单）+ 自己
+   `AgentDispatchService.create_dispatch(agent_name="bok-voice-ab")`；刺激物直接
+   `import e2e_multi_turn` 复用其 `TURNS`/`push_and_collect`/`asr_language`
+   （逐轮音频与读回断言**逐字节同构**，不引入新刺激物方差）。
+
+→ 两臂落在**同一 worker、同一 env、同一刺激物**上，**只差一行代码**。归属不再需要事后过滤
+（四个 driven call 在两个臂的 worker 日志里分别有 40/40 与 70/68 行，全部落我自己）。
+
+### 20.3 结果（每臂 2 通 × 3 轮；timeout=0.5s / 垫话 100ms / 看门狗 2.5s）
+
+| 判据 | B 臂（摘掉修复） | A 臂（含修复） |
+|---|---|---|
+| LLM API 错误（健康对照） | 0 | 0 |
+| 进 `suppressed` 分支 | 4 | 4 |
+| 走 `FALLBACK_TEXT`（对照分支） | 2 | 2 |
+| 晚到补答真实到达（`chars=`） | 6 | 6 |
+| **`[watchdog] no assistant audio`** | **4** | **0** |
+| `sentences=0 canceled=1` | 4 | 4 |
+| 客户实际听到 | 三轮回读**全是道歉句**（一轮是「道歉+补答」双念） | 道歉句之后**真答案照常念出** |
+
+**核心读数：fires 4 → 0，且 suppressed 4 轮 ↔ fires 4 次严格 1:1。** 这就是隔离——
+同样的触发条件（B 臂 4/4 复现），修复把开火清零。§16 的机制解释（suppressed 分支不产出
+任何文本 → 永不触发首音频回调 → 看门狗武装到最后）同时被证实：两臂 `FALLBACK_TEXT` 各 2 轮
+（该分支的道歉词走 TTS → 自己拆了弹）都**没有**开火。
+
+### 20.4 两处对我自己前文的更正（都靠配对臂拦下）
+
+1. **`sentences=0 canceled=1` 不是「被看门狗掐掉」的判据**——两臂都是 4。§19.3 表格把它
+   列成 B 臂证据是错读：它对用户抢话、任何零句取消都计数。**本实验里只有 fires 有区分度。**
+2. **手搓 env 会静默毁掉对照臂**：B 臂首跑按 `ps eww` 复刻 A4 的 env，**漏了 `MLX_*`**
+   （grep 前缀里没写 MLX）→ 模型名退化成 `local` → `Repository Not Found …
+   /models/local/…` → **每一轮 LLM 都 404**、兜底无条件触发（5 处 `APIStatusError`，
+   对照 A4 是 0），该臂读数全废。靠「健康对照」列自查发现。
+   纪律：worker env 一律经 `_agent_worker_env()` 构造；**每臂先验 `APIStatusError=0`**。
+
+### 20.5 顺带发现的第二个缺陷：晚到补答绕过出口两道防线
+
+B 臂落库账本里那句补答念成了 `唔好意思，我即刻帮你查。\n\n【你上一句】「唔好意思，`——
+**尾部锚拟声复刻被念出声**。代码定位（`providers/livekit_plugins.py`）：
+`_OpenAICompatBase.chat` 里 `_LlmFallbackStream` 包着内芯（:527），而
+`_StripTailAnchorStream` / `_RepeatSelfGuardStream` 在 `MlxLlmLLM.chat` 里包在**更外层**（:1896）；
+晚到补答由 tee 直投 `late_answer_cb`（:625/:691）→ **结构性不过剥离与复读防线**。见 §22 L2。
+
+---
+
+## 21. §15 三条读数在真码上换基
+
+口径：直接读共享 `agent.log`（app-data；裸 print 按「最近一次 JSON 行的 room」归属，
+因为我们的诊断行没有 ts）。**版本混杂**（并行会话各自 worktree 的 worker 都写这一个文件），
+所以 R1/R2 是「全量换基」而非「仅合并码」读数；R3 另给可控臂读数（§20）。
+
+| 读数 | 旧文（旧码） | 换基（本轮，n 更大） | 结论 |
+|---|---|---|---|
+| R1 TTFT 分解 | `TTFT ≈ 285ms + 未缓存/586`（n=2133，两桶差分） | 桶2−桶1 斜率 **1.718 ms/tok → 582 tok/s**（n=2607）；未缓存≤60 地板中位 **349ms**（旧文 349ms） | **成立**——可比口径几乎逐字重合；最高桶（600-1400）转 **404 tok/s**，正是 §15 那条超线性拐点 |
+| R2 打断→下一轮 | 中位 +0 / 均值 +216ms / p90 +1520ms / 最大 +6662ms（n=265，打断 557） | 中位 **+0** / 均值 **+198ms** / p90 **+1110ms** / 最大 **+7664ms**（n=482，打断 570） | **成立且功效更强**（可配对样本 1.8×） |
+| R3 看门狗账本 | 48 轮补答 / 17 轮被同轮看门狗掐掉 | 补答到达 **41**、补答失败 **7**（=旧文 48 轮，**对得上**）；fires **79**；`suppressed` 22；**有 suppressed 的通话 17 个，其中 17 个都出过 fire** | 相关性从「轮级」升级为「通话级 17/17」 |
+
+TTFT 分布（n=2607）：p50 943ms / p90 2487ms / p99 7041ms / max 20738ms；
+**>2000ms 占 19.1%（497 轮）、>3000ms 占 6.8%（177 轮）**——这两个数就是 §22 L3 的依据。
+
+顺手修掉一个**我自己的解析 bug**：`grep "[watchdog] no assistant"` 在 BRE 把方括号当字符类，
+计数恒 0，差点据此得出「日志里没有开火」。正确写法 `watchdog] no assistant`。
+
+---
+
+## 22. 可信修复计划（L1-L5）
+
+按「证据强度 × 收益/成本」排序；每条给改法、预期收益（尽量带本轮实测数）、风险、验证方式。
+
+### L1 晚到补答投递点自拆看门狗 —— **已落地（PR #128）**
+- 改法：`_late_answer_say` 出声前 `_cancel_response_watchdog()`（`agent.py:2748`）。
+- 收益：受控配对 fires **4 → 0**（suppressed 4 轮 1:1 复现）；§20 即验收。
+- 风险：若用户已开新轮，新轮的看门狗会被一并拆掉——与同钩子内 14 处直念族**同一取舍**，
+  由新轮自身音频覆盖。**低**。
+- 验证：结构测试 `tests/test_watchdog_filler_extend.py::test_late_answer_cancels_watchdog_before_saying`
+  （摘掉那行即红）+ §20 真栈配对。
+
+### L2 晚到补答补上出口两道防线（**新发现，未做**）
+- 现状：`late_answer_cb` 直投的文本结构性绕过 `_StripTailAnchorStream`/`_RepeatSelfGuardStream`
+  （§20.5 代码定位 + B 臂账本实证念出 `【你上一句】「…`）。
+- 改法：把锚剥离提成**纯函数**（现逻辑在 `_StripTailAnchorStream._feed` 的流式状态机里；
+  常量已单点 `_TAIL_ANCHOR_LABEL = "【你上一句】"`），在 `_late_answer_say` 投递前调用一次。
+  复读防线（句级比对）成本更高，建议先加「补答与上一句相似度」打点观测再决定。
+- 收益：补答路径（历史 41 次到达）上的念错类缺陷清零。
+- 风险：**低**（纯文本变换）；需注意别误伤「客户明确要求重复」的场景——那条走
+  `repeat_requested` 分支，与补答路径无交集。
+- 验证：纯函数单测（含跨 chunk 边界的锚块）+ 一次 driven call 看 turns 行无锚块。
+
+### L3 兜底阈值与 TTFT 分布错配（**最大杠杆，未做**）
+- 现状：`LLM_FIRST_TOKEN_TIMEOUT_S` 默认 2.0s，而实测 TTFT **>2000ms 占 19.1%**（497/2607）；
+  进兜底链是整条「suppressed → 看门狗」序列的唯一入口（历史通话级 17/17；控制臂轮级 4/4）。
+- 改法：默认抬到 **3.0s**（入口从 19.1% 砍到 **6.8%**，2.8×），或按 §15.6 与垫话延迟联动。
+- 收益：掐答案暴露面同比缩小（与 L1 叠加后趋零）；**不**改善 TTFT 本身（那是 L4）。
+- 风险：**低**——真死流上道歉句晚 ~1s 出声，但这 1s 由垫话（0.5-2.3s，独立于 LLM 阈值）
+  已盖住，用户可感空档不变。**前提是垫话开着**：若 `BOK_FILLER=0`，这条结论不成立，
+  改默认时须一并说明。
+- 验证：改默认后重跑 `e2e_multi_turn` + `probe_latency_soak`，对比兜底触发率与首声时间。
+
+### L4 TTFT 本身：**先测后改**（未做）
+- 事实：TTFT 占 LLM 墙钟 74%；地板 349ms + prefill 582 tok/s（§21 换基复算）。
+  §15.4 那 1.5s 超额仍未归因，唯一决定性测量 = **给每轮请求加 `X-Bok-Turn` 头**，
+  在服务端把「ctx-ready 等待」与「prefill」在时间轴上分开。
+- 顺带的便宜项：`--prompt-cache-bytes` **从未接线**（`server.py:1784` 只传 size；
+  `cache.py` 默认 `max_bytes = 1<<63`）→ 12GB 档是死的，「配置承诺未兑现」。接线成本极低、
+  收益未知，**先测再改**。
+- 验证：`X-Bok-Turn` 头落地后跑一轮真实通话，看被掐轮的 ctx-ready 段占比。
+
+### L5 仓库卫生：worker 端口/注册名单点化 + 归因仪表（未做）
+- **`BOK_WORKER_PORT` 三处硬编码**：`_worker_specs()` 里 `"port": 8081`、
+  `worker_port_singleton_guard(8081, "agent")` 也硬编码 → `agent.py:5311-5313` 注释承诺的
+  「单机多栈并存」在 8081 被占时**走不通**（§19.1 实证；可用姿势是多加 `BOK_WORKER_PORT_GUARD=0`）。
+  收口=端口与 agent_name 都从单点解析（默认零漂移）。
+- **注册名 env 化**：本轮临时补丁已证明可行且必要——同机双 worker 时 `agent_name` 必须能错开，
+  否则派单永远是抽奖（§20.1）。
+- **`[bok-timing]` 仪表失真**：`prompt_window_ms` 恒 0、`first_progress_ms` 恒等于 `generate_ms`、
+  `generate_ms` 不随 prefill 走（§17）→ 修或删，别让后来者据此归因。
+- **共享 agent.log 多版本混写**：本轮 R1/R2 只能给「全量换基」。多栈分日志（或行内带
+  pid/版本）是「仅合并码」读数的前置条件。
