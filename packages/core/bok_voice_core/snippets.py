@@ -25,6 +25,14 @@
 在 CJK 邻字可命中的机制下=全句该字皆被替换，与 §26-E6「单汉字替换永不生成全局映射」
 同款纪律）、trigger ≤ 32 字符、replacement ≤ 64 字符。
 
+**语言分域（2026-09-21 批次 3，词表挖掘改判逼出）**：规则带 ``lang`` 字段——``""``
+= 全语言生效，``zh`` / ``cantonese`` / ``en`` = 仅该语言通话生效。挖掘实弹发现真实
+错误形态**大部分是繁体形**（``集運`` 类）：在中文通话里是错字（该改成简体）、在粤语
+通话里是**正确写法**（改了反而错）。词表不分域就是双向伤害，所以分域是硬需求而非
+优化。装配序**必须先分域再合并**（``rules_for_lang`` → ``merge_rules`` → 编译）：
+反序会让「本语言专用规则在合并时压掉全语言规则、随后又被分域滤掉」= 全语言规则
+凭空消失。
+
 另外，type4me 把内置词表存了不用（``SnippetStorage.apply`` 只编译用户 ``snippets.json``，
 ``builtin-snippets.json`` 那 100+ 条映射从不进入替换路径）——这里 ``merge_rules`` 是
 **单点合并生效**：调用方按 ``[内置, 账号, 模板]`` 顺序传，后者覆盖前者。
@@ -43,6 +51,7 @@ from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 __all__ = [
+    "ALLOWED_LANGS",
     "MAX_REPLACEMENT_CHARS",
     "MAX_TRIGGER_CHARS",
     "MIN_TRIGGER_CHARS",
@@ -57,9 +66,16 @@ __all__ = [
     "compile_rules_with_skipped",
     "merge_rules",
     "normalize_key",
+    "normalize_lang",
     "parse_rule",
+    "rules_for_lang",
     "validate_rule",
 ]
+
+# 语言分域的合法值域（AGENTS.md 术语铁律：全时空唯一拼写，只有这三态）。
+# ``""``（缺省）不在本集合内但合法——语义是「全语言生效」，由 ``rules_for_lang``
+# 的 ``in ("", lang)`` 判定承载，与「写错的 lang」严格区分。
+ALLOWED_LANGS: tuple[str, ...] = ("zh", "cantonese", "en")
 
 # 长度护栏（归一后 trigger 的字符数 / replacement 的原始字符数）。
 MIN_TRIGGER_CHARS = 2  # 单字 trigger 拒绝：CJK 邻字可命中=全句该字皆被替换（§26-E6 同款纪律）
@@ -81,14 +97,20 @@ _LOOKAHEAD = r"(?![a-zA-Z0-9])"
 
 @dataclass(frozen=True)
 class SnippetRule:
-    """一条词级替换规则：trigger（含空白亦可）→ replacement。"""
+    """一条词级替换规则：trigger（含空白亦可）→ replacement，可选语言分域。"""
 
     trigger: str
     replacement: str
     source: str = ""  # 审计位：builtin / account / template 等来源标记
+    lang: str = ""  # 分域位：""=全语言 / "zh"|"cantonese"|"en"=仅该语言通话
 
     def norm_key(self) -> str:
-        """归一化去重键：去全部空白 + lower（空格/大小写不敏感的词表身份）。"""
+        """归一化去重键：去全部空白 + lower（空格/大小写不敏感的词表身份）。
+
+        注意：这是 **trigger 身份**（不含 lang）——合并去重发生在分域过滤**之后**，
+        所以同 trigger 的跨语言条目此时已不可能同场（见 ``rules_for_lang`` 与
+        ``merge_rules`` 的顺序契约）。
+        """
         return normalize_key(self.trigger)
 
 
@@ -136,6 +158,40 @@ def normalize_key(trigger: str) -> str:
     return _WS_RE.sub("", str(trigger or "")).lower()
 
 
+def normalize_lang(lang: object) -> str:
+    """lang 归一：去首尾空白 + lower；缺省/空值 → ``""``（全语言）。
+
+    只做大小写与空白归一（``"Cantonese "`` → ``"cantonese"``），**不做别名映射**
+    ——AGENTS.md 术语铁律要求语言三态唯一拼写，旧拼写/方言别名一律视为非法值由
+    ``validate_rule`` 拦下（``bad_lang``），绝不在此静默纠正。
+    """
+    return str(lang or "").strip().lower()
+
+
+def rules_for_lang(rules: Iterable[Any] | None, lang: str) -> list[SnippetRule]:
+    """按通话语言分域过滤：保留 ``lang == ""``（全语言）与 ``lang == 通话语言`` 的规则。
+
+    顺序契约：**必须在 ``merge_rules`` 之前调用**。若反序（先合并后分域），本语言
+    专用规则会在合并时按 trigger 压掉全语言规则（后者胜出），随后又因语言不匹配被
+    滤掉——该 trigger 在本通电话里变成「无规则」，全局兜底凭空消失。
+
+    ``lang`` 传空串 = 不限域（返回全部规则，含各语言专用条目）；调用方不知道通话
+    语言时用这一档（等价旧行为）。本函数只过滤不校验——非法值由 ``validate_rule``
+    的 ``bad_lang`` 拦下并进 skipped 审计面（此处比较两侧都走 ``normalize_lang``，
+    与 ``validate_rule`` 同口径，避免「大小写不同 → 分域滤掉但校验不管」的静默丢规则）。
+    """
+    want = normalize_lang(lang)
+    out: list[SnippetRule] = []
+    for raw in rules or []:
+        rule = parse_rule(raw)
+        if rule is None:
+            continue
+        rl = normalize_lang(rule.lang)
+        if not want or not rl or rl == want:
+            out.append(rule)
+    return out
+
+
 def build_flex_pattern(trigger: str) -> str:
     """trigger → 空白不敏感的词边界正则串（type4me ``buildFlexPattern`` 移植）。
 
@@ -152,13 +208,18 @@ def build_flex_pattern(trigger: str) -> str:
 def validate_rule(rule: SnippetRule) -> str:
     """严格轨校验：返回错误原因码（空串 = 合法）。
 
-    判定序：``digits``（数字铁律）→ ``empty_trigger``（空 trigger 铁律）→
-    ``trigger_too_short``（单字铁律）→ 长度护栏。
+    判定序：``digits``（数字铁律）→ ``bad_lang``（语言值域）→ ``empty_trigger``
+    （空 trigger 铁律）→ ``trigger_too_short``（单字铁律）→ 长度护栏。
+
+    ``bad_lang`` 比较走 ``normalize_lang``（大小写/空白不算错），但**不做别名映射**
+    ——旧粤语拼写（见 AGENTS.md 术语铁律）一律 ``bad_lang``。
     """
     trigger = str(rule.trigger or "")
     replacement = str(rule.replacement or "")
     if _DIGIT_RE.search(trigger) or _DIGIT_RE.search(replacement):
         return "digits"
+    if normalize_lang(rule.lang) not in ("", *ALLOWED_LANGS):
+        return "bad_lang"
     compact = _WS_RE.sub("", trigger)
     if not compact:
         return "empty_trigger"
@@ -172,8 +233,13 @@ def validate_rule(rule: SnippetRule) -> str:
 
 
 def parse_rule(raw: Any) -> SnippetRule | None:
-    """宽容解析：``SnippetRule`` 本体直通；mapping → 取 trigger/replacement/source；
-    结构坏（非 mapping / 缺关键键）返回 None（由调用方计入 skipped=``bad_rule``）。"""
+    """宽容解析：``SnippetRule`` 本体直通；mapping → 取 trigger/replacement/source/lang；
+    结构坏（非 mapping / 缺关键键）返回 None（由调用方计入 skipped=``bad_rule``）。
+
+    ``lang`` 走 ``normalize_lang`` 归一（缺省/None → ``""``）；归一后仍非法（旧拼写
+    之类）**不在解析层拦截**——宽容解析只保证结构，值域由 ``validate_rule``
+    的 ``bad_lang`` 严格轨拦下（与 digits 同为「解析宽容 / 校验严格」分工）。
+    """
     if isinstance(raw, SnippetRule):
         return raw
     if isinstance(raw, Mapping):
@@ -185,6 +251,7 @@ def parse_rule(raw: Any) -> SnippetRule | None:
             trigger=str(trigger),
             replacement=str(replacement),
             source=str(raw.get("source") or ""),
+            lang=normalize_lang(raw.get("lang")),
         )
     return None
 
@@ -248,6 +315,10 @@ def merge_rules(*rule_lists: Iterable[Any] | None) -> list[SnippetRule]:
 
     键为空串（空 trigger）的规则照常参与合并（多条空 trigger 折叠为一条），
     它们会在 ``compile_rules`` 被空 trigger 铁律拦下。
+
+    **顺序契约**：调用方必须先 ``rules_for_lang`` 分域、再进本函数（见该函数与模块
+    docstring 的反序失效说明）。合并键只有 trigger 身份，不含 lang——分域后同场
+    不存在跨语言同 trigger 条目，该假设才成立。
     """
     merged: dict[str, SnippetRule] = {}
     for rules in rule_lists:

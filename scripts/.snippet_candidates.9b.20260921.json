@@ -1,0 +1,555 @@
+{
+  "generated_by": {
+    "model": "/Users/halo/.lmstudio/models/huihui-ai/Huihui-Qwen3.5-9B-abliterated-mlx-4bit",
+    "port": 1237
+  },
+  "candidates": [],
+  "discarded": [
+    {
+      "trigger": "拼多度",
+      "replacement": "拼多多",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "拼朵多",
+      "replacement": "拼多多",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "拼多哆",
+      "replacement": "拼多多",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "拼多嘞",
+      "replacement": "拼多多",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "拼多咭",
+      "replacement": "拼多多",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "拼哆多",
+      "replacement": "拼多多",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "PinDuoDuo",
+      "replacement": "拼多多",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "PinDuoDo",
+      "replacement": "拼多多",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "京東",
+      "replacement": "京东",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "京东",
+      "replacement": "京东",
+      "reason": "identity"
+    },
+    {
+      "trigger": "金东",
+      "replacement": "京东",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "京栋",
+      "replacement": "京东",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "京东 J",
+      "replacement": "京东",
+      "reason": "contains_canonical"
+    },
+    {
+      "trigger": "J 东",
+      "replacement": "京东",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "京东 JD",
+      "replacement": "京东",
+      "reason": "contains_canonical"
+    },
+    {
+      "trigger": "顺风",
+      "replacement": "顺丰",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "順豐",
+      "replacement": "顺丰",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "顺峰",
+      "replacement": "顺丰",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "顺份",
+      "replacement": "顺丰",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "ShunFeng",
+      "replacement": "顺丰",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "顺丰哥",
+      "replacement": "顺丰",
+      "reason": "contains_canonical"
+    },
+    {
+      "trigger": "顺",
+      "replacement": "顺丰",
+      "reason": "trigger_too_short"
+    },
+    {
+      "trigger": "集雲",
+      "replacement": "集运",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "集运",
+      "replacement": "集运",
+      "reason": "identity"
+    },
+    {
+      "trigger": "转云",
+      "replacement": "转运",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "专运",
+      "replacement": "转运",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "转咭",
+      "replacement": "转运",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "转咩",
+      "replacement": "转运",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "轉运",
+      "replacement": "转运",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "ZhuanYun",
+      "replacement": "转运",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "转悠",
+      "replacement": "转运",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "李赔",
+      "replacement": "理赔",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "理陪",
+      "replacement": "理赔",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "LiPei",
+      "replacement": "理赔",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "培偿",
+      "replacement": "赔偿",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "赔尝",
+      "replacement": "赔偿",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "赔赏",
+      "replacement": "赔偿",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "單偿",
+      "replacement": "赔偿",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "单赏",
+      "replacement": "赔偿",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "單赏",
+      "replacement": "赔偿",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "PaiChang",
+      "replacement": "赔偿",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "PaiShang",
+      "replacement": "赔偿",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "运单",
+      "replacement": "运单",
+      "reason": "identity"
+    },
+    {
+      "trigger": "单浩",
+      "replacement": "单号",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "单号",
+      "replacement": "单号",
+      "reason": "identity"
+    },
+    {
+      "trigger": "单號",
+      "replacement": "单号",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "仓库",
+      "replacement": "仓库",
+      "reason": "identity"
+    },
+    {
+      "trigger": "藏库",
+      "replacement": "仓库",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "倉庫",
+      "replacement": "仓库",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "仓务",
+      "replacement": "仓库",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "藏务",
+      "replacement": "仓库",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "倉务",
+      "replacement": "仓库",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "Wharehouse",
+      "replacement": "仓库",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "Whāse",
+      "replacement": "仓库",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "专圆",
+      "replacement": "专员",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "专员",
+      "replacement": "专员",
+      "reason": "identity"
+    },
+    {
+      "trigger": "專員",
+      "replacement": "专员",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "快遞",
+      "replacement": "快递",
+      "reason": "lang_context_correct",
+      "langs": {
+        "cantonese": 2
+      }
+    },
+    {
+      "trigger": "快运",
+      "replacement": "快递",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "快递",
+      "replacement": "快递",
+      "reason": "identity"
+    },
+    {
+      "trigger": "包罗",
+      "replacement": "包裹",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "包脩",
+      "replacement": "包裹",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "包裹",
+      "replacement": "包裹",
+      "reason": "identity"
+    },
+    {
+      "trigger": "到好",
+      "replacement": "到货",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "道货",
+      "replacement": "到货",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "到货",
+      "replacement": "到货",
+      "reason": "identity"
+    },
+    {
+      "trigger": "到貨",
+      "replacement": "到货",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "倒货",
+      "replacement": "到货",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "倒貨",
+      "replacement": "到货",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "Dahao",
+      "replacement": "到货",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "Dahó",
+      "replacement": "到货",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "发哈",
+      "replacement": "发货",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "发话",
+      "replacement": "发货",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "發貨",
+      "replacement": "发货",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "顺货",
+      "replacement": "发货",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "FaHa",
+      "replacement": "发货",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "FaHao",
+      "replacement": "发货",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "发货",
+      "replacement": "发货",
+      "reason": "identity"
+    },
+    {
+      "trigger": "whatsapp",
+      "replacement": "WhatsApp",
+      "reason": "identity"
+    },
+    {
+      "trigger": "WeChat",
+      "replacement": "WhatsApp",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "华特士",
+      "replacement": "WhatsApp",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "华普斯",
+      "replacement": "WhatsApp",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "华沙普",
+      "replacement": "WhatsApp",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "华特沙",
+      "replacement": "WhatsApp",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "微讯",
+      "replacement": "微信",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "WeiXin",
+      "replacement": "微信",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "微心",
+      "replacement": "微信",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "微希",
+      "replacement": "微信",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "微信",
+      "replacement": "微信",
+      "reason": "identity"
+    },
+    {
+      "trigger": "Weixn",
+      "replacement": "微信",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "截圖",
+      "replacement": "截图",
+      "reason": "lang_context_correct",
+      "langs": {
+        "cantonese": 1
+      }
+    },
+    {
+      "trigger": "jie tu",
+      "replacement": "截图",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "接图",
+      "replacement": "截图",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "捷图",
+      "replacement": "截图",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "截投",
+      "replacement": "截图",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "jie tou",
+      "replacement": "截图",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "截具",
+      "replacement": "截图",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "jie ju",
+      "replacement": "截图",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "赔尝金",
+      "replacement": "赔偿金",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "培偿金",
+      "replacement": "赔偿金",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "單賠金",
+      "replacement": "赔偿金",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "单赔金",
+      "replacement": "赔偿金",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "单賠金",
+      "replacement": "赔偿金",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "顺赔金",
+      "replacement": "赔偿金",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "李赔金",
+      "replacement": "赔偿金",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "WeChat金",
+      "replacement": "赔偿金",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "物流",
+      "replacement": "物流",
+      "reason": "identity"
+    },
+    {
+      "trigger": "物六",
+      "replacement": "物流",
+      "reason": "no_evidence"
+    }
+  ]
+}

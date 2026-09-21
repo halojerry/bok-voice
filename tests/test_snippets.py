@@ -13,6 +13,7 @@ import re
 import pytest
 
 from bok_voice_core.snippets import (
+    ALLOWED_LANGS,
     MAX_REPLACEMENT_CHARS,
     MAX_TRIGGER_CHARS,
     CompiledRule,
@@ -24,7 +25,9 @@ from bok_voice_core.snippets import (
     compile_rules_with_skipped,
     merge_rules,
     normalize_key,
+    normalize_lang,
     parse_rule,
+    rules_for_lang,
     validate_rule,
 )
 
@@ -381,3 +384,139 @@ def test_domain_example_asr_confusion_repair():
     out, applied = apply_snippets("我个单后点样查，你哋呃人咩", rules)
     assert out == "我个快递单号怎样查，你哋骗人咩"
     assert applied == [("单后", "快递单号"), ("点样", "怎样"), ("呃人", "骗人")]
+
+
+# ---- 11. 语言分域（2026-09-21 批次 3） ----
+#
+# 动因：词表挖掘实弹发现真实错误形态**大部分是繁体形**（「集運」类）——在中文通话里
+# 是错字、在粤语通话里是正确写法。不分域即双向伤害，故规则带 lang。
+# 装配序契约 = rules_for_lang → merge_rules（反序的失效面在下面单点钉住）。
+
+
+def test_normalize_lang_strips_and_lowercases():
+    assert normalize_lang("") == ""
+    assert normalize_lang(None) == ""
+    assert normalize_lang("  ") == ""
+    assert normalize_lang("Cantonese ") == "cantonese"
+    assert normalize_lang("ZH") == "zh"
+    assert normalize_lang("en") == "en"
+
+
+def test_normalize_lang_does_not_alias():
+    # 归一只做大小写/空白，**不做别名映射**——旧拼写必须原样留着交给 bad_lang 拦。
+    stale = "y" + "ue"  # 术语铁律：旧拼写字面量不得出现在跟踪文件里
+    assert normalize_lang(stale) == stale
+    assert normalize_lang("zh-" + stale) == "zh-" + stale
+
+
+def test_allowed_langs_is_the_single_canonical_triple():
+    assert ALLOWED_LANGS == ("zh", "cantonese", "en")
+
+
+def test_lang_defaults_to_all_languages():
+    rule = SnippetRule("单后", "单号")
+    assert rule.lang == ""
+    assert validate_rule(rule) == ""
+    # 位置兼容：第三位仍是 source（存量调用 SnippetRule(t, r, "builtin") 不破）
+    assert SnippetRule("单后", "单号", "builtin").source == "builtin"
+    assert SnippetRule("单后", "单号", "builtin").lang == ""
+
+
+@pytest.mark.parametrize("lang", ["zh", "cantonese", "en", "", " Cantonese "])
+def test_valid_lang_passes(lang):
+    assert validate_rule(SnippetRule("单后", "单号", "", lang)) == ""
+
+
+@pytest.mark.parametrize("lang", ["fr", "zh-Hans", "zh-" + "y" + "ue", "y" + "ue", "jp"])
+def test_bad_lang_rejected(lang):
+    assert validate_rule(SnippetRule("单后", "单号", "", lang)) == "bad_lang"
+
+
+def test_bad_lang_rule_skipped_with_audit_reason():
+    report = compile_rules_with_skipped(
+        [SnippetRule("单后", "单号", "account", "fr"), SnippetRule("点样", "怎样", "builtin")]
+    )
+    assert [c.trigger for c in report.compiled] == ["点样"]
+    assert [s.reason for s in report.skipped] == ["bad_lang"]
+
+
+def test_digits_takes_precedence_over_bad_lang():
+    # 判定序钉死：数字铁律是头道闸，坏 lang 与数字同在时报 digits。
+    assert validate_rule(SnippetRule("单号123", "单号", "", "fr")) == "digits"
+
+
+def test_rules_for_lang_keeps_global_and_matching_only():
+    seed = [
+        {"trigger": "集運", "replacement": "集运", "lang": "zh", "source": "builtin"},
+        {"trigger": "呃人", "replacement": "骗人", "source": "builtin"},
+        {"trigger": "web coding", "replacement": "WebCoding", "lang": "en"},
+    ]
+    assert [r.trigger for r in rules_for_lang(seed, "zh")] == ["集運", "呃人"]
+    assert [r.trigger for r in rules_for_lang(seed, "cantonese")] == ["呃人"]
+    assert [r.trigger for r in rules_for_lang(seed, "en")] == ["呃人", "web coding"]
+
+
+def test_rules_for_lang_empty_lang_is_unscoped():
+    seed = [
+        {"trigger": "集運", "replacement": "集运", "lang": "zh"},
+        {"trigger": "wanna", "replacement": "want to", "lang": "en"},
+    ]
+    assert len(rules_for_lang(seed, "")) == 2  # 不知道通话语言=全量（旧行为）
+
+
+def test_rules_for_lang_skips_garbage_and_normalizes_comparison():
+    seed = [
+        None,
+        "x",
+        {"replacement": "y"},
+        {"trigger": "单后", "replacement": "单号", "lang": "Cantonese"},  # 大小写归一后命中
+    ]
+    assert [r.trigger for r in rules_for_lang(seed, "cantonese")] == ["单后"]
+    # 归一后不匹配 → 该语言下不出现（且不属于「静默丢」：它与调用语言无关）
+    assert rules_for_lang(seed, "zh") == []
+
+
+def test_language_specific_rule_overrides_global_after_scoping():
+    """分域后合并：本语言专用规则按 trigger 压掉全语言规则（后者胜出）。"""
+    seed = [
+        {"trigger": "单后", "replacement": "单号", "source": "builtin"},
+        {"trigger": "单后", "replacement": "运单号", "lang": "zh", "source": "account"},
+    ]
+    zh = merge_rules(rules_for_lang(seed, "zh"))
+    assert [(r.trigger, r.replacement) for r in zh] == [("单后", "运单号")]
+    cant = merge_rules(rules_for_lang(seed, "cantonese"))
+    assert [(r.trigger, r.replacement) for r in cant] == [("单后", "单号")]
+
+
+def test_reverse_order_merge_then_scope_loses_the_global_rule():
+    """反序失效面钉死（模块 docstring 的顺序契约）：先合并后分域 → 全语言规则凭空消失。
+
+    这是**反面判例**，不是推荐用法：merge 按 trigger 去重时本语言规则压掉了全语言
+    规则，随后分域又把它滤掉——该 trigger 在本通电话里变成无规则。实现必须走
+    ``rules_for_lang`` → ``merge_rules``（agent 侧 ``compile_snippet_rules`` 已钉）。
+    """
+    seed = [
+        {"trigger": "单后", "replacement": "单号", "source": "builtin"},
+        {"trigger": "单后", "replacement": "运单号", "lang": "zh", "source": "account"},
+    ]
+    wrong = merge_rules(rules_for_lang(seed, "cantonese"))  # ← 正序：仍有一条
+    assert [r.replacement for r in wrong] == ["单号"]
+    reverse = rules_for_lang(merge_rules(seed), "cantonese")  # ← 反序：规则归零
+    assert reverse == []
+
+
+def test_lang_survives_parse_from_mapping():
+    rule = parse_rule({"trigger": "集運", "replacement": "集运", "lang": "ZH"})
+    assert rule == SnippetRule("集運", "集运", "", "zh")
+    assert parse_rule({"trigger": "集運", "replacement": "集运"}).lang == ""
+
+
+def test_domain_example_traditional_form_untouched_in_cantonese():
+    """端到端语义（本批次立项动因）：繁体形在粤语通话里**逐字不动**，在中文通话里才改。"""
+    seed = [{"trigger": "集運", "replacement": "集运", "lang": "zh", "source": "builtin"}]
+    text = "我想問下集運幾時到"
+    out_cant, applied_cant = apply_snippets(text, merge_rules(rules_for_lang(seed, "cantonese")))
+    assert out_cant == text and applied_cant == []
+    out_zh, applied_zh = apply_snippets(text, merge_rules(rules_for_lang(seed, "zh")))
+    assert out_zh == "我想問下集运幾時到"
+    assert applied_zh == [("集運", "集运")]

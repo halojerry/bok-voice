@@ -110,6 +110,38 @@ def test_compile_snippet_rules_logs_skipped(capsys):
     assert "SNIPPET skipped=1 reasons=digits" in capsys.readouterr().out
 
 
+def test_compile_snippet_rules_scopes_by_language():
+    """装配期按通话语言分域:本语言专用 + 全语言保留,他语言专用滤掉。"""
+    seed = [
+        {"trigger": "集運", "replacement": "集运", "lang": "zh"},
+        {"trigger": "呃人", "replacement": "骗人"},
+        {"trigger": "wanna", "replacement": "want to", "lang": "en"},
+    ]
+    assert [r.trigger for r in ag.compile_snippet_rules(seed, lang="zh")] == ["集運", "呃人"]
+    assert [r.trigger for r in ag.compile_snippet_rules(seed, lang="cantonese")] == ["呃人"]
+    assert [r.trigger for r in ag.compile_snippet_rules(seed, lang="en")] == ["呃人", "wanna"]
+    # 不传 lang = 不限域(单测/未知语言档):全量,含各语言专用条目
+    assert len(ag.compile_snippet_rules(seed)) == 3
+
+
+def test_compile_snippet_rules_logs_bad_lang(capsys):
+    """语言值域进审计面:非法 lang 的规则被拦下并报原因(不静默丢弃)。"""
+    ag.compile_snippet_rules([{"trigger": "单后", "replacement": "单号", "lang": "fr"}])
+    assert "SNIPPET skipped=1 reasons=bad_lang" in capsys.readouterr().out
+
+
+def test_language_scoped_rule_end_to_end():
+    """端到端:繁体形修正在中文通话生效、粤语通话逐字不动。"""
+    seed = [{"trigger": "集運", "replacement": "集运", "lang": "zh"}]
+    text = "我想問下集運幾時到"
+    zh = ag.compile_snippet_rules(seed, lang="zh")
+    out_zh, _, applied_zh = ag._asr_postprocess(text, snippet_rules=zh, hotword_terms=[])
+    assert out_zh == "我想問下集运幾時到" and applied_zh == [("集運", "集运")]
+    cant = ag.compile_snippet_rules(seed, lang="cantonese")
+    out_cant, _, applied_cant = ag._asr_postprocess(text, snippet_rules=cant, hotword_terms=[])
+    assert out_cant == text and applied_cant == []
+
+
 def test_digits_pass_chain_byte_identical(monkeypatch):
     """数字铁律:含数字文本过整链逐字不变(空词表 + 命中规则两档)。"""
     monkeypatch.delenv("BOK_SNIPPETS", raising=False)
@@ -157,3 +189,12 @@ def test_forward_env_registers_both_kill_switches():
     """立法动作:两枚 env 键进 _FORWARD_ENV(prod 封闭面 kill-switch 可达)。"""
     assert "BOK_SNIPPETS" in bok._FORWARD_ENV
     assert "BOK_HOTWORD_LEAK_SANITIZE" in bok._FORWARD_ENV
+
+
+def test_assembly_passes_call_language_into_snippet_scoping():
+    """结构锚:装配期必须把**本通通话语言**传进 compile_snippet_rules(语言分域生效点)。
+
+    语言是一通电话内固定的一次性事实(AGENTS.md「每通对话语言固定」),所以分域在
+    装配期做一次、每轮零语言判断——传错(或漏传)会让繁体形规则反向伤害粤语通话。
+    """
+    assert "compile_snippet_rules(lang=greet_lang)" in _SRC

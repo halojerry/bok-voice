@@ -1714,6 +1714,14 @@ TTFT 分布（n=2607）：p50 943ms / p90 2487ms / p99 7041ms / max 20738ms；
 
 ### 24.1 TTS：本地 Qwen3-TTS 轨道退役（用户拍板：速度与音色都不如云端 MiniMax）
 
+> **⚠️ 本节已被 §29.2 修正，实施前必读 §29.2。** 2026-09-21 批次 3 盘点发现本节的
+> 两条前提**与实机不符**：①「本地模型已由用户删除」不成立——`~/.lmstudio/models/
+> mlx-community/Qwen3-TTS-12Hz-1.7B-{Base,CustomVoice}-8bit` 仍在盘、:8788 `/health`
+> 返 `model_ready=true`；②下方的「引用面」把 :8788 当**生产引用**，但实查里它同时是
+> **全部 19 个 E2E/探针脚本的客户话音合成源**（`TTS_URL=http://127.0.0.1:8788`）。
+> 按本节原样执行 = 拆掉项目「真栈验收」的地基（AGENTS.md：离线单测不算验收）。
+> **故本节不执行**，退役改动待 §29.2 的前置条件满足后再做。
+
 本地模型文件已由用户删除（`mlx-community/Qwen3-TTS-12Hz-1.7B-*` ×2）。**退役是代码级
 移除，不只是文档**——引用面盘点（2026-09-21 实查）：
 
@@ -2112,3 +2120,122 @@ E1/E2 同一落点接 agent 收到 ASR 终稿处（意图判定/QA 匹配前，�
 ### 28.5 集成验证
 
 全量 pytest **2106 passed**（批次 2 净增 26 项）；compileall 过；术语门禁绿。
+
+---
+
+## 29. 实施批次 3（2026-09-21）：E1 语言分域 + 挖掘实证归零 + TTS 退役前提证伪
+
+三路并行 + 一条纪律：3a 语言分域、3b TTS 退役盘点、3c 词表挖掘换 9B，
+外加 `AGENTS.md` 上下文纪律一条。**结论先说**：3a 落地；**3c 把 E1 的挖掘路线判为
+「机制保留、证据不足」**（候选全部来自词表 dump 伪影，清洗后归零）；**3b 不执行**
+（前提与实机不符，见 §29.2，并已回标修正 §24.1）。
+
+### 29.1 3a E1 语言分域（`SnippetRule.lang`）——落地
+
+**动因**：批次 2 词表挖掘的改判——真实错误形态**大部分是繁体形**（`集運` 类），
+在中文通话里是错字、在粤语通话里是**正确写法**。不分域即双向伤害（护了中文、伤了粤语）。
+
+**契约**（`packages/core/bok_voice_core/snippets.py`）：
+
+- `SnippetRule.lang`：`""` = 全语言 / `zh`|`cantonese`|`en` = 仅该语言通话生效；
+  字段位置在 `source` **之后**（存量 `SnippetRule(t, r, "builtin")` 三位置调用不破）。
+- `ALLOWED_LANGS` 三态单点；`normalize_lang` 只归一大小写/空白，**不做别名映射**
+  （旧拼写由 `bad_lang` 拦下——术语铁律，绝不在此静默纠正）。
+- `validate_rule` 判定序：`digits` → **`bad_lang`** → `empty_trigger` →
+  `trigger_too_short` → 长度护栏。
+- `rules_for_lang(rules, lang)` 分域过滤；`lang=""` = 不限域（等价旧行为）。
+- **顺序契约（钉死）**：`rules_for_lang` → `merge_rules` → 编译。**反序会静默丢规则**
+  ——本语言专用条目在合并时按 trigger 压掉全语言条目（后者胜出），随后又被分域滤掉，
+  该 trigger 在本通电话里变成「无规则」。反面判例已入测试
+  （`test_reverse_order_merge_then_scope_loses_the_global_rule`）。
+- 接线：`agent.compile_snippet_rules(seed, lang=greet_lang)`——装配期一次分域
+  （语言是一通电话内固定的一次性事实），每轮零语言判断；结构锚
+  `test_assembly_passes_call_language_into_snippet_scoping` 钉住。
+
+测试：`tests/test_snippets.py` 新增 §11（19 项）+ `tests/test_snippet_leak_wiring.py`
+新增 4 项（含端到端「粤语通话逐字不动 / 中文通话才改」）。
+
+### 29.2 3b TTS 本地轨道退役——**前提证伪，不执行**
+
+实机盘点（2026-09-21）：
+
+| 检查项 | 实测 |
+|---|---|
+| 本地模型在盘 | **在**（`~/.lmstudio/models/mlx-community/Qwen3-TTS-12Hz-1.7B-{Base,CustomVoice}-8bit`） |
+| :8788 sidecar | **健康**（`{"ok":true,"backend":"mlx","model_ready":true,"clone_model_ready":true}`） |
+| 生产实际 TTS 引擎 | **已是 minimax**（live settings `tts.provider=minimax`） |
+| 仓库默认种子 | `default_settings` 仍是 `qwen3_tts`（唯一真实不一致点） |
+| :8788 的**测试侧**引用 | **19 个 E2E/探针脚本**的客户话音合成源（`TTS_URL`；`tts_pcm` 硬依赖 `/v1/audio/speech`，无云端回退） |
+
+**为什么不执行**：§24.1 把 :8788 当生产引用面，实查它同时是**全部真栈验收的客户
+话音源**——探针/E2E 靠它把「客户语音」推进房间。按 §24.1 移除 sidecar spawn 与健康面
+＝ 一次删掉项目的真栈验收能力（AGENTS.md：**离线单测不算验收**；探针跑不了，改 A 线
+引擎就没有回归手段）。且前提「模型已删除」不成立，`_model_present` 假报 MISSING 的
+问题也不存在。
+
+**退役前置条件（满足后才做，按序）**：
+
+1. 探针/E2E 的客户话音源切云端——`scripts/mm_voice.py` 已有 `mm_pcm`（2026-09-13 起
+   2 个脚本在用：`acceptance_0913_scenarios` / `e2e_trilingual_livekit`）。**这是
+   baseline 变更**：换话音源会改探针读数（`mm_voice` 自身记录本地粤语合成
+   「拼多多」→「二。二。」可懂度差），必须在**无在途结论**的窗口成批切换并重跑基线，
+   不能边切边比。
+2. 切干净（`grep 8788 scripts/` 归零）后再动 `bok.py` 的 MODELS/sidecar spawn/
+   `CORE_PORTS`/`PROD_HTTP_CHECKS`、`default_settings` 种子、agent/interpret/web 的
+   provider 分支。
+3. `default_settings` 种子改 `minimax` 要**单独评估**：它同时移除「零 key 也能出声」
+   的本地兜底——新装无 key 用户会从「声音差」变成「没声音」。用户拍板前不动。
+
+### 29.3 3c E1 词表挖掘换 9B——**候选归零，路线定档「机制保留、证据不足」**
+
+三项改动（`scripts/snippet_seed_mining.py`）：
+
+1. **生成端可换档**：`--model-9b`（:1237 huihui 9B）+ `--out`；新增 `llm_allow(port)`
+   守卫（换档也必须过闸，1235/1237 之外一律 `UrlGuardError`）。
+2. **3b 由「丢弃」升为「分域」**（配合 §29.1）：抽出纯函数 `decide_lang_scope` 三档。
+3. **词表 dump 行前置剔除**：`looks_like_hotword_dump`（标点切分后的**短块密度**判定 +
+   **纯数词块豁免**——否则报号行 `WhatsApp係一、二、三、四、五、六、七。係。` 会被
+   误判成 dump；首版「最长块 ≤N」的判法实测在 3459 行语料里只逮到 2 行，已废）。
+
+读数（真实语料：turns 用户轮 3381 + gaps 80）：
+
+| 档 | candidates | discarded | 主要丢弃原因 |
+|---|---|---|---|
+| 4B（批次 2 读数） | 1 | 77 | no_evidence 38 / identity 16 / malformed 14 |
+| 9B（无 dump 过滤） | 2 | 106 | no_evidence 87 / identity 13 |
+| **9B + dump 过滤** | **0** | 108 | no_evidence 89 / identity 13 / contains_canonical 3 / lang_context_correct 2 / trigger_too_short 1 |
+
+**三条结论**：
+
+1. **9B 修好了「变体卫生」，但生成不是瓶颈**：`malformed_variant` 14 → 0（4B 会把
+   「赔偿→培偿」这种箭头解释当变体吐出来，9B 不吐）；然而 9B 的 108 条里 **89 条
+   （82%）在真实语料里零出现**——墙在**语料证据**，不在生成质量。换更大的生成端无收益。
+2. **本轮 2 个「幸存候选」全是 dump 伪影**（`專員→专员`、`京東→京东`）：它们的「证据」
+   行是 ASR 把热词表整行抄出来（`單號，運單，賠償，運費，專員，…`），不是客户话。
+   剔掉 dump 行后**候选直接归零** → E1 挖掘在**当前语料上零干净证据**。这也回头解释了
+   批次 2「候选=1」为什么是假信号（`集運` 的证据同样混着 dump 行）。
+3. **E1 路线定档**：机制（`snippets.py` + 语言分域 + 接线）保留且已测；**词表维持空
+   seed（人工确认制）**，不自动灌入。**再挖的触发条件**＝语料到 **E2 生效后**的新数据
+   （E2 运行时已丢弃纯 dump 轮，未来语料天然干净）——届时重跑 `--model-9b` 才有意义。
+
+测试：新增 `tests/test_snippet_mining_helpers.py`（26 项：dump 判定含数词豁免、分域
+三档、变体卫生、反向安全、白名单守卫、与 `snippets` 严格轨的契约对齐）。
+
+### 29.4 AGENTS.md 新增「Context 管理纪律」（长会话）
+
+用户直接要求：**上下文估算超 512K tokens（或收到 harness 压缩提示）时，不得直接压缩
+——先落盘再压缩**。已写进 `AGENTS.md` 新节，顺序为：整理已完成计划 → 消灭双轨结论 →
+写清未完成项可续性 → 落盘确认后才 `/compact`；红线 = 未落盘就压缩、拿代码注释或
+commit message 充当计划档。**本 §29 即该纪律的首次执行产物**（同时也是它第一次
+被用来回标修正 §24.1——旧结论不再并列保留，只留一句指向本文的修正指引）。
+
+### 29.5 集成验证与未完成项
+
+- 验证：全量 pytest **2159 passed**（批次 3 净增 53 项）＋ compileall ＋ 术语门禁绿。
+- 未完成（下一批候选，按优先级）：①§29.2 的三步前置（话音源切云 → 清 8788 引用 →
+  评估种子）——这是「TTS 退役」真正的下一步；②R3 澄清后效果 A/B（需真栈时间窗）；
+  ③E5 术语双轨 A/B（术语进 MT prompt vs MT 前正则归一）；④E7 离线润色面（生成模型
+  待定）；⑤Mimosa 1265 条静态候选分诊 + `scanner_enobufs` 收口；⑥DashScope key
+  轮换（用户动作）。
+- 已知残余：E2 的 `fallback_text` 在 agent 侧恒空（STT 不暴露 partial）→ 单词泄漏
+  护栏弱化；给 STT 加 partial 暴露口后补（批次 4 候选）。
