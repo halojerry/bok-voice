@@ -431,9 +431,9 @@ class MlxLlmLLM(_OpenAICompatBase):
         )
 
     # ---- 主回复 deadline + 兜底直念（2026-09-17,治「LLM 卡死整轮哑火」）----
-    # 客服口径（用户拍板 2.5s,可再收紧）:等 8s/重试链=这通电话已废。三层:
+    # 客服口径（用户拍板 3.0s,可再收紧）:等 8s/重试链=这通电话已废。三层:
     # ①首 token 截止——_LlmFallbackStream 对第一块 ChatChunk 计时
-    #   （LLM_FIRST_TOKEN_TIMEOUT_S 默认 2.0,0=关）,超时立即出三语兜底句,
+    #   （LLM_FIRST_TOKEN_TIMEOUT_S 默认 3.0,0=关）,超时立即出三语兜底句,
     #   但**唔弃流**:后台 drain 继续消费本流收晚到真答案(次级截止
     #   LLM_LATE_ANSWER_DEADLINE_S 默认 8s,0=回 aclose+regen 旧行为)——
     #   aclose 弃流换不来服务端停解码(mlx 无断连中止),二发只排其后抬 TTFT;
@@ -460,7 +460,7 @@ class MlxLlmLLM(_OpenAICompatBase):
 
     def set_fallback_gate(self, cb) -> None:
         """装配时注入「兜底抑制闸」(2026-09-17 call-11132bdd):cb()=True 表示
-        本轮垫话已出声盖耳——2s 首 token 超时的道歉句再出声=「垫话+道歉+晚到
+        本轮垫话已出声盖耳——3s 首 token 超时的道歉句再出声=「垫话+道歉+晚到
         真答案」三连叠音。闸合时跳过流内兜底 chunk,靠 drain/晚到补答交付;
         drain 无产出落 watchdog 兜底(顺延过,6s)。None=不抑制(旧行为)。"""
         self._fallback_gate = cb
@@ -485,9 +485,9 @@ class MlxLlmLLM(_OpenAICompatBase):
     @staticmethod
     def _first_token_timeout_s() -> float:
         try:
-            return float(os.environ.get("LLM_FIRST_TOKEN_TIMEOUT_S", "2.0") or 0)
+            return float(os.environ.get("LLM_FIRST_TOKEN_TIMEOUT_S", "3.0") or 0)
         except ValueError:  # pragma: no cover - 配错回默认
-            return 2.0
+            return 3.0
 
     def chat(
         self,
@@ -549,7 +549,7 @@ class _LlmFallbackStream(llm.LLMStream):
     """主回复出口闸：首 token 截止 + 失败兜底直念（LLM 出口单点拦截）。
 
     三条路都汇到同一句本地兜底（零模型调用）:
-    - 首 token 超时（LLM_FIRST_TOKEN_TIMEOUT_S,客服拍板默认 2.5s）:
+    - 首 token 超时（LLM_FIRST_TOKEN_TIMEOUT_S,默认 3.0s）:
       首 chunk 计时到点立即出兜底句——但**唔弃流**(2026-09-17 RC4):
       mlx 服务端无断连中止,被 aclose 的请求照解码到完才放锁,二发重生只排其后
       (僵尸解码税,实测 [watchdog] 后紧跟 TTFT 3872ms)。改为后台 drain 继续消费
