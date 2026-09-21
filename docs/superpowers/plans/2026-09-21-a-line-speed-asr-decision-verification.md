@@ -1707,3 +1707,48 @@ TTFT 分布（n=2607）：p50 943ms / p90 2487ms / p99 7041ms / max 20738ms；
 5. **分工**：真实碎片轮的大头本不该到判定层——先由快路/漏网轮治理（L-① 图词/分支提案）
    消化；澄清闸只兜「该问而问不出」的残余（§11.5 第 4 条的澄清后效果 A/B 仍是
    未测的最后一环）。
+
+---
+
+## 24. 两项产品定案（2026-09-21）：本地 TTS 轨道退役；LLM 校正换岗
+
+### 24.1 TTS：本地 Qwen3-TTS 轨道退役（用户拍板：速度与音色都不如云端 MiniMax）
+
+本地模型文件已由用户删除（`mlx-community/Qwen3-TTS-12Hz-1.7B-*` ×2）。**退役是代码级
+移除，不只是文档**——引用面盘点（2026-09-21 实查）：
+
+| 位置 | 内容 |
+|---|---|
+| `tools/bok.py` MODELS | `tts_preset`/`tts_clone` 四条（mac 8bit ×2 :88-89、windows bf16 ×2 :104-105） |
+| `tools/bok.py` :8788 sidecar | serve/monitor 两处 spawn（:1041-1093）+ alone-restart |
+| 健康面 | `CORE_PORTS`/`PROD_HTTP_CHECKS` 里的 tts 条目（:363/:379）——`_model_present` 会因模型已删而假报 MISSING |
+| default_settings | `"tts": {"provider": "qwen3_tts", …}`（:756） |
+| `apps/agent` | A 线 provider 构造引用 :8788（agent.py:2616）；B 线 `interpret.py` 的**离线兜底腿**（:408/:477-483）；`livekit_plugins.py` Qwen3TTS adapter（:4349） |
+| `apps/web` | `voice-options.ts` 本地克隆/本地预置音色源 + personas `listTtsSpeakers/listTtsVoices/registerTtsVoice` 本地链 |
+
+**后果声明（拍板时已确认）**：退役后 B 线失去离线 TTS 兜底——B 线必须配 MiniMax key；
+罐头预生成（`pregen_tts.py`）本就走 MiniMax，不受影响。移除 PR 应一并清 health surface
+与 doctor 的对应判定，避免 `doctor --packaged` 因模型已删假红。
+
+### 24.2 ASR/校正：语言钉定已上线；热词不是缺口；LLM 换岗不做「输出校正」主力
+
+用户问题：「对象语言输入应选 ASR 对应语言才识别得准（如探测所示）；语言千变万化、
+热词可能不够，是否还是要 LLM 助力？」——按已完成的实测链回答：
+
+1. **「按通话语言选 ASR 语言」已上线**（每通语言钉定：ASR hint 装配时一次钉死本通语言，
+   zh 也显式下发；sidecar 传规范 `language` 消除 auto 误判）。探测同款结论：hint 对，
+   识别才对。
+2. **热词不是缺口**：V-3.1 实测热词边际归零——现行档之上加词收益 ≈0，且
+   嬲/賠償/單號/倉类在多档下都错。「千变万化」的部分不靠词表。
+3. **LLM 做输出校正主力：否**（三次实测）：
+   - V-3.3：**语义不能吸收 ASR 损伤**（猜想被证伪）——信息已销毁的输入救不回；
+   - V-7：修正提示词后词表约束保真 0.42→0.47-0.61，但意图仅 6→7（n=10 噪声内）
+     ——「次序对，天花板仍低」；
+   - V-3.2：输出端音学校正上界 4-5/10，8 路歧义。
+4. **LLM 的正确岗位（已验证）**：
+   - **失败检测 + 显式澄清**（V-5/R1）：不猜，margin 低就澄清。真实集精确率 98%，
+     覆盖 39%——安全网，不是主力；
+   - **业务域结构化兜底**（QA 快路/图词条/L-① 漏网轮挖掘）：「千变万化」里反复出现的
+     说法沉淀成词条，字面命中就不走自由生成。
+5. **主力缺口在 ASR 本体**（V-3 结论）：云端同族大杯（Qwen3-ASR-Flash）试点，
+   针对热词救不动的硬混淆——**key 轮换后**做同音频 A/B（`probe_hotword_ab` 同款装置）。
