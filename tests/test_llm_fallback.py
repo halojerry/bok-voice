@@ -119,7 +119,7 @@ def test_request_conn_options_negative_retry_clamped_to_zero(monkeypatch):
 
 def test_first_token_timeout_default_and_env(monkeypatch):
     monkeypatch.delenv("LLM_FIRST_TOKEN_TIMEOUT_S", raising=False)
-    assert MlxLlmLLM._first_token_timeout_s() == 2.0
+    assert MlxLlmLLM._first_token_timeout_s() == 3.0
     monkeypatch.setenv("LLM_FIRST_TOKEN_TIMEOUT_S", "1.5")
     assert MlxLlmLLM._first_token_timeout_s() == 1.5
     monkeypatch.setenv("LLM_FIRST_TOKEN_TIMEOUT_S", "0")
