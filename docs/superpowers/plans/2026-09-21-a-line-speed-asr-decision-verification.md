@@ -2965,3 +2965,99 @@ PR #140 的 CI 两跑一红一绿，失败是
 - **环境状态（交接）**：本机栈现**由主树 `bok.py serve` 持有**（最新 main 代码，12 项 UP），
   对等会话 `20260919-232858-4eb7` 与其 monitor **已被停止**（用户授权窗口）；若要归还，
   请从那个会话的工作树重启它的栈。
+
+## 37. 实弹批次（2026-09-21 夜）：探针话音源切云后的**新基线重取**——作废面已清点、B 线不受影响、ASR 热词 A/B 旧结论被证伪为**刺激混淆**
+
+### 37.1 为什么要重取（根因：刺激源就是测量锚）
+
+探针读数（首声、感知延迟、同传 lag）全都是「**客户话音的某个时点** → agent 出声」的差值。
+而客户话音是**合成出来的**：换合成器 = 换信号（音质/语速/韵律/标点/停顿）→ ASR 的
+partial 与句级提交点位移 → 读数位移。**这不是 agent 变慢/变快，是尺子换了。**
+
+- 两个后端的差异有据：`mm_voice.py` 自己记录本地 Qwen3-TTS 粤语短词的 ASR 可懂度差
+  （「拼多多」→「二。二。」），云端 MM 回读才好（「拼多多/淘宝/正东」2/3 全对）。
+  可懂度直接决定「ASR 何时给出稳定前缀」→「何时提交」→「何时进 MT/TTS」。
+- 切换装置本身（批次 4，§30.2）就按「**刻意的、显式的**」设计：`resolve_stimulus_backend`
+  只认字面量 `cloud`，其余/空/未知一律 `local`，绝不静默改基线。§36.2 才是执行切换。
+- 故 §36.2 的口径警告成立：**A 线实时读数作废；B 线罐头-wav 探针例外（见 37.3）。**
+
+### 37.2 涉及代码：三档清点（本轮**零代码改动**——装置已覆盖全部实时探针）
+
+| 档 | 内容 |
+|---|---|
+| **开关本体** | `scripts/probe_stimulus.py`（`ENV_SWITCH`／`resolve_stimulus_backend`／`stimulus_pcm`／`_local_pcm`）；云端腿 `scripts/mm_voice.py::mm_pcm`（t2a_v2／16k PCM／音色按 lang 映射／key 从真库 `tts_json` 只读／**空音频抛错不静默**） |
+| **已接线（9 个直接消费点）** | `e2e_real_customer`／`e2e_barge_in`／`e2e_edge_cases`／`e2e_trilingual_livekit`／`mock_callee`／`probe_vad_head_syllable`／`probe_hotword_ab`／`probe_brand_words`／`probe_interp_continuous` |
+| **二级传递（4 个，靠 import 透传，同样已覆盖）** | `probe_filler_timing`（←`e2e_barge_in.tts_pcm`）／`probe_latency_soak`（←`e2e_real_customer as erc`）／`probe_offscript_soak`（同）／`probe_interp_backlog`（←`e2e_edge_cases.tts_pcm`） |
+| **不在覆盖面（罐头 wav，与开关无关）** | `e2e_interpret`／`probe_interpret_latency`／`probe_interp_duplex` 读 `tests/fixtures/audio/{zh,en,cantonese}.wav`（**tracked** 二进制，2026-09-03/05 落库） |
+
+**盘点纠正**：本轮开始时按「`probe_filler_timing` 自己直连 :8788」立过回补项，读码后发现它的
+`tts_pcm` 是从 `e2e_barge_in` import 的（已接线）——**A 线实时探针族 100% 在开关覆盖面内，
+无需回补**。若将来要让 B 线也吃云话音，先要做一个独立决定：重渲染 `tests/fixtures/audio/*.wav`
+是改 **tracked 二进制**，会同时改到 `e2e_multi_turn`／`loadtest_calls`／`smoke_sidecars`／
+`ab_vad_ten_vs_silero`／`probe_smart_turn` 等消费者的语义——本轮不动。
+
+### 37.3 新基线表（云端话音）与可比性
+
+| 探针 | 云端读数（本轮） | 旧读数（本地话音） | 可比？ |
+|---|---|---|---|
+| `probe_filler_timing`（`FILLER_REQUIRE=1`） | **PASS** `first_audio=1819ms`（预算 2500）`filler_fired=True` | 同预算 2500ms | ✗ 数值不可比（结论同向） |
+| `e2e_barge_in` | **PASS** `stop_ms=2391` `resume_ms=4525`（§36.3 云读数 2037/5955） | `stop≈2.4s` | ~ 同档，口径已改云 |
+| `probe_latency_soak --scenario soak-canto` | **PASS** 11 轮/0 哑；首声 p50 **2576**/p95 6407；perceived p50 **3893** | — | ✗ 不可比 |
+| `probe_brand_words` | **12/16** `intact_single` | 10/16 → 14/16（词表前缀 hold 收编后） | ✗ 不可比（见 37.4） |
+| `probe_hotword_ab`（10 句×3 档） | none **10/10** / current **10/10** / extended **10/10**；相似度 .929/.929/.940；端到端 209/211/239ms；extended 成本 **+14.2%** | 「过线词真实受益；嬲/賠償/單號/倉 各档都错」 | ✗ **旧结论被证伪为刺激混淆**（见 37.4） |
+| `probe_interpret_latency`（B 线） | **PASS** `lag=[2235,2989] avg=2612ms`（预算 3500） | 2478／2503／2581／2636-2654ms | ✓ **可比**（刺激=同一份罐头 wav，未变） |
+
+`probe_filler_timing` 本轮加了**非 QA 文本**（`FILLER_TEXT="我個盒好似畀人開過喎"`）才测到垫话——
+§36.3 那次 FAIL 是探针假阳（默认文本命中 QA 快路 → 零 LLM → 无需垫话，属正确行为）。
+
+**B 线三探针不受云切换影响**：其刺激是仓库里那份 2026-09-05 的罐头 wav，与 `BOK_PROBE_STIMULUS`
+无关；本轮 2612ms 与切换前 2503ms 同档（≈+4%，噪声内）即佐证。**B 线延迟基线继续有效。**
+
+### 37.4 本轮最要紧的发现：热词 A/B 三档无差 → 旧结论的「受益」来自碎裂话音
+
+`probe_hotword_ab` 的公平 A/B（每句只合成一次、三档共用同一条音频）在**云话音**下读：
+**none/current/extended 三档 10/10 全中、相似度 0.929/0.929/0.940**，唯一瑕疵句
+「你哋個倉喺邊度㗎」三档同错（sim=0.88）。历史「过线词真实受益（機器人/邊度/熱線/證明类）」
+是在**本地 Qwen3-TTS 话音**上读的——而那份话音本身就是碎裂面的主要来源。含义：
+
+1. **词表的边际收益随刺激源而变**：在「与碎裂面同分布」的音频上有效，在清晰话音上不可观测。
+2. 这**不是**「词表没用」：真实人声是第三种分布，两个 TTS 后端都只是替身；结论要落到真实通话
+   口径（turns 账本的转写碎裂率），不能靠任一合成腿单独定案。
+3. 成本面本轮有数：`current` 相对 `none` 的 ASR prefill 代价 ≈ +1%（211 vs 209ms），
+   `extended` **+14.2%**（239ms）——扩容到 extended 档要拿真实收益换这 14%。
+4. 两条探针 docstring 已写入「刺激源敏感性」前置警告（报数必须带刺激源）。
+
+### 37.5 逐轮时间数据（`soak-canto`，11 轮；JSON `reports/latency-soak/1790003502-soak-canto.json`）
+
+首声（墙钟，秒）：0.00 / 1.01 / 1.73 / 3.46 / 1.62 / 6.41 / 4.10 / 2.15 / 2.58 / 4.81 / 3.17
+（11 轮全有答、0 哑；超 2500ms 预算 6 轮，含按设计的对抗轮 `interrupt`/`fast`/`digits2`）
+
+**感知延迟三段分解**（`perceived = eou + llm + tts`，n=7）——**优化靶点一目了然**：
+
+| # | total | eou（停嘴确认） | llm（生成） | tts（首包） |
+|---|---|---|---|---|
+| 1 | 4182 | 709 | **2754** | 719 |
+| 2 | 3499 | 708 | **2754** | 37 |
+| 3 | 2165 | 701 | 1429 | 35 |
+| 4 | 3893 | 731 | 1803 | 1359 |
+| 5 | 2357 | 480 | 1820 | 57 |
+| 6 | 5479 | 0 | **4792** | 687 |
+| 7 | 5892 | 732 | **4792** | 368 |
+
+- **LLM 是主项**（1429-4792ms），**暂停确认 eou 是固定成本**（~0.7s），TTS 首包 35-1359ms。
+- p95 由两条 llm=4792ms 的轮决定；这两轮同时打了 `LLM_FIRST_TOKEN_TIMEOUT`/`LLM_LATE_ANSWER`
+  （哨兵计数 3/3）、`LLM_FALLBACK_TEXT` 1、`starve-ack` 1、`BOK_FILLER fired` 3——即**慢轮靠
+  垫话/兜底保住体感**，与 §36.3 的同族读数一致。
+- `[whatsapp] captured` 1（`digits2` 轮，11 位报号走 `digits2` 形态推流后仍捕获）。
+
+### 37.6 验证与队列
+
+- 验证：本轮**零代码改动**（仅两处探针 docstring + 本文档）；实弹 6 项（ASR 直打 2 + A 线 3 + B 线 1）
+  全绿且读数已入档；B 线可比性结论由同刺激源前后读数支撑。
+- 队列（更新）：①~~探针话音源切云后的新基线重取~~（**本轮完成**：A 线数值面已重建，B 线确认不受影响）；
+  ②打断后「内容丢弃 + 约 40s 静默才补位」单独立项（`resume_ms` 4.5-6.0s 说明恢复本身不慢）；
+  ③`latency_ms` 沿用口径（§36.4）；④polish 接直播 ASR 路径（落点+KV 约束已定）；
+  ⑤Guard 挂 snippet 应用点；⑥`branch-pregen` 键归属；⑦Linux 基线（押后）；
+  ⑧**新增**：词表价值的真实人声口径统计（turns 转写碎裂率，别再用合成腿定案）；
+  ⑨**新增（可选）**：B 线若要吃云话音，需先决定是否重渲染 `tests/fixtures/audio/*.wav`。
+

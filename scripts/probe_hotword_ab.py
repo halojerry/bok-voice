@@ -9,7 +9,8 @@
   current   现有行业表（agent.py _ASR_HOTWORDS["cantonese"]，逐词一致）
   extended  行业表 + 候选追加词（与另一路落表完全一致）
 
-链路：TTS sidecar(:8788) 合成客户音频（每句只合成一次、三档共用同一条音频=
+链路：客户话音经 `probe_stimulus` 单点开关合成（默认本地 TTS sidecar :8788；
+`BOK_PROBE_STIMULUS=cloud` 走云端 MiniMax，每句只合成一次、三档共用同一条音频=
 公平 A/B），ASR sidecar(:8787) 直打——POST /api/start?language=cantonese&context=
 开会话（context 即「Vocabulary: …」串，与 agent asr_hotword_context() 同格式），
 POST /api/finish 整包 PCM body 一次性解码（sidecar 生产契约的整句路径）。
@@ -19,6 +20,17 @@ POST /api/finish 整包 PCM body 一次性解码（sidecar 生产契约的整句
 全句归一化相似度（SequenceMatcher，归一口径同 probe_latency_soak._norm_text，
 外加繁→简与 ASR 简化渲染变体折叠）。耗时 = start→finish 端到端墙钟（含
 Vocabulary prefill，extended 档词表更长即量此项；判据：增量 <15% 算无感）。
+
+刺激源敏感性（2026-09-21 实测，结论前必读）
+--------------------------------------------
+**本探针的结论对刺激源敏感，报数必须带刺激源。** 历史结论「过线词真实受益
+（機器人/邊度/熱線/證明类）」是在**本地 Qwen3-TTS 话音**上取的——而本地合成音的
+粤语短词 ASR 可懂度差（`mm_voice.py`：碎片化的主要来源），词表扩容因此显得有效。
+换**云端 MiniMax 话音**后同 10 句实测：**none/current/extended 三档 10/10 全中、
+平均句相似度 0.929/0.929/0.940、端到端 209/211/239ms**（extended 成本 +14.2%）——
+即清晰话音下**边际收益不可观测**，词表价值只在与「碎裂面」同分布的音频上才显现。
+两个 TTS 后端都只是**替身**，真实人声是第三种分布；要判词表价值，请把刺激源
+（含具体后端）一并记录，并用同一刺激源做前后对比。
 
 用法：
   .venv312/bin/python scripts/probe_hotword_ab.py
