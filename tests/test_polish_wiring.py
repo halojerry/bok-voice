@@ -345,8 +345,13 @@ def _r1_corpus() -> list[dict]:
 def test_r1_corpus_measurement_baseline(monkeypatch):
     """R1 标注语料 152 轮的实测读数（默认策略；改 polish.py 会动这里——正是目的）。
 
-    读数含义：48/152 轮被改（31.6%）、1 轮润色稿被 Guard 判空回退原文、0 轮被
-    其它原因拒。这两个数是「默认关」判断的量化依据之一（见文件头）。
+    读数含义：**41**/152 轮被改（27.0%）、1 轮润色稿被 Guard 判空回退原文、0 轮被
+    其它原因拒。这几个数是「默认关」判断的量化依据之一（见文件头）。
+
+    2026-09-21 修正：48 → **41**（-7）。差量＝报号短路生效（``is_number_reporting``
+    主动进流水：这批轮里含 4 位以上数字串/号码关键词，整句逐字返回）。**读数变小是
+    好事**——旧档洗掉的正是「客户念的号码」，其中真库侧实测有 ``四三二零一一一。→
+    四三二零一。`` 这类破坏。数目证据：真库 3063 条客户轮，数字面变化 69 → 3。
     """
     from bok_voice_core.polish import polish_text
 
@@ -363,11 +368,11 @@ def test_r1_corpus_measurement_baseline(monkeypatch):
         if not result.guard.accepted:
             rejected += 1
             reasons[result.guard.reason] = reasons.get(result.guard.reason, 0) + 1
-    assert changed == 48
+    assert changed == 41
     assert rejected == 1 and reasons == {"empty": 1}
     # 接线层与本体同读数（关档不动、开档即本体输出）
     monkeypatch.setenv(POLISH_OFFLINE_ENV, "1")
-    assert sum(1 for r in corpus if polish_offline_text(r["txt"]) != r["txt"]) == 48
+    assert sum(1 for r in corpus if polish_offline_text(r["txt"]) != r["txt"]) == 41
 
 
 def test_ascii_runs_never_collapsed(monkeypatch):
