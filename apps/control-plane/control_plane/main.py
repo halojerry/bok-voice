@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import io
+import ipaddress
 import json
 import os
 import re
@@ -113,6 +114,55 @@ _TERMINAL_CALL_STATUSES = (CallStatus.ENDED.value, CallStatus.FAILED.value)
 # 旧版短路令「存在且 active」可被 ~20× 响应差探测（1.1ms vs 25.5ms 实测）。
 _DUMMY_PASSWORD_HASH = hash_password("bok-dummy-login-timing-equalizer")
 
+# ---- 启动锚：裸放行 × 非回环 bind（2026-09-21 安全收编，Item 1）----
+# 双关（BOK_AUTH_REQUIRED / BOK_CP_TOKEN 均未设=本机单用户默认形态）时全部 /api/*
+# 放行、CORS 回落 "*"——一旦 bind 到回环之外，同网段任何人可读改业务库、铸房
+# token、下发节点指令。缺省 bind 恒 127.0.0.1（tools/bok.py::_cp_bind_host）；
+# 云端容器 CMD 显式 --host 0.0.0.0，但 install.sh 强制写 BOK_AUTH_REQUIRED=1——
+# 所以「非回环 × 双关」只可能是配置事故，启动即拒绝，不接受静默裸奔。
+
+
+def _is_loopback_host(host: str) -> bool:
+    """回环判定：空/缺省=uvicorn 默认 127.0.0.1；localhost/127.x.x.x/::1 均回环。
+    解析不出 IP 的主机名一律判非回环（fail-closed：宁可拒启也不裸奔）。"""
+    h = (host or "").strip().strip("[]").lower()
+    if not h or h == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
+def _resolved_bind_host(argv: list[str] | None = None) -> str:
+    """CP 预定 bind 地址的运行时视图。两个来源（与 tools/bok.py 单点对齐）：
+
+    ① `--host <v>`（argv）——uvicorn 直启形态（Dockerfile/deploy CMD `--host 0.0.0.0`）
+       与 bok.py serve/prod 单元实际下发的值，即 uvicorn 真正吃的地址；
+    ② `BOK_BIND_HOST`——bok.py::_cp_bind_host 的唯一来源（最终同样落成 argv）。
+    argv 优先（它是实际生效值）；皆无=uvicorn 默认 127.0.0.1。"""
+    args = list(sys.argv if argv is None else argv)
+    for i, arg in enumerate(args):
+        if arg == "--host" and i + 1 < len(args):
+            return args[i + 1]
+        if arg.startswith("--host="):
+            return arg.split("=", 1)[1]
+    return (os.environ.get("BOK_BIND_HOST") or "").strip()
+
+
+def _unsafe_open_bind(host: str, *, auth_on: bool, cp_token: str) -> bool:
+    """纯判定（离线可测）：非回环 bind × 认证双关 = 拒绝启动。"""
+    return (not auth_on) and (not (cp_token or "").strip()) and not _is_loopback_host(host)
+
+
+def _cors_allow_origins(configured: list[str], host: str, *, auth_on: bool, cp_token: str) -> list[str]:
+    """CORS 白名单（纯判定，同启动闸判据）：显式 BOK_CORS_ORIGINS 恒照用；否则
+    裸放行 × 非回环不回落到 "*"（该形态 startup 会拒绝启动，这里是纵深防御——
+    启动闸万一被绕过，跨源读也不开天窗）。"""
+    if configured:
+        return configured
+    return ["*"] if not _unsafe_open_bind(host, auth_on=auth_on, cp_token=cp_token) else []
+
 
 app = FastAPI(
     title="Bok Voice Control Plane",
@@ -128,10 +178,17 @@ app = FastAPI(
 # 它要在 CorrelationMiddleware 内层运行——读取其 correlation 并覆写 user_id=已验证
 # 身份，审计 actor 由此自动落账（见 auth.py 模块注释）。
 app.middleware("http")(identity_gate)
-_cors_origins = [o.strip() for o in os.environ.get("BOK_CORS_ORIGINS", "*").split(",") if o.strip()]
+# 未设 env 时 `[]`（交由 _cors_allow_origins 按启动闸判据决定缺省，别再喂 "*"——
+# 那会把「显式配置」与「缺省」混同，令裸放行档的 `*` 收窄永不生效）。
+_cors_origins = [
+    o.strip() for o in os.environ.get("BOK_CORS_ORIGINS", "").split(",") if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cors_origins or ["*"],  # 云端部署设 BOK_CORS_ORIGINS 收敛到管理台 origin
+    allow_origins=_cors_allow_origins(
+        _cors_origins, _resolved_bind_host(), auth_on=auth_required(),
+        cp_token=os.environ.get("BOK_CP_TOKEN", ""),
+    ),
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -270,6 +327,19 @@ def _seed_root_user() -> None:
 @app.on_event("startup")
 def _startup() -> None:
     configure_logging(level=os.environ.get("BOK_LOG_LEVEL", "INFO"))
+    # 启动锚（Item 1）：非回环 bind × 双关 = 全 API 裸放行对外，拒绝启动。
+    # 放在最前——先于 DB 迁移/种子，配置事故不落任何副作用。
+    _bind_host = _resolved_bind_host()
+    if _unsafe_open_bind(
+        _bind_host, auth_on=auth_required(),
+        cp_token=os.environ.get("BOK_CP_TOKEN", ""),
+    ):
+        raise RuntimeError(
+            f"拒绝以裸放行形态对外监听：bind={_bind_host!r}（非回环）且 BOK_AUTH_REQUIRED / "
+            "BOK_CP_TOKEN 均未配置——/api/* 将对所有网络可达者无鉴权。请配置 "
+            "BOK_AUTH_REQUIRED=1（+BOK_JWT_SECRET）或 BOK_CP_TOKEN，"
+            "或改回回环 bind（BOK_BIND_HOST=127.0.0.1）。"
+        )
     # 云托管管理台运行时 CP 地址注入（见 _write_web_runtime_config docstring）：
     # 在首个请求前落盘，缺省/本地形态零动作。
     _public_cp_url = (os.environ.get("BOK_CP_PUBLIC_URL") or "").strip()
@@ -5157,11 +5227,13 @@ def _verify_livekit_webhook(request: Request, body: bytes) -> bool:
     """LiveKit webhook 官方验签：Authorization Bearer JWT（HS256/LIVEKIT_API_SECRET）
     + video.webhook grant + sha256(body) 摘要（2026-09-16 深测 P2）。
 
-    P3-C：auth-on（BOK_AUTH_REQUIRED=1）下 secret 为空=配置事故——伪造
-    participant_left 可触发 LiveKit 云 API 放大调用，不再 fail-open，401 拒收
-    （detail 指明漏配项）；双关 auth-off 与 CP-token-only 保留放行+打点（后者
-    行为被 tests/test_debug_sweep.py::test_webhook_bypasses_cp_token_gate 钉死
-    ——F2 修复语义「中间件/端点不得拦无 LiveKit 联调形态的 webhook」优先）。
+    P3-C + Item 4（2026-09-21）：secret 为空时**不再无条件 fail-open**——auth-on
+    （BOK_AUTH_REQUIRED=1）或非回环 bind 都是配置事故（伪造 participant_left 可触发
+    LiveKit 云 API 放大调用），一律 401 拒收（detail 指明漏配项）。唯一 carve-out=
+    「回环 bind + 双关 auth-off」（本地无 LiveKit 联调形态）：agent 崩溃补位链路依赖
+    webhook（F2 契约，tests/test_debug_sweep.py::test_webhook_bypasses_cp_token_gate
+    钉死），且仅本机可达——保留放行但每次打点 webhook.unsigned。CP-token-only 若仍
+    绑回环同属此档（不加 secret 前不放行到网络面）。
     """
     import hashlib
 
@@ -5170,17 +5242,18 @@ def _verify_livekit_webhook(request: Request, body: bytes) -> bool:
     global _webhook_secret_warned
     secret = getattr(app.state, "lk_secret", "") or os.environ.get("LIVEKIT_API_SECRET", "")
     if not secret:
-        if auth_required():
+        _exposed = auth_required() or not _is_loopback_host(_resolved_bind_host())
+        if _exposed:
             if not _webhook_secret_warned:
                 _webhook_secret_warned = True
                 control_log.warning(
                     "webhook_secret_missing_hardened",
                     extra={"event": "webhook.secret_missing",
-                           "data": {"hint": "auth-on 要求 LIVEKIT_API_SECRET，未配置前 webhook 一律 401"}},
+                           "data": {"hint": "auth-on 或非回环 bind 要求 LIVEKIT_API_SECRET，未配置前 webhook 一律 401"}},
                 )
             raise HTTPException(
                 status_code=401,
-                detail="webhook secret not configured — LIVEKIT_API_SECRET is required when auth is hardened",
+                detail="webhook secret not configured — LIVEKIT_API_SECRET is required unless the CP binds loopback with auth disabled",
             )
         control_log.warning("webhook_unsigned_accepted", extra={"event": "webhook.unsigned"})
         return True
@@ -5215,8 +5288,9 @@ async def livekit_webhook(request: Request) -> dict:
     # participant_left 会触发最多 3 轮 LiveKit 云 API 放大调用 + _redispatch_locks
     # 无界增长。官方姿势：LiveKit server 以 LIVEKIT_API_SECRET 签 JWT（HS256，
     # video.webhook grant）并在 claim 里带 sha256(body) 摘要——双验。
-    # LIVEKIT_API_SECRET 未配置：双关 auth-off（本地无 LiveKit 联调）放行并打点；
-    # 加固模式属配置事故 → P3-C 起 401 拒收（详见 _verify_livekit_webhook）。
+    # LIVEKIT_API_SECRET 未配置：仅「回环 bind + 双关 auth-off」（本地无 LiveKit
+    # 联调）放行并打点；auth-on 或非回环 bind 属配置事故 → 401 拒收
+    # （详见 _verify_livekit_webhook，Item 4）。
     raw = await request.body()
     if not _verify_livekit_webhook(request, raw):
         raise HTTPException(status_code=401, detail="invalid webhook signature")

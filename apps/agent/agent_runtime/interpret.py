@@ -31,6 +31,11 @@ import time
 from collections import deque
 from pathlib import Path
 
+# B 线 MT 出口确定性语言校验器(E5 增补):纯函数、零 LLM、零网络。判据本身只做
+# 脚本族(CJK vs 拉丁)判定——见 bok_voice_core.mt_lang_check 模块 docstring 的
+# 能/不能边界(治 en↔zh/cantonese 的脚本级错语言;测不出 zh↔cantonese)。
+from bok_voice_core.mt_lang_check import language_match_score, looks_like_language
+
 
 def _norm_lang(raw: str, default: str = "zh") -> str:
     key = (raw or "").strip().lower()
@@ -240,15 +245,34 @@ def _build_mt_context(instructions: str, pairs, text: str):
     return ctx
 
 
-async def _mt_once(llm_provider, ctx, *, timeout_s: float = 15.0) -> str:
-    """单句直调翻译 LLM(StatelessMTLLM/通用 LLM 同一入口),超时保护防句堆积。
+def _mt_lang_guard_enabled() -> bool:
+    """B 线 MT 出口语言校验器总闸(E5 增补,**默认开**)。
 
-    conn_options 必显式给——插件内芯直接读 conn_options.max_retry,session 托管
-    调用才有默认值,直调传 None 会 AttributeError(max_retry of None)。直调档
-    单次尝试不重试:重试是延迟放大器,积压由背压门槛管。"""
+    默认开的理由:判据是纯 Python 正则扫描(微秒级),正常轮**零额外网络/零额外
+    延迟**;只有输出真判为错语言时才多一次 MT 往返(且至多一次)。即「宁可在病态
+    轮多花一次往返,也不放一整句错语言出去」——正常路径零回归,病态路径有界
+    代价,故默认安全。``BOK_INTERP_MT_LANGGUARD=0`` 一键回退到「出口不校验、
+    照原样出稿」的旧行为。"""
+    return os.environ.get("BOK_INTERP_MT_LANGGUARD", "1") == "1"
+
+
+def _mt_open_stream(llm_provider, ctx, *, retry: bool):
+    """开一条单句翻译流:conn_options 必显式给 max_retry=1。
+
+    插件内芯直接读 conn_options.max_retry,session 托管调用才有默认值,直调传
+    None 会 AttributeError(max_retry of None)。直调档单次尝试不重试:重试是延迟
+    放大器,积压由背压门槛管。``retry=True`` 走 StatelessMTLLM.chat_retry(强化
+    prompt);通用回退 LLM 无该方法,调用方据此决定是否可重试。"""
     from livekit.agents import APIConnectOptions
 
-    stream = llm_provider.chat(chat_ctx=ctx, conn_options=APIConnectOptions(max_retry=1))
+    opts = APIConnectOptions(max_retry=1)
+    if retry:
+        return llm_provider.chat_retry(chat_ctx=ctx, conn_options=opts)
+    return llm_provider.chat(chat_ctx=ctx, conn_options=opts)
+
+
+async def _mt_collect(stream, timeout_s: float) -> str:
+    """把一条翻译流排空成整句(超时保护),awaitable 流先 await(旧 _mt_once 同款)。"""
     if inspect.isawaitable(stream):
         stream = await stream
     parts: list[str] = []
@@ -262,6 +286,52 @@ async def _mt_once(llm_provider, ctx, *, timeout_s: float = 15.0) -> str:
 
     await asyncio.wait_for(_drain(), timeout=timeout_s)
     return "".join(parts).strip()
+
+
+async def _mt_once(llm_provider, ctx, *, timeout_s: float = 15.0, target_lang: str = "") -> str:
+    """单句直调翻译 LLM(StatelessMTLLM/通用 LLM 同一入口),超时保护防句堆积。
+
+    E5 增补(2026-09-21):``target_lang`` 非空且总闸开时,出口做**确定性语言
+    校验**(mt_lang_check.looks_like_language,纯函数)。不像目标语言 → 同句
+    **至多一次**强化重试(``chat_retry``,IMPORTANT RETRY 前缀+模板句内约束);
+    重试仍错 → **按现状出稿**(绝不回退源文——同传断流比错语言伤害更大,反向
+    取舍写明于 plan §26.2-E5)。本函数无循环、重试后不再判,结构性不会累加。
+
+    延迟纪律:重试只在「首次**成功返回**但语言不对」时发生(超时/异常走原车道),
+    故额外代价至多一次 wait_for(同款 ``timeout_s``,默认 15s),与单句预算同量级;
+    重试流同样 max_retry=1。重试语言仍错时返回值=重试输出(不是原文)。"""
+    text = await _mt_collect(_mt_open_stream(llm_provider, ctx, retry=False), timeout_s)
+    if not text or not target_lang or not _mt_lang_guard_enabled():
+        return text
+    if looks_like_language(text, target_lang):
+        return text
+    if not callable(getattr(llm_provider, "chat_retry", None)):
+        # 通用回退 LLM(DeepSeek/主 LLM)无强化重试口:照现状出稿,只留观测行。
+        print(
+            f"[interp] MT_LANG_MISMATCH target={target_lang} "
+            f"score={language_match_score(text, target_lang):.2f} retry=unsupported emit-as-is",
+            flush=True,
+        )
+        return text
+    print(
+        f"[interp] MT_LANG_MISMATCH target={target_lang} "
+        f"score={language_match_score(text, target_lang):.2f} retry=1",
+        flush=True,
+    )
+    try:
+        retried = await _mt_collect(_mt_open_stream(llm_provider, ctx, retry=True), timeout_s)
+    except asyncio.TimeoutError:
+        print(f"[interp] MT_LANG_RETRY_TIMEOUT target={target_lang} emit-as-is", flush=True)
+        return text
+    if not retried:
+        return text
+    if not looks_like_language(retried, target_lang):
+        print(
+            f"[interp] MT_LANG_MISMATCH_RETRY_FAIL target={target_lang} "
+            f"score={language_match_score(retried, target_lang):.2f} emit-as-is",
+            flush=True,
+        )
+    return retried
 
 
 def _sidecar_url(cfg_value: str, env_key: str, default: str) -> str:
@@ -837,7 +907,7 @@ async def entrypoint(ctx) -> None:
             try:
                 t0 = time.perf_counter()
                 ctx = _build_mt_context(_llm_instructions, list(_mt_pairs), text)
-                translated = await _mt_once(llm_provider, ctx)
+                translated = await _mt_once(llm_provider, ctx, target_lang=target_lang)
                 _mt_latency["ms"] = int((time.perf_counter() - t0) * 1000)
                 if translated:
                     _mt_pairs.append((text, translated))

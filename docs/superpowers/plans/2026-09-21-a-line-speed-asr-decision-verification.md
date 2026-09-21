@@ -2335,12 +2335,14 @@ scan `scan-2026-09-21T02-11-19.508Z-5cac3aa631d5`（deep，`runStatus=inconclusi
   不到 CP 的鉴权中间件，于是把「handler 内有 `require_role`」判成「无鉴权」）／
   **需人工裁量 5 个系统性议题**／**新确认可利用：0**。
 - 优先清单（按真实风险，非扫描器严重度）：①**部署姿态**（双 auth env 皆未设时 `/api/*` 全开
-  + CORS `*`）——修法＝非回环绑定且无鉴权 env 时启动 fail-closed；②`POST /api/token`
-  可为**未记录房间**铸 publish token 并拉 agent（已知台账项）；③**扫描器漏掉**的三条
-  diag 路由（`/api/asr/health`、`/api/tts/health`、`/api/web_logs`）无角色闸；
-  ④`/api/webhook/livekit` 在无 secret 时 fail-open（已知台账项）；⑤MiniMax 音色增删打
-  全局 settings 行（需产品裁量）。**注意 ②④ 与仓库既有台账一致**——分诊确认了台账，
-  并发现扫描器**漏报**了 ③。
+  + CORS `*`）——修法＝非回环绑定且无鉴权 env 时启动 fail-closed；④`/api/webhook/livekit`
+  在无 secret 时 fail-open；⑤MiniMax 音色增删打全局 settings 行（需产品裁量）。
+- **⚠️ 本清单的 ②③ 两条已在批次 5 被证伪（见 §31.3）**——分诊只读了一处行号就下结论，
+  实际两处都早有闸：`/api/token` 对无记录房间只给 subscribe-only 且不挂 dispatch（P1-C 契约，
+  `tests/test_token_dispatch.py:81` 钉死）；`/api/asr/health`/`/api/tts/health` 早已挂
+  `_gate_page(request,"settings")`（2026-09-17 P3-A），`/api/web_logs` 的 user 可写是
+  刻意设计（浏览器侧诊断，per-identity 限速，测试钉死）。**故「扫描器漏报三条 diag 路由」
+  不成立**，本节其余条目请以批次 5 复核过的为准（⑥-⑨ 的低危项尚未逐条复核）。
 
 ### 30.5 集成验证与剩余队列
 
@@ -2348,6 +2350,113 @@ scan `scan-2026-09-21T02-11-19.508Z-5cac3aa631d5`（deep，`runStatus=inconclusi
   compileall ＋ 术语门禁绿；`_UNCOMMITTED_LEADING_WEAK_PUNCT` 等新引用符号经真 import 验证
   存在；三个 `_reset()` 调用点逐一复核语义。
 - 剩余队列（优先级序）：①§29.2 第 1 步的**人工切换窗口**（读数基线要重取）；②§30.4 的
-  ①②③④ 四条（①②③④ 都可独立小改，其中 ③ 扫描器漏报最该先堵）；③E7 离线润色面
-  （生成模型待定）；④R3 澄清后效果 A/B（需真栈时间窗，且与 ① 抢同一个窗口，宜合并做）；
-  ⑤DashScope key 轮换（用户动作）。
+  ①④ 两条**已在批次 5 落地**（§31.1/§31.2），⑤ 待产品裁量、⑥-⑨ 待逐条复核；
+  ③E7 离线润色面（生成模型待定）；④R3 澄清后效果 A/B（需真栈时间窗，且与 ① 抢同一个
+  窗口，宜合并做）；⑤DashScope key 轮换（用户动作）。
+
+---
+
+## 31. 实施批次 5（2026-09-21，subagent 并行 ×3）：CP 启动锚 + webhook 收口 + E3/E7 + E5 增补；**两条安全前提被证伪**
+
+三路并行（CP 安全面 / 离线质量栈 / B 线 MT 校验），主会话复核与集成。**结论先说**：
+§30.4 的 ①④ 落地；**②③ 两条经复核为误报**（详见 §30.4 的修正标注与 §31.3）；
+E3/E7 落地且**实测判定「不加 LLM 步」**；E5 增补落地且**干净输入上触发 0/26**（安全网）。
+
+### 31.1 CP 启动锚：非回环 bind × 认证双关 = 拒绝启动（§30.4 ①，落地）
+
+- 判据（纯函数 `_unsafe_open_bind`）：`BOK_AUTH_REQUIRED` 与 `BOK_CP_TOKEN` **皆空** 且 bind
+  非回环 → `_startup()` 抛 `RuntimeError` 拒绝启动，且**排在 DB 迁移/种子之前**（配置事故零副作用）。
+- bind 解析两源（`_resolved_bind_host`）：**argv `--host`**（uvicorn 实际吃的值——Dockerfile /
+  deploy CMD 显式 `0.0.0.0`）优先，其次 `BOK_BIND_HOST`（`tools/bok.py::_cp_bind_host` 唯一来源），
+  皆无=uvicorn 缺省回环。缺省 bind 恒回环，故本机单用户形态**零变化**。
+- CORS 纵深防御（`_cors_allow_origins`）：裸放行 × 非回环不再回落 `*`；顺带修掉一处真缺陷——
+  env 缺省原为 `"*"`，把「显式配置」与「缺省」混同，令裸放行档的收窄永不生效（env 缺省改 `""`）。
+- 连带（已处）：CI 云镜像冒烟必须给最小加固配置（镜像 CMD 是非回环）。**且密钥必须运行时
+  随机生成**——写死的 `*-0123456789*` 形状会命中 gitleaks 的 `generic-api-key`（`.gitleaks.toml`
+  前言有实测记录），那会逼我们放宽密钥门禁；随机值门禁零放宽、更贴近真实部署。
+- **未实证**：本机 docker daemon 未运行，无法就地验证 gitleaks 取舍——已按结构规避（文件里
+  不存在 secret 形状的值），以 CI 为准。
+- `dev/docker/`（archived 参考栈，不进 CI）现在会拒启：刻意不动，要跑它就显式给 auth env。
+
+### 31.2 webhook fail-closed 收口（§30.4 ④，落地）
+
+- 形态：`LIVEKIT_API_SECRET` 为空时，**auth-on 或非回环 bind** 一律 401 拒收（detail 指明漏配项）；
+  **唯一 carve-out = 回环 bind + 双关**（本地无 LiveKit 联调形态——agent 崩溃补位依赖 webhook，
+  F2 契约由 `tests/test_debug_sweep.py::test_webhook_bypasses_cp_token_gate` 钉死，且回环下
+  本就不可网络达）。刻意**不**把 CP-token-only 也判 fail-closed，就是为了不破该既有契约。
+- `tools/bok.py` 的 doctor 信息位检查同口径扩展（auth-on **或**非回环），仍不进打包门禁。
+- 残余（明说）：回环 CP 被反向代理公开且双关时仍放行——但 `deploy/cloud/install.sh` 恒写
+  `BOK_AUTH_REQUIRED=1`，所有受支持部署形态都关得上。
+
+### 31.3 §30.4 的 ②③ 两条**前提被证伪**（批次 4 分诊的误报）
+
+- **② `POST /api/token` 无记录房间**：早已不是缺口——跨账号检查在位（`:1457-1461`），无记录房间
+  只拿 **subscribe-only** grants（`can_publish=False`、无 dispatch，`:1426-1429`/`:1481`），
+  并审计 `token.issued recordless=True`：这是 **P1-C 契约（2026-09-17）**，由
+  `tests/test_token_dispatch.py:81` 等钉死。**若按分诊建议加「必须有通话记录」的硬校验，会打断
+  `doctor --packaged` 的 token 探针**（`room_name: "doctor-probe"` 走机器通道、本就无记录）。
+- **③ diag 路由无闸**：`/api/asr/health`（`:636`）与 `/api/tts/health`（`:648`）**2026-09-17 P3-A
+  已挂** `_gate_page(request, "settings")`（`settings` 不在 `PAGE_PERMISSIONS` 里 → `user` 恒 403，
+  admin/root/机器通道/无身份放行）；`/api/web_logs`（`:5645`）的 `user` 可写是**刻意设计**
+  （浏览器侧诊断，per-identity 限速 600/min，`tests/test_diag_gates.py` 明确钉住「保留 user 可写」）。
+  故「扫描器漏报三条 diag 路由」不成立。
+- **教训入档**：批次 4 的分诊**只读了一处行号**就下「无闸」结论，并把「与既有台账一致」当成
+  「缺口被确认」。**安全类分诊的每条「缺口」都必须由第二方在改动前独立复核**——本批次正是这条
+  复核救回了两次误改。该报告 ⑥-⑨ 的低危项同样按此标准**待复核**（勿直接照单改）。
+
+### 31.4 E3 OutputGuard + E7 离线润色（新模块；**实测判定不加 LLM 步**）
+
+- `packages/core/bok_voice_core/output_guard.py`（E3）：`guard_output(original, candidate, *, policy)`
+  → `GuardResult(accepted, reason, …)`；`apply_guard()` 拒绝即回原文。实现 §26.3 参数表的四类硬判据
+  （扩张 `max(3N,N+120)`／语言漂移 CJK≥4→0 与 0.65↔0.2 交叉／硬否定只比 `prohibition`+`never`
+  计数／敏感新增三类正则）。**刻意未实现两条**并在 docstring 写明理由：回应标记改写（我们无
+  IntelliSense 哨兵）、LLM 指令回声（会误拒合法口语开场）。
+- `packages/core/bok_voice_core/polish.py`（E7）：确定性精炼＝去口水词／消重复／折叠自我修正／
+  口语数字规范化，出口挂 Guard（`GuardPolicy(exempt_digit_addition=True)`——正是 §26.2-E7
+  记的「模板折『不是A是B』+新增阿拉伯数字与 Guard 相冲」要靠参数化解决）。
+- **数字铁律胜出（已判例钉死）**：口语数字规范化只对**数量型**（含 十/百/千/万/亿、
+  `百分之X`、`X点(半|Y分)`）生效；报号串由**双重防线**豁免（结构上纯单字报号/ASCII 数字 run
+  永不匹配 + 上下文上 ≥4 位数字 run／≥4 字单字号／号码语境词 ≤10 字内的数量词都不动）。
+  冲突面也钉死了：`不是12345，是67890` 这类**数字自我修正**按 polish 语义该取后值，但那会**丢掉
+  一个已报数字** → Guard 硬保护拒绝 → `polish_text` 返回原文
+  （`test_polish_number_self_correction_falls_back_to_original`）。
+- **模型判定：不加 LLM 步**（n=12 真实脏转写 A/B，artifact `.superpowers/sdd/2026-09-21-e7-polish/`）：
+  4B 全 12 条泄漏 `<|im_end|>`、吞词、并把 `三七七八九零→37890`（丢位）；9B 格式干净但**照样重写
+  客户报的号码**（`三七七八九零→377890`）且过度删 `好的`。唯一真实增益（繁→简）与 `snippets.py`
+  的**语言分域设计相冲**（繁体在粤语通话是正确写法），那属 E1 轨道（域感知、可审计、零 LLM）。
+- **顺带一个真缺口（入档）**：Guard 的硬保护 token 集按 §26.3 **只覆盖 ASCII 数字 run**，
+  **中文口报串（三七七八九零）不在保护面**——所以两个模型对报号串的破坏 Guard 拦不住。这正是
+  「不该让 LLM 碰这个面」的决定性理由；`polish.is_number_reporting` 已导出为将来若要上 LLM 的短路钩子。
+- 测试：`tests/test_output_guard.py`（63）+ `tests/test_polish.py`（66）。
+
+### 31.5 E5 增补：MT 出口确定性语言校验 + 单次强化重试（B 线）
+
+- `packages/core/bok_voice_core/mt_lang_check.py`：`looks_like_language` / `language_match_score`
+  纯函数（脚本族判定：CJK vs 拉丁；无 LLM、无网络）。
+- 接线单点＝`interpret._mt_once`（译文唯一物化点）：不像目标语 → 至多**一次** `chat_retry`
+  （`StatelessMTLLM.chat_retry`，强化 prompt 把「整句只用目标语、不得保留原文」**写进 Hy-MT2
+  模板句内**——`_mt_prompt` 自己的实测结论就是模板外指示会被无视）；重试仍败**照现状出稿**
+  （绝不回退源文）。无循环；重试只在「**成功返回**但语言不对」时发生，超时/异常走原车道。
+- kill-switch `BOK_INTERP_MT_LANGGUARD` **默认开**：判据是微秒级纯扫描、正常轮零额外网络，
+  只有病态轮多一次**有界**往返（同款 15s wait_for 上限）。注册在 `_interp_env`（B 线闭 env 面；
+  `_FORWARD_ENV` 是 A 线 worker 面，两套不可混）。
+- 实弹读数（真 `:1236`，26 句 / 6 语言对 / 6 硬例，artifact `scripts/.probe_mt_lang_validator.*.json`）：
+  **干净输入触发 0/26**——校验器在干净数据上惰性，是安全网而非「修一个已观测问题」（这正是预期，
+  且与 §30.3「术语槽位有效但真正的杠杆在覆盖」同一类判别）；人为构造「声明目标 ≠ 生成语言」的
+  真 MT 不匹配后 **2/2 触发、2/2 被强化重试救回**——证明网与重试对真 MT 输出确实工作。
+- **盲区（明说，已测试钉住）**：`zh` ↔ `cantonese` 同属 CJK，**本判据测不出**；简繁刻意不作信号
+  （会大量误重试）。故 E5 增补治的是 **en↔CJK 级错语言**，不是粤/普互串。
+
+### 31.6 集成验证与队列
+
+- 验证：全量 pytest **2372 passed**（批次 5 净增 161：9+63+66+23）；`compileall`；
+  术语门禁 + forward_env 门禁绿；三条误报前提由主会话**直接读码复核**（非采信报告）。
+- **⚠️ 开放项（未解决，不得忽视）**：本轮观察到**一次间歇性原生崩溃**（faulthandler dump、
+  `<no Python frame>`、列出的扩展模块含 `av.*`/`sqlalchemy.*`），发生在连续两次全量跑的**第一次**，
+  无任何测试级 FAILED 记录。此后 **3 次带 `-p no:randomly` 的逐名全量跑 + 1 次默认全量跑全部干净
+  （各 2372 passed）**，即 **5 次全量跑 1 次崩、3 次定向复现全败** → **未归因**。
+  未定位前**不宣称套件稳定**。下一步建议：在无并行栈占用的窗口，用 `-v` 全量输出重定向到文件
+  循环跑到复现，取 dump 头部（本次头部被 `tail -3` 截掉——教训：全量跑一律全量落盘）。
+- 队列（优先级序）：①§29.2 第 1 步的**人工切换窗口**（读数基线要重取）；②**R3** 澄清后效果 A/B
+  （需同一窗口，宜合并做）；③E7 **接线**（模块已就绪，落点＝挂断后纪要清洗 + QA 挖掘/L-① 漏报轮
+  的输入预处理——延迟不敏感面）；④§31.3 的 ⑥-⑨ 低危项逐条复核；⑤DashScope key 轮换（用户动作）。

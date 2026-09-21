@@ -18,6 +18,7 @@ Zero-Ollama: there is no Ollama anywhere in the distribution path.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import platform as _platform
@@ -2360,17 +2361,23 @@ def cmd_doctor() -> int:
     else:
         print("token endpoint: skipped (control-plane down)")
 
-    # P3-C 配套检查（2026-09-17 全量 debug）：auth-on（BOK_AUTH_REQUIRED=1）而
-    # LIVEKIT_API_SECRET 未配置时，CP webhook 验签对无签名请求一律 401 拒收——
-    # LiveKit 崩溃补位（participant_left 重派）会静默失效。与 CP 端闸同判据
-    # （auth-on 档；CP-token-only 形态保留 fail-open，见 _verify_livekit_webhook）。
-    # 纯 informational，不进 packaged 门禁 fails（本地 auth-off 未配 secret 是常态）。
+    # P3-C 配套检查（2026-09-17 全量 debug；2026-09-21 Item 4 扩判据）：
+    # LIVEKIT_API_SECRET 未配置且（auth-on 或 bind 非回环）时，CP webhook 验签对
+    # 无签名请求一律 401 拒收——LiveKit 崩溃补位（participant_left 重派）会静默
+    # 失效。与 CP 端闸同判据；仅「回环 bind + 双关 auth-off」保留 fail-open（F2
+    # 契约）。纯 informational，不进 packaged 门禁 fails（本地 auth-off 未配
+    # secret 是常态）。
     _doc_auth_on = os.environ.get("BOK_AUTH_REQUIRED", "").strip() == "1"
     _doc_lk_secret = os.environ.get("LIVEKIT_API_SECRET", "").strip()
-    if _doc_auth_on and not _doc_lk_secret:
-        print("webhook secret: MISSING (auth-on 拒收无签名 webhook)")
+    _doc_bind = _cp_bind_host().strip().strip("[]").lower()
+    try:
+        _doc_exposed = not ipaddress.ip_address(_doc_bind).is_loopback
+    except ValueError:
+        _doc_exposed = _doc_bind not in ("", "localhost")
+    if (_doc_auth_on or _doc_exposed) and not _doc_lk_secret:
+        print("webhook secret: MISSING (auth-on/非回环 bind 拒收无签名 webhook)")
     else:
-        print(f"webhook secret: {'ok' if _doc_lk_secret else 'n/a (auth-off fail-open)'}")
+        print(f"webhook secret: {'ok' if _doc_lk_secret else 'n/a (回环+auth-off fail-open)'}")
 
     # MiniMax 云 TTS 探针:provider=minimax 时校验 api_key 非空 + 至少一个已配音色
     # 能喺账号音色列表解析(key 缺失静默跳过,凭据永不入码)。
@@ -2446,6 +2453,9 @@ def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
     # 不显式带上的话文档里的逃生门在 dev/prod 栈都是死的,2026-09-16 实证)。
     for _k in (
         "BOK_INTERP_MT_CONTEXT",
+        # E5 增补 2026-09-21:MT 出口确定性语言校验+单次强化重试总闸。默认开
+        # ——正常轮零额外延迟,仅错语言轮多一次往返;=0 回退旧「出口不校验」档。
+        "BOK_INTERP_MT_LANGGUARD",
         "BOK_INTERP_REV_AUDIO",
         "BOK_INTERP_BACKLOG",
         "BOK_INTERP_MAX_BACKLOG_S",
