@@ -1,0 +1,412 @@
+{
+  "candidates": [
+    {
+      "trigger": "集運",
+      "replacement": "集运",
+      "source": "mined",
+      "evidence": 9,
+      "langs": {
+        "cantonese": 4,
+        "zh": 5
+      },
+      "samples": [
+        "單號，運單，賠償，運費，專員，集運，時效，上門，追蹤，核實，WhatsApp，微信。",
+        "單號，運單，賠償，運費，專員，集運，時效，上門，追蹤，核實，WhatsApp，微信，顺丰速递",
+        "拼多多。顺豐速運，運通，理賠，京東，拼多多，單號，運單，賠償，運費，專員，集運，時效，上門，追蹤，核實，微信，顺丰物流。"
+      ],
+      "warnings": [
+        "lang_ambiguous(zh=5,cantonese=4)"
+      ]
+    }
+  ],
+  "discarded": [
+    {
+      "trigger": "拼多道",
+      "replacement": "拼多多",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "拼多路",
+      "replacement": "拼多多",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "拼多多",
+      "replacement": "拼多多",
+      "reason": "identity"
+    },
+    {
+      "trigger": "京东",
+      "replacement": "京东",
+      "reason": "identity"
+    },
+    {
+      "trigger": "京动",
+      "replacement": "京东",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "京东→京动",
+      "replacement": "京东",
+      "reason": "malformed_variant"
+    },
+    {
+      "trigger": "京动→京东",
+      "replacement": "京东",
+      "reason": "malformed_variant"
+    },
+    {
+      "trigger": "京东→Jingdong",
+      "replacement": "京东",
+      "reason": "malformed_variant"
+    },
+    {
+      "trigger": "Jingdong→京东",
+      "replacement": "京东",
+      "reason": "malformed_variant"
+    },
+    {
+      "trigger": "京动→Jingdong",
+      "replacement": "京东",
+      "reason": "malformed_variant"
+    },
+    {
+      "trigger": "顺风",
+      "replacement": "顺丰",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "顺丰",
+      "replacement": "顺丰",
+      "reason": "identity"
+    },
+    {
+      "trigger": "顺分",
+      "replacement": "顺丰",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "顺丰运",
+      "replacement": "顺丰",
+      "reason": "contains_canonical"
+    },
+    {
+      "trigger": "顺丰快",
+      "replacement": "顺丰",
+      "reason": "contains_canonical"
+    },
+    {
+      "trigger": "顺丰快递",
+      "replacement": "顺丰",
+      "reason": "contains_canonical"
+    },
+    {
+      "trigger": "顺丰达",
+      "replacement": "顺丰",
+      "reason": "contains_canonical"
+    },
+    {
+      "trigger": "集雲",
+      "replacement": "集运",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "转運",
+      "replacement": "转运",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "转运",
+      "replacement": "转运",
+      "reason": "identity"
+    },
+    {
+      "trigger": "李赔",
+      "replacement": "理赔",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "理赔",
+      "replacement": "理赔",
+      "reason": "identity"
+    },
+    {
+      "trigger": "理陪",
+      "replacement": "理赔",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "培偿",
+      "replacement": "赔偿",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "赔偿→培偿",
+      "replacement": "赔偿",
+      "reason": "malformed_variant"
+    },
+    {
+      "trigger": "赔偿→赔尝",
+      "replacement": "赔偿",
+      "reason": "malformed_variant"
+    },
+    {
+      "trigger": "赔偿→陪偿",
+      "replacement": "赔偿",
+      "reason": "malformed_variant"
+    },
+    {
+      "trigger": "赔偿→培尝",
+      "replacement": "赔偿",
+      "reason": "malformed_variant"
+    },
+    {
+      "trigger": "赔偿→赔常",
+      "replacement": "赔偿",
+      "reason": "malformed_variant"
+    },
+    {
+      "trigger": "赔偿→培常",
+      "replacement": "赔偿",
+      "reason": "malformed_variant"
+    },
+    {
+      "trigger": "赔偿→陪尝",
+      "replacement": "赔偿",
+      "reason": "malformed_variant"
+    },
+    {
+      "trigger": "运单",
+      "replacement": "运单",
+      "reason": "identity"
+    },
+    {
+      "trigger": "单浩",
+      "replacement": "单号",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "单号",
+      "replacement": "单号",
+      "reason": "identity"
+    },
+    {
+      "trigger": "仓庫",
+      "replacement": "仓库",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "倉庫",
+      "replacement": "仓库",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "仓库",
+      "replacement": "仓库",
+      "reason": "identity"
+    },
+    {
+      "trigger": "仓苦",
+      "replacement": "仓库",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "仓物",
+      "replacement": "仓库",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "仓户",
+      "replacement": "仓库",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "专园",
+      "replacement": "专员",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "专圆",
+      "replacement": "专员",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "专员",
+      "replacement": "专员",
+      "reason": "identity"
+    },
+    {
+      "trigger": "专缘",
+      "replacement": "专员",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "专元",
+      "replacement": "专员",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "专晕",
+      "replacement": "专员",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "专云",
+      "replacement": "专员",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "专匀",
+      "replacement": "专员",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "快遞",
+      "replacement": "快递",
+      "reason": "lang_context_correct",
+      "langs": {
+        "cantonese": 2
+      }
+    },
+    {
+      "trigger": "包物",
+      "replacement": "包裹",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "包裹",
+      "replacement": "包裹",
+      "reason": "identity"
+    },
+    {
+      "trigger": "到号",
+      "replacement": "到货",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "到货",
+      "replacement": "到货",
+      "reason": "identity"
+    },
+    {
+      "trigger": "道货",
+      "replacement": "到货",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "到伙",
+      "replacement": "到货",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "到护",
+      "replacement": "到货",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "到货→dao huo",
+      "replacement": "到货",
+      "reason": "malformed_variant"
+    },
+    {
+      "trigger": "dao huo",
+      "replacement": "到货",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "到货→dào huò",
+      "replacement": "到货",
+      "reason": "malformed_variant"
+    },
+    {
+      "trigger": "发物",
+      "replacement": "发货",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "发惠",
+      "replacement": "发货",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "whatsapp",
+      "replacement": "WhatsApp",
+      "reason": "identity"
+    },
+    {
+      "trigger": "WeChat",
+      "replacement": "微信",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "Weixing",
+      "replacement": "微信",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "微讯",
+      "replacement": "微信",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "微信",
+      "replacement": "微信",
+      "reason": "identity"
+    },
+    {
+      "trigger": "微讯号",
+      "replacement": "微信",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "Weixin",
+      "replacement": "微信",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "切图",
+      "replacement": "截图",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "截图",
+      "replacement": "截图",
+      "reason": "identity"
+    },
+    {
+      "trigger": "赔偿金",
+      "replacement": "赔偿金",
+      "reason": "identity"
+    },
+    {
+      "trigger": "赔赏金",
+      "replacement": "赔偿金",
+      "reason": "no_evidence"
+    },
+    {
+      "trigger": "赔偿今",
+      "replacement": "赔偿金",
+      "reason": "contains_canonical"
+    },
+    {
+      "trigger": "赔偿尽",
+      "replacement": "赔偿金",
+      "reason": "contains_canonical"
+    },
+    {
+      "trigger": "赔偿瑾",
+      "replacement": "赔偿金",
+      "reason": "contains_canonical"
+    },
+    {
+      "trigger": "赔偿津",
+      "replacement": "赔偿金",
+      "reason": "contains_canonical"
+    },
+    {
+      "trigger": "物流",
+      "replacement": "物流",
+      "reason": "identity"
+    }
+  ]
+}
