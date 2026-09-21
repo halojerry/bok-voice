@@ -7,6 +7,12 @@ from typing import Any
 
 import httpx
 
+# E7 离线润色接线（2026-09-21）：润色**只**作用于喂 LLM 的纪要 prompt 文本
+# （``_render_transcript``），落盘的 ``transcript.md`` 原件（main._write_settlement_docs）
+# 逐字不碰——那是原始证据面。kill-switch ``BOK_POLISH_OFFLINE`` 默认关（见
+# ``polish_wiring`` 模块 docstring 的实测理由）。
+from bok_voice_core.polish_wiring import polish_offline_text
+
 
 _SYSTEM = (
     "你是电话客服质检助手。给定一场对话的逐轮文本，提炼：\n"
@@ -112,12 +118,17 @@ class Summarizer:
 
     @staticmethod
     def _render_transcript(turns: list[Any], max_chars: int = 6000) -> str:
+        """turns → 纪要 prompt 文本；每轮文本过 E7 离线润色（唯一接线点）。
+
+        只润色这一份**派生**文本（本地变量，喂 LLM）；原始转写仍在 turns 账本与
+        ``transcript.md`` 原件里逐字保留。kill-switch 关/润色异常时逐字原样。
+        """
         lines: list[str] = []
         total = 0
         for t in turns:
             role = getattr(t, "role", None) or getattr(t, "role", "?")
             text = getattr(t, "transcript", "") or getattr(t, "text", "")
-            line = f"{role}: {text}"
+            line = f"{role}: {polish_offline_text(text)}"
             lines.append(line)
             total += len(line)
             if total >= max_chars:

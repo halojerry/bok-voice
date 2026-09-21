@@ -2458,12 +2458,109 @@ E3/E7 落地且**实测判定「不加 LLM 步」**；E5 增补落地且**干净
   随机生成**（提交前规避，未进历史）——**同一条规则在本批次内两次咬到，代价一次为零、一次为一轮 CI**。
 - 验证：全量 pytest **2372 passed**（批次 5 净增 161：9+63+66+23）；`compileall`；
   术语门禁 + forward_env 门禁绿；三条误报前提由主会话**直接读码复核**（非采信报告）。
-- **⚠️ 开放项（未解决，不得忽视）**：本轮观察到**一次间歇性原生崩溃**（faulthandler dump、
-  `<no Python frame>`、列出的扩展模块含 `av.*`/`sqlalchemy.*`），发生在连续两次全量跑的**第一次**，
-  无任何测试级 FAILED 记录。此后 **3 次带 `-p no:randomly` 的逐名全量跑 + 1 次默认全量跑全部干净
-  （各 2372 passed）**，即 **5 次全量跑 1 次崩、3 次定向复现全败** → **未归因**。
-  未定位前**不宣称套件稳定**。下一步建议：在无并行栈占用的窗口，用 `-v` 全量输出重定向到文件
-  循环跑到复现，取 dump 头部（本次头部被 `tail -3` 截掉——教训：全量跑一律全量落盘）。
+- **⚠️ 开放项（已于批次 6 归因，见 §32.4）**：本轮观察到**一次间歇性原生崩溃**（faulthandler
+  dump、`<no Python frame>`）。批次 6 由 CI 抓到完整栈 → 定位为 **`SIGSEGV` 在 SQLite 连接的
+  `close` 路径**（`sql_repo` fixture 的 `engine.dispose()`，内存库 StaticPool 单连接跨线程
+  竞态），**既有缺陷、非本会话引入**，影响面＝CI 门禁随机变红；修法已记（6 个 fixture 改临时
+  文件库），因**本机复现不出**而**留待带复现窗口的专门收口**。**在此之前不宣称套件稳定。**
 - 队列（优先级序）：①§29.2 第 1 步的**人工切换窗口**（读数基线要重取）；②**R3** 澄清后效果 A/B
-  （需同一窗口，宜合并做）；③E7 **接线**（模块已就绪，落点＝挂断后纪要清洗 + QA 挖掘/L-① 漏报轮
-  的输入预处理——延迟不敏感面）；④§31.3 的 ⑥-⑨ 低危项逐条复核；⑤DashScope key 轮换（用户动作）。
+  （需同一窗口，宜合并做）；③E7 **接线**（**已在批次 6 落地**——见 §32.1，剩下的只是「转默认前
+  跑一轮真栈 A/B」）；④§31.3 的 ⑥-⑨ 低危项逐条复核（**已在批次 6 复核**——见 §32.3：
+  1 确认 3 证伪）；⑤DashScope key 轮换（用户动作）。
+
+---
+
+## 32. 实施批次 6（2026-09-21，subagent 并行 ×2）：E7 接线落地 + 「先量再判」抓到真破坏面；分诊 ⑥-⑨ 复核
+
+**结论先说**：①E7 接进三个离线面（默认关，旋钮就位）；②**真库实测抓到并修掉一处
+数据破坏**（polish 会吃掉粘在字母上的数字，而 Guard 拦不住）；③分诊 ⑥-⑨ **1 确认 3 证伪**。
+
+### 32.1 E7 接线落地（三个离线面，默认关）
+
+新增接线层 `packages/core/bok_voice_core/polish_wiring.py`：**唯一**读 `os.environ`、
+**唯一** try/except，供三面共用；`polish.py` 本体的纯函数承诺不动。
+
+| 落点 | 消费什么 | 性质 |
+|---|---|---|
+| `control_plane.summarize._render_transcript` | 喂 LLM 的纪要 **prompt 文本** | 派生（**不是** `_write_settlement_docs` 落盘的 `transcript.md` 原件——那是原始证据面，逐字不碰） |
+| `qa_text.mine_qa_pairs` 入口 | 问句键 + 答案文本（映射出**新 dict**，不改入参） | 派生（CP `/api/reports/qa-pairs` 与 `qa_cluster.py` 共用同一纯函数＝该面单点） |
+| `control_plane.gap_mining._turn_text` | L-① 漏报轮的 `customer_text`/`sample_answer` | 派生（turns 账本原件与 `repo.get_turns` 行都不改写） |
+
+- kill-switch `BOK_POLISH_OFFLINE`（`== "1"` 才开）；**默认关**，理由是**未做真栈 A/B**
+  （它改的是喂进挖掘的文本，而挖掘答案一经人工采纳就**罐头化**、下一通真实通话照播）。
+- **两层 fail-soft**：`polish_text` 出口的 Guard 拒绝即回原文 + 接线层 try/except → 清洗
+  绝不炸纪要/挖掘。
+- env 面：**进 `_control_plane_env`**（CP 闭 env 面，同 `BOK_SETTLE_LLM_*` 先例），
+  **不进 `_FORWARD_ENV`**（那是 A 线 agent worker 面；`agent_runtime` 不 import 本层，
+  结构锚钉住）——不注入 CP 面的话，prod launchd/schtasks 下这枚开关是**死门**。
+
+### 32.2 「先量再判」抓到真破坏面，已修（本批次最要紧的发现）
+
+批次 5 的 polish 模块在**真库 7744 条 A 线转写**上量过之后暴露一处**数据破坏**：
+
+- `collapse_repetitions` 会吃掉**粘在字母上或连成一串的数字**：`MT3000 → MT30`、
+  `soak111 → soak1`；英文词尾同理：`exceeded → exceed`、`preceded → preced`。
+- **而出口 Guard 静默放行**——`output_guard._NUMBER_RE` 只认「两侧皆非字母数字」的整数串，
+  粘着字母的数字串**不产出保护 token**。
+- 主会话**独立复现**（非采信报告）：`polish_text("订单号 MT3000 已发出")` → `MT30`，
+  且 `guard accepted=True`。**数字是数据不是口水词**，这是不可接受面。
+- 修法（`polish.py`）：三枚重复正则全部加 ASCII 两侧边界（`(?<![A-Za-z0-9])` /
+  `(?![A-Za-z0-9])`；三连档另把 `A-Za-z0-9` 加入不折字符类）。中文侧真重复折叠**不受影响**
+  （既有 9 条判例 + 新增对比例全过）。
+- **读数重基**（修后重测）：真库 A 线改动 **632 → 625 条（8.1%）**（修掉 7 条破坏性改动）；
+  R1 标注语料 152 轮改动 **48 轮（31.6%）不变**。回归判例
+  `test_polish_wiring.py::test_ascii_runs_never_collapsed`。
+- 附带口径修正：批次 5 写的「CHARACTERIZATION：默认关的直接理由」测试与文档**已按单轨
+  原则改写**——破坏面已修，「默认关」的现行理由只剩「未做真栈 A/B」。
+
+### 32.3 分诊 ⑥-⑨ 复核：1 确认 / 3 证伪（对四条都读了码，非采信）
+
+- **⑥ `BokMarkdownSource` SSRF → 证伪**：sink 是真的（`:66`/`:80` 的 `urlopen` 无 scheme/host
+  白名单），但**该类是死码**——全仓 grep 只有类定义行，`__init__.py` 只导出 `LocalMarkdownSource`，
+  线上装配走 `LocalMarkdownSource`（`main.py:385`），`BOK_URL` 除 docstring 外全仓无引用、
+  也没有 `/documents/read` 服务端。**不可达**。
+- **⑦ `node_agent._http_download` → 证伪**：唯一调用链 `dispatch_commands`→`perform_update`；
+  `version` 被正则钉死（`[A-Za-z0-9][A-Za-z0-9._-]*`，**碰不到 scheme/host/path**）、内容
+  sha256 校验、`tar.extractall(filter="data")`、目标在 `TemporaryDirectory`。**扫描器报的
+  CWE-22 判错了**。残余（已记）：scheme 未钉 https、摘要不是真实性校验。
+- **⑧ `tempfile.mktemp`（`load_cp_concurrency.py:38`）→ 确认（低危）**：CWE-377 TOCTOU，
+  仅本地 dev/CI 工具；修法＝`mkdtemp`/`mkstemp`。**本批次不改**（与本次主题无关，留作独立小改）。
+- **⑨ `mlx_lm_template_leak_fix.py` 写入 → 证伪**：路径来自 `find_spec("mlx_lm.server").origin`，
+  **无输入可达**；且有 `compile()` + `py_compile(doraise=True)` 双重校验。CWE-22 判错。
+- **来源核对**：四条**都真的来自扫描数据**（非编造），差异是**再表述**（⑦⑨ 被从 CWE-22
+  改述成「未校验 scheme/路径」）。另有 3 条新观察（最高一条＝`web_search.fetch` 是
+  **客户话术驱动**的出站抓取，但固定可信主机 + HTTPS + `WEB_SEARCH` 默认 0，判信息位）。
+- **⚠️ 一条要说明的「看似矛盾」**：复核报告称分诊 shortlist **#1「已存在」**——那是**批次 5
+  同日落地**的 `_unsafe_open_bind` 启动锚（§31.1），**不是分诊当时判断错误**（分诊在批次 5
+  之前跑的）。引用时勿据此回改分诊的可信度结论。
+
+### 32.4 验证与队列
+
+- 验证（主会话独立复跑）：全量 pytest **2393 passed**（批次 6 净增 21）；`compileall`；
+  156 项针对性测试（polish/output_guard/forward_env/术语门禁）绿。
+- 队列（未变，优先级序）：①§29.2 第 1 步的**人工切换窗口**（读数基线要重取）；②**R3** 澄清后
+  效果 A/B（同一窗口，宜合并）；③**E7 转默认前的真栈 A/B**（模块与旋钮已就位，缺的只是
+  「开一轮比对簇纯度/纪要质量」这一步）；④⑧ `mktemp` 小改；⑤DashScope key 轮换（用户动作）。
+- 开放项（**已归因，2026-09-21 批次 6 收尾**）：§31.6 记的**间歇性原生崩溃**已定位为
+  **`SIGSEGV`（exit 139）发生在 SQLite 连接的 `close` 路径**，栈由 CI 完整抓到：
+
+  ```
+  tests/test_dial_now_api.py:91 in sql_repo      ← fixture teardown
+    sqlalchemy/engine/base.py:3220 dispose → pool/impl.py:482 dispose → pool/base.py:883 __close
+  Segmentation fault (core dumped) python -m pytest -q tests/
+  ```
+
+  **归属结论（三条证据）**：①崩溃点是 `sql_repo` fixture 的 `engine.dispose()`——
+  `sqlite://` 内存库 + `StaticPool`（**全线程共享同一条连接**）+ `check_same_thread=False`，
+  而 TestClient 把 app 跑在线程池里，close 与在途使用**跨线程竞态**；②该文件**最后一次改动是
+  PR #79（P1.5 SIP）**，与批次 3-6 无任何交集（`git diff origin/main...HEAD` 零行）；
+  ③同一 SHA 上两次 CI 一失败（35593821787）一成功（35593838029）＝**同一提交的 flaky**。
+  **故：既有缺陷，非本会话引入**；影响面＝**CI 门禁会随机变红**（同一提交重跑可绿）。
+- **修法（已记，未实施）**：该 fixture 形状在 **6 个测试文件**里被复制传播
+  （`test_dial_now_api`/`test_campaign_site`/`test_sip_sites_repo`/`test_notify_skeleton`/
+  `test_sip_settings`/`test_campaign_api`，docstring「照 X 姿势」链条可见）。推荐改成
+  **临时文件库**（`tmp_path`，去 `StaticPool`，保留 `check_same_thread=False`）——语义等价
+  （仍全线程可见同一库）但**不再跨线程共享单条连接**，即消除竞态源。
+  **未实施的理由**：本机**复现不出来**（单文件 40 次循环 0 崩；全量约 6 次 1 崩），
+  改 6 个 fixture 属**不可验证的改动**——留给一次带复现窗口的专门收口（先跑全量循环攒再现，
+  再改，再对比崩率）。**在此之前不得宣称「套件稳定」。**

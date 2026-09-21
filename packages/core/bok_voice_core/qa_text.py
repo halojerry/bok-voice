@@ -4,11 +4,18 @@
 归一,否则报告聚出来的高频问句到运行时对不上。只做全半角标点/空白宽度归一;
 **不做数字归一**——含数字串的用户轮在闸门早被旁路(WhatsApp/单号轮绝不走快路),
 归一不需要也不应该处理数字。
+
+E7 离线润色(2026-09-21):``mine_qa_pairs`` 入口对转写文本过一遍
+``polish_offline_text``(kill-switch ``BOK_POLISH_OFFLINE`` 默认关,fail-soft)——
+脏转写是 qa 簇不纯的主因之一;润色作用于**派生报告行**,turns 账本原件不动。
+``normalize_question`` 本身仍是纯归一(零 env),运行时匹配面不受润色影响。
 """
 
 from __future__ import annotations
 
 import re
+
+from .polish_wiring import polish_offline_text
 
 _PUNCT_TRANS = str.maketrans(
     {
@@ -55,11 +62,21 @@ def mine_qa_pairs(
     计数按「出现的通话数」而非轮数(同通复读只算一通);答案取众数。
     conversations 形如 repository.iter_call_conversations 的返回:
     [[{"role","text","lang"}, ...], ...]
+
+    E7 离线润色单点(2026-09-21):入口把每轮 ``text`` 过一遍
+    ``polish_offline_text``(kill-switch 默认关/异常时逐字原样)——问句键与
+    答案文本都吃这份润色稿,而 turns 账本原件与其余消费者不受影响。映射出
+    **新 dict**,不写入参。
     """
     from collections import Counter
 
+    polished = [
+        [{**t, "text": polish_offline_text(t.get("text") or "")} for t in turns]
+        for turns in conversations or []
+    ]
+
     stats: dict[tuple[str, str], dict] = {}
-    for turns in conversations or []:
+    for turns in polished:
         seen_in_call: set[str] = set()
         for i in range(len(turns) - 1):
             a, b = turns[i], turns[i + 1]

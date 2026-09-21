@@ -68,6 +68,12 @@ from collections import Counter
 from bok_voice_core.qa_text import normalize_question
 from bok_voice_core.testdata import is_test_object_name
 
+# E7 离线润色接线（2026-09-21）：L-① 漏网轮挖掘的输入预处理——脏转写是聚类
+# 不纯的主因之一。kill-switch ``BOK_POLISH_OFFLINE`` 默认关（理由见
+# ``polish_wiring`` 模块 docstring）；只作用于**派生报告行**（customer_text /
+# sample_answer），turns 账本原件不动。
+from bok_voice_core.polish_wiring import polish_offline_text
+
 # ---- gen 取值面(模块级常量,来源行号见模块 docstring;改 agent 写入点须同步) ----
 
 GEN_LLM = "llm"
@@ -147,6 +153,21 @@ def candidate_norm(text: str) -> str:
     if digit_chars * 2 >= len(norm):
         return ""
     return norm
+
+
+# ---- E7 离线润色接线(单点,2026-09-21) ----
+
+
+def _turn_text(turn) -> str:
+    """turns 账本一行 → 派生报告用的文本(客户轮=候选问法 / AI 轮=样例答案)。
+
+    **E7 润色单点**:这里是本模块唯一取 transcript 的入口,润色只落在这份
+    **派生**文本上(kill-switch 默认关/润色异常时逐字原样——见
+    ``polish_wiring.polish_offline_text`` 的两层 fail-soft)。turns 账本原件
+    与 ``repo.get_turns`` 返回的行都不被改写;采纳后落库的是**新** qa_entry
+    (人工确认面),不是原话账本。
+    """
+    return polish_offline_text(str(getattr(turn, "transcript", "") or "").strip())
 
 
 # ---- 覆盖率(纯函数) ----
@@ -266,7 +287,10 @@ def build_llm_gap_report(
             if not is_reply_gen(gen):
                 continue  # 垫话/打断账本行:不配对、不进覆盖分母
             if is_llm_gen(gen) and prev_customer is not None:
-                norm = candidate_norm(str(getattr(prev_customer, "transcript", "") or ""))
+                # E7：候选问法与样例答案都走 _turn_text（润色单点），归一/聚合/
+                # 展示/采纳 payload 全吃同一份文本——键与显示不劈叉。
+                customer_text = _turn_text(prev_customer)
+                norm = candidate_norm(customer_text)
                 if norm:
                     g = groups.setdefault(
                         (norm, tpl),
@@ -284,8 +308,8 @@ def build_llm_gap_report(
                     )
                     g["count"] += 1
                     g["call_ids"].add(call_id)
-                    g["raws"][str(getattr(prev_customer, "transcript", "") or "").strip()] += 1
-                    answer = str(getattr(t, "transcript", "") or "").strip()[:ANSWER_MAX_CHARS]
+                    g["raws"][customer_text] += 1
+                    answer = _turn_text(t)[:ANSWER_MAX_CHARS]
                     if answer:
                         g["answers"][answer] += 1
                         g["answer_calls"].setdefault(answer, call_id)
