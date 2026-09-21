@@ -1377,6 +1377,27 @@ def _asr_postprocess(
     return out, leak_state, applied
 
 
+def _last_partial_text(stt_provider) -> str:
+    """取本轮 ASR 滑窗 partial 末稿(``_asr_postprocess`` 的 fallback_text 实参)。
+
+    来源=``Qwen3ASRLiveSTT.last_partial_text()``(流内 partial 暴露口,语义/清零点
+    见 livekit_plugins 该方法的 docstring);``_partial_gate_stt`` 只在 live 包装
+    时非 None,故 ``QWEN3_ASR_STREAM=0``(官方 StreamAdapter)与假 STT 一路拿不到
+    方法。
+
+    整条 fail-soft:缺方法/属性异常/None 一律空串。fallback 只是热词泄漏判据的
+    辅助证据(单词命中一条),拿不到时 ``sanitize`` 回落到「无 fallback」档——
+    与未接线时逐字节相同,绝不能因为它把一轮搞崩。
+    """
+    getter = getattr(stt_provider, "last_partial_text", None)
+    if not callable(getter):
+        return ""
+    try:
+        return str(getter() or "")
+    except Exception:  # noqa: BLE001 - 取 partial 失败只损这一个判据,不损本轮
+        return ""
+
+
 def _farewell_line(name: str, lang: str) -> str:
     """两次心跳都没回应:一句礼貌收尾直念(多谢+阵间再联系+再见),讲完即收线。
 
@@ -3262,11 +3283,13 @@ async def entrypoint(ctx):
             # 必须同文本(听 A 记 B 禁令)——框架 item 未被改写,这里独立跑同一条
             # _asr_postprocess(与 on_user_turn_completed 逐字节同源)。纯热词 dump
             # 返回空=空转写,不落库(同纯回声 TURN_HIDDEN 姿势)。
+            # fallback_text=本轮 partial 末稿(同钩子侧同源取口):终稿若是热词 dump,
+            # 这段才是「客户真讲过的话」。取不到=空串,行为同未接线。
             _u_clean, _u_leak, _u_snip = _asr_postprocess(
                 text,
                 snippet_rules=_snippet_merged,
                 hotword_terms=_hotword_terms,
-                fallback_text="",
+                fallback_text=_last_partial_text(_partial_gate_stt),
             )
             if not _u_clean:
                 print(f"ASR_LEAK_SANITIZE_TURN_HIDDEN (call {room_name})", flush=True)
@@ -3978,14 +4001,15 @@ async def entrypoint(ctx):
             # 上方 _stripped 写回实为被 except 吞掉的 no-op)——落库面在
             # _on_conversation_item 用同一条链(_asr_postprocess)独立复算,两边同文本
             # (听 A 记 B 禁令)。
-            # fallback_text:agent 侧拿不到本轮最后一条 partial/interim(它在
-            # Qwen3ASRLiveSTT 内层识别流的 _last_partial 上、不对外暴露;agent 无
-            # user interim 事件钩子)——按设计传空串。
+            # fallback_text:本轮 ASR 滑窗 partial 末稿(STT 暴露口,见
+            # Qwen3ASRLiveSTT.last_partial_text)。终稿被热词 dump 污染时它是「客户
+            # 实际讲了什么」的独立证据——单词泄漏判据(模块偏差②)靠它才成立。
+            # 无 partial/非 live 包装=空串,sanitize 回落旧档零变化。
             _clean_text, _leak_state, _snip_applied = _asr_postprocess(
                 user_text,
                 snippet_rules=_snippet_merged,
                 hotword_terms=_hotword_terms,
-                fallback_text="",
+                fallback_text=_last_partial_text(_partial_gate_stt),
             )
             if _leak_state == "dropped":
                 # 纯热词 dump = 空转写:复用既有静音分支(同纯回声丢弃:撤看门狗

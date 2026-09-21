@@ -53,15 +53,10 @@ def frame_rms(pcm: bytes) -> float:
 
 
 def tts_pcm(text: str, lang: str = "cantonese") -> bytes:
-    import httpx
+    # 客户话音单点开关（BOK_PROBE_STIMULUS，默认 local=逐字节不变；cloud 走 mm_pcm）。
+    from probe_stimulus import stimulus_pcm
 
-    with httpx.Client(timeout=60) as client:
-        r = client.post(
-            f"{TTS_URL}/v1/audio/speech",
-            json={"input": text, "language": lang, "voice": "Vivian", "sample_rate": 16000},
-        )
-        r.raise_for_status()
-        return r.content
+    return stimulus_pcm(text, lang, tts_url=TTS_URL)
 
 
 def read_pcm16(path: Path, max_seconds: float = 4.0) -> bytes:

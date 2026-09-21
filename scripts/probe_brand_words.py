@@ -42,13 +42,10 @@ CASES: list[dict] = [
 
 
 def tts_pcm(text: str, lang: str = "cantonese") -> bytes:
-    with httpx.Client(timeout=60) as client:
-        r = client.post(
-            f"{TTS_URL}/v1/audio/speech",
-            json={"input": text, "language": lang, "voice": "Vivian", "sample_rate": 16000},
-        )
-        r.raise_for_status()
-        return r.content
+    # 客户话音单点开关（BOK_PROBE_STIMULUS，默认 local=逐字节不变；cloud 走 mm_pcm）。
+    from probe_stimulus import stimulus_pcm
+
+    return stimulus_pcm(text, lang, tts_url=TTS_URL)
 
 
 def silence_pcm(seconds: float, sr: int = 16000) -> bytes:

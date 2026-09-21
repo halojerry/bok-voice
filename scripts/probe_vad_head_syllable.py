@@ -72,12 +72,13 @@ def _digitize(text: str) -> str:
 
 
 def synth(text: str, lang: str = "zh") -> bytes:
-    with httpx.Client(timeout=120) as client:
-        r = client.post(f"{TTS_URL}/v1/audio/speech",
-                        json={"input": text, "language": lang, "voice": VOICE,
-                              "sample_rate": SR})
-        r.raise_for_status()
-        return r.content
+    # 客户话音单点开关（BOK_PROBE_STIMULUS，默认 local=逐字节不变；cloud 走 mm_pcm）。
+    # 音色(VOICE)/采样率(SR)沿用脚本级常量；timeout=120 与原实现一致。
+    from probe_stimulus import stimulus_pcm
+
+    return stimulus_pcm(
+        text, lang, voice=VOICE, tts_url=TTS_URL, sample_rate=SR, timeout=120.0
+    )
 
 
 def sil(sec: float) -> bytes:
