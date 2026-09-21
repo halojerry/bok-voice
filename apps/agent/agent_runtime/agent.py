@@ -911,6 +911,40 @@ def _perceived_budget_ms() -> int:
         return 3000
 
 
+async def _wait_link_idle(link: dict, *, floor_s: float, cap_s: float) -> str:
+    """等到「4B 链路空闲」再开火（judge 错峰）。返回 "idle"/"capped"/"disabled"。
+
+    为什么不是固定 sleep（2026-09-22 `scripts/probe_gpu_contention.py` 实测）：9B 跑一次
+    判据形状请求要 **4.5s**，期间 4B 的 prefill 往返从 853ms 涨到 **2228ms（+1375ms）**。
+
+    **默认关闭（`FLOW_JUDGE_IDLE_CAP=0`）——实测它够不着空闲窗，故保持旧行为。**
+    2026-09-22 真栈 soak 实测：9 次开火**全部 `capped`**，一次没等到空闲——回复时长
+    （10-19s）普遍超过上限，闸只把开火从 3s 推到 8s，没避开 prefill 窗。所以「等链路
+    空闲」这条路只在**短回复**的轮才成立；长回复轮的争用要靠**把 judge 挪出本地 GPU**
+    （如云端判定）或压 judge 自身 prefill，不是靠延时。开（cap>0）需要先做 A/B，观测面=
+    本行 `[judge] yield capped` 占比 + 既有 `judge_pending_expired`（让路太晚会伤判定时效）。
+    """
+    if cap_s <= 0:  # 关闭=旧的固定让路语义，逐字节同旧
+        if floor_s > 0:
+            await asyncio.sleep(floor_s)
+        return "disabled"
+
+    t0 = time.monotonic()
+
+    def _idle() -> bool:
+        return link.get("agent") == "listening" and link.get("user") != "speaking"
+
+    if floor_s > 0:
+        await asyncio.sleep(floor_s)
+    if _idle():
+        return "idle"
+    while (time.monotonic() - t0) < cap_s:
+        await asyncio.sleep(0.2)
+        if _idle():
+            return "idle"
+    return "capped"
+
+
 def _response_watchdog_s() -> float:
     """响应看门狗阈值(0=关):轮提交后 N 秒零 assistant 音频 → 强制打断+兜底
     直念。垫话盖 0.5-2.3s、LLM 闸 2.0s 弃流出兜底——看门狗兜的是「生成从未
@@ -3647,6 +3681,22 @@ async def entrypoint(ctx):
 
     ctx.add_shutdown_callback(_wait_close_flush)
 
+    # 链路占用态(4B 在生成/播报? 客户在讲?)——judge 错峰用。单进程=单通话,一个 dict 足够;
+    # 由下方 _on_agent_state/_on_user_state 维护(与心跳共用同一对官方状态事件)。
+    _link: dict[str, str] = {"agent": "", "user": ""}
+
+    async def _judge_yield() -> str:
+        """judge 开火前的让路:floor(FLOW_JUDGE_DELAY,旧语义) + 空闲窗让路(默认关,见函数头)。"""
+        verdict = await _wait_link_idle(
+            _link,
+            floor_s=float(os.environ.get("FLOW_JUDGE_DELAY", "3") or 0),
+            cap_s=float(os.environ.get("FLOW_JUDGE_IDLE_CAP", "0") or 0),
+        )
+        # 观测:judge 是「下一轮才消费」的补位,让路到多晚直接决定它还能不能赶上那一轮——
+        # capped 占比与 judge_pending_expired 一起看,才知道这个闸有没有开始伤判定时效。
+        print(f"[judge] yield {verdict} (call {room_name})", flush=True)
+        return verdict
+
     async def _background_flow_judge(step_at: int, utt: str, turn_key: str = "") -> None:
         """背景跑 LLM 推進判定:唔好喺開聲前同步等(會每輪拖慢),判定完喺下一輪先生效。
 
@@ -3655,9 +3705,10 @@ async def entrypoint(ctx):
         带同 key 落账——unclear 去重只计 1,judge 改判非 unclear 则清该步计数。
         """
         try:
-            # 让路节流:主回复刚提交,先等一拍再喺同一 mlx server(:1235)跑 judge——
-            # judge 与主回复抢 prefill 会推高本轮 TTFT;judge 判定本来就下一轮先生效,迟几秒冇损失。
-            await asyncio.sleep(float(os.environ.get("FLOW_JUDGE_DELAY", "3")))
+            # 让路节流:主回复刚提交,先等一拍、再等到链路真空闲才喺 :1235 跑 judge——
+            # judge 与主回复抢 prefill 会推高本轮 TTFT(实测 9B 占 GPU 时 4B prefill
+            # +1375ms,见 probe_gpu_contention);judge 判定本来就下一轮先生效,迟几秒冇损失。
+            await _judge_yield()
             from .flow import (
                 build_judge_messages,
                 degrade_boost,
@@ -3793,8 +3844,8 @@ async def entrypoint(ctx):
         有可触发绑定),本任务唔再重算资格(单次调用=一次 LLM call,绝不 N 次)。
         """
         try:
-            # 让路节流同 flow judge:主回复刚提交,先等一拍再跑判定(同一 env 旋钮)。
-            await asyncio.sleep(float(os.environ.get("FLOW_JUDGE_DELAY", "3")))
+            # 让路节流同 flow judge:主回复刚提交,先等一拍、再等到链路真空闲才跑判定(同一闸)。
+            await _judge_yield()
             from .flow import build_intent_judge_messages, parse_intent_judge_output
 
             # 判定专线解析与 _background_flow_judge 逐字同源(FLOW_JUDGE_* → llm 卡 → MLX)。
@@ -5238,6 +5289,7 @@ async def entrypoint(ctx):
 
     def _on_agent_state(ev) -> None:
         # AI 講完轉「聆聽」→ 記低 AI 最後講完時刻再起錶;講話/思考中 → 撤錶。
+        _link["agent"] = getattr(ev, "new_state", "") or ""
         if getattr(ev, "new_state", "") == "listening":
             _nudge_state["last_reply_ts"] = time.monotonic()
             _arm_silence()
@@ -5245,6 +5297,7 @@ async def entrypoint(ctx):
             _disarm_silence()
 
     def _on_user_state(ev) -> None:
+        _link["user"] = getattr(ev, "new_state", "") or ""
         if getattr(ev, "new_state", "") == "speaking":
             _nudge_state["last_user_ts"] = time.monotonic()
             _disarm_silence()
