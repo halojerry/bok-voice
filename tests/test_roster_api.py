@@ -117,11 +117,10 @@ def test_roster_handled_missing_call_id_is_tolerated(monkeypatch):
     assert client.post(f"/api/roster/{entry['id']}/handled", json={"handled": False}).json()["status"] == "unclaimed"
 
 
-def test_roster_claim_unclaim_sql_backend_parity(monkeypatch):
+def test_roster_claim_unclaim_sql_backend_parity(monkeypatch, tmp_path):
     """SQL 后端同契约：claim 写 datetime → 读侧 ISO；unclaim 空串 → NULL → 读侧 ""。"""
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
-    from sqlalchemy.pool import StaticPool
 
     from bok_voice_business_db import models
     from bok_voice_business_db.repository import SqlAlchemyBusinessRepository
@@ -129,13 +128,14 @@ def test_roster_claim_unclaim_sql_backend_parity(monkeypatch):
 
     from control_plane.main import app
 
-    # TestClient 请求跑在 anyio 工作线程：sqlite:// 默认 SingletonThreadPool 每线程
-    # 各持一条独立连接（各自空内存库）→ 建表线程与请求线程看到的库不是同一个。
-    # StaticPool 令全线程共享同一连接（内存库唯一）。
+    # TestClient 请求跑在 anyio 工作线程：`sqlite://` 内存库默认 SingletonThreadPool
+    # 每线程各持一条独立连接（各自空内存库）→ 建表线程与请求线程看到的库不是同一个。
+    # 旧解法是 StaticPool「全线程共用同一条连接」，但那条连接被 dispose 时若有另一
+    # 线程正在用它就 SIGSEGV（2026-09-21 机制级复现 3/3）。改用**文件库**：天然全线程
+    # 同一个库，且默认 QueuePool 不再跨线程共享连接。
     engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
+        f"sqlite:///{tmp_path}/bok_test.db",
+        connect_args={"check_same_thread": False, "timeout": 30},
     )
     models.create_all(engine)
     repo = SqlAlchemyBusinessRepository(sessionmaker(bind=engine, expire_on_commit=False, future=True)())

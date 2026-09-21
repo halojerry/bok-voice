@@ -129,22 +129,20 @@ def test_cross_account_user_scoped(monkeypatch):
         assert r.json()["created_by"] == repo.get_user_by_username("peon")["id"]
 
 
-def test_followups_sql_backend_parity(monkeypatch):
+def test_followups_sql_backend_parity(monkeypatch, tmp_path):
     """SQL 后端同契约(生产真路径):幂等/白名单/404 与内存仓一致。"""
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
-    from sqlalchemy.pool import StaticPool
 
     from bok_voice_business_db import models
     from bok_voice_business_db.repository import SqlAlchemyBusinessRepository
     from control_plane.main import app
 
-    # TestClient 请求跑在 anyio 工作线程:StaticPool 令全线程共享同一连接
-    # (内存库唯一),姿势照 test_roster_claim_unclaim_sql_backend_parity。
+    # 文件库（tmp_path 每用例一个）而非 `sqlite://`+StaticPool：后者的「全线程共用
+    # 一条连接」在 dispose 与在用并发时 SIGSEGV（2026-09-21 机制级复现 3/3）。
     engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
+        f"sqlite:///{tmp_path}/bok_test.db",
+        connect_args={"check_same_thread": False, "timeout": 30},
     )
     models.create_all(engine)
     repo = SqlAlchemyBusinessRepository(sessionmaker(bind=engine, expire_on_commit=False, future=True)())

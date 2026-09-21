@@ -60,12 +60,16 @@ def test_inmemory_save_settings_keeps_sip():
 
 
 @pytest.fixture()
-def sql_repo():
+def sql_repo(tmp_path):
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
-    from sqlalchemy.pool import StaticPool
 
-    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    # 文件库（tmp_path 每用例一个）而非 `sqlite://`+StaticPool：后者的「全线程共用
+    # 一条连接」在 dispose 与在用并发时 SIGSEGV（2026-09-21 机制级复现 3/3）。
+    engine = create_engine(
+        f"sqlite:///{tmp_path}/bok_test.db",
+        connect_args={"check_same_thread": False, "timeout": 30},
+    )
     Base.metadata.create_all(engine)
     session = sessionmaker(bind=engine, expire_on_commit=False, future=True)()
     yield SqlAlchemyBusinessRepository(session)

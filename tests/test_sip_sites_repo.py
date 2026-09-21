@@ -19,7 +19,6 @@ from datetime import datetime
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from bok_voice_business_db import models
 from bok_voice_business_db.repository import (
@@ -38,10 +37,17 @@ def _repo() -> InMemoryBusinessRepository:
 
 
 @pytest.fixture()
-def sql_repo():
-    """真 sqlite 后端：StaticPool=全线程共享同一内存库（照 test_sip_settings 姿势）。"""
+def sql_repo(tmp_path):
+    """真 sqlite 后端：**文件库**（tmp_path 每用例一个）。
+
+    旧姿势是 `sqlite://` + `StaticPool`——内存库要「全线程同一个库」只能靠 StaticPool
+    的「所有线程共用同一条连接」实现，而**这条连接被 `dispose()` 时若有另一线程正在用
+    它就 SIGSEGV**（2026-09-21 机制级复现 3/3 崩；CI 上表现为随机 exit 139）。
+    文件库天然全线程可见，不再需要共享连接。
+    """
     engine = create_engine(
-        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+        f"sqlite:///{tmp_path}/bok_test.db",
+        connect_args={"check_same_thread": False, "timeout": 30},
     )
     models.create_all(engine)
     session = sessionmaker(bind=engine, expire_on_commit=False, future=True)()
