@@ -3147,4 +3147,3 @@ partial 与句级提交点位移 → 读数位移。**这不是 agent 变慢/变
 **代码面（本轮落地，默认零变化）**：`_llm_judge` 加 `api_key` 参数（缺省 `"mlx"`＝本地不校验凭据，逐字节同旧），
 两个判据调用点读 `FLOW_JUDGE_LLM_API_KEY`；该 env 已按立法进 `_FORWARD_ENV`。
 **key 只走 env，不落任何文件、不入库。**
-
