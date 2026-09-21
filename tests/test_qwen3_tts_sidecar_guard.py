@@ -75,6 +75,9 @@ def test_streaming_endpoint_closes_generator_in_producer_thread(monkeypatch):
             released.set()
 
     monkeypatch.setattr(tts_app.service, "synthesize_chunks", _fake_chunks)
+    # 就绪检查已前置到响应之前（见下一条判例），本判例测的是生成器锁线程纪律，
+    # 故把就绪位 stub 掉——否则真 service 未加载会先抛 503。
+    monkeypatch.setattr(tts_app.service, "ensure_loaded", lambda: None)
 
     async def _drive():
         resp = await tts_app.audio_speech(
@@ -114,3 +117,34 @@ def test_streaming_endpoint_closes_generator_in_producer_thread(monkeypatch):
     assert acquired == [True], "_gen_lock 断开后必须可被其他线程获取(唔可以有泄漏)"
     assert lock.acquire(timeout=5)
     lock.release()
+
+
+def test_not_ready_fails_fast_before_streaming_response(monkeypatch):
+    """就绪检查必须在**返回 StreamingResponse 之前**——否则只剩「200 + 0 字节」。
+
+    2026-09-21 实弹：模型路径解析到一个只有 `.cache/` 的空壳目录 → 加载失败。
+    旧版只在生成器内部 `ensure_loaded()`，那时响应头已发、状态码已定 200，
+    抛出的 503 改不了状态 → 客户端拿到**空音频还当成功**，三个 E2E 探针连带全哑，
+    症状伪装成「agent 听不到客户」。故判据钉两层：端点调用**直接抛** HTTPException，
+    且**根本没有**返回可用响应体。
+    """
+    from fastapi import HTTPException
+
+    def _boom():
+        raise HTTPException(status_code=503, detail="model not ready: shell dir")
+
+    monkeypatch.setattr(tts_app.service, "ensure_loaded", _boom)
+    monkeypatch.setattr(
+        tts_app.service,
+        "synthesize_chunks",
+        lambda **kw: (_ for _ in ()).throw(AssertionError("不该走到生成器")),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            tts_app.audio_speech(
+                {"input": "你好。", "language": "zh", "voice": "zh-female", "streaming": True}
+            )
+        )
+    assert exc.value.status_code == 503
+    assert "model not ready" in str(exc.value.detail)
