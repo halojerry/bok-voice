@@ -221,22 +221,34 @@ async def _strip_expr_markup(text):
 
 
 async def _llm_judge(
-    base_url: str, model: str, messages: list, *, max_tokens: int = 8, timeout: float = 5.0
+    base_url: str,
+    model: str,
+    messages: list,
+    *,
+    max_tokens: int = 8,
+    timeout: float = 5.0,
+    api_key: str = "mlx",
 ) -> str:
-    """流程推进判定器:对本地 MLX LLM 发一个 max_tokens 极短请求,取回一个字。失败返空(唔推进)。
+    """流程推进判定器:发一个 max_tokens 极短请求,取回一个字。失败返空(唔推进)。
 
     参数面与主回复同源(stop/温度语义),走 openai SDK(自动重试/超时),唔再手搓 HTTP。
     `max_tokens` 具名参数缺省 8=推进判定器原值(既有调用点零变化);意图判据判定
     (3.4)输出 intent id,长过 8 token,调用点显式传大值。`timeout` 缺省 5.0 同理
     (review N9:非流式单请求的总预算——9B 判据集 prefill 慢,意图判定调用点显式放宽,
     超时返空=静默永久 miss,唔可以两边共用 5s 硬码)。
+
+    `api_key` 缺省 `"mlx"`＝本地 mlx_lm server 不校验凭据（既有行为零变化）；判据走
+    云端（`FLOW_JUDGE_LLM_API_KEY`）时由调用点传入——云端判定同时解掉「9B 占本地 GPU
+    抢 4B prefill」与「9B 常驻显存」两笔账（2026-09-22 probe_gpu_contention 实测 +1375ms）。
     """
     if not base_url or not model:
         return ""
     from openai import AsyncOpenAI
 
     try:
-        client = AsyncOpenAI(api_key="mlx", base_url=base_url, timeout=timeout, max_retries=1)
+        client = AsyncOpenAI(
+            api_key=api_key or "mlx", base_url=base_url, timeout=timeout, max_retries=1
+        )
         r = await client.chat.completions.create(
             model=model,
             messages=messages,
@@ -3748,7 +3760,9 @@ async def entrypoint(ctx):
                 facts=flow_ctrl.vars_map,
                 route_enabled=route_enabled,
             )
-            _raw = await _llm_judge(jbase, jmodel, msgs)
+            _raw = await _llm_judge(
+                jbase, jmodel, msgs, api_key=os.environ.get("FLOW_JUDGE_LLM_API_KEY", "mlx")
+            )
             jv = parse_judge_output(_raw)
             if route_enabled:
                 _rr, _cc = parse_judge_route(_raw)
@@ -3881,7 +3895,14 @@ async def entrypoint(ctx):
             # timeout=20(review N9):非流式总预算,9B 判据集 prefill ~0.6k tok/s 档,
             # 中型候选集(4-7k tok)5s 必超时=静默永久 miss;背景任务延迟不敏感
             # (3s 让路 delay 都喺度),放宽到 20s 换「中型判据集可用」。
-            _gjtext = await _llm_judge(jbase, jmodel, msgs, max_tokens=32, timeout=20.0)
+            _gjtext = await _llm_judge(
+                jbase,
+                jmodel,
+                msgs,
+                max_tokens=32,
+                timeout=20.0,
+                api_key=os.environ.get("FLOW_JUDGE_LLM_API_KEY", "mlx"),
+            )
             _gjhit = parse_intent_judge_output(_gjtext, [i.id for i in candidates])
             # store 守卫(与 flow judge 换步守卫同源):判定期间已换步/暂停/收线/开关
             # 被关 → 迟到的命中唔准注入(下一轮已唔同语境,注入=错步触发)。closing
