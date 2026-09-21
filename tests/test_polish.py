@@ -4,8 +4,13 @@
 子面 + E3 Guard 出口；§26.2-E7 / §26.3）。本文件只测纯函数面，不碰接线。
 
 两条被测试钉住的裁决（交付报告会写明）：
-1. **数字铁律优先**：报号串一律不归一（结构防线 + 语境防线）；连「不是12345，是67890」
-   这类数字改口也因 Guard 硬保护 token 检查而**回退原文**——宁可退原文，不丢报号数字。
+1. **数字铁律优先**：报号串**整句短路**（``is_number_reporting`` 主动进流水，逐字返回原文）。
+   ⚠️ 2026-09-21 修正：这句先前写作「结构防线 + 语境防线」，但真库实测（3063 条真实
+   客户轮）证明**折叠重复能绕过那两道防线** —— ``四三二零一一一。→ 四三二零一。``
+   （69 轮数字面被改，含 WhatsApp 报号串，且 ``is_number_reporting`` 当时是**无人调用
+   的死保险**）。现改为整句短路这**唯一**一条保险，判例见文件末尾 ``_REAL_NUMBER_TURNS``。
+   连「不是12345，是67890」这类数字改口也因 Guard 硬保护 token 检查而**回退原文**
+   ——宁可退原文，不丢报号数字。
 2. **Guard/polish 参数化调解**：润色面走 ``GuardPolicy(exempt_digit_addition=True)``
    ——豁免数字新增（2300/15%/3:30），保留硬保护/语言/硬否定/敏感新增。
 
@@ -201,19 +206,39 @@ def test_guard_reconciliation_exemption_is_load_bearing():
 
 
 def test_polish_end_to_end_accepts_digit_normalization():
-    result = polish_text("单号12345，我买了两千三百块")
+    """数量词归一仍生效——但它**只在不含报号串的轮上**发生。
+
+    含 4 位以上数字串/号码关键词的轮走整句短路（下面一条判例），故这条改用纯数量句：
+    口语量词照归一到阿拉伯数字（2300），这是设计内的授权改写（Guard 豁免数字新增）。
+    """
+    result = polish_text("呃，我买了两千三百块")
     assert result.guard.accepted is True
-    assert result.text == "单号12345，我买了2300块"
+    assert result.text == "我买了2300块"
     assert "numbers" in result.applied
+    # 混着报号的轮 → 整句短路，数量词也一并让位（宁可少洗，不可改号）
+    mixed = polish_text("单号12345，我买了两千三百块")
+    assert mixed.text == "单号12345，我买了两千三百块"
+    assert mixed.guard.reason == "number-reporting"
 
 
 def test_polish_number_self_correction_falls_back_to_original():
-    """数字改口：折叠会丢掉原报号串 → Guard 硬保护 token 检查拒 → 回退原文。"""
+    """数字改口：落地恒为原文（铁律：不丢数字）——**由报号短路保证**。
+
+    短路是第一道也是唯一一道（2026-09-21 起）：``不是12345，是67890`` 含 4 位数字 run
+    → 整句短路直接返回原文。第二层「Guard 硬保护 token」仍在，供**没有**触发短路的
+    改口式句子兜底——用 ``skip_number_reporting=False`` 把那一层单独钉住。
+    """
     result = polish_text("不是12345，是67890")
-    assert result.guard.rejected is True
-    assert result.guard.reason == REASON_PROTECTED_TOKEN_LOST
-    assert result.polished == "67890"  # 润色稿留档
-    assert result.text == "不是12345，是67890"  # 落地 = 原文（铁律：不丢数字）
+    assert result.text == "不是12345，是67890"
+    assert result.guard.reason == "number-reporting"
+    assert result.applied == ()
+
+    # 第二层单独验：关掉短路，折叠仍会丢原报号串 → Guard 硬保护 token 检查拒 → 回退原文。
+    layered = polish_text("不是12345，是67890", policy=PolishPolicy(skip_number_reporting=False))
+    assert layered.guard.rejected is True
+    assert layered.guard.reason == REASON_PROTECTED_TOKEN_LOST
+    assert layered.polished == "67890"  # 润色稿留档
+    assert layered.text == "不是12345，是67890"
 
 
 def test_polish_hard_protection_keeps_url():
@@ -241,10 +266,16 @@ def test_policy_can_disable_steps():
 
 def test_policy_guard_off_skips_output_guard():
     # guard=False：不做后验，直接采纳润色稿（供调用方自行裁决；默认永远挂 Guard）。
-    off = PolishPolicy(guard=False)
+    # ⚠️ 报号短路是**前置安全条件**、不是 Guard：不受 guard 开关影响，故本判例要显式
+    # 关掉它才测得到「无后验」这一层（用含数字 run 的句子正好说明这个次序）。
+    off = PolishPolicy(guard=False, skip_number_reporting=False)
     result = polish_text("不是12345，是67890", policy=off)
     assert result.text == "67890"
     assert result.guard.detail == "guard disabled"
+    # 短路照常先行（guard=False 也挡不住）
+    assert polish_text("不是12345，是67890", policy=PolishPolicy(guard=False)).guard.reason == (
+        "number-reporting"
+    )
 
 
 def test_empty_after_polish_falls_back_to_original():
@@ -265,3 +296,48 @@ def test_polish_is_pure_and_deterministic():
 def test_polish_idempotent_on_clean_text():
     clean = "你好，请问是张三吗"
     assert polish_text(clean).text == clean
+
+
+# ---- 报号短路（2026-09-21 真库实测回归） ----------------------------------------
+# 下面这 6 条**逐字取自真库**（turns: line='a', role='user'），是 3063 条真实客户轮里
+# 被「折叠重复」改掉数字的那一批。前 4 条是客户在念号码（含 WhatsApp 报号），
+# 旧档会把中间重复的数字吃掉——`四三二零一一一。→ 四三二零一。` 在真库里出现 4 次。
+_REAL_NUMBER_TURNS = (
+    "四三二零一一一。",
+    "六四三二零一一一。",
+    "四五六五六五六七。",
+    "一三四四四三五是。",
+    "我的微信是一三四五五七七八。",
+    "四五六五六五六七。好的",
+)
+
+
+@pytest.mark.parametrize("text", _REAL_NUMBER_TURNS)
+def test_number_reporting_turn_returned_verbatim(text):
+    """报号串整句短路：逐字返回原文、零步生效、原因码可归因。"""
+    result = polish_text(text)
+    assert result.text == text
+    assert result.applied == ()
+    assert result.guard.reason == "number-reporting"
+    assert result.polished == text
+
+
+@pytest.mark.parametrize("text", _REAL_NUMBER_TURNS)
+def test_without_short_circuit_the_digits_are_eaten(text):
+    """A/B 归因（关掉短路=回旧档）：真库那批破坏确实来自「折叠重复」。
+
+    这是**缺陷留档**而非正确性断言——它钉住「旧档会吃号码」，所以短路不能被删。
+    不吞数字的样本（如「我的微信是…」）在旧档下本来就不变，跳过。
+    """
+    old = polish_text(text, policy=PolishPolicy(skip_number_reporting=False))
+    if old.text != text:
+        assert "repeats" in old.applied
+        assert old.text != text
+
+
+def test_short_circuit_does_not_over_block_ordinary_cleaning():
+    """短路只挡报号串：普通客户话照洗，数量词归一照做（不是一刀切停摆）。"""
+    assert polish_text("啊，你好，听得到我声音吗？").text == "你好，听得到我声音吗？"
+    # 数量型词（非报号）仍归一——`is_number_reporting` 对「两百块」为假。
+    assert polish_text("啊，两百块。").text == "200块。"
+    assert is_number_reporting("两百块。") is False

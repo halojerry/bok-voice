@@ -507,6 +507,9 @@ class PolishPolicy:
     collapse_repeats: bool = True
     normalize_numbers: bool = True
     guard: bool = True
+    # 报号串整句短路（默认开）。关掉 = 回到 2026-09-21 之前的行为：口报号码会被
+    # 「折叠重复」吃掉（真库实测 69/3063 客户轮）。留这个口只为 A/B 归因，正常别关。
+    skip_number_reporting: bool = True
 
 
 class PolishResult(NamedTuple):
@@ -520,17 +523,28 @@ class PolishResult(NamedTuple):
 
 
 def polish_text(text: str, *, policy: PolishPolicy | None = None) -> PolishResult:
-    """确定性润色出口：五步流水 + E3 Guard（豁免数字新增）后验。
+    """确定性润色出口：报号短路 → 五步流水 + E3 Guard（豁免数字新增）后验。
 
     步骤序：改口取后值 → 删口水词 → 折叠重复 → 数字规范化 → 收尾整理。**Guard 挂在
     出口**（§26.2-E7「出口必挂 E3 Guard」），拒绝即回退原文（``text`` = 原文，
     ``polished`` 仍留档）。Guard 走 ``GuardPolicy(exempt_digit_addition=True)``：豁免
     数字新增（2300/15%/3:30 是模板授权的），保留硬保护 token / 语言 / 硬否定 / 敏感新增。
+
+    **报号串整句短路（在任何一步之前）**：``is_number_reporting`` 主动进流水，
+    不再只是「供调用方选用的钩子」——2026-09-21 真库实测（3063 条真实客户轮）
+    「折叠重复」会把客户念的号码吃掉：``四三二零一一一。→ 四三二零一。``、
+    ``四五六五六五六七。→ 四五六七。``（69 轮数字面变化）。被叫重念、连续数字、
+    WA 报号都长这个形状，任何一步都可能改掉号码——故整句短路，逐字返回原文。
     """
     options = policy or PolishPolicy()
     src = _as_text(text)
     out = src
     applied: list[str] = []
+
+    if options.skip_number_reporting and is_number_reporting(src):
+        return PolishResult(
+            src, src, (), GuardResult(True, "number-reporting", "报号串整句短路", src, src)
+        )
 
     if options.fold_corrections:
         folded = fold_self_correction(out)
