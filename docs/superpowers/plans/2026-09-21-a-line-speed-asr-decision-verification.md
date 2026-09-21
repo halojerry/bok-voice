@@ -3120,3 +3120,31 @@ partial 与句级提交点位移 → 读数位移。**这不是 agent 变慢/变
 2. **压 judge 自身 prefill**（判据集+转写 4.5s）：裁判据集或换更短判据格式，收益直接。
 3. **记忆旋钮（零代码）**：`REPLY_MEMORY_LINES` 6→3-4 直接砍 ~280-380 tok（≈0.45-0.6s/轮）；每行 ≤200 字改要点式是代码档。改动后验收＝本工具前后差 + 300 轮 TTFT 回归。
 4. 兜底推迟（抬 3s 死线）**不做**——只是把痛苦推后，用户已拍板。
+
+### 38.6 云端分批实测（2026-09-22 夜，用户提供 DeepSeek key）
+
+**先记一条硬约束（差点让整批白跑）：该账号的 `deepseek-flash` / `deepseek-v4-pro` 默认是推理模型**
+——`content=''`、内容全在 `reasoning_content`、`finish=length`（160 token 预算全烧在思维链上）。
+判据请求 `max_tokens=32` 同样返回空 → **判据静默空转**（首跑 6 次全 `unclear conf=0.00` 就是这个假象）。
+可行姿势两条：**`deepseek-chat`（别名，默认不推理）** 或 `extra_body={"thinking":{"type":"disabled"}}`。
+这与本地「客服 LLM 关思考」是同一条教训。
+
+| 批次 | 改什么 | 实测 | 结论 |
+|---|---|---|---|
+| **1a 判据→flash（默认推理）** | `FLOW_JUDGE_LLM_*` 指云 | 判据请求 856ms 但 `content=''`；soak 首声 p50 1720ms、**哑 1**、6 次判据全 `unclear conf=0.00` | **无效跑**：判据空转，读数不可用 |
+| **1b 判据→`deepseek-chat`** | 同上换非推理别名 | 判据请求 **697ms**（本地 9B 同形 4537ms，**6.5×**）；soak **哑 0**、判据多档真输出（`confirm blocked (wa step, not captured)`／`unclear route=register_followup`／`confirm blocked (no ack signal)`／`route=degrade_question`） | **判据换云可行**：更快、真判、零本地 GPU |
+| **2 主回复（离线量，未上栈）** | 用真实渲染前缀+尾块造 prompt 直打云 | **首个内容 token 320-683ms**（`deepseek-chat` 默认 683ms；flash 关思考 368ms；chat 关思考 320ms）vs 本地 4B **TTFT p50 1010 / p90 2343ms** | 值得做，但要先解决隐私口径与降级链（见下） |
+
+**1b 最重要的意外**：判据已完全离本地 GPU，**慢轮依旧**（TTFT 4092/2941/4204/2933ms，tps 6-10 而健康档 15-19）。
+→ **§38.3 探针的 +1375ms 是「饱和负载」下的上界，真实通话节奏里 judge 不是主源**；剩下的争用者另有其人
+（怀疑 ASR：probe 推流 4s 音频只用 0.8s 墙钟＝5× 实时，解码密度远超真人说话）。下次归因要**分开量**
+「推流中」与「停嘴边沿」两个窗，别再用饱和法外推。
+
+**两个待查兼容点**：①云端判据 `conf` 恒 0.00（本地 D5 口径是「缺 conf 按 0.7 放行」），
+若 `register_followup` 需 conf≥0.7，则**云的跟进单路由会被静默挡掉**；②`DeepSeekLLM` 现成 provider
+只透传 `max_tokens`，**不带 thinking 开关**——直接换它上主回复会踩同一个推理坑。
+
+**代码面（本轮落地，默认零变化）**：`_llm_judge` 加 `api_key` 参数（缺省 `"mlx"`＝本地不校验凭据，逐字节同旧），
+两个判据调用点读 `FLOW_JUDGE_LLM_API_KEY`；该 env 已按立法进 `_FORWARD_ENV`。
+**key 只走 env，不落任何文件、不入库。**
+
