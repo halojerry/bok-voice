@@ -287,20 +287,22 @@ def test_campaign_audit_events(monkeypatch):
         assert expected in events, expected
 
 
-def test_campaign_sql_backend_parity(monkeypatch):
+def test_campaign_sql_backend_parity(monkeypatch, tmp_path):
     """SQL 后端同契约：create/list/detail/transition 全链在 SQL 仓可用。"""
     from fastapi.testclient import TestClient
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
-    from sqlalchemy.pool import StaticPool
 
     from bok_voice_business_db import models
     from bok_voice_business_db.repository import SqlAlchemyBusinessRepository
 
     from control_plane.main import app
 
+    # 文件库（tmp_path 每用例一个）而非 `sqlite://`+StaticPool：后者的「全线程共用
+    # 一条连接」在 dispose 与在用并发时 SIGSEGV（2026-09-21 机制级复现 3/3）。
     engine = create_engine(
-        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+        f"sqlite:///{tmp_path}/bok_test.db",
+        connect_args={"check_same_thread": False, "timeout": 30},
     )
     models.create_all(engine)
     repo = SqlAlchemyBusinessRepository(

@@ -35,7 +35,10 @@ def _start_cp() -> subprocess.Popen | None:
             return None
     except Exception:
         pass  # 未起 → 走启动分支
-    db = tempfile.mktemp(suffix=".db")
+    # CWE-377：mktemp 只给名字不留占位，「拿到名字 → sqlite 打开」之间可被抢占。
+    # mkstemp 原子建文件(0600)再关 fd——sqlite 打开零长文件即视为新库，语义等价。
+    fd, db = tempfile.mkstemp(suffix=".db", prefix="bok-load-cp-")
+    os.close(fd)
     env = dict(os.environ)
     env["DATABASE_URL"] = f"sqlite:///{db}"
     env["PYTHONPATH"] = (
