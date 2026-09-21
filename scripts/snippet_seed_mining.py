@@ -7,21 +7,43 @@
 两步法（plan §26 / vocab-skill 范式）:
   1. 领域词表（正形）：业务=粤语/中文快递集运外呼。可用业务库
      conversation_templates.hotwords 与 object_profiles.courier 佐证。
-  2. 对每个正形词调本地 4B（:1235）生成 3-8 个「ASR 可能听错的形态」，
+  2. 对每个正形词调本地 LLM 生成 3-8 个「ASR 可能听错的形态」，
      再拿候选 trigger 去真实转写语料里**实证回查**——只有真实出现过
      （evidence>=1）的候选才入选；纯 LLM 幻想进 discarded。
+
+模型档（2026-09-21 批次 3）：默认 4B（:1235）。4B 变体召回不足（首批实测
+candidates=1/discarded=77），故提供 `--model-9b`（:1237 huihui 9B）换生成端；
+生成端只影响候选覆盖面，实证回查与守卫两条闸不因换模型放松。
+
+语言分域（2026-09-21 批次 3，配合 snippets.SnippetRule.lang）:此前「形态多数
+出现在非 zh 通话」= 直接丢弃（`lang_context_correct`）——那在只有单份语言无关
+词表的年代是对的（全局替换会改坏粤语通话的正确繁体）。现在规则可带 `lang`，
+3b 升级为三档（证据驱动，fail-safe 方向「宁可漏改、不可改坏」）:
+
+  * zh 证据=0 且非 zh 出现过 → 仍是 `lang_context_correct` 丢弃（那是别语言的
+    正确形态，收窄成 zh 只会变成永不命中的死规则）；
+  * 非 zh 出现过 **且** zh 也出现过 → 入选但打 `lang="zh"`（粤语通话逐字不动、
+    中文通话才改）。**不设「非 zh 占比」门槛**：占比再低也证明该形态真实存在于
+    那些语言；改坏正确转写（污染下游匹配面）的代价 > 漏改一个已存在的错
+    （漏改=维持现状）；
+  * 非 zh 零出现 → 全语言（`lang=""`），安全。
 
 数据源（全只读）:
   - 业务库 turns 用户轮（role in user/me/other，排除测试对象前缀）
   - /tmp/r1_gaps_raw.json（若缺则从 CP :8000 llm-gaps 只读拉）
 
 安全边界:
-  - 网络仅限白名单守卫后的 http://127.0.0.1:1235 与 :8000（host/port 双验）。
+  - 网络仅限白名单守卫后的 http://127.0.0.1:{1235|1237} 与 :8000（host/port 双验）。
   - 术语：语言值只用 zh/cantonese/en（不使用任何旧的粤语拼写字面量）。
 
 用法:
-  python3 scripts/snippet_seed_mining.py            # 挖掘 + 落盘
-  python3 scripts/snippet_seed_mining.py --dry-run  # 只打印不落盘
+  python3 scripts/snippet_seed_mining.py                 # 4B 挖掘 + 落盘
+  python3 scripts/snippet_seed_mining.py --model-9b      # 9B 挖掘（变体召回更高档）
+  python3 scripts/snippet_seed_mining.py --dry-run       # 只打印不落盘
+
+**本脚本产出仅供人工确认，绝不写进运行时代码或词表**（`_SNIPPET_SEED` 由人工
+确认后灌入）——脚本零 side effect 是指对仓库/运行时零写入，落盘的候选 JSON
+只是审计产物。
 """
 
 from __future__ import annotations
@@ -57,9 +79,11 @@ OUT_PATH = ROOT / "scripts" / ".snippet_candidates.20260921.json"
 
 LLM_HOST = "127.0.0.1"
 LLM_PORT = 1235
+LLM_PORT_9B = 1237  # 后台重活专线（AGENTS.md）：settle/judge 同款 9B，生成端换档用
 CP_HOST = "127.0.0.1"
 CP_PORT = 8000
 LLM_MODEL = "/Users/halo/.lmstudio/models/avan-ag/Qwen3.5-4B-Uncensored-MLX-4bit"
+LLM_MODEL_9B = "/Users/halo/.lmstudio/models/huihui-ai/Huihui-Qwen3.5-9B-abliterated-mlx-4bit"
 
 MAX_VARIANTS_PER_WORD = 8
 LLM_MAX_TOKENS = 400
@@ -135,8 +159,17 @@ def guard_url(url: str, allowed: tuple[tuple[str, int], ...]) -> str:
     return url
 
 
-LLM_ALLOW: tuple[tuple[str, int], ...] = ((LLM_HOST, LLM_PORT),)
 CP_ALLOW: tuple[tuple[str, int], ...] = ((CP_HOST, CP_PORT),)
+
+
+def llm_allow(port: int) -> tuple[tuple[str, int], ...]:
+    """生成端白名单：只放行本机 1235（4B）/ 1237（9B）两个已知端口。
+
+    换档（--model-9b）也必须过守卫——端口是显式参数，不是「白名单外随便填」。
+    """
+    if port not in (LLM_PORT, LLM_PORT_9B):
+        raise UrlGuardError(f"LLM port not allowed: {port}")
+    return ((LLM_HOST, port),)
 
 
 def _post_json(url: str, payload: dict, timeout: int, allowed: tuple) -> dict:
@@ -272,22 +305,26 @@ def _extract_variants(raw_text: str) -> list[str]:
     return out
 
 
-def generate_variants(word: str) -> list[str]:
-    """调本地 4B 生成一个正形词的错形变体；失败重试 1 次后返回 []。"""
-    url = f"http://{LLM_HOST}:{LLM_PORT}/v1/chat/completions"
+def generate_variants(word: str, model: str, port: int) -> list[str]:
+    """调本地 LLM 生成一个正形词的错形变体；失败重试 1 次后返回 []。
+
+    生成端（model/port）由调用方给定：4B(:1235) 默认档，9B(:1237) 高召回档。
+    """
+    url = f"http://{LLM_HOST}:{port}/v1/chat/completions"
+    allowed = llm_allow(port)
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user", "content": f"正形词：「{word}」"},
     ]
     payload = {
-        "model": LLM_MODEL,
+        "model": model,
         "messages": messages,
         "temperature": 0,
         "max_tokens": LLM_MAX_TOKENS,
     }
     for attempt in range(2):  # 1 次 + 重试 1 次
         try:
-            resp = _post_json(url, payload, timeout=90, allowed=LLM_ALLOW)
+            resp = _post_json(url, payload, timeout=120, allowed=allowed)
             content = resp["choices"][0]["message"]["content"]
             variants = _extract_variants(content)
             if variants:
@@ -314,6 +351,39 @@ def is_malformed_variant(variant: str) -> bool:
     return any(m in variant for m in _MALFORMED_MARKERS)
 
 
+# 词表 dump 行的结构性判定（2026-09-21 批次 3 实弹发现）：挖掘语料里混着 ASR
+# 「热词失焦」行——整行是热词表本身被抄出来（如「單號，運單，賠償，運費，專員，
+# 集運，時效，上門，追蹤，核實，WhatsApp，微信。」）。那不是客户话，拿它当变体
+# 的实证会把 dump 伪影**自我放大**（本轮第一批候选 專員/京東 的证据行全是这种行）。
+# E2（hotword_leak）在运行时已把这类行清洗掉/丢弃，挖掘侧必须同样前置剔除。
+# 判定走**结构性**而非词表比对：dump 行真实长什么样与具体词表无关，且此处拿不到
+# 该通通话的 effective 词表（turns 表不存词表）。签名=「标点切出的 token 很多（≥6）、
+# 且绝大多数（≥80%）是短块（≤4 字）」——真实客户话要么 token 少、要么夹杂长句块。
+# 阈值取密度而非「最长 token ≤ N」：dump 行里混着 `WhatsApp`（8 字符）这种长英词，
+# 按最长块判会整批漏网（首版实弹实测：3459 行语料只逮到 2 行）。
+_DUMP_SPLIT_RE = re.compile(r"[，,、；;。.]+")
+DUMP_MIN_TOKENS = 6
+DUMP_SHORT_CHARS = 4
+DUMP_SHORT_RATIO = 0.8
+# 报号句与 dump 行同形（都是「一串短块」），但它是**真实客户话**且语义关键
+# （WhatsApp/单号捕获路径）：`WhatsApp係一、二、三、四、五、六、七。係。` 首版
+# 被误判成 dump。故纯数词块不计入短块——报号行因此达不到短块密度而落选。
+_NUMERAL_TOKEN_RE = re.compile(r"^[0-9０-９一二三四五六七八九十百千萬万零両两]+$")
+
+
+def looks_like_hotword_dump(text: str) -> bool:
+    """整行是否呈词表 dump 形态（见上方说明）。"""
+    tokens = [t.strip() for t in _DUMP_SPLIT_RE.split(str(text or "")) if t.strip()]
+    if len(tokens) < DUMP_MIN_TOKENS:
+        return False
+    short = sum(
+        1
+        for t in tokens
+        if len(t) <= DUMP_SHORT_CHARS and not _NUMERAL_TOKEN_RE.match(t)
+    )
+    return short / len(tokens) >= DUMP_SHORT_RATIO
+
+
 def count_occurrences(compact_text: str, compact_trigger: str) -> int:
     if not compact_trigger:
         return 0
@@ -330,6 +400,27 @@ def build_freq_vocab(compact_texts: list[str], threshold: int = 3, top: int = 20
                 counter[text[i : i + size]] += 1
     frequent = [gram for gram, c in counter.most_common() if c >= threshold]
     return set(frequent[:top])
+
+
+def decide_lang_scope(lang_weight: dict) -> tuple[str, str]:
+    """按语言分布决定分域；返回 ``(rule_lang, discard_reason)``（reason 非空=丢弃）。
+
+    三档（fail-safe 方向「宁可漏改、不可改坏」）：
+
+    * **非 zh 零出现** → ``("", "")`` 全语言，安全；
+    * **非 zh 出现过 且 zh 也出现过** → ``("zh", "")``：收窄 zh 专属。**不设「非 zh
+      占比」门槛**——占比再低也证明该形态真实存在于那些语言；改坏正确转写（污染
+      下游匹配面）的代价 > 漏改一个已存在的错（漏改=维持现状）；
+    * **非 zh 出现过 但 zh 证据=0** → ``("", "lang_context_correct")`` 丢弃：那是
+      别语言的正确形态，收窄成 zh 只会变成永不命中的死规则。
+    """
+    zh_weight = int(lang_weight.get("zh", 0) or 0)
+    non_zh = sum(int(w or 0) for lg, w in lang_weight.items() if lg and lg != "zh")
+    if non_zh <= 0:
+        return "", ""
+    if zh_weight <= 0:
+        return "", "lang_context_correct"
+    return "zh", ""
 
 
 def reverse_safety_reason(
@@ -376,6 +467,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="E1 snippet 词表候选挖掘")
     parser.add_argument("--dry-run", action="store_true", help="只打印不落盘")
     parser.add_argument("--db", default=str(DB_PATH), help="业务库路径（只读）")
+    parser.add_argument(
+        "--model-9b",
+        action="store_true",
+        help="生成端换 9B(:1237 huihui)——4B 变体召回不足时用（实证回查与守卫不放松）",
+    )
+    parser.add_argument("--out", default=str(OUT_PATH), help="候选清单落盘路径")
     args = parser.parse_args()
 
     canonical = build_canonical()
@@ -384,10 +481,27 @@ def main() -> int:
     gaps = load_gaps_corpus(GAPS_PATH)
     print(f"[corpus] turns 用户轮={len(turns)}  gaps 条={len(gaps)}", file=sys.stderr)
 
-    # 实证语料：compact 后的 (原文, 紧凑文, 权重, 语言)
+    gen_model = LLM_MODEL_9B if args.model_9b else LLM_MODEL
+    gen_port = LLM_PORT_9B if args.model_9b else LLM_PORT
+    print(f"[llm] 生成端 model={gen_model} port={gen_port}", file=sys.stderr)
+
+    # 实证语料：先剔词表 dump 行（不是客户话，留着会把 dump 伪影当变体证据），
+    # 再 compact 成 (原文, 紧凑文, 权重, 语言)。
+    raw_corpus = [(t, 1, lang) for t, lang in turns] + [(g, w, lang) for g, w, lang in gaps]
+    kept: list[tuple[str, int, str]] = []
+    dumps = 0
+    for text, weight, lang in raw_corpus:
+        if looks_like_hotword_dump(text):
+            dumps += 1
+            continue
+        kept.append((text, weight, lang))
     corpus_texts: list[tuple[str, str, int, str]] = [
-        (t, _compact(t), 1, lang) for t, lang in turns
-    ] + [(g, _compact(g), w, lang) for g, w, lang in gaps]
+        (t, _compact(t), w, lang) for t, w, lang in kept
+    ]
+    print(
+        f"[corpus] 剔词表 dump 行={dumps} 实证语料={len(corpus_texts)}",
+        file=sys.stderr,
+    )
     compact_all = [c for _, c, _, _ in corpus_texts if c]
     freq_vocab = build_freq_vocab(compact_all)
     print(f"[corpus] 高频正确词表(top200, n-gram 近似)={len(freq_vocab)}", file=sys.stderr)
@@ -397,7 +511,7 @@ def main() -> int:
     seen_triggers: set[str] = set()
 
     for word in canonical:
-        variants = generate_variants(word)
+        variants = generate_variants(word, gen_model, gen_port)
         print(f"[llm] {word} -> {variants}", file=sys.stderr)
         for v in variants:
             key = _compact(v)
@@ -445,33 +559,30 @@ def main() -> int:
                 )
                 continue
 
-            # 3b) 语言反向安全：该形态若多数出现在非正形语言的通话里，
-            # 就是那种语言的正确输出（如繁体=粤语通话的正确形态），
-            # 单份语言无关的词表全局替换会改坏它 —— 丢弃。
-            non_zh = sum(w for lg, w in lang_weight.items() if lg and lg != "zh")
-            if non_zh * 2 >= evidence:
+            # 3b) 语言反向安全：形态在非 zh 通话里出现过 = 无法证明它在那些语言里是错的。
+            # 判定抽成纯函数 decide_lang_scope（三档语义与 fail-safe 取向见该函数）。
+            rule_lang, scope_reason = decide_lang_scope(lang_weight)
+            if scope_reason:
                 discarded.append(
                     {
                         "trigger": v,
                         "replacement": word,
-                        "reason": "lang_context_correct",
+                        "reason": scope_reason,
                         "langs": dict(lang_weight),
                     }
                 )
                 continue
-
             warnings: list[str] = []
-            if non_zh * 3 >= evidence and non_zh > 0:
-                # 非正形语言也有可观占比（<50% 故未判丢弃）：人工复核时必须
-                # 权衡「单份语言无关词表」在那些通话里会改坏正确转写。
+            if rule_lang:
                 detail = ",".join(f"{lg or '?'}={w}" for lg, w in lang_weight.most_common())
-                warnings.append(f"lang_ambiguous({detail})")
+                warnings.append(f"lang_scoped_zh({detail})")
 
             candidates.append(
                 {
                     "trigger": v,
                     "replacement": word,
                     "source": "mined",
+                    "lang": rule_lang,
                     "evidence": evidence,
                     "langs": dict(lang_weight),
                     "samples": samples,
@@ -481,7 +592,11 @@ def main() -> int:
 
     candidates.sort(key=lambda c: (-int(c["evidence"]), c["trigger"]))
 
-    result = {"candidates": candidates, "discarded": discarded}
+    result = {
+        "generated_by": {"model": gen_model, "port": gen_port},
+        "candidates": candidates,
+        "discarded": discarded,
+    }
     print(
         f"[result] candidates={len(candidates)} discarded={len(discarded)}",
         file=sys.stderr,
@@ -489,10 +604,11 @@ def main() -> int:
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
     if not args.dry_run:
-        OUT_PATH.write_text(
+        out_path = Path(args.out)
+        out_path.write_text(
             json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
-        print(f"[result] wrote {OUT_PATH}", file=sys.stderr)
+        print(f"[result] wrote {out_path}", file=sys.stderr)
     return 0
 
 

@@ -28,6 +28,7 @@ from bok_voice_core.hotword_leak import sanitize as _hotword_leak_sanitize
 from bok_voice_core.snippets import apply_snippets as _apply_snippet_rules
 from bok_voice_core.snippets import compile_rules_with_skipped as _compile_snippet_rules
 from bok_voice_core.snippets import merge_rules as _merge_snippet_rules
+from bok_voice_core.snippets import rules_for_lang as _rules_for_lang
 
 from .plugins.context import ContextInjector
 from .plugins.knowledge import KnowledgePlugin
@@ -1318,16 +1319,21 @@ def _hotword_leak_sanitize_enabled() -> bool:
     return os.environ.get("BOK_HOTWORD_LEAK_SANITIZE", "1") == "1"
 
 
-def compile_snippet_rules(seed: list | None = None) -> list:
-    """装配期合并(单点)+守卫审计一次;返回交给每轮 apply 的合并规则 list。
+def compile_snippet_rules(seed: list | None = None, lang: str = "") -> list:
+    """装配期分域+合并(单点)+守卫审计一次;返回交给每轮 apply 的规则 list。
 
-    ``merge_rules`` 是词表合并唯一入口(本批只喂 _SNIPPET_SEED);``compile_rules
-    _with_skipped`` 在这里跑一次拿守卫审计面(数字/空 trigger/长度铁律拦下的规则),
+    顺序**钉死**为 ``rules_for_lang`` → ``merge_rules`` → 守卫审计:反序会让本语言
+    专用规则在合并时压掉全语言规则、随后又被分域滤掉(该 trigger 在本通电话里变成
+    无规则)——见 ``snippets`` 模块 docstring 的失效说明。
+
+    ``lang`` = 本通通话语言(``greet_lang``);传空串=不限域(等价旧行为,单测/未知语言
+    档)。守卫审计面(数字/空 trigger/语言值域/长度铁律拦下的规则)在这里跑一次,
     有 skipped 就打一条 ``SNIPPET skipped=<n> reasons=...``。每轮消费直接把返回值
     交给 ``apply_snippets``(其内部按模块设计再编译一次——规则数极小,合并与守卫
     审计的重活只在装配期做一遍)。
     """
-    merged = _merge_snippet_rules(_SNIPPET_SEED if seed is None else seed)
+    scoped = _rules_for_lang(_SNIPPET_SEED if seed is None else seed, lang)
+    merged = _merge_snippet_rules(scoped)
     report = _compile_snippet_rules(merged)
     if report.skipped:
         reasons = ",".join(sorted({s.reason for s in report.skipped}))
@@ -2573,7 +2579,9 @@ async def entrypoint(ctx):
     # 上面那份 asr_hotword_context 产物(即随 STT /api/start 下发 sidecar 的词表),
     # 保证「泄漏」判定与真实喂给 ASR 的偏置面对齐。E1 词表在装配期合并编译一次。
     _hotword_terms = _parse_vocab_terms(_hotword_ctx)
-    _snippet_merged = compile_snippet_rules()
+    # E1 词表按**本通通话语言**分域(2026-09-21 批次 3):繁体形错误形态(集運 类)在
+    # cantonese 通话里是正确写法,不分域改就是双向伤害。装配期定死,每轮零语言判断。
+    _snippet_merged = compile_snippet_rules(lang=greet_lang)
     if use_fake or asr_provider_name in ("fake", "fake_stt"):
         stt_provider = FakeLiveKitSTT()
     else:
