@@ -146,7 +146,7 @@ else
   mv -f "$RUNTIME/livekit-server-${TRIPLE}" "$RUNTIME/livekit-server"
 fi
 
-# --- llama.cpp (Windows only) ----------------------------------------------
+# --- llama.cpp (Windows CUDA / Linux ubuntu-x64) ---------------------------
 if [ "$OS" = "win" ]; then
   echo "==> [runtime] downloading llama.cpp CUDA 12.4 + cudart"
   LLAMA_DIR="$RUNTIME/llama"
@@ -158,6 +158,22 @@ if [ "$OS" = "win" ]; then
   (cd "$LLAMA_DIR" && unzip -qo "$RUNTIME/llama-cuda.zip" && unzip -qo "$RUNTIME/llama-cudart.zip")
   rm -f "$RUNTIME/llama-cuda.zip" "$RUNTIME/llama-cudart.zip"
   find "$LLAMA_DIR" -iname "llama-server.exe" -exec mv {} "$LLAMA_DIR/llama-server.exe" \;
+  ls -la "$LLAMA_DIR" | head -20
+elif [ "$OS" = "linux" ]; then
+  # Ubuntu 节点档（2026-09-20）：llama.cpp 官方 ubuntu-x64 构建 → runtime/llama/
+  # llama-server（bundled_llama() 的 Linux 候选之一）。机器需 NVIDIA 驱动 + CUDA
+  # 运行期库（安装脚本环境体检会查 nvidia-smi）；缺此档时 _start_llm 回退 PATH
+  # 的 llama-server（运维自装），doctor 如实报 :1235 不健康。
+  echo "==> [runtime] downloading llama.cpp (ubuntu x64)"
+  LLAMA_DIR="$RUNTIME/llama"
+  mkdir -p "$LLAMA_DIR"
+  LLAMA_TAG="b10733"
+  BASE="https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_TAG}"
+  curl -fsSL "${BASE}/llama-${LLAMA_TAG}-bin-ubuntu-x64.zip" -o "$RUNTIME/llama-ubuntu.zip"
+  (cd "$LLAMA_DIR" && unzip -qo "$RUNTIME/llama-ubuntu.zip")
+  rm -f "$RUNTIME/llama-ubuntu.zip"
+  find "$LLAMA_DIR" -iname "llama-server" -type f -exec mv {} "$LLAMA_DIR/llama-server" \;
+  chmod +x "$LLAMA_DIR/llama-server" 2>/dev/null || true
   ls -la "$LLAMA_DIR" | head -20
 fi
 
