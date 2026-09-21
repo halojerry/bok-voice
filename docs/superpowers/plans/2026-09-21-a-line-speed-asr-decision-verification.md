@@ -2564,3 +2564,61 @@ E3/E7 落地且**实测判定「不加 LLM 步」**；E5 增补落地且**干净
   **未实施的理由**：本机**复现不出来**（单文件 40 次循环 0 崩；全量约 6 次 1 崩），
   改 6 个 fixture 属**不可验证的改动**——留给一次带复现窗口的专门收口（先跑全量循环攒再现，
   再改，再对比崩率）。**在此之前不得宣称「套件稳定」。**
+
+---
+
+## 33. 收编两个 stranded 分支（2026-09-21）：9/20 的两条未合并工作分支
+
+用户指出 9/20 还有两个分支没合并。实查：`origin` 上三条未并入 main 的分支里，两条
+是 9/20 的——**都没有 PR、都漂移 44 个提交、从未合并**（第三条 `20260919-232858-4eb7`
+是 9/19 的并行会话分支，不在本次范围）。两条都**内容完整且带测试**，故按「一分支一 PR」
+收编，保持可回滚粒度。
+
+### 33.1 `session-20260920-031209-181a` → **PR #136（已合并）** 管理面下发制
+
+**内容**：`permissions.py` 新增管理键目录 6 键（settings/knowledge/personas/audit/
+users/supervisor；**nodes/licenses 仍 root 专属、不进任何目录**）。admin 的
+`permissions_json`：`''`/缺失=**存量全量**（升级对现有 admin 零变化）/显式 JSON=root
+裁定集；新建 admin 盖默认章（页面默认集+管理键全关）。42 处管理面闸换装
+`auto_gate_management`（路径前缀表；root/机器通道/auth-off 直通，admin 逐键查库 403
+带键名）+ **包含规则**（admin 授不出自己没有的键）+ users 三缺陷收口 +
+`GET /api/settings?internal=1` 明文回源收 root/机器通道。
+
+**两处漂移冲突（解法=保留双新，非二选一）**：
+1. `POST/PUT /api/personas`：main 同期加了 **F1 账号兜底**（`account_id or "acc-001"`），
+   原分支把 `require_role` 换成 `auto_gate_management` → **两者都留**。
+2. 导航表：main 已把话术/快答收进 AI 工作站（9/20 重组），原分支仍带旧两项 + 新 `mkey`
+   → **取 main 的新结构 + 换上新下发键**。
+
+**遗留（未擅自改）**：`/api/tts/branch-pregen` 仍走 `require_role(admin,root)`——它由
+**原分支之后的 PR** 加入，故没被换装。**不是安全洞**（依旧 admin/root 专属），但破坏
+「没下发就用不了」的一致性；归哪个键（settings / qa / templates）属产品语义，留决策。
+
+### 33.2 `session-20260920-160609-e576` → **PR #137** Ubuntu 节点运行时 + 装机七步制
+
+**内容**：①**修一个真 bug**——旧 `cmd_up` **只起服务面**（ASR/TTS/LLM/b-line），**通话面**
+（LiveKit + agent/interp worker + monitor）只在 dev `serve` 内联，故**节点装完打不了电话**；
+本分支把通话面提取为 `_start_call_plane`，serve 与 node_agent 同源。②Linux 运行时：app-data
+落 `$XDG_DATA_HOME`、模型表非 mac 走 GGUF 档、`BOK_LLM_TIER`/`download --only`。③`tools/
+systemd_units.py`（**纯文本模块、零 subprocess**）——最值得看的是**退出码语义对齐**：
+`Restart=on-failure` 复刻本仓语义（75=更新→拉回上新版；`exit(0)`=吊销熔断→**必须保持
+死亡**），文档**明文禁止 `Restart=always`**（会把熔断节点拉活）；另有单元名白名单与
+`ExecStart` 参数引用。④装机七步（体检/venv+**license 提前注册**/模型选型/systemd 装载/
+拉起+**六点硬自检**/成功摘要不打印凭据）。
+
+**零冲突合并，但仍做语义级复核**（`tools/bok.py` 是 main 上改动最集中的文件之一）：关键
+函数各只有 1 处定义（无重复定义遮蔽）、`cmd_download(only=)` 为可选参数（旧调用方不破）、
+`compileall` 过。
+
+**遗留（未擅自改）**：Linux 节点走 **GGUF/llama.cpp**，mac 走 **mlx**——**两侧推理栈不同**，
+而本仓全部延迟基线（`docs/LATENCY_BUDGETS.md`）都在 mlx 上测。真机 Ubuntu 跑过延迟探针
+之前**不得假定两平台等价**。
+
+### 33.3 验证与队列
+
+- 验证：分支 A 合并后全量 **2398 passed** + `tsc --noEmit` exit 0；分支 B 合并后全量
+  **2423 passed**；两次 `compileall` 均过；两次合并后**无残留冲突标记**。
+- 本 §33 即「把两条分支归到本任务」的落盘：两者的**内容、冲突解法、遗留项**都在此，
+  后续会话不必再翻那两个分支的历史。
+- 队列新增：①`branch-pregen` 的键归属（产品决策）；②**Linux 节点延迟/质量基线**（换平台
+  必须重测，勿假定等价）；③§32.4 的 6 个 fixture 收口（需复现窗口）。
