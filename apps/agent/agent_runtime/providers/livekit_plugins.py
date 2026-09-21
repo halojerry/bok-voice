@@ -4806,6 +4806,13 @@ class Qwen3ASRSTT(stt.STT):
         # 收线/告别直念窗旗(F4 二修):agent 播分支动作【收线】台词期间 True,
         # 念完即撤。此窗内流静默丢弃一切成轮事件(句级提交/EOS/FINAL)。
         self._closing_say = False
+        # 本轮 ASR 滑窗 partial 末稿(agent 侧 E2 热词泄漏清洗的 fallback_text 取口)。
+        # 写点=实时流 _Qwen3ASRLiveStream._publish_turn_partial(每窗 partial 到达);
+        # 清点=流 _reset(该段 FINAL 记账处,清后由 FINAL 发出点按 pre-reset 快照
+        # 重贴给刚落库那条 FINAL)/_start_session(新语音段开场=新一轮)。
+        # 故它是一个「本轮」值:新一轮开场即清,不会把上一轮的 partial 喂给下一轮。
+        # 恒可安全读:纯属性、无 await、无 IO;offline recognize 路径不写=恒空。
+        self._turn_partial_text: str = ""
 
     def stream(self, *, language=None, conn_options=None):
         return _Qwen3ASRStream(self, conn_options or APIConnectOptions())
@@ -5387,6 +5394,44 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         # 后续词表孤词残片按回声衰落丢弃——首现孤词保留(真人可能真讲「微信」)。
         self._vocab_echo_seen: bool = False
 
+    def _turn_partial_for_fallback(self) -> str:
+        """本段 partial 末稿(供 agent 侧 E2 fallback_text),**未提交坐标系**。
+
+        终稿是同一坐标系(句级提交句 / 停嘴 tail payload):fallback 与终稿对同一
+        段话比才有意义;整窗原文会把已提交句子也带上,而 ≥2 热词泄漏的 fallback
+        回吐路径(sanitize 步骤 6)会把那段已入史的话当新话再喂一次。
+
+        与 `_uncommitted` 的差别(故不复用它):①**零副作用零日志**——`_uncommitted`
+        在重解修正分支会打 ``QWEN3_ASR_REDECODE_DROP``,每窗多叫一次=同一窗重复
+        日志;本方法只做前缀剥离/定位。②坐标失配(窗口被重写、定位不到已提交前缀)
+        时**不猜**:原样返回整窗——fallback 只是泄漏判据的辅助证据,给长了判据自然
+        不成立,给错段会误剥。无人读时成本=两次字符串前缀比较。
+        """
+        text = self._last_partial
+        if not text:
+            return ""
+        committed = self._committed_text
+        if committed and text.startswith(committed):
+            return text[len(committed):].lstrip(_UNCOMMITTED_LEADING_WEAK_PUNCT)
+        if committed and self._last_sentence:
+            pos = text.rfind(self._last_sentence)
+            if pos >= 0:
+                return text[pos + len(self._last_sentence):].lstrip(_UNCOMMITTED_LEADING_WEAK_PUNCT)
+        return text
+
+    def _publish_turn_partial(self, text: str) -> None:
+        """把「本轮 partial 末稿」贴到内芯暴露位(agent 侧 E2 fallback_text 取口)。
+
+        空串=no-op(不是清):空白窗(未过已提交前缀/重解修正丢弃)不该把上一条
+        **有内容**的 partial 抹掉——fallback 要的正是「最近一条真 partial」。清零
+        是 `_reset` 的职责。
+
+        纯属性写:无 await、无 IO、无账本副作用,任何线程/协程时机都可调。
+        """
+        text = str(text or "")
+        if text:
+            self._stt_._turn_partial_text = text
+
     def _echo_filter(self, text: str, src: str) -> str:
         """词表回声统一闸(剥尾保头版,2026-09-12 call-46b94ebd P0)。
 
@@ -5578,8 +5623,15 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                             payload = ""
                     started = False
                     self._finishing = False
+                    # pre-reset 快照:本段 partial 末稿(_reset 会清暴露位,而这条
+                    # FINAL 的 fallback 正是它——agent 的 on_user_turn_completed/
+                    # _on_conversation_item 在本 FINAL 之后才跑,那时已是新的一段)。
+                    fallback_tail = self._turn_partial_for_fallback()
                     self._reset()
                     if payload:
+                        # 只给真发出去的 FINAL 重贴;短尾/纯 dump/迟到护栏丢弃=无
+                        # FINAL → 保持空(no-op 亦不会把空贴上)。
+                        self._publish_turn_partial(fallback_tail)
                         self._stt_._language_state.update(lang, payload)
                         self._event_ch.send_nowait(
                             stt.SpeechEvent(
@@ -5593,6 +5645,9 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
             await asyncio.gather(_forward_input(), _recognize())
         finally:
             # 流关闭时撤掉 hold flush,唔好留孤儿任务向已死 event_ch 发事件。
+            # (暴露位**不在这里清**:收官 FINAL 的 agent 钩子可能仍在途,清掉就
+            # 白丢这条 fallback;内芯 Qwen3ASRSTT 本就是每通一个,无跨通残留,
+            # 清零交给 _reset/_start_session——那两处只影响「谁算本轮」。)
             self._cancel_join_hold()
 
     def _cancel_join_hold(self) -> None:
@@ -5657,9 +5712,14 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                 payload = ""
         self._finishing = False
         if self._session_epoch == _epoch_at_hold:
+            # pre-reset 快照(同上停嘴路径):本段 partial 末稿。
+            fallback_tail = self._turn_partial_for_fallback()
             self._reset()
+            if payload:
+                self._publish_turn_partial(fallback_tail)
         # else: finish 等待期间 START 已开新 sidecar 会话——新会话状态属续讲段照常
-        # 滚动,本 flush 只负责把上一段 FINAL 发出(纪元守卫,防成轮转写被清)。
+        # 滚动,本 flush 只负责把上一段 FINAL 发出(纪元守卫,防成轮转写被清);
+        # 暴露位同样归新会话(勿用旧段 partial 覆盖新段已贴上的值)。
         if payload:
             self._stt_._language_state.update(lang, payload)
             self._event_ch.send_nowait(
@@ -5672,6 +5732,11 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         print(f"QWEN3_ASR_JOIN_FLUSH chars={len(payload or '')}", flush=True)
 
     async def _start_session(self) -> None:
+        # 新语音段开场 = 新一轮:`_reset` 已置 _session_id=None,故每段第一声必走
+        # 这里——上一轮的 partial 末稿到此为止,本轮 partial 到达前暴露位恒空(短
+        # 句无 partial 的轮也拿不到上一轮的话)。join-hold 续段会话存活、不走这里
+        # =同一轮,暴露值照留(语义正确)。
+        self._stt_._turn_partial_text = ""
         lang_hint = _asr_language_hint(self._stt_._language_state.lang, self._stt_._pin_language)
         # start 参数:language hint + 热词 context(同 offline 路径,空则不下发;
         # getattr 鸭型访问——测试 fake 无此属性时等同空)+ partial 间隔档
@@ -5783,6 +5848,11 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         self._last_lang = lang
         prev_full = self._last_partial
         self._last_partial = text
+        # 滑窗 partial 末稿对外暴露(agent 侧 E2 fallback_text):与 INTERIM 字幕
+        # 同坐标系(未提交剩余)。「文本没变」的早退分支不清也不算变化——同一段话;
+        # 句级提交分支在下面才走,故这里贴的恒是**提交前**的那一版(该 FINAL 的
+        # fallback 正是它)。
+        self._publish_turn_partial(self._turn_partial_for_fallback())
 
         # ---- 句级提交（turn_detection="stt"，VAD 说话中才会走到这里）----------
         # 能进 _maybe_partial 即 VAD 仍在语音段（INFERENCE_DONE 且非 finishing）：
@@ -6113,6 +6183,10 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         self._last_sentence = ""
         self._commit_idx = 0
         self._last_sentence_commit_at = 0.0
+        # 暴露位随段清零(本段已提交):FINAL 发出点会按 pre-reset 快照把「这条
+        # FINAL 的 partial 末稿」重贴回来——只给真发出去的 FINAL,纯 dump/短尾
+        # 等被丢弃=无 FINAL → 保持空,下一轮拿不到上一轮的话。
+        self._stt_._turn_partial_text = ""
 
 
 class Qwen3ASRLiveSTT(stt.STT):
@@ -6200,3 +6274,21 @@ class Qwen3ASRLiveSTT(stt.STT):
         与 set_reply_busy 同款「旗落内芯、流读判定时刻现取」姿势。
         """
         self._stt._closing_say = bool(on)
+
+    def last_partial_text(self) -> str:
+        """本轮 ASR 滑窗 partial 末稿(E2 热词泄漏清洗的 ``fallback_text`` 取口)。
+
+        语义:ASR 在把本轮终稿(句级提交句 / 停嘴 tail FINAL)交出去之前,滑窗
+        partial 最后给出的那段文本(未提交坐标系)。终稿被热词 dump 污染时,它是
+        「客户实际讲了什么」的独立证据——``hotword_leak.sanitize`` 的单词泄漏
+        判据正需要它(无 fallback 时该判据结构性不成立,见模块 docstring 偏差②)。
+
+        契约(写点在流内,见 ``_Qwen3ASRSTT._turn_partial_text`` 注释):
+        - 只反映**本轮**:新一轮 VAD 语音段开场(``_start_session``)即清,上一轮
+          的 partial 不会喂给下一轮;该轮无 FINAL 发出(纯 dump/短尾丢弃)时同样
+          为空——宁可拿不到 fallback,不可拿错轮的话。
+        - 读取恒安全:纯属性读,无 await/无网络/无状态变更,agent 异步钩子直接调。
+        - 无 partial(短句 <0.6s 窗 / ``QWEN3_ASR_STREAM=0`` 的官方
+          StreamAdapter / 假 STT)→ 空串:调用方行为与未接线时逐字节相同。
+        """
+        return str(getattr(self._stt, "_turn_partial_text", "") or "")

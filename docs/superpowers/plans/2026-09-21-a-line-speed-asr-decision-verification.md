@@ -2237,5 +2237,117 @@ commit message 充当计划档。**本 §29 即该纪律的首次执行产物**�
   ③E5 术语双轨 A/B（术语进 MT prompt vs MT 前正则归一）；④E7 离线润色面（生成模型
   待定）；⑤Mimosa 1265 条静态候选分诊 + `scanner_enobufs` 收口；⑥DashScope key
   轮换（用户动作）。
-- 已知残余：E2 的 `fallback_text` 在 agent 侧恒空（STT 不暴露 partial）→ 单词泄漏
-  护栏弱化；给 STT 加 partial 暴露口后补（批次 4 候选）。
+- 已知残余：E2 的 `fallback_text` 残余**已在批次 4 消除**（见 §30.1：STT partial
+  暴露口落地，两个调用点都喂真 partial）。
+
+---
+
+## 30. 实施批次 4（2026-09-21，subagent 并行 ×4）：partial 暴露口 + 台架云端话音腿 + E5 定案 + Mimosa 分诊
+
+四路并行（互不重叠的作业面），主会话负责审查、落盘与集成。**结论先说**：①§28.3 的
+E2 残余已消除；②§29.2 的退役前置第 1 步（台架话音源）拿到**可切换装置但未切换**；
+③**E5 定案＝保留 MT prompt 槽位**（实测有效，非摆设）；④Mimosa 1265 条分诊完毕，
+**无新确认可利用缺陷**，`scanner_enobufs` 定性为扫描器自身缓冲区耗尽。
+
+### 30.1 STT partial 暴露口 → E2 单词泄漏判据点亮（消除 §28.3 残余）
+
+**问题**：`hotword_leak.sanitize` 的**单词泄漏**判据依赖 `fallback_text`（客户真讲过
+的话），而 agent 侧两个 `_asr_postprocess` 调用点恒传空串——该判据结构性不成立，
+只剩「标签」与「≥2 连续热词」两条。
+
+**实现**（`providers/livekit_plugins.py` + `agent.py`）：
+
+- 内芯 `Qwen3ASRSTT._turn_partial_text` = 暴露位；写点＝`_Qwen3ASRLiveStream._publish_turn_partial`
+  （每窗 partial 到达时，**在句级提交块之前**——该 FINAL 的 fallback 正是提交前那一版）；
+  agent 侧只读取口＝`Qwen3ASRLiveSTT.last_partial_text()`（纯属性读，无 await/IO）。
+- **派生用独立小方法 `_turn_partial_for_fallback`（未提交坐标系）而不复用 `_uncommitted`**：
+  两者差别是①`_uncommitted` 在重解修正分支会打 `QWEN3_ASR_REDECODE_DROP`，每窗多叫
+  一次=重复日志；②坐标失配时不猜（原样返整窗，给长了判据自然不成立）。
+- **清零语义（关键设计，与「在 FINAL 处清零」的直读不同）**：`_reset()` 清、`_start_session()`
+  清（新语音段=新一轮），而两条 FINAL 发出点（停嘴 EOS / join-flush）在 `_reset()` **之前**
+  取 pre-reset 快照、**之后**按「确实发出了 FINAL」重贴回来。理由：`_run` 里的次序是
+  `payload → _reset() → send FINAL`，而 agent 钩子在 FINAL **之后**才跑——若「提交即清」，
+  停嘴路径的 fallback 将**恒为空**。第三个 `_reset()` 调用点（F4 收线/告别直念窗整段放弃）
+  不重贴是对的：该段本就整段丢弃、无 FINAL。
+- 流收官**不**清（在途钩子还要读）；跨轮残留由「内芯每通一个」+ 新一轮 START 清零兜住。
+- 接线：两个调用点都传 `fallback_text=_last_partial_text(_partial_gate_stt)`；取口整条
+  fail-soft（缺方法/None/抛异常→空串，非 live 包装与假 STT 天然空串）。
+
+**已知残余（新，窄）**：两个调用点读的是**活值**，若钩子读完之后、`_on_conversation_item`
+读之前客户抢话开了新语音段（⇒`_start_session` 清零），落库面会退回「原始 dump」——
+**退化为修复前行为，不会注入错文本**。要确定性就把 fallback 按已提交终稿文本做键。
+
+测试：`tests/test_asr_partial_fallback.py`（17 项：fail-soft 取口、真 `_run` 停嘴/
+join-flush 两条 FINAL 路径的 pre-reset 快照、丢弃路径无 fallback、新一轮清零、流收官保留、
+单词判据前后对比、`fallback` 必须与 remainder 一致才剥、回吐路径、kill-switch 仍全轨生效、
+源级锚钉两个调用点）。
+
+### 30.2 台架客户话音单点开关（§29.2 退役前置第 1 步——**装置就位，未切换**）
+
+新增 `scripts/probe_stimulus.py`：`stimulus_pcm(text, lang, ...)` + 纯选择器
+`resolve_stimulus_backend(env)`。`BOK_PROBE_STIMULUS` 只认 `cloud`，**缺省/未知/空一律
+`local`**（=历史行为逐字节不变）；`cloud` 委托 `scripts/mm_voice.mm_pcm`（不复制实现）。
+
+- **已委派 9 个脚本**（其余经它们传递生效 11 个）：`e2e_real_customer` / `e2e_barge_in` /
+  `e2e_edge_cases` / `e2e_trilingual_livekit` / `mock_callee` / `probe_brand_words` /
+  `probe_hotword_ab` / `probe_interp_continuous` / `probe_vad_head_syllable`。
+- **刻意不动 2 个**（签名/语义不同，动了就毁掉测量）：`measure_latency`（24k+streaming，
+  它测的就是本地 sidecar 延迟）、`smoke_sidecars`（24k，它的存在意义就是验 sidecar）。
+- **切换是换基线**（模块 docstring 已写明）：换话音源即换刺激信号即换读数
+  （`mm_voice` 记录过本地粤语合成「拼多多」→「二。二。」）。故 §29.2 第 1 步的「成批切换 +
+  重取基线」仍然要人工在无在途结论的窗口做——本批只补上缺失的能力。
+- 测试：`tests/test_probe_stimulus.py`（35 项：选择器真值表、local 模式钉 URL/payload/
+  音色/采样率逐字节、cloud 模式委托断言、转换后脚本不再含内联 POST 的结构锚）。
+
+### 30.3 E5 定案：保留 MT prompt 槽位，**不**引入 pre-MT 归一
+
+探针 `scripts/probe_mt_glossary_ab.py`（真 `:1236` Hy-MT2，三臂对照，`--dry-run` 可离线
+看句集/prompt，`--check-parity` 钉本地 prompt 复刻与 `livekit_plugins.py` 字面一致）：
+
+| 方向 | 臂 | 术语保真 | 延迟均值 |
+|---|---|---|---|
+| zh→en | A 无槽位 | **0/9** | 0.264s |
+| zh→en | B 槽位（现行） | **6/9** | 0.246s |
+| zh→en | C pre-MT 归一 | 6/9 | 0.249s |
+| zh→cantonese | A | **5/9** | 0.271s |
+| zh→cantonese | B | **8/9** | 0.281s |
+| zh→cantonese | C | 8/9 | 0.270s |
+
+生产采样档（temp=0.7，en）复跑：A **0/9** → B **8/9**。对照句泄漏 0（每臂 2 条/方向）。
+
+**结论**：prompt 槽位**确实有效、不是摆设**（这是 E5 的直接答复）；无延迟代价、未观察到
+附带强塞；臂 C 命中率不更高且**结构上漏掉同义/改写句**（术语表写「快递」而客户说「包裹」
+时三臂 temp=0 全 miss），还要新增语言相关替换层。**故保留 B**。置信度：槽位有效＝中高；
+保留 B 而非 C＝中（命中率打平，决定性论据是结构覆盖与工程面）；「无附带损伤」＝低-中（对照句少）。
+**真正的杠杆是术语表覆盖（同义词/别名）**，不是注入机制。
+
+### 30.4 Mimosa 分诊：1265 条归三类，**无新确认可利用缺陷**
+
+scan `scan-2026-09-21T02-11-19.508Z-5cac3aa631d5`（deep，`runStatus=inconclusive`、
+`completeness=partial`、`verdictEffect=none`）。报告：`.superpowers/sdd/2026-09-21-mimosa-triage/FINDINGS.md`。
+
+- **`scanner_enobufs` 定性**：字面量在可读插件包里不存在（扫描逻辑在保护资产内）——
+  从命名与可见效果判定为 POSIX **ENOBUFS**（「no buffer space available」）：**扫描器自身
+  的缓冲通道耗尽，拿不到完整结论**，属扫描器能力失败而**非项目漏洞**；但它**阻断任何
+  「已安全」的声明**。
+- 分类（1265 条）：**vendored 噪声 917**（全在 `runtime/python/lib/python3.12/**`，含全部
+  155 条代码注入、101 条反序列化等）／**一方代码误报 348 条**（175 唯一，主因＝扫描器解析
+  不到 CP 的鉴权中间件，于是把「handler 内有 `require_role`」判成「无鉴权」）／
+  **需人工裁量 5 个系统性议题**／**新确认可利用：0**。
+- 优先清单（按真实风险，非扫描器严重度）：①**部署姿态**（双 auth env 皆未设时 `/api/*` 全开
+  + CORS `*`）——修法＝非回环绑定且无鉴权 env 时启动 fail-closed；②`POST /api/token`
+  可为**未记录房间**铸 publish token 并拉 agent（已知台账项）；③**扫描器漏掉**的三条
+  diag 路由（`/api/asr/health`、`/api/tts/health`、`/api/web_logs`）无角色闸；
+  ④`/api/webhook/livekit` 在无 secret 时 fail-open（已知台账项）；⑤MiniMax 音色增删打
+  全局 settings 行（需产品裁量）。**注意 ②④ 与仓库既有台账一致**——分诊确认了台账，
+  并发现扫描器**漏报**了 ③。
+
+### 30.5 集成验证与剩余队列
+
+- 验证（主会话独立复跑）：全量 pytest **2211 passed**（批次 4 净增 52：17+35）＋
+  compileall ＋ 术语门禁绿；`_UNCOMMITTED_LEADING_WEAK_PUNCT` 等新引用符号经真 import 验证
+  存在；三个 `_reset()` 调用点逐一复核语义。
+- 剩余队列（优先级序）：①§29.2 第 1 步的**人工切换窗口**（读数基线要重取）；②§30.4 的
+  ①②③④ 四条（①②③④ 都可独立小改，其中 ③ 扫描器漏报最该先堵）；③E7 离线润色面
+  （生成模型待定）；④R3 澄清后效果 A/B（需真栈时间窗，且与 ① 抢同一个窗口，宜合并做）；
+  ⑤DashScope key 轮换（用户动作）。

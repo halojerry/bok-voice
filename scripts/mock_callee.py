@@ -270,17 +270,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def tts_pcm(text: str, lang: str) -> bytes:
-    """本地 TTS sidecar 合成客户话音(照搬 e2e_real_customer.tts_pcm)。"""
-    import httpx
+    """合成客户话音（单点开关 BOK_PROBE_STIMULUS，默认 local）。
 
-    with httpx.Client(timeout=60) as client:
-        r = client.post(
-            f"{TTS_URL}/v1/audio/speech",
-            json={"input": text, "language": lang, "voice": CUSTOMER_VOICE,
-                  "sample_rate": SAMPLE_RATE},
-        )
-        r.raise_for_status()
-        return r.content
+    音色/采样率沿用脚本级 CUSTOMER_VOICE(BOK_MOCK_CUSTOMER_VOICE)/SAMPLE_RATE，
+    经 stimulus_pcm 透传——local 档逐字节不变。
+    """
+    from probe_stimulus import stimulus_pcm
+
+    return stimulus_pcm(
+        text, lang, voice=CUSTOMER_VOICE, tts_url=TTS_URL, sample_rate=SAMPLE_RATE
+    )
 
 
 async def push_pcm(audio_source: Any, pcm: bytes) -> None:

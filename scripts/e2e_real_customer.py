@@ -190,13 +190,10 @@ def speech_stats(pcm: bytes, processed: int) -> tuple[float, float, int]:
 
 
 def tts_pcm(text: str, lang: str) -> bytes:
-    with httpx.Client(timeout=60) as client:
-        r = client.post(
-            f"{TTS_URL}/v1/audio/speech",
-            json={"input": text, "language": lang, "voice": CUSTOMER_VOICE, "sample_rate": 16000},
-        )
-        r.raise_for_status()
-        return r.content
+    # 客户话音单点开关（BOK_PROBE_STIMULUS，默认 local=逐字节不变；cloud 走 mm_pcm）。
+    from probe_stimulus import stimulus_pcm
+
+    return stimulus_pcm(text, lang, voice=CUSTOMER_VOICE, tts_url=TTS_URL)
 
 
 async def push_pcm(audio_source: rtc.AudioSource, pcm: bytes) -> None:
