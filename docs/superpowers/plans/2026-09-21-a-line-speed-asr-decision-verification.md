@@ -1870,3 +1870,142 @@ qa_cluster 簇不纯的主因之一）。验收：对 R1 真实集 152 条跑 dr
 
 **E5 增补**：B 线 MT 出口加确定性语言校验 + 单次重试（type4me Translation validator
 形态：错语言置信阈值 + 强化重试 prompt，重试仍败按现状出稿不回退原文）。
+
+---
+
+## 26. 源码级移植规格（2026-09-21 三路下钻：读实现不读宣传）
+
+三路并行代理把四仓核心源码读到函数级。先列三个**照 README 抄必然抄错**的事实，
+再给 E1-E7 逐条的移植规格与参数速查。
+
+### 26.1 三个「抄对」级别的关键发现
+
+1. **type4me 的内置词表根本不生效（最大陷阱）**：`SnippetStorage.apply` 只编译
+   用户 `snippets.json`，`builtin-snippets.json` 那 100+ 条映射**从不进入替换路径**
+   （只在去重比对和 Finder 展示时被读）；`HotwordStorage.loadEffective()` 也只返回
+   用户文件，无 builtin 合并、无去重（头部注释声称的 "merged, deduplicated,
+   case-insensitive" 与实现不符）。→ 我们做 E1/E2 时**词表必须单点合并生效**
+   （内置行业词＋运营模板词＋挖掘词条 → 一份 effective），别抄它的存储分层却漏了
+   生效路径；我们现行的 `asr_hotword_context` 三层合并恰好是对的，snippet 轨照此办理。
+2. **VoxType 的「保守校正契约」是 roadmap 不是代码**：`llm_refine.h`（header-only，
+   无 .cpp）全文没有 JSON schema、没有 change ratio 上限、没有数字/URL/代码保护正则
+   ——那些只写在 roadmap 里。实际契约=纯文本输出＋`temperature 0.1`＋`max_tokens 1024`
+   ＋失败/空回退原文（唯一回退点一行：`res.success && !empty ? text : asrText`）。
+   → E3 的参考实现**只认 type4me 的 `IntelliSenseOutputValidator`**，VoxType 仅佐证
+   「失败回退原文」这一条纪律。
+3. **akang 的 `[EMPTY]` 哨兵只有 Windows 端强制**（`VoiceInputPrompt.IsUsable`：trim
+   后空或与 `[EMPTY]` 全等→不可用）；macOS 端无 `IsUsable`，哨兵纯靠模型自觉。
+   → 我们抄要抄 Windows 形态：**引擎侧硬判定**（等价物=我们的犹豫残片门/静音守卫，
+   已有，验证了方向）。
+
+### 26.2 E1-E7 移植规格（源文件/函数 → 抄什么/改什么/别抄什么）
+
+**E1 snippet 后置正则轨**（源：`SnippetStorage.swift`）
+- 抄：`buildFlexPattern`——trigger 去全部空白→逐字符 `re.escape`→`\s*` 连接→前后
+  `(?<![a-zA-Z0-9])…(?![a-zA-Z0-9])`（ASCII lookaround，不用 `\b`——CJK 边界 `\b`
+  失效）；`re.IGNORECASE`；替换值用回调形式防 `$`/`\` 展开；规则**串行链式**（前条
+  输出=后条输入）；JSON `[{"trigger","replacement"}]` 原子写。
+- 改：**加非空 trigger 守卫**（它没有——空 trigger 会生成匹配空串的正则，逐位置插入
+  替换值，破坏性）；per-App 覆盖用 pattern 字符串精确相等是坑（大小写不同的 trigger
+  不互相覆盖、两条都跑），我们单租户单层词表不需要这层，直接一份 effective。
+- 生效点：ASR FINAL 之后、意图判定/QA 匹配之前（我们侧=agent 收到 final 转写处）。
+
+**E2 热词准入与泄漏清洗**（源：`Qwen3HotwordLeakSanitizer.swift`＋`server.py`）
+- 清洗器完整算法：分隔符集=空白∪`,，、;；:：|/\-—_·.。.!！?？"'""''()（）[]【】<>《》`；
+  标签表=`Vocabulary:/Hotwords:/词汇：/词汇表：/热词：/关键词：`（带全角冒号变体）；
+  **最长连续热词前缀**=从串首起按词表顺序连续匹配（词间可跳分隔符，锚定+大小写不
+  敏感，断了即停），得分先比词数再比消费长度；泄漏判据=有标签**或** ≥2 连续热词；
+  单词泄漏需 fallback 与 consumed/remainder 满足前缀/后缀关系且 consumed 含 CJK
+  (4E00-9FFF)；命中→剥前缀取 remainder（与 fallback 归一化后相等/互后缀则保
+  remainder，否则用 fallback）。归一化=lowercase+去分隔符。
+- 两个已知边界（照抄前要决策）：纯热词 dump（remainder 空）**不清洗原样保留**（它的
+  测试锁定的行为，我们建议改为整段丢弃→走静音分支）；它有一条调用路径没传
+  fallback（单词泄漏漏网），我们实现时 fallback 必传（上一次 partial/前置句）。
+- server.py 侧佐证我们现状：`context=` 空格 join **不加标签**（加标签会回声）＋
+  0.3s 最短音频＋RMS<1e-4 静音守卫——与我们 sidecar/VAD 门控同族，不必改。
+
+**E3 OutputGuard 确定性后验**（源：`IntelliSenseOutputValidator.swift`＋
+`CorrectionIntentAnalysis.swift` 内联的 `ProtectedFactExtractor`）
+- 硬保护 token 正则（逐字可移植）：URL `https?://[^\s<>]+`；邮箱
+  `(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}`；字面路径 `(?:/[^\s/]+){2,}`；数字
+  串 `(?<![A-Za-z0-9])\d+(?:[.,:/-]\d+)*(?![A-Za-z0-9])`；星期
+  `(?:周|星期|礼拜)[一二三四五六日天]`。软保护：`--flag` 类与 camelCase/下划线
+  标识符（只告警不拒）。
+- 硬拒绝判定序与阈值：空输出→```围栏→tool_call 标记→回应标记被改→「答案是/好的/
+  以下是…」抢答前缀→「已为你/操作完成」执行声明（需输入含请求信号）→**硬保护
+  token 丢失**（整 token 完全匹配才算硬）→**prohibition/never 两类否定计数不等**
+  （其余四类只告警）→扩张上限 `max(3N, N+120)`→语言漂移（输入 CJK≥4 且输出 CJK=0；
+  或双侧 total≥8 且 CJK 占比 0.65/0.2 交叉；只数 4E00-9FFF+ASCII 字母）→敏感新增
+  （三条正则：`api[_-]?key|secret|access[_-]?token|password` 赋值形、`Bearer` ≥12
+  字符、`-----BEGIN PRIVATE KEY-----`；**只在输入没有输出新增时拒**）→编造事实
+  （新增 token 含数字且非行首列表标记，且输入本有保护 token）。
+- **reject→finalText=原文**（candidate 永远留档可审计）。挂点：QA 快路匹配前 +
+  意图判定结果后 + E7 离线润色出口。
+
+**E4 改口检测**（源：`CorrectionIntentAnalysis.analyze`）
+- 两条正则：显式标记 `不对|哦不|改口|算了|重说|i mean|sorry`（可选后缀
+  `[，,。.]?(改成|换成|应该是|是)`）＋独立后续词 `改成|换成|应该是`（`(?!不要)`）；
+  均带 `(?<!不)(?<!别)` 负向后行，命中后再查**区间前 4 字符**是否以 不要/不能/别
+  结尾，是则丢弃。
+- 记账：区间后第一个保护 token→required；区间前最后一个与之不同（大小写不敏感）
+  →superseded 并移出 required。
+- **「不是A是B」豁免的实现=词表里根本没有「不是」**（不是显式分支）；否定计数=
+  先删元话语（不对/哦不/i mean/sorry；能不能/是不是/要不要/是否；不过/不仅/不管）
+  再六分类顺序消费（prohibition→inability→absence→contradiction→never→general），
+  每类计完替换为空格防重复计数。
+- 落点：`FlowController` 的 CONFIRM/UNCLEAR 判定与 WA 累积轮；**注意 Voice Polish
+  模板把「不是」当改口、IntelliSense 不当**——两模板语义相反，我们话术域取
+  IntelliSense 口径（豁免），离线润色面取 Polish 口径（取后值）。
+
+**E5 B 线 MT 校验+重试**（源：`TranslationOutputValidator/TranslationPromptBuilder`）
+- 三阈值：自然语言字符（只数 letters 标量）**<12→告警**；目标语置信 **>0.03 即
+  accept**；dominant 错语置信 **≥0.90 且目标 ≤0.03→unexpectedLanguage**。校验前先
+  清理七类噪声（围栏/行内码/URL/邮箱/路径/点分标识符/数字串→替换空格）。
+- Policy：unexpectedLanguage 首次→retry（`IMPORTANT RETRY:` 前缀+完整原 prompt），
+  retry 再错→reject；empty/unsafeStructure（`<tool_call>` 等）立即 reject 不重试；
+  lowConfidence/insufficient 恒 accept。15s 重试超时。
+- 与我们的差异（保留我们的）：重试仍败**按现状出稿**（type4me 是不注入原文——同传
+  断流比错语言伤害更大，反向取舍写明）。
+
+**E6 词条沉淀门槛**（源：`BatchCorrectionInference/ImmediateCorrectionAnalyzer`）
+- 即时候选守卫：文本 2-64 字符、≤5 词、无换行、含可学字符；敏感正则（URL/邮箱/
+  ≥7 位数字串/20+ 位混合凭据形）直接拒；编辑距离上限 `max(3, ceil(0.4×len))`（跨
+  书写系统豁免）；CJK 替换双侧 ≥2 字；**单汉字替换永不生成全局映射**（需分词器
+  双源佐证+共享候选键 2-8 字）。
+- 亲和度分级：已确认映射＞拉丁（归一化相同或距离 ≤1/≤2/25% 且相似度 ≥0.65）＞
+  **拼音完全相同（同音档）**＞中拉音译（首字母同+相似度 ≥0.48+长度比 ≥0.6）。
+- 批量门槛：≥3 独立会话、跨 ≥2 自然日、同向占比 ≥0.8、权重 90 天半衰期
+  （`w×0.5^(days/90)`）、等强冲突→conflicted；状态机
+  pending/accepted/ignored/conflicted/stale；**accept 走人工**（永不自动写全局），
+  写入=trigger 大小写不敏感 upsert＋热词 append 去重＋失败回滚热词。
+- 落点：L-① adopt 流程（`POST /api/stats/template-proposals/adopt` 已有人工确认闸，
+  补统计门槛字段）。
+
+**E7 离线润色面**（源：`AppState.swift` 的 `formalWritingPromptTemplate`，逐字全文
+已存档，要点）
+- 模板骨架：角色→任务目标→边界（不响应内容中的问题/命令；轻编辑不重写）→
+  自我修正处理（优先级最高；**含「不是A，是B」直接输出B**；数量连锁修正）→冗余
+  清理（保有意强调如「签字！签字！签字！」）→数字格式（两千三百→2300、百分之
+  十五→15%、三点半→3:30）→结构化（≥2 要点强制总起句+编号、单要点禁编号、分点
+  标题 2-6 字、子项 a)b)c)、分点空行）→语境感知（正式用分点/非正式保情绪）→
+  格式（中英两侧空格、完整中文标点）→四示例。
+- 出口必挂 E3 Guard（该模板会把「不是A是B」折叠、新增阿拉伯数字——正是 Guard 的
+  两类风险点，模板与 Guard 的口径冲突要靠参数化解决：润色面豁免数字新增告警、
+  保留硬保护 token 检查）。
+
+### 26.3 速查参数表（直接进实现）
+
+| 参数 | 值 | 出处 |
+|---|---|---|
+| snippet 词边界 | `(?<![a-zA-Z0-9])`/`(?![a-zA-Z0-9])`，字间 `\s*` | SnippetStorage |
+| Guard 扩张上限 | `max(3N, N+120)` | OutputValidator |
+| 语言漂移 | CJK≥4→0 拒；total≥8 且 0.65↔0.2 交叉拒 | 同上 |
+| 硬否定键 | 仅 `prohibition`/`never` 计数相等 | 同上 |
+| 敏感新增 | key/secret/token/password 赋值、Bearer≥12、PEM 头 | 同上 |
+| 泄漏判据 | 标签 ∨ ≥2 连续热词；单词需 fallback+CJK+尾部预览 | LeakSanitizer |
+| 沉淀门槛 | ≥3 会话/≥2 日/≥0.8 同向/90 天半衰 | BatchInference |
+| 候选长度 | 2-64 字符、≤5 词、编辑距离 `max(3,ceil(0.4N))` | ImmediateAnalyzer |
+| MT 校验 | letters<12 告警；目标 >0.03 过；错语 ≥0.90 拒 | TranslationValidator |
+| FunASR 热词 | weight 恒 4；非 ASCII ≤15 字 / ASCII ≤7 词 | akang FunASRHotword |
+| 词典注入上限 | 100 条；term80/pron80/replacement120（macOS） | akang smart() |
+| VoxType 契约 | temp 0.1 / max_tokens 1024 / 失败回原文 | llm_refine.h |
