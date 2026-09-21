@@ -920,6 +920,14 @@ async def audio_speech(payload: dict[str, Any]) -> Response:
     temperature = payload.get("temperature")
     top_k = payload.get("top_k")
 
+    # 就绪前置检查（**必须在返回 StreamingResponse 之前**）。旧版只在生成器内部
+    # `ensure_loaded()`：那时响应头已发出、状态码已定 200，抛出的 503 改不了状态，
+    # 只剩「HTTP 200 + 0 字节音频」——2026-09-21 实证踩到：模型路径解析到一个只有
+    # `.cache/` 的空壳目录 → 加载失败 → 三个 E2E 探针收到的客户话音是**空的**，
+    # 表面症状是「agent 听不到客户、全轮哑」，查了半天才在 tts.log 里看到 traceback。
+    # 静默失败比报错贵得多，故提前到响应发出之前 fail-fast。
+    service.ensure_loaded()
+
     if streaming:
         async def _agen():
             # 关键（P4-A 根因修复）：synthesize_chunks 内部 `with self._gen_lock`

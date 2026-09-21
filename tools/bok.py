@@ -158,6 +158,19 @@ def _lmstudio_models_dir() -> Path:
     return Path(os.environ.get("LMSTUDIO_MODELS_DIR", str(Path.home() / ".lmstudio" / "models")))
 
 
+def _usable_model_dir(path: Path) -> bool:
+    """目录里是否**真有一份可加载的模型**——不是「目录存在」，也不是「非空」。
+
+    `config.json` 是 mlx/HF 布局的加载入口（各 sidecar 缺它就报 `Config not found`）。
+    2026-09-21 实证：`~/.lmstudio/models/mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit`
+    只剩一个 `.cache/` 空壳（别家工具建的空目录），而 app-data 里那份是好的——旧判据
+    `dir.exists()` 认空壳为真并**优先**返回它，于是 TTS sidecar 加载失败、探针收到
+    **0 字节音频**（HTTP 还回 200），表象是「agent 听不到客户、整通全哑」。
+    空壳必须让位给真模型。
+    """
+    return (path / "config.json").is_file()
+
+
 def model_path(current: dict[str, str], name: str) -> str:
     """Resolve a model to a path the running backend accepts.
 
@@ -172,13 +185,15 @@ def model_path(current: dict[str, str], name: str) -> str:
         return str(model_dir(repo))
     if is_mac():
         # mac dev 惯例优先 ~/.lmstudio;但 bok.py download 落地在 app-data——
-        # 哪边真实存在用哪边,否则「download 成功但 serve 找不到」断层
+        # 哪边**真有一份可加载的模型**用哪边,否则「download 成功但 serve 找不到」断层
         # (2026-09-08 ASR 4bit 实证:health model_ready=false 指着不存在的 lmstudio 路径)。
+        # 判据用 `_usable_model_dir`(要 config.json)而非 `exists()`:空壳目录优先返回
+        # 会把好模型挡在后面(2026-09-21 TTS 实证)。
         lm = _lmstudio_models_dir() / repo
-        if lm.exists():
+        if _usable_model_dir(lm):
             return str(lm)
         app = model_dir(repo)
-        if app.exists():
+        if _usable_model_dir(app):
             return str(app)
         return str(lm)
     return repo

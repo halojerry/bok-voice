@@ -2834,3 +2834,134 @@ systemd_units.py`（**纯文本模块、零 subprocess**）——最值得看的
   ②polish 接直播 ASR 路径（落点+KV 约束已定，待窗口验证）；③Guard 挂 snippet 应用点；
   ④`五千。→5000。，` 标点并合（化妆级）；⑤E2 真通话抽验；⑥`branch-pregen` 键归属；
   ⑦Linux 基线（已押后）。
+
+---
+
+## 36. 实弹批次（2026-09-21 晚）：独占窗口开跑——**抓到并修掉一条「静默空音频」链**，五组×10 轮 5通/50轮 哑1 PASS，B 线 8/8
+
+用户拍板「直接用最新代码起全栈测试」。本轮把 §35.4 的阻断解除，代价是**停了在对等会话
+名下的旧栈**（monitor pid 48673 属 `work-session-20260919-232858-4eb7` + 主树 monitor
+86623，12 个端口），主树从 `e5fa60a`（落后 20 提交）拉平到 `726cd2c` 后用 `bok.py serve`
+重起，12 项全 UP（worker sdk=1.8.0）。
+
+**结论先说**：①实弹全绿——A 线冒烟 6/6、打断 PASS、**五组×10 轮 5 通/50 轮哑 1 PASS**、
+B 线 8/8；②但第一批探针**全哑**，根因是一条**与通话无关、却让三种探针同时失声**的缺陷
+（本地 TTS 模型路径被空壳目录遮蔽 → sidecar 回「200 + 0 字节音频」），已修并经真栈复验；
+③按用户方向把**探针客户话音源切成云端 MiniMax**（＝§29.2 第 1 步的执行）。
+
+### 36.1 抓到的缺陷：「静默空音频」——探针全哑的真凶（不是 agent 回归）
+
+**症状**：`e2e_barge_in` / `probe_filler_timing` / `e2e_real_customer` 第一批全部失败。
+最刺眼的一通（call-32451e12）：开场白正常播出（`greeting_playout_done +5526ms`，
+`AGENT_METRICS tts ttfb=843ms audio=4.37s`），之后**3 分钟零日志**、账本里**只有 1 条
+（开场白）**、客户 6 轮一条没进——表象完全像「agent 听不到客户」。
+
+**排查链**（每步都排除了一个假设）：
+1. 不是 agent 订阅问题——agent 侧连 STT 会话都没建，但也**没有任何报错**；
+2. ASR sidecar 在收 chunk（`/api/chunk` 200），但那些会话**对不上这通的时间**；
+3. 决定性读数来自探针自己：每轮都印 `话音0.0s`——**它推给房间的客户音频是空的**；
+4. 直打 `:8788/v1/audio/speech`（探针同 payload）→ **HTTP 200 + 0 字节**；
+5. `tts.log` 里才有真相：
+   `FileNotFoundError('Config not found at /Users/halo/.lmstudio/models/mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit')`。
+
+**根因（两个缺陷叠加，缺一个都不会这么难查）**：
+- **空壳遮蔽**：`~/.lmstudio/models/mlx-community/Qwen3-TTS-12Hz-1.7B-{CustomVoice,Base}-8bit`
+  是**只有 `.cache/` 的空壳**（2026-09-21 11:37 被别家工具建），真模型在 app-data；
+  而 `bok.model_path` 的判据是 `dir.exists()`，**先查 lmstudio 且空壳即命中** → 返回空壳。
+  （`serve` 自检反而报 `[ok] tts_preset present`——因为 `_model_present` 先看 app-data。）
+- **静默失败**：sidecar 的 `ensure_loaded()` 只在**生成器内部**调用，那时响应头已发、
+  状态码已定 200，抛出的 503 改不了状态 → 客户端拿到「成功但没声音」。**静默失败比报错贵**。
+
+**修法（两处，各配判例）**：
+1. `tools/bok.py` 新增 `_usable_model_dir`（**要 `config.json`**，不是「存在」也不是「非空」），
+   `model_path` 两个布局都用它；优先级与「两边都没有」的兜底行为保持不变。
+   复核：真模型表 6 项全部解析到可加载目录；其余 7 个模型（ASR/VAD/4B/9B/2B/MT）判据未受影响
+   （逐个核过 `config.json`）。
+2. `services/qwen3-tts-sidecar`：`ensure_loaded()` 提前到**返回 StreamingResponse 之前**
+   （fail-fast 503）。
+- 判例：`tests/test_model_path_resolution.py`（5：空壳遮蔽/优先级保持/兜底/打包档/判据本体）
+  ＋ `test_qwen3_tts_sidecar_guard.py` 新增「未就绪必须 503、不得 200 空体」（旧判例 test 生成器
+  锁线程纪律的，改为 stub 就绪位）。
+- **真栈复验**：重启后本地合成 cantonese **94,720B / 2.96s**、zh **81,280B / 2.54s**、
+  en **81,280B / 2.54s**（peak≈19k，非静音）；**修前 0 字节**。sidecar 进程内
+  `QWEN3_TTS_PRESET_MODEL` 现在指 app-data。
+
+### 36.2 探针客户话音源切云（＝§29.2 第 1 步执行）
+
+按用户口径「我们用云端 minimax」，全部实弹改走 `BOK_PROBE_STIMULUS=cloud`（批次 4 建好的
+开关，委托 `scripts/mm_voice.mm_pcm`）。云端合成直测：粤 2.00s / 普 2.68s / 英 2.04s 真实音频；
+key 从设置库 `tts_json` 读（不落明文），**空音频会抛错**（不静默）。
+
+**口径警告（照 §30.2）**：换话音源＝换刺激信号＝换读数，故**本轮首声/延迟读数不可与
+9/17 的本地话音基线直接对比**；旧基线自此作废，新基线以本轮为准。成本＝每句一次云合成
+（本轮约 60 句）。
+
+### 36.3 实弹结果（全绿）
+
+| 探针 | 结果 |
+|---|---|
+| `e2e_real_customer --scenario cantonese` | **6/6 有答、0 哑**；墊话 fired×2（`voice_hit=1`）；WA 捕获 `6432543` 且 `LEN_CHECK_SUSPECT num_len=7/8` 触发复述请重讲 |
+| `e2e_barge_in` | **PASS** `interrupted=yes stop_ms=2037 resumed=yes resume_ms=5955`（旧基线 stop≈2.4s） |
+| `probe_offscript_soak --set all` | **PASS 通数=5 总轮=50 哑轮=1** |
+| `e2e_interpret` | **8/8 PASSED**（fwd 中→英/中→粤回读、rev 纯字幕契约、账本分行 8/8、启停×3、长流 45s） |
+| `probe_filler_timing`（`FILLER_REQUIRE=1`） | **FAIL——探针假阳**：该轮客户话 `唔该，帮我查下张单到边度？` 命中 QA 快路（`QA_FASTPATH hit=1 score=0.94 hit_audio=1`），回复走罐头零 LLM → 无慢生成 → 无需垫话。`filler_fired=False` 是正确行为 |
+
+**五组 ×10 轮逐场景**（用户要的那张表）：
+
+| 场景 | 语言 | 轮 | 有答 | 首声 p50 |
+|---|---|---|---|---|
+| off-identity（防诈质疑） | cantonese | 10 | **10** | 1281ms |
+| off-human（转人工/情绪） | cantonese | 10 | **10** | 1821ms |
+| off-detail（追问细节） | cantonese | 10 | **10** | 1270ms |
+| off-deflect（推搪拖延） | cantonese | 10 | **10** | 1382ms |
+| off-mix-zh（混合+记忆） | zh | 10 | **9** | 1234ms |
+
+**全部时间数据（聚合，49 轮有答样本）**：
+- **首声（墙钟）**：p50=**1316ms**、p95=4603ms、max=5495ms、**超预算(>2500ms)=10 轮**
+- **感知延迟 perceived_ms**：n=18、p50=**2652ms**、p95=4282ms
+- **生成源**：`script 39` ／ `filler 10` ／ `llm 13`（逐轮明细落
+  `reports/offscript-soak/1790000315-*.json`）
+- **哨兵**：`BOK_FILLER fired` **10**、`LLM_FIRST_TOKEN_TIMEOUT` 3、`LLM_LATE_ANSWER` 3、
+  `LLM_FALLBACK_TEXT` 1、`[watchdog]` 2
+
+**三条「是否真生效」的直接答复**：
+1. **TTS**：全走云端 MiniMax（`MINIMAX_TTS_VOICE Cantonese_GentleLady` +
+   `AGENT_METRICS tts ttfb=843ms audio=4.37s`）；本地 :8788 不在通话链上。
+2. **垫话**：真出声——本轮 10 次，冒烟额外 2 次；历史账本另有 519 轮。
+3. **QA 快路**：真命中——本轮 `hit=1/hit_audio=1`（首声 1109ms、零 LLM）；
+   历史 7 天口径 `qa_fastpath` 20 轮、`latency_ms=0` 对 `llm` 均值 1044ms。
+
+### 36.4 顺手记下的两笔账（信息位，未修）
+
+- **账本口径**：`turns.latency_ms` 在 `script`/罐头行会**沿用上一轮 LLM 的值**
+  （call-08761077 里 5 条 `branch-canned` 全是 1762＝前面那条 llm 的读数），既不是 0 也不是
+  该行真实耗时 → **按行累加延迟的仪表会虚高**。要修就是「无 LLM 的行写 NULL」。
+- **收尾告警**：多通 teardown 报 `Task was destroyed but it is pending!`（`_VADSt…` 等），
+  现象级、未见影响；留观察位。
+
+### 36.5 顺手修掉第二条 flaky 判例（CI 一红一绿，与本次改动无关）
+
+PR #140 的 CI 两跑一红一绿，失败是
+`test_sentence_commit.py::test_join_hold_flush_does_not_clobber_new_session`（只出一条 FINAL）。
+机制读码可判：该判例在 `_n==3` 用**墙钟** `sleep(hold + 0.05)`（≈90ms）等 flush 开火，CI 的
+2vCPU 慢机上 hold 定时器回调晚于这 90ms → 新 START 先到 → flush 被取消。
+**本机 24 并行轮复现不出**（这点如实记，不冒充已复现）。
+
+修法：加 `entered` 事件位（flush 进 `/api/finish` 即 set），`_n==3` 改为
+`wait_for(entered)`——新 START 只在 flush 确实停住后才到，**与判例原文描述同义**
+（「等 flush 开火并阻塞喺 `/api/finish`，然后续讲 START」），断言不放松。
+验证：该文件 54 passed；单判例 40 轮串行 0 失败。这是继 §34.1 之后的**第二条** flaky
+（不同族：那条是原生崩溃，这条是测试自身的墙钟竞态）。
+
+### 36.6 验证与队列
+
+- 验证：全量 **2446 passed**（+6：模型路径 5 + sidecar 就绪前置 1；另 1 条旧判例按新语义收编）；
+  本地 TTS 合成 3 语种非静音实测；A 线/B 线/打断/长跑四类实弹全绿。
+- 队列（更新）：①**探针话音源切云后的新基线重取**（旧读数已作废，§36.2）；
+  ②打断后「内容丢弃 + 约 40s 静默才补位」（§35.3(5) 残留）——本轮 `resume_ms=5955` 说明
+  恢复本身很快，长静默是另一条路，值得单独立项；
+  ③`latency_ms` 沿用口径（§36.4）；④polish 接直播 ASR 路径（落点+KV 约束已定）；
+  ⑤Guard 挂 snippet 应用点；⑥`branch-pregen` 键归属；⑦Linux 基线（押后）。
+- **环境状态（交接）**：本机栈现**由主树 `bok.py serve` 持有**（最新 main 代码，12 项 UP），
+  对等会话 `20260919-232858-4eb7` 与其 monitor **已被停止**（用户授权窗口）；若要归还，
+  请从那个会话的工作树重启它的栈。
