@@ -25,6 +25,8 @@ from livekit.agents import (
 )
 from livekit.plugins.openai import LLM as _OpenAICompatBase
 
+from bok_voice_core.deepseek_llm import thinking_extra_body
+
 # 后台任务强引用池(2026-09-17 全量 debug P2-A):事件循环对 task 只持弱引用,
 # GC 可中途回收仍在跑的 fire-and-forget 任务——与本仓 _duration_fuse 注释、
 # MiniMax 孤儿 invalidate、agent.py _SETTLE_TASKS 是同一实证 bug 类。本模块无
@@ -794,13 +796,25 @@ class DeepSeekLLM(_OpenAICompatBase):
 
     provider = "deepseek"
 
-    def __init__(self, api_key="", model="deepseek-chat", base_url="https://api.deepseek.com/v1"):
+    def __init__(
+        self,
+        api_key="",
+        model="deepseek-flash",
+        base_url="https://api.deepseek.com/v1",
+        thinking: str = "",
+    ):
+        # 思考档位：DeepSeek 端点缺省**关**（官方默认 enabled，而本类 max_tokens 走
+        # LLM_MAX_TOKENS 默认 160——思考会把预算烧光、正文出空串，通话侧=静默哑火；
+        # 契约与实测见 bok_voice_core.deepseek_llm）。`DEEPSEEK_THINKING=enabled`
+        # 可显式开（需同时给足 LLM_MAX_TOKENS）。非 DeepSeek 端点该字段为空 dict。
+        body: dict = {"max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "160"))}
+        body.update(thinking_extra_body(base_url, thinking or os.environ.get("DEEPSEEK_THINKING", "")))
         super().__init__(
-            model=model or "deepseek-chat",
+            model=model or "deepseek-flash",
             api_key=api_key,
             base_url=base_url,
             temperature=float(os.environ.get("LLM_TEMPERATURE", "0.35")),
-            extra_body={"max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "160"))},
+            extra_body=body,
         )
 
 

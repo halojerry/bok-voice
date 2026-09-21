@@ -1636,6 +1636,16 @@ def parse_judge_route(text: str) -> tuple[str, float]:
 # 低置信轮宁可不动作,唔好乱开单打扰人工。
 FOLLOWUP_CONF_MIN = 0.7
 
+# 判据 max_tokens 两档（2026-09-21 实测修复）：route 模式契约是**两行**
+# （`advance/stay/objection` + `route=X conf=0.0~1.0`），而 `_llm_judge` 的缺省 8
+# token 只够第一行加半个 route 行——三个后端（本机 9B / deepseek-flash / v4-pro）
+# 在 8 token 下**全部**截在 `route=register_followup` 或 `... conf`，`conf` 结构性
+# 解析不出来 → 恒 0.00 < FOLLOWUP_CONF_MIN → **建单动作在生产里从未触发过**
+# （degrade_boost 同失置信信号）。24 token 三后端都完整出 `conf=0.8`。
+# 非 route 模式契约仍是一行一个词，保持 8 不动（多给预算=多等 token）。
+JUDGE_MAX_TOKENS = 8
+JUDGE_ROUTE_MAX_TOKENS = 24
+
 
 def degrade_boost(streak: int, route: str, conf: float) -> int:
     """degrade 早触发(漏斗 v2,spec §3.1):judge 高置信 degrade_question →
