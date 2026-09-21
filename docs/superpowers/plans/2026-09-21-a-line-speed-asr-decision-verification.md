@@ -3239,4 +3239,3 @@ route 调用点按 `route_enabled` 选档。本机 9B 代价实测 **369ms → 4
 `DeepSeekLLM` 现在可以直接上主回复（`llm.provider=deepseek` + `DEEPSEEK_MODEL=deepseek-flash`）。
 剩下的**唯一**前置仍是那个产品决策：**通话内容离开本机**（隐私口径），这不是工程问题。
 另外把「本地 4B 兜底链」想清楚再切——云端 4xx/超时会走 provider 的 fallback 路径。
-
