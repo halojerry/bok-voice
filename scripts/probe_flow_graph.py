@@ -145,7 +145,7 @@ PROBE_STEPS: list[dict] = [
 ]
 
 # FLOW_GRAPH 打点四词汇（长词在前防前缀误吃；\b 兜底）
-RE_FLOW_GRAPH = re.compile(r"FLOW_GRAPH\s+(play_miss|jump_noop|jump|play)\b(.*)$")
+RE_FLOW_GRAPH = re.compile(r"FLOW_GRAPH\s+(play_miss|jump_noop|jump|play|catchall)\b(.*)$")
 # 意图 judge 打点族（Phase 3.4；**不在** RE_FLOW_GRAPH 里——默认/then-jump 腿的事件集
 # 逐字节同旧，judge 事件只由 parse_judge_events 单独收，intent-judge 腿/其 kill 腿用）。
 RE_FLOW_GRAPH_JUDGE = re.compile(
@@ -346,6 +346,8 @@ def plan_rounds(
     intent_judge: bool = False,
     fuzzy_text: str = FUZZY_TEXT,
     jump_speech: bool = False,
+    catchall: bool = False,
+    qa_lex_text: str = "",
 ) -> list[tuple[str, str]]:
     """本腿轮次表 `[(窗口名, 话术)]`（纯函数）。
     - **then-jump 档**（`then_jump` 非 None，Phase 3.3 追问链）：`has_qa` 真 →
@@ -367,6 +369,14 @@ def plan_rounds(
         # 话面档（I3）：单触发轮——判据不在图引擎而在跳步轮**回复的词面**
         # （含本步事实词 / 不含被跳步问句词），transcript 由 turns 行直接读。
         return [("trigger", trigger_text)]
+    if catchall:
+        # P2.2 兜底腿（2026-09-22）：trigger=常规关键词命中（graph-jump）；
+        # nontrigger=无关键词中性话（应落 "*" 兜底 jump）；qa_lex=QA 条目原话
+        # （应走 qa-fastpath——precedence 铁律 QA>catch-all，不被兜底抢）。
+        rounds = [("trigger", trigger_text), ("nontrigger", nontrigger_text)]
+        if qa_lex_text:
+            rounds.append(("qa_lex", qa_lex_text))
+        return rounds
     if intent_judge:
         return [("fuzzy", fuzzy_text), ("consume", after_text)]
     if then_jump is not None:
@@ -452,6 +462,8 @@ def evaluate_leg(
     jump_speech: bool = False,
     expect_words: list[str] | None = None,
     forbid_words: list[str] | None = None,
+    catchall: bool = False,
+    qa_lex_events: list[dict] | None = None,
 ) -> dict:
     """主判据（纯函数）。expect_off=False=图开启腿；True=kill-switch 腿。
 
@@ -477,7 +489,7 @@ def evaluate_leg(
     **默认档（`then_jump is None`）判据集/事件键集逐字节同旧**（零变化铁律）。
     """
     after = list(after_events or [])
-    all_events = trigger_events + nontrigger_events + play_events + after
+    all_events = trigger_events + nontrigger_events + play_events + after + list(qa_lex_events or [])
     grows = graph_turn_rows(turns)
     play_kinds = [str(e.get("kind")) for e in play_events]
     ev_ok = bool((evidence or {}).get("ok"))
@@ -565,6 +577,34 @@ def evaluate_leg(
             "judge_hit_logged": hit,
             "judge_effective": bool(fired and consume_jump),
         }
+    elif catchall:
+        # P2.2 兜底腿（2026-09-22）：trigger=常规关键词命中（jump 照旧，优先级
+        # 不被 "*" 稀释）；nontrigger=中性话→兜底（日志 kind=catchall + turns
+        # provider=graph-catchall 双证据）；qa_lex=QA 条目原话（**信息位**：
+        # 隔离栈 QA 音频未物化时 no_audio 落兜底=设计内行为，precedence 的
+        # 硬断言在离线面 tests/test_flow_graph_catchall_wiring 已钉）。
+        qa_ev = list(qa_lex_events or [])
+        events["qa_lex"] = qa_ev
+        qa_fastpath_turn = any(
+            str(t.get("provider") or "").strip() == "qa-fastpath"
+            for t in turns if str(t.get("role") or "") == "assistant"
+        )
+        checks = {
+            "evidence_ok": ev_ok,
+            "jump_logged": any(str(e.get("kind")) == "jump" for e in trigger_events),
+            "catchall_logged": any(str(e.get("kind")) == "catchall" for e in nontrigger_events),
+        }
+        # 信息位（非硬判据）：兜底 jump 同位 no-op 时按防环纪律不烧 provider 账本
+        # （与常规 jump_noop 同语义）——turns 无 graph-catchall 行≠兜底没派发，
+        # 派发证据以 FLOW_GRAPH catchall 日志行为准。
+        info.update({
+            "catchall_turn_provider": any(
+                str(t.get("provider") or "").strip() == "graph-catchall"
+                for t in turns if str(t.get("role") or "") == "assistant"
+            ),
+            "qa_lex_kinds": [str(e.get("kind")) for e in qa_ev],
+            "qa_fastpath_turn": qa_fastpath_turn,
+        })
     elif jump_speech:
         # 话面档（I3,2026-09-19）：判据=跳步轮（provider=graph-jump）回复的词面——
         # 含本步事实词（expect）且不含被跳步台词词（forbid）。修复前实弹基线
@@ -622,13 +662,17 @@ def _cp(path: str, *, method: str = "GET", **kw) -> httpx.Response:
     )
 
 
-def build_graph_json(qa_id: str, *, then_jump: int | None = None, judge: bool = False) -> str:
+def build_graph_json(qa_id: str, *, then_jump: int | None = None, judge: bool = False,
+                     catchall_step: int | None = None) -> str:
     """图契约（spec §3）：投诉→jump_step 4；退款→play_qa（有 qa_id 才挂该腿）。
 
     `then_jump`（Phase 3.3 追问链，1-based）：非空且挂了 play_qa 绑定时给该绑定加
     `"then_jump": N`；默认 `None` 时输出与今逐字节同（旧腿/旧断言零变化）。
     `judge`（Phase 3.4 意图引擎）：真时给「投诉」意图挂 `judge.prompt=JUDGE_PROMPT`
     （关键词照旧必填——judge 只补关键词未中的模糊轮）；默认 False 逐字节同旧。
+    `catchall_step`（P2.2 兜底腿，2026-09-22）：非空时追加 `"*"` 兜底意图
+    （keywords 必空/once 禁）+ jump_step 绑定（priority 900 压底）——验证
+    「常规未中→兜底、QA 字面→快路（不被兜底抢）」的 precedence 铁律。
     """
     bindings = [{
         "id": "bnd_7e8f9a0b",
@@ -668,8 +712,42 @@ def build_graph_json(qa_id: str, *, then_jump: int | None = None, judge: bool = 
             "once": False,
             "enabled": True,
         })
+    if catchall_step is not None:
+        intents.append({
+            # catchall 意图本体（keywords 必空/once 禁——P2.2 契约）
+            "id": "*",
+            "label": "兜底",
+            "keywords": [],
+            "steps": [],
+            "enabled": True,
+        })
+        bindings.append({
+            "id": "bnd_ca0f11ba",
+            "intent": "*",
+            "action": "jump_step",
+            "step": int(catchall_step),
+            "priority": 900,
+            "once": False,
+            "enabled": True,
+        })
     return json.dumps({"version": 1, "intents": intents, "bindings": bindings},
                       ensure_ascii=False)
+
+
+def pick_qa_question(qa_id: str) -> str:
+    """QA 条目原话（catchall 腿 qa_lex 轮用——字面命中面就是 question 文本）。"""
+    if not qa_id:
+        return ""
+    try:
+        rows = _cp(f"/api/qa-entries?account_id={ACCOUNT_ID}").json()
+    except Exception:  # noqa: BLE001
+        return ""
+    if not isinstance(rows, list):
+        return ""
+    for r in rows:
+        if str(r.get("id")) == str(qa_id):
+            return str(r.get("question") or r.get("question_text") or "").strip()
+    return ""
 
 
 def pick_qa_id(lang: str) -> str:
@@ -766,7 +844,9 @@ async def run_leg(*, expect_off: bool, lang: str, voice: str, trigger_text: str,
                   judge_soak_s: float = JUDGE_SOAK_S,
                   jump_speech: bool = False,
                   expect_words: list[str] | None = None,
-                  forbid_words: list[str] | None = None) -> dict:
+                  forbid_words: list[str] | None = None,
+                  catchall: bool = False,
+                  catchall_step: int = 5) -> dict:
     leg_name = "killswitch-off" if expect_off else "graph-on"
     if then_jump is not None:
         leg_name = "then-jump-killswitch-off" if expect_off else "then-jump"
@@ -774,13 +854,19 @@ async def run_leg(*, expect_off: bool, lang: str, voice: str, trigger_text: str,
         leg_name = "intent-judge-killswitch-off" if expect_off else "intent-judge"
     if jump_speech:
         leg_name = "jump-speech"
+    if catchall:
+        leg_name = "catchall-killswitch-off" if expect_off else "catchall"
     qa_id = pick_qa_id(lang)
-    graph_json = build_graph_json(qa_id, then_jump=then_jump, judge=intent_judge)
+    qa_lex_text = pick_qa_question(qa_id) if catchall else ""
+    graph_json = build_graph_json(
+        qa_id, then_jump=then_jump, judge=intent_judge,
+        catchall_step=catchall_step if catchall else None,
+    )
     rounds = plan_rounds(
         then_jump=then_jump, has_qa=bool(qa_id), trigger_text=trigger_text,
         nontrigger_text=nontrigger_text, play_text=play_text, after_text=after_text,
         play_round=play_round, intent_judge=intent_judge, fuzzy_text=fuzzy_text,
-        jump_speech=jump_speech,
+        jump_speech=jump_speech, catchall=catchall, qa_lex_text=qa_lex_text,
     )
     print(f"\n[flow-graph] 腿={leg_name} lang={lang} qa_id={qa_id or '(无QA条目, play 腿跳过)'}"
           f" then_jump={then_jump} intent_judge={intent_judge} rounds={[n for n, _ in rounds]}",
@@ -811,6 +897,7 @@ async def run_leg(*, expect_off: bool, lang: str, voice: str, trigger_text: str,
             rounds=rounds, then_jump=then_jump, after_text=after_text,
             budgets=budgets, intent_judge=intent_judge, judge_soak_s=judge_soak_s,
             jump_speech=jump_speech, expect_words=expect_words, forbid_words=forbid_words,
+            catchall=catchall,
         )
     finally:
         # 清理探针模板：名字含 probe=不会被 E2E 自动挑中，但跑完仍应不留痕（--keep-template 留档用）。
@@ -826,7 +913,8 @@ async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_
                               judge_soak_s: float = JUDGE_SOAK_S,
                               jump_speech: bool = False,
                               expect_words: list[str] | None = None,
-                              forbid_words: list[str] | None = None) -> dict:
+                              forbid_words: list[str] | None = None,
+                              catchall: bool = False) -> dict:
     # 轮次表由 `plan_rounds` 单点产出（默认档=触发/非触发/play 信息位轮；then-jump 档=
     # 播 + 跳后两轮），这里只负责跑表与按窗口切日志。
     pcms = {name: erc.tts_pcm(text, lang) for name, text in rounds}
@@ -1000,6 +1088,8 @@ async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_
         jump_speech=jump_speech,
         expect_words=expect_words,
         forbid_words=forbid_words,
+        catchall=catchall,
+        qa_lex_events=parse_graph_events(name_to_window.get("qa_lex", [])),
     )
     # 归因用关键词：then-jump 腿的触发语是 `play_text`（退款 系），默认腿是「投诉」系。
     understood_keywords = PLAY_KEYWORDS if then_jump is not None else TRIGGER_KEYWORDS
@@ -1366,6 +1456,9 @@ async def main() -> int:
     parser.add_argument("--keep-template", action="store_true", help="保留探针模板（默认跑完删）")
     parser.add_argument("--budget-first-ms", type=float, default=2500.0)
     parser.add_argument("--budget-perceived-ms", type=float, default=3000.0)
+    parser.add_argument("--catchall", action="store_true",
+                        help="P2.2 兜底腿：常规关键词命中 + 中性话落 '*' 兜底 + QA 原话（信息位）")
+    parser.add_argument("--catchall-step", type=int, default=5, help="兜底 jump 目标步（1-based）")
     parser.add_argument("--selftest", action="store_true", help="无栈纯函数自检后退出")
     args = parser.parse_args()
 
@@ -1386,6 +1479,7 @@ async def main() -> int:
         jump_speech=args.jump_speech,
         expect_words=str(args.expect_words or "").split(","),
         forbid_words=str(args.forbid_words or "").split(","),
+        catchall=args.catchall, catchall_step=args.catchall_step,
     )
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
