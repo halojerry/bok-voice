@@ -129,31 +129,35 @@ def filler_max_per_call() -> int:
 
 
 def filler_max_dur_s() -> float:
-    """垫话**时长上限**(2026-09-21):只挑不超此值的条目。
+    """垫话时长上限（0=关）。
 
-    为什么要它——`hold_if_playing()` 把回复首帧扣到「垫话播完 + gap」,
-    **垫话多长,回复就被推迟多久**。真通话实测(`call-54ed586a`,计划档 §42.2):
-    回复音频 ~2.8s 就绪,却要等垫话播完 3.8s + gap 才出声,`tts ttfb` 被撑到
-    1398ms——**自伤约 1.3s**;那一轮垫话长 1.7s,而它是从「短档 1.0-1.5s /
-    长档 1.7-2.3s」里**随机**挑的,完全不看回复要多久。
-
-    长档当初是为「慢生成窗」加的(2026-09-16),但真通话实测 LLM TTFT 只
-    0.7s、回复首段音频 ~2.8s 就绪,长档现在是**纯延迟**——垫话是遮羞布,
-    盖住 ~1.5s 就够,盖太久反而把真答案按在后面。
-
-    0 = 关(回旧行为:整池随机,含长档)。池里没有合规条目时向整池放宽
-    (宁可用长的,也绝不饿死垫话——静音比长垫话更差)。条目缺 `dur_s` 视为
-    合规(manifest 正常都带,缺了不猜、按旧行为放行)。
+    2026-09-21 §45.2 口径反转后**默认关**：垫音第一声=用户已听到应答，垫音期
+    即应答期——「遮布比窗户长」不再是自伤（真人在答案出来前本来就会「嗯……
+    我睺下……」拖住）。上限降级为**可选调优口**（如想全通短促可设 1.2）；
+    播放排序契约（垫话播完→gap→回复）不变，衔接体验改看 `BOK_FILLER
+    reply_gap` 打点（P0.2）与 P3.2 的「就绪即掐」。
     """
     try:
-        return max(0.0, float(os.environ.get("BOK_FILLER_MAX_DUR_S", "1.2")))
+        return max(0.0, float(os.environ.get("BOK_FILLER_MAX_DUR_S", "0")))
     except ValueError:
-        return 1.2
+        return 0.0
 
 
 def filler_match_enabled() -> bool:
     """垫话罐头确定性匹配总闸(BOK_FILLER_MATCH,默认开;0=回退纯分类器随机池)。"""
     return os.environ.get("BOK_FILLER_MATCH", "1") == "1"
+
+
+def filler_cut_after_s() -> float:
+    """P3.2 掐垫话阈值（秒，0=关）：真回复音频就绪且垫话已播超过此值 → 掐剩余。
+
+    官方 hold-message 姿势（LiveKit audio customization「结果先回即 interrupt 掉
+    hold」）——「答案比垫话先好」不再硬等播完。默认 1.0s：太短会把垫话掐成
+    半句（不自然），1s 保住一个完整短应承再交棒。"""
+    try:
+        return max(0.0, float(os.environ.get("BOK_FILLER_CUT_AFTER_S", "1.0")))
+    except ValueError:
+        return 1.0
 
 
 def filler_match_threshold() -> float:
@@ -209,6 +213,26 @@ def classify_filler_category(user_text: str) -> str:
     if _FILLER_CAT_CHECK_RE.search(t):
         return "check"
     return "default"
+
+
+# 具名系统意图 id → 垫话类别提示(P2.4 意图喂下游,spec §48)。确定性映射、无正则
+# 无 LLM——规则归类(flow.SYSTEM_INTENTS)比字面分类器更可靠:客户原话经 ASR
+# 碎裂/同音滑失后分类器常归错,而规则 verdict 直接钉住语义。只覆盖语义无歧义四族,
+# 其余(refuse/farewell/repeat/whatsapp/…)不提示,交回字面分类器。
+_INTENT_CATEGORY_HINT: dict[str, str] = {
+    "sys_objection": "empathy",  # 否认/异议/质疑 → 先安抚
+    "sys_confirm": "ack",        # 应承确认 → 确认接收
+    "sys_question": "check",     # 提问/要解释 → 承诺查证
+    "sys_defer": "ack",          # 社交拖延 → 确认接收(勿承诺查,AI 稍后自然接)
+}
+
+
+def intent_category_hint(intent_id: str) -> str:
+    """具名系统意图 id → 垫话类别提示(未列出的 id/空 → ""=不提示)。
+
+    纯函数(离线可测);消费方=FillerDirector.hint_category 的本轮一次性提示。
+    """
+    return _INTENT_CATEGORY_HINT.get(str(intent_id or ""), "")
 
 
 def filler_chain_enabled() -> bool:
@@ -436,6 +460,13 @@ class FillerDirector:
         self._handle = None
         self._cur_dur = 0.0
         self._play_started = 0.0
+        # P3.3 打断特权轮状态:pending 在 arm 时消费成 _round_interrupted。
+        self._interrupt_pending = False
+        self._round_interrupted = False
+        # P2.4 意图喂下游:类别提示 pending 在 arm 时消费成 _hint_round
+        # (与 _interrupt_pending 同款 pending→consume 纪律)。
+        self._hint_pending = ""
+        self._hint_round = ""
         # 「垫话真正开播」回调(2026-09-17 RC3,agent 侧 set_on_fired 注入):
         # 垫话 out-of-band 出声框架/watchdog 感知不到,开播即通知顺延响应看门狗。
         # None=零行为变化。签名 ();异常由触发点吞掉,绝不阻垫话。
@@ -456,6 +487,13 @@ class FillerDirector:
     def arm(self) -> None:
         """轮提交、确认走 LLM 正常路径后调用;重复 arm 先作废旧定时器/链发。"""
         self._turn_seq += 1
+        # P3.3 打断特权轮：note_interrupt_round() 的待决旗在 arm 时消费——
+        # 本轮是否打断轮就此定格（fire 只看 _round_interrupted）。
+        self._round_interrupted = bool(getattr(self, "_interrupt_pending", False))
+        self._interrupt_pending = False
+        # P2.4 意图喂下游:类别提示 pending 消费成本轮值(消费即清,不泄漏下轮)。
+        self._hint_round = getattr(self, "_hint_pending", "")
+        self._hint_pending = ""
         self._cancel_timer()
         self._cancel_chain()
         if not filler_enabled() or self._count >= filler_max_per_call():
@@ -467,15 +505,53 @@ class FillerDirector:
             return
         self._timer = asyncio.create_task(self._fire(delay))
 
+    def note_interrupt_round(self) -> None:
+        """P3.3(2026-09-21,§48 打断特权轮)：标记下一轮为打断轮。
+
+        打断轮常紧跟上一垫话轮——连轮冷却恰好撞上=打断后「垫话完全没效果」
+        的主因之一（§44.3③a）。打断轮豁免冷却（轰炸感由 per-call 上限与
+        本身稀疏度兜住）。须在 arm() 前调（on_user_turn_completed 顶部）。"""
+        self._interrupt_pending = True
+
+    def hint_category(self, cat: str) -> None:
+        """P2.4(2026-09-21,§48 意图喂下游):标记下一轮的垫话类别提示。
+
+        本轮一次性:arm() 时消费成 _hint_round(与 note_interrupt_round 同款
+        pending→consume 纪律)。`_select` 只在该类于本语言池真实存在时采用,
+        否则照旧字面分类器;字面罐头命中优先级**不变**(FillerIndex 命中仍最高)。
+        须在 arm() 前调(agent on_user_turn_completed 意图接线点,kill-switch
+        `BOK_INTENT_CONTEXT` 关闭时调用方不调 = 零变化)。"""
+        self._hint_pending = str(cat or "")
+
     def on_reply_first_audio(self) -> None:
         """真回复首音频(CachedTTS stream 回调):只作废定时器。
 
         在播垫话**不掐**——播放排序契约=垫话播完→gap→回复;扣压由
         tts_cache._RelaySynthesizeStream 向 hold_if_playing() 询时实现。
         置位 _reply_audio_seen:链发观察者醒来时据此放弃补第二发。
+        P3.2(2026-09-21,§48,官方 hold-message 姿势):真回复音频就绪且垫话已播
+        超过 `BOK_FILLER_CUT_AFTER_S`(默认 1.0s,0=关)→ 掐掉剩余垫话并清 hold 窗,
+        回复即刻出声——「答案比垫话先好」不再硬等播完。不足阈值照旧播完+gap。
         """
         self._reply_audio_seen = True
         self._cancel_timer()
+        # P0.2(2026-09-21,§48 仪器化):垫话→真回复衔接观测,只在本轮真垫过
+        # (fired_this_round,防上一轮残值)才打。early=回复音频先到、被
+        # hold 扣住(用户无缝衔接);gap=垫话播完后的裸静默——垫音体验主指标
+        # (§48 P3 门槛 gap p90 ≤500ms)。
+        if self._play_started > 0 and self.fired_this_round():
+            elapsed = time.monotonic() - self._play_started
+            cut_after = filler_cut_after_s()
+            if cut_after > 0 and elapsed >= cut_after and self._handle is not None:
+                self._stop_playing()
+                self._play_started = 0.0  # 清 hold 窗:回复即刻放行
+                print(f"BOK_FILLER cut_on_ready elapsed={elapsed * 1000:.0f}ms", flush=True)
+                return
+            rel_ms = (time.monotonic() - (self._play_started + self._cur_dur)) * 1000
+            if rel_ms >= 0:
+                print(f"BOK_FILLER reply_gap={rel_ms:.0f}ms", flush=True)
+            else:
+                print(f"BOK_FILLER reply_early={-rel_ms:.0f}ms (held)", flush=True)
 
     def set_on_fired(self, cb) -> None:
         """注册「垫话真正开播」回调(2026-09-17 RC3):agent 侧把响应看门狗顺延
@@ -567,6 +643,10 @@ class FillerDirector:
         self._fired_lines.clear()
         self._recent.clear()
         self._entry_used.clear()
+        self._interrupt_pending = False
+        self._round_interrupted = False
+        self._hint_pending = ""
+        self._hint_round = ""
         self._cancel_timer()
         self._cancel_chain()
         self._stop_playing()
@@ -687,11 +767,29 @@ class FillerDirector:
         self._recent.append(entry["file"])
         return entry
 
+    def _hinted_category(self, lang: str, fallback: str) -> str:
+        """P2.4 意图喂下游:本轮类别提示优先(合法才用),否则回退 fallback。
+
+        「合法」=该提示类别在本语言池里真实存在 cat 标签条目——池里没这一类时
+        强行用会落 `_pick` 的 default/整池放宽(等于没提示还多一次绕路),不如
+        直接交回字面分类器。提示来源=agent 钩子的 intent_category_hint(规则
+        归类),确定性;无提示(空)/池缺失 → fallback(旧行为)。"""
+        hint = getattr(self, "_hint_round", "")
+        if not hint:
+            return fallback
+        pool = self._pools().get(lang) or []
+        if any(str(e.get("cat") or "") == hint for e in pool):
+            return hint
+        return fallback
+
     def _select(self, lang: str) -> tuple[dict | None, str]:
-        """选取链:①罐头确定性匹配(客户上一句) ②分类器→资产池回退。
+        """选取链:①罐头确定性匹配(客户上一句) ②分类器/意图提示→资产池回退。
 
         返回 (条目, 场景类)。罐头条目 {"text":..., "file": None}(音频只能来自
         tts-cache 人设物化,miss 在 _fire 里落资产兜底);资产条目带 file。
+
+        P2.4 意图喂下游:类别来源=**本轮提示(合法)优先,否则字面分类器**;罐头
+        字面命中优先级不变(命中即返,提示不参与抢条目)。
         """
         if (
             self._entries_index is not None
@@ -703,7 +801,7 @@ class FillerDirector:
             except Exception:  # noqa: BLE001 - provider 失败=回退
                 user_text = ""
             if user_text:
-                cat = classify_filler_category(user_text)
+                cat = self._hinted_category(lang, classify_filler_category(user_text))
                 entry, score = self._entries_index.match(
                     user_text, lang=lang, classifier_cat=cat, used=self._entry_used
                 )
@@ -722,7 +820,10 @@ class FillerDirector:
                     return {"text": str(entry.get("text") or ""), "file": None}, cat
                 print(f"BOK_FILLER_MATCH miss best={score:.2f} cat={cat}", flush=True)
                 return self._pick(lang, cat), cat
-        return self._pick(lang), ""
+        # 无罐头匹配路径(索引/provider 缺失或空转写):本轮提示仍在(合法才用);
+        # 无提示/不合法 → ""=旧行为(整池随机,与旧 `_pick(lang)` 逐字节同)。
+        cat = self._hinted_category(lang, "")
+        return self._pick(lang, cat), cat
 
     async def _fire(self, delay: float) -> None:
         try:
@@ -741,10 +842,12 @@ class FillerDirector:
                 self._turn_seq > 0
                 and self._chain_depth == 0
                 and self._turn_seq - self._last_fire_seq <= 1
+                and not getattr(self, "_round_interrupted", False)
             ):
                 # 连轮冷却(2026-09-17 call-11132bdd:8 轮垫 6 轮=轰炸):相邻轮
                 # 歇一轮;链发(同轮第二发)豁免。_turn_seq=0=无 arm 的直调(旧测试
                 # /嵌入方)不适用冷却语义。客户隔多轮再讲(序号差 >1)放行。
+                # P3.3:打断轮豁免(上一段回复被掐=客户有话要说,先接住)。
                 print("BOK_FILLER skip cooldown (上一轮已垫,防连轮轰炸)", flush=True)
                 return
             state = str(getattr(self._session, "agent_state", "") or "")

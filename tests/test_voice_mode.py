@@ -229,8 +229,10 @@ def test_repository_default_settings_carry_new_keys():
 # ---- P3：单会话记忆默认值 ----
 
 
-def test_history_turns_default_raised_to_8(monkeypatch):
-    # LLM_HISTORY_TURNS 缺省 4→8：30 对 > 2×8 → 一次剪回 8 对（滞回内纯追加命中缓存）。
+def test_history_turns_default_no_mid_call_truncation(monkeypatch):
+    # P1.3(2026-09-21,§48):缺省 8→40=通话内不截断——历史全命中 KV 前缀,截断
+    # 只产出前缀断裂全量重 prefill(§46.1 受控实验 2.5× 尖峰)。30 对 < 2×40
+    # 滞回线 → 零截断、原样全量递交。
     monkeypatch.delenv("LLM_HISTORY_TURNS", raising=False)
     from livekit.agents import llm as lk_llm
 
@@ -256,4 +258,30 @@ def test_history_turns_default_raised_to_8(monkeypatch):
     roles = [m.role for m in captured["items"]]
     assert roles[0] == "system"
     dialog = [r for r in roles[1:] if r in ("user", "assistant")]
-    assert dialog == ["user", "assistant"] * 8
+    assert dialog == ["user", "assistant"] * 30  # 典型通话长度：零截断
+
+
+def test_history_truncation_hysteresis_at_2x(monkeypatch):
+    # 超长通话(>80 条=2×40)仍按滞回剪回 40 对——机制不变,只是线从 8 挪到 40。
+    monkeypatch.delenv("LLM_HISTORY_TURNS", raising=False)
+    from livekit.agents import llm as lk_llm
+
+    from agent_runtime.providers.livekit_plugins import ContextAwareLLM, ContextState
+
+    captured = {}
+
+    class _Inner(lk_llm.LLM):
+        def chat(self, *, chat_ctx, **kwargs):  # noqa: ANN001, ANN003
+            captured["items"] = list(chat_ctx.items)
+            return "sentinel"
+
+    ctx_llm = ContextAwareLLM(_Inner(), ContextState(account_id="acc"))
+    chat_ctx = lk_llm.ChatContext()
+    chat_ctx.add_message(role="system", content="你是客服。")
+    for i in range(90):
+        chat_ctx.add_message(role="user", content=f"u{i}")
+        chat_ctx.add_message(role="assistant", content=f"a{i}")
+    ctx_llm.chat(chat_ctx=chat_ctx)
+    roles = [m.role for m in captured["items"]]
+    dialog = [r for r in roles[1:] if r in ("user", "assistant")]
+    assert dialog == ["user", "assistant"] * 40  # 90 对 > 2×40 → 一次剪回 40 对

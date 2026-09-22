@@ -389,14 +389,30 @@ def test_firewall_execute_all_ok(monkeypatch, capsys) -> None:
 # ---------------- ⑤ doctor NVIDIA 门禁回归 ----------------
 
 
-def test_doctor_gpu_gate_skipped_on_posix(monkeypatch, capsys) -> None:
+def test_doctor_gpu_gate_skipped_on_mac(monkeypatch, capsys) -> None:
     calls: list[int] = []
+    monkeypatch.setattr(bok, "is_linux", lambda: False)
     monkeypatch.setattr(bok, "_nvidia_gate", lambda: calls.append(1) or (True, "x"))
     fails: list[str] = []
     bok._doctor_gpu_gate(packaged=True, fails=fails)
-    assert calls == []  # mac/Linux 无 nvidia-smi：门禁不适用
+    assert calls == []  # mac 无 nvidia-smi：门禁不适用
     assert fails == []
     assert "nvidia gate" not in capsys.readouterr().out
+
+
+def test_doctor_gpu_gate_runs_on_linux(monkeypatch, capsys) -> None:
+    """Linux CUDA 节点同门同判（runbook §5⑥，2026-09-22）：门禁必须被评估。"""
+    calls: list[int] = []
+    monkeypatch.setattr(bok, "is_linux", lambda: True)
+    monkeypatch.setattr(bok.os, "name", "posix")
+    monkeypatch.setattr(bok, "_nvidia_gate", lambda: calls.append(1) or (True, "NVIDIA OK"))
+    fails: list[str] = []
+    bok._doctor_gpu_gate(packaged=False, fails=fails)
+    assert calls == [1]
+    assert fails == []  # dev 只提示
+    assert "nvidia gate: NVIDIA OK" in capsys.readouterr().out
+    bok._doctor_gpu_gate(packaged=True, fails=fails)
+    assert calls == [1, 1] and fails == []  # gate 过线=packaged 也不 fail
 
 
 def test_doctor_gpu_gate_runs_regardless_of_virtual_audio(monkeypatch, capsys) -> None:

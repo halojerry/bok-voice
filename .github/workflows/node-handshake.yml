@@ -6,12 +6,10 @@ name: Node handshake smoke
 #              心跳 → 伪 token 401 → root JWT 查节点列表 → heartbeat_interval_s），
 #              再跑 scripts/probe_killswitch.py（同一 CP 自建独立节点：吊销 sticky
 #              → 通话面 403 窒息 → unrevoke 复活全链），并对 install-node.sh 做
-#              语法解析 + 零副作用干跑；
-#   windows —— runner 无 docker，不起 CP；验 install-node.ps1 本体（语法解析 +
-#              -DryRun 干跑）+ scripts/probe_windows_lifecycle.py 生命周期探针
-#              （A 段 down 树杀实跑，纯 stdlib；B 段 schtasks 契约实跑，runner
-#              无提权注册 SYSTEM 任务被拒时按 access-denied 优雅 [skip]——
-#              skip 不计 pass，已执行步 FAIL 仍红）。
+#              语法解析 + 零副作用干跑。
+#              （windows 腿 2026-09-22 起软退役删除：Windows=仅浏览器访问 web UI，
+#              节点运行时只跑 mac/Linux；install-node.ps1 / probe_windows_lifecycle
+#              代码保留但不再维护/不出包。）
 # CP 依赖安装照 postgres-smoke.yml；起监听等待照 cloud-image.yml 的显式 curl 轮询
 # 循环——进程起 ≠ 端口就绪，bind 时差窗内裸 curl/connrefused 重试不可靠（CI 实证）。
 on:
@@ -107,37 +105,3 @@ jobs:
         if: always()
         run: |
           if [[ -f /tmp/cp.pid ]]; then kill "$(cat /tmp/cp.pid)" 2>/dev/null || true; fi
-
-  windows:
-    name: install-node.ps1 syntax + dry-run + lifecycle probe
-    runs-on: windows-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: PowerShell syntax parse
-        shell: pwsh
-        run: |
-          foreach ($f in @("scripts/install-node.ps1", "scripts/setup-virtual-audio.ps1")) {
-            $tokens = $null
-            $errors = $null
-            [System.Management.Automation.Language.Parser]::ParseFile(
-              (Join-Path $PWD $f), [ref]$tokens, [ref]$errors) | Out-Null
-            if ($errors -and $errors.Count -gt 0) {
-              $errors | ForEach-Object { Write-Host ("{0} parse error: {1}" -f $f, $_.Message) }
-              exit 1
-            }
-            Write-Host "$f 语法解析通过"
-          }
-      - name: install-node.ps1 -DryRun (零副作用，Windows runner 无 docker 不起 CP)
-        shell: pwsh
-        run: ./scripts/install-node.ps1 -CpUrl http://127.0.0.1:18011 -NodeToken ci-dummy-token -DryRun
-
-      - name: setup-virtual-audio.ps1 -DryRun (检测/计划打印，不下载不提权)
-        shell: pwsh
-        run: ./scripts/setup-virtual-audio.ps1 -DryRun
-
-      - name: Windows 生命周期探针 (A 段 down 树杀实跑 + B 段 schtasks 契约;无提权时 B 段优雅 skip)
-        run: python scripts/probe_windows_lifecycle.py

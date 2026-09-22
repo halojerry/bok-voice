@@ -1,5 +1,7 @@
 # Windows 实机验收 Checklist（节点分发行，2026-09-17 修订）
 
+> **搁置（2026-09-22）**：Windows 节点形态已软退役——Windows 定位=仅浏览器访问 web UI，节点运行时只跑 macOS/Linux。本清单不再执行/维护；相关装机脚本标 DEPRECATED、CI 停出 Windows 包（代码保留）。历史验收清单仅存档参考。
+
 > 本机（Mac）无法实机验收 Windows；以下清单在 NVIDIA GPU 的 Windows 机器上逐项执行，全部通过后回填结果并归档。
 
 ## 硬件与安装（install-node.ps1 -Fetch 路径）

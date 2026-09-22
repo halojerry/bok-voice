@@ -11,6 +11,11 @@ agent_runtime.flow(装配解析)、agent_runtime.agent(每轮命中)。
 Phase 3.4 意图引擎:意图可携可选 `judge.prompt`(判据片段)——关键词未中时由背景
 9B 批量判定补位,命中 id 经 `judge_hit` 与关键词命中同权入裁决(见
 `eligible_judge_intents`/`pick_graph_action`)。
+
+P2.2 兜底(catch-all,bolna 式,2026-09-21):保留意图 id `"*"` = 常规意图**全未
+命中**后的最后出口(`pick_catchall_action`)。形状三约束:keywords 必须为空、无
+judge、其绑定 `once` 必须 false——validate 严格拒(CP 400),parse 宽容丢(坏
+`"*"` 行=丢该意图/丢该绑定,宁空毋炸)。无 `"*"` 意图=落 LLM 兜底,逐字节同旧。
 """
 
 from __future__ import annotations
@@ -38,7 +43,22 @@ ACTION_JUMP_STEP = "jump_step"
 # 无负载(不要求 qa_id/step);agent 侧不抢话,LLM 照常兜话,坐席旁听后手动接管。
 ACTION_NOTIFY_HUMAN = "notify_human"
 ACTIONS = {ACTION_PLAY_QA, ACTION_JUMP_STEP, ACTION_NOTIFY_HUMAN}
+# P2.2(2026-09-21):保留意图 id `"*"`=兜底(catch-all,bolna 式 router 的
+# unconditional 边)。**两轨合法形状都不匹配**(`_INTENT_ID_RE`/`_ID_RE`),
+# 单独走支路;运营面语义=「以上都没接住的话,照这条做」,无该意图=落 LLM。
+CATCHALL_INTENT_ID = "*"
 _ID_RE = re.compile(r"^(?:int|bnd)_[0-9a-f]{8}$")
+# 意图 id 硬规则(P2.2 放宽):原 spec §3 是 `int_<8 hex>`(web 画布机器生成)。
+# P2.1 挖掘候选 id 是 snake_case 语义名(`whatsapp_contact`/`session_affirm`,
+# scripts/probe_intent_mine.py `_ID_RE` 逐字节同款)——**不入硬规则则挖掘产物永远
+# 保存不了**,故意图 id 放宽到 snake_case(旧 `int_<8 hex>` 是其子集 ⇒ 存量数据
+# 零影响;形状坏仍 400)。绑定 id 保持 `bnd_<8 hex>`(机器生成,无人手写)。
+_INTENT_ID_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+# 命名**软校验**(只出警告绝不 400,见 graph_warnings):建议 `<主体>_<关系>` 形状
+# (同词反向歧义防护,plan §46.3 医疗 KG 结论);画布机器占位 id `int_<8 hex>`
+# 亦提示改名(可读性,不阻断)。
+_ID_SHAPE_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$")
+_ID_MACHINE_RE = re.compile(r"^int_[0-9a-f]{8}$")
 
 # 关键词匹配噪声(I2,2026-09-18):ASR 转写窗口带标点/空格(实测「我要。投诉。」
 # 「我 要 投 诉」),运营写的关键词恒为连写形态 → 双侧剥噪声再 casefold 子串。
@@ -124,12 +144,46 @@ def _judge_prompt_of(raw: dict) -> str:
     return prompt
 
 
+def _parse_catchall_intent(raw: dict) -> FlowIntent | None:
+    """兜底意图(保留 id `"*"`)宽容解析:keywords 必须为空 + 无判据——违背即整项丢弃。
+
+    「宁空毋炸」:坏兜底行(带关键词/带判据/字段形状坏)只丢这一个意图,常规意图
+    照跑、图退「无兜底」=落 LLM,绝不因一行坏数据炸通话(严格档 validate 400)。
+    `steps` 与常规意图同语义(空=全程):窄化的兜底只在指定步生效,缺省=全程。
+    """
+    raw_keywords = raw.get("keywords")
+    if raw_keywords is not None and not isinstance(raw_keywords, list):
+        return None
+    if any(str(k or "").strip() for k in (raw_keywords or [])):
+        return None  # 有实质词 = 不是兜底(运营配错),整项丢弃(判据同 validate)
+    if _judge_prompt_of(raw):
+        return None  # 兜底无判据(判据只补常规意图的模糊轮)
+    raw_steps = raw.get("steps")
+    if raw_steps is not None and not isinstance(raw_steps, list):
+        return None
+    steps = sorted({_as_int(s, -1) for s in raw_steps or [] if _as_int(s, -1) >= 1})
+    return FlowIntent(
+        id=CATCHALL_INTENT_ID,
+        label=str(raw.get("label") or "")[:LABEL_MAX_CHARS],
+        keywords=[],
+        steps=steps,
+        enabled=_as_bool(raw.get("enabled")),
+        judge_prompt="",
+    )
+
+
 def _parse_intent(raw: object) -> FlowIntent | None:
-    """单项宽容:缺 id/坏 id/非 dict/字段形状坏 → None(调用方跳过)。"""
+    """单项宽容:缺 id/坏 id/非 dict/字段形状坏 → None(调用方跳过)。
+
+    保留 id `"*"`(兜底意图,P2.2)走 `_parse_catchall_intent`——形状坏同样整项
+    丢弃,常规意图零影响。
+    """
     if not isinstance(raw, dict):
         return None
     intent_id = str(raw.get("id") or "")
-    if not _ID_RE.match(intent_id):
+    if intent_id == CATCHALL_INTENT_ID:
+        return _parse_catchall_intent(raw)
+    if not _INTENT_ID_RE.match(intent_id):
         return None
     raw_keywords = raw.get("keywords")
     raw_steps = raw.get("steps")
@@ -175,6 +229,11 @@ def _parse_binding(raw: object) -> GraphBinding | None:
     intent = str(raw.get("intent") or "")
     if not intent:
         return None  # 悬空引用运行时不可执行,解析期直接丢
+    once = _as_bool(raw.get("once"), default=False)
+    if intent == CATCHALL_INTENT_ID and once:
+        # P2.2:兜底绑定 once 必须 false(validate 严格 400 同源)——坏行直接丢,
+        # 意图本身留着(=显式声明落 LLM),绝不因一条坏绑定炸通话。
+        return None
     return GraphBinding(
         id=binding_id,
         intent=intent,
@@ -183,7 +242,7 @@ def _parse_binding(raw: object) -> GraphBinding | None:
         step=max(1, min(_as_int(raw.get("step"), 0), STEP_MAX)),
         then_jump=_then_jump_of(raw, action),
         priority=max(PRIORITY_MIN, min(_as_int(raw.get("priority"), DEFAULT_PRIORITY), PRIORITY_MAX)),
-        once=_as_bool(raw.get("once"), default=False),
+        once=once,
         enabled=_as_bool(raw.get("enabled")),
     )
 
@@ -219,7 +278,12 @@ def parse_flow_graph(raw: str | bytes | None) -> FlowGraphDoc:
 
 
 def validate_flow_graph(raw: str | bytes) -> list[str]:
-    """严格校验(CP 保存用):返回错误列表,空=合法。空串=未启用,合法。"""
+    """严格校验(CP 保存用):返回错误列表,空=合法。空串=未启用,合法。
+
+    P2.2 起额外两条硬门:①保留意图 `"*"` 的形状(keywords 必须为空/无 judge/
+    其绑定 once=false/至多一次);②**孤儿意图门**——intents 非空时每个常规意图
+    至少要有一条 enabled 绑定(空图豁免)。软性命名建议走 `graph_warnings`。
+    """
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8", errors="replace")
     text = str(raw or "")
@@ -258,7 +322,9 @@ def validate_flow_graph(raw: str | bytes) -> list[str]:
             errors.append(f"intents[{idx}] must be an object")
             continue
         intent_id = str(item.get("id") or "")
-        if not _ID_RE.match(intent_id):
+        # P2.2 兜底意图(保留 id "*")不属 `int_<8 hex>` 形状,单列支路;其余照旧。
+        is_catchall = intent_id == CATCHALL_INTENT_ID
+        if not is_catchall and not _INTENT_ID_RE.match(intent_id):
             errors.append(f"intents[{idx}].id malformed: {intent_id!r}")
         elif intent_id in seen_intents:
             errors.append(f"intents[{idx}].id duplicated: {intent_id}")
@@ -267,7 +333,21 @@ def validate_flow_graph(raw: str | bytes) -> list[str]:
         if not label or len(label) > LABEL_MAX_CHARS:
             errors.append(f"intents[{idx}].label must be 1-{LABEL_MAX_CHARS} chars")
         keywords = item.get("keywords")
-        if not isinstance(keywords, list) or not keywords:
+        if is_catchall:
+            # 兜底意图 keywords 必须为空(有词=不是兜底)。判据与宽容 parse **同一
+            # 条**("剥空白后有无实质词"):缺省/空列表/纯空白项都合法,出现实质词
+            # 或非 list 形状才 400——两轨对同一份数据结论一致,不出现「保存过但
+            # 运行时被判坏行丢掉」的落差。
+            has_words = (
+                any(str(k or "").strip() for k in keywords)
+                if isinstance(keywords, list)
+                else keywords is not None
+            )
+            if has_words:
+                errors.append(
+                    f'intents[{idx}].keywords must be empty for intent "{CATCHALL_INTENT_ID}"'
+                )
+        elif not isinstance(keywords, list) or not keywords:
             errors.append(f"intents[{idx}].keywords must be a non-empty list")
         else:
             if len(keywords) > MAX_KEYWORDS:
@@ -285,9 +365,14 @@ def validate_flow_graph(raw: str | bytes) -> list[str]:
             errors.append(f"intents[{idx}].enabled must be bool")
         # Phase 3.4 判据:严格形状(CP 保存期拒)——运行时有宽容 parse 兜底,但运营面
         # 唔准静默存坏数据(判据坏=意图退纯关键词,运营以为写了判据却没生效)。
+        # P2.2:兜底意图**不准有 judge**(判据只补常规意图的模糊轮,兜底无判据可言)。
         if "judge" in item:
             judge = item["judge"]
-            if (
+            if is_catchall:
+                errors.append(
+                    f'intents[{idx}].judge is not allowed for intent "{CATCHALL_INTENT_ID}"'
+                )
+            elif (
                 not isinstance(judge, dict)
                 or "prompt" not in judge
                 or not isinstance(judge["prompt"], str)
@@ -297,6 +382,7 @@ def validate_flow_graph(raw: str | bytes) -> list[str]:
                     f"intents[{idx}].judge.prompt must be a 1-{JUDGE_PROMPT_MAX_CHARS} char string"
                 )
     seen_bindings: set[str] = set()
+    bound_intents: set[str] = set()  # 有 enabled 绑定的意图 id(孤儿门用)
     for idx, item in enumerate(raw_bindings):
         if not isinstance(item, dict):
             errors.append(f"bindings[{idx}] must be an object")
@@ -310,11 +396,19 @@ def validate_flow_graph(raw: str | bytes) -> list[str]:
         intent = str(item.get("intent") or "")
         if intent not in seen_intents:
             errors.append(f"bindings[{idx}].intent references missing intent: {intent!r}")
+        elif item.get("enabled", True) is not False:
+            bound_intents.add(intent)
         action = str(item.get("action") or "")
         if action not in ACTIONS:
             errors.append(f"bindings[{idx}].action must be one of {sorted(ACTIONS)}: {action!r}")
         if action == ACTION_PLAY_QA and not str(item.get("qa_id") or "").strip():
             errors.append(f"bindings[{idx}] action=play_qa requires qa_id")
+        # P2.2:兜底绑定 once 必须 false(每通至多一次的兜底=只在第一轮兜一次,
+        # 语义上不是兜底;运营要「只兜一次」应写关键词意图)。
+        if intent == CATCHALL_INTENT_ID and item.get("once") is True:
+            errors.append(
+                f'bindings[{idx}].once must be false for intent "{CATCHALL_INTENT_ID}"'
+            )
         # Phase 3.3 追问链:then_jump 仅 play_qa 合法;[1,999] 闭区间;非 int(含 bool)拒。
         if action in (ACTION_PLAY_QA, ACTION_JUMP_STEP) and "then_jump" in item:
             if action != ACTION_PLAY_QA:
@@ -335,7 +429,69 @@ def validate_flow_graph(raw: str | bytes) -> list[str]:
         for flag in ("once", "enabled"):
             if flag in item and not isinstance(item[flag], bool):
                 errors.append(f"bindings[{idx}].{flag} must be bool")
+    # P2.2 孤儿意图门(bolna 式「图必须走得通」的本地化):intents 非空时,每个常规
+    # 意图(非 "*")至少要有一条 enabled 绑定——「配了意图没绑动作」=该意图永不可能
+    # 触发,图是死的,保存期就拒(消灭静默无效配置)。**空图(无 intents)完全豁免**:
+    # 存量空图模板的保存不得被 breaking;"*" 意图本身允许无绑定(=显式声明落 LLM)。
+    if raw_intents:
+        for idx, item in enumerate(raw_intents):
+            if not isinstance(item, dict):
+                continue
+            intent_id = str(item.get("id") or "")
+            if intent_id == CATCHALL_INTENT_ID or not _INTENT_ID_RE.match(intent_id):
+                continue  # 兜底豁免;id 形状坏已单报,不再叠孤儿错
+            if intent_id not in bound_intents:
+                errors.append(f"intents[{idx}] has no enabled binding: {intent_id}")
     return errors
+
+
+def graph_warnings(graph: "str | bytes | FlowGraphDoc | None") -> list[str]:
+    """意图 id 命名规范**软校验**(P2.2):只出人话提示,**绝不阻断保存**。
+
+    与 `validate_flow_graph` 严格档**互不影响**(返回面分开=不破坏既有调用方):
+    错误走 validate(400),本函数只喂提示面(P2.5 表单/保存响应)。三条规则:
+    ①形状必须 `^[a-z][a-z0-9_]*$`——**这不是硬门**(validate 硬门是同一条正则,
+    不符早已 400);本函数对**手改/存量/文档态**数据仍照报,便于审计旧的
+    `int_<8 hex>` 之外的历史数据;
+    ②建议 `<主体>_<关系>` 形状(下划线分段,防同词反向歧义,plan §46.3);
+    ③画布机器占位 id `int_<8 hex>` 亦提示改名(可读性,非硬约束)。
+    输入坏 JSON/空串 → 无警告(取舍:坏图由 validate 报);`"*"` 兜底意图豁免。
+    喂原 JSON 串时按**原文档下标**取 id(宽容 parse 会丢坏行,坏 id 反而要提示)。
+    """
+    if isinstance(graph, FlowGraphDoc):
+        items: list[tuple[int, str]] = [(i, it.id) for i, it in enumerate(graph.intents)]
+    else:
+        if isinstance(graph, bytes):
+            graph = graph.decode("utf-8", errors="replace")
+        text = str(graph or "").strip()
+        items = []
+        if text:
+            try:
+                data = json.loads(text)
+            except (ValueError, RecursionError):
+                data = None
+            raw_intents = data.get("intents") if isinstance(data, dict) else None
+            if isinstance(raw_intents, list):
+                items = [
+                    (idx, str(item.get("id") or ""))
+                    for idx, item in enumerate(raw_intents[:MAX_INTENTS])
+                    if isinstance(item, dict)
+                ]
+    out: list[str] = []
+    for idx, intent_id in items:
+        if intent_id == CATCHALL_INTENT_ID:
+            continue
+        if not _INTENT_ID_RE.match(intent_id):
+            out.append(
+                f"intents[{idx}].id `{intent_id}` 建议用小写字母、数字、下划线命名"
+                f"（字母开头，形如 <主体>_<关系>）"
+            )
+        elif not _ID_SHAPE_RE.match(intent_id) or _ID_MACHINE_RE.match(intent_id):
+            out.append(
+                f"intents[{idx}].id `{intent_id}` 建议改成 <主体>_<关系> 形状"
+                f"（如 refund_request），同一个词的正反关系才分得清"
+            )
+    return out
 
 
 def pick_graph_action(
@@ -364,6 +520,8 @@ def pick_graph_action(
     for intent in doc.intents:
         if not intent.enabled:
             continue
+        if intent.id == CATCHALL_INTENT_ID:
+            continue  # P2.2 兜底不参与关键词路(无词);它只在常规全未命中后出场
         if intent.steps and step_1based not in intent.steps:
             continue
         for kw in intent.keywords:
@@ -394,6 +552,40 @@ def pick_graph_action(
     return candidates[0]
 
 
+def pick_catchall_action(
+    doc: FlowGraphDoc,
+    *,
+    step_1based: int,
+    fired: set[str],
+) -> GraphBinding | None:
+    """兜底意图(P2.2,bolna 式 catch-all)裁决:常规意图**全未命中之后**才调用。
+
+    命中条件(全部满足):图里有 `"*"` 意图 + 该意图 enabled + 步 scope 含当前步
+    (空=全程)+ 至少一条 enabled 且未 fired(once)的绑定;多绑定按 (priority,id)
+    升序取首个——与 `pick_graph_action` 逐字同款排序,零新语义。
+    无 `"*"` 意图 / 无启用绑定 → None(调用方照旧落 LLM,逐字节同旧)。
+
+    **与 judge 的关系**:判据只补常规意图的模糊轮(在 `pick_graph_action` 内),
+    兜底是它之后的最后出口——调用方顺序恒为 pick_graph_action → pick_catchall_action。
+    """
+    if not doc.intents:
+        return None
+    intent = doc.intent_by_id(CATCHALL_INTENT_ID)
+    if intent is None or not intent.enabled:
+        return None
+    if intent.steps and step_1based not in intent.steps:
+        return None
+    candidates = [
+        b
+        for b in doc.bindings
+        if b.enabled and b.intent == CATCHALL_INTENT_ID and not (b.once and b.id in fired)
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda b: (b.priority, b.id))
+    return candidates[0]
+
+
 def eligible_judge_intents(
     doc: FlowGraphDoc,
     *,
@@ -405,12 +597,15 @@ def eligible_judge_intents(
     四条全过才算候选:①`enabled`;②`judge_prompt` 非空(运营写了判据);③步 scope
     (空=全程);④至少一条可触发绑定(enabled + intent 对得上 + once 未 fired)。
     空列表=冇嘢可判=调用方零调度——**无 judge 数据故恒空**=全默认档行为逐字节
-    唔变的结构性保证(判定任务零创建、9B 专线零调用)。
+    唔变的结构性保证(判定任务零创建、9B 专线零调用)。P2.2 兜底意图永不进候选
+    (无判据正是它的形状约束;判据只补常规意图的模糊轮)。
     """
     if not doc.intents:
         return []
     out: list[FlowIntent] = []
     for intent in doc.intents:
+        if intent.id == CATCHALL_INTENT_ID:
+            continue
         if not intent.enabled or not intent.judge_prompt:
             continue
         if intent.steps and step_1based not in intent.steps:

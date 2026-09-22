@@ -1418,6 +1418,19 @@ class _RepeatSelfGuardStream(llm.LLMStream):
 # 会被静默挤掉,档案失真。
 
 
+def _context_mem_legacy() -> bool:
+    """P1.2a(2026-09-21)记忆压缩 kill-switch:1=回旧档(drop-oldest+上限 1200)。
+
+    进 `_FORWARD_ENV`(tests/test_forward_env 门禁)。"""
+    return os.environ.get("BOK_CONTEXT_MEM_LEGACY", "") == "1"
+
+
+def _intent_context_enabled() -> bool:
+    """P2.4(§48)意图喂下游 kill-switch:默认 "1" 开,`0` 全关(=set 恒 no-op、
+    【客户意图】行消失,尾部字节逐字同旧)。进 `_FORWARD_ENV`。"""
+    return os.environ.get("BOK_INTENT_CONTEXT", "1") == "1"
+
+
 class ContextState:
     """Shared per-call context memory: per-turn knowledge + running summary.
 
@@ -1426,10 +1439,16 @@ class ContextState:
     message (top-K snippets + bounded conversation summary) each turn.
     """
 
-    def __init__(self, account_id: str = "", max_snippets: int = 2, max_summary_chars: int = 1200):
+    def __init__(self, account_id: str = "", max_snippets: int = 2, max_summary_chars: int = 0):
         self.account_id = account_id
         self._max_snippets = max_snippets
-        self._max_summary_chars = max_summary_chars
+        # P1.2a:显式传参(测试/嵌入方)优先;缺省按 kill-switch 定——新档 400
+        # (尾部有界=每轮新 prefill 有界,§48 P1),legacy 档回旧 1200。
+        self._max_summary_chars = (
+            max_summary_chars
+            if max_summary_chars > 0
+            else (1200 if _context_mem_legacy() else 400)
+        )
         self._snippets: list[str] = []
         self._summary_lines: list[str] = []
         self._user_lang: str = ""
@@ -1445,6 +1464,12 @@ class ContextState:
         self.rag_enabled: bool = False
         # WhatsApp 已捕获号码（注入尾部,防 LLM 复述错号——2026-09-06 实测尾号读错）
         self._whatsapp_note: str = ""
+        # 当轮客户意图（P2.4 意图喂下游,spec §48）:agent 钩子每轮把「graph 命中意图
+        # 名 → 规则归类具名意图名」写进来(空=清位),render_context_tail 全量档渲染
+        # 一行【客户意图】。有界 ≤40 字;变化才 +revision(意图属实质变化,须全量尾部
+        # 才带得出——slim 紧凑档刻意不含它)。kill-switch BOK_INTENT_CONTEXT=0 时 set
+        # 恒 no-op → 字段恒空 → 尾部字节同旧。
+        self._customer_intent: str = ""
         # 追加式尾部账本（KV-cache 铁律 2026-09-05）：记录每个 user 消息被
         # ContextAwareLLM 拼上的易变尾部（原文, 原文+尾部, 当时 revision），FIFO
         # 对应历史里的 user 消息。下一轮请求把历史中的旧 user 重放成「原文+当时的
@@ -1498,6 +1523,22 @@ class ContextState:
         if len(self._call_facts) > limit:
             self._call_facts.pop(0)
         self._revision += 1
+
+    def set_customer_intent(self, text: str) -> None:
+        """设置当轮客户意图(截 40 字)— P2.4 意图喂下游(spec §48)。
+
+        语义=**每轮覆盖**:调用即重写当轮意图,**空串=清位**(上一轮有意图、本轮
+        无 → 不调用会令陈旧意图残留,下一轮任何实质变化触发全量尾部时带出误导
+        信号)。意图属实质变化 → 值变化才 +revision(同 add_call_fact 纪律),令
+        该轮走全量尾部、【客户意图】行才带得出(slim 紧凑档刻意不含它)。
+        kill-switch `BOK_INTENT_CONTEXT=0`(=0 全关)=本方法恒 no-op → 字段恒空,
+        尾部字节逐字同旧。"""
+        if not _intent_context_enabled():
+            return
+        v = str(text or "").strip()[:40]
+        if v != self._customer_intent:
+            self._customer_intent = v
+            self._revision += 1
 
     def set_last_reply(self, text: str) -> None:
         """记录 AI 最近一句回复(截 80 字)作尾部重复锚——模型看得见自己上一句,
@@ -1621,10 +1662,22 @@ class ContextState:
     def add_summary(self, role: str, text: str, max_char: int = 200) -> None:
         line = f"{role}: {str(text)[:max_char]}"
         self._summary_lines.append(line)
-        joined = "\n".join(self._summary_lines)
-        while len(joined) > self._max_summary_chars and len(self._summary_lines) > 1:
-            self._summary_lines.pop(0)
+        # P1.2a(2026-09-21,§48 P1「恒定轮延迟」):尾部=每轮新 prefill 的全部成本
+        # (§46.1 受控实验:638 字尾≈1.1s/轮、876 字≈1.6s/轮,单调涨)——记忆行是
+        # 唯一单调增长项。改**滚动压缩**:超上限时把最旧两行各取前半并成一行
+        # (信息密度翻倍而非整行丢弃),行数有界→尾部字数有界→每轮 TTFT 有界。
+        # kill-switch `BOK_CONTEXT_MEM_LEGACY=1` 回旧「drop-oldest」档(上限同旧 1200)。
+        cap = self._max_summary_chars
+        while len(self._summary_lines) > 1:
             joined = "\n".join(self._summary_lines)
+            if len(joined) <= cap:
+                break
+            if _context_mem_legacy():
+                self._summary_lines.pop(0)
+            else:
+                old = self._summary_lines
+                merged = (old[0][:80].rstrip() + "；" + old[1][:80].rstrip())[:180]
+                old[0:2] = [merged]
 
     def render_system_message(self) -> str:
         """完整 system 段（兼容旧调用/测试）：稳定指令前缀 + 易变参考尾部。"""
@@ -1765,6 +1818,12 @@ class ContextState:
             if self._last_reply:
                 parts.append(self._last_reply_anchor())
             return "\n".join(parts)
+        if self._customer_intent:
+            # P2.4 意图喂下游:当轮客户意图(graph 命中 → 规则归类)。**只在全量档**
+            # 渲染——slim 紧凑档的语义是「状态无实质变化」,意图属实质信息,变化即
+            # +revision 逼本轮走全量档(见 set_customer_intent)。kill-switch=0 时
+            # 字段恒空,本行不出现。
+            parts.append("【客户意图】" + self._customer_intent)
         if self._whatsapp_note:
             parts.append(
                 "【已记录客户 WhatsApp】" + self._whatsapp_note +
@@ -1892,7 +1951,12 @@ class ContextAwareLLM(llm.LLM):
                 else:
                     items.insert(0, llm.ChatMessage(role="system", content=[_join_system(prefix, "", "")]))
                 # 截断历史(摊销式,见 _truncate_chat_items):先剪后对齐,账本自尾映射。
-                max_turns = int(os.environ.get("LLM_HISTORY_TURNS", "8"))
+                # P1.3(2026-09-21,§48):缺省 8→40=**通话内不截断**——历史早已全命中
+                # KV 前缀(§46.1),截断的唯一产出是前缀断裂全量重 prefill(受控实验
+                # 2.5× 尖峰)+基线 qwen3_5 ArraysCache 不可 trim,截断纯亏;40 对
+                # (80 条)滞回线令典型 ≤20 轮通话零截断。逃生:LLM_HISTORY_TURNS=8
+                # 回旧档(env 已在 _FORWARD_ENV)。
+                max_turns = int(os.environ.get("LLM_HISTORY_TURNS", "40"))
                 items = _truncate_chat_items(items, max_turns=max_turns)
                 # 尾部重放+新消息追加(见上)。users=当前请求里的 user 消息下标(时序序)。
                 users = [i for i, it in enumerate(items) if getattr(it, "role", "") == "user"]
@@ -2063,7 +2127,14 @@ def _truncate_chat_items(items: list, max_turns: int = 4) -> list:
     # 滞回:超过 2×max_turns 对(4×max_turns 条)才截,剪回 max_turns 对。
     if len(dialog) <= max_turns * 4:
         return items
-    return system_part + dialog[-(max_turns * 2) :]
+    out = system_part + dialog[-(max_turns * 2) :]
+    # P0.3(2026-09-21,§48 仪器化):截断=KV 严格前缀断裂,该轮全量重 prefill
+    # (§46.1 受控实验 2.5× 尖峰)——先计数观测,截断策略(P1.3)按此数据定。
+    print(
+        f"HISTORY_TRUNCATED items={len(items)}->{len(out)} max_turns={max_turns} (KV prefix re-anchor)",
+        flush=True,
+    )
+    return out
 
 
 class ExprAwareLLM(llm.LLM):

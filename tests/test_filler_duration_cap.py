@@ -1,10 +1,8 @@
-"""垫话时长上限（2026-09-21）：`hold_if_playing()` 把回复扣多久，取决于垫话多长。
+"""垫话时长上限（2026-09-21 §45.2 口径反转后=**可选调优口，默认关**）。
 
-真通话实测（`call-54ed586a`，计划档 §42.2）：回复首段音频 ~2.8s 就绪，却要等垫话
-播完 3.8s + gap 才出声（`tts ttfb` 被撑到 1398ms）——**自伤约 1.3s**；而那一轮的
-垫话长 1.7s，是从「短档 1.0-1.5s / 长档 1.7-2.3s」里**随机**挑的。
-
-本文件钉住 `_pick` 的时长筛选契约：**只挑盖得住就够的短档，但绝不饿死垫话**。
+口径反转：垫音第一声=用户已听到应答，垫音期即应答期——「遮布比窗户长」不再
+是自伤（真人本就会拖到答案出来）。`BOK_FILLER_MAX_DUR_S` 保留给「想全通短促」
+的运营调优；本文件钉住设值时的筛选契约：只挑不超此值的条目，但绝不饿死垫话。
 """
 
 from __future__ import annotations
@@ -33,14 +31,16 @@ def _entries(*durs: float) -> list[dict]:
     return [{"file": f"f{i}.wav", "text": f"t{i}", "dur_s": d, "cat": "ack"} for i, d in enumerate(durs)]
 
 
-def test_default_cap_is_1_2s(monkeypatch):
+def test_default_is_off(monkeypatch):
+    """P3.1：默认 0=关——长档回归整池随机（新口径：垫音期=应答期）。"""
     monkeypatch.delenv("BOK_FILLER_MAX_DUR_S", raising=False)
-    assert filler_max_dur_s() == 1.2
-
-
-def test_zero_disables_the_cap(monkeypatch):
-    monkeypatch.setenv("BOK_FILLER_MAX_DUR_S", "0")
     assert filler_max_dur_s() == 0.0
+
+
+def test_explicit_cap_still_filters(monkeypatch):
+    """显式设值时筛选仍生效（调优口不死）。"""
+    monkeypatch.setenv("BOK_FILLER_MAX_DUR_S", "1.2")
+    assert filler_max_dur_s() == 1.2
 
 
 def test_long_tier_is_avoided(monkeypatch):

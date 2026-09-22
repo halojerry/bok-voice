@@ -152,14 +152,20 @@ def test_validate_version_must_be_exactly_int_one():
 
 
 def test_validate_intent_enabled_must_be_bool():
-    """m3:intents[].enabled 与绑定同档(bool 才收,非 bool=运营勾选静默失效)。"""
+    """m3:intents[].enabled 与绑定同档(bool 才收,非 bool=运营勾选静默失效)。
+
+    绑定边在场(P2.2 孤儿门:intents 非空时每个常规意图都要至少一条 enabled 绑定)
+    ——本测试的靶子是 enabled 的类型,不是绑定的有无。
+    """
 
     def _doc(enabled: object) -> str:
         return json.dumps(
             {
                 "version": 1,
                 "intents": [{"id": "int_1a2b3c4d", "label": "x", "keywords": ["k"], "steps": [], "enabled": enabled}],
-                "bindings": [],
+                "bindings": [
+                    {"id": "bnd_7e8f9a0b", "intent": "int_1a2b3c4d", "action": "jump_step", "step": 2}
+                ],
             }
         )
 
@@ -171,7 +177,8 @@ def test_validate_intent_enabled_must_be_bool():
     # 缺省=默认启用,唔报错(与 _as_bool 默认同向)
     assert (
         validate_flow_graph(
-            '{"version":1,"intents":[{"id":"int_1a2b3c4d","label":"x","keywords":["k"],"steps":[]}],"bindings":[]}'
+            '{"version":1,"intents":[{"id":"int_1a2b3c4d","label":"x","keywords":["k"],"steps":[]}],'
+            '"bindings":[{"id":"bnd_7e8f9a0b","intent":"int_1a2b3c4d","action":"jump_step","step":2}]}'
         )
         == []
     )

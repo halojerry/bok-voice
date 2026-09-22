@@ -278,6 +278,20 @@ def write_ui_config(out_dir: Path, cp_url: str, livekit_url: str) -> Path:
     return target
 
 
+def apply_cp_url_to_env(cp_url: str) -> str:
+    """--cp-url → CONTROL_PLANE_URL（缺省才写，显式 env 优先）。
+
+    云 CP 节点形态的 worker→CP 接线单点（Linux runbook §5④，2026-09-22 修）：
+    --cp-url 此前只喂心跳/UI 注入，不翻进 worker env——`_agent_worker_env` 的
+    CONTROL_PLANE_URL 缺省打本地 :8000，而 cmd_up 不起本地 CP，云 CP 节点上
+    turns/QA/设置上报全部断链。本进程 env 经 `_start_proc` 的 os.environ merge
+    进 worker/monitor（Linux systemd / Windows schtasks / dev 手跑三形态同治）。
+    返回生效值（测试面断言用）。
+    """
+    os.environ.setdefault("CONTROL_PLANE_URL", cp_url)
+    return os.environ["CONTROL_PLANE_URL"]
+
+
 # ---- 节点本地 UI 托管（2026-09-17：runbook「话务员浏览器开 :3000」的实现载体）----
 
 class _SpaStaticHandler(http.server.SimpleHTTPRequestHandler):
@@ -824,6 +838,10 @@ def main(argv=None) -> int:
         return 0
 
     import bok
+
+    # 云 CP 节点形态接线（runbook §5④）：cmd_up 拉起的 worker/monitor 靠
+    # os.environ 读到 CONTROL_PLANE_URL（缺省本地 :8000 在云 CP 节点上断链）。
+    LOG.info("worker CONTROL_PLANE_URL -> %s", apply_cp_url_to_env(args.cp_url))
 
     stack_down = False
 

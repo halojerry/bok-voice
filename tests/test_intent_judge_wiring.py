@@ -12,19 +12,33 @@ _SRC = (
 ).read_text(encoding="utf-8")
 
 
-def test_scheduler_pinned_to_user_text_branch():
-    """F1:调度调用必须钉在 `elif user_text:` 分支体内（图块真求值过 + 话语非空）。
+def test_scheduler_pinned_to_graph_block_tail_with_user_text_gate():
+    """F1(+P2.2 兜底腿):调度调用必须钉在图块尾部、以 `user_text` 为闸、唯一入口。
 
     旧形态 `else:` 与图激活块平级——空转写轮（user_text 为空令图块整体跳过）会
-    漏进调度：白烧一次 9B 之外，挂上的 pending 在下一轮无话语支撑地触发绑定。
+    漏进调度：白烧一次 9B 之外，挂上的 pending 在下一轮无话语支撑地触发绑定
+    （say/收线/图关各路径 `_intent_judge_candidates` 门已覆盖，唯 user_text 唔喺
+    门参数里，故结构上钉死）。P2.2 起闸门从「`_gbinding is None`」放宽为
+    「非常规命中」——`user_text and not _gregular_hit`（`_gregular_hit = _gbinding
+    is not None and not _gcatchall`）：兜底命中仍要撒网，否则图里一挂 "*" 就令判据
+    层永久饿死。判据命中的**优先权不变**：下一轮照旧由 pick_graph_action 先于兜底消费。
+    位置必须在动作派发**之后**：判据任务记当时的步号（store 守卫 `flow_ctrl.current
+    != step_at`），兜底 jump 换步后再调度才落得进下一轮。
     """
-    head = _SRC.index("elif user_text:")
+    head = _SRC.index("if user_text and not _gregular_hit:")
     call = _SRC.index("_maybe_schedule_intent_judge(user_text)")
+    assert head < call
     between = _SRC[head:call]
     # 同一分支体内：中间不得再出现分支头/函数定义（出现=调用被挪进别的结构）
     for forbidden in ("\n            elif ", "\n            else:", "\n    def ", "\n    async def "):
         assert forbidden not in between, forbidden
     assert _SRC.count("_maybe_schedule_intent_judge(user_text)") == 1  # 唯一调度入口
+    # 「常规命中」定义(P2.2;复核修后兜底=暂存,常规命中即 _gbinding 非空);
+    # 定义先于闸门,常规派发在闸门之前(三臂已抽 _gdispatch 闭包)
+    defined = _SRC.index("_gregular_hit = _gbinding is not None")
+    dispatch = _SRC.index("await _gdispatch(_gbinding, False)")
+    assert defined < dispatch < head
+    assert _SRC.index("flow_ctrl.jump_to(_gtarget)") < head  # 兜底 jump 换步发生在调度前
 
 
 def test_consume_pop_precedes_pick_and_pairs_kill_switch():
