@@ -38,15 +38,21 @@ def _sleeper_main() -> None:
 
 
 def _tmp_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
-    """HOME 指到 tmp（app_data_dir 调用时读 env，run/ 标记/pidfile 全落隔离面）。"""
+    """HOME 指到 tmp；run/ 目录用 bok 自己的 app_data_dir() 解析（mac=
+    Library/Application Support、Linux=~/.local/share——手造固定路径会在
+    Linux 上写错目录，首跑 CI 实证），XDG_DATA_HOME/LOCALAPPDATA 清干净
+    保证 HOME 是唯一变量。"""
     home = tmp_path / "home"
-    (home / "Library" / "Application Support" / "BokVoice" / "run").mkdir(parents=True)
+    home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    (bok.app_data_dir() / "run").mkdir(parents=True, exist_ok=True)
     return home
 
 
 def _run_dir(home: Path) -> Path:
-    return home / "Library" / "Application Support" / "BokVoice" / "run"
+    return bok.app_data_dir() / "run"
 
 
 @contextlib.contextmanager
