@@ -1239,7 +1239,7 @@ def _cmd_up_services() -> int:
     asr_py = sidecar_python("qwen3-asr-sidecar")
     tts_py = sidecar_python("qwen3-tts-sidecar")
     if not asr_py.exists() or not tts_py.exists():
-        print("[bok] sidecar pythons missing — run setup (setup-macos.sh / setup-windows.ps1)", file=sys.stderr)
+        print("[bok] sidecar pythons missing — run setup (./scripts/bootstrap.sh; node 节点机=scripts/install-node.sh)", file=sys.stderr)
         return 2
 
     asr_model = model_path(current, "asr")
