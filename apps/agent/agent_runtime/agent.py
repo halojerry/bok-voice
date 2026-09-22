@@ -4958,6 +4958,123 @@ async def entrypoint(ctx):
             # 空图零成本零变化;closing 后收线优先——REFUSE 分支已置 closing 且
             # 唔 raise,图唔可以抢走告别轮(与 QA 快路 closing 旁路同源)----
             _gbinding = None
+            _gcatchall_stash = None  # P2.2(复核修):兜底候选——QA 快路未接才在快路后派发
+
+            # P2.2(2026-09-21,§48 P2.2 复核修):图动作三臂派发抽成闭包——常规命中在
+            # graph 块内即派发;**兜底 "*" 命中改在 QA 快路之后派发**(让位铁律:
+            # 字面命中的罐头 ~50ms 即答,唔可以被 "*" 的 jump/notify 抢走——优先级
+            # REFUSE>DEFER>say>graph 常规>QA>**catch-all**>LLM)。QA 命中会
+            # StopResponse 收尾,能落到兜底派发点=本轮 QA 确实未接。
+            async def _gdispatch(_b, _from_catchall: bool) -> None:
+                nonlocal _flow_step_before
+                if _b.action == "jump_step":
+                    # 1-based 存储转 0-based;先跳、按**实际位移**记账(2026-09-18
+                    # review R1):jump_to 内部还会 no-op(无步骤/done 钳制),未位移
+                    # 就唔可以烧 once 绑定/宣告 provider/打 jump 日志(spec §4.3 防环)。
+                    _gtarget = int(_b.step or 1) - 1
+                    _gcur = flow_ctrl.current
+                    flow_ctrl.jump_to(_gtarget)
+                    if flow_ctrl.current != _gcur:
+                        flow_ctrl.graph_fired.add(_b.id)
+                        _invalidate_stale_preemptive(
+                            f"流程跳转 → 第 {flow_ctrl.current + 1} 步"
+                        )
+                        context_state.set_flow_current(flow_ctrl.current_step_text())
+                        # 跳步轮强制 advanced=True → QA 快路让位(spec precedence graph>QA):
+                        # 同轮规则推进+图后退跳可令净位移为零,不置哨兵快路会照抢本轮。
+                        _flow_step_before = -1
+                        print(
+                            f"FLOW_GRAPH jump binding={_b.id} "
+                            f"step={flow_ctrl.current + 1}",
+                            flush=True,
+                        )
+                        # 本轮继续回答(新步指引);provider 标记 assistant 轮
+                        # (兜底命中=provider 标 graph-catchall,动作本体见上方日志)
+                        _turn_origin["provider"] = (
+                            "graph-catchall" if _from_catchall else "graph-jump"
+                        )
+                    else:
+                        print(
+                            f"FLOW_GRAPH jump_noop binding={_b.id} "
+                            f"step={_gtarget + 1}",
+                            flush=True,
+                        )
+                elif _b.action == ACTION_NOTIFY_HUMAN:
+                    # W4-T2 notify_human 第三臂:打铃不抢话——CP assist 置 notified
+                    # (坐席台见「人工求助」),本轮 LLM 照常兜话,坐席旁听后手动接管;
+                    # **不 raise StopResponse**(jump 同构先例),落回后续 LLM 生成。
+                    # 上报 fire-and-forget,入队成功才烧 once/记 graph_notifies
+                    # (失败回滚 once,下一轮信号补报——_report_notify_once 文档)。
+                    _invalidate_stale_preemptive("人工协助已通知")
+                    print(f"FLOW_GRAPH notify binding={_b.id}", flush=True)
+                    # provider 标记 assistant 轮(本轮仍由 LLM 生成,item_added 落库)
+                    # (兜底命中=provider 标 graph-catchall,动作本体见上方日志)
+                    _turn_origin["provider"] = (
+                        "graph-catchall" if _from_catchall else "graph-notify"
+                    )
+                    _spawn_report(
+                        _report_notify_once(
+                            cp, call_id, _b.id, flow_ctrl.graph_fired, _facts,
+                            where=room_name,
+                        )
+                    )
+                else:  # play_qa:条目在场且音频已物化才播;miss 放行 LLM 不消耗 once
+                    _ge = (
+                        _qa_index.by_id(_b.qa_id)
+                        if _qa_index is not None and _b.qa_id
+                        else None
+                    )
+                    _gp = _qa_pcm_for(str((_ge or {}).get("answer_text") or ""))
+                    if (
+                        _ge is not None
+                        and _gp is not None
+                        and await _qa_canned_say(
+                            _ge,
+                            _gp,
+                            provider="graph-catchall" if _from_catchall else "graph-play",
+                        )
+                    ):
+                        flow_ctrl.graph_fired.add(_b.id)
+                        print(
+                            f"FLOW_GRAPH play binding={_b.id} "
+                            f"qa={_b.qa_id}",
+                            flush=True,
+                        )
+                        # ---- 追问链（Phase 3.3，spec §3）：罐头播完当场同步跳，下一轮
+                        # 按新步走。本分支以 StopResponse 收尾，冇任何 LLM 请求——唔喺本
+                        # 分支渲染当前步（渲染只会烧掉该步首渲染账本 _last_render_step/
+                        # _just_advanced，令下一轮流程块重渲染退成分支模式，底稿与
+                        # 【跳转进入】结构性失落）；位移状态已由 jump_to 置好，下一轮流程块
+                        # 首渲染即该步正稿+【跳转进入】，且真被请求消费。复用 Phase 2 位移
+                        # 记账纪律：实际位移才打 jump 日志；同位/closing/钳到同位 → jump_noop
+                        # 且零额外消耗（then_jump 是同一绑定的动作后缀，不另立 once 账本条目）。
+                        # 注：_invalidate_stale_preemptive 的标记随本轮 turn_ctx 副本蒸发
+                        # （承重件是 jump_to 置的位移状态）；照 spec 调用，零成本。
+                        # 0/False 为静默 no-op（T1 parse 丢 bool/拒 0——未来若扩「0=跳回首步」语义勿沿用真值门）。
+                        if _b.then_jump:
+                            _tj_target = int(_b.then_jump) - 1
+                            if flow_ctrl.apply_then_jump(_b.then_jump):
+                                _invalidate_stale_preemptive(
+                                    f"流程跳转 → 第 {flow_ctrl.current + 1} 步"
+                                )
+                                print(
+                                    f"FLOW_GRAPH jump binding={_b.id} "
+                                    f"step={flow_ctrl.current + 1} via=then_jump",
+                                    flush=True,
+                                )
+                            else:
+                                print(
+                                    f"FLOW_GRAPH jump_noop binding={_b.id} "
+                                    f"step={_tj_target + 1} via=then_jump",
+                                    flush=True,
+                                )
+                        raise StopResponse()  # 压掉本轮 LLM(WA 累积同款)
+                    print(
+                        f"FLOW_GRAPH play_miss binding={_b.id} "
+                        f"qa={_b.qa_id}",
+                        flush=True,
+                    )
+
             if (
                 os.environ.get("BOK_FLOW_GRAPH", "1") == "1"
                 and flow_ctrl.graph.intents
@@ -4998,111 +5115,31 @@ async def entrypoint(ctx):
                             f"FLOW_GRAPH judge_pending_expired intent={_gjudge_hit}",
                             flush=True,
                         )
+                # P2.2 catch-all(bolna 式兜底,spec 2026-09-21 §48 P2.2;**复核修**):
+                # 常规意图(关键词+判据两路)全未命中 → 兜底意图 "*" 的启用绑定。
+                # 位置钉在 judge 归因块**之后**(先补会让归因张冠李戴),但只**暂存**
+                # ——派发让位 QA 快路(见 _gdispatch 后置调用点),罐头字面命中先答。
+                # 无 "*" 意图/无启用绑定 → stash 仍 None → 照旧落 LLM(逐字节同旧)。
+                if _gbinding is None:
+                    _gcatchall_stash = flow_ctrl.pick_catchall_binding()
+            # 常规意图命中才「本轮已有专属动作」;兜底(暂存中)唔算——它只决定
+            # 「这一轮怎么答」,不係对常规意图的模糊判定(判据调度闸见下方)。
+            _gregular_hit = _gbinding is not None
             if _gbinding is not None:
-                if _gbinding.action == "jump_step":
-                    # 1-based 存储转 0-based;先跳、按**实际位移**记账(2026-09-18
-                    # review R1):jump_to 内部还会 no-op(无步骤/done 钳制),未位移
-                    # 就唔可以烧 once 绑定/宣告 provider/打 jump 日志(spec §4.3 防环)。
-                    _gtarget = int(_gbinding.step or 1) - 1
-                    _gcur = flow_ctrl.current
-                    flow_ctrl.jump_to(_gtarget)
-                    if flow_ctrl.current != _gcur:
-                        flow_ctrl.graph_fired.add(_gbinding.id)
-                        _invalidate_stale_preemptive(
-                            f"流程跳转 → 第 {flow_ctrl.current + 1} 步"
-                        )
-                        context_state.set_flow_current(flow_ctrl.current_step_text())
-                        # 跳步轮强制 advanced=True → QA 快路让位(spec precedence graph>QA):
-                        # 同轮规则推进+图后退跳可令净位移为零,不置哨兵快路会照抢本轮。
-                        _flow_step_before = -1
-                        print(
-                            f"FLOW_GRAPH jump binding={_gbinding.id} "
-                            f"step={flow_ctrl.current + 1}",
-                            flush=True,
-                        )
-                        # 本轮继续回答(新步指引);provider 标记 assistant 轮
-                        _turn_origin["provider"] = "graph-jump"
-                    else:
-                        print(
-                            f"FLOW_GRAPH jump_noop binding={_gbinding.id} "
-                            f"step={_gtarget + 1}",
-                            flush=True,
-                        )
-                elif _gbinding.action == ACTION_NOTIFY_HUMAN:
-                    # W4-T2 notify_human 第三臂:打铃不抢话——CP assist 置 notified
-                    # (坐席台见「人工求助」),本轮 LLM 照常兜话,坐席旁听后手动接管;
-                    # **不 raise StopResponse**(jump 同构先例),落回后续 LLM 生成。
-                    # 上报 fire-and-forget,入队成功才烧 once/记 graph_notifies
-                    # (失败回滚 once,下一轮信号补报——_report_notify_once 文档)。
-                    _invalidate_stale_preemptive("人工协助已通知")
-                    print(f"FLOW_GRAPH notify binding={_gbinding.id}", flush=True)
-                    # provider 标记 assistant 轮(本轮仍由 LLM 生成,item_added 落库)
-                    _turn_origin["provider"] = "graph-notify"
-                    _spawn_report(
-                        _report_notify_once(
-                            cp, call_id, _gbinding.id, flow_ctrl.graph_fired, _facts,
-                            where=room_name,
-                        )
-                    )
-                else:  # play_qa:条目在场且音频已物化才播;miss 放行 LLM 不消耗 once
-                    _ge = (
-                        _qa_index.by_id(_gbinding.qa_id)
-                        if _qa_index is not None and _gbinding.qa_id
-                        else None
-                    )
-                    _gp = _qa_pcm_for(str((_ge or {}).get("answer_text") or ""))
-                    if (
-                        _ge is not None
-                        and _gp is not None
-                        and await _qa_canned_say(_ge, _gp, provider="graph-play")
-                    ):
-                        flow_ctrl.graph_fired.add(_gbinding.id)
-                        print(
-                            f"FLOW_GRAPH play binding={_gbinding.id} "
-                            f"qa={_gbinding.qa_id}",
-                            flush=True,
-                        )
-                        # ---- 追问链（Phase 3.3，spec §3）：罐头播完当场同步跳，下一轮
-                        # 按新步走。本分支以 StopResponse 收尾，冇任何 LLM 请求——唔喺本
-                        # 分支渲染当前步（渲染只会烧掉该步首渲染账本 _last_render_step/
-                        # _just_advanced，令下一轮流程块重渲染退成分支模式，底稿与
-                        # 【跳转进入】结构性失落）；位移状态已由 jump_to 置好，下一轮流程块
-                        # 首渲染即该步正稿+【跳转进入】，且真被请求消费。复用 Phase 2 位移
-                        # 记账纪律：实际位移才打 jump 日志；同位/closing/钳到同位 → jump_noop
-                        # 且零额外消耗（then_jump 是同一绑定的动作后缀，不另立 once 账本条目）。
-                        # 注：_invalidate_stale_preemptive 的标记随本轮 turn_ctx 副本蒸发
-                        # （承重件是 jump_to 置的位移状态）；照 spec 调用，零成本。
-                        # 0/False 为静默 no-op（T1 parse 丢 bool/拒 0——未来若扩「0=跳回首步」语义勿沿用真值门）。
-                        if _gbinding.then_jump:
-                            _tj_target = int(_gbinding.then_jump) - 1
-                            if flow_ctrl.apply_then_jump(_gbinding.then_jump):
-                                _invalidate_stale_preemptive(
-                                    f"流程跳转 → 第 {flow_ctrl.current + 1} 步"
-                                )
-                                print(
-                                    f"FLOW_GRAPH jump binding={_gbinding.id} "
-                                    f"step={flow_ctrl.current + 1} via=then_jump",
-                                    flush=True,
-                                )
-                            else:
-                                print(
-                                    f"FLOW_GRAPH jump_noop binding={_gbinding.id} "
-                                    f"step={_tj_target + 1} via=then_jump",
-                                    flush=True,
-                                )
-                        raise StopResponse()  # 压掉本轮 LLM(WA 累积同款)
-                    print(
-                        f"FLOW_GRAPH play_miss binding={_gbinding.id} "
-                        f"qa={_gbinding.qa_id}",
-                        flush=True,
-                    )
-            elif user_text:
-                # 关键词未中才让判据判定补位——确定性关键词恒同步先行,judge 只做兜底
-                # (spec §4)。**elif 钉死在图块真求值过的分支**(review F1:旧 else 与
-                # 图块平级,空转写轮 user_text 为空令图块整体跳过时仍会漏进调度——
-                # 白烧一次 9B 之外,挂上的 pending 喺下一轮无话语支撑地触发绑定;
-                # say/收线/图关各路径 `_intent_judge_candidates` 门已覆盖,唯
-                # user_text 唔喺门参数里,这里结构上补死)。
+                await _gdispatch(_gbinding, False)
+            # 判据判定调度(Phase 3.4):常规意图未命中才让判据补位——确定性关键词恒
+            # 同步先行,judge 只做模糊轮(spec §4)。**P2.2 兜底命中同档撒网**:兜底只
+            # 决定「这一轮怎么答」,唔係对常规意图的模糊判定;若把兜底当常规命中而不
+            # 调度,图里一挂 `"*"` 就令判据层永久饿死(每轮都「命中」了)→ 运营写的
+            # 常规意图对模糊说法永远打不通。判据命中下一轮照旧**先于**兜底被 pick
+            # 消费(pick_graph_action 在 pick_catchall_action 之前),优先级不丢。
+            # 位置钉在派发**之后**:判据任务带当时的步号(`step_at`),兜底 jump 会换步
+            # ——先调度会让 store 守卫(flow_ctrl.current != step_at)把整条判定判成
+            # stale 白烧一次 9B;派发后调度=按跳后步算 scope,判定真能落到下一轮。
+            # 闸门仍以 user_text 钉死(review F1:空转写轮 user_text 为空令图块整体
+            # 跳过 → 唔准漏进调度,白烧 9B + 无话语支撑的 pending;play_qa 分支
+            # raise StopResponse 早已兜过本轮,调度到不了那里)。
+            if user_text and not _gregular_hit:
                 _maybe_schedule_intent_judge(user_text)
             # ---- Q→A 检索快路(PR-3):四道闸全过 + 应答音频已预生成才命中 ----
             # 命中 → 跳过 LLM 直接播缓存音频(~50ms);任一闸不过 → 照旧走 LLM。
@@ -5187,6 +5224,17 @@ async def entrypoint(ctx):
                             break  # 罐头路拒播(非异常径):原语义落 no_audio
                         print(f"QA_FASTPATH hit=0 reason=no_audio entry={_qa_entry.get('id')}", flush=True)
                         _qa_bump("no_audio")
+            # P2.2 兜底派发(复核修,§48 P2.2):QA 快路未接(命中/bypass 到不了这、
+            # 命中路径已 StopResponse 收尾)→ 兜底 "*" 绑定此刻派发。优先级铁律:
+            # REFUSE>DEFER>say>graph 常规>QA>**catch-all**>LLM——罐头字面命中先答,
+            # 兜底只接「常规意图与 QA 都没接住」的轮;play 臂 miss 照旧放行 LLM。
+            if _gcatchall_stash is not None:
+                print(
+                    f"FLOW_GRAPH catchall binding={_gcatchall_stash.id} "
+                    f"action={_gcatchall_stash.action}",
+                    flush=True,
+                )
+                await _gdispatch(_gcatchall_stash, True)
             # (旧 paused 分支已前移为 hook 顶部的 C1 暂停冻结——落库 gen=paused+
             # 三路推进全冻结;此处保留防御性兜底,正常流到不到。)
             if self.paused:

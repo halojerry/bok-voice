@@ -4093,6 +4093,14 @@ qwen3_5 混合注意力的 cache 是 ArraysCache **不可 trim**（mlx-lm 源码
 > （截断/失控每话一意图）、跨批重名（session_affirm/confirm）、平台提及缺口
 > （拼多多/京东 7 条）——**下轮迭代=去重合并+平台意图钉死+人审后才入图**。
 > 报告 `reports/intent-mine/`（gitignore 内，数据面不入库）。
+> **P2.2 已落地（同日，subagent+主线复核修）**：`"*"` 兜底意图（keywords 必空/
+> once 禁用/唯一）+孤儿意图 400+空图豁免+id 放宽 snake_case（`int_<8hex>` 是
+> 子集存量零影响——挖掘产物才存得进图）+`graph_warnings` 软校验；**复核修**
+> =兜底派发让位 QA 快路（三臂抽 `_gdispatch` 闭包、graph 块内只暂存、QA 之后
+> 才派发）——优先级 REFUSE>DEFER>say>graph 常规>QA>**catch-all**>LLM，罐头
+> 字面命中绝不被 "*" 抢走；判据调度闸 `not _gregular_hit` 防饿死（subagent
+> 设计，保留）。**真栈验收未跑**（无 owning window，probe_flow_graph 扩兜底腿
+> 届时补）。测试：catchall 39+wiring 7+模板 API 扩展。
 
 1. **探针先行（可与 P0 并行）**：全局沉淀 dry-run——真库 turns 按模板分组 →
    9B（:1237）挖掘 → 主用模板 1 张的意图候选（keywords=客户原话）；门槛=

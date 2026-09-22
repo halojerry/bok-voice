@@ -144,7 +144,8 @@ def test_agent_play_branch_wires_then_jump_before_stop_response():
     start = src.index("flow_ctrl.apply_then_jump(")
     stop = src.index("raise StopResponse()", start)   # 播放分支收尾 raise（注释无关锚）
     seg = src[start:stop]
-    assert "_gbinding.then_jump" in src
+    # P2.2 复核修：三臂抽 _gdispatch 闭包，绑定参数名 _b（then_jump 判据同源）
+    assert "_b.then_jump" in src
     assert "_invalidate_stale_preemptive(" in seg
     assert "current_step_text()" not in seg   # 渲染推迟到下一轮（R1，勿在本分支烧首渲染账本）
     assert "via=then_jump" in src

@@ -77,6 +77,7 @@ import json
 import re
 
 from bok_voice_core.flow_graph import (
+    CATCHALL_INTENT_ID,
     KEYWORD_MAX_CHARS,
     MAX_KEYWORDS,
     FlowGraphDoc,
@@ -229,10 +230,13 @@ def match_intent_for_text(
 
     候选=enabled 且有 enabled 绑定边的意图(关键词要有出口才有意义);优先步
     scope 含漏网步(空 scope=全程)的意图,没有再退全候选;亲和 >0 才算相关,
-    并列 (亲和降序, id 升序) 取首个——确定性,不依赖 dict 序。
+    并列 (亲和降序, id 升序) 取首个——确定性,不依赖 dict 序。P2.2 兜底意图
+    `"*"` 永不进候选(它的形状约束=keywords 必须为空,给它加词会被保存期 400)。
     """
     bound = {b.intent for b in doc.bindings if b.enabled}
-    candidates = [i for i in doc.intents if i.enabled and i.id in bound]
+    candidates = [
+        i for i in doc.intents if i.enabled and i.id in bound and i.id != CATCHALL_INTENT_ID
+    ]
     if not candidates:
         return None, BR_NO_ACTIVE_INTENT
     scoped = [i for i in candidates if not i.steps or (step > 0 and step in i.steps)]

@@ -300,20 +300,23 @@ def test_client_assist_and_intent_rules_shapes():
 
 
 def test_graph_notify_arm_pinned_between_jump_and_play():
-    jump = _SRC.index('if _gbinding.action == "jump_step":')
-    notify = _SRC.index("elif _gbinding.action == ACTION_NOTIFY_HUMAN:")
+    jump = _SRC.index('if _b.action == "jump_step":')
+    notify = _SRC.index("elif _b.action == ACTION_NOTIFY_HUMAN:")
     play = _SRC.index("else:  # play_qa:", notify)
     assert jump < notify < play  # 第三臂落在 jump 与 play 之间
 
 
 def test_graph_notify_arm_does_not_stop_response():
-    start = _SRC.index("elif _gbinding.action == ACTION_NOTIFY_HUMAN:")
+    start = _SRC.index("elif _b.action == ACTION_NOTIFY_HUMAN:")
     end = _SRC.index("else:  # play_qa:", start)
     seg = _SRC[start:end]
     # 唯一允许的出现形态=注释「不 raise StopResponse」;真实调用形态(带括号)禁现。
     assert "raise StopResponse()" not in seg  # 打铃不抢话:落回 LLM 生成
     assert "不 raise StopResponse" in seg  # 意图注释在场(删注释或改语义即红)
-    assert '_turn_origin["provider"] = "graph-notify"' in seg
+    # P2.2:provider 标记带兜底分叉(graph-catchall=本轮动作来自 "*" 兜底意图;
+    # 动作本体由后置派发点的 `FLOW_GRAPH catchall` 行交代)——两条来源都在场内。
+    # (复核修:三臂抽成 _gdispatch 闭包,变量名 _b/_from_catchall。)
+    assert '"graph-catchall" if _from_catchall else "graph-notify"' in seg
     assert "_spawn_report(" in seg and "_report_notify_once(" in seg
     assert "flow_ctrl.graph_fired" in seg
     assert "FLOW_GRAPH notify binding=" in seg

@@ -14,7 +14,12 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 
-from bok_voice_core.flow_graph import FlowGraphDoc, parse_flow_graph
+from bok_voice_core.flow_graph import (
+    FlowGraphDoc,
+    GraphBinding,
+    parse_flow_graph,
+    pick_catchall_action,
+)
 
 # 客户状态判定结果
 CONFIRM = "confirm"       # 确认/认可当前步 → 可推进下一步
@@ -1196,6 +1201,24 @@ class FlowController:
         before = self.current
         self.jump_to(int(then_jump_1based) - 1)   # 1-based → 0-based；钳制/closing 冻结在 jump_to 内
         return self.current != before
+
+    def pick_catchall_binding(self, *, step_1based: int | None = None) -> GraphBinding | None:
+        """兜底意图(P2.2,bolna 式 catch-all)求值:常规图未命中后调用。
+
+        返回 `"*"` 意图的启用绑定(按 (priority,id) 首条)或 None(=落 LLM 兜底,
+        与无 `"*"` 图逐字节同旧)。**调用点顺序铁律**:`pick_graph_action`(关键词+
+        判据)返回 None 之后才轮到本方法——兜底是图内最后出口,closing 冻结/
+        paused/收线让位等既有守卫全部照走(调用点在 agent 的 graph 块内、四道闸
+        之内)。closing 此处再钉一次(同 jump_to/apply_then_jump 冻结纪律):
+        收线后图不再动作,即便别的调用方漏了外层闸也不会在告别轮插一脚。
+        """
+        if self.closing:
+            return None
+        return pick_catchall_action(
+            self.graph,
+            step_1based=(int(self.current) + 1) if step_1based is None else int(step_1based),
+            fired=self.graph_fired,
+        )
 
     def note_turn_outcome(self, verdict: str, step: int, turn_key: str) -> int:
         """每轮判决记账(漏斗 v2,spec §3.1):UNCLEAR 且步未变 +1,其余清该步计数。
