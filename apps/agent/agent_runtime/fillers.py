@@ -128,6 +128,29 @@ def filler_max_per_call() -> int:
         return 6
 
 
+def filler_max_dur_s() -> float:
+    """垫话**时长上限**(2026-09-21):只挑不超此值的条目。
+
+    为什么要它——`hold_if_playing()` 把回复首帧扣到「垫话播完 + gap」,
+    **垫话多长,回复就被推迟多久**。真通话实测(`call-54ed586a`,计划档 §42.2):
+    回复音频 ~2.8s 就绪,却要等垫话播完 3.8s + gap 才出声,`tts ttfb` 被撑到
+    1398ms——**自伤约 1.3s**;那一轮垫话长 1.7s,而它是从「短档 1.0-1.5s /
+    长档 1.7-2.3s」里**随机**挑的,完全不看回复要多久。
+
+    长档当初是为「慢生成窗」加的(2026-09-16),但真通话实测 LLM TTFT 只
+    0.7s、回复首段音频 ~2.8s 就绪,长档现在是**纯延迟**——垫话是遮羞布,
+    盖住 ~1.5s 就够,盖太久反而把真答案按在后面。
+
+    0 = 关(回旧行为:整池随机,含长档)。池里没有合规条目时向整池放宽
+    (宁可用长的,也绝不饿死垫话——静音比长垫话更差)。条目缺 `dur_s` 视为
+    合规(manifest 正常都带,缺了不猜、按旧行为放行)。
+    """
+    try:
+        return max(0.0, float(os.environ.get("BOK_FILLER_MAX_DUR_S", "1.2")))
+    except ValueError:
+        return 1.2
+
+
 def filler_match_enabled() -> bool:
     """垫话罐头确定性匹配总闸(BOK_FILLER_MATCH,默认开;0=回退纯分类器随机池)。"""
     return os.environ.get("BOK_FILLER_MATCH", "1") == "1"
@@ -631,6 +654,14 @@ class FillerDirector:
             # 语言铁律:宁可不垫,绝不跨语言发声(池缺失响亮日志,不落其他语言池)。
             print(f"BOK_FILLER no pool lang={lang!r} — 跳过", flush=True)
             return None
+        # 时长上限先作用于池(2026-09-21):垫话多长,回复就被 hold 多久。必须**先于**
+        # recent 去重——否则短档进了去重窗后长档又会漏回来(4 条池连挑两次即复现,
+        # 上限形同虚设)。没有合规条目就保留整池(绝不饿死垫话);0=关。
+        cap = filler_max_dur_s()
+        if cap > 0:
+            shorter = [e for e in pool if float(e.get("dur_s") or 0) <= cap]
+            if shorter:
+                pool = shorter
         # 分类器回退层(2026-09-13):按场景类过滤 manifest 池(manifest 条目带
         # cat 标签);该类无条目 → default 标签池 → 整池(既有行为)。
         preferred = pool
