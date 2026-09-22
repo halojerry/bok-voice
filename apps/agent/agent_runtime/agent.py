@@ -5717,9 +5717,13 @@ def run_agent() -> None:
 
     # C6-2 端口单例守卫(2026-09-13):重复 spawn 撞 8081 时良性退出 0(旧版
     # Errno 48 崩溃+假故障噪音);BOK_WORKER_PORT_GUARD=0 关。
+    # 端口先读 env 再进守卫(2026-09-22 修序):旧版守卫写死 8081 且在
+    # _worker_port 解析之前——BOK_WORKER_PORT=9081 时守卫探错端口,防双实例
+    # 保护对实际监听口失效。
+    _worker_port = int(os.environ.get("BOK_WORKER_PORT", "8081") or 8081)
     from .worker_guard import worker_port_singleton_guard
 
-    worker_port_singleton_guard(8081, "agent")
+    worker_port_singleton_guard(_worker_port, "agent")
 
     # 抢跑失效诊断探针（BOK_PREEMPTIVE_DEBUG=1）：须在 worker 起跑前包好框架
     # 比较函数，否则首通 session 已绑旧引用。
@@ -5736,6 +5740,6 @@ def run_agent() -> None:
     # 不分端口会同抢默认 8081,后绑者 Errno 48 即崩("Agent did not join the
     # room" 根因,2026-09-06 实证)。BOK_WORKER_PORT 可覆盖(默认 8081 零漂移):
     # 单机多栈并存(并行会话/多 worktree 验收)时错开端口,免被对方端口预清
-    # 当殭尸杀(2026-09-18 漏斗 v2 隔离 E2E 实证)。
-    _worker_port = int(os.environ.get("BOK_WORKER_PORT", "8081") or 8081)
+    # 当殭尸杀(2026-09-18 漏斗 v2 隔离 E2E 实证)。_worker_port 已在上方
+    # 单例守卫前解析(修序见上)。
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name="bok-voice", port=_worker_port))
