@@ -583,7 +583,13 @@ def branch_hit_plan(
     }
 
 
-def _nudge_should_fire(now: float, last_reply_ts: float, last_user_ts: float, nudge_delay: float) -> bool:
+def _nudge_should_fire(
+    now: float,
+    last_reply_ts: float,
+    last_user_ts: float,
+    nudge_delay: float,
+    interrupted_unanswered: bool = False,
+) -> bool:
     """沉默心跳开火时序护栏（纯函数，单测用）。
 
     两种窗口唔开火：
@@ -592,10 +598,15 @@ def _nudge_should_fire(now: float, last_reply_ts: float, last_user_ts: float, nu
       唔好用「仲喺度嗎」頂替真答案；超 2×delay 仍無聲先允許心跳兜底
       （答案可能失敗/被取消——2026-09-05 三会话实测「一直心跳」根因护栏；
       ≤ 边界收紧系 2026-09-06 call-03a3295c:恰 16.0s 护栏失效心跳顶替真答案）。
+
+    P3.3（2026-09-21，§48 打断特权轮）：``interrupted_unanswered``=上一段回复
+    被打断且 AI 未回应过——2×delay 窗对打断轮**豁免**（打断后回复被取消/
+    被守卫丢轮的现场，硬等 16s 才问「仲喺度嗎」正是打断怪体验主源）；
+    gate1（AI 啱講完唔追）仍生效，打断轮最早也在标准 delay 后开火。
     """
     if now - last_reply_ts < nudge_delay:
         return False
-    if last_user_ts > last_reply_ts and now - last_user_ts <= nudge_delay * 2:
+    if not interrupted_unanswered and last_user_ts > last_reply_ts and now - last_user_ts <= nudge_delay * 2:
         return False
     return True
 
@@ -2614,7 +2625,7 @@ async def entrypoint(ctx):
     # count 會喺客戶真開口(on_user_turn_completed)時歸零。last_user_ts/last_reply_ts
     # 記錄「客戶最後開聲」與「AI 最後講完」時刻(秒),心跳只在兩者都足夠舊先開火
     # ——唔會喺客戶啱講完、AI 答案未出、或者 AI 啱講完幾秒內就打斷。
-    _nudge_state: dict = {"count": 0, "timer": None, "last_user_ts": 0.0, "last_reply_ts": 0.0}
+    _nudge_state: dict = {"count": 0, "timer": None, "last_user_ts": 0.0, "last_reply_ts": 0.0, "interrupt": False}
     from .plugins.emotion import EmotionState
 
     emotion_state = EmotionState()
@@ -4012,6 +4023,15 @@ async def entrypoint(ctx):
             _disarm_silence()
             # 上一轮若有垫话定时器还挂着(真回复一直未出声、客户又开口),作废它。
             _filler.cancel()
+            # P3.3 打断特权轮(§48):上一段回复刚被打断(_storm 台账 4s 内有
+            # generate_reply 打断记录,B4 补账同源)→ 本轮=打断轮:垫话豁免连轮
+            # 冷却(打断轮常紧跟上一垫话轮,冷却撞上=「打断后垫话没效果」主因)、
+            # 心跳判据缩短(打断后 AI 未回应,唔再等 2×delay 先问「仲喺度嗎」——
+            # gate2 对打断轮豁免,§44.3④ 的「仲喺度嗎」怪体验)。
+            _turn_interrupted = bool(_storm["ts"] and time.monotonic() - _storm["ts"][-1] <= 4.0)
+            if _turn_interrupted:
+                _filler.note_interrupt_round()
+                _nudge_state["interrupt"] = True
             # 响应看门狗武装(钩子最顶端,run-5 轮9 33s 死寂教训:垫话配额会耗尽、
             # 钩子/生成可能静默失败——任何分支只要本轮有意静默或已出声即拆弹)。
             _arm_response_watchdog()
@@ -5356,7 +5376,10 @@ async def entrypoint(ctx):
             now = time.monotonic()
             last_user = float(_nudge_state.get("last_user_ts") or 0.0)
             last_reply = float(_nudge_state.get("last_reply_ts") or 0.0)
-            if not _nudge_should_fire(now, last_reply, last_user, nudge_delay):
+            if not _nudge_should_fire(
+                now, last_reply, last_user, nudge_delay,
+                interrupted_unanswered=bool(_nudge_state.get("interrupt")),
+            ):
                 return
             name = str((object_card or {}).get("display_name") or "").strip()
             lang = language_state.lang if language_state.lang in ("zh", "cantonese", "en") else "zh"
@@ -5388,6 +5411,7 @@ async def entrypoint(ctx):
         _link["agent"] = getattr(ev, "new_state", "") or ""
         if getattr(ev, "new_state", "") == "listening":
             _nudge_state["last_reply_ts"] = time.monotonic()
+            _nudge_state["interrupt"] = False  # P3.3:AI 讲完一句=打断已获回应
             _arm_silence()
         else:
             _disarm_silence()

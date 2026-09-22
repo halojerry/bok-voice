@@ -148,6 +148,18 @@ def filler_match_enabled() -> bool:
     return os.environ.get("BOK_FILLER_MATCH", "1") == "1"
 
 
+def filler_cut_after_s() -> float:
+    """P3.2 掐垫话阈值（秒，0=关）：真回复音频就绪且垫话已播超过此值 → 掐剩余。
+
+    官方 hold-message 姿势（LiveKit audio customization「结果先回即 interrupt 掉
+    hold」）——「答案比垫话先好」不再硬等播完。默认 1.0s：太短会把垫话掐成
+    半句（不自然），1s 保住一个完整短应承再交棒。"""
+    try:
+        return max(0.0, float(os.environ.get("BOK_FILLER_CUT_AFTER_S", "1.0")))
+    except ValueError:
+        return 1.0
+
+
 def filler_match_threshold() -> float:
     # 0.42(2026-09-13 实机校准:ASR 变体「张单↔账单」下最佳 trigger 得分 0.48,
     # 旧 0.55 全 miss;垫话有分类器+资产双层兜底,宁 hit 勿 miss——比 QA 快路
@@ -428,6 +440,9 @@ class FillerDirector:
         self._handle = None
         self._cur_dur = 0.0
         self._play_started = 0.0
+        # P3.3 打断特权轮状态:pending 在 arm 时消费成 _round_interrupted。
+        self._interrupt_pending = False
+        self._round_interrupted = False
         # 「垫话真正开播」回调(2026-09-17 RC3,agent 侧 set_on_fired 注入):
         # 垫话 out-of-band 出声框架/watchdog 感知不到,开播即通知顺延响应看门狗。
         # None=零行为变化。签名 ();异常由触发点吞掉,绝不阻垫话。
@@ -448,6 +463,10 @@ class FillerDirector:
     def arm(self) -> None:
         """轮提交、确认走 LLM 正常路径后调用;重复 arm 先作废旧定时器/链发。"""
         self._turn_seq += 1
+        # P3.3 打断特权轮：note_interrupt_round() 的待决旗在 arm 时消费——
+        # 本轮是否打断轮就此定格（fire 只看 _round_interrupted）。
+        self._round_interrupted = bool(getattr(self, "_interrupt_pending", False))
+        self._interrupt_pending = False
         self._cancel_timer()
         self._cancel_chain()
         if not filler_enabled() or self._count >= filler_max_per_call():
@@ -459,12 +478,23 @@ class FillerDirector:
             return
         self._timer = asyncio.create_task(self._fire(delay))
 
+    def note_interrupt_round(self) -> None:
+        """P3.3(2026-09-21,§48 打断特权轮)：标记下一轮为打断轮。
+
+        打断轮常紧跟上一垫话轮——连轮冷却恰好撞上=打断后「垫话完全没效果」
+        的主因之一（§44.3③a）。打断轮豁免冷却（轰炸感由 per-call 上限与
+        本身稀疏度兜住）。须在 arm() 前调（on_user_turn_completed 顶部）。"""
+        self._interrupt_pending = True
+
     def on_reply_first_audio(self) -> None:
         """真回复首音频(CachedTTS stream 回调):只作废定时器。
 
         在播垫话**不掐**——播放排序契约=垫话播完→gap→回复;扣压由
         tts_cache._RelaySynthesizeStream 向 hold_if_playing() 询时实现。
         置位 _reply_audio_seen:链发观察者醒来时据此放弃补第二发。
+        P3.2(2026-09-21,§48,官方 hold-message 姿势):真回复音频就绪且垫话已播
+        超过 `BOK_FILLER_CUT_AFTER_S`(默认 1.0s,0=关)→ 掐掉剩余垫话并清 hold 窗,
+        回复即刻出声——「答案比垫话先好」不再硬等播完。不足阈值照旧播完+gap。
         """
         self._reply_audio_seen = True
         self._cancel_timer()
@@ -473,6 +503,13 @@ class FillerDirector:
         # hold 扣住(用户无缝衔接);gap=垫话播完后的裸静默——垫音体验主指标
         # (§48 P3 门槛 gap p90 ≤500ms)。
         if self._play_started > 0 and self.fired_this_round():
+            elapsed = time.monotonic() - self._play_started
+            cut_after = filler_cut_after_s()
+            if cut_after > 0 and elapsed >= cut_after and self._handle is not None:
+                self._stop_playing()
+                self._play_started = 0.0  # 清 hold 窗:回复即刻放行
+                print(f"BOK_FILLER cut_on_ready elapsed={elapsed * 1000:.0f}ms", flush=True)
+                return
             rel_ms = (time.monotonic() - (self._play_started + self._cur_dur)) * 1000
             if rel_ms >= 0:
                 print(f"BOK_FILLER reply_gap={rel_ms:.0f}ms", flush=True)
@@ -569,6 +606,8 @@ class FillerDirector:
         self._fired_lines.clear()
         self._recent.clear()
         self._entry_used.clear()
+        self._interrupt_pending = False
+        self._round_interrupted = False
         self._cancel_timer()
         self._cancel_chain()
         self._stop_playing()
@@ -743,10 +782,12 @@ class FillerDirector:
                 self._turn_seq > 0
                 and self._chain_depth == 0
                 and self._turn_seq - self._last_fire_seq <= 1
+                and not getattr(self, "_round_interrupted", False)
             ):
                 # 连轮冷却(2026-09-17 call-11132bdd:8 轮垫 6 轮=轰炸):相邻轮
                 # 歇一轮;链发(同轮第二发)豁免。_turn_seq=0=无 arm 的直调(旧测试
                 # /嵌入方)不适用冷却语义。客户隔多轮再讲(序号差 >1)放行。
+                # P3.3:打断轮豁免(上一段回复被掐=客户有话要说,先接住)。
                 print("BOK_FILLER skip cooldown (上一轮已垫,防连轮轰炸)", flush=True)
                 return
             state = str(getattr(self._session, "agent_state", "") or "")

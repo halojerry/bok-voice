@@ -4120,6 +4120,14 @@ qwen3_5 混合注意力的 cache 是 ArraysCache **不可 trim**（mlx-lm 源码
 
 ### P3 垫音与打断（跟随 P0 数据；agent.py，2 天）
 
+> **P3.1/P3.2/P3.3 已落地（2026-09-21）**：P3.1 上限默认关（54d9d83）；
+> P3.2 `BOK_FILLER cut_on_ready`（回复音频就绪且垫话已播 >1s → 掐剩余+清 hold 窗，
+> 官方 hold-message 姿势；`BOK_FILLER_CUT_AFTER_S` 默认 1.0/0=关，进 `_FORWARD_ENV`）；
+> P3.3 打断特权轮（`_storm` 台账 4s 内有打断记录=打断轮：垫话 `note_interrupt_round`
+> 豁免连轮冷却；`_nudge_should_fire` 新参 `interrupted_unanswered` 豁免 2×delay 窗、
+> gate1 不动，AI 讲完一句即清旗）。**e2e_barge_in 真栈回归未跑**（无 owning window，
+> 两条护栏不得挡真插话的验收欠着）。watchdog 归因（P3.4）待 P0.4 真栈数据。
+
 1. 1.2s 垫话上限**默认关**（长档回归；env 保留可调）。
 2. hold 掐垫话：回复音频就绪且垫话已播 >1s → 掐剩余（官方 hold pattern），
    kill-switch `BOK_FILLER_CUT`；门槛=**gap p90 ≤500ms** 且

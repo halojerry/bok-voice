@@ -29,6 +29,7 @@ class _GapStub(FillerDirector):
         self._last_fire_seq = -1
         self._play_started = 0.0
         self._cur_dur = 0.0
+        self._handle = None  # P3.2 后 on_reply_first_audio 会读(掐断门)
 
     def _pools(self) -> dict[str, list[dict]]:  # type: ignore[override]
         return {"cantonese": []}
