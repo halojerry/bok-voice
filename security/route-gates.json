@@ -1,0 +1,1585 @@
+{
+ "schemaVersion": "route-gates/v1",
+ "routes": [
+  {
+   "path": "/api/asr/health",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "asr_health",
+   "gates": [
+    "page"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/audit",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "list_audit",
+   "gates": [
+    "mgmt-auto",
+    "scoped-account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/auth/change-password",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "auth_change_password",
+   "gates": [
+    "identity-self"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/auth/login",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "auth_login",
+   "gates": [],
+   "note": "exempt:登录端点（本身即凭据交换）",
+   "reviewed": true,
+   "reason": "2026-09-23 实审：登录=凭据交换本体，identity_gate 豁免面（auth.py _EXEMPT_PATHS）"
+  },
+  {
+   "path": "/api/auth/me",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "auth_me",
+   "gates": [
+    "identity-self"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/calls",
+   "methods": [
+    "DELETE",
+    "GET",
+    "POST"
+   ],
+   "handlers": "create_call,list_calls,clear_ended_calls",
+   "gates": [
+    "page",
+    "identity-self",
+    "scoped-account",
+    "mgmt-auto"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/calls/{call_id}",
+   "methods": [
+    "DELETE",
+    "GET"
+   ],
+   "handlers": "get_call,delete_call",
+   "gates": [
+    "page",
+    "account",
+    "mgmt-auto"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/calls/{call_id}/assist",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "assist_notify",
+   "gates": [
+    "page",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/calls/{call_id}/dial-result",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "report_dial_result",
+   "gates": [
+    "page",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/calls/{call_id}/followups",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "create_followup",
+   "gates": [
+    "page",
+    "account",
+    "identity-self"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/calls/{call_id}/hangup",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "hangup",
+   "gates": [
+    "page",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/calls/{call_id}/metrics",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "get_call_metrics",
+   "gates": [
+    "page",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/calls/{call_id}/session-report",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "ingest_session_report",
+   "gates": [
+    "page",
+    "account",
+    "identity-self"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/calls/{call_id}/settle",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "settle",
+   "gates": [
+    "page",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/calls/{call_id}/settlement",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "get_settlement",
+   "gates": [
+    "page",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/calls/{call_id}/turns",
+   "methods": [
+    "GET",
+    "POST"
+   ],
+   "handlers": "add_turn,get_turns",
+   "gates": [
+    "page",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/calls/{call_id}/whatsapp",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "report_whatsapp",
+   "gates": [
+    "page",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/calls/{call_id}/whatsapp/handled",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "mark_whatsapp_handled",
+   "gates": [
+    "page",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/campaigns",
+   "methods": [
+    "GET",
+    "POST"
+   ],
+   "handlers": "create_campaign,list_campaigns",
+   "gates": [
+    "page",
+    "identity-self",
+    "scoped-account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/campaigns/{campaign_id}",
+   "methods": [
+    "DELETE",
+    "GET",
+    "PUT"
+   ],
+   "handlers": "get_campaign,delete_campaign,update_campaign",
+   "gates": [
+    "page",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/campaigns/{campaign_id}/pause",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "campaign_pause",
+   "gates": [
+    "campaign-transition(page+account)"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/campaigns/{campaign_id}/start",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "campaign_start",
+   "gates": [
+    "campaign-transition(page+account)"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/campaigns/{campaign_id}/stop",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "campaign_stop",
+   "gates": [
+    "campaign-transition(page+account)"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/fillers",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "list_filler_entries",
+   "gates": [
+    "mgmt-auto",
+    "scoped-account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/fillers/{entry_id}/hit",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "hit_filler_entry",
+   "gates": [
+    "page",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/insights",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "list_insights",
+   "gates": [
+    "mgmt-auto"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/intent-rules",
+   "methods": [
+    "GET",
+    "POST"
+   ],
+   "handlers": "list_intent_rules,create_intent_rule",
+   "gates": [
+    "page",
+    "scoped-account",
+    "identity-self"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/intent-rules/{rule_id}",
+   "methods": [
+    "DELETE",
+    "PATCH"
+   ],
+   "handlers": "update_intent_rule,delete_intent_rule",
+   "gates": [
+    "page",
+    "row-gate"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/knowledge",
+   "methods": [
+    "DELETE",
+    "GET"
+   ],
+   "handlers": "list_knowledge,delete_knowledge",
+   "gates": [
+    "mgmt-auto",
+    "scoped-account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/knowledge/import",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "import_knowledge",
+   "gates": [
+    "mgmt-auto",
+    "scoped-account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/knowledge/search",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "search_knowledge",
+   "gates": [
+    "mgmt-auto",
+    "scoped-account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/nodes",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "list_nodes",
+   "gates": [
+    "role"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/nodes/downloads/{kind}/{version}/{filename}",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "download_node_artifact",
+   "gates": [
+    "node-token"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/nodes/heartbeat",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "node_heartbeat",
+   "gates": [
+    "node-token"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/nodes/licenses",
+   "methods": [
+    "GET",
+    "POST"
+   ],
+   "handlers": "create_node_license,list_node_licenses",
+   "gates": [
+    "role"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/nodes/licenses/{license_id}/revoke",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "revoke_node_license",
+   "gates": [
+    "role"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/nodes/logs",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "upload_node_logs",
+   "gates": [
+    "node-token"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/nodes/register",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "register_node",
+   "gates": [],
+   "note": "exempt:节点注册（指纹+license 在 handler 内）",
+   "reviewed": true,
+   "reason": "2026-09-23 实审：节点注册走 license+指纹自证（nodes_store.register，revoked sticky 拒绝），中间件豁免但 handler 内闭环"
+  },
+  {
+   "path": "/api/nodes/{node_id}/commands",
+   "methods": [
+    "GET",
+    "POST"
+   ],
+   "handlers": "create_node_command,list_node_commands",
+   "gates": [
+    "role"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/nodes/{node_id}/logs",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "list_node_logs",
+   "gates": [
+    "role"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/nodes/{node_id}/logs/{filename}",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "download_node_logs",
+   "gates": [
+    "role"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/nodes/{node_id}/revoke",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "revoke_node",
+   "gates": [
+    "role"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/nodes/{node_id}/unrevoke",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "unrevoke_node",
+   "gates": [
+    "role"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/notify/sms",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "notify_sms",
+   "gates": [
+    "mgmt-auto"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/objects",
+   "methods": [
+    "GET",
+    "POST"
+   ],
+   "handlers": "list_objects,create_object",
+   "gates": [
+    "page",
+    "scoped-account",
+    "mgmt-auto"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/objects/import",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "import_objects",
+   "gates": [
+    "mgmt-auto",
+    "scoped-account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/objects/{object_id}",
+   "methods": [
+    "DELETE",
+    "GET",
+    "PATCH"
+   ],
+   "handlers": "get_object,update_object,delete_object",
+   "gates": [
+    "page",
+    "account",
+    "mgmt-auto"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/objects/{object_id}/dial-now",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "dial_now",
+   "gates": [
+    "page",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/objects/{object_id}/digest",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "get_object_digest",
+   "gates": [
+    "page",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/objects/{object_id}/topics",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "list_object_topics",
+   "gates": [
+    "page",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/personas",
+   "methods": [
+    "GET",
+    "POST",
+    "PUT"
+   ],
+   "handlers": "list_personas,create_persona,upsert_persona",
+   "gates": [
+    "mgmt-auto",
+    "scoped-account",
+    "identity-self"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/personas/{persona_id}",
+   "methods": [
+    "DELETE",
+    "GET",
+    "PUT"
+   ],
+   "handlers": "get_persona,update_persona,delete_persona",
+   "gates": [
+    "mgmt-auto",
+    "account",
+    "identity-self"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/qa-entries",
+   "methods": [
+    "GET",
+    "POST"
+   ],
+   "handlers": "list_qa_entries,create_qa_entry",
+   "gates": [
+    "page",
+    "scoped-account",
+    "identity-self"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/qa-entries/{entry_id}",
+   "methods": [
+    "DELETE",
+    "PATCH"
+   ],
+   "handlers": "update_qa_entry,delete_qa_entry",
+   "gates": [
+    "page",
+    "account",
+    "owner",
+    "identity-self"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/qa-entries/{entry_id}/hit",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "hit_qa_entry",
+   "gates": [
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/qa/canned-status",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "qa_canned_status_ep",
+   "gates": [
+    "page",
+    "scoped-account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/qa/cluster",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "qa_cluster_ep",
+   "gates": [
+    "page",
+    "scoped-account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/qa/pregen",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "qa_pregen_ep",
+   "gates": [
+    "mgmt-auto"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/qa/{entry_id}/canned-audio",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "qa_canned_audio",
+   "gates": [
+    "page",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/reports/calls",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "reports_calls",
+   "gates": [
+    "page",
+    "scoped-account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/reports/distill-health",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "distill_health",
+   "gates": [
+    "page",
+    "scoped-account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/reports/qa-pairs",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "report_qa_pairs",
+   "gates": [
+    "page",
+    "scoped-account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/reports/script-insights",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "script_insights",
+   "gates": [
+    "page",
+    "scoped-account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/reports/summary",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "reports_summary",
+   "gates": [
+    "page",
+    "scoped-account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/reports/usage",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "reports_usage",
+   "gates": [
+    "page",
+    "scoped-account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/roster",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "list_roster",
+   "gates": [
+    "page",
+    "scoped-account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/roster/{entry_id}/claim",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "roster_claim",
+   "gates": [
+    "page",
+    "account",
+    "identity-self"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/roster/{entry_id}/handled",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "roster_handled",
+   "gates": [
+    "page",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/roster/{entry_id}/unclaim",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "roster_unclaim",
+   "gates": [
+    "page",
+    "account",
+    "identity-self"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/settings",
+   "methods": [
+    "GET",
+    "PUT"
+   ],
+   "handlers": "get_settings,put_settings",
+   "gates": [
+    "mgmt",
+    "identity-self",
+    "mgmt-auto"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/setup",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "setup_status",
+   "gates": [
+    "mgmt-auto"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/setup/download",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "setup_download",
+   "gates": [
+    "mgmt-auto"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/sip/mock/callee",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "spawn_mock_callee",
+   "gates": [
+    "mgmt-auto"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/sip/sites",
+   "methods": [
+    "GET",
+    "POST"
+   ],
+   "handlers": "create_sip_site,list_sip_sites",
+   "gates": [
+    "mgmt-auto",
+    "identity-self",
+    "page",
+    "scoped-account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/sip/sites/{site_id}/trunk",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "register_sip_trunk",
+   "gates": [
+    "mgmt-auto",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/stats/dashboard",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "stats_dashboard",
+   "gates": [
+    "page",
+    "scoped-account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/stats/llm-gaps",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "stats_llm_gaps",
+   "gates": [
+    "page",
+    "scoped-account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/stats/llm-gaps/adopt",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "adopt_llm_gap",
+   "gates": [
+    "page",
+    "identity-self"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/stats/qa-drift",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "stats_qa_drift",
+   "gates": [
+    "page",
+    "scoped-account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/stats/qa-drift/adopt",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "adopt_qa_drift",
+   "gates": [
+    "page",
+    "account",
+    "owner",
+    "identity-self"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/stats/template-proposals",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "stats_template_proposals",
+   "gates": [
+    "page",
+    "scoped-account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/stats/template-proposals/adopt",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "adopt_template_proposals",
+   "gates": [
+    "page",
+    "account",
+    "owner"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/supervisor/active-calls",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "active_calls",
+   "gates": [
+    "mgmt-auto",
+    "scoped-account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/supervisor/{call_id}/end",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "supervisor_end",
+   "gates": [
+    "account",
+    "identity-self"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/supervisor/{call_id}/join",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "supervisor_join",
+   "gates": [
+    "mgmt-auto",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/supervisor/{call_id}/listen",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "supervisor_listen",
+   "gates": [
+    "mgmt-auto",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/supervisor/{call_id}/listen/stop",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "supervisor_listen_stop",
+   "gates": [
+    "mgmt-auto",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/supervisor/{call_id}/pause-agent",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "pause_agent",
+   "gates": [
+    "mgmt-auto",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/supervisor/{call_id}/resume-agent",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "resume_agent",
+   "gates": [
+    "mgmt-auto",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/supervisor/{call_id}/takeover",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "takeover",
+   "gates": [
+    "mgmt-auto",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/supervisor/{call_id}/transfer",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "transfer",
+   "gates": [
+    "mgmt-auto",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/supervisor/{call_id}/transfer-sip",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "transfer_sip",
+   "gates": [
+    "mgmt-auto",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/templates",
+   "methods": [
+    "GET",
+    "POST"
+   ],
+   "handlers": "list_templates,create_template",
+   "gates": [
+    "page",
+    "scoped-account",
+    "identity-self"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/templates/{template_id}",
+   "methods": [
+    "DELETE",
+    "GET",
+    "PUT"
+   ],
+   "handlers": "get_template,update_template,delete_template",
+   "gates": [
+    "page",
+    "account",
+    "owner",
+    "identity-self"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/templates/{template_id}/publish",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "publish_template",
+   "gates": [
+    "page",
+    "account",
+    "owner"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/templates/{template_id}/revisions",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "template_revisions",
+   "gates": [
+    "page",
+    "account",
+    "owner"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/token",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "token",
+   "gates": [
+    "page",
+    "identity-self"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/tts/branch-canned-status",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "branch_canned_status_ep",
+   "gates": [
+    "page",
+    "scoped-account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/tts/branch-pregen",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "branch_pregen_ep",
+   "gates": [
+    "role",
+    "scoped-account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/tts/filler-preview",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "tts_filler_preview",
+   "gates": [
+    "page"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/tts/health",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "tts_health",
+   "gates": [
+    "page"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/tts/minimax-voices",
+   "methods": [
+    "GET",
+    "POST"
+   ],
+   "handlers": "tts_minimax_voices_list,tts_minimax_voice_clone",
+   "gates": [
+    "page",
+    "mgmt-auto"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/tts/minimax-voices/{voice_id}",
+   "methods": [
+    "DELETE"
+   ],
+   "handlers": "tts_minimax_voice_delete",
+   "gates": [
+    "mgmt-auto"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/tts/preview",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "tts_preview",
+   "gates": [
+    "mgmt-auto"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/tts/speakers",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "tts_speakers",
+   "gates": [
+    "page"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/tts/voices",
+   "methods": [
+    "GET",
+    "POST"
+   ],
+   "handlers": "tts_voices,tts_register_voice",
+   "gates": [
+    "page",
+    "mgmt-auto"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/tts/voices/{voice_id}",
+   "methods": [
+    "DELETE"
+   ],
+   "handlers": "tts_delete_voice",
+   "gates": [
+    "mgmt-auto"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/users",
+   "methods": [
+    "GET",
+    "POST"
+   ],
+   "handlers": "create_user,list_users",
+   "gates": [
+    "user-admin",
+    "identity-self"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/users/{user_id}",
+   "methods": [
+    "PATCH"
+   ],
+   "handlers": "update_user",
+   "gates": [
+    "identity-self"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/web_logs",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "web_logs",
+   "gates": [
+    "identity-self"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/webhook/livekit",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "livekit_webhook",
+   "gates": [],
+   "note": "exempt:LiveKit 签名 webhook（外部回调面）",
+   "reviewed": true,
+   "reason": "2026-09-23 实审：外部系统回调面（identity_gate 豁免表对齐，§系统性 debug ②）；已知残留=无 secret 时 fail-open 已入档"
+  },
+  {
+   "path": "/health",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "health",
+   "gates": [],
+   "note": "exempt:存活探针，无敏感数据",
+   "reviewed": true,
+   "reason": "2026-09-23 实审：存活探针，零敏感字段（CP 可选鉴权设计面）"
+  }
+ ]
+}

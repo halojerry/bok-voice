@@ -1353,6 +1353,9 @@ class SqlAlchemyBusinessRepository:
                 "enabled": False,
                 "hangup_enabled": False,
                 "hangup_template": "",
+                # SSRF 守卫放行口（2026-09-23，Mimosa 修复）：False=启用中的
+                # webhook 只许公网端点；存量库缺键= falsy 同 False，零迁移。
+                "allow_private_webhook": False,
             },
             # 全局外呼时段窗段（T3b）：空=不限时段；GET 端点照常回显该键。
             "campaign": {"call_windows": []},

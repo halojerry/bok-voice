@@ -25,6 +25,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps" / "agent"))
 
 CP = os.environ.get("BOK_CP_URL", "http://127.0.0.1:8000")
+from urlguard_gate import gate  # SSRF 守卫（2026-09-23，Mimosa）：云端测试设 BOK_PROBE_EXTRA_HOSTS
+
+gate(CP)
 
 DUEL_QUERY = "怎么退款"
 DUEL_THRESHOLD = 0.3  # 显式低阈:让异问法低分条目也过关,优先级才真压过分(默认 0.90 下它永不出线)

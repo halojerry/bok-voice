@@ -175,9 +175,13 @@ export function createWorker(config, { metricsSink = appendMetrics, ttsVoices = 
 // 从 control-plane 拉取 TTS 三语言音色（speaker_zh/speaker_cantonese/en），让 B 线合成时按目标语言
 // 选粤语克隆/预设音色（否则默认普通话 Vivian 念粤语会「夹生」）。失败降级空 map（不崩）。
 // control-plane 固定本机 127.0.0.1:8000（A/B 线同栈）。
+// SSRF 守卫（2026-09-23，Mimosa 修复）：守卫拒=同款降级路径（warn+空 map），
+// 不崩 worker——环回默认天然过，坏配置不静默外发。
 async function loadTtsVoices(config) {
   const cp = config.controlPlaneUrl || "http://127.0.0.1:8000";
   try {
+    const { assertLocalDiagUrl } = await import("./src/lib/url-guard.js");
+    assertLocalDiagUrl(cp);
     const r = await fetch(`${cp}/api/settings?internal=1`, { signal: AbortSignal.timeout(5000) });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const s = await r.json();

@@ -182,3 +182,22 @@ def test_env_toggle_and_dir_env(tmp_path, monkeypatch):
     assert tts_cache_enabled() is False
     monkeypatch.setenv("BOK_TTS_CACHE", "1")
     assert tts_cache_enabled() is True
+
+
+def test_malformed_key_rejected_before_path_join(tmp_path):
+    """缓存键形状断言（2026-09-23，Mimosa path-traversal 防御收口）。
+
+    非 sha1-hex 键（含 '../' 穿越段、空、前缀合法后缀注入）在拼路径前
+    ValueError——get/put/meta 全走 _pcm_path/_meta_path 单点，一处断言全挡。
+    """
+    import pytest
+
+    cache = TtsAudioCache(root=tmp_path)
+    for bad in ("../../etc/passwd", "", "abc", "a" * 39, "g" * 40, "A" * 40, "x.pem"):
+        with pytest.raises(ValueError, match="malformed"):
+            cache.get(bad)
+        with pytest.raises(ValueError, match="malformed"):
+            cache._meta_path(bad)
+    # 合法 sha1 键照常（cache_key 产物）
+    ok = cache_key("你好", voice_id="v", model="m", sample_rate=24000)
+    cache.get(ok) is None  # 不抛、不落盘

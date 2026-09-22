@@ -44,10 +44,27 @@ SMS_DEFAULTS = {
     "enabled": False,
     "hangup_enabled": False,
     "hangup_template": "",
+    "allow_private_webhook": False,
 }
 
 WEBHOOK_URL = "https://sms.example.invalid/hook"
 WEBHOOK_SECRET = "devsecret-not-a-real-credential"
+
+
+def _dns_ok(monkeypatch):
+    """保存期全验的 DNS 桩（2026-09-23 SSRF 守卫配套）。
+
+    WEBHOOK_URL 用 RFC .invalid 域（真解析必失败），守卫 resolve=True 会拒——
+    测试桩把它解析成公网 IP，保存路径照常走通（与假 httpx 同款手法）。
+    """
+    import socket as _socket
+
+    def _resolve(host, *a, **kw):
+        if host == "sms.example.invalid":
+            return [(_socket.AF_INET, None, None, "", ("93.184.216.34", 0))]
+        raise OSError(f"unexpected host in test: {host}")
+
+    monkeypatch.setattr(_socket, "getaddrinfo", _resolve)
 
 
 # ---- 脚手架 ----
@@ -241,6 +258,7 @@ def test_get_settings_masks_sms_secret(monkeypatch):
 def test_put_sms_empty_secret_keeps_old(monkeypatch):
     client, repo = _client_and_repo(monkeypatch)
     _enable_sms(repo)
+    _dns_ok(monkeypatch)
     r = client.put("/api/settings", json={
         "sms": {"webhook_url": WEBHOOK_URL, "secret": "", "enabled": True,
                 "hangup_enabled": True, "hangup_template": "x"},
@@ -504,3 +522,56 @@ def test_transfer_sip_missing_params_400(monkeypatch):
     assert client.post(
         "/api/supervisor/call-nope/transfer-sip", json={"transfer_to": "+861500015000"}
     ).status_code == 404
+
+
+# ---- 10. SSRF 守卫（2026-09-23，Mimosa 修复：保存期全验 + 发送期字面量复验） ----
+
+
+def test_put_sms_enabled_webhook_guard_rejects_private(monkeypatch):
+    client, repo = _client_and_repo(monkeypatch)
+    r = client.put("/api/settings", json={
+        "sms": {"webhook_url": "http://192.168.1.9/hook", "secret": "s", "enabled": True},
+    })
+    assert r.status_code == 400
+    assert "不合规" in r.json()["detail"]
+
+
+def test_put_sms_metadata_rejected_even_with_allow_private(monkeypatch):
+    # 云元数据段无口子：allow_private_webhook 也不放行
+    client, repo = _client_and_repo(monkeypatch)
+    r = client.put("/api/settings", json={
+        "sms": {"webhook_url": "http://169.254.169.254/latest", "secret": "s",
+                "enabled": True, "allow_private_webhook": True},
+    })
+    assert r.status_code == 400
+
+
+def test_put_sms_allow_private_flag_permits_lab_gateway(monkeypatch):
+    client, repo = _client_and_repo(monkeypatch)
+    r = client.put("/api/settings", json={
+        "sms": {"webhook_url": "http://10.1.2.3/sms", "secret": "s",
+                "enabled": True, "allow_private_webhook": True},
+    })
+    assert r.status_code == 200
+    assert repo.get_settings()["sms"]["allow_private_webhook"] is True
+
+
+def test_put_sms_disabled_draft_url_not_validated(monkeypatch):
+    # 未启用的草稿 URL 不拦——保存摩擦留给启用那一刻
+    client, repo = _client_and_repo(monkeypatch)
+    r = client.put("/api/settings", json={
+        "sms": {"webhook_url": "http://192.168.1.9/hook", "secret": "s", "enabled": False},
+    })
+    assert r.status_code == 200
+
+
+def test_send_time_guard_blocks_repo_tampered_webhook(monkeypatch):
+    # 绕过 PUT 直接改库（保存面被绕过/被改库场景）→ 发送期字面量复验拦截（502）
+    client, repo = _client_and_repo(monkeypatch)
+    s = repo.get_settings()
+    s["sms"] = {"webhook_url": "http://169.254.169.254/latest", "secret": "s",
+                "enabled": True, "hangup_enabled": False, "hangup_template": "",
+                "allow_private_webhook": True}
+    repo.save_settings(s)
+    r = client.post("/api/notify/sms", json={"to": "+8613800138000", "text": "hi"})
+    assert r.status_code == 502

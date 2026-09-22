@@ -1,0 +1,156 @@
+{
+  "schemaVersion": "mimosa-suppressions/v1",
+  "note": "Mimosa 扫描审定清单（家族级规则）。纪律：不宣称项目安全；每条带 evidence 锚；新扫描跑 scripts/mimosa_triage.py 看增量。verdict ∈ false-positive（证据充分的误阳）/ accepted-risk（知情接受，带理由与条件）/ fixed（本轮已修，复扫应消失或降级）。",
+  "meta": {
+    "seedScanId": "scan-2026-09-22T15-35-03.291Z-44f1c2c94126",
+    "seedScanSeal": "sha256:dafd665318353df2943dfd6fb444377ff50bfaeb70e4d3ea3ac23df479dfbcef",
+    "seedFindingCount": 88,
+    "dependencyAdvisories": {
+      "mimosaOfflineAdvisory": "1 包 2 条（产物未具名）",
+      "disposition": "accepted-risk：2026-09-23 对 apps/web 与 services/realtime-translation 两份 package-lock 跑 npm audit --package-lock-only 均报 0 vulnerabilities——钉死版本在权威活源查无已知漏洞，Mimosa 离线库命中无法复现；后续锁定版本升级时随 CI 复核"
+    },
+    "advisories": [
+      "tts_cache sha1 缓存键（hook 侧弱算法告警）：内容寻址缓存键非安全边界，换 sha256 将作废全部已钉罐头（greetings/fillers/qa）——accepted-risk，勿顺手改",
+      "logger.ts trace id 的 Math.random 回退：非凭据（主路径 crypto.randomUUID）——accepted-risk",
+      "probe_cloud_asr_ab CLOUD_URL：云端 ASR API 客户端（官方端点默认+key），未上环回闸——候选后续用 assert_public_http_url 档加固",
+      "node_handshake_smoke：CI 基建脚本（workflow 注入云 CP 地址，受信 CI 面），不上环回闸"
+    ]
+  },
+  "rules": [
+    {
+      "id": "fp-cp-middleware-business",
+      "publicClass": "business-logic-risk",
+      "path_glob": "apps/control-plane/*",
+      "verdict": "false-positive",
+      "reason": "NestJS 视角扫描器看不见 FastAPI 中间件闸链（identity_gate/_gate_page/require_role/auto_gate_management/deny_cross_account）；§50 已逐条核验，tests/test_route_gate_coverage.py 把全路由闸链变成仓库自证",
+      "evidence": "tests/test_route_gate_coverage.py; security/route-gates.json; docs/superpowers/plans/2026-09-21-a-line-speed-asr-decision-verification.md §50"
+    },
+    {
+      "id": "fixed-scripts-urlguard-gate",
+      "publicClass": "ssrf",
+      "path_glob": "scripts/*",
+      "verdict": "fixed",
+      "reason": "探针/e2e/load 族出站基址已过 urlguard 本地诊断白名单（erc 底座 import 期闸+22 脚本直改；云端测试 BOK_PROBE_EXTRA_HOSTS 显式 opt-in）",
+      "evidence": "scripts/urlguard_gate.py; scripts/e2e_real_customer.py; tests/test_urlguard.py"
+    },
+    {
+      "id": "fixed-scripts-cp-api-entries",
+      "publicClass": "other-security",
+      "path_glob": "scripts/*",
+      "verdict": "fixed",
+      "reason": "『_cp/_api 是 ssrf 入口』=同族脚本出站面，已由 urlguard gate 覆盖（同 fixed-scripts-urlguard-gate）",
+      "evidence": "scripts/urlguard_gate.py; scripts/e2e_campaign.py; scripts/probe_branch_action.py"
+    },
+    {
+      "id": "fp-scripts-pcm-constants",
+      "publicClass": "path-traversal",
+      "path_glob": "scripts/*",
+      "verdict": "false-positive",
+      "reason": "read_pcm16 的文件名全部来自脚本内常量表/固定 fixtures 目录，无用户输入路径",
+      "evidence": "scripts/load_audio_concurrency.py:44 起 read_pcm16 定义与常量调用点"
+    },
+    {
+      "id": "fixed-node-agent-outbound",
+      "publicClass": "ssrf",
+      "path_glob": "tools/node_agent.py",
+      "verdict": "fixed",
+      "reason": "启动期 validate_cp_base（--cp-url 与生效 env 两面）+ _OPENER 禁随重定向（Bearer 不外送）+ _http_download dest 绝对路径无 '..' 断言",
+      "evidence": "tools/node_agent.py (_NoRedirect/validate_cp_base); tests/test_node_agent_urlguard.py"
+    },
+    {
+      "id": "fixed-node-agent-download-path",
+      "publicClass": "path-traversal",
+      "path_glob": "tools/node_agent.py",
+      "verdict": "fixed",
+      "reason": "下载 dest 断言（绝对路径+无 '..'）+ version 正则白名单（既有）双护栏",
+      "evidence": "tools/node_agent.py _http_download; tests/test_node_agent_urlguard.py::test_http_download_rejects_relative_or_traversal_dest"
+    },
+    {
+      "id": "fixed-rt-provider-guards",
+      "publicClass": "ssrf",
+      "path_glob": "services/realtime-translation/*",
+      "verdict": "fixed",
+      "reason": "ASR/TTS/LLM 三 provider 构造期 assertLocalDiagUrl（fail-fast）+ loadTtsVoices 守卫拒=同款降级不崩",
+      "evidence": "services/realtime-translation/src/lib/url-guard.js; test/url-guard.test.js"
+    },
+    {
+      "id": "fixed-cp-env-urls",
+      "publicClass": "ssrf",
+      "path_glob": "apps/control-plane/*",
+      "verdict": "fixed",
+      "reason": "唯一服务端可触发 sink=短信 webhook，已保存期全验（DNS）+发送期复验（字面量）双重校验+allow_private_webhook 显式放行口（元数据段恒拒）；其余 ssrf 面=env 派生内部端点（qwen3-tts/livekit API），由运维 env 白名单面管治",
+      "evidence": "apps/control-plane/control_plane/main.py put_settings/_send_sms_webhook; tests/test_notify_skeleton.py 组10"
+    },
+    {
+      "id": "fp-bok-cli-loopback",
+      "path_glob": "tools/bok.py",
+      "verdict": "false-positive",
+      "reason": "operator CLI 对本栈环回端点的探活/健康检查（_probe_llm/_relaxed_healthy/_api/_cp 家族，跨 ssrf/other-security 两类锚）；_NoRedirect 禁随重定向先例在位",
+      "evidence": "tools/bok.py _NoRedirect/_MONITOR_CP_ACTIVE_URL 编译期钉死环回常量"
+    },
+    {
+      "id": "fp-agent-sidecar-taint",
+      "publicClass": "other-security",
+      "path_glob": "apps/agent/*",
+      "verdict": "false-positive",
+      "reason": "『疑似跨文件污点』=env→sidecar 端点（QWEN3_TTS/ASR_BASE_URL 等）——端点由 bok serve 单点注入/运维 env 面配置，非远端用户输入",
+      "evidence": "tools/bok.py _FORWARD_ENV 注入面; tests/test_forward_env.py"
+    },
+    {
+      "id": "accepted-knowledge-source-fetch",
+      "publicClass": "other-security",
+      "path_glob": "apps/control-plane/*",
+      "verdict": "accepted-risk",
+      "reason": "main.py→markdown_source 的污点=知识库源抓取特性（URL 来自 admin 配置的知识源）；管理面配置+权限闸在位。后续候选：抓取前复用 urlguard 公网守卫",
+      "evidence": "packages/knowledge markdown_source 适配器; §50 知识抓取=配置型适配器核验"
+    },
+    {
+      "id": "fp-sidecar-taint",
+      "publicClass": "other-security",
+      "path_glob": "services/qwen3-tts-sidecar/*",
+      "verdict": "false-positive",
+      "reason": "sidecar 内 env 配置端点（bok serve 单点注入），无远端输入面",
+      "evidence": "tools/bok.py _start_proc spec env"
+    },
+    {
+      "id": "fixed-tts-cache-key",
+      "publicClass": "path-traversal",
+      "path_glob": "apps/agent/*",
+      "verdict": "fixed",
+      "reason": "_pcm_path/_meta_path 键形状断言（sha1 hex 40 位）——穿越段在拼路径前 ValueError；调用链 key 全出 cache_key",
+      "evidence": "apps/agent/agent_runtime/tts_cache.py _assert_hex_key; tests/test_tts_cache.py::test_malformed_key_rejected_before_path_join"
+    },
+    {
+      "id": "fp-filler-random",
+      "publicClass": "insecure-randomness",
+      "path_glob": "apps/agent/*",
+      "verdict": "false-positive",
+      "reason": "垫话池条目选取/gap 时长的业务随机，非安全语义；secret 生成面全用 secrets/uuid4",
+      "evidence": "apps/control-plane/control_plane/auth.py secrets; packages/business-db nodes_store.py"
+    },
+    {
+      "id": "fixed-web-intent-id",
+      "publicClass": "insecure-randomness",
+      "path_glob": "apps/web/*",
+      "verdict": "fixed",
+      "reason": "genGraphId 已删 Math.random 回退（crypto 缺席=明确抛错）；logger trace id 回退=非凭据 accepted（见 meta.advisories）",
+      "evidence": "apps/web/lib/intent-table.ts genGraphId; apps/web/test/intent-table.test.mjs"
+    },
+    {
+      "id": "fp-scripts-random",
+      "publicClass": "insecure-randomness",
+      "path_glob": "scripts/*",
+      "verdict": "false-positive",
+      "reason": "诊断脚本的测试数据节拍/采样抖动随机（erc 语音间隔、interp 推流 jitter、阈值重拟合采样），非安全语义",
+      "evidence": "scripts/e2e_real_customer.py; scripts/probe_interp_continuous.py; scripts/r2_threshold_refit.py"
+    },
+    {
+      "id": "accepted-knowledge-source-ssrf",
+      "publicClass": "ssrf",
+      "path_glob": "packages/knowledge/*",
+      "verdict": "accepted-risk",
+      "reason": "markdown_source=知识库源抓取适配器（URL 来自 admin 配置的知识源，抓取即特性）；管理面权限闸在位。后续候选：抓取前复用 urlguard 公网守卫",
+      "evidence": "packages/knowledge/bok_voice_knowledge/markdown_source.py; §50 配置型适配器核验"
+    }
+  ]
+}

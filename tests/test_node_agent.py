@@ -13,7 +13,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
-from node_agent import (
+import node_agent  # noqa: E402
+from node_agent import (  # noqa: E402
     NodeConfig,
     build_ui_server,
     dispatch_commands,
@@ -21,6 +22,17 @@ from node_agent import (
     should_refuse_jobs,
     write_ui_config,
 )
+
+
+class _FakePostOpener:
+    """出站桩（2026-09-23，SSRF 修复配套）：node_agent 出站统一走 ``_OPENER``
+    （禁随重定向面）——旧 ``urlopen`` 桩不再被路径触达，桩钉在 ``.open`` 上。"""
+
+    def __init__(self, fn):
+        self._fn = fn
+
+    def open(self, req, timeout=None):
+        return self._fn(req, timeout)
 
 
 def _cfg(**kw) -> NodeConfig:
@@ -52,7 +64,13 @@ def test_heartbeat_once_posts_bearer_and_parses_commands():
         return R()
 
     cfg = _cfg(version="v0.3.0")
-    with patch("node_agent.urllib.request.urlopen", fake_urlopen):
+    # 出站统一走 _OPENER（2026-09-23 SSRF 修复：禁随重定向）——桩钉在
+    # _OPENER.open 上（旧 urlopen 桩不再被路径触达）。
+    class _FakeOpener:
+        def open(self, req, timeout=None):
+            return fake_urlopen(req, timeout)
+
+    with patch.object(node_agent, "_OPENER", _FakeOpener()):
         ok, resp = heartbeat_once(
             cfg, metrics={"gpu": 0.5},
             acks=[{"id": "c1", "ok": False, "result": "boom"}])
@@ -298,7 +316,7 @@ def test_upload_recent_logs_bundles_and_posts(tmp_path, monkeypatch):
         captured["payload"] = req.data
         return FakeResp()
 
-    monkeypatch.setattr("node_agent.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(node_agent, "_OPENER", _FakePostOpener(fake_urlopen))
     err = upload_recent_logs(cfg, log_dir=log_dir, stack_dir=stack_dir)
     assert err == ""
     assert captured["url"] == "http://cp.test/api/nodes/logs"
@@ -331,7 +349,7 @@ def test_upload_recent_logs_http_error_returns_reason(tmp_path, monkeypatch):
     def raise_http(req, timeout=0):
         raise urllib.error.HTTPError(req.full_url, 413, "too large", None, None)
 
-    monkeypatch.setattr("node_agent.urllib.request.urlopen", raise_http)
+    monkeypatch.setattr(node_agent, "_OPENER", _FakePostOpener(raise_http))
     err = upload_recent_logs(cfg, log_dir=log_dir)
     assert err == "upload failed: HTTP 413"
 

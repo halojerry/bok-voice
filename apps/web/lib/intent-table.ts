@@ -66,14 +66,18 @@ export function isCatchallId(id: unknown): boolean {
 }
 
 /**
- * 新建 id（crypto 随机）：CP `_ID_RE` 只收 `int_`/`bnd_` + 8 位小写 hex，Math.random 不达标。
- * 非加密环境（无 crypto.getRandomValues）退 Math.random——测试/旧浏览器可用，id 唯一性足够。
+ * 新建 id（crypto 随机）：CP `_ID_RE` 只收 `int_`/`bnd_` + 8 位小写 hex。
+ * 2026-09-23（Mimosa insecure-randomness 修复）：删 Math.random 回退——目标
+ * 环境（现代浏览器/node）恒有 crypto.getRandomValues；缺失=运行环境不支持，
+ * 明确抛错好过静默降级成可预测 id。id 进 CP 且有 _ID_RE 形状校验兜底。
  */
 export function genGraphId(prefix: "int_" | "bnd_"): string {
-  const bytes = new Uint8Array(4);
   const c = (globalThis as { crypto?: Crypto }).crypto;
-  if (c && typeof c.getRandomValues === "function") c.getRandomValues(bytes);
-  else for (let i = 0; i < 4; i++) bytes[i] = Math.floor(Math.random() * 256);
+  if (!c || typeof c.getRandomValues !== "function") {
+    throw new Error("crypto.getRandomValues unavailable — cannot generate graph id");
+  }
+  const bytes = new Uint8Array(4);
+  c.getRandomValues(bytes);
   return prefix + Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 

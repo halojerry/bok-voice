@@ -50,6 +50,9 @@ import httpx
 ROOT = Path(__file__).resolve().parents[1]
 TTS_URL = os.environ.get("TTS_URL", "http://127.0.0.1:8788")
 ASR_URL = os.environ.get("QWEN3_ASR_BASE_URL", "http://127.0.0.1:8787")
+from urlguard_gate import gate  # SSRF 守卫（2026-09-23，Mimosa）：云端测试设 BOK_PROBE_EXTRA_HOSTS
+
+gate(TTS_URL, ASR_URL)
 VOICE = os.environ.get("BOK_MOCK_CUSTOMER_VOICE", "Vivian")
 SR = 16000
 WIN_MS = 32  # VAD 推理窗

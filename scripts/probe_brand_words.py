@@ -41,6 +41,9 @@ from livekit import rtc
 ROOT = Path(__file__).resolve().parents[1]
 CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
 TTS_URL = os.environ.get("TTS_URL", "http://127.0.0.1:8788")
+from urlguard_gate import gate  # SSRF 守卫（2026-09-23，Mimosa）：云端测试设 BOK_PROBE_EXTRA_HOSTS
+
+gate(CONTROL_PLANE_URL, TTS_URL)
 TAG = os.environ.get("PROBE_TAG", "baseline")
 
 # 品牌句：词内含三字品牌词，粤/普各两条；品牌词放句中（最易被切的位置）。

@@ -4354,6 +4354,87 @@ D 无 LiveKit 凭据 token 50 发全干净 503（无 500/挂起）。
 改计 `mute` 并逐行打印 MUTE road/turn）——run 1 那种「一路全哑 headline PASS」
 不再可能。离线验证判据表达式（构造含 None 轮的 results 分类正确）。
 
+## 52. Mimosa 审计修复（2026-09-23，PR #150 合并后基线 scan-…44f1c2c94126）
+
+分支 `security/mimosa-remediation`（b1c5f51 切出）。五相全部落地：
+
+### 52.1 依赖 advisory（Phase 0）
+
+两份 node lockfile `npm audit --package-lock-only` 均 **0 vulnerabilities**——
+Mimosa 离线库命中的 1 包 2 条在权威活源复现不出，处置=accepted-risk（随锁
+文件升级在 CI 复核）。Python 侧 range 无锁不动运行时（constraints 钉版留
+follow-up）。
+
+### 52.2 共享守卫（Phase 1-2）
+
+- `packages/core/bok_voice_core/urlguard.py`：`assert_public_http_url`（外部
+  端点：scheme+DNS/字面量地址段，云元数据恒拒，`allow_private` 实验室口）+
+  `assert_local_diag_url`（环回白名单 ∪ `BOK_PROBE_EXTRA_HOSTS` 显式扩展）。
+  发现并堵了一个真形状洞：**裸 IPv6（`http://fe80::1/x`）被 urlsplit 劈成
+  host="fe80" 流进 DNS 路径**——形状门直接拒（bracketed 才收）。JS 侧
+  Node 的 `URL.hostname` 保留方括号与 Python 相反，镜像模块统一剥。
+- **CP 短信 webhook（25 条 SSRF 里唯一实质 sink）**：保存期全验（DNS）+
+  发送期复验（字面量，不阻塞结算钩子）双重校验；`allow_private_webhook`
+  设置开关（默认 False）；元数据段无口子。
+- **node_agent**：启动期 `validate_cp_base`（--cp-url 与生效 env 两面，坏配置
+  FATAL）+ `_NoRedirect` opener（心跳/日志/下载三面 Bearer 不跟随重定向——
+  bok.py 同款先例）+ `_http_download` dest 绝对路径无 '..' 断言。
+- **realtime-translation**：ASR/TTS/LLM 三 provider 构造期 assertLocalDiagUrl
+  fail-fast；loadTtsVoices 守卫拒=同款降级不崩。
+- **tts_cache**：`_pcm_path/_meta_path` 键形状断言（sha1 hex 40 位）——穿越
+  段在拼路径前 ValueError。SHA1 缓存键本身=内容寻址非安全边界，换 sha256
+  作废全部已钉罐头，accepted-risk（hook 告警已记 suppressions meta）。
+- **web**：`genGraphId` 删 Math.random 回退（crypto 缺席=明确抛错）；
+  logger trace-id 回退=非凭据 accepted。
+
+### 52.3 脚本面扫荡（Phase 3）
+
+`scripts/urlguard_gate.py` 单点（自举 packages/core，gate=白名单不过即
+stderr+SystemExit(2)）+ **erc 底座 import 期闸**（5 个复用者自动继承）+
+22 脚本直改 = **27 脚本覆盖**（全部 env 可配出站基址：CP 族/sidecar 族/LLM
+族）。云端 CP/LLM 真栈测试迁移口=`BOK_PROBE_EXTRA_HOSTS=host1,host2` 显式
+opt-in（gate 的 stderr 自带提示）。`tests/conftest.py` 补 scripts/ 路径
+（按路径 exec_module 的测试加载器此前没有它）。
+
+**未接入长尾（知情记账）**：probe_cloud_asr_ab（云端 ASR API 客户端，候选
+后续用公网档守卫）、node_handshake_smoke（CI 基建，workflow 注入受信云 CP
+地址）、固定字面量端点脚本（e2e_http/probe_stimulus/interp 族——无 env 面
+即无配置 SSRR 面）、自带守卫四件（snippet_seed_mining/probe_mt_*/
+probe_intent_mine/probe_cache_discipline/probe_gpu_contention）。
+
+### 52.4 误阳治理制度化（Phase 4）
+
+- `security/mimosa/suppressions.json`：**家族级**规则 18 条（publicClass+路径
+  glob→verdict/reason/evidence）覆盖密封扫描全部 88 条；`scripts/mimosa_triage.py`
+  对任意 findings.json 打增量（exit 2=有未审）——**下次扫描只审新增量**。
+- `security/route-gates.json` + `scripts/gen_route_gates.py` +
+  `tests/test_route_gate_coverage.py`：**112 路径**（141 路由对象按 path 聚合）
+  逐条闸链登记（启发式 12 标记 + 4 条豁免人工审定；生成器保留人工审跨再生
+  成）——「扫描器看不见 FastAPI 中间件」从 §50 的文档核验升级为 CI 红绿资产。
+  实审补齐三类启发式盲区：`_require_user_admin`（users 族）、共用助手
+  `_campaign_transition`（campaigns 启停三兄弟）、`resolve_node_token`
+  （节点工件/日志自证）。
+- **过程事故（零丢失）**：验证「ws.test.js 失败是否预存」时用了 `git stash`
+  ——本仓 stash 是**仓库级共享**（非 per-worktree），我的树本无 tracked 改动
+  →「stash 空」+「pop」弹掉了别会话的 `stash@{0}`（feat/saas-delivery-rework
+  的 w1w2-observability-linux）半途冲突失败。恢复：洒出的 tracked 改动
+  reset 回 HEAD、洒出的 untracked 文件定点 rm（原内容都在**未被 drop 的**
+  stash@{0} 里，事后验证仍在）；我方 4 文件幸存。**立法：本仓多会话形态
+  禁用 `git stash` 做验证**，预存性判定走 CI 历史或 worktree 对照。
+  （ws.test.js 失败根因=worktree 没跑 npm ci，装上后 14/14 全绿。）
+
+### 52.5 验证与收尾（Phase 5，全绿）
+
+- 全量 pytest **2707 passed / 0 failed**（基线 2656 + 新增 51：urlguard 16、
+  node_agent 守卫 5、notify 组10 五条、tts_cache 键断言、路由闸覆盖 4、
+  node_agent 出站桩改钉 _OPENER 三条等）；web `tsc`+静态导出 build 绿；
+  realtime-translation node --test 14/14。
+- **复扫**（scan-2026-09-22T16-34-40.706Z-7bc1fd9de1db，seal sha256:1d0a3e76…）
+  ：88 → **84 条**，`mimosa_triage.py` 对新扫描 **84/84 全命中、零未审增量、
+  exit=0**——修复族（CP webhook/node_agent 出站/RT providers/tts_cache 键/
+  intent-id）的 finding 在新扫描里**直接消失**（守卫改变了污点路径）；
+  依赖 advisory 仍 1 包 2 条（活源复现不出，处置不变）。
+
 
 
 

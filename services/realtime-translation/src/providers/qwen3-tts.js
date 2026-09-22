@@ -2,6 +2,8 @@
 // (shared protocol with the A-line agent) and slices the returned PCM into
 // scheduler chunks. No CosyVoice in the B-line path, per plan.
 
+import { assertLocalDiagUrl } from "../lib/url-guard.js";
+
 const DEFAULT_OPTS = {
   baseUrl: "http://127.0.0.1:8788",
   sampleRate: 24000,
@@ -20,6 +22,9 @@ export class Qwen3TTSProvider {
   constructor(opts = {}) {
     this.opts = { ...DEFAULT_OPTS, ...opts };
     this.baseUrl = this.opts.baseUrl.replace(/\/$/, "");
+    // SSRF 守卫（2026-09-23，Mimosa 修复）：构造期校验 baseUrl——只放行
+    // http(s)+环回（云端/内网端点经 BOK_RT_EXTRA_HOSTS 显式扩展），fail-fast。
+    assertLocalDiagUrl(this.baseUrl);
   }
 
   async synthesize(text, targetLang) {

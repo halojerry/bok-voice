@@ -35,6 +35,13 @@ CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
 TTS_URL = os.environ.get("TTS_URL", "http://127.0.0.1:8788")
 LOG_PATH = Path.home() / "Library" / "Application Support" / "BokVoice" / "logs" / "agent.log"
 
+# SSRF 守卫（2026-09-23，Mimosa 修复）：本模块是 soak/branch/flow_graph/
+# qa_phonetic 等探针的共享底座——import 期对两个出站基址过本地诊断白名单，
+# 复用者自动继承（云端测试设 BOK_PROBE_EXTRA_HOSTS 显式扩展）。
+from urlguard_gate import gate  # noqa: E402
+
+gate(CONTROL_PLANE_URL, TTS_URL)
+
 # 机器通道鉴权（e2e_barge_in 同款惯例）：auth-on 栈/隔离 CP 必须带，未设 env 时
 # 头为空=与旧 auth-off 栈逐字节同行为。soak 族（offscript/latency）共享本底座。
 _CP_HEADERS: dict[str, str] = {}

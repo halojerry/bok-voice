@@ -272,6 +272,10 @@ class SmsSettingsModel(BaseModel):
     enabled: bool = False
     hangup_enabled: bool = False
     hangup_template: str = ""
+    # SSRF 守卫放行口（2026-09-23，Mimosa 修复）：实验室私网/环回网关显式放行；
+    # 云元数据段（link-local）无口子恒拒。默认 False=启用中的 webhook 只许公网端点
+    # （保存期+发送期双重校验，见 main.put_settings/_send_sms_webhook）。
+    allow_private_webhook: bool = False
 
 
 class SettingsRequest(BaseModel):
