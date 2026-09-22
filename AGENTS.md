@@ -11,6 +11,7 @@ Contributor guide for **Bok Voice**, a local-first voice customer-service assist
 - `services/` — local sidecars: Qwen3-ASR (:8787), Qwen3-TTS (:8788), realtime-translation worker (:8790), LiveKit server config.
 - `tools/node_agent.py` — 薄节点守护（心跳/commands/UI :3000 托管/全栈拉起）。
 - `tools/bok.py` — single orchestrator: `serve`, `status`, `down`, `doctor`, `download`.
+- **Windows 定位（2026-09-22 软退役）**：Windows=仅浏览器访问 web UI，节点运行时只支持 mac/Linux；Windows 节点形态退役（软退役：运行时代码与 nt 分支保留、CI 停出 Windows 包——`release.yml` matrix 与 `node-handshake.yml` windows job 已删，Windows 装机脚本标 DEPRECATED unmaintained，见 `docs/WINDOWS_CHECKLIST.md` 搁置注）。
 - `tests/`, `services/realtime-translation/test`, `scripts/` — Python/Node suites and CI helpers.
 
 ## Build, Test, and Development Commands

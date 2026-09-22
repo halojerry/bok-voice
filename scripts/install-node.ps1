@@ -1,3 +1,9 @@
+# =====================================================================
+# DEPRECATED 2026-09-22: Windows 节点形态退役（软退役）。Windows 定位=仅
+# 浏览器访问 web UI，节点运行时只跑 macOS/Linux；本脚本保留不再维护、
+# CI 已停出 Windows 包（release.yml matrix / node-handshake.yml windows
+# job 已删）。新部署勿用。
+# =====================================================================
 # 薄节点部署脚本 Windows/CUDA 档（spec §11.2；正式版 P2 出离线包 + 服务模板）。
 # 用法: .\install-node.ps1 -CpUrl URL (-NodeToken TOK | -LicenseKey KEY) [-RepoRoot DIR] [-DryRun] [-SkipModels] [-LivekitUrl ws://<内网IP>:7880]
 #       .\install-node.ps1 -CpUrl URL -LicenseKey KEY [-DryRun] [-InstallService]  # license 流（加固云推荐）：自动注册，token 落状态文件复用
