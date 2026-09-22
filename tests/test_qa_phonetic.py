@@ -23,7 +23,7 @@ from bok_voice_core.qa_phonetic import (  # noqa: E402
 )
 
 
-def _yue_entry(eid: str, question: str, **extra) -> dict:
+def _cantonese_entry(eid: str, question: str, **extra) -> dict:
     entry = {
         "id": eid,
         "question_text": question,
@@ -67,7 +67,7 @@ def test_align_score_candidate_expansion_bridges_multireading():
 def test_phonetic_second_stage_hits_on_literal_miss(monkeypatch):
     monkeypatch.delenv("BOK_QA_PHONETIC", raising=False)
     monkeypatch.delenv("BOK_QA_PHONETIC_THRESHOLD", raising=False)
-    index = QaIndex([_yue_entry("q1", "要点样赔"), _yue_entry("q2", "咩快遞")])
+    index = QaIndex([_cantonese_entry("q1", "要点样赔"), _cantonese_entry("q2", "咩快遞")])
     entry, score = index.match("那你要怎么赔给我呢", lang="cantonese")
     assert entry is not None and entry["id"] == "q1"
     assert score >= DEFAULT_THRESHOLD
@@ -75,7 +75,7 @@ def test_phonetic_second_stage_hits_on_literal_miss(monkeypatch):
 
 def test_phonetic_recovers_homophone_and_fragment(monkeypatch):
     monkeypatch.delenv("BOK_QA_PHONETIC", raising=False)
-    index = QaIndex([_yue_entry("q1", "要点样赔"), _yue_entry("q2", "咩快遞")])
+    index = QaIndex([_cantonese_entry("q1", "要点样赔"), _cantonese_entry("q2", "咩快遞")])
     # 陪/赔 同音替换(真库实证 0.838,命中的是「赔」词条)
     entry, _score = index.match("你要怎么陪我呢", lang="cantonese")
     assert entry is not None and entry["id"] == "q1"
@@ -87,7 +87,7 @@ def test_phonetic_recovers_homophone_and_fragment(monkeypatch):
 def test_phonetic_kill_switch_off_is_byte_old_behavior(monkeypatch):
     monkeypatch.setenv("BOK_QA_PHONETIC", "0")
     assert qa_phonetic_enabled() is False
-    index = QaIndex([_yue_entry("q1", "要点样赔")])
+    index = QaIndex([_cantonese_entry("q1", "要点样赔")])
     assert index._phon == []  # noqa: SLF001 - kill 档不建音系索引
     entry, _score = index.match("那你要怎么赔给我呢", lang="cantonese")
     assert entry is None  # 字面 miss 即终局(旧行为)
@@ -97,7 +97,7 @@ def test_phonetic_threshold_env_gate(monkeypatch):
     monkeypatch.delenv("BOK_QA_PHONETIC", raising=False)
     monkeypatch.setenv("BOK_QA_PHONETIC_THRESHOLD", "0.99")
     assert qa_phonetic_threshold() == 0.99
-    index = QaIndex([_yue_entry("q1", "要点样赔")])
+    index = QaIndex([_cantonese_entry("q1", "要点样赔")])
     entry, _score = index.match("那你要怎么赔给我呢", lang="cantonese")
     assert entry is None
     # 坏值宽容回默认
@@ -107,14 +107,14 @@ def test_phonetic_threshold_env_gate(monkeypatch):
 
 def test_phonetic_cantonese_only_zh_never_triggers(monkeypatch):
     monkeypatch.delenv("BOK_QA_PHONETIC", raising=False)
-    index = QaIndex([_yue_entry("q1", "要点样赔")])
+    index = QaIndex([_cantonese_entry("q1", "要点样赔")])
     entry, _score = index.match("那你要怎么赔给我呢", lang="zh")
     assert entry is None  # zh 通话不做音系匹配(zh 线验证 NO-GO,无此档)
 
 
 def test_literal_hit_still_wins_over_phonetic(monkeypatch):
     monkeypatch.delenv("BOK_QA_PHONETIC", raising=False)
-    index = QaIndex([_yue_entry("q1", "要点样赔")])
+    index = QaIndex([_cantonese_entry("q1", "要点样赔")])
     entry, score = index.match("要点样赔", lang="cantonese")
     assert entry is not None and entry["id"] == "q1"
     assert score >= 0.90  # 字面直中,不走音系分
@@ -123,8 +123,8 @@ def test_literal_hit_still_wins_over_phonetic(monkeypatch):
 def test_phonetic_winner_resolves_to_cluster_head(monkeypatch):
     """音系胜者是变体 → 折组代表出场(与字面档同一条 _team_head 路,C1 同判据)。"""
     monkeypatch.delenv("BOK_QA_PHONETIC", raising=False)
-    head = _yue_entry("head1", "要点样赔")
-    variant = _yue_entry("var1", "怎么赔给我", cluster_head_id="head1")
+    head = _cantonese_entry("head1", "要点样赔")
+    variant = _cantonese_entry("var1", "怎么赔给我", cluster_head_id="head1")
     index = QaIndex([head, variant])
     entry, score = index.match("那你要怎么赔给我呢", lang="cantonese")
     assert entry is not None
@@ -134,7 +134,7 @@ def test_phonetic_winner_resolves_to_cluster_head(monkeypatch):
 
 def test_phonetic_respects_step_scope(monkeypatch):
     monkeypatch.delenv("BOK_QA_PHONETIC", raising=False)
-    scoped = _yue_entry("q1", "要点样赔", scope="step", step_index=3)
+    scoped = _cantonese_entry("q1", "要点样赔", scope="step", step_index=3)
     index = QaIndex([scoped])
     # 本轮无步骤上下文 → 条目被滤出,音系层不接盘(绝不比 match 命中面宽)
     entry, _score = index.match("那你要怎么赔给我呢", lang="cantonese")
@@ -145,7 +145,7 @@ def test_phonetic_respects_step_scope(monkeypatch):
 
 def test_no_cantonese_entries_no_phonetic_index(monkeypatch):
     monkeypatch.delenv("BOK_QA_PHONETIC", raising=False)
-    zh_only = _yue_entry("z1", "要怎么赔")
+    zh_only = _cantonese_entry("z1", "要怎么赔")
     zh_only["lang"] = "zh"
     index = QaIndex([zh_only])
     assert index._phon == []  # noqa: SLF001 - 无粤语条目不建音系索引(零成本)
