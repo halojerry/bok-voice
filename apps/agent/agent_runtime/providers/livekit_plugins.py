@@ -1418,6 +1418,13 @@ class _RepeatSelfGuardStream(llm.LLMStream):
 # 会被静默挤掉,档案失真。
 
 
+def _context_mem_legacy() -> bool:
+    """P1.2a(2026-09-21)记忆压缩 kill-switch:1=回旧档(drop-oldest+上限 1200)。
+
+    进 `_FORWARD_ENV`(tests/test_forward_env 门禁)。"""
+    return os.environ.get("BOK_CONTEXT_MEM_LEGACY", "") == "1"
+
+
 class ContextState:
     """Shared per-call context memory: per-turn knowledge + running summary.
 
@@ -1426,10 +1433,16 @@ class ContextState:
     message (top-K snippets + bounded conversation summary) each turn.
     """
 
-    def __init__(self, account_id: str = "", max_snippets: int = 2, max_summary_chars: int = 1200):
+    def __init__(self, account_id: str = "", max_snippets: int = 2, max_summary_chars: int = 0):
         self.account_id = account_id
         self._max_snippets = max_snippets
-        self._max_summary_chars = max_summary_chars
+        # P1.2a:显式传参(测试/嵌入方)优先;缺省按 kill-switch 定——新档 400
+        # (尾部有界=每轮新 prefill 有界,§48 P1),legacy 档回旧 1200。
+        self._max_summary_chars = (
+            max_summary_chars
+            if max_summary_chars > 0
+            else (1200 if _context_mem_legacy() else 400)
+        )
         self._snippets: list[str] = []
         self._summary_lines: list[str] = []
         self._user_lang: str = ""
@@ -1621,10 +1634,22 @@ class ContextState:
     def add_summary(self, role: str, text: str, max_char: int = 200) -> None:
         line = f"{role}: {str(text)[:max_char]}"
         self._summary_lines.append(line)
-        joined = "\n".join(self._summary_lines)
-        while len(joined) > self._max_summary_chars and len(self._summary_lines) > 1:
-            self._summary_lines.pop(0)
+        # P1.2a(2026-09-21,§48 P1「恒定轮延迟」):尾部=每轮新 prefill 的全部成本
+        # (§46.1 受控实验:638 字尾≈1.1s/轮、876 字≈1.6s/轮,单调涨)——记忆行是
+        # 唯一单调增长项。改**滚动压缩**:超上限时把最旧两行各取前半并成一行
+        # (信息密度翻倍而非整行丢弃),行数有界→尾部字数有界→每轮 TTFT 有界。
+        # kill-switch `BOK_CONTEXT_MEM_LEGACY=1` 回旧「drop-oldest」档(上限同旧 1200)。
+        cap = self._max_summary_chars
+        while len(self._summary_lines) > 1:
             joined = "\n".join(self._summary_lines)
+            if len(joined) <= cap:
+                break
+            if _context_mem_legacy():
+                self._summary_lines.pop(0)
+            else:
+                old = self._summary_lines
+                merged = (old[0][:80].rstrip() + "；" + old[1][:80].rstrip())[:180]
+                old[0:2] = [merged]
 
     def render_system_message(self) -> str:
         """完整 system 段（兼容旧调用/测试）：稳定指令前缀 + 易变参考尾部。"""
