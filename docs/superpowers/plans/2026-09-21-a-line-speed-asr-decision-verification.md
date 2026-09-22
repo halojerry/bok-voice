@@ -4076,6 +4076,14 @@ qwen3_5 混合注意力的 cache 是 ArraysCache **不可 trim**（mlx-lm 源码
 
 ### P2 意图串通（钥匙；CP+core+web 三 subagent 并行，3-5 天）
 
+> **P2.1 已跑（同日，subagent）：PASS（薄）**——`scripts/probe_intent_mine.py`
+> 真库 dry-run（模板 febeeeebac97/105 通/300 条客户话，9B@:1237）：
+> **29 意图 ≥8 ✓、覆盖 64.0% ≥60% ✓**；sensitivity：8 词截断/去 top1 意图
+> 均落 59%——PASS 挂在跨批关键词并集上。9B 上限位实锤：10 批 2 批解析零
+> （截断/失控每话一意图）、跨批重名（session_affirm/confirm）、平台提及缺口
+> （拼多多/京东 7 条）——**下轮迭代=去重合并+平台意图钉死+人审后才入图**。
+> 报告 `reports/intent-mine/`（gitignore 内，数据面不入库）。
+
 1. **探针先行（可与 P0 并行）**：全局沉淀 dry-run——真库 turns 按模板分组 →
    9B（:1237）挖掘 → 主用模板 1 张的意图候选（keywords=客户原话）；门槛=
    **候选意图 ≥8 个、关键词在真实转写回放覆盖 ≥60%**（离线 eval 同
