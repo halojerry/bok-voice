@@ -1376,6 +1376,9 @@ _FORWARD_ENV = (
     "BOK_FLOW_GRAPH_JUDGE",
     # —— 意向规则挂断评估(W4-T2,2026-09-19:0=关,挂断走原 disposition) ——
     "BOK_INTENT_RULES",
+    # —— 意图喂下游(P2.4,2026-09-21:0=关;默认 1——当轮意图进 LLM 尾部
+    #    【客户意图】行 + 垫话类别提示;0=set no-op/行消失,字节同旧) ——
+    "BOK_INTENT_CONTEXT",
     "BOK_QA_ROTATION",
     "BOK_QA_PRIORITY",
     "BOK_QA_FASTPATH",

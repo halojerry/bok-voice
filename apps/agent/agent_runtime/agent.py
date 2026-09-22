@@ -38,7 +38,7 @@ from .plugins.knowledge import KnowledgePlugin
 from .plugins.settlement import SettlementTrigger
 from .providers.registry import build_provider_registry
 from .control_plane import ControlPlaneClient
-from .fillers import FillerDirector
+from .fillers import FillerDirector, intent_category_hint
 from .qa_gate import (
     QaIndex,
     pick_rotation_member,
@@ -734,6 +734,58 @@ def _intent_facts_snapshot(
     for verdict_name, fact_key in _VERDICT_FACT_KEYS.items():
         snap[fact_key] = int(counts.get(verdict_name) or 0)
     return snap
+
+
+def _intent_context_enabled() -> bool:
+    """P2.4(2026-09-21,§48)意图喂下游 kill-switch:默认 "1",`0` 全关。
+
+    关时 LLM 尾部【客户意图】行不写不渲染、垫话类别提示不下发(字节同旧)。
+    进 `_FORWARD_ENV`(tests/test_forward_env 门禁)。
+    """
+    return os.environ.get("BOK_INTENT_CONTEXT", "1") == "1"
+
+
+def _intent_display_name(flow_ctrl, intent_id: str) -> str:
+    """当轮具名意图 id → 展示名(纯函数,离线可测;P2.4 意图喂下游)。
+
+    两类来源统一出口:graph 意图(`flow_ctrl.graph.intent_by_id(id).label`,含兜底
+    `"*"` 的 label)优先,系统意图(`flow.SYSTEM_INTENTS[id].name`)兜底;都查不到
+    → 原样回 id(非空即有用信号)。空 id → 空串。异常一律吞掉回 id/空串(观测位,
+    绝不阻通话)。
+    """
+    iid = str(intent_id or "").strip()
+    if not iid:
+        return ""
+    try:
+        gi = flow_ctrl.graph.intent_by_id(iid) if flow_ctrl is not None else None
+        if gi is not None:
+            return str(getattr(gi, "label", "") or "") or iid
+    except Exception:  # noqa: BLE001 - 观测位:图查名失败唔阻回复
+        pass
+    try:
+        from .flow import SYSTEM_INTENTS
+
+        si = SYSTEM_INTENTS.get(iid)
+        if si is not None:
+            return str(getattr(si, "name", "") or "") or iid
+    except Exception:  # noqa: BLE001
+        pass
+    return iid
+
+
+def _turn_intent_id(gbinding, gcatchall, flow_ctrl) -> str:
+    """当轮意图 id 取序(纯函数):graph 常规命中 → 图兜底命中 → 规则归类。
+
+    `gcatchall` 只在本轮常规意图空手时被 agent 暂存(兜底派发让位 QA 快路后置),
+    故「常规命中优先、兜底补位」与派发 precedence 一致;两者皆空取
+    `flow_ctrl.last_rule_intent`(flow P2.3 清空式归类位,可能为 "")。
+    """
+    iid = str(getattr(gbinding, "intent", "") or "") if gbinding is not None else ""
+    if not iid and gcatchall is not None:
+        iid = str(getattr(gcatchall, "intent", "") or "")
+    if not iid:
+        iid = str(getattr(flow_ctrl, "last_rule_intent", "") or "")
+    return iid
 
 
 def evaluate_intent_disposition(
@@ -4419,6 +4471,12 @@ async def entrypoint(ctx):
                             print(f"[whatsapp] {_kind} num={_num or '-'} (call {room_name})", flush=True)
             except Exception:  # pragma: no cover - WhatsApp 偵測失敗唔阻斷
                 pass
+            # 意图归类喂下游(P2.4,§48):detect 结果 → flow 具名意图归类位(纯观测,
+            # None 也传=清位)。P2.3 留的 agent 侧接线点;不改 detect/上报任何行为。
+            try:
+                flow_ctrl.note_wa_signal(_wa_signal)
+            except Exception:  # pragma: no cover - 归类失败唔阻回复
+                pass
             # 会中事实沉淀(R4):客户话里的平台/号码抽进尾部【通话中客户已讲】
             # (去重有界 ≤4 条)——早轮事实唔再随滚动记忆/历史截断蒸发,
             # 模型唔会重复问已答过的事(call-701c180b 同一问三遍实证)。
@@ -5262,6 +5320,28 @@ async def entrypoint(ctx):
             # 走到这=本轮走 LLM 正常回复路径(话术直念/暂停/跳过都已在前面拦截)
             # → 起垫话定时器:回复首音频 ~700ms 未到才播,快轮零打扰(closing/WA
             # 步由开火前 guards 复核兜住)。
+            # ---- 意图喂下游(P2.4,§48):当轮意图 → LLM 尾部【客户意图】行 +
+            # 垫话类别提示。取序=graph 常规命中 → 图兜底派发 → 规则归类
+            # (flow_ctrl.last_rule_intent);位置在 graph/兜底派发**之后**、
+            # `_filler.arm()` **之前**(hint 须先于 arm 落 pending,否则本轮垫话
+            # 拿不到提示)。kill-switch BOK_INTENT_CONTEXT=0 → 两面皆关(set 不调、
+            # 提示不下发,字节同旧)。
+            if _intent_context_enabled():
+                _turn_intent = _turn_intent_id(_gbinding, _gcatchall_stash, flow_ctrl)
+                _turn_intent_text = _intent_display_name(flow_ctrl, _turn_intent)
+                # set_customer_intent **每轮覆盖**(空=清位):不调用会令上一轮意图
+                # 残留,下一轮任何实质变化触发全量尾部时带出误导信号(见 ContextState
+                # 文档「每轮覆盖」语义)。
+                try:
+                    context_state.set_customer_intent(_turn_intent_text)
+                except Exception:  # noqa: BLE001 - 观测位失败绝不阻回复
+                    pass
+                _hint_cat = intent_category_hint(_turn_intent)
+                if _hint_cat:
+                    try:
+                        _filler.hint_category(_hint_cat)
+                    except Exception:  # noqa: BLE001
+                        pass
             _filler.arm()
 
         async def _try_append_user_message(self, new_message) -> bool:

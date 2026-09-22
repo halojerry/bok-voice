@@ -215,6 +215,26 @@ def classify_filler_category(user_text: str) -> str:
     return "default"
 
 
+# 具名系统意图 id → 垫话类别提示(P2.4 意图喂下游,spec §48)。确定性映射、无正则
+# 无 LLM——规则归类(flow.SYSTEM_INTENTS)比字面分类器更可靠:客户原话经 ASR
+# 碎裂/同音滑失后分类器常归错,而规则 verdict 直接钉住语义。只覆盖语义无歧义四族,
+# 其余(refuse/farewell/repeat/whatsapp/…)不提示,交回字面分类器。
+_INTENT_CATEGORY_HINT: dict[str, str] = {
+    "sys_objection": "empathy",  # 否认/异议/质疑 → 先安抚
+    "sys_confirm": "ack",        # 应承确认 → 确认接收
+    "sys_question": "check",     # 提问/要解释 → 承诺查证
+    "sys_defer": "ack",          # 社交拖延 → 确认接收(勿承诺查,AI 稍后自然接)
+}
+
+
+def intent_category_hint(intent_id: str) -> str:
+    """具名系统意图 id → 垫话类别提示(未列出的 id/空 → ""=不提示)。
+
+    纯函数(离线可测);消费方=FillerDirector.hint_category 的本轮一次性提示。
+    """
+    return _INTENT_CATEGORY_HINT.get(str(intent_id or ""), "")
+
+
 def filler_chain_enabled() -> bool:
     """首条垫话播完回复仍未出声 → 自动补第二条。
 
@@ -443,6 +463,10 @@ class FillerDirector:
         # P3.3 打断特权轮状态:pending 在 arm 时消费成 _round_interrupted。
         self._interrupt_pending = False
         self._round_interrupted = False
+        # P2.4 意图喂下游:类别提示 pending 在 arm 时消费成 _hint_round
+        # (与 _interrupt_pending 同款 pending→consume 纪律)。
+        self._hint_pending = ""
+        self._hint_round = ""
         # 「垫话真正开播」回调(2026-09-17 RC3,agent 侧 set_on_fired 注入):
         # 垫话 out-of-band 出声框架/watchdog 感知不到,开播即通知顺延响应看门狗。
         # None=零行为变化。签名 ();异常由触发点吞掉,绝不阻垫话。
@@ -467,6 +491,9 @@ class FillerDirector:
         # 本轮是否打断轮就此定格（fire 只看 _round_interrupted）。
         self._round_interrupted = bool(getattr(self, "_interrupt_pending", False))
         self._interrupt_pending = False
+        # P2.4 意图喂下游:类别提示 pending 消费成本轮值(消费即清,不泄漏下轮)。
+        self._hint_round = getattr(self, "_hint_pending", "")
+        self._hint_pending = ""
         self._cancel_timer()
         self._cancel_chain()
         if not filler_enabled() or self._count >= filler_max_per_call():
@@ -485,6 +512,16 @@ class FillerDirector:
         的主因之一（§44.3③a）。打断轮豁免冷却（轰炸感由 per-call 上限与
         本身稀疏度兜住）。须在 arm() 前调（on_user_turn_completed 顶部）。"""
         self._interrupt_pending = True
+
+    def hint_category(self, cat: str) -> None:
+        """P2.4(2026-09-21,§48 意图喂下游):标记下一轮的垫话类别提示。
+
+        本轮一次性:arm() 时消费成 _hint_round(与 note_interrupt_round 同款
+        pending→consume 纪律)。`_select` 只在该类于本语言池真实存在时采用,
+        否则照旧字面分类器;字面罐头命中优先级**不变**(FillerIndex 命中仍最高)。
+        须在 arm() 前调(agent on_user_turn_completed 意图接线点,kill-switch
+        `BOK_INTENT_CONTEXT` 关闭时调用方不调 = 零变化)。"""
+        self._hint_pending = str(cat or "")
 
     def on_reply_first_audio(self) -> None:
         """真回复首音频(CachedTTS stream 回调):只作废定时器。
@@ -608,6 +645,8 @@ class FillerDirector:
         self._entry_used.clear()
         self._interrupt_pending = False
         self._round_interrupted = False
+        self._hint_pending = ""
+        self._hint_round = ""
         self._cancel_timer()
         self._cancel_chain()
         self._stop_playing()
@@ -728,11 +767,29 @@ class FillerDirector:
         self._recent.append(entry["file"])
         return entry
 
+    def _hinted_category(self, lang: str, fallback: str) -> str:
+        """P2.4 意图喂下游:本轮类别提示优先(合法才用),否则回退 fallback。
+
+        「合法」=该提示类别在本语言池里真实存在 cat 标签条目——池里没这一类时
+        强行用会落 `_pick` 的 default/整池放宽(等于没提示还多一次绕路),不如
+        直接交回字面分类器。提示来源=agent 钩子的 intent_category_hint(规则
+        归类),确定性;无提示(空)/池缺失 → fallback(旧行为)。"""
+        hint = getattr(self, "_hint_round", "")
+        if not hint:
+            return fallback
+        pool = self._pools().get(lang) or []
+        if any(str(e.get("cat") or "") == hint for e in pool):
+            return hint
+        return fallback
+
     def _select(self, lang: str) -> tuple[dict | None, str]:
-        """选取链:①罐头确定性匹配(客户上一句) ②分类器→资产池回退。
+        """选取链:①罐头确定性匹配(客户上一句) ②分类器/意图提示→资产池回退。
 
         返回 (条目, 场景类)。罐头条目 {"text":..., "file": None}(音频只能来自
         tts-cache 人设物化,miss 在 _fire 里落资产兜底);资产条目带 file。
+
+        P2.4 意图喂下游:类别来源=**本轮提示(合法)优先,否则字面分类器**;罐头
+        字面命中优先级不变(命中即返,提示不参与抢条目)。
         """
         if (
             self._entries_index is not None
@@ -744,7 +801,7 @@ class FillerDirector:
             except Exception:  # noqa: BLE001 - provider 失败=回退
                 user_text = ""
             if user_text:
-                cat = classify_filler_category(user_text)
+                cat = self._hinted_category(lang, classify_filler_category(user_text))
                 entry, score = self._entries_index.match(
                     user_text, lang=lang, classifier_cat=cat, used=self._entry_used
                 )
@@ -763,7 +820,10 @@ class FillerDirector:
                     return {"text": str(entry.get("text") or ""), "file": None}, cat
                 print(f"BOK_FILLER_MATCH miss best={score:.2f} cat={cat}", flush=True)
                 return self._pick(lang, cat), cat
-        return self._pick(lang), ""
+        # 无罐头匹配路径(索引/provider 缺失或空转写):本轮提示仍在(合法才用);
+        # 无提示/不合法 → ""=旧行为(整池随机,与旧 `_pick(lang)` 逐字节同)。
+        cat = self._hinted_category(lang, "")
+        return self._pick(lang, cat), cat
 
     async def _fire(self, delay: float) -> None:
         try:

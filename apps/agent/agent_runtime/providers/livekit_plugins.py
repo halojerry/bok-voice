@@ -1425,6 +1425,12 @@ def _context_mem_legacy() -> bool:
     return os.environ.get("BOK_CONTEXT_MEM_LEGACY", "") == "1"
 
 
+def _intent_context_enabled() -> bool:
+    """P2.4(§48)意图喂下游 kill-switch:默认 "1" 开,`0` 全关(=set 恒 no-op、
+    【客户意图】行消失,尾部字节逐字同旧)。进 `_FORWARD_ENV`。"""
+    return os.environ.get("BOK_INTENT_CONTEXT", "1") == "1"
+
+
 class ContextState:
     """Shared per-call context memory: per-turn knowledge + running summary.
 
@@ -1458,6 +1464,12 @@ class ContextState:
         self.rag_enabled: bool = False
         # WhatsApp 已捕获号码（注入尾部,防 LLM 复述错号——2026-09-06 实测尾号读错）
         self._whatsapp_note: str = ""
+        # 当轮客户意图（P2.4 意图喂下游,spec §48）:agent 钩子每轮把「graph 命中意图
+        # 名 → 规则归类具名意图名」写进来(空=清位),render_context_tail 全量档渲染
+        # 一行【客户意图】。有界 ≤40 字;变化才 +revision(意图属实质变化,须全量尾部
+        # 才带得出——slim 紧凑档刻意不含它)。kill-switch BOK_INTENT_CONTEXT=0 时 set
+        # 恒 no-op → 字段恒空 → 尾部字节同旧。
+        self._customer_intent: str = ""
         # 追加式尾部账本（KV-cache 铁律 2026-09-05）：记录每个 user 消息被
         # ContextAwareLLM 拼上的易变尾部（原文, 原文+尾部, 当时 revision），FIFO
         # 对应历史里的 user 消息。下一轮请求把历史中的旧 user 重放成「原文+当时的
@@ -1511,6 +1523,22 @@ class ContextState:
         if len(self._call_facts) > limit:
             self._call_facts.pop(0)
         self._revision += 1
+
+    def set_customer_intent(self, text: str) -> None:
+        """设置当轮客户意图(截 40 字)— P2.4 意图喂下游(spec §48)。
+
+        语义=**每轮覆盖**:调用即重写当轮意图,**空串=清位**(上一轮有意图、本轮
+        无 → 不调用会令陈旧意图残留,下一轮任何实质变化触发全量尾部时带出误导
+        信号)。意图属实质变化 → 值变化才 +revision(同 add_call_fact 纪律),令
+        该轮走全量尾部、【客户意图】行才带得出(slim 紧凑档刻意不含它)。
+        kill-switch `BOK_INTENT_CONTEXT=0`(=0 全关)=本方法恒 no-op → 字段恒空,
+        尾部字节逐字同旧。"""
+        if not _intent_context_enabled():
+            return
+        v = str(text or "").strip()[:40]
+        if v != self._customer_intent:
+            self._customer_intent = v
+            self._revision += 1
 
     def set_last_reply(self, text: str) -> None:
         """记录 AI 最近一句回复(截 80 字)作尾部重复锚——模型看得见自己上一句,
@@ -1790,6 +1818,12 @@ class ContextState:
             if self._last_reply:
                 parts.append(self._last_reply_anchor())
             return "\n".join(parts)
+        if self._customer_intent:
+            # P2.4 意图喂下游:当轮客户意图(graph 命中 → 规则归类)。**只在全量档**
+            # 渲染——slim 紧凑档的语义是「状态无实质变化」,意图属实质信息,变化即
+            # +revision 逼本轮走全量档(见 set_customer_intent)。kill-switch=0 时
+            # 字段恒空,本行不出现。
+            parts.append("【客户意图】" + self._customer_intent)
         if self._whatsapp_note:
             parts.append(
                 "【已记录客户 WhatsApp】" + self._whatsapp_note +
