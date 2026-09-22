@@ -1522,8 +1522,16 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
     # req.role/req.purpose 字段，participant_identity="supervisor-<room>" 走前缀
     # 反推在闸后改写 role=supervisor，话务员可自签主管身份房 token（第三条绕过路）。
     # 显式字段与前缀两条路都由最终 role 统一把关；is_listen 单列（grants 语义不同）。
-    if _ident is not None and _ident.role not in ("root", "admin") and (
-        role == "supervisor" or is_listen
+    # 2026-09-22 机器通道收紧：机器通道（BOK_CP_TOKEN）禁铸 supervisor/listen
+    # token——对齐 B-F1「机器通道不得进管理面」口径（BOK_CP_TOKEN 是 org 级共享
+    # 凭据，每个 worker/节点都持有；放行=任一节点失陷可对任意通话静默注入主管）。
+    # operator/publish 机器通道照放（三套 E2E/probe 走先建单后取 token，依赖
+    # 此路）。/api/supervisor/{id}/join|listen 复用本函数，同闸全链生效；具名
+    # admin/root 与 auth-off 本机形态零变化。
+    _machine_mint = _ident is None and _machine
+    if (role == "supervisor" or is_listen) and (
+        _machine_mint
+        or (_ident is not None and _ident.role not in ("root", "admin"))
     ):
         raise HTTPException(status_code=403, detail="forbidden")
     if role == "me":
