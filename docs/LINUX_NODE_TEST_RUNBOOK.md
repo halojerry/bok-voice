@@ -177,13 +177,19 @@ prod（mac=launchd / Windows=schtasks / **Linux=systemd Environment=**）只带�
 `tests/test_forward_env.py` 扫全读取面）。`bok.py prod install --node-agent` 的 systemd
 单元 env 透传面当前只有 `BOK_LIVEKIT_BIND`/`BOK_LIVEKIT_WEBHOOK_URL`/`BOK_LLM_TIER` 三枚。
 
-④ **云 CP 节点形态的 worker→CP 断链（接线缺口，测试前必验）**：node_agent 拿 `--cp-url`
+④ **云 CP 节点形态的 worker→CP 断链（✅已修，2026-09-22）**：node_agent 拿 `--cp-url`
 只用于心跳/UI 注入，**不翻进 worker env**；`_agent_worker_env` 的 `CONTROL_PLANE_URL`
 缺省 `http://127.0.0.1:8000`，而 `cmd_up` 不起本地 CP——云 CP 节点上 turns/QA/设置/主管
-上报会打不存在的本地 CP。本机 dev 档（serve 含 CP）不受影响。**验收姿势**：T2/T3 跑完看
-CP 侧 turns 行是否落库；不落=踩中。修复候选（待接线，勿在测试机手改）：node_agent
-`cmd_up` 前 `os.environ.setdefault("CONTROL_PLANE_URL", args.cp_url)`，或 prod install
-`--node-agent` passthrough 表加 `CONTROL_PLANE_URL`/`BOK_CP_TOKEN`。
+上报会打不存在的本地 CP。**修法=接线点收进 node_agent**（`apply_cp_url_to_env`，
+`bok.cmd_up()` 前 `os.environ.setdefault("CONTROL_PLANE_URL", args.cp_url)`，显式 env
+优先）：本进程 env 经 `_start_proc` 的 os.environ merge 进 worker/monitor，Linux systemd /
+Windows schtasks / dev 手跑三形态一并治好，URL 随 ExecStart 参数走**不落盘单元文件**。
+回归钉=`tests/test_linux_node_wiring.py` §6（导出/显式优先/`_agent_worker_env` 真吃到/
+缺省不变四条）。**验收姿势不变**：T2/T3 跑完看 CP 侧 turns 行是否落库。
+**残留（凭据层，非 URL 层）**：auth-on 云 CP 还需 worker 侧 `BOK_CP_TOKEN`——按既有
+决议**不进 systemd 单元透传表**（凭据落盘明文面，bok.py passthrough 注释明示归凭据
+治理议题）；过渡姿势=`systemctl edit bok-node-agent` drop-in 加
+`Environment=BOK_CP_TOKEN=…`（或 EnvironmentFile 指向 0600 文件），待凭据治理统一收口。
 
 ⑤ **TTS 本地面口径不一**：模型表仍带 tts_preset/tts_clone 且 `cmd_up` 照拉 :8788，但
 Linux 运行时未装 `qwen-tts` pip 包（cuda requirements 头注明示「TTS 走 MiniMax 云端」）。
