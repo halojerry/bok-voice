@@ -50,6 +50,19 @@ def qa_rotation_enabled() -> bool:
     return os.environ.get("BOK_QA_ROTATION", "1") == "1"
 
 
+def qa_phonetic_enabled() -> bool:
+    """粤语音系补位层开关(2026-09-22):0=字面 miss 后不做音系匹配(回旧行为)。"""
+    return os.environ.get("BOK_QA_PHONETIC", "1") == "1"
+
+
+def qa_phonetic_threshold() -> float:
+    """音系补位放行阈值:真库 873 粤轮实测推荐 0.80(精确率 95%/FP≈1‰/轮)。"""
+    try:
+        return max(0.0, min(1.0, float(os.environ.get("BOK_QA_PHONETIC_THRESHOLD", "0.80"))))
+    except ValueError:
+        return 0.80
+
+
 def _entry_priority(entry: dict) -> int:
     """条目优先级(小者先);旧 CP 响应/坏值宽容回默认 10,域 [0,1000]。"""
     raw = entry.get("priority", 10)
@@ -161,6 +174,26 @@ class QaIndex:
         self._clusters: dict[str, list[dict]] = {}
         self._cluster_of: dict[str, str] = {}
         self._build_clusters()
+        # 粤语音系补位索引(2026-09-22):cantonese 条目离线展开成粤拼候选音节
+        # 序列,字面 miss 后的第二段匹配用(bok_voice_core.qa_phonetic——权重
+        # 与阈值有真库实测依据)。vendored trie 解析 ~160ms 是一次性 import
+        # 成本,只在「开关开 + 真有粤语条目」时才付;任何失败=补位层静默
+        # 退役,字面档逐字节不受影响。
+        self._phon: list[tuple[dict, list]] = []
+        if qa_phonetic_enabled() and any(
+            str(e.get("lang") or "") == "cantonese" for e, _q, _v in self._items
+        ):
+            try:
+                from bok_voice_core.qa_phonetic import text_to_syllables
+
+                for e, q, _v in self._items:
+                    if str(e.get("lang") or "") != "cantonese":
+                        continue
+                    syl = text_to_syllables(q)
+                    if syl:
+                        self._phon.append((e, syl))
+            except Exception:  # noqa: BLE001 - 音系索引构建失败=补位层退役
+                self._phon = []
 
     def _build_clusters(self) -> None:
         by_id = {str(e.get("id") or ""): e for e, _q, _v in self._items}
@@ -265,7 +298,54 @@ class QaIndex:
                 return head, best_score
         if best is not None:
             return best, best_score
+        # 粤语音系补位(字面 miss 的第二段,2026-09-22):同音/碎裂变体在音节
+        # 槽位对齐层找回——仅 cantonese 通话触发,胜者走与字面档同一条折组代表
+        # 路(_team_head);分数是音系度量(与词法分不同纲,只用于本层阈值)。
+        ph_entry, ph_score = self._phonetic_match(q, lang=lang, step_index=step_index)
+        if ph_entry is not None:
+            print(
+                f"QA_FASTPATH phonetic=1 entry={ph_entry.get('id')} score={ph_score:.2f}",
+                flush=True,
+            )
+            if qa_rotation_enabled():
+                head = self._team_head(ph_entry, lang=lang, step_index=step_index)
+                if head is not None:
+                    return head, ph_score
+            return ph_entry, ph_score
         return None, top_score
+
+    def _phonetic_match(
+        self,
+        q: str,
+        *,
+        lang: str = "",
+        step_index: int | None = None,
+    ) -> tuple[dict | None, float]:
+        """字面 miss 后的粤语音系补位:返回 (条目, 音系分),不过阈值 → (None, 0.0)。
+
+        空索引(开关关/无粤语条目/构建失败)、非 cantonese 通话、空问句 →
+        (None, 0.0) 零成本短路。条目过滤与 match 同判据(_survives_turn 单点
+        防漂移);胜者=过关者中分数最高,平分吃索引序。
+        """
+        if not self._phon or lang != "cantonese" or not q:
+            return None, 0.0
+        try:
+            from bok_voice_core.qa_phonetic import align_score, text_to_syllables
+        except Exception:  # noqa: BLE001
+            return None, 0.0
+        q_syl = text_to_syllables(q)
+        if not q_syl:
+            return None, 0.0
+        thr = qa_phonetic_threshold()
+        best: dict | None = None
+        best_score = 0.0
+        for entry, e_syl in self._phon:
+            if not _survives_turn(entry, lang=lang, step_index=step_index):
+                continue
+            score = align_score(e_syl, q_syl)
+            if score >= thr and score > best_score:
+                best, best_score = entry, score
+        return best, best_score
 
     def _team_head(
         self,

@@ -230,6 +230,46 @@ def log_slice_markers(offset: int) -> list[str]:
     return lines[:40]
 
 
+async def wait_log_stable(*, poll_s: float = 0.3, max_wait_s: float = 6.0) -> int:
+    """轮询 agent.log 大小直到连续两次读数相同（间隔 poll_s），返回当前大小。
+
+    探针共享件（2026-09-22 收编单点，原 probe_branch_action 实战版）：切窗前
+    必须等日志落盘稳定——play_and_listen 按静默返回时，该轮的推进/快路日志
+    可能还在「端点 min_delay + 轮处理」的路上，不等稳就切 mark，上一轮的行
+    会串进本轮窗口（hold 腿窗界 race 假 FAIL 实证）。不改判据语义，只保证
+    「每轮的日志落在该轮自己的窗口内」。持续增长超 max_wait_s 按当前大小返回。"""
+    deadline = time.perf_counter() + max_wait_s
+    prev = LOG_PATH.stat().st_size if LOG_PATH.exists() else 0
+    while time.perf_counter() < deadline:
+        await asyncio.sleep(poll_s)
+        cur = LOG_PATH.stat().st_size if LOG_PATH.exists() else 0
+        if cur == prev:
+            return cur
+        prev = cur
+    return prev
+
+
+def log_windows(marks: list[int]) -> list[list[str]]:
+    """按字节偏移切 agent.log，返回相邻偏移间的行窗口（纯读，越界/缺失回空）。
+
+    探针共享契约（2026-09-22 三探针收编单点，防同名不同义）：marks[0] 必须是
+    **通话开始前**的日志大小，此后每轮结束先 await wait_log_stable() 再 append
+    ——窗口数=len(marks)-1、窗口 k=第 k 轮。与「marks[0]=0」写法不兼容：那会
+    把整个历史日志当窗口 0、轮名整体错位一位（qa-phonetic 探针实弹踩过，
+    他通话行污染 absence 判据）。"""
+    try:
+        data = LOG_PATH.read_bytes()
+    except Exception:  # noqa: BLE001 - 日志缺失=所有窗口空（断言会如实报零）
+        return [[] for _ in range(max(0, len(marks) - 1))]
+    out: list[list[str]] = []
+    for start, end in zip(marks, marks[1:]):
+        out.append([
+            raw.decode("utf-8", errors="replace")
+            for raw in data[max(0, start):max(0, end)].splitlines()
+        ])
+    return out
+
+
 def create_call(lang: str, persona_id: str | None, voice: str = "") -> tuple[str, str]:
     """建对象+人设+通话，返回 (call_id, persona_voice)。对象 E2E- 前缀=心跳豁免。
     绑账号该语言的正牌话术模板（E2E/probe 模板排除）——开场白=话术第 1 步
