@@ -741,18 +741,9 @@ def delete_template(template_id: str) -> None:
 
 
 def log_windows(marks: list[int]) -> list[list[str]]:
-    """按字节偏移切 agent.log，返回相邻偏移间的行窗口（纯读，越界/缺失回空）。"""
-    try:
-        data = erc.LOG_PATH.read_bytes()
-    except Exception:  # noqa: BLE001 - 日志缺失=所有窗口空（断言会如实报零）
-        return [[] for _ in range(max(0, len(marks) - 1))]
-    out: list[list[str]] = []
-    for start, end in zip(marks, marks[1:]):
-        out.append([
-            raw.decode("utf-8", errors="replace")
-            for raw in data[max(0, start):max(0, end)].splitlines()
-        ])
-    return out
+    """按字节偏移切 agent.log（erc.log_windows 共享件，保留本地名免散改调用点；
+    语义=「marks[0]=通话前大小、窗口 k=第 k 轮」，2026-09-22 三探针收编单点）。"""
+    return erc.log_windows(marks)
 
 
 # ---------------------------------------------------------------------------
