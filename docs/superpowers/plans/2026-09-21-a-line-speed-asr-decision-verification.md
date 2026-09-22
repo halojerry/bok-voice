@@ -4143,6 +4143,24 @@ qwen3_5 混合注意力的 cache 是 ArraysCache **不可 trim**（mlx-lm 源码
 
 ### 并行分工与提交纪律
 
+> **真栈验收完成（2026-09-22 owning window，隔离栈=真库副本 CP:8010+本树 worker:8081）**：
+> - **T1 barge-in PASS×2**：interrupted=yes stop_ms 2.6/2.5s（基线 2.4s）resumed=yes——
+>   P3.2/P3.3 两条护栏不挡真插话。
+> - **T2 长通话 PASS（P1.4 门）**：16 轮真 LLM 首声 1700-4000ms p50 2600ms **全程无单调涨**
+>   （对照 §42 基线 p50 3000ms+hold 自伤）；cached=1693/1788→3270/3380 逐轮严格增长
+>   （每轮新增 ~100 tok 恒定）；**HISTORY_TRUNCATED=0**（16 轮旧档必截断——P1.3 生效）；
+>   watchdog=0；**cut_on_ready=1**（P3.2 首次真触发）、reply_early=9/reply_gap=0
+>   （垫话播完从无裸静默）。
+> - **T3 catch-all PASS（新 `--catchall` 腿，12acb56）**：常规关键词命中→graph-jump
+>   （优先级不被 "*" 稀释）+中性话→`FLOW_GRAPH catchall` 兜底派发；noop 轮 provider
+>   不烧=防环纪律（信息位）。
+> - **T4 打点收割**：P0 四打点全在真通话出数（cached= 真值/reply_gap/early/cut/
+>   HISTORY_TRUNCATED/watchdog dump）。
+> - **过程事故与修正**：接管 launcher HOME=/tmp 令模型路径解析到 /tmp → mlx 404 →
+>   主 LLM 全挂走兜底道歉句（第一轮 T2 数据作废；llm_metrics「缺席疑云」全由此起，
+>   非代码回归）——修正=spec env 显式钉 MLX_LLM_MODEL。**教训入档：隔离 HOME 会毒化
+>   model_path 解析，接管配方须钉模型 id。**
+
 | subagent | 独占文件域 | 阶段 |
 |---|---|---|
 | 甲 | `apps/agent/agent_runtime/agent.py` 观测面 | P0 → P3 |
