@@ -1917,7 +1917,12 @@ class ContextAwareLLM(llm.LLM):
                 else:
                     items.insert(0, llm.ChatMessage(role="system", content=[_join_system(prefix, "", "")]))
                 # 截断历史(摊销式,见 _truncate_chat_items):先剪后对齐,账本自尾映射。
-                max_turns = int(os.environ.get("LLM_HISTORY_TURNS", "8"))
+                # P1.3(2026-09-21,§48):缺省 8→40=**通话内不截断**——历史早已全命中
+                # KV 前缀(§46.1),截断的唯一产出是前缀断裂全量重 prefill(受控实验
+                # 2.5× 尖峰)+基线 qwen3_5 ArraysCache 不可 trim,截断纯亏;40 对
+                # (80 条)滞回线令典型 ≤20 轮通话零截断。逃生:LLM_HISTORY_TURNS=8
+                # 回旧档(env 已在 _FORWARD_ENV)。
+                max_turns = int(os.environ.get("LLM_HISTORY_TURNS", "40"))
                 items = _truncate_chat_items(items, max_turns=max_turns)
                 # 尾部重放+新消息追加(见上)。users=当前请求里的 user 消息下标(时序序)。
                 users = [i for i, it in enumerate(items) if getattr(it, "role", "") == "user"]
