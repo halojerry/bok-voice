@@ -4161,6 +4161,74 @@ qwen3_5 混合注意力的 cache 是 ArraysCache **不可 trim**（mlx-lm 源码
 >   非代码回归）——修正=spec env 显式钉 MLX_LLM_MODEL。**教训入档：隔离 HOME 会毒化
 >   model_path 解析，接管配方须钉模型 id。**
 
+### 48.1 QA 词条库漂移疑点查证（2026-09-22，真库只读；结论=未漂移，疑点系探针幽灵）
+
+用户情报：21 条生产 fastpath 锚点里 11 条（「我要退款」族）用当前词条库重放不过闸
+（0.14-0.20），怀疑 09-18 后 cluster 采纳/退役动过库。真库查证：
+
+- **词条库静止**：103 条、created_at 全部落在 09-09→09-17；审计全期仅
+  `qa_entry.create×90`+`qa.pregen×1`，**零 delete/零 update**（qa-drift 采纳路径
+  会记审计——没发生过）。
+- **21 条真锚点的词条全在场**：answers join 逐字命中现存词条（「你们是哪家公司」
+  「你们是什么公司」「快递三天了还没到…」族，enabled=1）。
+- **「我要退款」族=探针幽灵**：`PLAY_TEXT="我要退款"` 是 `probe_flow_graph.py`
+  的推流台词——探针 play 腿命中时用的词条属探针域（模板清理即蒸发、无审计），
+  用生产库重放必然低分。**运营侧无需排查。**
+- **附带真发现**：现存词条 hit_count 几乎全 0（仅「你们是哪家公司」11 次等
+  少数）——QA 覆盖率低才是真课题（归 L-③/全局沉淀管线治）。
+
+## 49. 三路深度调研归仓（2026-09-22，subagent；KV 共享/四仓库/Linux runbook/Windows 事实）
+
+### 49.1 KV 共享与语义缓存（R1）
+- **mlx_lm 已跨请求共享**：LRUPromptCache=token trie（fetch_nearest_cache 三路
+  匹配+深拷贝续 prefill）——同模板同人设的第二通**首轮即复用静态前缀**（实测
+  的 195ms 重放即此）；与 SGLang Radix Attention 差距=条目按整请求快照存、无
+  物理块共享（内存≈快照之和，单机 4-6 路可接受）。
+- **坑**：`--prompt-cache-size` server 默认仅 10 条；4-6 路并发会冲刷闲置通话
+  快照（剩一条即可 walk 恢复，全逐出才整段重 prefill）。**行动**：bok 起
+  :1235/:1237 时显式设 16-20+bytes 预算（本机现为 32，已达标；打包/别的环境
+  需检查）。
+- **语义缓存**：GPTCache 类（阈值 ~0.7 平衡）；我们的 QA 快路（0.90 字面+簇
+  轮换+物化门）=更保守的高精度定制版，方向无需改。**行动**：加 0.85-0.90
+  低置信观测带打点（只记不回）为阈值调优攒证据。
+- 磁盘前缀缓存（DeepSeek/LMCache/Mooncake）：本地单机边际收益小，低优先。
+
+### 49.2 四仓库与流式理解（R2）
+- **huggingface/speech-to-speech（13.3k★）**：级联栈同构（VAD→STT→LLM→TTS，
+  LLM 支持 mlx-lm）——验证我们架构路线；**Smart Turn v3.2**=内容+韵律验证句末
+  +800ms 推测重开窗（「流式语义参与轮次判定」的产品化），粤语默认 STT 不覆盖
+  →不改变 S2S_ROADMAP。
+- **MiMo-Audio-7B**：early-fusion 路线，Linux+CUDA+20GB+显存，无流式/粤语
+  声明——mac MLX 不可落地；小米云端 MiMo-V2.5-ASR（原生粤语）记云端备选。
+- **mlx-audio（7.9k★）**：MLX 语音库（Kokoro-82M/Qwen3-TTS/MOSS-Nano 等 20+
+  TTS+流式合成+ASR）——**MiniMax 云 TTS 的本地降级/离线兜底候选**，需按音色
+  逐个验收。
+- **NVIDIA personaplex**：Moshi 架构 7B 全双工 S2S+双通道人格（文本管角色/
+  音频管音色）——佐证「模板话术+人设音色」解耦合理；FullDuplexBench 可作
+  打断/轮换质量基线参考。
+- **流式理解方向**（业界 vs 我们）：我们的意图 judge/QA 匹配都在 FINAL 后跑
+  =主要差距。最值得试三件（按 1.5s 目标排序）：①**partial 前缀预命中**（说话
+  中对 QA 词条/图关键词增量预匹配，FINAL 只确认——零精度风险）；②
+  PrefillSpeculator 升级 PredGen 式候选生成（说话中投机生成回复首句，说完
+  验证放行，感知延迟 ~2x↓）；③LiveKit turn-detector（multilingual 含中文、
+  开源权重、同栈）语义轮次判定收 endpointing——有语义兜底才敢压 0.45s 声学窗。
+
+### 49.3 Linux runbook + Windows 事实修正（F）
+- **runbook 落地**：`docs/LINUX_NODE_TEST_RUNBOOK.md`（形态差异 13 维/上栈
+  步骤/验收 T0-T8 映射 §48/9 条 Linux 坑）。
+- **F 发现 4 个 Linux 真实接线缺口**（未修，列待办）：①非打包档 model_path
+  对 Linux 返回 repo id（llama-server 要 .gguf 路径）→ :1235 起不来第一嫌疑；
+  ②**云 CP 节点形态 worker→CP 断链**（node_agent 不把 --cp-url 翻进 worker
+  env、systemd 只透传三枚 env）→ turns/QA/设置上报会断——生产级缺口；③TTS
+  本地面口径不一（表带 tts preset 但 qwen-tts 不在 Linux 运行时面）；④doctor
+  NVIDIA 门禁只挂 nt，Linux 无 GPU 不拦。
+- **Windows 事实修正**：「无 Windows 桌面客户端」正确（Tauri 壳 09-17 已退
+  役）；但 **Windows 节点形态是活交付面**（install-node.ps1/runtime-win 包/
+  CI 每版出包）——用户「已去除 Windows 部署」指桌面壳。**软退役拍板**（保
+  代码停出包）：release.yml 删 windows 行+handshake windows job+ps1/win
+  requirements 加弃用头注+文档标注；nt 分支/MODELS/test_prod_windows 原样
+  保留（88 处深交织，硬删风险不成比例）。
+
 | subagent | 独占文件域 | 阶段 |
 |---|---|---|
 | 甲 | `apps/agent/agent_runtime/agent.py` 观测面 | P0 → P3 |
