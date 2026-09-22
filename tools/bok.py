@@ -22,6 +22,7 @@ import ipaddress
 import json
 import os
 import platform as _platform
+import re
 import signal
 import socket
 import subprocess
@@ -865,9 +866,18 @@ def _start_proc(args: list[str], pidfile: Path, logfile: Path, env: dict | None 
 
 
 def _stop_pidfile(pidfile: Path) -> None:
-    """Terminate the process group recorded in a run/*.pid file, if alive."""
+    """Terminate the process group recorded in a run/*.pid file, if alive.
+
+    他树戳守卫（2026-09-22）：pidfile 指向的进程读得出「他树拉起」时拒绝杀
+    ——run/*.pid 是 HOME 作用域单槽共享文件，worker 换装/多会话会互相覆写，
+    旧版无脑 killpg 会把别人的 worker 收割掉（跨树互杀同款根因）。"""
     try:
         pid = int(pidfile.read_text().strip())
+        foreign, root = _pid_origin_foreign(pid)
+        if foreign:
+            print(f"[stop] skip {pidfile.name}: pid {pid} 属另一代码树（{root}）"
+                  "——他树进程永不收割", file=sys.stderr)
+            return
         try:
             os.killpg(os.getpgid(pid), signal.SIGTERM)
         except (ProcessLookupError, PermissionError, OSError):
@@ -1723,9 +1733,17 @@ def _kill_proc_tree(pid: int) -> None:
 
 
 def _kill_pidfile(pidfile: Path) -> None:
-    """按 pidfile 杀进程组(_start_proc 是会话组长,子进程一并清)。"""
+    """按 pidfile 杀进程组(_start_proc 是会话组长,子进程一并清)。
+
+    他树戳守卫（2026-09-22）：monitor respawn 路径读到被他树覆写的共享
+    pidfile 时拒绝杀——不挡「本树/无戳」，与 down 纪律同款 fail-open。"""
     try:
         pid = int(pidfile.read_text().strip())
+        foreign, root = _pid_origin_foreign(pid)
+        if foreign:
+            print(f"[kill] skip {pidfile.name}: pid {pid} 属另一代码树（{root}）"
+                  "——他树进程永不收割（先在对方树 down）", file=sys.stderr)
+            return
         _kill_proc_tree(pid)
     except _KillTreeError as exc:
         # monitor respawn 路径的 best-effort 停止：Windows 真失败留痕不炸环。
@@ -1823,6 +1841,13 @@ def cmd_monitor() -> int:
                 break
             time.sleep(0.5)
         for spec in specs:
+            # 他树/复用守卫（2026-09-22）：上一轮 kill 被他树戳挡下时，端口仍被
+            # 对方的健康 worker 持有——硬起只会 bind 失败退出刷噪声。已有健康
+            # 监听的端口跳过重拉（自己刚被杀掉的 worker 端口是空的，不受影响）。
+            if healthy(spec["port"]):
+                print(f"[monitor] :{spec['port']} 已有健康监听，跳过重拉"
+                      "（他树持有则去对方树 down）")
+                continue
             _start_proc(spec["argv"], spec["pidfile"], spec["logfile"], env=spec["env"])
             print(f"[monitor] respawned {spec['name']} :{spec['port']}")
 
@@ -1969,6 +1994,16 @@ def cmd_down() -> int:
             pid = int(pidfile.read_text().strip())
         except Exception:
             continue
+        # 他树戳守卫（2026-09-22）：run/*.pid 是 HOME 作用域单槽共享文件，
+        # 多会话/worker 换装会互相覆写——down 只停「本树 + 无戳遗留」（_sweep_
+        # orphan_listeners 已立法的同款纪律在 pidfile 路径落地；旧版此处对
+        # pidfile 内容无脑收割，2026-09-22 实弹把我们树的 worker 杀掉的正是
+        # 这个缺口）。
+        foreign, root = _pid_origin_foreign(pid)
+        if foreign:
+            print(f"[down] skip {pidfile.stem}: pid {pid} 属另一代码树（{root}）"
+                  "——他树进程永不收割（先在对方树 down）", file=sys.stderr)
+            continue
         # _start_proc 以 start_new_session=True 启动（会话组长）；按进程组
         # 终止可连 livekit-agents worker 的 multiprocessing 子进程一起清掉，
         # 避免子进程残留占用 8081 导致下次 agent 启动失败。
@@ -2016,7 +2051,9 @@ def _sweep_orphan_workers() -> list[tuple[int, str]]:
     判据：进程命令行含 agent_runtime.main / agent_runtime.interpret /
     scripts/mock_callee.py（CP detached 派生的 mock 被叫 start_new_session,
     同样绕过 pidfile 体系——房间断了会自退,但栈 down 时若仍卡响铃窗须一并清）。
-    只清本项目特征进程,唔会误伤无关服务。
+    只清本项目特征进程,唔会误伤无关服务。他树戳守卫（2026-09-22）：读得出
+    「拉起树」且 ≠ 本树 → 跳过不进 swept（与 _sweep_orphan_listeners 同款
+    纪律——命令行特征只证明「bok 家」，来源戳才证明「谁家的」）。
     Windows（M2 定案）：**明跳**（返回空表,不清扫）。tasklist 不回命令行
     （image 只有 python.exe,无法安全区分本项目 worker——宁可少清不可误杀）；
     wmic 已弃用；PowerShell CIM 查询未在本仓 Windows 实机验证过。无头形态下
@@ -2045,7 +2082,12 @@ def _sweep_orphan_workers() -> list[tuple[int, str]]:
             if marker in parts[1]:
                 if pid not in seen:
                     seen.add(pid)
-                    swept.append((pid, marker))
+                    foreign, root = _pid_origin_foreign(pid)
+                    if foreign:
+                        print(f"[sweep] orphan pid {pid} 属另一代码树（{root}）——不动"
+                              "（他树进程永不收割；要切换先在对方 down）", file=sys.stderr)
+                    else:
+                        swept.append((pid, marker))
                 break
     for pid, label in swept:
         try:
@@ -2073,8 +2115,11 @@ def _process_serve_root(pid: int) -> str:
     """来源鉴定（评审 A-P2 完整版）：该 pid 由哪棵代码树拉起。载体优先级：
     ① app-data run/proc-<pid>.root（_start_proc 落笔「ROOT<TAB>子代lstart」，
     lstart 与 ps 现值精确比对——pid 复用必然对不上，标记作废）；
-    ② Linux /proc/<pid>/environ 的 BOK_SERVE_ROOT（补标记缺席路径；macOS ps
-    不吐环境，故落盘标记是 mac 主载体）。
+    ② Linux /proc/<pid>/environ 的 BOK_SERVE_ROOT（补标记缺席路径）；
+    ③ macOS `ps eww -p <pid> -o command=`（2026-09-22 补：实测能读出 env 里的
+    BOK_SERVE_ROOT——隔离 HOME 接管的 worker 标记文件落在对方 app-data、
+    本树 app-data 里没有，/proc 又不存在，旧版两载体全盲=来源「未知」，
+    他树 worker 会被 down/清扫当无主残留收割，6c82 接管实弹踩到）。
     读不到/对不上返回空串=来源未知，调用方按未知走原语义；任何异常同空串。"""
     if os.name == "nt":
         return ""
@@ -2095,7 +2140,36 @@ def _process_serve_root(pid: int) -> str:
                 return item.decode("utf-8", "replace").split("=", 1)[1]
     except Exception:
         pass
+    try:
+        # 载体③：macOS 环境经 ps eww 挂在 command 列尾部。只认变量名边界，
+        # 防「某 env 值里恰好含这段字面量」误报；取非空白段（ROOT 是路径无空格）。
+        # 实测边界：python 进程（=真实标的 worker/monitor）恒可读；/bin/sleep
+        # 这类短 argv 二进制读不出 env——载体只服务 bok 家进程，够用。
+        out = subprocess.run(
+            ["ps", "eww", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        m = re.search(r"(?<![A-Za-z0-9_])BOK_SERVE_ROOT=(\S+)", out)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
     return ""
+
+
+def _pid_origin_foreign(pid: int) -> tuple[bool, str]:
+    """pid 是否属**另一棵代码树**（2026-09-22 pidfile 清杀路径补戳）。
+
+    返回 (foreign, root)：来源读得出且 ≠ 本树 ROOT → (True, root)；来源未知
+    （旧版进程/探测失败/pid 复用对不上）或本树 → (False, …)。fail-open 与
+    「down=停本树+无戳遗留」纪律一致——未知绝不挡杀，只有铁证是他树才让位。
+    只对 bok 家进程有意义（任意进程 env 里有 BOK_SERVE_ROOT 即视为 bok 子代）。"""
+    root = _process_serve_root(pid)
+    if not root:
+        return False, ""
+    if os.path.realpath(root) == os.path.realpath(str(ROOT)):
+        return False, root
+    return True, root
 
 
 def _sweep_stale_root_markers() -> None:
