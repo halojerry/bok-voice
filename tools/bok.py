@@ -985,6 +985,15 @@ def _control_plane_env(db: Path | str) -> dict[str, str]:
     if _settle and Path(_settle).exists():
         env["BOK_SETTLE_LLM_BASE_URL"] = os.environ.get("BOK_SETTLE_LLM_BASE_URL", "http://127.0.0.1:1237/v1")
         env["BOK_SETTLE_LLM_MODEL"] = _settle
+    # settle 专线指向**云端**（DeepSeek 等）时的凭据：Summarizer 现在会带
+    # `Authorization: Bearer`（2026-09-21——先前不带，云端点一律 401，即「纪要换云」
+    # 结构上走不通）。凭据只走 env、不落盘；未设=空串，payload/行为与本地档逐字节同旧。
+    if os.environ.get("BOK_SETTLE_LLM_API_KEY", "").strip():
+        env["BOK_SETTLE_LLM_API_KEY"] = os.environ["BOK_SETTLE_LLM_API_KEY"]
+    # 云端思考档下纪要单次要 9-14s 起，Summarizer 缺省 15s 会 ReadTimeout（实测
+    # v4-pro 5/5 全超时）——这枚开关是那档的超时口。同款 CP 面注入，未设=不上抬。
+    if os.environ.get("BOK_SETTLE_THINKING_TIMEOUT_S", "").strip():
+        env["BOK_SETTLE_THINKING_TIMEOUT_S"] = os.environ["BOK_SETTLE_THINKING_TIMEOUT_S"]
     # E7 离线润色面 kill-switch（2026-09-21）：唯一消费者是 **CP**（挂断后纪要输入 /
     # QA 挖掘 / L-① 漏网轮），故走这张 CP 面表显式下发（同 BOK_SETTLE_LLM_* 先例）——
     # prod launchd/schtasks 封闭 env 面不注入即死门。**不进 _FORWARD_ENV**：那张表是

@@ -135,9 +135,11 @@ def _capture(monkeypatch) -> dict:
         def json(self):
             return {"choices": [{"message": {"content": '{"summary":"s","new_topics":[],"insight":null}'}}]}
 
-    def fake_post(url, json=None, timeout=None):
+    def fake_post(url, json=None, timeout=None, headers=None):
         captured["url"] = url
         captured["payload"] = json
+        captured["timeout"] = timeout
+        captured["headers"] = headers
         return _Resp()
 
     monkeypatch.setattr(httpx, "post", fake_post)
@@ -173,6 +175,78 @@ def test_settle_local_endpoint_payload_unchanged(monkeypatch):
 
     assert "thinking" not in captured["payload"]
     assert captured["payload"]["max_tokens"] == 512
+
+
+def test_settle_thinking_raises_timeout_too(monkeypatch):
+    """光抬预算不抬超时=结构上跑不通（实测 v4-pro 思考档 5/5 ReadTimeout）。"""
+    monkeypatch.delenv("BOK_SETTLE_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("BOK_SETTLE_LLM_MODEL", raising=False)
+    monkeypatch.delenv("BOK_SETTLE_THINKING_TIMEOUT_S", raising=False)
+    captured = _capture(monkeypatch)
+
+    from control_plane.summarize import Summarizer
+
+    settings = {"llm": {"provider": "deepseek", "base_url": DS, "model": "deepseek-v4-pro"}}
+    Summarizer(timeout=15.0).build(_TURNS, {"object_id": "o", "account_id": "a"}, settings)
+
+    assert captured["timeout"] >= 90.0
+    assert captured["payload"]["thinking"] == {"type": "enabled"}
+
+
+def test_settle_sends_bearer_when_key_present(monkeypatch):
+    """云端 settle 的凭据口：先前不带 Authorization，云端点一律 401（换云走不通）。"""
+    monkeypatch.delenv("BOK_SETTLE_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("BOK_SETTLE_LLM_MODEL", raising=False)
+    monkeypatch.delenv("BOK_SETTLE_LLM_API_KEY", raising=False)
+    captured = _capture(monkeypatch)
+
+    from control_plane.summarize import Summarizer
+
+    settings = {"llm": {"provider": "deepseek", "base_url": DS, "model": "m", "api_key": "sk-x"}}
+    Summarizer().build(_TURNS, {"object_id": "o", "account_id": "a"}, settings)
+
+    assert captured["headers"] == {"Authorization": "Bearer sk-x"}
+
+
+def test_settle_mlx_placeholder_is_not_a_credential(monkeypatch):
+    """设置页本地卡存的是哨兵 `"mlx"`（不是凭据）——不许变成 Authorization 头。"""
+    monkeypatch.delenv("BOK_SETTLE_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("BOK_SETTLE_LLM_MODEL", raising=False)
+    monkeypatch.delenv("BOK_SETTLE_LLM_API_KEY", raising=False)
+    captured = _capture(monkeypatch)
+
+    from control_plane.summarize import Summarizer
+
+    settings = {"llm": {"provider": "local_openai", "base_url": "http://127.0.0.1:1237/v1", "model": "/m", "api_key": "mlx"}}
+    Summarizer().build(_TURNS, {"object_id": "o", "account_id": "a"}, settings)
+
+    assert captured["headers"] is None
+
+
+def test_settle_broken_json_falls_back_with_a_visible_log(monkeypatch, capsys):
+    """模型吐坏 JSON 时退指标摘要，但**必须留痕**——静默是这类丢数据藏最久的原因。"""
+    monkeypatch.delenv("BOK_SETTLE_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("BOK_SETTLE_LLM_MODEL", raising=False)
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            # 本机 9B 实测的真实坏法：结构齐全但缺逗号
+            return {"choices": [{"message": {"content": '{"summary":"s"\n"new_topics":[]}'}}]}
+
+    monkeypatch.setattr(httpx, "post", lambda url, json=None, timeout=None, headers=None: _Resp())
+
+    from control_plane.summarize import Summarizer
+
+    settings = {"llm": {"provider": "local_openai", "base_url": "http://127.0.0.1:1237/v1", "model": "/m"}}
+    result = Summarizer().build(_TURNS, {"object_id": "o", "account_id": "a"}, settings)
+
+    assert result["new_topics"] == []  # 走了 fallback
+    out = capsys.readouterr().out
+    assert "解析失败" in out
+    assert "new_topics/insight 全丢" in out
 
 
 # ---------------------------------------------------------------- 4. 判据侧
