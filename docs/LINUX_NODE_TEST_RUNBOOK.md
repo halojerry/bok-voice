@@ -197,8 +197,10 @@ Linux 运行时未装 `qwen-tts` pip 包（cuda requirements 头注明示「TTS 
 settings `tts.provider=minimax` + 探针 `BOK_PROBE_STIMULUS=cloud`，并把 :8788 本地合成档
 记为 Linux 待补项。
 
-⑥ **doctor 的 NVIDIA 门禁只挂 Windows**（`_doctor_gpu_gate` 见 `os.name=="nt"` 即返）——
-Linux 无 GPU/驱动过旧 doctor 不拦；GPU 健康判定以装机第 1 步 + `nvidia-smi` + llm.log 为准。
+⑥ **doctor 的 NVIDIA 门禁只挂 Windows**（✅已修，2026-09-22）：`_doctor_gpu_gate`
+原 `os.name=="nt"` 即返——Linux CUDA 节点同为 nvidia-smi/驱动 ≥550/显存 ≥8GB 前置，
+现同门同判（mac 仍无此检查）；回归钉 `test_prod_windows.py`（mac 跳过桩 is_linux=False /
+Linux 评估桩双条）。GPU 健康判定仍以装机第 1 步 + `nvidia-smi` + llm.log 为准。
 
 ⑦ **Supabase IPv6（云 CP 侧，节点打云 CP 时的前置）**：pooler 域名 IPv6-only、宿主/容器
 无 v6 出网 → CP crash-loop。重启/重拉一律走 `deploy/cloud/up.sh`（池器域名→IPv4 现场解析
