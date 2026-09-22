@@ -64,8 +64,17 @@ class Summarizer:
         # 缺席回退原链路(settings llm 卡 > MLX_LLM_* env,语义同旧)。
         _settle_base = os.environ.get("BOK_SETTLE_LLM_BASE_URL", "").strip()
         _settle_model = os.environ.get("BOK_SETTLE_LLM_MODEL", "").strip()
+        api_key = (llm_cfg.get("api_key") or "").strip()
         if _settle_base and _settle_model:
             base_url, model = _settle_base.rstrip("/"), _settle_model
+            # 专线若指向云端（DeepSeek 等）必须有凭据——本地 MLX 不校验时这是个空串，
+            # 语义不变。凭据只走 env（与 BOK_SETTLE_LLM_* 同款 CP 面注入），不落盘。
+            api_key = os.environ.get("BOK_SETTLE_LLM_API_KEY", "").strip() or api_key
+        # `"mlx"` 是本仓既有的「本地端点不校验凭据」哨兵（与 agent `_llm_judge` 的
+        # api_key 缺省同值）——设置页本地卡就存这个字面量，它**不是**凭据，不许变成
+        # Authorization 头（否则本地档的请求形状也变了）。
+        if api_key == "mlx":
+            api_key = ""
         # 设置页 LLM 卡片可存空 base_url / 占位 model="local"；本机 MLX 的真实地址
         # 由启动器经 env 注入（与 agent 的 MlxLlmLLM 同一来源）。只读 settings 会打到
         # 空 URL / model=local → mlx_lm 404 → 蒸馏表（new_topics/insight）永不写入。
@@ -78,12 +87,20 @@ class Summarizer:
             return self._fallback(turns)
         try:
             system = _SYSTEM_INTERP if str(call.get("kind") or "") == "interpret" else _SYSTEM
-            return self._via_llm(base_url, model, transcript, call, system)
+            return self._via_llm(base_url, model, transcript, call, system, api_key)
         except Exception as exc:  # pragma: no cover - model/network failure
             print(f"[summarize] LLM summary failed, falling back: {exc!r}", flush=True)
             return self._fallback(turns)
 
-    def _via_llm(self, base_url: str, model: str, transcript: str, call: dict, system: str = _SYSTEM) -> dict:
+    def _via_llm(
+        self,
+        base_url: str,
+        model: str,
+        transcript: str,
+        call: dict,
+        system: str = _SYSTEM,
+        api_key: str = "",
+    ) -> dict:
         payload = {
             "model": model,
             "messages": [
@@ -102,11 +119,23 @@ class Summarizer:
         # 会整段烧在 reasoning 上、content 出空串，而这里落地是静默 ``_fallback``
         # （指标摘要，质量无声降级）——故思考档下把预算抬到容得下「思考 + JSON 正文」。
         # 本地 MLX 端点该片段为空 dict，payload 逐字节同旧。
+        #
+        # **超时也得跟着抬**（2026-09-21 实测）：思考档下真跑一次要 9-14s 起，而
+        # ``self.timeout`` 缺省 15s——云端 v4-pro 档实测 5/5 全部 ReadTimeout
+        # （`ReadTimeout('The read operation timed out')`），即「纪要换云」光抬预算
+        # 不抬超时**结构上跑不通**。纪要本来就离线，放宽无代价。
         thinking_body = thinking_extra_body(base_url, "enabled")
+        timeout = self.timeout
         if thinking_body:
             payload.update(thinking_body)
             payload["max_tokens"] = 2048
-        r = httpx.post(f"{base_url}/chat/completions", json=payload, timeout=self.timeout)
+            timeout = max(timeout, float(os.environ.get("BOK_SETTLE_THINKING_TIMEOUT_S", "90")))
+        # 无凭据时不传 `headers` kwarg（而非传 None）：本地档的调用形状逐字节同旧，
+        # 既有以三参签名桩 httpx.post 的测试/调用方零改动。
+        post_kwargs: dict[str, Any] = {"json": payload, "timeout": timeout}
+        if api_key:
+            post_kwargs["headers"] = {"Authorization": f"Bearer {api_key}"}
+        r = httpx.post(f"{base_url}/chat/completions", **post_kwargs)
         r.raise_for_status()
         content = r.json()["choices"][0]["message"].get("content", "")
         return self._parse(content)
@@ -115,10 +144,19 @@ class Summarizer:
         text = content.strip()
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if not m:
+            # 可观测性（2026-09-21）：这里以前是**静默** `_fallback`，所以「settle 模型
+            # 换了以后沉淀成片丢」在观测面完全看不见——本次实测（本机 9B @1237）就是
+            # 靠这个盲区藏了很久。空稿要留痕，别只留结果。
+            print(f"[summarize] 模型没吐 JSON（content {len(text)} 字，头部：{text[:80]!r}）→ 退指标摘要", flush=True)
             return self._fallback([])
         try:
             data = json.loads(m.group(0))
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - 坏 JSON 是模型输出问题，可见即可
+            print(
+                f"[summarize] 模型吐的 JSON 解析失败（content {len(text)} 字）：{exc} "
+                f"→ 退指标摘要（new_topics/insight 全丢）",
+                flush=True,
+            )
             return self._fallback([])
         return {
             "summary": str(data.get("summary", "")),
