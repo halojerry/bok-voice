@@ -35,6 +35,12 @@ CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
 TTS_URL = os.environ.get("TTS_URL", "http://127.0.0.1:8788")
 LOG_PATH = Path.home() / "Library" / "Application Support" / "BokVoice" / "logs" / "agent.log"
 
+# 机器通道鉴权（e2e_barge_in 同款惯例）：auth-on 栈/隔离 CP 必须带，未设 env 时
+# 头为空=与旧 auth-off 栈逐字节同行为。soak 族（offscript/latency）共享本底座。
+_CP_HEADERS: dict[str, str] = {}
+if os.environ.get("BOK_CP_TOKEN", "").strip():
+    _CP_HEADERS["Authorization"] = f"Bearer {os.environ['BOK_CP_TOKEN'].strip()}"
+
 # 答完判定：出现过语音后，连续静默 ≥2.5s 视为答完；30s 无声=哑轮。
 ANSWER_TIMEOUT_S = float(os.environ.get("BOK_CUSTOMER_TIMEOUT_S", "30"))
 ANSWER_SILENCE_S = float(os.environ.get("BOK_CUSTOMER_SILENCE_S", "2.5"))
@@ -235,7 +241,8 @@ def create_call(lang: str, persona_id: str | None, voice: str = "") -> tuple[str
     template_id = ""
     try:
         tpls = httpx.get(
-            f"{CONTROL_PLANE_URL}/api/templates?account_id=acc-001", timeout=10
+            f"{CONTROL_PLANE_URL}/api/templates?account_id=acc-001", timeout=10,
+            headers=_CP_HEADERS,
         ).json()
         tpls = tpls.get("items", tpls) if isinstance(tpls, dict) else tpls
         tpl = next(
@@ -252,7 +259,7 @@ def create_call(lang: str, persona_id: str | None, voice: str = "") -> tuple[str
     except Exception:  # noqa: BLE001 - 模板拉不到=退无模板链路(通用语开场)
         template_id = ""
     def _post(path: str, **kw) -> dict:
-        resp = httpx.post(f"{CONTROL_PLANE_URL}{path}", timeout=10, **kw)
+        resp = httpx.post(f"{CONTROL_PLANE_URL}{path}", timeout=10, headers=_CP_HEADERS, **kw)
         resp.raise_for_status()
         return resp.json()
 
@@ -268,7 +275,9 @@ def create_call(lang: str, persona_id: str | None, voice: str = "") -> tuple[str
         },
     )
     if persona_id:
-        resp = httpx.get(f"{CONTROL_PLANE_URL}/api/personas/{persona_id}", timeout=10)
+        resp = httpx.get(
+            f"{CONTROL_PLANE_URL}/api/personas/{persona_id}", timeout=10, headers=_CP_HEADERS
+        )
         resp.raise_for_status()
         persona = resp.json()
         voice = str(persona.get("reference_audio") or "")
@@ -352,7 +361,9 @@ async def fetch_turns(call_id: str, settle_s: float = 12.0) -> list[dict]:
     stable = 0
     deadline = time.perf_counter() + settle_s
     while time.perf_counter() < deadline:
-        rows = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", timeout=10).json()
+        rows = httpx.get(
+            f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", timeout=10, headers=_CP_HEADERS
+        ).json()
         if rows and len(rows) == len(last):
             stable += 1
             if stable >= 2:
@@ -433,6 +444,7 @@ async def run_scenario(key: str, persona_id: str | None) -> dict:
             f"{CONTROL_PLANE_URL}/api/token",
             json={"account_id": "acc-001", "call_id": call_id},
             timeout=10,
+            headers=_CP_HEADERS,
         ).json()
         await room.connect(data["serverUrl"], data["participantToken"])
         audio_source = rtc.AudioSource(sample_rate=16000, num_channels=1)
@@ -467,8 +479,8 @@ async def run_scenario(key: str, persona_id: str | None) -> dict:
         for t in read_tasks:
             t.cancel()
         try:
-            httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/hangup", timeout=10)
-            httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/settle", timeout=30)
+            httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/hangup", timeout=10, headers=_CP_HEADERS)
+            httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/settle", timeout=30, headers=_CP_HEADERS)
         except Exception:
             pass
 

@@ -297,6 +297,7 @@ async def run_set(key: str, persona_id: str | None, budgets: dict[str, float]) -
             f"{erc.CONTROL_PLANE_URL}/api/token",
             json={"account_id": "acc-001", "call_id": call_id},
             timeout=10,
+            headers=erc._CP_HEADERS,
         ).json()
         await room.connect(data["serverUrl"], data["participantToken"])
         audio_source = rtc.AudioSource(sample_rate=16000, num_channels=1)
@@ -426,11 +427,15 @@ def print_report(res: dict, budgets: dict[str, float]) -> None:
             flush=True,
         )
     fa, pd = s["first_audio"], s["perceived"]
-    print(
-        f"\n墙钟首声 n={fa['n']} p50={fa['p50']:.0f}ms p95={fa['p95']:.0f}ms max={fa['max']:.0f}ms "
-        f"超标(>{budgets['first_ms']:.0f})={fa['over_budget']}",
-        flush=True,
-    )
+    if fa["n"] and fa["p50"] is not None:
+        print(
+            f"\n墙钟首声 n={fa['n']} p50={fa['p50']:.0f}ms p95={fa['p95']:.0f}ms max={fa['max']:.0f}ms "
+            f"超标(>{budgets['first_ms']:.0f})={fa['over_budget']}",
+            flush=True,
+        )
+    else:
+        # 组中断/零量测：报表不炸（一组失败不该毁掉整轮其余组的输出）。
+        print("\n墙钟首声：无有效量测（该组中断或全哑）", flush=True)
     if pd["n"]:
         print(
             f"PERCEIVED n={pd['n']} p50={pd['p50']:.0f}ms p95={pd['p95']:.0f}ms max={pd['max']:.0f}ms "

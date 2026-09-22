@@ -352,6 +352,7 @@ async def run_scenario(key: str, persona_id: str | None, *, adversarial: bool,
             f"{erc.CONTROL_PLANE_URL}/api/token",
             json={"account_id": "acc-001", "call_id": call_id},
             timeout=10,
+            headers=erc._CP_HEADERS,
         ).json()
         await room.connect(data["serverUrl"], data["participantToken"])
         audio_source = rtc.AudioSource(sample_rate=16000, num_channels=1)
