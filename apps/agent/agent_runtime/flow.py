@@ -678,6 +678,163 @@ _PLATFORM_RE = re.compile(
 )
 
 
+# ---- 系统意图目录(spec §48 P2.3 六层意图收敛) ----
+# A 线每轮的「规则推进」靠这些词族正则判 verdict/WA 信号(detect_whatsapp_signal
+# / should_auto_advance / decide_advance 与 _REFUSE_RE/_FAREWELL_RE/_CONFIRM_RE
+# 一族),但它们此前无名、无统一观测面。本目录把它们收敛为「具名系统意图」——纯
+# 数据、零新正则:每条**直接引用既有编译好的 RE 对象本身**(同一对象,不重写也不
+# 复制 pattern 文本),保证与判定路径逐字节同源,杜绝两处正则漂移。
+#
+# 铁律(§48 P2.3):本目录只做归类+命名+观测,不改任何 RE 的 pattern,也不改
+# decide/detect 的返回值、推进语义或账本行为。P2.4(意图喂垫话/LLM)按 intent id
+# 消费这些具名意图。
+
+
+@dataclass(frozen=True)
+class SystemIntent:
+    """一个具名系统意图:一条内置词族(引用既有 RE)+ 它的判定归属。"""
+
+    id: str
+    name: str
+    # 该意图的族正则——**必须**是 flow 内既有 RE 对象的引用(`is` 同一对象),
+    # 不重写、不复制 pattern 文本(防两处漂移)。一条意图可并列多个 RE(同族)。
+    regexes: tuple[re.Pattern[str], ...]
+    # 该族命中的 verdict 取值(只对产出 verdict 的族有意义;""=信号/非 verdict 族)。
+    verdict: str = ""
+    description: str = ""
+
+
+SYSTEM_INTENTS: dict[str, SystemIntent] = {
+    # —— 逐轮 verdict 词族(decide_advance 判定链) ——
+    "sys_refuse": SystemIntent(
+        id="sys_refuse",
+        name="明确拒绝/收线",
+        regexes=(_REFUSE_RE,),
+        verdict=REFUSE,
+        description="唔需要/唔办/别再打/拉黑类明确拒绝 → 收尾态,一句礼貌再见后结束通话。",
+    ),
+    "sys_hangup": SystemIntent(
+        id="sys_hangup",
+        name="要求挂断/别打",
+        regexes=(_HANGUP_RE,),
+        verdict=REFUSE,
+        description="不用了/挂断/别再打类挂线要求 → 与 sys_refuse 同落 REFUSE verdict。",
+    ),
+    "sys_farewell": SystemIntent(
+        id="sys_farewell",
+        name="纯道别",
+        regexes=(_FAREWELL_RE,),
+        verdict=FAREWELL,
+        description="再见/拜拜/bye → 道别≠拒绝(C4 分流)。",
+    ),
+    "sys_objection": SystemIntent(
+        id="sys_objection",
+        name="否认/异议/质疑",
+        regexes=(_DENY_RE,),
+        verdict=OBJECTION,
+        description="不是我/没买过/骗子/投诉类 → 停留本步应对。",
+    ),
+    "sys_repeat": SystemIntent(
+        id="sys_repeat",
+        name="要求重复",
+        regexes=(_REPEAT_RE,),
+        verdict=REPEAT,
+        description="听唔清/再说一次类短句 → 停留,上一句关键内容照再讲一遍。",
+    ),
+    "sys_question": SystemIntent(
+        id="sys_question",
+        name="提问/要解释",
+        regexes=(_QUESTION_RE,),
+        verdict=QUESTION,
+        description="点解/几时/多少/why/how 类 → 停留本步解答。",
+    ),
+    "sys_defer": SystemIntent(
+        id="sys_defer",
+        name="社交拖延",
+        regexes=(_DEFER_RE,),
+        verdict=DEFER,
+        description="我先查一下/稍等类 → 脚本直念短应承,零 LLM 零推进。",
+    ),
+    "sys_confirm": SystemIntent(
+        id="sys_confirm",
+        name="应承确认",
+        regexes=(_CONFIRM_RE,),
+        verdict=CONFIRM,
+        description="係我/好的/可以/嗯类应承 → 可推进下一步。",
+    ),
+    "sys_confirm_strong": SystemIntent(
+        id="sys_confirm_strong",
+        name="强确认",
+        regexes=(_STRONG_AFFIRM_RE,),
+        verdict=CONFIRM,
+        description="多字强确认(係我/没错/确认类) → 疑问句里出现亦算确认。",
+    ),
+    # —— WhatsApp 对接触发信号族(detect_whatsapp_signal) ——
+    "sys_whatsapp_capture": SystemIntent(
+        id="sys_whatsapp_capture",
+        name="WhatsApp 给号",
+        regexes=(_WHATSAPP_NUM_ANNOUNCE_RE,),
+        description="客户自报/报出 WhatsApp/微信号码 → captured 信号。",
+    ),
+    "sys_whatsapp_caller_bound": SystemIntent(
+        id="sys_whatsapp_caller_bound",
+        name="WhatsApp 绑定来电",
+        regexes=(_WHATSAPP_CALLER_BOUND,),
+        description="客户话号码绑定「呢个来电/呢个号码」 → captured_implicit(号在系统)。",
+    ),
+    "sys_whatsapp_offer": SystemIntent(
+        id="sys_whatsapp_offer",
+        name="WhatsApp 应承加",
+        regexes=(_WHATSAPP_ADD_VERB,),
+        description="应承加/叫加但未给号 → offered 信号。",
+    ),
+    "sys_whatsapp_decline": SystemIntent(
+        id="sys_whatsapp_decline",
+        name="WhatsApp 婉拒",
+        regexes=(_WHATSAPP_DECLINE,),
+        description="冇 WhatsApp/唔方便加 → 不触发信号。",
+    ),
+    # —— 规则级「必定推进」信号族(should_auto_advance) ——
+    "sys_platform": SystemIntent(
+        id="sys_platform",
+        name="平台名应答",
+        regexes=(_PLATFORM_RE,),
+        description="网购平台名 → 引导核实步「答到平台即过」的规则信号。",
+    ),
+}
+
+# verdict → 具名系统意图(primary 族)。sys_refuse/sys_hangup 同落 REFUSE,
+# sys_confirm/sys_confirm_strong 同落 CONFIRM——此处取主族命名归类。
+_VERDICT_INTENT: dict[str, str] = {
+    CONFIRM: "sys_confirm",
+    OBJECTION: "sys_objection",
+    QUESTION: "sys_question",
+    REFUSE: "sys_refuse",
+    FAREWELL: "sys_farewell",
+    REPEAT: "sys_repeat",
+    DEFER: "sys_defer",
+}
+
+# detect_whatsapp_signal 信号 kind → 具名系统意图。
+_WA_SIGNAL_INTENT: dict[str, str] = {
+    "captured": "sys_whatsapp_capture",
+    "captured_implicit": "sys_whatsapp_caller_bound",
+    "offered": "sys_whatsapp_offer",
+}
+
+
+def classify_verdict_intent(verdict: str) -> str:
+    """verdict → 具名系统意图 id(未识别/UNCLEAR → "")。"""
+    return _VERDICT_INTENT.get(str(verdict or ""), "")
+
+
+def classify_wa_intent(signal: "tuple[str, str] | None") -> str:
+    """detect_whatsapp_signal 结果 → 具名系统意图 id(None/未知 → "")。"""
+    if not signal:
+        return ""
+    return _WA_SIGNAL_INTENT.get(str(signal[0] or ""), "")
+
+
 def should_auto_advance(*, current: int, goal: str, ref: str, user_text: str, verdict: str, wa: str | None = None, say_step: bool = False) -> bool:
     """規則級「一定要推進」override,唔靠 LLM judge(judge 慢/唔穩會卡死)。
 
@@ -1062,6 +1219,14 @@ class FlowController:
     # 判定、从不进提示词,客户提问/答非所问时模型冇「该怎么答」指引 → 复读当前步。
     # current_step_text 据此渲染对应应答指引。
     last_verdict: str = ""
+    # 最近一次规则归类(具名系统意图 id,spec §48 P2.3 六层意图收敛)。语义=
+    # **清空式**:rule_verdict / note_wa_signal 每次调用都按本次 verdict / WA 信号
+    # 重写该字段——真命中 → 对应具名意图(`SYSTEM_INTENTS` 的 id,如
+    # "sys_refuse"/"sys_farewell"/"sys_confirm"/"sys_whatsapp_capture"),
+    # 未命中(UNCLEAR/无信号) → ""。即「每轮 decide/detect 调用后反映最近一次
+    # 规则归类」。纯观测位:不参与推进判定、不进提示词、不改账本;供 P2.4
+    # (意图喂垫话/LLM)消费。
+    last_rule_intent: str = ""
     # 最近一轮客户报出的数字串(≥4 位,已归一成 ASCII)——数字係 ASR 最弱项
     # (同一串数字两窗两解,2026-09-07 日志实证),AI 拿到错号从不复核。
     # current_step_text 据此渲染「逐位复述核对」指引。agent.py 钩子每轮写入。
@@ -1138,11 +1303,38 @@ class FlowController:
         )
 
     def rule_verdict(self, user_text: str) -> str:
-        """规则判定(唔改动状态):只有"确认/认可当前步"先算可推进。"""
+        """规则判定(唔改动状态):只有"确认/认可当前步"先算可推进。
+
+        副作用(spec §48 P2.3,纯观测):把本次 verdict 归类为具名系统意图写进
+        `last_rule_intent`(未命中 → ""),真命中打一行 `RULE_INTENT hit=`。
+        返回值、推进语义与账本行为逐字节不变。
+        """
         # facts=vars_map:客户覆述啱已知资料(姓名/尾号/单号)都算确认,唔净靠社交词。
         # 单字应承(好/係/嗯)只喺当前步係问话(「…合不合适？」)先算确认——
         # 陈述步收到单字应承係寒暄,降 UNCLEAR 停留,唔推流程走太快。
-        return decide_advance(user_text, facts=self.vars_map, short_ack_confirms=self._current_step_is_question())
+        verdict = decide_advance(user_text, facts=self.vars_map, short_ack_confirms=self._current_step_is_question())
+        self._record_rule_intent(classify_verdict_intent(verdict))
+        return verdict
+
+    def _record_rule_intent(self, intent_id: str) -> None:
+        """具名系统意图归类落点(spec §48 P2.3):写 last_rule_intent + 观测行。
+
+        清空式语义:每次调用按本次归类重写(未命中="" ),便于下游按「最近一次
+        规则归类」消费;只在非空时输出 `RULE_INTENT hit=<id>`——未命中不打,
+        避免每轮噪声。纯观测,不改变任何判定/推进状态。
+        """
+        self.last_rule_intent = intent_id or ""
+        if intent_id:
+            print(f"RULE_INTENT hit={intent_id}", flush=True)
+
+    def note_wa_signal(self, signal: "tuple[str, str] | None") -> None:
+        """WhatsApp 信号归类(spec §48 P2.3):detect_whatsapp_signal 结果 → 具名意图。
+
+        captured → sys_whatsapp_capture、captured_implicit →
+        sys_whatsapp_caller_bound、offered → sys_whatsapp_offer、None/未知 → ""。
+        规则路径每轮 detect 后调用;纯观测,不改 detect/caller 的返回值与行为。
+        """
+        self._record_rule_intent(classify_wa_intent(signal))
 
     def _current_step_is_question(self) -> bool:
         """当前步 ref 是否问话（含 ？/?）——单字应承算不算回答的依据。"""
