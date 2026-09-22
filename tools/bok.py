@@ -856,6 +856,21 @@ def _spawn_kwargs() -> dict:
     return {"start_new_session": True}
 
 
+def _write_proc_stamps(pidfile: Path, pid: int) -> None:
+    """pidfile + proc-<pid>.root 来源戳（_start_proc 落笔两件套的单点提炼）。
+
+    cmd_monitor 外部手跑时也自写（2026-09-22 monitor 盲斑修复）：外部启动
+    原本不落任何痕迹——_ensure_monitor 探不到单例会再拉一个（双监控环），
+    跨树杀守卫对无戳进程 fail-open 不保护。经 _start_proc 拉起时会写两次
+    （同 pid 同内容，幂等无害）。"""
+    pidfile.parent.mkdir(parents=True, exist_ok=True)
+    pidfile.write_text(str(pid))
+    try:
+        (pidfile.parent / f"proc-{pid}.root").write_text(f"{ROOT}\t{_ps_field(pid, 'lstart=')}\n")
+    except Exception:
+        pass  # 标记写不出=来源未知，清扫走原语义；绝不影响起进程
+
+
 def _start_proc(args: list[str], pidfile: Path, logfile: Path, env: dict | None = None, cwd: str | Path | None = None) -> int:
     pidfile.parent.mkdir(parents=True, exist_ok=True)
     _rotate_log(logfile)
@@ -871,11 +886,7 @@ def _start_proc(args: list[str], pidfile: Path, logfile: Path, env: dict | None 
     merged["BOK_SERVE_ROOT"] = str(ROOT)
     with logfile.open("ab") as log:
         proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, env=merged, cwd=str(cwd) if cwd else None, **_spawn_kwargs())
-    pidfile.write_text(str(proc.pid))
-    try:
-        (pidfile.parent / f"proc-{proc.pid}.root").write_text(f"{ROOT}\t{_ps_field(proc.pid, 'lstart=')}\n")
-    except Exception:
-        pass  # 标记写不出=来源未知，清扫走原语义；绝不影响起进程
+    _write_proc_stamps(pidfile, proc.pid)
     return proc.pid
 
 
@@ -1715,6 +1726,30 @@ def _pid_alive(pidfile: Path) -> bool:
         return False
 
 
+def _pidfile_alive_stamped(pidfile: Path) -> bool:
+    """_ensure_monitor 单例判定的 lstart 加强版（2026-09-22 monitor 盲斑 2）。
+
+    _pid_alive 是纯 pid 探活——pidfile 残留死 pid 被无关进程复用时误判存活，
+    _ensure_monitor 跳过重拉 = 栈从此无 monitor。本函数在 pid 活之上追加
+    来源戳比对：proc-<pid>.root 记的 lstart 与 ps 现值不一致 = pid 已被
+    复用，判死（stale pidfile，该重拉）。戳缺失/lstart 读不出时保守当存活
+    （fail-open 旧语义）——外部旧式启动的 monitor 没有戳，不能误杀单例。"""
+    if not _pid_alive(pidfile):
+        return False
+    try:
+        pid = int(pidfile.read_text().strip())
+        marker = pidfile.parent / f"proc-{pid}.root"
+        parts = marker.read_text().strip().split("\t")
+    except Exception:
+        return True  # pid 活但戳读不出：fail-open 当存活（与 _process_serve_root 同纪律）
+    if not (len(parts) == 2 and parts[1]):
+        return True  # 无戳/坏戳：外部旧式启动，保守当活
+    cur = _ps_field(pid, "lstart=")
+    if not cur:
+        return True  # ps 读不出（如 Windows 无 ps）：保守当活
+    return cur == parts[1]
+
+
 class _KillTreeError(RuntimeError):
     """Windows taskkill 停树失败（带 rc/输出尾）——必须浮出，不得静默吞
     （旧版 os.killpg 在 nt 抛 AttributeError 被外层 except 吞掉 = down 静默失效）。"""
@@ -1772,11 +1807,23 @@ def _kill_pidfile(pidfile: Path) -> None:
 
 
 def _ensure_monitor(py) -> None:
-    """C6-1:常驻 worker monitor 单例拉起(pidfile 存活即跳过)。"""
+    """C6-1:常驻 worker monitor 单例拉起(pidfile 存活即跳过)。
+
+    2026-09-22 盲斑修复：①存活判定升级为 lstart 比对（_pidfile_alive_stamped，
+    pidfile 残留 pid 被复用不再误判活 = 栈无 monitor）；②跨树可观测——monitor
+    属他树时打日志跳过（共享栈模型既定行为，从静默变有声，不改变动作）。"""
     run_dir = app_data_dir() / "run"
     log_dir = app_data_dir() / "logs"
     pidfile = run_dir / "monitor.pid"
-    if _pid_alive(pidfile):
+    if _pidfile_alive_stamped(pidfile):
+        try:
+            pid = int(pidfile.read_text().strip())
+            foreign, root = _pid_origin_foreign(pid)
+            if foreign:
+                print(f"[bok] monitor 已在运行且属另一代码树（{root}）——跳过拉起"
+                      "（共享栈模型；要换装先去对方树 down）")
+        except Exception:
+            pass
         return
     _start_proc(
         [str(py), str(Path(__file__).resolve()), "monitor"],
@@ -1839,6 +1886,11 @@ def cmd_monitor() -> int:
     log_dir = app_data_dir() / "logs"
     run_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
+    # 盲斑 1 修复（2026-09-22）：外部手跑 monitor 也落 pidfile+来源戳——旧版只
+    # 有 _start_proc 拉起的 monitor 才有痕迹，外部启动令 _ensure_monitor 探不到
+    # 单例（双监控环）、跨树杀守卫对无戳进程不保护。经 _start_proc 拉起时同
+    # 内容写两次，幂等无害。
+    _write_proc_stamps(run_dir / "monitor.pid", os.getpid())
     print("[monitor] started — watching :7880 + workers 8081/8082/8083")
     lk_up = healthy(7880)
     last_action = 0.0

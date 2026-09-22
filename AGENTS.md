@@ -103,10 +103,25 @@ scripts/build_node_pkg.sh <version>     # 发版：节点代码包（+ build_run
   `_spawn_report` 入池 + `except asyncio.CancelledError` 回滚 `_wa_reported` key（teardown 掐杀不走
   `except Exception` → 捕获永不补报）。⑧`ControlPlaneClient.report_dial_result` 重复定义删除（后者静默遮蔽
   前者，改一份即死代码）。⑨ASR sidecar `_sessions` 懒清扫（TTL 180s/总量 512，**插入后**清扫不变量）——
-  client 取消/崩溃致 finish 永不到达时 PCM bytearray 跨通话驻留泄漏。**缓项（有档未修）**：14 处未持引用
-  fire-and-forget task（A-F4 其余：context 更新/背景 judge/interpret 落库等，内部自捕异常、残余风险仅
-  teardown GC）、`/api/token` 无记录房间可铸 publish token+拉 agent dispatch、diag 路由（asr/tts health、
-  web_logs）无角色闸、webhook 无 secret 时 fail-open、B 线 interp 409 session-report 竞态（A 线先写则纪要丢）。
+  client 取消/崩溃致 finish 永不到达时 PCM bytearray 跨通话驻留泄漏。**缓项清账（2026-09-22 核账，旧「有档未修」
+  已全部修掉，档案曾过时误导盘点）**：①fire-and-forget 全量收编（2026-09-18 A-F4 收官，门禁
+  `tests/test_fire_forget_pool.py` 扫 apps/agent 零裸 create_task——新调用点必须走四种钦点 helper 之一
+  （`_spawn_report`/`_SETTLE_TASKS`/`_spawn_pooled_task`/`_spawn_bg`）或带 `FIRE_FORGET_EXEMPT:` 理由标记；
+  双池语义勿归一：`_report_tasks`/`_ledger_tasks` 参与 settle gather flush、`_SETTLE_TASKS` 纯引用池故意不被
+  gather——`_end` 延时睡眠是理由）；②`/api/token` 无记录房间（P1-C，`test_token_dispatch.py`：recordless=
+  subscribe-only+不挂 dispatch+单独审计）；③diag 路由（P3-A，`test_diag_gates.py`：asr/tts health 走
+  `_gate_page("settings")`；`/api/web_logs` 保留 user 可写=产品决定）；④webhook 无 secret（2026-09-21 收口：
+  auth-on 或非回环 bind 一律 401 fail-closed，仅「双关 auth-off+回环 bind」carve-out 放行并打点
+  `webhook.unsigned`）；⑤B 线 session-report 竞态（P1-A worker 字段：per-worker 报告列，异 worker ended 后
+  照收，`test_session_reports.py`）。**真实剩余面（2026-09-22 定案）**：机器通道 supervisor/listen 铸币（已修：
+  token 端点单一收窄点，`test_token_dispatch.py` 机器通道四腿）、旧格式（worker=""）报告在 worker 报告占主列后
+  逆序到达仍 409（实际拓扑 interpret 房不派 bok-voice，混合房不出现，不修）、`_stop_pidfile` pid 复用+无戳
+  fail-open 残余（PR #149 已知边界）。**monitor 三盲斑已修（2026-09-22）**：`cmd_monitor` 入口自写 pidfile+
+  来源戳（`_write_proc_stamps` 单点，外部手跑不再无痕=双监控环）、`_ensure_monitor` 存活判定升级 lstart 比对
+  （`_pidfile_alive_stamped`：pidfile 残留 pid 被复用不再误判活=栈无 monitor；无戳 fail-open 旧语义）、他树
+  monitor 跳过留痕——`tests/test_bok_stamp_guard.py` 钉住。**worker 单例守卫修序（2026-09-22）**：
+  `run_agent` 的 `BOK_WORKER_PORT` 解析上移到 `worker_port_singleton_guard` 之前（旧序守卫写死 8081 且先于
+  env 读取——自定义端口时防双实例保护对实际监听口失效）。
 
 ## Testing Guidelines
 

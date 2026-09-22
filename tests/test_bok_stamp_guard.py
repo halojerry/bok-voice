@@ -295,3 +295,85 @@ def test_respawn_skips_healthy_port(monkeypatch, tmp_path):
             continue
         bok._start_proc(spec["argv"], spec["pidfile"], spec["logfile"], env=spec["env"])
     assert started == [1], "只有不健康端口该被拉起"
+
+
+# ---------------------------------------------------------------------------
+# monitor 单例/来源三盲斑（2026-09-22）
+# ---------------------------------------------------------------------------
+
+def test_cmd_monitor_writes_own_stamps(monkeypatch, tmp_path):
+    """盲斑 1：外部手跑 monitor 也落 pidfile+戳。helper 直测（监控环是死循环，
+    入口接线按源码钉——cmd_monitor 必须自写，否则外部启动无痕=双监控环）。"""
+    home = _tmp_home(monkeypatch, tmp_path)
+    run = _run_dir(home)
+    pid = os.getpid()
+    bok._write_proc_stamps(run / "monitor.pid", pid)
+    assert (run / "monitor.pid").read_text().strip() == str(pid)
+    parts = (run / f"proc-{pid}.root").read_text().strip().split("\t")
+    assert len(parts) == 2 and parts[0] == str(bok.ROOT)
+    # 真 lstart：写完立刻按戳判活成立；幂等重写不炸
+    assert bok._pidfile_alive_stamped(run / "monitor.pid") is True
+    bok._write_proc_stamps(run / "monitor.pid", pid)
+    assert bok._pidfile_alive_stamped(run / "monitor.pid") is True
+    import inspect
+    assert "_write_proc_stamps(run_dir / \"monitor.pid\", os.getpid())" in inspect.getsource(bok.cmd_monitor)
+
+
+def test_pidfile_alive_stamped_pid_reuse_judged_dead(monkeypatch, tmp_path):
+    """盲斑 2：pidfile 指向活进程但戳 lstart 对不上（pid 被复用）→ 判死；
+    无戳/坏戳 fail-open 当活（外部旧式启动不能被误杀单例）；死 pid 基础语义不回归。"""
+    home = _tmp_home(monkeypatch, tmp_path)
+    pool = _FakeWorkers()
+    try:
+        proc = pool.spawn(None)
+        run = _run_dir(home)
+        (run / "monitor.pid").write_text(str(proc.pid))
+        (run / f"proc-{proc.pid}.root").write_text(
+            f"{bok.ROOT}\tFAKE LSTART (recycled)\n", encoding="utf-8")
+        assert bok._pidfile_alive_stamped(run / "monitor.pid") is False
+        (run / f"proc-{proc.pid}.root").unlink()
+        assert bok._pidfile_alive_stamped(run / "monitor.pid") is True
+        (run / f"proc-{proc.pid}.root").write_text(f"{bok.ROOT}\n", encoding="utf-8")
+        assert bok._pidfile_alive_stamped(run / "monitor.pid") is True
+        _write_marker(home, proc.pid, str(bok.ROOT))
+        assert bok._pidfile_alive_stamped(run / "monitor.pid") is True
+        proc.terminate()
+        proc.join(timeout=5)
+        (run / f"proc-{proc.pid}.root").unlink(missing_ok=True)
+        assert bok._pidfile_alive_stamped(run / "monitor.pid") is False
+    finally:
+        pool.cleanup()
+
+
+def test_ensure_monitor_reuse_respawns_foreign_logs(monkeypatch, tmp_path, capsys):
+    """盲斑 2/3 收口行为：stale pidfile（pid 复用）→ 重拉；他树活 monitor →
+    跳过+留痕；本树活 monitor → 静默跳过。_start_proc 打桩绝不真起进程。"""
+    home = _tmp_home(monkeypatch, tmp_path)
+    run = _run_dir(home)
+    started: list[str] = []
+    monkeypatch.setattr(bok, "_start_proc", lambda *a, **k: started.append("x") or 12345)
+    pool = _FakeWorkers()
+    try:
+        recycled = pool.spawn(None)
+        (run / "monitor.pid").write_text(str(recycled.pid))
+        (run / f"proc-{recycled.pid}.root").write_text(
+            f"{bok.ROOT}\tSTALE LSTART\n", encoding="utf-8")
+        bok._ensure_monitor(sys.executable)
+        assert started, "stale pidfile（pid 复用）该触发重拉"
+
+        started.clear()
+        foreign = pool.spawn(OTHER_ROOT)
+        (run / "monitor.pid").write_text(str(foreign.pid))
+        (run / f"proc-{foreign.pid}.root").unlink(missing_ok=True)
+        bok._ensure_monitor(sys.executable)
+        assert not started, "他树活 monitor 该跳过"
+        assert "属另一代码树" in capsys.readouterr().out
+
+        started.clear()
+        own = pool.spawn(str(bok.ROOT))
+        (run / "monitor.pid").write_text(str(own.pid))
+        bok._ensure_monitor(sys.executable)
+        assert not started, "本树活 monitor 该静默跳过"
+        assert capsys.readouterr().out == ""
+    finally:
+        pool.cleanup()
