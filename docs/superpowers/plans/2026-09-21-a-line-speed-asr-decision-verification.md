@@ -4315,6 +4315,45 @@ qwen3_5 混合注意力的 cache 是 ArraysCache **不可 trim**（mlx-lm 源码
 - `tools/bok.py` 一行提示语改动（cmd_up setup 指引指向 bootstrap.sh/install-node.sh，
   Windows 软退役配套）随本次收官提交。
 
+## 51. 并发测试收官（2026-09-22，合并前补课，用户问「并发测试都跑过了吗」）
+
+此前会话已跑真机多组多轮（§48/§50.2：8 通话 90+ 轮、offscript 5×10、barge-in×2、
+16 轮延迟、intent-judge、filler_timing、latency_soak），**并发资产此前未跑**——本节
+补齐两件（隔离栈同 §50 配方：DB 副本 + 隔离 CP + 本树 worker 接管，跑完交还）。
+
+### 51.1 CP 并发（load_cp_concurrency，自包含 :8001 + 临时 DB）
+
+**CP_LOAD PASS**（本树代码）：A 混合读 200 并发 p50=298ms p95=372ms 0 错；
+B 对象 CRUD 20/20；C **turns 30/30 并发写全落库**（turn_id 竞态回归正是这条钉）；
+D 无 LiveKit 凭据 token 50 发全干净 503（无 500/挂起）。
+
+### 51.2 音频并发（load_audio_concurrency 4 路 × 3 轮，真音频真通话）
+
+- **Run 2（稳态）PASS**：4/4 路全健康，12/12 轮真音频；t1 冷启 first≈10.7s
+  （第 4 个 job 进程冷 spawn 1.16s 在内），warm 轮 first≈3.2s、
+  real_after_speech p50=−739ms（垫话在客户话音未完时已出声=P3 垫话行为正常读数，
+  非抢答）；wall 26s；无错轮无挂死。
+- **Run 1（冷启首波）发现偶发派发缺口**：road3 建单成功、operator 入房，但
+  **agent job 从未派发**（agent.log 对该房间零行、`received job request` 只有 3 条），
+  三轮 first=None 空等；**headline 却报 PASS ok=12/12——探针把死路轮计成 ok 的
+  假绿缺陷**，已修（见 51.3）。
+- **根因定位（框架层，非本会话改动）**：worker 以 prod 模式跑
+  （日志 `adaptive interruption is disabled by default in production mode`），
+  livekit-agents `_default_load_threshold` **prod 档=0.7**（worker.py:148）；
+  冷启 worker idle 池默认 3 进程，第一波 4 房间突发时前三路起跳后 load 越 0.7，
+  第 4 路 job 请求晚到 ~300ms 被门槛挡掉，**单 worker 部署无处重派**=agent 永不
+  入房。Run 2 四路请求同毫秒窗齐到（load 未及上抬）→ 全过。两树 WorkerOptions
+  逐字一致（dispatch 层本会话零改动），间歇性+框架层=基线特征非回归。
+- **生产暴露面有限**：战役外呼 `max_concurrency` 温和爬升（一轮至多补一通），
+  不会瞬时 4 路冷突发；手工并发建单可触发。跟进杠杆（未做）：worker env 抬
+  load_threshold/加 num_idle_processes，或部署侧双 worker。本会话不阻塞合并。
+
+### 51.3 探针反假绿修复（随本节提交）
+
+`scripts/load_audio_concurrency.py` 判据收紧：`ok` 必须有 `first_ms`（死路轮
+改计 `mute` 并逐行打印 MUTE road/turn）——run 1 那种「一路全哑 headline PASS」
+不再可能。离线验证判据表达式（构造含 None 轮的 results 分类正确）。
+
 
 
 
