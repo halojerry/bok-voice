@@ -166,10 +166,13 @@ python3 tools/bok.py doctor            # 判据：doctor: OK（dev 模式 warnin
 KV 量化（llama-server 档 `--cache-type-k/v q8_0`）与 mlx 完全不同；`LLM_TTFT_MS cached=N/M`
 读数来自 mlx usage 面，llama-server 未必给同名字段——所有延迟结论必须 Linux 实测重采。
 
-② **llama-server `-m` 需要真 GGUF 文件路径**：非打包档 `model_path` 对 Linux 返回 repo id
-字符串（`model_path` 的 win dev 档语义），llama-server 不认 repo id——:1235 起不来或
-`model not found`。修复姿势：settings `llm.local_model` 填绝对路径（最高优先级）或
-`BOK_PACKAGED=1`。**上栈第一验。**
+② **llama-server `-m` 需要真 GGUF 文件路径**（🔧解析层已修，2026-09-22；**真机验收
+仍待**）：非打包档 `model_path` 原对 Linux 返回 repo id 字符串（win dev 档语义），
+llama-server 不认 repo id——:1235 起不来或 `model not found`。现 Linux dev 档保守解析：
+cmd_download 落盘布局 `app-data/models/<repo>/*.gguf` 里**真有 gguf** 才返回文件路径，
+否则保持 repo id 兜底（与 mac「哪边真有模型用哪边」同纪律）；packaged 分支不动。
+回归钉=`tests/test_linux_node_wiring.py` §7 两条。逃生位不变：settings
+`llm.local_model` 填绝对路径（最高优先级）或 `BOK_PACKAGED=1`。**上栈第一验。**
 
 ③ **prod env 封闭面三平台同病**：dev `serve` 靠 `_start_proc` merge `os.environ` 全活；
 prod（mac=launchd / Windows=schtasks / **Linux=systemd Environment=**）只带白名单。

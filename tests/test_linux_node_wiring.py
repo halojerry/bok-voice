@@ -236,3 +236,23 @@ def test_worker_env_default_still_local(monkeypatch):
     monkeypatch.delenv("CONTROL_PLANE_URL", raising=False)
     env = bok._agent_worker_env(bok.repo_python())
     assert env["CONTROL_PLANE_URL"] == "http://127.0.0.1:8000"
+
+
+# ---- 7. model_path Linux dev 档 gguf 解析（runbook §5②，2026-09-22）----
+
+
+def test_model_path_linux_dev_prefers_downloaded_gguf(monkeypatch, tmp_path: Path):
+    """cmd_download 落盘的 *Q4_K_M.gguf 应解析为文件路径（llama-server 只认文件）。"""
+    monkeypatch.setattr(bok._platform, "system", lambda: "Linux")
+    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
+    gguf = tmp_path / "models" / "Qwen--Qwen3-4B-Q4_K_M" / "Qwen3-4B.Q4_K_M.gguf"
+    gguf.parent.mkdir(parents=True)
+    gguf.write_text("x")
+    assert bok.model_path({"llm": "Qwen/Qwen3-4B-Q4_K_M"}, "llm") == str(gguf)
+
+
+def test_model_path_linux_dev_no_gguf_keeps_repo_id(monkeypatch, tmp_path: Path):
+    """布局里没有 gguf 时保持 repo id 兜底（win-dev hf cache 语义，行为不变）。"""
+    monkeypatch.setattr(bok._platform, "system", lambda: "Linux")
+    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
+    assert bok.model_path({"llm": "Qwen/Qwen3-4B"}, "llm") == "Qwen/Qwen3-4B"

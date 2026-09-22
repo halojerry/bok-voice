@@ -196,6 +196,20 @@ def model_path(current: dict[str, str], name: str) -> str:
         if _usable_model_dir(app):
             return str(app)
         return str(lm)
+    if is_linux():
+        # Linux dev（runbook §5②，2026-09-22）：cmd_download 只落 *Q4_K_M.gguf 进
+        # app-data/models/<repo>（WINDOWS_LLM_GGUF_PATTERNS），llama-server 只认
+        # .gguf **文件**路径——repo id 是 win-dev 的 hf cache 语义，直传会 :1235
+        # 起不来/model not found。保守解析：布局里真有 gguf 才返回文件路径，
+        # 否则保持 repo id 兜底（与 mac「哪边真有模型用哪边」同纪律）；真机验收
+        # 仍以 runbook §4 上栈第一验为准。
+        try:
+            _ggufs = sorted(model_dir(repo).glob("*.gguf"))
+        except OSError:
+            _ggufs = []
+        if _ggufs:
+            return str(_ggufs[0])
+        return repo
     return repo
 
 
