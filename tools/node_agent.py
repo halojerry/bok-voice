@@ -35,6 +35,9 @@ TOOLS_DIR = Path(__file__).resolve().parent
 ROOT_DIR = TOOLS_DIR.parent
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
+# 共享出站守卫（2026-09-23，Mimosa SSRF 修复）——与 mine_qa 同款 bootstrap。
+if str(ROOT_DIR / "packages" / "core") not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR / "packages" / "core"))
 
 
 # ---- 日志（W1，2026-09-18）：console + 轮转文件双面 ----
@@ -145,13 +148,45 @@ def collect_fingerprint() -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+# ---- 出站守卫（2026-09-23，Mimosa SSRF 修复）----
+# node-agent 的 CP 端点=operator 配置（云端公网/内网 CP/本地缺省皆合法），恒不
+# 合法的只有云元数据/组播/未指定段与坏 scheme——用 urlguard 公网守卫的
+# allow_private 档拦「永不合法集」（resolve=False：启动期不做 DNS，云端主机
+# 解析抖动不该 FATAL 节点；字面量段已够拦配置错字与元数据端）。
+# 重定向禁随（bok.py `_NoRedirect` 同款）：心跳/日志上传/包下载全部带 Bearer
+# node_token，被劫持的 CP 一条 30x 就能把凭据引去任意主机，禁随是结构性止血。
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        raise RuntimeError(f"redirect not allowed ({code}) — Bearer 凭据不跟随重定向")
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def validate_cp_base(cp_url: str) -> str:
+    """节点 CP 基址守卫：scheme http/https + 拒元数据/组播/未指定段。
+
+    公网/私网/环回 CP 都合法（云 CP、内网 CP、dev 缺省 127.0.0.1:8000）。
+    main() 启动期对**生效值**（--cp-url 与显式 env 两面）单点校验，坏配置
+    FATAL 退出——错配的节点不应带着坏端点跑心跳循环。
+    """
+    from bok_voice_core.urlguard import UrlGuardError, assert_public_http_url
+
+    try:
+        return assert_public_http_url(cp_url, allow_private=True, resolve=False)
+    except UrlGuardError as exc:
+        raise SystemExit(f"[node-agent] FATAL: CP 基址不合规: {exc}") from exc
+
+
 def _post_json(url: str, payload: dict, headers: dict | None = None,
                timeout: int = 10) -> tuple[int, dict]:
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json", **(headers or {})}, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _OPENER.open(req, timeout=timeout) as resp:
             return resp.status, json.loads(resp.read().decode())
     except urllib.error.HTTPError as exc:
         try:
@@ -246,7 +281,7 @@ def heartbeat_once(cfg: NodeConfig, metrics: dict | None = None,
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with _OPENER.open(req, timeout=10) as resp:
             return True, json.loads(resp.read().decode())
     except urllib.error.HTTPError as exc:
         # 401/403 带 body（detail=unknown node token / node revoked / license revoked /
@@ -519,9 +554,17 @@ def dispatch_commands(cfg: NodeConfig, commands: list, *,
 
 
 def _http_download(url: str, token: str, dest: Path, timeout: int = 300) -> None:
-    """流式下载（Bearer node_token 自证，与心跳同凭据面）。非 200 抛 RuntimeError。"""
+    """流式下载（Bearer node_token 自证，与心跳同凭据面）。非 200 抛 RuntimeError。
+
+    SSRF/穿越加固（2026-09-23，Mimosa 修复）：dest 必须是绝对路径且不含 '..'
+    （调用方现形状=tempdir+已校验版本号，此断言防未来调用方退化）；走
+    `_OPENER` 禁随重定向——下载请求带 Bearer node_token，30x 引导=凭据外送。
+    """
+    dest = Path(dest)
+    if not dest.is_absolute() or ".." in dest.parts:
+        raise ValueError(f"download dest must be absolute without '..': {dest}")
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as f:
+    with _OPENER.open(req, timeout=timeout) as resp, open(dest, "wb") as f:
         while True:
             chunk = resp.read(1 << 20)
             if not chunk:
@@ -690,7 +733,7 @@ def upload_recent_logs(cfg: NodeConfig, *, log_dir: Path | None = None,
             data=payload, method="POST",
             headers={"Authorization": f"Bearer {cfg.node_token}",
                      "Content-Type": "application/gzip"})
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with _OPENER.open(req, timeout=60) as resp:
             body = json.loads(resp.read().decode())
         return "" if body.get("ok") else f"cp rejected: {body}"
     except urllib.error.HTTPError as exc:
@@ -842,6 +885,13 @@ def main(argv=None) -> int:
     # 云 CP 节点形态接线（runbook §5④）：cmd_up 拉起的 worker/monitor 靠
     # os.environ 读到 CONTROL_PLANE_URL（缺省本地 :8000 在云 CP 节点上断链）。
     LOG.info("worker CONTROL_PLANE_URL -> %s", apply_cp_url_to_env(args.cp_url))
+
+    # SSRF 守卫（2026-09-23，Mimosa 修复）：生效 CP 基址（--cp-url 与显式 env
+    # 两个面——cfg/心跳走 args，worker 走 env）启动期各过一次守卫：scheme
+    # 白名单 + 拒元数据/组播/未指定段；公网/私网/环回 CP 均合法（节点形态使然）。
+    # 坏配置 FATAL 退出，不带坏端点进心跳循环。
+    validate_cp_base(args.cp_url)
+    validate_cp_base(os.environ["CONTROL_PLANE_URL"])
 
     stack_down = False
 

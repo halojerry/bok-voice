@@ -26,6 +26,7 @@ from bok_voice_core.flow_graph import validate_flow_graph
 from bok_voice_core.intent_rules import validate_conditions
 from bok_voice_core.providers import BusinessRepository
 from bok_voice_core.policies import select_session_manifest
+from bok_voice_core.urlguard import UrlGuardError, assert_public_http_url
 from bok_voice_core.qa_text import mine_qa_pairs
 from bok_voice_core.types import CallMode, CallStatus, Role, SessionManifest, TurnEvent
 
@@ -546,6 +547,18 @@ def put_settings(req: SettingsRequest, request: Request) -> dict:
             if not new.get(key) and old.get(key):
                 new[key] = old[key]
         new_values[kind] = new
+    if new_values.get("sms", {}).get("enabled") and str(new_values["sms"].get("webhook_url") or "").strip():
+        # SSRF 守卫（2026-09-23，Mimosa 修复）：**启用中**的 webhook_url 保存期
+        # 全验（scheme + DNS 解析后地址段）——配置错字/内网/云元数据端点当场
+        # 400，不等发送期才炸。私网实验室网关走 allow_private_webhook 显式放行
+        # （元数据段恒拒）。未启用的草稿 URL 不拦（保存摩擦留给启用那一刻）。
+        try:
+            assert_public_http_url(
+                str(new_values["sms"]["webhook_url"]).strip(),
+                allow_private=bool(new_values["sms"].get("allow_private_webhook")),
+            )
+        except UrlGuardError as exc:
+            raise HTTPException(400, f"短信 webhook URL 不合规: {exc}") from exc
     if req.campaign is not None:
         # 全局外呼时段窗（T3b）：归一后落库（非法项静默丢弃、≤3 组），
         # 空/全非法=不限时段。请求未带 campaign 键（None）→ 段不动（仓库层
@@ -591,9 +604,17 @@ async def _send_sms_webhook(cfg: dict, to: str, text: str) -> int:
     重算校验，参照 CP webhook 验签的「摘要绑定 body」思路反向运用）。
     返回上游 status_code；网络/HTTP 失败抛异常由调用方收敛（端点 502 /
     挂断钩子打点吞掉）。
+
+    SSRF 守卫（2026-09-23，Mimosa 修复）：发送期复验 URL——scheme 白名单 +
+    字面量地址段（resolve=False，结算尾钩子不被 DNS 阻塞；保存期已全验过
+    DNS，这里拦的是绕过保存面改库/字面量倒退）。私网放行口=
+    settings.sms.allow_private_webhook（与保存期同开关；云元数据段恒拒）。
     """
     url = str(cfg.get("webhook_url") or "").strip()
     secret = str(cfg.get("secret") or "")
+    assert_public_http_url(
+        url, allow_private=bool(cfg.get("allow_private_webhook")), resolve=False
+    )
     body = json.dumps({"to": to, "text": text}, ensure_ascii=False).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if secret:

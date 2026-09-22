@@ -5,6 +5,8 @@
 // Zero-Ollama: there is no native /api/chat transport anymore; only the
 // OpenAI-compatible /v1/chat/completions endpoint is used.
 
+import { assertLocalDiagUrl } from "../lib/url-guard.js";
+
 const DEFAULT_OPTS = {
   baseUrl: "http://127.0.0.1:1235/v1",
   model: "",
@@ -37,6 +39,8 @@ export class LocalOpenAITranslator {
       this.opts.model = process.env.MLX_LLM_MODEL || "local";
     }
     this.baseUrl = this.opts.baseUrl.replace(/\/+$/, "");
+    // SSRF 守卫（2026-09-23，Mimosa 修复）：构造期 fail-fast（同 ASR/TTS provider）。
+    assertLocalDiagUrl(this.baseUrl);
     this.chatUrl = this.baseUrl.endsWith("/v1")
       ? `${this.baseUrl}/chat/completions`
       : `${this.baseUrl}/v1/chat/completions`;

@@ -84,6 +84,20 @@ def cache_key(
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
+_HEX_KEY_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _assert_hex_key(key: str) -> None:
+    """缓存键形状断言（2026-09-23，Mimosa path-traversal 防御收口）。
+
+    全部合法键都出自 `cache_key`（sha1 hex，40 位小写）。当前调用链无外部
+    可控 key 直通（运行时/pregen 均经 `key_for`），此断言防未来调用方退化：
+    非 hex 键（含 '../' 等穿越段）在拼路径前 ValueError，绝不落盘/读盘。
+    """
+    if not _HEX_KEY_RE.fullmatch(str(key or "")):
+        raise ValueError(f"tts cache key malformed: {str(key)[:16]!r}")
+
+
 def tts_cache_enabled() -> bool:
     return os.environ.get(_ENABLE_ENV, "1") == "1"
 
@@ -146,9 +160,11 @@ class TtsAudioCache:
         )
 
     def _pcm_path(self, key: str) -> Path:
+        _assert_hex_key(key)
         return self.root / f"{key}.pcm"
 
     def _meta_path(self, key: str) -> Path:
+        _assert_hex_key(key)
         return self.root / f"{key}.json"
 
     def get(self, key: str) -> bytes | None:

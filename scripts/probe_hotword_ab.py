@@ -52,6 +52,9 @@ import httpx
 ROOT = Path(__file__).resolve().parents[1]
 ASR_URL = os.environ.get("ASR_URL", "http://127.0.0.1:8787")
 TTS_URL = os.environ.get("TTS_URL", "http://127.0.0.1:8788")
+from urlguard_gate import gate  # SSRF 守卫（2026-09-23，Mimosa）：云端测试设 BOK_PROBE_EXTRA_HOSTS
+
+gate(ASR_URL, TTS_URL)
 TAG = os.environ.get("PROBE_TAG", "ab")
 ROUNDS = int(os.environ.get("PROBE_ROUNDS", "2") or 2)
 SENT_GAP_S = float(os.environ.get("PROBE_SLEEP_S", "0.6") or 0.6)

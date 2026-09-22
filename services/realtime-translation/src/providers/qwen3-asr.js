@@ -3,6 +3,7 @@
 // /api/start|chunk|finish protocol is shared with the A-line agent.
 
 import { EnergyVAD } from "./energy-vad.js";
+import { assertLocalDiagUrl } from "../lib/url-guard.js";
 
 function resample16k(pcm, sampleRate, targetRate) {
   if (sampleRate === targetRate) return pcm;
@@ -22,6 +23,8 @@ function resample16k(pcm, sampleRate, targetRate) {
 export class Qwen3ASRProvider {
   constructor({ baseUrl = "http://127.0.0.1:8787", sampleRate = 16000, timeoutMs = 30000, vad } = {}) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
+    // SSRF 守卫（2026-09-23，Mimosa 修复）：构造期 fail-fast（同 Qwen3TTSProvider）。
+    assertLocalDiagUrl(this.baseUrl);
     this.sampleRate = sampleRate;
     this.timeoutMs = timeoutMs;
     this.vad = vad || new EnergyVAD({ sampleRate });
