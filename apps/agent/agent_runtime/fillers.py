@@ -476,6 +476,16 @@ class FillerDirector:
         """
         self._reply_audio_seen = True
         self._cancel_timer()
+        # P0.2(2026-09-21,§48 仪器化):垫话→真回复衔接观测,只在本轮真垫过
+        # (fired_this_round,防上一轮残值)才打。early=回复音频先到、被
+        # hold 扣住(用户无缝衔接);gap=垫话播完后的裸静默——垫音体验主指标
+        # (§48 P3 门槛 gap p90 ≤500ms)。
+        if self._play_started > 0 and self.fired_this_round():
+            rel_ms = (time.monotonic() - (self._play_started + self._cur_dur)) * 1000
+            if rel_ms >= 0:
+                print(f"BOK_FILLER reply_gap={rel_ms:.0f}ms", flush=True)
+            else:
+                print(f"BOK_FILLER reply_early={-rel_ms:.0f}ms (held)", flush=True)
 
     def set_on_fired(self, cb) -> None:
         """注册「垫话真正开播」回调(2026-09-17 RC3):agent 侧把响应看门狗顺延

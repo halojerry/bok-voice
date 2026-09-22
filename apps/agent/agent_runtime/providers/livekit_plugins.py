@@ -2063,7 +2063,14 @@ def _truncate_chat_items(items: list, max_turns: int = 4) -> list:
     # 滞回:超过 2×max_turns 对(4×max_turns 条)才截,剪回 max_turns 对。
     if len(dialog) <= max_turns * 4:
         return items
-    return system_part + dialog[-(max_turns * 2) :]
+    out = system_part + dialog[-(max_turns * 2) :]
+    # P0.3(2026-09-21,§48 仪器化):截断=KV 严格前缀断裂,该轮全量重 prefill
+    # (§46.1 受控实验 2.5× 尖峰)——先计数观测,截断策略(P1.3)按此数据定。
+    print(
+        f"HISTORY_TRUNCATED items={len(items)}->{len(out)} max_turns={max_turns} (KV prefix re-anchor)",
+        flush=True,
+    )
+    return out
 
 
 class ExprAwareLLM(llm.LLM):

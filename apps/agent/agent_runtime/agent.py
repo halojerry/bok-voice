@@ -2542,9 +2542,18 @@ async def entrypoint(ctx):
             return
         # W4-T2 意向账本:真触发才计数(拆弹/未武装不计)——「哑轮频发」信号。
         _facts["watchdog_fired"] += 1
+        # P0.4(2026-09-21,§48 仪器化):开火时带上可归因上下文——尾部字数(肥尾
+        # prefill=「越聊越慢」主因,§46.1)与 LLM 轮序(垫话 director 的 arm 计数,
+        # ≈本通走到 LLM 路径的轮数)。85 次实弹的归因按这行数据分档(§48 P3.4)。
+        try:
+            _tail_chars = len(context_state.render_context_tail())
+            _llm_turns = getattr(_filler, "_turn_seq", -1)
+        except Exception:  # noqa: BLE001 - 观测失败不阻兜底
+            _tail_chars, _llm_turns = -1, -1
         print(
             f"[watchdog] no assistant audio {_response_watchdog_s():.0f}s after commit "
-            f"-> force-interrupt + ack (call {room_name})",
+            f"-> force-interrupt + ack (call {room_name}) "
+            f"[P0.4 tail_chars={_tail_chars} llm_turns={_llm_turns}]",
             flush=True,
         )
         try:
