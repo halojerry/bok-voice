@@ -12,6 +12,7 @@ import httpx
 # 逐字不碰——那是原始证据面。kill-switch ``BOK_POLISH_OFFLINE`` 默认关（见
 # ``polish_wiring`` 模块 docstring 的实测理由）。
 from bok_voice_core.deepseek_llm import thinking_extra_body
+from bok_voice_core.json_repair import loads_lenient
 from bok_voice_core.polish_wiring import polish_offline_text
 
 
@@ -152,12 +153,24 @@ class Summarizer:
         try:
             data = json.loads(m.group(0))
         except Exception as exc:  # noqa: BLE001 - 坏 JSON 是模型输出问题，可见即可
-            print(
-                f"[summarize] 模型吐的 JSON 解析失败（content {len(text)} 字）：{exc} "
-                f"→ 退指标摘要（new_topics/insight 全丢）",
-                flush=True,
-            )
-            return self._fallback([])
+            # 「内容全对、只漏了最外层一个 `}`」是本机 9B 的**主要坏法**（2026-09-21
+            # 真实转写 6/6 复现，见 bok_voice_core.json_repair 模块 docstring）。
+            # 先试保守补括号再判失败——不然这些**内容完好**的纪要会整批退成桩文本。
+            repaired = loads_lenient(m.group(0))
+            if repaired is not None:
+                print(
+                    f"[summarize] 模型 JSON 漏收尾 → 补括号救回（content {len(text)} 字，"
+                    f"原错：{exc}）",
+                    flush=True,
+                )
+                data = repaired
+            else:
+                print(
+                    f"[summarize] 模型吐的 JSON 解析失败且补不回来（content {len(text)} 字）：{exc} "
+                    f"→ 退指标摘要（new_topics/insight 全丢）",
+                    flush=True,
+                )
+                return self._fallback([])
         return {
             "summary": str(data.get("summary", "")),
             "new_topics": list(data.get("new_topics", [])),
