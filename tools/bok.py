@@ -1379,6 +1379,9 @@ _FORWARD_ENV = (
     "BOK_QA_ROTATION",
     "BOK_QA_PRIORITY",
     "BOK_QA_FASTPATH",
+    # —— 粤语音系补位层(2026-09-22:字面 miss 后粤拼槽位对齐;zh 线无此档) ——
+    "BOK_QA_PHONETIC",
+    "BOK_QA_PHONETIC_THRESHOLD",
     # —— 分支罐头快路+分支动作(2026-09-20 路线 A-①/A-②:分支命中→物化录音跳
     #    LLM;应答首部【收线】/【转人工】/【跳第N步】/【留本步】动作前缀=引擎一等出口) ——
     "BOK_BRANCH_ACTION",
