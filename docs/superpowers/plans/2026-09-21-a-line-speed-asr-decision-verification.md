@@ -4292,8 +4292,10 @@ qwen3_5 混合注意力的 cache 是 ArraysCache **不可 trim**（mlx-lm 源码
 
 1. **本机 `~/.bok_dev_jwt_secret`/`~/.bok_dev_cp_token` 不存在**（AGENTS.md 标准姿势
    文件缺失）——CP fail-closed 闸如实拦下启动（`BOK_AUTH_REQUIRED=1 但未配置
-   BOK_JWT_SECRET 拒绝开启认证`，顺带实弹验证了这道闸）。修正=为隔离栈生成一次性
-   密钥（openssl rand，0600，只活 /tmp/bok-realtest，勿入库勿提交；异值校验过）。
+   BOK_JWT_SECRET 拒绝开启认证`，顺带实弹验证了这道闸）。**当晚已按用户拍板补齐
+   标准两文件**（openssl rand 生成、0600、jwt 64 字节≥32、异值校验过），并冒烟
+   验证全链：隔离 CP 标准姿势起=health 200/裸 401/机器通道 200/root 登录拿 JWT
+   →me 200。此后接管配方直接吃标准文件，不再现场造 /tmp 一次性密钥。
 2. **隔离 CP 必须带 LiveKit 三枚 env**（`LIVEKIT_URL=ws://127.0.0.1:7880
    LIVEKIT_API_KEY=devkey LIVEKIT_API_SECRET=devsecret`，来源=peer CP 进程 env/
    services/livekit-server/livekit.yaml）——缺了则 `/api/token` 503
