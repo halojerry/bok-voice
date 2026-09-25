@@ -99,6 +99,75 @@ SOAK_SCENARIOS: dict[str, dict] = {
             {"text": "the tracking number is eight six five three two seven four zero", "op": "digits2"},
         ],
     },
+    # 邀约腿（2026-09-24 云端 LLM+TTS 试点）：配合型客户走完邀约六步——
+    # 身份应承→来意倾听→内容询问→给时间→报渠道号码→收尾，轮文与邀约模板同域。
+    "invite-canto": {
+        "label": "邀約·阿明（粵語·配合型六步）",
+        "lang": "cantonese",
+        "persona_voice": "Cantonese_GentleLady",
+        "rounds": [
+            {"text": "你好", "op": "normal"},
+            {"text": "係我呀", "op": "normal"},
+            {"text": "好呀你講", "op": "normal"},
+            {"text": "上門檢測要錢嗎", "op": "normal"},
+            {"text": "禮拜六上午得閒", "op": "normal"},
+            {"text": "我WhatsApp係九一八七六五四三", "op": "normal"},
+            {"text": "好呀多謝你哋", "op": "normal"},
+        ],
+    },
+    "invite-zh": {
+        "label": "邀约·阿明（普通话·配合型六步）",
+        "lang": "zh",
+        "persona_voice": "Chinese_crisp_podcaster_nv1",
+        "rounds": [
+            {"text": "你好", "op": "normal"},
+            {"text": "是我", "op": "normal"},
+            {"text": "好的你说", "op": "normal"},
+            {"text": "上门检测收费吗", "op": "normal"},
+            {"text": "周六上午都有空", "op": "normal"},
+            {"text": "我微信是九一八七六五四三", "op": "normal"},
+            {"text": "好的谢谢你啦", "op": "normal"},
+        ],
+    },
+    "invite-en": {
+        "label": "Invite·Amos（英语·配合型六步）",
+        "lang": "en",
+        "persona_voice": "socialmedia_female_2_v1",
+        "rounds": [
+            {"text": "hello", "op": "normal"},
+            {"text": "yes this is him", "op": "normal"},
+            {"text": "sure go ahead", "op": "normal"},
+            {"text": "is the visit really free", "op": "normal"},
+            {"text": "saturday morning works", "op": "normal"},
+            {"text": "my whatsapp is nine one eight seven six five four three", "op": "normal"},
+            {"text": "sounds good thank you", "op": "normal"},
+        ],
+    },
+    # 停顿思考压力（2026-09-25 TurnDetector 试点 A/B）：长半句（每半 ≥11 字，
+    # 穿透 10 字 pause-commit 地板）+ 0.8s/1.2s 真停顿——stt 句级档应在停顿处
+    # 提前成轮（拆轮=1、AI 抢答半句），detector 档应持轮合并。
+    "pause-canto": {
+        "label": "停顿思考（粤语·TurnDetector A/B）",
+        "lang": "cantonese",
+        "persona_voice": "Cantonese_GentleLady",
+        "rounds": [
+            {"text": "你好", "op": "normal"},
+            {"text": "我個件喺你哋嗰邊中轉倉庫遲咗成個禮拜都仲未送到嚟", "op": "split", "gap_s": 0.8},
+            {"text": "我想問下呢單嘢而家搞成點樣可唔可以幫我跟進下", "op": "split", "gap_s": 1.2},
+            {"text": "好呀唔該你", "op": "normal"},
+        ],
+    },
+    "pause-zh": {
+        "label": "停顿思考（普通话·TurnDetector A/B）",
+        "lang": "zh",
+        "persona_voice": "Chinese_crisp_podcaster_nv1",
+        "rounds": [
+            {"text": "你好", "op": "normal"},
+            {"text": "我的件在你们那边中转仓库拖了一个星期都还没送到", "op": "split", "gap_s": 0.8},
+            {"text": "我想问一下这个事情现在处理得怎么样了能不能跟进", "op": "split", "gap_s": 1.2},
+            {"text": "好的谢谢你", "op": "normal"},
+        ],
+    },
 }
 
 # 打断轮首声等待上限:超过即照推插话(无回复=更要打,风暴退避的刺激形态)。
@@ -222,7 +291,10 @@ def summarize_report(measures: list[dict], perceived: list[dict], counts: dict[s
 # 推流驱动
 # ---------------------------------------------------------------------------
 def split_pcm(pcm: bytes, gap_s: float = 0.6) -> list[bytes]:
-    """一句劈两半，中间垫 gap_s 真静音（>VAD min_silence 0.45 → 结构性劈轮刺激）。"""
+    """一句劈两半，中间垫 gap_s 真静音（>VAD min_silence 0.45 → 结构性劈轮刺激）。
+    rounds 可带 gap_s 覆写（2026-09-25 TurnDetector 试点：0.8/1.2s 思考停顿 +
+    每半 ≥11 字长半句，打得穿 10 字 pause-commit 地板，量测 stt 档 vs
+    detector 档对「客户停顿」的行为差）。"""
     half = len(pcm) // 2
     half -= half % 640  # 对齐 20ms 帧
     silence = b"\x00" * (int(16000 * gap_s) * 2)
@@ -286,7 +358,7 @@ async def run_interrupt_round(audio_source: rtc.AudioSource, agent_audio: bytear
 
 
 async def run_scenario(key: str, persona_id: str | None, *, adversarial: bool,
-                       budgets: dict[str, float]) -> dict:
+                       budgets: dict[str, float], template_id: str = "") -> dict:
     sc = SOAK_SCENARIOS[key]
     lang = sc["lang"]
     rounds = [r for r in sc["rounds"] if adversarial or r["op"] == "normal"]
@@ -308,7 +380,8 @@ async def run_scenario(key: str, persona_id: str | None, *, adversarial: bool,
         if r["op"] == "interrupt":
             interject_pcms[i] = [_pcm(t) for t in r.get("interject", [])]
 
-    call_id, voice = erc.create_call(lang, persona_id, sc.get("persona_voice", ""))
+    call_id, voice = erc.create_call(lang, persona_id, sc.get("persona_voice", ""),
+                                     template_id=template_id)
     log_offset = erc.LOG_PATH.stat().st_size if erc.LOG_PATH.exists() else 0
     print(f"[latency-soak] call={call_id} persona_voice={voice!r} (log offset {log_offset})", flush=True)
 
@@ -352,6 +425,7 @@ async def run_scenario(key: str, persona_id: str | None, *, adversarial: bool,
             f"{erc.CONTROL_PLANE_URL}/api/token",
             json={"account_id": "acc-001", "call_id": call_id},
             timeout=10,
+            headers=erc.CP_HEADERS,
         ).json()
         await room.connect(data["serverUrl"], data["participantToken"])
         audio_source = rtc.AudioSource(sample_rate=16000, num_channels=1)
@@ -371,7 +445,11 @@ async def run_scenario(key: str, persona_id: str | None, *, adversarial: bool,
                 m = await run_interrupt_round(audio_source, agent_audio, pcms[i], interject_pcms.get(i, []))
             else:
                 pcm = pcms[i]
-                chunks = split_pcm(pcm) if op in ("split", "digits2") else [pcm]
+                chunks = (
+                    split_pcm(pcm, float(r.get("gap_s", 0.6)))
+                    if op in ("split", "digits2")
+                    else [pcm]
+                )
                 m = await erc.play_and_listen(audio_source, agent_audio, b"".join(chunks))
             m.update({"text": r["text"], "op": op})
             measures.append(m)
@@ -392,8 +470,8 @@ async def run_scenario(key: str, persona_id: str | None, *, adversarial: bool,
         for t in read_tasks:
             t.cancel()
         try:
-            httpx.post(f"{erc.CONTROL_PLANE_URL}/api/calls/{call_id}/hangup", timeout=10)
-            httpx.post(f"{erc.CONTROL_PLANE_URL}/api/calls/{call_id}/settle", timeout=30)
+            httpx.post(f"{erc.CONTROL_PLANE_URL}/api/calls/{call_id}/hangup", timeout=10, headers=erc.CP_HEADERS)
+            httpx.post(f"{erc.CONTROL_PLANE_URL}/api/calls/{call_id}/settle", timeout=30, headers=erc.CP_HEADERS)
         except Exception:
             pass
 
@@ -503,6 +581,7 @@ async def main() -> int:
     parser.add_argument("--scenario", choices=[*SOAK_SCENARIOS, "all"], default="soak-canto")
     parser.add_argument("--persona-id", default=None)
     parser.add_argument("--no-adversarial", action="store_true", help="只跑正常轮（基线对照）")
+    parser.add_argument("--template-id", default="", help="钉死话术模板（邀约腿/指定话术 A/B）")
     parser.add_argument("--budget-first-ms", type=float, default=2500.0)
     parser.add_argument("--budget-perceived-ms", type=float, default=3000.0)
     args = parser.parse_args()
@@ -512,7 +591,8 @@ async def main() -> int:
     results = []
     for key in keys:
         results.append(await run_scenario(
-            key, args.persona_id, adversarial=not args.no_adversarial, budgets=budgets
+            key, args.persona_id, adversarial=not args.no_adversarial,
+            budgets=budgets, template_id=args.template_id,
         ))
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)

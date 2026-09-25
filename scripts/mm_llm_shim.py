@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""MiniMax chatcompletion_v2 → OpenAI /v1/chat/completions 代理（测试腿）。
+
+B 机云端 LLM 腿专用：agent 的 OpenAI 客户端只会打 `{base}/chat/completions`，
+MiniMax 的文本端点在 `/v1/text/chatcompletion_v2` 且路径不兼容——本代理在
+:1236 收 OpenAI 形状，转发 MiniMax（固定上游 api.minimax.cn，启动时做
+host 白名单校验），SSE 逐行透传（chunk 形状与 OpenAI delta 兼容，多余
+字段客户端自忽略），缺 [DONE] 时补一条。
+
+启动（B 机，key 不落盘到脚本）：
+  MM_LLM_KEY=$(python -c '...读 DB tts_json...') python scripts/mm_llm_shim.py
+选型：默认 abab6.5s-chat（非思考模型，首 content token ~450ms）；
+M2/M2.5 恒先流 reasoning_content，电话腿不适用。
+"""
+from __future__ import annotations
+
+import ipaddress
+import json
+import os
+import socket
+import urllib.parse
+import urllib.request
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+import uvicorn
+
+# 上游是编译期常量，唯一的合法目标；运行期不做任何用户可控的 URL 拼接。
+UPSTREAM = "https://api.minimax.cn/v1/text/chatcompletion_v2"
+ALLOWED_HOST = "api.minimax.cn"
+MODEL = os.environ.get("MM_LLM_MODEL", "abab6.5s-chat")
+KEY = os.environ.get("MM_LLM_KEY", "")
+PORT = int(os.environ.get("MM_LLM_PORT", "1236"))
+
+
+def _assert_upstream_safe() -> None:
+    """SSRF 护栏：上游必须是 https + 固定域名，解析出的 IP 不得为
+    私网/环回/链路本地（防 DNS rebinding 指向内网元数据面）。"""
+    parsed = urllib.parse.urlparse(UPSTREAM)
+    if parsed.scheme != "https" or parsed.hostname != ALLOWED_HOST:
+        raise SystemExit(f"upstream 不合规: {UPSTREAM}")
+    for info in socket.getaddrinfo(parsed.hostname, 443):
+        ip = ipaddress.ip_address(info[4][0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            raise SystemExit(f"upstream 解析到内网地址 {ip}，拒绝启动")
+
+
+_assert_upstream_safe()
+
+app = FastAPI()
+
+
+def _build_request(payload: dict) -> urllib.request.Request:
+    return urllib.request.Request(
+        UPSTREAM,
+        data=json.dumps(payload).encode(),
+        headers={"Authorization": "Bearer " + KEY, "Content-Type": "application/json"},
+    )
+
+
+@app.get("/v1/models")
+def list_models() -> dict:
+    return {"object": "list", "data": [{"id": MODEL, "object": "model"}]}
+
+
+@app.get("/health")
+def health() -> dict:
+    return {"ok": bool(KEY), "model": MODEL}
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    body = await request.json()
+    out: dict = {
+        "model": MODEL,
+        "messages": body.get("messages") or [],
+        "stream": bool(body.get("stream")),
+    }
+    if body.get("temperature") is not None:
+        out["temperature"] = body["temperature"]
+    # OpenAI SDK 会把 extra_body 平铺进顶层：max_tokens 保留（预热 max_tokens=1
+    # 便宜），stop/top_k/repetition_penalty 等 mlx 专属字段一律剥掉不透传。
+    mt = body.get("max_tokens")
+    if isinstance(mt, int) and mt > 0:
+        out["max_tokens"] = mt
+
+    req = _build_request(out)
+
+    if not out["stream"]:
+        raw = urllib.request.urlopen(req, timeout=120).read()
+        payload = json.loads(raw)
+        base = payload.get("base_resp") or {}
+        if base.get("status_code", 0) != 0:
+            return JSONResponse({"error": {"message": str(base)}}, status_code=502)
+        return JSONResponse(payload)
+
+    def gen():
+        saw_done = False
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            for line in resp:
+                stripped = line.strip()
+                if stripped == b"data: [DONE]":
+                    saw_done = True
+                elif stripped.startswith(b"data:") and not stripped.endswith(b"[DONE]"):
+                    payload = stripped[5:].strip()
+                    if payload:
+                        try:
+                            j = json.loads(payload)
+                            base = j.get("base_resp") or {}
+                            if base.get("status_code", 0) != 0:
+                                yield b"data: " + json.dumps(
+                                    {"error": {"message": str(base)}}
+                                ).encode() + b"\n\n"
+                                yield b"data: [DONE]\n\n"
+                                return
+                        except Exception:
+                            pass
+                yield line
+        if not saw_done:
+            yield b"data: [DONE]\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+if __name__ == "__main__":
+    if not KEY:
+        raise SystemExit("MM_LLM_KEY 未设置（从 DB 读出后经环境变量传入，勿写死）")
+    uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="warning")

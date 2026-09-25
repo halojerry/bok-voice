@@ -28,6 +28,9 @@ from bok_voice_core.hotword_leak import sanitize as _hotword_leak_sanitize
 from bok_voice_core.snippets import apply_snippets as _apply_snippet_rules
 from bok_voice_core.snippets import compile_rules_with_skipped as _compile_snippet_rules
 from bok_voice_core.snippets import merge_rules as _merge_snippet_rules
+# M-22①(2026-09-23 修复波#4):罐头/分支出声前内部指令守卫——生产模板分支行
+# 「教练文案」被罐头车道逐字念给客户(task-4 M1 实弹,判据与镜像见该模块 docstring)。
+from bok_voice_core.canned_guard import is_internal_instruction as _is_internal_instruction
 from bok_voice_core.snippets import rules_for_lang as _rules_for_lang
 
 from .plugins.context import ContextInjector
@@ -35,13 +38,14 @@ from .plugins.knowledge import KnowledgePlugin
 from .plugins.settlement import SettlementTrigger
 from .providers.registry import build_provider_registry
 from .control_plane import ControlPlaneClient
-from .fillers import FillerDirector
+from .fillers import FillerDirector, derive_context_bucket
 from .qa_gate import (
     QaIndex,
     pick_rotation_member,
     qa_exclude_reason as _qa_exclude_reason,
     qa_fastpath_enabled,
     qa_rotation_enabled,
+    qa_semantic_enabled,
 )
 from .tts_cache import (
     CachedTTS,
@@ -66,6 +70,7 @@ from .flow import (  # noqa: F401 - 部分名字只被 branch_hit_plan 使用
     REFUSE,
     _cond_norm_text,
     _digit_normalize,
+    _digit_runs_in,
     _looks_like_whatsapp_step,
     digits_to_cantonese,
     hotword_only_by_length,
@@ -221,22 +226,34 @@ async def _strip_expr_markup(text):
 
 
 async def _llm_judge(
-    base_url: str, model: str, messages: list, *, max_tokens: int = 8, timeout: float = 5.0
+    base_url: str,
+    model: str,
+    messages: list,
+    *,
+    max_tokens: int = 8,
+    timeout: float = 5.0,
+    api_key: str = "mlx",
 ) -> str:
-    """流程推进判定器:对本地 MLX LLM 发一个 max_tokens 极短请求,取回一个字。失败返空(唔推进)。
+    """流程推进判定器:发一个 max_tokens 极短请求,取回一个字。失败返空(唔推进)。
 
     参数面与主回复同源(stop/温度语义),走 openai SDK(自动重试/超时),唔再手搓 HTTP。
     `max_tokens` 具名参数缺省 8=推进判定器原值(既有调用点零变化);意图判据判定
     (3.4)输出 intent id,长过 8 token,调用点显式传大值。`timeout` 缺省 5.0 同理
     (review N9:非流式单请求的总预算——9B 判据集 prefill 慢,意图判定调用点显式放宽,
     超时返空=静默永久 miss,唔可以两边共用 5s 硬码)。
+
+    `api_key` 缺省 `"mlx"`＝本地 mlx_lm server 不校验凭据（既有行为零变化）；判据走
+    云端（`FLOW_JUDGE_LLM_API_KEY`）时由调用点传入——云端判定同时解掉「9B 占本地 GPU
+    抢 4B prefill」与「9B 常驻显存」两笔账（2026-09-22 probe_gpu_contention 实测 +1375ms）。
     """
     if not base_url or not model:
         return ""
     from openai import AsyncOpenAI
 
     try:
-        client = AsyncOpenAI(api_key="mlx", base_url=base_url, timeout=timeout, max_retries=1)
+        client = AsyncOpenAI(
+            api_key=api_key or "mlx", base_url=base_url, timeout=timeout, max_retries=1
+        )
         r = await client.chat.completions.create(
             model=model,
             messages=messages,
@@ -747,6 +764,74 @@ async def _report_notify_once(
     facts["graph_notifies"] = int(facts.get("graph_notifies") or 0) + 1
 
 
+# ---- M-23 首位数字回声剥离(2026-09-23 修复波#4,task-4 M2 实弹)----
+# en 报号首位被 ASR 回声(「six four three…」听成「six six four…」)→ 错号被
+# 捕获+复述确认给客户。文本层对「首位数字双叠」无可靠判据(真号可双叠开头
+# 如 6643…)——不盲剥;可剥的是有据可查的回声源:新段数字串以「已确认号码/
+# AI last_reply 数字串」为**严格前缀且更长**(回声+续号形状)→ 剥前缀再进
+# 累积/侦测。相等或更短一律不动(客户重申同一号码係合法行为,绝不毁真内容)。
+# 长度可疑号由 _wa_confirm_or_reask 的号长闸拦「复述确认」(捕获照旧)。
+_LEADING_NUM_PHRASE_RE = re.compile(
+    r"^\s*(?P<phrase>(?:\s*(?:zero|oh|one|two|three|four|five|six|seven|eight|nine"
+    r"|[0-9０-９零一二三四五六七八九])[\s，,、。.～~]*)+)",
+    re.IGNORECASE,
+)
+_NUM_TOKEN_RE = re.compile(
+    r"(?:zero|oh|one|two|three|four|five|six|seven|eight|nine|[0-9０-９零一二三四五六七八九])",
+    re.IGNORECASE,
+)
+
+
+def _strip_number_echo(text: str, *, reported: set[str] | None, last_reply: str) -> str:
+    """首位数字回声剥离(纯函数,BOK_WA_ECHO_STRIP=0 回退)。
+
+    回声源两路:①本通已上报/确认过的号码串(``reported``=_wa_reported 数字键);
+    ②AI 上一句回复里的数字串(``last_reply``,复述确认台词「I've noted your
+    number XXXXXX」被麦克风回听)。判定=开头数字串以某回声源为**严格前缀且
+    更长**→ 从开头剥掉该前缀(连同分隔),打点可观测;无源/相等/更短原样返回。
+    """
+    echo_strip_on = os.environ.get("BOK_WA_ECHO_STRIP", "1") == "1"
+    if not echo_strip_on:
+        return str(text or "")
+    s = str(text or "")
+    if not s.strip():
+        return s
+    m = _LEADING_NUM_PHRASE_RE.match(s)
+    if not m:
+        return s
+    tokens = _NUM_TOKEN_RE.findall(m.group("phrase"))
+    digits = "".join(_digit_normalize(t) for t in tokens)
+    if not digits:
+        return s
+    sources: list[str] = [
+        str(k) for k in (reported or ()) if str(k).isdigit() and len(str(k)) >= 4
+    ]
+    sources.extend(_digit_runs_in(str(last_reply or "")))
+    for echo in sorted(set(sources), key=len, reverse=True):
+        if digits.startswith(echo) and len(digits) > len(echo):
+            n = 0
+            cut_end = None
+            for f in re.finditer(
+                r"\s*(?:zero|oh|one|two|three|four|five|six|seven|eight|nine"
+                r"|[0-9０-９零一二三四五六七八九])[\s，,、。.～~]*",
+                m.group("phrase"),
+                re.IGNORECASE,
+            ):
+                n += 1
+                if n == len(echo):
+                    cut_end = f.end()
+                    break
+            if cut_end is None:
+                return s
+            print(
+                f"[whatsapp] echo_strip prefix={echo} "
+                f"rest={digits[len(echo):]!r}",
+                flush=True,
+            )
+            return s[: m.start("phrase")] + m.group("phrase")[cut_end:]
+    return s
+
+
 def _wa_accum_merge(stashed: str, incoming: str) -> str:
     """累积合并:「结合上下文」的正确姿势(call-5f8bef6b 实证)。
 
@@ -909,6 +994,60 @@ def _perceived_budget_ms() -> int:
         return int(os.environ.get("BOK_PERCEIVED_BUDGET_MS", "3000") or 0)
     except ValueError:  # pragma: no cover - 配错回默认
         return 3000
+
+
+def _judge_yield_env() -> tuple[float, float]:
+    """judge 让路参数单点解析:(floor_s, cap_s)。测试钉默认值用。
+
+    - floor_s=FLOW_JUDGE_DELAY(默认 3):开火前固定让一拍(旧语义,永在)。
+    - cap_s=FLOW_JUDGE_IDLE_CAP(默认 6,2026-09-24 由 0 转正):空闲窗等待上限,
+      到点照开火(让不完就撞,仍是旧行为兜底,判定永不负损);0=回纯固定让路。
+    """
+    try:
+        floor_s = float(os.environ.get("FLOW_JUDGE_DELAY", "3") or 0)
+    except ValueError:  # pragma: no cover - 配错回默认
+        floor_s = 3.0
+    try:
+        cap_s = float(os.environ.get("FLOW_JUDGE_IDLE_CAP", "6") or 0)
+    except ValueError:  # pragma: no cover - 配错回默认
+        cap_s = 6.0
+    return floor_s, cap_s
+
+
+async def _wait_link_idle(link: dict, *, floor_s: float, cap_s: float) -> str:
+    """judge 开火前的让路:floor(固定让一拍) + 「4B 不在 prefill 窗」错峰。返回 idle/capped/disabled。
+
+    **空闲窗定义(2026-09-24 修正:播报中也算闲)**:``agent in (listening, speaking)``
+    且客户不在讲。真 GPU 空闲窗=LLM 生成完+TTS 云端放音中(4B 闲、ASR 无输入)——
+    即 ``agent==speaking`` 的中后段,每轮 3-10s,恰是旧闸看不见的那扇窗。旧版只认
+    listening(播报也结束),2026-09-22 实测 9/9 capped:回复播报 10-19s 普遍超过
+    闸上限,窗口结构性够不着,闸退化成纯延时后于 09-24 转正前一直默认关。同卡争用
+    实弹(2026-09-24 争用窗画像):judge 与回复生成同窗 → 4B tps 塌到 10-25、回复
+    整段超 4s 被看门狗收割(5/5 LLM 轮阵亡)。本闸把 judge 挪进播报窗=「judge 闲时
+    去」。capped 到点照开火:极端长生成轮让不完就让,判定永不负损。多机/CUDA 后
+    judge 挪出本地 GPU(W10-12),本闸届时自然空转(窗口恒开)。
+    观测面:``[judge] yield idle|capped|disabled`` 占比 + ``judge_pending_expired``
+    (让路太晚会伤判定时效——pending 单发,下一轮图块求值时先取即清)。
+    """
+    if cap_s <= 0:  # 关闭=旧的固定让路语义,逐字节同旧
+        if floor_s > 0:
+            await asyncio.sleep(floor_s)
+        return "disabled"
+
+    t0 = time.monotonic()
+
+    def _idle() -> bool:
+        return link.get("agent") in ("listening", "speaking") and link.get("user") != "speaking"
+
+    if floor_s > 0:
+        await asyncio.sleep(floor_s)
+    if _idle():
+        return "idle"
+    while (time.monotonic() - t0) < cap_s:
+        await asyncio.sleep(0.2)
+        if _idle():
+            return "idle"
+    return "capped"
 
 
 def _response_watchdog_s() -> float:
@@ -1078,7 +1217,9 @@ def _wa_number_line(lang: str, num: str) -> str:
 
 def _wa_len_expected(lang: str) -> int | None:
     """C3b 号长期望(2026-09-13,call-6f1c4ee3:7 位错号被复述确认+客户假确认):
-    粤=8 位港号(852+8=11 亦收);zh=11 位手机;en 宽松不校验。BOK_WA_LEN_CHECK=0 关。
+    粤=8 位港号(852+8=11 亦收);zh=11 位手机;en=8 位港号(M-23,2026-09-23
+    修复波#4 收紧:task-4 实弹 7/6 位错号被复述确认——en 原本宽松不校验;
+    852+8=11 亦收,与粤线同款)。BOK_WA_LEN_CHECK=0 关。
     只挡「复述确认」,不挡捕获——「报出就收」铁律不动(捕获/上报/横幅照旧)。"""
     if os.environ.get("BOK_WA_LEN_CHECK", "1") != "1":
         return None
@@ -1086,6 +1227,8 @@ def _wa_len_expected(lang: str) -> int | None:
         return 8
     if lang == "zh":
         return 11
+    if lang == "en":
+        return 8
     return None
 
 
@@ -1095,7 +1238,7 @@ def _wa_confirm_or_reask(lang: str, num: str) -> str:
     exp = _wa_len_expected(lang)
     if exp is not None and num and str(num).isdigit():
         n = len(str(num))
-        ok = n == exp or (lang == "cantonese" and str(num).startswith("852") and n == 11)
+        ok = n == exp or (str(num).startswith("852") and n == 11)
         if not ok:
             print(
                 f"[whatsapp] LEN_CHECK_SUSPECT num_len={n} expected={exp} lang={lang} "
@@ -1478,6 +1621,29 @@ def _resolve_tts_voice_mode(tts_cfg: dict) -> str:
     return mode if mode == "per_language" else "single"
 
 
+def effective_tts_provider(persona: dict | None, tts_cfg: dict) -> str:
+    """有效 TTS provider 单点判据（F-11，2026-09-23）：persona.tts_provider 覆盖
+    > 全局 tts.provider，空缺省 qwen3_tts——与 entrypoint 装配分支同一条规则，
+    pregen 物化/状态面共用（键推导必须与运行时同源，另见 canned_cache_supported）。
+    """
+    persona_p = str((persona or {}).get("tts_provider") or "").strip().lower()
+    if persona_p:
+        return persona_p
+    return str((tts_cfg or {}).get("provider") or "qwen3_tts").strip().lower()
+
+
+def canned_cache_supported(persona: dict | None, tts_cfg: dict) -> bool:
+    """罐头 TTS 缓存对 (persona, settings) 是否生效（F-11 单源闸）。
+
+    本地音频缓存只包云端 MiniMax 链（entrypoint：`_tts_primary` 仅 minimax 族
+    分支赋值，其余 provider `_tts_cache=None` → `_qa_pcm_for` 结构性查空）。
+    pregen 物化/状态面必须同闸：非 minimax 族的键物化出来运行时永远查不到，
+    状态面照 MiniMax 键报 ok = 假 ok（T3 报告 F-11 实弹：qwen3 运行时
+    canned-status=ok 而 BRANCH_CANNED miss / play_miss）。
+    """
+    return effective_tts_provider(persona, tts_cfg) in ("minimax", "minimax_streaming")
+
+
 # MiniMax 空 voice map 兜底音色（设置页 speaker 三键全空/全被本地过滤时）：
 # 按通话语言给各自语言的地道音色（fixed-language 整通一语言 → 一通一个默认音色）；
 # 此前 zh/en 也填粤语主播，普通话语料被粤语腔念(广普),用户判为"说粤语"。三个 id
@@ -1545,6 +1711,46 @@ def _turn_detection_mode_from_env() -> str:
     句级 FINAL，唔会出现「EOT 模式吃句子 FINAL 叠成重复转写」。
     """
     return os.environ.get("TURN_DETECTION", "stt").strip()
+
+
+def _turn_detection_from_env() -> object:
+    """turn_detection 装配值：官方字面量原样透传；"detector"=显式
+    inference.TurnDetector 对象（2026-09-25 试点档——audio EOT，生产 start
+    模式自动选 v1-mini 本地 CPU 跑，零云依赖）。
+
+    官方 unlikely_threshold 支持**按语言覆写**（未映射语言保出厂校准值）——
+    A 线历史病根「Cantonese 无校准档→回退英文阈值→停顿帧全判未完→提交撞
+    max_delay」由此可治：BOK_TURN_DETECTOR_THRESHOLDS 传 JSON dict（如
+    {"cantonese":0.4,"zh":0.5}），或 BOK_TURN_DETECTOR_THRESHOLD 标量全档
+    覆写。构造失败（包版本不含/二进制缺位）→ 回退空串（框架默认 EOT），
+    绝不裸崩——v1-mini 不可用时官方语义=每轮出默认概率，等同纯 VAD 档。"""
+    mode = _turn_detection_mode_from_env()
+    if mode.lower() != "detector":
+        return mode
+    try:
+        from livekit.agents import inference
+
+        kwargs: dict = {}
+        raw_map = os.environ.get("BOK_TURN_DETECTOR_THRESHOLDS", "").strip()
+        if raw_map:
+            kwargs["unlikely_threshold"] = json.loads(raw_map)
+        else:
+            raw_scalar = os.environ.get("BOK_TURN_DETECTOR_THRESHOLD", "").strip()
+            if raw_scalar:
+                kwargs["unlikely_threshold"] = float(raw_scalar)
+        detector = inference.TurnDetector(**kwargs)
+        print(
+            "[agent] turn_detection=TurnDetector "
+            f"thresholds={kwargs.get('unlikely_threshold', 'factory-default')}",
+            flush=True,
+        )
+        return detector
+    except Exception as exc:  # pragma: no cover - 版本/模型缺位回退框架默认
+        print(
+            f"[agent] TurnDetector init failed ({exc!r}) — falling back to framework default EOT",
+            flush=True,
+        )
+        return ""
 
 
 def _endpointing_delays_from_env() -> tuple[float, float]:
@@ -2569,11 +2775,12 @@ async def entrypoint(ctx):
             max_buffered_speech=_vad_float(vad_cfg, "max_buffered_speech", "VAD_MAX_BUFFERED_SPEECH", "15"),
         # VAD 参数权衡（曾为冲低延迟把 min_silence 收到 0.30/endpointing min 收到 0.15，
         # 实测导致「转写晚于轮次提交」被 LiveKit 丢弃、噪声/回声频繁误提交 → agent 长时间无声）：
-        # 离线式 ASR（用户整句说完 VAD flush 才出 FINAL）从停嘴到转写回来需 ~0.5-1.2s，
-        # 端点判定必须等得起它。恢复 0.45 静音门槛 + 0.35/1.2 endpointing 的可用基线；
-        # 短句不丢靠 min_speech 0.15、抗噪靠 activation_threshold(0.75)+打斷 min_duration(1.2s)。
+        # 0.30 的事故年代=离线式整段 flush 架构;句级提交+VAC 直转落地后重校,
+        # 0.45→0.35(W7,2026-09-24 实测 p50 −203ms、尾部 max 3150→1530,碎片/
+        # 打断/edge 探针全绿)。短句不丢靠 min_speech 0.15、抗噪靠
+        # activation_threshold(0.75)+打斷 min_duration。
         min_speech_duration=_vad_float(vad_cfg, "min_speech_duration", "VAD_MIN_SPEECH_DURATION", "0.15"),
-        min_silence_duration=_vad_float(vad_cfg, "min_silence_duration", "VAD_MIN_SILENCE_DURATION", "0.45"),
+        min_silence_duration=_vad_float(vad_cfg, "min_silence_duration", "VAD_MIN_SILENCE_DURATION", "0.35"),
             activation_threshold=_vad_float(vad_cfg, "sensitivity", "VAD_ACTIVATION_THRESHOLD", "0.75"),
         )
     interruption_enabled = bool(vad_cfg.get("interruption", True)) if vad_provider_name != "fake" else True
@@ -2635,9 +2842,11 @@ async def entrypoint(ctx):
     # 引擎决定音色池：qwen3_tts 用本地克隆（persona.reference_audio 是本地克隆 ID）；
     # minimax/volcano 是云端，用全局 speaker_zh/speaker_cantonese/en（云端音色 ID），
     # 绝不能把本地克隆 ID 发给云端。fake 出静音测试音。
+    # 有效 provider 判据走单点 helper(F-11,2026-09-23):与 pregen 物化/状态面
+    # 同一条规则(persona 覆盖 > 全局,空缺省 qwen3_tts)。两个局部量只喂日志行。
     global_tts_provider = (tts_cfg.get("provider") or "qwen3_tts").lower()
     persona_tts_provider = ((persona or {}).get("tts_provider") or "").strip().lower()
-    tts_provider_name = persona_tts_provider or global_tts_provider
+    tts_provider_name = effective_tts_provider(persona, tts_cfg)
     if persona_tts_provider:
         print(f"[agent] persona tts_provider={persona_tts_provider!r} overrides global {global_tts_provider!r}", flush=True)
     # 云端 MiniMax 链标记:minimax 分支赋主实例,其余分支保持 None。D2 前置
@@ -2895,6 +3104,7 @@ async def entrypoint(ctx):
     # 但冇 EOT 模型嘅中途停顿保护,留作实验档。TURN_DETECTION=stt/manual 等官方字面量
     # 原样透传。
     _turn_detection_mode = _turn_detection_mode_from_env()
+    _turn_detection_value: object = _turn_detection_from_env()
     _endpoint_min_delay, _endpoint_max_delay = _endpointing_delays_from_env()
     turn_handling: TurnHandlingOptions = {
         # 官方低延迟调参（docs.livekit.io/agents/logic/turns/tuning）：
@@ -2928,9 +3138,10 @@ async def entrypoint(ctx):
             "false_interruption_timeout": float(os.environ.get("FALSE_INTERRUPTION_TIMEOUT", "1.0")),
         },
     }
-    if _turn_detection_mode:
+    if _turn_detection_value:
         # 唔设 key = 今日行为(EOT 模型 auto-select),唔整 None 别名分支。
-        turn_handling["turn_detection"] = _turn_detection_mode
+        # "detector" 档在此放行 TurnDetector 对象（语言阈值覆写试点）。
+        turn_handling["turn_detection"] = _turn_detection_value
     # 抢跑「标记轮暂停」实验档（PREEMPTIVE_DISABLE_ON_MARKER，默认关——时序
     # 分析见 _marker_pause_enabled：标记轮 pre-FINAL 抢跑无法回溯、下一轮
     # speculation 快照一致本就会命中，暂停=纯损失，故只留作 opt-in 实验）。
@@ -2961,7 +3172,12 @@ async def entrypoint(ctx):
         f"max_retries={turn_handling['preemptive_generation']['max_retries']} "
         f"marker_pause={'on' if _marker_pause_on else 'off'} "
         f"interruption=min_{turn_handling['interruption']['min_duration']}s+false_interruption_self_heal "
-        f"turn_detection={_turn_detection_mode or 'default(EOT v1-mini kill-switch;Cantonese 未校准,阈值回退英文档)'}",
+        f"turn_detection={_turn_detection_mode or 'default(EOT v1-mini kill-switch;Cantonese 未校准,阈值回退英文档)'}"
+        + (
+            f" thresholds={os.environ.get('BOK_TURN_DETECTOR_THRESHOLDS') or os.environ.get('BOK_TURN_DETECTOR_THRESHOLD') or 'factory'}"
+            if _turn_detection_mode.lower() == "detector"
+            else ""
+        ),
         flush=True,
     )
 
@@ -2995,7 +3211,14 @@ async def entrypoint(ctx):
     try:
         from livekit.agents import BackgroundAudioPlayer
 
-        _bg_audio = BackgroundAudioPlayer()
+        from .fillers import thinking_sound_configs
+
+        # W2b 思考态键盘环境音(2026-09-24):thinking 态抽签播内置打字 burst,
+        # agent 开口即停——官方组件状态机自驱,agent_session 已在 start() 传入。
+        # 闸/音量/概率见 fillers.thinking_sound_configs()(env BOK_AMBIENT_KEYBOARD*)。
+        _ts_cfgs = thinking_sound_configs()
+        print(f"[agent] ambient keyboard: {'on' if _ts_cfgs else 'off'}", flush=True)
+        _bg_audio = BackgroundAudioPlayer(thinking_sound=_ts_cfgs)
     except Exception as _exc:  # noqa: BLE001 - 无 livekit(测试/异常环境)垫话失效
         print(f"[agent] background audio unavailable, filler off: {_exc!r}", flush=True)
         _bg_audio = None
@@ -3079,6 +3302,31 @@ async def entrypoint(ctx):
         except Exception:  # noqa: BLE001 - 无事件循环(测试)=丢弃计数
             pass
 
+    def _filler_context_bucket() -> str:
+        """W2c 语境桶(fire 时点由 FillerDirector 惰性调用):闭包晚绑定,
+        任何信号缺失/异常吞掉回 ""=现行阶梯。verdict 走 flow_ctrl.last_verdict
+        (本轮局部名无流程轮未绑定,NameError 坑——调研底稿钉)。"""
+        try:
+            from .flow import _looks_like_whatsapp_step as _llws
+
+            _g, _r = flow_ctrl.current_goal_ref()
+            return derive_context_bucket(
+                turn_provider=str(_turn_origin.get("provider") or ""),
+                wa_signal_kind=(str(_wa_signal[0]) if _wa_signal else ""),
+                wa_step=bool(_llws(_g, _r)),
+                wa_captured=bool(_wa_captured["on"]),
+                has_steps=bool(flow_ctrl.has_steps),
+                step_index=(flow_ctrl.current if flow_ctrl.has_steps else 0),
+                goal=_g,
+                ref=_r,
+                step_say_done=(
+                    bool(flow_ctrl.has_steps) and flow_ctrl.current in flow_ctrl.said_steps
+                ),
+                verdict=str(flow_ctrl.last_verdict or ""),
+            )
+        except Exception:  # noqa: BLE001 - 语境信号拿不到=无桶,绝不阻垫话
+            return ""
+
     _filler = FillerDirector(
         session,
         # 语言铁律(2026-09-10):垫话语言=装配时钉死的通话语言,构造时捕获,
@@ -3104,6 +3352,8 @@ async def entrypoint(ctx):
         backfill=_filler_backfill,
         report=_on_filler_played,
         caption=_filler_caption,
+        call_label=call_id,
+        context_resolver=lambda: {"bucket": _filler_context_bucket()},
     )
     # 垫话开播 → 看门狗一次性顺延(RC3,2026-09-17):垫话 out-of-band 出声框架
     # 不可见(不入 speech 队列、无首音频信号),watchdog 不拆弹——「垫话盖耳+
@@ -3138,10 +3388,26 @@ async def entrypoint(ctx):
         _filler._user_text_provider = lambda: flow_ctrl.last_user_text
         _filler._entry_hit = _filler_entry_hit
         print(f"[agent] filler canned on entries={len(_filler_index)} (call {room_name})", flush=True)
+    # W4 ② 三时间戳(2026-09-24):commit 墙钟戳(on_user_turn_completed 入口)
+    # → 回复首音频墙钟(下面 listener)——产出 BOK_TURN_TIMING 行。与
+    # PERCEIVED_MS 分工:PERCEIVED=provider 内部三段和(eou+ttft+ttfb,旁路轮
+    # 唔计);本行=**墙钟 commit→真出声**,两者差=框架隙(提交→LLM 派发排队+
+    # 首句缓冲+起播)——拆 1.3s 残差的主仪表,W7/W8 的靶子。eou 在 commit 之前
+    # 发生,不参与残差;join 靠同 call 的 [call_id] 前缀离线对齐(soak/探针解析)。
+    _turn_timing: dict = {}
+
+    def _on_reply_first_audio_timing() -> None:
+        t_commit = _turn_timing.pop("commit", None)
+        if t_commit is None:
+            return  # 开场白/脚本直念等无 commit 戳的出声:不打(残值防串轮)
+        wall_ms = int((time.monotonic() - t_commit) * 1000)
+        print(f"[{call_id}] BOK_TURN_TIMING commit_to_audio={wall_ms}ms", flush=True)
+
     if _has_first_audio_signal(tts_provider):
         tts_provider.add_first_audio_listener(_filler.on_reply_first_audio)
         # 真回复首音频=看门狗拆弹信号(垫话/兜底/直念族经同一 provider 透传层)。
         tts_provider.add_first_audio_listener(lambda: _disarm_response_watchdog())
+        tts_provider.add_first_audio_listener(_on_reply_first_audio_timing)
         # 播放排序契约(2026-09-10):垫话播完→gap→回复。回复首帧到达时若垫话
         # 在播,流出口扣压(垫话剩余+gap),不再掐垫话。
         tts_provider.set_hold_provider(_filler.hold_if_playing)
@@ -3149,6 +3415,7 @@ async def entrypoint(ctx):
     # 空表 → 闸门整体惰性(零行为变化);命中还需应答音频已在本地缓存,
     # 未物化的条目自动视为未命中走 LLM(闸门绝不触发云合成)。
     _qa_index = None
+    _qa_sem = None  # 语义补位车道(W3b 解锁):词面未中轮的释义档,装配失败/关 → None=旧档
     # 索引构建面=快路开 **或** 图里有启用嘅 play_qa 绑定(I1,2026-09-18):kill-switch
     # BOK_QA_FASTPATH=0 只关轮级兜底,唔可以连图嘅罐头播放一齐静默掐死(图有自己嘅
     # 开关 BOK_FLOW_GRAPH,两闸各管各的);无 TTS 缓存两条路都播唔出声,照关。
@@ -3165,6 +3432,29 @@ async def entrypoint(ctx):
                 from .qa_gate import QaIndex
 
                 _qa_index = QaIndex(_qa_rows)
+                # 语义补位车道(W3b 解锁,2026-09-24):词面 0.90 未中轮的释义档。
+                # 构建失败/端点缺席/零素材 → None 整通惰性(快路行为=旧档);
+                # kill-switch BOK_QA_SEMANTIC=0 只关补位,词面档零变化。
+                if _qa_fastpath_on and qa_semantic_enabled():
+                    try:
+                        from .intent_semantic import EmbedClient
+                        from .qa_gate import QaSemanticIndex, qa_semantic_base_url, qa_semantic_timeout_s
+
+                        _qa_sem_client = EmbedClient(
+                            base_url=qa_semantic_base_url(), timeout_s=qa_semantic_timeout_s()
+                        )
+                        _qa_sem = await QaSemanticIndex.build(_qa_sem_client, _qa_rows)
+                        if _qa_sem is None:
+                            _qa_sem_reason = (getattr(_qa_sem_client, "last_reason", "") or "").strip() or "no_material"
+                            print(f"[agent] qa semantic off ({_qa_sem_reason}) (call {room_name})", flush=True)
+                        else:
+                            print(
+                                f"[agent] qa semantic on entries={len(_qa_sem)} (call {room_name})",
+                                flush=True,
+                            )
+                    except Exception as exc:  # noqa: BLE001 - 语义补位不可用零影响
+                        _qa_sem = None
+                        print(f"[agent] qa semantic build failed: {exc!r} (call {room_name})", flush=True)
                 if _qa_fastpath_on:
                     print(f"[agent] qa fastpath on entries={len(_qa_rows)} (call {room_name})", flush=True)
                 else:
@@ -3182,6 +3472,24 @@ async def entrypoint(ctx):
             print(f"[agent] qa fastpath load failed: {exc!r} (call {room_name})", flush=True)
     else:
         _qa_bump("disabled")  # env 关/无 TTS 缓存:无应答音频可播,快路整体关闭
+    # W1b 意图语义车道(装配构建,查询在图块语义段):镜像 QaIndex 形状——构建
+    # 失败/端点缺席/无素材 → None 整通惰性(零行为变化)。意图语义模块镜像
+    # qa_gate 纪律(纯逻辑+HTTP 客户端,日志归 agent)。
+    _intent_sem = None
+    try:
+        from .intent_semantic import EmbedClient, IntentSemanticIndex, semantic_enabled
+
+        if semantic_enabled() and flow_ctrl.graph.intents:
+            _sem_client = EmbedClient()
+            _intent_sem = await IntentSemanticIndex.build(_sem_client, flow_ctrl.graph)
+            if _intent_sem is None:
+                _sem_reason = (getattr(_sem_client, "last_reason", "") or "").strip() or "no_material"
+                print(f"[agent] intent semantic off ({_sem_reason}) (call {room_name})", flush=True)
+            else:
+                print(f"[agent] intent semantic on intents={len(_intent_sem)} (call {room_name})", flush=True)
+    except Exception as exc:  # noqa: BLE001 - 语义车道不可用零影响
+        _intent_sem = None
+        print(f"[agent] intent semantic build failed: {exc!r} (call {room_name})", flush=True)
     # 意向规则(W4-T2):装配拉一次(两级行合并由 CP 出仓),挂断时评估 disposition
     # 覆盖+intent_code。拉取失败/空表 → 挂断走原 disposition(零行为变化);
     # BOK_INTENT_RULES=0 整闸关(评估与拉取都不跑)。
@@ -3647,6 +3955,19 @@ async def entrypoint(ctx):
 
     ctx.add_shutdown_callback(_wait_close_flush)
 
+    # 链路占用态(4B 在生成/播报? 客户在讲?)——judge 错峰用。单进程=单通话,一个 dict 足够;
+    # 由下方 _on_agent_state/_on_user_state 维护(与心跳共用同一对官方状态事件)。
+    _link: dict[str, str] = {"agent": "", "user": ""}
+
+    async def _judge_yield() -> str:
+        """judge 开火前的让路:floor(FLOW_JUDGE_DELAY) + 空闲窗让路(默认 6s,见 _wait_link_idle)。"""
+        _floor_s, _cap_s = _judge_yield_env()
+        verdict = await _wait_link_idle(_link, floor_s=_floor_s, cap_s=_cap_s)
+        # 观测:judge 是「下一轮才消费」的补位,让路到多晚直接决定它还能不能赶上那一轮——
+        # capped 占比与 judge_pending_expired 一起看,才知道这个闸有没有开始伤判定时效。
+        print(f"[judge] yield {verdict} (call {room_name})", flush=True)
+        return verdict
+
     async def _background_flow_judge(step_at: int, utt: str, turn_key: str = "") -> None:
         """背景跑 LLM 推進判定:唔好喺開聲前同步等(會每輪拖慢),判定完喺下一輪先生效。
 
@@ -3655,9 +3976,10 @@ async def entrypoint(ctx):
         带同 key 落账——unclear 去重只计 1,judge 改判非 unclear 则清该步计数。
         """
         try:
-            # 让路节流:主回复刚提交,先等一拍再喺同一 mlx server(:1235)跑 judge——
-            # judge 与主回复抢 prefill 会推高本轮 TTFT;judge 判定本来就下一轮先生效,迟几秒冇损失。
-            await asyncio.sleep(float(os.environ.get("FLOW_JUDGE_DELAY", "3")))
+            # 让路节流:主回复刚提交,先等一拍、再等到链路真空闲才喺 :1235 跑 judge——
+            # judge 与主回复抢 prefill 会推高本轮 TTFT(实测 9B 占 GPU 时 4B prefill
+            # +1375ms,见 probe_gpu_contention);judge 判定本来就下一轮先生效,迟几秒冇损失。
+            await _judge_yield()
             from .flow import (
                 build_judge_messages,
                 degrade_boost,
@@ -3697,7 +4019,9 @@ async def entrypoint(ctx):
                 facts=flow_ctrl.vars_map,
                 route_enabled=route_enabled,
             )
-            _raw = await _llm_judge(jbase, jmodel, msgs)
+            _raw = await _llm_judge(
+                jbase, jmodel, msgs, api_key=os.environ.get("FLOW_JUDGE_LLM_API_KEY", "mlx")
+            )
             jv = parse_judge_output(_raw)
             if route_enabled:
                 _rr, _cc = parse_judge_route(_raw)
@@ -3793,8 +4117,8 @@ async def entrypoint(ctx):
         有可触发绑定),本任务唔再重算资格(单次调用=一次 LLM call,绝不 N 次)。
         """
         try:
-            # 让路节流同 flow judge:主回复刚提交,先等一拍再跑判定(同一 env 旋钮)。
-            await asyncio.sleep(float(os.environ.get("FLOW_JUDGE_DELAY", "3")))
+            # 让路节流同 flow judge:主回复刚提交,先等一拍、再等到链路真空闲才跑判定(同一闸)。
+            await _judge_yield()
             from .flow import build_intent_judge_messages, parse_intent_judge_output
 
             # 判定专线解析与 _background_flow_judge 逐字同源(FLOW_JUDGE_* → llm 卡 → MLX)。
@@ -3830,7 +4154,14 @@ async def entrypoint(ctx):
             # timeout=20(review N9):非流式总预算,9B 判据集 prefill ~0.6k tok/s 档,
             # 中型候选集(4-7k tok)5s 必超时=静默永久 miss;背景任务延迟不敏感
             # (3s 让路 delay 都喺度),放宽到 20s 换「中型判据集可用」。
-            _gjtext = await _llm_judge(jbase, jmodel, msgs, max_tokens=32, timeout=20.0)
+            _gjtext = await _llm_judge(
+                jbase,
+                jmodel,
+                msgs,
+                max_tokens=32,
+                timeout=20.0,
+                api_key=os.environ.get("FLOW_JUDGE_LLM_API_KEY", "mlx"),
+            )
             _gjhit = parse_intent_judge_output(_gjtext, [i.id for i in candidates])
             # store 守卫(与 flow judge 换步守卫同源):判定期间已换步/暂停/收线/开关
             # 被关 → 迟到的命中唔准注入(下一轮已唔同语境,注入=错步触发)。closing
@@ -3898,6 +4229,10 @@ async def entrypoint(ctx):
             self.paused = False
 
         async def on_user_turn_completed(self, turn_ctx, new_message):
+            # W4 ②(2026-09-24):commit 墙钟戳——钩子入口即提交时刻,后续回复首
+            # 音频(_on_reply_first_audio_timing)消费打 BOK_TURN_TIMING 行。
+            # 单槽覆盖:barge-in 轮新戳顶旧戳(打断轮延迟本就含糊,近似可接受)。
+            _turn_timing["commit"] = time.monotonic()
             # 抢跑预算恢复（必须在语言锚定【前】）：仅在实验档 marker_pause=on 时
             # 会有挂起的暂停要撤（默认关 → 恒跳过）。恢复放本轮开头=下一轮的
             # FINAL 前抢跑照常生效。count 已由框架在本钩子前重置 0。
@@ -4162,6 +4497,25 @@ async def entrypoint(ctx):
                 _cancel_response_watchdog()  # 短承接即出声
                 await _say_script(session, tts_provider, _tts_cache, _ack)
                 raise StopResponse()
+            # M-23 首位回声剥离(2026-09-23 修复波#4):AI 复述/上轮已确认号码被
+            # 麦克风回听混进客户报号首位 → 错号捕获+确认(task-4 M2)。剥前缀再
+            # 进 WA/单号累积与侦测(改写 user_text+历史 text_content,与累积合并
+            # 路同姿势);失败原样,唔阻轮。
+            if user_text.strip() and not closed.is_set():
+                try:
+                    _echo_free = _strip_number_echo(
+                        user_text,
+                        reported=_wa_reported,
+                        last_reply=context_state.last_reply,
+                    )
+                    if _echo_free != user_text:
+                        user_text = _echo_free
+                        try:
+                            new_message.text_content = _echo_free
+                        except Exception:  # pragma: no cover - 历史一致性尽力而为
+                            pass
+                except Exception:  # noqa: BLE001 - 剥离失败唔阻轮
+                    pass
             if _WA_ACCUM_ENABLED and flow_ctrl.has_steps:
                 _g, _r = flow_ctrl.current_goal_ref()
                 if _looks_like_whatsapp_step(_g, _r) and user_text.strip() and not closed.is_set():
@@ -4396,7 +4750,10 @@ async def entrypoint(ctx):
                                 f"text_len={len(_branch_plan['text'])}",
                                 flush=True,
                             )
-                            if _branch_plan["text"]:
+                            if _branch_plan["text"] and (
+                                os.environ.get("BOK_CANNED_TEXT_GUARD", "1") != "1"
+                                or not _is_internal_instruction(str(_branch_plan["text"]))
+                            ):
                                 # 带台词 → 直念该台词收线(镜像 say 直念步记账:
                                 # user 轮补记+回声锚预锚+账本 gen=script);实际
                                 # _say_script+raise StopResponse 在流程 try 之外
@@ -4427,6 +4784,17 @@ async def entrypoint(ctx):
                                     )
                                 except Exception:  # noqa: BLE001
                                     pass
+                            elif _branch_plan["text"]:
+                                # M-22①:收线台词係内部指令(教练文案)→ 拒出声——
+                                # 收线动作照旧(enter_closing/_schedule_call_end 已
+                                # 在上方执行),本轮落 LLM 走收尾话术(同空台词档)。
+                                # 台词本体仍经渐进披露进 prompt=本来用途。
+                                print(
+                                    f"CANNED_COACH_BLOCKED lane=branch-refuse step={_bp_step} "
+                                    f"text={str(_branch_plan['text'])[:32]!r} (call {room_name})",
+                                    flush=True,
+                                )
+                                _branch_plan = None
                             else:
                                 # 空台词 → 不 raise,交给后面 LLM 走收尾话术(与
                                 # verdict==REFUSE 同款);closing 轮不许再播分支罐头
@@ -4732,10 +5100,31 @@ async def entrypoint(ctx):
                 raise StopResponse()
             # ---- 罐头播放共用件(2026-09-18 话术图 Phase 2):QA 快路与
             # graph play_qa 同一条出口,抽自 QA 快路原位(行为逐字节不变)。
+            # M-1(2026-09-23 评审返工):cache_off 诊断旗标挂 self(PausableAgent
+            # 每通一实例=会话级)——本轮闭包变量是每轮重建的,「每通一次」会退化
+            # 成每轮刷屏。
+            _cache_off_flag = getattr(self, "_canned_cache_off_flag", None)
+            if _cache_off_flag is None:
+                _cache_off_flag = {"on": False}
+                self._canned_cache_off_flag = _cache_off_flag
+
             def _qa_pcm_for(text: str) -> bytes | None:
+                # F-11(2026-09-23)诊断:缓存链缺席(有效 provider 非 minimax 族,
+                # _tts_cache=None)时罐头查找结构性查空——只打一次点,令分支罐头
+                # 与图播放的 miss 打点可归因(状态面 provider 档见 pregen 的
+                # --qa-status tts_provider 字段)。
+                if _tts_cache is None:
+                    if not _cache_off_flag["on"]:
+                        _cache_off_flag["on"] = True
+                        print(
+                            f"CANNED_PCM cache_off tts_provider={tts_provider_name} "
+                            "(罐头缓存只挂 MiniMax 链,本通罐头快路全程走 LLM)",
+                            flush=True,
+                        )
+                    return None
                 voice = getattr(tts_provider, "resolved_voice", lambda: "")()
                 model = getattr(tts_provider, "resolved_model", lambda: "")()
-                if not text or _tts_cache is None:
+                if not text:
                     return None
                 return _tts_cache.lookup(
                     text, voice=voice, model=model,
@@ -4777,83 +5166,6 @@ async def entrypoint(ctx):
                 )
                 return True
 
-            # ---- 分支罐头快路(2026-09-20 路线 A-①/A-②):分支命中且应答已物化
-            # 录音 → 直接播录音跳过 LLM(零 TTFT、措辞逐字一致);未命中/未物化
-            # 照旧落穿 graph/QA/LLM——提示词注入行为不变。不推进流程:分支应答
-            # 留在本步。A-② 起本块**只消费**早段评估的 _branch_plan(动作派发
-            # 已在早段做,能到这里的只剩 hold/无动作计划);BOK_BRANCH_ACTION=0
-            # 时早段不评估,本块按 A-① 旧姿势自己求值一次(action_enabled=False
-            # 纯罐头腿),行为逐字节回退。缓存键与 _say_script 同源(resp 渲染
-            # 文本+运行时 voice/model/speed,emotion 空)。BOK_BRANCH_CANNED=0 关。
-            try:
-                if (
-                    _branch_plan is None
-                    and os.environ.get("BOK_BRANCH_ACTION", "1") != "1"
-                ):
-                    _bc_g, _bc_r = flow_ctrl.current_goal_ref()
-                    _branch_plan = branch_hit_plan(
-                        action_enabled=False,
-                        canned_enabled=os.environ.get("BOK_BRANCH_CANNED", "1") == "1",
-                        step_index=int(flow_ctrl.current),
-                        closing=bool(flow_ctrl.closing),
-                        paused=bool(self.paused),
-                        done=bool(flow_ctrl.done),
-                        user_text=user_text,
-                        goal=_bc_g,
-                        ref=_bc_r,
-                        wa_captured=bool(_wa_captured["on"]),
-                        verdict=str(flow_ctrl.last_verdict or ""),
-                        vars_map=flow_ctrl.vars_map,
-                        hotword_terms=_parse_vocab_terms(_hotword_ctx),
-                    )
-                _bc_step = (int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0
-            except Exception:  # noqa: BLE001 - 挑选异常当未命中,照旧落穿
-                _branch_plan = None
-            if _branch_plan is not None:
-                _bc_resp = str(_branch_plan["text"])
-                _bc_cond = str(_branch_plan["cond"])
-                _bc_pcm = _qa_pcm_for(_bc_resp)
-                if _bc_pcm is not None:
-                    try:
-                        await session.interrupt()  # ① 作废停着的抢跑快照(同 _qa_canned_say)
-                    except Exception:  # noqa: BLE001
-                        pass
-                    # ② 手动补 user 轮(StopResponse 轮 item_added 唔会触发;
-                    # C5 官方姿势:旧 chat_ctx.items.append 打只读上下文恒失败)
-                    await self._try_append_user_message(new_message)
-                    # ③ 回声守卫预锚(正常 playout 完才置,快路要立即生效)
-                    context_state.set_last_reply(_bc_resp)
-                    _turn_origin["gen"] = "script"
-                    _turn_origin["provider"] = "branch-canned"
-                    try:
-                        _bc_ms = int((time.monotonic() - _t0) * 1000)
-                        await cp.add_turn(
-                            call_id, "user", user_text, language=language_state.lang,
-                            line="a", speaker="customer",
-                            template_step=_bc_step, started_ms=_bc_ms, ended_ms=_bc_ms,
-                        )
-                    except Exception:  # noqa: BLE001
-                        pass
-                    print(
-                        f"BRANCH_CANNED hit step={_bc_step} "
-                        f"branch_len={len(_bc_resp)} (call {room_name})",
-                        flush=True,
-                    )
-                    # ④ 快路不经 tts_provider,首音频回调唔会拆看门狗——显式拆
-                    _cancel_response_watchdog()
-                    await session.say(
-                        _bc_resp,
-                        audio=frames_aiter(pcm_to_frames(_bc_pcm, _tts_cache.sample_rate)),
-                    )
-                    # 必须在 except-pass try 之外 raise(同 say-step/WA 累积/QA 快路)
-                    raise StopResponse()
-                # 命中分支但应答未物化 → 照旧落穿(注入提示词走 LLM,现状不变)
-                print(
-                    f"BRANCH_CANNED miss step={_bc_step} "
-                    f"branch_len={len(_bc_resp)} (call {room_name})",
-                    flush=True,
-                )
-
             # ---- 话术图引擎(spec 2026-09-18;插在 say 直念步之后、QA 快路之前,
             # precedence: REFUSE>DEFER>say>graph[notify/jump/play]>QA 快路;BOK_FLOW_GRAPH=0 整闸,
             # 空图零成本零变化;closing 后收线优先——REFUSE 分支已置 closing 且
@@ -4865,6 +5177,9 @@ async def entrypoint(ctx):
                 and not flow_ctrl.closing
                 and user_text
             ):
+                # W1b Phase 0:play 臂 advanced 守卫的判据——必须在三臂派发**之前**
+                # 算(jump 臂会置 _flow_step_before=-1,臂后算会自触发)。
+                _graph_advanced = flow_ctrl.current != _flow_step_before
                 # 3.4 意图 judge 消费点:上一轮背景判定的命中在此**先取即清**
                 # (single-shot TTL——无论绑定最终是否真触发都算消费掉;pick 内对
                 # 该 id 重过 enabled/步 scope/绑定资格全部守卫,判据唔豁免任何闸)。
@@ -4899,6 +5214,60 @@ async def entrypoint(ctx):
                             f"FLOW_GRAPH judge_pending_expired intent={_gjudge_hit}",
                             flush=True,
                         )
+                # W1b 语义车道:关键词未中时的同步补位(与 judge 同权——带
+                # semantic_hit 重过 pick 全部守卫,零特权)。miss 落穿下方
+                # elif user_text 的 judge 调度(语义先挡、judge 兜底——绝不能挡住 judge)。
+                if _gbinding is None and _intent_sem is not None:
+                    _sem = await _intent_sem.match(
+                        user_text,
+                        flow_ctrl.graph,
+                        step_1based=(int(flow_ctrl.current) + 1),
+                        fired=flow_ctrl.graph_fired,
+                        play_allowed=not _graph_advanced,
+                    )
+                    if _sem.intent_id:
+                        _gbinding = pick_graph_action(
+                            flow_ctrl.graph,
+                            user_text,
+                            step_1based=(int(flow_ctrl.current) + 1),
+                            fired=flow_ctrl.graph_fired,
+                            semantic_hit=_sem.intent_id,
+                        )
+                        if _gbinding is not None:
+                            print(
+                                f"FLOW_GRAPH semantic_hit intent={_sem.intent_id} "
+                                f"score={_sem.score:.2f} text={_sem.best_text[:12]} "
+                                f"binding={_gbinding.id} step={flow_ctrl.current + 1}",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                f"FLOW_GRAPH semantic_miss reason=no_binding "
+                                f"score={_sem.score:.2f} step={flow_ctrl.current + 1}",
+                                flush=True,
+                            )
+                    elif _sem.reason in ("no_embedder", "timeout", "error"):
+                        # 降级闩/端点故障:每通只打一次(_canned_cache_off_flag 同款
+                        # self 挂旗——本轮闭包变量每轮重建,轮级旗会退化成每轮刷屏)。
+                        _sem_flag = getattr(self, "_sem_skip_flag", None)
+                        if _sem_flag is None:
+                            _sem_flag = {"on": False}
+                            self._sem_skip_flag = _sem_flag
+                        if not _sem_flag["on"]:
+                            _sem_flag["on"] = True
+                            print(
+                                f"FLOW_GRAPH semantic_skip reason={_sem.reason} "
+                                f"step={flow_ctrl.current + 1}",
+                                flush=True,
+                            )
+                    elif _sem.reason == "":
+                        print(
+                            f"FLOW_GRAPH semantic_miss reason=below_threshold "
+                            f"score={_sem.score:.2f} step={flow_ctrl.current + 1}",
+                            flush=True,
+                        )
+                    # reason=no_candidates:无可匹配意图(全被闸滤掉/空话语),静默
+                    # (同 _intent_judge_candidates 空表姿势,热路径一行不刷)。
             if _gbinding is not None:
                 if _gbinding.action == "jump_step":
                     # 1-based 存储转 0-based;先跳、按**实际位移**记账(2026-09-18
@@ -4916,6 +5285,9 @@ async def entrypoint(ctx):
                         # 跳步轮强制 advanced=True → QA 快路让位(spec precedence graph>QA):
                         # 同轮规则推进+图后退跳可令净位移为零,不置哨兵快路会照抢本轮。
                         _flow_step_before = -1
+                        # M-22②:分支计划是跳前旧步匹配的 → 作废(本轮不 raise,
+                        # 会落穿分支罐头腿,旧步罐头抢答新步轮)
+                        _branch_plan = None
                         print(
                             f"FLOW_GRAPH jump binding={_gbinding.id} "
                             f"step={flow_ctrl.current + 1}",
@@ -4946,57 +5318,69 @@ async def entrypoint(ctx):
                         )
                     )
                 else:  # play_qa:条目在场且音频已物化才播;miss 放行 LLM 不消耗 once
-                    _ge = (
-                        _qa_index.by_id(_gbinding.qa_id)
-                        if _qa_index is not None and _gbinding.qa_id
-                        else None
-                    )
-                    _gp = _qa_pcm_for(str((_ge or {}).get("answer_text") or ""))
-                    if (
-                        _ge is not None
-                        and _gp is not None
-                        and await _qa_canned_say(_ge, _gp, provider="graph-play")
-                    ):
-                        flow_ctrl.graph_fired.add(_gbinding.id)
+                    if _graph_advanced:
+                        # W1b Phase 0 advanced 守卫:规则推进轮 play 臂落穿 LLM——
+                        # 罐头劫持确认轮(意图目录 design_notes:「赔偿可以」被裸词
+                        # 抢)的 Phase 0 治理。镜像 play_miss 行为姿势:不烧 once、
+                        # 不播罐头、落穿 LLM。jump/notify 臂不加守卫(蓝图定案:
+                        # jump 必须能压过规则推进;notify 零抢话误铃代价低)。
                         print(
-                            f"FLOW_GRAPH play binding={_gbinding.id} "
+                            f"FLOW_GRAPH play_bypass binding={_gbinding.id} "
+                            f"reason=advanced (call {room_name})",
+                            flush=True,
+                        )
+                    else:
+                        _ge = (
+                            _qa_index.by_id(_gbinding.qa_id)
+                            if _qa_index is not None and _gbinding.qa_id
+                            else None
+                        )
+                        _gp = _qa_pcm_for(str((_ge or {}).get("answer_text") or ""))
+                        if (
+                            _ge is not None
+                            and _gp is not None
+                            and await _qa_canned_say(_ge, _gp, provider="graph-play")
+                        ):
+                            flow_ctrl.graph_fired.add(_gbinding.id)
+                            print(
+                                f"FLOW_GRAPH play binding={_gbinding.id} "
+                                f"qa={_gbinding.qa_id}",
+                                flush=True,
+                            )
+                            # ---- 追问链（Phase 3.3，spec §3）：罐头播完当场同步跳，下一轮
+                            # 按新步走。本分支以 StopResponse 收尾，冇任何 LLM 请求——唔喺本
+                            # 分支渲染当前步（渲染只会烧掉该步首渲染账本 _last_render_step/
+                            # _just_advanced，令下一轮流程块重渲染退成分支模式，底稿与
+                            # 【跳转进入】结构性失落）；位移状态已由 jump_to 置好，下一轮流程块
+                            # 首渲染即该步正稿+【跳转进入】，且真被请求消费。复用 Phase 2 位移
+                            # 记账纪律：实际位移才打 jump 日志；同位/closing/钳到同位 → jump_noop
+                            # 且零额外消耗（then_jump 是同一绑定的动作后缀，不另立 once 账本条目）。
+                            # 注：_invalidate_stale_preemptive 的标记随本轮 turn_ctx 副本蒸发
+                            # （承重件是 jump_to 置的位移状态）；照 spec 调用，零成本。
+                            # 0/False 为静默 no-op（T1 parse 丢 bool/拒 0——未来若扩「0=跳回首步」语义勿沿用真值门）。
+                            if _gbinding.then_jump:
+                                _tj_target = int(_gbinding.then_jump) - 1
+                                if flow_ctrl.apply_then_jump(_gbinding.then_jump):
+                                    _invalidate_stale_preemptive(
+                                        f"流程跳转 → 第 {flow_ctrl.current + 1} 步"
+                                    )
+                                    print(
+                                        f"FLOW_GRAPH jump binding={_gbinding.id} "
+                                        f"step={flow_ctrl.current + 1} via=then_jump",
+                                        flush=True,
+                                    )
+                                else:
+                                    print(
+                                        f"FLOW_GRAPH jump_noop binding={_gbinding.id} "
+                                        f"step={_tj_target + 1} via=then_jump",
+                                        flush=True,
+                                    )
+                            raise StopResponse()  # 压掉本轮 LLM(WA 累积同款)
+                        print(
+                            f"FLOW_GRAPH play_miss binding={_gbinding.id} "
                             f"qa={_gbinding.qa_id}",
                             flush=True,
                         )
-                        # ---- 追问链（Phase 3.3，spec §3）：罐头播完当场同步跳，下一轮
-                        # 按新步走。本分支以 StopResponse 收尾，冇任何 LLM 请求——唔喺本
-                        # 分支渲染当前步（渲染只会烧掉该步首渲染账本 _last_render_step/
-                        # _just_advanced，令下一轮流程块重渲染退成分支模式，底稿与
-                        # 【跳转进入】结构性失落）；位移状态已由 jump_to 置好，下一轮流程块
-                        # 首渲染即该步正稿+【跳转进入】，且真被请求消费。复用 Phase 2 位移
-                        # 记账纪律：实际位移才打 jump 日志；同位/closing/钳到同位 → jump_noop
-                        # 且零额外消耗（then_jump 是同一绑定的动作后缀，不另立 once 账本条目）。
-                        # 注：_invalidate_stale_preemptive 的标记随本轮 turn_ctx 副本蒸发
-                        # （承重件是 jump_to 置的位移状态）；照 spec 调用，零成本。
-                        # 0/False 为静默 no-op（T1 parse 丢 bool/拒 0——未来若扩「0=跳回首步」语义勿沿用真值门）。
-                        if _gbinding.then_jump:
-                            _tj_target = int(_gbinding.then_jump) - 1
-                            if flow_ctrl.apply_then_jump(_gbinding.then_jump):
-                                _invalidate_stale_preemptive(
-                                    f"流程跳转 → 第 {flow_ctrl.current + 1} 步"
-                                )
-                                print(
-                                    f"FLOW_GRAPH jump binding={_gbinding.id} "
-                                    f"step={flow_ctrl.current + 1} via=then_jump",
-                                    flush=True,
-                                )
-                            else:
-                                print(
-                                    f"FLOW_GRAPH jump_noop binding={_gbinding.id} "
-                                    f"step={_tj_target + 1} via=then_jump",
-                                    flush=True,
-                                )
-                        raise StopResponse()  # 压掉本轮 LLM(WA 累积同款)
-                    print(
-                        f"FLOW_GRAPH play_miss binding={_gbinding.id} "
-                        f"qa={_gbinding.qa_id}",
-                        flush=True,
-                    )
             elif user_text:
                 # 关键词未中才让判据判定补位——确定性关键词恒同步先行,judge 只做兜底
                 # (spec §4)。**elif 钉死在图块真求值过的分支**(review F1:旧 else 与
@@ -5005,6 +5389,120 @@ async def entrypoint(ctx):
                 # say/收线/图关各路径 `_intent_judge_candidates` 门已覆盖,唯
                 # user_text 唔喺门参数里,这里结构上补死)。
                 _maybe_schedule_intent_judge(user_text)
+            # ---- 分支罐头快路(M-22②,2026-09-23 起**移到话术图引擎之后**):
+            # 分支命中且应答已物化录音 → 直接播录音跳过 LLM(零 TTFT、措辞逐字
+            # 一致);未命中/未物化照旧落穿 QA/LLM——提示词注入行为不变。不推进
+            # 流程:分支应答留在本步。A-② 起本块**只消费**早段评估的 _branch_plan
+            # (动作派发已在早段做,能到这里的只剩 hold/无动作计划);BOK_BRANCH_
+            # ACTION=0 时早段不评估,本块按 A-① 旧姿势自己求值一次(action_enabled
+            # =False 纯罐头腿),行为逐字节回退。缓存键与 _say_script 同源(resp
+            # 渲染文本+运行时 voice/model/speed,emotion 空)。BOK_BRANCH_CANNED=0 关。
+            # 优先级(task-4 M1 复核,2026-09-23):graph 确定性关键词命中 >
+            # 分支模糊命中(家族+bigram)——旧序罐头遮蔽 graph(V2 六通零
+            # FLOW_GRAPH);notify 打铃臂不抢话=罐头共存,jump/play 臂 raise 或
+            # 位移后计划作废。本轮推进过的轮(rule advance/jump)计划係推进前
+            # 旧步匹配的 → stale 丢弃,唔准拿旧步罐头抢答新步轮(zh/s1 报号轮
+            # 被旧步「提示客户…」顶替实证;与 graph play advanced 守卫同语义)。
+
+            try:
+                if (
+                    _branch_plan is None
+                    and os.environ.get("BOK_BRANCH_ACTION", "1") != "1"
+                ):
+                    _bc_g, _bc_r = flow_ctrl.current_goal_ref()
+                    _branch_plan = branch_hit_plan(
+                        action_enabled=False,
+                        canned_enabled=os.environ.get("BOK_BRANCH_CANNED", "1") == "1",
+                        step_index=int(flow_ctrl.current),
+                        closing=bool(flow_ctrl.closing),
+                        paused=bool(self.paused),
+                        done=bool(flow_ctrl.done),
+                        user_text=user_text,
+                        goal=_bc_g,
+                        ref=_bc_r,
+                        wa_captured=bool(_wa_captured["on"]),
+                        verdict=str(flow_ctrl.last_verdict or ""),
+                        vars_map=flow_ctrl.vars_map,
+                        hotword_terms=_parse_vocab_terms(_hotword_ctx),
+                    )
+                _bc_step = (int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0
+            except Exception:  # noqa: BLE001 - 挑选异常当未命中,照旧落穿
+                _branch_plan = None
+            if _branch_plan is not None and flow_ctrl.current != _flow_step_before:
+                # 本轮流程已位移(规则推进/graph 跳步/分支跳步):计划是位移前
+                # 旧步 ref 匹配的 → stale 丢弃(新步答案交给后续 LLM;graph jump
+                # 轮 provider=graph-jump 已标记)。与 QA 快路 advanced 旁路同门。
+                print(
+                    f"BRANCH_CANNED stale step={_bc_step} "
+                    f"prev_step={_flow_step_before + 1} (call {room_name})",
+                    flush=True,
+                )
+                _branch_plan = None
+            if _branch_plan is not None:
+                _bc_resp = str(_branch_plan["text"])
+                _bc_cond = str(_branch_plan["cond"])
+                # M-22①:应答係内部指令(教练文案)→ 拒出声,计划作废落穿
+                # graph 已过/QA/LLM——教练文案经渐进披露进 prompt=本来用途。
+                if (
+                    os.environ.get("BOK_CANNED_TEXT_GUARD", "1") == "1"
+                    and _is_internal_instruction(_bc_resp)
+                ):
+                    print(
+                        f"CANNED_COACH_BLOCKED lane=branch-canned step={_bc_step} "
+                        f"text={_bc_resp[:32]!r} (call {room_name})",
+                        flush=True,
+                    )
+                    _branch_plan = None
+            if _branch_plan is not None:
+                _bc_pcm = _qa_pcm_for(_bc_resp)
+                if _bc_pcm is not None:
+                    try:
+                        await session.interrupt()  # ① 作废停着的抢跑快照(同 _qa_canned_say)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    # ② 手动补 user 轮(StopResponse 轮 item_added 唔会触发;
+                    # C5 官方姿势:旧 chat_ctx.items.append 打只读上下文恒失败)
+                    await self._try_append_user_message(new_message)
+                    # ③ 回声守卫预锚(正常 playout 完才置,快路要立即生效)
+                    context_state.set_last_reply(_bc_resp)
+                    _turn_origin["gen"] = "script"
+                    # M-1(2026-09-24 评审返工):同轮 graph-notify 打铃+分支罐头
+                    # 共存轮——罐头出声不得覆写 graph-notify 标记,合并归因令
+                    # turns 账本双标记俱在(provider VARCHAR(64) 容纳)。
+                    _turn_origin["provider"] = (
+                        "branch-canned+graph-notify"
+                        if str(_turn_origin.get("provider") or "") == "graph-notify"
+                        else "branch-canned"
+                    )
+                    try:
+                        _bc_ms = int((time.monotonic() - _t0) * 1000)
+                        await cp.add_turn(
+                            call_id, "user", user_text, language=language_state.lang,
+                            line="a", speaker="customer",
+                            template_step=_bc_step, started_ms=_bc_ms, ended_ms=_bc_ms,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    print(
+                        f"BRANCH_CANNED hit step={_bc_step} "
+                        f"branch_len={len(_bc_resp)} (call {room_name})",
+                        flush=True,
+                    )
+                    # ④ 快路不经 tts_provider,首音频回调唔会拆看门狗——显式拆
+                    _cancel_response_watchdog()
+                    await session.say(
+                        _bc_resp,
+                        audio=frames_aiter(pcm_to_frames(_bc_pcm, _tts_cache.sample_rate)),
+                    )
+                    # 必须在 except-pass try 之外 raise(同 say-step/WA 累积/QA 快路)
+                    raise StopResponse()
+                # 命中分支但应答未物化 → 照旧落穿(注入提示词走 LLM,现状不变)
+                print(
+                    f"BRANCH_CANNED miss step={_bc_step} "
+                    f"branch_len={len(_bc_resp)} (call {room_name})",
+                    flush=True,
+                )
+
             # ---- Q→A 检索快路(PR-3):四道闸全过 + 应答音频已预生成才命中 ----
             # 命中 → 跳过 LLM 直接播缓存音频(~50ms);任一闸不过 → 照旧走 LLM。
             # 位置在流程推进块之后:推进/收尾判定已落定,闸门让位(refuse/closing/
@@ -5041,9 +5539,41 @@ async def entrypoint(ctx):
                         )
                     except Exception:  # noqa: BLE001 - 匹配失败当未命中
                         _qa_entry, _qa_score = None, 0.0
+                    # 语义补位(W3b 解锁,2026-09-24):词面 0.90 未中 → 本地 embedding
+                    # 释义档(阈值 0.80)。**词面恒绝对优先**(命中轮零语义调用);
+                    # 命中条目走与词面同款的折组/轮换/PCM 出场链(补位轮不打
+                    # match0);车道不可用(reason 非空)静默降级=旧档。
+                    if _qa_entry is None and _qa_sem is not None:
+                        try:
+                            _sentry, _sscore, _sreason = await _qa_sem.match(
+                                user_text,
+                                lang=language_state.lang,
+                                step_index=(flow_ctrl.current if flow_ctrl.has_steps else None),
+                            )
+                        except Exception:  # noqa: BLE001 - 补位失败当未命中
+                            _sentry, _sscore, _sreason = None, 0.0, "error"
+                        if _sentry is not None:
+                            _folded = (
+                                _qa_index.team_head(
+                                    _sentry,
+                                    lang=language_state.lang,
+                                    step_index=(flow_ctrl.current if flow_ctrl.has_steps else None),
+                                )
+                                if qa_rotation_enabled()
+                                else None
+                            )
+                            _qa_entry = _folded or _sentry
+                            _qa_score = _sscore
+                            print(
+                                f"QA_SEM hit=1 entry={_qa_entry.get('id')} score={_sscore:.2f}",
+                                flush=True,
+                            )
+                        elif not _sreason:
+                            print(f"QA_SEM miss best={_sscore:.2f}", flush=True)
                     # 汇总打点(task-9):match0=零命中轮(含匹配异常);hit=命中条目
                     # 轮(=下文 hit=1 出声轮 + no_audio 轮之和,hit_audio=hit-no_audio
-                    # 由 format_qa_summary 求差)。
+                    # 由 format_qa_summary 求差)。语义补位命中轮计 hit(语义与词面
+                    # 同一条出场链,口径不拆;归因看 QA_SEM 行)。
                     _qa_bump("match0" if _qa_entry is None else "hit")
                     if _qa_entry is not None:
                         # 多答案轮换(Phase 3.2 spec §2):match 胜者已折组到簇内首个
@@ -5238,6 +5768,7 @@ async def entrypoint(ctx):
 
     def _on_agent_state(ev) -> None:
         # AI 講完轉「聆聽」→ 記低 AI 最後講完時刻再起錶;講話/思考中 → 撤錶。
+        _link["agent"] = getattr(ev, "new_state", "") or ""
         if getattr(ev, "new_state", "") == "listening":
             _nudge_state["last_reply_ts"] = time.monotonic()
             _arm_silence()
@@ -5245,6 +5776,7 @@ async def entrypoint(ctx):
             _disarm_silence()
 
     def _on_user_state(ev) -> None:
+        _link["user"] = getattr(ev, "new_state", "") or ""
         if getattr(ev, "new_state", "") == "speaking":
             _nudge_state["last_user_ts"] = time.monotonic()
             _disarm_silence()

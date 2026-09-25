@@ -29,7 +29,7 @@ _PCM = b"\x01\x02" * 1000  # 2000B 假音频(> 40ms 早推门槛,不足一整 20
 
 def _make_tts():
     return Qwen3TTSTTS(
-        voice={"zh": "zh-female", "cantonese": "cantonese-female"},
+        voice={"zh": "vivian", "cantonese": "sohee"},
         sample_rate=24000,
     )
 
@@ -106,7 +106,7 @@ def test_qwen3_stream_posts_per_sentence(monkeypatch):
     # voice 每任务即时解析(LanguageState 缺省 lang=zh → zh 音色)。
     for p in posts:
         assert p["streaming"] is True and p["chunk_ms"] == 200
-        assert p["voice"] == "zh-female"
+        assert p["voice"] == "vivian"  # 预设音色原样透传（2026-09-24 起新契约）
         assert p["response_format"] == "pcm"
     # 至少推过一段音频(两句话各回一包 PCM)。
     assert len(events) >= 1
@@ -163,9 +163,14 @@ def test_qwen3_stream_overlap_flushes_cjk_fragment(monkeypatch):
 
     旧 _flushable 用裸 isalpha()/isdigit() 拦尾——CJK 汉字 isalpha()==True,
     中文片段全被拦,overlap 对中文流量全死。
+
+    W8(2026-09-24)起首送另有快车道(≥6 字即送,test_tts_first_clause.py 钉);
+    本测试钉 **overlap 旧档语义** → 显式关掉快车道,否则首送在 7 字就发生、
+    12 字门槛断言面被吃掉。
     """
     from agent_runtime.providers.livekit_plugins import _Qwen3SynthesizeStream
 
+    monkeypatch.setenv("BOK_TTS_FIRST_CLAUSE", "0")
     posts: list[dict] = []
     _install_fake_sidecar(monkeypatch, posts)
 

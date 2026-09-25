@@ -70,10 +70,17 @@ def test_build_tts_provider_qwen3_fallback(monkeypatch):
         monkeypatch.delenv(key, raising=False)
     provider = interpret._build_tts_provider({"provider": "qwen3_tts", "speaker": "wan2"}, "zh")
     assert isinstance(provider, Qwen3TTSTTS)
-    assert provider._resolve_voice() == "wan2"
+    # 2026-09-24 新契约：未知本地音色 → 语言档回落（治 MiniMax 音色 id 误入本地线
+    # 崩 5/7 轮；契约全集见 tests/test_qwen3_voice_fallback.py）。
+    assert provider._resolve_voice() == "vivian"
+    # 预设音色原样透传。
+    assert (
+        interpret._build_tts_provider({"provider": "qwen3_tts", "speaker": "serena"}, "zh")._resolve_voice()
+        == "serena"
+    )
     # 未指定 provider 也走本地兜底；全局 speaker 缺省时按目标语取分语言键。
     assert isinstance(interpret._build_tts_provider({}, "en"), Qwen3TTSTTS)
-    assert interpret._build_tts_provider({"speaker_zh": "zh-voice"}, "zh")._resolve_voice() == "zh-voice"
+    assert interpret._build_tts_provider({"speaker_zh": "sohee"}, "zh")._resolve_voice() == "sohee"
     assert "MINIMAX_MODEL" not in os.environ
     assert "MINIMAX_LANGUAGE_BOOST" not in os.environ
 

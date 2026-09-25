@@ -2965,6 +2965,68 @@ def _trim_lead_silence(
     return bytes(body), trimmed_ms
 
 
+# ---- W8 首子句起播（2026-09-24，MiniMax/Qwen3 两家 TTS 共用） ----
+# 首个 task_continue/首段 POST 是首音频的门。overlap 档门槛 12 字
+# （MINIMAX_TTS_OVERLAP_CHARS）在慢生成轮（GPU 争用实测 tps 13-18，
+# call-ff96795c 族 commit_to_audio 1.9-2.6s）把首送推后 ~0.7-0.9s。
+# 首送走快车道：≥N 字（默认 6）即可送，且不要求「软停顿过半」——
+# 短首子句（「好的，我帮您查」）的软停顿本来到不了半程；送出后
+# 后续增量回 overlap 档原节奏，句子路径（。！？）照旧恒优先。
+_TTS_SENT_END = "。！？!?"
+_TTS_SOFT_BREAK = "，、；;：:"
+
+
+def _tts_first_clause_config() -> tuple[bool, int]:
+    """W8 首送快车道配置：(开关, 字数门槛)。纯函数，两家 TTS 共用。
+
+    - ``BOK_TTS_FIRST_CLAUSE``（默认 "1"）：总闸，0=回纯 overlap 档。
+    - ``BOK_TTS_FIRST_CLAUSE_CHARS``（默认 6，钳 ≥1）：首送门槛。
+    - 前提仍是各家 overlap 开着（MINIMAX/QWEN3_TTS_OVERLAP=0 = 运营
+      刻意回「整句才送」保守档，快车道不越权激活）。
+    """
+    on = os.environ.get("BOK_TTS_FIRST_CLAUSE", "1") == "1"
+    try:
+        chars = int(os.environ.get("BOK_TTS_FIRST_CLAUSE_CHARS", "6"))
+    except ValueError:
+        chars = 6
+    return on, max(1, chars)
+
+
+def _tts_overlap_send_now(
+    buf: str,
+    *,
+    sent_any: bool,
+    overlap_on: bool,
+    first_lane_on: bool,
+    first_lane_chars: int,
+    overlap_chars: int,
+    time_up: bool,
+) -> tuple[bool, bool]:
+    """overlap 增量此刻是否送出 → (send_now, via_first_lane)。纯函数。
+
+    与旧档的分别只在首送：门槛降为 first_lane_chars、软停顿过半门豁免。
+    time_up 恒可送（旧档同语义）；数字/字母尾的拦腰保护（_flushable）
+    与纯标点段检查由调用方把关（两家尾串处理同款，留在循环内）。
+    """
+    s = buf.strip()
+    if not s or not overlap_on:
+        return False, False
+    first_lane = first_lane_on and not sent_any
+    need = first_lane_chars if first_lane else overlap_chars
+    if len(s) < need:
+        return False, False
+    soft_idx = -1
+    for ch in _TTS_SOFT_BREAK:
+        pos = s.rfind(ch)
+        if pos != -1:
+            soft_idx = max(soft_idx, pos)
+    if soft_idx != -1 and (first_lane or soft_idx >= len(s) // 2):
+        return True, first_lane
+    if time_up:
+        return True, first_lane
+    return False, False
+
+
 class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
     """MiniMax 增量流式：一条 WS 连接，LLM 文本增量到达即 task_continue。
 
@@ -3206,10 +3268,17 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
             _reconnecting = asyncio.Event()
             t_first_text = 0.0
 
-            def _note_first_send() -> None:
+            def _note_first_send(s: str = "") -> None:
                 nonlocal t_first_text
                 if t_first_text == 0.0:
                     t_first_text = time.monotonic()
+                    # W8 A/B 秒表(两腿共通):首个 task_continue 的时刻与字数。
+                    # 首送是首音频的门;该读数=「流启动→首送」纯文本等待面,
+                    # 与 cloud RTT(TTS_FIRST_AUDIO_MS)/watchdog 收割解耦。
+                    print(
+                        f"MINIMAX_TTS_FIRST_SEND_MS {(t_first_text - t0) * 1000:.0f} chars={len(s)}",
+                        flush=True,
+                    )
 
             async def _stall_watch() -> None:
                 nonlocal ws, stalled, recv_task, init_done, first_pushed, t_task, t_start, t_first_text
@@ -3254,8 +3323,7 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
             # MINIMAX_TTS_OVERLAP=1(默认):句号之间也按「≥N 字 / 标点停顿 / ≥T ms」增量提前送,
             # 让 MiniMax 在 LLM 整句写完前先出前半句音频;连续数字/字母串不切开(防单号腰斩读错)。
             # 音频按序回流,recv_loop 持续推给 emitter,无需句间等待。
-            _SENT_END = "。！？!?"
-            _SOFT_BREAK = "，、；;：:"
+            _first_lane_on, _first_lane_chars = _tts_first_clause_config()
             sent_buf = ""
             sent_any = False
             try:
@@ -3293,7 +3361,7 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                     # 若前面已出过正常音频,课程句静默丢弃,唔追加罐头(避免二重声)。
                     self._lecture_fired = True
                     if not sent_any:
-                        _note_first_send()
+                        _note_first_send(s)
                         if _reconnecting.is_set():
                             await _reconnecting.wait()
                         await ws.send(
@@ -3303,7 +3371,7 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                     return
                 if is_lecture_text(s):
                     return  # 已触发过,课程延续句照丢
-                _note_first_send()
+                _note_first_send(s)
                 if _reconnecting.is_set():
                     await _reconnecting.wait()
                 await ws.send(json.dumps({"event": "task_continue", "text": s}))
@@ -3320,7 +3388,7 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                 sent_buf += text
                 while True:
                     idx = min(
-                        (sent_buf.find(ch) for ch in _SENT_END if sent_buf.find(ch) != -1),
+                        (sent_buf.find(ch) for ch in _TTS_SENT_END if sent_buf.find(ch) != -1),
                         default=-1,
                     )
                     if idx == -1:
@@ -3330,22 +3398,22 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                     if sentence.strip():
                         await _send_text(sentence.strip())
                 # overlap:句号之间的增量,满足「≥N 字且有软停顿/距上次够久」就提前送。
-                if (
-                    overlap_on
-                    and not self._lecture_fired
-                    and sent_buf.strip()
-                    and len(sent_buf.strip()) >= _overlap_chars
-                ):
-                    soft_idx = -1
-                    for ch in _SOFT_BREAK:
-                        pos = sent_buf.rfind(ch)
-                        if pos != -1:
-                            soft_idx = max(soft_idx, pos)
-                    now = time.monotonic()
-                    time_up = (now - _last_send) * 1000 >= _overlap_ms
-                    if (soft_idx != -1 and soft_idx >= len(sent_buf.strip()) // 2) or time_up:
+                # 首送走 W8 快车道(≥6 字即可、软停顿过半门豁免);后续回 overlap 档。
+                if overlap_on and not self._lecture_fired and sent_buf.strip():
+                    send_now, via_first = _tts_overlap_send_now(
+                        sent_buf,
+                        sent_any=sent_any,
+                        overlap_on=overlap_on,
+                        first_lane_on=_first_lane_on,
+                        first_lane_chars=_first_lane_chars,
+                        overlap_chars=_overlap_chars,
+                        time_up=(time.monotonic() - _last_send) * 1000 >= _overlap_ms,
+                    )
+                    if send_now:
                         frag = sent_buf.strip()
                         if _flushable(frag):
+                            if via_first:
+                                print(f"MINIMAX_TTS_FIRST_CLAUSE chars={len(frag)}", flush=True)
                             await _send_text(frag)
                             sent_buf = ""
                 if self._lecture_fired:
@@ -3354,14 +3422,14 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                 if not self._lecture_fired and is_lecture_text(sent_buf.strip()):
                     self._lecture_fired = True
                     if not sent_any:
-                        _note_first_send()
+                        _note_first_send(sent_buf.strip())
                         if _reconnecting.is_set():
                             await _reconnecting.wait()
                         await ws.send(
                             json.dumps({"event": "task_continue", "text": lecture_canned(self._tts_._speech_lang())})
                         )
                 elif not self._lecture_fired:
-                    _note_first_send()
+                    _note_first_send(sent_buf.strip())
                     if _reconnecting.is_set():
                         await _reconnecting.wait()
                     await ws.send(json.dumps({"event": "task_continue", "text": _inject_pauses(sent_buf.strip())}))
@@ -3432,6 +3500,23 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
 # 服务端永不 ping;客户端要定期 ping(空闲 >120s → 2201 断连),此处 60s 一发。
 # 2205 = 软背压：稍后原样重发同一条 task_continue,唔好重连;2204 单条 >10k 字
 # 跳过;2206 重复 task_start 会关连接。一条连接一个合成会话。
+# ---- F-10(2026-09-23 生产就绪修复波):bidi 限流守卫 ----
+# 官方 t2a_v2_bidi 指引:task_failed 事件必须关闭连接并处理错误。实弹(T3 报告
+# F-10 Blocker):1002(RPM 限流)呼叫开局突发即触后,适配器不关连接、不退避、
+# 不回落——死会话上继续 task_continue → 794 行「no audio frames were pushed」,
+# 且失败重试自我维持限流(同通后续轮全灭)。
+_MINIMAX_BIDI_RATE_LIMIT_STATUSES = frozenset({1002, 1039, 2205})
+# 指数退避重试序列(1039/2205 task_failed 用;1002 首击即回落 HTTP 不重试)。
+_MINIMAX_BIDI_RATE_LIMIT_RETRY_DELAYS = (1.0, 2.0)
+# 同通连续 N 轮限流 → 熔断:本通剩余轮直接 HTTP 不再碰 WS(防重试风暴)。
+_MINIMAX_BIDI_RATE_LIMIT_MAX_STREAK = 3
+
+
+def _bidi_guard_enabled() -> bool:
+    """F-10 kill-switch:BOK_MINIMAX_BIDI_GUARD=0 回旧行为(不关连接不回落)。"""
+    return os.environ.get("BOK_MINIMAX_BIDI_GUARD", "1") == "1"
+
+
 class _MiniMaxBidiSession:
     """每 TTS 实例(=每 job)一条 bidi 连接的生命周期管理。
 
@@ -3463,6 +3548,10 @@ class _MiniMaxBidiSession:
         self.last_connect_ms = 0.0
         # prewarm 失败重试计数(官方 #6969 姿势,上限 1):连接成功即清零
         self._prewarm_retries = 0
+        # F-10 限流熔断计数:本通(=本 job/本 TTS 实例)连续限流轮数。限流轮 +1,
+        # 任何一轮 WS 成功出声归零;达 _MINIMAX_BIDI_RATE_LIMIT_MAX_STREAK →
+        # 后续轮跳过 WS 直接 HTTP(BOK_MINIMAX_BIDI_GUARD=0 整闸回旧行为)。
+        self.rate_limit_streak = 0
 
     def alloc_epoch(self) -> int:
         """为本流分配纪元号（只占号，唔认领——认领发生在首个 task_continue）。"""
@@ -3728,6 +3817,11 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
         # 本流已发全部 task_continue 文本(按发送序)——看门狗僵死重连后单条合并重发
         # (官方 2204:单条 >10k 字跳过,故截 10k);2205 重发係重放已发文本,唔 append。
         self._sent_text_parts: list[str] = []
+        # F-10 限流守卫态(本轮内):收到限流族故障 / 最近一次故障码 / 首包信号
+        # (WS 退避重试后是否出声,由 recv_loop 在首推时置)。
+        self._rate_limited = False
+        self._last_rl_status = 0
+        self._first_audio_evt = asyncio.Event()
 
     async def _emit_beep(self, output_emitter):
         import math
@@ -3805,6 +3899,19 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
             session = self._tts_._bidi_session()
             await session.lock.acquire()
             my_epoch = session.alloc_epoch()  # 本流纪元:首个 task_continue 时认领
+            # F-10 限流熔断(2026-09-23):本通连续限流达上限 → 本轮跳过 WS,文本
+            # 只记账、收尾直接 HTTP(防「重试风暴自我维持限流」——同通后续轮
+            # 撞同一线)。BOK_MINIMAX_BIDI_GUARD=0 整闸回旧行为。
+            circuit_open = (
+                _bidi_guard_enabled()
+                and session.rate_limit_streak >= _MINIMAX_BIDI_RATE_LIMIT_MAX_STREAK
+            )
+            if circuit_open:
+                print(
+                    f"MINIMAX_BIDI_CIRCUIT_OPEN streak={session.rate_limit_streak} "
+                    "— 本轮直接 HTTP 合成,不碰 WS",
+                    flush=True,
+                )
             ws = None
             recv_task: asyncio.Task | None = None
             resend_task: asyncio.Task | None = None
@@ -3833,18 +3940,23 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
             # _sent_text_parts 的由看门狗合并重发覆盖,闸清后照常直发新连接。
             _reconnecting = asyncio.Event()
             try:
-                try:
-                    ws = await session.ensure_ready()
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    # 连唔到 WS 冇音频可推(livekit 会 APIError no audio frames →
-                    # 静音吞回复)。播一声 beep 令客户知 AI 有反应过,同 classic。
-                    print("MINIMAX_TTS_BIDI_CONNECT", repr(exc), flush=True)
-                    await self._emit_beep(output_emitter)
-                    return
-                reused = session.last_reused
-                connect_ms = session.last_connect_ms
+                if circuit_open:
+                    # 熔断轮:零握手段,文本由 _send_text 记账、收尾 HTTP 直落。
+                    reused = False
+                    connect_ms = 0.0
+                else:
+                    try:
+                        ws = await session.ensure_ready()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        # 连唔到 WS 冇音频可推(livekit 会 APIError no audio frames →
+                        # 静音吞回复)。播一声 beep 令客户知 AI 有反应过,同 classic。
+                        print("MINIMAX_TTS_BIDI_CONNECT", repr(exc), flush=True)
+                        await self._emit_beep(output_emitter)
+                        return
+                    reused = session.last_reused
+                    connect_ms = session.last_connect_ms
 
                 async def _recv_loop():
                     nonlocal init_done
@@ -3916,6 +4028,7 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                                 output_emitter.flush()
                                 buf.clear()
                                 state["first_pushed"] = True
+                                self._first_audio_evt.set()  # F-10:WS 退避重试的成功信号
                             while len(buf) >= frame_bytes:
                                 output_emitter.push(bytes(buf[:frame_bytes]))
                                 output_emitter.flush()
@@ -3938,6 +4051,42 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                             state["sentences"] += 1
                         base = msg.get("base_resp") or {}
                         status = int(base.get("status_code") or 0)
+                        # F-10 限流守卫(2026-09-23):官方指引 task_failed 必须关连接
+                        # 并处理错误。1002=RPM/1039=TPM/2205=请求超限族 → 关当前
+                        # WS 弃会话,由收尾段退避重试或回落 HTTP(非限流族维持现状
+                        # 记日志)。注意 2205 双形态:非 task_failed 事件携带的 2205
+                        # 仍是软背压,保留既有原样重发路径(唔好重连),唔入守卫。
+                        rl_hit = status in _MINIMAX_BIDI_RATE_LIMIT_STATUSES
+                        if rl_hit and status == 2205 and event != "task_failed":
+                            rl_hit = False
+                        if rl_hit and _bidi_guard_enabled():
+                            print(
+                                f"MINIMAX_BIDI_RATE_LIMIT status={status} "
+                                f"event={event or '-'} first_pushed={int(state['first_pushed'])} "
+                                f"streak={session.rate_limit_streak}",
+                                flush=True,
+                            )
+                            self._last_rl_status = status
+                            if not state.get("rl_counted"):
+                                state["rl_counted"] = True
+                                session.rate_limit_streak += 1
+                            if state["first_pushed"]:
+                                # 已出过音频:只弃毒化连接(死会话继续 continue=零帧
+                                # 根因),本轮已推音频照常收尾,唔重播唔回落。
+                                await session.invalidate()
+                                self._flushed_evt.set()
+                                self._canceled_evt.set()
+                                return
+                            self._rate_limited = True
+                            if stall_task is not None:
+                                stall_task.cancel()  # 守卫接管,看门狗唔好抢着重连
+                            await session.invalidate()
+                            # 本流不再有音频:置 flush 旗标让各等待方即时收摊
+                            # (守卫收尾走 HTTP 时跳过 flush 路径;竞态窗口若外层
+                            # 已选了 flush 路径,也唔好干等 15s)。
+                            self._flushed_evt.set()
+                            self._canceled_evt.set()
+                            return
                         if status == 2205:
                             self._resend_evt.set()  # 软背压:重发协程稍后原样重发
                         elif status == 2204:
@@ -3973,7 +4122,8 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                     recv_task = asyncio.create_task(_recv_loop())
                     resend_task = asyncio.create_task(_resend_loop())
 
-                _start_loops()
+                if not circuit_open:
+                    _start_loops()  # 熔断轮:无连接,收发协程不起
 
                 async def _stall_watch() -> None:
                     """首段文本发出后 N 秒无首包 → 判连接僵死:弃连接重连+重发已发文本。
@@ -4033,6 +4183,16 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                     if stall_task is None and self._first_audio_timeout_s() > 0:
                         stall_task = asyncio.create_task(_stall_watch())
 
+                def _guard_triggered() -> bool:
+                    """F-10 守卫触发态(C-1,2026-09-23):限流已弃会话——此后 LLM
+                    仍在流式上产的 chunk 只准记账,再 send 必抛 ConnectionClosed
+                    且被外层 except 吞掉=_guard_finalize 整段旁路(退避重试+HTTP
+                    回落全跳过)→ 该轮零音频零 beep 静默。
+                    只认守卫自身旗标 `_rate_limited`:flushed/canceled 也会被
+                    既有死亡路径与 stall 看门狗自愈场景置位/残留(见 I-1),拿它们
+                    当判据会把自愈后健康连接上的 chunk 误转记账(实测回归)。"""
+                    return self._rate_limited
+
                 async def _send_text(s: str) -> None:
                     if not self._lecture_fired and is_lecture_text(s):
                         # 开场即教学 → 播一次罐头的「请再报单号」,唔好照读课程;
@@ -4040,6 +4200,11 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                         self._lecture_fired = True
                         if not state["sent_any"]:
                             canned = lecture_canned(self._tts_._speech_lang())
+                            if circuit_open or _guard_triggered():
+                                # F-10 熔断/守卫已触发:文本只记账(收尾合并重发/
+                                # HTTP 合成用),绝不碰 WS。
+                                self._sent_text_parts.append(canned)
+                                return
                             if _reconnecting.is_set():
                                 await _reconnecting.wait()
                             self._last_continue = canned
@@ -4053,6 +4218,11 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                         return
                     if is_lecture_text(s):
                         return  # 已触发过,课程延续句照丢
+                    if circuit_open or _guard_triggered():
+                        # F-10 熔断/守卫已触发(2026-09-23 C-1):后续 chunk 只记账
+                        # ——自然并入 finalize 的合并重发/HTTP 回落文本。
+                        self._sent_text_parts.append(s)
+                        return
                     # bidi:逐块原样透传,唔切句——服务端自己按标点/长度切句合成。
                     if _reconnecting.is_set():
                         await _reconnecting.wait()
@@ -4061,7 +4231,15 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                         _arm_stall_watch()  # 首条 task_continue 起看门狗计时
                     self._last_continue = s
                     self._sent_text_parts.append(s)  # 看门狗重连合并重发用
-                    await ws.send(json.dumps({"event": "task_continue", "text": s}))
+                    try:
+                        await ws.send(json.dumps({"event": "task_continue", "text": s}))
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        # 守卫竞态兜底(C-1):检查与 send 之间连接被收侧判死——
+                        # 同款记账,异常绝不抛出输入循环(外层 except 会吞掉守卫
+                        # 收尾=整轮静默);文本由 finalize 合并重发/HTTP 回落承接。
+                        return
                     state["sent_any"] = True
                     session.active_epoch = my_epoch  # 认领纪元:此后残留门禁对本流放行
 
@@ -4073,25 +4251,119 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                         continue
                     await _send_text(text)
 
+                # ---- F-10 限流守卫收尾(2026-09-23):触发限流(或熔断轮)且零音频
+                # → 退避重试 WS(1039/2205)或回落既有 HTTP 路径(1002 首击/熔断/
+                # 重试耗尽)。返回 True=HTTP 已推完整音频,外层跳过 task_flush 路径。
+                async def _guard_finalize() -> bool:
+                    nonlocal ws, reused, connect_ms
+                    if not self._sent_text_parts:
+                        # 无文本可说(罕见:未发 continue 就被限流):跳过 flush 等待。
+                        self._flushed_evt.set()
+                        self._canceled_evt.set()
+                        return True
+                    if stall_task is not None:
+                        stall_task.cancel()  # 守卫接管,看门狗唔好抢着重连撞同一线
+                    for task in (recv_task, resend_task):
+                        if task:
+                            task.cancel()
+                    self._resend_evt.clear()
+                    status = self._last_rl_status
+                    # ① WS 退避重试:仅 1039/2205(1002 RPM 首击即回落——退避 1-2s
+                    # 撞同一条限流窗口只会白烧预算);熔断轮连试都唔试。
+                    if not circuit_open and status != 1002:
+                        for delay in _MINIMAX_BIDI_RATE_LIMIT_RETRY_DELAYS:
+                            await asyncio.sleep(delay)
+                            try:
+                                # 每次重试都全新会话:上一发重试的会话服务端可能已
+                                # 积累同文,复用会造成恢复后重复播两遍。
+                                await session.invalidate()
+                                ws = await session.ensure_ready()
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as exc:
+                                print(f"MINIMAX_BIDI_RATE_LIMIT_RETRY_FAIL {exc!r}", flush=True)
+                                continue
+                            reused = session.last_reused
+                            connect_ms = session.last_connect_ms
+                            merged = "".join(self._sent_text_parts)[:10000]  # 官方单条 ≤10k
+                            self._rate_limited = False
+                            self._first_audio_evt.clear()
+                            # I-1(2026-09-23):守卫分支已置 flushed/canceled——
+                            # 唔清掉,新连接 recv 窗按「flushed 后 0.5s 排干」跑,
+                            # 首包/句隙 >0.5s 即误判收摊(重试恒失败落 HTTP,
+                            # flush 等待也立即返回截尾)。全新会话=全新收摊语义。
+                            self._flushed_evt.clear()
+                            self._canceled_evt.clear()
+                            if merged:
+                                await ws.send(json.dumps({"event": "task_continue", "text": merged}))
+                                self._last_continue = merged
+                            session.active_epoch = my_epoch
+                            _start_loops()  # 新连接新收发协程(ws 已重绑进闭包)
+                            print(
+                                f"MINIMAX_BIDI_RATE_LIMIT_RETRY delay={delay}s "
+                                f"chars={len(merged)}", flush=True,
+                            )
+                            try:
+                                await asyncio.wait_for(self._first_audio_evt.wait(), timeout=3.0)
+                                session.rate_limit_streak = 0  # 出声=恢复,连续限流断链
+                                print("MINIMAX_BIDI_RATE_LIMIT_RECOVERED", flush=True)
+                                return False  # WS 救返:外层照常 flush 收尾
+                            except asyncio.TimeoutError:
+                                pass  # 这档重试没救回:下一档退避(或 HTTP)
+                    # ② HTTP 回落:既有 classic HTTP 合成路径(同 key/voice/模型档),
+                    # 文本=本流已发全部合并(截 10k,与看门狗重发同上限)。
+                    # 弃当前 WS 会话:最后一次重试的会话可能已积累同文未 flush,
+                    # 复用会让下一轮 task_continue 叠加文本=重复播两遍。
+                    await session.invalidate()
+                    fallback_text = "".join(self._sent_text_parts)[:10000]
+                    print(
+                        f"MINIMAX_BIDI_RATE_LIMIT_FALLBACK_HTTP status={status} "
+                        f"circuit={int(circuit_open)} chars={len(fallback_text)}", flush=True,
+                    )
+                    ok = await _minimax_http_synth(
+                        self._tts_, fallback_text, output_emitter,
+                        key=key, voice=voice, sample_rate=sample_rate, stream_mode=True,
+                    )
+                    if not ok:
+                        await self._emit_beep(output_emitter)
+                    return True
+
+                http_done = False
+                if _bidi_guard_enabled() and not state["first_pushed"]:
+                    # 让在飞 recv 协程先跑一步(M-3:仅守卫启用档加窗,guard=0
+                    # 逐字节回旧):限流消息与输入排空并发到达时(纯排空无 yield
+                    # 的窄窗口),先取到守卫判定再决策。
+                    await asyncio.sleep(0.01)
+                    if self._rate_limited or circuit_open:
+                        http_done = await _guard_finalize()
+                if (
+                    state["first_pushed"]
+                    and not http_done
+                    and not self._rate_limited
+                    and session.rate_limit_streak
+                ):
+                    session.rate_limit_streak = 0  # WS 正常出声=连续限流断链(guard=0 恒 0)
+
                 # 文本结束:task_flush 强制吐出无标点尾巴,会话唔结束(连接保留)。
-                try:
-                    if state["t_first_continue"] > 0.0:
-                        if _reconnecting.is_set():
-                            await _reconnecting.wait()
-                        t_flush = time.monotonic()
-                        await ws.send(json.dumps({"event": "task_flush"}))
-                except Exception:  # noqa: BLE001
-                    pass
-                try:
-                    await asyncio.wait_for(self._flushed_evt.wait(), timeout=15)
-                except asyncio.TimeoutError:
-                    print("MINIMAX_TTS_BIDI_FLUSH_TIMEOUT", flush=True)
-                # 等 recv_loop 把尾巴音频排完(0.5s 空闲自动收,给 20s 上限兜底)
-                if recv_task:
+                if not http_done:
                     try:
-                        await asyncio.wait_for(asyncio.shield(recv_task), timeout=20)
-                    except asyncio.TimeoutError:
+                        if state["t_first_continue"] > 0.0:
+                            if _reconnecting.is_set():
+                                await _reconnecting.wait()
+                            t_flush = time.monotonic()
+                            await ws.send(json.dumps({"event": "task_flush"}))
+                    except Exception:  # noqa: BLE001
                         pass
+                    try:
+                        await asyncio.wait_for(self._flushed_evt.wait(), timeout=15)
+                    except asyncio.TimeoutError:
+                        print("MINIMAX_TTS_BIDI_FLUSH_TIMEOUT", flush=True)
+                    # 等 recv_loop 把尾巴音频排完(0.5s 空闲自动收,给 20s 上限兜底)
+                    if recv_task:
+                        try:
+                            await asyncio.wait_for(asyncio.shield(recv_task), timeout=20)
+                        except asyncio.TimeoutError:
+                            pass
                 if t_flush > 0.0 and state["t_last_audio"] > 0.0:
                     print(
                         f"MINIMAX_TTS_BIDI_PERF flush_to_last_audio_ms="
@@ -4168,6 +4440,72 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                 await self._emit_beep(output_emitter)
             except Exception:  # pragma: no cover
                 pass
+
+
+async def _minimax_http_synth(
+    tts_: "MiniMaxTTS",
+    text: str,
+    output_emitter,
+    *,
+    key: str,
+    voice: str,
+    sample_rate: int,
+    stream_mode: bool = False,
+) -> bool:
+    """HTTP 整段合成核心(F-10,2026-09-23 自 classic `_run_http` 抽出)。
+
+    classic ChunkedStream(WS 失败兜底)与 bidi 限流回落共用同一条路径;返回
+    True=已推完整音频。stream_mode=False=classic emitter 口径(initialize
+    stream=False,无 segment);True=bidi SynthesizeStream 口径(initialize
+    stream=True + start/end_segment)。重试/日志与原 `_run_http` 逐字节同。
+    """
+    endpoint = tts_._endpoint()
+    last_exc: Exception | None = None
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                payload = {
+                    "model": tts_._model(),
+                    "text": _inject_pauses(text),
+                    "voice_setting": tts_._ws_voice_setting(voice),
+                    "audio_setting": {"sample_rate": sample_rate, "format": "pcm", "channel": 1},
+                }
+                # language_boost 与 WS 路径同源(env 注入,空则完全不带该键)。
+                boost = tts_._language_boost()
+                if boost:
+                    payload["language_boost"] = boost
+                resp = await client.post(
+                    endpoint,
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                    json=payload,
+                )
+                resp.raise_for_status()
+                body = resp.json()
+                data = body.get("data") or {}
+                audio_hex = data.get("audio") or ""
+                if not audio_hex:
+                    raise RuntimeError(f"minimax empty audio: {body.get('base_resp')}")
+                pcm = bytes.fromhex(audio_hex)
+                output_emitter.initialize(
+                    request_id=utils.shortuuid(),
+                    sample_rate=sample_rate,
+                    num_channels=tts_.num_channels,
+                    mime_type="audio/pcm",
+                    stream=stream_mode,
+                )
+                if stream_mode:
+                    output_emitter.start_segment(segment_id=utils.shortuuid())
+                output_emitter.push(pcm)
+                print("MINIMAX_TTS_BYTES", len(pcm), flush=True)
+                if stream_mode:
+                    output_emitter.end_segment()
+                return True
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            print("MINIMAX_TTS_RETRY", attempt + 1, repr(exc), flush=True)
+            await asyncio.sleep(0.5 * (attempt + 1))
+    print("MINIMAX_TTS_ERROR", repr(last_exc), flush=True)
+    return False
 
 
 class _MiniMaxTTSStream(tts.ChunkedStream):
@@ -4358,50 +4696,14 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
             _minimax_pool_schedule(url, key)
 
     async def _run_http(self, output_emitter, key: str, voice: str, sample_rate: int) -> None:
-        """HTTP 整段合成(WS 不可用时的降级)。"""
-        endpoint = self._tts_._endpoint()
-        last_exc: Exception | None = None
-        for attempt in range(2):
-            try:
-                async with httpx.AsyncClient(timeout=60) as client:
-                    payload = {
-                        "model": self._tts_._model(),
-                        "text": _inject_pauses(self._text),
-                        "voice_setting": self._tts_._ws_voice_setting(voice),
-                        "audio_setting": {"sample_rate": sample_rate, "format": "pcm", "channel": 1},
-                    }
-                    # language_boost 与 WS 路径同源(env 注入,空则完全不带该键)。
-                    boost = self._tts_._language_boost()
-                    if boost:
-                        payload["language_boost"] = boost
-                    resp = await client.post(
-                        endpoint,
-                        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                        json=payload,
-                    )
-                    resp.raise_for_status()
-                    body = resp.json()
-                    data = body.get("data") or {}
-                    audio_hex = data.get("audio") or ""
-                    if not audio_hex:
-                        raise RuntimeError(f"minimax empty audio: {body.get('base_resp')}")
-                    pcm = bytes.fromhex(audio_hex)
-                    output_emitter.initialize(
-                        request_id=utils.shortuuid(),
-                        sample_rate=sample_rate,
-                        num_channels=self._tts_.num_channels,
-                        mime_type="audio/pcm",
-                        stream=False,
-                    )
-                    output_emitter.push(pcm)
-                    print("MINIMAX_TTS_BYTES", len(pcm), flush=True)
-                    return
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                print("MINIMAX_TTS_RETRY", attempt + 1, repr(exc), flush=True)
-                await asyncio.sleep(0.5 * (attempt + 1))
-        print("MINIMAX_TTS_ERROR", repr(last_exc), flush=True)
-        await self._emit_beep(output_emitter)
+        """HTTP 整段合成(WS 不可用时的降级)。核心抽至 `_minimax_http_synth`
+        (F-10:bidi 限流回落共用同一条路径),失败兜 beep 语义不变。"""
+        ok = await _minimax_http_synth(
+            self._tts_, self._text, output_emitter,
+            key=key, voice=voice, sample_rate=sample_rate,
+        )
+        if not ok:
+            await self._emit_beep(output_emitter)
 
     async def _emit_beep(self, output_emitter):
         import math
@@ -4417,6 +4719,67 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
             pcm += v.to_bytes(2, "little", signed=True)
         output_emitter.push(bytes(pcm))
         output_emitter.flush()
+
+
+_QWEN3_TTS_PRESETS = frozenset(
+    {"aiden", "dylan", "eric", "ono_anna", "ryan", "serena", "sohee", "uncle_fu", "vivian"}
+)
+
+# 语言回落档（2026-09-25 实测九个预置 speaker 均可发 zh/cantonese/en 三语，
+# 缺省只定音色；env QWEN3_TTS_VOICE_<LANG> 覆写，运营可换耳感更好的预置）。
+_QWEN3_TTS_LANG_FALLBACK: dict[str, tuple[str, str]] = {
+    "zh": ("QWEN3_TTS_VOICE_ZH", "vivian"),
+    "cantonese": ("QWEN3_TTS_VOICE_CANTONESE", "vivian"),
+    "en": ("QWEN3_TTS_VOICE_EN", "serena"),
+}
+
+_QWEN3_SPEAKER_CACHE: dict[str, set[str]] = {}
+_QWEN3_FALLBACK_SEEN: set[str] = set()
+
+
+def _qwen3_speaker_union(base_url: str) -> set[str]:
+    """sidecar 预置 ∪ 已注册克隆音色 id（懒取进程级缓存，2s 超时失败退纯预置）。
+    克隆 id 是任意串（/v1/voices/register 自选），词法上与 MiniMax 音色 ID
+    无法区分——必须查表判定「本地认识这个名字」。"""
+    key = base_url.rstrip("/")
+    cached = _QWEN3_SPEAKER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    union = set(_QWEN3_TTS_PRESETS)
+    try:
+        with httpx.Client(timeout=2.0) as client:
+            for path in ("/v1/speakers", "/v1/voices"):
+                resp = client.get(key + path)
+                resp.raise_for_status()
+                data = resp.json()
+                if isinstance(data, list):
+                    for item in data:
+                        vid = item if isinstance(item, str) else str(item.get("voice_id") or item.get("id") or "")
+                        if vid:
+                            union.add(vid)
+    except Exception:
+        pass  # sidecar 不答=按纯预置判，宁回落勿哑轮
+    _QWEN3_SPEAKER_CACHE[key] = union
+    return union
+
+
+def _resolve_local_voice(picked: str, lang: str, base_url: str) -> str:
+    """本地档音色解析（2026-09-25 本地 TTS 立法）。
+
+    persona/设置三键里常驻的是 MiniMax 音色 ID（Cantonese_GentleLady 这类）——
+    直传 sidecar 会 _validate_speakers ValueError → 整轮 0 字节哑轮（实弹踩到，
+    5/7 轮哑）。解析链：①预置名/sidecar 注册 id → 原样；②空或未知（MiniMax 类
+    ID）→ 语言回落档（env 覆写 > 预置缺省）。回落只对每个陌生值打一次日志。"""
+    raw = (picked or "").strip()
+    if raw and raw in _qwen3_speaker_union(base_url):
+        return raw
+    env_key, default = _QWEN3_TTS_LANG_FALLBACK.get(lang, _QWEN3_TTS_LANG_FALLBACK["zh"])
+    resolved = os.environ.get(env_key, "").strip() or default
+    tag = f"{raw or '<empty>'} -> {resolved} (lang={lang})"
+    if tag not in _QWEN3_FALLBACK_SEEN:
+        _QWEN3_FALLBACK_SEEN.add(tag)
+        print(f"[qwen3-tts] voice fallback: {tag}", flush=True)
+    return resolved
 
 
 class Qwen3TTSTTS(tts.TTS):
@@ -4465,15 +4828,20 @@ class Qwen3TTSTTS(tts.TTS):
 
     def _resolve_voice(self) -> str:
         if isinstance(self._voice, dict):
-            return str(self._voice.get(self._language_state.lang) or self._voice.get("zh") or "")
-        raw = str(self._voice or "")
-        if raw.startswith("{"):
-            try:
-                mapping = json.loads(raw)
-                return str(mapping.get(self._language_state.lang) or mapping.get("zh") or "")
-            except Exception:
-                return raw
-        return raw
+            picked = str(self._voice.get(self._language_state.lang) or self._voice.get("zh") or "")
+        else:
+            raw = str(self._voice or "")
+            if raw.startswith("{"):
+                try:
+                    mapping = json.loads(raw)
+                    picked = str(mapping.get(self._language_state.lang) or mapping.get("zh") or "")
+                except Exception:
+                    picked = raw
+            else:
+                picked = raw
+        # 本地档音色闸（2026-09-25）：MiniMax 类 ID 直传 sidecar=哑轮，
+        # 未知一律回落语言档，预置/已注册克隆原样放行。
+        return _resolve_local_voice(picked, self._language_state.lang, self._base_url)
 
 
 def _tts_segment_has_word_char(s: str) -> bool:
@@ -4698,8 +5066,7 @@ class _Qwen3SynthesizeStream(tts.SynthesizeStream):
         broken = False
         pushed_any = False
         try:
-            _SENT_END = "。！？!?"
-            _SOFT_BREAK = "，、；;：:"
+            _first_lane_on, _first_lane_chars = _tts_first_clause_config()
             try:
                 overlap_on = os.environ.get("QWEN3_TTS_OVERLAP", "1") == "1"
             except Exception:  # pragma: no cover
@@ -4713,6 +5080,7 @@ class _Qwen3SynthesizeStream(tts.SynthesizeStream):
             except Exception:  # pragma: no cover
                 _overlap_ms = 300
             _last_send = time.monotonic()
+            sent_any = False
 
             def _flushable(s: str) -> bool:
                 """overlap 增量可否送出：不能把连续的号码/数字串拦腰截断。"""
@@ -4734,7 +5102,7 @@ class _Qwen3SynthesizeStream(tts.SynthesizeStream):
                 sent_buf += text
                 while True:
                     idx = min(
-                        (sent_buf.find(ch) for ch in _SENT_END if sent_buf.find(ch) != -1),
+                        (sent_buf.find(ch) for ch in _TTS_SENT_END if sent_buf.find(ch) != -1),
                         default=-1,
                     )
                     if idx == -1:
@@ -4751,28 +5119,29 @@ class _Qwen3SynthesizeStream(tts.SynthesizeStream):
                         end_segment=False,
                     )
                     _last_send = time.monotonic()
+                    sent_any = True
                     if not ok:
                         broken = True
                         break
                 if broken:
                     break
                 # overlap:句号之间的增量提前送(与 MiniMax 同款节奏)。
-                if (
-                    overlap_on
-                    and not broken
-                    and sent_buf.strip()
-                    and len(sent_buf.strip()) >= _overlap_chars
-                ):
-                    soft_idx = -1
-                    for ch in _SOFT_BREAK:
-                        pos = sent_buf.rfind(ch)
-                        if pos != -1:
-                            soft_idx = max(soft_idx, pos)
-                    now = time.monotonic()
-                    time_up = (now - _last_send) * 1000 >= _overlap_ms
-                    if (soft_idx != -1 and soft_idx >= len(sent_buf.strip()) // 2) or time_up:
+                # 首送走 W8 快车道(≥6 字即可、软停顿过半门豁免)。
+                if overlap_on and not broken and sent_buf.strip():
+                    send_now, via_first = _tts_overlap_send_now(
+                        sent_buf,
+                        sent_any=sent_any,
+                        overlap_on=overlap_on,
+                        first_lane_on=_first_lane_on,
+                        first_lane_chars=_first_lane_chars,
+                        overlap_chars=_overlap_chars,
+                        time_up=(time.monotonic() - _last_send) * 1000 >= _overlap_ms,
+                    )
+                    if send_now:
                         frag = sent_buf.strip()
                         if _flushable(frag) and _tts_segment_has_word_char(frag):
+                            if via_first:
+                                print(f"QWEN3_TTS_FIRST_CLAUSE chars={len(frag)}", flush=True)
                             ok = await _qwen3_tts_post_frames(
                                 self._tts_, frag, output_emitter, state,
                                 end_segment=False,
@@ -4781,6 +5150,7 @@ class _Qwen3SynthesizeStream(tts.SynthesizeStream):
                             if not ok:
                                 broken = True
                                 break
+                            sent_any = True
                             sent_buf = ""
             if not broken:
                 # 收尾残句:全场文本结束,把没凑够一句的尾巴合成掉。
