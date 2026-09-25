@@ -1618,6 +1618,9 @@ _FORWARD_ENV = (
     "TURN_DETECTION",
     "BOK_TURN_DETECTOR_THRESHOLD",
     "BOK_TURN_DETECTOR_THRESHOLDS",
+    # smart-turn 语义闸（V1，2026-09-26：VAD 停嘴处 ONNX 判「说完没」，p<0.5 复用
+    # join-hold 等续段；providers/smart_turn.py。默认 "0"=关——未验收特性不默认开）
+    "BOK_SMART_TURN",
     "ENDPOINT_MIN_DELAY",
     "ENDPOINT_MAX_DELAY",
     "INTERRUPT_MIN_DURATION",

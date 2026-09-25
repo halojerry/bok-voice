@@ -178,7 +178,7 @@ BANK: list[dict] = [
         "max_chars": 80,
     },
     {
-        "id": "obj-yue-fraud",
+        "id": "obj-canto-fraud",
         "family": "objection",
         "lang": "cantonese",
         "flow_step": 1,
@@ -245,7 +245,7 @@ BANK: list[dict] = [
         "max_chars": 80,
     },
     {
-        "id": "comp-yue-angry",
+        "id": "comp-canto-angry",
         "family": "compensation",
         "lang": "cantonese",
         "flow_step": 4,
@@ -288,7 +288,7 @@ BANK: list[dict] = [
         "max_chars": None,
     },
     {
-        "id": "jump-yue-direct",
+        "id": "jump-canto-direct",
         "family": "jump",
         "lang": "cantonese",
         "flow_step": 0,

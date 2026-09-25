@@ -64,6 +64,12 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     # 决策记录非运行时语言字段——按行豁免，新文件仍全禁。
     "docs/superpowers/plans/2026-09-17-campaign-scheduling-dashboard.md": re.compile(r"yue"),
     "scripts/probe_smart_turn.py": re.compile(r"yue"),
+    # 2026-09-26 复核轮入库的文档：S2S_ROADMAP 增补引 MiniMax ASR BCP-47 `yue`
+    # 外部枚举与 FLEURS 多语数据集位、2026-09-24 计划引 CantoNLU zh→yue 迁移
+    # 结论/LiveKit detector 语言表缺席/sherpa zh-yue-en 三语——均为「别人的接口/
+    # 数据集」类决策记录引述，非我方语言字段（政策同 zh-yue.wikipedia.org）。
+    "docs/S2S_ROADMAP.md": re.compile(r"yue"),
+    "docs/superpowers/plans/2026-09-24-a-line-flow-latency-intent.md": re.compile(r"yue"),
     # P0 真库烟测做 yue→cantonese 数据迁移演练(铺旧值行验证 build_engine 改写)，
     # 同 deps.py 类：旧拼写是演练夹具非运行时语言字段，按行豁免。
     "scripts/smoke_postgres.py": re.compile(r"yue"),

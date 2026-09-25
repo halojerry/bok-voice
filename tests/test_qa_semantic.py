@@ -141,7 +141,7 @@ def test_match_miss_below_threshold_returns_top():
 def test_match_survivors_filter_lang_and_step():
     entries = [
         _entry("zh1", "怎么申请退款", lang="zh"),
-        _entry("yue1", "点样申请退款", lang="cantonese"),
+        _entry("canto1", "点样申请退款", lang="cantonese"),
     ]
     vecs = {
         "怎么申请退款": _unit([1.0, 0.0, 0.0]),
@@ -153,7 +153,7 @@ def test_match_survivors_filter_lang_and_step():
     entry, _s, _r = asyncio.run(idx.match("我想把钱退回来怎么弄", lang="zh"))
     assert entry["id"] == "zh1"  # cantonese 条目被滤
     entry, _s, _r = asyncio.run(idx.match("我想把钱退回来怎么弄", lang="cantonese"))
-    assert entry["id"] == "yue1"
+    assert entry["id"] == "canto1"
 
 
 def test_match_tie_breaks_by_insertion_order():
@@ -197,10 +197,10 @@ def test_lexical_index_team_head_folds_semantic_winner():
     folded = qidx.team_head(variant, lang="zh", step_index=None)
     assert folded is not None and folded["id"] == "head1"
     # 整簇(粤语 head+粤语变体)在本语 zh 轮全滤光 → None(裸胜者由调用方兜)。
-    head_yue = _entry("head2", "点样退款", lang="cantonese")
-    var_yue = _entry("var2", "点样攞返啲钱", lang="cantonese", cluster="head2")
-    qidx2 = QaIndex([head_yue, var_yue])
-    assert qidx2.team_head(var_yue, lang="zh", step_index=None) is None  # 整簇滤光
+    head_canto = _entry("head2", "点样退款", lang="cantonese")
+    var_canto = _entry("var2", "点样攞返啲钱", lang="cantonese", cluster="head2")
+    qidx2 = QaIndex([head_canto, var_canto])
+    assert qidx2.team_head(var_canto, lang="zh", step_index=None) is None  # 整簇滤光
     assert qidx.team_head(head, lang="zh", step_index=None) is None  # head 无簇
 
 

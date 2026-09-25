@@ -28,6 +28,11 @@ from livekit.plugins.openai import LLM as _OpenAICompatBase
 # 模型路由共享契约(2026-09-25 阶段 0):只消费,解析/校验逻辑全在 packages/core。
 from bok_voice_core.model_routes import LaneRoute, PROVIDER_OPENAI
 
+# smart-turn 语义闸（V1，2026-09-26）：VAD 停嘴处判「说完没」的 ONNX 小模型
+# （pipecat smart-turn-v3.2-cpu，~12ms/次）。BOK_SMART_TURN=1 才启用（默认关，
+# 未验收特性不默认开），fail-open 语义见 providers/smart_turn.py。
+from . import smart_turn as _smart_turn
+
 from ..voice_style import NATURALNESS_BLOCK, strip_voice_style
 
 # 后台任务强引用池(2026-09-17 全量 debug P2-A):事件循环对 task 只持弱引用,
@@ -5885,6 +5890,16 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         # 词表回声事件账本(call-46b94ebd/1043de7c):确认过一次剥尾/纯回声后,
         # 后续词表孤词残片按回声衰落丢弃——首现孤词保留(真人可能真讲「微信」)。
         self._vocab_echo_seen: bool = False
+        # smart-turn 滚动尾部 PCM（V1，BOK_SMART_TURN=1 才消费）：本会话最近
+        # ≤8s 的 16kHz int16，喂语义闸判「说完没」。与会话同生命周期——_reset
+        # 清零；join-hold 续段**不清**（跨段积累正係判定所需上下文）。
+        self._smart_pcm = bytearray()
+
+    def _append_turn_pcm(self, data: bytes) -> None:
+        """滚动尾部缓冲：追加并裁到 8s 上限（留尾）。"""
+        self._smart_pcm.extend(data)
+        if len(self._smart_pcm) > _smart_turn.PCM_BYTES_8S:
+            del self._smart_pcm[: len(self._smart_pcm) - _smart_turn.PCM_BYTES_8S]
 
     def _turn_partial_for_fallback(self) -> str:
         """本段 partial 末稿(供 agent 侧 E2 fallback_text),**未提交坐标系**。
@@ -5980,9 +5995,9 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                         # DONE 全程在喂)不并入,防音频重复。
                         if event.frames:
                             try:
-                                self._pending.extend(
-                                    bytes(utils.merge_frames(event.frames).data)
-                                )
+                                _preroll_pcm = bytes(utils.merge_frames(event.frames).data)
+                                self._pending.extend(_preroll_pcm)
+                                self._append_turn_pcm(_preroll_pcm)
                             except Exception:  # noqa: BLE001 - pre-roll 合帧失败不致命
                                 pass
                 elif event.type == vad.VADEventType.INFERENCE_DONE:
@@ -5990,7 +6005,9 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                         continue
                     # 1.7 utils.merge_frames=rtc.combine_audio_frames:返回【单个】
                     # rtc.AudioFrame(不可迭代,官方 StreamAdapter 同款用法)。
-                    self._pending.extend(bytes(utils.merge_frames(event.frames).data))
+                    _window_pcm = bytes(utils.merge_frames(event.frames).data)
+                    self._pending.extend(_window_pcm)
+                    self._append_turn_pcm(_window_pcm)
                     await self._maybe_partial()
                 elif event.type == vad.VADEventType.END_OF_SPEECH:
                     if not started:
@@ -6007,6 +6024,36 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                         self._reset()
                         print("QWEN3_ASR_CLOSING_SAY_SUPPRESS src=segment_eos", flush=True)
                         continue
+                    # ---- smart-turn 语义闸（V1，BOK_SMART_TURN=1；默认关）--------
+                    # VAD 0.35s 静音只证明「停了 0.35s」——句间喘气与真停嘴同形，
+                    # 停嘴即提交会把没讲完的半句拆成碎轮。语义闸补第二判据：本会话
+                    # 最近 ≤8s 尾部 PCM 喂 smart-turn-v3，p<0.5=「话没说完」→ 复用
+                    # 既有 join-hold（不新造机制）等下一段并入，hold 超时真停嘴照旧
+                    # finish 兜底；p≥0.5 或模型不可判 → 旧路径逐字节不变。fail-open
+                    # 铁律：模型缺位/推理异常 smart_turn_prob 返回 None=pass（skip/
+                    # failopen 的原因打点在 smart_turn 模块内）。
+                    if _smart_turn.smart_turn_enabled():
+                        _st_t0 = time.monotonic()
+                        _st_prob = await _smart_turn.smart_turn_prob(bytes(self._smart_pcm))
+                        _st_verdict = _smart_turn.smart_turn_decide(_st_prob)
+                        _st_ms = int((time.monotonic() - _st_t0) * 1000)
+                        if _st_verdict == "hold":
+                            print(
+                                f"SMART_TURN verdict=held p={_st_prob:.3f} ms={_st_ms} "
+                                f"chars={len(self._last_partial)}",
+                                flush=True,
+                            )
+                            self._join_hold_active = True
+                            self._finishing = False  # hold 期间 partial 继续滚
+                            self._join_task = asyncio.create_task(self._hold_flush())
+                            continue
+                        if _st_verdict == "commit":
+                            print(
+                                f"SMART_TURN verdict=committed p={_st_prob:.3f} ms={_st_ms} "
+                                f"chars={len(self._last_partial)}",
+                                flush=True,
+                            )
+                        # pass（None）→ 零干预照旧；闸关时整块跳过（零成本）。
                     # ---- 跨段拼接 hold(治报号句被微停顿切碎,2026-09-06)----
                     # 数字/字母句被句级门有意排除(防半截号码提前提交)→ 永远走逐段
                     # 整句路径,VAD 微停顿即拆轮。续接可能句喺呢度唔发 END_OF_SPEECH、
@@ -6665,6 +6712,7 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
     def _reset(self) -> None:
         self._session_id = None
         self._pending.clear()
+        self._smart_pcm.clear()  # smart-turn 尾部随段清零（hold 续段不走 reset）
         self._last_partial = ""
         self._prev_partial = ""
         self._stable = ""
