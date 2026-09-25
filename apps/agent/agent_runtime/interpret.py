@@ -35,6 +35,8 @@ from pathlib import Path
 # 脚本族(CJK vs 拉丁)判定——见 bok_voice_core.mt_lang_check 模块 docstring 的
 # 能/不能边界(治 en↔zh/cantonese 的脚本级错语言;测不出 zh↔cantonese)。
 from bok_voice_core.mt_lang_check import language_match_score, looks_like_language
+# 模型路由共享契约(2026-09-25 阶段 0):mt/a_reply 车道本地↔云端解析单点,只消费。
+from bok_voice_core.model_routes import PROVIDER_OPENAI, resolve_route
 
 
 def _norm_lang(raw: str, default: str = "zh") -> str:
@@ -366,7 +368,7 @@ def _mt_sampling(env_key: str, mt_default: float) -> float:
     return v if math.isfinite(v) else mt_default
 
 
-def _build_llm_provider(llm_cfg: dict, target_lang: str, glossary: str = ""):
+def _build_llm_provider(llm_cfg: dict, target_lang: str, glossary: str = "", routing_raw: str = ""):
     """组装 B 线翻译 LLM:MT 小模型(:1236)优先,回退 DeepSeek 云端 / 主 LLM(:1235)。
 
     MT 分支按官方 Hy-MT2 推荐采样收窄,MlxLlmLLM 构造时显式传参(用户显式 env
@@ -376,11 +378,51 @@ def _build_llm_provider(llm_cfg: dict, target_lang: str, glossary: str = ""):
     性由 instructions 的 glossary 行兜)。MT_LLM_MODEL 须经 _mt_model_valid(本地
     绝对路径且在盘)才进 MT 分支——非法值原样透传会让 mlx_lm server 挂死,跳过
     MT 走回退链 + 日志留值。
-    """
-    from .providers.livekit_plugins import DeepSeekLLM, MlxLlmLLM, StatelessMTLLM
 
-    mt_base = os.environ.get("MT_LLM_BASE_URL", "").strip()
-    mt_model = os.environ.get("MT_LLM_MODEL", "").strip()
+    `routing_raw`＝当通 CP 设置顶层 `model_routing_json` 原始串(2026-09-25 阶段 0):
+    mt 车道 openai 档整体改走云端(本地路径门禁不适用——云端模型 id 非 mlx 路径);
+    local 档显式改端点时换 base_url/model 后仍走既有门禁与回退链(挂死防线不绕);
+    缺省 ""(未配置/kill-switch)＝env 档,既有读法逐字节(零漂移保证)。参数随当通
+    会话传入,worker 并发多通不串线(禁模块级可变全局)。
+    """
+    from .providers.livekit_plugins import (
+        DeepSeekLLM,
+        MlxLlmLLM,
+        StatelessMTLLM,
+        route_llm_kwargs,
+    )
+
+    mt_route = resolve_route("mt", os.environ, routing_raw)
+    if mt_route.provider == PROVIDER_OPENAI:
+        # 云端 MT(路由表 openai 档,2026-09-25):端点/模型/密钥全由路由表下发,
+        # 思考旗随请求体下发(Qwen3.5 家族云端思考陷阱,LANE-AB 实证)。采样档照
+        # 本地 MT 分支同源(Hy-MT2 推荐,经构造参数显式下发,唔写回进程 env)。
+        print(f"[interp] llm=mt-cloud base={mt_route.base_url}", flush=True)
+        context_turns = int(os.environ.get("BOK_INTERP_MT_CONTEXT", "0") or 0)
+        return StatelessMTLLM(
+            MlxLlmLLM(
+                base_url=mt_route.base_url,
+                model=mt_route.model,
+                api_key=mt_route.api_key or "mlx",
+                enable_thinking=mt_route.enable_thinking,
+                temperature=_mt_sampling("LLM_TEMPERATURE", 0.7),
+                top_p=_mt_sampling("LLM_TOP_P", 0.6),
+                top_k=int(_mt_sampling("LLM_TOP_K", 20)),
+                repetition_penalty=_mt_sampling("LLM_REPETITION_PENALTY", 1.05),
+            ),
+            target_lang,
+            glossary=glossary,
+            context_turns=context_turns,
+        )
+
+    if mt_route.source == "routing":
+        # local 档显式改端点(如 LM Studio :1234):路由表只换「去哪/用哪个模型」,
+        # _mt_model_valid 挂死防线与回退链照走(model 非空才覆盖)。
+        mt_base = mt_route.base_url
+        mt_model = mt_route.model or os.environ.get("MT_LLM_MODEL", "").strip()
+    else:
+        mt_base = os.environ.get("MT_LLM_BASE_URL", "").strip()
+        mt_model = os.environ.get("MT_LLM_MODEL", "").strip()
     if mt_base and _mt_model_valid(mt_model):
         # Hy-MT2 官方推荐采样:temperature 0.7 / top_p 0.6 / top_k 20 / 重复惩罚
         # 1.05——翻译要贴原文,采样收窄防小模型自由发挥/复读。经构造参数显式下发
@@ -420,9 +462,16 @@ def _build_llm_provider(llm_cfg: dict, target_lang: str, glossary: str = ""):
             model=llm_cfg.get("model") or os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
             base_url=llm_cfg.get("base_url") or os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
         )
+    # B 线回复/兜底车道路由(a_reply,2026-09-25):env 档=下方既有读法原样传参
+    # (零漂移);openai 档=路由表下发端点/模型/密钥+思考旗(local routing 档只换
+    # 端点/模型)。设置卡 deepseek 带密钥显式云档不属本车道覆盖面,原样保留。
     return MlxLlmLLM(
-        base_url=llm_cfg.get("base_url") or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
-        model=llm_cfg.get("model") or os.environ.get("MLX_LLM_MODEL", ""),
+        **route_llm_kwargs(
+            resolve_route("a_reply", os.environ, routing_raw),
+            env_base_url=llm_cfg.get("base_url")
+            or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
+            cfg_model=llm_cfg.get("model") or os.environ.get("MLX_LLM_MODEL", ""),
+        )
     )
 
 
@@ -639,24 +688,52 @@ class _PlaybackBacklog:
     永不弃——弃音保字,已生成文本的 chat item 照常落库/进字幕。生成中被取消的
     句=整句摘掉(译员压力下的跳句形态)。
 
+    门槛语义 v2(2026-09-23 修复波#2,task-9 §14 实证):①**队头不计入门槛**——
+    队头=正在播报的沉没成本,旧算法把它全额计入,单句译文即可「超门」但 depth<3
+    结构性弃不了,门槛日志恒饱和假警(est_ms=1600 drop=0);改计「等待积压」后
+    depth<3 不弃仍正确(唯一候选=最新一条,追最新保护),假警消失。②**源句队列
+    计入门槛、成为摘译候选**——MT 未消化的待译源句也是听感积压;等待积压超门
+    且 say 队无弃句候选时,按次摘译(arm)最旧待译源句一条(原文行已落库=摘译
+    保文,与 _src_q 溢出摘译同语义),由 MT worker 取句时消费跳过。每次评估至多
+    arm 一条(下轮再评估),压力阀步进不连跳。真实战场=源语连珠炮时先弃旧译文
+    再摘旧源句,最新内容必达。
+
     `BOK_INTERP_BACKLOG=0` 总闸关;`BOK_INTERP_MAX_BACKLOG_S` 调门槛(默认 6s
     ≈通路 lag 2.5s+一句余量)。只在 speech_created 事件判定——队列只在新建句时
     增长;interrupt 必须 force=True(会话打断默认关,非 force 会 RuntimeError)。
     """
 
-    def __init__(self, target_lang: str):
+    def __init__(self, target_lang: str, source_backlog_s=None):
         self._target_lang = target_lang
         try:
             self._max_s = float(os.environ.get("BOK_INTERP_MAX_BACKLOG_S", "6") or 6)
         except ValueError:
             self._max_s = 6.0
         self._pending: list[tuple[object, float]] = []  # [(handle, 估时秒)]
+        self._source_backlog_s = source_backlog_s  # () -> float:待译源句估时总量
+        self.source_drops_pending = 0  # 摘译指令(MT worker 取句时消费)
         self.dropped = 0
         self.dropped_est_s = 0.0
 
     @property
     def enabled(self) -> bool:
         return os.environ.get("BOK_INTERP_BACKLOG", "1") == "1" and self._max_s > 0
+
+    def set_source_backlog(self, est_s: float) -> None:
+        """测试注入口:直接设定源队列估时(生产走 source_backlog_s 回调)。"""
+        self._source_backlog_s = lambda: est_s  # type: ignore[assignment]
+
+    def _src_backlog_s(self) -> float:
+        try:
+            return max(0.0, float(self._source_backlog_s() or 0)) if self._source_backlog_s else 0.0
+        except Exception:
+            return 0.0
+
+    def take_source_drops(self) -> int:
+        """MT worker 取句时消费摘译指令(一次性取走当前计数)。"""
+        n = self.source_drops_pending
+        self.source_drops_pending = 0
+        return n
 
     def _est_of(self, handle) -> float:
         texts = []
@@ -667,7 +744,10 @@ class _PlaybackBacklog:
         return _estimate_speech_seconds(" ".join(texts), self._target_lang)
 
     def on_speech_created(self, handle) -> tuple[int, float, int]:
-        """登记新译文句并按门槛弃旧。返回 (队列深度, 估时总量秒, 本轮弃句数)。"""
+        """登记新译文句并按门槛弃旧。返回 (队列深度, 等待积压估时秒, 本轮弃句数)。
+
+        est=等待积压(不含在播队头)+待译源队列——门槛量的係「还要多久才轮到最新
+        内容」,不是已播了多少。"""
         if not self.enabled:
             return (0, 0.0, 0)
         # 1) 清账:已播完/已取消的句出队(text-only 方向句句秒完,队列天然不积)。
@@ -677,8 +757,9 @@ class _PlaybackBacklog:
         est_new = self._est_of(handle) or 0.8  # 新句此刻多半还没有 chat item
         refreshed.append((handle, est_new))
         self._pending = refreshed
-        # 3) 门槛:队头=当前播报永不弃、最新一条永不弃 → 只从 index 1 起弃。
-        total = sum(e for _, e in self._pending)
+        # 3) 门槛(等待积压口径,index 0=在播队头不计):队头永不弃、最新一条永不弃
+        #    → 只从 index 1 起弃;仍超门且 say 队无候选 → arm 一条源句摘译。
+        total = sum(e for _, e in self._pending[1:])
         dropped_now = 0
         while total > self._max_s and len(self._pending) > 2:
             h, e = self._pending.pop(1)
@@ -690,7 +771,26 @@ class _PlaybackBacklog:
             dropped_now += 1
             self.dropped += 1
             self.dropped_est_s += e
+        if total + self._src_backlog_s() > self._max_s and self._src_backlog_s() > 0:
+            self.source_drops_pending += 1  # 摘译压力阀:每次评估至多一条
         return len(self._pending), total, dropped_now
+
+
+def _mt_consume_skip(backlog: "_PlaybackBacklog", text: str) -> bool:
+    """MT worker 取句后先消费摘译指令（True=跳过本句 MT+播报）。
+
+    模块级便于单测钉消费契约（fix round 1 评审 Minor-6）：积压门 arm 的摘译在
+    取句时刻生效——被摘句的原文行已即时落库（`_on_user_input`），跳过的只是
+    译文生成与出声（摘译保文，与 _src_q 溢出摘译同语义）。消费一次性。"""
+    skipped = backlog.take_source_drops()
+    if skipped:
+        print(
+            f"[interp] INTERP_BACKLOG source-skip x{skipped} "
+            f"({len(text)} chars, backlog gate 摘译保文)",
+            flush=True,
+        )
+        return True
+    return False
 
 
 async def entrypoint(ctx) -> None:
@@ -825,7 +925,15 @@ async def entrypoint(ctx) -> None:
     voice_tags = os.environ.get("BOK_INTERP_VOICE_TAGS", "1") == "1" and _voice_tags_supported(tts_model)
     if tts_model:
         print(f"[interp] voice_tags {'on' if voice_tags else 'off'} (tts={tts_model})", flush=True)
-    llm_provider = _build_llm_provider(llm_cfg, target_lang, glossary=_glossary)
+    # 模型路由原始串（2026-09-25 阶段 0）：CP 设置顶层键与引擎卡同一 fetch（改道
+    # 下一通生效，零重启）；缺键/空＝未配置，resolve_route 落回 env 缺省链。随当通
+    # 会话传参，worker 并发多通不串线（禁模块级可变全局）。
+    llm_provider = _build_llm_provider(
+        llm_cfg,
+        target_lang,
+        glossary=_glossary,
+        routing_raw=str(settings.get("model_routing_json") or ""),
+    )
 
     # 轮次判定走 _turn_handling_opts(纯函数):manual 模式 + STT 句级 FINAL 自驱
     # MT→say 队列(P2 定案,函数注释有框架打断/丢弃两条路的实证);kill-switch
@@ -905,6 +1013,10 @@ async def entrypoint(ctx) -> None:
         while True:
             text = await _src_q.get()
             try:
+                # 背压摘译(2026-09-23 修复波#2):积压门 arm 的摘译指令在取句时
+                # 消费——跳过最旧待译源句的 MT+播报(原文行已落库=摘译保文)。
+                if _mt_consume_skip(backlog, text):
+                    continue
                 t0 = time.perf_counter()
                 ctx = _build_mt_context(_llm_instructions, list(_mt_pairs), text)
                 translated = await _mt_once(llm_provider, ctx, target_lang=target_lang)
@@ -942,20 +1054,28 @@ async def entrypoint(ctx) -> None:
 
     # 译文播放背压(P2):manual 之下译文堆在 say 队列——超门槛从最旧弃起
     # (已生成文本照常进字幕/落库,只弃音)。text-only 方向句句秒完播,队列
-    # 天然不积,同一钩子零害。
-    backlog = _PlaybackBacklog(target_lang)
+    # 天然不积,同一钩子零害。v2(2026-09-23):门槛=等待积压口径(队头在播不计),
+    # 源句待译队列计入并成为摘译候选(task-9 §14:depth<3 结构性不触发→假警)。
+    def _source_backlog_s() -> float:
+        return sum(
+            _estimate_speech_seconds(t, source_lang) for t in list(_src_q.queue)
+        )
+
+    backlog = _PlaybackBacklog(target_lang, source_backlog_s=_source_backlog_s)
     if backlog.enabled:
-        print(f"[interp] backlog gate={backlog._max_s:g}s (追最新弃音保字)", flush=True)
+        print(f"[interp] backlog gate={backlog._max_s:g}s (追最新弃音保字,等待积压口径+源队列摘译)", flush=True)
 
     def _on_speech_created(ev) -> None:
         handle = getattr(ev, "speech_handle", None)
         if handle is None or not backlog.enabled:
             return
         depth, est_s, dropped = backlog.on_speech_created(handle)
-        if dropped or depth > 1:
+        if dropped or depth > 1 or backlog.source_drops_pending:
             print(
                 f"[interp] INTERP_BACKLOG depth={depth} est_ms={int(est_s * 1000)} "
-                f"drop={dropped} total_dropped={backlog.dropped}",
+                f"drop={dropped} total_dropped={backlog.dropped} "
+                f"src_pending_s={int(backlog._src_backlog_s() * 1000)} "
+                f"src_skips={backlog.source_drops_pending}",
                 flush=True,
             )
 

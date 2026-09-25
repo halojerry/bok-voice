@@ -43,6 +43,19 @@ def test_core_ports_cover_settle():
     assert ("mt-llm", 1236) in bok.CORE_PORTS
 
 
+def test_core_ports_cover_embed_and_optional_exemption():
+    """W1b embedding sidecar(:8789) 进单点表 + 享可选豁免(缺模型不算超时/降级)。"""
+    assert ("embed", 8789) in bok.CORE_PORTS
+    assert "embedding" in bok.OPTIONAL_MODELS
+    assert 8789 in bok._OPTIONAL_LLM_PORTS
+    # 宽松终检:缺口仅 embed → 放行(镜像 mt/settle 语义)。
+    assert bok._only_optional_ports([8789]) is True
+    # 孤儿清扫身份映射:殭尸 embed 进程按端口+命令行双条件收割。
+    assert any(port == 8789 and "bge-embed" in markers for port, markers in bok._ORPHAN_PORT_OWNERS)
+    # 放宽探活面:暖机窗 /health 应答(哪怕 ready=false)算进程在。
+    assert bok._SWEEP_HTTP_PATHS.get(8789) == "/health"
+
+
 def test_worker_ports_triple_matches_prod_units(monkeypatch, tmp_path):
     """worker 探针表 = 生产常驻单元(agent + interp-fwd/rev)三件,8081-8083。"""
     assert bok.WORKER_PORTS == (
@@ -205,3 +218,103 @@ def test_prod_status_ok_when_workers_alive(monkeypatch, capsys):
     # 三件 worker 行都带 agent_name(真端点证据,非 TCP UP 空话);无 active_jobs 谎报。
     assert out.count("agent_name=bok-voice") == 3
     assert "active_jobs" not in out
+
+
+# ---------------------------------------------------------------------------
+# G3 monitor 硬否决（2026-09-25，LANE-AB-2026-09-25.md 附3：offscript 窗 worker
+# 被误杀 ×7 全落在场景间隙/swap 颠簸——12 轮/60s 抬门槛仍有窗，veto 才关死）。
+# ---------------------------------------------------------------------------
+
+def test_monitor_veto_blocks_kill_with_active_calls():
+    """硬 veto 纯函数判定：active_calls>0 任何探活失败都不杀；无通话/CP 不可达
+    退回连续失败口径（idle 门槛 2 轮）。"""
+    # 无通话在途：2 轮（≥10s）杀（旧 idle 口径不变）
+    assert bok._monitor_kill_round(1, 0) == (False, False)
+    assert bok._monitor_kill_round(2, 0) == (True, False)
+    assert bok._monitor_kill_round(99, 0)[0] is True
+    # CP 不可达（None）= 退回无通话口径（旧 `if active` 判例：None 属 falsy）
+    assert bok._monitor_kill_round(1, None) == (False, False)
+    assert bok._monitor_kill_round(2, None) == (True, False)
+    # 有通话在途：恒不杀（硬 veto）——streak 多深都不杀，等场景间隙 active 归零
+    for n in (1, 2, 3, 12, 60, 999):
+        kill, _veto = bok._monitor_kill_round(n, 2)
+        assert kill is False, f"active_calls>0 时 streak={n} 不得杀"
+    # veto 打点节奏：首过 idle 门槛一次 + 此后每 12 轮提醒一次（防长窗静默/刷屏）
+    assert bok._monitor_kill_round(2, 2) == (False, True)
+    assert bok._monitor_kill_round(3, 2) == (False, False)
+    assert bok._monitor_kill_round(12, 2) == (False, True)
+    assert bok._monitor_kill_round(24, 2) == (False, True)
+
+
+def test_monitor_probe_uses_real_worker_endpoint(monkeypatch):
+    """monitor 探活必须走真 GET :port/worker（_probe_worker 单点）——1s TCP 对
+    「进程在、没 register/swap 颠簸假死」不可见（G3①，prod 面同源探针）。"""
+
+    def fake_urlopen(url, timeout=None):
+        assert "/worker" in url  # 端点本体，非裸 TCP
+        raise urllib.error.URLError("swap stall")
+
+    monkeypatch.setattr(bok.urllib.request, "urlopen", fake_urlopen)
+    ok, detail = bok._probe_worker(8081)
+    assert not ok and detail.startswith("DOWN")
+
+
+# ---------------------------------------------------------------------------
+# 9B 后端化（2026-09-25，plan §2.7）：:1237 默认不随栈拉起、judge/settle env
+# 不注入（消费方各自回退 MLX :1235）；BOK_DEV_9B=1 时行为与改造前逐字节相同。
+# ---------------------------------------------------------------------------
+
+def test_dev_9b_off_gates_judge_and_settle_env(monkeypatch, tmp_path):
+    """BOK_DEV_9B 未开：judge/CP-settle 两路都不注入 :1237 指向；=1 时逐字节同旧；
+    9B 关但外部显式设了端点 → 照传（云端钩子不受开关误伤）。"""
+    fake_model = tmp_path / "settle-9b"
+    fake_model.write_text("x")
+    monkeypatch.setattr(bok, "_settle_llm_model", lambda cur: str(fake_model))
+    for key in ("BOK_DEV_9B", "FLOW_JUDGE_LLM_BASE_URL", "FLOW_JUDGE_LLM_MODEL",
+                "BOK_SETTLE_LLM_BASE_URL", "BOK_SETTLE_LLM_MODEL"):
+        monkeypatch.delenv(key, raising=False)
+
+    # 9B 关：judge env 不注入（agent.py 回退链落 MLX :1235）
+    env: dict[str, str] = {}
+    bok._apply_judge_env(env, {})
+    assert "FLOW_JUDGE_LLM_BASE_URL" not in env
+    assert "FLOW_JUDGE_LLM_MODEL" not in env
+    # 9B 开：与改造前逐字节相同
+    monkeypatch.setenv("BOK_DEV_9B", "1")
+    env_on: dict[str, str] = {}
+    bok._apply_judge_env(env_on, {})
+    assert env_on["FLOW_JUDGE_LLM_BASE_URL"] == "http://127.0.0.1:1237/v1"
+    assert env_on["FLOW_JUDGE_LLM_MODEL"] == str(fake_model)
+    # 9B 关 + 外部显式设定：照传（不动 :1237 缺省）
+    monkeypatch.delenv("BOK_DEV_9B", raising=False)
+    monkeypatch.setenv("FLOW_JUDGE_LLM_BASE_URL", "https://cloud.example/v1")
+    monkeypatch.setenv("FLOW_JUDGE_LLM_MODEL", "cloud-model")
+    env_ext: dict[str, str] = {}
+    bok._apply_judge_env(env_ext, {})
+    assert env_ext["FLOW_JUDGE_LLM_BASE_URL"] == "https://cloud.example/v1"
+    assert env_ext["FLOW_JUDGE_LLM_MODEL"] == "cloud-model"
+
+    # CP 面 settle env：9B 关不注入（Summarizer 回退 MLX）；=1 同旧
+    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
+    monkeypatch.delenv("FLOW_JUDGE_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("FLOW_JUDGE_LLM_MODEL", raising=False)
+    cp_off = bok._control_plane_env(tmp_path / "db.sqlite")
+    assert "BOK_SETTLE_LLM_BASE_URL" not in cp_off
+    assert "BOK_SETTLE_LLM_MODEL" not in cp_off
+    monkeypatch.setenv("BOK_DEV_9B", "1")
+    cp_on = bok._control_plane_env(tmp_path / "db.sqlite")
+    assert cp_on["BOK_SETTLE_LLM_BASE_URL"] == "http://127.0.0.1:1237/v1"
+    assert cp_on["BOK_SETTLE_LLM_MODEL"] == str(fake_model)
+
+
+def test_dev_9b_off_skips_settle_llm_start(monkeypatch, tmp_path, capsys):
+    """serve/up 侧：BOK_DEV_9B 未开时 _start_settle_llm 直接跳过（不起进程、
+    不等 :1237）；stderr 留一行明示回退。"""
+    monkeypatch.delenv("BOK_DEV_9B", raising=False)
+    started: list[list[str]] = []
+    monkeypatch.setattr(bok, "_start_proc", lambda args, pidfile, logfile, env=None, cwd=None: started.append(args))
+    rc = bok._start_settle_llm({}, tmp_path, tmp_path)
+    assert rc is False
+    assert not started
+    err = capsys.readouterr().err
+    assert "BOK_DEV_9B" in err and "1237" in err

@@ -25,6 +25,11 @@ from livekit.agents import (
 )
 from livekit.plugins.openai import LLM as _OpenAICompatBase
 
+# 模型路由共享契约(2026-09-25 阶段 0):只消费,解析/校验逻辑全在 packages/core。
+from bok_voice_core.model_routes import LaneRoute, PROVIDER_OPENAI
+
+from ..voice_style import NATURALNESS_BLOCK, strip_voice_style
+
 # 后台任务强引用池(2026-09-17 全量 debug P2-A):事件循环对 task 只持弱引用,
 # GC 可中途回收仍在跑的 fire-and-forget 任务——与本仓 _duration_fuse 注释、
 # MiniMax 孤儿 invalidate、agent.py _SETTLE_TASKS 是同一实证 bug 类。本模块无
@@ -256,6 +261,33 @@ class PinnedLanguageState(LanguageState):
         pass
 
 
+def route_llm_kwargs(
+    route: LaneRoute,
+    *,
+    env_base_url: str,
+    cfg_model: str,
+) -> dict:
+    """模型路由车道 → MlxLlmLLM 构造参数映射(纯函数,单测直喂;2026-09-25 阶段 0)。
+
+    openai 档=路由表四件套(base_url/model/api_key + enable_thinking 请求体旗,
+    Qwen3.5 家族云端思考陷阱,LANE-AB 实测不传该旗 5.85s 全 <think>);api_key 空
+    (routing source「保留旧值」语义)回落构造器缺省哨兵,等价不带 key 的既有请求。
+    local routing 档=只覆盖 base_url(显式改端点,如 LM Studio),model 非空才覆盖,
+    不带 key/思考旗。env 档=调用方传入的原读法**原样回传**——base_url 来源保持
+    既有 env/settings 链,不经本函数改写(零漂移保证:kill-switch/空表时构造参数
+    与改造前逐字节同)。"""
+    if route.provider == PROVIDER_OPENAI:
+        return {
+            "base_url": route.base_url,
+            "model": route.model,
+            "api_key": route.api_key or "mlx",
+            "enable_thinking": route.enable_thinking,
+        }
+    if route.source == "routing":
+        return {"base_url": route.base_url, "model": route.model or cfg_model}
+    return {"base_url": env_base_url, "model": cfg_model}
+
+
 class MlxLlmLLM(_OpenAICompatBase):
     """本地 OpenAI 兼容 LLM（macOS mlx_lm / Windows llama-server，:1235，thinking 关闭）。
 
@@ -280,6 +312,7 @@ class MlxLlmLLM(_OpenAICompatBase):
         top_p: float | None = None,
         top_k: int | None = None,
         repetition_penalty: float | None = None,
+        enable_thinking: bool | None = None,
     ):
         # mlx_lm server requires the real model path in requests; "local" is
         # only a last-resort placeholder when no env/settings provide one.
@@ -316,6 +349,12 @@ class MlxLlmLLM(_OpenAICompatBase):
                 extra_body[key] = int(raw) if raw.isdigit() else float(raw)
             except ValueError:  # pragma: no cover - 配错当没配,唔炸构造
                 continue
+        if enable_thinking is not None:
+            # 模型路由 openai 档(2026-09-25):思考旗随请求体下发(Qwen3.5 家族云端
+            # 思考陷阱——不传该旗思考全开,LANE-AB 实证)。extra_body 经官方 openai
+            # SDK 合并进请求体顶层(既有 max_tokens/stop 同通道)。缺省 None=请求体
+            # 不含该键,本地档逐字节同旧(零漂移保证)。
+            extra_body["enable_thinking"] = bool(enable_thinking)
         super().__init__(
             model=model,
             api_key=api_key,
@@ -377,6 +416,18 @@ class MlxLlmLLM(_OpenAICompatBase):
         self.on_request_messages = None  # Callable[[list[dict]], None] | None
 
         async def _snapshot_create(**kw):
+            # 阶段1·P1(2026-09-25):出站请求的 assistant 消息剥语气/停顿标记
+            # ——LLM 不见自己上轮的标记(防 4B 复制引力放大用量),连续请求同剥
+            # =严格前缀契约两侧一致;快照回调拿到的也是剥后列表,投机预热与
+            # 真实请求逐字节同源。user/system 不动。
+            _msgs = kw.get("messages")
+            if _msgs:
+                _clean: list[dict] = []
+                for _m in _msgs:
+                    if isinstance(_m, dict) and _m.get("role") == "assistant" and isinstance(_m.get("content"), str):
+                        _m = {**_m, "content": strip_voice_style(_m["content"])}
+                    _clean.append(_m)
+                kw["messages"] = _clean
             _cb = self.on_request_messages
             if _cb is not None:
                 try:
@@ -1423,6 +1474,10 @@ class ContextState:
         self._flow_overview: str = ""
         self._flow_current: str = ""
         self._object_brief: str = ""
+        # 说话自然度块渲染门(阶段1·P1,2026-09-25):装配时按实际 TTS 模型置位
+        # (voice_style_enabled_for_tts——persona 覆写非 2.8 档自动熄火),
+        # 置位才把【说话自然度】块进静态前缀;标记剥离永远执行(与门无关)。
+        self._voice_style_on: bool = False
         # RAG 检索段渲染门(默认关):绑分步话术的封闭流程不做知识库/联网检索
         # (单对象只上话术+对象档案),易变尾部只剩当前步+记忆,尾部预算最小化。
         # set_knowledge/set_web 仍可照常喂数据(开放人设场景),只有 rag_enabled=True
@@ -1620,6 +1675,10 @@ class ContextState:
             return f"{prefix}\n\n{tail}"
         return prefix or tail
 
+    def set_voice_style(self, on: bool) -> None:
+        """【说话自然度】块渲染门(agent.py 装配时置位;见 voice_style.py)。"""
+        self._voice_style_on = bool(on)
+
     def render_instruction_prefix(self) -> str:
         """【稳定指令前缀】——放最前、紧贴人设 base。
 
@@ -1704,6 +1763,10 @@ class ContextState:
                 "只能从这些里选一个：[关切] [抱歉] [耐心] [开心] [严肃]。"
                 "示例：[关切]您别着急，我马上帮您查。标签只输出一次，不要念出来，不要用别的格式。"
             )
+        if self._voice_style_on:
+            # 静态字节(整场不变,KV 安全);非 2.8 合成档装配侧不置位=块缺席,
+            # 且 TTS transform 全剥标记——双保险防标记被当文本念出。
+            parts.append(NATURALNESS_BLOCK)
         if self._flow_overview:
             parts.append("【话术流程总览(别照读,按进度推进)】\n" + self._flow_overview)
         # 对象档案:静态、整场不变,放总览之后(先懂流程再看客户是谁)。有界

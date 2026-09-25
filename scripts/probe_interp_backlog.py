@@ -53,25 +53,34 @@ LOG_PATH = Path(
 )
 
 
-def count_drops(call_id: str) -> tuple[int, int]:
-    """以本通首个 room 行为锚，数其后的 INTERP_BACKLOG 行数与 drop 句总数。
+def count_drops(call_id: str) -> tuple[int, int, int]:
+    """以本通首个 room 行为锚，数其后的背压事件与两类弃句。
 
     锚必须是**首次**出现——框架事件 JSON 行带 room 字段会持续刷,取最后一条
-    会把锚点推到事件流末尾,数到 0(首跑实证)。"""
+    会把锚点推到事件流末尾,数到 0(首跑实证)。
+
+    fix round 1（评审 I-2）扩列：M-31 摘译路径日志是 `INTERP_BACKLOG source-skip
+    xN`（无 `drop=` 字样），旧版只数 `drop=1` 行 → 摘译不进判据。现分开口径：
+    - drops  = 译文弃句（门日志 `drop=1` 行数,即该窗弃了几句译文音）
+    - skips  = 源句摘译（`source-skip` 消费行数,MT worker 真跳过的待译源句）
+    require_drop 判据取并集（drops+skips≥1）——「追最新弃音保字」与「摘译保文」
+    都是积压门生效的落地形态。"""
     try:
         lines = LOG_PATH.read_text(errors="ignore").splitlines()
     except OSError:
-        return 0, 0
+        return 0, 0, 0
     idx = [i for i, ln in enumerate(lines) if call_id in ln]
     if not idx:
-        return 0, 0
-    events = drops = 0
+        return 0, 0, 0
+    events = drops = skips = 0
     for ln in lines[idx[0]:]:
         if "INTERP_BACKLOG" in ln:
             events += 1
             if "drop=1" in ln:
                 drops += 1
-    return events, drops
+            if "source-skip" in ln:
+                skips += 1
+    return events, drops, skips
 
 
 async def main() -> int:
@@ -106,12 +115,12 @@ async def main() -> int:
     turns = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", headers=_CP_HEADERS, timeout=10).json()
     orig = [t for t in turns if str(t.get("transcript") or "").startswith("原文：")]
     tran = [t for t in turns if str(t.get("transcript") or "").startswith("译文：")]
-    events, drops = (count_drops(call_id) if require_drop else (0, 0))
+    events, drops, skips = (count_drops(call_id) if require_drop else (0, 0, 0))
 
-    ok = len(orig) >= len(SENTENCES) - 2 and (not require_drop or drops >= 1)
+    ok = len(orig) >= len(SENTENCES) - 2 and (not require_drop or drops + skips >= 1)
     print(
         f"INTERPRET_BACKLOG_PROBE call={call_id} src={len(SENTENCES)} orig={len(orig)} "
-        f"tran={len(tran)} events={events} dropped={drops} "
+        f"tran={len(tran)} events={events} dropped={drops} skipped={skips} "
         f"elapsed={int(time.time() - start)}s {'PASS' if ok else 'FAIL'}",
         flush=True,
     )

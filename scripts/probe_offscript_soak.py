@@ -297,6 +297,7 @@ async def run_set(key: str, persona_id: str | None, budgets: dict[str, float]) -
             f"{erc.CONTROL_PLANE_URL}/api/token",
             json={"account_id": "acc-001", "call_id": call_id},
             timeout=10,
+            headers=erc.CP_HEADERS,
         ).json()
         await room.connect(data["serverUrl"], data["participantToken"])
         audio_source = rtc.AudioSource(sample_rate=16000, num_channels=1)
@@ -331,8 +332,8 @@ async def run_set(key: str, persona_id: str | None, budgets: dict[str, float]) -
         for t in read_tasks:
             t.cancel()
         try:
-            httpx.post(f"{erc.CONTROL_PLANE_URL}/api/calls/{call_id}/hangup", timeout=10)
-            httpx.post(f"{erc.CONTROL_PLANE_URL}/api/calls/{call_id}/settle", timeout=30)
+            httpx.post(f"{erc.CONTROL_PLANE_URL}/api/calls/{call_id}/hangup", timeout=10, headers=erc.CP_HEADERS)
+            httpx.post(f"{erc.CONTROL_PLANE_URL}/api/calls/{call_id}/settle", timeout=30, headers=erc.CP_HEADERS)
         except Exception:
             pass
 
@@ -426,11 +427,15 @@ def print_report(res: dict, budgets: dict[str, float]) -> None:
             flush=True,
         )
     fa, pd = s["first_audio"], s["perceived"]
-    print(
-        f"\n墙钟首声 n={fa['n']} p50={fa['p50']:.0f}ms p95={fa['p95']:.0f}ms max={fa['max']:.0f}ms "
-        f"超标(>{budgets['first_ms']:.0f})={fa['over_budget']}",
-        flush=True,
-    )
+    if fa["n"]:
+        print(
+            f"\n墙钟首声 n={fa['n']} p50={fa['p50']:.0f}ms p95={fa['p95']:.0f}ms max={fa['max']:.0f}ms "
+            f"超标(>{budgets['first_ms']:.0f})={fa['over_budget']}",
+            flush=True,
+        )
+    else:
+        # setup 中断（如 token 响应缺 serverUrl）时零有效轮——打明文不炸整场
+        print("\n墙钟首声：无有效轮（setup 中断，见上方异常行）", flush=True)
     if pd["n"]:
         print(
             f"PERCEIVED n={pd['n']} p50={pd['p50']:.0f}ms p95={pd['p95']:.0f}ms max={pd['max']:.0f}ms "

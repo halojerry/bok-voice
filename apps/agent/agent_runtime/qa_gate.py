@@ -5,7 +5,9 @@
 
 打分照抄知识库 InMemoryVectorStore:0.6×余弦 + 0.4×子串长度比,向量用
 HybridLexicalEmbedding(CJK 逐字+bigram 哈希,零外部依赖)。阈值默认 0.90
-宁缺毋滥;语义向量(MlxEmbedding)与步骤作用域条目放量为 v2。
+宁缺毋滥;**语义补位车道已落地(2026-09-24,W3b 解锁)= QaSemanticIndex**:
+词面 0.90 未中轮的本地 embedding 释义档(阈值 0.80,词面恒绝对优先,
+BOK_QA_SEMANTIC=0 一键回纯词面档)。
 
 命中语义(Phase 3.2,spec 2026-09-18-flow-graph-phase3 §2):同义簇
 (cluster_head_id)在装配时折组——变体命中由簇内代表出场,簇内按「本通最少
@@ -19,6 +21,7 @@ scope 变体唔会在异步出线、跨语言成员唔会在本语通话播—�
 
 from __future__ import annotations
 
+import hashlib
 import os
 
 from bok_voice_core.embeddings import HybridLexicalEmbedding
@@ -48,6 +51,33 @@ def qa_priority_enabled() -> bool:
 def qa_rotation_enabled() -> bool:
     """多答案轮换开关(Phase 3.2):0=回裸索引竞争者档(变体自己赢、播自己的答案)。"""
     return os.environ.get("BOK_QA_ROTATION", "1") == "1"
+
+
+def qa_semantic_enabled() -> bool:
+    """语义补位车道总闸(W3b 解锁,2026-09-24):词面 0.90 未中轮的本地 embedding 补位。"""
+    return os.environ.get("BOK_QA_SEMANTIC", "1") == "1"
+
+
+def qa_semantic_threshold() -> float:
+    """释义档阈值(默认 0.80,比意图车道 0.78 高一档):快路播固定罐头答案,
+    误命中代价(答非所问的录音)高于意图跳转——宁缺毋滥。"""
+    try:
+        return max(0.0, min(1.0, float(os.environ.get("BOK_QA_SEM_THRESHOLD", "0.80"))))
+    except ValueError:
+        return 0.80
+
+
+def qa_semantic_base_url() -> str:
+    raw = os.environ.get("BOK_QA_SEM_BASE_URL", "").strip()
+    return raw or "http://127.0.0.1:8789"
+
+
+def qa_semantic_timeout_s() -> float:
+    """毫秒→秒;坏值回默认 400ms(与意图车道同预算:热路径同步等,必须小)。"""
+    try:
+        return max(0.0, float(os.environ.get("BOK_QA_SEM_TIMEOUT_MS", "400"))) / 1000.0
+    except ValueError:
+        return 0.4
 
 
 def _entry_priority(entry: dict) -> int:
@@ -298,3 +328,123 @@ class QaIndex:
             if str(entry.get("id") or "") == wanted:
                 return entry
         return None
+
+    def team_head(
+        self,
+        entry: dict,
+        *,
+        lang: str = "",
+        step_index: int | None = None,
+    ) -> dict | None:
+        """语义补位胜者的簇折组出口(公开面,2026-09-24):与词面 match 内部
+        `_team_head` 同款判据——胜者属簇且簇内有幸存成员 → 首个幸存成员代表
+        出场;无簇/整簇滤光 → None(调用方裸胜者)。"""
+        return self._team_head(entry, lang=lang, step_index=step_index)
+
+
+class QaSemanticIndex:
+    """快答库语义补位索引(2026-09-24,W3b 解锁):词面 0.90 未中轮的释义档。
+
+    纪律镜像 W1b 意图车道(intent_semantic):
+    - 素材向量经 ``SEMANTIC_VECTOR_CACHE``(模块级 LRU,键=条目 id+问法集
+      sha256)——同目录反复外呼零重复 embed,改目录 → 哈希变 → 重算;
+    - 装配构建分块批量(64/块,块预算 5s),查询每轮至多一次 embed(~20ms);
+    - 端点缺席/连续失败 → EmbedClient 降级闩,本通惰性(快路行为=旧档);
+    - **词面档恒绝对优先**:语义只在词面 match 未中时补位(调用方职责),
+      命中条目进与词面同款的轮换/PCM 出场链(折组经 QaIndex.team_head);
+    - 胜者=最高余弦、平分吃插入序,**不进优先级 duel**——补位车道语义:
+      词面档的 (priority,-score) 契约不延伸到这里,最贴近的问法直接出场。
+    """
+
+    def __init__(self, client, items: list[tuple[dict, str, list[float]]]):
+        self._client = client
+        self._items = items  # (entry, 归一问法, 语义向量),插入序=created_at
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    @classmethod
+    async def build(cls, client, entries: list[dict]) -> "QaSemanticIndex | None":
+        """装配构建(异步:批量 embed)。素材=去重归一问法(同问法多条目共享
+        向量、首条出场——快路命中面按问法);零素材/任一批次失败 → None 整通
+        惰性(零行为变化)。"""
+        from .intent_semantic import (
+            _BUILD_EMBED_CHUNK,
+            _BUILD_EMBED_TIMEOUT_S,
+            SEMANTIC_VECTOR_CACHE,
+        )
+
+        items: list[tuple[dict, str]] = []
+        seen: set[str] = set()
+        for e in entries or []:
+            q = normalize_question(str(e.get("question_text") or ""))
+            if not q or q in seen:
+                continue
+            seen.add(q)
+            items.append((e, q))
+        if not items:
+            return None
+        key = hashlib.sha256(
+            "\n".join(f"{e.get('id')}|{q}" for e, q in items).encode("utf-8")
+        ).hexdigest()
+        cached = SEMANTIC_VECTOR_CACHE.get(key)
+        if cached is None:
+            texts = [q for _e, q in items]
+            vecs: list[list[float]] = []
+            for i in range(0, len(texts), _BUILD_EMBED_CHUNK):
+                chunk = await client.embed(
+                    texts[i : i + _BUILD_EMBED_CHUNK], timeout_s=_BUILD_EMBED_TIMEOUT_S
+                )
+                if chunk is None:
+                    return None
+                vecs.extend(chunk)
+            cached = dict(zip(texts, vecs))
+            SEMANTIC_VECTOR_CACHE.put(key, cached)
+        return cls(client, [(e, q, cached[q]) for e, q in items])
+
+    async def match(
+        self,
+        user_text: str,
+        *,
+        lang: str = "",
+        step_index: int | None = None,
+        threshold: float | None = None,
+    ) -> tuple[dict | None, float, str]:
+        """词面未中轮的语义补位 → (命中条目|None, 最佳余弦, reason)。
+
+        reason ∈ ""|empty|no_embedder|timeout|error:空串=正常评分(未过阈值
+        也是正常 miss,调用方可打 miss 日志);其余=车道不可用归因(静默降级,
+        与意图车道同纪律——日志归 agent 统一打)。幸存过滤与词面 match 同判据
+        `_survives_turn`(单点防漂移)。
+        """
+        from .intent_semantic import _cosines
+
+        q = normalize_question(user_text)
+        if not q or not self._items:
+            return None, 0.0, "empty"
+        if self._client is None or self._client.dead:
+            return None, 0.0, "no_embedder"
+        qv = await self._client.embed([q])
+        if qv is None:
+            return None, 0.0, (self._client.last_reason or "error")
+        thr = qa_semantic_threshold() if threshold is None else threshold
+        rows: list[list[float]] = []
+        entries: list[dict] = []
+        for e, _q, vec in self._items:
+            if _survives_turn(e, lang=lang, step_index=step_index):
+                entries.append(e)
+                rows.append(vec)
+        if not rows:
+            return None, 0.0, "empty"
+        coss = _cosines(qv[0], rows)
+        best: dict | None = None
+        best_score = -1.0
+        top = 0.0
+        for e, c in zip(entries, coss):
+            if c > top:
+                top = c
+            if c >= thr and c > best_score:
+                best, best_score = e, c
+        if best is None:
+            return None, top, ""
+        return best, best_score, ""

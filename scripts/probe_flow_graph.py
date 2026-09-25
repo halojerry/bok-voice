@@ -134,6 +134,53 @@ JUDGE_PROMPT = (
 # 起推才落账 → pending 未存 → consume 轮 pop 空。默认 6s 盖住 delay+往返，env 可调。
 JUDGE_SOAK_S = float(os.environ.get("BOK_PROBE_JUDGE_SOAK_S", "6"))
 
+# ---- 意图语义腿（W1b，2026-09-23）--------------------------------------------
+# 语义触发话术：**不含任何触发/play 关键词**（含关键词就走不到语义车道），但与「投诉」
+# 意图素材（label+keywords+judge.prompt）语义近——离线自检钉死关键词零包含；真模型
+# 实测同族释义对 cos 0.78-0.88（阈值 BOK_INTENT_SEM_THRESHOLD=0.78）。话术刻意与
+# JUDGE_PROMPT 的描述措辞重叠（「拖着不处理/讨个说法」）保分数余量。
+SEMANTIC_TEXT = "你们拖了这么久都没有人处理，我真的很生气，要讨个说法"
+# 语义腿专用判据文案（兼作语义素材锚；judge=str 覆盖透传）：贴近触发话术的客户
+# 措辞——真模型实测探针默认素材太薄（5 短词+通用判据），释义分 0.736 恒 miss
+# 阈值 0.78；换近义锚后触发分 ≥0.85（离线预检钉死，ASR 噪声余量足）。
+SEMANTIC_JUDGE_PROMPT = (
+    "客户在表达强烈不满和抱怨：事情拖了这么久都没有人处理、我真的很生气、"
+    "要向你们讨一个说法；单纯询问进度、确认信息、客气地催一下不算命中。"
+)
+# 语义打点族（与 judge 族同例：**不在** RE_FLOW_GRAPH 里——默认/then-jump 腿事件集
+# 逐字节同旧；semantic_* / play_bypass 只由 parse_semantic_events 单独收）。
+RE_FLOW_GRAPH_SEMANTIC = re.compile(
+    r"FLOW_GRAPH\s+(semantic_hit|semantic_miss|semantic_skip)\b(.*)$"
+)
+# 装配面降级线（build None 时每通一次；非 FLOW_GRAPH 前缀，单独解析）。
+RE_SEMANTIC_ASSEMBLY_OFF = re.compile(r"\[agent\] intent semantic off \((\w+)\)")
+SEMANTIC_EVENT_KINDS = ("semantic_hit", "semantic_miss", "semantic_skip")
+
+
+def parse_semantic_events(lines: list[str]) -> list[dict]:
+    """抽 `FLOW_GRAPH semantic_*` 打点为事件字典（纯函数，保序；k=v 展开）。
+
+    兼收装配面 `[agent] intent semantic off (reason)`（kind="semantic_off",
+    reason 展开）——降级腿两种降级形态（装配失败=整通惰性 / 运行中失联=skip）
+    都要能被观测到。
+    """
+    events: list[dict] = []
+    for raw in lines:
+        m = RE_FLOW_GRAPH_SEMANTIC.search(str(raw))
+        if m:
+            ev: dict = {"kind": m.group(1)}
+            for token in m.group(2).split():
+                if "=" in token:
+                    key, value = token.split("=", 1)
+                    ev[key] = value
+            events.append(ev)
+            continue
+        m2 = RE_SEMANTIC_ASSEMBLY_OFF.search(str(raw))
+        if m2:
+            events.append({"kind": "semantic_off", "reason": m2.group(1)})
+    return events
+
+
 # 探针模板（6 步，纯 goal/ref，无 say 直念步——直念步会在 graph 块之前抢走本轮）。
 PROBE_STEPS: list[dict] = [
     {"goal": "确认身份", "ref": "你好，请问是{姓名}吗？"},
@@ -346,6 +393,8 @@ def plan_rounds(
     intent_judge: bool = False,
     fuzzy_text: str = FUZZY_TEXT,
     jump_speech: bool = False,
+    semantic: bool = False,
+    semantic_text: str = SEMANTIC_TEXT,
 ) -> list[tuple[str, str]]:
     """本腿轮次表 `[(窗口名, 话术)]`（纯函数）。
     - **then-jump 档**（`then_jump` 非 None，Phase 3.3 追问链）：`has_qa` 真 →
@@ -367,6 +416,10 @@ def plan_rounds(
         # 话面档（I3）：单触发轮——判据不在图引擎而在跳步轮**回复的词面**
         # （含本步事实词 / 不含被跳步问句词），transcript 由 turns 行直接读。
         return [("trigger", trigger_text)]
+    if semantic:
+        # 语义档（W1b）：单触发轮——释义话术（无关键词）走语义车道同步补位,
+        # judge 调度被语义命中前置挡下(漏斗序:关键词>语义>judge)。
+        return [("sem", semantic_text)]
     if intent_judge:
         return [("fuzzy", fuzzy_text), ("consume", after_text)]
     if then_jump is not None:
@@ -452,6 +505,10 @@ def evaluate_leg(
     jump_speech: bool = False,
     expect_words: list[str] | None = None,
     forbid_words: list[str] | None = None,
+    semantic: bool = False,
+    sem_events: list[dict] | None = None,
+    sem_events_global: list[dict] | None = None,
+    degraded: bool = False,
 ) -> dict:
     """主判据（纯函数）。expect_off=False=图开启腿；True=kill-switch 腿。
 
@@ -504,6 +561,54 @@ def evaluate_leg(
             "killswitch_no_judge_logs": ev_ok and not judges,
         }
         events["judge"] = judges
+    elif expect_off and semantic:
+        # W1b kill 面：semantic_* 打点族不在 RE_FLOW_GRAPH（全局尾扫传入）——
+        # 关闸=零语义调用零日志；assembly off 行也不该在（env 关时装配块整体短路）。
+        semglob = list(sem_events_global or [])
+        checks = {
+            "evidence_ok": ev_ok,
+            "killswitch_no_semantic_logs": ev_ok and not semglob,
+            "killswitch_no_graph_turns": ev_ok and not grows,
+        }
+        events["semantic"] = semglob
+    elif semantic and degraded:
+        # W1b 降级面：sidecar 缺席时两种降级形态都要被观测到——装配失败
+        # （build None → `[agent] intent semantic off`，整通惰性）或运行中
+        # 失联（`semantic_skip`，闩后每通一次）；语义零命中；LLM 照常兜话。
+        sems = list(sem_events or []) + list(sem_events_global or [])
+        deg = [e for e in sems if str(e.get("kind")) in ("semantic_off", "semantic_skip")]
+        llm_replied = any(
+            str(t.get("role") or "") == "assistant"
+            and str(t.get("provider") or "").strip() not in GRAPH_PROVIDERS
+            for t in turns
+        )
+        checks = {
+            "evidence_ok": ev_ok,
+            "semantic_degraded_logged": bool(deg),
+            "no_semantic_hit": ev_ok and not any(
+                str(e.get("kind")) == "semantic_hit" for e in sems
+            ),
+            "llm_fallback_alive": llm_replied,
+        }
+        events["semantic"] = sems
+    elif semantic:
+        # W1b 语义面：sem 窗口内语义命中（硬）→ pick 同权 → jump 落 provider；
+        # judge 零调度（漏斗序铁律：语义先挡、judge 只兜语义也不中的）。
+        sems = list(sem_events or [])
+        checks = {
+            "evidence_ok": ev_ok,
+            "semantic_hit_logged": any(
+                str(e.get("kind")) == "semantic_hit" for e in sems
+            ),
+            "jump_after_semantic": any(
+                g["provider"] == "graph-jump" and g["template_step"] == target_step
+                for g in grows
+            ),
+            "judge_not_scheduled": ev_ok and not any(
+                str(e.get("kind")) == "judge_scheduled" for e in sems
+            ),
+        }
+        events["sem"] = sems
     elif expect_off:
         checks = {
             "evidence_ok": ev_ok,
@@ -622,14 +727,15 @@ def _cp(path: str, *, method: str = "GET", **kw) -> httpx.Response:
     )
 
 
-def build_graph_json(qa_id: str, *, then_jump: int | None = None, judge: bool = False) -> str:
+def build_graph_json(qa_id: str, *, then_jump: int | None = None, judge: bool | str = False) -> str:
     """图契约（spec §3）：投诉→jump_step 4；退款→play_qa（有 qa_id 才挂该腿）。
 
     `then_jump`（Phase 3.3 追问链，1-based）：非空且挂了 play_qa 绑定时给该绑定加
     `"then_jump": N`；默认 `None` 时输出与今逐字节同（旧腿/旧断言零变化）。
-    `judge`（Phase 3.4 意图引擎）：真时给「投诉」意图挂 `judge.prompt=JUDGE_PROMPT`
-    （关键词照旧必填——judge 只补关键词未中的模糊轮）；默认 False 逐字节同旧。
+    `judge`（Phase 3.4 意图引擎 / W1b 语义腿）：True=挂默认 `JUDGE_PROMPT`；
+    **str=挂该文案**（W1b 语义腿的专用素材——贴近客户措辞的判据，其他腿零变化）。
     """
+    judge_prompt = judge if isinstance(judge, str) else JUDGE_PROMPT
     bindings = [{
         "id": "bnd_7e8f9a0b",
         "intent": "int_1a2b3c4d",
@@ -645,8 +751,9 @@ def build_graph_json(qa_id: str, *, then_jump: int | None = None, judge: bool = 
         "keywords": list(TRIGGER_KEYWORDS),
         "steps": [],
         "enabled": True,
-        # 判据只在显式开 judge 腿时写键（CP 严格校验面：prompt 必须 1-400 字符串）。
-        **({"judge": {"prompt": JUDGE_PROMPT}} if judge else {}),
+        # 判据只在显式开 judge 腿时写键（CP 严格校验面：prompt 必须 1-400 字符串）；
+        # W1b 语义腿传 str 覆盖素材文案（近义释义锚），默认腿逐字节同旧。
+        **({"judge": {"prompt": judge_prompt}} if judge else {}),
     }]
     if qa_id:
         intents.append({
@@ -766,7 +873,10 @@ async def run_leg(*, expect_off: bool, lang: str, voice: str, trigger_text: str,
                   judge_soak_s: float = JUDGE_SOAK_S,
                   jump_speech: bool = False,
                   expect_words: list[str] | None = None,
-                  forbid_words: list[str] | None = None) -> dict:
+                  forbid_words: list[str] | None = None,
+                  semantic: bool = False,
+                  semantic_text: str = SEMANTIC_TEXT,
+                  degraded: bool = False) -> dict:
     leg_name = "killswitch-off" if expect_off else "graph-on"
     if then_jump is not None:
         leg_name = "then-jump-killswitch-off" if expect_off else "then-jump"
@@ -774,13 +884,23 @@ async def run_leg(*, expect_off: bool, lang: str, voice: str, trigger_text: str,
         leg_name = "intent-judge-killswitch-off" if expect_off else "intent-judge"
     if jump_speech:
         leg_name = "jump-speech"
+    if semantic:
+        # W1b：语义腿三态——命中 / 降级(sidecar 缺席) / kill(env 关)。
+        # 图与 intent-judge 腿同款（judge.prompt 兼作语义素材——释义话术与判据
+        # 描述同义时 cos 余量足）；差别只在触发话术与判据。
+        leg_name = "semantic-killswitch-off" if expect_off else (
+            "semantic-degraded" if degraded else "semantic"
+        )
     qa_id = pick_qa_id(lang)
-    graph_json = build_graph_json(qa_id, then_jump=then_jump, judge=intent_judge)
+    graph_json = build_graph_json(
+        qa_id, then_jump=then_jump,
+        judge=SEMANTIC_JUDGE_PROMPT if semantic else bool(intent_judge),
+    )
     rounds = plan_rounds(
         then_jump=then_jump, has_qa=bool(qa_id), trigger_text=trigger_text,
         nontrigger_text=nontrigger_text, play_text=play_text, after_text=after_text,
         play_round=play_round, intent_judge=intent_judge, fuzzy_text=fuzzy_text,
-        jump_speech=jump_speech,
+        jump_speech=jump_speech, semantic=semantic, semantic_text=semantic_text,
     )
     print(f"\n[flow-graph] 腿={leg_name} lang={lang} qa_id={qa_id or '(无QA条目, play 腿跳过)'}"
           f" then_jump={then_jump} intent_judge={intent_judge} rounds={[n for n, _ in rounds]}",
@@ -811,6 +931,7 @@ async def run_leg(*, expect_off: bool, lang: str, voice: str, trigger_text: str,
             rounds=rounds, then_jump=then_jump, after_text=after_text,
             budgets=budgets, intent_judge=intent_judge, judge_soak_s=judge_soak_s,
             jump_speech=jump_speech, expect_words=expect_words, forbid_words=forbid_words,
+            semantic=semantic, degraded=degraded,
         )
     finally:
         # 清理探针模板：名字含 probe=不会被 E2E 自动挑中，但跑完仍应不留痕（--keep-template 留档用）。
@@ -826,7 +947,9 @@ async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_
                               judge_soak_s: float = JUDGE_SOAK_S,
                               jump_speech: bool = False,
                               expect_words: list[str] | None = None,
-                              forbid_words: list[str] | None = None) -> dict:
+                              forbid_words: list[str] | None = None,
+                              semantic: bool = False,
+                              degraded: bool = False) -> dict:
     # 轮次表由 `plan_rounds` 单点产出（默认档=触发/非触发/play 信息位轮；then-jump 档=
     # 播 + 跳后两轮），这里只负责跑表与按窗口切日志。
     pcms = {name: erc.tts_pcm(text, lang) for name, text in rounds}
@@ -951,6 +1074,14 @@ async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_
         + parse_judge_events(name_to_window.get("fuzzy", []))
     )
     consume_events = parse_graph_events(name_to_window.get("consume", []))
+    # 语义窗口叠加三解析器（graph 四词 + judge 族 + semantic 族）——sem 轮的
+    # judge_not_scheduled 判据靠 judge 解析器捞 judge_scheduled，semantic_hit 靠
+    # semantic 解析器，jump 靠 graph 解析器，三者同窗口并行观测。
+    sem_events = (
+        parse_graph_events(name_to_window.get("sem", []))
+        + parse_judge_events(name_to_window.get("sem", []))
+        + parse_semantic_events(name_to_window.get("sem", []))
+    )
     # judge 打点全局尾扫（Phase 3.4）：judge_hit/judge_pending_fired 的落点跨窗口边界
     # （3s 让路 + 9B 往返 vs reply 播放时长，可能落 fuzzy 窗、soak 间隙=consume 窗头、
     # 甚至 settle 后），窗口归属只作信息位——判据用 marks[0]:EOF 全量。
@@ -963,6 +1094,17 @@ async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_
             )
         except Exception:  # noqa: BLE001 - 日志缺失=零 judge 事件（判据如实报缺）
             judge_events = []
+    # 语义打点全局尾扫（W1b）：装配面 off 行在进房前落（marks[0] 之前也可能），
+    # skip/hit 可能跨窗——kill/降级判据用 marks[0]:EOF 全量 + 装配行容赦。
+    sem_events_global: list[dict] = []
+    if semantic:
+        try:
+            tail = erc.LOG_PATH.read_bytes()[max(0, marks[0]):]
+            sem_events_global = parse_semantic_events(
+                [ln.decode("utf-8", errors="replace") for ln in tail.splitlines()]
+            )
+        except Exception:  # noqa: BLE001 - 日志缺失=零语义事件（判据如实报缺）
+            sem_events_global = []
     if not evidence["ok"]:
         print(f"[flow-graph] 观测面不足 → absence 判据不计 PASS：{evidence}", flush=True)
 
@@ -1000,6 +1142,10 @@ async def _run_leg_with_stack(*, expect_off: bool, leg_name: str, lang: str, qa_
         jump_speech=jump_speech,
         expect_words=expect_words,
         forbid_words=forbid_words,
+        semantic=semantic,
+        sem_events=sem_events,
+        sem_events_global=sem_events_global,
+        degraded=degraded,
     )
     # 归因用关键词：then-jump 腿的触发语是 `play_text`（退款 系），默认腿是「投诉」系。
     understood_keywords = PLAY_KEYWORDS if then_jump is not None else TRIGGER_KEYWORDS
@@ -1150,6 +1296,60 @@ def selftest() -> int:
             expect_off=True, target_step=TARGET_STEP,
             trigger_events=[jump_ev], nontrigger_events=[], play_events=[],
             turns=_turns("graph-jump", TARGET_STEP), evidence=_ev())["pass"], False),
+        # ---- 语义腿（W1b，2026-09-23）：命中/降级/kill 三面 ----
+        ("semantic 正例：hit+graph-jump+judge 零调度", evaluate_leg(
+            expect_off=False, target_step=TARGET_STEP,
+            trigger_events=[], nontrigger_events=[], play_events=[],
+            turns=_turns("graph-jump", TARGET_STEP), evidence=_ev(expected=1),
+            semantic=True,
+            sem_events=[{"kind": "semantic_hit", "intent": "int_1a2b3c4d",
+                         "score": "0.83", "binding": "bnd_7e8f9a0b"}])["pass"], True),
+        ("semantic 反例：无 semantic_hit（阈值未过/端点缺席）", evaluate_leg(
+            expect_off=False, target_step=TARGET_STEP,
+            trigger_events=[], nontrigger_events=[], play_events=[],
+            turns=_turns("graph-jump", TARGET_STEP), evidence=_ev(expected=1),
+            semantic=True,
+            sem_events=[{"kind": "semantic_miss", "reason": "below_threshold"}])["pass"], False),
+        ("semantic 反例：judge 被调度=语义没挡住（漏斗序破）", evaluate_leg(
+            expect_off=False, target_step=TARGET_STEP,
+            trigger_events=[], nontrigger_events=[], play_events=[],
+            turns=_turns("graph-jump", TARGET_STEP), evidence=_ev(expected=1),
+            semantic=True,
+            sem_events=[{"kind": "semantic_hit"}, {"kind": "judge_scheduled"}])["pass"], False),
+        ("semantic-degraded 正例：assembly off+零 hit+LLM 兜话", evaluate_leg(
+            expect_off=False, target_step=TARGET_STEP,
+            trigger_events=[], nontrigger_events=[], play_events=[],
+            turns=_turns("", 2), evidence=_ev(expected=1),
+            semantic=True, degraded=True,
+            sem_events=[], sem_events_global=[{"kind": "semantic_off", "reason": "no_embedder"}])["pass"], True),
+        ("semantic-degraded 反例：无降级打点", evaluate_leg(
+            expect_off=False, target_step=TARGET_STEP,
+            trigger_events=[], nontrigger_events=[], play_events=[],
+            turns=_turns("", 2), evidence=_ev(expected=1),
+            semantic=True, degraded=True,
+            sem_events=[], sem_events_global=[])["pass"], False),
+        ("semantic kill 正例：零语义痕迹", evaluate_leg(
+            expect_off=True, target_step=TARGET_STEP,
+            trigger_events=[], nontrigger_events=[], play_events=[],
+            turns=[{"role": "assistant", "provider": "", "gen": "llm",
+                    "template_step": 2, "transcript": "好的"}], evidence=_ev(expected=1),
+            semantic=True, sem_events_global=[])["pass"], True),
+        ("semantic kill 反例：仍有 semantic_skip 残留", evaluate_leg(
+            expect_off=True, target_step=TARGET_STEP,
+            trigger_events=[], nontrigger_events=[], play_events=[],
+            turns=[{"role": "assistant", "provider": "", "gen": "llm",
+                    "template_step": 2, "transcript": "好的"}], evidence=_ev(expected=1),
+            semantic=True,
+            sem_events_global=[{"kind": "semantic_skip", "reason": "timeout"}])["pass"], False),
+        ("parse_semantic_events：semantic_hit k=v + 装配 off 行", parse_semantic_events([
+            "FLOW_GRAPH semantic_hit intent=int_1a2b3c4d score=0.83 binding=bnd_7e8f9a0b step=1",
+            "[agent] intent semantic off (no_embedder) (call call-x)",
+            "FLOW_GRAPH judge_scheduled intents=1 step=1",
+        ]) == [
+            {"kind": "semantic_hit", "intent": "int_1a2b3c4d", "score": "0.83",
+             "binding": "bnd_7e8f9a0b", "step": "1"},
+            {"kind": "semantic_off", "reason": "no_embedder"},
+        ], True),
         # ---- review R1：absence-based 判据的观测前提（无观测不成 PASS）----
         ("假绿闸：日志缺失 → kill 腿零痕迹不成立", evaluate_leg(
             expect_off=True, target_step=TARGET_STEP,
@@ -1357,6 +1557,16 @@ async def main() -> int:
     parser.add_argument("--jump-speech", action="store_true",
                         help="话面腿（I3）：单触发轮，判据=跳步轮回复词面（含本步事实词、"
                              "不含被跳步问句词）——修的是 4B 被总览引力拉回线性剧本的问题")
+    parser.add_argument("--semantic", action="store_true",
+                        help="语义腿（W1b）：投诉意图挂 judge.prompt（兼作语义素材），单触发轮推"
+                             "无关键词释义话术，判据=semantic_hit+graph-jump+judge 零调度；"
+                             "--expect-degraded 配套=停 :8789 后跑（降级形态）；kill 腿须先以"
+                             " BOK_INTENT_SEMANTIC=0 重启 worker")
+    parser.add_argument("--semantic-text", default=SEMANTIC_TEXT,
+                        help="--semantic 的释义触发话术（须避开图全部关键词，保持强不满语义）")
+    parser.add_argument("--expect-degraded", action="store_true",
+                        help="语义降级腿：先停 bge-embed sidecar(:8789) 再跑——判据=降级打点"
+                             "（assembly off 或 semantic_skip）+零 semantic_hit+LLM 兜话存活")
     parser.add_argument("--expect-words", default="赔付,理赔",
                         help="--jump-speech 跳步轮回复必须包含的本步事实词（逗号分隔，任序全含）")
     parser.add_argument("--forbid-words", default="需要跟您确认",
@@ -1386,6 +1596,9 @@ async def main() -> int:
         jump_speech=args.jump_speech,
         expect_words=str(args.expect_words or "").split(","),
         forbid_words=str(args.forbid_words or "").split(","),
+        semantic=args.semantic,
+        semantic_text=args.semantic_text,
+        degraded=args.expect_degraded,
     )
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1404,11 +1617,18 @@ async def main() -> int:
           " ".join(f"{k}={'1' if v else '0'}" for k, v in checks.items()) +
           f" → {'PASS' if res['verdict']['pass'] else 'FAIL'}", flush=True)
     if args.expect_off:
-        kill_env = "BOK_FLOW_GRAPH_JUDGE" if args.intent_judge else "BOK_FLOW_GRAPH"
+        kill_env = (
+            "BOK_INTENT_SEMANTIC" if args.semantic
+            else ("BOK_FLOW_GRAPH_JUDGE" if args.intent_judge else "BOK_FLOW_GRAPH")
+        )
         print(f"（kill-switch 腿：须以 {kill_env}=0 重启 serve，探针不代重启；env 经 bok.py "
               "_BOK_PASSTHROUGH_KEYS 白名单透传（dev serve merge os.environ，白名单真正兜底 "
               "prod 封闭 env 面）——若本腿仍 FAIL，先核对 worker 进程 env 里到底有没有 "
               f"{kill_env}，再怀疑引擎）", flush=True)
+    if args.semantic and not args.expect_off and not args.expect_degraded:
+        print("（语义腿前置：bge-embed sidecar :8789 须在跑（bok serve 自动拉起）；"
+              "触发话术的语义分数可先离线验：见 reports/intent-catalog 或直接打 /v1/embeddings）",
+              flush=True)
     return 0 if res["verdict"]["pass"] else 1
 
 

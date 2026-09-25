@@ -31,6 +31,9 @@ ROOT = Path(__file__).resolve().parents[1]
 LIVEKIT_URL = "ws://127.0.0.1:7880"
 CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
 ASR_URL = "http://127.0.0.1:8787"
+# 压测档开关（2026-09-24）：0=跳过音频 ASR 回读断言（与真会话挤 :8787 解码队列
+# 必超时），语言断言改走翻译音轨名 trans-<lang>；默认 1=完整回读（单跑回归用）。
+READBACK = os.environ.get("E2E_INTERP_READBACK", "1") == "1"
 # auth-on 栈(2026-09-15 标准姿势)要求 CP 请求带机器通道 token——E2E 建单/取
 # token/收线/读 turns 全是机器语义,Bearer BOK_CP_TOKEN 直通(与 agent worker 同源)。
 # 未设 env(老 auth-off 栈)零变化。CP 之外(asr sidecar)不带。
@@ -91,6 +94,7 @@ class Side:
         self.room = rtc.Room()
         self.audio_source = rtc.AudioSource(sample_rate=16000, num_channels=1)
         self.captured = bytearray()
+        self.trans_names: set[str] = set()
         self._tasks: list[asyncio.Task] = []
 
     async def connect(self) -> None:
@@ -113,6 +117,7 @@ class Side:
             # 麦克风原声也收进来,语言断言全被原声污染(2026-09-07 首跑实证)。
             if not getattr(track, "name", "").startswith("trans-"):
                 return
+            self.trans_names.add(track.name)
             print(f"  [track] {self.identity} <- {track.name}", flush=True)
 
             async def _read():
@@ -152,7 +157,9 @@ class Side:
             pass
 
 
-async def wait_translated(captured: bytearray, mark: int, want_tag: str, timeout_s: float) -> tuple[bool, str, str]:
+async def wait_translated(
+    captured: bytearray, mark: int, want_tag: str, timeout_s: float, trans_names: set[str] | None = None
+) -> tuple[bool, str, str]:
     """等 captured 自 mark 起出现语音，收够后 ASR 回读断言目标语。"""
     deadline = time.perf_counter() + timeout_s
     speech = 0.0
@@ -168,6 +175,19 @@ async def wait_translated(captured: bytearray, mark: int, want_tag: str, timeout
         await asyncio.sleep(0.2)
     # 语音出现后再收 3s（翻译音频可能分句到达）
     await asyncio.sleep(3.0)
+    if not READBACK:
+        # 压测档（2026-09-24）：回读 ASR 与四条真会话挤同一条 :8787 解码队列,
+        # 并发腿必超时(ReadTimeout 实证)——语言断言改走翻译音轨名 trans-<lang>
+        # (解释器发布即定性),音频到达断言保留(能量窗)。零 ASR 占用。
+        # tag→音轨后缀归一（2026-09-25 修）：fwd_expect 是 ASR 语言名(English/
+        # Chinese/Cantonese),音轨名是 trans-<规范后缀>——旧直拼匹配令 en 方向
+        # I1/I3/I4 恒败(canto 碰巧子串成立),非产品问题。
+        _tag = {"english": "en", "chinese": "zh", "mandarin": "zh",
+                "cantonese": "cantonese"}.get(
+                    want_tag.lower().strip(), want_tag.lower().strip())
+        ok = speech >= 1.2 and any(
+            f"trans-{_tag}" in n.lower() for n in (trans_names or set()))
+        return ok, "skip-readback", ""
     lang, text = asr_transcribe(bytes(captured[mark:]))
     # 严格语言断言（len 兜底会让原声泄漏蒙混过关,已删）
     ok = bool(text) and want_tag.lower() in (lang or "").lower()
@@ -204,13 +224,13 @@ async def run_one(
         # fwd：me 说 {language} → other 听 {target_lang}（ASR 回读断言目标语标签）
         mark_other = len(other.captured)
         await me.push(src_pcm)
-        ok, lang, text = await wait_translated(other.captured, mark_other, fwd_expect, timeout_s)
+        ok, lang, text = await wait_translated(other.captured, mark_other, fwd_expect, timeout_s, other.trans_names)
         info["fwd_ok"], info["fwd_text"] = ok, text[:60]
         # rev：other 说 {target_lang} → me 听 {language}
         if rev_pcm is not None:
             mark_me = len(me.captured)
             await other.push(rev_pcm)
-            ok2, lang2, text2 = await wait_translated(me.captured, mark_me, rev_expect, timeout_s)
+            ok2, lang2, text2 = await wait_translated(me.captured, mark_me, rev_expect, timeout_s, me.trans_names)
             info["rev_ok"], info["rev_text"] = ok2, text2[:60]
     finally:
         await me.close()

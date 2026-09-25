@@ -308,6 +308,13 @@ def build_engine() -> Engine | None:
                 # models.GlobalSetting.sms_json server 侧同形（同 campaign_json 先例）。
                 _ensure_column(conn, "global_settings", "sms_json",
                                "sms_json TEXT NOT NULL DEFAULT ''")
+                # 模型路由统一（2026-09-25 阶段 0）：五车道（a_reply/judge/mt/
+                # settle/mining）本地↔云端路由表 + 档位预置，契约单点在
+                # packages/core/bok_voice_core/model_routes.py。空 blob=全 local
+                # （env 缺省链），读侧零配置即用；DDL 同 sms_json/campaign_json
+                # 先例（TEXT NOT NULL DEFAULT ''，SQLite/PG 双认，方言门禁）。
+                _ensure_column(conn, "global_settings", "model_routing_json",
+                               "model_routing_json TEXT NOT NULL DEFAULT ''")
                 # 同义簇(qa-canvas Phase1,spec 2026-09-17):qa_entries 变体指向
                 # 簇头条目——''=独立条目/簇头本体,非空=本条是指向条目的变体。
                 _ensure_column(
@@ -578,3 +585,66 @@ def build_session_factory(engine: Engine | None = None):
     from sqlalchemy.orm import sessionmaker
 
     return sessionmaker(bind=engine, expire_on_commit=False, future=True)
+
+
+# ---- 模型路由存储（2026-09-25 阶段 0，CP 进程内消费面）----
+# global_settings.model_routing_json 列不进仓库层 get/save_settings（业务库包不
+# 随本改动动列语义），CP 侧经这里直读直写。SQL 路径用 session factory（main
+# startup 绑定，与 repo 同一 engine）；engine=None（单机内存形态/tests）回落
+# 模块级内存——与 InMemoryBusinessRepository 同生命周期，行为对齐。
+
+_ROUTING_ROW_ID = "global"
+_routing_state: dict = {"session_factory": None, "memory": ""}
+
+
+def bind_routing_storage(session_factory) -> None:
+    """main startup 调用：绑定与 repo 同 engine 的 session factory（None=内存态）。"""
+    _routing_state["session_factory"] = session_factory
+
+
+def read_model_routing_raw() -> str:
+    """读路由表原始 JSON 串（空串=未配置，parse_routing 宽容面接管）。读失败软回落。"""
+    factory = _routing_state["session_factory"]
+    if factory is None:
+        return str(_routing_state["memory"] or "")
+    from sqlalchemy import text
+
+    try:
+        with factory() as session:
+            row = session.execute(
+                text("SELECT model_routing_json FROM global_settings WHERE id = :gid"),
+                {"gid": _ROUTING_ROW_ID},
+            ).fetchone()
+        return str(row[0] or "") if row else ""
+    except Exception as exc:  # pragma: no cover - 读失败不破坏结算/挖掘主链
+        print(f"[deps] model_routing read skipped: {exc!r}")
+        return ""
+
+
+def write_model_routing_raw(raw: str) -> None:
+    """写路由表原始 JSON 串（幂等 upsert：行缺省时补一行业务默认值的全行）。"""
+    raw = str(raw or "")
+    factory = _routing_state["session_factory"]
+    if factory is None:
+        _routing_state["memory"] = raw
+        return
+    from sqlalchemy import text
+
+    from bok_voice_business_db.repository import SqlAlchemyBusinessRepository
+
+    with factory() as session:
+        row = session.execute(
+            text("SELECT id FROM global_settings WHERE id = :gid"), {"gid": _ROUTING_ROW_ID}
+        ).fetchone()
+        if row is None:
+            # 行缺省=先经 ORM 落一行业务默认值（default_settings 全段 JSON；
+            # updated_at 等 nullable/DateTime 类型由 ORM 兜住，SQLite/PG 双认），
+            # 再原位 UPDATE 路由列——不手写跨方言 INSERT，避免与 ORM 默认值漂移
+            # （首版手写 INSERT 曾漏 updated_at NOT NULL，SQLite 冒烟实证）。
+            repo = SqlAlchemyBusinessRepository(factory())
+            repo.save_settings(dict(repo.get_settings()))
+        session.execute(
+            text("UPDATE global_settings SET model_routing_json = :raw WHERE id = :gid"),
+            {"raw": raw, "gid": _ROUTING_ROW_ID},
+        )
+        session.commit()

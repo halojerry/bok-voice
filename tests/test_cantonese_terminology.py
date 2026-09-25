@@ -30,6 +30,10 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     "tests/test_control_plane.py": None,
     "apps/agent/agent_runtime/web_search.py": re.compile(r"zh-yue"),
     "tests/test_web_search.py": re.compile(r"zh-yue"),
+    # whisper 语言码外部枚举（OpenAI/whisper 粤语=language "yue"，与 zh/en
+    # 同族 API 真字面量）——asr_whisper_bench.py 是 bench 脚本，yue 只出现在
+    # 语言码映射/转写调用/报告行，语言字段本身仍一律 cantonese。
+    "scripts/asr_whisper_bench.py": re.compile(r"yue"),
     # MiniMax language_boost 外部枚举(API 真字面量,粤=普+粤标记);只豁免带该
     # 枚举值的行,语言字段本身仍一律 cantonese。A 线 agent.py 同源注入
     # (per-call 固定语言,B 线 interpret 同值)。

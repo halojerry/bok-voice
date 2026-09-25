@@ -105,7 +105,15 @@ class TTSService:
 
             device = self._resolve_device()
             dtype = torch.bfloat16 if device in ("cuda", "mps") else torch.float32
+            # CUDA 档优先 FA2;包缺席(容器/裸 Linux 常态)回落 SDPA——fa2 需源码编译,
+            # 装不上不应令整个 sidecar 起不来(transformers 侧 ImportError 实证
+            # 2026-09-24 CUDA 节点首部署)。SDPA 在 4090 上对 1.7B TTS 前向足够。
             attn = "flash_attention_2" if device == "cuda" else "sdpa"
+            if attn == "flash_attention_2":
+                try:
+                    import flash_attn  # noqa: F401
+                except ImportError:
+                    attn = "sdpa"
             self._preset_model = Qwen3TTSModel.from_pretrained(
                 DEFAULT_PRESET_MODEL,
                 device_map=device,
@@ -919,6 +927,14 @@ async def audio_speech(payload: dict[str, Any]) -> Response:
     do_sample = payload.get("do_sample")
     temperature = payload.get("temperature")
     top_k = payload.get("top_k")
+
+    # 就绪前置检查（**必须在返回 StreamingResponse 之前**）。旧版只在生成器内部
+    # `ensure_loaded()`：那时响应头已发出、状态码已定 200，抛出的 503 改不了状态，
+    # 只剩「HTTP 200 + 0 字节音频」——2026-09-21 实证踩到：模型路径解析到一个只有
+    # `.cache/` 的空壳目录 → 解析失败 → 三个 E2E 探针收到的客户话音是**空的**，
+    # 表面症状是「agent 听不到客户、全轮哑」，查了半天才在 tts.log 里看到 traceback。
+    # 静默失败比报错贵得多，故提前到响应发出之前 fail-fast。
+    service.ensure_loaded()
 
     if streaming:
         async def _agen():

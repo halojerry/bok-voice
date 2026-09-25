@@ -31,6 +31,9 @@ ROADS = int(os.environ.get("LOAD_ROADS", "4"))
 TURNS = int(os.environ.get("LOAD_TURNS", "3"))
 LANG = os.environ.get("LOAD_LANG", "cantonese")
 AUDIO = os.environ.get("LOAD_AUDIO", "cantonese.wav")
+# 钉死话术模板（2026-09-24）：不设=CP 端 auto-pick（可能抓旧赔偿话术）；
+# 设 LOAD_TEMPLATE_ID=<id> → POST /api/calls 显式指定（与 e2e_real_customer 同源语义）。
+TEMPLATE_ID = os.environ.get("LOAD_TEMPLATE_ID", "").strip()
 
 
 def frame_rms(pcm: bytes) -> float:
@@ -62,11 +65,14 @@ async def road(idx: int, results: list) -> None:
         json={"name": "压测客服", "language": lang, "tone": "礼貌专业"},
         timeout=10,
     ).json()
+    call_body = {"account_id": "acc-001", "object_id": obj["id"], "persona_id": persona["id"],
+                 "mode": "live", "direction": "webrtc", "language": lang}
+    if TEMPLATE_ID:
+        call_body["template_id"] = TEMPLATE_ID
     call = httpx.post(
         f"{CONTROL_PLANE_URL}/api/calls",
         headers=_CP_HEADERS,
-        json={"account_id": "acc-001", "object_id": obj["id"], "persona_id": persona["id"],
-              "mode": "live", "direction": "webrtc", "language": lang},
+        json=call_body,
         timeout=10,
     ).json()
     room_name = call["id"]

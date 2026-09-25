@@ -76,6 +76,12 @@ def test_streaming_endpoint_closes_generator_in_producer_thread(monkeypatch):
 
     monkeypatch.setattr(tts_app.service, "synthesize_chunks", _fake_chunks)
 
+    # 2026-09-21 fail-fast 改动把 ensure_loaded() 提前到 streaming 分支之前
+    # （旧版 503 发不出、只剩「HTTP 200 + 0 字节音频」的静默故障——该改动有意为之）。
+    # 测试环境无模型,夹具须 stub 掉它,否则端点在到达被测的 producer 线程锁纪律
+    # 代码前就抛 503「model not loaded」,守卫跑不到（prod-readiness task-1 F1）。
+    monkeypatch.setattr(tts_app.service, "ensure_loaded", lambda: None)
+
     async def _drive():
         resp = await tts_app.audio_speech(
             {"input": "你好。", "language": "zh", "voice": "zh-female", "streaming": True}

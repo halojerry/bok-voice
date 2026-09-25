@@ -7,11 +7,11 @@
 --   schema 唯一真源 = packages/business-db ORM 模型 + deps.build_engine() 的幂等迁移;
 --   **改表后必须重跑本脚本重新生成**,再应用到 Supabase。
 --
--- 生成日期: 2026-09-19
+-- 生成日期: 2026-09-26
 -- 源镜像:   pgvector/pgvector:pg16
 -- 源命令:   docker exec pg-ddl pg_dump -U postgres --schema-only --no-owner --no-privileges postgres
 -- 回环校验: pgvector/pgvector:pg16 上应用本文件 + 重跑 build_engine() = 零 DDL 变更(生成时实测)
--- 规模:     CREATE TABLE 27 张 / CREATE INDEX 41 条 / 数据语句 0 条
+-- 规模:     CREATE TABLE 27 张 / CREATE INDEX 39 条 / 数据语句 0 条
 --           (--schema-only:正常应 0 条数据语句;带 DEFAULT/COMMENT 属 schema 本身)
 --
 -- 目标: 全新 Supabase(Postgres)项目首次引导。应用方式(Main 线程):
@@ -284,6 +284,7 @@ CREATE TABLE public.global_settings (
     sip_json text NOT NULL,
     campaign_json text DEFAULT ''::text NOT NULL,
     sms_json text DEFAULT ''::text NOT NULL,
+    model_routing_json text DEFAULT ''::text NOT NULL,
     policy character varying(64) NOT NULL,
     updated_at timestamp without time zone NOT NULL
 );

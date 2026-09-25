@@ -51,6 +51,8 @@ from agent_runtime.agent import (  # noqa: E402
     _nudge_line,
     _resolve_tts_voice_mode,
     _wa_number_line,
+    canned_cache_supported,
+    effective_tts_provider,
 )
 from agent_runtime.fillers import FILLER_ASSETS_DIR, load_manifest  # noqa: E402
 from agent_runtime.flow import (  # noqa: E402
@@ -367,10 +369,17 @@ def _qa_jobs(
             continue
         if all_personas:
             for persona in persona_pool:
+                # F-11 provider 闸:非 minimax 族的版本运行时查不到,不进计划。
+                if not canned_cache_supported(persona, tts_cfg):
+                    continue
                 if not _persona_resolved_voice(persona, lang, tts_cfg, voice_mode):
                     continue
                 jobs.append((persona, lang, text, ""))
         else:
+            persona = lang_personas.get(lang)
+            # F-11 provider 闸(同上):计划期剔除,物化零烧云。
+            if not canned_cache_supported(persona, tts_cfg):
+                continue
             jobs.append((lang_personas.get(lang), lang, text, ""))
     return jobs
 
@@ -410,18 +419,31 @@ def _qa_status(
             continue
         lang = _normalize_lang((e or {}).get("lang"), default="zh") or "zh"
         voices: list[str] = []
+        provider_off = False
         if all_personas:
             for persona in persona_pool:
+                # F-11 provider 闸:非 minimax 族的 persona 版本运行时查不到,不入候选。
+                if not canned_cache_supported(persona, tts_cfg):
+                    provider_off = True
+                    continue
                 v = _persona_resolved_voice(persona, lang, tts_cfg, voice_mode)
                 if v:
                     voices.append(v)
         else:
             persona = lang_personas.get(lang)
-            v = _persona_resolved_voice(persona, lang, tts_cfg, voice_mode)
-            if v:
-                voices.append(v)
+            if not canned_cache_supported(persona, tts_cfg):
+                provider_off = True
+            else:
+                v = _persona_resolved_voice(persona, lang, tts_cfg, voice_mode)
+                if v:
+                    voices.append(v)
         if not voices:
-            out[eid] = {"state": "missing", "voice": "", "key": ""}
+            entry = {"state": "missing", "voice": "", "key": ""}
+            # F-11 信息位:缺料原因是有效 provider 非 minimax 族(运行时无缓存链,
+            # 物化/补录都无效),与「缺录音」区分——运营先改 provider 再谈补录。
+            if provider_off:
+                entry["reason"] = "provider_off"
+            out[eid] = entry
             continue
         speed = minimax_speed_for(lang)
         state = "missing"
@@ -477,9 +499,12 @@ def _branch_status(
             rendered = render_template_text(_strip_branch_action(raw), {})
             if not rendered.strip() or re.search(r"\{[^{}]+\}", rendered):
                 continue  # ph 上下文:补录无效
-            voice = _persona_resolved_voice(
-                lang_personas.get(lang), lang, tts_cfg, voice_mode
-            )
+            persona = lang_personas.get(lang)
+            # F-11 provider 闸:非 minimax 族上下文运行时无缓存链,查不到任何键
+            # ——不算可合成上下文(qwen3 栈同一份 MiniMax 缓存在场也绝不报 ok)。
+            if not canned_cache_supported(persona, tts_cfg):
+                continue
+            voice = _persona_resolved_voice(persona, lang, tts_cfg, voice_mode)
             if not voice:
                 continue  # 无音色:运行时同样不查缓存
             synthable = True
@@ -543,6 +568,19 @@ async def _materialize(
             )
             map_cache[pk] = voice_map
         voice = _resolve_voice_map(voice_map, lang)
+        # F-11(2026-09-23)provider 闸:罐头缓存只挂 MiniMax 链——非 minimax 族
+        # 运行时(_tts_cache=None)结构性查不到任何键,物化=白烧云+状态面假 ok。
+        # 与 agent.canned_cache_supported 同一判据(单源),skip 不计 fail(非故障)。
+        if not canned_cache_supported(persona, tts_cfg):
+            skip += 1
+            records.append((persona, lang, voice, "skip"))
+            print(
+                f"SKIP_PROVIDER_OFF persona={pk[0]} lang={lang} "
+                f"provider={effective_tts_provider(persona, tts_cfg)} — "
+                "罐头缓存只挂 MiniMax 链,该 provider 下运行时查不到键,不物化不烧云",
+                flush=True,
+            )
+            continue
         if not voice:
             fail += 1
             records.append((persona, lang, "", "fail"))
@@ -680,6 +718,13 @@ async def main_async() -> int:
         )
         for lang in ("zh", "cantonese", "en")
     }
+    # F-11(2026-09-23)信息位:逐语言有效 TTS provider(与运行时 agent 装配同源
+    # 判据)。非 minimax 族=运行时无罐头缓存链,状态面的一切 ok/missing 都只是
+    # MiniMax 键位的读数,CP 端点顶层透传。
+    tts_provider_map: dict[str, str] = {
+        lang: effective_tts_provider(lang_personas.get(lang), tts_cfg)
+        for lang in ("zh", "cantonese", "en")
+    }
     # 按人设物化的人设池(fillers / qa --all-personas 共用):--persona 限单人人设,
     # 缺省=CP 全部人设(人设无 enabled 字段,在册即启用;无音色/无池者在计划期跳过)。
     if args.persona:
@@ -731,7 +776,8 @@ async def main_async() -> int:
                 model=model, sample_rate=sample_rate, cache=cache,
                 entry_ids=set(args.entry_id) if args.entry_id else None,
             )
-        print(json.dumps({"qa_status": status, "voice_source": voice_source}, ensure_ascii=False), flush=True)
+        print(json.dumps({"qa_status": status, "voice_source": voice_source,
+                          "tts_provider": tts_provider_map}, ensure_ascii=False), flush=True)
         return 0
 
     if args.branch_status:
@@ -744,7 +790,8 @@ async def main_async() -> int:
                 tts_cfg=tts_cfg, voice_mode=voice_mode, model=model, cache=cache,
                 texts=_load_texts_file(args.texts_file),
             )
-        print(json.dumps({"branch_status": status, "voice_source": voice_source}, ensure_ascii=False), flush=True)
+        print(json.dumps({"branch_status": status, "voice_source": voice_source,
+                          "tts_provider": tts_provider_map}, ensure_ascii=False), flush=True)
         return 0
 
     # 缓存目录须与运行时同根:BOK_TTS_CACHE_DIR 由 bok.py/调用方透传。

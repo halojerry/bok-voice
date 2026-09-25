@@ -116,6 +116,9 @@ MODELS: dict[str, dict[str, str]] = {
         # 这颗 9B——延迟不敏感的岗位吃大模型质量,与活通话的 4B(:1235)分进程,
         # 争用实测可控(9B 出 512-token 纪要时 4B 暖轮 +60ms/冷轮 +360ms,单篇
         # 纪要 4-9s)。可选:模型缺失时 :1237 不起,settle/judge 自动回退 :1235。
+        # 2026-09-25 实测否决 TheCluster-mxfp4 顶此岗:其 prefill 窗把 :1235
+        # 打到 41s、单篇纪要 48.5s(mxfp4 核慢)——Huihui-4bit 重下回归(同日其
+        # 权重被误删);TheCluster 只进 5.x 隔离 A/B,不进常驻车道。
         "settle": "huihui-ai/Huihui-Qwen3.5-9B-abliterated-mlx-4bit",
         # W1b 意图语义车道 embedding(:8789 sidecar,2026-09-23):bge-m3 4bit,
         # CLS+L2 池化(壳内自做——mlx-embeddings 0.1.0 硬编码 mean 池化)。
@@ -272,6 +275,18 @@ def _settle_llm_model(current: dict[str, str]) -> str:
     if override:
         return override
     return model_path(current, "settle")
+
+
+def _dev_9b_enabled() -> bool:
+    """9B 后台专线(:1237)是否随栈常驻：``BOK_DEV_9B=1`` 显式才拉，默认不启动。
+
+    为什么：9B 常驻=夜间崩速主犯之一（reports/latency-soak/LANE-AB-2026-09-25.md
+    附 3）——judge 9B 二号驻留与回复 4B(:1235) 共挤统一内存，swap 颠簸 + 闲置
+    权重页换出（一被触碰=页入 stall），in-call tps 4-12 vs 隔离 43-47。2026-09-25
+    起改 opt-in：内存让给 :1235 的 prompt cache；settle 纪要/judge 各自有 env
+    缺席回退链落 :1235（summarize.py / agent.py judge 均已核实）。读法与全仓
+    同款 ``os.environ.get(...) == "1"``。"""
+    return os.environ.get("BOK_DEV_9B", "") == "1"
 
 
 def sidecar_python(name: str) -> Path:
@@ -520,8 +535,8 @@ def _probe_worker(port: int, timeout: float = 3.0) -> tuple[bool, str]:
     """worker 真·健康探针:livekit-agents 在 worker 端口内建 GET /worker
     (worker_type/agent_name/sdk_version/worker_load)。TCP 探活对「进程在、
     没 register / 错码假活」不可见,必须读端点本体(2026-09-17 体检缺口)。
-    注意 1.8.0 payload 没有 active_jobs 字段——旧 prod status 打印它恒 None
-    属谎报,这里只打真实存在的字段。"""
+    版本注:1.8.2 payload 已含 active_jobs(worker.py:663-669,2026-09-25
+    审计复核)——如需恢复打印可直读该字段;此处维持最小字段面。"""
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/worker", timeout=timeout) as r:
             data = json.loads(r.read().decode())
@@ -1041,14 +1056,30 @@ def _control_plane_env(db: Path | str) -> dict[str, str]:
         "LIVEKIT_API_SECRET": os.environ.get("LIVEKIT_API_SECRET", "devsecret"),
         "MLX_LLM_BASE_URL": os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
         "MLX_LLM_MODEL": llm_model,
+        # mt 车道缺省(:1236,与 _interp_env 同源)：CP 自身不翻译,但模型路由测连
+        # 端点在 CP 进程内 resolve——缺这行 root 点 mt 测连恒 400「未配置显式
+        # 端点」而 MT 其实活着(2026-09-26 实弹发现)。
+        "MT_LLM_BASE_URL": os.environ.get("MT_LLM_BASE_URL", "http://127.0.0.1:1236/v1"),
     }
     # settle 专线(:1237,9B):Summarizer 优先吃这条——纪要/蒸馏係延迟不敏感的
     # 后台重活,大模型质量↑且与活通话的 :1235 隔离;模型不在盘不下发(注了会
     # 打死端口),Summarizer 走原链路回退 :1235。
+    # 9B 后端化（2026-09-25，LANE-AB-2026-09-25.md 附3：9B 常驻=夜间崩速主犯
+    # 之一——judge 二号驻留与回复车道共挤统一内存/swap 颠簸）：默认不随栈拉起
+    # 也不注入该键（Summarizer 回退 MLX 已核实）；外部显式设了 BOK_SETTLE_LLM_*
+    # 照传（云端纪要端点不受开关误伤）。BOK_DEV_9B=1 时行为与改造前逐字节相同。
     _settle = _settle_llm_model(_cur)
-    if _settle and Path(_settle).exists():
-        env["BOK_SETTLE_LLM_BASE_URL"] = os.environ.get("BOK_SETTLE_LLM_BASE_URL", "http://127.0.0.1:1237/v1")
-        env["BOK_SETTLE_LLM_MODEL"] = _settle
+    if _dev_9b_enabled():
+        if _settle and Path(_settle).exists():
+            env["BOK_SETTLE_LLM_BASE_URL"] = os.environ.get("BOK_SETTLE_LLM_BASE_URL", "http://127.0.0.1:1237/v1")
+            env["BOK_SETTLE_LLM_MODEL"] = _settle
+    else:
+        _ext_settle_url = os.environ.get("BOK_SETTLE_LLM_BASE_URL", "").strip()
+        if _ext_settle_url:
+            env["BOK_SETTLE_LLM_BASE_URL"] = _ext_settle_url
+            _ext_settle_model = os.environ.get("BOK_SETTLE_LLM_MODEL", "").strip()
+            if _ext_settle_model:
+                env["BOK_SETTLE_LLM_MODEL"] = _ext_settle_model
     # E7 离线润色面 kill-switch（2026-09-21）：唯一消费者是 **CP**（挂断后纪要输入 /
     # QA 挖掘 / L-① 漏网轮），故走这张 CP 面表显式下发（同 BOK_SETTLE_LLM_* 先例）——
     # prod launchd/schtasks 封闭 env 面不注入即死门。**不进 _FORWARD_ENV**：那张表是
@@ -1225,7 +1256,16 @@ def _start_settle_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> 
     与 judge 走各自 env 缺席链路回退 :1235;端口已健康不重复起。Qwen3.5 家族
     与主 LLM 同模板参数(关思考);纪要是单发长任务,8 槽 2GB cache 够用;
     log WARNING(后台作业,唔刷屏)。
+
+    9B 后端化(2026-09-25):默认不随栈常驻——9B 常驻=夜间崩速主犯之一
+    (reports/latency-soak/LANE-AB-2026-09-25.md 附3:judge 9B 二号驻留与回复
+    4B(:1235) 共挤统一内存,swap 满 + 闲置权重页换出,in-call tps 4-12 vs 隔离
+    43-47);内存让给 :1235 的 prompt cache。开发/排障要 9B 就 ``BOK_DEV_9B=1``
+    显式拉起;settle 纪要/judge 消费方各自有回退链,默认档零功能损失。
     """
+    if not _dev_9b_enabled():
+        print("[bok] 9B settle lane off (BOK_DEV_9B!=1) — skip :1237 (settle/judge fall back to :1235)", file=sys.stderr)
+        return False
     if healthy(1237):
         return True
     settle_model = _settle_llm_model(current)
@@ -1462,7 +1502,21 @@ def _apply_judge_env(env: dict[str, str], _cur: dict[str, str]) -> None:
     """flow judge 专线 env(:1237 9B):模糊轮判定係后台重活(fire-and-forget),
     大模型判定质量↑且与活通话回复的 :1235 完全隔离;模型缺失(不在盘)不下发,
     judge 走原链路 :1235(agent.py 的 FLOW_JUDGE_* 优先级空头自动回退)。
-    存在性检查必须有——注了 env 而 :1237 没起,judge 请求会打上死端口。"""
+    存在性检查必须有——注了 env 而 :1237 没起,judge 请求会打上死端口。
+
+    9B 后端化(2026-09-25,LANE-AB-2026-09-25.md 附3):9B 常驻=夜间崩速主犯之一
+    ——judge 9B 二号驻留与回复车道共挤统一内存,swap 颠簸下 in-call tps 4-12。
+    默认(:1237 不拉)不注入该键,judge 回退链落 MLX :1235(agent.py
+    ``FLOW_JUDGE_LLM_BASE_URL or MLX_LLM_BASE_URL`` 已核实);外部显式设了照传
+    (云端 judge 钩子不受开关误伤)。BOK_DEV_9B=1 时行为与改造前逐字节相同。"""
+    if not _dev_9b_enabled():
+        _ext_judge_url = os.environ.get("FLOW_JUDGE_LLM_BASE_URL", "").strip()
+        if _ext_judge_url:
+            env["FLOW_JUDGE_LLM_BASE_URL"] = _ext_judge_url
+            _ext_judge_model = os.environ.get("FLOW_JUDGE_LLM_MODEL", "").strip()
+            if _ext_judge_model:
+                env["FLOW_JUDGE_LLM_MODEL"] = _ext_judge_model
+        return
     _settle = _settle_llm_model(_cur)
     if _settle and Path(_settle).exists():
         env["FLOW_JUDGE_LLM_BASE_URL"] = os.environ.get("FLOW_JUDGE_LLM_BASE_URL", "http://127.0.0.1:1237/v1")
@@ -1549,6 +1603,9 @@ _FORWARD_ENV = (
     "FLOW_JUDGE_DELAY",
     "FLOW_JUDGE_IDLE_CAP",
     "FLOW_JUDGE_LLM_API_KEY",
+    # —— 模型路由统一 kill-switch（2026-09-25 阶段 0：packages/core/model_routes.py
+    #    契约在读，="0" 忽略路由表字节同旧；进表=dev/prod 双面都可达） ——
+    "BOK_MODEL_ROUTING",
     "FLOW_LLM_ADVANCE",
     "BOK_PERCEIVED_BUDGET_MS",
     "BOK_MAX_CALL_DURATION_S",
@@ -1629,6 +1686,7 @@ _FORWARD_ENV = (
     # LLM 生成链调参/诊断（livekit_plugins.py MlxLlmLLM/ContextAwareLLM 读面）：
     "BOK_LLM_MSG_DEBUG",
     "BOK_LLM_REGEN",
+    "BOK_A_LINE_VOICE_TAGS",
     "BOK_REPEAT_GUARD",
     "BOK_TAIL_SLIM",
     "EMOTION_TAG_PROMPT",
@@ -1925,7 +1983,30 @@ def _cp_active_calls() -> int | None:
 _MONITOR_CP_ACTIVE_URL = "http://127.0.0.1:8000/api/calls?status=active"
 
 _DOWN_STREAK_NEED_IDLE = 2  # 连续 ≥2 轮(≥10s)探不上才判 down(无通话在途)
-_DOWN_STREAK_NEED_ACTIVE = 12  # 有通话在途:≥12 轮(≥60s)——绝不因卡顿误杀在途通话
+# G3 硬 veto(2026-09-25)取代旧「有通话在途门槛抬到 12 轮(≥60s)」：在途通话
+# >0 时**任何探活失败都不杀**——12 轮抬门槛仍有误杀窗（LANE-AB-2026-09-25.md
+# 附3：swap 颠簸下 offscript 窗 worker 被误杀 ×7，respawn 244 行）。该常量仅
+# 剩 veto 打点节奏用途（长 veto 窗每 12 轮≈60s 提醒一次，防静默）。
+_DOWN_STREAK_NEED_ACTIVE = 12
+
+
+def _monitor_kill_round(streak: int, active_calls: int | None) -> tuple[bool, bool]:
+    """单 worker 连续探活失败的处置判定（纯函数，monitor 环与单测共用）。
+
+    返回 ``(kill, veto_log)``：
+    - ``kill``：本轮该补拉。``active_calls>0`` 时恒 False——硬 veto 关死误杀窗
+      （活 worker 卡顿多惨都唔杀，真死 worker 等场景间隙 active 归零立刻补拉，
+      连续计数在 veto 窗内照涨所以不丢窗口）；active 为 0/None 时按 idle 门槛。
+      CP 不可达（None）= 退回无通话口径（与旧 ``if active`` 判例一致）。
+    - ``veto_log``：该打 veto 打点——streak 首过 idle 门槛时一次，此后每
+      ``_DOWN_STREAK_NEED_ACTIVE`` 轮提醒一次（长 veto 窗不静默也不刷屏）。
+    """
+    if not active_calls:
+        return streak >= _DOWN_STREAK_NEED_IDLE, False
+    veto_log = streak == _DOWN_STREAK_NEED_IDLE or (
+        streak > _DOWN_STREAK_NEED_IDLE and streak % _DOWN_STREAK_NEED_ACTIVE == 0
+    )
+    return False, veto_log
 
 
 def cmd_monitor() -> int:
@@ -1933,8 +2014,13 @@ def cmd_monitor() -> int:
     掉线→补拉。9/12 11:52-12:05 实证:livekit 重启后 worker 注册全丢,
     「no worker is available」连 4 通 0 轮、无人补拉;serve 一次性返回管唔到。
     2026-09-17 重排:探不上→respawn 改连续失败计数(单轮 1s TCP 探测在 GPU
-    满载下係常态误报),且 CP 报有在途通话时门槛 2→12 轮——绝不因卡顿误杀
-    在途通话。
+    满载下係常态误报)。
+    2026-09-25 G3 重排(LANE-AB-2026-09-25.md 附3):①探活从 1s TCP 换成真
+    GET :port/worker 端点(_probe_worker 与 prod status 同源单点)——TCP UP 对
+    「进程在、没 register/假活」不可见,1s 窗在 swap 颠簸下还假死(offscript
+    窗误杀 ×7 根因);②active_calls>0 时**任何探活失败都不杀**(硬 veto,取代
+    12 轮/60s 抬门槛——swap 颠簸可连吃 60s,门槛抬得再高也有窗,veto 先生才
+    关死);CP 不可达退回无通话口径。
     """
     py = repo_python()
     run_dir = app_data_dir() / "run"
@@ -1978,16 +2064,26 @@ def cmd_monitor() -> int:
                 need = _DOWN_STREAK_NEED_ACTIVE if active else _DOWN_STREAK_NEED_IDLE
                 down: list[dict] = []
                 for spec in specs:
-                    if healthy(spec["port"]):
+                    # 真端点探针:与 prod status/_probe_worker 同源单点(见 docstring G3①)。
+                    ok, _detail = _probe_worker(spec["port"])
+                    if ok:
                         down_streak[spec["name"]] = 0
-                    else:
-                        down_streak[spec["name"]] = down_streak.get(spec["name"], 0) + 1
-                        if down_streak[spec["name"]] >= need:
-                            down.append(spec)
+                        continue
+                    streak = down_streak.get(spec["name"], 0) + 1
+                    down_streak[spec["name"]] = streak
+                    kill, veto_log = _monitor_kill_round(streak, active)
+                    if veto_log:
+                        print(
+                            f"[monitor] worker {spec['name']} probe failed x{streak} "
+                            f"but active_calls={active}, veto kill"
+                        )
+                    if kill:
+                        down.append(spec)
                 if down and time.monotonic() - last_action >= 30.0:
                     # 单 worker 真 down 补拉;全 down 逐个 kill+start(端口已死,
-                    # 无需 _respawn 的集体 kill-then-wait)。有通话在途时 need=12,
-                    # 活 worker 的卡顿探不上永远攒不满 60s——在途通话唔会陪葬。
+                    # 无需 _respawn 的集体 kill-then-wait)。有通话在途时硬 veto
+                    # (G3②):kill 恒 False、streak 照涨——通话一结束(active 归零)
+                    # 真死 worker 立刻补拉,活 worker 的瞬态卡顿永不触发。
                     last_action = time.monotonic()
                     for spec in down:
                         down_streak[spec["name"]] = 0

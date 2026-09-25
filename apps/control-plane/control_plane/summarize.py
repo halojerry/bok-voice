@@ -12,6 +12,9 @@ import httpx
 # 逐字不碰——那是原始证据面。kill-switch ``BOK_POLISH_OFFLINE`` 默认关（见
 # ``polish_wiring`` 模块 docstring 的实测理由）。
 from bok_voice_core.polish_wiring import polish_offline_text
+from bok_voice_core.model_routes import PROVIDER_OPENAI, resolve_route
+
+from .deps import read_model_routing_raw
 
 
 _SYSTEM = (
@@ -73,16 +76,47 @@ class Summarizer:
             env_model = (os.environ.get("MLX_LLM_MODEL") or "").strip()
             if env_base and env_model:
                 base_url, model = env_base, env_model
+        # 模型路由合流（2026-09-25 阶段 0，settle 车道）。铁律：路由表未命中
+        # （空表/kill-switch → source=="env"）时上面的 env 链路逐字节不动；仅
+        # source=="routing" 命中才覆盖端点——openai 云端档吃 base_url/model/
+        # api_key + enable_thinking；local 档显式改端点（model 空沿用现值）。
+        api_key = ""
+        enable_thinking = False
+        route = resolve_route("settle", os.environ, read_model_routing_raw())
+        if route.source == "routing":
+            if route.provider == PROVIDER_OPENAI:
+                base_url, model = route.base_url, route.model
+                api_key, enable_thinking = route.api_key, route.enable_thinking
+            elif route.base_url:
+                base_url = route.base_url.rstrip("/")
+                if route.model:
+                    model = route.model
+            else:
+                # 路由 local 档未给端点（手改列坏数据）=视同未命中，走上面 env 链。
+                pass
         if not base_url or not model:
             return self._fallback(turns)
         try:
             system = _SYSTEM_INTERP if str(call.get("kind") or "") == "interpret" else _SYSTEM
-            return self._via_llm(base_url, model, transcript, call, system)
+            return self._via_llm(
+                base_url, model, transcript, call, system,
+                api_key=api_key, enable_thinking=enable_thinking,
+            )
         except Exception as exc:  # pragma: no cover - model/network failure
             print(f"[summarize] LLM summary failed, falling back: {exc!r}", flush=True)
             return self._fallback(turns)
 
-    def _via_llm(self, base_url: str, model: str, transcript: str, call: dict, system: str = _SYSTEM) -> dict:
+    def _via_llm(
+        self,
+        base_url: str,
+        model: str,
+        transcript: str,
+        call: dict,
+        system: str = _SYSTEM,
+        *,
+        api_key: str = "",
+        enable_thinking: bool = False,
+    ) -> dict:
         payload = {
             "model": model,
             "messages": [
@@ -96,7 +130,22 @@ class Summarizer:
             "temperature": 0.2,
             "stream": False,
         }
-        r = httpx.post(f"{base_url}/chat/completions", json=payload, timeout=self.timeout)
+        # enable_thinking 只在 True 时附加（OpenAI 兼容端点的扩展字段；本地 mlx
+        # 档不附带——env 链请求体与改造前逐字节一致，Qwen3.5 思考陷阱见计划 §2.2）。
+        if enable_thinking:
+            payload["enable_thinking"] = True
+        # api_key 仅云端档携带（本地档 "mlx" 不塞请求头——契约 model_routes 注释）。
+        # env 链（api_key=""）保持与改造前**同一调用形状**（不带 headers 参）——
+        # 测试面 monkeypatch httpx.post 的窄签名不破（test_summarize 实证）。
+        if api_key:
+            r = httpx.post(
+                f"{base_url}/chat/completions",
+                json=payload,
+                timeout=self.timeout,
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+        else:
+            r = httpx.post(f"{base_url}/chat/completions", json=payload, timeout=self.timeout)
         r.raise_for_status()
         content = r.json()["choices"][0]["message"].get("content", "")
         return self._parse(content)

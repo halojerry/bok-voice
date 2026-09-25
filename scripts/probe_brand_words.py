@@ -32,6 +32,12 @@ CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
 TTS_URL = os.environ.get("TTS_URL", "http://127.0.0.1:8788")
 TAG = os.environ.get("PROBE_TAG", "baseline")
 
+# auth-on 栈适配（e2e_real_customer.CP_HEADERS 同款，2026-09-24）：本文件自带
+# 的 CP 调用点补 Bearer；erc 骨架调用点由 erc 自带。
+CP_HEADERS: dict[str, str] = {}
+if os.environ.get("BOK_CP_TOKEN", "").strip():
+    CP_HEADERS["Authorization"] = f"Bearer {os.environ['BOK_CP_TOKEN'].strip()}"
+
 # 品牌句：词内含三字品牌词，粤/普各两条；品牌词放句中（最易被切的位置）。
 CASES: list[dict] = [
     {"lang": "zh", "text": "我在拼多多买的东西还没有到货", "brand": "拼多多"},
@@ -72,7 +78,7 @@ async def push_pcm(audio_source: rtc.AudioSource, pcm: bytes) -> None:
 
 
 def turns_of(call_id: str) -> list[dict]:
-    return httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", timeout=10).json()
+    return httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", timeout=10, headers=CP_HEADERS).json()
 
 
 async def make_call(courier: str = "") -> tuple[str, rtc.Room, rtc.AudioSource, bytearray]:
@@ -81,21 +87,21 @@ async def make_call(courier: str = "") -> tuple[str, rtc.Room, rtc.AudioSource, 
     obj = httpx.post(
         f"{CONTROL_PLANE_URL}/api/objects?account_id=acc-001",
         json={"display_name": f"探针-品牌-{ts}", "role_template": "buyer", "language": "cantonese", "background": "probe", "courier": courier},
-        timeout=10,
+        timeout=10, headers=CP_HEADERS,
     ).json()
     persona = httpx.post(
         f"{CONTROL_PLANE_URL}/api/personas",
         json={"name": f"探针客服品牌{ts}", "language": "cantonese", "tone": "礼貌专业"},
-        timeout=10,
+        timeout=10, headers=CP_HEADERS,
     ).json()
     call = httpx.post(
         f"{CONTROL_PLANE_URL}/api/calls",
         json={"account_id": "acc-001", "object_id": obj["id"], "persona_id": persona["id"],
               "mode": "live", "direction": "webrtc", "language": "cantonese"},
-        timeout=10,
+        timeout=10, headers=CP_HEADERS,
     ).json()
     call_id = call["id"]
-    data = httpx.post(f"{CONTROL_PLANE_URL}/api/token", json={"account_id": "acc-001", "call_id": call_id}, timeout=10).json()
+    data = httpx.post(f"{CONTROL_PLANE_URL}/api/token", json={"account_id": "acc-001", "call_id": call_id}, timeout=10, headers=CP_HEADERS).json()
     room = rtc.Room()
     await room.connect(data["serverUrl"], data["participantToken"])
     audio_source = rtc.AudioSource(sample_rate=16000, num_channels=1)
@@ -206,7 +212,7 @@ async def main() -> int:
                 )
         await room.disconnect()
         try:
-            httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/hangup", timeout=10)
+            httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/hangup", timeout=10, headers=CP_HEADERS)
         except Exception:
             pass
     single = sum(1 for r in results if r["intact_single"])

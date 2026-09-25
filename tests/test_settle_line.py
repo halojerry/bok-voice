@@ -28,10 +28,12 @@ def test_settle_model_env_override(monkeypatch):
 
 
 def test_apply_judge_env_present_and_absent(monkeypatch, tmp_path):
-    """模型在盘 → 注入 FLOW_JUDGE_*(:1237);不在盘 → 不注入(零配置回退 :1235)。"""
+    """BOK_DEV_9B=1 且模型在盘 → 注入 FLOW_JUDGE_*(:1237);不在盘 → 不注入
+    (零配置回退 :1235)。默认(9B 后端化,2026-09-25)不注入——9B 不随栈常驻。"""
     fake = tmp_path / "fake-settle-model"
     fake.mkdir()
     monkeypatch.setenv("BOK_SETTLE_LLM_MODEL", str(fake))
+    monkeypatch.setenv("BOK_DEV_9B", "1")
     env: dict[str, str] = {}
     bok._apply_judge_env(env, bok.MODELS["mac"])
     assert env.get("FLOW_JUDGE_LLM_BASE_URL") == "http://127.0.0.1:1237/v1"
@@ -43,15 +45,30 @@ def test_apply_judge_env_present_and_absent(monkeypatch, tmp_path):
     assert "FLOW_JUDGE_LLM_BASE_URL" not in env2
     assert "FLOW_JUDGE_LLM_MODEL" not in env2
 
+    # 9B 后端化默认档:模型在盘也不注入(不随栈拉起,judge 落 :1235)。
+    monkeypatch.delenv("BOK_DEV_9B", raising=False)
+    monkeypatch.setenv("BOK_SETTLE_LLM_MODEL", str(fake))
+    env3: dict[str, str] = {}
+    bok._apply_judge_env(env3, bok.MODELS["mac"])
+    assert "FLOW_JUDGE_LLM_BASE_URL" not in env3
+    assert "FLOW_JUDGE_LLM_MODEL" not in env3
+
 
 def test_control_plane_env_carries_settle(monkeypatch, tmp_path):
-    """CP env 带 BOK_SETTLE_*:Summarizer 专线入口(bok.py 注入面)。"""
+    """CP env 带 BOK_SETTLE_*:Summarizer 专线入口(bok.py 注入面);9B 后端化后
+    需 BOK_DEV_9B=1 显式开(默认档不注入,Summarizer 回退 MLX)。"""
     fake = tmp_path / "fake-settle-model"
     fake.mkdir()
     monkeypatch.setenv("BOK_SETTLE_LLM_MODEL", str(fake))
+    monkeypatch.setenv("BOK_DEV_9B", "1")
     env = bok._control_plane_env(tmp_path / "x.db")
     assert env.get("BOK_SETTLE_LLM_BASE_URL") == "http://127.0.0.1:1237/v1"
     assert env.get("BOK_SETTLE_LLM_MODEL") == str(fake)
+    # 默认档(9B 关):不注入。
+    monkeypatch.delenv("BOK_DEV_9B", raising=False)
+    env_off = bok._control_plane_env(tmp_path / "x.db")
+    assert "BOK_SETTLE_LLM_BASE_URL" not in env_off
+    assert "BOK_SETTLE_LLM_MODEL" not in env_off
 
 
 def test_prompt_cache_bytes_tiers(monkeypatch):

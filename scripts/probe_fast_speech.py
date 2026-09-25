@@ -43,22 +43,23 @@ async def run_case(case: dict) -> dict:
         json={"display_name": f"探针-快语速-{ts}", "role_template": "buyer",
               "language": case.get("lang", "zh"), "background": "probe",
               "courier": case.get("courier", "")},
-        timeout=10,
+        timeout=10, headers=pb.CP_HEADERS,
     ).json()
     persona = httpx.post(
         f"{CONTROL_PLANE_URL}/api/personas",
         json={"name": f"探针客服快语速{ts}", "language": case.get("lang", "zh"), "tone": "礼貌专业"},
-        timeout=10,
+        timeout=10, headers=pb.CP_HEADERS,
     ).json()
     call = httpx.post(
         f"{CONTROL_PLANE_URL}/api/calls",
         json={"account_id": "acc-001", "object_id": obj["id"], "persona_id": persona["id"],
               "mode": "live", "direction": "webrtc", "language": case.get("lang", "zh")},
-        timeout=10,
+        timeout=10, headers=pb.CP_HEADERS,
     ).json()
     call_id = call["id"]
     data = httpx.post(f"{CONTROL_PLANE_URL}/api/token",
-                      json={"account_id": "acc-001", "call_id": call_id}, timeout=10).json()
+                      json={"account_id": "acc-001", "call_id": call_id}, timeout=10,
+                      headers=pb.CP_HEADERS).json()
     from livekit import rtc
 
     room = rtc.Room()

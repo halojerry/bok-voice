@@ -1,8 +1,24 @@
 from __future__ import annotations
 
+import asyncio
 import os
+from collections import deque
 
 import httpx
+
+# M-30 turns 断窗重放（2026-09-23 修复波#2，task-9 腿 9.6 实证 ~14 轮永久丢）：
+# add_turn 失败（连接错误/5xx/429）→ 本地有界暂存 + 背景重放，CP 恢复按序补齐。
+# 重放周期有界（连续失败 _TURN_REPLAY_MAX_ATTEMPTS 次收工），下次 add_turn 失败
+# 再踢新周期——CP 长断窗自愈不跑飞。4xx 不重放（404 已删单/401 鉴权，重放无益）。
+# 杀开关 BOK_TURNS_REPLAY（默认 "1"；"0"=回旧行为失败即抛，调用方 REPORT_TASK_ERR）。
+# 乱序口径（fix round 1 评审 Minor-3）：断窗恢复的混合窗内，重放补交与直投新轮
+# 交错 → CP 侧 turns 到达序可能与生成序不一致（重放组内部恒按原序）。仅影响
+# 「断窗+恢复」混合窗内按到达序做配对/排序的下游；相比修复前整段永久丢失，属
+# 可接受权衡——CP 侧展示/学习账本以单客户端到达序为准，读侧如需生成序请用
+# started_ms/ended_ms 轮时间轴列。
+_TURN_SPOOL_MAX = 512
+_TURN_REPLAY_BACKOFF_S = 2.0
+_TURN_REPLAY_MAX_ATTEMPTS = 5
 
 
 class ControlPlaneClient:
@@ -24,6 +40,11 @@ class ControlPlaneClient:
         if cp_token:
             headers["Authorization"] = f"Bearer {cp_token}"
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=15, headers=headers)
+        # M-30：turns 断窗暂存（(url, params) 对）+ 单飞重放任务强引用（防 GC 中途
+        # 回收——同 _SETTLE_TASKS 教训）。进程内即可，不必落盘（brief 拍板）。
+        self._turn_replay_enabled = os.environ.get("BOK_TURNS_REPLAY", "1") != "0"
+        self._turn_spool: deque = deque()
+        self._replay_task: asyncio.Task | None = None
 
     async def get_call(self, call_id: str) -> dict:
         r = await self._client.get(f"/api/calls/{call_id}")
@@ -60,6 +81,57 @@ class ControlPlaneClient:
         r.raise_for_status()
         return r.json()
 
+    async def _post_turn_once(self, url: str, params: dict) -> httpx.Response:
+        r = await self._client.post(url, params=params)
+        if r.status_code >= 500 or r.status_code == 429:
+            raise httpx.HTTPStatusError(
+                f"turns post {r.status_code}", request=r.request, response=r
+            )
+        return r
+
+    def _spool_turn(self, url: str, params: dict, reason: str) -> None:
+        if len(self._turn_spool) >= _TURN_SPOOL_MAX:
+            self._turn_spool.popleft()  # drop-oldest：长断窗丢最旧，新轮保命
+            print("TURNS_REPLAY overflow dropped oldest", flush=True)
+        self._turn_spool.append((url, params))
+        print(
+            f"TURNS_REPLAY spooled n={len(self._turn_spool)} ({reason})",
+            flush=True,
+        )
+        self._kick_replay()
+
+    def _kick_replay(self) -> None:
+        if self._replay_task is not None and not self._replay_task.done():
+            return
+        self._replay_task = asyncio.get_running_loop().create_task(self._replay_loop())
+
+    async def _replay_loop(self) -> None:
+        failures = 0
+        while self._turn_spool:
+            if failures:
+                await asyncio.sleep(min(_TURN_REPLAY_BACKOFF_S * failures, 8.0))
+            url, params = self._turn_spool[0]
+            try:
+                await self._post_turn_once(url, params)
+            except (httpx.RequestError, httpx.HTTPStatusError):
+                failures += 1
+                if failures >= _TURN_REPLAY_MAX_ATTEMPTS:
+                    print(
+                        "TURNS_REPLAY cycle exhausted "
+                        f"n={len(self._turn_spool)} — next turn failure re-kicks",
+                        flush=True,
+                    )
+                    return
+                continue
+            except RuntimeError:
+                # 客户端已关（aclose 超时残尾，评审 Minor-4）：重试无意义，安静
+                # 收工防「Task exception was never retrieved」GC 噪声；暂存保留。
+                return
+            self._turn_spool.popleft()
+            failures = 0  # 恢复后零间歇连续清空（补交不逐条等退避）
+        if failures == 0:
+            print("TURNS_REPLAY drained", flush=True)
+
     async def add_turn(
         self,
         call_id: str,
@@ -82,24 +154,37 @@ class ControlPlaneClient:
         ended_ms: int = 0,
         perceived_ms: int = 0,
     ) -> None:
-        await self._client.post(
-            f"/api/calls/{call_id}/turns",
-            params={
-                "role": role,
-                "transcript": transcript,
-                "emotion": emotion,
-                "provider": provider,
-                "latency_ms": latency_ms,
-                "language": language,
-                "line": line,
-                "speaker": speaker,
-                "gen": gen,
-                "template_step": template_step,
-                "started_ms": started_ms,
-                "ended_ms": ended_ms,
-                "perceived_ms": perceived_ms,
-            },
-        )
+        url = f"/api/calls/{call_id}/turns"
+        params = {
+            "role": role,
+            "transcript": transcript,
+            "emotion": emotion,
+            "provider": provider,
+            "latency_ms": latency_ms,
+            "language": language,
+            "line": line,
+            "speaker": speaker,
+            "gen": gen,
+            "template_step": template_step,
+            "started_ms": started_ms,
+            "ended_ms": ended_ms,
+            "perceived_ms": perceived_ms,
+        }
+        if not self._turn_replay_enabled:
+            await self._client.post(url, params=params)  # 旧行为：单发即弃
+            return
+        try:
+            await self._post_turn_once(url, params)
+        except httpx.RequestError as exc:
+            self._spool_turn(url, params, repr(exc))
+        except httpx.HTTPStatusError:
+            # 4xx 不重放（404 已删单/401 鉴权——重放无益，与旧行为同弃）。
+            # _post_turn_once 只对 5xx/429 抛，故这里必是可重试态。
+            self._spool_turn(url, params, "server error")
+        else:
+            if self._turn_spool:
+                # 补交追平（CP 刚恢复）：成功轮也踢重放，不必等下一次失败。
+                self._kick_replay()
 
     async def settle(self, call_id: str) -> dict:
         r = await self._client.post(f"/api/calls/{call_id}/settle")
@@ -240,4 +325,15 @@ class ControlPlaneClient:
             pass
 
     async def aclose(self) -> None:
+        # M-30：会话收尾有界等待在途重放——断窗轮次尽力补交（CP 已恢复时通常
+        # 立即清空）；仍失败/超时则放弃（进程内暂存随进程消亡，不落盘）。
+        if self._turn_spool and (
+            self._replay_task is None or self._replay_task.done()
+        ):
+            self._kick_replay()  # 末轮补交窗：周期可能已收工，收尾再踢一次
+        if self._replay_task is not None and not self._replay_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(self._replay_task), timeout=5.0)
+            except Exception:  # noqa: BLE001 - 收尾 drain 尽力而为
+                pass
         await self._client.aclose()

@@ -124,7 +124,10 @@ def test_qa_jobs_default_one_persona_per_lang():
         "en": None,
     }
     jobs = pregen_tts._qa_jobs(
-        _QA_ROWS, [], lang_personas, all_personas=False, tts_cfg={}, voice_mode="single"
+        _QA_ROWS, [], lang_personas, all_personas=False,
+        # F-11:罐头缓存只挂 MiniMax 链,计划/物化测试一律显式 minimax 上下文
+        # (tts_cfg={} 缺省=qwen3_tts 运行时,job 会被 provider 闸剔除)。
+        tts_cfg={"provider": "minimax"}, voice_mode="single"
     )
     assert jobs == [
         (lang_personas["zh"], "zh", "我们九点上班。", ""),
@@ -138,7 +141,8 @@ def test_qa_jobs_all_personas_covers_every_persona_with_voice():
         {"id": "pcanto", "language": "cantonese", "reference_audio": '{"cantonese":"Vcanto"}'},
     ]
     jobs = pregen_tts._qa_jobs(
-        _QA_ROWS, personas, {}, all_personas=True, tts_cfg={}, voice_mode="per_language"
+        _QA_ROWS, personas, {}, all_personas=True,
+        tts_cfg={"provider": "minimax"}, voice_mode="per_language"
     )
     # zh 条目:pzh zh 键直取;pcanto 只有 cantonese 键、zh 请求解析为空 → 跳过
     # (「音色匹配条目语言」门:运行时音色为空同样不查缓存,物化无意义)。

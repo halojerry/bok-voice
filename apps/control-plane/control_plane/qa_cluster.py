@@ -6,8 +6,9 @@ mine_qa_pairs(与 /api/reports/qa-pairs 同源,进程内调用零重复)→ 按�
 (variant/fresh/junk)→ apply 按 select 逐行盖章入库(与 create_qa_entry 同款:
 账号/owner/priority)。
 
-LLM 端点=MLX_LLM_BASE_URL(CP env 面已有,勿用 CLI 的 BOK_LLM_PORT);
-模型经 /v1/models 发现(路径型 id、含 4b 优先),env BOK_QA_CLUSTER_MODEL 直覆盖;
+LLM 端点=mining 车道（2026-09-25 模型路由：路由表命中吃 base_url/model/api_key；
+未命中=MLX_LLM_BASE_URL env 链逐字节同旧，CP env 面已有，勿用 CLI 的 BOK_LLM_PORT）;
+模型经 /v1/models 发现(路径型 id、含 4b 优先),路由 model 空/覆盖 env BOK_QA_CLUSTER_MODEL;
 httpx 同步直打 OpenAI 兼容 /v1(temperature 0/max_tokens 4096/timeout 120,
 照 Summarizer 姿势)。
 单飞:模块级锁+运行标志,冲突 AlreadyRunning(端点转 409)。
@@ -24,6 +25,7 @@ from typing import Any, Callable
 
 import httpx
 
+from bok_voice_core.model_routes import PROVIDER_OPENAI, resolve_route
 from bok_voice_core.qa_cluster import (  # noqa: F401  (_CLUSTER_SYSTEM_PROMPT re-export)
     _CLUSTER_SYSTEM_PROMPT,
     build_cluster_messages,
@@ -33,6 +35,7 @@ from bok_voice_core.qa_cluster import (  # noqa: F401  (_CLUSTER_SYSTEM_PROMPT r
 from bok_voice_core.qa_text import mine_qa_pairs
 
 from .auth import current_identity
+from .deps import read_model_routing_raw
 
 # dry 计划缓存 TTL(秒):apply 带选择时吃缓存免二次 LLM。
 # 键=(account, min_calls, limit)——不同参数=不同计划,apply 参数与 dry 不符时
@@ -52,6 +55,26 @@ class AlreadyRunning(RuntimeError):
 
 def _base_url() -> str:
     return os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1").rstrip("/")
+
+
+def _mining_lane() -> tuple[str, str, str, bool]:
+    """mining 车道解析（2026-09-25 模型路由）→ (base_url, model_override, api_key, enable_thinking)。
+
+    铁律——路由表未命中（空表/kill-switch → source=="env"）时返回 env 链现状
+    （_base_url() + /models 发现），逐字节同旧。openai 云端档才真正携带 api_key
+    （本地档 "mlx" 不塞请求头，契约 model_routes 注释）；enable_thinking 请求体
+    扩展字段只随云端档下发（本地 mlx 走启动旗标 --chat-template-args，见计划 §2.2）。
+    """
+    route = resolve_route("mining", os.environ, read_model_routing_raw())
+    if route.source != "routing":
+        return _base_url(), "", "", False
+    if route.provider == PROVIDER_OPENAI:
+        return route.base_url, route.model, route.api_key, route.enable_thinking
+    if route.base_url:
+        # local 档显式改端点：model 空仍走 /models 发现，不带 thinking/body 扩展。
+        return route.base_url, route.model, "", False
+    # 坏数据（local 档无端点）=视同未命中，env 链兜底。
+    return _base_url(), "", "", False
 
 
 def _discover_model(base_url: str) -> str:
@@ -77,8 +100,20 @@ def _resolve_model(base_url: str) -> str:
     return model
 
 
-def _llm_chat(base_url: str, model: str, system: str, user: str, *, timeout: float = 120.0) -> str:
-    """OpenAI 兼容 /v1/chat/completions(httpx 同步,Summarizer 先例)。"""
+def _llm_chat(
+    base_url: str,
+    model: str,
+    system: str,
+    user: str,
+    *,
+    timeout: float = 120.0,
+    api_key: str = "",
+    enable_thinking: bool = False,
+) -> str:
+    """OpenAI 兼容 /v1/chat/completions(httpx 同步,Summarizer 先例)。
+
+    api_key/enable_thinking 仅云端路由档携带（env 链请求=与旧版逐字节一致）。
+    """
     payload = {
         "model": model,
         "messages": [
@@ -89,7 +124,19 @@ def _llm_chat(base_url: str, model: str, system: str, user: str, *, timeout: flo
         "max_tokens": 4096,
         "stream": False,
     }
-    r = httpx.post(f"{base_url}/chat/completions", json=payload, timeout=timeout)
+    if enable_thinking:
+        payload["enable_thinking"] = True
+    # api_key 仅云端档携带；env 链（api_key=""）保持与改造前同一调用形状
+    # （不带 headers 参，Summarize 同款纪律——monkeypatch 窄签名不破）。
+    if api_key:
+        r = httpx.post(
+            f"{base_url}/chat/completions",
+            json=payload,
+            timeout=timeout,
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+    else:
+        r = httpx.post(f"{base_url}/chat/completions", json=payload, timeout=timeout)
     r.raise_for_status()
     return str((r.json().get("choices") or [{}])[0].get("message", {}).get("content") or "")
 
@@ -131,9 +178,10 @@ def _compute_plan(repo: Any, account_id: str, min_calls: int, limit: int) -> dic
     conversations = repo.iter_call_conversations(account_id, exclude_test_objects=True)
     pairs = mine_qa_pairs(conversations, min_calls=min_calls, limit=limit)
     existing_rows = repo.list_qa_entries(account_id, owner_scope=None)
-    base_url = _base_url()
+    # mining 车道（模型路由）：env 链/本地显式端点走发现，云端档 model 必填直接用。
+    base_url, model_override, api_key, thinking = _mining_lane()
     try:
-        model = _resolve_model(base_url)
+        model = model_override or _resolve_model(base_url)
     except httpx.HTTPError as exc:
         raise ClusterError(f"llm models 探测失败({base_url}): {exc!r}") from exc
     variants: list[dict] = []
@@ -146,7 +194,10 @@ def _compute_plan(repo: Any, account_id: str, min_calls: int, limit: int) -> dic
             fresh.extend(rows)
             continue
         try:
-            text = _llm_chat(base_url, model, _CLUSTER_SYSTEM_PROMPT, batch["message"])
+            text = _llm_chat(
+                base_url, model, _CLUSTER_SYSTEM_PROMPT, batch["message"],
+                api_key=api_key, enable_thinking=thinking,
+            )
         except Exception as exc:  # noqa: BLE001 - 网络/解析失败统一 503 带原因
             raise ClusterError(f"llm 请求失败(lang={batch['lang']}): {exc!r}") from exc
         decisions = parse_llm_decisions(text)

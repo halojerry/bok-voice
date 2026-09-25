@@ -631,3 +631,126 @@ def test_consecutive_round_cooldown(tmp_path, monkeypatch):
         assert len(player.plays) == 2
 
     _run(_case())
+
+
+# ---- W2a 分层犹豫垫音(2026-09-23):hesitation 第六类资产标签,分类器五类
+# 永不产出 → _pick 概率混入;犹豫池缺失=零行为变化(短路)。 ----
+
+
+def _patch_roll(monkeypatch, value: float) -> None:
+    import agent_runtime.fillers as fm
+
+    monkeypatch.setattr(fm.random, "random", lambda: value)
+
+
+def test_hesitation_blend_hit_picks_from_hes_pool(tmp_path, monkeypatch):
+    """抽签命中(roll < PROB)→ 从 hesitation 池选,即使分类器给了别的类。"""
+    _patch_roll(monkeypatch, 0.0)
+
+    async def _case():
+        pools = {"cantonese": ["正常垫话一。", "嗯——呃——", "呃——嗯——"]}
+        cats = {"cantonese": ["check", "hesitation", "hesitation"]}
+        d, _ = _director(tmp_path, pools=pools, cats=cats)
+        e = d._pick("cantonese", "check")
+        assert e["cat"] == "hesitation", "混入抽签命中必须出自犹豫池"
+
+    _run(_case())
+
+
+def test_hesitation_blend_miss_keeps_normal_path(tmp_path, monkeypatch):
+    """抽签未中(roll ≥ PROB)→ 既有分类池路径逐字节不变。"""
+    _patch_roll(monkeypatch, 0.99)
+
+    async def _case():
+        pools = {"cantonese": ["正常垫话一。", "嗯——呃——"]}
+        cats = {"cantonese": ["check", "hesitation"]}
+        d, _ = _director(tmp_path, pools=pools, cats=cats)
+        e = d._pick("cantonese", "check")
+        assert e["cat"] == "check", "抽签未中不得动分类池路径"
+
+    _run(_case())
+
+
+def test_no_hesitation_pool_short_circuits(tmp_path, monkeypatch):
+    """池里无 hesitation 条目 → 混合分支短路,旧 manifest 行为零变化
+    (roll 恒 0 也不得改道——短路靠池空,不靠抽签值)。"""
+    _patch_roll(monkeypatch, 0.0)
+
+    async def _case():
+        pools = {"cantonese": ["默认垫话。", "应承一。"]}
+        cats = {"cantonese": ["default", "ack"]}
+        d, _ = _director(tmp_path, pools=pools, cats=cats)
+        e = d._pick("cantonese", "default")
+        assert e["cat"] == "default"
+
+    _run(_case())
+
+
+def test_hesitation_blend_respects_recent_dedup(tmp_path, monkeypatch):
+    """连续混入抽签同走去重窗(相邻选取不重复);犹豫池 3 条 > 窗 2 必不重。"""
+    _patch_roll(monkeypatch, 0.0)
+
+    async def _case():
+        pools = {"cantonese": ["嗯——呃——", "呃——嗯——", "呃——哦——"]}
+        cats = {"cantonese": ["hesitation"] * 3}
+        d, _ = _director(tmp_path, pools=pools, cats=cats)
+        picks = [d._pick("cantonese", "check")["text"] for _ in range(3)]
+        assert len(set(picks)) == 3, f"犹豫池连续抽签重复: {picks}"
+
+    _run(_case())
+
+
+def test_real_manifest_hesitation_tier():
+    """真实资产契约(W2a):三语各 7 条 hesitation,文件名 h 档前缀,
+    时长全在犹豫独立窗 [0.8,2.6]s,wav 在位。"""
+    import re
+
+    from agent_runtime.fillers import FILLER_ASSETS_DIR, HESITATION_CAT, load_manifest
+
+    m = load_manifest(FILLER_ASSETS_DIR)
+    for lang, entries in m.items():
+        hes = [e for e in entries if e.get("cat") == HESITATION_CAT]
+        assert len(hes) == 7, f"{lang} hesitation 应 7 条,得 {len(hes)}"
+        for e in hes:
+            assert re.match(rf"^{lang}-h\d{{2}}\.wav$", e["file"]), e["file"]
+            assert 0.8 <= e["dur_s"] <= 2.6, f"{e['file']} dur={e['dur_s']} 出独立窗"
+            assert (FILLER_ASSETS_DIR / e["file"]).exists()
+
+
+# —— W2b 思考态键盘环境音(fillers.thinking_sound_configs) ——————————————
+
+
+def test_thinking_sound_configs_default(monkeypatch):
+    """默认开:两条内置打字 burst,音量 0.6/概率 0.30/fade_out 0.05。"""
+    from livekit.agents.voice.background_audio import BuiltinAudioClip
+
+    from agent_runtime.fillers import thinking_sound_configs
+
+    monkeypatch.delenv("BOK_AMBIENT_KEYBOARD", raising=False)
+    monkeypatch.delenv("BOK_AMBIENT_KEYBOARD_VOL", raising=False)
+    cfgs = thinking_sound_configs()
+    assert cfgs is not None and len(cfgs) == 2
+    srcs = {c.source for c in cfgs}
+    assert srcs == {BuiltinAudioClip.KEYBOARD_TYPING, BuiltinAudioClip.KEYBOARD_TYPING2}
+    for c in cfgs:
+        assert c.volume == 0.6
+        assert c.probability == 0.30
+        assert c.fade_out == 0.05
+
+
+def test_thinking_sound_configs_kill_switch(monkeypatch):
+    """BOK_AMBIENT_KEYBOARD=0 → None(构造不带 thinking_sound,行为与旧版同)。"""
+    from agent_runtime.fillers import thinking_sound_configs
+
+    monkeypatch.setenv("BOK_AMBIENT_KEYBOARD", "0")
+    assert thinking_sound_configs() is None
+
+
+def test_thinking_sound_configs_volume_clamp(monkeypatch):
+    """音量 env:非法值回落 0.6,越界夹 [0,1]。"""
+    from agent_runtime.fillers import thinking_sound_configs
+
+    for raw, want in (("1.7", 1.0), ("-0.2", 0.0), ("abc", 0.6), ("0.25", 0.25)):
+        monkeypatch.setenv("BOK_AMBIENT_KEYBOARD_VOL", raw)
+        cfgs = thinking_sound_configs()
+        assert cfgs is not None and all(c.volume == want for c in cfgs), raw

@@ -8,7 +8,7 @@
 |---|---|
 | 三语话术 / 标记与停顿 / MiniMax 云 TTS（2.8）/ 垫话梯子 / TurnDetector v1-mini（本地 CPU ~108MB）/ 9B judge 纪律 / 全部离线单测与三语 E2E / barge-in / offscript soak | **并发负载**（Mac GPU 争抢：ASR partials 拖 LLM TTFT +24%，单腿顺序测试可信、并发结论不可信）/ ASR CUDA 档 / llama `-np 3` 多槽 / 打包与节点拓扑实测 |
 
-**已定决策**（本计划的前提）：TTS 统一 MiniMax（音色一致）；LLM 本地 9B（DeepSeek 仅逃生档）；EOT 官方无粤语档（v1 云=隐私否决，v1-mini 本地=无 yue 校准、回落英文 0.36）；标记集 = (breath)(inhale)(exhale)(clear-throat)(emm)（砍 (coughs)）；回复头部禁标记/停顿；`<#x#>` 停顿无模型限制。
+**已定决策**（本计划的前提）：TTS 统一 MiniMax（音色一致）；LLM 本地（**Mac 表默认=4B avan-ag，2026-09-25 核实：设置页从未设过 9B、运行车道一直 4B；「9B」=CUDA/llama.cpp 车道默认+质量目标，对话车道三方 A/B 见 5.x**）；EOT 官方无粤语档（v1 云=隐私否决，v1-mini 本地=无粤语档校准、回落英文 0.36）；标记集 = (breath)(inhale)(exhale)(clear-throat)(emm)（砍 (coughs)）；回复头部禁标记/停顿；`<#x#>` 停顿无模型限制。
 
 ---
 
@@ -18,7 +18,7 @@
 - [ ] 0.2 Mac `bok.py serve` 起栈；三语邀约话术 reseed（2026-09-24 改写稿：zh -38% / 粤 -36% / en -24%）；TTS 渲染三语耳测（人感+标记禁入 ref 核对）
 - [ ] 0.3 基线 soak：invite 三语 + pause 场景，记 p50/p90 落盘——后续每阶段对照这张表
 - [ ] 0.4 核对 livekit-agents 实装 1.8.2 vs 锁版/AGENTS.md 记录的 1.8.0（子代理在 venv 实测为 1.8.2），不一致就更新锁版与文档
-- [ ] 0.5 **核实 ASR device=cuda 的固化点**：当时 cpu→cuda（finish 1330→250ms，soak -43%）若是手工重启 sidecar 而非仓库启动配置，箱一重建就蒸发——找到固化点（bok.py Linux lane / sidecar 默认 / env 表），没固化就在 Mac 上先固化进代码
+- [x] 0.5 **核实 ASR device=cuda 的固化点**（2026-09-24 结案）：**已固化，无缺口**——bok.py 启动层 `_cuda()` → `QWEN3_ASR_DEVICE=cuda` 自动钉（:1335，非本会话引入、仓库既有）+ sidecar `_resolve_device()` 双保险（env 覆写 > torch.cuda 可用即 cuda > cpu）。箱上当时跑 cpu 是孤儿栈手工启动姿势的产物，非仓库缺口；窗口 6.2 干净 bring-up 即自动 cuda，一键电池加一条断言：ASR 日志 `device=cuda`（app.py:236/252 会打）
 
 ## 阶段 1 · P1 TTS 人感包
 
@@ -38,7 +38,7 @@
 - [ ] 3.1 粤语 detector 阈值扫描三腿：`BOK_TURN_DETECTOR_THRESHOLD` 0.45/0.50 × `ENDPOINT_MAX_DELAY` 0.6/1.2（`TURN_DETECTION=detector` 重启 worker，注意零殭尸 worker 铁律）；判据 = pause-canto 劈轮数 × invite-canto 正常轮 p50 的 Pareto
 - [ ] 3.2 zh / en 急档复核（官方校准值 zh 0.355 / en 0.36 × max 0.6），对照 stt 基线 −340ms 是否复现
 - [ ] 3.3 定案按语言分流表（zh/en/canto 各自 detector 或 stt），阈值进 `repository.default_settings`；找不到粤语甜点就 canto 留 stt
-- [ ] 3.4 盯官方 `languages.py`：yue 档上线即换按语言 dict 校准（env 钩子已就位）
+- [ ] 3.4 盯官方 `languages.py`：粤语语言档上线即换按语言 dict 校准（env 钩子已就位）
 
 ## 阶段 4 · P3 judge 纪律 + 人工交接
 
@@ -50,6 +50,7 @@
 
 - [ ] 全 pytest + 三语 E2E（真 `/api/token`）+ `e2e_barge_in` + `probe_offscript_soak` + `probe_filler_timing` + interpret 延迟探针
 - [ ] soak p50/p90 对照阶段 0 基线出对比表（人感包+梯子+轮次档的净收益）
+- [ ] 5.v **Mac 实机并发电池（2026-09-24 Ethan 定案：多组多轮多并发 + A/B 线同开）**：`load_audio_concurrency.py`（已补 `LOAD_TEMPLATE_ID` 钉邀约模板）阶梯 A2/A4/A6 路 × 3 轮（每级一跑，逐轮首声 + 哑轮率）；B 腿=`e2e_interpret.py` ×2 并行（每通=fwd+rev 双 worker + MT :1236）；**AB 同开腿**=A4 + B×2 同时开火，看 A 线 TTFT 相对 A4 单独跑的增量与 B 线退化。段落归因走 turns 表（worker 已带 token，PERCEIVED 账本恢复）。已知口径：旧"TTS sidecar 全局锁"约束已随 TTS 上云失效，本电池实测新的天花板在哪（嫌疑=mlx :1235 请求串行）；A/B 同开前必须确认基线 soak 已收（互污染）。报告落 `reports/mac-concurrency-2026-09-24/`
 - [ ] 5.x（可选 A/B）LLM 候选：`qwen3.5-9b-uncensored`（mlx 8bit）经现有 :1235 sidecar 接入（bok.py MODELS 加条目），对照现 9B——判据四件：soak TTFT/cached 命中、`probe_reply_quality`、offscript soak、jump-speech 探针（abliterated 重点盯指令遵循/复制引力）。**不换 LM Studio 引擎**：同 mlx Metal kernel 无量级增益，丢 `cached=N/M` 观测面（KV 架构验证命脉），.lmstudio 路径断层有前科；可选 30 分钟背靠背基准（同模型同前缀重放）拿数据；连带决策：ASR 不换 Whisper/ANE/ExecuTorch（Qwen3-ASR 无 CoreML 路，换引擎=放弃热词/句级提交/join-hold全家+Mac 与 CUDA 分叉）
 - [ ] 5.y **演示档（Mac demo posture，2026-09-24 新增——Mac 要给人演示，流畅度一等公民）**：①`scripts/demo_preflight.sh` 一键预热体检：起栈→LLM 前缀预热→罐头/垫话物化核对→开场白 TTS 缓存温热→零殭尸核查→出体检单；②演示配置：单通话、背景意图 judge 关（`BOK_FLOW_GRAPH_JUDGE=0`，除非演示点就是图意图）、ASR partial 抑制确认开、垫话物化优先命中；③演示腿判据：invite-zh/canto 单通话 p50 ≤1.2s、零哑轮、尖刺轮全被梯子盖住；④演示走生产架构本身，不经 LM Studio/ExecuTorch 中转换活线（换引擎救不了链路结构；ExecuTorch ASR 0.0.8 = Whisper 系无热词无句级契约，观察项）
 - [ ] 5.z（bench）**Whisper vs Qwen3-ASR 三腿对照（2026-09-24 定案，bench 层活线零改动）**：腿1 转写质量 A/B（同语料：16 碎裂句+三语 e2e wav+数字串，盯数字/品牌词/粤语三维）；腿2 单发延迟（whisper.cpp 墙钟 vs sidecar finish）；腿3 GPU 自由度探针（:1235 固定前缀 LLM TTFT × {空闲 / Qwen3-ASR 循环 / whisper-Metal 循环 / whisper-CoreML(ANE encoder) 循环}——第四格≈第一格=分流假设成立）。工具：whisper.cpp 源码编译（`WHISPER_COREML=ON`，先查 Xcode CLT）+ `ggml-large-v3-turbo`(1.6GB)（+large-v3 3.1GB 可选）+ LM Studio ExecuTorch ASR 对照。**判据预先押定**：活线换=腿1三维全不输 AND 腿3 ANE 格≈基线 AND 接受句级提交重写；演示档局部采纳=仅腿3成立；全不满足=对账表记"Whisper/ANE 实测否决"闭题。产出 `scripts/asr_whisper_bench.py` + 报告落盘 `reports/asr-whisper-bench/`

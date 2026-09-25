@@ -7,7 +7,9 @@
     PERCEIVED_MS 三段（eou/llm/tts）｜turns 账本 perceived_ms/latency_ms/gen；
   - 逐轮异常旗：拆轮（一句被收成 N>1 个 user 轮）、哑轮、canceled 回复、风暴退避
     触发、LLM 兜底直念、PERCEIVED 预算超标；
-  - 汇总：逐指标 p50/p95/max + 异常计数 + 逐轮明细表 + JSON 落盘。
+  - 汇总：**headline=PERCEIVED p50/p95（带预算判定）**——G6（LANE-AB-2026-09-25
+    附3「掩盖层」）：PERCEIVED 才係「真实答案到达」，墙钟首声被垫话/兜底盖耳只是
+    「有声音」，降为次要并标「含垫话」；另加异常计数 + 逐轮明细表 + JSON 落盘。
 
 退出码：正常轮哑 ≥2 或全部轮无回复 → FAIL(1)；对抗轮异常只记旗不强 FAIL
 （拆轮被防线救起 = split=0 也是合法结果，看报告判读）。
@@ -558,19 +560,27 @@ def print_report(res: dict, budgets: dict[str, float]) -> None:
             flush=True,
         )
     fa, pd = s["first_audio"], s["perceived"]
-    print(
-        f"\n墙钟首声 n={fa['n']} p50={fa['p50']:.0f}ms p95={fa['p95']:.0f}ms max={fa['max']:.0f}ms "
-        f"超标(>{budgets['first_ms']:.0f})={fa['over_budget']}",
-        flush=True,
-    )
+    # G6（LANE-AB-2026-09-25.md 附3「掩盖层」）：报告 headline=PERCEIVED（真实
+    # 答案到达，带预算判定）；墙钟首声降为次要并标「含垫话」——垫话/兜底层把
+    # 「有声音」与「有答案」拆开，只看墙钟首声会误读（下午 9B≈4B 的假象根因）。
+    # 测量本身不动，只重排呈现。
     if pd["n"]:
+        p50_ok = pd["p50"] is not None and pd["p50"] <= budgets["perceived_ms"]
+        verdict = "达标" if p50_ok and not pd["over_budget"] else "超标"
         print(
-            f"PERCEIVED n={pd['n']} p50={pd['p50']:.0f}ms p95={pd['p95']:.0f}ms max={pd['max']:.0f}ms "
-            f"超标(>{budgets['perceived_ms']:.0f})={pd['over_budget']} (预算哨兵={len(res['budget_hits'])})",
+            f"\n[首要] PERCEIVED n={pd['n']} p50={pd['p50']:.0f}ms p95={pd['p95']:.0f}ms max={pd['max']:.0f}ms "
+            f"预算({budgets['perceived_ms']:.0f}ms)超标轮数={pd['over_budget']} → {verdict} "
+            f"(预算哨兵={len(res['budget_hits'])})",
             flush=True,
         )
     else:
-        print("PERCEIVED 无样本（全旁路轮?）", flush=True)
+        print("\n[首要] PERCEIVED 无样本（全旁路轮?）", flush=True)
+    print(
+        f"[次要] 墙钟首声（含垫话——被垫话/兜底盖耳，只是「有声音」非答案到达） "
+        f"n={fa['n']} p50={fa['p50']:.0f}ms p95={fa['p95']:.0f}ms max={fa['max']:.0f}ms "
+        f"超标(>{budgets['first_ms']:.0f})={fa['over_budget']}",
+        flush=True,
+    )
     active = {k: v for k, v in s["markers"].items() if v}
     print(f"哨兵计数：{active if active else '（无）'}", flush=True)
     print(f"小计[{res['key']}]: {s['rounds']} 轮 · 有答 {s['answered']} · 哑 {s['mute']}", flush=True)

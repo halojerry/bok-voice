@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import threading
 import time
 import uuid
@@ -76,6 +77,27 @@ def _has_latin_or_digit(text: str) -> bool:
     回退整句高精度转写,保「停嘴整句兜底」铁律。
     """
     return any(ch.isascii() and ch.isalnum() for ch in text)
+
+
+# ---- M-24 泰文字形幻觉守卫(2026-09-23 修复波#4,task-4 M3 实弹)----
+# Qwen3-ASR 偶发语种混淆:粤/中/英语音的 finish 输出整段带泰文字形
+# (「兩日內賠到」→「เล่าอย่างหน่อย陪到。」,task-4 WER 批 4 渲染 3 次)。
+# 判据=输出含泰文块(U+0E00–U+0E7F)——本产品三语(zh/cantonese/en)任何位置
+# 都不可能合法出现泰文,零误伤面。动作=触发时以 temperature 重解一次(greedy
+# 重解同音频恒同结果,采样才有变化);重解干净即采用,仍带泰文则剥泰文串保留
+# 余文——缓解非根除(诚实边界:模型缺陷,头部内容可能已损)。重解只在罕见
+# 触发时发生:干净输出零开销零行为变化。
+_SCRIPT_RETRY_TEMP = float(os.environ.get("QWEN3_ASR_SCRIPT_RETRY_TEMP", "0.25"))
+
+
+def _has_thai_glyphs(text: str) -> bool:
+    return any("\u0e00" <= ch <= "\u0e7f" for ch in str(text or ""))
+
+
+def _strip_thai_runs(text: str) -> str:
+    out = re.sub(r"[\u0e00-\u0e7f]+", "", str(text or ""))
+    out = re.sub(r"^[，,、。.\s]+", "", out)  # 剥完开头残留标点/空白
+    return out.strip()
 
 
 def _strip_punct_space(text: str) -> str:
@@ -369,6 +391,11 @@ class ASRService:
             language = str(langs[0] or "") if isinstance(langs, list) and langs else ""
             if not language:
                 language = _fallback_language(text)
+            # W6 稳定性账本:记上一窗文本——VAC 直转只在「连续两窗解码收敛」时放行
+            # (当前窗是上一窗的延伸/相等)。单词 partial(短句只有一窗,无收敛证据)
+            # 与劣化重解(快语速下 4 字跟在更全的解码后)都唔够格直转,落回整句
+            # 兜底=旧守卫的质量优先行为(fast_speech 探针 3/3 FAIL 实证后加)。
+            session["partial_prev_text"] = str(session.get("partial_text") or "")
             session["partial_text"] = text
             session["partial_lang"] = language
             # covered=解码快照长度(上面 bytes(chunks) 拍照),【唔系】解码完成后的
@@ -423,9 +450,17 @@ class ASRService:
                 fresh_sec, tail_max_sec = min(fresh_sec, 1.2), min(tail_max_sec, 1.0)
             if (time.monotonic() - last_at) > fresh_sec:
                 return None
-            if not (0 < covered <= len(pcm)):
+            if covered <= 0:
                 return None
-            tail = pcm[covered:]
+            # VAC 即时提交(W6,2026-09-24):covered 越过裁剪后末端(快照落在尾部
+            # 静音区)=partial 输入已含全部语音(语音结束点 ≤ trimmed_len ≤ covered)
+            # → 零 GPU 直转下方 `if not tail` 分支。旧守卫 `covered <= len(pcm)` 恰
+            # 把这个黄金场景打成整句兜底 0.5-1.2s(==len 精确相等反而是罕见巧合;
+            # VAD 停嘴等窗 0.45s 内起解的 partial,快照天然带一段后来被 trim 掉的
+            # 静音)。竞态不变量不动:covered 恒为解码快照长度(_partial_mlx 注释),
+            # 快照后还有**语音**时 len(pcm)>covered 照走尾段解码——本分支只在
+            # 快照之后全是被裁掉的静音时成立(trim 只裁静音,语音结束点之前唔动)。
+            tail = pcm[covered:] if covered < len(pcm) else b""
             tail_sec = len(tail) / 2 / SAMPLE_RATE
             if tail_sec > tail_max_sec:
                 return None
@@ -438,7 +473,9 @@ class ASRService:
             # （首字六丢失）、tail 拼接出「他。的再见。」（partial=2 字覆盖 2.6s）。
             # 语音正常节奏 ≥4 字/秒，取极保守下限 2 字/秒——正常 partial 远超此线,
             # 只有「窗起点切在语音中间」的坏窗会被挡下并退回整句高精度兜底。
-            partial_sec = covered / 2 / SAMPLE_RATE
+            # 直转 case 的 covered 含尾部静音:以裁剪后语音长度为下限基(保守方向
+            # ——静音不产字,唔可以用它抬高 min_chars 把真 partial 错杀)。
+            partial_sec = min(covered, len(pcm)) / 2 / SAMPLE_RATE
             min_chars = int(partial_sec * _INC_PARTIAL_MIN_CHARS_PER_SEC)
             if len(_strip_punct_space(partial_text)) < min_chars:
                 print(
@@ -449,8 +486,29 @@ class ASRService:
                 )
                 return None
             if not tail:
-                # 尾巴为零:最后一窗已解码完整 buffer(≤PARTIAL_MAX_SEC 才有 covered),
-                # partial 即整句结果,直接转正,一次 GPU 都不用再烧。
+                # 尾巴为零的两种形态分流:
+                # - covered == len(pcm):旧零尾直转(2026-09-12 行为,保持零变化);
+                # - covered > len(pcm):W6 VAC 直转(快照越过裁剪后末端=落在尾部
+                #   静音区)——必须有两窗收敛证据:快语速/劣化窗的 partial 解码可以
+                #   比整句差(实测 1.2s 语音出 4 字,fast_speech 探针 3/3 FAIL 实证),
+                #   当前窗是上一窗的延伸/相等才算收敛,否则整句兜底质量优先。
+                if covered > len(pcm):
+                    _prev = _strip_punct_space(str(session.get("partial_prev_text") or ""))
+                    _cur = _strip_punct_space(partial_text)
+                    _stable = bool(_prev) and (
+                        _cur == _prev or _cur.startswith(_prev) or _prev.startswith(_cur)
+                    )
+                    if not _stable:
+                        return None
+                    _vac = " stable"
+                else:
+                    _vac = ""
+                print(
+                    f"[qwen3-asr] incremental finish: zero-tail direct "
+                    f"(covered={covered / 2 / SAMPLE_RATE:.1f}s "
+                    f"trimmed={len(pcm) / 2 / SAMPLE_RATE:.1f}s{_vac})",
+                    flush=True,
+                )
                 return {
                     "text": partial_text,
                     "language": str(session.get("partial_lang") or "") or _fallback_language(partial_text),
@@ -492,6 +550,75 @@ class ASRService:
         finally:
             lock.release()
 
+    def _script_confusion_guard(
+        self, out: dict, session: dict, pcm: bytes, hint: str | None
+    ) -> dict:
+        """泰文字形幻觉守卫(M-24,纯出口单元,finish 各路径统一收口)。
+
+        输出含泰文块 → mlx 后端以 temperature 重解一次(同 hint/context,采样
+        变化搏一次干净解);重解干净即采用,仍带泰文/无重解能力 → 剥泰文串保留
+        余文。干净输出原样返回(结构性零行为变化)。QWEN3_ASR_SCRIPT_GUARD=0 关。
+        """
+        text = str(out.get("text") or "")
+        if not _has_thai_glyphs(text):
+            return out
+        if os.environ.get("QWEN3_ASR_SCRIPT_GUARD", "1") != "1":
+            return out
+        _t0 = time.monotonic()
+        retry_text = ""
+        if BACKEND == "mlx" and self._model is not None:
+            try:
+                wav, sr = _wav_from_pcm16(pcm)
+                retry = self._model.generate(
+                    _resample(wav, sr, SAMPLE_RATE),
+                    language=hint,
+                    system_prompt=_session_context(session),
+                    max_tokens=int(os.environ.get("QWEN3_ASR_MAX_TOKENS", "256")),
+                    temperature=_SCRIPT_RETRY_TEMP,
+                )
+                retry_text = getattr(retry, "text", "") or ""
+            except TypeError as exc:
+                # I-2(2026-09-24 评审返工):采样 kwarg 不被当前 mlx_audio generate
+                # 签名接受(升级改签名族)→ 重解路结构性不可用。真模型实证该 kwarg
+                # 被接受(2026-09-24 实载 1.7B-MLX-8bit,temperature=0.25 无
+                # TypeError、重解 ~0.7s)——此分支只防未来签名漂移,显式告警令
+                # 降级可观测(评审项:静默退剥串=死路无痕)。
+                print(
+                    f"[qwen3-asr] script_guard: retry unavailable reason=TypeError "
+                    f"detail={exc!r} — sampling kwarg not accepted, strip-only",
+                    flush=True,
+                )
+                retry_text = ""
+            except Exception as exc:  # noqa: BLE001 - 其余重解失败同样可观测
+                print(
+                    f"[qwen3-asr] script_guard: retry unavailable reason=error "
+                    f"detail={exc!r} — strip-only",
+                    flush=True,
+                )
+                retry_text = ""
+        if retry_text.strip() and not _has_thai_glyphs(retry_text):
+            print(
+                f"[qwen3-asr] script_guard: thai confusion → retry clean "
+                f"({(time.monotonic() - _t0) * 1000:.0f}ms) text={retry_text[:24]!r}",
+                flush=True,
+            )
+            return {
+                "text": retry_text,
+                "language": str(out.get("language") or "") or _fallback_language(retry_text),
+                "partial": False,
+            }
+        cleaned = _strip_thai_runs(text)
+        print(
+            f"[qwen3-asr] script_guard: thai confusion stripped "
+            f"chars={len(text)}→{len(cleaned)} retry={'still_thai' if retry_text else 'n/a'}",
+            flush=True,
+        )
+        return {
+            "text": cleaned,
+            "language": str(out.get("language") or ""),
+            "partial": False,
+        }
+
     def finish(self, session_id: str) -> dict[str, str | bool]:
         session = self._sessions.pop(session_id, None)
         if session is None:
@@ -510,11 +637,12 @@ class ASRService:
                 language = getattr(state, "language", "") or ""
                 if not language:
                     language = _fallback_language(text)
-                return {
-                    "text": text,
-                    "language": language,
-                    "partial": False,
-                }
+                # M-2(2026-09-24 评审返工):vllm 出口同款收口进泰文守卫
+                # (剥串档;重解路 guard 内 BACKEND==mlx 才有,pcm 传空即不适用)。
+                return self._script_confusion_guard(
+                    {"text": text, "language": language, "partial": False},
+                    session, b"", _finish_language_hint(session.get("language")),
+                )
 
         pcm = bytes(session["chunks"])
         if len(pcm) < 2:
@@ -531,7 +659,7 @@ class ASRService:
             # 任一前提不成立则回退整句高精度兜底(WhatsApp 捕获零降级)。
             incremental = self._try_incremental_finish(session, pcm, hint)
             if incremental is not None:
-                return incremental
+                return self._script_confusion_guard(incremental, session, pcm, hint)
             out = self._model.generate(
                 _resample(wav, sr, SAMPLE_RATE),
                 language=hint,
@@ -545,11 +673,10 @@ class ASRService:
                 language = str(langs[0] or "")
             if not language:
                 language = _fallback_language(text)
-            return {
-                "text": text,
-                "language": language,
-                "partial": False,
-            }
+            return self._script_confusion_guard(
+                {"text": text, "language": language, "partial": False},
+                session, pcm, hint,
+            )
         result = self._model.transcribe(
             audio=(_resample(wav, sr, SAMPLE_RATE), SAMPLE_RATE),
             language=hint,
@@ -561,11 +688,10 @@ class ASRService:
         language = getattr(first, "language", "") or ""
         if not language:
             language = _fallback_language(text)
-        return {
-            "text": text,
-            "language": language,
-            "partial": False,
-        }
+        return self._script_confusion_guard(
+            {"text": text, "language": language, "partial": False},
+            session, pcm, hint,
+        )
 
 service = ASRService()
 
@@ -651,4 +777,13 @@ async def finish(session_id: str, request: Request) -> dict[str, str | bool]:
             session["chunks"].extend(body)
     # 增量路径要在 inf_lock 上小等在飞 partial(≤FINISH_LOCK_WAIT_SEC),解码本身也是
     # 秒级阻塞计算——与 /api/chunk 同款丢线程池,唔阻塞事件循环(并发会话共用 loop)。
-    return await run_in_threadpool(service.finish, session_id)
+    # 墙钟打点(W6,2026-09-24):finish 往返是 EOU 延迟的直接组分(plugin 侧实测
+    # ~0.15-0.3s),分布观测/AB 归因靠它——zero-tail direct 应见个位数 ms。
+    _t0 = time.monotonic()
+    out = await run_in_threadpool(service.finish, session_id)
+    print(
+        f"[qwen3-asr] finish wall={(time.monotonic() - _t0) * 1000:.0f}ms "
+        f"text={len(out.get('text') or '')}ch",
+        flush=True,
+    )
+    return out

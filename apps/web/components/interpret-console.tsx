@@ -2079,7 +2079,9 @@ function watchTransAudio(room: Room | null, setHeld: (v: boolean) => void): () =
 async function fetchToken(account: string, callId: string, role: "me" | "other"): Promise<{ serverUrl: string; participantToken: string }> {
   const resp = await fetch(`${apiBase()}/api/token`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    // auth-on 栈要求身份（fix-wave-3 M-9）：裸 fetch 曾 401 令同传台进不了房
+    // ——与同文件 :1108 试听 fetch 同族，authHeaders() 无 token 时返回空表。
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify({ account_id: account, call_id: callId, participant_identity: `${role}-${callId}` }),
   });
   if (!resp.ok) throw new Error(`token http ${resp.status}`);

@@ -352,6 +352,12 @@ class GlobalSetting(Base):
     # default_settings()["sms"]。迁移 DDL 与 deps._ensure_column 同形；
     # server_default 必须带上（同上 campaign_json 注释）。
     sms_json: Mapped[str] = mapped_column(Text, default="", server_default="")
+    # 模型路由统一（2026-09-25 阶段 0）：五车道（a_reply/judge/mt/settle/mining）
+    # 本地↔云端路由表 {lanes:{...},presets:{...}}——空串=全 env 缺省（消费侧
+    # resolve_route 回 env 链，逐字节同旧）。api_key 真值只经 root+机器通道面
+    # 出入（CP 掩码/审计零密钥）。迁移 DDL 与 deps._ensure_column 同形；
+    # server_default 必须带上（同上 campaign_json 注释）。
+    model_routing_json: Mapped[str] = mapped_column(Text, default="", server_default="")
     policy: Mapped[str] = mapped_column(String(64), default="offline_first")
     updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
 

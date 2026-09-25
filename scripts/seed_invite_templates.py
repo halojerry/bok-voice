@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""三语「客服邀约」话术种子（2026-09-24 云端腿测试专用）。
+"""三语「客服邀约」话术种子（2026-09-24 精炼版）。
 
 中性场景：家电延保服务回访邀约——**不含赔偿/货损/平台核实域**，用于
-「都用云端（MiniMax LLM+TTS）」TTFT 腿与邀约话术通用链路验证。
+邀约话术通用链路验证与延迟基线。
+
+2026-09-24 人感精炼改写（-38%/-36%/-24% 字数）：砍官僚腔、动词直给、
+每步 ≤2 短句；语气词只用真词（好的/唔緊要/No problem），不用任何
+声音标记——标记只活在 LLM 轮 prompt 规则与合成层过滤（P1 人感包域）。
 
 用法：
   python scripts/seed_invite_templates.py [--api http://127.0.0.1:8000]
-幂等：同名同语言模板已存在则复用（打印 id），不重复建。
+幂等 upsert：同名模板已存在 → PUT 更新 steps_json/hotwords（不重复建、
+不留旧版）；不存在 → 新建。
 """
 from __future__ import annotations
 
@@ -27,28 +32,28 @@ TEMPLATES: list[dict] = [
         "steps": [
             {
                 "goal": "确认身份",
-                "ref": "您好，请问是{姓名}吗？\n如果客户不是本人→请对方转告，稍后再联系",
+                "ref": "您好，请问是{姓名}吗？\n如果客户不是本人→麻烦您转告他，我稍后再打来。",
             },
             {
                 "goal": "自报家门与来意",
                 "say": True,
-                "ref": "您好，我是品牌客户服务中心的专员。这次来电是想邀请您参加我们为老客户安排的免费延保服务回访，顺便帮您的家电做一次免费检测。",
+                "ref": "您好，我是您家电品牌的客服。想请您参加免费的延保回访，顺便给家电做个免费检测。",
             },
             {
                 "goal": "说明回访内容",
-                "ref": "这次回访大概需要二十分钟，工程师会上门检查电器运行情况，并免费更换易损配件。请问您平时家里方便接待上门服务吗？\n如果客户问要收费吗→全程免费，不收任何费用\n注意:一次只问一件事",
+                "ref": "工程师上门约二十分钟，检查电器，免费更换易损配件。您家里方便吗？\n如果客户问要收费吗→对，全程免费，不收任何费用\n注意:一次只问一件事",
             },
             {
                 "goal": "约定上门时间",
-                "ref": "那请问您这周哪天方便呢？周六周日我们都可以安排。\n如果客户说最近都没空→问下周三之前哪天合适",
+                "ref": "您这周哪天方便？周六周日都可以。\n如果客户说最近都没空→没关系，那下周三之前哪天合适呢？",
             },
             {
                 "goal": "登记联系方式",
-                "ref": "好的，我帮您登记。请问您的{联系方式}是多少？预约成功后我们把确认信息发给您。\n如果客户不愿意留→告知号码只用于发送预约确认",
+                "ref": "好的，我帮您登记。您的{联系方式}是多少？\n如果客户不愿意留→这个号码只用来发预约确认，您放心。",
             },
             {
                 "goal": "收尾告别",
-                "ref": "好的，已经帮您登记好了，感谢您的支持，祝您生活愉快，再见。",
+                "ref": "登记好了，确认信息稍后发给您。祝您愉快，再见。",
             },
         ],
     },
@@ -59,28 +64,28 @@ TEMPLATES: list[dict] = [
         "steps": [
             {
                 "goal": "確認身份",
-                "ref": "您好，請問係{姓名}嗎？\n如果客戶唔係本人→請對方轉告，遲啲再聯絡",
+                "ref": "您好，請問係{姓名}嗎？\n如果客戶唔係本人→麻煩您話返俾佢聽，我遲啲再打嚟。",
             },
             {
                 "goal": "自報家門與來意",
                 "say": True,
-                "ref": "您好，我係品牌客戶服務中心嘅專員。今次打嚟係想邀請您參加我哋為舊客戶安排嘅免費延保服務回訪，順便幫您嘅家電做一次免費檢測。",
+                "ref": "您好，我係您家電品牌嘅客服。想邀請您參加免費嘅延保回訪，順便幫您嘅家電做個免費檢測。",
             },
             {
                 "goal": "說明回訪內容",
-                "ref": "今次回訪大概需要二十分鐘，工程師會上門檢查電器運作，仲會免費更換易損配件。請問您平時屋企方便接待上門服務嗎？\n如果客戶問要唔要收費→全程免費，唔收任何費用\n注意:一次只問一件事",
+                "ref": "工程師上門大約二十分鐘，檢查電器，免費更換易損配件。您屋企方便嗎？\n如果客戶問要唔要收費→係，全程免費，唔收任何費用\n注意:一次只問一件事",
             },
             {
                 "goal": "約定上門時間",
-                "ref": "咁請問您今個禮拜邊日得閒呢？禮拜六禮拜日我哋都可以安排。\n如果客戶話最近都冇時間→問下星期三之前邊日合適",
+                "ref": "您今個禮拜邊日得閒？禮拜六禮拜日都得。\n如果客戶話最近都冇時間→唔緊要，咁下星期三之前邊日得閒呢？",
             },
             {
                 "goal": "登記聯絡方式",
-                "ref": "好嘅，我幫您登記。請問您嘅{聯絡方式}係幾多？預約成功之後我哋發確認信息俾您。\n如果客戶唔願意留→告知號碼只用嚟發預約確認",
+                "ref": "好嘅，我幫您登記。您嘅{聯絡方式}係幾多？\n如果客戶唔願意留→呢個號碼淨係用嚟發預約確認，您放心。",
             },
             {
                 "goal": "收尾告別",
-                "ref": "好嘅，已經幫您登記好喇，多謝您嘅支持，祝您生活愉快，再見。",
+                "ref": "登記好喇，確認信息遲啲發俾您。祝您愉快，再見。",
             },
         ],
     },
@@ -91,28 +96,28 @@ TEMPLATES: list[dict] = [
         "steps": [
             {
                 "goal": "Confirm identity",
-                "ref": "Hello, may I speak with {name} please?\n如果客户不是本人→No problem, I will call back at a better time.",
+                "ref": "Hello, may I speak with {name} please?\n如果客户不是本人→No problem, could you let them know? I'll call back later.",
             },
             {
                 "goal": "Introduce and state purpose",
                 "say": True,
-                "ref": "Hello, this is the customer service center of your appliance brand. We are calling to invite you to a free extended-warranty follow-up visit, including a free check-up for your appliance.",
+                "ref": "Hello, this is customer service from your appliance brand. We'd like to invite you to a free extended-warranty follow-up visit, with a free check-up.",
             },
             {
                 "goal": "Explain the visit",
-                "ref": "The visit takes about twenty minutes. Our engineer will check your appliance and replace any worn parts for free. Would it be convenient for us to visit your home?\n如果客户问要收费吗→The whole service is completely free of charge.\n注意:一次只问一件事",
+                "ref": "The engineer visits your home for about twenty minutes, checks your appliance, and replaces worn parts for free. Would that be convenient for you?\n如果客户问要收费吗→Yes, it's completely free, no charge at all\n注意:一次只问一件事",
             },
             {
                 "goal": "Schedule the visit",
-                "ref": "Great. Which day this week works best for you? Saturday and Sunday are also available.\n如果客户说最近都没空→No problem, any day before next Wednesday also works for us.",
+                "ref": "Which day this week suits you? Saturday and Sunday are both fine.\n如果客户说最近都没空→No problem, any day before next Wednesday also works.",
             },
             {
                 "goal": "Register contact",
-                "ref": "Perfect, let me register that for you. May I have your {contact} so we can send you the confirmation?\n如果客户不愿意留→No worries, we only use it to send your booking confirmation.",
+                "ref": "Okay, let me register that. What's your {contact}?\n如果客户不愿意留→No worries, we only use it to send your booking confirmation.",
             },
             {
                 "goal": "Close the call",
-                "ref": "All set, you are registered. Thank you for your support, and have a great day. Goodbye.",
+                "ref": "All set, the confirmation will be sent shortly. Have a great day. Goodbye.",
             },
         ],
     },
@@ -134,21 +139,31 @@ def main() -> None:
         existing = existing.get("items", existing) if isinstance(existing, dict) else existing
         by_name = {str(t.get("name")): str(t.get("id")) for t in existing}
         for tpl in TEMPLATES:
-            if tpl["name"] in by_name:
-                print(f"{tpl['language']}: {tpl['name']} -> 复用 {by_name[tpl['name']]}")
-                continue
             body = {
-                "name": tpl["name"],
-                "language": tpl["language"],
                 "steps_json": json.dumps(tpl["steps"], ensure_ascii=False),
                 "hotwords": tpl["hotwords"],
             }
-            resp = client.post(
-                f"{args.api}/api/templates", params={"account_id": ACCOUNT}, json=body
-            )
-            resp.raise_for_status()
-            created = resp.json()
-            print(f"{tpl['language']}: {tpl['name']} -> 新建 {created.get('id')}")
+            if tpl["name"] in by_name:
+                tid = by_name[tpl["name"]]
+                resp = client.put(
+                    f"{args.api}/api/templates/{tid}",
+                    params={"account_id": ACCOUNT},
+                    json=body,
+                )
+                resp.raise_for_status()
+                print(f"{tpl['language']}: {tpl['name']} -> 更新 {tid}")
+            else:
+                created_body = {
+                    "name": tpl["name"],
+                    "language": tpl["language"],
+                    **body,
+                }
+                resp = client.post(
+                    f"{args.api}/api/templates", params={"account_id": ACCOUNT}, json=created_body
+                )
+                resp.raise_for_status()
+                created = resp.json()
+                print(f"{tpl['language']}: {tpl['name']} -> 新建 {created.get('id')}")
 
 
 if __name__ == "__main__":

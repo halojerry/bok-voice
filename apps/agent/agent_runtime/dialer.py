@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -134,8 +135,18 @@ async def _dial_mock(ctx, *, number: str, cp_base: str, call_id: str, scenario: 
     # 调试零行为变化；E2E 用 campaign dial 块把它对齐到 AI 步进）。
     if float(speak_interval_s or 0) > 0:
         payload["speak_interval_s"] = float(speak_interval_s)
+    # 机器通道（F-14，2026-09-23 生产就绪修复波）：auth-on 标准姿势下 CP 全端点
+    # 要求 Bearer——裸 aiohttp 无头 → spawn 401 → 外呼战役派叫全灭（实弹
+    # `[dial] outcome=failed detail=mock spawn http 401`×3）。与 worker 侧
+    # ControlPlaneClient 同款惯例：BOK_CP_TOKEN 在场自动携带 + X-Bok-Channel
+    # 机器通道自报（auth-off 不带 Authorization，零行为变化）。
+    headers: dict[str, str] = {"X-Bok-Channel": "agent"}
+    cp_token = (os.environ.get("BOK_CP_TOKEN") or "").strip()
+    if cp_token:
+        headers["Authorization"] = f"Bearer {cp_token}"
     async with aiohttp.ClientSession() as http:
-        async with http.post(f"{cp_base}/api/sip/mock/callee", json=payload) as resp:
+        async with http.post(f"{cp_base}/api/sip/mock/callee", json=payload,
+                             headers=headers) as resp:
             if resp.status != 200:
                 return DialOutcome(status=OUT_FAILED, detail=f"mock spawn http {resp.status}")
     try:

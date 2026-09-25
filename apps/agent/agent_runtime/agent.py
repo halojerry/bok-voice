@@ -5,7 +5,7 @@ import json
 import os
 import re
 import time
-from typing import Optional
+from typing import Mapping, Optional
 
 from bok_voice_core.flow_graph import (
     ACTION_NOTIFY_HUMAN,
@@ -15,6 +15,8 @@ from bok_voice_core.flow_graph import (
     eligible_judge_intents,
     pick_graph_action,
 )
+# 模型路由共享契约(2026-09-25 阶段 0):车道本地↔云端解析单点,只消费不改动。
+from bok_voice_core.model_routes import LaneRoute, resolve_route
 # W4-T2 意向规则评估(挂断 disposition 覆盖+intent_code;共享契约主会话写死,只消费)
 from bok_voice_core.intent_rules import eval_intent_rules
 from bok_voice_core.policies import ProviderRegistry, ProviderState, select_session_manifest
@@ -46,6 +48,11 @@ from .qa_gate import (
     qa_fastpath_enabled,
     qa_rotation_enabled,
     qa_semantic_enabled,
+)
+from .voice_style import (
+    make_tts_voice_style_transform,
+    strip_voice_style,
+    voice_style_enabled_for_tts,
 )
 from .tts_cache import (
     CachedTTS,
@@ -233,6 +240,7 @@ async def _llm_judge(
     max_tokens: int = 8,
     timeout: float = 5.0,
     api_key: str = "mlx",
+    enable_thinking: bool | None = None,
 ) -> str:
     """流程推进判定器:发一个 max_tokens 极短请求,取回一个字。失败返空(唔推进)。
 
@@ -245,6 +253,10 @@ async def _llm_judge(
     `api_key` 缺省 `"mlx"`＝本地 mlx_lm server 不校验凭据（既有行为零变化）；判据走
     云端（`FLOW_JUDGE_LLM_API_KEY`）时由调用点传入——云端判定同时解掉「9B 占本地 GPU
     抢 4B prefill」与「9B 常驻显存」两笔账（2026-09-22 probe_gpu_contention 实测 +1375ms）。
+
+    `enable_thinking` 缺省 `None`＝请求 kwargs 不含 `extra_body` 键（逐字节同旧）；模型
+    路由 judge 云端档（openai）传布尔——Qwen3.5 家族云端思考陷阱：不传该旗思考全开
+    （LANE-AB 实测 5.85s 全 <think>），随请求体显式下发（2026-09-25 阶段 0）。
     """
     if not base_url or not model:
         return ""
@@ -254,7 +266,7 @@ async def _llm_judge(
         client = AsyncOpenAI(
             api_key=api_key or "mlx", base_url=base_url, timeout=timeout, max_retries=1
         )
-        r = await client.chat.completions.create(
+        _create_kwargs: dict = dict(
             model=model,
             messages=messages,
             max_tokens=max_tokens,
@@ -262,12 +274,69 @@ async def _llm_judge(
             # 本地 MLX 對話模板會 append <|im_end|>,停喺呢度,回應淨係 verdict 字。
             stop=["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
         )
+        if enable_thinking is not None:
+            # 仅 openai 档加（缺省 None=既有调用点请求体零变化）。
+            _create_kwargs["extra_body"] = {"enable_thinking": bool(enable_thinking)}
+        r = await client.chat.completions.create(**_create_kwargs)
         if r.choices:
             return str(r.choices[0].message.content or "")
         return ""
     except Exception as exc:  # pragma: no cover - 判定失败唔推进,唔阻断通话
         print(f"[flow] llm judge failed: {exc!r}", flush=True)
         return ""
+
+
+def _judge_lane_target(
+    route: LaneRoute,
+    env: Mapping[str, str],
+    llm_base_url: str = "",
+    llm_model: str = "",
+) -> tuple[str, str, str, bool | None]:
+    """judge 车道路由 → 判定端点四件套（纯函数,单测直喂;2026-09-25 阶段 0）。
+
+    返回 ``(base_url, model, api_key, enable_thinking)``。``route`` 必须是
+    ``resolve_route("judge", env, 当通 routing_raw)`` 的解析值；``llm_base_url``/
+    ``llm_model`` 两键＝当通 settings llm 卡（env 档旧链在 FLOW_JUDGE_* 与 MLX
+    缺省之间的既有回退层）。解析语义：
+
+    - openai 档＝路由表下发端点/模型/密钥＋思考旗（key 空回落 "mlx" 缺省哨兵）；
+    - local routing 档＝显式改端点（model 非空才覆盖），密钥/思考旗保持既有 env
+      行为（"mlx" 哨兵不换语义）；
+    - env 档＝FLOW_JUDGE_* → llm 卡 → MLX 旧链逐字节（零漂移保证：kill-switch/
+      空表时本函数输出与改造前构造点表达式同值）。
+
+    ``env`` 由调用方传 ``os.environ``（Mapping 契约）而非函数内直读——纯函数可离线
+    单测；当通 ``routing_raw`` 经调用点闭包捕获，worker 并发多通不串线。
+    """
+    if route.provider == "openai":
+        return (
+            route.base_url.rstrip("/"),
+            route.model,
+            route.api_key or "mlx",
+            route.enable_thinking,
+        )
+    if route.source == "routing":
+        return (
+            route.base_url.rstrip("/"),
+            route.model
+            or str(env.get("FLOW_JUDGE_LLM_MODEL", "") or "").strip()
+            or llm_model
+            or str(env.get("MLX_LLM_MODEL", "") or ""),
+            str(env.get("FLOW_JUDGE_LLM_API_KEY", "mlx")),
+            None,
+        )
+    return (
+        (
+            str(env.get("FLOW_JUDGE_LLM_BASE_URL", "") or "").strip()
+            or (llm_base_url or "")
+            or str(env.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"))
+        ).rstrip("/"),
+        str(env.get("FLOW_JUDGE_LLM_MODEL", "") or "").strip()
+        or llm_model
+        or str(env.get("MLX_LLM_MODEL", "") or ""),
+        str(env.get("FLOW_JUDGE_LLM_API_KEY", "mlx")),
+        None,
+    )
 
 
 def _intent_judge_candidates(
@@ -2480,6 +2549,11 @@ async def entrypoint(ctx):
     asr_cfg = settings.get("asr", {})
     tts_cfg = settings.get("tts", {})
     vad_cfg = settings.get("vad", {})
+    # 模型路由原始串（2026-09-25 阶段 0）：CP /api/settings?internal=1 顶层键，与
+    # 引擎卡/personas 同一 fetch（改道下一通生效，零重启）；缺键/空＝未配置，
+    # resolve_route 内部落回 env 缺省链。存**当通局部值**——worker 并发跑多通，
+    # 模块级可变全局会串线；下游 judge/a_reply 构造点经本函数闭包读取。
+    _routing_raw = str(settings.get("model_routing_json") or "")
 
     from .providers.livekit_plugins import (
         DeepSeekLLM,
@@ -2496,6 +2570,7 @@ async def entrypoint(ctx):
         ContextState,
         ScriptedLLM,
         VolcanoTTS,
+        route_llm_kwargs,
     )
 
     # 每通对话语言固定（A 线新政策）：开场语言 = 人设(AI)语言优先（用户在人设里
@@ -2981,6 +3056,11 @@ async def entrypoint(ctx):
                 flush=True,
             )
 
+    # a_reply 车道路由（2026-09-25 阶段 0）：回复 LLM 端点/模型/密钥/思考旗按路由
+    # 表解析（kill-switch/空表在 resolve_route 内部落回 env 缺省链）。env 档＝下方
+    # 三个构造点的既有读法原样传参（零漂移保证）；设置卡 deepseek 带密钥显式云档
+    # 不属本车道覆盖面，原样保留。
+    _a_reply_route = resolve_route("a_reply", os.environ, _routing_raw)
     llm_provider_name = llm_cfg.get("provider") or "local_openai"
     if os.environ.get("SCRIPTED_LLM") == "1":
         llm_provider = ScriptedLLM(
@@ -3000,14 +3080,20 @@ async def entrypoint(ctx):
             _agent_log("llm.deepseek.no_api_key", fallback="mlx")
             print("[agent] deepseek selected but DEEPSEEK_API_KEY missing — falling back to local MLX LLM", flush=True)
             llm_provider = MlxLlmLLM(
-                base_url=os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
-                model=os.environ.get("MLX_LLM_MODEL", "local"),
+                **route_llm_kwargs(
+                    _a_reply_route,
+                    env_base_url=os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
+                    cfg_model=os.environ.get("MLX_LLM_MODEL", "local"),
+                )
             )
     elif llm_provider_name in ("mlx", "local_openai", "lmstudio"):
         llm_provider = MlxLlmLLM(
-            base_url=llm_cfg.get("base_url")
-            or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
-            model=llm_cfg.get("model") or os.environ.get("MLX_LLM_MODEL", ""),
+            **route_llm_kwargs(
+                _a_reply_route,
+                env_base_url=llm_cfg.get("base_url")
+                or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
+                cfg_model=llm_cfg.get("model") or os.environ.get("MLX_LLM_MODEL", ""),
+            )
         )
     elif llm_provider_name == "fake":
         from .providers.livekit_plugins import ScriptedLLM
@@ -3019,8 +3105,11 @@ async def entrypoint(ctx):
         _agent_log("llm.unknown_provider", provider=llm_provider_name, fallback="mlx")
         print(f"[agent] unknown llm provider {llm_provider_name!r} — falling back to local MLX LLM", flush=True)
         llm_provider = MlxLlmLLM(
-            base_url=os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
-            model=os.environ.get("MLX_LLM_MODEL", ""),
+            **route_llm_kwargs(
+                _a_reply_route,
+                env_base_url=os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
+                cfg_model=os.environ.get("MLX_LLM_MODEL", ""),
+            )
         )
 
     # 确定性 mood 通道：无论模型是否遵守「吐 <expr> 标签」的指令，
@@ -3198,8 +3287,17 @@ async def entrypoint(ctx):
             "filter_emoji",
             *([_strip_emotion_tag_pilot] if os.environ.get("EMOTION_TAG_PILOT", "0") == "1" else []),
             _strip_expr_markup,
+            # 阶段1·P1 说话自然度(2026-09-25):语气/停顿标记白名单 sanitize;
+            # 门关(非 2.8 合成档 / BOK_A_LINE_VOICE_TAGS=0)自动退化为全剥。
+            make_tts_voice_style_transform(voice_style_enabled_for_tts(tts_provider)),
         ],
     )
+    # 【说话自然度】prompt 块渲染门:与 TTS transform 同一把尺(实际合成档;
+    # persona 覆写非 2.8 时块缺席+标记全剥,双保险防标记被当文本念出)。
+    try:
+        context_state.set_voice_style(voice_style_enabled_for_tts(tts_provider))
+    except Exception:  # pragma: no cover - 置位失败唔阻装配
+        pass
     # 垫话编排(PR-2;2026-09-09 改版):LLM 临场慢轮回复首音频 ~700ms 未到 → 播
     # 预合成应承语,真回复出声即停。**通道=BackgroundAudioPlayer out-of-band 音轨**
     # (官方组件,独立 track 即刻出声)——旧 session.say() 走 speech 队列,1.8 调度
@@ -3559,8 +3657,9 @@ async def entrypoint(ctx):
             return
         if role == "assistant":
             # 与音频同守则:模型若输出发音/拼音教学,转录也落「请再报单号」罐頭,
-            # 唔好畀课程留喺通话记录(下次摘要又会引用返)。
-            text = lecture_guard(text, language_state.lang if language_state.lang in ("zh", "cantonese") else None)
+            # 唔好畀课程留喺通话记录(下次摘要又会引用返)。标记先剥(阶段1·P1:
+            # turns 账本不带语气/停顿标记——标记只活在合成层)。
+            text = lecture_guard(strip_voice_style(text), language_state.lang if language_state.lang in ("zh", "cantonese") else None)
         # 审计闭环(2026-09-07):每轮带上最近一次官方 metrics 的 LLM TTFT 作
         # latency_ms + 通话语言——之前 CP 侧丢弃,审计面无延迟档案可查。
         latency = int(_turn_metrics.get("llm_ttft_ms") or 0) if role == "assistant" else 0
@@ -3712,18 +3811,22 @@ async def entrypoint(ctx):
         if text:
             if role == "assistant":
                 # PrefillSpeculator:历史条目原文（含 expr 标记）——投机预热按下
-                # 一条请求的严格前缀组装,assistant 段必须与框架追加进历史的
-                # 逐字节一致(last_reply 是清洗后的锚文本,直接用会分叉白暖)。
+                # 一条请求的严格前缀组装,assistant 段必须与真实请求逐字节一致。
+                # 阶段1·P1:出站请求在 MlxLlmLLM._snapshot_create 统一剥语气/
+                # 停顿标记(防 4B 复制引力),此处投机预热同款剥——两边字节对齐,
+                # 否则预热前缀永不相等=每轮全量重 prefill(soak p50 3255ms 实证)。
                 if _prefill_spec is not None:
                     try:
-                        _prefill_spec.on_reply_history_text(text)
+                        _prefill_spec.on_reply_history_text(
+                            strip_voice_style(text) if role == "assistant" else text
+                        )
                     except Exception:  # noqa: BLE001 - 预热原料失败唔阻主流程
                         pass
                 # 尾部重复锚同步写(R3 治原句/近原句复述):lecture_guard 守则与摘要
                 # 记忆同一把尺(转录落咗罐頭,記憶/錨都唔可以留原稿)。
                 try:
                     guarded = lecture_guard(
-                        text,
+                        strip_voice_style(text),
                         language_state.lang if language_state.lang in ("zh", "cantonese") else None,
                     )
                     context_state.set_last_reply(_clean_transcript(guarded))
@@ -3733,7 +3836,7 @@ async def entrypoint(ctx):
             # 引用,事件循环只持弱引用——GC 中途回收=每轮记忆写入静默丢失。复用
             # _spawn_report 纯当「在途任务池+失败打点」用:REPORT_TASK_ERR 是通用
             # 后台任务失败标记,此处非语义上的「上报」,协程名不同是既有事实。
-            _spawn_report(_async_update_context(role, text))
+            _spawn_report(_async_update_context(role, strip_voice_style(text) if role == "assistant" else text))
 
     # 会话关闭事件：置位后 supervisor watcher 退出、结算触发。
     closed = asyncio.Event()
@@ -3994,16 +4097,15 @@ async def entrypoint(ctx):
 
             # judge 专线优先(FLOW_JUDGE_*,bok.py 注入指向 :1237 9B——后台判定
             # 是 fire-and-forget 重活,大模型判定质量↑且与活通话回复的 :1235
-            # 完全隔离;env 缺席=原链路,零配置零变化)。
-            jbase = (
-                os.environ.get("FLOW_JUDGE_LLM_BASE_URL", "").strip()
-                or (llm_cfg.get("base_url") or "")
-                or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1")
-            ).rstrip("/")
-            jmodel = (
-                os.environ.get("FLOW_JUDGE_LLM_MODEL", "").strip()
-                or llm_cfg.get("model")
-                or os.environ.get("MLX_LLM_MODEL", "")
+            # 完全隔离;env 缺席=原链路,零配置零变化)。2026-09-25 起经模型路由
+            # judge 车道解析(routing openai 档=表下发端点/模型/密钥+思考旗;
+            # env 档=旧链逐字节,零漂移保证)。_routing_raw 为当通闭包值,
+            # worker 并发多通不串线。
+            jbase, jmodel, jkey, jthinking = _judge_lane_target(
+                resolve_route("judge", os.environ, _routing_raw),
+                os.environ,
+                llm_base_url=llm_cfg.get("base_url") or "",
+                llm_model=llm_cfg.get("model") or "",
             )
             if not jbase or not jmodel:
                 return
@@ -4020,7 +4122,7 @@ async def entrypoint(ctx):
                 route_enabled=route_enabled,
             )
             _raw = await _llm_judge(
-                jbase, jmodel, msgs, api_key=os.environ.get("FLOW_JUDGE_LLM_API_KEY", "mlx")
+                jbase, jmodel, msgs, api_key=jkey, enable_thinking=jthinking
             )
             jv = parse_judge_output(_raw)
             if route_enabled:
@@ -4121,16 +4223,14 @@ async def entrypoint(ctx):
             await _judge_yield()
             from .flow import build_intent_judge_messages, parse_intent_judge_output
 
-            # 判定专线解析与 _background_flow_judge 逐字同源(FLOW_JUDGE_* → llm 卡 → MLX)。
-            jbase = (
-                os.environ.get("FLOW_JUDGE_LLM_BASE_URL", "").strip()
-                or (llm_cfg.get("base_url") or "")
-                or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1")
-            ).rstrip("/")
-            jmodel = (
-                os.environ.get("FLOW_JUDGE_LLM_MODEL", "").strip()
-                or llm_cfg.get("model")
-                or os.environ.get("MLX_LLM_MODEL", "")
+            # 判定专线解析与 _background_flow_judge 逐字同源(FLOW_JUDGE_* → llm 卡
+            # → MLX);2026-09-25 起经模型路由 judge 车道(同上:openai 档换端点/模型/
+            # 密钥+思考旗,env 档旧链逐字节;_routing_raw 当通闭包值不串线)。
+            jbase, jmodel, jkey, jthinking = _judge_lane_target(
+                resolve_route("judge", os.environ, _routing_raw),
+                os.environ,
+                llm_base_url=llm_cfg.get("base_url") or "",
+                llm_model=llm_cfg.get("model") or "",
             )
             if not jbase or not jmodel:
                 # review N11:endpoint 缺席静默 return 会让 judge_scheduled 后无下文
@@ -4160,7 +4260,8 @@ async def entrypoint(ctx):
                 msgs,
                 max_tokens=32,
                 timeout=20.0,
-                api_key=os.environ.get("FLOW_JUDGE_LLM_API_KEY", "mlx"),
+                api_key=jkey,
+                enable_thinking=jthinking,
             )
             _gjhit = parse_intent_judge_output(_gjtext, [i.id for i in candidates])
             # store 守卫(与 flow judge 换步守卫同源):判定期间已换步/暂停/收线/开关

@@ -48,7 +48,9 @@ def _status(cache: TtsAudioCache, templates=None, texts=None) -> dict[str, str]:
     return pregen_tts._branch_status(
         templates if templates is not None else [_TPL],
         _LANG_PERSONAS,
-        tts_cfg={}, voice_mode="single", model="speech-2.8-hd", cache=cache,
+        # F-11:状态面与运行时同源,minimax 上下文(空配置缺省 qwen3_tts 会被
+        # provider 闸视为不可合成上下文)。
+        tts_cfg={"provider": "minimax"}, voice_mode="single", model="speech-2.8-hd", cache=cache,
         texts=texts,
     )
 
@@ -67,7 +69,7 @@ def test_branch_status_three_states_and_marker_key(tmp_path):
     assert plan["您的包裹已经到驿站了，凭取件码就能取。"] == "missing"
     assert plan["【转人工】好的，马上为您转接人工客服处理赔偿。"] == "missing"
     # 音频文本=剥标记后渲染:以剥标记文本算 key 物化后,带标记键翻 ok
-    voice = pregen_tts._persona_resolved_voice(None, "zh", {}, "single")
+    voice = pregen_tts._persona_resolved_voice(None, "zh", {"provider": "minimax"}, "single")
     from agent_runtime.providers.livekit_plugins import minimax_speed_for
 
     text = "好的，马上为您转接人工客服处理赔偿。"
@@ -96,7 +98,7 @@ def test_branch_status_cross_language_any_hit_is_ok(tmp_path):
             ensure_ascii=False)},
     ]
     # zh 版物化、粤版未物化:任一上下文命中即 ok(运行时该语言通话即可播录音)
-    voice = pregen_tts._persona_resolved_voice(None, "zh", {}, "single")
+    voice = pregen_tts._persona_resolved_voice(None, "zh", {"provider": "minimax"}, "single")
     from agent_runtime.providers.livekit_plugins import minimax_speed_for
 
     text = "您的包裹已经到驿站了，凭取件码就能取。"

@@ -1,6 +1,6 @@
 declare global {
   interface Window {
-    __BOK_CONFIG__?: { cpUrl?: string; livekitUrl?: string };
+    __BOK_CONFIG__?: { cpUrl?: string; livekitUrl?: string; registryUrl?: string };
   }
 }
 
@@ -12,6 +12,16 @@ export function apiBase(): string {
     return window.__BOK_CONFIG__.cpUrl;
   }
   return process.env.NEXT_PUBLIC_CONTROL_PLANE_URL ?? "http://127.0.0.1:8000";
+}
+
+// 节点注册表基址（F2，2026-09-24 双 CP 拓扑）：/api/nodes* 走注册 CP（管理面 A），
+// 业务 API 走 apiBase()（工作 CP）。单 CP 形态 registryUrl 未注入 → 回 apiBase()
+// 零变化；appliance 双 CP 档 node_agent 的 runtime-config 注入 registryUrl=A。
+export function registryBase(): string {
+  if (typeof window !== "undefined" && window.__BOK_CONFIG__?.registryUrl) {
+    return window.__BOK_CONFIG__.registryUrl;
+  }
+  return apiBase();
 }
 
 async function toError(res: Response): Promise<Error> {
@@ -49,7 +59,7 @@ function handleUnauthorized(path: string) {
   window.location.href = "/login/";
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+async function request<T>(path: string, init?: RequestInit, base?: string): Promise<T> {
   // correlation 透传:前端生成 request_id,audit 行可与前端动作对账;
   // call_id 由调用方在 headers 显式带(init.headers 里已有则不覆盖)。
   const extra = new Headers(init?.headers);
@@ -61,7 +71,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   extra.forEach((v, k) => {
     headers[k] = v;
   });
-  const res = await fetch(`${apiBase()}${path}`, { ...init, headers });
+  const res = await fetch(`${base ?? apiBase()}${path}`, { ...init, headers });
   if (!res.ok) {
     if (res.status === 401) handleUnauthorized(path);
     throw await toError(res);
@@ -163,6 +173,41 @@ export const api = {
     }),
   getSettings: () => request<Record<string, unknown>>("/api/settings"),
   saveSettings: (body: unknown) => request<Record<string, unknown>>("/api/settings", { method: "PUT", body: JSON.stringify(body) }),
+  // 模型路由（2026-09-25 §2.4，root 专属）：五车道 LLM 路由 + 档位预置。
+  // PUT 契约：api_key 空=保留旧值；openai 档 base_url+model 必填，400 返回
+  // {"errors":[…]}——shared request() 只认 detail 字符串，此处自解 errors 拼可读消息。
+  getModelRouting: () =>
+    request<ModelRoutingReport>("/api/model-routing"),
+  saveModelRouting: (lanes: Record<string, unknown>) =>
+    fetch(`${apiBase()}/api/model-routing`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ lanes }),
+    }).then(async (res) => {
+      if (!res.ok) {
+        let msg = `${res.status} ${res.statusText}`;
+        try {
+          const body = await res.json();
+          if (Array.isArray(body?.errors) && body.errors.length) msg = body.errors.join("；");
+          else if (typeof body?.detail === "string" && body.detail) msg = body.detail;
+        } catch {
+          /* 非 JSON 响应（网关错误页等）忽略，回退状态行 */
+        }
+        throw new Error(msg);
+      }
+      return res.json() as Promise<Record<string, unknown>>;
+    }),
+  testModelRouting: (lane: string) =>
+    request<ModelRoutingTestResult>("/api/model-routing/test", { method: "POST", body: JSON.stringify({ lane }) }),
+  createModelRoutingPreset: (name: string) =>
+    request<{ ok: boolean }>("/api/model-routing/presets", { method: "POST", body: JSON.stringify({ name }) }),
+  applyModelRoutingPreset: (name: string) =>
+    request<{ ok: boolean; lanes: Record<string, ModelRoutingLaneConfig> }>(
+      `/api/model-routing/presets/${encodeURIComponent(name)}/apply`,
+      { method: "POST" },
+    ),
+  deleteModelRoutingPreset: (name: string) =>
+    request<{ ok: boolean }>(`/api/model-routing/presets/${encodeURIComponent(name)}`, { method: "DELETE" }),
   // 电话边缘站点（P1.5）：站点下拉 + 一次性把 SIP 供应商凭据注册成 outbound trunk。
   // 注册成功返回 trunk_id——调用方回填设置表单的 sip.trunk_id（保存后 campaign 按站点取）。
   listSites: (accountId = "acc-001") =>
@@ -358,18 +403,21 @@ export const api = {
     ),
   // 节点注册表（P1 平台面，root 专属）：清单 + 吊销/解除吊销（kill-switch UI）。
   // unrevoke 后端 409=节点本就未吊销（live），404=节点不存在，均由页面内联展示。
-  listNodes: () => request<NodeRow[]>("/api/nodes"),
+  // 全族走 registryBase()（F2）：双 CP 档注册表在管理面 A，业务 CP 上是空表。
+  listNodes: () => request<NodeRow[]>("/api/nodes", undefined, registryBase()),
   revokeNode: (nodeId: string) =>
     request<{ node_id: string; revoked: boolean }>(
       `/api/nodes/${encodeURIComponent(nodeId)}/revoke`,
       { method: "POST" },
+      registryBase(),
     ),
   unrevokeNode: (nodeId: string) =>
     request<{ node_id: string; revoked: boolean }>(
       `/api/nodes/${encodeURIComponent(nodeId)}/unrevoke`,
       { method: "POST" },
+      registryBase(),
     ),
-  // 远程日志通道（W2）：下发取日志指令 → 节点下个心跳周期上传 → root 查看下载。
+  // 远程日志通道（W2）：下发取日志指令 → 节点下个心跳周期上传 → root 查看。
   enqueueNodeCommand: (
     nodeId: string,
     body: { action: string; version?: string; force?: boolean },
@@ -377,14 +425,17 @@ export const api = {
     request<{ id: string; status: string }>(
       `/api/nodes/${encodeURIComponent(nodeId)}/commands`,
       { method: "POST", body: JSON.stringify(body) },
+      registryBase(),
     ),
   listNodeLogs: (nodeId: string) =>
     request<NodeLogFile[]>(
       `/api/nodes/${encodeURIComponent(nodeId)}/logs`,
+      undefined,
+      registryBase(),
     ),
   downloadNodeLog: (nodeId: string, file: string) =>
     fetch(
-      `${apiBase()}/api/nodes/${encodeURIComponent(nodeId)}/logs/${encodeURIComponent(file)}`,
+      `${registryBase()}/api/nodes/${encodeURIComponent(nodeId)}/logs/${encodeURIComponent(file)}`,
       { headers: authHeaders() },
     ).then(async (res) => {
       if (!res.ok) throw await toError(res);
@@ -409,6 +460,31 @@ export type SetupStatus = {
   ready: boolean;
   models: SetupModelStatus[];
   error?: string;
+};
+
+// ---- 模型路由（root 专属，GET /api/model-routing 契约形状） ----
+// 五车道：a_reply / judge / mt / settle / mining（lib 层不钉枚举，键以 CP 为准）。
+export type ModelRoutingLaneConfig = {
+  provider: "local" | "openai";
+  base_url: string;
+  model: string;
+  /** 读回恒空串（掩码）；是否已配置看 has_api_key */
+  api_key: string;
+  has_api_key: boolean;
+  extra?: { enable_thinking?: boolean };
+};
+
+export type ModelRoutingReport = {
+  lanes: Record<string, ModelRoutingLaneConfig>;
+  /** 命名档位=五车道整表快照（只存路由值不含密钥） */
+  presets: Record<string, Record<string, ModelRoutingLaneConfig>>;
+};
+
+export type ModelRoutingTestResult = {
+  ok: boolean;
+  latency_ms: number;
+  model: string;
+  error: string | null;
 };
 
 // ---- 快路覆盖率 + 漏网轮候选（L-① 学习驾驶舱，GET /api/stats/llm-gaps 契约形状） ----

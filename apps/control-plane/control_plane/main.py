@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import io
@@ -9,6 +10,8 @@ import json
 import os
 import re
 import sys
+import threading
+import time
 import uuid
 import wave
 from collections import defaultdict, deque
@@ -18,16 +21,34 @@ from typing import Any
 
 import httpx
 from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 from bok_voice_core.flow_graph import validate_flow_graph
 from bok_voice_core.intent_rules import validate_conditions
+from bok_voice_core.model_routes import (
+    LANES as MODEL_LANES,
+    PROVIDER_OPENAI as MODEL_PROVIDER_OPENAI,
+    parse_routing as parse_model_routing,
+    resolve_route as resolve_model_route,
+    validate_routing as validate_model_routing,
+)
 from bok_voice_core.providers import BusinessRepository
 from bok_voice_core.policies import select_session_manifest
 from bok_voice_core.qa_text import mine_qa_pairs
 from bok_voice_core.types import CallMode, CallStatus, Role, SessionManifest, TurnEvent
+# M-22③(2026-09-23 修复波#4):steps_json 分支行内部指令保存校验(教练文案进
+# 罐头挡在写入口);动作前缀镜像件+检测判据在 canned_guard。
+from bok_voice_core.canned_guard import (
+    coach_hits,
+    strip_branch_action_prefix,
+)
+# 分支行语法镜像(条件+应答两组):gap_proposals._BRANCH_COND_RE 逐字节镜像
+# flow.py _BRANCH_LINE_RE(L-② 判例,改语法三处同步 flow.py/flow-canvas.ts/
+# gap_proposals)——本校验复用同一镜像点,不另立第四份拷贝。
+from .gap_proposals import _BRANCH_COND_RE as _BRANCH_LINE_COND_RE
 
 from bok_voice_core.settlement import SettlementTrigger
 from bok_voice_core.embeddings import CharHashEmbedding, HybridLexicalEmbedding
@@ -39,6 +60,7 @@ from bok_voice_obs.audit import AuditEvent, AuditStore, audit_store
 from bok_voice_obs.context import get_correlation
 from bok_voice_obs.logging import configure_logging, get_logger
 from bok_voice_obs.middleware import CorrelationMiddleware
+from bok_voice_obs.provider_health import scan_provider_health
 
 from .campaign import (
     parse_call_windows,
@@ -47,7 +69,14 @@ from .campaign import (
     redispatch_policy,
     _utcnow_naive,
 )
-from .deps import build_engine, build_repository, build_session_factory
+from .deps import (
+    bind_routing_storage,
+    build_engine,
+    build_repository,
+    build_session_factory,
+    read_model_routing_raw,
+    write_model_routing_raw,
+)
 from .dispatch_utils import cleanup_dispatch, has_active_dispatch
 from .nodes_store import HEARTBEAT_INTERVAL_S, LicenseError, NodeStore
 from .permissions import (
@@ -65,6 +94,7 @@ from . import qa_cluster as qa_cluster_mod
 from . import gap_mining
 from . import gap_proposals
 from . import qa_drift
+from . import silence_poke
 from .auth import (
     Identity,
     JWT_TTL_S,
@@ -203,6 +233,50 @@ app.add_middleware(
 app.add_middleware(CorrelationMiddleware)
 
 
+# M-6（fix-wave-3，task-12 F-Major-1）：validation error 的 `input` echo 深嵌套
+# 爆栈护栏。FastAPI 缺省 handler 对 `exc.errors()` 跑 `jsonable_encoder`——1000 层
+# 深嵌套 JSON（task-12 fuzz F9）令 echo 递归爆栈 RecursionError 500（任意持
+# calls 键身份可反复触发的一次性 DoS 面）。自定义 handler：错误明细（type/loc/msg，
+# 普通输错的可诊断性）原样保留，`input` 过 `_safe_validation_input` 有界化
+# （深度 ≤4、每层 ≤16 键/项、叶子 repr ≤200 字）→ 畸形输入恒 422 不再 500。
+_VALIDATION_INPUT_MAX_DEPTH = 4
+_VALIDATION_INPUT_MAX_WIDTH = 16
+_VALIDATION_INPUT_MAX_LEAF = 200
+
+
+def _safe_validation_input(value: Any, _depth: int = 0) -> Any:
+    """validation error `input` echo 的有界化（纯函数，离线可测）。
+
+    浅层小值原样（422 提示哪些字段送错了什么）；dict/list 超深度截为标记串、
+    超宽度截断；叶子 repr ≤200 字。任何产出都可 json.dumps（防再入 RecursionError）。
+    """
+    if isinstance(value, dict):
+        if _depth >= _VALIDATION_INPUT_MAX_DEPTH:
+            return "<truncated: nested too deep>"
+        return {
+            str(k)[:_VALIDATION_INPUT_MAX_LEAF]: _safe_validation_input(v, _depth + 1)
+            for k, v in list(value.items())[:_VALIDATION_INPUT_MAX_WIDTH]
+        }
+    if isinstance(value, (list, tuple)):
+        if _depth >= _VALIDATION_INPUT_MAX_DEPTH:
+            return "<truncated: nested too deep>"
+        return [_safe_validation_input(v, _depth + 1) for v in list(value)[:_VALIDATION_INPUT_MAX_WIDTH]]
+    if isinstance(value, str):
+        return value if len(value) <= _VALIDATION_INPUT_MAX_LEAF else value[:_VALIDATION_INPUT_MAX_LEAF] + "…"
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value  # JSON 原生标量原样（input 来自解析后的请求体）
+    return repr(value)[:_VALIDATION_INPUT_MAX_LEAF]
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    errors = [
+        {**err, "input": _safe_validation_input(err.get("input"))} if "input" in err else err
+        for err in exc.errors()
+    ]
+    return JSONResponse(status_code=422, content={"detail": errors})
+
+
 @app.middleware("http")
 async def optional_bearer_auth(request: Request, call_next):
     """可选 Bearer 鉴权（R2）：BOK_CP_TOKEN 未设=全放行（本机单用户形态零变化）。
@@ -333,6 +407,16 @@ def _seed_root_user() -> None:
 
 
 @app.on_event("startup")
+async def _capture_main_loop() -> None:
+    """I-1（fix round 1）：捕获 CP 主事件循环，看门狗作业经
+    run_coroutine_threadsafe 挂本 loop 跑——与 webhook 恢复链共用的
+    `_redispatch_locks`（asyncio.Lock）锁域归一（async handler 在主 loop 上执行，
+    get_running_loop 即服务 loop）。"""
+    global _main_loop
+    _main_loop = asyncio.get_running_loop()
+
+
+@app.on_event("startup")
 def _startup() -> None:
     configure_logging(level=os.environ.get("BOK_LOG_LEVEL", "INFO"))
     # 启动锚（Item 1）：非回环 bind × 双关 = 全 API 裸放行对外，拒绝启动。
@@ -360,6 +444,9 @@ def _startup() -> None:
     # 禁用/删号立即 401、role 以库为准（降权即时生效），不再吃满 8h TTL。
     app.state.user_lookup = lambda user_id: _repo().get_user(user_id)
     app.state.session_factory = build_session_factory(engine)
+    # 模型路由存储（2026-09-25）：与 repo 同 engine 的 session factory；None
+    # （单机内存形态）时 deps 侧自动回落模块级内存。
+    bind_routing_storage(app.state.session_factory)
     app.state.lk_key = os.environ.get("LIVEKIT_API_KEY", "")
     app.state.lk_secret = os.environ.get("LIVEKIT_API_SECRET", "")
     app.state.lk_url = os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880")
@@ -506,13 +593,19 @@ def health() -> dict:
 def get_settings(request: Request, internal: bool = False) -> dict:
     # 设置=节点运维面（含云端凭据），话务员不可见；agent 机器通道直通（下发制键闸）。
     _gate_management(request, "settings")
-    raw = _repo().get_settings()
+    # 浅拷贝后才动：内存仓 get_settings 返回活引用，直接写 model_routing_json
+    # 会把该键持久化进仓（随后掩码面 _mask_secrets 撞字符串 500）。
+    raw = dict(_repo().get_settings())
     if internal:
         # 密钥面收口（2026-09-20 下发制）：明文回源只认 root 与机器通道——
         # admin 浏览器面恒掩码，被盗 admin 凭据拉不走云凭据（MiniMax key 等）。
         ident = current_identity(request)
         if ident is not None and ident.role != "root":
             raise HTTPException(403, "明文设置仅平台方（root）可读")
+        # 模型路由统一（2026-09-25 阶段 0）：internal 明文面附原始路由表串
+        # （含各车道 api_key，root+机器通道专属）；普通掩码面完全不含该键
+        # （admin 不得见，仓库层 get_settings 本就不含此列）。
+        raw["model_routing_json"] = read_model_routing_raw()
         return raw
     masked = {k: _mask_secrets(v) for k, v in raw.items() if k != "policy"}
     masked["policy"] = raw.get("policy", "offline_first")
@@ -567,6 +660,251 @@ def _mask_secrets(config: dict) -> dict:
             out[key] = ""
             out[f"has_{key}"] = True
     return out
+
+
+# ---- 模型路由统一（2026-09-25 阶段 0，root+机器通道专属）----
+# 五车道（a_reply/judge/mt/settle/mining）本地↔云端路由表 + 档位预置。权限同
+# /api/nodes 先例：require_role("root")——机器通道恒直通、auth-off 直通、admin/
+# user 403；**不进管理键目录**（下发面板看不见，admin 授不了，计划 §2.4 红线）。
+# 契约单点 packages/core/bok_voice_core/model_routes.py；存储 deps.read/write_
+# model_routing_raw（SQL 列或内存态）。密钥面：掩码回读恒空串+has_api_key 布尔
+# （sms secret 先例）；明文仅 GET ?internal=1（root+机器通道，同 settings 先例）；
+# PUT 空 key=保留旧值；审计零密钥材料。
+
+
+class ModelRoutingPutRequest(BaseModel):
+    # 车道值原样透传给共享契约解析（宽容：未知车道丢弃、缺字段补默认）。
+    lanes: dict[str, dict] = {}
+
+
+class ModelRoutingPresetSaveRequest(BaseModel):
+    name: str
+
+
+class ModelRoutingTestRequest(BaseModel):
+    lane: str
+
+
+_PRESET_NAME_BAD_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+
+
+def _sanitize_preset_name(raw: str) -> str:
+    """预置名=档位标签不是路径：剥路径/控制字符后仍须 1-32 字，非法 400。"""
+    name = _PRESET_NAME_BAD_RE.sub("", str(raw or "")).strip()
+    if not name or len(name) > 32:
+        raise HTTPException(400, "预置名非法（1-32 字，不含路径字符）")
+    return name
+
+
+def _routing_lane_view(cfg: dict, *, masked: bool) -> dict:
+    """单车道出仓视图：masked=True 时 api_key 恒空串、只给 has_api_key 布尔。"""
+    key = str((cfg or {}).get("api_key") or "")
+    return {
+        "provider": str((cfg or {}).get("provider") or "local"),
+        "base_url": str((cfg or {}).get("base_url") or ""),
+        "model": str((cfg or {}).get("model") or ""),
+        "api_key": "" if masked else key,
+        "has_api_key": bool(key),
+        "extra": {
+            "enable_thinking": bool(
+                ((cfg or {}).get("extra") or {}).get("enable_thinking", False)
+            )
+        },
+    }
+
+
+def _routing_preset_view(preset: dict) -> dict:
+    """预置条目出仓视图：预置无密钥概念（保存面已剥），has_api_key 恒 false。"""
+    return {
+        lane: {
+            "provider": str(cfg.get("provider") or "local"),
+            "base_url": str(cfg.get("base_url") or ""),
+            "model": str(cfg.get("model") or ""),
+            "api_key": "",
+            "has_api_key": False,
+            "extra": {
+                "enable_thinking": bool((cfg.get("extra") or {}).get("enable_thinking", False))
+            },
+        }
+        for lane, cfg in (preset or {}).items()
+    }
+
+
+def _routing_response(internal: bool) -> dict:
+    parsed = parse_model_routing(read_model_routing_raw())
+    # 五车道恒齐（未配置=缺省视图）——web 面拿稳定形状渲染。
+    lanes = {
+        lane: _routing_lane_view(parsed["lanes"].get(lane) or {}, masked=not internal)
+        for lane in MODEL_LANES
+    }
+    presets = {name: _routing_preset_view(p) for name, p in parsed["presets"].items()}
+    return {"lanes": lanes, "presets": presets}
+
+
+def _routing_store_doc(stored: dict) -> None:
+    """规范化后的 {lanes, presets} 写回列（JSON 序列化单点）。"""
+    write_model_routing_raw(json.dumps(
+        {"lanes": stored["lanes"], "presets": stored["presets"]}, ensure_ascii=False
+    ))
+
+
+@app.get("/api/model-routing")
+def get_model_routing(request: Request, internal: bool = False) -> dict:
+    require_role(request, "root")
+    if internal:
+        # 明文 key 与 settings?internal=1 同红线：admin 403（root/机器通道直通）。
+        ident = current_identity(request)
+        if ident is not None and ident.role != "root":
+            raise HTTPException(403, "明文设置仅平台方（root）可读")
+    return _routing_response(internal=internal)
+
+
+@app.put("/api/model-routing")
+def put_model_routing(req: ModelRoutingPutRequest, request: Request) -> dict:
+    require_role(request, "root")
+    errors = validate_model_routing({"lanes": req.lanes})
+    if errors:
+        # 保存校验（共享契约）：openai 档缺 base_url/model → 人话错误清单；
+        # api_key 空=保留旧值（放行），不是校验错误。
+        return JSONResponse(status_code=400, content={"errors": errors})
+    stored = parse_model_routing(read_model_routing_raw())
+    incoming = parse_model_routing({"lanes": req.lanes})["lanes"]
+    merged = dict(stored["lanes"])
+    for lane, cfg in incoming.items():
+        if not cfg["api_key"]:
+            # 空传=保留旧值（sms secret 先例）——掩码读回的 UI 恒回空串，
+            # 不合并会把已存密钥洗掉。
+            cfg["api_key"] = str((merged.get(lane) or {}).get("api_key") or "")
+        merged[lane] = cfg
+    _routing_store_doc({"lanes": merged, "presets": stored["presets"]})
+    _audit(
+        "model_routing.update",
+        subject_type="global_settings",
+        subject_id="model_routing",
+        detail={
+            lane: {"provider": cfg["provider"], "base_url": cfg["base_url"], "model": cfg["model"]}
+            for lane, cfg in incoming.items()
+        },
+    )
+    return _routing_response(internal=False)
+
+
+@app.post("/api/model-routing/presets")
+def save_model_routing_preset(req: ModelRoutingPresetSaveRequest, request: Request) -> dict:
+    require_role(request, "root")
+    name = _sanitize_preset_name(req.name)
+    stored = parse_model_routing(read_model_routing_raw())
+    # 快照=当前 lanes 剥 api_key（预置只存路由值不含密钥，计划 §2.2）。
+    snapshot = {
+        lane: {**cfg, "api_key": ""} for lane, cfg in stored["lanes"].items()
+    }
+    stored["presets"][name] = snapshot
+    _routing_store_doc(stored)
+    _audit(
+        "model_routing.preset_save",
+        subject_type="global_settings",
+        subject_id="model_routing",
+        detail={"name": name, "lanes": sorted(snapshot)},
+    )
+    return {"ok": True, **_routing_response(internal=False)}
+
+
+@app.post("/api/model-routing/presets/{name}/apply")
+def apply_model_routing_preset(name: str, request: Request) -> dict:
+    require_role(request, "root")
+    key = _sanitize_preset_name(name)
+    stored = parse_model_routing(read_model_routing_raw())
+    preset = stored["presets"].get(key)
+    if not preset:
+        raise HTTPException(404, "preset not found")
+    merged = dict(stored["lanes"])
+    applied: list[str] = []
+    for lane, cfg in preset.items():
+        # 预置无 api_key 的车道保留现值——套档误操作=再套回，密钥无损。
+        merged[lane] = {**cfg, "api_key": str((merged.get(lane) or {}).get("api_key") or "")}
+        applied.append(lane)
+    _routing_store_doc({"lanes": merged, "presets": stored["presets"]})
+    _audit(
+        "model_routing.preset_apply",
+        subject_type="global_settings",
+        subject_id="model_routing",
+        detail={"name": key, "lanes": applied},
+    )
+    return {"ok": True, **_routing_response(internal=False)}
+
+
+@app.delete("/api/model-routing/presets/{name}")
+def delete_model_routing_preset(name: str, request: Request) -> dict:
+    require_role(request, "root")
+    key = _sanitize_preset_name(name)
+    stored = parse_model_routing(read_model_routing_raw())
+    if key not in stored["presets"]:
+        raise HTTPException(404, "preset not found")
+    del stored["presets"][key]
+    _routing_store_doc(stored)
+    _audit(
+        "model_routing.preset_delete",
+        subject_type="global_settings",
+        subject_id="model_routing",
+        detail={"name": key},
+    )
+    return {"ok": True}
+
+
+@app.post("/api/model-routing/test")
+def test_model_routing(req: ModelRoutingTestRequest, request: Request) -> dict:
+    """车道探活（计划 §2.5）：当前配置发 max_tokens=1 请求，回延迟+模型回显。
+
+    任何网络/协议失败折成 ok=false 错误串——探活**绝不 500**（informational 面）。
+    model 空（env 缺省档）先 GET /models 取第一个 id（qa_cluster 发现先例）。
+    """
+    require_role(request, "root")
+    if req.lane not in MODEL_LANES:
+        return JSONResponse(status_code=400, content={"error": f"未知车道: {req.lane}"})
+    route = resolve_model_route(req.lane, os.environ, read_model_routing_raw())
+    if not route.base_url:
+        # mt 旧回退语义：MT_LLM_BASE_URL 未设=无显式端点，探活无意义。
+        return JSONResponse(status_code=400, content={"error": "该车道未配置显式端点"})
+    headers: dict = {}
+    if route.provider == MODEL_PROVIDER_OPENAI and route.api_key:
+        # 本地档 api_key="mlx" 不塞请求头（共享契约铁律：不得因契约把假 key 塞进
+        # 原本不带 key 的请求）。
+        headers["Authorization"] = f"Bearer {route.api_key}"
+    model = route.model
+    started = time.monotonic()
+    try:
+        if not model:
+            resp = httpx.get(f"{route.base_url}/models", timeout=10, headers=headers)
+            resp.raise_for_status()
+            ids = [str(d.get("id") or "") for d in (resp.json().get("data") or [])]
+            # 与 bok._probe_llm 同款：mlx_lm 的 /models 列**全模型目录**，绝对路径 id
+            # 才是本 server 实际托管的那只（裸 repo id 还会触发 HF hub 解析）——
+            # ids[0] 直接拿会探到别的模型（2026-09-26 本机实证：:1235 回显 MT2）。
+            model = next((i for i in ids if i.startswith("/")), ids[0] if ids else "")
+        if not model:
+            return {"ok": False, "latency_ms": 0, "model": "",
+                    "error": "端点未返回可用模型（/models 空）"}
+        resp = httpx.post(
+            f"{route.base_url}/chat/completions",
+            # messages 必带：mlx_lm handle_chat_completions 首行 assert "messages" in
+            # body——缺字段=断言炸 handler、连接直接断（RemoteProtocolError 实证）。
+            # prompt 用中长句而非超短 ASCII：Hy-MT2 的 chat template 对超短 ASCII
+            # 输入会 list index out of range 404（bok._probe_llm docstring 实测）。
+            json={"model": model, "max_tokens": 1,
+                  "messages": [{"role": "user", "content": "连接测试：请确认服务可用。"}]},
+            headers=headers,
+            timeout=10,
+        )
+        latency_ms = int((time.monotonic() - started) * 1000)
+        resp.raise_for_status()
+        return {"ok": True, "latency_ms": latency_ms, "model": model, "error": None}
+    except Exception as exc:  # noqa: BLE001 - 探活失败统一 ok=false，不外抛
+        return {
+            "ok": False,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "model": model,
+            "error": repr(exc),
+        }
 
 
 def _sms_settings() -> dict:
@@ -1258,6 +1596,55 @@ def _token_rate_limit(request: Request) -> None:
     dq.append(now)
 
 
+# M-7（fix-wave-3，task-12 F-Major-2）：/api/auth/login 按用户名滑动窗口频控。
+# task-12 实测 100 连发错误密码 401×100 全放行（全仓此前仅 /api/token 与
+# /api/web_logs 有频控）。实现复制 token 频控件（同款 deque 滑窗，单进程形态
+# 够用）；键=登录体 username（strip 归一，防空白变体绕过）——登录是预认证端点，
+# JWT 身份尚不存在。IP 维不采：本栈全部调用方（web/脚本/agent/测试）共享
+# loopback，IP 频控会让本地组件互挤额度自伤；跨用户名喷洒的残余风险接受
+# （公网部署 checklist 另行把关，见 task-12 报告）。成功登录同样计入（撞库
+# 常混正确密码探测）。杀开关 BOK_LOGIN_RATE_LIMIT（默认开；"0"=关。CP 侧键，
+# bok._control_plane_env 显式下发——prod 封闭 env 面下开关不可达即死门，
+# BOK_DISPATCH_RETRY 判例；不进 agent 面的 _FORWARD_ENV）。
+_LOGIN_RATE_LIMIT = 30
+_LOGIN_RATE_WINDOW_S = 60.0
+# 键空间封顶（评审 I-1，fix round 1）：预认证键=请求体用户名，喷洒 5000+/分钟
+# 可无限撑大 dict。超限先整批清过期键（真过期键本就该走），仍超=并发 fresh 键
+# 堆积（真实喷洒攻击）→ 丢最旧键（dict 插入序）。有界化的已知代价=超额攻击
+# 可重置别人预算（逐出后重新计数）——优于无界内存增长，语义写死在测试里。
+_LOGIN_RATE_MAX_KEYS = 4096
+_login_attempt_times: dict[str, deque] = {}
+
+
+def _login_rate_limit(username: str) -> None:
+    """/api/auth/login per-username 滑动窗口频控：超限 429，放行记时间戳。"""
+    if os.environ.get("BOK_LOGIN_RATE_LIMIT", "1").strip() == "0":
+        return
+    import time as _time
+
+    now = _time.monotonic()
+    key = (username or "").strip()
+    dq = _login_attempt_times.get(key)
+    if dq is None and len(_login_attempt_times) >= _LOGIN_RATE_MAX_KEYS:
+        # 只在新键入场且已达封顶时淘金（存量键重复命中零扫描成本）。
+        dead = [
+            k for k, d in _login_attempt_times.items()
+            if not d or now - d[-1] >= _LOGIN_RATE_WINDOW_S
+        ]
+        for k in dead:
+            _login_attempt_times.pop(k, None)
+        while len(_login_attempt_times) >= _LOGIN_RATE_MAX_KEYS:
+            _login_attempt_times.pop(next(iter(_login_attempt_times)))
+        dq = None
+    if dq is None:
+        dq = _login_attempt_times.setdefault(key, deque())
+    while dq and now - dq[0] >= _LOGIN_RATE_WINDOW_S:
+        dq.popleft()
+    if len(dq) >= _LOGIN_RATE_LIMIT:
+        raise HTTPException(status_code=429, detail="login rate limited (30/min per username)")
+    dq.append(now)
+
+
 def _require_user_admin(identity: Identity | None, target_role: str, target_account: str) -> None:
     if identity is None:
         # 加固模式下 identity=None=机器通道(BOK_CP_TOKEN 持有者)——账号管理面
@@ -1285,6 +1672,7 @@ def _require_user_admin(identity: Identity | None, target_role: str, target_acco
 
 @app.post("/api/auth/login")
 def auth_login(req: LoginRequest) -> dict:
+    _login_rate_limit(req.username)
     user = _repo().get_user_by_username(req.username.strip())
     stored = str((user or {}).get("password_hash") or "")
     # 时序均衡且 fail-closed：user 缺失或其 hash 为空（数据异常）都跑同价位
@@ -1575,6 +1963,11 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
     )
     if req.participant_metadata:
         at = at.with_metadata(req.participant_metadata)
+    # M-27 看门狗排程旗标：仅 A 线 dispatch 分支置位（该分支 token 挂了 bok-voice
+    # RoomConfiguration，建房触发派发；瞬时不可用窗会静默吞派发，签发后由看门狗
+    # 兜底）。interpret/listen/recordless 均不置位（B 线短命房不自动补位、旁听
+    # 零副作用、无记录房间无 dispatch 可守——全是既有契约）。
+    _watchdog_room = ""
     # 业务维度放 participant attributes(官方机制):agent/前端按属性判定角色,
     # 替代对 identity 前缀的字符串嗅探;SIP 接入时同通道补 bok.* 属性。
     at = at.with_attributes({"bok.role": role, "bok.account_id": req.account_id})
@@ -1666,6 +2059,7 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
         # A 线 agent 隐式抢派」。metadata 带 call_id,取代已删除的 AGENT_CALL_ID env 旁路。
         from livekit.api import RoomAgentDispatch, RoomConfiguration
 
+        _watchdog_room = room
         at = at.with_room_config(
             RoomConfiguration(
                 agents=[
@@ -1708,6 +2102,9 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
         _audit("token.issued", subject_type="room", subject_id=room,
                detail={"recordless": True, "role": role, "purpose": _purpose,
                        "caller": _ident.user_id if _ident else ("machine" if _machine else "anon")})
+    if _watchdog_room:
+        # M-27：A 线 dispatch 分支签发后起派发看门狗（守护线程，绝不打断本请求）。
+        _schedule_dispatch_watchdog(_watchdog_room)
     return TokenResponse(serverUrl=url, participantToken=participant_token)
 
 
@@ -1899,6 +2296,196 @@ async def _cleanup_room_dispatch(room_name: str) -> None:
 def _is_agent_identity(identity: str) -> bool:
     """agents SDK 真实 job 入房 identity=agent-<jobid>；A 线另兼容旧 bok-voice 直名。"""
     return identity == "bok-voice" or identity.startswith("agent-")
+
+
+# ---------------------------------------------------------------------------
+# M-27 派发黑洞看门狗（2026-09-23 生产就绪修复波#2）
+#
+# 实证（task-8 §4-A / task-7 F2）：worker load>0.7 自标 unavailable 的瞬时窗
+# （~2.5s）恰跨 token 建单瞬间 → LiveKit 建房触发的 RoomConfiguration dispatch
+# 丢失且无重试 → 整轮死空气（soak 2/55 轮 ≈1.8%），通话 active 悬挂需人工收。
+# 既有 webhook 恢复链（livekit_webhook）只盖「agent 离房」（participant_left），
+# 不盖「agent 从未入房」——agent 永远没进房，participant_left 永不触发。
+#
+# 修法：token 签发（A 线 dispatch 分支）后排程看门狗——短退避窗（2/2.5/3s，
+# 总 ~7.5s 覆盖实测 ~2.5s 瞬时窗）内验证 agent 是否回房；房间已有真人而 agent
+# 缺席 = 派发丢失信号 → 与 webhook 恢复链同款纪律显式补派：终态不派（防复活）/
+# has_active_dispatch 防重（不叠加双 agent）/ per-room 锁 / attempt>0 清扫 stale
+# dispatch（OSS 缺口：agent 缺席时旧 dispatch 常驻「活跃」，不清扫则防重门永远
+# 让位=双重死锁）。房未建（无真人）= 派发根本没触发，不算丢失，只等待。
+# 末次仍缺席 → 审计 dispatch.watchdog.exhausted 明确留痕（不再静默丢）。
+# 杀开关 BOK_DISPATCH_RETRY（默认开；CP 侧键走 _control_plane_env 注入面，
+# BOK_POLISH_OFFLINE 判例，非 _FORWARD_ENV——那张表是 A 线 agent worker 面）。
+# ---------------------------------------------------------------------------
+
+# 重试排程（秒，token 签发后偏移）：实测瞬时不可用窗 ~2.5s，三段短退避全覆盖。
+_DISPATCH_WATCHDOG_SCHEDULE = (2.0, 2.5, 3.0)
+# in-flight 房间数封顶：token 风暴下防守护线程无界膨胀（每线程寿命 ≤schedule 总长）。
+_DISPATCH_WATCHDOG_CAP = 32
+_dispatch_watchdog_inflight: set[str] = set()
+# Minor-5（fix round 1）：in-flight check-then-add 原子化——同房并发 token 双起
+# 看门狗的竞态窗，threading.Lock 短临界段（线程与主 loop 双上下文可达，须线程原语）。
+_dispatch_schedule_lock = threading.Lock()
+# I-1（fix round 1）：startup 捕获的 CP 主事件循环。看门狗与 webhook 恢复链共用
+# `_redispatch_locks`（asyncio.Lock）——CPython ≥3.10 无争用快速路径不做 loop 绑定
+# 校验，争用路径跨 loop 直接 RuntimeError：防双派 TOCTOU 在重叠窗不成立 + 败方异常
+# 被宽 except 吞成 error/create_failed（审计归因失真）。方案①=锁域归一：看门狗作业
+# 经 run_coroutine_threadsafe 挂主 loop 跑；None（测试/REPL）回退守护线程自持 loop。
+_main_loop: asyncio.AbstractEventLoop | None = None
+
+
+async def _dispatch_watchdog_attempt(
+    lkapi, room: str, attempt: int, *, is_last: bool = False
+) -> str:
+    """看门狗单次尝试，返回结局码（供 loop 与测试断言）。
+
+    terminal/recovered = 收口；waiting = 房未建继续等；dup = 派发在途继续等；
+    created = 已补派（下轮验证回房）；error = API 瞬断继续；exhausted = 末次
+    仍缺席（审计留痕后收口）。
+    """
+    try:
+        call = _repo().get_call(room) or {}
+    except Exception:
+        call = {}
+    if not call or str(call.get("status") or "") in _TERMINAL_CALL_STATUSES:
+        return "terminal"
+    from livekit.api import CreateAgentDispatchRequest, ListParticipantsRequest
+
+    try:
+        ps = await lkapi.room.list_participants(ListParticipantsRequest(room=room))
+    except Exception:
+        # 房查不到(房未建/服务瞬断)=状态未知,不算「派发丢失」——token 签了
+        # 没人 join 是常态(探针/集成测试),末次也不留 exhausted 审计(噪声)。
+        return "error"
+    if any(_is_agent_identity(str(getattr(p, "identity", "") or "")) for p in ps.participants):
+        return "recovered"
+    if not _has_human_participants(ps.participants):
+        # 房不存在/还没有真人：建房触发的 token dispatch 根本没发生，无丢失可言。
+        return "waiting"
+    try:
+        async with _redispatch_locks[room]:
+            if attempt > 0:
+                # 复查轮清扫（webhook 恢复链同款）：agent 缺席 → 本 agent 全部
+                # dispatch 视为 stale 删除，让 create 走全新生命周期。
+                for d in await lkapi.agent_dispatch.list_dispatch(room_name=room):
+                    if d.agent_name == "bok-voice":
+                        await lkapi.agent_dispatch.delete_dispatch(
+                            dispatch_id=d.id, room_name=room
+                        )
+            if await has_active_dispatch(lkapi, room):
+                if is_last:
+                    _audit("dispatch.watchdog.exhausted", subject_type="call", subject_id=room,
+                           call_id=room, detail={"attempt": attempt, "reason": "dispatch_in_flight"})
+                    return "exhausted"
+                return "dup"
+            await lkapi.agent_dispatch.create_dispatch(
+                CreateAgentDispatchRequest(agent_name="bok-voice", room=room)
+            )
+        _audit("agent.watchdog_dispatch", subject_type="call", subject_id=room,
+               call_id=room, detail={"attempt": attempt, "agent_name": "bok-voice"})
+        control_log.warning(
+            "dispatch_watchdog_recreated",
+            extra={"event": "dispatch.watchdog.create",
+                   "data": {"room": room, "attempt": attempt}},
+        )
+        return "created"
+    except Exception:
+        if is_last:
+            _audit("dispatch.watchdog.exhausted", subject_type="call", subject_id=room,
+                   call_id=room, detail={"attempt": attempt, "reason": "create_failed"})
+            return "exhausted"
+        return "error"
+
+
+async def _dispatch_watchdog_loop(room: str, schedule: tuple[float, ...] | None = None) -> str:
+    """按排程跑看门狗直到收口；返回末次结局码（测试可注入 schedule 零延迟）。"""
+    sched = tuple(schedule) if schedule is not None else _DISPATCH_WATCHDOG_SCHEDULE
+    last = "error"
+    for attempt, delay in enumerate(sched):
+        if delay:
+            await asyncio.sleep(delay)
+        lkapi = _lkapi_client()
+        if lkapi is None:
+            return "no_credentials"
+        try:
+            last = await _dispatch_watchdog_attempt(
+                lkapi, room, attempt, is_last=(attempt == len(sched) - 1)
+            )
+        finally:
+            try:
+                await lkapi.aclose()
+            except Exception:  # pragma: no cover - 客户端收尾自吞
+                pass
+        if last in ("terminal", "recovered", "exhausted", "no_credentials"):
+            break
+        # waiting/dup/error/created → 下轮复查（created 后验证 agent 是否真回房，
+        # 未回房则下轮清扫 stale 再补派——webhook 恢复链同款收敛语义）。
+    return last
+
+
+async def _dispatch_watchdog_job(room: str) -> None:
+    """主 loop 上的看门狗作业（run_coroutine_threadsafe 入口）：异常自吞、收尾清 in-flight。"""
+    try:
+        await _dispatch_watchdog_loop(room)
+    except Exception as exc:  # pragma: no cover - 作业自吞
+        control_log.warning(
+            "dispatch_watchdog_crashed",
+            extra={"event": "dispatch.watchdog.crash",
+                   "data": {"room": room, "error": repr(exc)}},
+        )
+    finally:
+        _dispatch_watchdog_inflight.discard(room)
+
+
+def _schedule_dispatch_watchdog(room: str) -> None:
+    """token 签发后的同步入口：排程看门狗 loop（端点是 sync def，线程池上下文）。
+
+    主 loop 在（服务常态）：`run_coroutine_threadsafe` 挂 startup 捕获的 CP 主
+    loop 跑——与 webhook 恢复链共享的 `_redispatch_locks` 锁域归一（评审 I-1
+    方案①，跨 loop RuntimeError/防双派 TOCTOU 失效一并根除）。主 loop 不在
+    （单测/REPL）：守护线程自持 loop 兜底（生产不可达；该路径锁域隔离，互斥由
+    in-flight threading.Lock + 上游终态/防重闸兜）。
+    自身绝不抛（调用方在 token 主链路上）；in-flight 去重 + 封顶（threading.Lock
+    原子化 check-then-add，评审 Minor-5）。
+    """
+    try:
+        if os.environ.get("BOK_DISPATCH_RETRY", "1").strip() == "0":
+            return
+        with _dispatch_schedule_lock:
+            if room in _dispatch_watchdog_inflight:
+                return
+            if len(_dispatch_watchdog_inflight) >= _DISPATCH_WATCHDOG_CAP:
+                control_log.warning(
+                    "dispatch_watchdog_skipped_cap",
+                    extra={"event": "dispatch.watchdog.cap", "data": {"room": room}},
+                )
+                return
+            _dispatch_watchdog_inflight.add(room)
+        loop = _main_loop
+        if loop is not None and not loop.is_closed():
+            asyncio.run_coroutine_threadsafe(_dispatch_watchdog_job(room), loop)
+            return
+
+        def _run() -> None:
+            try:
+                asyncio.run(_dispatch_watchdog_loop(room))
+            except Exception as exc:  # pragma: no cover - 守护线程自吞
+                control_log.warning(
+                    "dispatch_watchdog_crashed",
+                    extra={"event": "dispatch.watchdog.crash",
+                           "data": {"room": room, "error": repr(exc)}},
+                )
+            finally:
+                _dispatch_watchdog_inflight.discard(room)
+
+        threading.Thread(
+            target=_run, name=f"dispatch-watchdog-{room[:24]}", daemon=True
+        ).start()
+    except Exception as exc:  # pragma: no cover - 排程失败绝不打断 token 主链路
+        control_log.warning(
+            "dispatch_watchdog_schedule_failed",
+            extra={"event": "dispatch.watchdog.schedule_error", "data": {"error": repr(exc)}},
+        )
 
 
 def _has_human_participants(participants) -> bool:
@@ -4044,6 +4631,9 @@ def qa_canned_status_ep(request: Request, account_id: str = "acc-001") -> dict:
         # 状态若按默认音色判 ok,与绑定了人设音色的运行时可能不同源(永远 miss)。
         # 顶层附加字段,不改 statuses 三态语义(web 按三态渲染)。
         "voice_source": out.get("voice_source") or {},
+        # F11(2026-09-23)信息位:逐语言有效 TTS provider——非 minimax 族=运行时
+        # 无罐头缓存链(_tts_cache=None),status ok 也播不出来(物化键不同源)。
+        "tts_provider": out.get("tts_provider") or {},
     }
 
 
@@ -4102,6 +4692,8 @@ def branch_canned_status_ep(request: Request, account_id: str = "acc-001") -> di
         # F1(2026-09-20)信息位:逐语言音色来源,同 qa_canned_status_ep 注释。
         # 顶层附加字段,不改 statuses 三态语义(web 按三态渲染)。
         "voice_source": out.get("voice_source") or {},
+        # F11(2026-09-23)信息位:逐语言有效 TTS provider,同 qa_canned_status_ep。
+        "tts_provider": out.get("tts_provider") or {},
     }
 
 
@@ -4316,6 +4908,47 @@ def _validate_graph_field(raw: str) -> list[str]:
     return validate_flow_graph(str(raw))
 
 
+def _validate_steps_branch_text(raw: str) -> list[str]:
+    """模板 steps_json 分支行内部指令校验(M-22③,2026-09-23 修复波#4):
+    「教练文案进罐头」挡在写入口(task-4 M1 实弹:生产模板教练文案被罐头车道
+    逐字念给客户)。逐步 ref 逐分支行——动作前缀【…】先消费(镜像 flow.py
+    parse_branch_action,镜像件在 canned_guard.strip_branch_action_prefix)、
+    余文过 canned_guard.is_internal_instruction。命中返回人话错误列表(→400
+    invalid_branch_text,与 invalid_graph_json 同门);非 json/无分支=零命中
+    放行(形状宽容面属运行时 parse_steps,这里不扩权)。存量违例行由运营
+    清理(清单在 fix-wave-4 报告),本校验只防新增。"""
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError):
+        return []
+    if not isinstance(data, list):
+        return []
+    errors: list[str] = []
+    for sidx, step in enumerate(data):
+        if not isinstance(step, dict):
+            continue
+        ref = str(step.get("ref") or "")
+        for line_no, raw_line in enumerate(ref.splitlines(), start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            m = _BRANCH_LINE_COND_RE.match(line)
+            if not m:
+                continue
+            body = strip_branch_action_prefix(m.group("resp").strip())
+            hits = coach_hits(body)
+            if hits:
+                errors.append(
+                    f"step {sidx + 1} line {line_no} 分支应答含内部指令标记"
+                    f"({','.join(hits)}),只会被念给客户不会被执行:"
+                    f"{body[:40]!r}"
+                )
+    return errors
+
+
 # ---- 模板发布两态(W2-T1,2026-09-19):保存=草稿、发布=冻结即生效 ----
 # 冻结 payload 九键(接口冻结):发布时按当时 live 值原样收进 published_json;
 # 「已发布」≡published_json 非空,「有未发布改动」≡九键逐一比对 live≠冻结
@@ -4427,6 +5060,9 @@ def create_template(req: TemplateRequest, request: Request) -> dict:
     _graph_errors = _validate_graph_field(req.graph_json)
     if _graph_errors:
         raise HTTPException(400, {"error": "invalid_graph_json", "detail": _graph_errors[:5]})
+    _branch_errors = _validate_steps_branch_text(req.steps_json)
+    if _branch_errors:
+        raise HTTPException(400, {"error": "invalid_branch_text", "detail": _branch_errors[:5]})
     tpl = _repo().create_template(req.model_dump())
     _audit("template.create", subject_type="template", subject_id=tpl.get("id", ""), account_id=tpl.get("account_id", ""),
            detail={"name": tpl.get("name", ""), "owner_user_id": tpl.get("owner_user_id", ""),
@@ -4452,6 +5088,12 @@ def update_template(template_id: str, req: UpdateTemplateRequest, request: Reque
         _graph_errors = _validate_graph_field(str(payload.get("graph_json") or ""))
         if _graph_errors:
             raise HTTPException(400, {"error": "invalid_graph_json", "detail": _graph_errors[:5]})
+    # M-22③:steps_json 分支行内部指令校验(显式携带才校验,同 exclude_unset 语义);
+    # 必须排在 revision 快照之前(同 graph 校验:「拒绝对数据无副作用」)。
+    if "steps_json" in payload:
+        _branch_errors = _validate_steps_branch_text(str(payload.get("steps_json") or ""))
+        if _branch_errors:
+            raise HTTPException(400, {"error": "invalid_branch_text", "detail": _branch_errors[:5]})
     # 话术版本化（2026-09-07 专项 B3）:update 即快照旧版——「哪版话术转化更好」
     # 从数据上可答;call_sessions.template_id 快照指向的版本内容不再随更新漂移。
     # default=str:SQL repo 的 before 含 datetime(created_at),不转直接 500——
@@ -4673,6 +5315,18 @@ def stats_dashboard(request: Request, account_id: str = "acc-001") -> dict:
             disposition_counts[d] = disposition_counts.get(d, 0) + 1
         if w := str(call.get("whatsapp_status") or ""):
             whatsapp_counts[w] = whatsapp_counts.get(w, 0) + 1
+    # 沉默戳话(W4-③,2026-09-24):「有冇人知道」类客户轮=AI 迟答/哑轮的延迟症状
+    # (docs/superpowers/plans/2026-09-24-a-line-flow-latency-intent.md W1a 定性)。
+    # 复用本端点既有 calls 清单逐通 get_turns(gap_mining/qa_drift 同款公开方法,
+    # 零新 SQL、零新窗口);纯函数面在 silence_poke 模块。
+    repo = _repo()
+    poke_stats: list[dict] = []
+    for call in calls:
+        try:
+            turns = repo.get_turns(str(call.get("id") or ""))
+        except Exception:  # noqa: BLE001 - 单通取数失败不炸整表(同 gap_mining)
+            continue
+        poke_stats.append(silence_poke.count_silence_pokes(turns))
     return {
         "concurrency": {"current": sum(1 for c in calls if str(c.get("status") or "") == CallStatus.ACTIVE.value)},
         "calls": {"today": sum(1 for c in calls if _is_today(c)),
@@ -4683,6 +5337,7 @@ def stats_dashboard(request: Request, account_id: str = "acc-001") -> dict:
         "agents": sorted(by_agent.values(), key=lambda a: (-a["calls"], a["user_id"]))[:8],
         "tags": {"disposition": disposition_counts, "whatsapp": whatsapp_counts},
         "todo": _dashboard_todo(_repo()),
+        "silence_pokes": silence_poke.merge_poke_stats(poke_stats),
     }
 
 
@@ -5198,6 +5853,23 @@ def list_insights(request: Request) -> list[dict]:
     return _repo().list_global_insights(kind="insight")
 
 
+@app.get("/api/stats/provider-health")
+def provider_health(request: Request) -> dict:
+    """MiniMax 云 TTS 配额/限流健康（M-11，2026-09-23 修复波#3，task-13 F-M1）。
+
+    task-13 坐实「配额死 N=∞ 不可见」：2056 风暴期全部健康面全绿、agent.log
+    打点族零程序消费。本端点消费共享扫描器（bok_voice_obs.provider_health，
+    bok.py status/doctor 同源）：tail 读 worker 日志，近窗（默认 5 分钟）聚合
+    2056（Token Plan 配额死）与 1002/1039/2205（限流族）计数 + 最近命中时间。
+    只做可见性，不做通知渠道。logs 目录取 VAULT_ROOT 的兄弟目录（本机单机
+    拓扑；跨机部署下 available=false 的诚实降级）。闸=reports 页键——同
+    llm-gaps/qa-drift 观测家族，与 web 报表页门控一致。
+    """
+    _gate_page(request, "reports")
+    vault = Path(os.environ.get("VAULT_ROOT", "./data/vault"))
+    return scan_provider_health(vault.parent / "logs")
+
+
 @app.get("/api/objects/{object_id}/topics")
 def list_object_topics(object_id: str, request: Request) -> list[dict]:
     """对象历史主题（结算时 Summarizer 蒸馏产出并 append 到该对象）。"""
@@ -5405,9 +6077,22 @@ def _verify_livekit_webhook(request: Request, body: bytes) -> bool:
         )
     except _pyjwt.PyJWTError:
         return False
-    if not (claims.get("video") or {}).get("webhook"):
+    # M-28（fix-wave-3，task-8 §4-B）：摘要比对兼容两代 LiveKit 官方格式——
+    # 新一代协议=hex 摘要；livekit-server 1.13.x 实发（/tmp/m28 取证 + 官方
+    # livekit-api WebhookReceiver.receive 同语义）=base64(raw digest)。旧验签器
+    # 只认 hex + 强制 video.webhook grant → 真 webhook 全 401（1464/1464，
+    # 崩溃补位/拨号结果状态面静默死）。sha256 body 绑定保持强制（防重放的核心锚：
+    # room-join 类用户 token 与 server 同 secret 签名但无摘要 claim，天然被拒）。
+    digest_hex = hashlib.sha256(body).hexdigest()
+    digest_b64 = base64.b64encode(hashlib.sha256(body).digest()).decode()
+    if claims.get("sha256") not in (digest_hex, digest_b64):
         return False
-    return claims.get("sha256") == hashlib.sha256(body).hexdigest()
+    video = claims.get("video") or {}
+    # 带 video claim 的 token 必须是 webhook grant（用户 token 不得打 webhook 面）；
+    # 无 video claim 的 OSS 形状按官方 WebhookReceiver 语义放行（摘要绑定在场）。
+    if video and not video.get("webhook"):
+        return False
+    return True
 
 
 @app.post("/api/webhook/livekit")

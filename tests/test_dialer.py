@@ -353,3 +353,53 @@ def test_dial_mock_leaves_before_audio_is_rejected(monkeypatch):
 
     out = asyncio.run(_run())
     assert out.status == OUT_REJECTED
+
+
+# ---- F-14（2026-09-23 生产就绪修复波）：auth-on 栈下 mock 派叫必须带机器通道头 ----
+# 实弹证据：campaign E2E C3 三腿 `[dial] outcome=failed detail=mock spawn http 401`
+# ——`_dial_mock` 裸 aiohttp POST `/api/sip/mock/callee` 无 Authorization 头，
+# `BOK_CP_TOKEN` 设置后 CP 全端点要求 Bearer（与 worker 侧 ControlPlaneClient
+# 自动携带同款惯例，dialer 此前漏装）。
+
+
+def test_dial_mock_sends_machine_channel_auth_header(monkeypatch):
+    """BOK_CP_TOKEN 在场 → spawn 请求带 Authorization Bearer + X-Bok-Channel。"""
+    headers_seen: list[dict] = []
+
+    class _RecordingHttp(_FakeHttp):
+        def post(self, *a, **k):
+            headers_seen.append(dict(k.get("headers") or {}))
+            return super().post(*a, **k)
+
+    import aiohttp
+    monkeypatch.setenv("BOK_CP_TOKEN", "tok-mock-123")
+    monkeypatch.setattr(aiohttp, "ClientSession",
+                        lambda *a, **k: _RecordingHttp(200), raising=True)
+    out = asyncio.run(_dial_mock(
+        _MockCtx(joins=True), number="123", cp_base="http://cp", call_id="c1",
+        scenario="answer", language="cantonese", script=[], ringing_timeout_s=5.0))
+    assert out.status == OUT_ANSWERED
+    assert headers_seen, "spawn 请求未发出"
+    assert headers_seen[-1].get("Authorization") == "Bearer tok-mock-123"
+    assert headers_seen[-1].get("X-Bok-Channel") == "agent"
+
+
+def test_dial_mock_without_token_keeps_headerless_request(monkeypatch):
+    """auth-off（无 token）→ 不带 Authorization 头（零行为变化，X-Bok-Channel 仍自报）。"""
+    headers_seen: list[dict] = []
+
+    class _RecordingHttp(_FakeHttp):
+        def post(self, *a, **k):
+            headers_seen.append(dict(k.get("headers") or {}))
+            return super().post(*a, **k)
+
+    import aiohttp
+    monkeypatch.delenv("BOK_CP_TOKEN", raising=False)
+    monkeypatch.setattr(aiohttp, "ClientSession",
+                        lambda *a, **k: _RecordingHttp(200), raising=True)
+    out = asyncio.run(_dial_mock(
+        _MockCtx(joins=True), number="123", cp_base="http://cp", call_id="c1",
+        scenario="answer", language="cantonese", script=[], ringing_timeout_s=5.0))
+    assert out.status == OUT_ANSWERED
+    assert "Authorization" not in headers_seen[-1]
+    assert headers_seen[-1].get("X-Bok-Channel") == "agent"

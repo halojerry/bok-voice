@@ -41,7 +41,9 @@ class ListenStopRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    username: str
+    # username 上限 128（评审 I-2，fix round 1）：登录是预认证端点，超长串原样
+    # 进 strip/查库/频控键=无谓成本；pydantic 层 422 拒收。
+    username: str = Field(max_length=128)
     password: str
 
 
@@ -221,7 +223,11 @@ class ProviderSettings(BaseModel):
     # 越高越抗噪，越低越灵敏，agent 侧传给 inference.VAD activation_threshold）
     max_buffered_speech: float = 15.0
     min_speech_duration: float = 0.15
-    min_silence_duration: float = 0.45
+    # 0.45→0.35(W7,2026-09-24):旧 0.45 是「离线式 ASR 整段 flush」年代的护身符
+    # ——句级提交+VAC 直转落地后重校,0.35 腿实测 p50 1225→1022ms(−203ms)、
+    # 尾部 max 3150→1530,fast_speech/barge-in/edge 8/8 全绿。存量部署的显式
+    # 设置值仍压过本默认,升级后要生效须改设置页或调 API。
+    min_silence_duration: float = 0.35
     interruption: bool = True
     sensitivity: float = 0.6
     sample_rate: int = 24000

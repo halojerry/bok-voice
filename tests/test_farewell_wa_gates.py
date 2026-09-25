@@ -5,8 +5,10 @@ C3a WA 报号轮落库——call-6f1c4ee3 实证 stash 路径整轮蒸发(turns 
 (hook 闭包内,代码位次+compileall 保证,本文件测 C3b 可测面)。
 
 C3b 复述确认前号长闸——7 位错号被复述确认+客户「嗯嗯好的」假确认(call-
-6f1c4ee3):粤=8 位港号(852+8=11 亦收)/zh=11 位手机/en 宽松;只挡复述
-确认不挡捕获(「报出就收」铁律不动);BOK_WA_LEN_CHECK=0 关。
+6f1c4ee3):粤=8 位港号(852+8=11 亦收)/zh=11 位手机/en=8 位港号(852+8=11
+亦收;M-23 2026-09-23 修复波#4 由「宽松不校验」收紧——task-4 实弹 7/6 位
+ASR 回声错号被复述确认给客户);只挡复述确认不挡捕获(「报出就收」铁律
+不动);BOK_WA_LEN_CHECK=0 关。
 
 C4 道别分流——「拜拜」命中 REFUSE 令谈成通话标 declined:FAREWELL verdict
 剥出,agent 侧 disposition 按业务结果(captured→scheduled,否则 polite_close)。
@@ -76,8 +78,10 @@ def test_wa_len_gate_zh_and_en():
     assert "13800000000" in _wa_confirm_or_reask("zh", "13800000000")  # 11 位手机
     reask = _wa_confirm_or_reask("zh", "1234567")
     assert "完整" in reask and "1234567" not in reask
-    # en 宽松不校验:任意长度照复述
-    assert "555123" in _wa_confirm_or_reask("en", "555123")
+    # M-23(2026-09-23 修复波#4):en 收紧到 8 位港号——task-4 实弹 7/6 位
+    # ASR 回声错号被复述确认给客户,原「en 宽松不校验」取消(852+8=11 亦收)。
+    assert "555123" not in _wa_confirm_or_reask("en", "555123")
+    assert "98765432" in _wa_confirm_or_reask("en", "98765432")
 
 
 def test_wa_len_gate_kill_switch(monkeypatch):

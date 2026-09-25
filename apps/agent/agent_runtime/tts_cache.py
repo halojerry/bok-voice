@@ -31,7 +31,20 @@ from livekit import rtc
 _ENABLE_ENV = "BOK_TTS_CACHE"
 _DIR_ENV = "BOK_TTS_CACHE_DIR"
 _MAX_ENTRIES_ENV = "BOK_TTS_CACHE_MAX"
+_META_TEXT_ENV = "BOK_TTS_CACHE_META_TEXT"
 _DEFAULT_MAX_ENTRIES = 500
+
+
+def meta_text_enabled() -> bool:
+    """meta JSON 是否落原文（L1，2026-09-24 客户现场 IP 落盘面收口）。
+
+    全仓唯一业务 IP 落盘点就是 meta 的 text 字段（罐头原句明文，pinned 永不
+    逐出）；text 无任何读回消费方（纯信息位），`BOK_TTS_CACHE_META_TEXT=0`
+    客户现场档=字段不写，音频/缓存行为零变化。缺省 1（开发侧可读 meta 对账
+    是排障习惯，不砍）。"""
+    import os
+
+    return os.environ.get(_META_TEXT_ENV, "1") == "1"
 
 # 全角→半角标点/空白统一(缓存 key 归一化用;不做数字归一——号码读法逐字对应,
 # 归一会把不同号码错配到同一段音频)。
@@ -194,7 +207,6 @@ class TtsAudioCache:
             tmp.write_bytes(pcm)
             os.replace(tmp, self._pcm_path(key))
             meta = {
-                "text": str(text or ""),
                 "voice": voice or "",
                 "model": model or "",
                 "sample_rate": self.sample_rate,
@@ -203,6 +215,8 @@ class TtsAudioCache:
                 "bytes": len(pcm),
                 "stored_at": time.time(),
             }
+            if meta_text_enabled():
+                meta["text"] = str(text or "")
             if pin:
                 meta["pinned"] = True
             mtmp = self._meta_path(key).with_suffix(".mtmp")

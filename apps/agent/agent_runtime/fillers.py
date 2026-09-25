@@ -202,6 +202,109 @@ def filler_backfill_enabled() -> bool:
     return os.environ.get("BOK_FILLER_BACKFILL", "1") == "1"
 
 
+# ---- W2a 分层犹豫垫音(2026-09-23) ----
+# hesitation=资产第六类标签(scripts/gen_filler_assets.py hes_lines 档,三语各 7 条
+# 短呃/中嗯/长查证承诺):真人犹豫声(呃/嗯/let me see)替代每轮同一句罐头应承的
+# 机器感(行业共识,OpenAI Realtime/Sierra)。分类器五类(classify_filler_category)
+# 不产出该类 → 选池以固定概率混入,犹豫池缺失=零行为变化;闸=BOK_FILLER_HESITATION
+# (默认 "1";0=犹豫混入整体关,罐头五类照旧)+总闸 BOK_FILLER(0=全关),限次/冷却/
+# 去重窗等上游门全部照旧(env 已登记 bok.py _FORWARD_ENV,2026-09-24 补立法)。
+HESITATION_CAT = "hesitation"
+HESITATION_BLEND_PROB = 0.35
+
+
+def _hesitation_enabled() -> bool:
+    """犹豫混入专用 kill-switch(默认开):0 只关犹豫混入,罐头五类与全部上游门不动。"""
+    return os.environ.get("BOK_FILLER_HESITATION", "1") == "1"
+
+
+# ---- W2c 语境化过渡承诺(2026-09-24) ----
+# 垫话从「泛用应承」升级为「贴语境的过渡承诺」:fire 时点由 agent 惰性给语境桶
+# (context_resolver),选池优先 promise_<bucket> 资产(话术域措辞);桶池缺失/
+# 闸关/解析失败 → 现行五类阶梯逐字节不变(零回归设计,镜像 hesitation 立法)。
+# 闸=BOK_FILLER_CONTEXT(默认 "1";0=语境层整体关)+总闸 BOK_FILLER。
+PROMISE_CAT_PREFIX = "promise_"
+
+
+def _context_enabled() -> bool:
+    """语境层专用 kill-switch(默认开):0 只关桶优先/桶 cat 覆写,其余全不动。"""
+    return os.environ.get("BOK_FILLER_CONTEXT", "1") == "1"
+
+
+def derive_context_bucket(
+    *,
+    turn_provider: str = "",
+    wa_signal_kind: str = "",
+    wa_step: bool = False,
+    wa_captured: bool = False,
+    has_steps: bool = False,
+    step_index: int = 0,
+    goal: str = "",
+    ref: str = "",
+    step_say_done: bool = False,
+    verdict: str = "",
+) -> str:
+    """语境桶判定(纯函数,agent fire 时点快照入参;规则次序=优先级)。
+
+    handoff > wa > comp > identity > query > ""(空=现行阶梯):
+    - handoff:本轮 provider ∈ graph-notify/branch-notify(转人工打铃不抢话,
+      轮照走 LLM——垫话只承诺「已通知/会跟进」,措辞域在资产侧钉死不越界);
+    - wa:号码捕获/报号轮(offered/captured)或 WA 步未捕获——旧版此轮垫
+      check 类「马上帮您查」答非所问(客户刚报完号码),语境层根治;
+    - comp:赔偿步且三档通知已念(say 账本在场)——承诺跟进但不带数字
+      (赔偿数字纪律在 prompt 域,资产措辞侧同样不写数字);
+    - identity:身份步(step 0)——minimal/ack 短应承域;
+    - query:查询域(goal/ref 关键词)或 QUESTION 轮——承诺「查到就覆」。
+    """
+    p = str(turn_provider or "")
+    if p in ("graph-notify", "branch-notify"):
+        return "handoff"
+    k = str(wa_signal_kind or "")
+    if k in ("captured", "captured_implicit", "offered") or (wa_step and not wa_captured):
+        return "wa"
+    gr = f"{goal or ''}\n{ref or ''}"
+    if has_steps and "赔" in gr:
+        return "comp" if step_say_done else "query"
+    if has_steps and step_index == 0:
+        return "identity"
+    if has_steps and any(w in gr for w in ("查", "进度", "物流", "单号")) or str(verdict or "").lower() == "question":
+        return "query"
+    return ""
+
+
+def thinking_sound_configs() -> "list | None":
+    """W2b 思考态键盘环境音(2026-09-24):官方 BackgroundAudioPlayer thinking_sound 装配。
+
+    语义=官方组件状态机驱动:agent 进 "thinking" 态(客户停嘴→回复首音频前)按
+    probability 抽签播一条内置打字 burst(0.2/0.5s,**单次不循环**——连续打字循环
+    在电话里反而假;burst 是「我在查」的人类线索),离开 thinking(开口)即停。
+    与垫话零冲突:同一 out-of-band 混音器,垫话是人声主力、键盘在底下垫层。
+
+    - `BOK_AMBIENT_KEYBOARD`(默认 "1"):总闸,0=构造不带 thinking_sound(行为与
+      旧版逐字节同——官方组件无 thinking_sound 时状态机钩子空转)。
+    - `BOK_AMBIENT_KEYBOARD_VOL`(默认 0.6,夹 [0,1]):两条 burst 的音量。
+    - 概率 0.30+0.30=0.60:约四成思考隙静默(抽签制,避免每轮必响的机械感)。
+    返回 None=不启用;调用方(agent.py 构造区)透传给 BackgroundAudioPlayer。
+    无 livekit 环境(测试)返回 None 以外的形状不炸——本函数只造配置不碰 livekit,
+    import 在调用方 try 内。env 两键已登记 bok.py _FORWARD_ENV(2026-09-24)。
+    """
+    if os.environ.get("BOK_AMBIENT_KEYBOARD", "1") != "1":
+        return None
+    try:
+        vol = float(os.environ.get("BOK_AMBIENT_KEYBOARD_VOL", "0.6"))
+    except ValueError:
+        vol = 0.6
+    vol = min(max(vol, 0.0), 1.0)
+    try:
+        from livekit.agents.voice.background_audio import AudioConfig, BuiltinAudioClip
+    except Exception:  # noqa: BLE001 - 无 livekit(纯单测环境)时无环境音,零炸
+        return None
+    return [
+        AudioConfig(BuiltinAudioClip.KEYBOARD_TYPING, volume=vol, probability=0.30, fade_out=0.05),
+        AudioConfig(BuiltinAudioClip.KEYBOARD_TYPING2, volume=vol, probability=0.30, fade_out=0.05),
+    ]
+
+
 _FILLER_DEFLECT_RE = re.compile(
     r"(繼續講|继续讲|聽住|听住|聽緊|听紧|聽著|听著|慢慢講|慢慢讲|慢慢說|慢慢说|"
     r"你講先|你讲先|go ahead|please\s+continue)",
@@ -374,9 +477,21 @@ class FillerDirector:
         entries_index=None,
         user_text_provider=None,
         entry_hit=None,
+        call_label: str = "",
+        context_resolver=None,
     ) -> None:
         self._session = session
         self._lang_resolver = lang_resolver
+        # W4 ①(2026-09-24):fired 行带 call 标——多路并发/归档日志按通话定位;
+        # 空=零变化(单测/嵌入方不传)。
+        self._call_label = str(call_label or "")
+        # W2c 语境化过渡承诺(2026-09-24):fire 时点惰性取语境桶(agent 注入,
+        # 镜像 _user_text_provider 先例;异常吞掉回 ""=现行阶梯零变化)。
+        self._context_resolver = context_resolver
+        self._last_bucket = ""  # W2c 观测:fired 行带桶标(空=非桶驱动)
+        # W4 ①(2026-09-24):fired 行带 call 标——多路并发/归档日志按通话定位;
+        # 空=零变化(单测/嵌入方不传)。
+        self._call_label = str(call_label or "")
         # BackgroundAudioPlayer(livekit 官方 out-of-band 音轨):垫话唯一合法通道。
         # None=垫话整体失效。
         self._player = player
@@ -625,12 +740,26 @@ class FillerDirector:
                 self._manifest = {}
         return self._manifest
 
-    def _pick(self, lang: str, category: str = "") -> dict | None:
+    def _pick(self, lang: str, category: str = "", bucket: str = "") -> dict | None:
         pool = self._pools().get(lang)
         if not pool:
             # 语言铁律:宁可不垫,绝不跨语言发声(池缺失响亮日志,不落其他语言池)。
             print(f"BOK_FILLER no pool lang={lang!r} — 跳过", flush=True)
             return None
+        # W2c 语境层:桶在场且桶池有货 → 桶池优先(promise_* 措辞自带语境,
+        # 分类器 cat 阶梯让位);桶池缺失=此分支短路,下行逐字节旧档。
+        if bucket and _context_enabled():
+            bcat = PROMISE_CAT_PREFIX + bucket
+            b_pool = [e for e in pool if e.get("cat") == bcat]
+            if b_pool:
+                recent = set(self._recent[-2:])
+                candidates = [e for e in b_pool if e["file"] not in recent] or list(b_pool)
+                entry = random.choice(candidates)
+                self._recent.append(entry["file"])
+                return entry
+            # 桶无专属资产但桶语义指向明确 cat → cat 覆写(query=查证承诺域)。
+            if bucket == "query":
+                category = "check"
         # 分类器回退层(2026-09-13):按场景类过滤 manifest 池(manifest 条目带
         # cat 标签);该类无条目 → default 标签池 → 整池(既有行为)。
         preferred = pool
@@ -647,6 +776,15 @@ class FillerDirector:
         # 「冇問題，你稍等多一陣…」4 分钟播 3 次)。只有整池都在去重窗内
         # 才允许重复(池太小没有别的可选)。
         recent = set(self._recent[-2:])
+        # W2a 犹豫垫音混入:hesitation 条目分类器永不命中,不混入=死重;
+        # 命中抽签时同走去重窗(窗内全占才允许重复)。池里无 hesitation
+        # 条目=此分支短路,既有行为逐字节不变。
+        hes_pool = [e for e in pool if e.get("cat") == HESITATION_CAT]
+        if hes_pool and _hesitation_enabled() and random.random() < HESITATION_BLEND_PROB:
+            hes_candidates = [e for e in hes_pool if e["file"] not in recent] or list(hes_pool)
+            entry = random.choice(hes_candidates)
+            self._recent.append(entry["file"])
+            return entry
         candidates = [e for e in preferred if e["file"] not in recent]
         if not candidates and preferred is not pool:
             candidates = [e for e in pool if e["file"] not in recent]
@@ -656,12 +794,26 @@ class FillerDirector:
         self._recent.append(entry["file"])
         return entry
 
+    def _current_bucket(self) -> str:
+        """fire 时点语境桶(惰性;解析失败/闸关 → ""=现行阶梯零变化)。"""
+        if self._context_resolver is None or not _context_enabled():
+            return ""
+        try:
+            ctx = self._context_resolver() or {}
+            return str(ctx.get("bucket") or "")
+        except Exception:  # noqa: BLE001 - 语境解析失败=无桶,绝唔阻垫话
+            return ""
+
     def _select(self, lang: str) -> tuple[dict | None, str]:
         """选取链:①罐头确定性匹配(客户上一句) ②分类器→资产池回退。
 
         返回 (条目, 场景类)。罐头条目 {"text":..., "file": None}(音频只能来自
         tts-cache 人设物化,miss 在 _fire 里落资产兜底);资产条目带 file。
+        W2c:资产档带语境桶(罐头确定性匹配优先级最高,不受桶影响——matched
+        条目本身就是对客户话的精准回应)。
         """
+        bucket = self._current_bucket()
+        self._last_bucket = bucket
         if (
             self._entries_index is not None
             and self._user_text_provider is not None
@@ -690,8 +842,8 @@ class FillerDirector:
                             pass
                     return {"text": str(entry.get("text") or ""), "file": None}, cat
                 print(f"BOK_FILLER_MATCH miss best={score:.2f} cat={cat}", flush=True)
-                return self._pick(lang, cat), cat
-        return self._pick(lang), ""
+                return self._pick(lang, cat, bucket), cat
+        return self._pick(lang, "", bucket), ""
 
     async def _fire(self, delay: float) -> None:
         try:
@@ -776,7 +928,9 @@ class FillerDirector:
             self._count += 1
             self._last_fire_seq = self._turn_seq
             self._fired_lines.append(entry["text"])
-            print(f"BOK_FILLER fired count={self._count} line={entry['text']!r} {voice_mark}", flush=True)
+            _label = f" call={self._call_label}" if self._call_label else ""
+            _bucket_mark = f" bucket={self._last_bucket}" if self._last_bucket else ""
+            print(f"BOK_FILLER fired{_label}{_bucket_mark} count={self._count} line={entry['text']!r} {voice_mark}", flush=True)
             # 展示/账本文本剥 MiniMax 停顿标记——<#0.3#> 是合成指令,原样进字幕
             # 与 turns 账本=用户可见的指令泄漏(缓存键/backfill 仍用原文,勿动)。
             display_text = _strip_pause_marks(str(entry["text"]))

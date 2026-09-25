@@ -53,3 +53,8 @@ docs/*.tar.gz
 docs/runtime-architecture*.html
 docs/runtime-architecture*.png
 docs/runtime-architecture*.json
+
+# 工作区垃圾（会话快照/打包暂存/误生成目录）
+work-session-*/
+pkgruntime-aside/
+Library/

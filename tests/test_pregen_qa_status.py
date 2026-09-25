@@ -27,9 +27,11 @@ def test_qa_status_ok_and_missing(tmp_path):
     cache = TtsAudioCache(tmp_path)
     rows = _rows()
     # 先用同函数算计划,再把 ok 条目物化进缓存,状态应翻成 ok。
+    # F-11:tts_cfg 显式 minimax(罐头缓存只挂 MiniMax 链;空配置缺省 qwen3_tts
+    # 运行时无缓存链,条目会带 reason=provider_off 而非音色计划)。
     plan = pregen_tts._qa_status(
         rows, persona_pool=[], lang_personas={"zh": None},
-        all_personas=False, tts_cfg={}, voice_mode="single",
+        all_personas=False, tts_cfg={"provider": "minimax"}, voice_mode="single",
         model="speech-2.8-hd", sample_rate=24000, cache=cache,
     )
     assert set(plan) == {"qa:ok", "qa:miss"}  # 停用/空答案不进计划
@@ -39,7 +41,7 @@ def test_qa_status_ok_and_missing(tmp_path):
                 voice=miss["voice"], model="speech-2.8-hd", pin=True)
     plan2 = pregen_tts._qa_status(
         rows, persona_pool=[], lang_personas={"zh": None},
-        all_personas=False, tts_cfg={}, voice_mode="single",
+        all_personas=False, tts_cfg={"provider": "minimax"}, voice_mode="single",
         model="speech-2.8-hd", sample_rate=24000, cache=cache,
     )
     assert plan2["qa:miss"]["state"] == "ok"

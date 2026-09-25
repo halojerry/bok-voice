@@ -312,9 +312,14 @@ def test_minimax_overlap_flushes_cjk_fragment(monkeypatch):
 
     旧 _flushable 用裸 isalpha()/isdigit() 拦尾——CJK 汉字 isalpha()==True,
     中文片段全被拦,MINIMAX_TTS_OVERLAP 对中文流量全死。
+
+    W8(2026-09-24)起首送另有快车道(≥6 字即送,test_tts_first_clause.py 钉);
+    本测试钉 **overlap 旧档语义** → 显式关掉快车道,否则首送在 7 字就发生、
+    12 字门槛断言面被吃掉。
     """
     import json
 
+    monkeypatch.setenv("BOK_TTS_FIRST_CLAUSE", "0")
     sent: list[dict] = []
     recv_count = {"n": 0}
 

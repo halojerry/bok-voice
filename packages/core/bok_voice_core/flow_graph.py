@@ -345,8 +345,9 @@ def pick_graph_action(
     step_1based: int,
     fired: set[str],
     judge_hit: str | None = None,
+    semantic_hit: str | None = None,
 ) -> GraphBinding | None:
-    """图引擎每轮唯一裁决点:确定性命中 + (Phase 3.4)背景判据命中。
+    """图引擎每轮唯一裁决点:确定性命中 + (Phase 3.4)背景判据命中 + (W1b)语义命中。
 
     确定性命中:enabled 意图 + 关键词归一化子串(双侧剥标点/空格+casefold)
     + 步号 scope;绑定按 (priority, id) 升序取首个,once 且已 fired 的跳过。
@@ -355,6 +356,9 @@ def pick_graph_action(
     `hit_ids`——只补模糊轮(关键词未中),绝不豁免任何守卫:该意图照过 enabled +
     步 scope 检查(逐个查 `doc.intents`,id 不在图里=no-op),绑定照过 enabled/once
     资格与 (priority,id) 排序。`user_text` 为空时整体不裁决(判据语义依附于话语)。
+
+    `semantic_hit`(W1b):语义车道=关键词未中时的同步补位,与 judge 同权、
+    同守卫、零特权——两路补位共用同一段守卫代码,可并存。
     无命中返回 None。
     """
     if not doc.intents or not user_text:
@@ -371,16 +375,14 @@ def pick_graph_action(
             if token and token in text:
                 hit_ids.add(intent.id)
                 break
-    if judge_hit:
-        # 与关键词路**同两道守卫**(enabled/步 scope);绑定资格与排序在下游统一收口
-        # ——判据结果只是「多了一个命中意图」,唔係特权通道。
-        jintent = doc.intent_by_id(judge_hit)
-        if (
-            jintent is not None
-            and jintent.enabled
-            and (not jintent.steps or step_1based in jintent.steps)
-        ):
-            hit_ids.add(jintent.id)
+    for lane_hit in (judge_hit, semantic_hit):
+        if not lane_hit:
+            continue
+        # judge/语义补位与关键词路**同两道守卫**(enabled/步 scope);绑定资格与
+        # 排序在下游统一收口——补位结果只是「多了一个命中意图」,唔係特权通道。
+        hint = doc.intent_by_id(lane_hit)
+        if hint is not None and hint.enabled and (not hint.steps or step_1based in hint.steps):
+            hit_ids.add(hint.id)
     if not hit_ids:
         return None
     candidates = [
