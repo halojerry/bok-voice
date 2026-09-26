@@ -607,7 +607,7 @@ def _matches_known_fact(user_text: str, facts: dict | None) -> bool:
 
 # ---- WhatsApp 对接触发侦测 ----
 # 客户喺通话俾出 WhatsApp(读出号码 / 应承加专员)→ 上报 control-plane → 操作台爆闪横幅。
-_WHATSAPP_STEP_HINTS = ("whatsapp", "微信", "wechat", "加專員", "加我哋", "工作人員", "聯絡方式", "联系方式", "帳號", "账号", "加你", "加我", "contact")
+_WHATSAPP_STEP_HINTS = ("whatsapp", "微信", "wechat", "加專員", "加我哋", "工作人員", "聯絡方式", "联系方式", "帳號", "账号", "截圖", "截图", "加你", "加我", "contact")
 # 冇 WhatsApp / 唔想加 → 唔触发 offered（粤/普/英三语收齐，zh/en 模板照用）
 _WHATSAPP_DECLINE = re.compile(r"(冇whatsapp|冇用whatsapp|無whatsapp|唔用whatsapp|冇微信|無微信|唔用微信|"
     r"没微信|没有微信|不用微信|不加微信|没whatsapp|没有whatsapp|不用whatsapp|"
@@ -708,7 +708,10 @@ def should_auto_advance(*, current: int, goal: str, ref: str, user_text: str, ve
     # 客戶已俾號碼(captured)或話 WhatsApp 綁定來電
     # (captured_implicit) → 一定推(去下一步承接);offered(應承加但未俾號)→ 唔推,
     # 留喺本步等號碼。淨係答到平台 → 停留。
-    wa_step = any(h in low_ctx for h in ("whatsapp", "wechat", "微信", "帳號", "账号", "截圖", "截图", "加專員", "加你", "聯絡方式", "联系方式", "contact"))
+    # 2026-09-26 call-ec075023:收口到 _looks_like_whatsapp_step 单源(此处旧有
+    # 内联第二份词表,与共享词表漂移——「微信小店」注意行同样把平台步判成收号
+    # 步,规则级 CONFIRM 推进被同一根因永锁;正稿-only 判定见该函数文档)。
+    wa_step = _looks_like_whatsapp_step(goal, ref)
     if wa_step and wa in ("captured", "captured_implicit"):
         return True
     if wa_step:
@@ -740,7 +743,15 @@ _KNOWN_NUM_KEYS = ("快递单号", "快递单號", "快递尾号", "電話", "�
 
 
 def _looks_like_whatsapp_step(goal: str, ref: str) -> bool:
-    ctx = f"{goal} {ref}".lower()
+    """收号步侦测：只看 goal + 正稿(首段台词)，分支/注意行不算。
+
+    2026-09-26 call-ec075023 实证：旧版对整个 ref 做子串全量匹配——平台步注意行
+    「客户喺第啲平台買（小紅書、微信小店等）」含「微信」→ 平台步被判收号步 →
+    wa_confirm_advance_allowed 永锁 CONFIRM 推进 + QA wa_step_locked 旁路，客户
+    答平台整通死锁在 step3。收号步的索取语义必在正稿（「留個{聯絡方式}號碼」），
+    分支/注意行只是提及渠道名，不再误判。"""
+    main = parse_step_ref(ref).script
+    ctx = f"{goal} {main}".lower()
     return any(h.lower() in ctx for h in _WHATSAPP_STEP_HINTS)
 
 

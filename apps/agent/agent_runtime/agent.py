@@ -1145,6 +1145,18 @@ def _response_watchdog_filler_ext_s() -> float:
         return 2.0
 
 
+def _response_watchdog_synth_ext_s() -> float:
+    """在途合成对看门狗的一次性顺延秒数(2026-09-26 call-ec075023,0=关 kill-switch):
+    fire 时刻回复 TTS 流已开、首音频未到(LLM 文本已完、bidi 连接/首包在路上)
+    = 慢而非死火——顺延一窗等真回复出声,而非打断换兜底句。实测误杀:TTFT 1406ms
+    文本 3.2s 完成、TTS 首包 ~4.0s 临界,4s 闸恰把将出声的真回复掐成 ack+nudge、
+    客户挂线。BOK_RESPONSE_WATCHDOG_SYNTH_EXT_S 显式覆盖。"""
+    try:
+        return float(os.environ.get("BOK_RESPONSE_WATCHDOG_SYNTH_EXT_S", "2") or 0)
+    except ValueError:  # pragma: no cover - 配错回默认
+        return 2.0
+
+
 def _watchdog_extend(state: dict, spawn, extra_s: float, now: float) -> bool:
     """看门狗一次性顺延(2026-09-17 RC3,纯逻辑可单测):已武装且未顺延过 →
     取消现行 timer、以「剩余截止 + extra_s」重武装;未武装/已拆弹/已顺延过/
@@ -2124,15 +2136,21 @@ def _resolve_asr_language_mode(asr_cfg: dict) -> tuple[str, str]:
     return "fixed", fixed_lang
 
 
-def _call_language(persona: dict | None, object_card: dict | None) -> str:
+def _call_language(persona: dict | None, object_card: dict | None, template_lang: str = "") -> str:
     """每通对话的固定语言（A 线新政策，取代逐轮语言跟随）。
 
-    会话装配时一次定死、整通不切：人设(AI)语言优先（用户选了普通话/粤语/英文，
-    就是期望 AI 全程用它说话），未设置回落对象(客户)语言，再退回普通话。
-    同一解析即旧 greet_lang 逻辑；提为函数供 ASR/LLM/TTS 三方共用同一决定。
+    解析顺序：**话术快照语言 > 人设(AI)语言 > 对象(客户)语言 > zh**。会话装配时
+    一次定死、整通不切；同一解析即旧 greet_lang 逻辑，ASR/LLM/TTS 三方共用。
+
+    2026-09-26 call-ec075023 实证加话术优先：粤语模板 + zh 人设 → 旧序（人设优先）
+    钉 zh，开场白触发「模板语言≠通话语言」退通用语，而 say 直念步照念粤语正稿
+    ——一通普通话开场+粤语通知稿的劈叉通话。话术（尤其 say=1 直念步）才是整通
+    「说什么语言」的契约：快照在场时模板语言优先；人设语言仍决定音色/语气，不再
+    决定语言。无快照（无话术通话）保持 人设→对象→zh 旧序零变化。
     """
     return (
-        _normalize_lang((persona or {}).get("language"))
+        _normalize_lang(template_lang)
+        or _normalize_lang((persona or {}).get("language"))
         or _normalize_lang((object_card or {}).get("language"))
         or "zh"
     )
@@ -2577,10 +2595,19 @@ async def entrypoint(ctx):
         route_llm_kwargs,
     )
 
-    # 每通对话语言固定（A 线新政策）：开场语言 = 人设(AI)语言优先（用户在人设里
-    # 选了普通话/粤语/英文，就是期望 AI 全程用它说话）；未设置回落对象(客户)语言；
-    # 再退回普通话。这一决定在会话装配时钉死 ASR/LLM/TTS 三方，整通不切换。
-    greet_lang = _call_language(persona, object_card)
+    # 每通对话语言固定（A 线新政策）：话术快照语言优先（call-ec075023 劈叉修复，
+    # 详见 _call_language 文档）；无快照回落 人设(AI)→对象(客户)→zh。这一决定在
+    # 会话装配时钉死 ASR/LLM/TTS 三方，整通不切换。
+    _tpl_lang = str((template or {}).get("language") or "")
+    greet_lang = _call_language(persona, object_card, template_lang=_tpl_lang)
+    if _tpl_lang and greet_lang != _call_language(persona, object_card):
+        # 运营可见性：人设/对象语言与话术语言打架时，话术赢——打一行让复盘能搜到。
+        print(
+            f"[agent] call language={greet_lang} follows template (persona="
+            f"{(persona or {}).get('language') or '-'} object="
+            f"{(object_card or {}).get('language') or '-'} mismatch) (call {room_name})",
+            flush=True,
+        )
     # 语言态整通钉死：PinnedLanguageState 构造后 update 永不改写——ASR 检出语言
     # 不再回流（ASR 用独立钉定态），逐轮 sticky 跟随已删除，TTS _resolve_voice/
     # lecture_guard/联网语言等全部整通恒为 greet_lang。
@@ -2752,7 +2779,9 @@ async def entrypoint(ctx):
         "task": None,
         "disarmed": True,
         "deadline": 0.0,  # 武装时的绝对截止(time.monotonic 口径,顺延以此为基)
+        "arm_time": 0.0,  # 本轮武装时刻(在途合成顺延判据:开流须晚于它)
         "extended": False,  # 本轮已顺延(垫话开播一次性,arm 复位)
+        "synth_extended": False,  # 本轮已顺延(在途合成一次性,arm 复位)
     }
 
     def _cancel_response_watchdog() -> None:
@@ -2769,6 +2798,26 @@ async def entrypoint(ctx):
         await asyncio.sleep(delay)
         if closed.is_set() or agent.paused or _watchdog["disarmed"]:
             return
+        # 在途合成顺延(2026-09-26 call-ec075023):回复 TTS 流已开、首音频未到
+        # = 慢而非死火——顺延一窗等真回复出声,别把临界真回复掐成 ack。真死火
+        # (流开了永不流)只多等一窗,兜底路径不变。
+        _pending_s = getattr(tts_provider, "reply_stream_pending_since", None)
+        if callable(_pending_s) and not _watchdog["synth_extended"]:
+            try:
+                _started = float(_pending_s() or 0.0)
+            except Exception:  # noqa: BLE001 - 信号口异常按无在途处理
+                _started = 0.0
+            if _started > _watchdog.get("arm_time", 0.0):
+                _ext = _response_watchdog_synth_ext_s()
+                if _ext > 0:
+                    _watchdog["synth_extended"] = True
+                    _watchdog["deadline"] = time.monotonic() + _ext
+                    print(
+                        f"[watchdog] synth in flight (no first audio yet) -> extend +{_ext:.0f}s (call {room_name})",
+                        flush=True,
+                    )
+                    _watchdog["task"] = asyncio.create_task(_watchdog_fire(_ext))
+                    return
         # W4-T2 意向账本:真触发才计数(拆弹/未武装不计)——「哑轮频发」信号。
         _facts["watchdog_fired"] += 1
         print(
@@ -2799,8 +2848,10 @@ async def entrypoint(ctx):
             return
         _cancel_response_watchdog()
         _watchdog["disarmed"] = False
-        _watchdog["deadline"] = time.monotonic() + _response_watchdog_s()
+        _watchdog["arm_time"] = time.monotonic()
+        _watchdog["deadline"] = _watchdog["arm_time"] + _response_watchdog_s()
         _watchdog["extended"] = False
+        _watchdog["synth_extended"] = False
         _watchdog["task"] = asyncio.create_task(_watchdog_fire(_response_watchdog_s()))
 
     def _extend_response_watchdog(extra_s: float | None = None) -> None:

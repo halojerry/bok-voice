@@ -842,6 +842,33 @@ def test_wa_confirm_guard_shared_rule_and_judge():
     assert wa_confirm_advance_allowed(goal="核实平台", ref="你喺边个平台落单?", captured=False) is True
 
 
+def test_whatsapp_step_hint_main_script_only():
+    """回归 call-ec075023:渠道名出现在分支/注意行不得误判收号步。
+
+    平台步注意行「客户喺第啲平台買（小紅書、微信小店等）」含「微信」——旧版
+    整 ref 子串全量匹配把平台步判成收号步 → CONFIRM 永锁 + QA wa_step_locked,
+    整通死锁 step3。修后只看 goal+正稿:收号步的索取语义必在正稿。"""
+    from agent_runtime.flow import _looks_like_whatsapp_step, wa_confirm_advance_allowed
+
+    platform_step = {
+        "goal": "核實購買平台",
+        "ref": (
+            "咁你係喺邊個平台買㗎——拼多多、淘寶、京東定係第啲平台？\n"
+            "如果客户话唔记得边个平台 → 提佢睇下手机入面最近嘅购物订单。\n"
+            "注意:客户喺第啲平台買（小紅書、微信小店等）都算答到，照常推进。"
+        ),
+    }
+    # 平台步:注意行的「微信小店」不再误判
+    assert _looks_like_whatsapp_step(platform_step["goal"], platform_step["ref"]) is False
+    # 客户答平台 → CONFIRM 放行(死锁解除)
+    assert wa_confirm_advance_allowed(
+        goal=platform_step["goal"], ref=platform_step["ref"], captured=False
+    ) is True
+    # 真收号步:正稿「留個{聯絡方式}號碼」仍判 WA(护栏原语义)
+    assert _looks_like_whatsapp_step(_WA_STEP["goal"], _WA_STEP["ref"]) is True
+    assert wa_confirm_advance_allowed(goal=_WA_STEP["goal"], ref=_WA_STEP["ref"], captured=False) is False
+
+
 def test_judge_path_has_wa_guard():
     """源码级:背景 judge 的 CONFIRM 分支必须过同一护栏(nested closure 冇法直接
     单测,用 test_echo_guard 的源码断言姿势;泄漏点=c4f6e4f1 judge=confirm step=4)。"""
