@@ -29,7 +29,7 @@ import TemplateEditor, {
   type FlowStep,
   type TemplateRow,
 } from "@/components/template-editor";
-import FlowCanvas from "@/components/flow-canvas";
+import StepCanvasView from "@/components/step-canvas-view";
 import StepsListEditor from "@/components/steps-list-editor";
 import StudyTab from "@/components/study-tab";
 import GapMining from "@/components/gap-mining";
@@ -484,6 +484,31 @@ export default function StudioPage() {
     };
   }, [tab, selId, accountId, branchRev]);
 
+  // ---- 快答标签（场景画布 play_qa 徽章文案，2026-09-26）：qa_id → question_text。
+  // 进主流程画布视图 / 换模板 / 换账号拉一次;失败=徽章降级「词条缺失」，不阻塞画布。 ----
+  const [qaLabels, setQaLabels] = useState<Record<string, string>>({});
+  useEffect(() => {
+    if (tab !== "flow" || flowView !== "canvas" || !selId) return;
+    let alive = true;
+    api.listQaAll(accountId)
+      .then((rows) => {
+        if (!alive) return;
+        const m: Record<string, string> = {};
+        for (const r of Array.isArray(rows) ? rows : []) {
+          const id = String(r?.id ?? "");
+          const q = String(r?.question_text ?? "").trim();
+          if (id && q) m[id] = q;
+        }
+        setQaLabels(m);
+      })
+      .catch(() => {
+        if (alive) setQaLabels({});
+      });
+    return () => {
+      alive = false;
+    };
+  }, [tab, flowView, selId, accountId]);
+
   /** 分支一键补录（答法抽屉「补录这条」）：queued→人话提示+5s 后刷一次状态。 */
   async function pregenBranch(resp: string) {
     setBranchNote("");
@@ -735,16 +760,17 @@ export default function StudioPage() {
               </div>
               {/* 重派生保险（2026-09-25「列表与画布对不上」排查收尾）：两视图本就同吃页面层
                   stepsDraft、切换视图=条件渲染卸载重挂,天然拿到最新草稿;key 再钉到 模板+步数
-                  ——保存后步数变化（空白步被剔除/列表加删步后应用重锚）时画布整树重建,拖动
-                  覆盖与抽屉步号不再按旧下标错位。步数不变的同模板保存不换 key,F7（答法抽屉
-                  保存后保持打开）不受影响。刻意不用内容哈希——逐字编辑会频繁换 key 反复重挂。 */}
+                  ——保存后步数变化（空白步被剔除/列表加删步后应用重锚）时画布整树重建,抽屉
+                  步号不再按旧下标错位。步数不变的同模板保存不换 key,F7（答法抽屉保存后保持
+                  打开）不受影响。刻意不用内容哈希——逐字编辑会频繁换 key 反复重挂。 */}
               {flowView === "canvas" ? (
-                <FlowCanvas
+                <StepCanvasView
                   key={`${selId}:${stepsDraft.length}`}
                   tpl={tplRow}
                   graph={graph}
                   draft={stepsDraft}
                   onDraftChange={changeSteps}
+                  qaLabels={qaLabels}
                   branchCanned={branchCanned}
                   onPregenBranch={pregenBranch}
                   onOpenIntents={() => setTab("intent")}

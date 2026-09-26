@@ -9,7 +9,7 @@
 // _BRANCH_LINE_RE/_NOTE_LINE_RE/_BRANCH_ACTION_RE 的逐语义移植）,round-trip 无损：
 // 未知行原样保留、箭头两侧空格形态保真（F8）、无标记分支零改写。
 //
-// 与 components/flow-canvas.tsx 答法抽屉同语义（该文件保持原样,后续另行收编）：
+// 与 step-canvas-view 答法抽屉同语义（2026-09-26 旧 flow-canvas 画布已随场景画布改版删除）：
 //   - parts 持组件态：装载 parseStepRefParts 拆,每次编辑即时 serializeStepRef 写回
 //     调用方的 step.ref（「即时序列化回草稿」模式,与抽屉 updateParts 同款）;
 //   - 编辑面三件拆装：条件 / 动作（+jump 步号）/ 纯文本——动作标记只活在 resp 原文里,
