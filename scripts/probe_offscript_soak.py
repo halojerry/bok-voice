@@ -6,6 +6,8 @@
 全靠 LLM 自由应答。本探针 5 套主题 × 10 轮（默认全粤语 + 1 套普通话），逐轮量
 首声延迟、哑轮，并在结束后拉 turns 账本输出**对话实录**（客户原话 vs AI 应答
 逐轮对照），供人工判读：答非所问 / 复读 / 直念锁死 / 兜底直念占比。
+G7 常设段（2026-09-25）：turns 统计 gen=qa_fastpath 占回复轮比例（快路覆盖
+实测面 = 喂库收益），逐通打印 + 聚合进 JSON 报告 fastpath_stats。
 
 退出码：总哑轮 ≥2 或任一通开场白未出声 → FAIL(1)。
 
@@ -204,12 +206,45 @@ def reply_quality_flags(rounds: list[dict]) -> dict[str, int]:
     return flags
 
 
+def qa_fastpath_stats(turns: list[dict]) -> dict:
+    """G7 would-hit 快路覆盖实测面（纯函数，tests/test_offscript_report.py 直测）。
+
+    本轮回复轮里 gen=="qa_fastpath"（QA 罐头直出）的占比——喂进问答库的词条
+    在真实话术外轮次里实际接住了多少。口径与 gap_mining 同源：gen 是唯一权威
+    快路判定源（provider 是跳步/通知副作用标记不参与），分母=回复轮
+    （排除 filler/interrupted 账本行，它们不是回复）；gen 空（旧数据）按 llm
+    归桶、照进分母（保守不误归因）。
+    """
+    replies = 0
+    fast = 0
+    by_gen: dict[str, int] = {}
+    for t in turns:
+        if t.get("role") != "assistant":
+            continue
+        g = str(t.get("gen") or "").strip()
+        if g in ("filler", "interrupted"):
+            continue  # 垫话/打断账本行：非回复，不进分母
+        replies += 1
+        key = g or "llm"
+        by_gen[key] = by_gen.get(key, 0) + 1
+        if g == "qa_fastpath":
+            fast += 1
+    return {
+        "reply_turns": replies,
+        "qa_fastpath_turns": fast,
+        "qa_fastpath_rate": round(fast / replies, 4) if replies else 0.0,
+        "by_gen": by_gen,
+    }
+
+
 def summarize_all(results: list[dict], budgets: dict[str, float]) -> dict:
     """跨通聚合（纯函数）。"""
     first: list[float] = []
     totals: list[float] = []
     markers: dict[str, int] = {}
     gens: dict[str, int] = {}
+    fp_replies = 0
+    fp_fast = 0
     for r in results:
         first.extend(m["first_audio_ms"] for m in r["measures"] if m.get("first_audio_ms") is not None)
         totals.extend(p["total"] for p in r["perceived"])
@@ -218,6 +253,9 @@ def summarize_all(results: list[dict], budgets: dict[str, float]) -> dict:
                 markers[k] = markers.get(k, 0) + v
         for g, n in r.get("gen_counts", {}).items():
             gens[g] = gens.get(g, 0) + n
+        fs = r.get("fastpath_stats") or {}
+        fp_replies += int(fs.get("reply_turns") or 0)
+        fp_fast += int(fs.get("qa_fastpath_turns") or 0)
     over = sum(1 for v in first if v > budgets["first_ms"])
     return {
         "calls": len(results),
@@ -239,6 +277,12 @@ def summarize_all(results: list[dict], budgets: dict[str, float]) -> dict:
         },
         "markers": markers,
         "gen_counts": gens,
+        # G7 快路覆盖实测面：跨通回复轮里 gen=qa_fastpath 的占比（喂库收益）
+        "fastpath_stats": {
+            "reply_turns": fp_replies,
+            "qa_fastpath_turns": fp_fast,
+            "qa_fastpath_rate": round(fp_fast / fp_replies, 4) if fp_replies else 0.0,
+        },
     }
 
 
@@ -353,6 +397,7 @@ async def run_set(key: str, persona_id: str | None, budgets: dict[str, float]) -
         if t.get("role") == "assistant":
             g = (t.get("gen") or "llm").strip() or "llm"
             gen_counts[g] = gen_counts.get(g, 0) + 1
+    fastpath_stats = qa_fastpath_stats(turns)
     attributed = attribute_replies(turns, turn_counts)
 
     # 日志窗口：PERCEIVED 三段 + 哨兵计数（复用 soak 的正则/哨兵集）。
@@ -397,6 +442,7 @@ async def run_set(key: str, persona_id: str | None, budgets: dict[str, float]) -
         "attributed": attributed,
         "quality": quality,
         "gen_counts": gen_counts,
+        "fastpath_stats": fastpath_stats,
         "summary": summary,
         "ts": int(time.time()),
     }
@@ -444,6 +490,12 @@ def print_report(res: dict, budgets: dict[str, float]) -> None:
         )
     q = res["quality"]
     print(f"质量旗：空答轮={q['empty_reply']} 整句复读轮={q['repeat_reply']} · 生成源={res['gen_counts']}")
+    fs = res.get("fastpath_stats") or {}
+    print(
+        f"快路覆盖：qa_fastpath {fs.get('qa_fastpath_turns', 0)}/{fs.get('reply_turns', 0)} 回复轮"
+        f"（{fs.get('qa_fastpath_rate', 0.0) * 100:.1f}%）",
+        flush=True,
+    )
     active = {k: v for k, v in s["markers"].items() if v}
     print(f"哨兵计数：{active if active else '（无）'}", flush=True)
     print("\n对话实录（逐轮对照）:", flush=True)
@@ -488,6 +540,12 @@ async def main() -> int:
     if pd["n"]:
         print(f"PERCEIVED n={pd['n']} p50={pd['p50']:.0f}ms p95={pd['p95']:.0f}ms max={pd['max']:.0f}ms", flush=True)
     print(f"生成源合计={agg['gen_counts']}", flush=True)
+    afs = agg.get("fastpath_stats") or {}
+    print(
+        f"快路覆盖合计：qa_fastpath {afs.get('qa_fastpath_turns', 0)}/{afs.get('reply_turns', 0)} 回复轮"
+        f"（{afs.get('qa_fastpath_rate', 0.0) * 100:.1f}%）",
+        flush=True,
+    )
     print(f"哨兵合计={agg['markers'] if agg['markers'] else '（无）'}", flush=True)
     print(f"[offscript] JSON 报告 → {out}", flush=True)
     fail = agg["mute"] >= erc.FAIL_MUTE_ROUNDS or any(not r["setup_ok"] for r in results)

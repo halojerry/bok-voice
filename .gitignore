@@ -58,3 +58,4 @@ docs/runtime-architecture*.json
 work-session-*/
 pkgruntime-aside/
 Library/
+scripts/.judge_group_eval.json

@@ -4498,7 +4498,8 @@ def update_qa_entry(entry_id: str, req: QaEntryPatch, request: Request) -> dict:
         from fastapi import HTTPException
 
         raise HTTPException(status_code=404, detail="qa entry not found")
-    _audit("qa_entry.update", subject_type="qa_entry", subject_id=entry_id)
+    _audit("qa_entry.update", subject_type="qa_entry", subject_id=entry_id,
+           detail={"fields": sorted(patch.keys())})
     return row
 
 
@@ -5117,7 +5118,8 @@ def update_template(template_id: str, req: UpdateTemplateRequest, request: Reque
         subject_id=template_id,
         account_id=tpl.get("account_id", ""),
         detail={"name": tpl.get("name", ""), "revision": revision, "graph_saved": bool(payload.get("graph_json")),
-                "changed": sorted(k for k in req.model_dump() if req.model_dump().get(k) not in (None, "") and before.get(k) != req.model_dump().get(k))},
+                "changed": sorted(k for k in req.model_dump() if req.model_dump().get(k) not in (None, "") and before.get(k) != req.model_dump().get(k)),
+                "keys": sorted(payload.keys())},
     )
     return tpl
 

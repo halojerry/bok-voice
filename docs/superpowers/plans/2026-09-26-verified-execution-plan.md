@@ -10,7 +10,7 @@
 |---|---|---|
 | V1 smart-turn 现模型 | **粤语退化实锤**：47% 真停嘴被判未说完、held 概率中位 0.019（系统性低估）、23 次 held 全部 800ms 超时 flush 零真并入=纯 +810ms 首声（offscript 50 轮实弹）；普通话腿 p 0.24-0.35 正常 | 不能用于粤语 A 线；zh/en 可用 |
 | V1 smart-turn 工程面 | 接入完成（kill-switch `BOK_SMART_TURN` 默认关，fail-open 三层，onnxruntime 35-130ms 不阻环，A/B barge_in 打断安全无损） | 代码已就位，开闸即用 |
-| V3 LiveKit 内置 detector | 1.8.2 在位（14 语含 zh 无 yue）；杀句级重叠 | 只作对照，不主用 |
+| V3 LiveKit 内置 detector | 1.8.2 在位（14 语含 zh、无粤语）；杀句级重叠 | 只作对照，不主用 |
 | V4 TTS SFT 全链 | **全链打通**（含最险的 checkpoint→8bit→sidecar 跳，产物与生产同构、sidecar 零改动）；手册=TTS-SFT-PLAYBOOK.md | 主路径放行，只差 CUDA 训练 |
 | V5 VoxCPM2 | Mac 可用、粤语零样本可懂、RTF 0.95、但 10.4G 内存无 MLX 量化 | 粤语 B 计划/对照组 |
 | V6 speculative reopen | 兼容矩阵+集成设计+回归清单齐；两硬冲突（say 先烧账本/已出声召回状态双烧）均有绕开姿势；我们已有半套（join-hold 同构） | M 量级，排在 smart-turn 粤语结论后 |

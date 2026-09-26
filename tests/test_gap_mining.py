@@ -314,7 +314,8 @@ def test_llm_gaps_endpoint_shape(client_with_repo):
     r = client_with_repo.client.get("/api/stats/llm-gaps?account_id=acc-001&min_calls=1")
     assert r.status_code == 200, r.text
     body = r.json()
-    assert set(body) == {"coverage", "gaps", "generated_at"}
+    assert set(body) == {"coverage", "gaps", "summary", "generated_at"}
+    assert body["summary"] == {"would_hit_covered": 0, "gaps_total": 1}
     cov = body["coverage"]
     assert cov["turns"] == 1 and cov["llm"] == 1 and cov["fastpath"] == 0
     assert cov["fastpath_ratio"] == 0.0

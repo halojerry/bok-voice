@@ -207,3 +207,60 @@ def test_livekit_plugins_wiring_source_pins():
     assert "def _append_turn_pcm" in src
     # hold 期间 partial 继续滚（finishing 置 False，与 join-hold 分支同纪律）
     assert "self._finishing = False  # hold 期间 partial 继续滚" in src
+
+
+# ---- 车道门（V1 定案 2026-09-26：cantonese 恒关，zh/en 可用）------------------
+
+
+def test_lane_allowed_pure():
+    """cantonese 恒关；zh/en 可用；None/未知/空=不挡（fail-open 精神）。"""
+    assert st.smart_turn_lane_allowed("cantonese") is False
+    assert st.smart_turn_lane_allowed("zh") is True
+    assert st.smart_turn_lane_allowed("en") is True
+    assert st.smart_turn_lane_allowed(None) is True
+    assert st.smart_turn_lane_allowed("") is True
+    assert st.smart_turn_lane_allowed("fr") is True
+
+
+def test_lane_gate_combo_blocks_canto(monkeypatch):
+    """组合门（照接线点条件逐字模拟）：闸开 + cantonese → 闸不激活，
+    smart_turn_prob 不被调用（推理层零触碰）。"""
+    monkeypatch.setenv("BOK_SMART_TURN", "1")
+    assert st.smart_turn_enabled() is True
+
+    def _never_call(pcm):
+        raise AssertionError("cantonese lane must not reach inference")
+
+    monkeypatch.setattr(st, "smart_turn_prob", _never_call)
+    # 与 livekit_plugins END_OF_SPEECH 分支同款组合条件：
+    lang = "cantonese"
+    if st.smart_turn_enabled() and st.smart_turn_lane_allowed(lang):
+        asyncio.run(st.smart_turn_prob(b"\x00\x01" * 16))  # pragma: no cover - 不应到达
+
+
+def test_lane_gate_combo_allows_zh_and_en(monkeypatch, fresh_singleton):
+    """组合门：闸开 + zh/en → 车道放行，闸照常评估（prob 语义由既有用例钉）。"""
+    monkeypatch.setenv("BOK_SMART_TURN", "1")
+    monkeypatch.setattr(st, "_analyzer", _FakeAnalyzer(prob=0.2))
+    pcm = b"\x01\x02" * (st._MIN_PCM_BYTES // 2 + 8)
+    for lang in ("zh", "en"):
+        assert st.smart_turn_enabled() and st.smart_turn_lane_allowed(lang)
+        prob = asyncio.run(st.smart_turn_prob(pcm))
+        assert prob == pytest.approx(0.2)
+        assert st.smart_turn_decide(prob) == "hold"
+
+
+def test_livekit_plugins_lane_wiring_source_pins():
+    """车道门接线 pin：cantonese 必须旧路径逐字节照走——lane 只挡 smart-turn 块、
+    不碰 join-hold；lane_off 打点每流一次（标志在流初始化、不在 _reset 重置）。"""
+    src = _LP_PATH.read_text(encoding="utf-8")
+    assert "smart_turn_lane_allowed" in src
+    assert src.count('print(f"SMART_TURN lane_off lang={_st_lang}", flush=True)') == 1
+    assert "self._smart_lane_off_logged = False" in src
+    # 每流一次：_reset 不得重置该标志（否则每段语音都刷一遍）。
+    i_reset = src.index("def _reset(self)")
+    assert "_smart_lane_off_logged" not in src[i_reset:]
+    # lane_off 分支只是打点，不得吞 join-hold：其位置必须在既有 join-hold 段之前。
+    i_lane = src.index("SMART_TURN lane_off")
+    i_vocab = src.index("_vocab_hit = (")
+    assert i_lane < i_vocab, "lane_off elif 后必须原样落到 join-hold 逻辑"

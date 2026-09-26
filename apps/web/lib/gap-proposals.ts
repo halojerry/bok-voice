@@ -53,12 +53,22 @@ export type ProposalGapRow = {
   lang: string;
   sample_answer: string;
   sample_call_id: string;
+  /** G7 would-hit：该问法已有同语言词条覆盖（与 adopt 幂等判据同源）。 */
+  would_hit: boolean;
+  existing_qa_id: string;
 };
 
-/** GET /api/stats/template-proposals 整包（coverage/gaps 与 L-① 同源同形）。 */
+/** G7 would-hit 汇总（喂库收益信号：漏网问法里已有词条可覆盖的占比）。 */
+export type ProposalGapSummary = {
+  would_hit_covered: number;
+  gaps_total: number;
+};
+
+/** GET /api/stats/template-proposals 整包（coverage/gaps/summary 与 L-① 同源同形）。 */
 export type TemplateProposalsReport = {
   coverage: ProposalCoverage;
   gaps: ProposalGapRow[];
+  summary?: ProposalGapSummary;
   proposals: TemplateProposal[];
   generated_at: number;
 };

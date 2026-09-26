@@ -56,7 +56,11 @@ gen 是唯一权威快路判定源(_turn_origin consume-once 账本,:3015 默认
 - 归一化复用 bok_voice_core.qa_text.normalize_question(与运行时 QA 快路匹配
   同源——报告聚出来的问法运行时才对得上),聚合键=(归一文本, template_id),
   template_id 为空的通话合并成一组(calls 累计);
-- 结果按 count 降序,门槛 count >= min_calls,截 limit。
+- 结果按 count 降序,门槛 count >= min_calls,截 limit;
+- would-hit(G7 喂库收益信号,2026-09-25):每个 gap 组标注该问法是否已有
+  同语言词条可覆盖——判定复用 find_existing_qa_entry(与 adopt 幂等判据
+  同一条匹配器,不另造第二套),组行带 would_hit/existing_qa_id,顶层
+  summary 带 would_hit_covered/gaps_total 供前端算覆盖率。
 """
 
 from __future__ import annotations
@@ -328,9 +332,46 @@ def build_llm_gap_report(
     rows = [r for r in aggregate_gap_groups(groups) if r["count"] >= max(1, int(min_calls))]
     rows.sort(key=lambda r: (-r["count"], r["norm"]))
     rows = rows[: max(1, min(int(limit), 200))]
+    annotate_would_hit(repo, account_id, rows)
+    covered = sum(1 for r in rows if r["would_hit"])
     for r in rows:
         r.pop("norm", None)  # 内部聚合键不出仓
-    return {"coverage": coverage, "gaps": rows, "generated_at": int(time.time())}
+    return {
+        "coverage": coverage,
+        "gaps": rows,
+        # G7 汇总:漏网组里已有同语言词条可覆盖的组数/总组数——前端算
+        # would-hit 覆盖率(M/N),喂库动力信号。
+        "summary": {"would_hit_covered": covered, "gaps_total": len(rows)},
+        "generated_at": int(time.time()),
+    }
+
+
+# ---- would-hit 标注(G7 喂库收益信号,2026-09-25) ----
+
+
+def annotate_would_hit(repo, account_id: str, rows: list[dict]) -> None:
+    """逐 gap 组原地标注 would_hit/existing_qa_id。
+
+    判定复用 find_existing_qa_entry——与漏网轮采纳(adopt)幂等判据同一条
+    匹配器(同账号同 lang 归一同问法),不发明第二套;词条已在库 = 该问法
+    其实不用 AI 现场组织,快路本可以接住。词条面不可读(list_qa_entries
+    异常)时整体降级为全 False,报告照出——信号缺失不炸驾驶舱。
+    """
+    for r in rows:
+        r["would_hit"] = False
+        r["existing_qa_id"] = ""
+    try:
+        for r in rows:
+            hit = find_existing_qa_entry(
+                repo, account_id, str(r.get("customer_text") or ""), str(r.get("lang") or "")
+            )
+            if hit is not None:
+                r["would_hit"] = True
+                r["existing_qa_id"] = str(hit.get("id") or "")
+    except Exception:  # noqa: BLE001 - 词条面不可读只损信号,不炸报表
+        for r in rows:
+            r["would_hit"] = False
+            r["existing_qa_id"] = ""
 
 
 # ---- 采集幂等查找(纯查询;入库与审计在 main.adopt 端点,与 POST /api/qa-entries 同链) ----

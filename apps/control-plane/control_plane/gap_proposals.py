@@ -23,9 +23,10 @@ L-①(gap_mining)把「LLM 漏网轮」采集成快答词条;本模块把同一�
 ## 端点契约(main.py 薄壳,闸链与 L-① 对齐)
 
 - GET /api/stats/template-proposals →
-  `{"coverage": <L-① 同款>, "gaps": <L-① 同款 gap 行>,
-    "proposals": [proposal...], "generated_at": int}`——coverage/gaps 逐字节
-  复用 gap_mining.build_llm_gap_report(驾驶舱一张画面);proposals 每 gap 行
+  `{"coverage": <L-① 同款>, "gaps": <L-① 同款 gap 行(含 G7 would_hit/
+    existing_qa_id)>, "summary": <L-① G7 汇总 would_hit_covered/gaps_total>,
+    "proposals": [proposal...], "generated_at": int}`——coverage/gaps/summary
+  逐字节复用 gap_mining.build_llm_gap_report(驾驶舱一张画面);proposals 每 gap 行
   至多两条(branch 先、intent_keyword 后),字段:
     key(稳定去重键,见下)/kind("branch"|"intent_keyword")/template_id/
     template_name/customer_text(代表原话)/norm(归一客户话,即运行时匹配面)/
@@ -471,7 +472,7 @@ def build_template_proposal_report(
     limit: int = 30,
     exclude_test_objects: bool = True,
 ) -> dict:
-    """查询主入口:coverage+gaps 逐字节来自 gap_mining.build_llm_gap_report;
+    """查询主入口:coverage+gaps+summary(G7) 逐字节来自 gap_mining.build_llm_gap_report;
     对每条 gap 行按其 template_id 取模板行(steps_json/graph_json)生成提案。
 
     模板按账号归属校验(跨账号/已删=按「模板不存在」出不可采纳提案,不炸、
@@ -516,6 +517,10 @@ def build_template_proposal_report(
     return {
         "coverage": base["coverage"],
         "gaps": base["gaps"],
+        # G7 would-hit 汇总(gap_mining 产出,原样透传;旧 base 缺键时给零值兜底)
+        "summary": base.get(
+            "summary", {"would_hit_covered": 0, "gaps_total": len(base["gaps"])}
+        ),
         "proposals": proposals,
         "generated_at": base["generated_at"],
     }

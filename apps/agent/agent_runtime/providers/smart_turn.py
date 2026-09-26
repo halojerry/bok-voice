@@ -47,6 +47,12 @@ def smart_turn_enabled() -> bool:
     return os.environ.get("BOK_SMART_TURN", "0") == "1"
 
 
+def smart_turn_lane_allowed(lang: str | None) -> bool:
+    """车道门（V1 定案 2026-09-26）：cantonese 通话恒关——offscript 50 轮实弹 47% 真停嘴
+    被判未说完、held p 中位 0.019，纯 +810ms 首声；zh/en 可用。"""
+    return str(lang or "") != "cantonese"
+
+
 def _pcm16_to_float(pcm: bytes | bytearray):
     """int16 LE PCM → [-1,1] float32（模型/特征件的输入域）。"""
     import numpy as np

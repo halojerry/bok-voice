@@ -1145,12 +1145,17 @@ def _physical_mem_gib() -> float:
 
 
 def _default_prompt_cache_bytes() -> str:
-    """:1235 prompt-cache-bytes 档位:≥32GB 机型 12GB(多路并发会话前缀互不逐出,
-    同人设/话术跨会话命中更高——M4 48GB 下 4k 前缀 KV 仅 ~134MB,加档纯赚),
-    16GB 机型维持 6GB;BOK_LLM_PROMPT_CACHE_BYTES 显式覆盖。"""
+    """:1235 prompt-cache-bytes 档位,三级优先级:① BOK_LLM_PROMPT_CACHE_BYTES 显式
+    覆盖(专家直设,最高);② BOK_DEMO_PRESET=1 演示/单通档 → 6GB(即便 48GB 机型也压到
+    6GB——V10 2026-09-26 实弹:12→6GB 单通无损,cached 命中 0.906→0.901、TTFT 噪声级,
+    省 6G 统一内存);③ 内存分档:≥32GB 机型 12GB(12GB 的价值只在 4-6 路并发——多路
+    并发会话前缀互不逐出,同人设/话术跨会话命中更高;M4 48GB 下 4k 前缀 KV 仅 ~134MB,
+    加档纯赚),16GB 机型维持 6GB。"""
     override = os.environ.get("BOK_LLM_PROMPT_CACHE_BYTES", "").strip()
     if override:
         return override
+    if os.environ.get("BOK_DEMO_PRESET", "") == "1":
+        return "6GB"
     return "12GB" if _physical_mem_gib() >= 32 else "6GB"
 
 
@@ -1172,6 +1177,10 @@ def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
         # 单槽可涨到几十 MB,不封顶会把统一内存吃穿触发 macOS 压缩/交换,TTFT 抖尖。
         # 档位见 _default_prompt_cache_bytes(内存分档+env 覆盖)。
         _cache_bytes = _default_prompt_cache_bytes()
+        _cache_tier = ("explicit" if os.environ.get("BOK_LLM_PROMPT_CACHE_BYTES", "").strip()
+                       else "demo_preset" if os.environ.get("BOK_DEMO_PRESET", "") == "1"
+                       else "mem")
+        print(f"[bok] llm prompt-cache {_cache_bytes} (tier={_cache_tier})")
         # prefill-step-size 512(官方默认 2048,2026-09-08 二分实证从 1024 再降):
         # 暖缓存 TTFT 中位 913/917ms vs 1024 的 1066/1092ms(双轮反向 A/B,增量轮
         # 尾段一步喂完少等半步),并发交错打平——纯赚。

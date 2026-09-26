@@ -5894,6 +5894,8 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         # ≤8s 的 16kHz int16，喂语义闸判「说完没」。与会话同生命周期——_reset
         # 清零；join-hold 续段**不清**（跨段积累正係判定所需上下文）。
         self._smart_pcm = bytearray()
+        # 车道关闭打点标志（cantonese 车道恒关时每流只打一次；流级，不随 _reset 清）：
+        self._smart_lane_off_logged = False
 
     def _append_turn_pcm(self, data: bytes) -> None:
         """滚动尾部缓冲：追加并裁到 8s 上限（留尾）。"""
@@ -6032,7 +6034,14 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                     # finish 兜底；p≥0.5 或模型不可判 → 旧路径逐字节不变。fail-open
                     # 铁律：模型缺位/推理异常 smart_turn_prob 返回 None=pass（skip/
                     # failopen 的原因打点在 smart_turn 模块内）。
-                    if _smart_turn.smart_turn_enabled():
+                    # 车道门（V1 定案 2026-09-26）：smart-turn-v3.2 无粤语校准，
+                    # cantonese 通话恒关——本块不进=旧路径逐字节照走（join-hold
+                    # 等下游逻辑零变化）；zh/en 才吃语义闸。
+                    _st_lang = str(getattr(self._stt_._language_state, "lang", "") or "")
+                    if (
+                        _smart_turn.smart_turn_enabled()
+                        and _smart_turn.smart_turn_lane_allowed(_st_lang)
+                    ):
                         _st_t0 = time.monotonic()
                         _st_prob = await _smart_turn.smart_turn_prob(bytes(self._smart_pcm))
                         _st_verdict = _smart_turn.smart_turn_decide(_st_prob)
@@ -6054,6 +6063,11 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                                 flush=True,
                             )
                         # pass（None）→ 零干预照旧；闸关时整块跳过（零成本）。
+                    elif _smart_turn.smart_turn_enabled():
+                        # 闸开但车道关（cantonese）：只打点，不走判定——每流一次防刷屏。
+                        if not self._smart_lane_off_logged:
+                            self._smart_lane_off_logged = True
+                            print(f"SMART_TURN lane_off lang={_st_lang}", flush=True)
                     # ---- 跨段拼接 hold(治报号句被微停顿切碎,2026-09-06)----
                     # 数字/字母句被句级门有意排除(防半截号码提前提交)→ 永远走逐段
                     # 整句路径,VAD 微停顿即拆轮。续接可能句喺呢度唔发 END_OF_SPEECH、

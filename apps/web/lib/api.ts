@@ -497,6 +497,15 @@ export type LlmGapRow = {
   lang: string;
   sample_answer: string;
   sample_call_id: string;
+  /** G7 would-hit：该问法已有同语言词条覆盖（采纳幂等判据同源） */
+  would_hit: boolean;
+  existing_qa_id: string;
+};
+
+// G7 would-hit 汇总（喂库收益信号：漏网问法里已有词条可覆盖的占比）
+export type LlmGapSummary = {
+  would_hit_covered: number;
+  gaps_total: number;
 };
 
 export type LlmGapsReport = {
@@ -509,6 +518,7 @@ export type LlmGapsReport = {
     by_provider: Record<string, number>;
   };
   gaps: LlmGapRow[];
+  summary?: LlmGapSummary;
   generated_at: number;
 };
 
@@ -542,6 +552,7 @@ export type TemplateProposalsReport = {
     blocked_reason: string;
     blocked_label: string;
   }[];
+  summary?: LlmGapSummary;
   generated_at: number;
 };
 
