@@ -37,10 +37,15 @@ DEFAULT_REALTIME_VOICE = "Cherry"
 DEFAULT_MAX_SECONDS = 300
 
 # 演示人设（标准书面中文，简短客服演示口径；dispatch metadata.instructions
-# 非空才覆盖）。演示档无话术总览，只保留最基座的应答纪律。
+# 非空才覆盖）。演示档无话术总览，只保留最基座的应答纪律。话风收紧（真会话
+# 冒烟实证：omni-flash 每轮回 7-10s/33 字+，软性「一次只说一两句话」压不住
+# S2S 复读偏长）——简洁约束升格为硬规则并置顶，人设与演示说明句殿后。
 DEMO_INSTRUCTIONS = (
-    "你是 Bok 智能语音助手的演示专员，正在与客户进行一通友好的演示通话。"
-    "简短自然地回应客户的问题，一次只说一两句话，不念稿不复读。"
+    "回答必须简短：正常每轮一句话，最多两句，每句不超过 25 字；"
+    "客户没追问就不要展开，不要主动补充说明，不要复述客户的问题；"
+    "演示场景宁可短不可长。"
+    "你是 Bok 智能语音助手的演示专员，正在与客户进行一通友好的演示通话，"
+    "简短自然地回应客户的问题，不念稿不复读。"
     "遇到不确定的问题如实说明这是功能演示，并邀请客户继续体验。"
 )
 
@@ -103,6 +108,41 @@ def attach_usage_hook(model, on_usage) -> bool:
     return False
 
 
+def format_session_usage(usage) -> str | None:
+    """SessionUsageUpdatedEvent.usage → REALTIME_DEMO usage 打点行主体（纯函数，
+    鸭型桩可单测；无可记账目返回 None，调用方跳过打点）。
+
+    payload 形状核实（livekit-agents 1.8.2，.venv312 源）：
+    - SessionUsageUpdatedEvent（voice/events.py:407-410）：字段 usage: AgentSessionUsage；
+      每次指标采集后重发（voice/agent_activity.py:2154-2156），usage 为会话累计
+      快照（voice/agent_session.py:833-835 usage property → flatten() 深拷贝）。
+    - AgentSessionUsage（metrics/usage.py:133-134）：dataclass，model_usage: list[ModelUsage]。
+    - RealtimeModelMetrics 被收集器折进 LLMModelUsage 桶（metrics/usage.py
+      ModelUsageCollector.collect），计数字段=input_tokens / output_tokens /
+      session_duration（均为累计值），**无 total_tokens 字段**——total=input+output。
+      本函数只取 llm_usage 桶：S2S 演示档无 STT/TTS 侧车，token 账全在 LLM 桶。
+    """
+    input_tokens = 0
+    output_tokens = 0
+    duration = 0.0
+    seen = False
+    for entry in getattr(usage, "model_usage", None) or []:
+        if str(getattr(entry, "type", "")) != "llm_usage":
+            continue
+        seen = True
+        input_tokens += int(getattr(entry, "input_tokens", 0) or 0)
+        output_tokens += int(getattr(entry, "output_tokens", 0) or 0)
+        duration += float(getattr(entry, "session_duration", 0.0) or 0.0)
+    if not seen:
+        return None
+    return (
+        f"total_tokens={input_tokens + output_tokens} "
+        f"input_tokens={input_tokens} "
+        f"output_tokens={output_tokens} "
+        f"duration={round(duration, 3)}"
+    )
+
+
 async def entrypoint(ctx) -> None:
     from livekit.agents import Agent, AgentSession, RoomInputOptions, RoomOutputOptions
 
@@ -136,9 +176,10 @@ async def entrypoint(ctx) -> None:
     # instructions=..., turn_detection=...)；WS 端点常量 QWEN_REALTIME_WS_BASE 与
     # 端点覆盖 env QWEN_REALTIME_BASE_URL 在适配器模块内。turn_detection 不传=
     # 适配器内建 server_vad 缺省（DashScope 旧平铺契约收 TurnDetection 对象，
-    # 裸字符串会炸官方构造）；usage 走 session 的 metrics_collected 事件（适配器
-    # 头注 #7：response.done 换算 RealtimeModelMetrics），本 worker 挂监听转发。
-    # 延迟导入——纯函数测试面不依赖适配器在盘。
+    # 裸字符串会炸官方构造）；usage 走 session 的 session_usage_updated 事件
+    # （适配器头注 #7：response.done 换算 RealtimeModelMetrics，会话级收集器累计
+    # 后经该事件暴露——livekit-agents 1.8.2 起 metrics 事件官方标注弃用，本 worker
+    # 已迁移），挂监听转发。延迟导入——纯函数测试面不依赖适配器在盘。
     from .providers.qwen_realtime import QwenRealtimeModel
 
     print(
@@ -198,22 +239,15 @@ async def entrypoint(ctx) -> None:
 
     session.on("conversation_item_added", _on_item)
 
-    def _on_metrics(ev) -> None:
-        # usage 落账主路（适配器头注 #7）：RealtimeModelMetrics 经 metrics_collected
-        # 暴露——逐段转发打点（input/output/total tokens），供云端账单对账。
-        m = getattr(ev, "metrics", None)
-        if m is None:
-            return
-        print(
-            "REALTIME_DEMO usage "
-            f"total_tokens={getattr(m, 'total_tokens', '?')} "
-            f"input_tokens={getattr(m, 'input_tokens', '?')} "
-            f"output_tokens={getattr(m, 'output_tokens', '?')} "
-            f"duration={getattr(m, 'duration', '?')}",
-            flush=True,
-        )
+    def _on_usage_event(ev) -> None:
+        # usage 落账主路（适配器头注 #7）：RealtimeModelMetrics 由会话级收集器
+        # 累计成 AgentSessionUsage，经 session_usage_updated 逐次暴露累计值——
+        # 打点 input/output/total tokens + 累计时长，供云端账单对账。
+        line = format_session_usage(getattr(ev, "usage", None))
+        if line:
+            print(f"REALTIME_DEMO usage {line}", flush=True)
 
-    session.on("metrics_collected", _on_metrics)
+    session.on("session_usage_updated", _on_usage_event)
 
     room = ctx.room
 

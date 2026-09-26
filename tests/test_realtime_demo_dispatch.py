@@ -9,7 +9,8 @@
   A 线 bok-voice 分支对演示房零串台；
 - webhook：演示房 agent 离房不自动补位（补位只会派 bok-voice=跨线串台）；
 - worker 纯函数（apps/agent/agent_runtime/realtime_demo.py）：假对象前缀闸、
-  派单元数据解析缺省、时长熔断档读 env、usage 钩子探测。
+  派单元数据解析缺省、时长熔断档读 env、usage 钩子探测、话风硬规则置顶、
+  session_usage_updated 打点纯函数与新事件源级 pin。
 """
 
 from __future__ import annotations
@@ -292,6 +293,76 @@ def test_attach_usage_hook_probe():
         pass
 
     assert rd.attach_usage_hook(_NoHook(), cb) is False
+
+
+# ---- 话风收紧 + usage 事件迁移（2026-09-25 阶段 B 收尾遗留项） ----
+
+
+def test_demo_instructions_brevity_hard_rule():
+    """话风收紧（真会话冒烟实证 omni-flash 每轮 7-10s/33 字+）：简洁约束写成
+    硬规则并置顶；演示专员人设与「不确定就说明是演示」句保留。"""
+    rd = _demo_module()
+    text = rd.DEMO_INSTRUCTIONS
+    # 硬规则关键词（稳定子串）
+    assert "回答必须简短" in text
+    assert "一句" in text
+    assert "最多两句" in text
+    assert "25" in text  # 每句不超过 25 字
+    assert "不要复述客户的问题" in text
+    assert "宁可短" in text
+    # 置顶：简洁硬规则先于人设句出现
+    assert text.index("回答必须简短") < text.index("演示专员")
+    # 人设与演示口径保留
+    assert "演示专员" in text
+    assert "功能演示" in text
+
+
+def test_format_session_usage_llm_bucket_line():
+    """usage 打点纯函数：新 payload（SessionUsageUpdatedEvent.usage →
+    AgentSessionUsage.model_usage）→ 稳定行格式；只取 llm_usage 桶（Realtime
+    模型的 token 账由收集器折进 LLM 桶，无 total_tokens 字段=input+output），
+    空账/无 llm 条目返回 None（调用方跳过打点）。"""
+    rd = _demo_module()
+
+    class _LLM:
+        def __init__(self, inp, outp, dur):
+            self.type = "llm_usage"
+            self.input_tokens = inp
+            self.output_tokens = outp
+            self.session_duration = dur
+
+    class _TTS:  # 非 LLM 桶不进 token 账
+        type = "tts_usage"
+        input_tokens = 999
+        output_tokens = 999
+        session_duration = 9.9
+
+    class _Usage:
+        model_usage = [_LLM(120, 33, 1.5), _LLM(50, 17, 0.25), _TTS()]
+
+    line = rd.format_session_usage(_Usage())
+    assert line == "total_tokens=220 input_tokens=170 output_tokens=50 duration=1.75"
+    # 空/坏 payload 宽容：None 跳过，绝不炸监听回调
+    assert rd.format_session_usage(None) is None
+    assert rd.format_session_usage(object()) is None  # 无 model_usage 属性
+
+    class _Empty:
+        model_usage = []
+
+    class _OnlyTTS:
+        model_usage = [_TTS()]
+
+    assert rd.format_session_usage(_Empty()) is None
+    assert rd.format_session_usage(_OnlyTTS()) is None
+
+
+def test_usage_event_pinned_to_session_usage_updated():
+    """源级 pin：usage 监听挂新事件 session_usage_updated（livekit-agents 1.8.2，
+    旧事件注册会触发官方 deprecation 告警），旧的 metrics_collected 全文不再出现。"""
+    rd = _demo_module()
+    src = Path(rd.__file__).read_text(encoding="utf-8")
+    assert 'session.on("session_usage_updated"' in src
+    assert "metrics_collected" not in src
 
 
 # ---- bok.py 侧：worker spec/prod unit opt-in 门（BOK_QWEN_REALTIME） ----
