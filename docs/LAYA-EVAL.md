@@ -55,9 +55,9 @@ state 放 600 字（384 tok）内正常；1200 字（729 tok）判读开始翻�
 | 挖掘聚类 | ❌ 保持 4B | 4/8，碎片误入库直接伤 QA 快路 |
 | offscript 质量旗/回声/热词等 | ❌ 不引入 | 已有确定性方案，ML 反而引入不确定性 |
 
-**集成形态**：独立决策 sidecar（:8789 与 ASR/TTS sidecar 同族拓扑），不进 A 线 worker 进程
+**集成形态**：独立决策 sidecar（:8791 与 ASR/TTS sidecar 同族拓扑），不进 A 线 worker 进程
 （0.2.0 早期依赖不进关键路径、崩溃可隔离）；模型路由 judge 车道加第三种 kind=`laya`；agent 薄契约
-`POST :8789/v1/decide {state(≤800tok), questions{type,instructions,criteria}, confidence_floor}` →
+`POST :8791/v1/decide {state(≤800tok), questions{type,instructions,criteria}, confidence_floor}` →
 answers 带 `below_floor` 旗，低置信回落现有 9B 链路=纯加速旁路零行为回归；kill-switch
 `BOK_LAYA_JUDGE`（入 `_FORWARD_ENV`——D14 教训）。
 

@@ -41,6 +41,10 @@ from .plugins.settlement import SettlementTrigger
 from .providers.registry import build_provider_registry
 from .control_plane import ControlPlaneClient
 from .fillers import FillerDirector, derive_context_bucket
+# Laya 决策旁路(2026-09-26,docs/LAYA-EVAL.md 第一落位 intent judge):薄客户端+纯
+# 装配,日志由本模块统一打点;enabled 闸(BOK_LAYA_JUDGE,默认 "0")在最外层=零调用
+# 零日志零变化。kill-switch 经 bok.py _FORWARD_ENV 进 worker env(键由 bok 侧立法)。
+from .laya_judge import laya_judge_enabled, pick_intent_laya, recent_turn_pairs
 from .qa_gate import (
     QaIndex,
     pick_rotation_member,
@@ -4318,6 +4322,74 @@ async def entrypoint(ctx):
             flush=True,
         )
 
+    async def _laya_intent_pick(utt: str, history: list, play_allowed: bool) -> dict | None:
+        """Laya 决策旁路单轮壳（2026-09-26，docs/LAYA-EVAL.md 第一落位 intent judge）。
+
+        判定装配在 `laya_judge.pick_intent_laya`（模块级，离线可测）；此处只管
+        per-call 打点纪律与命中返回。打点镜像 `_sem_skip_flag` 姿势：per-call 旗
+        挂 agent 实例（轮级局部变量会退化成每轮刷屏）——off/unavailable 每通只打
+        一次；默认闸关（BOK_LAYA_JUDGE!=1）时零日志，仅「当通曾开、中程被关」才
+        打一行 off。返回 dict=高置信命中（answer.choice=意图 id，消费方经
+        pick_graph_action(judge_hit=) 与关键词/9B judge 同权同守卫）；None=回落
+        旧路（off/abstain/unavailable/silent——下方 9B 调度分支照旧调度后台判，
+        旧路逐字节不变，fail-open 铁律）。
+        """
+        flags = getattr(agent, "_laya_flags", None)
+        if flags is None:
+            flags = {"off": False, "unavail": False, "ever_on": False}
+            agent._laya_flags = flags
+        # enabled 闸在最外层：默认关 → 零调用零日志零变化。
+        if not laya_judge_enabled():
+            if flags["ever_on"] and not flags["off"]:
+                flags["off"] = True
+                print(f"LAYA_JUDGE verdict=off (call {room_name})", flush=True)
+            return None
+        flags["ever_on"] = True
+        _lg, _lr = flow_ctrl.current_goal_ref()
+        _res = await pick_intent_laya(
+            graph=flow_ctrl.graph,
+            step_1based=int(flow_ctrl.current) + 1,
+            fired=flow_ctrl.graph_fired,
+            user_text=utt,
+            history=history,
+            goal=_lg or _lr,
+            play_allowed=play_allowed,
+        )
+        if _res.verdict == "silent":
+            # 无可判定候选（无可触发绑定的意图）：热路径静默（与语义 no_candidates 同款）。
+            return None
+        if _res.verdict == "off":
+            if not flags["off"]:
+                flags["off"] = True
+                print(f"LAYA_JUDGE verdict=off (call {room_name})", flush=True)
+            return None
+        if _res.verdict == "unavailable":
+            # 健康/判定失败：回落 9B，每通只打一次归因（60s 健康缓存兜住重探风暴）。
+            if not flags["unavail"]:
+                flags["unavail"] = True
+                print(
+                    f"LAYA_JUDGE verdict=unavailable reason={_res.reason or 'unknown'} "
+                    f"ms={_res.ms} intents={_res.intents} (call {room_name})",
+                    flush=True,
+                )
+            return None
+        _conf = float((_res.answer or {}).get("confidence") or 0.0)
+        _trunc = " state_truncated=1" if (_res.answer or {}).get("state_truncated") else ""
+        if _res.verdict == "abstain":
+            # below_floor / NONE：置信门回落——9B 后台判在下方原样调度（不动）。
+            print(
+                f"LAYA_JUDGE verdict=abstain conf={_conf:.2f} ms={_res.ms} "
+                f"intents={_res.intents}{_trunc} (call {room_name})",
+                flush=True,
+            )
+            return None
+        print(
+            f"LAYA_JUDGE verdict=hit conf={_conf:.2f} ms={_res.ms} "
+            f"intents={_res.intents}{_trunc} (call {room_name})",
+            flush=True,
+        )
+        return _res.answer
+
     class PausableAgent(Agent):
         """可被主管台暂停/接管/恢复的 Agent：暂停期间抑制自动回复，但保留转写与历史。
 
@@ -5369,6 +5441,42 @@ async def entrypoint(ctx):
                         )
                     # reason=no_candidates:无可匹配意图(全被闸滤掉/空话语),静默
                     # (同 _intent_judge_candidates 空表姿势,热路径一行不刷)。
+                # Laya 决策旁路（2026-09-26，docs/LAYA-EVAL.md 第一落位 intent judge）：
+                # 关键词 + 9B pending + 语义三路都未中时的**当轮同步**快判（实测 ~10ms
+                # 边缘判定，9B 后台判要 0.6-2s 且下一轮才生效）。高置信命中
+                # （below_floor=false 且 choice≠NONE）→ 当轮即视为图命中：
+                # pick_graph_action(judge_hit=) 与关键词/9B judge **同权同守卫**
+                # （enabled/步 scope/绑定资格/(priority,id) 排序全在 pick 内重过，
+                # 不烧 once 不改胜者语义），下方命中消费（jump/notify/play 三臂+
+                # 记账+日志）一行不改——只换「命中从哪来」。below_floor/不可用 →
+                # None 回落，9B 后台判照旧在原调度分支触发（原样原样）。
+                # BOK_LAYA_JUDGE=0（默认）=enabled 闸在最外层，零调用零日志。
+                if _gbinding is None and laya_judge_enabled():
+                    _laya_ans = await _laya_intent_pick(
+                        user_text,
+                        recent_turn_pairs(
+                            list(getattr(turn_ctx, "items", None) or []),
+                            exclude=new_message,
+                        ),
+                        play_allowed=not _graph_advanced,
+                    )
+                    if _laya_ans is not None:
+                        _gbinding = pick_graph_action(
+                            flow_ctrl.graph,
+                            user_text,
+                            step_1based=(int(flow_ctrl.current) + 1),
+                            fired=flow_ctrl.graph_fired,
+                            judge_hit=str(_laya_ans.get("choice") or ""),
+                        )
+                        if _gbinding is not None:
+                            print(
+                                f"FLOW_GRAPH judge_hit source=laya "
+                                f"conf={float(_laya_ans.get('confidence') or 0.0):.2f} "
+                                f"intent={_laya_ans.get('choice')} "
+                                f"binding={_gbinding.id} "
+                                f"step={flow_ctrl.current + 1} (call {room_name})",
+                                flush=True,
+                            )
             if _gbinding is not None:
                 if _gbinding.action == "jump_step":
                     # 1-based 存储转 0-based;先跳、按**实际位移**记账(2026-09-18

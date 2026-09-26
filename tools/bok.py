@@ -125,6 +125,12 @@ MODELS: dict[str, dict[str, str]] = {
         # 单句前向 p50 10.5ms。可选:模型缺失时 sidecar 不起,agent 装配面
         # 降级闩自动关语义车道(关键词+judge 双车道=现状)。
         "embedding": "mlx-community/bge-m3-mlx-4bit",
+        # Laya 决策 sidecar(:8791,2026-09-26):0.4B 非自回归判定引擎
+        # (aac6fef/laya-multilingual-mlx,~690MB FP16,上下文硬顶 1024 token),
+        # 暖态单判 ~10ms——意图/流程判定的边缘快路,带校准置信度
+        # (below_floor 调用方回落 9B)。可选:缺失时 sidecar 不起,agent 走
+        # 原 9B judge。评估数据与坑见 docs/LAYA-EVAL.md。
+        "laya": "aac6fef/laya-multilingual-mlx",
     },
     "windows": {
         "asr": "Qwen/Qwen3-ASR-1.7B",
@@ -147,8 +153,9 @@ MODELS: dict[str, dict[str, str]] = {
 WINDOWS_LLM_GGUF_PATTERNS = ["*Q4_K_M.gguf", "README.md"]
 
 # 首启向导不门禁的模型(可选增强,缺失时对应功能自动回退:B 线 MT 回退主 LLM :1235,
-# settle/judge 专线回退 :1235,意图语义车道回退关键词+judge 双车道)。
-OPTIONAL_MODELS = {"mt", "settle", "embedding"}
+# settle/judge 专线回退 :1235,意图语义车道回退关键词+judge 双车道,Laya judge
+# 回退 :1237/:1235 生成式判定链)。
+OPTIONAL_MODELS = {"mt", "settle", "embedding", "laya"}
 
 
 def platform_key() -> str:
@@ -275,6 +282,41 @@ def _settle_llm_model(current: dict[str, str]) -> str:
     if override:
         return override
     return model_path(current, "settle")
+
+
+def _usable_laya_dir(path: Path) -> bool:
+    """laya 检查点在盘判据——不能借 `_usable_model_dir`（config.json 是 mlx/HF
+    布局入口；laya 检查点入口是 rl_agent_config.json + model.safetensors +
+    encoder/config.json，与 sidecar 侧 _is_checkpoint 同源）。"""
+    return (
+        (path / "rl_agent_config.json").is_file()
+        and (path / "model.safetensors").is_file()
+        and (path / "encoder" / "config.json").is_file()
+    )
+
+
+def laya_model_path(current: dict[str, str]) -> str:
+    """Laya 决策 sidecar(:8791) 模型路径:LAYA_MODEL_DIR 显式覆盖 > MODELS 表
+    laya 条目(mac dev 走 lmstudio/app-data 双布局「哪边真实在盘用哪边」同款
+    次序,判据用 laya 专属 `_usable_laya_dir`)。解析不出返回 ""(调用方跳过
+    :8791,agent 走原 9B judge 回落链,唔会指去死端口)。"""
+    override = os.environ.get("LAYA_MODEL_DIR", "").strip()
+    if override:
+        return override
+    repo = current.get("laya", "")
+    if not repo:
+        return ""
+    if is_packaged():
+        return str(model_dir(repo))
+    if is_mac():
+        lm = _lmstudio_models_dir() / repo
+        if _usable_laya_dir(lm):
+            return str(lm)
+        app = model_dir(repo)
+        if _usable_laya_dir(app):
+            return str(app)
+        return ""
+    return repo
 
 
 def _dev_9b_enabled() -> bool:
@@ -512,6 +554,7 @@ CORE_PORTS: tuple[tuple[str, int], ...] = (
     ("mt-llm", 1236),
     ("settle-llm", 1237),
     ("embed", 8789),
+    ("laya", 8791),
     ("b-line", 8790),
     ("livekit", 7880),
 )
@@ -650,6 +693,8 @@ _SWEEP_HTTP_PATHS.setdefault(1237, "/v1/models")
 # W1b embedding sidecar(:8789):/health 暖机窗答 ready=false 但仍是本体作答
 # ——_relaxed_healthy 语义(任何 HTTP 应答=进程在)正确覆盖加载窗。
 _SWEEP_HTTP_PATHS.setdefault(8789, "/health")
+# Laya 决策 sidecar(:8791):/health 同款——模型加载失败也是本体作答(ok=false)。
+_SWEEP_HTTP_PATHS.setdefault(8791, "/health")
 
 
 def _relaxed_healthy(port: int, timeout_s: float = 5.0) -> bool:
@@ -684,7 +729,7 @@ def _ports_down_after_grace(
     return [p for p in targets if not probe(p)]
 
 
-_OPTIONAL_LLM_PORTS = (1236, 1237, 8789)  # mt/settle/embed:模型缺失即跳过,缺它们不拖垮整栈(embed 非 LLM,同享可选豁免)
+_OPTIONAL_LLM_PORTS = (1236, 1237, 8789, 8791)  # mt/settle/embed/laya:模型缺失即跳过,缺它们不拖垮整栈(embed/laya 非 LLM,同享可选豁免)
 
 
 def _only_optional_ports(down: list[int]) -> bool:
@@ -1294,6 +1339,37 @@ def _start_settle_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> 
     return True
 
 
+def _start_laya(current: dict[str, str], run_dir: Path, log_dir: Path) -> bool:
+    """Laya 决策 sidecar(:8791,意图/流程判定 10ms 快路):独立 FastAPI sidecar,
+    与 asr/tts/embed 同族(非 agent worker,down 走 run/*.pid 全局收割,prod 单元
+    面不列——照 embed 的可选增强姿势)。
+
+    双闸 opt-in(2026-09-26):``BOK_LAYA_JUDGE`` 默认 "0"=不随栈拉起(0.4B 判定
+    引擎属新装车道,未过实弹验收不进默认栈);="1" 且模型在盘才起。sidecar 进程
+    自身也读同键,"0" 时 /v1/decide 一律 503(手动直起也杀得死)——agent 侧同闸
+    三保险。模型缺失/venv 缺席跳过并留一行明示(agent 走原 9B judge 回落链)。
+    端口注::8789 是 embed sidecar 既定端口,本服务用家族下一空位 8791。
+    """
+    if os.environ.get("BOK_LAYA_JUDGE", "0") != "1":
+        print("[bok] laya judge off (BOK_LAYA_JUDGE!=1) — skip :8791 (agent judges fall back to 9B lane)", file=sys.stderr)
+        return False
+    if healthy(8791):
+        return True
+    laya_py = sidecar_python("laya-sidecar")
+    laya_model = laya_model_path(current)
+    if not laya_py.exists() or not laya_model:
+        print(f"[bok] laya model/sidecar not present, skip :8791 ({laya_model or 'unset'})", file=sys.stderr)
+        return False
+    _start_proc(
+        [str(laya_py), "-m", "uvicorn", "app:app", "--app-dir", "services/laya-sidecar",
+         "--host", "127.0.0.1", "--port", "8791"],
+        run_dir / "laya.pid",
+        log_dir / "laya.log",
+        env={"LAYA_MODEL_DIR": laya_model},
+    )
+    return True
+
+
 def _start_call_plane(py) -> bool:
     """通话面拉起（LiveKit + 三个 agent worker + 常驻监控），serve/node 全栈共用。
 
@@ -1432,6 +1508,10 @@ def _cmd_up_services() -> int:
         else:
             print(f"[bok] embed model/sidecar not present, skip :8789 ({embed_model or 'unset'})", file=sys.stderr)
 
+    # Laya 决策 sidecar(:8791,2026-09-26):BOK_LAYA_JUDGE="1" 且模型在盘才起
+    # (opt-in,见 _start_laya docstring;agent 走原 9B judge 回落链=默认档零变化)。
+    want_laya = _start_laya(current, run_dir, log_dir)
+
     # B-line worker (Node, OpenAI-compatible translator on :1235).
     bline_cfg = write_bline_config(current)
     if not healthy(8790):
@@ -1442,13 +1522,14 @@ def _cmd_up_services() -> int:
         )
 
     print("[bok] waiting for services…")
-    # mt(:1236)/settle(:1237)/embed(:8789)仅在确实拉起时纳入等待;主栈四端口照旧。
+    # mt(:1236)/settle(:1237)/embed(:8789)/laya(:8791)仅在确实拉起时纳入等待;主栈四端口照旧。
     core_ports = (8787, 8788, 8790, 1235)
     targets = (
         core_ports
         + ((1236,) if want_mt else ())
         + ((1237,) if want_settle else ())
         + ((8789,) if want_embed else ())
+        + ((8791,) if want_laya else ())
     )
     mt_ready_suffix = " mt=1236" if want_mt else ""
     for _ in range(180):
@@ -1560,6 +1641,12 @@ _FORWARD_ENV = (
     "BOK_QA_SEM_THRESHOLD",
     "BOK_QA_SEM_BASE_URL",
     "BOK_QA_SEM_TIMEOUT_MS",
+    # —— Laya 决策 sidecar(:8791,2026-09-26):意图/流程判定 10ms 快路。总闸
+    #    BOK_LAYA_JUDGE(serve 默认 "0" 不随栈拉起;="1" 且模型在盘才起;sidecar
+    #    侧同闸双保险,"0" 时 /v1/decide 一律 503)与端点覆盖(缺省 127.0.0.1:8791;
+    #    8789 是 embed sidecar 既定端口,勿混)。
+    "BOK_LAYA_JUDGE",
+    "BOK_LAYA_SIDECAR_URL",
     # —— 意向规则挂断评估(W4-T2,2026-09-19:0=关,挂断走原 disposition) ——
     "BOK_INTENT_RULES",
     "BOK_QA_ROTATION",
@@ -2427,6 +2514,8 @@ _ORPHAN_PORT_OWNERS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (8787, ("qwen3-asr",)),
     (8788, ("qwen3-tts",)),
     (8789, ("bge-embed",)),
+    # Laya 决策 sidecar(:8791):uvicorn 命令行带 --app-dir services/laya-sidecar。
+    (8791, ("laya-sidecar",)),
     (1235, ("mlx_lm",)),
     (1236, ("mlx_lm",)),
     (1237, ("mlx_lm",)),
@@ -3301,6 +3390,11 @@ def cmd_prod_status() -> int:
         # W1b embedding sidecar:/health 本体答 ready(未就绪答 ready=false 但
         # 200——下面 "Not Ready" 同款行检不出,暖机窗极短可接受;DOWN 才是缺席)。
         checks.append(("embed", 8789, "/health"))
+    if healthy(8791):
+        # Laya 决策 sidecar:同款「起了才查」——未启用部署(BOK_LAYA_JUDGE!=1)
+        # 不进表,健康面不假 DEGRADED;/health ok=false(模型加载失败)仍是本体
+        # 作答算活,真 DOWN 才缺席。
+        checks.append(("laya", 8791, "/health"))
     all_ok = True
     for name, port, path in checks:
         try:
@@ -3349,7 +3443,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         sub.add_parser(name)
     p_dl = sub.add_parser("download", help="下载平台模型表（--only 子集=装机选型）")
     p_dl.add_argument("--only", nargs="*", default=None,
-                      help="只下载指定模型键（asr tts_preset tts_clone llm llm_4b mt settle）")
+                      help="只下载指定模型键（asr tts_preset tts_clone llm llm_4b mt settle embedding laya）")
     sub.add_parser("tts-pregen", help="离线预合成 TTS 本地缓存(参数透传:--greetings/--objects/--fillers/--cp/--model)")
     p_prod = sub.add_parser("prod", help="生产常驻单元与健康面")
     p_prod.add_argument("action", nargs="?", default="status",
