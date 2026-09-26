@@ -77,9 +77,10 @@ const ACTIONS: [GraphBinding["action"], string][] = [
   ["notify_human", "通知人工（打铃不暂停）"],
 ];
 
-function rid(prefix: string): string {
-  return `${prefix}_${Math.random().toString(36).slice(2, 8)}`;
-}
+// id 生成一律走 genHexId（int_/bnd_ + 8 位小写 hex，CP `_ID_RE` 唯一合法形状）。
+// 2026-09-26 实弹：旧 rid()（Math.random base36、6 字符、含非 hex 字符）产出的
+// int_88skq2 被 CP validate_flow_graph 400 拒——新建意图/加动作/基础意图包三条
+// 路全灭且 UI 只剩裸 "400 Bad Request"。删 rid，四处调用点全换 genHexId。
 
 /** 文本 → 关键词数组：逗号/顿号/分号/空白/换行分隔，去重保序。 */
 function parseKeywords(text: string): string[] {
@@ -123,7 +124,7 @@ type IntentDraft = {
 
 function emptyDraft(): IntentDraft {
   return {
-    id: rid("int"),
+    id: genHexId("int_"),
     label: "",
     keywords: [],
     stepsText: "",
@@ -144,7 +145,7 @@ function toDraft(it: GraphIntent, bindings: GraphBinding[]): IntentDraft {
     bindings: bindings
       .filter((b) => b.intent === it.id)
       .map((b) => ({
-        id: b.id || rid("bnd"),
+        id: b.id || genHexId("bnd_"),
         action: b.action,
         qa_id: String(b.qa_id ?? ""),
         step: Number(b.step ?? 1) || 1,
@@ -278,7 +279,7 @@ function IntentModal(props: {
                   patch({
                     bindings: [
                       ...draft.bindings,
-                      { id: rid("bnd"), action: "jump_step", qa_id: "", step: 1, then_jump: 0, priority: 10, once: true, enabled: true },
+                      { id: genHexId("bnd_"), action: "jump_step", qa_id: "", step: 1, then_jump: 0, priority: 10, once: true, enabled: true },
                     ],
                   })
                 }
@@ -539,7 +540,7 @@ export default function IntentManager(props: {
     }
     if (!window.confirm(`导入 ${pending.length} 条基础意图？（只建意图不挂动作，命中后暂无行为，需在编辑里挂绑定）`)) return;
     const added: GraphIntent[] = pending.map((s) => ({
-      id: rid("int"),
+      id: genHexId("int_"),
       label: s.label,
       keywords: [...s.keywords],
       steps: [],

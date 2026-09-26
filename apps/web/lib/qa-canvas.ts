@@ -222,9 +222,12 @@ export function graphDocWithJumpBinding(
   const n = Math.round(Number(stepNo));
   if (!Number.isFinite(n) || n < 1 || n > max) return null;
   const existing = doc.bindings.find((b) => b.intent === intentId);
+  // 新绑定 id 必须过 CP `_ID_RE`（bnd_+8 位小写 hex）。2026-09-26 实弹：曾用
+  // `b-<intentId>-jump` 被 CP 400 拒（连线静默失败、画布不出边）。复用既有 id 时
+  // 它本身已在库=合法；否则 crypto 生成。
   const binding = bindingFromDraft(
     {
-      id: String(existing?.id ?? `b-${intentId}-jump`),
+      id: String(existing?.id ?? genBndId()),
       action: "jump_step",
       step: n,
       priority: existing?.priority,
@@ -239,6 +242,13 @@ export function graphDocWithJumpBinding(
     intents: doc.intents,
     bindings: [...doc.bindings.filter((b) => b.intent !== intentId), binding],
   };
+}
+
+/** CP `flow_graph._ID_RE` 唯一合法的绑定 id 形状：bnd_ + 8 位小写 hex（crypto）。 */
+function genBndId(): string {
+  const bytes = new Uint8Array(4);
+  crypto.getRandomValues(bytes);
+  return "bnd_" + Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 /** 解除该意图的全部绑定（意图/关键词/判据保留——命中后只按命中语料答话，无动作）。

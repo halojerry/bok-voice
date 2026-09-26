@@ -26,10 +26,17 @@ export function registryBase(): string {
 
 async function toError(res: Response): Promise<Error> {
   // 优先透传 FastAPI 的 detail（如 MiniMax API Key 未配置），失败时退回 statusText。
+  // detail 也可能是列表（CP graph 校验 400 的形状 {"error":"invalid_graph_json","detail":[...]}），
+  // 拼成可读串——否则运营只看到裸 "400 Bad Request"，校验原文（如 id malformed）被吞。
   let detail = "";
   try {
     const body = await res.json();
-    if (body && typeof body.detail === "string") detail = body.detail;
+    if (body && typeof body.detail === "string" && body.detail) detail = body.detail;
+    else if (Array.isArray(body?.detail) && body.detail.length) {
+      const parts = body.detail.map((x) => (typeof x === "string" ? x : JSON.stringify(x)));
+      const tag = typeof body.error === "string" && body.error ? `${body.error}: ` : "";
+      detail = tag + parts.join("；");
+    }
   } catch {
     /* 非 JSON 响应(如网关错误页)直接忽略 */
   }

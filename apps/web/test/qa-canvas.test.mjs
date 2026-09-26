@@ -176,7 +176,8 @@ test("graphDocWithJumpBinding 无既有绑定时生成新 id、非法输入返 n
   const fresh = qa.graphDocWithJumpBinding(bare, "int_9z8y7x6w", 1, 8);
   assert.ok(fresh);
   assert.equal(fresh.bindings.length, 1);
-  assert.match(fresh.bindings[0].id, /^b-int_9z8y7x6w-jump$/);
+  // 新 id 必须过 CP `_ID_RE`（bnd_+8hex；2026-09-26 实弹 b-<intent>-jump 被 400 拒）
+  assert.match(fresh.bindings[0].id, /^bnd_[0-9a-f]{8}$/);
   assert.equal(fresh.bindings[0].priority, 10); // bindingFromDraft 缺省档
   // 有旧绑定的意图=复用 id（GRAPH_DOC 的 int_1a2b3c4d 挂 bnd_7e8f9a0b）
   const reuse = qa.graphDocWithJumpBinding(JSON.stringify(GRAPH_DOC), "int_1a2b3c4d", 1, 8);

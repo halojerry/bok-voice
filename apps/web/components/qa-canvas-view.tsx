@@ -351,7 +351,7 @@ export default function QaCanvasView(props: {
       <div
         ref={(el) => {
           wrapperRef.current = el;
-          sizedWrap.ref.current = el;
+          sizedWrap.ref(el);
         }}
         className="h-[600px] rounded-lg border border-(--card-border)"
         onDoubleClick={(e) => {
