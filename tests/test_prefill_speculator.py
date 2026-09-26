@@ -42,11 +42,12 @@ _REQ = [
 
 
 def _arm(spec: PrefillSpeculator) -> None:
-    """喂快照+回复+空闲,并清掉时间戳令间隔门全开。"""
+    """喂快照+回复+空闲,并清掉时间戳令间隔门/静默窗全开。"""
     spec.on_request_messages([dict(m) for m in _REQ])
     spec.on_reply_history_text("<expr>好的客户")
     spec.set_busy(False)
     spec._last_fire_ts = 0.0
+    spec._last_final_ts = 0.0
 
 
 def test_fire_message_shape_is_strict_prefix():
@@ -105,9 +106,10 @@ def test_dedupe_budget_and_new_turn_reset():
         spec.on_stable_prefix("你好我想查下我個集運件而家去咗")
         assert spec._task is None, "预算烧穿(默认 2)不再开火"
 
-        # new_turn 归还预算
+        # new_turn 归还预算（并记 FINAL 时刻——测试里手动归零重开静默窗）
         spec.new_turn()
         spec._last_fire_ts = 0.0
+        spec._last_final_ts = 0.0
         spec.on_stable_prefix("你好我想查下我個集運件而家去咗邊")
         await spec._task
         return prewarm
@@ -169,3 +171,57 @@ def test_short_prefix_no_fire():
 
     prewarm, spec = asyncio.run(run())
     assert spec._task is None and not prewarm.calls
+
+
+def test_final_quiet_gate_blocks_then_passes(monkeypatch):
+    """FINAL 后静默窗(默认 1000ms)内不开火——真回复即将进场,投机预热让路;
+    窗过后照常开火(quiet=1ms 档)。"""
+
+    async def run():
+        spec, prewarm = _spec()
+        _arm(spec)
+        spec.new_turn()  # FINAL 提交:记时刻 + 预算重置
+        spec.on_stable_prefix("你好我想查下我個")
+        await asyncio.sleep(0)
+        assert spec._task is None and not prewarm.calls, "FINAL 后 1s 内不开火"
+        monkeypatch.setenv("BOK_PREFILL_SPEC_FINAL_QUIET_MS", "1")
+        await asyncio.sleep(0.02)  # 越过 1ms 窗
+        spec.on_stable_prefix("你好我想查下我個集運件")
+        assert spec._task is not None, "静默窗过后应照常开火"
+        await spec._task
+        return prewarm
+
+    prewarm = asyncio.run(run())
+    assert len(prewarm.calls) == 1
+
+
+def test_new_turn_aborts_inflight():
+    """FINAL 即断:在飞投机预热被 new_turn 取消——真回复要进 reply 车道,
+    在飞预热(httpx 连接)即刻关闭,残余解码尾巴最小化。"""
+
+    started = asyncio.Event()
+
+    class _SlowPrewarm:
+        async def __call__(self, messages: list[dict]) -> None:
+            started.set()
+            await asyncio.sleep(5)
+
+    async def run():
+        spec = PrefillSpeculator(_SlowPrewarm(), _FakeCtx())
+        _arm(spec)
+        spec.on_stable_prefix("你好我想查下我個")
+        await started.wait()
+        task = spec._task
+        assert task is not None
+        spec.new_turn()
+        assert task.cancelled() is False, "cancel 是异步的,此刻尚未终结"
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("在飞任务应被取消")
+        return spec
+
+    spec = asyncio.run(run())
+    assert spec._task is None, "finally 清槽,后续可再开火"

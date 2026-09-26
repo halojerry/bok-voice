@@ -1087,6 +1087,19 @@ def _judge_yield_env() -> tuple[float, float]:
     return floor_s, cap_s
 
 
+def _judge_capped_skip_enabled() -> bool:
+    """capped（让不完）时跳过本轮判定而非到点照开火（2026-09-25 车道卫生）。
+
+    背景：让路统计实测 capped 169 / idle 仅 6——等满 FLOW_JUDGE_IDLE_CAP 照样
+    开火意味着 judge 大概率撞进「回复生成中/客户长讲」窗，prefill 589-694 tok
+    直接推高当轮 TTFT（call-9e8f51a0：5 条 capped 与 TTFT 3790ms 同窗）。判定
+    本来是「下一轮才消费」的补位，capped=链路持续忙 → 本轮判定错过就错过，
+    规则路/下一轮 judge 兜底。BOK_JUDGE_CAPPED_SKIP=0 回旧行为（到点照开火，
+    判定永不负损）。
+    """
+    return os.environ.get("BOK_JUDGE_CAPPED_SKIP", "1") == "1"
+
+
 async def _wait_link_idle(link: dict, *, floor_s: float, cap_s: float) -> str:
     """judge 开火前的让路:floor(固定让一拍) + 「4B 不在 prefill 窗」错峰。返回 idle/capped/disabled。
 
@@ -4180,7 +4193,12 @@ async def entrypoint(ctx):
             # 让路节流:主回复刚提交,先等一拍、再等到链路真空闲才喺 :1235 跑 judge——
             # judge 与主回复抢 prefill 会推高本轮 TTFT(实测 9B 占 GPU 时 4B prefill
             # +1375ms,见 probe_gpu_contention);judge 判定本来就下一轮先生效,迟几秒冇损失。
-            await _judge_yield()
+            _yield_verdict = await _judge_yield()
+            if _yield_verdict == "capped" and _judge_capped_skip_enabled():
+                # 车道卫生(2026-09-25):让不完=链路持续忙,照开火只会把 judge 的
+                # prefill 撞进真回复的生成窗——跳过本轮,规则路/下一轮判定兜底。
+                print(f"[judge] skipped reason=capped (call {room_name})", flush=True)
+                return
             from .flow import (
                 build_judge_messages,
                 degrade_boost,
@@ -4318,7 +4336,14 @@ async def entrypoint(ctx):
         """
         try:
             # 让路节流同 flow judge:主回复刚提交,先等一拍、再等到链路真空闲才跑判定(同一闸)。
-            await _judge_yield()
+            # capped→skip 同款语义(2026-09-25 车道卫生,见 _judge_capped_skip_enabled)。
+            _yield_verdict = await _judge_yield()
+            if _yield_verdict == "capped" and _judge_capped_skip_enabled():
+                print(
+                    f"FLOW_GRAPH judge_skipped reason=capped (call {room_name})",
+                    flush=True,
+                )
+                return
             from .flow import build_intent_judge_messages, parse_intent_judge_output
 
             # 判定专线解析与 _background_flow_judge 逐字同源(FLOW_JUDGE_* → llm 卡

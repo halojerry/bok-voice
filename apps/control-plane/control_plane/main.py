@@ -2616,7 +2616,7 @@ async def _reap_stale_calls_once() -> dict:
                                 **_call_end_fields(c))
             out["ended"] += 1
             try:
-                await _settle_core(c["id"])  # 幂等:已结算直接 existing 短路
+                await _settle_core(c["id"], idle_cap_s=30.0)  # 幂等:已结算直接 existing 短路
                 out["settled"] += 1
             except Exception as exc:  # pragma: no cover - 兜底结算失败不阻回收
                 print(f"[cp] reaper settle skipped ({c['id']}): {exc!r}", flush=True)
@@ -2633,7 +2633,7 @@ async def _reap_stale_calls_once() -> dict:
         if _repo().get_settlement(c["id"]):
             continue
         try:
-            await _settle_core(c["id"])
+            await _settle_core(c["id"], idle_cap_s=30.0)
             patched += 1
             out["settled"] += 1
         except Exception as exc:  # pragma: no cover
@@ -4198,7 +4198,51 @@ async def settle(call_id: str, request: Request) -> dict:
 _SETTLE_LOCKS: dict[str, asyncio.Lock] = {}
 
 
-async def _settle_core(call_id: str) -> dict:
+def _live_call_count() -> int:
+    """「活」通话数（ringing+active+paused）：结算闲时门的判据。
+
+    ringing 也算——在振铃的通话随时会有 agent dispatch 进场（开场白 prewarm +
+    首轮生成），正是 settle 最不该撞的窗。
+    """
+    n = 0
+    for st in (CallStatus.RINGING.value, CallStatus.ACTIVE.value, CallStatus.PAUSED.value):
+        n += len(_repo().list_calls("", status=st))
+    return n
+
+
+def _settle_idle_env() -> tuple[float, float]:
+    """结算闲时门参数单点解析：(poll_s, cap_s)。cap=0=关（旧行为逐字节）。"""
+    try:
+        poll_s = float(os.environ.get("BOK_SETTLE_IDLE_POLL_S", "15") or 15)
+    except ValueError:  # pragma: no cover - 配错回默认
+        poll_s = 15.0
+    try:
+        cap_s = float(os.environ.get("BOK_SETTLE_IDLE_WAIT_S", "300") or 300)
+    except ValueError:  # pragma: no cover - 配错回默认
+        cap_s = 300.0
+    return max(poll_s, 0.05), max(cap_s, 0.0)
+
+
+async def _settle_idle_gate(active_fn, *, poll_s: float, cap_s: float) -> str:
+    """结算闲时门（2026-09-25 车道卫生）：有活通话就等，至多 cap_s。返回 now|capped。
+
+    Summarizer 是 3-9s bg 长生成，恰撞「下一通首轮」的回复窗——:1235 队列代理
+    只管排队，mlx 无抢占，in-flight 的 bg 解码 reply 车道抢不走（30e47f3 之后的
+    残余争用面）。门=等活通话清零再跑；cap 到点照跑（结算永不负损，幂等重试面
+    不变——agent 侧 HTTP 超时/断连不取消服务端协程，reaper/web 补结算会再进门）。
+    0 通话=立即过（尾通零成本）。
+    """
+    if active_fn() <= 0:
+        return "now"
+    t0 = time.monotonic()
+    while (time.monotonic() - t0) < cap_s:
+        await asyncio.sleep(poll_s)
+        if active_fn() <= 0:
+            return "now"
+    return "capped"
+
+
+async def _settle_core(call_id: str, *, idle_cap_s: float | None = None) -> dict:
     """结算内核（无鉴权层）：HTTP 端点与 reaper 后台循环共用。
 
     2026-09-18 修复：reaper 此前直调 settle(c["id"]) 缺 request 参数——TypeError
@@ -4210,6 +4254,9 @@ async def _settle_core(call_id: str) -> dict:
     第二路等到锁时第一路多半已落库，直接短路，Summarizer 每通至多跑一遍。
     锁外快路径保留旧幂等语义（串行补结算零锁开销）。web/agent 两侧调用
     行为不动（双发保留），单飞在服务端吸收，双保险留给未来调用方。
+
+    idle_cap_s（2026-09-25 闲时门）：None=按 env（默认 300s）；显式值覆盖——
+    reaper 循环传短档（30s），防忙时每通僵尸结算把收割循环节奏拖死。
     """
     existing = _repo().get_settlement(call_id)
     if existing:
@@ -4278,6 +4325,21 @@ async def _settle_core(call_id: str) -> dict:
                     _repo().session.commit()
             except Exception as exc:  # pragma: no cover
                 print(f"[settle] usage_record write skipped: {exc!r}", flush=True)
+            # 闲时门（2026-09-25 车道卫生）：Summarizer 是 3-9s bg 长生成，恰撞下一通
+            # 首轮回复窗（mlx 无抢占，reply 车道抢不走 in-flight bg）——有活通话先等，
+            # 至多 BOK_SETTLE_IDLE_WAIT_S（默认 300s），到点照跑保结算不饿死。已有
+            # 结算/0 通话时零成本；等待超 1s 才打点（尾通无噪声）。
+            _poll_s, _cap_s = _settle_idle_env()
+            if idle_cap_s is not None:
+                _cap_s = float(idle_cap_s)
+            if _cap_s > 0:
+                _gate_t0 = time.monotonic()
+                _gate_v = await _settle_idle_gate(_live_call_count, poll_s=_poll_s, cap_s=_cap_s)
+                if time.monotonic() - _gate_t0 > 1.0:
+                    print(
+                        f"[settle] idle-wait {time.monotonic() - _gate_t0:.0f}s gate={_gate_v} ({call_id})",
+                        flush=True,
+                    )
             # 总结/沉淀：用本机 LLM 生成总结正文 + 新话题 + 全局洞察（失败回退纯指标）。
             # 可观测（2026-09-07）：单次尝试,仍空→审计事件 settle.distill_empty,
             # 唔再静默吞掉（蒸馏覆盖率从此可查）。

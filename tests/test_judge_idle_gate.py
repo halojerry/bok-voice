@@ -19,7 +19,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps" / "agent"))
 
-from agent_runtime.agent import _judge_yield_env, _wait_link_idle  # noqa: E402
+from agent_runtime.agent import (  # noqa: E402
+    _judge_capped_skip_enabled,
+    _judge_yield_env,
+    _wait_link_idle,
+)
+
+_SRC = (
+    Path(__file__).resolve().parents[1] / "apps" / "agent" / "agent_runtime" / "agent.py"
+).read_text(encoding="utf-8")
 
 
 def test_speaking_window_now_counts_as_idle():
@@ -106,3 +114,23 @@ def test_yield_env_defaults_and_overrides(monkeypatch):
     monkeypatch.setenv("FLOW_JUDGE_IDLE_CAP", "abc")
     monkeypatch.setenv("FLOW_JUDGE_DELAY", "xyz")
     assert _judge_yield_env() == (3.0, 6.0)  # 坏值回默认
+
+
+# ---- capped→skip（2026-09-25 车道卫生） ---------------------------------------
+def test_capped_skip_env_default_on(monkeypatch):
+    """默认跳过（让不完就不撞）;BOK_JUDGE_CAPPED_SKIP=0 回「到点照开火」。"""
+    monkeypatch.delenv("BOK_JUDGE_CAPPED_SKIP", raising=False)
+    assert _judge_capped_skip_enabled() is True
+    monkeypatch.setenv("BOK_JUDGE_CAPPED_SKIP", "0")
+    assert _judge_capped_skip_enabled() is False
+
+
+def test_both_judges_gate_on_capped():
+    """接线 pin:flow judge 与 intent judge 两路都在 yield 后按 capped 门跳过。"""
+    assert _SRC.count("verdict = await _judge_yield()") >= 2, "两路 judge 都应捕获 verdict"
+    assert "_judge_capped_skip_enabled()" in _SRC
+    assert "[judge] skipped reason=capped" in _SRC
+    assert "FLOW_GRAPH judge_skipped reason=capped" in _SRC
+    # env 立法:新键必须进 _FORWARD_ENV(prod 封闭 env 面可达)。
+    bok_src = (Path(__file__).resolve().parents[1] / "tools" / "bok.py").read_text(encoding="utf-8")
+    assert '"BOK_JUDGE_CAPPED_SKIP",' in bok_src

@@ -1721,6 +1721,7 @@ _FORWARD_ENV = (
     "BOK_LLM_FALLBACK",
     "BOK_PREFILL_SPEC",
     "BOK_PREFILL_SPEC_DEBUG",
+    "BOK_PREFILL_SPEC_FINAL_QUIET_MS",
     "BOK_PREEMPTIVE_DEBUG",
     "LLM_PREFIX_PREWARM",
     "PREEMPTIVE_GENERATION",
@@ -1729,6 +1730,7 @@ _FORWARD_ENV = (
     "PREEMPTIVE_DISABLE_ON_MARKER",
     "FLOW_JUDGE_DELAY",
     "FLOW_JUDGE_IDLE_CAP",
+    "BOK_JUDGE_CAPPED_SKIP",
     "FLOW_JUDGE_LLM_API_KEY",
     # —— 模型路由统一 kill-switch（2026-09-25 阶段 0：packages/core/model_routes.py
     #    契约在读，="0" 忽略路由表字节同旧；进表=dev/prod 双面都可达） ——
