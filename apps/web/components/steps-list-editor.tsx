@@ -11,7 +11,7 @@ import {
   parseStepsFromTable, STEPS_EXAMPLES, LANGS,
   type FlowStep,
 } from "@/components/template-editor";
-import { VarTextarea } from "@/components/var-insert";
+import { StepRefForm } from "@/components/step-form";
 
 const textarea =
   "w-full resize-none rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)";
@@ -145,9 +145,9 @@ export default function StepsListEditor(props: {
               onChange={(e) => setStep(i, { goal: e.target.value })}
             />
             <div className="mt-1.5">
-              <VarTextarea
-                className={`h-24 ${textarea} text-xs`}
-                value={st.ref}
+              <StepRefForm
+                refText={st.ref}
+                stepCount={value.length}
                 disabled={readOnly}
                 onChange={(v) => setStep(i, { ref: v })}
               />
