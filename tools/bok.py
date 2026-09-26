@@ -1615,6 +1615,20 @@ _FORWARD_ENV = (
     # —— 模型路由统一 kill-switch（2026-09-25 阶段 0：packages/core/model_routes.py
     #    契约在读，="0" 忽略路由表字节同旧；进表=dev/prod 双面都可达） ——
     "BOK_MODEL_ROUTING",
+    # —— 云端 Realtime S2S 演示档（2026-09-25 阶段 B：realtime_demo.py +
+    #    providers/qwen_realtime.py 适配器读面。BOK_QWEN_REALTIME="1" 才随栈
+    #    拉起 bok-realtime worker（:8084，opt-in 不动默认栈）；="0" worker 拒接
+    #    一切 job 且适配器构造即 raise；QWEN_REALTIME_KEY=云端凭据（worker 端
+    #    读好后**构造参数**传入，适配器自身零 key env 读取）；BOK_REALTIME_DEMO_
+    #    MAX_S=会话时长熔断秒数（缺省 300）；QWEN_REALTIME_BASE_URL=WS 端点
+    #    覆盖（缺省=适配器模块常量 QWEN_REALTIME_WS_BASE） ——
+    "BOK_QWEN_REALTIME",
+    "BOK_REALTIME_DEMO_MAX_S",
+    "QWEN_REALTIME_KEY",
+    # WS 端点覆盖：适配器现读 QWEN_REALTIME_WS_BASE（缺省=同名模块常量）；
+    # QWEN_REALTIME_BASE_URL 是该槽的历史/别名登记，防适配器改名时门禁闪红。
+    "QWEN_REALTIME_WS_BASE",
+    "QWEN_REALTIME_BASE_URL",
     "FLOW_LLM_ADVANCE",
     "BOK_PERCEIVED_BUDGET_MS",
     "BOK_MAX_CALL_DURATION_S",
@@ -1832,8 +1846,19 @@ def _apply_interp_direction_env(env: dict, direction: str) -> dict:
     return env
 
 
+def _realtime_demo_enabled() -> bool:
+    """演示档 worker 随栈开关（opt-in）：BOK_QWEN_REALTIME="1" 才拉起 :8084。
+
+    默认关——演示档整通走云端 S2S（按分钟真金计费），不是每套栈都该常驻一个
+    空转 worker；要试演示在启动环境设 BOK_QWEN_REALTIME=1（凭据 QWEN_REALTIME_KEY
+    经 _FORWARD_ENV 透传）。worker 手工直起不受此门（realtime_demo.py 自身只在
+    ="0" 时拒接 job）。"""
+    return os.environ.get("BOK_QWEN_REALTIME", "") == "1"
+
+
 def _worker_specs(py) -> list[dict]:
-    """三个 agent worker(A 线 main + B 线 fwd/rev)的 spawn 描述(serve/monitor 同源)。"""
+    """agent worker spawn 描述(serve/monitor 同源)：A 线 main + B 线 fwd/rev
+    + 演示档 realtime-demo（BOK_QWEN_REALTIME=1 才在列）。"""
     agent_env = _agent_worker_env(py)
     run_dir = app_data_dir() / "run"
     log_dir = app_data_dir() / "logs"
@@ -1860,6 +1885,21 @@ def _worker_specs(py) -> list[dict]:
                 "logfile": log_dir / f"interp-{_dir}.log",
                 "argv": [str(py), "-m", "agent_runtime.interpret"],
                 "env": interp_env,
+            }
+        )
+    if _realtime_demo_enabled():
+        # 演示档 worker（云端 Realtime S2S）：env 基于 _agent_worker_env 全集
+        # （BOK_CP_TOKEN/QWEN_REALTIME_KEY 等 _FORWARD_ENV 键经 passthrough 在内）。
+        rt_env = dict(agent_env)
+        rt_env["BOK_SERVICE"] = "realtime-demo"
+        specs.append(
+            {
+                "name": "realtime-demo",
+                "port": 8084,
+                "pidfile": run_dir / "realtime-demo.pid",
+                "logfile": log_dir / "realtime-demo.log",
+                "argv": [str(py), "-m", "agent_runtime.realtime_demo"],
+                "env": rt_env,
             }
         )
     return specs
@@ -2177,6 +2217,9 @@ def cmd_serve() -> int:
 
     print("[bok] waiting for desktop stack…")
     targets = [8000, 8787, 8788, 8790, 1235, 7880, 8081, 8082, 8083]
+    if _realtime_demo_enabled():
+        # 演示档 worker 随栈拉起时纳入就绪等待（opt-in，:8084）。
+        targets.append(8084)
     if healthy(1236):
         # MT 翻译小模型(:1236)可选:cmd_up 拉起了才纳入等待,缺模型不算失败。
         targets.append(1236)
@@ -2393,6 +2436,9 @@ _ORPHAN_PORT_OWNERS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (8081, ("agent_runtime", "multiprocessing")),
     (8082, ("agent_runtime", "multiprocessing")),
     (8083, ("agent_runtime", "multiprocessing")),
+    # 演示档 worker（opt-in）：同族身份标记——只清「占着 8084 且是 bok 家进程」
+    # 的殭尸，身份不符照旧不动手。
+    (8084, ("agent_runtime", "multiprocessing")),
 )
 
 
@@ -2935,13 +2981,26 @@ def _prod_units() -> list[tuple[str, list[str], dict[str, str], str]]:
     livekit_bin = str(_embedded_livekit() or "livekit-server")
     py = repo_python()
     # unit 定义:name → (args, 附加 env)。agent/interp 共用 agent_env。
-    return [
+    units = [
         ("bok-control-plane", [str(py), "-m", "uvicorn", "control_plane.main:app", "--host", _cp_bind_host(), "--port", "8000"], _control_plane_env((app_data_dir() / "bok_voice.db").as_posix()), "Bok 控制面 API"),
         ("bok-livekit", [livekit_bin, "--config", str(_livekit_config_path())], {}, "实时语音信令/媒体"),
         ("bok-agent", [str(py), "-m", "agent_runtime.main"], agent_env, "A 线客服 agent worker"),
         ("bok-interp-fwd", [str(py), "-m", "agent_runtime.interpret"], {**_interp_env(agent_env), "BOK_SERVICE": "interp-fwd", "INTERP_DIRECTION": "fwd"}, "B 线同传 fwd"),
         ("bok-interp-rev", [str(py), "-m", "agent_runtime.interpret"], {**_interp_env(agent_env), "BOK_SERVICE": "interp-rev", "INTERP_DIRECTION": "rev"}, "B 线同传 rev"),
     ]
+    if _realtime_demo_enabled():
+        # 演示档常驻单元（opt-in，同 _worker_specs 门）：BOK_QWEN_REALTIME=1 才
+        # 生成 launchd/schtasks/systemd 单元——健康面 WORKER_PORTS 不收 :8084
+        # （默认栈不跑演示档，常列会令 prod status 对未启用部署恒 DEGRADED）。
+        units.append(
+            (
+                "bok-realtime",
+                [str(py), "-m", "agent_runtime.realtime_demo"],
+                {**agent_env, "BOK_SERVICE": "realtime-demo"},
+                "云端 Realtime S2S 演示档",
+            )
+        )
+    return units
 
 
 def _systemd_staging_dir(explicit: str = "") -> Path:

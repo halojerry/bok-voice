@@ -24,6 +24,7 @@ import { AgentSessionProvider } from "@/components/agents-ui/agent-session-provi
 import { StartAudioButton } from "@/components/agents-ui/start-audio-button";
 import { useMoodColor } from "@/hooks/use-mood-color";
 import { useAccount } from "@/components/account-context";
+import { useSession as useAppSession } from "@/components/session-context";
 
 // 模块级 trace（环形缓存+TTL 有界，见 lib/logger.ts 头注释）：数据加载/设备应用失败不再静默。
 const log = startTrace({ operation: "web.call-studio" });
@@ -546,6 +547,10 @@ function CallStudioInner({
   onReDialWithObject: (objectId: string) => void;
 }) {
   const { accountId: ACCOUNT } = useAccount();
+  // 演示档（云端 Realtime）选项 root 专属（settings 页 model-routing 卡同姿势；
+  // 匿名本地会话 role=user 同样不渲染——CP 侧红线闸兜底，UI 只是第一道门）。
+  const appSession = useAppSession();
+  const isRoot = appSession?.role === "root";
   // 记住本账号上一次使用的人设/对象：新建通话默认恢复它(而非恒取列表第一个),
   // 挂断后切新人设/对象 → 接通即用新选择,唔会悄悄回到上个对话的档案。
   const lastKey = (kind: "persona" | "object") => `bok.call.${kind}.${ACCOUNT}`;
@@ -581,7 +586,9 @@ function CallStudioInner({
   personaIdRef.current = personaId;
   const [object, setObject] = useState<Record<string, unknown> | null>(null);
   const [persona, setPersona] = useState<Record<string, unknown> | null>(null);
-  const [mode, setMode] = useState<"simulation" | "live">("simulation");
+  // 通话模式（realtime_demo=云端 Realtime 演示档，root 专属——出境计费红线，
+  // 下拉选项仅 root 渲染；历史通话里的该值仍要能正确回显）。
+  const [mode, setMode] = useState<"simulation" | "live" | "realtime_demo">("simulation");
   const [objectTopics, setObjectTopics] = useState<Record<string, unknown>[]>([]);
   const [settings, setSettings] = useState<Record<string, unknown> | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -789,7 +796,7 @@ function CallStudioInner({
         if (c.persona_id && String(c.persona_id) !== personaIdRef.current) suppressPersist.current += 1;
         if (c.object_id) setObjId(String(c.object_id));
         if (c.persona_id) setPersonaId(String(c.persona_id));
-        if (c.mode) setMode(c.mode as "simulation" | "live");
+        if (c.mode) setMode(c.mode as "simulation" | "live" | "realtime_demo");
         // ended 通话:点亮「用该对象发起新通话」并禁用接通按钮——别让用户点
         // 一次必然失败的「接通/进房」才看到提示(交互自洽,2026-09-14)。
         if (String(c.status ?? "") === "ended") setEndedBlock(true);
@@ -981,10 +988,11 @@ function CallStudioInner({
             <select
               className="select px-2 py-1 text-xs"
               value={mode}
-              onChange={(e) => setMode(e.target.value as "simulation" | "live")}
+              onChange={(e) => setMode(e.target.value as "simulation" | "live" | "realtime_demo")}
             >
               <option value="simulation">训练模式</option>
               <option value="live">真实业务</option>
+              {isRoot && <option value="realtime_demo">演示档（云端 Realtime）</option>}
             </select>
           )}
         </div>

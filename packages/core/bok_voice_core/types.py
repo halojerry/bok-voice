@@ -13,6 +13,10 @@ def utcnow() -> str:
 class CallMode(str, Enum):
     SIMULATION = "simulation"
     LIVE = "live"
+    # 云端 Realtime S2S 演示档（2026-09-25 阶段 B）：整通话走 Qwen Realtime
+    # 端到端语音模型（bok-realtime worker），不接话术漏斗/QA/心跳；出境计费
+    # 红线=仅 root（或机器通道）可建，对象恒测试前缀族假数据。
+    REALTIME_DEMO = "realtime_demo"
 
 
 class CallStatus(str, Enum):

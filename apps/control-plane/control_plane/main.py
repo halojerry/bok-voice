@@ -2049,7 +2049,52 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
                 ]
             )
         )
-    elif not is_listen and kind != "interpret" and role in ("operator", "supervisor") and not _recordless:
+    elif (
+        not is_listen
+        and kind != "interpret"
+        and str(_call.get("mode") or "") == CallMode.REALTIME_DEMO.value
+        and role in ("operator", "supervisor")
+        and not _recordless
+    ):
+        # 演示档 dispatch（云端 Realtime S2S，2026-09-25 阶段 B）：派到 bok-realtime
+        # 专用 worker（realtime_demo.py 以同名 agent_name 注册）。不设 _watchdog_room
+        # ——看门狗/崩溃重派路径硬编码 agent_name="bok-voice"，补位会把 A 线话术
+        # worker 派进演示房（跨线串台）；演示房短命，缺位不补（与 interpret 同契约，
+        # webhook 侧另有 realtime_demo 拦截）。
+        from livekit.api import RoomAgentDispatch, RoomConfiguration
+
+        try:
+            _demo_obj = _repo().get_object(str(_call.get("object_id") or "")) or {}
+        except Exception:
+            _demo_obj = {}
+        at = at.with_room_config(
+            RoomConfiguration(
+                agents=[
+                    RoomAgentDispatch(
+                        agent_name="bok-realtime",
+                        metadata=json.dumps({
+                            # ---- realtime_demo 派单元数据契约（字段名定死，消费方
+                            # agent_runtime/realtime_demo.py；model/voice/instructions
+                            # 空串=worker 用内建缺省，后续放开覆盖位无需改契约）----
+                            "call_id": room,
+                            "object_id": str(_call.get("object_id") or ""),
+                            "object_name": str((_demo_obj or {}).get("display_name") or ""),
+                            "account_id": str(_call.get("account_id") or ""),
+                            "model": "",
+                            "voice": "",
+                            "instructions": "",
+                        }),
+                    ),
+                ]
+            )
+        )
+    elif (
+        not is_listen
+        and kind != "interpret"
+        and str(_call.get("mode") or "") != CallMode.REALTIME_DEMO.value
+        and role in ("operator", "supervisor")
+        and not _recordless
+    ):
         # 旁听 token 不加 RoomConfiguration：主管通常后于坐席进房（无副作用），
         # 但若先到，挂 dispatch 会替房间建房并拉起 agent——旁听必须零副作用。
         # P1-C：无记录房间同样零副作用（不建房不拉 agent，只发 subscribe-only
@@ -2112,6 +2157,20 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
 def create_call(req: CreateCallRequest, request: Request) -> dict:
     # B4 页面权限：同传建单（kind=interpret）归 interpret 键，其余客服通话归 calls。
     _gate_page(request, "interpret" if (req.kind or "").strip() == "interpret" else "calls")
+    # 出境红线闸（云端 Realtime 演示档，2026-09-25 阶段 B）：mode=realtime_demo
+    # 整通走云端 S2S（真金白银按分钟计费），仅 root 或机器通道可建——姿势同
+    # /api/model-routing 端点族（require_role("root")：机器通道恒直通、auth-off
+    # 开发形态直通、admin/user 403）。403 文案换人话，root 之外一眼知道为什么。
+    if req.mode == CallMode.REALTIME_DEMO:
+        try:
+            require_role(request, "root")
+        except HTTPException as exc:
+            if exc.status_code == 403:
+                raise HTTPException(
+                    status_code=403,
+                    detail="演示档（云端 Realtime）产生出境云端费用，仅 root 可建",
+                )
+            raise
     # 熔断产品路径（site-delivery M1）：显式绑定承载节点的建单先验节点——
     # 未知 404（既有 404 约定）、revoked 403（root 熔断即刻断供，含坐席 JWT 通道）。
     _req_node = (req.node_id or "").strip()
@@ -6150,6 +6209,11 @@ async def livekit_webhook(request: Request) -> dict:
         _wcall = {}
     if str(_wcall.get("kind") or "") == "interpret":
         return {"handled": False, "reason": "interpret room"}
+    # 演示档房（mode=realtime_demo）同款不补位：本路径只会派 bok-voice，补进
+    # 演示房=云端 Realtime 通话被 A 线话术 worker 抢接（跨线串台）；演示房短命
+    # 且 root 专属，缺位不自动补（agent-<jobid> 离房也涵盖 demo job 自身崩溃）。
+    if str(_wcall.get("mode") or "") == CallMode.REALTIME_DEMO.value:
+        return {"handled": False, "reason": "realtime demo room"}
 
     async def _redispatch() -> None:
         # 防复活(F1):挂断链是 update_call(ENDED) → delete_room 踢出 agent →
