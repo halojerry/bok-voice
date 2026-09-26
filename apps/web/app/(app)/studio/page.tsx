@@ -484,6 +484,13 @@ export default function StudioPage() {
     };
   }, [tab, selId, accountId, branchRev]);
 
+  // 场景画布当前步（页面层持有,2026-09-26 实弹:组件内部态在画布↔表单视图切换
+  // 重挂时丢失,选步被弹回第 1 步、连线落错步——受控上提后视图往返保持选步）。
+  const [canvasStep, setCanvasStep] = useState(1);
+  useEffect(() => {
+    setCanvasStep(1); // 换模板回第 1 步
+  }, [selId]);
+
   // ---- 快答标签（场景画布 play_qa 徽章文案，2026-09-26）：qa_id → question_text。
   // 进主流程画布视图 / 换模板 / 换账号拉一次;失败=徽章降级「词条缺失」，不阻塞画布。 ----
   const [qaLabels, setQaLabels] = useState<Record<string, string>>({});
@@ -758,14 +765,16 @@ export default function StudioPage() {
                 )}
                 {branchNote && <span className="ml-auto text-xs text-amber-700">{branchNote}</span>}
               </div>
-              {/* 重派生保险（2026-09-25「列表与画布对不上」排查收尾）：两视图本就同吃页面层
-                  stepsDraft、切换视图=条件渲染卸载重挂,天然拿到最新草稿;key 再钉到 模板+步数
-                  ——保存后步数变化（空白步被剔除/列表加删步后应用重锚）时画布整树重建,抽屉
-                  步号不再按旧下标错位。步数不变的同模板保存不换 key,F7（答法抽屉保存后保持
-                  打开）不受影响。刻意不用内容哈希——逐字编辑会频繁换 key 反复重挂。 */}
+              {/* 重派生保险（2026-09-25「列表与画布对不上」排查收尾,2026-09-26 场景画布再修）：
+                  两视图同吃页面层 stepsDraft、切换视图=条件渲染卸载重挂,天然拿最新草稿。
+                  key 只钉模板 id——长度保险是旧大画布的遗留（按下标寻址的拖动覆盖会错位）,
+                  StepCanvasView 无拖动覆盖、currentStep 自带越界钳制,长度入 key 反而把
+                  「加一步自动跳新步」冲掉（key 变=整树重挂=内部状态归零,实弹抓出）。 */}
               {flowView === "canvas" ? (
                 <StepCanvasView
-                  key={`${selId}:${stepsDraft.length}`}
+                  key={selId}
+                  currentStep={canvasStep}
+                  onCurrentStepChange={setCanvasStep}
                   tpl={tplRow}
                   graph={graph}
                   draft={stepsDraft}

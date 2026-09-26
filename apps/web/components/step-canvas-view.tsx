@@ -16,7 +16,7 @@
 //   - owner 只读判定 / useSized 守门 / nodeTypes 模块级——姿势逐条照抄旧画布。
 // 本组件零网络请求：qaLabels / branchCanned / 全部回调由上层喂。
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Background,
   Controls,
@@ -373,6 +373,11 @@ export default function StepCanvasView(props: {
   onPregenBranch?: (resp: string) => void;
   /** 「去意图管理」深链（全程意图横条尾部按钮）。 */
   onOpenIntents?: () => void;
+  /** 当前步受控（1-based,可选）：宿主页面层持有——画布↔表单视图来回切换时
+   * 组件卸载重挂,内部状态会丢（2026-09-26 实弹:切回画布被弹回第 1 步,
+   * 连线落错步）。传了以此为准;不传退内部状态（独立使用零依赖）。 */
+  currentStep?: number;
+  onCurrentStepChange?: (n: number) => void;
   /** 意图拖线→步 chip：该意图绑定设为跳到第 N 步,立即落库 graph_json（页面层回调）。 */
   onBindJump?: (intentId: string, stepNo: number) => Promise<void> | void;
   /** 点意图跳步连线：解除该意图绑定（页面层回调）。未传=连线不可点。 */
@@ -395,8 +400,17 @@ export default function StepCanvasView(props: {
   const canUnbindGraph = !readOnly && typeof props.onUnbindJump === "function";
 
   const stepCount = draft.length;
-  // 当前步（1-based）：默认第 1 步;表单视图删步/导入替换后钳回 1..len,超界回落最后一步。
-  const [currentStep, setCurrentStep] = useState(1);
+  // 当前步（1-based）：宿主受控优先（视图切换不丢选步）,否则内部态。
+  const [internalStep, setInternalStep] = useState(1);
+  const currentStep = props.currentStep ?? internalStep;
+  const setCurrentStep = useCallback(
+    (n: number | ((prev: number) => number)) => {
+      const next = typeof n === "function" ? (n as (p: number) => number)(currentStep) : n;
+      if (props.onCurrentStepChange) props.onCurrentStepChange(next);
+      else setInternalStep(next);
+    },
+    [currentStep, props.onCurrentStepChange],
+  );
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [globalOpen, setGlobalOpen] = useState(false);
   // 容器尺寸就绪守门（error#004/#015,旧画布同款）：挂载竞态期 0 尺寸不挂 ReactFlow。
@@ -408,11 +422,21 @@ export default function StepCanvasView(props: {
   }, [stepCount]);
 
   // 换模板：抽屉/全程意图展开收起、当前步回 1（id 不变的应用保存不打扰在途状态）。
+  // 跳过首挂载——受控模式下首挂载归一会把宿主保住的选步打回 1（视图切换重挂
+  // 即触发本 effect,2026-09-26 实弹:往返切视图选步丢失的第二处 reset 源）。
+  const mountTplId = useRef<string | null>(null);
   useEffect(() => {
-    setDrawerOpen(false);
-    setGlobalOpen(false);
-    setCurrentStep(1);
-  }, [tplId]);
+    if (mountTplId.current === null) {
+      mountTplId.current = tplId;
+      return;
+    }
+    if (mountTplId.current !== tplId) {
+      mountTplId.current = tplId;
+      setDrawerOpen(false);
+      setGlobalOpen(false);
+      setCurrentStep(1);
+    }
+  }, [tplId, setCurrentStep]);
 
   // —— 宇宙派生（lib/step-canvas 纯函数;本组件不含任何布局/解析逻辑） ——
   const u = useMemo(
@@ -642,7 +666,17 @@ export default function StepCanvasView(props: {
             current={currentStep}
             onSelect={setCurrentStep}
             readOnly={readOnly}
-            onAddStep={readOnly ? undefined : () => props.onDraftChange([...draft, { goal: "", ref: "" }])}
+            onAddStep={
+              readOnly
+                ? undefined
+                : () => {
+                    // 加完即跳到新步并开抽屉（2026-09-26 Ethan 实测反馈「点了没反应」）
+                    // ——append 后画布还停在旧步,运营看不出任何变化。
+                    props.onDraftChange([...draft, { goal: "", ref: "" }]);
+                    setCurrentStep(draft.length + 1);
+                    setDrawerOpen(true);
+                  }
+            }
           />
         </div>
         <div className="flex min-w-0 flex-1 flex-col gap-2">

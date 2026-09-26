@@ -145,3 +145,70 @@ def test_invalid_steps_json_shape_still_saves(monkeypatch):
         "/api/templates", json={"name": "t", "steps_json": "{not json"}
     )
     assert ok.status_code == 200
+
+
+# ---- 存量豁免（2026-09-26 理赔模板实弹）-------------------------------------
+# 校验器 docstring 原意「只防新增」,但整稿 PUT 全量校验把规则上线前保存的模板
+# 整本锁死(任何编辑应用都 400)。PUT 按 legacy_raw=旧稿 steps_json 行级豁免:
+# 存量行原样放行;新写/改动一行(哪怕一个字)照拦;create 无旧稿全量校验不变。
+
+
+def test_put_legacy_coach_line_unchanged_grandfathered(monkeypatch):
+    client, repo = _client_and_repo(monkeypatch)
+    tpl = client.post(
+        "/api/templates", json={"name": "t", "steps_json": _CLEAN_STEPS}
+    ).json()
+    # 直写 repo 模拟「规则上线前的存量违例」(create 通道今天起就拒 coach 行,
+    # 存量只能来自历史数据)
+    repo.update_template(tpl["id"], {"steps_json": _COACH_STEPS})
+    # 整稿原样重存(加个无关字段)→ 存量行豁免,200
+    ok = client.put(
+        f"/api/templates/{tpl['id']}",
+        json={"steps_json": _COACH_STEPS, "tone_override": "专业"},
+    )
+    assert ok.status_code == 200, ok.text
+    assert repo.get_template(tpl["id"])["steps_json"] == _COACH_STEPS
+
+
+def test_put_new_coach_line_still_rejected_alongside_legacy(monkeypatch):
+    client, repo = _client_and_repo(monkeypatch)
+    tpl = client.post(
+        "/api/templates", json={"name": "t", "steps_json": _CLEAN_STEPS}
+    ).json()
+    repo.update_template(tpl["id"], {"steps_json": _COACH_STEPS})
+    # 旧稿 + 一条新增 coach 行 → 新行照拦(豁免只保存量,不放宽新增)
+    combined = json.dumps(
+        json.loads(_COACH_STEPS) + json.loads(_COACH_WITH_ACTION),
+        ensure_ascii=False,
+    )
+    bad = client.put(
+        f"/api/templates/{tpl['id']}",
+        json={"steps_json": combined},
+    )
+    assert bad.status_code == 400
+    body = bad.json()["detail"]
+    assert body["error"] == "invalid_branch_text"
+    # 只报新行,不报豁免掉的存量行
+    assert any("收线" in str(d) for d in body["detail"])
+    assert not any("骗局" in str(d) for d in body["detail"])
+    # 拒绝零副作用
+    assert repo.get_template(tpl["id"])["steps_json"] == _COACH_STEPS
+
+
+def test_put_legacy_coach_line_edited_forces_cleanup(monkeypatch):
+    client, repo = _client_and_repo(monkeypatch)
+    tpl = client.post(
+        "/api/templates", json={"name": "t", "steps_json": _CLEAN_STEPS}
+    ).json()
+    repo.update_template(tpl["id"], {"steps_json": _COACH_STEPS})
+    # 存量违例行被编辑(哪怕只改一处措辞)→ 不再豁免,强制运营清理后才存得进
+    edited = json.loads(_COACH_STEPS)
+    edited[0]["ref"] = edited[0]["ref"].replace(
+        "说要核对订单才能确认到", "说要核对订单后才能确认到"
+    )
+    bad = client.put(
+        f"/api/templates/{tpl['id']}",
+        json={"steps_json": json.dumps(edited, ensure_ascii=False)},
+    )
+    assert bad.status_code == 400
+    assert bad.json()["detail"]["error"] == "invalid_branch_text"

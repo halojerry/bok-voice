@@ -26,8 +26,9 @@ export function registryBase(): string {
 
 async function toError(res: Response): Promise<Error> {
   // 优先透传 FastAPI 的 detail（如 MiniMax API Key 未配置），失败时退回 statusText。
-  // detail 也可能是列表（CP graph 校验 400 的形状 {"error":"invalid_graph_json","detail":[...]}），
-  // 拼成可读串——否则运营只看到裸 "400 Bad Request"，校验原文（如 id malformed）被吞。
+  // detail 三形态：string / 数组（CP graph 校验 400 {"error":…,"detail":[…]}）/
+  // 嵌套对象（steps 分支校验 400 {"detail":{"error":"invalid_branch_text","detail":[…]}}）
+  // ——2026-09-26 实弹：嵌套形只露「400 Bad Request」，运营看不到哪行错。
   let detail = "";
   try {
     const body = await res.json();
@@ -36,6 +37,13 @@ async function toError(res: Response): Promise<Error> {
       const parts = body.detail.map((x) => (typeof x === "string" ? x : JSON.stringify(x)));
       const tag = typeof body.error === "string" && body.error ? `${body.error}: ` : "";
       detail = tag + parts.join("；");
+    } else if (body?.detail && typeof body.detail === "object") {
+      const inner = body.detail as { error?: unknown; detail?: unknown };
+      const parts = Array.isArray(inner.detail)
+        ? inner.detail.map((x) => (typeof x === "string" ? x : JSON.stringify(x)))
+        : [];
+      const tag = typeof inner.error === "string" && inner.error ? `${inner.error}: ` : "";
+      if (tag || parts.length) detail = (tag + parts.join("；")).slice(0, 500);
     }
   } catch {
     /* 非 JSON 响应(如网关错误页)直接忽略 */

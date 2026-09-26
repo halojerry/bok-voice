@@ -4968,15 +4968,21 @@ def _validate_graph_field(raw: str) -> list[str]:
     return validate_flow_graph(str(raw))
 
 
-def _validate_steps_branch_text(raw: str) -> list[str]:
+def _validate_steps_branch_text(raw: str, *, legacy_raw: str = "") -> list[str]:
     """模板 steps_json 分支行内部指令校验(M-22③,2026-09-23 修复波#4):
     「教练文案进罐头」挡在写入口(task-4 M1 实弹:生产模板教练文案被罐头车道
     逐字念给客户)。逐步 ref 逐分支行——动作前缀【…】先消费(镜像 flow.py
     parse_branch_action,镜像件在 canned_guard.strip_branch_action_prefix)、
     余文过 canned_guard.is_internal_instruction。命中返回人话错误列表(→400
     invalid_branch_text,与 invalid_graph_json 同门);非 json/无分支=零命中
-    放行(形状宽容面属运行时 parse_steps,这里不扩权)。存量违例行由运营
-    清理(清单在 fix-wave-4 报告),本校验只防新增。"""
+    放行(形状宽容面属运行时 parse_steps,这里不扩权)。
+
+    存量豁免(2026-09-26 理赔模板实弹):本校验只防新增(docstring 原意),但
+    整稿 PUT 会把存量违例行一并算进错误 → 规则上线前保存过的模板被整本锁死
+    (任何编辑应用都 400,运营无解)。legacy_raw=旧稿 steps_json 时按行级豁免
+    ——分支行(剥空白)原文在旧稿出现过的视为存量放行;新写/改动过一行(哪怕
+    一个字)照拦,运营编辑到哪行就清理哪行,与「存量由运营清理」的原意对齐。
+    create(无旧稿)不豁免,全量校验同旧。"""
     text = str(raw or "").strip()
     if not text:
         return []
@@ -4986,6 +4992,21 @@ def _validate_steps_branch_text(raw: str) -> list[str]:
         return []
     if not isinstance(data, list):
         return []
+    legacy_lines: set[str] = set()
+    legacy_text = str(legacy_raw or "").strip()
+    if legacy_text:
+        try:
+            legacy_data = json.loads(legacy_text)
+        except (ValueError, RecursionError):
+            legacy_data = None
+        if isinstance(legacy_data, list):
+            for legacy_step in legacy_data:
+                if not isinstance(legacy_step, dict):
+                    continue
+                for legacy_line in str(legacy_step.get("ref") or "").splitlines():
+                    line_key = legacy_line.strip()
+                    if line_key:
+                        legacy_lines.add(line_key)
     errors: list[str] = []
     for sidx, step in enumerate(data):
         if not isinstance(step, dict):
@@ -4995,6 +5016,8 @@ def _validate_steps_branch_text(raw: str) -> list[str]:
             line = raw_line.strip()
             if not line:
                 continue
+            if line in legacy_lines:
+                continue  # 存量行豁免:只防新增,老行编辑时才强制清理
             m = _BRANCH_LINE_COND_RE.match(line)
             if not m:
                 continue
@@ -5150,8 +5173,12 @@ def update_template(template_id: str, req: UpdateTemplateRequest, request: Reque
             raise HTTPException(400, {"error": "invalid_graph_json", "detail": _graph_errors[:5]})
     # M-22③:steps_json 分支行内部指令校验(显式携带才校验,同 exclude_unset 语义);
     # 必须排在 revision 快照之前(同 graph 校验:「拒绝对数据无副作用」)。
+    # 存量豁免:旧稿行原文在新稿仍原样出现的放行——只防新增/改动(2026-09-26 实弹)。
     if "steps_json" in payload:
-        _branch_errors = _validate_steps_branch_text(str(payload.get("steps_json") or ""))
+        _branch_errors = _validate_steps_branch_text(
+            str(payload.get("steps_json") or ""),
+            legacy_raw=str(before.get("steps_json") or ""),
+        )
         if _branch_errors:
             raise HTTPException(400, {"error": "invalid_branch_text", "detail": _branch_errors[:5]})
     # 话术版本化（2026-09-07 专项 B3）:update 即快照旧版——「哪版话术转化更好」
