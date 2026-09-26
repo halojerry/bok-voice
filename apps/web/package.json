@@ -10,6 +10,7 @@
     "test": "node --test \"test/*.test.mjs\""
   },
   "dependencies": {
+    "@dagrejs/dagre": "^3.1.1",
     "@livekit/components-react": "^2.9.24",
     "@shadcn/react": "^0.3.1",
     "@xyflow/react": "^12.11.6",

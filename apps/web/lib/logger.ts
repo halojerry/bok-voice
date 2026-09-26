@@ -27,7 +27,9 @@
  * logger.error，否则上报器故障会再次触发上报形成递归。
  */
 
-export type LogLevel = "info" | "warn" | "error";
+/** debug=已知无害噪音档（如 ReactFlow 画布的 ResizeObserver loop）：
+ * 只进本地输出与 trace 环形缓存，不触发上报、不走 console.error。 */
+export type LogLevel = "debug" | "info" | "warn" | "error";
 
 export type LogContext = Record<string, unknown>;
 
@@ -77,6 +79,15 @@ const MAX_REDACT_ARRAY = 100;
 const MAX_ERROR_CAUSE_DEPTH = 3;
 const REDACTED = "[REDACTED]";
 const GLOBAL_TRACE_ID = "trc-global-fallback";
+
+/**
+ * ReactFlow 画布的知名无害噪音（「ResizeObserver loop completed with undelivered
+ * notifications」/ 旧 Chrome「ResizeObserver loop limit exceeded」）：浏览器一帧内布局
+ * 反馈循环未送达通知，规范允许、零业务影响（ReactFlow 官方 FAQ 认定可忽略）。命中即降为
+ * debug——不 console.error、不触发 error 上报，仍进 trace 环形缓存可回查。
+ */
+const RESIZE_OBSERVER_NOISE_RE = /resizeobserver loop/i;
+const RESIZE_OBSERVER_NOISE_TAG = "noise:resize-observer";
 
 /** 命中即整值掩码的敏感键（大小写不敏感，子串匹配）。 */
 const SENSITIVE_KEY_RE =
@@ -172,6 +183,7 @@ export interface ConfigureLoggerOptions {
 function defaultWrite(level: LogLevel, line: string): void {
   if (level === "error") console.error(line);
   else if (level === "warn") console.warn(line);
+  else if (level === "debug") console.debug(line);
   else console.log(line);
 }
 
@@ -410,6 +422,12 @@ export class TraceLogger {
   constructor(traceId: string, base: LogContext) {
     this.traceId = traceId;
     this.base = base;
+  }
+
+  /** 已知无害噪音档：本地输出 + trace 环形缓存可见，但绝不触发上报（log() 只对
+   * error 调 scheduleReport）、不序列化 error 对象。 */
+  debug(message: string, context?: LogContext): void {
+    this.log("debug", message, undefined, context);
   }
 
   info(message: string, context?: LogContext): void {
@@ -706,6 +724,19 @@ export function installGlobalHandlers(
   if (g.window && typeof g.window.addEventListener === "function") {
     const win = g.window;
     installed.onWindowError = (event: ErrorEvent): void => {
+      const msg = String(event.message ?? "");
+      // 已知无害噪音先过滤（ResizeObserver 不带 error 对象，只能按 message 命中）：
+      // 降为 debug 进环形缓存，其余错误路径零变化。
+      if (RESIZE_OBSERVER_NOISE_RE.test(msg)) {
+        globalFallbackLogger().debug("window.onerror (known noise, downgraded)", {
+          tag: RESIZE_OBSERVER_NOISE_TAG,
+          message: msg,
+          filename: event.filename,
+          lineno: event.lineno,
+          colno: event.colno,
+        });
+        return;
+      }
       const err =
         event.error instanceof Error
           ? event.error

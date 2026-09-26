@@ -10,6 +10,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "@/lib/api";
 import { ErrorState } from "@/components/app-shell";
+import { downloadCsv, parseBoolCell, splitListCell } from "@/lib/csv";
+import TableImport, {
+  buildExampleCsvRows, rowOk, rowSkip, type ImportResult, type ParsedRow,
+} from "@/components/table-import";
 import {
   bindingFromDraft, intentJudgeField, parseGraphDoc, parseTemplateSteps,
   JUDGE_PROMPT_MAX_CHARS, type GraphBinding, type GraphIntent,
@@ -19,6 +23,53 @@ import type { TemplateRow } from "@/components/template-editor";
 
 /** 关键词展示/落库上限（引擎无硬限；PRD 口径 200——超限保存拦截而非静默截断）。 */
 const KEYWORD_LIMIT = 200;
+
+const LANG_LABEL: Record<string, string> = { zh: "普通话", cantonese: "粤语", en: "English" };
+
+// ---- 表格导入契约（列=意图ID,显示名,关键词,判据提示词,动作,动作目标,优先级,仅一次；
+//      组装 graph_json 走既有保存，整表替换前弹确认）。----
+const INTENT_IMPORT_COLUMNS = [
+  { key: "id", label: "意图ID", hint: "可空自动生成；int_+8位小写hex 才原样使用" },
+  { key: "label", label: "显示名", hint: "必填，≤64 字" },
+  { key: "kw", label: "关键词", hint: "必填；分号/逗号分隔，≤32 个每个≤64 字" },
+  { key: "judge", label: "判据提示词", hint: "可空；≤400 字" },
+  { key: "action", label: "动作", hint: "play_qa/jump_step/notify_human/无，可空=无" },
+  { key: "target", label: "动作目标", hint: "play_qa=词条ID；jump_step=步号；其余留空" },
+  { key: "prio", label: "优先级", hint: "数字，可空=10（小者先）" },
+  { key: "once", label: "仅一次", hint: "是/否，可空=否" },
+];
+const INTENT_IMPORT_FILENAME = "intents-example.csv";
+const INTENT_IMPORT_EXAMPLE: string[][] = [
+  ["", "客户投诉", "投诉;我要投诉;找你们领导", "客户表达不满或要求说法算命中；单纯询问细节不算。", "notify_human", "", "5", "是"],
+  ["", "问理赔进度", "进度;几时赔;到哪一步", "", "play_qa", "粘贴快答词条ID", "10", "否"],
+  ["", "不感兴趣", "不需要;别打了;唔使", "", "jump_step", "4", "20", "否"],
+];
+
+/** CP flow_graph `_ID_RE` 同款：意图/绑定 id 只收 int_/bnd_ + 8 位小写 hex。 */
+const INTENT_ID_RE = /^int_[0-9a-f]{8}$/;
+
+/** crypto 随机生成合法 id（与 /qa 页 genGraphId 同款，非 Math.random）。 */
+function genHexId(prefix: "int_" | "bnd_"): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(4));
+  return prefix + Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** 表格一行解析出的意图数据（预览/导入共用）。 */
+type IntentImportRow = {
+  intentId: string;
+  /** 填了但不合法的原 ID（仅提示用；落库一律用 intentId）。 */
+  providedId: string;
+  label: string;
+  keywords: string[];
+  judge: string;
+  /** ""=无动作（意图零行为，绑定由后续编辑补）。 */
+  action: "play_qa" | "jump_step" | "notify_human" | "";
+  qaId: string;
+  /** jump_step 目标步号（1 基；其它动作=0）。 */
+  step: number;
+  priority: number;
+  once: boolean;
+};
 
 const ACTIONS: [GraphBinding["action"], string][] = [
   ["jump_step", "跳到指定步骤"],
@@ -112,7 +163,9 @@ const inputCls =
 function IntentModal(props: {
   draft: IntentDraft;
   stepCount: number;
+  /** 仅本模板语言的词条（语言过滤在上游做；弹窗只渲染）。 */
   qaRows: { id?: string; question_text?: string }[];
+  langLabel: string;
   readOnly: boolean;
   onChange: (next: IntentDraft) => void;
   onClose: () => void;
@@ -234,6 +287,9 @@ function IntentModal(props: {
               </button>
             )}
           </div>
+          <p className="mt-1 text-[11px] muted">
+            「播快答」选词条只列出本模板语言（{props.langLabel}）的；其他语言词条到 /qa 页管理。
+          </p>
           <div className="mt-1 space-y-2">
             {draft.bindings.length === 0 && (
               <p className="text-[11px] muted">暂无动作——意图命中后不会做任何事（可先建意图再挂动作）。</p>
@@ -382,7 +438,9 @@ export default function IntentManager(props: {
   const [draft, setDraft] = useState<IntentDraft | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
-  const [qaRows, setQaRows] = useState<{ id?: string; question_text?: string }[]>([]);
+  const [qaRows, setQaRows] = useState<{ id?: string; question_text?: string; lang?: string }[]>([]);
+  // 表格导入弹窗（整表替换 graph_json）。
+  const [importOpen, setImportOpen] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -397,6 +455,15 @@ export default function IntentManager(props: {
       alive = false;
     };
   }, [props.accountId]);
+
+  const tplLang = String(tpl.language ?? "zh");
+  // 语言过滤（模板视角）：词条选择只列本模板语言的（其他语言去 /qa 全局页）。
+  const langQaRows = useMemo(
+    () => qaRows.filter((r) => String(r.lang ?? "zh") === tplLang),
+    [qaRows, tplLang],
+  );
+  // play_qa 动作目标的合法性校验集（用全量词条——存在性与语言过滤是两件事）。
+  const qaIdSet = useMemo(() => new Set(qaRows.map((r) => String(r.id ?? ""))), [qaRows]);
 
   const submit = useCallback(async () => {
     if (!draft) return;
@@ -506,6 +573,124 @@ export default function IntentManager(props: {
       .join("，");
   };
 
+  // ---- 表格导入（2026-09-25）：整表替换 graph_json；预览期逐行校验 ----
+
+  /** 单行解析：row-locally 校验 + 用 prev 做 文件内 ID/显示名 查重（预览期即标跳过）。 */
+  const parseIntentsImportRow = useCallback(
+    (row: string[], prev: ParsedRow<IntentImportRow>[]): ParsedRow<IntentImportRow> => {
+      const rawId = String(row[0] ?? "").trim();
+      const label = String(row[1] ?? "").trim();
+      if (!label) return rowSkip("显示名为空");
+      if (label.length > 64) return rowSkip(`显示名超 64 字（当前 ${label.length} 字）`);
+      const seenLabels = new Set<string>();
+      const seenIds = new Set<string>();
+      for (const p of prev) {
+        if (!p.ok || p.data === null) continue;
+        seenLabels.add(p.data.label);
+        if (p.data.providedId) seenIds.add(p.data.providedId);
+        seenIds.add(p.data.intentId);
+      }
+      if (seenLabels.has(label)) return rowSkip(`显示名「${label}」与前面行重复`);
+      const keywords = splitListCell(String(row[2] ?? ""));
+      if (keywords.length === 0) return rowSkip("关键词为空");
+      if (keywords.length > 32) return rowSkip(`关键词 ${keywords.length} 个，最多 32 个`);
+      const overKw = keywords.find((k) => k.length > 64);
+      if (overKw) return rowSkip(`关键词「${overKw.slice(0, 12)}…」超 64 字`);
+      const judge = String(row[3] ?? "").trim();
+      if (judge.length > JUDGE_PROMPT_MAX_CHARS) {
+        return rowSkip(`判据超 ${JUDGE_PROMPT_MAX_CHARS} 字（当前 ${judge.length} 字）`);
+      }
+      const actionRaw = String(row[4] ?? "").trim().toLowerCase();
+      let action: IntentImportRow["action"] = "";
+      if (actionRaw === "play_qa" || actionRaw === "播快答") action = "play_qa";
+      else if (actionRaw === "jump_step" || actionRaw === "跳步") action = "jump_step";
+      else if (actionRaw === "notify_human" || actionRaw === "通知人工") action = "notify_human";
+      else if (actionRaw !== "" && !["无", "none", "-"].includes(actionRaw)) {
+        return rowSkip(`动作须为 play_qa/jump_step/notify_human/无（当前「${String(row[4]).trim()}」）`);
+      }
+      const target = String(row[5] ?? "").trim();
+      let qaId = "";
+      let step = 0;
+      if (action === "play_qa") {
+        if (!target) return rowSkip("动作=play_qa 但动作目标（词条 ID）为空");
+        // 存在性只在校验集非空时把闸（词条表拉取失败时放行，运行时 play_miss 会优雅降级）。
+        if (qaIdSet.size > 0 && !qaIdSet.has(target)) {
+          return rowSkip(`词条 ID「${target.slice(0, 16)}」不在快答库（到问答库复制词条 ID）`);
+        }
+        qaId = target;
+      } else if (action === "jump_step") {
+        const n = Math.round(Number(target));
+        if (!Number.isFinite(n) || n < 1 || n > stepCount) {
+          return rowSkip(`动作目标须为 1..${stepCount} 的步号（当前「${target || "空"}」）`);
+        }
+        step = n;
+      }
+      let priority = 10;
+      const prioRaw = String(row[6] ?? "").trim();
+      if (prioRaw !== "") {
+        const n = Math.round(Number(prioRaw));
+        if (!Number.isFinite(n)) return rowSkip(`优先级「${prioRaw}」不是数字`);
+        priority = Math.max(0, Math.min(n, 1000));
+      }
+      const once = parseBoolCell(String(row[7] ?? ""), false);
+      if (once === null) return rowSkip(`仅一次「${String(row[7]).trim()}」须为 是/否`);
+      // 意图 ID：合法 int_hex 原样用（支撑 导出→改→再导入 的幂等替换）；不合法/空=生成。
+      let intentId = "";
+      let providedId = "";
+      if (rawId && INTENT_ID_RE.test(rawId)) {
+        if (seenIds.has(rawId)) return rowSkip(`意图 ID「${rawId}」与前面行重复`);
+        intentId = rawId;
+        providedId = rawId;
+      } else {
+        providedId = rawId; // 填了但不合法：记录原值（提示面），落库用自动生成
+        do {
+          intentId = genHexId("int_");
+        } while (seenIds.has(intentId));
+      }
+      return rowOk({
+        intentId, providedId, label, keywords, judge, action, qaId, step, priority, once,
+      });
+    },
+    [qaIdSet, stepCount],
+  );
+
+  /** 组装并保存：整表替换 intents+bindings（表格没写的意图会被删，确认文案明说）。 */
+  async function importIntentRows(rows: IntentImportRow[]): Promise<ImportResult> {
+    const intents: GraphIntent[] = rows.map((r) => ({
+      id: r.intentId,
+      label: r.label,
+      keywords: r.keywords,
+      steps: [],
+      enabled: true,
+      judge: r.judge ? { prompt: r.judge } : undefined,
+    }));
+    const bindings: GraphBinding[] = [];
+    for (const r of rows) {
+      if (!r.action) continue;
+      bindings.push(
+        bindingFromDraft(
+          {
+            id: genHexId("bnd_"),
+            action: r.action,
+            qa_id: r.qaId,
+            step: r.step || 1,
+            then_jump: 0,
+            priority: r.priority,
+            once: r.once,
+            enabled: true,
+          },
+          r.intentId,
+          stepCount,
+        ),
+      );
+    }
+    await api.updateTemplate(String(tpl.id ?? ""), {
+      graph_json: JSON.stringify({ version: 1, intents, bindings }),
+    });
+    props.onSaved();
+    return { done: rows.length, failed: 0, errors: [] };
+  }
+
   return (
     <section className="card space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -513,6 +698,22 @@ export default function IntentManager(props: {
           第一层识别：客户原话命中关键词（或判据）→ 执行动作。同轮多命中只执行优先级最小者。
         </p>
         <div className="flex items-center gap-2">
+          {!readOnly && (
+            <>
+              <button className="btn-ghost text-xs" onClick={() => setImportOpen(true)}>
+                导入意图
+              </button>
+              <button
+                className="btn-ghost text-xs"
+                title="下载示例 CSV（含列说明注释行，导入时自动忽略）"
+                onClick={() =>
+                  downloadCsv(INTENT_IMPORT_FILENAME, buildExampleCsvRows(INTENT_IMPORT_COLUMNS, INTENT_IMPORT_EXAMPLE))
+                }
+              >
+                下载示例模板
+              </button>
+            </>
+          )}
           {!readOnly && (props.seedIntents?.length ?? 0) > 0 && (
             <button className="btn-ghost text-xs" disabled={busy} onClick={() => void importSeeds()}>
               导入基础意图包
@@ -599,13 +800,32 @@ export default function IntentManager(props: {
         <IntentModal
           draft={draft}
           stepCount={stepCount}
-          qaRows={qaRows}
+          qaRows={langQaRows}
+          langLabel={LANG_LABEL[tplLang] ?? tplLang}
           readOnly={readOnly}
           onChange={setDraft}
           onClose={() => setDraft(null)}
           onSubmit={() => void submit()}
           busy={busy}
           err={err}
+        />
+      )}
+
+      {/* 表格导入（2026-09-25）：CSV 上传→预览（N 行将导入/M 行跳过及原因）→确认（整表替换）→保存→摘要 */}
+      {!readOnly && (
+        <TableImport<IntentImportRow>
+          open={importOpen}
+          title="表格导入意图"
+          description="整表替换：导入将替换该模板现有的全部意图与绑定，未包含在表格里的意图会被删除。"
+          columns={INTENT_IMPORT_COLUMNS}
+          exampleRows={INTENT_IMPORT_EXAMPLE}
+          exampleFilename={INTENT_IMPORT_FILENAME}
+          parseRow={parseIntentsImportRow}
+          onImport={importIntentRows}
+          confirmText={(n) =>
+            `导入将【整表替换】该模板现有的意图与绑定：\n现有 ${doc.intents.length} 个意图 / ${doc.bindings.length} 条绑定 → 替换为表格的 ${n} 条意图。\n未包含在表格里的现有意图会被删除。确定继续？`
+          }
+          onClose={() => setImportOpen(false)}
         />
       )}
     </section>

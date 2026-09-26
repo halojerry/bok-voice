@@ -514,3 +514,66 @@ test("F5/F6/F7 数据面：初始缩放选项 / 引导语空态 / 抽屉保持�
   assert.equal(fc.drawerIndexValid(-1, 3), false);
   assert.equal(fc.drawerIndexValid(1.5, 3), false);
 });
+
+// ---- ⑧ 两视图同源最小复现（2026-09-25「列表和画布逻辑对不上」排查）----
+// 同一份 steps_json 走 studio 页唯一数据面（stepsToJson 落库 → jsonToSteps 装配草稿）：
+// 列表视图消费 raw ref（textarea 原文）,画布视图消费 layoutFlow(parseStepRefParts)
+// 派生——断言两路对 分支数/动作徽标/直念/场景/变量 的展示数据逐件一致;列表编辑一笔后
+// 画布布局立即反映;「应用」保存→重锚（stepsToJson→jsonToSteps 再走一轮）后布局逐件不变。
+test("两视图同源：列表原稿与画布布局对同一 steps_json 派生一致（分支/直念/动作/变量）", () => {
+  const draft = [
+    {
+      goal: "开场确认",
+      ref: "你好，请问係{姓名}吗？我哋係{物流公司}。\n如果客户问点解 → 简短讲来意\n如果客户闹 → 【收线】唔好意思打搅咗",
+      scene: "开场",
+    },
+    { goal: "通知赔偿", ref: "同你讲声唔好意思，会按一赔二赔俾你。", say: true, emotion: "sad" },
+    {
+      goal: "收号码",
+      ref: "麻烦你报下 WhatsApp 号码\n如果客户唔方便 → 【留本步】约个时间再跟进",
+    },
+  ];
+  // studio 页唯一装配路径：save→load（进工作台与「应用」后重锚走同一条路）。
+  const shared = te.jsonToSteps(te.stepsToJson(draft));
+  const lay = fc.layoutFlow(shared);
+  const stepNodes = lay.nodes.filter((n) => n.kind === "step");
+  assert.equal(stepNodes.length, shared.length, "画布步卡数=列表步数");
+
+  // 步号一致：两视图都按数组下标编号（列表「第 N 步」=画布徽标 N）。
+  assert.deepEqual(stepNodes.map((n) => n.index), [0, 1, 2]);
+
+  // 直念/情绪：列表 checkbox 位（shared[i].say/emotion）与画布步卡徽标同源。
+  const n1 = stepNodes.find((n) => n.index === 1);
+  assert.equal(n1.say, shared[1].say === true);
+  assert.equal(n1.say, true);
+  assert.equal(n1.emotion, shared[1].emotion);
+
+  // 分支数：列表原稿里「如果客户…→…」行数=画布 chip 数（上限内）;动作徽标同源
+  // （都派生自同一 parseStepRefParts/parseBranchAction）。
+  const p0 = fc.parseStepRefParts(shared[0].ref);
+  const n0 = stepNodes.find((n) => n.index === 0);
+  assert.equal(p0.branches.length, 2);
+  assert.equal(n0.branches.length, p0.branches.length);
+  assert.deepEqual(n0.branches.map((b) => [b.cond, b.action]), [
+    ["问点解", ""],
+    ["闹", "refuse"],
+  ]);
+  const n2 = stepNodes.find((n) => n.index === 2);
+  assert.deepEqual(n2.branches.map((b) => b.action), ["hold"]);
+
+  // 变量：画布摘要原样保留 {占位}（不渲染、也不吞）。
+  assert.ok(n0.scriptFirst.includes("{姓名}"));
+
+  // 列表编辑一笔（模拟 StepsListEditor.onChange 改 ref）→ 画布布局同步反映新分支。
+  const edited = shared.map((s, i) =>
+    i === 2 ? { ...s, ref: s.ref + "\n如果客户报咗 → 【跳第1步】返开场" } : s,
+  );
+  const lay2 = fc.layoutFlow(edited);
+  const n2b = lay2.nodes.find((n) => n.id === "fstep:2");
+  assert.equal(n2b.kind === "step" ? n2b.branches.length : -1, 2);
+  assert.equal(n2b.kind === "step" ? n2b.branches[1].action : "", "jump");
+  assert.equal(n2b.kind === "step" ? n2b.branches[1].jump : -1, 1);
+
+  // 「应用」保存→重锚（stepsToJson→jsonToSteps 再走一轮）后画布布局逐件不变。
+  assert.deepEqual(fc.layoutFlow(te.jsonToSteps(te.stepsToJson(edited))), lay2);
+});

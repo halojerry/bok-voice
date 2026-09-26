@@ -11,10 +11,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { api, type UserRow } from "@/lib/api";
+import { downloadCsv, parseBoolCell } from "@/lib/csv";
+import { serializeStepRef } from "@/lib/flow-canvas";
 import { parseGraphDoc, parseTemplateSteps } from "@/lib/qa-canvas";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
 import { hasPage, useSession } from "@/components/session-context";
+import TableImport, {
+  buildExampleCsvRows, rowOk, rowSkip, type ImportResult, type ParsedRow,
+} from "@/components/table-import";
 import TemplateEditor, {
   LANGS,
   PublishBadge,
@@ -50,6 +55,94 @@ const LANG_LABEL: Record<string, string> = {
   en: "英语",
   vi: "越南语",
 };
+
+// 主流程 tab 双视图记忆（2026-09-25 用户拍板）：默认「列表编辑」（表单/卡片对运营更
+// 易用;画布不能连线、整理弱,降为切换选项）,用户上次选择记 localStorage,首访=列表。
+const FLOW_VIEW_STORAGE_KEY = "bok.flow.view";
+function readStoredFlowView(): "form" | "canvas" {
+  // 静态导出预渲染期无 window;存储值非法一律回落列表（首访默认）。
+  if (typeof window === "undefined") return "form";
+  try {
+    return window.localStorage.getItem(FLOW_VIEW_STORAGE_KEY) === "canvas" ? "canvas" : "form";
+  } catch {
+    return "form"; // 存储不可用（隐私模式等）:仅不记忆选择,功能不受影响
+  }
+}
+
+// ---- 表格导入契约（主流程 tab「导入话术」，2026-09-25）：列=步号,目的,AI主要说的话,
+// 客户这样说→AI怎么做（分支行：`条件 :: 应答` 每格一条,多条用 | 分隔）,逐字照念(是/否),
+// 补充提醒。组装 steps_json 走既有模板保存（单键 steps_json），整表替换前弹确认。----
+const FLOW_IMPORT_COLUMNS = [
+  { key: "no", label: "步号", hint: "必填；≥1 整数，决定顺序" },
+  { key: "goal", label: "目的", hint: "这一步要达成什么（可空）" },
+  { key: "script", label: "AI主要说的话", hint: "参考说法正文（可空）" },
+  { key: "branch", label: "客户这样说→AI怎么做", hint: "格式「条件 :: 应答」，多条用 | 分隔" },
+  { key: "say", label: "逐字照念", hint: "是/否，可空=否（通知/道歉等合规内容用）" },
+  { key: "note", label: "补充提醒", hint: "可空；多条用 | 分隔" },
+];
+const FLOW_IMPORT_FILENAME = "flow-steps-example.csv";
+const FLOW_IMPORT_EXAMPLE: string[][] = [
+  ["1", "确认身份", "您好，请问是{姓名}本人吗？我是{物流公司}客服。", "", "否", ""],
+  ["2", "说明来意并致歉", "您的包裹在运输途中丢失了，非常抱歉，我们按承诺给您办理理赔。", "现在没空 :: 好的，那您方便的时候我再给您来电|已经知道了 :: 好的，那我们直接进入理赔办理", "是", "赔偿档位只在这一步讲，其他步骤不报数字"],
+  ["3", "索取联系方式", "麻烦把您的微信号报给我，理赔专员会加您办理。", "不方便 :: 问什么时候方便，约好时间再跟进", "否", ""],
+  ["4", "收尾", "感谢您的配合，祝您生活愉快，再见。", "", "否", ""],
+];
+
+/** 主流程表格一行解析出的数据（预览/导入共用）。 */
+type FlowImportRow = {
+  /** 步号（≥1；决定步骤顺序，允许跳号）。 */
+  no: number;
+  goal: string;
+  script: string;
+  branches: { cond: string; resp: string }[];
+  say: boolean;
+  /** 注意行内容（多条 \n 连接，序列化时逐行还原「注意：」头）。 */
+  notes: string;
+};
+
+/** 分支格一条「条件 :: 应答」→ (cond, resp)；缺分隔/缺件=null（预览标跳过）。 */
+function parseBranchCell(piece: string): { cond: string; resp: string } | null {
+  const m = piece.match(/^(.+?)\s*(?:::|：：)\s*(.+)$/);
+  if (!m) return null;
+  const cond = m[1].trim();
+  const resp = m[2].trim();
+  return cond && resp ? { cond, resp } : null;
+}
+
+/** 单行解析（纯函数；prev=先前各行，做步号查重——预览期即标跳过）。 */
+function parseFlowImportRow(row: string[], prev: ParsedRow<FlowImportRow>[]): ParsedRow<FlowImportRow> {
+  const noRaw = String(row[0] ?? "").trim();
+  const no = Math.round(Number(noRaw));
+  if (!noRaw || !Number.isFinite(no) || no < 1) {
+    return rowSkip(`步号须为 ≥1 的整数（当前「${noRaw || "空"}」）`);
+  }
+  const seenNos = new Set<number>();
+  for (const p of prev) if (p.ok) seenNos.add(p.data.no);
+  if (seenNos.has(no)) return rowSkip(`步号 ${no} 重复`);
+  const goal = String(row[1] ?? "").trim();
+  const script = String(row[2] ?? "").trim();
+  const branchCell = String(row[3] ?? "").trim();
+  const branches: { cond: string; resp: string }[] = [];
+  if (branchCell) {
+    for (const piece of branchCell.split("|")) {
+      const t = piece.trim();
+      if (!t) continue;
+      const b = parseBranchCell(t);
+      if (!b) return rowSkip(`分支「${t.slice(0, 20)}」缺 :: 分隔（格式：条件 :: 应答）`);
+      branches.push(b);
+    }
+  }
+  const say = parseBoolCell(String(row[4] ?? ""), false);
+  if (say === null) return rowSkip(`逐字照念「${String(row[4]).trim()}」须为 是/否`);
+  const noteCell = String(row[5] ?? "").trim();
+  const notes = noteCell
+    ? noteCell.split(/\s*\|\s*|\r?\n\s*/).map((n) => n.trim()).filter(Boolean)
+    : [];
+  if (!goal && !script && branches.length === 0 && notes.length === 0) {
+    return rowSkip("该行没有任何内容");
+  }
+  return rowOk({ no, goal, script, branches, say, notes: notes.join("\n") });
+}
 
 export default function StudioPage() {
   const { accountId } = useAccount();
@@ -192,6 +285,27 @@ export default function StudioPage() {
     setApplyNote("");
   }, []);
 
+  // ---- 主流程表格导入（整表替换 steps_json）----
+  const [flowImportOpen, setFlowImportOpen] = useState(false);
+
+  /** 组装并保存：按步号升序成步，ref=serializeStepRef（正稿+分支+注意三件，
+   * 语法与 lib/flow-canvas 对 flow.py _BRANCH_LINE_RE/_NOTE_LINE_RE 的镜像一致）。
+   * 保存后草稿直接重锚为导入结果（不等重拉），再 tplRev+1 取权威行。 */
+  async function importFlowRows(rows: FlowImportRow[]): Promise<ImportResult> {
+    const ordered = [...rows].sort((a, b) => a.no - b.no);
+    const steps: FlowStep[] = ordered.map((r) => ({
+      goal: r.goal,
+      ref: serializeStepRef({ script: r.script, branches: r.branches, notes: r.notes }),
+      ...(r.say ? { say: true } : {}),
+    }));
+    await api.updateTemplate(selId, { steps_json: stepsToJson(steps) });
+    setStepsDraft(steps);
+    setStepsDirty(false);
+    setApplyNote(`已从表格导入 ${steps.length} 步（整表替换）`);
+    setTplRev((v) => v + 1);
+    return { done: steps.length, failed: 0, errors: [] };
+  }
+
   /** 全局「应用」：唯一保存入口（只写 steps_json 单键,PUT exclude_unset 部分更新）。 */
   async function applySteps() {
     if (!selId || applying) return;
@@ -245,8 +359,16 @@ export default function StudioPage() {
 
   // ---- tab 切换（qa 页 view chips 同款写法）；学习报告 tab 仅对有 reports 键的人出现 ----
   const [tab, setTab] = useState("flow");
-  // 主流程 tab 双视图：画布=推荐默认（普通人视角：看到流程再点步骤）；列表=批量编辑。
-  const [flowView, setFlowView] = useState<"form" | "canvas">("canvas");
+  // 主流程 tab 双视图：默认「列表编辑」,画布为切换选项;选择记 localStorage（见文件头注释）。
+  const [flowView, setFlowView] = useState<"form" | "canvas">(readStoredFlowView);
+  const switchFlowView = useCallback((v: "form" | "canvas") => {
+    setFlowView(v);
+    try {
+      window.localStorage.setItem(FLOW_VIEW_STORAGE_KEY, v);
+    } catch {
+      // 存储不可用:选择只在本次会话生效,功能不受影响。
+    }
+  }, []);
   const tabs: [string, string][] = [
     ["flow", "主流程"],
     ["intent", "意图管理"],
@@ -539,23 +661,46 @@ export default function StudioPage() {
             ))}
           </div>
 
-          {/* 1. 主流程：画布（默认）/ 列表编辑——同一份工作站层草稿,右上角「应用」统一保存 */}
+          {/* 1. 主流程：列表编辑（默认）/ 画布——同一份工作站层草稿,右上角「应用」统一保存 */}
           {tab === "flow" && (
             <div className="space-y-2">
               <div className="flex items-center gap-1">
-                {([["canvas", "画布（推荐）"], ["form", "列表编辑"]] as const).map(([k, label]) => (
+                {([["form", "列表编辑"], ["canvas", "画布"]] as const).map(([k, label]) => (
                   <button
                     key={k}
                     className={`btn-ghost text-xs ${flowView === k ? "border-(--live) text-(--live-ink)" : "muted"}`}
-                    onClick={() => setFlowView(k)}
+                    onClick={() => switchFlowView(k)}
                   >
                     {label}
                   </button>
                 ))}
+                {/* 表格导入（整表替换 steps_json）+ 示例模板下载 */}
+                {!contentReadOnly && (
+                  <>
+                    <button className="btn-ghost text-xs" onClick={() => setFlowImportOpen(true)}>
+                      导入话术
+                    </button>
+                    <button
+                      className="btn-ghost text-xs"
+                      title="下载示例 CSV（含列说明注释行，导入时自动忽略）"
+                      onClick={() =>
+                        downloadCsv(FLOW_IMPORT_FILENAME, buildExampleCsvRows(FLOW_IMPORT_COLUMNS, FLOW_IMPORT_EXAMPLE))
+                      }
+                    >
+                      下载示例模板
+                    </button>
+                  </>
+                )}
                 {branchNote && <span className="ml-auto text-xs text-amber-700">{branchNote}</span>}
               </div>
+              {/* 重派生保险（2026-09-25「列表与画布对不上」排查收尾）：两视图本就同吃页面层
+                  stepsDraft、切换视图=条件渲染卸载重挂,天然拿到最新草稿;key 再钉到 模板+步数
+                  ——保存后步数变化（空白步被剔除/列表加删步后应用重锚）时画布整树重建,拖动
+                  覆盖与抽屉步号不再按旧下标错位。步数不变的同模板保存不换 key,F7（答法抽屉
+                  保存后保持打开）不受影响。刻意不用内容哈希——逐字编辑会频繁换 key 反复重挂。 */}
               {flowView === "canvas" ? (
                 <FlowCanvas
+                  key={`${selId}:${stepsDraft.length}`}
                   tpl={tplRow}
                   graph={graph}
                   draft={stepsDraft}
@@ -731,6 +876,30 @@ export default function StudioPage() {
             </>
           )}
         </>
+      )}
+
+      {/* 主流程表格导入（2026-09-25）：CSV 上传→预览（N 行将导入/M 行跳过及原因）→
+          确认（整表替换 steps_json）→保存→摘要 */}
+      {Boolean(selId) && (
+        <TableImport<FlowImportRow>
+          open={flowImportOpen}
+          title="导入话术（表格）"
+          description="整表替换：导入将覆盖当前主流程的全部步骤（按步号排序），保存后立即生效为草稿。"
+          columns={FLOW_IMPORT_COLUMNS}
+          exampleRows={FLOW_IMPORT_EXAMPLE}
+          exampleFilename={FLOW_IMPORT_FILENAME}
+          parseRow={parseFlowImportRow}
+          onImport={importFlowRows}
+          confirmText={(n) => {
+            const lines = [
+              `导入将【整表替换】当前主流程的全部步骤：现有 ${stepsList.length} 步 → 表格的 ${n} 步。`,
+            ];
+            if (stepsDirty) lines.push("注意：还有未应用的修改，将被这次导入覆盖。");
+            lines.push("替换后立即保存，无需再点「应用」；已发布版本不受影响。确定继续？");
+            return lines.join("\n");
+          }}
+          onClose={() => setFlowImportOpen(false)}
+        />
       )}
     </div>
   );

@@ -6,12 +6,13 @@
 // 左栏意图卡（虚线=听到关键词跳到对应步骤）+ 点步开「AI 怎么说」抽屉。
 // 意图=只读 overlay（编辑在「意图管理」tab）。
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Background, Controls, Handle, MiniMap, Position, ReactFlow,
-  type Edge, type Node, type NodeChange, type NodeProps,
+  type Edge, type Node, type NodeChange, type NodeProps, type ReactFlowInstance,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
+import dagre from "@dagrejs/dagre";
 import { useSession } from "@/components/session-context";
 import type { FlowStep, TemplateRow } from "@/components/template-editor";
 import { VarTextarea } from "@/components/var-insert";
@@ -20,7 +21,8 @@ import {
   layoutFlow, parseStepRefParts, serializeStepRef, UNGROUPED_LANE,
   parseBranchAction, composeBranchResp, branchActionBadge, branchCannedMeta, BRANCH_ACTIONS,
   canvasFitViewOptions, canvasGuideText, graphHasIntents, CANVAS_INTENT_EMPTY_HINT, drawerIndexValid,
-  type FlowNode, type StepRefParts, type StepBranch, type BranchAction, type BranchCannedStatus,
+  BRANCH_CHIP_LIMIT, STEP_NODE_W, INTENT_NODE_W,
+  type FlowNode, type FlowEdge, type StepRefParts, type StepBranch, type BranchAction, type BranchCannedStatus,
 } from "@/lib/flow-canvas";
 
 // 情绪下拉选项与 template-editor 表单同款（罐头物化烧进音频,实时回复不受影响）。
@@ -153,6 +155,48 @@ function FlowIntentNode({ data }: NodeProps) {
 }
 
 const NODE_TYPES = { flowStep: FlowStepNode, flowIntent: FlowIntentNode };
+
+// —— 一键整理（2026-09-25）：dagre 自动布局 ——
+// 步骤=脊柱链按步号逐级向下（spine 边决定 rank 序）;意图卡=按 jump/播完跳转边贴近
+// 目标步（dagre rank 最短化）。只产出显示层覆盖位置（与手动拖动走同一条
+// positions 覆盖通道）,不落库;拖乱后再点整理=重新归位。
+
+/** dagre 布局用的节点盒估计：画布卡是 CSS 内容自适应,精确高度拿不到——布局只要
+ * 粗盒防重叠,估值偏差由 nodesep/ranksep 吸收（step 卡按徽标/分支行数估高）。 */
+export function estimateNodeSize(n: FlowNode): { width: number; height: number } {
+  if (n.kind === "intent") return { width: INTENT_NODE_W, height: 84 };
+  const chips = Math.min(n.branches.length + (n.branchMore > 0 ? 1 : 0), BRANCH_CHIP_LIMIT + 1);
+  let h = 44 + (n.scriptFirst ? 32 : 0);
+  if (n.index === 0) h += 16;
+  if (n.say || n.scene || n.jumpIn > 0) h += 26;
+  if (chips > 0) h += 24 + Math.ceil(chips / 2) * 22;
+  return { width: STEP_NODE_W, height: h };
+}
+
+/** 整理位计算（纯函数,确定性:同输入同输出）。dagre 产出中心点,React Flow 受控节点
+ * 要左上角——此处换算。注意 dagre 边必须先 setDefaultEdgeLabel（缺省边标签时
+ * layout 会以 undefined 边标签崩）。 */
+export function tidyPositions(
+  nodes: FlowNode[],
+  edges: FlowEdge[],
+): Record<string, { x: number; y: number }> {
+  const g = new dagre.graphlib.Graph();
+  g.setGraph({ rankdir: "TB", nodesep: 48, ranksep: 72, marginx: 16, marginy: 16 });
+  g.setDefaultEdgeLabel(() => ({}));
+  for (const n of nodes) {
+    const size = estimateNodeSize(n);
+    g.setNode(n.id, { width: size.width, height: size.height });
+  }
+  for (const e of edges) g.setEdge(e.source, e.target);
+  dagre.layout(g);
+  const out: Record<string, { x: number; y: number }> = {};
+  for (const n of nodes) {
+    const pos = g.node(n.id);
+    const size = estimateNodeSize(n);
+    out[n.id] = { x: Math.round(pos.x - size.width / 2), y: Math.round(pos.y - size.height / 2) };
+  }
+  return out;
+}
 
 // —— 步骤编辑抽屉（右侧固定面板,非 modal）：全部字段受控,写路径归宿主 ——
 function AnswerDrawer(props: {
@@ -399,14 +443,21 @@ export default function FlowCanvas(props: {
   const [drawerIdx, setDrawerIdx] = useState<number | null>(null);
   const [parts, setParts] = useState<StepRefParts | null>(null);
   const [positions, setPositions] = useState<Record<string, { x: number; y: number }>>({});
+  // 一键整理：实例句柄用于整理后重跑 fitView;fitRev>0 才触发（首渲染 fitView 交给
+  // <ReactFlow fitView> prop,勿重复跑两次）。
+  const instanceRef = useRef<ReactFlowInstance | null>(null);
+  const [fitRev, setFitRev] = useState(0);
 
+  const draftLength = draft.length;
   useEffect(() => {
     setDrawerIdx(null);
     setPositions({});
-    // 只跟 tpl.id 走（换模板才收抽屉/重置拖动位置）。点「应用」保存=同 id 重拉,
-    // 这里的 tplId 字符串不变 → 抽屉与画布状态原样保留（F7：连续改多条分支不用重开）。
+    // 只跟 tpl.id 与步数走（换模板收抽屉/重置拖动位置是旧有行为;步数变化是 2026-09-25
+    // 「列表与画布对不上」排查补的:按下标寻址的拖动覆盖与抽屉步号在步数增删后会错位,
+    // 整树重置让内容与位置重新对齐）。点「应用」保存且步数不变=id/长度均不变 → 画布
+    // 状态原样保留（F7：连续改多条分支不用重开抽屉）。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tplId]);
+  }, [tplId, draftLength]);
 
   // 抽屉打开时把该步 ref 拆成 主要内容/应对/提醒 三件（受控编辑实时序列化回草稿）。
   useEffect(() => {
@@ -425,6 +476,16 @@ export default function FlowCanvas(props: {
   }, [drawerIdx, draft.length]);
 
   const layout = useMemo(() => layoutFlow(draft, graph), [draft, graph]);
+  // 一键整理：把全部节点排回 dagre 自动版式（覆盖手动拖动位置）,提交后重跑 fitView。
+  const tidy = useCallback(() => {
+    setPositions(tidyPositions(layout.nodes, layout.edges));
+    setFitRev((v) => v + 1);
+  }, [layout]);
+  useEffect(() => {
+    if (fitRev === 0) return; // 首渲染的 fitView 交给 <ReactFlow fitView> prop
+    // 效果跑在提交后:新位置已进 React Flow store,fitView 量到的是整理后的图。
+    instanceRef.current?.fitView(FIT_VIEW_OPTIONS);
+  }, [fitRev]);
   // F6：左栏意图卡在不在（引导语与空态提示跟它走,停用意图也渲染成卡,与布局同口径）。
   const hasIntents = graphHasIntents(graph);
   const scenes = useMemo(
@@ -521,6 +582,15 @@ export default function FlowCanvas(props: {
       <div className="flex flex-wrap items-center gap-2">
         <span className="label">流程画布</span>
         <span className="text-[11px] muted">{canvasGuideText(hasIntents)}</span>
+        <button
+          type="button"
+          className="btn-ghost ml-auto px-2 py-0.5 text-xs"
+          disabled={layout.nodes.length === 0}
+          onClick={tidy}
+          title="把全部步骤/意图卡排回整齐版式：步骤从上到下按通话顺序，拖乱的卡片一键归位"
+        >
+          一键整理
+        </button>
       </div>
       {readOnly && (
         <p className="rounded-lg bg-amber-50 px-3 py-2 text-[11px] text-amber-700">
@@ -554,6 +624,7 @@ export default function FlowCanvas(props: {
             fitViewOptions={FIT_VIEW_OPTIONS}
             minZoom={0.2}
             deleteKeyCode={null}
+            onInit={(inst) => { instanceRef.current = inst; }}
             onNodesChange={onNodesChange}
             onEdgesChange={() => {}}
           >
