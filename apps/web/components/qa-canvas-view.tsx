@@ -19,6 +19,7 @@ import {
   deriveGraph, LOCAL_POS_KEY, parseTemplateSteps,
   type CanvasIntentNode, type FlowStep, type GraphDoc, type GraphIntent, type Pt, type QaRow,
 } from "@/lib/qa-canvas";
+import { useSized } from "@/lib/use-sized";
 
 export type TemplateRow = { id: string; name?: string; steps_json?: string; language?: string };
 
@@ -186,6 +187,8 @@ export default function QaCanvasView(props: {
   const canEditGraph = Boolean(props.canEditGraph);
   // 画布外层 div:调色盘落点=该矩形中心(screenToFlowPosition 吃屏幕坐标)。
   const wrapperRef = useRef<HTMLDivElement | null>(null);
+  // 容器尺寸就绪守门（error#004/#015，flow-canvas 同款）：ref 与 wrapperRef 合并挂同一 div。
+  const sizedWrap = useSized<HTMLDivElement>();
   const [langFilter, setLangFilter] = useState("all");
   const [positions, setPositions] = useState<Record<string, Pt>>({});
   // 边选中态本地持有(spec §4.4:点选边→Delete 键或右键解除):受控图里 RF 的
@@ -346,7 +349,10 @@ export default function QaCanvasView(props: {
           用包裹层 onDoubleClick + 落点判 pane 兜出,并关掉双击缩放避免手势打架;
           坐标上抛 page,Phase1 仅开新建表单(落点插入待 Phase2)。 */}
       <div
-        ref={wrapperRef}
+        ref={(el) => {
+          wrapperRef.current = el;
+          sizedWrap.ref.current = el;
+        }}
         className="h-[600px] rounded-lg border border-(--card-border)"
         onDoubleClick={(e) => {
           const t = e.target as HTMLElement | null;
@@ -355,6 +361,11 @@ export default function QaCanvasView(props: {
           }
         }}
       >
+        {/* 尺寸就绪才挂 ReactFlow（error#004/#015 官方修法，flow-canvas 同款）：挂载竞态期
+            0 尺寸=布局警告+节点量不到。 */}
+        {!sizedWrap.ready ? (
+          <div className="flex h-full items-center justify-center text-xs muted">画布加载中…</div>
+        ) : (
         <ReactFlow
           nodes={nodes}
           edges={edges}
@@ -441,6 +452,7 @@ export default function QaCanvasView(props: {
           {/* 调色盘浮层(spec §7):不可编辑图时不渲染。 */}
           {canEditGraph && <IntentPalette wrapperRef={wrapperRef} onAddIntent={props.onAddIntent} />}
         </ReactFlow>
+        )}
       </div>
     </div>
   );

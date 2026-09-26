@@ -13,7 +13,7 @@ import Link from "next/link";
 import { api, type UserRow } from "@/lib/api";
 import { downloadCsv, parseBoolCell } from "@/lib/csv";
 import { serializeStepRef } from "@/lib/flow-canvas";
-import { parseGraphDoc, parseTemplateSteps } from "@/lib/qa-canvas";
+import { graphDocWithJumpBinding, graphDocWithoutIntentBindings, parseGraphDoc, parseTemplateSteps } from "@/lib/qa-canvas";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
 import { hasPage, useSession } from "@/components/session-context";
@@ -304,6 +304,46 @@ export default function StudioPage() {
     setApplyNote(`已从表格导入 ${steps.length} 步（整表替换）`);
     setTplRev((v) => v + 1);
     return { done: steps.length, failed: 0, errors: [] };
+  }
+
+  // —— 画布连线（2026-09-26）：意图→步骤 拖线=改绑定,graph_json 单键立即落库（qa 画布
+  // 拖线同款姿势——绑定是图数据不是步骤草稿,不进「应用」缓冲）;保存后 tplRev+1 重拉,
+  // 画布边与意图管理 tab 都拿到权威数据。步骤草稿（未保存改动）不受影响。
+  async function bindIntentJump(intentId: string, stepNo: number) {
+    if (!selId) return;
+    const next = graphDocWithJumpBinding(
+      typeof tplRow?.graph_json === "string" ? tplRow.graph_json : "",
+      intentId,
+      stepNo,
+      stepsDraft.length,
+    );
+    if (!next) {
+      setApplyNote("画布连线失败：意图不存在或步号越界，刷新后重试。");
+      return;
+    }
+    try {
+      await api.updateTemplate(selId, { graph_json: JSON.stringify(next) });
+      setApplyNote(`画布连线已保存：该意图命中后跳到第 ${stepNo} 步（记得有未发布的改动要去发布）`);
+      setTplRev((v) => v + 1);
+    } catch (e) {
+      setApplyNote(`画布连线失败：${String(e)}`);
+    }
+  }
+
+  async function unbindIntentJump(intentId: string) {
+    if (!selId) return;
+    const next = graphDocWithoutIntentBindings(
+      typeof tplRow?.graph_json === "string" ? tplRow.graph_json : "",
+      intentId,
+    );
+    if (!next) return;
+    try {
+      await api.updateTemplate(selId, { graph_json: JSON.stringify(next) });
+      setApplyNote("已解除该意图的连线（意图与关键词保留）");
+      setTplRev((v) => v + 1);
+    } catch (e) {
+      setApplyNote(`解除连线失败：${String(e)}`);
+    }
   }
 
   /** 全局「应用」：唯一保存入口（只写 steps_json 单键,PUT exclude_unset 部分更新）。 */
@@ -708,6 +748,8 @@ export default function StudioPage() {
                   branchCanned={branchCanned}
                   onPregenBranch={pregenBranch}
                   onOpenIntents={() => setTab("intent")}
+                  onBindJump={bindIntentJump}
+                  onUnbindJump={unbindIntentJump}
                 />
               ) : (
                 <>

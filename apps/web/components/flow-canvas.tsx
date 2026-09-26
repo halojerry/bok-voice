@@ -9,11 +9,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Background, Controls, Handle, MiniMap, Position, ReactFlow,
-  type Edge, type Node, type NodeChange, type NodeProps, type ReactFlowInstance,
+  type Connection, type Edge, type Node, type NodeChange, type NodeProps, type ReactFlowInstance,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import dagre from "@dagrejs/dagre";
 import { useSession } from "@/components/session-context";
+import { useSized } from "@/lib/use-sized";
 import type { FlowStep, TemplateRow } from "@/components/template-editor";
 import { VarTextarea } from "@/components/var-insert";
 import type { GraphDoc } from "@/lib/qa-canvas";
@@ -60,16 +61,16 @@ const ACTION_BADGE_CLS: Record<string, string> = {
 // —— 纯渲染节点 ——
 // 步节点（工作流卡）：目的 + AI 说的话预览 + 徽标 + 「客户这样说」chip；点击开抽屉。
 function FlowStepNode({ data }: NodeProps) {
-  const d = data as Extract<FlowNode, { kind: "step" }> & { onOpen: (index: number) => void };
+  const d = data as Extract<FlowNode, { kind: "step" }> & { onOpen: (index: number) => void; bindable?: boolean };
   return (
     <div
       className="w-[300px] cursor-pointer rounded-lg border border-(--live) bg-(--live-soft) p-3 text-xs hover:bg-accent"
       title="点这一步，编辑 AI 怎么说、怎么应对"
       onClick={() => d.onOpen(d.index)}
     >
-      {/* 脊柱入边（上）+ 意图跳转入边（左）+ 脊柱出边（下） */}
+      {/* 脊柱入边（上）+ 意图跳转入边（左,可连线目标）+ 脊柱出边（下） */}
       <Handle type="target" position={Position.Top} id="t" isConnectable={false} style={HANDLE_STYLE} />
-      <Handle type="target" position={Position.Left} id="l" isConnectable={false} style={HANDLE_STYLE} />
+      <Handle type="target" position={Position.Left} id="l" isConnectable={Boolean(d.bindable)} style={HANDLE_STYLE} />
       <Handle type="source" position={Position.Bottom} id="b" isConnectable={false} style={HANDLE_STYLE} />
       <p className="flex items-center gap-1.5 font-medium">
         <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-(--live) px-1 text-[10px] font-bold text-white">
@@ -125,14 +126,14 @@ function FlowStepNode({ data }: NodeProps) {
 
 // 意图节点（只读 overlay,左栏）：跳转边在布局层派生;编辑在「意图管理」tab。
 function FlowIntentNode({ data }: NodeProps) {
-  const d = data as Extract<FlowNode, { kind: "intent" }>;
+  const d = data as Extract<FlowNode, { kind: "intent" }> & { bindable?: boolean };
   return (
     <div
       className={`w-[240px] rounded-lg border px-3 py-2 text-xs shadow-sm ${
         d.enabled ? "border-amber-300 bg-amber-50" : "border-(--card-border) bg-muted/60 opacity-50"
       }`}
     >
-      <Handle type="source" position={Position.Right} id="r" isConnectable={false} style={HANDLE_STYLE} />
+      <Handle type="source" position={Position.Right} id="r" isConnectable={Boolean(d.bindable)} style={HANDLE_STYLE} />
       <p className="flex items-center gap-1.5 font-medium">
         <span aria-hidden>🎯</span>
         <span className="min-w-0 truncate">{d.label}</span>
@@ -429,6 +430,11 @@ export default function FlowCanvas(props: {
   currentTemplateLanguage?: string;
   /** F6：画布没有意图时的空态引导点击回调（跳「意图管理」tab）;未传=只给文字提示。 */
   onOpenIntents?: () => void;
+  /** 画布连线（2026-09-26）：意图卡右圆点拖到步骤卡左圆点=该意图绑定改为「跳到第 N 步」，
+   *  立即落库（graph_json 单键部分更新，qa 画布拖线同款姿势）。未传=把手不可连（旧行为）。 */
+  onBindJump?: (intentId: string, stepNo: number) => Promise<void> | void;
+  /** 点已连的跳步连线=解除该意图的全部绑定（意图/关键词保留）。未传=连线不可点。 */
+  onUnbindJump?: (intentId: string) => Promise<void> | void;
 }) {
   const { graph, draft } = props;
   const session = useSession();
@@ -439,10 +445,15 @@ export default function FlowCanvas(props: {
   );
   const uid = session?.user_id ?? "";
   const readOnly = Boolean(tplId) && !isManager && !(uid !== "" && String(props.tpl?.owner_user_id ?? "") === uid);
+  // 画布连线开关：回调在场且非只读才开把手（缺省=旧只读 overlay 零变化）。
+  const canBind = !readOnly && typeof props.onBindJump === "function";
+  const canUnbind = !readOnly && typeof props.onUnbindJump === "function";
 
   const [drawerIdx, setDrawerIdx] = useState<number | null>(null);
   const [parts, setParts] = useState<StepRefParts | null>(null);
   const [positions, setPositions] = useState<Record<string, { x: number; y: number }>>({});
+  // 容器尺寸就绪守门（error#004/#015）：见 JSX 内注释。
+  const sizedWrap = useSized<HTMLDivElement>();
   // 一键整理：实例句柄用于整理后重跑 fitView;fitRev>0 才触发（首渲染 fitView 交给
   // <ReactFlow fitView> prop,勿重复跑两次）。
   const instanceRef = useRef<ReactFlowInstance | null>(null);
@@ -517,12 +528,12 @@ export default function FlowCanvas(props: {
         if (n.kind === "step") {
           return {
             id: n.id, type: "flowStep" as const, position, deletable: false,
-            data: { ...n, onOpen: openDrawer },
+            data: { ...n, onOpen: openDrawer, bindable: canBind },
           };
         }
-        return { id: n.id, type: "flowIntent" as const, position, deletable: false, data: { ...n } };
+        return { id: n.id, type: "flowIntent" as const, position, deletable: false, data: { ...n, bindable: canBind } };
       }),
-    [layout, positions, openDrawer],
+    [layout, positions, openDrawer, canBind],
   );
   const edges: Edge[] = useMemo(
     () =>
@@ -551,14 +562,19 @@ export default function FlowCanvas(props: {
         return {
           id: e.id, source: e.source, target: e.target,
           sourceHandle: "r", targetHandle: "l",
-          selectable: false, deletable: false,
+          // 跳步连线可点（canUnbind 时）——点=解除该意图绑定;播完跳转/脊柱边恒不可点。
+          selectable: canUnbind,
+          deletable: false,
           label: e.label,
-          style: { stroke: "#d97706", strokeWidth: 1.8, strokeDasharray: "6 4" },
+          style: {
+            stroke: "#d97706", strokeWidth: 1.8, strokeDasharray: "6 4",
+            ...(canUnbind ? { cursor: "pointer" } : {}),
+          },
           labelStyle: { fill: "#92400e", fontSize: 10 },
           labelBgStyle: { fill: "#fef3c7" },
         };
       }),
-    [layout],
+    [layout, canUnbind],
   );
   // 受控图：只消化拖动位置（选择/删除一律吞——结构改动全走抽屉/宿主）。
   const onNodesChange = useCallback((changes: NodeChange[]) => {
@@ -575,6 +591,36 @@ export default function FlowCanvas(props: {
     });
   }, []);
 
+  // 画布连线（2026-09-26）：意图卡右圆点 → 步骤卡左圆点 = 该意图绑定改为「跳到第 N 步」。
+  // 非法端点（步→步/→意图等）静默忽略——把手只对意图(source)/步骤(target)开,拖不出去。
+  const onConnect = useCallback(
+    (conn: Connection) => {
+      const src = String(conn.source ?? "");
+      const tgt = String(conn.target ?? "");
+      if (!src.startsWith("fintent:") || !tgt.startsWith("fstep:")) return;
+      const intentId = src.slice("fintent:".length);
+      const idx = Number(tgt.slice("fstep:".length));
+      if (!Number.isInteger(idx) || idx < 0 || idx >= draft.length) return;
+      void props.onBindJump?.(intentId, idx + 1);
+    },
+    [draft.length, props.onBindJump],
+  );
+  // 点已连的跳步连线 = 解除该意图的全部绑定（意图/关键词保留;播完跳转边 source 同为
+  // fintent 但语义属 play_qa 链,解除会连播快答一起掉——统一文案明说,让操作员自己拿主意）。
+  const onEdgeClick = useCallback(
+    (_ev: unknown, edge: Edge) => {
+      if (!canUnbind) return;
+      // 只认「jump:」直连边——播完跳转（thenjump:）/脊柱线点击不解绑（语义不属于换绑）。
+      if (!String(edge.id ?? "").startsWith("jump:")) return;
+      const src = String(edge.source ?? "");
+      if (!src.startsWith("fintent:")) return;
+      const intentId = src.slice("fintent:".length);
+      if (!window.confirm(`解除「${edge.label ?? "该意图"}」的连线？解除后这条意图命中时只答话、不再跳步。`)) return;
+      void props.onUnbindJump?.(intentId);
+    },
+    [canUnbind, props.onUnbindJump],
+  );
+
   const drawerStep = drawerIdx !== null ? draft[drawerIdx] : undefined;
 
   return (
@@ -582,6 +628,11 @@ export default function FlowCanvas(props: {
       <div className="flex flex-wrap items-center gap-2">
         <span className="label">流程画布</span>
         <span className="text-[11px] muted">{canvasGuideText(hasIntents)}</span>
+        {canBind && (
+          <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] text-amber-700">
+            拖意图卡右侧圆点到步骤卡左侧＝设跳步；点连线＝解除
+          </span>
+        )}
         <button
           type="button"
           className="btn-ghost ml-auto px-2 py-0.5 text-xs"
@@ -615,23 +666,31 @@ export default function FlowCanvas(props: {
         </p>
       )}
       <div className="flex items-stretch gap-3">
-        <div className="h-[560px] min-w-0 flex-1 rounded-lg border border-(--card-border)">
-          <ReactFlow
-            nodes={nodes}
-            edges={edges}
-            nodeTypes={NODE_TYPES}
-            fitView
-            fitViewOptions={FIT_VIEW_OPTIONS}
-            minZoom={0.2}
-            deleteKeyCode={null}
-            onInit={(inst) => { instanceRef.current = inst; }}
-            onNodesChange={onNodesChange}
-            onEdgesChange={() => {}}
-          >
-            <Background gap={24} />
-            <Controls />
-            <MiniMap pannable zoomable />
-          </ReactFlow>
+        {/* 尺寸就绪才挂 ReactFlow（error#004/#015 官方修法）：容器量到非零宽高前渲染
+            空占位——挂载竞态期 0 尺寸=布局警告+节点量不到、拖拽即「not initialized」。 */}
+        <div ref={sizedWrap.ref} className="h-[560px] min-w-0 flex-1 rounded-lg border border-(--card-border)">
+          {sizedWrap.ready ? (
+            <ReactFlow
+              nodes={nodes}
+              edges={edges}
+              nodeTypes={NODE_TYPES}
+              fitView
+              fitViewOptions={FIT_VIEW_OPTIONS}
+              minZoom={0.2}
+              deleteKeyCode={null}
+              onInit={(inst) => { instanceRef.current = inst; }}
+              onNodesChange={onNodesChange}
+              onEdgesChange={() => {}}
+              onConnect={onConnect}
+              onEdgeClick={onEdgeClick}
+            >
+              <Background gap={24} />
+              <Controls />
+              <MiniMap pannable zoomable />
+            </ReactFlow>
+          ) : (
+            <div className="flex h-full items-center justify-center text-xs muted">画布加载中…</div>
+          )}
         </div>
         {drawerStep && parts && drawerIdx !== null && (
           <AnswerDrawer

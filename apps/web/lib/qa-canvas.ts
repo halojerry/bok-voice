@@ -205,6 +205,54 @@ export function intentJudgeField(judgeText: unknown): { prompt: string } | undef
   return prompt ? { prompt } : undefined;
 }
 
+// —— 画布连线（2026-09-26）：flow 画布 intent→step 拖线=改绑定，纯函数两枚 ——
+// 保存路径仍走 bindingFromDraft（字段纪律唯一入口）；替换绑定保留该意图现有绑定的
+// id/priority/once/enabled（只换动作与目标，不偷改运营调过的旋钮）。
+
+/** 意图→步骤 连线：该意图的全部绑定替换为单条 jump_step。意图不存在/步号越界 → null。 */
+export function graphDocWithJumpBinding(
+  raw: string | null | undefined,
+  intentId: string,
+  stepNo: number,
+  stepCount: number,
+): GraphDoc | null {
+  const doc = parseGraphDoc(raw);
+  if (!doc.intents.some((it) => it.id === intentId)) return null;
+  const max = Math.max(Math.round(Number(stepCount)) || 0, 1);
+  const n = Math.round(Number(stepNo));
+  if (!Number.isFinite(n) || n < 1 || n > max) return null;
+  const existing = doc.bindings.find((b) => b.intent === intentId);
+  const binding = bindingFromDraft(
+    {
+      id: String(existing?.id ?? `b-${intentId}-jump`),
+      action: "jump_step",
+      step: n,
+      priority: existing?.priority,
+      once: existing?.once,
+      enabled: existing?.enabled,
+    },
+    intentId,
+    stepCount,
+  );
+  return {
+    version: 1,
+    intents: doc.intents,
+    bindings: [...doc.bindings.filter((b) => b.intent !== intentId), binding],
+  };
+}
+
+/** 解除该意图的全部绑定（意图/关键词/判据保留——命中后只按命中语料答话，无动作）。
+ *  意图不存在 → null；本来就没有绑定 → 原样返回（幂等）。 */
+export function graphDocWithoutIntentBindings(
+  raw: string | null | undefined,
+  intentId: string,
+): GraphDoc | null {
+  const doc = parseGraphDoc(raw);
+  if (!doc.intents.some((it) => it.id === intentId)) return null;
+  if (!doc.bindings.some((b) => b.intent === intentId)) return doc;
+  return { version: 1, intents: doc.intents, bindings: doc.bindings.filter((b) => b.intent !== intentId) };
+}
+
 export type CanvasIntentNode = {
   id: string; type: "intent";
   position: Pt;
