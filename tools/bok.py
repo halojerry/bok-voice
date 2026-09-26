@@ -1191,21 +1191,34 @@ def _physical_mem_gib() -> float:
 
 def _default_prompt_cache_bytes() -> str:
     """:1235 prompt-cache-bytes 档位,三级优先级:① BOK_LLM_PROMPT_CACHE_BYTES 显式
-    覆盖(专家直设,最高);② BOK_DEMO_PRESET=1 演示/单通档 → 6GB(即便 48GB 机型也压到
-    6GB——V10 2026-09-26 实弹:12→6GB 单通无损,cached 命中 0.906→0.901、TTFT 噪声级,
-    省 6G 统一内存);③ 内存分档:≥32GB 机型 12GB(12GB 的价值只在 4-6 路并发——多路
-    并发会话前缀互不逐出,同人设/话术跨会话命中更高;M4 48GB 下 4k 前缀 KV 仅 ~134MB,
-    加档纯赚),16GB 机型维持 6GB。"""
+    覆盖(专家直设,最高);② BOK_DEMO_PRESET=1 演示/单通档 → 6GB;③ 内存分档:
+    ≥32GB 机型 6GB(2026-09-26 由 12GB 下调——全栈实测 47/48G 占用、压缩器扛
+    24G,12GB cache 灌满(111 序列/11.77GB)而每通真命中的只有自家 1555-token
+    前缀;V10 实弹 12→6GB 单通无损(cached 0.906→0.901、TTFT 噪声级),省 6G
+    统一内存直接卸压缩/换页压力——「多路并发跨会话命中」的价值在内存压力线下
+    到不了,理论收益让位实测压力),16GB 机型 6GB。要回 12GB:env 显式覆盖。"""
     override = os.environ.get("BOK_LLM_PROMPT_CACHE_BYTES", "").strip()
     if override:
         return override
-    if os.environ.get("BOK_DEMO_PRESET", "") == "1":
-        return "6GB"
-    return "12GB" if _physical_mem_gib() >= 32 else "6GB"
+    return "6GB"
+
+
+def _llm_queue_proxy_on() -> bool:
+    """:1235 优先级队列代理开关(2026-09-26 根治 mlx 解码争用,默认开;
+    BOK_LLM_QUEUE_PROXY=0 回旧拓扑=mlx 直跑 :1235 无代理)。开=mlx_lm 挪
+    内部 :1239,services/llm-mlx/queue_proxy.py 占公网口 :1235:生成请求
+    单并发排队、agent 回复(X-Bok-Lane: reply)插队,后台(settle/qa-cluster/
+    judge)不再与活通话首轮互抢 GPU 时间片。"""
+    return os.environ.get("BOK_LLM_QUEUE_PROXY", "1") == "1"
 
 
 def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
-    if healthy(1235):
+    # 队列代理拓扑下「健康」= 两级都在（:1235 代理 + :1239 mlx）——只探公网口会
+    # 把「代理活着、mlx 死了」的半瘫当健康跳过（2026-09-26 新拓扑配套）。
+    if _llm_queue_proxy_on() and is_mac():
+        if healthy(1235) and healthy(1239):
+            return
+    elif healthy(1235):
         return
     llm_model = model_path({**current, "llm": resolve_llm_repo(current)}, "llm")
     if is_mac():
@@ -1233,9 +1246,14 @@ def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
         # (llm.log);dev/mac serve 路径专用,生产 launchd 单元不从这里起 :1235,
         # 可用 BOK_LLM_LOG_LEVEL 回 WARNING。
         llm_log_level = os.environ.get("BOK_LLM_LOG_LEVEL", "INFO")
+        # 队列代理拓扑（2026-09-26 根治 mlx 解码争用,默认开）：mlx 挪内部 :1239、
+        # queue_proxy 占公网口 :1235（生成单并发+reply 插队;BOK_LLM_QUEUE_PROXY=0
+        # 回旧拓扑 mlx 直跑 :1235）。消费方（agent/CP/judge）env 一律 :1235 不动。
+        _queue_on = _llm_queue_proxy_on()
+        _mlx_port = "1239" if _queue_on else "1235"
         _start_proc(
             [str(llm_py), "-m", "mlx_lm", "server",
-             "--model", llm_model, "--host", "127.0.0.1", "--port", "1235",
+             "--model", llm_model, "--host", "127.0.0.1", "--port", _mlx_port,
              "--prompt-cache-size", "128",
              "--prompt-cache-bytes", _cache_bytes,
              "--prefill-step-size", "512",
@@ -1243,6 +1261,15 @@ def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
             run_dir / "llm.pid",
             log_dir / "llm.log",
         )
+        if _queue_on:
+            print("[bok] llm queue proxy :1235 -> mlx :1239 (reply lane priority)")
+            _start_proc(
+                [str(repo_python()), str(ROOT / "services" / "llm-mlx" / "queue_proxy.py")],
+                run_dir / "llm-proxy.pid",
+                log_dir / "llm-proxy.log",
+                env={"BOK_LLM_QUEUE_UPSTREAM": "http://127.0.0.1:1239",
+                     "BOK_LLM_QUEUE_HOST": "127.0.0.1", "BOK_LLM_QUEUE_PORT": "1235"},
+            )
         return
     # 非 mac（Windows/Linux）：llama.cpp 后端（GPU 必选；无 GPU 由 doctor 门禁阻止）。
     # Linux 档（2026-09-20 Ubuntu 节点）：runtime/llama/llama-server 或 PATH 提供。

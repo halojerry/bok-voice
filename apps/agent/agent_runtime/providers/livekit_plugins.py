@@ -370,6 +370,20 @@ class MlxLlmLLM(_OpenAICompatBase):
             ),
             extra_body=extra_body,
         )
+        # reply 车道标记（2026-09-26 根治 mlx 解码争用）：:1235 前置队列代理按
+        # X-Bok-Lane 分道——回复请求插队,后台消费者(settle/qa-cluster/judge)排队。
+        # 直连 mlx 时该头被无害忽略(mlx_lm 不读未知头),零拓扑耦合;与下方两个
+        # 调试包装同姿势(包 _client.chat.completions.create)。
+        _lane_client = self._client
+        _lane_raw = _lane_client.chat.completions.create
+
+        async def _lane_create(**kw):
+            headers = dict(kw.get("extra_headers") or {})
+            headers.setdefault("X-Bok-Lane", "reply")
+            kw["extra_headers"] = headers
+            return await _lane_raw(**kw)
+
+        _lane_client.chat.completions.create = _lane_create
         # BOK_LLM_MSG_DEBUG=1：逐请求消息指纹（sha1+长度+头尾片段），定位
         # 「缓存锚点后即分叉」是哪条消息每轮在变（W0 诊断工具，默认关）。
         if os.environ.get("BOK_LLM_MSG_DEBUG", "") == "1":

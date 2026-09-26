@@ -4189,6 +4189,15 @@ async def settle(call_id: str, request: Request) -> dict:
     return await _settle_core(call_id)
 
 
+# 挂断结算每通单飞（per-call single-flight，2026-09-25）：/settle 双发来源=
+# web 自动补结算与 agent _settle_core 直调并发到达，双双穿过函数头的 existing
+# 快路径（彼时谁都没落库）→ Summarizer 跑两遍（实测每遍 3.3-4.0s 本机 LLM），
+# 正好压住下一通通话的首轮 LLM 生成。锁条目结算完即清（finally），字典不泄漏；
+# setdefault 无需护锁——单线程事件循环内 check-then-set 之间无 await，天然
+# 原子（asyncio.Lock 创建廉价，再配一把总锁反而多余）。
+_SETTLE_LOCKS: dict[str, asyncio.Lock] = {}
+
+
 async def _settle_core(call_id: str) -> dict:
     """结算内核（无鉴权层）：HTTP 端点与 reaper 后台循环共用。
 
@@ -4196,138 +4205,156 @@ async def _settle_core(call_id: str) -> dict:
     被兜底 except 吞掉，僵尸通话/存量补结算从上线起一直空转（每轮打印
     reaper settle skipped 报 TypeError 即其痕迹）。鉴权留在端点壳，后台路径
     走本内核。
+
+    2026-09-25 并发双发单飞：per-call 锁串行化 + 锁内双检 existing——双发的
+    第二路等到锁时第一路多半已落库，直接短路，Summarizer 每通至多跑一遍。
+    锁外快路径保留旧幂等语义（串行补结算零锁开销）。web/agent 两侧调用
+    行为不动（双发保留），单飞在服务端吸收，双保险留给未来调用方。
     """
     existing = _repo().get_settlement(call_id)
     if existing:
         return existing
-    call = _repo().get_call(call_id)
-    if not call:
-        raise HTTPException(404, "call not found")
-    turns = _repo().get_turns(call_id)
-    if not turns:
-        # 回填（2026-09-07 审计闭环）：打断/强挂通话的轮次可能整批未落库
-        # （conversation_item_added 未及触发），但 SessionReport.chat_history
-        # 有权威快照——settle 时回填,保证「每通通话必有档案」。
-        backfilled = _backfill_turns_from_report(call_id, call.get("session_report") or "")
-        if backfilled:
+    lock = _SETTLE_LOCKS.setdefault(call_id, asyncio.Lock())
+    try:
+        async with lock:
+            # 双检（double-check）：等到锁时第一路可能已落库——直接吃它的
+            # 结果，绝不重跑 Summarizer。双发的第二路多从这里短路。
+            existing = _repo().get_settlement(call_id)
+            if existing:
+                return existing
+            call = _repo().get_call(call_id)
+            if not call:
+                raise HTTPException(404, "call not found")
             turns = _repo().get_turns(call_id)
-    from bok_voice_core.types import CallSession
+            if not turns:
+                # 回填（2026-09-07 审计闭环）：打断/强挂通话的轮次可能整批未落库
+                # （conversation_item_added 未及触发），但 SessionReport.chat_history
+                # 有权威快照——settle 时回填,保证「每通通话必有档案」。
+                backfilled = _backfill_turns_from_report(call_id, call.get("session_report") or "")
+                if backfilled:
+                    turns = _repo().get_turns(call_id)
+            from bok_voice_core.types import CallSession
 
-    session = CallSession(
-        id=call["id"],
-        account_id=call["account_id"],
-        object_id=call["object_id"],
-        persona_id=call.get("persona_id", ""),
-        mode=CallMode(call.get("mode", "simulation")),
-    )
-    result = app.state.settlement.build_result(session, turns)
-    # usage_records 落一笔（2026-09-07 审计闭环:表此前无写入者）。数据取自
-    # session_report 的真实 llm_usage(有)或轮数估算(无),重复 settle 幂等跳过
-    # ——写失败只告警不阻结算。
-    try:
-        from bok_voice_business_db.models import UsageRecord
-
-        # P1-A：跨「主列 + per-worker 历史列」逐份累加 llm_usage.total_tokens
-        # （B 线双 worker 各一份；单份旧数据行为不变）。坏 report 只丢该份不炸。
-        tokens = 0
-        for _report in _iter_call_reports(call):
-            try:
-                tokens += int((_report.get("llm_usage") or {}).get("total_tokens") or 0)
-            except Exception:
-                continue
-        if not tokens:
-            tokens = len(turns) * 300
-        if not _repo().get_usage_record(call_id):
-            _repo().session.add(
-                UsageRecord(
-                    id=f"usage:{call_id}",
-                    account_id=call["account_id"],
-                    call_id=call_id,
-                    provider="local",
-                    kind="call",
-                    units=len(turns),
-                    tokens=tokens,
-                    audio_seconds=0.0,
-                    latency_ms=0,
-                    cost_estimate=0.0,
-                    status="ok",
-                )
+            session = CallSession(
+                id=call["id"],
+                account_id=call["account_id"],
+                object_id=call["object_id"],
+                persona_id=call.get("persona_id", ""),
+                mode=CallMode(call.get("mode", "simulation")),
             )
-            _repo().session.commit()
-    except Exception as exc:  # pragma: no cover
-        print(f"[settle] usage_record write skipped: {exc!r}", flush=True)
-    # 总结/沉淀：用本机 LLM 生成总结正文 + 新话题 + 全局洞察（失败回退纯指标）。
-    # 可观测（2026-09-07）：单次尝试,仍空→审计事件 settle.distill_empty,
-    # 唔再静默吞掉（蒸馏覆盖率从此可查）。
-    try:
-        from .summarize import Summarizer
-
-        settings = _repo().get_settings()
-        # P1-4（2026-09-16 深测）：Summarizer.build 是同步 httpx 调用（原 timeout
-        # 60s×2 次重试），直接跑在 async 路由=事件循环整体冻结——黑洞 LLM 实测
-        # /health 59.4s 停摆（turns 上报/心跳/token 全部停摆）。挪工作线程+单次
-        # 尝试；蒸馏失败由审计 settle.distill_empty 可观测。
-        summ = await asyncio.to_thread(Summarizer().build, turns, call, settings)
-        if not (summ.get("summary") or "").strip() and turns:
-            _audit("settle.distill_empty", subject_type="call", subject_id=call_id,
-                   detail={"turns": len(turns)})
-        # 对象级滚动摘要（专项 B2 v1:结构化拼接,LLM 增量润色为后续增强）
-        if (summ.get("summary") or "").strip() and call.get("object_id"):
+            result = app.state.settlement.build_result(session, turns)
+            # usage_records 落一笔（2026-09-07 审计闭环:表此前无写入者）。数据取自
+            # session_report 的真实 llm_usage(有)或轮数估算(无),重复 settle 幂等跳过
+            # ——写失败只告警不阻结算。
             try:
-                from datetime import datetime as _dt
+                from bok_voice_business_db.models import UsageRecord
 
-                obj = _repo().get_object(call["object_id"])
-                if obj is not None:
-                    prev = str(obj.get("digest") or "").strip()
-                    entry = f"- {_dt.now().strftime('%Y-%m-%d')}：{summ['summary'].strip()[:150]}"
-                    merged = (prev + "\n" + entry).strip()
-                    lines = merged.splitlines()
-                    _repo().update_object_digest(call["object_id"], "\n".join(lines[-10:]))
+                # P1-A：跨「主列 + per-worker 历史列」逐份累加 llm_usage.total_tokens
+                # （B 线双 worker 各一份；单份旧数据行为不变）。坏 report 只丢该份不炸。
+                tokens = 0
+                for _report in _iter_call_reports(call):
+                    try:
+                        tokens += int((_report.get("llm_usage") or {}).get("total_tokens") or 0)
+                    except Exception:
+                        continue
+                if not tokens:
+                    tokens = len(turns) * 300
+                if not _repo().get_usage_record(call_id):
+                    _repo().session.add(
+                        UsageRecord(
+                            id=f"usage:{call_id}",
+                            account_id=call["account_id"],
+                            call_id=call_id,
+                            provider="local",
+                            kind="call",
+                            units=len(turns),
+                            tokens=tokens,
+                            audio_seconds=0.0,
+                            latency_ms=0,
+                            cost_estimate=0.0,
+                            status="ok",
+                        )
+                    )
+                    _repo().session.commit()
             except Exception as exc:  # pragma: no cover
-                print(f"[settle] digest merge skipped: {exc!r}", flush=True)
-        if summ.get("summary"):
-            result["summary"] = summ["summary"]
-        else:
-            result["summary"] = ""
-        result["new_topics"] = summ.get("new_topics", [])
-        insight = summ.get("insight")
-        if insight:
-            saved = _repo().append_global_insight({**insight, "kind": "insight"})
-            result["global_insight_id"] = saved.get("id", "")
-        if result.get("new_topics"):
-            _repo().append_object_topics(call["object_id"], call["account_id"], result["new_topics"])
-    except Exception as exc:  # pragma: no cover - summarizer must not break settle
-        print(f"[settle] summarizer failed: {exc!r}", flush=True)
-    _write_settlement_docs(call, turns, result)
-    # 蒸馏入库（可检索 knowledge）：自动沉淀经验，供后续通话引用。
-    await _write_distill_knowledge(call, result)
-    _repo().append_settlement(call_id, result)
-    _audit(
-        "settle.create",
-        subject_type="call",
-        subject_id=call_id,
-        detail={"status": result.get("status", ""), "turns": len(turns), "has_summary": bool(result.get("summary"))},
-    )
-    # 挂断自动短信（W5-T1 骨架，默认关）：enabled+hangup_enabled 且有号码才发；
-    # 号码=call.contact_phone，空则 object.phone 兜底（同 digest 段读法）。模板
-    # hangup_template 支持 {contact} 占位=收件号码。二次 settle 在函数头被
-    # existing 短路，天然不重发。失败只打点绝不破 settle（照 summarizer 段
-    # 「must not break settle」先例）。
-    try:
-        sms_cfg = _sms_settings()
-        if _sms_configured(sms_cfg) and sms_cfg.get("hangup_enabled"):
-            phone = str(call.get("contact_phone") or "").strip()
-            if not phone and call.get("object_id"):
-                obj = _repo().get_object(call["object_id"])
-                phone = str((obj or {}).get("phone") or "").strip()
-            template = str(sms_cfg.get("hangup_template") or "").strip()
-            if phone and template:
-                status_code = await _send_sms_webhook(sms_cfg, phone, template.replace("{contact}", phone))
-                _audit("sms.send", subject_type="sms", subject_id=call_id,
-                       call_id=call_id, detail={"chars": len(template), "status_code": status_code, "source": "hangup"})
-    except Exception as exc:  # pragma: no cover - sms hook must not break settle
-        print(f"[settle] sms hook failed: {exc!r}", flush=True)
-    return _repo().get_settlement(call_id) or result
+                print(f"[settle] usage_record write skipped: {exc!r}", flush=True)
+            # 总结/沉淀：用本机 LLM 生成总结正文 + 新话题 + 全局洞察（失败回退纯指标）。
+            # 可观测（2026-09-07）：单次尝试,仍空→审计事件 settle.distill_empty,
+            # 唔再静默吞掉（蒸馏覆盖率从此可查）。
+            try:
+                from .summarize import Summarizer
+
+                settings = _repo().get_settings()
+                # P1-4（2026-09-16 深测）：Summarizer.build 是同步 httpx 调用（原 timeout
+                # 60s×2 次重试），直接跑在 async 路由=事件循环整体冻结——黑洞 LLM 实测
+                # /health 59.4s 停摆（turns 上报/心跳/token 全部停摆）。挪工作线程+单次
+                # 尝试；蒸馏失败由审计 settle.distill_empty 可观测。
+                summ = await asyncio.to_thread(Summarizer().build, turns, call, settings)
+                if not (summ.get("summary") or "").strip() and turns:
+                    _audit("settle.distill_empty", subject_type="call", subject_id=call_id,
+                           detail={"turns": len(turns)})
+                # 对象级滚动摘要（专项 B2 v1:结构化拼接,LLM 增量润色为后续增强）
+                if (summ.get("summary") or "").strip() and call.get("object_id"):
+                    try:
+                        from datetime import datetime as _dt
+
+                        obj = _repo().get_object(call["object_id"])
+                        if obj is not None:
+                            prev = str(obj.get("digest") or "").strip()
+                            entry = f"- {_dt.now().strftime('%Y-%m-%d')}：{summ['summary'].strip()[:150]}"
+                            merged = (prev + "\n" + entry).strip()
+                            lines = merged.splitlines()
+                            _repo().update_object_digest(call["object_id"], "\n".join(lines[-10:]))
+                    except Exception as exc:  # pragma: no cover
+                        print(f"[settle] digest merge skipped: {exc!r}", flush=True)
+                if summ.get("summary"):
+                    result["summary"] = summ["summary"]
+                else:
+                    result["summary"] = ""
+                result["new_topics"] = summ.get("new_topics", [])
+                insight = summ.get("insight")
+                if insight:
+                    saved = _repo().append_global_insight({**insight, "kind": "insight"})
+                    result["global_insight_id"] = saved.get("id", "")
+                if result.get("new_topics"):
+                    _repo().append_object_topics(call["object_id"], call["account_id"], result["new_topics"])
+            except Exception as exc:  # pragma: no cover - summarizer must not break settle
+                print(f"[settle] summarizer failed: {exc!r}", flush=True)
+            _write_settlement_docs(call, turns, result)
+            # 蒸馏入库（可检索 knowledge）：自动沉淀经验，供后续通话引用。
+            await _write_distill_knowledge(call, result)
+            _repo().append_settlement(call_id, result)
+            _audit(
+                "settle.create",
+                subject_type="call",
+                subject_id=call_id,
+                detail={"status": result.get("status", ""), "turns": len(turns), "has_summary": bool(result.get("summary"))},
+            )
+            # 挂断自动短信（W5-T1 骨架，默认关）：enabled+hangup_enabled 且有号码才发；
+            # 号码=call.contact_phone，空则 object.phone 兜底（同 digest 段读法）。模板
+            # hangup_template 支持 {contact} 占位=收件号码。二次 settle 在函数头被
+            # existing 短路，天然不重发。失败只打点绝不破 settle（照 summarizer 段
+            # 「must not break settle」先例）。
+            try:
+                sms_cfg = _sms_settings()
+                if _sms_configured(sms_cfg) and sms_cfg.get("hangup_enabled"):
+                    phone = str(call.get("contact_phone") or "").strip()
+                    if not phone and call.get("object_id"):
+                        obj = _repo().get_object(call["object_id"])
+                        phone = str((obj or {}).get("phone") or "").strip()
+                    template = str(sms_cfg.get("hangup_template") or "").strip()
+                    if phone and template:
+                        status_code = await _send_sms_webhook(sms_cfg, phone, template.replace("{contact}", phone))
+                        _audit("sms.send", subject_type="sms", subject_id=call_id,
+                               call_id=call_id, detail={"chars": len(template), "status_code": status_code, "source": "hangup"})
+            except Exception as exc:  # pragma: no cover - sms hook must not break settle
+                print(f"[settle] sms hook failed: {exc!r}", flush=True)
+            return _repo().get_settlement(call_id) or result
+    finally:
+        # 只清自己那把：本路收尾前后可能有后来者 setdefault 了新锁，误删会令
+        # 后续双检失效（防泄漏的同时不误伤）。
+        if _SETTLE_LOCKS.get(call_id) is lock:
+            del _SETTLE_LOCKS[call_id]
 
 
 @app.get("/api/objects")
