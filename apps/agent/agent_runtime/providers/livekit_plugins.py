@@ -5569,6 +5569,16 @@ def _late_final_guard_on() -> bool:
     return os.environ.get("BOK_LATE_FINAL_GUARD", "1") == "1"
 
 
+def _late_final_hotword_guard_on() -> bool:
+    """词表幻听否决层总门（默认开；0=整层否决不评估，行为回 F2 现状）。
+
+    AI 忙时停嘴 finish 整窗重解把词表热词抄成独立迟到 FINAL（「打错电话。」
+    恰好整条是词表词、4 字连「极短追加」门都够不着）会掐断在播罐头——本层
+    只否决「按词表贪心剥离后严格为空」的尾巴，真插话必有词表外残留照放行。
+    """
+    return os.environ.get("BOK_LATE_FINAL_HOTWORD_GUARD", "1") == "1"
+
+
 def _late_final_max_tail_chars() -> int:
     """「极短追加」字数上限（BOK_LATE_FINAL_MAX_TAIL_CHARS，默认 2，地板 1）。
 
@@ -5580,6 +5590,32 @@ def _late_final_max_tail_chars() -> int:
         return 2
 
 
+def _vocab_only_net(net: str, vocab_terms) -> bool:
+    """净文按词表贪心最长匹配剥离后**严格为空**（整条全由词表词首尾相接组成）。
+
+    归一口径与 `_vocab_words_from_context`/`_to_simp` 同款（逐词剥标点+繁→简，
+    两侧同表归一）；词表入参=流级 `_vocab_terms`（`_parse_vocab_terms` 反解的
+    原始 token）。判定核与 `_is_hotword_vocab_echo` 同款贪心取最长命中，但无
+    总长下限（「打错电话」4 字也要拦）、判「整条全覆盖」而非回声顺串。"""
+    terms: set[str] = set()
+    for t in vocab_terms or ():
+        w = re.sub(r"[^\w\u4e00-\u9fff]+", "", _to_simp(str(t or "")))
+        if w:
+            terms.add(w)
+    if not terms:
+        return False
+    remaining = re.sub(r"[^\w\u4e00-\u9fff]+", "", _to_simp(str(net or "")))
+    if not remaining:
+        return False
+    ordered = sorted(terms, key=len, reverse=True)
+    while remaining:
+        hit = next((w for w in ordered if remaining.startswith(w)), None)
+        if hit is None:
+            return False  # 有一段唔係词表词 → 真人话,唔拦
+        remaining = remaining[len(hit):]
+    return True
+
+
 def late_final_is_new_speech(
     payload: str,
     committed: str,
@@ -5587,6 +5623,7 @@ def late_final_is_new_speech(
     agent_busy: bool,
     max_tail_chars: int = 2,
     closing_say: bool = False,
+    vocab_terms: tuple = (),
 ) -> bool:
     """迟到 finish 尾巴是否够格当新客户话（纯函数，单测用）。
 
@@ -5599,6 +5636,11 @@ def late_final_is_new_speech(
       听感），数字零降级在此窗让位；
     - 净文（去标点空白）为空 → False（空/纯标点永不成轮）；
     - 数字/字母 run ≥2 → True（数字零降级：补报单号永远送达）；
+    - 词表幻听 hotword_only（AI 忙+净文无数字字母 run+按词表贪心最长匹配
+      剥离后严格为空）→ False：停嘴整窗重解把词表热词抄成独立迟到 FINAL
+      （「打错电话。」恰好整条是词表词，4 字连「极短追加」门都够不着，却
+      会掐断在播罐头）——真插话剥后必有词表外残留（「打错电话啊」剩「啊」），
+      照放行；
     - AI 未在生成/播报 → True（无回复可掐，维持带内容短尾豁免旧行为）；
     - 净文长 > max_tail_chars → True（足够长=真新话）；
     - 其余（AI 忙+极短追加）→ False。
@@ -5610,6 +5652,13 @@ def late_final_is_new_speech(
         return False
     if re.search(r"[0-9A-Za-z]{2,}", norm):
         return True
+    # 词表幻听否决层（hotword_only）：AI 忙 + 净文无数字/字母 run（上一行已
+    # 放行带 run 的尾巴，数字零降级豁免同 L5611 口径）+ 按词表贪心最长匹配
+    # 剥离后严格为空 → 整条只是词表词顺串的重解幻听，唔成轮唔打断。刻意比
+    # F3 的「剩余 ≤2 字」严：只认剥后严格为空，真插话「打错电话啊」（剩
+    # 「啊」）照放行。vocab_terms 默认空=层短路，逐字节旧行为。
+    if agent_busy and vocab_terms and _vocab_only_net(norm, vocab_terms):
+        return False
     if not agent_busy:
         return True
     return len(norm) > max_tail_chars
@@ -6161,15 +6210,26 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                     # closing_say 窗（F4 二修）：在播的係收线台词时任何长度都丢弃。
                     if payload and committed_before and _late_final_guard_on():
                         _cs = _closing_say_active(self._stt_)
+                        # 词表幻听否决层（hotword_only）词表：流级 _vocab_terms
+                        # 已在 __init__ 从 _hotword_context 反解好（注意挂在流
+                        # 包装层 self 上，不在 _stt_）；kill-switch 关=传空=层
+                        # 不评估。
+                        _vt = (
+                            getattr(self, "_vocab_terms", ())
+                            if _late_final_hotword_guard_on()
+                            else ()
+                        )
                         if _cs or not late_final_is_new_speech(
                             payload,
                             committed_before,
                             agent_busy=bool(getattr(self._stt_, "_reply_busy", False)),
                             max_tail_chars=_late_final_max_tail_chars(),
+                            vocab_terms=_vt,
                         ):
+                            _hw = bool(_vt) and _vocab_only_net(payload, _vt)
                             print(
                                 f"QWEN3_ASR_LATE_FINAL_DROP reason="
-                                f"{'closing_say' if _cs else 'tail_append'} "
+                                f"{'closing_say' if _cs else 'tail_append' if not _hw else 'hotword_only'} "
                                 f"committed={committed_before!r} tail={payload!r}",
                                 flush=True,
                             )
@@ -6250,15 +6310,25 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         # 长度都丢弃。
         if payload and committed_before and _late_final_guard_on():
             _cs = _closing_say_active(self._stt_)
+            # 词表幻听否决层（hotword_only）词表：流级 self._vocab_terms（__init__
+            # 反解位，不在 _stt_ 上）；kill-switch 关=传空=层不评估（与 _run
+            # 停嘴分支同一把尺）。
+            _vt = (
+                getattr(self, "_vocab_terms", ())
+                if _late_final_hotword_guard_on()
+                else ()
+            )
             if _cs or not late_final_is_new_speech(
                 payload,
                 committed_before,
                 agent_busy=bool(getattr(self._stt_, "_reply_busy", False)),
                 max_tail_chars=_late_final_max_tail_chars(),
+                vocab_terms=_vt,
             ):
+                _hw = bool(_vt) and _vocab_only_net(payload, _vt)
                 print(
                     f"QWEN3_ASR_LATE_FINAL_DROP reason="
-                    f"{'closing_say' if _cs else 'tail_append'} "
+                    f"{'closing_say' if _cs else 'tail_append' if not _hw else 'hotword_only'} "
                     f"committed={committed_before!r} tail={payload!r}",
                     flush=True,
                 )

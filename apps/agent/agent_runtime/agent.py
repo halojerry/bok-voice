@@ -1176,6 +1176,44 @@ def _watchdog_extend(state: dict, spawn, extra_s: float, now: float) -> bool:
     return True
 
 
+def _watchdog_synth_extend_reason(
+    pending_fn: object, arm_time: float, synth_extended: bool, session: object
+) -> str:
+    """在途合成顺延判据(纯逻辑可单测,同 _watchdog_extend 注入式):返回顺延
+    理由/""。两路——
+    - "tts_pending":回复 TTS 流已开(起点晚于本轮武装时刻)且首音频未到;
+    - "thinking":pending 信号为 0/缺席但 session.agent_state=="thinking"
+      (官方值=回复管线在途且零音频)。LLM 本体生成中=TTS 未接、pending 恒 0,
+      首判据够不着——jump 腿慢 LLM(tps 6.5-11)触发轮回复 3.9-4.5s 恰过 4s
+      闸被 force-interrupt 掐成 watchdog-ack。LLM 在途=TTS 未接=慢非死火
+      (tps 方差实证 0920 批自身 3.2-15.2)。
+    两路沿用同一 synth_extended 旗(一次性,arm 复位)与同一顺延窗——真死火只
+    多等一窗,兜底路径不变;TTS 路先判(流已开时 thinking 不参与,互斥)。
+    ext<=0(BOK_RESPONSE_WATCHDOG_SYNTH_EXT_S=0 kill-switch)一律 ""=直通
+    interrupt,零新 env。pending/agent_state 全防御:信号口异常、fake/duck
+    无属性、状态口异常一律按无在途处理。
+    """
+    _ext = _response_watchdog_synth_ext_s()
+    if synth_extended or _ext <= 0:
+        return ""
+    pending = 0.0
+    if callable(pending_fn):
+        try:
+            pending = float(pending_fn() or 0.0)
+        except Exception:  # noqa: BLE001 - 信号口异常按无在途处理
+            pending = 0.0
+    if pending > arm_time:
+        return "tts_pending"
+    if pending == 0.0:
+        try:
+            state = str(getattr(session, "agent_state", "") or "")
+        except Exception:  # noqa: BLE001 - 状态口异常按无在途处理
+            state = ""
+        if state == "thinking":
+            return "thinking"
+    return ""
+
+
 def _has_first_audio_signal(provider: object) -> bool:
     """provider 是否带首音频信号口(D2,2026-09-20):看门狗拆弹与垫话撤表/扣压
     接线都挂这个接口——CachedTTS 与薄透传 _FirstAudioTTS 都有,裸 MiniMax/
@@ -2801,23 +2839,28 @@ async def entrypoint(ctx):
         # 在途合成顺延(2026-09-26 call-ec075023):回复 TTS 流已开、首音频未到
         # = 慢而非死火——顺延一窗等真回复出声,别把临界真回复掐成 ack。真死火
         # (流开了永不流)只多等一窗,兜底路径不变。
-        _pending_s = getattr(tts_provider, "reply_stream_pending_since", None)
-        if callable(_pending_s) and not _watchdog["synth_extended"]:
-            try:
-                _started = float(_pending_s() or 0.0)
-            except Exception:  # noqa: BLE001 - 信号口异常按无在途处理
-                _started = 0.0
-            if _started > _watchdog.get("arm_time", 0.0):
-                _ext = _response_watchdog_synth_ext_s()
-                if _ext > 0:
-                    _watchdog["synth_extended"] = True
-                    _watchdog["deadline"] = time.monotonic() + _ext
-                    print(
-                        f"[watchdog] synth in flight (no first audio yet) -> extend +{_ext:.0f}s (call {room_name})",
-                        flush=True,
-                    )
-                    _watchdog["task"] = asyncio.create_task(_watchdog_fire(_ext))
-                    return
+        # 2026-09-25 二判据(reason="thinking"):LLM 本体生成中=TTS 未接、pending
+        # 恒 0,74ddbaf 的首判据只在 TTS 流开后为真、此处够不着——jump 腿慢 LLM
+        # (tps 6.5-11)触发轮回复 3.9-4.5s 恰过 4s 闸被掐成 watchdog-ack。慢非
+        # 死火(0920 批 tps 方差自身 3.2-15.2),沿用同一 synth_extended 旗与同一
+        # 顺延窗再判一次;真死火只多等一窗。零新 env:BOK_RESPONSE_WATCHDOG_SYNTH_
+        # EXT_S=0 仍是整段 kill-switch(kill 时二判据同灭,直通 interrupt)。
+        _ext_reason = _watchdog_synth_extend_reason(
+            getattr(tts_provider, "reply_stream_pending_since", None),
+            float(_watchdog.get("arm_time", 0.0)),
+            bool(_watchdog.get("synth_extended", False)),
+            session,
+        )
+        if _ext_reason:
+            _ext = _response_watchdog_synth_ext_s()  # 判据口已挡 kill,此处恒 >0
+            _watchdog["synth_extended"] = True
+            _watchdog["deadline"] = time.monotonic() + _ext
+            print(
+                f"[watchdog] synth in flight (no first audio yet) reason={_ext_reason} -> extend +{_ext:.0f}s (call {room_name})",
+                flush=True,
+            )
+            _watchdog["task"] = asyncio.create_task(_watchdog_fire(_ext))
+            return
         # W4-T2 意向账本:真触发才计数(拆弹/未武装不计)——「哑轮频发」信号。
         _facts["watchdog_fired"] += 1
         print(

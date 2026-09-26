@@ -1664,6 +1664,10 @@ _FORWARD_ENV = (
     #    极短追加 finish 尾巴=重解幻听,不成轮不打断快路/直念回复) ——
     "BOK_LATE_FINAL_GUARD",
     "BOK_LATE_FINAL_MAX_TAIL_CHARS",
+    # —— hotword_only 否决层(2026-09-25:AI 忙时停嘴整窗重解把词表热词抄成独立
+    #    迟到 FINAL 掐断在播罐头;按词表贪心剥离后严格为空才否决;0=整层不评估,
+    #    行为回 F2 现状) ——
+    "BOK_LATE_FINAL_HOTWORD_GUARD",
     "BOK_QA_MATCH_THRESHOLD",
     # —— 垫话/罐头/TTS 缓存 ——
     "BOK_FILLER",
