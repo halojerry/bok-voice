@@ -633,8 +633,10 @@ export default function StepCanvasView(props: {
       )}
       <div className="flex items-stretch gap-3">
         {/* StepRail 自身渲染 w-full（列内自适应）——横向两栏里给它一个定宽 shrink-0
-            容器,否则它的 100% flex-basis 会把右侧 flex-1 画布挤塌成零宽。 */}
-        <div className="w-60 shrink-0">
+            容器,否则它的 100% flex-basis 会把右侧 flex-1 画布挤塌成零宽。
+            高度钉画布同高 600：步列超出在列内滚动（加步不改页面总高,2026-09-26
+            Ethan 反馈「整个画面被顶得很长」）;加一步按钮随列滚,不悬浮。 */}
+        <div className="flex h-[600px] w-60 shrink-0 flex-col">
           <StepRail
             rail={rail}
             current={currentStep}

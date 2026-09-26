@@ -22,8 +22,12 @@ export default function StepRail(props: {
   onAddStep?: () => void;
 }) {
   const { rail, current, onSelect, readOnly, onAddStep } = props;
+  // 列表区自身滚动（真机实测：步一多整列把页面顶得很长——2026-09-26 Ethan 反馈）。
+  // 不写死高度：滚不滚动由父容器决定（画布侧钉 600px 同高,列超出即出滑块;
+  // 无高度约束的嵌入方保持自然高度零变化）。min-h-0 是 flex 子项允许收缩到内容
+  // 以下的前提,没有它 overflow 永不触发。
   return (
-    <nav className="flex w-full flex-col gap-2" aria-label="步骤导航">
+    <nav className="flex min-h-0 w-full flex-1 flex-col gap-2 overflow-y-auto pr-1" aria-label="步骤导航">
       {rail.length === 0 && <p className="text-sm muted">还没有步骤</p>}
       {rail.map((item) => {
         const isCurrent = item.stepNo === current;
