@@ -16,8 +16,11 @@ state 压到 ≤600 字（实测 384 tok 内判读正常）且**客户原话置�
 截没）。宁短勿长。
 
 env 读取面（须入 tools/bok.py `_FORWARD_ENV`——D14 教训，由 bok 侧立法）：
-- `BOK_LAYA_JUDGE`：总闸，默认 "0"=零调用零日志零变化（enabled 闸在最外层）；
-- `BOK_LAYA_SIDECAR_URL`：sidecar 基址，默认 http://127.0.0.1:8791。
+- `BOK_LAYA_JUDGE`：意图快判总闸，默认 "0"=零调用零日志零变化（enabled 闸在最外层）；
+- `BOK_LAYA_SIDECAR_URL`：sidecar 基址，默认 http://127.0.0.1:8791；
+- `BOK_LAYA_QA`：QA 复核车道总闸，默认 "0"=零调用零变化（与意图闸独立立法）；
+- `BOK_LAYA_QA_TIMEOUT_MS`：QA 判定预算，默认 300ms；
+- `BOK_LAYA_QA_P`：QA 命中概率门，默认 0.85。
 """
 
 from __future__ import annotations
@@ -170,14 +173,20 @@ class LayaJudgeClient:
         criteria: Sequence[str],
         *,
         timeout_s: float = DEFAULT_DECIDE_TIMEOUT_S,
+        qid: str = "intent",
+        skip_gate: bool = False,
     ) -> dict | None:
         """单问封装：choice 面=`criteria`（缺 NONE 自动补）。任何异常/超时/坏形 → None。
 
         返回 dict：{"choice","confidence","below_floor","probabilities",
         "state_truncated"}——below_floor 透传 sidecar 旗；缺席时按 confidence_floor
         本地补算。choice 不在候选面（含 NONE）=坏形 → None（宁可回落，绝不乱命中）。
+
+        - `qid`：问题键（意图车道默认 "intent"；姊妹车道用自带键如 "qa_match"）；
+        - `skip_gate`：姊妹车道自带 env 总闸时置 True 跳过 BOK_LAYA_JUDGE 复检
+          （闸责任归调用方单点化，两把闸独立立法）——健康缓存/坏形防御不豁免。
         """
-        if not laya_judge_enabled():
+        if not skip_gate and not laya_judge_enabled():
             return None
         face = [str(c or "").strip() for c in (criteria or []) if str(c or "").strip()]
         if not face:
@@ -187,7 +196,6 @@ class LayaJudgeClient:
         ok, _reason = await self.ensure_health()
         if not ok:
             return None
-        qid = "intent"
         payload = {
             "state": str(state or ""),
             "questions": {
@@ -432,3 +440,162 @@ async def pick_intent_laya(
     return LayaPickResult(
         verdict="hit", answer=ans, ms=ms, intents=len(choices), choices=choices
     )
+
+
+# ---- QA 验证车道（2026-09-26，第二落位：qa fastpath 词面未中轮复核）----
+#
+# 实测纪律（多选一面概率锐利 0.99+、二元 match/no_match 面偏糊）：**只用多选一
+# 形状**——召回 top-K 词条做候选面，一次 decide 多选一。短 state（成本驱动是
+# state 长度）：客户原话置头 + 当前步 goal 一行，**不带会话史**。车道闸
+# `BOK_LAYA_QA` 默认 "0"=零调用零变化；fail-open 铁律同意图车道：off/空候选/
+# 健康失败/判定失败/坏形一律回落旧路（QA_SEM/LLM），绝不抛。
+
+# 召回面参数：K 与地板的**单点在 qa_gate（qa_recall_k()/qa_recall_floor()，
+# env BOK_QA_RECALL_K/BOK_QA_RECALL_FLOOR）**——本模块只保留候选面容量上限
+# （+NONE 自动补=9 顶格）。2026-09-25 审计：废除本处常量副本防双源漂移。
+QA_MAX_CANDIDATES = 8
+# 短 state 预算（LAYA-EVAL §2：超 1024 token 静默截尾，原话放尾部会被截没）。
+QA_STATE_MAX_CHARS = 300
+QA_GOAL_MAX_CHARS = 60
+# 选项描述（question_text）截断。
+QA_OPTION_TEXT_MAX = 40
+
+# BOK_LAYA_QA_TIMEOUT_MS 默认 300ms（多选一单问实测 15-40ms，300ms≈7 倍余量）。
+DEFAULT_QA_TIMEOUT_S = 0.3
+# BOK_LAYA_QA_P 命中概率门：hit/none 都要 p 过门才算数（命中乱播与拒绝翻案
+# 都比落旧路贵——门下一律 fail-open 落 QA_SEM）。
+DEFAULT_QA_HIT_P = 0.85
+
+
+def laya_qa_enabled() -> bool:
+    """QA 复核车道总闸（默认关）：`BOK_LAYA_QA=="1"` 才启用——零变化的结构性保证。"""
+    return os.environ.get("BOK_LAYA_QA", "0") == "1"
+
+
+def qa_timeout_s() -> float:
+    """判定预算（毫秒→秒）；缺省/坏值/非正数/inf/nan 回默认 0.3s。"""
+    raw = str(os.environ.get("BOK_LAYA_QA_TIMEOUT_MS", "") or "").strip()
+    try:
+        ms = float(raw)
+    except ValueError:
+        return DEFAULT_QA_TIMEOUT_S
+    if not (0.0 < ms < 1e9):
+        return DEFAULT_QA_TIMEOUT_S
+    return ms / 1000.0
+
+
+def qa_hit_floor_p() -> float:
+    """命中概率门；缺省/坏值/越界（≤0 或 >1，含 nan）回默认 0.85。"""
+    raw = str(os.environ.get("BOK_LAYA_QA_P", "") or "").strip()
+    try:
+        p = float(raw)
+    except ValueError:
+        return DEFAULT_QA_HIT_P
+    if not (0.0 < p <= 1.0):
+        return DEFAULT_QA_HIT_P
+    return p
+
+
+def build_qa_state(user_text: str, step_goal: str) -> list[str]:
+    """短 state（纯函数）：客户原话置头 + 当前步 goal 一行，**不带会话史**。
+
+    QA 复核语义上只需「客户问什么 + 现在聊到哪步」——历史只会添乱加钱
+    （实测：成本驱动是 state 长度）。返回行表（decide 前由调用方 join）。
+    """
+    utt = " ".join(str(user_text or "").split())
+    if len(utt) > QA_STATE_MAX_CHARS // 2:
+        utt = utt[: QA_STATE_MAX_CHARS // 2]
+    lines = [f"客户原话：{utt}"]
+    goal = " ".join(str(step_goal or "").split())
+    if goal:
+        if len(goal) > QA_GOAL_MAX_CHARS:
+            goal = goal[:QA_GOAL_MAX_CHARS]
+        lines.append(f"当前流程：{goal}")
+    return lines
+
+
+def build_qa_instructions(entries: Sequence[dict]) -> str:
+    """choice 问题的 instructions（纯函数）：候选词条问法表进 instructions，criteria 只放 id。
+
+    语义=判定客户问句与哪条词条同义（快答库匹配域）；选项描述=question_text
+    截 ≤40 字。标准书面中文（prompt 语言纯度铁律——该文本无条件进判定请求）。
+    """
+    lines = [
+        "根据客户刚说的话，从候选知识库词条中选出与他所问问题同义的一条；",
+        "只按问题含义判断，不要凭编号猜测；全部不贴合时选 NONE。候选词条：",
+    ]
+    for e in entries:
+        eid = str((e or {}).get("id") or "")
+        q = " ".join(str((e or {}).get("question_text") or "").split())
+        if len(q) > QA_OPTION_TEXT_MAX:
+            q = q[:QA_OPTION_TEXT_MAX]
+        lines.append(f"- {eid}｜问法 {q or '(无)'}")
+    return "\n".join(lines)
+
+
+_QA_OFF: dict = {"verdict": "off", "choice": "", "p": 0.0, "conf": 0.0}
+_QA_UNAVAILABLE: dict = {"verdict": "unavailable", "choice": "", "p": 0.0, "conf": 0.0}
+
+
+async def decide_qa_match(
+    state_lines: list[str],
+    candidates: list[dict],
+    *,
+    client: LayaJudgeClient | None = None,
+    enabled: bool | None = None,
+) -> dict:
+    """QA 复核单问（模块级入口，离线可测）。返回**原始面**：
+
+    {"verdict": hit|none|abstain|off|unavailable, "choice": str, "p": float,
+    "conf": float}——hit=choice 命中候选且未 below_floor；none=choice==NONE 且
+    未 below_floor（高置信拒绝）；abstain=below_floor（置信门不裁边界案）；
+    off=总闸关（默认档，零调用）；unavailable=空候选/健康失败/判定失败/坏形
+    响应（客户端 fail-open 已兜，合并归因）。p=胜者面概率（probabilities 缺席
+    回退 confidence）；conf=sidecar confidence。候选超 QA_MAX_CANDIDATES 截前
+    8；任何异常一律 unavailable（消费方落 QA_SEM，绝不抛）。
+    """
+    if enabled is None:
+        enabled = laya_qa_enabled()
+    if not enabled:
+        return dict(_QA_OFF)
+    try:
+        face: list[dict] = []
+        seen: set[str] = set()
+        for e in candidates or []:
+            eid = str((e or {}).get("id") or "").strip()
+            if not eid or eid in seen:
+                continue
+            seen.add(eid)
+            face.append(e)
+            if len(face) >= QA_MAX_CANDIDATES:
+                break
+        if not face:
+            return dict(_QA_UNAVAILABLE)
+        cli = client if client is not None else default_client()
+        ans = await cli.decide_choice(
+            "\n".join(str(line or "") for line in (state_lines or [])),
+            build_qa_instructions(face),
+            [str(e.get("id") or "") for e in face],
+            timeout_s=qa_timeout_s(),
+            qid="qa_match",
+            skip_gate=True,  # 车道闸=BOK_LAYA_QA（上方），不复检 BOK_LAYA_JUDGE
+        )
+        if ans is None:
+            return dict(_QA_UNAVAILABLE)
+        choice = str(ans.get("choice") or "")
+        conf = float(ans.get("confidence") or 0.0)
+        probs = ans.get("probabilities")
+        raw_p = probs.get(choice) if isinstance(probs, dict) else None
+        try:
+            p = float(raw_p)
+        except (TypeError, ValueError):
+            p = conf
+        if ans.get("below_floor"):
+            verdict = "abstain"
+        elif choice == "NONE":
+            verdict = "none"
+        else:
+            verdict = "hit"
+        return {"verdict": verdict, "choice": choice, "p": p, "conf": conf}
+    except Exception:  # noqa: BLE001 - fail-open：一切异常=unavailable（落旧路）
+        return dict(_QA_UNAVAILABLE)

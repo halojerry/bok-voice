@@ -17,6 +17,12 @@ BOK_QA_SEMANTIC=0 一键回纯词面档)。
 折组/轮换池**绝不比 match 的命中面宽**(C1,2026-09-18 终审):代表与成员表
 都按本通 `lang`/`step_index` 过滤(= match 同款判据 `_survives_turn`),跨
 scope 变体唔会在异步出线、跨语言成员唔会在本语通话播——整簇滤光回裸胜者。
+
+召回排序 ``QaIndex.rank()``(2026-09-25,Laya QA 验证车道候选供给):与 0.90
+快道**完全独立**的评分面——0.60×词面余弦 + 0.25×双向子串(镜像 fillers 的
+双向姿势,治「超集句」单向缺口)+ 0.15×拼音 bigram Dice(治 ASR 同音错字,
+pypinyin 缺库/``BOK_QA_PINYIN=0`` 时通道恒 0、余两项按比例归一)。幸存面与
+折组纪律同 match;``match()`` 本体零改动。
 """
 
 from __future__ import annotations
@@ -26,6 +32,12 @@ import os
 
 from bok_voice_core.embeddings import HybridLexicalEmbedding
 from bok_voice_core.qa_text import normalize_question
+
+try:  # pypinyin 纯 Python 轻依赖;缺失时 rank 拼音通道静默降级为恒 0 分
+    from pypinyin import lazy_pinyin
+except ImportError:  # pragma: no cover - 取决于安装面
+    lazy_pinyin = None  # type: ignore[assignment]
+    print("QA_PINYIN unavailable: pypinyin 未安装,召回排序拼音通道恒 0 分")
 
 # 允许走快路的 rule_verdict:确认/含糊/提问(QUESTION 仅限 FAQ 条目命中)。
 # REFUSE/OBJECTION 让位(收线/安抚需要临场生成);推进轮由调用方传 advanced 拦。
@@ -51,6 +63,32 @@ def qa_priority_enabled() -> bool:
 def qa_rotation_enabled() -> bool:
     """多答案轮换开关(Phase 3.2):0=回裸索引竞争者档(变体自己赢、播自己的答案)。"""
     return os.environ.get("BOK_QA_ROTATION", "1") == "1"
+
+
+def qa_pinyin_enabled() -> bool:
+    """召回拼音通道开关(rank 专用,2026-09-25):0=通道权重置 0,余两项按
+    0.60/0.25 比例归一;只影响召回排序,0.90 词面快道字节不变。"""
+    return os.environ.get("BOK_QA_PINYIN", "1") == "1"
+
+
+def qa_recall_k() -> int:
+    """rank 默认召回条数(BOK_QA_RECALL_K,坏值回 8,下限 1)。"""
+    try:
+        return max(1, int(os.environ.get("BOK_QA_RECALL_K", "8")))
+    except ValueError:
+        return 8
+
+
+def qa_recall_floor() -> float:
+    """rank 默认分数地板(BOK_QA_RECALL_FLOOR,坏值回 0.40,钳 [0,1])。
+
+    0.40=golden 标定拐点(scripts/qa_match_report.py floor sweep):adjacent 负样本
+    入侵 0/20 档的最大召回(0.35 档 1/20、0.55 档丢 6pt 召回)。
+    """
+    try:
+        return max(0.0, min(1.0, float(os.environ.get("BOK_QA_RECALL_FLOOR", "0.40"))))
+    except ValueError:
+        return 0.40
 
 
 def qa_semantic_enabled() -> bool:
@@ -111,6 +149,42 @@ def _cos(a: list[float], b: list[float]) -> float:
     na = sum(x * x for x in a) ** 0.5
     nb = sum(y * y for y in b) ** 0.5
     return num / max(1e-9, na * nb)
+
+
+# rank() 召回权重(2026-09-25):词面余弦主导,双向子串次之,拼音补同音错字。
+_W_COS = 0.60
+_W_SUB = 0.25
+_W_PINYIN = 0.15
+
+
+def _bidir_substring_hit(q_low: str, e_low: str) -> bool:
+    """双向子串命中(rank 专用):归一化后 客户话⊂词条 或 词条⊂客户话 任一向
+    即真——镜像 fillers.py 的双向姿势(单向只认 user⊂entry 会漏「超集句」)。"""
+    return bool(q_low) and bool(e_low) and (q_low in e_low or e_low in q_low)
+
+
+def _pinyin_syllables(text: str) -> list[str]:
+    """文本→无声调拼音音节表;只留 a-z 音节(lazy_pinyin 会透传标点,滤掉防
+    垃圾 bigram)。pypinyin 缺失/单条转换失败 → 空表(通道分恒 0,绝不 raise)。"""
+    if lazy_pinyin is None:
+        return []
+    try:
+        raw = lazy_pinyin(text)
+    except Exception:  # noqa: BLE001 - 单条转换失败当无拼音
+        return []
+    return [s for s in raw if s.isascii() and s.isalpha()]
+
+
+def _pinyin_bigram_score(query_syl: list[str], entry_syl: list[str]) -> float:
+    """拼音二元音节对重叠 Dice 系数 2|A∩B|/(|A|+|B|);任一侧 <2 音节 → 0。"""
+    if len(query_syl) < 2 or len(entry_syl) < 2:
+        return 0.0
+    q_big = {query_syl[i] + query_syl[i + 1] for i in range(len(query_syl) - 1)}
+    e_big = {entry_syl[i] + entry_syl[i + 1] for i in range(len(entry_syl) - 1)}
+    inter = len(q_big & e_big)
+    if not inter:
+        return 0.0
+    return 2.0 * inter / (len(q_big) + len(e_big))
 
 
 def pick_rotation_member(members: list[dict], played: list[str]) -> dict:
@@ -191,6 +265,15 @@ class QaIndex:
         self._clusters: dict[str, list[dict]] = {}
         self._cluster_of: dict[str, str] = {}
         self._build_clusters()
+        # 拼音通道预计算(rank 召回专用,2026-09-25):词条侧每词条一次,查询侧
+        # 每次现算。match() 不吃拼音(0.90 快道字节不变);缺库时表恒空=通道 0。
+        # 按条目 id 键控;rank 取不到(空 id/重复 id)时现场补算兜底。
+        self._pinyin: dict[str, list[str]] = {}
+        if lazy_pinyin is not None:
+            for e, _q, _v in self._items:
+                eid = str(e.get("id") or "")
+                if eid and eid not in self._pinyin:
+                    self._pinyin[eid] = _pinyin_syllables(str(e.get("question_text") or ""))
 
     def _build_clusters(self) -> None:
         by_id = {str(e.get("id") or ""): e for e, _q, _v in self._items}
@@ -296,6 +379,75 @@ class QaIndex:
         if best is not None:
             return best, best_score
         return None, top_score
+
+    def rank(
+        self,
+        query: str,
+        *,
+        k: int | None = None,
+        floor: float | None = None,
+        lang: str | None = None,
+        step_index: int | None = None,
+    ) -> list[tuple[float, str]]:
+        """召回排序(Laya QA 验证车道候选供给,2026-09-25)。
+
+        返回 (score, entry_id) 降序、≤k 条、score≥floor。评分与 match() 的
+        0.90 快道**完全独立**(match 本体零改动):
+
+          _W_COS × 词面余弦(复用 HybridLexicalEmbedding 同一套向量)
+        + _W_SUB × 双向子串(归一化后任一向命中即 1.0,双向同义)
+        + _W_PINYIN × 拼音 bigram Dice(ASR 同音错字补位;pypinyin 缺库或
+          ``BOK_QA_PINYIN=0`` 时该项置 0,余两项按 0.60/0.25 比例归一——
+          即 0.706/0.294,比例恒由权重常量推导,不另硬编码)。
+
+        幸存面与 match 同口径:``_survives_turn(lang, step_index)`` 过滤 +
+        同义簇折组——变体命中折到簇代表 team_head 出线(与 match 胜者同纪律,
+        同簇多命中只留最高分一行);``BOK_QA_ROTATION=0`` 折组关 → 独立条目。
+
+        ``k``/``floor`` 显式传入优先;缺省(None)读 ``BOK_QA_RECALL_K``/
+        ``BOK_QA_RECALL_FLOOR``(坏值回 8 / 0.40)。空查询/空索引 → []。
+        """
+        q = normalize_question(query)
+        if not q or not self._items:
+            return []
+        n = qa_recall_k() if k is None else max(1, int(k))
+        thr = qa_recall_floor() if floor is None else max(0.0, min(1.0, float(floor)))
+        use_pinyin = qa_pinyin_enabled() and lazy_pinyin is not None
+        w_cos, w_sub, w_pin = _W_COS, _W_SUB, _W_PINYIN
+        if not use_pinyin:
+            rest = _W_COS + _W_SUB
+            w_cos, w_sub, w_pin = _W_COS / rest, _W_SUB / rest, 0.0
+        qv = self._embed.embed([q])[0]
+        q_low = q.lower()
+        q_syl = _pinyin_syllables(q) if use_pinyin else []
+        # 同簇多命中只留最高分一行:按代表 dict 对象身份去重(代表可能为空 id,
+        # 对象身份在调用期内稳定且跨簇唯一)。
+        best_by_rep: dict[int, tuple[float, str]] = {}
+        for entry, _e_q, e_vec in self._items:
+            if not _survives_turn(entry, lang=lang or "", step_index=step_index):
+                continue
+            e_q_low = str(entry.get("question_text") or "")
+            e_q_low = normalize_question(e_q_low).lower()
+            score = w_cos * _cos(qv, e_vec)
+            if _bidir_substring_hit(q_low, e_q_low):
+                score += w_sub
+            if use_pinyin:
+                e_syl = self._pinyin.get(str(entry.get("id") or ""))
+                if e_syl is None:
+                    e_syl = _pinyin_syllables(e_q_low)
+                score += w_pin * _pinyin_bigram_score(q_syl, e_syl)
+            rep = entry
+            if qa_rotation_enabled():
+                head = self._team_head(entry, lang=lang or "", step_index=step_index)
+                if head is not None:
+                    rep = head
+            rid = id(rep)
+            prev = best_by_rep.get(rid)
+            if prev is None or score > prev[0]:
+                best_by_rep[rid] = (score, str(rep.get("id") or ""))
+        rows = [(s, eid) for s, eid in best_by_rep.values() if s >= thr]
+        rows.sort(key=lambda t: -t[0])  # 稳定排序:平分保持插入序(=索引序)
+        return rows[:n]
 
     def _team_head(
         self,
@@ -448,3 +600,49 @@ class QaSemanticIndex:
         if best is None:
             return None, top, ""
         return best, best_score, ""
+
+    async def rank(
+        self,
+        user_text: str,
+        *,
+        k: int = 3,
+        floor: float = 0.60,
+        lang: str = "",
+        step_index: int | None = None,
+    ) -> list[tuple[float, str]]:
+        """语义召回 top-k（Laya QA 验证车道的第二召回腿，2026-09-25 审计补）。
+
+        golden 标定实证：改写/同音族的真实 miss 形态是「换词+同音叠加」，
+        词面 rank 的拼音通道只救得动近逐字同音——语义余弦才是释义档的天然
+        召回层。与 match() 同判据（``_survives_turn`` 单点）、同一份素材向量，
+        但**不过 0.80 出场阈值**：floor（默认 0.60）是召回地板，精度交给
+        Laya 精判车道。车道不可用（no_embedder/timeout/空面）=空列表
+        （fail-open，调用方当池空，绝不炸）。返回 (cos, entry_id) 降序 ≤k。
+        """
+        from .intent_semantic import _cosines
+
+        q = normalize_question(user_text)
+        if not q or not self._items:
+            return []
+        if self._client is None or self._client.dead:
+            return []
+        qv = await self._client.embed([q])
+        if qv is None:
+            return []
+        entries: list[dict] = []
+        rows: list[list[float]] = []
+        for e, _q, vec in self._items:
+            if _survives_turn(e, lang=lang, step_index=step_index):
+                entries.append(e)
+                rows.append(vec)
+        if not rows:
+            return []
+        coss = _cosines(qv[0], rows)
+        scored = [
+            (float(c), str(e.get("id") or ""))
+            for e, c in zip(entries, coss)
+            if c >= floor and e.get("id")
+        ]
+        scored.sort(key=lambda t: t[0], reverse=True)
+        return scored[:k]
+

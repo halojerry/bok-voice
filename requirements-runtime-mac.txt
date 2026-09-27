@@ -18,3 +18,6 @@ mlx-audio==0.5.0
 mlx-lm==0.31.3
 # transformers 由 mlx-audio(>=5.14.0)/mlx-lm(>=5.0.0) 解析，不手动钉版本。
 sentencepiece>=0.2
+# QA 召回拼音通道(qa_gate.rank,2026-09-25):同音错字补位,纯 Python 零模型;
+# 缺库时通道静默降级 0 分(import 容错),与 apps/agent[livekit] extra 同步。
+pypinyin>=0.53,<1

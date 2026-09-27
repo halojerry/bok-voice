@@ -28,6 +28,9 @@ livekit = [
   "websockets>=13,<15",
   # Local Qwen3 ASR/TTS sidecars are called over HTTP.
   "httpx>=0.27,<1",
+  # QA 召回拼音通道(qa_gate.rank,2026-09-25):同音错字补位,纯 Python 零模型。
+  # import 容错——缺库时通道静默降级 0 分,不阻断装配。
+  "pypinyin>=0.53,<1",
 ]
 
 [tool.hatch.build.targets.wheel]

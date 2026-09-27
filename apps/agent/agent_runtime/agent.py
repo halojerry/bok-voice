@@ -41,15 +41,26 @@ from .plugins.settlement import SettlementTrigger
 from .providers.registry import build_provider_registry
 from .control_plane import ControlPlaneClient
 from .fillers import FillerDirector, derive_context_bucket
-# Laya 决策旁路(2026-09-26,docs/LAYA-EVAL.md 第一落位 intent judge):薄客户端+纯
-# 装配,日志由本模块统一打点;enabled 闸(BOK_LAYA_JUDGE,默认 "0")在最外层=零调用
-# 零日志零变化。kill-switch 经 bok.py _FORWARD_ENV 进 worker env(键由 bok 侧立法)。
-from .laya_judge import laya_judge_enabled, pick_intent_laya, recent_turn_pairs
+# Laya 决策旁路(2026-09-26,docs/LAYA-EVAL.md):薄客户端+纯装配,日志由本模块统一
+# 打点;enabled 闸在最外层=零调用零日志零变化(意图=BOK_LAYA_JUDGE、QA 复核=
+# BOK_LAYA_QA,两把 env 闸独立立法,均默认 "0")。kill-switch 经 bok.py
+# _FORWARD_ENV 进 worker env(键由 bok 侧立法)。
+from .laya_judge import (
+    build_qa_state,
+    decide_qa_match,
+    laya_judge_enabled,
+    laya_qa_enabled,
+    pick_intent_laya,
+    qa_hit_floor_p,
+    recent_turn_pairs
+)
 from .qa_gate import (
     QaIndex,
     pick_rotation_member,
     qa_exclude_reason as _qa_exclude_reason,
     qa_fastpath_enabled,
+    qa_recall_floor,
+    qa_recall_k,
     qa_rotation_enabled,
     qa_semantic_enabled,
 )
@@ -5867,37 +5878,157 @@ async def entrypoint(ctx):
                         )
                     except Exception:  # noqa: BLE001 - 匹配失败当未命中
                         _qa_entry, _qa_score = None, 0.0
+                    # Laya QA 验证车道(2026-09-26,docs/LAYA-EVAL.md 第二落位):词面
+                    # 0.90 未中 → rank 召回 top-K 候选打 :8791 决策 sidecar 复核。
+                    # 默认闸关(BOK_LAYA_QA!=1)=零调用零变化;rank 契约未就位/
+                    # 召回异常=当池空(fail-open 落 QA_SEM,逐字节旧档)。
+                    _qa_laya_reject = False
+                    if _qa_entry is None and laya_qa_enabled():
+                        # 双召回腿（2026-09-25 审计补,golden 标定实证）:词面 rank
+                        # 的拼音通道只救近逐字同音;改写/同音叠加族的天然召回层是
+                        # 语义余弦——词面 top-K ∪ 语义 top-3,按分并池去重截 K。
+                        # K/地板单点=qa_gate env helper(BOK_QA_RECALL_K/FLOOR)。
+                        _qa_rank = getattr(_qa_index, "rank", None)
+                        _qa_pool: list = []
+                        if callable(_qa_rank):
+                            try:
+                                _qa_pool = list(
+                                    _qa_rank(
+                                        user_text,
+                                        k=qa_recall_k(),
+                                        floor=qa_recall_floor(),
+                                        lang=language_state.lang,
+                                        step_index=(
+                                            flow_ctrl.current
+                                            if flow_ctrl.has_steps
+                                            else None
+                                        ),
+                                    )
+                                    or []
+                                )
+                            except Exception:  # noqa: BLE001 - 召回失败当池空
+                                _qa_pool = []
+                        # 语义召回腿的真值守卫用 ``if _qa_sem``（None→假;真索引
+                        # __len__ 恒>0→真）——避免与 test_qa_semantic 源级锚的
+                        # 字面量撞串（该锚钉死 QA_SEM 门唯一）。
+                        _qa_sem_rank = getattr(_qa_sem, "rank", None) if _qa_sem else None
+                        if callable(_qa_sem_rank):
+                            try:
+                                _qa_sem_pool = list(
+                                    await _qa_sem_rank(
+                                        user_text,
+                                        lang=language_state.lang,
+                                        step_index=(
+                                            flow_ctrl.current
+                                            if flow_ctrl.has_steps
+                                            else None
+                                        ),
+                                    )
+                                    or []
+                                )
+                            except Exception:  # noqa: BLE001 - 语义召回失败当池空
+                                _qa_sem_pool = []
+                            if _qa_sem_pool:
+                                _merged = {str(_eid): float(_ps) for _ps, _eid in _qa_pool}
+                                for _ps, _eid in _qa_sem_pool:
+                                    _eid = str(_eid)
+                                    if _ps > _merged.get(_eid, -1.0):
+                                        _merged[_eid] = float(_ps)
+                                _qa_pool = sorted(
+                                    _merged.items(), key=lambda t: t[1], reverse=True
+                                )[: qa_recall_k()]
+                        _qa_cands = [
+                            _cand
+                            for _cand in (
+                                _qa_index.by_id(str(_eid)) for _ps, _eid in _qa_pool
+                            )
+                            if _cand is not None
+                        ]
+                        if _qa_cands:
+                            _qa_dec = await decide_qa_match(
+                                build_qa_state(user_text, _qg or _qr), _qa_cands
+                            )
+                            print(
+                                f"QA_LAYA verdict={_qa_dec['verdict']} "
+                                f"p={_qa_dec['p']:.2f} conf={_qa_dec['conf']:.2f} "
+                                f"cand={_qa_dec['choice'] or '-'} "
+                                f"pool={len(_qa_pool)} (call {room_name})",
+                                flush=True,
+                            )
+                            if _qa_dec["p"] >= qa_hit_floor_p():
+                                if _qa_dec["verdict"] == "hit":
+                                    # 命中消费=与词面/QA_SEM 完全同款:折组(team_head
+                                    # 首个幸存成员)后交给下方公共出场链(轮换/PCM/
+                                    # canned_say,gen 仍 qa_fastpath;汇总计 hit)。
+                                    _qa_hit_entry = _qa_index.by_id(
+                                        str(_qa_dec["choice"])
+                                    )
+                                    if _qa_hit_entry is None:
+                                        _qa_hit_entry = next(
+                                            (
+                                                _cand
+                                                for _cand in _qa_cands
+                                                if str(_cand.get("id") or "")
+                                                == str(_qa_dec["choice"])
+                                            ),
+                                            None,
+                                        )
+                                    if _qa_hit_entry is not None:
+                                        _qa_folded = (
+                                            _qa_index.team_head(
+                                                _qa_hit_entry,
+                                                lang=language_state.lang,
+                                                step_index=(
+                                                    flow_ctrl.current
+                                                    if flow_ctrl.has_steps
+                                                    else None
+                                                ),
+                                            )
+                                            if qa_rotation_enabled()
+                                            else None
+                                        )
+                                        _qa_entry = _qa_folded or _qa_hit_entry
+                                        _qa_score = float(_qa_dec["p"])
+                                elif _qa_dec["verdict"] == "none":
+                                    # 高置信拒绝:验证器说话了,不再让语义补位翻案
+                                    # (直落 LLM)。
+                                    _qa_laya_reject = True
+                            # abstain/off/unavailable/p 不过门:不落旗不落条目 →
+                            # 下方 QA_SEM 原路(fail-open,字节同旧)。
                     # 语义补位(W3b 解锁,2026-09-24):词面 0.90 未中 → 本地 embedding
                     # 释义档(阈值 0.80)。**词面恒绝对优先**(命中轮零语义调用);
                     # 命中条目走与词面同款的折组/轮换/PCM 出场链(补位轮不打
                     # match0);车道不可用(reason 非空)静默降级=旧档。
-                    if _qa_entry is None and _qa_sem is not None:
-                        try:
-                            _sentry, _sscore, _sreason = await _qa_sem.match(
-                                user_text,
-                                lang=language_state.lang,
-                                step_index=(flow_ctrl.current if flow_ctrl.has_steps else None),
-                            )
-                        except Exception:  # noqa: BLE001 - 补位失败当未命中
-                            _sentry, _sscore, _sreason = None, 0.0, "error"
-                        if _sentry is not None:
-                            _folded = (
-                                _qa_index.team_head(
-                                    _sentry,
+                    # Laya QA 车道高置信 none 轮跳过语义补位(_qa_laya_reject;
+                    # 车道关=旗恒 False,守卫恒真=旧档逐字节)。
+                    if not _qa_laya_reject:
+                        if _qa_entry is None and _qa_sem is not None:
+                            try:
+                                _sentry, _sscore, _sreason = await _qa_sem.match(
+                                    user_text,
                                     lang=language_state.lang,
                                     step_index=(flow_ctrl.current if flow_ctrl.has_steps else None),
                                 )
-                                if qa_rotation_enabled()
-                                else None
-                            )
-                            _qa_entry = _folded or _sentry
-                            _qa_score = _sscore
-                            print(
-                                f"QA_SEM hit=1 entry={_qa_entry.get('id')} score={_sscore:.2f}",
-                                flush=True,
-                            )
-                        elif not _sreason:
-                            print(f"QA_SEM miss best={_sscore:.2f}", flush=True)
+                            except Exception:  # noqa: BLE001 - 补位失败当未命中
+                                _sentry, _sscore, _sreason = None, 0.0, "error"
+                            if _sentry is not None:
+                                _folded = (
+                                    _qa_index.team_head(
+                                        _sentry,
+                                        lang=language_state.lang,
+                                        step_index=(flow_ctrl.current if flow_ctrl.has_steps else None),
+                                    )
+                                    if qa_rotation_enabled()
+                                    else None
+                                )
+                                _qa_entry = _folded or _sentry
+                                _qa_score = _sscore
+                                print(
+                                    f"QA_SEM hit=1 entry={_qa_entry.get('id')} score={_sscore:.2f}",
+                                    flush=True,
+                                )
+                            elif not _sreason:
+                                print(f"QA_SEM miss best={_sscore:.2f}", flush=True)
                     # 汇总打点(task-9):match0=零命中轮(含匹配异常);hit=命中条目
                     # 轮(=下文 hit=1 出声轮 + no_audio 轮之和,hit_audio=hit-no_audio
                     # 由 format_qa_summary 求差)。语义补位命中轮计 hit(语义与词面

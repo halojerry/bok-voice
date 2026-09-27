@@ -1668,6 +1668,15 @@ _FORWARD_ENV = (
     "BOK_QA_SEM_THRESHOLD",
     "BOK_QA_SEM_BASE_URL",
     "BOK_QA_SEM_TIMEOUT_MS",
+    # 匹配端根治（2026-09-25 三刀）：召回通道（双向子串+拼音）与 Laya QA 验证车道。
+    # 全部默认保守：PINYIN=1 只影响召回排序（词面 0.90 快道字节不变）；LAYA_QA 默认 0
+    # =整条车道零调用零变化。
+    "BOK_QA_PINYIN",
+    "BOK_QA_RECALL_K",
+    "BOK_QA_RECALL_FLOOR",
+    "BOK_LAYA_QA",
+    "BOK_LAYA_QA_TIMEOUT_MS",
+    "BOK_LAYA_QA_P",
     # —— Laya 决策 sidecar(:8791,2026-09-26):意图/流程判定 10ms 快路。总闸
     #    BOK_LAYA_JUDGE(serve 默认 "0" 不随栈拉起;="1" 且模型在盘才起;sidecar
     #    侧同闸双保险,"0" 时 /v1/decide 一律 503)与端点覆盖(缺省 127.0.0.1:8791;
