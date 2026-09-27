@@ -2926,8 +2926,14 @@ async def entrypoint(ctx):
         垫话 out-of-band 出声框架不可见,watchdog 唔拆弹——开播即把截止推后
         BOK_RESPONSE_WATCHDOG_FILLER_EXT_S(默认 2s,一次性),「垫话盖耳+系统
         慢」轮唔好被 4s 闸 force-interrupt 掉在途真回复。旗标语义见
-        _watchdog_extend(未武装/已拆弹/已顺延过一律不动)。"""
+        _watchdog_extend(未武装/已拆弹/已顺延过一律不动)。
+        按需第二发(reshot,2026-09-25):第二发开播时首轮垫话的 extended 旗已
+        耗——复位后重走 _watchdog_extend,第二发 ~1-2s 出声窗同样享一次性顺延,
+        防 4s 闸把在播的第二发掐成 watchdog-ack(每轮至多两延:首发一延+第二发
+        一延;顺延失败/未武装照旧无害)。"""
         ext = _response_watchdog_filler_ext_s() if extra_s is None else extra_s
+        if _filler.reshot_firing():
+            _watchdog["extended"] = False
         _watchdog_extend(
             _watchdog,
             # lambda 产物被 _watchdog_extend 内 state["task"] = spawn(...) 强引用

@@ -21,13 +21,27 @@
    source='auto-digest'；幂等=find_existing_qa_entry 同 question+lang 已存在即跳过；
    审计逐条 qa_entry.create + 一条 qa.auto_adopt 汇总；采纳成功作废该账号 dry
    计划缓存（与 apply_cluster 同纪律）。
-⑤ drift 自动动作：复用 ``qa_drift.build_qa_drift_report`` 纯计算（零 SQL 复制）→
-   never_asked（词条龄≥14d）/ digits_bypass / repeat_after_play 三类 →
-   ``enabled=False``（**禁用可逆，不删**）；never_asked 龄不足 / never_fired
-   不自动。审计 qa_entry.update detail.source=auto-digest；已禁用行不重复。
-⑥ 同音表：miss 问法（count≥2，且与现有词条词面互不包含=「不沾」）× 现有词条 →
-   策略层 ``mine_homophones`` → support≥2 的对子 UPSERT 进 qa_homophones
-   （support 取 max(旧,新)）。审计 qa.homophone_learn 一条汇总。
+⑤ drift 反馈（2026-09-25 VectorQ 化，语义从「只禁用」升级为每词条阈值）：复用
+   ``qa_drift.build_qa_drift_report`` 纯计算（零 SQL 复制）——
+   - never_asked（龄≥14d + 终身零命中守卫）/ digits_bypass →
+     ``enabled=False``（**禁用可逆，不删**）；never_asked 龄不足不自动；
+   - repeat_after_play → **一升二禁**：``hit_threshold`` 步升 +0.03（缺省按
+     全局档 0.80 起算，顶格 0.95）；顶格仍 repeat → 才 ``enabled=False``
+     （原语义=首犯即禁，现在给词条一次自证机会，保守度只升不降）；
+   - 回落：被升过的词条（hit_threshold 非 NULL）窗口内 fired>0（清白命中=
+     快答真播出去且没被复问）→ 步降 -0.02，回到全局档 0.80 写 NULL（回全局）。
+   审计 qa_entry.update detail.source=auto-digest，阈值动作带 old/new；
+   已禁用行不重复；当轮刚升过的词条不参与回落（同窗既有 repeat 证据又衰减
+   自相矛盾）。
+⑥ 同音表（一期词面 + 二期语义锚定）：miss 问法（count≥2，且与现有词条词面
+   互不包含=「不沾」）× 现有词条 → 一期 ``mine_homophones``（整句距离=1）
+   + 二期 ``mine_homophones_semantic``（语义同族 cos≥0.75 前提下按逐字拼音
+   序列块对齐取「裴/赔」族，sims 由本模块 embed 客户端批量算——
+   ``BOK_EMBED_BASE_URL`` 覆盖端点、默认本机 :8789 bge 侧车；**不可达/失败
+   → 二期跳过记 run error，一期词面路径照跑**；词条向量按 (id, question)
+   进程内缓存）→ 两路结果按 (wrong,right) 合并（support 取大）→ support≥2
+   的对子 UPSERT 进 qa_homophones（support 取 max(旧,新)）。
+   审计 qa.homophone_learn 一条汇总。
 ⑦ pregen：本轮有采纳 → 复用 ``pregen.qa_pregen_spawn`` 子进程姿势（与
    POST /api/qa/pregen 同一入口）；失败只记 error 不回滚采纳。
 ⑧ 落 qa_digest_runs 行（各步骤计数；finished_at=下一次挖掘的水位）。
@@ -76,6 +90,25 @@ AUTO_SOURCE = "auto-digest"  # 引擎采纳行的 source 盖章（运行时匹�
 DIGEST_INTERVAL_S = 600.0  # 循环间隔；BOK_QA_DIGEST_INTERVAL_S 可覆盖
 MIN_HOMOPHONE_SUPPORT = 2  # 同音对子入库的支持数下限
 NEVER_ASKED_MIN_AGE_DAYS = 14  # never_asked 自动禁用的词条龄下限
+
+# ---- VectorQ 每词条自适应阈值（2026-09-25，生产端；消费端=agent qa_gate 逐
+# 条目读 entry["hit_threshold"]，NULL=用全局默认）。误差驱动的单调调参：
+# 误命中证据（repeat_after_play=播了快答客户又问）单调上调，顶格仍犯才禁用；
+# 清白命中（窗口 fired>0 且无 repeat 提案）步降回落，回到全局档写 NULL。
+HIT_THRESHOLD_DEFAULT = 0.80  # 全局默认档（QA_SEM 语义补位档）
+HIT_THRESHOLD_STEP = 0.03  # repeat_after_play 一次升幅
+HIT_THRESHOLD_CAP = 0.95  # 顶格；顶格仍 repeat → 禁用
+HIT_THRESHOLD_DECAY = 0.02  # 清白命中一次降幅
+HIT_THRESHOLD_FLOOR = 0.80  # 回落下限（=全局档；触底写 NULL）
+
+# ---- 二期语义锚定 embed 客户端（services/bge-embed-sidecar，OpenAI 兼容）----
+# POST {base}/v1/embeddings {"input": [texts...]} → {"data":[{"index","embedding"}]}
+# GET {base}/health。CP 不 import agent_runtime，httpx 直调；失败/不可达 →
+# 二期跳过（一期词面路径照跑），错误记 run error 不炸轮。
+ENV_EMBED_BASE_URL = "BOK_EMBED_BASE_URL"
+_EMBED_DEFAULT_BASE = "http://127.0.0.1:8789"
+_EMBED_TIMEOUT_S = 4.0  # 闲时循环：慢侧车不值得等
+_EMBED_MAX_CACHE = 4096  # 词条向量进程内缓存上限（超限整体清空，防无界）
 
 # 聚类挖掘参数（与 HTTP dry 档独立）：min_calls=2 让同音步拿得到 count≥2 的
 # miss 问法；limit 与端点同钳 100。
@@ -444,6 +477,179 @@ def _entry_age_days(row: dict, now: datetime | None = None) -> float:
     return max(0.0, (now - created).total_seconds() / 86400.0)
 
 
+# ---- ⑥ 二期 embed 客户端（bge 侧车 :8789，OpenAI 兼容 /v1/embeddings）----
+
+
+def embed_base_url() -> str:
+    """embed 侧车基址：``BOK_EMBED_BASE_URL`` 覆盖，缺省本机 :8789。"""
+    raw = os.environ.get(ENV_EMBED_BASE_URL, "").strip()
+    return (raw or _EMBED_DEFAULT_BASE).rstrip("/")
+
+
+def _embed_vectors(
+    texts: list[str], *, base_url: str = "", timeout: float = _EMBED_TIMEOUT_S
+) -> list[list[float]] | None:
+    """批量取向量（对齐入参序）；任何失败/不可达/形状不对 → None（不抛）。
+
+    侧车响应 OpenAI 兼容：``{"data": [{"index": i, "embedding": [...]}]}``；
+    逐条按 index 回填，缺位/空向量都算失败（宁可跳过二期不出错对子）。
+    测试经 monkeypatch 本函数桩化（零网络）。
+    """
+    clean = [str(t or "") for t in (texts or [])]
+    if not clean:
+        return []
+    import httpx
+
+    try:
+        resp = httpx.post(
+            f"{(base_url or embed_base_url())}/v1/embeddings",
+            json={"input": clean},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json().get("data") or []
+    except Exception:  # noqa: BLE001 - 不可达/超时/坏 JSON 统一按缺席处理
+        return None
+    vecs: list[list[float] | None] = [None] * len(clean)
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        try:
+            idx = int(item.get("index", -1))
+        except (TypeError, ValueError):
+            continue
+        vec = item.get("embedding")
+        if 0 <= idx < len(clean) and isinstance(vec, list) and vec:
+            try:
+                vecs[idx] = [float(x) for x in vec]
+            except (TypeError, ValueError):
+                vecs[idx] = None
+    if any(v is None for v in vecs):
+        return None
+    return [v for v in vecs if v is not None]
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    """余弦相似度（零向量按 0 处理——不相似，绝不做 NaN）。"""
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(x * x for x in b) ** 0.5
+    if na <= 0.0 or nb <= 0.0:
+        return 0.0
+    return dot / (na * nb)
+
+
+# 词条向量进程内缓存（键=(id, question_text)——问题改了键就变，天然失效）。
+_ENTRY_VEC_CACHE: dict[tuple[str, str], list[float]] = {}
+
+
+def reset_embed_cache() -> None:
+    """清词条向量缓存（测试隔离用；生产进程内常驻，容量封顶整体清空）。"""
+    _ENTRY_VEC_CACHE.clear()
+
+
+def _entry_vectors(
+    entries: list[dict],
+) -> dict[tuple[str, str], list[float]] | None:
+    """enabled 词条 → {(id, question_text): 向量}；embed 不可达 → None。
+
+    缓存命中不重复请求；miss 的键批量取向量，**失败值不进缓存**（下轮重试，
+    不把「侧车临时挂了」钉死成永久缺席）。
+    """
+    wanted: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for e in entries or []:
+        key = (str((e or {}).get("id") or ""), str((e or {}).get("question_text") or ""))
+        if key[0] and key[1] and key not in seen:
+            seen.add(key)
+            wanted.append(key)
+    missing = [k for k in wanted if k not in _ENTRY_VEC_CACHE]
+    if missing:
+        vecs = _embed_vectors([k[1] for k in missing])
+        if vecs is None:
+            return None
+        for key, vec in zip(missing, vecs):
+            if len(_ENTRY_VEC_CACHE) >= _EMBED_MAX_CACHE:
+                _ENTRY_VEC_CACHE.clear()
+            _ENTRY_VEC_CACHE[key] = vec
+    return {k: _ENTRY_VEC_CACHE[k] for k in wanted}
+
+
+def _mine_semantic_homophones(
+    policy: Any, misses: list[dict], entries: list[dict]
+) -> tuple[list[dict], str]:
+    """二期语义锚定挖掘 → (对子, error)。零网络失败面：embed 不可达/策略层
+    无此函数（旧版并行开发兼容）→ ([], 因)——一期词面路径照跑。"""
+    harvest = getattr(policy, "mine_homophones_semantic", None)
+    if not callable(harvest):
+        return [], ""
+    miss_qs: list[str] = []
+    for m in misses or []:
+        q = str((m or {}).get("question") or "")
+        if q and q not in miss_qs:
+            miss_qs.append(q)
+    if not miss_qs:
+        return [], ""
+    entry_vecs = _entry_vectors(entries)
+    if entry_vecs is None:
+        return [], "embed unavailable"
+    miss_vecs = _embed_vectors(miss_qs)
+    if miss_vecs is None:
+        return [], "embed unavailable"
+    q2vec = dict(zip(miss_qs, miss_vecs))
+    sims: dict[tuple[str, str], float] = {}
+    for m in misses or []:
+        raw_q = str((m or {}).get("question") or "")
+        mv = q2vec.get(raw_q)
+        if not mv:
+            continue
+        for e in entries or []:
+            eid = str((e or {}).get("id") or "")
+            key = (eid, str((e or {}).get("question_text") or ""))
+            ev = entry_vecs.get(key)
+            if eid and ev:
+                sims[(raw_q, eid)] = _cosine(mv, ev)
+    try:
+        return list(harvest(misses, entries, sims) or []), ""
+    except Exception as exc:  # noqa: BLE001 - 策略层异常降级为跳过不炸轮
+        return [], repr(exc)
+
+
+def _merge_homophone_pairs(*groups: list[dict]) -> list[dict]:
+    """多路挖掘结果按 (wrong,right) 合并：support 取大，example 取先到。
+
+    一期/二期常对同一 (wrong,right) 各出一条（「钟/仲」距离=1 与拼音对齐
+    双路都命中）——不去重会让 UPSERT written 计数翻倍、审计虚高。输出按
+    (-support, wrong, right) 排序保证确定性。
+    """
+    merged: dict[tuple[str, str], dict] = {}
+    for group in groups:
+        for pair in group or []:
+            if not isinstance(pair, dict):
+                continue
+            key = (str(pair.get("wrong") or ""), str(pair.get("right") or ""))
+            if not key[0] or not key[1]:
+                continue
+            try:
+                sup = int(pair.get("support") or 0)
+            except (TypeError, ValueError):
+                sup = 0
+            cur = merged.get(key)
+            if cur is None:
+                merged[key] = {
+                    "wrong": key[0],
+                    "right": key[1],
+                    "support": sup,
+                    "example": str(pair.get("example") or ""),
+                }
+            else:
+                cur["support"] = max(cur["support"], sup)
+    out = sorted(
+        merged.values(), key=lambda d: (-d["support"], d["wrong"], d["right"])
+    )
+    return out
+
+
 # ---- 主入口 ----
 
 # 单飞锁（loop-aware）：模块级锁但按当前事件循环惰性（重）建——CP 服务全程单
@@ -499,6 +705,8 @@ async def _run_once(
         "adopted_fresh": 0,
         "pending": 0,
         "disabled": 0,
+        "threshold_raised": 0,
+        "threshold_decayed": 0,
         "homophones": 0,
         "pregen": "",
         "errors": [],
@@ -588,10 +796,13 @@ async def _run_once(
         except Exception as exc:  # noqa: BLE001 - 步骤隔离
             errors.append(f"adopt({acc}): {exc!r}")
 
-    # ⑤ drift 自动禁用（never_asked 龄门/digits_bypass/repeat_after_play；可逆）。
+    # ⑤ drift 反馈（VectorQ 一升二禁 + 清白回落；never_asked/digits 仍直接禁用）。
     for acc in accounts:
         try:
-            report = qa_drift.build_qa_drift_report(repo, account_id=acc)
+            report = qa_drift.build_qa_drift_report(
+                repo, account_id=acc, include_fired=True
+            )
+            raised_ids: set[str] = set()
             for proposal in report.get("proposals") or []:
                 reason = str(proposal.get("reason") or "")
                 if reason == qa_drift.RS_NEVER_FIRED:
@@ -606,6 +817,49 @@ async def _run_once(
                 row = repo.get_qa_entry(qa_id)
                 if not row or not row.get("enabled"):
                     continue  # 已禁用/已删：幂等不重复
+                if reason == qa_drift.RS_REPEAT_AFTER_PLAY:
+                    # VectorQ 一升二禁：首犯=该词条在当前阈值下仍有误命中证据
+                    # → 阈值步升（给一次自证机会）；顶格 0.95 仍 repeat → 禁用
+                    # （原语义=首犯即禁；保守度只升不降——禁用仍可逆不删）。
+                    try:
+                        _old = row.get("hit_threshold")
+                        _base = HIT_THRESHOLD_DEFAULT if _old is None else float(_old)
+                    except (TypeError, ValueError):
+                        _base = HIT_THRESHOLD_DEFAULT
+                    if _base >= HIT_THRESHOLD_CAP - 1e-9:
+                        repo.update_qa_entry(qa_id, {"enabled": False})
+                        audit_fn(
+                            "qa_entry.update",
+                            subject_type="qa_entry",
+                            subject_id=qa_id,
+                            account_id=acc,
+                            detail={
+                                "source": AUTO_SOURCE,
+                                "reason": reason,
+                                "enabled": False,
+                                "question": str(proposal.get("question_text") or "")[:60],
+                                "hit_threshold": {"old": _base, "new": _base},
+                            },
+                        )
+                        out["disabled"] += 1
+                        continue
+                    _new = round(min(HIT_THRESHOLD_CAP, _base + HIT_THRESHOLD_STEP), 6)
+                    repo.update_qa_entry(qa_id, {"hit_threshold": _new})
+                    audit_fn(
+                        "qa_entry.update",
+                        subject_type="qa_entry",
+                        subject_id=qa_id,
+                        account_id=acc,
+                        detail={
+                            "source": AUTO_SOURCE,
+                            "reason": reason,
+                            "question": str(proposal.get("question_text") or "")[:60],
+                            "hit_threshold": {"old": _base, "new": _new},
+                        },
+                    )
+                    raised_ids.add(qa_id)
+                    out["threshold_raised"] += 1
+                    continue
                 if reason == qa_drift.RS_NEVER_ASKED:
                     if _entry_age_days(row) < NEVER_ASKED_MIN_AGE_DAYS:
                         continue  # 龄不足：可能只是窗口小，不自动
@@ -632,10 +886,49 @@ async def _run_once(
                     },
                 )
                 out["disabled"] += 1
+            # 回落 pass：被升过的词条（hit_threshold 非 NULL）本窗 fired>0
+            # （清白命中=快答真播出去且没被复问）→ 步降；回到全局档写 NULL。
+            # 当轮刚升过的词条跳过——同窗既有 repeat 证据又衰减自相矛盾；
+            # never_asked/digits 禁用行已不在 enabled 列表，天然不参与。
+            fired_by_norm = report.get("fired_by_norm") or {}
+            for entry in repo.list_qa_entries(acc, enabled=True, owner_scope=None) or []:
+                eid = str(entry.get("id") or "")
+                ht = entry.get("hit_threshold")
+                if not eid or ht is None or eid in raised_ids:
+                    continue
+                try:
+                    _base = float(ht)
+                except (TypeError, ValueError):
+                    continue
+                if _base <= HIT_THRESHOLD_FLOOR + 1e-9:
+                    continue  # 已在全局档（残留数据），无可回落
+                try:
+                    _fired = int(fired_by_norm.get(qa_drift.qa_norm(entry), 0) or 0)
+                except (TypeError, ValueError):
+                    _fired = 0
+                if _fired <= 0:
+                    continue
+                _new = round(_base - HIT_THRESHOLD_DECAY, 6)
+                _back = _new <= HIT_THRESHOLD_FLOOR + 1e-9
+                repo.update_qa_entry(eid, {"hit_threshold": None if _back else _new})
+                audit_fn(
+                    "qa_entry.update",
+                    subject_type="qa_entry",
+                    subject_id=eid,
+                    account_id=acc,
+                    detail={
+                        "source": AUTO_SOURCE,
+                        "reason": "clean_hit_decay",
+                        "fired": _fired,
+                        "hit_threshold": {"old": _base, "new": None if _back else _new},
+                    },
+                )
+                out["threshold_decayed"] += 1
         except Exception as exc:  # noqa: BLE001 - 步骤隔离
             errors.append(f"drift({acc}): {exc!r}")
 
-    # ⑥ 同音学习（策略层缺席→跳过）：miss×词条 → support≥2 对子 UPSERT。
+    # ⑥ 同音学习（策略层缺席→跳过）：miss×词条 → 一期词面 + 二期语义锚定，
+    # 合并（support 取大）后 support≥2 对子 UPSERT。
     if policy is not None:
         for acc in accounts:
             try:
@@ -660,6 +953,12 @@ async def _run_once(
                 if not misses:
                     continue
                 mined = policy.mine_homophones(misses, entries)
+                # 二期语义锚定：embed 侧车批量算 sims（词条向量进程内缓存）；
+                # 不可达/失败 → 跳过记 error，一期词面路径照跑不炸轮。
+                sem_pairs, sem_err = _mine_semantic_homophones(policy, misses, entries)
+                if sem_err:
+                    errors.append(f"homophone-semantic({acc}): {sem_err}")
+                mined = _merge_homophone_pairs(mined, sem_pairs)
                 items = [
                     {"wrong": str(p.get("wrong") or "")[:60],
                      "right": str(p.get("right") or "")[:60],
@@ -880,6 +1179,8 @@ async def digest_loop() -> None:
                         f" adopted(v={out.get('adopted_variant')},"
                         f"f={out.get('adopted_fresh')})"
                         f" disabled={out.get('disabled')}"
+                        f" threshold(+{out.get('threshold_raised') or 0}"
+                        f"/-{out.get('threshold_decayed') or 0})"
                         f" homophones={out.get('homophones')}"
                         f" errors={len(out.get('errors') or [])}",
                         flush=True,

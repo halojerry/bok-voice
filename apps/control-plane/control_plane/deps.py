@@ -360,6 +360,17 @@ def build_engine() -> Engine | None:
                     "priority",
                     "priority INTEGER NOT NULL DEFAULT 10",
                 )
+                # VectorQ 每词条自适应阈值(2026-09-25):可空 float,NULL=用全局
+                # 默认档(0.80)。生产端=CP qa_digest 的 drift 反馈(repeat_after_play
+                # 一升二禁/清白命中回落);消费端=agent qa_gate 逐条目读
+                # entry["hit_threshold"]。可空无 DEFAULT——与 models.QaEntry.
+                # hit_threshold(nullable=True)create_all 路径同形,方言安全。
+                _ensure_column(
+                    conn,
+                    "qa_entries",
+                    "hit_threshold",
+                    "hit_threshold FLOAT",
+                )
                 # 话术图(2026-09-18 Phase 2):模板可选携带意图节点+绑定边 JSON,
                 # ''=未启用(旧库补列即空串,装配零变化)。TEXT+DEFAULT '' 方言安全。
                 _ensure_column(

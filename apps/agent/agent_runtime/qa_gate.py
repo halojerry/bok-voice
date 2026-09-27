@@ -32,6 +32,18 @@ embed(词条素材向量不动,双方在语义空间自然接近)。词面 ``QaI
 ``bok_voice_core.qa_digest_policy.apply_homophones``(并行交付):import 失败/
 调用失败一律原查询逐字节(优雅降级);``BOK_QA_HOMOPHONE=0`` 整钩子旁路,
 表空/无对子=行为逐字节同旧。
+
+每词条出场阈值(VectorQ 消费端,2026-09-25):语义补位 ``QaSemanticIndex.match``
+逐条目吃 ``hit_threshold`` 列(CP drift 反馈生产端写列,本文件只做消费端)——
+列在场且在 (0,1] 逐条生效(``_effective_thr``),缺席/坏值回全局阈值(列未写
+=行为逐字节同旧,golden adjacent 负样本零漂移);``rank()`` 召回地板不吃
+词条列(召回供给与出场阈值是两件事)。词面 ``QaIndex.match`` 恒不吃。
+
+WA 收号步 question 轮放行(2026-09-25):``qa_exclude_reason`` 的
+wa_step_locked 闸对 verdict 归一化后为 question(flow.QUESTION)且同轮无
+wa_signal 的轮放行——收号步客户提问(「可以点样赔?」)答罐头与收号不冲突;
+``BOK_QA_WA_STEP_QUESTION=0`` 回旧行为,其余闸(digits/refuse/advanced 等)
+独立判定零改动。
 """
 
 from __future__ import annotations
@@ -133,6 +145,13 @@ def qa_semantic_timeout_s() -> float:
         return 0.4
 
 
+def qa_wa_step_question_enabled() -> bool:
+    """WA 收号步 question 轮放行开关(2026-09-25):默认 "1"=放行——verdict 为
+    question 且同轮无 WA 信号时跳过 wa_step_locked 闸;"0"=旧行为逐字节
+    (wa_step_locked 对 question 轮照拦)。"""
+    return os.environ.get("BOK_QA_WA_STEP_QUESTION", "1") == "1"
+
+
 def _entry_priority(entry: dict) -> int:
     """条目优先级(小者先);旧 CP 响应/坏值宽容回默认 10,域 [0,1000]。"""
     raw = entry.get("priority", 10)
@@ -232,6 +251,12 @@ def qa_exclude_reason(
     抢话,任何含数字串的轮交回 LLM+flow(数字读法零降级铁律)。数字探测用
     _digit_runs_in(汉字/英文数字词归一成 ASCII 后逐 run 归一),与 WA 侦测
     同源,粤式「三七七八九零」照拦。
+
+    WA 收号步 question 放行(2026-09-25):verdict 归一化后为 question
+    (flow.QUESTION)且同轮无 wa_signal 时,wa_step_locked 闸放行——放行=允许
+    罐头快路先答提问,WA 捕获状态机零触碰(question 轮无数字串,不进捕获;
+    digits 闸仍独立拦号码轮);其余闸照走。``BOK_QA_WA_STEP_QUESTION=0`` 回
+    旧行为(该闸对 question 轮照拦)。
     """
     from .flow import _REFUSE_RE, _digit_runs_in
 
@@ -242,7 +267,11 @@ def qa_exclude_reason(
     if wa_signal:
         return "wa_signal"
     if wa_step_locked and not wa_captured:
-        return "wa_step_locked"
+        # 收号步 question 轮放行(2026-09-25):到此处 wa_signal 必为空
+        # (wa_signal 闸已先行返回),放行只豁本闸——digits/refuse/verdict 等
+        # 独立判定照走,question 轮无数字,收号状态机零触碰。
+        if str(verdict or "").lower() != "question" or not qa_wa_step_question_enabled():
+            return "wa_step_locked"
     if _digit_runs_in(user_text):
         return "digits"
     if _REFUSE_RE.search(user_text):
@@ -553,6 +582,17 @@ def _homophone_normalize(q: str, pairs: list[tuple[str, str]]) -> str:
     return out if isinstance(out, str) and out else q
 
 
+def _effective_thr(entry: dict, global_thr: float) -> float:
+    """词条级阈值(VectorQ,2026-09-25):hit_threshold 列在场且在 (0,1] → 用它;
+    缺席/坏值 → 全局。消费端零迁移成本:列未加/未写=行为逐字节同旧。"""
+    raw = (entry or {}).get("hit_threshold")
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return global_thr
+    return v if 0.0 < v <= 1.0 else global_thr
+
+
 class QaSemanticIndex:
     """快答库语义补位索引(2026-09-24,W3b 解锁):词面 0.90 未中轮的释义档。
 
@@ -646,7 +686,12 @@ class QaSemanticIndex:
         reason ∈ ""|empty|no_embedder|timeout|error:空串=正常评分(未过阈值
         也是正常 miss,调用方可打 miss 日志);其余=车道不可用归因(静默降级,
         与意图车道同纪律——日志归 agent 统一打)。幸存过滤与词面 match 同判据
-        `_survives_turn`(单点防漂移)。
+        ``_survives_turn``(单点防漂移)。
+
+        出场阈值逐条目(2026-09-25,VectorQ):词条 ``hit_threshold`` 列在场且
+        在 (0,1] → 该条用它,缺席/坏值 → 全局 ``thr``(显式 threshold 参数仍
+        优先于 env 全局);胜者仍是最高余弦的通过者。``rank()`` 召回地板不吃
+        词条列(召回供给与出场阈值是两件事)。
         """
         from .intent_semantic import _cosines
 
@@ -680,7 +725,7 @@ class QaSemanticIndex:
         for e, c in zip(entries, coss):
             if c > top:
                 top = c
-            if c >= thr and c > best_score:
+            if c >= _effective_thr(e, thr) and c > best_score:
                 best, best_score = e, c
         if best is None:
             return None, top, ""

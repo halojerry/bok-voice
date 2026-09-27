@@ -131,6 +131,14 @@ MODELS: dict[str, dict[str, str]] = {
         # (below_floor 调用方回落 9B)。可选:缺失时 sidecar 不起,agent 走
         # 原 9B judge。评估数据与坑见 docs/LAYA-EVAL.md。
         "laya": "aac6fef/laya-multilingual-mlx",
+        # Draft 模型(speculative decoding,2026-09-25):Qwen3-0.6B-4bit(HF API
+        # 只读探活核实存在,base_model:Qwen/Qwen3-0.6B,repo 自带 config.json
+        # +tokenizer,~335MB)——与主 LLM(avan-ag Qwen3.5-4B)同族 Qwen3 分词器,
+        # 满足 mlx_lm server --draft-model 的「draft/target 同分词器」前提。
+        # 注意:mlx-lm#846 丢 token 风险在 Qwen3-Next 架构,dense 4B 不同族;
+        # 上线前仍须输出一致性 A/B(同 prompt 逐 token 对比)。可选增强:默认不
+        # 下载(cmd_download 有 opt-in 门),BOK_LLM_DRAFT=1 才挂旗标。
+        "llm_draft": "mlx-community/Qwen3-0.6B-4bit",
     },
     "windows": {
         "asr": "Qwen/Qwen3-ASR-1.7B",
@@ -154,8 +162,8 @@ WINDOWS_LLM_GGUF_PATTERNS = ["*Q4_K_M.gguf", "README.md"]
 
 # 首启向导不门禁的模型(可选增强,缺失时对应功能自动回退:B 线 MT 回退主 LLM :1235,
 # settle/judge 专线回退 :1235,意图语义车道回退关键词+judge 双车道,Laya judge
-# 回退 :1237/:1235 生成式判定链)。
-OPTIONAL_MODELS = {"mt", "settle", "embedding", "laya"}
+# 回退 :1237/:1235 生成式判定链,llm_draft 回退无 draft 普通解码)。
+OPTIONAL_MODELS = {"mt", "settle", "embedding", "laya", "llm_draft"}
 
 
 def platform_key() -> str:
@@ -329,6 +337,47 @@ def _dev_9b_enabled() -> bool:
     缺席回退链落 :1235（summarize.py / agent.py judge 均已核实）。读法与全仓
     同款 ``os.environ.get(...) == "1"``。"""
     return os.environ.get("BOK_DEV_9B", "") == "1"
+
+
+def _llm_draft_enabled() -> bool:
+    """Draft 模型 speculative decoding 开关(:1235 主 LLM,BOK_LLM_DRAFT,默认关;
+    ="1" 才开)。mlx_lm 0.31.3 server 支持 ``--draft-model <path>`` +
+    ``--num-draft-tokens``(默认 3),与 prompt cache 同槽共管(cache key 含 draft
+    维度,不破坏「上一轮请求=下一轮严格前缀」的追加式缓存);队列代理零改动已
+    核实(2026-09-25 读码):queue_proxy 透传原始 body 仅换 content-type/
+    x-bok-lane 头,draft 是 server 启动旗标而非 body 参数,LaneGate 并发=1 本就
+    与带 draft 的单发路径契合。风险面:mlx-lm#846 丢 token 见 MODELS 表 llm_draft
+    注——上线前必须输出一致性 A/B(归审计方)。读法与全仓同款 ``=="1"``。"""
+    return os.environ.get("BOK_LLM_DRAFT", "") == "1"
+
+
+def _llm_draft_model(current: dict[str, str]) -> str:
+    """Draft 模型路径解析:BOK_LLM_DRAFT_MODEL 显式覆盖 > MODELS 表 llm_draft
+    条目(mac dev 走 lmstudio/app-data 双布局「哪边真实在盘用哪边」,与主 LLM
+    同一 model_path 语义);表无条目/非 mac 表回 ""(调用方跳过 draft 旗标)。"""
+    override = os.environ.get("BOK_LLM_DRAFT_MODEL", "").strip()
+    if override:
+        return override
+    return model_path(current, "llm_draft")
+
+
+def _llm_draft_flags(current: dict[str, str]) -> list[str]:
+    """Draft 旗标组装(离线可单测):BOK_LLM_DRAFT=1 且 draft 模型在盘 →
+    ``["--draft-model", <path>, "--num-draft-tokens", "3"]``;其余情形(默认关/
+    模型缺席)回 [](调用方零追加=无 draft 普通解码,**不 fail**)。
+
+    模型缺席时打一行 stderr 明示跳过——opt-in 特性静默降级违背可观测纪律,
+    但绝不让 serve 起不来。num-draft-tokens 取官方默认 3,不另设 env(实弹
+    调优后再谈)。"""
+    if not _llm_draft_enabled():
+        return []
+    draft_model = _llm_draft_model(current)
+    if not draft_model or not Path(draft_model).exists():
+        print(f"[bok] llm draft model not present, start without draft "
+              f"({draft_model or 'unset'}); 补齐: python tools/bok.py download --only llm_draft",
+              file=sys.stderr)
+        return []
+    return ["--draft-model", draft_model, "--num-draft-tokens", "3"]
 
 
 def sidecar_python(name: str) -> Path:
@@ -875,6 +924,14 @@ def cmd_download(only: set[str] | None = None) -> int:
     for name, repo in table.items():
         if not repo:
             continue
+        # draft 权重 opt-in(2026-09-25,BOK_LLM_DRAFT 默认关):全量下载/serve
+        # ensure 不拉 0.6B(~335MB)——默认档零下载零驻留(全栈 47/48G 内存压力
+        # 线上,没人用的权重不占盘不占内存)。显式 --only llm_draft 或
+        # BOK_LLM_DRAFT=1 才落盘。
+        if (name == "llm_draft" and not _llm_draft_enabled()
+                and (requested is None or "llm_draft" not in requested)):
+            print("  [skip] llm_draft (BOK_LLM_DRAFT!=1 默认不下载;补齐: download --only llm_draft)")
+            continue
         if requested is not None and name not in requested:
             continue
         target = model_dir(repo)
@@ -1189,18 +1246,20 @@ def _physical_mem_gib() -> float:
         return 0.0
 
 
-def _default_prompt_cache_bytes() -> str:
+def _default_prompt_cache_bytes(draft_on: bool = False) -> str:
     """:1235 prompt-cache-bytes 档位,三级优先级:① BOK_LLM_PROMPT_CACHE_BYTES 显式
-    覆盖(专家直设,最高);② BOK_DEMO_PRESET=1 演示/单通档 → 6GB;③ 内存分档:
-    ≥32GB 机型 6GB(2026-09-26 由 12GB 下调——全栈实测 47/48G 占用、压缩器扛
-    24G,12GB cache 灌满(111 序列/11.77GB)而每通真命中的只有自家 1555-token
-    前缀;V10 实弹 12→6GB 单通无损(cached 0.906→0.901、TTFT 噪声级),省 6G
-    统一内存直接卸压缩/换页压力——「多路并发跨会话命中」的价值在内存压力线下
-    到不了,理论收益让位实测压力),16GB 机型 6GB。要回 12GB:env 显式覆盖。"""
+    覆盖(专家直设,最高;draft 开时**不折**——用户显式值尊重原样);② draft_on=True
+    (draft 模型在场)→ 5GB;③ 否则 6GB(2026-09-26 由 12GB 下调——全栈实测 47/48G
+    占用、压缩器扛 24G,12GB cache 灌满(111 序列/11.77GB)而每通真命中的只有自家
+    1555-token 前缀;V10 实弹 12→6GB 单通无损(cached 0.906→0.901、TTFT 噪声级),
+    省内存直接卸压缩/换页压力)。draft 折扣(2026-09-25):0.6B-4bit draft 权重
+    ~0.4-0.5GB + draft 侧 KV 计入同一 prompt-cache-bytes 池——开 draft 时 6GB→5GB
+    腾挪,统一内存总量不涨(47/48G 高位线上多 0.5G 就是压缩器的事)。要回 6GB
+    以上:env 显式覆盖。"""
     override = os.environ.get("BOK_LLM_PROMPT_CACHE_BYTES", "").strip()
     if override:
         return override
-    return "6GB"
+    return "5GB" if draft_on else "6GB"
 
 
 def _llm_queue_proxy_on() -> bool:
@@ -1210,6 +1269,36 @@ def _llm_queue_proxy_on() -> bool:
     单并发排队、agent 回复(X-Bok-Lane: reply)插队,后台(settle/qa-cluster/
     judge)不再与活通话首轮互抢 GPU 时间片。"""
     return os.environ.get("BOK_LLM_QUEUE_PROXY", "1") == "1"
+
+
+def _mac_llm_server_argv(
+    llm_py: Path,
+    llm_model: str,
+    mlx_port: str,
+    current: dict[str, str],
+    log_level: str = "INFO",
+    draft_flags: list[str] | None = None,
+) -> list[str]:
+    """mac mlx_lm server 完整命令行组装(纯函数,离线可单测)。
+
+    draft 旗标(BOK_LLM_DRAFT=1 且模型在盘,见 _llm_draft_flags)**追加在 argv
+    末尾**——关=逐字节同旧命令行(默认档零漂移);开=尾部多
+    ``--draft-model <path> --num-draft-tokens 3``。prompt-cache-bytes 随 draft
+    开关折档(_default_prompt_cache_bytes)。draft_flags 由调用方预算入参可免
+    重复求值(跳过打印打两遍)。"""
+    if draft_flags is None:
+        draft_flags = _llm_draft_flags(current)
+    cache_bytes = _default_prompt_cache_bytes(draft_on=bool(draft_flags))
+    return [
+        str(llm_py), "-m", "mlx_lm", "server",
+        "--model", llm_model, "--host", "127.0.0.1", "--port", mlx_port,
+        "--prompt-cache-size", "128",
+        "--prompt-cache-bytes", cache_bytes,
+        "--prefill-step-size", "512",
+        "--chat-template-args", '{"enable_thinking":false}',
+        "--log-level", log_level,
+        *draft_flags,
+    ]
 
 
 def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
@@ -1233,12 +1322,17 @@ def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
         # 16GB 机型可下调,或用 --prompt-cache-bytes 限制缓存总字节。
         # prompt-cache-bytes:给 128 槽加总字节上限——长会话(几十轮×8k ctx)
         # 单槽可涨到几十 MB,不封顶会把统一内存吃穿触发 macOS 压缩/交换,TTFT 抖尖。
-        # 档位见 _default_prompt_cache_bytes(内存分档+env 覆盖)。
-        _cache_bytes = _default_prompt_cache_bytes()
+        # 档位见 _default_prompt_cache_bytes(env 覆盖+draft 折扣)。
+        # draft 旗标先算:cache 档位与打印行都要感知它(开=draft=on 尾标)。
+        _draft_flags = _llm_draft_flags(current)
+        _cache_bytes = _default_prompt_cache_bytes(draft_on=bool(_draft_flags))
         _cache_tier = ("explicit" if os.environ.get("BOK_LLM_PROMPT_CACHE_BYTES", "").strip()
                        else "demo_preset" if os.environ.get("BOK_DEMO_PRESET", "") == "1"
                        else "mem")
-        print(f"[bok] llm prompt-cache {_cache_bytes} (tier={_cache_tier})")
+        if _draft_flags:
+            print(f"[bok] llm prompt-cache {_cache_bytes} (tier={_cache_tier}, draft=on)")
+        else:
+            print(f"[bok] llm prompt-cache {_cache_bytes} (tier={_cache_tier})")
         # prefill-step-size 512(官方默认 2048,2026-09-08 二分实证从 1024 再降):
         # 暖缓存 TTFT 中位 913/917ms vs 1024 的 1066/1092ms(双轮反向 A/B,增量轮
         # 尾段一步喂完少等半步),并发交错打平——纯赚。
@@ -1249,15 +1343,14 @@ def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
         # 队列代理拓扑（2026-09-26 根治 mlx 解码争用,默认开）：mlx 挪内部 :1239、
         # queue_proxy 占公网口 :1235（生成单并发+reply 插队;BOK_LLM_QUEUE_PROXY=0
         # 回旧拓扑 mlx 直跑 :1235）。消费方（agent/CP/judge）env 一律 :1235 不动。
+        # draft 兼容已核实（2026-09-25 读码）：queue_proxy 透传原始 body 仅换
+        # content-type/x-bok-lane 头、不剥任何字段;draft 是 server 启动旗标
+        # （mlx 启动时装载 draft 模型）而非 body 参数——代理零改动。
         _queue_on = _llm_queue_proxy_on()
         _mlx_port = "1239" if _queue_on else "1235"
         _start_proc(
-            [str(llm_py), "-m", "mlx_lm", "server",
-             "--model", llm_model, "--host", "127.0.0.1", "--port", _mlx_port,
-             "--prompt-cache-size", "128",
-             "--prompt-cache-bytes", _cache_bytes,
-             "--prefill-step-size", "512",
-             "--chat-template-args", '{"enable_thinking":false}', "--log-level", llm_log_level],
+            _mac_llm_server_argv(llm_py, llm_model, _mlx_port, current,
+                                 log_level=llm_log_level, draft_flags=_draft_flags),
             run_dir / "llm.pid",
             log_dir / "llm.log",
         )
@@ -1692,6 +1785,11 @@ _FORWARD_ENV = (
     # HOMOPHONE 默认 1（表空=行为逐字节同旧，学到对子才生效，golden 负样本守门）。
     "BOK_QA_AUTO_DIGEST",
     "BOK_QA_HOMOPHONE",
+    # 匹配端闸松绑+死区填补（2026-09-25 四路并行轮预埋）：WA 步放行 question 类
+    # （真实数据 wa_step_locked 431 次 bypass 的半数是错杀——答赔法与收号不冲突）；
+    # 垫话按需第二发（治载荷轮 2.3s 后裸静默，仅真慢轮触发非固定双发）。
+    "BOK_QA_WA_STEP_QUESTION",
+    "BOK_FILLER_RESHOT",
     # —— Laya 决策 sidecar(:8791,2026-09-26):意图/流程判定 10ms 快路。总闸
     #    BOK_LAYA_JUDGE(serve 默认 "0" 不随栈拉起;="1" 且模型在盘才起;sidecar
     #    侧同闸双保险,"0" 时 /v1/decide 一律 503)与端点覆盖(缺省 127.0.0.1:8791;
@@ -2830,6 +2928,22 @@ def _model_present(repo: str) -> bool:
     return False
 
 
+def _doctor_draft_warning(current: dict[str, str]) -> str:
+    """draft 模型 doctor 警告判定(纯函数,离线可单测):BOK_LLM_DRAFT=1 且
+    draft 模型缺席 → 警告文案;其余(默认关/在盘/表无条目)回 ""。
+
+    警告只进 doctor 打印面,**不进 fails**(不判死、不进 packaged 门禁)——
+    draft 是 opt-in 特性,缺席时 _llm_draft_flags 回 [] 正常起无 draft 服务,
+    功能零损失,不构成「活着但残废」。"""
+    if not _llm_draft_enabled():
+        return ""
+    repo = current.get("llm_draft", "")
+    if not repo or _model_present(repo):
+        return ""
+    return (f"llm draft: BOK_LLM_DRAFT=1 但模型未在盘 ({repo}) — serve 将无 draft "
+            "起 :1235(不 fail);补齐: python tools/bok.py download --only llm_draft")
+
+
 def cmd_doctor() -> int:
     """Preflight diagnostics. In packaged mode every check is a hard gate."""
     key = platform_key()
@@ -2914,6 +3028,12 @@ def cmd_doctor() -> int:
         if not present:
             # 模型在 CI/首启前允许缺失：由 setup status 门禁管理，不阻塞 bundle 校验。
             print("  (模型权重不随包，首启向导下载；doctor 不将其视为结构失败)")
+
+    # draft 模型警告(opt-in 特性):只在 BOK_LLM_DRAFT=1 且缺席时出一行——
+    # 不进 fails(不判死),缺席时 serve 自动回落无 draft,见 _doctor_draft_warning。
+    draft_warn = _doctor_draft_warning(current)
+    if draft_warn:
+        print(f"  {draft_warn}")
 
     for name, port in CORE_PORTS:
         print(f"  port {port:<5} ({name}): {'UP' if healthy(port) else 'DOWN'}")

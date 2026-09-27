@@ -15,8 +15,12 @@ CP 消化引擎(control_plane 侧,另行落地)喂入候选、拿走分档计划
   「300 蚊」在无关轮乱入均有实弹前科,敏感域闸是最后一道堤);
 - **与运行时同源**:文本归一复用 ``qa_text.normalize_question``,保证
   挖掘面与运行时匹配面对同一字符串;
-- **同音对只管纯同音替换**:问句对整句编辑距离=1 且差异字符同音才出对;
-  「改写+同音叠加」(距离>1)是语义召回的活,挖掘层绝不越界出对子。
+- **同音对只管纯同音替换**:一期 ``mine_homophones`` 问句对整句编辑距离=1
+  且差异字符同音才出对;二期 ``mine_homophones_semantic`` 在语义同族
+  (embed 余弦,CP 侧算好传入)的前提下,按**逐字拼音序列**做块对齐——
+  发音对齐而字形不同的位就是同音替换本体(「裴/赔」族改写+同音叠加),
+  改写段/增删段/异音段一律不出对。「改写+同音叠加」单靠词面距离
+  判不出对,必须有语义锚,挖掘层绝不越界出对子。
 
 分工:LLM 聚类结论由 ``qa_cluster`` 产;本模块只做裁决与同音对挖掘,
 全部输入输出是 plain dict,单测全离线。
@@ -226,6 +230,10 @@ def classify_candidates(candidates: list[dict]) -> dict:
 # 「裴/赔」类替换对必须被真实用户重复说过才值得铸进查询侧归一。
 MIN_HOMOPHONE_MISS_COUNT = 2
 
+# 二期(语义锚定)replace 段单侧长度上限:超过即「改写」不是「同音替换」,
+# 逐位对齐在长段上是噪声放大器,保守丢弃(任务契约:两侧各 ≤2 字)。
+_SEMANTIC_REPLACE_MAX = 2
+
 
 def _edit_distance(a: str, b: str) -> int:
     """自写 O(nm) DP 编辑距离(Levenshtein;勿引第三方编辑距离库)。"""
@@ -325,6 +333,141 @@ def mine_homophones(misses: list[dict], entries: list[dict]) -> list[dict]:
             )
             if norm not in rec["missers"]:
                 rec["missers"].add(norm)
+    out = [
+        {"wrong": w, "right": r, "support": len(rec["missers"]), "example": rec["example"]}
+        for (w, r), rec in support.items()
+    ]
+    out.sort(key=lambda d: (-d["support"], d["wrong"], d["right"]))
+    return out
+
+
+def _syl_seq(norm: str) -> list[str]:
+    """归一文本 → 逐字无声调拼音序列(每字恰一音;非汉字原样透传)。
+
+    多音字取 lazy_pinyin 默认首选(与一期 ``_pinyin_of`` 同判据);序列长度
+    恒等于字符数,块对齐的位移可直接映射回字符。
+    """
+    out: list[str] = []
+    for ch in norm:
+        py = lazy_pinyin(ch)
+        out.append("".join(py) if py else ch)
+    return out
+
+
+def _harvest_semantic_pairs(
+    norm_m: str, norm_e: str, raw_q: str, support: dict[tuple[str, str], dict]
+) -> None:
+    """单对 (miss 归一形, 词条归一形) → 把挖到的同音字符对累进 support。
+
+    对齐在**逐字拼音序列**上做(difflib.SequenceMatcher opcodes),同音字天然
+    落进 equal 块——equal 块内「拼音相同而字形不同」的位就是同音替换本体
+    (「裴/赔」),这是二期比一期(整句距离=1)多治的「改写+同音叠加」;
+    replace 块按任务契约收紧(两侧各 ≤2 字、等长、逐位拼音相等才逐位取对,
+    覆盖 SequenceMatcher 对齐歧义把同音位留在 replace 块里的边缘形态);
+    delete/insert(增删)与长度不等的 replace(改写)一律跳过。
+    """
+    from difflib import SequenceMatcher
+
+    sm = SequenceMatcher(None, _syl_seq(norm_m), _syl_seq(norm_e))
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if i2 - i1 != j2 - j1:
+            continue  # 等长才逐位对:增删段/改写段(长段)直接弃
+        if tag == "equal":
+            # 发音对齐块:同字位跳过,异字形位=同音替换候选
+            for k in range(i2 - i1):
+                wrong, right = norm_m[i1 + k], norm_e[j1 + k]
+                if wrong == right:
+                    continue
+                rec = support.setdefault(
+                    (wrong, right), {"missers": set(), "example": raw_q}
+                )
+                rec["missers"].add(norm_m)
+        elif tag == "replace":
+            a_seg, b_seg = norm_m[i1:i2], norm_e[j1:j2]
+            if not a_seg or len(a_seg) > _SEMANTIC_REPLACE_MAX:
+                continue  # 长段是改写不是同音(保守)
+            # 对齐歧义兜底:同音位被留在 replace 块时,逐位拼音相等才逐位取对
+            # (错位同音/异音整段弃)。
+            if any(
+                _pinyin_of(x) != _pinyin_of(y) for x, y in zip(a_seg, b_seg)
+            ):
+                continue
+            for x, y in zip(a_seg, b_seg):
+                if x == y:
+                    continue
+                rec = support.setdefault(
+                    (x, y), {"missers": set(), "example": raw_q}
+                )
+                rec["missers"].add(norm_m)
+
+
+def mine_homophones_semantic(
+    misses: list[dict],
+    entries: list[dict],
+    sims: dict[tuple[str, str], float],
+    *,
+    sim_floor: float = 0.75,
+) -> list[dict]:
+    """语义锚定同音挖掘(二期,VectorQ 配套):治「改写+同音叠加」。
+
+    一期 ``mine_homophones`` 只认整句编辑距离=1 的纯同音替换,「我想先问下
+    裴几多」vs「可以点样赔」这类改写叠加(距离>1)治不动。本函数在 **语义
+    同族**(embed 余弦 ≥sim_floor,由 CP 侧算好传入——本层零 IO 零模型)
+    的前提下,把 miss 与词条问法各归一(``normalize_question``)后按逐字
+    拼音序列做块对齐:发音对齐而字形不同的位即同音替换,产出字符对。
+
+    参数::
+
+        misses    = [{"question": str(未命中问法原话), "count": int}]
+        entries   = [{"id": str, "question_text": str}](enabled 词条)
+        sims      = {(miss 原话, entry_id): float 余弦}——键用 misses 里的
+                    **原话**(未归一),由调用方(CP 引擎)按同一批 misses 计算
+        sim_floor = 语义同族门槛(默认 0.75);缺席/低于门槛的对不看
+
+    规则(与一期同守):count<MIN_HOMOPHONE_MISS_COUNT 的 miss 不看;
+    对齐细节见 ``_harvest_semantic_pairs``(equal 块取异字形位,replace 块
+    两侧各 ≤2 字且逐位同音才取,增删/改写段跳过)。
+
+    输出与 ``mine_homophones`` 同形,按 (-support, wrong, right) 排序::
+
+        [{"wrong": "裴", "right": "赔",
+          "support": int(支持该对的去重 miss 归一形数),
+          "example": str(首个支持 miss 的原话)}]
+    """
+    norms_by_id: dict[str, str] = {}
+    for e in entries or []:
+        if not isinstance(e, dict):
+            continue
+        eid = str(e.get("id") or "")
+        n = normalize_question(str(e.get("question_text") or ""))
+        if eid and n:
+            norms_by_id[eid] = n
+    support: dict[tuple[str, str], dict] = {}
+    for m in misses or []:
+        if not isinstance(m, dict):
+            continue
+        try:
+            cnt = int(m.get("count") or 0)
+        except (TypeError, ValueError):
+            cnt = 0
+        if cnt < MIN_HOMOPHONE_MISS_COUNT:
+            continue
+        raw_q = str(m.get("question") or "")
+        norm_m = normalize_question(raw_q)
+        if not norm_m:
+            continue
+        for eid, norm_e in norms_by_id.items():
+            sim = (sims or {}).get((raw_q, eid))
+            if sim is None:
+                continue
+            try:
+                if float(sim) < sim_floor:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if norm_e == norm_m:
+                continue  # 完全同形:无替换可言
+            _harvest_semantic_pairs(norm_m, norm_e, raw_q, support)
     out = [
         {"wrong": w, "right": r, "support": len(rec["missers"]), "example": rec["example"]}
         for (w, r), rec in support.items()

@@ -25,6 +25,23 @@ BOK_FILLER_GAP_MS 呼吸后自动补第二发——挂「播完观察者」等�
 PlayHandle.wait_for_playout()(播完即醒,精确补位,不靠估时长)。每轮封顶
 1 次(_chain_depth),链发消耗 BOK_FILLER_MAX 同一计数;BOK_FILLER_CHAIN=0 关。
 
+按需第二发(reshot,2026-09-25,取代链发默认位):链发被砍因「每轮固定双发
+啰嗦」——暖轮回复 100ms 后就到也补。载荷轮死区(节奏审计实锤):垫话只盖
+~2.3s,watchdog 4s 闸前纯静默 1.7s+,连轮冷却又保证裸奔轮结构性存在。修法=
+同一「播完观察者」挂点、新开门条件:第一发播完+gap 后回复首音频仍未到,且
+**距 arm 已 >2.2s**(真载荷轮才补,正常 TTFT 轮绝不双发)→ 补一发
+hesitation/promise 短句(dur_s 短者优先)。每轮至多一次(独立计数,不复用链发
+_chain_depth),与第一发合计消耗 BOK_FILLER_MAX 同一计数;连轮冷却豁免同链发
+(本轮已有第一发=冷却已消耗);第二发开播同样打 on_fired 顺延口(agent 侧为
+其重开一次 watchdog 顺延窗,防 4s 闸掐掉在播的第二发)。闸=BOK_FILLER_RESHOT
+(默认开,"0"=单发旧行为);BOK_FILLER_CHAIN=1 时旧链发档优先(逐字节不变)。
+
+开场音节去重(2026-09-25):同文件去重只排重复文件,不排同开头——实测连发
+「嗯——呃——」「嗯，你等等」「嗯，我而家睇下」开场听感雷同。选池升级两窗:
+①既有「最近 2 条同文件」;②新增「开场键=剥停顿标记/标点后的前 2 字」与最近
+2 次垫话相同 → 排除(对按需第二发同样生效)。②排光回退①——宁重复勿静默,
+死区比复读贵(有垫话听比无声等强)。
+
 通道铁律(不变):垫话走 BackgroundAudioPlayer out-of-band 音轨,绝不能走
 session.say()——livekit 1.8 speech 队列严格串行,垫话必排回复后(实机实证)。
 垫话不进 LLM 上下文(out-of-band 不入 chat_ctx,KV 前缀/回声锚零污染)。
@@ -197,6 +214,24 @@ def filler_chain_enabled() -> bool:
     return os.environ.get("BOK_FILLER_CHAIN", "0") == "1"
 
 
+# 按需第二发的 elapsed 闸(2026-09-25):距 arm 超 2.2s 才补。垫话 500ms 起播、
+# ~1.1-2.7s 播完——短句播完+gap 时 elapsed 常落在 2.0s 附近(正常 TTFT 轮),
+# 载荷轮(TTFT 2.2-3.8s)落在 2.5s+;闸把两者分开,治旧链发「固定双发」的根。
+RESHOT_MIN_ELAPSED_S = 2.2
+
+
+def filler_reshot_enabled() -> bool:
+    """按需第二发(reshot,2026-09-25):第一发播完+gap 后回复首音频仍未到、
+    且距 arm 已 >RESHOT_MIN_ELAPSED_S(真载荷轮)→ 补一发 hesitation/promise
+    短句,填补 2.3s→4s(watchdog 闸)之间的死区。
+
+    与已废链发(BOK_FILLER_CHAIN,每轮固定双发)的区别=elapsed 闸——正常
+    TTFT 轮第一发播完时回复已到或将到,绝不双发。BOK_FILLER_RESHOT 默认开,
+    "0"=单发旧行为;新语义独立立法,不复用链发 env。已登记 bok.py
+    _FORWARD_ENV(2026-09-25 四路并行轮预埋)。"""
+    return os.environ.get("BOK_FILLER_RESHOT", "1") == "1"
+
+
 def filler_backfill_enabled() -> bool:
     """miss 播资产后异步把该句用运行时人设音色补物化进缓存(BOK_FILLER_BACKFILL,默认开)。"""
     return os.environ.get("BOK_FILLER_BACKFILL", "1") == "1"
@@ -323,6 +358,23 @@ def filter_deflect_entries(entries: list[dict]) -> list[dict]:
     if dropped:
         print(f"BOK_FILLER pool hygiene: dropped {dropped} deflect-family entries", flush=True)
     return kept
+
+
+# 开场键剥除面(2026-09-25):停顿标记/标点/空白/全角符号一律不算「字」,
+# 只留字母数字与 CJK——键=剩余串的前 2 字。
+_OPENING_STRIP_RE = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff]+")
+
+
+def opening_syllable_key(text: str) -> str:
+    """垫话开场键(纯函数):剥停顿标记与标点后的前 2 字,开场音节去重比对用。
+
+    实证(节奏审计):连发「嗯——呃——」「嗯，你等等」「嗯，我而家睇下」
+    开场听感雷同——同文件去重只排重复文件、不排同开头。键语义:
+    「嗯——呃——」→"嗯呃";「嗯<#0.3#>我而家睇下」与「嗯，我看一下」同键
+    "嗯我"(停顿标记是合成指令,剥掉才同键);「嗯，你等等…」→"嗯你"。
+    """
+    clean = _OPENING_STRIP_RE.sub("", _strip_pause_marks(str(text or "")))
+    return clean[:2]
 
 
 def load_manifest(assets_dir: Path) -> dict[str, list[dict]]:
@@ -534,10 +586,20 @@ class FillerDirector:
         self._on_fired = None
         self._fired_lines: list[str] = []  # 已实际播放(审计/探针断言用)
         self._recent: list[str] = []  # 已选取(含未播出),防相邻重复
+        # 开场音节去重(2026-09-25):file → 开场键,随 _record_recent 记账;
+        # 去重窗恒由 _recent[-2:] 单源派生(外部清 _recent 两窗同清,无平行
+        # 账本漂移),查不到键的旧文件名按无键处理(退同文件窗)。
+        self._key_by_file: dict[str, str] = {}
         self._count = 0
         self._chain_task: asyncio.Task | None = None
-        self._chain_depth = 0  # 本轮已链发次数(每轮封顶 1)
+        self._chain_depth = 0  # 本轮已链发次数(每轮封顶 1;链发旧档专用)
         self._reply_audio_seen = False  # on_reply_first_audio 置位,新轮/arm 重置
+        # 按需第二发(reshot,2026-09-25):独立计数(每轮至多 1,不复用链发
+        # _chain_depth);_arm_time=elapsed 基准(arm 时点);_reshot_firing=第二发
+        # 开播瞬态标(agent 侧顺延口读,真播后即清)。
+        self._reshot_done = False
+        self._arm_time = 0.0
+        self._reshot_firing = False
         # 连轮冷却(2026-09-17 call-11132bdd:8 轮垫 6 轮=轰炸感):相邻轮只垫
         # 一轮歇一轮,除非客户连讲跨轮(arm 序号差 >1 自然放行)。
         self._turn_seq = 0
@@ -548,6 +610,7 @@ class FillerDirector:
     def arm(self) -> None:
         """轮提交、确认走 LLM 正常路径后调用;重复 arm 先作废旧定时器/链发。"""
         self._turn_seq += 1
+        self._arm_time = time.monotonic()  # reshot elapsed 基准(自 arm 起)
         self._cancel_timer()
         self._cancel_chain()
         if not filler_enabled() or self._count >= filler_max_per_call():
@@ -573,9 +636,18 @@ class FillerDirector:
         """注册「垫话真正开播」回调(2026-09-17 RC3):agent 侧把响应看门狗顺延
         接到这里——垫话走 BackgroundAudioPlayer out-of-band 音轨,框架与 watchdog
         均不可见,开播即通知顺延一次,免「垫话盖耳+系统慢」轮被 4s 闸误伤。
+        按需第二发(reshot)开播同样触发——cb 内可查 reshot_firing() 辨第二发,
+        为其重开一次顺延窗(首轮 extended 旗已耗,别让 4s 闸掐在播的第二发)。
         cb 在事件循环内被调(签名 ();链发第二发起播同样触发);cb 异常在触发点
         吞掉,绝不阻垫话出声。None=清除。"""
         self._on_fired = cb
+
+    def reshot_firing(self) -> bool:
+        """当前正在开播的係咪按需第二发(瞬态,真播后即清)。
+
+        agent 侧 _extend_response_watchdog 在 on_fired 回调内读:True=复位
+        extended 旗重走 _watchdog_extend(第二发享有自己的顺延额度)。"""
+        return self._reshot_firing
 
     def fired_this_round(self) -> bool:
         """本轮(当前 arm 序号)是否已垫过——LLM 兜底闸用:垫话已盖耳的轮,
@@ -658,6 +730,7 @@ class FillerDirector:
         self._count = 0
         self._fired_lines.clear()
         self._recent.clear()
+        self._key_by_file.clear()
         self._entry_used.clear()
         self._cancel_timer()
         self._cancel_chain()
@@ -672,11 +745,12 @@ class FillerDirector:
         self._timer = None
 
     def _cancel_chain(self) -> None:
-        """取消链发观察者并复位本轮链发状态(arm/cancel/reset 三处共用)。"""
+        """取消播完观察者并复位本轮链发/按需第二发状态(arm/cancel/reset 三处共用)。"""
         if self._chain_task is not None and not self._chain_task.done():
             self._chain_task.cancel()
         self._chain_task = None
         self._chain_depth = 0
+        self._reshot_done = False
         self._reply_audio_seen = False
 
     def _stop_playing(self) -> None:
@@ -693,8 +767,14 @@ class FillerDirector:
             pass
 
     def _spawn_chain(self) -> None:
-        """首条起播即挂「播完观察者」——官方 PlayHandle.wait_for_playout 精确补位。"""
-        if not filler_chain_enabled() or self._chain_depth > 0:
+        """首条起播即挂「播完观察者」——官方 PlayHandle.wait_for_playout 精确补位。
+
+        观察者由链发(BOK_FILLER_CHAIN=1,旧档)与按需第二发(BOK_FILLER_RESHOT
+        默认开)两语义共用;各自开门条件在 _chain_wait 内分流,两闸同开时链发
+        优先(旧档逐字节不变)。本轮已链发/已补发过 → 不再挂(各自每轮封顶 1)。"""
+        if self._chain_depth > 0 or self._reshot_done:
+            return
+        if not (filler_chain_enabled() or filler_reshot_enabled()):
             return
         self._chain_task = asyncio.create_task(self._chain_wait())
 
@@ -714,7 +794,10 @@ class FillerDirector:
             return
         self._handle = None  # 已播完:清档,放行 _fire 的「上一句还在播」门
         if self._reply_audio_seen:
-            return  # 回复首音频已到,hold 契约自会衔接,唔使链发
+            # 回复首音频已到,hold 契约自会衔接,唔使补第二发。
+            if not filler_chain_enabled() and filler_reshot_enabled():
+                print("BOK_FILLER reshot skip reason=audio_arrived", flush=True)
+            return
         if not filler_enabled() or self._player is None:
             return
         if self._guards() or filler_max_per_call() <= self._count:
@@ -722,11 +805,55 @@ class FillerDirector:
         state = str(getattr(self._session, "agent_state", "") or "")
         if state not in ("listening", "thinking", ""):
             return
-        await asyncio.sleep(filler_gap_s())  # 垫话→垫话同款呼吸
-        if self._reply_audio_seen or self._handle is not None:
-            return  # gap 中回复出声/新开火——让位,唔叠音
-        self._chain_depth += 1
-        await self._fire(0.0)  # 复用开火路径(门在 _fire 内再复核;计数同源)
+        if filler_chain_enabled():
+            # 旧链发档(2026-09-10):gap 呼吸后无条件补一发(每轮封顶 1,
+            # _chain_depth 计数;BOK_FILLER_CHAIN=1 显式恢复才走此档)。
+            await asyncio.sleep(filler_gap_s())  # 垫话→垫话同款呼吸
+            if self._reply_audio_seen or self._handle is not None:
+                return  # gap 中回复出声/新开火——让位,唔叠音
+            self._chain_depth += 1
+            await self._fire(0.0)  # 复用开火路径(门在 _fire 内再复核;计数同源)
+            return
+        # 按需第二发(reshot):同任务内续跑——cancel()/arm() 取消 _chain_task
+        # 必须连 gap 呼吸段一起取消(拆独立 task 会脱管)。
+        await self._reshot_wait()
+
+    async def _reshot_wait(self) -> None:
+        """按需第二发观察段(2026-09-25):gap 呼吸后复核 elapsed 闸再补。
+
+        顺序=①每轮至多一次(独立计数 _reshot_done,不复用链发) ②env 闸
+        ③无 arm 账本(直调 _fire 的嵌入方)不适用 ④gap 呼吸(垫话→垫话同款)
+        ⑤gap 中回复出声让位 ⑥elapsed>RESHOT_MIN_ELAPSED_S(真载荷轮才补——
+        治旧链发「固定双发」的根) ⑦补发走 _fire(reshot=True),计数同源(与
+        第一发合计消耗 BOK_FILLER_MAX);连轮冷却豁免同链发(本轮已有第一发=
+        冷却已消耗,由 _fire 冷却门按 _reshot_done 放行)。"""
+        if self._reshot_done:
+            return
+        if not filler_reshot_enabled():
+            print("BOK_FILLER reshot skip reason=off", flush=True)
+            return
+        if not self.fired_this_round():
+            return
+        await asyncio.sleep(filler_gap_s())
+        if self._reply_audio_seen:
+            print("BOK_FILLER reshot skip reason=audio_arrived", flush=True)
+            return
+        if self._handle is not None:
+            return  # 新开火让位,唔叠音
+        elapsed = max(0.0, time.monotonic() - self._arm_time) if self._arm_time else 0.0
+        if elapsed <= RESHOT_MIN_ELAPSED_S:
+            print(
+                f"BOK_FILLER reshot skip reason=elapsed elapsed={elapsed:.2f}s",
+                flush=True,
+            )
+            return
+        self._reshot_done = True
+        _count_before = self._count
+        await self._fire(0.0, reshot=True)
+        if self._count == _count_before:
+            # _fire 门内被挡(选池全灭/状态翻脸)——打 pool 位归因(闸级失败
+            # 已在上面各 skip 位各归各)。
+            print("BOK_FILLER reshot skip reason=pool", flush=True)
 
     def _pools(self) -> dict[str, list[dict]]:
         if self._manifest is None:
@@ -740,6 +867,30 @@ class FillerDirector:
                 self._manifest = {}
         return self._manifest
 
+    def _record_recent(self, entry: dict) -> None:
+        """选取记账:文件进 _recent 滚动窗,开场键随文件记 _key_by_file——
+        去重窗恒由 _recent[-2:] 单源派生(外部清 _recent 两窗同清)。"""
+        f = str(entry.get("file") or "")
+        self._recent.append(f)
+        self._key_by_file[f] = opening_syllable_key(str(entry.get("text") or ""))
+
+    def _dedup_two_stage(self, entries: list[dict]) -> list[dict]:
+        """两窗去重(纯过滤,不记账):①既有「最近 2 条同文件」排除;②新增
+        「开场键与最近 2 次垫话相同」排除(2026-09-25)。②排光 → 回退①——
+        宁重复勿静默,死区比复读贵;①也排光 → 空表(调用方按池放宽/整池兜底,
+        与旧单窗放宽层次逐字节同构)。开场键查不到的文件名(窗内旧账)按无键
+        处理,只吃①窗。"""
+        recent_files = set(self._recent[-2:])
+        stage1 = [e for e in entries if str(e.get("file") or "") not in recent_files]
+        recent_keys = {self._key_by_file.get(f, "") for f in recent_files} - {""}
+        if not recent_keys:
+            return stage1
+        stage2 = [
+            e for e in stage1
+            if opening_syllable_key(str(e.get("text") or "")) not in recent_keys
+        ]
+        return stage2 or stage1
+
     def _pick(self, lang: str, category: str = "", bucket: str = "") -> dict | None:
         pool = self._pools().get(lang)
         if not pool:
@@ -752,10 +903,9 @@ class FillerDirector:
             bcat = PROMISE_CAT_PREFIX + bucket
             b_pool = [e for e in pool if e.get("cat") == bcat]
             if b_pool:
-                recent = set(self._recent[-2:])
-                candidates = [e for e in b_pool if e["file"] not in recent] or list(b_pool)
+                candidates = self._dedup_two_stage(b_pool) or list(b_pool)
                 entry = random.choice(candidates)
-                self._recent.append(entry["file"])
+                self._record_recent(entry)
                 return entry
             # 桶无专属资产但桶语义指向明确 cat → cat 覆写(query=查证承诺域)。
             if bucket == "query":
@@ -769,29 +919,64 @@ class FillerDirector:
                 cat_pool = [e for e in pool if e.get("cat") == "default"]
             if cat_pool:
                 preferred = cat_pool
-        # 随机不重样(同垫话连续两轮最刺耳):池里剔除上两句后随机。
+        # 随机不重样(同垫话连续两轮最刺耳):池里剔除上两句后随机(2026-09-25
+        # 起两窗:同文件+同开场键,见 _dedup_two_stage)。
         # 优先池被去重清空 → 向整池放宽再挑,而不是原样落回单条池——旧版
         # `or list(pool)` 兜底在分类池只有 1 条时把同一条放回,同句连播
         # (2026-09-14 call-c76832ac 实证:cantonese default 池=1 条,
         # 「冇問題，你稍等多一陣…」4 分钟播 3 次)。只有整池都在去重窗内
         # 才允许重复(池太小没有别的可选)。
-        recent = set(self._recent[-2:])
         # W2a 犹豫垫音混入:hesitation 条目分类器永不命中,不混入=死重;
-        # 命中抽签时同走去重窗(窗内全占才允许重复)。池里无 hesitation
-        # 条目=此分支短路,既有行为逐字节不变。
+        # 命中抽签时同走两窗去重(排光回退同文件窗,窗内全占才允许重复)。
+        # 池里无 hesitation 条目=此分支短路,既有行为逐字节不变。
         hes_pool = [e for e in pool if e.get("cat") == HESITATION_CAT]
         if hes_pool and _hesitation_enabled() and random.random() < HESITATION_BLEND_PROB:
-            hes_candidates = [e for e in hes_pool if e["file"] not in recent] or list(hes_pool)
+            hes_candidates = self._dedup_two_stage(hes_pool) or list(hes_pool)
             entry = random.choice(hes_candidates)
-            self._recent.append(entry["file"])
+            self._record_recent(entry)
             return entry
-        candidates = [e for e in preferred if e["file"] not in recent]
+        candidates = self._dedup_two_stage(preferred)
         if not candidates and preferred is not pool:
-            candidates = [e for e in pool if e["file"] not in recent]
+            candidates = self._dedup_two_stage(pool)
         if not candidates:
             candidates = list(pool)
         entry = random.choice(candidates)
-        self._recent.append(entry["file"])
+        self._record_recent(entry)
+        return entry
+
+    def _pick_reshot(self, lang: str) -> dict | None:
+        """按需第二发选池(2026-09-25):hesitation/promise 短桶,dur_s 短者优先。
+
+        死区补位语气=短犹豫/短承诺(「呃，您稍等啊」再买 1-2s 即可),非完整
+        应承句——长句反而把死区往后拖。选法:①hesitation 池 ∪ promise_* 池;
+        ②语境桶在场且桶承诺池(promise_<bucket>)有货 → 收窄到桶池(W2c 同源,
+        复用现有桶分类);③按 dur_s 升序取短半区(至少 1 条);④两窗去重
+        (同文件+开场键,第二发与前发同开头=复读感)→ 短半区排空放宽全池 →
+        仍排空回退短半区原样(宁重复勿静默)。池空/去重全灭 → None(调用方打
+        reshot skip reason=pool,退 LLM 等待,不硬凑普通应承句)。"""
+        pool = self._pools().get(lang)
+        if not pool:
+            return None
+        bucket = self._current_bucket()
+        self._last_bucket = bucket
+        candidates = [
+            e for e in pool
+            if e.get("cat") == HESITATION_CAT
+            or str(e.get("cat") or "").startswith(PROMISE_CAT_PREFIX)
+        ]
+        if bucket and _context_enabled():
+            b_pool = [e for e in candidates if e.get("cat") == PROMISE_CAT_PREFIX + bucket]
+            if b_pool:
+                candidates = b_pool
+        if not candidates:
+            return None
+        ordered = sorted(candidates, key=lambda e: float(e.get("dur_s") or 0.0))
+        short_half = ordered[: max(1, len(ordered) // 2)]
+        picked = self._dedup_two_stage(short_half) or self._dedup_two_stage(candidates)
+        if not picked:
+            picked = short_half
+        entry = random.choice(picked)
+        self._record_recent(entry)
         return entry
 
     def _current_bucket(self) -> str:
@@ -845,7 +1030,7 @@ class FillerDirector:
                 return self._pick(lang, cat, bucket), cat
         return self._pick(lang, "", bucket), ""
 
-    async def _fire(self, delay: float) -> None:
+    async def _fire(self, delay: float, *, reshot: bool = False) -> None:
         try:
             await asyncio.sleep(delay)
         except asyncio.CancelledError:
@@ -861,11 +1046,13 @@ class FillerDirector:
             if (
                 self._turn_seq > 0
                 and self._chain_depth == 0
+                and not self._reshot_done
                 and self._turn_seq - self._last_fire_seq <= 1
             ):
                 # 连轮冷却(2026-09-17 call-11132bdd:8 轮垫 6 轮=轰炸):相邻轮
-                # 歇一轮;链发(同轮第二发)豁免。_turn_seq=0=无 arm 的直调(旧测试
-                # /嵌入方)不适用冷却语义。客户隔多轮再讲(序号差 >1)放行。
+                # 歇一轮;链发(同轮第二发,_chain_depth)与按需第二发(_reshot_done
+                # 已置=本轮第一发已垫)豁免——本轮已有第一发=冷却已消耗。
+                # _turn_seq=0=无 arm 的直调(旧测试/嵌入方)不适用冷却语义。
                 print("BOK_FILLER skip cooldown (上一轮已垫,防连轮轰炸)", flush=True)
                 return
             state = str(getattr(self._session, "agent_state", "") or "")
@@ -874,7 +1061,13 @@ class FillerDirector:
             if self._handle is not None:
                 return  # 上一句垫话还在播(理论到唔到:cancel 已清),唔叠音
             lang = self._lang_resolver()
-            entry, cat = self._select(lang)
+            if reshot:
+                # 按需第二发选池:hesitation/promise 短桶(不走罐头确定性匹配/
+                # 分类器阶梯——第一发已按语境选过,第二发只补短犹豫声)。
+                entry = self._pick_reshot(lang)
+                cat = HESITATION_CAT
+            else:
+                entry, cat = self._select(lang)
             if not entry:
                 return
             # 双层选源(task-14a):先查运行时人设物化版,miss 落源码资产兜底。
@@ -930,7 +1123,8 @@ class FillerDirector:
             self._fired_lines.append(entry["text"])
             _label = f" call={self._call_label}" if self._call_label else ""
             _bucket_mark = f" bucket={self._last_bucket}" if self._last_bucket else ""
-            print(f"BOK_FILLER fired{_label}{_bucket_mark} count={self._count} line={entry['text']!r} {voice_mark}", flush=True)
+            _mark = "BOK_FILLER reshot fired" if reshot else "BOK_FILLER fired"
+            print(f"{_mark}{_label}{_bucket_mark} count={self._count} line={entry['text']!r} {voice_mark}", flush=True)
             # 展示/账本文本剥 MiniMax 停顿标记——<#0.3#> 是合成指令,原样进字幕
             # 与 turns 账本=用户可见的指令泄漏(缓存键/backfill 仍用原文,勿动)。
             display_text = _strip_pause_marks(str(entry["text"]))
@@ -969,6 +1163,12 @@ class FillerDirector:
                 source = frames_aiter(frames)
             self._play_started = time.monotonic()
             self._handle = self._player.play(source)
+            if reshot:
+                # 按需第二发开播标(瞬态):agent 侧 _extend_response_watchdog 在
+                # on_fired 回调内读 reshot_firing() 辨第二发,为其重开一次顺延窗
+                # (首轮 extended 旗已耗,防 4s 闸掐掉在播的第二发)。回调同步执行,
+                # 单线程事件循环内无竞态。
+                self._reshot_firing = True
             if self._on_fired is not None:
                 # RC3:真正开播(play 已提交)即通知——watchdog 顺延口。异常吞掉,
                 # 顺延失败绝不阻垫话出声。
@@ -976,7 +1176,8 @@ class FillerDirector:
                     self._on_fired()
                 except Exception:  # noqa: BLE001
                     pass
-            self._spawn_chain()  # 挂播完观察者:回复没来就链发第二发
+            self._reshot_firing = False
+            self._spawn_chain()  # 挂播完观察者:回复没来就链发/按需补第二发
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - 垫话失败唔阻通话

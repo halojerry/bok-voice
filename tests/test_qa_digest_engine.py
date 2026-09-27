@@ -334,7 +334,8 @@ def test_digest_drift_disables_three_classes_with_age_gate_and_idempotent(monkey
     e_young = _entry(repo, "可以上门取件吗", "可以。", created_at=_days_ago_iso(0))
     # digits_bypass（问法带 4 位数字 run，词条是死重）→ 禁用
     e_digits = _entry(repo, "查询单号1234", "请稍等。", created_at=_days_ago_iso(30))
-    # repeat_after_play（播了快答客户又问）→ 禁用
+    # repeat_after_play（播了快答客户又问）→ 一升二禁（2026-09-25 VectorQ 化）：
+    # 首犯升阈值 0.80→0.83 不禁用，顶格 0.95 仍犯才禁
     e_repeat = _entry(repo, "幾時送到", "兩到三日。", created_at=_days_ago_iso(30))
     # never_fired（occ≥3 全走 LLM）→ 不自动（两成因分不清）
     e_neverfired = _entry(repo, "可以退换货吗", "七日内可以退换。", created_at=_days_ago_iso(30))
@@ -360,24 +361,36 @@ def test_digest_drift_disables_three_classes_with_age_gate_and_idempotent(monkey
     ))
     out = asyncio.run(qd.run_digest_once(repo=repo, audit=audit_fn, live_count=lambda: 0))
 
-    assert out["disabled"] == 3
+    assert out["disabled"] == 2
     state = {e["id"]: repo.get_qa_entry(e["id"])["enabled"]
              for e in (e_old, e_young, e_digits, e_repeat, e_neverfired, e_lifethit)}
     assert state[e_old["id"]] is False, "never_asked 龄 20d → 禁用"
     assert state[e_young["id"]] is True, "never_asked 龄 0d < 14d → 不自动"
     assert state[e_lifethit["id"]] is True, "never_asked 但终身命中过 → 不自动（窗口 occ=0 ≠ 没用）"
     assert state[e_digits["id"]] is False, "digits_bypass → 禁用"
-    assert state[e_repeat["id"]] is False, "repeat_after_play → 禁用"
-    assert state[e_neverfired["id"]] is True, "never_fired → 不自动"
+    assert state[e_repeat["id"]] is True, "repeat_after_play 首犯 → 一升（阈值 0.83）不禁用"
+    assert out["threshold_raised"] == 1
+    _thr = repo.get_qa_entry(e_repeat["id"])["hit_threshold"]
+    assert _thr is not None and float(_thr) == pytest.approx(0.83)
     upd = [e for e in events if e["action"] == "qa_entry.update"]
-    assert len(upd) == 3
-    assert all(e["detail"]["source"] == "auto-digest" and e["detail"]["enabled"] is False for e in upd)
+    disables = [e for e in upd if e["detail"].get("enabled") is False]
+    raises = [e for e in upd if "hit_threshold" in e["detail"]]
+    assert len(disables) == 2 and len(raises) == 1
+    assert all(e["detail"]["source"] == "auto-digest" for e in upd)
+    assert raises[0]["detail"]["reason"] == "repeat_after_play"
+    assert raises[0]["detail"]["hit_threshold"]["old"] == pytest.approx(0.80)
+    assert raises[0]["detail"]["hit_threshold"]["new"] == pytest.approx(0.83)
 
-    # 幂等二跑：已禁用行不再体检（drift 只扫 enabled=True）→ 零新禁用
+    # 二跑：已禁用行不再体检（drift 只扫 enabled=True）→ 零新禁用；
+    # repeat 词条窗口证据仍在 → 再升 0.83→0.86（一升二禁的「二」腿）。
     events.clear()
     out2 = asyncio.run(qd.run_digest_once(repo=repo, audit=audit_fn, live_count=lambda: 0))
     assert out2["disabled"] == 0
-    assert not [e for e in events if e["action"] == "qa_entry.update"]
+    assert out2["threshold_raised"] == 1
+    _thr2 = repo.get_qa_entry(e_repeat["id"])["hit_threshold"]
+    assert _thr2 is not None and float(_thr2) == pytest.approx(0.86)
+    upd2 = [e for e in events if e["action"] == "qa_entry.update"]
+    assert len(upd2) == 1 and "hit_threshold" in upd2[0]["detail"]
 
 
 def test_entry_age_days_parsing():

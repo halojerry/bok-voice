@@ -443,6 +443,11 @@ class QaEntry(Base):
     # server_default 与 _ensure_column 的 DDL DEFAULT 10 镜像(models.py 惯例:
     # create_all 路径与 ALTER 路径必须同形,否则 schema-drift 门禁红)。
     priority: Mapped[int] = mapped_column(Integer, default=10, server_default="10")
+    # VectorQ 每词条自适应阈值(2026-09-25):可空 float,NULL=用全局默认档(0.80)。
+    # 生产端=CP qa_digest 的 drift 反馈(repeat_after_play 一升二禁/清白命中回落),
+    # 消费端=agent qa_gate 逐条目读 entry["hit_threshold"]。普通可 update 字段
+    # (≠hit_count 计数器——后者只走 incr);server 侧无默认,与 deps 补列 DDL 同形。
+    hit_threshold: Mapped[float | None] = mapped_column(Float, nullable=True)
     template_id: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 

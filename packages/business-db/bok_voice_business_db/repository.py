@@ -276,6 +276,11 @@ class SqlAlchemyBusinessRepository:
             "source": row.source,
             "cluster_head_id": getattr(row, "cluster_head_id", "") or "",
             "priority": int(row.priority) if row.priority is not None else 10,
+            "hit_threshold": (
+                float(row.hit_threshold)
+                if getattr(row, "hit_threshold", None) is not None
+                else None
+            ),
             "template_id": row.template_id,
             "created_at": row.created_at.isoformat() if row.created_at else "",
         }
@@ -310,6 +315,11 @@ class SqlAlchemyBusinessRepository:
             source=data.get("source") or "curated",
             cluster_head_id=data.get("cluster_head_id") or "",
             priority=int(data["priority"]) if data.get("priority") is not None else 10,
+            hit_threshold=(
+                float(data["hit_threshold"])
+                if data.get("hit_threshold") is not None
+                else None
+            ),
             template_id=data.get("template_id") or "",
         )
         self.session.add(row)
@@ -340,6 +350,11 @@ class SqlAlchemyBusinessRepository:
             row.cluster_head_id = str(patch["cluster_head_id"])
         if "priority" in patch and patch["priority"] is not None:
             row.priority = int(patch["priority"])
+        if "hit_threshold" in patch:
+            # VectorQ 阈值(2026-09-25):普通字段且**显式 None=回全局默认档**,
+            # 故不能套上面「键在且值非 None 才写」的护栏——键在即写(None 合法)。
+            ht = patch["hit_threshold"]
+            row.hit_threshold = float(ht) if ht is not None else None
         self.session.commit()
         return self._qa_to_dict(row)
 
@@ -1605,6 +1620,11 @@ class InMemoryBusinessRepository:
             "source": data.get("source") or "curated",
             "cluster_head_id": data.get("cluster_head_id") or "",
             "priority": int(data["priority"]) if data.get("priority") is not None else 10,
+            "hit_threshold": (
+                float(data["hit_threshold"])
+                if data.get("hit_threshold") is not None
+                else None
+            ),
             "template_id": data.get("template_id") or "",
             "created_at": data.get("created_at") or "",
         }
@@ -1620,6 +1640,11 @@ class InMemoryBusinessRepository:
                 row[k] = patch[k]
         if "cluster_head_id" in patch and patch["cluster_head_id"] is not None:
             row["cluster_head_id"] = str(patch["cluster_head_id"])
+        if "hit_threshold" in patch:
+            # VectorQ 阈值(2026-09-25):显式 None=回全局默认档,与 SQL 后端同语义
+            # (键在即写,不走「值非 None 才写」护栏;hit_count 计数器不在此列)。
+            ht = patch["hit_threshold"]
+            row["hit_threshold"] = float(ht) if ht is not None else None
         return dict(row)
 
     def delete_qa_entry(self, entry_id: str) -> bool:
