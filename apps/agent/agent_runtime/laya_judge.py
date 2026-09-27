@@ -454,6 +454,19 @@ async def pick_intent_laya(
 # env BOK_QA_RECALL_K/BOK_QA_RECALL_FLOOR）**——本模块只保留候选面容量上限
 # （+NONE 自动补=9 顶格）。2026-09-25 审计：废除本处常量副本防双源漂移。
 QA_MAX_CANDIDATES = 8
+
+# 【零样本标定结论（2026-09-25 实测,scripts/qa_laya_calibrate.py 100 正/30 负
+# golden 全量）——勿在无新证据时开启本车道】：
+#   - winner==expect 62%（面缩到 4+NONE 仍 63%——缩面救不了）；
+#   - 概率面平坦：p_win p50=0.53、confidence p50=0.20、below_floor 89%
+#     （confidence_floor=0.5 在九选一面上结构性全弃权）；
+#   - 30 条邻近/离题负样本 14 条被选非 NONE（最高 p=0.55）——无达标阈值档
+#     （neg_false=0 与 accuracy≥0.97 不可同时满足）。
+# 结论=零样本 multilingual 档在「多条释义词条 discrimination」任务上不可用
+# （与官方「zero-shot 接近随机,微调才是预期用法」一致;LAYA-EVAL 的 0.99+ 锐利
+# 面是 3-4 选项意图判定,勿外推到词条匹配）。开启路径=微调（官方 RLCD 配方,
+# 弱标签=9B judge 历史输出+fastpath 命中账本,见 LAYA-EVAL §微调）——微调后
+# 必须重跑 qa_laya_calibrate.py 出达标阈值档才准翻 BOK_LAYA_QA。
 # 短 state 预算（LAYA-EVAL §2：超 1024 token 静默截尾，原话放尾部会被截没）。
 QA_STATE_MAX_CHARS = 300
 QA_GOAL_MAX_CHARS = 60

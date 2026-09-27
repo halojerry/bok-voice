@@ -1372,13 +1372,23 @@ def _start_laya(current: dict[str, str], run_dir: Path, log_dir: Path) -> bool:
     面不列——照 embed 的可选增强姿势)。
 
     双闸 opt-in(2026-09-26):``BOK_LAYA_JUDGE`` 默认 "0"=不随栈拉起(0.4B 判定
-    引擎属新装车道,未过实弹验收不进默认栈);="1" 且模型在盘才起。sidecar 进程
-    自身也读同键,"0" 时 /v1/decide 一律 503(手动直起也杀得死)——agent 侧同闸
-    三保险。模型缺失/venv 缺席跳过并留一行明示(agent 走原 9B judge 回落链)。
+    引擎属新装车道,未过实弹验收不进默认栈);="1" 且模型在盘才起。**2026-09-25
+    起两把闸任一打开即拉起**(BOK_LAYA_JUDGE=意图判定车道 / BOK_LAYA_QA=QA
+    验证车道——sidecar 是共享的,两车道独立开关节省一次 690MB 驻留)。sidecar
+    进程自身闸只拦显式 BOK_LAYA_JUDGE=0(未设=开),503 姿势不变;agent 侧
+    两闸各自独立三保险。模型缺失/venv 缺席跳过并留一行明示(agent 走原
+    9B judge 回落链)。
     端口注::8789 是 embed sidecar 既定端口,本服务用家族下一空位 8791。
     """
-    if os.environ.get("BOK_LAYA_JUDGE", "0") != "1":
-        print("[bok] laya judge off (BOK_LAYA_JUDGE!=1) — skip :8791 (agent judges fall back to 9B lane)", file=sys.stderr)
+    if (
+        os.environ.get("BOK_LAYA_JUDGE", "0") != "1"
+        and os.environ.get("BOK_LAYA_QA", "0") != "1"
+    ):
+        print(
+            "[bok] laya off (BOK_LAYA_JUDGE!=1 and BOK_LAYA_QA!=1) — skip :8791 "
+            "(intent judges fall back to 9B lane; QA lane falls back to QA_SEM)",
+            file=sys.stderr,
+        )
         return False
     if healthy(8791):
         return True
