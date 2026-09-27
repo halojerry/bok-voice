@@ -368,7 +368,21 @@ def _llm_draft_flags(current: dict[str, str]) -> list[str]:
 
     模型缺席时打一行 stderr 明示跳过——opt-in 特性静默降级违背可观测纪律,
     但绝不让 serve 起不来。num-draft-tokens 取官方默认 3,不另设 env(实弹
-    调优后再谈)。"""
+    调优后再谈)。
+
+    【2026-09-27 隔离 A/B 实弹判死缓期(scripts/probe_llm_draft_ab.py;基准
+    读数 TTFT 暖档 141ms / decode tps 70.8)——勿在无新证据时开启】:
+    1. mlx-lm 0.31.3 ``speculative_generate_step`` 硬性要求 trimmable prompt
+       cache,而 server 的 ArraysCache(--prompt-cache-size 路径)**任何配置
+       下都不可 trim**——首条生成即 ValueError「requires a trimmable prompt
+       cache (got {'ArraysCache'})」。有无 --prompt-cache-bytes 同错,与本仓
+       旗标无关;server 路径 spec decode 与 prompt cache 架构(TTFT 命中的
+       承重墙)结构性互斥,弃缓存换 spec 不可接受(每轮全量重 prefill)。
+    2. 独立第二记:Qwen3-0.6B 与主模型(avan-ag Qwen3.5-4B)tokenizer 不匹配
+       (server 警告「may not work as expected」)——同分词器前提不成立。
+    复活条件(任一):上游 mlx-lm 让 server cache 可 trim;或 Qwen3.5 家族
+    0.6B 级 draft 发布且分词器匹配。届时重跑 probe_llm_draft_ab.py 三面
+    (tps 加速比 / greedy 逐字节一致 / 内存)达标才准翻闸。"""
     if not _llm_draft_enabled():
         return []
     draft_model = _llm_draft_model(current)

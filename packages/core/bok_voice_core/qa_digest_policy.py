@@ -20,7 +20,10 @@ CP 消化引擎(control_plane 侧,另行落地)喂入候选、拿走分档计划
   (embed 余弦,CP 侧算好传入)的前提下,按**逐字拼音序列**做块对齐——
   发音对齐而字形不同的位就是同音替换本体(「裴/赔」族改写+同音叠加),
   改写段/增删段/异音段一律不出对。「改写+同音叠加」单靠词面距离
-  判不出对,必须有语义锚,挖掘层绝不越界出对子。
+  判不出对,必须有语义锚,挖掘层绝不越界出对子;三期
+  ``mine_homophones_corpus`` 干脆不看词条问法也不看 embedding:同一句话
+  在语料里的两种写法(ASR 伪装的 miss 侧 × 命中侧问法)互为证据——
+  孪生句(等长、恰一处差异、差异字符同音)的方向由命中侧给出。
 
 分工:LLM 聚类结论由 ``qa_cluster`` 产;本模块只做裁决与同音对挖掘,
 全部输入输出是 plain dict,单测全离线。
@@ -512,3 +515,92 @@ def apply_homophones(query: str, pairs: list) -> str:
     if not best:
         return q
     return "".join(best[ch][1] if ch in best else ch for ch in q)
+
+
+# ---- 三期:语料内自聚类同音对挖掘(2026-09-25) ----
+# 同一句话在语料里的两种写法互为证据:ASR 有时把「赔」写成「裴」,于是
+# 「我想先问下裴几多」(未命中词条)与「我想先问下赔几多」(命中词条)共存
+# 于挖掘语料——孪生句一侧未命中一侧命中,方向由命中侧单方面给出。
+# miss↔miss 对(两侧都未命中)没有「谁正谁误」的证据,结构性不收:收了
+# 就是把误差当真值教给运行时。
+
+
+def mine_homophones_corpus(
+    misses: list[dict], matched_corpus: list[dict]
+) -> list[dict]:
+    """三期语料自聚类:miss × matched 语料的孪生句 → 同音替换对(命中侧为正)。
+
+    与前两期的分工:一期只治纯同音替换(整句距离=1);二期治「改写+同音
+    叠加」但被实弹证伪于重度伪装——伪装越好 embedding 越歪越锚不住
+    (裴族 miss 最佳余弦 0.591 够不着 0.75 锚线,循环)。本函数从同一批
+    挖掘语料内部取证据,两个自由度都不要:不依赖词条问法形状(词条只是
+    让「命中侧」得以被标记),不需要 embedding。
+
+    参数::
+
+        misses         = [{"question": str(未命中问法原话), "count": int}]
+                         复现 count≥MIN_HOMOPHONE_MISS_COUNT 才看(同前两期,
+                         单次出现分不清真实问法与 ASR 噪声)
+        matched_corpus = [{"question": str(命中侧问法), "count": int}]
+                         挖掘全量问法−misses(CP 侧构造传入);count 不设
+                         门槛——方向证据与复现无关,一条命中侧原话即可锚定
+
+    规则:两侧各 ``normalize_question`` 归一;**长度分桶**——纯单字替换必
+    等长,只在等长桶内比对(真库 2026-09-25 只读实测:205 通真实通话 →
+    mine_qa_pairs 全量 44 条问法 miss 38/matched 6,量级远低于设计上限;
+    本函数按几百 miss × 几千 matched 设计,分桶后比对面积=桶内乘积)。
+    等长约束下「编辑距离=1」⟺「恰一处差异位」——``_single_sub_pair`` 的
+    O(n) 扫描与 ``_edit_distance(norm_m, norm_e) == 1`` 严格等价,免去
+    O(nm) DP;差异字符 ``_pinyin_of`` 相同(与一期同判据)才出对;完全
+    同形(距离 0)跳过;多处差异/异音差异一律不出。
+
+    方向铁律:wrong 恒取 miss 侧字、right 恒取 matched 侧字;miss↔miss
+    对结构性不产生(本函数只做 miss×matched 配对)。
+
+    输出与前两期同形,按 (-support, wrong, right) 排序::
+
+        [{"wrong": "裴", "right": "赔",
+          "support": int(支持该对的去重 miss 归一形数),
+          "example": str(首个支持 miss 的原话)}]
+    """
+    # 长度分桶:matched 侧一次归一、按长度入桶,miss 侧只扫同长桶。
+    buckets: dict[int, list[str]] = {}
+    for row in matched_corpus or []:
+        if not isinstance(row, dict):
+            continue
+        norm = normalize_question(str(row.get("question") or ""))
+        if norm:
+            buckets.setdefault(len(norm), []).append(norm)
+    support: dict[tuple[str, str], dict] = {}
+    for m in misses or []:
+        if not isinstance(m, dict):
+            continue
+        try:
+            cnt = int(m.get("count") or 0)
+        except (TypeError, ValueError):
+            cnt = 0
+        if cnt < MIN_HOMOPHONE_MISS_COUNT:
+            continue
+        raw_q = str(m.get("question") or "")
+        norm_m = normalize_question(raw_q)
+        if not norm_m:
+            continue
+        for norm_e in buckets.get(len(norm_m), ()):
+            if norm_e == norm_m:
+                continue  # 距离 0:完全同形,无替换可言
+            pair = _single_sub_pair(norm_m, norm_e)
+            if pair is None:
+                continue  # 等长下非「恰一处差异」=距离≠1(改写/多处差异):不出
+            wrong, right = pair
+            if _pinyin_of(wrong) != _pinyin_of(right):
+                continue  # 差异字符异音:不是同音替换
+            rec = support.setdefault(
+                (wrong, right), {"missers": set(), "example": raw_q}
+            )
+            rec["missers"].add(norm_m)
+    out = [
+        {"wrong": w, "right": r, "support": len(rec["missers"]), "example": rec["example"]}
+        for (w, r), rec in support.items()
+    ]
+    out.sort(key=lambda d: (-d["support"], d["wrong"], d["right"]))
+    return out

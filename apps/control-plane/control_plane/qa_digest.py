@@ -33,15 +33,19 @@
    审计 qa_entry.update detail.source=auto-digest，阈值动作带 old/new；
    已禁用行不重复；当轮刚升过的词条不参与回落（同窗既有 repeat 证据又衰减
    自相矛盾）。
-⑥ 同音表（一期词面 + 二期语义锚定）：miss 问法（count≥2，且与现有词条词面
-   互不包含=「不沾」）× 现有词条 → 一期 ``mine_homophones``（整句距离=1）
-   + 二期 ``mine_homophones_semantic``（语义同族 cos≥0.75 前提下按逐字拼音
-   序列块对齐取「裴/赔」族，sims 由本模块 embed 客户端批量算——
+⑥ 同音表（一期词面 + 二期语义锚定 + 三期语料自聚类）：miss 问法（count≥2，且
+   与现有词条词面互不包含=「不沾」）× 现有词条 → 一期 ``mine_homophones``
+   （整句距离=1）+ 二期 ``mine_homophones_semantic``（语义同族 cos≥0.75 前提下
+   按逐字拼音序列块对齐取「裴/赔」族，sims 由本模块 embed 客户端批量算——
    ``BOK_EMBED_BASE_URL`` 覆盖端点、默认本机 :8789 bge 侧车；**不可达/失败
    → 二期跳过记 run error，一期词面路径照跑**；词条向量按 (id, question)
-   进程内缓存）→ 两路结果按 (wrong,right) 合并（support 取大）→ support≥2
-   的对子 UPSERT 进 qa_homophones（support 取 max(旧,新)）。
-   审计 qa.homophone_learn 一条汇总。
+   进程内缓存）+ 三期 ``mine_homophones_corpus``（matched_corpus=挖掘全量
+   问法−misses 归一化对齐去重；孪生句=等长+恰一处同音差异，**方向由命中侧
+   给出**——不依赖 embedding 也不依赖词条问法形状）→ 三路按 (wrong,right)
+   合并（support 取大）→ support≥2 的对子 UPSERT 进 qa_homophones（support
+   取 max(旧,新)）；**source 分轨：三期 corpus 独有的对子 source='corpus'，
+   一/二期已产出的对子保持默认 'auto'**（按 key 互斥切分，同 key 恰写一次，
+   written 计数不翻倍）。审计 qa.homophone_learn 一条汇总。
 ⑦ pregen：本轮有采纳 → 复用 ``pregen.qa_pregen_spawn`` 子进程姿势（与
    POST /api/qa/pregen 同一入口）；失败只记 error 不回滚采纳。
 ⑧ 落 qa_digest_runs 行（各步骤计数；finished_at=下一次挖掘的水位）。
@@ -615,6 +619,48 @@ def _mine_semantic_homophones(
         return [], repr(exc)
 
 
+def _mine_corpus_homophones(
+    policy: Any, misses: list[dict], matched_corpus: list[dict]
+) -> tuple[list[dict], str]:
+    """三期语料自聚类挖掘 → (对子, error)。策略层无此函数（旧版并行开发
+    兼容）→ ([], "")——同二期姿势，一期/二期路径照跑不炸轮。"""
+    harvest = getattr(policy, "mine_homophones_corpus", None)
+    if not callable(harvest):
+        return [], ""
+    try:
+        return list(harvest(misses, matched_corpus) or []), ""
+    except Exception as exc:  # noqa: BLE001 - 策略层异常降级为跳过不炸轮
+        return [], repr(exc)
+
+
+def _matched_corpus_rows(
+    candidates: list[dict], account_id: str, misses: list[dict]
+) -> list[dict]:
+    """三期 matched 语料：本账号挖掘全量问法 − misses（归一化对齐去重）。
+
+    mine_qa_pairs 的问法键本就是归一形，这里再过一遍 ``normalize_question``
+    对齐（幂等）；misses 的归一形从 matched 侧剔除——matched=「方向证据源」，
+    只要不是 miss 就收（词面沾词条的高频问法天然在列，count 不设门槛）。
+    同归一形去重保留首个（mine 输出按 (-calls, question) 排序，首个=计数
+    最高的行）。
+    """
+    miss_norms = {
+        normalize_question(str(m.get("question") or "")) for m in misses or []
+    }
+    seen: set[str] = set()
+    out: list[dict] = []
+    for row in candidates or []:
+        if row.get("account_id") != account_id:
+            continue
+        q = str(row.get("question") or "")
+        norm = normalize_question(q)
+        if not norm or norm in miss_norms or norm in seen:
+            continue
+        seen.add(norm)
+        out.append({"question": q, "count": int(row.get("calls") or 0)})
+    return out
+
+
 def _merge_homophone_pairs(*groups: list[dict]) -> list[dict]:
     """多路挖掘结果按 (wrong,right) 合并：support 取大，example 取先到。
 
@@ -927,8 +973,8 @@ async def _run_once(
         except Exception as exc:  # noqa: BLE001 - 步骤隔离
             errors.append(f"drift({acc}): {exc!r}")
 
-    # ⑥ 同音学习（策略层缺席→跳过）：miss×词条 → 一期词面 + 二期语义锚定，
-    # 合并（support 取大）后 support≥2 对子 UPSERT。
+    # ⑥ 同音学习（策略层缺席→跳过）：miss×词条 → 一期词面 + 二期语义锚定
+    # + 三期语料自聚类，三路合并（support 取大）后 support≥2 对子 UPSERT。
     if policy is not None:
         for acc in accounts:
             try:
@@ -958,14 +1004,40 @@ async def _run_once(
                 sem_pairs, sem_err = _mine_semantic_homophones(policy, misses, entries)
                 if sem_err:
                     errors.append(f"homophone-semantic({acc}): {sem_err}")
-                mined = _merge_homophone_pairs(mined, sem_pairs)
+                # 三期语料自聚类：matched_corpus=挖掘全量问法−misses（归一化
+                # 对齐去重）；孪生句对方向由命中侧给出。策略层旧版无此函数
+                # → 跳过不炸（同二期姿势）。
+                matched_corpus = _matched_corpus_rows(candidates, acc, misses)
+                corpus_pairs, corpus_err = _mine_corpus_homophones(
+                    policy, misses, matched_corpus
+                )
+                if corpus_err:
+                    errors.append(f"homophone-corpus({acc}): {corpus_err}")
+                # 三路合并（support 取大）；source 分轨——三期 corpus 独有的
+                # 对子盖 'corpus' 章，一/二期已产出的对子保持默认 'auto'
+                # （按 key 互斥切分，同 key 恰写一次，written 计数不翻倍）。
+                leg12 = _merge_homophone_pairs(mined, sem_pairs)
+                merged = _merge_homophone_pairs(leg12, corpus_pairs)
+                corpus_only_keys = {
+                    (str(p.get("wrong") or ""), str(p.get("right") or ""))
+                    for p in corpus_pairs
+                } - {
+                    (str(p.get("wrong") or ""), str(p.get("right") or ""))
+                    for p in leg12
+                }
+                auto_rows: list[dict] = []
+                corpus_rows: list[dict] = []
+                for pair in merged:
+                    key = (str(pair.get("wrong") or ""), str(pair.get("right") or ""))
+                    (corpus_rows if key in corpus_only_keys else auto_rows).append(pair)
+                written = upsert_homophones(auto_rows)
+                written += upsert_homophones(corpus_rows, source="corpus")
                 items = [
                     {"wrong": str(p.get("wrong") or "")[:60],
                      "right": str(p.get("right") or "")[:60],
                      "support": int(p.get("support") or 0)}
-                    for p in (mined or [])
+                    for p in (merged or [])
                 ]
-                written = upsert_homophones(mined)
                 if written:
                     audit_fn(
                         "qa.homophone_learn",
