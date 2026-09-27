@@ -1687,6 +1687,11 @@ _FORWARD_ENV = (
     "BOK_LAYA_QA",
     "BOK_LAYA_QA_TIMEOUT_MS",
     "BOK_LAYA_QA_P",
+    # 沉淀引擎 v1（2026-09-25）：闲时自动消化（挖→聚→分档采纳→退休→学同音→
+    # pregen）。AUTO_DIGEST 默认 0（CP 读；自主写库行为先 opt-in 实弹再谈默认）；
+    # HOMOPHONE 默认 1（表空=行为逐字节同旧，学到对子才生效，golden 负样本守门）。
+    "BOK_QA_AUTO_DIGEST",
+    "BOK_QA_HOMOPHONE",
     # —— Laya 决策 sidecar(:8791,2026-09-26):意图/流程判定 10ms 快路。总闸
     #    BOK_LAYA_JUDGE(serve 默认 "0" 不随栈拉起;="1" 且模型在盘才起;sidecar
     #    侧同闸双保险,"0" 时 /v1/decide 一律 503)与端点覆盖(缺省 127.0.0.1:8791;

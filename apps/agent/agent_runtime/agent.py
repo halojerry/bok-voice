@@ -3663,13 +3663,24 @@ async def entrypoint(ctx):
                         _qa_sem_client = EmbedClient(
                             base_url=qa_semantic_base_url(), timeout_s=qa_semantic_timeout_s()
                         )
-                        _qa_sem = await QaSemanticIndex.build(_qa_sem_client, _qa_rows)
+                        # 同音归一对子(2026-09-25 沉淀引擎):CP 闲时学到的 wrong→right
+                        # 对,只注入语义召回面(词面 0.90 快道零漂移铁律);拉取失败/
+                        # 引擎未启用=空表,qa_gate 侧表空=行为逐字节同旧。
+                        try:
+                            _qa_homo = await cp.list_homophones()
+                        except Exception:  # noqa: BLE001 - 对子不可达=不归一
+                            _qa_homo = []
+                        _qa_sem = await QaSemanticIndex.build(
+                            _qa_sem_client, _qa_rows,
+                            homophones=(_qa_homo or None),
+                        )
                         if _qa_sem is None:
                             _qa_sem_reason = (getattr(_qa_sem_client, "last_reason", "") or "").strip() or "no_material"
                             print(f"[agent] qa semantic off ({_qa_sem_reason}) (call {room_name})", flush=True)
                         else:
                             print(
-                                f"[agent] qa semantic on entries={len(_qa_sem)} (call {room_name})",
+                                f"[agent] qa semantic on entries={len(_qa_sem)} "
+                                f"homophones={len(_qa_homo or [])} (call {room_name})",
                                 flush=True,
                             )
                     except Exception as exc:  # noqa: BLE001 - 语义补位不可用零影响

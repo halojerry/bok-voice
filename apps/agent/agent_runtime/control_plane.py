@@ -294,6 +294,22 @@ class ControlPlaneClient:
         except Exception:  # noqa: BLE001
             pass
 
+    async def list_homophones(self) -> list[dict]:
+        """沉淀引擎学到的同音对子(2026-09-25):每通装配拉一次。
+
+        GET /api/stats/qa-digest 的 homophones 段([{"wrong","right","support"}])。
+        失败/形状异常=空列(调用方 None 注入=语义召回行为同旧,绝不阻装配);
+        引擎未启用=空表,零成本。
+        """
+        try:
+            r = await self._client.get("/api/stats/qa-digest")
+            r.raise_for_status()
+            data = r.json()
+            rows = data.get("homophones") if isinstance(data, dict) else None
+            return list(rows) if isinstance(rows, list) else []
+        except Exception:  # noqa: BLE001 - 同音表不可达=不归一,零影响
+            return []
+
     async def list_filler_entries(self, account_id: str = "acc-001") -> list[dict]:
         """垫话罐头启用条目(2026-09-13 乙节):每通装配拉一次,变更下一通生效。
 

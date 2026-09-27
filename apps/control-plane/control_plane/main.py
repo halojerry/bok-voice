@@ -93,6 +93,7 @@ from . import pregen as pregen_mod
 from . import qa_cluster as qa_cluster_mod
 from . import gap_mining
 from . import gap_proposals
+from . import qa_digest as qa_digest_mod
 from . import qa_drift
 from . import silence_poke
 from .auth import (
@@ -500,6 +501,14 @@ def _startup() -> None:
         asyncio.get_event_loop().create_task(_campaign_loop())
     except Exception as exc:  # pragma: no cover
         control_log.warning("campaign_start_failed", extra={"data": {"error": str(exc)}})
+    # QA 自沉淀引擎闲时循环（2026-09-25）：BOK_QA_AUTO_DIGEST 默认关——任务照样
+    # 挂上空转零成本（每周期只读一次 env，翻转免重启）；两表 SQL 存储与 repo 同
+    # engine 绑定，None（内存仓形态）回落 qa_digest 模块级内存表。
+    try:
+        qa_digest_mod.bind_storage(app.state.session_factory)
+        qa_digest_mod.start_digest_task()
+    except Exception as exc:  # pragma: no cover
+        control_log.warning("qa_digest_start_failed", extra={"data": {"error": str(exc)}})
     app.state.settlement = SettlementTrigger()
     # Mirror every JSONL audit event into the repository (SQL or in-memory) so
     # /api/audit is queryable without scraping the file sink.
@@ -1474,6 +1483,7 @@ _AUTO_GATE_KEY_BY_PREFIX: tuple[tuple[str, str], ...] = (
     ("/api/audit", "audit"),
     ("/api/qa/pregen", "qa"),
     ("/api/fillers", "qa"),
+    ("/api/stats/qa-digest", "qa"),  # QA 自沉淀引擎观测面（2026-09-25，管理面只读）
     ("/api/objects", "objects"),
     ("/api/insights", "reports"),
     ("/api/supervisor", "supervisor"),
@@ -1489,7 +1499,9 @@ def auto_gate_management(request: Request) -> None:
             _gate_management(request, key)
             return
     # 无映射：保守回旧角色闸（表应覆盖全部换装点；此处兜底不放大权限面）。
-    auto_gate_management(request)
+    # 2026-09-25 修：旧实现此处误写自调用（auto_gate_management(request)）——
+    # 无映射路径=无限递归 RecursionError 500；按注释本意回 require_role。
+    require_role(request, "admin", "root")
 
 
 def _gate_management(request: Request, key: str) -> None:
@@ -6020,6 +6032,26 @@ def adopt_qa_drift(req: QaDriftAdoptRequest, request: Request) -> JSONResponse:
         status_code=201 if any_created else 200,
         content={"results": results, "adopted": sum(1 for r in results if r["created"])},
     )
+
+
+@app.get("/api/stats/qa-digest")
+def stats_qa_digest(request: Request, account_id: str = "acc-001", limit: int = 20) -> dict:
+    """QA 自沉淀引擎观测面（只读，2026-09-25）：最近 N 轮 run 行+当前同音对子表。
+
+    引擎自主跑、**无写端点**——人不需要按钮；本面只回答「它跑了没有、采了什么、
+    学了什么」。闸=管理面下发制（/api/stats/qa-digest → qa 键，与 /api/qa/pregen
+    同族；run 行/同音表是全局沉淀，无账号维度列，scoped_account 仅做身份口径
+    归一不裁剪行）。
+    """
+    auto_gate_management(request)
+    scoped_account(request, account_id)  # 身份口径归一；数据本身全局（表无账号列）
+    return {
+        "enabled": qa_digest_mod.digest_enabled(),
+        "policy": qa_digest_mod.policy_module() is not None,
+        "interval_s": qa_digest_mod.digest_interval_s(),
+        "runs": qa_digest_mod.list_runs(limit=max(1, min(int(limit), 100))),
+        "homophones": qa_digest_mod.list_homophones(),
+    }
 
 
 @app.get("/api/insights")

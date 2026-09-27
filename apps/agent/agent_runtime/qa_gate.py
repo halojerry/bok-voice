@@ -23,6 +23,15 @@ scope 变体唔会在异步出线、跨语言成员唔会在本语通话播—�
 双向姿势,治「超集句」单向缺口)+ 0.15×拼音 bigram Dice(治 ASR 同音错字,
 pypinyin 缺库/``BOK_QA_PINYIN=0`` 时通道恒 0、余两项按比例归一)。幸存面与
 折组纪律同 match;``match()`` 本体零改动。
+
+同音归一应用钩子(2026-09-25,**只挂语义召回面**):沉淀引擎把真实通话学到的
+同音对子(裴→赔)经 CP 拉取、构造注入 ``QaSemanticIndex(homophones=)``——
+``match()``/``rank()`` 的查询文本在 ``normalize_question`` 之后按对子归一再
+embed(词条素材向量不动,双方在语义空间自然接近)。词面 ``QaIndex.match``/
+``rank`` 恒不吃(0.90 快道零漂移铁律)。策略函数在
+``bok_voice_core.qa_digest_policy.apply_homophones``(并行交付):import 失败/
+调用失败一律原查询逐字节(优雅降级);``BOK_QA_HOMOPHONE=0`` 整钩子旁路,
+表空/无对子=行为逐字节同旧。
 """
 
 from __future__ import annotations
@@ -94,6 +103,12 @@ def qa_recall_floor() -> float:
 def qa_semantic_enabled() -> bool:
     """语义补位车道总闸(W3b 解锁,2026-09-24):词面 0.90 未中轮的本地 embedding 补位。"""
     return os.environ.get("BOK_QA_SEMANTIC", "1") == "1"
+
+
+def qa_homophone_enabled() -> bool:
+    """同音归一应用钩子开关(语义召回面专用,2026-09-25):0=整个钩子旁路,
+    行为逐字节同旧。词面 0.90 快道与词面 rank 恒不吃归一(零漂移铁律)。"""
+    return os.environ.get("BOK_QA_HOMOPHONE", "1") == "1"
 
 
 def qa_semantic_threshold() -> float:
@@ -494,6 +509,50 @@ class QaIndex:
         return self._team_head(entry, lang=lang, step_index=step_index)
 
 
+def _homophone_pairs(raw: list | None) -> list[tuple[str, str]]:
+    """CP 端点形状 → ``(wrong, right)`` 元组列(装配时一次归一,坏项静默丢弃)。
+
+    接受 dict 列(``{"wrong","right","support"}``;support 仅为溯源信息,此处
+    忽略)或二元组列;缺键/非字符串/空串/自反(wrong==right)/形状不明一律
+    跳过——装配面坏数据绝不炸通话。
+    """
+    pairs: list[tuple[str, str]] = []
+    for item in raw or []:
+        if isinstance(item, dict):
+            wrong, right = item.get("wrong"), item.get("right")
+        elif isinstance(item, (tuple, list)) and len(item) >= 2:
+            wrong, right = item[0], item[1]
+        else:
+            continue
+        if not isinstance(wrong, str) or not isinstance(right, str):
+            continue
+        wrong, right = wrong.strip(), right.strip()
+        if not wrong or not right or wrong == right:
+            continue
+        pairs.append((wrong, right))
+    return pairs
+
+
+def _homophone_normalize(q: str, pairs: list[tuple[str, str]]) -> str:
+    """查询侧同音归一(策略单点):``apply_homophones`` 缺失/失败 → 原查询逐字节。
+
+    策略函数在 ``bok_voice_core.qa_digest_policy``(并行交付面),**惰性 import**
+    ——包缺席是常态部署形态,import 失败=无对子行为;调用期任何异常也兜住,
+    召回面绝不因归一炸轮。
+    """
+    if not q or not pairs:
+        return q
+    try:
+        from bok_voice_core.qa_digest_policy import apply_homophones
+    except ImportError:
+        return q
+    try:
+        out = apply_homophones(q, pairs)
+    except Exception:  # noqa: BLE001 - 策略面任何失败都不许炸召回
+        return q
+    return out if isinstance(out, str) and out else q
+
+
 class QaSemanticIndex:
     """快答库语义补位索引(2026-09-24,W3b 解锁):词面 0.90 未中轮的释义档。
 
@@ -505,21 +564,41 @@ class QaSemanticIndex:
     - **词面档恒绝对优先**:语义只在词面 match 未中时补位(调用方职责),
       命中条目进与词面同款的轮换/PCM 出场链(折组经 QaIndex.team_head);
     - 胜者=最高余弦、平分吃插入序,**不进优先级 duel**——补位车道语义:
-      词面档的 (priority,-score) 契约不延伸到这里,最贴近的问法直接出场。
+      词面档的 (priority,-score) 契约不延伸到这里,最贴近的问法直接出场;
+    - **同音归一只在查询侧**(2026-09-25):构造注入 ``homophones=``(CP 已学
+      对子),``match``/``rank`` 的查询文本经 ``apply_homophones`` 归一后再
+      embed——词条素材向量在 build 时已按原问法固化,**不动**(改素材=改既
+      有缓存序列;查询与素材同在语义空间,归一查询自然贴近正字素材)。
+      ``BOK_QA_HOMOPHONE=0`` 旁路;表空/策略缺失/失败=行为逐字节同旧。
     """
 
-    def __init__(self, client, items: list[tuple[dict, str, list[float]]]):
+    def __init__(
+        self,
+        client,
+        items: list[tuple[dict, str, list[float]]],
+        *,
+        homophones: list | None = None,
+    ):
         self._client = client
         self._items = items  # (entry, 归一问法, 语义向量),插入序=created_at
+        # 同音对子:CP 形状(dict/元组列)在此一次归一,坏项丢弃;None/空=旧行为。
+        self._homophones: list[tuple[str, str]] = _homophone_pairs(homophones)
 
     def __len__(self) -> int:
         return len(self._items)
 
     @classmethod
-    async def build(cls, client, entries: list[dict]) -> "QaSemanticIndex | None":
+    async def build(
+        cls,
+        client,
+        entries: list[dict],
+        *,
+        homophones: list | None = None,
+    ) -> "QaSemanticIndex | None":
         """装配构建(异步:批量 embed)。素材=去重归一问法(同问法多条目共享
         向量、首条出场——快路命中面按问法);零素材/任一批次失败 → None 整通
-        惰性(零行为变化)。"""
+        惰性(零行为变化)。``homophones`` 只透传给构造(查询侧归一),素材
+        embed 恒吃原归一问法、缓存键零变化(词面素材序列不动)。"""
         from .intent_semantic import (
             _BUILD_EMBED_CHUNK,
             _BUILD_EMBED_TIMEOUT_S,
@@ -552,7 +631,7 @@ class QaSemanticIndex:
                 vecs.extend(chunk)
             cached = dict(zip(texts, vecs))
             SEMANTIC_VECTOR_CACHE.put(key, cached)
-        return cls(client, [(e, q, cached[q]) for e, q in items])
+        return cls(client, [(e, q, cached[q]) for e, q in items], homophones=homophones)
 
     async def match(
         self,
@@ -572,6 +651,12 @@ class QaSemanticIndex:
         from .intent_semantic import _cosines
 
         q = normalize_question(user_text)
+        # 同音归一应用钩子(2026-09-25):顺序钉死=先 normalize_question 再按
+        # 对子替换——归一化清标点/空白,对子替换吃干净文本;仅查询侧,词条
+        # 素材向量不动(双方在语义空间自然接近)。表空/env 关/策略缺失/失败
+        # → 原查询逐字节(=旧行为)。词面 QaIndex.match 恒不吃此钩子。
+        if self._homophones and qa_homophone_enabled():
+            q = _homophone_normalize(q, self._homophones)
         if not q or not self._items:
             return None, 0.0, "empty"
         if self._client is None or self._client.dead:
@@ -622,6 +707,10 @@ class QaSemanticIndex:
         from .intent_semantic import _cosines
 
         q = normalize_question(user_text)
+        # 同音归一与 match 同款(顺序钉死:normalize→对子替换;仅查询侧,
+        # 词面 QaIndex.rank 恒不吃——词面召回的对子收益归语义面管)。
+        if self._homophones and qa_homophone_enabled():
+            q = _homophone_normalize(q, self._homophones)
         if not q or not self._items:
             return []
         if self._client is None or self._client.dead:
