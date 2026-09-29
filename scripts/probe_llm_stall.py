@@ -150,26 +150,6 @@ async def main() -> int:
     reproduced = False
     timeline_lines: list[str] = [f"# 慢速注入时间线（tps={args.tps}）", f"- call={call_id}", ""]
 
-    def attach(track) -> None:
-        if int(track.kind) != int(rtc.TrackKind.KIND_AUDIO):
-            return
-        if getattr(track, "name", "") not in ("roomio_audio", "background_audio"):
-            return
-
-        async def _read() -> None:
-            stream = rtc.AudioStream(track, sample_rate=16000, num_channels=1)
-            try:
-                async for event in stream:
-                    _ = getattr(event, "frame", event)
-            except Exception:
-                pass
-
-        read_tasks.append(asyncio.get_running_loop().create_task(_read()))
-
-    @room.on("track_subscribed")
-    def _on_track(track, _pub, _part):
-        attach(track)
-
     try:
         data = httpx.post(
             f"{erc.CONTROL_PLANE_URL}/api/token",
@@ -184,6 +164,34 @@ async def main() -> int:
         )
         pcms = [erc.tts_pcm(t, "cantonese") for t in ROUNDS]
         print(f"[stall] 预合成 {len(pcms)} 轮完成", flush=True)
+        # 等开场白播完再推（同 FLOW20 姿势）：不等的话推入音频落在 opening
+        # 播放期，VAD/endpointing 全程不触发=零转写（T2 首跑实证）。
+        agent_audio = bytearray()
+
+        def _collect(track) -> None:
+            if int(track.kind) != int(rtc.TrackKind.KIND_AUDIO):
+                return
+            if getattr(track, "name", "") not in ("roomio_audio", "background_audio"):
+                return
+
+            async def _read() -> None:
+                stream = rtc.AudioStream(track, sample_rate=16000, num_channels=1)
+                try:
+                    async for event in stream:
+                        frame = getattr(event, "frame", event)
+                        agent_audio.extend(bytes(frame.data))
+                except Exception:
+                    pass
+
+            read_tasks.append(asyncio.get_running_loop().create_task(_read()))
+
+        @room.on("track_subscribed")
+        def _on_track2(track, _pub, _part):
+            _collect(track)
+
+        setup_ok = await erc.wait_greeting(agent_audio)
+        print(f"[stall] 开场白 {'OK' if setup_ok else '45s 未出声（照常推进）'}", flush=True)
+        agent_audio.clear()
         for i, pcm in enumerate(pcms, 1):
             await erc.push_pcm(src, pcm)
             t_push = time.perf_counter()
