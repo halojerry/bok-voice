@@ -762,6 +762,15 @@ def ladder_should_fire(fired: set[str], level: str) -> bool:
     同句实证）。显式账本替数值：fired=本步已发射级别集合（advance/jump 清空，
     换步同级别可再发）。close 级不走本门（enter_closing 幂等+块外 closing 拦）。"""
     return level not in fired
+
+
+def unclear_should_advance(streak: int, threshold: int) -> bool:
+    """unclear 连续推进门（P3.1，2026-09-29 v2 spec §6）：连续 unclear 达阈值。
+
+    产品语义（Ethan 拍板「意图不明确的时候就一步一步往下走」）：judge 连续
+    N 轮判 unclear → 走 rule=auto 同构管线推一步。纯数值判定；边界门（非最后
+    一步/closing/done/WA 收号）在 agent 消费点组合。"""
+    return streak >= max(1, int(threshold))
 # 已知资料键:若号码 run 命中佢哋 → 唔当新 WhatsApp(覆述单号/电话)
 _KNOWN_NUM_KEYS = ("快递单号", "快递单號", "快递尾号", "電話", "电话", "電話號碼")
 
@@ -1177,6 +1186,10 @@ class FlowController:
     # 同级不连发账本(P2.b,2026-09-29 v2 spec §5):本步已发射过的阶梯级别。
     # advance/jump_to 清空(换步新账);close 不入账(enter_closing 幂等)。
     ladder_fired: set[str] = field(default_factory=set)
+    # unclear 连续推进账本(P3.1,2026-09-29 v2 spec §6):同 step 连续 judge
+    # unclear 轮数。实答轮 -1 抵销(relieve_unclear_streak,挂 relieve_stall_streak
+    # 同点);advance/jump_to 清零(换步新账)。
+    unclear_streak: dict[int, int] = field(default_factory=dict)
     # 话术图(2026-09-18 Phase 2):意图节点+绑定边;空图=零变化。from_template
     # 宽容解析 template["graph_json"](坏 JSON/坏版本→空图,spec §3 校验双轨)。
     graph: FlowGraphDoc = field(default_factory=FlowGraphDoc)
@@ -1265,7 +1278,9 @@ class FlowController:
         # 首行执行(守卫之前):冇流程的控制器也照清,账本语义与流程解耦。
         self.step_streak.pop(self.current, None)
         # P2.b（2026-09-29 v2 §5）：换步=新账——ladder_fired 清空（同级在新步可再发）。
+        # P3.1：unclear 推进账同点清零（新步新账）。
         self.ladder_fired.clear()
+        self.unclear_streak.clear()
         if not self.has_steps or self.done:
             return
         if self.current < len(self.steps):
@@ -1290,8 +1305,9 @@ class FlowController:
         self.current = target
         self._just_advanced = True
         self._entered_by_jump = True
-        # P2.b：跳转=换步，ladder_fired 同步清空（镜像 advance）。
+        # P2.b：跳转=换步，ladder_fired 同步清空（镜像 advance）；P3.1 unclear 同点。
         self.ladder_fired.clear()
+        self.unclear_streak.clear()
         # 前向跳:起点步之后、目标步之前的全部被跳过(1-based);后退跳无「被跳过」
         # 语义(嗰啲步客户早已听过),留空走「回到本步」措辞。
         self._jump_skipped = list(range(before + 2, target + 1)) if target > before else []
@@ -1353,6 +1369,27 @@ class FlowController:
         cur = self.step_streak.get(self.current, 0)
         if cur > 0:
             self.step_streak[self.current] = cur - 1
+
+    def bump_unclear_streak(self) -> int:
+        """judge unclear 消费点 bump（P3.1，2026-09-29 v2 spec §6）。
+
+        返回当前步新值（消费点直接喂 unclear_should_advance）。"""
+        n = self.unclear_streak.get(self.current, 0) + 1
+        self.unclear_streak[self.current] = n
+        return n
+
+    def unclear_at(self, step: int) -> int:
+        """当前步 unclear 连续数（缺省 0）。"""
+        return self.unclear_streak.get(step, 0)
+
+    def relieve_unclear_streak(self) -> None:
+        """实答轮抵销 unclear 计数（挂 relieve_stall_streak 同点，0 下限）。
+
+        健康问答链（客户提问-AI 实答）不攒推进账——只有真死火轮连续 unclear
+        才推。"""
+        cur = self.unclear_streak.get(self.current, 0)
+        if cur > 0:
+            self.unclear_streak[self.current] = cur - 1
 
     def apply_judge_verdict(self, verdict: str) -> None:
         """LLM 语义判定结果落状态(advance→推进;其它唔郁)。"""

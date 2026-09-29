@@ -113,6 +113,7 @@ from .flow import (  # noqa: F401 - 部分名字只被 branch_hit_plan 使用
     render_template_text,
     ladder_should_fire,
     stall_ladder_level,
+    unclear_should_advance,
 )
 
 try:
@@ -4273,6 +4274,7 @@ async def entrypoint(ctx):
         if relieve:
             try:
                 flow_ctrl.relieve_stall_streak()
+                flow_ctrl.relieve_unclear_streak()  # P3.1：实答同样抵销推进账
             except Exception:  # pragma: no cover - 抵销失败唔阻车道
                 pass
         # 跨轮复读账本(PART C):脚本车道登记时点即入账(即使随后被打断)。
@@ -4915,7 +4917,46 @@ async def entrypoint(ctx):
                     else:
                         print(f"[flow] judge(bg)=confirm blocked (wa step, not captured) step={step_at + 1} (call {room_name}){_route_log}", flush=True)
                 else:
-                    print(f"[flow] judge(bg)={jv} step={step_at + 1} (call {room_name}){_route_log}", flush=True)
+                    # P3.1（2026-09-29 v2 spec §6，Ethan 拍板「意图不明确时一步步往下走」）：
+                    # judge unclear 连续达门槛 → rule=auto 同构推进。边界门：非最后
+                    # 一步（到底交 stall ladder 接管）/非 closing/done/WA 收号未捕获
+                    # （模糊话不得推过收号步=丢号）。实答轮 relieve_unclear_streak
+                    # 抵销——健康问答链不攒推进账。BOK_UNCLEAR_ADVANCE=0 整闸回退。
+                    _advanced_uc = False
+                    if jv == UNCLEAR:
+                        _n_uc = flow_ctrl.bump_unclear_streak()
+                        _n_need = 0
+                        try:
+                            _n_need = int(os.environ.get("BOK_UNCLEAR_ADVANCE_N", "3") or 3)
+                        except ValueError:
+                            _n_need = 3
+                        if (
+                            os.environ.get("BOK_UNCLEAR_ADVANCE", "1") == "1"
+                            and unclear_should_advance(_n_uc, _n_need)
+                            and flow_ctrl.has_steps
+                            and flow_ctrl.current < len(flow_ctrl.steps) - 1
+                            and not flow_ctrl.closing
+                            and not flow_ctrl.done
+                        ):
+                            _gu, _ru = flow_ctrl.current_goal_ref()
+                            if wa_confirm_advance_allowed(goal=_gu, ref=_ru, captured=_wa_captured["on"]):
+                                flow_ctrl.advance()
+                                context_state.set_flow_current(flow_ctrl.current_step_text())
+                                _invalidate_stale_preemptive("unclear 连续 → 推进")
+                                _advanced_uc = True
+                                print(
+                                    f"[flow] unclear-advance step={flow_ctrl.current + 1} "
+                                    f"streak={_n_uc} (call {room_name}){_route_log}",
+                                    flush=True,
+                                )
+                            else:
+                                print(
+                                    f"[flow] unclear-advance blocked (wa step, not captured) "
+                                    f"step={flow_ctrl.current + 1} streak={_n_uc} (call {room_name}){_route_log}",
+                                    flush=True,
+                                )
+                    if not _advanced_uc:
+                        print(f"[flow] judge(bg)={jv} step={step_at + 1} (call {room_name}){_route_log}", flush=True)
             # 跟进工单消费(漏斗 v2,spec §3.3):judge 高置信 register_followup →
             # CP 建单 + 诚实确认语直念(登记+专人跟进+SLA,绝不装查)。背景任务
             # 内执行唔进关键路径;speech 队列天然串行,确认语排在在途回复后出声。
