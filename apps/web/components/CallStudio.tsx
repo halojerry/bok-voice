@@ -12,7 +12,7 @@ import {
 } from "@livekit/components-react";
 import { ConnectionState, TokenSource, Track, type Room } from "livekit-client";
 import { ArrowRight } from "lucide-react";
-import { api } from "@/lib/api";
+import { api, apiBase } from "@/lib/api";
 import { describeConnectError, friendlyErrorText, useControlPlaneReady } from "@/lib/api-ready";
 import { listAudioDevicesOf, requestMicPermission, saveMicDevice, savedMicDevice, savedOutputDevice, switchWebOutputDevice, webCanSwitchOutput, type AudioDeviceInfo } from "@/lib/audio";
 import { startTrace } from "@/lib/logger";
@@ -977,6 +977,28 @@ function CallStudioInner({
     // 外壳保留「查看通话记录」入口(转写在会话页,工作台重挂后已清)。
     onCycle(finished);
   }
+
+  // 挂断兜底（P1.a，2026-09-29 v2 spec §4）：关页/刷新不经过 leave() 的路径，
+  // 用 sendBeacon 补发 hangup。beacon 无法带 auth 头——auth-off 本机/局域网档
+  // 直达；auth-on 部署 beacon 可能 401，此路径只作 best-effort，服务端
+  // ever_dispatched（P1.b 补派免疫）才是根治。重复 hangup 幂等（CP 已 ENDED
+  // 短路）。pagehide 兼容移动端 Safari 的 bfcache 退出路径。
+  useEffect(() => {
+    const onHide = () => {
+      const id = callIdRef.current;
+      if (!id || typeof navigator.sendBeacon !== "function") return;
+      try {
+        navigator.sendBeacon(
+          `${apiBase().replace(/\/$/, "")}/api/calls/${id}/hangup`,
+          new Blob(["{}"], { type: "application/json" }),
+        );
+      } catch {
+        /* best-effort */
+      }
+    };
+    window.addEventListener("pagehide", onHide);
+    return () => window.removeEventListener("pagehide", onHide);
+  }, []);
 
   return (
     <div className="grid grid-cols-[280px_1fr_300px] gap-6 lg:h-[calc(100vh-7.5rem)]">
