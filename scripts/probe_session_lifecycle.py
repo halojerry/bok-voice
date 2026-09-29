@@ -216,11 +216,40 @@ async def _one_call(lk: LiveKitAPI, mode: str, dwell_s: float = 4.0) -> dict:
             if "session_started" in win and call_id in win:
                 break
             await asyncio.sleep(0.5)
+        # 收 agent 音轨等开场白播完（同 FLOW20 姿势——不等就推=推入音频落在
+        # opening 播放期，VAD 全程不触发=零转写，2026-09-30 探针首跑实证）。
+        agent_audio = bytearray()
+        read_tasks: list[asyncio.Task] = []
+
+        def _collect(t) -> None:
+            if int(t.kind) != int(rtc.TrackKind.KIND_AUDIO):
+                return
+            if getattr(t, "name", "") not in ("roomio_audio", "background_audio"):
+                return
+
+            async def _read() -> None:
+                stream = rtc.AudioStream(t, sample_rate=16000, num_channels=1)
+                try:
+                    async for event in stream:
+                        frame = getattr(event, "frame", event)
+                        agent_audio.extend(bytes(frame.data))
+                except Exception:
+                    pass
+
+            read_tasks.append(asyncio.get_running_loop().create_task(_read()))
+
+        @room.on("track_subscribed")
+        def _on_track(t, _pub, _part):
+            _collect(t)
+
+        await erc.wait_greeting(agent_audio)
         # 推一轮话（真实会话活动，令 ASR/LLM/TTS 资源真实占用）
         await erc.push_pcm(src, erc.tts_pcm(STIM_TEXT, "cantonese"))
-        await asyncio.sleep(4.0)  # 听答+真实停留
+        await asyncio.sleep(dwell_s)  # 听答+真实停留（--dwell 长停留复刻连打中的长通话）
     finally:
         t_hangup = time.perf_counter()
+        for _t in read_tasks:
+            _t.cancel()
         try:
             await asyncio.wait_for(room.disconnect(), timeout=10)
         except Exception:
