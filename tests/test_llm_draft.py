@@ -91,10 +91,14 @@ def test_cache_bytes_explicit_env_never_discounted(monkeypatch):
 
 
 def test_cache_bytes_draft_discount_pairing(monkeypatch):
-    """无显式 env:draft 开=5GB(权重+KV ~0.5GB 腾挪位),关=6GB(默认不变)。"""
+    """无显式 env:draft 开=3.5GB(权重+KV ~0.5GB 腾挪位),关=4GB。
+
+    2026-09-29 v2 P1.d 定档：8 连打探针实测每通 cache +0.35-0.45GB，6GB 上限
+    第 8-10 通打穿进 LRU 换页（生成段 tps 崩 2.6 实证）；4GB=日常 8-10 通
+    工作集零换页。要回 6GB：env 显式覆盖。"""
     _clear_draft_env(monkeypatch)
-    assert bok._default_prompt_cache_bytes(draft_on=False) == "6GB"
-    assert bok._default_prompt_cache_bytes(draft_on=True) == "5GB"
+    assert bok._default_prompt_cache_bytes(draft_on=False) == "4GB"
+    assert bok._default_prompt_cache_bytes(draft_on=True) == "3.5GB"
 
 
 def test_models_table_llm_draft_registration():

@@ -192,10 +192,19 @@ async def _one_call(lk: LiveKitAPI, mode: str, dwell_s: float = 4.0) -> dict:
         await room.connect(data["serverUrl"], data["participantToken"])
         if mode == "abandon":
             # 复刻病灶形态：主客户断开后房里仍有真人（2026-09-29 三例 job2
-            # 复活时 Ethan web 端没关页）——observer 连房滞留，令看门狗看到
-            # 「真人在场 + 无 agent」的补派窗。
+            # 复活时 Ethan web 端没关页）——observer 以 purpose=listen 旁听身份
+            # 连房滞留（独立 token：同 token 二连会挂起；listen 不排看门狗=
+            # 零副作用），令看门狗看到「真人在场 + 无 agent」的补派窗。
+            ldata = httpx.post(
+                f"{erc.CONTROL_PLANE_URL}/api/token",
+                json={"account_id": "acc-001", "call_id": call_id, "purpose": "listen"},
+                timeout=10, headers=erc.CP_HEADERS,
+            ).json()
             observer = rtc.Room()
-            await observer.connect(data["serverUrl"], data["participantToken"])
+            await asyncio.wait_for(
+                observer.connect(ldata["serverUrl"], ldata["participantToken"]),
+                timeout=10,
+            )
         src = rtc.AudioSource(sample_rate=16000, num_channels=1)
         track = rtc.LocalAudioTrack.create_audio_track("customer-src", src)
         await room.local_participant.publish_track(
@@ -213,7 +222,7 @@ async def _one_call(lk: LiveKitAPI, mode: str, dwell_s: float = 4.0) -> dict:
     finally:
         t_hangup = time.perf_counter()
         try:
-            await room.disconnect()
+            await asyncio.wait_for(room.disconnect(), timeout=10)
         except Exception:
             pass
         if mode == "hangup":
@@ -240,11 +249,16 @@ async def _one_call(lk: LiveKitAPI, mode: str, dwell_s: float = 4.0) -> dict:
         await asyncio.sleep(0.5)
     row["job_exit_s"] = job_exit
 
+    # room_gone 复测（hangup 臂）：job 退出后房间才真正空——首轮并行测的
+    # None 是探针缺陷（job 15s 收尾期房间必然在），job 退后再等房删。
+    if mode == "hangup" and row.get("room_gone_s") is None:
+        row["room_gone_s"] = await _wait_room_gone(lk, call_id, 15.0)
+
     # 结算窗后再数 job/补派（补派发生在 job1 退后 ~3s，abandon 臂等 25s 足够）
     await asyncio.sleep(25.0 if mode == "abandon" else 5.0)
     if observer is not None:
         try:
-            await observer.disconnect()  # 补派窗观测完，observer 撤场
+            await asyncio.wait_for(observer.disconnect(), timeout=10)  # 补派窗观测完，observer 撤场
         except Exception:
             pass
     win = _log_window(erc.LOG_PATH, agent_off)

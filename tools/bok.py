@@ -1369,17 +1369,20 @@ def _physical_mem_gib() -> float:
 def _default_prompt_cache_bytes(draft_on: bool = False) -> str:
     """:1235 prompt-cache-bytes 档位,三级优先级:① BOK_LLM_PROMPT_CACHE_BYTES 显式
     覆盖(专家直设,最高;draft 开时**不折**——用户显式值尊重原样);② draft_on=True
-    (draft 模型在场)→ 5GB;③ 否则 6GB(2026-09-26 由 12GB 下调——全栈实测 47/48G
-    占用、压缩器扛 24G,12GB cache 灌满(111 序列/11.77GB)而每通真命中的只有自家
-    1555-token 前缀;V10 实弹 12→6GB 单通无损(cached 0.906→0.901、TTFT 噪声级),
-    省内存直接卸压缩/换页压力)。draft 折扣(2026-09-25):0.6B-4bit draft 权重
-    ~0.4-0.5GB + draft 侧 KV 计入同一 prompt-cache-bytes 池——开 draft 时 6GB→5GB
-    腾挪,统一内存总量不涨(47/48G 高位线上多 0.5G 就是压缩器的事)。要回 6GB
-    以上:env 显式覆盖。"""
+    (draft 模型在场)→ 3.5GB;③ 否则 4GB。
+
+    档位沿革:12GB(2026-09-26 前,全栈 47/48G 占用)→ 6GB(2026-09-26 单通实弹
+    无损下调)→ **4GB(2026-09-29 v2 生命周期治本 P1.d,spec §4)**:8 连打生命
+    周期探针实测每通 cache 增量 ~0.35-0.45GB,6GB 上限在第 8-10 通打穿进 LRU
+    换页(2.93→6.46GB 实测)——统一内存架构下换页期 GPU 可用内存被挤,生成段
+    tps 崩至 2.6(call-ed6aa9b8 生成段 10.7s 实证)。4GB=日常 8-10 通工作集内
+    零换页;更长连打的换页退化由 LLM_STALL_OBS 观测行盯住(P2.c;换页期 tps
+    崩的根治=mlx 侧课题留档)。draft 折扣(2026-09-25):0.6B-4bit 权重+draft
+    KV 同池计——开 draft 4GB→3.5GB 腾挪。要回 6GB:env 显式覆盖。"""
     override = os.environ.get("BOK_LLM_PROMPT_CACHE_BYTES", "").strip()
     if override:
         return override
-    return "5GB" if draft_on else "6GB"
+    return "3.5GB" if draft_on else "4GB"
 
 
 def _llm_queue_proxy_on() -> bool:
