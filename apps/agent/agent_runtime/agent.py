@@ -466,25 +466,30 @@ def _nudge_line(name: str, lang: str, count: int) -> str:
     其后全尾部重 prefill);②4B 照抄指令里的例句,两连发一字不差(2026-09-06
     call-64543304 实证)。脚本直念零 TTFT(TTS 即点即播,答案卡死时即时补位)、
     零前缀断裂、轮换不重样。
+
+    P3.2(2026-09-29 v2 spec §6,Ethan 拍板「情绪太大很吓人必须换」):三语软
+    陪伴型——去「喂，」呼叫开头、降调陪伴语义;间隔 SILENCE_NUDGE_SECONDS
+    默认 8→12s。新文案=新 TTS 缓存 key,旧条目自然失效。
     """
     who = f"{name}，" if name else ""
+    who_en = f"{name}, " if name else ""
     if lang == "cantonese":
         variants = (
-            f"{who}你仲喺度嗎？",
-            f"{who}喂，聽唔聽到我講嘢？",
-            f"{who}唔好意思，等你一陣，仲喺度嗎？",
+            f"{who}唔急，我等你，你聽到就應我一聲。",
+            f"{who}我仲喺度，你有咩想問隨時講。",
+            f"{who}唔好意思，你可能喺度谂紧，我等你。",
         )
     elif lang == "en":
         variants = (
-            f"{name or 'Hello'}, are you still there?",
-            "Hello? Can you hear me?",
-            "Sorry to keep you — still there?",
+            f"{who_en}no rush — I'm here whenever you're ready.",
+            f"{who_en}I'm still here — ask me anything.",
+            f"{who_en}sorry — take your time, I'll wait.",
         )
     else:
         variants = (
-            f"{who}您还在吗？",
-            f"{who}喂，能听到我说话吗？",
-            f"{who}不好意思，您还在吗？",
+            f"{who}不急，我等您，您听到就应我一声。",
+            f"{who}我还在，您有什么想问随时说。",
+            f"{who}不好意思，您可能在想事情，我等您。",
         )
     return variants[min(max(count, 0), len(variants) - 1) % len(variants)]
 
@@ -7016,7 +7021,7 @@ async def entrypoint(ctx):
     _nudge_max_env = os.environ.get("SILENCE_NUDGE_MAX", "2")
     nudge_max = _effective_nudge_max(_nudge_max_env, str((object_card or {}).get("display_name") or ""))
     # 默认 8s:旧 3.5-4s 太激进,客戶停頓/諗嘢/答案生成中就跳心跳(實測反饋「一直心跳」)。
-    nudge_delay = float(os.environ.get("SILENCE_NUDGE_SECONDS", "8"))
+    nudge_delay = float(os.environ.get("SILENCE_NUDGE_SECONDS", "12"))  # P3.2: 8→12s（Ethan 拍板降压迫感）
     if nudge_max == 0 and int(_nudge_max_env or "2") > 0:
         print(f"[heartbeat] test object {(object_card or {}).get('display_name')!r} -> silence nudge disabled (call {room_name})", flush=True)
     _nudge_state["farewell"] = False
