@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import re
 import sys
+import time
 from pathlib import Path
 
 # fastapi/httpx 导入必须在模块级：文件头有 `from __future__ import annotations`
@@ -189,6 +191,132 @@ def test_proxy_passthrough_not_queued():
         qp._CLIENT = None
 
 
+def test_proxy_gate_holds_until_stream_exhausted():
+    """闸门必须持满整条流（2026-09-28 串行化修正回归钉）。
+
+    旧 bug：handler 在 `async with` 内 return StreamingResponse——__aexit__ 在
+    响应头发出时放闸，decode 阶段第二条请求与第一条并行「解码」。既有 ASGI 级
+    测试对此结构性失明（ASGITransport 会缓冲完整上游响应体，handler 的 send()
+    直到上游流结束才返回，门从未提前放）。本测试用真 uvicorn 上游（头部先于
+    体到达，与真 mlx_lm server 行为一致）实证：后台长流在场时，reply 的上游
+    受理必须等到 bg 流体耗尽之后。"""
+    import socket
+    import threading
+    import time as _time
+
+    import uvicorn
+
+    served: list[dict] = []
+    stub = FastAPI()
+
+    @stub.post("/v1/chat/completions")
+    async def _gen(request: Request):  # noqa: ANN202
+        lane = request.headers.get("x-bok-lane", "bg")
+        rec = {"lane": lane, "start": _time.perf_counter(), "end": None}
+        served.append(rec)
+
+        async def stream():
+            for _ in range(3):
+                await asyncio.sleep(0.08)
+                yield b"data: chunk\n\n"
+            rec["end"] = _time.perf_counter()
+
+        return StreamingResponse(stream(), media_type="text/event-stream")
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    config = uvicorn.Config(stub, host="127.0.0.1", port=port, log_level="error")
+    server = uvicorn.Server(config)
+    th = threading.Thread(target=server.run, daemon=True)
+    th.start()
+    for _ in range(100):
+        if server.started:
+            break
+        time.sleep(0.05)
+    assert server.started
+
+    proxy = qp.app
+    upstream_client = httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}")
+    qp._CLIENT = upstream_client
+    try:
+        async def call(lane: str | None):
+            headers = {"X-Bok-Lane": lane} if lane else {}
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=proxy), base_url="http://px"
+            ) as c:
+                r = await c.post("/v1/chat/completions", json={"stream": True}, headers=headers)
+                body = b"".join([part async for part in r.aiter_bytes()])
+                return r.status_code, len(body)
+
+        async def scenario():
+            bg1 = asyncio.create_task(call(None))       # 后台长流先占槽
+            await asyncio.sleep(0.03)                   # 头已到、体未耗尽的窗口
+            reply = asyncio.create_task(call("reply"))  # 闸门必须仍被 bg1 持有
+            return await asyncio.gather(bg1, reply)
+
+        results = asyncio.run(scenario())
+        assert all(r[0] == 200 and r[1] > 0 for r in results)
+        assert [s["lane"] for s in served] == ["bg", "reply"], f"受理顺序错: {served}"
+        # 串行铁证（真 HTTP 语义）：reply 的上游受理不早于 bg1 流体耗尽
+        assert served[1]["start"] >= served[0]["end"] - 0.005, (
+            f"闸门提前释放(头时相): reply_start={served[1]['start']:.3f} "
+            f"bg_end={served[0]['end']:.3f}"
+        )
+    finally:
+        qp._CLIENT = None
+        server.should_exit = True
+        th.join(timeout=5)
+
+
+# ---- 过闸观测（W-GATE，2026-09-27） ------------------------------------------
+def test_gate_line_printed_for_every_generation_request(capsys):
+    """每条生成请求过闸打一行 `GATE lane=<lane> waited_ms=<n> active=<n>`。
+
+    W-GATE 观测面：TTFT 分解要按日志归因到「排队多少毫秒」——零等待快路径也要
+    落行（旧 [llm-queue] 行只记 >50ms 的等待）。闸语义（单并发+reply 插队）不变。
+    """
+    stub = FastAPI()
+
+    @stub.post("/v1/chat/completions")
+    async def _gen():  # noqa: ANN202
+        async def stream():
+            for _ in range(2):
+                await asyncio.sleep(0.08)
+                yield b"data: x\n\n"
+
+        return StreamingResponse(stream(), media_type="text/event-stream")
+
+    proxy = qp.app
+    qp._CLIENT = httpx.AsyncClient(transport=httpx.ASGITransport(app=stub), base_url="http://stub")
+    try:
+        async def call(lane: str | None):
+            headers = {"X-Bok-Lane": lane} if lane else {}
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=proxy), base_url="http://px") as c:
+                r = await c.post("/v1/chat/completions", json={"stream": True}, headers=headers)
+                b"".join([p async for p in r.aiter_bytes()])
+                return r.status_code
+
+        async def scenario():
+            bg1 = asyncio.create_task(call(None))        # 占槽长流（零等待快路径）
+            await asyncio.sleep(0.02)
+            reply = asyncio.create_task(call("reply"))   # 后到 → 真等待（仍排 bg1 之后）
+            return await asyncio.gather(bg1, reply)
+
+        codes = asyncio.run(scenario())
+        assert all(code == 200 for code in codes)
+    finally:
+        qp._CLIENT = None
+
+    lines = re.findall(r"GATE lane=(\w+) waited_ms=(\d+) active=(\d+)", capsys.readouterr().out)
+    assert len(lines) == 2, f"每条生成请求一行 GATE: {lines}"
+    assert {lane for lane, _, _ in lines} == {"bg", "reply"}
+    waited = {lane: int(ms) for lane, ms, _ in lines}
+    assert waited["bg"] == 0, f"占槽者零等待也要落行: {waited}"
+    assert waited["reply"] > 0, f"后到者真等过: {waited}"
+    assert all(int(active) >= 1 for _, _, active in lines)
+
+
 # ---- 源扫描（拓扑接线 + 车道头注入） ----------------------------------------
 def test_bok_wiring_and_agent_lane_header_pinned():
     """bok.py 队列拓扑接线 + agent X-Bok-Lane 注入 + cache 档 6GB 缺省在源码钉住。"""
@@ -197,7 +325,7 @@ def test_bok_wiring_and_agent_lane_header_pinned():
     assert '"1239"' in bok_src, "mlx 内部端口接线在场"
     assert "queue_proxy.py" in bok_src, "代理启动接线在场"
     assert "llm-proxy.pid" in bok_src, "代理 pidfile（down 清扫收编）在场"
-    assert '"6GB"' in bok_src, "cache 缺省档在场"
+    assert '"4GB"' in bok_src, "cache 缺省档在场"
 
     agent_src = (_ROOT / "apps" / "agent" / "agent_runtime" / "providers" / "livekit_plugins.py").read_text(encoding="utf-8")
     assert '"X-Bok-Lane", "reply"' in agent_src, "agent reply 车道头注入在场"

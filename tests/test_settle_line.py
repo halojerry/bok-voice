@@ -72,16 +72,16 @@ def test_control_plane_env_carries_settle(monkeypatch, tmp_path):
 
 
 def test_prompt_cache_bytes_tiers(monkeypatch):
-    """缓存档位:显式 env > 恒 6GB(2026-09-26 下调,回 12GB 走 env;探测失败同 6GB)。"""
+    """缓存档位:显式 env > 恒 4GB(P1.d 2026-09-29 定档;回 6GB 走 env;探测失败同 4GB)。"""
     monkeypatch.setenv("BOK_LLM_PROMPT_CACHE_BYTES", "8GB")
     assert bok._default_prompt_cache_bytes() == "8GB"
     monkeypatch.delenv("BOK_LLM_PROMPT_CACHE_BYTES", raising=False)
     monkeypatch.setattr(bok, "_physical_mem_gib", lambda: 48.0)
-    assert bok._default_prompt_cache_bytes() == "6GB"
+    assert bok._default_prompt_cache_bytes() == "4GB"
     monkeypatch.setattr(bok, "_physical_mem_gib", lambda: 16.0)
-    assert bok._default_prompt_cache_bytes() == "6GB"
+    assert bok._default_prompt_cache_bytes() == "4GB"
     monkeypatch.setattr(bok, "_physical_mem_gib", lambda: 0.0)
-    assert bok._default_prompt_cache_bytes() == "6GB"
+    assert bok._default_prompt_cache_bytes() == "4GB"
 
 
 def test_settle_in_optional_models():

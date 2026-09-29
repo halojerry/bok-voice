@@ -26,15 +26,15 @@ def _tier(monkeypatch, mem_gib: float, **env: str) -> str:
     return bok._default_prompt_cache_bytes()
 
 
-def test_big_mem_default_is_6gb(monkeypatch):
-    """48GB 机型默认档 → 6GB(2026-09-26 下调:内存压力线实测,跨会话命中
+def test_big_mem_default_is_4gb(monkeypatch):
+    """48GB 机型默认档 → 4GB(2026-09-26 下调:内存压力线实测,跨会话命中
     理论收益让位;要 12GB 走 env 显式覆盖)。"""
-    assert _tier(monkeypatch, 48.0) == "6GB"
+    assert _tier(monkeypatch, 48.0) == "4GB"
 
 
-def test_small_mem_default_is_6gb(monkeypatch):
+def test_small_mem_default_is_4gb(monkeypatch):
     """16GB 机型默认档 → 6GB(现状不变)。"""
-    assert _tier(monkeypatch, 16.0) == "6GB"
+    assert _tier(monkeypatch, 16.0) == "4GB"
 
 
 def test_explicit_override_wins(monkeypatch):
@@ -44,4 +44,4 @@ def test_explicit_override_wins(monkeypatch):
 
 def test_demo_preset_no_regression_on_big_mem(monkeypatch):
     """48GB + BOK_DEMO_PRESET=1 → 6GB(演示档在大内存机型不劣化=与新默认一致)。"""
-    assert _tier(monkeypatch, 48.0, BOK_DEMO_PRESET="1") == "6GB"
+    assert _tier(monkeypatch, 48.0, BOK_DEMO_PRESET="1") == "4GB"
