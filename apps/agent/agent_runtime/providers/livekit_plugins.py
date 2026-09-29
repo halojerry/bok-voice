@@ -33,7 +33,10 @@ from bok_voice_core.model_routes import LaneRoute, PROVIDER_OPENAI
 # 未验收特性不默认开），fail-open 语义见 providers/smart_turn.py。
 from . import smart_turn as _smart_turn
 
-from ..voice_style import NATURALNESS_BLOCK, strip_voice_style
+from ..voice_style import NATURALNESS_BLOCK, a_line_tags_supported, strip_voice_style
+from ..asr_polish_runtime import polish_enabled as _polish_layer_on
+from ..asr_polish_runtime import sync_polish as _polish_sync_text
+from ..flow import STEP_DISCIPLINE_RULE, split_step_text, stable_step_key
 
 # 后台任务强引用池(2026-09-17 全量 debug P2-A):事件循环对 task 只持弱引用,
 # GC 可中途回收仍在跑的 fire-and-forget 任务——与本仓 _duration_fuse 注释、
@@ -537,10 +540,15 @@ class MlxLlmLLM(_OpenAICompatBase):
 
     @staticmethod
     def _request_conn_options() -> APIConnectOptions:
+        # 8→22（2026-09-28 定时器普查）:这是传输层 read-gap 粗后盾,赌的是
+        # 「字节流死了」——但冷/缓存失配 prefill 实测 p95=18.9s（3926 轮全量:
+        # TTFT p95=3.46s/p99=7.04s,cache-miss p95=18.85s）,8s 会把「慢」误杀成
+        # 「死」→ APITimeoutError → regen 再超时（drain/regen 143 次失败恢复的
+        # 主死因）。22s 盖住冷 prefill p95;真死流由首-token 闸+watchdog 先出手。
         try:
-            timeout = float(os.environ.get("LLM_REQUEST_TIMEOUT_S", "8") or 0)
+            timeout = float(os.environ.get("LLM_REQUEST_TIMEOUT_S", "22") or 0)
         except ValueError:  # pragma: no cover - 配错回默认
-            timeout = 8.0
+            timeout = 22.0
         try:
             max_retry = int(os.environ.get("LLM_REQUEST_RETRIES", "0"))
         except ValueError:  # pragma: no cover - 配错回默认
@@ -1252,10 +1260,77 @@ def strip_tail_anchor_text(text: str) -> str:
 
 # 单字数字(汉字+阿拉伯)之间的顿/逗号——剥离后连续读;「拼多多、淘宝」等
 # 普通列表不含数字字,不受影响。(2026-09-12「普通话念数字很奇怪」:4B 爱写
-# 「一、一、二、二」,每个顿号一次 TTS 停顿=机器人感;MiniMax 对阿拉伯数字串
-# 本来就逐位读,时长实验 6.54s vs 6.40s 等价,无需改写数字形态。)
+# 「一、一、二、二」,每个顿号一次 TTS 停顿=机器人感;顿号剥离时长实验
+# 6.54s vs 6.40s 等价,故此处只剥分隔符、不改数字形态。)
 _DIGIT_PAUSE_RE = re.compile(r"(?<=[零〇一二三四五六七八九0-9])[、，]\s*(?=[零〇一二三四五六七八九0-9])")
 _DIGIT_CHAR_RE = re.compile(r"[零〇一二三四五六七八九0-9]")
+
+# ---- 标识符数字槽逐位读（2026-09-27 取证修正）----
+# 旧注释「MiniMax 对阿拉伯数字串本来就逐位读」**只对 ≥5 位成立**：缓存罐头音频过
+# ASR 复核实测——"1459"(尾号) 被读成 一千四百五十九、"6699"(tracking ending)
+# 读成 六千六百九十九；顺串 ≥5 位才是逐位。标识符槽（单号/尾号/电话/热线索/连字符
+# 号段）必须逐位读，否则客户听到的号码是错的。金额/数量读数值才对（最低 300 蚊 →
+# 三百蚊），一律不碰。
+# 只动**标识符语境**里的 3/4 位串：2 位以内数值读==逐位读无需动；≥5 位本就逐位。
+# 汉字映射风格与 flow.py:383 `_CANTONESE_DIGITS` 同款（逐位、零→零、1-9 逐位汉字），
+# MiniMax 按脚本自行渲染语种，故 zh/cantonese 共用同一套汉字、无需按通话语言分支。
+_ID_DIGIT_HANZI = {
+    "0": "零", "1": "一", "2": "二", "3": "三", "4": "四",
+    "5": "五", "6": "六", "7": "七", "8": "八", "9": "九",
+}
+# 完整 3/4 位数字 run（前后不得再是数字，否则 ≥5 位顺串会被截 4 位改写）。
+_ID_DIGIT_RUN_RE = re.compile(r"(?<![0-9])[0-9]{3,4}(?![0-9])")
+# 中文标识符前缀（紧邻数字串之前，允许夹空白/冒号顿号/系词「是·係·为·為」）。
+_ID_ZH_PREFIX_RE = re.compile(
+    r"(?:尾号|尾號|单号|單號|编号|編號|号码|號碼|电话|電話|热线|熱線|单是|單係)"
+    r"[\s:：，,、]*(?:是|係|为|為)?[\s:：，,、]*$"
+)
+# 英文标识符引导词（"tracking ending 6699" / "order number 1459"）；
+# \b 边界的 id/no 防「valid/rapid」类词尾误命中。
+_ID_EN_CUE_RE = re.compile(
+    r"\b(?:ending|number|no|id|code|ref|reference|order|tracking|hotline|phone|contact)\b"
+    r"\.?[\s:：#]*$",
+    re.IGNORECASE,
+)
+# 金额/数量语境后缀（读数值才对）——命中即跳过，绝不改。
+_ID_QTY_TAIL_RE = re.compile(
+    r"\s*(?:元|蚊|塊|块|美金|美元|dollar|dollars|usd|hkd|"
+    r"个|個|次|天|日|工作日|小时|小時|倍|年|月)",
+    re.IGNORECASE,
+)
+
+
+def _digitize_id_slots(text: str) -> str:
+    """标识符语境的 3/4 位阿拉伯数字串逐位转汉字，其余原样（纯函数）。
+
+    语境判据（任一命中即标识符）：① 中文前缀（尾号/单号/电话…，可夹「是/係」）；
+    ② 英文引导词（ending/number/order…）；③ 紧邻连字符（852-1234-5678 /
+    E2E-陳小明-2170）。金额/数量后缀（元/蚊/个/天…）优先否决。≥5 位与 1/2 位
+    结构上不匹配本 run 正则，天然不动。同输入恒同输出，零 I/O、零实例状态。
+    """
+    s = str(text or "")
+    if not s:
+        return s
+
+    def _repl(m: re.Match[str]) -> str:
+        run = m.group(0)
+        start, end = m.start(), m.end()
+        # 金额/数量语境：读数值才对，先否决（.match 在 pos 处锚定，模式无需 ^）。
+        if _ID_QTY_TAIL_RE.match(s, end):
+            return run
+        before = s[:start]
+        prev_ch = s[start - 1] if start > 0 else ""
+        next_ch = s[end] if end < len(s) else ""
+        if not (
+            _ID_ZH_PREFIX_RE.search(before)
+            or _ID_EN_CUE_RE.search(before)
+            or prev_ch == "-"
+            or next_ch == "-"
+        ):
+            return run
+        return "".join(_ID_DIGIT_HANZI.get(ch, ch) for ch in run)
+
+    return _ID_DIGIT_RUN_RE.sub(_repl, s)
 
 
 class _StripTailAnchorStream(llm.LLMStream):
@@ -1400,26 +1475,122 @@ def _is_parrot_sentence(sentence: str, last_reply: str, threshold: float = 0.9) 
     return False
 
 
+def _repeat_cross_turn_on() -> bool:
+    """跨轮复读防线总闸(EX-2;默认开,与 BOK_REPEAT_GUARD 同读法)。"""
+    return os.environ.get("BOK_REPEAT_CROSS_TURN", "1") == "1"
+
+
+def _repeat_cross_turn_sim() -> float:
+    """跨轮整段相似阈值(EX-2;BOK_REPEAT_CROSS_TURN_SIM 默认 0.85)。"""
+    try:
+        v = float(os.environ.get("BOK_REPEAT_CROSS_TURN_SIM", "0.85") or 0.85)
+    except ValueError:  # pragma: no cover - 配错回默认
+        return 0.85
+    return v if v > 0 else 0.85
+
+
 class _RepeatSelfGuardStream(llm.LLMStream):
     """LLM 流出口逐句剥复读:缓冲到句边界,复读句吞掉、新内容照发。
 
     全剥空 → 流空收尾(罕见;渐进披露治源头后这里只兜底,真发生时垫话/心跳
-    补位)。壳与 _StripTailAnchorStream 同款:metrics 由内芯转发,此处排空。"""
+    补位)。壳与 _StripTailAnchorStream 同款:metrics 由内芯转发,此处排空。
 
-    def __init__(self, plugin, inner: "llm.LLMStream", last_reply: str, *, bypass: bool = False):
+    EX-2(2026-09-28)跨轮扩展:除比对上一条回复(REPEAT_SELF),再比对
+    ContextState 跨轮账本 reply_ledger()(只含 gen=llm 历史回复)——句级相似
+    ≥0.9(reuse _is_parrot_sentence)或整段滚动相似 ≥threshold → 剥,治「同一通
+    内隔轮复述」(已读乱回)。客户复述/追问轮(allow_repeat)整段放行。"""
+
+    def __init__(
+        self,
+        plugin,
+        inner: "llm.LLMStream",
+        last_reply: str,
+        *,
+        bypass: bool = False,
+        ledger: list[str] | None = None,
+        threshold: float = 0.85,
+        allow_repeat: bool = False,
+    ):
         super().__init__(llm=plugin, chat_ctx=llm.ChatContext(), tools=[], conn_options=APIConnectOptions())
         self._inner = inner
         self._last_reply = last_reply
         self._bypass = bypass or not last_reply
         self._buf = ""
+        # 跨轮账本只收非空条目;allow_repeat=true 整段放行(复问)。
+        self._ledger = [str(x) for x in (ledger or []) if str(x or "").strip()]
+        self._threshold = float(threshold)
+        self._cross_on = bool(self._ledger) and not allow_repeat
+        self._emitted: list[str] = []
+        self._cross_suppressed = 0
+        # 首 chunk 早发(2026-09-28):本回复首段是否已放行(句界或早切任一)。
+        self._first_sent = False
+        # 已早放的片段(换头复读防线):下一句界判定时前缀拼合比对,判复读
+        # 只剥余段(片段已出声不可回收,但复读主体不得再播)。
+        self._released_head = ""
+        if self._ledger and allow_repeat:
+            print("REPEAT_CROSS_TURN_SKIPPED reason=reask", flush=True)
 
     async def _metrics_monitor_task(self, event_aiter) -> None:
         async for _ in event_aiter:
             pass
 
+    def _is_cross_turn(self, sentence: str) -> bool:
+        """句子与本通历史 LLM 回复的复述判定(EX-2)。
+
+        句级 reuse _is_parrot_sentence(阈值 0.9,含子串前缀截断);另叠整段滚动
+        相似:已产出句+当前句 与某条历史整体 SequenceMatcher ≥threshold(可配)。"""
+        s = _norm_for_similarity(sentence)
+        if len(s) < 6:
+            return False
+        combined = _norm_for_similarity("".join(self._emitted) + sentence)
+        for entry in self._ledger:
+            if _is_parrot_sentence(sentence, entry):
+                return True
+            e = _norm_for_similarity(entry)
+            if len(e) >= 6 and len(combined) >= 6:
+                if difflib.SequenceMatcher(a=combined, b=e).ratio() >= self._threshold:
+                    return True
+        return False
+
+    def _fragment_is_repeat_head(self, fragment: str) -> bool:
+        """首片段是否复读句的头(2026-09-28 早发安全闸)。
+
+        两道命中皆扣住等句界整句判定——复读句的头 10 字漏播不可接受:
+        ①前缀命中:片段与语料(last_reply/跨轮账本)归一前缀相同(原句复读);
+        ②后缀交叠:片段尾 ≥4 字窗口命中语料任一子串(「换头复读」——头部
+        几字不同+整段复读主体,前缀检查接不住;交叠命中宁可多等一轮句界,
+        只是丢速度不丢正确性)。
+        """
+        frag = _norm_for_similarity(fragment)
+        if len(frag) < 6:
+            return False
+        corpus: list[str] = []
+        if not self._bypass:
+            corpus.append(_norm_for_similarity(self._last_reply))
+        if self._cross_on:
+            corpus.extend(_norm_for_similarity(e) for e in self._ledger)
+        for entry in corpus:
+            if not entry:
+                continue
+            if entry.startswith(frag):
+                return True
+            # 后缀交叠:片段尾与语料中任一 4 字窗口相同。
+            for k in range(4, len(frag) + 1):
+                tail = frag[-k:]
+                if len(tail) >= 4 and tail in entry:
+                    return True
+        return False
+
     def _feed(self, text: str) -> str:
-        """缓冲到句边界;完整句非复读才放行,复读句整句吞掉。"""
-        if self._bypass:
+        """缓冲到句边界;完整句非复读才放行,复读句整句吞掉。
+
+        首 chunk 早发(2026-09-28):本回复**首段**在无句界且攒够
+        BOK_TTS_FIRST_CHUNK_CHARS 时提前放行(长首句在 tps ~20 下的出声
+        闸门在本层——token 攒到句界才放,首句 20+ 字=1 秒级干等)。铁闸
+        复用 _first_chunk_cut(数字/拉丁 run 不劈、句界 N+6 容差内让位
+        自然断点);前缀命中复读语料的片段扣住(见 _fragment_is_repeat_head)。
+        只动首段:后续句仍按句界对齐,复读判定面零变化;env=0 逐字节旧行为。"""
+        if self._bypass and not self._cross_on:
             return text
         self._buf += text
         out: list[str] = []
@@ -1429,44 +1600,93 @@ class _RepeatSelfGuardStream(llm.LLMStream):
                 break
             sentence = self._buf[: m.end()]
             self._buf = self._buf[m.end() :]
-            if _is_parrot_sentence(sentence, self._last_reply):
+            # 换头复读防线:已早放片段存在时,整句判定用「片段+句」拼合单元
+            # (剩余段独立比对相似度不够会漏);判复读只吞句,片段已出声不回收。
+            check_unit = (self._released_head or "") + sentence if self._released_head else sentence
+            if not self._bypass and _is_parrot_sentence(check_unit, self._last_reply):
                 print(f"REPEAT_SELF_SUPPRESSED sent={sentence!r}", flush=True)
+                self._released_head = ""
                 continue
+            if self._cross_on and self._is_cross_turn(check_unit):
+                self._cross_suppressed += 1
+                print(f"REPEAT_CROSS_TURN_SUPPRESSED sent={sentence!r}", flush=True)
+                self._released_head = ""
+                continue
+            self._released_head = ""
             out.append(sentence)
+            self._emitted.append(sentence)
+        if out:
+            self._first_sent = True
+        elif not self._first_sent:
+            n = _tts_first_chunk_chars()
+            cut = _first_chunk_cut(self._buf, n) if n > 0 else None
+            if cut is not None and not self._fragment_is_repeat_head(self._buf[:cut]):
+                head = self._buf[:cut]
+                self._buf = self._buf[cut:]
+                self._first_sent = True
+                self._released_head = head
+                out.append(head)
+                self._emitted.append(head)
         return "".join(out)
 
     def _flush_at_end(self) -> str:
-        if self._bypass or not self._buf:
+        if (self._bypass and not self._cross_on) or not self._buf:
             return self._buf
         rest = self._buf
         self._buf = ""
-        if _is_parrot_sentence(rest, self._last_reply):
+        if not self._bypass and _is_parrot_sentence(rest, self._last_reply):
             print(f"REPEAT_SELF_SUPPRESSED sent={rest!r}", flush=True)
             return ""
+        if self._cross_on and self._is_cross_turn(rest):
+            self._cross_suppressed += 1
+            print(f"REPEAT_CROSS_TURN_SUPPRESSED sent={rest!r}", flush=True)
+            return ""
+        self._emitted.append(rest)
         return rest
 
+    @property
+    def pending_buffer(self) -> str:
+        """cancel 后残留的未播缓冲（P2.a，spec 2026-09-29 v2 §5）。
+
+        barge-in / watchdog force-interrupt 令 _run 在句界前被取消时，_buf 攒着
+        的文本曾随协程蒸发（call-ed6aa9b8 三轮 chars=10 实证）——本属性供
+        agent 侧 interrupted 补账点读取拼入 turns，账本证据不丢。"""
+        return self._buf
+
     async def _run(self):
-        async for ev in self._inner:
-            delta = getattr(ev, "delta", None)
-            content = getattr(delta, "content", None) if delta is not None else None
-            if not content:
+        try:
+            async for ev in self._inner:
+                delta = getattr(ev, "delta", None)
+                content = getattr(delta, "content", None) if delta is not None else None
+                if not content:
+                    self._event_ch.send_nowait(ev)
+                    continue
+                clean = self._feed(content)
+                if not clean:
+                    continue
+                if clean != content:
+                    ev = llm.ChatChunk(
+                        id=getattr(ev, "id", ""),
+                        delta=llm.ChoiceDelta(content=clean, role=getattr(delta, "role", "assistant")),
+                        usage=getattr(ev, "usage", None),
+                    )
                 self._event_ch.send_nowait(ev)
-                continue
-            clean = self._feed(content)
-            if not clean:
-                continue
-            if clean != content:
-                ev = llm.ChatChunk(
-                    id=getattr(ev, "id", ""),
-                    delta=llm.ChoiceDelta(content=clean, role=getattr(delta, "role", "assistant")),
-                    usage=getattr(ev, "usage", None),
+            tail = self._flush_at_end()
+            if tail:
+                self._event_ch.send_nowait(
+                    llm.ChatChunk(id="repeat-flush", delta=llm.ChoiceDelta(content=tail, role="assistant"))
                 )
-            self._event_ch.send_nowait(ev)
-        tail = self._flush_at_end()
-        if tail:
-            self._event_ch.send_nowait(
-                llm.ChatChunk(id="repeat-flush", delta=llm.ChoiceDelta(content=tail, role="assistant"))
-            )
+            if self._cross_suppressed and not self._emitted:
+                print(
+                    f"REPEAT_CROSS_TURN_EMPTY suppressed={self._cross_suppressed}",
+                    flush=True,
+                )
+        except asyncio.CancelledError:
+            # P2.a（2026-09-29 v2 §5）：cancel 不再令缓冲静默蒸发——打点留痕，
+            # agent 侧 interrupted 补账点读 pending_buffer 拼入 turns。
+            if self._buf:
+                print(f"REPEAT_GUARD_CANCEL_DROP chars={len(self._buf)}", flush=True)
+            raise
 
 
 # 对象档案行边界=调用方给的显式换行(每个输入行是一个语义单元,如一行背景
@@ -1482,10 +1702,28 @@ class ContextState:
     message (top-K snippets + bounded conversation summary) each turn.
     """
 
-    def __init__(self, account_id: str = "", max_snippets: int = 2, max_summary_chars: int = 1200):
+    def __init__(self, account_id: str = "", max_snippets: int = 2, max_summary_chars: int | None = None):
         self.account_id = account_id
         self._max_snippets = max_snippets
+        # F2 记忆块减半（2026-09-28 尾部手术③）：尾部每轮 prefill 直接组分。
+        # 默认 250 字（原 600），env BOK_MEMORY_CHARS 可覆盖；渲染行数默认 3
+        # （原 6，见 render_context_tail）。总长先裁，行数上限再兜底。
+        if max_summary_chars is None:
+            try:
+                max_summary_chars = int(os.environ.get("BOK_MEMORY_CHARS", "250") or 250)
+            except ValueError:
+                max_summary_chars = 250
         self._max_summary_chars = max_summary_chars
+        # F1 两段化（2026-09-28 尾部手术③）：当前步文本拆稳定段/增量段。
+        # 稳定段只在每步首条消息进尾部；增量段每轮都发。revision 只跟稳定段
+        # 身份键走（步内恒定，防止每轮 verdict/底稿波动虚增 revision、令
+        # slim/投机门失效）。_applied_stable_keys 与 _applied_tails 平行，
+        # 记录每条已冻结尾部当时是否带稳定段（重试重建据此复现同一决定）。
+        self._flow_stable: str = ""
+        self._flow_delta: str = ""
+        self._stable_key: str = ""
+        self._applied_stable_keys: list[str] = []
+        self._last_emit_stable_key: str = ""
         self._snippets: list[str] = []
         self._summary_lines: list[str] = []
         self._user_lang: str = ""
@@ -1523,6 +1761,16 @@ class ContextState:
         # (2026-09-12:agent 钩子每轮写入;客户明确要求重复时模型照讲上一句关键
         # 内容是正确行为,不能被当拟声复读剥掉)。
         self.repeat_requested: bool = False
+        # EX-2(2026-09-28)跨轮复读账本:最近 3 条 AI 回复 (text, gen)。出口复读
+        # 防线只对 gen=="llm" 条目比对(脚本直念/罐头结构性不在 LLM 流内,不参与
+        # 跨轮比对——见 _RepeatSelfGuardStream)。治「已读乱回」:同一通内隔轮复述。
+        self._reply_ledger: list[tuple[str, str]] = []
+        # EX-2 复问放行闸:客户复述/追问上一问、或 verdict==REPEAT 时,模型复讲
+        # 关键内容正确——跨轮防线放行。**不依赖 has_steps**(旧 repeat_requested
+        # 只在 has_steps 块内写,无模板通话结构性失效)。
+        self.allow_repeat: bool = False
+        # ASR 受限润色映射（2026-09-27,原文单轨契约见 set_polished 注释）。
+        self._polished_map: dict[str, str] = {}
 
     @property
     def revision(self) -> int:
@@ -1537,12 +1785,19 @@ class ContextState:
     def set_flow_current(self, current: str) -> None:
         """每轮更新当前步约束(flow controller 推进后调用)。
 
-        内容实质变化才 +revision:每轮同值重复 set 唔虚增;【新一步】一次性提示
-        在下一轮消失亦算变化(重建轮据此把末条 user 尾部对齐到当前版)。
+        F1 两段化（2026-09-28 手术③）：拆稳定段/增量段；revision 只跟稳定段
+        身份键走——步内 verdict/底稿波动（增量段）不再虚增 revision，slim 与
+        投机门据此稳定。真换步（稳定键变）才 +revision，重建轮据此把末条 user
+        尾部对齐新步；无步骤头的任意文本（收尾/测试串）键=整段，旧语义保留。
         """
         current = current or ""
-        if current != self._flow_current:
-            self._flow_current = current
+        self._flow_current = current
+        stable, delta = split_step_text(current)
+        self._flow_stable = stable
+        self._flow_delta = delta
+        key = stable_step_key(stable)
+        if key != self._stable_key:
+            self._stable_key = key
             self._revision += 1
 
     def add_call_fact(self, text: str, limit: int = 4) -> None:
@@ -1571,13 +1826,43 @@ class ContextState:
         """只读出口:agent 回声守卫比对「AI 正在讲/刚讲过」的文本用。"""
         return self._last_reply
 
-    def record_applied_tail(self, orig: str, final: str) -> None:
+    def record_reply(self, text: str, gen: str) -> None:
+        """跨轮复读账本写入(EX-2,2026-09-28):有界 last 3。空文本忽略。
+
+        LLM 轮由 _on_item_for_context 记;脚本/罐头车道由 agent chokepoint 登记
+        时点记(即使随后被打断也在案)。"""
+        t = str(text or "").strip()
+        if not t:
+            return
+        self._reply_ledger.append((t, str(gen or "")))
+        if len(self._reply_ledger) > 3:
+            self._reply_ledger = self._reply_ledger[-3:]
+
+    def reply_ledger(self) -> list[str]:
+        """只读出口:gen=="llm" 的历史回复(跨轮复读防线比对面)。"""
+        return [t for t, g in self._reply_ledger if g == "llm"]
+
+    def set_allow_repeat(self, on: bool) -> None:
+        """复问/REPEAT 放行闸置位(EX-2;见 allow_repeat 字段注释)。"""
+        self.allow_repeat = bool(on)
+
+    def record_applied_tail(self, orig: str, final: str, *, bare: bool = False) -> None:
+        """冻结尾部账本。`bare=True`=非 LLM 回复车道（say 直念/QA 罐头/graph play/
+        分支罐头）补进历史的洞消息：只冻裸体、稳定键恒记 ""（EX-1 尾部封洞）。
+
+        稳定键必须恒空——若把当前 `_last_emit_stable_key` 记进洞消息，紧随其后的
+        最新消息会误判稳定段已发（`_applied_stable_keys[-1] == _stable_key`）而丢掉
+        【现在这一步】指引；且下轮又会因末条稳定键空而重发一次（稳定段付两遍）。"""
         self._applied_tails.append((orig, final, self._revision))
+        # F1：与 _applied_tails 平行记本条尾部当时是否带稳定段（""=未带）。
+        self._applied_stable_keys.append("" if bare else self._last_emit_stable_key)
 
     def rewrite_last_applied_tail(self, orig: str, final: str) -> None:
         """抢跑重建轮把末条 user 尾部重渲染成当前版后,同步账本(保持 FIFO 对齐)。"""
         if self._applied_tails:
             self._applied_tails[-1] = (orig, final, self._revision)
+            if self._applied_stable_keys:
+                self._applied_stable_keys[-1] = self._last_emit_stable_key
 
     def applied_tails(self) -> list[tuple[str, str, int]]:
         return list(self._applied_tails)
@@ -1587,6 +1872,21 @@ class ContextState:
             keep = 0
         if len(self._applied_tails) > keep:
             self._applied_tails = self._applied_tails[-keep:]
+        if len(self._applied_stable_keys) > keep:
+            self._applied_stable_keys = self._applied_stable_keys[-keep:]
+
+    def tail_emit_stable_for_rebuild(self) -> bool:
+        """重试/重建轮（n_new==0）复现末条尾部当时的稳定段发出决定（F3）。
+
+        步身份键未变→复现冻结时的决定（带过则带、没带则不带，字节可对齐）；
+        键变（真换步）→必带新稳定段（语义要求的那次断裂）。
+        """
+        if os.environ.get("BOK_TAIL_SLIM", "1") == "0":
+            return True
+        last = self._applied_stable_keys[-1] if self._applied_stable_keys else ""
+        if self._stable_key != last:
+            return True
+        return bool(last)
 
     @classmethod
     def from_env(cls, account_id: str = "") -> "ContextState":
@@ -1623,10 +1923,7 @@ class ContextState:
     def set_flow(self, overview: str, current: str) -> None:
         """设置对话流程:overview 为基础注入(全貌),current 为每轮当前步约束。"""
         self._flow_overview = overview
-        current = current or ""
-        if current != self._flow_current:
-            self._flow_current = current
-            self._revision += 1
+        self.set_flow_current(current)
 
     def set_web(self, results: str | list[str]) -> None:
         """注入联网检索结果（Wikipedia/DDG 摘要），随 system 消息给 LLM 参考。
@@ -1658,6 +1955,26 @@ class ContextState:
             self._user_lang = "en"
         else:
             self._user_lang = key
+
+    @property
+    def user_language(self) -> str:
+        """装配时钉死的通话语言（润色层车道判定用，A 线恒非空）。"""
+        return self._user_lang
+
+    # ---- ASR 受限润色（2026-09-27）：raw→polished 映射，只喂 LLM 上下文 ----
+    # 原文单轨铁律：本 map 的存在不改变任何业务判据——FlowController/WA 收号/
+    # QA 快路读的都是框架 chat_ctx 里的 raw；polished 只在 ContextAwareLLM
+    # 冻结点（user 消息首次拼尾部时）替换请求侧文本。确定性映射保证同 raw
+    # 恒同 polished，账本重放期间不重算、严格前缀契约不破。
+    def set_polished(self, raw: str, polished: str) -> None:
+        # 首写为准（确定性契约：同 raw 恒同 polished——轮处理器预计算与冻结点
+        # 兜底两条写入路径对同一 raw 必然产出相同结果；万一不一致，保先到的
+        # 预计算结果，账本与映射永不漂移）。
+        if raw and polished and polished != raw and raw not in self._polished_map:
+            self._polished_map[raw] = polished
+
+    def polished_of(self, raw: str) -> str | None:
+        return self._polished_map.get(raw)
 
     def set_knowledge(self, snippets: list[dict]) -> None:
         """注入知识库检索片段(单条 150 字截断)。渲染受 rag_enabled 门控(默认关),
@@ -1738,6 +2055,11 @@ class ContextState:
             "客户没有新异议就不要重复确认，停下来等他说。"
             "每轮尾部的【你上一句】即你最近一次回复原文，对照它避免重复。"
         )
+        # 步骤纪律（2026-09-28 prompt 手术②）：原挂在 flow.current_step_text()
+        # 尾部、每轮逐字复读 ~180 字符——S5「重复控制」同款手术：无条件文本
+        # 上移稳定前缀，整场 KV 命中零成本，每全量轮省 ~130 token ≈ 0.17s
+        # prefill。语义不变；「当前这一步」由尾部【现在这一步】块逐轮点名。
+        parts.append("【步骤纪律】" + STEP_DISCIPLINE_RULE)
         # 客服应答准则：永不主动说"不知道/查不到"，知识不够时用客服话术兜住。
         # 这是客服与聊天机器人的本质区别——客户要的是被接住，不是被拒绝。
         # 语言纯度：此段无条件进每通通话的前缀，必须用标准书面中文——写成粤语
@@ -1795,15 +2117,15 @@ class ContextState:
         return "\n\n".join(parts)
 
     def _last_reply_anchor(self) -> str:
-        """【你上一句】截短锚:只示开头 12 字,带转换性指令(勿原样重述)。"""
-        head = self._last_reply[:12]
-        ell = "…" if len(self._last_reply) > 12 else ""
-        return (
-            "【你上一句】「" + head + ell + "」"
-            "（只示开头，全文在对话历史；这句已讲过，禁止原样或只换个别字重述）"
-        )
+        """【你上一句】截短锚:只示开头 8 字（F5 由 12 收窄——尾部每轮 prefill
+        的直接组分）。禁止重述的指令已上移稳定前缀【重复控制】
+        （render_instruction_prefix 已含同义句），尾部不再复读，只留引文；
+        标签【你上一句】字面不变（_StripTailAnchorStream 靠它剥拟声复刻）。"""
+        head = self._last_reply[:8]
+        ell = "…" if len(self._last_reply) > 8 else ""
+        return "【你上一句】「" + head + ell + "」"
 
-    def render_context_tail(self) -> str:
+    def render_context_tail(self, *, emit_stable: bool | None = None) -> str:
         """【易变参考尾部】——每轮变的当前步/检索资料/记忆，垫在 system 最末。
 
         前缀(稳定指令+话术总览+对象档案)+人设 base 在前且整场字节不变，flow
@@ -1812,10 +2134,16 @@ class ContextState:
         知识/联网两节仅在 rag_enabled=True 时渲染(默认关:封闭话术流程不做检索,
         单对象只上话术+对象档案;CONTEXT_RAG=1/开放人设由装配处置 True)。
 
-        尾部瘦身（BOK_TAIL_SLIM=1 默认,0 回退;2026-09-09 S5）:revision 与上一
-        条已冻结尾部相同（流程/事实/WhatsApp 均无实质变化）时,只发紧凑标签
-        ——全量指引在上一轮尾部里原样可见,重复逐轮重 prefill 是纯浪费（未缓存
-        后缀实测 238-315 tok/轮,是暖轮 TTFT 大头,0.4-0.6k tok/s 下≈0.4-0.6s）。
+        F1 两段化（2026-09-28 手术③，替代旧紧凑标签档）：
+        - 稳定段【现在这一步】=步身份/目标/底稿/注意/身份后备/禁讲清单，只在
+          每步**首条消息**进尾部（emit_stable 由 _stable_key vs 已冻结尾部键
+          _applied_stable_keys 决定）；后续消息不带——旧步指引原样留在该步首条
+          消息的历史里，逐轮重 prefill 是纯浪费。
+        - 增量段（verdict 指引/数字/命中分支）每轮都发（_flow_delta）。
+        - BOK_TAIL_SLIM=0 回退旧行为：稳定段恒进每条尾部。slim 档（revision
+          与上条冻结尾部相同）另发一行紧凑「继续」标签。
+        - 稳定段发出决定记进账本（record/rewrite），重试/重建轮（F3）据此复现
+          同一条尾部的字节，只有真换步或真内容变化才发生语义必需的断裂。
         【你上一句】的固定指令文本已上移稳定前缀（【重复控制】）,尾部只留引文。
         """
         _last_rev = self._applied_tails[-1][2] if self._applied_tails else None
@@ -1824,15 +2152,15 @@ class ContextState:
             and _last_rev is not None
             and _last_rev == self._revision
         )
+        if emit_stable is None:
+            _last_stable = self._applied_stable_keys[-1] if self._applied_stable_keys else ""
+            emit_stable = (
+                os.environ.get("BOK_TAIL_SLIM", "1") == "0"
+                or self._stable_key != _last_stable
+            )
+        # 供 record_applied_tail/rewrite_last_applied_tail 记账（本条尾部带稳定段否）。
+        self._last_emit_stable_key = self._stable_key if emit_stable else ""
         parts: list[str] = []
-        if slim:
-            _step_head = (self._flow_current.strip().splitlines() or [""])[0]
-            parts.append(f"【{_step_head or '流程'}·继续】状态无实质变化，按上文同一步要求继续。")
-            if self._whatsapp_note:
-                parts.append("【已记录客户 WhatsApp】" + self._whatsapp_note)
-            if self._last_reply:
-                parts.append(self._last_reply_anchor())
-            return "\n".join(parts)
         if self._whatsapp_note:
             parts.append(
                 "【已记录客户 WhatsApp】" + self._whatsapp_note +
@@ -1845,14 +2173,21 @@ class ContextState:
                 "【通话中客户已讲（已确认过，不要再问）】\n"
                 + "\n".join(f"- {s}" for s in self._call_facts)
             )
-        if self._flow_current:
-            # 当前步约束(随 flow 推进而变):放尾部最前,推进只改这里、前缀字节不动。
-            parts.append("【现在这一步】\n" + self._flow_current)
+        if self._flow_stable and emit_stable:
+            # 稳定段(随步推进而变的步身份/底稿):只在每步首条消息发,推进只改这里、
+            # 前缀字节不动。
+            parts.append("【现在这一步】\n" + self._flow_stable)
+        elif slim and self._flow_current:
+            _step_head = (self._flow_current.strip().splitlines() or [""])[0]
+            parts.append(f"【{_step_head or '流程'}·继续】状态无实质变化，按上文同一步要求继续。")
+        if self._flow_delta:
+            # 每轮增量段(verdict 指引/数字核对/命中分支):每轮都发。
+            parts.append(self._flow_delta)
         if self._last_reply:
-            # 重复锚(截短版,2026-09-12 P0):旧版把上一句全文引在尾部,等于把
+            # 重复锚(截短版,2026-09-12 P0/F5):旧版把上一句全文引在尾部,等于把
             # 抄袭素材递到 4B 嘴边(call-8fa17d2b 两轮回复一字不差实证)。只示
-            # 开头 12 字+转换性指令——全文在对话历史里,对照能力不丢;标签
-            # 【你上一句】字面不变(_StripTailAnchorStream 靠它剥拟声复刻)。
+            # 开头 8 字——全文在对话历史里,对照能力不丢;标签【你上一句】字面不变
+            # (_StripTailAnchorStream 靠它剥拟声复刻),【重复控制】在前缀兜禁令。
             parts.append(self._last_reply_anchor())
         if self.rag_enabled and self._snippets:
             parts.append("【实时检索到的资料（知识库）】\n" + "\n".join(f"- {s}" for s in self._snippets))
@@ -1864,14 +2199,13 @@ class ContextState:
                 + "不要生硬说查不到。"
             )
         if self._summary_lines:
-            # 只带最近几轮记忆(默认 6):尾部每轮 prefill 只吃增量,行数是 TTFT 杠杆;
-            # 更早的上下文由原始历史截断(LLM_HISTORY_TURNS)与当前步约束兜底。
-            # 尾部真实预算(RAG 关,默认档) = 【现在这一步】节头+当前步文本(典型
-            # ~321 字) + 【本通对话记忆】节头 + 6 行×每行 ≤201 字(≈1206 字) ≈
-            # 1.55-1.6k 字/轮逐轮重 prefill;RAG 开(rag_enabled=True)另加知识
-            # 2×~151 字 + 联网 1×~151 字 + 两个节头。旧注释「≤~120 token 典型」
-            # 是瘦砍前口径,早已失真,以此公式为准。
-            keep = max(1, int(os.environ.get("REPLY_MEMORY_LINES", "6")))
+            # 只带最近几轮记忆(默认 3,F2 由 6 收窄):尾部每轮 prefill 只吃增量,
+            # 行数是 TTFT 杠杆;更早的上下文由原始历史截断(LLM_HISTORY_TURNS)与
+            # 当前步约束兜底。尾部真实预算(RAG 关,默认档) = 稳定段(每步首条,
+            # 典型 ~321 字) 或 紧凑标签 + 增量段(每轮) + 【本通对话记忆】节头 +
+            # 摘要总长 ≤BOK_MEMORY_CHARS(默认 250 字,原 600;3 行×每行 ≤201 字
+            # 上限,总长先裁);RAG 开另加知识 2×~151 字 + 联网 1×~151 字。
+            keep = max(1, int(os.environ.get("REPLY_MEMORY_LINES", "3")))
             parts.append("【本通对话记忆】\n" + "\n".join(self._summary_lines[-keep:]))
         return "\n\n".join(parts)
 
@@ -1923,6 +2257,9 @@ class ContextAwareLLM(llm.LLM):
         self._inner = inner
         self._ctx = context_state
         self._partial_capture: dict | None = None
+        # P2.a：最近一次 guard 流（chat() 时更新；agent 侧 interrupted 补账读
+        # pending_buffer 用。None 安全：bypass 档/测试替身路径无 guard）。
+        self._last_guard_stream: "_RepeatSelfGuardStream | None" = None
         _bind_metrics_forward(inner, self)
 
     def chat(
@@ -1973,6 +2310,21 @@ class ContextAwareLLM(llm.LLM):
                         return c
                     return "".join(x for x in (c or []) if isinstance(x, str))
 
+                def _polish_body(raw: str) -> str:
+                    # LLM 上下文侧润色替换（2026-09-27 ASR 受限纠错层,原文单轨:
+                    # raw 是账本键永不改;确定性映射,同 raw 恒同 polished——先查
+                    # 轮处理器 async 预计算(含 CSC 二道)的 map,miss 才本地同步
+                    # 兜底吸附)。关档直通 raw。
+                    if not raw or not _polish_layer_on():
+                        return raw
+                    hit = self._ctx.polished_of(raw)
+                    if hit is not None:
+                        return hit
+                    body = _polish_sync_text(raw, self._ctx.user_language or None)
+                    if body != raw:
+                        self._ctx.set_polished(raw, body)
+                    return body
+
                 def _replay(idx: int, orig: str, final: str) -> bool:
                     it = items[idx]
                     if isinstance(it, llm.ChatMessage) and _text_of(it) == orig:
@@ -1986,12 +2338,30 @@ class ContextAwareLLM(llm.LLM):
                     # 新增的尾部 user 从最后一条起各拼当前尾部并入账。
                     for k, (orig, final, _rev) in enumerate(applied):
                         _replay(users[k], orig, final)
-                    for idx in users[len(applied):]:
+                    # EX-1 尾部封洞（2026-09-28）：非 LLM 回复车道（flow say 直念/
+                    # QA 罐头/graph play/分支罐头）把客户消息 append 进 chat 上下文后
+                    # 从不调 LLM，该消息永不入尾部账本；下一真轮 n_new≥2，旧循环给
+                    # 每条新消息都渲染尾部——稳定段落在「已被替答」的洞消息上，紧随
+                    # 其后的最新消息只拿紧凑标签，且末条账本稳定键为空 → 下轮又重发
+                    # 一次稳定段（稳定段付两遍，实测 ~1975 未缓存 token ≈ 2.2-2.4s）。
+                    # 修=除最后一条外全部冻结裸体（无尾部）：洞消息从不渲染尾部，稳定
+                    # 段只由最新消息照常发出一次。裸体条目仍是普通账本项
+                    # (orig, final, rev)，原样重放；稳定键恒空（bare=True）。
+                    new_indices = users[len(applied):]
+                    for idx in new_indices[:-1]:
+                        it = items[idx]
+                        orig = _text_of(it) if isinstance(it, llm.ChatMessage) else ""
+                        final = _polish_body(orig)
+                        if final != orig:
+                            items[idx] = llm.ChatMessage(role="user", content=[final])
+                        self._ctx.record_applied_tail(orig, final, bare=True)
+                    for idx in new_indices[-1:]:
                         it = items[idx]
                         orig = _text_of(it) if isinstance(it, llm.ChatMessage) else ""
                         tail = self._ctx.render_context_tail()
-                        final = f"{orig}\n\n{tail}" if (orig and tail) else (orig or tail)
-                        if tail:
+                        body = _polish_body(orig)
+                        final = f"{body}\n\n{tail}" if (body and tail) else (body or tail)
+                        if tail or body != orig:
                             items[idx] = llm.ChatMessage(role="user", content=[final])
                         self._ctx.record_applied_tail(orig, final)
                 elif users:
@@ -2014,18 +2384,31 @@ class ContextAwareLLM(llm.LLM):
                             # 且账本 orig 永远对不上、其后每轮 replay 全跳过。
                             actual = _text_of(items[users[offset + k]])
                             tail = self._ctx.render_context_tail()
-                            rebased = f"{actual}\n\n{tail}" if (actual and tail) else (actual or tail)
+                            body = _polish_body(actual)
+                            rebased = f"{body}\n\n{tail}" if (body and tail) else (body or tail)
                             items[users[offset + k]] = llm.ChatMessage(role="user", content=[rebased])
                             last_orig = actual
                             self._ctx.rewrite_last_applied_tail(actual, rebased)
                             ok = True
                         if k == len(tail_window) - 1:
                             last_replayed = ok
-                    if last_replayed and tail_window and tail_window[-1][2] < self._ctx.revision:
-                        tail = self._ctx.render_context_tail()
-                        final = f"{last_orig}\n\n{tail}" if (last_orig and tail) else (last_orig or tail)
-                        items[users[-1]] = llm.ChatMessage(role="user", content=[final])
-                        self._ctx.rewrite_last_applied_tail(last_orig, final)
+                    if last_replayed and tail_window:
+                        # F3 重试字节稳定（2026-09-28 手术③）：重渲染当前尾部与冻结尾部
+                        # 逐字节比对——相同则原样重放（不动请求=前缀不裂），只有真换步/
+                        # 真内容变化才重写。旧版按 revision 无条件重写，是同轮重试
+                        # 19.9% 尾部断裂的来源。重渲染用重建档发出决定（复现末条尾部
+                        # 当时的稳定段带否），否则会把已带的稳定段重渲染成不带=误判变化。
+                        tail = self._ctx.render_context_tail(
+                            emit_stable=self._ctx.tail_emit_stable_for_rebuild()
+                        )
+                        body = _polish_body(last_orig)
+                        final = f"{body}\n\n{tail}" if (body and tail) else (body or tail)
+                        if final == tail_window[-1][1]:
+                            print("TAIL_REWRITE identical_skipped", flush=True)
+                        else:
+                            items[users[-1]] = llm.ChatMessage(role="user", content=[final])
+                            self._ctx.rewrite_last_applied_tail(last_orig, final)
+                            print("TAIL_REWRITE content_changed", flush=True)
                 self._ctx.prune_applied_tails(keep=len(users))
                 # 剔除框架一次性步骤标记([流程状态] system):它只服务抢跑失效判定,
                 # 本轮在、下轮无 → 进了请求流会令下一轮喺同一位分叉,cached 钉死
@@ -2056,9 +2439,24 @@ class ContextAwareLLM(llm.LLM):
             ):
                 # 出口复读防线(2026-09-12):逐句比对上一句回复,拟声复读句剥掉
                 # (call-8fa17d2b 两轮一字不差实证);客户要求重讲轮放行。
-                out = _RepeatSelfGuardStream(
-                    self, _stripped, self._ctx.last_reply, bypass=self._ctx.repeat_requested
+                # EX-2:再叠跨轮账本(gen=llm 历史回复),治同通隔轮复述;
+                # BOK_REPEAT_CROSS_TURN=0 或复问放行(allow_repeat)时账本喂空。
+                _cross_ledger = (
+                    self._ctx.reply_ledger()
+                    if _repeat_cross_turn_on() and not self._ctx.allow_repeat
+                    else []
                 )
+                out = _RepeatSelfGuardStream(
+                    self, _stripped, self._ctx.last_reply,
+                    bypass=self._ctx.repeat_requested or self._ctx.allow_repeat,
+                    ledger=_cross_ledger,
+                    threshold=_repeat_cross_turn_sim(),
+                    allow_repeat=self._ctx.allow_repeat,
+                )
+                # P2.a（2026-09-29 v2 §5）：持最近 guard 流引用——agent 侧 speech
+                # watcher 在 interrupted 补账时读 pending_buffer，cancel 轮的
+                # 未播缓冲（tee 捕不到的部分）不再蒸发。
+                self._last_guard_stream = out
             else:
                 out = _stripped
             # 部分文本 tee(2026-09-17,治「打断轮零账本」):把本回复已生成的文本
@@ -2113,9 +2511,12 @@ def _truncate_chat_items(items: list, max_turns: int = 4) -> list:
 
     旧实现:dialog 一超过 max_turns 对就【每轮】截到 max_turns 对——截断动了序列
     头部,mlx KV-cache(只认严格前缀)每轮重新锚定,省下的 prefill 全赔回去。
-    现在:dialog 涨到 2×max_turns 对才动手、一次剪回 max_turns 对——之后 max_turns
-    轮内纯追加(缓存逐轮命中),每 max_turns 轮才重锚一次。更早的信息由
-    ContextState「本通对话记忆」摘要承担,剪掉不丢上下文。
+    现在:dialog 涨到 6×max_turns 对才动手、一次剪回 max_turns 对——之后最多
+    6×max_turns 轮纯追加(缓存逐轮命中),每 6×max_turns 轮才重锚一次。F4
+    (2026-09-28 手术③)由 2×→(触发 4×)改为触发 6×:历史截断整段重锚实测
+    5-9s/次、占 6.6% 轮次,触发点抬高一半=重锚频率减半,坍塌成本减半;剪回
+    目标不变(2×max_turns 条=最近 max_turns 对)。更早的信息由 ContextState
+    「本通对话记忆」摘要承担,剪掉不丢上下文。
     """
     if max_turns <= 0:
         return items
@@ -2128,8 +2529,8 @@ def _truncate_chat_items(items: list, max_turns: int = 4) -> list:
             break
     system_part = items[:split]
     dialog = items[split:]
-    # 滞回:超过 2×max_turns 对(4×max_turns 条)才截,剪回 max_turns 对。
-    if len(dialog) <= max_turns * 4:
+    # 滞回:超过 6×max_turns 对(12×max_turns 条)才截,剪回 2×max_turns 条。
+    if len(dialog) <= max_turns * 6:
         return items
     return system_part + dialog[-(max_turns * 2) :]
 
@@ -2494,6 +2895,7 @@ class MiniMaxTTS(tts.TTS):
         emotion_state=None,
         model_override: str = "",
         language_boost: str | None = None,
+        pronunciation: list[str] | None = None,
     ):
         super().__init__(
             # 真流式：声明 streaming=True，voice 管线调 stream() 走 SynthesizeStream，
@@ -2514,6 +2916,10 @@ class MiniMaxTTS(tts.TTS):
         self._model_override = model_override
         # 目标语 language_boost 显式档(None=未传→透传 env;空串=显式禁用)。
         self._language_boost_override = language_boost
+        # 请求级发音词典(人名/专名读准):每条 `原词/读法`(读法=拼音/IPA/粤拼/
+        # 纯文本替换)。粤语拼法由调用方给(本层不做 g2p);空/None=完全不下发键,
+        # 现行为零变化(2026-09-27)。
+        self._pronunciation = [str(e) for e in (pronunciation or []) if str(e).strip()]
 
     def _resolve_emotion(self) -> str | None:
         """emotion 策略(2026-09-07 翻默认):不指定 → MiniMax 按文本自动匹配。
@@ -2586,6 +2992,20 @@ class MiniMaxTTS(tts.TTS):
     def _model(self) -> str:
         return self._model_override or os.environ.get("MINIMAX_MODEL", "speech-2.8-hd")
 
+    def _prep_outbound(self, text: str) -> str:
+        """实例侧出站文本预处：标识符数字槽逐位化 + 非 2.8 档剥自然度标记。
+
+        数字槽逐位化先做（与标记无交互，:`func:`_digitize_id_slots`）：标识符语境
+        的 3/4 位阿拉伯串按逐位读，修 MiniMax 数值读法事故（1459→一千四百五十九）。
+        标记只係 2.8 系的合成语义；会话级 transform 门按**主档**判（agent.py
+        `_tts_primary.resolved_model()`），FallbackAdapter 切到 2.6 备档时那层
+        管不到——(emm)/<#0.3#> 会被 2.6 当文本照念。本层按**本实例**档位兜底
+        剥干净（2026-09-27，test_minimax_prep_outbound_strips_tags_on_26 钉住）。"""
+        s = _digitize_id_slots(text)
+        if a_line_tags_supported(self._model()):
+            return s
+        return strip_voice_style(s)
+
     def _language_boost(self) -> str:
         """目标语 language_boost(B 线构造经 language_boost 显式下发;未传=env 透传,
         空=不下发)。
@@ -2648,6 +3068,16 @@ class MiniMaxTTS(tts.TTS):
         """
         return os.environ.get("MINIMAX_CONTINUOUS_SOUND", "0") == "1"
 
+    def _apply_pronunciation(self, payload: dict) -> dict:
+        """非空发音词典就加 `pronunciation_dict` 键,空=完全不加(现行为零变化)。
+
+        官方 schema 只一个 `tone: string[]`,每条 `原词/读法`;多条同时生效。
+        task_start(bidi/classic 两处)与 HTTP 整段三路共用本单点,防漏接。
+        """
+        if self._pronunciation:
+            payload["pronunciation_dict"] = {"tone": list(self._pronunciation)}
+        return payload
+
     def _task_start_payload(self, voice: str, sample_rate: int) -> dict:
         """bidi task_start 载荷：参数与 classic 同源（_ws_voice_setting 一套构造）。"""
         start = {
@@ -2667,6 +3097,8 @@ class MiniMaxTTS(tts.TTS):
         # 长文本韵律更自然。默认关(官方默认 false=切分并发,延迟低)。
         if self._continuous_sound():
             start["continuous_sound"] = True
+        # 请求级发音词典(空=不加键)。
+        self._apply_pronunciation(start)
         return start
 
     def _bidi_session(self) -> "_MiniMaxBidiSession":
@@ -2680,7 +3112,7 @@ class MiniMaxTTS(tts.TTS):
     def synthesize(self, text, *, conn_options=None):
         # 保留整段合成路径：livekit 某些非 stream 调用 / 测试仍会走 synthesize。
         # 整段齐晒先落 stream——喺度套教学形拦截最稳(逐句流式只喺 send 前拦)。
-        text = lecture_guard(str(text), self._speech_lang())
+        text = self._prep_outbound(lecture_guard(str(text), self._speech_lang()))
         return _MiniMaxTTSStream(self, text, conn_options or APIConnectOptions())
 
     def _speech_lang(self) -> str | None:
@@ -2688,18 +3120,30 @@ class MiniMaxTTS(tts.TTS):
         lang = self._language_state.lang
         return lang if lang in ("zh", "cantonese") else None
 
-    def prewarm(self) -> None:
-        """会话开始即后台预连（bidi: 预连持久会话; classic: keep-warm 池,容量 1）。
+    async def prewarm(self) -> bool:
+        """预热一次 WS 会话入池。返回 True=池里现在有暖会话;False=不可预热(HTTP 车道/未配置/失败)。绝不 raise。
 
-        classic 官方 t2a_v2 WS 一连接一任务（task_finish 后服务端关连接），用过的连接
-        复用唔到；但 connect（TCP+TLS 握手，实测冷 ~0.65s/暖 ~0.2s）可以提前做。
-        失败静默——首段合成回退流内自连，行为同旧。
-        bidi 一条连接服务整个 call：预热 = 后台 connect+task_start，首段合成零握手段。
+        冻结契约(W-TTS,会话装配单点调用):bidi(默认)=预连持久会话
+        (connect+task_start,首段合成零握手段;连接整通复用);classic=预连
+        「处女连接」入池(只 connect,容量 1,合成取用免 TCP+TLS 握手)。池是
+        纯快路径:取唔到/陈旧一律回退流内自连,合成永不因预热失败而慢或错。
+        `BOK_TTS_PREWARM=0` 整闸回退:立即 False,池逻辑全旁路(旧行为逐字节不变)。
         """
-        if self._ws_mode() == "bidi":
-            self._bidi_session().prewarm()
-            return
-        _minimax_pool_schedule(self._endpoint_ws(), self._api_key())
+        if not _minimax_prewarm_enabled():
+            return False
+        try:
+            # HTTP 整段车道(无 WS 握手可摊销):不可预热,零行为变化。
+            if os.environ.get("MINIMAX_WS", "1") != "1":
+                return False
+            if not self._api_key() or not self._resolve_voice():
+                return False
+            if self._ws_mode() == "bidi":
+                return await self._bidi_session().prewarm_wait()
+            return await _minimax_pool_prewarm(self._endpoint_ws(), self._api_key())
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - 预热尽力而为:失败静默,合成路径自会流内自连
+            return False
 
     def stream(self, *, conn_options=None):
         """真流式 SynthesizeStream：classic 按句 task_continue;bidi 逐字透传服务端切句。"""
@@ -2724,7 +3168,9 @@ class MiniMaxTTS(tts.TTS):
 # connected_success 留喺接收缓冲由取用方握手逻辑照常收），下次合成直接取用，
 # 免整个握手段。failure-safe：取池验 key/endpoint 匹配 + TTL + open 状态，
 # 握手失败弃池全新重连一次；任何取唔到/失败都回退流内自连（旧行为）。
-# MINIMAX_WS_POOL=0 关闭（恒走流内自连）。
+# 命中即**立刻**后台补一条（池深 1，不等本段合成收尾）——每一轮都免握手，
+# 唔止第一轮。`BOK_TTS_PREWARM=0` 总闸（prewarm() 立即 False + 池逻辑全旁路）；
+# MINIMAX_WS_POOL=0 旧开关保留（恒走流内自连）。
 _MINIMAX_POOL_WS = None  # 热连接（websockets 客户端实例）
 _MINIMAX_POOL_KEY: tuple[str, str] | None = None  # 入池时 (endpoint, api_key)
 _MINIMAX_POOL_AT = 0.0  # 入池时刻（monotonic）
@@ -2732,8 +3178,43 @@ _MINIMAX_POOL_TTL_S = 240.0  # 超龄弃用（服务端对空闲连接的生命�
 _MINIMAX_POOL_TASK: asyncio.Task | None = None  # 补池任务（单飞）
 
 
+class PrewarmFallbackTTS(tts.FallbackAdapter):
+    """官方 FallbackAdapter 的预热兼容垫（2026-09-28）。
+
+    官方 ``FallbackAdapter.prewarm()``（livekit 1.8）按**同步**约定直调 primary
+    child——``MiniMaxTTS.prewarm`` 已 async 化（W-TTS 会话预热池），官方一跳产生
+    未 await 协程（RuntimeWarning + 经适配器链的预热静默失效）。覆写：child 同步
+    签名照旧直调；协程签名挂当前 loop 后台跑，失败静默（合成路径自会流内自连）。
+    构造签名与官方完全一致，装配点零漂移换类名即可。
+    """
+
+    def prewarm(self) -> None:
+        instances = getattr(self, "_tts_instances", None) or []
+        if not instances:
+            return
+        child_pw = getattr(instances[0], "prewarm", None)
+        if child_pw is None:
+            return
+        try:
+            result = child_pw()
+        except Exception:  # noqa: BLE001 - 预热尽力而为,失败零影响
+            return
+        if not asyncio.iscoroutine(result):
+            return
+        try:
+            # FIRE_FORGET_EXEMPT: 预热纯增益——被 GC 掐掉=首次合成就地握手回退。
+            asyncio.get_running_loop().create_task(result)
+        except RuntimeError:
+            result.close()
+
+
+def _minimax_prewarm_enabled() -> bool:
+    """BOK_TTS_PREWARM 总闸（默认 "1"）："0"=prewarm() 立即 False + 池逻辑全旁路。"""
+    return os.environ.get("BOK_TTS_PREWARM", "1") == "1"
+
+
 def _minimax_pool_enabled() -> bool:
-    return os.environ.get("MINIMAX_WS_POOL", "1") == "1"
+    return _minimax_prewarm_enabled() and os.environ.get("MINIMAX_WS_POOL", "1") == "1"
 
 
 async def _minimax_ws_silent_close(ws) -> None:
@@ -2778,7 +3259,12 @@ def _minimax_pool_discard(ws) -> None:
 
 
 def _minimax_pool_pop(endpoint: str, key: str):
-    """取热连接；无池/参数变/超龄/已闭 → None（调用方回退全新连接）。"""
+    """取热连接；无池/参数变/超龄/已闭 → None（调用方回退全新连接）。
+
+    命中即打点 `MINIMAX_PREWARM hit=1` 并**立刻**后台补一条（池深 1）——补池
+    不等本段合成收尾，下一轮（第 N+1 轮）同样免握手；陈旧弃置打点
+    `MINIMAX_PREWARM stale=1`（握手期才发现服务端静默关闭的另一处见调用方）。
+    """
     global _MINIMAX_POOL_WS, _MINIMAX_POOL_KEY, _MINIMAX_POOL_AT
     ws = _MINIMAX_POOL_WS
     pooled_key = _MINIMAX_POOL_KEY
@@ -2788,18 +3274,84 @@ def _minimax_pool_pop(endpoint: str, key: str):
     _MINIMAX_POOL_AT = 0.0
     if ws is None:
         return None
-    if pooled_key != (endpoint, key) or (time.monotonic() - pooled_at) > _MINIMAX_POOL_TTL_S:
+    if pooled_key != (endpoint, key):  # 参数变(换 key/端点):配置性弃置,非陈旧
+        _minimax_pool_discard(ws)
+        return None
+    if (time.monotonic() - pooled_at) > _MINIMAX_POOL_TTL_S:
+        print("MINIMAX_PREWARM stale=1", flush=True)
         _minimax_pool_discard(ws)
         return None
     try:
         from websockets.protocol import State
 
         if getattr(ws, "state", State.OPEN) != State.OPEN:
+            print("MINIMAX_PREWARM stale=1", flush=True)
             _minimax_pool_discard(ws)
             return None
     except Exception:  # noqa: BLE001 - 判不了状态就信任之（握手失败另有回退）
         pass
+    print("MINIMAX_PREWARM hit=1", flush=True)
+    _minimax_pool_schedule(endpoint, key)
     return ws
+
+
+def _minimax_pool_ready(endpoint: str, key: str) -> bool:
+    """池里是否有一条 (endpoint,key) 匹配、未超龄、OPEN 的暖连接（不取用）。
+
+    不可用（参数变/超龄/已闭）即就地弃置——prewarm() 随后补一条新的；判不了
+    状态就信任之（取用方握手失败另有弃池全新重连回退）。
+    """
+    global _MINIMAX_POOL_WS, _MINIMAX_POOL_KEY, _MINIMAX_POOL_AT
+    ws = _MINIMAX_POOL_WS
+    if ws is None:
+        return False
+    if _MINIMAX_POOL_KEY != (endpoint, key) or (
+        time.monotonic() - _MINIMAX_POOL_AT
+    ) > _MINIMAX_POOL_TTL_S:
+        _MINIMAX_POOL_WS = None
+        _MINIMAX_POOL_KEY = None
+        _MINIMAX_POOL_AT = 0.0
+        _minimax_pool_discard(ws)
+        return False
+    try:
+        from websockets.protocol import State
+
+        if getattr(ws, "state", State.OPEN) != State.OPEN:
+            _MINIMAX_POOL_WS = None
+            _MINIMAX_POOL_KEY = None
+            _MINIMAX_POOL_AT = 0.0
+            _minimax_pool_discard(ws)
+            return False
+    except Exception:  # noqa: BLE001 - 判不了状态就信任之
+        pass
+    return True
+
+
+async def _minimax_pool_prewarm(endpoint: str, key: str) -> bool:
+    """等一条暖连接入池（池深 1）：已有=True；在飞=共享同一任务（单飞防重复握手）。
+
+    绝不 raise —— 补池任务自身吞异常，本函数只回报最终池态；无池/未配置=False。
+    """
+    global _MINIMAX_POOL_TASK
+    if not _minimax_pool_enabled() or not key or not endpoint:
+        return False
+    if _minimax_pool_ready(endpoint, key):
+        return True
+    task = _MINIMAX_POOL_TASK
+    if task is None or task.done():
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - 调用点都在 loop 内
+            return False
+        task = loop.create_task(_minimax_pool_replenish(endpoint, key))
+        _MINIMAX_POOL_TASK = task
+    try:
+        await task
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - 补池任务自身已吞,双保险
+        return False
+    return _minimax_pool_ready(endpoint, key)
 
 
 async def _minimax_pool_replenish(endpoint: str, key: str) -> None:
@@ -2825,8 +3377,8 @@ async def _minimax_pool_replenish(endpoint: str, key: str) -> None:
         print(f"MINIMAX_TTS_WS_POOL_PREWARM connect_ms={connect_ms:.0f}", flush=True)
     except asyncio.CancelledError:
         raise
-    except Exception as exc:  # noqa: BLE001 - 预热尽力而为
-        print(f"MINIMAX_TTS_WS_POOL_PREWARM_FAIL {exc!r}", flush=True)
+    except Exception:  # noqa: BLE001 - 预热尽力而为:补池失败静默(纯快路径,合成自会流内自连)
+        pass
     finally:
         _MINIMAX_POOL_TASK = None
 
@@ -3074,6 +3626,83 @@ def _tts_first_clause_config() -> tuple[bool, int]:
     return on, max(1, chars)
 
 
+# ---- bidi 首 chunk 提前切（W-TTS 首音频,2026-09-28） ----------------------------
+# 生产回复= bidi 持久连接,输入循环逐块原样透传、服务端攒句合成。首个 continue
+# 若等整句标点才发(长首句),该句音频要等服务端攒够整句才开始合成 → 客户干等。
+# 首个 continue 按字数提前切:≥N 字且句内无标点时先发一段(切点不落数字/拉丁
+# run 内),后续 continue 照旧按句界对齐——只移动首块切点,韵律影响最小。
+# ``BOK_TTS_FIRST_CHUNK_CHARS`` 缺省 "10";"0"=整段关闭(旧行为逐字节同)。
+def _tts_first_chunk_chars() -> int:
+    """首个 bidi continue 提前切门槛(字数)。0=关闭;坏值回默认 10。"""
+    try:
+        v = int(os.environ.get("BOK_TTS_FIRST_CHUNK_CHARS", "10"))
+    except Exception:  # pragma: no cover - 配错回默认
+        return 10
+    return v if v > 0 else 0
+
+
+# 保护 run 字符集:数字(ASCII/全角/中文数字词)与拉丁字母——这些连续串绝不能被
+# 提前切点拦腰截断(号码/专名拆两段会在拼接边界停顿/重读)。放一起当同一类 run,
+# 保守但安全(多延伸永远不伤语义)。
+_FIRST_CHUNK_RUN_CHARS = frozenset(
+    "0123456789"
+    "０１２３４５６７８９"
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "〇零一二三四五六七八九俩两"
+)
+
+
+def _first_chunk_cut(text: str, min_chars: int) -> int | None:
+    """首个 bidi continue 的提前切点 → 安全切点下标,或 None=走既有路径。
+
+    纯函数(零依赖,单测可隔离)。返回 None 的情形:功能关闭(min_chars<=0)/
+    空串/首个句末标点落在 min_chars+6 容差内(自然切点就近,按句路径优先,
+    韵律更优)/去空白后不足 N 字/切点延伸后无剩余(整段都在保护 run 内,
+    切了等于没切)。命中时返回的下标保证:text[:cut] 既不落在数字 run 内
+    也不落在拉丁/数字词 run 内。
+
+    注意(2026-09-28 A/B 实弹勘误):旧版「全文任何位置有句界就让位」会令
+    58 字远处的一个句号压制 10 字早切——早切本就为长首句而生,远处句界
+    不该挡;只有「句界就快自然到达」(N+6 内)才值得多等几个字换自然断点。
+    """
+    if min_chars <= 0 or not text:
+        return None
+    # 首个句末标点就近(min_chars+6 容差内)→ 按句路径的自然切点优先。
+    b = _first_sentence_end(text)
+    if b is not None and b <= min_chars + 6:
+        return None
+    if len(text.strip()) < min_chars:
+        return None
+    cut = min_chars
+    if cut >= len(text):
+        return None
+    # IRON GUARD:切点若把同一 run 劈开(text[cut-1] 与 text[cut] 都是保护字符),
+    # 延伸到该 run 结束(数字/拉丁词整段同行,延伸永远安全)。
+    if (
+        0 < cut < len(text)
+        and text[cut - 1] in _FIRST_CHUNK_RUN_CHARS
+        and text[cut] in _FIRST_CHUNK_RUN_CHARS
+    ):
+        while cut < len(text) and text[cut] in _FIRST_CHUNK_RUN_CHARS:
+            cut += 1
+    if cut >= len(text):
+        return None
+    if not text[:cut].strip():
+        return None
+    return cut
+
+
+def _first_sentence_end(text: str) -> int | None:
+    """首个句末标点之后的下标(含标点),无则 None。尾块按句界对齐用。"""
+    best = -1
+    for ch in _TTS_SENT_END:
+        i = text.find(ch)
+        if i != -1 and (best == -1 or i < best):
+            best = i
+    return best + 1 if best != -1 else None
+
+
 def _tts_overlap_send_now(
     buf: str,
     *,
@@ -3124,6 +3753,11 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
         self._tts_ = tts_
         # 教学形拦截已触发过就唔再重复播罐头(同段后续课程句静默丢弃)。
         self._lecture_fired = False
+
+    def push_text(self, text: str = "", *args, **kwargs):
+        # 框架文本入口统一过 _prep_outbound:非 2.8 备档实例剥自然度标记
+        # (会话级 transform 门按主档判,FallbackAdapter 换档这层管不到)。
+        return super().push_text(self._tts_._prep_outbound(str(text or "")), *args, **kwargs)
 
     async def _emit_beep(self, output_emitter):
         import math
@@ -3208,6 +3842,8 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
             boost = self._tts_._language_boost()
             if boost:
                 start["language_boost"] = boost
+            # 请求级发音词典(空=不加键),与 bidi/HTTP 三路同单点。
+            self._tts_._apply_pronunciation(start)
             await a_ws.send(json.dumps(start))
             return json.loads(await asyncio.wait_for(a_ws.recv(), timeout=15))
 
@@ -3228,6 +3864,7 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                     raise
                 # 池连接空闲期被服务端静默关闭 → 弃池，全新连接重握手一次
                 # （再失败就走下方 START 失败路径 beep，同旧行为）。
+                print("MINIMAX_PREWARM stale=1", flush=True)
                 print("MINIMAX_TTS_WS_POOL_STALE retry_fresh", flush=True)
                 await _minimax_ws_silent_close(ws)
                 t_fresh = time.monotonic()
@@ -3843,6 +4480,29 @@ class _MiniMaxBidiSession:
             return
         self._prewarm_task = loop.create_task(self._prewarm_run())
 
+    async def prewarm_wait(self) -> bool:
+        """（W-TTS 冻结契约）等本次预热落地并返回连接是否可用。
+
+        已连且参数指纹一致=True（零握手）;在飞预热=共享同一任务（单飞,不会重复
+        握手）;否则拉起 prewarm() 再等。自身异常已被 _prewarm_run 吞（绝不上抛）
+        ——失败=False,首个真实轮 ensure_ready 自会流内连接,行为同旧。
+        """
+        params = self._tts_._bidi_params_key()
+        if self._alive() and self._params == params:
+            return True
+        task = self._prewarm_task
+        if task is None or task.done():
+            self.prewarm()
+            task = self._prewarm_task
+        if task is not None and not task.done():
+            try:
+                await task
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - 预热任务自身已吞,双保险
+                pass
+        return bool(self._alive() and self._params == params)
+
     async def _prewarm_run(self) -> None:
         try:
             async with self._lock:
@@ -3900,10 +4560,15 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
         # (官方 2204:单条 >10k 字跳过,故截 10k);2205 重发係重放已发文本,唔 append。
         self._sent_text_parts: list[str] = []
         # F-10 限流守卫态(本轮内):收到限流族故障 / 最近一次故障码 / 首包信号
-        # (WS 退避重试后是否出声,由 recv_loop 在首推时置)。
+        # (WS 退避重试后,是否出声由 recv_loop 在首推时置)。
         self._rate_limited = False
         self._last_rl_status = 0
         self._first_audio_evt = asyncio.Event()
+
+    def push_text(self, text: str = "", *args, **kwargs):
+        # 同 _MiniMaxSynthesizeStream.push_text:非 2.8 档实例剥自然度标记
+        # (会话级 transform 门按主档判,FallbackAdapter 换档这层管不到)。
+        return super().push_text(self._tts_._prep_outbound(str(text or "")), *args, **kwargs)
 
     async def _emit_beep(self, output_emitter):
         import math
@@ -4103,6 +4768,8 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                                     f"MINIMAX_TTS_BIDI_PERF reused={int(reused)} "
                                     f"connect_ms={connect_ms:.0f} "
                                     f"first_continue_to_audio_ms={(t_first - fc) * 1000:.0f} "
+                                    f"first_chunk={state.get('first_chunk') or 'sentence'} "
+                                    f"chars={state.get('first_chunk_chars', 0)} "
                                     f"total_ms={(t_first - t0) * 1000:.0f}",
                                     flush=True,
                                 )
@@ -4325,13 +4992,51 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                     state["sent_any"] = True
                     session.active_epoch = my_epoch  # 认领纪元:此后残留门禁对本流放行
 
+                # W-TTS 首 chunk 提前切:仅本流(=本回复)首个 continue 可句内提前
+                # 送(≥N 字),此后回按句界对齐(尾块攒到句界或收尾才发)。env "0"
+                # 或不足 N 字时逐块原样透传=旧行为逐字节同。
+                first_chunk_chars = _tts_first_chunk_chars()
+                first_chunk_done = False
+                first_tail = ""
                 async for item in self._input_ch:
                     if isinstance(item, self._FlushSentinel):
                         continue
                     text = str(item or "")
                     if not text.strip():
                         continue
+                    if first_tail:
+                        # 首块切走后的尾块:攒到句界一次发(后续 continue 按句对齐)。
+                        first_tail += text
+                        seg_end = _first_sentence_end(first_tail)
+                        if seg_end is not None:
+                            seg, first_tail = first_tail[:seg_end], first_tail[seg_end:]
+                            if seg.strip():
+                                await _send_text(seg)
+                        continue
+                    if not first_chunk_done:
+                        first_chunk_done = True
+                        if first_chunk_chars > 0 and not is_lecture_text(text):
+                            cut = _first_chunk_cut(text, first_chunk_chars)
+                            if cut is not None:
+                                state["first_chunk"] = "early"
+                                state["first_chunk_chars"] = len(text[:cut].strip())
+                                print(
+                                    f"MINIMAX_TTS_BIDI_FIRST_CHUNK early "
+                                    f"chars={state['first_chunk_chars']} cut={cut}",
+                                    flush=True,
+                                )
+                                await _send_text(text[:cut])
+                                if text[cut:].strip():
+                                    first_tail = text[cut:]
+                                continue
+                        state["first_chunk"] = "sentence"
+                        state["first_chunk_chars"] = len(text.strip())
                     await _send_text(text)
+                if first_tail.strip():
+                    # 回复结束尾块未攒到句界:收尾前补发(唔可以丢——task_flush 只
+                    # 吐服务端已收到的文本)。
+                    await _send_text(first_tail)
+                    first_tail = ""
 
                 # ---- F-10 限流守卫收尾(2026-09-23):触发限流(或熔断轮)且零音频
                 # → 退避重试 WS(1039/2205)或回落既有 HTTP 路径(1002 首击/熔断/
@@ -4556,6 +5261,8 @@ async def _minimax_http_synth(
                 boost = tts_._language_boost()
                 if boost:
                     payload["language_boost"] = boost
+                # 请求级发音词典(空=不加键):HTTP 整段兜底路径与 WS 同份语义。
+                tts_._apply_pronunciation(payload)
                 resp = await client.post(
                     endpoint,
                     headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
@@ -4677,6 +5384,8 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
             boost = self._tts_._language_boost()
             if boost:
                 start["language_boost"] = boost
+            # 请求级发音词典(空=不加键),与 bidi/HTTP 三路同单点。
+            self._tts_._apply_pronunciation(start)
             await a_ws.send(json.dumps(start))
             return json.loads(await asyncio.wait_for(a_ws.recv(), timeout=15))
 
@@ -4689,6 +5398,7 @@ class _MiniMaxTTSStream(tts.ChunkedStream):
                 if not ws_from_pool:
                     raise
                 # 池连接空闲期被服务端静默关闭 → 弃池，全新连接重握手一次。
+                print("MINIMAX_PREWARM stale=1", flush=True)
                 print("MINIMAX_TTS_WS_POOL_STALE retry_fresh", flush=True)
                 await _minimax_ws_silent_close(ws)
                 t_fresh = time.monotonic()
@@ -4955,7 +5665,16 @@ async def _qwen3_tts_post_frames(
     (情绪变化逐段生效,等价 MiniMax 的 task_start 语义)。
     end_segment=False 时由调用方(流式路径)在整场文本结束后统一收尾。
     返回是否成功推出音频。
+
+    MiniMax 标记剥离单点(2026-09-28):本车道两条流(直念 ChunkedStream/LLM
+    SynthesizeStream)全部经此 POST——Qwen3-TTS 无标记解析层(源码证:文本纯
+    拼接进 tokenizer),正稿直念里的 `(breath)`、历史残留的 `<#0.3#>` 会逐字
+    照念;NATURALNESS_BLOCK 由模型门("2.8"判据)保证不注入本地车道,此处再
+    兜底剥净。剥后纯空白直接跳过(无音节输入会 hallucinate 爆段)。
     """
+    text = strip_voice_style(text)
+    if not text or not text.strip():
+        return False
     last_exc: Exception | None = None
     pushed_any = False  # 本任务是否已有音频落地(半途断流后重试会重读音频)
     # 单任务音频上限(秒):正常一段≤2-3 短句 ≤8s;TTS 对异常输入(纯标点/幻觉)
@@ -5420,6 +6139,14 @@ class _Qwen3ASRStream(stt.RecognizeStream):
                     final.raise_for_status()
                     data = final.json()
                     text = str(data.get("text") or "")
+                    # 整段路径同款词表回声补口(2026-09-28):一次性转写无流内闸口,
+                    # 直接过守卫(一次性语义,echo_seen 不必跨请求持有)。
+                    if os.environ.get("QWEN3_HOTWORD_ECHO_GUARD", "1") == "1":
+                        text, _echo_seen = _vocab_echo_guard(
+                            text,
+                            getattr(self._stt_, "_hotword_context", "") or "",
+                            echo_seen=False,
+                        )
                     lang = str(data.get("language") or "")
                     lang = _normalize_asr_language(lang, text)
                     print(
@@ -6794,10 +7521,24 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                 r.raise_for_status()
                 data = r.json()
                 text = str(data.get("text") or "")
+                # 词表回声守卫补口(2026-09-28):finish 增量捷径丢失/全量重解时,
+                # 整表抄词直穿此路径(四个流内闸口都管不到)——13 通实证转写带
+                # 110-120 字词表尾巴直入流程判定,两通随即被 stall-degrade 吞答。
+                text = self._echo_filter(text, "finish")
                 lang = _normalize_asr_language(str(data.get("language") or ""), text)
+                # 句级置信度（2026-09-27 sidecar stream_generate per-token top1 概率
+                # 聚合）:暴露位给轮处理器做 CSC 门控;None=sidecar 关档/回退/旧版。
+                conf = data.get("confidence")
+                self._stt_.last_confidence = conf if isinstance(conf, dict) else None
+                _conf_log = ""
+                if isinstance(conf, dict):
+                    _conf_log = (
+                        f" conf_mean={conf.get('mean')} conf_min={conf.get('min')}"
+                        f" low_tokens={conf.get('low_tokens')}/{conf.get('n_tokens')}"
+                    )
                 print(
                     f"QWEN3_ASR_TEXT {repr(text[:120])} {lang} "
-                    f"ASR_MS={(time.monotonic() - t0) * 1000:.0f}(stream)",
+                    f"ASR_MS={(time.monotonic() - t0) * 1000:.0f}(stream){_conf_log}",
                     flush=True,
                 )
                 return text, lang
@@ -6852,6 +7593,10 @@ class Qwen3ASRLiveSTT(stt.STT):
         # 在活流追踪(GPU 竞态专项):set_partial_ms 要即时转发到当前 stream 的
         # 开会话;WeakSet 随流 GC 自动清理,勿改强引用。
         self._live_streams: weakref.WeakSet = weakref.WeakSet()
+        # 最近一次 /api/finish 的句级置信度(2026-09-27):sidecar 按 stream_generate
+        # per-token top1 概率聚合;None=关档/回退/旧版 sidecar。轮处理器在
+        # on_user_turn_completed 读它做 CSC 触发门(FINAL 先于 turn 钩子,时序成立)。
+        self.last_confidence: dict | None = None
 
     @property
     def model(self) -> str:
