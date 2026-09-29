@@ -111,9 +111,8 @@ from .flow import (  # noqa: F401 - 部分名字只被 branch_hit_plan 使用
     parse_step_ref,
     refuse_condition_confirmed,
     render_template_text,
+    ladder_should_fire,
     stall_ladder_level,
-    STALL_BYPASS_N,
-    STALL_CLOSE_N,
 )
 
 try:
@@ -6006,7 +6005,11 @@ async def entrypoint(ctx):
                 _lvl = stall_ladder_level(flow_ctrl.step_streak.get(flow_ctrl.current, 0))
                 if _lvl == "bypass" and _wa_captured["on"]:
                     _lvl = "close"  # 号码已在手,留号无意义 → 直接收线
-                if _lvl:
+                # P2.b（2026-09-29 v2 §5）：同级不连发门——ladder_fired 显式账本
+                # 替旧「顶 streak 到下一级门槛-1」数值魔术（该写法在 streak=4 时
+                # 仍判 degrade → 同级再发，call-ed6aa9b8 17:30:37/46 两发同句实证）。
+                # close 不入账：enter_closing 幂等 + 块外 not closing 已拦。
+                if _lvl and ladder_should_fire(flow_ctrl.ladder_fired, _lvl):
                     print(
                         f"[stall-ladder] step={flow_ctrl.current + 1} level={_lvl} "
                         f"streak={flow_ctrl.step_streak.get(flow_ctrl.current, 0)} (call {room_name})",
@@ -6022,12 +6025,8 @@ async def entrypoint(ctx):
                         _schedule_call_end(8.0, disposition="polite_close")
                     else:
                         _line = _stall_ladder_line(language_state.lang, _lvl)
-                        # 同级不连发(2026-09-28 实证 degrade 连发两轮):发射后把
-                        # streak 顶到下一级门槛-1,下一轮 UNCLEAR 直落下一级——
-                        # 每级每次升迁只发一次(degrade→bypass→close)。
-                        flow_ctrl.step_streak[flow_ctrl.current] = (
-                            STALL_CLOSE_N - 1 if _lvl == "bypass" else STALL_BYPASS_N - 1
-                        )
+                        # 发射记账：本步该级别已发（advance/jump 清空=换步新账）。
+                        flow_ctrl.ladder_fired.add(_lvl)
                     _register_reply_lane(lane=f"stall-{_lvl}", text=_line)  # EX-2 chokepoint
                     try:
                         _sl_ms = int((time.monotonic() - _t0) * 1000)
