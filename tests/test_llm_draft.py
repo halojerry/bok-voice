@@ -1,9 +1,9 @@
 """Draft 模型 speculative decoding 管线单测(2026-09-25,默认关)。
 
 契约:BOK_LLM_DRAFT 默认 "0"——mlx_lm server 命令行**逐字节同旧**(无
---draft-model),prompt-cache-bytes 恒 6GB,draft 权重不随全量下载拉取;
+--draft-model),prompt-cache-bytes 恒 4GB(P1.d 定档),draft 权重不随全量下载拉取;
 ="1" 且 draft 模型在盘才追加 --draft-model/--num-draft-tokens 3 两旗并把
-cache 折到 5GB;模型缺席=无 draft 起服务不 fail,doctor 只出一行警告不进
+cache 折到 3.5GB;模型缺席=无 draft 起服务不 fail,doctor 只出一行警告不进
 fails。全部离线:不依赖真实模型在盘、不触网、不起进程。
 """
 
@@ -62,7 +62,7 @@ def test_draft_off_argv_byte_identical(monkeypatch):
         "py", "-m", "mlx_lm", "server",
         "--model", "/models/main-4b", "--host", "127.0.0.1", "--port", "1239",
         "--prompt-cache-size", "128",
-        "--prompt-cache-bytes", "6GB",
+        "--prompt-cache-bytes", "4GB",
         "--prefill-step-size", "512",
         "--chat-template-args", '{"enable_thinking":false}',
         "--log-level", "INFO",
@@ -70,7 +70,7 @@ def test_draft_off_argv_byte_identical(monkeypatch):
 
 
 def test_draft_on_argv_tail_and_cache_discount(monkeypatch, tmp_path):
-    """draft 开 → argv 尾部追加两旗,cache-bytes 落 5GB(同一条命令行内一致)。"""
+    """draft 开 → argv 尾部追加两旗,cache-bytes 落 3.5GB(同一条命令行内一致,P1.d 折档)。"""
     _clear_draft_env(monkeypatch)
     monkeypatch.setenv("BOK_LLM_DRAFT", "1")
     monkeypatch.setenv("BOK_LLM_DRAFT_MODEL", str(tmp_path))
@@ -79,7 +79,7 @@ def test_draft_on_argv_tail_and_cache_discount(monkeypatch, tmp_path):
         "--draft-model", str(tmp_path), "--num-draft-tokens", "3",
     ]
     assert argv[-6:-4] == ["--log-level", "INFO"]
-    assert argv[argv.index("--prompt-cache-bytes") + 1] == "5GB"
+    assert argv[argv.index("--prompt-cache-bytes") + 1] == "3.5GB"
 
 
 def test_cache_bytes_explicit_env_never_discounted(monkeypatch):
