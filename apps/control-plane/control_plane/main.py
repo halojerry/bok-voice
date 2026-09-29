@@ -9,6 +9,7 @@ import ipaddress
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -91,11 +92,13 @@ from .permissions import (
 from .pregen import persona_pregen_status
 from . import pregen as pregen_mod
 from . import qa_cluster as qa_cluster_mod
+from . import hotword_mining
 from . import gap_mining
 from . import gap_proposals
 from . import qa_digest as qa_digest_mod
 from . import qa_drift
 from . import silence_poke
+from .model_routing_detect import detect_local as detect_local_endpoints
 from .auth import (
     Identity,
     JWT_TTL_S,
@@ -624,6 +627,15 @@ def get_settings(request: Request, internal: bool = False) -> dict:
 @app.put("/api/settings")
 def put_settings(req: SettingsRequest, request: Request) -> dict:
     auto_gate_management(request)
+    # 引擎设置收 root（2026-09-27，镜像 model_routing 红线）：asr/llm/tts/vad/
+    # sip/sms/policy 全是**节点基建**——settings 单行是全 CP 唯一真源，多节点
+    # 每通热读（agent 装配 cp.get_settings），admin 改一处=所有本地部署跟着变。
+    # 该面不该进下发键目录（admin 授了 settings 键也只能读掩码面；GET 保持
+    # 下发制键闸——voice-options/personas 等读面靠它）。机器通道（BOK_CP_TOKEN）
+    # 与 auth-off 单机形态 identity=None 照旧直通。
+    ident = current_identity(request)
+    if ident is not None and ident.role != "root":
+        raise HTTPException(403, "引擎设置仅平台方（root）可修改")
     existing = _repo().get_settings()
     new_values = {
         "asr": req.asr.model_dump(),
@@ -916,6 +928,19 @@ def test_model_routing(req: ModelRoutingTestRequest, request: Request) -> dict:
         }
 
 
+@app.get("/api/model-routing/detect")
+async def detect_model_routing(request: Request) -> dict:
+    """本地端点自动发现（2026-09-27）：同 GET /api/model-routing 的 root 闸
+    （require_role("root")：机器通道恒直通、auth-off 直通、admin/user 403）。
+
+    并行探候选端点（env MLX_LLM_BASE_URL + 本地缺省端口 + 现路由表 base_url 活性
+    复查），回 `{endpoints:[{base_url, ok, models, error}]}`（可达在前）。出仓**永不
+    含 api_key 材料**；probe 失败折成数据，端点**绝不 500**。检测只回读，绝不落库。
+    """
+    require_role(request, "root")
+    return await detect_local_endpoints(read_model_routing_raw(), os.environ)
+
+
 def _sms_settings() -> dict:
     """settings.sms 段读取（W5-T1）：端点与挂断钩子共用，缺段=空 dict=未配置。"""
     return (_repo().get_settings() or {}).get("sms") or {}
@@ -1001,6 +1026,36 @@ async def asr_health(request: Request) -> dict:
             return resp.json()
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.get("/api/asr/hotwords")
+def asr_hotwords(request: Request, account_id: str = "", lang: str = "") -> dict:
+    """ASR 热词下发(EX-H1,2026-09-28):agent 机器通道 + 话务员读面(与 qa 页同闸)。
+
+    契约(与 agent 侧消费固定):GET /api/asr/hotwords?account_id=<id>&lang=<lang>
+    → {"words": ["…", …]}。两级合并:全局行(account_id='')∪ 本账号行,enabled
+    仅取 True,按 lang 过滤,去重,数字主导/含数字词服务端滤除(数字铁律),无上限
+    逻辑(截断在消费端)。lang 必填(zh/cantonese/en),缺省/非法 400;account_id
+    缺省 ''=仅全局行。**单条 SELECT 无 join**(读面要便宜)。
+    """
+    _gate_page(request, "qa")
+    lang = str(lang or "").strip()
+    if lang not in hotword_mining.CANONICAL_LANGS:
+        raise HTTPException(status_code=400, detail="lang required (zh|cantonese|en)")
+    account_id = scoped_account(request, account_id)
+    rows = _repo().list_hotword_entries(account_id, lang=lang, enabled=True)
+    words: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        word = str(row.get("word") or "").strip()
+        if not word or hotword_mining.is_digit_dominant(word):
+            continue
+        key = word.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        words.append(word)
+    return {"words": words}
 
 
 @app.get("/api/tts/health")
@@ -2211,12 +2266,64 @@ def create_call(req: CreateCallRequest, request: Request) -> dict:
     return _create_call_in(_repo(), req, created_by=created_by)
 
 
+def _max_active_calls_env() -> int:
+    """并发准入上限（BOK_MAX_ACTIVE_CALLS，缺省 3；<=0=不限，非法回落 3）。
+
+    单机单并发 LLM 队列：2 通已退化、6 通 Metal OOM 拖垮整栈
+    （reports/mac-concurrency-2026-09-24/BATTERY-FINAL.md）。**不落 settings schema**
+    ——建单时读 os.environ，经 tools/bok.py `_control_plane_env` 下发（同
+    BOK_DISPATCH_RETRY 判例），零迁移。
+    """
+    try:
+        n = int(str(os.environ.get("BOK_MAX_ACTIVE_CALLS", "") or "3").strip())
+    except (TypeError, ValueError):
+        return 3
+    return n  # <=0 由调用方视为不限
+
+
+def _require_template_env() -> bool:
+    """实时通话是否强制绑定话术模板（BOK_REQUIRE_TEMPLATE，缺省开；=0 关）。
+
+    与 `_max_active_calls_env` 同判例：建单时读 os.environ，经 tools/bok.py
+    `_control_plane_env` 下发，零迁移。默认开启——实时业务通话不绑模板=agent
+    无话术漏斗裸跑，属结构性配置错误。
+    """
+    return str(os.environ.get("BOK_REQUIRE_TEMPLATE", "1")).strip() != "0"
+
+
+# 活跃通话状态集（准入闸/防重闸共用；与 `_live_call_count` 的三态同源）。
+_LIVE_CALL_STATUSES = (CallStatus.RINGING.value, CallStatus.ACTIVE.value, CallStatus.PAUSED.value)
+
+
 def _create_call_in(repo, req: CreateCallRequest, created_by: str = "") -> dict:
     """建通话（会话清单装配 + 审计）；repo 由调用方给出（端点= `_repo()`）。
 
     抽成函数便于 campaign 循环在**注入的 repo** 上建通话（campaign_tick 的 repo
     参数与 app.state 可不同源，单测注入内存仓时不能走 `_repo()`）。
     """
+    # 并发准入 + 重复建单防重（2026-09-27）：建单前拒，绝不先建后杀。
+    # 作用域=mode=live（真实业务 A 线通话，吃本机单并发 LLM/GPU 的车道）；
+    # simulation（训练/画布试跑）与 realtime_demo（云端 S2S，不吃本地 GPU）不受限
+    # ——训练/单测会刻意对同一对象连续建多单，闸到它们会误伤既有语义（且非 OOM 源）。
+    # ①并发：活通话（ringing/active/paused）达 BOK_MAX_ACTIVE_CALLS（默认 3）→ 409。
+    #   campaign/dial-now（均 mode=live）亦走此闸=背压；E2E 探针串行不受影响。
+    # ②重复：同一 object_id 已有活通话 → 409（对象维度防叠单，B 线无 object 跳过）。
+    if req.mode == CallMode.LIVE:
+        _max_active = _max_active_calls_env()
+        if _max_active > 0:
+            _active = _live_call_count(repo)
+            if _active >= _max_active:
+                _audit("call.reject_concurrency", subject_type="call", account_id=req.account_id,
+                       detail={"active": _active, "max": _max_active, "mode": req.mode, "kind": req.kind})
+                raise HTTPException(status_code=409, detail="并发已达上限，请稍后重试")
+        if req.object_id:
+            for _c in repo.list_calls(""):
+                if (str(_c.get("object_id") or "") == req.object_id
+                        and str(_c.get("status") or "") in _LIVE_CALL_STATUSES):
+                    _audit("call.reject_duplicate", subject_type="call", subject_id=_c.get("id", ""),
+                           account_id=req.account_id, call_id=_c.get("id", ""),
+                           detail={"object_id": req.object_id, "existing_status": _c.get("status") or ""})
+                    raise HTTPException(status_code=409, detail="该对象已有进行中的通话")
     # 会话清单：读取全局策略(offline_first/cloud_first)与已配置 provider，
     # 并把话术快照到 call（审计「这场用了哪版话术」）。
     # 话术优先级：显式指定（外呼战役/话务员自选）> 对象卡绑定。
@@ -2227,6 +2334,17 @@ def _create_call_in(repo, req: CreateCallRequest, created_by: str = "") -> dict:
     if not template_id and req.object_id:
         obj = repo.get_object(req.object_id)
         template_id = (obj or {}).get("template_id", "") or ""
+    # 话术模板强绑闸（2026-09-27）：实时通话（A 线真实业务）必须绑定话术模板，
+    # 否则 agent 装配无话术漏斗=结构裸跑。simulation（训练/画布试跑）与
+    # realtime_demo（云端 S2S 演示）不吃本地话术漏斗、kind=interpret（B 线同传）
+    # 无话术语义——三者豁免。闸口在建单唯一汇聚点，POST /api/calls、dial-now、
+    # campaign 循环（经 _start_call）全部经此。kill-switch BOK_REQUIRE_TEMPLATE=0。
+    if (req.mode == CallMode.LIVE and str(req.kind or "") != "interpret"
+            and not template_id and _require_template_env()):
+        _audit("call.reject_no_template", subject_type="call", account_id=req.account_id,
+               detail={"mode": req.mode, "kind": req.kind, "object_id": req.object_id})
+        raise HTTPException(status_code=400,
+                            detail="实时通话必须绑定话术模板（对象卡 template_id 或显式 template_id）")
     manifest = select_session_manifest(
         session_id=f"call-{uuid.uuid4().hex[:8]}",
         account_id=req.account_id,
@@ -2322,8 +2440,11 @@ def clear_ended_calls(request: Request, account_id: str = "acc-001") -> dict:
 # agent 崩溃/浏览器直接关页会让 ringing/active 永久停摆(supervisor 曾显示 26 路
 # 假活跃)。启动扫一遍 + 60s 周期:
 #   ①ringing 且 created_at>10min → FAILED(从未接通,无 token 无 turns);
-#   ②active/paused 且 LiveKit 房间已无参与者 → ENDED(abandoned)+ 兜底 settle
-#     (幂等,existing 短路——agent 实时结算为主,这里只扫尾)。
+#   ②active/paused 且 LiveKit 房间**确认**无参与者 → ENDED(disposition='reaped',
+#     与客户真挂断区分)+ 兜底 settle(幂等,existing 短路——agent 实时结算为主,这里只扫尾);
+#     房间状态未知(LiveKit 瞬断/鉴权/网络,_room_has_participants→None)→ **跳过**
+#     (审计 reaper.skip),绝不把「查不到」当没人(2026-09-27 修:旧版任何异常=可回收,
+#     dispatch_list_failed 628× / ≥52 通 active 被误杀且与真挂断不可分)。
 _STALE_RINGING_S = 600
 _REAP_INTERVAL_S = 60
 
@@ -2389,8 +2510,11 @@ def _is_agent_identity(identity: str) -> bool:
 # BOK_POLISH_OFFLINE 判例，非 _FORWARD_ENV——那张表是 A 线 agent worker 面）。
 # ---------------------------------------------------------------------------
 
-# 重试排程（秒，token 签发后偏移）：实测瞬时不可用窗 ~2.5s，三段短退避全覆盖。
-_DISPATCH_WATCHDOG_SCHEDULE = (2.0, 2.5, 3.0)
+# 重试排程（秒，token 签发后偏移）：旧 (2.0,2.5,3.0) 与 agent 冷启动实测 ~3s
+# （LOAD ≤8s）相撞——复查轮删掉的正是冷启动中的活派发（2026-09-28 双派发实证，
+# call-0105a539 第二 dispatch 恰在 token+2.0s 由本看门狗 CreateDispatch 造出）。
+# 现首attempt放宽到 6s（>冷启动 p99），两段 5s 退避仍覆盖瞬时不可用窗。
+_DISPATCH_WATCHDOG_SCHEDULE = (6.0, 5.0, 5.0)
 # in-flight 房间数封顶：token 风暴下防守护线程无界膨胀（每线程寿命 ≤schedule 总长）。
 _DISPATCH_WATCHDOG_CAP = 32
 _dispatch_watchdog_inflight: set[str] = set()
@@ -2429,26 +2553,74 @@ async def _dispatch_watchdog_attempt(
         # 没人 join 是常态(探针/集成测试),末次也不留 exhausted 审计(噪声)。
         return "error"
     if any(_is_agent_identity(str(getattr(p, "identity", "") or "")) for p in ps.participants):
+        # P1.b（2026-09-29 v2 spec §4）：agent 真实入房=烧 ever_dispatched 标记。
+        # 生命周期语义：本通 agent 活过——之后无论正常结束/崩溃，看门狗永不
+        # 复活（补派只救「从未入房」的冷启动窗）。
+        from .dispatch_utils import mark_dispatch_alive
+
+        mark_dispatch_alive(room)
         return "recovered"
     if not _has_human_participants(ps.participants):
         # 房不存在/还没有真人：建房触发的 token dispatch 根本没发生，无丢失可言。
         return "waiting"
     try:
         async with _redispatch_locks[room]:
-            if attempt > 0:
-                # 复查轮清扫（webhook 恢复链同款）：agent 缺席 → 本 agent 全部
-                # dispatch 视为 stale 删除，让 create 走全新生命周期。
-                for d in await lkapi.agent_dispatch.list_dispatch(room_name=room):
-                    if d.agent_name == "bok-voice":
-                        await lkapi.agent_dispatch.delete_dispatch(
-                            dispatch_id=d.id, room_name=room
-                        )
-            if await has_active_dispatch(lkapi, room):
+            # 2026-09-28 双派发收口（call-0105a539 实锤：24/27 并发双派发房间的
+            # 首派发间隔恰落在本看门狗 1.5-2.0s 节拍上）：旧版 attempt>0 无条件
+            # 删光本 agent dispatch 再重建——room-config dispatch 在「job 已派、
+            # agent 冷启动未入房」窗口被当 stale 删掉，看门狗亲手造出第二个 job
+            # （双开场白/双份回答/GPU 翻倍=多轮卡死体感来源之一）。现改为：
+            # ①只清「可证僵尸」（job 全终态空壳 / 判龄 ≥30s 仍缺席 / 无 created_at
+            #   的旧形状且已进复查轮）——attempt 0 永不清扫；
+            # ②防重判据改「存在任意 dispatch 记录」（job 状态在冷启动窗不反映
+            #   真实，存在性才可靠；一次 list_dispatches_safe 取列表，清扫后仍在场
+            #   的 bok-voice 记录即「已在派」）。
+            #
+            # 2026-09-27 tri-state 收口：dispatch 列表拉取改用 list_dispatches_safe，
+            # None=LiveKit 瞬断/鉴权失败=「在派与否」状态未知——此时绝不可按「无在派」
+            # 补建第二个 job（防重闸被瞬断静默卸掉正是 M-27 黑洞的放大面）。跳过本轮
+            # 补派返回 "error"（loop 视为非终态、下轮重试；末次亦不打 exhausted——
+            # 状态未知非「真人在场仍未恢复」的真丢失，与 list_participants 异常同判例）。
+            from .dispatch_utils import dispatch_is_zombie, list_dispatches_safe
+
+            dispatches = await list_dispatches_safe(lkapi, room)
+            if dispatches is None:
+                control_log.warning(
+                    "dispatch_watchdog_skip_unknown",
+                    extra={"event": "dispatch.watchdog.skip_unknown",
+                           "data": {"room": room, "attempt": attempt}},
+                )
+                return "error"
+            swept_ids: set[str] = set()
+            for d in dispatches:
+                if d.agent_name == "bok-voice" and dispatch_is_zombie(d, attempt=attempt):
+                    await lkapi.agent_dispatch.delete_dispatch(
+                        dispatch_id=d.id, room_name=room
+                    )
+                    swept_ids.add(str(getattr(d, "id", "") or ""))
+            # 存在性判据只看清扫后仍在场的记录（僵尸已删，不算「在派」）。
+            if any(
+                d.agent_name == "bok-voice" and str(getattr(d, "id", "") or "") not in swept_ids
+                for d in dispatches
+            ):
                 if is_last:
                     _audit("dispatch.watchdog.exhausted", subject_type="call", subject_id=room,
                            call_id=room, detail={"attempt": attempt, "reason": "dispatch_in_flight"})
                     return "exhausted"
                 return "dup"
+            # P1.b（2026-09-29 v2 spec §4）：本通 agent 曾真实入房（ever_dispatched）
+            # → 生命周期已尽，永不复活。三例 job1 退→3s 补 job2 空转的根修：
+            # 正常结束的 dispatch 被判僵尸清扫后存在性失效，此处旧逻辑会补派
+            # job2 接手客户已放弃的房间。冷启动窗（从未入房）不受影响。
+            from .dispatch_utils import has_dispatched_before
+
+            if has_dispatched_before(room):
+                control_log.warning(
+                    "dispatch_watchdog_suppress_ever_dispatched",
+                    extra={"event": "dispatch.watchdog.suppress_ever_dispatched",
+                           "data": {"room": room, "attempt": attempt}},
+                )
+                return "suppress_ever"
             await lkapi.agent_dispatch.create_dispatch(
                 CreateAgentDispatchRequest(agent_name="bok-voice", room=room)
             )
@@ -2487,7 +2659,7 @@ async def _dispatch_watchdog_loop(room: str, schedule: tuple[float, ...] | None 
                 await lkapi.aclose()
             except Exception:  # pragma: no cover - 客户端收尾自吞
                 pass
-        if last in ("terminal", "recovered", "exhausted", "no_credentials"):
+        if last in ("terminal", "recovered", "exhausted", "no_credentials", "suppress_ever"):
             break
         # waiting/dup/error/created → 下轮复查（created 后验证 agent 是否真回房，
         # 未回房则下轮清扫 stale 再补派——webhook 恢复链同款收敛语义）。
@@ -2567,13 +2739,20 @@ def _has_human_participants(participants) -> bool:
     return any(not _is_agent_identity(str(getattr(p, "identity", "") or "")) for p in participants or [])
 
 
-async def _room_has_participants(room_name: str) -> bool:
-    """房间存在且有真人 → True;房间不存在/服务不可用/只剩 agent → False(可回收)。"""
+async def _room_has_participants(room_name: str) -> bool | None:
+    """房间状态 tri-state：有真人 → True；确认空/不存在 → False；状态未知 → None。
+
+    None = 无凭据 / 鉴权失败 / 网络或 LiveKit 不可用——调用方（reaper）必须**跳过**
+    回收，绝不能把「查不到」当「没人」。2026-09 实证（dispatch_list_failed 628×、
+    ≥52 通 active 被误判 empty 回收成 ended+abandoned）：LiveKit 瞬断时旧版一律
+    返回 False，任何一次抖动都会静默杀掉在途通话且与真挂断不可分。
+    房间 NotFound（LiveKit ServerError.code=='not_found'）是确认无人 → False（可回收）。
+    """
     key = getattr(app.state, "lk_key", "") or os.environ.get("LIVEKIT_API_KEY", "")
     secret = getattr(app.state, "lk_secret", "") or os.environ.get("LIVEKIT_API_SECRET", "")
     url = getattr(app.state, "lk_url", "") or os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880")
     if not key or not secret or not room_name:
-        return False
+        return None
     http_url = url.replace("ws://", "http://").replace("wss://", "https://").rstrip("/")
     try:
         import aiohttp
@@ -2585,10 +2764,17 @@ async def _room_has_participants(room_name: str) -> bool:
             svc = RoomService(session, http_url, key, secret)
             res = await svc.list_participants(ListParticipantsRequest(room=room_name))
             return _has_human_participants(res.participants)
-    except Exception:
-        # 房间不存在(NotFound)→ 无人 → False;鉴权/网络异常同样按可回收处理
-        # (比「永远卡 active」好;回收带 disposition=abandoned 可追溯)。
-        return False
+    except Exception as exc:
+        # 房不存在 → 确认无人（旧语义保留，否则已删房的通话永不回收）；
+        # 其余异常（鉴权/网络/服务不可用）→ None=状态未知，交给调用方跳过。
+        if getattr(exc, "code", None) == "not_found":
+            return False
+        control_log.warning(
+            "room_participants_unknown",
+            extra={"event": "reaper.room.unknown",
+                   "data": {"room": room_name, "error": repr(exc)}},
+        )
+        return None
 
 
 def _created_before(call: dict, seconds: float) -> bool:
@@ -2614,7 +2800,7 @@ def _created_before(call: dict, seconds: float) -> bool:
 
 
 async def _reap_stale_calls_once() -> dict:
-    out = {"failed": 0, "ended": 0, "settled": 0}
+    out = {"failed": 0, "ended": 0, "settled": 0, "skipped": 0}
     for c in _repo().list_calls("", status=CallStatus.RINGING.value):
         if _created_before(c, _STALE_RINGING_S):
             _repo().update_call(c["id"], status=CallStatus.FAILED.value, disposition="abandoned",
@@ -2622,9 +2808,25 @@ async def _reap_stale_calls_once() -> dict:
             out["failed"] += 1
     for st in (CallStatus.ACTIVE.value, CallStatus.PAUSED.value):
         for c in _repo().list_calls("", status=st):
-            if await _room_has_participants(c["id"]):
+            alive = await _room_has_participants(c["id"])
+            if alive is True:
                 continue
-            _repo().update_call(c["id"], status=CallStatus.ENDED.value, disposition="abandoned",
+            if alive is None:
+                # 状态未知（LiveKit 瞬断/鉴权/网络）：保守跳过，绝不把「查不到」
+                # 当「没人」——2026-09 实证 ≥52 通 active 被瞬断误回收。审计
+                # reaper.skip 留痕，纯 log 不够（post-hoc 可追溯是本次修复目标）。
+                out["skipped"] += 1
+                _audit("reaper.skip", subject_type="call", subject_id=c["id"], call_id=c["id"],
+                       detail={"reason": "room_state_unknown", "status": st})
+                control_log.warning(
+                    "reaper_skip_unknown",
+                    extra={"event": "reaper.skip",
+                           "data": {"room": c["id"], "status": st}},
+                )
+                continue
+            # alive is False：确认空房/房不存在 → 回收。disposition='reaped' 与
+            # 客户真挂断区分（旧版同落 abandoned，post-hoc 审计无法辨别系统杀）。
+            _repo().update_call(c["id"], status=CallStatus.ENDED.value, disposition="reaped",
                                 **_call_end_fields(c))
             out["ended"] += 1
             try:
@@ -2748,7 +2950,13 @@ def add_turn(
 ) -> dict:
     _gate_page(request, "calls")
     # B2 归属闸（agent 机器上报无身份恒过）；先于 turn_id 说明注释。
-    deny_cross_account(request, _repo().get_call(call_id))
+    call_row = _repo().get_call(call_id)
+    deny_cross_account(request, call_row)
+    # 孤儿轮拒绝(2026-09-28 账本一致性探针):deny_cross_account 对缺失行恒放行,
+    # 此前 turn 会被落库到不存在的通话——15 通孤儿轮对所有 join call_sessions 的
+    # 消费者(挖掘/漂移/看板/结算)不可见=纯脏数据。404 让上报方立刻知道。
+    if call_row is None:
+        raise HTTPException(status_code=404, detail=f"call not found: {call_id}")
     # turn_id 用 uuid 而非 len(get_turns()) 序号：并发写时序号竞态产生重复
     # turn_id → 主键冲突 → IntegrityError 幂等分支吞成 200（静默丢数据，QA
     # 压测 30 并发丢 30-37% 实证）。uuid 根除竞态（#20 同期修 provider/latency
@@ -4210,15 +4418,17 @@ async def settle(call_id: str, request: Request) -> dict:
 _SETTLE_LOCKS: dict[str, asyncio.Lock] = {}
 
 
-def _live_call_count() -> int:
-    """「活」通话数（ringing+active+paused）：结算闲时门的判据。
+def _live_call_count(repo=None) -> int:
+    """「活」通话数（ringing+active+paused）：结算闲时门 + 建单并发准入的判据。
 
     ringing 也算——在振铃的通话随时会有 agent dispatch 进场（开场白 prewarm +
-    首轮生成），正是 settle 最不该撞的窗。
+    首轮生成），正是 settle 最不该撞的窗。`repo` 缺省走全局 `_repo()`；campaign
+    循环在**注入的 repo** 上建单时须显式传入（否则撞 app.state 未初始化的 AttributeError）。
     """
     n = 0
+    r = repo if repo is not None else _repo()
     for st in (CallStatus.RINGING.value, CallStatus.ACTIVE.value, CallStatus.PAUSED.value):
-        n += len(_repo().list_calls("", status=st))
+        n += len(r.list_calls("", status=st))
     return n
 
 
@@ -4318,6 +4528,10 @@ async def _settle_core(call_id: str, *, idle_cap_s: float | None = None) -> dict
                         continue
                 if not tokens:
                     tokens = len(turns) * 300
+                # 估算口径标记(2026-09-28 账本探针):208 通 ended 无 session_report,
+                # tokens=轮数×300 係估算——status 标 estimated,报表可区分真值/估算
+                #(消费方按 status 过滤即得旧行为)。
+                _usage_estimated = tokens == len(turns) * 300
                 if not _repo().get_usage_record(call_id):
                     _repo().session.add(
                         UsageRecord(
@@ -4331,7 +4545,7 @@ async def _settle_core(call_id: str, *, idle_cap_s: float | None = None) -> dict
                             audio_seconds=0.0,
                             latency_ms=0,
                             cost_estimate=0.0,
-                            status="ok",
+                            status="estimated" if _usage_estimated else "ok",
                         )
                     )
                     _repo().session.commit()
@@ -4517,20 +4731,21 @@ async def dial_now(object_id: str, req: DialNowRequest, request: Request) -> dic
         sip=dict(settings.get("sip") or {}),
         site=site,
     )
+    # 话术快照：显式 template_id 压过对象绑定模板（call_sessions.template_id 是
+    # agent 装配的第一优先来源，与 campaign/工作台建单同优先级）。**必须随建单
+    # 一起传入**（建单前由 _create_call_in 统一解析+过模板强绑闸）——旧版先建单
+    # 再 update_call 覆盖会绕过闸口，令显式指定模板的 dial-now 被误拒。
     call = _create_call_in(repo, CreateCallRequest(
         account_id=account_id,
         object_id=object_id,
         persona_id=req.persona_id or "",
+        template_id=req.template_id or "",
         language=dial["language"],
         mode=CallMode.LIVE,
         direction="outbound",
     ))
     call_id = str(call.get("id") or "")
     repo.update_call(call_id, contact_phone=phone)
-    # 话术快照：显式 template_id 压过对象绑定模板（call_sessions.template_id 是
-    # agent 装配的第一优先来源，与 campaign/工作台建单同优先级）。
-    if req.template_id:
-        repo.update_call(call_id, template_id=req.template_id)
     metadata = json.dumps({"call_id": call_id, "dial": dial}, ensure_ascii=False)
     from .campaign import _default_dispatcher
 
@@ -4892,17 +5107,21 @@ def qa_cluster_ep(req: QaClusterRequest, request: Request, account_id: str = "ac
         if req.select is not None
         else None
     )
-    # 勾选采纳守卫(主会话审计修复):select 下标只在「与 dry 同参数的新鲜缓存」上有效,
-    # 缓存过期/参数不符时静默重算=下标可能对到另一份计划采错条目——409 让前端重新
-    # 生成;select=None 的「采纳全部」可安全重算(语义=采纳当前计划全量)。
-    if req.apply and select is not None and not qa_cluster_mod.has_fresh_plan(account_id, min_calls, limit):
+    hotword_select = (
+        [int(i) for i in req.hotword_select] if req.hotword_select is not None else None
+    )
+    # 勾选采纳守卫(主会话审计修复):select/hotword_select 下标只在「与 dry 同参数的
+    # 新鲜缓存」上有效,缓存过期/参数不符时静默重算=下标可能对到另一份计划采错条目
+    # ——409 让前端重新生成;未带任何选择(NULL)的「采纳全部」可安全重算。
+    has_selection = select is not None or hotword_select is not None
+    if req.apply and has_selection and not qa_cluster_mod.has_fresh_plan(account_id, min_calls, limit):
         raise HTTPException(status_code=409, detail="聚类计划已过期或参数不符，请重新生成计划后再采纳")
     try:
         plan = qa_cluster_mod.run_cluster(_repo(), account_id, min_calls=min_calls, limit=limit)
         if not req.apply:
             return plan
         return qa_cluster_mod.apply_cluster(
-            _repo(), request, account_id, plan, select, audit=_audit
+            _repo(), request, account_id, plan, select, hotword_select, audit=_audit
         )
     except qa_cluster_mod.AlreadyRunning as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -5311,6 +5530,76 @@ def update_template(template_id: str, req: UpdateTemplateRequest, request: Reque
     return tpl
 
 
+def _spawn_detached_popen(cmd: list[str], env: dict[str, str], log: Path) -> subprocess.Popen:
+    """起 detached 子进程(镜像 pregen._spawn_detached):新会话(栈/进程组杀不断它)
+    +日志落盘,打开日志失败退 DEVNULL。daemon reaper 线程回收退出码防僵尸。
+
+    cmd 固定为字面量 argv 列表(无 shell);调用方负责 try/except 全包。
+    """
+    repo_root = str(Path(__file__).resolve().parents[3])
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("ab") as lf:
+            proc = subprocess.Popen(  # noqa: S603 - 固定脚本+参数,无 shell
+                cmd,
+                cwd=repo_root,
+                env=env,
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+    except OSError:
+        proc = subprocess.Popen(  # noqa: S603
+            cmd,
+            cwd=repo_root,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    threading.Thread(
+        target=proc.wait, daemon=True, name=f"publish-pregen-reap-{proc.pid}"
+    ).start()
+    return proc
+
+
+def _publish_auto_pregen(template: dict, *, base_url: str) -> dict:
+    """模板发布成功后的自动罐头物化(2026-09-27):detached 跑
+    `pregen_tts.py --greetings --branches --account-id <acct>`——greetings 线覆盖
+    直念步(say=1)文本线、branches 线覆盖分支应答线;模板按发布模板所属账号取
+    (详情端点=发布冻结 overlay,与运行时装配同源)。QA 无账号维度(全局表),不在
+    发布钩子面。
+
+    镜像 POST/PUT /api/personas 的 persona 自动物化姿势:任何失败只回状态键,
+    绝不阻发布响应。kill-switch `BOK_PUBLISH_AUTO_PREGEN=0` 全关。
+    """
+    try:
+        if os.environ.get("BOK_PUBLISH_AUTO_PREGEN", "1") != "1":
+            return {"status": "disabled"}
+        script = Path(__file__).resolve().parents[3] / "scripts" / "pregen_tts.py"
+        if not script.exists():
+            return {
+                "status": "script_missing",
+                "hint": "运行目录无 scripts/pregen_tts.py(打包部署),请手动执行 bok.py tts-pregen --greetings --branches",
+            }
+        cmd = [sys.executable, str(script), "--greetings", "--branches"]
+        account_id = str(template.get("account_id") or "").strip()
+        if account_id:
+            cmd += ["--account-id", account_id]
+        env = {**os.environ, "PYTHONUNBUFFERED": "1", "BOK_CP_URL": base_url}
+        pregen_mod._bake_ssl_cert_file(env)
+        log = pregen_mod._log_path()
+        proc = _spawn_detached_popen(cmd, env, log)
+        print(
+            f"BOK_PUBLISH_PREGEN queued template={template.get('id', '')} "
+            f"pid={proc.pid} log={log}",
+            flush=True,
+        )
+        return {"status": "queued", "log": str(log)}
+    except Exception as exc:  # noqa: BLE001 - 提醒面永不阻发布响应
+        return {"status": "failed", "error": repr(exc)[:200]}
+
+
 @app.post("/api/templates/{template_id}/publish")
 def publish_template(template_id: str, request: Request) -> dict:
     """发布=冻结当时 live 九键写 published_json(模板发布两态 W2-T1)。
@@ -5334,7 +5623,13 @@ def publish_template(template_id: str, request: Request) -> dict:
         account_id=updated.get("account_id", ""),
         detail={"name": updated.get("name", ""), "language": frozen.get("language", "")},
     )
-    return {**updated, **_template_published_flags(updated)}
+    # 冻结+审计落库后:detached 物化该模板账号的罐头(直念步/分支),给发布即热。
+    # 失败只回 tts_pregen 状态键,绝不阻发布响应(镜像 personas 自动物化姿势)。
+    out = {**updated, **_template_published_flags(updated)}
+    out["tts_pregen"] = _publish_auto_pregen(
+        updated, base_url=str(request.base_url).rstrip("/")
+    )
+    return out
 
 
 @app.get("/api/templates/{template_id}/revisions")

@@ -113,7 +113,12 @@ def env_guard(monkeypatch):
 
     `_main_loop=None` 强制线程兜底路径——单元级调度测试要钉的是该路径的去重/
     封顶/杀开关;主 loop 路由由专用测试钉（run_coroutine_threadsafe 归一锁域）。
+    P1.b：同步隔离 ever_dispatched 账本（recovered 分支会烧标记，跨测试污染
+    会让后续补派测试被 suppress_ever 拦截）。
     """
+    from control_plane import dispatch_utils as _du
+
+    monkeypatch.setattr(_du, "_EVER_DISPATCHED", set())
     audits: list[tuple] = []
     monkeypatch.setattr(cp_main, "_audit", lambda action, **kw: audits.append((action, kw)))
     monkeypatch.setattr(cp_main, "_dispatch_watchdog_inflight", set())
@@ -186,6 +191,66 @@ def test_attempt_cleans_stale_dispatch_on_retry(env_guard, monkeypatch):
     assert disp.created == ["call-x"]
 
 
+# ---- 2026-09-28 双派发收口：看门狗不得杀死冷启动中的活派发 ----
+# call-0105a539 实锤：attempt>0 无条件删光重建 + job-state 防重在冷启动窗误判，
+# 看门狗亲手造出第二个 job（24/27 并发双派发房间落在 1.5-2.0s 旧节拍上）。
+
+
+def _room_config_dispatch_young():
+    """现代 room-config dispatch：job 已 RUNNING、created_at=现在（冷启动中）。"""
+    import time as _t
+    return SimpleNamespace(
+        id="d-live-coldstart", agent_name="bok-voice", created_at=int(_t.time()),
+        state=SimpleNamespace(jobs=[SimpleNamespace(state=SimpleNamespace(status=1))]),
+    )
+
+
+def _room_config_dispatch_zombie():
+    """僵尸：RUNNING job 但 created_at 在 31s 前（agent 冷启动不可能这么久）。"""
+    import time as _t
+    return SimpleNamespace(
+        id="d-zombie-aged", agent_name="bok-voice", created_at=int(_t.time()) - 31,
+        state=SimpleNamespace(jobs=[SimpleNamespace(state=SimpleNamespace(status=1))]),
+    )
+
+
+def test_attempt_never_kills_cold_start_dispatch(env_guard, monkeypatch):
+    """核心回归钉：job RUNNING + 判龄新鲜 → 任何 attempt 都不得删/不得补派。"""
+    for attempt in (0, 1, 2):
+        lkapi, disp = _fake_lkapi(
+            lambda: {"call-x": ["operator-a"]},
+            dispatches=[_room_config_dispatch_young()],
+        )
+        monkeypatch.setattr(cp_main, "_repo", _live_repo)
+        outcome = asyncio.run(cp_main._dispatch_watchdog_attempt(lkapi, "call-x", attempt))
+        assert outcome == "dup", f"attempt={attempt}"
+        assert disp.deleted == [], f"attempt={attempt}"
+        assert disp.created == [], f"attempt={attempt}"
+
+
+def test_attempt_holds_on_any_dispatch_record_attempt0(env_guard, monkeypatch):
+    """防重改存在性判据：PENDING 无 created_at 的在途派发在 attempt 0 照样让位。"""
+    lkapi, disp = _fake_lkapi(lambda: {"call-x": ["operator-a"]}, dispatches=[_active_dispatch()])
+    monkeypatch.setattr(cp_main, "_repo", _live_repo)
+    outcome = asyncio.run(cp_main._dispatch_watchdog_attempt(lkapi, "call-x", 0))
+    assert outcome == "dup"
+    assert disp.created == []
+    assert disp.deleted == []
+
+
+def test_attempt_sweeps_zombie_by_age(env_guard, monkeypatch):
+    """判龄 ≥30s 的 RUNNING dispatch + agent 缺席 = 僵死 → 清扫 + 补派。"""
+    lkapi, disp = _fake_lkapi(
+        lambda: {"call-x": ["operator-a"]},
+        dispatches=[_room_config_dispatch_zombie()],
+    )
+    monkeypatch.setattr(cp_main, "_repo", _live_repo)
+    outcome = asyncio.run(cp_main._dispatch_watchdog_attempt(lkapi, "call-x", 0))
+    assert outcome == "created"
+    assert disp.deleted == ["d-zombie-aged"]
+    assert disp.created == ["call-x"]
+
+
 def test_attempt_last_chance_create_still_fires_on_last_attempt(env_guard, monkeypatch):
     """末次尝试：真人仍缺席 → 最后一搏补派（worker 可能刚恢复）并留痕，不当失败收。"""
     lkapi, disp = _fake_lkapi(lambda: {"call-x": ["operator-a"]})
@@ -194,6 +259,55 @@ def test_attempt_last_chance_create_still_fires_on_last_attempt(env_guard, monke
     assert outcome == "created"
     assert disp.created == ["call-x"]
     assert any(a[0] == "agent.watchdog_dispatch" for a in env_guard)
+
+
+# ---- 2026-09-27 tri-state：dispatch 列表状态未知时不得补派 ----
+
+
+def test_attempt_skips_when_dispatch_list_unknown(env_guard, monkeypatch):
+    """list_dispatch 抛异常（LiveKit 瞬断/鉴权失败）→ 防御重未知，跳过补派。
+
+    旧 best-effort `has_dispatch_record` 把异常压成 False=「无在派」，防重闸被瞬断
+    静默卸掉、看门狗照建第二个 job。tri-state 后 None=状态未知 → 返回 "error"
+    （loop 非终态下轮重试），绝不 create。
+    """
+    from unittest.mock import AsyncMock
+
+    lkapi, disp = _fake_lkapi(lambda: {"call-x": ["operator-a"]})
+    disp.list_dispatch = AsyncMock(side_effect=RuntimeError("livekit api down"))
+    monkeypatch.setattr(cp_main, "_repo", _live_repo)
+    outcome = asyncio.run(cp_main._dispatch_watchdog_attempt(lkapi, "call-x", 0))
+    assert outcome == "error"
+    assert disp.created == []
+    assert disp.deleted == []
+
+
+def test_attempt_dispatch_list_unknown_on_last_returns_error_no_audit(monkeypatch):
+    """末次仍状态未知 → 返回 error 且不打 exhausted（非「真人在场仍未恢复」）。"""
+    from unittest.mock import AsyncMock
+
+    audits: list[tuple] = []
+    monkeypatch.setattr(cp_main, "_audit", lambda action, **kw: audits.append((action, kw)))
+    lkapi, disp = _fake_lkapi(lambda: {"call-x": ["operator-a"]})
+    disp.list_dispatch = AsyncMock(side_effect=RuntimeError("livekit api down"))
+    monkeypatch.setattr(cp_main, "_repo", _live_repo)
+    outcome = asyncio.run(cp_main._dispatch_watchdog_attempt(lkapi, "call-x", 2, is_last=True))
+    assert outcome == "error"
+    assert disp.created == []
+    assert audits == []
+
+
+def test_attempt_holds_on_dispatch_record_after_partial_sweep(env_guard, monkeypatch):
+    """同一列表里僵尸 + 判龄新鲜的正常派发：只清僵尸，存在性判据仍让位（不叠加）。"""
+    lkapi, disp = _fake_lkapi(
+        lambda: {"call-x": ["operator-a"]},
+        dispatches=[_room_config_dispatch_zombie(), _room_config_dispatch_young()],
+    )
+    monkeypatch.setattr(cp_main, "_repo", _live_repo)
+    outcome = asyncio.run(cp_main._dispatch_watchdog_attempt(lkapi, "call-x", 1))
+    assert outcome == "dup"
+    assert disp.deleted == ["d-zombie-aged"]  # 只清可证僵尸
+    assert disp.created == []
 
 
 def test_attempt_api_error_on_last_stays_silent(monkeypatch):
@@ -454,3 +568,59 @@ def test_token_endpoint_watchdog_never_breaks_token_issue(monkeypatch):
     while cp_main._dispatch_watchdog_inflight and __import__("time").monotonic() < deadline:
         __import__("time").sleep(0.02)
     assert call["id"] not in cp_main._dispatch_watchdog_inflight
+
+
+# ---- P1.b 补派免疫（spec 2026-09-29 v2，spec §4 P1.b）----
+# 根因（2026-09-29 三例 803e44ad/8c25aa8a/9f2ff7a3）：job 正常结束 → 其
+# dispatch 变「全终态空壳」→ dispatch_is_zombie 清扫删除 → 存在性判据变
+# False → 看门狗判「丢派发」→ 补派 job2 接手客户已放弃的房间空转到回收器。
+# 语义修正：每通通话至多一个 agent 生命周期——看门狗只救「从未入房」的
+# 冷启动窗（ever_dispatched 无标记），不复活已结束的（有标记）。
+
+
+def test_attempt_suppresses_revive_after_agent_lifecycle_ended(env_guard, monkeypatch):
+    """job 入房过再退出（dispatch 全终态被清）+ 真人仍在房 → 不补派。
+
+    2026-09-29 三例 job2 复活空房的回归钉：期待新结局码 suppress_ever。"""
+    from control_plane.dispatch_utils import mark_dispatch_alive
+
+    mark_dispatch_alive("call-revive")
+    lkapi, disp = _fake_lkapi(
+        lambda: {"call-revive": ["operator-acc-001-call-revive"]},
+        dispatches=[_stale_dispatch()],  # 全终态空壳：会被清扫，存在性失效
+    )
+    monkeypatch.setattr(cp_main, "_repo", _live_repo)
+    outcome = asyncio.run(cp_main._dispatch_watchdog_attempt(lkapi, "call-revive", 1))
+    assert outcome == "suppress_ever"
+    assert disp.created == []
+
+
+def test_attempt_marks_ever_dispatched_when_agent_seen(env_guard, monkeypatch):
+    """agent 真实入房（recovered 判定）时烧 ever_dispatched 标记。"""
+    from control_plane import dispatch_utils as du
+
+    du._EVER_DISPATCHED.discard("call-mark")
+    lkapi, disp = _fake_lkapi(lambda: {"call-mark": ["operator-a", "agent-AJ_1"]})
+    monkeypatch.setattr(cp_main, "_repo", _live_repo)
+    outcome = asyncio.run(cp_main._dispatch_watchdog_attempt(lkapi, "call-mark", 0))
+    assert outcome == "recovered"
+    assert du.has_dispatched_before("call-mark") is True
+    du._EVER_DISPATCHED.discard("call-mark")  # 测试隔离清尾
+
+
+def test_ever_dispatched_is_per_room_and_cold_start_still_creates(env_guard, monkeypatch):
+    """账本 per-room；无标记（冷启动从未入房）照常补派（既有语义保留）。"""
+    from control_plane import dispatch_utils as du
+
+    du._EVER_DISPATCHED.discard("call-a")
+    du._EVER_DISPATCHED.discard("call-b")
+    du.mark_dispatch_alive("call-a")
+    assert du.has_dispatched_before("call-a") is True
+    assert du.has_dispatched_before("call-b") is False
+    du._EVER_DISPATCHED.discard("call-a")
+    # 冷启动（call-b 无标记）+ 真人在场 → created（与既有核心测试同型）
+    lkapi, disp = _fake_lkapi(lambda: {"call-b": ["operator-b"]})
+    monkeypatch.setattr(cp_main, "_repo", _live_repo)
+    outcome = asyncio.run(cp_main._dispatch_watchdog_attempt(lkapi, "call-b", 0))
+    assert outcome == "created"
+    du._EVER_DISPATCHED.discard("call-b")
