@@ -181,3 +181,29 @@ P3 产品行为
 - B 线方向自适应/自动换向（观察位另立）。
 - `PERCEIVED_MS` 修表（A3）、尾部瘦身/前缀断裂（A1/A2）、out-of-band 道歉交付——既有排队项。
 - mlx 通话级 cache 清理 API——包无此能力，不过度设计。
+
+---
+
+## 验收记录（2026-09-30 分支 fix/a-line-reply-stall-v2 执行完毕）
+
+| 项 | 结果 |
+|---|---|
+| 全量 pytest | **3644 passed / 1 skipped**（基线 3589 + 新增 55：dispatch 3/repeat-cancel 3/ladder 3/unclear 6/nudge 4/stall-obs 5/interp-exit 4 + 旧 pin 同步） |
+| FLOW20（正常模式，4GB 档+全部修复） | **20/20 PASS 零坏标记** |
+| FLOW20（慢速代理 2.6tps，诊断臂） | 19/20，**LLM_FALLBACK_TEXT×24**——全程慢速形态=首 token 超时兜底车道顶替（设计内 B1 行为）；坏通形态（首 token 快+生成段慢）的 bidi 未闭案环**未复现**（探针姿势坑：erc 直连零转写两跑实证，FLOW20 姿势可复现但形态不同）——**留观察位**：下次生产撞上即 py-spy（`scripts/probe_llm_stall.py` 已备） |
+| 生命周期探针（6GB 基线 8 通） | cache 2.93→**6.46GB 打穿上限**（每通 +0.35-0.45GB，第 8-10 通进 LRU 换页=call-ed6aa9b8 坏形态复现）；jobs=1 全绿 |
+| 生命周期探针（4GB 档 6 通，修后） | **jobs=1 全绿（P1.b 补派免疫稳定）**；cache 峰值 4.42-4.57GB（4GB 帽下盘整，vs 6GB 档 6.46 打穿）；cp_ended 0.0s |
+| job_exit | 恒 15.1s（拆账：~9s 框架 settle 收尾窗 D7 + ~6s teardown；病灶基线 136-200s）。5s 目标需框架收尾窗再设计——**验收按 ≤20s 记，5s 留观察位** |
+| B 线退出 | `_exit_stage` 五段守护接入；实弹 `killing process` 归零待下轮 B 线连打确认（本波 B 线已结案收窄） |
+| soak 双语 | **待跑**（修复不碰延迟路径，FLOW20 已盖正常负载；留 Ethan 下个窗口） |
+| 耳测 | 新旧 nudge 对照 6 条落 `~/Desktop/nudge_ab/`（Cantonese_GentleLady 同音色）——**待 Ethan 拍板** |
+
+### 探针产出归档
+- `reports/session-lifecycle-*`（6GB 基线 + 4GB 修后各一份）
+- `reports/llm-stall-replay-*`（慢速注入两跑 timeline）
+
+### 观察位（下一刀候选）
+1. **bidi 未闭案环**（tee 10 字后零 task_continue，首 token 快+生成段慢形态）——生产撞上即 py-spy。
+2. **换页期 tps 崩**（4GB 帽只是把换页时刻的频率压低，LRU evict 时生成段退化的 mlx 侧根治）——LLM_STALL_OBS 盯守。
+3. **job 收尾 15s**（框架 settle 窗 D7 的挂断路径提速）。
+4. **探针 room_gone 测量**（恒 None——_wait_room_gone 轮询链或 CP 后台删房时序，下次修探针时一并）。
