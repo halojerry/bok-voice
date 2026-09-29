@@ -2069,6 +2069,7 @@ _FORWARD_ENV = (
     "BOK_STALL_LADDER",
     "BOK_UNCLEAR_ADVANCE",
     "BOK_UNCLEAR_ADVANCE_N",
+    "BOK_LLM_STALL_OBS_TPS",
     "BOK_ROUTE_JUDGE",
     "BOK_TOOLS_FOLLOWUP",
     # —— 双派发守卫（2026-09-28 call-0105a539 实证：同房双 job 并跑整通=双开场

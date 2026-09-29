@@ -2258,16 +2258,31 @@ def _format_llm_metrics(m) -> str:
     cached=prompt_cached_tokens/prompt_tokens：mlx prompt KV-cache 命中可视——
     稳态轮 cached 接近 prompt=前缀命中；前缀断裂轮 cached=0（KV-cache 铁律
     回归排查就睇呢个数）。字段名与 1.7.1 metrics/base.py LLMMetrics 一致。
+
+    P2.c（2026-09-29 v2 spec §5）：平均 tps 低于 BOK_LLM_STALL_OBS_TPS（默认
+    5，"0"=关）且 gen≥5（超短流噪声过滤）→ 附 LLM_STALL_OBS 观测行。纯打点
+    不处置——治本（P1 生命周期四件）后凭此行判断慢速是否绝迹，不绝迹再议。
     """
     prompt = int(getattr(m, "prompt_tokens", 0) or 0)
     cached = int(getattr(m, "prompt_cached_tokens", 0) or 0)
     ttft = float(getattr(m, "ttft", 0.0) or 0.0)
     tps = float(getattr(m, "tokens_per_second", 0.0) or 0.0)
-    return (
+    gen = int(getattr(m, "completion_tokens", 0) or 0)
+    line = (
         f"LLM_TTFT_MS {ttft * 1000:.0f} (official) "
         f"cached={cached}/{prompt} prompt={prompt} "
-        f"gen={getattr(m, 'completion_tokens', 0)} tps={tps:.1f}"
+        f"gen={gen} tps={tps:.1f}"
     )
+    try:
+        obs_tps = float(os.environ.get("BOK_LLM_STALL_OBS_TPS", "5") or 5)
+    except ValueError:
+        obs_tps = 5.0
+    if obs_tps > 0 and gen >= 5 and 0.0 < tps < obs_tps:
+        line += (
+            f"\nLLM_STALL_OBS tps={tps:.1f} gen={gen} "
+            f"window_s={gen / tps:.1f} (慢速流——P1 治本后仍现则查 gpu/cache)"
+        )
+    return line
 
 
 # ---- QA 快路每通汇总打点(2026-09-10 task-9) ----
