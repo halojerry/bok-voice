@@ -4775,7 +4775,20 @@ async def entrypoint(ctx):
             # → CP 入库;结算/报表由「伪造 llm_tokens=轮次数」变真数据。失败唔阻结算。
             try:
                 report = ctx.make_session_report(session)
-                await cp.post_session_report(call_id, report.to_dict())
+                _rd = report.to_dict()
+                # D3 状态快照（2026-09-30 多轮上下文计划 Phase 4）：FlowController
+                # 终态随官方报告上行——CP 结算时与 turns 账本对账（τ-bench DB-diff/
+                # BFCL state-check 同款「终态可校验」面：step vs 最大 template_step、
+                # WA 捕获 vs 账本标记），脱节响亮报审计。失败唔阻结算。
+                try:
+                    _rd["flow_state"] = (
+                        f"step:{(int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0}"
+                        f",closing:{int(bool(flow_ctrl.closing))}"
+                        f",wa:{int(bool(_wa_captured.get('on')))}"
+                    )
+                except Exception:  # noqa: BLE001 - 快照缺失=对账面自动跳过
+                    pass
+                await cp.post_session_report(call_id, _rd)
                 print(f"[agent] session report posted (call {room_name})", flush=True)
             except Exception as exc:  # pragma: no cover - 报表失败唔阻结算
                 print(f"[agent] session report failed: {exc!r} (call {room_name})", flush=True)

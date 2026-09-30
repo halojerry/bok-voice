@@ -4356,6 +4356,51 @@ async def _write_distill_knowledge(call: dict, result: dict) -> dict | None:
         return None
 
 
+def _assert_flow_state_vs_turns(report_raw: str, turns: list) -> str | None:
+    """D3 状态对账纯函数（2026-09-30 多轮上下文计划 Phase 4）。
+
+    session_report.flow_state（agent 终态快照，"step:N,closing:0|1,wa:0|1"）
+    vs turns 账本——τ-bench DB-diff / BFCL state-check 同款「终态可校验」思想：
+    状态层与历史层脱节（步进了但轮次没跟上 / WA 捕获无账本痕迹）在这里现形。
+    返回 mismatch 描述串；无快照/无轮次/坏 JSON 一律 None（对账面自动跳过，
+    绝不误报旧通话）。步号语义：快照与 turns.template_step 同为 1 基
+    （current+1），挂断恰逢步进后未发轮属合法（step ≤ max+1 放行）。"""
+    try:
+        rep = json.loads(report_raw) if str(report_raw or "").strip() else {}
+    except Exception:  # noqa: BLE001 - 坏 report 唔对账
+        return None
+    fs = str(rep.get("flow_state") or "").strip() if isinstance(rep, dict) else ""
+    if not fs or not turns:
+        return None
+    kv: dict[str, str] = {}
+    for part in fs.split(","):
+        if ":" in part:
+            k, v = part.split(":", 1)
+            kv[k.strip()] = v.strip()
+    try:
+        step = int(kv.get("step", "0"))
+    except ValueError:
+        return None
+    max_tpl = 0
+    wa_seen = False
+    for t in turns:
+        prov = str((t or {}).get("provider") or "")
+        if "wa" in prov:
+            wa_seen = True
+        if str((t or {}).get("role") or "") != "assistant":
+            continue
+        try:
+            max_tpl = max(max_tpl, int((t or {}).get("template_step") or 0))
+        except (TypeError, ValueError):
+            continue
+    issues: list[str] = []
+    if step > max_tpl + 1:
+        issues.append(f"step:{step}>turns_max:{max_tpl}")
+    if kv.get("wa") == "1" and not wa_seen:
+        issues.append("wa:1-no-ledger-trace")
+    return ";".join(issues) or None
+
+
 def _backfill_turns_from_report(call_id: str, report_raw: str) -> int:
     """SessionReport.chat_history → turns 回填（幂等：仅当该通话零轮次时调用）。
 
@@ -4503,6 +4548,23 @@ async def _settle_core(call_id: str, *, idle_cap_s: float | None = None) -> dict
                 if backfilled:
                     turns = _repo().get_turns(call_id)
             from bok_voice_core.types import CallSession
+
+            # D3 状态对账（2026-09-30 多轮上下文计划 Phase 4）：session_report.
+            # flow_state 终态快照 vs turns 账本——脱节（步进了轮次没跟上/WA 捕获
+            # 无账本痕迹）响亮报审计+控制台，**绝不破结算**（W5 SMS 尾钩同款纪律）。
+            try:
+                _mismatch = _assert_flow_state_vs_turns(call.get("session_report") or "", turns)
+                if _mismatch:
+                    print(f"SETTLE_STATE_MISMATCH call={call_id} {_mismatch}", flush=True)
+                    _audit(
+                        "settle.state_mismatch",
+                        subject_type="call",
+                        subject_id=call_id,
+                        call_id=call_id,
+                        detail={"mismatch": _mismatch},
+                    )
+            except Exception as exc:  # pragma: no cover - 对账失败唔阻结算
+                print(f"[settle] state assertion failed: {exc!r}", flush=True)
 
             session = CallSession(
                 id=call["id"],
