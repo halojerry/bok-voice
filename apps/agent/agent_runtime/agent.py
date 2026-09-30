@@ -138,6 +138,10 @@ _EXPR_PARTIAL_RE = re.compile(r"<expr\b[^>]*$")
 # emotion tag (open/closed/self-closing, including a dangling open fragment)
 # so the persisted transcript is clean customer-facing copy.
 _EXPR_SYNC_RE = re.compile(r"<expr\b[^>]*?/>|<expr\b[^>]*>|</expr>|<expr\b[^>]*$")
+# expr 标记被流截断后的无前缀尾巴（2026-09-30 真机 call-fde11c52 interrupted
+# 补账落了 ="expression" label="calm"/> 残片）——锚定 expr 固定属性名
+# （type∈expression/role），防误吃正文里普通 ="xxx" 形态。
+_EXPR_TAIL_RE = re.compile(r'=?"(?:expression|role)"\s+label="[a-z_]+"\s*/>')
 
 # 4B/Qwen3 偶发把对话模板收尾 token <|im_end|> 当文字输出——转录同 TTS 都唔可以留低。
 # _EXPR_TAG_RE 只剥「有 > 收尾」嘅 tag,<|im_end|> 冇 >,会漏,所以专门补剥。
@@ -189,7 +193,10 @@ def _strip_stage_dirs(text: str) -> str:
 
 def _clean_transcript(text: str) -> str:
     text = _strip_eos_tokens(text)
-    return _EXPR_SYNC_RE.sub("", text).strip()
+    # 顺序:先完整标记(SYNC 整体吃)再残片尾巴(TAIL)——反序会把完整标记吃成
+    # 中段残片+裸 <expr 前缀,两步连吃误伤正文。
+    text = _EXPR_SYNC_RE.sub("", text)
+    return _EXPR_TAIL_RE.sub("", text).strip()
 
 
 _EMOTION_TAG_PILOT_RE = re.compile(r"^\s*\[(关切|抱歉|耐心|开心|严肃)\]")
@@ -6240,8 +6247,32 @@ async def entrypoint(ctx):
                     speed=getattr(tts_provider, "resolved_speed", lambda: 1.0)(),
                 )
 
+            # C 组(2026-09-30 真机):QA 罐头同条目冷却账本——最后播出的条目与时刻。
+            _qa_canned_last: dict = {"id": "", "ts": 0.0}
+
             async def _qa_canned_say(entry: dict, pcm, *, provider: str) -> bool:
                 answer = str(entry.get("answer_text") or "").strip()
+                # C 组(2026-09-30 真机,call-4392c7bb 17:08:18/32):同条目冷却窗——
+                # 客户换问法(「怎么赔偿」→「钱怎么给我」)命中同条目重播同一罐头
+                # =答非所问。冷却窗内拒播(return False 放行 LLM 结合上下文自由答);
+                # 窗外照播(真重问语义)。
+                try:
+                    _qcd_s = float(os.environ.get("BOK_QA_CANNED_COOLDOWN_S", "20") or 20)
+                except ValueError:
+                    _qcd_s = 20.0
+                _qcd_id = str(entry.get("id") or "")
+                if (
+                    _qcd_s > 0
+                    and _qcd_id
+                    and _qcd_id == _qa_canned_last["id"]
+                    and (time.monotonic() - _qa_canned_last["ts"]) < _qcd_s
+                ):
+                    print(
+                        f"QA_CANNED_COOLDOWN entry={_qcd_id} elapsed={time.monotonic() - _qa_canned_last['ts']:.0f}s "
+                        f"-> 放行 LLM（同条目冷却窗内不重播）",
+                        flush=True,
+                    )
+                    return False
                 try:
                     await session.interrupt()  # ① 作废停着的抢跑快照(幻影账本条目下轮 rebase 自愈)
                 except Exception:  # noqa: BLE001
@@ -6274,6 +6305,10 @@ async def entrypoint(ctx):
                 await session.say(
                     answer, audio=frames_aiter(pcm_to_frames(pcm, _tts_cache.sample_rate))
                 )
+                # C 组:成功播出记账(冷却窗起点)。
+                if _qcd_id:
+                    _qa_canned_last["id"] = _qcd_id
+                    _qa_canned_last["ts"] = time.monotonic()
                 return True
 
             # ---- 话术图引擎(spec 2026-09-18;插在 say 直念步之后、QA 快路之前,
