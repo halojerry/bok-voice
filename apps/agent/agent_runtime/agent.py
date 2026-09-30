@@ -3132,6 +3132,9 @@ async def entrypoint(ctx):
     # WA 号码碎片累积:客户逐位/逐段报号时暂存半截句(见 on_user_turn_completed
     # 内 _WA_ACCUM 注释)。text=暂存拼接,ts=最后一段时刻,task=超时 flush 任务。
     _wa_accum: dict = {"text": "", "ts": 0.0, "task": None}
+    # A 组(2026-09-30 真机,call-4392c7bb):最后一条已落库的 wa-stash 文本——
+    # flush 落 merged 前比对,相同(单段无增量)跳过,防「一句话两行一模一样」双计。
+    _wa_stash_last: dict = {"text": ""}
     # 捕获渠道账本:flush 时原句已不在作用域,检测处(channel_from_text)记落嚟随
     # 上报透传,名册 channel 数据源。缺省 whatsapp(对象 contact_channel 缺省同款)。
     _wa_channel: dict = {"v": "whatsapp"}
@@ -3175,14 +3178,17 @@ async def entrypoint(ctx):
                 return
             # C3a:合并轮落库(provider=wa-merged)——stash 轮(provider=wa-stash)
             # 已各段在案,这里是拼完的整句,分析侧按 provider 对账。
+            # A 组(2026-09-30 真机,call-4392c7bb):单段无增量(merged==最后
+            # stash)跳过——「一句话两行一模一样」双计的根修;多段拼接照落。
             try:
                 _fm_ms = int((time.monotonic() - _t0) * 1000)
-                await cp.add_turn(
-                    call_id, "user", stashed, language=language_state.lang,
-                    line="a", speaker="customer", provider="wa-merged",
-                    template_step=(int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0,
-                    started_ms=_fm_ms, ended_ms=_fm_ms,
-                )
+                if _wa_stash_last["text"] != stashed:
+                    await cp.add_turn(
+                        call_id, "user", stashed, language=language_state.lang,
+                        line="a", speaker="customer", provider="wa-merged",
+                        template_step=(int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0,
+                        started_ms=_fm_ms, ended_ms=_fm_ms,
+                    )
             except Exception:  # noqa: BLE001 - 落库失败唔阻 flush
                 pass
             _g, _r = flow_ctrl.current_goal_ref()
@@ -5626,6 +5632,7 @@ async def entrypoint(ctx):
                             )
                         except Exception:  # noqa: BLE001 - 落库失败唔阻累积
                             pass
+                        _wa_stash_last["text"] = user_text  # A 组:flush 比对源
                         print(
                             f"[whatsapp] accumulate chars={len(user_text)} total_digits={_n} (call {room_name})",
                             flush=True,
