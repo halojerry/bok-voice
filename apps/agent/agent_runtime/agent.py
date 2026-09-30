@@ -1000,6 +1000,25 @@ def _starve_ack_line(lang: str) -> str:
     return "在的，您讲，我马上答复您。"
 
 
+def _reap_generation_idle(stream) -> bool:
+    """D1 收尸孤儿门控(2026-09-30 终修):仅当包装流链**最内层**的生成任务
+    已结束(或拿不到任务引用)才允许收尸。
+
+    包装链形状:reply(_PartialCaptureStream) → guard(_RepeatSelfGuardStream)
+    → 原生 LLMStream(其 ``_task``=真生成任务)。外层各自的 ``_task`` 只是
+    泵任务,活着是常态;判据只看最内层:生成已完=真孤儿(消费者已走、流悬死,
+    收尸安全且必要);生成在途=在途回复,框架 speech_handle 的 interrupt 5s
+    定时器自会按序取消,抢先 aclose=抽地毯(call-3b776663 实弹形态)。"""
+    cur = stream
+    for _ in range(6):
+        nxt = getattr(cur, "_inner", None)
+        if nxt is None:
+            break
+        cur = nxt
+    task = getattr(cur, "_task", None)
+    return task is None or task.done()
+
+
 def _llm_fallback_line(lang: str) -> str:
     """LLM 主回复重试耗尽后的兜底直念文本(2026-09-17;2026-09-28 去系统口癖)。
 
@@ -3353,22 +3372,68 @@ async def entrypoint(ctx):
             await session.interrupt(force=True)  # 清僵死 speech(若有),释放队列
         except Exception:  # noqa: BLE001 - 无在播内容时 interrupt 抛错=无妨
             pass
-        # D1 病理现场快照(2026-09-30 Phase 0):零音频强断极罕见(25 天 24 例),
-        # 打一行在途任务名单(协程名,无栈)——下一例直接定位「零 push」卡点
-        # (调度器/文本转发/收流哪层悬死),配合 py-spy 手动深挖(print-only)。
+        # D1 病理现场快照(2026-09-30 Phase 0→终修升级):零音频强断极罕见
+        # (25 天 24 例),一次打全三块证据,下一例直接定位「零 push」卡点——
+        # ①任务名单(协程名);②每任务 await 链栈(cr_await 逐帧 walk,帧=
+        # 文件:行:函数名,深 8)——判「调度器 parked 在哪/speech 任务悬在哪」;
+        # ③调度器判别子(官方 tests 深读定案):speech_q 深度、_current_speech
+        # 的 done/interrupted/scheduled/generation 四态、_paused_speech、
+        # _preemptive_generation=PARKED(抢跑生成 schedule_speech=False 悬停=
+        # 零 push 独有形态)。print-only,失败唔阻 ack。
         try:
+            _tasks = [t for t in asyncio.all_tasks() if not t.done()]
             _stuck = sorted(
-                {
-                    getattr(t.get_coro(), "__qualname__", "") or repr(t.get_coro())[:60]
-                    for t in asyncio.all_tasks()
-                    if not t.done()
-                }
+                getattr(t.get_coro(), "__qualname__", "") or repr(t.get_coro())[:60]
+                for t in _tasks
             )
             print(
                 f"[watchdog] dead-turn snapshot tasks={len(_stuck)} "
                 f"live={';'.join(_stuck[:14])} | py-spy: py-spy dump --pid {os.getpid()} (call {room_name})",
                 flush=True,
             )
+            _lines: list[str] = []
+            for t in _tasks[:48]:
+                _frames: list[str] = []
+                _coro = t.get_coro()
+                for _ in range(8):
+                    if _coro is None:
+                        break
+                    _frame = getattr(_coro, "cr_frame", None)
+                    if _frame is not None:
+                        _code = _frame.f_code
+                        _fname = (_code.co_filename or "?").rsplit("/", 1)[-1]
+                        _frames.append(f"{_fname}:{_frame.f_lineno}:{_code.co_name}")
+                    _coro = getattr(_coro, "cr_await", None)
+                _name = getattr(t.get_coro(), "__qualname__", "") or repr(t.get_coro())[:40]
+                _lines.append(f"  {_name} <- {' <- '.join(reversed(_frames))}")
+            if _lines:
+                print("[watchdog] dead-turn stacks:\n" + "\n".join(_lines), flush=True)
+            _sched_bits: list[str] = []
+            try:
+                _acts = getattr(session, "_activities", None) or {}
+                _vals = _acts.values() if isinstance(_acts, dict) else _acts
+                for _act in _vals:
+                    _q = getattr(_act, "_speech_q", None)
+                    if _q is not None:
+                        _sched_bits.append(f"q={len(_q)}")
+                    _cs = getattr(_act, "_current_speech", None)
+                    if _cs is not None:
+                        _sched = getattr(_cs, "_scheduled_fut", None)
+                        _gens = getattr(_cs, "_generations", None) or []
+                        _sched_bits.append(
+                            f"cur={hex(id(_cs))[-6:]} done={int(_cs.done())} "
+                            f"int={int(_cs.interrupted)} "
+                            f"sched={int(_sched.done()) if _sched is not None else -1} "
+                            f"gen={int(_gens[-1].done()) if _gens else -1}"
+                        )
+                    if getattr(_act, "_preemptive_generation", None) is not None:
+                        _sched_bits.append("preemptive=PARKED")
+                    if getattr(_act, "_paused_speech", None) is not None:
+                        _sched_bits.append("paused_speech=1")
+            except Exception as exc:  # noqa: BLE001
+                _sched_bits.append(f"state_err={exc!r}")
+            if _sched_bits:
+                print(f"[watchdog] dead-turn sched {' '.join(_sched_bits)} (call {room_name})", flush=True)
         except Exception:  # noqa: BLE001 - 快照失败唔阻 ack
             pass
         _ack = _llm_fallback_line(language_state.lang)
@@ -7406,6 +7471,12 @@ async def entrypoint(ctx):
                 # 流引用:guard=缓冲任务树根 / reply=最外层(框架消费链),cancel_and_
                 # wait 打穿,CancelledError 分支自然触发。partial 非空=有卡文本证据
                 # (兼防误杀恰开跑的下一流)。尽力而为,失败唔阻补账。BOK_INTERRUPT_REAP=0 关。
+                # 【孤儿门控(2026-09-30 终修)】call-3b776663 实弹:收尸槽是单槽,
+                # 撞上「收尸时下一流已入槽」的竞态=把在途生成连根 aclose(随后两条
+                # LLM 流+零 push 形态)。现仅当该包装流**最内层生成任务已结束**
+                # (真孤儿:生成完毕、消费者已走)才收;活任务=在途生成,框架
+                # speech_handle 的 interrupt 5s 定时器自会按序取消(channel 关闭
+                # 顺序正确),抢先收=抽地毯。跳过时打观测行留证据。
                 if (
                     partial
                     and os.environ.get("BOK_INTERRUPT_REAP", "1") == "1"
@@ -7413,6 +7484,12 @@ async def entrypoint(ctx):
                     for _reap_layer in ("_last_guard_stream", "_last_reply_stream"):
                         _reap_stream = getattr(llm_provider, _reap_layer, None)
                         if _reap_stream is None:
+                            continue
+                        if not _reap_generation_idle(_reap_stream):
+                            print(
+                                f"[agent] reap skipped layer={_reap_layer} (generation in flight) (call {room_name})",
+                                flush=True,
+                            )
                             continue
                         try:
                             await _reap_stream.aclose()

@@ -1489,6 +1489,23 @@ def _repeat_cross_turn_sim() -> float:
     return v if v > 0 else 0.85
 
 
+def _repeat_head_max_hold() -> int:
+    """D1 终修(2026-09-30):repeat-head 冻结的有界持有上限,字。
+
+    病理(call-3b776663/25 天 24 例):冻结命中的首段在「无句界长首句」下可
+    无限期扣住——官方链路 ``_produce_segments`` 只在**非空 chunk**才起 TTS
+    段(agent_activity.py:3576-3587),空文本=零 push_text+零 TTS 任务+框架
+    干净完稿,死寂直到 watchdog 6-8s 强断。本层有界化:冻结攒到该字数即强制
+    经同一 ``_first_chunk_cut`` 放行(数字/拉丁 run 铁闸复用,切点安全面不
+    变);换头复读主体仍由「片段+句」拼合纵深在下一句界剥除。宁可 22 字早放
+    不零句死。默认 22 字;0=无界旧行为(逐字节回退)。"""
+    try:
+        v = int(os.environ.get("BOK_REPEAT_HEAD_MAX_HOLD", "22") or 22)
+    except ValueError:  # pragma: no cover - 配错回默认
+        return 22
+    return v if v >= 0 else 22
+
+
 class _RepeatSelfGuardStream(llm.LLMStream):
     """LLM 流出口逐句剥复读:缓冲到句边界,复读句吞掉、新内容照发。
 
@@ -1524,6 +1541,8 @@ class _RepeatSelfGuardStream(llm.LLMStream):
         self._cross_suppressed = 0
         # 首 chunk 早发(2026-09-28):本回复首段是否已放行(句界或早切任一)。
         self._first_sent = False
+        # D1 有界持有(2026-09-30):强制放行观测只打一次,防日志风暴。
+        self._head_force_released = False
         # 已早放的片段(换头复读防线):下一句界判定时前缀拼合比对,判复读
         # 只剥余段(片段已出声不可回收,但复读主体不得再播)。
         self._released_head = ""
@@ -1627,6 +1646,24 @@ class _RepeatSelfGuardStream(llm.LLMStream):
                 self._released_head = head
                 out.append(head)
                 self._emitted.append(head)
+            elif cut is not None:
+                # D1 有界持有(2026-09-30):repeat-head 冻结攒到 BOK_REPEAT_HEAD
+                # _MAX_HOLD(默认 22 字)强制放行——无句界长首句在此前可无限期
+                # 扣住=零句死(见 _repeat_head_max_hold 档案)。放行走同一切点
+                # 函数(数字/拉丁 run 不劈),复读主体仍由下一句界拼合纵深剥。
+                hold = _repeat_head_max_hold()
+                if 0 < hold <= len(self._buf) and not self._head_force_released:
+                    self._head_force_released = True
+                    head = self._buf[:cut]
+                    self._buf = self._buf[cut:]
+                    self._first_sent = True
+                    self._released_head = head
+                    out.append(head)
+                    self._emitted.append(head)
+                    print(
+                        f"REPEAT_GUARD_HEAD_FORCE_RELEASE chars={len(head)} hold={hold}",
+                        flush=True,
+                    )
         return "".join(out)
 
     def _flush_at_end(self) -> str:
@@ -1684,8 +1721,15 @@ class _RepeatSelfGuardStream(llm.LLMStream):
         except asyncio.CancelledError:
             # P2.a（2026-09-29 v2 §5）：cancel 不再令缓冲静默蒸发——打点留痕，
             # agent 侧 interrupted 补账点读 pending_buffer 拼入 turns。
+            # first_sent 判别子(2026-09-30 D1):0=整条回复一字未出(冻结/空产)
+            # vs 1=已出过声被拦腰掐——两种病理的下一步排查面不同。
             if self._buf:
-                print(f"REPEAT_GUARD_CANCEL_DROP chars={len(self._buf)}", flush=True)
+                print(
+                    f"REPEAT_GUARD_CANCEL_DROP chars={len(self._buf)} first_sent={int(self._first_sent)}",
+                    flush=True,
+                )
+            elif not self._first_sent:
+                print("REPEAT_GUARD_CANCEL_EMPTY first_sent=0", flush=True)
             raise
 
 

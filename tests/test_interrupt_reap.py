@@ -125,6 +125,93 @@ def test_reap_wiring_source_pins():
     assert "py-spy dump --pid" in AGENT_SRC
 
 
+# ---- 孤儿门控（2026-09-30 终修）----
+
+
+class _Layer:
+    """包装层占位：_task=本层泵任务（活着是常态），_inner=下一层。"""
+
+    def __init__(self, task=None, inner=None):
+        self._task = task
+        self._inner = inner
+
+
+def test_reap_gate_true_when_innermost_generation_done():
+    """最内层生成任务已结束=真孤儿 → 允许收尸（外层泵活着不影响判据）。"""
+    from agent_runtime.agent import _reap_generation_idle
+
+    async def _main() -> None:
+        done_gen = asyncio.create_task(asyncio.sleep(0))
+        alive_pump = asyncio.create_task(asyncio.sleep(50))
+        await asyncio.sleep(0.05)
+        assert done_gen.done()
+        raw = _Layer(task=done_gen)
+        guard = _Layer(task=alive_pump, inner=raw)
+        reply = _Layer(task=alive_pump, inner=guard)
+        assert _reap_generation_idle(reply) is True
+        assert _reap_generation_idle(guard) is True
+        alive_pump.cancel()
+
+    asyncio.run(_main())
+
+
+def test_reap_gate_false_when_generation_in_flight():
+    """最内层生成任务在途 → 跳过收尸（单槽竞态=抽地毯，call-3b776663 形态）。"""
+    from agent_runtime.agent import _reap_generation_idle
+
+    async def _main() -> None:
+        alive_gen = asyncio.create_task(asyncio.sleep(50))
+        alive_pump = asyncio.create_task(asyncio.sleep(50))
+        await asyncio.sleep(0.05)
+        raw = _Layer(task=alive_gen)
+        guard = _Layer(task=alive_pump, inner=raw)
+        assert _reap_generation_idle(guard) is False
+        alive_gen.cancel()
+        alive_pump.cancel()
+
+    asyncio.run(_main())
+
+
+def test_reap_gate_true_when_task_ref_unreachable():
+    """拿不到任务引用（形状变化/裸对象）→ 保守放行收尸（尽力而为面）。"""
+    from agent_runtime.agent import _reap_generation_idle
+
+    assert _reap_generation_idle(_Layer()) is True
+    assert _reap_generation_idle(object()) is True
+
+
+def test_reap_gate_on_real_wrapper_chain():
+    """真包装链（guard → 原生 LLMStream）：inner._task 在途 → False。"""
+
+    async def _main() -> None:
+        inner = _StreamInner(["我哋係顺丰有個包裹單號七八九零"])
+        stream = inner.chat(chat_ctx=llm.ChatContext())
+        guard = _RepeatSelfGuardStream(inner, stream, "无关旧回复")
+        await asyncio.sleep(0.1)
+        from agent_runtime.agent import _reap_generation_idle
+
+        assert guard._inner is stream
+        assert _reap_generation_idle(guard) is False, "挂起的 inner 流=生成在途"
+        await asyncio.wait_for(guard.aclose(), timeout=5.0)
+        stream._hold.set()  # 放行 inner 收尾
+        await asyncio.sleep(0.1)
+        assert _reap_generation_idle(guard) is True, "inner 任务结束后=孤儿"
+
+    asyncio.run(_main())
+
+
+def test_reap_gate_and_snapshot_source_pins():
+    """终修接线源级 pin：门控调用 + 跳过观测行 + 全栈快照 + 调度判别子。"""
+    assert "_reap_generation_idle" in AGENT_SRC
+    assert "if not _reap_generation_idle(_reap_stream):" in AGENT_SRC
+    assert "reap skipped layer=" in AGENT_SRC
+    assert "[watchdog] dead-turn stacks:" in AGENT_SRC
+    assert "[watchdog] dead-turn sched " in AGENT_SRC
+    assert "preemptive=PARKED" in AGENT_SRC
+    assert "paused_speech=1" in AGENT_SRC
+    assert "REPEAT_GUARD_HEAD_FORCE_RELEASE" in PLUGINS_SRC
+
+
 def test_forward_env_registered():
     """BOK_INTERRUPT_REAP 已立法（prod 封闭 env 面可达）。"""
     assert '"BOK_INTERRUPT_REAP"' in BOK_SRC
