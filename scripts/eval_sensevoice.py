@@ -36,6 +36,7 @@ from probe_stimulus import narrowband_pcm, stimulus_pcm  # noqa: E402
 ASR_URL = os.environ.get("ASR_URL", "http://127.0.0.1:8787")
 TTS_URL = os.environ.get("TTS_URL", "http://127.0.0.1:8788")
 DEFAULT_MODEL_DIR = "/tmp/sensevoice/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
+QW3_ONNX_DIR = "/tmp/sensevoice/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25"
 
 # 生产姿态域词 context(A 线热词四源里的模板/行业词代表)。
 HOTWORD_CONTEXT = "新龙 集运 速遞 拼多多 淘寶 京東 WhatsApp 微信 賠償 銅鑼灣 聽唔清 講多次"
@@ -148,6 +149,24 @@ def sensevoice_recognizer(model_dir: str, language: str):
     )
 
 
+def qwen3_onnx_recognizer(model_dir: str = QW3_ONNX_DIR, *, hotwords: str = ""):
+    """Qwen3-ASR-0.6B int8 ONNX 纯 CPU(sherpa-onnx from_qwen3_asr)——同一模型
+    只换运行时,质量差=int8 量化差;支持官方 hotwords 通道(与 transformers 版
+    的 context 对位)。"""
+    import sherpa_onnx
+
+    d = Path(model_dir)
+    return sherpa_onnx.OfflineRecognizer.from_qwen3_asr(
+        conv_frontend=str(d / "conv_frontend.onnx"),
+        encoder=str(d / "encoder.int8.onnx"),
+        decoder=str(d / "decoder.int8.onnx"),
+        tokenizer=str(d / "tokenizer"),
+        num_threads=4,
+        provider="cpu",
+        hotwords=hotwords,
+    )
+
+
 def sv_transcribe(rec, pcm: bytes) -> tuple[str, float]:
     import numpy as np
 
@@ -165,11 +184,18 @@ def main() -> int:
     ap.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
     ap.add_argument("--language", default="auto", help="SenseVoice language hint: auto|yue|zh")
     ap.add_argument("--skip-qwen3", action="store_true")
+    ap.add_argument("--skip-sv", action="store_true", help="只跑 qw3cpu 臂")
+    ap.add_argument("--qw3-onnx-dir", default=QW3_ONNX_DIR)
     args = ap.parse_args()
 
-    print(f"[sv] loading {args.model_dir} lang={args.language} ...", flush=True)
-    rec = sensevoice_recognizer(args.model_dir, args.language)
-    print("[sv] loaded", flush=True)
+    sv_rec = None
+    if not args.skip_sv:
+        print(f"[sv] loading {args.model_dir} lang={args.language} ...", flush=True)
+        sv_rec = sensevoice_recognizer(args.model_dir, args.language)
+        print("[sv] loaded", flush=True)
+    print("[qw3cpu] loading Qwen3-ASR int8 ONNX (cpu) ...", flush=True)
+    qw3_rec = qwen3_onnx_recognizer(args.qw3_onnx_dir, hotwords=HOTWORD_CONTEXT)
+    print("[qw3cpu] loaded", flush=True)
 
     rows = []
     for kind, lines in (("canto", CANTO_LINES), ("digits", DIGIT_LINES)):
@@ -179,46 +205,58 @@ def main() -> int:
                 print(f"[synth-fail] {text}", flush=True)
                 continue
             for band, wav in (("clean", pcm), ("narrow", narrowband_pcm(pcm))):
-                sv_text, sv_ms = sv_transcribe(rec, wav)
+                sv_text, sv_ms = ("", 0)
+                if sv_rec is not None:
+                    sv_text, sv_ms = sv_transcribe(sv_rec, wav)
+                q3_text, q3_ms = sv_transcribe(qw3_rec, wav)  # 同款流式 API
                 qw_text = "" if args.skip_qwen3 else qwen3_transcribe(wav)
                 row = {
                     "kind": kind, "band": band, "ref": text,
                     "sv": sv_text, "sv_ms": round(sv_ms * 1000),
+                    "q3": q3_text, "q3_ms": round(q3_ms * 1000),
                     "qwen": qw_text,
                 }
                 if kind == "canto":
-                    row["sv_cer"] = round(cer(sv_text, text), 4)
+                    row["sv_cer"] = round(cer(sv_text, text), 4) if sv_rec is not None else None
+                    row["q3_cer"] = round(cer(q3_text, text), 4)
                     row["qw_cer"] = round(cer(qw_text, text), 4) if qw_text else None
                 else:
                     rd = ref_digits_of(text)
                     row["ref_digits"] = rd
-                    row["sv_digits"] = _digit_seq(sv_text)
+                    row["sv_digits"] = _digit_seq(sv_text) if sv_rec is not None else ""
+                    row["q3_digits"] = _digit_seq(q3_text)
                     row["qw_digits"] = _digit_seq(qw_text) if qw_text else ""
                 rows.append(row)
                 tag = f"{kind}/{band}"
                 if kind == "canto":
-                    print(f"[{tag}] ref={text} | sv_cer={row['sv_cer']} sv={sv_text} | "
-                          f"qw_cer={row['qw_cer']} qw={qw_text}", flush=True)
+                    print(f"[{tag}] ref={text} | sv_cer={row['sv_cer']} | q3cpu_cer={row['q3_cer']} "
+                          f"({q3_ms*1000:.0f}ms) {q3_text} | qw_cer={row['qw_cer']}", flush=True)
                 else:
-                    print(f"[{tag}] ref_digits={row['ref_digits']} | sv={row['sv_digits']} "
-                          f"({sv_text}) | qw={row['qw_digits']} ({qw_text})", flush=True)
+                    print(f"[{tag}] ref_digits={rd} | sv={row['sv_digits']} | "
+                          f"q3cpu={row['q3_digits']} ({q3_ms*1000:.0f}ms) | qw={row['qw_digits']}", flush=True)
 
     def _summary(kind: str, band: str) -> dict:
         sel = [r for r in rows if r["kind"] == kind and r["band"] == band]
         if kind == "canto":
-            sv = [r["sv_cer"] for r in sel]
-            qw = [r["qw_cer"] for r in sel if r["qw_cer"] is not None]
-            sv_ms = [r["sv_ms"] for r in sel]
-            return {"n": len(sel), "sv_cer_mean": round(sum(sv) / len(sv), 4) if sv else None,
-                    "qw_cer_mean": round(sum(qw) / len(qw), 4) if qw else None,
-                    "sv_ms_avg": round(sum(sv_ms) / len(sv_ms)) if sv_ms else None}
+            out: dict = {"n": len(sel)}
+            for eng, key in (("sv", "sv_cer"), ("q3", "q3_cer"), ("qw", "qw_cer")):
+                vals = [r[key] for r in sel if r[key] is not None]
+                if vals:
+                    out[f"{eng}_cer_mean"] = round(sum(vals) / len(vals), 4)
+            ms = [r["q3_ms"] for r in sel]
+            out["q3_ms_avg"] = round(sum(ms) / len(ms)) if ms else None
+            return out
         n = len(sel)
-        sv_ok = sum(1 for r in sel if r["sv_digits"] == r["ref_digits"])
-        qw_ok = sum(1 for r in sel if r["qw_digits"] == r["ref_digits"])
-        return {"n": n, "sv_exact": f"{sv_ok}/{n}", "qw_exact": f"{qw_ok}/{n}"}
+        return {
+            "n": n,
+            "sv_exact": f"{sum(1 for r in sel if r['sv_digits'] == r['ref_digits'])}/{n}",
+            "q3_exact": f"{sum(1 for r in sel if r['q3_digits'] == r['ref_digits'])}/{n}",
+            "qw_exact": f"{sum(1 for r in sel if r['qw_digits'] == r['ref_digits'])}/{n}",
+        }
 
     report = {
         "model_dir": args.model_dir, "language": args.language,
+        "qw3_onnx_dir": args.qw3_onnx_dir,
         "summary": {f"{k}-{b}": _summary(k, b) for k in ("canto", "digits") for b in ("clean", "narrow")},
         "rows": rows,
     }
