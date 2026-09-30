@@ -230,7 +230,9 @@ def test_repository_default_settings_carry_new_keys():
 
 
 def test_history_turns_default_raised_to_8(monkeypatch):
-    # LLM_HISTORY_TURNS 缺省 4→8：30 对 > 2×8 → 一次剪回 8 对（滞回内纯追加命中缓存）。
+    # LLM_HISTORY_TURNS 缺省 4→8（P3）；5b（2026-09-30 soak A/B）8→6——TTFT
+    # p50 1297→1107/max 2940→1295、commit_to_audio 中位 ~2070→~1430：30 对 >
+    # 2×6 → 一次剪回 6 对（滞回内纯追加命中缓存）。
     monkeypatch.delenv("LLM_HISTORY_TURNS", raising=False)
     from livekit.agents import llm as lk_llm
 
@@ -256,4 +258,4 @@ def test_history_turns_default_raised_to_8(monkeypatch):
     roles = [m.role for m in captured["items"]]
     assert roles[0] == "system"
     dialog = [r for r in roles[1:] if r in ("user", "assistant")]
-    assert dialog == ["user", "assistant"] * 8
+    assert dialog == ["user", "assistant"] * 6

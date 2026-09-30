@@ -42,6 +42,8 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     "scripts/acceptance_0913_scenarios.py": re.compile(r"Chinese,Yue"),
     "scripts/mm_voice.py": re.compile(r"Chinese,Yue"),
     "apps/agent/agent_runtime/agent.py": re.compile(r"Chinese,Yue"),
+    # 5a(2026-09-30) AB 首 chunk 三臂样本脚本入库——同 MM language_boost 外部字面量。
+    "scripts/ab_tts_first_chunk.py": re.compile(r"Chinese,Yue"),
     "tests/test_interpret_tts_provider.py": re.compile(r"Chinese,Yue"),
     "tests/test_fixed_language_call.py": re.compile(r"Chinese,Yue"),
     "scripts/test_volcano_v3.py": None,

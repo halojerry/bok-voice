@@ -1710,7 +1710,9 @@ class ContextState:
         # （原 6，见 render_context_tail）。总长先裁，行数上限再兜底。
         if max_summary_chars is None:
             try:
-                max_summary_chars = int(os.environ.get("BOK_MEMORY_CHARS", "250") or 250)
+                # 5b(2026-09-30 soak A/B 定档):250→180——同 HISTORY=6 臂,判据同上;
+                # 摘要+facts+8→6 对窗补上下文,env 一键回 250。
+                max_summary_chars = int(os.environ.get("BOK_MEMORY_CHARS", "180") or 180)
             except ValueError:
                 max_summary_chars = 250
         self._max_summary_chars = max_summary_chars
@@ -2316,7 +2318,10 @@ class ContextAwareLLM(llm.LLM):
                 else:
                     items.insert(0, llm.ChatMessage(role="system", content=[_join_system(prefix, "", "")]))
                 # 截断历史(摊销式,见 _truncate_chat_items):先剪后对齐,账本自尾映射。
-                max_turns = int(os.environ.get("LLM_HISTORY_TURNS", "8"))
+                # 5b(2026-09-30 soak A/B 定档):8→6——TTFT p50 1297→1107/max
+                # 2940→1295、commit_to_audio 中位 ~2070→~1430(增量尖峰 1252→628);
+                # 摊销截断+账本自尾对齐机制原样,前缀安全。env 一键回 8。
+                max_turns = int(os.environ.get("LLM_HISTORY_TURNS", "6"))
                 items = _truncate_chat_items(items, max_turns=max_turns)
                 # 尾部重放+新消息追加(见上)。users=当前请求里的 user 消息下标(时序序)。
                 users = [i for i, it in enumerate(items) if getattr(it, "role", "") == "user"]
