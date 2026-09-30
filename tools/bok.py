@@ -1710,6 +1710,11 @@ def _cmd_up_services() -> int:
     if not is_mac():
         # Windows/transformers 后端才需要 device 指定;mac mlx 分支不读该 env(MLX 默认走 Metal)。
         asr_env["QWEN3_ASR_DEVICE"] = "cuda" if _cuda() else "cpu"
+    # ASR 并发竞态让位(2026-10-01 双通实弹):重活在别人在飞时降档——sidecar
+    # 进程不吃全 env 面,prod 封闭面显式透传;缺省=sidecar 内默认开。
+    _cy = os.environ.get("QWEN3_ASR_CONTENTION_YIELD")
+    if _cy is not None:
+        asr_env["QWEN3_ASR_CONTENTION_YIELD"] = _cy
     if not healthy(8787):
         _start_proc(
             [str(asr_py), "-m", "uvicorn", "app:app", "--app-dir", "services/qwen3-asr-sidecar",

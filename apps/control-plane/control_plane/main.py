@@ -2267,17 +2267,19 @@ def create_call(req: CreateCallRequest, request: Request) -> dict:
 
 
 def _max_active_calls_env() -> int:
-    """并发准入上限（BOK_MAX_ACTIVE_CALLS，缺省 3；<=0=不限，非法回落 3）。
+    """并发准入上限（BOK_MAX_ACTIVE_CALLS，缺省 2；<=0=不限，非法回落 2）。
 
-    单机单并发 LLM 队列：2 通已退化、6 通 Metal OOM 拖垮整栈
-    （reports/mac-concurrency-2026-09-24/BATTERY-FINAL.md）。**不落 settings schema**
+    实测诚实上限（2026-10-01 双通实弹复核）：6 通 Metal OOM 拖垮整栈
+    （reports/mac-concurrency-2026-09-24/BATTERY-FINAL.md）；2 通=可服务但
+    降级（共享 MPS,prewarm 让位+ASR 竞态让位已拔掉最尖的刺）；3 通从未
+    验证过全质量——缺省收紧到 2,要 3 显式设。**不落 settings schema**
     ——建单时读 os.environ，经 tools/bok.py `_control_plane_env` 下发（同
     BOK_DISPATCH_RETRY 判例），零迁移。
     """
     try:
-        n = int(str(os.environ.get("BOK_MAX_ACTIVE_CALLS", "") or "3").strip())
+        n = int(str(os.environ.get("BOK_MAX_ACTIVE_CALLS", "") or "2").strip())
     except (TypeError, ValueError):
-        return 3
+        return 2
     return n  # <=0 由调用方视为不限
 
 
