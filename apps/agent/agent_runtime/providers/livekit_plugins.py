@@ -3659,13 +3659,15 @@ def _tts_first_clause_config() -> tuple[bool, int]:
 # 若等整句标点才发(长首句),该句音频要等服务端攒够整句才开始合成 → 客户干等。
 # 首个 continue 按字数提前切:≥N 字且句内无标点时先发一段(切点不落数字/拉丁
 # run 内),后续 continue 照旧按句界对齐——只移动首块切点,韵律影响最小。
-# ``BOK_TTS_FIRST_CHUNK_CHARS`` 缺省 "10";"0"=整段关闭(旧行为逐字节同)。
+# ``BOK_TTS_FIRST_CHUNK_CHARS`` 缺省 "6"（2026-09-30 Ethan 耳测定档：AB 三臂
+# 0/6/10 全 MiniMax bidi 实声对照，2_long_early6 最好、10 也不错——取 6 最快）;
+# "0"=整段关闭(旧行为逐字节同)。
 def _tts_first_chunk_chars() -> int:
-    """首个 bidi continue 提前切门槛(字数)。0=关闭;坏值回默认 10。"""
+    """首个 bidi continue 提前切门槛(字数)。0=关闭;坏值回默认 6。"""
     try:
-        v = int(os.environ.get("BOK_TTS_FIRST_CHUNK_CHARS", "10"))
+        v = int(os.environ.get("BOK_TTS_FIRST_CHUNK_CHARS", "6"))
     except Exception:  # pragma: no cover - 配错回默认
-        return 10
+        return 6
     return v if v > 0 else 0
 
 
