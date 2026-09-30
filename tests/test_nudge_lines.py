@@ -37,11 +37,13 @@ def test_no_hello_prefix_and_rotation_wraps():
 
 def test_zh_and_en_variants():
     assert _nudge_line("陈先生", "zh", 0) == "陈先生，您还在吗？"
-    assert _nudge_line("陈先生", "zh", 1) == "陈先生，能听到我说话吗？"
+    assert _nudge_line("陈先生", "zh", 1) == "陈先生，您能听到我说话吗？"
     assert _nudge_line("陈先生", "zh", 2) == "陈先生，不好意思，您还在听吗？"
     assert _nudge_line("Mr. Lin", "en", 0) == "Mr. Lin, are you still there?"
     assert _nudge_line("Mr. Lin", "en", 1) == "Mr. Lin, can you hear me?"
-    assert _nudge_line("Mr. Lin", "en", 2) == "Mr. Lin, sorry — can you still hear me?"
+    assert _nudge_line("Mr. Lin", "en", 2) == "Mr. Lin, sorry, are you still with me?"
+    assert _nudge_line("", "en", 0) == "Are you still there?"  # 无名=句首大写成句
+    
 
 
 def test_default_interval_12s_pinned():

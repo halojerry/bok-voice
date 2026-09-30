@@ -479,6 +479,11 @@ def _nudge_line(name: str, lang: str, count: int) -> str:
     """
     who = f"{name}，" if name else ""
     who_en = f"{name}, " if name else ""
+
+    def _en(prefix: str, s: str) -> str:
+        # 有称呼=句中小写跟随；无名=句首大写成句（en 字幕显示用）。
+        return f"{prefix}{s}" if prefix else s.capitalize()
+
     if lang == "cantonese":
         variants = (
             f"{who}你仲喺度嗎？",
@@ -487,14 +492,14 @@ def _nudge_line(name: str, lang: str, count: int) -> str:
         )
     elif lang == "en":
         variants = (
-            f"{who_en}are you still there?",
-            f"{who_en}can you hear me?",
-            f"{who_en}sorry — can you still hear me?",
+            _en(who_en, "are you still there?"),
+            _en(who_en, "can you hear me?"),
+            _en(who_en, "sorry, are you still with me?"),
         )
     else:
         variants = (
             f"{who}您还在吗？",
-            f"{who}能听到我说话吗？",
+            f"{who}您能听到我说话吗？",
             f"{who}不好意思，您还在听吗？",
         )
     return variants[min(max(count, 0), len(variants) - 1) % len(variants)]
