@@ -75,8 +75,12 @@ class _SessionFake:
     def __init__(self):
         self.said: list[dict] = []
 
-    async def say(self, text, audio=None):
-        self.said.append({"text": text, "audio": audio is not None})
+    async def say(self, text, audio=None, add_to_chat_ctx=True):
+        # D6(2026-09-30):_say_script 穿透 add_to_chat_ctx——默认 True(进史),
+        # 纯 ack 车道显式 False(不进史,官方 fast-filler 对齐)。
+        self.said.append(
+            {"text": text, "audio": audio is not None, "ctx": add_to_chat_ctx}
+        )
 
 
 def test_say_script_lookup_carries_speed():

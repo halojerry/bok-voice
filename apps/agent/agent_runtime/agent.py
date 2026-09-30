@@ -520,7 +520,9 @@ GENERIC_GREETINGS = {
 }
 
 
-async def _say_script(session, tts_provider, cache, text: str, emotion: str = ""):
+async def _say_script(
+    session, tts_provider, cache, text: str, emotion: str = "", add_to_chat_ctx: bool = True
+):
     """脚本直念统一入口(2026-09-08 本地 TTS 音频缓存):命中本地 PCM ~0ms 直出,
     零云调用;未命中照常流式合成——tee 边播边收集,完整播完自动落盘,同文本
     第二通起即命中(带 {name}/单号变量话术靠这条自动沉淀)。
@@ -531,9 +533,13 @@ async def _say_script(session, tts_provider, cache, text: str, emotion: str = ""
     缓存未装配(BOK_TTS_CACHE=0/本地 TTS)或任何 I/O 异常 → 退回普通
     session.say(text),行为与无缓存完全一致。播放已出声后的异常不重念
     (避免重复开口);一帧未出才回退文本路径。
-    """
+
+    add_to_chat_ctx(D6,2026-09-30 纯 ack 族不进史):False=官方 fast-filler
+    对齐(文档 on_user_turn_completed 节),ack/垫话类行不落 LLM 历史——史窗
+    密度留给真回复、4B 唔再看到自己的 ack 刷屏。item_added 不再发生,调用方
+    负责手工补 turns 行(_ledger_ack_line)+history=False 注册。"""
     if cache is None or tts_provider is None:
-        return await session.say(text)
+        return await session.say(text, add_to_chat_ctx=add_to_chat_ctx)
     try:
         voice = getattr(tts_provider, "resolved_voice", lambda: "")()
         model = getattr(tts_provider, "resolved_model", lambda: "")()
@@ -546,7 +552,9 @@ async def _say_script(session, tts_provider, cache, text: str, emotion: str = ""
     if pcm is not None:
         print(f"TTS_CACHE hit=1 chars={len(text)}", flush=True)
         return await session.say(
-            text, audio=frames_aiter(pcm_to_frames(pcm, tts_provider.sample_rate))
+            text,
+            audio=frames_aiter(pcm_to_frames(pcm, tts_provider.sample_rate)),
+            add_to_chat_ctx=add_to_chat_ctx,
         )
     print(f"TTS_CACHE hit=0 chars={len(text)}", flush=True)
     played = {"frames": 0}
@@ -560,11 +568,11 @@ async def _say_script(session, tts_provider, cache, text: str, emotion: str = ""
                 yield ev.frame
 
     try:
-        return await session.say(text, audio=_synth_and_play())
+        return await session.say(text, audio=_synth_and_play(), add_to_chat_ctx=add_to_chat_ctx)
     except Exception as exc:  # noqa: BLE001 - 合成管线异常回退
         print(f"TTS_CACHE say_audio_failed fallback={'text' if not played['frames'] else 'none'} err={exc!r}", flush=True)
         if not played["frames"]:
-            return await session.say(text)
+            return await session.say(text, add_to_chat_ctx=add_to_chat_ctx)
         return None
 
 
@@ -3366,9 +3374,14 @@ async def entrypoint(ctx):
         _ack = _llm_fallback_line(language_state.lang)
         try:
             # 看门狗自身开火路径:cancel_watchdog=False(否则取消自己=自噬)。
-            _register_reply_lane(lane="watchdog-ack", text=_ack, cancel_watchdog=False)
-            # 落库交 _say_script 的 item_added（票据透传,勿手写补账防双记）
-            await _say_script(session, tts_provider, _tts_cache, _ack)
+            # D6:纯 ack 不进史(history=False+add_to_chat_ctx=False),手工补账。
+            _register_reply_lane(
+                lane="watchdog-ack", text=_ack, cancel_watchdog=False, history=False
+            )
+            await _say_script(
+                session, tts_provider, _tts_cache, _ack, add_to_chat_ctx=False
+            )
+            await _ledger_ack_line("watchdog-ack", _ack)
         except Exception as exc:  # noqa: BLE001 - 兜底失败唔阻后续轮
             print(f"[watchdog] ack say failed: {exc!r}", flush=True)
 
@@ -4315,12 +4328,17 @@ async def entrypoint(ctx):
         relieve: bool | None = None,
         step: int | None = None,
         notify: bool = False,
+        history: bool = True,
     ) -> None:
         """登记一条回复车道(EX-2 chokepoint):账本票据+重复锚+拆看门狗+stall 抵销。
 
         - notify=True:本车道无自有 assistant 出声(打铃/跳步,回复仍由 LLM 产出)
           → 不建票据,只把 provider 顺延到下一个 assistant item;turn 开头会清,
           被中断无 item 时不再泄漏进下一轮(call-35adfa90 根治)。
+        - history=False(D6,2026-09-30 纯 ack 族不进史):本车道出声但
+          add_to_chat_ctx=False(官方 fast-filler 对齐)——item 永不发生,不推
+          票据(5s 新鲜度窗的误领面消灭);可闻应答照实置位 A3 旗
+          (item_added 不再代劳);调用方负责手工补 turns 行(_ledger_ack_line)。
         - 其余车道:推 TurnTicket(FIFO),_on_conversation_item 按 item 文本配对消费。
         - anchor:非 ack 文本预写【你上一句】锚(中央 sink _on_item_for_context 仍
           会以 lecture_guard 版精修,先到先得消灭 last-writer-wins 竞态)。
@@ -4330,15 +4348,20 @@ async def entrypoint(ctx):
         if notify:
             _pending_lane["lane"] = str(lane or "")
             return
-        _reply_tickets.append(
-            TurnTicket(
-                lane=str(lane or ""),
-                gen=str(gen or "script"),
-                text=str(text or ""),
-                step=step,
-                t=time.monotonic(),
+        if not history:
+            # D6:ack 出声即接住上一用户轮(A3 语义),item_added 不再发生;
+            # 不推票据(5s 新鲜度窗的误领面消灭)。
+            _assistant_out["on"] = True
+        else:
+            _reply_tickets.append(
+                TurnTicket(
+                    lane=str(lane or ""),
+                    gen=str(gen or "script"),
+                    text=str(text or ""),
+                    step=step,
+                    t=time.monotonic(),
+                )
             )
-        )
         if anchor and text and not _is_ack_anchor_text(text):
             try:
                 context_state.set_last_reply(_clean_transcript(strip_voice_style(text)))
@@ -4359,6 +4382,21 @@ async def entrypoint(ctx):
             context_state.record_reply(_clean_transcript(strip_voice_style(text)), gen)
         except Exception:  # pragma: no cover - 账本失败唔阻车道
             pass
+
+    async def _ledger_ack_line(lane: str, text: str) -> None:
+        """D6(2026-09-30 纯 ack 族不进史):history=False 车道的手工 turns 行——
+        item_added 不再发生,账本不缺项(B4 手工补账同款语义);失败唔阻出声。"""
+        try:
+            _ms = int((time.monotonic() - _t0) * 1000)
+            await cp.add_turn(
+                call_id, "assistant", text,
+                provider=lane, gen="script",
+                language=language_state.lang, line="a", speaker="agent_ai",
+                template_step=(int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0,
+                started_ms=_ms, ended_ms=_ms,
+            )
+        except Exception as exc:  # noqa: BLE001 - 补账失败唔阻出声
+            print(f"[agent] ack lane ledger failed lane={lane}: {exc!r} (call {room_name})", flush=True)
 
     def _consume_reply_ticket(item_text: str) -> TurnTicket | None:
         """assistant item 到达时取票据:文本归一配对优先,新鲜票据退回首张(最旧)。
@@ -5053,8 +5091,11 @@ async def entrypoint(ctx):
                     _fu_ack = _followup_ack_line(language_state.lang)
                     # EX-2 chokepoint:此前此背景车道四件全缺(无票据/provider/拆
                     # 看门狗/预锚)——ack 行还会污染锚+错误抵销 stall;统一登记根治。
-                    _register_reply_lane(lane="followup-ack", text=_fu_ack)
-                    await _say_script(session, tts_provider, _tts_cache, _fu_ack)
+                    _register_reply_lane(lane="followup-ack", text=_fu_ack, history=False)
+                    await _say_script(
+                        session, tts_provider, _tts_cache, _fu_ack, add_to_chat_ctx=False
+                    )
+                    await _ledger_ack_line("followup-ack", _fu_ack)
                     print(
                         f"[followup] created via judge route id={_fu.get('id', '')} (call {room_name})",
                         flush=True,
@@ -5531,7 +5572,7 @@ async def entrypoint(ctx):
                     _sm_rounds = int(_storm.get("rounds", 0))
                     if _verdict == "ack":
                         _ack = _starve_ack_line(language_state.lang)
-                        _register_reply_lane(lane="starve-ack", text=_ack)  # EX-2 chokepoint
+                        _register_reply_lane(lane="starve-ack", text=_ack, history=False)  # EX-2+D6
                         try:
                             _sm_ms = int((_now - _t0) * 1000)
                             await cp.add_turn(
@@ -5546,7 +5587,10 @@ async def entrypoint(ctx):
                             f"[storm] listening ack r{_sm_rounds} (call {room_name})",
                             flush=True,
                         )
-                        await _say_script(session, tts_provider, _tts_cache, _ack)
+                        await _say_script(
+                            session, tts_provider, _tts_cache, _ack, add_to_chat_ctx=False
+                        )
+                        await _ledger_ack_line("starve-ack", _ack)
                     else:
                         try:
                             _sm_ms = int((_now - _t0) * 1000)
@@ -5586,7 +5630,7 @@ async def entrypoint(ctx):
             ):
                 _starve["n"] = 0
                 _ack = _starve_ack_line(language_state.lang)
-                _register_reply_lane(lane="starve-ack", text=_ack)  # EX-2 chokepoint
+                _register_reply_lane(lane="starve-ack", text=_ack, history=False)  # EX-2+D6
                 try:
                     _sa_ms = int((time.monotonic() - _t0) * 1000)
                     await cp.add_turn(
@@ -5601,7 +5645,10 @@ async def entrypoint(ctx):
                     f"[agent] starve-ack (连续 2 轮零回复,短承接让路) (call {room_name})",
                     flush=True,
                 )
-                await _say_script(session, tts_provider, _tts_cache, _ack)
+                await _say_script(
+                    session, tts_provider, _tts_cache, _ack, add_to_chat_ctx=False
+                )
+                await _ledger_ack_line("starve-ack", _ack)
                 raise StopResponse()
             # M-23 首位回声剥离(2026-09-23 修复波#4):AI 复述/上轮已确认号码被
             # 麦克风回听混进客户报号首位 → 错号捕获+确认(task-4 M2)。剥前缀再
@@ -6192,7 +6239,10 @@ async def entrypoint(ctx):
                 except Exception:  # noqa: BLE001
                     pass
                 print(f"[flow] defer-ack (call {room_name})", flush=True)
-                await _say_script(session, tts_provider, _tts_cache, _ack)
+                await _say_script(
+                    session, tts_provider, _tts_cache, _ack, add_to_chat_ctx=False
+                )
+                await _ledger_ack_line("defer-ack", _ack)
                 raise StopResponse()
             # ---- 直念步快路(2026-09-12 开场白三段拆分):当前步标 say=1 且未念
             # → 本轮以脚本直念作答(ref 首行,_say_script 缓存线),跳过 LLM。
@@ -7027,9 +7077,13 @@ async def entrypoint(ctx):
                         )
                         _register_reply_lane(
                             lane="garbled-reask", gen="script",
-                            text=_reask_line, anchor=False,
+                            text=_reask_line, anchor=False, history=False,
                         )
-                        await _say_script(session, tts_provider, _tts_cache, _reask_line)
+                        await _say_script(
+                            session, tts_provider, _tts_cache, _reask_line,
+                            add_to_chat_ctx=False,
+                        )
+                        await _ledger_ack_line("garbled-reask", _reask_line)
                         raise StopResponse()
                 except StopResponse:
                     raise
@@ -7187,8 +7241,15 @@ async def entrypoint(ctx):
             try:
                 _nudge = _nudge_line(name, lang, _nudge_state["count"] - 1)
                 # EX-2 chokepoint:心跳补位直念 + 拆看门狗(此前缺,cancel 补上)
-                _register_reply_lane(lane="nudge", text=_nudge)
-                await _say_script(session, tts_provider, _tts_cache, _nudge)
+                # D6:nudge 属纯 ack 族——history=False 不进史;anchor=False
+                # (行带可选名字前缀,精确 ack 集匹配不成立,直关预锚)。
+                _register_reply_lane(
+                    lane="nudge", text=_nudge, history=False, anchor=False
+                )
+                await _say_script(
+                    session, tts_provider, _tts_cache, _nudge, add_to_chat_ctx=False
+                )
+                await _ledger_ack_line("nudge", _nudge)
             except Exception as exc:  # pragma: no cover - 心跳失敗唔阻通話
                 print(f"[heartbeat] nudge failed: {exc!r} (call {room_name})", flush=True)
 
@@ -7295,10 +7356,12 @@ async def entrypoint(ctx):
                     )
                     try:
                         _storm_line = _storm_ack_line(language_state.lang)
-                        _register_reply_lane(lane="storm-ack", text=_storm_line)  # EX-2
+                        _register_reply_lane(lane="storm-ack", text=_storm_line, history=False)  # EX-2+D6
                         await _say_script(
-                            session, tts_provider, _tts_cache, _storm_line
+                            session, tts_provider, _tts_cache, _storm_line,
+                            add_to_chat_ctx=False,
                         )
+                        await _ledger_ack_line("storm-ack", _storm_line)
                     except Exception as exc:  # noqa: BLE001 - 让路语失败唔阻静听
                         print(f"[storm] ack say failed: {exc!r}", flush=True)
                 # B4:被打断且回复已有部分文本 → 补记 gen=interrupted 行。
