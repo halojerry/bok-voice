@@ -1238,6 +1238,34 @@ function ConsoleLive(p: LiveProps) {
     if (oth) out.push(scriptMismatchWarning("对方", p.otherLang, oth));
     return out;
   }, [transcriptions, p.myLang, p.otherLang]);
+  // 【B 线缺源显性化(2026-09-30 call-72112fd7)】传译开着、我方在说话,但解释器
+  // 全程没听到我方(fwd 订阅空挂/麦克风未真正发布——现场两者一个样=我方原文
+  // 字幕零条,对着静默猜)。判据保守:传译开 ≥45s 且我方原文字幕一条都没有 →
+  // 页内提示;我方原文一旦出现即自动消隐。有说话才报、静坐不报做不到(无本地
+  // VAD),文案按「如果你在说话」措辞。
+  const meSrcCount = useMemo(
+    () =>
+      transcriptions.filter((t) => String(t.participantInfo?.identity ?? "").startsWith("me-"))
+        .length,
+    [transcriptions],
+  );
+  const interpOnAtRef = useRef<number | null>(null);
+  useEffect(() => {
+    interpOnAtRef.current = p.interpOn ? Date.now() : null;
+  }, [p.interpOn]);
+  const [srcSilent, setSrcSilent] = useState(false);
+  useEffect(() => {
+    if (!p.interpOn || meSrcCount > 0) {
+      setSrcSilent(false);
+      return;
+    }
+    const t0 = interpOnAtRef.current ?? Date.now();
+    const timer = window.setTimeout(
+      () => setSrcSilent(true),
+      Math.max(1000, 45_000 - (Date.now() - t0)),
+    );
+    return () => window.clearTimeout(timer);
+  }, [p.interpOn, meSrcCount]);
   useEffect(() => {
     const el = listRef.current;
     if (el) el.scrollTop = el.scrollHeight;
@@ -1246,6 +1274,11 @@ function ConsoleLive(p: LiveProps) {
 
   return (
     <div className="flex flex-col gap-4 lg:h-[calc(100vh-7.5rem)]">
+      {srcSilent && (
+        <div className="shrink-0 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-700">
+          <TriangleAlert className="h-3.5 w-3.5" /> 传译已启动 45 秒，但还没有收到你方的任何语音字幕——如果你在说话而无字幕，说明解释器没听到你的麦克风：先停再启传译；仍无字幕请刷新页面重连。
+        </div>
+      )}
       {p.roleFatal.map((m) => (
         <div
           key={m}

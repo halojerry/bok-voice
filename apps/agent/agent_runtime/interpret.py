@@ -290,6 +290,24 @@ async def _mt_collect(stream, timeout_s: float) -> str:
     return "".join(parts).strip()
 
 
+def _src_track_state(participant, audio_kind) -> tuple[str, list[str]]:
+    """listen 身份的音轨订阅态分类(纯函数,遥测看护消费)。
+
+    返回 ("none", [])           —— 对端无任何音轨发布;
+    ("unsubscribed", [sid...]) —— 有音轨但本 worker 未订上(publication.track
+                                  is None;sdk 无手动订阅口,此态=订阅链断);
+    ("ok", [])                  —— 至少一条音轨已订阅在席。
+    participant 为 None(对端未进房)按 none 计。"""
+    pubs = list(participant.track_publications.values()) if participant is not None else []
+    audio = [p for p in pubs if getattr(p, "kind", None) == audio_kind]
+    if not audio:
+        return ("none", [])
+    unsubs = [str(p.sid) for p in audio if getattr(p, "track", None) is None]
+    if unsubs:
+        return ("unsubscribed", unsubs)
+    return ("ok", [])
+
+
 async def _mt_once(llm_provider, ctx, *, timeout_s: float = 15.0, target_lang: str = "") -> str:
     """单句直调翻译 LLM(StatelessMTLLM/通用 LLM 同一入口),超时保护防句堆积。
 
@@ -1298,6 +1316,62 @@ async def entrypoint(ctx) -> None:
     # 保持 entrypoint 存活直到会话关闭(框架在房间断开时终止 job 并跑 shutdown 回调)。
     closed = asyncio.Event()
     session.on("close", lambda _ev: closed.set())
+
+    # 【B 线缺源遥测(2026-09-30 call-72112fd7 定案)】同房三轨齐发(服务器实锤:
+    # fwd TTS + me-/other- 麦于 +16s 双双发布)而 fwd 全程零订阅零 ASR、rev 同
+    # 形正常——订阅空挂在我们的代码面零痕迹,python SDK 亦无手动 subscribe 口
+    # (auto_subscribe 房间级默认开,订阅面在 FFI)。本看护每 BOK_INTERP_SRC_
+    # TELEMETRY_S(默认 10s)扫一次 listen 身份的音轨,分辨两态留观测行:
+    #   SRC_NO_AUDIO_TRACK        —— 对端根本没发麦(未开传译/浏览器发布失败);
+    #   SRC_TRACK_NOT_SUBSCRIBED  —— 音轨已发布但本 worker 订不上(订阅链断,
+    #                                下一例现场直接指认服务器/FFI 哪层断)。
+    # 纯遥测零干预(SDK 无手动订阅口);=0 关。fwd(音频方向)为主要受益面。
+    async def _src_track_watch() -> None:
+        if os.environ.get("BOK_INTERP_SRC_TELEMETRY", "1") != "1":
+            return
+        try:
+            interval = float(os.environ.get("BOK_INTERP_SRC_TELEMETRY_S", "10") or 10)
+        except ValueError:
+            interval = 10.0
+        if interval <= 0:
+            interval = 10.0
+        from livekit import rtc as _rtc  # 局部导入:模块头部无 rtc 面
+
+        no_track_rounds = 0
+        not_sub_rounds = 0
+        while True:
+            try:
+                await asyncio.wait_for(closed.wait(), timeout=interval)
+                return  # 会话收线,收队
+            except asyncio.TimeoutError:
+                pass
+            state, sids = _src_track_state(
+                room.remote_participants.get(listen_identity), _rtc.TrackKind.KIND_AUDIO
+            )
+            if state == "none":
+                not_sub_rounds = 0
+                no_track_rounds += 1
+                if no_track_rounds == 3 or no_track_rounds % 10 == 0:
+                    print(
+                        f"[interp] SRC_NO_AUDIO_TRACK identity={listen_identity} "
+                        f"rounds={no_track_rounds} (对端未发布麦克风/未开传译)",
+                        flush=True,
+                    )
+            elif state == "unsubscribed":
+                no_track_rounds = 0
+                not_sub_rounds += 1
+                if not_sub_rounds <= 3 or not_sub_rounds % 10 == 0:
+                    print(
+                        f"[interp] SRC_TRACK_NOT_SUBSCRIBED identity={listen_identity} "
+                        f"sids={sids} rounds={not_sub_rounds} (音轨已发布但未订上=订阅链断)",
+                        flush=True,
+                    )
+            else:
+                no_track_rounds = 0
+                not_sub_rounds = 0
+
+    # FIRE_FORGET_EXEMPT: 纯遥测看护,closed 置位(会话关闭)自退,job teardown 兜底
+    asyncio.create_task(_src_track_watch())
     try:
         await closed.wait()
     finally:

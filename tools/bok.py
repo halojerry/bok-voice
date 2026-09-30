@@ -3431,6 +3431,10 @@ def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
         "BOK_INTERP_BACKLOG",
         "BOK_INTERP_MAX_BACKLOG_S",
         "BOK_INTERP_VOICE_TAGS",
+        # B 线缺源遥测 2026-09-30：fwd 订阅空挂零痕迹(call-72112fd7)——看护
+        # 每 N 秒分辨「对端没发麦」vs「发了订不上」打观测行;=0 关。
+        "BOK_INTERP_SRC_TELEMETRY",
+        "BOK_INTERP_SRC_TELEMETRY_S",
         # B 线 MiniMax 硬失败兜底 2026-09-27：主档云端 MiniMax 失败时 FallbackAdapter
         # 备档=本地 Qwen3-TTS 是否装备。=0 显式跳过本地 TTS 时不装备，与 bok.py
         # _local_tts_needed 同键语义；未设=装备，本地 sidecar 未跑时逐请求穿透。
