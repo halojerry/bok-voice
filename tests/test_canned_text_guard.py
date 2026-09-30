@@ -44,6 +44,15 @@ T4_COACH_LINES = [
     "briefly say it follows the Hong Kong courier regulations, starting from "
     "300 dollars; details come at the compensation step.",
     "say we need to verify the orders to confirm, go to the next step (platform).",
+    # ---- 2026-09-27 生产取证扩面:turns 逐字实录被出声的教练指引(56 条族代表) ----
+    "认真听，简单回应一声，然后去下一步问平台。",
+    "先安抚：完全理解您的不满，我们会负责到底…",
+    "逐档讲：金额不足 100 元，申请 300 到 600 元赔偿…",
+    "先答完再道别收线。",
+    "复述确认一次，说专员会加客户收截图，然后推进下一步交代办理要求。",
+    # en 泄漏行:以 "no problem, we'll …" 开场,行首锚罩唔到,靠 "go to the next step"
+    # 短语(anywhere)命中——先前 T4 误标为可念,本轮取证重分类(同句中段指令语=教练文案)。
+    "no problem, we'll help verify the orders, go to the next step (platform).",
 ]
 
 
@@ -58,8 +67,8 @@ def test_t4_coach_lines_all_blocked():
 T4_SPEAKABLE_LINES = [
     # zh 罐头复用行(10 通级):首(person)人称台词,去下一步是话面对客户讲的
     "没关系，我们会帮您核对订单，然后去下一步问平台。",
-    # en 同族
-    "no problem, we'll help verify the orders, go to the next step (platform).",
+    # 「先给您道歉了」类客户-facing 开场——新头锚「先安抚/先答」不得误伤裸「先」。
+    "先给您道歉了，实在唔好意思。",
     # 拒收线台词(test_branch_actions._REF_WRONG_NUMBER)
     "唔好意思打搅咗，我哋再核对下资料，拜拜",
     # 常规分支应答(test_branch_canned/_REF_PLATFORM)
@@ -113,3 +122,37 @@ def test_strip_branch_action_prefix_mirror():
     # 消费后余文仍係教练文案 → 被检测(收线标记+指令体)
     body = strip_branch_action_prefix("【收线】礼貌收线，交代安慰话术")
     assert is_internal_instruction(body)
+
+
+# ---- 2026-09-30 call-3b776663 实弹两漏(分支罐头教练文案出声事故) ----
+
+
+def test_field_leak_43char_compensation_coach_line_blocked():
+    """现场漏放:「简单话按…标准赔、最低 300 蚊起，细节到赔偿方案嗰步讲；
+    答完继续问平台。」——「简单话」教练头 + 「细节到…嗰步讲」/「答完继续」
+    编排语，任一信号命中即拦。"""
+    line = "简单话按香港速递条例标准赔、最低 300 蚊起，细节到赔偿方案嗰步讲；答完继续问平台。"
+    assert is_internal_instruction(line), f"实弹漏放行必须拦: {line!r}"
+    assert coach_hits(line), "命中信号非空"
+    # 繁体同形亦拦
+    assert is_internal_instruction(
+        "簡單話按香港速遞條例標準賠、細節到賠償方案嗰步講；答完繼續問平台。"
+    )
+
+
+def test_field_leak_third_person_reminder_coach_line_blocked():
+    """现场漏放:「提佢睇下手机入面最近嘅购物订单。」——第三人称指在场客户
+    (提佢/提他)=写给坐席的口吻;客户-facing 台词只会说「提你」。"""
+    assert is_internal_instruction("提佢睇下手机入面最近嘅购物订单。")
+    assert is_internal_instruction("提他看一下手机里最近的购物订单。")
+    # 对照:同义客户-facing 说法(提你…)不受牵连;行首裸「提醒」係既有头锚
+    # (提醒客户族)不在本波放宽面,客户-facing 提醒句用「我提醒你」起句。
+    assert not is_internal_instruction("提你睇下手机入面最近嘅购物订单。")
+    assert not is_internal_instruction("我提醒你打开订单看一下入仓状态。")
+
+
+def test_new_coach_tokens_do_not_overblock_legit_lines():
+    """精度回归:新增信号不误伤既有可念台词族(含「…然后去下一步问平台」反例)。"""
+    assert not is_internal_instruction("呢个我帮你查一下，然后去下一步问平台。")
+    assert not is_internal_instruction("好嘅，我简单讲下赔偿方案你听。")
+    assert not is_internal_instruction("细节我哋一步一步嚟，你先唔使急。")
