@@ -129,6 +129,20 @@ async def main() -> None:
         json={"name": "E2E客服", "language": lang, "tone": "礼貌专业"},
         timeout=10,
     ).json()
+    # B1 模板必填闸(2026-09-28 后):live 建单必须绑模板——显式 env 或取账号
+    # 首个模板(probe 语义只要一通真话术通话,不挑模板)。
+    tpl_id = os.environ.get("BARGEIN_TEMPLATE_ID", "").strip()
+    if not tpl_id:
+        tpls = httpx.get(
+            f"{CONTROL_PLANE_URL}/api/templates?account_id=acc-001",
+            headers=_CP_HEADERS,
+            timeout=10,
+        ).json()
+        tpls = tpls if isinstance(tpls, list) else tpls.get("items") or tpls.get("templates") or []
+        if tpls:
+            tpl_id = str(tpls[0].get("id") or "")
+    if not tpl_id:
+        raise SystemExit("B1 模板闸:无可用模板——请设 BARGEIN_TEMPLATE_ID 或先建模板")
     call = httpx.post(
         f"{CONTROL_PLANE_URL}/api/calls",
         headers=_CP_HEADERS,
@@ -136,6 +150,7 @@ async def main() -> None:
             "account_id": "acc-001",
             "object_id": obj["id"],
             "persona_id": persona["id"],
+            "template_id": tpl_id,
             "mode": "live",
             "direction": "webrtc",
             "language": lang,

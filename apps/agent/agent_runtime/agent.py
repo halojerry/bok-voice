@@ -9,6 +9,7 @@ import httpx
 import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Mapping, Optional
 
 from bok_voice_core.flow_graph import (
@@ -465,14 +466,66 @@ def _sticky_reply_language(anchor: str, asr_lang: str, cur_sticky: str, cur_stre
     return anchor, anchor, 0
 
 
-# 【并发让位(2026-09-30 call-9af18da5 定案)】A 线 worker 单进程多 job——第二通
-# 电话冷启动的 prefix prewarm(~6k token 全量 prefill,实测 +6.2s)排进 LLM 队列
-# 代理单槽,把在途通话的交互轮 header 拖到 4-5s、TTFT 5.3-6.8s、tps 崩到 5.8,
-# 连锁 MiniMax bidi FLUSH_TIMEOUT+TTS fallback 切换(call-9af18da5 × call-2ec8eec6
-# 并发窗口实证)。本表让 prewarm 在「另有在途通话」时让位:新通话首轮吃冷
-# prefill(~1.4s,开场白盖住),在途通话保住延迟。BOK_PREFIX_PREWARM_YIELD=0
-# 回旧「照发」档。
+# 【并发让位(2026-09-30 call-9af18da5 定案)】A 线 worker **一 job 一子进程**
+# (PROCESS 执行器,worker.py 默认;相邻两通子进程 pid 实测不同)——进程内
+# set 看不见别的通话(实弹验证:双通并发让位零触发)。注册表走文件标记
+# (run/ pidfile 同款面):entrypoint 建标记、shutdown 删,prewarm 扫描
+# 「除自己外 mtime 新鲜」的标记。第二通电话冷启动的 prefix prewarm(~6k
+# token 全量 prefill,+6.2s 实测)排进 LLM 队列代理单槽,会把在途通话的
+# 交互轮 header 拖到 4-5s、TTFT 5.3-6.8s、tps 崩到 5.8,连锁 MiniMax bidi
+# FLUSH_TIMEOUT(call-9af18da5 × call-2ec8eec6 并发窗口实证)。让位后新通话
+# 首轮吃冷 prefill(~1.4s,开场白盖住)。BOK_PREFIX_PREWARM_YIELD=0 回旧档。
 _ACTIVE_CALLS: set[str] = set()
+
+
+def _active_calls_dir() -> Path:
+    """在途通话标记目录;BOK_ACTIVE_CALLS_DIR 可隔离(测试腿)。"""
+    d = os.environ.get("BOK_ACTIVE_CALLS_DIR", "")
+    base = (
+        Path(d)
+        if d
+        else Path.home() / "Library" / "Application Support" / "BokVoice" / "run" / "active-calls"
+    )
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except Exception:  # noqa: BLE001 - 目录失败退化进程内 set
+        pass
+    return base
+
+
+def _register_active_call(room: str, job_id: str = "") -> None:
+    _ACTIVE_CALLS.add(room)
+    try:
+        (_active_calls_dir() / f"{room}.marker").write_text(job_id or room, encoding="utf-8")
+    except Exception:  # noqa: BLE001 - 文件面失败退化进程内
+        pass
+
+
+def _release_active_call(room: str) -> None:
+    _ACTIVE_CALLS.discard(room)
+    try:
+        (_active_calls_dir() / f"{room}.marker").unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _other_active_calls(self_room: str, *, max_age_s: float = 7200.0) -> list[str]:
+    """跨进程在途名单:目录里除自己外、mtime 新鲜(默认 ≤2h=崩溃残留兜底)。"""
+    out: list[str] = []
+    try:
+        now = time.time()
+        for p in _active_calls_dir().glob("*.marker"):
+            room = p.name[: -len(".marker")]
+            if room == self_room:
+                continue
+            try:
+                if now - p.stat().st_mtime <= max_age_s:
+                    out.append(room)
+            except OSError:
+                continue
+    except Exception:  # noqa: BLE001 - 扫描失败=无并发(保守照发)
+        pass
+    return out
 
 
 def _prewarm_should_yield(active: set, self_room: str) -> str | None:
@@ -2903,12 +2956,12 @@ async def entrypoint(ctx):
 
     async def _release_room_claim() -> None:
         _room_claim.release()
-        _ACTIVE_CALLS.discard(room_name)
+        _release_active_call(room_name)
 
     ctx.add_shutdown_callback(_release_room_claim)
-    # 【并发让位注册(2026-09-30 call-9af18da5 定案)】A 线 worker 单进程多 job,
-    # 本表=本进程在途通话名单(prefix prewarm 让位判据,见 _prewarm_should_yield)。
-    _ACTIVE_CALLS.add(room_name)
+    # 【并发让位注册(2026-09-30 call-9af18da5 定案)】A 线 worker 一 job 一子
+    # 进程——文件标记跨进程互见(run/ pidfile 同款面;进程内 set 兜底)。
+    _register_active_call(room_name, str(getattr(ctx.job, "id", "") or ""))
     # call_id 来自显式分发 metadata(CP /api/token 挂 RoomAgentDispatch 时写入);
     # 房间名与 call_id 全栈同约定,兜底相等。AGENT_CALL_ID env 旁路已废除。
     try:
@@ -4361,9 +4414,13 @@ async def entrypoint(ctx):
             # 并发让位(2026-09-30 call-9af18da5 定案,见 _ACTIVE_CALLS 档案):
             # 另有在途通话时跳过 prewarm——6k token 全量 prefill 排进队列代理
             # 单槽会把它俩的交互轮全部拖到 4-5s header。新通话首轮吃冷 prefill
-            # 由开场白盖住,在途通话保住延迟。
+            # 由开场白盖住,在途通话保住延迟。A 线一 job 一子进程:进程内 set
+            # + 文件标记双面(实弹验证纯 set 零触发,2026-10-01 修正)。
             if os.environ.get("BOK_PREFIX_PREWARM_YIELD", "1") == "1":
                 _busy_other = _prewarm_should_yield(_ACTIVE_CALLS, room_name)
+                if _busy_other is None:
+                    _file_others = _other_active_calls(room_name)
+                    _busy_other = _file_others[0] if _file_others else None
                 if _busy_other is not None:
                     print(
                         f"[agent] llm prefix prewarm yielded (concurrent call {_busy_other}) (call {room_name})",

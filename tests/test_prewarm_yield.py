@@ -35,9 +35,42 @@ def test_should_yield_none_when_alone_or_empty():
 
 def test_wiring_source_pins():
     """注册/回收/门/env 立法四点接线源级 pin。"""
-    assert "_ACTIVE_CALLS.add(room_name)" in AGENT_SRC
-    assert "_ACTIVE_CALLS.discard(room_name)" in AGENT_SRC
+    assert "_register_active_call(room_name" in AGENT_SRC
+    assert "_release_active_call(room_name)" in AGENT_SRC
     assert "_prewarm_should_yield(_ACTIVE_CALLS, room_name)" in AGENT_SRC
+    assert "_other_active_calls(room_name)" in AGENT_SRC
     assert 'os.environ.get("BOK_PREFIX_PREWARM_YIELD", "1") == "1"' in AGENT_SRC
     assert "llm prefix prewarm yielded (concurrent call" in AGENT_SRC
     assert '"BOK_PREFIX_PREWARM_YIELD"' in BOK_SRC
+    assert '"BOK_ACTIVE_CALLS_DIR"' in BOK_SRC
+
+
+def test_other_active_calls_file_registry(tmp_path, monkeypatch):
+    """跨进程标记面:一 job 一子进程(实弹验证纯 set 零触发,2026-10-01 修正)。"""
+    import os
+    import time as _t
+
+    from agent_runtime.agent import (
+        _other_active_calls,
+        _register_active_call,
+        _release_active_call,
+    )
+
+    monkeypatch.setenv("BOK_ACTIVE_CALLS_DIR", str(tmp_path))
+    _register_active_call("call-a", "AJ_1")
+    _register_active_call("call-b", "AJ_2")
+    assert sorted(_other_active_calls("call-a")) == ["call-b"]
+    assert _other_active_calls("call-c") == ["call-a", "call-b"] or sorted(
+        _other_active_calls("call-c")
+    ) == ["call-a", "call-b"]
+    # 回收后消失
+    _release_active_call("call-b")
+    assert _other_active_calls("call-a") == []
+    # 陈旧标记(>max_age)=崩溃残留,忽略
+    _register_active_call("call-stale", "AJ_3")
+    stale = tmp_path / "call-stale.marker"
+    old = _t.time() - 7200.0 - 60
+    os.utime(stale, (old, old))
+    assert _other_active_calls("call-a") == []
+    _release_active_call("call-a")
+    _release_active_call("call-stale")
