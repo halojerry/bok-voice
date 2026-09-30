@@ -7033,22 +7033,6 @@ async def entrypoint(ctx):
                 print(f"[agent] append_user_message failed: {exc!r} (call {room_name})", flush=True)
                 return False
 
-        async def _try_append_assistant_partial(self, text: str) -> bool:
-            """C(2026-09-30 真机 batch-1 ③):被打断回复的半句注入会话历史。
-
-            B4 补账只落 turns DB——分析侧知道、生成侧失忆:被打断的半句不进
-            chat_ctx,客户问「你刚讲咩」时 LLM 历史里那半句不存在(执行端与
-            生成端脱节)。官方姿势(同 _try_append_user_message)注入 assistant
-            半句;插在被掐回复的 user 轮之后=纯追加,上一轮请求仍是严格前缀
-            (KV 契约不破)。"""
-            try:
-                from livekit.agents import llm as _lk_llm
-                msg = _lk_llm.ChatMessage(role="assistant", content=str(text or ""))
-                return await self._try_append_user_message(msg)
-            except Exception as exc:  # noqa: BLE001
-                print(f"[agent] append_assistant_partial failed: {exc!r} (call {room_name})", flush=True)
-                return False
-
         async def on_user_turn_exceeded(self, ev):
             if self.paused:
                 raise StopResponse()
@@ -7310,25 +7294,6 @@ async def entrypoint(ctx):
                         )
                     except Exception as exc:  # noqa: BLE001 - 账本失败唔阻通话
                         print(f"[agent] interrupted ledger failed: {exc!r}", flush=True)
-                # C(2026-09-30 真机 batch-1 ③「被打断之后不结合上下文」根修):
-                # 补账只落 DB=分析侧知道、生成侧失忆。半句三路并进生成端——
-                # ① chat_ctx 官方姿势注入(插在本轮 user 轮后=纯追加,严格前缀
-                # 契约不破);② set_last_reply 重复锚(模型看得见自己被掐前讲了
-                # 什么);③ record_reply 复读账本(gen=llm,跨轮复读防线把半句
-                # 当 LLM 历史比对,防下一轮原句续播)。BOK_INTERRUPT_CTX=0 关。
-                if partial and os.environ.get("BOK_INTERRUPT_CTX", "1") == "1":
-                    _ic = _clean_transcript(strip_voice_style(partial))
-                    if _ic:
-                        try:
-                            context_state.set_last_reply(_ic)
-                            context_state.record_reply(_ic, "llm")
-                        except Exception:  # noqa: BLE001 - 锚/账本失败唔阻注入
-                            pass
-                        if await agent._try_append_assistant_partial(_ic):
-                            print(
-                                f"[agent] interrupted reply -> ctx chars={len(_ic)} (call {room_name})",
-                                flush=True,
-                            )
 
         # 池化(2026-09-17 全量 debug P2-A):打断账本+风暴计数任务强引用;_close
         # 结算前 gather(_report_tasks) 顺带等它落地,补账不再有 GC 丢失窗口。
