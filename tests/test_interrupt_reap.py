@@ -212,6 +212,59 @@ def test_reap_gate_and_snapshot_source_pins():
     assert "REPEAT_GUARD_HEAD_FORCE_RELEASE" in PLUGINS_SRC
 
 
+# ---- 级联关闭（2026-09-30 A 线对账 Critical-1）----
+
+
+def test_aclose_cascades_to_inner_stream():
+    """官方姿势 `async with` 同款:外层 aclose 必须把内层原生流一并收尾。
+
+    病灶:包装链此前只关自己的泵任务,内层 MLX 流继续解码到自然完稿=被掐
+    回复盗占 GPU(call-9af18da5 双句打断后 TTFT 5.3/6.8s 机理)。"""
+
+    async def _main() -> None:
+        inner = _StreamInner(["我哋係顺丰，有个包裹單號尾號七八九零運輸途中唔見咗"])
+        stream = inner.chat(chat_ctx=llm.ChatContext())
+        guard = _RepeatSelfGuardStream(inner, stream, "无关旧回复")
+        await asyncio.sleep(0.1)
+        assert not stream._task.done(), "内层流应仍在途(挂起形状)"
+        await asyncio.wait_for(guard.aclose(), timeout=5.0)
+        assert guard._task.done()
+        assert stream._task.done(), "级联关闭:内层原生流任务必须一并收尾"
+
+    asyncio.run(_main())
+
+
+def test_aclose_cascade_idempotent():
+    """重复 aclose(框架收一次、reap 再收一次)不炸。"""
+
+    async def _main() -> None:
+        inner = _StreamInner(["你好。"])
+        stream = inner.chat(chat_ctx=llm.ChatContext())
+        guard = _RepeatSelfGuardStream(inner, stream, "无关")
+        await asyncio.sleep(0.1)
+        await asyncio.wait_for(guard.aclose(), timeout=5.0)
+        await asyncio.wait_for(guard.aclose(), timeout=5.0)
+        assert stream._task.done()
+
+    asyncio.run(_main())
+
+
+def test_cascade_and_prewarm_wiring_source_pins():
+    """级联 mixin + 双包装器 _prewarm_impl 透传 + 两线 TTS 收尾接线 pin。"""
+    # 三包装流全部挂 mixin
+    assert "class _CascadeCloseStreamMixin:" in PLUGINS_SRC
+    for _cls in ("_StripTailAnchorStream", "_RepeatSelfGuardStream", "_PartialCaptureStream"):
+        assert f"class {_cls}(_CascadeCloseStreamMixin, llm.LLMStream):" in PLUGINS_SRC
+    # 官方每通 llm.prewarm() 只认 _prewarm_impl 覆写——双 LLM 包装器透传
+    assert PLUGINS_SRC.count("async def _prewarm_impl(self) -> None:") >= 4  # mlx/mt/context/expr
+    # A 线/B 线收线 TTS aclose
+    assert "await asyncio.wait_for(tts_provider.aclose(), timeout=3.0)" in AGENT_SRC
+    assert "tts aclose failed" in AGENT_SRC
+    assert "tts aclose failed" in (
+        ROOT / "apps" / "agent" / "agent_runtime" / "interpret.py"
+    ).read_text(encoding="utf-8")
+
+
 def test_forward_env_registered():
     """BOK_INTERRUPT_REAP 已立法（prod 封闭 env 面可达）。"""
     assert '"BOK_INTERRUPT_REAP"' in BOK_SRC

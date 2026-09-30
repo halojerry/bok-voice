@@ -4872,6 +4872,13 @@ async def entrypoint(ctx):
         _reply_done_event.set()
 
         async def _close():
+            # 【TTS 收尾(2026-09-30 A 线对账 Note-9)】bidi 持久 WS 此前无人
+            # aclose——框架不代关模型连接,prod worker 复用进程=连接跨通残留。
+            # 官方姿势:会话收尾由 tts.aclose() 收口(尽力而为,失败唔阻结算)。
+            try:
+                await asyncio.wait_for(tts_provider.aclose(), timeout=3.0)
+            except Exception as exc:  # noqa: BLE001 - 收尾失败唔阻结算
+                print(f"[agent] tts aclose failed: {exc!r} (call {room_name})", flush=True)
             # 官方 SessionReport(自部署可用):真实逐模型 usage + 权威 chat_history
             # → CP 入库;结算/报表由「伪造 llm_tokens=轮次数」变真数据。失败唔阻结算。
             try:

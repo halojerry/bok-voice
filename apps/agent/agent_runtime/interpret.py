@@ -1228,6 +1228,13 @@ async def entrypoint(ctx) -> None:
     # 房间断开 → SessionReport(真实 usage) + settle(总结/知识蒸馏/vault,服务端幂等;失败不阻塞退出)。
     async def _shutdown() -> None:
         _mt_worker.cancel()  # 排空 MT 消费协程(挂队列 get 上,不 cancel 会泄漏到下个 job)
+        # TTS 收尾(2026-09-30 对账):bidi 持久 WS 无人 aclose=worker 复用进程下
+        # 连接跨通残留;text-only 方向 rev 现不装配 TTS(None 跳过)。
+        if tts_provider is not None:
+            try:
+                await asyncio.wait_for(tts_provider.aclose(), timeout=3.0)
+            except Exception as exc:  # noqa: BLE001 - 收尾失败唔阻结算
+                print(f"[interp] tts aclose failed: {exc!r}", flush=True)
         try:
             await _exit_stage("mt_drain", _mt_worker, timeout_s=3.0)
         except Exception:  # noqa: BLE001 - cancel 语义由 _exit_stage 内吞

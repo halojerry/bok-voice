@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import difflib
 import json
 import os
@@ -1333,7 +1334,28 @@ def _digitize_id_slots(text: str) -> str:
     return _ID_DIGIT_RUN_RE.sub(_repl, s)
 
 
-class _StripTailAnchorStream(llm.LLMStream):
+class _CascadeCloseStreamMixin:
+    """包装流级联关闭内层(2026-09-30 A 线官方对账 Critical-1)。
+
+    官方姿势是 ``async with llm.chat(...) as stream``(官方 llm/fallback_
+    adapter.py 同款),框架只在最外层调 ``aclose``——此前三个包装流只关自己
+    的泵任务,内层**原生 MLX/MiniMax 流继续解码到自然完稿**:被掐回复的生成
+    盗占 GPU(call-9af18da5 双句打断后新回复 TTFT 5.3/6.8s、tps 崩 5.8 的
+    机理),文本全进无人读的 channel。级联链:外层 aclose → cancel 本层泵 →
+    内层 aclose → httpx 断连 → 队列代理放闸+上游断开 → 服务端中止解码。
+    内层关闭尽力而为(异常吞掉),幂等(重复 aclose 安全)。"""
+
+    async def aclose(self) -> None:
+        try:
+            await super().aclose()
+        finally:
+            _inner = getattr(self, "_inner", None)
+            if _inner is not None:
+                with contextlib.suppress(BaseException):
+                    await _inner.aclose()
+
+
+class _StripTailAnchorStream(_CascadeCloseStreamMixin, llm.LLMStream):
     """剥离模型输出里拟声复刻的「你上一句」锚块（LLM 流出口单点拦截）。
 
     2026-09-09 call-974d8da3 实证:S5 尾部瘦身令易变尾部以【你上一句】「…」
@@ -1506,7 +1528,7 @@ def _repeat_head_max_hold() -> int:
     return v if v >= 0 else 22
 
 
-class _RepeatSelfGuardStream(llm.LLMStream):
+class _RepeatSelfGuardStream(_CascadeCloseStreamMixin, llm.LLMStream):
     """LLM 流出口逐句剥复读:缓冲到句边界,复读句吞掉、新内容照发。
 
     全剥空 → 流空收尾(罕见;渐进披露治源头后这里只兜底,真发生时垫话/心跳
@@ -2327,6 +2349,14 @@ class ContextAwareLLM(llm.LLM):
         self._last_guard_stream: "_RepeatSelfGuardStream | None" = None
         _bind_metrics_forward(inner, self)
 
+    async def _prewarm_impl(self) -> None:
+        # 官方对账(2026-09-30 High-3):官方每通 activity start 的 llm.prewarm()
+        # 只认 _prewarm_impl 覆写——包装层不透传=真预热死在链上(agent.py 注释
+        # "由 AgentSession 自动调用"与事实不符)。照 StatelessMTLLM 的委托形状。
+        inner_prewarm = getattr(self._inner, "_prewarm_impl", None)
+        if inner_prewarm is not None:
+            await inner_prewarm()
+
     def chat(
         self,
         *,
@@ -2545,7 +2575,7 @@ class ContextAwareLLM(llm.LLM):
         self._partial_capture = capture
 
 
-class _PartialCaptureStream(llm.LLMStream):
+class _PartialCaptureStream(_CascadeCloseStreamMixin, llm.LLMStream):
     """记下本回复已生成的文本（打断轮补记账本的数据源，agent.py 注入）。
 
     正常走完 → 清空 capture(item_added 照常上报);异常/取消(=框架打断)→
@@ -2626,6 +2656,12 @@ class ExprAwareLLM(llm.LLM):
 
         self._emotion = EmotionProcessor()
         self._emotion_state = emotion_state
+
+    async def _prewarm_impl(self) -> None:
+        # 同 ContextAwareLLM(2026-09-30 High-3):包装层透传官方 prewarm。
+        inner_prewarm = getattr(self._inner, "_prewarm_impl", None)
+        if inner_prewarm is not None:
+            await inner_prewarm()
         _bind_metrics_forward(inner, self)
 
     def chat(self, *, chat_ctx, tools=None, conn_options=None, parallel_tool_calls=None, tool_choice=None, extra_kwargs=NOT_GIVEN):
