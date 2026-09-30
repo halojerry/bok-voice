@@ -3040,6 +3040,7 @@ async def entrypoint(ctx):
         UNCLEAR,
         detect_whatsapp_signal,
         extract_call_facts,
+        extract_fact_updates,
         judge_confirm_advance_allowed,
     )
     from .flow import _digit_normalize, _looks_like_whatsapp_step, _WHATSAPP_DECLINE, digits_to_cantonese
@@ -5791,9 +5792,18 @@ async def entrypoint(ctx):
             # 会中事实沉淀(R4):客户话里的平台/号码抽进尾部【通话中客户已讲】
             # (去重有界 ≤4 条)——早轮事实唔再随滚动记忆/历史截断蒸发,
             # 模型唔会重复问已答过的事(call-701c180b 同一问三遍实证)。
+            # D2 更正 lane(2026-09-30):更正轮(「唔係拼多多,係淘宝」)走
+            # supersede 顶替旧平台事实(旧路首位置匹配=沉淀被否定值,主动下毒);
+            # 纯否认轮不沉淀。BOK_FACT_CORRECTION=0 回旧 append-only。
             try:
-                for _fact in extract_call_facts(user_text, facts=flow_ctrl.vars_map):
-                    context_state.add_call_fact(_fact)
+                _corr_on = os.environ.get("BOK_FACT_CORRECTION", "1") == "1"
+                for _fact, _needle in extract_fact_updates(
+                    user_text, facts=flow_ctrl.vars_map, enabled=_corr_on
+                ):
+                    if _needle:
+                        context_state.supersede_call_fact(_needle, _fact)
+                    else:
+                        context_state.add_call_fact(_fact)
             except Exception:  # pragma: no cover - 沉淀失败唔阻回复
                 pass
             _flow_step_before = flow_ctrl.current

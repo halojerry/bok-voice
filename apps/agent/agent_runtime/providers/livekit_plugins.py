@@ -1814,6 +1814,25 @@ class ContextState:
             self._call_facts.pop(0)
         self._revision += 1
 
+    def supersede_call_fact(self, needle: str, new_text: str, limit: int = 4) -> None:
+        """更正覆盖(D2,2026-09-30 前提推翻更正 lane):移除含 needle 的旧事实
+        (新条目自身豁免)后 append 新条目——同槽新值压倒旧值,矛盾事实不再并排
+        每轮喂模型。旧事实仍留在旧消息冻结尾部里(≤8 轮自然截断),由新尾部
+        的「以X为准」显式压倒——**冻结尾部永不回溯重写(KV 严格前缀契约,
+        test_context_append_only 钉死)**。revision 照 bump(slim 门/speculator
+        F6 门自动跟随)。"""
+        t = str(new_text or "").strip()
+        if not t or not str(needle or "").strip():
+            return
+        kept = [s for s in self._call_facts if needle not in s or s == t]
+        if t not in kept:
+            kept.append(t)
+        new_list = kept[-limit:]
+        if new_list == self._call_facts:
+            return  # 幂等:无实际变化(重复 supersede)不 bump revision
+        self._call_facts = new_list
+        self._revision += 1
+
     def set_last_reply(self, text: str) -> None:
         """记录 AI 最近一句回复(截 80 字)作尾部重复锚——模型看得见自己上一句,
         唔会原句再讲一次。空串忽略(保持上一条锚)。"""

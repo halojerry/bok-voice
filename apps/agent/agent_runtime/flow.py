@@ -985,6 +985,96 @@ def extract_call_facts(user_text: str, *, facts: dict | None = None) -> list[str
     return out
 
 
+# ---- 前提推翻更正 lane(D2,2026-09-30 多轮上下文计划 Phase 2) ----
+# 病灶:「唔係拼多多,係淘宝」旧路取 _PLATFORM_RE 首个位置匹配=沉淀**被否定的
+# 平台**(主动下毒);facts FIFO 纯 append 无槽位覆盖,新旧矛盾事实并排每轮喂
+# 模型。确定性正则识别更正对(A-CC 2512.00332:散文历史输给用户新断言,唯一
+# 可靠解=结构化槽位权威+确定性写入,零 LLM 仲裁)。
+_FACT_DENY_RE = re.compile(r"唔係|唔系|不是|不对|错咗|错了|毋係")
+# 肯定尾:紧邻提及前的 係/是/系,负向后顾排除否认词自身的字(「唔係」的係
+# 唔算肯定——否则「唔係淘宝」会被误判成更正)。
+_FACT_AFFIRM_TAIL_RE = re.compile(r"(?<![唔不毋])(?:係|是|系)\s*[，,。！! ]*\s*$")
+_FACT_SWAP_RE = re.compile(r"(?:改成|換成|换成|改为|改爲|换做|改用)")
+_FACT_MAYBE_RE = re.compile(r"可能|大概|或者|或许|不确定|唔确定")
+
+
+def _platform_correction(t: str) -> tuple[str | None, str]:
+    """识别平台更正:返回 (被顶替的旧平台|None, 新平台)。纯函数。
+
+    三种形态(全确定性,无 LLM):
+    - 双提及 + 否认头:「唔係拼多多,係淘宝」→(拼多多,淘宝);
+      「拼多多唔係,係淘宝」→ 两提及间含否认+肯定连接词 → 同判;
+    - 单提及 + 改换动词:「改成淘宝」→(None,淘宝)——旧值未知,顶替一切平台事实;
+    - 单提及 + 否认 + 紧邻肯定:「唔係咩,係淘宝」→(None,淘宝)。
+    排除:不确定语气(可能/大概/...)照旧按普通提及沉淀;纯否认无肯定
+    (「唔係淘宝」)=异议非更正,唔沉淀任何东西(治旧路毒化);双提及但
+    中间无肯定连接(「係淘宝,唔係拼多多」语序含混)唔判更正,走旧路。
+    """
+    ms = list(_PLATFORM_RE.finditer(t))
+    if len(ms) >= 2:
+        between = t[ms[0].end(): ms[1].start()]
+        head = t[: ms[0].start()]
+        denied = bool(_FACT_DENY_RE.search(head)) or bool(_FACT_DENY_RE.search(between))
+        affirmed = bool(_FACT_AFFIRM_TAIL_RE.search(head)) or bool(
+            _FACT_AFFIRM_TAIL_RE.search(between)
+        )
+        if denied and affirmed:
+            return (ms[0].group(1), ms[1].group(1))
+        return ("", "")  # 双提及但语序含混/无肯定连接 → 旧路首位置匹配
+    if len(ms) == 1:
+        plat = ms[0].group(1)
+        head = t[: ms[0].start()]
+        if _FACT_MAYBE_RE.search(head):
+            return ("", "")  # 不确定语气 → 旧路普通沉淀
+        if _FACT_SWAP_RE.search(head) or (
+            _FACT_DENY_RE.search(head) and _FACT_AFFIRM_TAIL_RE.search(head)
+        ):
+            return (None, plat)
+        if _FACT_DENY_RE.search(head):
+            # 纯否认(「唔係淘宝」):异议非更正——不沉淀(治旧路首位置匹配毒化)
+            return ("SKIP", "")
+    return ("", "")
+
+
+def extract_fact_updates(
+    user_text: str, *, facts: dict | None = None, enabled: bool = True
+) -> list[tuple[str, str | None]]:
+    """更正感知的事实抽取:返回 [(沉淀文本, 被顶替needle|None)]。
+
+    - 非更正轮:与 extract_call_facts 逐字节同产出(needle 全 None);
+    - 更正轮:沉淀「客户更正:在X买(此前讲过Y,以X为准)」+ needle 顶替旧
+      平台事实;同轮号码照常追加(号码不走 supersede——WA 号码权威通道是
+      set_whatsapp_note 覆盖语义,facts 号码 bullet 仅信息性);
+    - 纯否认轮:[] (不沉淀)。
+    enabled=False(BOK_FACT_CORRECTION=0)=旧 append-only 行为。"""
+    t = (user_text or "").strip()
+    if not enabled or not t:
+        return [(f, None) for f in extract_call_facts(user_text, facts=facts)]
+    old, new = _platform_correction(t)
+    if old == "SKIP":
+        return []
+    if new:
+        out: list[tuple[str, str | None]] = []
+        if old:
+            out.append(
+                (
+                    f"客户更正：在{new}买（此前讲过{old}，以{new}为准）",
+                    f"客户讲过在{old}买",
+                )
+            )
+        else:
+            out.append((f"客户更正：在{new}买（以此为准）", "客户讲过在"))
+        # 同轮号码照常追加(号码不走 supersede——WA 号码权威通道是
+        # set_whatsapp_note 覆盖语义,facts 号码 bullet 仅信息性)
+        norm = _digit_normalize(t)
+        for run in _valid_digit_runs(norm):
+            if _run_is_known_number(run, facts):
+                continue
+            out.append((f"客户报过号码:{digits_to_cantonese(run)}", None))
+        return out
+    return [(f, None) for f in extract_call_facts(user_text, facts=facts)]
+
+
 def _short_pure_ack(text: str) -> bool:
     """归一化(去标点空白)后 ≤2 字的纯应承(「好」「係啊」「嗯」「ok」)。
 
