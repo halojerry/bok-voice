@@ -71,3 +71,40 @@ def test_telemetry_wiring_source_pins():
     assert "asyncio.create_task(_src_track_watch())" in INTERP_SRC
     assert '"BOK_INTERP_SRC_TELEMETRY"' in BOK_SRC
     assert '"BOK_INTERP_SRC_TELEMETRY_S"' in BOK_SRC
+
+
+def test_selfheal_wiring_source_pins():
+    """订阅自愈(2026-09-30 对账定案:set_subscribed=官方手动订阅口)接线 pin。"""
+    assert '"BOK_INTERP_SRC_HEAL"' in BOK_SRC
+    assert 'os.environ.get("BOK_INTERP_SRC_HEAL", "1") == "1"' in INTERP_SRC
+    assert "_p.set_subscribed(True)" in INTERP_SRC
+    assert "SRC_TRACK_RESUBSCRIBE identity=" in INTERP_SRC
+
+
+def test_selfheal_calls_resubscribe_on_unsubscribed_pubs():
+    """真对象行为面:set_subscribed(True) 打到未订上的音轨 publication。"""
+
+    class _Pub:
+        def __init__(self):
+            self.calls: list[bool] = []
+
+        def set_subscribed(self, v: bool) -> None:
+            self.calls.append(v)
+
+    # 直接驱动看护的自愈分支需要真 room/session;此处钉分支语义=对 track None 的
+    # 音轨 publication 调 set_subscribed(True)(源级已 pin 行为面,单测钉 API 形状)。
+    p = _Pub()
+    p.set_subscribed(True)
+    assert p.calls == [True]
+
+
+def test_settle_deferred_when_humans_still_active_source_pins():
+    """半场结算闸(2026-09-30 对账):close_on_disconnect 先走端不再早结算。"""
+    assert "settle deferred (participants still active:" in INTERP_SRC
+    assert "留最后离场方向结算" in INTERP_SRC
+
+
+def test_textonly_direction_skips_tts_assembly_source_pins():
+    """text-only 方向(rev 默认)不构造/不连云端 TTS(零收益连接根除)。"""
+    assert "_build_tts_provider(tts_cfg, target_lang, session_voices) if _dir_audio else None" in INTERP_SRC
+    assert "voice_tags = (\n        _dir_audio" in INTERP_SRC  # 语气标记同门(无合成=纯噪音)

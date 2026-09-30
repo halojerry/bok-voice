@@ -1028,7 +1028,12 @@ async def entrypoint(ctx) -> None:
     _glossary = glossary_block(glossary_pairs)
     if _glossary:
         print(f"[interp] glossary {len(glossary_pairs)} terms -> asr+mt", flush=True)
-    tts_provider = _build_tts_provider(tts_cfg, target_lang, session_voices)
+    # B 线官方对账(2026-09-30):text-only 方向(rev 默认档)此前无条件构造并
+    # **真连**云端 MiniMax bidi(prewarm connect_ms=446 实测)——但
+    # RoomOutputOptions.audio_enabled=False 下 TTS 永不被调用=零收益连接,
+    # 还与在途方向抢握手。音频向关闭的方向直接不装配 TTS。
+    _dir_audio = _direction_audio_enabled(speaker_role)
+    tts_provider = _build_tts_provider(tts_cfg, target_lang, session_voices) if _dir_audio else None
     # 语气词标记(2026-09-16 用户拍板):Hy-MT2 会把语气照词翻译(Hahaha/Coughs),
     # say 前由 _apply_voice_tags 换成 MiniMax 2.8 括号标记——合成层出真声(笑/咳/
     # 叹),不再是假人念稿。双门控:模型档(仅 2.8 系支持,非 2.8 会把标记念出来)
@@ -1036,12 +1041,17 @@ async def entrypoint(ctx) -> None:
     # _strip_voice_tags(译文行)与前端 stripVoiceTags(字幕)剥掉,只活合成层。
     # 模型档只认 MiniMax 分支(旧版靠 _build_tts_provider 的 setdefault 副作用
     # 传递;本地 Qwen3 兜底档标记会被当文本念出来,必须保持熄火)。
+    # 语气词标记同理只在音频向有意义(合成层标记,text-only 无合成=纯噪音)。
     _tts_is_minimax = (tts_cfg.get("provider") or "qwen3_tts").lower() in (
         "minimax",
         "minimax_streaming",
     )
-    tts_model = _resolve_minimax_model() if _tts_is_minimax else ""
-    voice_tags = os.environ.get("BOK_INTERP_VOICE_TAGS", "1") == "1" and _voice_tags_supported(tts_model)
+    tts_model = (_resolve_minimax_model() if _tts_is_minimax else "") if _dir_audio else ""
+    voice_tags = (
+        _dir_audio
+        and os.environ.get("BOK_INTERP_VOICE_TAGS", "1") == "1"
+        and _voice_tags_supported(tts_model)
+    )
     if tts_model:
         print(f"[interp] voice_tags {'on' if voice_tags else 'off'} (tts={tts_model})", flush=True)
     # 模型路由原始串（2026-09-25 阶段 0）：CP 设置顶层键与引擎卡同一 fetch（改道
@@ -1244,9 +1254,32 @@ async def entrypoint(ctx) -> None:
             await _exit_stage(
                 "report", cp.post_session_report(call_id, _session_report_payload(report.to_dict()))
             )
-        _settle_res = await _exit_stage("settle", cp.settle(call_id))
-        if _settle_res is not None:
-            print(f"[interp] settled {call_id}", flush=True)
+        # 【半场结算闸(2026-09-30 官方对账)】close_on_disconnect 默认开=先走的
+        # 一端(如 me- 挂线)立刻关本方向会话并触发 shutdown——但双 worker 同房,
+        # 另一端(other-)可能还在通话,此刻 settle=拿半场账本早结算。有人仍在房
+        # (非 agent 身份)→ 本方向跳过 settle 留给最后离场方向;两端同时走=双方
+        # 都见空房各结算一次(CP 幂等);job 被杀没人结算=既有回收器兜底。
+        _humans_alive: list[str] = []
+        try:
+            from livekit.rtc import ParticipantState as _PState
+
+            for _p in room.remote_participants.values():
+                if str(_p.identity).startswith("agent-"):
+                    continue
+                if getattr(_p, "state", None) == _PState.ACTIVE:
+                    _humans_alive.append(str(_p.identity))
+        except Exception:  # noqa: BLE001 - 判定失败回旧行为(照结算)
+            _humans_alive = []
+        if _humans_alive:
+            print(
+                f"[interp] settle deferred (participants still active: {_humans_alive[:3]}) "
+                f"— 双 worker 同房,留最后离场方向结算",
+                flush=True,
+            )
+        else:
+            _settle_res = await _exit_stage("settle", cp.settle(call_id))
+            if _settle_res is not None:
+                print(f"[interp] settled {call_id}", flush=True)
         await _exit_stage("cp_close", cp.aclose())
 
     ctx.add_shutdown_callback(_shutdown)
@@ -1366,6 +1399,37 @@ async def entrypoint(ctx) -> None:
                         f"sids={sids} rounds={not_sub_rounds} (音轨已发布但未订上=订阅链断)",
                         flush=True,
                     )
+                # 【B 线订阅自愈(2026-09-30 官方对账定案)】RemoteTrackPublication
+                # .set_subscribed(True) 即官方手动订阅口(官方 job.py 自己在用;
+                # 此前误判"SDK 无手动订阅口")——检测到「已发布未订上」时重发订阅
+                # 请求,前 3 轮每轮一次、其后每 10 轮一次,打 SRC_TRACK_RESUBSCRIBE
+                # 观测行。call-72112fd7 形态(fwd 对 me- 轨零订阅静默 3 分钟)从
+                # 只观测升级为自愈。BOK_INTERP_SRC_HEAL=0 回纯观测档。
+                if (
+                    os.environ.get("BOK_INTERP_SRC_HEAL", "1") == "1"
+                    and (not_sub_rounds <= 3 or not_sub_rounds % 10 == 0)
+                    and part is not None
+                ):
+                    _healed: list[str] = []
+                    for _p in part.track_publications.values():
+                        if (
+                            getattr(_p, "kind", None) == _rtc.TrackKind.KIND_AUDIO
+                            and getattr(_p, "track", None) is None
+                        ):
+                            try:
+                                _p.set_subscribed(True)
+                                _healed.append(str(_p.sid))
+                            except Exception as exc:  # noqa: BLE001 - 自愈失败唔阻看护
+                                print(
+                                    f"[interp] SRC_TRACK_RESUBSCRIBE failed sid={getattr(_p, 'sid', '?')} exc={exc!r}",
+                                    flush=True,
+                                )
+                    if _healed:
+                        print(
+                            f"[interp] SRC_TRACK_RESUBSCRIBE identity={listen_identity} "
+                            f"sids={_healed} rounds={not_sub_rounds}",
+                            flush=True,
+                        )
             else:
                 no_track_rounds = 0
                 not_sub_rounds = 0
