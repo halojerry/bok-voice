@@ -2465,6 +2465,10 @@ class ContextAwareLLM(llm.LLM):
             # 正常走完自动清空(item_added 照常上报,零双记)。
             if self._partial_capture is not None:
                 out = _PartialCaptureStream(self, out, self._partial_capture)
+                # D1（2026-09-30 Phase 0 定案）：最外层回复流引用——interrupted
+                # 收尸点 aclose 用（guard 层杀缓冲任务树根，最外层解框架消费链
+                # 的悬死等待；病理形态=下一轮 LLM 完成但零 push 到 TTS）。
+                self._last_reply_stream = out
             return out
         return inner_stream
 
@@ -5186,9 +5190,12 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                 except Exception:  # noqa: BLE001 - 收尾尽力而为
                     pass
                 # 打断轮也打 PERF(此前 CancelledError 跳过汇总,打断观测只能靠音频断言)。
+                # pushed=D1 判别字段(2026-09-30)：本流是否向服务端推过文本——
+                # 0=文本从未到 TTS(调度/转发层悬死),1=推过但零响应(连接/服务端)。
                 print(
                     f"MINIMAX_BIDI_PERF sentences={state['sentences']} "
-                    f"canceled={int(self._canceled_evt.is_set())} (interrupted)",
+                    f"canceled={int(self._canceled_evt.is_set())} "
+                    f"pushed={int(bool(state.get('sent_any')))} (interrupted)",
                     flush=True,
                 )
                 raise

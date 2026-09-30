@@ -3344,6 +3344,24 @@ async def entrypoint(ctx):
             await session.interrupt(force=True)  # 清僵死 speech(若有),释放队列
         except Exception:  # noqa: BLE001 - 无在播内容时 interrupt 抛错=无妨
             pass
+        # D1 病理现场快照(2026-09-30 Phase 0):零音频强断极罕见(25 天 24 例),
+        # 打一行在途任务名单(协程名,无栈)——下一例直接定位「零 push」卡点
+        # (调度器/文本转发/收流哪层悬死),配合 py-spy 手动深挖(print-only)。
+        try:
+            _stuck = sorted(
+                {
+                    getattr(t.get_coro(), "__qualname__", "") or repr(t.get_coro())[:60]
+                    for t in asyncio.all_tasks()
+                    if not t.done()
+                }
+            )
+            print(
+                f"[watchdog] dead-turn snapshot tasks={len(_stuck)} "
+                f"live={';'.join(_stuck[:14])} | py-spy: py-spy dump --pid {os.getpid()} (call {room_name})",
+                flush=True,
+            )
+        except Exception:  # noqa: BLE001 - 快照失败唔阻 ack
+            pass
         _ack = _llm_fallback_line(language_state.lang)
         try:
             # 看门狗自身开火路径:cancel_watchdog=False(否则取消自己=自噬)。
@@ -7294,6 +7312,33 @@ async def entrypoint(ctx):
                         )
                     except Exception as exc:  # noqa: BLE001 - 账本失败唔阻通话
                         print(f"[agent] interrupted ledger failed: {exc!r}", flush=True)
+                # D1 收尸(2026-09-30 Phase 0 定案):被掐回复的 LLM 包装流在消费者
+                # 断开后悬在 inner 链上永不收尾——guard cancel 分支 25 天 0 次触发
+                # =该路径从未执行;病理形态=下一轮回复 LLM 正常完成(TTFT/gen 正常)
+                # 但文本零 push 到 TTS(24/4114 全零 FIRST_CHUNK,今日真机 5 例,
+                # watchdog 6-8s 收尸)。补账点(pending_buffer 已读)显式 aclose 两层
+                # 流引用:guard=缓冲任务树根 / reply=最外层(框架消费链),cancel_and_
+                # wait 打穿,CancelledError 分支自然触发。partial 非空=有卡文本证据
+                # (兼防误杀恰开跑的下一流)。尽力而为,失败唔阻补账。BOK_INTERRUPT_REAP=0 关。
+                if (
+                    partial
+                    and os.environ.get("BOK_INTERRUPT_REAP", "1") == "1"
+                ):
+                    for _reap_layer in ("_last_guard_stream", "_last_reply_stream"):
+                        _reap_stream = getattr(llm_provider, _reap_layer, None)
+                        if _reap_stream is None:
+                            continue
+                        try:
+                            await _reap_stream.aclose()
+                            print(
+                                f"[agent] interrupted stream reaped layer={_reap_layer} (call {room_name})",
+                                flush=True,
+                            )
+                        except Exception as exc:  # noqa: BLE001 - 收尸失败唔阻补账
+                            print(
+                                f"[agent] interrupted stream reap failed layer={_reap_layer}: {exc!r} (call {room_name})",
+                                flush=True,
+                            )
 
         # 池化(2026-09-17 全量 debug P2-A):打断账本+风暴计数任务强引用;_close
         # 结算前 gather(_report_tasks) 顺带等它落地,补账不再有 GC 丢失窗口。
