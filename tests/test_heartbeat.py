@@ -18,7 +18,7 @@ from agent_runtime.agent import (  # noqa: E402
 
 def test_nudge_cantonese_with_name():
     out = _nudge_line("陳先生", "cantonese", 0)
-    assert out == "陳先生，唔急，我等你，你聽到就應我一聲。"
+    assert out == "陳先生，你仲喺度嗎？"
     # 輪換骨架:同一通內連續心跳唔重樣(舊 LLM 版兩連發一字不差,2026-09-06 實證)
     assert _nudge_line("陳先生", "cantonese", 1) != out
     assert _nudge_line("陳先生", "cantonese", 2) not in {out, _nudge_line("陳先生", "cantonese", 1)}
@@ -26,13 +26,13 @@ def test_nudge_cantonese_with_name():
 
 def test_nudge_mandarin_without_name():
     out = _nudge_line("", "zh", 0)
-    assert "不急，我等您" in out
-    assert out.startswith("不急") and "{name}" not in out  # 无名版=纯句（新文案自带句内逗号，只防 name 占位残留）
+    assert "您还在吗" in out
+    assert out.startswith("您还在") and "{name}" not in out  # 无名版=纯问句（只防 name 占位残留）
 
 
 def test_nudge_english():
     out = _nudge_line("Mr. Chan", "en", 0)
-    assert "Mr. Chan" in out and "no rush" in out
+    assert "Mr. Chan" in out and "still there" in out
 
 
 def test_nudge_count_clamped():

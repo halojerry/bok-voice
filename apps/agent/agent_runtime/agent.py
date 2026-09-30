@@ -467,28 +467,32 @@ def _nudge_line(name: str, lang: str, count: int) -> str:
     call-64543304 实证)。脚本直念零 TTFT(TTS 即点即播,答案卡死时即时补位)、
     零前缀断裂、轮换不重样。
 
-    P3.2(2026-09-29 v2 spec §6,Ethan 拍板「情绪太大很吓人必须换」):三语软
-    陪伴型——去「喂，」呼叫开头、降调陪伴语义;间隔 SILENCE_NUDGE_SECONDS
-    默认 8→12s。新文案=新 TTS 缓存 key,旧条目自然失效。
+    P3.2(2026-09-29 v2 spec §6,Ethan 拍板「情绪太大很吓人必须换」):间隔
+    SILENCE_NUDGE_SECONDS 默认 8→12s。
+    耳测定稿(2026-09-30,Ethan 听 nudge_ab 对照逐句评):①旧第一句
+    「你仲喺度嗎？」**原样保留**(评「最好」);②真正吓人的只有旧第二句的
+    「喂，」呼叫开头——只杀它,句长不动;③软陪伴第三句「你可能喺度谂紧,
+    我等你」**保留**(评「还不错」——等待语义放轮换末位合适)。其余软陪伴
+    长句(第一二位)同速下听感偏拖被否。新文案=新缓存 key 自然失效。
     """
     who = f"{name}，" if name else ""
     who_en = f"{name}, " if name else ""
     if lang == "cantonese":
         variants = (
-            f"{who}唔急，我等你，你聽到就應我一聲。",
-            f"{who}我仲喺度，你有咩想問隨時講。",
+            f"{who}你仲喺度嗎？",
+            f"{who}聽唔聽到我講嘢？",
             f"{who}唔好意思，你可能喺度谂紧，我等你。",
         )
     elif lang == "en":
         variants = (
-            f"{who_en}no rush — I'm here whenever you're ready.",
-            f"{who_en}I'm still here — ask me anything.",
+            f"{who_en}are you still there?",
+            f"{who_en}can you hear me?",
             f"{who_en}sorry — take your time, I'll wait.",
         )
     else:
         variants = (
-            f"{who}不急，我等您，您听到就应我一声。",
-            f"{who}我还在，您有什么想问随时说。",
+            f"{who}您还在吗？",
+            f"{who}能听到我说话吗？",
             f"{who}不好意思，您可能在想事情，我等您。",
         )
     return variants[min(max(count, 0), len(variants) - 1) % len(variants)]
