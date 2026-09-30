@@ -471,9 +471,11 @@ def _nudge_line(name: str, lang: str, count: int) -> str:
     SILENCE_NUDGE_SECONDS 默认 8→12s。
     耳测定稿(2026-09-30,Ethan 听 nudge_ab 对照逐句评):①旧第一句
     「你仲喺度嗎？」**原样保留**(评「最好」);②真正吓人的只有旧第二句的
-    「喂，」呼叫开头——只杀它,句长不动;③软陪伴第三句「你可能喺度谂紧,
-    我等你」**保留**(评「还不错」——等待语义放轮换末位合适)。其余软陪伴
-    长句(第一二位)同速下听感偏拖被否。新文案=新缓存 key 自然失效。
+    「喂，」呼叫开头——只杀它,句长不动;其余软陪伴长句同速下听感偏拖被否。
+    语义修正(2026-09-30 Ethan 复核):「你可能在想事情,我等你」是坐席等
+    来电的口吻+替客户猜心思——**外呼客服第三拍做的是再确认对方还在听**,
+    不是宣布等待。第三句改「唔好意思,你仲聽到嗎?」。新文案=新缓存 key
+    自然失效。
     """
     who = f"{name}，" if name else ""
     who_en = f"{name}, " if name else ""
@@ -481,19 +483,19 @@ def _nudge_line(name: str, lang: str, count: int) -> str:
         variants = (
             f"{who}你仲喺度嗎？",
             f"{who}聽唔聽到我講嘢？",
-            f"{who}唔好意思，你可能喺度谂紧，我等你。",
+            f"{who}唔好意思，你仲聽到嗎？",
         )
     elif lang == "en":
         variants = (
             f"{who_en}are you still there?",
             f"{who_en}can you hear me?",
-            f"{who_en}sorry — take your time, I'll wait.",
+            f"{who_en}sorry — can you still hear me?",
         )
     else:
         variants = (
             f"{who}您还在吗？",
             f"{who}能听到我说话吗？",
-            f"{who}不好意思，您可能在想事情，我等您。",
+            f"{who}不好意思，您还在听吗？",
         )
     return variants[min(max(count, 0), len(variants) - 1) % len(variants)]
 
