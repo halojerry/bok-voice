@@ -30,5 +30,5 @@ def test_stash_ledger_writes_and_resets():
     """源级 pin：stash 落账点写 _wa_stash_last；flush 消费后清（防跨轮误抑制）。"""
     body_start = AGENT_SRC.index('provider="wa-stash"')
     assert body_start > 0
-    window = AGENT_SRC[body_start - 1500 : body_start + 200]
+    window = AGENT_SRC[body_start - 400 : body_start + 400]
     assert '_wa_stash_last["text"] =' in window, "stash add_turn 附近须同步更新账本最后文本"
