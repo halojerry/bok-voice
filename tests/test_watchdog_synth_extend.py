@@ -153,27 +153,31 @@ def _pending_fn(value: object):
     return _fn
 
 
-def test_thinking_path_extends_and_burns_flag_once():
+def test_thinking_path_extends_burns_counter():
     session = _FakeSession("thinking")
     assert (
-        _watchdog_synth_extend_reason(_pending_fn(0.0), 100.0, False, session)
+        _watchdog_synth_extend_reason(_pending_fn(0.0), 100.0, 0, session)
         == "thinking"
     ), "pending=0 + thinking(LLM 生成中)=慢非死火 → 顺延"
-    # 二次 fire:同一 synth_extended 旗已烧 → 不再顺延(落回 force-interrupt)
+    # 二次 fire:已延 1 次 → 仍顺延(2026-09-30 真机 B 组:一次性窗差 1-4s 掐真回复)
     assert (
-        _watchdog_synth_extend_reason(_pending_fn(0.0), 100.0, True, session) == ""
-    ), "顺延一次性,真死火只多等一窗"
+        _watchdog_synth_extend_reason(_pending_fn(0.0), 100.0, 1, session) == "thinking"
+    ), "第二窗仍顺延——真机回复首帧叠 hold 落 5-6s,两窗才覆盖"
+    # 三次 fire:计数=2 → 封顶(真死火只多等两窗,兜底不变)
+    assert (
+        _watchdog_synth_extend_reason(_pending_fn(0.0), 100.0, 2, session) == ""
+    ), "两窗封顶,真死火落回 force-interrupt"
 
 
 def test_tts_pending_takes_precedence_over_thinking():
     # 流已开且晚于武装 → TTS 路,即便 agent_state 也是 thinking(互斥先 pending)
     assert (
-        _watchdog_synth_extend_reason(_pending_fn(101.0), 100.0, False, _FakeSession("thinking"))
+        _watchdog_synth_extend_reason(_pending_fn(101.0), 100.0, 0, _FakeSession("thinking"))
         == "tts_pending"
     )
     # 流已开但早于武装(上一轮残留窗口)→ 两路都不顺延
     assert (
-        _watchdog_synth_extend_reason(_pending_fn(50.0), 100.0, False, _FakeSession("thinking"))
+        _watchdog_synth_extend_reason(_pending_fn(50.0), 100.0, 0, _FakeSession("thinking"))
         == ""
     )
 

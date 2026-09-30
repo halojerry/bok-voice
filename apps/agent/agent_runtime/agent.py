@@ -1407,7 +1407,7 @@ def _watchdog_extend(state: dict, spawn, extra_s: float, now: float) -> bool:
 
 
 def _watchdog_synth_extend_reason(
-    pending_fn: object, arm_time: float, synth_extended: bool, session: object
+    pending_fn: object, arm_time: float, synth_extended: int, session: object
 ) -> str:
     """在途合成顺延判据(纯逻辑可单测,同 _watchdog_extend 注入式):返回顺延
     理由/""。两路——
@@ -1417,14 +1417,18 @@ def _watchdog_synth_extend_reason(
       首判据够不着——jump 腿慢 LLM(tps 6.5-11)触发轮回复 3.9-4.5s 恰过 4s
       闸被 force-interrupt 掐成 watchdog-ack。LLM 在途=TTS 未接=慢非死火
       (tps 方差实证 0920 批自身 3.2-15.2)。
-    两路沿用同一 synth_extended 旗(一次性,arm 复位)与同一顺延窗——真死火只
-    多等一窗,兜底路径不变;TTS 路先判(流已开时 thinking 不参与,互斥)。
+    两路沿用同一 synth_extended 计数(arm 复位为 0)与同一顺延窗。**至多顺延
+    两次**(2026-09-30 真机第一批 B 组,call-fde11c52 实证:真机链路比探针慢
+    30-50%,回复首帧叠 filler hold 落 5-6s,一次性 +2s 窗差 1-4s 把「LLM 已
+    完整生成、TTS 攒句中」的真回复掐成 ack——「打断后不结合上下文」的真身;
+    两次窗后仍无声=真死火,兜底路径不变)。TTS 路先判(流已开时 thinking 不
+    参与,互斥)。
     ext<=0(BOK_RESPONSE_WATCHDOG_SYNTH_EXT_S=0 kill-switch)一律 ""=直通
     interrupt,零新 env。pending/agent_state 全防御:信号口异常、fake/duck
     无属性、状态口异常一律按无在途处理。
     """
     _ext = _response_watchdog_synth_ext_s()
-    if synth_extended or _ext <= 0:
+    if int(synth_extended) >= 2 or _ext <= 0:
         return ""
     pending = 0.0
     if callable(pending_fn):
@@ -3274,7 +3278,7 @@ async def entrypoint(ctx):
         "deadline": 0.0,  # 武装时的绝对截止(time.monotonic 口径,顺延以此为基)
         "arm_time": 0.0,  # 本轮武装时刻(在途合成顺延判据:开流须晚于它)
         "extended": False,  # 本轮已顺延(垫话开播一次性,arm 复位)
-        "synth_extended": False,  # 本轮已顺延(在途合成一次性,arm 复位)
+        "synth_extended": 0,  # 本轮已顺延次数(在途合成,至多 2;arm 复位)
     }
 
     def _cancel_response_watchdog() -> None:
@@ -3303,12 +3307,12 @@ async def entrypoint(ctx):
         _ext_reason = _watchdog_synth_extend_reason(
             getattr(tts_provider, "reply_stream_pending_since", None),
             float(_watchdog.get("arm_time", 0.0)),
-            bool(_watchdog.get("synth_extended", False)),
+            int(_watchdog.get("synth_extended", 0) or 0),
             session,
         )
         if _ext_reason:
             _ext = _response_watchdog_synth_ext_s()  # 判据口已挡 kill,此处恒 >0
-            _watchdog["synth_extended"] = True
+            _watchdog["synth_extended"] = int(_watchdog.get("synth_extended", 0) or 0) + 1
             _watchdog["deadline"] = time.monotonic() + _ext
             print(
                 f"[watchdog] synth in flight (no first audio yet) reason={_ext_reason} -> extend +{_ext:.0f}s (call {room_name})",
@@ -3349,7 +3353,7 @@ async def entrypoint(ctx):
         _watchdog["arm_time"] = time.monotonic()
         _watchdog["deadline"] = _watchdog["arm_time"] + _response_watchdog_s()
         _watchdog["extended"] = False
-        _watchdog["synth_extended"] = False
+        _watchdog["synth_extended"] = 0
         _watchdog["task"] = asyncio.create_task(_watchdog_fire(_response_watchdog_s()))
 
     def _extend_response_watchdog(extra_s: float | None = None) -> None:
@@ -3363,6 +3367,16 @@ async def entrypoint(ctx):
         防 4s 闸把在播的第二发掐成 watchdog-ack(每轮至多两延:首发一延+第二发
         一延;顺延失败/未武装照旧无害)。"""
         ext = _response_watchdog_filler_ext_s() if extra_s is None else extra_s
+        if extra_s is None:
+            # B1(2026-09-30 真机第一批,call-fde11c52 实证):垫话 2-3s 音频盖耳期
+            # 只顺延 2s 是结构性短窗——真机回复首帧叠 hold 落 5-6s 被掐。顺延窗
+            # 按**垫话时间轴剩余**撑高(hold_if_playing 返回「回复首帧应扣压的
+            # 秒数」=垫话开播+时长+gap 的剩余量)+1.5s 出声缓冲,env 值为下限。
+            try:
+                hold_left = float(_filler.hold_if_playing() or 0.0)
+            except Exception:  # noqa: BLE001 - 垫话无时钟=退 env 窗
+                hold_left = 0.0
+            ext = max(ext, hold_left + 1.5)
         if _filler.reshot_firing():
             _watchdog["extended"] = False
         _watchdog_extend(
