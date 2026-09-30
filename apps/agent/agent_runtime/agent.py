@@ -465,6 +465,26 @@ def _sticky_reply_language(anchor: str, asr_lang: str, cur_sticky: str, cur_stre
     return anchor, anchor, 0
 
 
+# 【并发让位(2026-09-30 call-9af18da5 定案)】A 线 worker 单进程多 job——第二通
+# 电话冷启动的 prefix prewarm(~6k token 全量 prefill,实测 +6.2s)排进 LLM 队列
+# 代理单槽,把在途通话的交互轮 header 拖到 4-5s、TTFT 5.3-6.8s、tps 崩到 5.8,
+# 连锁 MiniMax bidi FLUSH_TIMEOUT+TTS fallback 切换(call-9af18da5 × call-2ec8eec6
+# 并发窗口实证)。本表让 prewarm 在「另有在途通话」时让位:新通话首轮吃冷
+# prefill(~1.4s,开场白盖住),在途通话保住延迟。BOK_PREFIX_PREWARM_YIELD=0
+# 回旧「照发」档。
+_ACTIVE_CALLS: set[str] = set()
+
+
+def _prewarm_should_yield(active: set, self_room: str) -> str | None:
+    """纯函数:另有在途通话 → 返回其房间名(让位);只有自己/空表 → None(照发)。
+
+    测试腿单点;entrypoint 注册/回收 _ACTIVE_CALLS,prewarm 任务体消费。"""
+    for r in active:
+        if r != self_room:
+            return str(r)
+    return None
+
+
 def _nudge_line(name: str, lang: str, count: int) -> str:
     """沉默心跳脚本直念(session.say,不加 LLM):短确认轮换骨架。
 
@@ -2883,8 +2903,12 @@ async def entrypoint(ctx):
 
     async def _release_room_claim() -> None:
         _room_claim.release()
+        _ACTIVE_CALLS.discard(room_name)
 
     ctx.add_shutdown_callback(_release_room_claim)
+    # 【并发让位注册(2026-09-30 call-9af18da5 定案)】A 线 worker 单进程多 job,
+    # 本表=本进程在途通话名单(prefix prewarm 让位判据,见 _prewarm_should_yield)。
+    _ACTIVE_CALLS.add(room_name)
     # call_id 来自显式分发 metadata(CP /api/token 挂 RoomAgentDispatch 时写入);
     # 房间名与 call_id 全栈同约定,兜底相等。AGENT_CALL_ID env 旁路已废除。
     try:
@@ -4334,6 +4358,18 @@ async def entrypoint(ctx):
         async def _prefix_prewarm_task(agent_ref, greeting_text: str = "") -> None:
             import time as _t2
 
+            # 并发让位(2026-09-30 call-9af18da5 定案,见 _ACTIVE_CALLS 档案):
+            # 另有在途通话时跳过 prewarm——6k token 全量 prefill 排进队列代理
+            # 单槽会把它俩的交互轮全部拖到 4-5s header。新通话首轮吃冷 prefill
+            # 由开场白盖住,在途通话保住延迟。
+            if os.environ.get("BOK_PREFIX_PREWARM_YIELD", "1") == "1":
+                _busy_other = _prewarm_should_yield(_ACTIVE_CALLS, room_name)
+                if _busy_other is not None:
+                    print(
+                        f"[agent] llm prefix prewarm yielded (concurrent call {_busy_other}) (call {room_name})",
+                        flush=True,
+                    )
+                    return
             try:
                 # 预热形状必须含开场白 assistant 轮,turn-1 才命中到 assistant 轮末。
                 # greeting_text 由调用方直传(开场白直念文本,装配时已知);为空才
