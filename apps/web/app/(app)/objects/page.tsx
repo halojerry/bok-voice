@@ -17,6 +17,7 @@ interface ObjectRow {
   courier: string;
   address: string;
   contact_channel: string;
+  pronunciation: string;
   template_id: string;
 }
 
@@ -30,6 +31,7 @@ const EMPTY_FORM = {
   courier: "",
   address: "",
   contact_channel: "",
+  pronunciation: "",
   template_id: "",
 };
 
@@ -98,8 +100,12 @@ export default function ObjectsPage() {
       try {
         await api.deleteObject(id);
       } catch (e) {
+        const s = String(e);
+        // 404 幂等成功（2026-09-30 真机）：对象已不在=删除目标已达成（列表
+        // 陈旧/他端已删），不计失败——「成功 0 失败 918」全 404 的误导根修。
+        if (s.includes("404")) continue;
         failed += 1;
-        if (!firstErr) firstErr = String(e);
+        if (!firstErr) firstErr = s;
       }
     }
     setSelected(new Set());
@@ -220,6 +226,7 @@ export default function ObjectsPage() {
       courier: row.courier ?? "",
       address: row.address ?? "",
       contact_channel: row.contact_channel ?? "",
+      pronunciation: row.pronunciation ?? "",
       template_id: row.template_id ?? "",
     });
   }
@@ -416,6 +423,16 @@ export default function ObjectsPage() {
               value={form.background}
               onChange={(e) => setForm({ ...form, background: e.target.value })}
             />
+            <label className="block">
+              <span className="text-xs muted">发音标注（可选，每行「原词/读法」）</span>
+              <textarea
+                className="mt-1 h-20 w-full resize-none rounded-lg border border-(--card-border) bg-transparent px-3 py-2 font-mono text-sm outline-hidden focus:border-(--live)"
+                placeholder={"陳大文/(can4)(daai6)(man4)\n张伟/(zhang1)(wei3)"}
+                value={form.pronunciation}
+                onChange={(e) => setForm({ ...form, pronunciation: e.target.value })}
+              />
+              <span className="mt-1 block text-xs muted">粤语用粤拼+数字声调，普通话用拼音；留空=默认读音。</span>
+            </label>
             <label className="block">
               <span className="text-xs muted">绑定话术模板</span>
               <select
