@@ -7588,6 +7588,13 @@ async def entrypoint(ctx):
                 print(f"[agent] interrupted reply guard-buffer appended chars={len(_gb)} (call {room_name})", flush=True)
             if closed.is_set() or not bool(getattr(handle, "interrupted", False)):
                 return
+            # W-GATE 打断面补洞（2026-10-01 call-231aa92a 实弹）：打断轮的回复
+            # 车道就此终结（无 item 交付、_report_assistant_turn 不会来）——20 站点
+            # 审计漏了这条路，事件不置位 → 等待中的 judge 挂到 15s 硬帽过期才放行，
+            # 恰好撞进重生/下一轮回复最需要 :1237 槽的窗口（实弹级联：TTFT 35.6s
+            # + watchdog 双杀）。此刻用户正在说话，judge 有话中窗先跑完 prefill，
+            # 严格优于帽过期抢槽。
+            _reply_done_event.set()
             now = time.monotonic()
             if source == "generate_reply":
                 # B3:计数 + 达阈值开风暴(让路语直念一次)。

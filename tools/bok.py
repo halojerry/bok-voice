@@ -1584,11 +1584,15 @@ def _start_settle_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> 
         return False
     llm_py = sidecar_python("llm-mlx")
     _apply_mlx_template_fix(llm_py)
+    # log-level INFO(2026-10-01 第十二波,call-231aa92a 取证需求):9B 已是 a_reply
+    # 主脑,槽位占用归因(排队的 35s TTFT 类事故)要读 mlx 请求/prompt-cache 命中行
+    # (settle-llm.log);BOK_LLM_LOG_LEVEL=WARNING 回静默(与 :1235 同一旋钮)。
+    _log_level = os.environ.get("BOK_LLM_LOG_LEVEL", "INFO")
     _start_proc(
         [str(llm_py), "-m", "mlx_lm", "server",
          "--model", settle_model, "--host", "127.0.0.1", "--port", "1237",
          "--prompt-cache-size", "8", "--prompt-cache-bytes", "2GB",
-         "--chat-template-args", '{"enable_thinking":false}', "--log-level", "WARNING"],
+         "--chat-template-args", '{"enable_thinking":false}', "--log-level", _log_level],
         run_dir / "settle-llm.pid",
         log_dir / "settle-llm.log",
     )

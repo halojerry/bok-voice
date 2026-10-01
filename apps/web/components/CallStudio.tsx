@@ -19,9 +19,8 @@ import { startTrace } from "@/lib/logger";
 import { AgentAudioVisualizerAura } from "@/components/agents-ui/agent-audio-visualizer-aura";
 import { AgentChatIndicator } from "@/components/agents-ui/agent-chat-indicator";
 import { AgentChatTranscript } from "@/components/agents-ui/agent-chat-transcript";
-import { AgentControlBar } from "@/components/agents-ui/agent-control-bar";
-import { AgentSessionProvider } from "@/components/agents-ui/agent-session-provider";
 import { StartAudioButton } from "@/components/agents-ui/start-audio-button";
+import { AgentSessionProvider } from "@/components/agents-ui/agent-session-provider";
 import { useMoodColor } from "@/hooks/use-mood-color";
 import { useAccount } from "@/components/account-context";
 import { useSession as useAppSession } from "@/components/session-context";
@@ -134,22 +133,15 @@ function LiveAgentPanel({ room, session }: { room: Room | null; session: UseSess
         </div>
       )}
 
-      {/* 控制条（AgentSessionProvider 已内置音频渲染）；设备切换已移到右侧「音频设备」卡片。
-          官方 AgentControlBar 按 CallStudio 能力裁剪=只留麦克风开关（旧实验控制条的 mic toggle +
-          audioinput 设备菜单同款，摄像头/屏幕/文字聊天本就没有）。
-          saveUserChoices=false：设备偏好仍归 CallStudio 的 bok.audio.* 单轨，禁官方写 livekit
-          标准 localStorage 键（spec §7 零新增存储键）。
-          leave=false（挂断行为保真取舍）：CallStudio 挂断是复合路径 leave()=session.end()→
-          api.hangup 上报→结算轮询→重挂；官方 AgentDisconnectButton 在 onClick 后恒再调
-          session.end()（useSessionContext），接入会双触发且官方件无处安放后续清理——挂断
-          仍由顶部「挂断」按钮（同款 leave()）承担，本条不渲染 leave 控件。 */}
+      {/* 控制条（2026-10-01 Ethan 拍板砍除）：官方 AgentControlBar 在本页只剩两块——
+          chat:false 恒真的 inert 文字输入行（死 DOM）+ 麦克风簇（静音开关/可视化/
+          设备菜单）；设备切换已由右侧「音频设备」卡片承担（bok.audio.* 单轨），
+          静音需求实测不需要（测试台挂断走顶部「挂断」）。整个组件从本页移除，
+          共享组件 agents-ui/agent-control-bar.tsx 保留（其他消费面不动）。
+          StartAudioButton（点击开启声音）仍是浏览器自动播放策略的必要入口。 */}
       <div className="flex shrink-0 flex-col items-center gap-2 border-t border-(--card-border) py-2">
         <div className="flex items-center justify-center gap-3">
           <StartAudioButton label="点击开启声音" />
-          <AgentControlBar
-            saveUserChoices={false}
-            controls={{ leave: false, camera: false, microphone: true, screenShare: false, chat: false }}
-          />
         </div>
       </div>
     </div>
