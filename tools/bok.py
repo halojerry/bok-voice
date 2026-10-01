@@ -2178,6 +2178,9 @@ _FORWARD_ENV = (
     "BOK_REPEAT_CROSS_TURN_SIM",
     "BOK_TAIL_SLIM",
     "BOK_MEMORY_CHARS",
+    # D1 槽位化 actor（2026-10-01,第一性原理重构）：A 线回复 LLM 从「整本剧本+
+    # 全规则」切「角色卡+任务块」（默认 "0"=旧路径逐字节不变；B 线不接）。
+    "BOK_SLOT_ACTOR",
     "EMOTION_TAG_PROMPT",
     "LLM_FIRST_TOKEN_TIMEOUT_S",
     "LLM_HISTORY_TURNS",

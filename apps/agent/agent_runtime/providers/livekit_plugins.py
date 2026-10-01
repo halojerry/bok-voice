@@ -39,6 +39,7 @@ from ..voice_style import NATURALNESS_BLOCK, a_line_tags_supported, strip_voice_
 from ..asr_polish_runtime import polish_enabled as _polish_layer_on
 from ..asr_polish_runtime import sync_polish as _polish_sync_text
 from ..flow import STEP_DISCIPLINE_RULE, split_step_text, stable_step_key
+from ..slot_actor import build_slot_task_block, compose_slot_user_message
 
 # 后台任务强引用池(2026-09-17 全量 debug P2-A):事件循环对 task 只持弱引用,
 # GC 可中途回收仍在跑的 fire-and-forget 任务——与本仓 _duration_fuse 注释、
@@ -1861,6 +1862,14 @@ class ContextState:
         self.allow_repeat: bool = False
         # ASR 受限润色映射（2026-09-27,原文单轨契约见 set_polished 注释）。
         self._polished_map: dict[str, str] = {}
+        # D1 槽位化 actor（2026-10-01,第一性原理重构）：闸 BOK_SLOT_ACTOR 由 A 线
+        # 装配点（agent.py entrypoint）读一次置位；缺省 False=旧路径逐字节不变
+        # （B 线 interpret 不接）。置位后静态前缀换角色卡（set_slot_system）、
+        # 每轮尾部换任务块（set_slot_step→slot_actor.build_slot_task_block）。
+        self.slot_mode: bool = False
+        self._slot_system: str = ""
+        self._slot_view: dict = {}
+        self._slot_key: str = ""
 
     @property
     def revision(self) -> int:
@@ -1888,6 +1897,26 @@ class ContextState:
         key = stable_step_key(stable)
         if key != self._stable_key:
             self._stable_key = key
+            self._revision += 1
+
+    def set_slot_system(self, text: str) -> None:
+        """槽位化 actor（D1）角色卡注入——装配点一次写入，整场字节不变
+        （render_instruction_prefix 缺省档之一；KV 前缀稳定区）。"""
+        self._slot_system = str(text or "")
+
+    def set_slot_step(self, view: dict | None) -> None:
+        """编排器给槽（D1）：当步结构化槽位（flow.FlowController.slot_step_view()）。
+
+        revision 跟随步身份键（换步/收尾态切换 +1）：重建轮尾部字节比对与
+        prefill 投机 F6 稳定门（snapshot_revision vs now）据此判尾部是否已分叉。
+        渲染侧只格式化本视图（render_context_tail 槽位分支），不再有稳定段/
+        增量段/slim 账本——任务块每轮随最新 user 消息冻结入史，追加式契约由
+        ContextAwareLLM.chat 既有 record_applied_tail 机制承担。
+        """
+        self._slot_view = dict(view or {})
+        key = f"{self._slot_view.get('state') or ''}:{self._slot_view.get('step_no') or ''}"
+        if key != self._slot_key:
+            self._slot_key = key
             self._revision += 1
 
     def add_call_fact(self, text: str, limit: int = 4) -> None:
@@ -2132,7 +2161,13 @@ class ContextState:
         不变量：前缀整场字节不变（步骤推进只改尾部）→ mlx KV-cache 整场命中；
         当前步约束已移到尾部（推进若改前缀,token0 起整段重 prefill,实测卡 3-5s）。
         真正每轮变的当前步/检索资料/记忆都放 render_context_tail()。
+
+        D1 槽位化（2026-10-01）：slot_mode 置位时整段换成装配点注入的角色卡
+        （slot_actor.build_slot_system——人设压缩+facts+语言块+口吻+范例）——
+        旧协议族（总览/共享规则/纪律/范例三段/对象档案）全部退出 prompt。
         """
+        if self.slot_mode:
+            return self._slot_system
         parts: list[str] = []
         if self._user_lang:
             names = {"zh": "普通话/中文", "cantonese": "粤语（广东话）", "en": "英语"}
@@ -2254,7 +2289,21 @@ class ContextState:
         - 稳定段发出决定记进账本（record/rewrite），重试/重建轮（F3）据此复现
           同一条尾部的字节，只有真换步或真内容变化才发生语义必需的断裂。
         【你上一句】的固定指令文本已上移稳定前缀（【重复控制】）,尾部只留引文。
+
+        D1 槽位化（2026-10-01）：slot_mode 置位时整段换成任务块（slot_actor.
+        build_slot_task_block——当前步/命中分支/事实槽/8 字锚）——总览/共享规则/
+        纪律/verdict 指引/状态标记/记忆摘要全部不进 prompt（规格铁律）。
+        稳定段/增量段/slim 账本不参与槽位分支：任务块每轮随最新 user 消息冻结
+        入史（record_applied_tail 机制原样复用），历史重放逐字节原样。
         """
+        if self.slot_mode:
+            return build_slot_task_block(
+                view=self._slot_view,
+                object_brief=self._object_brief,
+                call_facts=self._call_facts,
+                whatsapp_note=self._whatsapp_note,
+                anchor=self._last_reply_anchor() if self._last_reply else "",
+            )
         _last_rev = self._applied_tails[-1][2] if self._applied_tails else None
         slim = (
             os.environ.get("BOK_TAIL_SLIM", "1") == "1"
@@ -2409,8 +2458,13 @@ class ContextAwareLLM(llm.LLM):
                 items = list(copy.items)
                 if items and isinstance(items[0], llm.ChatMessage) and items[0].role == "system":
                     head = items[0].content
-                    if isinstance(head, str):
-                        merged: list = [_join_system(prefix, head, "")]
+                    # D1 槽位化（2026-10-01）：slot_mode 置位时角色卡即整个人格面
+                    # （人设 base 已压缩进卡，见 slot_actor.build_slot_system），
+                    # 不并 head——旧路径零变化（slot_mode 缺省 False）。
+                    if self._ctx.slot_mode and prefix:
+                        merged: list = [prefix]
+                    elif isinstance(head, str):
+                        merged = [_join_system(prefix, head, "")]
                     else:
                         merged = [*([prefix] if prefix else []), *head]
                     items[0] = llm.ChatMessage(role="system", content=merged)
@@ -2456,6 +2510,14 @@ class ContextAwareLLM(llm.LLM):
                     # 原文对不上(极端改写)→ 跳过该条,损失局部缓存也好过乱拼。
                     return False
 
+                def _compose(body: str, tail: str) -> str:
+                    # user 消息拼装单点：旧路径「客户话+尾部」（逐字节同旧）；
+                    # D1 槽位化路径「任务块+客户话」（规格形状，slot_actor.
+                    # compose_slot_user_message——与投机预热共用同一序防分叉）。
+                    if self._ctx.slot_mode:
+                        return compose_slot_user_message(tail, body)
+                    return f"{body}\n\n{tail}" if (body and tail) else (body or tail)
+
                 if n_new > 0:
                     # 旧的 applied 对应 users 前 |applied| 条(时序一致),逐条重放;
                     # 新增的尾部 user 从最后一条起各拼当前尾部并入账。
@@ -2483,7 +2545,7 @@ class ContextAwareLLM(llm.LLM):
                         orig = _text_of(it) if isinstance(it, llm.ChatMessage) else ""
                         tail = self._ctx.render_context_tail()
                         body = _polish_body(orig)
-                        final = f"{body}\n\n{tail}" if (body and tail) else (body or tail)
+                        final = _compose(body, tail)
                         if tail or body != orig:
                             items[idx] = llm.ChatMessage(role="user", content=[final])
                         self._ctx.record_applied_tail(orig, final)
@@ -2508,7 +2570,7 @@ class ContextAwareLLM(llm.LLM):
                             actual = _text_of(items[users[offset + k]])
                             tail = self._ctx.render_context_tail()
                             body = _polish_body(actual)
-                            rebased = f"{body}\n\n{tail}" if (body and tail) else (body or tail)
+                            rebased = _compose(body, tail)
                             items[users[offset + k]] = llm.ChatMessage(role="user", content=[rebased])
                             last_orig = actual
                             self._ctx.rewrite_last_applied_tail(actual, rebased)
@@ -2525,7 +2587,7 @@ class ContextAwareLLM(llm.LLM):
                             emit_stable=self._ctx.tail_emit_stable_for_rebuild()
                         )
                         body = _polish_body(last_orig)
-                        final = f"{body}\n\n{tail}" if (body and tail) else (body or tail)
+                        final = _compose(body, tail)
                         if final == tail_window[-1][1]:
                             print("TAIL_REWRITE identical_skipped", flush=True)
                         else:

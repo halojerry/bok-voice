@@ -1716,6 +1716,53 @@ class FlowController:
                 )
         return "\n".join(lines)
 
+    def slot_step_view(self) -> dict:
+        """槽位化 actor(D1,2026-10-01)当步结构化槽位:步号/goal/首轮底稿首行/命中分支应答。
+
+        与 current_step_text() **互斥调用**——两者共享首渲染账本(_last_render_step/
+        _just_advanced),同一渲染点只许调其一(agent.py `_push_flow_state` 按
+        ContextState.slot_mode 二选一)。槽位模式渲染侧(`slot_actor.
+        build_slot_task_block`)只格式化本视图,零文本解析、零协议泄漏。
+        收尾/流程完成态给 state 槽(closing/done),与 legacy closing_text/
+        done_text 同语义(状态行由 slot_actor 渲染)。
+        """
+        if self.closing:
+            return {"state": "closing"}
+        if not self.has_steps or self.done:
+            return {"state": "done"}
+        step = self.steps[self.current]
+        # 首轮判定与 current_step_text 同账本(渲染计数而非 _just_advanced 推导)。
+        _first_turn = self._last_render_step != self.current
+        self._last_render_step = self.current
+        # 【新一步】/【跳转进入】/禁讲清单整族不进槽位 prompt(D1 规格),但账本
+        # 照旧消费——从槽位模式切回/来回对照时引擎状态恒一致。
+        self._just_advanced = False
+        parts = parse_step_ref(step.ref)
+        goal = render_template_text(step.goal, self.vars_map) if step.goal else ""
+        script = parts.script or ""
+        if not goal and script:
+            # goal 缺失回退正稿首行当步意图(同 flow_overview 的 goal or ref 惯例);
+            # 已当 goal 用则不再重复底稿行。
+            goal = script
+            script = ""
+        view = {
+            "state": "steps",
+            "step_no": self.current + 1,
+            "total": len(self.steps),
+            "goal": goal,
+            "script": "",
+            "branch": "",
+        }
+        # 渐进披露同语义:正稿只进本步首轮、say 步恒不给(直念原文在历史);
+        # 分支只在非首轮(或 say 步)按当轮回应命中一条,命中不了不注入。
+        if _first_turn and not step.say and script:
+            view["script"] = render_template_text(script, self.vars_map)
+        if (not _first_turn or step.say) and parts.branches:
+            _m = match_step_branch(parts, self.last_user_text, self.last_verdict)
+            if _m:
+                view["branch"] = render_template_text(_m[1], self.vars_map)
+        return view
+
     def flow_overview(self) -> str:
         """流程总览(注入基础 system,让 LLM 知道全貌但不照读)。
 

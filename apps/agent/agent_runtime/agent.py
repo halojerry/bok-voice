@@ -2419,6 +2419,21 @@ def _prefix_prewarm_enabled() -> bool:
     return os.environ.get("LLM_PREFIX_PREWARM", "1") == "1"
 
 
+def _push_flow_state(context_state, flow_ctrl) -> None:
+    """编排器给槽（D1 槽位化 actor，2026-10-01）：把「当步状态」推给 ContextState。
+
+    旧路径=渲染 ``current_step_text()`` 文本存尾部（逐字节同旧）；槽位置位=
+    推结构化视图 ``flow_ctrl.slot_step_view()``（渲染留给 ContextState 的
+    slot_actor.build_slot_task_block）。两者**互斥**——共享首渲染账本
+    （``FlowController._last_render_step``/_just_advanced），同一编排点只许调其一。
+    全部 7 个推进/直念推点经本函数收口（原先直接调 set_flow_current）。
+    """
+    if getattr(context_state, "slot_mode", False):
+        context_state.set_slot_step(flow_ctrl.slot_step_view())
+    else:
+        context_state.set_flow_current(flow_ctrl.current_step_text())
+
+
 def _build_prefix_prewarm_messages(context_state, instructions: str, greeting_text: str = "") -> list[dict]:
     """组装 turn-1 真实 prompt 形状的预热请求体（纯函数，单测断言标记）。
 
@@ -2438,7 +2453,12 @@ def _build_prefix_prewarm_messages(context_state, instructions: str, greeting_te
     # [prefix, *base_parts] 列表,序列化按 "\n" 连接(实测逐字节 diff 定位,
     # 旧 _join_system 用 "\n\n" 差一个换行 → 预热与 turn-1 在 system 尾分叉,
     # cached=0 全量 prefill 白烧)。
-    system = "\n".join([prefix, instructions or ""]) if instructions else prefix
+    # D1 槽位化：slot_mode 时真请求 system=[角色卡]（chat() 不并 head），预热
+    # 必须同形——只发卡，不再拼 instructions。
+    if getattr(context_state, "slot_mode", False):
+        system = prefix
+    else:
+        system = "\n".join([prefix, instructions or ""]) if instructions else prefix
     user = f"你好。\n\n{tail}" if tail else "你好。"
     msgs: list[dict] = [{"role": "system", "content": system}]
     if greeting_text:
@@ -3206,6 +3226,7 @@ async def entrypoint(ctx):
             _fuse_task.add_done_callback(_fuse_tasks.discard)
     # 对话流程控制器:载入模板分步 + 对象变量;由它按轮注入"当前步",逐步推进。
     from .flow import FlowController, facts_line
+    from .slot_actor import build_slot_system, slot_actor_enabled
     from .flow import (
         CONFIRM,
         DEFER,
@@ -3225,12 +3246,20 @@ async def entrypoint(ctx):
 
     flow_ctrl = FlowController.from_template(template, object_card)
     _log_stage("context_resolved")
-    if flow_ctrl.has_steps:
+    # D1 槽位化 actor（2026-10-01）：总闸 A 线装配点读一次置位（B 线 interpret 不接；
+    # 缺省 "0"=旧路径逐字节不变）。置位后静态前缀换角色卡、每轮尾部换任务块。
+    context_state.slot_mode = slot_actor_enabled()
+    if context_state.slot_mode:
+        # 总览/共享规则/纪律整族不进 prompt——只推当步结构化槽位（角色卡在下方
+        # greet_lang 落定后 set_slot_system）。
+        context_state.set_slot_step(flow_ctrl.slot_step_view())
+    elif flow_ctrl.has_steps:
         context_state.set_flow(flow_ctrl.flow_overview(), flow_ctrl.current_step_text())
-        print(f"[agent] flow loaded {len(flow_ctrl.steps)} steps (call {room_name})", flush=True)
     else:
         # 无分步模板:对象事实仍注入(变量在四段参考里也可用)。
         context_state.set_flow("", "")
+    if flow_ctrl.has_steps:
+        print(f"[agent] flow loaded {len(flow_ctrl.steps)} steps (call {room_name})", flush=True)
 
     instructions = _instructions(
         persona=persona,
@@ -3294,6 +3323,22 @@ async def entrypoint(ctx):
     # 不再回流（ASR 用独立钉定态），逐轮 sticky 跟随已删除，TTS _resolve_voice/
     # lecture_guard/联网语言等全部整通恒为 greet_lang。
     language_state = PinnedLanguageState(lang=greet_lang)
+    # D1 槽位化 actor（2026-10-01）：语言落定后一次性渲染角色卡（人设压缩+facts+
+    # 语言块+口吻规则+2 条范例；slot_actor.build_slot_system 硬帽 600c），
+    # 整场字节不变——KV 前缀稳定区，零逐轮成本。闸关（默认）本块零调用。
+    if context_state.slot_mode:
+        _slot_card = build_slot_system(
+            persona=persona,
+            template=template,
+            facts=facts_line(object_card) if object_card else "",
+            language=greet_lang,
+        )
+        context_state.set_slot_system(_slot_card)
+        print(
+            f"[agent] slot actor on system_chars={len(_slot_card)} "
+            f"lang={greet_lang} (call {room_name})",
+            flush=True,
+        )
     # 开场即锚定回复语言（P4-C 沿革）：会话开始前就按 greet_lang 渲染，前缀从
     # 第一声起字节稳定。【用户语言】规则自此字节静态整通：装配时写入一次，逐轮
     # 钩子不再 set_user_language（旧 sticky 跟随/语言切换标记全部退役）——KV-cache
@@ -5355,7 +5400,7 @@ async def entrypoint(ctx):
                         )
                     elif wa_confirm_advance_allowed(goal=_gj, ref=_rj, captured=_wa_captured["on"]):
                         flow_ctrl.advance()
-                        context_state.set_flow_current(flow_ctrl.current_step_text())
+                        _push_flow_state(context_state, flow_ctrl)
                         print(f"[flow] judge(bg)=confirm step={flow_ctrl.current + 1} (call {room_name}){_route_log}", flush=True)
                     else:
                         print(f"[flow] judge(bg)=confirm blocked (wa step, not captured) step={step_at + 1} (call {room_name}){_route_log}", flush=True)
@@ -5384,7 +5429,7 @@ async def entrypoint(ctx):
                             _gu, _ru = flow_ctrl.current_goal_ref()
                             if wa_confirm_advance_allowed(goal=_gu, ref=_ru, captured=_wa_captured["on"]):
                                 flow_ctrl.advance()
-                                context_state.set_flow_current(flow_ctrl.current_step_text())
+                                _push_flow_state(context_state, flow_ctrl)
                                 _invalidate_stale_preemptive("unclear 连续 → 推进")
                                 _advanced_uc = True
                                 print(
@@ -6391,7 +6436,7 @@ async def entrypoint(ctx):
                                 _invalidate_stale_preemptive(
                                     f"流程跳转 → 第 {flow_ctrl.current + 1} 步"
                                 )
-                                context_state.set_flow_current(flow_ctrl.current_step_text())
+                                _push_flow_state(context_state, flow_ctrl)
                                 # 跳步轮强制 advanced → QA 快路让位(同 graph 跳哨兵)
                                 _flow_step_before = -1
                                 _register_reply_lane(lane="branch-jump", notify=True)  # EX-2
@@ -6514,7 +6559,7 @@ async def entrypoint(ctx):
                             flow_ctrl.current,
                             _turn_key,
                         )
-                    context_state.set_flow_current(flow_ctrl.current_step_text())
+                    _push_flow_state(context_state, flow_ctrl)
                 except Exception:  # pragma: no cover - 流程推进失败不阻断回复
                     pass
             # ---- 分支【收线】台词直念出口(A-②):raise 必须在任何 except-pass
@@ -6735,7 +6780,7 @@ async def entrypoint(ctx):
             if _say_now:
                 flow_ctrl.note_step_said()
                 try:
-                    context_state.set_flow_current(flow_ctrl.current_step_text())
+                    _push_flow_state(context_state, flow_ctrl)
                 except Exception:  # noqa: BLE001
                     pass
                 try:
@@ -7014,7 +7059,7 @@ async def entrypoint(ctx):
                         _invalidate_stale_preemptive(
                             f"流程跳转 → 第 {flow_ctrl.current + 1} 步"
                         )
-                        context_state.set_flow_current(flow_ctrl.current_step_text())
+                        _push_flow_state(context_state, flow_ctrl)
                         # 跳步轮强制 advanced=True → QA 快路让位(spec precedence graph>QA):
                         # 同轮规则推进+图后退跳可令净位移为零,不置哨兵快路会照抢本轮。
                         _flow_step_before = -1
@@ -7885,7 +7930,7 @@ async def entrypoint(ctx):
         # 首条 user 尾部此时尚未冻结,保证预热形状 == turn-1 请求形状。
         flow_ctrl.opening_played = True
         if flow_ctrl.has_steps:
-            context_state.set_flow_current(flow_ctrl.current_step_text())
+            _push_flow_state(context_state, flow_ctrl)
         greeting_text = opening or GENERIC_GREETINGS.get(greet_lang, GENERIC_GREETINGS["zh"])
         # 预热与开场白并行:开场白=纯 TTS(云 MiniMax,本地缓存命中则 ~0ms),预热走
         # 本地 LLM prefill,互无争抢——旧顺序 say() 要等整段念完才返回(话术开场白
