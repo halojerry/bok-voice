@@ -54,6 +54,20 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     "scripts/eval_sensevoice.py": re.compile(r"yue"),
     "tools/bok.py": re.compile(r"zh-en-ja-ko-yue"),
     "tests/test_asr_engine_routing.py": re.compile(r"yue"),
+    # CSC 管线族(2026-09-27 落地,主仓工作区快照 e9be38a 收编):yue 出现面全部是
+    # 外部边界/指标命名,非运行时语言字段——HF Common Voice 数据集语言 tag
+    # (LANE_YUE="yue"=数据集 lane 键,外部真字面量)、评测指标字段(YUE_MARKERS/
+    # yue_markers_lost)/变量名(pool_yue/EMBEDDED_SEED_YUE)、边界变体接受单点、
+    # 同音字测试 fixture 键。内部语言字段仍一律 cantonese(LANE_YUE→"cantonese"
+    # 的映射行即收口单点)。IGNORECASE=大小写混合的变量命名族。
+    "scripts/prepare_csc_data.py": re.compile(r"yue", re.IGNORECASE),
+    "scripts/train_csc_model.py": re.compile(r"yue", re.IGNORECASE),
+    "scripts/eval_csc_model.py": re.compile(r"yue", re.IGNORECASE),
+    "scripts/predict_csc_model.py": re.compile(r"yue", re.IGNORECASE),
+    "services/csc-sidecar/app.py": re.compile(r"yue", re.IGNORECASE),
+    "services/csc-sidecar/selftest.py": re.compile(r"yue", re.IGNORECASE),
+    "tests/test_csc_data.py": re.compile(r"yue", re.IGNORECASE),
+    "tests/test_probe_stimulus_tools.py": re.compile(r"yue", re.IGNORECASE),
     "scripts/test_volcano_v3.py": None,
     # 计划文档里的粤语文本检测示例代码（_YUE_MARKS 正则只是「识别粤语字」的
     # 变量名，非语言字段赋值）——4b0dd6b 存量，按门禁政策文档白名单收口。
