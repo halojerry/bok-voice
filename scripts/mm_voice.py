@@ -20,9 +20,45 @@ _VOICES = {
     "en": ("socialmedia_female_2_v1", "English"),
 }
 
+# 固定云端端点(字面量):协议 https + host 白名单单点,拒绝任何动态/内网/
+# 环回目标(SSRF 边界)。
+_T2A_URL = "https://api.minimax.cn/v1/t2a_v2"
+_T2A_ORIGIN = "https://api.minimax.cn/"
+
 
 def mm_pcm(text: str, lang: str) -> bytes:
+    """MiniMax 云合成 16k PCM;**磁盘缓存**(2026-10-01):探针语料逐轮同句,
+    每次现调云=一通多花 30-60s 网络(BOK_PROBE_STIMULUS=cloud 实测)——以
+    (lang,voice,text) 哈希落 app-data/probe-stimulus-cache/,只有首跑付合成
+    钱。命中静默回放;写盘失败降级直调。BOK_PROBE_STIMULUS_CACHE=0 关。"""
+    import hashlib
+    import os
+
+    voice = _VOICES.get(lang, _VOICES["zh"])[0]
+    cache_dir = Path.home() / "Library/Application Support/BokVoice/probe-stimulus-cache"
+    cache_path = cache_dir / f"{hashlib.sha256(f'{lang}|{voice}|{text}'.encode()).hexdigest()[:24]}.pcm"
+    use_cache = os.environ.get("BOK_PROBE_STIMULUS_CACHE", "1") == "1"
+    if use_cache:
+        try:
+            if cache_path.is_file():
+                return cache_path.read_bytes()
+        except OSError:
+            pass
+    pcm = _mm_pcm_fetch(text, lang)
+    if use_cache:
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_path.write_bytes(pcm)
+        except OSError:
+            pass
+    return pcm
+
+
+def _mm_pcm_fetch(text: str, lang: str) -> bytes:
     import certifi
+
+    if not _T2A_URL.startswith(_T2A_ORIGIN):
+        raise RuntimeError("t2a endpoint hardening: unexpected origin")
 
     db = sqlite3.connect(
         str(Path.home() / "Library/Application Support/BokVoice/bok_voice.db")
@@ -35,7 +71,7 @@ def mm_pcm(text: str, lang: str) -> bytes:
     voice, boost = _VOICES.get(lang, _VOICES["zh"])
     ctx = ssl.create_default_context(cafile=certifi.where())
     req = urllib.request.Request(
-        "https://api.minimax.cn/v1/t2a_v2",
+        _T2A_URL,
         method="POST",
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
         data=json.dumps(
