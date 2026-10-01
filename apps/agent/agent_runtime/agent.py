@@ -4452,14 +4452,35 @@ async def entrypoint(ctx):
                             break
                         await asyncio.sleep(0.25)
                 msgs = _build_prefix_prewarm_messages(context_state, instructions, greeting_text)
-                _pw0 = _t2.monotonic()
-                await _raw_llm.prefix_prewarm(msgs)
-                print(
-                    f"[agent] llm prefix prewarm done +{(_t2.monotonic() - _pw0) * 1000:.0f}ms "
-                    f"msgs={len(msgs)} system_chars={len(msgs[0]['content'])} "
-                    f"greeting={'yes' if greeting_text else 'no'} (call {room_name})",
-                    flush=True,
-                )
+                # 【P2 护栏(2026-10-01 实弹)】LM Studio 闲时会卸载模型,首个请求
+                # 吃 400「Model is unloaded」——prewarm 是 fire-and-forget,正好当
+                # JIT 装载的触发器+等待器:退避重试(5s/12s)让装载在开场白播放窗
+                # 内完成,turn-1 真请求到时模型已在位。仍失败只损首轮 cache。
+                for _pw_try, _pw_wait in enumerate((0.0, 5.0, 12.0), 1):
+                    if _pw_wait:
+                        await asyncio.sleep(_pw_wait)
+                    try:
+                        _pw0 = _t2.monotonic()
+                        await _raw_llm.prefix_prewarm(msgs)
+                        print(
+                            f"[agent] llm prefix prewarm done +{(_t2.monotonic() - _pw0) * 1000:.0f}ms "
+                            f"msgs={len(msgs)} system_chars={len(msgs[0]['content'])} "
+                            f"greeting={'yes' if greeting_text else 'no'} (call {room_name})",
+                            flush=True,
+                        )
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        if "unloaded" not in str(exc).lower() or _pw_try == 3:
+                            print(
+                                f"[agent] llm prefix prewarm skipped: {exc!r} (call {room_name})",
+                                flush=True,
+                            )
+                            break
+                        print(
+                            f"[agent] llm prefix prewarm retry {_pw_try}/3 "
+                            f"(model unloaded, wait {_pw_wait:.0f}s for JIT load) (call {room_name})",
+                            flush=True,
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - 预热失败零影响，只损失首轮 cache
