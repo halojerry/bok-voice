@@ -266,9 +266,11 @@ def test_funnel_early_block_wiring():
     assert "BRANCH_ACTION jump step=" in src
     assert "BRANCH_ACTION jump_noop step=" in src
     assert "BRANCH_ACTION hold step=" in src
-    assert '_turn_origin["provider"] = "branch-refuse"' in src
-    assert '_turn_origin["provider"] = "branch-notify"' in src
-    assert '_turn_origin["provider"] = "branch-jump"' in src
+    # EX-2（2026-09-28）：三臂 provider 归因改经 chokepoint；refuse 建票据，
+    # notify/jump 为 notify=True（provider 顺延到下一个 assistant item）。
+    assert '_register_reply_lane(  # EX-2 chokepoint\n                                    lane="branch-refuse", text=_branch_refuse_say' in src
+    assert '_register_reply_lane(lane="branch-notify", notify=True)' in src
+    assert '_register_reply_lane(lane="branch-jump", notify=True)' in src
     # 收线台词直念出口:raise 在流程 try 之外(StopResponse 是 Exception 子类)
     i_exit = src.index("if _branch_refuse_say:")
     i_try_end = src.index("# pragma: no cover - 流程推进失败不阻断回复")

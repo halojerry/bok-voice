@@ -261,6 +261,20 @@ def _trim_lead_silence_safe(pcm: bytes, sample_rate: int) -> bytes:
         return pcm
 
 
+def _schedule_async_prewarm(result: object) -> None:
+    """装配层 sync `prewarm()` 兼容垫(2026-09-28):provider 内芯 prewarm 已
+    async 化(会话预热池,W-TTS),同步转发点把协程挂到当前 loop 火忘了结,
+    异常吞掉——预热失败零影响(合成路径自会回退流内自连);无事件循环时
+    关闭协程静默跳过(interpret 无 loop 装配形态)。"""
+    if not asyncio.iscoroutine(result):
+        return
+    try:
+        # FIRE_FORGET_EXEMPT: 预热纯增益——被 GC 掐掉=下次合成就地握手回退。
+        asyncio.get_running_loop().create_task(result)
+    except RuntimeError:
+        result.close()
+
+
 class _CachedChunkedStream(tts.ChunkedStream):
     """缓存命中:本地 PCM 组流,零云调用。
 
@@ -563,7 +577,7 @@ class CachedTTS(tts.TTS):
         )
 
     def prewarm(self) -> None:
-        self._wrapped.prewarm()
+        _schedule_async_prewarm(self._wrapped.prewarm())
 
     async def aclose(self) -> None:
         self._wrapped.off("metrics_collected", self._forward_metric)
@@ -661,7 +675,7 @@ class _FirstAudioTTS(tts.TTS):
         )
 
     def prewarm(self) -> None:
-        self._wrapped.prewarm()
+        _schedule_async_prewarm(self._wrapped.prewarm())
 
     async def aclose(self) -> None:
         self._wrapped.off("metrics_collected", self._forward_metric)

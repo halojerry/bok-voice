@@ -793,9 +793,22 @@ async def _run_once(
     out["candidates"] = len(candidates)
 
     # ③ 聚类：复用 qa_cluster 内核（headless）；LLM 不可用→本轮跳过聚类采纳。
+    # 中途闲时复查（2026-09-28）：①的闸只在 run 起点看一次——挖掘/写库耗时窗内
+    # 来了通话，聚类 LLM 是 :1235 单闸的最长持有者（实测一次 digest 距真实通话
+    # 开跑仅 0.85s），顶住实时回复=通话侧 TTFT 抖刺。失联按忙处理（宁可不跑）。
+    try:
+        if (live_count or _default_live_count)() > 0:
+            out["skipped"] = "busy-midway"
+            return out
+    except Exception as exc:  # noqa: BLE001
+        out["skipped"] = f"busy({exc!r})"
+        return out
     plans: dict[str, dict] = {}
     for acc in accounts:
         try:
+            if (live_count or _default_live_count)() > 0:
+                out["skipped"] = "busy-midway"
+                return out
             plans[acc] = qa_cluster_mod._compute_plan(repo, acc, _MIN_CALLS, _LIMIT)
         except Exception as exc:  # noqa: BLE001 - ClusterError(LLM 不可用)等一并列错误
             errors.append(f"cluster({acc}): {exc!r}")

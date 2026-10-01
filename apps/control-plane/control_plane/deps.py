@@ -196,6 +196,14 @@ def build_engine() -> Engine | None:
                     "address",
                     "address VARCHAR(255) DEFAULT ''",
                 )
+                # 发音词典（2026-09-27）：多行 `原词/读法` 文本，装配时下发 MiniMax
+                # pronunciation_dict 让人名/专名读准。空串=默认读音（运行时不下发键）。
+                _ensure_column(
+                    conn,
+                    "object_profiles",
+                    "pronunciation",
+                    "pronunciation TEXT DEFAULT ''",
+                )
                 _ensure_column(
                     conn,
                     "conversation_templates",

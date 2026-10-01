@@ -129,9 +129,9 @@ def test_gate_off_zero_transport(monkeypatch):
 
 
 def test_lane_gate_independent_of_intent_gate(monkeypatch):
-    """QA 车道闸与 BOK_LAYA_JUDGE 独立：意图闸默认关时 QA 车道照常打判定。"""
+    """QA 车道闸与 BOK_LAYA_JUDGE 独立：意图闸显式关（env 清空）时 QA 车道照常打判定。"""
     monkeypatch.setenv("BOK_LAYA_QA", "1")
-    monkeypatch.delenv("BOK_LAYA_JUDGE", raising=False)  # 意图车道默认关
+    monkeypatch.delenv("BOK_LAYA_JUDGE", raising=False)  # 意图车道显式清空（不再默认关）
     fake = _FakeSidecar(decide=_decide_response("qa_00", 0.93))
     res = asyncio.run(decide_qa_match(["客户原话：x"], _entries(2), client=fake))
     assert res["verdict"] == "hit"

@@ -323,8 +323,11 @@ def test_knowledge_delete_removes_vault_file_and_does_not_resurrect(tmp_path, mo
         assert not any(str(d.get("path", "")).endswith("del-me.md") for d in after)
 
 
-def test_supervisor_pause_resume_roundtrip():
+def test_supervisor_pause_resume_roundtrip(monkeypatch):
     """主管台暂停/恢复要真实改通话状态（agent 轮询到后生效）。"""
+    # 本用例钉的是监督/暂停链路，与被测无关的「实时通话强绑话术模板」闸关掉，
+    # 保持隔离（模板闸自身契约见 test_template_gate.py）。
+    monkeypatch.setenv("BOK_REQUIRE_TEMPLATE", "0")
     with TestClient(app) as client:
         created = client.post(
             "/api/calls",
@@ -446,13 +449,15 @@ def test_setup_status_reports_model_readiness():
             assert set(["name", "repo", "present", "required"]).issubset(m.keys())
 
 
-def test_concurrent_add_turns_no_silent_loss():
+def test_concurrent_add_turns_no_silent_loss(monkeypatch):
     """并发 add_turn 不得静默丢数据（QA 压测 P1：旧 len 序号竞态 30 并发丢 30-37%）。
 
     turn_id 已改 uuid：30 线程并发写同一 call，须全部落库且响应全 200 无 duplicate。
     """
     import concurrent.futures
 
+    # 本用例钉的是并发写轮次，同为隔离关掉实时通话强绑模板闸。
+    monkeypatch.setenv("BOK_REQUIRE_TEMPLATE", "0")
     with TestClient(app) as client:
         call = client.post(
             "/api/calls",

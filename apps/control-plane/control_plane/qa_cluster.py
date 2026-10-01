@@ -32,8 +32,9 @@ from bok_voice_core.qa_cluster import (  # noqa: F401  (_CLUSTER_SYSTEM_PROMPT r
     parse_llm_decisions,
     plan_cluster,
 )
-from bok_voice_core.qa_text import mine_qa_pairs
+from bok_voice_core.qa_text import mine_qa_pairs, normalize_question
 
+from . import hotword_mining
 from .auth import current_identity
 from .deps import read_model_routing_raw
 
@@ -121,7 +122,10 @@ def _llm_chat(
             {"role": "user", "content": user},
         ],
         "temperature": 0,
-        "max_tokens": 4096,
+        # 4096→2048（2026-09-28 车道干扰审计）：决策输出实测数百 token,4096 只是
+        # 头皮余量;这个调用是 :1235 单闸后台侧最长持有者,钳半最坏情况。截断的
+        # 失败形态=JSON 解析失败→该账号 error 隔离（digest errors.append）,安全。
+        "max_tokens": 2048,
         "stream": False,
     }
     if enable_thinking:
@@ -169,11 +173,68 @@ def has_fresh_plan(account_id: str, min_calls: int, limit: int) -> bool:
     return _plan_cache_get(account_id, min_calls, limit) is not None
 
 
-def _compute_plan(repo: Any, account_id: str, min_calls: int, limit: int) -> dict:
+def _compute_hotwords(
+    repo: Any,
+    account_id: str,
+    conversations: list[list[dict]],
+    existing_rows: list[dict],
+    base_url: str,
+    model: str,
+    api_key: str,
+    thinking: bool,
+) -> dict:
+    """同一份对话扫描上挖 ASR 热词候选（零额外 I/O），同一 mining 车道 LLM 单次批量判定。
+
+    existing_words=两级热词行（含停用）避重复提议；existing_q_norms=qa 词条归一后
+    问法集（gap_ngram 覆盖排除，与 gap_mining 同源 normalize_question）。候选空=
+    零 LLM 调用直接空段。LLM 失败照 qa 聚类口径 503（同车道同服务器，不静默吞）。
+    """
+    existing_words = [
+        str(r.get("word") or "") for r in repo.list_hotword_entries(account_id, enabled=None)
+    ]
+    existing_q_norms = {
+        normalize_question(str(r.get("question_text") or ""))
+        for r in existing_rows or []
+        if str(r.get("question_text") or "").strip()
+    }
+    candidates = hotword_mining.extract_hotword_candidates(
+        conversations, existing_words, existing_q_norms
+    )
+    if not candidates:
+        return hotword_mining.build_hotword_section([], {})
+    message = hotword_mining.build_hotword_messages(candidates)
+    try:
+        text = _llm_chat(
+            base_url,
+            model,
+            hotword_mining._HOTWORD_SYSTEM_PROMPT,
+            message,
+            api_key=api_key,
+            enable_thinking=thinking,
+        )
+    except Exception as exc:  # noqa: BLE001 - 网络/解析失败统一 503 带原因
+        raise ClusterError(f"hotword llm 请求失败: {exc!r}") from exc
+    return hotword_mining.build_hotword_section(
+        candidates, hotword_mining.parse_hotword_plan(text)
+    )
+
+
+def _compute_plan(
+    repo: Any,
+    account_id: str,
+    min_calls: int,
+    limit: int,
+    *,
+    with_hotwords: bool = False,
+) -> dict:
     """挖掘→分语言 LLM 聚类→三列计划(junk 转 {row,reason} 便于 JSON 出仓)。
 
     词条清单=账号全量(owner_scope=None 无 owner 过滤,机器/管理口径)——variant
     只拷贝 answer_text,对目标词条无运行时依赖(任务书探针结论)。
+
+    with_hotwords=True 时在**同一份 conversations** 上追加 hotwords 段（零额外
+    扫描；供 POST /api/qa/cluster dry 计划用）。默认 False=qa_digest 闲时循环复用
+    本内核时零行为/零 LLM 增量变化。
     """
     conversations = repo.iter_call_conversations(account_id, exclude_test_objects=True)
     pairs = mine_qa_pairs(conversations, min_calls=min_calls, limit=limit)
@@ -205,7 +266,7 @@ def _compute_plan(repo: Any, account_id: str, min_calls: int, limit: int) -> dic
         variants.extend(v)
         fresh.extend(f)
         junk.extend(j)
-    return {
+    plan = {
         "account_id": account_id,
         "min_calls": min_calls,
         "limit": limit,
@@ -220,6 +281,13 @@ def _compute_plan(repo: Any, account_id: str, min_calls: int, limit: int) -> dic
             "candidates": len(pairs),
         },
     }
+    if with_hotwords:
+        # 同一份 conversations 上追加热词段（零额外 I/O）；LLM 与 qa 聚类同车道。
+        plan["hotwords"] = _compute_hotwords(
+            repo, account_id, conversations, existing_rows,
+            base_url, model, api_key, thinking,
+        )
+    return plan
 
 
 class _SingleFlight:
@@ -248,7 +316,7 @@ def run_cluster(repo: Any, account_id: str, min_calls: int = 5, limit: int = 60)
         hit = _plan_cache_get(account_id, min_calls, limit)
         if hit is not None:
             return hit
-        plan = _compute_plan(repo, account_id, min_calls, limit)
+        plan = _compute_plan(repo, account_id, min_calls, limit, with_hotwords=True)
     _plan_cache[(account_id, min_calls, limit)] = (plan, time.time())
     return plan
 
@@ -301,6 +369,7 @@ def apply_cluster(
     account_id: str,
     plan: dict,
     select: list[dict] | None = None,
+    hotword_select: list[int] | None = None,
     *,
     audit: Callable[..., dict] | None = None,
 ) -> dict:
@@ -310,11 +379,20 @@ def apply_cluster(
     本账号;role==user → owner 强制本人;priority 钳制。每行审计 qa_entry.create,
     汇总审计 qa.cluster。采纳成功(created>0)后作废该账号 dry 缓存——已入库问法
     下次重算即 dup-existing,不再 offered(防 TTL 内重复采纳双写)。
+
+    hotword_select(EX-H1):dry 计划 hotwords.candidates 的下标;选中候选 upsert 进
+    `hotword_entries` 为**本账号行**(source=mined, freq 取计划值)——INSERT-or-UPDATE
+    在 UNIQUE(account_id, lang, word) 上,已启用且 freq 未增=幂等 no-op 不审计;
+    真写入(建行/复活/bump)每行审计 hotword.create(detail.source=qa-cluster,
+    detail.freq=计划值)。热词采纳成功与 qa 采纳同款作废 dry 缓存。
     """
     sel_v, sel_f = _select_rows(plan, select)
+    hw_rows = hotword_mining.select_hotword_rows(plan, hotword_select)
     with _SingleFlight():  # 创建段也单飞:并发 apply 双写 / dry 撞正在落库的计划都 409
         audit_fn = audit or (lambda **kw: {})
         ident = current_identity(request)
+        # 采纳归属:与 qa 行同款——user/admin 强制本账号;root/无身份按 cluster 账号。
+        owner_account = ident.account_id if (ident is not None and ident.role != "root") else account_id
         created = 0
         rows_payloads = [("variant", dict(p)) for p in sel_v] + [
             ("fresh", _fresh_payload(p, account_id)) for p in sel_f
@@ -334,12 +412,39 @@ def apply_cluster(
                 account_id=str(payload.get("account_id") or account_id),
                 detail={"owner_user_id": str(row.get("owner_user_id") or ""), "kind": kind},
             )
+        hotwords_created = 0
+        for cand in hw_rows:
+            freq = int(cand.get("freq") or 0)
+            res = repo.upsert_hotword_entry(
+                {
+                    "account_id": owner_account,
+                    "lang": str(cand.get("lang") or "zh"),
+                    "word": str(cand.get("word") or ""),
+                    "source": "mined",
+                    "enabled": True,
+                    "freq": freq,
+                }
+            )
+            if res.get("changed"):
+                hotwords_created += 1
+                audit_fn(
+                    "hotword.create",
+                    subject_type="hotword",
+                    subject_id=str(res.get("id") or ""),
+                    account_id=owner_account,
+                    detail={"source": "qa-cluster", "freq": freq},
+                )
         audit_fn(
             "qa.cluster",
             subject_type="qa_entry",
             account_id=account_id,
             detail={"variants": len(sel_v), "fresh": len(sel_f), "junk": len(plan.get("junk") or [])},
         )
-    if created > 0:
+    if created > 0 or hotwords_created > 0:
         _plan_cache_pop_account(account_id)
-    return {"created": created, "plan": plan, "model": str(plan.get("model") or "")}
+    return {
+        "created": created,
+        "hotwords_created": hotwords_created,
+        "plan": plan,
+        "model": str(plan.get("model") or ""),
+    }

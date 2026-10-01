@@ -91,7 +91,9 @@ def test_request_conn_options_defaults(monkeypatch):
     monkeypatch.delenv("LLM_REQUEST_TIMEOUT_S", raising=False)
     monkeypatch.delenv("LLM_REQUEST_RETRIES", raising=False)
     opts = MlxLlmLLM._request_conn_options()
-    assert opts.timeout == 8.0
+    # 8→22(2026-09-28 定时器普查):read-gap 粗后盾必须盖过冷/缓存失配 prefill
+    # p95=18.9s——8s 把「慢」误杀成「死」,drain/regen 143 次失败的主死因。
+    assert opts.timeout == 22.0
     assert opts.max_retry == 0  # 插件级重试归零:恢复交给兜底壳(有声、更快)
 
 

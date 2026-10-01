@@ -195,6 +195,65 @@ def test_final_quiet_gate_blocks_then_passes(monkeypatch):
     assert len(prewarm.calls) == 1
 
 
+def test_revision_advanced_since_snapshot_skips_fire():
+    """F6 稳定性门:快照后 context revision 已前进(换步/事实沉淀)→ 投机组的
+    user 段必与真请求分叉=白烧 GPU,直接跳过开火。"""
+
+    class _RevCtx:
+        def __init__(self):
+            self.revision = 3
+            self._tail = "【第1/5步】"
+
+        def render_context_tail(self) -> str:
+            return self._tail
+
+    async def run():
+        ctx = _RevCtx()
+        prewarm = _FakePrewarm()
+        spec = PrefillSpeculator(prewarm, ctx)
+        spec.on_request_messages([dict(m) for m in _REQ])
+        spec.on_reply_history_text("回复")
+        spec.set_busy(False)
+        spec._last_fire_ts = 0.0
+        spec._last_final_ts = 0.0
+        ctx.revision = 4  # 快照之后尾部 revision 前进
+        spec.on_stable_prefix("你好我想查下我個")
+        await asyncio.sleep(0)
+        return prewarm, spec
+
+    prewarm, spec = asyncio.run(run())
+    assert spec._task is None and not prewarm.calls, "revision 前进=投机尾部必分叉,不开火"
+
+
+def test_revision_unchanged_fires():
+    """F6 反向:revision 与快照一致 → 照常开火(ctx 暴露 revision 时门只拦变化轮)。"""
+
+    class _RevCtx:
+        def __init__(self):
+            self.revision = 3
+            self._tail = "【第1/5步】"
+
+        def render_context_tail(self) -> str:
+            return self._tail
+
+    async def run():
+        ctx = _RevCtx()
+        prewarm = _FakePrewarm()
+        spec = PrefillSpeculator(prewarm, ctx)
+        spec.on_request_messages([dict(m) for m in _REQ])
+        spec.on_reply_history_text("回复")
+        spec.set_busy(False)
+        spec._last_fire_ts = 0.0
+        spec._last_final_ts = 0.0
+        spec.on_stable_prefix("你好我想查下我個")
+        assert spec._task is not None
+        await spec._task
+        return prewarm
+
+    prewarm = asyncio.run(run())
+    assert len(prewarm.calls) == 1
+
+
 def test_new_turn_aborts_inflight():
     """FINAL 即断:在飞投机预热被 new_turn 取消——真回复要进 reply 车道,
     在飞预热(httpx 连接)即刻关闭,残余解码尾巴最小化。"""

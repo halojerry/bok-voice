@@ -64,9 +64,53 @@ def a_line_tags_supported(model: str) -> bool:
     return "2.8" in (model or "")
 
 
+# ---------------------------------------------------------------------------
+# 换气注入（2026-09-27，断句换气=真人感最大单点）：transform 流式统计句长，
+# 长句句界后自动补 (breath)。env 两键均进 _FORWARD_ENV（bok.py 白名单表）。
+# ---------------------------------------------------------------------------
+_BREATH_TAG = "(breath)"
+_SENT_END_RE = re.compile(r"[。！？!?]")
+
+
+def breath_inject_enabled() -> bool:
+    """换气注入总闸（默认开；关=只留 LLM 自发标记）。"""
+    return os.environ.get("BOK_BREATH_INJECT", "1") == "1"
+
+
+def _breath_min_sent_chars() -> int:
+    """触发阈值：句正文 ≥N 字（默认 20≈4s 语流）才在句界换气。"""
+    try:
+        return max(0, int(os.environ.get("BOK_BREATH_SENT_CHARS", "20")))
+    except Exception:  # noqa: BLE001 - 坏值回默认
+        return 20
+
+
+def _has_whitelist_tag(text: str) -> bool:
+    """文本中是否含白名单标记（_split_safe 的 hold 机制保证完整 token 落同一
+    emit，逐 emit 检查即跨句精确）。"""
+    for m in _PAREN_RE.finditer(text or ""):
+        if _norm_tag(m.group(1)) in VOICE_TAG_WHITELIST:
+            return True
+    return False
+
+
+def voice_style_enabled_for_model(model: str) -> bool:
+    """门（模型显式版）：装配点已知**实际合成模型**时用这把——这是规范入口。
+
+    勿对包裹后的 provider 探属性：生产装配链 MiniMax→FallbackAdapter→CachedTTS
+    →_FirstAudioTTS 的公开 `.model` 是插件名（"minimax-tts"），判 "2.8" 恒 False
+    → prompt 块永不注入 + 标记全剥，整条人感管线哑火（2026-09-27 实证根因；
+    test_voice_style_gate_wrapped_provider_regression 钉住）。"""
+    return env_gate_on() and a_line_tags_supported(str(model or ""))
+
+
 def voice_style_enabled_for_tts(tts_provider) -> bool:
-    """构造时解析实际合成模型（_model_override 优先于 env——persona 覆写 2.6
-    时门自动关，标记不会再被当文本念出）。读不到模型属性=按 env 默认档判。"""
+    """门（provider 探测版）：只在拿到裸 provider 时用；装配点应改用
+    voice_style_enabled_for_model（模型字符串从 _tts_primary.resolved_model()
+    单点取，见 agent.py 装配注释）。
+
+    _model_override 优先于 env——persona 覆写 2.6 时门自动关，标记不会再被
+    当文本念出。读不到模型属性=按 env 默认档判。"""
     model = ""
     fn = getattr(tts_provider, "_model", None)
     if callable(fn):
@@ -74,6 +118,13 @@ def voice_style_enabled_for_tts(tts_provider) -> bool:
             model = str(fn() or "")
         except Exception:  # noqa: BLE001 - 探测失败唔阻装配
             model = ""
+    if not model:
+        rf = getattr(tts_provider, "resolved_model", None)
+        if callable(rf):
+            try:
+                model = str(rf() or "")
+            except Exception:  # noqa: BLE001
+                model = ""
     if not model:
         model = getattr(tts_provider, "model", "") or ""
     if not model:
@@ -175,12 +226,54 @@ def _split_safe(buf: str, enabled: bool) -> tuple[str, str]:
 
 
 def make_tts_voice_style_transform(enabled: bool):
-    """工厂：门开=sanitize（保留白名单）；门关=全剥（2.6 回退档防线）。"""
+    """工厂：门开=sanitize（保留白名单）；门关=全剥（2.6 回退档防线）。
+
+    门开时叠加**换气注入**（2026-09-27，Ethan 拍板「断句换气最能体现真人感」）：
+    刚说完的句子够长（≥`BOK_BREATH_SENT_CHARS`，默认 20 字≈4s 语流）→ 在句界
+    后注入一枚 (breath)。约束：每条回复至多 1 枚（_transform 每次合成请求新建
+    =天然按回复重置）、该句已带白名单标记不重复注、回复尾界不注（没人换完气
+    就收线）。LLM 自发标记照旧（prompt 引导），这层是 4B 不听话时的保底。
+    `BOK_BREATH_INJECT=0` 关。"""
+    inject_on = enabled and breath_inject_enabled()
+    min_chars = _breath_min_sent_chars()
+
     async def _transform(chunks: AsyncIterable[str]):
         carry = ""
+        sent_chars = 0  # 当前句正文累计（跨块维护；空白不计）
+        sent_had_tag = False  # 当前句是否已带白名单标记（防双重换气，块粒度）
+        breath_used = False  # 每条回复至多一枚（_transform 每次合成请求新建）
+        pending = False  # 块尾句界待注：下一块有正文才落地（无下一块=收尾不注）
         async for chunk in chunks:
             buf = carry + str(chunk)
             carry = ""
+            if inject_on and pending and buf.lstrip():
+                i = len(buf) - len(buf.lstrip())
+                buf = buf[:i] + _BREATH_TAG + buf[i:]
+                pending = False
+                breath_used = True
+            if inject_on and not breath_used:
+                # 本块含白名单标记 → 保守抑制（LLM 已自发换气/标记，不叠注）；
+                # 先于扫描判（同块「标记+句界」也压得住）。
+                if _has_whitelist_tag(buf):
+                    sent_had_tag = True
+                # raw 层扫描（先于 split/sanitize）：句界原位插入，sanitize 对
+                # 白名单标记原位保留；块尾句界走 pending 延后（跨块/收尾两态）。
+                parts: list[str] = []
+                n = len(buf)
+                for idx, ch in enumerate(buf):
+                    parts.append(ch)
+                    if _SENT_END_RE.match(ch):
+                        if not breath_used and not sent_had_tag and sent_chars >= min_chars:
+                            if idx < n - 1:
+                                parts.append(_BREATH_TAG)
+                                breath_used = True
+                            else:
+                                pending = True
+                        sent_chars = 0
+                        sent_had_tag = False
+                    elif not ch.isspace():
+                        sent_chars += 1
+                buf = "".join(parts)
             out, carry = _split_safe(buf, enabled)
             if out:
                 yield out
@@ -189,6 +282,7 @@ def make_tts_voice_style_transform(enabled: bool):
             tail = fn(carry)
             if tail:
                 yield tail
+        # 块尾 pending 未落地=回复在句界收尾，不换气
     return _transform
 
 
@@ -200,10 +294,10 @@ def make_tts_voice_style_transform(enabled: bool):
 
 NATURALNESS_BLOCK = """【说话自然度】
 想让语气更像真人，可以遵守下面几条：
+- 讲完一个较长的句子、要接着讲下一句时，可以在句号后换一口气：加 (breath)，例如：「这个订单的赔付记录我帮您查过了。(breath)接下来给您讲三种方案。」。
 - 要查询或查找信息时，可以在句读之后加 (emm)，例如：「您稍等，(emm)我帮您查一下」。
 - 停顿标记 <#0.3#> 可以插在两个短句中间，例如：「您先别急<#0.3#>我马上帮您看」。
-- (breath) 表示换一口气，可以用在要展开较长解释之前。
-- 其余声音标记（如 (clear-throat)、(inhale)、(exhale)、(coughs)）不要主动使用。
+- (inhale) 用在开始回答一个较长问题之前；其余声音标记（如 (clear-throat)、(exhale)、(coughs)）不要主动使用。
 - 开场和应承可以换着说法，不要每轮同一句开头。
 - 说错了就直接重新说一遍正确的，不用道歉也不用解释。
-纪律：回复的第一个字之前不要放任何标记或停顿；每轮回复最多用 1 个标记，整通电话最多用 3 次；拿不准就不用；标记只是给语音系统的，客户听到的是自然的声音。"""
+纪律：回复的第一个字之前不要放任何标记或停顿；每轮回复最多用 2 个标记，其中换气 (breath) 优先；整通电话最多用 4 次；拿不准就不用；标记只是给语音系统的，客户听到的是自然的声音。"""

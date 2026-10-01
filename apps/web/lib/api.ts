@@ -180,7 +180,14 @@ export const api = {
   // 账号经 query 传（与 canned-status 同款 scoped_account 口径）。
   qaCluster: (
     accountId: string,
-    body: { min_calls?: number; limit?: number; apply?: boolean; select?: { kind: string; i: number }[] } = {},
+    body: {
+      min_calls?: number;
+      limit?: number;
+      apply?: boolean;
+      select?: { kind: string; i: number }[];
+      // 热词沉淀（EX-H1）：dry 计划 hotwords.candidates 的下标；采纳为本账号热词行。
+      hotword_select?: number[];
+    } = {},
   ) =>
     request<Record<string, unknown>>(`/api/qa/cluster?account_id=${encodeURIComponent(accountId)}`, {
       method: "POST",

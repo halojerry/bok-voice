@@ -70,7 +70,8 @@ def test_glossary_block_renders_and_caps():
 def test_asr_hotword_context_no_industry_words_for_bline(monkeypatch):
     monkeypatch.delenv("BOK_ASR_HOTWORDS", raising=False)
     ctx = asr_hotword_context("cantonese", None, extra_hotwords="順豐速運, 京東物流", include_industry=False)
-    assert ctx == "Vocabulary: 順豐速運, 京東物流"
+    # 标签已砍(2026-09-27 A/B,见 agent.py asr_hotword_context 注释)=裸逗号 join
+    assert ctx == "順豐速運, 京東物流"
     # include_industry=True(缺省,A 线)才带行业静态词——B 线不吃
     ctx_industry = asr_hotword_context("cantonese", None, extra_hotwords="順豐速運")
     assert "單號" in ctx_industry

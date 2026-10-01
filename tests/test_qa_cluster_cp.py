@@ -84,10 +84,17 @@ def _make(monkeypatch, users=()):
 
 
 def _fake_llm(monkeypatch, target_id: str, decisions: str | None = None):
-    """假 LLM:记录 user 消息条数;返回固定决策。"""
-    calls = {"chat": 0, "discover": 0, "messages": []}
+    """假 LLM:记录 user 消息条数;返回固定决策。
+
+    EX-H1:dry 计划同时挖热词,热词判定走同一 `_llm_chat`（不同 system 提示词）——
+    按 system 分流,热词调用单独计数并回空数组(本文件不考热词采纳;qa 断言口径不变)。
+    """
+    calls = {"chat": 0, "hotword": 0, "discover": 0, "messages": []}
 
     def fake_chat(base_url, model, system, user, **kw):
+        if "热词" in str(system or ""):
+            calls["hotword"] += 1
+            return "[]"
         calls["chat"] += 1
         calls["messages"].append(user)
         return decisions or (

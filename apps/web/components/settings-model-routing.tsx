@@ -6,7 +6,7 @@
 // 静态导出零动态段：预置名一律 encodeURIComponent 进 path/body（lib/api.ts 单点）。
 
 import { useCallback, useEffect, useState } from "react";
-import { api, type ModelRoutingLaneConfig } from "@/lib/api";
+import { api, apiBase, authHeaders, type ModelRoutingLaneConfig } from "@/lib/api";
 import { ErrorState } from "@/components/app-shell";
 import { useSession } from "@/components/session-context";
 import { friendlyErrorText } from "@/lib/api-ready";
@@ -63,6 +63,17 @@ function draftToPayload(d: LaneDraft) {
 }
 
 type TestState = { busy: boolean; text: string; bad: boolean };
+
+/** 车道中文名（结果面板提示用）。 */
+function laneLabel(key: string): string {
+  return LANES.find(([k]) => k === key)?.[1] ?? key;
+}
+
+/** 检测端点单条结果（GET /api/model-routing/detect 契约形状）。 */
+type DetectEndpoint = { base_url: string; ok: boolean; models: string[]; error: string };
+
+/** 结果面板每端点的填入选择（模型 + 目标车道），只在本地表单状态，不落库。 */
+type FillSel = { model: string; lane: string };
 
 const inputCls =
   "mt-1 w-full rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--live)";
@@ -165,6 +176,10 @@ export default function ModelRoutingCard() {
   const [saving, setSaving] = useState(false);
   const [presetBusy, setPresetBusy] = useState(false);
   const [tests, setTests] = useState<Record<string, TestState>>({});
+  const [detectBusy, setDetectBusy] = useState(false);
+  const [detectErr, setDetectErr] = useState("");
+  const [detectResult, setDetectResult] = useState<DetectEndpoint[] | null>(null);
+  const [fillSel, setFillSel] = useState<Record<string, FillSel>>({});
 
   const load = useCallback(async () => {
     try {
@@ -210,6 +225,41 @@ export default function ModelRoutingCard() {
     } finally {
       setSaving(false);
     }
+  }
+
+  /** 检测本地端点：回读可达端点+模型清单（只读，绝不落库）。 */
+  async function detectEndpoints() {
+    setDetectBusy(true);
+    setDetectErr("");
+    try {
+      const res = await fetch(`${apiBase()}/api/model-routing/detect`, { headers: authHeaders() });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      const data = (await res.json()) as { endpoints?: DetectEndpoint[] };
+      const eps = Array.isArray(data.endpoints) ? data.endpoints : [];
+      setDetectResult(eps);
+      // 每可达端点默认选第一个模型 + a_reply 车道（用户可改）。
+      const sel: Record<string, FillSel> = {};
+      for (const ep of eps) {
+        if (ep.ok) sel[ep.base_url] = { model: ep.models[0] ?? "", lane: "a_reply" };
+      }
+      setFillSel(sel);
+    } catch (e) {
+      setDetectErr(friendlyErrorText(String(e)));
+      setDetectResult(null);
+    } finally {
+      setDetectBusy(false);
+    }
+  }
+
+  /** 把检测到的端点+模型填进目标车道的本地表单草稿（用户核对后再保存）。 */
+  function fillLane(baseUrl: string) {
+    const sel = fillSel[baseUrl];
+    if (!sel) return;
+    patchLane(sel.lane, { provider: "local", base_url: baseUrl, model: sel.model });
+    setNote({
+      text: `已填入「${laneLabel(sel.lane)}」：${baseUrl}${sel.model ? ` · ${sel.model}` : ""}。核对后点「保存」生效（检测不落库）。`,
+      bad: false,
+    });
   }
 
   async function testLane(key: string) {
@@ -285,6 +335,9 @@ export default function ModelRoutingCard() {
     }
   }
 
+  const reachable = detectResult?.filter((ep) => ep.ok) ?? [];
+  const unreachable = detectResult?.filter((ep) => !ep.ok) ?? [];
+
   return (
     <section className="card">
       <div className="flex flex-wrap items-start justify-between gap-2">
@@ -295,10 +348,87 @@ export default function ModelRoutingCard() {
             改动下一通通话生效；本地引擎内换 model 仍需重启对应本地服务。
           </p>
         </div>
-        <button className="btn-primary shrink-0" disabled={saving || !lanes} onClick={save}>
-          {saving ? "保存中…" : "保存"}
-        </button>
+        <div className="flex shrink-0 items-center gap-2">
+          <button
+            className="btn-ghost"
+            disabled={detectBusy}
+            title="并行探本地端点 /v1/models，一键把 base_url+模型填入车道（不落库）"
+            onClick={() => void detectEndpoints()}
+          >
+            {detectBusy ? "检测中…" : "检测本地端点"}
+          </button>
+          <button className="btn-primary shrink-0" disabled={saving || !lanes} onClick={save}>
+            {saving ? "保存中…" : "保存"}
+          </button>
+        </div>
       </div>
+
+      {(detectBusy || detectErr || detectResult !== null) && (
+        <div className="mt-3 rounded-lg border border-(--card-border) p-3">
+          <span className="text-xs muted">本地端点检测</span>
+          {detectBusy && <p className="mt-1.5 text-[11px] muted">检测中…</p>}
+          {!detectBusy && detectErr && (
+            <p className="mt-1.5 text-[11px] text-red-600">{detectErr}</p>
+          )}
+          {!detectBusy && !detectErr && detectResult !== null && reachable.length === 0 && (
+            <p className="mt-1.5 text-[11px] muted">
+              未发现可达的本地端点。
+              {unreachable.length > 0 && ` 不可达: ${unreachable.map((ep) => ep.base_url).join("、")}`}
+            </p>
+          )}
+          {!detectBusy && !detectErr && reachable.length > 0 && (
+            <div className="mt-1.5 flex flex-col gap-1.5">
+              {reachable.map((ep) => {
+                const sel = fillSel[ep.base_url] ?? { model: "", lane: "a_reply" };
+                return (
+                  <div key={ep.base_url} className="flex flex-wrap items-center gap-2">
+                    <span className="font-mono text-[11px] break-all">{ep.base_url}</span>
+                    {ep.error === "auth" && <span className="text-[11px] muted">（需鉴权）</span>}
+                    <select
+                      className="select px-1.5 py-0.5 text-[11px]"
+                      value={sel.model}
+                      onChange={(e) =>
+                        setFillSel((cur) => ({ ...cur, [ep.base_url]: { ...sel, model: e.target.value } }))
+                      }
+                    >
+                      {ep.models.length === 0 && <option value="">（无模型清单）</option>}
+                      {ep.models.map((m) => (
+                        <option key={`${ep.base_url}:${m}`} value={m}>
+                          {m}
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      className="select px-1.5 py-0.5 text-[11px]"
+                      value={sel.lane}
+                      onChange={(e) =>
+                        setFillSel((cur) => ({ ...cur, [ep.base_url]: { ...sel, lane: e.target.value } }))
+                      }
+                    >
+                      {LANES.map(([k, l]) => (
+                        <option key={k} value={k}>
+                          {l}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      className="btn-ghost px-2 py-0.5 text-[11px]"
+                      onClick={() => fillLane(ep.base_url)}
+                    >
+                      填入
+                    </button>
+                  </div>
+                );
+              })}
+              {unreachable.length > 0 && (
+                <p className="text-[11px] muted">
+                  不可达: {unreachable.map((ep) => ep.base_url).join("、")}
+                </p>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {loadErr && <div className="mt-3"><ErrorState message={loadErr} /></div>}
 

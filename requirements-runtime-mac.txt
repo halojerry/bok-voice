@@ -21,3 +21,6 @@ sentencepiece>=0.2
 # QA 召回拼音通道(qa_gate.rank,2026-09-25):同音错字补位,纯 Python 零模型;
 # 缺库时通道静默降级 0 分(import 容错),与 apps/agent[livekit] extra 同步。
 pypinyin>=0.53,<1
+# kaldi fbank（FireRedVAD 试点可选 VAD，providers/firered_vad.py）：跨平台 wheel
+# （mac arm64/linux x86_64/win amd64），仅 BOK_VAD_PROVIDER=firered 时才 import。
+kaldi-native-fbank>=1.22,<2

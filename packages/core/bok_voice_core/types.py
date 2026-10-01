@@ -131,6 +131,8 @@ class ObjectProfile:
     courier: str = ""
     address: str = ""
     contact_channel: str = ""
+    # 发音词典（多行 `原词/读法`，空=默认读音；装配下发 MiniMax pronunciation_dict）。
+    pronunciation: str = ""
     template_id: str = ""
     status: str = "active"
 

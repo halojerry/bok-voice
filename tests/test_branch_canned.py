@@ -171,10 +171,11 @@ def test_funnel_block_position_and_wiring():
     assert 'os.environ.get("BOK_BRANCH_CANNED", "1") == "1"' in region  # 默认开
     assert "_branch_plan" in region  # A-②:罐头腿消费早段评估计划
     assert "action_enabled=False" in region  # BOK_BRANCH_ACTION=0 回退档=纯罐头腿
-    assert '_turn_origin["gen"] = "script"' in region
-    # M-1(2026-09-24 评审返工):罐头出声不再裸覆写 provider——同轮 graph-notify
-    # 打铃共存时合并归因,账本双标记俱在。
-    assert '"branch-canned+graph-notify"' in region
+    assert '_register_reply_lane(lane="branch-canned", text=_bc_resp)' in region
+    # M-1(2026-09-24 评审返工;EX-2 2026-09-28 泛化):罐头出声不再裸覆写 provider
+    # ——同轮 graph-notify 打铃共存时,notify 顺延槽在 item 消费点并归(取代手写
+    # "branch-canned+graph-notify" 特例;合并逻辑在 _consume_reply_ticket)。
+    assert 'provider = f"{_ticket.lane}+{_pending}"' in src
     assert "BRANCH_CANNED hit" in region
     assert "BRANCH_CANNED miss" in region  # 未物化落穿有日志
     assert "raise StopResponse()" in region

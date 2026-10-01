@@ -99,6 +99,14 @@ class _AcquireCtx:
         self._gate = gate
         self._lane = lane
         self.waited = 0.0
+        self._handed_off = False
+
+    def handoff(self) -> None:
+        """闸门所有权移交（2026-09-28 串行化修正）：释放点从「handler 返回」
+        移到「流耗尽/断连」。旧版 handler 在 `async with` 内 return
+        StreamingResponse——__aexit__ 在响应**头**发出时就放闸，decode 阶段
+        背景生成与实时回复并行抢 GPU，串行化名存实亡（实测复现）。"""
+        self._handed_off = True
 
     async def __aenter__(self) -> "_AcquireCtx":
         gate = self._gate
@@ -118,7 +126,8 @@ class _AcquireCtx:
         return self
 
     async def __aexit__(self, *exc) -> None:
-        self._gate.release()
+        if not self._handed_off:
+            self._gate.release()
 
 
 GATE = LaneGate(_CONCURRENCY)
@@ -140,6 +149,10 @@ async def _generate(request: Request):
     lane = "reply" if (request.headers.get("x-bok-lane") or "").strip() == "reply" else "bg"
     body = await request.body()
     async with _AcquireCtx(GATE, lane) as acq:
+        # W-GATE 观测(2026-09-27):每条生成请求过闸即打一行(含零等待快路径)——
+        # TTFT 分解要从日志面归因到「排队多少毫秒」,仅 >50ms 的旧行看不到快路
+        # 占比。一行一 print,不改闸语义(单并发+reply 插队照旧)。
+        print(f"GATE lane={lane} waited_ms={acq.waited * 1000:.0f} active={GATE._active}", flush=True)
         if acq.waited > 0.05:
             print(
                 f"[llm-queue] lane={lane} waited={acq.waited * 1000:.0f}ms "
@@ -153,14 +166,25 @@ async def _generate(request: Request):
         }
         req = _client().build_request("POST", request.url.path, content=body, headers=fwd_headers)
         upstream = await _client().send(req, stream=True)
+        acq.handoff()  # 释放点移交：流耗尽/断连时在 _relay finally 放闸
+
+        async def _relay():
+            try:
+                async for chunk in upstream.aiter_raw():
+                    yield chunk
+            finally:
+                # 先放闸再断连：下一个请求可立刻起跑；aclose 令上游侧
+                # （mlx_lm 检测断连中止解码）尽快回收 GPU。
+                GATE.release()
+                await upstream.aclose()
+
         return StreamingResponse(
-            upstream.aiter_raw(),
+            _relay(),
             status_code=upstream.status_code,
             headers={
                 "content-type": upstream.headers.get("content-type", "application/json"),
                 "x-bok-queue-waited-ms": f"{acq.waited * 1000:.0f}",
             },
-            background=BackgroundTask(upstream.aclose),
         )
 
 

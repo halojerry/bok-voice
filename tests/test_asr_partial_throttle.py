@@ -73,9 +73,9 @@ def test_finish_sets_partials_done_and_partial_skips_decode(monkeypatch):
 
     sid = svc.start(language="cantonese")
     assert svc._sessions[sid]["partials_done"] is False  # start 重置
-    # 一窗正常 partial(2s > 0.6s 起步阈值,last_partial_at 清零强制推理)。
+    # 一窗正常 partial(3s > 2.0s 整句解码门=增量直转域;last_partial_at 清零强制推理)。
     svc._sessions[sid]["last_partial_at"] = 0.0
-    out = svc.chunk(sid, VOICED * 32000)
+    out = svc.chunk(sid, VOICED * 48000)
     assert out["partial"] is True and out["text"] == PARTIAL_TEXT
     assert len(model.calls) == 1
 

@@ -55,6 +55,33 @@ def _has_word_char(text: str) -> bool:
     return _WORD_CHAR_RE.search(text or "") is not None
 
 
+# 长文拆句护栏（2026-09-28）：句末/句中标点（含逗号级）保标点切分；无标点长串硬切。
+_SENT_SPLIT_RE = re.compile(r"[^。！？!?；;，、\n]+[。！？!?；;，、\n]?|\n")
+
+
+def _split_long_text(text: str, max_chars: int) -> list[str]:
+    """把长文按句界拆成 ≤max_chars 的子段（保标点），无界可切时硬切。"""
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return [text] if text else []
+    parts: list[str] = []
+    buf = ""
+    for m in _SENT_SPLIT_RE.finditer(text):
+        seg = m.group(0)
+        if not seg.strip():
+            continue
+        if buf and len(buf) + len(seg) > max_chars:
+            parts.append(buf)
+            buf = seg
+        else:
+            buf += seg
+        while len(buf) > max_chars:  # 无标点长串（号码/纯数字行）硬切
+            parts.append(buf[:max_chars])
+            buf = buf[max_chars:]
+    if buf.strip():
+        parts.append(buf)
+    return parts or [text]
+
 
 class TTSService:
     def __init__(self) -> None:
@@ -446,6 +473,39 @@ class TTSService:
         self.ensure_loaded()
         if not text:
             return
+        # 长文拆句护栏（2026-09-28 生产事故防御）：单任务长文本（>N 字）会触发
+        # (1) 语速漂移（社区 torch 后端 +16.7% 实证；mlx ICL 机制不同但长文
+        # 加速同族）+ (2) 客户端 QWEN3_TTS_MAX_TASK_AUDIO_SEC 15s cap 拦腰截断
+        # （实测 91 字整段第 4 句 4.14s→1.52s）。按句界拆成 ≤N 字子段依次合成、
+        # 段间 120ms 静音拼接——流式语义不变，任何调用方直发长文都安全。
+        # QWEN3_TTS_SPLIT_MAX_CHARS=0 关。
+        try:
+            split_max = int(os.environ.get("QWEN3_TTS_SPLIT_MAX_CHARS", "60"))
+        except ValueError:  # pragma: no cover - 配错当默认
+            split_max = 60
+        if split_max > 0 and len(text) > split_max:
+            sub_texts = _split_long_text(text, split_max)
+            if len(sub_texts) > 1:
+                gap = np.zeros(int(SAMPLE_RATE * 0.12) * 2, dtype=np.int16).tobytes()
+                emitted = False
+                for i, sub in enumerate(sub_texts):
+                    for is_first, frame in self.synthesize_chunks(
+                        text=sub,
+                        language=language,
+                        voice=voice,
+                        instruct=instruct,
+                        sample_rate=sample_rate,
+                        chunk_ms=chunk_ms,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_k=top_k,
+                    ):
+                        yield (not emitted, frame)
+                        emitted = True
+                    if i < len(sub_texts) - 1:
+                        for off in range(0, len(gap), int(sample_rate * chunk_ms / 1000) * 2):
+                            yield (False, gap[off : off + int(sample_rate * chunk_ms / 1000) * 2])
+                return
         if BACKEND == "mlx":
             yield from self._synthesize_mlx_stream(
                 text=text,

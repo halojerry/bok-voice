@@ -7,11 +7,11 @@
 --   schema 唯一真源 = packages/business-db ORM 模型 + deps.build_engine() 的幂等迁移;
 --   **改表后必须重跑本脚本重新生成**,再应用到 Supabase。
 --
--- 生成日期: 2026-09-26
+-- 生成日期: 2026-09-27
 -- 源镜像:   pgvector/pgvector:pg16
 -- 源命令:   docker exec pg-ddl pg_dump -U postgres --schema-only --no-owner --no-privileges postgres
 -- 回环校验: pgvector/pgvector:pg16 上应用本文件 + 重跑 build_engine() = 零 DDL 变更(生成时实测)
--- 规模:     CREATE TABLE 27 张 / CREATE INDEX 39 条 / 数据语句 0 条
+-- 规模:     CREATE TABLE 29 张 / CREATE INDEX 39 条 / 数据语句 0 条
 --           (--schema-only:正常应 0 条数据语句;带 DEFAULT/COMMENT 属 schema 本身)
 --
 -- 目标: 全新 Supabase(Postgres)项目首次引导。应用方式(Main 线程):
@@ -400,7 +400,8 @@ CREATE TABLE public.object_profiles (
     contact_channel character varying(32) NOT NULL,
     digest text NOT NULL,
     template_id character varying(64) NOT NULL,
-    status character varying(32) NOT NULL
+    status character varying(32) NOT NULL,
+    pronunciation text DEFAULT ''::text
 );
 
 
@@ -447,6 +448,23 @@ CREATE TABLE public.persona_profiles (
 
 
 --
+-- Name: qa_digest_runs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.qa_digest_runs (
+    id character varying(64) NOT NULL,
+    started_at character varying(32) DEFAULT ''::character varying NOT NULL,
+    finished_at character varying(32) DEFAULT ''::character varying NOT NULL,
+    adopted_variant integer DEFAULT 0 NOT NULL,
+    adopted_fresh integer DEFAULT 0 NOT NULL,
+    disabled integer DEFAULT 0 NOT NULL,
+    homophones integer DEFAULT 0 NOT NULL,
+    pregen integer DEFAULT 0 NOT NULL,
+    error text DEFAULT ''::text NOT NULL
+);
+
+
+--
 -- Name: qa_entries; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -466,7 +484,21 @@ CREATE TABLE public.qa_entries (
     cluster_head_id character varying(64) NOT NULL,
     priority integer DEFAULT 10 NOT NULL,
     template_id character varying(64) NOT NULL,
-    created_at timestamp without time zone NOT NULL
+    created_at timestamp without time zone NOT NULL,
+    hit_threshold double precision
+);
+
+
+--
+-- Name: qa_homophones; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.qa_homophones (
+    wrong character varying(255) NOT NULL,
+    "right" character varying(255) NOT NULL,
+    support integer DEFAULT 0 NOT NULL,
+    source character varying(32) DEFAULT 'auto'::character varying NOT NULL,
+    created_at character varying(32) DEFAULT ''::character varying NOT NULL
 );
 
 
@@ -752,11 +784,27 @@ ALTER TABLE ONLY public.persona_profiles
 
 
 --
+-- Name: qa_digest_runs qa_digest_runs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.qa_digest_runs
+    ADD CONSTRAINT qa_digest_runs_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: qa_entries qa_entries_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.qa_entries
     ADD CONSTRAINT qa_entries_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: qa_homophones qa_homophones_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.qa_homophones
+    ADD CONSTRAINT qa_homophones_pkey PRIMARY KEY (wrong, "right");
 
 
 --

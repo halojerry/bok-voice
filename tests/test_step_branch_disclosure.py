@@ -194,6 +194,10 @@ def test_vars_rendered_in_branch_response():
     fc = FlowController.from_template(_tpl(ref), {"聯絡方式": "微信"})
     fc.current = 0
     fc.opening_played = True
+    # 渐进披露：先走一次首轮渲染（底稿入对话史），下一轮才进分支模式——
+    # 原版此测没走首轮渲染，断言的「微信号码」其实来自步骤纪律块的括注
+    # （2026-09-28 手术②上移前缀后假绿暴露），修成真测分支渲染路径。
+    fc.current_step_text()
     fc.last_verdict = "question"
     fc.last_user_text = "怎么联系你们"
     text = fc.current_step_text()
