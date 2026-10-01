@@ -7994,11 +7994,20 @@ def run_agent() -> None:
     # 按 min(cpu, 4) 预 fork 空闲子进程,本机 12 空闲子进程 ≈3.1GB(常驻内存大
     # 头/swap 压力源);A 线通话=每通起 job 子进程,空闲池只服务「预热」,1 个
     # 足够覆盖派单间隙。不做 env 旋钮——纯资源参数,回滚=删本行。
+    #
+    # load_threshold 0.99(2026-10-02 FLOW20 全哑根修):livekit 缺省(prod)0.7 的
+    # load=**整机** psutil.cpu_percent(worker.py/hw/cpu.py:37)——共享机上桌面/
+    # 探针预合成把整机顶过 0.7 → worker 自封 unavailable → LiveKit「no worker
+    # is available」→ 通话空房全哑(call-329affc6 20/20 哑实证)。它量错了信号
+    # (该量 worker 容量,实量整机噪音);真正的容量门=BOK_MAX_ACTIVE_CALLS 并发
+    # 闸+饥荒准入(量真实 TTFT EMA)。prod 校验拒 >1,0.99=仅整机近全饱和才拒。
+    # env BOK_WORKER_LOAD_THRESHOLD 可调(生产专用节点想保守可回 0.7)。
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
             agent_name="bok-voice",
             port=_worker_port,
             num_idle_processes=1,
+            load_threshold=float(os.environ.get("BOK_WORKER_LOAD_THRESHOLD", "0.99") or 0.99),
         )
     )

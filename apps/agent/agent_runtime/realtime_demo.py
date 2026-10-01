@@ -310,6 +310,8 @@ def run_realtime_demo() -> None:
             # （本机 3 worker=12 个 idle 吃 ~3.1GB）。演示档几乎不常开，1 个足够
             # 兜冷启动；框架无 env 旋钮，只能 WorkerOptions 传参（2026-10-02 内存瘦身）。
             num_idle_processes=1,
+            # load=整机 psutil.cpu_percent（见 agent.py 同款注释）。0.99 同修。
+            load_threshold=float(os.environ.get("BOK_WORKER_LOAD_THRESHOLD", "0.99") or 0.99),
         )
     )
 

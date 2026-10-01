@@ -316,8 +316,9 @@ def test_app_source_gate_pins():
 
 
 def test_worker_idle_pool_pinned_to_one():
-    """两入口 WorkerOptions 显式 num_idle_processes=1（框架缺省 prod=min(cpu,4)）。"""
+    """三入口 WorkerOptions 显式 num_idle_processes=1（框架缺省 prod=min(cpu,4)）。"""
     for rel in (
+        "apps/agent/agent_runtime/agent.py",
         "apps/agent/agent_runtime/interpret.py",
         "apps/agent/agent_runtime/realtime_demo.py",
     ):
@@ -325,3 +326,18 @@ def test_worker_idle_pool_pinned_to_one():
         anchor = src.index("cli.run_app(")
         window = src[anchor : anchor + 1200]
         assert "num_idle_processes=1" in window, rel
+
+
+def test_worker_load_threshold_pinned_high():
+    """三入口 load_threshold 钉 0.99（第十七波 FLOW20 全哑根修：livekit load=
+    整机 psutil.cpu_percent，共享机 0.7 缺省=桌面噪音拒派空房全哑）。
+    BOK_WORKER_LOAD_THRESHOLD env 可调，源级 pin 防重构静默回缺省。"""
+    for rel in (
+        "apps/agent/agent_runtime/agent.py",
+        "apps/agent/agent_runtime/interpret.py",
+        "apps/agent/agent_runtime/realtime_demo.py",
+    ):
+        src = (ROOT / rel).read_text(encoding="utf-8")
+        anchor = src.index("cli.run_app(")
+        window = src[anchor : anchor + 1400]
+        assert 'os.environ.get("BOK_WORKER_LOAD_THRESHOLD", "0.99")' in window, rel

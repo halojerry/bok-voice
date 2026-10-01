@@ -2051,6 +2051,10 @@ _FORWARD_ENV = (
     # 晚到补答去重(第十七波):交付前与已交付文本比相似度(阈值沿用
     # BOK_REPEAT_CROSS_TURN_SIM);="0" 跳过比对回旧行为。
     "BOK_LATE_ANSWER_DEDUP",
+    # worker 容量阈值(第十七波 FLOW20 全哑根修):livekit load=整机 psutil
+    # cpu_percent,共享机桌面噪音过 0.7 线=拒派空房全哑;钉 0.99 仅近全饱和才拒,
+    # 生产专用节点想保守可设回 0.7。
+    "BOK_WORKER_LOAD_THRESHOLD",
     "BOK_FILLER_GAP_MS",
     "BOK_FILLER_CHAIN",
     "BOK_FILLER_MAX",

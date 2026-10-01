@@ -1481,6 +1481,9 @@ def run_interpreter() -> None:
             # （本机 3 worker=12 个 idle 吃 ~3.1GB）。B 线通话量低，1 个足够兜
             # 冷启动；框架无 env 旋钮，只能 WorkerOptions 传参（2026-10-02 内存瘦身）。
             num_idle_processes=1,
+            # load=整机 psutil.cpu_percent（见 agent.py 同款注释；B 线同暴露:
+            # 共享机桌面噪音→0.7 线拒派=空房全哑）。0.99 仅整机近全饱和才拒。
+            load_threshold=float(os.environ.get("BOK_WORKER_LOAD_THRESHOLD", "0.99") or 0.99),
         )
     )
 
