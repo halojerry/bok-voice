@@ -5,10 +5,12 @@
   状态未知（None）**跳过**回收并审计 `reaper.skip`；确认空房才置 ENDED 且用
   `disposition='reaped'`（与客户真挂断区分）。旧版任何异常=可回收
   （dispatch_list_failed 628× / ≥52 通 active 被误杀，与真挂断不可分）。
-- TASK 3：`_create_call_in` 建单前闸——活通话数达 BOK_MAX_ACTIVE_CALLS（默认 2，
-  2026-10-01 实测诚实上限收紧；3 通从未验证全质量）
+- TASK 3：`_create_call_in` 建单前闸——活通话数达容量准入上限（缺省=capacity.py
+  动态档，mac 档 ceiling=2，2026-10-01 实测诚实上限；显式 BOK_MAX_ACTIVE_CALLS=
+  legacy 钉死，0/负=不限）
   → 409 `call.reject_concurrency`；同 object_id 已有活通话 → 409 `call.reject_duplicate`。
-  （单机单并发 LLM：2 通降级可服务、6 通 Metal OOM，reports/mac-concurrency-2026-09-24。）
+  （单机单并发 LLM：2 通降级可服务、6 通 Metal OOM，reports/mac-concurrency-2026-09-24。
+  公式/clamp/探测数学由 tests/test_capacity_admission.py 钉，本文件钉闸口消费语义。）
 
 测试全部走内存仓 + TestClient / AsyncMock，不连真 LiveKit。
 """
@@ -142,12 +144,19 @@ def test_create_call_rejected_at_concurrency_limit(monkeypatch):
 
 
 def test_create_call_passes_below_concurrency_limit(monkeypatch):
-    """未超上限照建（默认 2——2026-10-01 实测诚实上限,建 2 通全过）。"""
+    """未超上限照建（缺省档=capacity 动态；mac 内存充裕时 clamp 到 ceiling 2）。
+
+    公式/clamp/探测数学由 tests/test_capacity_admission.py 钉；这里把快照钉成
+    确定值，只钉闸口消费语义（不依赖测试机真实内存）。
+    """
     client, repo, _audits = _client_and_repo(monkeypatch)
     monkeypatch.delenv("BOK_MAX_ACTIVE_CALLS", raising=False)
     monkeypatch.setenv("BOK_REQUIRE_TEMPLATE", "0")
+    monkeypatch.setattr(cp_main, "capacity_snapshot", lambda: {
+        "max": 2, "profile": "mac", "floor": 1, "computed": 2, "ceiling": 2,
+        "free_gb": 10.0, "legacy": False,
+    })
     try:
-        assert cp_main._max_active_calls_env() == 2  # 缺省收紧 3→2 的源级钉
         for _ in range(2):
             r = client.post("/api/calls", json={"account_id": "acc-001", "mode": "live"})
             assert r.status_code == 200, r.text
