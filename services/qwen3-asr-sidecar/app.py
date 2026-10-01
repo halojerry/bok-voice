@@ -340,8 +340,9 @@ class ASRService:
         self._model: Any | None = None
         self._sessions: dict[str, dict[str, Any]] = {}
         self._load_error: str | None = None
-        # P1 SV-CPU 引擎:识别器懒加载单例(None=未加载;首次 sensevoice 会话触发)。
-        self._sv: Any | None = None
+        # P1 SV-CPU 引擎:按语言键缓存的识别器表(空表=未加载;首次 sensevoice
+        # 会话按钉定语言触发懒加载)。
+        self._sv_models: dict[str, Any] = {}
 
     def _sweep_sessions(self, now: float | None = None) -> None:
         """过期/超量会话清扫:TTL 到期先清,总量超限再按 created_at 清最旧。
@@ -507,29 +508,50 @@ class ASRService:
 
     # ---- P1 SV-CPU 引擎(CPU 耳朵):识别器懒加载 + 滑窗 partial + finish ----
 
-    def _sv_model(self):
-        """SenseVoice 识别器单例(sherpa-onnx OfflineRecognizer, int8, CPU)。"""
-        if self._sv is None:
-            import sherpa_onnx
+    def _sv_model(self, lang_key: str = "auto"):
+        """SenseVoice 识别器缓存(按语言键):auto/zh/en/yue 各一份懒加载。
 
-            d = Path(SV_MODEL_DIR)
-            self._sv = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-                model=str(d / "model.int8.onnx"),
-                tokens=str(d / "tokens.txt"),
-                use_itn=True,
-                language=SV_LANGUAGE,
-                num_threads=int(os.environ.get("QWEN3_ASR_SV_THREADS", "2")),
-            )
+        实弹勘误(2026-10-01 soak 首跑):auto 档把粤语短句听成日语(「おへ君か」)
+        ——识别器 language 是构造期参数,按会话钉定语言各建一份(cantonese→yue),
+        内存 ~4×230MB 纯 RAM(CPU)可承受;auto 仅兜未钉语言。"""
+        key = lang_key if lang_key in ("auto", "zh", "en", "ja", "ko", "yue") else "auto"
+        cached = self._sv_models.get(key)
+        if cached is not None:
+            return cached
+        import sherpa_onnx
+
+        d = Path(SV_MODEL_DIR)
+        rec = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+            model=str(d / "model.int8.onnx"),
+            tokens=str(d / "tokens.txt"),
+            use_itn=True,
+            language=key,
+            num_threads=int(os.environ.get("QWEN3_ASR_SV_THREADS", "2")),
+        )
+        if not self._sv_models:
             print(
                 f"[qwen3-asr] sensevoice engine ready dir={SV_MODEL_DIR} "
-                f"lang={SV_LANGUAGE} (cpu)",
+                f"first_lang={key} (cpu)",
                 flush=True,
             )
-        return self._sv
+        self._sv_models[key] = rec
+        return rec
 
-    def _sv_decode(self, pcm: bytes) -> str:
+    @staticmethod
+    def _sv_lang_key(session_lang: str) -> str:
+        """会话语言 → SenseVoice 识别器语言键(缺省 auto)。"""
+        s = str(session_lang or "").strip().lower()
+        if s in ("cantonese", "yue", "粵", "粤"):
+            return "yue"
+        if s in ("zh", "chinese", "mandarin"):
+            return "zh"
+        if s in ("en", "english"):
+            return "en"
+        return SV_LANGUAGE if SV_LANGUAGE in ("auto", "zh", "en", "ja", "ko", "yue") else "auto"
+
+    def _sv_decode(self, pcm: bytes, session_lang: str = "") -> str:
         x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-        rec = self._sv_model()
+        rec = self._sv_model(self._sv_lang_key(session_lang))
         stream = rec.create_stream()
         stream.accept_waveform(sample_rate=SAMPLE_RATE, waveform=x)
         rec.decode_stream(stream)
@@ -564,7 +586,7 @@ class ASRService:
             capped = dur_sec > PARTIAL_MAX_SEC
             if capped:
                 pcm = pcm[-int(PARTIAL_MAX_SEC * SAMPLE_RATE) * 2 :]
-            text = self._sv_decode(pcm)
+            text = self._sv_decode(pcm, session.get("language"))
             session["partial_prev_text"] = str(session.get("partial_text") or "")
             session["partial_text"] = text
             session["partial_lang"] = _sv_lang_label(session.get("language")) or _fallback_language(text)
@@ -579,7 +601,7 @@ class ASRService:
     def _finish_sv(self, session: dict, pcm: bytes) -> dict[str, Any]:
         """SV finish:整段全量解码(45ms 级,无需增量/置信度加菜);语言标签由会话
         钉定语言映射(与 Qwen3 路径的 language 契约一致)。"""
-        text = self._sv_decode(pcm)
+        text = self._sv_decode(pcm, session.get("language"))
         language = _sv_lang_label(session.get("language")) or _fallback_language(text)
         return {"text": text, "language": language, "partial": False}
 

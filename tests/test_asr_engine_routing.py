@@ -134,7 +134,7 @@ def test_partial_sv_writes_ledger_fields(monkeypatch, tmp_path):
     _fake_sv_dir(monkeypatch, mod, tmp_path)
     fake = _FakeSVRec("你好嗎")
     svc = mod.ASRService()
-    svc._sv = fake
+    svc._sv_models = {k: fake for k in ("auto", "zh", "en", "ja", "ko", "yue")}
     sid = svc.start(language="cantonese", engine="sensevoice", partial_ms="1")
     s = svc._sessions[sid]
     out = svc.chunk(sid, _voiced_pcm(1.5))
@@ -155,7 +155,7 @@ def test_partial_sv_final_stops_and_busy_lock(monkeypatch, tmp_path):
     _fake_sv_dir(monkeypatch, mod, tmp_path)
     fake = _FakeSVRec("锁测试")
     svc = mod.ASRService()
-    svc._sv = fake
+    svc._sv_models = {k: fake for k in ("auto", "zh", "en", "ja", "ko", "yue")}
     sid = svc.start(language="zh", engine="sensevoice")
     s = svc._sessions[sid]
     s["partials_done"] = True
@@ -178,7 +178,7 @@ def test_finish_sv_full_decode_and_language_label(monkeypatch, tmp_path):
     _fake_sv_dir(monkeypatch, mod, tmp_path)
     fake = _FakeSVRec("我嘅 WhatsApp 係六六九九四五")
     svc = mod.ASRService()
-    svc._sv = fake
+    svc._sv_models = {k: fake for k in ("auto", "zh", "en", "ja", "ko", "yue")}
     sid = svc.start(language="cantonese", engine="sensevoice")
     svc._sessions[sid]["chunks"].extend(_voiced_pcm(2.0))
     out = svc.finish(sid)
