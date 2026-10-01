@@ -18,14 +18,14 @@ import wave
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from bok_voice_core.flow_graph import validate_flow_graph
 from bok_voice_core.intent_rules import validate_conditions
@@ -95,6 +95,7 @@ from . import qa_cluster as qa_cluster_mod
 from . import hotword_mining
 from . import gap_mining
 from . import gap_proposals
+from . import ops_metrics
 from . import qa_digest as qa_digest_mod
 from . import qa_drift
 from . import silence_poke
@@ -596,6 +597,18 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
 
+# ---- 容灾波（feat/dr-observability 契约 §3）：饥荒状态读面 + 转换审计钩子 ----
+# CP 单一真源=ops_metrics.store()（滚动窗+迟滞状态机，DR 波 B 路）。转换审计经钩子
+# 动态查本模块全局 `_audit`（lambda 体在调用时解析名字）——测试 monkeypatch
+# cp_main._audit 照常拦截；钩子内异常由 ops_metrics 吞掉，不破状态机。
+ops_metrics.store().set_audit_hook(lambda action, detail: _audit(action, detail=detail))
+
+
+def _famine_downgraded() -> bool:
+    """当前是否已降档（读时惰性评估状态机；settings overlay 判定用，契约 §3）。"""
+    return bool(ops_metrics.store().famine_view()["downgraded"])
+
+
 @app.get("/health")
 def health() -> dict:
     return {"ok": True, "service": "bok-voice-control-plane"}
@@ -618,6 +631,22 @@ def get_settings(request: Request, internal: bool = False) -> dict:
         # （含各车道 api_key，root+机器通道专属）；普通掩码面完全不含该键
         # （admin 不得见，仓库层 get_settings 本就不含此列）。
         raw["model_routing_json"] = read_model_routing_raw()
+        # 饥荒 overlay（DR 波 §3，2026-10-02）：downgraded 时只对 agent/机器通道的
+        # 热读响应把 a_reply 车道替换成 4B 本地档（:1235 队列代理有 reply 优先权），
+        # **不落库**——用户 model_routing_json 原文/掩码面/磁盘照旧。overlay 后串走
+        # 既有热切换通道（agent 每通装配读该键 → resolve_route），下一通生效；
+        # 优先序天然正确：BOK_MODEL_ROUTING=0 kill-switch 令 agent 忽略整表，overlay
+        # 自然失效（kill-switch > overlay > 用户配置 > env 链）。模型取栈注入的
+        # MLX_LLM_MODEL（本机 4B 路径），缺省回落 settings.llm.model。
+        if _famine_downgraded() and _template_machine_channel(request):
+            raw["model_routing_json"] = ops_metrics.overlay_a_reply(
+                raw["model_routing_json"],
+                ops_metrics.famine_overlay_lane(
+                    model=os.environ.get("MLX_LLM_MODEL", "")
+                    or str(((raw.get("llm") or {}).get("model")) or ""),
+                    base_url=os.environ.get("MLX_LLM_BASE_URL", ""),
+                ),
+            )
         return raw
     masked = {k: _mask_secrets(v) for k, v in raw.items() if k != "policy"}
     masked["policy"] = raw.get("policy", "offline_first")
@@ -2303,6 +2332,19 @@ def _create_call_in(repo, req: CreateCallRequest, created_by: str = "") -> dict:
     抽成函数便于 campaign 循环在**注入的 repo** 上建通话（campaign_tick 的 repo
     参数与 app.state 可不同源，单测注入内存仓时不能走 `_repo()`）。
     """
+    # 饥荒准入闸（DR 波 §3，2026-10-02）：downgraded（自动降档或手动钉住）或手动
+    # 停拨 → 拒新建单，绝不先建后杀；在途通话不受影响（campaign 改期由既有
+    # redispatch 承担）。作用域=live 且非 interpret（B 线同传不吃本地回复车道；
+    # simulation/realtime_demo 档不拦，与并发闸同判例）。kill-switch 由状态机侧
+    # 承担（无样本=恒 healthy）；手动解除=POST /api/ops/disaster-override。
+    if req.mode == CallMode.LIVE and str(req.kind or "") != "interpret":
+        _famine_block = ops_metrics.store().blocking_state()
+        if _famine_block["blocked"]:
+            _audit("call.reject_famine", subject_type="call", account_id=req.account_id,
+                   detail={"mode": req.mode, "kind": req.kind,
+                           "reason": _famine_block["reason"],
+                           "famine": _famine_block["famine"]})
+            raise HTTPException(status_code=409, detail="节点饥荒降档中，暂停新建单")
     # 并发准入 + 重复建单防重（2026-09-27）：建单前拒，绝不先建后杀。
     # 作用域=mode=live（真实业务 A 线通话，吃本机单并发 LLM/GPU 的车道）；
     # simulation（训练/画布试跑）与 realtime_demo（云端 S2S，不吃本地 GPU）不受限
@@ -7222,6 +7264,159 @@ async def supervisor_end(call_id: str, request: Request, disposition: str = "dec
         end_detail["intent_code"] = intent_code
     _audit("supervisor.end", subject_type="call", subject_id=call_id, account_id=call.get("account_id", ""), call_id=call_id, detail=end_detail)
     return {"call_id": call_id, "action": "end", "status": call["status"], "disconnected": True}
+
+
+# ---- 容灾+可观测波端点（feat/dr-observability 契约 §1/§2/§4/§5，2026-10-02，B 路）----
+# 数据面=control_plane/ops_metrics.py（滚动窗+饥荒状态机单一真源）。鉴权逐端点：
+# agent-report=calls 页闸（auth-off/机器通道直通，与 turns/whatsapp 上报同姿势）；
+# providers=同 calls 页（CallStudio Provider 卡）；ops.*=root（机器通道直通，
+# /api/nodes 先例）；call logs=calls 页闸（契约 §5）。env 键登记待办见
+# ops_metrics 模块 docstring（tools/bok.py 不在 B 路所有权内）。
+
+
+class AgentMetricSample(BaseModel):
+    """单条指标样本（契约 §1：kind 枚举固定四种，ms 毫秒）。"""
+
+    kind: Literal["llm_ttft", "asr_transcribe", "tts_first_audio", "vad_infer"]
+    ms: float
+    ts: str = ""
+
+
+class AgentMetricsReport(BaseModel):
+    """worker 批量上报（契约 §1）。形状不合 → FastAPI 422；端点绝不 500。
+
+    ``samples`` 上限 5000（worker 批 ≤50，此帽防巨包打 CP；超限=422 而非 500）。
+    """
+
+    call_id: str = ""
+    account_id: str = ""
+    worker: str = ""
+    samples: list[AgentMetricSample] = Field(default_factory=list, max_length=5000)
+
+
+class DisasterOverrideRequest(BaseModel):
+    """手动覆盖四动作（契约 §3/§4；未知值 → 422）。"""
+
+    action: Literal["force_downgrade", "force_healthy", "pause_dialing", "resume_dialing"]
+
+
+@app.post("/api/metrics/agent-report")
+def report_agent_metrics(req: AgentMetricsReport, request: Request) -> dict:
+    """A 线 worker 指标批量上报（契约 §1）：入滚动窗 + 喂饥荒 EMA。
+
+    返回 200 只代表样本已入窗（fire-and-forget 语义，worker 侧全吞错）；
+    accepted=实际入窗数（非法 ms 静默滤掉，kind 已由请求模型冻结）。
+    """
+    _gate_page(request, "calls")
+    accepted = ops_metrics.store().record_many(
+        [(s.kind, s.ms) for s in req.samples], call_id=req.call_id
+    )
+    return {"ok": True, "accepted": accepted}
+
+
+@app.get("/api/metrics/providers")
+def get_provider_metrics(request: Request, call_id: str = "") -> dict:
+    """Provider 卡读面（契约 §2）：300s 滚动窗四 provider + 饥荒状态行。"""
+    _gate_page(request, "calls")
+    return ops_metrics.store().providers_view(call_id=str(call_id or "").strip())
+
+
+def _ops_recent_events(repo, limit: int = 20) -> list[dict]:
+    """最近 ops.* 审计事件（chronological：最旧→最新；web 取末尾 N 条反转显示）。
+
+    仓储层 ``list_audit_events`` 无前缀过滤，取近 200 条在 CP 侧筛 ``ops.`` 前缀，
+    再反转成时间正序（consumer 前例=disaster 面板 slice(-8).reverse()）。
+    """
+    try:
+        rows = repo.list_audit_events(limit=200) if hasattr(repo, "list_audit_events") else []
+    except Exception as exc:  # noqa: BLE001 - 事件流读失败不阻面板
+        print(f"[cp] ops recent events skipped: {exc!r}", flush=True)
+        rows = []
+    picked: list[dict] = []
+    for row in rows:
+        action = str((row or {}).get("action") or "")
+        if not action.startswith("ops."):
+            continue
+        picked.append(
+            {
+                "ts": str((row or {}).get("ts") or ""),
+                "event": action,
+                "detail": (row or {}).get("detail") or {},
+            }
+        )
+        if len(picked) >= int(limit):
+            break
+    picked.reverse()  # 仓储侧最新在前 → 契约面板要时间正序（consumer 定向确认）
+    return picked
+
+
+def _ops_memory_view() -> dict:
+    """§4 memory 段：swap 用量（不支持平台=None 不编数字）+ 阈值标注。"""
+    return {
+        "swap_used_gb": ops_metrics.swap_used_gb(),
+        "threshold_gb": ops_metrics.swap_threshold_gb(),
+    }
+
+
+@app.get("/api/ops/disaster-status")
+def ops_disaster_status(request: Request) -> dict:
+    """Root 容灾面板（契约 §4）：饥荒 + providers + swap/servers/事件流 + 活通话数。"""
+    require_role(request, "root")
+    repo = _repo()
+    return {
+        "famine": ops_metrics.store().famine_view(include_override=True),
+        "providers": ops_metrics.store().providers(),
+        "memory": _ops_memory_view(),
+        "servers": ops_metrics.probe_servers(),
+        "active_calls": _live_call_count(repo),
+        "recent_events": _ops_recent_events(repo),
+    }
+
+
+@app.post("/api/ops/disaster-override")
+def ops_disaster_override(req: DisasterOverrideRequest, request: Request) -> dict:
+    """手动覆盖四钮（契约 §3/§4）：force_downgrade/force_healthy/pause_dialing/
+    resume_dialing，覆盖优先于自动；每次动作审计 ``ops.famine_override``（level
+    转换若发生另由状态机发 ``ops.famine``）。返回覆盖后的 famine 视图。"""
+    require_role(request, "root")
+    view = ops_metrics.store().override(req.action)
+    _audit(
+        "ops.famine_override",
+        subject_type="ops",
+        subject_id="famine",
+        detail={
+            "action": req.action,
+            "level": view.get("level"),
+            "downgraded": view.get("downgraded"),
+            "dialing_paused": view.get("dialing_paused"),
+            "manual_override": view.get("manual_override"),
+            "ema_ms": round(float(view.get("ema_s") or 0.0) * 1000.0, 1),
+        },
+    )
+    return view
+
+
+@app.get("/api/calls/{call_id}/logs")
+def get_call_logs(
+    call_id: str, request: Request, after: int = 0, limit: int = 200
+) -> dict:
+    """实时日志尾读（契约 §5）：``{lines, next_offset, eof}``，``after`` 字节游标。
+
+    数据源=agent.log（``BOK_AGENT_LOG`` 覆盖 > 平台 app-data logs/agent.log）；
+    过滤=行内含 call_id + 原始 print 行按最近结构行归属跟随。权限=calls 页闸
+    （root 可经既有键授权面放给 admin/用户，不新增权限模型）。limit 默认 200、
+    上限 1000；本轮超限时停在未消费行起点（零丢行），下一轮自 next_offset 续读。
+    """
+    _gate_page(request, "calls")
+    row = _repo().get_call(call_id)
+    if not row:
+        raise HTTPException(404, "call not found")
+    deny_cross_account(request, row)
+    return ops_metrics.read_call_log(
+        call_id,
+        after=max(int(after or 0), 0),
+        limit=max(1, min(int(limit or 200), 1000)),
+    )
 
 
 # 管理台静态托管（云端形态）：目录在才挂载，本地开发形态零变化。

@@ -298,6 +298,26 @@ export const api = {
   deletePersona: (id: string) => request<Record<string, unknown>>(`/api/personas/${id}`, { method: "DELETE" }),
   getTurns: (id: string) => request<Record<string, unknown>[]>(`/api/calls/${id}/turns`),
   getSettlement: (id: string) => request<Record<string, unknown>>(`/api/calls/${id}/settlement`),
+  // ---- 容灾可观测波（feat/dr-observability，契约 §2/§4/§5） ----
+  // Provider 滚动窗读数（CallStudio 右栏卡 3s 轮询；call_id 缺省=全局窗）。
+  providerMetrics: (callId?: string) =>
+    request<ProviderMetricsReport>(
+      callId ? `/api/metrics/providers?call_id=${encodeURIComponent(callId)}` : "/api/metrics/providers",
+    ),
+  // root 容灾面板（require_role root）：饥荒状态 + providers + swap/servers/事件流。
+  disasterStatus: () => request<DisasterStatusReport>("/api/ops/disaster-status"),
+  // 手动覆盖四钮（force_downgrade/force_healthy/pause_dialing/resume_dialing）。
+  disasterOverride: (action: DisasterOverrideAction) =>
+    request<Record<string, unknown>>("/api/ops/disaster-override", {
+      method: "POST",
+      body: JSON.stringify({ action }),
+    }),
+  // 实时日志游标续读（契约 §5）：after 缺省=字节 0；lines 为该区间原始行，
+  // next_offset 回填游标；eof=true 表示已到文件末尾（继续轮询即可等新行）。
+  callLogs: (id: string, after = 0, limit = 200) =>
+    request<CallLogsPage>(
+      `/api/calls/${encodeURIComponent(id)}/logs?after=${Math.max(0, Math.floor(after))}&limit=${Math.max(1, Math.floor(limit))}`,
+    ),
   activeCalls: () => request<Record<string, unknown>[]>("/api/supervisor/active-calls"),
   supervisorPause: (id: string) => request<Record<string, unknown>>(`/api/supervisor/${id}/pause-agent`, { method: "POST" }),
   supervisorResume: (id: string) => request<Record<string, unknown>>(`/api/supervisor/${id}/resume-agent`, { method: "POST" }),
@@ -657,6 +677,61 @@ export type QaDriftAdoptResult = {
 export type QaDriftAdoptResponse = {
   results: QaDriftAdoptResult[];
   adopted: number;
+};
+
+// ---- 容灾可观测波契约类型（dr-observability §2/§4/§5；形状与后端响应逐键对齐） ----
+/** 单 provider 滚动窗读数（§2）：last/p50/p95 毫秒 + 窗口内样本数。 */
+export type ProviderStat = {
+  last_ms?: number | null;
+  p50?: number | null;
+  p95?: number | null;
+  n?: number | null;
+};
+
+/**
+ * 饥荒单真源状态（§3）：level=healthy|famine；downgraded=已降档（a_reply 车道
+ * overlay 成 4B，新通话下一通生效）；dialing_paused=外呼闸；manual_override=
+ * root 手动覆盖标记（null=自动）。
+ */
+export type FamineState = {
+  level?: string;
+  ema_s?: number | null;
+  since?: string | null;
+  downgraded?: boolean;
+  dialing_paused?: boolean;
+  manual_override?: string | null;
+};
+
+/** GET /api/metrics/providers（§2）响应。 */
+export type ProviderMetricsReport = {
+  window_s: number;
+  providers: Record<string, ProviderStat>;
+  famine: FamineState;
+};
+
+/** GET /api/ops/disaster-status（§4）响应。 */
+export type DisasterStatusReport = {
+  famine: FamineState;
+  providers: Record<string, ProviderStat>;
+  memory: { swap_used_gb?: number | null; threshold_gb?: number | null };
+  servers: { name: string; port: number; up: boolean }[];
+  active_calls: number;
+  /** 最近事件（后端给最近 20 条，页面临近 8 条渲染）。 */
+  recent_events: { ts: string; event: string; detail?: Record<string, unknown> }[];
+};
+
+/** POST /api/ops/disaster-override（§4）四动作。 */
+export type DisasterOverrideAction =
+  | "force_downgrade"
+  | "force_healthy"
+  | "pause_dialing"
+  | "resume_dialing";
+
+/** GET /api/calls/{id}/logs（§5）响应：byte 游标续读 + EOF 标记。 */
+export type CallLogsPage = {
+  lines: string[];
+  next_offset: number;
+  eof: boolean;
 };
 
 // ---- B4 会话与权限类型（契约预埋） ----

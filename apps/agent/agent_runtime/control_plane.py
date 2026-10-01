@@ -46,6 +46,11 @@ class ControlPlaneClient:
         self._turn_spool: deque = deque()
         self._replay_task: asyncio.Task | None = None
 
+    @property
+    def request_headers(self) -> dict[str, str]:
+        """请求头快照（DR 契约 §1）：指标上报等旁路通道同源复用，防第二套组装漂移。"""
+        return dict(self._client.headers)
+
     async def get_call(self, call_id: str) -> dict:
         r = await self._client.get(f"/api/calls/{call_id}")
         r.raise_for_status()
