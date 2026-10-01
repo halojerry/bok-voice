@@ -3742,6 +3742,18 @@ def _tts_first_clause_config() -> tuple[bool, int]:
 # ``BOK_TTS_FIRST_CHUNK_CHARS`` 缺省 "6"（2026-09-30 Ethan 耳测定档：AB 三臂
 # 0/6/10 全 MiniMax bidi 实声对照，2_long_early6 最好、10 也不错——取 6 最快）;
 # "0"=整段关闭(旧行为逐字节同)。
+def _bidi_head_flush_enabled() -> bool:
+    """头段催产 task_flush(2026-09-29,官方文档+直连台架定案)。
+
+    MiniMax bidi 服务端只在句末标点(或攒够/兜底窗)才起合成——首 6-10 字早发
+    的 continue 会被扣住(C 场景实测无标点兜底窗 2.4s),云嘴首声实际=首句句号
+    到达+~240ms 地板(生产 637-1017ms 的构成)。官方 task_flush=已缓冲文本
+    立即合成且会话不关;早切头段后立刻 flush,台架实测首声 918-962→210-343ms
+    (压到服务端地板)。"0" 一键回退=只早发不催产(第八波原行为)。
+    """
+    return os.environ.get("MINIMAX_BIDI_HEAD_FLUSH", "1") == "1"
+
+
 def _tts_first_chunk_chars() -> int:
     """首个 bidi continue 提前切门槛(字数)。0=关闭;坏值回默认 6。"""
     try:
@@ -4899,7 +4911,15 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                             output_emitter.flush()
                             buf.clear()
                         if event == "task_flushed":
-                            self._flushed_evt.set()
+                            if state.get("head_flush_pending"):
+                                # 头段催产 flush 的 ack(非收尾):唔收摊,recv 继续
+                                # 30s 等待窗照常吃余句音频。流已收尾(头段=整条
+                                # 回复)时,这次 ack 同时兼任收尾 ack。
+                                state["head_flush_pending"] = False
+                                if state.get("stream_ended"):
+                                    self._flushed_evt.set()
+                            else:
+                                self._flushed_evt.set()
                         elif event == "task_canceled":
                             self._canceled_evt.set()
                         elif event == "task_finished":
@@ -5136,6 +5156,31 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                                     flush=True,
                                 )
                                 await _send_text(text[:cut])
+                                # 头段催产(2026-09-29):服务端对无句末标点的缓冲
+                                # 不起合成(兜底窗 2.4s),早发的头段要 task_flush
+                                # 催一声才有声——台架 918-962→210-343ms。ack 在
+                                # recv 循环按 head_flush_pending 区分,唔收摊。
+                                if (
+                                    _bidi_head_flush_enabled()
+                                    and not circuit_open
+                                    and not _guard_triggered()
+                                ):
+                                    try:
+                                        if _reconnecting.is_set():
+                                            await _reconnecting.wait()
+                                        state["head_flush_pending"] = True
+                                        await ws.send(json.dumps({"event": "task_flush"}))
+                                        print(
+                                            f"MINIMAX_BIDI_HEAD_FLUSH sent "
+                                            f"chars={state['first_chunk_chars']}",
+                                            flush=True,
+                                        )
+                                    except asyncio.CancelledError:
+                                        state["head_flush_pending"] = False
+                                        raise
+                                    except Exception:
+                                        # 发唔出去=无事发生(余句句号到自然起合成)
+                                        state["head_flush_pending"] = False
                                 if text[cut:].strip():
                                     first_tail = text[cut:]
                                 continue
@@ -5147,6 +5192,8 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                     # 吐服务端已收到的文本)。
                     await _send_text(first_tail)
                     first_tail = ""
+                # 输入已尽(头段催产 ack 与收尾 ack 可能是同一发,recv 侧靠此标记判)
+                state["stream_ended"] = True
 
                 # ---- F-10 限流守卫收尾(2026-09-23):触发限流(或熔断轮)且零音频
                 # → 退避重试 WS(1039/2205)或回落既有 HTTP 路径(1002 首击/熔断/

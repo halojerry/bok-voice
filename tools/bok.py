@@ -2005,6 +2005,9 @@ _FORWARD_ENV = (
     # W-TTS bidi 首 chunk 提前切(2026-09-28):首个 task_continue 句内 ≥N 字即发
     # (默认 10,切点避数字/拉丁 run),后续 continue 仍按句界;0=旧行为逐字节同。
     "BOK_TTS_FIRST_CHUNK_CHARS",
+    # bidi 头段催产(2026-09-29):早切头段后立刻 task_flush——服务端对无句末标点
+    # 缓冲不起合成(兜底窗 2.4s),不催=早发空转;台架首声 918-962→210-343ms。
+    "MINIMAX_BIDI_HEAD_FLUSH",
     # —— LLM 生成链（兜底/投机/预热/超时预算） ——
     "BOK_LLM_FALLBACK",
     "BOK_PREFILL_SPEC",
