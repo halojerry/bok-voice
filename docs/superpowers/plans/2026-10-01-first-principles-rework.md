@@ -61,7 +61,7 @@ max_active_calls = clamp(floor, (可用内存 − 安全垫含常驻脚印) / �
 | 404ddff | D2-3 garbled-reask 求值上移至 stall 阶梯前 + garbled 轮不喂 streak（ASR 病不再算模型头上；守卫=整笔跳过写点，噪声误判 confirm 不抹真 stall 证据）。**已知副效应**：reask 现先于 DEFER/直念步/图/QA（命中即消费），挂起 say 步在连续烂转写+cap 期间可推迟——观察位 |
 | 2ee0a02 | D2-4 复读全吞上抛：on_full_swallow 回调→拆 watchdog+放行 W-GATE+turns provider=repeat-suppressed（被吞全文证据保全）+REPEAT_SUPPRESSED 标记；不改 starve/_assistant_out（客户耳中确是静默，starve-ack 是正确可闻兜底） |
 | 52355ba | 容量准入 capacity.py（vm_stat//proc/meminfo/nvidia-smi 零依赖探测、30s 缓存、fail-open 回档案 ceiling、409 detail 带计算明细、legacy 钉死）+ sensevoice 档 Qwen3 权重跳载（缺省跳、懒加载保 qwen3 回滚免重启、ASR_QWEN3_SKIPPED） |
-| (本档) | 术语门禁 CSC 族白名单收口（LANE_YUE=HF 数据集 tag/指标字段/变量名，IGNORECASE） |
+| (本档) | 术语门禁 CSC 族白名单收口（HF Common Voice 数据集 lane 常量/指标字段/变量名，IGNORECASE） |
 
 审计通过项：所有权互斥干净、车道顺序实证（reask 6540 < stall 6642 < DEFER 6692 < say 6721 < graph 6866 < QA 7231）、全量 3778+1 独立复跑、本机容量实测 mac 档内存紧时自动压到 1（只压不抬验证）。
 
