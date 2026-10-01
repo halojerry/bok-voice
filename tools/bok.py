@@ -1984,6 +1984,10 @@ _FORWARD_ENV = (
     # —— 垫话/罐头/TTS 缓存 ——
     "BOK_FILLER",
     "BOK_FILLER_DELAY_MS",
+    # 垫话连发冷却时间窗(2026-09-29):上次真垫话 Ns 内跳过本发(0=关窗)。
+    # 旧「相邻轮歇一轮」seq 冷却把慢轮覆盖打穿,改时间窗后真实通话轮间隔
+    # (>10s)普遍出窗=慢轮全覆盖,急连发段仍有阻尼。
+    "BOK_FILLER_COOLDOWN_S",
     "BOK_FILLER_GAP_MS",
     "BOK_FILLER_CHAIN",
     "BOK_FILLER_MAX",

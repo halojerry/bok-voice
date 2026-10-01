@@ -109,6 +109,18 @@ def filler_delay_s() -> float:
         return 0.5
 
 
+def filler_cooldown_s() -> float:
+    """连发冷却时间窗(2026-09-29):上次真垫话多少秒内跳过本发。
+
+    0=关窗。真实通话轮间隔(答话播放+客户讲+EOU)普遍 >10s=慢轮全覆盖;
+    急连发段(<10s 连续多轮)仍有阻尼,防轰炸语义由懒 delay+每通上限共兜。
+    """
+    try:
+        return max(0.0, float(os.environ.get("BOK_FILLER_COOLDOWN_S", "10")))
+    except ValueError:
+        return 10.0
+
+
 def filler_gap_s() -> float:
     """垫话播完 → 回复衔接前的静默间隔。
 
@@ -600,10 +612,15 @@ class FillerDirector:
         self._reshot_done = False
         self._arm_time = 0.0
         self._reshot_firing = False
-        # 连轮冷却(2026-09-17 call-11132bdd:8 轮垫 6 轮=轰炸感):相邻轮只垫
-        # 一轮歇一轮,除非客户连讲跨轮(arm 序号差 >1 自然放行)。
+        # 连发冷却(2026-09-29 重设计):垫话本是懒触发(arm 定时器,真答案首
+        # 音频到达即作废=快轮天然不垫),旧「相邻轮歇一轮」seq 冷却恰把慢轮的
+        # 覆盖打穿(轮 6 冷却跳过+答案 3.1s=纯静默,soak p95 正主)。改时间窗:
+        # 上次真垫话 <BOK_FILLER_COOLDOWN_S(默认 10s)内才跳过——真实通话轮
+        # 间隔(答话播放+客户讲+EOU)普遍 >10s=慢轮全覆盖,急连发段仍有阻尼;
+        # 0=冷却全关(懒 delay+每通上限仍兜轰炸)。
         self._turn_seq = 0
         self._last_fire_seq = -2
+        self._last_fire_at = 0.0
 
     # ---- 生命周期 ----
 
@@ -1043,17 +1060,20 @@ class FillerDirector:
                 return
             if self._guards() or filler_max_per_call() <= self._count:
                 return
+            _cd = filler_cooldown_s()
             if (
                 self._turn_seq > 0
                 and self._chain_depth == 0
                 and not self._reshot_done
-                and self._turn_seq - self._last_fire_seq <= 1
+                and _cd > 0
+                and (time.monotonic() - self._last_fire_at) < _cd
             ):
-                # 连轮冷却(2026-09-17 call-11132bdd:8 轮垫 6 轮=轰炸):相邻轮
-                # 歇一轮;链发(同轮第二发,_chain_depth)与按需第二发(_reshot_done
-                # 已置=本轮第一发已垫)豁免——本轮已有第一发=冷却已消耗。
-                # _turn_seq=0=无 arm 的直调(旧测试/嵌入方)不适用冷却语义。
-                print("BOK_FILLER skip cooldown (上一轮已垫,防连轮轰炸)", flush=True)
+                # 时间窗连发冷却(2026-09-29):链发(同轮第二发)与按需第二发豁免
+                # ——本轮已有第一发=冷却已消耗。0=关窗(懒 delay+每通上限兜轰炸)。
+                print(
+                    f"BOK_FILLER skip cooldown (上次垫话 {_cd:.0f}s 窗内,防连发轰炸)",
+                    flush=True,
+                )
                 return
             state = str(getattr(self._session, "agent_state", "") or "")
             if state not in ("listening", "thinking", ""):
@@ -1120,6 +1140,7 @@ class FillerDirector:
             frames = pcm_to_frames(resample_pcm(pcm, rate, BACKGROUND_PLAYER_RATE), BACKGROUND_PLAYER_RATE)
             self._count += 1
             self._last_fire_seq = self._turn_seq
+            self._last_fire_at = time.monotonic()
             self._fired_lines.append(entry["text"])
             _label = f" call={self._call_label}" if self._call_label else ""
             _bucket_mark = f" bucket={self._last_bucket}" if self._last_bucket else ""

@@ -613,6 +613,8 @@ def test_load_manifest_filters_deflect_family(tmp_path):
 
 
 def test_consecutive_round_cooldown(tmp_path, monkeypatch):
+    """时间窗连发冷却(2026-09-29):窗内跳过、出窗放行——真实通话轮间隔
+    (>10s)普遍出窗=慢轮全覆盖;旧「相邻轮歇一轮」把慢轮覆盖打穿已废。"""
     monkeypatch.setenv("BOK_FILLER_DELAY_MS", "0")
 
     async def _case():
@@ -622,13 +624,31 @@ def test_consecutive_round_cooldown(tmp_path, monkeypatch):
         d._handle = None
         assert len(player.plays) == 1
         assert d.fired_this_round() is True
-        d.arm()  # r2:相邻轮 → 冷却跳过
+        d.arm()  # r2:上次垫话 10s 窗内 → 跳过
         await d._fire(0)
-        assert len(player.plays) == 1, "相邻轮必须歇一轮(8轮垫6轮=轰炸感)"
+        assert len(player.plays) == 1, "冷却窗内必须跳过(急连发防轰炸)"
         assert d.fired_this_round() is False
-        d.arm()  # r3:隔开 → 放行
+        d.arm()  # r3:模拟真实通话轮间隔(>10s,出窗)→ 放行=慢轮全覆盖
+        d._last_fire_at -= 11.0
         await d._fire(0)
-        assert len(player.plays) == 2
+        assert len(player.plays) == 2, "出窗后必须放行(旧 seq 交替在此打穿慢轮)"
+
+    _run(_case())
+
+
+def test_filler_cooldown_disabled_by_env(tmp_path, monkeypatch):
+    """BOK_FILLER_COOLDOWN_S=0 → 冷却全关:连发也不跳(懒 delay+每通上限兜)。"""
+    monkeypatch.setenv("BOK_FILLER_DELAY_MS", "0")
+    monkeypatch.setenv("BOK_FILLER_COOLDOWN_S", "0")
+
+    async def _case():
+        d, player = _director(tmp_path)
+        d.arm()
+        await d._fire(0)
+        d._handle = None
+        d.arm()
+        await d._fire(0)
+        assert len(player.plays) == 2, "0=关窗,不得跳过"
 
     _run(_case())
 
