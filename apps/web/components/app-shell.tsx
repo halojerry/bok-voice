@@ -3,12 +3,14 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useRef, useState } from "react";
+import { SWRConfig } from "swr";
 import { AlertCircle, Inbox } from "lucide-react";
 import { AccountProvider, useAccount } from "@/components/account-context";
 import { Sidebar } from "@/components/layout/sidebar";
 import { Topbar } from "@/components/layout/topbar";
 import { Skeleton } from "@/components/ui/skeleton";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { ToastProvider } from "@/components/toast";
 import { gateForPath } from "@/lib/navigation";
 import {
   SessionProvider,
@@ -84,6 +86,12 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     <SessionProvider>
       <SessionReady>
         <AccountProvider>
+          {/* SWR 全局默认（2026-10-02 数据层）：切回标签页自动重验 + 短窗去重；
+              keepPreviousData=换 key（如分页 limit 增长）时旧列表先留屏不闪白。 */}
+          <SWRConfig value={{ revalidateOnFocus: true, dedupingInterval: 1500, keepPreviousData: true }}>
+          {/* Toast 全站单例（2026-10-02 交互逻辑刀）：mutation 反馈唯一面，
+              消费点一律 useToast()，禁止自建平行反馈。 */}
+          <ToastProvider>
           {/* TooltipProvider 全站单例：折叠态导航 Tooltip 等都在此伞下。 */}
           <TooltipProvider>
             <div className="flex min-h-screen w-full bg-background">
@@ -104,6 +112,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               </div>
             </div>
           </TooltipProvider>
+          </ToastProvider>
+          </SWRConfig>
         </AccountProvider>
       </SessionReady>
     </SessionProvider>

@@ -251,8 +251,9 @@ export const api = {
   token: (body: { account_id: string; object_id?: string; call_id?: string; role?: string }) =>
     request<{ serverUrl: string; participantToken: string }>("/api/token", { method: "POST", body: JSON.stringify(body) }),
   createCall: (body: unknown) => request<Record<string, unknown>>("/api/calls", { method: "POST", body: JSON.stringify(body) }),
-  listCalls: (accountId = "acc-001", status = "") =>
-    request<Record<string, unknown>[]>(`/api/calls?account_id=${accountId}&status=${status}`),
+  // limit>0=服务端分页（created_at 倒序+截断，2026-10-02）；0=旧档全量零漂移。
+  listCalls: (accountId = "acc-001", status = "", limit = 0) =>
+    request<Record<string, unknown>[]>(`/api/calls?account_id=${accountId}&status=${status}${limit > 0 ? `&limit=${limit}` : ""}`),
   getCall: (id: string) => request<Record<string, unknown>>(`/api/calls/${id}`),
   deleteCall: (id: string) => request<Record<string, unknown>>(`/api/calls/${id}`, { method: "DELETE" }),
   clearEndedCalls: (accountId = "acc-001") =>
