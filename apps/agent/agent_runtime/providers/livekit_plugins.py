@@ -6111,19 +6111,20 @@ def _asr_language_hint(lang_state: str, pin: bool) -> str:
 def _asr_engine_from_cfg(asr_cfg: dict) -> str:
     """P1(2026-10-01)ASR 引擎车道解析(纯函数,A/B 线共用)。
 
-    优先序:env ``BOK_ASR_ENGINE``(终极覆盖,测试/一键回滚键)> ``asr_json.engine``
-    > 缺省 ``""``(旧 Qwen3-ASR 路径)。返回 ``"sensevoice"`` 或 ``""``。
-    **缺省翻转纪律**:P1 首步保持旧路,soak/FLOW20/数字轮验证门全绿后才把
-    ``return ""`` 缺省改 ``"sensevoice"``——翻转动作只动本函数一处。"""
+    优先序:env ``BOK_ASR_ENGINE``(终极覆盖,一键回滚键)> ``asr_json.engine``
+    > 缺省 ``"sensevoice"``。返回 ``"sensevoice"`` 或 ``""``(旧 Qwen3-ASR)。
+    **缺省已翻 sensevoice**(2026-10-01 验证门全绿:soak 11/11 首声 p50
+    1014ms/双通 B PASS+yield 命中/FLOW20 pass^3 零坏标记);回滚=设
+    ``BOK_ASR_ENGINE=qwen3`` 或 asr_json.engine=qwen3。"""
     v = str(os.environ.get("BOK_ASR_ENGINE", "") or "").strip().lower()
     if v in ("sensevoice", "sv"):
         return "sensevoice"
     if v in ("qwen3", "mlx"):
         return ""
     cfg = str((asr_cfg or {}).get("engine") or "").strip().lower()
-    if cfg in ("sensevoice", "sv"):
-        return "sensevoice"
-    return ""
+    if cfg in ("qwen3", "mlx"):
+        return ""
+    return "sensevoice"
 
 
 class Qwen3ASRSTT(stt.STT):

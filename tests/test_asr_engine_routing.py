@@ -195,18 +195,18 @@ def test_asr_engine_from_cfg_resolution(monkeypatch):
     from agent_runtime.providers.livekit_plugins import _asr_engine_from_cfg
 
     monkeypatch.delenv("BOK_ASR_ENGINE", raising=False)
-    # 缺省=旧路(验证门后此断言随缺省翻转同步改)
-    assert _asr_engine_from_cfg({}) == ""
+    # 缺省=sensevoice(2026-10-01 验证门全绿后翻定);回滚键 env/asr_json=qwen3
+    assert _asr_engine_from_cfg({}) == "sensevoice"
     assert _asr_engine_from_cfg({"engine": "qwen3"}) == ""
     assert _asr_engine_from_cfg({"engine": "sensevoice"}) == "sensevoice"
     assert _asr_engine_from_cfg({"engine": "SV"}) == "sensevoice"
-    assert _asr_engine_from_cfg({"engine": "garbage"}) == ""
+    assert _asr_engine_from_cfg({"engine": "garbage"}) == "sensevoice"
     # env 终极覆盖
-    monkeypatch.setenv("BOK_ASR_ENGINE", "sensevoice")
-    assert _asr_engine_from_cfg({}) == "sensevoice"
-    assert _asr_engine_from_cfg({"engine": "qwen3"}) == "sensevoice"
     monkeypatch.setenv("BOK_ASR_ENGINE", "qwen3")
+    assert _asr_engine_from_cfg({}) == ""
     assert _asr_engine_from_cfg({"engine": "sensevoice"}) == ""
+    monkeypatch.setenv("BOK_ASR_ENGINE", "sensevoice")
+    assert _asr_engine_from_cfg({"engine": "qwen3"}) == "sensevoice"
 
 
 def test_wiring_source_pins():
