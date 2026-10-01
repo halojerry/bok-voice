@@ -4597,6 +4597,10 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                 nonlocal t_first_text
                 if t_first_text == 0.0:
                     t_first_text = time.monotonic()
+                    # 官方 SynthesizeStream 契约(同 bidi _send_text):首段文本交
+                    # provider 时 _mark_started()——漏调则基座 metrics 监视器因
+                    # _started_time==0 永不 emit,本流 tts_metrics 整条哑。
+                    self._mark_started()
                     # W8 A/B 秒表(两腿共通):首个 task_continue 的时刻与字数。
                     # 首送是首音频的门;该读数=「流启动→首送」纯文本等待面,
                     # 与 cloud RTT(TTS_FIRST_AUDIO_MS)/watchdog 收割解耦。
@@ -5527,6 +5531,7 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                             # 新连接上「最后一条 continue」=合并重发,后续 2205 原样重发它
                             self._last_continue = text
                         state["t_first_continue"] = time.monotonic()
+                        self._mark_started()  # 官方契约:文本交 provider(幂等;见 _send_text 注释)
                         state["first_pushed"] = False
                         session.active_epoch = my_epoch  # 认领纪元:重发即本流首个 continue,同发送分支
                         _start_loops()  # 新连接新收发协程(ws 已重绑进闭包)
@@ -5574,6 +5579,8 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                             self._sent_text_parts.append(canned)  # 看门狗重连合并重发用
                             if state["t_first_continue"] == 0.0:
                                 state["t_first_continue"] = time.monotonic()
+                                # 官方契约:首段文本交 provider(见 _send_text 注释)
+                                self._mark_started()
                                 _arm_stall_watch()  # 首条 task_continue 起看门狗计时
                             await ws.send(json.dumps({"event": "task_continue", "text": canned}))
                             state["sent_any"] = True
@@ -5591,6 +5598,14 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                         await _reconnecting.wait()
                     if state["t_first_continue"] == 0.0:
                         state["t_first_continue"] = time.monotonic()
+                        # 官方 SynthesizeStream 契约(livekit 1.8.2 tts.py
+                        # _emit_metrics):基座 metrics 监视器以 _started_time 为闸,
+                        # 而 _started_time 只由子类在「首段文本交给 provider」时调
+                        # _mark_started() 设置(官方 stream_adapter.py:132 /
+                        # inference/tts.py:690 同款)——漏调=本流 tts_metrics 永不
+                        # emit(CP Provider 卡 TTS 行灰)。锚点=首条 task_continue
+                        # 发出,ttfb=首送→首帧墙钟,与 TTS_FIRST_AUDIO_MS 同口径。
+                        self._mark_started()
                         _arm_stall_watch()  # 首条 task_continue 起看门狗计时
                     self._last_continue = s
                     self._sent_text_parts.append(s)  # 看门狗重连合并重发用
@@ -5723,6 +5738,7 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                             self._flushed_evt.clear()
                             self._canceled_evt.clear()
                             if merged:
+                                self._mark_started()  # 官方契约:文本交 provider(守卫重发可能正是首送)
                                 await ws.send(json.dumps({"event": "task_continue", "text": merged}))
                                 self._last_continue = merged
                             session.active_epoch = my_epoch
@@ -5748,6 +5764,7 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                         f"MINIMAX_BIDI_RATE_LIMIT_FALLBACK_HTTP status={status} "
                         f"circuit={int(circuit_open)} chars={len(fallback_text)}", flush=True,
                     )
+                    self._mark_started()  # 官方契约:文本已交 HTTP provider(熔断轮零 WS 的首送)
                     ok = await _minimax_http_synth(
                         self._tts_, fallback_text, output_emitter,
                         key=key, voice=voice, sample_rate=sample_rate, stream_mode=True,
@@ -6536,6 +6553,15 @@ class _Qwen3SynthesizeStream(tts.SynthesizeStream):
                 # CJK 汉字 isalpha()==True → 中文片段全被拦,overlap 对中文全死。
                 return not (tail and tail[-1].isascii() and tail[-1].isalnum())
 
+            def _mark_first_send() -> None:
+                # 官方 SynthesizeStream 契约(同 _MiniMaxBidiStream._send_text):
+                # 首段文本交 provider(本车道=HTTP POST sidecar)时 _mark_started()
+                # ——本地车道装配为裸 provider(无 CachedTTS/Relay 兜底),漏调则
+                # 基座 metrics 监视器因 _started_time==0 永不 emit,整通 tts_metrics
+                # 结构性为零(CP Provider 卡 TTS 行恒灰)。幂等:三个「可能是首段」
+                # 的 POST 入口共用一个点。
+                self._mark_started()
+
             sent_buf = ""
             async for item in self._input_ch:
                 if isinstance(item, self._FlushSentinel):
@@ -6559,6 +6585,7 @@ class _Qwen3SynthesizeStream(tts.SynthesizeStream):
                         # 输入会 hallucinate 4-30s 爆段。直接丢弃,绝唔单独 POST
                         # (前句已带句末标点,丢呢段零语音损失)。
                         continue
+                    _mark_first_send()
                     ok = await _qwen3_tts_post_frames(
                         self._tts_, sentence.strip(), output_emitter, state,
                         end_segment=False,
@@ -6587,6 +6614,7 @@ class _Qwen3SynthesizeStream(tts.SynthesizeStream):
                         if _flushable(frag) and _tts_segment_has_word_char(frag):
                             if via_first:
                                 print(f"QWEN3_TTS_FIRST_CLAUSE chars={len(frag)}", flush=True)
+                            _mark_first_send()
                             ok = await _qwen3_tts_post_frames(
                                 self._tts_, frag, output_emitter, state,
                                 end_segment=False,
@@ -6602,6 +6630,7 @@ class _Qwen3SynthesizeStream(tts.SynthesizeStream):
                 # 纯标点尾巴(唔沾正字)直接丢弃,绝唔 POST(P4-B 爆段源)。
                 final_text = sent_buf.strip()
                 if _tts_segment_has_word_char(final_text):
+                    _mark_first_send()
                     await _qwen3_tts_post_frames(
                         self._tts_, final_text, output_emitter, state,
                         end_segment=False,
