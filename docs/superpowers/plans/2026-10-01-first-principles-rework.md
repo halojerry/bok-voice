@@ -64,3 +64,12 @@ max_active_calls = clamp(floor, (可用内存 − 安全垫含常驻脚印) / �
 | (本档) | 术语门禁 CSC 族白名单收口（LANE_YUE=HF 数据集 tag/指标字段/变量名，IGNORECASE） |
 
 审计通过项：所有权互斥干净、车道顺序实证（reask 6540 < stall 6642 < DEFER 6692 < say 6721 < graph 6866 < QA 7231）、全量 3778+1 独立复跑、本机容量实测 mac 档内存紧时自动压到 1（只压不抬验证）。
+
+## 七、吸收外部定案（主仓 631f80a，2026-10-01 9B 直连 A/B 台架）
+
+另一会话在主仓落的 bench 结论，已收编（脚本 `scripts/bench_9b_direct.py` 带入本 worktree，AGENTS.md 条目留待合并时对齐）：
+
+1. **模型定案，不重造**：hauhaucs mxfp4 ≡ huihui affine-4bit 全等（暖 TTFT 171-184ms / tps 38-42 / 冷 prefill 5888tok=18.9s 双同）。**D1 四臂全部用 huihui 现接线，零模型 bake-off；hauhaucs=验证过的热备。**
+2. **prefill 算术有了硬地基**：M4 Pro 9B prefill 天花板 **311 tok/s**（暖 cache 187-195ms）。FLOW20 首 token 3-4s 尾巴定案=真前缀 miss 的秒级代价。**D1 的收益从"应该会快"变成算术必然**：现状峰值 prompt ~9.5k tok 冷 miss=18.9s、每轮 ~2000 uncached≈6.4s；槽位化后全冷 ~700tok≈2.2s、每轮增量 100-300tok≈0.3-1s。
+3. **勘误吸收**：旧结论「hauhaucs 模板拒 assistant-first」是 LM Studio 模板层，非模型——直连 `[s,a,u]` 双 200。唯一共享限制=无尾 user 消息 404；槽位请求恒带尾 user=构造上安全。
+4. **陷阱钉死**：mlx_lm server 请求 `model` 字段必须**绝对路径**，短 repo id 触发 HF 在线下载（实测卡死 300s）——model_routing detect/preset 填值面与 CUDA 部署面都要遵守；LM Studio 残值=模型仓库。
