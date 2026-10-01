@@ -794,6 +794,36 @@ def _nudge_should_fire(now: float, last_reply_ts: float, last_user_ts: float, nu
     return True
 
 
+# FIX-1(D2-2,2026-10-01):护窗复查周期——护栏不过时重挂短周期复查定时器
+# （模块常量,不加 env;见 _nudge_next_action/_fire 文档)。
+_NUDGE_RECHECK_S = 2.0
+
+
+def _nudge_next_action(
+    now: float,
+    last_reply_ts: float,
+    last_user_ts: float,
+    nudge_delay: float,
+    *,
+    terminal: bool,
+) -> str:
+    """沉默心跳到点后的处置计划（纯函数，单测用）："stop" | "fire" | "recheck"。
+
+    - "stop"：终态（closed/paused/closing/farewell）=唔再追;
+    - "fire"：护栏通过 = 正常心跳/收尾路径;
+    - "recheck"：护栏不过（AI 啱講完/答案在路上）且未终态 = **重挂短周期
+      复查**唔退场（FIX-1，D2-2 2026-10-01）。旧版此处直接 return 不重挂：
+      garbled-reask cap 静默轮无任何回复,客户刚讲完话的时刻恰在护栏禁区
+      （last_user 新于 last_reply 且 ≤2×delay）,心跳定时器一退场就整段不响
+      ——客户耳边真死气。复查直到窗口关闭（"fire"）或终态（"stop"）。
+    """
+    if terminal:
+        return "stop"
+    if _nudge_should_fire(now, last_reply_ts, last_user_ts, nudge_delay):
+        return "fire"
+    return "recheck"
+
+
 # 测试对象名前缀族判定已抽单源 bok_voice_core.testdata(文件头 import 为
 # `_is_test_object_name` 别名,CP qa-pairs 挖掘过滤共用同一份):命中则沉默
 # 心跳整条关闭。E2E/压测脚本的 greeting→用户语音间隙(greeting 静默判定+脚本侧
@@ -7458,17 +7488,38 @@ async def entrypoint(ctx):
         # 在途但 2×8s 心跳+farewell+12s 尾巴太长,用户 8s 后即关页)。
         _disarm_silence()
 
-        async def _fire() -> None:
+        async def _fire(wait_s: float = 0.0) -> None:
+            _wait = wait_s if wait_s > 0 else nudge_delay
             try:
-                await asyncio.sleep(nudge_delay)
+                await asyncio.sleep(_wait)
             except asyncio.CancelledError:
                 return
-            if closed.is_set() or agent.paused or flow_ctrl.closing or _nudge_state.get("farewell"):
-                return
+            _terminal = (
+                closed.is_set()
+                or agent.paused
+                or flow_ctrl.closing
+                or bool(_nudge_state.get("farewell"))
+            )
             now = time.monotonic()
             last_user = float(_nudge_state.get("last_user_ts") or 0.0)
             last_reply = float(_nudge_state.get("last_reply_ts") or 0.0)
-            if not _nudge_should_fire(now, last_reply, last_user, nudge_delay):
+            _action = _nudge_next_action(
+                now, last_reply, last_user, nudge_delay, terminal=_terminal
+            )
+            if _action == "recheck":
+                # FIX-1(D2-2,2026-10-01):护栏不过(客戶啱講完/答案在路上)且未终态
+                # → 重挂短周期复查,唔退场。旧版直接 return=定时器退场:garbled-reask
+                # cap 静默轮无任何回复,客户刚讲完话的时刻恰在护栏禁区,心跳整段
+                # 不响(客户听死气)。重挂沿用同一 timer 槽,disarm(new turn/收线)
+                # 照旧可取消。
+                print(
+                    f"[heartbeat] nudge guard window -> recheck +{_NUDGE_RECHECK_S:.0f}s "
+                    f"(call {room_name})",
+                    flush=True,
+                )
+                _nudge_state["timer"] = asyncio.create_task(_fire(_NUDGE_RECHECK_S))
+                return
+            if _action == "stop":
                 return
             name = str((object_card or {}).get("display_name") or "").strip()
             lang = language_state.lang if language_state.lang in ("zh", "cantonese", "en") else "zh"
