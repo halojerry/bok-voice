@@ -12,6 +12,7 @@ from agent_runtime.agent import (  # noqa: E402
     _farewell_line,
     _is_test_object_name,
     _nudge_line,
+    _nudge_next_action,
     _nudge_should_fire,
 )
 
@@ -65,6 +66,51 @@ def test_nudge_should_fire_guard_windows():
     assert not _nudge_should_fire(116.0, 90.0, 100.0, d)
     # 超 2×delay 仍無聲 → 兜底跳(答案可能失敗)
     assert _nudge_should_fire(100.0, 90.0, 73.0, d)
+
+
+# ---- FIX-1(D2-2,2026-10-01):护窗复查重挂 ----
+# 病灶:garbled-reask cap 轮(静默丢弃)无任何回复,客户刚讲完话的时刻恰在
+# _nudge_should_fire 护窗禁区(last_user 新于 last_reply 且 ≤2×delay),旧版
+# _fire 护栏不过直接 return 不重挂定时器 → 心跳整段不响,客户听死气。
+
+
+def test_nudge_recheck_when_guard_window_blocks_not_silent_exit():
+    d = 12.0
+    # 客户啱講完、答案「在路上」窗内 → recheck(旧版此处静默退场=死气)
+    assert _nudge_next_action(100.0, 90.0, 96.0, d, terminal=False) == "recheck"
+    # AI 啱講完 <delay(俾客户反应窗前段) 同属 recheck
+    assert _nudge_next_action(100.0, 97.0, 90.0, d, terminal=False) == "recheck"
+
+
+def test_nudge_recheck_then_fire_after_window_closes():
+    d = 12.0
+    # 客户 t=100 讲完,2×delay=24s 窗:104s/恰 124s 边界仍在窗内继续复查,
+    # 124.1s 窗外 → fire(稍后开火,不丢心跳)。
+    assert _nudge_next_action(104.0, 90.0, 100.0, d, terminal=False) == "recheck"
+    assert _nudge_next_action(124.0, 90.0, 100.0, d, terminal=False) == "recheck"
+    assert _nudge_next_action(124.1, 90.0, 100.0, d, terminal=False) == "fire"
+
+
+def test_nudge_terminal_states_stop_never_recheck():
+    d = 12.0
+    # closed/farewell/closing/paused 终态:stop,不再重挂(即使护栏可开火)
+    assert _nudge_next_action(100.0, 90.0, 96.0, d, terminal=True) == "stop"
+    assert _nudge_next_action(100.0, 50.0, 40.0, d, terminal=True) == "stop"
+
+
+def test_nudge_recheck_wiring_source_pinned():
+    # 复查周期=模块常量(不加 env);重挂走同一 timer 槽(disarm/新轮照旧可取消);
+    # 终态四件(closed/paused/closing/farewell)在巡查前置检查。
+    import agent_runtime.agent as _agent_mod
+
+    assert _agent_mod._NUDGE_RECHECK_S == 2.0
+    src = (Path(__file__).resolve().parents[1] / "apps" / "agent" / "agent_runtime" / "agent.py").read_text(encoding="utf-8")
+    assert '_nudge_state["timer"] = asyncio.create_task(_fire(_NUDGE_RECHECK_S))' in src
+    assert 'if _action == "recheck":' in src
+    idx = src.index("async def _fire(wait_s: float = 0.0) -> None:")
+    window = src[idx : idx + 2200]
+    for marker in ("closed.is_set()", "agent.paused", "flow_ctrl.closing", '"farewell"'):
+        assert marker in window, marker
 
 
 def test_test_object_name_family():
