@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import difflib
 import json
 import os
 import re
 import time
 import unicodedata
+import uuid
 import weakref
+from collections.abc import Callable
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import httpx
 from livekit.agents import (
@@ -28,6 +32,10 @@ from livekit.plugins.openai import LLM as _OpenAICompatBase
 
 # 模型路由共享契约(2026-09-25 阶段 0):只消费,解析/校验逻辑全在 packages/core。
 from bok_voice_core.model_routes import LaneRoute, PROVIDER_OPENAI
+
+# 编造号码输出守卫(2026-10-01,call-231aa92a):LLM 流出口逐句校验号码确认,
+# 纯函数在 packages/core;本模块只做接线(BOK_NUMBER_GUARD 开关)。
+from bok_voice_core.output_guard import guard_fabricated_number, number_guard_pending
 
 # smart-turn 语义闸（V1，2026-09-26）：VAD 停嘴处判「说完没」的 ONNX 小模型
 # （pipecat smart-turn-v3.2-cpu，~12ms/次）。BOK_SMART_TURN=1 才启用（默认关，
@@ -297,6 +305,87 @@ def route_llm_kwargs(
     return {"base_url": env_base_url, "model": cfg_model}
 
 
+# ---- mlx 生成中止（abort）客户端（2026-10-01 W-ABORT）----
+# 服务端 = 同仓 services/llm-mlx/bok_mlx_server.py（mlx_lm server 的薄 wrapper，
+# 生成循环按请求身份查 abort 旗，``POST /v1/abort`` 置位即从解码循环退出放槽）。
+# 客户端两个动作：①生成请求带 ``X-Bok-Req-Id``（uuid，经 ContextVar 随流任务
+# 上下文传递，官方流的 create 包装读取）；②取消/弃流确定点 fire-and-forget 发
+# ``POST {base}/v1/abort``（0.5s 超时，全吞）。BOK_MLX_ABORT=0 或 base_url 非
+# 本机（云端 OpenAI 兼容车道）→ 零注入零请求，出站字节面同旧。
+_MLX_REQ_ID_HEADER = "X-Bok-Req-Id"
+_MLX_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_MLX_ABORT_CLIENT: httpx.AsyncClient | None = None
+_MLX_REQ_ID_VAR: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "bok_mlx_req_id", default=""
+)
+
+
+def _mlx_abort_on_for(base_url: str) -> bool:
+    """abort 总闸：BOK_MLX_ABORT=1 且 base_url 指向本机 mlx（云端车道不打扰）。"""
+    if os.environ.get("BOK_MLX_ABORT", "1") != "1":
+        return False
+    try:
+        host = (urlparse(str(base_url or "")).hostname or "").lower()
+    except Exception:  # noqa: BLE001 - 解不出=非本地，退回旧行为
+        return False
+    return host in _MLX_LOCAL_HOSTS
+
+
+def _mlx_abort_url(base_url: str) -> str:
+    """abort 端点 URL：base_url 以 /v1 结尾（OpenAI 约定）时同挂 /v1/abort。"""
+    base = str(base_url or "").rstrip("/")
+    return f"{base}/abort" if base.endswith("/v1") else f"{base}/v1/abort"
+
+
+def _abort_http_client() -> httpx.AsyncClient:
+    global _MLX_ABORT_CLIENT
+    if _MLX_ABORT_CLIENT is None:
+        _MLX_ABORT_CLIENT = httpx.AsyncClient(timeout=httpx.Timeout(0.5))
+    return _MLX_ABORT_CLIENT
+
+
+async def _send_mlx_abort(base_url: str, req_id: str) -> None:
+    """fire-and-forget POST /v1/abort（0.5s 超时；任何失败全吞，绝不外抛）。"""
+    if not base_url or not req_id:
+        return
+    try:
+        await _abort_http_client().post(
+            _mlx_abort_url(base_url), json={"request_id": req_id}
+        )
+    except Exception:  # noqa: BLE001 - 中止是尽力语义
+        pass
+
+
+def _fire_mlx_abort(base_url: str, req_id: str) -> None:
+    if base_url and req_id:
+        _spawn_bg(_send_mlx_abort(base_url, req_id))
+
+
+def _attach_mlx_abort(stream, base_url: str, req_id: str) -> None:
+    """给官方流挂 abort 钩子：aclose 且内芯生成未完结 → 发 abort（幂等一次）。
+
+    只服务无兜底壳的路径（B 线 MT 等）；主回复路径由 _LlmFallbackStream 自持
+    挂钩（它对 aclose 有 drain/兜底语义，需要自己的判据）。"""
+    if not (base_url and req_id):
+        return
+    orig_aclose = stream.aclose
+    fired = False
+
+    async def _aclose():
+        nonlocal fired
+        if not fired:
+            fired = True
+            task = getattr(stream, "_task", None)
+            if task is None or not task.done():
+                _fire_mlx_abort(base_url, req_id)
+        await orig_aclose()
+
+    try:
+        stream.aclose = _aclose
+    except Exception:  # noqa: BLE001 - 挂不上=退化为无 abort
+        pass
+
+
 class MlxLlmLLM(_OpenAICompatBase):
     """本地 OpenAI 兼容 LLM（macOS mlx_lm / Windows llama-server，:1235，thinking 关闭）。
 
@@ -461,6 +550,28 @@ class MlxLlmLLM(_OpenAICompatBase):
 
         _sclient.chat.completions.create = _snapshot_create
 
+        # mlx 生成中止（2026-10-01 W-ABORT）：本地车道出站请求带 X-Bok-Req-Id，
+        # 取消/弃流点发 POST /v1/abort——mlx_lm server 单生成线程零取消路径，
+        # 被弃请求照解码到底（直打 :1237 实测断连后新请求 TTFT=2334ms；生产
+        # 放大形态=打断轮 call-231aa92a TTFT 35.6s 级联）。req_id 经 ContextVar
+        # 传递：chat() 里 set、super().chat() 构造流任务时随上下文进流，
+        # 官方流的 create 包装（本层，最外）读取上头。云端 base_url 零注入。
+        self._bok_abort_base = str(getattr(self._client, "base_url", "") or "")
+        self._bok_abort_on = _mlx_abort_on_for(self._bok_abort_base)
+        if self._bok_abort_on:
+            _rclient = self._client
+            _rraw = _rclient.chat.completions.create
+
+            async def _reqid_create(**kw):
+                rid = _MLX_REQ_ID_VAR.get()
+                if rid:
+                    headers = dict(kw.get("extra_headers") or {})
+                    headers.setdefault(_MLX_REQ_ID_HEADER, rid)
+                    kw["extra_headers"] = headers
+                return await _rraw(**kw)
+
+            _rclient.chat.completions.create = _reqid_create
+
     async def _prewarm_impl(self) -> None:
         # 真实 1-token 生成：暖 mlx 模型（冷启动的 KV 分配/首 token 占首包大头）。
         # 官方 prewarm 只验连接；AgentSession 构造时会自动调用本钩子。
@@ -522,6 +633,9 @@ class MlxLlmLLM(_OpenAICompatBase):
     _fallback_text: str = ""
     _late_answer_cb = None  # Callable[[str], Awaitable[None]] | None(agent 注入)
     _fallback_gate = None  # Callable[[], bool] | None:True=本轮垫话已盖耳,抑制流内兜底
+    # W-ABORT 实例面默认（__init__ 里按 base_url 覆写；类级兜底防裸构造）
+    _bok_abort_on: bool = False
+    _bok_abort_base: str = ""
 
     def set_late_answer_cb(self, cb) -> None:
         """晚到答案交付回调(装配时注入):弃流兜底后后台重生成功 → cb(text) 补答。
@@ -583,17 +697,35 @@ class MlxLlmLLM(_OpenAICompatBase):
         injected = conn_options is None or conn_options is DEFAULT_API_CONNECT_OPTIONS
         if injected:
             conn_options = self._conn_opts
-        stream = super().chat(
-            chat_ctx=chat_ctx,
-            tools=tools,
-            conn_options=conn_options,
-            parallel_tool_calls=parallel_tool_calls,
-            tool_choice=tool_choice,
-            extra_kwargs=extra_kwargs,
-        )
+        # W-ABORT：req_id 必须在 super().chat() 之前 set——官方 LLMStream 基类
+        # 在构造时 create_task，ContextVar 在那刻被 copy 进流任务上下文；流内
+        # 的 create 包装（_reqid_create）据此把 id 上头。reset 在 finally，绝不
+        # 泄漏给后续无关请求；BOK_MLX_ABORT=0=零 set 零头（字节面同旧）。
+        req_id = ""
+        _req_token = None
+        if self._bok_abort_on:
+            req_id = uuid.uuid4().hex
+            _req_token = _MLX_REQ_ID_VAR.set(req_id)
+        try:
+            stream = super().chat(
+                chat_ctx=chat_ctx,
+                tools=tools,
+                conn_options=conn_options,
+                parallel_tool_calls=parallel_tool_calls,
+                tool_choice=tool_choice,
+                extra_kwargs=extra_kwargs,
+            )
+        finally:
+            if _req_token is not None:
+                _MLX_REQ_ID_VAR.reset(_req_token)
         # 兜底壳只包主回复路径(注入档);自带 conn_options 的调用方
         # (prefix_prewarm 30s 档等)失败照旧被调用方吞,唔出兜底句。
         if injected and self._fallback_text and isinstance(stream, llm.LLMStream):
+            if req_id:
+                try:
+                    stream._bok_req_id = req_id
+                except Exception:  # noqa: BLE001 - 标不上=退化为无 abort
+                    pass
             # 弃流重生工厂:同参重建内芯流(官方流,唔套兜底壳),单次后台补答。
             def _stream_factory(_ctx=chat_ctx, _tools=tools, _co=conn_options,
                                 _ptc=parallel_tool_calls, _tc=tool_choice,
@@ -609,7 +741,12 @@ class MlxLlmLLM(_OpenAICompatBase):
                 stream_factory=_stream_factory,
                 late_answer_cb=self._late_answer_cb,
                 fallback_gate=self._fallback_gate,
+                req_id=req_id,
+                abort_base=self._bok_abort_base,
             )
+        if req_id and isinstance(stream, llm.LLMStream):
+            # 无兜底壳路径（B 线 MT 等）：取消即弃流点挂在官方流 aclose 上。
+            _attach_mlx_abort(stream, self._bok_abort_base, req_id)
         return stream
 
 
@@ -646,7 +783,7 @@ class _LlmFallbackStream(llm.LLMStream):
     def __init__(self, plugin, inner: "llm.LLMStream", fallback_text: str,
                  first_token_timeout_s: float = 0.0, stream_factory=None,
                  late_answer_cb=None, late_deadline_s: float | None = None,
-                 fallback_gate=None):
+                 fallback_gate=None, req_id: str = "", abort_base: str = ""):
         super().__init__(llm=plugin, chat_ctx=llm.ChatContext(), tools=[], conn_options=APIConnectOptions())
         self._plugin_ref = plugin  # 基类不保底存 plugin:重生任务强引用集挂它身上
         self._inner = inner
@@ -659,6 +796,38 @@ class _LlmFallbackStream(llm.LLMStream):
             _late_answer_deadline_s() if late_deadline_s is None else late_deadline_s
         )
         self._got_first = False
+        # W-ABORT：本流对应服务端请求身份 + abort 端点（空=不接中止线）。
+        self._bok_req_id = req_id or ""
+        self._bok_abort_base = abort_base or ""
+        self._abort_fired = False
+        # 首 token 超时后 drain 接手内芯（设计上继续读，见类注释）——此时框架
+        # aclose 只关本层泵、不代表弃内芯；abort 只在真弃流点（_aclose_inner）
+        # 强制触发，别把 drain 语义误杀。
+        self._drain_owns = False
+
+    def _fire_abort(self, force: bool = False) -> None:
+        """弃流中止（幂等一次）：内芯生成未完结才发（已完结=服务端早放槽，免扰）。
+
+        ``force=False``（框架 aclose / cancel 路径）时若 drain 已接手则不发——
+        drain 的存在意义就是继续读同一条流，abort 会把它截断成 regen。"""
+        if self._abort_fired or not (self._bok_req_id and self._bok_abort_base):
+            return
+        if self._drain_owns and not force:
+            return
+        self._abort_fired = True
+        task = getattr(self._inner, "_task", None)
+        if task is None or not task.done():
+            _fire_mlx_abort(self._bok_abort_base, self._bok_req_id)
+
+    async def aclose(self) -> None:
+        """取消即弃流（框架 ``async with`` 出口/打断收尸/会话收尾）先发 abort。
+
+        这是「服务端单线程被弃生成照解码到底」的客户端侧出口：框架只关本层泵，
+        内芯 httpx 流与 mlx 生成任务本会解到自然完稿（call-9af18da5 双句打断后
+        新回复 TTFT 5.3/6.8s 的机理）；abort 置位后生成循环立即放槽。幂等，
+        内芯已完结时为纯 no-op；drain 接手时交 _aclose_inner 收口。"""
+        self._fire_abort()
+        await super().aclose()
 
     async def _metrics_monitor_task(self, event_aiter) -> None:
         # 内芯官方流自带 metrics(或失败时无 metrics),转发链上层负责;本壳只排空。
@@ -675,7 +844,9 @@ class _LlmFallbackStream(llm.LLMStream):
         )
 
     async def _aclose_inner(self) -> None:
-        """真弃流(限时 1s):失败唔阻兜底/重生。"""
+        """真弃流(限时 1s):失败唔阻兜底/重生。W-ABORT：先发 abort 再关内芯
+        （force——drain 交接后的最后放弃点，正是要中止服务端僵尸解码的地方）。"""
+        self._fire_abort(force=True)
         try:
             await asyncio.wait_for(self._inner.aclose(), timeout=1.0)
         except Exception:  # noqa: BLE001 - 弃流失败唔阻后续
@@ -831,12 +1002,14 @@ class _LlmFallbackStream(llm.LLMStream):
                                         flush=True,
                                     )
                                     drain_owns = True
+                                    self._drain_owns = True
                                     self._spawn_attached(self._drain_late_answer(first_task))
                                     return
                             except Exception:  # noqa: BLE001 - 闸回调失败=照常兜底
                                 pass
                         self._emit_fallback()
                         drain_owns = True
+                        self._drain_owns = True
                         self._spawn_attached(self._drain_late_answer(first_task))
                     else:
                         # 旧行为(kill-switch LLM_LATE_ANSWER_DEADLINE_S=0,或无
@@ -857,6 +1030,9 @@ class _LlmFallbackStream(llm.LLMStream):
             async for ev in self._inner:
                 self._event_ch.send_nowait(ev)
         except asyncio.CancelledError:
+            # W-ABORT：框架直 cancel（打断/会话收尾，未必经 aclose 链）——
+            # 内芯生成可能还在跑，同点发 abort（与 aclose 幂等共享一旗）。
+            self._fire_abort()
             if first_task is not None and not first_task.done() and not drain_owns:
                 first_task.cancel()
             raise
@@ -1537,7 +1713,12 @@ class _RepeatSelfGuardStream(_CascadeCloseStreamMixin, llm.LLMStream):
     EX-2(2026-09-28)跨轮扩展:除比对上一条回复(REPEAT_SELF),再比对
     ContextState 跨轮账本 reply_ledger()(只含 gen=llm 历史回复)——句级相似
     ≥0.9(reuse _is_parrot_sentence)或整段滚动相似 ≥threshold → 剥,治「同一通
-    内隔轮复述」(已读乱回)。客户复述/追问轮(allow_repeat)整段放行。"""
+    内隔轮复述」(已读乱回)。客户复述/追问轮(allow_repeat)整段放行。
+
+    编造号码守卫(2026-10-01,call-231aa92a):同流逐句过
+    ``guard_fabricated_number``(number_on=True 时)——无捕获的号码确认句替换为
+    索取句、错号改正为捕获号码。修改发生在**放行前**,TTS/历史/turns 三方拿到
+    同一份文本(原文单轨);命中风险句时首段早发让位到句界(整句在手才动)。"""
 
     def __init__(
         self,
@@ -1549,6 +1730,11 @@ class _RepeatSelfGuardStream(_CascadeCloseStreamMixin, llm.LLMStream):
         ledger: list[str] | None = None,
         threshold: float = 0.85,
         allow_repeat: bool = False,
+        number_on: bool = False,
+        number_lang: str = "",
+        number_captured: str | None = None,
+        number_turn_text: str | Callable[[], str | None] | None = None,
+        number_known_text: str | Callable[[], str | None] | None = None,
     ):
         super().__init__(llm=plugin, chat_ctx=llm.ChatContext(), tools=[], conn_options=APIConnectOptions())
         self._inner = inner
@@ -1568,6 +1754,14 @@ class _RepeatSelfGuardStream(_CascadeCloseStreamMixin, llm.LLMStream):
         # 已早放的片段(换头复读防线):下一句界判定时前缀拼合比对,判复读
         # 只剥余段(片段已出声不可回收,但复读主体不得再播)。
         self._released_head = ""
+        # 编造号码守卫接线(2026-10-01):开关+语言+合法数字源(捕获账本 ∪ 本轮
+        # 客户原话转写 ∪ 对象档案已知事实);默认关(直接构造的旧调用点零变化,
+        # ContextAwareLLM.chat 才按 env 打开)。
+        self._number_on = bool(number_on)
+        self._number_lang = str(number_lang or "")
+        self._number_captured = number_captured
+        self._number_turn_text = number_turn_text
+        self._number_known_text = number_known_text
         if self._ledger and allow_repeat:
             print("REPEAT_CROSS_TURN_SKIPPED reason=reask", flush=True)
 
@@ -1630,8 +1824,12 @@ class _RepeatSelfGuardStream(_CascadeCloseStreamMixin, llm.LLMStream):
         闸门在本层——token 攒到句界才放,首句 20+ 字=1 秒级干等)。铁闸
         复用 _first_chunk_cut(数字/拉丁 run 不劈、句界 N+6 容差内让位
         自然断点);前缀命中复读语料的片段扣住(见 _fragment_is_repeat_head)。
-        只动首段:后续句仍按句界对齐,复读判定面零变化;env=0 逐字节旧行为。"""
-        if self._bypass and not self._cross_on:
+        只动首段:后续句仍按句界对齐,复读判定面零变化;env=0 逐字节旧行为。
+
+        编造号码守卫(2026-10-01):number_on 时缓冲里出现数字/语境词残件
+        (_number_hold)→ 首段早发让位到句界,整句在手才交给
+        guard_fabricated_number 校验(放行前改,TTS/账本同文本)。"""
+        if self._bypass and not self._cross_on and not self._number_on:
             return text
         self._buf += text
         out: list[str] = []
@@ -1654,6 +1852,15 @@ class _RepeatSelfGuardStream(_CascadeCloseStreamMixin, llm.LLMStream):
                 self._released_head = ""
                 continue
             self._released_head = ""
+            if self._number_on:
+                # 放行前过号码守卫:改后文本=TTS 念的=turns 账本记的(原文单轨)。
+                sentence = guard_fabricated_number(
+                    sentence,
+                    self._number_lang,
+                    self._number_captured,
+                    self._number_turn_source(),
+                    self._number_known_source(),
+                )
             out.append(sentence)
             self._emitted.append(sentence)
         if out:
@@ -1661,7 +1868,11 @@ class _RepeatSelfGuardStream(_CascadeCloseStreamMixin, llm.LLMStream):
         elif not self._first_sent:
             n = _tts_first_chunk_chars()
             cut = _first_chunk_cut(self._buf, n) if n > 0 else None
-            if cut is not None and not self._fragment_is_repeat_head(self._buf[:cut]):
+            if (
+                cut is not None
+                and not self._fragment_is_repeat_head(self._buf[:cut])
+                and not self._number_hold()
+            ):
                 head = self._buf[:cut]
                 self._buf = self._buf[cut:]
                 self._first_sent = True
@@ -1673,8 +1884,14 @@ class _RepeatSelfGuardStream(_CascadeCloseStreamMixin, llm.LLMStream):
                 # _MAX_HOLD(默认 22 字)强制放行——无句界长首句在此前可无限期
                 # 扣住=零句死(见 _repeat_head_max_hold 档案)。放行走同一切点
                 # 函数(数字/拉丁 run 不劈),复读主体仍由下一句界拼合纵深剥。
+                # 号码守卫扣留(numeric pending)连强制放行也压住:半截号码出声
+                # 不可回收,等句界整句校验(LLM 纪律单句≤24字,等窗短)。
                 hold = _repeat_head_max_hold()
-                if 0 < hold <= len(self._buf) and not self._head_force_released:
+                if (
+                    0 < hold <= len(self._buf)
+                    and not self._head_force_released
+                    and not self._number_hold()
+                ):
                     self._head_force_released = True
                     head = self._buf[:cut]
                     self._buf = self._buf[cut:]
@@ -1688,8 +1905,47 @@ class _RepeatSelfGuardStream(_CascadeCloseStreamMixin, llm.LLMStream):
                     )
         return "".join(out)
 
+    def _number_hold(self) -> bool:
+        """编造号码守卫的首段早发扣留判据(number_on 才生效)。
+
+        缓冲里可能出现号码确认(数字/语境词残件)=守卫必须整句在手才能替换/
+        改正 → 早发(含 D1 强制放行)让位到句界;number_on=False 恒 False
+        (旧路径逐字节零变化)。"""
+        return self._number_on and number_guard_pending(self._buf)
+
+    def _number_turn_source(self) -> str | None:
+        """本轮客户原话(守卫合法数字源之二)。
+
+        惰性取:抢跑(preemptive)流的构造早于 turn 钩子写完本轮文本,构造期
+        快照会拿到上一轮——每次求值现取,流真正喂文本时已是本轮值。取不到
+        (异常/非文本)=None,守卫按「无权威源」只认捕获账本。"""
+        v = self._number_turn_text
+        if callable(v):
+            try:
+                v = v()
+            except Exception:  # pragma: no cover - 取不到=按无权威源
+                return None
+        if v is None:
+            return None
+        return v if isinstance(v, str) else str(v)
+
+    def _number_known_source(self) -> str | None:
+        """对象档案等系统已知事实(守卫合法数字源之三,2026-10-01 补)。
+
+        AI 念读系统已知数据(快递单号等)做确认係合法确认环——客户当场可纠正,
+        与「复述用户真说过的话」同权。惰性取,同 turn_source 姿势。"""
+        v = self._number_known_text
+        if callable(v):
+            try:
+                v = v()
+            except Exception:  # pragma: no cover - 取不到=无此源
+                return None
+        if v is None:
+            return None
+        return v if isinstance(v, str) else str(v)
+
     def _flush_at_end(self) -> str:
-        if (self._bypass and not self._cross_on) or not self._buf:
+        if (self._bypass and not self._cross_on and not self._number_on) or not self._buf:
             return self._buf
         rest = self._buf
         self._buf = ""
@@ -1700,6 +1956,15 @@ class _RepeatSelfGuardStream(_CascadeCloseStreamMixin, llm.LLMStream):
             self._cross_suppressed += 1
             print(f"REPEAT_CROSS_TURN_SUPPRESSED sent={rest!r}", flush=True)
             return ""
+        if self._number_on:
+            # 流末余段同样过守卫(放行前改;TTS 与账本同文本)。
+            rest = guard_fabricated_number(
+                rest,
+                self._number_lang,
+                self._number_captured,
+                self._number_turn_source(),
+                self._number_known_source(),
+            )
         self._emitted.append(rest)
         return rest
 
@@ -1847,16 +2112,41 @@ class ContextState:
         self.allow_repeat: bool = False
         # ASR 受限润色映射（2026-09-27,原文单轨契约见 set_polished 注释）。
         self._polished_map: dict[str, str] = {}
+        # 本轮客户原话转写(编造号码守卫的合法数字源之二,2026-10-01):turn 钩子
+        # 在文本定稿(净化/累积合并完)后写入,LLM 流装配时读——复述内容源唯一=
+        # 用户真说过的话;缺省空串=拿不到权威源(守卫只认捕获账本)。
+        self._turn_user_text: str = ""
 
     @property
     def revision(self) -> int:
         return self._revision
+
+    def set_turn_user_text(self, text: str) -> None:
+        """记本轮客户原话转写(逐轮覆盖,不进尾部/revision——纯守卫读面)。"""
+        self._turn_user_text = str(text or "")
+
+    @property
+    def turn_user_text(self) -> str:
+        """只读出口:本轮客户原话转写(编造号码守卫数字源;空=未写)。"""
+        return self._turn_user_text
+
+    @property
+    def object_brief(self) -> str:
+        """只读出口:对象档案(编造号码守卫数字源之三——系统已知事实念读)。"""
+        return self._object_brief
 
     def set_whatsapp_note(self, num: str) -> None:
         v = num or ""
         if v != self._whatsapp_note:
             self._whatsapp_note = v
             self._revision += 1
+
+    @property
+    def whatsapp_note(self) -> str:
+        """只读出口：本通已捕获的客户号码文本（编造号码守卫比对基准）。
+
+        空串=本通尚未捕获（守卫按「无捕获」处理）。"""
+        return self._whatsapp_note
 
     def set_flow_current(self, current: str) -> None:
         """每轮更新当前步约束(flow controller 推进后调用)。
@@ -2619,25 +2909,39 @@ class ContextAwareLLM(llm.LLM):
         # 非 LLMStream(单测 _CaptureInner 返回 "ok")时原样透传。
         if isinstance(inner_stream, llm.LLMStream):
             _stripped = _StripTailAnchorStream(self, inner_stream)
-            if (
-                os.environ.get("BOK_REPEAT_GUARD", "1") == "1"
-                and self._ctx is not None
-            ):
+            # 编造号码守卫(2026-10-01)总闸:BOK_NUMBER_GUARD 默认 "1",="0" 零行为
+            # 变化。与复读防线共用同一条句级流(两条防线互相独立——复读闸关时
+            # 号码守卫仍要跑,故这里是 or)。
+            _number_on = os.environ.get("BOK_NUMBER_GUARD", "1") == "1"
+            _repeat_on = os.environ.get("BOK_REPEAT_GUARD", "1") == "1"
+            if (_repeat_on or _number_on) and self._ctx is not None:
                 # 出口复读防线(2026-09-12):逐句比对上一句回复,拟声复读句剥掉
                 # (call-8fa17d2b 两轮一字不差实证);客户要求重讲轮放行。
                 # EX-2:再叠跨轮账本(gen=llm 历史回复),治同通隔轮复述;
                 # BOK_REPEAT_CROSS_TURN=0 或复问放行(allow_repeat)时账本喂空。
                 _cross_ledger = (
                     self._ctx.reply_ledger()
-                    if _repeat_cross_turn_on() and not self._ctx.allow_repeat
+                    if _repeat_on
+                    and _repeat_cross_turn_on()
+                    and not self._ctx.allow_repeat
                     else []
                 )
                 out = _RepeatSelfGuardStream(
                     self, _stripped, self._ctx.last_reply,
-                    bypass=self._ctx.repeat_requested or self._ctx.allow_repeat,
+                    bypass=(not _repeat_on)
+                    or self._ctx.repeat_requested
+                    or self._ctx.allow_repeat,
                     ledger=_cross_ledger,
                     threshold=_repeat_cross_turn_sim(),
                     allow_repeat=self._ctx.allow_repeat,
+                    number_on=_number_on,
+                    number_lang=self._ctx.user_language,
+                    number_captured=self._ctx.whatsapp_note,
+                    # 惰性读:抢跑流构造早于 turn 钩子写完本轮原话(见
+                    # _number_turn_source)。
+                    number_turn_text=lambda: self._ctx.turn_user_text,
+                    # 合法源之三:对象档案已知事实(快递单号等系统数据念读)。
+                    number_known_text=lambda: self._ctx.object_brief,
                 )
                 # P2.a（2026-09-29 v2 §5）：持最近 guard 流引用——agent 侧 speech
                 # watcher 在 interrupted 补账时读 pending_buffer，cancel 轮的

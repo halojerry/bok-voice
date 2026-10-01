@@ -1405,6 +1405,14 @@ def _llm_queue_proxy_on() -> bool:
     return os.environ.get("BOK_LLM_QUEUE_PROXY", "1") == "1"
 
 
+# mlx_lm server 入口 wrapper（2026-10-01 W-ABORT）：`from mlx_lm import server`
+# 后做按请求身份的生成中止 patch（POST /v1/abort），argv 原样透传。三处 mlx
+# 启动点（:1235/:1239 主 LLM、:1236 MT、:1237 settle/9B）统一走它；
+# BOK_MLX_ABORT=0 时 wrapper 零 patch=逐字节旧行为。客户端 req_id 由 agent
+# worker 侧 livekit_plugins.MlxLlmLLM 注入（X-Bok-Req-Id）。
+MLX_SERVER_WRAPPER = ROOT / "services" / "llm-mlx" / "bok_mlx_server.py"
+
+
 def _mac_llm_server_argv(
     llm_py: Path,
     llm_model: str,
@@ -1415,6 +1423,10 @@ def _mac_llm_server_argv(
 ) -> list[str]:
     """mac mlx_lm server 完整命令行组装(纯函数,离线可单测)。
 
+    入口=同仓 wrapper ``services/llm-mlx/bok_mlx_server.py``（2026-10-01
+    W-ABORT；argv 其余逐字节原样透传给 mlx server）。Windows/Linux 的
+    llama.cpp 分支不涉及。
+
     draft 旗标(BOK_LLM_DRAFT=1 且模型在盘,见 _llm_draft_flags)**追加在 argv
     末尾**——关=逐字节同旧命令行(默认档零漂移);开=尾部多
     ``--draft-model <path> --num-draft-tokens 3``。prompt-cache-bytes 随 draft
@@ -1424,7 +1436,7 @@ def _mac_llm_server_argv(
         draft_flags = _llm_draft_flags(current)
     cache_bytes = _default_prompt_cache_bytes(draft_on=bool(draft_flags))
     return [
-        str(llm_py), "-m", "mlx_lm", "server",
+        str(llm_py), str(MLX_SERVER_WRAPPER),
         "--model", llm_model, "--host", "127.0.0.1", "--port", mlx_port,
         "--prompt-cache-size", "128",
         "--prompt-cache-bytes", cache_bytes,
@@ -1487,6 +1499,7 @@ def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
                                  log_level=llm_log_level, draft_flags=_draft_flags),
             run_dir / "llm.pid",
             log_dir / "llm.log",
+            env=_mlx_hf_offline_env(),
         )
         if _queue_on:
             print("[bok] llm queue proxy :1235 -> mlx :1239 (reply lane priority)")
@@ -1530,6 +1543,22 @@ def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
     )
 
 
+def _mlx_hf_offline_env() -> dict[str, str]:
+    """mlx server 全家离线档（2026-10-01 第十三波）：模型恒本地绝对路径，hub 元数据
+    探测纯属浪费——call-231aa92a 窗口 settle-llm.log INFO 实证重启后首请求先去
+    huggingface.co 查 revision（401 匿名限流）再冷缓存，首请求 3.5-3.9s 的直接
+    组分。本地缺件时离线档让它大声失败（INFO 日志可见）而非静默网络等待。
+    `download` 车道不走本 env（bootstrap 照常联网拉模型）。残迹观察位：huihui-9B
+    首请求仍见过一次 revision 查询——transformers 系 tokenizer 装载认
+    TRANSFORMERS_OFFLINE 不认 HF_HUB_OFFLINE,两旗都给;INFO 日志盯下一次。"""
+    return {
+        "HF_HUB_OFFLINE": "1",
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "TRANSFORMERS_NO_ADVISORY_WARNINGS": "1",
+    }
+
+
 def _start_mt_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> bool:
     """B 线同传翻译 LLM(:1236,Hy-MT2 小模型):与主 LLM 分进程,prefill 互不挤占。
 
@@ -1547,12 +1576,14 @@ def _start_mt_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> bool
     _apply_mlx_template_fix(llm_py)
     # 逐句无状态 MT:请求前缀只有模板头一条,32 槽 prompt cache 足够;Hy-MT2
     # 自带非思考对话模板,不传 --chat-template-args(主 LLM 的关思考参数不通用)。
+    # 入口=wrapper（W-ABORT；B 线取消/打断流同享 abort）。
     _start_proc(
-        [str(llm_py), "-m", "mlx_lm", "server",
+        [str(llm_py), str(MLX_SERVER_WRAPPER),
          "--model", mt_model, "--host", "127.0.0.1", "--port", "1236",
          "--prompt-cache-size", "32", "--log-level", "WARNING"],
         run_dir / "mt-llm.pid",
         log_dir / "mt-llm.log",
+        env=_mlx_hf_offline_env(),
     )
     return True
 
@@ -1588,13 +1619,15 @@ def _start_settle_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> 
     # 主脑,槽位占用归因(排队的 35s TTFT 类事故)要读 mlx 请求/prompt-cache 命中行
     # (settle-llm.log);BOK_LLM_LOG_LEVEL=WARNING 回静默(与 :1235 同一旋钮)。
     _log_level = os.environ.get("BOK_LLM_LOG_LEVEL", "INFO")
+    # 入口=wrapper（W-ABORT；被打断/取消的 9B 生成立即放槽=打断级联根治点）。
     _start_proc(
-        [str(llm_py), "-m", "mlx_lm", "server",
+        [str(llm_py), str(MLX_SERVER_WRAPPER),
          "--model", settle_model, "--host", "127.0.0.1", "--port", "1237",
          "--prompt-cache-size", "8", "--prompt-cache-bytes", "2GB",
          "--chat-template-args", '{"enable_thinking":false}', "--log-level", _log_level],
         run_dir / "settle-llm.pid",
         log_dir / "settle-llm.log",
+        env=_mlx_hf_offline_env(),
     )
     return True
 
@@ -2018,6 +2051,10 @@ _FORWARD_ENV = (
     "MINIMAX_BIDI_HEAD_FLUSH",
     # —— LLM 生成链（兜底/投机/预热/超时预算） ——
     "BOK_LLM_FALLBACK",
+    # mlx 生成中止（W-ABORT，2026-10-01）：agent worker 侧 MlxLlmLLM 读；="0"
+    # 时不带 X-Bok-Req-Id、不发 POST /v1/abort（字节面同旧）。服务端 wrapper
+    # 同键（dev serve 走 _start_proc merge；prod 侧 wrapper 由 bok 拉起时继承）。
+    "BOK_MLX_ABORT",
     "BOK_PREFILL_SPEC",
     "BOK_PREFILL_SPEC_DEBUG",
     "BOK_PREFILL_SPEC_FINAL_QUIET_MS",
@@ -2172,6 +2209,10 @@ _FORWARD_ENV = (
     "BOK_REPEAT_GUARD",
     "BOK_REPEAT_CROSS_TURN",
     "BOK_REPEAT_CROSS_TURN_SIM",
+    # 编造号码输出守卫（2026-10-01，call-231aa92a）：LLM 流出口逐句校验号码
+    # 确认句——数字须来自 {捕获账本, 本轮客户原话}，编造者改写/替换（默认 "1"，
+    # "0"=关=恒等返回；实现 packages/core/bok_voice_core/output_guard.py）。
+    "BOK_NUMBER_GUARD",
     "BOK_TAIL_SLIM",
     "BOK_MEMORY_CHARS",
     # 尾部节食（第十一波 2026-09-29）：slim 轮记忆块降频——距上次带过 ≥N 条

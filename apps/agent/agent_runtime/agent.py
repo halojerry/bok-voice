@@ -5998,6 +5998,11 @@ async def entrypoint(ctx):
                         except Exception:  # pragma: no cover - 历史合并失败仅损转写一致性
                             pass
                         user_text = _d_merged
+            # 编造号码守卫合法数字源之二(2026-10-01):文本定稿(净化+累积合并完)
+            # 后写本轮客户原话——LLM 流出口的守卫认「客户真说过的话 ∪ 捕获账本」,
+            # 复述听错的让客户当场纠正,守卫绝不猜「正确」号码。必须落在所有
+            # StopResponse 早退分支(脚本直念轮)之后:那些轮不经 LLM 流,零消费。
+            context_state.set_turn_user_text(user_text)
             # WA 直捕 canned 确认(EX-2,2026-09-28):客户一句报齐号码(captured 直路)
             # 旧版落穿去 LLM 生成;累积 flush 路已有 _wa_number_line 脚本直念确认。
             # 本路对齐:新捕获即 canned 确认(零 TTFT,替掉一个 LLM 轮=更快)。

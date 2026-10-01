@@ -54,12 +54,15 @@ def test_draft_on_model_absent_no_flags(monkeypatch, tmp_path, capsys):
 
 
 def test_draft_off_argv_byte_identical(monkeypatch):
-    """draft 关 → mlx server 命令行逐字节同旧(钉死默认档零漂移)。"""
+    """draft 关 → mlx server 命令行除 wrapper 入口外逐字节同旧(默认档零漂移)。
+
+    2026-10-01 W-ABORT：入口从 ``-m mlx_lm server`` 换成同仓 wrapper
+    （services/llm-mlx/bok_mlx_server.py，argv 原样透传），其余旗标/顺序不变。"""
     _clear_draft_env(monkeypatch)
     argv = bok._mac_llm_server_argv(
         Path("py"), "/models/main-4b", "1239", {"llm_draft": _DRAFT_REPO})
     assert argv == [
-        "py", "-m", "mlx_lm", "server",
+        "py", str(bok.MLX_SERVER_WRAPPER),
         "--model", "/models/main-4b", "--host", "127.0.0.1", "--port", "1239",
         "--prompt-cache-size", "128",
         "--prompt-cache-bytes", "4GB",
