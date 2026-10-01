@@ -46,6 +46,10 @@ export type NavItem = {
   admin?: boolean;
   /** root 专属（平台面，如 /nodes 节点治理）；仅 root 可见。 */
   rootOnly?: boolean;
+  /** 属主专属（引擎基建面，如 /settings）：root 或本机匿名属主（auth-off 单机
+   *  =整机属主）可见；admin/user 恒不可见——PUT /api/settings 已同款收 root
+   *  （2026-09-27），读面仍走 CP settings 键供 voice-options 等消费。 */
+  ownerOnly?: boolean;
   /** lucide-react 字形（侧边栏图标轨/折叠态提示用）。 */
   icon: LucideIcon;
 };
@@ -85,7 +89,9 @@ export const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
       { href: "/users", label: "员工", admin: true, mkey: "users", icon: Users },
       { href: "/nodes", label: "节点", rootOnly: true, icon: Server },
       { href: "/audit", label: "审计", admin: true, mkey: "audit", icon: ScrollText },
-      { href: "/settings", label: "设置", admin: true, mkey: "settings", icon: Settings },
+      // 设置=引擎基建面（asr/llm/tts/vad/sip/sms）：admin/user 不可改不可见
+      // （2026-09-27 收口，镜像 /nodes 先例）；本地匿名单机形态照常全权。
+      { href: "/settings", label: "设置", ownerOnly: true, icon: Settings },
     ],
   },
 ];
@@ -118,12 +124,13 @@ export function isStageRoute(pathname: string): boolean {
   return STAGE_ROUTE_PREFIXES.some((prefix) => matchesPath(pathname, prefix));
 }
 
-/** 路由访问门（契约 §4）：open=放行；page=按权限键；manager=主管专属；root=root 专属。 */
+/** 路由访问门（契约 §4）：open=放行；page=按权限键；manager=主管专属；root=root 专属；owner=属主专属。 */
 export type RouteGate =
   | { kind: "open" }
   | { kind: "page"; key: PageKey }
   | { kind: "manager" }
-  | { kind: "root" };
+  | { kind: "root" }
+  | { kind: "owner" };
 
 /** 前缀匹配：/calls 命中 /calls 与 /calls/**（静态导出尾斜杠兼容），不命中 /callsXYZ。 */
 export function matchesPath(pathname: string, prefix: string): boolean {
@@ -134,6 +141,7 @@ export function matchesPath(pathname: string, prefix: string): boolean {
 export function gateForPath(pathname: string): RouteGate {
   const hit = [...FLAT_NAV, ...GUARD_ONLY].find((n) => matchesPath(pathname, n.href));
   if (!hit) return { kind: "open" };
+  if (hit.ownerOnly) return { kind: "owner" };
   if (hit.rootOnly) return { kind: "root" };
   if (hit.admin) return { kind: "manager" };
   return hit.key ? { kind: "page", key: hit.key } : { kind: "open" };
@@ -145,6 +153,7 @@ export function gateForPath(pathname: string): RouteGate {
  * user=话务员台——权限键 ∩ 有效集；匿名本地模式=单机全权。 */
 export function navVisible(item: NavItem, session: Session | null): boolean {
   if (!session) return false;
+  if (item.ownerOnly) return session.anonymous || (session.role === "root" && !session.anonymous);
   if (item.rootOnly) return !session.anonymous && session.role === "root";
   if (session.anonymous) return true;
   if (session.role === "root") return Boolean(item.admin) || item.rootOnly === true;
