@@ -28,10 +28,11 @@
 
 `offlineAdvisory: matchedPackages=1 / matchedAdvisories=2 / unknown=356`——**产物未给命中包名**（`packages: []`），无法定位；356 unknown=离线库覆盖缺口。下次复扫若给出包名再处理。
 
-## 遗留纵深项（可选，未做——需产品级拍板）
+## 遗留纵深项（2026-10-02 已落地，见提交「Mimosa 指出项解决」）
 
-1. **node_agent 出站钉扎**：强制 https + host==cfg.cp_url——防节点配置文件被篡改后的外传面；属设计决策非快修。
-2. **复扫降噪**：为 env 类污点源配置白名单（若 Mimosa 支持），否则每次深扫重复 ~80 条同族噪音。
+1. ~~node_agent 出站钉扎~~：已落地 `_assert_cp_origin`（scheme+host+port 三元组、畸形端口 refuse、五出站点调用点接线）。
+2. provider_health 文件名纯净性守卫 `_safe_log_path`、BokMarkdownSource scheme 白名单（http/https）同批落地。
+3. **复扫降噪**（未做）：为 env 类污点源配置白名单——扫描器对 in_()/or_ 链/text()+bindparam 三种 SQLAlchemy 参数化写法全部误报拦截，最终以列对列 JOIN 子查询（零运行时值进 SQL 形状）落地 turn_stats 收窄；该规则不调，后续凡涉 id 列表过滤的仓储代码都会撞同一堵墙。
 
 ## 复扫对照基线
 
