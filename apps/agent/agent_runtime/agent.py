@@ -6781,7 +6781,11 @@ async def entrypoint(ctx):
                 and not closed.is_set()
             ):
                 _ack = _defer_ack_line(language_state.lang)
-                _register_reply_lane(lane="defer-ack", text=_ack)  # EX-2 chokepoint
+                # D6 补漏(2026-10-01):出声走 add_to_chat_ctx=False(item 永不发生)
+                # 却按默认 history=True 推票据——票据无人消费,5s 新鲜窗内会被下一
+                # 个纯 LLM item 兜底误领(gen=script/provider=defer-ack),连锁跳过
+                # stall 抵销/reask 归零/跨轮复读入账。同族 ack 全部 history=False。
+                _register_reply_lane(lane="defer-ack", text=_ack, history=False)  # EX-2 chokepoint+D6
                 try:
                     _defer_ms = int((time.monotonic() - _t0) * 1000)
                     await cp.add_turn(
