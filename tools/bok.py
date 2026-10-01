@@ -338,6 +338,11 @@ def _qwen3_tts_sidecar_env(base: dict[str, str]) -> dict[str, str]:
     当天新键 `QWEN3_TTS_SPLIT_MAX_CHARS` 正落在死区）。前缀整族透传：新增
     sidecar 调参键自动可达，不用回改本函数。空值不透传（必填键优先）。"""
     env = dict(base)
+    # 双模型强制键(第十七波 2026-10-02):TTS sidecar 启动期条件加载的逃生键
+    # (registry 空时 clone 不载省 2.9GB;"1"=无条件双载回旧行为)——无 QWEN3_TTS_
+    # 前缀,单独透传。
+    if os.environ.get("BOK_TTS_BOTH_MODELS", "") != "":
+        env.setdefault("BOK_TTS_BOTH_MODELS", os.environ["BOK_TTS_BOTH_MODELS"])
     for key, val in os.environ.items():
         if key.startswith("QWEN3_TTS_") and val != "":
             env.setdefault(key, val)
@@ -2040,6 +2045,12 @@ _FORWARD_ENV = (
     # 旧「相邻轮歇一轮」seq 冷却把慢轮覆盖打穿,改时间窗后真实通话轮间隔
     # (>10s)普遍出窗=慢轮全覆盖,急连发段仍有阻尼。
     "BOK_FILLER_COOLDOWN_S",
+    # 垫话让路(第十七波 2026-10-02,call-4e8d58c1):真答案首音频就绪即停在播
+    # 垫话+hold 归零+reshot 查 reply 在途;="0" 一键回 09-10「垫话必须播完」。
+    "BOK_FILLER_YIELD",
+    # 晚到补答去重(第十七波):交付前与已交付文本比相似度(阈值沿用
+    # BOK_REPEAT_CROSS_TURN_SIM);="0" 跳过比对回旧行为。
+    "BOK_LATE_ANSWER_DEDUP",
     "BOK_FILLER_GAP_MS",
     "BOK_FILLER_CHAIN",
     "BOK_FILLER_MAX",

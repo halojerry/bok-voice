@@ -301,7 +301,17 @@ def run_realtime_demo() -> None:
     # livekit-agents 1.7.x 的 cli.run_app 需要显式子命令（start），与 A/B 线同。
     if len(sys.argv) == 1:
         sys.argv.append("start")
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name="bok-realtime", port=8084))
+    cli.run_app(
+        WorkerOptions(
+            entrypoint_fnc=entrypoint,
+            agent_name="bok-realtime",
+            port=8084,
+            # 空闲子进程池框架缺省 prod=min(cpu,4)：每个 worker 4 个空转子进程
+            # （本机 3 worker=12 个 idle 吃 ~3.1GB）。演示档几乎不常开，1 个足够
+            # 兜冷启动；框架无 env 旋钮，只能 WorkerOptions 传参（2026-10-02 内存瘦身）。
+            num_idle_processes=1,
+        )
+    )
 
 
 if __name__ == "__main__":

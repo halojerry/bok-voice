@@ -1473,7 +1473,15 @@ def run_interpreter() -> None:
 
     worker_port_singleton_guard(ports[direction], f"interp-{direction}")
     cli.run_app(
-        WorkerOptions(entrypoint_fnc=entrypoint, agent_name=f"bok-interp-{direction}", port=ports[direction])
+        WorkerOptions(
+            entrypoint_fnc=entrypoint,
+            agent_name=f"bok-interp-{direction}",
+            port=ports[direction],
+            # 空闲子进程池框架缺省 prod=min(cpu,4)：每个 worker 4 个空转子进程
+            # （本机 3 worker=12 个 idle 吃 ~3.1GB）。B 线通话量低，1 个足够兜
+            # 冷启动；框架无 env 旋钮，只能 WorkerOptions 传参（2026-10-02 内存瘦身）。
+            num_idle_processes=1,
+        )
     )
 
 

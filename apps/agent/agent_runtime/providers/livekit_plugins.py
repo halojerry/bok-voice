@@ -879,6 +879,12 @@ class _LlmFallbackStream(llm.LLMStream):
         # aclose 只关本层泵、不代表弃内芯；abort 只在真弃流点（_aclose_inner）
         # 强制触发，别把 drain 语义误杀。
         self._drain_owns = False
+        # 刀1 打断弃流（2026-10-02 call-4e8d58c1 R4 实证）：用户开口打断=答案
+        # 过时——abandon() force abort 服务端 + 熔断 drain/regen 补答交付；
+        # 纯超时（机器慢、答案仍相关）drain 语义不变。_bok_created 供打断侧
+        # 时序门（创建早于打断时刻=本轮僵尸；晚于=下一轮新流，绝不误杀）。
+        self._abandoned = False
+        self._bok_created = time.monotonic()
 
     def _fire_abort(self, force: bool = False) -> None:
         """弃流中止（幂等一次）：内芯生成未完结才发（已完结=服务端早放槽，免扰）。
@@ -903,6 +909,23 @@ class _LlmFallbackStream(llm.LLMStream):
         内芯已完结时为纯 no-op；drain 接手时交 _aclose_inner 收口。"""
         self._fire_abort()
         await super().aclose()
+
+    async def abandon(self) -> None:
+        """打断弃流（force，幂等）：用户已开口、本轮答案过时。
+
+        call-4e8d58c1 R4 病理：打断后框架 speech_handle 给 5s 宽限才硬 cancel，
+        首token超时 drain 又接管压制了 cancel 路径的 abort——僵尸 prefill 与下一轮
+        回复在同块 9B 上互抢（6110ms 里 96% 是白等）。打断时刻调本方法：
+        ① force abort 服务端（绕开 drain 压制，生成循环立即放槽）；
+        ② 置 _abandoned——drain/regen 后续一切补答交付熔断（晚到答案对已打断
+        的轮=重复内容，正是 17:28:08 重复交付的半个根因）；
+        ③ 内芯限时收口。纯超时（机器慢）路径永不调本方法，drain 语义零变化。"""
+        self._abandoned = True
+        self._fire_abort(force=True)
+        try:
+            await asyncio.wait_for(self._inner.aclose(), timeout=1.0)
+        except Exception:  # noqa: BLE001 - 弃流失败唔阻打断路径
+            pass
 
     async def _metrics_monitor_task(self, event_aiter) -> None:
         # 内芯官方流自带 metrics(或失败时无 metrics),转发链上层负责;本壳只排空。
@@ -935,6 +958,8 @@ class _LlmFallbackStream(llm.LLMStream):
             return
         if os.environ.get("BOK_LLM_REGEN", "1") != "1":
             return
+        if self._abandoned:
+            return
         try:
             parts: list[str] = []
             async for ev in self._stream_factory():
@@ -945,6 +970,9 @@ class _LlmFallbackStream(llm.LLMStream):
             text = "".join(parts).strip()
             if not text:
                 print("LLM_LATE_ANSWER source=regen empty — skip", flush=True)
+                return
+            if self._abandoned:
+                print(f"LLM_LATE_ANSWER dropped chars={len(text)} (interrupted regen)", flush=True)
                 return
             print(f"LLM_LATE_ANSWER source=regen chars={len(text)} — 补答", flush=True)
             await self._late_answer_cb(text)
@@ -995,6 +1023,12 @@ class _LlmFallbackStream(llm.LLMStream):
             note = f"err={exc!r}"
         await self._reap_first_task(first_task)
         await self._aclose_inner()
+        if self._abandoned:
+            print(
+                f"LLM_LATE_ANSWER dropped chars={len(''.join(parts).strip())} (interrupted drain)",
+                flush=True,
+            )
+            return
         salvage = "".join(parts).strip()
         if note:
             if salvage:

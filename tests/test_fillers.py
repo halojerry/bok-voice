@@ -1,5 +1,6 @@
-"""FillerDirector 单测(2026-09-10 资产化改版):manifest 池/语言铁律(绝不跨语言)/
-限次/轮换防重/播放排序契约(首音频不掐垫话+hold 扣压=垫话剩余+gap)/用户插话停播/kill-switch。
+"""FillerDirector 单测(2026-09-10 资产化改版;2026-10-02 播放排序翻转为让路):
+manifest 池/语言铁律(绝不跨语言)/限次/轮换防重/首音频停播+hold 归零(新政策,
+BOK_FILLER_YIELD=0 回「播完+hold 扣压」旧档)/用户插话停播/kill-switch。
 
 资产契约:垫话=随源码分发的 wav+manifest(apps/agent/agent_runtime/assets/fillers/),
 运行时只播文件绝不云合成;语言=装配时钉死的通话语言,池缺失明文跳过。
@@ -181,21 +182,27 @@ def test_player_none_disables(tmp_path):
     _run(_case())
 
 
-def test_reply_first_audio_does_not_stop_playing(tmp_path):
-    """播放排序契约:首音频到达只作废定时器,在播垫话必须播完(不掐)。"""
+def test_reply_first_audio_stops_playing(tmp_path):
+    """播放排序契约(2026-10-02 政策翻转):首音频到达即停垫话,hold 归零。
+
+    旧契约「垫话播完」的反例=call-4e8d58c1(真答案首音频 18.4s≈垫话2 播完 18.5s);
+    旧档回归由 BOK_FILLER_YIELD=0 臂覆盖(见 tests/test_filler_yield.py)。"""
 
     async def _case():
         d, player = _director(tmp_path)
         await d._fire(0)
         handle = player.handles[-1]
         d.on_reply_first_audio()
-        assert handle.stopped is False, "垫话在播被掐=违反播放排序契约"
-        assert d.hold_if_playing() > 0, "在播垫话应触发回复扣压"
+        assert handle.stopped is True, "首音频应停掉在播垫话(让路政策)"
+        assert d.hold_if_playing() == 0.0, "让路后回复不再扣压"
 
     _run(_case())
 
 
-def test_hold_if_playing_remaining_plus_gap(tmp_path):
+def test_hold_if_playing_legacy_timeline_under_kill_switch(tmp_path, monkeypatch):
+    """旧档(BOK_FILLER_YIELD=0)hold 时间轴契约原样保留:剩余+gap、播完保 gap 窗。"""
+    monkeypatch.setenv("BOK_FILLER_YIELD", "0")
+
     async def _case():
         d, player = _director(tmp_path)
         assert d.hold_if_playing() == 0.0  # 未播
@@ -387,9 +394,12 @@ _CHAIN_ENV = {
 
 
 def test_chain_fires_second_filler_when_reply_late(tmp_path, monkeypatch):
-    """首条播完、回复首音频仍未到 → gap 后自动补第二发(不重样、计数同源)。"""
+    """首条播完、回复首音频仍未到 → gap 后自动补第二发(不重样、计数同源)。
+
+    旧链发档(BOK_FILLER_CHAIN=1)整体走旧契约:hold 时间轴随之(让路闸关)。"""
     for k, v in _CHAIN_ENV.items():
         monkeypatch.setenv(k, v)
+    monkeypatch.setenv("BOK_FILLER_YIELD", "0")
 
     async def _case():
         d, player = _director(tmp_path)

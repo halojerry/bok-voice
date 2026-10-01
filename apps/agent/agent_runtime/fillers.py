@@ -15,10 +15,14 @@ voice_hit=1);miss 播源码资产兜底(永不哑,打点 voice_fallback=运行�
 (好的/收到/明白/嗯)与等待邀请(稍等/我看下),零动作动词;改话术=改生成脚本
 重新生成,一个 PR。
 
-播放排序(2026-09-10 用户拍板):垫话一旦开播必须播完。真回复首音频到达时
-不再掐垫话,而是 _RelaySynthesizeStream 向 hold_if_playing() 询问扣压时长
-(垫话剩余+BOK_FILLER_GAP_MS 默认 300ms),帧缓冲到点再放——垫话→静默→回复
-自然衔接。新用户轮(cancel)仍立即掐垫话:用户插话优先,放完旧垫话反而怪。
+播放排序(2026-10-02 政策翻转,取代 2026-09-10「垫话开播必须播完」):真答案首
+音频就绪即停垫话——on_reply_first_audio 调 _stop_playing(PlayHandle.stop 带
+0.05s fade),hold_if_playing 恒 0(_RelaySynthesizeStream 的 `if hold > 0`
+自然不睡),回复立即出声。旧契约(回复由 hold 扣到「垫话剩余+gap」)实弹反例:
+call-4e8d58c1 真答案首音频 18.4s≈第二发垫话播完 18.5s,垫话把答案整段顶到末尾。
+新契约三件=①首音频停播 ②hold 归零 ③reshot 查回复在途(pending)让路;总闸
+BOK_FILLER_YIELD(缺省 "1","0"=三件全回旧行为)。新用户轮(cancel)照旧立即掐
+垫话:用户插话优先,放完旧垫话反而怪。
 
 链发(2026-09-10):首条垫话播完、回复首音频仍未到 → 垫话后残余静默照旧,
 BOK_FILLER_GAP_MS 呼吸后自动补第二发——挂「播完观察者」等官方
@@ -100,6 +104,13 @@ def resample_pcm(pcm: bytes, from_rate: int, to_rate: int) -> bytes:
 
 def filler_enabled() -> bool:
     return os.environ.get("BOK_FILLER", "1") == "1"
+
+
+def _yield_enabled() -> bool:
+    """垫话让路总闸(2026-10-02 政策翻转,缺省开):真答案首音频就绪即停垫话+
+    hold 归零+reshot 见回复在途跳过。BOK_FILLER_YIELD=0 三件全回旧行为——
+    停播不调/hold 按旧时间轴扣压/reshot 不查 pending。"""
+    return os.environ.get("BOK_FILLER_YIELD", "1") == "1"
 
 
 def filler_delay_s() -> float:
@@ -543,6 +554,7 @@ class FillerDirector:
         entry_hit=None,
         call_label: str = "",
         context_resolver=None,
+        reply_pending_provider=None,
     ) -> None:
         self._session = session
         self._lang_resolver = lang_resolver
@@ -552,6 +564,10 @@ class FillerDirector:
         # W2c 语境化过渡承诺(2026-09-24):fire 时点惰性取语境桶(agent 注入,
         # 镜像 _user_text_provider 先例;异常吞掉回 ""=现行阶梯零变化)。
         self._context_resolver = context_resolver
+        # I2 垫话让路(2026-10-02):回复在途查询口(tts_cache 的
+        # reply_stream_pending_since)——reshot 开火前查「回复流已开未出声」,
+        # 在途即让路。None=旧门零变化(嵌入方不传)。
+        self._reply_pending_provider = reply_pending_provider
         self._last_bucket = ""  # W2c 观测:fired 行带桶标(空=非桶驱动)
         # W4 ①(2026-09-24):fired 行带 call 标——多路并发/归档日志按通话定位;
         # 空=零变化(单测/嵌入方不传)。
@@ -640,14 +656,19 @@ class FillerDirector:
         self._timer = asyncio.create_task(self._fire(delay))
 
     def on_reply_first_audio(self) -> None:
-        """真回复首音频(CachedTTS stream 回调):只作废定时器。
+        """真回复首音频(CachedTTS stream 回调):作废定时器;yield 档停掉在播垫话。
 
-        在播垫话**不掐**——播放排序契约=垫话播完→gap→回复;扣压由
-        tts_cache._RelaySynthesizeStream 向 hold_if_playing() 询时实现。
+        政策翻转(2026-10-02,call-4e8d58c1):旧契约=垫话一旦开播必须播完,回复
+        由 tts_cache hold 扣到「垫话剩余+gap」——实弹账本真答案首音频 18.4s≈
+        第二发垫话播完 18.5s,垫话把真答案整段顶到末尾。新契约=真答案首音频
+        就绪即停垫话(PlayHandle.stop 0.05s fade),hold 归零,回复立即出声。
+        `BOK_FILLER_YIELD=0` 回旧行为(不停播/hold 原值/reshot 不查 pending)。
         置位 _reply_audio_seen:链发观察者醒来时据此放弃补第二发。
         """
         self._reply_audio_seen = True
         self._cancel_timer()
+        if _yield_enabled() and self._stop_playing():
+            print("FILLER_YIELD stopped at_first_audio", flush=True)
 
     def set_on_fired(self, cb) -> None:
         """注册「垫话真正开播」回调(2026-09-17 RC3):agent 侧把响应看门狗顺延
@@ -674,13 +695,23 @@ class FillerDirector:
     def hold_if_playing(self) -> float:
         """回复首帧应扣压的秒数:垫话时间轴(开播+时长+gap)内=剩余量。
 
-        2026-09-11 用户复测实证「垫话→回复衔接生硬」:回复恰在垫话播完后到达时,
-        旧实现(handle done 即 0)零间隔硬接——现在播完后仍保住余下 gap 窗,
-        最小间隔契约=垫话结束→回复出声 ≥ gap;cancel(用户插话)清窗不扣压。"""
+        yield 档(2026-10-02 政策翻转)恒 0:真答案首音频就绪即已停垫话
+        (on_reply_first_audio),回复不再等垫话时间轴;tts_cache 侧 `if hold > 0`
+        自然不睡,tts_first_audio 口径自愈。旧档(2026-09-11 实证)保留:回复恰在
+        垫话播完后到达时零间隔硬接生硬——播完后仍保住余下 gap 窗,最小间隔
+        契约=垫话结束→回复出声 ≥ gap;cancel(用户插话)清窗不扣压。
+        """
         if not self._play_started:
             return 0.0
         hold = self._play_started + self._cur_dur + filler_gap_s() - time.monotonic()
-        return max(0.0, hold)
+        hold = max(0.0, hold)
+        if _yield_enabled():
+            if hold > 0:
+                # 仅在旧档真会扣压时打点=让路确实省掉了一段等待(旧档 hold 值
+                # 顺带入行,复盘可对账实际省了多少)。
+                print(f"FILLER_YIELD hold=0 (legacy {hold * 1000:.0f}ms)", flush=True)
+            return 0.0
+        return hold
 
     def play_offband(self, text: str) -> None:
         """C1 修复(2026-09-13 实机 A/B 实证):暂停播报绝不能走 session.say()——
@@ -770,18 +801,42 @@ class FillerDirector:
         self._reshot_done = False
         self._reply_audio_seen = False
 
-    def _stop_playing(self) -> None:
+    def _stop_playing(self) -> bool:
+        """停掉在播垫话(带 0.05s fade)。返回 True=确实停掉了一段在播音频。
+
+        返回值只服务 I1 让路观测(on_reply_first_audio 据此决定打不打
+        FILLER_YIELD 行);既有两个调用方(cancel/reset_per_call)忽略返回值,
+        语义逐字节不变。"""
         handle = self._handle
         self._handle = None
         if handle is None:
-            return
+            return False
         try:
             done = getattr(handle, "done", None)
             if callable(done) and done():
-                return
+                return False
             handle.stop()
+            return True
         except Exception:  # noqa: BLE001 - 停播失败让垫话自然播完(短语 ≤1.5s)
-            pass
+            return False
+
+    def _reply_pending_since_arm(self) -> bool:
+        """本轮 arm 之后回复流已开未出声(真答案在途)→ reshot 让路(I2)。
+
+        provider(tts_cache reply_stream_pending_since)返回「回复流已开、首音频
+        未到」起点的 monotonic;晚于本轮 arm=真答案已在路上,再补垫话只会继续
+        顶延迟(政策翻转:垫话服务真答案,不是反过来)。yield 闸关/provider 缺席/
+        无 arm 账本(直调 _fire 的嵌入方)/读取失败/早于 arm → False(旧行为)。
+        """
+        if not _yield_enabled() or self._reply_pending_provider is None:
+            return False
+        if not self._arm_time:
+            return False
+        try:
+            since = float(self._reply_pending_provider() or 0.0)
+        except Exception:  # noqa: BLE001 - 查询失败=不拦(旧行为)
+            return False
+        return since > self._arm_time
 
     def _spawn_chain(self) -> None:
         """首条起播即挂「播完观察者」——官方 PlayHandle.wait_for_playout 精确补位。
@@ -840,8 +895,9 @@ class FillerDirector:
 
         顺序=①每轮至多一次(独立计数 _reshot_done,不复用链发) ②env 闸
         ③无 arm 账本(直调 _fire 的嵌入方)不适用 ④gap 呼吸(垫话→垫话同款)
-        ⑤gap 中回复出声让位 ⑥elapsed>RESHOT_MIN_ELAPSED_S(真载荷轮才补——
-        治旧链发「固定双发」的根) ⑦补发走 _fire(reshot=True),计数同源(与
+        ⑤回复在途让路(I2,2026-10-02:真答案首帧已在路上=再补只会顶延迟)
+        ⑥gap 中回复出声让位 ⑦elapsed>RESHOT_MIN_ELAPSED_S(真载荷轮才补——
+        治旧链发「固定双发」的根) ⑧补发走 _fire(reshot=True),计数同源(与
         第一发合计消耗 BOK_FILLER_MAX);连轮冷却豁免同链发(本轮已有第一发=
         冷却已消耗,由 _fire 冷却门按 _reshot_done 放行)。"""
         if self._reshot_done:
@@ -852,6 +908,9 @@ class FillerDirector:
         if not self.fired_this_round():
             return
         await asyncio.sleep(filler_gap_s())
+        if self._reply_pending_since_arm():
+            print("FILLER_YIELD reshot skipped (reply pending)", flush=True)
+            return
         if self._reply_audio_seen:
             print("BOK_FILLER reshot skip reason=audio_arrived", flush=True)
             return
@@ -1057,6 +1116,11 @@ class FillerDirector:
             # 直调防御:kill-switch/player 缺失在 arm 已挡,这里再挡一次
             # (定时器任务与状态翻转存在竞态窗口)。
             if not filler_enabled() or self._player is None:
+                return
+            if reshot and self._reply_pending_since_arm():
+                # I2 让路(2026-10-02):观察段与真正开火之间的窗口里回复流已开
+                # (_reshot_wait 已先行拦一道,这里是 _fire 直调/竞态的第二道)。
+                print("FILLER_YIELD reshot skipped (reply pending)", flush=True)
                 return
             if self._guards() or filler_max_per_call() <= self._count:
                 return

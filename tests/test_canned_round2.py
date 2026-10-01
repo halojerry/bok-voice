@@ -255,9 +255,13 @@ def test_filler_gap_default_random_window(monkeypatch):
 
 def test_hold_returns_gap_window_after_filler_done(tmp_path, monkeypatch):
     """垫话播完后 hold 不得归零:回复恰在垫话尾后到达=零间隔硬接(用户实证生硬),
-    必须保住剩余 gap 窗;cancel(用户插话)清窗。"""
+    必须保住剩余 gap 窗;cancel(用户插话)清窗。
+
+    2026-10-02 政策翻转(让路)后本契约只活在旧档——BOK_FILLER_YIELD=0 显式恢复;
+    新档 hold 恒 0 由 tests/test_filler_yield.py 钉住。"""
     monkeypatch.setenv("BOK_FILLER_DELAY_MS", "1")
     monkeypatch.delenv("BOK_FILLER_GAP_MS", raising=False)
+    monkeypatch.setenv("BOK_FILLER_YIELD", "0")
     d = FillerDirector(
         _FakeSession(), lang_resolver=lambda: "zh", player=_FakePlayer(),
         guards=lambda: False, assets_dir=_make_assets(tmp_path),
