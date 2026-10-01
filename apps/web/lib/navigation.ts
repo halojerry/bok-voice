@@ -23,6 +23,7 @@ import {
   ScrollText,
   Server,
   Settings,
+  ShieldAlert,
   UserRound,
   Users,
   Workflow,
@@ -84,6 +85,11 @@ export const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
       { href: "/supervisor", label: "主管台", admin: true, mkey: "supervisor", icon: Headphones },
       { href: "/users", label: "员工", admin: true, mkey: "users", icon: Users },
       { href: "/nodes", label: "节点", rootOnly: true, icon: Server },
+      // 容灾处置面板（DR 波 §6）：rootOnly 入口 + 独立页——改动最小的一档
+      // （本行 + app/(app)/disaster/page.tsx；RouteGuard 的 root 门、侧栏过滤、
+      // 顶栏标题全部按 /nodes 同一条现成通路自动生效），不塞进 /settings
+      // （设置=配置面且已有属主专属语义，容灾=处置面，混页会把处置按钮埋进长表单）。
+      { href: "/disaster", label: "容灾", rootOnly: true, icon: ShieldAlert },
       { href: "/audit", label: "审计", admin: true, mkey: "audit", icon: ScrollText },
       { href: "/settings", label: "设置", admin: true, mkey: "settings", icon: Settings },
     ],

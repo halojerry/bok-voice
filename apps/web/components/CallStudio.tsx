@@ -16,6 +16,7 @@ import { api, apiBase } from "@/lib/api";
 import { describeConnectError, friendlyErrorText, useControlPlaneReady } from "@/lib/api-ready";
 import { listAudioDevicesOf, requestMicPermission, saveMicDevice, savedMicDevice, savedOutputDevice, switchWebOutputDevice, webCanSwitchOutput, type AudioDeviceInfo } from "@/lib/audio";
 import { startTrace } from "@/lib/logger";
+import { appendLogLines, isNearBottom, type LogLine } from "@/lib/live-logs";
 import { AgentAudioVisualizerAura } from "@/components/agents-ui/agent-audio-visualizer-aura";
 import { AgentChatIndicator } from "@/components/agents-ui/agent-chat-indicator";
 import { AgentChatTranscript } from "@/components/agents-ui/agent-chat-transcript";
@@ -24,6 +25,7 @@ import { AgentSessionProvider } from "@/components/agents-ui/agent-session-provi
 import { useMoodColor } from "@/hooks/use-mood-color";
 import { useAccount } from "@/components/account-context";
 import { useSession as useAppSession } from "@/components/session-context";
+import { FamineStatusLine, ProviderLines, useProviderMetrics } from "@/components/provider-status";
 
 // 模块级 trace（环形缓存+TTL 有界，见 lib/logger.ts 头注释）：数据加载/设备应用失败不再静默。
 const log = startTrace({ operation: "web.call-studio" });
@@ -456,12 +458,134 @@ function HistoryTranscript({ callId }: { callId: string }) {
   );
 }
 
-const PROVIDER_FIELDS: [string, string][] = [
-  ["asr", "ASR"],
-  ["llm", "LLM"],
-  ["tts", "TTS"],
-  ["vad", "VAD"],
-];
+/**
+ * 实时日志抽屉（DR 波契约 §5/§6）：CP `GET /api/calls/{id}/logs?after=<byte>` 游标续读。
+ * 2s 轮询；行追加渲染、上限最近 500 行（超出丢头部——游标不受影响，续读靠 next_offset）；
+ * EOF 标记；挂断/换 call_id 重置游标与缓冲（新一轮从字节 0 起，行不错位）；
+ * 自动滚底——用户上滚即暂停、回底（≤24px）恢复。
+ * 权限：通话页角色可读（CP 端 _gate_page("calls") 拦），此处不新做权限门（默认渲染）。
+ */
+const LOG_LINES_MAX = 500;
+const LOG_POLL_MS = 2000;
+const LOG_BOTTOM_EPS = 24;
+
+function CallLogDrawer({ callId }: { callId: string }) {
+  const [open, setOpen] = useState(false);
+  // 行带自增 id：头部丢行后 index 位移不撞 key（追加/截断逻辑=lib/live-logs.ts 纯函数）
+  const [lines, setLines] = useState<LogLine[]>([]);
+  const [eof, setEof] = useState(false);
+  const [err, setErr] = useState("");
+  const viewRef = useRef<HTMLDivElement | null>(null);
+  const stickRef = useRef(true); // true=贴底（自动滚）；用户上滚置 false
+  const offsetRef = useRef(0);
+  const seqRef = useRef(0);
+  const busyRef = useRef(false);
+
+  // 挂断/换通话：游标与缓冲全重置（callId 空=未接通，抽屉可开但不可读）。
+  useEffect(() => {
+    offsetRef.current = 0;
+    seqRef.current = 0;
+    stickRef.current = true;
+    setLines([]);
+    setEof(false);
+    setErr("");
+  }, [callId]);
+
+  useEffect(() => {
+    if (!open || !callId) return;
+    let stopped = false;
+    const load = async () => {
+      if (busyRef.current) return;
+      busyRef.current = true;
+      try {
+        const page = await api.callLogs(callId, offsetRef.current);
+        if (stopped) return;
+        const fresh = Array.isArray(page?.lines) ? page.lines : [];
+        if (fresh.length) {
+          setLines((prev) => {
+            const next = appendLogLines(prev, fresh, seqRef.current, LOG_LINES_MAX);
+            seqRef.current = next.nextId;
+            return next.lines;
+          });
+        }
+        if (typeof page?.next_offset === "number" && Number.isFinite(page.next_offset)) {
+          offsetRef.current = page.next_offset;
+        }
+        setEof(Boolean(page?.eof));
+        setErr("");
+      } catch (e) {
+        // 读失败保留已读行，亮一行原因（下一轮可能自愈）
+        if (!stopped) setErr(friendlyErrorText(String(e)));
+      } finally {
+        busyRef.current = false;
+      }
+    };
+    void load();
+    const t = setInterval(load, LOG_POLL_MS);
+    return () => {
+      stopped = true;
+      clearInterval(t);
+    };
+  }, [open, callId]);
+
+  // 自动滚底（仅贴底时；上滚不动视口）
+  useEffect(() => {
+    if (!open) return;
+    const el = viewRef.current;
+    if (el && stickRef.current) el.scrollTop = el.scrollHeight;
+  }, [lines, open, eof, err]);
+
+  const onScroll = () => {
+    const el = viewRef.current;
+    if (!el) return;
+    stickRef.current = isNearBottom(el.scrollHeight, el.scrollTop, el.clientHeight, LOG_BOTTOM_EPS);
+  };
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center justify-between gap-2">
+        <button
+          type="button"
+          className="btn-ghost text-xs"
+          aria-expanded={open}
+          onClick={() => setOpen((v) => !v)}
+        >
+          {open ? "收起实时日志" : "实时日志"}
+        </button>
+        {open && (
+          <span className="text-[10px] muted">
+            {!callId
+              ? "接通后可读本通日志"
+              : `${eof ? "已读到末尾" : "追加中"} · 每 2s 续读 · 最近 ${LOG_LINES_MAX} 行`}
+          </span>
+        )}
+      </div>
+      {open && (
+        <div className="rounded-lg border border-(--card-border) bg-muted/40">
+          <div
+            ref={viewRef}
+            onScroll={onScroll}
+            className="max-h-[260px] min-h-[96px] overflow-y-auto whitespace-pre-wrap break-all p-2 font-mono text-[11px] leading-relaxed"
+          >
+            {!callId ? (
+              <p className="muted">
+                未接通——接通后这里实时显示本通通话的 agent 日志（结构行 + 同窗口原始打印行）。
+              </p>
+            ) : lines.length === 0 && !err ? (
+              <p className="muted">暂无日志（通话开始后最多 2s 出现）…</p>
+            ) : (
+              lines.map((l) => <div key={l.id}>{l.text || " "}</div>)
+            )}
+            {callId && eof && lines.length > 0 && (
+              <p className="muted">—— 已读到文件末尾，继续等待新行 ——</p>
+            )}
+            {err && <p className="text-red-600">读取失败：{err}</p>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function str(v: unknown, fallback = "-") {
   return v === undefined || v === null || v === "" ? fallback : String(v);
@@ -640,6 +764,9 @@ function CallStudioInner({
   // 进来自动显示"已连接"、却只有一个会真挂断的按钮、无法接通的隐患。
   const roomConnected = session.room.state === ConnectionState.Connected;
   const isJoiningExisting = Boolean(stateCallId);
+  // Provider 实时读数（DR 波 §6，3s 轮询）：有通话=本通窗（call_id 过滤），
+  // 未接通=全局窗；请求失败静默保持上次值（卡不闪）。
+  const providerMetrics = useProviderMetrics(stateCallId || undefined);
   // 主管操作（暂停/接管/转人工）状态；挂断走 leave()。
   const [superviseMsg, setSuperviseMsg] = useState("");
   const [superviseBusy, setSuperviseBusy] = useState(false);
@@ -1012,6 +1139,9 @@ function CallStudioInner({
   }, []);
 
   return (
+    // 外层只为在既有三栏工作台下挂「实时日志」抽屉（DR 波 §6）——三栏网格自身
+    // 布局零改动；抽屉展开时页面整体变高（滚动），不挤压通话区。
+    <div className="flex flex-col gap-3">
     <div className="grid grid-cols-[280px_1fr_300px] gap-6 lg:h-[calc(100vh-7.5rem)]">
       {/* 左：对象档案 / 人设 */}
       <section className="card flex min-h-0 flex-col gap-4 overflow-y-auto">
@@ -1288,19 +1418,18 @@ function CallStudioInner({
 
       {/* 右：Provider / 音频 / 结算 */}
       <section className="card flex min-h-0 flex-col gap-4 overflow-y-auto">
+        {/* Provider 服务状态（DR 波 §6 实时化）：3s 轮询读数——
+            「ASR 🟢 已连接 · 412ms (p95 490)」+ 分隔线 + 「状态: 🟢 健康 (EMA 0.6s)」；
+            阈值/色调判定单点在 lib/provider-status.ts（与 root 容灾面板同源），
+            无数据=灰灯沿用原「已连接」文案；读数失败静默保持上次值。 */}
         <div className="rounded-lg bg-muted/60 p-3">
           <span className="label">Provider 服务状态</span>
-          <div className="mt-2 space-y-1 text-sm">
-            {PROVIDER_FIELDS.map(([kind, label]) => (
-              <p key={kind} className="flex justify-between">
-                <span className="muted">{label}</span>
-                <span className="inline-flex items-center gap-1.5 text-emerald-600">
-                  <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                  已连接
-                </span>
-              </p>
-            ))}
+          <div className="mt-2">
+            <ProviderLines providers={providerMetrics?.providers} />
           </div>
+          {/* 定稿草图里的「────」虚线=视觉分隔，正文用 1px 边框实现（等价） */}
+          <div className="my-2 border-t border-(--card-border)" />
+          <FamineStatusLine famine={providerMetrics?.famine} />
         </div>
         <AudioDevicesCard room={session.room} />
         <div className="rounded-lg bg-muted/60 p-3 text-sm">
@@ -1342,6 +1471,9 @@ function CallStudioInner({
           )}
         </div>
       </section>
+    </div>
+      {/* 实时日志抽屉（DR 波 §6）：本通 agent 日志游标续读（挂断即重置游标） */}
+      <CallLogDrawer callId={stateCallId} />
     </div>
   );
 }

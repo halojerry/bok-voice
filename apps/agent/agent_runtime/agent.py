@@ -49,6 +49,9 @@ from .plugins.knowledge import KnowledgePlugin
 from .plugins.settlement import SettlementTrigger
 from .providers.registry import build_provider_registry
 from .control_plane import ControlPlaneClient
+# DR 容灾+可观测(契约 §1,2026-10-01):worker 四 kind 指标批量上报 CP——
+# 通道/节流/吞错纪律全在模块内,agent 侧只做采样与生命周期挂线。
+from .metrics_report import MetricsReporter, VadInferTracker
 from .fillers import FillerDirector, derive_context_bucket
 # Laya 决策旁路(2026-09-26,docs/LAYA-EVAL.md):薄客户端+纯装配,日志由本模块统一
 # 打点;enabled 闸在最外层(意图=BOK_LAYA_JUDGE、QA 复核=BOK_LAYA_QA,两把 env 闸
@@ -4080,6 +4083,20 @@ async def entrypoint(ctx):
         except Exception:  # noqa: BLE001 - 解析失败按门关处理,唔阻装配
             _voice_style_model = ""
 
+    # DR 容灾+可观测(契约 §1,2026-10-01):worker 指标批量上报 CP。会话装配时
+    # 构造——上报通道复用既有 cp 客户端的 base_url 与请求头(同源:X-Call-ID/
+    # X-Bok-Channel: agent/机器凭据 Bearer),不另造一套 header 组装;_on_metrics
+    # 按四 kind 采样入队,后台 ≤2s 批量 POST /api/metrics/agent-report,失败全吞
+    # (静默丢、不重试不堆积)——纯观测,绝不进通话链路。call_id/account_id 取
+    # 本通会话上下文(account_id 同下方 _ctx_account 表达式)。_close 收尾 flush。
+    _metrics_reporter = MetricsReporter(
+        cp.base_url,
+        cp.request_headers,
+        call_id=call_id,
+        account_id=str((call or {}).get("account_id") or "acc-001"),
+    )
+    _vad_tracker = VadInferTracker()
+
     session = AgentSession(
         vad=vad_provider,
         stt=stt_provider,
@@ -4906,22 +4923,42 @@ async def entrypoint(ctx):
         try:
             if kind == "llm_metrics":
                 _turn_metrics["llm_ttft_ms"] = int(m.ttft * 1000)
+                # DR 契约 §1:llm_ttft=LLM 首 token 延迟(官方 llm_metrics.ttft,
+                # 秒→ms;取消/错误哨兵 -1 由 reporter 侧静默滤除)。
+                _metrics_reporter.add("llm_ttft", m.ttft * 1000)
                 # 行格式统一在 _format_llm_metrics（含 cached=prompt_cached/prompt,
                 # KV-cache 命中可视），单测直接喂鸭型 metrics 断言。
                 print(f"{tag}{_format_llm_metrics(m)}", flush=True)
                 _maybe_print_perceived(tag)
             elif kind == "tts_metrics":
                 _turn_metrics["tts_ttfb_ms"] = int(m.ttfb * 1000)
+                # DR 契约 §1:tts_first_audio 口径=官方 TTSMetrics.ttfb(合成请求
+                # →首帧音频)。MiniMax bidi 的 first_continue_to_audio_ms(text
+                # continue→首帧)只在 livekit_plugins 的 PERF 打印里、未走事件面,
+                # 故取 tts_metrics.ttfb;同为「首音频延迟」但起点早于 continue。
+                _metrics_reporter.add("tts_first_audio", m.ttfb * 1000)
                 print(f"{tag}AGENT_METRICS tts ttfb={m.ttfb * 1000:.0f}ms audio={m.audio_duration:.2f}s", flush=True)
                 _maybe_print_perceived(tag)
             elif kind == "eou_metrics":
                 _turn_metrics["eou_ms"] = int(m.end_of_utterance_delay * 1000)
+                # DR 契约 §1:asr_transcribe=EOU 的转写延迟(官方
+                # eou_metrics.transcription_delay,秒→ms)。
+                _metrics_reporter.add("asr_transcribe", m.transcription_delay * 1000)
                 print(
                     f"{tag}AGENT_METRICS eou delay={m.end_of_utterance_delay * 1000:.0f}ms "
                     f"transcription={m.transcription_delay * 1000:.0f}ms",
                     flush=True,
                 )
                 _maybe_print_perceived(tag)
+            elif kind == "vad_metrics":
+                # DR 契约 §1:vad_infer=逐次推理均耗(增量差分,首样本/除零跳过见
+                # VadInferTracker;livekit 逐批 emit,批总量即增量)。
+                _vad_ms = _vad_tracker.feed(
+                    getattr(m, "inference_duration_total", 0.0),
+                    getattr(m, "inference_count", 0),
+                )
+                if _vad_ms is not None:
+                    _metrics_reporter.add("vad_infer", _vad_ms)
         except Exception:
             pass
 
@@ -4977,6 +5014,12 @@ async def entrypoint(ctx):
         _reply_done_event.set()
 
         async def _close():
+            # DR 指标收尾(契约 §1):停后台批循环 + 扫尾 flush 余样 + 关上报客户端
+            # ——尽力而为、全吞错,绝不因上报拖住结算/收线。
+            try:
+                await asyncio.wait_for(_metrics_reporter.close(), timeout=3.0)
+            except Exception:  # noqa: BLE001 - 上报纯观测,失败不影响任何链路
+                pass
             # 【TTS 收尾(2026-09-30 A 线对账 Note-9)】bidi 持久 WS 此前无人
             # aclose——框架不代关模型连接,prod worker 复用进程=连接跨通残留。
             # 官方姿势:会话收尾由 tts.aclose() 收口(尽力而为,失败唔阻结算)。

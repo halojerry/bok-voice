@@ -1337,6 +1337,20 @@ def _control_plane_env(db: Path | str) -> dict[str, str]:
         _v = os.environ.get(_k, "").strip()
         if _v:
             env[_k] = _v
+    # 容灾波（2026-10-02 DR-WAVE-CONTRACT §3）：CP 饥荒监视器的迟滞键——
+    # 消费者是 CP 进程（ops_metrics 状态机），prod 封闭 env 面在此透传；
+    # BOK_LLM_FAMINE_TTFT_S 消费者双面（agent worker 走 _FORWARD_ENV 已登记，
+    # CP 复用同键）故这里也透传。
+    for _k in ("BOK_LLM_FAMINE_TTFT_S", "BOK_LLM_FAMINE_HOLD_S", "BOK_LLM_FAMINE_RELEASE_S"):
+        _v = os.environ.get(_k, "").strip()
+        if _v:
+            env[_k] = _v
+    # 容灾波配套（ops_metrics 日志尾读/swap 阈值标注）：不透传=prod 封闭面死门
+    # （日志端点按平台默认路径找日志、阈值恒 8——功能在但不可调）。
+    for _k in ("BOK_AGENT_LOG", "BOK_SWAP_THRESHOLD_GB"):
+        _v = os.environ.get(_k, "").strip()
+        if _v:
+            env[_k] = _v
     # .venv312 OpenSSL 无默认 CA 束：固化 SSL_CERT_FILE（P5 遗留项；CP 的
     # Summarizer/联网探针同食 TLS，注入失败零副作用）。
     return _bake_ssl_cert_file(env, repo_python())
