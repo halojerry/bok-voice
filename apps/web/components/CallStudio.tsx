@@ -595,12 +595,19 @@ function CallStudioInner({
   // （此处不用 TokenSource.endpoint+useSession options：「新建通话」要先把刚拿到的
   //   callId 同步进请求——useSession options 经 render 传播，时序上拿不到本轮 id，
   //   custom 闭包读 callIdRef 恒为最新。）
+  // C2b 掐断重连(2026-10-01):通话被服务端收线(agent 挂断/CP 结束)时,LiveKit 把
+  // 房间关闭当异常断开自动重连→再来要 token→CP 409 ghost guard→抛进 TokenSource
+  // 的 promise 链没人接=unhandledrejection 刷屏(call-231aa92a 窗口两通各一次)。
+  // 预检查(getCall status)存在竞态(token 请求可能跑赢状态翻转),409 兜底必须
+  // 在 token 调用点本地接住:接住后 end 会话掐断重连,返回永不 resolve 的 promise
+  // 静默停住重连链(room 正在死,无人等它)。
+  const endSessionRef = useRef<() => void>(() => {});
   const tokenSource = useMemo(
     () =>
       TokenSource.custom(async () => {
         const id = callIdRef.current;
         if (!id) throw new Error("no call id");
-        // C2 幽灵重连闸(2026-09-13,call-6bd59b40):TokenSource 自带 exp 前自动
+        // C2 幽灵重连闸(2026-09-13,call-6bd59c40):TokenSource 自带 exp 前自动
         // 续签,房间被删后的 livekit 全量重连会再来要 token——通话已 ended 时
         // 提前 throw,掐断「新 token→重连重建房→幽灵 job 重放开场白」链
         // (CP /api/token 侧同款 409 双保险)。
@@ -610,11 +617,23 @@ function CallStudioInner({
         if (cur && String(cur.status ?? "") === "ended") {
           throw new Error("call ended — refusing to renew token (ghost rejoin guard)");
         }
-        return await api.token({ account_id: ACCOUNT, call_id: id });
+        try {
+          return await api.token({ account_id: ACCOUNT, call_id: id });
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          if (/409|call has ended/i.test(msg)) {
+            endSessionRef.current();
+            return new Promise<never>(() => {});
+          }
+          throw e;
+        }
       }),
     [],
   );
   const session = useSession(tokenSource);
+  endSessionRef.current = () => {
+    void session.end().catch(() => {});
+  };
   const { canPlayAudio, startAudio } = useAudioPlayback(session.room);
 
   // 真实连接态：以房间状态为准，而不是「callId 非空」冒充。修复了带历史通话 id
