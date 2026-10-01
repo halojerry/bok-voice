@@ -11,6 +11,7 @@ import re
 import time
 import unicodedata
 import weakref
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 import httpx
@@ -1549,6 +1550,7 @@ class _RepeatSelfGuardStream(_CascadeCloseStreamMixin, llm.LLMStream):
         ledger: list[str] | None = None,
         threshold: float = 0.85,
         allow_repeat: bool = False,
+        on_full_swallow: "Callable[[str], Awaitable[None]] | None" = None,
     ):
         super().__init__(llm=plugin, chat_ctx=llm.ChatContext(), tools=[], conn_options=APIConnectOptions())
         self._inner = inner
@@ -1561,6 +1563,12 @@ class _RepeatSelfGuardStream(_CascadeCloseStreamMixin, llm.LLMStream):
         self._cross_on = bool(self._ledger) and not allow_repeat
         self._emitted: list[str] = []
         self._cross_suppressed = 0
+        # FIX-3(D2-4,2026-10-01):全吞上抛。被剥句子逐条记账(证据保全);
+        # 流收尾时若无一句放出(_emitted 空)且确有剥除 → on_full_swallow(全文)。
+        # agent 侧接住=拆响应看门狗+落 turns provider=repeat-suppressed,不再把
+        # 「4B 复读全吞」记成「AI 死了」(starve 计数+6s watchdog 道歉)。
+        self._swallowed: list[str] = []
+        self._on_full_swallow = on_full_swallow
         # 首 chunk 早发(2026-09-28):本回复首段是否已放行(句界或早切任一)。
         self._first_sent = False
         # D1 有界持有(2026-09-30):强制放行观测只打一次,防日志风暴。
@@ -1646,11 +1654,13 @@ class _RepeatSelfGuardStream(_CascadeCloseStreamMixin, llm.LLMStream):
             check_unit = (self._released_head or "") + sentence if self._released_head else sentence
             if not self._bypass and _is_parrot_sentence(check_unit, self._last_reply):
                 print(f"REPEAT_SELF_SUPPRESSED sent={sentence!r}", flush=True)
+                self._swallowed.append(sentence)  # FIX-3:全吞证据保全
                 self._released_head = ""
                 continue
             if self._cross_on and self._is_cross_turn(check_unit):
                 self._cross_suppressed += 1
                 print(f"REPEAT_CROSS_TURN_SUPPRESSED sent={sentence!r}", flush=True)
+                self._swallowed.append(sentence)  # FIX-3:全吞证据保全
                 self._released_head = ""
                 continue
             self._released_head = ""
@@ -1695,10 +1705,12 @@ class _RepeatSelfGuardStream(_CascadeCloseStreamMixin, llm.LLMStream):
         self._buf = ""
         if not self._bypass and _is_parrot_sentence(rest, self._last_reply):
             print(f"REPEAT_SELF_SUPPRESSED sent={rest!r}", flush=True)
+            self._swallowed.append(rest)  # FIX-3:全吞证据保全
             return ""
         if self._cross_on and self._is_cross_turn(rest):
             self._cross_suppressed += 1
             print(f"REPEAT_CROSS_TURN_SUPPRESSED sent={rest!r}", flush=True)
+            self._swallowed.append(rest)  # FIX-3:全吞证据保全
             return ""
         self._emitted.append(rest)
         return rest
@@ -1740,6 +1752,16 @@ class _RepeatSelfGuardStream(_CascadeCloseStreamMixin, llm.LLMStream):
                     f"REPEAT_CROSS_TURN_EMPTY suppressed={self._cross_suppressed}",
                     flush=True,
                 )
+            # FIX-3(D2-4,2026-10-01):复读全吞 ≠ 死火。全吞(一句未放出)且确有
+            # 剥除时把被吞全文上抛——agent 侧拆响应看门狗+落 turns 证据行
+            # (provider=repeat-suppressed),账本不再把「4B 复读」记成「AI 死了」
+            # (starve+1、6s watchdog 强断道歉)。部分剥除(_emitted 非空)=正常
+            # 说话中剥复读句,不上抛;回调失败绝不被流收尾(证据记账是尽力而为)。
+            if not self._emitted and self._swallowed and self._on_full_swallow is not None:
+                try:
+                    await self._on_full_swallow("".join(self._swallowed))
+                except Exception as exc:  # noqa: BLE001 - 回调异常不破流收尾
+                    print(f"REPEAT_SUPPRESSED callback_error={exc!r}", flush=True)
         except asyncio.CancelledError:
             # P2.a（2026-09-29 v2 §5）：cancel 不再令缓冲静默蒸发——打点留痕，
             # agent 侧 interrupted 补账点读 pending_buffer 拼入 turns。
@@ -2344,6 +2366,9 @@ class ContextAwareLLM(llm.LLM):
         self._inner = inner
         self._ctx = context_state
         self._partial_capture: dict | None = None
+        # FIX-3(D2-4,2026-10-01):复读防线全吞回调(装配时注入;None=不接=旧行为)。
+        # 见 set_full_swallow_cb 与 _RepeatSelfGuardStream._run。
+        self._full_swallow_cb: "Callable[[str], Awaitable[None]] | None" = None
         # P2.a：最近一次 guard 流（chat() 时更新；agent 侧 interrupted 补账读
         # pending_buffer 用。None 安全：bypass 档/测试替身路径无 guard）。
         self._last_guard_stream: "_RepeatSelfGuardStream | None" = None
@@ -2550,6 +2575,7 @@ class ContextAwareLLM(llm.LLM):
                     ledger=_cross_ledger,
                     threshold=_repeat_cross_turn_sim(),
                     allow_repeat=self._ctx.allow_repeat,
+                    on_full_swallow=self._full_swallow_cb,
                 )
                 # P2.a（2026-09-29 v2 §5）：持最近 guard 流引用——agent 侧 speech
                 # watcher 在 interrupted 补账时读 pending_buffer，cancel 轮的
@@ -2573,6 +2599,13 @@ class ContextAwareLLM(llm.LLM):
     def set_partial_capture(self, capture: dict | None) -> None:
         """注入 per-turn 部分文本 tee({"text": str})。None=关闭。"""
         self._partial_capture = capture
+
+    def set_full_swallow_cb(self, cb) -> None:
+        """FIX-3(D2-4,2026-10-01):复读防线全吞回调注入(装配时,agent 侧)。
+
+        cb(text)=本轮回复被复读防线全吞时收到被吞全文(guard 流收尾处 await
+        调用);None(B 线等)=不接=旧行为(全吞照旧静默收尾,账本不补证)。"""
+        self._full_swallow_cb = cb
 
 
 class _PartialCaptureStream(_CascadeCloseStreamMixin, llm.LLMStream):

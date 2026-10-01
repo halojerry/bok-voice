@@ -4020,6 +4020,47 @@ async def entrypoint(ctx):
     _set_lacb = getattr(_raw_llm, "set_late_answer_cb", None)
     if _set_lacb is not None:
         _set_lacb(_late_answer_say)
+
+    async def _repeat_full_swallow(text: str) -> None:
+        """FIX-3(D2-4,2026-10-01):复读防线全吞回调——静默是刻意决定,不是死火。
+
+        病灶:_RepeatSelfGuardStream 全吞(REPEAT_CROSS_TURN_EMPTY/整句全剥)
+        → 无 assistant item → relieve/reask 不归零、_assistant_out 不置位 →
+        starve 计数 +1、6s watchdog 强断念道歉——「4B 复读」被账本记成「AI
+        死了」,归因污染。本回调(最小手术,不引入新出声行为):
+        ①立刻拆响应看门狗(响应发生过;静默是刻意决定,不由 6s 兜底顶替);
+        ②放行 W-GATE 让位 judge(本轮回复生命周期已完结,不会再有交付);
+        ③turns 落一行 provider=repeat-suppressed/gen=llm/文本=被吞全文
+          (证据保全+可分辨,通话记录不再是一片静默);
+        ④REPEAT_SUPPRESSED 标记日志。
+        不改 _assistant_out/starve(客户耳中确是静默,starve-ack 是正确可闻
+        兜底),不抵销 stall(复读是坏输出不是好答案)。
+        """
+        try:
+            _cancel_response_watchdog()
+        except Exception:  # pragma: no cover - 拆弹失败唔阻记账
+            pass
+        _reply_done_event.set()
+        print(
+            f"REPEAT_SUPPRESSED full_swallow chars={len(text)} (call {room_name})",
+            flush=True,
+        )
+        try:
+            _rs_ms = int((time.monotonic() - _t0) * 1000)
+            await cp.add_turn(
+                call_id, "assistant", text,
+                provider="repeat-suppressed", gen="llm",
+                language=language_state.lang, line="a", speaker="agent_ai",
+                template_step=(int(flow_ctrl.current) + 1) if flow_ctrl.has_steps else 0,
+                started_ms=_rs_ms, ended_ms=_rs_ms,
+            )
+        except Exception as exc:  # noqa: BLE001 - 补账失败唔阻流收尾
+            print(f"[agent] repeat-suppressed ledger failed: {exc!r} (call {room_name})", flush=True)
+
+    # FIX-3:全吞回调注入 ContextAwareLLM(guard 流由它构造;set_xxx_cb 同款模式)。
+    _set_fscb = getattr(llm_provider, "set_full_swallow_cb", None)
+    if _set_fscb is not None:
+        _set_fscb(_repeat_full_swallow)
     # B4 打断轮部分文本 tee:ContextAwareLLM 出口把已生成文本记进 _reply_partial,
     # speech watcher 在打断时补记 gen=interrupted 行。BOK_INTERRUPT_LEDGER=0 关。
     _set_pc = getattr(llm_provider, "set_partial_capture", None)

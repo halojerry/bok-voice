@@ -38,6 +38,9 @@ _ALLOW_CANCEL_WATCHDOG: dict[tuple[str, str], str] = {
     # on_user_turn_completed 内的「有意静默」拆弹（自听回声/纯回声轮/暂停/风暴
     # 静听/暂存等续段）——这些不是回复车道，保留直调（EX-2 明确允许）。
     ("agent.py", "on_user_turn_completed"): "有意静默路径（非回复车道）",
+    # FIX-3(D2-4)：复读防线全吞收尾回调——响应发生过，静默是刻意决定；
+    # 拆看门狗防 6s 兜底强断念道歉（非回复车道：无 item/无出声）。
+    ("agent.py", "_repeat_full_swallow"): "全吞有意静默（非回复车道）",
     # 看门狗武装点：arm 前先拆旧 timer（watchdog 定义/arm site 豁免）
     ("agent.py", "_arm_response_watchdog"): "武装点拆旧 timer",
 }
