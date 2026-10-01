@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
 import {
   useAgent,
   useAgentExpression,
@@ -1457,12 +1458,12 @@ function CallStudioInner({
               )}
               <p className="mt-1 break-all text-xs muted">通话文档：{str(settlement.transcript_doc_path)}</p>
               {lastFinishedCallId && (
-                <a
+                <Link
                   className="mt-2 inline-block text-xs text-(--live)"
                   href={`/calls?call=${encodeURIComponent(lastFinishedCallId)}`}
                 >
                   查看通话记录（转写/逐轮）<ArrowRight className="h-3.5 w-3.5" />
-                </a>
+                </Link>
               )}
               <p className="mt-1 break-all text-xs muted">结算文档：{str(settlement.settlement_doc_path)}</p>
             </>
