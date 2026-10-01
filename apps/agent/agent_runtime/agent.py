@@ -1215,6 +1215,27 @@ def garbled_reask_gate(
     return "reask"
 
 
+def _band_round_is_garbled(
+    band: str,
+    user_text: str,
+    hotword_terms: tuple = (),
+    min_content_chars: int = 2,
+) -> bool:
+    """FIX-2(b)(D2-3,2026-10-01):本轮是否「garbled band」——streak 守卫判据。
+
+    第一性:streak(step_streak/unclear_streak)语义=「模型拿到可懂输入仍不
+    推进」;把烂转写/碎片噪声喂进去=把 ASR 病记模型头上(归因错误),连续烂
+    转写轮会静默攒到 degrade 门槛。判据与 garbled_reask_gate 的 fire 面同源
+    (那里 fire = band=="low" or (band=="unknown" and looks_garbled)),此处只
+    做带级别判定,不做旁路/连续计数(守卫用途,纯函数可离线单测)。
+    """
+    if band == "low":
+        return True
+    if band == "unknown":
+        return looks_garbled(user_text, hotword_terms, min_content_chars)
+    return False
+
+
 def _ack_anchor_texts() -> frozenset[str]:
     """ack/兜底直念行全集(三语,fallback/watchdog-ack/starve/storm/defer/followup 同款口径)。
 
@@ -5169,12 +5190,15 @@ async def entrypoint(ctx):
         print(f"[judge] yield {verdict} (call {room_name})", flush=True)
         return verdict
 
-    async def _background_flow_judge(step_at: int, utt: str, turn_key: str = "") -> None:
+    async def _background_flow_judge(step_at: int, utt: str, turn_key: str = "", garbled: bool = False) -> None:
         """背景跑 LLM 推進判定:唔好喺開聲前同步等(會每輪拖慢),判定完喺下一輪先生效。
 
         唔會 double-advance:只喺 flow 仲喺 judge 嗰步(step_at)時先落 advance。
         turn_key(stall 账本用,漏斗 v2):同轮 rule 路已按此 key 记账,judge 返回后
         带同 key 落账——unclear 去重只计 1,judge 改判非 unclear 则清该步计数。
+        garbled(FIX-2(b),D2-3):本轮是 garbled band(烂转写/碎片)——streak 三处
+        写点(note_turn_outcome/degrade_boost/bump_unclear_streak)全部跳过:判定
+        对象本身就是噪声,喂 streak=把 ASR 病算模型头上。
         """
         try:
             # 让路节流:主回复刚提交,先等一拍、再等到链路真空闲才喺 :1235 跑 judge——
@@ -5245,12 +5269,19 @@ async def entrypoint(ctx):
             # stall 账本 judge 路(漏斗 v2,spec §3.1):仍喺 judge 嗰步先落账——
             # unclear 同轮 rule 路已计过(同 turn_key 去重只计 1);judge 改判
             # 非 unclear(实质应承/提问/异议)= 客户唔係卡死 → 清该步计数。
-            if turn_key and flow_ctrl.current == step_at:
+            # FIX-2(b):garbled 轮跳过(note_turn_outcome 与 degrade_boost 两写点
+            # 同守——判定对象是噪声,任何 streak 读写都是归因错误)。
+            if turn_key and flow_ctrl.current == step_at and not garbled:
                 flow_ctrl.note_turn_outcome(jv, step_at, turn_key)
             # degrade 早触发(漏斗 v2,spec §3.1):judge 高置信 degrade_question →
             # streak 抬到降级门槛,下一轮规则路 stall 车道立即出降级问法,
             # 免硬数 3 轮——客户明确「听唔明你讲咩」时每轮都係损耗。
-            if route_enabled and _judge_route["step"] == step_at and flow_ctrl.current == step_at:
+            if (
+                route_enabled
+                and _judge_route["step"] == step_at
+                and flow_ctrl.current == step_at
+                and not garbled
+            ):
                 flow_ctrl.step_streak[step_at] = degrade_boost(
                     flow_ctrl.step_streak.get(step_at, 0),
                     _judge_route["route"],
@@ -5294,7 +5325,7 @@ async def entrypoint(ctx):
                     # （模糊话不得推过收号步=丢号）。实答轮 relieve_unclear_streak
                     # 抵销——健康问答链不攒推进账。BOK_UNCLEAR_ADVANCE=0 整闸回退。
                     _advanced_uc = False
-                    if jv == UNCLEAR:
+                    if jv == UNCLEAR and not garbled:
                         _n_uc = flow_ctrl.bump_unclear_streak()
                         _n_need = 0
                         try:
@@ -6110,6 +6141,47 @@ async def entrypoint(ctx):
             except Exception:  # pragma: no cover - 沉淀失败唔阻回复
                 pass
             _flow_step_before = flow_ctrl.current
+            # ---- garbled band 旗标(FIX-2(b),D2-3 2026-10-01)----
+            # streak 语义=「模型拿到可懂输入仍不推进」;连续烂转写轮喂 step_streak/
+            # unclear_streak=把 ASR 病记模型头上(归因错误),静默攒到 degrade 门槛。
+            # 旗标在 streak 写点(下方 note_turn_outcome 与 judge 路)之前算好并
+            # 线程过去;判据=band=="low" 或 band=="unknown"∧looks_garbled(与
+            # garbled_reask_gate 的 fire 面同源)。lane 总闸关=旗恒 False(逐字节
+            # 旧行为)。band/conf 读数与 reask 求值块共用(该块在 stall 阶梯前)。
+            _reask_conf = (
+                getattr(_partial_gate_stt, "last_confidence", None)
+                if _partial_gate_stt is not None
+                else None
+            )
+            # 【P1-SV 置信度缺口(2026-10-01)】SV 引擎无 token 置信度(band 恒
+            # unknown):reask 门 unknown 档收紧为「逐字复读上一轮或 ≤1 字」才开
+            # (防短应承轮烧光 reask 预算,FLOW20 轮11 哑根因)。引擎档在此单点
+            # 解析,band 旗标与门共用同一 conf_available 语义。
+            _reask_engine = str(
+                getattr(
+                    getattr(_partial_gate_stt, "_stt_", None) or object(),
+                    "_engine",
+                    "",
+                )
+                or ""
+            )
+            _reask_conf_available = _reask_engine != "sensevoice"
+            _reask_band = band_from_confidence(
+                _reask_conf,
+                float(os.environ.get("BOK_REASK_CONF_MEAN", "0.45")),
+                float(os.environ.get("BOK_REASK_LOW_RATIO", "0.5")),
+            )
+            _garbled_band_round = False
+            if os.environ.get("BOK_GARBLED_REASK", "1") != "0" and user_text.strip():
+                try:
+                    _garbled_band_round = _band_round_is_garbled(
+                        _reask_band,
+                        user_text,
+                        tuple(_hotword_terms or ()),
+                        int(os.environ.get("BOK_REASK_MIN_CONTENT_CHARS", "2")),
+                    )
+                except Exception:  # noqa: BLE001 - 判据异常=不设旗(旧行为)
+                    _garbled_band_round = False
             # 分支动作规划状态(A-②,每轮重置防上一轮残留计划泄漏):
             # _branch_plan  命中计划(None=未命中/已派发),罐头腿消费
             # _branch_hold  分支命中轮抑制规则推进(留本步/跳步/无动作分支)
@@ -6388,16 +6460,19 @@ async def entrypoint(ctx):
                                 _judge_inflight["step"] = _step_at
                                 # 池化(2026-09-17 全量 debug P2-A):judge 任务丢失=
                                 # 该轮不推进(下轮规则补位)——强引用+失败打点防静默。
-                                _spawn_report(_background_flow_judge(_step_at, user_text, turn_key=_turn_key))
+                                _spawn_report(_background_flow_judge(_step_at, user_text, turn_key=_turn_key, garbled=_garbled_band_round))
                     # stall 账本规则路(漏斗 v2,spec §3.1):每轮判决记账——UNCLEAR
                     # 且步未变 +1(下方 judge 路同 key 去重只计 1);推进/其它 verdict
                     # 清该步计数(清零语义在方法内)。推进轮 verdict 以 "" 记
                     # (advance 已清旧步;UNCLEAR 借宽松语义推进如身份步,唔算新步 stall)。
-                    flow_ctrl.note_turn_outcome(
-                        "" if flow_ctrl.current != _flow_step_before else verdict,
-                        flow_ctrl.current,
-                        _turn_key,
-                    )
+                    # FIX-2(b):garbled band 轮(烂转写/碎片)跳过整笔——不递增也
+                    # 不清零(streak 语义只对「可懂输入仍不推进」的轮负责)。
+                    if not _garbled_band_round:
+                        flow_ctrl.note_turn_outcome(
+                            "" if flow_ctrl.current != _flow_step_before else verdict,
+                            flow_ctrl.current,
+                            _turn_key,
+                        )
                     context_state.set_flow_current(flow_ctrl.current_step_text())
                 except Exception:  # pragma: no cover - 流程推进失败不阻断回复
                     pass
@@ -6421,6 +6496,108 @@ async def entrypoint(ctx):
                     if _partial_gate_stt is not None:
                         _partial_gate_stt.set_closing_say(False)
                 raise StopResponse()
+            # ---- 碎片轮重问车道(garbled-reask,EX-2 2026-09-28;FIX-2(a) 2026-10-01 上移)----
+            # 病灶(20 轮粤语 probe):碎裂/碎片转写(纯数字碎片、热词回声残渣)
+            # 落到垫话/胡答——错语境接话比沉默更伤。出口=canned 脚本直念(零 TTFT,
+            # 替掉一个 LLM 轮=碎片轮更快而非更慢,延迟铁律);**必须**在 _filler.arm()
+            # 之前 raise,碎片轮唔准起垫话定时器(否则垫话叠在重问上)。
+            # FIX-2(a)(D2-3,2026-10-01):求值先于 stall 阶梯=ASR 病优先于模型病
+            # ——旧序里连续烂转写 UNCLEAR 轮先被 degrade 台词截走,重问车道永远
+            # 到不了;配套 streak 守卫(garbled 轮不喂 step_streak/unclear_streak)
+            # 见上方旗标块与 judge 路。band/conf 读数在旗标块单点解析(共用)。
+            # 判据:数字 run / WA numberish / 热词 / verdict / 推进 旁路优先;置信度
+            # 只是辅助(窄带数字错听高置信实测)——
+            #   band=="low"   → 开(STT 自己都唔确定)
+            #   band=="unknown" → 才靠 looks_garbled 文本判据兜底(conf 缺失才 unknown,
+            #                     不单凭它误开;band=="ok" 恒不开)
+            # 连续上限 self._reask_state(真回复时归零):到顶打 GARBLED_REASK cap=1
+            # 静默丢弃(拆看门狗;死气由 nudge 心跳兜——FIX-1 已令护窗期重挂复查)。
+            if not closed.is_set() and os.environ.get("BOK_GARBLED_REASK", "1") != "0":
+                try:
+                    from .flow import _digit_runs_in as _reask_digit_runs
+
+                    _reask_g, _reask_r = flow_ctrl.current_goal_ref()
+                    try:
+                        _reask_pairs = recent_turn_pairs(
+                            list(getattr(turn_ctx, "items", None) or []),
+                            exclude=new_message,
+                            recent_turns=1,
+                        )
+                        _reask_prev_user = next(
+                            (t for r, t in _reask_pairs if r == "customer"), ""
+                        )
+                    except Exception:  # noqa: BLE001 - 取史失败=无复读证据
+                        _reask_prev_user = ""
+                    _reask_verdict = garbled_reask_gate(
+                        user_text=user_text,
+                        band=_reask_band,
+                        conf_available=_reask_conf_available,
+                        prev_user_text=_reask_prev_user,
+                        excluded=bool(
+                            _qa_exclude_reason(
+                                user_text,
+                                verdict=str(flow_ctrl.last_verdict or ""),
+                                closing=bool(flow_ctrl.closing),
+                                flow_done=bool(flow_ctrl.done),
+                                wa_signal=str(_wa_signal[0]) if _wa_signal else "",
+                                wa_captured=bool(_wa_captured["on"]),
+                                wa_step_locked=bool(
+                                    _looks_like_whatsapp_step(_reask_g, _reask_r)
+                                    and not _wa_captured["on"]
+                                ),
+                                advanced=(flow_ctrl.current != _flow_step_before),
+                            )
+                        ),
+                        closing=bool(flow_ctrl.closing),
+                        paused=bool(self.paused),
+                        wa_pending=bool(_wa_accum["text"]),
+                        digit_pending=bool(_digit_accum["text"]),
+                        digit_run=bool(_reask_digit_runs(user_text)),
+                        wa_numberish=bool(_wa_numberish(user_text)),
+                        hotword_terms=tuple(_hotword_terms or ()),
+                        min_content_chars=int(
+                            os.environ.get("BOK_REASK_MIN_CONTENT_CHARS", "2")
+                        ),
+                        consec=int(self._reask_state),
+                        max_consec=int(os.environ.get("BOK_REASK_MAX_CONSEC", "2")),
+                    )
+                    if _reask_verdict == "cap":
+                        # 到顶:静默丢弃(无垫话/无 LLM/无音频)——死气由 nudge
+                        # 心跳兜(FIX-1:护窗期重挂复查,cap 轮客户刚讲完的时刻
+                        # 不再令心跳整段缺席);拆看门狗防它补一段兜底直念。
+                        print("GARBLED_REASK cap=1", flush=True)
+                        _cancel_response_watchdog()
+                        # W-GATE:到顶静默丢弃无 item 可报 → 直接放行让位 judge
+                        _reply_done_event.set()
+                        raise StopResponse()
+                    if _reask_verdict == "reask":
+                        self._reask_state += 1
+                        _reask_line = _garbled_reask_line(language_state.lang)
+                        _reask_conf_show = "-"
+                        if isinstance(_reask_conf, dict) and _reask_conf.get("mean") is not None:
+                            try:
+                                _reask_conf_show = f"{float(_reask_conf['mean']):.2f}"
+                            except (TypeError, ValueError):
+                                _reask_conf_show = "-"
+                        print(
+                            f"GARBLED_REASK lane=1 band={_reask_band} "
+                            f"conf={_reask_conf_show} text_len={len(user_text)}",
+                            flush=True,
+                        )
+                        _register_reply_lane(
+                            lane="garbled-reask", gen="script",
+                            text=_reask_line, anchor=False, history=False,
+                        )
+                        await _say_script(
+                            session, tts_provider, _tts_cache, _reask_line,
+                            add_to_chat_ctx=False,
+                        )
+                        await _ledger_ack_line("garbled-reask", _reask_line)
+                        raise StopResponse()
+                except StopResponse:
+                    raise
+                except Exception as _reask_exc:  # noqa: BLE001 - 车道异常=落穿 LLM
+                    print(f"GARBLED_REASK error={_reask_exc!r}", flush=True)
             # ---- stall 升级阶梯(漏斗 v2,spec §3.1):同 step 连续 UNCLEAR 有出口。
             # 3 降级问法 / 5 绕过留号 / 8 主动收线——全部 _say_script 直念零 TTFT。
             # bypass 在号码已在手时直升 close(留号无意义)。插喺 DEFER 车道之前:
@@ -7251,125 +7428,6 @@ async def entrypoint(ctx):
                 # W-GATE:暂停轮永不出回复 → 直接放行让位 judge
                 _reply_done_event.set()
                 raise StopResponse()
-            # ---- 碎片轮重问车道(garbled-reask,EX-2 2026-09-28)----
-            # 病灶(20 轮粤语 probe):碎裂/碎片转写(纯数字碎片、热词回声残渣)
-            # 落到垫话/胡答——错语境接话比沉默更伤。出口=canned 脚本直念(零 TTFT,
-            # 替掉一个 LLM 轮=碎片轮更快而非更慢,延迟铁律);**必须**在 _filler.arm()
-            # 之前 raise,碎片轮唔准起垫话定时器(否则垫话叠在重问上)。
-            # 判据:数字 run / WA numberish / 热词 / verdict / 推进 旁路优先;置信度
-            # 只是辅助(窄带数字错听高置信实测)——
-            #   band=="low"   → 开(STT 自己都唔确定)
-            #   band=="unknown" → 才靠 looks_garbled 文本判据兜底(conf 缺失才 unknown,
-            #                     不单凭它误开;band=="ok" 恒不开)
-            # 连续上限 self._reask_state(真回复时归零):到顶打 GARBLED_REASK cap=1
-            # 静默丢弃(拆看门狗;死气由既有 nudge 心跳兜)。
-            if not closed.is_set() and os.environ.get("BOK_GARBLED_REASK", "1") != "0":
-                try:
-                    from .flow import _digit_runs_in as _reask_digit_runs
-
-                    _reask_g, _reask_r = flow_ctrl.current_goal_ref()
-                    _reask_conf = (
-                        getattr(_partial_gate_stt, "last_confidence", None)
-                        if _partial_gate_stt is not None
-                        else None
-                    )
-                    # 【P1-SV 置信度缺口(2026-10-01)】SV 引擎无 token 置信度
-                    # (band 恒 unknown):gate 的 unknown 档收紧为「逐字复读上一轮
-                    # 或 ≤1 字」才开,防短应承轮烧光 reask 预算(FLOW20 轮11 哑根因)。
-                    _reask_engine = str(
-                        getattr(
-                            getattr(_partial_gate_stt, "_stt_", None) or object(),
-                            "_engine",
-                            "",
-                        )
-                        or ""
-                    )
-                    _reask_conf_available = _reask_engine != "sensevoice"
-                    try:
-                        _reask_pairs = recent_turn_pairs(
-                            list(getattr(turn_ctx, "items", None) or []),
-                            exclude=new_message,
-                            recent_turns=1,
-                        )
-                        _reask_prev_user = next(
-                            (t for r, t in _reask_pairs if r == "customer"), ""
-                        )
-                    except Exception:  # noqa: BLE001 - 取史失败=无复读证据
-                        _reask_prev_user = ""
-                    _reask_band = band_from_confidence(
-                        _reask_conf,
-                        float(os.environ.get("BOK_REASK_CONF_MEAN", "0.45")),
-                        float(os.environ.get("BOK_REASK_LOW_RATIO", "0.5")),
-                    )
-                    _reask_verdict = garbled_reask_gate(
-                        user_text=user_text,
-                        band=_reask_band,
-                        conf_available=_reask_conf_available,
-                        prev_user_text=_reask_prev_user,
-                        excluded=bool(
-                            _qa_exclude_reason(
-                                user_text,
-                                verdict=str(flow_ctrl.last_verdict or ""),
-                                closing=bool(flow_ctrl.closing),
-                                flow_done=bool(flow_ctrl.done),
-                                wa_signal=str(_wa_signal[0]) if _wa_signal else "",
-                                wa_captured=bool(_wa_captured["on"]),
-                                wa_step_locked=bool(
-                                    _looks_like_whatsapp_step(_reask_g, _reask_r)
-                                    and not _wa_captured["on"]
-                                ),
-                                advanced=(flow_ctrl.current != _flow_step_before),
-                            )
-                        ),
-                        closing=bool(flow_ctrl.closing),
-                        paused=bool(self.paused),
-                        wa_pending=bool(_wa_accum["text"]),
-                        digit_pending=bool(_digit_accum["text"]),
-                        digit_run=bool(_reask_digit_runs(user_text)),
-                        wa_numberish=bool(_wa_numberish(user_text)),
-                        hotword_terms=tuple(_hotword_terms or ()),
-                        min_content_chars=int(
-                            os.environ.get("BOK_REASK_MIN_CONTENT_CHARS", "2")
-                        ),
-                        consec=int(self._reask_state),
-                        max_consec=int(os.environ.get("BOK_REASK_MAX_CONSEC", "2")),
-                    )
-                    if _reask_verdict == "cap":
-                        # 到顶:静默丢弃(无垫话/无 LLM/无音频)——死气由 nudge
-                        # 心跳兜;拆看门狗防它补一段兜底直念。
-                        print("GARBLED_REASK cap=1", flush=True)
-                        _cancel_response_watchdog()
-                        # W-GATE:到顶静默丢弃无 item 可报 → 直接放行让位 judge
-                        _reply_done_event.set()
-                        raise StopResponse()
-                    if _reask_verdict == "reask":
-                        self._reask_state += 1
-                        _reask_line = _garbled_reask_line(language_state.lang)
-                        _reask_conf_show = "-"
-                        if isinstance(_reask_conf, dict) and _reask_conf.get("mean") is not None:
-                            try:
-                                _reask_conf_show = f"{float(_reask_conf['mean']):.2f}"
-                            except (TypeError, ValueError):
-                                _reask_conf_show = "-"
-                        print(
-                            f"GARBLED_REASK lane=1 band={_reask_band} "
-                            f"conf={_reask_conf_show} text_len={len(user_text)}",
-                            flush=True,
-                        )
-                        _register_reply_lane(
-                            lane="garbled-reask", gen="script",
-                            text=_reask_line, anchor=False, history=False,
-                        )
-                        await _say_script(
-                            session, tts_provider, _tts_cache, _reask_line,
-                            add_to_chat_ctx=False,
-                        )
-                        await _ledger_ack_line("garbled-reask", _reask_line)
-                        raise StopResponse()
-                except StopResponse:
-                    raise
-                except Exception as _reask_exc:  # noqa: BLE001 - 车道异常=落穿 LLM
-                    print(f"GARBLED_REASK error={_reask_exc!r}", flush=True)
             # 走到这=本轮走 LLM 正常回复路径(话术直念/暂停/跳过都已在前面拦截)
             # → 起垫话定时器:回复首音频 ~700ms 未到才播,快轮零打扰(closing/WA
             # 步由开火前 guards 复核兜住)。
