@@ -46,6 +46,14 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     "scripts/ab_tts_first_chunk.py": re.compile(r"Chinese,Yue"),
     "tests/test_interpret_tts_provider.py": re.compile(r"Chinese,Yue"),
     "tests/test_fixed_language_call.py": re.compile(r"Chinese,Yue"),
+    # P1(2026-10-01) SV-CPU 引擎车道:SenseVoice 外部语言枚举(yue,与 zh/en 同族
+    # sherpa API 真字面量)+ HF repo id(zh-en-ja-ko-yue=仓库名 opaque 标识)。
+    # 语言字段本身(session/通话级)仍一律小写 cantonese——_sv_lang_label 即收口
+    # 单点(外部枚举→内部规范值的边界映射)。
+    "services/qwen3-asr-sidecar/app.py": re.compile(r"yue"),
+    "scripts/eval_sensevoice.py": re.compile(r"yue"),
+    "tools/bok.py": re.compile(r"zh-en-ja-ko-yue"),
+    "tests/test_asr_engine_routing.py": re.compile(r"yue"),
     "scripts/test_volcano_v3.py": None,
     # 计划文档里的粤语文本检测示例代码（_YUE_MARKS 正则只是「识别粤语字」的
     # 变量名，非语言字段赋值）——4b0dd6b 存量，按门禁政策文档白名单收口。

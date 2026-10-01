@@ -6108,6 +6108,24 @@ def _asr_language_hint(lang_state: str, pin: bool) -> str:
     return hint
 
 
+def _asr_engine_from_cfg(asr_cfg: dict) -> str:
+    """P1(2026-10-01)ASR 引擎车道解析(纯函数,A/B 线共用)。
+
+    优先序:env ``BOK_ASR_ENGINE``(终极覆盖,测试/一键回滚键)> ``asr_json.engine``
+    > 缺省 ``""``(旧 Qwen3-ASR 路径)。返回 ``"sensevoice"`` 或 ``""``。
+    **缺省翻转纪律**:P1 首步保持旧路,soak/FLOW20/数字轮验证门全绿后才把
+    ``return ""`` 缺省改 ``"sensevoice"``——翻转动作只动本函数一处。"""
+    v = str(os.environ.get("BOK_ASR_ENGINE", "") or "").strip().lower()
+    if v in ("sensevoice", "sv"):
+        return "sensevoice"
+    if v in ("qwen3", "mlx"):
+        return ""
+    cfg = str((asr_cfg or {}).get("engine") or "").strip().lower()
+    if cfg in ("sensevoice", "sv"):
+        return "sensevoice"
+    return ""
+
+
 class Qwen3ASRSTT(stt.STT):
     """LiveKit STT adapter for the local Qwen3-ASR sidecar."""
 
@@ -6120,6 +6138,7 @@ class Qwen3ASRSTT(stt.STT):
         language_state: LanguageState | None = None,
         pin_language: bool = False,
         hotword_context: str = "",
+        engine: str = "",
     ):
         super().__init__(
             capabilities=stt.STTCapabilities(
@@ -6140,6 +6159,10 @@ class Qwen3ASRSTT(stt.STT):
         # 热词/context(Qwen3-ASR 官方 customizable context = system message 词汇表
         # 软偏置):每通对话装配一次,随 /api/start 下发,session 级透传每次解码。
         self._hotword_context = str(hotword_context or "").strip()
+        # 【P1 SV-CPU 引擎车道(2026-10-01)】""/qwen3=旧 Qwen3 路径;sensevoice=
+        # 纯 CPU 三语过门车道(40-48ms/句,MPS 只剩 LLM)。值来自 asr_json 设置
+        # 通道(agent/interpret 装配点传入);sidecar 缺模型 fail-open 回旧引擎。
+        self._engine = str(engine or "").strip()
         # 会话级 partial 解码间隔档(GPU 竞态专项):agent 回复生成/播报中抬高,
         # listening 恢复 None=env 默认。getattr 鸭型访问,勿删(测试 fake 无此属性)。
         self._partial_ms_override: int | None = None
@@ -6230,13 +6253,16 @@ class _Qwen3ASRStream(stt.RecognizeStream):
         for attempt in range(3):
             try:
                 async with httpx.AsyncClient(timeout=30) as client:
-                    # start 参数:language hint + 热词 context(都有先例可空,空则不下发;
-                    # getattr 鸭型访问——测试 fake 与旧设置面无此属性时等同空)
+                    # start 参数:language hint + 热词 context + 引擎车道(P1,都有先例
+                    # 可空,空则不下发;getattr 鸭型访问——测试 fake 与旧设置面无此
+                    # 属性时等同空)
                     start_params: dict[str, str] = {}
                     if lang_hint:
                         start_params["language"] = lang_hint
                     if getattr(self._stt_, "_hotword_context", ""):
                         start_params["context"] = self._stt_._hotword_context
+                    if getattr(self._stt_, "_engine", ""):
+                        start_params["engine"] = self._stt_._engine
                     start = await client.post(
                         f"{self._stt_._base_url}/api/start",
                         params=start_params or None,
@@ -7215,14 +7241,16 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         # =同一轮,暴露值照留(语义正确)。
         self._stt_._turn_partial_text = ""
         lang_hint = _asr_language_hint(self._stt_._language_state.lang, self._stt_._pin_language)
-        # start 参数:language hint + 热词 context(同 offline 路径,空则不下发;
-        # getattr 鸭型访问——测试 fake 无此属性时等同空)+ partial 间隔档
-        # (agent 生成中抑制,GPU 竞态专项;None=不下发用 env 默认)。
+        # start 参数:language hint + 热词 context + 引擎车道(P1;同 offline 路径,
+        # 空则不下发;getattr 鸭型访问——测试 fake 无此属性时等同空)+ partial
+        # 间隔档(agent 生成中抑制,GPU 竞态专项;None=不下发用 env 默认)。
         start_params: dict[str, str] = {}
         if lang_hint:
             start_params["language"] = lang_hint
         if getattr(self._stt_, "_hotword_context", ""):
             start_params["context"] = self._stt_._hotword_context
+        if getattr(self._stt_, "_engine", ""):
+            start_params["engine"] = self._stt_._engine
         _pm = getattr(self._stt_, "_partial_ms_override", None)
         if _pm:
             start_params["partial_ms"] = str(int(_pm))

@@ -104,6 +104,12 @@ MODELS: dict[str, dict[str, str]] = {
         # 滑失(九→狗/號→后,同渲染音频 8bit 逐字全对)——WhatsApp 捕获零降级铁律
         # 优先。GPU 减负靠 partial 会话级抑制(见 agent BOK_ASR_PARTIAL_SLOW_MS)。
         "asr": "aufklarer/Qwen3-ASR-1.7B-MLX-8bit",
+        # P1 SV-CPU 引擎车道(2026-10-01 三层解耦):SenseVoice-small int8 ONNX,
+        # 纯 CPU 三语识别(zh 2.8%/en 5.4%/canto 8.6%、WA 数字 16/16、40-48ms/句;
+        # reports/sensevoice-eval/)。HF 镜像仓(repo 内即 model.int8.onnx+tokens.txt
+        # 布局,与 k2-fsa release 同源)。可选:缺模型时 asr engine fail-open 回
+        # Qwen3 路径;--only sensevoice 显式落盘(~230MB)。
+        "sensevoice": "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
         "tts_preset": "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit",
         "tts_clone": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
         # 客服 LLM 用 4B 关思考:话术化场景速度优先(一轮 ~1s,约为 9B 一半),
@@ -142,6 +148,8 @@ MODELS: dict[str, dict[str, str]] = {
     },
     "windows": {
         "asr": "Qwen/Qwen3-ASR-1.7B",
+        # P1:SV CPU 车道跨平台同一份 ONNX(见 mac 表注释)。
+        "sensevoice": "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
         "tts_preset": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
         "tts_clone": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
         # GGUF for llama.cpp; only the Q4_K_M file is downloaded (see patterns).
@@ -163,7 +171,7 @@ WINDOWS_LLM_GGUF_PATTERNS = ["*Q4_K_M.gguf", "README.md"]
 # 首启向导不门禁的模型(可选增强,缺失时对应功能自动回退:B 线 MT 回退主 LLM :1235,
 # settle/judge 专线回退 :1235,意图语义车道回退关键词+judge 双车道,Laya judge
 # 回退 :1237/:1235 生成式判定链,llm_draft 回退无 draft 普通解码)。
-OPTIONAL_MODELS = {"mt", "settle", "embedding", "laya", "llm_draft"}
+OPTIONAL_MODELS = {"mt", "settle", "embedding", "laya", "llm_draft", "sensevoice"}
 
 
 def platform_key() -> str:
@@ -1712,9 +1720,19 @@ def _cmd_up_services() -> int:
         asr_env["QWEN3_ASR_DEVICE"] = "cuda" if _cuda() else "cpu"
     # ASR 并发竞态让位(2026-10-01 双通实弹):重活在别人在飞时降档——sidecar
     # 进程不吃全 env 面,prod 封闭面显式透传;缺省=sidecar 内默认开。
-    _cy = os.environ.get("QWEN3_ASR_CONTENTION_YIELD")
-    if _cy is not None:
-        asr_env["QWEN3_ASR_CONTENTION_YIELD"] = _cy
+    # P1 SV 车道键同路透传(SV_LANGUAGE/SV_THREADS 调参口)。
+    for _k in ("QWEN3_ASR_CONTENTION_YIELD", "QWEN3_ASR_SV_LANGUAGE", "QWEN3_ASR_SV_THREADS"):
+        _v = os.environ.get(_k)
+        if _v is not None:
+            asr_env[_k] = _v
+    # P1 SV-CPU 引擎:模型目录下发。ONNX 布局无 config.json(model_path 判据
+    # 不适用),专用解析:download 落位(app-data/models/<repo-->)有
+    # model.int8.onnx+tokens.txt 即用;缺席不下发=sidecar 用自身缺省/fail-open。
+    _sv_repo = current.get("sensevoice", "")
+    if _sv_repo:
+        _sv_dir = model_dir(_sv_repo)
+        if (_sv_dir / "model.int8.onnx").is_file() and (_sv_dir / "tokens.txt").is_file():
+            asr_env["QWEN3_ASR_SV_MODEL_DIR"] = str(_sv_dir)
     if not healthy(8787):
         _start_proc(
             [str(asr_py), "-m", "uvicorn", "app:app", "--app-dir", "services/qwen3-asr-sidecar",
@@ -2053,6 +2071,7 @@ _FORWARD_ENV = (
     "BOK_REPEAT_HEAD_MAX_HOLD",
     "BOK_PREFIX_PREWARM_YIELD",
     "BOK_ACTIVE_CALLS_DIR",
+    "BOK_ASR_ENGINE",
     "BOK_FACT_CORRECTION",
     "SILENCE_NUDGE_SECONDS",
     "SILENCE_NUDGE_MAX",

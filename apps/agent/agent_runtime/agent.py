@@ -3195,6 +3195,7 @@ async def entrypoint(ctx):
         PinnedLanguageState,
         Qwen3ASRLiveSTT,
         Qwen3ASRSTT,
+        _asr_engine_from_cfg,
         Qwen3TTSTTS,
         ContextAwareLLM,
         ContextState,
@@ -3654,6 +3655,10 @@ async def entrypoint(ctx):
             # （官方 system message 软偏置），随 /api/start 下发。
             # BOK_ASR_HOTWORDS=0 回退。
             hotword_context=_hotword_ctx,
+            # 【P1 SV-CPU 引擎车道(2026-10-01 三层解耦)】_asr_engine_from_cfg:
+            # env BOK_ASR_ENGINE > asr_json.engine > 缺省旧路;验证门全绿后缺省翻
+            # sensevoice(三语过门 40-48ms CPU,MPS 只剩 LLM)。翻转只动那一处。
+            engine=_asr_engine_from_cfg(asr_cfg),
         )
         if os.environ.get("QWEN3_ASR_STREAM", "1") == "1":
             # 「VAD+滑窗 partial」流式包装:说话期间出 INTERIM(实时字幕)/

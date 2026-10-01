@@ -110,6 +110,8 @@ class CreateObjectRequest(BaseModel):
     courier: str = ""
     address: str = ""
     contact_channel: str = ""
+    # 发音词典（多行 `原词/读法`；空=默认读音）。仓储层截断 ≤500 字。
+    pronunciation: str = ""
     template_id: str = ""
 
 
@@ -129,6 +131,8 @@ class UpdateObjectRequest(BaseModel):
     courier: str = ""
     address: str = ""
     contact_channel: str = ""
+    # 发音词典（多行 `原词/读法`；空=默认读音）。仓储层截断 ≤500 字。
+    pronunciation: str = ""
     template_id: str = ""
     status: str = "active"
 
@@ -201,6 +205,12 @@ class ProviderSettings(BaseModel):
     # asr.language_mode: auto=锚定+滞回跟随(默认) | fixed=钉死 language 指定语言。
     voice_mode: str = "single"
     language_mode: str = "auto"
+    # 【P1 SV-CPU 引擎车道(2026-10-01 三层解耦)】asr.engine: ""/qwen3=旧
+    # Qwen3-ASR(MPS)路径 | sensevoice=SenseVoice-small int8 纯 CPU 车道
+    # (三语过门 zh 2.8%/en 5.4%/canto 8.6%、WA 数字 16/16、40-48ms/句;
+    # reports/sensevoice-eval/)。缺省翻 sensevoice 待 soak/FLOW20/数字轮验证门;
+    # 未知值运行时保守回旧路径(fail-safe)。不声明此键 PUT 会蒸发——见上注释。
+    engine: str = ""
     speaker: str = ""
     speaker_zh: str = ""
     speaker_cantonese: str = ""
@@ -435,12 +445,17 @@ class QaClusterRequest(BaseModel):
 
     limit 钳 ≤100(CP 侧);select 缺省=全部 variants+fresh。dry 计划有 600s
     per-account 缓存,apply 优先吃新鲜缓存免二次 LLM。
+
+    hotword_select(EX-H1,2026-09-28):dry 计划 hotwords.candidates 的下标列表,
+    apply 时采纳为账号热词行(account_id=本账号, source=mined);缺省 None=不采纳
+    任何热词。与 select 同受「新鲜缓存」守卫(带选择必须有同参数新鲜计划)。
     """
 
     min_calls: int = 5
     limit: int = 60
     apply: bool = False
     select: Optional[list[QaClusterSelectItem]] = None
+    hotword_select: Optional[list[int]] = None
 
 
 class IntentRuleCreate(BaseModel):

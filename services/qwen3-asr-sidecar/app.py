@@ -6,6 +6,7 @@ import re
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -58,6 +59,45 @@ def _partial_should_skip(elapsed_ms: float, interval_ms: float, others: bool) ->
     """partial 解码节流决策(纯函数):未到间隔跳;并发在飞时间隔×2 再判。"""
     eff = interval_ms * 2 if others else interval_ms
     return elapsed_ms < eff
+
+
+# ---- P1 SV-CPU 引擎车道(2026-10-01 三层解耦计划:CPU 耳朵/MPS 大脑) ----
+# SenseVoice-small int8 ONNX 纯 CPU:三语过门(zh 2.8%/en 5.4%/canto 8.6%,
+# WA 数字 16/16 clean+窄带,40-48ms/句;reports/sensevoice-eval/)。模型目录
+# 由 bok download --only sensevoice 落位(不进 git);缺席 fail-open 回 Qwen3。
+SV_MODEL_DIR = os.environ.get(
+    "QWEN3_ASR_SV_MODEL_DIR",
+    str(Path.home() / "Library" / "Application Support" / "BokVoice" / "models" / "sensevoice"),
+)
+# 识别器语言档:auto≈yue 钉死(评估语料同分);要钉死设 yue/zh/en。
+SV_LANGUAGE = os.environ.get("QWEN3_ASR_SV_LANGUAGE", "auto")
+
+
+def _norm_engine(engine: str) -> str:
+    """会话引擎归一:"" / qwen3 / mlx = 旧全局路径;sensevoice / sv = CPU 车道。
+
+    未知值保守回缺省(旧行为)。"""
+    e = str(engine or "").strip().lower()
+    if e in ("sensevoice", "sv"):
+        return "sensevoice"
+    return ""
+
+
+def _sv_model_dir_ok() -> bool:
+    d = Path(SV_MODEL_DIR)
+    return (d / "model.int8.onnx").is_file() and (d / "tokens.txt").is_file()
+
+
+def _sv_lang_label(session_lang: str) -> str:
+    """会话语言(cantonese/zh/en)→ 插件契约的 language 标签(与 Qwen3 路径一致)。"""
+    s = str(session_lang or "").strip().lower()
+    if s in ("cantonese", "yue", "粵", "粤"):
+        return "Cantonese"
+    if s in ("zh", "chinese", "mandarin"):
+        return "Chinese"
+    if s in ("en", "english"):
+        return "English"
+    return ""
 
 
 def _resample(wav: np.ndarray, sr: int, target_sr: int) -> np.ndarray:
@@ -300,6 +340,8 @@ class ASRService:
         self._model: Any | None = None
         self._sessions: dict[str, dict[str, Any]] = {}
         self._load_error: str | None = None
+        # P1 SV-CPU 引擎:识别器懒加载单例(None=未加载;首次 sensevoice 会话触发)。
+        self._sv: Any | None = None
 
     def _sweep_sessions(self, now: float | None = None) -> None:
         """过期/超量会话清扫:TTL 到期先清,总量超限再按 created_at 清最旧。
@@ -379,9 +421,25 @@ class ASRService:
         if self._model is None:
             raise HTTPException(status_code=503, detail="model not loaded")
 
-    def start(self, language: str = "", context: str = "", partial_ms: str = "") -> str:
+    def start(self, language: str = "", context: str = "", partial_ms: str = "", engine: str = "") -> str:
         session_id = uuid.uuid4().hex
         pm = str(partial_ms or "").strip()
+        # 【P1 SV-CPU 引擎车道(2026-10-01 计划定案)】engine=会话级引擎选择:
+        #   ""/"qwen3"/"mlx" = 全局 BACKEND 旧路径(Qwen3-ASR,逐字节不变);
+        #   "sensevoice"/"sv" = SenseVoice-small int8 ONNX,**纯 CPU**——三语实测
+        #   zh 2.8%/en 5.4%/canto 8.6%、WA 数字 16/16(clean+窄带)、40-48ms/句
+        #   (reports/sensevoice-eval/);MPS 从此只跑 LLM,ASR/LLM 竞态结构性终结。
+        #   SV 无 context 热词通道(域词靠 agent 侧 asr_polish 吸附层兜)、无
+        #   token 置信度(confidence 键缺席=插件回旧行为)。模型缺席 fail-open
+        #   回旧引擎+一行告警。
+        _eng = _norm_engine(engine)
+        if _eng == "sensevoice" and not _sv_model_dir_ok():
+            _eng = ""
+            print(
+                f"[qwen3-asr] sensevoice engine fallback: model dir missing "
+                f"({SV_MODEL_DIR}) — set QWEN3_ASR_SV_MODEL_DIR or bok download --only sensevoice",
+                flush=True,
+            )
         self._sessions[session_id] = {
             "chunks": bytearray(),
             "text": "",
@@ -401,6 +459,7 @@ class ASRService:
             "last_partial_at": 0.0,
             "partials_done": False,
             "inf_lock": threading.Lock(),
+            "engine": _eng,
         }
         # 懒清扫在插入后跑(不变量见 _sweep_sessions docstring)。
         self._sweep_sessions()
@@ -432,6 +491,10 @@ class ASRService:
                 "language": session["language"],
                 "partial": True,
             }
+        # 【P1】SV 引擎:partial 滑窗同款语义,但解码在 CPU(并发让位不适用——
+        # 不同芯片,不吃 MPS 时间片,partial 只按普通间隔门跑)。
+        if session.get("engine") == "sensevoice":
+            return self._partial_sv(session)
         if BACKEND == "mlx" and STREAM_PARTIAL:
             return self._partial_mlx(session)
 
@@ -441,6 +504,84 @@ class ASRService:
             "language": session["language"],
             "partial": False,
         }
+
+    # ---- P1 SV-CPU 引擎(CPU 耳朵):识别器懒加载 + 滑窗 partial + finish ----
+
+    def _sv_model(self):
+        """SenseVoice 识别器单例(sherpa-onnx OfflineRecognizer, int8, CPU)。"""
+        if self._sv is None:
+            import sherpa_onnx
+
+            d = Path(SV_MODEL_DIR)
+            self._sv = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+                model=str(d / "model.int8.onnx"),
+                tokens=str(d / "tokens.txt"),
+                use_itn=True,
+                language=SV_LANGUAGE,
+                num_threads=int(os.environ.get("QWEN3_ASR_SV_THREADS", "2")),
+            )
+            print(
+                f"[qwen3-asr] sensevoice engine ready dir={SV_MODEL_DIR} "
+                f"lang={SV_LANGUAGE} (cpu)",
+                flush=True,
+            )
+        return self._sv
+
+    def _sv_decode(self, pcm: bytes) -> str:
+        x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        rec = self._sv_model()
+        stream = rec.create_stream()
+        stream.accept_waveform(sample_rate=SAMPLE_RATE, waveform=x)
+        rec.decode_stream(stream)
+        return str(getattr(stream.result, "text", "") or "")
+
+    def _partial_sv(self, session: dict) -> dict[str, str | bool]:
+        """SV 滑窗 partial:语义与 _partial_mlx 逐条对齐(同锁/同账本字段/同间隔门),
+        差异两点——①解码在 CPU:不吃 MPS 时间片,不参与并发让位(×2 退避不适用);
+        ②无 token 置信度(partial 本就不带,响应形状一致)。partial_text/partial
+        _covered/last_partial_at 同款落账 → 增量 finish 的 zero-tail 判据面不变。
+        """
+        cached = {
+            "text": session.get("partial_text", ""),
+            "language": session.get("partial_lang", ""),
+            "partial": True,
+        }
+        if session.get("partials_done"):
+            return cached
+        lock = session.setdefault("inf_lock", threading.Lock())
+        if not lock.acquire(blocking=False):
+            return cached
+        try:
+            now = time.monotonic()
+            elapsed_ms = (now - float(session.get("last_partial_at") or 0.0)) * 1000
+            pcm = bytes(session["chunks"])
+            dur_sec = len(pcm) / 2 / SAMPLE_RATE
+            interval_ms = float(session.get("partial_ms") or PARTIAL_INTERVAL_MS)
+            if elapsed_ms < interval_ms:
+                return cached
+            if dur_sec < 0.6:
+                return cached  # 太短没有转写价值,等下一窗
+            capped = dur_sec > PARTIAL_MAX_SEC
+            if capped:
+                pcm = pcm[-int(PARTIAL_MAX_SEC * SAMPLE_RATE) * 2 :]
+            text = self._sv_decode(pcm)
+            session["partial_prev_text"] = str(session.get("partial_text") or "")
+            session["partial_text"] = text
+            session["partial_lang"] = _sv_lang_label(session.get("language")) or _fallback_language(text)
+            session["partial_covered"] = None if capped else len(pcm)
+            session["last_partial_at"] = now
+            return {"text": text, "language": session["partial_lang"], "partial": True}
+        except Exception:  # noqa: BLE001 - partial 失败回 cached,finish 全量兜底
+            return cached
+        finally:
+            lock.release()
+
+    def _finish_sv(self, session: dict, pcm: bytes) -> dict[str, Any]:
+        """SV finish:整段全量解码(45ms 级,无需增量/置信度加菜);语言标签由会话
+        钉定语言映射(与 Qwen3 路径的 language 契约一致)。"""
+        text = self._sv_decode(pcm)
+        language = _sv_lang_label(session.get("language")) or _fallback_language(text)
+        return {"text": text, "language": language, "partial": False}
 
     def _partial_mlx(self, session: dict) -> dict[str, str | bool]:
         """滑窗 partial：说话期间每 PARTIAL_INTERVAL_MS 对累积 buffer 重推一次。
@@ -820,7 +961,10 @@ class ASRService:
         # 让「pop 前已拿到 session 引用」的喺途 chunk 调用也停发 partial——
         # FINAL 之后唔再有解码排 GPU,也唔会吐过期 INTERIM 抢跑事件。
         session["partials_done"] = True
-        self._ensure_loaded()
+        # 【P1】SV 车道不依赖 Qwen3 权重(独立识别器)——ensure 只对旧引擎跑,
+        # 免得「只装了 SV 模型」的部署被 503 拦住。
+        if session.get("engine") != "sensevoice":
+            self._ensure_loaded()
 
         if BACKEND == "vllm":
             state = session["vllm_state"]
@@ -852,6 +996,15 @@ class ASRService:
         # 语言提示:由会话 start 语言归一(en/english→"English",cantonese 透传,
         # zh/空=auto);整句与增量尾段两条 generate 路径共用同一 hint。
         hint = _finish_language_hint(session.get("language"))
+        # 【P1】SV 引擎 finish:整段全量解码(CPU 45ms 级,无增量/置信度分支),
+        # 泰文串档守卫同款收口(pcm 真值在手)。
+        if session.get("engine") == "sensevoice":
+            return self._with_confidence(
+                self._script_confusion_guard(
+                    self._finish_sv(session, pcm), session, pcm, hint
+                ),
+                None,  # SV 无 token 级置信度(插件按缺席回旧行为)
+            )
         if BACKEND == "mlx":
             # 增量 fast path:新鲜 partial 已覆盖 buffer 主体 → 只解码尾巴再拼接;
             # 任一前提不成立则回退整句高精度兜底(WhatsApp 捕获零降级)。
@@ -957,7 +1110,12 @@ def health() -> dict:
     }
 
 @app.post("/api/start")
-async def start(language: str = "", context: str = "", partial_ms: str = "") -> dict[str, str]:
+async def start(
+    language: str = "",
+    context: str = "",
+    partial_ms: str = "",
+    engine: str = "",
+) -> dict[str, str]:
     # language: 可选转写语言提示("cantonese"/"Chinese"/"English")。agent 按每通
     # 对话钉定语言传入(A 线通话/B 线同传三语全钉),强制模型按该语言转写
     # (cantonese 不钉会被 auto 误判成普通话);留空 = 交给模型 auto。
@@ -965,9 +1123,14 @@ async def start(language: str = "", context: str = "", partial_ms: str = "") -> 
     # context 通道),agent 按话术领域词+对象文字字段组装;QWEN3_ASR_CONTEXT=0 关。
     # partial_ms: 会话级 partial 解码间隔档(agent 生成中抑制,GPU 竞态专项);
     # 空值=env 默认。
+    # engine: P1(2026-10-01) 会话级引擎——""/qwen3=旧 Qwen3 路径,
+    # sensevoice=CPU 车道(三语过门,见 _norm_engine 档案)。
     return {
         "session_id": service.start(
-            language=language.strip(), context=context.strip(), partial_ms=partial_ms.strip()
+            language=language.strip(),
+            context=context.strip(),
+            partial_ms=partial_ms.strip(),
+            engine=engine.strip(),
         )
     }
 

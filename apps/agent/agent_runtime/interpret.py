@@ -928,6 +928,7 @@ async def entrypoint(ctx) -> None:
         LanguageState,
         Qwen3ASRLiveSTT,
         Qwen3ASRSTT,
+        _asr_engine_from_cfg,
     )
 
     meta: dict = {}
@@ -1017,6 +1018,9 @@ async def entrypoint(ctx) -> None:
         language_state=asr_ls,
         pin_language=True,
         hotword_context=_asr_hotword_ctx,
+        # 【P1 SV-CPU 引擎车道(2026-10-01)】与 A 线同解析器:env > asr_json >
+        # 缺省旧路;验证门后同步翻 sensevoice。
+        engine=_asr_engine_from_cfg(asr_cfg),
     )
     if os.environ.get("QWEN3_ASR_STREAM", "1") == "1":
         # 同传更要 partial:源语音边说边出稳定前缀 → 抢跑 prefill,译文首句更早。
