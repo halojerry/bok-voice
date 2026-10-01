@@ -129,8 +129,9 @@ async def main() -> None:
         json={"name": "E2E客服", "language": lang, "tone": "礼貌专业"},
         timeout=10,
     ).json()
-    # B1 模板必填闸(2026-09-28 后):live 建单必须绑模板——显式 env 或取账号
-    # 首个模板(probe 语义只要一通真话术通话,不挑模板)。
+    # B1 模板必填闸(2026-09-28 后):live 建单必须绑模板——显式 env 或取**同语言**
+    # 正牌模板(2026-10-01 勘误:旧「取首个」会拿普通话模板打粤语电话,reply1 变成
+    # 9 秒 say 直念步=不同播放车道可打断性不同,stop_ms 读数与历史基线不可比)。
     tpl_id = os.environ.get("BARGEIN_TEMPLATE_ID", "").strip()
     if not tpl_id:
         tpls = httpx.get(
@@ -139,8 +140,14 @@ async def main() -> None:
             timeout=10,
         ).json()
         tpls = tpls if isinstance(tpls, list) else tpls.get("items") or tpls.get("templates") or []
-        if tpls:
-            tpl_id = str(tpls[0].get("id") or "")
+        tpl = next(
+            (t for t in tpls
+             if str(t.get("language")) == lang
+             and "e2e" not in str(t.get("name", "")).lower()
+             and "probe" not in str(t.get("name", "")).lower()),
+            None,
+        )
+        tpl_id = str(tpl.get("id") or "") if tpl else ""
     if not tpl_id:
         raise SystemExit("B1 模板闸:无可用模板——请设 BARGEIN_TEMPLATE_ID 或先建模板")
     call = httpx.post(
@@ -235,17 +242,25 @@ async def main() -> None:
         interrupt_at = time.perf_counter()
         await push_pcm(audio_source, tts_pcm(SECOND_TEXT))
 
-        # 断言①：agent ≤8s 内停声（打断生效——若一直在讲说明打断失败）
+        # 断言①：agent 打断后当句停声——首个 ≥0.8s 连续静音隙即记停(2026-10-01
+        # 勘误:旧「累计 2.0s 静音」会被打断后自动推进的下一步罐头播报顶住=假 FAIL,
+        # 打断契约=当句停止,流程继续开新句(say 直念步)不算打断失败;0.8s 对齐
+        # interruption min_duration 0.6s+余量)。
         state2 = {"processed": reply1_speech_at, "speech": 0.0, "silent": 0.0}
         stopped = False
+        consec_sil = 0.0
         while time.perf_counter() - interrupt_at < 8:
-            _, sil, state2["processed"] = speech_stats(
+            sp, sil, state2["processed"] = speech_stats(
                 bytes(agent_audio), state2["processed"]
             )
             state2["silent"] += sil
-            if state2["silent"] >= 2.0:
-                stopped = True
-                break
+            if sp > 0:
+                consec_sil = 0.0
+            else:
+                consec_sil += sil
+                if consec_sil >= 0.8:
+                    stopped = True
+                    break
             await asyncio.sleep(0.3)
         stop_ms = (time.perf_counter() - interrupt_at) * 1000
 
