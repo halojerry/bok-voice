@@ -174,10 +174,15 @@ def test_both_judges_await_event_after_delay_before_llm():
 
 
 def test_scheduling_points_unchanged():
-    """调度点不变（fire-and-forget 位置/形态逐字节）——只挪 LLM 调用时刻。"""
+    """调度点不变（fire-and-forget 位置/形态逐字节）——只挪 LLM 调用时刻。
+
+    FIX-2(b)(2026-10-01):调用多带一个 garbled=_garbled_band_round 实参
+    (garbled 轮 streak 三写点全守,ASR 病不记模型头上)——调度点/位置/单飞不变。
+    """
     assert (
         _SRC.count(
-            "_spawn_report(_background_flow_judge(_step_at, user_text, turn_key=_turn_key))"
+            "_spawn_report(_background_flow_judge("
+            "_step_at, user_text, turn_key=_turn_key, garbled=_garbled_band_round))"
         )
         == 1
     )

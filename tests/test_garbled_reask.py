@@ -13,10 +13,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "apps" / "agent"))
 
 from agent_runtime.agent import (  # noqa: E402
+    _band_round_is_garbled,
     _garbled_reask_line,
     _is_ack_anchor_text,
     garbled_reask_gate,
 )
+from agent_runtime.flow import FlowController, stall_ladder_level  # noqa: E402
 
 # scripts/e2e_barge_in.py 的真客户插话激励(第一句触发回复/第二句播放中插入打断):
 # 打断轮是**合法话头**,碎片车道绝不可以把它截成重问。
@@ -120,13 +122,16 @@ def _agent_src() -> str:
     return (ROOT / "apps" / "agent" / "agent_runtime" / "agent.py").read_text(encoding="utf-8")
 
 
-def test_lane_sits_after_qa_fastpath_and_before_filler_arm():
+def test_lane_sits_before_stall_ladder_and_before_filler_arm():
+    # FIX-2(a)(D2-3,2026-10-01):旧序 lane 在 QA 快路之后、_filler.arm() 之前,
+    # 烂转写轮先被 stall 阶梯 degrade 台词截走——求值上移到 stall 阶梯块之前
+    # (ASR 病优先于模型病);仍在 _filler.arm() 之前 raise(碎片轮不起垫话)。
     src = _agent_src()
-    qa = src.index("QA_FASTPATH hit=0 reason=no_audio")
     reask = src.index("GARBLED_REASK lane=1")
+    ladder = src.index("[stall-ladder] step=")
     # rindex:取真调用点(车道注释里也提到 _filler.arm(),那处唔算)
     filler = src.rindex("_filler.arm()")
-    assert qa < reask < filler
+    assert reask < ladder < filler
     # 车道登记形状:chokepoint+gen=script+anchor=False
     assert 'lane="garbled-reask", gen="script",' in src
     assert "text=_reask_line, anchor=False," in src
@@ -197,3 +202,79 @@ def test_sv_no_conf_single_char_fires():
 def test_qwen3_path_unchanged_with_conf():
     """conf_available=True(Qwen3 默认):旧判据不变(unknown+looks_garbled 照开)。"""
     assert _sv_gate("哦。", conf_available=True) == "reask"
+
+
+# ---- FIX-2(D2-3,2026-10-01):ASR 病优先于模型病 ----
+# 病灶:连续烂转写 UNCLEAR 轮先被 stall 阶梯 degrade 台词截走,永远走不到重问;
+# 且烂转写轮还在喂 step_streak/unclear_streak(把 ASR 病记模型头上=归因错误)。
+
+
+def test_band_round_is_garbled_pure():
+    """streak 守卫判据=band=="low" 或 band=="unknown"∧looks_garbled(与门同源)。"""
+    # low:STT 自己都唔确定 → 烂轮,唔理文本
+    assert _band_round_is_garbled("low", "我件貨爛咗想投訴。")
+    # ok:置信度高 → 正常文本永唔算烂(窄带数字错听高置信实测,band 只是辅助)
+    assert not _band_round_is_garbled("ok", "64311133")
+    # unknown + 碎片/数字主导文本 → 烂
+    assert _band_round_is_garbled("unknown", "64311133")
+    assert _band_round_is_garbled("unknown", "六四三一一三三")
+    assert _band_round_is_garbled("unknown", "哦。")  # ≤1 实质字
+    # unknown + 有内容 → 唔算烂(正常 UNCLEAR 轮照常喂 streak)
+    assert not _band_round_is_garbled("unknown", "我件貨爛咗想投訴。")
+    # 热词词表命中剥除后无内容 → 烂(词表回声残渣形态)
+    assert _band_round_is_garbled("unknown", "拼多多", ("拼多多",))
+
+
+def test_garbled_rounds_never_feed_streak_contrast():
+    """守卫对照:无守卫 3 轮烂转写当 UNCLEAR 喂=degrade;守卫后恒 0。"""
+    garbage = "六四三一一三三"
+    # 旧路(病灶形态):3 轮烂转写被记成 UNCLEAR → 阶梯 degure 门槛
+    fc_old = FlowController(steps=[])
+    for i in range(3):
+        fc_old.note_turn_outcome("unclear", 0, f"g{i}")
+    assert stall_ladder_level(fc_old.step_streak[0]) == "degrade"
+    # FIX-2(b):同判据下 3 轮全部跳过写点 → 永不爬升
+    assert _band_round_is_garbled("unknown", garbage)
+    fc_new = FlowController(steps=[])
+    for i in range(3):
+        if not _band_round_is_garbled("unknown", garbage):
+            fc_new.note_turn_outcome("unclear", 0, f"g{i}")
+    assert fc_new.step_streak.get(0, 0) == 0
+    assert stall_ladder_level(fc_new.step_streak.get(0, 0)) == ""
+    # 正常 UNCLEAR 轮(可懂输入)旧语义保持:照常爬升
+    fc_ok = FlowController(steps=[])
+    for i in range(3):
+        assert not _band_round_is_garbled("unknown", "我件貨爛咗想投訴。")
+        fc_ok.note_turn_outcome("unclear", 0, f"n{i}")
+    assert stall_ladder_level(fc_ok.step_streak[0]) == "degrade"
+
+
+def test_consecutive_garbled_rounds_consumed_by_reask_lane():
+    """连续 3 轮烂转写:门连发 reask/reask/cap——每轮都被车道消费(raise),
+    到不了 stall 阶梯;cap 轮同属 garbled band(不喂 streak)。"""
+    consec = 0
+    verdicts = []
+    for _ in range(3):
+        v = _gate(user_text="六四三一一三三", band="unknown", consec=consec)
+        verdicts.append(v)
+        if v == "reask":
+            consec += 1
+    assert verdicts == ["reask", "reask", "cap"]
+    assert _band_round_is_garbled("unknown", "六四三一一三三")  # cap 轮旗标面
+
+
+def test_garbled_streak_guard_wiring_source_pinned():
+    """源级 pin:旗标块在 streak 写点前;规则路/ judge 路三写点全守;judge 透传。"""
+    src = _agent_src()
+    # 旗标在 _flow_step_before 之后、规则推进 note_turn_outcome 之前
+    flag = src.index("_garbled_band_round = False")
+    write_first = src.index("if not _garbled_band_round:\n                        flow_ctrl.note_turn_outcome(")
+    assert flag < write_first
+    assert '"" if flow_ctrl.current != _flow_step_before else verdict,' in src
+    assert "_band_round_is_garbled(" in src
+    assert "_background_flow_judge(_step_at, user_text, turn_key=_turn_key, garbled=_garbled_band_round)" in src
+    assert "async def _background_flow_judge(step_at: int, utt: str, turn_key: str = \"\", garbled: bool = False) -> None:" in src
+    # judge 路三写点:note_turn_outcome/degrade_boost/unclear bump
+    assert "if turn_key and flow_ctrl.current == step_at and not garbled:" in src
+    assert "and flow_ctrl.current == step_at\n                and not garbled\n            ):" in src
+    assert "if jv == UNCLEAR and not garbled:" in src
