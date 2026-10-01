@@ -79,6 +79,7 @@ from .deps import (
     read_model_routing_raw,
     write_model_routing_raw,
 )
+from .capacity import capacity_snapshot, format_limit_detail
 from .dispatch_utils import cleanup_dispatch, has_active_dispatch
 from .nodes_store import HEARTBEAT_INTERVAL_S, LicenseError, NodeStore
 from .permissions import (
@@ -2365,27 +2366,10 @@ def create_call(req: CreateCallRequest, request: Request) -> dict:
     return _create_call_in(_repo(), req, created_by=created_by)
 
 
-def _max_active_calls_env() -> int:
-    """并发准入上限（BOK_MAX_ACTIVE_CALLS，缺省 2；<=0=不限，非法回落 2）。
-
-    实测诚实上限（2026-10-01 双通实弹复核）：6 通 Metal OOM 拖垮整栈
-    （reports/mac-concurrency-2026-09-24/BATTERY-FINAL.md）；2 通=可服务但
-    降级（共享 MPS,prewarm 让位+ASR 竞态让位已拔掉最尖的刺）；3 通从未
-    验证过全质量——缺省收紧到 2,要 3 显式设。**不落 settings schema**
-    ——建单时读 os.environ，经 tools/bok.py `_control_plane_env` 下发（同
-    BOK_DISPATCH_RETRY 判例），零迁移。
-    """
-    try:
-        n = int(str(os.environ.get("BOK_MAX_ACTIVE_CALLS", "") or "2").strip())
-    except (TypeError, ValueError):
-        return 2
-    return n  # <=0 由调用方视为不限
-
-
 def _require_template_env() -> bool:
     """实时通话是否强制绑定话术模板（BOK_REQUIRE_TEMPLATE，缺省开；=0 关）。
 
-    与 `_max_active_calls_env` 同判例：建单时读 os.environ，经 tools/bok.py
+    同 BOK_DISPATCH_RETRY 判例：建单时读 os.environ，经 tools/bok.py
     `_control_plane_env` 下发，零迁移。默认开启——实时业务通话不绑模板=agent
     无话术漏斗裸跑，属结构性配置错误。
     """
@@ -2419,17 +2403,29 @@ def _create_call_in(repo, req: CreateCallRequest, created_by: str = "") -> dict:
     # 作用域=mode=live（真实业务 A 线通话，吃本机单并发 LLM/GPU 的车道）；
     # simulation（训练/画布试跑）与 realtime_demo（云端 S2S，不吃本地 GPU）不受限
     # ——训练/单测会刻意对同一对象连续建多单，闸到它们会误伤既有语义（且非 OOM 源）。
-    # ①并发：活通话（ringing/active/paused）达 BOK_MAX_ACTIVE_CALLS（默认 3）→ 409。
-    #   campaign/dial-now（均 mode=live）亦走此闸=背压；E2E 探针串行不受影响。
+    # ①并发：活通话（ringing/active/paused）达容量准入上限 → 409。
+    #   上限=capacity.py 动态档 clamp(floor,(available-headroom)/workset,ceiling)——
+    #   准入不创造容量,内存紧时往下压;mac 档 ceiling=2=6 通 Metal OOM 实弹的物理
+    #   上限(reports/mac-concurrency-2026-09-24)。显式 BOK_MAX_ACTIVE_CALLS=legacy
+    #   钉死（旧语义逐字节,0/负=不限;显式设了就不探测）。campaign/dial-now（均
+    #   mode=live）亦走此闸=背压；E2E 探针串行不受影响。
     # ②重复：同一 object_id 已有活通话 → 409（对象维度防叠单，B 线无 object 跳过）。
     if req.mode == CallMode.LIVE:
-        _max_active = _max_active_calls_env()
+        _limit = capacity_snapshot()
+        _max_active = int(_limit.get("max") or 0)
         if _max_active > 0:
             _active = _live_call_count(repo)
             if _active >= _max_active:
+                # 409 detail 带计算明细（profile/floor/computed/ceiling/free_gb）
+                # 便于运维归因「为什么只放 N 通」;审计落同款结构字段。
+                _detail = {"active": _active, "max": _max_active, "mode": req.mode,
+                           "kind": req.kind, "profile": _limit.get("profile"),
+                           "floor": _limit.get("floor"), "computed": _limit.get("computed"),
+                           "ceiling": _limit.get("ceiling"), "free_gb": _limit.get("free_gb"),
+                           "legacy": bool(_limit.get("legacy"))}
                 _audit("call.reject_concurrency", subject_type="call", account_id=req.account_id,
-                       detail={"active": _active, "max": _max_active, "mode": req.mode, "kind": req.kind})
-                raise HTTPException(status_code=409, detail="并发已达上限，请稍后重试")
+                       detail=_detail)
+                raise HTTPException(status_code=409, detail=format_limit_detail(_limit))
         if req.object_id:
             for _c in repo.list_calls(""):
                 if (str(_c.get("object_id") or "") == req.object_id

@@ -83,6 +83,20 @@ def _norm_engine(engine: str) -> str:
     return ""
 
 
+def _boot_engine() -> str:
+    """启动期引擎档:env ``BOK_ASR_ENGINE``(bok 起 :8787 时透传)归一。
+
+    缺省/未知 → ``"sensevoice"``(与 agent ``_asr_engine_from_cfg`` 的缺省档
+    对齐——默认部署 CPU 耳朵跑 SV,sidecar 无需 eager 加载 Qwen3-1.7B GPU
+    权重,~1.9GB 纯占卡零消费);显式 ``qwen3``/``mlx`` → ``""``=旧路径,
+    启动 eager 加载,回滚档行为逐字节不变。
+    """
+    v = str(os.environ.get("BOK_ASR_ENGINE", "") or "").strip().lower()
+    if v in ("qwen3", "mlx"):
+        return ""
+    return "sensevoice"
+
+
 def _sv_model_dir_ok() -> bool:
     d = Path(SV_MODEL_DIR)
     return (d / "model.int8.onnx").is_file() and (d / "tokens.txt").is_file()
@@ -343,6 +357,13 @@ class ASRService:
         # P1 SV-CPU 引擎:按语言键缓存的识别器表(空表=未加载;首次 sensevoice
         # 会话按钉定语言触发懒加载)。
         self._sv_models: dict[str, Any] = {}
+        # 任务 B(2026-10-01):BOK_ASR_ENGINE=sensevoice 档启动不加载 Qwen3 权重,
+        # 首个真走 qwen3 路径的请求(_ensure_loaded)触发懒加载——回滚
+        # BOK_ASR_ENGINE=qwen3 免重启。_load_lock+_loading 单飞:加载期间到达的
+        # 并发请求在锁上排队,不静默丢请求、不重复加载。
+        self._qwen3_deferred = False
+        self._loading = False
+        self._load_lock = threading.Lock()
 
     def _sweep_sessions(self, now: float | None = None) -> None:
         """过期/超量会话清扫:TTL 到期先清,总量超限再按 created_at 清最旧。
@@ -417,8 +438,29 @@ class ASRService:
         return "cpu"
 
     def _ensure_loaded(self) -> None:
+        """Qwen3 权重就绪闸(懒加载档单飞)。
+
+        任务 B:启动跳载档(_qwen3_deferred)下,首个真走 qwen3 路径的请求在此
+        触发加载——_load_lock 单飞,并发请求在锁上排队等加载完成(不硬拒、不
+        静默丢请求);加载失败照旧 503+原因。eager 档(显式 BOK_ASR_ENGINE=
+        qwen3)路径零行为变化。
+        """
         if self._load_error:
             raise HTTPException(status_code=503, detail=f"model not ready: {self._load_error}")
+        # 等待条件含 _loading:加载窗口内(首个请求已置 deferred=False)到达的并发
+        # 请求仍须进锁排队——只认 deferred 会把窗口内的请求直接 503 掉(竞态)。
+        if self._model is None and (self._qwen3_deferred or self._loading):
+            with self._load_lock:
+                if self._model is None and self._qwen3_deferred:
+                    self._loading = True
+                    self._qwen3_deferred = False
+                    print("ASR_QWEN3_LAZY_LOAD engine=qwen3", flush=True)
+                    try:
+                        self.load()
+                    finally:
+                        self._loading = False
+            if self._load_error:
+                raise HTTPException(status_code=503, detail=f"model not ready: {self._load_error}")
         if self._model is None:
             raise HTTPException(status_code=503, detail="model not loaded")
 
@@ -627,6 +669,10 @@ class ASRService:
         if not lock.acquire(blocking=False):
             return cached
         try:
+            # 任务 B:懒加载档下 partial 是 qwen3 路径的首个解码入口——先收敛
+            # 权重就绪(_ensure_loaded 单飞;失败由其 503 抛出让下面 except 回
+            # cached,finish 全量兜底),否则首个回滚会话静默丢全部 partial。
+            self._ensure_loaded()
             now = time.monotonic()
             elapsed_ms = (now - float(session.get("last_partial_at") or 0.0)) * 1000
             # 解码快照:喺持锁期间、generate 之前拍照。incremental finish 的
@@ -1119,7 +1165,16 @@ _CONF_ENABLED = os.environ.get("QWEN3_ASR_CONFIDENCE", "1") == "1"
 
 @app.on_event("startup")
 def _startup() -> None:
-    service.load()
+    # 任务 B（2026-10-01）:BOK_ASR_ENGINE=sensevoice 档（含缺省/未设——与 agent
+    # `_asr_engine_from_cfg` 缺省对齐）跳过 Qwen3-1.7B GPU 权重 eager 加载
+    # （审计实锤 asr.log "loaded ... device=gpu"，~1.9GB 纯占卡零消费——默认
+    # 部署 ASR 全走 CPU 车道）。首个真走 qwen3 路径的请求由 _ensure_loaded
+    # 懒加载，回滚 BOK_ASR_ENGINE=qwen3 免重启；显式 qwen3=旧行为逐字节不变。
+    if _boot_engine() == "sensevoice":
+        service._qwen3_deferred = True
+        print("ASR_QWEN3_SKIPPED engine=sensevoice", flush=True)
+    else:
+        service.load()
 
 @app.get("/health")
 def health() -> dict:
@@ -1129,6 +1184,9 @@ def health() -> dict:
         "model": MODEL_PATH,
         "model_ready": service._model is not None,
         "load_error": service._load_error,
+        # 任务 B:跳载档=true（model_ready=False 是设计态不是故障）;首个 qwen3
+        # 路径请求触发懒加载后翻 false。
+        "qwen3_deferred": service._qwen3_deferred,
     }
 
 @app.post("/api/start")

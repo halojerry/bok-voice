@@ -1315,13 +1315,21 @@ def _control_plane_env(db: Path | str) -> dict[str, str]:
     _dispatch_retry = os.environ.get("BOK_DISPATCH_RETRY", "").strip()
     if _dispatch_retry:
         env["BOK_DISPATCH_RETRY"] = _dispatch_retry
-    # 并发准入上限（2026-09-27）：唯一消费者是 **CP**（_create_call_in 建单闸，
-    # control_plane.main），同 BOK_DISPATCH_RETRY 判例走这张 CP 面表显式下发
-    # （不进 _FORWARD_ENV——agent worker 面）。未设/空串不注入（CP 侧默认 3；
-    # "0"=不限）。
+    # 并发准入上限（2026-09-27；2026-10-01 容量模块化）：唯一消费者是 **CP**
+    # （_create_call_in 建单闸，control_plane.main），同 BOK_DISPATCH_RETRY 判例
+    # 走这张 CP 面表显式下发（不进 _FORWARD_ENV——agent worker 面）。显式设了
+    # =legacy 钉死（旧语义逐字节；"0"=不限）；未设/空串不注入=CP 侧 capacity.py
+    # 动态档（mac 档 ceiling=2，准入不创造容量）。
     _max_active = os.environ.get("BOK_MAX_ACTIVE_CALLS", "").strip()
     if _max_active:
         env["BOK_MAX_ACTIVE_CALLS"] = _max_active
+    # 容量准入档案（2026-10-01 第一性重写）：CP 面三键——部署档案选择 + floor/
+    # ceiling 覆盖（capacity.py 消费；auto=macOS→mac、Linux+nvidia-smi→cuda）。
+    # 未设/空串不注入=CP 侧 auto 探测，零迁移（同 BOK_DISPATCH_RETRY 判例）。
+    for _k in ("BOK_DEPLOY_PROFILE", "BOK_MAX_CALLS_FLOOR", "BOK_MAX_CALLS_CEILING"):
+        _v = os.environ.get(_k, "").strip()
+        if _v:
+            env[_k] = _v
     # M-7 login 频控 kill-switch（2026-09-23 修复波#3）：唯一消费者是 **CP**
     # （/api/auth/login per-username 滑窗，control_plane.main），同 BOK_DISPATCH_RETRY
     # 判例走这张 CP 面表显式下发（不进 _FORWARD_ENV）。未设/空串不注入（默认档=开；
@@ -1787,6 +1795,13 @@ def _cmd_up_services() -> int:
         _v = os.environ.get(_k)
         if _v is not None:
             asr_env[_k] = _v
+    # P1 引擎档进 sidecar（2026-10-01 任务 B）：sidecar 据此决定启动是否 eager
+    # 加载 Qwen3-1.7B GPU 权重——sensevoice 档（含缺省/未设，与 agent
+    # `_asr_engine_from_cfg` 缺省对齐）纯 CPU 车道不加载 GPU 权重（~1.9GB 纯占
+    # 卡）；显式 BOK_ASR_ENGINE=qwen3 回滚档照旧 eager，sidecar 行为零变化。
+    _asr_engine = os.environ.get("BOK_ASR_ENGINE", "").strip()
+    if _asr_engine:
+        asr_env["BOK_ASR_ENGINE"] = _asr_engine
     # P1 SV-CPU 引擎:模型目录下发。ONNX 布局无 config.json(model_path 判据
     # 不适用),专用解析:download 落位(app-data/models/<repo-->)有
     # model.int8.onnx+tokens.txt 即用;缺席不下发=sidecar 用自身缺省/fail-open。
