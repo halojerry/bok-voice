@@ -44,7 +44,28 @@ def mm_pcm(text: str, lang: str) -> bytes:
                 return cache_path.read_bytes()
         except OSError:
             pass
-    pcm = _mm_pcm_fetch(text, lang)
+    pcm = b""
+    for _attempt in range(3):  # 云端抖动重试(2 次退避),30s×3 才认输
+        try:
+            pcm = _mm_pcm_fetch(text, lang)
+            break
+        except (TimeoutError, OSError, RuntimeError):
+            if _attempt == 2:
+                pcm = b""
+                break
+            import time as _t
+
+            _t.sleep(2 * (_attempt + 1))
+    if not pcm:
+        # 云端抖动(30s 读超时×3 实弹):有陈旧缓存宁可复用陈旧,也别让整跑崩
+        if use_cache:
+            try:
+                if cache_path.is_file():
+                    print(f"[mm_pcm] cloud timeout — reuse stale cache {cache_path.name}", flush=True)
+                    return cache_path.read_bytes()
+            except OSError:
+                pass
+        raise RuntimeError("mm_pcm: cloud fetch failed and no stale cache")
     if use_cache:
         try:
             cache_dir.mkdir(parents=True, exist_ok=True)

@@ -1134,6 +1134,8 @@ def garbled_reask_gate(
     min_content_chars: int = 2,
     consec: int = 0,
     max_consec: int = 2,
+    conf_available: bool = True,
+    prev_user_text: str = "",
 ) -> str:
     """garbled-reask 车道门(EX-2,2026-09-28,纯函数可离线单测)。
 
@@ -1148,11 +1150,31 @@ def garbled_reask_gate(
     3. band=="unknown" → 才靠 looks_garbled 文本判据兜底(conf 缺失才 unknown;
        band=="ok" 恒唔开——窄带数字错听高置信实测,conf 只是辅助信号)。
     4. 命中后按连续计数:consec >= max_consec → "cap";否则 "reask"。
+
+    【P1-SV 置信度缺口修正(2026-10-01 FLOW20 实弹)】``conf_available=False``
+    (SV 引擎无 token 置信度,band 恒 unknown)时,looks_garbled 对短应承轮
+    (「哦。」2 字)过度开火——预算被短轮烧光,真重问轮(轮11)到 cap 静默
+    丢弃=哑轮(FLOW20 19/20 ×2 同形实证)。修正:无置信度引擎下,unknown 档
+    只在「与上一轮 user 原文相同(逐字复读=真卡壳)」或「≤1 字」才开;
+    Qwen3(conf_available=True)路径逐字节不变。
     """
     if excluded or closing or paused or wa_pending or digit_pending:
         return ""
     if digit_run or wa_numberish:
         return ""
+    if not conf_available and band == "unknown":
+        _same_repeat = bool(
+            prev_user_text
+            and user_text.strip()
+            and user_text.strip() == prev_user_text.strip()
+        )
+        if _same_repeat:
+            fire = True  # 逐字复读上一轮=真卡壳,直接开(looks_garbled 不必再看)
+            if consec >= max_consec:
+                return "cap"
+            return "reask"
+        if len(user_text.strip()) > 1:
+            return ""
     fire = band == "low" or (
         band == "unknown" and looks_garbled(user_text, hotword_terms, min_content_chars)
     )
@@ -7221,6 +7243,29 @@ async def entrypoint(ctx):
                         if _partial_gate_stt is not None
                         else None
                     )
+                    # 【P1-SV 置信度缺口(2026-10-01)】SV 引擎无 token 置信度
+                    # (band 恒 unknown):gate 的 unknown 档收紧为「逐字复读上一轮
+                    # 或 ≤1 字」才开,防短应承轮烧光 reask 预算(FLOW20 轮11 哑根因)。
+                    _reask_engine = str(
+                        getattr(
+                            getattr(_partial_gate_stt, "_stt_", None) or object(),
+                            "_engine",
+                            "",
+                        )
+                        or ""
+                    )
+                    _reask_conf_available = _reask_engine != "sensevoice"
+                    try:
+                        _reask_pairs = recent_turn_pairs(
+                            list(getattr(turn_ctx, "items", None) or []),
+                            exclude=new_message,
+                            recent_turns=1,
+                        )
+                        _reask_prev_user = next(
+                            (t for r, t in _reask_pairs if r == "customer"), ""
+                        )
+                    except Exception:  # noqa: BLE001 - 取史失败=无复读证据
+                        _reask_prev_user = ""
                     _reask_band = band_from_confidence(
                         _reask_conf,
                         float(os.environ.get("BOK_REASK_CONF_MEAN", "0.45")),
@@ -7229,6 +7274,8 @@ async def entrypoint(ctx):
                     _reask_verdict = garbled_reask_gate(
                         user_text=user_text,
                         band=_reask_band,
+                        conf_available=_reask_conf_available,
+                        prev_user_text=_reask_prev_user,
                         excluded=bool(
                             _qa_exclude_reason(
                                 user_text,
