@@ -24,6 +24,7 @@ import os
 import platform as _platform
 import signal
 import socket
+import re
 import subprocess
 import sys
 import time
@@ -2223,6 +2224,12 @@ _FORWARD_ENV = (
     "BOK_TAIL_STABLE_SPAN",
     "EMOTION_TAG_PROMPT",
     "LLM_FIRST_TOKEN_TIMEOUT_S",
+    # LLM 饥荒自适应（第十五波 2026-10-01,call-dc54f542）：机器级首 token 慢
+    # （swap/GPU 争用）时拉长首 token 超时与 drain、禁 regen——等原流优于重来。
+    "BOK_LLM_FAMINE",
+    "BOK_LLM_FAMINE_TTFT_S",
+    "BOK_LLM_FAMINE_FIRST_S",
+    "BOK_LLM_FAMINE_DRAIN_S",
     "LLM_HISTORY_TURNS",
     "LLM_LATE_ANSWER_DEADLINE_S",
     "LLM_MAX_TOKENS",
@@ -3243,6 +3250,47 @@ def _doctor_draft_warning(current: dict[str, str]) -> str:
             "起 :1235(不 fail);补齐: python tools/bok.py download --only llm_draft")
 
 
+def _swap_used_gb() -> float:
+    """本机 swap 已用 GB（mac=sysctl vm.swapusage / linux=/proc/meminfo；失败=-1）。"""
+    try:
+        if _platform.system() == "Darwin":
+            out = subprocess.run(
+                ["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True, timeout=3
+            ).stdout
+            for part in out.split():
+                pass
+            m = re.search(r"used\s*=\s*([\d.]+)M", out)
+            return float(m.group(1)) / 1024.0 if m else -1.0
+        swap = {}
+        for ln in Path("/proc/meminfo").read_text().splitlines():
+            if ln.startswith(("SwapTotal", "SwapFree")):
+                k, v = ln.split(":")
+                swap[k] = int(v.strip().split()[0]) / 1048576.0  # kB→GB
+        if "SwapTotal" in swap:
+            return swap["SwapTotal"] - swap.get("SwapFree", 0.0)
+        return -1.0
+    except Exception:
+        return -1.0
+
+
+def _warn_memory_posture(fails: list[str], *, packaged: bool) -> None:
+    """内存姿态检查（2026-10-01 第十五波,call-dc54f542 根修配套）：swap 挤压会把
+    MLX 权重页出→首 token 3-25s（实测 26GB swap 欠账窗口,LLM 轮全灭由罐头垫）。
+    >8GB 警告（语音栈常驻 ~12-18GB 统一内存,桌面应用挤占是主要来源）。"""
+    used = _swap_used_gb()
+    if used < 0:
+        print("memory posture: swap 读取失败(跳过)")
+        return
+    lvl = "ok" if used < 2 else ("warn" if used < 8 else "CRITICAL")
+    print(f"memory posture: swap used {used:.1f}GB [{lvl}]")
+    if used >= 8:
+        msg = (f"swap {used:.0f}GB 挤压——MLX 权重会被页出,首 token 可达 3-25s。"
+               "关桌面大户/重启清欠账后再跑语音。")
+        print(f"  ⚠ {msg}")
+        if packaged:
+            fails.append(msg)
+
+
 def cmd_doctor() -> int:
     """Preflight diagnostics. In packaged mode every check is a hard gate."""
     key = platform_key()
@@ -3261,6 +3309,8 @@ def cmd_doctor() -> int:
         print("app-data writable: ok")
     except Exception as exc:
         fails.append(f"app-data 不可写: {exc}")
+
+    _warn_memory_posture(fails, packaged=packaged)
 
     py = sidecar_python("qwen3-asr-sidecar")
     print(f"runtime python: {py} {'ok' if py.exists() else 'MISSING'}")

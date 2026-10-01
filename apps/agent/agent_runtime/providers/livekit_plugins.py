@@ -678,9 +678,15 @@ class MlxLlmLLM(_OpenAICompatBase):
     @staticmethod
     def _first_token_timeout_s() -> float:
         try:
-            return float(os.environ.get("LLM_FIRST_TOKEN_TIMEOUT_S", "3.0") or 0)
+            v = float(os.environ.get("LLM_FIRST_TOKEN_TIMEOUT_S", "3.0") or 0)
         except ValueError:  # pragma: no cover - 配错回默认
-            return 3.0
+            v = 3.0
+        if llm_famine_active():
+            # 饥荒自适应（2026-10-01 第十五波,call-dc54f542）:机器级首 token 慢
+            # (交换/GPU 争用,实测窗口 3-25s)时,3s 健康档常数把「慢但活着」误杀
+            # 成「死」——拉长到饥荒档,等原流严格优于杀掉重来。
+            v = max(v, _famine_first_timeout_s())
+        return v
 
     def chat(
         self,
@@ -750,15 +756,84 @@ class MlxLlmLLM(_OpenAICompatBase):
         return stream
 
 
+# ---- LLM 饥荒自适应（2026-10-01 第十五波,call-dc54f542 根修） -----------------
+# 饥荒=机器级首 token 慢：交换挤压（实测 26GB swap/权重页出）或 GPU 争用把
+# 首 token 推到 3-25s（健康档 0.2-0.6s）。按健康档调的恢复常数在饥荒中全是
+# 负贡献——实弹时间线（call-dc54f542 23:01）：原流 7.9s 本有答案 → 3s 首
+# token 超时垫话盖耳 → drain 8s 差 1-2 秒没等到 → abort 杀原流 → regen 全量
+# 重 prefill（饥荒中负载×2）→ 25.3s>22s 传输超时 → 客户 37s 零答案；干等
+# 原流 10s 即有答案。信号=本 worker 最近流的首 token 延迟 EMA（机器级状态
+# 跨通话共享）；饥荒时：首 token 超时拉长、drain 拉长、禁 regen。
+# 复原=快样本把 EMA 拉回阈值下，自动回健康档常数。
+
+_FAMINE_STATE: dict = {"ema": 0.0, "n": 0}
+
+
+def _famine_enabled() -> bool:
+    return os.environ.get("BOK_LLM_FAMINE", "1") == "1"
+
+
+def _famine_threshold_s() -> float:
+    try:
+        return float(os.environ.get("BOK_LLM_FAMINE_TTFT_S", "4") or 0)
+    except ValueError:  # pragma: no cover - 配错回默认
+        return 4.0
+
+
+def _famine_first_timeout_s() -> float:
+    try:
+        return float(os.environ.get("BOK_LLM_FAMINE_FIRST_S", "15") or 0)
+    except ValueError:  # pragma: no cover
+        return 15.0
+
+
+def _famine_drain_s() -> float:
+    try:
+        return float(os.environ.get("BOK_LLM_FAMINE_DRAIN_S", "15") or 0)
+    except ValueError:  # pragma: no cover
+        return 15.0
+
+
+def record_llm_first_token(ttft_s: float) -> None:
+    """喂一次首 token 延迟样本（EMA α=0.4；超时样本也喂=饥荒加深信号）。
+
+    纯模块级账本：worker 进程内跨通话共享（饥荒係机器级状态）。测试用
+    ``_FAMINE_STATE.clear()+update`` 重置。"""
+    if ttft_s <= 0:
+        return
+    s = _FAMINE_STATE
+    s["n"] = int(s.get("n") or 0) + 1
+    s["ema"] = ttft_s if s["n"] == 1 else float(s.get("ema") or 0.0) * 0.6 + ttft_s * 0.4
+
+
+def llm_famine_active() -> bool:
+    """饥荒判定：≥2 个样本且 EMA ≥ 阈值（默认 4s）。kill-switch 整体关。"""
+    if not _famine_enabled():
+        return False
+    if int(_FAMINE_STATE.get("n") or 0) < 2:
+        return False
+    return float(_FAMINE_STATE.get("ema") or 0.0) >= _famine_threshold_s()
+
+
+def _famine_reset_for_tests() -> None:
+    _FAMINE_STATE.clear()
+    _FAMINE_STATE.update({"ema": 0.0, "n": 0})
+
+
 def _late_answer_deadline_s() -> float:
     """drain(原流续读)次级截止秒数:首 token 超时出兜底后,本流最多再等多久。
 
     默认 8s(mlx 4B 出满答案远快于此;超时基本=真死流)。0=关 → 回立即
-    aclose+factory 重生旧行为(kill-switch)。"""
+    aclose+factory 重生旧行为(kill-switch)。
+    饥荒自适应（第十五波）:饥荒时拉长(call-dc54f542 实弹:原流首 token 7.9s
+    撞 8s drain 窗差 1-2 秒判死——窗口盖住慢-但-活的流)。"""
     try:
-        return float(os.environ.get("LLM_LATE_ANSWER_DEADLINE_S", "8") or 0)
+        v = float(os.environ.get("LLM_LATE_ANSWER_DEADLINE_S", "8") or 0)
     except ValueError:  # pragma: no cover - 配错回默认
-        return 8.0
+        v = 8.0
+    if llm_famine_active():
+        v = max(v, _famine_drain_s())
+    return v
 
 
 class _LlmFallbackStream(llm.LLMStream):
@@ -965,12 +1040,23 @@ class _LlmFallbackStream(llm.LLMStream):
         t.add_done_callback(tasks.discard)
 
     def _spawn_regen(self) -> None:
+        # 饥荒自适应（第十五波,call-dc54f542 实弹）：regen=同参全量重 prefill,
+        # 饥荒中纯负贡献（原流+regen+judge 三重排队,25.3s>22s 传输超时零答案）。
+        # 饥荒时禁 regen——原流已被 drain 接住/兜底已出声,等机器缓过来。
+        if llm_famine_active():
+            print(
+                f"LLM_FAMINE regen_skipped ema={_FAMINE_STATE.get('ema', 0):.1f}s"
+                " (机器级慢,等原流/兜底,禁重生)",
+                flush=True,
+            )
+            return
         self._spawn_attached(self._regen_late_answer())
 
     async def _run(self):
         timeout = self._first_deadline
         first_task: asyncio.Task | None = None
         drain_owns = False
+        _t_req0 = time.monotonic()
         try:
             # 首 chunk 任务化(RC4):截止计时用 asyncio.wait(唔 cancel 任务)——
             # wait_for(__anext__) 超时会 cancel 掉内芯 tee_peer(async generator
@@ -980,6 +1066,7 @@ class _LlmFallbackStream(llm.LLMStream):
             if timeout > 0:
                 done, _pending = await asyncio.wait({first_task}, timeout=timeout)
                 if first_task not in done:
+                    record_llm_first_token(timeout)  # 饥荒信号:超时也喂样本
                     if self._late_deadline > 0 and self._late_answer_cb is not None:
                         # 原流续读:唔 aclose——服务端无断连中止,弃流只换僵尸
                         # 解码税。兜底先出声,后台 drain 收晚到真答案;截止无
@@ -1025,6 +1112,7 @@ class _LlmFallbackStream(llm.LLMStream):
                         self._spawn_regen()
                     return
             self._got_first = True
+            record_llm_first_token(time.monotonic() - _t_req0)  # 饥荒信号:健康样本
             self._event_ch.send_nowait(await first_task)
             first_task = None
             async for ev in self._inner:
