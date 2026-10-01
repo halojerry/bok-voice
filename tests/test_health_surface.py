@@ -232,9 +232,10 @@ def test_monitor_veto_blocks_kill_with_active_calls():
     assert bok._monitor_kill_round(1, 0) == (False, False)
     assert bok._monitor_kill_round(2, 0) == (True, False)
     assert bok._monitor_kill_round(99, 0)[0] is True
-    # CP 不可达（None）= 退回无通话口径（旧 `if active` 判例：None 属 falsy）
+    # CP 不可达（None）= 保守不杀(2026-09-28 生命周期护栏:None 曾落 falsy 分支
+    # 令 veto 静默失效——CP 抖一下 + worker 探活失败 = 可能杀掉在途 worker)
     assert bok._monitor_kill_round(1, None) == (False, False)
-    assert bok._monitor_kill_round(2, None) == (True, False)
+    assert bok._monitor_kill_round(2, None) == (False, True)
     # 有通话在途：恒不杀（硬 veto）——streak 多深都不杀，等场景间隙 active 归零
     for n in (1, 2, 3, 12, 60, 999):
         kill, _veto = bok._monitor_kill_round(n, 2)
@@ -274,7 +275,8 @@ def test_dev_9b_off_gates_judge_and_settle_env(monkeypatch, tmp_path):
                 "BOK_SETTLE_LLM_BASE_URL", "BOK_SETTLE_LLM_MODEL"):
         monkeypatch.delenv(key, raising=False)
 
-    # 9B 关：judge env 不注入（agent.py 回退链落 MLX :1235）
+    # 9B 关(2026-10-01 P2 翻档后须显式 =0)：judge env 不注入（agent.py 回退链落 MLX :1235）
+    monkeypatch.setenv("BOK_DEV_9B", "0")
     env: dict[str, str] = {}
     bok._apply_judge_env(env, {})
     assert "FLOW_JUDGE_LLM_BASE_URL" not in env
@@ -294,7 +296,8 @@ def test_dev_9b_off_gates_judge_and_settle_env(monkeypatch, tmp_path):
     assert env_ext["FLOW_JUDGE_LLM_BASE_URL"] == "https://cloud.example/v1"
     assert env_ext["FLOW_JUDGE_LLM_MODEL"] == "cloud-model"
 
-    # CP 面 settle env：9B 关不注入（Summarizer 回退 MLX）；=1 同旧
+    # CP 面 settle env：9B 显式关(=0)不注入（Summarizer 回退 MLX）；缺省/=1 注入
+    monkeypatch.setenv("BOK_DEV_9B", "0")
     monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
     monkeypatch.delenv("FLOW_JUDGE_LLM_BASE_URL", raising=False)
     monkeypatch.delenv("FLOW_JUDGE_LLM_MODEL", raising=False)
@@ -308,9 +311,9 @@ def test_dev_9b_off_gates_judge_and_settle_env(monkeypatch, tmp_path):
 
 
 def test_dev_9b_off_skips_settle_llm_start(monkeypatch, tmp_path, capsys):
-    """serve/up 侧：BOK_DEV_9B 未开时 _start_settle_llm 直接跳过（不起进程、
-    不等 :1237）；stderr 留一行明示回退。"""
-    monkeypatch.delenv("BOK_DEV_9B", raising=False)
+    """serve/up 侧：BOK_DEV_9B=0 显式关时 _start_settle_llm 直接跳过（不起进程、
+    不等 :1237）；stderr 留一行明示回退。2026-10-01 P2 翻档后缺省=开。"""
+    monkeypatch.setenv("BOK_DEV_9B", "0")
     started: list[list[str]] = []
     monkeypatch.setattr(bok, "_start_proc", lambda args, pidfile, logfile, env=None, cwd=None: started.append(args))
     rc = bok._start_settle_llm({}, tmp_path, tmp_path)

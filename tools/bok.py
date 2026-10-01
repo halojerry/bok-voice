@@ -422,15 +422,18 @@ def laya_model_path(current: dict[str, str]) -> str:
 
 
 def _dev_9b_enabled() -> bool:
-    """9B 后台专线(:1237)是否随栈常驻：``BOK_DEV_9B=1`` 显式才拉，默认不启动。
+    """9B 专线(:1237)是否随栈常驻:``BOK_DEV_9B=0`` 显式关,**默认启动(2026-10-01
+    P2 翻档,模型在盘才拉)**。
 
-    为什么：9B 常驻=夜间崩速主犯之一（reports/latency-soak/LANE-AB-2026-09-25.md
-    附 3）——judge 9B 二号驻留与回复 4B(:1235) 共挤统一内存，swap 颠簸 + 闲置
-    权重页换出（一被触碰=页入 stall），in-call tps 4-12 vs 隔离 43-47。2026-09-25
-    起改 opt-in：内存让给 :1235 的 prompt cache；settle 纪要/judge 各自有 env
-    缺席回退链落 :1235（summarize.py / agent.py judge 均已核实）。读法与全仓
-    同款 ``os.environ.get(...) == "1"``。"""
-    return os.environ.get("BOK_DEV_9B", "") == "1"
+    历史与翻档理由:9B 常驻曾是夜间崩速主犯(LANE-AB-2026-09-25 附 3:judge 9B
+    与回复 4B 共挤统一内存,swap 颠簸,in-call tps 4-12)。**该结论的前提已被
+    P1 拆除**——ASR 全量迁 CPU 后 MPS 只剩 LLM,统一内存压力位换人;且 9B 现在
+    的角色是 a_reply 专线(Huihui-Qwen3.5-9B-abliterated):暖态 TTFT 175ms
+    (:1237 直连,无队列代理头排),soak 11/11 p50 912ms/0 fallback,双引擎
+    (4B 判官 :1235 + 9B 回复 :1237)分进程分端口互不挤占。模型缺盘时保持旧
+    形状(不拉,judge/settle 回退 :1235)——a_reply 车道的回滚键=BOK_DEV_9B=0
+    或路由表改回缺省链。读法与全仓同款(env=="0" 显式关)。"""
+    return os.environ.get("BOK_DEV_9B", "") != "0"
 
 
 def _llm_draft_enabled() -> bool:
@@ -1565,11 +1568,13 @@ def _start_settle_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> 
     9B 后端化(2026-09-25):默认不随栈常驻——9B 常驻=夜间崩速主犯之一
     (reports/latency-soak/LANE-AB-2026-09-25.md 附3:judge 9B 二号驻留与回复
     4B(:1235) 共挤统一内存,swap 满 + 闲置权重页换出,in-call tps 4-12 vs 隔离
-    43-47);内存让给 :1235 的 prompt cache。开发/排障要 9B 就 ``BOK_DEV_9B=1``
-    显式拉起;settle 纪要/judge 消费方各自有回退链,默认档零功能损失。
+    43-47)——该前提已被 P1(ASR 迁 CPU,MPS 只剩 LLM)拆除。2026-10-01 P2 翻档:
+    :1237=Huihui-9B **a_reply 专线**(暖态 TTFT 175ms,soak p50 912ms/0
+    fallback),默认随栈(模型在盘);BOK_DEV_9B=0 显式关=旧形状(judge/settle
+    回退 :1235)。
     """
     if not _dev_9b_enabled():
-        print("[bok] 9B settle lane off (BOK_DEV_9B!=1) — skip :1237 (settle/judge fall back to :1235)", file=sys.stderr)
+        print("[bok] 9B lane off (BOK_DEV_9B=0) — skip :1237 (a_reply 车道/judge/settle 回退 :1235)", file=sys.stderr)
         return False
     if healthy(1237):
         return True
@@ -1893,7 +1898,9 @@ def _apply_judge_env(env: dict[str, str], _cur: dict[str, str]) -> None:
     _settle = _settle_llm_model(_cur)
     if _settle and Path(_settle).exists():
         env["FLOW_JUDGE_LLM_BASE_URL"] = os.environ.get("FLOW_JUDGE_LLM_BASE_URL", "http://127.0.0.1:1237/v1")
-        env["FLOW_JUDGE_LLM_MODEL"] = _settle
+        # 外部显式 model 照传(docstring「外部显式设了照传」全分支一致化,2026-10-01
+        # 翻档后此分支成为缺省路径;云端 judge 钩子不受开关误伤)。
+        env["FLOW_JUDGE_LLM_MODEL"] = os.environ.get("FLOW_JUDGE_LLM_MODEL", "").strip() or _settle
 
 
 # ---------------------------------------------------------------------------

@@ -45,13 +45,18 @@ def test_apply_judge_env_present_and_absent(monkeypatch, tmp_path):
     assert "FLOW_JUDGE_LLM_BASE_URL" not in env2
     assert "FLOW_JUDGE_LLM_MODEL" not in env2
 
-    # 9B 后端化默认档:模型在盘也不注入(不随栈拉起,judge 落 :1235)。
-    monkeypatch.delenv("BOK_DEV_9B", raising=False)
+    # 2026-10-01 P2 翻档:默认(=1)在盘即注入;BOK_DEV_9B=0 显式关才不注入。
+    monkeypatch.setenv("BOK_DEV_9B", "0")
     monkeypatch.setenv("BOK_SETTLE_LLM_MODEL", str(fake))
     env3: dict[str, str] = {}
     bok._apply_judge_env(env3, bok.MODELS["mac"])
     assert "FLOW_JUDGE_LLM_BASE_URL" not in env3
     assert "FLOW_JUDGE_LLM_MODEL" not in env3
+    # 缺省(env 不设)=开——模型在盘即注入。
+    monkeypatch.delenv("BOK_DEV_9B", raising=False)
+    env4: dict[str, str] = {}
+    bok._apply_judge_env(env4, bok.MODELS["mac"])
+    assert env4.get("FLOW_JUDGE_LLM_BASE_URL") == "http://127.0.0.1:1237/v1"
 
 
 def test_control_plane_env_carries_settle(monkeypatch, tmp_path):
@@ -64,8 +69,11 @@ def test_control_plane_env_carries_settle(monkeypatch, tmp_path):
     env = bok._control_plane_env(tmp_path / "x.db")
     assert env.get("BOK_SETTLE_LLM_BASE_URL") == "http://127.0.0.1:1237/v1"
     assert env.get("BOK_SETTLE_LLM_MODEL") == str(fake)
-    # 默认档(9B 关):不注入。
+    # 2026-10-01 P2 翻档:缺省=开(在盘即注入);BOK_DEV_9B=0 显式关。
     monkeypatch.delenv("BOK_DEV_9B", raising=False)
+    env_on = bok._control_plane_env(tmp_path / "x.db")
+    assert env_on.get("BOK_SETTLE_LLM_BASE_URL") == "http://127.0.0.1:1237/v1"
+    monkeypatch.setenv("BOK_DEV_9B", "0")
     env_off = bok._control_plane_env(tmp_path / "x.db")
     assert "BOK_SETTLE_LLM_BASE_URL" not in env_off
     assert "BOK_SETTLE_LLM_MODEL" not in env_off
