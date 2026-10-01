@@ -2276,6 +2276,9 @@ _FORWARD_ENV = (
     # 窗口条数（默认 max(2, LLM_HISTORY_TURNS-2)；修隔轮意外重发 uncached 交替）。
     "BOK_TAIL_MEMORY_EVERY",
     "BOK_TAIL_STABLE_SPAN",
+    # D1 槽位化 actor（2026-10-01,第一性原理重构）：A 线回复 LLM 从「整本剧本+
+    # 全规则」切「角色卡+任务块」（默认 "0"=旧路径逐字节不变；B 线不接）。
+    "BOK_SLOT_ACTOR",
     "EMOTION_TAG_PROMPT",
     "LLM_FIRST_TOKEN_TIMEOUT_S",
     # LLM 饥荒自适应（第十五波 2026-10-01,call-dc54f542）：机器级首 token 慢

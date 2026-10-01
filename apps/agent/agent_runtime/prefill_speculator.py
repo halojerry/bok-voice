@@ -29,6 +29,8 @@ import asyncio
 import os
 import time
 
+from .slot_actor import compose_slot_user_message
+
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -143,7 +145,13 @@ class PrefillSpeculator:
             tail = self._ctx.render_context_tail() if self._ctx is not None else ""
         except Exception:  # noqa: BLE001 - 尾部渲染失败按无尾部预热
             tail = ""
-        user_content = f"{prefix}\n\n{tail}" if tail else prefix
+        if getattr(self._ctx, "slot_mode", False):
+            # D1 槽位化（2026-10-01）：真请求 user 消息=任务块+客户话
+            # （compose_slot_user_message 单一顺序源），投机预热必须同序——
+            # 否则预热序列从任务块处与真请求分叉，白烧一次全量 prefill。
+            user_content = compose_slot_user_message(tail, prefix)
+        else:
+            user_content = f"{prefix}\n\n{tail}" if tail else prefix
         msgs = list(self._last_request)
         if self._reply_text:
             msgs.append({"role": "assistant", "content": self._reply_text})
