@@ -2170,6 +2170,12 @@ _FORWARD_ENV = (
     "BOK_REPEAT_CROSS_TURN_SIM",
     "BOK_TAIL_SLIM",
     "BOK_MEMORY_CHARS",
+    # 尾部节食（第十一波 2026-09-29）：slim 轮记忆块降频——距上次带过 ≥N 条
+    # 账本项才带（=1 旧行为每轮带）。尾部骑在新 user 消息后=每轮全新 uncached，
+    # 记忆块(~250 字≈170 tok)是 slim 轮尾部最大件。STABLE_SPAN=稳定段重发回看
+    # 窗口条数（默认 max(2, LLM_HISTORY_TURNS-2)；修隔轮意外重发 uncached 交替）。
+    "BOK_TAIL_MEMORY_EVERY",
+    "BOK_TAIL_STABLE_SPAN",
     "EMOTION_TAG_PROMPT",
     "LLM_FIRST_TOKEN_TIMEOUT_S",
     "LLM_HISTORY_TURNS",

@@ -1792,6 +1792,14 @@ class ContextState:
         self._stable_key: str = ""
         self._applied_stable_keys: list[str] = []
         self._last_emit_stable_key: str = ""
+        # 尾部节食（第十一波 2026-09-29）：尾部骑在新 user 消息后=全新位置，前缀
+        # 缓存对它零命中，**每轮全量 uncached**（实测 uncached 中位 ~310 tok 里尾部
+        # 占 ~250）。记忆块降频（每 K 轮带一次）+ facts 封顶只影响 slim 轮字节量。
+        # 与 _applied_tails 平行的第三条账本：每条已发尾部当时是否带记忆块——
+        # 降频决定必须是账本纯函数（F3 重试重渲染同一账本状态 → 同一决定 →
+        # 逐字节复现，否则 identical_skipped 判定假断裂、前缀真裂）。
+        self._memory_in_tails: list[bool] = []
+        self._last_tail_had_memory: bool = False
         self._snippets: list[str] = []
         self._summary_lines: list[str] = []
         self._user_lang: str = ""
@@ -1943,6 +1951,9 @@ class ContextState:
         self._applied_tails.append((orig, final, self._revision))
         # F1：与 _applied_tails 平行记本条尾部当时是否带稳定段（""=未带）。
         self._applied_stable_keys.append("" if bare else self._last_emit_stable_key)
+        # 尾部节食：平行记本条尾部当时是否带记忆块（洞消息恒 False=裸体无尾部，
+        # 计入距离但不重置降频节奏）。
+        self._memory_in_tails.append(False if bare else self._last_tail_had_memory)
 
     def rewrite_last_applied_tail(self, orig: str, final: str) -> None:
         """抢跑重建轮把末条 user 尾部重渲染成当前版后,同步账本(保持 FIFO 对齐)。"""
@@ -1950,6 +1961,8 @@ class ContextState:
             self._applied_tails[-1] = (orig, final, self._revision)
             if self._applied_stable_keys:
                 self._applied_stable_keys[-1] = self._last_emit_stable_key
+            if self._memory_in_tails:
+                self._memory_in_tails[-1] = self._last_tail_had_memory
 
     def applied_tails(self) -> list[tuple[str, str, int]]:
         return list(self._applied_tails)
@@ -1961,19 +1974,76 @@ class ContextState:
             self._applied_tails = self._applied_tails[-keep:]
         if len(self._applied_stable_keys) > keep:
             self._applied_stable_keys = self._applied_stable_keys[-keep:]
+        if len(self._memory_in_tails) > keep:
+            self._memory_in_tails = self._memory_in_tails[-keep:]
+
+    def _slim_memory_due(self, *, exclude_last: bool = False) -> bool:
+        """slim 轮是否携带记忆块——**账本纯函数**（尾部节食,第十一波）。
+
+        距上一次「带记忆的尾部」≥BOK_TAIL_MEMORY_EVERY(默认 3)条 → 到期。
+        账本里从未带过（开局/截断重锚）→ 账本第 EVERY 条起带（开局首条通常是
+        步首条 emit_stable=True 全量尾，天然带过）。=1 → 每轮都带（旧字节）。
+        exclude_last=True（F3 重建复现语境）：末条账本=被复现条自身,回看须排
+        自身——否则距界轮（原渲染时距离 2、记账后 3）复现会翻案 → 字节不等 →
+        content_changed 假断裂前缀。
+        """
+        try:
+            every = int(os.environ.get("BOK_TAIL_MEMORY_EVERY", "3"))
+        except ValueError:
+            every = 3
+        if every <= 1:
+            return True
+        ledger = self._memory_in_tails[:-1] if exclude_last else self._memory_in_tails
+        n = len(ledger)
+        for i in range(n - 1, -1, -1):
+            if ledger[i]:
+                return (n - 1 - i) >= every
+        return n >= every
+
+    def _stable_refresh_span(self) -> int:
+        """稳定段重发回看窗口(条)。默认 max(2, LLM_HISTORY_TURNS-2)——载条距
+        窗口底留 2 条余量(截断按消息计,bare 洞消息同占一格);BOK_TAIL_STABLE_SPAN
+        显式覆盖(≥1)。"""
+        try:
+            explicit = int(os.environ.get("BOK_TAIL_STABLE_SPAN", "0"))
+        except ValueError:
+            explicit = 0
+        if explicit >= 1:
+            return explicit
+        try:
+            hist = int(os.environ.get("LLM_HISTORY_TURNS", "6"))
+        except ValueError:
+            hist = 6
+        return max(2, hist - 2)
+
+    def _stable_stale_in_window(self) -> bool:
+        """当前步稳定段是否需要重发——**账本纯函数**（窗口纪律,第十一波修）。
+
+        回看最近 _stable_refresh_span() 条冻结尾部:任何一条带当前稳定键 →
+        指引仍在截断窗口内,不重发;一条都不带(换步首条/载条即将被淘汰) → 重发。
+        slim/bare 条目记 ""(不携带),天然不匹配。"""
+        for k in self._applied_stable_keys[-self._stable_refresh_span():]:
+            if k == self._stable_key:
+                return False
+        return True
 
     def tail_emit_stable_for_rebuild(self) -> bool:
         """重试/重建轮（n_new==0）复现末条尾部当时的稳定段发出决定（F3）。
 
-        步身份键未变→复现冻结时的决定（带过则带、没带则不带，字节可对齐）；
-        键变（真换步）→必带新稳定段（语义要求的那次断裂）。
+        窗口纪律复现（第十一波修）：末条账本项**自身入列前**的回看结果——
+        等价于「键变（新步在窗内无载条）→必带新稳定段；键未变→复现末条自己
+        的决定 bool(last)」。旧实现 `key != last` 把「末条=同步 slim 条(记 "")」
+        误判成换步 → 重建必带稳定段 → 与冻结尾部字节不等 → content_changed
+        假断裂 → 前缀真裂（slim 轮后的每次 F3 重建都在裂）。
         """
         if os.environ.get("BOK_TAIL_SLIM", "1") == "0":
             return True
-        last = self._applied_stable_keys[-1] if self._applied_stable_keys else ""
-        if self._stable_key != last:
+        if not self._applied_stable_keys:
             return True
-        return bool(last)
+        for k in self._applied_stable_keys[-(self._stable_refresh_span() + 1):-1]:
+            if k == self._stable_key:
+                return bool(self._applied_stable_keys[-1])
+        return True
 
     @classmethod
     def from_env(cls, account_id: str = "") -> "ContextState":
@@ -2234,28 +2304,33 @@ class ContextState:
         【你上一句】的固定指令文本已上移稳定前缀（【重复控制】）,尾部只留引文。
         """
         _last_rev = self._applied_tails[-1][2] if self._applied_tails else None
+        _explicit_stable = emit_stable is not None  # F3 重建复现语境（显式传入）
         slim = (
             os.environ.get("BOK_TAIL_SLIM", "1") == "1"
             and _last_rev is not None
             and _last_rev == self._revision
         )
         if emit_stable is None:
-            _last_stable = self._applied_stable_keys[-1] if self._applied_stable_keys else ""
+            # 窗口纪律（第十一波修,2026-09-29）:稳定段只在 (a)换步 或 (b)载有
+            # 本步稳定段的最近冻结尾部即将被截断窗口淘汰 时重发。旧行为=与
+            # **末条**账本键比对——slim 轮记 "" → 键≠"" → 隔轮重发(实测 uncached
+            # 167↔642 交替形状的来源,一半轮白付 ~220 tok 步底稿)。
             emit_stable = (
                 os.environ.get("BOK_TAIL_SLIM", "1") == "0"
-                or self._stable_key != _last_stable
+                or self._stable_stale_in_window()
             )
         # 供 record_applied_tail/rewrite_last_applied_tail 记账（本条尾部带稳定段否）。
         self._last_emit_stable_key = self._stable_key if emit_stable else ""
         parts: list[str] = []
+        _diet = slim and not emit_stable  # 尾部节食只作用于 slim 轮（同步未推进）
         if self._whatsapp_note:
             parts.append(
                 "【已记录客户 WhatsApp】" + self._whatsapp_note +
                 "（复述号码必须逐位以此为准，不要凭记忆或猜测）"
             )
         if self._call_facts:
-            # 会中事实沉淀(append-only 有界,add_call_fact):客户早轮讲过的
-            # 平台/号码唔随滚动记忆/历史截断蒸发,治「重复问已答过的事」。
+            # 会中事实沉淀(append-only 有界≤4,add_call_fact,变化轮 bump revision
+            # → 自动落在全量尾部轮):治「重复问已答过的事」。
             parts.append(
                 "【通话中客户已讲（已确认过，不要再问）】\n"
                 + "\n".join(f"- {s}" for s in self._call_facts)
@@ -2292,8 +2367,21 @@ class ContextState:
             # 典型 ~321 字) 或 紧凑标签 + 增量段(每轮) + 【本通对话记忆】节头 +
             # 摘要总长 ≤BOK_MEMORY_CHARS(默认 250 字,原 600;3 行×每行 ≤201 字
             # 上限,总长先裁);RAG 开另加知识 2×~151 字 + 联网 1×~151 字。
-            keep = max(1, int(os.environ.get("REPLY_MEMORY_LINES", "3")))
-            parts.append("【本通对话记忆】\n" + "\n".join(self._summary_lines[-keep:]))
+            # 节食(第十一波):slim 轮降频——距上次带过 ≥BOK_TAIL_MEMORY_EVERY
+            # (默认 3)条才带;全量轮(稳定段/非 slim)恒带。质量逻辑:尾部骑在新
+            # user 消息后=每轮全新 uncached(前缀缓存零命中),而最近对话本来就在
+            # LLM_HISTORY_TURNS 原始历史窗口里,记忆块职责=窗口外的旧事实,隔 K
+            # 轮不带不丢信息。=1 → 每轮都带(旧字节)。emit_stable 显式传入=F3
+            # 重建复现语境,回看排末条(被复现条自身)。
+            _mem_due = (not _diet) or self._slim_memory_due(
+                exclude_last=_explicit_stable
+            )
+            self._last_tail_had_memory = _mem_due
+            if _mem_due:
+                keep = max(1, int(os.environ.get("REPLY_MEMORY_LINES", "3")))
+                parts.append("【本通对话记忆】\n" + "\n".join(self._summary_lines[-keep:]))
+        else:
+            self._last_tail_had_memory = False
         return "\n\n".join(parts)
 
     def _zh_rule(self) -> str:
