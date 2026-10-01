@@ -2656,13 +2656,17 @@ class ExprAwareLLM(llm.LLM):
 
         self._emotion = EmotionProcessor()
         self._emotion_state = emotion_state
+        # LLMMetrics 转发必须在构造期绑定(RCA §0.3):内芯流监视器 emit 在
+        # 创建流的对象上,包装层不转发则 session 永远收不到——2026-09-29 勘误:
+        # 本行曾因 _prewarm_impl 插入接缝被吞进方法体(且 `inner` 作用域不存在
+        # →NameError 被预热兜底吞=LLM_TTFT_MS/PRECEIVED 全灭一整天),归位。
+        _bind_metrics_forward(inner, self)
 
     async def _prewarm_impl(self) -> None:
         # 同 ContextAwareLLM(2026-09-30 High-3):包装层透传官方 prewarm。
         inner_prewarm = getattr(self._inner, "_prewarm_impl", None)
         if inner_prewarm is not None:
             await inner_prewarm()
-        _bind_metrics_forward(inner, self)
 
     def chat(self, *, chat_ctx, tools=None, conn_options=None, parallel_tool_calls=None, tool_choice=None, extra_kwargs=NOT_GIVEN):
         last_user = ""
