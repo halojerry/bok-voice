@@ -3,7 +3,8 @@
 背景:裸 `create_task` 的任务只被事件循环弱引用,GC/teardown 可在中途掐掉
 ("Task was destroyed")=静默丢轮。结算域与 2026-09-17 全量 debug F4/P2-A 已把
 apps/agent 全部调用点收编进强引用池(`_spawn_report`/`_SETTLE_TASKS`/
-`_spawn_pooled_task`/`_spawn_bg`)。本档钉住两件不随实现漂移的事:
+`_spawn_pooled_task`/`_spawn_bg`;2026-10-02 编排审计第二波新增预热池
+`_spawn_prewarm`——预热可取消且不占收线等待窗)。本档钉住两件不随实现漂移的事:
 
 - 源码扫描:apps/agent 不得再有「结果不持有」的裸 create_task——新调用点必须
   走既有池化 helper / 持有结果 / 带 FIRE_FORGET_EXEMPT: 标记(test_cantonese_
@@ -142,8 +143,9 @@ def test_no_bare_fire_and_forget_in_agent_runtime():
     offenders = _bare_create_task_offenders(AGENT_ROOT)
     assert not offenders, (
         "裸 create_task(结果不持有)只被事件循环弱引用,GC/teardown 中途可掐掉=静默丢轮。"
-        "改用既有池化 helper(_spawn_report/_SETTLE_TASKS/_spawn_pooled_task/_spawn_bg)"
-        f"或持有结果;确属有意 detach 的加 FIRE_FORGET_EXEMPT: 标记说明理由:\n"
+        "改用既有池化 helper(_spawn_report/_SETTLE_TASKS/_spawn_pooled_task/_spawn_bg/"
+        "_spawn_prewarm——预热类)或持有结果;确属有意 detach 的加 FIRE_FORGET_EXEMPT: "
+        "标记说明理由:\n"
         + "\n".join(offenders)
     )
 
