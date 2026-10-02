@@ -2432,11 +2432,19 @@ def _effective_providers(settings: dict) -> dict:
 
 
 @app.get("/api/calls")
-def list_calls(request: Request, account_id: str = "acc-001", status: str = "") -> list[dict]:
+def list_calls(request: Request, account_id: str = "acc-001", status: str = "", limit: int = 0) -> list[dict]:
+    """通话列表（2026-10-02 UX 根因修复·分页契约）：limit>0=created_at 倒序+截断
+    （web /calls 轮询此前全量 1570 行回传、浏览器再排序再切 50——payload 随历史
+    单调涨）；limit 缺省 0=旧档全量零漂移（dispatch/monitor/scripts 既有消费点不变）。
+    turn_stats 聚合随 limit>0 收窄到当页 id（SQL 仓收窄待 Mimosa 误报放行后落）。
+    """
     _gate_page(request, "calls")
     account_id = scoped_account(request, account_id)
-    calls = _repo().list_calls(account_id, status)
-    stats = _repo().turn_stats()
+    calls = _repo().list_calls(account_id, status, limit=limit)
+    # turn_stats 收窄到当页口径（2026-10-02）：与 list_calls 同 filters/limit 的
+    # 聚合（SQL 仓=列对列 JOIN 子查询；内存仓=list_calls+call_ids 收窄）——
+    # 旧全表 GROUP BY 的消费面本来只有当页键，切换零语义差。
+    stats = _repo().turn_stats_for_calls(account_id, status, limit)
     for c in calls:
         st = stats.get(c.get("id") or "", {})
         c["turn_count"] = st.get("turns", 0)

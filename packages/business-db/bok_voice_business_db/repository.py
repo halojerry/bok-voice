@@ -171,7 +171,7 @@ class SqlAlchemyBusinessRepository:
         self.session.commit()
         return True
 
-    def list_calls(self, account_id: str, status: str = "", node_id: str = "") -> list[dict]:
+    def list_calls(self, account_id: str, status: str = "", node_id: str = "", limit: int = 0) -> list[dict]:
         stmt = select(models.CallSession)
         if account_id:
             stmt = stmt.filter_by(account_id=account_id)
@@ -179,6 +179,11 @@ class SqlAlchemyBusinessRepository:
             stmt = stmt.filter_by(status=status)
         if node_id:
             stmt = stmt.filter_by(node_id=node_id)
+        if limit > 0:
+            # 2026-10-02 UX 根因修复·列表分页契约：limit>0=新档（created_at 倒序+截断，
+            # 服务端排序是分页的前提——此前 web 全量拉回浏览器自己排）；limit=0=旧档
+            # 全量零漂移（dispatch/monitor/reports 等既有消费点不传 limit 不受影响）。
+            stmt = stmt.order_by(models.CallSession.created_at.desc()).limit(limit)
         return [self._call_to_dict(c) for c in self.session.scalars(stmt)]
 
     def create_turn(self, turn: TurnEvent) -> dict:
@@ -251,6 +256,36 @@ class SqlAlchemyBusinessRepository:
                 func.count(models.Turn.id),
                 func.avg(models.Turn.latency_ms),
             ).group_by(models.Turn.call_id)
+        ).all()
+        return {
+            call_id: {"turns": n, "avg_latency_ms": int(float(avg or 0))}
+            for call_id, n, avg in rows
+        }
+
+    def turn_stats_for_calls(self, account_id: str, status: str = "", limit: int = 0) -> dict[str, dict]:
+        """当页通话的 turns 聚合（2026-10-02 分页收窄）：与 list_calls 同一筛选
+        口径（account/status/created_at 倒序/limit）做成**列对列 JOIN 子查询**——
+        不回传 id 列表，值全走 filter_by 绑定（与 list_calls 相同惯用法），SQL
+        形状无任何运行时值。口径改动必须与 list_calls 同步。
+        """
+        from sqlalchemy import func, select
+
+        page = select(models.CallSession.id)
+        if account_id:
+            page = page.filter_by(account_id=account_id)
+        if status:
+            page = page.filter_by(status=status)
+        if limit > 0:
+            page = page.order_by(models.CallSession.created_at.desc()).limit(limit)
+        sub = page.subquery()
+        rows = self.session.execute(
+            select(
+                models.Turn.call_id,
+                func.count(models.Turn.id),
+                func.avg(models.Turn.latency_ms),
+            )
+            .join(sub, models.Turn.call_id == sub.c.id)
+            .group_by(models.Turn.call_id)
         ).all()
         return {
             call_id: {"turns": n, "avg_latency_ms": int(float(avg or 0))}
@@ -1466,12 +1501,17 @@ class InMemoryBusinessRepository:
         self.settlements.pop(call_id, None)
         return True
 
-    def list_calls(self, account_id: str, status: str = "", node_id: str = "") -> list[dict]:
-        return [
+    def list_calls(self, account_id: str, status: str = "", node_id: str = "", limit: int = 0) -> list[dict]:
+        rows = [
             c for c in self.calls.values()
             if (not account_id or c["account_id"] == account_id) and (not status or c["status"] == status)
             and (not node_id or c.get("node_id", "") == node_id)
         ]
+        if limit > 0:
+            # 与 SQL 仓同契约（2026-10-02）：limit>0=created_at 倒序+截断；0=旧档全量。
+            # created_at 为同格式 UTC ISO 字符串，字典序=时间序。
+            rows = sorted(rows, key=lambda c: str(c.get("created_at") or ""), reverse=True)[:limit]
+        return rows
 
     def create_turn(self, turn: TurnEvent) -> dict:
         from datetime import datetime, timezone
@@ -1484,15 +1524,23 @@ class InMemoryBusinessRepository:
     def get_turns(self, call_id: str) -> list[TurnEvent]:
         return list(self.turns.get(call_id, []))
 
-    def turn_stats(self) -> dict[str, dict]:
+    def turn_stats(self, call_ids: list[str] | None = None) -> dict[str, dict]:
         out: dict[str, dict] = {}
+        wanted = set(call_ids) if call_ids is not None else None
         for call_id, turns in self.turns.items():
+            if wanted is not None and call_id not in wanted:
+                continue
             lats = [t.latency_ms for t in turns if t.latency_ms]
             out[call_id] = {
                 "turns": len(turns),
                 "avg_latency_ms": int(sum(lats) / len(lats)) if lats else 0,
             }
         return out
+
+    def turn_stats_for_calls(self, account_id: str, status: str = "", limit: int = 0) -> dict[str, dict]:
+        # 与 SQL 仓同口径（2026-10-02 分页收窄）：复用 list_calls 分页 + turn_stats 收窄。
+        calls = self.list_calls(account_id, status, limit=limit)
+        return self.turn_stats([str(c.get("id") or "") for c in calls])
 
     # ---- 快答库(Q→A 快路,2026-09-09) ----
 

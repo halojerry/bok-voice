@@ -145,6 +145,27 @@ def collect_fingerprint() -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+def _assert_cp_origin(url: str, cp_url: str) -> str:
+    """出站钉扎（2026-10-02 安全分流跟进，Mimosa env→urlopen 污点族纵深）：
+    节点全部出站流量只允许已配置 CP 同源（scheme+host+port 三元组）。URL 由
+    cp_url/cfg 拼接，钉扎后即使拼接面/命令面将来被污染也出不了 CP 域。
+    违反抛 RuntimeError（fail-closed；各调用方 except 兜底链原样接住回执）。"""
+    from urllib.parse import urlsplit
+
+    def _triple(u):
+        # 畸形端口（如 "cp.host:8000.evil.local" 的 port 段非数字）在 urlsplit
+        # 里 .port 访问会抛 ValueError——视作不匹配三元组，落 refuse 分支。
+        try:
+            port = u.port
+        except ValueError:
+            return (u.scheme, u.hostname, "__malformed__")
+        return (u.scheme, u.hostname, port)
+
+    if _triple(urlsplit(url)) != _triple(urlsplit(cp_url.rstrip("/"))):
+        raise RuntimeError("outbound url is not CP-origin, refused")
+    return url
+
+
 def _post_json(url: str, payload: dict, headers: dict | None = None,
                timeout: int = 10) -> tuple[int, dict]:
     req = urllib.request.Request(
@@ -175,7 +196,7 @@ def register_once(cp_url: str, license_key: str, fingerprint: str, *,
     一律 401 不复活，nodes_store.register）→ RegisterRevoked 致命退出、明文
     一行说清原因；其余失败维持原 SystemExit 语义。"""
     code, body = _post_json(
-        f"{cp_url.rstrip('/')}/api/nodes/register",
+        _assert_cp_origin(f"{cp_url.rstrip('/')}/api/nodes/register", cp_url),
         {"name": name, "platform": platform_label, "version": version,
          "license_key": license_key, "fingerprint": fingerprint},
     )
@@ -209,7 +230,7 @@ def ensure_token(cp_url: str, license_key: str, fingerprint: str,
             token = ""
     if token:
         code, body = _post_json(
-            f"{cp_url.rstrip('/')}/api/nodes/heartbeat",
+            _assert_cp_origin(f"{cp_url.rstrip('/')}/api/nodes/heartbeat", cp_url),
             {"metrics": {}, "fingerprint": fingerprint},
             headers={"Authorization": f"Bearer {token}"}, timeout=10)
         if code == 200:
@@ -245,6 +266,7 @@ def heartbeat_once(cfg: NodeConfig, metrics: dict | None = None,
         headers={"Authorization": f"Bearer {cfg.node_token}", "Content-Type": "application/json"},
         method="POST",
     )
+    _assert_cp_origin(req.full_url, cfg.cp_url)
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return True, json.loads(resp.read().decode())
@@ -510,7 +532,8 @@ def dispatch_commands(cfg: NodeConfig, commands: list, *,
 
 
 def _http_download(url: str, token: str, dest: Path, timeout: int = 300) -> None:
-    """流式下载（Bearer node_token 自证，与心跳同凭据面）。非 200 抛 RuntimeError。"""
+    """流式下载（Bearer node_token 自证，与心跳同凭据面）。非 200 抛 RuntimeError。
+    出站钉扎在调用点（perform_update）做——替身测试替换本函数不受影响。"""
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
     with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as f:
         while True:
@@ -557,10 +580,14 @@ def perform_update(cfg: NodeConfig, version: str, *,
         tgz = Path(td) / f"bok-node-{version}.tar.gz"
         sha_path = Path(td) / "artifact.sha256"
         try:
-            _http_download(f"{base}/api/nodes/downloads/pkg/{version}/"
-                           f"bok-node-{version}.tar.gz", cfg.node_token, tgz)
-            _http_download(f"{base}/api/nodes/downloads/pkg/{version}/"
-                           f"bok-node-{version}.tar.gz.sha256", cfg.node_token, sha_path)
+            _http_download(
+                _assert_cp_origin(f"{base}/api/nodes/downloads/pkg/{version}/"
+                                  f"bok-node-{version}.tar.gz", base),
+                cfg.node_token, tgz)
+            _http_download(
+                _assert_cp_origin(f"{base}/api/nodes/downloads/pkg/{version}/"
+                                  f"bok-node-{version}.tar.gz.sha256", base),
+                cfg.node_token, sha_path)
         except Exception as exc:  # noqa: BLE001 - 下载失败=可回执的普通失败
             return f"download failed: {exc}"
         expected = sha_path.read_text(encoding="utf-8").strip().split()[0].lower()
@@ -681,6 +708,7 @@ def upload_recent_logs(cfg: NodeConfig, *, log_dir: Path | None = None,
             data=payload, method="POST",
             headers={"Authorization": f"Bearer {cfg.node_token}",
                      "Content-Type": "application/gzip"})
+        _assert_cp_origin(req.full_url, cfg.cp_url)
         with urllib.request.urlopen(req, timeout=60) as resp:
             body = json.loads(resp.read().decode())
         return "" if body.get("ok") else f"cp rejected: {body}"

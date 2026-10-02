@@ -115,6 +115,23 @@ def _scan_file(path: Path, window_start: float, tail_bytes: int) -> dict:
     return out
 
 
+def _safe_log_path(log_dir: Path, name: str) -> Path | None:
+    """文件名纯净性守卫（2026-10-02 安全分流跟进，Mimosa 穿越链纵深）：files
+    参数当前是模块常量，但按「将来可能被配置/请求污染」防御——拒绝路径分隔符/
+    ..，且解析结果必须仍在 log_dir 内。违反返回 None 跳过该文件（本模块
+    「读路径永不抛」契约不变，不制造新的失败面）。"""
+    if not name or name in {".", ".."} or "/" in name or "\\" in name or "\x00" in name:
+        return None
+    try:
+        base = log_dir.resolve()
+        target = (log_dir / name).resolve()
+        if target.parent != base:
+            return None
+        return target
+    except Exception:  # noqa: BLE001 - resolve 失败（符号环等）=跳过，不抛
+        return None
+
+
 def scan_provider_health(
     log_dir: Path | str,
     window_s: float = DEFAULT_WINDOW_S,
@@ -145,7 +162,13 @@ def scan_provider_health(
     last_hits: dict[str, float | None] = {"quota_2056": None, "rate_limit": None}
     scanned: dict[str, dict] = {}
     for name in files:
-        per = _scan_file(log_dir / name, window_start, tail_bytes)
+        safe = _safe_log_path(log_dir, name)
+        if safe is None:
+            # 纯净性守卫拒绝的文件名：诚实记空明细（available 语义仍由目录决定）。
+            scanned[name] = {"quota_2056": 0, "rate_limit": 0, "undated": 0,
+                             "statuses": {}, "last_hits": {"quota_2056": None, "rate_limit": None}}
+            continue
+        per = _scan_file(safe, window_start, tail_bytes)
         scanned[name] = per
         total["quota_2056"] += per["quota_2056"]
         total["rate_limit"] += per["rate_limit"]
