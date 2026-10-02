@@ -4,7 +4,6 @@
 # Layout produced:
 #   runtime/python/                    standalone CPython + platform deps
 #   runtime/llama/                     Windows: llama-server.exe + cudart DLLs
-#   runtime/bline-node_modules/        B-line worker deps (ws)
 #   desktop/src-tauri/binaries/        Tauri externalBin staging: livekit-server,
 #                                      node (<name>-<target-triple>[.exe])
 #                                      (退役注：Tauri 拆除后此 staging 由
@@ -107,7 +106,7 @@ fi
   packages/core packages/business-db packages/knowledge packages/observability \
   apps/control-plane "apps/agent[livekit]"
 
-# --- Node (B-line worker) --------------------------------------------------
+# --- Node (web dev server / desktop shell) ---------------------------------
 # 退役注（2026-09-17）：原打进 Tauri externalBin staging，现按 bok.py
 # bundled_node() 的 runtime 契约直放 runtime/（win: node/node.exe，
 # mac/linux: node/bin/node）。
@@ -175,15 +174,6 @@ elif [ "$OS" = "linux" ]; then
   find "$LLAMA_DIR" -iname "llama-server" -type f -exec mv {} "$LLAMA_DIR/llama-server" \;
   chmod +x "$LLAMA_DIR/llama-server" 2>/dev/null || true
   ls -la "$LLAMA_DIR" | head -20
-fi
-
-# --- B-line node_modules ---------------------------------------------------
-echo "==> [runtime] installing realtime-translation node deps …"
-if command -v npm >/dev/null 2>&1; then
-  (cd services/realtime-translation && npm ci --no-audit --no-fund)
-  cp -R services/realtime-translation/node_modules "$RUNTIME/bline-node_modules"
-else
-  echo "    npm missing — node_modules will be resolved from repo (dev path)"
 fi
 
 echo "==> [runtime] pruning bytecode caches (__pycache__ / *.pyc) …"

@@ -4,6 +4,8 @@
 - 诊断读面（/api/asr/health、/api/tts/health、/api/tts/speakers、/api/tts/voices、
   /api/tts/filler-preview）挂 settings 页键闸——auth-on 下 user JWT 403，
   双关 auth-off 直通（sidecar 缺席=503，非 403）；
+  （2026-10-02 刀2 修正：/api/tts/voices 改 settings|interpret 多键闸——同传页
+  共用读面；下面 user-403 矩阵改用「两键皆无」的权限全关 user 钉缺键 403 语义。）
 - /api/web_logs 保留 user 可写，但限速窗改 per-identity——一个身份打满 600/min
   不再挤占其他调用方额度。
 
@@ -47,10 +49,11 @@ def _client_and_repo(monkeypatch):
     return TestClient(app), repo
 
 
-def _mk_user(repo, username, role="user", account="acc-001", password=PW):
+def _mk_user(repo, username, role="user", account="acc-001", password=PW, permissions=""):
     return repo.create_user(
         username=username, password_hash=hash_password(password),
         role=role, org_id="org-t", account_id=account,
+        permissions_json=permissions,
     )
 
 
@@ -70,7 +73,9 @@ def _auth(token):
 def test_diag_routes_user_403(monkeypatch):
     client, repo = _client_and_repo(monkeypatch)
     monkeypatch.setenv("BOK_AUTH_REQUIRED", "1")
-    _mk_user(repo, "peon")
+    # 权限全关（'[]'）钉「缺键即 403」：默认集含 interpret，会让 2026-10-02 后
+    # 多键闸的 /api/tts/voices 放行——那不是本用例要证的语义（见模块 docstring）。
+    _mk_user(repo, "peon", permissions="[]")
     tok = _login(client, "peon")
     for path in _DIAG_PATHS:
         r = client.get(path, headers=_auth(tok))

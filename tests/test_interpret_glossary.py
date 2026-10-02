@@ -100,11 +100,14 @@ def test_build_llm_provider_passes_glossary(monkeypatch, tmp_path):
     mt_model.mkdir()
     monkeypatch.setenv("MT_LLM_MODEL", str(mt_model))
     monkeypatch.setenv("MT_LLM_BASE_URL", "http://127.0.0.1:1236/v1")
-    provider = interpret._build_llm_provider({}, "en", glossary="顺丰=SF Express")
+    # 装配期探活(刀1 RC-2)注入口:假活免网络,本测只钉 glossary 槽。
+    provider = interpret._build_llm_provider(
+        {}, "en", glossary="顺丰=SF Express", mt_alive=lambda *_: True
+    )
     assert isinstance(provider, StatelessMTLLM)
     assert provider._glossary == "顺丰=SF Express"
     # 缺省(不传)=空术语槽,行为同旧
-    assert interpret._build_llm_provider({}, "en")._glossary == ""
+    assert interpret._build_llm_provider({}, "en", mt_alive=lambda *_: True)._glossary == ""
 
 
 def test_translation_instructions_glossary_line():

@@ -397,6 +397,8 @@ class MlxLlmLLM(_OpenAICompatBase):
     采样档显式传参（temperature/top_p/top_k/repetition_penalty）优先，None 回落
     env 现状——调用方（B 线 MT 分支）显式传值时不再依赖写进程 env 下发（评审
     P2-3：env setdefault 会在同 worker 跨会话驻留，泄漏给回退主 LLM）。
+    max_tokens 同治理（2026-10-02 刀1）：构造参优先，None=现行 env 读（缺省 160）
+    ——B 线整句翻译显式 512，不再靠 entrypoint setdefault 写进程 env 下发。
     """
 
     provider = "mlx"
@@ -411,6 +413,7 @@ class MlxLlmLLM(_OpenAICompatBase):
         top_k: int | None = None,
         repetition_penalty: float | None = None,
         enable_thinking: bool | None = None,
+        max_tokens: int | None = None,
     ):
         # mlx_lm server requires the real model path in requests; "local" is
         # only a last-resort placeholder when no env/settings provide one.
@@ -424,7 +427,11 @@ class MlxLlmLLM(_OpenAICompatBase):
                 flush=True,
             )
         extra_body = {
-            "max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "160")),
+            # max_tokens:构造参优先(缺省 None=现行 env 读,既有调用零漂移);
+            # B 线整句翻译经此显式 512,不再依赖进程 env setdefault(刀1 卫生)。
+            "max_tokens": int(
+                max_tokens if max_tokens is not None else os.environ.get("LLM_MAX_TOKENS", "160")
+            ),
             # Qwen3 对话模板以 <|im_end|> 收尾:唔传 stop 个 server 会当文字输出
             # (转录/TTS 见住 <|im_end|>),喺源头截停最干净;下游再剥多一重保险。
             "stop": ["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
@@ -1175,17 +1182,29 @@ class _LlmFallbackStream(llm.LLMStream):
 
 
 class DeepSeekLLM(_OpenAICompatBase):
-    """DeepSeek 云端（OpenAI 兼容契约，与本地 MlxLlmLLM 同一官方内芯）。"""
+    """DeepSeek 云端（OpenAI 兼容契约，与本地 MlxLlmLLM 同一官方内芯）。
+
+    max_tokens 构造参优先（缺省 None=现行 env 读）——与 MlxLlmLLM 同治理：
+    B 线整句翻译显式 512，不再靠 entrypoint setdefault 写进程 env 下发。
+    """
 
     provider = "deepseek"
 
-    def __init__(self, api_key="", model="deepseek-chat", base_url="https://api.deepseek.com/v1"):
+    def __init__(
+        self,
+        api_key="",
+        model="deepseek-chat",
+        base_url="https://api.deepseek.com/v1",
+        max_tokens: int | None = None,
+    ):
+        if max_tokens is None:
+            max_tokens = int(os.environ.get("LLM_MAX_TOKENS", "160"))
         super().__init__(
             model=model or "deepseek-chat",
             api_key=api_key,
             base_url=base_url,
             temperature=float(os.environ.get("LLM_TEMPERATURE", "0.35")),
-            extra_body={"max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "160"))},
+            extra_body={"max_tokens": int(max_tokens)},
         )
 
 

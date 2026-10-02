@@ -16,7 +16,7 @@
    - **箱上成品脚本**：`/root/build_llamacpp_box.sh`、`/root/make_cuda_shim.sh`。
 5. **双道起服**（`/root/launch_llm_lanes.sh`）：Q8 回道 :1235（fa on + cache-reuse 256 + -np 6 -c 30720）、Q4 判官道 :1237（-np 3 -c 12288）、**`-rea off` 必须**（#7）。bok serve 健康检查自动让位收编。
 6. **sidecar venv**：`services/*-sidecar/.venv` → symlink `/root/bok-venv`（torch cu13 复用省 3G；代价见 #11 版本冲突）。
-7. **bok serve**（`/root/serve_box.sh`）：自动下载 ASR/TTS 模型（HF 直连可用且快，~3min/模型）；B 线需先 `npm ci`（#6）。
+7. **bok serve**（`/root/serve_box.sh`）：自动下载 ASR/TTS 模型（HF 直连可用且快，~3min/模型）。
 8. **真库种子**：Mac `sqlite3 .backup` → 换入 `~/.local/share/BokVoice/bok_voice.db`（模板/对象/QA/凭据全套即得）。
 9. **验证**：`E2E_ONLY=cantonese e2e_trilingual_livekit.py` → `e2e_interpret.py` → `probe_latency_soak.py`。
 
@@ -29,7 +29,7 @@
 | 3 | pip CUDA wheel 布局不合 FindCUDAToolkit | `/root/cuda` shim（lib64 开发链接） | `make_cuda_shim.sh` |
 | 4 | cu13 wheel nvcc 13.4 + 头 13.0 嵌合体 | 摘 cccl 一致性 #error | 构建脚本注释 |
 | 5 | 主 env 缺 huggingface_hub → cmd_download 死 | 补装（**Linux bootstrap 应自带**=开口项 A） | 流程 |
-| 6 | serve 硬等 :8790 超时即退 → LiveKit/worker 没起 | 先 `npm ci`（**开口项 B：serve 对可选服务应软等待**） | 流程 |
+| 6 | serve 硬等 :8790 超时即退 → LiveKit/worker 没起 | 走 `npm ci` 绕过；**v1 :8790 已退役（2026-10-02），此硬等随端口删除消失** | 流程 |
 | 7 | Qwen3.5 thinking 默认烧 reasoning_content | `-rea off`（bok.py Linux 分支已升级旗标：fa/cache-reuse/-rea/-np） | **tools/bok.py ✅** |
 | 8 | TTS sidecar fa2 硬依赖（包缺席=起不来） | fa2 ImportError→SDPA 回落 | **services/qwen3-tts-sidecar/app.py ✅** |
 | 9 | `pkill -f "pattern"` 自匹配杀自家 SSH shell（两次神秘断连根因） | `[p]attern` 正则避身——**远程 ops 铁律** | 流程 |
@@ -38,8 +38,8 @@
 
 ## 三、开口项（待修/待验）
 
-- **A. Linux bootstrap 脚本**：本手册第一节固化成 `scripts/setup-linux.sh`（含 #5 依赖、node deps、#9 排除清单 rsync 姿势）。
-- **B. serve 对可选服务软等待**：:8790 不在时应降级继续起 A 线全家，不该整体退出。
+- **A. Linux bootstrap 脚本**：本手册第一节固化成 `scripts/setup-linux.sh`（含 #5 依赖、#9 排除清单 rsync 姿势）。
+- **B. serve 对可选服务软等待**（2026-10-02 随 v1 :8790 退役消解）：可选线（MT/settle/embed/laya）已由 `_only_optional_ports` 豁免，主栈不再因可选端口缺席整体退出。
 - **C. sidecar 分 env**：asr/tts/vllm 各自 venv，消除版本三方拔河。
 - **D. [W10] 首声 p50 2184ms 归因未完**：零哑全过但比 Mac 最佳窗（927ms）差。llama 侧已洗清（prefill 增量 3400tok/s、decode 50tps 满载）；头号嫌疑=**transformers ASR 与全家共卡争抢**。soak 的 `PERCEIVED 无样本` 是测量面缺口（turns perceived_ms 未落？），先修读数再动刀。
 - **E. [W12] 热词 context 在 transformers ASR 是否生效未验**（E2E 过≠biasing 在）。
@@ -52,7 +52,7 @@
 :1235 Q8 回道 (fa/cache-reuse/6槽)   :1237 Q4 判官道 (3槽)
 :8000 CP(真库种子) :3000 web :7880 LiveKit 1.9.4 :8081 worker
 :8787 ASR transformers+CUDA :8788 TTS transformers+CUDA(SDPA)
-:8790 B线 :9000 FireRedTTS3(Gradio)         显存 39.4/49G
+:9000 FireRedTTS3(Gradio)                   显存 39.4/49G
 ```
 
 运维脚本：`/root/serve_box.sh`（全家）、`/root/launch_llm_lanes.sh`（双道）、`/root/build_llamacpp_box.sh`（重编）。重启顺序：双道 → serve。

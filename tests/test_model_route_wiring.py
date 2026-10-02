@@ -276,11 +276,13 @@ def _valid_local_model(tmp_path: Path) -> str:
 
 
 def test_build_llm_provider_mt_env_lane_unchanged(monkeypatch, tmp_path):
-    """env 档回归：MT env 齐 → MT 分支（与改造前同 base/model）。"""
+    """env 档回归：MT env 齐 → MT 分支（与改造前同 base/model）。
+
+    `mt_alive=lambda *_: True`：装配期探活（刀1 RC-2）注入口,测试不吃真网络。"""
     model_path = _valid_local_model(tmp_path)
     monkeypatch.setenv("MT_LLM_BASE_URL", "http://127.0.0.1:1236/v1")
     monkeypatch.setenv("MT_LLM_MODEL", model_path)
-    provider = interpret_mod._build_llm_provider({}, "cantonese")
+    provider = interpret_mod._build_llm_provider({}, "cantonese", mt_alive=lambda *_: True)
     assert isinstance(provider, StatelessMTLLM)
     assert _base_url(provider._inner) == "http://127.0.0.1:1236/v1"
     assert provider._inner._opts.model == model_path
@@ -318,10 +320,14 @@ def test_build_llm_provider_mt_openai_route(monkeypatch, clean_lane_env, tmp_pat
 
 
 def test_build_llm_provider_mt_local_routing_overrides_endpoint(monkeypatch, clean_lane_env, tmp_path):
-    """mt 车道 local routing 档＝换端点/模型后走既有门禁（显式模型须过路径门）。"""
+    """mt 车道 local routing 档＝换端点/模型后走既有门禁（显式模型须过路径门）。
+
+    `mt_alive` 注入同 env 档（刀1 RC-2 探活注入口,测试免真网络）。"""
     model_path = _valid_local_model(tmp_path)
     routing = _routing({"mt": {"provider": "local", "base_url": "http://127.0.0.1:4321/v1", "model": model_path}})
-    provider = interpret_mod._build_llm_provider({}, "cantonese", routing_raw=routing)
+    provider = interpret_mod._build_llm_provider(
+        {}, "cantonese", routing_raw=routing, mt_alive=lambda *_: True
+    )
     assert isinstance(provider, StatelessMTLLM)
     assert _base_url(provider._inner) == "http://127.0.0.1:4321/v1"
     assert provider._inner._opts.model == model_path

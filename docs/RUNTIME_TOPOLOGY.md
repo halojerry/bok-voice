@@ -25,7 +25,6 @@
 | TTS sidecar | :8788 HTTP | 合成 / 克隆 / 试听 | Mac=mlx_audio；Win=qwen-tts | 模型 → app-data/models |
 | LLM | :1235 OpenAI 兼容 | A 线对话（flow judge、CP 摘要同源）；B 线翻译回退 | Mac=mlx_lm；Win=llama-server CUDA | 模型 → app-data/models |
 | MT LLM（可选） | :1236 OpenAI 兼容 | B 线同传专用翻译（Hy-MT2 小模型，逐句无状态；模型缺失自动跳过 → B 线回退 :1235） | Mac=mlx_lm | 模型 → app-data/models |
-| B-line worker | :8790 WS | 同传通道：ASR→翻译→TTS 队列 / 背压 | 内嵌 Node | 指标 → app-data/translation-metrics.jsonl |
 | LiveKit server | :7880 WS/WebRTC | RTC 信令与媒体（7881/7882 RTC 端口） | 内嵌二进制 | keys → 内嵌 livekit.yaml |
 | agent worker | 进程（健康 :8081/worker） | A 线智能体（VAD/对话/情绪/打断） | 打包 Python | 调 8787/8788/1235/8000；TTS=MiniMax 云（`tts_cache` 本地音频缓存叠加） |
 | interpreter worker ×2 | 进程（健康 :8082 fwd / :8083 rev） | B 线双 AgentSession 同传（`bok-interp-fwd/rev` 显式分发） | 打包 Python | 调 8787/8788/1236(MT,回退 1235)/8000；TTS=MiniMax 云(或本地 8788) |
@@ -33,8 +32,7 @@
 > 健康探针（2026-09-17）：三 worker 的 `/worker` 是 livekit-agents 内建真端点
 > （agent_name/worker_load/sdk_version），`bok.py status/doctor/prod status`
 > 统一读端点本体而非 TCP UP；LLM 另有 max_tokens=1 功能探针（端口 UP ≠ 能用，
-> `BOK_DOCTOR_LLM_PROBE_TIMEOUT_S` 默认 10s）；b-line :8790 无明文 /health，
-> 非 upgrade 请求恒 426=本体作答判活。常量单点 `CORE_PORTS`/`WORKER_PORTS`/
+> `BOK_DOCTOR_LLM_PROBE_TIMEOUT_S` 默认 10s）。常量单点 `CORE_PORTS`/`WORKER_PORTS`/
 > `PROD_HTTP_CHECKS`（tools/bok.py），契约钉在 `tests/test_health_surface.py`。
 
 ### 本地 TTS 音频缓存 + 垫话 + Q→A 快路（2026-09-09，`docs/superpowers/specs/2026-09-08-*-design.md`）
@@ -328,7 +326,7 @@ RoomAgentDispatch metadata 下发;无房间时空闲,job 到达才拉管线)。
 三个 livekit-agents worker 健康端口显式分拆(A 线 8081/interp 8082·8083,
 WorkerOptions.port)——默认同为 8081 会竞态,后绑者 Errno 48 即崩
 ("Agent did not join the room" 根因,2026-09-06)。
-旧 v1(/translate + WS :8790)冻结保留作 POC,不再迭代。
+v1 Node 同传 POC（/translate + WS :8790）已于 2026-10-02 退役，代码见 git 历史。
 ```
 
 ## 3. 生命周期
@@ -339,9 +337,8 @@ WorkerOptions.port)——默认同为 8081 会竞态,后绑者 Errno 48 即崩
 2. control-plane :8000（注入 `DATABASE_URL=sqlite:///<app-data>/bok_voice.db`、`VAULT_ROOT=<app-data>/vault`）
 3. LiveKit :7880（内嵌二进制 + livekit.yaml；不依赖 Docker）
 4. ASR :8787、TTS :8788、LLM :1235（并行拉起）
-5. B-line :8790（注入 app-data 配置文件）
-6. agent worker（注册到 :7880）
-7. 轮询全部端口 UP → 前端可用
+5. agent worker（注册到 :7880）
+6. 轮询全部端口 UP → 前端可用
 
 ### 关闭（`bok.py down`）
 
@@ -409,7 +406,7 @@ Windows 站点机的常驻等价物（对照 mac launchd RunAtLoad + KeepAlive�
 ### Ubuntu 节点形态（2026-09-20 接线补齐）
 
 - **进程面**：节点 = node_agent（systemd 常驻，Restart=on-failure）→ cmd_up =
-  服务面（ASR:8787 / TTS:8788 / LLM:1235[/MT:1236/settle:1237] / b-line:8790）
+  服务面（ASR:8787 / TTS:8788 / LLM:1235[/MT:1236/settle:1237]）
   **+ 通话面**（LiveKit:7880 + agent/interp worker:8081-8083 + monitor）。旧版
   cmd_up 只起服务面，通话面只在 dev `serve` 内联——节点装完打不了电话（本版把
   通话面提取为 `_start_call_plane`，serve 与 node_agent 同源）。
@@ -456,7 +453,7 @@ Windows 站点机的常驻等价物（对照 mac launchd RunAtLoad + KeepAlive�
 | 路径 | 可写 | 用途 |
 |---|---|---|
 | 节点安装树（`~/bok-voice` / `%USERPROFILE%\bok-voice`） | 代码可更新 | 代码、runtime/（Python/二进制复用）、静态前端 |
-| `~/Library/Application Support/BokVoice`（win `%LOCALAPPDATA%\BokVoice`） | 是 | models / vault / logs / run / bok_voice.db / audit / bline.json |
+| `~/Library/Application Support/BokVoice`（win `%LOCALAPPDATA%\BokVoice`） | 是 | models / vault / logs / run / bok_voice.db / audit |
 | `~/.lmstudio/models` | 只读引用 | 本机开发/软链复用（`--` 目录名映射） |
 
 ## 5. 默认配置与环境变量
@@ -470,7 +467,6 @@ Windows 站点机的常驻等价物（对照 mac launchd RunAtLoad + KeepAlive�
 | `LIVEKIT_URL` | `ws://127.0.0.1:7880` | control-plane 签 token 时下发的服务器地址 |
 | `LIVEKIT_API_KEY` | `devkey` | control-plane `/api/token` 签发真实 JWT（缺失会 503） |
 | `LIVEKIT_API_SECRET` | `devsecret` | 同上；与 livekit.yaml `keys` 一致 |
-| `BOK_BLINE_CONFIG` | `<app-data>/bline.json` | B 线通道配置（ASR/TTS/翻译/指标路径） |
 | `QWEN3_TTS_DATA_DIR` | `<app-data>/tts-data` | TTS 语音克隆注册数据（registry + 参考音频），bundle 只读/可升级 |
 | LLM 默认 | `provider=local_openai` + `http://127.0.0.1:1235/v1` | A/B 线共用本地 LLM |
 | 服务绑定 | 127.0.0.1 | 仅本机可访问 |

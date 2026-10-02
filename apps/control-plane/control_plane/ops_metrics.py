@@ -547,7 +547,6 @@ def server_registry(env: Mapping[str, str] | None = None) -> list[tuple[str, str
         ("asr", str(e.get("QWEN3_ASR_BASE_URL") or "http://127.0.0.1:8787"), 8787),
         ("tts", str(e.get("QWEN3_TTS_BASE_URL") or "http://127.0.0.1:8788"), 8788),
         ("livekit", str(e.get("LIVEKIT_URL") or "ws://127.0.0.1:7880"), 7880),
-        ("b-line", "http://127.0.0.1:8790", 8790),
         ("laya", str(e.get("BOK_LAYA_URL") or "http://127.0.0.1:8791"), 8791),
         ("csc", str(e.get("BOK_CSC_URL") or "http://127.0.0.1:8792"), 8792),
     ]

@@ -94,6 +94,38 @@ async function request<T>(path: string, init?: RequestInit, base?: string): Prom
   return res.json() as Promise<T>;
 }
 
+/**
+ * 泛型 POST → JSON（2026-10-02 刀3 卫生收编）：auth 头 + X-Request-ID + 401 处理
+ * 与 request 同款。供「body 形状与既有 api.* 不同」的就地 POST 用（一体台
+ * fetchToken 的 /api/token 走 participant_identity 契约，与 api.token 的 role
+ * 形状并存），不再裸 fetch。
+ */
+export function postJson<T>(path: string, body: unknown): Promise<T> {
+  return request<T>(path, { method: "POST", body: JSON.stringify(body) });
+}
+
+/**
+ * 泛型 POST → Blob（试听/预览类二进制端点，2026-10-02 刀3 卫生收编）：与 request
+ * 同款鉴权头、X-Request-ID 与 401 处理；非 2xx 经 toError 转可读错误。objectURL
+ * 的创建/回收交给 lib/preview.ts 的 playAudioBlob 单点管理。
+ */
+export async function postBlob(path: string, body: unknown): Promise<Blob> {
+  const res = await fetch(`${apiBase()}${path}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Request-ID": crypto.randomUUID(),
+      ...authHeaders(),
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    if (res.status === 401) handleUnauthorized(path);
+    throw await toError(res);
+  }
+  return res.blob();
+}
+
 export const api = {
   health: () => request<{ ok: boolean }>("/health"),
   asrHealth: () => request<Record<string, unknown>>("/api/asr/health"),

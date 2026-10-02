@@ -9,11 +9,20 @@ import { api, authHeaders } from "@/lib/api";
 /**
  * 播一段音频 blob（qa 页 playBlob 手法收编）：开始播放即返回，ended/error 后
  * 回收 objectURL；setSinkId 可选（指定输出设备试听）；play 失败立即回收并 rethrow。
+ * prepare 钩子（2026-10-02 刀3）：播放前就地准备（如一体台试听的 element.setSinkId
+ * ——设备指认留在调用方），抛错则中止播放且 URL 立即回收，播放/回收仍由本函数单点管。
  */
-export async function playAudioBlob(blob: Blob, opts: { sinkId?: string } = {}): Promise<void> {
+export async function playAudioBlob(
+  blob: Blob,
+  opts: {
+    sinkId?: string;
+    prepare?: (audio: HTMLAudioElement) => void | Promise<void>;
+  } = {},
+): Promise<void> {
   const url = URL.createObjectURL(blob);
   const audio = new Audio(url);
   try {
+    if (opts.prepare) await opts.prepare(audio);
     if (opts.sinkId) {
       const sink = audio as HTMLAudioElement & { setSinkId?: (id: string) => Promise<void> };
       if (sink.setSinkId) await sink.setSinkId(opts.sinkId);

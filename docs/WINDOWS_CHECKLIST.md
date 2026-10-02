@@ -15,7 +15,7 @@
 
 ## 服务拓扑（七项端口）
 
-- [ ] control-plane :8000 / ASR :8787 / TTS :8788 / LLM :1235 / B-line :8790 / LiveKit :7880 全 UP
+- [ ] control-plane :8000 / ASR :8787 / TTS :8788 / LLM :1235 / LiveKit :7880 全 UP
 - [ ] LLM 为 llama-server CUDA（--jinja + enable_thinking=false，回复无 reasoning、首 token 快）
 - [ ] ASR 为 Qwen3-ASR transformers+CUDA：zh/cantonese/en 三语转写正确（粤语：我哋支持粵語）
 
