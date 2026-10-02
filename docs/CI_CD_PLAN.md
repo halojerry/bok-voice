@@ -10,7 +10,6 @@
 | Job | 内容 | 跑什么 |
 |---|---|---|
 | `python` | Python checks | `compileall` + 全量 pytest |
-| `node` | Node tests (realtime-translation) | `npm ci && npm test` |
 | `web` | Web typecheck + export | `tsc --noEmit` + `npm run build` |
 | `bok` | Launcher smoke | `bok.py manifest/status/doctor` |
 | `desktop` | Desktop shell (Rust) | `cargo test` + `cargo check` |
@@ -78,9 +77,9 @@ GitHub Settings → Branches → default branch（已通过 `gh api` 改为 `mai
 ### 4.2 ✅ `main` 分支保护（已配置）
 Settings → Branches → Branch protection rule（`main`）：
 - **Require a pull request before merging**：approval count = **0**。理由：halojerry 是仓库唯一维护者，GitHub 不允许作者给自己的 PR 打 approval，设 1 会自锁合并；以后有第二位 reviewer 再升 1。
-- **Require status checks to pass before merging**（4 个 context，`strict` = require branches up to date）：
-  `Python checks`、`Node tests (realtime-translation)`、`Web typecheck + export`、`Launcher smoke`
-  （`Desktop shell (Rust)` 已随 Tauri 退役删除——branch protection 需同步移除该 required context，否则 PR 永久阻塞）
+- **Require status checks to pass before merging**（3 个 context，`strict` = require branches up to date）：
+  `Python checks`、`Web typecheck + export`、`Launcher smoke`
+  （`Desktop shell (Rust)` 已随 Tauri 退役删除；`Node tests (realtime-translation)` 已随 v1 同传退役删除（2026-10-02）——branch protection 需同步移除这两个 required context，否则 PR 永久阻塞）
 - **Enforce admins**：管理员也走 PR，不能直推绕过。
 - 效果：feature → PR → CI 绿 → merge main；`main` 直推被 GitHub 拒绝。
 

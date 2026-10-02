@@ -36,7 +36,6 @@
 | MT LLM（可选） | :1236 | B 线同传专用翻译（Hy-MT2；缺失自动回退 :1235） |
 | settle-llm（可选） | :1237 | 后台重活 9B（纪要/judge；缺盘回退 :1235） |
 | embedding（可选） | :8789 | 意图语义车道（bge-m3；缺失回退关键词双车道） |
-| B-line worker | :8790 | B 线 WS 通道（旧 v1 POC 冻结） |
 | LiveKit | :7880 | RTC 信令与媒体 |
 | agent worker | :8081 | A 线智能体（健康端点 `GET /worker`） |
 | interp worker ×2 | :8082 / :8083 | B 线 fwd/rev 同传 worker |
@@ -87,9 +86,6 @@ python tools/bok.py setup status        # 查看在盘/缺失（first-run 向导
 
 # 3) Web 管理台构建（静态导出）
 cd apps/web && npm ci && npm run build
-
-# 4) B 线 Node 依赖
-cd services/realtime-translation && npm ci
 ```
 
 模型表要点（tools/bok.py `MODELS`，以代码为准）：
@@ -114,7 +110,7 @@ python tools/bok.py doctor    # 体检（打包形态 --packaged 为硬门禁；
 2. control-plane :8000（注入 `DATABASE_URL=sqlite:///<app-data>/bok_voice.db`、`VAULT_ROOT`）
 3. LiveKit :7880（内嵌二进制 + livekit.yaml，不依赖 Docker）
 4. ASR :8787 / TTS :8788 / LLM :1235 并行拉起
-5. B-line :8790 → agent worker（注册到 :7880）→ 轮询全部端口 UP
+5. agent worker（注册到 :7880）→ 轮询全部端口 UP
 
 **macOS 生产常驻（launchd，KeepAlive 崩溃自拉起）**（docs/DEV_TOOLS.md §6）：
 
@@ -133,9 +129,9 @@ python tools/bok.py prod uninstall  # 对称卸载
 
 | 表 | 内容 | 探针方式 |
 |---|---|---|
-| `CORE_PORTS` | 8000/8787/8788/1235/1236/1237/8789/8790/7880 | HTTP 面（`PROD_HTTP_CHECKS`）优先，b-line :8790 非 upgrade 恒 426=本体作答判活 |
+| `CORE_PORTS` | 8000/8787/8788/1235/1236/1237/8789/7880 | HTTP 面（`PROD_HTTP_CHECKS`）优先，无 HTTP 面退 TCP 判活 |
 | `WORKER_PORTS` | agent-worker 8081 / interp-fwd 8082 / interp-rev 8083 | `GET :port/worker` 真端点（agent_name/load/sdk_version；TCP UP 对「进程在、没注册」不可见） |
-| `PROD_HTTP_CHECKS` | 8000/health、8787/health、8788/health、1235/v1/models、8790/health、7880/ | mt/settle(1236/1237)「起了才查」可选线 |
+| `PROD_HTTP_CHECKS` | 8000/health、8787/health、8788/health、1235/v1/models、7880/ | mt/settle(1236/1237)「起了才查」可选线 |
 
 LLM 另有功能探针 `_probe_llm`（max_tokens=1 真往返；预算 env `BOK_DOCTOR_LLM_PROBE_TIMEOUT_S` 默认 10s；空闲 >2h 权重页入 ~40s 会一次假警，重跑区分）。契约钉在 `tests/test_health_surface.py`。
 
@@ -526,12 +522,11 @@ mock 档派生 `scripts/mock_callee.py` 子进程当虚拟客户（answer 逐句
 | `interp-fwd.log` / `interp-rev.log` | B 线双 worker | 句级提交 `source=partial-punct|partial-len|vad-pause`、`MINIMAX_BIDI_PERF` |
 | `realtime-demo.log` | 演示档 worker | `REALTIME_DEMO usage` |
 | `control-plane.log` | CP API | 403/审计、迁移 `_ensure_column` |
-| `asr.log` / `tts.log` / `llm.log` / `mt-llm.log` / `settle-llm.log` / `embed.log` / `livekit.log` / `bline.log` | 各 sidecar/服务 | 模型加载、/v1/models |
+| `asr.log` / `tts.log` / `llm.log` / `mt-llm.log` / `settle-llm.log` / `embed.log` / `livekit.log` | 各 sidecar/服务 | 模型加载、/v1/models |
 | `monitor.log` | dev 监护 | `down xN (active_calls=M)` |
 | `tts-pregen.log` | 罐头物化 | 预合成进度/失败 |
 | `runtime/logs/mock-callee.log` | 外呼 mock 虚拟客户 | `MOCK_CALLEE event=…` |
 | `<app-data>/audit/*.jsonl` | 审计账本 | 逐操作一行 |
-| `<app-data>/translation-metrics.jsonl` | B 线 v1 指标（冻结 POC） | — |
 
 通话质量诊断技能：`.agents/skills/call-diagnosis/SKILL.md`（症状速查+标记词汇表+probe 用法）。延迟预算单一事实源：`docs/LATENCY_BUDGETS.md`。
 

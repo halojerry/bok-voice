@@ -2,13 +2,19 @@
 
 不启 worker：直接调 interpret._build_tts_provider / _build_llm_provider 纯装配函数。
 env 断言全部走 monkeypatch（终了自动还原，唔污染其他测试）。
+
+MT 分支测试统一注入 `mt_alive=lambda *_: True`（装配期探活 RC-2 的注入口）——
+否则本地 :1236 不在场时探活死会落回退链（这正是被测行为,但会让既有分支断言红）。
 """
 
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from agent_runtime import interpret
+
+ROOT = Path(__file__).resolve().parents[1]
 
 # MiniMax language_boost 外部枚举（TTS 供应商 API 真字面量，粤=普+粤标记）。
 # 常量名唔带旧拼写——术语门禁只豁免含字面量值的行。
@@ -186,7 +192,8 @@ def test_build_llm_provider_mt_branch(monkeypatch, tmp_path):
     monkeypatch.setenv("MT_LLM_BASE_URL", "http://127.0.0.1:1236/v1")
     monkeypatch.setenv("MT_LLM_MODEL", str(mt_model))
 
-    provider = interpret._build_llm_provider({}, "cantonese")
+    # 装配期探活(RC-2)注入口:假活,免网络(真探活行为见下方专门用例)。
+    provider = interpret._build_llm_provider({}, "cantonese", mt_alive=lambda *_: True)
     assert isinstance(provider, StatelessMTLLM)
     assert provider._target_lang == "cantonese"
     assert provider.provider == "mlx"
@@ -202,6 +209,8 @@ def test_build_llm_provider_mt_branch(monkeypatch, tmp_path):
     assert body["top_k"] == 20 and isinstance(body["top_k"], int)
     assert body["repetition_penalty"] == 1.05
     assert inner._opts.temperature == 0.7
+    # 刀1(D):整句翻译 max_tokens=512 经构造参数下发(entrypoint setdefault 已删)。
+    assert body["max_tokens"] == 512
     # 四键不得出现在进程 env（泄漏防线,monkeypatch 终了自动还原）。
     for key in ("LLM_TEMPERATURE", "LLM_TOP_P", "LLM_TOP_K", "LLM_REPETITION_PENALTY"):
         assert key not in os.environ
@@ -228,7 +237,7 @@ def test_build_llm_provider_mt_env_override(monkeypatch, tmp_path):
     monkeypatch.setenv("MT_LLM_MODEL", str(mt_model))
     monkeypatch.setenv("LLM_TEMPERATURE", "0.1")
 
-    provider = interpret._build_llm_provider({}, "cantonese")
+    provider = interpret._build_llm_provider({}, "cantonese", mt_alive=lambda *_: True)
     assert isinstance(provider, StatelessMTLLM)
     inner = provider._inner
     assert isinstance(inner, MlxLlmLLM)
@@ -301,3 +310,167 @@ def test_direction_audio_enabled_rev_text_only_by_default(monkeypatch):
     assert interpret._direction_audio_enabled("other") is False
     monkeypatch.setenv("BOK_INTERP_REV_AUDIO", "1")
     assert interpret._direction_audio_enabled("other") is True
+
+
+# ---------------------------------------------------------------------------
+# 刀1(C) MT 装配期探活 + 刀1(D) max_tokens 构造参
+# ---------------------------------------------------------------------------
+
+
+def _mt_env(monkeypatch, tmp_path):
+    """本地 MT 分支齐全配置(model=真实在盘绝对路径),探活注入口留给调用方。"""
+    mt_model = tmp_path / "Hy-MT2-8bit"
+    mt_model.mkdir()
+    monkeypatch.setenv("MT_LLM_BASE_URL", "http://127.0.0.1:1236/v1")
+    monkeypatch.setenv("MT_LLM_MODEL", str(mt_model))
+    monkeypatch.delenv("BOK_INTERP_MT_PROBE", raising=False)
+    monkeypatch.delenv("MLX_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    return mt_model
+
+
+def test_build_llm_provider_mt_probe_dead_falls_back(monkeypatch, tmp_path, capsys):
+    """装配期探活(RC-2)::1236 死 → 不返回 MT provider,落回退链 + 日志一行。
+
+    死端点若进 MT 分支=整通每句走异常兜底(装配期不探活的旧病);现探活失败即
+    回退到既有 DeepSeek/主 LLM 链。
+    """
+    from agent_runtime.providers.livekit_plugins import MlxLlmLLM, StatelessMTLLM
+
+    _mt_env(monkeypatch, tmp_path)
+    provider = interpret._build_llm_provider({}, "cantonese", mt_alive=lambda *_: False)
+    assert isinstance(provider, MlxLlmLLM)
+    assert not isinstance(provider, StatelessMTLLM)
+    assert str(provider._client.base_url).rstrip("/") == "http://127.0.0.1:1235/v1"
+    assert (provider._opts.extra_body or {})["max_tokens"] == 512  # 刀1(D) 回退链同口径
+    out = capsys.readouterr().out
+    assert "[interp] mt endpoint dead (http://127.0.0.1:1236/v1) — fallback chain" in out
+    assert "mt model invalid" not in out  # 探活死已单独报,不重复误导
+    assert "llm=hy-mt2" not in out
+
+
+def test_build_llm_provider_mt_probe_disabled_trusts_config(monkeypatch, tmp_path):
+    """BOK_INTERP_MT_PROBE=0 = 旧行为:不探活,信任配置直接给 MT provider。
+
+    注入口给「一调即炸」证明探活确实被跳过(kill-switch 逐字节回旧)。"""
+    from agent_runtime.providers.livekit_plugins import StatelessMTLLM
+
+    _mt_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("BOK_INTERP_MT_PROBE", "0")
+
+    def _boom(*_args):  # pragma: no cover - 被调用即失败
+        raise AssertionError("probe must not run when BOK_INTERP_MT_PROBE=0")
+
+    provider = interpret._build_llm_provider({}, "cantonese", mt_alive=_boom)
+    assert isinstance(provider, StatelessMTLLM)
+
+
+def test_build_llm_provider_mt_probe_dead_only_for_local_branch(monkeypatch, tmp_path, capsys):
+    """探活只挂本地 MT 分支:模型非法(未进分支)不探——注入口一调即炸。"""
+    from agent_runtime.providers.livekit_plugins import MlxLlmLLM
+
+    monkeypatch.setenv("MT_LLM_BASE_URL", "http://127.0.0.1:1236/v1")
+    monkeypatch.setenv("MT_LLM_MODEL", "repo-id-not-a-path")  # 非本地路径=挂死防线拦下
+    monkeypatch.delenv("BOK_INTERP_MT_PROBE", raising=False)
+
+    def _boom(*_args):  # pragma: no cover - 被调用即失败
+        raise AssertionError("probe must not run when model gate fails first")
+
+    provider = interpret._build_llm_provider({}, "cantonese", mt_alive=_boom)
+    assert isinstance(provider, MlxLlmLLM)
+    assert "mt model invalid" in capsys.readouterr().out
+
+
+def test_mt_endpoint_alive_any_http_response_is_alive(monkeypatch):
+    """镜像 CP probe_endpoint:401/404 等 HTTPError 也是「端点在场」(不 raise)。"""
+    import urllib.error
+    import urllib.request
+
+    def _http_error(*_args, **_kwargs):
+        raise urllib.error.HTTPError("http://127.0.0.1:1236/v1/models", 401, "unauthorized", {}, None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", _http_error)
+    assert interpret._mt_endpoint_alive("http://127.0.0.1:1236/v1") is True
+
+
+def test_mt_endpoint_alive_2xx_via_stub(monkeypatch):
+    """2xx(有响应体)=活;空 base=死(不发起请求)。"""
+    import urllib.request
+
+    calls: list[str] = []
+
+    class _Resp:
+        def close(self) -> None:  # pragma: no cover - 关闭即释放
+            pass
+
+    def _ok(url, timeout=None):
+        calls.append(url)
+        return _Resp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", _ok)
+    assert interpret._mt_endpoint_alive("http://127.0.0.1:1236/v1/") is True
+    assert calls == ["http://127.0.0.1:1236/v1/models"]
+    assert interpret._mt_endpoint_alive("") is False
+    assert calls == ["http://127.0.0.1:1236/v1/models"]  # 空 base 短路
+
+
+def test_mt_endpoint_alive_connection_error_is_dead(monkeypatch):
+    """连接错误/超时=死(探活失败是数据不是异常,绝不外抛)。"""
+    import urllib.error
+    import urllib.request
+
+    def _refused(*_args, **_kwargs):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _refused)
+    assert interpret._mt_endpoint_alive("http://127.0.0.1:1236/v1") is False
+
+
+def test_mlx_llm_max_tokens_param_and_env_fallback(monkeypatch):
+    """刀1(D):构造参优先,None=env 读(缺省 160)——既有调用零漂移。"""
+    from agent_runtime.providers.livekit_plugins import MlxLlmLLM
+
+    monkeypatch.delenv("LLM_MAX_TOKENS", raising=False)
+    explicit = MlxLlmLLM(base_url="http://127.0.0.1:1235/v1", model="m", max_tokens=512)
+    assert (explicit._opts.extra_body or {})["max_tokens"] == 512
+    assert (MlxLlmLLM(base_url="http://127.0.0.1:1235/v1", model="m")._opts.extra_body or {})[
+        "max_tokens"
+    ] == 160
+    monkeypatch.setenv("LLM_MAX_TOKENS", "256")
+    assert (MlxLlmLLM(base_url="http://127.0.0.1:1235/v1", model="m")._opts.extra_body or {})[
+        "max_tokens"
+    ] == 256
+    # 显式参压过 env(构造参数是唯一真源)。
+    assert (
+        MlxLlmLLM(base_url="http://127.0.0.1:1235/v1", model="m", max_tokens=512)._opts.extra_body or {}
+    )["max_tokens"] == 512
+
+
+def test_interpret_source_has_no_llm_max_tokens_setdefault():
+    """刀1(D) 卫生 pin:进程 env 写入绝迹(常驻 worker 跨会话驻留的老病)。"""
+    src = (ROOT / "apps" / "agent" / "agent_runtime" / "interpret.py").read_text(encoding="utf-8")
+    # 只扫代码面(注释里保留旧形态说明是有意为之,不算 env 写入)。
+    code = "\n".join(line.split("#", 1)[0] for line in src.splitlines())
+    assert 'setdefault("LLM_MAX_TOKENS"' not in code
+    assert "setdefault('LLM_MAX_TOKENS'" not in code
+    # 三个 MlxLlmLLM 构造点 + DeepSeek 回退点都显式 512(代码面,注释剥后)。
+    assert code.count("max_tokens=512") == 4
+
+
+def test_mt_worker_exception_path_says_fallback_source_pinned():
+    """刀1(B):MT 异常(连接错误/装配异常)与超时同款出声兜底——不静默丢句。
+
+    :1236 死亡时每句都走泛异常分支;旧版只 print=整通只有日志没有声音(与已修的
+    超时静默同构)。worker 是 entrypoint 闭包不可直调 → 源码级 pin。
+    """
+    src = (ROOT / "apps" / "agent" / "agent_runtime" / "interpret.py").read_text(encoding="utf-8")
+    worker = src[src.index("async def _mt_say_worker"):]
+    # 超时 + 泛异常两分支都要 say 兜底句(目标语中性请示语,绝不回放源文)。
+    assert worker.count("session.say(_mt_fail_line(target_lang))") >= 2
+    generic = worker[worker.index("except Exception as exc:  # 单句失败不阻后续"):]
+    # 原有打点保留 + 兜底 say 再包 try(兜底失败不阻后续句)。
+    assert 'print(f"[interp] mt/say failed: {exc!r}", flush=True)' in generic
+    assert "session.say(_mt_fail_line(target_lang))" in generic
+    assert "mt fail fallback say failed" in generic
+
+

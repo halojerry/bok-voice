@@ -399,6 +399,8 @@ class MlxLlmLLM(_OpenAICompatBase):
     采样档显式传参（temperature/top_p/top_k/repetition_penalty）优先，None 回落
     env 现状——调用方（B 线 MT 分支）显式传值时不再依赖写进程 env 下发（评审
     P2-3：env setdefault 会在同 worker 跨会话驻留，泄漏给回退主 LLM）。
+    max_tokens 同治理（2026-10-02 刀1）：构造参优先，None=现行 env 读（缺省 160）
+    ——B 线整句翻译显式 512，不再靠 entrypoint setdefault 写进程 env 下发。
     """
 
     provider = "mlx"
@@ -413,6 +415,7 @@ class MlxLlmLLM(_OpenAICompatBase):
         top_k: int | None = None,
         repetition_penalty: float | None = None,
         enable_thinking: bool | None = None,
+        max_tokens: int | None = None,
     ):
         # mlx_lm server requires the real model path in requests; "local" is
         # only a last-resort placeholder when no env/settings provide one.
@@ -426,7 +429,11 @@ class MlxLlmLLM(_OpenAICompatBase):
                 flush=True,
             )
         extra_body = {
-            "max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "160")),
+            # max_tokens:构造参优先(缺省 None=现行 env 读,既有调用零漂移);
+            # B 线整句翻译经此显式 512,不再依赖进程 env setdefault(刀1 卫生)。
+            "max_tokens": int(
+                max_tokens if max_tokens is not None else os.environ.get("LLM_MAX_TOKENS", "160")
+            ),
             # Qwen3 对话模板以 <|im_end|> 收尾:唔传 stop 个 server 会当文字输出
             # (转录/TTS 见住 <|im_end|>),喺源头截停最干净;下游再剥多一重保险。
             "stop": ["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
@@ -1177,7 +1184,11 @@ class _LlmFallbackStream(llm.LLMStream):
 
 
 class DeepSeekLLM(_OpenAICompatBase):
-    """DeepSeek 云端（OpenAI 兼容契约，与本地 MlxLlmLLM 同一官方内芯）。"""
+    """DeepSeek 云端（OpenAI 兼容契约，与本地 MlxLlmLLM 同一官方内芯）。
+
+    max_tokens 构造参优先（缺省 None=现行 env 读）——与 MlxLlmLLM 同治理：
+    B 线整句翻译显式 512，不再靠 entrypoint setdefault 写进程 env 下发。
+    """
 
     provider = "deepseek"
 
@@ -1187,12 +1198,17 @@ class DeepSeekLLM(_OpenAICompatBase):
         model="deepseek-flash",
         base_url="https://api.deepseek.com/v1",
         thinking: str = "",
+        max_tokens: int | None = None,
     ):
         # 思考档位：DeepSeek 端点缺省**关**（官方默认 enabled，而本类 max_tokens 走
         # LLM_MAX_TOKENS 默认 160——思考会把预算烧光、正文出空串，通话侧=静默哑火；
         # 契约与实测见 bok_voice_core.deepseek_llm）。`DEEPSEEK_THINKING=enabled`
         # 可显式开（需同时给足 LLM_MAX_TOKENS）。非 DeepSeek 端点该字段为空 dict。
-        body: dict = {"max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "160"))}
+        # max_tokens 参数化（B 线 MT 车道,2026-10-02 b-line 波）：显式参数 >
+        # env LLM_MAX_TOKENS——翻译长文要 1024 级,通话侧不传走缺省。
+        if max_tokens is None:
+            max_tokens = int(os.environ.get("LLM_MAX_TOKENS", "160"))
+        body: dict = {"max_tokens": int(max_tokens)}
         body.update(thinking_extra_body(base_url, thinking or os.environ.get("DEEPSEEK_THINKING", "")))
         super().__init__(
             model=model or "deepseek-flash",
@@ -7364,14 +7380,34 @@ def _join_norm_digits(text: str) -> str:
     return re.sub(r"[^0-9]", "", lowered.translate(_JOIN_DIGIT_TRANS))
 
 
+# join 门尾剥集:句尾标点/空白剥掉后看「最后说出口的字」——hold 判定只关心
+# 尾部形状(号码是否被拦腰),唔关心句中内容。
+_JOIN_TAIL_STRIP = "。，,．.！!？?～~…；;、 \t"
+
+
 def _join_worthy(text: str) -> bool:
-    """续接可能句:归一后有 ≥2 位数字(汉字数字/英文数字词都算,号码/价格/日期常见)、
-    或以系词收尾(係/系/是/is,英文只认独立词)。呢类句每轮多等一个 hold 窗;
-    其余普通陈述句零加迟。"""
+    """续接可能句:**句尾是数字**(汉字/全角数字字符、或英文数字词收尾——号码可能
+    被停顿拦腰,等续段并入同一会话)、或以系词收尾(係/系/是/is,英文只认独立词)。
+    呢类句每轮多等一个 hold 窗;其余普通陈述句零加迟。
+
+    判据收窄(2026-10-02,B 线连珠炮 blob 链实证):旧版「句中任意位置 ≥2 位数字」
+    把「…有三百多名员工。」(数字在句中、句尾是字)也扣 hold——数字后还有字=
+    号码已完整讲完,无拦腰风险;hold 却在 0.8s 窗内把下一句粘进同一 sidecar 会话
+    (START 取消 flush 计时),链式粘串直到断线,尾巴 finish 才整块吐出——
+    probe_interp_backlog 正压臂 orig=4/6、drops/skips=0 FAIL 的根因(商务同传里
+    价格/数量/日期满地 ≥2 位数字,任何带数字句在自然停顿下都会触发粘串)。
+    新判据只认尾部:剥尾标点后末字符经 _JOIN_DIGIT_TRANS 归一是数字(「我的号码
+    係一七二」停嘴=拦腰,hold),或英文末词 ∈_JOIN_EN_DIGIT_MAP(「code is
+    three」)。数字后带量词/名词收尾(「三百多」「300多名」「三百六十八块」)照常
+    提交。09-06 报号粘接修复的目的场景(逐位报号停嘴)一字不损。"""
     t = (text or "").strip()
     if not t:
         return False
-    if len(_join_norm_digits(t)) >= 2:
+    core = t.rstrip(_JOIN_TAIL_STRIP)
+    if core and _join_norm_digits(core[-1:]):
+        return True
+    _m = re.search(r"[A-Za-z]+$", core or "")
+    if _m and _m.group(0).lower() in _JOIN_EN_DIGIT_MAP:
         return True
     return bool(re.search(r"(?:係|系|是|\bis\b)\s*[。，,．.！!？?～~]*$", t, re.IGNORECASE))
 
@@ -7602,10 +7638,32 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
 
         async def _forward_input() -> None:
             """forward input to vad（与官方 StreamAdapter 一致）"""
+            _dbg = os.environ.get("BOK_ASR_FRAME_DEBUG", "") == "1"
+            _dbg_t0 = time.monotonic()
+            _dbg_n = 0
+            _dbg_samples = 0
+            _dbg_sr = 0
             async for input in self._input_ch:
                 if isinstance(input, self._FlushSentinel):
                     vad_stream.flush()
                     continue
+                if _dbg:
+                    _dbg_n += 1
+                    _dbg_samples += len(input.data) // 2
+                    _dbg_sr = input.sample_rate
+                    _dt = time.monotonic() - _dbg_t0
+                    if _dt >= 1.0:
+                        # 帧到达节奏观测行(诊断用):samples_ms/s≈1000=满速;显著
+                        # <1000=上游丢帧(事件环溢出/重采样链路丢失),frames 只作
+                        # 粒度参考——B 线正压臂吃头定位仪器(2026-10-02)。
+                        print(
+                            f"QWEN3_ASR_FRAME_DEBUG frames={_dbg_n} samples_ms={_dbg_samples//16} "
+                            f"sr={_dbg_sr} gap={_dt:.2f}s",
+                            flush=True,
+                        )
+                        _dbg_t0 = time.monotonic()
+                        _dbg_n = 0
+                        _dbg_samples = 0
                 vad_stream.push_frame(input)
             vad_stream.end_input()
 
@@ -7614,6 +7672,12 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
             async for event in vad_stream:
                 if event.type == vad.VADEventType.START_OF_SPEECH:
                     started = True
+                    if _frame_dbg_on():
+                        print(
+                            f"QWEN3_ASR_VAD_DEBUG START_OF_SPEECH finishing={self._finishing} "
+                            f"session={bool(self._session_id)}",
+                            flush=True,
+                        )
                     # join-hold 期间续段嚟到:取消超时 flush。sidecar session 仲生猛
                     # (hold 唔 finish),唔好重复 start——orphan 旧会话会令拼接变两段。
                     self._cancel_join_hold()
@@ -7632,6 +7696,12 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                         if event.frames:
                             try:
                                 _preroll_pcm = bytes(utils.merge_frames(event.frames).data)
+                                if _frame_dbg_on():
+                                    print(
+                                        f"QWEN3_ASR_VAD_DEBUG preroll_ms={len(_preroll_pcm)//32} "
+                                        f"frames_n={len(event.frames)}",
+                                        flush=True,
+                                    )
                                 self._pending.extend(_preroll_pcm)
                                 self._append_turn_pcm(_preroll_pcm)
                             except Exception:  # noqa: BLE001 - pre-roll 合帧失败不致命
@@ -7646,6 +7716,12 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
                     self._append_turn_pcm(_window_pcm)
                     await self._maybe_partial()
                 elif event.type == vad.VADEventType.END_OF_SPEECH:
+                    if _frame_dbg_on():
+                        print(
+                            f"QWEN3_ASR_VAD_DEBUG END_OF_SPEECH started={started} "
+                            f"finishing={self._finishing} pending_ms={len(self._pending)//32}",
+                            flush=True,
+                        )
                     if not started:
                         continue
                     # ---- 收线/告别直念窗(F4 二修,call-179c7608):整段静默丢弃 --
@@ -8412,6 +8488,11 @@ class _Qwen3ASRLiveStream(stt.RecognizeStream):
         # FINAL 的 partial 末稿」重贴回来——只给真发出去的 FINAL,纯 dump/短尾
         # 等被丢弃=无 FINAL → 保持空,下一轮拿不到上一轮的话。
         self._stt_._turn_partial_text = ""
+
+
+# 帧/VAD 事件观测行总闸(诊断仪器,默认关):B 线正压臂吃头取证 2026-10-02。
+def _frame_dbg_on() -> bool:
+    return os.environ.get("BOK_ASR_FRAME_DEBUG", "") == "1"
 
 
 class Qwen3ASRLiveSTT(stt.STT):

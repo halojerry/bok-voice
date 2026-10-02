@@ -80,7 +80,7 @@ def test_build_llm_provider_valid_mt_model_uses_mt(monkeypatch, tmp_path):
     monkeypatch.setenv("MT_LLM_BASE_URL", "http://127.0.0.1:1236/v1")
     monkeypatch.setenv("MT_LLM_MODEL", str(mt_model))
 
-    provider = interpret._build_llm_provider({}, "cantonese")
+    provider = interpret._build_llm_provider({}, "cantonese", mt_alive=lambda *_: True)
     assert isinstance(provider, StatelessMTLLM)
     assert isinstance(provider._inner, MlxLlmLLM)
     assert provider._inner._opts.model == str(mt_model)

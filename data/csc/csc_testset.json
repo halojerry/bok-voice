@@ -1,0 +1,28 @@
+{
+  "note": "ASR post-processing homophone-correction eval set. lang: zh=Mandarin simplified, cantonese=Cantonese (traditional). group: fix=should be corrected, keep=must NOT change (negative control), literal=verbatim examples from task brief (latin placeholder style, not real ASR output).",
+  "items": [
+    {"id": "zh-fix-1", "lang": "zh", "group": "fix", "input": "我的快第单号是三七七八九零", "ref": "我的快递单号是三七七八九零", "gold_edits": 1, "note": "第→递"},
+    {"id": "zh-fix-2", "lang": "zh", "group": "fix", "input": "请问是拼多多还是京冬发货", "ref": "请问是拼多多还是京东发货", "gold_edits": 1, "note": "冬→东"},
+    {"id": "zh-fix-3", "lang": "zh", "group": "fix", "input": "这个方按需要我承担运费吗", "ref": "这个方案需要我承担运费吗", "gold_edits": 1, "note": "按→案"},
+    {"id": "zh-fix-4", "lang": "zh", "group": "fix", "input": "我不需要你们的赔尝", "ref": "我不需要你们的赔偿", "gold_edits": 1, "note": "尝→偿"},
+    {"id": "zh-fix-5", "lang": "zh", "group": "fix", "input": "麻烦察一下我的订单状态", "ref": "麻烦查一下我的订单状态", "gold_edits": 1, "note": "察→查"},
+    {"id": "zh-fix-6", "lang": "zh", "group": "fix", "input": "我的收或地址在广州市", "ref": "我的收货地址在广州市", "gold_edits": 1, "note": "或→货 (近音)"},
+
+    {"id": "yue-fix-1", "lang": "cantonese", "group": "fix", "input": "你地公司係唔係香港既", "ref": "你哋公司係唔係香港嘅", "gold_edits": 2, "note": "地→哋, 既→嘅 (粤语功能字, 漂移风险)"},
+    {"id": "yue-fix-2", "lang": "cantonese", "group": "fix", "input": "呢个赔尝方案几多钱", "ref": "呢个赔偿方案几多钱", "gold_edits": 1, "note": "尝→偿"},
+    {"id": "yue-fix-3", "lang": "cantonese", "group": "fix", "input": "我唔想被乍骗", "ref": "我唔想被诈骗", "gold_edits": 1, "note": "乍→诈"},
+    {"id": "yue-fix-4", "lang": "cantonese", "group": "fix", "input": "我个快第单号係三七七八九零", "ref": "我个快遞单号係三七七八九零", "gold_edits": 1, "note": "第→遞"},
+    {"id": "yue-fix-5", "lang": "cantonese", "group": "fix", "input": "你地几时得闲帮我搞店件事", "ref": "你哋几时得闲帮我搞掂件事", "gold_edits": 2, "note": "地→哋, 店→掂 (粤语特有词, 高难)"},
+
+    {"id": "zh-keep-1", "lang": "zh", "group": "keep", "input": "我的订单号是三七七八九零", "ref": "我的订单号是三七七八九零", "gold_edits": 0, "note": "正确句+数字串"},
+    {"id": "zh-keep-2", "lang": "zh", "group": "keep", "input": "你好，请问是陈小明先生吗", "ref": "你好，请问是陈小明先生吗", "gold_edits": 0, "note": "正确句+专名"},
+    {"id": "zh-keep-3", "lang": "zh", "group": "keep", "input": "拼多多和京东都可以发货", "ref": "拼多多和京东都可以发货", "gold_edits": 0, "note": "专名, 不得改写"},
+    {"id": "zh-keep-4", "lang": "zh", "group": "keep", "input": "这个方案我同意，运费我来承担", "ref": "这个方案我同意，运费我来承担", "gold_edits": 0, "note": "正确句"},
+    {"id": "yue-keep-1", "lang": "cantonese", "group": "keep", "input": "你哋公司喺香港，我係用顺丰嘅", "ref": "你哋公司喺香港，我係用顺丰嘅", "gold_edits": 0, "note": "正确粤语句, 不得漂移成普通话"},
+    {"id": "yue-keep-2", "lang": "cantonese", "group": "keep", "input": "我个快遞单号係三七七八九零", "ref": "我个快遞单号係三七七八九零", "gold_edits": 0, "note": "正确粤语+数字串"},
+
+    {"id": "lit-1", "lang": "zh", "group": "literal", "input": "我的快du是三七七八九零", "ref": "我的快递是三七七八九零", "gold_edits": 1, "note": "任务原例(latin拼写), 非真实ASR中文输出"},
+    {"id": "lit-2", "lang": "zh", "group": "literal", "input": "呢个赔chang方案几多钱", "ref": "呢个赔偿方案几多钱", "gold_edits": 1, "note": "任务原例(latin拼写), 粤语"},
+    {"id": "lit-3", "lang": "zh", "group": "literal", "input": "你地公司係唔係香港嘅", "ref": "你哋公司係唔係香港嘅", "gold_edits": 1, "note": "任务原例, 粤语功能字"}
+  ]
+}

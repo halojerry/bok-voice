@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import io
 import sys
-import urllib.error
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
@@ -171,22 +170,6 @@ def test_relaxed_healthy_http_surface(monkeypatch):
     assert seen["timeout"] == 5.0  # 放宽窗口：CPU 风暴下 1s 会假死
 
 
-def test_relaxed_healthy_http_error_still_alive(monkeypatch):
-    """HTTPError=服务端有应答（b-line :8790 非 upgrade 恒 426）→ 活。"""
-
-    def fake_urlopen(url, timeout=None):
-        raise urllib.error.HTTPError(url, 426, "Upgrade Required", None, None)
-
-    monkeypatch.setattr(bok.urllib.request, "urlopen", fake_urlopen)
-    assert bok._relaxed_healthy(8790)
-
-    def fake_down(url, timeout=None):
-        raise urllib.error.URLError("connection refused")
-
-    monkeypatch.setattr(bok.urllib.request, "urlopen", fake_down)
-    assert not bok._relaxed_healthy(8790)
-
-
 def test_relaxed_healthy_tcp_fallback(monkeypatch):
     """无 HTTP 面的端口（3000 web UI 等）退 TCP——连接通即算活。"""
     assert 3000 not in bok._SWEEP_HTTP_PATHS
@@ -219,6 +202,8 @@ def test_sweep_http_paths_derive_from_official_tables():
     assert bok._SWEEP_HTTP_PATHS[1237] == "/v1/models"
     # 表外端口缺席=TCP 语义，不得乱造 HTTP 面。
     assert 3000 not in bok._SWEEP_HTTP_PATHS
+    # B 线 v1 Node worker(:8790) 退役（2026-10-02）——表行删除后不得再留 HTTP 面。
+    assert 8790 not in bok._SWEEP_HTTP_PATHS
 
 
 def test_ports_down_after_grace():

@@ -6,7 +6,7 @@
  * - 桌面（≥md）恒驻：展开 `w-60` / 折叠 `w-[3.5rem]` 图标轨。折叠偏好存
  *   localStorage `bok_sidebar_collapsed`（"1"=折叠）；初渲染恒按展开渲染、
  *   mount 后再读存储——static export 的服务端 HTML 与客户端首帧保持一致，
- *   防水合 mismatch。舞台路由（/calls/new、/interpret、/translate，判定走
+ *   防水合 mismatch。舞台路由（/calls/new、/interpret，判定走
  *   lib/navigation isStageRoute 单一事实源）自动折叠——临时态**不写偏好键**，
  *   离开舞台路由恢复存储偏好；舞台页上的手动切换仅当页临时生效。
  * - 移动（<md）：受控 off-canvas 抽屉 + 常挂半透明遮罩（opacity/pointer-events
@@ -201,7 +201,7 @@ export function Sidebar({
 
   // 换路由清舞台临时态：自动折叠是「进舞台页」的一次性行为，不跨路由续命。
   // 渲染期同步重置（React 官方「props 变化重置派生态」模式）——舞台路由互跳
-  // （/interpret ↔ /translate）不残留上一页手动展开的一帧（effect 版会迟一帧）。
+  // 不残留上一页手动展开的一帧（effect 版会迟一帧）。
   const [prevPathname, setPrevPathname] = useState(pathname);
   if (prevPathname !== pathname) {
     setPrevPathname(pathname);

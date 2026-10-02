@@ -5,7 +5,7 @@
 # job 已删）。新部署勿用。
 # =====================================================================
 # setup-windows.ps1 — one-time environment bootstrap for the no-Docker Windows path.
-# Creates the sidecar venvs + installs the web/realtime deps. Model weights are
+# Creates the sidecar venvs + installs the web deps. Model weights are
 # fetched later by `python tools/bok.py download` (or the desktop first-run guide).
 $ErrorActionPreference = "Stop"
 
@@ -22,11 +22,8 @@ foreach ($name in @("qwen3-asr-sidecar", "qwen3-tts-sidecar")) {
   }
 }
 
-Write-Host "[bok] installing web + realtime-translation deps …"
+Write-Host "[bok] installing web deps …"
 Push-Location (Join-Path $Root "apps\web")
-npm ci
-Pop-Location
-Push-Location (Join-Path $Root "services\realtime-translation")
 npm ci
 Pop-Location
 

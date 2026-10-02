@@ -106,10 +106,10 @@ export const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
 export const FLAT_NAV: NavItem[] = NAV_GROUPS.flatMap((g) => g.items);
 
 /** 不在主导航中但需路由守卫/顶栏标题的页面（深链可达）：
- *  /translate（同传同键）；/templates、/qa（2026-09-20 移出导航——内容整合进 AI 工作站，
- *  工作站与问答画布深链仍落到这两页，守卫键原样保留）。 */
+ *  /templates、/qa（2026-09-20 移出导航——内容整合进 AI 工作站，工作站「意图管理」
+ *  tab 与问答画布深链仍落到这两页，守卫键原样保留）。
+ *  （v1 /translate 页已随 B 线 v1 退役连带删除——2026-10-02，条目不再保留。） */
 export const GUARD_ONLY: NavItem[] = [
-  { href: "/translate", label: "同传", key: "interpret", icon: AudioLines },
   { href: "/templates", label: "话术", key: "templates", icon: FileText },
   { href: "/qa", label: "快答库", key: "qa", icon: MessageCircleQuestion },
 ];
@@ -117,7 +117,7 @@ export const GUARD_ONLY: NavItem[] = [
 /**
  * 舞台路由（沉浸工作面）：进入时桌面侧栏自动收成图标轨——**临时态**，不写
  * `bok_sidebar_collapsed` 用户偏好键（离开舞台路由即恢复存储偏好；舞台页上的
- * 手动切换仅当轮路由生效）。/translate 取自 GUARD_ONLY 单一事实源，本表不重复拼写。
+ * 手动切换仅当轮路由生效）。GUARD_ONLY 深链页整族取自单一事实源，本表不重复拼写。
  */
 export const STAGE_ROUTE_PREFIXES = [
   "/calls/new",

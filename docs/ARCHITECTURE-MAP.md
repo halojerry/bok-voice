@@ -19,7 +19,6 @@ bok.py serve（单点编排：启动顺序/健康/worker env 白名单 _FORWARD_
 ├─ MT LLM             :1236   Hy-MT2 1.8B（B 线专用，缺失自动回退 :1235）
 ├─ settle/judge 专线  :1237   Huihui-9B 4bit ← ⚠️G2 与车道并存的「二号 9B」常驻（judge/settle/意图批量判定）
 ├─ embed              :8789   bge
-├─ b-line worker      :8790   WS（旧同传通道；现役=fwd/rev 双 worker）
 ├─ agent worker       :8081   A 线智能体（livekit-agents job 进程）
 ├─ interp-fwd/rev     :8082/3 B 线双 AgentSession
 ├─ node-agent         :3000   薄节点守护 + 坐席 UI 静态托管
