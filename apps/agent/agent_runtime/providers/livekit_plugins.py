@@ -608,7 +608,8 @@ class MlxLlmLLM(_OpenAICompatBase):
             print(f"[agent] llm warmup skipped: {exc!r}", flush=True)
 
     async def prefix_prewarm(self, messages: list[dict]) -> None:
-        """真实 prompt 形状的 1-token 预热（会话首轮前，agent.py 发起）。
+        """真实 prompt 形状的 1-token 预热（会话首轮前，agent.py 发起；speculator
+        每轮投机预热同走本方法）。
 
         与 _prewarm_impl（只暖模型/连接）不同：这里喂「真实 merged system +
         fake user 轮」，mlx_lm server 会把该前缀的 KV 留喺 prompt cache——
@@ -618,13 +619,34 @@ class MlxLlmLLM(_OpenAICompatBase):
         client 的 read=5s 会提前放弃（实测 APITimeoutError）——per-request
         放宽 read=30s，让服务端把前缀 prefill 跑完入 cache（client 等耐些，
         反正 fire-and-forget 唔阻塞任何人）。
+
+        W-ABORT 接线（2026-10-02 实机验证波）：speculator 的投机预热被 FINAL
+        即断（new_turn cancel）时，客户端断连对 mlx **prefill 期不可见**（十三
+        波刀B 定案）——投机请求残余 prefill（带上一条真实请求的全前缀，miss 时
+        2-3k tok）继续独占单生成线程，真 reply 的 ctx 排其后=秒级「请求到达→
+        prefill 开始」空窗（FLOW20 首 token 超时链的最后一环，settle-llm.log
+        first_progress 8-16s/prompt_window 仅 60ms 的实录形状）。修=带
+        X-Bok-Req-Id，CancelledError 时显式 POST /v1/abort 令 server 立即弃
+        prefill 放槽。正常完成/其他异常不 abort（max_tokens=1 自完）。
         """
-        await self._client.chat.completions.create(
-            model=self._opts.model,
-            messages=messages,
-            max_tokens=1,
-            timeout=httpx.Timeout(connect=5.0, read=30.0, write=5.0, pool=5.0),
-        )
+        req_id = str(uuid.uuid4())
+        try:
+            await self._client.chat.completions.create(
+                model=self._opts.model,
+                messages=messages,
+                max_tokens=1,
+                extra_headers={_MLX_REQ_ID_HEADER: req_id},
+                timeout=httpx.Timeout(connect=5.0, read=30.0, write=5.0, pool=5.0),
+            )
+        except asyncio.CancelledError:
+            if _mlx_abort_on_for(self._bok_abort_base):
+                _fire_mlx_abort(self._bok_abort_base, req_id)
+                print(
+                    f"BOK_PREFILL_SPEC abort-fired (server-side) req={req_id[:8]} "
+                    f"base={self._bok_abort_base}",
+                    flush=True,
+                )
+            raise
 
     # ---- 主回复 deadline + 兜底直念（2026-09-17,治「LLM 卡死整轮哑火」）----
     # 客服口径（用户拍板 3.0s,可再收紧）:等 8s/重试链=这通电话已废。三层:
