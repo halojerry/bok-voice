@@ -2,11 +2,18 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import dynamic from "next/dynamic";
 import { Check } from "lucide-react";
 import { api } from "@/lib/api";
 import { friendlyErrorText } from "@/lib/api-ready";
 import { useAccount } from "@/components/account-context";
-import ListenPanel from "@/components/listen-panel";
+
+// 旁听面板懒加载（2026-10-02 UX 根因修复）：listen-panel 静态引入 livekit（706KB）
+// 打进主管台初始包；旁听是低频动作，面板自带加载/错误态，按需拉 chunk 即可。
+const ListenPanel = dynamic(() => import("@/components/listen-panel"), {
+  ssr: false,
+  loading: () => null,
+});
 
 type CallRow = Record<string, unknown> & { id?: string; call_id?: string; status?: string };
 type TurnRow = Record<string, unknown>;

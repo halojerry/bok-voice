@@ -54,6 +54,15 @@ class BokMarkdownSource:
     """
 
     def __init__(self, base_url: str = "http://127.0.0.1:8771/v1", token: str = ""):
+        # scheme 白名单（2026-10-02 安全分流跟进）：base_url 是操作员 env 配置
+        # （BOK_URL），但 urllib 对 file:// 等非预期 scheme 会照单全收——构造期
+        # 就拒绝，配置错误在启动面炸而不是请求面静默读本地文件。
+        from urllib.parse import urlsplit
+
+        scheme = urlsplit(base_url).scheme.lower()
+        if scheme not in ("http", "https"):
+            raise ValueError(
+                f"BokMarkdownSource base_url 仅支持 http/https，收到 {scheme!r}：{base_url!r}")
         self.base_url = base_url.rstrip("/")
         self.token = token
 

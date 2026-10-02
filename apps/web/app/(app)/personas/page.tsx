@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
+import { useToast } from "@/components/toast";
 import { startRecording, type RecorderHandle } from "@/lib/recorder";
 import { MINIMAX_VOICE_ENTRIES } from "@/lib/minimax-voices";
 import { buildVoiceSelectOptions, previewSampleText, resolvePreviewLang } from "@/lib/voice-options";
@@ -77,6 +78,7 @@ function voiceMapForOneVoice(v: string): Record<string, string> {
 
 export default function PersonasPage() {
   const { accountId } = useAccount();
+  const toast = useToast();
   const [rows, setRows] = useState<Record<string, unknown>[]>([]);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState(EMPTY);
@@ -89,6 +91,11 @@ export default function PersonasPage() {
   const [voiceMap, setVoiceMap] = useState<Record<string, string>>({});
   // 云端单音色（全场同声）选择：与人设主语言解耦，一个人设一把声。
   const [cloudVoice, setCloudVoice] = useState("");
+  // mutation busy 锁（防连点双发）：保存人设 / 删除人设 / 克隆音色 / 删除克隆音色。
+  const [saving, setSaving] = useState(false);
+  const [removingId, setRemovingId] = useState<string | null>(null);
+  const [registering, setRegistering] = useState(false);
+  const [removingVoiceId, setRemovingVoiceId] = useState<string | null>(null);
   const [previewUrl, setPreviewUrl] = useState("");
   // 云端试听语言：默认跟随音色（Cantonese_* 默认粤语），可切到普/英听同一声。
   const [cloudPreviewLang, setCloudPreviewLang] = useState<"zh" | "cantonese" | "en" | "">("");
@@ -184,6 +191,7 @@ export default function PersonasPage() {
   }, [activeLang, clonedVoices, speakers]);
 
   async function save() {
+    if (saving) return;
     // 查重提示(QA B7,2026-09-09):同名同公司已存在 → 确认后仍可保存(不强制阻断)。
     const dup = rows.find(
       (x: Record<string, unknown>) => String(x.name ?? "") === form.name.trim() && String(x.company ?? "") === form.company.trim() && String(x.id) !== editingId,
@@ -198,6 +206,8 @@ export default function PersonasPage() {
     }
     setErr(null);
     setOk(false);
+    const wasEditing = Boolean(editingId);
+    setSaving(true);
     try {
       // 云端引擎：整场固定一个音色（不随客户语言换声）。reference_audio 存三键同值，
       // 兼容 agent 按 {zh,cantonese,en} 读 map 的旧路径；本地 Qwen3 仍存分语言 voiceMap。
@@ -213,19 +223,29 @@ export default function PersonasPage() {
       setRefFile(null);
       clearRecording();
       setOk(true);
+      toast.success(wasEditing ? "已保存修改。" : "已新建人设。");
       await refresh();
     } catch (e) {
       setErr(String(e));
+      toast.error(String(e));
+    } finally {
+      setSaving(false);
     }
   }
 
   async function remove(id: string) {
+    if (removingId) return;
     if (!window.confirm("确认删除该人设？")) return;
+    setRemovingId(id);
     try {
       await api.deletePersona(id);
       await refresh();
+      toast.success("已删除人设。");
     } catch (e) {
       setErr(String(e));
+      toast.error(String(e));
+    } finally {
+      setRemovingId(null);
     }
   }
 
@@ -297,6 +317,7 @@ export default function PersonasPage() {
   }
 
   async function registerVoice() {
+    if (registering) return;
     if (!refFile) {
       setErr("请先上传参考音频，或点「录音」说一段话作为克隆素材。");
       return;
@@ -307,6 +328,7 @@ export default function PersonasPage() {
     }
     setErr(null);
     setOk(false);
+    setRegistering(true);
     try {
       const body = new FormData();
       body.append("file", refFile);
@@ -322,8 +344,12 @@ export default function PersonasPage() {
       );
       clearRecording();
       setOk(true);
+      toast.success("音色已克隆并保存。");
     } catch (e) {
       setErr(String(e));
+      toast.error(String(e));
+    } finally {
+      setRegistering(false);
     }
   }
 
@@ -394,7 +420,13 @@ export default function PersonasPage() {
                     </div>
                     <div className="flex shrink-0 gap-2">
                       <button className="btn-ghost text-xs" onClick={() => edit(row)}>编辑</button>
-                      <button className="btn-ghost text-xs text-red-600" onClick={() => remove(id)}>删除</button>
+                      <button
+                        className="btn-ghost text-xs text-red-600"
+                        onClick={() => remove(id)}
+                        disabled={removingId === id}
+                      >
+                        {removingId === id ? "删除中…" : "删除"}
+                      </button>
                     </div>
                   </div>
                 );
@@ -578,7 +610,9 @@ export default function PersonasPage() {
               克隆出来的音色会讲什么语言/口音，由你录的参考音频决定：想让 AI 讲<b className="text-(--foreground)">粤语</b>，就对着麦用粤语说一段参考语料（如上方的粤语示例）；用普通话参考音频克隆出的音色，读粤语文字也会带普通话音。克隆会存为独立音色，可随时回来试听。
             </p>
             <div className="flex gap-2">
-              <button className="btn-ghost w-full" onClick={registerVoice} disabled={recording}>克隆并保存音色</button>
+              <button className="btn-ghost w-full" onClick={registerVoice} disabled={recording || registering}>
+                {registering ? "克隆中…" : "克隆并保存音色"}
+              </button>
               <button className="btn-ghost w-full" onClick={previewVoice}>试听已选音色</button>
             </div>
             {previewUrl && <audio controls autoPlay src={previewUrl} className="mt-2 w-full" />}
@@ -620,9 +654,12 @@ export default function PersonasPage() {
                         </button>
                         <button
                           className="text-red-600 hover:text-red-700"
+                          disabled={removingVoiceId === cv.id}
                           onClick={async () => {
+                            if (removingVoiceId) return;
                             if (!window.confirm(`确认删除克隆音色「${cv.id}」？\n已绑定该音色的人设会自动改为不绑定。`)) return;
                             setErr(null);
+                            setRemovingVoiceId(cv.id);
                             try {
                               await api.deleteTtsVoice(cv.id);
                               setClonedVoices((prev) => prev.filter((v) => v.id !== cv.id));
@@ -631,12 +668,16 @@ export default function PersonasPage() {
                                 for (const k of Object.keys(next)) if (next[k] === cv.id) delete next[k];
                                 return next;
                               });
+                              toast.success("已删除克隆音色。");
                             } catch (e) {
                               setErr(`删除失败：${String(e)}`);
+                              toast.error(String(e));
+                            } finally {
+                              setRemovingVoiceId(null);
                             }
                           }}
                         >
-                          删除
+                          {removingVoiceId === cv.id ? "删除中…" : "删除"}
                         </button>
                       </div>
                     </li>
@@ -647,8 +688,8 @@ export default function PersonasPage() {
               </>
             )}
           </div>
-          <button className="btn-primary w-full" onClick={save}>
-            {editingId ? "保存修改" : "新建人设"}
+          <button className="btn-primary w-full" onClick={save} disabled={saving}>
+            {saving ? "保存中…" : editingId ? "保存修改" : "新建人设"}
           </button>
           {ok && <p className="text-sm text-emerald-600">已保存。</p>}
         </section>

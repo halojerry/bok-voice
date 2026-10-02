@@ -4,8 +4,9 @@
 // 纯函数助手）已原样提取到 components/template-editor.tsx 供 /studio 工作台共用。
 // 提取前后渲染输出逐字一致（字段、默认值、占位文案不动）。
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { api, type UserRow } from "@/lib/api";
+import { useTemplatesList } from "@/lib/swr";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
 import { useSession } from "@/components/session-context";
@@ -16,10 +17,16 @@ import TemplateEditor, {
 
 export default function TemplatesPage() {
   const { accountId } = useAccount();
-  const [rows, setRows] = useState<Record<string, unknown>[]>([]);
+  // 数据层（2026-10-02）：模板列表走 SWR 共享缓存（key=["templates",accountId]）——
+  // 与 /studio 列表同缓存，跨页导航秒开不重拉；保存/删除后 mutate 重验。
+  const { data: tplData, isLoading: loading, error: tplErr, mutate: mutateTemplates } =
+    useTemplatesList(accountId);
+  const rows = tplData ?? [];
+  const fetchErr = tplErr ? String(tplErr) : null;
   const [editingRow, setEditingRow] = useState<Record<string, unknown> | null>(null);
+  // 编辑器未保存状态（onDirtyChange 上抛）：切行/取消编辑前做丢失确认。
+  const [editorDirty, setEditorDirty] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
   // B4：归属徽标与编辑权——话务员（user）只能改自己的条目，共享/他人只读（服务端 403 兜底）。
   const session = useSession();
   const [userNames, setUserNames] = useState<Record<string, string>>({});
@@ -28,22 +35,24 @@ export default function TemplatesPage() {
     session && (session.anonymous || session.role === "admin" || session.role === "root"),
   );
 
-  async function refresh() {
-    setLoading(true);
-    try {
-      const data = await api.listTemplates(accountId);
-      setRows(Array.isArray(data) ? data : []);
-      setErr(null);
-    } catch (e) {
-      setErr(String(e));
-    } finally {
-      setLoading(false);
-    }
-  }
+  const refresh = useCallback(async () => {
+    const next = await mutateTemplates().catch(() => undefined);
+    // 编辑行快照回填（2026-10-02 交互逻辑）：重拉后用最新行数据替换选中时的陈旧快照——
+    // 编辑器只跟 tplId 重锚（同 id 换对象不覆写正在编辑的表单），但保存 payload 应以
+    // 最新行为准（修复「保存后仍拿旧名称/旧字段覆盖」的陈旧快照源头）。
+    setEditingRow((prev) => {
+      if (!prev) return prev;
+      const id = String(prev.id ?? "");
+      const latest = (next ?? []).find((r) => String(r.id ?? "") === id);
+      return latest ?? prev;
+    });
+  }, [mutateTemplates]);
 
-  useEffect(() => {
-    refresh();
-  }, [accountId]);
+  /** 丢弃未保存修改的确认（切行/取消编辑共用）。返回 true=可以切走。 */
+  const confirmDiscardEdits = useCallback(() => {
+    if (!editorDirty) return true;
+    return window.confirm("当前编辑未保存，切换会丢失。仍要切换？");
+  }, [editorDirty]);
 
   // 主管面：拉成员表把归属 user_id 显示成姓名（话务员无权访问 /api/users，不请求）。
   useEffect(() => {
@@ -125,7 +134,7 @@ export default function TemplatesPage() {
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_440px]">
         <section className="card">
-          {err && <ErrorState message={err} />}
+          {(err || fetchErr) && <ErrorState message={err || fetchErr} />}
           {loading ? (
             <LoadingState />
           ) : rows.length === 0 ? (
@@ -175,7 +184,12 @@ export default function TemplatesPage() {
                           className="btn-ghost text-xs"
                           disabled={!canEdit}
                           title={canEdit ? undefined : "共享话术由主管维护"}
-                          onClick={() => setEditingRow(row)}
+                          onClick={() => {
+                            const nextId = String(row.id ?? "");
+                            // 换目标行且编辑器有未保存修改 → 先确认（同 id 点开不重锚表单，无需拦）。
+                            if (nextId !== String(editingTpl?.id ?? "") && !confirmDiscardEdits()) return;
+                            setEditingRow(row);
+                          }}
                         >
                           编辑
                         </button>
@@ -227,12 +241,17 @@ export default function TemplatesPage() {
             话务员新建归属本人 → 切回「全部」保证刚保存的条目可见）。 */}
         <TemplateEditor
           tpl={editingTpl}
+          onDirtyChange={setEditorDirty}
           onSaved={() => {
             setEditingRow(null);
             if (!isManager) setScopeTab("all");
             void refresh();
           }}
-          onCancel={() => setEditingRow(null)}
+          onCancel={() => {
+            // 取消编辑=丢弃草稿：有未保存修改时先确认（取消则留在编辑态）。
+            if (!confirmDiscardEdits()) return;
+            setEditingRow(null);
+          }}
         />
       </div>
     </div>
