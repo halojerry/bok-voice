@@ -5223,7 +5223,13 @@ def qa_cluster_ep(req: QaClusterRequest, request: Request, account_id: str = "ac
     if req.apply and has_selection and not qa_cluster_mod.has_fresh_plan(account_id, min_calls, limit):
         raise HTTPException(status_code=409, detail="聚类计划已过期或参数不符，请重新生成计划后再采纳")
     try:
-        plan = qa_cluster_mod.run_cluster(_repo(), account_id, min_calls=min_calls, limit=limit)
+        # fresh_only(2026-10-02 TOCTOU 二道闸):带选择时取计划只吃缓存不重算——
+        # 一道闸与本行之间缓存被并发作废(apply 成功/闲时采纳都清账号键)的话,
+        # 缺席=PlanStale→409,绝不把前端旧下标静默对到重算的新计划上。
+        plan = qa_cluster_mod.run_cluster(
+            _repo(), account_id, min_calls=min_calls, limit=limit,
+            fresh_only=bool(req.apply and has_selection),
+        )
         if not req.apply:
             return plan
         return qa_cluster_mod.apply_cluster(
@@ -5231,6 +5237,8 @@ def qa_cluster_ep(req: QaClusterRequest, request: Request, account_id: str = "ac
         )
     except qa_cluster_mod.AlreadyRunning as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except qa_cluster_mod.PlanStaleError as exc:
+        raise HTTPException(status_code=409, detail="聚类计划已失效，请重新生成计划后再采纳") from exc
     except qa_cluster_mod.ClusterError as exc:
         raise HTTPException(status_code=503, detail=f"聚类 LLM 不可用: {exc}") from exc
 

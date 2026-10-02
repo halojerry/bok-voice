@@ -28,7 +28,7 @@ _NEW_WORDS = {
 def test_new_words_in_context_all_langs():
     for lang, words in _NEW_WORDS.items():
         ctx = asr_hotword_context(lang, None)
-        assert ctx.startswith("Vocabulary: ")
+        assert not ctx.startswith("Vocabulary")  # 标签已砍(2026-09-27 A/B)
         for w in words:
             assert w in ctx, (lang, w, ctx)
 
@@ -38,14 +38,15 @@ def test_cap_raised_to_200_and_full_tables_fit():
     assert _ASR_HOTWORD_MAX_CHARS == 200
     for lang in ("cantonese", "zh", "en"):
         ctx = asr_hotword_context(lang, None)
-        assert ctx == "Vocabulary: " + ", ".join(_ASR_HOTWORDS[lang]), (lang, ctx)
+        assert ctx == ", ".join(_ASR_HOTWORDS[lang]), (lang, ctx)
         assert len(ctx) <= 200
 
 
 def test_industry_words_survive_template_inflation():
     """行业段保底截断:模板热词吃满预算也不得挤掉行业表(旧逐词截断会把
     「官網」类表尾词整段丢掉=运营改表不生效)。模板词仍先入列,超预算者让位。"""
-    # 6 个 16 字模板词:总长 221 字 > cap 200,旧逻辑下行业表尾被截。
+    # 6 个 16 字模板词:总长超 cap,旧逻辑下行业表尾被截。标签砍除后预算
+    # 多出 12 字符=第 5 个模板词也装得进(良性变化,截断位随预算走)。
     template_words = [f"超長測試模板熱詞佔位演示第{c}號位" for c in "甲乙丙丁戊己"]
     ctx = asr_hotword_context("cantonese", None, extra_hotwords=", ".join(template_words))
     assert len(ctx) <= _ASR_HOTWORD_MAX_CHARS, ctx
@@ -54,10 +55,10 @@ def test_industry_words_survive_template_inflation():
     # 模板词先入列(位次契约不变),超预算的让位
     assert template_words[0] in ctx, ctx
     assert ctx.index(template_words[0]) < ctx.index("單號"), ctx
-    assert template_words[4] not in ctx and template_words[5] not in ctx, ctx
+    assert template_words[5] not in ctx, ctx  # 6 词必有一个让位(总长仍超 cap)
     # 整词粒度:每个 token 都是已知词,唔截半词
     known = set(_ASR_HOTWORDS["cantonese"]) | set(template_words)
-    for tok in ctx[len("Vocabulary: "):].split(", "):
+    for tok in ctx.split(", "):
         assert tok in known, tok
 
 
@@ -65,9 +66,8 @@ def test_fallback_plain_truncation_when_industry_alone_over_cap(monkeypatch):
     """行业表自身超限 → 退回整体贪心(既有行为:模板→行业→对象原序,尾部让位)。"""
     monkeypatch.setattr(ag, "_ASR_HOTWORD_MAX_CHARS", 30)
     ctx = asr_hotword_context("cantonese", None, extra_hotwords="順豐速運")
-    assert ctx.startswith("Vocabulary: ")
     assert len(ctx) <= 30
-    for tok in ctx[len("Vocabulary: "):].split(", "):
+    for tok in ctx.split(", "):
         assert tok in ("順豐速運", "單號", "運單", "賠償", "運費", "專員", "集運", "時效", "上門", "追蹤"), tok
 
 

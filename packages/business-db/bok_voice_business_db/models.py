@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, func
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -58,6 +58,14 @@ class ObjectProfile(Base):
     contact_channel: Mapped[str] = mapped_column(String(32), default="")
     # 对象级滚动摘要（蒸馏沉淀,settle 时并入;分析/回访视角一屏可见）
     digest: Mapped[str] = mapped_column(Text, default="")
+    # 发音词典（2026-09-27）：多行 `原词/读法`，装配时下发 MiniMax
+    # pronunciation_dict 让人名/专名读准（读法=拼音/IPA/粤拼/纯文本替换）。
+    # 空串=默认读音，运行时完全不下发键；≤500 字由仓储层截断。
+    # nullable+server_default：与 deps `_ensure_column` 的 `TEXT DEFAULT ''`
+    # 逐字对齐——否则 create_all(全新 PG)产 NOT NULL、_ensure_column(存量库)
+    # 产 DEFAULT ''，两条迁移路径 DDL 漂移会打红 schema 漂移门禁（2026-09-27
+    # check_schema_drift 实证）。
+    pronunciation: Mapped[str] = mapped_column(Text, nullable=True, server_default="")
     template_id: Mapped[str] = mapped_column(String(64), default="")
     status: Mapped[str] = mapped_column(String(32), default="active")
 
@@ -186,6 +194,37 @@ class IntentRule(Base):
     priority: Mapped[int] = mapped_column(Integer, default=10, server_default="10")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class HotwordEntry(Base):
+    """ASR 热词沉淀（EX-H1，2026-09-28）：真实通话转写挖出的词 / 被 ASR 听错的词 /
+    要求重复用语，采纳后喂 ASR biasing（GET /api/asr/hotwords → agent 消费）。
+
+    两级作用域（逐字镜像 IntentRule）：account_id ''=全局行（admin/root 写）、
+    账号行=该账号话务员写；读=两级行合并（``account_id IN ('', acct)``）。
+    UNIQUE(account_id, lang, word) 是 upsert 单键（采纳路径 bump freq/last_seen、
+    set enabled=1）。lang 三态 zh/cantonese/en（cantonese 为规范拼写，见
+    tests/test_cantonese_terminology.py）。source='mined'（聚类采纳）|'manual'。
+    数字串/数字主导词一律不进（repo 铁律，抽取与出仓两侧同滤）。
+    """
+
+    __tablename__ = "hotword_entries"
+    __table_args__ = (
+        UniqueConstraint("account_id", "lang", "word", name="uq_hotword_account_lang_word"),
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=uuid_hex)
+    # ''=全局行 admin 写、账号行话务员写、读=两级行合并（镜像 IntentRule.account_id）。
+    account_id: Mapped[str] = mapped_column(String(64), index=True, default="")
+    lang: Mapped[str] = mapped_column(String(16), default="zh")
+    word: Mapped[str] = mapped_column(Text, default="")
+    source: Mapped[str] = mapped_column(String(16), default="mined")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # 证据出现次数（采纳时 bump 到 max(旧, 新)，单调不缩水）。
+    freq: Mapped[int] = mapped_column(Integer, default=0)
+    first_seen: Mapped[str] = mapped_column(String(32), default="")
+    last_seen: Mapped[str] = mapped_column(String(32), default="")
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    created_by: Mapped[str] = mapped_column(String(64), default="")
 
 
 class RosterEntry(Base):

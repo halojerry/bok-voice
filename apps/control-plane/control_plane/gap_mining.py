@@ -44,10 +44,12 @@ gen 是唯一权威快路判定源(_turn_origin consume-once 账本,:3015 默认
   分析账本三列 2026-09-10 起才有,旧行 speaker 为空不计(报告偏保守,不误归因);
 - **回复轮**=AI 轮再排除 gen ∈ NON_REPLY_GENS(垫话/打断账本残行)——垫话每通
   最多 BOK_FILLER_MAX(3-6)行,若进分母会把覆盖率实质拉低 10-30%;
-  coverage.turns=回复轮数,fastpath(gen ∈ FASTPATH_GENS)+llm(gen=="llm")
-  为其两个子集;gen 为空/未知(旧数据、未来新值)留在分母、不归两边(by_gen
-  可见),让比率偏保守而不误归因;
-- gaps=gen=="llm" 的回复轮,取同通内**前一条**客户轮(role=="user" 且
+  **内容回复轮**=回复轮再排除 provider ∈ DEGRADATION_PROVIDERS(降级/兜底行);
+  coverage.turns=内容回复轮数,fastpath(gen ∈ FASTPATH_GENS)+llm(gen=="llm")
+  为其两个子集,degraded=降级行数为第三桶(**不进内容分母**);gen 为空/未知
+  (旧数据、未来新值)留在分母、不归两边(by_gen 可见),让比率偏保守而不误归因;
+  by_gen/by_provider 仍覆盖全部回复轮(含降级行),来源细分向后兼容;
+- gaps=gen=="llm" 的回复轮(口径未动),取同通内**前一条**客户轮(role=="user" 且
   speaker=="customer")transcript 作候选;一条客户轮只配一条 LLM 回复
   (消费后即清,防一路客户话配多条回复重复计数);
 - 候选排除:归一后 <3 字、纯数字/数字主导、应承语族、测试对象通话
@@ -92,6 +94,26 @@ LLM_GENS = frozenset({GEN_LLM})
 # AI 侧非回复账本行:不进驾驶舱分母(见模块 docstring「回复轮」段)。
 NON_REPLY_GENS = frozenset({GEN_FILLER, GEN_INTERRUPTED})
 
+# 降级/兜底 provider(2026-09-27):这些行的文本是兜底话而非内容回复——ack 行
+# gen=script,旧 is_fastpath_gen 把它们算进快路分子/分母,报出的 0.544 实为
+# 「含 497 行兜底」的虚高(真内容快路比例 0.411)。单列 degraded 桶、不进内容
+# 分母。branch-notify=通知人工的副作用行(gen=llm),同属噪声。
+DEGRADATION_PROVIDERS = frozenset(
+    {
+        "watchdog-ack",
+        "starve-ack",
+        "storm-ack",
+        "defer-ack",
+        "late-answer",
+        "stall-degrade",
+        "stall-bypass",
+        "stall-close",
+        "pause-ack",
+        "fallback-ack",
+        "branch-notify",
+    }
+)
+
 # ---- 候选文本排除判定(纯函数) ----
 
 # 归一后最小长度:「嗯/好/係」类单双字应承一并拦在长度门。
@@ -133,6 +155,11 @@ def is_llm_gen(gen: str) -> bool:
 def is_reply_gen(gen: str) -> bool:
     """回复轮=非垫话/打断账本行。gen 空串(旧数据)按回复计(保守留分母)。"""
     return str(gen or "") not in NON_REPLY_GENS
+
+
+def is_degraded_provider(provider: str) -> bool:
+    """降级/兜底行判定(provider 维度);这些行不是内容回复(见常量注释)。"""
+    return str(provider or "") in DEGRADATION_PROVIDERS
 
 
 def candidate_norm(text: str) -> str:
@@ -180,20 +207,28 @@ def _turn_text(turn) -> str:
 def compute_coverage(rows: list[dict]) -> dict:
     """AI 回复轮行 [{"gen","provider"}] → coverage 段。
 
-    分母=回复轮(gen 不在 NON_REPLY_GENS);fastpath_ratio 分母为 0 → 0.0。
-    by_gen/by_provider 只统计回复轮(垫话/打断行不是回复,不进细分)。
+    分母=**内容回复轮**(gen 不在 NON_REPLY_GENS 且 provider 不在
+    DEGRADATION_PROVIDERS),fastpath_ratio 只在此内容集上算;降级/兜底行
+    (*-ack/late-answer/stall-*/branch-notify)单列 degraded 桶、不进分母——
+    旧口径把它们算进快路,比例虚高(0.544 vs 真 0.411)。by_gen/by_provider
+    仍覆盖全部回复轮(含降级行),来源细分向后兼容。分母为 0 → 0.0。
     """
     replies = [r for r in rows or [] if is_reply_gen(str(r.get("gen") or ""))]
-    total = len(replies)
-    fast = sum(1 for r in replies if is_fastpath_gen(str(r.get("gen") or "")))
-    llm = sum(1 for r in replies if is_llm_gen(str(r.get("gen") or "")))
+    total_replies = len(replies)
+    content = [r for r in replies if not is_degraded_provider(str(r.get("provider") or ""))]
+    degraded = total_replies - len(content)
+    total = len(content)
+    fast = sum(1 for r in content if is_fastpath_gen(str(r.get("gen") or "")))
+    llm = sum(1 for r in content if is_llm_gen(str(r.get("gen") or "")))
     by_gen = Counter(str(r.get("gen") or "") for r in replies)
     by_provider = Counter(str(r.get("provider") or "") for r in replies if str(r.get("provider") or ""))
     return {
         "turns": total,
         "fastpath": fast,
         "llm": llm,
+        "degraded": degraded,
         "fastpath_ratio": round(fast / total, 4) if total else 0.0,
+        "degraded_ratio": round(degraded / total_replies, 4) if total_replies else 0.0,
         "by_gen": dict(by_gen),
         "by_provider": dict(by_provider),
     }

@@ -51,7 +51,8 @@ def test_tail_renders_facts_and_last_reply_anchor():
     st.set_last_reply("收到，尾号係七八九零，啱唔啱？")
     tail = st.render_context_tail()
     assert "【通话中客户已讲" in tail and "拼多多" in tail
-    assert "【你上一句】" in tail and "七八九零" in tail
+    # F5 锚头由 12 字收窄到 8 字（尾部 token 组分）——断言只钉标签+锚头数字。
+    assert "【你上一句】" in tail and "七八" in tail
     # 指令文本已上移稳定前缀【重复控制】(S5 尾部瘦身),尾部只留引文
     assert "绝不原句或近原句再讲一次" in st.render_instruction_prefix()
     assert "绝不原句或近原句再讲一次" not in tail
@@ -113,7 +114,8 @@ def test_tail_slim_compact_when_revision_unchanged():
     st.record_applied_tail("u1", "u1\n\n" + st.render_context_tail())  # 首轮全量冻结
     slim = st.render_context_tail()
     assert "·继续】" in slim and "状态无实质变化" in slim
-    assert "【你上一句】「好的，我帮你查下。」" in slim
+    # F5 锚头 8 字 → 9 字的句子带省略号；断言改为前缀匹配（标签+锚头开头）。
+    assert "【你上一句】「好的，我帮你查下" in slim
     # 紧凑尾不含全量【现在这一步】块(全量指引在上轮冻结尾部里可见)
     assert "【现在这一步】" not in slim
 
