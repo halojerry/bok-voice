@@ -20,7 +20,6 @@
 | `services/qwen3-asr-sidecar/` | ASR HTTP sidecar :8787（`app.py`：start/chunk/finish、partial 滑窗 + 增量 finish） | both |
 | `services/qwen3-tts-sidecar/` | TTS HTTP sidecar :8788（`app.py`：克隆音色/流式；本地回退档） | both |
 | `services/llm-mlx/` | 仅 `.venv`（mlx_lm 0.31.3）；server 启动命令在 bok.py，无仓库代码 | dev |
-| `services/realtime-translation/` | B 线 v1 同传 :8790（Node，冻结留 POC） | both(旧) |
 | `services/livekit-server/` | `livekit.yaml`（self-host 配置，钉端口/prometheus/json 日志） | both |
 | `desktop/` | Tauri 桌壳 + runtime 装配（src-tauri Rust / runtime symlink；前端经 `apps/web/lib/tauri.ts` 直连 invoke，`desktop/src/` 前端桥已删） | packaged |
 | `tests/` | pytest 全量（含 `fixtures/audio/{zh,cantonese,en}.wav` E2E 音频 + 术语门禁 + `test_prod_windows.py` Windows prod 生命周期/安装器单测 + qa-canvas Phase 1 四件：`test_qa_cluster_field.py` 簇列数据层/级联、`test_pregen_qa_status.py` pregen --qa-status、`test_qa_canned_status.py` CP 罐头状态/试听/补料端点、`test_import_xkt_qa.py` 惜客通导入器纯函数） | dev/CI |
@@ -74,7 +73,6 @@
 | 生产常驻（launchd） | `bok.py prod install` / `prod status` |
 | A 线通话 | 前端 /calls → LiveKit :7880 → agent worker（每通语言固定） |
 | B 线同传 v2 | 前端 /interpret → LiveKit :7880 → interp worker ×2（:1236 MT + MiniMax） |
-| B 线同传 v1(冻结) | 前端 /translate → ws://127.0.0.1:8790 |
 
 ## apps/control-plane（control_plane）
 
@@ -116,7 +114,6 @@
 ```text
 runtime/python/                独立 CPython（依赖 requirements-runtime-<平台>.txt；2026-09-17 迁出 desktop/）
 runtime/llama/                 Windows llama-server.exe + cudart DLL
-runtime/bline-node_modules/    B-line worker 依赖
 ```
 
 ## 已清理的遗留

@@ -5,7 +5,7 @@ Subcommands:
   catalog    List per-platform models + sizes.
   download   Download missing models into the app-data dir (resume + progress).
   status     Summarize service health + model readiness.
-  up         Ensure models + runtimes, then start ASR/TTS/LLM/B-line.
+  up         Ensure models + runtimes, then start ASR/TTS/LLM.
   serve      Full desktop stack: control-plane + LiveKit + up + agent worker.
   down       Stop services started by bokctl (pidfiles).
   doctor     Preflight diagnostics (structure/deps/hardware; strict when packaged).
@@ -606,24 +606,6 @@ def bundled_node() -> str | None:
     return None
 
 
-def bundled_node_modules() -> Path | None:
-    for c in (runtime_root() / "bline-node_modules", ROOT / "services" / "realtime-translation" / "node_modules"):
-        if c.exists():
-            return c
-    return None
-
-
-def node() -> str:
-    return bundled_node() or "node"
-
-
-def node_env() -> dict[str, str]:
-    mods = bundled_node_modules()
-    if mods:
-        return {"NODE_PATH": str(mods)}
-    return {}
-
-
 def bundled_llama() -> Path | None:
     """打包内嵌 llama-server：Windows=llama-server.exe；Linux=llama-server
     （2026-09-20 Ubuntu 节点：runtime/llama/ 或 runtime/llama/linux/ 放置；
@@ -736,7 +718,6 @@ CORE_PORTS: tuple[tuple[str, int], ...] = (
     ("settle-llm", 1237),
     ("embed", 8789),
     ("laya", 8791),
-    ("b-line", 8790),
     ("livekit", 7880),
 )
 WORKER_PORTS: tuple[tuple[str, int], ...] = (
@@ -750,7 +731,6 @@ PROD_HTTP_CHECKS: tuple[tuple[str, int, str], ...] = (
     ("asr", 8787, "/health"),
     ("tts", 8788, "/health"),
     ("llm", 1235, "/v1/models"),
-    ("b-line", 8790, "/health"),
     ("livekit", 7880, "/"),
 )
 
@@ -890,7 +870,7 @@ def _relaxed_healthy(port: int, timeout_s: float = 5.0) -> bool:
                 pass
             return True
         except urllib.error.HTTPError:
-            return True  # 有 HTTP 应答=活（b-line :8790 无明文 /health 恒 426 同款）
+            return True  # 有 HTTP 应答=活（WS worker 非 upgrade 请求恒 426 同款语义）
         except Exception:  # noqa: BLE001 - 探针只判定，不抛
             return False
     try:
@@ -964,7 +944,7 @@ def cmd_manifest() -> int:
     data: dict = {
         "platform": key,
         "app_data_dir": str(app_data_dir()),
-        "ports": {"control_plane": 8000, "web": 3000, "asr": 8787, "tts": 8788, "llm": 1235, "mt_llm": 1236, "b_line": 8790, "livekit": 7880},
+        "ports": {"control_plane": 8000, "web": 3000, "asr": 8787, "tts": 8788, "llm": 1235, "mt_llm": 1236, "livekit": 7880},
         "models": {},
     }
     for name, repo in MODELS[key].items():
@@ -1212,35 +1192,6 @@ def _stop_pidfile(pidfile: Path) -> None:
             os.kill(pid, signal.SIGTERM)
     except Exception:
         pass
-
-
-def _bline_config_path() -> Path:
-    return app_data_dir() / "bline.json"
-
-
-def write_bline_config(current: dict[str, str] | None = None) -> Path:
-    """Write a fully-resolved B-line config into app-data (bundle stays read-only)."""
-    if current is None:
-        current = MODELS["mac"] if is_mac() else MODELS["windows"]
-    cfg = {
-        "asr": {"provider": "qwen3_asr", "base_url": "http://127.0.0.1:8787", "sample_rate": 16000},
-        "translator": {
-            "provider": "local_openai",
-            "base_url": "http://127.0.0.1:1235/v1",
-            # mlx_lm server 要求请求里的 model 是真实模型路径，不能用 "local"。
-            "model": model_path({**current, "llm": resolve_llm_repo(current)}, "llm"),
-        },
-        "tts": {"provider": "qwen3_tts", "base_url": "http://127.0.0.1:8788", "sample_rate": 24000},
-        "server": {
-            "host": "127.0.0.1",
-            "port": 8790,
-            "metrics_file": str(app_data_dir() / "translation-metrics.jsonl"),
-        },
-    }
-    p = _bline_config_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
-    return p
 
 
 def _certifi_bundle(py: Path | None = None) -> str:
@@ -1903,19 +1854,12 @@ def _cmd_up_services() -> int:
     # fail-open=缺 sidecar 走原 9B judge 回落链,行为零退化)。
     want_laya = _start_laya(current, run_dir, log_dir)
 
-    # B-line worker (Node, OpenAI-compatible translator on :1235).
-    bline_cfg = write_bline_config(current)
-    if not healthy(8790):
-        _start_proc(
-            [node(), str(ROOT / "services" / "realtime-translation" / "server.mjs")],
-            run_dir / "bline.pid", log_dir / "bline.log",
-            env={**node_env(), "BOK_BLINE_CONFIG": str(bline_cfg)},
-        )
+    # B-line v1 Node worker (:8790) 已退役（2026-10-02，B 线 v2 双 Python worker 为唯一翻译链）。
 
     print("[bok] waiting for services…")
-    # mt(:1236)/settle(:1237)/embed(:8789)/laya(:8791)仅在确实拉起时纳入等待;主栈四端口照旧。
+    # mt(:1236)/settle(:1237)/embed(:8789)/laya(:8791)仅在确实拉起时纳入等待;主栈端口照旧。
     # :8788 同理（2026-09-27 全云端门控）——跳过时不等待也不进重启兜底。
-    core_ports = (8787, 8790, 1235) + ((8788,) if tts_needed else ())
+    core_ports = (8787, 1235) + ((8788,) if tts_needed else ())
     tts_ready = "tts=8788" if tts_needed else "tts=skipped(cloud-only)"
     targets = (
         core_ports
@@ -1927,7 +1871,7 @@ def _cmd_up_services() -> int:
     mt_ready_suffix = " mt=1236" if want_mt else ""
     for _ in range(180):
         if all(healthy(p) for p in targets):
-            print(f"[bok] ready: asr=8787 {tts_ready} llm=1235 b-line=8790{mt_ready_suffix}")
+            print(f"[bok] ready: asr=8787 {tts_ready} llm=1235{mt_ready_suffix}")
             return 0
         time.sleep(1)
     # TTS 首启偶发卡死在 MLX 模型加载/暖机（观察：与 LLM/ASR 同启时概率出现，
@@ -1954,7 +1898,7 @@ def _cmd_up_services() -> int:
                 break
             time.sleep(1)
     if all(healthy(p) for p in targets):
-        print(f"[bok] ready (after tts restart): asr=8787 {tts_ready} llm=1235 b-line=8790{mt_ready_suffix}")
+        print(f"[bok] ready (after tts restart): asr=8787 {tts_ready} llm=1235{mt_ready_suffix}")
         return 0
     if want_mt and all(healthy(p) for p in core_ports) and not healthy(1236):
         # MT 是可选增强:主栈齐而独缺 mt 不拖垮整栈(B 线 interpret 回退主 LLM)。
@@ -1966,7 +1910,7 @@ def _cmd_up_services() -> int:
     # serve 的孤儿清扫当孤儿杀（互杀循环根因），能不退就不退。
     still_down = _ports_down_after_grace(targets)
     if not still_down:
-        print(f"[bok] ready (relaxed recheck): asr=8787 tts=8788 llm=1235 b-line=8790{mt_ready_suffix}")
+        print(f"[bok] ready (relaxed recheck): asr=8787 tts=8788 llm=1235{mt_ready_suffix}")
         return 0
     if _only_optional_ports(still_down):
         # 可选线豁免与上方 1s 档的 MT 语义对齐:宽松终检只剩可选缺口也放行
@@ -2261,6 +2205,9 @@ _FORWARD_ENV = (
     # —— ASR（agent 侧读的运维档；sidecar 专属键走 asr_env 另注入） ——
     "BOK_ASR_HOTWORDS",
     "BOK_ASR_PARTIAL_SLOW_MS",
+    # B 线正压臂波(2026-10-02):ASR 帧级调试观测(掉帧/水位打点)——
+    # 运维键,prod 不透传=死门(test_forward_env 钉)。
+    "BOK_ASR_FRAME_DEBUG",
     # 开采热词(第四来源,2026-09-28):agent 装配期 GET /api/asr/hotwords 一次;
     # 默认 "1"(端点缺席 fail-open 空串),="0" 跳过零 HTTP 调用。
     "BOK_MINED_HOTWORDS",
@@ -2391,6 +2338,8 @@ _FORWARD_ENV = (
     "BOK_REASK_LOW_RATIO",
     "BOK_REASK_MIN_CONTENT_CHARS",
     "BOK_REASK_MAX_CONSEC",
+    # —— B 线第一性原理波（2026-10-02）：装配期 MT 探活 kill-switch（缺省开） ——
+    "BOK_INTERP_MT_PROBE",
 )
 # 历史名（2026-09-18 终审 I1 起的既有调用面/单测锚）：表本体唯一，别名防散。
 _BOK_PASSTHROUGH_KEYS = _FORWARD_ENV
@@ -2909,7 +2858,7 @@ def cmd_serve() -> int:
 
     print("[bok] waiting for desktop stack…")
     desktop_tts_needed = _local_tts_needed()[0]
-    targets = [8000, 8787, 8790, 1235, 7880, 8081, 8082, 8083]
+    targets = [8000, 8787, 1235, 7880, 8081, 8082, 8083]
     if desktop_tts_needed:
         targets.insert(2, 8788)
     if _realtime_demo_enabled():
@@ -2923,7 +2872,7 @@ def cmd_serve() -> int:
     for _ in range(120):
         if all(healthy(p) for p in targets):
             _desktop_tts = "tts=8788" if desktop_tts_needed else "tts=skipped(cloud-only)"
-            ready = f"[bok] desktop ready: control-plane=8000 asr=8787 {_desktop_tts} llm=1235 b-line=8790"
+            ready = f"[bok] desktop ready: control-plane=8000 asr=8787 {_desktop_tts} llm=1235"
             if 1236 in targets:
                 ready += " mt=1236"
             print(ready)
@@ -2942,7 +2891,7 @@ def cmd_serve() -> int:
     still_down = _ports_down_after_grace(targets)
     if not still_down:
         _desktop_tts2 = "tts=8788" if desktop_tts_needed else "tts=skipped(cloud-only)"
-        print(f"[bok] desktop ready (relaxed recheck): control-plane=8000 asr=8787 {_desktop_tts2} llm=1235 b-line=8790")
+        print(f"[bok] desktop ready (relaxed recheck): control-plane=8000 asr=8787 {_desktop_tts2} llm=1235")
         return 0
     print(f"[bok] timeout waiting for desktop stack — still down: {still_down} (see app-data/logs)", file=sys.stderr)
     return 1
@@ -3178,7 +3127,6 @@ _ORPHAN_PORT_OWNERS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (1235, ("mlx_lm",)),
     (1236, ("mlx_lm",)),
     (1237, ("mlx_lm",)),
-    (8790, ("realtime-translation",)),
     (7880, ("livekit-server",)),
     (3000, ("next", "node")),
     (8081, ("agent_runtime", "multiprocessing")),
@@ -3754,12 +3702,12 @@ def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
     # 时,滑窗未提交前缀攒够字数(默认 10)且跨窗稳定即就地切句——标点档/停顿档
     # 的第三事件源,译出声不等人讲完。默认 1,显式 0 逃生;A 线唔带此 env。
     env.setdefault("QWEN3_ASR_CLAUSE_LEN_COMMIT", "1")
-    # B 线 VAD 停嘴门槛收紧(2026-09-17):0.45 是 A 线客服通话校准(防碎片提交
-    # 打断在途回复——A 线碎片提交会被下一碎片掐死回复);B 线 manual 管线无此
-    # 伤害(假切句只多一段翻译,无链路损伤),而真人间子句换气普遍 0.3-0.45s,
-    # 0.45 门槛下嗰啲微停顿完全不产生提交=「每句话讲完先翻」的体感主刀之一。
-    # 0.35 收紧后浅停顿也成提交点。显式 env 逃生。
-    env.setdefault("VAD_MIN_SILENCE_DURATION", "0.35")
+    # VAD 停嘴门槛(2026-10-02 收编):旧版在此 setdefault 0.35(2026-09-17 B 线
+    # 专属调参,当时 A 线 0.45)——但 env 优先级压过设置面,设置页对 B 线永久
+    # 说谎(改了不生效)。现拆 setdefault:B 线与 A 线同读设置面 vad 段
+    # (interpret _cfg_float / agent _vad_float 同一序:显式 env 部署覆盖 >
+    # 设置页 > 缺省 0.35),显式 env 仍经下方透传白名单下发。当前设置值 0.35=
+    # 拆钉零行为变化;后续调门槛只动设置页,两线同源。
     # B 线开关透传(_agent_worker_env 是白名单 env,不透传 os.environ——
     # 不显式带上的话文档里的逃生门在 dev/prod 栈都是死的,2026-09-16 实证)。
     for _k in (
@@ -4141,10 +4089,8 @@ def cmd_prod_status() -> int:
             print(f"  {name:<13} :{port}  {'ok' if ok else 'NON-200'}")
             all_ok = all_ok and ok
         except urllib.error.HTTPError as exc:
-            # 426 Upgrade Required = WS worker 本体作答(b-line :8790 无明文
-            # /health 路由,非升级请求一律 426,urlopen 以 HTTPError 抛出)——
-            # 比 TCP 探活证据更强,视为活。旧版在健康栈上恒 b-line DOWN →
-            # prod 恒 DEGRADED 假警报(2026-09-17 修)。
+            # 426 Upgrade Required = WS 服务本体作答（非升级请求一律 426,
+            # urlopen 以 HTTPError 抛出）——比 TCP 探活证据更强,视为活。
             if exc.code == 426:
                 print(f"  {name:<13} :{port}  ok (ws worker, 426 upgrade)")
             else:

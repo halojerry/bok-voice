@@ -3,8 +3,9 @@
 背景（2026-09-16 P2）：句级提交 + 打断默认关之后，源语语速 > 译文播报速度时，
 译文会在框架 speech 队列里无限堆积（体感 lag 雪球）。策略=追最新：估时超限从
 最旧弃未开播的句，队头与最新一条永不弃；interrupt 必须 force=True（会话打断
-默认关，非 force 会 RuntimeError）。v1 PlaybackScheduler（services/
-realtime-translation/src/playback-scheduler.js）的 maxBacklogMs 门的移植。
+默认关，非 force 会 RuntimeError）。maxBacklogMs 门的移植自 v1 PlaybackScheduler
+（`services/realtime-translation/src/playback-scheduler.js`，该目录已于 2026-10-02
+随 v1 退役删除，来源见 git 历史；本实现为 B 线 v2 的独立 Python 版本）。
 """
 
 from __future__ import annotations

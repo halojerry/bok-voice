@@ -31,8 +31,7 @@
 ```bash
 ./scripts/bootstrap.sh        # 建 .venv312 + 安装依赖（Python ≥3.11）
 ./scripts/test.sh             # pytest
-cd services/realtime-translation && npm ci && npm test   # B 线单测
-python tools/bok.py serve     # 拉起 control-plane/LiveKit/sidecars/LLM/B-line/agent
+python tools/bok.py serve     # 拉起 control-plane/LiveKit/sidecars/LLM/agent
 ```
 
 开发机模型默认从 `~/.lmstudio/models` 读取（Mac）；Windows 开发机模型走

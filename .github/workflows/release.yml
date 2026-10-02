@@ -42,8 +42,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-          cache: npm
-          cache-dependency-path: services/realtime-translation/package-lock.json
 
       - uses: actions/setup-go@v5
         with:
@@ -55,10 +53,9 @@ jobs:
           path: |
             runtime
             ~/.cache/pip
-            services/realtime-translation/node_modules
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: ${{ runner.os }}-runtime-v4-${{ hashFiles('requirements-runtime-*.txt','packages/**/pyproject.toml','apps/**/pyproject.toml','services/realtime-translation/package-lock.json') }}
+          key: ${{ runner.os }}-runtime-v4-${{ hashFiles('requirements-runtime-*.txt','packages/**/pyproject.toml','apps/**/pyproject.toml') }}
 
       - name: Assemble bundled runtime (Python/Node/LiveKit/llama)
         shell: bash

@@ -1,0 +1,4 @@
+# CSC 自训语料（scripts/prepare_csc_data.py 产出）。
+# 大文件本地生成、不进仓；样例与种子评测集是必备件，进仓。
+csc_train.jsonl
+csc_stats.json

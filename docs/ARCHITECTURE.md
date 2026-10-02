@@ -69,9 +69,9 @@ Agent Worker (livekit-agents) ── ControlPlaneClient ── ContextInjector �
 
 ### CI/CD
 
-- **CI**（`.github/workflows/ci.yml`）：Python `compileall+pytest`、Node `realtime-translation` 测试、
+- **CI**（`.github/workflows/ci.yml`）：Python `compileall+pytest`、
   Web `tsc --noEmit` + `npm test` + 瘦客户端静态探针、`bok manifest/status` 冒烟
-  （`Desktop shell (Rust)` 必检上下文已随 Tauri 退役移除——GitHub branch protection 同步删）；
+  （`Desktop shell (Rust)` 必检上下文已随 Tauri 退役移除、`Node tests (realtime-translation)` 已随 v1 同传退役移除——GitHub branch protection 同步删）；
   节点侧 `node-handshake.yml`：Linux 真 CP 握手（含 commands 通道+工件下载鉴权步）+
   kill-switch 探针 / Windows ps1 干跑 + 生命周期探针。
 - **Release**（`.github/workflows/release.yml`）：tag `v*` 触发矩阵

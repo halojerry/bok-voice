@@ -1134,7 +1134,9 @@ async def tts_speakers(request: Request) -> list[str]:
 
 @app.get("/api/tts/voices")
 async def tts_voices(request: Request) -> list[dict]:
-    _gate_page(request, "settings")  # P3-A：诊断读面归管理面（克隆音色清单不外泄）
+    # 本地克隆音色清单：设置页（settings）与同传页（interpret）共用读面——
+    # interpret-only 话务员面板此前静默空列表（RC-5 权限错配，2026-10-02）。
+    _gate_page_any(request, ("settings", "interpret"))
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.get(f"{_qwen3_tts_url()}/v1/voices")
@@ -1274,8 +1276,10 @@ def _save_minimax_clones(clones: list[dict]) -> None:
 
 @app.get("/api/tts/minimax-voices")
 async def tts_minimax_voices_list(request: Request) -> list[dict]:
-    # 克隆清单是本地面板数据（settings blob），读面归管理面（同 tts_voices）。
-    _gate_page(request, "settings")
+    # 克隆清单是本地面板数据（settings blob）：设置页（settings）与同传页
+    # （interpret）共用读面——同传页 voice 下拉/克隆音色列表此前静默空列表
+    # （RC-5 权限错配，2026-10-02）。
+    _gate_page_any(request, ("settings", "interpret"))
     return _minimax_clones_list((_repo().get_settings() or {}).get("tts") or {})
 
 
@@ -1437,11 +1441,13 @@ def tts_filler_preview(lang: str = "zh", i: int = 0, request: Request = None) ->
 
 @app.post("/api/tts/preview")
 async def tts_preview(payload: dict, request: Request) -> Response:
-    # 试听会真实消耗云端 TTS 配额（MiniMax），auth-on 时归管理面。
-    auto_gate_management(request)
     """试听一段 TTS。provider=qwen3_tts 走本地 sidecar；provider=minimax 走云端 MiniMax
     （voice 是 MiniMax 音色 ID，如 Cantonese_Male_news_anchor_vv2）。返回 WAV。"""
     provider = str(payload.get("provider") or "qwen3_tts").lower()
+    # 闸按 provider 分流(2026-10-02 review 修):本地 qwen3_tts 零云耗,interpret-only
+    # 话务员的「输出设备指认」放行(RC-5 权限错配);minimax 族烧云端真金——维持
+    # settings 管理面闸(与旧 auto_gate_management 同强度,interpret 话务员不可烧)。
+    _gate_page_any(request, ("interpret",) if provider.startswith("qwen3") else ("settings",))
     sample_rate = int(payload.get("sample_rate") or 24000)
     text = str(payload.get("text") or "")
     voice = str(payload.get("voice") or "")
@@ -1571,10 +1577,45 @@ def _gate_page(request: Request, key: str) -> None:
         raise HTTPException(status_code=403, detail="forbidden")
 
 
+def _gate_page_any(request: Request, keys: tuple[str, ...]) -> None:
+    """多键页面权限闸：任一页键通过即放行（单键与 _gate_page 语义逐字节一致）。
+
+    判据与 _gate_page 同一套原语：无身份（auth-off/机器通道）直通；admin/root
+    直通；user 逐请求查库算有效集。差异仅在失败判据=「全部键都不在有效集」才
+    403（单键即退化为原语义）。用于同一资源被两个页面面共同消费的端点——
+    TTS 试听/音色清单（设置页 settings 管理面 + 同传页 interpret 页键）。
+    """
+    ident = current_identity(request)
+    if ident is None or ident.role in ("admin", "root"):
+        return
+    user = _repo().get_user(ident.user_id) or {}
+    perms = effective_permissions(
+        str(user.get("role") or ident.role), str(user.get("permissions_json") or "")
+    )
+    if not any(key in perms for key in keys):
+        raise HTTPException(status_code=403, detail="forbidden")
+
+
+def _gate_call_resource(request: Request, row: dict | None) -> None:
+    """通话资源端点按行 kind 分闸（与建单/token 的 kind 派生闸同口径）。
+
+    kind=interpret 行归同传工作面：calls|interpret 任一页键放行（interpret-only
+    操作员建了单、进得了房，结束/读回同一通话不得 403——RC-5 权限错配）；
+    其余行（含行缺失）照旧只认 calls——非 interpret 行为与旧
+    ``_gate_page(request, "calls")`` 逐字节一致（403 先于 404，保留越权不泄露
+    存在性的旧序：先闸后归属）。
+    """
+    if str((row or {}).get("kind") or "") == "interpret":
+        _gate_page_any(request, ("calls", "interpret"))
+    else:
+        _gate_page(request, "calls")
+
+
 # 管理面路径→下发键（单一映射表）：auto_gate_management 按请求路径前缀取键。
-# 口径：TTS 声纹/预览、SIP 站点、短信、setup 归 settings；知识库/人设/审计/
-# 主管台各归其键；qa 预生成与垫话罐头归 qa 页键；对象写门归 objects 页键；
-# insights 归 reports 页键（报表洞察域）；通话删除归 supervisor（处置域）。
+# 口径：TTS 声纹、SIP 站点、短信、setup 归 settings（/api/tts/preview 例外：
+# 2026-10-02 起走 _gate_page_any(settings|interpret) 页键共用面，同传页试听）；
+# 知识库/人设/审计/主管台各归其键；qa 预生成与垫话罐头归 qa 页键；对象写门归
+# objects 页键；insights 归 reports 页键（报表洞察域）；通话删除归 supervisor。
 # 仅曾以 require_role(admin,root) 把闸的管理面换装到此表——话务员工作面
 # （_gate_page）不经此表。
 _AUTO_GATE_KEY_BY_PREFIX: tuple[tuple[str, str], ...] = (
@@ -2475,8 +2516,12 @@ def list_calls(request: Request, account_id: str = "acc-001", status: str = "") 
 
 @app.get("/api/calls/{call_id}")
 def get_call(call_id: str, request: Request) -> dict:
-    _gate_page(request, "calls")
-    call = deny_cross_account(request, _repo().get_call(call_id))
+    # 先取行再分闸（2026-10-02 RC-5）：kind=interpret 行归同传工作面
+    # （calls|interpret 任一页键），其余/缺失行照旧只认 calls——403 先于 404
+    # 的旧序保留（非 interpret 行行为逐字节不变）。
+    call = _repo().get_call(call_id)
+    _gate_call_resource(request, call)
+    call = deny_cross_account(request, call)
     if not call:
         raise HTTPException(404, "call not found")
     return call
@@ -2958,8 +3003,12 @@ def _disconnect_room_background(room_name: str) -> None:
 
 @app.post("/api/calls/{call_id}/hangup")
 async def hangup(call_id: str, request: Request) -> dict:
-    _gate_page(request, "calls")
+    # 先取行再分闸（2026-10-02 RC-5）：kind=interpret 行归同传工作面
+    # （calls|interpret 任一页键）——interpret-only 操作员建单进房后「结束」
+    # 不得 403；其余/缺失行照旧只认 calls（行为逐字节不变）。归属闸/审计/
+    # 断房语义原样。
     existing = _repo().get_call(call_id)
+    _gate_call_resource(request, existing)
     deny_cross_account(request, existing)
     if not existing:
         raise HTTPException(404, "call not found")

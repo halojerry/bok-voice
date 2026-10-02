@@ -15,7 +15,8 @@ Contract decisions baked in here (do not re-litigate at call sites):
 - Port 8791. The task brief said 8789, but 8789 is the W1b bge-embed sidecar's
   canonical port (CORE_PORTS ("embed", 8789), serve wiring, live stack) — two
   services cannot share it; 2026-09-26 user decision moved laya to the next
-  free family slot 8791 (8787/8788/8790 taken).
+  free family slot 8791 (8787/8788/8790 were taken at the time; the v1 worker
+  on :8790 has since been retired, 2026-10-02).
 - Truncation discipline lives HERE, server-side, single point. The upstream
   hard cap is 1024 tokens with SILENT tail truncation — a 2000-char state and
   a 4500-char state produce byte-identical outputs while the customer's actual

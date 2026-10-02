@@ -38,10 +38,11 @@ import {
 import { useSession, useTranscriptions } from "@livekit/components-react";
 import { Ban, TriangleAlert } from "lucide-react";
 import { AgentSessionProvider } from "@/components/agents-ui/agent-session-provider";
-import { api, apiBase, authHeaders } from "@/lib/api";
+import { api, postBlob, postJson } from "@/lib/api";
 import { describeConnectError } from "@/lib/api-ready";
 import { wlog, wlogBindCall } from "@/lib/weblog";
 import { startTrace } from "@/lib/logger";
+import { playAudioBlob } from "@/lib/preview";
 import {
   deviceRoleIssues,
   expectedScript,
@@ -85,10 +86,6 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
     if (can) setOutputMode("dual");
   }, []);
   const [outputMode, setOutputMode] = useState<"shared" | "dual">("shared");
-  const outputModeRef = useRef(outputMode);
-  useEffect(() => {
-    outputModeRef.current = outputMode;
-  }, [outputMode]);
 
   // ---- 设备枚举(两端共用一份列表,各存各的选择) ----
   const [micDevices, setMicDevices] = useState<AudioDeviceInfo[]>([]);
@@ -219,10 +216,16 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   const [otherRoomVersion, setOtherRoomVersion] = useState(0);
   const leavingRef = useRef(false);
   const [leaving, setLeaving] = useState(false);
+  // 卸载收线闸（2026-10-02 刀3）：connectedEver=会话真开过（首次 me 连上置位）；
+  // hangupSent=hangup 已发出（leave 按钮与卸载共用一次闸，绝无双发）。
+  const connectedEverRef = useRef(false);
+  const hangupSentRef = useRef(false);
 
   const [meConnected, setMeConnected] = useState(false);
   const [otherConnected, setOtherConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // 平台能力缺失类提示（非 Chromium 无 ctx.setSinkId）：一行提示，不进红色错误面。
+  const [sinkNotice, setSinkNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [startedAt, setStartedAt] = useState<number | null>(null);
 
@@ -379,14 +382,23 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   const routersRef = useRef<{ me: ReturnType<typeof createAudioRouter> | null; oth: ReturnType<typeof createAudioRouter> | null }>({ me: null, oth: null });
   const getRouter = useCallback((who: "me" | "oth") => {
     if (!routersRef.current[who])
-      routersRef.current[who] = createAudioRouter(who, (id, err) => {
-        const unsupported = err instanceof Error && /unsupported/i.test(err.message);
-        setError(
-          unsupported
-            ? `当前内核不支持音频输出路由（ctx.setSinkId 需 Chromium 110+；桌面壳请在系统声音设置切换默认输出）——「${who === "me" ? "我方" : "对方"}」声音走的是系统默认设备。`
-            : `「${who === "me" ? "我方" : "对方"}」译文无法路由到所选输出设备（${id.slice(0, 12)}）——请重选扬声器或切回共享扬声器。`,
-        );
-      });
+      routersRef.current[who] = createAudioRouter(
+        who,
+        (id) => {
+          // setSinkId 存在但调用被拒（设备被占用/已失效）=真路由失败：红色错误面。
+          setError(
+            `「${who === "me" ? "我方" : "对方"}」译文无法路由到所选输出设备（${id.slice(0, 12)}）——请重选扬声器或切回共享扬声器。`,
+          );
+        },
+        () => {
+          // 平台无 ctx.setSinkId（WKWebView/Safari 等）=能力缺失不是故障：放音照走
+          // ctx.destination（系统默认输出），一行提示即可（2026-10-02 刀3：旧版把
+          // 它当红色路由错误报，「能用却报错」）。
+          setSinkNotice(
+            "当前内核不支持音频输出路由（ctx.setSinkId 需 Chromium 110+）——声音走系统默认输出，可在系统声音设置里换设备。",
+          );
+        },
+      );
     return routersRef.current[who]!;
   }, []);
   // AudioContext 受自动播放策略管:手势前 suspended,任意点击唤醒两路放音。
@@ -441,7 +453,6 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
       try {
         // 连接 effect 可能早于设备恢复 state,直接用已存值兜底。
         const micId = meMicId || savedMicDevice("me");
-        const outId = meOutId || savedOutputDevice("me");
         // 结果落日志 + **硬约束(exact=true)**:第三参传 false 是软约束,设备不在场时
         // Chrome 会另挑一支(=系统默认)而不报错,两个房间便双双落到同一支默认麦上——
         // 这正是本轮「两侧同一支麦」的机关:存值失效 + 软约束静默换麦 + 未发布时
@@ -459,13 +470,21 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
         await meSession.start({
           // 传译总开关(默认关):进房只连接不采麦,按「启动传译」才开始——已连接
           // 房间上后开采集无 15s 死锁风险(那死锁只发生在未连接房间上 await)。
-          tracks: { microphone: { enabled: interpOnRef.current, publishOptions: { preConnectBuffer: true } } },
+          // dtx:false(2026-10-02):Opus DTX 静音期不发帧=服务端 VAD 缺帧不
+          // 计静音 → EOS 永不触发、句尾无强标点的句子永不 finish(B 线正压臂
+          // 根因链)。关 DTX 保连续帧流;操作台上行带宽代价可忽略。
+          tracks: {
+            microphone: {
+              enabled: interpOnRef.current,
+              publishOptions: { preConnectBuffer: true, dtx: false },
+            },
+          },
         });
         // 确保我方麦克风真正发布:失败(权限被拒/设备被占)显式报错并把开关拉回
         // 现实,不再静默装「已接入」。传译未启动时跳过探活(探活会把麦打开)。
         if (interpOnRef.current) {
           try {
-            const pub = await meRoom.localParticipant.setMicrophoneEnabled(true);
+            const pub = await meRoom.localParticipant.setMicrophoneEnabled(true, undefined, { dtx: false });
             setMeMicOn(Boolean(pub));
             if (!pub) setError("无法开启我方麦克风：请检查浏览器麦克风权限——已连接,但同传听不到我方说话。");
           } catch {
@@ -473,9 +492,8 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
             setError("无法开启我方麦克风：请检查浏览器麦克风权限——已连接,但同传听不到我方说话。");
           }
         }
-        // 输出路由:连接后的初投由 ctx_sink effect(meConnected 入 deps)直投
-        // router,这里不再走已删的死路径。outId 仅留存状态供 effect 读取。
-        void outId;
+        // 输出路由:连接后的初投由 ctx_sink effect(meConnected 入 deps)直投 router,
+        // 这里不再走已删的死路径。
       } catch (e) {
         // session.start 内部 token/连房与麦克风并行:麦克风失败时房间可能仍连上。
         const raw = e instanceof Error ? e.message : String(e ?? "");
@@ -509,6 +527,7 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   useEffect(() => {
     if (meRoom.state !== ConnectionState.Connected) return;
     wlog("me_connected");
+    connectedEverRef.current = true; // 卸载收线判据：连过一次才算「会话真开过」
     setMeConnected(true);
     setStartedAt((prev) => prev ?? Date.now());
     setBusy(false);
@@ -594,7 +613,6 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
         });
         // 连接 effect 可能早于设备恢复 state,直接用已存值兜底。
         const micId = othMicId || savedMicDevice("other");
-        const outId = othOutId || savedOutputDevice("other");
         // 结果落日志（同我方侧:未发布恒 true，真值看回读）。
         if (micId) {
           const ok = await room.switchActiveDevice("audioinput", micId, true).catch(() => false);
@@ -607,12 +625,10 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
           );
           return;
         }
-        await room.localParticipant.setMicrophoneEnabled(othMicOn && interpOnRef.current);
+        await room.localParticipant.setMicrophoneEnabled(othMicOn && interpOnRef.current, undefined, { dtx: false });
         // 输出路由:otherConnected 翻转触发 ctx_sink effect 直投 router(同我方侧)。
-        void outId;
         wlog("other_connected");
         setOtherConnected(true);
-        setOtherRoomVersion((v) => v + 1);
         await room.startAudio().catch((e: unknown) =>
           log.warn("other room startAudio failed (autoplay policy?)", { err: e instanceof Error ? e.message : String(e) }),
         );
@@ -639,6 +655,25 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [callId, meConnected]);
+
+  // ---- 卸载收线(2026-10-02 刀3,R2 状态说真话) ----
+  // 控制台连上过一次 = 会话事实开启；路由切走/组件卸载时两个本地房都断（me 房随
+  // useSession 卸载、other 房在上方 cleanup 断），但 CP 通话行原本永远 ACTIVE 等
+  // 回收器。这里 fire-and-forget 补一发 hangup（不阻卸载）——声明位在 other 房
+  // cleanup 之后，卸载时房间断开先于收线，不存在「误杀进行中通话」的风险面。
+  // 判据与闸：从未连上（dev StrictMode 首探未连即卸）=零动作，绝不误杀；
+  // leave 按钮路径先发（同一 hangupSent 闸）卸载不双发。
+  useEffect(() => {
+    return () => {
+      if (!connectedEverRef.current) return;
+      // 会话已事实结束：复位模块级 wlog 绑定（他页/下一通事件不再挂旧 call_id）。
+      wlogBindCall("");
+      if (hangupSentRef.current) return;
+      hangupSentRef.current = true;
+      void api.hangup(callId).catch(() => {});
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [callId]);
 
   // ---- 设备选择应用(applyDualOutput 已上移到输出路由统一入口处) ----
   // 麦克风热切换(2026-09-12 call-ae8fece8 实证):switchActiveDevice 内部会重启采集
@@ -668,7 +703,7 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
         await room.localParticipant.setMicrophoneEnabled(false).catch((e: unknown) =>
           log.warn("mic rollback: mute failed", { who, err: e instanceof Error ? e.message : String(e) }),
         );
-        await room.localParticipant.setMicrophoneEnabled(true).catch((e: unknown) =>
+        await room.localParticipant.setMicrophoneEnabled(true, undefined, { dtx: false }).catch((e: unknown) =>
           log.warn("mic rollback: unmute failed", { who, err: e instanceof Error ? e.message : String(e) }),
         );
       } catch (e) {
@@ -733,7 +768,7 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   const toggleOthMic = useCallback(() => setOthMicOn((v) => !v), []);
   useEffect(() => {
     if (!meConnected) return;
-    meRoom.localParticipant.setMicrophoneEnabled(meMicOn && !meHeld && !voiceHoldMe && interpOn).catch((e: unknown) =>
+    meRoom.localParticipant.setMicrophoneEnabled(meMicOn && !meHeld && !voiceHoldMe && interpOn, undefined, { dtx: false }).catch((e: unknown) =>
       log.warn("apply me mic enabled state failed", { on: meMicOn, err: e instanceof Error ? e.message : String(e) }),
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -741,7 +776,7 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   useEffect(() => {
     const r = otherRoomRef.current;
     if (!otherConnected || !r) return;
-    r.localParticipant.setMicrophoneEnabled(othMicOn && !othHeld && !voiceHoldOth && interpOn).catch((e: unknown) =>
+    r.localParticipant.setMicrophoneEnabled(othMicOn && !othHeld && !voiceHoldOth && interpOn, undefined, { dtx: false }).catch((e: unknown) =>
       log.warn("apply other mic enabled state failed", { on: othMicOn, err: e instanceof Error ? e.message : String(e) }),
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -942,6 +977,7 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
         otherConnected={otherConnected}
         error={error}
         setError={setError}
+        sinkNotice={sinkNotice}
         busy={busy}
         leaving={leaving}
         micDevices={micDevices}
@@ -1002,6 +1038,8 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
           log.error("other room disconnect failed on leave", e),
         );
       }
+      // 与「卸载收线」共用同一次闸：按钮路径先发，unmount 不再补发（防双发）。
+      hangupSentRef.current = true;
       await api.hangup(callId).catch((e) => {
         if (!String(e).includes("404")) console.warn("hangup failed", e);
       });
@@ -1021,6 +1059,8 @@ type LiveProps = {
   meConnected: boolean;
   otherConnected: boolean;
   error: string | null;
+  /** 平台能力缺失类一行提示（非 Chromium 无 ctx.setSinkId）——与红色 error 面分立。 */
+  sinkNotice: string | null;
   busy: boolean;
   leaving: boolean;
   micDevices: AudioDeviceInfo[];
@@ -1102,34 +1142,39 @@ function ConsoleLive(p: LiveProps) {
   // 「我方扬声器出译文/对方扬声器没声」九成是两路方向猜反或设备不在列表;试听令
   // 物理指认 5 秒锁定,选完下拉即记住。走本地 TTS sidecar 预览端点,零云端开销。
   const playSinkTest = useCallback(async (deviceId: string, label: string) => {
+    // 试听硬化(2026-09-12):setSinkId 结果必须落 wlog 且失败亮错误——旧版 catch
+    // 吞掉,「点了没声」无线索(实测 3 秒连点 5 次对方输出的重试形态)。
+    // 2026-10-02 刀3 收编:取音频走 lib/api postBlob(auth 头 + X-Request-ID + 401 面),
+    // 放声与 objectURL 回收走 lib/preview playAudioBlob(修「只在 ended 回收」的泄漏);
+    // 设备指认(element.setSinkId)仍留在本地,经 prepare 钩子在播放前就地做。
+    let sinkErr = "";
     try {
-      const r = await fetch(`${apiBase()}/api/tts/preview`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ provider: "qwen3_tts", voice: "Vivian", language: "zh", text: label }),
+      const blob = await postBlob("/api/tts/preview", {
+        provider: "qwen3_tts",
+        voice: "Vivian",
+        language: "zh",
+        text: label,
       });
-      if (!r.ok) throw new Error(`preview ${r.status}`);
-      const el = new Audio(URL.createObjectURL(await r.blob()));
-      // 试听硬化(2026-09-12):setSinkId 结果必须落 wlog 且失败亮错误——旧版 catch
-      // 吞掉,「点了没声」无线索(实测 3 秒连点 5 次对方输出的重试形态)。
-      const sinkEl = el as HTMLAudioElement & { setSinkId?: (id: string) => Promise<void>; sinkId?: string };
-      if (!sinkEl.setSinkId) {
-        wlog("sink_test", { label, id: deviceId.slice(0, 12), ok: true, note: "no_setSinkId" });
-      } else {
-        try {
-          await sinkEl.setSinkId(deviceId || "default");
-          wlog("sink_test", { label, id: deviceId.slice(0, 12), ok: true, got: String(sinkEl.sinkId ?? "").slice(0, 12) });
-        } catch (e) {
-          const err = e instanceof Error ? e.name : String(e);
-          wlog("sink_test", { label, id: deviceId.slice(0, 12), ok: false, err });
-          p.setError(`「${label}」路由失败（${err}）——该输出设备可能被占用或已不可用，请换一台。`);
-          return;
-        }
-      }
-      await el.play();
-      el.addEventListener("ended", () => URL.revokeObjectURL(el.src));
+      await playAudioBlob(blob, {
+        prepare: async (el) => {
+          const sinkEl = el as HTMLAudioElement & { setSinkId?: (id: string) => Promise<void>; sinkId?: string };
+          if (!sinkEl.setSinkId) {
+            wlog("sink_test", { label, id: deviceId.slice(0, 12), ok: true, note: "no_setSinkId" });
+            return;
+          }
+          try {
+            await sinkEl.setSinkId(deviceId || "default");
+            wlog("sink_test", { label, id: deviceId.slice(0, 12), ok: true, got: String(sinkEl.sinkId ?? "").slice(0, 12) });
+          } catch (e) {
+            sinkErr = e instanceof Error ? e.name : String(e);
+            wlog("sink_test", { label, id: deviceId.slice(0, 12), ok: false, err: sinkErr });
+            throw e; // 中止播放(与旧版 return 同语义);URL 由 playAudioBlob catch 回收
+          }
+        },
+      });
     } catch (e) {
-      p.setError(`试听失败(${e instanceof Error ? e.message : String(e)})——请确认本地 TTS 服务在跑。`);
+      if (sinkErr) p.setError(`「${label}」路由失败（${sinkErr}）——该输出设备可能被占用或已不可用，请换一台。`);
+      else p.setError(`试听失败(${e instanceof Error ? e.message : String(e)})——请确认本地 TTS 服务在跑。`);
     }
   }, [p.setError]);
   const listRef = useRef<HTMLDivElement | null>(null);
@@ -1138,7 +1183,10 @@ function ConsoleLive(p: LiveProps) {
   // 是给译员读的,不是聊天记录。「我→对方」流与全部仍可切。
   const [filter, setFilter] = useState<"rev" | "fwd" | "both">("rev");
   const [clearedCount, setClearedCount] = useState(0);
-  const items = useMemo(() => transcriptions.slice(-80), [transcriptions]);
+  // 字幕源裁剪(2026-10-02 刀3):useTranscriptions 历史无界增长,下游 memo 原来全量
+  // 重扫。派生单点 trimmed(近 300 条)供所有下游 memo 消费;渲染窗仍 80 条不变。
+  const trimmed = useMemo(() => transcriptions.slice(-300), [transcriptions]);
+  const items = useMemo(() => trimmed.slice(-80), [trimmed]);
   // 大字幕窗(对齐 Windows 版 SubtitleWindow:scope/字号/追帧;浏览器形态=页内
   // 浮动置顶面板,可拖动可全屏,投屏场景把主界面藏起来只留字幕)。
   const [popOpen, setPopOpen] = useState(false);
@@ -1165,13 +1213,13 @@ function ConsoleLive(p: LiveProps) {
   }, [popOpen]);
   const popRows = useMemo(() => {
     const out: { who: Bubble; text: string }[] = [];
-    for (const t of transcriptions.slice(-60)) {
+    for (const t of trimmed.slice(-60)) {
       const w = whoIs(t, p.room, p.myLang, p.otherLang);
       if (popScope !== "both" && w.flow !== popScope) continue;
       out.push({ who: w, text: stripVoiceTags(String(t.text ?? "")) });
     }
     return out.slice(-6); // 追帧:只留最新 6 行,旧的让位
-  }, [transcriptions, p.room, p.myLang, p.otherLang, popScope]);
+  }, [trimmed, p.room, p.myLang, p.otherLang, popScope]);
   // 逐句翻译延迟(对方→我):原文行到达 → 其后第一条 rev 译文字幕的差值。
   // 口径注:rev 译文字幕≈MT 完成时刻(纯字幕无音频输出);fwd 译文字幕被
   // sync_transcription 锚到播报,数值含播报等待,不进均值只看 rev 流。
@@ -1182,13 +1230,15 @@ function ConsoleLive(p: LiveProps) {
   }, [transcriptions]);
   const revLatency = useMemo(() => {
     const stamps = stampsRef.current;
+    // trimmed 是全局表的后缀:下标换算到 stamps(与全文索引对齐)后取值(刀3)。
+    const base = transcriptions.length - trimmed.length;
     const last: number[] = [];
     let anchor = -1;
-    transcriptions.forEach((t, i) => {
+    trimmed.forEach((t, i) => {
       const w = whoIs(t, p.room, p.myLang, p.otherLang);
       if (w.kind === "src" && w.flow === "rev") anchor = i;
       else if (w.kind === "dst" && w.flow === "rev" && anchor >= 0) {
-        last.push(Math.max(0, (stamps[i] ?? 0) - (stamps[anchor] ?? 0)));
+        last.push(Math.max(0, (stamps[base + i] ?? 0) - (stamps[base + anchor] ?? 0)));
         anchor = -1;
       }
     });
@@ -1196,18 +1246,18 @@ function ConsoleLive(p: LiveProps) {
     if (!recent.length) return null;
     const avg = Math.round(recent.reduce((a, b) => a + b, 0) / recent.length);
     return { lastMs: recent[recent.length - 1], avgMs: avg };
-  }, [transcriptions, p.room, p.myLang, p.otherLang]);
+  }, [transcriptions, trimmed, p.room, p.myLang, p.otherLang]);
   // 声源仲裁:两侧「原文转写流」的最近更新时刻=谁在说话;400ms 轮询衰减
   // (1.5s 窗)。AGT 译文(meHeld/othHeld 的 TTS 暂让已覆盖)不算说话。
   const lastSpokeRef = useRef<{ me: number; oth: number }>({ me: 0, oth: 0 });
   useEffect(() => {
     const now = Date.now();
-    for (const tr of transcriptions) {
+    for (const tr of trimmed) {
       const id = String(tr.participantInfo?.identity ?? "");
       if (id.startsWith("me-")) lastSpokeRef.current.me = now;
       else if (id.startsWith("other-")) lastSpokeRef.current.oth = now;
     }
-  }, [transcriptions]);
+  }, [trimmed]);
   useEffect(() => {
     const timer = window.setInterval(() => {
       const now = Date.now();
@@ -1217,17 +1267,55 @@ function ConsoleLive(p: LiveProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   const offset = transcriptions.length - items.length;
-  const dstCount = useMemo(
-    () => transcriptions.filter((t) => whoIs(t, p.room, p.myLang, p.otherLang).kind === "dst").length,
-    [transcriptions, p.room, p.myLang, p.otherLang],
-  );
+  // ---- 翻译状态滚动窗(2026-10-02 刀3,R2 状态说真话) ----
+  // 旧「同传服务=出译中」由累计 dstCount>0 驱动=第一次出译后闩死、永不再回待命。
+  // 新口径:近 30s 到达的译文字幕 >0(或正在出声)才算「出译中」,30s 无新译文回「待命」。
+  // 到达时刻在「新条目出现」单点记账(条目文本就地更新不改长度,只认追加);「翻译条数」
+  // 保持累计,同路径递增,零全量重扫。
+  const dstSeenRef = useRef(0);
+  const dstArrivalsRef = useRef<number[]>([]);
+  const [dstTotal, setDstTotal] = useState(0);
+  const [dstRecent, setDstRecent] = useState(0);
+  useEffect(() => {
+    const total = transcriptions.length;
+    // 房间断开会清空字幕表(components-react Disconnected 清 textStreams):游标回退
+    // 重新对齐,不把清空当负增长。
+    if (total < dstSeenRef.current) dstSeenRef.current = total;
+    if (total <= dstSeenRef.current) return;
+    const arr = dstArrivalsRef.current;
+    const now = Date.now();
+    let added = 0;
+    for (let i = dstSeenRef.current; i < total; i++) {
+      if (whoIs(transcriptions[i], p.room, p.myLang, p.otherLang).kind !== "dst") continue;
+      arr.push(now);
+      added += 1;
+    }
+    dstSeenRef.current = total;
+    if (added) {
+      setDstTotal((v) => v + added);
+      setDstRecent(arr.length); // 立即点亮;过期项由下方 1s tick 修剪
+    }
+  }, [transcriptions, p.room, p.myLang, p.otherLang]);
+  useEffect(() => {
+    const tick = () => {
+      const cutoff = Date.now() - 30_000;
+      const arr = dstArrivalsRef.current;
+      let drop = 0;
+      while (drop < arr.length && arr[drop] < cutoff) drop += 1;
+      if (drop) arr.splice(0, drop);
+      setDstRecent(arr.length); // 同值自动 bail,不产生多余渲染
+    };
+    tick();
+    const t = window.setInterval(tick, 1000);
+    return () => window.clearInterval(t);
+  }, []);
   // 语言对 × 实际文种错配（2026-09-12）:某侧的「原文」文种与钉定语言不符＝语言对选错
   // 或两侧麦克风装反。反向钉 en 却收到中文时 ASR 会在中文音频上硬解英文词（实测同一段
   // 音频被两种 hint 解成 '补助不会让你补助错了人' / '不会不会让你不会错掉人'），这就是
   // 「ASR 识别非常不准」的另一半根因。只看原文条：译文天然是目标语言，不参与判定。
   const scriptWarnings = useMemo(() => {
     const samplesOf = (prefix: string) =>
-      transcriptions
+      trimmed
         .filter((t) => String(t.participantInfo?.identity ?? "").startsWith(prefix))
         .slice(-40)
         .map((t) => String(t.text ?? ""));
@@ -1237,7 +1325,7 @@ function ConsoleLive(p: LiveProps) {
     const oth = scriptMismatch(samplesOf("other-"), expectedScript(p.otherLang));
     if (oth) out.push(scriptMismatchWarning("对方", p.otherLang, oth));
     return out;
-  }, [transcriptions, p.myLang, p.otherLang]);
+  }, [trimmed, p.myLang, p.otherLang]);
   // 【B 线缺源显性化(2026-09-30 call-72112fd7)】传译开着、我方在说话,但解释器
   // 全程没听到我方(fwd 订阅空挂/麦克风未真正发布——现场两者一个样=我方原文
   // 字幕零条,对着静默猜)。判据保守:传译开 ≥45s 且我方原文字幕一条都没有 →
@@ -1245,9 +1333,9 @@ function ConsoleLive(p: LiveProps) {
   // VAD),文案按「如果你在说话」措辞。
   const meSrcCount = useMemo(
     () =>
-      transcriptions.filter((t) => String(t.participantInfo?.identity ?? "").startsWith("me-"))
+      trimmed.filter((t) => String(t.participantInfo?.identity ?? "").startsWith("me-"))
         .length,
-    [transcriptions],
+    [trimmed],
   );
   const interpOnAtRef = useRef<number | null>(null);
   useEffect(() => {
@@ -1270,7 +1358,10 @@ function ConsoleLive(p: LiveProps) {
     const el = listRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [items]);
-  const liveBusy = p.meHeld || p.othHeld;
+  // 半双工/出声口径(TTS 暂让徽标与字幕脚注专用):纯 TTS hold,与译文到达无关。
+  const holdBusy = p.meHeld || p.othHeld;
+  // 「同传服务」徽标口径(刀3):近 30s 有译文到达,或正在出声——任一都表示翻译链在动。
+  const liveBusy = dstRecent > 0 || holdBusy;
 
   return (
     <div className="flex flex-col gap-4 lg:h-[calc(100vh-7.5rem)]">
@@ -1484,14 +1575,14 @@ function ConsoleLive(p: LiveProps) {
               {p.otherConnected ? "已接入" : "未接入"}
             </Stat>
             <Stat label="同传服务">
-              <Dot on={dstCount > 0 || liveBusy} />
-              {dstCount > 0 || liveBusy ? "出译中" : "待命"}
+              <Dot on={liveBusy} />
+              {liveBusy ? "出译中" : "待命"}
             </Stat>
-            <Stat label="半双工">{p.halfDuplex ? (liveBusy ? "暂让中" : "值守") : "关闭"}</Stat>
+            <Stat label="半双工">{p.halfDuplex ? (holdBusy ? "暂让中" : "值守") : "关闭"}</Stat>
             <Stat label="会话时长">
               <SessionClock startedAt={p.startedAt} />
             </Stat>
-            <Stat label="翻译条数">{dstCount}</Stat>
+            <Stat label="翻译条数">{dstTotal}</Stat>
             <Stat label="翻译延迟·对方→我">
               {revLatency
                 ? `${(revLatency.lastMs / 1000).toFixed(1)}s·均${(revLatency.avgMs / 1000).toFixed(1)}s`
@@ -1553,8 +1644,9 @@ function ConsoleLive(p: LiveProps) {
           <button className="stage-btn-secondary" onClick={() => setClearedCount(transcriptions.length)}>
             清空字幕
           </button>
-          {/* 结束按钮只在「已在退出中」时禁用(防 7 连发),连接/busy 中都保持可点。 */}
-          <button className="stage-btn-secondary mt-auto text-red-600" onClick={p.leave} disabled={p.leaving}>
+          {/* 结束按钮:退出中(leaving)与连接尝试进行中(busy)禁用——连接期点结束会把
+              未完成的连接与收线搅在一起;连接失败 busy 复位后仍可退出(不锁死)。 */}
+          <button className="stage-btn-secondary mt-auto text-red-600" onClick={p.leave} disabled={p.leaving || p.busy}>
             {p.leaving ? "结束中…" : "结束一体台会话"}
           </button>
         </section>
@@ -1622,7 +1714,7 @@ function ConsoleLive(p: LiveProps) {
             );
           })}
         </div>
-        {liveBusy && (
+        {holdBusy && (
           <p className="shrink-0 text-[11px] text-amber-700">
             {p.othHeld ? "我方译文播报中 · 对方麦克风暂让" : "对方译文播报中 · 我方麦克风暂让"}
           </p>
@@ -1634,6 +1726,9 @@ function ConsoleLive(p: LiveProps) {
             连续 5 秒没有电平——这支设备可能被别的页面/程序占用（蓝牙麦同一时刻只能给一个程序用），或它根本没在拾音。换一支设备，
             或关掉占用它的窗口/程序再试。
           </p>
+        )}
+        {p.sinkNotice && (
+          <p className="shrink-0 text-[11px] leading-relaxed text-muted-foreground">{p.sinkNotice}</p>
         )}
         {p.error && <p className="shrink-0 text-xs text-red-600">{p.error}</p>}
       </section>
@@ -1868,7 +1963,11 @@ function createMicMeter() {
   };
 }
 
-function createAudioRouter(who: string, onSinkError?: (id: string, err: unknown) => void) {
+function createAudioRouter(
+  who: string,
+  onSinkError?: (id: string, err: unknown) => void,
+  onSinkUnsupported?: () => void,
+) {
   let ctx: AudioContext | null = null;
   let lastSink = "";
   let lastErrId = "";
@@ -1898,11 +1997,14 @@ function createAudioRouter(who: string, onSinkError?: (id: string, err: unknown)
       }
     }
     const sinkCtx = c as AudioContext & { setSinkId?: (id: string) => Promise<void>; sinkId?: string };
-    // 非 Chromium(WKWebView/Safari)没有 ctx.setSinkId——旧 `?.` 写法静默跳过,
-    // UI 以为「已应用」、声音永远走系统默认(「选了对方扬声器没声音」的一类真相)。
-    // 显式抛错交给 setSink 的 catch → onSinkError → UI 可见。
+    // 非 Chromium(WKWebView/Safari)没有 ctx.setSinkId:这是**平台能力缺失**,不是故障
+    // ——放音照走 ctx.destination(系统默认输出)。2026-10-02 刀3:旧版在此显式 throw
+    // 进红色错误面(「能用却报错」),现按「尽力而为」处理,转一行能力提示。
+    // 红色错误只留给 setSinkId 存在但调用失败(真路由失败,见下方 await)。
     if (typeof sinkCtx.setSinkId !== "function") {
-      throw new Error("setSinkId unsupported (need Chromium 110+)");
+      wlog("ctx_sink", { who, want: (id || "default").slice(0, 12), note: "no_ctx_setSinkId" });
+      onSinkUnsupported?.();
+      return;
     }
     await sinkCtx.setSinkId(id || "default");
     wlog("ctx_sink", { who, want: (id || "default").slice(0, 12), got: String(sinkCtx.sinkId ?? "").slice(0, 12), ctxState: c.state });
@@ -2110,15 +2212,14 @@ function watchTransAudio(room: Room | null, setHeld: (v: boolean) => void): () =
 }
 
 async function fetchToken(account: string, callId: string, role: "me" | "other"): Promise<{ serverUrl: string; participantToken: string }> {
-  const resp = await fetch(`${apiBase()}/api/token`, {
-    method: "POST",
-    // auth-on 栈要求身份（fix-wave-3 M-9）：裸 fetch 曾 401 令同传台进不了房
-    // ——与同文件 :1108 试听 fetch 同族，authHeaders() 无 token 时返回空表。
-    headers: { "Content-Type": "application/json", ...authHeaders() },
-    body: JSON.stringify({ account_id: account, call_id: callId, participant_identity: `${role}-${callId}` }),
+  // auth-on 栈要求身份（fix-wave-3 M-9）：裸 fetch 曾 401 令同传台进不了房。
+  // 统一走 lib/api postJson（auth 头 + X-Request-ID + 401 处理）；
+  // participant_identity 是本端点契约字段（与 api.token 的 role 形状并存）。
+  const data = await postJson<{ serverUrl?: string; participantToken?: string }>("/api/token", {
+    account_id: account,
+    call_id: callId,
+    participant_identity: `${role}-${callId}`,
   });
-  if (!resp.ok) throw new Error(`token http ${resp.status}`);
-  const data = (await resp.json()) as { serverUrl?: string; participantToken?: string };
   if (!data.serverUrl || !data.participantToken) throw new Error("token 响应缺 serverUrl/participantToken");
   return { serverUrl: data.serverUrl, participantToken: data.participantToken };
 }

@@ -22,6 +22,7 @@ Qwen3-ASR(源语言钉死) + 翻译 LLM(Hy-MT2 MT 小模型 :1236 逐句无状�
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
 import math
@@ -29,6 +30,7 @@ import os
 import re
 import time
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 
 # B 线 MT 出口确定性语言校验器(E5 增补):纯函数、零 LLM、零网络。判据本身只做
@@ -51,8 +53,9 @@ def _norm_lang(raw: str, default: str = "zh") -> str:
 
 
 def _translation_instructions(src: str, tgt: str, glossary: str = "") -> str:
-    """同传 system 指令(对齐 services/realtime-translation 的 local-openai prompt,
-    补电话同传节奏与港式粤语输出规则)。glossary 非空时追加术语行——回退 LLM
+    """同传 system 指令(对齐 v1 已退役 Node POC 的 local-openai prompt——目录
+    2026-10-02 删除,prompt 血统见 git 史;补电话同传节奏与港式粤语输出规则)。
+    glossary 非空时追加术语行——回退 LLM
     路径(DeepSeek/主 LLM)的术语一致性挂点;MT 快路(StatelessMTLLM)走
     _mt_prompt 的术语槽,不靠 instructions。"""
     names = {
@@ -308,6 +311,93 @@ def _src_track_state(participant, audio_kind) -> tuple[str, list[str]]:
     return ("ok", [])
 
 
+async def _src_track_watch_loop(
+    room, listen_identity: str, closed: asyncio.Event, interval: float, heal: bool
+) -> None:
+    """listen 身份音轨订阅看护循环(2026-10-02 刀1 自闭包提取,假 room 可驱动)。
+
+    行为与旧 entrypoint 内联闭包逐字节同口径(2026-09-30 call-72112fd7 定案):
+    每 interval 秒扫一次 listen 身份的音轨,分辨两态留观测行——
+      SRC_NO_AUDIO_TRACK       —— 对端根本没发麦(未开传译/浏览器发布失败);
+      SRC_TRACK_NOT_SUBSCRIBED —— 音轨已发布但本 worker 订不上(订阅链断)。
+    heal=True 时在 unsubscribed 态对「已发布未订上」的音轨发 set_subscribed(True)
+    (官方手动订阅口,官方 job.py 自己在用;前 3 轮每轮一次、其后每 10 轮一次),
+    打 SRC_TRACK_RESUBSCRIBE 观测行。closed 置位(会话关闭)即返回。
+
+    RC-1 根因(2026-10-02 定案):旧闭包 inline 消费 room.remote_participants.get()
+    而 heal 分支引用未定义的 `part` → 首次进入 unsubscribed 态 NameError 杀死看护
+    (裸 create_task 静默死,遥测+自愈同时熄火)。现每轮 **part 单点解析**,分类与
+    自愈同源;迭代体全包 try/except 纵深防御(任何异常不杀循环,只打观测行)。
+    """
+    from livekit import rtc as _rtc  # 局部导入:模块头部无 rtc 面
+
+    no_track_rounds = 0
+    not_sub_rounds = 0
+    while True:
+        try:
+            await asyncio.wait_for(closed.wait(), timeout=interval)
+            return  # 会话收线,收队
+        except asyncio.TimeoutError:
+            pass
+        try:
+            part = room.remote_participants.get(listen_identity)
+            state, sids = _src_track_state(part, _rtc.TrackKind.KIND_AUDIO)
+            if state == "none":
+                not_sub_rounds = 0
+                no_track_rounds += 1
+                if no_track_rounds == 3 or no_track_rounds % 10 == 0:
+                    print(
+                        f"[interp] SRC_NO_AUDIO_TRACK identity={listen_identity} "
+                        f"rounds={no_track_rounds} (对端未发布麦克风/未开传译)",
+                        flush=True,
+                    )
+            elif state == "unsubscribed":
+                no_track_rounds = 0
+                not_sub_rounds += 1
+                if not_sub_rounds <= 3 or not_sub_rounds % 10 == 0:
+                    print(
+                        f"[interp] SRC_TRACK_NOT_SUBSCRIBED identity={listen_identity} "
+                        f"sids={sids} rounds={not_sub_rounds} (音轨已发布但未订上=订阅链断)",
+                        flush=True,
+                    )
+                # 【B 线订阅自愈(2026-09-30 官方对账定案)】RemoteTrackPublication
+                # .set_subscribed(True) 即官方手动订阅口(官方 job.py 自己在用;
+                # 此前误判"SDK 无手动订阅口")——检测到「已发布未订上」时重发订阅
+                # 请求,前 3 轮每轮一次、其后每 10 轮一次,打 SRC_TRACK_RESUBSCRIBE
+                # 观测行。call-72112fd7 形态(fwd 对 me- 轨零订阅静默 3 分钟)从
+                # 只观测升级为自愈。heal=False 回纯观测档(BOK_INTERP_SRC_HEAL=0)。
+                if (
+                    heal
+                    and (not_sub_rounds <= 3 or not_sub_rounds % 10 == 0)
+                    and part is not None
+                ):
+                    _healed: list[str] = []
+                    for _p in part.track_publications.values():
+                        if (
+                            getattr(_p, "kind", None) == _rtc.TrackKind.KIND_AUDIO
+                            and getattr(_p, "track", None) is None
+                        ):
+                            try:
+                                _p.set_subscribed(True)
+                                _healed.append(str(_p.sid))
+                            except Exception as exc:  # noqa: BLE001 - 自愈失败唔阻看护
+                                print(
+                                    f"[interp] SRC_TRACK_RESUBSCRIBE failed sid={getattr(_p, 'sid', '?')} exc={exc!r}",
+                                    flush=True,
+                                )
+                    if _healed:
+                        print(
+                            f"[interp] SRC_TRACK_RESUBSCRIBE identity={listen_identity} "
+                            f"sids={_healed} rounds={not_sub_rounds}",
+                            flush=True,
+                        )
+            else:
+                no_track_rounds = 0
+                not_sub_rounds = 0
+        except Exception as exc:  # noqa: BLE001 - 纵深防御:单轮异常绝不杀看护循环
+            print(f"[interp] SRC_TRACK_WATCH_ERR {exc!r}", flush=True)
+
+
 async def _mt_once(llm_provider, ctx, *, timeout_s: float = 15.0, target_lang: str = "") -> str:
     """单句直调翻译 LLM(StatelessMTLLM/通用 LLM 同一入口),超时保护防句堆积。
 
@@ -386,6 +476,34 @@ def _mt_model_valid(p: str) -> bool:
     return path.is_absolute() and path.exists()
 
 
+def _mt_endpoint_alive(base_url: str, timeout_s: float = 1.5) -> bool:
+    """MT 端点装配期探活(RC-2,2026-10-02 刀1):纯同步、绝不 raise。
+
+    判据=「有 HTTP 响应即活」:GET `{base}/models` 拿到任何 HTTP 响应(2xx/3xx,
+    或 401/404/5xx 等 HTTPError)=端点在场;连接错误/超时/协议错误=死。比
+    control_plane/model_routing_detect.probe_endpoint 更宽(那处 401 算活、404
+    不算)——本探针要拦的是「server 根本没起」(连接拒绝/超时)这类整通死亡,
+    有服务在听即不该跳 MT;/models 未实现返回 404 也证明有进程在。装配点是同步
+    函数,这里用 urllib(零新依赖);探活是数据不是异常,失败一律 False。
+    """
+    base = str(base_url or "").strip().rstrip("/")
+    if not base:
+        return False
+    import urllib.error
+    import urllib.request
+
+    try:
+        # 无鉴权头:401/404 抛 HTTPError,与成功响应同判「端点在场」。
+        with contextlib.closing(
+            urllib.request.urlopen(f"{base}/models", timeout=timeout_s)  # noqa: S310
+        ):
+            return True
+    except urllib.error.HTTPError:
+        return True
+    except Exception:  # noqa: BLE001 - URLError/超时/坏协议=死，绝不外抛
+        return False
+
+
 def _mt_sampling(env_key: str, mt_default: float) -> float:
     """MT 采样档解析(单测直喂):用户显式 env 优先,缺省/非法回落 MT 推荐值。
 
@@ -403,7 +521,9 @@ def _mt_sampling(env_key: str, mt_default: float) -> float:
     return v if math.isfinite(v) else mt_default
 
 
-def _build_llm_provider(llm_cfg: dict, target_lang: str, glossary: str = "", routing_raw: str = ""):
+def _build_llm_provider(
+    llm_cfg: dict, target_lang: str, glossary: str = "", routing_raw: str = "", mt_alive=None
+):
     """组装 B 线翻译 LLM:MT 小模型(:1236)优先,回退 DeepSeek 云端 / 主 LLM(:1235)。
 
     MT 分支按官方 Hy-MT2 推荐采样收窄,MlxLlmLLM 构造时显式传参(用户显式 env
@@ -414,11 +534,22 @@ def _build_llm_provider(llm_cfg: dict, target_lang: str, glossary: str = "", rou
     绝对路径且在盘)才进 MT 分支——非法值原样透传会让 mlx_lm server 挂死,跳过
     MT 走回退链 + 日志留值。
 
+    装配期 MT 探活(RC-2,2026-10-02 刀1):本地 MT 分支只验「模型在盘」不验
+    「server 活着」——:1236 死(模型在盘但 server 挂/prod 单元不含它)则整通每句
+    走异常兜底。现分支选定后 GET `{base}/models` 1.5s 探活(_mt_endpoint_alive),
+    死→日志一行 + 落既有回退链(绝不把整通押在死端点);`BOK_INTERP_MT_PROBE=0`
+    回旧行为(信任配置),`mt_alive` 注入口供单测免网络。云端 openai 档不经此闸
+    (路由表显式配置的云端点,探活只剩装配延迟)。
+
     `routing_raw`＝当通 CP 设置顶层 `model_routing_json` 原始串(2026-09-25 阶段 0):
     mt 车道 openai 档整体改走云端(本地路径门禁不适用——云端模型 id 非 mlx 路径);
     local 档显式改端点时换 base_url/model 后仍走既有门禁与回退链(挂死防线不绕);
     缺省 ""(未配置/kill-switch)＝env 档,既有读法逐字节(零漂移保证)。参数随当通
     会话传入,worker 并发多通不串线(禁模块级可变全局)。
+
+    max_tokens:整句翻译放宽到 512(默认 160 是客服短句口径,长句会截断)——经
+    构造参数显式下发,不再靠 entrypoint `os.environ.setdefault` 写进程 env
+    (常驻 worker 跨会话驻留,刀1 卫生)。
     """
     from .providers.livekit_plugins import (
         DeepSeekLLM,
@@ -444,6 +575,7 @@ def _build_llm_provider(llm_cfg: dict, target_lang: str, glossary: str = "", rou
                 top_p=_mt_sampling("LLM_TOP_P", 0.6),
                 top_k=int(_mt_sampling("LLM_TOP_K", 20)),
                 repetition_penalty=_mt_sampling("LLM_REPETITION_PENALTY", 1.05),
+                max_tokens=512,
             ),
             target_lang,
             glossary=glossary,
@@ -458,34 +590,43 @@ def _build_llm_provider(llm_cfg: dict, target_lang: str, glossary: str = "", rou
     else:
         mt_base = os.environ.get("MT_LLM_BASE_URL", "").strip()
         mt_model = os.environ.get("MT_LLM_MODEL", "").strip()
+    _mt_probe_dead = False
     if mt_base and _mt_model_valid(mt_model):
-        # Hy-MT2 官方推荐采样:temperature 0.7 / top_p 0.6 / top_k 20 / 重复惩罚
-        # 1.05——翻译要贴原文,采样收窄防小模型自由发挥/复读。经构造参数显式下发
-        # (用户显式 env 优先),唔再用 env setdefault——那会在同 worker 跨会话驻留,
-        # MT 失效落回主 LLM 时采样档跟着泄漏(评审 P2-3)。
-        print(f"[interp] llm=hy-mt2 base={mt_base}", flush=True)
-        # 滚动上下文(默认 0=关,治代词/指代断裂的 A/B 档):非零=带最近 N 对
-        # 「源→译」进 MT prompt 上文参考块(LLMA 式)。代价=参考段逐轮位移,
-        # prefix 从该段失效(术语槽/模板头仍命中)——延迟影响用
-        # scripts/probe_interpret_latency.py 实测后再定默认。
-        context_turns = int(os.environ.get("BOK_INTERP_MT_CONTEXT", "0") or 0)
-        return StatelessMTLLM(
-            MlxLlmLLM(
-                base_url=mt_base,
-                model=mt_model,
-                temperature=_mt_sampling("LLM_TEMPERATURE", 0.7),
-                top_p=_mt_sampling("LLM_TOP_P", 0.6),
-                top_k=int(_mt_sampling("LLM_TOP_K", 20)),
-                repetition_penalty=_mt_sampling("LLM_REPETITION_PENALTY", 1.05),
-            ),
-            target_lang,
-            glossary=glossary,
-            context_turns=context_turns,
-        )
+        if os.environ.get("BOK_INTERP_MT_PROBE", "1") == "1":
+            _probe = mt_alive or _mt_endpoint_alive
+            if not _probe(mt_base):
+                _mt_probe_dead = True
+                print(f"[interp] mt endpoint dead ({mt_base}) — fallback chain", flush=True)
+        if not _mt_probe_dead:
+            # Hy-MT2 官方推荐采样:temperature 0.7 / top_p 0.6 / top_k 20 / 重复惩罚
+            # 1.05——翻译要贴原文,采样收窄防小模型自由发挥/复读。经构造参数显式下发
+            # (用户显式 env 优先),唔再用 env setdefault——那会在同 worker 跨会话驻留,
+            # MT 失效落回主 LLM 时采样档跟着泄漏(评审 P2-3)。
+            print(f"[interp] llm=hy-mt2 base={mt_base}", flush=True)
+            # 滚动上下文(默认 0=关,治代词/指代断裂的 A/B 档):非零=带最近 N 对
+            # 「源→译」进 MT prompt 上文参考块(LLMA 式)。代价=参考段逐轮位移,
+            # prefix 从该段失效(术语槽/模板头仍命中)——延迟影响用
+            # scripts/probe_interpret_latency.py 实测后再定默认。
+            context_turns = int(os.environ.get("BOK_INTERP_MT_CONTEXT", "0") or 0)
+            return StatelessMTLLM(
+                MlxLlmLLM(
+                    base_url=mt_base,
+                    model=mt_model,
+                    temperature=_mt_sampling("LLM_TEMPERATURE", 0.7),
+                    top_p=_mt_sampling("LLM_TOP_P", 0.6),
+                    top_k=int(_mt_sampling("LLM_TOP_K", 20)),
+                    repetition_penalty=_mt_sampling("LLM_REPETITION_PENALTY", 1.05),
+                    max_tokens=512,
+                ),
+                target_lang,
+                glossary=glossary,
+                context_turns=context_turns,
+            )
 
-    if mt_base:
+    if mt_base and not _mt_probe_dead:
         # 挂死防线:base 有值但 model 非法(repo-id/占位符/空)——跳过 MT 走既有
         # 回退链(DeepSeek/主 LLM 原逻辑不动),日志留值方便查 env(超 60 字截断)。
+        # 探活死已单独打过日志,不重复报「model invalid」误导排障。
         shown = mt_model[:60] + ("…" if len(mt_model) > 60 else "")
         print(f"[interp] mt model invalid ('{shown}') — fallback (deepseek/main LLM 链)", flush=True)
 
@@ -496,6 +637,7 @@ def _build_llm_provider(llm_cfg: dict, target_lang: str, glossary: str = "", rou
             api_key=llm_cfg.get("api_key") or os.environ.get("DEEPSEEK_API_KEY", ""),
             model=llm_cfg.get("model") or os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
             base_url=llm_cfg.get("base_url") or os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
+            max_tokens=512,
         )
     # B 线回复/兜底车道路由(a_reply,2026-09-25):env 档=下方既有读法原样传参
     # (零漂移);openai 档=路由表下发端点/模型/密钥+思考旗(local routing 档只换
@@ -506,7 +648,8 @@ def _build_llm_provider(llm_cfg: dict, target_lang: str, glossary: str = "", rou
             env_base_url=llm_cfg.get("base_url")
             or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
             cfg_model=llm_cfg.get("model") or os.environ.get("MLX_LLM_MODEL", ""),
-        )
+        ),
+        max_tokens=512,
     )
 
 
@@ -883,6 +1026,62 @@ def _mt_consume_skip(backlog: "_PlaybackBacklog", text: str) -> bool:
     return False
 
 
+class _LagLedger:
+    """B 线感知延迟账本(RC-8,2026-10-02 刀1):源句 final → 译文交付的 FIFO 配对。
+
+    口径镜像 A 线(agent.py `_on_conversation_item`/`_report_assistant_turn`):
+    started_ms/ended_ms=通话相对毫秒(单调钟减当通基线 `_t0`),perceived_ms=源句
+    讲完→译文 item 落地(入账时刻)的墙钟毫秒。**代理口径**:B 线无 eou/tts 分段,
+    且框架在整句播报完成才发 conversation_item_added——perceived 是整链上界
+    (MT+合成+播报),不是首声北极星;生产 grep INTERP_LAG 行可得真实分布。
+
+    两条 FIFO 天然同序:源句按序 `note_src`(`_on_user_input` 句级 final,确认入队
+    成功才记),MT 完成按序 `done_mt`(弹 src 头进 pending),译文 item 按序
+    `pop_pending`。未产出译文的句(积压摘译/MT 空/超时/异常)必须 `drop_src` 消费
+    src 头,否则后续句全部错配。`clock` 注入口供单测免真钟。
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic):
+        self._clock = clock
+        self._src: deque = deque()      # [(t_src, src_chars)]
+        self._pending: deque = deque()  # [(t_src, src_chars, mt_ms)]
+
+    def note_src(self, text: str) -> None:
+        """源句 final 记账(句子确认进入 MT 队列后调用,防溢出摘句错配)。"""
+        self._src.append((float(self._clock()), len(str(text or ""))))
+
+    def drop_src(self) -> None:
+        """消费 src 头但不产出译文(摘译/空译文/MT 失败):保后续句配对对齐。"""
+        if self._src:
+            self._src.popleft()
+
+    def done_mt(self, mt_ms: int) -> None:
+        """该句 MT 完成且译文非空(say 前):src 头配对进 pending。"""
+        if not self._src:
+            return
+        t_src, src_chars = self._src.popleft()
+        self._pending.append((t_src, src_chars, int(mt_ms or 0)))
+
+    def pop_pending(self) -> tuple[float, int, int] | None:
+        """译文 item 落地时取配对头;无配对(兜底句/异常轮)=None,不落时间列。"""
+        if not self._pending:
+            return None
+        return self._pending.popleft()
+
+
+def _lag_turn_timing(rec: tuple[float, int, int], now: float, t0: float) -> tuple[int, int, int]:
+    """账本配对 → add_turn 三列(纯函数,单测直喂):镜像 A 线口径。
+
+    started_ms/ended_ms=通话相对毫秒(单调钟减当通基线),perceived_ms=源句 final→
+    译文 item 落地的墙钟毫秒(代理口径,见 _LagLedger docstring)。"""
+    t_src, _src_chars, _mt_ms = rec
+    return (
+        int((t_src - t0) * 1000),
+        int((now - t0) * 1000),
+        int((now - t_src) * 1000),
+    )
+
+
 async def _exit_stage(name: str, coro, timeout_s: float = 5.0):
     """退出路径单段守护（P1.c，2026-09-29 v2 spec §4）。
 
@@ -986,8 +1185,10 @@ async def entrypoint(ctx) -> None:
         except Exception:
             return float(default)
 
-    # 翻译输出按句合成,token 上限放宽(默认 160 是客服短句口径,长句会截断)。
-    os.environ.setdefault("LLM_MAX_TOKENS", "512")
+    # 翻译输出按句合成,token 上限放宽(默认 160 是客服短句口径,长句会截断)——
+    # 2026-10-02 刀1:不再 `os.environ.setdefault("LLM_MAX_TOKENS", "512")`(常驻
+    # worker 写入即驻留、跨会话泄漏),改由 _build_llm_provider 各构造点显式传参
+    # max_tokens 512 下发(构造参数,进程 env 零写入)。
 
     # VAD 基线与 A 线一致(0.45 静音/0.15 起声/0.75 抗噪):压缩端点会让轮次
     # 在整包 ASR 返回前提交,转写被丢——同传同样受此约束。
@@ -1061,7 +1262,11 @@ async def entrypoint(ctx) -> None:
     # 模型路由原始串（2026-09-25 阶段 0）：CP 设置顶层键与引擎卡同一 fetch（改道
     # 下一通生效，零重启）；缺键/空＝未配置，resolve_route 落回 env 缺省链。随当通
     # 会话传参，worker 并发多通不串线（禁模块级可变全局）。
-    llm_provider = _build_llm_provider(
+    # 构造整体下线程(2026-10-02 review 修):内部含 _mt_endpoint_alive 的同步
+    # urllib 1.5s 探活——死端点窗内若直跑在事件循环上会拖住同 worker 的并发
+    # job;装配非热路径,to_thread 包裹后循环零阻塞。
+    llm_provider = await asyncio.to_thread(
+        _build_llm_provider,
         llm_cfg,
         target_lang,
         glossary=_glossary,
@@ -1094,13 +1299,28 @@ async def entrypoint(ctx) -> None:
     # 落库:原文/译文拆成两条 turn(2026-09-07 审计闭环——旧行为合成一条,
     # 无 language 标签、译文延迟无从查)。译文行带 latency;原文行即时落,
     # 译文后到再落——总结/蒸馏按序读仍是对照文本(language 字段区分)。
+    # B 线感知延迟账本(RC-8,2026-10-02 刀1):当通单调基线 + FIFO 配对(见
+    # _LagLedger docstring)。口径镜像 A 线——started/ended=通话相对毫秒,
+    # perceived=源句 final→译文 item 落地(代理口径:整链上界,含播报)。
+    _t0 = time.monotonic()
+    _lag = _LagLedger()
     last_user = {"text": ""}
 
-    async def _add_turn(text: str, language: str, latency: int = 0) -> None:
+    async def _add_turn(
+        text: str,
+        language: str,
+        latency: int = 0,
+        *,
+        started_ms: int = 0,
+        ended_ms: int = 0,
+        perceived_ms: int = 0,
+    ) -> None:
         try:
             await cp.add_turn(
                 call_id, speaker_role, text, provider="interpret", latency_ms=latency, language=language,
                 line="b", speaker=speaker_role,  # B 线账本:此前缺省误标 line=a(P0 遗留)
+                # RC-8:源句 final→译文入账时间轴(call 相对毫秒,缺省 0=无配对不落)。
+                started_ms=started_ms, ended_ms=ended_ms, perceived_ms=perceived_ms,
             )
         except Exception as exc:  # pragma: no cover - 落库失败不阻翻译
             print(f"[interp] add_turn failed: {exc!r}", flush=True)
@@ -1137,7 +1357,27 @@ async def entrypoint(ctx) -> None:
             last_user["text"] = text
         elif role == "assistant":
             latency = int(_mt_latency.get("ms") or 0)
-            _spawn_ledger(_add_turn(f"译文：{_strip_voice_tags(text)}", target_lang, latency))
+            # RC-8(2026-10-02 刀1):译文 item 落地时取账本配对,落时间轴三列+
+            # 每句 INTERP_LAG 观测行(计时起点=源句 final,代理口径见 _LagLedger)。
+            # 无配对(MT 兜底句/异常轮):三列缺省 0,add_turn 与旧行为逐字节同。
+            _rec = _lag.pop_pending()
+            if _rec is not None:
+                _started_ms, _ended_ms, _perceived_ms = _lag_turn_timing(
+                    _rec, time.monotonic(), _t0
+                )
+                print(
+                    f"[interp] INTERP_LAG src_chars={_rec[1]} mt_ms={_rec[2]} "
+                    f"perceived_ms={_perceived_ms}",
+                    flush=True,
+                )
+                _spawn_ledger(
+                    _add_turn(
+                        f"译文：{_strip_voice_tags(text)}", target_lang, latency,
+                        started_ms=_started_ms, ended_ms=_ended_ms, perceived_ms=_perceived_ms,
+                    )
+                )
+            else:
+                _spawn_ledger(_add_turn(f"译文：{_strip_voice_tags(text)}", target_lang, latency))
 
     session.on("conversation_item_added", _on_item)
 
@@ -1151,6 +1391,7 @@ async def entrypoint(ctx) -> None:
                 # 背压摘译(2026-09-23 修复波#2):积压门 arm 的摘译指令在取句时
                 # 消费——跳过最旧待译源句的 MT+播报(原文行已落库=摘译保文)。
                 if _mt_consume_skip(backlog, text):
+                    _lag.drop_src()  # 摘译句不产出译文:消费 src 头保后续配对对齐
                     continue
                 t0 = time.perf_counter()
                 ctx = _build_mt_context(_llm_instructions, list(_mt_pairs), text)
@@ -1158,8 +1399,12 @@ async def entrypoint(ctx) -> None:
                 _mt_latency["ms"] = int((time.perf_counter() - t0) * 1000)
                 if translated:
                     _mt_pairs.append((text, translated))
+                    # 先 say 后记账:say 失败(会话关闭)不留 pending 孤儿——待配对
+                    # 队列只装「交付已发起」的句,与 item 到达序仍一一对应(RC-8)。
                     session.say(_apply_voice_tags(translated) if voice_tags else translated)
+                    _lag.done_mt(_mt_latency["ms"])
                 else:
+                    _lag.drop_src()
                     print(f"[interp] mt empty for {len(text)} chars, skipped", flush=True)
             except asyncio.CancelledError:
                 raise
@@ -1174,10 +1419,26 @@ async def entrypoint(ctx) -> None:
                 )
                 try:
                     session.say(_mt_fail_line(target_lang))
+                    # 兜底句也是一次交付(2026-10-02 LagLedger 错位根修):say 出声
+                    # 就配对记账(done_mt(0),mt_ms=0=非真译),否则 _on_item 会偷弹
+                    # **下一条真译文**的 pending——三列时间轴整体错一位、末条永不弹。
+                    # 先 say 后记账与成功路径同款:say 失败(会话关闭)不留孤儿。
+                    _lag.done_mt(0)
                 except Exception as say_exc:  # noqa: BLE001 - 兜底不出声也不阻后续
+                    _lag.drop_src()
                     print(f"[interp] mt timeout fallback say failed: {say_exc!r}", flush=True)
             except Exception as exc:  # 单句失败不阻后续
+                # RC-2(2026-10-02 刀1):连接错误/装配异常此前只 print 不出声——
+                # :1236 死亡(模型在盘但 server 挂)时每句都走这条=整通只有日志没有
+                # 声音,与超时静默(已修的兄弟 bug)同构。与超时分支同款:目标语中性
+                # 请示语兜底,绝不回放源文;译文行故意不补(诚实缺行)。say 再包 try。
                 print(f"[interp] mt/say failed: {exc!r}", flush=True)
+                try:
+                    session.say(_mt_fail_line(target_lang))
+                    _lag.done_mt(0)  # 同上:兜底句配对记账,防 _on_item 错位
+                except Exception as say_exc:  # noqa: BLE001 - 兜底不出声也不阻后续
+                    _lag.drop_src()
+                    print(f"[interp] mt fail fallback say failed: {say_exc!r}", flush=True)
             finally:
                 _src_q.task_done()
 
@@ -1197,6 +1458,10 @@ async def entrypoint(ctx) -> None:
             _src_q.put_nowait(text)
         except asyncio.QueueFull:  # 48 句积压=极端场景,摘最新句防雪崩
             print("[interp] source queue overflow, sentence dropped(摘译)", flush=True)
+            return
+        # RC-8:确认入队成功才记账本(溢出摘掉的句不进 MT/不出 item=不进配对);
+        # put_nowait 到 note_src 之间无 await,MT worker 不可能先消费该句。
+        _lag.note_src(text)
 
     session.on("user_input_transcribed", _on_user_input)
 
@@ -1369,8 +1634,14 @@ async def entrypoint(ctx) -> None:
     #   SRC_NO_AUDIO_TRACK        —— 对端根本没发麦(未开传译/浏览器发布失败);
     #   SRC_TRACK_NOT_SUBSCRIBED  —— 音轨已发布但本 worker 订不上(订阅链断,
     #                                下一例现场直接指认服务器/FFI 哪层断)。
-    # 纯遥测零干预(SDK 无手动订阅口);=0 关。fwd(音频方向)为主要受益面。
-    async def _src_track_watch() -> None:
+    # 纯遥测+订阅自愈(=0 关);fwd(音频方向)为主要受益面。
+    # RC-1(2026-10-02 刀1):循环体提取为模块级 `_src_track_watch_loop`(假 room
+    # 可直驱单测),此处只解析 env 旋钮 + 池化 spawn——旧闭包 heal 分支引用未定义
+    # `part`(首次进 unsubscribed 态 NameError),且裸 create_task 无 done-callback
+    # 静默死;入 `_watch_tasks` 池后异常必有 SRC_WATCH_ERR 日志。
+    _watch_tasks: set = set()
+
+    def _spawn_src_watch() -> None:
         if os.environ.get("BOK_INTERP_SRC_TELEMETRY", "1") != "1":
             return
         try:
@@ -1379,74 +1650,14 @@ async def entrypoint(ctx) -> None:
             interval = 10.0
         if interval <= 0:
             interval = 10.0
-        from livekit import rtc as _rtc  # 局部导入:模块头部无 rtc 面
+        heal = os.environ.get("BOK_INTERP_SRC_HEAL", "1") == "1"
+        _spawn_pooled_task(
+            _src_track_watch_loop(room, listen_identity, closed, interval, heal),
+            _watch_tasks,
+            "SRC_WATCH_ERR",
+        )
 
-        no_track_rounds = 0
-        not_sub_rounds = 0
-        while True:
-            try:
-                await asyncio.wait_for(closed.wait(), timeout=interval)
-                return  # 会话收线,收队
-            except asyncio.TimeoutError:
-                pass
-            state, sids = _src_track_state(
-                room.remote_participants.get(listen_identity), _rtc.TrackKind.KIND_AUDIO
-            )
-            if state == "none":
-                not_sub_rounds = 0
-                no_track_rounds += 1
-                if no_track_rounds == 3 or no_track_rounds % 10 == 0:
-                    print(
-                        f"[interp] SRC_NO_AUDIO_TRACK identity={listen_identity} "
-                        f"rounds={no_track_rounds} (对端未发布麦克风/未开传译)",
-                        flush=True,
-                    )
-            elif state == "unsubscribed":
-                no_track_rounds = 0
-                not_sub_rounds += 1
-                if not_sub_rounds <= 3 or not_sub_rounds % 10 == 0:
-                    print(
-                        f"[interp] SRC_TRACK_NOT_SUBSCRIBED identity={listen_identity} "
-                        f"sids={sids} rounds={not_sub_rounds} (音轨已发布但未订上=订阅链断)",
-                        flush=True,
-                    )
-                # 【B 线订阅自愈(2026-09-30 官方对账定案)】RemoteTrackPublication
-                # .set_subscribed(True) 即官方手动订阅口(官方 job.py 自己在用;
-                # 此前误判"SDK 无手动订阅口")——检测到「已发布未订上」时重发订阅
-                # 请求,前 3 轮每轮一次、其后每 10 轮一次,打 SRC_TRACK_RESUBSCRIBE
-                # 观测行。call-72112fd7 形态(fwd 对 me- 轨零订阅静默 3 分钟)从
-                # 只观测升级为自愈。BOK_INTERP_SRC_HEAL=0 回纯观测档。
-                if (
-                    os.environ.get("BOK_INTERP_SRC_HEAL", "1") == "1"
-                    and (not_sub_rounds <= 3 or not_sub_rounds % 10 == 0)
-                    and part is not None
-                ):
-                    _healed: list[str] = []
-                    for _p in part.track_publications.values():
-                        if (
-                            getattr(_p, "kind", None) == _rtc.TrackKind.KIND_AUDIO
-                            and getattr(_p, "track", None) is None
-                        ):
-                            try:
-                                _p.set_subscribed(True)
-                                _healed.append(str(_p.sid))
-                            except Exception as exc:  # noqa: BLE001 - 自愈失败唔阻看护
-                                print(
-                                    f"[interp] SRC_TRACK_RESUBSCRIBE failed sid={getattr(_p, 'sid', '?')} exc={exc!r}",
-                                    flush=True,
-                                )
-                    if _healed:
-                        print(
-                            f"[interp] SRC_TRACK_RESUBSCRIBE identity={listen_identity} "
-                            f"sids={_healed} rounds={not_sub_rounds}",
-                            flush=True,
-                        )
-            else:
-                no_track_rounds = 0
-                not_sub_rounds = 0
-
-    # FIRE_FORGET_EXEMPT: 纯遥测看护,closed 置位(会话关闭)自退,job teardown 兜底
-    asyncio.create_task(_src_track_watch())
+    _spawn_src_watch()
     try:
         await closed.wait()
     finally:

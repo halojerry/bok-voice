@@ -149,7 +149,11 @@ class Side:
                 data=seg, sample_rate=16000, num_channels=1, samples_per_channel=len(seg) // 2
             )
             await self.audio_source.capture_frame(frame)
-            await asyncio.sleep(0.08)
+            # 真实时节奏(2026-10-02):0.08 与 capture_frame 的实时背压打架=实际
+            # 发布速率被压到 ~0.5x(实测插件侧 samples_ms≈500/s)——句子有效节奏
+            # 翻倍拖慢,backlog 门的结构性触发条件(depth≥3)永不成形。0.10 对齐
+            # A 线 push_pcm(real_time=True) 的真实时纪律。
+            await asyncio.sleep(0.10)
 
     async def close(self) -> None:
         for t in self._tasks:

@@ -77,6 +77,9 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     "services/csc-sidecar/selftest.py": re.compile(
         r"yue =|\"text\": yue|== yue|YUE_MARKERS|yue_markers|cantonese_markers", re.IGNORECASE
     ),
+    # CSC 种子测试集(数据文件):"yue-fix-N"/"yue-keep-N" 是**用例 id 分组前缀**
+    # (修复组/保持组),非语言字段——数据里语言字段一律 "cantonese"。窄豁免 id 形状。
+    "data/csc/csc_testset.json": re.compile(r"yue-(fix|keep)"),
     # 计划文档里的粤语文本检测示例代码（_YUE_MARKS 正则只是「识别粤语字」的
     # 变量名，非语言字段赋值）——4b0dd6b 存量，按门禁政策文档白名单收口。
     "docs/superpowers/plans/2026-09-17-qa-canvas-phase1.md": re.compile(r"_YUE_MARKS"),
