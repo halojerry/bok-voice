@@ -16,7 +16,8 @@ state 压到 ≤600 字（实测 384 tok 内判读正常）且**客户原话置�
 截没）。宁短勿长。
 
 env 读取面（须入 tools/bok.py `_FORWARD_ENV`——D14 教训，由 bok 侧立法）：
-- `BOK_LAYA_JUDGE`：意图快判总闸，默认 "0"=零调用零日志零变化（enabled 闸在最外层）；
+- `BOK_LAYA_JUDGE`：意图快判总闸，默认 "1"=随栈启用（="0" 显式关=零调用零日志
+  零变化；enabled 闸在最外层，fail-open 铁律不变）；
 - `BOK_LAYA_SIDECAR_URL`：sidecar 基址，默认 http://127.0.0.1:8791；
 - `BOK_LAYA_QA`：QA 复核车道总闸，默认 "0"=零调用零变化（与意图闸独立立法）；
 - `BOK_LAYA_QA_TIMEOUT_MS`：QA 判定预算，默认 300ms；
@@ -56,8 +57,9 @@ HISTORY_LINE_MAX_CHARS = 120
 
 
 def laya_judge_enabled() -> bool:
-    """总闸（默认关）：`BOK_LAYA_JUDGE=="1"` 才启用旁路——零变化的结构性保证。"""
-    return os.environ.get("BOK_LAYA_JUDGE", "0") == "1"
+    """总闸（默认开 "1"）：`BOK_LAYA_JUDGE=="0"` 显式关才禁用旁路；未设=启用，
+    任一失败路径仍 fail-open 落回 9B 旧路（零命中变化的结构性保证）。"""
+    return os.environ.get("BOK_LAYA_JUDGE", "1") == "1"
 
 
 def laya_base_url() -> str:

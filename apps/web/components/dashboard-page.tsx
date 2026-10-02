@@ -6,6 +6,7 @@ import { ArrowRight, Plus } from "lucide-react";
 import { api } from "@/lib/api";
 import { AppShell, ErrorState, LoadingState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
+import { useSession } from "@/components/session-context";
 import { friendlyErrorText, useControlPlaneReady } from "@/lib/api-ready";
 
 // ---- 宽类型工具：/api/stats/dashboard 全字段兜底，端点缺位/字段缺失不白屏 ----
@@ -125,6 +126,11 @@ export function DashboardPage() {
 function DashboardContent() {
   const { accountId, health } = useAccount();
   const cp = useControlPlaneReady();
+  // 引擎设置面属主专属（2026-09-27，同 navigation ownerOnly 判据）：
+  // admin/user 不显示入口（路由守卫也会拦，这里防死链）。
+  const session = useSession();
+  const engineSettingsVisible =
+    !!session && (session.anonymous || (session.role === "root" && !session.anonymous));
   const [stats, setStats] = useState<Row | null>(null);
   const [calls, setCalls] = useState<Row[]>([]);
   const [loading, setLoading] = useState(true);
@@ -325,7 +331,9 @@ function DashboardContent() {
                 <Link href="/objects" className="btn-ghost w-full">对象管理</Link>
                 <Link href="/knowledge" className="btn-ghost w-full">知识库</Link>
                 <Link href="/supervisor" className="btn-ghost w-full">主管台</Link>
-                <Link href="/settings" className="btn-ghost w-full">设置</Link>
+                {engineSettingsVisible ? (
+                  <Link href="/settings" className="btn-ghost w-full">设置</Link>
+                ) : null}
               </div>
               <div className="mt-4 rounded-lg bg-muted/60 p-3 text-xs muted">
                 控制面状态：{health === false ? "离线" : health === true ? "在线" : "未知"}

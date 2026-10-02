@@ -1,7 +1,7 @@
 """Laya 决策旁路客户端（2026-09-26，docs/LAYA-EVAL.md 第一落位 intent judge）。
 
 覆盖面：
-- enabled 闸（BOK_LAYA_JUDGE 默认 "0"=零调用）与健康缓存（TTL/fail-open/归因）；
+- enabled 闸（BOK_LAYA_JUDGE 默认 "1" 随栈启用，显式 "0" 关）与健康缓存（TTL/fail-open/归因）；
 - decide_choice 单问封装：超时/异常/坏形一律 None=回落（fail-open 铁律）、
   below_floor 透传、NONE 自动补进候选面、未知 choice 拒收；
 - build_intent_state：客户原话置头（LAYA-EVAL 截尾坑）、轮数裁剪、预算纪律；
@@ -110,18 +110,21 @@ def _decide_response(choice: str, conf: float, *, below: bool = False) -> dict:
 # ---- enabled 闸 / base_url ----
 
 
-def test_gate_default_off_and_env_on(monkeypatch):
+def test_gate_default_on(monkeypatch):
     monkeypatch.delenv("BOK_LAYA_JUDGE", raising=False)
-    assert laya_judge_enabled() is False  # 默认 "0"=零变化的结构性保证
+    assert laya_judge_enabled() is True  # 未设 env → 默认 "1" 随栈启用
+
+
+def test_gate_env_off(monkeypatch):
     monkeypatch.setenv("BOK_LAYA_JUDGE", "0")
-    assert laya_judge_enabled() is False
+    assert laya_judge_enabled() is False  # 显式 "0" 才关（kill-switch）
     monkeypatch.setenv("BOK_LAYA_JUDGE", "1")
     assert laya_judge_enabled() is True
 
 
 def test_gate_off_short_circuits_zero_transport(monkeypatch):
     """闸关=零调用（mock 传输断言 not called，fail-open 的最外层）。"""
-    monkeypatch.delenv("BOK_LAYA_JUDGE", raising=False)
+    monkeypatch.setenv("BOK_LAYA_JUDGE", "0")
     fake = _FakeSidecar()
     assert asyncio.run(decide_choice("state", "instr", [_ID_A])) is None
     assert fake.health_calls == 0 and fake.decide_payloads == []
