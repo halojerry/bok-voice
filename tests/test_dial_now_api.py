@@ -76,7 +76,18 @@ def _client_and_repo(monkeypatch, repo=None):
     from control_plane.main import app
 
     repo = repo if repo is not None else InMemoryBusinessRepository()
-    monkeypatch.setattr("control_plane.main._repo", lambda: repo)
+    # 生产 parity（2026-10-02 flake 根修）：SQL 仓时 `_repo()` 必须每调用建一个
+    # 新 session 的仓——旧姿势把夹具的**同一个 session 实例**同时交给 TestClient
+    # 工作线程与 CP 后台路径（后台会 close 所持 repo），与测试线程手里的 ORM 对象
+    # 赛跑 → CI 慢机上 ResourceClosedError / identity-map 失效族随机红
+    # （#162/#164 各咬一次）。工厂由 sql_repo 夹具挂 `_bok_test_session_factory`。
+    _fac = getattr(repo, "_bok_test_session_factory", None)
+    if _fac is not None:
+        monkeypatch.setattr(
+            "control_plane.main._repo", lambda: SqlAlchemyBusinessRepository(_fac())
+        )
+    else:
+        monkeypatch.setattr("control_plane.main._repo", lambda: repo)
     return TestClient(app), repo
 
 
@@ -94,8 +105,13 @@ def sql_repo(tmp_path):
         connect_args={"check_same_thread": False, "timeout": 30},
     )
     models.create_all(engine)
-    session = sessionmaker(bind=engine, expire_on_commit=False, future=True)()
-    yield SqlAlchemyBusinessRepository(session)
+    _factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    session = _factory()
+    repo = SqlAlchemyBusinessRepository(session)
+    # 挂 session 工厂给 _client_and_repo：_repo() 每调用新 session（生产语义），
+    # 测试侧 setup/断言仍走本 session——双线程不再共用一条 SessionTransaction。
+    repo._bok_test_session_factory = _factory
+    yield repo
     session.close()
     engine.dispose()
 
