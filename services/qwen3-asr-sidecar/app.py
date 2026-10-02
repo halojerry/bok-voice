@@ -1176,10 +1176,34 @@ def _startup() -> None:
     else:
         service.load()
 
+def _health_state() -> tuple[bool, str]:
+    """就绪真话（2026-10-02 编排审计第二波 · readiness）：uvicorn socket 先于
+    权重可用，旧版恒 200 让 TCP/健康面「绿着坏」。
+
+    就绪判据 = **现在就能服务本档引擎**：
+    - eager 档（显式 BOK_ASR_ENGINE=qwen3）：Qwen3 权重已载；
+    - 设计跳载档（sensevoice，_qwen3_deferred）：SV CPU 车道在役 = 就绪——首个
+      qwen3 路径请求才懒加载，模型未载是设计态不是故障（smoke_sidecars
+      「已载或按期跳载」同款判据）；返 503 会把默认生产栈判成永久 DOWN；
+    - 懒加载在飞（_loading）/ 装载失败（_load_error）→ 未就绪（503）。
+    """
+    if service._load_error:
+        return False, "error"
+    if service._model is not None:
+        return True, "ready"
+    if service._qwen3_deferred and not service._loading:
+        return True, "ready"
+    return False, "loading"
+
+
 @app.get("/health")
-def health() -> dict:
-    return {
+def health() -> JSONResponse:
+    """200=可服务 / 503=loading|error。键面与旧版完全一致（新增 status），
+    `_relaxed_healthy`（任何 HTTP 应答=进程在）与 smoke 探针零改动。"""
+    ready, status = _health_state()
+    body = {
         "ok": True,
+        "status": status,
         "backend": BACKEND,
         "model": MODEL_PATH,
         "model_ready": service._model is not None,
@@ -1188,6 +1212,7 @@ def health() -> dict:
         # 路径请求触发懒加载后翻 false。
         "qwen3_deferred": service._qwen3_deferred,
     }
+    return JSONResponse(body, status_code=200 if ready else 503)
 
 @app.post("/api/start")
 async def start(

@@ -995,15 +995,32 @@ def _startup() -> None:
     service.load()
 
 
+def _health_state() -> tuple[bool, str]:
+    """就绪真话（2026-10-02 编排审计第二波 · readiness）：uvicorn socket 先于
+    权重装载，旧版恒 200 让 TCP/健康面「绿着坏」（serve 等待环会等到半死进程）。
+
+    就绪判据=preset 权重已载（`load()` 单飞同步装载，失败落 _load_error）；
+    双载档 clone 缺席不算缺口（preset 车道在役，clone 请求另有 503 人话）。
+    """
+    if service._preset_model is not None:
+        return True, "ready"
+    return False, "error" if service._load_error else "loading"
+
+
 @app.get("/health")
-def health() -> dict:
-    return {
+def health() -> JSONResponse:
+    """200=可服务 / 503=loading|error。键面与旧版完全一致（新增 status）——
+    `_relaxed_healthy`（任何 HTTP 应答=进程在）与其余消费方零改动。"""
+    ready, status = _health_state()
+    body = {
         "ok": True,
+        "status": status,
         "backend": BACKEND,
         "model_ready": service._preset_model is not None,
         "clone_model_ready": service._clone_model is not None,
         "load_error": service._load_error,
     }
+    return JSONResponse(body, status_code=200 if ready else 503)
 
 
 @app.get("/v1/speakers")
