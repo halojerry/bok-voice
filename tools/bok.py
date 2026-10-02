@@ -1647,11 +1647,18 @@ def _start_settle_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> 
     # (8 sequences)LRU 逐出回复链,R8 3312 tok 全量重 prefill 10.6s 独占单生成
     # 线,后续轮 1.1-1.3k tok 连环全量 miss 各 ~4s=PERCEIVED p95 5622 的全部来源
     # (:1235 同病灶同修,见其注释:每请求插 system/对话/完成 多条前缀键,LRU
-    # 轮换把共享前缀挤掉)。bytes 上限 2GB 不动=内存预算真闸门,槽位只放宽序列数。
+    # 轮换把共享前缀挤掉)。
+    # bytes 2GB→4GB(2026-10-02 实机验证波):FLOW20 连跑两通时 2GB 帽逐出断崖
+    # (Prompt Cache 20 seq/2.70GB→15 seq/1.75GB 实录)——run2 的 R1 前缀被逐,
+    # 2948 tok 全量 prefill 16s(与 28 tok 装配 prewarm 同线程交替)=首 token
+    # 3s 超时→fallback→LATE_ANSWER 坏标记链。与 :1235 同档 4GB;十八波「2GB=
+    # 内存预算真闸门」的判断基于云 TTS 前的全栈 27GB 常驻年代,现云姿态栈
+    # ~12GB+9B 权重 5.3GB,4GB cache 总预算充裕(16GB 机型可 BOK_SETTLE_CACHE_BYTES
+    # 显式下调……本键直改档位,与 :1235 的 BOK_LLM_PROMPT_CACHE_BYTES 覆盖独立)。
     _start_proc(
         [str(llm_py), str(MLX_SERVER_WRAPPER),
          "--model", settle_model, "--host", "127.0.0.1", "--port", "1237",
-         "--prompt-cache-size", "128", "--prompt-cache-bytes", "2GB",
+         "--prompt-cache-size", "128", "--prompt-cache-bytes", "4GB",
          "--chat-template-args", '{"enable_thinking":false}', "--log-level", _log_level],
         run_dir / "settle-llm.pid",
         log_dir / "settle-llm.log",
