@@ -67,7 +67,14 @@ def _lane_registration_sites(src: str):
     import re
 
     key = "_register_reply_lane("
-    starts = [m.start() for m in re.finditer(re.escape(key), src)]
+    # 排除 def 定义本身(2026-10-02 批3 合流校准):main 的 def 跨行形参
+    # (`async def _register_reply_lane(\n    *,\n    lane...`)同样含本串,
+    # 误收为「调用点」后其 1200 字符窗口(def 体+邻函数)会触发假阳性劈叉断言。
+    starts = [
+        m.start()
+        for m in re.finditer(re.escape(key), src)
+        if not re.search(r"def\s*$", src[max(0, m.start() - 40) : m.start()])
+    ]
     sites = []
     for i, s in enumerate(starts):
         depth = 0

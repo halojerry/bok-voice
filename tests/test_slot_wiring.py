@@ -39,9 +39,14 @@ def test_slot_assembly_point_reads_gate_and_builds_card():
 
 
 def test_slot_push_helper_replaces_all_seven_sites():
-    """编排器给槽单点：_push_flow_state 收口全部 7 个推进/直念推点；
-    直调 set_flow_current(current_step_text()) 只剩 helper 内一处（旧路径）。"""
-    assert _AGENT_SRC.count("_push_flow_state(context_state, flow_ctrl)") == 8  # def + 7 调用点
+    """编排器给槽单点：_push_flow_state 收口全部推进/直念推点；
+    直调 set_flow_current(current_step_text()) 只剩 helper 内一处（旧路径）。
+
+    计数=def + 6 调用点（2026-10-02 批3 合流校准）：fp 线原 7 个独立点中的
+    「catchall jump 推进」与「常规图 jump」在 main 的 _gdispatch 闭包重构里
+    已收编为**同一处** push——每个推进路径仍全被 helper 覆盖（钩子在
+    helper 体内=全调用点生效），源级计数相应 8→7。"""
+    assert _AGENT_SRC.count("_push_flow_state(context_state, flow_ctrl)") == 7  # def + 6 调用点
     assert _AGENT_SRC.count("context_state.set_flow_current(flow_ctrl.current_step_text())") == 1
     # 装配点分流：slot 只推槽位（总览族不进 prompt）；legacy 走 set_flow。
     assert _AGENT_SRC.count("context_state.set_slot_step(flow_ctrl.slot_step_view())") == 2
