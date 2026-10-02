@@ -441,8 +441,15 @@ def test_early_disconnected_client_returns_499_without_upstream():
                 "root_path": "", "server": ("px", 80), "client": ("127.0.0.1", 1),
                 "headers": [(b"content-type", b"application/json")],
             }
+            # 两段式 receive(2026-10-02 实机雷修复回归钉):先 body 后 disconnect
+            # ——body 必须能被完整读走(旧版 is_disconnected 在 body 前探测会偷吃
+            # 首 chunk,ASGITransport 失明、真 uvicorn 挂死),断开在 body 之后才报。
+            state = {"n": 0}
 
             async def receive():
+                state["n"] += 1
+                if state["n"] == 1:
+                    return {"type": "http.request", "body": b'{"stream": true}', "more_body": False}
                 return {"type": "http.disconnect"}
 
             sent: list[dict] = []
@@ -459,3 +466,59 @@ def test_early_disconnected_client_returns_499_without_upstream():
         assert qp.GATE.stats()["active"] == 0, "断开请求不得占槽"
     finally:
         qp._CLIENT = None
+
+
+def test_real_uvicorn_body_reaches_handler_not_eaten_by_probe():
+    """真 uvicorn 起 qp.app:POST body 必须完整到达 handler 并拿到 200。
+
+    回归钉(2026-10-02 实机雷):旧版 `_generate` 在读 body 前调
+    request.is_disconnected()——它在取消 scope 里试收一条 receive 消息,真
+    uvicorn 下 body 首 chunk 已就绪会被偷吃 → request.body() 永不完成 →
+    请求挂死(curl 3 分钟超时)。ASGITransport 对该语义结构性失明(取消
+    scope 里 await 直接抛,消息不被消费),只有真 server 能抓——与
+    test_proxy_gate_holds_until_stream_exhausted 同款「真 uvicorn 钉」姿势。
+    上游用桩(ASGITransport),量的是代理自身 的 receive 链。"""
+    import socket
+    import threading
+    import time as _time
+
+    import uvicorn
+
+    stub = FastAPI()
+
+    @stub.post("/v1/chat/completions")
+    async def _gen():  # noqa: ANN202
+        async def stream():
+            yield b"data: ok\n\n"
+
+        return StreamingResponse(stream(), media_type="text/event-stream")
+
+    qp._CLIENT = httpx.AsyncClient(transport=httpx.ASGITransport(app=stub), base_url="http://stub")
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(qp.app, host="127.0.0.1", port=port, log_level="error"))
+    th = threading.Thread(target=server.run, daemon=True)
+    th.start()
+    for _ in range(100):
+        if server.started:
+            break
+        time.sleep(0.05)
+    assert server.started
+    try:
+        async def call():
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as c:  # 挂死=超时=红
+                r = await c.post(
+                    f"http://127.0.0.1:{port}/v1/chat/completions",
+                    json={"stream": True},
+                )
+                body = b"".join([p async for p in r.aiter_bytes()])
+                return r.status_code, len(body)
+
+        code, blen = asyncio.run(call())
+        assert code == 200 and blen > 0, f"body 应完整到达并被转发: code={code} len={blen}"
+        assert qp.GATE.stats()["active"] == 0, "流结束后槽位必须归还"
+    finally:
+        qp._CLIENT = None
+        server.should_exit = True
+        th.join(timeout=5)
