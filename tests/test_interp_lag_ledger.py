@@ -80,6 +80,29 @@ def test_lag_ledger_note_src_counts_chars_not_bytes():
     assert led.pop_pending()[1] == len("译文abc") == 5  # str 长度(中英混排按字符)
 
 
+def test_lag_ledger_fallback_say_gets_own_pairing():
+    """MT 兜底句也配对记账(2026-10-02 错位根修回归钉)。
+
+    旧 bug:超时/异常分支 drop_src 后 session.say(_mt_fail_line(...)) 出声——
+    兜底 item 落地时 _on_item 的 pop_pending **偷弹下一条真译文的 pending**,
+    三列时间轴整体错一位、末条永不弹。修法=say 成功即 done_mt(0)(mt_ms=0=
+    非真译但 perceived 诚实);say 失败才 drop_src(无 item 不留孤儿)。"""
+    led = _LagLedger(clock=lambda: 1.0)
+    led.note_src("超时句")
+    led.note_src("真译文句")
+    # 超时轮:say 出声 → done_mt(0)(兜底句自己的配对);不再是 drop_src
+    led.done_mt(0)
+    rec_fallback = led.pop_pending()
+    assert rec_fallback is not None
+    assert rec_fallback[1] == len("超时句")
+    assert rec_fallback[2] == 0, "兜底句 mt_ms=0(非真译)"
+    # 下一句真译文的配对不被偷弹
+    led.done_mt(240)
+    rec_real = led.pop_pending()
+    assert rec_real == (1.0, len("真译文句"), 240)
+    assert led.pop_pending() is None
+
+
 def test_lag_turn_timing_relative_ms_mirrors_aline():
     """三列口径:started/ended=通话相对毫秒(减当通基线 t0),perceived=墙钟差。"""
     rec = (100.0, 7, 250)

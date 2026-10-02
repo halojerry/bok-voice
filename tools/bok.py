@@ -2205,6 +2205,9 @@ _FORWARD_ENV = (
     # —— ASR（agent 侧读的运维档；sidecar 专属键走 asr_env 另注入） ——
     "BOK_ASR_HOTWORDS",
     "BOK_ASR_PARTIAL_SLOW_MS",
+    # B 线正压臂波(2026-10-02):ASR 帧级调试观测(掉帧/水位打点)——
+    # 运维键,prod 不透传=死门(test_forward_env 钉)。
+    "BOK_ASR_FRAME_DEBUG",
     # 开采热词(第四来源,2026-09-28):agent 装配期 GET /api/asr/hotwords 一次;
     # 默认 "1"(端点缺席 fail-open 空串),="0" 跳过零 HTTP 调用。
     "BOK_MINED_HOTWORDS",
