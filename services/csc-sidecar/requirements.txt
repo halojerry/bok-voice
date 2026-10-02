@@ -1,0 +1,5 @@
+fastapi>=0.110
+uvicorn>=0.27
+# macOS arm64 wheel 自带 MPS 后端（约 2GB 磁盘）。MPS 优先、CPU 回退在 app.py 里判。
+torch>=2.2
+transformers>=4.40,<5
