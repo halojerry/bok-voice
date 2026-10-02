@@ -140,8 +140,10 @@ def test_detect_profile_env_override(monkeypatch):
     assert capacity.detect_profile() == "mac"
     monkeypatch.setenv("BOK_DEPLOY_PROFILE", "CUDA")
     assert capacity.detect_profile() == "cuda"
-    # 非法值=auto（本机 darwin → mac）
+    # 非法值=auto 平台探测——钉 darwin(2026-10-02 批3 合流修:原注释「本机
+    # darwin→mac」是 fp 线 mac 宿主假设,CI Linux+无 nvidia-smi 会得 unknown)。
     monkeypatch.setenv("BOK_DEPLOY_PROFILE", "garbage")
+    monkeypatch.setattr(sys, "platform", "darwin")
     assert capacity.detect_profile() == "mac"
 
 
