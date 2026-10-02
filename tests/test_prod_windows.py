@@ -726,3 +726,42 @@ def test_prod_units_cp_bind_host_blank_env_falls_back(monkeypatch, tmp_path: Pat
     monkeypatch.setenv("BOK_BIND_HOST", "   ")
     argv = _cp_unit_args(monkeypatch, tmp_path)
     assert argv[argv.index("--host") + 1] == "127.0.0.1"
+
+
+# ---------------- ⑩ monitor 保守性（2026-09-27）：CP 不可达/在途通话一律不杀 ----------------
+# 病灶：`_cp_active_calls()` CP 不可达返回 None，旧 `if not active_calls` 把 None 当 0
+# → idle 门槛（连续 2 轮≈10s）即杀，硬 veto 被静默卸掉；LiveKit 重启分支更是无条件
+# 集体 kill+respawn，在途通话陪葬。修：None 显式保守不杀 + respawn 分支同 veto。
+
+
+def test_monitor_kill_round_none_active_calls_is_conservative() -> None:
+    """active_calls=None（CP 不可达=状态未知）→ kill 恒 False（旧 None 当 0 误杀）。"""
+    assert bok._monitor_kill_round(2, None) == (False, True)
+    assert bok._monitor_kill_round(11, None)[0] is False
+    # 未知档也按 veto 节奏打点（首过 idle 门槛一次 + 每 12 轮提醒），不静默。
+    assert bok._monitor_kill_round(12, None) == (False, True)
+
+
+def test_monitor_kill_round_zero_still_uses_idle_threshold() -> None:
+    """active_calls=0（确认无在途）→ 仍按 idle 门槛补拉（保守修不误伤真死 worker）。"""
+    assert bok._monitor_kill_round(1, 0) == (False, False)
+    assert bok._monitor_kill_round(2, 0) == (True, False)
+    # 在途 >0 恒不杀（G3 硬 veto）。
+    assert bok._monitor_kill_round(99, 1)[0] is False
+
+
+def test_monitor_kill_round_source_pins_none_guard() -> None:
+    """源码 pin：None 的显式保守分支必须在 `if not active_calls` 之前。"""
+    src = inspect.getsource(bok._monitor_kill_round)
+    assert "active_calls is None" in src, (
+        "_monitor_kill_round must special-case None (CP unreachable) before the "
+        "falsy `if not active_calls` branch")
+
+
+def test_monitor_respawn_branch_has_active_calls_veto() -> None:
+    """源码 pin：LiveKit 重启分支的 respawn 必须先过 active-calls veto。"""
+    src = inspect.getsource(bok.cmd_monitor)
+    assert "veto respawn" in src, "cmd_monitor must veto respawn while calls active"
+    assert "skip_lk_mark" in src, (
+        "cmd_monitor must NOT mark lk_up when respawn is vetoed, so it retries "
+        "each round until calls drain")

@@ -313,7 +313,9 @@ def test_graph_notify_arm_does_not_stop_response():
     # 唯一允许的出现形态=注释「不 raise StopResponse」;真实调用形态(带括号)禁现。
     assert "raise StopResponse()" not in seg  # 打铃不抢话:落回 LLM 生成
     assert "不 raise StopResponse" in seg  # 意图注释在场(删注释或改语义即红)
-    assert '_turn_origin["provider"] = "graph-notify"' in seg
+    # EX-2（2026-09-28）：provider 归因改经 chokepoint（notify 顺延到下一个
+    # assistant item），旧 _turn_origin 单槽已删除。
+    assert '_register_reply_lane(lane="graph-notify", notify=True)' in seg
     assert "_spawn_report(" in seg and "_report_notify_once(" in seg
     assert "flow_ctrl.graph_fired" in seg
     assert "FLOW_GRAPH notify binding=" in seg

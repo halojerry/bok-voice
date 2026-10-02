@@ -103,8 +103,11 @@ def test_notify_arm_keeps_branch_plan_coexist():
 
 
 def test_notify_and_canned_same_turn_provider_merged():
-    """M-1(评审返工):同轮 graph-notify 打铃 + 分支罐头共存——罐头出声不再
-    覆写 graph-notify 标记,turns provider 合并归因,账本双标记俱在。"""
+    """M-1(评审返工;EX-2 2026-09-28 泛化):同轮 graph-notify 打铃 + 分支罐头
+    共存——罐头出声不再覆写 graph-notify 标记,notify 顺延槽在 item 消费点并归,
+    turns provider 合并归因(branch-canned+graph-notify),账本双标记俱在。"""
     src = _agent_src()
-    assert '"branch-canned+graph-notify"' in src  # 合并归因标记在
-    assert '_turn_origin["provider"] = "branch-canned"' not in src  # 裸覆写已死
+    # 合并归因:消费点把票据 lane 与 notify 顺延 lane 用 "+" 拼接(泛化,非特例)
+    assert 'provider = f"{_ticket.lane}+{_pending}"' in src
+    assert '_register_reply_lane(lane="branch-canned", text=_bc_resp)' in src  # 罐头建票
+    assert '_register_reply_lane(lane="graph-notify", notify=True)' in src  # 打铃顺延

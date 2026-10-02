@@ -104,3 +104,37 @@ def stimulus_pcm(
     url = tts_url if tts_url is not None else os.environ.get("TTS_URL", DEFAULT_TTS_URL)
     resolved_voice = voice if voice is not None else DEFAULT_VOICE
     return _local_pcm(text, lang, resolved_voice, url, sample_rate, timeout)
+
+
+def narrowband_pcm(pcm: bytes, rate: int = 16000) -> bytes:
+    """把 PCM 砍到电话窄带再升回原率——模拟生产 SIP PCMU 8k 信道。
+
+    定义（刻意保持最小）：**2 样本平均降采样到 8k，再线性插值升采样回 16k**。
+    这条链路把频带砍到 8k 奈奎斯特（4kHz）——生产 PCMU 数字误听正是这一条信道
+    劣化所致（实测 band-limiting 单独即可复现生产数字误听，置信度 0.939）。
+    不做带通滤波等过度工程：本定义即为唯一口径，给 probe 一个「生产真实感」
+    ASR 测量臂。
+
+    纯 numpy（仓内 .venv312 恒有），空输入/空降采样返回同长静音。`rate` 为输入
+    采样率（缺省 16k，链路即 8k↔16k）。
+    """
+    import numpy as np
+
+    if not pcm:
+        return b""
+    x = np.frombuffer(pcm, dtype=np.int16).astype(np.float64)
+    n_out = int(x.size)
+    # 降采样：2 样本平均（16k → 8k）
+    n_even = n_out - (n_out % 2)
+    if n_even == 0:
+        return b"\x00" * (n_out * 2)
+    d = x[:n_even].reshape(-1, 2).mean(axis=1)
+    # 升采样：线性插值回原长度（8k → 16k）
+    pos = np.arange(n_out, dtype=np.float64) / 2.0
+    idx = np.floor(pos).astype(np.int64)
+    frac = pos - idx
+    idx = np.clip(idx, 0, d.size - 1)
+    idx2 = np.clip(idx + 1, 0, d.size - 1)
+    up = d[idx] * (1.0 - frac) + d[idx2] * frac
+    out = np.clip(np.rint(up), -32768, 32767).astype(np.int16)
+    return out.tobytes()

@@ -43,6 +43,11 @@ def test_no_mktemp_pattern_in_source():
         for path in (_ROOT / top).rglob("*.py"):
             if "__pycache__" in path.parts:
                 continue
+            # 第三方 venv（services/*-sidecar/.venv 的 site-packages，git 已忽略）
+            # 与 runtime/ vendored 同类——门禁只管第一方源（2026-09-27 csc-sidecar
+            # 建场后 mpmath/numpy 自带测试文件误触）。
+            if any(part.startswith(".venv") for part in path.parts):
+                continue
             body = path.read_text(encoding="utf-8", errors="ignore")
             if _MKTEMP_NEEDLE in body:
                 hits.append(str(path.relative_to(_ROOT)))

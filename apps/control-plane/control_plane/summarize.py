@@ -13,6 +13,12 @@ import httpx
 # ``polish_wiring`` 模块 docstring 的实测理由）。
 from bok_voice_core.polish_wiring import polish_offline_text
 from bok_voice_core.model_routes import PROVIDER_OPENAI, resolve_route
+# 账本噪声分类单源(2026-09-27):垫话/打断/兜底降级行不是内容回复——纪要 prompt
+# 不得把「我先查一下」这类兜底话当成客服实质回应(真实通话 32.1% 的相邻对是垫话
+# 当答案)。B 线(line=="b")由 is_content_reply 直接放行。注意:落盘 transcript.md
+# 是原始证据面(由 main._write_settlement_docs 从原始 turns 直写,不本处隶属),
+# 本过滤只作用于喂 LLM 的派生 prompt 文本。
+from bok_voice_core.qa_text import is_content_reply
 
 from .deps import read_model_routing_raw
 
@@ -169,12 +175,18 @@ class Summarizer:
     def _render_transcript(turns: list[Any], max_chars: int = 6000) -> str:
         """turns → 纪要 prompt 文本；每轮文本过 E7 离线润色（唯一接线点）。
 
+        2026-09-27 噪声过滤：跳过非内容回复（垫话/打断/兜底降级行，判据单源
+        ``qa_text.is_content_reply``）——否则 «补一句我先帮你查下» 会被 LLM 当
+        客服实质回应写进纪要；B 线（line=="b"）原样保留。
+
         只润色这一份**派生**文本（本地变量，喂 LLM）；原始转写仍在 turns 账本与
         ``transcript.md`` 原件里逐字保留。kill-switch 关/润色异常时逐字原样。
         """
         lines: list[str] = []
         total = 0
         for t in turns:
+            if not is_content_reply(t):
+                continue
             role = getattr(t, "role", None) or getattr(t, "role", "?")
             text = getattr(t, "transcript", "") or getattr(t, "text", "")
             line = f"{role}: {polish_offline_text(text)}"

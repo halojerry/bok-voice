@@ -47,6 +47,10 @@ class PrefillSpeculator:
         self._ctx = context_state
         self._last_request: list[dict] | None = None
         self._reply_text: str | None = None
+        # F6 稳定性门（2026-09-28）：快照时刻的 context revision。真请求落地时尾部
+        # 会按当前 revision 渲染；若快照之后 revision 已前进（换步/事实沉淀），投机
+        # 组的 user 段必与真请求分叉=纯白烧 GPU，直接跳过开火。
+        self._snapshot_revision: int | None = None
         self._busy = False  # thinking/speaking 期间不开火（LLM 忙，抢不过还添堵）
         self._turn_fires = 0
         self._last_fire_ts = 0.0
@@ -56,9 +60,14 @@ class PrefillSpeculator:
 
     # ------------------------------------------------------------------ 输入
     def on_request_messages(self, messages: list[dict]) -> None:
-        """快照钩子（MlxLlmLLM.on_request_messages）：逐字节真实请求 messages。"""
+        """快照钩子（MlxLlmLLM.on_request_messages）：逐字节真实请求 messages。
+
+        同时记下快照时刻的 context revision（F6），供 on_stable_prefix 判投机尾部
+        是否已与真请求分叉。ctx 无 revision（测试替身）→ None=不启用本门。
+        """
         if messages:
             self._last_request = messages
+            self._snapshot_revision = getattr(self._ctx, "revision", None)
 
     def on_reply_history_text(self, text: str) -> None:
         """上轮回复进会话历史的原文（含 expr 标记，与框架追加的逐字节一致）。"""
@@ -102,6 +111,21 @@ class PrefillSpeculator:
         if not self._last_request or text == self._last_prefix:
             if _dbg:
                 print(f"BOK_PREFILL_SPEC skip snapshot={self._last_request is not None} same={text == self._last_prefix}", flush=True)
+            return
+        # F6 稳定性门：快照后尾部 revision 已前进（换步/事实沉淀）→ 投机 user 段必与
+        # 真请求分叉，白烧 GPU，跳过（ctx 无 revision=测试替身，不启用）。
+        _rev = getattr(self._ctx, "revision", None)
+        if (
+            self._snapshot_revision is not None
+            and _rev is not None
+            and _rev != self._snapshot_revision
+        ):
+            if _dbg:
+                print(
+                    f"BOK_PREFILL_SPEC skip revision_advanced "
+                    f"snapshot={self._snapshot_revision} now={_rev}",
+                    flush=True,
+                )
             return
         # 前缀必须比上次开火更长（≥2 字），同段文本不重复预热。
         if len(text) - len(self._last_prefix) < 2:
