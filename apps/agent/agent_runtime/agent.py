@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import difflib
 import json
 import os
@@ -8,9 +9,11 @@ import os
 import httpx
 import re
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional
+from urllib.parse import urlparse
 
 # DeepSeek 端点的思考开关契约(判据/意图判据换云时缺省关思考,否则小 max_tokens
 # 预算被 reasoning 烧光、正文出空串=判据静默全 miss;理由与实测见该模块 docstring)
@@ -136,6 +139,116 @@ except Exception:  # pragma: no cover - observability must never break the agent
 def _agent_log(event: str, **data):
     if agent_log:
         agent_log.info(event, extra={"event": event, "component": "agent", "data": data})
+
+
+# ---- a_reply 车道装配期活性探针（编排审计第二波 FIX 1,2026-10-02） -----------
+# 实弹基线（死车道 10 轮通话）:端点 kill 后 10/10 轮「有答」全为罐头
+# （gen script=11 filler=1 llm=0）、首声 p50 1117ms、哨兵
+# LLM_FALLBACK_TEXT err=APIConnectionError('Connection error.') ×16、饥荒激活 0、
+# 车道级告警 0——装配面零痕迹，每轮都要等满传输超时才落兜底。本探针=装配期
+# 一行响亮告警；**只告警不换路**（自动降级是饥荒 overlay 的职责，分工不动）。
+_A_REPLY_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _is_local_base_url(base_url: str) -> bool:
+    """base_url host ∈ loopback（127.0.0.1/localhost/::1）=本机车道。
+
+    纯函数、绝不 raise（解不出 host=非本地）。判据与 W-ABORT 客户端
+    （livekit_plugins._MLX_LOCAL_HOSTS）同源；此处不 import 对方模块。
+    """
+    try:
+        host = (urlparse(str(base_url or "")).hostname or "").lower()
+    except Exception:  # noqa: BLE001 - 坏 base=非本地
+        return False
+    return host in _A_REPLY_LOOPBACK_HOSTS
+
+
+def _a_reply_endpoint_alive(base_url: str, timeout_s: float = 1.0) -> bool:
+    """a_reply 端点装配期探活（纯同步、绝不 raise;镜像 B 线 _mt_endpoint_alive）。
+
+    判据=「有 HTTP 响应即活」:GET ``{base}/models`` 拿到任何 HTTP 响应
+    （2xx/3xx,或 401/404/5xx 等 HTTPError）=端点在场;连接错误/超时/协议错误=死。
+    本探针要拦的是「server 根本没起」（connection refused/超时）这类整通死亡，
+    有进程在听即不该跳;装配点经 ``asyncio.to_thread`` 调用=事件循环零阻塞。
+    探活是数据不是异常，失败一律 False。
+    """
+    base = str(base_url or "").strip().rstrip("/")
+    if not base:
+        return False
+    import urllib.error
+    import urllib.request
+
+    try:
+        # 无鉴权头:401/404 抛 HTTPError,与成功响应同判「端点在场」。
+        with contextlib.closing(
+            urllib.request.urlopen(f"{base}/models", timeout=timeout_s)  # noqa: S310
+        ):
+            return True
+    except urllib.error.HTTPError:
+        return True
+    except Exception:  # noqa: BLE001 - URLError/超时/坏协议=死，绝不外抛
+        return False
+
+
+def _a_reply_probe_needed(base_url: str, env: Mapping[str, str]) -> bool:
+    """装配期探针总闸（纯函数,单测直喂）:kill-switch 非 "0" 且 base_url 本机。
+
+    ``BOK_A_REPLY_PROBE`` 缺省 "1"（字面量缺省=全仓闸读法）;云端档不探
+    （本探针只服务「本机 server 没起」族，且装配点不该对云打网络）。
+    """
+    if str(env.get("BOK_A_REPLY_PROBE", "1")).strip() == "0":
+        return False
+    return _is_local_base_url(base_url)
+
+
+# ---- 死车道喂饥荒信号（编排审计第二波 FIX 1 加刀） --------------------------
+# connection refused 是**秒级返回**、不走首 token 超时分支——饥荒 EMA
+# （record_llm_first_token）只吃超时样本与真实耗时，死车道上恒平：overlay
+# 不落 4B、CP 准入闸不介入，整通全罐头且零饥荒（16 发 APIConnectionError
+# 零激活实弹,2026-10-02）。修=预热连接失败按「首 token 超时×2,地板 8s」
+# 喂深饥荒样本（与 livekit_plugins 超时分支 timeout*2.0 同构）。
+def _is_connect_failure(exc: BaseException | None) -> bool:
+    """连接层失败判据（车道不可达）:openai SDK 包装 + 裸 httpx 传输异常双面。
+
+    纯函数、绝不 raise;400「Model is unloaded」等非连接失败**不喂**（JIT
+    装载窗不是饥荒）。httpx 已在模块顶导入;openai 延迟 import（缺席=判不出,
+    保守 False,绝不因判据本身炸掉预热路径）。
+    """
+    if exc is None:
+        return False
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return True
+    try:
+        from openai import APIConnectionError
+    except Exception:  # noqa: BLE001 - openai 缺席=判不出
+        return False
+    return isinstance(exc, APIConnectionError)
+
+
+def _connect_failure_penalty_s() -> float:
+    """连接失败的饥荒惩罚样本（秒）:首 token 超时×2、地板 8s。
+
+    健康档 timeout=3s→6s 不足「死≠慢」的声明力（connection refused 是硬
+    不可达,比任何「慢」都重）;显式配大 timeout 时随其放大（同超时分支
+    ``timeout * 2.0`` 的 max 语义）。
+    """
+    try:
+        t = float(os.environ.get("LLM_FIRST_TOKEN_TIMEOUT_S", "3.0") or 0)
+    except ValueError:  # pragma: no cover - 配错回默认
+        t = 3.0
+    if t <= 0:  # 0=关首 token 截止;连接失败仍要喂（地板兜住）
+        t = 3.0
+    return max(t * 2.0, 8.0)
+
+
+def _feed_famine_on_connect_failure(exc: BaseException | None) -> bool:
+    """连接失败→饥荒样本单点（返回是否喂了）;两发即 llm_famine_active()。"""
+    if not _is_connect_failure(exc):
+        return False
+    from .providers.livekit_plugins import record_llm_first_token
+
+    record_llm_first_token(_connect_failure_penalty_s())
+    return True
 
 
 # 剥掉进 TTS 那一路的 <expr/> 标签（防被念出来）；转录那一路框架会自动剥离并发布 mood。
@@ -272,6 +385,63 @@ async def _strip_expr_markup(text):
         yield ""
 
 
+# ---- judge LLM 客户端生命周期（编排审计第二波 J1,2026-10-02） ------------------
+# 病灶:每次 `_llm_judge` 都新建 AsyncOpenAI 且无人 close——每发判定泄漏一个
+# httpx 连接池;且请求不带请求身份,判定流在 W-ABORT 协议下不可中止（mlx_lm
+# server 单生成线程零取消路径,超时后服务端继续解码占槽,后续判定排队）。
+# 修:①按 (base_url, api_key, timeout) 复用客户端（进程生命周期持有,绝不
+# 中途 close——判定请求与 aclose 竞态=更糟）;②本机档带 X-Bok-Req-Id;
+# ③失败后尽力 POST /v1/abort。:1235 代理路径端到端可中止:queue_proxy.py
+# 已透传 x-bok-req-id（第一波审计修）,judge 经代理打 4B 同样生效。
+_JUDGE_CLIENT_CACHE: dict[tuple[str, str, float], object] = {}
+_MLX_ABORT_PATH = "/v1/abort"
+
+
+def _mlx_abort_endpoint(base_url: str) -> str:
+    """abort 端点 URL:base_url 已带 /v1（OpenAI 约定）时同挂 /v1/abort。"""
+    base = str(base_url or "").strip().rstrip("/")
+    if not base:
+        return ""
+    return f"{base}/abort" if base.endswith("/v1") else f"{base}{_MLX_ABORT_PATH}"
+
+
+def _post_abort(base_url: str, req_id: str, timeout_s: float = 0.5) -> None:
+    """同步 POST {base}/v1/abort（尽力中止;经 asyncio.to_thread 调用）。
+
+    服务端契约见 services/llm-mlx/bok_mlx_server.py（body ``{"request_id": ...}``）。
+    走 urllib（零新依赖）;任何失败全吞——中止是尽力语义,绝不外抛。
+    """
+    url = _mlx_abort_endpoint(base_url)
+    if not url or not req_id:
+        return
+    import urllib.request
+
+    try:
+        body = json.dumps({"request_id": req_id}).encode()
+        req = urllib.request.Request(  # noqa: S310 - 本机 loopback 端点
+            url,
+            data=body,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with contextlib.closing(urllib.request.urlopen(req, timeout=timeout_s)):  # noqa: S310
+            pass
+    except Exception:  # noqa: BLE001 - 中止尽力而为
+        pass
+
+
+def _judge_client(base_url: str, api_key: str, timeout: float, cls):
+    """judge 客户端复用单点（缓存键含 timeout:5s 流程判定与 20s 意图判据预算
+    不得互相污染——客户端 timeout 是构造期参数）。类不符（测试替身/热换类）
+    一律重建,绝不把旧类实例交给新调用方。"""
+    key = (str(base_url or ""), str(api_key or "mlx"), float(timeout))
+    client = _JUDGE_CLIENT_CACHE.get(key)
+    if client is None or type(client) is not cls:
+        client = cls(api_key=api_key or "mlx", base_url=base_url, timeout=timeout, max_retries=1)
+        _JUDGE_CLIENT_CACHE[key] = client
+    return client
+
+
 async def _llm_judge(
     base_url: str,
     model: str,
@@ -308,10 +478,13 @@ async def _llm_judge(
         return ""
     from openai import AsyncOpenAI
 
+    # 编排审计第二波 J1（2026-10-02）:请求身份+客户端复用（见 _JUDGE_CLIENT_CACHE
+    # 注释）。身份只在**本机档**上头——云端端点不认这个私有头,也不该被 abort
+    # 打扰（POST /v1/abort 是 mlx wrapper 私有端点）。
+    _local = _is_local_base_url(base_url)
+    _rid = uuid.uuid4().hex
     try:
-        client = AsyncOpenAI(
-            api_key=api_key or "mlx", base_url=base_url, timeout=timeout, max_retries=1
-        )
+        client = _judge_client(base_url, api_key, timeout, AsyncOpenAI)
         _create_kwargs: dict = dict(
             model=model,
             messages=messages,
@@ -320,6 +493,8 @@ async def _llm_judge(
             # 本地 MLX 對話模板會 append <|im_end|>,停喺呢度,回應淨係 verdict 字。
             stop=["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
         )
+        if _local:
+            _create_kwargs["extra_headers"] = {"X-Bok-Req-Id": _rid}
         # 思考旗两契约合流(2026-10-02 合并):
         # ① DeepSeek 端点(2026-09-21 判据换云首轮 6/6 静默全 miss 的坑,契约见
         #    bok_voice_core.deepseek_llm):max_tokens 只有 8-32,思考会把预算烧在
@@ -343,6 +518,15 @@ async def _llm_judge(
         return ""
     except Exception as exc:  # pragma: no cover - 判定失败唔推进,唔阻断通话
         print(f"[flow] llm judge failed: {exc!r}", flush=True)
+        if _local:
+            # 编排审计第二波 J1:超时/失败后按**当发身份**尽力中止——mlx_lm
+            # server 单生成线程零取消路径,不中止则服务端把这次判定解码到底占槽,
+            # 后续判定排队（judge 走 :1235 代理时 x-bok-req-id 已透传,同样生效）。
+            try:
+                # FIRE_FORGET_EXEMPT: 中止是尽力语义——任务被 GC 掐掉=服务端照旧跑完该请求（旧行为）。
+                asyncio.create_task(asyncio.to_thread(_post_abort, base_url, _rid))
+            except Exception:  # noqa: BLE001 - 无运行 loop 等=退化为无中止
+                pass
         return ""
 
 
@@ -2716,6 +2900,75 @@ QA_COUNTERS: dict[str, int] = {}
 # 孤儿 invalidate 实证是同一 bug 类;done-callback 自清,job 进程一通一命无跨通话残留。
 _SETTLE_TASKS: set = set()
 
+# ---- 预热任务强引用池(编排审计第二波 F1,2026-10-02) ----
+# 预热(TTS 预连 + LLM 前缀暖 cache)是纯增益任务,但旧形态两处都不对:
+# ①TTS prewarm 是无线索裸 create_task(FIRE_FORGET_EXEMPT),无人取消、teardown
+#   掐杀=无痕;②LLM 前缀预热落在 `_report_tasks`——挂断 gather 会为仍在退避
+#   重试(5s/12s)的预热白等最多 10s,且第一轮交付后预热再无消费点仍挂着。
+# 本池=强引用 + done-callback 自清(镜像 _SETTLE_TASKS 先例,job 进程一通一命,
+# 池空即自清无跨通话残留);取消点两处:首个 assistant 轮交付(first_turn,
+# once 门)与收线(_on_close)。`_PREWARM_FIRST_TURN_DONE` 的纪元语义=池空时
+# 的 spawn(新一通装配)重置,进程复用多通时每通都保留自己的首轮取消。
+_PREWARM_TASKS: set = set()
+_PREWARM_FIRST_TURN_DONE = False
+
+
+def _spawn_prewarm(coro):
+    """预热任务单点(spawn-and-report 语义同 `_spawn_report`,但落预热池)。
+
+    - 强引用入 `_PREWARM_TASKS`,done-callback 自清;失败打 `PREWARM_TASK_ERR`
+      (取消≠失败,不打点);无运行 loop(纯单测路径)=就地关闭协程并返回 None
+      (旧 try/except RuntimeError 语义)。
+    - 池空时的 spawn=新一通纪元:重置 first_turn once 门(见上)。
+    """
+    global _PREWARM_FIRST_TURN_DONE
+    if not _PREWARM_TASKS:
+        _PREWARM_FIRST_TURN_DONE = False
+    try:
+        task = asyncio.create_task(coro)
+    except RuntimeError:  # pragma: no cover - 无 loop 调用(纯单测)
+        try:
+            coro.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+    _PREWARM_TASKS.add(task)
+
+    def _done(t: asyncio.Task) -> None:
+        _PREWARM_TASKS.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            # 预热失败纯增益损失,但必须留痕(静默 never-retrieved 会掩盖车道问题)。
+            print(f"PREWARM_TASK_ERR {t.exception()!r}", flush=True)
+
+    task.add_done_callback(_done)
+    return task
+
+
+async def _cancel_prewarm_tasks(reason: str) -> int:
+    """取消预热池全部在途任务并等其落地(编排审计第二波 F1);绝不 raise。
+
+    ``reason="first_turn"``=once 门(每纪元一次,池空也置门);``"close"``=收线
+    无门(幂等调用安全)。取消+await-suppress:取消是热路径语义(第一轮交付后/
+    收线后预热再无消费点),等待只为让 done-callback 与 aclose 顺序干净。
+    返回实际取消的任务数;n>0 才打一行 `PREWARM_CANCELLED reason=... n=...`。
+    """
+    global _PREWARM_FIRST_TURN_DONE
+    if reason == "first_turn":
+        if _PREWARM_FIRST_TURN_DONE:
+            return 0
+        _PREWARM_FIRST_TURN_DONE = True
+    tasks = [t for t in _PREWARM_TASKS if not t.done()]
+    if not tasks:
+        return 0
+    for t in tasks:
+        t.cancel()
+    try:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    except Exception:  # noqa: BLE001 - 取消等待失败不阻任何链路
+        pass
+    print(f"PREWARM_CANCELLED reason={reason} n={len(tasks)}", flush=True)
+    return len(tasks)
+
 # ---- 结算 gather 自适应等待窗(D7,2026-09-20) ----
 # 原硬码 10s 与意图判据 `_background_intent_judge` 的 LLM 总预算 timeout=20s
 # (review N9,9B 判据集 prefill ~0.6k tok/s 实测依据,**勿改 judge 语义**)同吃
@@ -4058,13 +4311,9 @@ async def entrypoint(ctx):
         # 握手(实测冷 ~0.65s/暖 ~0.2s)。失败静默——合成路径自会回退流内自连。
         # 2026-09-28 prewarm async 化(W-TTS 会话预热池):协程挂当前 loop 后台
         # 跑,与开场白合成并行;单飞守卫在 provider 内,重复预热安全。
-        try:
-            # FIRE_FORGET_EXEMPT: 预热纯增益——被 GC 掐掉=首段合成就地握手回退,零正确性影响。
-            asyncio.get_running_loop().create_task(tts_provider.prewarm())
-        except RuntimeError:
-            pass
-        except Exception:  # noqa: BLE001 - 预热失败零影响
-            pass
+        # 编排审计第二波 F1:改走 `_spawn_prewarm`——强引用入预热池(可被首轮/
+        # 收线取消),不再是有意 detach 的裸任务。
+        _spawn_prewarm(tts_provider.prewarm())
         # 主实例引用先于回退链包裹 capture:FallbackAdapter 包裹后 isinstance
         # (tts_provider, MiniMaxTTS) 恒 False,后面 CachedTTS 装配的判据要用它。
         _tts_primary = tts_provider
@@ -4161,6 +4410,26 @@ async def entrypoint(ctx):
     # 三个构造点的既有读法原样传参（零漂移保证）；设置卡 deepseek 带密钥显式云档
     # 不属本车道覆盖面，原样保留。
     _a_reply_route = resolve_route("a_reply", os.environ, _routing_raw)
+    # 编排审计第二波 FIX 1（2026-10-02）:装配期车道活性探针——端点死时每轮
+    # LLM 都要等满传输超时才落兜底,装配面却零车道级痕迹（死车道 10 轮实弹:
+    # 10/10「有答」全罐头、16 发 APIConnectionError、饥荒 0 次）。只探本机档、
+    # 只告警不换路（自动降级=饥荒 overlay 职责）;to_thread=事件循环零阻塞,
+    # 探活自身异常=数据不是故障（照常装配）。
+    if _a_reply_probe_needed(_a_reply_route.base_url, os.environ):
+        try:
+            _a_reply_alive = await asyncio.to_thread(
+                _a_reply_endpoint_alive, _a_reply_route.base_url
+            )
+        except Exception:  # noqa: BLE001 - 探活异常不阻装配
+            _a_reply_alive = True
+        if not _a_reply_alive:
+            print(
+                f"A_REPLY_ENDPOINT_DEAD base={_a_reply_route.base_url} lane=a_reply",
+                flush=True,
+            )
+            _agent_log(
+                "llm.a_reply_dead", base_url=_a_reply_route.base_url, lane="a_reply"
+            )
     llm_provider_name = llm_cfg.get("provider") or "local_openai"
     if os.environ.get("SCRIPTED_LLM") == "1":
         llm_provider = ScriptedLLM(
@@ -4875,6 +5144,11 @@ async def entrypoint(ctx):
                         )
                         break
                     except Exception as exc:  # noqa: BLE001
+                        # 编排审计第二波 FIX 1 加刀（2026-10-02）:连接失败喂饥荒
+                        # 样本——connection refused 秒级返回、不走首 token 超时
+                        # 分支,不喂则 EMA 恒平（死车道 16 发 APIConnectionError
+                        # 零饥荒实弹）;非连接失败（400 模型未载）不喂。
+                        _feed_famine_on_connect_failure(exc)
                         if "unloaded" not in str(exc).lower() or _pw_try == 3:
                             print(
                                 f"[agent] llm prefix prewarm skipped: {exc!r} (call {room_name})",
@@ -5143,6 +5417,10 @@ async def entrypoint(ctx):
         text: str, latency: int, gen: str, provider: str, step: int, started_ms: int,
         ended_ms: int | None = None,
     ) -> None:
+        # 编排审计第二波 F1(2026-10-02):首个 assistant 轮已交付=预热(LLM 前缀
+        # 暖 cache / TTS 预连)再无消费点——once 门取消预热池,不再让在途预热
+        # 挂着(前缀预热此时通常已完成:开场白播完才 commit,预热窗口足够)。
+        await _cancel_prewarm_tasks("first_turn")
         # W-GATE(2026-09-27):回复已交付(assistant item 已落地)=放行让位中的
         # judge 进 :1235。本函数是全回复车道唯一 chokepoint(script/qa_fastpath/
         # LLM/ack 皆经此),故事件只在这里 set 一处。
@@ -5454,6 +5732,10 @@ async def entrypoint(ctx):
                         f"tasks={_left}",
                         flush=True,
                     )
+            # 编排审计第二波 F1(2026-10-02):收线取消预热池(含 SETTLE_WAIT_TIMEOUT
+            # 路径——上面 gather 超时后照样到这行)。预热不是结算面数据,等它=白等
+            # (退避重试窗最长 ~17s);取消+await-suppress 后立刻 settle。
+            await _cancel_prewarm_tasks("close")
             await cp.settle(call_id)
             # QA 快路每通汇总(task-9):每通一行 PERF 风格,打完即清零(job 进程
             # 一通一命,清零属防御);打点失败绝不影响结算。
@@ -8402,8 +8684,9 @@ async def entrypoint(ctx):
         # 7-11s),预热被拖到最后,客户在开场白中途插话的 turn-1 只能全量 prefill
         # (~2-4s TTFT)。paused(无开场白)分支在下方立即发(无开场白形状)。
         if _prefix_prewarm_armed:
-            # 池化(2026-09-17 全量 debug P2-A):预热任务丢失只损性能,同池补强引用。
-            _spawn_report(_prefix_prewarm_task(agent, greeting_text))
+            # 池化(2026-09-17 全量 debug P2-A;2026-10-02 第二波改预热池):
+            # 预热任务丢失只损性能;独立池=可取消,不再占 _report_tasks 的收线等待窗。
+            _spawn_prewarm(_prefix_prewarm_task(agent, greeting_text))
         _register_reply_lane(lane="opening", text=greeting_text)  # EX-2 chokepoint
         await _say_script(session, tts_provider, _tts_cache, greeting_text)
         # say() 返回=整段念完(playout end),唔係出声时刻——TTS 首包在 say 调用后
@@ -8411,7 +8694,7 @@ async def entrypoint(ctx):
         _log_stage("greeting_playout_done")
     elif _prefix_prewarm_armed:
         # paused 起动无开场白:立即按「无开场白」形状预热(任务体回退抓 chat_ctx)。
-        _spawn_report(_prefix_prewarm_task(agent, ""))  # 池化 P2-A:同上
+        _spawn_prewarm(_prefix_prewarm_task(agent, ""))  # 池化 P2-A + 第二波预热池:同上
 
     # session.start 只负责拉起流水线（返回后会话在后台运行）。保持 entrypoint
     # 存活直到房间关闭，supervisor watcher 在此期间持续轮询；_on_close 置位

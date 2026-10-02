@@ -133,7 +133,9 @@ def test_agent_entrypoint_pools_remaining_sites():
     assert "_spawn_report(cp.qa_hit(" in src
     assert "_spawn_report(_go())" in src
     assert "_spawn_report(_watch())" in src
-    assert src.count("_spawn_report(_prefix_prewarm_task(") == 2
+    # 预热两处改走独立预热池（编排审计第二波 F1,2026-10-02）:可取消、不占
+    # _report_tasks 的收线等待窗（旧断言 _spawn_report(_prefix_prewarm_task( == 2）。
+    assert src.count("_spawn_prewarm(_prefix_prewarm_task(") == 2
     # F5 回归:结算池仍在
     assert agent_mod._SETTLE_TASKS == set() or isinstance(agent_mod._SETTLE_TASKS, set)
 
