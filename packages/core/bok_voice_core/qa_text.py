@@ -71,6 +71,9 @@ NON_REPLY_PROVIDERS: frozenset[str] = frozenset(
         "stall-close",
         "pause-ack",
         "fallback-ack",
+        # FIX-3(2026-10-02 批3 合流补登):复读全吞上抛行——文本=被吞的复读主体,
+        # 按定义是坏输出,不可当内容回复挖掘成 QA 答案(gen=llm 但 provider 标记)。
+        "repeat-suppressed",
     }
 )
 

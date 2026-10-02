@@ -114,6 +114,9 @@ DEGRADATION_PROVIDERS = frozenset(
         "pause-ack",
         "fallback-ack",
         "branch-notify",
+        # FIX-3(2026-10-02 批3 合流补登):复读全吞上抛行——坏输出不进内容回复
+        # 口径(与 qa_text.NON_REPLY_PROVIDERS 同步,两处契约)。
+        "repeat-suppressed",
     }
 )
 

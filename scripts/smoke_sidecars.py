@@ -68,7 +68,10 @@ def main() -> None:
         # 0) health
         asr_health = client.get(f"{ASR}/health").json()
         tts_health = client.get(f"{TTS}/health").json()
-        assert_step("ASR health model_ready", asr_health.get("model_ready") is True, asr_health)
+        # 任务 B（2026-10-01）：sensevoice 档启动跳载 Qwen3 权重——model_ready=
+        # False 是设计态（首个 qwen3 路径请求懒加载），就绪判据=已载或按期跳载。
+        assert_step("ASR health ready", asr_health.get("model_ready") is True
+                    or asr_health.get("qwen3_deferred") is True, asr_health)
         assert_step("TTS health model_ready", tts_health.get("model_ready") is True, tts_health)
 
         # 1) ASR zh / cantonese / en

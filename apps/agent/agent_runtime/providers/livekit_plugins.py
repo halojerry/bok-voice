@@ -14,6 +14,7 @@ import unicodedata
 import uuid
 import weakref
 from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -48,6 +49,7 @@ from ..voice_style import NATURALNESS_BLOCK, a_line_tags_supported, strip_voice_
 from ..asr_polish_runtime import polish_enabled as _polish_layer_on
 from ..asr_polish_runtime import sync_polish as _polish_sync_text
 from ..flow import STEP_DISCIPLINE_RULE, split_step_text, stable_step_key
+from ..slot_actor import build_slot_task_block, compose_slot_user_message
 
 # 后台任务强引用池(2026-09-17 全量 debug P2-A):事件循环对 task 只持弱引用,
 # GC 可中途回收仍在跑的 fire-and-forget 任务——与本仓 _duration_fuse 注释、
@@ -1895,6 +1897,7 @@ class _RepeatSelfGuardStream(_CascadeCloseStreamMixin, llm.LLMStream):
         number_captured: str | None = None,
         number_turn_text: str | Callable[[], str | None] | None = None,
         number_known_text: str | Callable[[], str | None] | None = None,
+        on_full_swallow: "Callable[[str], Awaitable[None]] | None" = None,
     ):
         super().__init__(llm=plugin, chat_ctx=llm.ChatContext(), tools=[], conn_options=APIConnectOptions())
         self._inner = inner
@@ -1907,6 +1910,12 @@ class _RepeatSelfGuardStream(_CascadeCloseStreamMixin, llm.LLMStream):
         self._cross_on = bool(self._ledger) and not allow_repeat
         self._emitted: list[str] = []
         self._cross_suppressed = 0
+        # FIX-3(D2-4,2026-10-01):全吞上抛。被剥句子逐条记账(证据保全);
+        # 流收尾时若无一句放出(_emitted 空)且确有剥除 → on_full_swallow(全文)。
+        # agent 侧接住=拆响应看门狗+落 turns provider=repeat-suppressed,不再把
+        # 「4B 复读全吞」记成「AI 死了」(starve 计数+6s watchdog 道歉)。
+        self._swallowed: list[str] = []
+        self._on_full_swallow = on_full_swallow
         # 首 chunk 早发(2026-09-28):本回复首段是否已放行(句界或早切任一)。
         self._first_sent = False
         # D1 有界持有(2026-09-30):强制放行观测只打一次,防日志风暴。
@@ -2004,11 +2013,13 @@ class _RepeatSelfGuardStream(_CascadeCloseStreamMixin, llm.LLMStream):
             check_unit = (self._released_head or "") + sentence if self._released_head else sentence
             if not self._bypass and _is_parrot_sentence(check_unit, self._last_reply):
                 print(f"REPEAT_SELF_SUPPRESSED sent={sentence!r}", flush=True)
+                self._swallowed.append(sentence)  # FIX-3:全吞证据保全
                 self._released_head = ""
                 continue
             if self._cross_on and self._is_cross_turn(check_unit):
                 self._cross_suppressed += 1
                 print(f"REPEAT_CROSS_TURN_SUPPRESSED sent={sentence!r}", flush=True)
+                self._swallowed.append(sentence)  # FIX-3:全吞证据保全
                 self._released_head = ""
                 continue
             self._released_head = ""
@@ -2117,11 +2128,13 @@ class _RepeatSelfGuardStream(_CascadeCloseStreamMixin, llm.LLMStream):
         if not self._bypass and _is_parrot_sentence(check_unit, self._last_reply):
             print(f"REPEAT_SELF_SUPPRESSED sent={rest!r}", flush=True)
             self._released_head = ""
+            self._swallowed.append(rest)  # FIX-3:全吞证据保全
             return ""
         if self._cross_on and self._is_cross_turn(check_unit):
             self._cross_suppressed += 1
             print(f"REPEAT_CROSS_TURN_SUPPRESSED sent={rest!r}", flush=True)
             self._released_head = ""
+            self._swallowed.append(rest)  # FIX-3:全吞证据保全
             return ""
         self._released_head = ""
         if self._number_on:
@@ -2173,6 +2186,16 @@ class _RepeatSelfGuardStream(_CascadeCloseStreamMixin, llm.LLMStream):
                     f"REPEAT_CROSS_TURN_EMPTY suppressed={self._cross_suppressed}",
                     flush=True,
                 )
+            # FIX-3(D2-4,2026-10-01):复读全吞 ≠ 死火。全吞(一句未放出)且确有
+            # 剥除时把被吞全文上抛——agent 侧拆响应看门狗+落 turns 证据行
+            # (provider=repeat-suppressed),账本不再把「4B 复读」记成「AI 死了」
+            # (starve+1、6s watchdog 强断道歉)。部分剥除(_emitted 非空)=正常
+            # 说话中剥复读句,不上抛;回调失败绝不被流收尾(证据记账是尽力而为)。
+            if not self._emitted and self._swallowed and self._on_full_swallow is not None:
+                try:
+                    await self._on_full_swallow("".join(self._swallowed))
+                except Exception as exc:  # noqa: BLE001 - 回调异常不破流收尾
+                    print(f"REPEAT_SUPPRESSED callback_error={exc!r}", flush=True)
         except asyncio.CancelledError:
             # P2.a（2026-09-29 v2 §5）：cancel 不再令缓冲静默蒸发——打点留痕，
             # agent 侧 interrupted 补账点读 pending_buffer 拼入 turns。
@@ -2318,6 +2341,15 @@ class ContextState:
         # 用户真说过的话;缺省空串=拿不到权威源(守卫只认捕获账本)。
         self._turn_user_text: str = ""
 
+        # D1 槽位化 actor（2026-10-01,第一性原理重构）：闸 BOK_SLOT_ACTOR 由 A 线
+        # 装配点（agent.py entrypoint）读一次置位；缺省 False=旧路径逐字节不变
+        # （B 线 interpret 不接）。置位后静态前缀换角色卡（set_slot_system）、
+        # 每轮尾部换任务块（set_slot_step→slot_actor.build_slot_task_block）。
+        self.slot_mode: bool = False
+        self._slot_system: str = ""
+        self._slot_view: dict = {}
+        self._slot_key: str = ""
+
     @property
     def revision(self) -> int:
         return self._revision
@@ -2365,6 +2397,26 @@ class ContextState:
         key = stable_step_key(stable)
         if key != self._stable_key:
             self._stable_key = key
+            self._revision += 1
+
+    def set_slot_system(self, text: str) -> None:
+        """槽位化 actor（D1）角色卡注入——装配点一次写入，整场字节不变
+        （render_instruction_prefix 缺省档之一；KV 前缀稳定区）。"""
+        self._slot_system = str(text or "")
+
+    def set_slot_step(self, view: dict | None) -> None:
+        """编排器给槽（D1）：当步结构化槽位（flow.FlowController.slot_step_view()）。
+
+        revision 跟随步身份键（换步/收尾态切换 +1）：重建轮尾部字节比对与
+        prefill 投机 F6 稳定门（snapshot_revision vs now）据此判尾部是否已分叉。
+        渲染侧只格式化本视图（render_context_tail 槽位分支），不再有稳定段/
+        增量段/slim 账本——任务块每轮随最新 user 消息冻结入史，追加式契约由
+        ContextAwareLLM.chat 既有 record_applied_tail 机制承担。
+        """
+        self._slot_view = dict(view or {})
+        key = f"{self._slot_view.get('state') or ''}:{self._slot_view.get('step_no') or ''}"
+        if key != self._slot_key:
+            self._slot_key = key
             self._revision += 1
 
     def add_call_fact(self, text: str, limit: int = 4) -> None:
@@ -2702,7 +2754,13 @@ class ContextState:
         不变量：前缀整场字节不变（步骤推进只改尾部）→ mlx KV-cache 整场命中；
         当前步约束已移到尾部（推进若改前缀,token0 起整段重 prefill,实测卡 3-5s）。
         真正每轮变的当前步/检索资料/记忆都放 render_context_tail()。
+
+        D1 槽位化（2026-10-01）：slot_mode 置位时整段换成装配点注入的角色卡
+        （slot_actor.build_slot_system——人设压缩+facts+语言块+口吻+范例）——
+        旧协议族（总览/共享规则/纪律/范例三段/对象档案）全部退出 prompt。
         """
+        if self.slot_mode:
+            return self._slot_system
         parts: list[str] = []
         if self._user_lang:
             names = {"zh": "普通话/中文", "cantonese": "粤语（广东话）", "en": "英语"}
@@ -2824,7 +2882,21 @@ class ContextState:
         - 稳定段发出决定记进账本（record/rewrite），重试/重建轮（F3）据此复现
           同一条尾部的字节，只有真换步或真内容变化才发生语义必需的断裂。
         【你上一句】的固定指令文本已上移稳定前缀（【重复控制】）,尾部只留引文。
+
+        D1 槽位化（2026-10-01）：slot_mode 置位时整段换成任务块（slot_actor.
+        build_slot_task_block——当前步/命中分支/事实槽/8 字锚）——总览/共享规则/
+        纪律/verdict 指引/状态标记/记忆摘要全部不进 prompt（规格铁律）。
+        稳定段/增量段/slim 账本不参与槽位分支：任务块每轮随最新 user 消息冻结
+        入史（record_applied_tail 机制原样复用），历史重放逐字节原样。
         """
+        if self.slot_mode:
+            return build_slot_task_block(
+                view=self._slot_view,
+                object_brief=self._object_brief,
+                call_facts=self._call_facts,
+                whatsapp_note=self._whatsapp_note,
+                anchor=self._last_reply_anchor() if self._last_reply else "",
+            )
         _last_rev = self._applied_tails[-1][2] if self._applied_tails else None
         _explicit_stable = emit_stable is not None  # F3 重建复现语境（显式传入）
         slim = (
@@ -2960,6 +3032,9 @@ class ContextAwareLLM(llm.LLM):
         self._inner = inner
         self._ctx = context_state
         self._partial_capture: dict | None = None
+        # FIX-3(D2-4,2026-10-01):复读防线全吞回调(装配时注入;None=不接=旧行为)。
+        # 见 set_full_swallow_cb 与 _RepeatSelfGuardStream._run。
+        self._full_swallow_cb: "Callable[[str], Awaitable[None]] | None" = None
         # P2.a：最近一次 guard 流（chat() 时更新；agent 侧 interrupted 补账读
         # pending_buffer 用。None 安全：bypass 档/测试替身路径无 guard）。
         self._last_guard_stream: "_RepeatSelfGuardStream | None" = None
@@ -3000,8 +3075,13 @@ class ContextAwareLLM(llm.LLM):
                 items = list(copy.items)
                 if items and isinstance(items[0], llm.ChatMessage) and items[0].role == "system":
                     head = items[0].content
-                    if isinstance(head, str):
-                        merged: list = [_join_system(prefix, head, "")]
+                    # D1 槽位化（2026-10-01）：slot_mode 置位时角色卡即整个人格面
+                    # （人设 base 已压缩进卡，见 slot_actor.build_slot_system），
+                    # 不并 head——旧路径零变化（slot_mode 缺省 False）。
+                    if self._ctx.slot_mode and prefix:
+                        merged: list = [prefix]
+                    elif isinstance(head, str):
+                        merged = [_join_system(prefix, head, "")]
                     else:
                         merged = [*([prefix] if prefix else []), *head]
                     items[0] = llm.ChatMessage(role="system", content=merged)
@@ -3050,6 +3130,14 @@ class ContextAwareLLM(llm.LLM):
                     # 原文对不上(极端改写)→ 跳过该条,损失局部缓存也好过乱拼。
                     return False
 
+                def _compose(body: str, tail: str) -> str:
+                    # user 消息拼装单点：旧路径「客户话+尾部」（逐字节同旧）；
+                    # D1 槽位化路径「任务块+客户话」（规格形状，slot_actor.
+                    # compose_slot_user_message——与投机预热共用同一序防分叉）。
+                    if self._ctx.slot_mode:
+                        return compose_slot_user_message(tail, body)
+                    return f"{body}\n\n{tail}" if (body and tail) else (body or tail)
+
                 if n_new > 0:
                     # 旧的 applied 对应 users 前 |applied| 条(时序一致),逐条重放;
                     # 新增的尾部 user 从最后一条起各拼当前尾部并入账。
@@ -3077,7 +3165,7 @@ class ContextAwareLLM(llm.LLM):
                         orig = _text_of(it) if isinstance(it, llm.ChatMessage) else ""
                         tail = self._ctx.render_context_tail()
                         body = _polish_body(orig)
-                        final = f"{body}\n\n{tail}" if (body and tail) else (body or tail)
+                        final = _compose(body, tail)
                         if tail or body != orig:
                             items[idx] = llm.ChatMessage(role="user", content=[final])
                         self._ctx.record_applied_tail(orig, final)
@@ -3102,7 +3190,7 @@ class ContextAwareLLM(llm.LLM):
                             actual = _text_of(items[users[offset + k]])
                             tail = self._ctx.render_context_tail()
                             body = _polish_body(actual)
-                            rebased = f"{body}\n\n{tail}" if (body and tail) else (body or tail)
+                            rebased = _compose(body, tail)
                             items[users[offset + k]] = llm.ChatMessage(role="user", content=[rebased])
                             last_orig = actual
                             self._ctx.rewrite_last_applied_tail(actual, rebased)
@@ -3119,7 +3207,7 @@ class ContextAwareLLM(llm.LLM):
                             emit_stable=self._ctx.tail_emit_stable_for_rebuild()
                         )
                         body = _polish_body(last_orig)
-                        final = f"{body}\n\n{tail}" if (body and tail) else (body or tail)
+                        final = _compose(body, tail)
                         if final == tail_window[-1][1]:
                             print("TAIL_REWRITE identical_skipped", flush=True)
                         else:
@@ -3183,6 +3271,7 @@ class ContextAwareLLM(llm.LLM):
                     number_turn_text=lambda: self._ctx.turn_user_text,
                     # 合法源之三:对象档案已知事实(快递单号等系统数据念读)。
                     number_known_text=lambda: self._ctx.object_brief,
+                    on_full_swallow=self._full_swallow_cb,
                 )
                 # P2.a（2026-09-29 v2 §5）：持最近 guard 流引用——agent 侧 speech
                 # watcher 在 interrupted 补账时读 pending_buffer，cancel 轮的
@@ -3206,6 +3295,13 @@ class ContextAwareLLM(llm.LLM):
     def set_partial_capture(self, capture: dict | None) -> None:
         """注入 per-turn 部分文本 tee({"text": str})。None=关闭。"""
         self._partial_capture = capture
+
+    def set_full_swallow_cb(self, cb) -> None:
+        """FIX-3(D2-4,2026-10-01):复读防线全吞回调注入(装配时,agent 侧)。
+
+        cb(text)=本轮回复被复读防线全吞时收到被吞全文(guard 流收尾处 await
+        调用);None(B 线等)=不接=旧行为(全吞照旧静默收尾,账本不补证)。"""
+        self._full_swallow_cb = cb
 
 
 class _PartialCaptureStream(_CascadeCloseStreamMixin, llm.LLMStream):
