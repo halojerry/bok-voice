@@ -264,7 +264,14 @@ async def _generate(request: Request):
             "content-type": request.headers.get("content-type", "application/json"),
             # 车道透传（观测/测试用：桩上游可记录每请求的车道归属）
             "x-bok-lane": lane,
+            # req-id 透传(2026-10-02 审计修):W-ABORT 的注册头——旧版只转
+            # content-type/lane 令本代理路径上**一切**请求的 abort 注册失效,
+            # 客户端 POST /v1/abort 变静默 no-op(judge/mining/speculator/默认
+            # a_reply 全中;/v1/abort 本身走 catch-all 直通不受影响,但请求
+            # 从未登记)。缺头照旧省略(非 mlx 上游/无 abort 语义)。
+            "x-bok-req-id": request.headers.get("x-bok-req-id", ""),
         }
+        fwd_headers = {k: v for k, v in fwd_headers.items() if v}
         req = _client().build_request("POST", request.url.path, content=body, headers=fwd_headers)
         upstream = await _client().send(req, stream=True)
         acq.handoff()  # 释放点移交：流耗尽/断连时在 _relay finally 归还

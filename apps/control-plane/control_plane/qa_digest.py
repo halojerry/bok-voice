@@ -809,7 +809,13 @@ async def _run_once(
             if (live_count or _default_live_count)() > 0:
                 out["skipped"] = "busy-midway"
                 return out
-            plans[acc] = qa_cluster_mod._compute_plan(repo, acc, _MIN_CALLS, _LIMIT)
+            # 下线程(2026-10-02 审计修):_compute_plan 内含 httpx.post(timeout=120)
+            # 的同步 LLM 调用——直跑在事件循环上=整个 CP 停摆(/health/turns 上报/
+            # token/挂断/webhook 全冻;settle 已修同款「/health 59.4s 停摆」);闲时门
+            # 只在调用前后查活通话,不救循环本身。
+            plans[acc] = await asyncio.to_thread(
+                qa_cluster_mod._compute_plan, repo, acc, _MIN_CALLS, _LIMIT
+            )
         except Exception as exc:  # noqa: BLE001 - ClusterError(LLM 不可用)等一并列错误
             errors.append(f"cluster({acc}): {exc!r}")
     out["plan"] = {

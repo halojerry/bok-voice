@@ -145,6 +145,18 @@ class PrefillSpeculator:
             tail = self._ctx.render_context_tail() if self._ctx is not None else ""
         except Exception:  # noqa: BLE001 - 尾部渲染失败按无尾部预热
             tail = ""
+        # prefix 过同步润色(2026-10-02 审计修):真请求的 user 消息经
+        # _polish_body(CSC/吸附润色,BOK_ASR_POLISH 默认开)——旧版投机用
+        # raw STT 前缀,凡润色有编辑的轮,投机 user 段与真请求字节分叉=整段
+        # 白烧(还在单生成线程上排真请求)。sync_polish=确定性吸附(纯本地
+        # ~1ms,润色 map 未填时它正是真请求的同款兜底路径)。两分支(slot/
+        # legacy)的 user 消息都以润色后的 prefix 组装。
+        from .asr_polish_runtime import sync_polish as _sync_polish
+        _lang = getattr(self._ctx, "user_language", None)
+        try:
+            prefix = _sync_polish(prefix, _lang or None) or prefix
+        except Exception:  # noqa: BLE001 - 润色失败=raw 前缀照旧
+            pass
         if getattr(self._ctx, "slot_mode", False):
             # D1 槽位化（2026-10-01）：真请求 user 消息=任务块+客户话
             # （compose_slot_user_message 单一顺序源），投机预热必须同序——

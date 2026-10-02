@@ -252,6 +252,40 @@ def test_settle_writes_transcript_docs(tmp_path, monkeypatch):
         assert "通话结算" in settlement.read_text(encoding="utf-8")
 
 
+def test_settle_persists_usage_record(tmp_path, monkeypatch):
+    """结算 usage 落库回归钉(2026-10-02 审计修)。
+
+    旧 bug:`_repo().session.add(...)` + `_repo().session.commit()` 跨三个
+    _repo() 实例——add 挂在无人提交的 session 上=INSERT 回滚,计费账本自始
+    零写入(in-memory 后端 AttributeError 被 except 吞)。修后结算必须能读回
+    usage 记录(单 repo create_usage_record)。"""
+    monkeypatch.setenv("VAULT_ROOT", str(tmp_path / "vault"))
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/calls",
+            json={"account_id": "acc-001", "object_id": "obj-1", "persona_id": "p-1", "mode": "simulation"},
+        ).json()
+        call_id = created["id"]
+        client.post(f"/api/calls/{call_id}/turns", params={"role": "user", "transcript": "你好"}).json()
+        settled = client.post(f"/api/calls/{call_id}/settle").json()
+        assert settled["status"] == "done"
+        rec = client.get(f"/api/usage/{call_id}").json() if _usage_endpoint_exists(client) else None
+        if rec is None:
+            # 端点不存在时直查 repo(双后端同签名)
+            from control_plane.main import _repo
+            rec = _repo().get_usage_record(call_id)
+        assert rec is not None, "结算后 usage 记录必须可读回(旧 bug=零写入)"
+        assert rec["call_id"] == call_id
+
+
+def _usage_endpoint_exists(client) -> bool:
+    try:
+        r = client.get("/api/usage/nonexistent")
+        return r.status_code != 404
+    except Exception:
+        return False
+
+
 def test_settings_object_persona_knowledge_and_reports():
     with TestClient(app) as client:
         settings = client.get("/api/settings").json()

@@ -2410,30 +2410,39 @@ def _create_call_in(repo, req: CreateCallRequest, created_by: str = "") -> dict:
     #   钉死（旧语义逐字节,0/负=不限;显式设了就不探测）。campaign/dial-now（均
     #   mode=live）亦走此闸=背压；E2E 探针串行不受影响。
     # ②重复：同一 object_id 已有活通话 → 409（对象维度防叠单，B 线无 object 跳过）。
-    if req.mode == CallMode.LIVE:
-        _limit = capacity_snapshot()
-        _max_active = int(_limit.get("max") or 0)
-        if _max_active > 0:
-            _active = _live_call_count(repo)
-            if _active >= _max_active:
-                # 409 detail 带计算明细（profile/floor/computed/ceiling/free_gb）
-                # 便于运维归因「为什么只放 N 通」;审计落同款结构字段。
-                _detail = {"active": _active, "max": _max_active, "mode": req.mode,
-                           "kind": req.kind, "profile": _limit.get("profile"),
-                           "floor": _limit.get("floor"), "computed": _limit.get("computed"),
-                           "ceiling": _limit.get("ceiling"), "free_gb": _limit.get("free_gb"),
-                           "legacy": bool(_limit.get("legacy"))}
-                _audit("call.reject_concurrency", subject_type="call", account_id=req.account_id,
-                       detail=_detail)
-                raise HTTPException(status_code=409, detail=format_limit_detail(_limit))
-        if req.object_id:
-            for _c in repo.list_calls(""):
-                if (str(_c.get("object_id") or "") == req.object_id
-                        and str(_c.get("status") or "") in _LIVE_CALL_STATUSES):
-                    _audit("call.reject_duplicate", subject_type="call", subject_id=_c.get("id", ""),
-                           account_id=req.account_id, call_id=_c.get("id", ""),
-                           detail={"object_id": req.object_id, "existing_status": _c.get("status") or ""})
-                    raise HTTPException(status_code=409, detail="该对象已有进行中的通话")
+    # 准入原子化(2026-10-02 审计修):create_call 是 sync 端点跑线程池,与事件循环
+    # 上的 campaign tick/dial_now 并发时 check-then-act 会被双穿(mac ceiling=2,
+    # 六波 6 通 Metal OOM 的物理形状)——容量检查+重复检查+create_call 全程持
+    # threading.Lock(线程与主 loop 双上下文可达,须线程原语;_dispatch_schedule_lock
+    # 同款先例)。持锁段内零 LLM/网络调用,临界段纯 DB 读写。
+    with _create_admission_lock:
+        if req.mode == CallMode.LIVE:
+            _limit = capacity_snapshot()
+            _max_active = int(_limit.get("max") or 0)
+            if _max_active > 0:
+                _active = _live_call_count(repo)
+                if _active >= _max_active:
+                    # 409 detail 带计算明细（profile/floor/computed/ceiling/free_gb）
+                    # 便于运维归因「为什么只放 N 通」;审计落同款结构字段。
+                    _detail = {"active": _active, "max": _max_active, "mode": req.mode,
+                               "kind": req.kind, "profile": _limit.get("profile"),
+                               "floor": _limit.get("floor"), "computed": _limit.get("computed"),
+                               "ceiling": _limit.get("ceiling"), "free_gb": _limit.get("free_gb"),
+                               "legacy": bool(_limit.get("legacy"))}
+                    _audit("call.reject_concurrency", subject_type="call", account_id=req.account_id,
+                           detail=_detail)
+                    raise HTTPException(status_code=409, detail=format_limit_detail(_limit))
+            # 防重闸在 LIVE 块内(2026-10-02 审计修回退修正):simulation/test 刻意
+            # 对同一对象连续建多单(训练/画布试跑),闸到它们=误伤既有语义——锁包住
+            # 整个 LIVE 判定段即可,勿把 object 防重提级到全模式。
+            if req.object_id:
+                for _c in repo.list_calls(""):
+                    if (str(_c.get("object_id") or "") == req.object_id
+                            and str(_c.get("status") or "") in _LIVE_CALL_STATUSES):
+                        _audit("call.reject_duplicate", subject_type="call", subject_id=_c.get("id", ""),
+                               account_id=req.account_id, call_id=_c.get("id", ""),
+                               detail={"object_id": req.object_id, "existing_status": _c.get("status") or ""})
+                        raise HTTPException(status_code=409, detail="该对象已有进行中的通话")
     # 会话清单：读取全局策略(offline_first/cloud_first)与已配置 provider，
     # 并把话术快照到 call（审计「这场用了哪版话术」）。
     # 话术优先级：显式指定（外呼战役/话务员自选）> 对象卡绑定。
@@ -2643,6 +2652,11 @@ _dispatch_watchdog_inflight: set[str] = set()
 # Minor-5（fix round 1）：in-flight check-then-add 原子化——同房并发 token 双起
 # 看门狗的竞态窗，threading.Lock 短临界段（线程与主 loop 双上下文可达，须线程原语）。
 _dispatch_schedule_lock = threading.Lock()
+
+# 建单准入原子锁(2026-10-02 审计修):容量/重复 check-then-act 与 create_call 的
+# 竞态窗——sync 端点(线程池)与事件循环(campaign tick/dial_now)并发时双穿容量帽
+# (mac ceiling=2,六波 6 通 Metal OOM 的形状)。临界段纯 DB 读写零网络。
+_create_admission_lock = threading.Lock()
 # I-1（fix round 1）：startup 捕获的 CP 主事件循环。看门狗与 webhook 恢复链共用
 # `_redispatch_locks`（asyncio.Lock）——CPython ≥3.10 无争用快速路径不做 loop 绑定
 # 校验，争用路径跨 loop 直接 RuntimeError：防双派 TOCTOU 在重叠窗不成立 + 败方异常
@@ -4720,23 +4734,26 @@ async def _settle_core(call_id: str, *, idle_cap_s: float | None = None) -> dict
                 # tokens=轮数×300 係估算——status 标 estimated,报表可区分真值/估算
                 #(消费方按 status 过滤即得旧行为)。
                 _usage_estimated = tokens == len(turns) * 300
-                if not _repo().get_usage_record(call_id):
-                    _repo().session.add(
-                        UsageRecord(
-                            id=f"usage:{call_id}",
-                            account_id=call["account_id"],
-                            call_id=call_id,
-                            provider="local",
-                            kind="call",
-                            units=len(turns),
-                            tokens=tokens,
-                            audio_seconds=0.0,
-                            latency_ms=0,
-                            cost_estimate=0.0,
-                            status="estimated" if _usage_estimated else "ok",
-                        )
-                    )
-                    _repo().session.commit()
+                # usage 落库(2026-10-02 审计修):旧写法 `_repo().session.add(...)`
+                # +`_repo().session.commit()` 跨三个 _repo() 实例——add 挂在无人
+                # 提交的 session 上=INSERT 回滚,计费账本自始零写入(in-memory
+                # 后端更是 AttributeError 被 except 吞)。统一走 create_usage_record
+                # (双后端同签名,单 session 内 add+commit)。
+                _urepo = _repo()
+                if not _urepo.get_usage_record(call_id):
+                    _urepo.create_usage_record({
+                        "id": f"usage:{call_id}",
+                        "account_id": call["account_id"],
+                        "call_id": call_id,
+                        "provider": "local",
+                        "kind": "call",
+                        "units": len(turns),
+                        "tokens": tokens,
+                        "audio_seconds": 0.0,
+                        "latency_ms": 0,
+                        "cost_estimate": 0.0,
+                        "status": "estimated" if _usage_estimated else "ok",
+                    })
             except Exception as exc:  # pragma: no cover
                 print(f"[settle] usage_record write skipped: {exc!r}", flush=True)
             # 闲时门（2026-09-25 车道卫生）：Summarizer 是 3-9s bg 长生成，恰撞下一通
