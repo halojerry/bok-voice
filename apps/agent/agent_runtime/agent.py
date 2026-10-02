@@ -241,13 +241,26 @@ def _connect_failure_penalty_s() -> float:
     return max(t * 2.0, 8.0)
 
 
-def _feed_famine_on_connect_failure(exc: BaseException | None) -> bool:
-    """连接失败→饥荒样本单点（返回是否喂了）;两发即 llm_famine_active()。"""
+def _feed_famine_on_connect_failure(exc: BaseException | None, metrics=None) -> bool:
+    """连接失败→饥荒样本单点（返回是否喂了）;两发即 llm_famine_active()。
+
+    2026-10-02 验收补刀:罚样本必须**双面落地**——worker 本地 EMA(record_llm_
+    first_token)之外，还要经当通 metrics reporter 入队 ``llm_ttft``（ms）。
+    只喂本地 EMA 时 CP 侧饥荒状态机（准入 409 + 新单 overlay 切 4B）结构性
+    收不到死车道信号（实弹:两通死车道后 CP 零转换、零 8s 样本）——那张网
+    才是硬宕机的自动防线。add() 同步非阻塞全吞错，通话链路零风险。
+    """
     if not _is_connect_failure(exc):
         return False
     from .providers.livekit_plugins import record_llm_first_token
 
-    record_llm_first_token(_connect_failure_penalty_s())
+    _penalty_s = _connect_failure_penalty_s()
+    record_llm_first_token(_penalty_s)
+    if metrics is not None:
+        try:
+            metrics.add("llm_ttft", _penalty_s * 1000.0)
+        except Exception:  # noqa: BLE001 - 观测面绝不反噬
+            pass
     return True
 
 
@@ -5087,7 +5100,7 @@ async def entrypoint(ctx):
     # （见下方 greeting 块），这里只定義任务体。
     if _prefix_prewarm_enabled() and isinstance(_raw_llm, MlxLlmLLM) and instructions:
 
-        async def _prefix_prewarm_task(agent_ref, greeting_text: str = "") -> None:
+        async def _prefix_prewarm_task(agent_ref, greeting_text: str = "", *, metrics=None) -> None:
             import time as _t2
 
             # 并发让位(2026-09-30 call-9af18da5 定案,见 _ACTIVE_CALLS 档案):
@@ -5148,7 +5161,7 @@ async def entrypoint(ctx):
                         # 样本——connection refused 秒级返回、不走首 token 超时
                         # 分支,不喂则 EMA 恒平（死车道 16 发 APIConnectionError
                         # 零饥荒实弹）;非连接失败（400 模型未载）不喂。
-                        _feed_famine_on_connect_failure(exc)
+                        _feed_famine_on_connect_failure(exc, metrics)
                         if "unloaded" not in str(exc).lower() or _pw_try == 3:
                             print(
                                 f"[agent] llm prefix prewarm skipped: {exc!r} (call {room_name})",
@@ -8686,7 +8699,7 @@ async def entrypoint(ctx):
         if _prefix_prewarm_armed:
             # 池化(2026-09-17 全量 debug P2-A;2026-10-02 第二波改预热池):
             # 预热任务丢失只损性能;独立池=可取消,不再占 _report_tasks 的收线等待窗。
-            _spawn_prewarm(_prefix_prewarm_task(agent, greeting_text))
+            _spawn_prewarm(_prefix_prewarm_task(agent, greeting_text, metrics=_metrics_reporter))
         _register_reply_lane(lane="opening", text=greeting_text)  # EX-2 chokepoint
         await _say_script(session, tts_provider, _tts_cache, greeting_text)
         # say() 返回=整段念完(playout end),唔係出声时刻——TTS 首包在 say 调用后
@@ -8694,7 +8707,7 @@ async def entrypoint(ctx):
         _log_stage("greeting_playout_done")
     elif _prefix_prewarm_armed:
         # paused 起动无开场白:立即按「无开场白」形状预热(任务体回退抓 chat_ctx)。
-        _spawn_prewarm(_prefix_prewarm_task(agent, ""))  # 池化 P2-A + 第二波预热池:同上
+        _spawn_prewarm(_prefix_prewarm_task(agent, "", metrics=_metrics_reporter))  # 池化 P2-A + 第二波预热池:同上
 
     # session.start 只负责拉起流水线（返回后会话在后台运行）。保持 entrypoint
     # 存活直到房间关闭，supervisor watcher 在此期间持续轮询；_on_close 置位

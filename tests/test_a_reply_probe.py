@@ -266,7 +266,7 @@ def test_source_pin_warmup_catch_feeds_connect_failure():
     i = _SRC.index("async def _prefix_prewarm_task")
     j = _SRC.index("_prefix_prewarm_armed = True", i)
     seg = _SRC[i:j]
-    assert "_feed_famine_on_connect_failure(exc)" in seg
+    assert "_feed_famine_on_connect_failure(exc, metrics)" in seg
 
 
 def test_probe_smoke_real_function_does_not_raise():
@@ -282,3 +282,53 @@ def test_forward_env_membership_pin():
     import tools.bok as bok  # noqa: PLC0415
 
     assert "BOK_A_REPLY_PROBE" in bok._FORWARD_ENV
+
+
+# ---------------------------------------------------------------------------
+# 验收补刀（2026-10-02）：连接罚样本必须双面落地——本地 EMA 之外还要经当通
+# metrics reporter 入队 llm_ttft（ms），否则 CP 侧饥荒状态机（准入 409 + 新单
+# overlay 切 4B）结构性收不到死车道信号（实弹：两通死车道后 CP 零转换）。
+# ---------------------------------------------------------------------------
+
+
+class _FakeMetrics:
+    def __init__(self):
+        self.calls: list[tuple[str, float]] = []
+
+    def add(self, kind: str, ms: float) -> None:
+        self.calls.append((kind, float(ms)))
+
+
+def test_connect_failure_feeds_metrics_reporter():
+    import httpx
+
+    fake = _FakeMetrics()
+    fed = agent_mod._feed_famine_on_connect_failure(httpx.ConnectError("refused"), fake)
+    assert fed is True
+    assert fake.calls == [("llm_ttft", agent_mod._connect_failure_penalty_s() * 1000.0)]
+    assert agent_mod._connect_failure_penalty_s() >= 8.0
+
+
+def test_connect_failure_metrics_add_never_raises():
+    class _Boom:
+        def add(self, *a, **k):
+            raise RuntimeError("boom")
+
+    import httpx
+
+    assert agent_mod._feed_famine_on_connect_failure(httpx.ConnectTimeout("t"), _Boom()) is True
+
+
+def test_non_connect_failure_does_not_touch_metrics():
+    fake = _FakeMetrics()
+    assert agent_mod._feed_famine_on_connect_failure(ValueError("unloaded"), fake) is False
+    assert fake.calls == []
+
+
+def test_source_pin_prewarm_spawns_pass_reporter():
+    """两个 prewarm spawn 点必须把当通 _metrics_reporter 递进任务——漏一个就少一路
+    罚样本上报（老 worker 只有本地 EMA,CP 网收不到）。"""
+    assert _SRC.count("_prefix_prewarm_task(agent, greeting_text, metrics=_metrics_reporter)") == 1
+    assert _SRC.count('_prefix_prewarm_task(agent, "", metrics=_metrics_reporter)') == 1
+    assert "_feed_famine_on_connect_failure(exc, metrics)" in _SRC
+    assert "metrics=None" in _SRC.split("async def _prefix_prewarm_task")[1][:200]
