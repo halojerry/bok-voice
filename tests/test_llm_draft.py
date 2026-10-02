@@ -166,6 +166,9 @@ def test_download_draft_gate_opt_in(monkeypatch, tmp_path):
     fake_hub = types.SimpleNamespace(snapshot_download=_fake_download)
     monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
     monkeypatch.setattr(bok, "model_dir", lambda repo: tmp_path / "never" / repo)
+    # llm_draft 只在 mac(mlx)平台表——CI Linux 走 windows 表会 [skip] 平台
+    # 未配置,断言恒 0。钉住 mac 表测的是**下载闸逻辑本身**,与宿主平台无关。
+    monkeypatch.setattr(bok, "platform_key", lambda: "mac")
 
     _clear_draft_env(monkeypatch)
     assert bok.cmd_download() == 0

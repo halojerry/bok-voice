@@ -36,4 +36,7 @@ id = "generic-api-key"
     '''test-secret-for-qa-drift-0123456789''',
     '''diag-gates-fixture-secret-0123456789abcdef''',
     '''sk-abcdef123456''',
+    # tests/test_gap_would_hit.py(2026-10-02 欠账清偿首推):BOK_JWT_SECRET 测试
+    # 占位,同族尾数字串抬熵越线,按既定政策精确登记。
+    '''test-secret-for-gap-wouldhit-012345678''',
   ]

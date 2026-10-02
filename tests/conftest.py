@@ -27,3 +27,10 @@ for part in (
 # 5 分钟级。门的时间语义由 test_settle_idle_gate.py 单独钉；需要开门的测试
 # 显式 setenv 覆盖本 setdefault 即可。
 os.environ.setdefault("BOK_SETTLE_IDLE_WAIT_S", "0")
+
+# 登录频控（30/min per username）测试面全局关闭：全量套件对同一批测试用户名的
+# login 调用远超 30 次/分钟——CI 与本地全量都会在 test_scope/test_security_
+# hardening 等处随机 429（曾经被误记为「序耦合 flaky」的真身）。频控本身的
+# 行为由 test_login_rate_limit.py 单独钉（其 fixture delenv 后吃代码缺省 "1"）；
+# 需要开闸的其他测试显式 setenv 覆盖即可。
+os.environ.setdefault("BOK_LOGIN_RATE_LIMIT", "0")
