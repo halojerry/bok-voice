@@ -329,3 +329,133 @@ def test_bok_wiring_and_agent_lane_header_pinned():
 
     agent_src = (_ROOT / "apps" / "agent" / "agent_runtime" / "providers" / "livekit_plugins.py").read_text(encoding="utf-8")
     assert '"X-Bok-Lane", "reply"' in agent_src, "agent reply 车道头注入在场"
+
+
+# ---- 槽泄漏三道防线（2026-10-02 根修回归钉） --------------------------------
+def test_retire_idempotent_and_watchdog_reclaims_leaked_slot():
+    """释放令牌化（幂等 retire）+ 租约看门狗强制回收。
+
+    泄漏形态（review 实证）：客户端在响应体开始前断开时,starlette 在 _relay
+    首次迭代前取消 stream_response——async generator 未启动则 aclose() 不执行
+    生成器体,旧版唯一释放点（_relay finally 的 GATE.release()）永不跑,
+    concurrency=1 下整条 LLM 通路卡死到进程重启。修法=retire 幂等多头调用安全
+    + sweep_leases 超租约强制回收。
+    """
+    gate = qp.LaneGate(1)
+
+    async def _hold(g, lane):
+        async with g.acquire(lane):
+            await asyncio.sleep(0)
+
+    async def run():
+        # ctx1 拿槽后模拟「relay 未启动」：既不 __aexit__ 也不 retire（泄漏）
+        ctx1 = gate.acquire("bg")
+        await ctx1.__aenter__()
+        assert gate.stats()["active"] == 1
+
+        # ctx2 排队等待（被泄漏槽卡住）
+        ctx2 = gate.acquire("bg")
+        t2 = asyncio.create_task(ctx2.__aenter__())
+        await asyncio.sleep(0.02)
+        assert not t2.done(), "槽被泄漏持有,ctx2 应仍在等待"
+
+        # 看门狗：租约到期前不回收;到期后强制回收并唤醒等待者
+        assert gate.sweep_leases(now=time.monotonic() + 1) == [], "未到期不回收"
+        expired = gate.sweep_leases(now=time.monotonic() + qp._MAX_HOLD_S + 1)
+        assert expired == [ctx1], f"超租约应回收泄漏持有者: {expired}"
+        await asyncio.wait_for(t2, 1)
+        assert gate.stats()["lease_timeouts"] == 1
+
+        # retire 幂等：看门狗已收,ctx1 再 retire=no-op;ctx2 正常归还一次,
+        # 重复归还不再掉 active
+        assert ctx1.retire() is False, "已被看门狗回收,幂等 no-op"
+        assert ctx2.retire() is True
+        assert ctx2.retire() is False
+        assert gate.stats()["active"] == 0
+        # 重复 retire 后新请求仍可取槽（active 没被多扣成负数/假占用）
+        async with gate.acquire("bg") as fresh:
+            assert fresh.waited == 0.0
+        assert gate.stats()["active"] == 0
+
+    asyncio.run(run())
+
+
+def test_pop_next_falls_through_to_bg_when_reply_waiters_cancelled():
+    """reply 列残留已取消 future 时,release 必须照看 bg 列（饿死根修）。
+
+    旧 bug：_pop_next 只挑一条列——reply 列非空就只清它,列里全是 done()
+    future 时本轮返回 None,bg 等待者不被唤醒;配合快路径插队,bg 可被无限期
+    推迟。修法=两列按优先级依次排空。
+    """
+    import contextlib
+
+    gate = qp.LaneGate(1)
+
+    async def _hold(g, lane):
+        async with g.acquire(lane):
+            await asyncio.sleep(0)
+
+    async def run():
+        bg_task = None
+        async with gate.acquire("bg"):  # 占槽
+            # reply 等待者排队后被取消（打断/挂断的常态路径）
+            reply_task = asyncio.create_task(_hold(gate, "reply"))
+            await asyncio.sleep(0.02)
+            reply_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reply_task
+            # reply 列现在只剩 done() future;再排一个真 bg 等待者
+            bg_task = asyncio.create_task(_hold(gate, "bg"))
+            await asyncio.sleep(0.02)
+            assert gate._reply_waiters, "前置:reply 列确有残留"
+            # async with 退出（=release）：旧版只弹 reply 列的死 future,bg 饿死
+        await asyncio.wait_for(bg_task, 1)
+        assert gate.stats()["active"] == 0
+
+    asyncio.run(run())
+
+
+def test_early_disconnected_client_returns_499_without_upstream():
+    """排队前探断连：客户端已消失就不占槽不烧上游（499 短路）。
+
+    手写 ASGI 调用——receive 首个消息即 http.disconnect,模拟「排队期间用户
+    挂断、客户端早已不在」。此时尚未进入流式响应,与 starlette 的断连监听
+    无 receive 竞争。
+    """
+    served: list[str] = []
+    stub = FastAPI()
+
+    @stub.post("/v1/chat/completions")
+    async def _gen():  # noqa: ANN202
+        served.append("called")
+        return JSONResponse({"ok": True})
+
+    qp._CLIENT = httpx.AsyncClient(transport=httpx.ASGITransport(app=stub), base_url="http://stub")
+    try:
+        async def run():
+            scope = {
+                "type": "http", "asgi": {"version": "3.0"},
+                "http_version": "1.1", "method": "POST",
+                "scheme": "http", "path": "/v1/chat/completions",
+                "raw_path": b"/v1/chat/completions", "query_string": b"",
+                "root_path": "", "server": ("px", 80), "client": ("127.0.0.1", 1),
+                "headers": [(b"content-type", b"application/json")],
+            }
+
+            async def receive():
+                return {"type": "http.disconnect"}
+
+            sent: list[dict] = []
+
+            async def send(msg):
+                sent.append(msg)
+
+            await qp.app(scope, receive, send)
+            start = next(m for m in sent if m["type"] == "http.response.start")
+            return start["status"]
+
+        assert asyncio.run(run()) == 499
+        assert served == [], "客户端已断开,上游不应被烧一次生成"
+        assert qp.GATE.stats()["active"] == 0, "断开请求不得占槽"
+    finally:
+        qp._CLIENT = None
