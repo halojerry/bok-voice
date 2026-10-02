@@ -166,13 +166,29 @@ async def main() -> int:
         json={"name": "E2E客服", "language": LANG, "tone": "礼貌专业", "reference_audio": PERSONA_VOICE},
         timeout=10,
     ).json()
+    # 模板必填闸（2026-09-28）：live 建单无 template_id → 400，随后 call["id"]
+    # KeyError（探针自该闸起结构性坏）。按探针语言挑一个模板；无则大声失败。
+    templates = httpx.get(
+        f"{CONTROL_PLANE_URL}/api/templates?account_id=acc-001",
+        headers=_CP_HEADERS, timeout=10,
+    ).json()
+    tpl = next((t for t in templates if str(t.get("language") or "") == LANG), None)
+    if tpl is None:
+        print(f"[latency-probe] 无 language={LANG} 的模板（模板必填闸 2026-09-28："
+              "先在工作站建模板并发布，或用 REPLY_LAT_LANG 指向已有模板语言）",
+              file=sys.stderr)
+        return 2
     call = httpx.post(
         f"{CONTROL_PLANE_URL}/api/calls",
         headers=_CP_HEADERS,
         json={"account_id": "acc-001", "object_id": obj["id"], "persona_id": persona["id"],
-              "mode": "live", "direction": "webrtc", "language": LANG},
+              "mode": "live", "direction": "webrtc", "language": LANG,
+              "template_id": tpl["id"]},
         timeout=10,
     ).json()
+    if "id" not in call:
+        print(f"[latency-probe] 建单失败: {call}", file=sys.stderr)
+        return 2
     room_name = call["id"]
     resp = httpx.post(f"{CONTROL_PLANE_URL}/api/token", headers=_CP_HEADERS,
                       json={"account_id": "acc-001", "call_id": room_name}, timeout=10)
