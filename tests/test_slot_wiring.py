@@ -42,11 +42,10 @@ def test_slot_push_helper_replaces_all_seven_sites():
     """编排器给槽单点：_push_flow_state 收口全部推进/直念推点；
     直调 set_flow_current(current_step_text()) 只剩 helper 内一处（旧路径）。
 
-    计数=def + 6 调用点（2026-10-02 批3 合流校准）：fp 线原 7 个独立点中的
-    「catchall jump 推进」与「常规图 jump」在 main 的 _gdispatch 闭包重构里
-    已收编为**同一处** push——每个推进路径仍全被 helper 覆盖（钩子在
-    helper 体内=全调用点生效），源级计数相应 8→7。"""
-    assert _AGENT_SRC.count("_push_flow_state(context_state, flow_ctrl)") == 7  # def + 6 调用点
+    计数=def + 7 调用点（2026-10-02 批3 合流修后回归 8）：main 闭包版的
+    jump 臂曾退化为 legacy 直调（slot 模式图跳后槽位不更新）——已修回
+    _push_flow_state，七个推进点重新全数收口。"""
+    assert _AGENT_SRC.count("_push_flow_state(context_state, flow_ctrl)") == 8  # def + 7 调用点
     assert _AGENT_SRC.count("context_state.set_flow_current(flow_ctrl.current_step_text())") == 1
     # 装配点分流：slot 只推槽位（总览族不进 prompt）；legacy 走 set_flow。
     assert _AGENT_SRC.count("context_state.set_slot_step(flow_ctrl.slot_step_view())") == 2

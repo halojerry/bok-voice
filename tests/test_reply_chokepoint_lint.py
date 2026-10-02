@@ -67,6 +67,9 @@ _ALLOW_REPLY_DONE_SET: dict[tuple[str, str], int] = {
     ("agent.py", "on_user_turn_completed"): 10,
     # 打断 watcher（speech_created 触发的放弃边；第七波审计漏网、十二波补洞）
     ("agent.py", "_watch"): 1,
+    # FIX-3（2026-10-02 批3 合流）：复读全吞=有意静默的放弃边——judge 不等
+    # 一条被吞的复读（全吞上抛处置完即解除等待）。
+    ("agent.py", "_repeat_full_swallow"): 1,
 }
 
 

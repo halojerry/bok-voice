@@ -7270,7 +7270,10 @@ async def entrypoint(ctx):
                         _invalidate_stale_preemptive(
                             f"流程跳转 → 第 {flow_ctrl.current + 1} 步"
                         )
-                        context_state.set_flow_current(flow_ctrl.current_step_text())
+                        # D1 收口(2026-10-02 批3 合流修):闭包内 jump 推进也走
+                        # _push_flow_state——slot 模式下该点同推任务块;此前
+                        # legacy 直调=slot 模式图跳后槽位不更新(七个收口点漏一)。
+                        _push_flow_state(context_state, flow_ctrl)
                         # 跳步轮强制 advanced=True → QA 快路让位(spec precedence graph>QA):
                         # 同轮规则推进+图后退跳可令净位移为零,不置哨兵快路会照抢本轮。
                         _flow_step_before = -1

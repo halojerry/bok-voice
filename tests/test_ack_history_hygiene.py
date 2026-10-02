@@ -113,21 +113,33 @@ def test_excluded_lanes_registered_history_false():
 
 
 def test_add_to_chat_ctx_false_paired_with_history_false():
-    """配对不变量：凡出声走 add_to_chat_ctx=False 的车道块,注册必带 history=False。
+    """配对不变量：凡以 add_to_chat_ctx=False 方式出声,其注册必带 history=False。
 
-    窗口=注册点后 1200 字符（真配对全部 <700 字符;跨到邻车道块的假阳性距离
-    >4000 字符,实测分离干净）。违反即票据/出声方式劈叉
+    反向判定(2026-10-02 批3 合流校准)：对每个 `add_to_chat_ctx=False` 的
+    出声调用,回溯**最近的前置注册点**——正向块窗口(注册→下一注册)在相邻
+    车道块紧挨时(heartbeat farewell→nudge<1200 字符)会误把邻块的 False 出声
+    记到本块头上(farewell/digit-flush 双假阳性);反向锚定把 False 出声唯一
+    归属给紧邻它之前的注册,配对关系精确。违反即票据/出声方式劈叉
     (票据推了 item 永不发生→5s 兜底误领)。
     """
-    for lane_raw, call, _window in _lane_registration_sites(AGENT_SRC):
-        after = AGENT_SRC[
-            AGENT_SRC.index(call) + len(call) : AGENT_SRC.index(call) + len(call) + 1200
+    import re as _re
+
+    for m in _re.finditer(r"_say_script\((?:[^()]|\([^()]*\))*?add_to_chat_ctx=False", AGENT_SRC, _re.S):
+        idx = m.start()
+        prev = [
+            (raw, call)
+            for raw, call, _ in _lane_registration_sites(AGENT_SRC)
+            if AGENT_SRC.index(call) < idx
         ]
-        if "add_to_chat_ctx=False" in after and "notify=True" not in call:
-            assert "history=False" in call, (
-                f"lane={lane_raw} 出声 add_to_chat_ctx=False 但注册未带 "
-                f"history=False（票据劈叉）:{call[:120]}"
-            )
+        if not prev:
+            continue
+        lane_raw, call = prev[-1]
+        if "notify=True" in call:
+            continue
+        assert "history=False" in call, (
+            f"lane={lane_raw} 出声 add_to_chat_ctx=False 但最近注册未带 "
+            f"history=False（票据劈叉）:{call[:120]}"
+        )
 
 
 def test_ledger_ack_line_helper_shape():
