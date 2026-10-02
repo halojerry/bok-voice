@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -200,3 +201,58 @@ def _deadline_clock():
         return 0.0 if state["n"] == 1 else 10_000.0
 
     return _clock
+
+
+# ---- 6. 云 CP 节点 worker→CP 接线（runbook §5④，2026-09-22 修）----
+
+
+def test_cp_url_exported_to_env(monkeypatch):
+    """node_agent 把 --cp-url 翻进 CONTROL_PLANE_URL（缺省才写）。"""
+    import node_agent
+
+    monkeypatch.delenv("CONTROL_PLANE_URL", raising=False)
+    assert node_agent.apply_cp_url_to_env("https://cp.example.com") == "https://cp.example.com"
+    assert os.environ["CONTROL_PLANE_URL"] == "https://cp.example.com"
+
+
+def test_cp_url_explicit_env_wins(monkeypatch):
+    """显式 env 优先于 --cp-url（dev 栈/隔离栈已设值时零影响）。"""
+    import node_agent
+
+    monkeypatch.setenv("CONTROL_PLANE_URL", "http://127.0.0.1:8010")
+    assert node_agent.apply_cp_url_to_env("https://cp.example.com") == "http://127.0.0.1:8010"
+
+
+def test_worker_env_consumes_cp_url(monkeypatch):
+    """端到端契约钉：node_agent 导出的 env → `_agent_worker_env` 真吃到——
+    云 CP 节点上 worker 的 turns/QA/设置上报不再打缺省本地 :8000。"""
+    monkeypatch.setenv("CONTROL_PLANE_URL", "https://cp.example.com")
+    env = bok._agent_worker_env(bok.repo_python())
+    assert env["CONTROL_PLANE_URL"] == "https://cp.example.com"
+
+
+def test_worker_env_default_still_local(monkeypatch):
+    """非节点形态（dev serve 含本地 CP）缺省值不变。"""
+    monkeypatch.delenv("CONTROL_PLANE_URL", raising=False)
+    env = bok._agent_worker_env(bok.repo_python())
+    assert env["CONTROL_PLANE_URL"] == "http://127.0.0.1:8000"
+
+
+# ---- 7. model_path Linux dev 档 gguf 解析（runbook §5②，2026-09-22）----
+
+
+def test_model_path_linux_dev_prefers_downloaded_gguf(monkeypatch, tmp_path: Path):
+    """cmd_download 落盘的 *Q4_K_M.gguf 应解析为文件路径（llama-server 只认文件）。"""
+    monkeypatch.setattr(bok._platform, "system", lambda: "Linux")
+    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
+    gguf = tmp_path / "models" / "Qwen--Qwen3-4B-Q4_K_M" / "Qwen3-4B.Q4_K_M.gguf"
+    gguf.parent.mkdir(parents=True)
+    gguf.write_text("x")
+    assert bok.model_path({"llm": "Qwen/Qwen3-4B-Q4_K_M"}, "llm") == str(gguf)
+
+
+def test_model_path_linux_dev_no_gguf_keeps_repo_id(monkeypatch, tmp_path: Path):
+    """布局里没有 gguf 时保持 repo id 兜底（win-dev hf cache 语义，行为不变）。"""
+    monkeypatch.setattr(bok._platform, "system", lambda: "Linux")
+    monkeypatch.setattr(bok, "app_data_dir", lambda: tmp_path)
+    assert bok.model_path({"llm": "Qwen/Qwen3-4B"}, "llm") == "Qwen/Qwen3-4B"

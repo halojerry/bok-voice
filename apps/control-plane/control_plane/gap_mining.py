@@ -23,7 +23,10 @@ gen 是唯一权威快路判定源(_turn_origin consume-once 账本,:3015 默认
                    "stall-{N}"(:4385,超时降级重试)——这些 provider 是跳步/通知/
                    看门狗**副作用标记,回复文本仍係 LLM 生成**,不得按 provider
                    判快路(任务书提示的「provider 属 graph-*/branch-* 即快路」
-                   会把这三类错算成罐头,以代码实证为准推翻);
+                   会把这三类错算成罐头,以代码实证为准推翻)。
+                   P2.2 catch-all 命中同档:provider="graph-catchall" 只标「本轮动作
+                   来自兜底意图 "*"」,回复文本照旧按 gen 判(jump/notify=llm 生成,
+                   play_qa=qa_fastpath 罐头,见下条);
 - "script"       脚本直念:开场白(:5106)/心跳(:4916)/收线(:4906)/收线告别/
                    直念步(:4456 provider=flow-say)/WA 复述确认(:2197/:2250)/
                    watchdog-ack(:2295)/late-answer(:2642)/starve-ack(:3790/:3845)/

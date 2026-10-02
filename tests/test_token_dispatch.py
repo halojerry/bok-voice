@@ -217,3 +217,92 @@ def test_token_rate_limit_429_and_per_identity(monkeypatch):
     cp_main._token_issue_times["anon"] = []
     r3 = client.post("/api/token", json={"account_id": "acc-001", "room_name": "rate-x"})
     assert r3.status_code == 201
+
+
+# ---- 2026-09-22 机器通道铸币收紧：supervisor/listen 只准具名 admin/root 或 auth-off ----
+
+
+def _machine_on(monkeypatch):
+    monkeypatch.setenv("BOK_AUTH_REQUIRED", "1")
+    monkeypatch.setenv("BOK_CP_TOKEN", "machine-token")
+    return {"Authorization": "Bearer machine-token"}
+
+
+def _dual_off(monkeypatch):
+    monkeypatch.delenv("BOK_AUTH_REQUIRED", raising=False)
+    monkeypatch.delenv("BOK_CP_TOKEN", raising=False)
+    return {}
+
+
+def _mk_call(repo, call_id: str) -> str:
+    from bok_voice_core.policies import select_session_manifest
+    from bok_voice_core.types import CallMode
+
+    repo.create_call(select_session_manifest(
+        session_id=call_id, account_id="acc-001", object_id="",
+        persona_id="", mode=CallMode.SIMULATION))
+    return call_id
+
+
+def test_machine_channel_cannot_mint_supervisor_token(monkeypatch):
+    """BOK_CP_TOKEN 持有人（org 级共享凭据）禁铸 supervisor 房 token——对齐
+    B-F1「机器通道不得进管理面」口径（任一节点失陷不得对通话静默注入主管）。"""
+    client, repo = _client_and_repo(monkeypatch)
+    _fresh_limiter(monkeypatch)
+    call_id = _mk_call(repo, "call-m1")
+    r = client.post(
+        "/api/token",
+        json={"account_id": "acc-001", "call_id": call_id, "role": "supervisor"},
+        headers=_machine_on(monkeypatch),
+    )
+    assert r.status_code == 403, r.text
+
+
+def test_machine_channel_cannot_mint_listen_token(monkeypatch):
+    """listen 专线同闸：直打 /api/token purpose=listen 与复用链
+    /api/supervisor/{id}/listen 两条路都 403（单一收窄点全链生效）。"""
+    client, repo = _client_and_repo(monkeypatch)
+    _fresh_limiter(monkeypatch)
+    call_id = _mk_call(repo, "call-m2")
+    hdr = _machine_on(monkeypatch)
+    r = client.post(
+        "/api/token",
+        json={"account_id": "acc-001", "call_id": call_id, "purpose": "listen"},
+        headers=hdr,
+    )
+    assert r.status_code == 403, r.text
+    r2 = client.post(f"/api/supervisor/{call_id}/listen", headers=hdr)
+    assert r2.status_code == 403, r2.text
+
+
+def test_machine_channel_publish_token_unchanged(monkeypatch):
+    """收紧不溢出：机器通道普通 operator/有记录房间照发 publish+dispatch
+    （三套 E2E/probe 先建单后取 token 依赖此路）。"""
+    client, repo = _client_and_repo(monkeypatch)
+    _fresh_limiter(monkeypatch)
+    call_id = _mk_call(repo, "call-m3")
+    r = client.post(
+        "/api/token",
+        json={"account_id": "acc-001", "call_id": call_id},
+        headers=_machine_on(monkeypatch),
+    )
+    assert r.status_code == 201, r.text
+    claims = _claims(r.json()["participantToken"])
+    assert claims["video"]["canPublish"] is True
+    agents = claims.get("roomConfig", {}).get("agents") or []
+    assert agents and agents[0]["agentName"] == "bok-voice"
+
+
+def test_dual_off_supervisor_unchanged(monkeypatch):
+    """auth-off 本机形态零变化：supervisor 照发 201（本机单用户形态既定口径）。"""
+    client, repo = _client_and_repo(monkeypatch)
+    _fresh_limiter(monkeypatch)
+    call_id = _mk_call(repo, "call-m4")
+    r = client.post(
+        "/api/token",
+        json={"account_id": "acc-001", "call_id": call_id, "role": "supervisor"},
+        headers=_dual_off(monkeypatch),
+    )
+    assert r.status_code == 201, r.text
+    claims = _claims(r.json()["participantToken"])
+    assert claims["video"]["canPublish"] is True  # supervisor join 语义（非 listen）

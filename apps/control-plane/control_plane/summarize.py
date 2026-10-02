@@ -11,6 +11,8 @@ import httpx
 # （``_render_transcript``），落盘的 ``transcript.md`` 原件（main._write_settlement_docs）
 # 逐字不碰——那是原始证据面。kill-switch ``BOK_POLISH_OFFLINE`` 默认关（见
 # ``polish_wiring`` 模块 docstring 的实测理由）。
+from bok_voice_core.deepseek_llm import thinking_extra_body
+from bok_voice_core.json_repair import loads_lenient
 from bok_voice_core.polish_wiring import polish_offline_text
 from bok_voice_core.model_routes import PROVIDER_OPENAI, resolve_route
 # 账本噪声分类单源(2026-09-27):垫话/打断/兜底降级行不是内容回复——纪要 prompt
@@ -72,8 +74,17 @@ class Summarizer:
         # 缺席回退原链路(settings llm 卡 > MLX_LLM_* env,语义同旧)。
         _settle_base = os.environ.get("BOK_SETTLE_LLM_BASE_URL", "").strip()
         _settle_model = os.environ.get("BOK_SETTLE_LLM_MODEL", "").strip()
+        api_key = (llm_cfg.get("api_key") or "").strip()
         if _settle_base and _settle_model:
             base_url, model = _settle_base.rstrip("/"), _settle_model
+            # 专线若指向云端（DeepSeek 等）必须有凭据——本地 MLX 不校验时这是个空串，
+            # 语义不变。凭据只走 env（与 BOK_SETTLE_LLM_* 同款 CP 面注入），不落盘。
+            api_key = os.environ.get("BOK_SETTLE_LLM_API_KEY", "").strip() or api_key
+        # `"mlx"` 是本仓既有的「本地端点不校验凭据」哨兵（与 agent `_llm_judge` 的
+        # api_key 缺省同值）——设置页本地卡就存这个字面量，它**不是**凭据，不许变成
+        # Authorization 头（否则本地档的请求形状也变了）。
+        if api_key == "mlx":
+            api_key = ""
         # 设置页 LLM 卡片可存空 base_url / 占位 model="local"；本机 MLX 的真实地址
         # 由启动器经 env 注入（与 agent 的 MlxLlmLLM 同一来源）。只读 settings 会打到
         # 空 URL / model=local → mlx_lm 404 → 蒸馏表（new_topics/insight）永不写入。
@@ -86,7 +97,10 @@ class Summarizer:
         # （空表/kill-switch → source=="env"）时上面的 env 链路逐字节不动；仅
         # source=="routing" 命中才覆盖端点——openai 云端档吃 base_url/model/
         # api_key + enable_thinking；local 档显式改端点（model 空沿用现值）。
-        api_key = ""
+        # 合并注记（origin/main 安全波 × 本线路由波）：api_key 的**基线**是上面
+        # settings/env 的凭据链（BOK_SETTLE_LLM_API_KEY + "mlx" 哨兵治理），这里
+        # 不再清零——仅 routing 命中 openai 档时被路由表覆盖；未命中时凭据照旧
+        # 可用（否则「设置页存了云端 key」在无路由表时被静默丢弃、云端点 401）。
         enable_thinking = False
         route = resolve_route("settle", os.environ, read_model_routing_raw())
         if route.source == "routing":
@@ -119,8 +133,8 @@ class Summarizer:
         transcript: str,
         call: dict,
         system: str = _SYSTEM,
-        *,
         api_key: str = "",
+        *,
         enable_thinking: bool = False,
     ) -> dict:
         payload = {
@@ -140,18 +154,31 @@ class Summarizer:
         # 档不附带——env 链请求体与改造前逐字节一致，Qwen3.5 思考陷阱见计划 §2.2）。
         if enable_thinking:
             payload["enable_thinking"] = True
+        # 沉淀/纪要是**非实时**后台重活：思考开着更准（2026-09-21 口径——对话侧关思考
+        # 换首字延迟，纪要侧不动它）。但思考与正文**共用** max_tokens 预算，512 不够时
+        # 会整段烧在 reasoning 上、content 出空串，而这里落地是静默 ``_fallback``
+        # （指标摘要，质量无声降级）——故思考档下把预算抬到容得下「思考 + JSON 正文」。
+        # 本地 MLX 端点该片段为空 dict，payload 逐字节同旧。
+        #
+        # **超时也得跟着抬**（2026-09-21 实测）：思考档下真跑一次要 9-14s 起，而
+        # ``self.timeout`` 缺省 15s——云端 v4-pro 档实测 5/5 全部 ReadTimeout
+        # （`ReadTimeout('The read operation timed out')`），即「纪要换云」光抬预算
+        # 不抬超时**结构上跑不通**。纪要本来就离线，放宽无代价。
+        # （DeepSeek 专有 reasoning 字段走 thinking_extra_body；非 DeepSeek 端点={}，
+        #   与路由 extra.enable_thinking 的通用扩展字段互不干扰。）
+        thinking_body = thinking_extra_body(base_url, "enabled")
+        timeout = self.timeout
+        if thinking_body:
+            payload.update(thinking_body)
+            payload["max_tokens"] = 2048
+            timeout = max(timeout, float(os.environ.get("BOK_SETTLE_THINKING_TIMEOUT_S", "90")))
         # api_key 仅云端档携带（本地档 "mlx" 不塞请求头——契约 model_routes 注释）。
-        # env 链（api_key=""）保持与改造前**同一调用形状**（不带 headers 参）——
-        # 测试面 monkeypatch httpx.post 的窄签名不破（test_summarize 实证）。
+        # 无凭据时不传 `headers` kwarg（而非传 None）：本地档的调用形状逐字节同旧，
+        # 既有以窄签名桩 httpx.post 的测试/调用方零改动（test_summarize 实证）。
+        post_kwargs: dict[str, Any] = {"json": payload, "timeout": timeout}
         if api_key:
-            r = httpx.post(
-                f"{base_url}/chat/completions",
-                json=payload,
-                timeout=self.timeout,
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
-        else:
-            r = httpx.post(f"{base_url}/chat/completions", json=payload, timeout=self.timeout)
+            post_kwargs["headers"] = {"Authorization": f"Bearer {api_key}"}
+        r = httpx.post(f"{base_url}/chat/completions", **post_kwargs)
         r.raise_for_status()
         content = r.json()["choices"][0]["message"].get("content", "")
         return self._parse(content)
@@ -160,11 +187,32 @@ class Summarizer:
         text = content.strip()
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if not m:
+            # 可观测性（2026-09-21）：这里以前是**静默** `_fallback`，所以「settle 模型
+            # 换了以后沉淀成片丢」在观测面完全看不见——本次实测（本机 9B @1237）就是
+            # 靠这个盲区藏了很久。空稿要留痕，别只留结果。
+            print(f"[summarize] 模型没吐 JSON（content {len(text)} 字，头部：{text[:80]!r}）→ 退指标摘要", flush=True)
             return self._fallback([])
         try:
             data = json.loads(m.group(0))
-        except Exception:
-            return self._fallback([])
+        except Exception as exc:  # noqa: BLE001 - 坏 JSON 是模型输出问题，可见即可
+            # 「内容全对、只漏了最外层一个 `}`」是本机 9B 的**主要坏法**（2026-09-21
+            # 真实转写 6/6 复现，见 bok_voice_core.json_repair 模块 docstring）。
+            # 先试保守补括号再判失败——不然这些**内容完好**的纪要会整批退成桩文本。
+            repaired = loads_lenient(m.group(0))
+            if repaired is not None:
+                print(
+                    f"[summarize] 模型 JSON 漏收尾 → 补括号救回（content {len(text)} 字，"
+                    f"原错：{exc}）",
+                    flush=True,
+                )
+                data = repaired
+            else:
+                print(
+                    f"[summarize] 模型吐的 JSON 解析失败且补不回来（content {len(text)} 字）：{exc} "
+                    f"→ 退指标摘要（new_topics/insight 全丢）",
+                    flush=True,
+                )
+                return self._fallback([])
         return {
             "summary": str(data.get("summary", "")),
             "new_topics": list(data.get("new_topics", [])),

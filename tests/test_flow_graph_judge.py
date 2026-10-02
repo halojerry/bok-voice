@@ -103,8 +103,9 @@ def test_parse_judge_ignores_extra_keys():
 
 
 def test_validate_judge_boundaries_pass():
+    # 绑定边在场(P2.2 孤儿门):本测试的靶子是判据长度窗,不是绑定的有无。
     for prompt in ("判", "判" * JUDGE_PROMPT_MAX_CHARS):
-        raw = _graph(intents=[_intent(judge={"prompt": prompt})])
+        raw = _graph(intents=[_intent(judge={"prompt": prompt})], bindings=[_binding()])
         assert validate_flow_graph(raw) == []
 
 

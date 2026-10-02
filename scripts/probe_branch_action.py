@@ -546,18 +546,8 @@ async def wait_assist_notified(call_id: str, timeout_s: float) -> str:
 
 
 def log_windows(marks: list[int]) -> list[list[str]]:
-    """按字节偏移切 agent.log（同 probe_flow_graph.log_windows；纯读）。"""
-    try:
-        data = erc.LOG_PATH.read_bytes()
-    except Exception:  # noqa: BLE001
-        return [[] for _ in range(max(0, len(marks) - 1))]
-    out: list[list[str]] = []
-    for start, end in zip(marks, marks[1:]):
-        out.append([
-            raw.decode("utf-8", errors="replace")
-            for raw in data[max(0, start):max(0, end)].splitlines()
-        ])
-    return out
+    """按字节偏移切 agent.log（erc.log_windows 共享件，保留本地名免散改调用点）。"""
+    return erc.log_windows(marks)
 
 
 # ---------------------------------------------------------------------------
@@ -630,24 +620,9 @@ def materialize_branches(persona_id: str, raw_texts: list[str]) -> dict[str, str
 # ---------------------------------------------------------------------------
 # 跑一腿
 # ---------------------------------------------------------------------------
-async def wait_log_stable(*, poll_s: float = 0.3, max_wait_s: float = 6.0) -> int:
-    """轮询 agent.log 大小直到连续两次读数相同（间隔 poll_s），返回当前大小。
-
-    切窗前必须等日志落盘稳定（hold 腿窗界 race 收口）：`play_and_listen` 按
-    静默返回时，该轮的推进/分支日志可能还在「端点 min_delay + 轮处理」的路上
-    ——不等稳就切 mark，上一轮的 `[flow] rule=auto step=2`（warmup 身份步合法
-    推进）会串进 trigger 窗口，令 `no_advance` 误判推进。这不改任何判据语义，
-    只保证「每轮的日志落在该轮自己的窗口内」。日志持续增长超 max_wait_s 时按
-    当前大小返回（不无限等）。"""
-    deadline = time.perf_counter() + max_wait_s
-    prev = erc.LOG_PATH.stat().st_size if erc.LOG_PATH.exists() else 0
-    while time.perf_counter() < deadline:
-        await asyncio.sleep(poll_s)
-        cur = erc.LOG_PATH.stat().st_size if erc.LOG_PATH.exists() else 0
-        if cur == prev:
-            return cur
-        prev = cur
-    return prev
+# wait_log_stable/log_windows 已收编 erc 共享件（2026-09-22 三探针单点）；
+# 本地别名免散改调用点，语义=「marks[0]=通话前大小、窗口 k=第 k 轮」。
+wait_log_stable = erc.wait_log_stable
 
 
 async def run_leg(*, leg: str, lang: str, voice: str, keep_template: bool) -> dict:

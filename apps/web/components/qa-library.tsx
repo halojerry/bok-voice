@@ -147,7 +147,7 @@ function QaModal(props: {
         </label>
 
         <p className="rounded-lg bg-muted/60 px-2 py-1.5 text-[11px] leading-relaxed muted">
-          提示：命中本条后想继续多轮（播完跳到某步 / 通知人工），在「意图管理」里给意图挂
+          提示：命中本条后想继续多轮（播完跳到某步 / 通知人工），在「主流程」的意图卡里给意图挂
           「播快答」动作并选中本条。回答里可点上方变量按钮插入 {"{姓名}"} 等占位符。
         </p>
 

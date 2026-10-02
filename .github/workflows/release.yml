@@ -4,6 +4,8 @@ name: Release
 # 代码包/运行时包 → 冒烟 → GitHub Release（私有仓=私有资产）。操作员随后
 # `deploy/cloud/publish_node_pkg.sh <版本>` 推到云 CP 工件卷，客户节点经
 # license/node_token 鉴权下载——交付链零 GitHub、零桌面安装包。
+# Windows 节点形态 2026-09-22 起软退役：matrix 不再出 windows 运行时包
+# （Windows=仅浏览器访问 web UI；装机脚本保留但标 DEPRECATED unmaintained）。
 
 on:
   push:
@@ -28,8 +30,6 @@ jobs:
         include:
           - os: macos-14
             target: mac
-          - os: windows-latest
-            target: windows
           - os: ubuntu-22.04
             target: linux
     steps:

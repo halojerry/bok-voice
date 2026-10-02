@@ -12,6 +12,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional
 
+# DeepSeek 端点的思考开关契约(判据/意图判据换云时缺省关思考,否则小 max_tokens
+# 预算被 reasoning 烧光、正文出空串=判据静默全 miss;理由与实测见该模块 docstring)
+from bok_voice_core.deepseek_llm import thinking_extra_body
 from bok_voice_core.flow_graph import (
     ACTION_NOTIFY_HUMAN,
     ACTION_PLAY_QA,
@@ -52,11 +55,11 @@ from .control_plane import ControlPlaneClient
 # DR 容灾+可观测(契约 §1,2026-10-01):worker 四 kind 指标批量上报 CP——
 # 通道/节流/吞错纪律全在模块内,agent 侧只做采样与生命周期挂线。
 from .metrics_report import MetricsReporter, VadInferTracker
-from .fillers import FillerDirector, derive_context_bucket
 # Laya 决策旁路(2026-09-26,docs/LAYA-EVAL.md):薄客户端+纯装配,日志由本模块统一
 # 打点;enabled 闸在最外层(意图=BOK_LAYA_JUDGE、QA 复核=BOK_LAYA_QA,两把 env 闸
 # 独立立法;2026-09-27 意图闸默认翻启 "1"、QA 复核仍默认 "0")。缺 sidecar=
 # fail-open 结构性零退化。kill-switch 经 bok.py _FORWARD_ENV 进 worker env。
+from .fillers import FillerDirector, derive_context_bucket, intent_category_hint
 from .laya_judge import (
     build_qa_state,
     decide_qa_match,
@@ -294,6 +297,12 @@ async def _llm_judge(
     `enable_thinking` 缺省 `None`＝请求 kwargs 不含 `extra_body` 键（逐字节同旧）；模型
     路由 judge 云端档（openai）传布尔——Qwen3.5 家族云端思考陷阱：不传该旗思考全开
     （LANE-AB 实测 5.85s 全 <think>），随请求体显式下发（2026-09-25 阶段 0）。
+
+    端点换云（DeepSeek）时附「缺省关思考」：判据 max_tokens 只有 8-32，思考会把预算
+    整段烧在 reasoning 上、正文出空串——本判据换云首轮就是这么**静默全 miss** 的
+    （6/6 `unclear conf=0.00`）。非 DeepSeek 端点该字段为空 dict，本地 MLX 零变化。
+    与 `enable_thinking` 的合流：DeepSeek 端点走 `thinking` 键（本守卫），其余云端
+    才发 `enable_thinking` 旗（两契约互斥，见下方请求体构造）。
     """
     if not base_url or not model:
         return ""
@@ -311,8 +320,22 @@ async def _llm_judge(
             # 本地 MLX 對話模板會 append <|im_end|>,停喺呢度,回應淨係 verdict 字。
             stop=["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
         )
-        if enable_thinking is not None:
-            # 仅 openai 档加（缺省 None=既有调用点请求体零变化）。
+        # 思考旗两契约合流(2026-10-02 合并):
+        # ① DeepSeek 端点(2026-09-21 判据换云首轮 6/6 静默全 miss 的坑,契约见
+        #    bok_voice_core.deepseek_llm):max_tokens 只有 8-32,思考会把预算烧在
+        #    reasoning 上、正文出空串——缺省关思考(FLOW_JUDGE_LLM_THINKING=enabled
+        #    显式开);非 DeepSeek 端点本片段为空 dict=不加键(HEAD 路由波零漂移
+        #    契约:缺省请求 kwargs 不含 extra_body 键,test_model_route_wiring 钉死;
+        #    main 侧「恒带空 extra_body」形状在线上无字节差,由本契约取代)。
+        # ② 其余云端(路由 judge openai 档,Qwen3.5 家族):不传旗思考全开(LANE-AB
+        #    实测 5.85s 全  thinking),按路由表显式下发 enable_thinking(缺省 None=
+        #    本地 MLX 不加 extra_body 键,逐字节同旧)。
+        _thinking_body = thinking_extra_body(
+            base_url, os.environ.get("FLOW_JUDGE_LLM_THINKING", "")
+        )
+        if _thinking_body:
+            _create_kwargs["extra_body"] = _thinking_body
+        elif enable_thinking is not None:
             _create_kwargs["extra_body"] = {"enable_thinking": bool(enable_thinking)}
         r = await client.chat.completions.create(**_create_kwargs)
         if r.choices:
@@ -780,7 +803,13 @@ def branch_hit_plan(
     }
 
 
-def _nudge_should_fire(now: float, last_reply_ts: float, last_user_ts: float, nudge_delay: float) -> bool:
+def _nudge_should_fire(
+    now: float,
+    last_reply_ts: float,
+    last_user_ts: float,
+    nudge_delay: float,
+    interrupted_unanswered: bool = False,
+) -> bool:
     """沉默心跳开火时序护栏（纯函数，单测用）。
 
     两种窗口唔开火：
@@ -789,10 +818,15 @@ def _nudge_should_fire(now: float, last_reply_ts: float, last_user_ts: float, nu
       唔好用「仲喺度嗎」頂替真答案；超 2×delay 仍無聲先允許心跳兜底
       （答案可能失敗/被取消——2026-09-05 三会话实测「一直心跳」根因护栏；
       ≤ 边界收紧系 2026-09-06 call-03a3295c:恰 16.0s 护栏失效心跳顶替真答案）。
+
+    P3.3（2026-09-21，§48 打断特权轮）：``interrupted_unanswered``=上一段回复
+    被打断且 AI 未回应过——2×delay 窗对打断轮**豁免**（打断后回复被取消/
+    被守卫丢轮的现场，硬等 16s 才问「仲喺度嗎」正是打断怪体验主源）；
+    gate1（AI 啱講完唔追）仍生效，打断轮最早也在标准 delay 后开火。
     """
     if now - last_reply_ts < nudge_delay:
         return False
-    if last_user_ts > last_reply_ts and now - last_user_ts <= nudge_delay * 2:
+    if not interrupted_unanswered and last_user_ts > last_reply_ts and now - last_user_ts <= nudge_delay * 2:
         return False
     return True
 
@@ -920,6 +954,58 @@ def _intent_facts_snapshot(
     for verdict_name, fact_key in _VERDICT_FACT_KEYS.items():
         snap[fact_key] = int(counts.get(verdict_name) or 0)
     return snap
+
+
+def _intent_context_enabled() -> bool:
+    """P2.4(2026-09-21,§48)意图喂下游 kill-switch:默认 "1",`0` 全关。
+
+    关时 LLM 尾部【客户意图】行不写不渲染、垫话类别提示不下发(字节同旧)。
+    进 `_FORWARD_ENV`(tests/test_forward_env 门禁)。
+    """
+    return os.environ.get("BOK_INTENT_CONTEXT", "1") == "1"
+
+
+def _intent_display_name(flow_ctrl, intent_id: str) -> str:
+    """当轮具名意图 id → 展示名(纯函数,离线可测;P2.4 意图喂下游)。
+
+    两类来源统一出口:graph 意图(`flow_ctrl.graph.intent_by_id(id).label`,含兜底
+    `"*"` 的 label)优先,系统意图(`flow.SYSTEM_INTENTS[id].name`)兜底;都查不到
+    → 原样回 id(非空即有用信号)。空 id → 空串。异常一律吞掉回 id/空串(观测位,
+    绝不阻通话)。
+    """
+    iid = str(intent_id or "").strip()
+    if not iid:
+        return ""
+    try:
+        gi = flow_ctrl.graph.intent_by_id(iid) if flow_ctrl is not None else None
+        if gi is not None:
+            return str(getattr(gi, "label", "") or "") or iid
+    except Exception:  # noqa: BLE001 - 观测位:图查名失败唔阻回复
+        pass
+    try:
+        from .flow import SYSTEM_INTENTS
+
+        si = SYSTEM_INTENTS.get(iid)
+        if si is not None:
+            return str(getattr(si, "name", "") or "") or iid
+    except Exception:  # noqa: BLE001
+        pass
+    return iid
+
+
+def _turn_intent_id(gbinding, gcatchall, flow_ctrl) -> str:
+    """当轮意图 id 取序(纯函数):graph 常规命中 → 图兜底命中 → 规则归类。
+
+    `gcatchall` 只在本轮常规意图空手时被 agent 暂存(兜底派发让位 QA 快路后置),
+    故「常规命中优先、兜底补位」与派发 precedence 一致;两者皆空取
+    `flow_ctrl.last_rule_intent`(flow P2.3 清空式归类位,可能为 "")。
+    """
+    iid = str(getattr(gbinding, "intent", "") or "") if gbinding is not None else ""
+    if not iid and gcatchall is not None:
+        iid = str(getattr(gcatchall, "intent", "") or "")
+    if not iid:
+        iid = str(getattr(flow_ctrl, "last_rule_intent", "") or "")
+    return iid
 
 
 def evaluate_intent_disposition(
@@ -1257,7 +1343,8 @@ _REPLY_LANES: tuple[str, ...] = (
     "opening", "wa-flush", "digit-flush", "watchdog-ack", "late-answer",
     "starve-ack", "storm-ack", "branch-refuse", "branch-notify", "branch-jump",
     "stall-degrade", "stall-bypass", "stall-close", "defer-ack", "flow-say",
-    "qa-fastpath", "graph-play", "graph-jump", "graph-notify", "branch-canned",
+    "qa-fastpath", "graph-play", "graph-jump", "graph-notify", "graph-catchall",
+    "branch-canned",
     "farewell", "nudge", "followup-ack", "pause-ack", "fallback-ack",
     "garbled-reask", "wa-confirm",
 )
@@ -3577,9 +3664,18 @@ async def entrypoint(ctx):
             return
         # W4-T2 意向账本:真触发才计数(拆弹/未武装不计)——「哑轮频发」信号。
         _facts["watchdog_fired"] += 1
+        # P0.4(2026-09-21,§48 仪器化):开火时带上可归因上下文——尾部字数(肥尾
+        # prefill=「越聊越慢」主因,§46.1)与 LLM 轮序(垫话 director 的 arm 计数,
+        # ≈本通走到 LLM 路径的轮数)。85 次实弹的归因按这行数据分档(§48 P3.4)。
+        try:
+            _tail_chars = len(context_state.render_context_tail())
+            _llm_turns = getattr(_filler, "_turn_seq", -1)
+        except Exception:  # noqa: BLE001 - 观测失败不阻兜底
+            _tail_chars, _llm_turns = -1, -1
         print(
             f"[watchdog] no assistant audio {_response_watchdog_s():.0f}s after commit "
-            f"-> force-interrupt + ack (call {room_name})",
+            f"-> force-interrupt + ack (call {room_name}) "
+            f"[P0.4 tail_chars={_tail_chars} llm_turns={_llm_turns}]",
             flush=True,
         )
         try:
@@ -3720,7 +3816,7 @@ async def entrypoint(ctx):
     # count 會喺客戶真開口(on_user_turn_completed)時歸零。last_user_ts/last_reply_ts
     # 記錄「客戶最後開聲」與「AI 最後講完」時刻(秒),心跳只在兩者都足夠舊先開火
     # ——唔會喺客戶啱講完、AI 答案未出、或者 AI 啱講完幾秒內就打斷。
-    _nudge_state: dict = {"count": 0, "timer": None, "last_user_ts": 0.0, "last_reply_ts": 0.0}
+    _nudge_state: dict = {"count": 0, "timer": None, "last_user_ts": 0.0, "last_reply_ts": 0.0, "interrupt": False}
     from .plugins.emotion import EmotionState
 
     emotion_state = EmotionState()
@@ -5366,6 +5462,8 @@ async def entrypoint(ctx):
                 build_judge_messages,
                 degrade_boost,
                 FOLLOWUP_CONF_MIN,
+                JUDGE_MAX_TOKENS,
+                JUDGE_ROUTE_MAX_TOKENS,
                 parse_judge_output,
                 parse_judge_route,
             )
@@ -5401,7 +5499,14 @@ async def entrypoint(ctx):
                 route_enabled=route_enabled,
             )
             _raw = await _llm_judge(
-                jbase, jmodel, msgs, api_key=jkey, enable_thinking=jthinking
+                jbase,
+                jmodel,
+                msgs,
+                # route 模式契约是两行（verdict + route/conf），8 token 只够第一行加半个
+                # route 行——conf 结构性解析不出来，建单闸恒不触发（见 flow.py 常量注释）。
+                max_tokens=JUDGE_ROUTE_MAX_TOKENS if route_enabled else JUDGE_MAX_TOKENS,
+                api_key=jkey,
+                enable_thinking=jthinking,
             )
             jv = parse_judge_output(_raw)
             if route_enabled:
@@ -5762,6 +5867,15 @@ async def entrypoint(ctx):
             _disarm_silence()
             # 上一轮若有垫话定时器还挂着(真回复一直未出声、客户又开口),作废它。
             _filler.cancel()
+            # P3.3 打断特权轮(§48):上一段回复刚被打断(_storm 台账 4s 内有
+            # generate_reply 打断记录,B4 补账同源)→ 本轮=打断轮:垫话豁免连轮
+            # 冷却(打断轮常紧跟上一垫话轮,冷却撞上=「打断后垫话没效果」主因)、
+            # 心跳判据缩短(打断后 AI 未回应,唔再等 2×delay 先问「仲喺度嗎」——
+            # gate2 对打断轮豁免,§44.3④ 的「仲喺度嗎」怪体验)。
+            _turn_interrupted = bool(_storm["ts"] and time.monotonic() - _storm["ts"][-1] <= 4.0)
+            if _turn_interrupted:
+                _filler.note_interrupt_round()
+                _nudge_state["interrupt"] = True
             # 响应看门狗武装(钩子最顶端,run-5 轮9 33s 死寂教训:垫话配额会耗尽、
             # 钩子/生成可能静默失败——任何分支只要本轮有意静默或已出声即拆弹)。
             _arm_response_watchdog()
@@ -6255,6 +6369,14 @@ async def entrypoint(ctx):
                                 _wa_direct_confirm = _num
                             print(f"[whatsapp] {_kind} num={_num or '-'} (call {room_name})", flush=True)
             except Exception:  # pragma: no cover - WhatsApp 偵測失敗唔阻斷
+                pass
+            # 意图归类喂下游(P2.4,§48):detect 结果 → flow 具名意图归类位(纯观测,
+            # None 也传=清位)。P2.3 留的 agent 侧接线点;不改 detect/上报任何行为。
+            # 放在直捕 canned 确认之前:确认臂 raise StopResponse 提前收轮,归类
+            # 必须先行才不丢本轮的观测(pending 消费在下一轮 arm 时)。
+            try:
+                flow_ctrl.note_wa_signal(_wa_signal)
+            except Exception:  # pragma: no cover - 归类失败唔阻回复
                 pass
             if _wa_direct_confirm:
                 # 直捕 canned 确认(_wa_number_line,同累积 flush 同源):脚本直念
@@ -6826,6 +6948,142 @@ async def entrypoint(ctx):
             # 空图零成本零变化;closing 后收线优先——REFUSE 分支已置 closing 且
             # 唔 raise,图唔可以抢走告别轮(与 QA 快路 closing 旁路同源)----
             _gbinding = None
+            _gcatchall_stash = None  # P2.2(复核修):兜底候选——QA 快路未接才在快路后派发
+
+            # P2.2(2026-09-21,§48 P2.2 复核修):图动作三臂派发抽成闭包——常规命中在
+            # graph 块内即派发;**兜底 "*" 命中改在 QA 快路之后派发**(让位铁律:
+            # 字面命中的罐头 ~50ms 即答,唔可以被 "*" 的 jump/notify 抢走——优先级
+            # REFUSE>DEFER>say>graph 常规>QA>**catch-all**>LLM)。QA 命中会
+            # StopResponse 收尾,能落到兜底派发点=本轮 QA 确实未接。
+            async def _gdispatch(_gbinding, _from_catchall: bool) -> None:
+                nonlocal _flow_step_before, _branch_plan
+                if _gbinding.action == "jump_step":
+                    # 1-based 存储转 0-based;先跳、按**实际位移**记账(2026-09-18
+                    # review R1):jump_to 内部还会 no-op(无步骤/done 钳制),未位移
+                    # 就唔可以烧 once 绑定/宣告 provider/打 jump 日志(spec §4.3 防环)。
+                    _gtarget = int(_gbinding.step or 1) - 1
+                    _gcur = flow_ctrl.current
+                    flow_ctrl.jump_to(_gtarget)
+                    if flow_ctrl.current != _gcur:
+                        flow_ctrl.graph_fired.add(_gbinding.id)
+                        _invalidate_stale_preemptive(
+                            f"流程跳转 → 第 {flow_ctrl.current + 1} 步"
+                        )
+                        context_state.set_flow_current(flow_ctrl.current_step_text())
+                        # 跳步轮强制 advanced=True → QA 快路让位(spec precedence graph>QA):
+                        # 同轮规则推进+图后退跳可令净位移为零,不置哨兵快路会照抢本轮。
+                        _flow_step_before = -1
+                        # M-22②:分支计划是跳前旧步匹配的 → 作废(本轮不 raise,
+                        # 会落穿分支罐头腿,旧步罐头抢答新步轮)
+                        _branch_plan = None
+                        print(
+                            f"FLOW_GRAPH jump binding={_gbinding.id} "
+                            f"step={flow_ctrl.current + 1}",
+                            flush=True,
+                        )
+                        # 本轮继续回答(新步指引);provider 标记 assistant 轮
+                        # (兜底命中=provider 标 graph-catchall,动作本体见上方日志)。
+                        # EX-2 chokepoint:notify=True=只顺延 provider,不建票据
+                        # (被中断无 item 时不泄漏进下一轮,call-35adfa90 根治)。
+                        if _from_catchall:
+                            _register_reply_lane(lane="graph-catchall", notify=True)
+                        else:
+                            _register_reply_lane(lane="graph-jump", notify=True)  # EX-2
+                    else:
+                        print(
+                            f"FLOW_GRAPH jump_noop binding={_gbinding.id} "
+                            f"step={_gtarget + 1}",
+                            flush=True,
+                        )
+                elif _gbinding.action == ACTION_NOTIFY_HUMAN:
+                    # W4-T2 notify_human 第三臂:打铃不抢话——CP assist 置 notified
+                    # (坐席台见「人工求助」),本轮 LLM 照常兜话,坐席旁听后手动接管;
+                    # **不 raise StopResponse**(jump 同构先例),落回后续 LLM 生成。
+                    # 上报 fire-and-forget,入队成功才烧 once/记 graph_notifies
+                    # (失败回滚 once,下一轮信号补报——_report_notify_once 文档)。
+                    _invalidate_stale_preemptive("人工协助已通知")
+                    print(f"FLOW_GRAPH notify binding={_gbinding.id}", flush=True)
+                    # provider 标记 assistant 轮(本轮仍由 LLM 生成,item_added 落库)
+                    # (兜底命中=provider 标 graph-catchall,动作本体见上方日志)
+                    if _from_catchall:
+                        _register_reply_lane(lane="graph-catchall", notify=True)
+                    else:
+                        _register_reply_lane(lane="graph-notify", notify=True)  # EX-2
+                    _spawn_report(
+                        _report_notify_once(
+                            cp, call_id, _gbinding.id, flow_ctrl.graph_fired, _facts,
+                            where=room_name,
+                        )
+                    )
+                else:  # play_qa:条目在场且音频已物化才播;miss 放行 LLM 不消耗 once
+                    if _graph_advanced:
+                        # W1b Phase 0 advanced 守卫:规则推进轮 play 臂落穿 LLM——
+                        # 罐头劫持确认轮(意图目录 design_notes:「赔偿可以」被裸词
+                        # 抢)的 Phase 0 治理。镜像 play_miss 行为姿势:不烧 once、
+                        # 不播罐头、落穿 LLM。jump/notify 臂不加守卫(蓝图定案:
+                        # jump 必须能压过规则推进;notify 零抢话误铃代价低)。
+                        print(
+                            f"FLOW_GRAPH play_bypass binding={_gbinding.id} "
+                            f"reason=advanced (call {room_name})",
+                            flush=True,
+                        )
+                        return
+                    _ge = (
+                        _qa_index.by_id(_gbinding.qa_id)
+                        if _qa_index is not None and _gbinding.qa_id
+                        else None
+                    )
+                    _gp = _qa_pcm_for(str((_ge or {}).get("answer_text") or ""))
+                    if (
+                        _ge is not None
+                        and _gp is not None
+                        and await _qa_canned_say(
+                            _ge,
+                            _gp,
+                            provider="graph-play" if not _from_catchall else "graph-catchall",
+                        )
+                    ):
+                        flow_ctrl.graph_fired.add(_gbinding.id)
+                        print(
+                            f"FLOW_GRAPH play binding={_gbinding.id} "
+                            f"qa={_gbinding.qa_id}",
+                            flush=True,
+                        )
+                        # ---- 追问链（Phase 3.3，spec §3）：罐头播完当场同步跳，下一轮
+                        # 按新步走。本分支以 StopResponse 收尾，冇任何 LLM 请求——唔喺本
+                        # 分支渲染当前步（渲染只会烧掉该步首渲染账本 _last_render_step/
+                        # _just_advanced，令下一轮流程块重渲染退成分支模式，底稿与
+                        # 【跳转进入】结构性失落）；位移状态已由 jump_to 置好，下一轮流程块
+                        # 首渲染即该步正稿+【跳转进入】，且真被请求消费。复用 Phase 2 位移
+                        # 记账纪律：实际位移才打 jump 日志；同位/closing/钳到同位 → jump_noop
+                        # 且零额外消耗（then_jump 是同一绑定的动作后缀，不另立 once 账本条目）。
+                        # 注：_invalidate_stale_preemptive 的标记随本轮 turn_ctx 副本蒸发
+                        # （承重件是 jump_to 置的位移状态）；照 spec 调用，零成本。
+                        # 0/False 为静默 no-op（T1 parse 丢 bool/拒 0——未来若扩「0=跳回首步」语义勿沿用真值门）。
+                        if _gbinding.then_jump:
+                            _tj_target = int(_gbinding.then_jump) - 1
+                            if flow_ctrl.apply_then_jump(_gbinding.then_jump):
+                                _invalidate_stale_preemptive(
+                                    f"流程跳转 → 第 {flow_ctrl.current + 1} 步"
+                                )
+                                print(
+                                    f"FLOW_GRAPH jump binding={_gbinding.id} "
+                                    f"step={flow_ctrl.current + 1} via=then_jump",
+                                    flush=True,
+                                )
+                            else:
+                                print(
+                                    f"FLOW_GRAPH jump_noop binding={_gbinding.id} "
+                                    f"step={_tj_target + 1} via=then_jump",
+                                    flush=True,
+                                )
+                        raise StopResponse()  # 压掉本轮 LLM(WA 累积同款)
+                    print(
+                        f"FLOW_GRAPH play_miss binding={_gbinding.id} "
+                        f"qa={_gbinding.qa_id}",
+                        flush=True,
+                    )
+
             if (
                 os.environ.get("BOK_FLOW_GRAPH", "1") == "1"
                 and flow_ctrl.graph.intents
@@ -6959,127 +7217,35 @@ async def entrypoint(ctx):
                                 f"step={flow_ctrl.current + 1} (call {room_name})",
                                 flush=True,
                             )
+                # P2.2 catch-all(bolna 式兜底,spec 2026-09-21 §48 P2.2;**复核修**):
+                # 常规意图(关键词+判据两路)全未命中 → 兜底意图 "*" 的启用绑定。
+                # 位置钉在 judge 归因块**之后**(先补会让归因张冠李戴),但只**暂存**
+                # ——派发让位 QA 快路(见 _gdispatch 后置调用点),罐头字面命中先答。
+                # 无 "*" 意图/无启用绑定 → stash 仍 None → 照旧落 LLM(逐字节同旧)。
+                if _gbinding is None:
+                    _gcatchall_stash = flow_ctrl.pick_catchall_binding()
+            # 常规意图命中才「本轮已有专属动作」;兜底(暂存中)唔算——它只决定
+            # 「这一轮怎么答」,不係对常规意图的模糊判定(判据调度闸见下方)。
+            _gregular_hit = _gbinding is not None
             if _gbinding is not None:
-                if _gbinding.action == "jump_step":
-                    # 1-based 存储转 0-based;先跳、按**实际位移**记账(2026-09-18
-                    # review R1):jump_to 内部还会 no-op(无步骤/done 钳制),未位移
-                    # 就唔可以烧 once 绑定/宣告 provider/打 jump 日志(spec §4.3 防环)。
-                    _gtarget = int(_gbinding.step or 1) - 1
-                    _gcur = flow_ctrl.current
-                    flow_ctrl.jump_to(_gtarget)
-                    if flow_ctrl.current != _gcur:
-                        flow_ctrl.graph_fired.add(_gbinding.id)
-                        _invalidate_stale_preemptive(
-                            f"流程跳转 → 第 {flow_ctrl.current + 1} 步"
-                        )
-                        context_state.set_flow_current(flow_ctrl.current_step_text())
-                        # 跳步轮强制 advanced=True → QA 快路让位(spec precedence graph>QA):
-                        # 同轮规则推进+图后退跳可令净位移为零,不置哨兵快路会照抢本轮。
-                        _flow_step_before = -1
-                        # M-22②:分支计划是跳前旧步匹配的 → 作废(本轮不 raise,
-                        # 会落穿分支罐头腿,旧步罐头抢答新步轮)
-                        _branch_plan = None
-                        print(
-                            f"FLOW_GRAPH jump binding={_gbinding.id} "
-                            f"step={flow_ctrl.current + 1}",
-                            flush=True,
-                        )
-                        # 本轮继续回答(新步指引);provider 标记 assistant 轮
-                        _register_reply_lane(lane="graph-jump", notify=True)  # EX-2
-                    else:
-                        print(
-                            f"FLOW_GRAPH jump_noop binding={_gbinding.id} "
-                            f"step={_gtarget + 1}",
-                            flush=True,
-                        )
-                elif _gbinding.action == ACTION_NOTIFY_HUMAN:
-                    # W4-T2 notify_human 第三臂:打铃不抢话——CP assist 置 notified
-                    # (坐席台见「人工求助」),本轮 LLM 照常兜话,坐席旁听后手动接管;
-                    # **不 raise StopResponse**(jump 同构先例),落回后续 LLM 生成。
-                    # 上报 fire-and-forget,入队成功才烧 once/记 graph_notifies
-                    # (失败回滚 once,下一轮信号补报——_report_notify_once 文档)。
-                    _invalidate_stale_preemptive("人工协助已通知")
-                    print(f"FLOW_GRAPH notify binding={_gbinding.id}", flush=True)
-                    # provider 标记 assistant 轮(本轮仍由 LLM 生成,item_added 落库)
-                    _register_reply_lane(lane="graph-notify", notify=True)  # EX-2
-                    _spawn_report(
-                        _report_notify_once(
-                            cp, call_id, _gbinding.id, flow_ctrl.graph_fired, _facts,
-                            where=room_name,
-                        )
-                    )
-                else:  # play_qa:条目在场且音频已物化才播;miss 放行 LLM 不消耗 once
-                    if _graph_advanced:
-                        # W1b Phase 0 advanced 守卫:规则推进轮 play 臂落穿 LLM——
-                        # 罐头劫持确认轮(意图目录 design_notes:「赔偿可以」被裸词
-                        # 抢)的 Phase 0 治理。镜像 play_miss 行为姿势:不烧 once、
-                        # 不播罐头、落穿 LLM。jump/notify 臂不加守卫(蓝图定案:
-                        # jump 必须能压过规则推进;notify 零抢话误铃代价低)。
-                        print(
-                            f"FLOW_GRAPH play_bypass binding={_gbinding.id} "
-                            f"reason=advanced (call {room_name})",
-                            flush=True,
-                        )
-                    else:
-                        _ge = (
-                            _qa_index.by_id(_gbinding.qa_id)
-                            if _qa_index is not None and _gbinding.qa_id
-                            else None
-                        )
-                        _gp = _qa_pcm_for(str((_ge or {}).get("answer_text") or ""))
-                        if (
-                            _ge is not None
-                            and _gp is not None
-                            and await _qa_canned_say(_ge, _gp, provider="graph-play")
-                        ):
-                            flow_ctrl.graph_fired.add(_gbinding.id)
-                            print(
-                                f"FLOW_GRAPH play binding={_gbinding.id} "
-                                f"qa={_gbinding.qa_id}",
-                                flush=True,
-                            )
-                            # ---- 追问链（Phase 3.3，spec §3）：罐头播完当场同步跳，下一轮
-                            # 按新步走。本分支以 StopResponse 收尾，冇任何 LLM 请求——唔喺本
-                            # 分支渲染当前步（渲染只会烧掉该步首渲染账本 _last_render_step/
-                            # _just_advanced，令下一轮流程块重渲染退成分支模式，底稿与
-                            # 【跳转进入】结构性失落）；位移状态已由 jump_to 置好，下一轮流程块
-                            # 首渲染即该步正稿+【跳转进入】，且真被请求消费。复用 Phase 2 位移
-                            # 记账纪律：实际位移才打 jump 日志；同位/closing/钳到同位 → jump_noop
-                            # 且零额外消耗（then_jump 是同一绑定的动作后缀，不另立 once 账本条目）。
-                            # 注：_invalidate_stale_preemptive 的标记随本轮 turn_ctx 副本蒸发
-                            # （承重件是 jump_to 置的位移状态）；照 spec 调用，零成本。
-                            # 0/False 为静默 no-op（T1 parse 丢 bool/拒 0——未来若扩「0=跳回首步」语义勿沿用真值门）。
-                            if _gbinding.then_jump:
-                                _tj_target = int(_gbinding.then_jump) - 1
-                                if flow_ctrl.apply_then_jump(_gbinding.then_jump):
-                                    _invalidate_stale_preemptive(
-                                        f"流程跳转 → 第 {flow_ctrl.current + 1} 步"
-                                    )
-                                    print(
-                                        f"FLOW_GRAPH jump binding={_gbinding.id} "
-                                        f"step={flow_ctrl.current + 1} via=then_jump",
-                                        flush=True,
-                                    )
-                                else:
-                                    print(
-                                        f"FLOW_GRAPH jump_noop binding={_gbinding.id} "
-                                        f"step={_tj_target + 1} via=then_jump",
-                                        flush=True,
-                                    )
-                            raise StopResponse()  # 压掉本轮 LLM(WA 累积同款)
-                        print(
-                            f"FLOW_GRAPH play_miss binding={_gbinding.id} "
-                            f"qa={_gbinding.qa_id}",
-                            flush=True,
-                        )
+                await _gdispatch(_gbinding, False)
+            # 判据判定调度(Phase 3.4):常规意图未命中才让判据补位——确定性关键词恒
+            # 同步先行,judge 只做模糊轮(spec §4)。**P2.2 兜底命中同档撒网**:兜底只
+            # 决定「这一轮怎么答」,唔係对常规意图的模糊判定;若把兜底当常规命中而不
+            # 调度,图里一挂 `"*"` 就令判据层永久饿死(每轮都「命中」了)→ 运营写的
+            # 常规意图对模糊说法永远打不通。判据命中下一轮照旧**先于**兜底被 pick
+            # 消费(pick_graph_action 在 pick_catchall_action 之前),优先级不丢。
+            # 位置钉在派发**之后**:判据任务带当时的步号(`step_at`),兜底 jump 会换步
+            # ——先调度会让 store 守卫(flow_ctrl.current != step_at)把整条判定判成
+            # stale 白烧一次 9B;派发后调度=按跳后步算 scope,判定真能落到下一轮。
+            # 闸门仍以 user_text 钉死(review F1:空转写轮 user_text 为空令图块整体
+            # 跳过 → 唔准漏进调度,白烧 9B + 无话语支撑的 pending;play_qa 分支
+            # raise StopResponse 早已兜过本轮,调度到不了那里)。
+            # `elif` 承接「常规命中已派发」:此支恒 _gregular_hit=False,内层
+            # not _gregular_hit 是 P2.2 语义的显式留痕(兜底命中同档撒网)。
             elif user_text:
-                # 关键词未中才让判据判定补位——确定性关键词恒同步先行,judge 只做兜底
-                # (spec §4)。**elif 钉死在图块真求值过的分支**(review F1:旧 else 与
-                # 图块平级,空转写轮 user_text 为空令图块整体跳过时仍会漏进调度——
-                # 白烧一次 9B 之外,挂上的 pending 喺下一轮无话语支撑地触发绑定;
-                # say/收线/图关各路径 `_intent_judge_candidates` 门已覆盖,唯
-                # user_text 唔喺门参数里,这里结构上补死)。
-                _maybe_schedule_intent_judge(user_text)
+                if not _gregular_hit:
+                    _maybe_schedule_intent_judge(user_text)
             # ---- 分支罐头快路(M-22②,2026-09-23 起**移到话术图引擎之后**):
             # 分支命中且应答已物化录音 → 直接播录音跳过 LLM(零 TTFT、措辞逐字
             # 一致);未命中/未物化照旧落穿 QA/LLM——提示词注入行为不变。不推进
@@ -7421,6 +7587,17 @@ async def entrypoint(ctx):
                             break  # 罐头路拒播(非异常径):原语义落 no_audio
                         print(f"QA_FASTPATH hit=0 reason=no_audio entry={_qa_entry.get('id')}", flush=True)
                         _qa_bump("no_audio")
+            # P2.2 兜底派发(复核修,§48 P2.2):QA 快路未接(命中/bypass 到不了这、
+            # 命中路径已 StopResponse 收尾)→ 兜底 "*" 绑定此刻派发。优先级铁律:
+            # REFUSE>DEFER>say>graph 常规>QA>**catch-all**>LLM——罐头字面命中先答,
+            # 兜底只接「常规意图与 QA 都没接住」的轮;play 臂 miss 照旧放行 LLM。
+            if _gcatchall_stash is not None:
+                print(
+                    f"FLOW_GRAPH catchall binding={_gcatchall_stash.id} "
+                    f"action={_gcatchall_stash.action}",
+                    flush=True,
+                )
+                await _gdispatch(_gcatchall_stash, True)
             # (旧 paused 分支已前移为 hook 顶部的 C1 暂停冻结——落库 gen=paused+
             # 三路推进全冻结;此处保留防御性兜底,正常流到不到。)
             if self.paused:
@@ -7549,6 +7726,28 @@ async def entrypoint(ctx):
             # 走到这=本轮走 LLM 正常回复路径(话术直念/暂停/跳过都已在前面拦截)
             # → 起垫话定时器:回复首音频 ~700ms 未到才播,快轮零打扰(closing/WA
             # 步由开火前 guards 复核兜住)。
+            # ---- 意图喂下游(P2.4,§48):当轮意图 → LLM 尾部【客户意图】行 +
+            # 垫话类别提示。取序=graph 常规命中 → 图兜底派发 → 规则归类
+            # (flow_ctrl.last_rule_intent);位置在 graph/兜底派发**之后**、
+            # `_filler.arm()` **之前**(hint 须先于 arm 落 pending,否则本轮垫话
+            # 拿不到提示)。kill-switch BOK_INTENT_CONTEXT=0 → 两面皆关(set 不调、
+            # 提示不下发,字节同旧)。
+            if _intent_context_enabled():
+                _turn_intent = _turn_intent_id(_gbinding, _gcatchall_stash, flow_ctrl)
+                _turn_intent_text = _intent_display_name(flow_ctrl, _turn_intent)
+                # set_customer_intent **每轮覆盖**(空=清位):不调用会令上一轮意图
+                # 残留,下一轮任何实质变化触发全量尾部时带出误导信号(见 ContextState
+                # 文档「每轮覆盖」语义)。
+                try:
+                    context_state.set_customer_intent(_turn_intent_text)
+                except Exception:  # noqa: BLE001 - 观测位失败绝不阻回复
+                    pass
+                _hint_cat = intent_category_hint(_turn_intent)
+                if _hint_cat:
+                    try:
+                        _filler.hint_category(_hint_cat)
+                    except Exception:  # noqa: BLE001
+                        pass
             _filler.arm()
 
         async def _try_append_user_message(self, new_message) -> bool:
@@ -7678,7 +7877,10 @@ async def entrypoint(ctx):
             now = time.monotonic()
             last_user = float(_nudge_state.get("last_user_ts") or 0.0)
             last_reply = float(_nudge_state.get("last_reply_ts") or 0.0)
-            if not _nudge_should_fire(now, last_reply, last_user, nudge_delay):
+            if not _nudge_should_fire(
+                now, last_reply, last_user, nudge_delay,
+                interrupted_unanswered=bool(_nudge_state.get("interrupt")),
+            ):
                 return
             name = str((object_card or {}).get("display_name") or "").strip()
             lang = language_state.lang if language_state.lang in ("zh", "cantonese", "en") else "zh"
@@ -7723,6 +7925,7 @@ async def entrypoint(ctx):
         _link["agent"] = getattr(ev, "new_state", "") or ""
         if getattr(ev, "new_state", "") == "listening":
             _nudge_state["last_reply_ts"] = time.monotonic()
+            _nudge_state["interrupt"] = False  # P3.3:AI 讲完一句=打断已获回应
             _arm_silence()
         else:
             _disarm_silence()
@@ -8040,9 +8243,13 @@ def run_agent() -> None:
 
     # C6-2 端口单例守卫(2026-09-13):重复 spawn 撞 8081 时良性退出 0(旧版
     # Errno 48 崩溃+假故障噪音);BOK_WORKER_PORT_GUARD=0 关。
+    # 端口先读 env 再进守卫(2026-09-22 修序):旧版守卫写死 8081 且在
+    # _worker_port 解析之前——BOK_WORKER_PORT=9081 时守卫探错端口,防双实例
+    # 保护对实际监听口失效。
+    _worker_port = int(os.environ.get("BOK_WORKER_PORT", "8081") or 8081)
     from .worker_guard import worker_port_singleton_guard
 
-    worker_port_singleton_guard(8081, "agent")
+    worker_port_singleton_guard(_worker_port, "agent")
 
     # 抢跑失效诊断探针（BOK_PREEMPTIVE_DEBUG=1）：须在 worker 起跑前包好框架
     # 比较函数，否则首通 session 已绑旧引用。
@@ -8059,8 +8266,9 @@ def run_agent() -> None:
     # 不分端口会同抢默认 8081,后绑者 Errno 48 即崩("Agent did not join the
     # room" 根因,2026-09-06 实证)。BOK_WORKER_PORT 可覆盖(默认 8081 零漂移):
     # 单机多栈并存(并行会话/多 worktree 验收)时错开端口,免被对方端口预清
-    # 当殭尸杀(2026-09-18 漏斗 v2 隔离 E2E 实证)。
-    _worker_port = int(os.environ.get("BOK_WORKER_PORT", "8081") or 8081)
+    # 当殭尸杀(2026-09-18 漏斗 v2 隔离 E2E 实证)。_worker_port 已在上方
+    # 单例守卫前解析(修序见上,2026-09-22)。
+    #
     # 刀5A(2026-10-02):num_idle_processes=1——livekit 1.8.2 WorkerOptions 缺省
     # 按 min(cpu, 4) 预 fork 空闲子进程,本机 12 空闲子进程 ≈3.1GB(常驻内存大
     # 头/swap 压力源);A 线通话=每通起 job 子进程,空闲池只服务「预热」,1 个

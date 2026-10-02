@@ -3,8 +3,10 @@
 // AI 工作站（W1；2026-09-20 重设计）：以话术模板为入口的集中工作台。
 // 列表态（无 ?t=）：全部模板概览 + 新建话术（话术/快答内容全部整合在此，
 // /templates、/qa 移出主导航后这里成为唯一内容入口）；
-// 工作台态（?t=<id>）：话术流程 + 意图管理 + 变量 + 客户意向 + 录音沉淀 +
-// 通话日志 + 学习报告 tab（对齐参考产品的主流程/意图管理/变量设定/客户意向/录音管理 tab 面）。
+// 工作台态（?t=<id>）：主流程（列表编辑/画布双视图）+ 意图管理 + 问答库 +
+// 变量 + 客户意向 + 录音沉淀 + 通话日志 + 学习报告 tab（对齐参考产品的主流程/
+// 意图管理/变量设定/客户意向/录音管理 tab 面；合并注记：origin/main 的 P2.5
+// 「画布退役、意图折进主流程」属另一条线，本线画布在役、意图独立成 tab）。
 // （学习报告/聚类采纳在 components/study-tab.tsx,变量目录与预览在 components/template-vars.tsx）。
 // 深链先例：/calls?call= / /supervisor?listen= —— 静态导出用 query，不开动态路由。
 
@@ -253,12 +255,13 @@ export default function StudioPage() {
 
   const tplRow: TemplateRow | null = useMemo(() => (tpl ? toTemplateRow(tpl) : null), [tpl]);
   // 意图图与步骤脊柱（graph_json 解析一律走 lib/qa-canvas.parseGraphDoc 现成实现）。
+  // 合并注记：origin/main（P2.5 画布退役线）删了此定义，本线画布在役——恢复。
   const graph = useMemo(() => parseGraphDoc(tplRow?.graph_json ?? ""), [tplRow]);
   const stepsList = useMemo(() => parseTemplateSteps(tplRow?.steps_json ?? ""), [tplRow]);
-  // 内容只读判定（B4 owner 口径，与 FlowCanvas/TemplateEditor 同款）：共享话术非主管=只读。
+  // 内容只读判定（B4 owner 口径，与 TemplateEditor/IntentManager 同款）：共享话术非主管=只读。
   const contentReadOnly = Boolean(selId) && !isManager && !(uid !== "" && String(tplRow?.owner_user_id ?? "") === uid);
 
-  // ---- 步骤草稿（工作站层唯一持有；画布与列表编辑同一份——切换视图不丢修改） ----
+  // ---- 步骤草稿（工作站层唯一持有；列表编辑/模板设置共用——切换不丢修改） ----
   const [stepsDraft, setStepsDraft] = useState<FlowStep[]>([]);
   const [stepsDirty, setStepsDirty] = useState(false);
   const [applying, setApplying] = useState(false);
@@ -409,6 +412,9 @@ export default function StudioPage() {
       // 存储不可用:选择只在本次会话生效,功能不受影响。
     }
   }, []);
+  // 合并注记：意图 tab 是本线（HEAD）的工作站分区——origin/main 的 P2.5 把意图折进
+  // 「主流程」表单（画布退役线），本线画布在役、意图编辑器独立成 tab（画布
+  // onOpenIntents 也深链到这里），故保留 HEAD 分区。
   const tabs: [string, string][] = [
     ["flow", "主流程"],
     ["intent", "意图管理"],
@@ -580,7 +586,7 @@ export default function StudioPage() {
         <div className="mb-8 flex items-start justify-between gap-3">
           <div>
             <h1 className="page-title">AI 工作站</h1>
-            <p className="page-sub">按话术模板集中作业：话术流程 · 意图管理 · 变量 · 客户意向 · 录音沉淀 · 通话日志 · 学习报告</p>
+            <p className="page-sub">按话术模板集中作业：主流程 · 意图管理 · 问答库 · 变量 · 客户意向 · 录音沉淀 · 通话日志 · 学习报告</p>
           </div>
           {!creating && (
             <button className="btn-primary shrink-0" onClick={() => setCreating(true)}>
@@ -808,7 +814,10 @@ export default function StudioPage() {
             </div>
           )}
 
-          {/* 2. 意图管理（PRD 3.3）：第一层识别——表格+弹窗直编 graph_json；种子包一键导入 */}
+          {/* 2. 意图管理（PRD 3.3）：第一层识别——表格+弹窗直编 graph_json；种子包逐条登记。
+              合并注记：origin/main P2.5 把意图折进「主流程」表单（画布退役线），本线保留
+              独立意图 tab（画布 onOpenIntents 深链此处）；IntentManager 本体已采合并后
+              （lib/intent-table）结构 + 本线表格导入/语言过滤/种子包。 */}
           {tab === "intent" && tplRow && (
             <IntentManager
               tpl={tplRow}

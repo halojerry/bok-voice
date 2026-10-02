@@ -1,3 +1,9 @@
+# =====================================================================
+# DEPRECATED 2026-09-22: Windows 节点形态退役（软退役）。Windows 定位=仅
+# 浏览器访问 web UI，节点运行时只跑 macOS/Linux；本脚本保留不再维护、
+# CI 已停出 Windows 包（release.yml matrix / node-handshake.yml windows
+# job 已删）。新部署勿用。
+# =====================================================================
 # setup-windows.ps1 — one-time environment bootstrap for the no-Docker Windows path.
 # Creates the sidecar venvs + installs the web/realtime deps. Model weights are
 # fetched later by `python tools/bok.py download` (or the desktop first-run guide).

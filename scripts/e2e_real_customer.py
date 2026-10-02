@@ -58,6 +58,19 @@ CP_HEADERS: dict[str, str] = {}
 if os.environ.get("BOK_CP_TOKEN", "").strip():
     CP_HEADERS["Authorization"] = f"Bearer {os.environ['BOK_CP_TOKEN'].strip()}"
 
+# SSRF 守卫（2026-09-23，Mimosa 修复）：本模块是 soak/branch/flow_graph/
+# qa_phonetic 等探针的共享底座——import 期对两个出站基址过本地诊断白名单，
+# 复用者自动继承（云端测试设 BOK_PROBE_EXTRA_HOSTS 显式扩展）。
+from urlguard_gate import gate  # noqa: E402
+
+gate(CONTROL_PLANE_URL, TTS_URL)
+
+# 机器通道鉴权（e2e_barge_in 同款惯例）：auth-on 栈/隔离 CP 必须带，未设 env 时
+# 头为空=与旧 auth-off 栈逐字节同行为。soak 族（offscript/latency）共享本底座。
+# `_CP_HEADERS` 是旧名（origin/main 侧探针 erc._CP_HEADERS 引用）——同一 dict 别名，
+# 禁止再造第二个账本（两名字漂移=真隐患）。
+_CP_HEADERS = CP_HEADERS
+
 # 答完判定：出现过语音后，连续静默 ≥2.5s 视为答完；30s 无声=哑轮。
 ANSWER_TIMEOUT_S = float(os.environ.get("BOK_CUSTOMER_TIMEOUT_S", "30"))
 ANSWER_SILENCE_S = float(os.environ.get("BOK_CUSTOMER_SILENCE_S", "2.5"))
@@ -245,6 +258,46 @@ def log_slice_markers(offset: int) -> list[str]:
             if line and line not in lines:
                 lines.append(line)
     return lines[:40]
+
+
+async def wait_log_stable(*, poll_s: float = 0.3, max_wait_s: float = 6.0) -> int:
+    """轮询 agent.log 大小直到连续两次读数相同（间隔 poll_s），返回当前大小。
+
+    探针共享件（2026-09-22 收编单点，原 probe_branch_action 实战版）：切窗前
+    必须等日志落盘稳定——play_and_listen 按静默返回时，该轮的推进/快路日志
+    可能还在「端点 min_delay + 轮处理」的路上，不等稳就切 mark，上一轮的行
+    会串进本轮窗口（hold 腿窗界 race 假 FAIL 实证）。不改判据语义，只保证
+    「每轮的日志落在该轮自己的窗口内」。持续增长超 max_wait_s 按当前大小返回。"""
+    deadline = time.perf_counter() + max_wait_s
+    prev = LOG_PATH.stat().st_size if LOG_PATH.exists() else 0
+    while time.perf_counter() < deadline:
+        await asyncio.sleep(poll_s)
+        cur = LOG_PATH.stat().st_size if LOG_PATH.exists() else 0
+        if cur == prev:
+            return cur
+        prev = cur
+    return prev
+
+
+def log_windows(marks: list[int]) -> list[list[str]]:
+    """按字节偏移切 agent.log，返回相邻偏移间的行窗口（纯读，越界/缺失回空）。
+
+    探针共享契约（2026-09-22 三探针收编单点，防同名不同义）：marks[0] 必须是
+    **通话开始前**的日志大小，此后每轮结束先 await wait_log_stable() 再 append
+    ——窗口数=len(marks)-1、窗口 k=第 k 轮。与「marks[0]=0」写法不兼容：那会
+    把整个历史日志当窗口 0、轮名整体错位一位（qa-phonetic 探针实弹踩过，
+    他通话行污染 absence 判据）。"""
+    try:
+        data = LOG_PATH.read_bytes()
+    except Exception:  # noqa: BLE001 - 日志缺失=所有窗口空（断言会如实报零）
+        return [[] for _ in range(max(0, len(marks) - 1))]
+    out: list[list[str]] = []
+    for start, end in zip(marks, marks[1:]):
+        out.append([
+            raw.decode("utf-8", errors="replace")
+            for raw in data[max(0, start):max(0, end)].splitlines()
+        ])
+    return out
 
 
 def create_call(lang: str, persona_id: str | None, voice: str = "",

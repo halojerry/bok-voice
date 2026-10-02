@@ -10,13 +10,13 @@
 
 2026-09-22 扩充：**每轮真花钱的是尾块，不是前缀。**
 真栈 `LLM_TTFT_MS … cached=N/M` 实测：前缀整场命中（cached 逐轮递增），每轮未命中
-≈ 尾块 + 助手回复 + 用户话；TTFT ≈ 未命中 token × **2ms**（未命中 ≤250 tok → p50
-582ms；>500 tok → 1384ms）。所以本工具改为：
+≈ 尾块 + 助手回复 + 用户话；TTFT ≈ **465ms 固定头 + 2.21ms × 未命中 token**（近 300 轮
+最小二乘；无争用档 402ms + 1.58ms/tok，争用档 795ms + 2.00ms/tok）。所以本工具改为：
 ① 按【节】拆前缀与尾块（谁大谁小一眼可见）；
 ② 给真实 token（用 4B 自己的 tokenizer，中文 ≈1.2 字/token）；
-③ 按 2ms/token 折算尾块的 TTFT 预算；
+③ 按未命中 token 折算尾块的 TTFT 预算；
 ④ 用**晚通话真实态**（记忆 6 行满额/会中事实/重复锚）而非空尾——空尾会把读数
-   系统性压低，是会漏掉真问题的假绿姿势。
+   系统性压低（321 tok vs 997 tok），是会漏掉真问题的假绿姿势。
 """
 from __future__ import annotations
 
@@ -55,8 +55,9 @@ _FACTS = [
 ]
 _ANCHOR = "你好，請問係咪陳先生本人？我哋係順丰，有個包裹單號尾號……"
 
-# 真栈实测斜率（2026-09-22，近 300 轮 LLM_TTFT_MS 统计）：每未命中 token ≈ 2ms
-MS_PER_UNCACHED_TOKEN = 2.0
+# 真栈实测（2026-09-22，近 300 轮 LLM_TTFT_MS 最小二乘）
+FIXED_HEAD_MS = 465.0
+MS_PER_UNCACHED_TOKEN = 2.21
 
 
 def build_ctx(
@@ -92,6 +93,9 @@ def build_ctx(
     return ctx
 
 
+_CHUNKS: dict[str, str] = {}
+
+
 def _sections(text: str) -> list[tuple[str, int]]:
     """按【节】切分并计量，返回 [(节名, 字数)]；同时把每节原文留在 _CHUNKS 供逐节量 token。"""
     global _CHUNKS
@@ -103,16 +107,13 @@ def _sections(text: str) -> list[tuple[str, int]]:
             continue
         head = chunk.splitlines()[0]
         name = head.split("】")[0] + "】" if "】" in head else head[:16]
-        if name in _CHUNKS:  # 同名重复（如多条规则各带【】）→ 合并计量
+        if name in _CHUNKS:  # 同名重复（多条规则各带【】）→ 合并计量
             _CHUNKS[name] += "\n" + chunk
             out = [(n, c + len(chunk) + 1) if n == name else (n, c) for n, c in out]
             continue
         _CHUNKS[name] = chunk
         out.append((name, len(chunk)))
     return out
-
-
-_CHUNKS: dict[str, str] = {}
 
 
 def _tokenizer():
@@ -139,16 +140,16 @@ def main() -> None:
 
     empty = build_ctx(2)
     late = build_ctx(2, memory_lines=6, facts=4, wa="6432543", anchor=_ANCHOR)
-    p_empty, p_late = empty.render_instruction_prefix(), late.render_instruction_prefix()
+    p_late = late.render_instruction_prefix()
     t_empty, t_late = empty.render_context_tail(), late.render_context_tail()
 
     print("\n[前缀整场静态（逐轮 cached，不花每轮时间）]")
-    for name, chars in _sections(p_late):
+    for name, _chars in _sections(p_late):
         print(f"  {name:<34} {_measure(tok, _CHUNKS[name])}")
     print(f"  {'合计':<34} {_measure(tok, p_late)}")
 
     print("\n[尾块每轮重拼（每轮真花钱）]　空尾 vs 晚通话真实态")
-    print(f"  空尾（旧口径，会低估）              {_measure(tok, t_empty)}")
+    print(f"  空尾（旧口径，会低估）                {_measure(tok, t_empty)}")
     print(f"  晚通话真实态（记忆6行+事实4条+WA+锚） {_measure(tok, t_late)}")
 
     print("\n[晚通话尾块的分节增量]")
@@ -160,12 +161,10 @@ def main() -> None:
         ("【已记录客户 WhatsApp】", build_ctx(2, wa="6432543").render_context_tail()),
         ("【你上一句】锚(12字头)", build_ctx(2, anchor=_ANCHOR).render_context_tail()),
     ]
-    acc = len(base)
     for name, text in variants:
         delta = len(text) - len(base)
         if delta <= 0:
             continue
-        acc += delta
         print(f"  {name:<34} +{delta:>4} 字 ≈ +{round(delta / 1.2):>4} tok")
     print(f"  {'（节头和≈合计，误差来自节头换行）':<34} 合计 {_measure(tok, t_late)}")
 
@@ -175,11 +174,11 @@ def main() -> None:
     per_turn = tail_tok + reply_tok + user_tok
     print(f"  尾块 ≈{tail_tok} tok + 助手回复 ≈{reply_tok} + 用户话 ≈{user_tok} = ≈{per_turn} tok/轮")
     print(
-        f"  按真栈斜率 ≈1ms/token（见下）→ **尾块 prefill ≈ {tail_tok}ms**"
-        "，加固定头(排队+首 token 开销)才是 TTFT"
+        f"  按真栈回归（{FIXED_HEAD_MS:.0f}ms + {MS_PER_UNCACHED_TOKEN:.2f}ms/token）"
+        f"→ **TTFT ≈ {FIXED_HEAD_MS + per_turn * MS_PER_UNCACHED_TOKEN:.0f}ms**"
     )
     print(
-        "\n结论：前缀整场 cached（免费）；**每轮 TTFT ≈ 尾块 prefill + 固定头**。"
+        "\n结论：前缀整场 cached（免费）；**每轮 TTFT ≈ 固定头 + 尾块 prefill**。"
         "记忆行是本通内单调增长的那一项 → 通话越到后面越慢。"
     )
     print("验收: 绑话术 ≈ ≤2.5K字; 前缀段不含知识/记忆 → 同一步内逐轮字节不变(吃 KV-cache)")

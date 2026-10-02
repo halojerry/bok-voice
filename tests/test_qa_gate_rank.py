@@ -69,7 +69,11 @@ def test_pinyin_helpers():
 
 # ---- 1. 双向子串:超集句查询 ----
 
-def test_rank_superset_query_and_match_unchanged():
+def test_rank_superset_query_and_match_unchanged(monkeypatch):
+    # 音感补位层(2026-10-02 拉平 origin/main)在此关闸:phonetic 索引在 QaIndex
+    # 构造期建立,「字面 miss 后的第二段音感命中」是另一层行为,由
+    # tests/test_qa_phonetic.py 覆盖;本测试守字面/语义通道的 rank/match 基线。
+    monkeypatch.setenv("BOK_QA_PHONETIC", "0")
     idx = QaIndex(
         [
             _e("qa-pei", "赔几多"),

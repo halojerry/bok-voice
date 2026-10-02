@@ -31,6 +31,9 @@ ROOT = Path(__file__).resolve().parents[1]
 LIVEKIT_URL = "ws://127.0.0.1:7880"
 CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
 ASR_URL = "http://127.0.0.1:8787"
+from urlguard_gate import gate  # SSRF 守卫（2026-09-23，Mimosa）：云端测试设 BOK_PROBE_EXTRA_HOSTS
+
+gate(CONTROL_PLANE_URL, ASR_URL)
 # 压测档开关（2026-09-24）：0=跳过音频 ASR 回读断言（与真会话挤 :8787 解码队列
 # 必超时），语言断言改走翻译音轨名 trans-<lang>；默认 1=完整回读（单跑回归用）。
 READBACK = os.environ.get("E2E_INTERP_READBACK", "1") == "1"

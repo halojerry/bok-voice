@@ -20,6 +20,9 @@ from livekit import rtc
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
+from urlguard_gate import gate  # SSRF 守卫（2026-09-23，Mimosa）：云端测试设 BOK_PROBE_EXTRA_HOSTS
+
+gate(CONTROL_PLANE_URL)
 # auth-on 栈(2026-09-15 标准姿势)要求 CP 请求带机器通道 token——压测建对象/建
 # 人设/建单/取 token/收线全是机器语义,Bearer BOK_CP_TOKEN 直通(与 agent worker
 # 同源)。未设 env(老 auth-off 栈)零变化。
@@ -185,20 +188,28 @@ async def main() -> None:
     t0 = time.perf_counter()
     await asyncio.gather(*(road(i, results) for i in range(ROADS)))
     wall = time.perf_counter() - t0
-    ok = [r for r in results if "error" not in r]
+    # 无异常但整轮零首声(死路)=不得计 ok(2026-09-22 实弹:单 worker prod 档
+    # load_threshold=0.7,冷启后第一波 4 路突发里第 4 路 job 未派发,headline 曾
+    # 假绿 PASS ok=12/12 而该路三轮 first 全 None——判据钉死:有首声才算过)。
+    ok = [r for r in results if "error" not in r and r.get("first_ms") is not None]
+    mute = [r for r in results if "error" not in r and r.get("first_ms") is None]
     real = sorted(r["real_ms"] for r in ok if r.get("real_ms"))
     errs = [r for r in results if "error" in r]
     p50 = real[len(real) // 2] if real else 0
     p95 = real[int(len(real) * 0.95)] if real else 0
     print(
         f"AUDIO_LOAD {'PASS' if len(ok) == ROADS * TURNS else 'DEGRADED'} "
-        f"roads={ROADS} turns={TURNS} ok={len(ok)}/{ROADS * TURNS} errors={len(errs)} "
+        f"roads={ROADS} turns={TURNS} ok={len(ok)}/{ROADS * TURNS} mute={len(mute)} errors={len(errs)} "
         f"real_after_speech_ms p50={p50:.0f} p95={p95:.0f} wall={wall:.0f}s",
         flush=True,
     )
     if errs:
         for r in errs:
             print("  ERR:", r.get("error"), flush=True)
+    if mute:
+        for r in mute:
+            print(f"  MUTE: road={r.get('road')} turn={r.get('turn')} "
+                  f"(无首声:agent 未派发或全程哑)", flush=True)
 
 
 if __name__ == "__main__":

@@ -1,3 +1,8 @@
+# =====================================================================
+# DEPRECATED 2026-09-22: Windows 节点形态退役（软退役）。Windows 定位=仅
+# 浏览器访问 web UI，节点运行时只跑 macOS/Linux；本文件保留不再维护、
+# CI 已停出 Windows 运行时包（release.yml matrix 已删 windows 行）。
+# =====================================================================
 # Windows bundled runtime deps (NVIDIA CUDA path).
 # - ASR: Qwen3-ASR (qwen-asr 0.0.6 pins transformers==4.57.6) -> installed by
 #   build_runtime.sh after this file.

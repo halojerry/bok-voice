@@ -24,6 +24,9 @@ import httpx
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = os.environ.get("LOAD_CP_BASE", "http://127.0.0.1:8001")
+from urlguard_gate import gate  # SSRF 守卫（2026-09-23，Mimosa）：云端测试设 BOK_PROBE_EXTRA_HOSTS
+
+gate(BASE)
 ACC = "acc-001"
 
 

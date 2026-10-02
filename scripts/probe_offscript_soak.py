@@ -473,15 +473,16 @@ def print_report(res: dict, budgets: dict[str, float]) -> None:
             flush=True,
         )
     fa, pd = s["first_audio"], s["perceived"]
-    if fa["n"]:
+    if fa["n"] and fa["p50"] is not None:
         print(
             f"\n墙钟首声 n={fa['n']} p50={fa['p50']:.0f}ms p95={fa['p95']:.0f}ms max={fa['max']:.0f}ms "
             f"超标(>{budgets['first_ms']:.0f})={fa['over_budget']}",
             flush=True,
         )
     else:
-        # setup 中断（如 token 响应缺 serverUrl）时零有效轮——打明文不炸整场
-        print("\n墙钟首声：无有效轮（setup 中断，见上方异常行）", flush=True)
+        # 组中断/零量测/setup 中断（如 token 响应缺 serverUrl）：报表不炸
+        # （一组失败不该毁掉整轮其余组的输出）。
+        print("\n墙钟首声：无有效量测（该组中断、全哑或 setup 中断，见上方异常行）", flush=True)
     if pd["n"]:
         print(
             f"PERCEIVED n={pd['n']} p50={pd['p50']:.0f}ms p95={pd['p95']:.0f}ms max={pd['max']:.0f}ms "

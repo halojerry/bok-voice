@@ -54,7 +54,22 @@ _VALID_LANGS = {"zh", "cantonese", "en"}
 
 
 @pytest.fixture(scope="module")
-def index() -> QaIndex:
+def monkeypatch_module():
+    from _pytest.monkeypatch import MonkeyPatch
+
+    m = MonkeyPatch()
+    yield m
+    m.undo()
+
+
+@pytest.fixture(scope="module")
+def index(monkeypatch_module):
+    # 分层定案(2026-10-02 拉平 origin/main 音感层):golden 守**字面+语义基线**——
+    # 音感补位层(BOK_QA_PHONETIC,字面 miss 后第二段)由 tests/test_qa_phonetic.py
+    # 独立覆盖(其阈值 0.80 系 2026-09-22 真库 873 粤语轮标定,不动)。golden 若
+    # 不关闸,邻近负例「赔偿係咪要扣手续费?」会被音感层以恰 0.80 命中——那不是
+    # 字面/语义基线的回退,是另一层的已知取舍。
+    monkeypatch_module.setenv("BOK_QA_PHONETIC", "0")
     return QaIndex(ENTRIES)
 
 

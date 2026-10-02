@@ -29,6 +29,9 @@ LIVEKIT_KEY = "devkey"
 LIVEKIT_SECRET = "devsecret"
 CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
 TTS_URL = os.environ.get("TTS_URL", "http://127.0.0.1:8788")
+from urlguard_gate import gate  # SSRF 守卫（2026-09-23，Mimosa）：云端测试设 BOK_PROBE_EXTRA_HOSTS
+
+gate(CONTROL_PLANE_URL, TTS_URL)
 # auth-on 栈(2026-09-15 标准姿势)要求 CP 请求带机器通道 token——E2E 建单/取
 # token/收线/读 turns 全是机器语义,Bearer BOK_CP_TOKEN 直通(与 agent worker 同源)。
 # 未设 env(老 auth-off 栈)零变化。CP 之外(tts/asr sidecar)不带。

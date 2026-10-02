@@ -34,6 +34,9 @@ from agent_runtime.providers.livekit_plugins import ContextState  # noqa: E402
 
 APP_DB = Path(os.environ.get("BOK_APP_DB", Path.home() / "Library/Application Support/BokVoice/bok_voice.db"))
 LLM_URL = os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1")
+from urlguard_gate import gate  # SSRF 守卫（2026-09-23，Mimosa）：云端测试设 BOK_PROBE_EXTRA_HOSTS
+
+gate(LLM_URL)
 LLM_MODEL = os.environ.get(
     "MLX_LLM_MODEL", "/Users/halo/.lmstudio/models/avan-ag/Qwen3.5-4B-Uncensored-MLX-4bit"
 )

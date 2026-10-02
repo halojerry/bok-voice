@@ -28,12 +28,22 @@ def test_semantic_query_sits_after_pick_before_judge_elif():
 
 def test_graph_advanced_computed_before_arms_and_pick():
     """`_graph_advanced` 必须在三臂派发之前算(jump 臂置 _flow_step_before=-1,
-    臂后算会自触发),也在 play 守卫消费之前。"""
+    臂后算会自触发),也在 play 守卫消费之前。
+
+    合并形态：三臂在 `_gdispatch` 闭包体内（定义序在块首），消费受调用点钉住
+    ——计算必须在两处 `await _gdispatch(...)` 调用之前（执行序保证）；play 守卫
+    （`if _graph_advanced:` + play_bypass）在同一闭包体内消费同一判据。
+    """
     adv = _SRC.index("_graph_advanced = flow_ctrl.current != _flow_step_before")
     first_pick = _SRC.index("_gbinding = pick_graph_action(")
-    arm = _SRC.index('if _gbinding.action == "jump_step"')
-    play_guard = _SRC.index("if _graph_advanced:", adv)
-    assert adv < first_pick < arm < play_guard
+    dispatch = _SRC.index("await _gdispatch(_gbinding, False)")
+    catchall_dispatch = _SRC.index("await _gdispatch(_gcatchall_stash, True)")
+    assert adv < first_pick < dispatch < catchall_dispatch
+    # play 守卫在闭包体内（定义序在前,执行序由上面两处调用点钉住）
+    dispatch_def = _SRC.index("async def _gdispatch(")
+    guard = _SRC.index("if _graph_advanced:", dispatch_def)
+    assert dispatch_def < guard < dispatch
+    assert "FLOW_GRAPH play_bypass" in _SRC[guard : guard + 600]
     # 语义查询的 play_allowed 参数消费同一判据
     assert "play_allowed=not _graph_advanced" in _SRC
 

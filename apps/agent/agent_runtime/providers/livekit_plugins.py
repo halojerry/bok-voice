@@ -30,6 +30,8 @@ from livekit.agents import (
 )
 from livekit.plugins.openai import LLM as _OpenAICompatBase
 
+from bok_voice_core.deepseek_llm import thinking_extra_body
+
 # 模型路由共享契约(2026-09-25 阶段 0):只消费,解析/校验逻辑全在 packages/core。
 from bok_voice_core.model_routes import LaneRoute, PROVIDER_OPENAI
 
@@ -1179,13 +1181,25 @@ class DeepSeekLLM(_OpenAICompatBase):
 
     provider = "deepseek"
 
-    def __init__(self, api_key="", model="deepseek-chat", base_url="https://api.deepseek.com/v1"):
+    def __init__(
+        self,
+        api_key="",
+        model="deepseek-flash",
+        base_url="https://api.deepseek.com/v1",
+        thinking: str = "",
+    ):
+        # 思考档位：DeepSeek 端点缺省**关**（官方默认 enabled，而本类 max_tokens 走
+        # LLM_MAX_TOKENS 默认 160——思考会把预算烧光、正文出空串，通话侧=静默哑火；
+        # 契约与实测见 bok_voice_core.deepseek_llm）。`DEEPSEEK_THINKING=enabled`
+        # 可显式开（需同时给足 LLM_MAX_TOKENS）。非 DeepSeek 端点该字段为空 dict。
+        body: dict = {"max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "160"))}
+        body.update(thinking_extra_body(base_url, thinking or os.environ.get("DEEPSEEK_THINKING", "")))
         super().__init__(
-            model=model or "deepseek-chat",
+            model=model or "deepseek-flash",
             api_key=api_key,
             base_url=base_url,
             temperature=float(os.environ.get("LLM_TEMPERATURE", "0.35")),
-            extra_body={"max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "160"))},
+            extra_body=body,
         )
 
 
@@ -2163,6 +2177,34 @@ class _RepeatSelfGuardStream(_CascadeCloseStreamMixin, llm.LLMStream):
 # 会被静默挤掉,档案失真。
 
 
+def _context_mem_legacy() -> bool:
+    """P1.2a(2026-09-21)记忆压缩 kill-switch:1=回旧档(drop-oldest+上限 1200)。
+
+    进 `_FORWARD_ENV`(tests/test_forward_env 门禁)。"""
+    return os.environ.get("BOK_CONTEXT_MEM_LEGACY", "") == "1"
+
+
+def _memory_cap_from_env() -> int:
+    """F2/F5b 生产记忆帽(尾部手术③,实弹定档):BOK_MEMORY_CHARS 默认 180。
+
+    坏值/空回 180;`BOK_CONTEXT_MEM_LEGACY=1`(P1.2a kill-switch)上位——返回 0
+    (=不注入,交 `ContextState.__init__` 缺省旧档 1200)。只有 env 装配口
+    `ContextState.from_env()`(生产装配点)消费本口,裸构造保持 P1.2a 缺省档。
+    """
+    if _context_mem_legacy():
+        return 0
+    try:
+        return max(0, int(os.environ.get("BOK_MEMORY_CHARS", "180") or 180))
+    except ValueError:
+        return 180
+
+
+def _intent_context_enabled() -> bool:
+    """P2.4(§48)意图喂下游 kill-switch:默认 "1" 开,`0` 全关(=set 恒 no-op、
+    【客户意图】行消失,尾部字节逐字同旧)。进 `_FORWARD_ENV`。"""
+    return os.environ.get("BOK_INTENT_CONTEXT", "1") == "1"
+
+
 class ContextState:
     """Shared per-call context memory: per-turn knowledge + running summary.
 
@@ -2171,20 +2213,19 @@ class ContextState:
     message (top-K snippets + bounded conversation summary) each turn.
     """
 
-    def __init__(self, account_id: str = "", max_snippets: int = 2, max_summary_chars: int | None = None):
+    def __init__(self, account_id: str = "", max_snippets: int = 2, max_summary_chars: int = 0):
         self.account_id = account_id
         self._max_snippets = max_snippets
-        # F2 记忆块减半（2026-09-28 尾部手术③）：尾部每轮 prefill 直接组分。
-        # 默认 250 字（原 600），env BOK_MEMORY_CHARS 可覆盖；渲染行数默认 3
-        # （原 6，见 render_context_tail）。总长先裁，行数上限再兜底。
-        if max_summary_chars is None:
-            try:
-                # 5b(2026-09-30 soak A/B 定档):250→180——同 HISTORY=6 臂,判据同上;
-                # 摘要+facts+8→6 对窗补上下文,env 一键回 250。
-                max_summary_chars = int(os.environ.get("BOK_MEMORY_CHARS", "180") or 180)
-            except ValueError:
-                max_summary_chars = 250
-        self._max_summary_chars = max_summary_chars
+        # P1.2a(2026-09-21 记忆压缩):显式传参(测试/嵌入方)优先;缺省按 kill-switch
+        # 定——新档 400(尾部有界=每轮新 prefill 有界,§48 P1),legacy 档回旧 1200。
+        # F2/F5b(2026-09-28/30 尾部手术③)的生产定档(默认 180,BOK_MEMORY_CHARS
+        # 可覆盖)走 env 装配口 `ContextState.from_env()`(生产装配点);裸构造
+        # (测试/嵌入方)保留本 P1.2a 缺省档,legacy kill-switch 两路同效。
+        self._max_summary_chars = (
+            max_summary_chars
+            if max_summary_chars and max_summary_chars > 0
+            else (1200 if _context_mem_legacy() else 400)
+        )
         # F1 两段化（2026-09-28 尾部手术③）：当前步文本拆稳定段/增量段。
         # 稳定段只在每步首条消息进尾部；增量段每轮都发。revision 只跟稳定段
         # 身份键走（步内恒定，防止每轮 verdict/底稿波动虚增 revision、令
@@ -2222,6 +2263,12 @@ class ContextState:
         self.rag_enabled: bool = False
         # WhatsApp 已捕获号码（注入尾部,防 LLM 复述错号——2026-09-06 实测尾号读错）
         self._whatsapp_note: str = ""
+        # 当轮客户意图（P2.4 意图喂下游,spec §48）:agent 钩子每轮把「graph 命中意图
+        # 名 → 规则归类具名意图名」写进来(空=清位),render_context_tail 全量档渲染
+        # 一行【客户意图】。有界 ≤40 字;变化才 +revision(意图属实质变化,须全量尾部
+        # 才带得出——slim 紧凑档刻意不含它)。kill-switch BOK_INTENT_CONTEXT=0 时 set
+        # 恒 no-op → 字段恒空 → 尾部字节同旧。
+        self._customer_intent: str = ""
         # 追加式尾部账本（KV-cache 铁律 2026-09-05）：记录每个 user 消息被
         # ContextAwareLLM 拼上的易变尾部（原文, 原文+尾部, 当时 revision），FIFO
         # 对应历史里的 user 消息。下一轮请求把历史中的旧 user 重放成「原文+当时的
@@ -2336,6 +2383,22 @@ class ContextState:
             return  # 幂等:无实际变化(重复 supersede)不 bump revision
         self._call_facts = new_list
         self._revision += 1
+
+    def set_customer_intent(self, text: str) -> None:
+        """设置当轮客户意图(截 40 字)— P2.4 意图喂下游(spec §48)。
+
+        语义=**每轮覆盖**:调用即重写当轮意图,**空串=清位**(上一轮有意图、本轮
+        无 → 不调用会令陈旧意图残留,下一轮任何实质变化触发全量尾部时带出误导
+        信号)。意图属实质变化 → 值变化才 +revision(同 add_call_fact 纪律),令
+        该轮走全量尾部、【客户意图】行才带得出(slim 紧凑档刻意不含它)。
+        kill-switch `BOK_INTENT_CONTEXT=0`(=0 全关)=本方法恒 no-op → 字段恒空,
+        尾部字节逐字同旧。"""
+        if not _intent_context_enabled():
+            return
+        v = str(text or "").strip()[:40]
+        if v != self._customer_intent:
+            self._customer_intent = v
+            self._revision += 1
 
     def set_last_reply(self, text: str) -> None:
         """记录 AI 最近一句回复(截 80 字)作尾部重复锚——模型看得见自己上一句,
@@ -2479,8 +2542,11 @@ class ContextState:
 
         与 agent.py 的取数门控 _context_rag_enabled 同一 env 开关;装配处换用
         本口即可让「取数开」与「渲染开」永远同源,不留两套判定。
+        记忆总长同口注入(F2/F5b 尾部手术③生产定档 180,BOK_MEMORY_CHARS 可
+        覆盖;legacy kill-switch 上位时由 __init__ 缺省旧档 1200 接管,见
+        _memory_cap_from_env)。
         """
-        st = cls(account_id=account_id)
+        st = cls(account_id=account_id, max_summary_chars=_memory_cap_from_env())
         if os.environ.get("CONTEXT_RAG", "") == "1":
             st.rag_enabled = True
         return st
@@ -2583,10 +2649,22 @@ class ContextState:
     def add_summary(self, role: str, text: str, max_char: int = 200) -> None:
         line = f"{role}: {str(text)[:max_char]}"
         self._summary_lines.append(line)
-        joined = "\n".join(self._summary_lines)
-        while len(joined) > self._max_summary_chars and len(self._summary_lines) > 1:
-            self._summary_lines.pop(0)
+        # P1.2a(2026-09-21,§48 P1「恒定轮延迟」):尾部=每轮新 prefill 的全部成本
+        # (§46.1 受控实验:638 字尾≈1.1s/轮、876 字≈1.6s/轮,单调涨)——记忆行是
+        # 唯一单调增长项。改**滚动压缩**:超上限时把最旧两行各取前半并成一行
+        # (信息密度翻倍而非整行丢弃),行数有界→尾部字数有界→每轮 TTFT 有界。
+        # kill-switch `BOK_CONTEXT_MEM_LEGACY=1` 回旧「drop-oldest」档(上限同旧 1200)。
+        cap = self._max_summary_chars
+        while len(self._summary_lines) > 1:
             joined = "\n".join(self._summary_lines)
+            if len(joined) <= cap:
+                break
+            if _context_mem_legacy():
+                self._summary_lines.pop(0)
+            else:
+                old = self._summary_lines
+                merged = (old[0][:80].rstrip() + "；" + old[1][:80].rstrip())[:180]
+                old[0:2] = [merged]
 
     def render_system_message(self) -> str:
         """完整 system 段（兼容旧调用/测试）：稳定指令前缀 + 易变参考尾部。"""
@@ -2751,6 +2829,12 @@ class ContextState:
         self._last_emit_stable_key = self._stable_key if emit_stable else ""
         parts: list[str] = []
         _diet = slim and not emit_stable  # 尾部节食只作用于 slim 轮（同步未推进）
+        if self._customer_intent and not _diet:
+            # P2.4 意图喂下游:当轮客户意图(graph 命中 → 规则归类)。**只在全量档**
+            # 渲染(_diet=瘦身档刻意不含它)——slim 紧凑档的语义是「状态无实质
+            # 变化」,意图属实质信息,变化即 +revision 逼本轮走全量档(见
+            # set_customer_intent)。kill-switch=0 时字段恒空,本行不出现。
+            parts.append("【客户意图】" + self._customer_intent)
         if self._whatsapp_note:
             parts.append(
                 "【已记录客户 WhatsApp】" + self._whatsapp_note +
@@ -2911,6 +2995,9 @@ class ContextAwareLLM(llm.LLM):
                 # 5b(2026-09-30 soak A/B 定档):8→6——TTFT p50 1297→1107/max
                 # 2940→1295、commit_to_audio 中位 ~2070→~1430(增量尖峰 1252→628);
                 # 摊销截断+账本自尾对齐机制原样,前缀安全。env 一键回 8。
+                # 合并注记:origin/main P1.3「缺省 40=通话内不截断」与 5b 实测档
+                # 冲突——按 HEAD 实测定档保留 6(tests/test_voice_mode 合并树重算);
+                # main 档意图可用 env 显式 `LLM_HISTORY_TURNS=40` 取回。
                 max_turns = int(os.environ.get("LLM_HISTORY_TURNS", "6"))
                 items = _truncate_chat_items(items, max_turns=max_turns)
                 # 尾部重放+新消息追加(见上)。users=当前请求里的 user 消息下标(时序序)。
@@ -3164,7 +3251,14 @@ def _truncate_chat_items(items: list, max_turns: int = 4) -> list:
     # 滞回:超过 6×max_turns 对(12×max_turns 条)才截,剪回 2×max_turns 条。
     if len(dialog) <= max_turns * 6:
         return items
-    return system_part + dialog[-(max_turns * 2) :]
+    out = system_part + dialog[-(max_turns * 2) :]
+    # P0.3(2026-09-21,§48 仪器化):截断=KV 严格前缀断裂,该轮全量重 prefill
+    # (§46.1 受控实验 2.5× 尖峰)——先计数观测,截断策略(P1.3)按此数据定。
+    print(
+        f"HISTORY_TRUNCATED items={len(items)}->{len(out)} max_turns={max_turns} (KV prefix re-anchor)",
+        flush=True,
+    )
+    return out
 
 
 class ExprAwareLLM(llm.LLM):

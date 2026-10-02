@@ -1206,6 +1206,11 @@ def test_join_hold_flush_does_not_clobber_new_session(monkeypatch):
 
     class _BlockingClient:
         release = asyncio.Event()
+        # 确定性握手位：flush 已经进 /api/finish 并阻塞在这里。旧版靠墙钟
+        # `sleep(hold + 0.05)` 等它开火，慢机（CI 2vCPU）上定时器回调会晚于该 sleep
+        # → 新 START 先到 → flush 被取消 → 只出一条 FINAL（2026-09-21 CI 实证 flaky，
+        # 本机 24 并行轮复现不出）。改成「等 flush 确实停住再续讲」，与判例描述同义。
+        entered = asyncio.Event()
         bodies = [
             {"text": "我的WhatsApp是。", "language": "cantonese"},
             {"text": "多謝你啊。", "language": "cantonese"},
@@ -1223,6 +1228,7 @@ def test_join_hold_flush_does_not_clobber_new_session(monkeypatch):
         async def post(self, url, params=None, content=None, headers=None):
             if url.endswith("/api/start"):
                 return _FakeResp({"session_id": "sid-b"})
+            _BlockingClient.entered.set()
             await _BlockingClient.release.wait()
             return _FakeResp(_BlockingClient.bodies.pop(0))
 
@@ -1260,8 +1266,9 @@ def test_join_hold_flush_does_not_clobber_new_session(monkeypatch):
                     self._ref._last_partial = "我的WhatsApp是。"  # join-worthy → hold
                     return end
                 if self._n == 3:
-                    # 等 flush 开火并阻塞喺 /api/finish,然后续讲 START(新 session)
-                    await asyncio.sleep(_join_hold_s() + 0.05)
+                    # 等 flush **确实**开火并阻塞喺 /api/finish,然后续讲 START(新 session)。
+                    # 握手是事件而非墙钟：慢机上定时器晚回调不再能改写本判例的时序。
+                    await asyncio.wait_for(_BlockingClient.entered.wait(), timeout=5)
                     self._ref._last_partial = "多謝你啊。"
                     return start
                 if self._n == 4:

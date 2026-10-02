@@ -22,6 +22,9 @@ from livekit import rtc
 from e2e_barge_in import push_pcm, speech_stats, tts_pcm, wait_speech_then_silence  # noqa: E402
 
 CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
+from urlguard_gate import gate  # SSRF 守卫（2026-09-23，Mimosa）：云端测试设 BOK_PROBE_EXTRA_HOSTS
+
+gate(CONTROL_PLANE_URL)
 LANG = os.environ.get("PREEMPTIVE_LANG", "cantonese")
 TEXT = os.environ.get(
     "PREEMPTIVE_TEXT",

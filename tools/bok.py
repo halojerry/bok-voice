@@ -22,6 +22,7 @@ import ipaddress
 import json
 import os
 import platform as _platform
+import re
 import signal
 import socket
 import re
@@ -239,6 +240,20 @@ def model_path(current: dict[str, str], name: str) -> str:
         if _usable_model_dir(app, extra_required=extra):
             return str(app)
         return str(lm)
+    if is_linux():
+        # Linux dev（runbook §5②，2026-09-22）：cmd_download 只落 *Q4_K_M.gguf 进
+        # app-data/models/<repo>（WINDOWS_LLM_GGUF_PATTERNS），llama-server 只认
+        # .gguf **文件**路径——repo id 是 win-dev 的 hf cache 语义，直传会 :1235
+        # 起不来/model not found。保守解析：布局里真有 gguf 才返回文件路径，
+        # 否则保持 repo id 兜底（与 mac「哪边真有模型用哪边」同纪律）；真机验收
+        # 仍以 runbook §4 上栈第一验为准。
+        try:
+            _ggufs = sorted(model_dir(repo).glob("*.gguf"))
+        except OSError:
+            _ggufs = []
+        if _ggufs:
+            return str(_ggufs[0])
+        return repo
     return repo
 
 
@@ -1144,6 +1159,21 @@ def _spawn_kwargs() -> dict:
     return {"start_new_session": True}
 
 
+def _write_proc_stamps(pidfile: Path, pid: int) -> None:
+    """pidfile + proc-<pid>.root 来源戳（_start_proc 落笔两件套的单点提炼）。
+
+    cmd_monitor 外部手跑时也自写（2026-09-22 monitor 盲斑修复）：外部启动
+    原本不落任何痕迹——_ensure_monitor 探不到单例会再拉一个（双监控环），
+    跨树杀守卫对无戳进程 fail-open 不保护。经 _start_proc 拉起时会写两次
+    （同 pid 同内容，幂等无害）。"""
+    pidfile.parent.mkdir(parents=True, exist_ok=True)
+    pidfile.write_text(str(pid))
+    try:
+        (pidfile.parent / f"proc-{pid}.root").write_text(f"{ROOT}\t{_ps_field(pid, 'lstart=')}\n")
+    except Exception:
+        pass  # 标记写不出=来源未知，清扫走原语义；绝不影响起进程
+
+
 def _start_proc(args: list[str], pidfile: Path, logfile: Path, env: dict | None = None, cwd: str | Path | None = None) -> int:
     pidfile.parent.mkdir(parents=True, exist_ok=True)
     _rotate_log(logfile)
@@ -1159,18 +1189,23 @@ def _start_proc(args: list[str], pidfile: Path, logfile: Path, env: dict | None 
     merged["BOK_SERVE_ROOT"] = str(ROOT)
     with logfile.open("ab") as log:
         proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, env=merged, cwd=str(cwd) if cwd else None, **_spawn_kwargs())
-    pidfile.write_text(str(proc.pid))
-    try:
-        (pidfile.parent / f"proc-{proc.pid}.root").write_text(f"{ROOT}\t{_ps_field(proc.pid, 'lstart=')}\n")
-    except Exception:
-        pass  # 标记写不出=来源未知，清扫走原语义；绝不影响起进程
+    _write_proc_stamps(pidfile, proc.pid)
     return proc.pid
 
 
 def _stop_pidfile(pidfile: Path) -> None:
-    """Terminate the process group recorded in a run/*.pid file, if alive."""
+    """Terminate the process group recorded in a run/*.pid file, if alive.
+
+    他树戳守卫（2026-09-22）：pidfile 指向的进程读得出「他树拉起」时拒绝杀
+    ——run/*.pid 是 HOME 作用域单槽共享文件，worker 换装/多会话会互相覆写，
+    旧版无脑 killpg 会把别人的 worker 收割掉（跨树互杀同款根因）。"""
     try:
         pid = int(pidfile.read_text().strip())
+        foreign, root = _pid_origin_foreign(pid)
+        if foreign:
+            print(f"[stop] skip {pidfile.name}: pid {pid} 属另一代码树（{root}）"
+                  "——他树进程永不收割", file=sys.stderr)
+            return
         try:
             os.killpg(os.getpgid(pid), signal.SIGTERM)
         except (ProcessLookupError, PermissionError, OSError):
@@ -1304,6 +1339,15 @@ def _control_plane_env(db: Path | str) -> dict[str, str]:
             _ext_settle_model = os.environ.get("BOK_SETTLE_LLM_MODEL", "").strip()
             if _ext_settle_model:
                 env["BOK_SETTLE_LLM_MODEL"] = _ext_settle_model
+    # settle 专线指向**云端**（DeepSeek 等）时的凭据：Summarizer 现在会带
+    # `Authorization: Bearer`（2026-09-21——先前不带，云端点一律 401，即「纪要换云」
+    # 结构上走不通）。凭据只走 env、不落盘；未设=空串，payload/行为与本地档逐字节同旧。
+    if os.environ.get("BOK_SETTLE_LLM_API_KEY", "").strip():
+        env["BOK_SETTLE_LLM_API_KEY"] = os.environ["BOK_SETTLE_LLM_API_KEY"]
+    # 云端思考档下纪要单次要 9-14s 起，Summarizer 缺省 15s 会 ReadTimeout（实测
+    # v4-pro 5/5 全超时）——这枚开关是那档的超时口。同款 CP 面注入，未设=不上抬。
+    if os.environ.get("BOK_SETTLE_THINKING_TIMEOUT_S", "").strip():
+        env["BOK_SETTLE_THINKING_TIMEOUT_S"] = os.environ["BOK_SETTLE_THINKING_TIMEOUT_S"]
     # E7 离线润色面 kill-switch（2026-09-21）：唯一消费者是 **CP**（挂断后纪要输入 /
     # QA 挖掘 / L-① 漏网轮），故走这张 CP 面表显式下发（同 BOK_SETTLE_LLM_* 先例）——
     # prod launchd/schtasks 封闭 env 面不注入即死门。**不进 _FORWARD_ENV**：那张表是
@@ -1772,7 +1816,7 @@ def _cmd_up_services() -> int:
     asr_py = sidecar_python("qwen3-asr-sidecar")
     tts_py = sidecar_python("qwen3-tts-sidecar")
     if not asr_py.exists() or not tts_py.exists():
-        print("[bok] sidecar pythons missing — run setup (setup-macos.sh / setup-windows.ps1)", file=sys.stderr)
+        print("[bok] sidecar pythons missing — run setup (./scripts/bootstrap.sh; node 节点机=scripts/install-node.sh)", file=sys.stderr)
         return 2
 
     asr_model = model_path(current, "asr")
@@ -2023,9 +2067,15 @@ _FORWARD_ENV = (
     "BOK_LAYA_SIDECAR_URL",
     # —— 意向规则挂断评估(W4-T2,2026-09-19:0=关,挂断走原 disposition) ——
     "BOK_INTENT_RULES",
+    # —— 意图喂下游(P2.4,2026-09-21:0=关;默认 1——当轮意图进 LLM 尾部
+    #    【客户意图】行 + 垫话类别提示;0=set no-op/行消失,字节同旧) ——
+    "BOK_INTENT_CONTEXT",
     "BOK_QA_ROTATION",
     "BOK_QA_PRIORITY",
     "BOK_QA_FASTPATH",
+    # —— 粤语音系补位层(2026-09-22:字面 miss 后粤拼槽位对齐;zh 线无此档) ——
+    "BOK_QA_PHONETIC",
+    "BOK_QA_PHONETIC_THRESHOLD",
     # —— 分支罐头快路+分支动作(2026-09-20 路线 A-①/A-②:分支命中→物化录音跳
     #    LLM;应答首部【收线】/【转人工】/【跳第N步】/【留本步】动作前缀=引擎一等出口) ——
     "BOK_BRANCH_ACTION",
@@ -2063,6 +2113,9 @@ _FORWARD_ENV = (
     "BOK_FILLER_GAP_MS",
     "BOK_FILLER_CHAIN",
     "BOK_FILLER_MAX",
+    "BOK_FILLER_MAX_DUR_S",
+    "BOK_FILLER_CUT_AFTER_S",
+    "BOK_CONTEXT_MEM_LEGACY",
     "BOK_FILLER_MATCH",
     # W2a 犹豫混入专用闸(2026-09-24):0 只关犹豫池混入,罐头五类与上游门不动。
     "BOK_FILLER_HESITATION",
@@ -2128,6 +2181,11 @@ _FORWARD_ENV = (
     "DEEPSEEK_BASE_URL",
     "DEEPSEEK_MODEL",
     "DEEPSEEK_API_KEY",
+    # DeepSeek 思考档位：官方默认 enabled，而我们的 max_tokens 都很小（对话 160 /
+    # 判据 8-32）——思考会把预算烧光、正文出空串（通话侧=静默哑火）。故 DeepSeek
+    # 端点缺省关思考（契约见 bok_voice_core.deepseek_llm），这两枚是显式开/覆盖口。
+    "DEEPSEEK_THINKING",
+    "FLOW_JUDGE_LLM_THINKING",
     # —— 轮次/打断/心跳 ——
     "TURN_DETECTION",
     "BOK_TURN_DETECTOR_THRESHOLD",
@@ -2490,6 +2548,30 @@ def _pid_alive(pidfile: Path) -> bool:
         return False
 
 
+def _pidfile_alive_stamped(pidfile: Path) -> bool:
+    """_ensure_monitor 单例判定的 lstart 加强版（2026-09-22 monitor 盲斑 2）。
+
+    _pid_alive 是纯 pid 探活——pidfile 残留死 pid 被无关进程复用时误判存活，
+    _ensure_monitor 跳过重拉 = 栈从此无 monitor。本函数在 pid 活之上追加
+    来源戳比对：proc-<pid>.root 记的 lstart 与 ps 现值不一致 = pid 已被
+    复用，判死（stale pidfile，该重拉）。戳缺失/lstart 读不出时保守当存活
+    （fail-open 旧语义）——外部旧式启动的 monitor 没有戳，不能误杀单例。"""
+    if not _pid_alive(pidfile):
+        return False
+    try:
+        pid = int(pidfile.read_text().strip())
+        marker = pidfile.parent / f"proc-{pid}.root"
+        parts = marker.read_text().strip().split("\t")
+    except Exception:
+        return True  # pid 活但戳读不出：fail-open 当存活（与 _process_serve_root 同纪律）
+    if not (len(parts) == 2 and parts[1]):
+        return True  # 无戳/坏戳：外部旧式启动，保守当活
+    cur = _ps_field(pid, "lstart=")
+    if not cur:
+        return True  # ps 读不出（如 Windows 无 ps）：保守当活
+    return cur == parts[1]
+
+
 class _KillTreeError(RuntimeError):
     """Windows taskkill 停树失败（带 rc/输出尾）——必须浮出，不得静默吞
     （旧版 os.killpg 在 nt 抛 AttributeError 被外层 except 吞掉 = down 静默失效）。"""
@@ -2527,9 +2609,17 @@ def _kill_proc_tree(pid: int) -> None:
 
 
 def _kill_pidfile(pidfile: Path) -> None:
-    """按 pidfile 杀进程组(_start_proc 是会话组长,子进程一并清)。"""
+    """按 pidfile 杀进程组(_start_proc 是会话组长,子进程一并清)。
+
+    他树戳守卫（2026-09-22）：monitor respawn 路径读到被他树覆写的共享
+    pidfile 时拒绝杀——不挡「本树/无戳」，与 down 纪律同款 fail-open。"""
     try:
         pid = int(pidfile.read_text().strip())
+        foreign, root = _pid_origin_foreign(pid)
+        if foreign:
+            print(f"[kill] skip {pidfile.name}: pid {pid} 属另一代码树（{root}）"
+                  "——他树进程永不收割（先在对方树 down）", file=sys.stderr)
+            return
         _kill_proc_tree(pid)
     except _KillTreeError as exc:
         # monitor respawn 路径的 best-effort 停止：Windows 真失败留痕不炸环。
@@ -2539,11 +2629,23 @@ def _kill_pidfile(pidfile: Path) -> None:
 
 
 def _ensure_monitor(py) -> None:
-    """C6-1:常驻 worker monitor 单例拉起(pidfile 存活即跳过)。"""
+    """C6-1:常驻 worker monitor 单例拉起(pidfile 存活即跳过)。
+
+    2026-09-22 盲斑修复：①存活判定升级为 lstart 比对（_pidfile_alive_stamped，
+    pidfile 残留 pid 被复用不再误判活 = 栈无 monitor）；②跨树可观测——monitor
+    属他树时打日志跳过（共享栈模型既定行为，从静默变有声，不改变动作）。"""
     run_dir = app_data_dir() / "run"
     log_dir = app_data_dir() / "logs"
     pidfile = run_dir / "monitor.pid"
-    if _pid_alive(pidfile):
+    if _pidfile_alive_stamped(pidfile):
+        try:
+            pid = int(pidfile.read_text().strip())
+            foreign, root = _pid_origin_foreign(pid)
+            if foreign:
+                print(f"[bok] monitor 已在运行且属另一代码树（{root}）——跳过拉起"
+                      "（共享栈模型；要换装先去对方树 down）")
+        except Exception:
+            pass
         return
     _start_proc(
         [str(py), str(Path(__file__).resolve()), "monitor"],
@@ -2642,6 +2744,11 @@ def cmd_monitor() -> int:
     log_dir = app_data_dir() / "logs"
     run_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
+    # 盲斑 1 修复（2026-09-22）：外部手跑 monitor 也落 pidfile+来源戳——旧版只
+    # 有 _start_proc 拉起的 monitor 才有痕迹，外部启动令 _ensure_monitor 探不到
+    # 单例（双监控环）、跨树杀守卫对无戳进程不保护。经 _start_proc 拉起时同
+    # 内容写两次，幂等无害。
+    _write_proc_stamps(run_dir / "monitor.pid", os.getpid())
     print("[monitor] started — watching :7880 + workers 8081/8082/8083")
     lk_up = healthy(7880)
     last_action = 0.0
@@ -2663,6 +2770,13 @@ def cmd_monitor() -> int:
                 break
             time.sleep(0.5)
         for spec in specs:
+            # 他树/复用守卫（2026-09-22）：上一轮 kill 被他树戳挡下时，端口仍被
+            # 对方的健康 worker 持有——硬起只会 bind 失败退出刷噪声。已有健康
+            # 监听的端口跳过重拉（自己刚被杀掉的 worker 端口是空的，不受影响）。
+            if healthy(spec["port"]):
+                print(f"[monitor] :{spec['port']} 已有健康监听，跳过重拉"
+                      "（他树持有则去对方树 down）")
+                continue
             _start_proc(spec["argv"], spec["pidfile"], spec["logfile"], env=spec["env"])
             print(f"[monitor] respawned {spec['name']} :{spec['port']}")
 
@@ -2842,6 +2956,16 @@ def cmd_down() -> int:
             pid = int(pidfile.read_text().strip())
         except Exception:
             continue
+        # 他树戳守卫（2026-09-22）：run/*.pid 是 HOME 作用域单槽共享文件，
+        # 多会话/worker 换装会互相覆写——down 只停「本树 + 无戳遗留」（_sweep_
+        # orphan_listeners 已立法的同款纪律在 pidfile 路径落地；旧版此处对
+        # pidfile 内容无脑收割，2026-09-22 实弹把我们树的 worker 杀掉的正是
+        # 这个缺口）。
+        foreign, root = _pid_origin_foreign(pid)
+        if foreign:
+            print(f"[down] skip {pidfile.stem}: pid {pid} 属另一代码树（{root}）"
+                  "——他树进程永不收割（先在对方树 down）", file=sys.stderr)
+            continue
         # _start_proc 以 start_new_session=True 启动（会话组长）；按进程组
         # 终止可连 livekit-agents worker 的 multiprocessing 子进程一起清掉，
         # 避免子进程残留占用 8081 导致下次 agent 启动失败。
@@ -2889,7 +3013,9 @@ def _sweep_orphan_workers() -> list[tuple[int, str]]:
     判据：进程命令行含 agent_runtime.main / agent_runtime.interpret /
     scripts/mock_callee.py（CP detached 派生的 mock 被叫 start_new_session,
     同样绕过 pidfile 体系——房间断了会自退,但栈 down 时若仍卡响铃窗须一并清）。
-    只清本项目特征进程,唔会误伤无关服务。
+    只清本项目特征进程,唔会误伤无关服务。他树戳守卫（2026-09-22）：读得出
+    「拉起树」且 ≠ 本树 → 跳过不进 swept（与 _sweep_orphan_listeners 同款
+    纪律——命令行特征只证明「bok 家」，来源戳才证明「谁家的」）。
     Windows（M2 定案）：**明跳**（返回空表,不清扫）。tasklist 不回命令行
     （image 只有 python.exe,无法安全区分本项目 worker——宁可少清不可误杀）；
     wmic 已弃用；PowerShell CIM 查询未在本仓 Windows 实机验证过。无头形态下
@@ -2918,7 +3044,12 @@ def _sweep_orphan_workers() -> list[tuple[int, str]]:
             if marker in parts[1]:
                 if pid not in seen:
                     seen.add(pid)
-                    swept.append((pid, marker))
+                    foreign, root = _pid_origin_foreign(pid)
+                    if foreign:
+                        print(f"[sweep] orphan pid {pid} 属另一代码树（{root}）——不动"
+                              "（他树进程永不收割；要切换先在对方 down）", file=sys.stderr)
+                    else:
+                        swept.append((pid, marker))
                 break
     for pid, label in swept:
         try:
@@ -2946,8 +3077,11 @@ def _process_serve_root(pid: int) -> str:
     """来源鉴定（评审 A-P2 完整版）：该 pid 由哪棵代码树拉起。载体优先级：
     ① app-data run/proc-<pid>.root（_start_proc 落笔「ROOT<TAB>子代lstart」，
     lstart 与 ps 现值精确比对——pid 复用必然对不上，标记作废）；
-    ② Linux /proc/<pid>/environ 的 BOK_SERVE_ROOT（补标记缺席路径；macOS ps
-    不吐环境，故落盘标记是 mac 主载体）。
+    ② Linux /proc/<pid>/environ 的 BOK_SERVE_ROOT（补标记缺席路径）；
+    ③ macOS `ps eww -p <pid> -o command=`（2026-09-22 补：实测能读出 env 里的
+    BOK_SERVE_ROOT——隔离 HOME 接管的 worker 标记文件落在对方 app-data、
+    本树 app-data 里没有，/proc 又不存在，旧版两载体全盲=来源「未知」，
+    他树 worker 会被 down/清扫当无主残留收割，6c82 接管实弹踩到）。
     读不到/对不上返回空串=来源未知，调用方按未知走原语义；任何异常同空串。"""
     if os.name == "nt":
         return ""
@@ -2968,7 +3102,36 @@ def _process_serve_root(pid: int) -> str:
                 return item.decode("utf-8", "replace").split("=", 1)[1]
     except Exception:
         pass
+    try:
+        # 载体③：macOS 环境经 ps eww 挂在 command 列尾部。只认变量名边界，
+        # 防「某 env 值里恰好含这段字面量」误报；取非空白段（ROOT 是路径无空格）。
+        # 实测边界：python 进程（=真实标的 worker/monitor）恒可读；/bin/sleep
+        # 这类短 argv 二进制读不出 env——载体只服务 bok 家进程，够用。
+        out = subprocess.run(
+            ["ps", "eww", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        m = re.search(r"(?<![A-Za-z0-9_])BOK_SERVE_ROOT=(\S+)", out)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
     return ""
+
+
+def _pid_origin_foreign(pid: int) -> tuple[bool, str]:
+    """pid 是否属**另一棵代码树**（2026-09-22 pidfile 清杀路径补戳）。
+
+    返回 (foreign, root)：来源读得出且 ≠ 本树 ROOT → (True, root)；来源未知
+    （旧版进程/探测失败/pid 复用对不上）或本树 → (False, …)。fail-open 与
+    「down=停本树+无戳遗留」纪律一致——未知绝不挡杀，只有铁证是他树才让位。
+    只对 bok 家进程有意义（任意进程 env 里有 BOK_SERVE_ROOT 即视为 bok 子代）。"""
+    root = _process_serve_root(pid)
+    if not root:
+        return False, ""
+    if os.path.realpath(root) == os.path.realpath(str(ROOT)):
+        return False, root
+    return True, root
 
 
 def _sweep_stale_root_markers() -> None:
@@ -3135,14 +3298,16 @@ def _nvidia_gate() -> tuple[bool, str]:
 
 
 def _doctor_gpu_gate(packaged: bool, fails: list[str]) -> None:
-    """Windows NVIDIA 硬件门禁（独立于虚拟声卡检测）。
+    """Windows/Linux(CUDA) NVIDIA 硬件门禁（独立于虚拟声卡检测）。
 
     曾误缩进在 `if not va_ok:` 下——装了 VB-CABLE 的 Windows 机器直接跳过 GPU
     检查（打包 doctor 漏报），而没装虚拟声卡的 mac 反而被拖去跑 nvidia-smi
     （packaged 模式误报 fail）。d0035c3 原始意图就是挂在 Windows 分支
     （nvidia-smi 是 Windows LLM=CUDA llama.cpp 的前置，mac 无此检查）。
+    Linux 扩档（2026-09-22，runbook §5⑥）：GPU 节点同为 CUDA llama.cpp 前置，
+    同门同判（nvidia-smi/驱动 ≥550/显存 ≥8GB 同阈值）；mac 仍无此检查。
     """
-    if os.name != "nt":
+    if os.name != "nt" and not is_linux():
         return
     ok, msg = _nvidia_gate()
     print(f"nvidia gate: {msg}")
