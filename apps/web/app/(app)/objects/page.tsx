@@ -1,10 +1,12 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import Link from "next/link";
 import { api } from "@/lib/api";
+import { useObjectsList, useTemplatesList } from "@/lib/swr";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
+import { useToast } from "@/components/toast";
 
 interface ObjectRow {
   id: string;
@@ -37,13 +39,19 @@ const EMPTY_FORM = {
 
 export default function ObjectsPage() {
   const { accountId } = useAccount();
-  const [rows, setRows] = useState<Record<string, unknown>[]>([]);
+  const toast = useToast();
+  // 数据层（2026-10-02）：SWR 共享缓存接管（objects 键与 calls 页名称映射/campaigns
+  // 同缓存；templates 键与 studio/templates 同缓存）——跨页导航秒开，保存/删除 mutate。
+  const { data: objData, isLoading: loading, error: objErr, mutate: mutateObjects } =
+    useObjectsList(accountId);
+  const { data: tplData } = useTemplatesList(accountId);
+  const rows = objData ?? [];
+  const templates = tplData ?? [];
+  const fetchErr = objErr ? String(objErr) : null;
   const [q, setQ] = useState("");
   const [form, setForm] = useState(EMPTY_FORM);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [templates, setTemplates] = useState<Record<string, unknown>[]>([]);
   const [importText, setImportText] = useState("");
   const [importMsg, setImportMsg] = useState<string | null>(null);
   const [showImport, setShowImport] = useState(false);
@@ -53,6 +61,11 @@ export default function ObjectsPage() {
   // 立即外呼（P1.5 单发外呼）：逐行按钮正在跑 + 成功后展示的 call_id。
   const [dialingId, setDialingId] = useState<string | null>(null);
   const [dialMsg, setDialMsg] = useState<string | null>(null);
+  // 保存/批量删除/单删/导入的 busy 锁（防连点双发；批量删除用一把锁盖住整个循环）。
+  const [saving, setSaving] = useState(false);
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+  const [removingId, setRemovingId] = useState<string | null>(null);
+  const [importing, setImporting] = useState(false);
 
   /** 用对象的电话立即外呼一通（后端建 outbound 通话 + 派 agent，走 SIP settings/site）。 */
   async function dialNow(id: string) {
@@ -62,8 +75,10 @@ export default function ObjectsPage() {
     try {
       const res = await api.dialNow(id);
       setDialMsg(`已发起外呼，通话 ${res.call_id}`);
+      toast.success(`已发起外呼，通话 ${res.call_id}`);
     } catch (e) {
       setErr(String(e));
+      toast.error(String(e));
     } finally {
       setDialingId(null);
     }
@@ -90,28 +105,38 @@ export default function ObjectsPage() {
     });
 
   async function deleteSelected() {
+    if (bulkDeleting) return;
     const ids = [...selected].filter(Boolean);
     if (ids.length === 0) return;
     if (!window.confirm(`确认删除选中的 ${ids.length} 个对象？（通话转写与结算一并删除）`)) return;
     setBulkErr(null);
+    // 单一 busy 锁住整个循环：循环期间按钮禁用，防重入双删。
+    setBulkDeleting(true);
     let failed = 0;
     let firstErr = "";
-    for (const id of ids) {
-      try {
-        await api.deleteObject(id);
-      } catch (e) {
-        const s = String(e);
-        // 404 幂等成功（2026-09-30 真机）：对象已不在=删除目标已达成（列表
-        // 陈旧/他端已删），不计失败——「成功 0 失败 918」全 404 的误导根修。
-        if (s.includes("404")) continue;
-        failed += 1;
-        if (!firstErr) firstErr = s;
+    try {
+      for (const id of ids) {
+        try {
+          await api.deleteObject(id);
+        } catch (e) {
+          const s = String(e);
+          // 404 幂等成功（2026-09-30 真机）：对象已不在=删除目标已达成（列表
+          // 陈旧/他端已删），不计失败——「成功 0 失败 918」全 404 的误导根修。
+          if (s.includes("404")) continue;
+          failed += 1;
+          if (!firstErr) firstErr = s;
+        }
       }
-    }
-    setSelected(new Set());
-    await refresh();
-    if (failed > 0) {
-      setBulkErr(`删除完成：成功 ${ids.length - failed} 个，失败 ${failed} 个${firstErr ? `（${firstErr}）` : ""}。`);
+      setSelected(new Set());
+      await refresh();
+      if (failed > 0) {
+        setBulkErr(`删除完成：成功 ${ids.length - failed} 个，失败 ${failed} 个${firstErr ? `（${firstErr}）` : ""}。`);
+        toast.error(`删除完成：成功 ${ids.length - failed} 个，失败 ${failed} 个。`);
+      } else {
+        toast.success(`已删除 ${ids.length} 个对象。`);
+      }
+    } finally {
+      setBulkDeleting(false);
     }
   }
 
@@ -148,39 +173,32 @@ export default function ObjectsPage() {
   }
 
   async function doImport() {
+    if (importing) return;
     if (!importText.trim()) { setImportMsg("请先粘贴表格内容。"); return; }
     setImportMsg(null);
+    setImporting(true);
     try {
       const rows = parseImport(importText);
       if (rows.length === 0) { setImportMsg("没有解析到有效行：首行需含「姓名」表头，每行一个人。"); return; }
       const res = await api.importObjects(rows, accountId);
       const imported = Number((res as { imported?: number }).imported ?? rows.length);
       setImportMsg(`已导入 ${imported} 条。`);
+      // 成功后面板会收起、importMsg 随之不可见——toast 补上这条「静默成功」。
+      toast.success(`已导入 ${imported} 条。`);
       setImportText("");
       setShowImport(false);
       await refresh();
     } catch (e) {
       setImportMsg(`导入失败：${String(e)}`);
-    }
-  }
-
-  async function refresh() {
-    setLoading(true);
-    try {
-      const data = await api.listObjects(accountId);
-      setRows(Array.isArray(data) ? data : []);
-      setErr(null);
-    } catch (e) {
-      setErr(String(e));
+      toast.error(String(e));
     } finally {
-      setLoading(false);
+      setImporting(false);
     }
   }
 
-  useEffect(() => {
-    refresh();
-    api.listTemplates(accountId).then(setTemplates).catch(() => {});
-  }, [accountId]);
+  const refresh = useCallback(() => {
+    void mutateObjects();
+  }, [mutateObjects]);
 
   const filtered = useMemo(() => {
     const query = q.trim().toLowerCase();
@@ -191,26 +209,39 @@ export default function ObjectsPage() {
   }, [q, rows]);
 
   async function save() {
+    if (saving) return;
     if (!form.display_name.trim()) return;
     setErr(null);
+    const wasEditing = Boolean(editingId);
+    setSaving(true);
     try {
       if (editingId) await api.updateObject(editingId, form);
       else await api.createObject(form, accountId);
       setForm(EMPTY_FORM);
       setEditingId(null);
       await refresh();
+      toast.success(wasEditing ? "已保存修改。" : "已建档。");
     } catch (e) {
       setErr(String(e));
+      toast.error(String(e));
+    } finally {
+      setSaving(false);
     }
   }
 
   async function remove(id: string) {
+    if (removingId) return;
     if (!window.confirm("确认删除该对象？")) return;
+    setRemovingId(id);
     try {
       await api.deleteObject(id);
       await refresh();
+      toast.success("已删除对象。");
     } catch (e) {
       setErr(String(e));
+      toast.error(String(e));
+    } finally {
+      setRemovingId(null);
     }
   }
 
@@ -268,12 +299,14 @@ export default function ObjectsPage() {
                 onChange={(e) => setImportText(e.target.value)}
               />
               <div className="mt-2 flex items-center gap-2">
-                <button className="btn-primary px-3 py-1 text-xs" onClick={doImport}>导入</button>
+                <button className="btn-primary px-3 py-1 text-xs" onClick={doImport} disabled={importing}>
+                  {importing ? "导入中…" : "导入"}
+                </button>
                 {importMsg && <span className="text-xs muted">{importMsg}</span>}
               </div>
             </div>
           )}
-          {err && <ErrorState message={err} />}
+          {(err || fetchErr) && <ErrorState message={err || fetchErr} />}
           {bulkErr && <p className="mb-2 text-xs text-red-600">{bulkErr}</p>}
           {dialMsg && (
             <p className="mb-2 text-xs muted">
@@ -298,8 +331,8 @@ export default function ObjectsPage() {
                 </label>
                 <span className="muted">已选 {selected.size}</span>
                 {selected.size > 0 && (
-                  <button className="btn-ghost text-red-600" onClick={deleteSelected}>
-                    删除所选（{selected.size}）
+                  <button className="btn-ghost text-red-600" onClick={deleteSelected} disabled={bulkDeleting}>
+                    {bulkDeleting ? "删除中…" : `删除所选（${selected.size}）`}
                   </button>
                 )}
               </div>
@@ -346,7 +379,13 @@ export default function ObjectsPage() {
                         发起新通话
                       </Link>
                       <button className="btn-ghost text-xs" onClick={() => edit(r as unknown as ObjectRow)}>编辑</button>
-                      <button className="btn-ghost text-xs text-red-600" onClick={() => remove(id)}>删除</button>
+                      <button
+                        className="btn-ghost text-xs text-red-600"
+                        onClick={() => remove(id)}
+                        disabled={removingId === id}
+                      >
+                        {removingId === id ? "删除中…" : "删除"}
+                      </button>
                     </div>
                     </div>
                   );
@@ -446,8 +485,8 @@ export default function ObjectsPage() {
                 ))}
               </select>
             </label>
-            <button className="btn-primary w-full" onClick={save}>
-              {editingId ? "保存修改" : "建档"}
+            <button className="btn-primary w-full" onClick={save} disabled={saving}>
+              {saving ? "保存中…" : editingId ? "保存修改" : "建档"}
             </button>
             <p className="text-xs muted">对象档案会注入后续通话上下文。</p>
           </div>

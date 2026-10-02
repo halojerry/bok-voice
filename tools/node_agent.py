@@ -180,6 +180,27 @@ def validate_cp_base(cp_url: str) -> str:
         raise SystemExit(f"[node-agent] FATAL: CP 基址不合规: {exc}") from exc
 
 
+def _assert_cp_origin(url: str, cp_url: str) -> str:
+    """出站钉扎（2026-10-02 安全分流跟进，Mimosa env→urlopen 污点族纵深）：
+    节点全部出站流量只允许已配置 CP 同源（scheme+host+port 三元组）。URL 由
+    cp_url/cfg 拼接，钉扎后即使拼接面/命令面将来被污染也出不了 CP 域。
+    违反抛 RuntimeError（fail-closed；各调用方 except 兜底链原样接住回执）。"""
+    from urllib.parse import urlsplit
+
+    def _triple(u):
+        # 畸形端口（如 "cp.host:8000.evil.local" 的 port 段非数字）在 urlsplit
+        # 里 .port 访问会抛 ValueError——视作不匹配三元组，落 refuse 分支。
+        try:
+            port = u.port
+        except ValueError:
+            return (u.scheme, u.hostname, "__malformed__")
+        return (u.scheme, u.hostname, port)
+
+    if _triple(urlsplit(url)) != _triple(urlsplit(cp_url.rstrip("/"))):
+        raise RuntimeError("outbound url is not CP-origin, refused")
+    return url
+
+
 def _post_json(url: str, payload: dict, headers: dict | None = None,
                timeout: int = 10) -> tuple[int, dict]:
     req = urllib.request.Request(
@@ -210,7 +231,7 @@ def register_once(cp_url: str, license_key: str, fingerprint: str, *,
     一律 401 不复活，nodes_store.register）→ RegisterRevoked 致命退出、明文
     一行说清原因；其余失败维持原 SystemExit 语义。"""
     code, body = _post_json(
-        f"{cp_url.rstrip('/')}/api/nodes/register",
+        _assert_cp_origin(f"{cp_url.rstrip('/')}/api/nodes/register", cp_url),
         {"name": name, "platform": platform_label, "version": version,
          "license_key": license_key, "fingerprint": fingerprint},
     )
@@ -244,7 +265,7 @@ def ensure_token(cp_url: str, license_key: str, fingerprint: str,
             token = ""
     if token:
         code, body = _post_json(
-            f"{cp_url.rstrip('/')}/api/nodes/heartbeat",
+            _assert_cp_origin(f"{cp_url.rstrip('/')}/api/nodes/heartbeat", cp_url),
             {"metrics": {}, "fingerprint": fingerprint},
             headers={"Authorization": f"Bearer {token}"}, timeout=10)
         if code == 200:
@@ -280,6 +301,7 @@ def heartbeat_once(cfg: NodeConfig, metrics: dict | None = None,
         headers={"Authorization": f"Bearer {cfg.node_token}", "Content-Type": "application/json"},
         method="POST",
     )
+    _assert_cp_origin(req.full_url, cfg.cp_url)
     try:
         with _OPENER.open(req, timeout=10) as resp:
             return True, json.loads(resp.read().decode())
@@ -564,6 +586,7 @@ def _http_download(url: str, token: str, dest: Path, timeout: int = 300) -> None
     SSRF/穿越加固（2026-09-23，Mimosa 修复）：dest 必须是绝对路径且不含 '..'
     （调用方现形状=tempdir+已校验版本号，此断言防未来调用方退化）；走
     `_OPENER` 禁随重定向——下载请求带 Bearer node_token，30x 引导=凭据外送。
+    出站钉扎在调用点（perform_update）做——替身测试替换本函数不受影响。
     """
     dest = Path(dest)
     if not dest.is_absolute() or ".." in dest.parts:
@@ -614,10 +637,14 @@ def perform_update(cfg: NodeConfig, version: str, *,
         tgz = Path(td) / f"bok-node-{version}.tar.gz"
         sha_path = Path(td) / "artifact.sha256"
         try:
-            _http_download(f"{base}/api/nodes/downloads/pkg/{version}/"
-                           f"bok-node-{version}.tar.gz", cfg.node_token, tgz)
-            _http_download(f"{base}/api/nodes/downloads/pkg/{version}/"
-                           f"bok-node-{version}.tar.gz.sha256", cfg.node_token, sha_path)
+            _http_download(
+                _assert_cp_origin(f"{base}/api/nodes/downloads/pkg/{version}/"
+                                  f"bok-node-{version}.tar.gz", base),
+                cfg.node_token, tgz)
+            _http_download(
+                _assert_cp_origin(f"{base}/api/nodes/downloads/pkg/{version}/"
+                                  f"bok-node-{version}.tar.gz.sha256", base),
+                cfg.node_token, sha_path)
         except Exception as exc:  # noqa: BLE001 - 下载失败=可回执的普通失败
             return f"download failed: {exc}"
         expected = sha_path.read_text(encoding="utf-8").strip().split()[0].lower()
@@ -738,6 +765,7 @@ def upload_recent_logs(cfg: NodeConfig, *, log_dir: Path | None = None,
             data=payload, method="POST",
             headers={"Authorization": f"Bearer {cfg.node_token}",
                      "Content-Type": "application/gzip"})
+        _assert_cp_origin(req.full_url, cfg.cp_url)
         with _OPENER.open(req, timeout=60) as resp:
             body = json.loads(resp.read().decode())
         return "" if body.get("ok") else f"cp rejected: {body}"

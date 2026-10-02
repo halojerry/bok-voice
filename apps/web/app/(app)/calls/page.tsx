@@ -2,12 +2,23 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import dynamic from "next/dynamic";
+import { useRouter } from "next/navigation";
 import { ArrowRight, Plus } from "lucide-react";
 import { api } from "@/lib/api";
+import { useCallsList, useObjectsList } from "@/lib/swr";
 import { useAccount } from "@/components/account-context";
-import { CallStudio } from "@/components/CallStudio";
 import { LoadingState } from "@/components/app-shell";
 import IntentRulesCard from "@/components/intent-rules-card";
+
+// 内嵌工作台懒加载（2026-10-02 UX 根因修复）：CallStudio 静态引入会把 livekit 706KB +
+// streamdown 467KB + agents-ui 246KB 全部打进 /calls 初始包（共 2.1MB）；列表态只有
+// 点开 ?call= 才需要工作台——dynamic 后重媒体栈只进按需 chunk（/calls/new 保持直引，
+// 该页首屏即工作台）。/qa 画布 dynamic() 同款先例。
+const CallStudio = dynamic(() => import("@/components/CallStudio").then((m) => m.CallStudio), {
+  ssr: false,
+  loading: () => <LoadingState label="载入工作台…" />,
+});
 
 const STATUS: Record<string, [string, string]> = {
   active: ["进行中", "bg-emerald-500"],
@@ -40,18 +51,28 @@ function langLabel(lang: string) {
 
 export default function CallsPage() {
   const { accountId } = useAccount();
-  const [rows, setRows] = useState<Record<string, unknown>[]>([]);
-  const [objects, setObjects] = useState<Record<string, unknown>[]>([]);
   const [err, setErr] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
   const [clearing, setClearing] = useState(false);
   // 选中的通话：同页内嵌工作台（静态导出无法为真实 call id 生成路由，改内嵌而非 /calls/[id]）。
   const [openId, setOpenId] = useState<string | null>(null);
-  // 列表上限递增（QA 2026-09-13）：CP 全量返回 1000+ 通且最老在前——刚挂断的通话
-  // 沉底=切换客户闭环断头；改客户端最新优先排序 + 只渲染最近 limit 通。
+  // 服务端分页页量（2026-10-02 改造；旧客户端全量排序注释存档）：limit 直传
+  // GET /api/calls?limit=（CP created_at 倒序截断），「显示更多」+100；
+  // SWR keepPreviousData 换 key 时旧列表留屏不闪白。
   const [limit, setLimit] = useState(50);
   // 正在补结算的通话 id（行级 busy，防重复点击）。
   const [settlingId, setSettlingId] = useState("");
+  const router = useRouter();
+  // 数据层（2026-10-02 UX 根因修复）：SWR 缓存+去重+轮询接管列表——旧形状=裸 fetch
+  // 全量回传（生产 1570 行）浏览器再排序再切 50、4s 裸 setInterval 全量重拉、
+  // 每次导航进页全冷取。新形状：服务端 limit 分页（created_at 倒序截断）、
+  // SWR refreshInterval 轮询（tab 隐藏自停）、缓存导航秒开。开着内嵌工作台时
+  // 轮询暂停（旧语义保留）。
+  const { data: rowsData, isLoading: loading, error: callsErr, mutate: mutateCalls } =
+    useCallsList(accountId, "", limit, openId ? 0 : 4000);
+  const { data: objectsData } = useObjectsList(accountId);
+  const rows = rowsData ?? [];
+  const objects = objectsData ?? [];
+  const fetchErr = callsErr ? String(callsErr) : null;
   const sortedRows = useMemo(() => {
     const arr = [...rows];
     arr.sort((a, b) =>
@@ -69,8 +90,7 @@ export default function CallsPage() {
     try {
       await api.settle(id);
       setErr(null);
-      const c = await api.listCalls(accountId, "");
-      setRows(Array.isArray(c) ? c : []);
+      void mutateCalls();
     } catch (e) {
       setErr(String(e));
     } finally {
@@ -82,7 +102,7 @@ export default function CallsPage() {
     if (!window.confirm("确认删除该通话记录？（转写与结算一并删除）")) return;
     try {
       await api.deleteCall(id);
-      setRows((prev) => prev.filter((r) => String(r.id ?? r.call_id) !== id));
+      void mutateCalls();
       if (openId === id) setOpenId(null);
     } catch (e) {
       setErr(String(e));
@@ -94,7 +114,7 @@ export default function CallsPage() {
     setClearing(true);
     try {
       await api.clearEndedCalls(accountId);
-      setRows((prev) => prev.filter((r) => String(r.status ?? "") !== "ended"));
+      void mutateCalls();
     } catch (e) {
       setErr(String(e));
     } finally {
@@ -102,43 +122,18 @@ export default function CallsPage() {
     }
   }
 
+  // 从内嵌工作台返回列表时立即重验:挂断的那通此刻状态已变,不等 ≤4s 轮询
+  // (否则行还挂着「进行中」,交互不自洽)。首挂载时 SWR 已自取,此处被去重窗吞掉。
   useEffect(() => {
-    setLoading(true);
-    Promise.all([api.listCalls(accountId, ""), api.listObjects(accountId)])
-      .then(([c, o]) => {
-        setRows(Array.isArray(c) ? c : []);
-        setObjects(Array.isArray(o) ? o : []);
-        setErr(null);
-      })
-      .catch((e) => setErr(String(e)))
-      .finally(() => setLoading(false));
-  }, [accountId]);
-
-  // 从内嵌工作台返回列表时立即刷新:挂断的那通此刻状态已变,不等 ≤4s 轮询
-  // (否则行还挂着「进行中」,交互不自洽)。
-  useEffect(() => {
-    if (openId) return;
-    api.listCalls(accountId, "")
-      .then((c) => setRows(Array.isArray(c) ? c : []))
-      .catch(() => {});
-  }, [accountId, openId]);
+    if (!openId) void mutateCalls();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openId]);
 
   // 主管台橫幅撳「進入工作台」→ /calls?call=<id>:自動開嗰通工作台(靜態 export 用 query,唔使新 route)。
   useEffect(() => {
     const m = window.location.search.match(/[?&]call=([^&]+)/);
     if (m) setOpenId(decodeURIComponent(m[1]));
   }, []);
-
-  // 列表 4s 輪詢:捉 active call 嘅 WhatsApp 待對接/狀態變化(主管台同步;開咗工作台就唔 poll)。
-  useEffect(() => {
-    if (openId) return;
-    const t = setInterval(() => {
-      api.listCalls(accountId, "")
-        .then((c) => setRows(Array.isArray(c) ? c : []))
-        .catch(() => {});
-    }, 4000);
-    return () => clearInterval(t);
-  }, [accountId, openId]);
 
   function objectName(id: unknown) {
     const o = objects.find((x) => String(x.id) === String(id));
@@ -166,7 +161,7 @@ export default function CallsPage() {
         </div>
       </div>
 
-      {err && <p className="mb-4 text-sm text-red-600">{err}</p>}
+      {(err || fetchErr) && <p className="mb-4 text-sm text-red-600">{err || fetchErr}</p>}
       {loading && <LoadingState />}
 
       {/* 意向规则（W4-T3）：折叠卡放页面顶部，列表+新建常驻可用（内嵌工作台时也不挡路） */}
@@ -187,7 +182,7 @@ export default function CallsPage() {
             onRequestNewCall={(oid) => {
               // 退出内嵌工作台 → 跳独立新建页并预选该对象（?object= 预选已验证路径）
               setOpenId(null);
-              window.location.assign(`/calls/new?object=${encodeURIComponent(oid)}`);
+              router.push(`/calls/new?object=${encodeURIComponent(oid)}`);
             }}
           />
         </section>
@@ -201,8 +196,8 @@ export default function CallsPage() {
             )}
             {rows.length > 0 && (
               <p className="px-2 text-xs muted">
-                共 {rows.length} 通 · 按最新优先显示 {visibleRows.length} 通
-                {sortedRows.length > visibleRows.length && (
+                已载入 {rows.length} 通（最新优先）
+                {rows.length >= limit && (
                   <button className="ml-2 text-(--live)" onClick={() => setLimit((v) => v + 100)}>
                     显示更多
                   </button>

@@ -12,7 +12,10 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
+import dynamic from "next/dynamic";
+import { useRouter } from "next/navigation";
 import { api, type UserRow } from "@/lib/api";
+import { useTemplatesList } from "@/lib/swr";
 import { downloadCsv, parseBoolCell } from "@/lib/csv";
 import { serializeStepRef } from "@/lib/flow-canvas";
 import { graphDocWithJumpBinding, graphDocWithoutIntentBindings, parseGraphDoc, parseTemplateSteps } from "@/lib/qa-canvas";
@@ -31,7 +34,12 @@ import TemplateEditor, {
   type FlowStep,
   type TemplateRow,
 } from "@/components/template-editor";
-import StepCanvasView from "@/components/step-canvas-view";
+// 画布视图懒加载（/qa 页 dynamic() 同款先例）：@xyflow/react ~176KB 只进画布 chunk，
+// 默认「列表编辑」视图零负担（UX 性能根因修复 2026-10-02）。
+const StepCanvasView = dynamic(() => import("@/components/step-canvas-view"), {
+  ssr: false,
+  loading: () => <LoadingState />,
+});
 import StepsListEditor from "@/components/steps-list-editor";
 import StudyTab from "@/components/study-tab";
 import GapMining from "@/components/gap-mining";
@@ -40,6 +48,7 @@ import CannedAuditionCard from "@/components/canned-audition";
 import IntentRulesCard from "@/components/intent-rules-card";
 import IntentManager from "@/components/intent-manager";
 import QaLibrary from "@/components/qa-library";
+import { useToast } from "@/components/toast";
 import { seedPackFor } from "@/lib/seed-pack";
 
 // 通话行状态徽标（照 calls 页惯例搬一份,页面文件不可导入）。
@@ -155,44 +164,62 @@ export default function StudioPage() {
   const uid = session?.user_id ?? "";
   // 学习报告 = reports 权限键（B4 页面矩阵；会话未加载时不出该 tab）。
   const canReports = hasPage(session, "reports");
+  const router = useRouter();
+  const toast = useToast();
 
   // ---- 深链：?t=<模板 id> 进工作台态 ----
+  // 2026-10-02 UX 根因修复：列表↔工作台改 SPA 内导航（原 window.location.assign =
+  // 整页重载，React 整树重挂 + 全部数据冷取，主编辑环路每进出一次付一次全价）。
+  // selId 是唯一工作台锚；URL 走 pushState（浏览器返回键可用）+ popstate 回读。
+  // 手法与 /supervisor ?listen= 同款 window.location，不引入 useSearchParams
+  // （静态导出下需 Suspense 包裹，不值）。换模板重锚见 anchoredSelRef，SPA 化无串稿。
   const [selId, setSelId] = useState("");
+  // popstate 丢稿防线（2026-10-02 review 修）：浏览器 Back 离开工作台与「返回列表」
+  // 同语义——旧版只拦 beforeunload(刷新/关闭)与站内按钮,Back 直落 popstate 静默
+  // 重锚丢草稿。dirty/selId 引用走 ref(effect 依赖空数组,不重挂监听;赋值在
+  // anyDirty 声明之后,见下)。
+  const dirtyRef = useRef(false);
+  const selIdRef = useRef("");
   useEffect(() => {
-    const m = window.location.search.match(/[?&]t=([^&]+)/);
-    if (m) setSelId(decodeURIComponent(m[1]));
+    const selFromUrl = () => {
+      const m = window.location.search.match(/[?&]t=([^&]+)/);
+      return m ? decodeURIComponent(m[1]) : "";
+    };
+    setSelId(selFromUrl());
+    const onPop = () => {
+      const next = selFromUrl();
+      if (selIdRef.current && !next && dirtyRef.current) {
+        if (!window.confirm("有未保存/未应用的修改（主流程或模板设置），离开会丢失。仍要离开？")) {
+          // 拒绝=推回工作台条目(forward 再触发一次 onPop,此时 next=工作台,正常落地)
+          window.history.forward();
+          return;
+        }
+      }
+      selIdRef.current = next;
+      setSelId(next);
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ---- 列表态数据 ----
-  const [rows, setRows] = useState<Record<string, unknown>[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [err, setErr] = useState("");
+  /** 列表→工作台：SPA 导航（列表数据留存，返回列表即时、零冷取）。 */
+  const openWorkbench = useCallback((id: string) => {
+    setSelId(id);
+    window.history.pushState(null, "", `/studio/?t=${encodeURIComponent(id)}`);
+    window.scrollTo(0, 0);
+  }, []);
+
+  // ---- 列表态数据（2026-10-02 数据层：SWR 共享缓存接管——key=["templates",accountId]
+  // 与 /templates 页同缓存，跨页导航秒开不重拉；工作台态不再跳过（缓存命中零请求，
+  // 返回列表即刻可用），新建保存后 mutate 重验（旧 listRev 序号机制退役）。 ----
+  const { data: tplListData, isLoading: loading, error: tplListErr, mutate: mutateTemplates } =
+    useTemplatesList(accountId);
+  const rows = tplListData ?? [];
+  const err = tplListErr ? String(tplListErr) : "";
   const [userNames, setUserNames] = useState<Record<string, string>>({});
   // 新建话术面板（2026-09-20：/templates 移出主导航，这里成为唯一内容入口）。
   const [creating, setCreating] = useState(false);
-  // 列表刷新序号：新建保存成功后 +1 重拉列表。
-  const [listRev, setListRev] = useState(0);
-
-  useEffect(() => {
-    if (selId) return; // 工作台态不拉列表
-    let alive = true;
-    setLoading(true);
-    api.listTemplates(accountId)
-      .then((data) => {
-        if (!alive) return;
-        setRows(Array.isArray(data) ? data : []);
-        setErr("");
-      })
-      .catch((e) => {
-        if (alive) setErr(String(e));
-      })
-      .finally(() => {
-        if (alive) setLoading(false);
-      });
-    return () => {
-      alive = false;
-    };
-  }, [selId, accountId, listRev]);
 
   // 主管面归属徽标要显示成员姓名（话务员无权访问 /api/users，不请求；照 templates 页惯例）。
   useEffect(() => {
@@ -264,6 +291,14 @@ export default function StudioPage() {
   // ---- 步骤草稿（工作站层唯一持有；列表编辑/模板设置共用——切换不丢修改） ----
   const [stepsDraft, setStepsDraft] = useState<FlowStep[]>([]);
   const [stepsDirty, setStepsDirty] = useState(false);
+  // 模板设置（meta 编辑器）独立 dirty（2026-10-02 review 修）：TemplateEditor
+  // (variant=meta) 有自己的保存按钮——旧版 backToList/publishNow 只看 stepsDirty,
+  // meta 区未保存的名称/语言/语气/热词改动被静默丢、或带着旧值发布。
+  const [metaDirty, setMetaDirty] = useState(false);
+  const anyDirty = stepsDirty || metaDirty;
+  // popstate 防线的引用快照(声明在 effect 附近,赋值在此=anyDirty 已就绪)
+  dirtyRef.current = anyDirty;
+  selIdRef.current = selId;
   const [applying, setApplying] = useState(false);
   const [applyErr, setApplyErr] = useState("");
   const [applyNote, setApplyNote] = useState("");
@@ -301,11 +336,17 @@ export default function StudioPage() {
       ref: serializeStepRef({ script: r.script, branches: r.branches, notes: r.notes }),
       ...(r.say ? { say: true } : {}),
     }));
-    await api.updateTemplate(selId, { steps_json: stepsToJson(steps) });
+    try {
+      await api.updateTemplate(selId, { steps_json: stepsToJson(steps) });
+    } catch (e) {
+      toast.error(String(e)); // 内联「导入失败」由 TableImport 结果面保留
+      throw e;
+    }
     setStepsDraft(steps);
     setStepsDirty(false);
     setApplyNote(`已从表格导入 ${steps.length} 步（整表替换）`);
     setTplRev((v) => v + 1);
+    toast.success(`已从表格导入 ${steps.length} 步（整表替换）`);
     return { done: steps.length, failed: 0, errors: [] };
   }
 
@@ -321,15 +362,19 @@ export default function StudioPage() {
       stepsDraft.length,
     );
     if (!next) {
-      setApplyNote("画布连线失败：意图不存在或步号越界，刷新后重试。");
+      const msg = "画布连线失败：意图不存在或步号越界，刷新后重试。";
+      setApplyNote(msg);
+      toast.error(msg);
       return;
     }
     try {
       await api.updateTemplate(selId, { graph_json: JSON.stringify(next) });
       setApplyNote(`画布连线已保存：该意图命中后跳到第 ${stepNo} 步（记得有未发布的改动要去发布）`);
       setTplRev((v) => v + 1);
+      toast.success(`画布连线已保存：该意图命中后跳到第 ${stepNo} 步`);
     } catch (e) {
       setApplyNote(`画布连线失败：${String(e)}`);
+      toast.error(String(e));
     }
   }
 
@@ -344,8 +389,10 @@ export default function StudioPage() {
       await api.updateTemplate(selId, { graph_json: JSON.stringify(next) });
       setApplyNote("已解除该意图的连线（意图与关键词保留）");
       setTplRev((v) => v + 1);
+      toast.success("已解除该意图的连线（意图与关键词保留）");
     } catch (e) {
       setApplyNote(`解除连线失败：${String(e)}`);
+      toast.error(String(e));
     }
   }
 
@@ -357,12 +404,15 @@ export default function StudioPage() {
     try {
       await api.updateTemplate(selId, { steps_json: stepsToJson(stepsDraft) });
       const dropped = stepsDraft.filter((s) => !s.goal.trim() && !s.ref.trim()).length;
-      setApplyNote(dropped > 0 ? `已应用（忽略了 ${dropped} 个空白步）` : "已应用");
+      const note = dropped > 0 ? `已应用（忽略了 ${dropped} 个空白步）` : "已应用";
+      setApplyNote(note);
       // 应用后即清脏（重拉到达前用户可见状态正确;锚定效应随后重锚为同一份落库值）。
       setStepsDirty(false);
       setTplRev((v) => v + 1); // 重拉模板行（发布徽标等随之取权威数据）
+      toast.success(note); // 内联注记保留,浮层追加成功反馈（2026-10-02 反馈面）
     } catch (e) {
       setApplyErr(String(e));
+      toast.error(String(e)); // 内联错误保留
     } finally {
       setApplying(false);
     }
@@ -371,14 +421,19 @@ export default function StudioPage() {
   /** 发布（新通话用冻结版）：有未应用修改先提醒——发布的是已保存版本。 */
   async function publishNow() {
     if (!selId) return;
-    if (stepsDirty && !window.confirm("还有未应用的修改：发布的是「已保存」的版本。建议先点「应用」。\n\n仍要直接发布？")) return;
+    if (anyDirty && !window.confirm("还有未保存/未应用的修改（主流程或模板设置）：发布的是「已保存」的版本。建议先点「应用」/「保存」。\n\n仍要直接发布？")) return;
     if (!window.confirm("发布后，之后拨出的电话都按这个版本讲。确定发布？")) return;
     setPublishing(true);
     try {
-      await api.publishTemplate(selId);
+      const res = await api.publishTemplate(selId);
       setTplRev((v) => v + 1);
+      toast.success("已发布，新通话将使用该版本");
+      // 发布钩子的自动罐头物化（CP 只回状态键,失败绝不阻发布）：真正排队了才多说一句。
+      const pregen = res?.tts_pregen as { status?: unknown } | undefined;
+      if (String(pregen?.status ?? "") === "queued") toast.info("罐头预合成已排队，稍后自动生效");
     } catch (e) {
       setApplyErr(String(e));
+      toast.error(String(e));
     } finally {
       setPublishing(false);
     }
@@ -386,22 +441,46 @@ export default function StudioPage() {
 
   // 有未应用修改时拦浏览器关闭/刷新（站点内导航走「返回列表」的确认）。
   useEffect(() => {
-    if (!stepsDirty) return;
+    if (!anyDirty) return;
     const onBeforeUnload = (e: BeforeUnloadEvent) => {
       e.preventDefault();
     };
     window.addEventListener("beforeunload", onBeforeUnload);
     return () => window.removeEventListener("beforeunload", onBeforeUnload);
-  }, [stepsDirty]);
+  }, [anyDirty]);
 
-  /** 返回列表：脏=确认（未应用的修改会丢——页面态不跨模板保留）。 */
+  /** 返回列表：脏=确认（未应用的修改会丢——再进任何模板必重锚，草稿不跨模板保留）。 */
   function backToList() {
-    if (stepsDirty && !window.confirm("主流程的修改还没应用，返回会丢失。仍要返回？")) return;
-    window.location.assign("/studio/");
+    if (anyDirty && !window.confirm("有未保存/未应用的修改（主流程或模板设置），返回会丢失。仍要返回？")) return;
+    setSelId("");
+    window.history.pushState(null, "", "/studio/");
+    window.scrollTo(0, 0);
   }
 
   // ---- tab 切换（qa 页 view chips 同款写法）；学习报告 tab 仅对有 reports 键的人出现 ----
   const [tab, setTab] = useState("flow");
+  // tab 懒加载保活（2026-10-02 交互逻辑修复）：五+个 tab 原为条件渲染，切走即卸载——
+  // IntentManager 草稿 / QaLibrary 表单 / StudyTab 聚类计划（生成要几十秒）/ GapMining
+  // 编辑全灭、切回全部重拉。visitedTabs=访问过的 tab 常驻挂载、非激活加 hidden
+  // （display:none 只藏不卸）；未访问的 tab 依旧零挂载零请求（懒加载语义不变）。
+  const [visitedTabs, setVisitedTabs] = useState<Set<string>>(() => new Set(["flow"]));
+  const selectTab = useCallback((k: string) => {
+    setTab(k);
+    setVisitedTabs((prev) => {
+      if (prev.has(k)) return prev;
+      const next = new Set(prev);
+      next.add(k);
+      return next;
+    });
+  }, []);
+  // 进入工作台/换模板重置 tab=主流程——对齐旧整页重载语义（深链与换模板恒落主流程；
+  // SPA 化后组件不重挂，tab 是组件态需显式归位；列表态不渲染 tab 面，顺带无害）。
+  // 同时重置保活面：草稿跨 tab 保留、跨模板清零（对齐 anchoredSelRef 纪律，
+  // 防 intent/qa 草稿串模板）。
+  useEffect(() => {
+    setTab("flow");
+    setVisitedTabs(new Set(["flow"]));
+  }, [selId]);
   // 主流程 tab 双视图：默认「列表编辑」,画布为切换选项;选择记 localStorage（见文件头注释）。
   const [flowView, setFlowView] = useState<"form" | "canvas">(readStoredFlowView);
   const switchFlowView = useCallback((v: "form" | "canvas") => {
@@ -607,7 +686,7 @@ export default function StudioPage() {
               tpl={null}
               onSaved={() => {
                 setCreating(false);
-                setListRev((v) => v + 1);
+                void mutateTemplates();
               }}
             />
           </section>
@@ -642,7 +721,7 @@ export default function StudioPage() {
                   <button
                     key={id}
                     type="button"
-                    onClick={() => window.location.assign(`/studio/?t=${encodeURIComponent(id)}`)}
+                    onClick={() => openWorkbench(id)}
                     className="w-full rounded-lg bg-muted/60 p-4 text-left transition hover:bg-accent"
                   >
                     <div className="flex items-start justify-between gap-3">
@@ -732,7 +811,7 @@ export default function StudioPage() {
               <button
                 key={k}
                 className={`btn-ghost text-xs ${tab === k ? "border-(--live) text-(--live-ink)" : "muted"}`}
-                onClick={() => setTab(k)}
+                onClick={() => selectTab(k)}
               >
                 {label}
               </button>
@@ -740,8 +819,8 @@ export default function StudioPage() {
           </div>
 
           {/* 1. 主流程：列表编辑（默认）/ 画布——同一份工作站层草稿,右上角「应用」统一保存 */}
-          {tab === "flow" && (
-            <div className="space-y-2">
+          {visitedTabs.has("flow") && (
+            <div className={`space-y-2 ${tab === "flow" ? "" : "hidden"}`}>
               <div className="flex items-center gap-1">
                 {([["form", "列表编辑"], ["canvas", "画布"]] as const).map(([k, label]) => (
                   <button
@@ -788,7 +867,7 @@ export default function StudioPage() {
                   qaLabels={qaLabels}
                   branchCanned={branchCanned}
                   onPregenBranch={pregenBranch}
-                  onOpenIntents={() => setTab("intent")}
+                  onOpenIntents={() => selectTab("intent")}
                   onBindJump={bindIntentJump}
                   onUnbindJump={unbindIntentJump}
                 />
@@ -806,7 +885,18 @@ export default function StudioPage() {
                       模板设置 <span className="ml-1 text-xs muted">（名称 / 语言 / 语气 / 热词——本块有独立保存按钮）</span>
                     </summary>
                     <div className="mt-3">
-                      <TemplateEditor tpl={tplRow} variant="meta" onSaved={() => setTplRev((v) => v + 1)} />
+                      {/* 发布守卫（并行契约 publishGuard）：编辑器那颗「发布当前版本」会绕过
+                          页面级 publishNow 的脏草稿检查——未应用时先确认，只发已应用版本。 */}
+                      <TemplateEditor
+                        tpl={tplRow}
+                        variant="meta"
+                        onSaved={() => setTplRev((v) => v + 1)}
+                        onDirtyChange={setMetaDirty}
+                        publishGuard={() => {
+                          if (anyDirty && !window.confirm("有未应用的修改（主流程或模板设置），发布只会包含已保存版本。仍要发布？")) return false;
+                          return true;
+                        }}
+                      />
                     </div>
                   </details>
                 </>
@@ -817,32 +907,37 @@ export default function StudioPage() {
           {/* 2. 意图管理（PRD 3.3）：第一层识别——表格+弹窗直编 graph_json；种子包逐条登记。
               合并注记：origin/main P2.5 把意图折进「主流程」表单（画布退役线），本线保留
               独立意图 tab（画布 onOpenIntents 深链此处）；IntentManager 本体已采合并后
-              （lib/intent-table）结构 + 本线表格导入/语言过滤/种子包。 */}
-          {tab === "intent" && tplRow && (
-            <IntentManager
-              tpl={tplRow}
-              accountId={accountId}
-              readOnly={contentReadOnly}
-              onSaved={() => setTplRev((v) => v + 1)}
-              seedIntents={seedPackFor(String(tplRow.language ?? "zh")).intents}
-            />
+              （lib/intent-table）结构 + 本线表格导入/语言过滤/种子包。
+              UX 刀三（2026-10-02）：visitedTabs 保活——切走 hidden 不卸载,表格筛选态不丢。 */}
+          {visitedTabs.has("intent") && tplRow && (
+            <div className={tab === "intent" ? undefined : "hidden"}>
+              <IntentManager
+                tpl={tplRow}
+                accountId={accountId}
+                readOnly={contentReadOnly}
+                onSaved={() => setTplRev((v) => v + 1)}
+                seedIntents={seedPackFor(String(tplRow.language ?? "zh")).intents}
+              />
+            </div>
           )}
 
           {/* 2b. 问答库（PRD 3.4）：表格+弹窗；多轮行为（播完跳转/通知人工）在意图管理挂 play_qa 绑定 */}
-          {tab === "qa" && tplRow && (
-            <QaLibrary
-              accountId={accountId}
-              templateId={selId}
-              lang={String(tplRow.language ?? "zh")}
-              stepCount={Math.max(stepsList.length, 1)}
-              readOnly={contentReadOnly}
-              seedPack={seedPackFor(String(tplRow.language ?? "zh")).qa}
-            />
+          {visitedTabs.has("qa") && tplRow && (
+            <div className={tab === "qa" ? undefined : "hidden"}>
+              <QaLibrary
+                accountId={accountId}
+                templateId={selId}
+                lang={String(tplRow.language ?? "zh")}
+                stepCount={Math.max(stepsList.length, 1)}
+                readOnly={contentReadOnly}
+                seedPack={seedPackFor(String(tplRow.language ?? "zh")).qa}
+              />
+            </div>
           )}
 
           {/* 3. 客户意向（挂断判定 intent_rules）：与 /calls 页同一张卡（账号级规则面） */}
-          {tab === "disposition" && (
-            <section className="space-y-2">
+          {visitedTabs.has("disposition") && (
+            <section className={`space-y-2 ${tab === "disposition" ? "" : "hidden"}`}>
               <p className="text-xs muted">
                 挂断时按通话事实（时长/轮数/到达步数/是否捕获号码等）判定客户意向码与处置，命中即写进通话记录。
               </p>
@@ -851,8 +946,8 @@ export default function StudioPage() {
           )}
 
           {/* 4. 录音沉淀：罐头音资产试听（垫话/QA 罐头） + 挂步骤词条的物化状态面 */}
-          {tab === "canned" && (
-            <section className="space-y-3">
+          {visitedTabs.has("canned") && (
+            <section className={`space-y-3 ${tab === "canned" ? "" : "hidden"}`}>
               <CannedAuditionCard />
               <div className="card space-y-3">
               {cannedErr && <ErrorState message={cannedErr} />}
@@ -896,8 +991,8 @@ export default function StudioPage() {
           )}
 
           {/* 4. 通话日志：按模板过滤的最新通话（最多 50 条） */}
-          {tab === "calls" && (
-            <section className="card space-y-2">
+          {visitedTabs.has("calls") && (
+            <section className={`card space-y-2 ${tab === "calls" ? "" : "hidden"}`}>
               {callsErr && <ErrorState message={callsErr} />}
               {callsLoading ? (
                 <LoadingState />
@@ -920,7 +1015,7 @@ export default function StudioPage() {
                         <button
                           key={cid}
                           type="button"
-                          onClick={() => window.location.assign(`/calls/?call=${encodeURIComponent(cid)}`)}
+                          onClick={() => router.push(`/calls/?call=${encodeURIComponent(cid)}`)}
                           className="w-full rounded-lg bg-muted/60 px-3 py-2 text-left transition hover:bg-accent"
                         >
                           <div className="flex items-center justify-between gap-3">
@@ -952,14 +1047,18 @@ export default function StudioPage() {
           )}
 
           {/* 5. 变量：占位符目录 + 无效占位告警 + 对象预览（渲染语义 lib/var-panel.ts） */}
-          {tab === "vars" && <TemplateVarsTab tpl={tplRow} accountId={accountId} />}
+          {visitedTabs.has("vars") && (
+            <div className={tab === "vars" ? undefined : "hidden"}>
+              <TemplateVarsTab tpl={tplRow} accountId={accountId} />
+            </div>
+          )}
 
           {/* 6. 学习报告（reports 键可见）：话术优化分析 + 高频问答对 + AI 聚类采纳 + 快路覆盖率/漏网轮采集 */}
-          {tab === "reports" && canReports && (
-            <>
+          {visitedTabs.has("reports") && canReports && (
+            <div className={tab === "reports" ? undefined : "hidden"}>
               <StudyTab />
               <GapMining templateId={selId} />
-            </>
+            </div>
           )}
         </>
       )}

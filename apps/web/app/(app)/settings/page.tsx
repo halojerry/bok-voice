@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Plus } from "lucide-react";
 import { api } from "@/lib/api";
 import { ErrorState, LoadingState } from "@/components/app-shell";
+import { useToast } from "@/components/toast";
 import CannedAuditionCard from "@/components/canned-audition";
 import ModelRoutingCard from "@/components/settings-model-routing";
 import { SETTING_CARDS, POLICY_META, DEFAULT_PROVIDER, type ProviderKind, type FieldMeta } from "@/lib/settings-meta";
@@ -822,11 +823,13 @@ function VoiceCard({ value, onChange }: { value: ProviderForm; onChange: (next: 
 }
 
 export default function SettingsPage() {
+  const toast = useToast();
   const [form, setForm] = useState<Record<string, any>>(EMPTY_FORM);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [ok, setOk] = useState(false);
   const [health, setHealth] = useState("");
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     api.getSettings()
@@ -846,8 +849,10 @@ export default function SettingsPage() {
   }, []);
 
   async function save() {
+    if (saving) return;
     setErr(null);
     setOk(false);
+    setSaving(true);
     try {
       const payload = {
         asr: { ...EMPTY_FORM.asr, ...form.asr },
@@ -859,8 +864,12 @@ export default function SettingsPage() {
       };
       await api.saveSettings(payload);
       setOk(true);
+      toast.success("已保存设置。");
     } catch (e) {
       setErr(friendlyErrorText(String(e)));
+      toast.error(friendlyErrorText(String(e)));
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -928,7 +937,9 @@ export default function SettingsPage() {
             </div>
           </details>
           <div className="flex flex-wrap items-end gap-3 lg:col-span-2">
-            <button className="btn-primary" onClick={save}>保存设置</button>
+            <button className="btn-primary" onClick={save} disabled={saving}>
+              {saving ? "保存中…" : "保存设置"}
+            </button>
             <button className="btn-ghost" onClick={() => testHealth("asr")}>测试 ASR</button>
             <button className="btn-ghost" onClick={() => testHealth("tts")}>测试 TTS</button>
             {ok && <span className="text-sm text-emerald-600">已保存。</span>}
