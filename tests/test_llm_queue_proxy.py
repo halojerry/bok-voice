@@ -547,3 +547,104 @@ def test_real_uvicorn_body_reaches_handler_not_eaten_by_probe():
         qp._CLIENT = None
         server.should_exit = True
         th.join(timeout=5)
+
+
+def test_queued_disconnect_dropped_without_upstream(capfd):
+    """排队后断连复检（2026-10-02 orch2-D）：客户端在等闸窗口里消失（打断/挂断
+    掐断连接是常态），拿到槽后必须复检并丢弃——绝不为一个幽灵烧上游生成槽
+    （单并发下整条回复链白等一整轮 decode）。
+
+    真 uvicorn 起代理（只有真 server 的 receive 通道会递 http.disconnect 给
+    is_disconnected；ASGITransport 对此结构性失明——与 wave-1 真 uvicorn 钉同
+    姿势）。A 长流占槽；B 从裸 socket 发完整请求、排进队列后断开（排队前探针
+    已过，接不住这个窗口）；A 结束后 B 拿到槽——断言上游计数停在 1（B 未转发）
+    且槽即刻归零（不等 B 那条上游流跑完），并落一行 drop 观测。
+    """
+    import socket
+    import threading
+    import time as _time
+
+    import uvicorn
+
+    served: list[str] = []
+    stub = FastAPI()
+
+    @stub.post("/v1/chat/completions")
+    async def _gen(request: Request):  # noqa: ANN202
+        served.append(request.headers.get("x-bok-lane", "bg"))
+
+        async def stream():
+            for _ in range(6):
+                await asyncio.sleep(0.1)  # ~0.6s 长流占槽
+                yield b"data: chunk\n\n"
+
+        return StreamingResponse(stream(), media_type="text/event-stream")
+
+    qp._CLIENT = httpx.AsyncClient(transport=httpx.ASGITransport(app=stub), base_url="http://stub")
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(qp.app, host="127.0.0.1", port=port, log_level="error"))
+    th = threading.Thread(target=server.run, daemon=True)
+    th.start()
+    for _ in range(100):
+        if server.started:
+            break
+        _time.sleep(0.05)
+    assert server.started
+    try:
+        async def scenario():
+            async def hold_a():
+                async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as c:
+                    r = await c.post(
+                        f"http://127.0.0.1:{port}/v1/chat/completions", json={"stream": True}
+                    )
+                    body = b"".join([p async for p in r.aiter_bytes()])
+                    return r.status_code, len(body)
+
+            a = asyncio.create_task(hold_a())
+            for _ in range(200):
+                if qp.GATE.stats()["active"] == 1:
+                    break
+                await asyncio.sleep(0.01)
+            assert qp.GATE.stats()["active"] == 1, "A 应先占槽再放 B"
+
+            # B：裸 socket 发一条完整请求，排进队列后断开（排队窗口内断连）
+            sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+            req_body = b'{"stream": true}'
+            sock.sendall(
+                b"POST /v1/chat/completions HTTP/1.1\r\n"
+                + f"Host: 127.0.0.1:{port}\r\n".encode()
+                + b"Content-Type: application/json\r\n"
+                + f"Content-Length: {len(req_body)}\r\n".encode()
+                + b"Connection: close\r\n\r\n"
+                + req_body
+            )
+            for _ in range(200):
+                if qp.GATE.stats()["queued_bg"] == 1:
+                    break
+                await asyncio.sleep(0.01)
+            assert qp.GATE.stats()["queued_bg"] == 1, "B 应停在队列里（此前已过排队前探针）"
+            sock.shutdown(socket.SHUT_RDWR)
+            sock.close()
+
+            code, blen = await asyncio.wait_for(a, 10)
+            assert code == 200 and blen > 0
+            t0 = _time.perf_counter()
+            while _time.perf_counter() - t0 < 1.0:
+                st = qp.GATE.stats()
+                if len(served) > 1 or (st["active"] == 0 and st["queued_bg"] == 0):
+                    break
+                await asyncio.sleep(0.005)
+            return (_time.perf_counter() - t0) * 1000, list(served)
+
+        drop_ms, upstream = asyncio.run(scenario())
+        assert upstream == ["bg"], f"排队期间断连的幽灵不得转发上游: {upstream}"
+        assert drop_ms < 300, f"断连处置应即刻完成（不等上游流）: {drop_ms:.0f}ms"
+        assert qp.GATE.stats()["active"] == 0 and qp.GATE.stats()["queued_bg"] == 0
+        out = capfd.readouterr().out
+        assert re.search(r"queue_proxy drop disconnected lane=bg waited_ms=\d+", out), out
+    finally:
+        qp._CLIENT = None
+        server.should_exit = True
+        th.join(timeout=5)

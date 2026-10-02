@@ -69,15 +69,17 @@ def _pin_available(monkeypatch, value: int | None, *, record: list | None = None
 
 
 def test_formula_and_clamp_math_mac(monkeypatch):
-    """mac 档案(floor1/ceiling2/workset2.5/headroom2)各内存档位：
-    公式 computed=(avail-headroom)//workset，结果=clamp 且恒 ≥1。"""
+    """mac 档案(floor1/ceiling2/workset2.5/headroom8)各内存档位：
+    公式 computed=(avail-headroom)//workset，结果=clamp 且恒 ≥1。
+    headroom=8 是 2026-10-02 对齐双 4GB prompt-cache 时代的定值。"""
     monkeypatch.setenv("BOK_DEPLOY_PROFILE", "mac")
     cases = {
-        1 * GB: (-1, 1),      # (1-2)/2.5 = -1 → floor 1
-        4 * GB: (0, 1),       # 0.8 → 0 → floor 1
-        6 * GB: (1, 1),       # 1.6 → 1
-        10 * GB: (3, 2),      # 3.2 → 3 → ceiling 2
-        128 * GB: (50, 2),    # 50 → ceiling 2（内存再多也不上抬）
+        1 * GB: (-3, 1),      # (1-8)/2.5 → 商 -3 → floor 1
+        4 * GB: (-2, 1),      # -1.6 → -2 → floor 1
+        6 * GB: (-1, 1),      # -0.8 → -1 → floor 1
+        10 * GB: (0, 1),      # 0.8 → 0 → floor 1
+        16 * GB: (3, 2),      # 3.2 → 3 → clamp ceiling 2（fake 16GB 机也压回物理上限）
+        128 * GB: (48, 2),    # 48 → ceiling 2（内存再多也不上抬）
     }
     for avail, (want_computed, want_max) in cases.items():
         _pin_available(monkeypatch, avail)
@@ -86,6 +88,21 @@ def test_formula_and_clamp_math_mac(monkeypatch):
         assert snap["computed"] == want_computed, (avail, snap)
         assert snap["max"] == want_max, (avail, snap)
         assert snap["probed"] is True and snap["legacy"] is False
+
+
+def test_profiles_headroom_pins_cache_era(monkeypatch):
+    """headroom 常量钉（2026-10-02 orch2-D）：mac/unknown=8.0=双 4GB prompt-cache
+    顶满的最坏增长面（旧值 2.0 是 2GB cap 年代）；cuda 档不动（计划档初始值）。
+    可用内存 8GB 的机器此前算出 2（clamp ceiling），现压到 floor=1——准入不
+    创造容量，宁可少放。"""
+    assert capacity.PROFILES["mac"]["headroom_gb"] == 8.0
+    assert capacity.PROFILES["unknown"]["headroom_gb"] == 8.0
+    assert capacity.PROFILES["cuda"]["headroom_gb"] == 4.0
+    # 8GB 可用：headroom 未回本 → computed=0 → floor 1（旧档为 clamp ceiling 2）
+    monkeypatch.setenv("BOK_DEPLOY_PROFILE", "mac")
+    _pin_available(monkeypatch, 8 * GB)
+    snap = capacity.capacity_snapshot()
+    assert snap["computed"] == 0 and snap["max"] == 1
 
 
 def test_mac_ceiling_two_is_physical_limit(monkeypatch):
@@ -198,13 +215,13 @@ def test_legacy_env_pins_and_skips_probe(monkeypatch):
 def test_cache_single_probe_and_env_key(monkeypatch):
     monkeypatch.setenv("BOK_DEPLOY_PROFILE", "mac")
     calls: list = []
-    _pin_available(monkeypatch, 12 * GB, record=calls)
-    assert capacity.compute_max_calls() == 2
+    _pin_available(monkeypatch, 16 * GB, record=calls)
+    assert capacity.compute_max_calls() == 2  # (16-8)/2.5=3 → clamp ceiling 2
     assert capacity.compute_max_calls() == 2
     assert len(calls) == 1, "30s 内高频建单只探测一次"
     # env 改键立刻失效（缓存键含 profile/legacy/floor/ceiling）
     monkeypatch.setenv("BOK_MAX_CALLS_CEILING", "5")
-    assert capacity.compute_max_calls() == 4  # 12GB → (12-2)/2.5=4 < ceiling 5
+    assert capacity.compute_max_calls() == 3  # 同 16GB → (16-8)/2.5=3 < ceiling 5
     assert len(calls) == 2
     # 显式 now 推过 TTL → 重探
     capacity.reset_cache()
@@ -315,7 +332,7 @@ def test_gate_rejects_with_capacity_breakdown(monkeypatch):
     审计同款结构字段；被拒通话不落库。"""
     monkeypatch.setenv("BOK_DEPLOY_PROFILE", "mac")
     monkeypatch.setenv("BOK_REQUIRE_TEMPLATE", "0")
-    _pin_available(monkeypatch, 64 * GB)  # (64-2)/2.5=24 → clamp 到 ceiling 2
+    _pin_available(monkeypatch, 64 * GB)  # (64-8)/2.5=22.4 → 22 → clamp 到 ceiling 2
     capacity.reset_cache()
     client, repo, audits = _client_and_repo(monkeypatch)
     try:
@@ -326,11 +343,11 @@ def test_gate_rejects_with_capacity_breakdown(monkeypatch):
         assert r.status_code == 409, r.text
         detail = r.json()["detail"]
         assert isinstance(detail, str)
-        for frag in ("profile=mac", "floor=1", "computed=24", "ceiling=2", "free_gb=64.0"):
+        for frag in ("profile=mac", "floor=1", "computed=22", "ceiling=2", "free_gb=64.0"):
             assert frag in detail, (frag, detail)
         hit = [a for a in audits if a[0] == "call.reject_concurrency"]
         assert hit, audits
-        assert hit[0][1]["detail"]["computed"] == 24
+        assert hit[0][1]["detail"]["computed"] == 22
         assert hit[0][1]["detail"]["profile"] == "mac"
         assert len(repo.list_calls("")) == 2
     finally:
