@@ -364,6 +364,24 @@ def _qwen3_tts_sidecar_env(base: dict[str, str]) -> dict[str, str]:
     return env
 
 
+def _qwen3_asr_sidecar_env(base: dict[str, str]) -> dict[str, str]:
+    """ASR sidecar 启动 env：必填键 + `QWEN3_ASR_*` 前缀整族透传（2026-10-02，
+    镜像 `_qwen3_tts_sidecar_env` 先例）。
+
+    sidecar 是独立进程，`_FORWARD_ENV`（agent worker 表）不覆盖它——此前启动点
+    是硬编码最小集（MODEL/BACKEND/DEVICE/CONTENTION_YIELD/SV_*），而 sidecar
+    实际读 ~25 个 `QWEN3_ASR_*` 键（SAMPLE_RATE/INC_MIN_CPS/PARTIAL_*/
+    FINISH_*/TRIM_*/CONFIDENCE…）：调参键 dev 靠 `_start_proc` merge
+    `os.environ` 才活，prod 封闭 env 结构性不可调（TTS 先例同款死门）。
+    前缀整族透传：新增 sidecar 调参键自动可达，不用回改本函数。空值不透传
+    （必填键优先）。BOK_ASR_ENGINE / QWEN3_ASR_DEVICE 仍由启动点显式处理。"""
+    env = dict(base)
+    for key, val in os.environ.items():
+        if key.startswith("QWEN3_ASR_") and val != "":
+            env.setdefault(key, val)
+    return env
+
+
 def resolve_llm_repo(current: dict[str, str]) -> str:
     """选定要启动/注入的本地 LLM repo：设置页 local_model 优先 → 档位 env
     （`BOK_LLM_TIER=4b` 且表内 `llm_4b` 非空）→ 表默认 `llm`。
@@ -405,6 +423,15 @@ def _settle_llm_model(current: dict[str, str]) -> str:
     if override:
         return override
     return model_path(current, "settle")
+
+
+def _settle_cache_bytes() -> str:
+    """:1237 prompt-cache-bytes 档位：``BOK_SETTLE_CACHE_BYTES`` 显式覆盖 >
+    缺省 4GB（2026-10-02 编排审计第二波——该键此前只活在注释里，argv 恒硬编码
+    4GB，注释承诺的「16GB 机型可显式下调」旋钮实际不存在）。与 :1235 的
+    ``BOK_LLM_PROMPT_CACHE_BYTES`` 覆盖独立（两进程各自预算）。空/空白=未设。"""
+    override = os.environ.get("BOK_SETTLE_CACHE_BYTES", "").strip()
+    return override or "4GB"
 
 
 def _usable_laya_dir(path: Path) -> bool:
@@ -752,6 +779,44 @@ WORKER_PORTS: tuple[tuple[str, int], ...] = (
     ("interp-fwd", 8082),
     ("interp-rev", 8083),
 )
+
+
+def _agent_worker_port() -> int:
+    """A 线 agent worker 端口：``BOK_WORKER_PORT`` 覆盖（单机多栈并存错开），
+    缺省 8081 零漂移（2026-10-02 编排审计第二波）。
+
+    worker 进程自身读该键（agent.py ``_worker_port``），但 bok.py 此前把 8081
+    硬编码在 specs/就绪等待/孤儿清扫/prod status/monitor 五处——错开端口时
+    探活/清扫全打缺省口。非法值（空/非数字/越界）回缺省，绝不把探活指去死口。
+    B 线 interp fwd/rev（8082/8083）不读该键，保持固定。"""
+    raw = (os.environ.get("BOK_WORKER_PORT") or "").strip()
+    if not raw:
+        return 8081
+    try:
+        port = int(raw)
+    except ValueError:
+        return 8081
+    return port if 0 < port < 65536 else 8081
+
+
+def _worker_ports() -> tuple[tuple[str, int], ...]:
+    """``WORKER_PORTS`` 的动态版：agent-worker 口吃 ``_agent_worker_port()``，
+    interp 两件固定。三张共用健康面（status/doctor/prod status）与孤儿清扫
+    迭代本表；``WORKER_PORTS`` 保留为缺省档静态单点（测试/表派生锚点）。"""
+    return (
+        ("agent-worker", _agent_worker_port()),
+        ("interp-fwd", 8082),
+        ("interp-rev", 8083),
+    )
+
+
+def _desktop_stack_targets() -> list[int]:
+    """cmd_serve 就绪等待的桌面栈基础口表：control-plane/asr/llm/livekit +
+    三 worker（agent 口吃 ``_agent_worker_port()``）。8788/1236/8084/3000 按
+    运行时条件由调用方追加，不在本表。"""
+    return [8000, 8787, 1235, 7880, _agent_worker_port(), 8082, 8083]
+
+
 # prod status 基础 HTTP 检查（mt/settle 是可选增强，起了才动态追加；llm-raw
 # 同属可选线——queue proxy 拓扑在 + 代理活着才进表，见
 # _llm_raw_status_check_expected）。
@@ -896,6 +961,10 @@ def _relaxed_healthy(port: int, timeout_s: float = 5.0) -> bool:
     优先 HTTP——任何应答都算活（426/404/5xx 与 prod status 同款语义：本体
     作答=进程在）；无 HTTP 面的端口退 TCP 连接探测。"""
     path = _SWEEP_HTTP_PATHS.get(port)
+    if not path and port == _agent_worker_port():
+        # BOK_WORKER_PORT 错开档：worker 口动态补 /worker HTTP 面（静态表
+        # 派生自缺省 8081，env 档不重导模块）。
+        path = "/worker"
     if path:
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=timeout_s):
@@ -1176,7 +1245,7 @@ def cmd_status() -> int:
     # worker 三件(2026-09-12 上表;2026-09-17 起读真 /worker 端点):serve 竞态令
     # worker 静默缺失、或进程在而没 register 时,TCP UP 仍全绿——「看着正常其实
     # 通话全灭」。端点本体才见 agent_name/worker_load。
-    for name, port in WORKER_PORTS:
+    for name, port in _worker_ports():
         ok, detail = _probe_worker(port, timeout=2.0)
         print(f"  {name:<13} :{port:<6} {detail if ok else 'DOWN'}")
     # M-11（2026-09-23 修复波#3）云 TTS 配额健康：本地端口全绿 ≠ 云配额活着
@@ -1833,12 +1902,18 @@ def _start_settle_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> 
     # 2948 tok 全量 prefill 16s(与 28 tok 装配 prewarm 同线程交替)=首 token
     # 3s 超时→fallback→LATE_ANSWER 坏标记链。与 :1235 同档 4GB;十八波「2GB=
     # 内存预算真闸门」的判断基于云 TTS 前的全栈 27GB 常驻年代,现云姿态栈
-    # ~12GB+9B 权重 5.3GB,4GB cache 总预算充裕(16GB 机型可 BOK_SETTLE_CACHE_BYTES
-    # 显式下调……本键直改档位,与 :1235 的 BOK_LLM_PROMPT_CACHE_BYTES 覆盖独立)。
+    # ~12GB+9B 权重 5.3GB,4GB cache 总预算充裕。
+    # BOK_SETTLE_CACHE_BYTES 做实（2026-10-02 审计）：档位=env 覆盖>缺省 4GB
+    # （16GB 机型显式下调；与 :1235 的 BOK_LLM_PROMPT_CACHE_BYTES 独立），
+    # tier 打点镜像 :1235 的 explicit/default 先例。
+    _cache_bytes = _settle_cache_bytes()
+    _cache_tier = ("explicit" if os.environ.get("BOK_SETTLE_CACHE_BYTES", "").strip()
+                   else "default")
+    print(f"[bok] settle prompt-cache {_cache_bytes} (tier={_cache_tier})")
     _start_proc(
         [str(llm_py), str(MLX_SERVER_WRAPPER),
          "--model", settle_model, "--host", "127.0.0.1", "--port", "1237",
-         "--prompt-cache-size", "128", "--prompt-cache-bytes", "4GB",
+         "--prompt-cache-size", "128", "--prompt-cache-bytes", _cache_bytes,
          "--chat-template-args", '{"enable_thinking":false}', "--log-level", _log_level],
         run_dir / "settle-llm.pid",
         log_dir / "settle-llm.log",
@@ -1933,7 +2008,7 @@ def _start_call_plane(py) -> bool:
     return True
 
 
-def cmd_up() -> int:
+def cmd_up(models_only: bool = False) -> int:
     """全栈拉起（node_agent 与 serve 共用）：服务面 + 通话面。
 
     Ubuntu 节点形态修复（2026-09-20）：旧 cmd_up 只起服务面（sidecar/LLM/b-line），
@@ -1941,15 +2016,24 @@ def cmd_up() -> int:
     通话面现已提取为 _start_call_plane（与 serve 同源）。返回码沿用服务面语义：
     通话面未齐只打 stderr 不篡改服务面结果（由调用方就绪等待如实失败，健康面
     doctor 呈现 degrad）。
+
+    ``models_only=True``（`bok up --models-only`，2026-10-02 审计）：只拉模型面
+    （服务面：asr/llm/mt/settle/tts+proxy），跳过通话面（livekit/worker/monitor）
+    ——重启后模型面由可选常驻单元 `bok-model-plane` 补拉（`prod install
+    --with-model-plane`，默认 OFF），通话面归既有单元，人工零介入。
     """
-    rc = _cmd_up_services()
+    # 缺省档零参调用（既有 stub/调用方逐字节兼容）；仅显式 --models-only 传参。
+    rc = _cmd_up_services(models_only=True) if models_only else _cmd_up_services()
     if rc:
         return rc
+    if models_only:
+        print("[bok] models-only: 模型面就绪——通话面（livekit/worker/monitor）跳过")
+        return 0
     _start_call_plane(repo_python())
     return 0
 
 
-def _cmd_up_services() -> int:
+def _cmd_up_services(models_only: bool = False) -> int:
     run_dir = app_data_dir() / "run"
     log_dir = app_data_dir() / "logs"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -2002,7 +2086,10 @@ def _cmd_up_services() -> int:
             [str(asr_py), "-m", "uvicorn", "app:app", "--app-dir", "services/qwen3-asr-sidecar",
              "--host", "127.0.0.1", "--port", "8787"],
             run_dir / "asr.pid", log_dir / "asr.log",
-            env=asr_env,
+            # 前缀整族透传（2026-10-02）：sidecar 专属调参键 prod 封闭 env 可达
+            # （TTS `_qwen3_tts_sidecar_env` 先例；BOK_ASR_ENGINE/DEVICE 已在上
+            # 方显式进 asr_env）。
+            env=_qwen3_asr_sidecar_env(asr_env),
         )
     tts_needed, tts_why = _local_tts_needed()
     if tts_needed and not healthy(8788):
@@ -2071,9 +2158,10 @@ def _cmd_up_services() -> int:
         + ((8791,) if want_laya else ())
     )
     mt_ready_suffix = " mt=1236" if want_mt else ""
+    mo_suffix = " (models-only)" if models_only else ""
     for _ in range(180):
         if all(healthy(p) for p in targets):
-            print(f"[bok] ready: asr=8787 {tts_ready} llm=1235{mt_ready_suffix}")
+            print(f"[bok] ready: asr=8787 {tts_ready} llm=1235{mt_ready_suffix}{mo_suffix}")
             return 0
         time.sleep(1)
     # TTS 首启偶发卡死在 MLX 模型加载/暖机（观察：与 LLM/ASR 同启时概率出现，
@@ -2632,7 +2720,10 @@ def _worker_specs(py) -> list[dict]:
     specs = [
         {
             "name": "agent",
-            "port": 8081,
+            # BOK_WORKER_PORT 动态口（2026-10-02 审计）：spec 口必须与 worker
+            # 进程实际 bind 的口一致（env 经 _FORWARD_ENV 透传），否则健康面
+            # 探活/跳过判定全打缺省口。缺省 8081 零漂移。
+            "port": _agent_worker_port(),
             "pidfile": run_dir / "agent.pid",
             "logfile": log_dir / "agent.log",
             "argv": [str(py), "-m", "agent_runtime.main"],
@@ -2724,6 +2815,33 @@ def _pidfile_alive_stamped(pidfile: Path) -> bool:
     if not cur:
         return True  # ps 读不出（如 Windows 无 ps）：保守当活
     return cur == parts[1]
+
+
+def _pid_reused_stale(pidfile: Path, pid: int) -> bool:
+    """pidfile 指向的 pid 是否已被无关进程复用（down 清杀前置闸，2026-10-02）。
+
+    判据=来源戳 ``proc-<pid>.root`` 记的 lstart 与 live 进程 ``ps -o lstart=``
+    现值不一致（与 ``_pidfile_alive_stamped`` 同款比对——该判据此前只接
+    monitor 单例判定，清杀路径缺失 = stale pidfile 的 pid 被复用时来源「未知」
+    fail-open 照杀，误杀无辜进程）。戳搜索面=pidfile 同目录 + app-data ``run/``
+    （legacy ``data/sidecar-*.pid`` 的戳落在 run 面）。无戳（旧式启动）/坏戳/
+    ps 读不出 → False（fail-open 旧语义：无戳遗留照杀，未知绝不挡杀——与
+    ``_pid_origin_foreign`` 同纪律）。"""
+    recorded = ""
+    for base in (pidfile.parent, app_data_dir() / "run"):
+        try:
+            parts = (base / f"proc-{pid}.root").read_text().strip().split("\t")
+        except Exception:
+            continue
+        if len(parts) == 2 and parts[1]:
+            recorded = parts[1]
+            break
+    if not recorded:
+        return False
+    cur = _ps_field(pid, "lstart=")
+    if not cur:
+        return False
+    return cur != recorded
 
 
 class _KillTreeError(RuntimeError):
@@ -2903,7 +3021,7 @@ def cmd_monitor() -> int:
     # 单例（双监控环）、跨树杀守卫对无戳进程不保护。经 _start_proc 拉起时同
     # 内容写两次，幂等无害。
     _write_proc_stamps(run_dir / "monitor.pid", os.getpid())
-    print("[monitor] started — watching :7880 + workers 8081/8082/8083")
+    print(f"[monitor] started — watching :7880 + workers {_agent_worker_port()}/8082/8083")
     lk_up = healthy(7880)
     last_action = 0.0
     down_streak: dict[str, int] = {}
@@ -3063,7 +3181,9 @@ def cmd_serve() -> int:
 
     print("[bok] waiting for desktop stack…")
     desktop_tts_needed = _local_tts_needed()[0]
-    targets = [8000, 8787, 1235, 7880, 8081, 8082, 8083]
+    # 基础口表吃 _desktop_stack_targets()（agent worker 口=BOK_WORKER_PORT 动态；
+    # 2026-10-02 审计——旧版硬编码 8081，错开档就绪等待永远打缺省口）。
+    targets = _desktop_stack_targets()
     if desktop_tts_needed:
         targets.insert(2, 8788)
     if _realtime_demo_enabled():
@@ -3122,6 +3242,12 @@ def cmd_down() -> int:
             print(f"[down] skip {pidfile.stem}: pid {pid} 属另一代码树（{root}）"
                   "——他树进程永不收割（先在对方树 down）", file=sys.stderr)
             continue
+        # pid 复用闸（2026-10-02 审计）：来源戳 lstart 与 live 进程对不上 =
+        # stale pidfile 的 pid 已被无关进程复用——来源判「未知」会 fail-open
+        # 照杀（误杀无辜）；此处按铁证跳过。无戳遗留照旧语义杀。
+        if _pid_reused_stale(pidfile, pid):
+            print(f"[bok] stale pidfile {pidfile.stem} pid={pid} reused — skip kill")
+            continue
         # _start_proc 以 start_new_session=True 启动（会话组长）；按进程组
         # 终止可连 livekit-agents worker 的 multiprocessing 子进程一起清掉，
         # 避免子进程残留占用 8081 导致下次 agent 启动失败。
@@ -3143,6 +3269,10 @@ def cmd_down() -> int:
     for pidfile in data_dir.glob("sidecar-*.pid"):
         try:
             pid = int(pidfile.read_text().strip())
+            # pid 复用闸同款（2026-10-02 审计）：legacy 扫描面同样只杀真本树 pid。
+            if _pid_reused_stale(pidfile, pid):
+                print(f"[bok] stale pidfile {pidfile.stem} pid={pid} reused — skip kill")
+                continue
             os.kill(pid, signal.SIGTERM)
             print(f"[down] stopped {pidfile.stem} (pid {pid})")
         except Exception:
@@ -3349,6 +3479,19 @@ _ORPHAN_PORT_OWNERS: tuple[tuple[int, tuple[str, ...]], ...] = (
 )
 
 
+def _orphan_port_owners() -> tuple[tuple[int, tuple[str, ...]], ...]:
+    """``_ORPHAN_PORT_OWNERS`` 的动态版：A 线 worker 口吃
+    ``_agent_worker_port()``（BOK_WORKER_PORT 错开时孤儿清扫/身份复核仍对得上
+    真口；2026-10-02 审计），其余条目原样（interp 8082/8083 与静态表相同）。"""
+    agent_port = _agent_worker_port()
+    if agent_port == 8081:
+        return _ORPHAN_PORT_OWNERS
+    return tuple(
+        (agent_port, markers) if port == 8081 else (port, markers)
+        for port, markers in _ORPHAN_PORT_OWNERS
+    )
+
+
 def _sweep_orphan_listeners(kill: bool = True,
                             healthy_ok: bool = True) -> list[tuple[int, str, int]]:
     """端口级孤儿兜底（2026-09-17 殭尸专项）：按 bok 端口表逐口查 LISTEN 进程，
@@ -3371,7 +3514,7 @@ def _sweep_orphan_listeners(kill: bool = True,
     if os.name == "nt":
         return swept
     _sweep_stale_root_markers()
-    for port, markers in _ORPHAN_PORT_OWNERS:
+    for port, markers in _orphan_port_owners():
         try:
             out = subprocess.run(
                 ["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
@@ -3649,6 +3792,24 @@ def _warn_memory_posture(fails: list[str], *, packaged: bool) -> None:
             fails.append(msg)
 
 
+# queue_proxy 租约看门狗打点字面量（services/llm-mlx/queue_proxy.py
+# `[llm-queue] lease-timeout forced-reclaim ...`）——doctor 计数面单点，防两侧
+# 字面量漂移假绿（test_doctor_blind_spots 有源级 pin）。
+_LEASE_TIMEOUT_MARKER = "lease-timeout forced-reclaim"
+
+
+def _doctor_queue_proxy_lease_timeouts(log_dir: Path) -> int | None:
+    """llm-proxy.log 里租约看门狗打点计数（None=日志不存在/读不出）。
+
+    队列代理的槽泄漏/断连僵尸回收证据全在这行——doctor 汇总一行数字面
+    （informational：历史累计非当前故障，要判窗看行内时间戳）。"""
+    try:
+        text = (log_dir / "llm-proxy.log").read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    return text.count(_LEASE_TIMEOUT_MARKER)
+
+
 def cmd_doctor() -> int:
     """Preflight diagnostics. In packaged mode every check is a hard gate."""
     key = platform_key()
@@ -3751,7 +3912,7 @@ def cmd_doctor() -> int:
         print(f"  port {port:<5} ({name}): {'UP' if healthy(port) else 'DOWN'}")
     # worker 探针读端点本体(TCP UP 对错码/未 register 假活不可见);缺席只打印
     # 不判死——打包 doctor 在栈未起时也要能跑。
-    for name, port in WORKER_PORTS:
+    for name, port in _worker_ports():
         ok, detail = _probe_worker(port)
         print(f"  worker {port:<5} ({name}): {detail}")
     # LLM 功能探针:端口 UP ≠ 能用,见 _probe_llm docstring; informational
@@ -3780,6 +3941,22 @@ def cmd_doctor() -> int:
             # worker(interpret 守卫兜底回退主 LLM)——诊断面对同一错配不能零输出。
             print(f"  mt 功能探针: SKIP (MT 模型缺失/非法: {mt_model[:60] or 'unset'})"
                   " — B 线已回退主 LLM,查 MT_LLM_MODEL/MODELS 表")
+
+    # a_reply 专线功能探针（:1237，2026-10-02 审计补盲）：P2 翻档后 :1237 是
+    # 通话回复主脑（9B 专线），此前 doctor 只探 :1235/:1236——:1237 wedge 时
+    # 通话回复直接灭而 doctor 全绿。同 _probe_llm max_tokens=1 形状（显式在盘
+    # 模型路径），informational 不进 fails（冷启动页入同 :1235 语义）。
+    if healthy(1237):
+        _ar_model = _settle_llm_model(current)
+        if _ar_model and Path(_ar_model).exists():
+            ar_ok, ar_detail = _probe_llm("http://127.0.0.1:1237/v1", model=_ar_model)
+            print(f"  a_reply 功能探针(:1237): {ar_detail}")
+            if not ar_ok:
+                print("    (a_reply 专线端口 UP 但 prefill 探针失败——通话回复会灭;"
+                      "重跑 doctor 区分冷启动)")
+        else:
+            print(f"  a_reply 功能探针(:1237): SKIP (9B 模型缺失/非法: "
+                  f"{_ar_model[:60] or 'unset'}) — a_reply 回退 :1235")
 
     # /api/token 必须是真 JWT（三段式）；否则 A 线 UI 永远“接通失败”。
     if healthy(8000):
@@ -3857,6 +4034,13 @@ def cmd_doctor() -> int:
             print(f"  cloud-tts 配额面: FAIL (近 {_ph['window_s']:.0f}s 2056×{_ph['quota_2056']['count']} 限流×{_ph['rate_limit']['count']})")
         else:
             print(f"  cloud-tts 配额面: ok (近 {_ph['window_s']:.0f}s 无 2056/限流打点)")
+
+    # queue_proxy 租约看门狗计数（2026-10-02 审计补盲）：槽泄漏/断连僵尸的
+    # 代理侧证据（lease-timeout forced-reclaim）此前无人汇总。informational
+    # 不进 fails——历史累计非当前故障；日志缺席静默（dev 非代理拓扑常态）。
+    _lease_n = _doctor_queue_proxy_lease_timeouts(app_data_dir() / "logs")
+    if _lease_n is not None:
+        print(f"doctor: queue_proxy lease_timeouts={_lease_n}")
 
     if packaged and fails:
         print("\nPACKAGED DOCTOR FAILED:")
@@ -3964,9 +4148,14 @@ def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
     return env
 
 
-def _prod_units() -> list[tuple[str, list[str], dict[str, str], str]]:
+def _prod_units(with_model_plane: bool = False) -> list[tuple[str, list[str], dict[str, str], str]]:
     """生产常驻单元清单（mac plists 与 Windows Task Scheduler 任务共用同一份定义，
-    含完整 env（SSL_CERT_FILE 烘焙后），防两平台定义漂移）。"""
+    含完整 env（SSL_CERT_FILE 烘焙后），防两平台定义漂移）。
+
+    ``with_model_plane=True``（opt-in，`prod install --with-model-plane`，2026-10-02
+    审计）：追加 `bok-model-plane` 单元跑 `bok up --models-only`（RunAtLoad 开机
+    补拉模型面 + KeepAlive 幂等重扫；重启后 :8787/:1235/:1236/:1237/:1239 不再
+    等人工）。默认 False——既有装机渲染逐字节零变化。"""
     agent_env = _agent_prod_env()
     livekit_bin = str(_embedded_livekit() or "livekit-server")
     py = repo_python()
@@ -3978,6 +4167,19 @@ def _prod_units() -> list[tuple[str, list[str], dict[str, str], str]]:
         ("bok-interp-fwd", [str(py), "-m", "agent_runtime.interpret"], {**_interp_env(agent_env), "BOK_SERVICE": "interp-fwd", "INTERP_DIRECTION": "fwd"}, "B 线同传 fwd"),
         ("bok-interp-rev", [str(py), "-m", "agent_runtime.interpret"], {**_interp_env(agent_env), "BOK_SERVICE": "interp-rev", "INTERP_DIRECTION": "rev"}, "B 线同传 rev"),
     ]
+    if with_model_plane:
+        # 模型面常驻（opt-in）：`bok up --models-only` 幂等（health 门防叠进程）
+        # ——RunAtLoad 开机补拉；KeepAlive 让 launchd 周期重扫（进程退出即被
+        # 10s 节流重启），模型面掉线不等人。env 用 agent 面（BOK_CP_TOKEN 等
+        # passthrough 在内，download 与 CP 探测同源）。
+        units.append(
+            (
+                "bok-model-plane",
+                [str(py), str(Path(__file__).resolve()), "up", "--models-only"],
+                agent_env,
+                "模型面常驻（asr/llm/mt/settle/tts；bok up --models-only 幂等重扫）",
+            )
+        )
     if _realtime_demo_enabled():
         # 演示档常驻单元（opt-in，同 _worker_specs 门）：BOK_QWEN_REALTIME=1 才
         # 生成 launchd/schtasks/systemd 单元——健康面 WORKER_PORTS 不收 :8084
@@ -4014,7 +4216,8 @@ def _systemd_staging_dir(explicit: str = "") -> Path:
 
 
 def cmd_prod_install(node_agent: bool = False, node_args: list[str] | None = None,
-                     open_firewall: bool = False, staging_dir: str = "") -> int:
+                     open_firewall: bool = False, staging_dir: str = "",
+                     with_model_plane: bool = False) -> int:
     """生成生产常驻单元（mac launchd plist / Windows Task Scheduler / Linux
     systemd 暂存），不启动。
 
@@ -4034,6 +4237,11 @@ def cmd_prod_install(node_agent: bool = False, node_args: list[str] | None = Non
         <repo>/release-artifacts/systemd/），**永不写 /etc/systemd/system**；
       - 输出打印 cp + daemon-reload + enable --now 逐字装载指引（root 执行）；
       - /etc/bok/bok.env 由操作员维护（示例文本随输出打印，本工具不代写）。
+    --with-model-plane（opt-in，默认 OFF；mac/Windows 档）：追加
+      `bok-model-plane` 常驻单元跑 `bok up --models-only`——重启后模型面
+      （:8787/:1235/:1236/:1237/:1239）由 launchd/schtasks 补拉，不再等人工。
+      默认不传 = 既有装机渲染逐字节零变化；Linux systemd 档暂不接（单元面
+      由 systemd_units 模块单点，另窗收编）。
     """
     if is_mac() and node_agent:
         print("[prod] --node-agent 是 Windows 节点拓扑模式；mac 全栈机用标准 5 单元安装",
@@ -4047,7 +4255,7 @@ def cmd_prod_install(node_agent: bool = False, node_args: list[str] | None = Non
         log_dir.mkdir(parents=True, exist_ok=True)
         if open_firewall:
             print("[prod] --open-firewall 是 Windows(netsh) 专用；mac 走系统防火墙应用签名规则，忽略")
-        for name, args, env, comment in _prod_units():
+        for name, args, env, comment in _prod_units(with_model_plane=with_model_plane):
             label = f"com.bokvoice.{name}"
             arg_xml = "\n".join(f"    <string>{a}</string>" for a in args)
             env_xml = "\n".join(f"      <key>{k}</key>\n      <string>{v}</string>" for k, v in sorted(env.items()))
@@ -4146,7 +4354,7 @@ def cmd_prod_install(node_agent: bool = False, node_args: list[str] | None = Non
             "薄节点守护（cmd_up 拉全栈 + 心跳；参数原样透传 node_agent）",
         )]
     else:
-        units = _prod_units()
+        units = _prod_units(with_model_plane=with_model_plane)
 
     comspec = os.environ.get("ComSpec", "cmd.exe")
     install_ok = True
@@ -4193,7 +4401,13 @@ def cmd_prod_uninstall(staging_dir: str = "") -> int:
     unit_dir = app_data_dir() / "units"
     failures = 0
     if is_mac():
-        for name, _args, _env, _comment in _prod_units():
+        names = [u[0] for u in _prod_units()]
+        # opt-in 模型面单元（--with-model-plane，2026-10-02）：默认清单不含它——
+        # 装过的机器卸载不能残留（bootout+删 plist）；未装=plist 不在,静默
+        # （零输出变化，不骗 not installed）。
+        if (unit_dir / "com.bokvoice.bok-model-plane.plist").exists():
+            names.append("bok-model-plane")
+        for name in names:
             label = f"com.bokvoice.{name}"
             plist = unit_dir / f"{label}.plist"
             if not plist.exists():
@@ -4234,6 +4448,10 @@ def cmd_prod_uninstall(staging_dir: str = "") -> int:
     import schtasks_units as _sch
 
     names = [u[0] for u in _prod_units()] + ["node-agent"]
+    # opt-in 模型面任务（--with-model-plane，2026-10-02）：装过才补进卸载面
+    # （xml 副本是「装过」的廉价判据；默认 OFF 的既有装机零输出变化）。
+    if (unit_dir / f"{_sch.task_name('bok-model-plane')}.xml").exists():
+        names.append("bok-model-plane")
     # /end 只终止任务实例的 Exec 动作进程（本仓恒为 cmd.exe），cmd_up 拉起的
     # 链式子进程（ASR/TTS/LLM/LiveKit/CP/worker）会存活——scripts/
     # probe_windows_lifecycle.py B5b 在真 Windows 上断言这一点。顺序：
@@ -4322,7 +4540,7 @@ def cmd_prod_status() -> int:
         except Exception as exc:
             print(f"  {name:<13} :{port}  DOWN ({exc})")
             all_ok = False
-    for name, port in WORKER_PORTS:
+    for name, port in _worker_ports():
         ok, detail = _probe_worker(port)
         print(f"  {name:<13} :{port}  {detail}")
         all_ok = all_ok and ok
@@ -4332,11 +4550,13 @@ def cmd_prod_status() -> int:
 
 def cmd_prod(cmd: str, node_agent: bool = False,
              node_args: list[str] | None = None,
-             open_firewall: bool = False, staging_dir: str = "") -> int:
+             open_firewall: bool = False, staging_dir: str = "",
+             with_model_plane: bool = False) -> int:
     if cmd == "install":
         return cmd_prod_install(node_agent=node_agent, node_args=node_args,
                                 open_firewall=open_firewall,
-                                staging_dir=staging_dir)
+                                staging_dir=staging_dir,
+                                with_model_plane=with_model_plane)
     if cmd == "uninstall":
         return cmd_prod_uninstall(staging_dir=staging_dir)
     return cmd_prod_status()
@@ -4345,8 +4565,12 @@ def cmd_prod(cmd: str, node_agent: bool = False,
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="bok", description="Bok voice stack launcher (no Docker)")
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("catalog", "manifest", "status", "up", "serve", "down", "doctor", "tts-mine", "clean-testdata", "monitor"):
+    for name in ("catalog", "manifest", "status", "serve", "down", "doctor", "tts-mine", "clean-testdata", "monitor"):
         sub.add_parser(name)
+    p_up = sub.add_parser("up", help="拉起全栈；--models-only=只拉模型面（跳过通话面）")
+    p_up.add_argument("--models-only", action="store_true",
+                      help="只起模型面（asr/llm/mt/settle/tts+proxy；云 TTS 档跳过 :8788），"
+                           "不拉 LiveKit/worker/monitor（prod 常驻单元 bok-model-plane 用）")
     p_dl = sub.add_parser("download", help="下载平台模型表（--only 子集=装机选型）")
     p_dl.add_argument("--only", nargs="*", default=None,
                       help="只下载指定模型键（asr tts_preset tts_clone llm llm_4b mt settle embedding laya）")
@@ -4362,6 +4586,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="[install/uninstall;Linux] systemd 单元暂存目录"
                              "（缺省 <repo>/release-artifacts/systemd；"
                              "BOK_SYSTEMD_STAGING_DIR 同义，旗标优先）")
+    p_prod.add_argument("--with-model-plane", action="store_true",
+                        help="[install;mac/Windows] 追加 opt-in 常驻单元 "
+                             "bok-model-plane（bok up --models-only，重启补拉模型面；"
+                             "缺省 OFF=既有装机零变化）")
     p_setup = sub.add_parser("setup", help="First-run model readiness / download")
     p_setup.add_argument("action", nargs="?", default="status", choices=["status", "download"])
     # tts-pregen/tts-mine 参数原样透传给执行脚本,顶层不做校验
@@ -4462,7 +4690,8 @@ def main(argv=None) -> int:
                         node_agent=getattr(args, "node_agent", False),
                         node_args=getattr(args, "extra", None),
                         open_firewall=getattr(args, "open_firewall", False),
-                        staging_dir=getattr(args, "staging_dir", ""))
+                        staging_dir=getattr(args, "staging_dir", ""),
+                        with_model_plane=getattr(args, "with_model_plane", False))
     if args.cmd == "tts-pregen":
         return cmd_tts_pregen(getattr(args, "extra", None))
     if args.cmd == "clean-testdata":
@@ -4474,8 +4703,10 @@ def main(argv=None) -> int:
     if args.cmd == "download":
         only = set(getattr(args, "only", None) or []) or None
         return cmd_download(only=only)
+    if args.cmd == "up":
+        return cmd_up(models_only=bool(getattr(args, "models_only", False)))
     return {"catalog": cmd_catalog, "manifest": cmd_manifest, "status": cmd_status,
-            "up": cmd_up, "serve": cmd_serve, "down": cmd_down, "doctor": cmd_doctor}[args.cmd]()
+            "serve": cmd_serve, "down": cmd_down, "doctor": cmd_doctor}[args.cmd]()
 
 
 if __name__ == "__main__":
