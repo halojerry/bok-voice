@@ -17,6 +17,7 @@ from agent_runtime.voice_style import (
     make_tts_voice_style_transform,
     sanitize_speech_text,
     strip_voice_style,
+    voice_style_enabled_for_model,
     voice_style_enabled_for_tts,
 )
 from agent_runtime.providers.livekit_plugins import ContextState
@@ -127,3 +128,159 @@ def test_prefix_naturalness_block_gated():
     assert NATURALNESS_BLOCK not in base
     # 置位后前缀=置位前前缀+块（整场字节静态;块只增不改既有段）
     assert on.startswith(base)
+
+
+# ---------------------------------- 门控修正回归（2026-09-27 真人感哑火根因）
+
+class _WrappedLikeProduction:
+    """模拟生产包裹链的公开面：FallbackAdapter/CachedTTS/_FirstAudioTTS 只透出
+    插件类名级 `.model`（"minimax-tts"），不透出 `_model()`/`resolved_model()`
+    ——旧探针对这个形状判 "2.8" 恒 False，人感管线整线哑火的根因形状。"""
+
+    model = "minimax-tts"
+
+
+def test_gate_wrapped_provider_regression(monkeypatch):
+    monkeypatch.delenv("MINIMAX_MODEL", raising=False)
+    # 规范入口=模型显式门（agent.py 装配从 _tts_primary.resolved_model() 单点取）
+    assert voice_style_enabled_for_model("speech-2.8-hd")
+    assert voice_style_enabled_for_model("speech-2.8-turbo")
+    assert not voice_style_enabled_for_model("speech-2.6-turbo")
+    # 空模型（qwen3/volcano/fake 车道 _tts_primary=None）=门关，
+    # 不回落 env 默认档把标记喂给本地 sidecar。
+    assert not voice_style_enabled_for_model("")
+    # 陷阱钉死：生产包裹形状下 provider 探测版恒 False——它只准喂裸实例
+    assert not voice_style_enabled_for_tts(_WrappedLikeProduction())
+    assert voice_style_enabled_for_tts(_FakeTTS("speech-2.8-hd"))
+
+
+def test_agent_assembly_pins_model_explicit_gate():
+    """源级 pin：装配点必须用模型显式门（对包裹实例探属性的旧姿势已实证哑火）。"""
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parents[1]
+        / "apps" / "agent" / "agent_runtime" / "agent.py"
+    ).read_text(encoding="utf-8")
+    assert "voice_style_enabled_for_model(_voice_style_model)" in src
+    assert "voice_style_enabled_for_tts(tts_provider)" not in src
+
+
+def test_minimax_prep_outbound_strips_tags_on_26(monkeypatch):
+    """非 2.8 实例（FallbackAdapter 备档 2.6）出站前剥标记；2.8 主档原样透传。"""
+    from agent_runtime.providers.livekit_plugins import MiniMaxTTS
+
+    monkeypatch.delenv("MINIMAX_MODEL", raising=False)
+    t26 = MiniMaxTTS(voice="v", api_key="k", model_override="speech-2.6-turbo")
+    out = t26._prep_outbound("(emm)您稍等<#0.3#>我帮您查一下")
+    assert "(emm)" not in out and "<#" not in out and "我帮您查一下" in out
+    # 2.8 主档（env 缺省 speech-2.8-hd）：透传不碰
+    t28 = MiniMaxTTS(voice="v", api_key="k")
+    assert t28._prep_outbound("(emm)您稍等<#0.3#>我帮您查一下") == "(emm)您稍等<#0.3#>我帮您查一下"
+
+
+def test_minimax_stream_pins_prep_outbound():
+    """源级 pin：两条流式类 push_text 都过 _prep_outbound、synthesize 同源。"""
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parents[1]
+        / "apps" / "agent" / "agent_runtime" / "providers" / "livekit_plugins.py"
+    ).read_text(encoding="utf-8")
+    assert src.count("def push_text(self, text: str = \"\", *args, **kwargs):") == 2
+    assert src.count("self._tts_._prep_outbound(str(text or \"\"))") == 2
+    assert "text = self._prep_outbound(lecture_guard(" in src
+
+
+# ------------------------------------------------ 换气注入（2026-09-27 断句换气）
+
+_LONG1 = "这个订单的赔付记录和物流信息我都帮您查过了"  # 21 字 ≥ 默认阈值 20
+_NEXT = "接下来给您讲三种方案"
+_SHORT_A = "您先别急"
+_SHORT_B = "我马上帮您看"
+
+
+def _breath_env(monkeypatch, on="1", chars=None):
+    monkeypatch.delenv("BOK_A_LINE_VOICE_TAGS", raising=False)
+    monkeypatch.setenv("BOK_BREATH_INJECT", on)
+    if chars is None:
+        monkeypatch.delenv("BOK_BREATH_SENT_CHARS", raising=False)
+    else:
+        monkeypatch.setenv("BOK_BREATH_SENT_CHARS", chars)
+
+
+def test_breath_inject_after_long_sentence_cross_chunk(monkeypatch):
+    _breath_env(monkeypatch)
+    tr = make_tts_voice_style_transform(True)
+    out = _drain(tr, [_LONG1 + "。", _NEXT + "。"])
+    assert out.count("(breath)") == 1
+    assert "(breath)接下来" in out.replace(" ", "")
+
+
+def test_breath_inject_after_long_sentence_same_chunk(monkeypatch):
+    _breath_env(monkeypatch)
+    tr = make_tts_voice_style_transform(True)
+    out = _drain(tr, [_LONG1 + "。" + _NEXT + "。"])
+    assert out.count("(breath)") == 1
+    assert "。(breath)接下来" in out.replace(" ", "")
+
+
+def test_breath_inject_split_mid_sentence(monkeypatch):
+    """长句被流式切块劈开：字数跨块累计，句界照触发。"""
+    _breath_env(monkeypatch)
+    tr = make_tts_voice_style_transform(True)
+    out = _drain(tr, [_LONG1[:10], _LONG1[10:] + "。", _NEXT + "。"])
+    assert out.count("(breath)") == 1
+
+
+def test_breath_inject_short_sentences_noop(monkeypatch):
+    _breath_env(monkeypatch)
+    tr = make_tts_voice_style_transform(True)
+    out = _drain(tr, [_SHORT_A + "。", _SHORT_B + "。", "好的。"])
+    assert "(breath)" not in out
+
+
+def test_breath_inject_env_off(monkeypatch):
+    _breath_env(monkeypatch, on="0")
+    tr = make_tts_voice_style_transform(True)
+    out = _drain(tr, [_LONG1 + "。" + _NEXT + "。"])
+    assert "(breath)" not in out
+
+
+def test_breath_inject_threshold_env(monkeypatch):
+    _breath_env(monkeypatch, chars="100")
+    tr = make_tts_voice_style_transform(True)
+    out = _drain(tr, [_LONG1 + "。" + _NEXT + "。"])
+    assert "(breath)" not in out
+
+
+def test_breath_inject_trailing_boundary_dropped(monkeypatch):
+    """回复在句界收尾：不换气（没人换完气就闭嘴）。"""
+    _breath_env(monkeypatch)
+    tr = make_tts_voice_style_transform(True)
+    out = _drain(tr, [_LONG1 + "。"])
+    assert "(breath)" not in out
+
+
+def test_breath_inject_max_one_per_reply(monkeypatch):
+    _breath_env(monkeypatch)
+    tr = make_tts_voice_style_transform(True)
+    out = _drain(tr, [_LONG1 + "。" + _LONG1 + "。" + _NEXT + "。"])
+    assert out.count("(breath)") == 1
+
+
+def test_breath_inject_dedup_with_llm_tag(monkeypatch):
+    """LLM 已在该句自发标记 → 不叠注（块内标记+句界同块也压得住）。"""
+    _breath_env(monkeypatch)
+    tr = make_tts_voice_style_transform(True)
+    out = _drain(tr, ["您稍等，(emm)我马上帮您查" + _LONG1[5:] + "。" + _NEXT + "。"])
+    assert out.count("(emm)") == 1
+    assert "(breath)" not in out
+
+
+def test_breath_inject_disabled_gate_no_inject(monkeypatch):
+    """门关（非 2.8 档 transform）=全剥，注入层同样不参与。"""
+    _breath_env(monkeypatch)
+    tr = make_tts_voice_style_transform(False)
+    out = _drain(tr, [_LONG1 + "。" + _NEXT + "。"])
+    assert "(breath)" not in out and "(emm)" not in out

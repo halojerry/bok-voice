@@ -4,6 +4,7 @@
   python scripts/pregen_tts.py --greetings            # 无变量脚本线全量
   python scripts/pregen_tts.py --objects              # 逐对象渲染开场白/收线/心跳
   python scripts/pregen_tts.py --greetings --objects  # 一次跑齐
+  python scripts/pregen_tts.py --greetings --object X # 直念步按对象 X 的变量渲染(缺省=账号最近更新对象)
   python scripts/pregen_tts.py --fillers              # 垫话按人设音色物化(全部启用人设)
   python scripts/pregen_tts.py --fillers --persona X  # 只给一个人设补物化垫话
   python scripts/pregen_tts.py --qa --all-personas    # QA 罐头 × 全部启用人设
@@ -80,7 +81,7 @@ Record = tuple[dict | None, str, str, str]
 _CP_RETRY_DELAYS = (1.0, 3.0)
 
 
-def _cp_get(base: str, path: str, token: str, *, opener=None) -> object:
+def _cp_get(base: str, path: str, token: str, *, opener=None, channel: bool = False) -> object:
     url = f"{base.rstrip('/')}{path}"
     opener = opener or urllib.request.urlopen
     last_exc: Exception | None = None
@@ -91,6 +92,11 @@ def _cp_get(base: str, path: str, token: str, *, opener=None) -> object:
         req = urllib.request.Request(url)
         if token:
             req.add_header("Authorization", f"Bearer {token}")
+        if channel:
+            # 机器通道自报(与运行时 agent ControlPlaneClient 同款头):
+            # GET /api/templates/{id} 据此吃 published_json 冻结 overlay
+            # (auth-off 单机形态;auth-on 下凭 token 已判机器通道,头无害)。
+            req.add_header("X-Bok-Channel", "agent")
         try:
             with opener(req, timeout=10) as resp:
                 return json.loads(resp.read().decode("utf-8"))
@@ -100,6 +106,30 @@ def _cp_get(base: str, path: str, token: str, *, opener=None) -> object:
             last_exc = exc
             continue
     raise last_exc  # type: ignore[misc]
+
+
+def _template_detail_rows(base: str, token: str, listed: list) -> list:
+    """列表行 → 逐条详情行(冻结 overlay),修「分文物化吃 live 草稿」漂移。
+
+    列表端点 GET /api/templates **不**应用 published_json overlay(见 main.py
+    ``_template_machine_overlay`` docstring「列表端点不 overlay」),而运行时 agent
+    装配走详情端点 GET /api/templates/{id} 的机器通道 overlay。分支/直念步物化若
+    读列表行的 steps_json,就会用**编辑中的 live 草稿**算缓存键,与运行时冻结版
+    错位——物化出的音频运行时查不到(永远 miss)。故列表只用于发现 id,steps_json
+    一律取详情冻结版;单条详情拉取失败退列表行(不阻物化,旧行为)。
+    """
+    out: list = []
+    for tpl in listed or []:
+        tid = str((tpl or {}).get("id") or "")
+        if not tid:
+            out.append(tpl)
+            continue
+        try:
+            detail = _cp_get(base, f"/api/templates/{quote(tid)}", token, channel=True)
+        except Exception:  # noqa: BLE001 - 详情不可读退列表行(不阻物化;旧行为)
+            detail = None
+        out.append(detail if isinstance(detail, dict) and detail else tpl)
+    return out
 
 
 def _fetch_cp(base: str, token: str, *, account_id: str = "") -> tuple[dict, list, list, list]:
@@ -114,16 +144,21 @@ def _fetch_cp(base: str, token: str, *, account_id: str = "") -> tuple[dict, lis
     except Exception:
         personas = []
     try:
-        objects = _cp_get(base, "/api/objects", token) or []
+        # 2026-09-27:account_id 给定时同步收窄对象列表——直念步变量渲染的缺省
+        # 对象要求是「该账号最近更新的对象」,不按账号会误取 acc-001(CP 端点缺省)。
+        obj_path = "/api/objects"
+        if account_id:
+            obj_path = f"/api/objects?account_id={quote(account_id)}"
+        objects = _cp_get(base, obj_path, token) or []
     except Exception:
         objects = []
     try:
-        # 分支模式(--branches/--branch-status)可按账号过滤模板(CP 端点缺省
-        # acc-001);空=不带参,维持旧行为。
+        # 列表端点只用于发现模板 id;steps_json 逐条取详情端点(冻结 overlay)——
+        # 见 _template_detail_rows(2026-09-27 修「物化吃 live 草稿」漂移)。
         tpl_path = "/api/templates"
         if account_id:
             tpl_path = f"/api/templates?account_id={quote(account_id)}"
-        templates = _cp_get(base, tpl_path, token) or []
+        templates = _template_detail_rows(base, token, _cp_get(base, tpl_path, token) or [])
     except Exception:
         templates = []
     return settings, list(personas), list(objects), list(templates)
@@ -231,25 +266,47 @@ def _opening_line(tpl: dict | None, obj: dict, lang: str) -> str:
     return ""
 
 
-def _say_step_lines(tpl: dict | None) -> list[tuple[str, str]]:
-    """直念步(say=1)ref 首行(2026-09-12 开场白三段拆分):通知/道歉类文本
-    无变量,agent 走 _say_script 脚本线——与本脚本同一条缓存线物化后即点即播。
-    与 FlowController.step_say_text 同首行规则。返回 (text, emotion):
+def _say_step_lines(tpl: dict | None, obj: dict | None = None) -> list[tuple[str, str]]:
+    """直念步(say=1)ref 首行(2026-09-12 开场白三段拆分):通知/道歉类文本,
+    agent 走 _say_script 脚本线——与本脚本同一条缓存线物化后即点即播。
+    与 FlowController.step_say_text 同首行规则(同 parse_steps/同 `ref or goal`/
+    同 render_template_text/同 residual-`{}` 跳过)。返回 (text, emotion):
     emotion=步级行级情绪(模板 steps_json `emotion` 字段,2026-09-16 罐头带
-    情绪——物化时经 MINIMAX_EMOTION 烧进音频;空=不下发自动匹配)。"""
+    情绪——物化时经 MINIMAX_EMOTION 烧进音频;空=不下发自动匹配)。
+
+    obj=变量渲染所用对象卡(2026-09-27):必须与运行时 **同一个对象** 才等价——
+    运行时 FlowController.vars_map=object_vars(object_card)(flow.py:1183),这里
+    走同一个 object_vars()+render_template_text(),故对同一 obj 产出的文本逐字节
+    等于 step_say_text(),缓存键(文本+音色+模型)才对得上。obj=None=空变量(旧
+    行为:含 {占位} 的行渲染后仍有残留 → 跳过,永不物化)。"""
     if not tpl:
         return []
+    vars_map = object_vars(obj) if obj else {}
     out: list[tuple[str, str]] = []
     for s in parse_steps(str(tpl.get("steps_json") or "")):
         if not s.say:
             continue
-        rendered = render_template_text(s.ref or s.goal, {})
+        rendered = render_template_text(s.ref or s.goal, vars_map)
         for line in rendered.splitlines():
             line = line.strip()
             if line and not re.search(r"\{[^{}]+\}", line):
                 out.append((line, s.emotion))
                 break
     return out
+
+
+def _resolve_say_object(objects: list[dict], *, object_id: str) -> dict | None:
+    """直念步变量渲染所用对象(2026-09-27)。
+
+    - 显式 `--object <id>` 命中即用;显式指定但不在列表=None(**绝不静默换对象**
+      ——换对象会算出错误的缓存键,宁退回空变量旧行为)。
+    - 未给:该账号对象列表末条。CP /api/objects 无 updated_at 列,返回序≈插入/
+      更新序,末条作「最近更新对象」代理;空表=None(空变量旧行为)。
+    """
+    oid = str(object_id or "").strip()
+    if oid:
+        return next((o for o in objects if str((o or {}).get("id") or "") == oid), None)
+    return objects[-1] if objects else None
 
 
 def _strip_branch_action(resp: str) -> str:
@@ -671,6 +728,7 @@ async def main_async() -> int:
     ap.add_argument("--account-id", default="", help="分支模式(--branches/--branch-status)按账号过滤 CP 模板(缺省不带参,走 CP 端点默认账号)")
     ap.add_argument("--persona", default="", help="人设范围:指定 persona id(fillers/qa-all 只物化该人设;缺省按语言取该语言的 persona/全部人设)")
     ap.add_argument("--object-id", default="", help="只为指定对象预生成开场白/收线/心跳(配合 --objects)")
+    ap.add_argument("--object", default="", help="直念步(--greetings 线)变量渲染所用对象 id:缺省=该账号最近更新的对象;无对象=保留 {占位} 的行不物化(--object-id 缺省时作同义回退)")
     ap.add_argument("--model", default="", help="MINIMAX_MODEL 覆盖(默认 env/2.8-hd,须与运行时一致)")
     args = ap.parse_args()
     if not (args.greetings or args.objects or args.fillers or args.qa or args.branches
@@ -813,12 +871,15 @@ async def main_async() -> int:
             greet_jobs.append((lang_personas.get(lang), lang, _wa_number_line(lang, ""), ""))
         # 直念步(say=1)文本线:通知/道歉类合规内容,agent 走 _say_script 脚本线
         # ——同一条缓存线物化(钉住)。按语言去重(同语言模板共用同一段通知)。
+        # 变量渲染对象(2026-09-27):--object 显式 / 回退 --object-id / 缺省=该
+        # 账号最近更新对象;无对象=None → 空变量(含占位符的行不物化,旧行为)。
+        _say_obj = _resolve_say_object(objects, object_id=args.object or args.object_id)
         _seen_notice: set[tuple[str, str]] = set()
         for tpl in templates or []:
             _tlang = _normalize_lang((tpl or {}).get("language"), default="") or ""
             if not _tlang:
                 continue
-            for text, emotion in _say_step_lines(tpl):
+            for text, emotion in _say_step_lines(tpl, _say_obj):
                 if (_tlang, text) in _seen_notice:
                     continue
                 _seen_notice.add((_tlang, text))
