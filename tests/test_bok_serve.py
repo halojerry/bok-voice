@@ -86,3 +86,75 @@ def test_worker_env_no_certifi_left_unset(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("SSL_CERT_FILE", raising=False)
     env = bok._agent_prod_env()
     assert "SSL_CERT_FILE" not in env
+
+
+# ---- 2026-10-02 编排审计第二波 · CP env 面收编（prod 封闭白名单显式透传）
+
+
+# 收编键 → 代表值（每组至少一键；键面完整清单见 tools/bok.py::_control_plane_env
+# 的「CP env 面收编」注释块）。prod（launchd/schtasks）封闭 env 面收不到这些键
+# = CP 读到的全是缺省/空；本地 dev 靠 _start_proc merge 掩盖。
+_CP_ENV_COERCED_KEYS: tuple[tuple[str, str], ...] = (
+    # ① 认证三键（auth.py / main 启动闸）
+    ("BOK_AUTH_REQUIRED", "1"),
+    ("BOK_JWT_SECRET", "test-jwt-secret-dummy"),
+    ("BOK_CP_TOKEN", "test-cp-token"),
+    # ② ops（日志/CORS/root 种子/SIP/公开地址）
+    ("BOK_LOG_LEVEL", "DEBUG"),
+    ("BOK_CORS_ORIGINS", "http://localhost:3000,https://cp.example.com"),
+    ("BOK_ROOT_USERNAME", "opsroot"),
+    ("BOK_ROOT_PASSWORD", "ops-root-pw"),
+    ("BOK_SIP_MODE", "real"),
+    ("BOK_CP_PUBLIC_URL", "https://cp.example.com"),
+    # ③ node/static（节点制品/日志 TTL/静态 UI/app-data）
+    ("BOK_NODE_ARTIFACTS_DIR", "/srv/bok/downloads"),
+    ("BOK_NODE_LOG_TTL_DAYS", "7"),
+    ("BOK_WEB_STATIC_DIR", "/srv/bok/web-out"),
+    ("BOK_APP_DATA", "/srv/bok/data"),
+    # ④ settle 闲时轮（poll/wait 两窗）
+    ("BOK_SETTLE_IDLE_POLL_S", "5"),
+    ("BOK_SETTLE_IDLE_WAIT_S", "120"),
+    # ⑤ pregen/qa/embed
+    ("BOK_PERSONA_AUTO_PREGEN", "0"),
+    ("BOK_TTS_CACHE_DIR", "/srv/bok/tts-cache"),
+    ("BOK_QA_CLUSTER_MODEL", "/models/qwen3-4b"),
+    ("BOK_QA_DIGEST_INTERVAL_S", "300"),
+    ("BOK_EMBED_BASE_URL", "http://127.0.0.1:8789"),
+    # ⑥ MiniMax（CP 侧 TTS 设置回落 + 克隆端点域）
+    ("MINIMAX_API_KEY", "sk-test-minimax"),
+    ("MINIMAX_BASE_URL", "https://api.minimax.io/v1"),
+    ("MINIMAX_REGION", "intl"),
+    ("MINIMAX_MODEL", "speech-2.8-hd"),
+    # ⑦ ops 端点覆盖（非默认拓扑 ASR/TTS/laya/csc）
+    ("BOK_LAYA_URL", "http://127.0.0.1:8791"),
+    ("BOK_CSC_URL", "http://127.0.0.1:8792"),
+    ("QWEN3_ASR_BASE_URL", "http://127.0.0.1:8787"),
+    ("QWEN3_TTS_BASE_URL", "http://127.0.0.1:8788"),
+)
+
+
+def test_control_plane_env_carries_audited_keys(monkeypatch) -> None:
+    """显式设了的收编键必须原样下发（prod 单元 env 白名单）。"""
+    for key, value in _CP_ENV_COERCED_KEYS:
+        monkeypatch.setenv(key, value)
+    env = bok._control_plane_env("/tmp/bok_voice.db")
+    missing = [key for key, _v in _CP_ENV_COERCED_KEYS if env.get(key) is None]
+    assert not missing, f"CP env 未收编: {missing}"
+    for key, value in _CP_ENV_COERCED_KEYS:
+        assert env[key] == value, key
+
+
+def test_control_plane_env_no_empty_string_injection(monkeypatch, tmp_path) -> None:
+    """未设/空串/纯空白一律不注入（显式设了才透传的既有先例；空串注入会覆盖
+    CP 侧缺省档语义）。"""
+    for key, _value in _CP_ENV_COERCED_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    env = bok._control_plane_env(tmp_path / "db.sqlite")
+    leaked = [key for key, _v in _CP_ENV_COERCED_KEYS if key in env]
+    assert not leaked, f"未设键被注入: {leaked}"
+    # 纯空白同样不注入
+    for key, _value in _CP_ENV_COERCED_KEYS:
+        monkeypatch.setenv(key, "   ")
+    env2 = bok._control_plane_env(tmp_path / "db.sqlite")
+    leaked2 = [key for key, _v in _CP_ENV_COERCED_KEYS if key in env2]
+    assert not leaked2, f"空白值被注入: {leaked2}"
