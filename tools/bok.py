@@ -2633,6 +2633,10 @@ _FORWARD_ENV = (
     "BOK_REASK_MAX_CONSEC",
     # —— B 线第一性原理波（2026-10-02）：装配期 MT 探活 kill-switch（缺省开） ——
     "BOK_INTERP_MT_PROBE",
+    # —— 编排审计第二波 PR-B（2026-10-02）：A 线 a_reply 车道装配期探活 kill-switch
+    #    （缺省开；agent.py 读注入 env Mapping 故静态扫描不强制，prod 转发靠此登记——
+    #    BOK_INTERP_MT_PROBE 同款判例；tests/test_a_reply_probe.py 钉 membership） ——
+    "BOK_A_REPLY_PROBE",
 )
 # 历史名（2026-09-18 终审 I1 起的既有调用面/单测锚）：表本体唯一，别名防散。
 _BOK_PASSTHROUGH_KEYS = _FORWARD_ENV

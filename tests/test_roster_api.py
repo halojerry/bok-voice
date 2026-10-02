@@ -138,8 +138,14 @@ def test_roster_claim_unclaim_sql_backend_parity(monkeypatch, tmp_path):
         connect_args={"check_same_thread": False, "timeout": 30},
     )
     models.create_all(engine)
-    repo = SqlAlchemyBusinessRepository(sessionmaker(bind=engine, expire_on_commit=False, future=True)())
-    monkeypatch.setattr("control_plane.main._repo", lambda: repo)
+    _factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    repo = SqlAlchemyBusinessRepository(_factory())
+    # 生产 parity（2026-10-02 flake 根修）：_repo() 每调用新 session——旧姿势把
+    # 同一 session 实例交给 TestClient 工作线程（含会 close 所持 repo 的后台路径），
+    # CI 慢机上 ResourceClosedError / identity-map 失效族随机红（三度咬合并）。
+    monkeypatch.setattr(
+        "control_plane.main._repo", lambda: SqlAlchemyBusinessRepository(_factory())
+    )
     client = TestClient(app)
 
     entry = repo.upsert_roster_entry(
@@ -155,5 +161,6 @@ def test_roster_claim_unclaim_sql_backend_parity(monkeypatch, tmp_path):
     assert r.status_code == 200
     assert r.json()["status"] == "unclaimed"
     assert r.json()["claimed_by"] == "" and r.json()["claimed_at"] == ""
-    # 确认落库为 NULL 而非字符串 ""
-    assert repo.get_roster_entry(entry["id"])["claimed_at"] == ""
+    # 确认落库为 NULL 而非字符串 ""——走**新 session** 读真 DB 态（测试 session 的
+    # identity map 里还挂着 API claim 时写入的旧对象，expire_on_commit=False 不会刷）。
+    assert SqlAlchemyBusinessRepository(_factory()).get_roster_entry(entry["id"])["claimed_at"] == ""
