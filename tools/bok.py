@@ -1613,8 +1613,7 @@ def _start_settle_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> 
 
     可选服务(同 _start_mt_llm 契约):模型缺失直接跳过返回 False——Summarizer
     与 judge 走各自 env 缺席链路回退 :1235;端口已健康不重复起。Qwen3.5 家族
-    与主 LLM 同模板参数(关思考);纪要是单发长任务,8 槽 2GB cache 够用;
-    log WARNING(后台作业,唔刷屏)。
+    与主 LLM 同模板参数(关思考);log WARNING(后台作业,唔刷屏)。
 
     9B 后端化(2026-09-25):默认不随栈常驻——9B 常驻=夜间崩速主犯之一
     (reports/latency-soak/LANE-AB-2026-09-25.md 附3:judge 9B 二号驻留与回复
@@ -1640,10 +1639,16 @@ def _start_settle_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> 
     # (settle-llm.log);BOK_LLM_LOG_LEVEL=WARNING 回静默(与 :1235 同一旋钮)。
     _log_level = os.environ.get("BOK_LLM_LOG_LEVEL", "INFO")
     # 入口=wrapper（W-ABORT；被打断/取消的 9B 生成立即放槽=打断级联根治点）。
+    # prompt-cache-size 128(2026-10-02 十八波,P2 角色翻档补课)::1237 已是 a_reply
+    # 主脑,但 cache 槽停留在后台作业年代的 8——soak 实弹 13:00:16 cache 打满
+    # (8 sequences)LRU 逐出回复链,R8 3312 tok 全量重 prefill 10.6s 独占单生成
+    # 线,后续轮 1.1-1.3k tok 连环全量 miss 各 ~4s=PERCEIVED p95 5622 的全部来源
+    # (:1235 同病灶同修,见其注释:每请求插 system/对话/完成 多条前缀键,LRU
+    # 轮换把共享前缀挤掉)。bytes 上限 2GB 不动=内存预算真闸门,槽位只放宽序列数。
     _start_proc(
         [str(llm_py), str(MLX_SERVER_WRAPPER),
          "--model", settle_model, "--host", "127.0.0.1", "--port", "1237",
-         "--prompt-cache-size", "8", "--prompt-cache-bytes", "2GB",
+         "--prompt-cache-size", "128", "--prompt-cache-bytes", "2GB",
          "--chat-template-args", '{"enable_thinking":false}', "--log-level", _log_level],
         run_dir / "settle-llm.pid",
         log_dir / "settle-llm.log",
