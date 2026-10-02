@@ -357,10 +357,20 @@ class _RelaySynthesizeStream(tts.SynthesizeStream):
         self._hold_provider = hold_provider
         self._fired = False
 
-    # ⚠️ 勿覆写 _metrics_monitor_task:基类监视器在转发帧上算 ttfb/audio 时长并
-    # emit tts_metrics。曾 pass 掉(垫话 PR,注释误以为内芯會转发,实际 session 只
-    # 监听包装层)→ PERCEIVED_MS 北极星缺 tts 段、turns 账本 perceived_ms 哑火
-    # (2026-09-10 实测恢复)。
+    # ⚠️ 基座监视器已排空（2026-10-02 双样本根修，见下）——勿恢复 emit：
+    # 旧注释（垫话 PR,2026-09-10）禁止覆写此方法，前提是「内芯样本无人转发、
+    # session 只监听包装层」。该前提已变：包装层（CachedTTS/_FirstAudioTTS）
+    # 构造期已挂 ``wrapped.on("metrics_collected", self._forward_metric)``——
+    # 内芯真样本（bidi ttfb 200-700ms 量级）经转发抵达 session；而本层基座
+    # 监视器以**首帧转发时刻**为锚（``_mark_started`` 调在 ``_relay_audio``
+    # 首帧处），emit 出的是 ttfb≈0 的退化样本 → 每轮两条、第二条近零（实弹
+    # 同轮 279ms+7ms 双行，Provider 卡 p50 被拉低、n 翻倍）。本层只排空 tee，
+    # 不 emit；``_mark_started`` 保留（framework 侧 USERDATA_TTS_STARTED_TIME
+    # 锚点走它，删调用会让 data.ttfb 退回输入到达锚）——``_fire_first_audio``
+    # 首音频回调链不受影响。
+    async def _metrics_monitor_task(self, event_aiter) -> None:
+        async for _ in event_aiter:
+            pass
 
     async def _run(self, output_emitter) -> None:
         output_emitter.initialize(

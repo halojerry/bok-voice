@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import ast
+from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,6 +48,24 @@ _ALLOW_REPEAT_REQUESTED: dict[tuple[str, str], str] = {
     ("agent.py", "on_user_turn_completed"): "re-ask gate",
 }
 
+# `_reply_done_event.set()` 站点清单（P3，2026-10-02 补面）。
+# 语义：judge 让路链（第七波）靠该事件感知「本轮回复已交付/放弃」，站点散落
+# 各出口车道——20 站点逐一审计后固化于此。**双向钉**：新增站点（新车道出口）
+# 或删除既有站点（漏 set=judge 白等等待帽）都会使清单失配 → 红，逼一次显式
+# 修订（新出口必须在交付/静默放弃两条边上都 set，否则 judge 被饥饿）。
+# 判据 = (文件名, 最近的 enclosing function 名) → 该函数内 `.set()` 次数。
+# 基线=HEAD 78e17e1（S1 的 P0-P3 未提交改动合流后按实际重核一次）。
+_ALLOW_REPLY_DONE_SET: dict[tuple[str, str], int] = {
+    # 中央交付点：assistant turn 上报（框架 speech 交付）后置位
+    ("agent.py", "_report_assistant_turn"): 1,
+    # 会话收尾：on_close 全量解除等待
+    ("agent.py", "_on_close"): 1,
+    # turn 钩子内的出口车道（10 处：打断/风暴/暂停/静默放弃等，EX-2 审计集）
+    ("agent.py", "on_user_turn_completed"): 10,
+    # 打断 watcher（speech_created 触发的放弃边；第七波审计漏网、十二波补洞）
+    ("agent.py", "_watch"): 1,
+}
+
 
 def _iter_trees():
     for path in sorted(AGENT_DIR.rglob("*.py")):
@@ -66,7 +85,7 @@ def _walk_with_func(tree: ast.AST, funcname: str = "<module>"):
 
 
 def _sites():
-    """收集四类受限写入/调用的 (kind, filename, funcname)。"""
+    """收集五类受限写入/调用的 (kind, filename, funcname)。"""
     out: list[tuple[str, str, str]] = []
     for fname, tree in _iter_trees():
         for node, func in _walk_with_func(tree):
@@ -86,6 +105,18 @@ def _sites():
                     out.append(("set_last_reply", fname, func))
                 if isinstance(f, ast.Name) and f.id == "_cancel_response_watchdog":
                     out.append(("cancel_watchdog", fname, func))
+                if (
+                    isinstance(f, ast.Attribute)
+                    and f.attr == "set"
+                    and (
+                        (isinstance(f.value, ast.Name) and f.value.id == "_reply_done_event")
+                        or (
+                            isinstance(f.value, ast.Attribute)
+                            and f.value.attr == "_reply_done_event"
+                        )
+                    )
+                ):
+                    out.append(("reply_done_set", fname, func))
     return out
 
 
@@ -110,3 +141,40 @@ def test_repeat_requested_only_in_allowlist():
     allow = set(_ALLOW_REPEAT_REQUESTED)
     bad = [(f, fn) for (k, f, fn) in _sites() if k == "repeat_requested" and (f, fn) not in allow]
     assert not bad, f"repeat_requested 只准在 re-ask gate 写，越权点：{bad}"
+
+
+def test_reply_done_set_sites_match_manifest():
+    """`_reply_done_event.set()` 站点清单双向钉（P3）。
+
+    方向一（新增即红）：新出口车道加了 set 站点而不改清单 → 此处报未知站点；
+    方向二（删除即红）：既有 set 被误删（judge 白等等待帽/饿死）→ 计数失配。
+    修订姿势：动清单必须同时说明该出口的交付/静默放弃语义（本文件注释）。
+    """
+    live = Counter((f, fn) for (k, f, fn) in _sites() if k == "reply_done_set")
+    expected = Counter(_ALLOW_REPLY_DONE_SET)
+    assert live == expected, (
+        "reply_done_event.set() 站点与清单不符——新增站点(新车道出口)或删除既有"
+        f"站点均需显式修订清单。live={dict(live)} expected={dict(expected)}"
+    )
+
+
+def test_reply_done_set_declaration_and_clear_are_single():
+    """声明点与 clear 点各恰一处（协议面锚：跨函数泄漏/双 Event 即红）。"""
+    declared = 0
+    cleared: list[tuple[str, str]] = []
+    for fname, tree in _iter_trees():
+        for node, func in _walk_with_func(tree):
+            if isinstance(node, ast.Assign):
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Name) and tgt.id == "_reply_done_event":
+                        declared += 1
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "clear"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "_reply_done_event"
+            ):
+                cleared.append((fname, func))
+    assert declared == 1, f"_reply_done_event 声明点应恰 1 处：{declared}"
+    assert cleared == [("agent.py", "on_user_turn_completed")], cleared

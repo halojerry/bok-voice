@@ -620,8 +620,12 @@ class MlxLlmLLM(_OpenAICompatBase):
     # ①首 token 截止——_LlmFallbackStream 对第一块 ChatChunk 计时
     #   （LLM_FIRST_TOKEN_TIMEOUT_S 默认 3.0,0=关）,超时立即出三语兜底句,
     #   但**唔弃流**:后台 drain 继续消费本流收晚到真答案(次级截止
-    #   LLM_LATE_ANSWER_DEADLINE_S 默认 8s,0=回 aclose+regen 旧行为)——
-    #   aclose 弃流换不来服务端停解码(mlx 无断连中止),二发只排其后抬 TTFT;
+    #   LLM_LATE_ANSWER_DEADLINE_S 默认 8s,0=回 aclose+regen 旧行为)。
+    #   注（2026-10-02 注释同步）:W-ABORT 落地后 aclose/cancel 已能中止服务端
+    #   解码（_attach_mlx_abort→POST /v1/abort,生成循环立即放槽）——drain 是
+    #   **策略选择**而非无奈:原流慢但可能仍活,继续读严格优于杀掉重排(同参
+    #   regen 全量重 prefill,饥荒中负载×2);只有超过次级截止仍无产出才真弃
+    #   流重生(且饥荒档禁 regen,见 _spawn_regen)。
     # ②插件级重试默认归零（LLM_REQUEST_RETRIES 默认 0——官方 _main_task
     #   默认 3 次重试×10s=最坏 46s 静默,兜底壳取代它做恢复,更快且有声）;
     # ③传输层 read-gap（LLM_REQUEST_TIMEOUT_S 默认 8）只作字节流死流的粗后盾,
@@ -842,11 +846,14 @@ class _LlmFallbackStream(llm.LLMStream):
     三条路都汇到同一句本地兜底（零模型调用）:
     - 首 token 超时（LLM_FIRST_TOKEN_TIMEOUT_S,默认 3.0s）:
       首 chunk 计时到点立即出兜底句——但**唔弃流**(2026-09-17 RC4):
-      mlx 服务端无断连中止,被 aclose 的请求照解码到完才放锁,二发重生只排其后
-      (僵尸解码税,实测 [watchdog] 后紧跟 TTFT 3872ms)。改为后台 drain 继续消费
-      本流收集剩余文本,晚到真答案经回调补答;次级截止
+      drain 继续消费本流收集剩余文本,晚到真答案经回调补答;次级截止
       （LLM_LATE_ANSWER_DEADLINE_S,默认 8s,0=关→回立即 aclose+factory 重生
-      旧行为）仍无产出才真弃流重生(最后手段);
+      旧行为）仍无产出才真弃流重生(最后手段)。注释同步（2026-10-02）:RC4 当
+      年「mlx 服务端无断连中止、弃流只换僵尸解码税」的被迫理由已被 W-ABORT
+      推翻（aclose/cancel 会经 _attach_mlx_abort 发 POST /v1/abort,服务端
+      生成循环立即放槽）——现在 drain 是对「慢但可能仍活」的**策略选择**:
+      继续读原流严格优于杀掉重排（同参 regen 全量重 prefill,饥荒中负载×2,
+      见 _spawn_regen 饥荒禁 regen 档）;
     - 传输层超时/重试耗尽仍失败（APIError 浮出）;
     - 首 token 后流中卡死被传输层掐断（部分真答案已在途→兜底句跟在后面,
       好过死寂）。
@@ -1102,9 +1109,10 @@ class _LlmFallbackStream(llm.LLMStream):
                 if first_task not in done:
                     record_llm_first_token(timeout)  # 饥荒信号:超时也喂样本
                     if self._late_deadline > 0 and self._late_answer_cb is not None:
-                        # 原流续读:唔 aclose——服务端无断连中止,弃流只换僵尸
-                        # 解码税。兜底先出声,后台 drain 收晚到真答案;截止无
-                        # 产出才真弃流重生。
+                        # 原流续读:唔 aclose——策略选择(2026-10-02 注释同步):
+                        # W-ABORT 已能给服务端生成循环止损,但原流「慢但可能仍活」,
+                        # 继续读严格优于杀掉重排(同参 regen 全量重 prefill);兜底
+                        # 先出声,后台 drain 收晚到真答案;截止无产出才真弃流重生。
                         print(
                             f"LLM_FIRST_TOKEN_TIMEOUT deadline={timeout}s — 兜底先出,"
                             f"原流续读(drain deadline={self._late_deadline:g}s)",
@@ -2071,13 +2079,21 @@ class _RepeatSelfGuardStream(_CascadeCloseStreamMixin, llm.LLMStream):
             return self._buf
         rest = self._buf
         self._buf = ""
-        if not self._bypass and _is_parrot_sentence(rest, self._last_reply):
+        # 换头复读纵深补面(P3,2026-10-02):流末无句界,已早放片段(_released_head)在场的
+        # 判定必须用「片段+余段」拼合单元——与 _feed 句界路径同款(1966)。单看余段时
+        # D1 强制放行后的换头残段(头部几字不同、相似度不够)会漏剥。片段已出声不回收,
+        # 命中的只是余段。
+        check_unit = (self._released_head or "") + rest if self._released_head else rest
+        if not self._bypass and _is_parrot_sentence(check_unit, self._last_reply):
             print(f"REPEAT_SELF_SUPPRESSED sent={rest!r}", flush=True)
+            self._released_head = ""
             return ""
-        if self._cross_on and self._is_cross_turn(rest):
+        if self._cross_on and self._is_cross_turn(check_unit):
             self._cross_suppressed += 1
             print(f"REPEAT_CROSS_TURN_SUPPRESSED sent={rest!r}", flush=True)
+            self._released_head = ""
             return ""
+        self._released_head = ""
         if self._number_on:
             # 流末余段同样过守卫(放行前改;TTS 与账本同文本)。
             rest = guard_fabricated_number(

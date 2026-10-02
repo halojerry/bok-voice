@@ -199,17 +199,37 @@ def test_first_audio_no_stop_when_yield_off(tmp_path, monkeypatch, capsys):
 
 
 def test_hold_zero_when_yield_on(tmp_path, monkeypatch, capsys):
-    """yield 档:hold_if_playing 恒 0——tts_cache 的 `if hold > 0` 自然不睡。"""
+    """yield 档:hold_if_playing 恒 0——tts_cache 的 `if hold > 0` 自然不睡。
+
+    2026-10-02 P2 降频后观测行只在 legacy hold >500ms 才打(几十毫秒=死档
+    噪声)——本用例 gap 抬到 800ms 让旧档真会扣压的可感等待,保住子串断言;
+    legacy 小值静默另见 test_hold_small_legacy_silent。"""
     _fast_env(monkeypatch)
+    monkeypatch.setenv("BOK_FILLER_GAP_MS", "800")
 
     async def _case():
         d, player = _director(tmp_path)
         d.arm()
         await _wait_first_fire(d, player)
-        # 旧档此刻 hold = pcm(0.02s)+gap(0.05s)-elapsed ≈ 0.07s > 0
+        # 旧档此刻 hold = pcm(0.02s)+gap(0.8s)-elapsed ≈ 0.8s > 0.5s
         assert d.hold_if_playing() == 0.0
         out = capsys.readouterr().out
         assert "FILLER_YIELD hold=0" in out
+
+    _run(_case())
+
+
+def test_hold_small_legacy_silent(tmp_path, monkeypatch, capsys):
+    """legacy hold <=500ms → 观测行静默(降频:省下的等待太小不值得记);
+    hold 返回值仍旧恒 0,行为零变化。"""
+    _fast_env(monkeypatch)  # 默认 gap 50ms → legacy hold ≈ 70ms
+
+    async def _case():
+        d, player = _director(tmp_path)
+        d.arm()
+        await _wait_first_fire(d, player)
+        assert d.hold_if_playing() == 0.0
+        assert "FILLER_YIELD" not in capsys.readouterr().out, "小值不得刷屏"
 
     _run(_case())
 

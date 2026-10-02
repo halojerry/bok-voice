@@ -130,7 +130,12 @@ def test_late_answer_say_dedups_before_delivery():
 
 
 def test_late_answer_lane_registers_gen_llm():
-    """登记侧 gen="llm"(不动账本过滤器,改登记方)——补答进跨轮比对面。"""
-    assert '_register_reply_lane(lane="late-answer", gen="llm", text=text)' in AGENT_SRC
-    # 旧 gen 缺省(script)形态不得出现在补答登记点
+    """登记侧 gen="llm"(不动账本过滤器,改登记方)——补答进跨轮比对面。
+
+    2026-10-02 复标:登记点补 ``relieve=False``(先例 qa-fastpath)——stall 抵销
+    单点归交付后 ``_report_assistant_turn``,登记再抵=双扣。
+    """
+    assert '_register_reply_lane(lane="late-answer", gen="llm", text=text, relieve=False)' in AGENT_SRC
+    # 旧形态(无 relieve=False / 旧 gen 缺省 script)不得出现在补答登记点
+    assert '_register_reply_lane(lane="late-answer", gen="llm", text=text)' not in AGENT_SRC
     assert '_register_reply_lane(lane="late-answer", text=text)' not in AGENT_SRC

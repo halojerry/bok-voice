@@ -214,12 +214,43 @@ def test_find_abandonable_timestamp_gate():
     assert _find_abandonable_stream(None, before) is None
 
 
+def test_interrupt_time_sampled_at_watch_entry_not_after_handle():
+    """P0 刀1 取样点回归（2026-10-02 复标）：弃流门必须吃 speech_created 入口时刻。
+
+    原 bug：``now = time.monotonic()`` 在 ``await handle`` 之后取样——框架打断
+    有 5s 宽限，宽限 > 下一轮流创建窗（~0.4-1s）时，新流的 ``_bok_created`` 晚于
+    真打断时刻但早于收场 now → 被当僵尸错弃。本测试双面钉死：源级（取样点必须
+    在 await handle 之前且传给 _find_abandonable_stream）+ 行为面（同一对
+    stale/fresh 流，真打断时刻只弃 stale；用收场时刻则误弃 fresh=旧病灶）。
+    """
+    from agent_runtime.agent import _find_abandonable_stream
+
+    src = (_REPO / "apps" / "agent" / "agent_runtime" / "agent.py").read_text(encoding="utf-8")
+    _start = src.index("async def _watch() -> None:")
+    _end = src.index("# 池化(2026-09-17 全量 debug P2-A)", _start)
+    watch = src[_start:_end]
+    entry = watch.index("_interrupt_at = time.monotonic()")
+    await_pos = watch.index("\n            try:\n                await handle")  # 代码行,非注释引用
+    assert entry < await_pos, "打断时刻必须在 await handle 之前取样"
+    assert "_find_abandonable_stream(_reap_stream, _interrupt_at)" in watch
+    assert "_find_abandonable_stream(_reap_stream, now)" not in watch
+
+    interrupt_at = time.monotonic()
+    stale = _Layer(abandonable=True, created=interrupt_at - 5.0)    # 本通被打断的僵尸流
+    fresh = _Layer(abandonable=True, created=interrupt_at + 0.6)    # 宽限窗内下一轮新流
+    completion = interrupt_at + 5.0                                 # 宽限后收场时刻
+    assert _find_abandonable_stream(_Layer(stale), interrupt_at) is stale
+    assert _find_abandonable_stream(_Layer(fresh), interrupt_at) is None
+    # 旧取样点（收场时刻）=新流落进「早于」侧被误弃——病灶形状本身在案。
+    assert _find_abandonable_stream(_Layer(fresh), completion) is fresh
+
+
 def test_source_pins_interrupt_abandon_wiring():
     # 源级 pin:打断分支必须调 abandon（防未来重构静默脱线——wave-13 同文件
     # 并行撞车教训的终态复验形态）。
     agent_src = (_REPO / "apps" / "agent" / "agent_runtime" / "agent.py").read_text(encoding="utf-8")
     lp_src = (_REPO / "apps" / "agent" / "agent_runtime" / "providers" / "livekit_plugins.py").read_text(encoding="utf-8")
-    assert "_find_abandonable_stream(_reap_stream, now)" in agent_src
+    assert "_find_abandonable_stream(_reap_stream, _interrupt_at)" in agent_src
     assert "await _fs.abandon()" in agent_src
     assert "async def abandon(self)" in lp_src
     assert "LLM_LATE_ANSWER dropped" in lp_src

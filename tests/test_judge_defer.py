@@ -5,7 +5,9 @@
 流（4B 上 1-4s，实测 TTFT 2366-2546ms 离群 + 回复 tps 14-20 塌陷主因）。修法
 （agent 侧）：judge 在让路 delay 之后、进 LLM 之前 await「本轮回复已交付」事件
 （`_reply_done_event`，turn 钩子开头 clear / `_report_assistant_turn` 与 close
-路径 set / 纯 StopResponse 轮直接 set），上限 `_JUDGE_REPLY_WAIT_S = 15.0`。
+路径 set / 纯 StopResponse 轮直接 set），上限 `_JUDGE_REPLY_WAIT_S = 4.0`
+（2026-10-02 复标：judge/reply 已分端点，互斥消失只剩 GPU 错峰——15s 旧帽是
+排队时代余数；overlay 姿态用已转发 FLOW_JUDGE_DELAY/IDLE_CAP 恢复旧闸）。
 
 本文件钉三面：
 - 行为面（`_await_reply_done`，模块级可测）：回复未交付=不放行；已置位=零等待
@@ -91,14 +93,14 @@ def test_event_already_set_no_wait_no_log(capsys):
 def test_timeout_cap_proceeds_old_behavior(monkeypatch, capsys):
     """超时（回复卡死/永不来）→ 照旧开火（旧行为兜底），落行 reply_ms≈上限。
 
-    上限默认读模块常量（调用时解析）——测试 patch 小值，等同 15s 档语义。
+    上限默认读模块常量（调用时解析）——测试 patch 小值，等同缺省帽语义。
     """
     monkeypatch.setattr(agent_mod, "_JUDGE_REPLY_WAIT_S", 0.15)
 
     async def run():
         ev = asyncio.Event()  # 永不置位
         t0 = time.monotonic()
-        waited = await agent_mod._await_reply_done(ev)  # 不传 timeout → 读常量
+        waited = await agent_mod._await_reply_done(ev)  # 不传 timeout → 读解析器
         return waited, time.monotonic() - t0
 
     waited, dt = asyncio.run(run())
@@ -107,10 +109,10 @@ def test_timeout_cap_proceeds_old_behavior(monkeypatch, capsys):
     assert "FLOW_JUDGE deferred reply_ms=" in capsys.readouterr().out
 
 
-def test_cap_constant_is_hard_15s():
-    """15s 硬常量（不做 env）：等满仍未交付=回复结构性死火，judge 照开火。"""
-    assert agent_mod._JUDGE_REPLY_WAIT_S == 15.0
-    assert "_JUDGE_REPLY_WAIT_S = 15.0" in _SRC
+def test_cap_default_4s_constant():
+    """4s 缺省常量（2026-10-02 复标：分端点后 15s 排队帽退役）。"""
+    assert agent_mod._JUDGE_REPLY_WAIT_S == 4.0
+    assert "_JUDGE_REPLY_WAIT_S = 4.0" in _SRC
     assert 'label: str = "FLOW_JUDGE"' in _SRC  # 日志标签缺省=要求格式
     assert "deferred reply_ms={waited_ms}" in _SRC
 
@@ -132,7 +134,7 @@ def test_event_declared_cleared_and_released_on_report():
 
 
 def test_event_set_on_close_path():
-    """会话关闭=回复永不再来 → _on_close 置位（不陪等 15s 上限）。"""
+    """会话关闭=回复永不再来 → _on_close 置位（不陪等等待帽）。"""
     close = _seg("def _on_close(ev):", "async def _close():")
     assert "closed.set()" in close and "_reply_done_event.set()" in close
 
@@ -140,8 +142,8 @@ def test_event_set_on_close_path():
 def test_event_set_on_interrupted_speech_path():
     """打断轮=回复车道就此终结（无 item 交付、report 不会来）→ 置位。
 
-    2026-10-01 call-231aa92a 实弹：打断轮事件不置位 → judge 挂满 15s 硬帽才
-    放行，恰在重生/下一轮回复最需要 :1237 槽的窗口开火（TTFT 35.6s 级联）。
+    2026-10-01 call-231aa92a 实弹：打断轮事件不置位 → judge 挂满等待帽才
+    放行（当时代码帽=15s；现缺省 4s 同病仍在），恰在重生/下一轮回复最需要 :1237 槽的窗口开火（TTFT 35.6s 级联）。
     20 站点审计漏了这条路——本 pin 防再漏。
     """
     watch = _seg("async def _watch() -> None:", "# 池化(2026-09-17 全量 debug P2-A)")
@@ -206,7 +208,7 @@ _SILENT_DROP_MARKERS = (
 
 
 def test_silent_stopresponse_sites_release_judge():
-    """静默丢弃轮无 item 可报 → 每个出口就地 set（不然 judge 白等满 15s）。"""
+    """静默丢弃轮无 item 可报 → 每个出口就地 set（不然 judge 白等满等待帽）。"""
     hook = _hook()
     for marker in _SILENT_DROP_MARKERS:
         i = hook.index(marker)

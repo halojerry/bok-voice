@@ -21,8 +21,11 @@ voice_hit=1);miss 播源码资产兜底(永不哑,打点 voice_fallback=运行�
 自然不睡),回复立即出声。旧契约(回复由 hold 扣到「垫话剩余+gap」)实弹反例:
 call-4e8d58c1 真答案首音频 18.4s≈第二发垫话播完 18.5s,垫话把答案整段顶到末尾。
 新契约三件=①首音频停播 ②hold 归零 ③reshot 查回复在途(pending)让路;总闸
-BOK_FILLER_YIELD(缺省 "1","0"=三件全回旧行为)。新用户轮(cancel)照旧立即掐
-垫话:用户插话优先,放完旧垫话反而怪。
+BOK_FILLER_YIELD(缺省 "1","0"=三件全回旧行为)。第三件带时间窗(2026-10-02
+P2 二次立法):仅**新近在途**(<RESHOT_PENDING_GRACE_S=2s,首音频将至,补了也
+会被立刻停掉)才让路;在途已 >2s=真 bidi 卡顿/LLM 慢窗(pending 本身即病理,
+裸静默比补发贵)反而放行第二发填死区。新用户轮(cancel)照旧立即掐垫话:用户
+插话优先,放完旧垫话反而怪。
 
 链发(2026-09-10):首条垫话播完、回复首音频仍未到 → 垫话后残余静默照旧,
 BOK_FILLER_GAP_MS 呼吸后自动补第二发——挂「播完观察者」等官方
@@ -34,7 +37,10 @@ PlayHandle.wait_for_playout()(播完即醒,精确补位,不靠估时长)。每�
 ~2.3s,watchdog 4s 闸前纯静默 1.7s+,连轮冷却又保证裸奔轮结构性存在。修法=
 同一「播完观察者」挂点、新开门条件:第一发播完+gap 后回复首音频仍未到,且
 **距 arm 已 >2.2s**(真载荷轮才补,正常 TTFT 轮绝不双发)→ 补一发
-hesitation/promise 短句(dur_s 短者优先)。每轮至多一次(独立计数,不复用链发
+hesitation/promise 短句(dur_s 短者优先)。回复流「已开未出声」在途时(pending)
+按时间窗分流(2026-10-02 P2):新近在途(<2s)=首音频将至,让路(补了也会被
+on_reply_first_audio 立刻停掉);在途久悬(>2s)=真卡顿窗,放行补发填死区。
+每轮至多一次(独立计数,不复用链发
 _chain_depth),与第一发合计消耗 BOK_FILLER_MAX 同一计数;连轮冷却豁免同链发
 (本轮已有第一发=冷却已消耗);第二发开播同样打 on_fired 顺延口(agent 侧为
 其重开一次 watchdog 顺延窗,防 4s 闸掐掉在播的第二发)。闸=BOK_FILLER_RESHOT
@@ -241,6 +247,18 @@ def filler_chain_enabled() -> bool:
 # ~1.1-2.7s 播完——短句播完+gap 时 elapsed 常落在 2.0s 附近(正常 TTFT 轮),
 # 载荷轮(TTFT 2.2-3.8s)落在 2.5s+;闸把两者分开,治旧链发「固定双发」的根。
 RESHOT_MIN_ELAPSED_S = 2.2
+
+# reshot pending 宽限窗(2026-10-02 P2 二次立法):回复流「已开未出声」在本轮
+# arm 后持续 <2s=首音频将至——补发也会被 on_reply_first_audio 的停播立刻掐掉,
+# 白烧额度,让路;持续 >=2s=真 bidi 卡顿/LLM 慢窗(pending 本身即病理),裸静默
+# 比补发贵,放行第二发填 2.3s→watchdog 闸之间的死区。hold=0 政策翻转后「再补
+# 只会顶延迟」的旧理由已死(垫话不再扣压回复),这里是纯时长判据。
+RESHOT_PENDING_GRACE_S = 2.0
+
+# hold 让路观测行的最小 legacy 值(2026-10-02 P2 降频):legacy hold 只有
+# >500ms 才值得记一行——让路真省下了可感等待;几十毫秒级的剩余时间轴是
+# 死档噪声(每轮刷屏,soak 里淹没有效信号)。行格式不变(legacy Nms)。
+HOLD_LOG_MIN_LEGACY_S = 0.5
 
 
 def filler_reshot_enabled() -> bool:
@@ -706,9 +724,9 @@ class FillerDirector:
         hold = self._play_started + self._cur_dur + filler_gap_s() - time.monotonic()
         hold = max(0.0, hold)
         if _yield_enabled():
-            if hold > 0:
-                # 仅在旧档真会扣压时打点=让路确实省掉了一段等待(旧档 hold 值
-                # 顺带入行,复盘可对账实际省了多少)。
+            if hold > HOLD_LOG_MIN_LEGACY_S:
+                # 仅旧档真会扣压、且省下的等待够大(>500ms)才打点——几十毫秒级
+                # 剩余时间轴是死档噪声(2026-10-02 P2 降频,行格式不变)。
                 print(f"FILLER_YIELD hold=0 (legacy {hold * 1000:.0f}ms)", flush=True)
             return 0.0
         return hold
@@ -820,23 +838,29 @@ class FillerDirector:
         except Exception:  # noqa: BLE001 - 停播失败让垫话自然播完(短语 ≤1.5s)
             return False
 
-    def _reply_pending_since_arm(self) -> bool:
-        """本轮 arm 之后回复流已开未出声(真答案在途)→ reshot 让路(I2)。
+    def _reply_pending_hold_s(self) -> float:
+        """本轮 arm 之后回复流「已开未出声」已持续秒数(无在途/闸关/provider 缺席=0)。
 
         provider(tts_cache reply_stream_pending_since)返回「回复流已开、首音频
-        未到」起点的 monotonic;晚于本轮 arm=真答案已在路上,再补垫话只会继续
-        顶延迟(政策翻转:垫话服务真答案,不是反过来)。yield 闸关/provider 缺席/
-        无 arm 账本(直调 _fire 的嵌入方)/读取失败/早于 arm → False(旧行为)。
+        未到」起点的 monotonic;晚于本轮 arm=真答案在途。返回值=now-since 的
+        已持续时长,调用方按 RESHOT_PENDING_GRACE_S 分流:
+        - 0 < 时长 <= 2s:新近在途,首音频将至——reshot 让路(补发会被停播立刻
+          掐掉,白烧额度;旧文案「再补只会顶延迟」随 hold=0 政策翻转已死);
+        - 时长 > 2s:真 bidi 卡顿/LLM 慢窗——放行第二发填死区(裸静默比补发贵)。
+        闸关/无 arm 账本(直调 _fire 的嵌入方)/读取失败/早于 arm(上一轮残值)
+        → 0.0(旧行为:不拦)。
         """
         if not _yield_enabled() or self._reply_pending_provider is None:
-            return False
+            return 0.0
         if not self._arm_time:
-            return False
+            return 0.0
         try:
             since = float(self._reply_pending_provider() or 0.0)
         except Exception:  # noqa: BLE001 - 查询失败=不拦(旧行为)
-            return False
-        return since > self._arm_time
+            return 0.0
+        if since <= self._arm_time:
+            return 0.0
+        return max(0.0, time.monotonic() - since)
 
     def _spawn_chain(self) -> None:
         """首条起播即挂「播完观察者」——官方 PlayHandle.wait_for_playout 精确补位。
@@ -895,7 +919,8 @@ class FillerDirector:
 
         顺序=①每轮至多一次(独立计数 _reshot_done,不复用链发) ②env 闸
         ③无 arm 账本(直调 _fire 的嵌入方)不适用 ④gap 呼吸(垫话→垫话同款)
-        ⑤回复在途让路(I2,2026-10-02:真答案首帧已在路上=再补只会顶延迟)
+        ⑤回复在途让路(I2,2026-10-02:新近在途=首音频将至,补了白补;但久悬
+        >RESHOT_PENDING_GRACE_S=真卡顿窗,放行补发填死区)
         ⑥gap 中回复出声让位 ⑦elapsed>RESHOT_MIN_ELAPSED_S(真载荷轮才补——
         治旧链发「固定双发」的根) ⑧补发走 _fire(reshot=True),计数同源(与
         第一发合计消耗 BOK_FILLER_MAX);连轮冷却豁免同链发(本轮已有第一发=
@@ -908,8 +933,16 @@ class FillerDirector:
         if not self.fired_this_round():
             return
         await asyncio.sleep(filler_gap_s())
-        if self._reply_pending_since_arm():
-            print("FILLER_YIELD reshot skipped (reply pending)", flush=True)
+        pending = self._reply_pending_hold_s()
+        if 0.0 < pending <= RESHOT_PENDING_GRACE_S:
+            # 文案同步(2026-10-02):旧理由「再补只会顶延迟」随 hold=0 死亡;
+            # 现理由=首音频将至(补发会被停播即刻掐掉)。前缀保持不变(既有
+            # 子串断言/soak grep 兼容),新语义追加在后。
+            print(
+                f"FILLER_YIELD reshot skipped (reply pending) {pending:.2f}s —"
+                " first audio imminent",
+                flush=True,
+            )
             return
         if self._reply_audio_seen:
             print("BOK_FILLER reshot skip reason=audio_arrived", flush=True)
@@ -923,6 +956,15 @@ class FillerDirector:
                 flush=True,
             )
             return
+        if pending > RESHOT_PENDING_GRACE_S:
+            # 真卡顿窗(pending 本身即病理):让路反转=放行补发填死区。
+            # 归因行放在真开火前(前置各门全过后)——避免「打了放行却因
+            # elapsed/让位门落空」的误导日志。
+            print(
+                f"FILLER_YIELD reshot pending {pending:.2f}s >"
+                f" {RESHOT_PENDING_GRACE_S:g}s — stalled, 放行补发",
+                flush=True,
+            )
         self._reshot_done = True
         _count_before = self._count
         await self._fire(0.0, reshot=True)
@@ -1117,11 +1159,19 @@ class FillerDirector:
             # (定时器任务与状态翻转存在竞态窗口)。
             if not filler_enabled() or self._player is None:
                 return
-            if reshot and self._reply_pending_since_arm():
-                # I2 让路(2026-10-02):观察段与真正开火之间的窗口里回复流已开
-                # (_reshot_wait 已先行拦一道,这里是 _fire 直调/竞态的第二道)。
-                print("FILLER_YIELD reshot skipped (reply pending)", flush=True)
-                return
+            if reshot:
+                _pending = self._reply_pending_hold_s()
+                if 0.0 < _pending <= RESHOT_PENDING_GRACE_S:
+                    # I2 让路(2026-10-02):观察段与真正开火之间的窗口里回复流
+                    # 新近在途(_reshot_wait 已先行拦一道,这里是 _fire 直调/竞态
+                    # 的第二道)——首音频将至,补发白补。久悬(>2s)属真卡顿窗,
+                    # 放行(与 _reshot_wait 同判据,分叉即回滚)。
+                    print(
+                        f"FILLER_YIELD reshot skipped (reply pending) {_pending:.2f}s —"
+                        " first audio imminent",
+                        flush=True,
+                    )
+                    return
             if self._guards() or filler_max_per_call() <= self._count:
                 return
             _cd = filler_cooldown_s()

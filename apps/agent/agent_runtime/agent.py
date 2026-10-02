@@ -1457,23 +1457,27 @@ def _perceived_take(m: dict) -> tuple[int, int, int] | None:
 def _judge_yield_env() -> tuple[float, float]:
     """judge 让路参数单点解析:(floor_s, cap_s)。测试钉默认值用。
 
-    - floor_s=FLOW_JUDGE_DELAY(默认 3):开火前固定让一拍(旧语义,永在)。
-    - cap_s=FLOW_JUDGE_IDLE_CAP(默认 6,2026-09-24 由 0 转正):空闲窗等待上限,
+    - floor_s=FLOW_JUDGE_DELAY(默认 1,2026-10-02 由 3 放宽):judge 与 reply 已
+      分端点(十七波,a_reply=:1237 直连 / judge=:1235 代理→4B),同槽互斥消失,
+      只剩 GPU 错峰——固定让一拍即可,3s 旧档是排队时代的余数。
+    - cap_s=FLOW_JUDGE_IDLE_CAP(默认 3,2026-10-02 由 6 放宽):空闲窗等待上限,
       到点照开火(让不完就撞,仍是旧行为兜底,判定永不负损);0=回纯固定让路。
+    - 饥荒 overlay 姿态(a_reply 拉回 :1235 同槽互斥复活)时 env 调回旧档
+      (FLOW_JUDGE_DELAY=3 / FLOW_JUDGE_IDLE_CAP=6)=恢复排队时代闸语义。
     """
     try:
-        floor_s = float(os.environ.get("FLOW_JUDGE_DELAY", "3") or 0)
+        floor_s = float(os.environ.get("FLOW_JUDGE_DELAY", "1") or 0)
     except ValueError:  # pragma: no cover - 配错回默认
-        floor_s = 3.0
+        floor_s = 1.0
     try:
-        cap_s = float(os.environ.get("FLOW_JUDGE_IDLE_CAP", "6") or 0)
+        cap_s = float(os.environ.get("FLOW_JUDGE_IDLE_CAP", "3") or 0)
     except ValueError:  # pragma: no cover - 配错回默认
-        cap_s = 6.0
+        cap_s = 3.0
     return floor_s, cap_s
 
 
 def _judge_capped_skip_enabled() -> bool:
-    """capped（让不完）时跳过本轮判定而非到点照开火（2026-09-25 车道卫生）。
+    """capped（让不完）时的跳过总闸（2026-09-25 车道卫生；2026-10-02 复标）。
 
     背景：让路统计实测 capped 169 / idle 仅 6——等满 FLOW_JUDGE_IDLE_CAP 照样
     开火意味着 judge 大概率撞进「回复生成中/客户长讲」窗，prefill 589-694 tok
@@ -1481,18 +1485,45 @@ def _judge_capped_skip_enabled() -> bool:
     本来是「下一轮才消费」的补位，capped=链路持续忙 → 本轮判定错过就错过，
     规则路/下一轮 judge 兜底。BOK_JUDGE_CAPPED_SKIP=0 回旧行为（到点照开火，
     判定永不负损）。
+
+    复标注（判定点见 `_judge_capped_should_skip`）：本闸只表示「允许收窄跳过」，
+    真正跳不跳由 `_judge_capped_should_skip` 定——仅 agent==thinking（链路明示
+    回复在生成）才跳；状态未知/缺席一律放行。实弹 130/130 capped 全来自
+    test-object 通话（旧版 _link 钩子挂 nudge 门下从未注册 → 闸恒 busy），
+    359 skip 把 flow judge 结构性饿死——收窄后该病根不再致命。
     """
     return os.environ.get("BOK_JUDGE_CAPPED_SKIP", "1") == "1"
 
 
-# judge 回复让位等待上限(秒,硬常量不做 env——W-GATE 2026-09-27):
-# :1235 单飞门只有排队优先级、无抢占——judge 先占槽时回复要等 judge 整条流
-# (1-4s,实测 TTFT 2366-2546ms 离群与回复 tps 塌陷的主因)。修法=judge 起跑后
-# 等「本轮回复已交付」事件再进 LLM(:1235 前端与 FLOW_JUDGE_* 专线同吃让位)。
-# 15s 上限的理由:回复正常 p95 <6s(卡死轮由 6s 看门狗兜出 ack 照落账),等满
-# 15s 仍未交付=回复结构性死火/永不来,judge 照旧开火(判定永不被无限饿死);
-# 不做 env 开关——事件已置位=零等待零日志,天然退化为旧行为,无需 kill-switch。
-_JUDGE_REPLY_WAIT_S = 15.0
+def _judge_capped_should_skip(verdict: str, link: dict, *, enabled: bool | None = None) -> bool:
+    """capped→skip 收窄判定（2026-10-02 复标,纯函数可单测）。
+
+    旧语义：任一 capped 即跳过——但 capped 只说明「让路窗没等到」，不等于
+    「judge 会伤回复」：judge 与 reply 已分端点（十七波），同槽互斥消失，
+    开火只剩 GPU 错峰。真值得让的还是「回复正在生成」（agent==thinking）;
+    链路状态未知/缺席（空态、装配初期）不构成伤害证据 → 放行（fail-open，
+    判定永不被结构性饿死；BOK_JUDGE_CAPPED_SKIP=0 = 整闸关，到点照开火）。
+    """
+    if str(verdict) != "capped":
+        return False
+    on = _judge_capped_skip_enabled() if enabled is None else bool(enabled)
+    if not on:
+        return False
+    return str((link or {}).get("agent") or "") == "thinking"
+
+
+# judge 回复让位等待上限(秒,2026-10-02 复标:15→4):
+# 旧 15s 前提=judge 与回复同端点(:1235 单飞门无抢占——judge 先占槽时回复要等
+# 整条流 1-4s),等待帽必须盖住回复 p95 才不至于同槽对撞。十七波已分端点
+# (a_reply=:1237 直连 / judge=:1235 代理→4B),互斥消失只剩 GPU 错峰:回复
+# 请求恒先入队(钩子同步触发,百毫秒级),judge 迟进队列只会排在回复之后——
+# 等 4s 足够错开回复首包窗,等满仍未交付=回复结构性慢/死火,judge 照旧开火
+# (判定永不被饿死)。**饥荒 overlay 姿态**(a_reply 拉回 :1235 代理=同槽互斥
+# 复活)下 4s 帽依旧安全(回复请求先入队,FIFO/回复优先令 judge 不会挡回复);
+# 要恢复排队时代整闸语义用已转发的 env 对:FLOW_JUDGE_DELAY=3 +
+# FLOW_JUDGE_IDLE_CAP=6(见 `_judge_yield_env`)。本常量不做 env(新增键须进
+# tools/bok.py `_FORWARD_ENV` 才非死门,本波文件面外;调用时解析=可单测 patch)。
+_JUDGE_REPLY_WAIT_S = 4.0
 
 
 async def _await_reply_done(
@@ -1503,7 +1534,8 @@ async def _await_reply_done(
     返回实际等待毫秒(事件早已置位=0.0,零日志快路径)。真等过 → 打一行
     ``FLOW_JUDGE deferred reply_ms=<ms>``(超时同样落行,reply_ms≈上限,日志面
     可区分「让到位」与「让不完」);超时照旧开火(回复卡死唔可以饿死判定)。
-    默认上限读模块常量 `_JUDGE_REPLY_WAIT_S`(调用时解析=测试可 patch 小值)。
+    默认上限读模块常量 `_JUDGE_REPLY_WAIT_S`(=4.0,调用时解析=测试可 patch
+    小值;新前提=分端点仅 GPU 错峰,见常量注释)。
     """
     if ev.is_set():
         return 0.0
@@ -1520,19 +1552,19 @@ async def _await_reply_done(
 
 
 async def _wait_link_idle(link: dict, *, floor_s: float, cap_s: float) -> str:
-    """judge 开火前的让路:floor(固定让一拍) + 「4B 不在 prefill 窗」错峰。返回 idle/capped/disabled。
+    """judge 开火前的让路:floor(固定让一拍) + 「4B 不在回复生成窗」错峰。返回 idle/capped/disabled。
 
-    **空闲窗定义(2026-09-24 修正:播报中也算闲)**:``agent in (listening, speaking)``
-    且客户不在讲。真 GPU 空闲窗=LLM 生成完+TTS 云端放音中(4B 闲、ASR 无输入)——
-    即 ``agent==speaking`` 的中后段,每轮 3-10s,恰是旧闸看不见的那扇窗。旧版只认
-    listening(播报也结束),2026-09-22 实测 9/9 capped:回复播报 10-19s 普遍超过
-    闸上限,窗口结构性够不着,闸退化成纯延时后于 09-24 转正前一直默认关。同卡争用
-    实弹(2026-09-24 争用窗画像):judge 与回复生成同窗 → 4B tps 塌到 10-25、回复
-    整段超 4s 被看门狗收割(5/5 LLM 轮阵亡)。本闸把 judge 挪进播报窗=「judge 闲时
-    去」。capped 到点照开火:极端长生成轮让不完就让,判定永不负损。多机/CUDA 后
-    judge 挪出本地 GPU(W10-12),本闸届时自然空转(窗口恒开)。
-    观测面:``[judge] yield idle|capped|disabled`` 占比 + ``judge_pending_expired``
-    (让路太晚会伤判定时效——pending 单发,下一轮图块求值时先取即清)。
+    **空闲窗定义(2026-09-24 修正:播报中也算闲;2026-10-02 复标:用户话中窗放行)**:
+    ``agent in (listening, speaking)`` 即闲——真 GPU 空闲窗=LLM 生成完+TTS 云端
+    放音中(4B 闲),即 ``agent==speaking`` 的中后段,每轮 3-10s。旧版**还要求
+    客户不在讲**(user!=speaking)是排队时代余数:judge 与回复同端点时,客户话中
+    窗=预生成/回复 prefill 即将抢槽;十七波分端点(judge=:1235 / a_reply=:1237)
+    后互斥消失,用户话中窗直接跑零额外代价(实测 130/130 capped 全来自状态面
+    缺席,用户窗非瓶颈)。capped 到点照开火(判定永不负损;是否收窄跳过见
+    `_judge_capped_should_skip`)。多机/CUDA 后 judge 挪出本地 GPU,本闸自然空转
+    (窗口恒开)。观测面:``[judge] yield idle|capped|disabled`` 占比 +
+    ``judge_pending_expired``(让路太晚会伤判定时效——pending 单发,下一轮图块
+    求值时先取即清)。
     """
     if cap_s <= 0:  # 关闭=旧的固定让路语义,逐字节同旧
         if floor_s > 0:
@@ -1542,7 +1574,9 @@ async def _wait_link_idle(link: dict, *, floor_s: float, cap_s: float) -> str:
     t0 = time.monotonic()
 
     def _idle() -> bool:
-        return link.get("agent") in ("listening", "speaking") and link.get("user") != "speaking"
+        # 用户话中窗放行(2026-10-02):分端点后 judge 进 LLM 不再与回复同槽,
+        # 客户在讲不构成互斥;剩下唯一要错峰的信号=agent 还在生成(thinking)。
+        return link.get("agent") in ("listening", "speaking") or link.get("user") == "speaking"
 
     if floor_s > 0:
         await asyncio.sleep(floor_s)
@@ -2326,8 +2360,10 @@ def _preemptive_generation_opts() -> dict:
     结构性不可能：插件 PREFLIGHT 只发稳定前缀（防幻觉尾巴），提交转写是全句
     FINAL，框架 `_transcripts_equivalent`（逐词相等）恒假；且 max_retries 烧穿
     后新 PREFLIGHT 先 cancel 旧快照再 bail → commit 时连比较都不跑。每次失效
-    的投机请求被 mlx「无断连中止」解码到完才放锁，解码尾巴（~1-2s GPU）挤占
-    真请求队列。替代=PrefillSpeculator out-of-band prefill 预热（不出声、
+    的投机请求在 W-ABORT(2026-10-01 刀B)前会被 mlx 解码到完才放锁，解码尾巴
+    （~1-2s GPU）挤占真请求队列；刀B 后弃流确定点发 POST /v1/abort、服务端
+    逐 yield 查旗自停（残余损伤窗=prefill 期——服务端零写、断连不可见）。
+    替代=PrefillSpeculator out-of-band prefill 预热（不出声、
     max_tokens=1、只暖 KV），见 prefill_speculator.py。
     """
     return {
@@ -3655,16 +3691,9 @@ async def entrypoint(ctx):
         防 4s 闸把在播的第二发掐成 watchdog-ack(每轮至多两延:首发一延+第二发
         一延;顺延失败/未武装照旧无害)。"""
         ext = _response_watchdog_filler_ext_s() if extra_s is None else extra_s
-        if extra_s is None:
-            # B1(2026-09-30 真机第一批,call-fde11c52 实证):垫话 2-3s 音频盖耳期
-            # 只顺延 2s 是结构性短窗——真机回复首帧叠 hold 落 5-6s 被掐。顺延窗
-            # 按**垫话时间轴剩余**撑高(hold_if_playing 返回「回复首帧应扣压的
-            # 秒数」=垫话开播+时长+gap 的剩余量)+1.5s 出声缓冲,env 值为下限。
-            try:
-                hold_left = float(_filler.hold_if_playing() or 0.0)
-            except Exception:  # noqa: BLE001 - 垫话无时钟=退 env 窗
-                hold_left = 0.0
-            ext = max(ext, hold_left + 1.5)
+        # B1「按垫话时间轴剩余撑高」退役(2026-10-02 复标):十七波垫话让路改
+        # hold=0 后 hold_if_playing() 恒 0,max(env, 0+1.5)=max(2,1.5)=env ——
+        # 撑高已成死码,删除读取(恒 env 下限);击杀开关/重发语义原样。
         if _filler.reshot_firing():
             _watchdog["extended"] = False
         _watchdog_extend(
@@ -4057,7 +4086,11 @@ async def entrypoint(ctx):
                 return
             # EX-2 chokepoint:投递前拆看门狗 + 预锚(迟答真内容是待补的实答);
             # gen="llm"=补答入跨轮复读账本(见 I3 去重注释)。
-            _register_reply_lane(lane="late-answer", gen="llm", text=text)
+            # relieve=False(2026-10-02 复标,先例 qa-fastpath 6746-6748):本登记的
+            # 抵销会与交付后 `_report_assistant_turn`(gen=llm)再抵一次=stall 双扣
+            # (账本同时被登记点+item 侧双写 record_reply)。抵销/账本单点归交付
+            # 后链路;登记侧只留票据+锚+拆看门狗。
+            _register_reply_lane(lane="late-answer", gen="llm", text=text, relieve=False)
             await _say_script(session, tts_provider, _tts_cache, text)
         except Exception as exc:  # noqa: BLE001 - 会话已关等
             print(f"late-answer say failed: {exc!r}", flush=True)
@@ -4634,6 +4667,10 @@ async def entrypoint(ctx):
     _pending_lane: dict = {"lane": ""}   # notify 车道:provider 顺延到下一个 assistant item
     _current_lane: dict = {"lane": ""}   # 垫话 derive_context_bucket 读面(等价旧 provider)
     _last_item_gen: dict = {"v": ""}     # _on_item_for_context 的 LLM 账本写入判据
+    # 本 item 的原文是否已在登记时点入跨轮账本(2026-10-02 late-answer 双写复标):
+    # ticket 带文=chokepoint `_register_reply_lane` 已 record_reply,item 侧不得
+    # 二次 record(同文双条既污染比对面也放大复读误判)。
+    _last_item_registered: dict = {"v": False}
     _TICKET_TTL_S = 30.0          # 过期孤儿票据硬丢弃
     _TICKET_FRESH_S = 5.0         # 无文本匹配时的最旧票据兜底窗(say item 即时到达)
 
@@ -4828,6 +4865,9 @@ async def entrypoint(ctx):
             gen = "llm"
             provider = _pending  # 默认空串(纯 LLM);notify 车道标 provider
         _last_item_gen["v"] = gen
+        # 票据带文=登记时点已 record_reply（见 _last_item_registered 注释）；
+        # item 侧账本写入据此跳过第二次。
+        _last_item_registered["v"] = bool(_ticket is not None and _ticket.text)
         # F7 墙钟（2026-09-28）：commit→首音频都在场时用真墙钟毫秒；否则旧近似
         # （started=now-latency、ended=落库时刻）。
         _commit_ms = _turn_timing.pop("commit_ms", None)
@@ -4984,8 +5024,10 @@ async def entrypoint(ctx):
                         context_state.set_last_reply(_clean_transcript(guarded))
                         # 跨轮复读账本(PART C,EX-2):只记 LLM 轮(脚本车道由
                         # chokepoint 登记时已入账);_last_item_gen 由
-                        # _on_conversation_item(先注册)置位。
-                        if _last_item_gen["v"] == "llm":
+                        # _on_conversation_item(先注册)置位。带文票据(如
+                        # late-answer)登记侧已 record → 此处让开,防同文双条
+                        # (2026-10-02 复标,见 _last_item_registered)。
+                        if _last_item_gen["v"] == "llm" and not _last_item_registered["v"]:
                             context_state.record_reply(_clean_transcript(guarded), "llm")
                     except Exception:  # pragma: no cover - 锚失败唔阻主流程
                         pass
@@ -5282,7 +5324,14 @@ async def entrypoint(ctx):
     _link: dict[str, str] = {"agent": "", "user": ""}
 
     async def _judge_yield() -> str:
-        """judge 开火前的让路:floor(FLOW_JUDGE_DELAY) + 空闲窗让路(默认 6s,见 _wait_link_idle)。"""
+        """judge 开火前的让路:floor(FLOW_JUDGE_DELAY,缺省 1s) + 空闲窗让路(缺省 3s,见 _wait_link_idle)。
+
+        2026-10-02 新前提:judge(:1235 代理→4B)与 a_reply(:1237 直连 9B)已分
+        端点,同槽互斥消失,让路只为 GPU 错峰(best-effort);真排位保护在
+        `_await_reply_done`(回复已交付才进 LLM,缺省帽 4s=常量 `_JUDGE_REPLY_WAIT_S`)。
+        饥荒 overlay 把 a_reply 拉回 :1235 代理(=同槽互斥复活)时,用已转发的
+        env 对 FLOW_JUDGE_DELAY=3 / FLOW_JUDGE_IDLE_CAP=6 恢复排队时代闸语义。
+        """
         _floor_s, _cap_s = _judge_yield_env()
         verdict = await _wait_link_idle(_link, floor_s=_floor_s, cap_s=_cap_s)
         # 观测:judge 是「下一轮才消费」的补位,让路到多晚直接决定它还能不能赶上那一轮——
@@ -5302,9 +5351,10 @@ async def entrypoint(ctx):
             # judge 与主回复抢 prefill 会推高本轮 TTFT(实测 9B 占 GPU 时 4B prefill
             # +1375ms,见 probe_gpu_contention);judge 判定本来就下一轮先生效,迟几秒冇损失。
             _yield_verdict = await _judge_yield()
-            if _yield_verdict == "capped" and _judge_capped_skip_enabled():
-                # 车道卫生(2026-09-25):让不完=链路持续忙,照开火只会把 judge 的
-                # prefill 撞进真回复的生成窗——跳过本轮,规则路/下一轮判定兜底。
+            if _judge_capped_should_skip(_yield_verdict, _link):
+                # 车道卫生(2026-09-25;2026-10-02 复标收窄):仅「capped 且链路
+                # 明示回复生成中」才跳过——状态未知/缺席照跑(fail-open,防旧版
+                # _link 未注册时闸恒 busy=judge 全灭)。收窄判定见纯函数。
                 print(f"[judge] skipped reason=capped (call {room_name})", flush=True)
                 return
             # W-GATE(2026-09-27):回复让位——让路 delay 之后、进 LLM 之前等本轮
@@ -5493,9 +5543,9 @@ async def entrypoint(ctx):
         """
         try:
             # 让路节流同 flow judge:主回复刚提交,先等一拍、再等到链路真空闲才跑判定(同一闸)。
-            # capped→skip 同款语义(2026-09-25 车道卫生,见 _judge_capped_skip_enabled)。
+            # capped→skip 同款收窄语义(2026-10-02,见 _judge_capped_should_skip)。
             _yield_verdict = await _judge_yield()
-            if _yield_verdict == "capped" and _judge_capped_skip_enabled():
+            if _judge_capped_should_skip(_yield_verdict, _link):
                 print(
                     f"FLOW_GRAPH judge_skipped reason=capped (call {room_name})",
                     flush=True,
@@ -7574,6 +7624,10 @@ async def entrypoint(ctx):
                             notify=True,
                         )
                         _filler.play_offband(_pa_line)
+                        # P3(2026-10-02):off-band 音轨无 speech item → turns 此前
+                        # 零痕迹(暂停期客户听到的账外话)。直记一行(provider=
+                        # pause-ack,不进聊天史;语音行为不变)。
+                        await _ledger_ack_line("pause-ack", _pa_line)
                 elif not paused and agent.paused:
                     agent.paused = False
                     print(f"[agent] supervisor resumed agent ({room_name})", flush=True)
@@ -7664,6 +7718,8 @@ async def entrypoint(ctx):
 
     def _on_agent_state(ev) -> None:
         # AI 講完轉「聆聽」→ 記低 AI 最後講完時刻再起錶;講話/思考中 → 撤錶。
+        # 链路占用态喂 judge 错峰闸(_link)——与 nudge 解耦恒注册(2026-10-02
+        # 复标,见下方注册点):nudge 副作用各函数内自守。
         _link["agent"] = getattr(ev, "new_state", "") or ""
         if getattr(ev, "new_state", "") == "listening":
             _nudge_state["last_reply_ts"] = time.monotonic()
@@ -7681,9 +7737,13 @@ async def entrypoint(ctx):
             # _fire 的时序护栏会挡住「答案还在路上」的窗口,误 arm 无害。
             _arm_silence()
 
-    if nudge_max > 0:
-        session.on("agent_state_changed", _on_agent_state)
-        session.on("user_state_changed", _on_user_state)
+    # 链路占用态钩子恒注册(2026-10-02 复标):judge 错峰闸吃 _link,此前与心跳
+    # 同挂 `nudge_max > 0` 门下——test-object/E2E 通话(=探针主战场)nudge 关 →
+    # _link 从未喂过 → 闸恒 busy=capped → 实弹 130/130 capped、359 skip=judge
+    # 全灭。与 _on_partial_gate 同款教训(恒注册),nudge 副作用在各自函数内
+    # 按 `nudge_max` 自守。
+    session.on("agent_state_changed", _on_agent_state)
+    session.on("user_state_changed", _on_user_state)
 
     def _on_partial_gate(ev) -> None:
         # GPU 竞态专项:LLM 生成/播报中抬高 ASR partial 档,listening 恢复默认。
@@ -7725,6 +7785,14 @@ async def entrypoint(ctx):
             return
 
         async def _watch() -> None:
+            # P0 刀1 时序门取样点(2026-10-02 复标,原 bug):打断/弃流判据的
+            # 「打断时刻」必须在此同步取(speech_created 入口),绝不能用
+            # `await handle` 之后的时刻——框架打断有 5s 宽限,宽限窗内下一轮
+            # 新流可能已创建(~0.4-1s,`_bok_created` 晚于真打断时刻但早于
+            # 收场时刻),晚归的 now 会让 `_find_abandonable_stream` 把新流
+            # 当「早于打断」错弃(单槽竞态误杀)。被打断的回复流创建恒早于
+            # 本 speech 创建时刻,判据方向不变。
+            _interrupt_at = time.monotonic()
             try:
                 await handle
             except Exception:  # noqa: BLE001 - speech 收场异常唔阻账本
@@ -7751,6 +7819,8 @@ async def entrypoint(ctx):
             # + watchdog 双杀）。此刻用户正在说话，judge 有话中窗先跑完 prefill，
             # 严格优于帽过期抢槽。
             _reply_done_event.set()
+            # 收场时刻(风暴计数/退避窗用);弃流时序门用入口的 _interrupt_at
+            # ——两者不可混(见上,5s 宽限窗错位)。
             now = time.monotonic()
             if source == "generate_reply":
                 # B3:计数 + 达阈值开风暴(让路语直念一次)。
@@ -7817,7 +7887,8 @@ async def entrypoint(ctx):
                 # 用户已开口=本轮答案过时:链上 fallback 流创建早于打断时刻即
                 # abandon(force abort 服务端+熔断补答交付),partial 为空的
                 # 无首token僵尸正是主体,故本块移出 partial 门。时序门保下一轮
-                # 新流永不误杀。纯超时 drain(机器慢)语义不变。BOK_INTERRUPT_REAP=0 关。
+                # 新流永不误杀(取样点=_watch 入口 _interrupt_at,非收场 now)。
+                # 纯超时 drain(机器慢)语义不变。BOK_INTERRUPT_REAP=0 关。
                 if os.environ.get("BOK_INTERRUPT_REAP", "1") == "1":
                     _abandoned_ids: set[int] = set()
                     for _reap_layer in ("_last_guard_stream", "_last_reply_stream"):
@@ -7825,7 +7896,7 @@ async def entrypoint(ctx):
                         if _reap_stream is None:
                             continue
                         if not _reap_generation_idle(_reap_stream):
-                            _fs = _find_abandonable_stream(_reap_stream, now)
+                            _fs = _find_abandonable_stream(_reap_stream, _interrupt_at)
                             if _fs is not None and id(_fs) not in _abandoned_ids:
                                 _abandoned_ids.add(id(_fs))
                                 try:
