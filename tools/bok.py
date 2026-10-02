@@ -706,9 +706,35 @@ def healthy(port: int) -> bool:
         return False
 
 
+# ── 就绪真话（2026-10-02 编排审计第二波 · PR-A）──────────────────────────────
+# 端口绑定先于权重可用：mlx_lm 先 listen 再装权重、sidecar 的 uvicorn socket
+# 先于模型装载就绪，两者都让 1s TCP 探活变成谎（「绿着坏」）——等待环等到的是
+# 半死进程、健康面全绿而通话全灭。下列两个探针只认 HTTP 200，永不抛。
+def _http_ok(port: int, path: str, timeout_s: float = 1.5) -> bool:
+    """HTTP 真话探针：**仅 HTTP 200 为 True**（404/426/5xx/超时/拒连全 False，
+    与 _relaxed_healthy「任何应答=活」语义刻意相反——那个答的是「进程在」，
+    这个答的是「能干活」）。永不抛。"""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=timeout_s) as r:
+            return int(getattr(r, "status", 0) or 0) == 200
+    except Exception:  # noqa: BLE001 - 探针只判定，不抛
+        return False
+
+
+def _llm_http_ready(port: int, timeout_s: float = 1.5) -> bool:
+    """LLM 端口就绪真话：/v1/models 必须 HTTP 200。queue proxy 拓扑下 :1235 是
+    代理（/v1/models 直通上游 mlx），代理活而上游 mlx 死亡/装载中同样 False。"""
+    return _http_ok(port, "/v1/models", timeout_s)
+
+
 # 健康面服务单点表（cmd_status / cmd_doctor / cmd_prod_status 共用，防三张表
 # 各自漂移）：settle-llm(1237) 曾缺席 doctor 与 prod status——9B 静默缺失时
 # judge/纪要悄悄退回 4B 健康面全绿；worker 三件曾缺席 doctor。改端口先改这里。
+# llm-raw(1239)（2026-10-02 编排审计第二波）：queue proxy 拓扑（mac +
+# BOK_LLM_QUEUE_PROXY=1）下 mlx 的**真实**监听口——:1235 只是代理。此前
+# 1239 在全部健康/孤儿表缺席：代理活着而上游 mlx 死了（半瘫）四表全绿。
+# 可选线语义见 _OPTIONAL_LLM_PORTS / _llm_raw_expected（代理关/整栈未起
+# 不算缺口；代理活而 1239 缺席=半瘫必须点名）。
 CORE_PORTS: tuple[tuple[str, int], ...] = (
     ("control-plane", 8000),
     ("asr", 8787),
@@ -716,6 +742,7 @@ CORE_PORTS: tuple[tuple[str, int], ...] = (
     ("llm", 1235),
     ("mt-llm", 1236),
     ("settle-llm", 1237),
+    ("llm-raw", 1239),
     ("embed", 8789),
     ("laya", 8791),
     ("livekit", 7880),
@@ -725,12 +752,15 @@ WORKER_PORTS: tuple[tuple[str, int], ...] = (
     ("interp-fwd", 8082),
     ("interp-rev", 8083),
 )
-# prod status 基础 HTTP 检查（mt/settle 是可选增强，起了才动态追加）。
+# prod status 基础 HTTP 检查（mt/settle 是可选增强，起了才动态追加；llm-raw
+# 同属可选线——queue proxy 拓扑在 + 代理活着才进表，见
+# _llm_raw_status_check_expected）。
 PROD_HTTP_CHECKS: tuple[tuple[str, int, str], ...] = (
     ("control-plane", 8000, "/health"),
     ("asr", 8787, "/health"),
     ("tts", 8788, "/health"),
     ("llm", 1235, "/v1/models"),
+    ("llm-raw", 1239, "/v1/models"),
     ("livekit", 7880, "/"),
 )
 
@@ -846,6 +876,8 @@ def _probe_llm(base_url: str = "http://127.0.0.1:1235/v1",
 # PROD_HTTP_CHECKS/WORKER_PORTS 既有单点表，不另造并行表；mt/settle(:1236/1237)
 # 是 prod status「起了才查」的可选线，同为 mlx_lm server，健康面同样是 /v1/models；
 # 不在表内的端口（3000 web UI 等）退 TCP——连接通即算活。
+# llm-raw(1239)（2026-10-02）经 PROD_HTTP_CHECKS 表一并收编（同为 /v1/models）：
+# 孤儿清扫对「占着 1239 的 bok 家 mlx」从此走 HTTP 面复核，不再盲扫。
 _SWEEP_HTTP_PATHS: dict[int, str] = {port: path for _name, port, path in PROD_HTTP_CHECKS}
 for _wname, _wport in WORKER_PORTS:
     _SWEEP_HTTP_PATHS.setdefault(_wport, "/worker")
@@ -890,12 +922,67 @@ def _ports_down_after_grace(
     return [p for p in targets if not probe(p)]
 
 
-_OPTIONAL_LLM_PORTS = (1236, 1237, 8789, 8791)  # mt/settle/embed/laya:模型缺失即跳过,缺它们不拖垮整栈(embed/laya 非 LLM,同享可选豁免)
+_OPTIONAL_LLM_PORTS = (1236, 1237, 1239, 8789, 8791)  # mt/settle/llm-raw/embed/laya:模型缺失即跳过,缺它们不拖垮整栈(embed/laya/llm-raw 非主回复链,同享可选豁免)
 
 
 def _only_optional_ports(down: list[int]) -> bool:
-    """宽松终检缺口全落在可选线(MT :1236/settle :1237)→ True(整栈照常放行)。"""
+    """宽松终检缺口全落在可选线(MT :1236/settle :1237/llm-raw :1239)→ True(整栈照常放行)。"""
     return bool(down) and all(p in _OPTIONAL_LLM_PORTS for p in down)
+
+
+def _llm_raw_expected() -> bool:
+    """:1239（llm-raw，queue proxy 背后的内部 mlx）拓扑是否在役：mac +
+    BOK_LLM_QUEUE_PROXY=1。代理关（或非 mac——Windows/Linux 走 llama.cpp，
+    无 1239 拓扑）时 mlx 直跑 :1235，1239 缺席是设计态不是故障。"""
+    return is_mac() and _llm_queue_proxy_on()
+
+
+def _llm_raw_status_check_expected() -> bool:
+    """prod status 对 :1239 的「进表」判据：拓扑在役 + 代理活着（:1235 在听）。
+    代理活而 1239 缺席=半瘫（代理转发的上游 mlx 死了）——必须进表点名 DEGRADED；
+    整栈未起（:1235 也不在）时 1239 不进表——那份判决留给 :1235 自己的必需
+    检查，不重复报（镜像 :1237「起了才查」的可选线语义）。"""
+    return _llm_raw_expected() and healthy(1235)
+
+
+# serve 就绪等待环的逐口判据（2026-10-02 readiness 真话）：这三个口有真实
+# HTTP 就绪面，必须 200 才算就绪（端口绑定先于权重可用，TCP=谎）；其余
+# （8000/7880/worker）维持 TCP——worker 的 /worker 真端点由 prod status /
+# monitor 面负责，serve 等待环不改语义。
+_SERVE_HTTP_READY_PORTS: dict[int, str] = {8787: "/health", 8788: "/health"}
+
+
+def _serve_ready_probe(port: int) -> bool:
+    """serve 等待环 1s 快档判据：LLM :1235 走 /v1/models HTTP-200；ASR/TTS
+    sidecar :8787/:8788 走 /health HTTP-200（模型装载中=503，等它）；其余 TCP。"""
+    if port == 1235:
+        return _llm_http_ready(port)
+    path = _SERVE_HTTP_READY_PORTS.get(port)
+    if path:
+        return _http_ok(port, path)
+    return healthy(port)
+
+
+def _serve_ready_probe_relaxed(port: int) -> bool:
+    """serve 宽松终检档判据：严格口维持 HTTP-200 真话（5s 窗吸收宿主 CPU
+    风暴的调度延迟），其余端口退回 _relaxed_healthy 旧语义——互杀事故收编
+    （2026-09-19）不得因本轮收窄。"""
+    if port == 1235:
+        return _llm_http_ready(port, timeout_s=5.0)
+    path = _SERVE_HTTP_READY_PORTS.get(port)
+    if path:
+        return _http_ok(port, path, timeout_s=5.0)
+    return _relaxed_healthy(port)
+
+
+def _wait_desktop_ready(targets: Sequence[int], tries: int = 120) -> bool:
+    """serve 就绪等待环（120×1s 形状保留）：全部 target 按 _serve_ready_probe
+    逐口判就绪才 True；超时 False（由调用方做宽松终检/宣判）。"""
+    for _ in range(tries):
+        if all(_serve_ready_probe(p) for p in targets):
+            return True
+        time.sleep(1)
+    return False
 
 
 def _repo_pythonpath() -> str:
@@ -1079,6 +1166,11 @@ def cmd_status() -> int:
         if name == "tts" and not healthy(port) and not _tts_needed:
             # 全云端门控跳过的 :8788 不是故障——如实标 skipped，不骗 DOWN。
             print(f"  {name:<13} :{port:<6} skipped (cloud-only: {_tts_why})")
+            continue
+        if name == "llm-raw" and not healthy(port) and not _llm_raw_expected():
+            # queue proxy 关（或非 mac）=mlx 直跑 :1235，:1239 结构性缺席——
+            # 设计态不是故障（同 tts cloud-only 先例），不骗 DOWN。
+            print(f"  {name:<13} :{port:<6} skipped (queue proxy off: mlx direct on :1235)")
             continue
         print(f"  {name:<13} :{port:<6} {'UP' if healthy(port) else 'DOWN'}")
     # worker 三件(2026-09-12 上表;2026-09-17 起读真 /worker 端点):serve 竞态令
@@ -1359,6 +1451,78 @@ def _control_plane_env(db: Path | str) -> dict[str, str]:
         _v = os.environ.get(_k, "").strip()
         if _v:
             env[_k] = _v
+    # ══ 2026-10-02 编排审计第二波 · CP env 面收编 ══════════════════════════
+    # prod（mac launchd / Windows schtasks）CP 单元的 env 是**封闭白名单**
+    # （_prod_units → _control_plane_env），dev 靠 _start_proc merge 才能活着——
+    # 凡 CP 会读而这张表没登记的键，在 prod 都是结构性死门（BOK_FLOW_GRAPH /
+    # BOK_QA_AUTO_DIGEST 两次同款教训）。下面按消费者分组显式透传；**显式设了
+    # 才下发（未设/空串/纯空白不注入）**=CP 侧缺省档零变化，先例=
+    # BOK_POLISH_OFFLINE/BOK_DISPATCH_RETRY 块。
+    # ① 认证三键（control_plane/auth.py）：BOK_AUTH_REQUIRED（auth_required()
+    #    判据 auth.py:75）、BOK_JWT_SECRET（jwt_secret() 签名键 auth.py:84，
+    #    main 启动闸缺它=BOK_AUTH_REQUIRED=1 直接拒启 main.py:461）、
+    #    BOK_CP_TOKEN（机器通道同值直通 auth.py:293 + main 多处）。**事故形状**：
+    #    prod 封闭面收不到 BOK_AUTH_REQUIRED=1 → CP 静默 auth-off（对外 bind 时
+    #    /api/* 全裸放行；main._unsafe_open_bind 只挡非回环+双关的极端档）。
+    #    密钥类走 BOK_SETTLE_LLM_API_KEY 先例（strip 判空 + 原值下发，不吃空格）。
+    for _k in ("BOK_AUTH_REQUIRED", "BOK_JWT_SECRET", "BOK_CP_TOKEN"):
+        if os.environ.get(_k, "").strip():
+            env[_k] = os.environ[_k]
+    # ② ops 面：BOK_LOG_LEVEL（CP 日志档 main.py:428）、BOK_CORS_ORIGINS（跨域
+    #    白名单 main.py:229）、BOK_ROOT_USERNAME/BOK_ROOT_PASSWORD（root 幂等种子
+    #    main.py:400-401，operator/机器赋权后的自助入口；密码原值下发不 strip）、
+    #    BOK_SIP_MODE（dial.mode env 覆盖 campaign.py:61）、BOK_CP_PUBLIC_URL
+    #    （云托管管理台/托管节点写 runtime-config main.py:444 + qa_digest.py:394）。
+    if os.environ.get("BOK_ROOT_PASSWORD", "").strip():
+        env["BOK_ROOT_PASSWORD"] = os.environ["BOK_ROOT_PASSWORD"]
+    for _k in ("BOK_LOG_LEVEL", "BOK_CORS_ORIGINS", "BOK_ROOT_USERNAME",
+               "BOK_SIP_MODE", "BOK_CP_PUBLIC_URL"):
+        _v = os.environ.get(_k, "").strip()
+        if _v:
+            env[_k] = _v
+    # ③ node / 静态面：BOK_NODE_ARTIFACTS_DIR（节点制品目录 main.py:4189,4208）、
+    #    BOK_NODE_LOG_TTL_DAYS（节点日志清扫窗 main.py:4250）、
+    #    BOK_WEB_STATIC_DIR（CP 托管的静态 UI 根 main.py:7532）、
+    #    BOK_APP_DATA（日志尾读/app-data 解析 main.py:7225——prod 的 app-data
+    #    与 dev 默认路径不同，不注入则 ops 日志面指向错目录）。
+    for _k in ("BOK_NODE_ARTIFACTS_DIR", "BOK_NODE_LOG_TTL_DAYS",
+               "BOK_WEB_STATIC_DIR", "BOK_APP_DATA"):
+        _v = os.environ.get(_k, "").strip()
+        if _v:
+            env[_k] = _v
+    # ④ settle 闲时轮（main.py:4623/4627 两窗；QA 挖掘/reports 后台作业在活通话
+    #    窗口的让路姿势——不注入则 prod 恒吃缺省 15s/300s）。
+    for _k in ("BOK_SETTLE_IDLE_POLL_S", "BOK_SETTLE_IDLE_WAIT_S"):
+        _v = os.environ.get(_k, "").strip()
+        if _v:
+            env[_k] = _v
+    # ⑤ pregen/qa/embed：BOK_PERSONA_AUTO_PREGEN（发布即预热闸 pregen.py:135）、
+    #    BOK_TTS_CACHE_DIR（罐头缓存目录 pregen.py:251）、BOK_QA_CLUSTER_MODEL
+    #    （聚类计划 LLM 覆盖 qa_cluster.py:104）、BOK_QA_DIGEST_INTERVAL_S（沉淀
+    #    循环间隔 qa_digest.py:137）、BOK_EMBED_BASE_URL（bge 侧车端点
+    #    qa_digest.py:489）。
+    for _k in ("BOK_PERSONA_AUTO_PREGEN", "BOK_TTS_CACHE_DIR", "BOK_QA_CLUSTER_MODEL",
+               "BOK_QA_DIGEST_INTERVAL_S", "BOK_EMBED_BASE_URL"):
+        _v = os.environ.get(_k, "").strip()
+        if _v:
+            env[_k] = _v
+    # ⑥ MiniMax（CP 侧 main.py:1247-1486）：MINIMAX_API_KEY（TTS 设置无 key 时的
+    #    回落）+ BASE_URL/REGION（_minimax_clone_base 端点域）+ MODEL（合成档，
+    #    缺省 speech-2.8-hd）。_FORWARD_ENV 先例已把 MINIMAX_API_KEY 发给 agent
+    #    单元，CP 面同权（机器通道/门诊探针同源凭据；只走 env、不落盘）。key 原值
+    #    下发不 strip（BOK_SETTLE_LLM_API_KEY 先例）。
+    if os.environ.get("MINIMAX_API_KEY", "").strip():
+        env["MINIMAX_API_KEY"] = os.environ["MINIMAX_API_KEY"]
+    for _k in ("MINIMAX_BASE_URL", "MINIMAX_REGION", "MINIMAX_MODEL"):
+        _v = os.environ.get(_k, "").strip()
+        if _v:
+            env[_k] = _v
+    # ⑦ ops 端点覆盖（ops_metrics.py:545-551 server_registry——容灾面板/Provider
+    #    卡/分节点部署把 ASR/TTS/laya/csc 指向非缺省 host:port 时的唯一入口）。
+    for _k in ("BOK_LAYA_URL", "BOK_CSC_URL", "QWEN3_ASR_BASE_URL", "QWEN3_TTS_BASE_URL"):
+        _v = os.environ.get(_k, "").strip()
+        if _v:
+            env[_k] = _v
     # .venv312 OpenSSL 无默认 CA 束：固化 SSL_CERT_FILE（P5 遗留项；CP 的
     # Summarizer/联网探针同食 TLS，注入失败零副作用）。
     return _bake_ssl_cert_file(env, repo_python())
@@ -1470,13 +1634,29 @@ def _mac_llm_server_argv(
     ]
 
 
+def _warn_llm_not_http_ready(ports: Sequence[int]) -> None:
+    """TCP 健康跳过点的一次性 /v1/models 真话探针（2026-10-02 readiness 真话）：
+    mlx 端口先绑后装权重（或代理活着而上游 mlx 半死）时 TCP 探活全绿，serve
+    会把「绿着坏」的栈当已起跳过 → 下一通首轮全量冷 prefill 甚至哑火。只打
+    警告、**不改跳过语义**（双起风险远大于告警价值；真修复走 down+serve）。"""
+    not_ready = [p for p in ports if not _llm_http_ready(p)]
+    if not_ready:
+        for p in not_ready:
+            print(f"[bok] llm :{p} tcp-up but /v1/models not ready "
+                  "(weights loading or half-dead)", file=sys.stderr)
+
+
 def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
     # 队列代理拓扑下「健康」= 两级都在（:1235 代理 + :1239 mlx）——只探公网口会
     # 把「代理活着、mlx 死了」的半瘫当健康跳过（2026-09-26 新拓扑配套）。
+    # readiness 真话（2026-10-02）：TCP 跳过前补探一次 /v1/models，不就绪大声
+    # 告警（不改跳过语义，防双起）。
     if _llm_queue_proxy_on() and is_mac():
         if healthy(1235) and healthy(1239):
+            _warn_llm_not_http_ready((1235, 1239))
             return
     elif healthy(1235):
+        _warn_llm_not_http_ready((1235,))
         return
     llm_model = model_path({**current, "llm": resolve_llm_repo(current)}, "llm")
     if is_mac():
@@ -2894,26 +3074,28 @@ def cmd_serve() -> int:
         targets.append(1236)
     if not is_packaged():
         targets.append(3000)
-    for _ in range(120):
-        if all(healthy(p) for p in targets):
-            _desktop_tts = "tts=8788" if desktop_tts_needed else "tts=skipped(cloud-only)"
-            ready = f"[bok] desktop ready: control-plane=8000 asr=8787 {_desktop_tts} llm=1235"
-            if 1236 in targets:
-                ready += " mt=1236"
-            print(ready)
-            # 非打包模式自动打开浏览器页面(可用 BOK_NO_OPEN_BROWSER=1 关闭)。
-            if not is_packaged() and os.environ.get("BOK_NO_OPEN_BROWSER", "0") != "1":
-                try:
-                    import webbrowser
-                    webbrowser.open("http://127.0.0.1:3000")
-                except Exception:  # pragma: no cover - 打开浏览器失败不影响启动
-                    pass
-            return 0
-        time.sleep(1)
+    # 就绪判据（2026-10-02 readiness 真话）：1235（/v1/models）/8787/8788
+    # （/health）必须 HTTP 200——mlx 先绑端口后装权重、sidecar 模型装载中
+    # 503，TCP 通≠能干活；这些口的宽松终检同款（见 _serve_ready_probe*）。
+    if _wait_desktop_ready(targets):
+        _desktop_tts = "tts=8788" if desktop_tts_needed else "tts=skipped(cloud-only)"
+        ready = f"[bok] desktop ready: control-plane=8000 asr=8787 {_desktop_tts} llm=1235"
+        if 1236 in targets:
+            ready += " mt=1236"
+        print(ready)
+        # 非打包模式自动打开浏览器页面(可用 BOK_NO_OPEN_BROWSER=1 关闭)。
+        if not is_packaged() and os.environ.get("BOK_NO_OPEN_BROWSER", "0") != "1":
+            try:
+                import webbrowser
+                webbrowser.open("http://127.0.0.1:3000")
+            except Exception:  # pragma: no cover - 打开浏览器失败不影响启动
+                pass
+        return 0
     # 宽松终检（2026-09-19 互杀事故收编）：CPU 风暴下 1s 探测可整轮假死，
     # 120s 走完≠栈真死——逐口 5s 复检再宣判；serve 在这里退出会把健康子代
     # 留给下一轮 serve 的孤儿清扫误杀（互杀循环根因），能不退就不退。
-    still_down = _ports_down_after_grace(targets)
+    # 严格口（1235/8787/8788）的复检维持 HTTP-200 真话（still_down 点名如实）。
+    still_down = _ports_down_after_grace(targets, probe=_serve_ready_probe_relaxed)
     if not still_down:
         _desktop_tts2 = "tts=8788" if desktop_tts_needed else "tts=skipped(cloud-only)"
         print(f"[bok] desktop ready (relaxed recheck): control-plane=8000 asr=8787 {_desktop_tts2} llm=1235")
@@ -3152,6 +3334,10 @@ _ORPHAN_PORT_OWNERS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (1235, ("mlx_lm",)),
     (1236, ("mlx_lm",)),
     (1237, ("mlx_lm",)),
+    # llm-raw(1239)（2026-10-02 编排审计第二波）：queue proxy 拓扑下 mlx 的真实
+    # 监听口——父进程暴毙后代理仍转发失败、孤儿 mlx 却占着 GPU 解码不放，
+    # 身份标记同族（--model 路径 + mlx_lm）。
+    (1239, ("mlx_lm",)),
     (7880, ("livekit-server",)),
     (3000, ("next", "node")),
     (8081, ("agent_runtime", "multiprocessing")),
@@ -3557,6 +3743,11 @@ def cmd_doctor() -> int:
         print(f"  {draft_warn}")
 
     for name, port in CORE_PORTS:
+        if name == "llm-raw" and not healthy(port) and not _llm_raw_expected():
+            # queue proxy 关（或非 mac）=mlx 直跑 :1235，:1239 设计缺席——
+            # 标 skipped 不骗 DOWN（同 cmd_status 先例）。
+            print(f"  port {port:<5} ({name}): skipped (queue proxy off)")
+            continue
         print(f"  port {port:<5} ({name}): {'UP' if healthy(port) else 'DOWN'}")
     # worker 探针读端点本体(TCP UP 对错码/未 register 假活不可见);缺席只打印
     # 不判死——打包 doctor 在栈未起时也要能跑。
@@ -4088,10 +4279,17 @@ def cmd_prod_status() -> int:
 
     worker 三件(8081-8083)是 _prod_units 的常驻单元,失联必须 DEGRADED——
     旧版只探 :8081,B 线 fwd/rev 双 worker 静默缺失健康面照绿(2026-09-17 补盲)。
-    可选增强(mt/settle)起了才纳入,缺模型环境不算降级。
+    可选增强(mt/settle)起了才纳入,缺模型环境不算降级；llm-raw(:1239)同属可选线
+    ——queue proxy 关/整栈未起不点名,代理活而 1239 死=半瘫必须点名（见
+    _llm_raw_status_check_expected）。
     """
     print("bok prod status:")
-    checks = list(PROD_HTTP_CHECKS)
+    # 可选线 :1239（llm-raw）「预期在场才查」：queue proxy 拓扑（mac+开）下
+    # mlx 的真实监听口——代理活着而它死了，生成会全灭而旧四表全绿。
+    checks = [
+        (name, port, path) for (name, port, path) in PROD_HTTP_CHECKS
+        if port != 1239 or _llm_raw_status_check_expected()
+    ]
     if healthy(1236):
         checks.append(("mt-llm", 1236, "/v1/models"))
     if healthy(1237):
