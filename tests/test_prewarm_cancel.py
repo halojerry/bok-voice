@@ -185,7 +185,11 @@ def test_source_pin_prefix_prewarm_sites_pooled():
 
 def test_source_pin_first_turn_cancel_in_report_assistant_turn():
     i = _SRC.index("async def _report_assistant_turn(")
-    seg = _SRC[i : i + 900]
+    seg = _SRC[i : i + 1100]
+    # 验收修(2026-10-02 FLOW20 实弹):取消必须收紧到 gen=="llm"——无门的
+    # 「首个 assistant 轮」会在开场白/罐头 ack 先行时掐掉在途预热,首个 LLM
+    # 轮吃冷 prefill(FIRST_TOKEN_TIMEOUT×2 实弹)。
+    assert 'if gen == "llm":' in seg
     assert '_cancel_prewarm_tasks("first_turn")' in seg
     assert "_reply_done_event.set()" in seg  # 仍在函数体开头（chokepoint 不漂移）
 

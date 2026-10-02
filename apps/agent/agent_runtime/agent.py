@@ -5430,10 +5430,15 @@ async def entrypoint(ctx):
         text: str, latency: int, gen: str, provider: str, step: int, started_ms: int,
         ended_ms: int | None = None,
     ) -> None:
-        # 编排审计第二波 F1(2026-10-02):首个 assistant 轮已交付=预热(LLM 前缀
-        # 暖 cache / TTS 预连)再无消费点——once 门取消预热池,不再让在途预热
-        # 挂着(前缀预热此时通常已完成:开场白播完才 commit,预热窗口足够)。
-        await _cancel_prewarm_tasks("first_turn")
+        # 编排审计第二波 F1(2026-10-02)——同日验收修(FLOW20 实弹):取消点收紧到
+        # **首个 LLM 轮交付**。旧版「首个 assistant 轮」在开场白/罐头 ack 先行时
+        # (探针形态:prewarm spawn→开场白播报 commit→PREWARM_CANCELLED)把在途
+        # 预热拦腰掐掉——首个 LLM 轮吃冷 prefill(3.3k tok ≈10s 冷档破 3s 首
+        # token 线):FIRST_TOKEN_TIMEOUT×2+watchdog 延展+晚答连发。prewarm 的
+        # 消费点就是 LLM 轮本身:LLM 已自答=预热作废;script/qa_fastpath 轮不取消
+        # (后续 LLM 轮仍要吃暖前缀)。close 侧取消不变。
+        if gen == "llm":
+            await _cancel_prewarm_tasks("first_turn")
         # W-GATE(2026-09-27):回复已交付(assistant item 已落地)=放行让位中的
         # judge 进 :1235。本函数是全回复车道唯一 chokepoint(script/qa_fastpath/
         # LLM/ack 皆经此),故事件只在这里 set 一处。
