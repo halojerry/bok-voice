@@ -1002,6 +1002,13 @@ class _LlmFallbackStream(llm.LLMStream):
             return
         try:
             parts: list[str] = []
+            # regen 换新身份(2026-10-02 审计修):原请求的 X-Bok-Req-Id 经
+            # ContextVar 随任务继承——旧版 regen 复用它,而本方法的调用点都先
+            # _aclose_inner() 对**同一 id** 发过 /v1/abort,服务端 AbortRegistry
+            # 对该 id 的登记项 event 已置位,regen 请求 attach 即被停(call 现场
+            # 形状=「LLM_LATE_ANSWER source=regen empty — skip」)。此处 mint 新
+            # id(任务内 set 只影响本任务上下文),regen 才真正活到生成完。
+            _MLX_REQ_ID_VAR.set(uuid.uuid4().hex)
             async for ev in self._stream_factory():
                 delta = getattr(ev, "delta", None)
                 content = getattr(delta, "content", None) if delta is not None else None
@@ -1140,7 +1147,14 @@ class _LlmFallbackStream(llm.LLMStream):
             if timeout > 0:
                 done, _pending = await asyncio.wait({first_task}, timeout=timeout)
                 if first_task not in done:
-                    record_llm_first_token(timeout)  # 饥荒信号:超时也喂样本
+                    # 饥荒信号(2026-10-02 审计修):超时样本喂 timeout×2 而非
+                    # timeout 本身——喂 3.0(s)的话 EMA 上限=3.0,数学上永远够不着
+                    # BOK_LLM_FAMINE_TTFT_S 缺省 4.0 的激活线,十五波饥荒自适应
+                    # **从未激活过**(swap 抖动机上依旧 3s 超时→drain→regen 负载
+                    # ×2 的病态链)。×2=声明性深饥荒信号:首 token 超 3s 的轮,
+                    # 真实感知 TTFT 至少是 deadline+兜底/晚到链;drain 交付点另
+                    # 补真实样本(见 _drain_late_answer)。
+                    record_llm_first_token(timeout * 2.0)
                     if self._late_deadline > 0 and self._late_answer_cb is not None:
                         # 原流续读:唔 aclose——策略选择(2026-10-02 注释同步):
                         # W-ABORT 已能给服务端生成循环止损,但原流「慢但可能仍活」,
@@ -1305,13 +1319,41 @@ _MT_QUOTES_OPEN = "\"“「『'`"
 _MT_QUOTES_CLOSE = "\"”」』'`"
 
 
-class _StripMTQuoteStream(llm.LLMStream):
+class _CascadeCloseStreamMixin:
+    """包装流级联关闭内层(2026-09-30 A 线官方对账 Critical-1)。
+
+    官方姿势是 ``async with llm.chat(...) as stream``(官方 llm/fallback_
+    adapter.py 同款),框架只在最外层调 ``aclose``——此前包装流只关自己的
+    泵任务,内层**原生 MLX/MiniMax 流继续解码到自然完稿**:被掐回复的生成
+    盗占 GPU(call-9af18da5 双句打断后新回复 TTFT 5.3/6.8s、tps 崩 5.8 的
+    机理),文本全进无人读的 channel。级联链:外层 aclose → cancel 本层泵 →
+    内层 aclose → httpx 断连 → 队列代理放闸+上游断开 → 服务端中止解码。
+    内层关闭尽力而为(异常吞掉),幂等(重复 aclose 安全)。
+
+    位置注记(2026-10-02):定义必须先于全部使用者(_StripMTQuoteStream/
+    _ExprPrependStream 等)——类定义立即求值基类列表,后置=导入期 NameError。"""
+
+    async def aclose(self) -> None:
+        try:
+            await super().aclose()
+        finally:
+            _inner = getattr(self, "_inner", None)
+            if _inner is not None:
+                with contextlib.suppress(BaseException):
+                    await _inner.aclose()
+
+
+class _StripMTQuoteStream(_CascadeCloseStreamMixin, llm.LLMStream):
     """剥离 MT 输出包裹引号(StatelessMTLLM 出口单点,TTS/字幕/历史全干净)。
 
     首个非空增量剥前引号;末字符扣住待定——流结束时是闭合引号则吞、否则补发
     (一字符 hold,延迟≈一个 chunk)。壳照抄 _ExprPrependStream:metrics 由内芯
     发出经 _bind_metrics_forward 转发,此处只排空监视分支。
-    """
+
+    级联 mixin(2026-10-02 审计修):B 线 MT 超时路径(_mt_collect 的
+    wait_for 超时)从不关流——本类不带级联时,内层 _attach_mlx_abort 挂的
+    aclose 补丁**不可达**,每次超时留一条全量 512-token 解码僵尸占 :1236
+    (AGENTS 记 21 次/通实证,「句堆积」的形状)。"""
 
     def __init__(self, plugin, inner: "llm.LLMStream"):
         super().__init__(llm=plugin, chat_ctx=llm.ChatContext(), tools=[], conn_options=APIConnectOptions())
@@ -1575,8 +1617,15 @@ class _ScriptedLLMStream:
         return self._real
 
 
-class _ExprPrependStream(llm.LLMStream):
-    """在真实 LLM 流之前先发一个 <expr type="expression" label="..."/> 标记块。"""
+class _ExprPrependStream(_CascadeCloseStreamMixin, llm.LLMStream):
+    """在真实 LLM 流之前先发一个 <expr type="expression" label="..."/> 标记块。
+
+    级联 mixin(2026-10-02 审计修):本类曾在 A 线回复链
+    (_PartialCapture→_RepeatGuard→_StripAnchor→**本类**→_LlmFallback→native)
+    唯一断掉 aclose 级联——框架只关最外层,断在这里令 _LlmFallbackStream.aclose
+    (关闭路径唯一的 mlx server-abort 触发点)在会话/收线关闭时**永不可达**
+    (打断路径靠 agent 侧 abandon() 绕路才活着;call-9af18da5「双句打断后
+    TTFT 5.3/6.8s」的同族残余)。"""
 
     def __init__(self, plugin, inner: "llm.LLMStream", tag: str):
         super().__init__(llm=plugin, chat_ctx=llm.ChatContext(), tools=[], conn_options=APIConnectOptions())
@@ -1694,25 +1743,9 @@ def _digitize_id_slots(text: str) -> str:
     return _ID_DIGIT_RUN_RE.sub(_repl, s)
 
 
-class _CascadeCloseStreamMixin:
-    """包装流级联关闭内层(2026-09-30 A 线官方对账 Critical-1)。
-
-    官方姿势是 ``async with llm.chat(...) as stream``(官方 llm/fallback_
-    adapter.py 同款),框架只在最外层调 ``aclose``——此前三个包装流只关自己
-    的泵任务,内层**原生 MLX/MiniMax 流继续解码到自然完稿**:被掐回复的生成
-    盗占 GPU(call-9af18da5 双句打断后新回复 TTFT 5.3/6.8s、tps 崩 5.8 的
-    机理),文本全进无人读的 channel。级联链:外层 aclose → cancel 本层泵 →
-    内层 aclose → httpx 断连 → 队列代理放闸+上游断开 → 服务端中止解码。
-    内层关闭尽力而为(异常吞掉),幂等(重复 aclose 安全)。"""
-
-    async def aclose(self) -> None:
-        try:
-            await super().aclose()
-        finally:
-            _inner = getattr(self, "_inner", None)
-            if _inner is not None:
-                with contextlib.suppress(BaseException):
-                    await _inner.aclose()
+# (_CascadeCloseStreamMixin 已前移至 _StripMTQuoteStream 之前——2026-10-02
+#  审计修:_ExprPrependStream/_StripMTQuoteStream 两个使用者补级联,类定义立即
+#  求值基类列表,原位置(此处之后)会令导入期 NameError。)
 
 
 class _StripTailAnchorStream(_CascadeCloseStreamMixin, llm.LLMStream):

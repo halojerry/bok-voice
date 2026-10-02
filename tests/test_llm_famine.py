@@ -66,11 +66,20 @@ def test_ema_recovery_via_fast_samples():
 
 
 def test_timeout_sample_counts_as_famine_signal():
-    """首 token 超时也喂样本（超时=饥荒加深）——两轮超时即进饥荒。"""
-    record_llm_first_token(3.0)  # 超时值本身
-    record_llm_first_token(3.0)
-    # EMA=3.0 < 4 阈值——不触发!超时 3s 量级本身不代表机器级饥荒。
-    assert llm_famine_active() is False
+    """超时轮喂 timeout×2 深饥荒样本(2026-10-02 审计修)——两轮超时即进饥荒。
+
+    旧版喂 timeout 本身(3.0),EMA 上限=3.0 < 4.0 阈值,饥荒**数学上永不
+    激活**(十五波修复自始是死代码——call-dc54f542 的病态链:3s 超时→drain
+    8s→abort→regen 同参全量重 prefill 负载×2,在 swap 抖动机上循环)。
+    修后:超时轮=6.0 样本,两轮 EMA=6.0 ≥ 4.0 → 饥荒激活(拉长超时/drain、
+    禁 regen,等原流优于重来);快样本仍可自动复原。"""
+    record_llm_first_token(6.0)  # 超时轮的真实样本(timeout 3.0 × 2)
+    assert llm_famine_active() is False, "单样本未达 n≥2"
+    record_llm_first_token(6.0)
+    assert llm_famine_active() is True, "两轮首 token 超时=机器级病态,必须进饥荒"
+    for _ in range(6):
+        record_llm_first_token(0.3)  # 快样本把 EMA 拉回
+    assert llm_famine_active() is False, "健康样本应自动复原"
 
 
 # ------------------------------------------------------------------ 常数面
@@ -163,8 +172,12 @@ def test_famine_env_keys_in_forward_env():
 
 
 def test_source_pin_timeout_branch_records_sample():
-    """超时分支必须喂样本（饥荒加深信号）——源级 pin 防重构丢。"""
+    """超时分支必须喂**深饥荒样本**(timeout×2)——源级 pin 防重构丢。
+
+    2026-10-02 审计修:旧版喂 timeout 本身(3.0),EMA 上限=3.0 < 激活线 4.0,
+    十五波饥荒自适应从未激活过(纯死代码)。×2 语义=首 token 超 3s 的轮代表
+    ≥2×deadline 的机器级病态;两轮超时即应进饥荒(见行为测试)。"""
     src = (_REPO / "apps" / "agent" / "agent_runtime" / "providers" / "livekit_plugins.py").read_text(encoding="utf-8")
     i = src.index("if first_task not in done:")
     j = src.index("self._late_deadline > 0", i)
-    assert "record_llm_first_token(timeout)" in src[i:j]
+    assert "record_llm_first_token(timeout * 2.0)" in src[i:j]

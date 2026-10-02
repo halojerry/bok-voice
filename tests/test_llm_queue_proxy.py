@@ -468,6 +468,31 @@ def test_early_disconnected_client_returns_499_without_upstream():
         qp._CLIENT = None
 
 
+def test_proxy_forwards_bok_req_id_header():
+    """req-id 透传(2026-10-02 审计修回归钉):W-ABORT 注册头必须随生成请求
+    到达上游——旧版 fwd_headers 只转 content-type/lane,代理路径上一切请求的
+    abort 注册失效,客户端 /v1/abort 变静默 no-op。"""
+    captured: dict = {}
+    stub = FastAPI()
+
+    @stub.post("/v1/chat/completions")
+    async def _gen(request: Request):  # noqa: ANN202
+        captured["req_id"] = request.headers.get("x-bok-req-id")
+        return JSONResponse({"ok": True})
+
+    qp._CLIENT = httpx.AsyncClient(transport=httpx.ASGITransport(app=stub), base_url="http://stub")
+    try:
+        async def run():
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=qp.app), base_url="http://px") as c:
+                await c.post("/v1/chat/completions", json={"stream": False},
+                             headers={"X-Bok-Req-Id": "req-abc-123"})
+
+        asyncio.run(run())
+        assert captured["req_id"] == "req-abc-123", f"req-id 必须透传到上游: {captured}"
+    finally:
+        qp._CLIENT = None
+
+
 def test_real_uvicorn_body_reaches_handler_not_eaten_by_probe():
     """真 uvicorn 起 qp.app:POST body 必须完整到达 handler 并拿到 200。
 

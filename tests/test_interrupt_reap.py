@@ -251,10 +251,20 @@ def test_aclose_cascade_idempotent():
 
 def test_cascade_and_prewarm_wiring_source_pins():
     """级联 mixin + 双包装器 _prewarm_impl 透传 + 两线 TTS 收尾接线 pin。"""
-    # 三包装流全部挂 mixin
+    # 五包装流全部挂 mixin(2026-10-02 审计修:_ExprPrepend/_StripMTQuote 曾断
+    # 级联——_ExprPrepend 在 A 线回复链上断掉 aclose 级联令 _LlmFallbackStream
+    # 的关闭期 server-abort 永不可达;_StripMTQuote 令 MT 超时留全量解码僵尸)
     assert "class _CascadeCloseStreamMixin:" in PLUGINS_SRC
-    for _cls in ("_StripTailAnchorStream", "_RepeatSelfGuardStream", "_PartialCaptureStream"):
+    for _cls in (
+        "_StripTailAnchorStream",
+        "_RepeatSelfGuardStream",
+        "_PartialCaptureStream",
+        "_ExprPrependStream",
+        "_StripMTQuoteStream",
+    ):
         assert f"class {_cls}(_CascadeCloseStreamMixin, llm.LLMStream):" in PLUGINS_SRC
+        # 级联链完整性:每个包装类的 _inner 必须在(级联 aclose 关它)
+        assert PLUGINS_SRC.count("self._inner = inner") >= 5
     # 官方每通 llm.prewarm() 只认 _prewarm_impl 覆写——双 LLM 包装器透传
     assert PLUGINS_SRC.count("async def _prewarm_impl(self) -> None:") >= 4  # mlx/mt/context/expr
     # A 线/B 线收线 TTS aclose

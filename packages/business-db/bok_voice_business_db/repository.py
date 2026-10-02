@@ -728,6 +728,32 @@ class SqlAlchemyBusinessRepository:
             return None
         return {"id": row.id, "call_id": row.call_id, "tokens": row.tokens}
 
+    def create_usage_record(self, record: dict) -> dict:
+        """结算 usage 落库(2026-10-02 审计修:补 SQL 侧缺位——旧调用方在
+        main._settle_core 里跨三个 _repo() 实例 add/commit,INSERT 挂在不被
+        提交的 session 上=计费账本零写入;统一走本方法与 InMemory 同签名)。"""
+        row = models.UsageRecord(
+            id=record.get("id") or f"usage:{record.get('call_id', '')}",
+            account_id=str(record.get("account_id") or ""),
+            call_id=str(record.get("call_id") or ""),
+            provider=str(record.get("provider") or "local"),
+            kind=str(record.get("kind") or "call"),
+            units=int(record.get("units") or 0),
+            tokens=int(record.get("tokens") or 0),
+            audio_seconds=float(record.get("audio_seconds") or 0.0),
+            latency_ms=int(record.get("latency_ms") or 0),
+            cost_estimate=float(record.get("cost_estimate") or 0.0),
+            status=str(record.get("status") or "ok"),
+        )
+        self.session.add(row)
+        self.session.commit()
+        return {
+            "id": row.id,
+            "call_id": row.call_id,
+            "tokens": row.tokens,
+            "status": row.status,
+        }
+
     def get_settlement(self, call_id: str) -> dict | None:
         row = self.session.get(models.Settlement, call_id)
         if not row:

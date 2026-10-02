@@ -277,7 +277,13 @@ def _mt_open_stream(llm_provider, ctx, *, retry: bool):
 
 
 async def _mt_collect(stream, timeout_s: float) -> str:
-    """把一条翻译流排空成整句(超时保护),awaitable 流先 await(旧 _mt_once 同款)。"""
+    """把一条翻译流排空成整句(超时保护),awaitable 流先 await(旧 _mt_once 同款)。
+
+    超时也关流(2026-10-02 审计修):旧版 wait_for 超时只 cancel 读取端,流本体
+    (含 _StripMTQuoteStream 泵+原生 openai 流)继续解码到自然完稿——每次
+    15s 超时留一条全量 512-token 僵尸占 :1236 单生成线程(AGENTS 记 21 次/通,
+    「句堆积」形状);MT 回落主 LLM 时僵尸坐在 reply lane。finally 级联关闭
+    (mixin 已挂,内芯 _attach_mlx_abort 的 aclose 补丁由此外达,server 端止损)。"""
     if inspect.isawaitable(stream):
         stream = await stream
     parts: list[str] = []
@@ -289,7 +295,15 @@ async def _mt_collect(stream, timeout_s: float) -> str:
             if content:
                 parts.append(content)
 
-    await asyncio.wait_for(_drain(), timeout=timeout_s)
+    try:
+        await asyncio.wait_for(_drain(), timeout=timeout_s)
+    finally:
+        aclose = getattr(stream, "aclose", None)
+        if aclose is not None:
+            try:
+                await aclose()
+            except Exception:  # noqa: BLE001 - 关流尽力而为,不吞业务结果
+                pass
     return "".join(parts).strip()
 
 
