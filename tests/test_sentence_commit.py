@@ -1010,6 +1010,20 @@ def test_join_worthy_gate():
     assert _join_worthy("") is False
     # 英文 is 要词边界:句尾 -is 词(this/analysis)唔係系词,唔好误扣 hold 窗
     assert _join_worthy("Let me confirm this.") is False
+    # 2026-10-02 判据收窄(句尾形状门):数字在句中、字/量词收尾=号码已完整,
+    # 唔扣 hold——旧「任意位置≥2位」在 B 线连珠炮下链式粘串成整场一个
+    # sidecar 会话,尾巴 finish 断线才整块吐出(probe_interp_backlog 正压臂
+    # orig=4/6 FAIL 的根因)。
+    assert _join_worthy("我们公司在深圳南山区科技园那边有三百多名员工。") is False
+    assert _join_worthy("一共是三百六十八块。") is False
+    assert _join_worthy("大概 300 多人。") is False
+    assert _join_worthy("三百万。") is False  # 百/万位词:旧版归一后<2 同样唔算
+    # 句尾数字=可能拦腰,照旧 hold(09-06 报号粘接场景一字不损;逐位报号停嘴
+    # 落在任意位——单数字尾同样等一窗)
+    assert _join_worthy("我的号码係一七二三三四") is True
+    assert _join_worthy("订单号 6643。") is True
+    assert _join_worthy("我有三。") is True
+    assert _join_worthy("code is three") is True
 
 
 def test_join_norm_digits_cjk_fullwidth_en():
@@ -1613,12 +1627,13 @@ def test_length_commit_off_by_default_runon_waits_eos(monkeypatch):
 
 
 def test_interp_env_len_commit_on():
-    """B 线长度档默认开(_interp_env setdefault),显式 0 逃生不抢;
-    VAD 停嘴门槛 B 线收紧 0.35(A 线 0.45 不变)同样 setdefault+逃生。"""
+    """B 线长度档默认开(_interp_env setdefault),显式 0 逃生不抢;VAD 停嘴
+    门槛 2026-10-02 拆 setdefault(B 线与 A 线同读设置面,显式 env 只经透传
+    白名单做真部署覆盖——设置页从此对 B 线说真话)。"""
     env = bok._interp_env({})
     assert env.get("QWEN3_ASR_CLAUSE_LEN_COMMIT") == "1"
-    assert env.get("VAD_MIN_SILENCE_DURATION") == "0.35"
+    assert "VAD_MIN_SILENCE_DURATION" not in env  # 不再 setdefault;由设置面治理
     env2 = bok._interp_env({"QWEN3_ASR_CLAUSE_LEN_COMMIT": "0"})
     assert env2["QWEN3_ASR_CLAUSE_LEN_COMMIT"] == "0"
     env3 = bok._interp_env({"VAD_MIN_SILENCE_DURATION": "0.45"})
-    assert env3["VAD_MIN_SILENCE_DURATION"] == "0.45"
+    assert env3["VAD_MIN_SILENCE_DURATION"] == "0.45"  # 显式 env 仍透传(部署覆盖)

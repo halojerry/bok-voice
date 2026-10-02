@@ -3529,12 +3529,12 @@ def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
     # 时,滑窗未提交前缀攒够字数(默认 10)且跨窗稳定即就地切句——标点档/停顿档
     # 的第三事件源,译出声不等人讲完。默认 1,显式 0 逃生;A 线唔带此 env。
     env.setdefault("QWEN3_ASR_CLAUSE_LEN_COMMIT", "1")
-    # B 线 VAD 停嘴门槛收紧(2026-09-17):0.45 是 A 线客服通话校准(防碎片提交
-    # 打断在途回复——A 线碎片提交会被下一碎片掐死回复);B 线 manual 管线无此
-    # 伤害(假切句只多一段翻译,无链路损伤),而真人间子句换气普遍 0.3-0.45s,
-    # 0.45 门槛下嗰啲微停顿完全不产生提交=「每句话讲完先翻」的体感主刀之一。
-    # 0.35 收紧后浅停顿也成提交点。显式 env 逃生。
-    env.setdefault("VAD_MIN_SILENCE_DURATION", "0.35")
+    # VAD 停嘴门槛(2026-10-02 收编):旧版在此 setdefault 0.35(2026-09-17 B 线
+    # 专属调参,当时 A 线 0.45)——但 env 优先级压过设置面,设置页对 B 线永久
+    # 说谎(改了不生效)。现拆 setdefault:B 线与 A 线同读设置面 vad 段
+    # (interpret _cfg_float / agent _vad_float 同一序:显式 env 部署覆盖 >
+    # 设置页 > 缺省 0.35),显式 env 仍经下方透传白名单下发。当前设置值 0.35=
+    # 拆钉零行为变化;后续调门槛只动设置页,两线同源。
     # B 线开关透传(_agent_worker_env 是白名单 env,不透传 os.environ——
     # 不显式带上的话文档里的逃生门在 dev/prod 栈都是死的,2026-09-16 实证)。
     for _k in (

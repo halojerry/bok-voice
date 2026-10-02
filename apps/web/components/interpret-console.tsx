@@ -470,13 +470,21 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
         await meSession.start({
           // 传译总开关(默认关):进房只连接不采麦,按「启动传译」才开始——已连接
           // 房间上后开采集无 15s 死锁风险(那死锁只发生在未连接房间上 await)。
-          tracks: { microphone: { enabled: interpOnRef.current, publishOptions: { preConnectBuffer: true } } },
+          // dtx:false(2026-10-02):Opus DTX 静音期不发帧=服务端 VAD 缺帧不
+          // 计静音 → EOS 永不触发、句尾无强标点的句子永不 finish(B 线正压臂
+          // 根因链)。关 DTX 保连续帧流;操作台上行带宽代价可忽略。
+          tracks: {
+            microphone: {
+              enabled: interpOnRef.current,
+              publishOptions: { preConnectBuffer: true, dtx: false },
+            },
+          },
         });
         // 确保我方麦克风真正发布:失败(权限被拒/设备被占)显式报错并把开关拉回
         // 现实,不再静默装「已接入」。传译未启动时跳过探活(探活会把麦打开)。
         if (interpOnRef.current) {
           try {
-            const pub = await meRoom.localParticipant.setMicrophoneEnabled(true);
+            const pub = await meRoom.localParticipant.setMicrophoneEnabled(true, undefined, { dtx: false });
             setMeMicOn(Boolean(pub));
             if (!pub) setError("无法开启我方麦克风：请检查浏览器麦克风权限——已连接,但同传听不到我方说话。");
           } catch {
@@ -617,7 +625,7 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
           );
           return;
         }
-        await room.localParticipant.setMicrophoneEnabled(othMicOn && interpOnRef.current);
+        await room.localParticipant.setMicrophoneEnabled(othMicOn && interpOnRef.current, undefined, { dtx: false });
         // 输出路由:otherConnected 翻转触发 ctx_sink effect 直投 router(同我方侧)。
         wlog("other_connected");
         setOtherConnected(true);
@@ -695,7 +703,7 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
         await room.localParticipant.setMicrophoneEnabled(false).catch((e: unknown) =>
           log.warn("mic rollback: mute failed", { who, err: e instanceof Error ? e.message : String(e) }),
         );
-        await room.localParticipant.setMicrophoneEnabled(true).catch((e: unknown) =>
+        await room.localParticipant.setMicrophoneEnabled(true, undefined, { dtx: false }).catch((e: unknown) =>
           log.warn("mic rollback: unmute failed", { who, err: e instanceof Error ? e.message : String(e) }),
         );
       } catch (e) {
@@ -760,7 +768,7 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   const toggleOthMic = useCallback(() => setOthMicOn((v) => !v), []);
   useEffect(() => {
     if (!meConnected) return;
-    meRoom.localParticipant.setMicrophoneEnabled(meMicOn && !meHeld && !voiceHoldMe && interpOn).catch((e: unknown) =>
+    meRoom.localParticipant.setMicrophoneEnabled(meMicOn && !meHeld && !voiceHoldMe && interpOn, undefined, { dtx: false }).catch((e: unknown) =>
       log.warn("apply me mic enabled state failed", { on: meMicOn, err: e instanceof Error ? e.message : String(e) }),
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -768,7 +776,7 @@ export default function InterpretConsole({ account, callId, myLang, otherLang, o
   useEffect(() => {
     const r = otherRoomRef.current;
     if (!otherConnected || !r) return;
-    r.localParticipant.setMicrophoneEnabled(othMicOn && !othHeld && !voiceHoldOth && interpOn).catch((e: unknown) =>
+    r.localParticipant.setMicrophoneEnabled(othMicOn && !othHeld && !voiceHoldOth && interpOn, undefined, { dtx: false }).catch((e: unknown) =>
       log.warn("apply other mic enabled state failed", { on: othMicOn, err: e instanceof Error ? e.message : String(e) }),
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps

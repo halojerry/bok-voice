@@ -22,6 +22,17 @@ from pathlib import Path
 import httpx
 
 from e2e_edge_cases import tts_pcm
+
+
+def _dither_silence_pcm(seconds: float, sr: int = 16000) -> bytes:
+    """低幅噪声「静音」:±1 会被 Opus 编码器 VAD 判静音照样 DTX 丢弃(实测),
+    ±500(≈-36dBFS 白噪,人耳轻嘶声)能过 DTX,而 silero(activation 0.75)
+    仍判静音——间隙静音对 VAD 可见。"""
+    import random  # 非加密:探针噪声种子固定系可复现要求(Mimosa 弱随机提示不适用)
+
+    rng = random.Random(0x5EED)
+    n = int(sr * seconds)
+    return b"".join(rng.randrange(-500, 501).to_bytes(2, "little", signed=True) for _ in range(n))
 from e2e_interpret import CONTROL_PLANE_URL, Side
 
 # auth-on 栈(2026-09-15 标准姿势)要求 CP 请求带机器通道 token——E2E 建单/取
@@ -102,7 +113,14 @@ async def main() -> int:
     try:
         for s in SENTENCES:
             await me.push(tts_pcm(s, "zh"))
-            await asyncio.sleep(GAP_S)  # ≥VAD min_silence,句间边界稳定
+            # 间隙必须推静音帧(2026-10-02 根因定案):官方 VAD 缺帧=静音不可见
+            # ——只 sleep 唔推帧时 EOS 永不触发,'。'尾句(流式 partial 只出逗号)
+            # 无强标点可提交=整串粘进一个永不 finish 的会话、断线才蒸发
+            # (orig=4/6 与 drops/skips=0 的双重 FAIL 根因;A 线台架
+            # silence_pcm 同款纪律)。⚠ 不能用纯零(silence_pcm):发布端 Opus
+            # DTX 把数字静音整段丢弃(实测纯零间隙零效果),A 线刺激 WAV 能过
+            # 是因为真合成音带本底噪声——±1 抖动同理:过 DTX、VAD 读作静音。
+            await me.push(_dither_silence_pcm(GAP_S))
         await asyncio.sleep(16)  # 等队列排干(追最新:最后一条必须出)
     finally:
         await me.close()
