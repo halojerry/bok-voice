@@ -59,8 +59,12 @@ export default function AuditPage() {
     [action, accountId, callId],
   );
 
+  // 防抖 350ms（2026-10-02 UX 根因修复）：账号/通话是逐键受控输入，旧实现 load memo
+  // 每变一次身份就发一次请求=每个字符一个 HTTP+200 行渲染；防抖后静止 350ms 才拉。
+  // 「查询」按钮仍直发（onClick 调 load()，不经此 effect）。
   useEffect(() => {
-    load();
+    const t = setTimeout(load, 350);
+    return () => clearTimeout(t);
   }, [load]);
 
   return (

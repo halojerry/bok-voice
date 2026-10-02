@@ -10,12 +10,13 @@
 // 三件结构化编辑（正稿/分支行/注意），拆装走 StepRefForm（components/step-form.tsx，
 // 内部用 lib/flow-canvas 纯函数镜像，round-trip 无损、与画布抽屉同语义）。
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { ErrorState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
 import { useSession } from "@/components/session-context";
 import { StepRefForm } from "@/components/step-form";
+import { useToast } from "@/components/toast";
 
 export const LANGS = [
   ["zh", "普通话"],
@@ -113,6 +114,22 @@ const EMPTY_FORM: TplForm = {
   language: "zh",
   hotwords: "",
 };
+
+/** 表单+分步的快照序列化（未保存判定用）：字段序固定、step 键序归一，
+ *  避免对象字面量构造顺序差异造成假脏。快照锚点=「上一次已保存/已载入」的状态。 */
+function serializeState(f: TplForm, st: FlowStep[]): string {
+  return JSON.stringify({
+    name: f.name,
+    opening: f.opening,
+    core: f.core,
+    objection: f.objection,
+    closing: f.closing,
+    tone_override: f.tone_override,
+    language: f.language,
+    hotwords: f.hotwords,
+    steps: st.map((s) => [s.goal, s.ref, Boolean(s.say), s.emotion ?? "", s.scene ?? ""]),
+  });
+}
 
 const STEPS_HINT = "可用变量:{姓名}/{名字}/{name} {快递单号} {快递尾号}/{tracking_tail} {物流公司}/{快递公司}/{courier} {收货地址}/{地址} {电话} {聯絡方式}/{联系方式}/{contact}。完整目录与预览见工作站·变量 tab。\n正稿是给 AI 的要点参考,不是逐字稿——AI 会结合客户原话用自己的话讲;「客户如果这样说」分支=客户出现该反应时的应对,AI 会挑对应分支回答。\n勾选「直念」的步骤:进入该步的当轮 AI 逐字念正稿首行,适合通知/道歉等要逐字一致的内容。\n直念步可选「情绪」:只在罐头物化时烧进音频(如致歉步选低沉柔和),实时生成的回复保持语气稳定不受影响;改情绪/正稿后需重跑 tts-pregen。";
 
@@ -293,10 +310,18 @@ export default function TemplateEditor(props: {
    * 不会把工作站层的步骤草稿冲掉）。/templates 页保持 full 档零变化。
    */
   variant?: "full" | "meta";
+  /** 未保存状态上抛（可选）：dirty 变化时回调一次（同值不重复回调），父页用于切行/离开守卫。 */
+  onDirtyChange?: (dirty: boolean) => void;
+  /**
+   * 发布前守卫（可选）：返回 false 直接中止发布，不弹任何框（守卫自己负责交互）。
+   * /studio 用它拦「步骤草稿未保存就发布」；不传=行为与既有完全一致。
+   */
+  publishGuard?: () => boolean;
 }) {
   const meta = props.variant === "meta";
   const { accountId } = useAccount();
   const session = useSession();
+  const toast = useToast();
   const [form, setForm] = useState<TplForm>(EMPTY_FORM);
   const [steps, setSteps] = useState<FlowStep[]>([]);
   // 编辑态组件内自持（save 用它决定 create/update，与原 editingId 同语义）；
@@ -310,6 +335,9 @@ export default function TemplateEditor(props: {
   const [ok, setOk] = useState(false);
   const [pubErr, setPubErr] = useState<string | null>(null);
   const [publishing, setPublishing] = useState(false);
+  const [saving, setSaving] = useState(false);
+  // dirty 快照锚点：tpl 变化（换模板/退回新建态）与保存成功时重锚为当时的序列化。
+  const [snap, setSnap] = useState<string>(() => serializeState(EMPTY_FORM, []));
 
   const tpl = props.tpl;
   const tplId = String(tpl?.id ?? "");
@@ -328,12 +356,49 @@ export default function TemplateEditor(props: {
     setForm(f);
     // 分步为主:旧模板(只有四段无 steps)载入时自动转成步骤,让用户按步骤编辑。
     const saved = jsonToSteps(tpl?.steps_json);
-    setSteps(saved.length > 0 ? saved : fourSectionsToSteps(f));
+    const loaded = saved.length > 0 ? saved : fourSectionsToSteps(f);
+    setSteps(loaded);
+    // 换模板=脏清零（含四段→步骤的自动转换一起进快照，避免载入即假脏）。
+    setSnap(serializeState(f, loaded));
     setErr(null);
     setPubErr(null);
     // 只跟 tpl.id 走：对象引用换新但同 id（保存后重拉）不重锚。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tplId]);
+
+  // 未保存判定（快照对比法，不逐个 onChange 打标）：当前表单+分步序列化 ≠ 快照锚点。
+  // 覆盖本组件持有的全部可编辑面（名称/四段/语气/热词/语言/分步）；保存成功与换模板时重锚。
+  const dirty = useMemo(() => serializeState(form, steps) !== snap, [form, steps, snap]);
+
+  // dirty 上抛（可选 prop）：同一值只回调一次——父页常传内联回调（每次渲染换引用），
+  // 用 ref 持最新回调、用 lastDirtyRef 去重；卸载时回落 false（编辑面已销毁，残留 true 会误报）。
+  const dirtyCbRef = useRef(props.onDirtyChange);
+  const lastDirtyRef = useRef<boolean | null>(null);
+  useEffect(() => {
+    dirtyCbRef.current = props.onDirtyChange;
+  });
+  useEffect(() => {
+    if (lastDirtyRef.current === dirty) return;
+    lastDirtyRef.current = dirty;
+    dirtyCbRef.current?.(dirty);
+  }, [dirty]);
+  useEffect(
+    () => () => {
+      if (lastDirtyRef.current) dirtyCbRef.current?.(false);
+    },
+    [],
+  );
+
+  // dirty 时挂 beforeunload（只兜浏览器关闭/刷新；SPA 导航守卫由父页负责）。
+  useEffect(() => {
+    if (!dirty) return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [dirty]);
 
   // B4 owner 只读兜底（行级 canEdit 闸在页面侧；studio 直达详情时靠这里兜底）：
   // 主管（admin/root/本地匿名）可改；话务员只改自己的，共享/他人模板只读（服务端 403 兜底）。
@@ -344,10 +409,13 @@ export default function TemplateEditor(props: {
   const readOnly = Boolean(tplId) && !isManager && !(uid !== "" && String(tpl?.owner_user_id ?? "") === uid);
 
   async function save() {
+    if (saving) return; // 防重入：双击/连点不双发请求
     if (!form.name.trim()) {
       setErr("请填写模板名称");
+      toast.error("请填写模板名称");
       return;
     }
+    setSaving(true);
     setErr(null);
     setOk(false);
     try {
@@ -363,6 +431,9 @@ export default function TemplateEditor(props: {
         };
         await api.updateTemplate(String(tpl?.id ?? ""), settings);
         setOk(true);
+        // meta 档保存后表单原样留在屏上：快照重锚到已落库的当前值（脏清零）。
+        setSnap(serializeState(form, steps));
+        toast.success("模板设置已保存");
         props.onSaved?.();
         return;
       }
@@ -378,24 +449,38 @@ export default function TemplateEditor(props: {
       setEditing(false);
       setForm(EMPTY_FORM);
       setSteps([]);
+      // 保存后组件退回新建态：快照同锚到空表单（脏清零）。
+      setSnap(serializeState(EMPTY_FORM, []));
       setOk(true);
+      toast.success(editing ? "模板已保存" : "模板已创建");
       props.onSaved?.();
     } catch (e) {
       setErr(String(e));
+      toast.error(String(e));
+    } finally {
+      setSaving(false);
     }
   }
 
   /** 发布当前版本（W2）：confirm 后冻结当时 live 九键 → 外层 onSaved 重拉行刷新徽标。
-   * 只读（共享话术非主管）与新建态不出按钮——发布闸链与 PUT 同（CP 侧兜底）。 */
+   * 只读（共享话术非主管）与新建态不出按钮——发布闸链与 PUT 同（CP 侧兜底）。
+   * publishGuard（可选）：先于 confirm 调用，返回 false 静默中止（守卫自负责交互）。 */
   async function publish() {
-    if (!tplId || !window.confirm("发布后新通话将使用此版本？")) return;
+    if (!tplId) return;
+    if (props.publishGuard && !props.publishGuard()) return;
+    if (!window.confirm("发布后新通话将使用此版本？")) return;
     setPublishing(true);
     setPubErr(null);
     try {
-      await api.publishTemplate(tplId);
+      const res = await api.publishTemplate(tplId);
+      // 发布回执（审计问题 5）：消费 response.tts_pregen——queued=罐头音频已排后台物化。
+      const pregen = (res as { tts_pregen?: { status?: unknown } } | null)?.tts_pregen;
+      const pregenQueued = String(pregen?.status ?? "") === "queued";
+      toast.success(pregenQueued ? "已发布：新通话将使用此版本；罐头音频后台物化中" : "已发布：新通话将使用此版本");
       props.onSaved?.();
     } catch (e) {
       setPubErr(String(e));
+      toast.error(String(e));
     } finally {
       setPublishing(false);
     }
@@ -410,6 +495,7 @@ export default function TemplateEditor(props: {
     setEditing(false);
     setForm(EMPTY_FORM);
     setSteps([]);
+    setSnap(serializeState(EMPTY_FORM, []));
   }
 
   /** 填入三语理赔示例（分步为主:示例直接填成分步,四段清空由步骤统一承载）。 */
@@ -439,7 +525,17 @@ export default function TemplateEditor(props: {
   return (
     <section className="card space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="label">{editing ? "编辑模板" : "新建模板"}</span>
+        <div className="flex items-center gap-2">
+          <span className="label">{editing ? "编辑模板" : "新建模板"}</span>
+          {dirty && (
+            <span
+              className="rounded-sm bg-amber-100 px-1.5 py-0.5 text-[10px] font-normal text-amber-700"
+              title="有修改尚未保存"
+            >
+              未保存
+            </span>
+          )}
+        </div>
         {editing && (
           <div className="flex items-center gap-2">
             <PublishBadge row={tpl ?? {}} />
@@ -653,8 +749,8 @@ export default function TemplateEditor(props: {
       {err && <ErrorState message={err} />}
       <div className="flex items-center gap-3">
         {!readOnly && (
-          <button className="btn-primary" onClick={save}>
-            {editing ? (meta ? "保存模板设置" : "保存修改") : "创建模板"}
+          <button className="btn-primary" disabled={saving} onClick={save}>
+            {saving ? "保存中…" : editing ? (meta ? "保存模板设置" : "保存修改") : "创建模板"}
           </button>
         )}
         {editing && !meta && !readOnly && <button className="btn-ghost" onClick={cancelEdit}>取消</button>}
