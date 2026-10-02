@@ -260,6 +260,19 @@ async def _generate(request: Request):
                 f"queued(reply={len(GATE._reply_waiters)},bg={len(GATE._bg_waiters)})",
                 flush=True,
             )
+        # 排队后断连复检（2026-10-02 orch2-D）：上面的早断短路只接得住**排队前**
+        # 已断的客户端；排队窗口内断连（打断/挂断掐链路是常态）此前无人复检——
+        # 拿到槽后照样打上游，为一个幽灵烧满一次 mlx 生成槽（单并发下整条回复链
+        # 白等一整轮 decode）。body 已在过闸前读完（与早断短路同一安全前提：通道
+        # 里只剩 disconnect/尾部消息，is_disconnected 取消 scope 的试收不会偷吃
+        # 正文）。早退经 async with 的 __aexit__ 正常归还槽（尚未 handoff，与
+        # _relay/BackgroundTask/看门狗的多头 retire 幂等无冲突）。
+        if await request.is_disconnected():
+            print(
+                f"queue_proxy drop disconnected lane={lane} waited_ms={acq.waited * 1000:.0f}",
+                flush=True,
+            )
+            return JSONResponse({"detail": "client disconnected"}, status_code=499)
         fwd_headers = {
             "content-type": request.headers.get("content-type", "application/json"),
             # 车道透传（观测/测试用：桩上游可记录每请求的车道归属）
