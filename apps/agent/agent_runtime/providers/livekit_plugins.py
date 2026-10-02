@@ -5485,6 +5485,9 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
         self._rate_limited = False
         self._last_rl_status = 0
         self._first_audio_evt = asyncio.Event()
+        # orch2-C 中途死亡可见性:连接死亡时音频已开始(=客户听到截断回复)置真,
+        # 收尾 PERF 行据此带 truncated_mid_reply=1(否则死亡在日志/账本零痕)。
+        self._truncated_mid_reply = False
 
     def push_text(self, text: str = "", *args, **kwargs):
         # 同 _MiniMaxSynthesizeStream.push_text:非 2.8 档实例剥自然度标记
@@ -5593,6 +5596,9 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
             state = {
                 "sent_any": False,
                 "first_pushed": False,
+                # orch2-C:本回复曾向 emitter 推过音频(粘性)——stall 自愈重连会把
+                # first_pushed 复位(新一轮首包含义),但已出声的历史唔可以丢。
+                "audio_ever": False,
                 "t_first_continue": 0.0,
                 "t_last_audio": 0.0,
                 "stale_msgs": 0,
@@ -5600,6 +5606,20 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                 "sentences": 0,
                 "stall_heals": 0,
             }
+
+            def _note_conn_died(reason: str, exc: BaseException | None = None) -> None:
+                """orch2-C 连接死亡可见性:音频已开始(=客户听到截断回复)置截断旗,
+                无论首包前后都打一行标记(first_audio=0|1)——死亡唔再零痕。"""
+                mid = bool(state.get("audio_ever"))
+                if mid:
+                    self._truncated_mid_reply = True
+                print(
+                    f"MINIMAX_TTS_BIDI_DIED_MID_REPLY first_audio={int(mid)} "
+                    f"reason={reason} sentences={state['sentences']} epoch={my_epoch}"
+                    + (f" err={repr(exc)[:120]}" if exc is not None else ""),
+                    flush=True,
+                )
+
             t_flush = 0.0
             # 重连窗口发送闸(看门狗换连接期间):输入循环若继续 task_continue 会发到
             # 已弃旧 ws → 整轮音频丢失。所有发送点先 is_set() 再 wait()(Event.wait()
@@ -5638,9 +5658,10 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                             if self._flushed_evt.is_set():
                                 return  # 尾巴排干净了
                             continue  # 还在等句子音频,继续等
-                        except Exception:
+                        except Exception as exc:
                             # 连接死亡(2201/网络):标记死连接 + 解锁等待方;
                             # 死亡即后台重预热,下个真实轮零冷启动
+                            _note_conn_died("recv-exc", exc)
                             await session.invalidate(reprewarm=True)
                             self._flushed_evt.set()
                             self._canceled_evt.set()
@@ -5698,6 +5719,7 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                                 output_emitter.flush()
                                 buf.clear()
                                 state["first_pushed"] = True
+                                state["audio_ever"] = True  # orch2-C:粘性中途死亡判据
                                 self._first_audio_evt.set()  # F-10:WS 退避重试的成功信号
                             while len(buf) >= frame_bytes:
                                 output_emitter.push(bytes(buf[:frame_bytes]))
@@ -5709,6 +5731,7 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                             output_emitter.push(bytes(buf))
                             output_emitter.flush()
                             buf.clear()
+                            state["audio_ever"] = True  # orch2-C:尾块推清也算已出声
                         if event == "task_flushed":
                             if state.get("head_flush_pending"):
                                 # 头段催产 flush 的 ack(非收尾):唔收摊,recv 继续
@@ -5771,6 +5794,7 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                             print("MINIMAX_TTS_BIDI_2204_TEXT_SKIPPED", flush=True)
                         elif status in (2201, 2206):
                             print(f"MINIMAX_TTS_BIDI_{status}", flush=True)
+                            _note_conn_died(f"status-{status}")
                             await session.invalidate()
                             self._flushed_evt.set()
                             self._canceled_evt.set()
@@ -6130,18 +6154,23 @@ class _MiniMaxBidiStream(tts.SynthesizeStream):
                 # 验收读数:典型 2-3 短句回复 sentences 应 2-4;first_audio_ms 稳定
                 # 在数百 ms 且方差小于 classic overlap 时代。
                 def _print_perf_summary() -> None:
+                    # orch2-C:中途死亡(音频已开始)时补截断旗,否则 PERF 行与
+                    # 正常收线无法区分(死亡分支已置 flushed,这里照常走到)。
+                    dead = " truncated_mid_reply=1" if self._truncated_mid_reply else ""
                     if state["t_last_audio"] > 0.0 and state["t_first_continue"] > 0.0:
                         print(
                             f"MINIMAX_BIDI_PERF sentences={state['sentences']} "
                             f"canceled={int(self._canceled_evt.is_set())} "
                             f"first_audio_ms="
-                            f"{(state['t_last_audio'] - state['t_first_continue']) * 1000:.0f}",
+                            f"{(state['t_last_audio'] - state['t_first_continue']) * 1000:.0f}"
+                            f"{dead}",
                             flush=True,
                         )
                     else:
                         print(
                             f"MINIMAX_BIDI_PERF sentences=0 "
-                            f"canceled={int(self._canceled_evt.is_set())} (no audio this turn)",
+                            f"canceled={int(self._canceled_evt.is_set())} (no audio this turn)"
+                            f"{dead}",
                             flush=True,
                         )
 
