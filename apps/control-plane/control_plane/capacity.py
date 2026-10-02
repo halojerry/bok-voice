@@ -12,7 +12,8 @@
    reports/mac-concurrency-2026-09-24/BATTERY-FINAL.md；cuda=48 为
    硬件档案上限初值）。
 2. **常驻脚印并入安全垫**：定案档案只有四个旋钮（floor/ceiling/workset/
-   headroom），常驻服务余量算进 headroom，不单列（mac 2GB 已覆盖）。
+   headroom），常驻服务余量算进 headroom，不单列（mac 8GB 已覆盖双 4GB
+   prompt-cache 时代的最坏增长面）。
 3. **显式 ``BOK_MAX_ACTIVE_CALLS`` = legacy 钉死**：显式设了就不探测不
    计算，返回值逐字节等于旧语义（0/负=不限），作为 ceiling 硬覆盖的
    钉死档——要动态档就别设它，要固定档就设它。未设 → 动态路径。
@@ -55,12 +56,20 @@ _GB = 1024 ** 3
 # 硬件档案初值（floor=已验证下限 / ceiling=实测物理上限 / workset=单通工作集 /
 # headroom=安全垫）。mac 档数字直接来自双通实弹与 6 通 OOM 对照；cuda 档为
 # 计划档定案的初始档案（首跑校准后凭 BOK_MAX_CALLS_* 覆盖，勿在代码里猜）。
+# headroom 2026-10-02（orch2-D）对齐双 4GB cache 时代：mac/unknown 2.0→8.0。
+# 旧值 2.0 是 :1235/:1237 prompt-cache cap=2GB 年代的数字；现两实例均
+# --prompt-cache-bytes 4GB（tools/bok.py）——双 cap 顶满=+8GB 最坏增长面，
+# 另加 9B 权重（~5.3GB）空闲被换出后生成期的回页抖动；2.0 结构性低估
+# （纪律 2：常驻服务余量算进 headroom，不单列）。8.0 按「双 4GB cap 顶满」
+# 定价的保守垫——准入不创造容量，宁可少放（净效应：可用内存 <13GB 的机器
+# 压到 floor=1，≥13GB 仍 clamp 到 ceiling=2）。cuda 档不动（4.0 是计划档
+# 初始值，首跑校准前勿猜）。
 PROFILES: dict[str, dict[str, float]] = {
-    "mac": {"floor": 1, "ceiling": 2, "workset_gb": 2.5, "headroom_gb": 2.0},
+    "mac": {"floor": 1, "ceiling": 2, "workset_gb": 2.5, "headroom_gb": 8.0},
     "cuda": {"floor": 10, "ceiling": 48, "workset_gb": 1.5, "headroom_gb": 4.0},
     # 未知平台（非 mac / 非 cuda-Linux）：按 mac 档保守兜底（准入不创造容量，
     # 宁可少放；要更多显式设 BOK_MAX_CALLS_CEILING）。
-    "unknown": {"floor": 1, "ceiling": 2, "workset_gb": 2.5, "headroom_gb": 2.0},
+    "unknown": {"floor": 1, "ceiling": 2, "workset_gb": 2.5, "headroom_gb": 8.0},
 }
 
 _CACHE_TTL_S = 30.0
