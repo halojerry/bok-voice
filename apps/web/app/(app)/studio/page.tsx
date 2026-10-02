@@ -174,15 +174,33 @@ export default function StudioPage() {
   // 手法与 /supervisor ?listen= 同款 window.location，不引入 useSearchParams
   // （静态导出下需 Suspense 包裹，不值）。换模板重锚见 anchoredSelRef，SPA 化无串稿。
   const [selId, setSelId] = useState("");
+  // popstate 丢稿防线（2026-10-02 review 修）：浏览器 Back 离开工作台与「返回列表」
+  // 同语义——旧版只拦 beforeunload(刷新/关闭)与站内按钮,Back 直落 popstate 静默
+  // 重锚丢草稿。dirty/selId 引用走 ref(effect 依赖空数组,不重挂监听;赋值在
+  // anyDirty 声明之后,见下)。
+  const dirtyRef = useRef(false);
+  const selIdRef = useRef("");
   useEffect(() => {
     const selFromUrl = () => {
       const m = window.location.search.match(/[?&]t=([^&]+)/);
       return m ? decodeURIComponent(m[1]) : "";
     };
     setSelId(selFromUrl());
-    const onPop = () => setSelId(selFromUrl());
+    const onPop = () => {
+      const next = selFromUrl();
+      if (selIdRef.current && !next && dirtyRef.current) {
+        if (!window.confirm("有未保存/未应用的修改（主流程或模板设置），离开会丢失。仍要离开？")) {
+          // 拒绝=推回工作台条目(forward 再触发一次 onPop,此时 next=工作台,正常落地)
+          window.history.forward();
+          return;
+        }
+      }
+      selIdRef.current = next;
+      setSelId(next);
+    };
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   /** 列表→工作台：SPA 导航（列表数据留存，返回列表即时、零冷取）。 */
@@ -273,6 +291,14 @@ export default function StudioPage() {
   // ---- 步骤草稿（工作站层唯一持有；列表编辑/模板设置共用——切换不丢修改） ----
   const [stepsDraft, setStepsDraft] = useState<FlowStep[]>([]);
   const [stepsDirty, setStepsDirty] = useState(false);
+  // 模板设置（meta 编辑器）独立 dirty（2026-10-02 review 修）：TemplateEditor
+  // (variant=meta) 有自己的保存按钮——旧版 backToList/publishNow 只看 stepsDirty,
+  // meta 区未保存的名称/语言/语气/热词改动被静默丢、或带着旧值发布。
+  const [metaDirty, setMetaDirty] = useState(false);
+  const anyDirty = stepsDirty || metaDirty;
+  // popstate 防线的引用快照(声明在 effect 附近,赋值在此=anyDirty 已就绪)
+  dirtyRef.current = anyDirty;
+  selIdRef.current = selId;
   const [applying, setApplying] = useState(false);
   const [applyErr, setApplyErr] = useState("");
   const [applyNote, setApplyNote] = useState("");
@@ -395,7 +421,7 @@ export default function StudioPage() {
   /** 发布（新通话用冻结版）：有未应用修改先提醒——发布的是已保存版本。 */
   async function publishNow() {
     if (!selId) return;
-    if (stepsDirty && !window.confirm("还有未应用的修改：发布的是「已保存」的版本。建议先点「应用」。\n\n仍要直接发布？")) return;
+    if (anyDirty && !window.confirm("还有未保存/未应用的修改（主流程或模板设置）：发布的是「已保存」的版本。建议先点「应用」/「保存」。\n\n仍要直接发布？")) return;
     if (!window.confirm("发布后，之后拨出的电话都按这个版本讲。确定发布？")) return;
     setPublishing(true);
     try {
@@ -415,18 +441,17 @@ export default function StudioPage() {
 
   // 有未应用修改时拦浏览器关闭/刷新（站点内导航走「返回列表」的确认）。
   useEffect(() => {
-    if (!stepsDirty) return;
+    if (!anyDirty) return;
     const onBeforeUnload = (e: BeforeUnloadEvent) => {
       e.preventDefault();
     };
     window.addEventListener("beforeunload", onBeforeUnload);
     return () => window.removeEventListener("beforeunload", onBeforeUnload);
-  }, [stepsDirty]);
+  }, [anyDirty]);
 
-  /** 返回列表：脏=确认（未应用的修改会丢——页面态不跨模板保留）。 */
   /** 返回列表：脏=确认（未应用的修改会丢——再进任何模板必重锚，草稿不跨模板保留）。 */
   function backToList() {
-    if (stepsDirty && !window.confirm("主流程的修改还没应用，返回会丢失。仍要返回？")) return;
+    if (anyDirty && !window.confirm("有未保存/未应用的修改（主流程或模板设置），返回会丢失。仍要返回？")) return;
     setSelId("");
     window.history.pushState(null, "", "/studio/");
     window.scrollTo(0, 0);
@@ -866,8 +891,9 @@ export default function StudioPage() {
                         tpl={tplRow}
                         variant="meta"
                         onSaved={() => setTplRev((v) => v + 1)}
+                        onDirtyChange={setMetaDirty}
                         publishGuard={() => {
-                          if (stepsDirty && !window.confirm("主流程有未应用的修改，发布只会包含已应用版本。仍要发布？")) return false;
+                          if (anyDirty && !window.confirm("有未应用的修改（主流程或模板设置），发布只会包含已保存版本。仍要发布？")) return false;
                           return true;
                         }}
                       />
