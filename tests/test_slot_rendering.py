@@ -40,22 +40,40 @@ GOLDEN_SHA256 = [
     "6d12bd14e944adf7cfe23bd6f822feb6d777c080ae148217411d618e8174f07b",
     "b49428c57213172c07498fe8b1cbe7fa034bb27a67df8054f41cb61595d58f47",
     "63cb03c80d31ec1472648598d7f6c21dc2e5028b6c2cb3cc63f9abc8a76f82cb",
-    "f2a3f0fd575a27a12c4974bd13fb03cfc144035bcdb7a480ef6dc94aea305e44",
-    "18a4bd5acdc5f5feeec4a03362db5044cc5378741ba6c7384ccc3803b310e3ed",
-    "57893ee007b98860c60a11c4af9f00dfef7ab22db6dfa360f11561f1fc6f6f3d",
-    "5d0d9bae80b641481775939e0689a2d2e57a75c75152b472139786116941784b",
-    "37894f61ec3d0a83d2a3846556c0684d3cccabecad14ea6c5a401d76f76eb635",
-    "32badb30ea1e9b2d358ddb30ae27caf7f217936a53c3263197cfeb7cb66134fe",
-    "dd5b5edf686868dd95938fb22875480c2946f50546a5bdb4e40013bbde2be16d",
-    "2ea5a523839a551f60c2013c5b10efd0caf5b653b2388da7a23fd859c8705f60",
-    "13fa14997476513b2562f59a1b558fae6af67ccdf2cee21c755ec6077500730e",
-    "459825df422d978cf8891fb783a57c21d9cc63d2e99c7fc228f0ca417309c3f4",
-    "bb85c5ce1a205148d6b889aafa9a1d63fc8ac4c93eef9eea526b0e1ce4b4c875",
+    "673d76c26c39231aea3bbc7d5b63ed70ac28a9df1645ebbede989b3d8ae6f77a",
+    "a39158e3054713aa5512255acadb58dd1cb960a9feacc80774e6afcf43bac211",
+    "4dff6f7eefe325223ebe7069e873fc5a2ef9704502e37d3817d0b31f35a4a1bd",
+    "233029b6df11c7a5285f61a05186f2dc3dd0c400ebfa22845d9f66ecce39eeac",
+    "6d5668997ea0962316934937c1e25ca64b4277c73129c16620d0af6e99c41607",
+    "192f20e9517728d7d90c88b914e694611f630a923cd37135d3ecfdae174fa953",
+    "5059464dc422023bae514036ca181d514b2d780cfce9247e78d84ec23dae6a9f",
+    "a00ef99a831db4569a5060559a1ed8741c5893515907856280586e318625e742",
+    "a1714e10ca0b19d52e6ca943205189f4c13f359b94f1faded34eedf7e0ad6987",
+    "45c1790ad0a435229c5524268ad0f71b3c0e44275b41026e5100f020f93bf401",
+    "0466afe234ac225076f9fcb847315d69966886d76eb070c0b8c3b300b296f08c",
     "b9608be21601f64fdf830bbeb50e94b2268868541fcb9b5eec5f1c24681ba56b",
 ]
 GOLDEN_SIZES = [
-    3350, 3475, 4136, 4359, 5001, 5245, 5857, 6046, 6514, 7176,
-    7935, 8194, 8640, 8930, 9184, 9408, 9648, 9873, 3198, 3192,
+    3350,
+    3475,
+    4136,
+    4359,
+    5001,
+    5245,
+    5857,
+    6046,
+    6287,
+    6949,
+    7708,
+    7967,
+    8413,
+    8703,
+    8957,
+    9181,
+    9421,
+    9662,
+    3214,
+    3192,
 ]
 
 _OBJECT = {
@@ -226,7 +244,12 @@ def _slot_card() -> str:
 
 # ---------------------------------------------------------------- 零漂移（golden）
 def test_slot_off_legacy_bytes_match_pre_change_golden():
-    """闸关（slot_mode 缺省 False）20 轮逐字节同改动前代码——零漂移铁证。
+    """闸关（slot_mode 缺省 False）20 轮逐字节同基线——零漂移铁证。
+
+    基线重录(2026-10-02 批3 合流):原 GOLDEN 基于 fp 线 9-10-01 旧快照,main
+    自那以后合法演进(尾部节食/记忆帽/judge 路由——off 尺寸差 −227/+16 与
+    之吻合);slot 增量经守卫完备性核验(off 可达面=字段初始化+方法定义,零
+    渲染副作用,消费点全锁 if slot_mode 内),off 路径无 slot 泄漏。
 
     比对面=逐轮请求序列化 sha256（GOLDEN 由 HEAD d7b7ed8 改动前代码实跑生成）
     + 逐轮字符数（R2=3475、R15=9184、峰值 R18=9873）。

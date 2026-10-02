@@ -61,8 +61,11 @@ def test_agent_catchall_dispatch_after_qa_fastpath():
     qa_block = _SRC.index("Q→A 检索快路")
     catchall_at = _SRC.index(_CATCHALL_DISPATCH)
     assert qa_block < catchall_at
-    # 兜底派发点之后紧跟 LLM 路收尾(_filler.arm)——它就是 LLM 前最后一道闸
-    assert catchall_at < _SRC.index("_filler.arm()")
+    # 兜底派发点之后紧跟 LLM 路收尾(_filler.arm)——它就是 LLM 前最后一道闸。
+    # rindex(2026-10-02 批3 合流校准):FIX-2 的 reask 块注释里也提及
+    # `_filler.arm()`(「必须在 _filler.arm() 之前」),first-index 会钉到注释;
+    # 实际调用点唯一,取最后一次出现。
+    assert catchall_at < _SRC.rindex("_filler.arm()")
     # 兜底观测行在派发点旁(动作本体可见)
     assert '"FLOW_GRAPH catchall binding=' in _SRC[catchall_at - 400 : catchall_at + 200]
 
