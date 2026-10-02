@@ -62,8 +62,10 @@ def _server_path() -> str | None:
 
 
 
-# ---- S5 排队定罪计时补丁（2026-09-09,独立于模板归一补丁,幂等）----
+# ---- S5 排队定罪计时补丁 v2（2026-10-02 刀6B，独立于模板归一补丁，幂等）----
 TIMING_MARK = "bok-timing"
+TIMING_MARK_V1 = "[bok-timing 2026-09-09]"
+TIMING_MARK_V2 = "[bok-timing-v2 2026-10-02"
 TIMING_ANCHOR = """        # Create the token generator
         try:
             ctx, response = self.response_generator.generate(
@@ -72,7 +74,8 @@ TIMING_ANCHOR = """        # Create the token generator
                 progress_callback=keepalive_callback,
             )
         except Exception as e:"""
-TIMING_BLOCK = """        # [bok-timing 2026-09-09] generate() 内含「模型锁等待 + prompt
+# v1（2026-09-09～2026-10-02）原文，仅用于把存量注入升级成 v2（不叠加）。
+TIMING_BLOCK_V1 = """        # [bok-timing 2026-09-09] generate() 内含「模型锁等待 + prompt
         # processing」——首行 progress 前的耗时=锁等待+首步 prefill,行间=prompt
         # 处理窗。缺这条没法把暖轮 TTFT 的排队常数定罪到具体环节。BOK_TIMING_PATCH=0 关。
         _bok_t0 = time.perf_counter()
@@ -101,26 +104,95 @@ TIMING_BLOCK = """        # [bok-timing 2026-09-09] generate() 内含「模型�
                 % (_bok_g, _bok_fpm, _bok_ppw)
             )
         except Exception as e:"""
+TIMING_BLOCK = """        # [bok-timing-v2 2026-10-02 刀6B] generate() 只等「排队 + tokenize +
+        # ctx 就绪」——prefill 与它的 progress 回调全部发生在返回之后的流迭代里
+        # （生成线程先 rqueue.put(ctx)，再跑 stream_generate）。旧 v1 在 generate()
+        # 返回处立刻取值打点，彼时 _bok_fp 恒为 None → first_progress_ms≡
+        # generate_ms、prompt_window_ms≡0 的恒等式（系统性误导排障：把「handler
+        # 拿到 ctx 的时刻」当全部服务端耗时）。v2：回调只记时刻；打点延迟到首个
+        # 生成项到达（progress 元组先于 Response 入队，此刻 prefill 窗已完整）；
+        # progress/token 缺席时明标 -1.0，不再 `or` 兜底成恒等。BOK_TIMING_PATCH=0
+        # 在脚本注入期关闭（与 BOK_MLX_ABORT 互不拖累）。
+        _bok_t0 = time.perf_counter()
+        _bok_fp = [None, None, None]  # [0]=首 progress [1]=末 progress [2]=首 token
+        _bok_logged = [False]
+        _bok_orig_cb = keepalive_callback
+
+        def _bok_progress_cb(_p, _t):
+            _now = time.perf_counter()
+            if _bok_fp[0] is None:
+                _bok_fp[0] = _now
+            _bok_fp[1] = _now
+            _bok_orig_cb(_p, _t)
+
+        try:
+            ctx, response = self.response_generator.generate(
+                request,
+                args,
+                progress_callback=_bok_progress_cb,
+            )
+            _bok_g = (time.perf_counter() - _bok_t0) * 1000
+
+            def _bok_log_timing():
+                if _bok_logged[0]:
+                    return
+                _bok_logged[0] = True
+                _fp0, _fp1, _tok = _bok_fp
+                _fpm = ((_fp0 - _bok_t0) * 1000) if _fp0 is not None else -1.0
+                _ppw = (
+                    ((_fp1 - _fp0) * 1000)
+                    if (_fp0 is not None and _fp1 is not None)
+                    else -1.0
+                )
+                _ftm = ((_tok - _bok_t0) * 1000) if _tok is not None else -1.0
+                logging.info(
+                    "[bok-timing] generate_ms=%.0f first_progress_ms=%.0f "
+                    "prompt_window_ms=%.0f first_token_ms=%.0f"
+                    % (_bok_g, _fpm, _ppw, _ftm)
+                )
+
+            def _bok_timed_stream(_stream):
+                try:
+                    for _item in _stream:
+                        if _bok_fp[2] is None:
+                            _bok_fp[2] = time.perf_counter()
+                        _bok_log_timing()
+                        yield _item
+                    _bok_log_timing()
+                finally:
+                    _bok_close = getattr(_stream, "close", None)
+                    if _bok_close is not None:
+                        try:
+                            _bok_close()
+                        except Exception:  # noqa: BLE001 - 收尾尽力
+                            pass
+
+            response = _bok_timed_stream(response)
+        except Exception as e:"""
 
 
 def _apply_timing_patch(path: str, src: str) -> str:
     if os.environ.get("BOK_TIMING_PATCH", "1") != "1":
         print("[bok-timing] disabled by env")
         return src
-    if TIMING_MARK in src:
-        print(f"[bok-timing] already patched: {path}")
+    if TIMING_MARK_V2 in src:
+        print(f"[bok-timing] already patched (v2): {path}")
         return src
-    if TIMING_ANCHOR not in src:
+    if TIMING_BLOCK_V1 in src:
+        patched = src.replace(TIMING_BLOCK_V1, TIMING_BLOCK, 1)
+        print(f"[bok-timing] upgrading v1 -> v2: {path}")
+    elif TIMING_ANCHOR in src:
+        patched = src.replace(TIMING_ANCHOR, TIMING_BLOCK, 1)
+        print(f"[bok-timing] patched: {path}")
+    else:
         print(f"[bok-timing] anchor not present (upstream changed?), skip: {path}")
         return src
     import py_compile
 
-    patched = src.replace(TIMING_ANCHOR, TIMING_BLOCK, 1)
     compile(patched, path, "exec")  # 语法校验,写坏 server 会炸整个栈
     with open(path, "w", encoding="utf-8") as f:
         f.write(patched)
     py_compile.compile(path, doraise=True)
-    print(f"[bok-timing] patched: {path}")
     return patched
 
 

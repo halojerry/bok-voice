@@ -291,11 +291,17 @@ def build_qa_drift_report(
     max_calls: int = DEFAULT_MAX_CALLS,
     limit: int = 30,
     exclude_test_objects: bool = True,
+    include_fired: bool = False,
 ) -> dict:
     """体检主入口:窗口内 turns → 逐词条提案。
 
     「通知」的形状:每条提案自带 headline(发现了什么)+ detail(建议做什么),
     运营看得懂再决定;`counts` 给出两类各多少条(驾驶舱徽标/铃铛数字用)。
+
+    include_fired=True(2026-09-25 VectorQ 生产端专用)时额外出仓
+    ``fired_by_norm``(归一问法→窗口 fired 计数)——CP qa_digest 的阈值回落
+    pass 需要逐词条「清白命中」证据;默认关,**公共报告形状逐字节不变**
+    (端点 shape 被测试钉死,引擎外消费者零感知)。
     """
     calls = repo.list_calls(account_id)
     obj_names: dict[str, str | None] = {}
@@ -348,10 +354,15 @@ def build_qa_drift_report(
     proposals.sort(key=lambda p: (rank.get(p["kind"], 9), -p["occurrences"], p["qa_id"]))
     proposals = proposals[: max(1, min(int(limit), 200))]
     counts = Counter(p["kind"] for p in proposals)
-    return {
+    out = {
         "window_calls": window_calls,
         "entries_scanned": len(entries),
         "counts": {KIND_REANSWER: counts.get(KIND_REANSWER, 0), KIND_RETIRE: counts.get(KIND_RETIRE, 0)},
         "proposals": proposals,
         "generated_at": int(time.time()),
     }
+    if include_fired:
+        # 逐问法 fired 计数(VectorQ 阈值回落的「清白命中」证据):仅引擎侧
+        # include_fired=True 时出仓,公共报告形状不变(见 docstring)。
+        out["fired_by_norm"] = dict(counters["fired"])
+    return out

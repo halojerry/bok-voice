@@ -28,10 +28,12 @@ def test_settle_model_env_override(monkeypatch):
 
 
 def test_apply_judge_env_present_and_absent(monkeypatch, tmp_path):
-    """模型在盘 → 注入 FLOW_JUDGE_*(:1237);不在盘 → 不注入(零配置回退 :1235)。"""
+    """BOK_DEV_9B=1 且模型在盘 → 注入 FLOW_JUDGE_*(:1237);不在盘 → 不注入
+    (零配置回退 :1235)。默认(9B 后端化,2026-09-25)不注入——9B 不随栈常驻。"""
     fake = tmp_path / "fake-settle-model"
     fake.mkdir()
     monkeypatch.setenv("BOK_SETTLE_LLM_MODEL", str(fake))
+    monkeypatch.setenv("BOK_DEV_9B", "1")
     env: dict[str, str] = {}
     bok._apply_judge_env(env, bok.MODELS["mac"])
     assert env.get("FLOW_JUDGE_LLM_BASE_URL") == "http://127.0.0.1:1237/v1"
@@ -43,28 +45,51 @@ def test_apply_judge_env_present_and_absent(monkeypatch, tmp_path):
     assert "FLOW_JUDGE_LLM_BASE_URL" not in env2
     assert "FLOW_JUDGE_LLM_MODEL" not in env2
 
+    # 2026-10-01 P2 翻档:默认(=1)在盘即注入;BOK_DEV_9B=0 显式关才不注入。
+    monkeypatch.setenv("BOK_DEV_9B", "0")
+    monkeypatch.setenv("BOK_SETTLE_LLM_MODEL", str(fake))
+    env3: dict[str, str] = {}
+    bok._apply_judge_env(env3, bok.MODELS["mac"])
+    assert "FLOW_JUDGE_LLM_BASE_URL" not in env3
+    assert "FLOW_JUDGE_LLM_MODEL" not in env3
+    # 缺省(env 不设)=开——模型在盘即注入。
+    monkeypatch.delenv("BOK_DEV_9B", raising=False)
+    env4: dict[str, str] = {}
+    bok._apply_judge_env(env4, bok.MODELS["mac"])
+    assert env4.get("FLOW_JUDGE_LLM_BASE_URL") == "http://127.0.0.1:1237/v1"
+
 
 def test_control_plane_env_carries_settle(monkeypatch, tmp_path):
-    """CP env 带 BOK_SETTLE_*:Summarizer 专线入口(bok.py 注入面)。"""
+    """CP env 带 BOK_SETTLE_*:Summarizer 专线入口(bok.py 注入面);9B 后端化后
+    需 BOK_DEV_9B=1 显式开(默认档不注入,Summarizer 回退 MLX)。"""
     fake = tmp_path / "fake-settle-model"
     fake.mkdir()
     monkeypatch.setenv("BOK_SETTLE_LLM_MODEL", str(fake))
+    monkeypatch.setenv("BOK_DEV_9B", "1")
     env = bok._control_plane_env(tmp_path / "x.db")
     assert env.get("BOK_SETTLE_LLM_BASE_URL") == "http://127.0.0.1:1237/v1"
     assert env.get("BOK_SETTLE_LLM_MODEL") == str(fake)
+    # 2026-10-01 P2 翻档:缺省=开(在盘即注入);BOK_DEV_9B=0 显式关。
+    monkeypatch.delenv("BOK_DEV_9B", raising=False)
+    env_on = bok._control_plane_env(tmp_path / "x.db")
+    assert env_on.get("BOK_SETTLE_LLM_BASE_URL") == "http://127.0.0.1:1237/v1"
+    monkeypatch.setenv("BOK_DEV_9B", "0")
+    env_off = bok._control_plane_env(tmp_path / "x.db")
+    assert "BOK_SETTLE_LLM_BASE_URL" not in env_off
+    assert "BOK_SETTLE_LLM_MODEL" not in env_off
 
 
 def test_prompt_cache_bytes_tiers(monkeypatch):
-    """缓存档位:显式 env > ≥32GB 12GB > 小内存 6GB;探测失败安全落 6GB。"""
+    """缓存档位:显式 env > 恒 4GB(P1.d 2026-09-29 定档;回 6GB 走 env;探测失败同 4GB)。"""
     monkeypatch.setenv("BOK_LLM_PROMPT_CACHE_BYTES", "8GB")
     assert bok._default_prompt_cache_bytes() == "8GB"
     monkeypatch.delenv("BOK_LLM_PROMPT_CACHE_BYTES", raising=False)
     monkeypatch.setattr(bok, "_physical_mem_gib", lambda: 48.0)
-    assert bok._default_prompt_cache_bytes() == "12GB"
+    assert bok._default_prompt_cache_bytes() == "4GB"
     monkeypatch.setattr(bok, "_physical_mem_gib", lambda: 16.0)
-    assert bok._default_prompt_cache_bytes() == "6GB"
+    assert bok._default_prompt_cache_bytes() == "4GB"
     monkeypatch.setattr(bok, "_physical_mem_gib", lambda: 0.0)
-    assert bok._default_prompt_cache_bytes() == "6GB"
+    assert bok._default_prompt_cache_bytes() == "4GB"
 
 
 def test_settle_in_optional_models():

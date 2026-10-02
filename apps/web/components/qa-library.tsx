@@ -212,14 +212,18 @@ export default function QaLibrary(props: {
   }, []);
 
   // 本模板相关条目：挂本模板步的 + 全程通用的（全程通用对任何模板生效）。
+  // 语言过滤（模板视角，2026-09-25）：只显示模板语言的词条——词条本身带 lang，
+  // 混排的全局词条按模板语言收窄；其他语言去 /qa 全局页（下方提示行明说）。
   const scoped = useMemo(() => {
     const list = rows ?? [];
     return list.filter((r) => {
       const tid = String(r.template_id ?? "");
       const scope = String(r.scope ?? "global");
-      return scope === "global" ? true : tid === templateId;
+      const inScope = scope === "global" ? true : tid === templateId;
+      if (!inScope) return false;
+      return String(r.lang ?? "zh") === props.lang;
     });
-  }, [rows, templateId]);
+  }, [rows, templateId, props.lang]);
 
   const filtered = useMemo(() => {
     const q = query.trim();
@@ -388,6 +392,9 @@ export default function QaLibrary(props: {
 
       <p className="text-xs muted">
         显示：挂本模板的条目 + 全程通用条目。命中按 0.90 字面相似度——客户要问到几乎一样的说法。
+      </p>
+      <p className="text-[11px] muted">
+        已按模板语言（{LANG_LABEL[props.lang] ?? props.lang}）过滤，切换语言去 <span className="underline decoration-dotted">/qa 页</span>。
       </p>
       {err && <ErrorState message={err} />}
       {note && <p className="text-xs text-(--live-ink)">{note}</p>}

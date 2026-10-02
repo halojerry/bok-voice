@@ -2,7 +2,9 @@
 
 // 步骤列表编辑器（2026-09-20 易用性改版）：完全受控（value/onChange），
 // 草稿状态归工作站页面层——「未保存/应用」全局按钮的唯一数据面之一。
-// （P2.5 画布退役后，「主流程」tab 唯一呈现本表单；FlowCanvas 代码保留另案。）
+// 与场景画布（StepCanvasView 同样受控）编辑同一份草稿：来回切换视图不再丢修改。
+// （合并注记：origin/main 的「P2.5 画布退役」描述属于另一条线——本线画布在役，
+// 故保留 HEAD 语义；FlowCanvas 代码保留另案。）
 // 字段面与原 TemplateEditor 分步块一致（目标/参考说法+变量按钮/直念/情绪/
 // 排序/删除），文案按普通人视角重写；表格导入与三语示例复用 template-editor 纯函数。
 
@@ -11,7 +13,7 @@ import {
   parseStepsFromTable, STEPS_EXAMPLES, LANGS,
   type FlowStep,
 } from "@/components/template-editor";
-import { VarTextarea } from "@/components/var-insert";
+import { StepRefForm } from "@/components/step-form";
 
 const textarea =
   "w-full resize-none rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)";
@@ -145,9 +147,9 @@ export default function StepsListEditor(props: {
               onChange={(e) => setStep(i, { goal: e.target.value })}
             />
             <div className="mt-1.5">
-              <VarTextarea
-                className={`h-24 ${textarea} text-xs`}
-                value={st.ref}
+              <StepRefForm
+                refText={st.ref}
+                stepCount={value.length}
                 disabled={readOnly}
                 onChange={(v) => setStep(i, { ref: v })}
               />

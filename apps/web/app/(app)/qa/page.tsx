@@ -9,6 +9,10 @@ import dynamic from "next/dynamic";
 import { api, type UserRow } from "@/lib/api";
 import { decideAuditionPath } from "@/lib/voice-options";
 import { previewVoice } from "@/lib/preview";
+import { downloadCsv, parseBoolCell } from "@/lib/csv";
+import TableImport, {
+  buildExampleCsvRows, rowOk, rowSkip, type ImportResult, type ParsedRow,
+} from "@/components/table-import";
 import {
   bindingFromDraft, bindingThenJumpToDraft, intentJudgeField, JUDGE_PROMPT_MAX_CHARS,
   parseGraphDoc, parseTemplateSteps, resolveClusterTarget, revertCluster,
@@ -49,6 +53,75 @@ const LANGS = [
 ] as const;
 
 const SCOPE_LABEL: Record<string, string> = { global: "全程通用", step: "指定步骤" };
+
+// ---- 语言过滤（客户端过滤；词条量级千内）：选择持久化 localStorage（bok.qa.lang）----
+const LANG_FILTER_KEY = "bok.qa.lang";
+const LANG_FILTER_VALUES = ["", "zh", "cantonese", "en"];
+const LANG_FILTERS: [string, string][] = [
+  ["", "全部"],
+  ["zh", "中文"],
+  ["cantonese", "粤语"],
+  ["en", "英文"],
+];
+
+// ---- 表格导入契约（列=问法,回答,语言,优先级,挂步,启用；写入走既有 POST /api/qa-entries，
+//      幂等在后端）。「下载示例模板」= 前端生成样例 CSV blob（注释行导入时忽略）。----
+const QA_IMPORT_COLUMNS = [
+  { key: "q", label: "问法", hint: "必填；按客户实际说法写" },
+  { key: "a", label: "回答", hint: "必填；命中即播" },
+  { key: "lang", label: "语言", hint: "zh/cantonese/en，可空=zh" },
+  { key: "prio", label: "优先级", hint: "数字，可空=10" },
+  { key: "step", label: "挂步", hint: "步号数字，可空=全程通用" },
+  { key: "enabled", label: "启用", hint: "是/否，可空=是" },
+];
+const QA_IMPORT_EXAMPLE: string[][] = [
+  ["你们是哪家公司", "我们是{物流公司}的客服，负责您的包裹理赔事宜。", "zh", "10", "", "是"],
+  ["點樣查物流進度", "你報個單號畀我，我幫你查運輸進度。", "cantonese", "10", "1", "是"],
+  ["Where is my parcel", "We are checking with the courier and will update you shortly.", "en", "", "", "否"],
+];
+const QA_IMPORT_FILENAME = "qa-entries-example.csv";
+
+/** 表格一行 → 快答条目数据（预览/导入共用；错误=跳过原因给人话）。 */
+type QaImportRow = {
+  question: string;
+  answer: string;
+  lang: string;
+  priority: number;
+  /** 0 基 step_index；-1=全程通用。 */
+  stepIndex: number;
+  enabled: boolean;
+};
+
+function parseQaImportRow(
+  row: string[],
+  _prev: ParsedRow<QaImportRow>[],
+): ParsedRow<QaImportRow> {
+  const question = String(row[0] ?? "").trim();
+  const answer = String(row[1] ?? "").trim();
+  if (!question) return rowSkip("问法为空");
+  if (!answer) return rowSkip("回答为空");
+  const lang = String(row[2] ?? "").trim().toLowerCase() || "zh";
+  if (!["zh", "cantonese", "en"].includes(lang)) {
+    return rowSkip(`语言须为 zh/cantonese/en（当前「${String(row[2]).trim()}」）`);
+  }
+  let priority = 10;
+  const prioRaw = String(row[3] ?? "").trim();
+  if (prioRaw !== "") {
+    const n = Math.round(Number(prioRaw));
+    if (!Number.isFinite(n)) return rowSkip(`优先级「${prioRaw}」不是数字`);
+    priority = Math.max(0, Math.min(n, 1000));
+  }
+  let stepIndex = -1;
+  const stepRaw = String(row[4] ?? "").trim();
+  if (stepRaw !== "") {
+    const n = Math.round(Number(stepRaw));
+    if (!Number.isFinite(n) || n < 1) return rowSkip(`挂步「${stepRaw}」须为 ≥1 的步号数字`);
+    stepIndex = n - 1; // 界面 1 基 → 入库 0 基（表单同款）
+  }
+  const enabled = parseBoolCell(String(row[5] ?? ""), true);
+  if (enabled === null) return rowSkip(`启用「${String(row[5]).trim()}」须为 是/否`);
+  return rowOk({ question, answer, lang, priority, stepIndex, enabled });
+}
 
 type QaRow = {
   id: string;
@@ -258,6 +331,22 @@ export default function QaPage() {
   // 右键菜单(节点/边):{x,y}=视口坐标,fixed 定位直用。
   const [menu, setMenu] = useState<{ row: QaRow; x: number; y: number } | null>(null);
   const [edgeMenu, setEdgeMenu] = useState<{ edge: CanvasEdgeHit; x: number; y: number } | null>(null);
+  // 语言过滤（列表视图；""=全部）：mount 后读 localStorage（避免静态导出预渲染/hydration 失配）。
+  const [langFilter, setLangFilter] = useState("");
+  useEffect(() => {
+    const v = window.localStorage.getItem(LANG_FILTER_KEY) ?? "";
+    if (LANG_FILTER_VALUES.includes(v)) setLangFilter(v);
+  }, []);
+  const changeLangFilter = useCallback((v: string) => {
+    setLangFilter(v);
+    try {
+      window.localStorage.setItem(LANG_FILTER_KEY, v);
+    } catch {
+      // 隐私模式等存储不可用：过滤仍生效，只是不记住
+    }
+  }, []);
+  // 表格导入弹窗（逐行 POST /api/qa-entries）。
+  const [importOpen, setImportOpen] = useState(false);
 
   /** 主管模式：匿名本地会话（auth-off 单机形态）与 admin/root 一律全量管理。 */
   const isManager = Boolean(
@@ -457,12 +546,16 @@ export default function QaPage() {
 
   const visibleRows = useMemo(() => {
     const all = rows ?? [];
-    if (isManager || !session) return all;
-    if (tab === "mine") {
-      return all.filter((r) => String(r.owner_user_id ?? "") === session.user_id);
+    let list = all;
+    if (!isManager && session) {
+      list = tab === "mine"
+        ? all.filter((r) => String(r.owner_user_id ?? "") === session.user_id)
+        : all.filter((r) => String(r.owner_user_id ?? "") !== session.user_id);
     }
-    return all.filter((r) => String(r.owner_user_id ?? "") !== session.user_id);
-  }, [rows, isManager, tab, session]);
+    // 语言过滤（客户端；lang 缺失按 zh 归类，与表单默认一致）。
+    if (langFilter) list = list.filter((r) => String(r.lang ?? "zh") === langFilter);
+    return list;
+  }, [rows, isManager, tab, session, langFilter]);
 
   const mineCount = (rows ?? []).filter(
     (r) => String(r.owner_user_id ?? "") === (session?.user_id ?? ""),
@@ -613,6 +706,31 @@ export default function QaPage() {
     } finally {
       setBusy("");
     }
+  }
+
+  /** 表格导入：预览通过的行逐行 POST /api/qa-entries（幂等在后端），返回结果摘要。 */
+  async function importQaRows(rows: QaImportRow[]): Promise<ImportResult> {
+    let done = 0;
+    const errors: string[] = [];
+    for (const r of rows) {
+      try {
+        await api.createQa({
+          question_text: r.question,
+          answer_text: r.answer,
+          lang: r.lang,
+          scope: r.stepIndex >= 0 ? "step" : "global",
+          step_index: r.stepIndex,
+          enabled: r.enabled,
+          priority: r.priority,
+          account_id: accountId,
+        });
+        done += 1;
+      } catch (e) {
+        errors.push(`「${r.question.slice(0, 20)}」：${String(e)}`);
+      }
+    }
+    await refresh();
+    return { done, failed: errors.length, errors };
   }
 
   /** 试听(spec §5):路由判定单点 decideAuditionPath(状态面缺录音=非主管直接拦截),
@@ -868,11 +986,14 @@ export default function QaPage() {
 
   if (!session) return <LoadingState label="正在读取会话…" />;
 
-  const emptyLabel = isManager
-    ? "暂无快答条目，请在右侧新建。"
-    : tab === "mine"
-      ? "你还没有个人条目，可在右侧新建。"
-      : "暂无共享条目。";
+  const emptyLabel =
+    langFilter && rows !== null && rows.length > 0 && visibleRows.length === 0
+      ? "当前语言筛选下暂无条目。"
+      : isManager
+        ? "暂无快答条目，请在右侧新建。"
+        : tab === "mine"
+          ? "你还没有个人条目，可在右侧新建。"
+          : "暂无共享条目。";
   const textarea = "w-full resize-none rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)";
   const selectCls = "w-full rounded-lg border border-(--card-border) bg-transparent px-3 py-2 text-sm outline-hidden focus:border-(--live)";
   const menuItemCls = "block w-full px-3 py-1.5 text-left text-xs hover:bg-accent";
@@ -885,6 +1006,32 @@ export default function QaPage() {
           <p className="page-sub">常见问法的即答条目 · 命中即播标准回答，跳过模型生成</p>
         </div>
         <div className="flex items-center gap-3">
+          {/* 表格导入（逐行 POST /api/qa-entries，预览→确认→摘要）+ 示例模板下载 */}
+          <button className="btn-ghost text-xs" onClick={() => setImportOpen(true)}>
+            表格导入
+          </button>
+          <button
+            className="btn-ghost text-xs"
+            title="下载示例 CSV（含列说明注释行，导入时自动忽略）"
+            onClick={() =>
+              downloadCsv(QA_IMPORT_FILENAME, buildExampleCsvRows(QA_IMPORT_COLUMNS, QA_IMPORT_EXAMPLE))
+            }
+          >
+            下载示例模板
+          </button>
+          {/* 语言过滤（列表视图；选择持久化 localStorage bok.qa.lang） */}
+          {view === "list" && (
+            <select
+              className="rounded-lg border border-(--card-border) bg-transparent px-2 py-1 text-xs outline-hidden focus:border-(--live)"
+              value={langFilter}
+              title="按语言过滤词条（选择会记住）"
+              onChange={(e) => changeLangFilter(e.target.value)}
+            >
+              {LANG_FILTERS.map(([v, l]) => (
+                <option key={v || "all"} value={v}>{l}</option>
+              ))}
+            </select>
+          )}
           {/* 画布不套用 mine/shared 过滤(spec §4.3:画布=全部可见条目),画布视图藏归属 tab。 */}
           {!isManager && view === "list" && (
             <div className="flex items-center gap-1">
@@ -1274,6 +1421,19 @@ export default function QaPage() {
           }}
         />
       )}
+
+      {/* 表格导入（2026-09-25）：CSV 上传→预览（N 行将导入/M 行跳过及原因）→确认→逐行写入→摘要 */}
+      <TableImport
+        open={importOpen}
+        title="表格导入快答条目"
+        description="逐条新增：预览确认后逐行写入快答库（同问法+语言重复由后端幂等去重）。"
+        columns={QA_IMPORT_COLUMNS}
+        exampleRows={QA_IMPORT_EXAMPLE}
+        exampleFilename={QA_IMPORT_FILENAME}
+        parseRow={parseQaImportRow}
+        onImport={importQaRows}
+        onClose={() => setImportOpen(false)}
+      />
     </div>
   );
 }

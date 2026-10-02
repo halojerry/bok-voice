@@ -23,6 +23,7 @@ import argparse
 import asyncio
 import math
 import os
+import platform
 import random
 import struct
 import time
@@ -31,9 +32,31 @@ from pathlib import Path
 import httpx
 from livekit import rtc
 
+
+def _default_log_dir() -> Path:
+    """agent.log 平台路径：env BOK_LOG_DIR 覆盖 > macOS 库目录 > Linux XDG vault。
+    （Linux 节点 vault 在 ~/.local/share/BokVoice——旧硬编码 Library 路径在
+    Linux 上恒不存在，soak 的日志窗口（PERCEIVED/哨兵）整段空转。）"""
+    override = os.environ.get("BOK_LOG_DIR", "").strip()
+    if override:
+        return Path(override)
+    if platform.system() == "Darwin":
+        return Path.home() / "Library" / "Application Support" / "BokVoice" / "logs"
+    return Path.home() / ".local" / "share" / "BokVoice" / "logs"
+
+
+LOG_PATH = _default_log_dir() / "agent.log"
+
 CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
 TTS_URL = os.environ.get("TTS_URL", "http://127.0.0.1:8788")
-LOG_PATH = Path.home() / "Library" / "Application Support" / "BokVoice" / "logs" / "agent.log"
+
+# auth-on 栈适配（2026-09-24，probe_flow_graph._CP_HEADERS 同款）：BOK_CP_TOKEN
+# 在场时全部 CP 调用自动带机器通道 Bearer；auth-off 栈零变化。本文件是探针共享
+# 骨架——这里补齐，fast_speech/brand_words/latency_soak 等旧探针在 auth-on 栈
+# 上不再 401→KeyError 崩。
+CP_HEADERS: dict[str, str] = {}
+if os.environ.get("BOK_CP_TOKEN", "").strip():
+    CP_HEADERS["Authorization"] = f"Bearer {os.environ['BOK_CP_TOKEN'].strip()}"
 
 # SSRF 守卫（2026-09-23，Mimosa 修复）：本模块是 soak/branch/flow_graph/
 # qa_phonetic 等探针的共享底座——import 期对两个出站基址过本地诊断白名单，
@@ -44,9 +67,9 @@ gate(CONTROL_PLANE_URL, TTS_URL)
 
 # 机器通道鉴权（e2e_barge_in 同款惯例）：auth-on 栈/隔离 CP 必须带，未设 env 时
 # 头为空=与旧 auth-off 栈逐字节同行为。soak 族（offscript/latency）共享本底座。
-_CP_HEADERS: dict[str, str] = {}
-if os.environ.get("BOK_CP_TOKEN", "").strip():
-    _CP_HEADERS["Authorization"] = f"Bearer {os.environ['BOK_CP_TOKEN'].strip()}"
+# `_CP_HEADERS` 是旧名（origin/main 侧探针 erc._CP_HEADERS 引用）——同一 dict 别名，
+# 禁止再造第二个账本（两名字漂移=真隐患）。
+_CP_HEADERS = CP_HEADERS
 
 # 答完判定：出现过语音后，连续静默 ≥2.5s 视为答完；30s 无声=哑轮。
 ANSWER_TIMEOUT_S = float(os.environ.get("BOK_CUSTOMER_TIMEOUT_S", "30"))
@@ -277,36 +300,38 @@ def log_windows(marks: list[int]) -> list[list[str]]:
     return out
 
 
-def create_call(lang: str, persona_id: str | None, voice: str = "") -> tuple[str, str]:
+def create_call(lang: str, persona_id: str | None, voice: str = "",
+                template_id: str = "") -> tuple[str, str]:
     """建对象+人设+通话，返回 (call_id, persona_voice)。对象 E2E- 前缀=心跳豁免。
     绑账号该语言的正牌话术模板（E2E/probe 模板排除）——开场白=话术第 1 步
     原文、推进走 FlowController，这才是「真实客户对话」要测的链路。
-    voice 缺省回落 SCENARIOS[lang]（旧三场景=键即语言）。"""
+    voice 缺省回落 SCENARIOS[lang]（旧三场景=键即语言）。
+    template_id 非空=调用方钉死模板（邀约腿/指定话术 A/B），跳过自动挑选。"""
     ts = int(time.time() * 1000) % 100000
     # 话术模板：该语言的正牌模板（排除测试模板）。绑定走**对象**的 template_id
     # 字段——/api/calls 不读请求体直传，模板跟对象走（对象→话术是产品绑定设计）。
-    template_id = ""
-    try:
-        tpls = httpx.get(
-            f"{CONTROL_PLANE_URL}/api/templates?account_id=acc-001", timeout=10,
-            headers=_CP_HEADERS,
-        ).json()
-        tpls = tpls.get("items", tpls) if isinstance(tpls, dict) else tpls
-        tpl = next(
-            (
-                t
-                for t in tpls
-                if str(t.get("language")) == lang
-                and "e2e" not in str(t.get("name", "")).lower()
-                and "probe" not in str(t.get("name", "")).lower()
-            ),
-            None,
-        )
-        template_id = str(tpl.get("id") or "") if tpl else ""
-    except Exception:  # noqa: BLE001 - 模板拉不到=退无模板链路(通用语开场)
-        template_id = ""
+    if not template_id:
+        try:
+            tpls = httpx.get(
+                f"{CONTROL_PLANE_URL}/api/templates?account_id=acc-001", timeout=10,
+                headers=CP_HEADERS,
+            ).json()
+            tpls = tpls.get("items", tpls) if isinstance(tpls, dict) else tpls
+            tpl = next(
+                (
+                    t
+                    for t in tpls
+                    if str(t.get("language")) == lang
+                    and "e2e" not in str(t.get("name", "")).lower()
+                    and "probe" not in str(t.get("name", "")).lower()
+                ),
+                None,
+            )
+            template_id = str(tpl.get("id") or "") if tpl else ""
+        except Exception:  # noqa: BLE001 - 模板拉不到=退无模板链路(通用语开场)
+            template_id = ""
     def _post(path: str, **kw) -> dict:
-        resp = httpx.post(f"{CONTROL_PLANE_URL}{path}", timeout=10, headers=_CP_HEADERS, **kw)
+        resp = httpx.post(f"{CONTROL_PLANE_URL}{path}", timeout=10, headers=CP_HEADERS, **kw)
         resp.raise_for_status()
         return resp.json()
 
@@ -322,9 +347,7 @@ def create_call(lang: str, persona_id: str | None, voice: str = "") -> tuple[str
         },
     )
     if persona_id:
-        resp = httpx.get(
-            f"{CONTROL_PLANE_URL}/api/personas/{persona_id}", timeout=10, headers=_CP_HEADERS
-        )
+        resp = httpx.get(f"{CONTROL_PLANE_URL}/api/personas/{persona_id}", timeout=10, headers=CP_HEADERS)
         resp.raise_for_status()
         persona = resp.json()
         voice = str(persona.get("reference_audio") or "")
@@ -408,9 +431,7 @@ async def fetch_turns(call_id: str, settle_s: float = 12.0) -> list[dict]:
     stable = 0
     deadline = time.perf_counter() + settle_s
     while time.perf_counter() < deadline:
-        rows = httpx.get(
-            f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", timeout=10, headers=_CP_HEADERS
-        ).json()
+        rows = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/turns", timeout=10, headers=CP_HEADERS).json()
         if rows and len(rows) == len(last):
             stable += 1
             if stable >= 2:
@@ -491,7 +512,7 @@ async def run_scenario(key: str, persona_id: str | None) -> dict:
             f"{CONTROL_PLANE_URL}/api/token",
             json={"account_id": "acc-001", "call_id": call_id},
             timeout=10,
-            headers=_CP_HEADERS,
+            headers=CP_HEADERS,
         ).json()
         await room.connect(data["serverUrl"], data["participantToken"])
         audio_source = rtc.AudioSource(sample_rate=16000, num_channels=1)
@@ -526,8 +547,8 @@ async def run_scenario(key: str, persona_id: str | None) -> dict:
         for t in read_tasks:
             t.cancel()
         try:
-            httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/hangup", timeout=10, headers=_CP_HEADERS)
-            httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/settle", timeout=30, headers=_CP_HEADERS)
+            httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/hangup", timeout=10, headers=CP_HEADERS)
+            httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/settle", timeout=30, headers=CP_HEADERS)
         except Exception:
             pass
 

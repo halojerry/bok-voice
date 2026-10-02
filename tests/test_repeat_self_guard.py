@@ -56,6 +56,9 @@ def _run_llm(chunks: list[str], last_reply: str, *, repeat_requested: bool = Fal
         ctx = ContextState(account_id="t")
         ctx.set_last_reply(last_reply)
         ctx.repeat_requested = repeat_requested
+        # 编造号码守卫（2026-10-01）的合法源：本文件固定语料含「尾号七八九零」
+        # 确认句——账本置捕获号=客户真报过，号码守卫恒等放行（本文件只测复读面）。
+        ctx.set_whatsapp_note("7890")
         wrapped = ContextAwareLLM(inner=_StreamInner(chunks), context_state=ctx)
         cc = llm.ChatContext()
         cc.add_message(role="user", content="你好")

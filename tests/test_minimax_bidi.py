@@ -1,8 +1,11 @@
 """MiniMax bidi 持久连接(t2a_v2_bidi)单测(fake WS,无网络,镜像 test_minimax_ws_pool.py)。
 
-MINIMAX_WS_MODE=bidi 选入(默认 classic 零变化):一条连接服务整个 call,
-task_continue 逐字透传(服务端切句)、task_flush 收尾(连接保留)、打断 task_cancel
-(连接保留)、60s 客户端 ping、2205 软背压重发、2201 断连自动重连。
+MINIMAX_WS_MODE 缺省即 bidi(livekit_plugins `_ws_mode` default "bidi"——生产回复
+流=本持久连接路径,服务端攒句切句);MINIMAX_WS_MODE=classic 回退才走按句
+task_continue 档(W8 起首送走快车道,见 test_tts_first_clause.py)。bidi 形态:
+一条连接服务整个 call,task_continue 逐字透传(服务端切句)、task_flush 收尾
+(连接保留)、打断 task_cancel(连接保留)、60s 客户端 ping、2205 软背压重发、
+2201 断连自动重连。
 """
 
 from __future__ import annotations

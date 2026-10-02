@@ -27,6 +27,9 @@ os.environ.setdefault("DATABASE_URL", "")  # force in-memory repo for tests
 os.environ.setdefault("LIVEKIT_API_KEY", "devkey")
 os.environ.setdefault("LIVEKIT_API_SECRET", "devsecret")
 os.environ.setdefault("LIVEKIT_URL", "ws://127.0.0.1:7880")
+# 本文件钉 dial 块/派单链路（多数对象无模板）；模板强绑闸契约见
+# test_template_gate.py，这里隔离关掉以免与拨号语义测试纠缠。
+os.environ.setdefault("BOK_REQUIRE_TEMPLATE", "0")
 
 import json
 import sys
@@ -398,6 +401,10 @@ def test_dial_now_template_snapshot(monkeypatch):
 
     plain = _post_dial_now(client, obj["id"])
     assert repo.get_call(plain.json()["call_id"])["template_id"] == "tpl-object"
+
+    # 同对象双活建单已被并发/重复闸 409 拦(2026-09-28 生命周期护栏):第一通先收线
+    # 再验证「显式 template_id 覆盖对象绑定模板」的快照优先级。
+    repo.update_call(plain.json()["call_id"], status="ended")
 
     over = _post_dial_now(client, obj["id"], template_id="tpl-explicit")
     assert repo.get_call(over.json()["call_id"])["template_id"] == "tpl-explicit"

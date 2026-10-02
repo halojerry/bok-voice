@@ -70,6 +70,9 @@ def test_cut_logged(monkeypatch, capsys):
 
 def test_no_cut_below_threshold(monkeypatch, capsys):
     monkeypatch.delenv("BOK_FILLER_CUT_AFTER_S", raising=False)
+    # 十七波政策翻转（播完→让路）迁移先例：本契约只活在旧档，
+    # BOK_FILLER_YIELD=0 显式恢复 cut 时间轴（同 tests/test_fillers.py 旧档臂）。
+    monkeypatch.setenv("BOK_FILLER_YIELD", "0")
     d = _CutStub()
     _fired(d, playing_for_s=0.4, dur=1.2)  # 已播 0.4s < 1.0 → 不掐,early 打点
     d.on_reply_first_audio()
@@ -79,6 +82,9 @@ def test_no_cut_below_threshold(monkeypatch, capsys):
 
 def test_cut_disabled_by_env(monkeypatch, capsys):
     monkeypatch.setenv("BOK_FILLER_CUT_AFTER_S", "0")
+    # 十七波政策翻转（播完→让路）迁移先例：无 YIELD=0 时 yield 档仍会在首音频
+    # 停播（让路语义），本档要测的是 CUT 闸关，故显式回旧档（同 test_fillers.py）。
+    monkeypatch.setenv("BOK_FILLER_YIELD", "0")
     assert filler_cut_after_s() == 0.0
     d = _CutStub()
     _fired(d, playing_for_s=1.5)

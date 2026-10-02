@@ -1,0 +1,8 @@
+# W1b embedding sidecar deps.
+# mlx-embeddings (Blaizzy) is the only candidate package that natively loads
+# MLX-quantized BERT-family weights (mlx-community/bge-m3-mlx-4bit) without
+# torch; it pulls mlx + transformers (tokenizer only) via mlx-vlm.
+mlx-embeddings==0.1.0
+fastapi>=0.110,<1
+uvicorn[standard]>=0.29,<1
+numpy>=1.26,<3

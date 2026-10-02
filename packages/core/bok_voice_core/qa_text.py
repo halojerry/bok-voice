@@ -51,6 +51,53 @@ def normalize_question(text: str) -> str:
     return re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", t)
 
 
+# ---- 账本噪声分类(2026-09-27:mine 答案必须是内容回复) ----
+# turns 账本按 gen/provider 标注每轮来源:filler(垫话 out-of-band 音轨账本)/
+# interrupted(打断残文本补记)不是回复轮;各类 *-ack / late-answer / stall-*
+# provider 是兜底/降级账本行。真实通话实证:用户轮→下一条 assistant 轮的相邻
+# 配对里 32.1%(155/527)是垫话当答案,且 question 一旦被标 seen 就把随后真正的
+# 内容回复丢弃(221 条真答案丢失)。分类值域与 control_plane.gap_mining /
+# agent.py 写入点同源——改 agent 写入点须两处同步。
+NON_REPLY_GENS: frozenset[str] = frozenset({"filler", "interrupted"})
+NON_REPLY_PROVIDERS: frozenset[str] = frozenset(
+    {
+        "watchdog-ack",
+        "starve-ack",
+        "storm-ack",
+        "defer-ack",
+        "late-answer",
+        "stall-degrade",
+        "stall-bypass",
+        "stall-close",
+        "pause-ack",
+        "fallback-ack",
+    }
+)
+
+
+def _field(turn, name: str):
+    """dict(挖掘/报告面)与对象(TurnEvent 账本面)同判据的取字段。"""
+    if isinstance(turn, dict):
+        return turn.get(name)
+    return getattr(turn, name, None)
+
+
+def is_content_reply(turn) -> bool:
+    """账本轮是否「内容回复」(非垫话/打断/兜底降级噪声)。
+
+    **字段缺省保守判 True**:当前 ``repository.iter_call_conversations`` 与
+    ``qa_digest._mine_recent_conversations`` 产出的轮 dict 只带
+    ``role/text/lang``(**不含 gen/provider**),故那份路径上本过滤为空转、旧
+    行为不变;上游补投影 turns 表本就有的 gen/provider 两列后自动生效。
+    B 线(``line=="b"``)同传轮与本分类无关,直接放行。
+    """
+    if str(_field(turn, "line") or "") == "b":
+        return True
+    if str(_field(turn, "gen") or "") in NON_REPLY_GENS:
+        return False
+    return str(_field(turn, "provider") or "") not in NON_REPLY_PROVIDERS
+
+
 def mine_qa_pairs(
     conversations: list[list[dict]],
     *,
@@ -62,6 +109,12 @@ def mine_qa_pairs(
     计数按「出现的通话数」而非轮数(同通复读只算一通);答案取众数。
     conversations 形如 repository.iter_call_conversations 的返回:
     [[{"role","text","lang"}, ...], ...]
+
+    2026-09-27 噪声修复:配对时**跳过非内容回复**(``is_content_reply`` False 的
+    垫话/打断/兜底降级行),取该用户轮之后**第一条内容回复**为答案;question 只在
+    找到内容答案后才标 ``seen``——旧相邻配对会把垫话配成答案,并把之后真正的
+    答案当作复读丢弃(真实通话 221 条真答案因此丢失)。轮 dict 带 gen/provider
+    时该过滤才生效(见 ``is_content_reply`` 的字段缺省说明)。
 
     E7 离线润色单点(2026-09-21):入口把每轮 ``text`` 过一遍
     ``polish_offline_text``(kill-switch 默认关/异常时逐字原样)——问句键与
@@ -78,16 +131,31 @@ def mine_qa_pairs(
     stats: dict[tuple[str, str], dict] = {}
     for turns in polished:
         seen_in_call: set[str] = set()
-        for i in range(len(turns) - 1):
-            a, b = turns[i], turns[i + 1]
-            if str(a.get("role") or "") != "user" or str(b.get("role") or "") != "assistant":
+        for i, a in enumerate(turns):
+            if str(a.get("role") or "") != "user":
                 continue
             q = normalize_question(str(a.get("text") or ""))
-            ans = str(b.get("text") or "").strip()
-            lang = str(a.get("lang") or b.get("lang") or "zh") or "zh"
-            if not q or not ans or q in seen_in_call:
+            if not q or q in seen_in_call:
                 continue
-            seen_in_call.add(q)
+            # 下一条内容回复 = 答案:跳过垫话/打断/兜底降级行;遇到下一个用户轮
+            # 即止(那之后的回复属于新问题,不可错配)。
+            b = None
+            for j in range(i + 1, len(turns)):
+                cand = turns[j]
+                role_c = str(cand.get("role") or "")
+                if role_c == "user":
+                    break
+                if role_c != "assistant" or not is_content_reply(cand):
+                    continue
+                b = cand
+                break
+            if b is None:
+                continue
+            ans = str(b.get("text") or "").strip()
+            if not ans:
+                continue
+            lang = str(a.get("lang") or b.get("lang") or "zh") or "zh"
+            seen_in_call.add(q)  # 只在找到内容答案后才标 seen(真答案不被丢弃)
             st = stats.setdefault(
                 (lang, q),
                 {"lang": lang, "question": q, "calls": 0, "answers": Counter()},

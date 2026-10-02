@@ -47,17 +47,27 @@ class PrefillSpeculator:
         self._ctx = context_state
         self._last_request: list[dict] | None = None
         self._reply_text: str | None = None
+        # F6 稳定性门（2026-09-28）：快照时刻的 context revision。真请求落地时尾部
+        # 会按当前 revision 渲染；若快照之后 revision 已前进（换步/事实沉淀），投机
+        # 组的 user 段必与真请求分叉=纯白烧 GPU，直接跳过开火。
+        self._snapshot_revision: int | None = None
         self._busy = False  # thinking/speaking 期间不开火（LLM 忙，抢不过还添堵）
         self._turn_fires = 0
         self._last_fire_ts = 0.0
+        self._last_final_ts = 0.0  # 最近一次 FINAL 提交时刻（new_turn 记）
         self._last_prefix = ""
         self._task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------ 输入
     def on_request_messages(self, messages: list[dict]) -> None:
-        """快照钩子（MlxLlmLLM.on_request_messages）：逐字节真实请求 messages。"""
+        """快照钩子（MlxLlmLLM.on_request_messages）：逐字节真实请求 messages。
+
+        同时记下快照时刻的 context revision（F6），供 on_stable_prefix 判投机尾部
+        是否已与真请求分叉。ctx 无 revision（测试替身）→ None=不启用本门。
+        """
         if messages:
             self._last_request = messages
+            self._snapshot_revision = getattr(self._ctx, "revision", None)
 
     def on_reply_history_text(self, text: str) -> None:
         """上轮回复进会话历史的原文（含 expr 标记，与框架追加的逐字节一致）。"""
@@ -69,9 +79,20 @@ class PrefillSpeculator:
         self._busy = busy
 
     def new_turn(self) -> None:
-        """新用户轮提交（on_user_turn_completed 调）：预算与去重态重置。"""
+        """新用户轮提交（on_user_turn_completed 调）：预算与去重态重置 + FINAL 即断。
+
+        FINAL 即断（2026-09-25 车道卫生）：真回复请求马上要进 :1235 reply 车道——
+        在飞的投机预热继续跑只会与真回复抢槽（mlx 无抢占，客户端断连也不中止
+        解码；llm.log 实证两个 prefill 窗同秒交错即此类残余）。取消任务=关掉
+        httpx 连接，把残余解码尾巴压到最小。静默窗（BOK_PREFILL_SPEC_FINAL_
+        QUIET_MS，默认 1000，0=关）拦住 FINAL 后即刻再开火的竞态窗。
+        """
         self._turn_fires = 0
         self._last_prefix = ""
+        self._last_final_ts = time.monotonic()
+        task = self._task
+        if task is not None and not task.done():
+            task.cancel()
 
     def on_stable_prefix(self, text: str) -> None:
         """STT 稳定前缀回调：门控全过则异步开火预热。"""
@@ -82,9 +103,29 @@ class PrefillSpeculator:
             if _dbg:
                 print(f"BOK_PREFILL_SPEC skip busy={self._busy} inflight={self._task is not None}", flush=True)
             return
+        quiet_ms = _env_int("BOK_PREFILL_SPEC_FINAL_QUIET_MS", 1000)
+        if quiet_ms > 0 and (time.monotonic() - self._last_final_ts) * 1000 < quiet_ms:
+            if _dbg:
+                print(f"BOK_PREFILL_SPEC skip final_quiet={quiet_ms}ms", flush=True)
+            return
         if not self._last_request or text == self._last_prefix:
             if _dbg:
                 print(f"BOK_PREFILL_SPEC skip snapshot={self._last_request is not None} same={text == self._last_prefix}", flush=True)
+            return
+        # F6 稳定性门：快照后尾部 revision 已前进（换步/事实沉淀）→ 投机 user 段必与
+        # 真请求分叉，白烧 GPU，跳过（ctx 无 revision=测试替身，不启用）。
+        _rev = getattr(self._ctx, "revision", None)
+        if (
+            self._snapshot_revision is not None
+            and _rev is not None
+            and _rev != self._snapshot_revision
+        ):
+            if _dbg:
+                print(
+                    f"BOK_PREFILL_SPEC skip revision_advanced "
+                    f"snapshot={self._snapshot_revision} now={_rev}",
+                    flush=True,
+                )
             return
         # 前缀必须比上次开火更长（≥2 字），同段文本不重复预热。
         if len(text) - len(self._last_prefix) < 2:
@@ -122,7 +163,13 @@ class PrefillSpeculator:
             )
             await self._prewarm(msgs)
             print("BOK_PREFILL_SPEC done", flush=True)
+        except asyncio.CancelledError:
+            # FINAL 即断（new_turn cancel）：预热被真回复让路，重抛保持取消语义。
+            print("BOK_PREFILL_SPEC aborted (final committed)", flush=True)
+            raise
         except Exception as exc:  # noqa: BLE001 - 预热失败零影响
             print(f"BOK_PREFILL_SPEC failed: {exc!r}", flush=True)
         finally:
-            self._task = None
+            _cur = asyncio.current_task()
+            if _cur is None or self._task is _cur:
+                self._task = None

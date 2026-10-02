@@ -211,8 +211,14 @@ def test_cp_url_exported_to_env(monkeypatch):
     import node_agent
 
     monkeypatch.delenv("CONTROL_PLANE_URL", raising=False)
-    assert node_agent.apply_cp_url_to_env("https://cp.example.com") == "https://cp.example.com"
-    assert os.environ["CONTROL_PLANE_URL"] == "https://cp.example.com"
+    try:
+        assert node_agent.apply_cp_url_to_env("https://cp.example.com") == "https://cp.example.com"
+        assert os.environ["CONTROL_PLANE_URL"] == "https://cp.example.com"
+    finally:
+        # 被测函数直写进程 env——monkeypatch 只恢复自己动过的键,这里必须
+        # 手工摘除,否则泄漏给后续测试(test_mined_hotwords 的缺省断言被
+        # 污染,本地/CI 全量红的真身)。
+        os.environ.pop("CONTROL_PLANE_URL", None)
 
 
 def test_cp_url_explicit_env_wins(monkeypatch):

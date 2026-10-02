@@ -1,6 +1,6 @@
 declare global {
   interface Window {
-    __BOK_CONFIG__?: { cpUrl?: string; livekitUrl?: string };
+    __BOK_CONFIG__?: { cpUrl?: string; livekitUrl?: string; registryUrl?: string };
   }
 }
 
@@ -14,12 +14,37 @@ export function apiBase(): string {
   return process.env.NEXT_PUBLIC_CONTROL_PLANE_URL ?? "http://127.0.0.1:8000";
 }
 
+// 节点注册表基址（F2，2026-09-24 双 CP 拓扑）：/api/nodes* 走注册 CP（管理面 A），
+// 业务 API 走 apiBase()（工作 CP）。单 CP 形态 registryUrl 未注入 → 回 apiBase()
+// 零变化；appliance 双 CP 档 node_agent 的 runtime-config 注入 registryUrl=A。
+export function registryBase(): string {
+  if (typeof window !== "undefined" && window.__BOK_CONFIG__?.registryUrl) {
+    return window.__BOK_CONFIG__.registryUrl;
+  }
+  return apiBase();
+}
+
 async function toError(res: Response): Promise<Error> {
   // 优先透传 FastAPI 的 detail（如 MiniMax API Key 未配置），失败时退回 statusText。
+  // detail 三形态：string / 数组（CP graph 校验 400 {"error":…,"detail":[…]}）/
+  // 嵌套对象（steps 分支校验 400 {"detail":{"error":"invalid_branch_text","detail":[…]}}）
+  // ——2026-09-26 实弹：嵌套形只露「400 Bad Request」，运营看不到哪行错。
   let detail = "";
   try {
     const body = await res.json();
-    if (body && typeof body.detail === "string") detail = body.detail;
+    if (body && typeof body.detail === "string" && body.detail) detail = body.detail;
+    else if (Array.isArray(body?.detail) && body.detail.length) {
+      const parts = body.detail.map((x) => (typeof x === "string" ? x : JSON.stringify(x)));
+      const tag = typeof body.error === "string" && body.error ? `${body.error}: ` : "";
+      detail = tag + parts.join("；");
+    } else if (body?.detail && typeof body.detail === "object") {
+      const inner = body.detail as { error?: unknown; detail?: unknown };
+      const parts = Array.isArray(inner.detail)
+        ? inner.detail.map((x) => (typeof x === "string" ? x : JSON.stringify(x)))
+        : [];
+      const tag = typeof inner.error === "string" && inner.error ? `${inner.error}: ` : "";
+      if (tag || parts.length) detail = (tag + parts.join("；")).slice(0, 500);
+    }
   } catch {
     /* 非 JSON 响应(如网关错误页)直接忽略 */
   }
@@ -49,7 +74,7 @@ function handleUnauthorized(path: string) {
   window.location.href = "/login/";
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+async function request<T>(path: string, init?: RequestInit, base?: string): Promise<T> {
   // correlation 透传:前端生成 request_id,audit 行可与前端动作对账;
   // call_id 由调用方在 headers 显式带(init.headers 里已有则不覆盖)。
   const extra = new Headers(init?.headers);
@@ -61,7 +86,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   extra.forEach((v, k) => {
     headers[k] = v;
   });
-  const res = await fetch(`${apiBase()}${path}`, { ...init, headers });
+  const res = await fetch(`${base ?? apiBase()}${path}`, { ...init, headers });
   if (!res.ok) {
     if (res.status === 401) handleUnauthorized(path);
     throw await toError(res);
@@ -155,7 +180,14 @@ export const api = {
   // 账号经 query 传（与 canned-status 同款 scoped_account 口径）。
   qaCluster: (
     accountId: string,
-    body: { min_calls?: number; limit?: number; apply?: boolean; select?: { kind: string; i: number }[] } = {},
+    body: {
+      min_calls?: number;
+      limit?: number;
+      apply?: boolean;
+      select?: { kind: string; i: number }[];
+      // 热词沉淀（EX-H1）：dry 计划 hotwords.candidates 的下标；采纳为本账号热词行。
+      hotword_select?: number[];
+    } = {},
   ) =>
     request<Record<string, unknown>>(`/api/qa/cluster?account_id=${encodeURIComponent(accountId)}`, {
       method: "POST",
@@ -163,6 +195,41 @@ export const api = {
     }),
   getSettings: () => request<Record<string, unknown>>("/api/settings"),
   saveSettings: (body: unknown) => request<Record<string, unknown>>("/api/settings", { method: "PUT", body: JSON.stringify(body) }),
+  // 模型路由（2026-09-25 §2.4，root 专属）：五车道 LLM 路由 + 档位预置。
+  // PUT 契约：api_key 空=保留旧值；openai 档 base_url+model 必填，400 返回
+  // {"errors":[…]}——shared request() 只认 detail 字符串，此处自解 errors 拼可读消息。
+  getModelRouting: () =>
+    request<ModelRoutingReport>("/api/model-routing"),
+  saveModelRouting: (lanes: Record<string, unknown>) =>
+    fetch(`${apiBase()}/api/model-routing`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ lanes }),
+    }).then(async (res) => {
+      if (!res.ok) {
+        let msg = `${res.status} ${res.statusText}`;
+        try {
+          const body = await res.json();
+          if (Array.isArray(body?.errors) && body.errors.length) msg = body.errors.join("；");
+          else if (typeof body?.detail === "string" && body.detail) msg = body.detail;
+        } catch {
+          /* 非 JSON 响应（网关错误页等）忽略，回退状态行 */
+        }
+        throw new Error(msg);
+      }
+      return res.json() as Promise<Record<string, unknown>>;
+    }),
+  testModelRouting: (lane: string) =>
+    request<ModelRoutingTestResult>("/api/model-routing/test", { method: "POST", body: JSON.stringify({ lane }) }),
+  createModelRoutingPreset: (name: string) =>
+    request<{ ok: boolean }>("/api/model-routing/presets", { method: "POST", body: JSON.stringify({ name }) }),
+  applyModelRoutingPreset: (name: string) =>
+    request<{ ok: boolean; lanes: Record<string, ModelRoutingLaneConfig> }>(
+      `/api/model-routing/presets/${encodeURIComponent(name)}/apply`,
+      { method: "POST" },
+    ),
+  deleteModelRoutingPreset: (name: string) =>
+    request<{ ok: boolean }>(`/api/model-routing/presets/${encodeURIComponent(name)}`, { method: "DELETE" }),
   // 电话边缘站点（P1.5）：站点下拉 + 一次性把 SIP 供应商凭据注册成 outbound trunk。
   // 注册成功返回 trunk_id——调用方回填设置表单的 sip.trunk_id（保存后 campaign 按站点取）。
   listSites: (accountId = "acc-001") =>
@@ -231,6 +298,26 @@ export const api = {
   deletePersona: (id: string) => request<Record<string, unknown>>(`/api/personas/${id}`, { method: "DELETE" }),
   getTurns: (id: string) => request<Record<string, unknown>[]>(`/api/calls/${id}/turns`),
   getSettlement: (id: string) => request<Record<string, unknown>>(`/api/calls/${id}/settlement`),
+  // ---- 容灾可观测波（feat/dr-observability，契约 §2/§4/§5） ----
+  // Provider 滚动窗读数（CallStudio 右栏卡 3s 轮询；call_id 缺省=全局窗）。
+  providerMetrics: (callId?: string) =>
+    request<ProviderMetricsReport>(
+      callId ? `/api/metrics/providers?call_id=${encodeURIComponent(callId)}` : "/api/metrics/providers",
+    ),
+  // root 容灾面板（require_role root）：饥荒状态 + providers + swap/servers/事件流。
+  disasterStatus: () => request<DisasterStatusReport>("/api/ops/disaster-status"),
+  // 手动覆盖四钮（force_downgrade/force_healthy/pause_dialing/resume_dialing）。
+  disasterOverride: (action: DisasterOverrideAction) =>
+    request<Record<string, unknown>>("/api/ops/disaster-override", {
+      method: "POST",
+      body: JSON.stringify({ action }),
+    }),
+  // 实时日志游标续读（契约 §5）：after 缺省=字节 0；lines 为该区间原始行，
+  // next_offset 回填游标；eof=true 表示已到文件末尾（继续轮询即可等新行）。
+  callLogs: (id: string, after = 0, limit = 200) =>
+    request<CallLogsPage>(
+      `/api/calls/${encodeURIComponent(id)}/logs?after=${Math.max(0, Math.floor(after))}&limit=${Math.max(1, Math.floor(limit))}`,
+    ),
   activeCalls: () => request<Record<string, unknown>[]>("/api/supervisor/active-calls"),
   supervisorPause: (id: string) => request<Record<string, unknown>>(`/api/supervisor/${id}/pause-agent`, { method: "POST" }),
   supervisorResume: (id: string) => request<Record<string, unknown>>(`/api/supervisor/${id}/resume-agent`, { method: "POST" }),
@@ -358,18 +445,21 @@ export const api = {
     ),
   // 节点注册表（P1 平台面，root 专属）：清单 + 吊销/解除吊销（kill-switch UI）。
   // unrevoke 后端 409=节点本就未吊销（live），404=节点不存在，均由页面内联展示。
-  listNodes: () => request<NodeRow[]>("/api/nodes"),
+  // 全族走 registryBase()（F2）：双 CP 档注册表在管理面 A，业务 CP 上是空表。
+  listNodes: () => request<NodeRow[]>("/api/nodes", undefined, registryBase()),
   revokeNode: (nodeId: string) =>
     request<{ node_id: string; revoked: boolean }>(
       `/api/nodes/${encodeURIComponent(nodeId)}/revoke`,
       { method: "POST" },
+      registryBase(),
     ),
   unrevokeNode: (nodeId: string) =>
     request<{ node_id: string; revoked: boolean }>(
       `/api/nodes/${encodeURIComponent(nodeId)}/unrevoke`,
       { method: "POST" },
+      registryBase(),
     ),
-  // 远程日志通道（W2）：下发取日志指令 → 节点下个心跳周期上传 → root 查看下载。
+  // 远程日志通道（W2）：下发取日志指令 → 节点下个心跳周期上传 → root 查看。
   enqueueNodeCommand: (
     nodeId: string,
     body: { action: string; version?: string; force?: boolean },
@@ -377,14 +467,17 @@ export const api = {
     request<{ id: string; status: string }>(
       `/api/nodes/${encodeURIComponent(nodeId)}/commands`,
       { method: "POST", body: JSON.stringify(body) },
+      registryBase(),
     ),
   listNodeLogs: (nodeId: string) =>
     request<NodeLogFile[]>(
       `/api/nodes/${encodeURIComponent(nodeId)}/logs`,
+      undefined,
+      registryBase(),
     ),
   downloadNodeLog: (nodeId: string, file: string) =>
     fetch(
-      `${apiBase()}/api/nodes/${encodeURIComponent(nodeId)}/logs/${encodeURIComponent(file)}`,
+      `${registryBase()}/api/nodes/${encodeURIComponent(nodeId)}/logs/${encodeURIComponent(file)}`,
       { headers: authHeaders() },
     ).then(async (res) => {
       if (!res.ok) throw await toError(res);
@@ -411,6 +504,31 @@ export type SetupStatus = {
   error?: string;
 };
 
+// ---- 模型路由（root 专属，GET /api/model-routing 契约形状） ----
+// 五车道：a_reply / judge / mt / settle / mining（lib 层不钉枚举，键以 CP 为准）。
+export type ModelRoutingLaneConfig = {
+  provider: "local" | "openai";
+  base_url: string;
+  model: string;
+  /** 读回恒空串（掩码）；是否已配置看 has_api_key */
+  api_key: string;
+  has_api_key: boolean;
+  extra?: { enable_thinking?: boolean };
+};
+
+export type ModelRoutingReport = {
+  lanes: Record<string, ModelRoutingLaneConfig>;
+  /** 命名档位=五车道整表快照（只存路由值不含密钥） */
+  presets: Record<string, Record<string, ModelRoutingLaneConfig>>;
+};
+
+export type ModelRoutingTestResult = {
+  ok: boolean;
+  latency_ms: number;
+  model: string;
+  error: string | null;
+};
+
 // ---- 快路覆盖率 + 漏网轮候选（L-① 学习驾驶舱，GET /api/stats/llm-gaps 契约形状） ----
 export type LlmGapRow = {
   customer_text: string;
@@ -421,6 +539,15 @@ export type LlmGapRow = {
   lang: string;
   sample_answer: string;
   sample_call_id: string;
+  /** G7 would-hit：该问法已有同语言词条覆盖（采纳幂等判据同源） */
+  would_hit: boolean;
+  existing_qa_id: string;
+};
+
+// G7 would-hit 汇总（喂库收益信号：漏网问法里已有词条可覆盖的占比）
+export type LlmGapSummary = {
+  would_hit_covered: number;
+  gaps_total: number;
 };
 
 export type LlmGapsReport = {
@@ -433,6 +560,7 @@ export type LlmGapsReport = {
     by_provider: Record<string, number>;
   };
   gaps: LlmGapRow[];
+  summary?: LlmGapSummary;
   generated_at: number;
 };
 
@@ -466,6 +594,7 @@ export type TemplateProposalsReport = {
     blocked_reason: string;
     blocked_label: string;
   }[];
+  summary?: LlmGapSummary;
   generated_at: number;
 };
 
@@ -548,6 +677,61 @@ export type QaDriftAdoptResult = {
 export type QaDriftAdoptResponse = {
   results: QaDriftAdoptResult[];
   adopted: number;
+};
+
+// ---- 容灾可观测波契约类型（dr-observability §2/§4/§5；形状与后端响应逐键对齐） ----
+/** 单 provider 滚动窗读数（§2）：last/p50/p95 毫秒 + 窗口内样本数。 */
+export type ProviderStat = {
+  last_ms?: number | null;
+  p50?: number | null;
+  p95?: number | null;
+  n?: number | null;
+};
+
+/**
+ * 饥荒单真源状态（§3）：level=healthy|famine；downgraded=已降档（a_reply 车道
+ * overlay 成 4B，新通话下一通生效）；dialing_paused=外呼闸；manual_override=
+ * root 手动覆盖标记（null=自动）。
+ */
+export type FamineState = {
+  level?: string;
+  ema_s?: number | null;
+  since?: string | null;
+  downgraded?: boolean;
+  dialing_paused?: boolean;
+  manual_override?: string | null;
+};
+
+/** GET /api/metrics/providers（§2）响应。 */
+export type ProviderMetricsReport = {
+  window_s: number;
+  providers: Record<string, ProviderStat>;
+  famine: FamineState;
+};
+
+/** GET /api/ops/disaster-status（§4）响应。 */
+export type DisasterStatusReport = {
+  famine: FamineState;
+  providers: Record<string, ProviderStat>;
+  memory: { swap_used_gb?: number | null; threshold_gb?: number | null };
+  servers: { name: string; port: number; up: boolean }[];
+  active_calls: number;
+  /** 最近事件（后端给最近 20 条，页面临近 8 条渲染）。 */
+  recent_events: { ts: string; event: string; detail?: Record<string, unknown> }[];
+};
+
+/** POST /api/ops/disaster-override（§4）四动作。 */
+export type DisasterOverrideAction =
+  | "force_downgrade"
+  | "force_healthy"
+  | "pause_dialing"
+  | "resume_dialing";
+
+/** GET /api/calls/{id}/logs（§5）响应：byte 游标续读 + EOF 标记。 */
+export type CallLogsPage = {
+  lines: string[];
+  next_offset: number;
+  eof: boolean;
 };
 
 // ---- B4 会话与权限类型（契约预埋） ----

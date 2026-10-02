@@ -46,6 +46,22 @@ def test_call_language_resolution_precedence():
     assert _call_language({"language": "vi"}, {"language": "vi"}) == "zh"
 
 
+def test_call_language_template_snapshot_wins():
+    """回归 call-ec075023:话术快照语言优先,治「粤语模板+zh人设」劈叉通话。
+
+    旧序人设优先钉 zh → 开场白退通用语、say 直念步照念粤语正稿。话术(say=1
+    直念步)才是整通语言契约:快照在场模板赢;人设语言决定音色语气不再决定语言。"""
+    # 话术粤语 + 人设 zh + 对象 zh → 整通粤语
+    assert _call_language({"language": "zh"}, {"language": "zh"}, template_lang="cantonese") == "cantonese"
+    # 话术英文 + 人设粤语 → 整通英文
+    assert _call_language({"language": "粤"}, None, template_lang="en") == "en"
+    # 无快照:旧序零变化(人设→对象→zh)
+    assert _call_language({"language": "English"}, {"language": "cantonese"}, template_lang="") == "en"
+    # 快照语言非法/空 → 照旧回落人设→对象→zh
+    assert _call_language({"language": "vi"}, {"language": "cantonese"}, template_lang="vi") == "cantonese"
+    assert _call_language(None, {"language": "粤"}, template_lang="") == "cantonese"
+
+
 # ---- 2. ASR 恒钉定：显式设置优先，否则钉到通话语言 ----
 
 

@@ -91,7 +91,9 @@ def test_request_conn_options_defaults(monkeypatch):
     monkeypatch.delenv("LLM_REQUEST_TIMEOUT_S", raising=False)
     monkeypatch.delenv("LLM_REQUEST_RETRIES", raising=False)
     opts = MlxLlmLLM._request_conn_options()
-    assert opts.timeout == 8.0
+    # 8→22(2026-09-28 定时器普查):read-gap 粗后盾必须盖过冷/缓存失配 prefill
+    # p95=18.9s——8s 把「慢」误杀成「死」,drain/regen 143 次失败的主死因。
+    assert opts.timeout == 22.0
     assert opts.max_retry == 0  # 插件级重试归零:恢复交给兜底壳(有声、更快)
 
 
@@ -591,8 +593,12 @@ def test_partial_capture_normal_completion_clears():
     assert capture["text"] == ""  # 正常走完清空(item_added 照常上报,零双记)
 
 
-def test_partial_capture_keeps_text_on_failure():
+def test_partial_capture_keeps_text_on_failure(monkeypatch):
     # 回复生成到一半链路死(=打断族)→ tee 保留部分文本,agent watcher 拿去补记。
+    # 号码守卫(2026-10-01,默认开)在句级缓冲:tee 只拿已放行段,句界前被杀的
+    # 未放段由 guard 的 pending_buffer 在 agent 补账点拼入(见 _on_speech_created)
+    # ——本测试只钉 tee 路径,故关号码守卫。
+    monkeypatch.setenv("BOK_NUMBER_GUARD", "0")
     out, capture, err = _run_captured(["您讲嘅单号", "我记"], boom=True)
     assert err is not None
     assert capture["text"] == "您讲嘅单号我记"

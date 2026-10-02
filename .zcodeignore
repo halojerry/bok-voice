@@ -1,0 +1,84 @@
+.venv*/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules
+.next/
+apps/web/out/
+release-artifacts/
+dist/
+build/
+*.egg-info/
+.env
+.env.*
+!.env.example
+.DS_Store
+data/vault/
+data/uploads/
+data/models/
+# 节点守护本地日志（node-agent W1 落盘；dev 误跑不进库）。
+logs/
+data/smoke-out/
+data/sidecar-*.log
+data/sidecar-*.pid
+data/*.log
+data/translation-metrics.jsonl
+services/*/data/
+*.sqlite
+*.db
+*.tsbuildinfo
+.zcode/
+apps/web/AGENTS.md
+apps/web/CLAUDE.md
+runtime
+tests/fixtures/audio/e2e_multi/
+
+# SDD plan workspace (superpowers subagent-driven development scratch)
+.superpowers/
+
+# 未跟踪本地资产（2026-09-16 深测 P3）：商业路演稿/扫描器会话/视频产物，
+# 公开仓一次 git add -A 即泄——显式忽略。
+decks/
+.mimosa/
+.v2c/
+
+# 本地运行时产物（2026-09-17 会话整理）：CP 运行数据/报表/探针输出/话术包/
+# 可视化检查产物——本机工作面，公开仓不进库。
+apps/control-plane/data/
+reports/
+scripts/.probe_*.json
+docs/*.tar.gz
+docs/runtime-architecture*.html
+docs/runtime-architecture*.png
+docs/runtime-architecture*.json
+
+# ===== ↑ 以上同步自 .gitignore（「从 .gitignore 同步」只重写以上部分）=====
+.git/
+.hg/
+.svn/
+bower_components/
+jspm_packages/
+site-packages/
+venv/
+coverage/
+htmlcov/
+lcov-report/
+cmakefiles/
+cmake-build-*/
+bazel-*/
+pods/
+deriveddata/
+storybook-static/
+playwright-report/
+test-results/
+allure-results/
+allure-report/
+cdk.out/
+*.dist-info/
+eggs/
+pip-wheel-metadata/
+wheels/
+# ----- ↑ 以上为 ZCode 默认排除规则（自定义规则请写在本行下方，不会被同步/恢复改动）-----
+# 自定义规则写在下方（本行提示可删除）

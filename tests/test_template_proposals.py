@@ -462,8 +462,10 @@ def _seed_repo(*, template_rows=True):
 def test_report_reuses_gap_aggregation_and_attaches_proposals():
     repo = _seed_repo()
     out = gp.build_template_proposal_report(repo, account_id="acc-001", min_calls=4)
-    assert set(out) == {"coverage", "gaps", "proposals", "generated_at"}
+    assert set(out) == {"coverage", "gaps", "summary", "proposals", "generated_at"}
     assert out["coverage"]["llm"] == 4
+    # G7 would-hit 汇总随 base 透传（此 repo 无词条 → 全 0）
+    assert out["summary"] == {"would_hit_covered": 0, "gaps_total": 1}
     assert len(out["gaps"]) == 1 and out["gaps"][0]["template_id"] == "tpl-1"
     kinds = {p["kind"] for p in out["proposals"]}
     assert kinds == {gp.KIND_BRANCH, gp.KIND_INTENT_KEYWORD}
@@ -517,8 +519,9 @@ def test_proposals_endpoint_shape(client_with_repo):
     r = client_with_repo.client.get("/api/stats/template-proposals?account_id=acc-001&min_calls=4")
     assert r.status_code == 200, r.text
     body = r.json()
-    assert set(body) == {"coverage", "gaps", "proposals", "generated_at"}
+    assert set(body) == {"coverage", "gaps", "summary", "proposals", "generated_at"}
     assert body["coverage"]["llm"] == 4
+    assert body["summary"]["gaps_total"] == 1
     assert {p["kind"] for p in body["proposals"]} == {"branch", "intent_keyword"}
     branch = next(p for p in body["proposals"] if p["kind"] == "branch")
     for key in ("key", "kind", "template_id", "template_name", "customer_text", "norm", "count",

@@ -345,8 +345,15 @@ def _compare(a_lines: list[str], b_lines: list[str], f_lines: list[str]) -> bool
         _print_diff(a_lines, b_lines, "artifact-db@apply", "artifact-db@build_engine")
     if a_lines == f_lines:
         return drift
-    only_a = Counter(a_lines) - Counter(f_lines)
-    only_f = Counter(f_lines) - Counter(a_lines)
+    # 行尾逗号=pg_dump 的列序表现层（同列在两库中的表内位次不同→句尾逗号有无
+    # 不同），非 schema 语义——2026-09-27 实证：新列经 _ensure_column 追加在
+    # 表尾（无尾逗号）vs create_all 模型位次（带尾逗号），四条假阳性 hunk 全是
+    # 逗号位。多重集比对前先剥尾逗号（空格+','）。
+    def _key(ln: str) -> str:
+        return ln.rstrip().rstrip(",").rstrip()
+
+    only_a = Counter(_key(l) for l in a_lines) - Counter(_key(l) for l in f_lines)
+    only_f = Counter(_key(l) for l in f_lines) - Counter(_key(l) for l in a_lines)
     if not only_a and not only_f:
         _log("产物库 vs 代码基线:仅行序差异(pg_dump presentation order),多重集相等 → 视为等价")
         return drift

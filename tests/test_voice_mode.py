@@ -229,10 +229,12 @@ def test_repository_default_settings_carry_new_keys():
 # ---- P3：单会话记忆默认值 ----
 
 
-def test_history_turns_default_no_mid_call_truncation(monkeypatch):
-    # P1.3(2026-09-21,§48):缺省 8→40=通话内不截断——历史全命中 KV 前缀,截断
-    # 只产出前缀断裂全量重 prefill(§46.1 受控实验 2.5× 尖峰)。30 对 < 2×40
-    # 滞回线 → 零截断、原样全量递交。
+def test_history_turns_default_raised_to_8(monkeypatch):
+    # LLM_HISTORY_TURNS 缺省 4→8（P3）；5b（2026-09-30 soak A/B）8→6——TTFT
+    # p50 1297→1107/max 2940→1295、commit_to_audio 中位 ~2070→~1430：30 对
+    # (60 条) > 6×6 滞回线 → 一次剪回 6 对（滞回内纯追加命中缓存）。
+    # 合并注记：origin/main 的 P1.3「8→40 通话内不截断」与 5b 实测档直接冲突，
+    # 按「HEAD 值优先」保留 6（也是合并树 livekit_plugins 的既成值）。
     monkeypatch.delenv("LLM_HISTORY_TURNS", raising=False)
     from livekit.agents import llm as lk_llm
 
@@ -258,11 +260,13 @@ def test_history_turns_default_no_mid_call_truncation(monkeypatch):
     roles = [m.role for m in captured["items"]]
     assert roles[0] == "system"
     dialog = [r for r in roles[1:] if r in ("user", "assistant")]
-    assert dialog == ["user", "assistant"] * 30  # 典型通话长度：零截断
+    assert dialog == ["user", "assistant"] * 6
 
 
-def test_history_truncation_hysteresis_at_2x(monkeypatch):
-    # 超长通话(>80 条=2×40)仍按滞回剪回 40 对——机制不变,只是线从 8 挪到 40。
+def test_history_truncation_hysteresis_at_6x(monkeypatch):
+    # 超长通话(> 6×6 对=滞回触发线,F4 手术③ 起为 6×)一次剪回 max_turns 对——
+    # 机制沿用 origin/main 的回归测,但按合并树常量重算:缺省 max_turns=6(HEAD
+    # 5b 档)、触发线 6×(合并树既有实现),90 对 180 条 > 36 条 → 剪回 12 条。
     monkeypatch.delenv("LLM_HISTORY_TURNS", raising=False)
     from livekit.agents import llm as lk_llm
 
@@ -284,4 +288,4 @@ def test_history_truncation_hysteresis_at_2x(monkeypatch):
     ctx_llm.chat(chat_ctx=chat_ctx)
     roles = [m.role for m in captured["items"]]
     dialog = [r for r in roles[1:] if r in ("user", "assistant")]
-    assert dialog == ["user", "assistant"] * 40  # 90 对 > 2×40 → 一次剪回 40 对
+    assert dialog == ["user", "assistant"] * 6  # 90 对 > 6×6 → 一次剪回 6 对

@@ -51,6 +51,7 @@ from dataclasses import dataclass, field
 from .correction_intent import semantic_negation_counts
 
 __all__ = [
+    "GUARD_SOLICIT_LINES",
     "NEGATION_HARD_KEYS",
     "NEGATION_SOFT_KEYS",
     "REASON_EMPTY",
@@ -66,7 +67,9 @@ __all__ = [
     "GuardResult",
     "apply_guard",
     "contains_sensitive_content",
+    "guard_fabricated_number",
     "guard_output",
+    "number_guard_pending",
     "protected_tokens",
 ]
 
@@ -412,3 +415,249 @@ def apply_guard(
 ) -> str:
     """便捷出口：通过取候选、拒绝回退原文（等价 ``guard_output(...).final_text``）。"""
     return guard_output(original, candidate, policy=policy).final_text
+
+
+# ---------------------------------------------------------------------------
+# 编造号码输出守卫（2026-10-01，实弹 call-231aa92a）——与上面的 E3 后验 Guard
+# 是两件独立的事，共用本模块只为「出口纯函数守卫」一个家。
+#
+# 病灶：A 线粤语外呼，流程第 5 步向客户索取 WhatsApp 号码。客户未报任何号码时
+# 9B 凭空输出「收到，尾號係七七八八九九八，啱唔啱？」——用编造数字做确认
+# （合规级问题；模板/QA 库均无该串，已查证）。必须在 LLM 出口做确定性守卫。
+#
+# 判定三件同时成立才动手（缺一不动，规则 4 铁律）：
+#   ① 语境词门：句含 尾號/尾号/號碼/号码/WhatsApp/單號/单号/phone number/number；
+#   ② 数字 run：≥4 位（阿拉伯半/全角、中文数词 七七八八九九八、混排都算）；
+#   ③ 确认句式：语境词或 係/是/is/啱唔啱 等确认标记与 run 紧邻。
+# 赔偿金额（「最低 300 蚊」<4 位、无语境词）、工作日（「三至五個工作天」不成
+# 连续 run）等非确认数字结构性不中。
+#
+# 数字「合法」判定（不变量，Ethan 第一性原理定案 2026-10-01）：确认句里的
+# 数字 run ∈ {捕获账本 captured, 本轮用户原话转写 turn_user_text}。复述内容
+# 源唯一=用户真说过的话——听错靠复述环路本身兜住（忠实念回错的、让客户当场
+# 纠正），守卫绝不猜「正确」号码；边角=客户当场改口时捕获账本可能滞后，本轮
+# 原话匹配放行，防误改回旧值。两者都不含该 run = 编造。
+#
+# 动作：违约时（编造）有捕获 → 该 run 改正为捕获号码（阿拉伯→中文数位逐位，
+# MiniMax 逐位读）；无捕获 → 含确认的那句整句替换为三语索取句。
+# 只替换/改正命中的句子，其余句子原样保留；恒等返回=无改动。
+#
+# 纯函数、零 I/O、零全局状态；幂等（守卫后文本再守卫恒等）。
+# ---------------------------------------------------------------------------
+
+# 三语索取句（lang 未知回落 zh——与 `_call_language` 缺省链同口径）。
+GUARD_SOLICIT_LINES: dict[str, str] = {
+    "cantonese": "你報個常用嘅 WhatsApp 號碼俾我，我再同你確認一次。",
+    "zh": "您报一个常用的 WhatsApp 号码给我，我再跟您确认一次。",
+    "en": "Could you share your WhatsApp number so I can confirm it?",
+}
+
+# 号码语境词（三语；英文按 casefold 匹配）。
+_NUMBER_CTX_WORDS: tuple[str, ...] = (
+    "尾號", "尾号", "號碼", "号码", "whatsapp", "單號", "单号",
+    "phone number", "number",
+)
+
+# 数字 run：阿拉伯（半/全角）+ 中文数词（含 〇），混排也算，≥4 位。
+_NUMBER_RUN_RE = re.compile(r"[0-9０-９零〇一二三四五六七八九]{4,}")
+
+# 逐位转换表（与 flow.py `_digit_normalize` 同口径；英文数字词不在本守卫面）。
+_DIGIT_ALIASES: dict[str, str] = {
+    **{d: d for d in "0123456789"},
+    **{c: str(i) for i, c in enumerate("０１２３４５６７８９")},
+    "零": "0", "〇": "0", "一": "1", "二": "2", "三": "3", "四": "4",
+    "五": "5", "六": "6", "七": "7", "八": "8", "九": "9",
+}
+_ASCII_TO_CN = "零一二三四五六七八九"
+
+# 句界（强标点+换行，含分号）——整句连同句末标点一起替换，避免「。，」残句；
+# 逗号链不是句界（只替换含确认的整句，不往逗号链里塞索取句）。
+_SENTENCE_RE = re.compile(r"[^。！？!?；;\n]+[。！？!?；;\n]*")
+
+# 确认标记紧邻 run 之前（係/是/号码/is/…；容许冒号等连接符）。
+_CONFIRM_BEFORE_RE = re.compile(
+    r"(?:係|系|是|\b(?:is|are)\b|號|号|碼|码|:|：|=)\s*$",
+    re.IGNORECASE,
+)
+# run 之后的确认词（啱唔啱/对吗/right/…）。
+_CONFIRM_AFTER_RE = re.compile(
+    r"^\s*(?:啱唔啱|啱嗎|對唔對|對嗎|对吗|對不對|对不对|係咪|係唔係|是不是|"
+    r"right|correct|is that right|yes or no)",
+    re.IGNORECASE,
+)
+
+# 首段早发扣留触发面：缓冲出现任一数字字符或语境词残件（含单字前缀，防语境词
+# 被早切点劈开）→ 早发让位到句界（守卫必须整句在手才能替换/改正）。
+_NUMBER_PENDING_CHARS = frozenset(
+    "0123456789０１２３４５６７８９零〇一二三四五六七八九尾號号码碼單单"
+)
+
+
+def _digits_ascii(text: object) -> str:
+    """文本里的数字字符逐位归一成 ASCII（汉字/全角/阿拉伯混排都收；其余丢弃）。"""
+    return "".join(_DIGIT_ALIASES[ch] for ch in str(text or "") if ch in _DIGIT_ALIASES)
+
+
+def _digits_to_cn(digits: str) -> str:
+    """ASCII 数字串 → 中文数词（逐位；MiniMax 对汉字数字逐位读）。"""
+    return "".join(_ASCII_TO_CN[int(ch)] for ch in digits if ch in "0123456789")
+
+
+# 分组分隔符（数字夹缝里）先折叠：「7788-998」/「7788、998」是同一个号的
+# 分组报号（与 flow.py `_collapse_digit_groups` 同口径），折叠后才抽 run。
+_DIGIT_GROUP_SEP_RE = re.compile(
+    r"(?<=[0-9０-９零〇一二三四五六七八九])[ \t,，、\-–—·:：/／]+"
+    r"(?=[0-9０-９零〇一二三四五六七八九])"
+)
+
+
+def _transcript_digit_runs(text: object) -> tuple[str, ...]:
+    """转写里的数字 run 集合（≥4 位，归一 ASCII；分组分隔符先折叠）。"""
+    body = _DIGIT_GROUP_SEP_RE.sub("", str(text or ""))
+    runs: list[str] = []
+    for m in _NUMBER_RUN_RE.finditer(body):
+        v = _digits_ascii(m.group(0))
+        if v and v not in runs:
+            runs.append(v)
+    return tuple(runs)
+
+
+def _context_hit(text: str) -> bool:
+    low = str(text or "").lower()
+    return any(word in low for word in _NUMBER_CTX_WORDS)
+
+
+def _ctx_close_before(before: str) -> bool:
+    """语境词与 run 之间只隔极短连接成分（係/是/is/冒号/空白/标点）→ 紧邻。"""
+    low = str(before or "").lower()
+    for word in _NUMBER_CTX_WORDS:
+        idx = low.rfind(word)
+        if idx == -1:
+            continue
+        gap = low[idx + len(word):].strip(" \t:：,，、=＝")
+        if len(gap) <= 3:
+            return True
+    return False
+
+
+# 分句内连接符（逗号/顿号/分号/句读）——确认句式不跨分句认语境词，防
+# 「查咗單號，賠償金額係 3000」这类串句误把金额 run 当号码确认。
+_CLAUSE_BREAK_RE = re.compile(r"[，,；;。！？!?、\n]")
+
+
+def _run_is_confirmation(sentence: str, match: "re.Match[str]") -> bool:
+    """run 是否处于确认句式（规则 4：係/是/号 + 数字 run 邻近）。"""
+    before = sentence[max(0, match.start() - 16): match.start()]
+    after = sentence[match.end(): match.end() + 12]
+    if _ctx_close_before(before):
+        return True
+    clause = _CLAUSE_BREAK_RE.split(before)[-1]
+    if _context_hit(clause) or _context_hit(after):
+        if _CONFIRM_BEFORE_RE.search(before[-6:]):
+            return True
+        if _CONFIRM_AFTER_RE.search(after):
+            return True
+    return False
+
+
+def _run_is_known(run_digits: str, captured: str, turn_runs: tuple[str, ...]) -> bool:
+    """run 数字是否来自已知内容源（捕获账本 ∪ 本轮客户原话转写）。
+
+    匹配形态=run 是已知串的子串（等长/尾号后缀都合法——尾号场景即「捕获串的
+    后 N 位等长子串」）。run 比已知串长（多出数字）=新增=违约。"""
+    if not run_digits:
+        return False
+    if captured and run_digits in captured:
+        return True
+    return any(run_digits in known for known in turn_runs)
+
+
+def _guard_sentence(
+    sentence: str, lang: str, captured: str, turn_runs: tuple[str, ...]
+) -> str:
+    """单句守卫：命中编造确认 → 索取句；有捕获的错号 → 改正；否则恒等。"""
+    if not sentence.strip() or not _context_hit(sentence):
+        return sentence
+    runs = list(_NUMBER_RUN_RE.finditer(sentence))
+    if not runs:
+        return sentence
+    confirmed = [m for m in runs if _run_is_confirmation(sentence, m)]
+    if not confirmed:
+        return sentence
+    bad = [
+        m
+        for m in confirmed
+        if not _run_is_known(_digits_ascii(m.group(0)), captured, turn_runs)
+    ]
+    if not bad:
+        return sentence
+    if not captured:
+        return GUARD_SOLICIT_LINES.get(lang, GUARD_SOLICIT_LINES["zh"])
+    out: list[str] = []
+    last = 0
+    for m in bad:
+        out.append(sentence[last: m.start()])
+        out.append(_digits_to_cn(captured))
+        last = m.end()
+    out.append(sentence[last:])
+    return "".join(out)
+
+
+def guard_fabricated_number(
+    text: str,
+    lang: str,
+    captured: str | None,
+    turn_user_text: str | None = None,
+    known_text: str | None = None,
+) -> str:
+    """编造号码输出守卫（纯函数，零 LLM）：返回守卫后文本，恒等=无改动。
+
+    ``captured`` = 本通已捕获的客户号码文本（``ContextState._whatsapp_note``；
+    None/空 = 无捕获）；``turn_user_text`` = 本轮客户原话转写（None=拿不到权威
+    源）；``known_text`` = 对象档案等**系统已知事实**文本（快递单号等——AI 念读
+    系统数据做确认是合法确认环（客户可当场纠正），同为合法内容源；None=无）。
+    确认句里的数字 run 只有落在 {captured, turn_user_text 的数字 run,
+    known_text 的数字 run} 之内才算合法（含尾号后缀子串形态）——复述内容源
+    唯一=用户真说过的话 ∪ 系统已知事实。
+    违约时：有捕获 → 把错误 run 改正为捕获号码（阿拉伯→中文逐位）；无捕获 →
+    含确认的句子整句替换为三语索取句（替换后整段为空则整段用索取句）。
+    非确认语境的数字（赔偿金额/工作日）结构性不中，绝不动。
+    """
+    body = "" if text is None else str(text)
+    if not body:
+        return body
+    captured_digits = _digits_ascii(captured or "")
+    turn_runs = _transcript_digit_runs(turn_user_text) + _transcript_digit_runs(known_text)
+    lang_key = str(lang or "").strip().lower()
+    if lang_key not in GUARD_SOLICIT_LINES:
+        lang_key = "zh"
+    out: list[str] = []
+    changed = False
+    last = 0
+    for m in _SENTENCE_RE.finditer(body):
+        out.append(body[last: m.start()])
+        seg = m.group(0)
+        guarded = _guard_sentence(seg, lang_key, captured_digits, turn_runs)
+        if guarded != seg:
+            changed = True
+        out.append(guarded)
+        last = m.end()
+    out.append(body[last:])
+    if not changed:
+        return body
+    final = "".join(out)
+    # 「替换后为空则整段用索取句」兜底（整段句界字符等 degenerate 输入）。
+    return final if final.strip() else GUARD_SOLICIT_LINES[lang_key]
+
+
+def number_guard_pending(text: str) -> bool:
+    """缓冲里是否可能出现「号码确认」→ 首段早发扣留判据（纯函数）。
+
+    出现任一数字字符（阿拉伯/全角/中文数词）或语境词（含其单字残件）即真——
+    宁可让首段早发让位到句界（守卫必须整句在手才能替换/改正），不能让号码
+    被早切点劈成两段漏检。
+    """
+    body = str(text or "")
+    if any(ch in _NUMBER_PENDING_CHARS for ch in body):
+        return True
+    return _context_hit(body)

@@ -256,6 +256,25 @@ async def _case_session(case: dict) -> dict:
     """一案一通话：object/persona/call 全部用 case 自身语言建（每通语言固定策略下，
     全量三语共用一通 zh 电话的旧结构已不成立——agent 会按通话语言全程回 zh）。"""
     lang = case["lang"]
+    # B1 模板必填闸(2026-09-28 后):live 建单无模板=400——绑定走对象 template_id
+    # (erc.create_call 同款:该语言正牌模板,排除 e2e/probe 测试模板)。
+    _tpl_id = ""
+    try:
+        _tpls = httpx.get(
+            f"{CONTROL_PLANE_URL}/api/templates?account_id=acc-001",
+            headers=_CP_HEADERS, timeout=10,
+        ).json()
+        _tpls = _tpls if isinstance(_tpls, list) else _tpls.get("items") or []
+        _tpl = next(
+            (t for t in _tpls
+             if str(t.get("language")) == lang
+             and "e2e" not in str(t.get("name", "")).lower()
+             and "probe" not in str(t.get("name", "")).lower()),
+            None,
+        )
+        _tpl_id = str(_tpl.get("id") or "") if _tpl else ""
+    except Exception:  # noqa: BLE001 - 拉不到=闸会拒,报错可见
+        _tpl_id = ""
     obj = httpx.post(
         f"{CONTROL_PLANE_URL}/api/objects?account_id=acc-001",
         headers=_CP_HEADERS,
@@ -264,6 +283,7 @@ async def _case_session(case: dict) -> dict:
             "role_template": "buyer",
             "language": lang,
             "background": "e2e fixture",
+            "template_id": _tpl_id,
         },
         timeout=10,
     ).json()

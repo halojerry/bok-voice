@@ -75,27 +75,54 @@ def test_agent_catchall_log_line_shape():
     assert "FLOW_GRAPH judge_pending_expired" in _SRC
 
 
+def _catchall_branch_pin(seg: str, regular_lane: str) -> None:
+    """臂内兜底分叉钉死：`if _from_catchall:` → catchall 车道 → `else:` → 常规车道。
+
+    EX-2 chokepoint 迁移后 jump/notify 臂经 `_register_reply_lane(lane=...)`
+    注册（origin 的 provider 三元形状已折进 lane 实参）；play 臂仍走 provider
+    三元。分叉方向必须保住：兜底命中标 graph-catchall，常规命中标原车道。
+    """
+    i = seg.index("if _from_catchall:")
+    catch = seg.index('_register_reply_lane(lane="graph-catchall", notify=True)', i)
+    els = seg.index("else:", catch)
+    regular = seg.index(regular_lane, els)
+    assert i < catch < els < regular
+
+
 def test_agent_catchall_provider_marker_on_all_three_arms():
-    """三臂 provider 全带兜底标记(动作本体见 catchall 日志;jump/notify/play 各一)。"""
-    assert '"graph-catchall" if _from_catchall else "graph-jump"' in _SRC
-    assert '"graph-catchall" if _from_catchall else "graph-notify"' in _SRC
-    assert 'provider="graph-catchall" if _from_catchall else "graph-play"' in _SRC
+    """三臂 provider/lane 全带兜底标记（动作本体见 catchall 日志;jump/notify/play 各一）。"""
+    body = _SRC[_SRC.index("async def _gdispatch(") :]
+    jump = body.index('if _gbinding.action == "jump_step":')
+    notify = body.index("elif _gbinding.action == ACTION_NOTIFY_HUMAN:", jump)
+    play = body.index("else:  # play_qa:", notify)
+    jump_seg, notify_seg, play_seg = body[jump:notify], body[notify:play], body[play:]
+    _catchall_branch_pin(jump_seg, '_register_reply_lane(lane="graph-jump", notify=True)')
+    _catchall_branch_pin(notify_seg, '_register_reply_lane(lane="graph-notify", notify=True)')
+    assert 'provider="graph-play" if not _from_catchall else "graph-catchall"' in play_seg
 
 
 def test_agent_catchall_keeps_existing_action_dispatch_untouched():
-    """三臂既有语义零变化:notify 仍不 StopResponse、play 仍 raise、jump 仍记账。"""
-    jump = _SRC.index('if _b.action == "jump_step":')
-    notify = _SRC.index("elif _b.action == ACTION_NOTIFY_HUMAN:")
+    """三臂既有语义零变化:notify 仍不 StopResponse、play 仍 raise、jump 仍记账。
+
+    P2.2 复核修后三臂抽进 `_gdispatch` 闭包（绑定参数名 _gbinding）；判据调度闸
+    从「仅 `_gbinding is None`」放宽成「非常规命中」——合并形态为
+    `elif user_text:` 承接常规派发、内层 `if not _gregular_hit:` 兜底同档撒网。
+    """
+    dispatch = _SRC.index("async def _gdispatch(")
+    jump = _SRC.index('if _gbinding.action == "jump_step":', dispatch)
+    notify = _SRC.index("elif _gbinding.action == ACTION_NOTIFY_HUMAN:", jump)
     play = _SRC.index("else:  # play_qa:", notify)
     assert jump < notify < play
-    assert "flow_ctrl.graph_fired.add(_b.id)" in _SRC[jump:notify]
+    assert "flow_ctrl.graph_fired.add(_gbinding.id)" in _SRC[jump:notify]
     assert "raise StopResponse()" not in _SRC[notify:play]      # 打铃不抢话
     assert "raise StopResponse()" in _SRC[play : play + 6000]   # 罐头播完压掉 LLM
     # 判据调度闸从「仅 `_gbinding is None`」放宽成「非常规命中」(兜底命中同档撒网),
     # 唯一入口仍在;细节见 tests/test_intent_judge_wiring.py 的 F1 锚。
-    assert "elif user_text:" not in _SRC
-    assert "if user_text and not _gregular_hit:" in _SRC
-    assert "_maybe_schedule_intent_judge(user_text)" in _SRC
+    head = _SRC.index("elif user_text:")
+    call = _SRC.index("_maybe_schedule_intent_judge(user_text)")
+    assert head < call
+    assert "if not _gregular_hit:" in _SRC[head:call]
+    assert _SRC.count("_maybe_schedule_intent_judge(user_text)") == 1
 
 
 def test_flow_controller_delegates_to_pure_function():

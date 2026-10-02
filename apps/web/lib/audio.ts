@@ -100,13 +100,26 @@ export async function listAudioDevicesOf(kind: AudioDeviceKind): Promise<AudioDe
 export async function switchWebOutputDevice(room: { switchActiveDevice: (kind: string, id: string, exact?: boolean) => Promise<boolean> }, deviceId: string): Promise<boolean> {
   if (!deviceId || !room || typeof room.switchActiveDevice !== "function") return false;
   if (!webCanSwitchOutput()) return false;
+  // 预校验(2026-10-01 第十三波):已存设备失效(拔掉/换机)时,livekit 内部对每个
+  // 远端音轨 setSinkId 失败会先打 console.error「Failed to set sink id on remote
+  // audio track」再返回——我们的 catch 永远接不到异常,存档也清不掉,每次挂轨都
+  // 刷屏(call-231aa92a 窗口实弹 4 次/通)。改为调用前比对枚举清单:不在清单=
+  // 失效存档,静默清档回系统默认,零报错。
+  try {
+    const outs = await listAudioDevicesOf("output");
+    if (outs.length && !outs.some((d) => d.id === deviceId)) {
+      saveOutputDevice("");
+      return false;
+    }
+  } catch {
+    /* 枚举失败不拦切换(权限异常等边缘),按旧路径走 */
+  }
   try {
     await room.switchActiveDevice("audiooutput", deviceId, false);
     saveOutputDevice(deviceId);
     return true;
   } catch (e) {
-    // 已存输出设备失效(拔掉/换设备)时,每次远端音轨挂载都 setSinkId 失败刷屏。
-    // 清掉失效存档让后续音轨回系统默认,唔再反复报错。
+    // 兜底:切换本身抛错(非 Chromium 内核的 setSinkId 缺席等)。
     console.warn("switch web audiooutput failed, 回退系统默认输出", e);
     saveOutputDevice("");
     return false;

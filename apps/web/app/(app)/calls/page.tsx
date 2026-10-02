@@ -20,6 +20,7 @@ const STATUS: Record<string, [string, string]> = {
 const WA_PENDING = ["offered", "captured"];
 
 function modeLabel(mode: string) {
+  if (mode === "realtime_demo") return "演示档";
   return mode === "live" ? "真实业务" : "训练";
 }
 
@@ -231,6 +232,14 @@ export default function CallsPage() {
                     <div className="min-w-0">
                       <p className="truncate font-medium">
                         {objectName(c.object_id)}
+                        {String(c.mode ?? "") === "realtime_demo" && (
+                          <span
+                            className="ml-2 rounded-sm bg-fuchsia-500/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-fuchsia-600"
+                            title="云端 Realtime 演示档（root 建单，出境计费）"
+                          >
+                            演示档
+                          </span>
+                        )}
                         {waPending && (
                           <span className="ml-2 rounded-sm bg-(--live-soft) px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-(--live-ink)">
                             WhatsApp {wa === "captured" && waNum ? waNum : "待对接"}

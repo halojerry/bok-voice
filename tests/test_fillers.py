@@ -1,5 +1,6 @@
-"""FillerDirector 单测(2026-09-10 资产化改版):manifest 池/语言铁律(绝不跨语言)/
-限次/轮换防重/播放排序契约(首音频不掐垫话+hold 扣压=垫话剩余+gap)/用户插话停播/kill-switch。
+"""FillerDirector 单测(2026-09-10 资产化改版;2026-10-02 播放排序翻转为让路):
+manifest 池/语言铁律(绝不跨语言)/限次/轮换防重/首音频停播+hold 归零(新政策,
+BOK_FILLER_YIELD=0 回「播完+hold 扣压」旧档)/用户插话停播/kill-switch。
 
 资产契约:垫话=随源码分发的 wav+manifest(apps/agent/agent_runtime/assets/fillers/),
 运行时只播文件绝不云合成;语言=装配时钉死的通话语言,池缺失明文跳过。
@@ -181,21 +182,27 @@ def test_player_none_disables(tmp_path):
     _run(_case())
 
 
-def test_reply_first_audio_does_not_stop_playing(tmp_path):
-    """播放排序契约:首音频到达只作废定时器,在播垫话必须播完(不掐)。"""
+def test_reply_first_audio_stops_playing(tmp_path):
+    """播放排序契约(2026-10-02 政策翻转):首音频到达即停垫话,hold 归零。
+
+    旧契约「垫话播完」的反例=call-4e8d58c1(真答案首音频 18.4s≈垫话2 播完 18.5s);
+    旧档回归由 BOK_FILLER_YIELD=0 臂覆盖(见 tests/test_filler_yield.py)。"""
 
     async def _case():
         d, player = _director(tmp_path)
         await d._fire(0)
         handle = player.handles[-1]
         d.on_reply_first_audio()
-        assert handle.stopped is False, "垫话在播被掐=违反播放排序契约"
-        assert d.hold_if_playing() > 0, "在播垫话应触发回复扣压"
+        assert handle.stopped is True, "首音频应停掉在播垫话(让路政策)"
+        assert d.hold_if_playing() == 0.0, "让路后回复不再扣压"
 
     _run(_case())
 
 
-def test_hold_if_playing_remaining_plus_gap(tmp_path):
+def test_hold_if_playing_legacy_timeline_under_kill_switch(tmp_path, monkeypatch):
+    """旧档(BOK_FILLER_YIELD=0)hold 时间轴契约原样保留:剩余+gap、播完保 gap 窗。"""
+    monkeypatch.setenv("BOK_FILLER_YIELD", "0")
+
     async def _case():
         d, player = _director(tmp_path)
         assert d.hold_if_playing() == 0.0  # 未播
@@ -387,9 +394,12 @@ _CHAIN_ENV = {
 
 
 def test_chain_fires_second_filler_when_reply_late(tmp_path, monkeypatch):
-    """首条播完、回复首音频仍未到 → gap 后自动补第二发(不重样、计数同源)。"""
+    """首条播完、回复首音频仍未到 → gap 后自动补第二发(不重样、计数同源)。
+
+    旧链发档(BOK_FILLER_CHAIN=1)整体走旧契约:hold 时间轴随之(让路闸关)。"""
     for k, v in _CHAIN_ENV.items():
         monkeypatch.setenv(k, v)
+    monkeypatch.setenv("BOK_FILLER_YIELD", "0")
 
     async def _case():
         d, player = _director(tmp_path)
@@ -613,6 +623,8 @@ def test_load_manifest_filters_deflect_family(tmp_path):
 
 
 def test_consecutive_round_cooldown(tmp_path, monkeypatch):
+    """时间窗连发冷却(2026-09-29):窗内跳过、出窗放行——真实通话轮间隔
+    (>10s)普遍出窗=慢轮全覆盖;旧「相邻轮歇一轮」把慢轮覆盖打穿已废。"""
     monkeypatch.setenv("BOK_FILLER_DELAY_MS", "0")
 
     async def _case():
@@ -622,12 +634,153 @@ def test_consecutive_round_cooldown(tmp_path, monkeypatch):
         d._handle = None
         assert len(player.plays) == 1
         assert d.fired_this_round() is True
-        d.arm()  # r2:相邻轮 → 冷却跳过
+        d.arm()  # r2:上次垫话 10s 窗内 → 跳过
         await d._fire(0)
-        assert len(player.plays) == 1, "相邻轮必须歇一轮(8轮垫6轮=轰炸感)"
+        assert len(player.plays) == 1, "冷却窗内必须跳过(急连发防轰炸)"
         assert d.fired_this_round() is False
-        d.arm()  # r3:隔开 → 放行
+        d.arm()  # r3:模拟真实通话轮间隔(>10s,出窗)→ 放行=慢轮全覆盖
+        d._last_fire_at -= 11.0
         await d._fire(0)
-        assert len(player.plays) == 2
+        assert len(player.plays) == 2, "出窗后必须放行(旧 seq 交替在此打穿慢轮)"
 
     _run(_case())
+
+
+def test_filler_cooldown_disabled_by_env(tmp_path, monkeypatch):
+    """BOK_FILLER_COOLDOWN_S=0 → 冷却全关:连发也不跳(懒 delay+每通上限兜)。"""
+    monkeypatch.setenv("BOK_FILLER_DELAY_MS", "0")
+    monkeypatch.setenv("BOK_FILLER_COOLDOWN_S", "0")
+
+    async def _case():
+        d, player = _director(tmp_path)
+        d.arm()
+        await d._fire(0)
+        d._handle = None
+        d.arm()
+        await d._fire(0)
+        assert len(player.plays) == 2, "0=关窗,不得跳过"
+
+    _run(_case())
+
+
+# ---- W2a 分层犹豫垫音(2026-09-23):hesitation 第六类资产标签,分类器五类
+# 永不产出 → _pick 概率混入;犹豫池缺失=零行为变化(短路)。 ----
+
+
+def _patch_roll(monkeypatch, value: float) -> None:
+    import agent_runtime.fillers as fm
+
+    monkeypatch.setattr(fm.random, "random", lambda: value)
+
+
+def test_hesitation_blend_hit_picks_from_hes_pool(tmp_path, monkeypatch):
+    """抽签命中(roll < PROB)→ 从 hesitation 池选,即使分类器给了别的类。"""
+    _patch_roll(monkeypatch, 0.0)
+
+    async def _case():
+        pools = {"cantonese": ["正常垫话一。", "嗯——呃——", "呃——嗯——"]}
+        cats = {"cantonese": ["check", "hesitation", "hesitation"]}
+        d, _ = _director(tmp_path, pools=pools, cats=cats)
+        e = d._pick("cantonese", "check")
+        assert e["cat"] == "hesitation", "混入抽签命中必须出自犹豫池"
+
+    _run(_case())
+
+
+def test_hesitation_blend_miss_keeps_normal_path(tmp_path, monkeypatch):
+    """抽签未中(roll ≥ PROB)→ 既有分类池路径逐字节不变。"""
+    _patch_roll(monkeypatch, 0.99)
+
+    async def _case():
+        pools = {"cantonese": ["正常垫话一。", "嗯——呃——"]}
+        cats = {"cantonese": ["check", "hesitation"]}
+        d, _ = _director(tmp_path, pools=pools, cats=cats)
+        e = d._pick("cantonese", "check")
+        assert e["cat"] == "check", "抽签未中不得动分类池路径"
+
+    _run(_case())
+
+
+def test_no_hesitation_pool_short_circuits(tmp_path, monkeypatch):
+    """池里无 hesitation 条目 → 混合分支短路,旧 manifest 行为零变化
+    (roll 恒 0 也不得改道——短路靠池空,不靠抽签值)。"""
+    _patch_roll(monkeypatch, 0.0)
+
+    async def _case():
+        pools = {"cantonese": ["默认垫话。", "应承一。"]}
+        cats = {"cantonese": ["default", "ack"]}
+        d, _ = _director(tmp_path, pools=pools, cats=cats)
+        e = d._pick("cantonese", "default")
+        assert e["cat"] == "default"
+
+    _run(_case())
+
+
+def test_hesitation_blend_respects_recent_dedup(tmp_path, monkeypatch):
+    """连续混入抽签同走去重窗(相邻选取不重复);犹豫池 3 条 > 窗 2 必不重。"""
+    _patch_roll(monkeypatch, 0.0)
+
+    async def _case():
+        pools = {"cantonese": ["嗯——呃——", "呃——嗯——", "呃——哦——"]}
+        cats = {"cantonese": ["hesitation"] * 3}
+        d, _ = _director(tmp_path, pools=pools, cats=cats)
+        picks = [d._pick("cantonese", "check")["text"] for _ in range(3)]
+        assert len(set(picks)) == 3, f"犹豫池连续抽签重复: {picks}"
+
+    _run(_case())
+
+
+def test_real_manifest_hesitation_tier():
+    """真实资产契约(W2a):三语各 7 条 hesitation,文件名 h 档前缀,
+    时长全在犹豫独立窗 [0.8,2.6]s,wav 在位。"""
+    import re
+
+    from agent_runtime.fillers import FILLER_ASSETS_DIR, HESITATION_CAT, load_manifest
+
+    m = load_manifest(FILLER_ASSETS_DIR)
+    for lang, entries in m.items():
+        hes = [e for e in entries if e.get("cat") == HESITATION_CAT]
+        assert len(hes) == 7, f"{lang} hesitation 应 7 条,得 {len(hes)}"
+        for e in hes:
+            assert re.match(rf"^{lang}-h\d{{2}}\.wav$", e["file"]), e["file"]
+            assert 0.8 <= e["dur_s"] <= 2.6, f"{e['file']} dur={e['dur_s']} 出独立窗"
+            assert (FILLER_ASSETS_DIR / e["file"]).exists()
+
+
+# —— W2b 思考态键盘环境音(fillers.thinking_sound_configs) ——————————————
+
+
+def test_thinking_sound_configs_default(monkeypatch):
+    """默认开:两条内置打字 burst,音量 0.6/概率 0.30/fade_out 0.05。"""
+    from livekit.agents.voice.background_audio import BuiltinAudioClip
+
+    from agent_runtime.fillers import thinking_sound_configs
+
+    monkeypatch.delenv("BOK_AMBIENT_KEYBOARD", raising=False)
+    monkeypatch.delenv("BOK_AMBIENT_KEYBOARD_VOL", raising=False)
+    cfgs = thinking_sound_configs()
+    assert cfgs is not None and len(cfgs) == 2
+    srcs = {c.source for c in cfgs}
+    assert srcs == {BuiltinAudioClip.KEYBOARD_TYPING, BuiltinAudioClip.KEYBOARD_TYPING2}
+    for c in cfgs:
+        assert c.volume == 0.6
+        assert c.probability == 0.30
+        assert c.fade_out == 0.05
+
+
+def test_thinking_sound_configs_kill_switch(monkeypatch):
+    """BOK_AMBIENT_KEYBOARD=0 → None(构造不带 thinking_sound,行为与旧版同)。"""
+    from agent_runtime.fillers import thinking_sound_configs
+
+    monkeypatch.setenv("BOK_AMBIENT_KEYBOARD", "0")
+    assert thinking_sound_configs() is None
+
+
+def test_thinking_sound_configs_volume_clamp(monkeypatch):
+    """音量 env:非法值回落 0.6,越界夹 [0,1]。"""
+    from agent_runtime.fillers import thinking_sound_configs
+
+    for raw, want in (("1.7", 1.0), ("-0.2", 0.0), ("abc", 0.6), ("0.25", 0.25)):
+        monkeypatch.setenv("BOK_AMBIENT_KEYBOARD_VOL", raw)
+        cfgs = thinking_sound_configs()
+        assert cfgs is not None and all(c.volume == want for c in cfgs), raw

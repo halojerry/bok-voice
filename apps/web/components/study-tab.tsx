@@ -38,17 +38,20 @@ type ClusterPlan = {
   variants: ClusterItem[];
   fresh: ClusterItem[];
   junk: ClusterItem[];
+  hotwords: ClusterItem[];
   model: string;
 };
 
-/** dry 响应 → 三组清单（T1 接口冻结形状 {variants[],fresh[],junk[],model,counts}；
- * 字段名按 §6 口径防御收窄，缺组按空数组降级）。 */
+/** dry 响应 → 四组清单（T1 冻结 {variants[],fresh[],junk[],model,counts}；EX-H1
+ * 追加 hotwords 段 {hotwords:{candidates[],counts}}；字段名防御收窄，缺组按空数组降级）。 */
 function parsePlan(data: Record<string, unknown> | null | undefined): ClusterPlan {
   const arr = (v: unknown) => (Array.isArray(v) ? (v as ClusterItem[]) : []);
+  const hw = data?.hotwords as Record<string, unknown> | undefined;
   return {
     variants: arr(data?.variants),
     fresh: arr(data?.fresh),
     junk: arr(data?.junk),
+    hotwords: arr(hw?.candidates),
     model: String(data?.model ?? ""),
   };
 }
@@ -75,6 +78,41 @@ function junkReason(it: ClusterItem): string {
   return fieldOf(it, ["reason", "note"]);
 }
 
+// ---- 热词沉淀（EX-H1）----
+
+const HOTWORD_KIND_LABEL: Record<string, string> = {
+  polish_fix: "听错纠正",
+  near_miss: "要求重复",
+  gap_ngram: "高频词",
+};
+const HOTWORD_VERDICT_LABEL: Record<string, string> = {
+  adopt: "建议采纳",
+  reject: "建议丢弃",
+};
+
+function hotwordWord(it: ClusterItem): string {
+  return fieldOf(it, ["word"]);
+}
+function hotwordFreq(it: ClusterItem): string {
+  return fieldOf(it, ["freq"]);
+}
+function hotwordKind(it: ClusterItem): string {
+  return fieldOf(it, ["kind"]);
+}
+function hotwordVerdict(it: ClusterItem): string {
+  return fieldOf(it, ["verdict"]);
+}
+/** 第一条证据样本 raw→fixed（fixed 为空=仅原始转写，非纠错类）。 */
+function hotwordEvidence(it: ClusterItem): { raw: string; fixed: string } | null {
+  const arr = Array.isArray(it.evidence) ? (it.evidence as ClusterItem[]) : [];
+  if (arr.length === 0) return null;
+  const e = arr[0];
+  return {
+    raw: typeof e.raw === "string" ? e.raw : "",
+    fixed: typeof e.fixed === "string" ? e.fixed : "",
+  };
+}
+
 /** 聚类候选上限：dry 与 apply **必须同参**——CP 勾选采纳守卫按 (账号,参数) 找
  * 新鲜计划缓存，apply 参数与 dry 不符即 409「请重新生成」（不同参数是另一份计划）。 */
 const CLUSTER_LIMIT = 30;
@@ -91,8 +129,19 @@ function buildSelect(variantChecks: boolean[], freshChecks: boolean[]) {
   return select;
 }
 
+/** 热词采纳子集：勾选下标（CP hotword_select 入参；空数组=不采纳任何热词）。 */
+function buildHotwordSelect(hotwordChecks: boolean[]): number[] {
+  const sel: number[] = [];
+  hotwordChecks.forEach((on, i) => {
+    if (on) sel.push(i);
+  });
+  return sel;
+}
+
 const ADOPT_TIP =
   "已采纳。新词条需补录罐头音：问答库右键重新录音，或主管在设置页触发 pregen。";
+
+const HOTWORD_ADOPT_TIP = "热词已采纳（挖掘自真实通话转写，采纳后下一通生效）。";
 
 export default function StudyTab() {
   const { accountId } = useAccount();
@@ -142,6 +191,7 @@ export default function StudyTab() {
   const [plan, setPlan] = useState<ClusterPlan | null>(null);
   const [variantChecks, setVariantChecks] = useState<boolean[]>([]);
   const [freshChecks, setFreshChecks] = useState<boolean[]>([]);
+  const [hotwordChecks, setHotwordChecks] = useState<boolean[]>([]);
   const [qaQuestionById, setQaQuestionById] = useState<Record<string, string>>({});
   const [generating, setGenerating] = useState(false);
   const [adopting, setAdopting] = useState(false);
@@ -159,6 +209,8 @@ export default function StudyTab() {
       setPlan(p);
       setVariantChecks(p.variants.map(() => true)); // 变体+新词条默认全勾
       setFreshChecks(p.fresh.map(() => true));
+      // 热词默认只勾 LLM 建议采纳（adopt）的项——reject 项仍展示，运营可自行覆盖。
+      setHotwordChecks(p.hotwords.map((it) => hotwordVerdict(it) === "adopt"));
       // dry 计划的 variant 行只带目标词条 id（cluster_head_id）不带问法——
       // 拉词条列表建 id→问法映射供展示（失败降级只显示 id,不阻塞计划）。
       try {
@@ -183,16 +235,20 @@ export default function StudyTab() {
     if (!plan) return;
     setAdopting(true);
     setClusterErr("");
+    const hotwordSel = buildHotwordSelect(hotwordChecks);
+    const qaSel = buildSelect(variantChecks, freshChecks);
     try {
       await api.qaCluster(accountId, {
         apply: true,
         limit: CLUSTER_LIMIT, // 与 dry 同参：否则 CP 守卫按参数找不到计划缓存 → 409
-        select: buildSelect(variantChecks, freshChecks),
+        select: qaSel,
+        hotword_select: hotwordSel,
       });
       setPlan(null); // 成功后清面板
       setVariantChecks([]);
       setFreshChecks([]);
-      setOkMsg(ADOPT_TIP);
+      setHotwordChecks([]);
+      setOkMsg(qaSel.length === 0 && hotwordSel.length > 0 ? HOTWORD_ADOPT_TIP : ADOPT_TIP);
       loadReports(); // 重拉 qaPairs（挖掘报告与词条库同步）
     } catch (e) {
       setClusterErr(String(e));
@@ -202,7 +258,9 @@ export default function StudyTab() {
   }
 
   const adoptableCount =
-    variantChecks.filter(Boolean).length + freshChecks.filter(Boolean).length;
+    variantChecks.filter(Boolean).length +
+    freshChecks.filter(Boolean).length +
+    hotwordChecks.filter(Boolean).length;
 
   const itemRowCls = "rounded-lg bg-muted/60 p-2 text-xs";
 
@@ -295,6 +353,7 @@ export default function StudyTab() {
                 <p className="text-[11px] muted">
                   {plan.model && `聚类模型：${plan.model} · `}
                   变体 {plan.variants.length} · 新词条 {plan.fresh.length} · 丢弃 {plan.junk.length}
+                  {plan.hotwords.length > 0 && ` · 热词 ${plan.hotwords.length}`}
                   （丢弃组仅展示，不入库）
                 </p>
                 {plan.variants.length === 0 && plan.fresh.length === 0 && plan.junk.length === 0 && (
@@ -367,6 +426,58 @@ export default function StudyTab() {
                     </div>
                   </div>
                 )}
+                <div>
+                  <span className="label">热词沉淀（ASR 偏置）</span>
+                  <p className="mt-0.5 text-[11px] muted">
+                    挖掘自真实通话转写，采纳后下一通生效（写进本账号热词表，喂 ASR 识别偏置）。
+                  </p>
+                  {plan.hotwords.length === 0 ? (
+                    <p className="mt-1 text-xs muted">本轮没有可沉淀的热词候选。</p>
+                  ) : (
+                    <div className="mt-1 space-y-2">
+                      {plan.hotwords.map((it, i) => {
+                        const ev = hotwordEvidence(it);
+                        const verdict = hotwordVerdict(it);
+                        return (
+                          <label key={i} className={`${itemRowCls} flex cursor-pointer items-start gap-2`}>
+                            <input
+                              type="checkbox"
+                              className="mt-0.5 size-3.5 accent-(--live)"
+                              checked={hotwordChecks[i] ?? false}
+                              onChange={(e) =>
+                                setHotwordChecks((prev) => prev.map((v, j) => (j === i ? e.target.checked : v)))
+                              }
+                            />
+                            <span className="min-w-0 flex-1">
+                              <p className="font-medium">
+                                {hotwordWord(it) || "(空词)"}
+                                <span className="ml-1 rounded bg-muted px-1 text-[10px] muted">
+                                  {LANG_LABEL[itemLang(it)] ?? (itemLang(it) || "-")}
+                                </span>
+                                {hotwordKind(it) && (
+                                  <span className="ml-1 rounded bg-muted px-1 text-[10px] muted">
+                                    {HOTWORD_KIND_LABEL[hotwordKind(it)] ?? hotwordKind(it)}
+                                  </span>
+                                )}
+                                {hotwordFreq(it) && <span className="ml-1 muted">×{hotwordFreq(it)}</span>}
+                              </p>
+                              <p className="mt-0.5 muted">
+                                {HOTWORD_VERDICT_LABEL[verdict] ?? (verdict || "-")}
+                                {junkReason(it) && ` · ${junkReason(it)}`}
+                              </p>
+                              {ev && (
+                                <p className="mt-0.5 line-clamp-2 muted">
+                                  证据：{ev.raw}
+                                  {ev.fixed && ev.fixed !== ev.raw && ` → ${ev.fixed}`}
+                                </p>
+                              )}
+                            </span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
               </div>
             )}
           </div>

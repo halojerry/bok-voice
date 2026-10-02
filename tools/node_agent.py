@@ -301,14 +301,19 @@ def should_refuse_jobs(missed: int, max_missed: int) -> bool:
     return missed >= max_missed
 
 
-def write_ui_config(out_dir: Path, cp_url: str, livekit_url: str) -> Path:
+def write_ui_config(out_dir: Path, cp_url: str, livekit_url: str,
+                    registry_url: str = "") -> Path:
+    """写 UI 运行时配置。registry_url（F2，2026-09-24 双 CP 拓扑）：/api/nodes*
+    的注册表基址（管理面 A）——非空才注入 registryUrl 键，单 CP 形态字节同旧
+    （web registryBase() 回 apiBase()）。"""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     target = out_dir / "runtime-config.js"
+    payload: dict[str, str] = {"cpUrl": cp_url, "livekitUrl": livekit_url}
+    if registry_url:
+        payload["registryUrl"] = registry_url
     target.write_text(
-        "window.__BOK_CONFIG__ = "
-        + json.dumps({"cpUrl": cp_url, "livekitUrl": livekit_url})
-        + ";\n"
+        "window.__BOK_CONFIG__ = " + json.dumps(payload) + ";\n"
     )
     return target
 
@@ -830,6 +835,11 @@ def main(argv=None) -> int:
     ap.add_argument("--heartbeat-only", action="store_true", help="不拉起全栈，只跑心跳")
     ap.add_argument("--ui-dir", default="", help="web 静态产物目录（提供则写 runtime-config.js；"
                     "非 --heartbeat-only 时同时本地托管 :3000）")
+    ap.add_argument("--ui-cp-url", default=os.environ.get("BOK_UI_CP_URL", ""),
+                    help="UI runtime-config 的 cpUrl（F1，2026-09-24 双 CP 拓扑）：缺省回退"
+                    " --cp-url——注册 CP 与工作 CP 同址的旧形态零变化；appliance 双 CP 档"
+                    "（node_agent 注册到 A、话务员 UI 吃 B 本地 CP）必须显式指 B，否则 UI "
+                    "被指去管理面。env BOK_UI_CP_URL 同效（键不走 argv）")
     ap.add_argument("--ui-port", type=int, default=3000, help="UI 托管端口（默认 3000）")
     ap.add_argument("--ui-bind", default="0.0.0.0",
                     help="UI 托管绑定地址（默认 0.0.0.0=内网话务员可访问；仅本机用 127.0.0.1）")
@@ -865,7 +875,13 @@ def main(argv=None) -> int:
     if version:
         LOG.info("node package version: %s", version)
     if args.ui_dir:
-        target = write_ui_config(Path(args.ui_dir), cfg.cp_url, args.livekit_url)
+        # F1（2026-09-24）：UI 的 cpUrl 独立于注册 CP——缺省同址（旧形态零变化），
+        # 双 CP 档显式 --ui-cp-url 指 B 本地工作 CP，防管理面地址劫持话务员 UI。
+        # F2：registryUrl 恒=注册 CP（cfg.cp_url），与 ui cpUrl 分家后注入。
+        ui_cp_url = args.ui_cp_url or cfg.cp_url
+        registry = cfg.cp_url if ui_cp_url != cfg.cp_url else ""
+        target = write_ui_config(Path(args.ui_dir), ui_cp_url, args.livekit_url,
+                                 registry_url=registry)
         LOG.info("ui config -> %s", target)
         if not args.no_ui and not args.heartbeat_only:
             threading.Thread(target=serve_ui, args=(Path(args.ui_dir), args.ui_bind, args.ui_port),

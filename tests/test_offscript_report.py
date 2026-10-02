@@ -84,3 +84,53 @@ def test_summarize_all_aggregates():
     assert agg["first_audio"]["n"] == 2 and agg["first_audio"]["p50"] == 1000.0
     assert agg["markers"]["BOK_FILLER fired"] == 6
     assert agg["gen_counts"] == {"llm": 2, "script": 2}
+
+
+# ---- G7 快路覆盖实测面（qa_fastpath 占回复轮比例,2026-09-25） ----
+
+
+def test_qa_fastpath_stats_denominator_and_rate():
+    turns = [
+        {"role": "user", "transcript": "幾時送到", "gen": ""},
+        {"role": "assistant", "transcript": "兩到三日到。", "gen": "qa_fastpath"},
+        {"role": "assistant", "transcript": "", "gen": "filler"},  # 垫话账本：不进分母
+        {"role": "user", "transcript": "可以退貨嗎", "gen": ""},
+        {"role": "assistant", "transcript": "七日內。", "gen": "llm"},
+        {"role": "assistant", "transcript": "…", "gen": "interrupted"},  # 打断残行：不进分母
+        {"role": "user", "transcript": "轉人工", "gen": ""},
+        # 旧数据 gen 空 ×2：按 llm 归桶、照进分母
+        {"role": "assistant", "transcript": "我幫你轉接。", "gen": ""},
+        {"role": "assistant", "transcript": "好嘅。", "gen": "script"},
+    ]
+    fs = off.qa_fastpath_stats(turns)
+    assert fs["reply_turns"] == 4
+    assert fs["qa_fastpath_turns"] == 1
+    assert fs["qa_fastpath_rate"] == round(1 / 4, 4)
+    assert fs["by_gen"] == {"qa_fastpath": 1, "llm": 2, "script": 1}
+
+
+def test_qa_fastpath_stats_empty_turns_zero_denominator():
+    fs = off.qa_fastpath_stats([])
+    assert fs == {"reply_turns": 0, "qa_fastpath_turns": 0, "qa_fastpath_rate": 0.0, "by_gen": {}}
+    only_ledger = off.qa_fastpath_stats([{"role": "assistant", "gen": "filler"}])
+    assert only_ledger["reply_turns"] == 0 and only_ledger["qa_fastpath_rate"] == 0.0
+
+
+def test_summarize_all_aggregates_fastpath_stats():
+    budgets = {"first_ms": 2500.0, "perceived_ms": 3000.0}
+    base = {
+        "measures": [],
+        "perceived": [],
+        "summary": {"rounds": 0, "answered": 0, "mute": 0, "markers": {}},
+        "gen_counts": {},
+        "setup_ok": True,
+    }
+    results = [
+        {**base, "fastpath_stats": {"reply_turns": 4, "qa_fastpath_turns": 1, "qa_fastpath_rate": 0.25}},
+        {**base, "fastpath_stats": {"reply_turns": 6, "qa_fastpath_turns": 2, "qa_fastpath_rate": 1 / 3}},
+        dict(base),  # 旧结果无 fastpath_stats：聚合零贡献不炸
+    ]
+    agg = off.summarize_all(results, budgets)
+    assert agg["fastpath_stats"]["reply_turns"] == 10
+    assert agg["fastpath_stats"]["qa_fastpath_turns"] == 3
+    assert agg["fastpath_stats"]["qa_fastpath_rate"] == 0.3

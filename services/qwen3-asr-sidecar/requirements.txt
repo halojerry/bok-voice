@@ -5,3 +5,7 @@ soundfile>=0.12
 librosa>=0.10
 httpx>=0.27,<1
 qwen-asr>=0.0.6
+# P1 SV-CPU 引擎车道(2026-10-01):SenseVoice-small int8 ONNX 纯 CPU 识别器
+# (三语过门 40-48ms/句;缺模型时 engine fail-open 回 Qwen3 路径,此依赖仅
+# sensevoice 会话触发懒加载)。
+sherpa-onnx>=1.13,<2

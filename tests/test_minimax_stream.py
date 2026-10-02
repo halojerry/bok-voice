@@ -160,19 +160,19 @@ def test_truncate_chat_items_keeps_recent_turns():
         return lk_llm.ChatMessage(role=role, content=[txt])
 
     items = [msg("system", "你是客服"), msg("system", "【知识】规则")]
-    for i in range(12):  # 12 轮 user+assistant
+    for i in range(14):  # 14 轮 user+assistant（> 6×max_turns 条,触发截断）
         items.append(msg("user", f"客户{i}"))
         items.append(msg("assistant", f"回复{i}"))
     out = _truncate_chat_items(items, max_turns=4)
     roles = [getattr(m, "role", "") for m in out]
     # 开头 system 全保留
     assert roles[0] == "system" and roles[1] == "system"
-    # 对话只剩最近 4 对(8 条)
+    # 对话只剩最近 4 对(8 条)——F4 触发点抬到 6×max_turns,剪回目标不变。
     dialog = roles[2:]
     assert dialog == ["user", "assistant"] * 4, f"应保留最近4对: {dialog}"
     # 最近一轮在
-    assert out[-1].content == ["回复11"]
-    assert out[-2].content == ["客户11"]
+    assert out[-1].content == ["回复13"]
+    assert out[-2].content == ["客户13"]
     # 最早轮被截掉
     assert not any(getattr(m, "content", "") == ["客户0"] for m in out)
 
@@ -190,11 +190,12 @@ def test_truncate_chat_items_short_untouched():
 
 
 def test_truncate_chat_items_amortized_hysteresis():
-    """摊销式截断(滞回):超过 max_turns 对但未到 2×max_turns 对 → 不截(纯追加,
-    KV-cache 逐轮命中);到 2×max_turns 对才一次剪回 max_turns 对。
+    """摊销式截断(滞回):超过 max_turns 对但未到 6×max_turns 对 → 不截(纯追加,
+    KV-cache 逐轮命中);到 6×max_turns 对才一次剪回 max_turns 对。
 
     旧实现每轮剪到 max_turns 对,序列头部每轮都动 → mlx 缓存每轮重锚(实测
-    +1.3s/轮),截断反而比不截慢。
+    +1.3s/轮),截断反而比不截慢。F4(2026-09-28)触发点由 2×→4× 抬到 6×:
+    重锚频率减半(历史截断整段重锚实测 5-9s/次、占 6.6% 轮次)。
     """
     from agent_runtime.providers.livekit_plugins import _truncate_chat_items
 
@@ -210,16 +211,16 @@ def test_truncate_chat_items_amortized_hysteresis():
             items.append(msg("assistant", f"回复{i}"))
         return items
 
-    # 6 对:超过 max_turns(4) 但未到 2×max_turns(8) → 原样返回(不截)
-    items6 = build(6)
-    assert _truncate_chat_items(items6, max_turns=4) is items6
+    # 9 对:超过 max_turns(4) 但未到 6×max_turns(12) → 原样返回(不截)
+    items9 = build(9)
+    assert _truncate_chat_items(items9, max_turns=4) is items9
 
-    # 9 对:到 2×max_turns 对 → 剪回 max_turns 对(8 条)
-    out = _truncate_chat_items(build(9), max_turns=4)
+    # 13 对:超过 6×max_turns 对 → 剪回 max_turns 对(8 条)
+    out = _truncate_chat_items(build(13), max_turns=4)
     roles = [getattr(m, "role", "") for m in out]
     assert roles[0] == "system"
     assert roles[1:] == ["user", "assistant"] * 4
-    assert out[-1].content == ["回复8"]
+    assert out[-1].content == ["回复12"]
 
 
 def test_preflight_throttled_by_prefix_growth(monkeypatch):
@@ -312,9 +313,14 @@ def test_minimax_overlap_flushes_cjk_fragment(monkeypatch):
 
     旧 _flushable 用裸 isalpha()/isdigit() 拦尾——CJK 汉字 isalpha()==True,
     中文片段全被拦,MINIMAX_TTS_OVERLAP 对中文流量全死。
+
+    W8(2026-09-24)起首送另有快车道(≥6 字即送,test_tts_first_clause.py 钉);
+    本测试钉 **overlap 旧档语义** → 显式关掉快车道,否则首送在 7 字就发生、
+    12 字门槛断言面被吃掉。
     """
     import json
 
+    monkeypatch.setenv("BOK_TTS_FIRST_CLAUSE", "0")
     sent: list[dict] = []
     recv_count = {"n": 0}
 

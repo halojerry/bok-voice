@@ -209,6 +209,10 @@ def qa_status_json(base_url: str) -> dict:
                 # F1(2026-09-20)信息位:逐语言音色来源(旧版脚本无此键=缺省空表)。
                 if "voice_source" in parsed:
                     out["voice_source"] = parsed["voice_source"]
+                # F11(2026-09-23)信息位:逐语言有效 TTS provider(非 minimax 族=
+                # 运行时无罐头缓存链,状态面读数只是 MiniMax 键位视角)。
+                if "tts_provider" in parsed:
+                    out["tts_provider"] = parsed["tts_provider"]
                 return out
     return {"available": False}
 
@@ -228,9 +232,12 @@ def qa_canned_status(base_url: str, *, force: bool = False) -> dict:
             "generated_at": int(_time.time()),
             # F1(2026-09-20)信息位:旧脚本无键=空表(端点侧再兜一次)。
             "voice_source": dict(data.get("voice_source") or {}),
+            # F11(2026-09-23)信息位:逐语言有效 TTS provider(同上,端点透传)。
+            "tts_provider": dict(data.get("tts_provider") or {}),
         }
     except Exception:  # noqa: BLE001 - 状态面永不炸端点
-        out = {"available": False, "statuses": {}, "generated_at": int(_time.time()), "voice_source": {}}
+        out = {"available": False, "statuses": {}, "generated_at": int(_time.time()),
+               "voice_source": {}, "tts_provider": {}}
     globals()["_status_cache"] = (now, out)
     return out
 
@@ -304,6 +311,10 @@ def branch_status_json(base_url: str, account_id: str = "") -> dict:
                 # F1(2026-09-20)信息位:逐语言音色来源(旧版脚本无此键=缺省空表)。
                 if "voice_source" in parsed:
                     out["voice_source"] = parsed["voice_source"]
+                # F11(2026-09-23)信息位:逐语言有效 TTS provider(非 minimax 族=
+                # 运行时无罐头缓存链,状态面读数只是 MiniMax 键位视角)。
+                if "tts_provider" in parsed:
+                    out["tts_provider"] = parsed["tts_provider"]
                 return out
     return {"available": False}
 
@@ -326,9 +337,12 @@ def branch_canned_status(base_url: str, *, account_id: str = "", force: bool = F
             "generated_at": int(_time.time()),
             # F1(2026-09-20)信息位:旧脚本无键=空表(端点侧再兜一次)。
             "voice_source": dict(data.get("voice_source") or {}),
+            # F11(2026-09-23)信息位:逐语言有效 TTS provider(同上,端点透传)。
+            "tts_provider": dict(data.get("tts_provider") or {}),
         }
     except Exception:  # noqa: BLE001 - 状态面永不炸端点
-        out = {"available": False, "statuses": {}, "generated_at": int(_time.time()), "voice_source": {}}
+        out = {"available": False, "statuses": {}, "generated_at": int(_time.time()),
+               "voice_source": {}, "tts_provider": {}}
     _branch_status_cache[key] = (now, out)
     return out
 

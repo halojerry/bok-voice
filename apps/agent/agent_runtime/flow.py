@@ -549,8 +549,22 @@ _REFUSE_SOFT_GUARD_RE = re.compile(
     r"|(?:唔使喇|唔使啦).{0,12}(?:唔方便|唔得闲|唔得閒)|(?:唔方便|唔得闲|唔得閒).{0,12}(?:唔使喇|唔使啦)"
 )
 # 没听清/要求重复(2026-09-09):「听唔清」「再说一次」「你说什么」→ REPEAT——客户要求
-# 嘅复述照讲(单号/数字逐位),唔算复读违例。只认【短句】(≤12 字):长句里出现
-# 「乜嘢」多半係内容提问(「乜嘢意思?」),照走 QUESTION。
+# 嘅复述照讲(单号/数字逐位),唔算复读违例。
+#
+# 两族合体(2026-09-28 EX-2 拆分):_REPEAT_RE 保留【短句专用】的兜底族——「乜嘢」
+# 「咩」「what」这类模糊词只喺 ≤12 字短句才算没听清(「乜嘢意思?」16 字长句係内容
+# 提问,照走 QUESTION),故 _REPEAT_RE 里带 ^what/^乜嘢/^咩 的整句锚。
+# _REPEAT_EXPLICIT_RE 只装【显式要求重复/没听清】的短语——「冇聽清」「再講一次」
+# 「repeat」「didn't hear」这类出现即明说,与句长无关:16 字「唔好意思頭先冇聽清,
+# 你講多次」实测被旧 ≤12 闸误杀成 QUESTION(probe 20 轮实证),必须无锚、不看长度。
+# 判据序见 rule_verdict:显式族命中恒 REPEAT → 其余再按 ≤12 闸走 _REPEAT_RE。
+_REPEAT_EXPLICIT_RE = re.compile(
+    r"(听唔清|聽唔清|听不清|聽不清|冇聽清|冇听清|没听清|聽唔到|听唔到|听不到|听不见|聽唔見|"
+    r"再说一次|再說一次|再讲一次|再講一次|再说一遍|再講一遍|再讲一遍|讲多次|講多次|再讲啦|再講啦|"
+    r"乜嘢话|乜嘢啊|咩话|咩話|你说什么|你說什麼|你讲乜|你講乜|大声啲|大聲啲|"
+    r"repeat|pardon|say again|come again|didn'?t hear|can'?t hear)",
+    re.IGNORECASE,
+)
 _REPEAT_RE = re.compile(
     r"(听唔清|聽唔清|听不清|聽不清|冇聽清|冇听清|没听清|聽唔到|听唔到|听不到|听不见|聽唔見|"
     r"再说一次|再說一次|再讲一次|再講一次|再说一遍|再講一遍|再讲一遍|讲多次|講多次|再讲啦|再講啦|"
@@ -612,7 +626,7 @@ def _matches_known_fact(user_text: str, facts: dict | None) -> bool:
 
 # ---- WhatsApp 对接触发侦测 ----
 # 客户喺通话俾出 WhatsApp(读出号码 / 应承加专员)→ 上报 control-plane → 操作台爆闪横幅。
-_WHATSAPP_STEP_HINTS = ("whatsapp", "微信", "wechat", "加專員", "加我哋", "工作人員", "聯絡方式", "联系方式", "帳號", "账号", "加你", "加我", "contact")
+_WHATSAPP_STEP_HINTS = ("whatsapp", "微信", "wechat", "加專員", "加我哋", "工作人員", "聯絡方式", "联系方式", "帳號", "账号", "截圖", "截图", "加你", "加我", "contact")
 # 冇 WhatsApp / 唔想加 → 唔触发 offered（粤/普/英三语收齐，zh/en 模板照用）
 _WHATSAPP_DECLINE = re.compile(r"(冇whatsapp|冇用whatsapp|無whatsapp|唔用whatsapp|冇微信|無微信|唔用微信|"
     r"没微信|没有微信|不用微信|不加微信|没whatsapp|没有whatsapp|不用whatsapp|"
@@ -870,7 +884,10 @@ def should_auto_advance(*, current: int, goal: str, ref: str, user_text: str, ve
     # 客戶已俾號碼(captured)或話 WhatsApp 綁定來電
     # (captured_implicit) → 一定推(去下一步承接);offered(應承加但未俾號)→ 唔推,
     # 留喺本步等號碼。淨係答到平台 → 停留。
-    wa_step = any(h in low_ctx for h in ("whatsapp", "wechat", "微信", "帳號", "账号", "截圖", "截图", "加專員", "加你", "聯絡方式", "联系方式", "contact"))
+    # 2026-09-26 call-ec075023:收口到 _looks_like_whatsapp_step 单源(此处旧有
+    # 内联第二份词表,与共享词表漂移——「微信小店」注意行同样把平台步判成收号
+    # 步,规则级 CONFIRM 推进被同一根因永锁;正稿-only 判定见该函数文档)。
+    wa_step = _looks_like_whatsapp_step(goal, ref)
     if wa_step and wa in ("captured", "captured_implicit"):
         return True
     if wa_step:
@@ -897,12 +914,39 @@ def stall_ladder_level(streak: int) -> str:
     if streak >= STALL_DEGRADE_N:
         return "degrade"
     return ""
+
+
+def ladder_should_fire(fired: set[str], level: str) -> bool:
+    """同级不连发门（P2.b，2026-09-29 v2 spec §5）：本步已发射过的级别不再发。
+
+    旧「发射后顶 streak 到下一级门槛-1」数值魔术有洞——degrade 发射后
+    streak=4 仍判 degrade → 同级再发（call-ed6aa9b8 17:30:37/17:30:46 两发
+    同句实证）。显式账本替数值：fired=本步已发射级别集合（advance/jump 清空，
+    换步同级别可再发）。close 级不走本门（enter_closing 幂等+块外 closing 拦）。"""
+    return level not in fired
+
+
+def unclear_should_advance(streak: int, threshold: int) -> bool:
+    """unclear 连续推进门（P3.1，2026-09-29 v2 spec §6）：连续 unclear 达阈值。
+
+    产品语义（Ethan 拍板「意图不明确的时候就一步一步往下走」）：judge 连续
+    N 轮判 unclear → 走 rule=auto 同构管线推一步。纯数值判定；边界门（非最后
+    一步/closing/done/WA 收号）在 agent 消费点组合。"""
+    return streak >= max(1, int(threshold))
 # 已知资料键:若号码 run 命中佢哋 → 唔当新 WhatsApp(覆述单号/电话)
 _KNOWN_NUM_KEYS = ("快递单号", "快递单號", "快递尾号", "電話", "电话", "電話號碼")
 
 
 def _looks_like_whatsapp_step(goal: str, ref: str) -> bool:
-    ctx = f"{goal} {ref}".lower()
+    """收号步侦测：只看 goal + 正稿(首段台词)，分支/注意行不算。
+
+    2026-09-26 call-ec075023 实证：旧版对整个 ref 做子串全量匹配——平台步注意行
+    「客户喺第啲平台買（小紅書、微信小店等）」含「微信」→ 平台步被判收号步 →
+    wa_confirm_advance_allowed 永锁 CONFIRM 推进 + QA wa_step_locked 旁路，客户
+    答平台整通死锁在 step3。收号步的索取语义必在正稿（「留個{聯絡方式}號碼」），
+    分支/注意行只是提及渠道名，不再误判。"""
+    main = parse_step_ref(ref).script
+    ctx = f"{goal} {main}".lower()
     return any(h.lower() in ctx for h in _WHATSAPP_STEP_HINTS)
 
 
@@ -1103,6 +1147,96 @@ def extract_call_facts(user_text: str, *, facts: dict | None = None) -> list[str
     return out
 
 
+# ---- 前提推翻更正 lane(D2,2026-09-30 多轮上下文计划 Phase 2) ----
+# 病灶:「唔係拼多多,係淘宝」旧路取 _PLATFORM_RE 首个位置匹配=沉淀**被否定的
+# 平台**(主动下毒);facts FIFO 纯 append 无槽位覆盖,新旧矛盾事实并排每轮喂
+# 模型。确定性正则识别更正对(A-CC 2512.00332:散文历史输给用户新断言,唯一
+# 可靠解=结构化槽位权威+确定性写入,零 LLM 仲裁)。
+_FACT_DENY_RE = re.compile(r"唔係|唔系|不是|不对|错咗|错了|毋係")
+# 肯定尾:紧邻提及前的 係/是/系,负向后顾排除否认词自身的字(「唔係」的係
+# 唔算肯定——否则「唔係淘宝」会被误判成更正)。
+_FACT_AFFIRM_TAIL_RE = re.compile(r"(?<![唔不毋])(?:係|是|系)\s*[，,。！! ]*\s*$")
+_FACT_SWAP_RE = re.compile(r"(?:改成|換成|换成|改为|改爲|换做|改用)")
+_FACT_MAYBE_RE = re.compile(r"可能|大概|或者|或许|不确定|唔确定")
+
+
+def _platform_correction(t: str) -> tuple[str | None, str]:
+    """识别平台更正:返回 (被顶替的旧平台|None, 新平台)。纯函数。
+
+    三种形态(全确定性,无 LLM):
+    - 双提及 + 否认头:「唔係拼多多,係淘宝」→(拼多多,淘宝);
+      「拼多多唔係,係淘宝」→ 两提及间含否认+肯定连接词 → 同判;
+    - 单提及 + 改换动词:「改成淘宝」→(None,淘宝)——旧值未知,顶替一切平台事实;
+    - 单提及 + 否认 + 紧邻肯定:「唔係咩,係淘宝」→(None,淘宝)。
+    排除:不确定语气(可能/大概/...)照旧按普通提及沉淀;纯否认无肯定
+    (「唔係淘宝」)=异议非更正,唔沉淀任何东西(治旧路毒化);双提及但
+    中间无肯定连接(「係淘宝,唔係拼多多」语序含混)唔判更正,走旧路。
+    """
+    ms = list(_PLATFORM_RE.finditer(t))
+    if len(ms) >= 2:
+        between = t[ms[0].end(): ms[1].start()]
+        head = t[: ms[0].start()]
+        denied = bool(_FACT_DENY_RE.search(head)) or bool(_FACT_DENY_RE.search(between))
+        affirmed = bool(_FACT_AFFIRM_TAIL_RE.search(head)) or bool(
+            _FACT_AFFIRM_TAIL_RE.search(between)
+        )
+        if denied and affirmed:
+            return (ms[0].group(1), ms[1].group(1))
+        return ("", "")  # 双提及但语序含混/无肯定连接 → 旧路首位置匹配
+    if len(ms) == 1:
+        plat = ms[0].group(1)
+        head = t[: ms[0].start()]
+        if _FACT_MAYBE_RE.search(head):
+            return ("", "")  # 不确定语气 → 旧路普通沉淀
+        if _FACT_SWAP_RE.search(head) or (
+            _FACT_DENY_RE.search(head) and _FACT_AFFIRM_TAIL_RE.search(head)
+        ):
+            return (None, plat)
+        if _FACT_DENY_RE.search(head):
+            # 纯否认(「唔係淘宝」):异议非更正——不沉淀(治旧路首位置匹配毒化)
+            return ("SKIP", "")
+    return ("", "")
+
+
+def extract_fact_updates(
+    user_text: str, *, facts: dict | None = None, enabled: bool = True
+) -> list[tuple[str, str | None]]:
+    """更正感知的事实抽取:返回 [(沉淀文本, 被顶替needle|None)]。
+
+    - 非更正轮:与 extract_call_facts 逐字节同产出(needle 全 None);
+    - 更正轮:沉淀「客户更正:在X买(此前讲过Y,以X为准)」+ needle 顶替旧
+      平台事实;同轮号码照常追加(号码不走 supersede——WA 号码权威通道是
+      set_whatsapp_note 覆盖语义,facts 号码 bullet 仅信息性);
+    - 纯否认轮:[] (不沉淀)。
+    enabled=False(BOK_FACT_CORRECTION=0)=旧 append-only 行为。"""
+    t = (user_text or "").strip()
+    if not enabled or not t:
+        return [(f, None) for f in extract_call_facts(user_text, facts=facts)]
+    old, new = _platform_correction(t)
+    if old == "SKIP":
+        return []
+    if new:
+        out: list[tuple[str, str | None]] = []
+        if old:
+            out.append(
+                (
+                    f"客户更正：在{new}买（此前讲过{old}，以{new}为准）",
+                    f"客户讲过在{old}买",
+                )
+            )
+        else:
+            out.append((f"客户更正：在{new}买（以此为准）", "客户讲过在"))
+        # 同轮号码照常追加(号码不走 supersede——WA 号码权威通道是
+        # set_whatsapp_note 覆盖语义,facts 号码 bullet 仅信息性)
+        norm = _digit_normalize(t)
+        for run in _valid_digit_runs(norm):
+            if _run_is_known_number(run, facts):
+                continue
+            out.append((f"客户报过号码:{digits_to_cantonese(run)}", None))
+        return out
+    return [(f, None) for f in extract_call_facts(user_text, facts=facts)]
+
+
 def _short_pure_ack(text: str) -> bool:
     """归一化(去标点空白)后 ≤2 字的纯应承(「好」「係啊」「嗯」「ok」)。
 
@@ -1136,9 +1270,12 @@ def decide_advance(user_text: str, *, facts: dict | None = None, short_ack_confi
     # 2) 明确否认/不是本人 → objection(优先于确认词,避免"不是,是我…"误判)
     if _DENY_RE.search(t):
         return OBJECTION
-    # 2.5) 没听清/要求重复(短句) → REPEAT:停留,上一句关键内容照再讲一遍。
+    # 2.5) 没听清/要求重复 → REPEAT:停留,上一句关键内容照再讲一遍。
     # 先于 question/confirm:「你说什么?」主体係要求重复,唔係内容提问。
-    if len(t) <= 12 and _REPEAT_RE.search(t):
+    # 两族分治(2026-09-28 EX-2):显式族(_REPEAT_EXPLICIT_RE)出现即命中、不看句长
+    # ——16 字「唔好意思頭先冇聽清,你講多次」实测被 ≤12 闸误杀;模糊族(乜嘢/咩/what)
+    # 保留 ≤12 闸,长句里嘅「乜嘢意思」照走 QUESTION(内容提问)。
+    if _REPEAT_EXPLICIT_RE.search(t) or (len(t) <= 12 and _REPEAT_RE.search(t)):
         return REPEAT
     is_question = bool(_QUESTION_RE.search(t))
     strong_affirm = bool(_STRONG_AFFIRM_RE.search(t))
@@ -1198,6 +1335,78 @@ _SHARED_RESPONSE_RULES = (
     "已经讲过的档位数字，也不得在无关轮次复述。"
 )
 
+# 步骤纪律（2026-09-28 prompt 手术②）：原挂在 current_step_text() 尾部、每轮
+# 逐字复读 ~180 字符——无条件文本逐轮重 prefill 纯属浪费（同 S5「重复控制」
+# 上移前缀的先例）。上移 render_instruction_prefix() 稳定前缀后整场 KV 命中
+# 零成本。措辞仅一处微调：「上面的应对」→「本步给到的应对」（脱离尾部局部
+# 语境）；语义与原尾部版逐字等价。每全量轮省 ~130 token ≈ 0.17s prefill。
+STEP_DISCIPLINE_RULE = (
+    "只围绕当前这一步回应，说清楚就停下等客户，不要替客户答或自行跳到下一步；"
+    "客户问什么，先用一句话直接答他问的事（用手上的资料和本步给到的应对，不照念底稿），"
+    "再把话题带回当前步。"
+    "不要索取电话/WhatsApp/微信等联系方式，除非当前步参考明确要求"
+    "（如向客户索取其 WhatsApp/微信号码，由专员添加）；"
+    "核实资料用选项式引导（「您是在拼多多、淘宝还是京东买的？」），客户答到关键资料就确认并自然过渡，不无限追问。"
+)
+
+# F1 两段化（2026-09-28 尾部手术③）：current_step_text() 输出按块首拆两段——
+# 稳定段=步身份（步骤头/开场已念/通知已念/新一步/跳转进入/目标/底稿/注意/
+# 身份后备/禁讲清单），每步只进首条消息的尾部；增量段=每轮变的 verdict 指引/
+# 数字核对/命中分支，每轮都发。分类=pure 数据契约（块首前缀），无正则无 LLM。
+# 改本表须与 current_step_text() 的 append 顺序同步（tests/test_flow_controller）。
+_STEP_STABLE_HEADS = (
+    "流程第 ",
+    "【开场已念】",
+    "【通知已念】",
+    "【新一步】",
+    "【跳转进入】",
+    "这一步要达成:",
+    "本步底稿(",
+    "注意:",
+    "【核对/引导资料后备",
+    "【禁讲清单】",
+)
+_STEP_DELTA_HEADS = (
+    "【客户没听清",
+    "【客户在提问】",
+    "【客户回应不明确】",
+    "【客户有疑虑】",
+    "【客户报了数字（",
+    "【应对客户当前回应】",
+)
+
+
+def split_step_text(text: str) -> tuple[str, str]:
+    """把 current_step_text() 拆成 (稳定段, 每轮增量段)（F1）。
+
+    稳定段=步身份/底稿/注意/身份后备，每步只发一次（首条消息）；增量段=
+    verdict 指引/数字/命中分支，每轮都发。行首分类状态机：命中块首切换归属，
+    未命中的续行（多行 goal/底稿/分支）归当前归属。整段无任何已知块首
+    （收尾话术/测试任意串）→整段视为稳定段（revision 随文本变化，旧语义保留）。
+    """
+    if not text:
+        return "", ""
+    stable_lines: list[str] = []
+    delta_lines: list[str] = []
+    kind = "stable"
+    for line in text.split("\n"):
+        if line.startswith(_STEP_DELTA_HEADS):
+            kind = "delta"
+        elif line.startswith(_STEP_STABLE_HEADS):
+            kind = "stable"
+        (delta_lines if kind == "delta" else stable_lines).append(line)
+    return "\n".join(stable_lines), "\n".join(delta_lines)
+
+
+def stable_step_key(stable_text: str) -> str:
+    """稳定段身份键（F1）：真步文本取「流程第 N/M 步」首行（步内恒定，底稿/
+    【新一步】等首轮块退出后键不变→revision 不虚增）；无步骤头的任意文本
+    （收尾/测试串）取整段——文本一变即视为换步，旧 revision 语义保留。"""
+    lines = stable_text.strip().splitlines()
+    if lines and lines[0].startswith("流程第 "):
+        return lines[0].strip()
+    return stable_text
+
 
 @dataclass
 class FlowController:
@@ -1234,6 +1443,13 @@ class FlowController:
     # stall 升级账本(漏斗 v2,spec §3.1):同 step 连续 UNCLEAR 数;按 (step, turn_key)
     # 去重——rule 与 background judge 双路报同一轮只计 1。
     step_streak: dict[int, int] = field(default_factory=dict)
+    # 同级不连发账本(P2.b,2026-09-29 v2 spec §5):本步已发射过的阶梯级别。
+    # advance/jump_to 清空(换步新账);close 不入账(enter_closing 幂等)。
+    ladder_fired: set[str] = field(default_factory=set)
+    # unclear 连续推进账本(P3.1,2026-09-29 v2 spec §6):同 step 连续 judge
+    # unclear 轮数。实答轮 -1 抵销(relieve_unclear_streak,挂 relieve_stall_streak
+    # 同点);advance/jump_to 清零(换步新账)。
+    unclear_streak: dict[int, int] = field(default_factory=dict)
     # 话术图(2026-09-18 Phase 2):意图节点+绑定边;空图=零变化。from_template
     # 宽容解析 template["graph_json"](坏 JSON/坏版本→空图,spec §3 校验双轨)。
     graph: FlowGraphDoc = field(default_factory=FlowGraphDoc)
@@ -1348,6 +1564,10 @@ class FlowController:
         # 步切换 → 清旧步 stall 计数(漏斗 v2,spec §3.1):推进本身就係「唔卡」的证明。
         # 首行执行(守卫之前):冇流程的控制器也照清,账本语义与流程解耦。
         self.step_streak.pop(self.current, None)
+        # P2.b（2026-09-29 v2 §5）：换步=新账——ladder_fired 清空（同级在新步可再发）。
+        # P3.1：unclear 推进账同点清零（新步新账）。
+        self.ladder_fired.clear()
+        self.unclear_streak.clear()
         if not self.has_steps or self.done:
             return
         if self.current < len(self.steps):
@@ -1372,6 +1592,9 @@ class FlowController:
         self.current = target
         self._just_advanced = True
         self._entered_by_jump = True
+        # P2.b：跳转=换步，ladder_fired 同步清空（镜像 advance）；P3.1 unclear 同点。
+        self.ladder_fired.clear()
+        self.unclear_streak.clear()
         # 前向跳:起点步之后、目标步之前的全部被跳过(1-based);后退跳无「被跳过」
         # 语义(嗰啲步客户早已听过),留空走「回到本步」措辞。
         self._jump_skipped = list(range(before + 2, target + 1)) if target > before else []
@@ -1434,6 +1657,44 @@ class FlowController:
         n = self.step_streak.get(step, 0) + 1
         self.step_streak[step] = n
         return n
+
+    def relieve_stall_streak(self) -> None:
+        """实答轮抵销当前步 stall 计数(2026-09-28 多轮卡死实证)。
+
+        漏斗 v2 streak 语义「同步连续 UNCLEAR」有个盲区:QA 快路/LLM 实答轮
+        的判决同样是 UNCLEAR/QUESTION(QUESTION 是刻意中性——2026-09-18
+        off-detail 实弹不能抹平 judge 攒的 streak),而实答交付不经过任何
+        verdict 路径——健康问答(客户连续提问、AI 连续作答)会静默攒 streak
+        到 3,下一轮降级问法顶替真答案(call-bbf700a4/call-2d9b35e9 实证:
+        客户问「件到哪」被回「答个是或不是」,degrade 连发两轮,再落 bypass)。
+        实答交付时 -1 抵销:全答链恒 0-1 永不触发阶梯;真死火(连续无出口轮)
+        照常爬升;judge 高置信 degrade_question 的 degrade_boost 仍是显式
+        逃生门。步切换照旧由 advance()/jump_to() 清零。
+        """
+        cur = self.step_streak.get(self.current, 0)
+        if cur > 0:
+            self.step_streak[self.current] = cur - 1
+
+    def bump_unclear_streak(self) -> int:
+        """judge unclear 消费点 bump（P3.1，2026-09-29 v2 spec §6）。
+
+        返回当前步新值（消费点直接喂 unclear_should_advance）。"""
+        n = self.unclear_streak.get(self.current, 0) + 1
+        self.unclear_streak[self.current] = n
+        return n
+
+    def unclear_at(self, step: int) -> int:
+        """当前步 unclear 连续数（缺省 0）。"""
+        return self.unclear_streak.get(step, 0)
+
+    def relieve_unclear_streak(self) -> None:
+        """实答轮抵销 unclear 计数（挂 relieve_stall_streak 同点，0 下限）。
+
+        健康问答链（客户提问-AI 实答）不攒推进账——只有真死火轮连续 unclear
+        才推。"""
+        cur = self.unclear_streak.get(self.current, 0)
+        if cur > 0:
+            self.unclear_streak[self.current] = cur - 1
 
     def apply_judge_verdict(self, verdict: str) -> None:
         """LLM 语义判定结果落状态(advance→推进;其它唔郁)。"""
@@ -1643,14 +1904,8 @@ class FlowController:
                 )
         for _n in parts.notes[:2]:
             lines.append("注意:" + render_template_text(_n, self.vars_map))
-        lines.append(
-            "只围绕当前这一步回应，说清楚就停下等客户，不要替客户答或自行跳到下一步；"
-            "客户问什么，先用一句话直接答他问的事（用手上的资料和上面的应对，不照念底稿），"
-            "再把话题带回当前步。"
-            "不要索取电话/WhatsApp/微信等联系方式，除非当前步参考明确要求"
-            "（如向客户索取其 WhatsApp/微信号码，由专员添加）；"
-            "核实资料用选项式引导（「您是在拼多多、淘宝还是京东买的？」），客户答到关键资料就确认并自然过渡，不无限追问。"
-        )
+        # 步骤纪律已上移稳定前缀（2026-09-28 手术②，STEP_DISCIPLINE_RULE）——
+        # 此处不再逐轮复读；「只围绕当前这一步」约束仍由前缀无条件生效。
         if _is_identity_verification_step(step.goal, step.ref):
             lines.append(
                 "【核对/引导资料后备（内部指示，不要读出来）】全程你自己与客户沟通，"

@@ -30,6 +30,10 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     "tests/test_control_plane.py": None,
     "apps/agent/agent_runtime/web_search.py": re.compile(r"zh-yue"),
     "tests/test_web_search.py": re.compile(r"zh-yue"),
+    # whisper 语言码外部枚举（OpenAI/whisper 粤语=language "yue"，与 zh/en
+    # 同族 API 真字面量）——asr_whisper_bench.py 是 bench 脚本，yue 只出现在
+    # 语言码映射/转写调用/报告行，语言字段本身仍一律 cantonese。
+    "scripts/asr_whisper_bench.py": re.compile(r"yue"),
     # MiniMax language_boost 外部枚举(API 真字面量,粤=普+粤标记);只豁免带该
     # 枚举值的行,语言字段本身仍一律 cantonese。A 线 agent.py 同源注入
     # (per-call 固定语言,B 线 interpret 同值)。
@@ -38,9 +42,41 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     "scripts/acceptance_0913_scenarios.py": re.compile(r"Chinese,Yue"),
     "scripts/mm_voice.py": re.compile(r"Chinese,Yue"),
     "apps/agent/agent_runtime/agent.py": re.compile(r"Chinese,Yue"),
+    # 5a(2026-09-30) AB 首 chunk 三臂样本脚本入库——同 MM language_boost 外部字面量。
+    "scripts/ab_tts_first_chunk.py": re.compile(r"Chinese,Yue"),
+    "scripts/bench_minimax_bidi.py": re.compile(r"Chinese,Yue"),
     "tests/test_interpret_tts_provider.py": re.compile(r"Chinese,Yue"),
     "tests/test_fixed_language_call.py": re.compile(r"Chinese,Yue"),
+    # P1(2026-10-01) SV-CPU 引擎车道:SenseVoice 外部语言枚举(yue,与 zh/en 同族
+    # sherpa API 真字面量)+ HF repo id(zh-en-ja-ko-yue=仓库名 opaque 标识)。
+    # 语言字段本身(session/通话级)仍一律小写 cantonese——_sv_lang_label 即收口
+    # 单点(外部枚举→内部规范值的边界映射)。
+    "services/qwen3-asr-sidecar/app.py": re.compile(r"yue"),
+    "scripts/eval_sensevoice.py": re.compile(r"yue"),
+    "tools/bok.py": re.compile(r"zh-en-ja-ko-yue"),
+    "tests/test_asr_engine_routing.py": re.compile(r"yue"),
     "scripts/test_volcano_v3.py": None,
+    # CSC 管线(2026-10-02 入库):yue 只作**车道标识**(LANE_YUE 常量收口单点,
+    # 值="yue")与特征字计量(yue_markers_lost)——语言字段一律 cantonese
+    # (lang 归一边界映射 in ("cantonese","yue","zh-yue") 同 whisper 先例)。
+    # prepare_csc_data.py 车道语义密度最高(yue_pool/id_yue/yue_marker_pool/
+    # 车道语义注释 60+ 处),token 枚举不成句——按 qwen3-asr-sidecar 先例整
+    # 文件豁免;其余文件按 token 族窄匹配,裸 language="yue" 赋值不含这些
+    # token 仍会被拦。
+    "scripts/prepare_csc_data.py": re.compile(r"yue", re.IGNORECASE),
+    "scripts/eval_csc_model.py": re.compile(r"yue_marker|yue_loss|yue_markers|\"yue\", \"zh-yue\"", re.IGNORECASE),
+    "scripts/predict_csc_model.py": re.compile(r"yue_marker_loss", re.IGNORECASE),
+    "tests/test_csc_data.py": re.compile(
+        r"_ITEM_YUE|yue_marker|EMBEDDED_SEED_YUE|yue_ratio|yue_id\b|\"yue\"|test_yue_|yue identity|yue 句|yue-keep",
+        re.IGNORECASE,
+    ),
+    "tests/test_probe_stimulus_tools.py": re.compile(r"LANE_YUE|\"yue\"", re.IGNORECASE),
+    "services/csc-sidecar/app.py": re.compile(
+        r"YUE_MARKERS|yue_markers|cantonese_markers", re.IGNORECASE
+    ),
+    "services/csc-sidecar/selftest.py": re.compile(
+        r"yue =|\"text\": yue|== yue|YUE_MARKERS|yue_markers|cantonese_markers", re.IGNORECASE
+    ),
     # 计划文档里的粤语文本检测示例代码（_YUE_MARKS 正则只是「识别粤语字」的
     # 变量名，非语言字段赋值）——4b0dd6b 存量，按门禁政策文档白名单收口。
     "docs/superpowers/plans/2026-09-17-qa-canvas-phase1.md": re.compile(r"_YUE_MARKS"),
@@ -60,6 +96,12 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     # 决策记录非运行时语言字段——按行豁免，新文件仍全禁。
     "docs/superpowers/plans/2026-09-17-campaign-scheduling-dashboard.md": re.compile(r"yue"),
     "scripts/probe_smart_turn.py": re.compile(r"yue"),
+    # 2026-09-26 复核轮入库的文档：S2S_ROADMAP 增补引 MiniMax ASR BCP-47 `yue`
+    # 外部枚举与 FLEURS 多语数据集位、2026-09-24 计划引 CantoNLU zh→yue 迁移
+    # 结论/LiveKit detector 语言表缺席/sherpa zh-yue-en 三语——均为「别人的接口/
+    # 数据集」类决策记录引述，非我方语言字段（政策同 zh-yue.wikipedia.org）。
+    "docs/S2S_ROADMAP.md": re.compile(r"yue"),
+    "docs/superpowers/plans/2026-09-24-a-line-flow-latency-intent.md": re.compile(r"yue"),
     # P0 真库烟测做 yue→cantonese 数据迁移演练(铺旧值行验证 build_engine 改写)，
     # 同 deps.py 类：旧拼写是演练夹具非运行时语言字段，按行豁免。
     "scripts/smoke_postgres.py": re.compile(r"yue"),

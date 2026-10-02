@@ -144,6 +144,65 @@ test("parseGraphDoc tolerant", () => {
   assert.equal(qa.parseGraphDoc(JSON.stringify(GRAPH_DOC)).intents.length, 2);
 });
 
+// ---- 画布连线（2026-09-26）：intent→step 拖线=改绑定的两枚纯函数 ----
+
+test("graphDocWithJumpBinding 替换该意图全部绑定并保留旋钮", () => {
+  const raw = JSON.stringify(GRAPH_DOC);
+  const next = qa.graphDocWithJumpBinding(raw, "int_2b3c4d5e", 2, 8);
+  assert.ok(next);
+  // 意图原样全保留
+  assert.equal(next.intents.length, 2);
+  // 该意图只剩一条 jump_step,指向第 2 步
+  const mine = next.bindings.filter((b) => b.intent === "int_2b3c4d5e");
+  assert.equal(mine.length, 1);
+  assert.equal(mine[0].action, "jump_step");
+  assert.equal(mine[0].step, 2);
+  // id/priority/once 复用旧绑定（不偷改运营旋钮）
+  assert.equal(mine[0].id, "bnd_c1d2e3f4");
+  assert.equal(mine[0].priority, 5);
+  assert.equal(mine[0].once, true);
+  // 其他意图的绑定原样（含悬空绑定不动）
+  assert.equal(next.bindings.filter((b) => b.intent === "int_1a2b3c4d").length, 1);
+  assert.equal(next.bindings.filter((b) => b.intent === "int_nope").length, 1);
+});
+
+test("graphDocWithJumpBinding 无既有绑定时生成新 id、非法输入返 null", () => {
+  // 无绑定意图的最小 doc（GRAPH_DOC 里两个意图都带绑定，另造一个干净的）
+  const bare = JSON.stringify({
+    version: 1,
+    intents: [{ id: "int_9z8y7x6w", label: "问热线", keywords: ["热线"], steps: [], enabled: true }],
+    bindings: [],
+  });
+  const fresh = qa.graphDocWithJumpBinding(bare, "int_9z8y7x6w", 1, 8);
+  assert.ok(fresh);
+  assert.equal(fresh.bindings.length, 1);
+  // 新 id 必须过 CP `_ID_RE`（bnd_+8hex；2026-09-26 实弹 b-<intent>-jump 被 400 拒）
+  assert.match(fresh.bindings[0].id, /^bnd_[0-9a-f]{8}$/);
+  assert.equal(fresh.bindings[0].priority, 10); // bindingFromDraft 缺省档
+  // 有旧绑定的意图=复用 id（GRAPH_DOC 的 int_1a2b3c4d 挂 bnd_7e8f9a0b）
+  const reuse = qa.graphDocWithJumpBinding(JSON.stringify(GRAPH_DOC), "int_1a2b3c4d", 1, 8);
+  assert.equal(reuse.bindings.find((b) => b.intent === "int_1a2b3c4d").id, "bnd_7e8f9a0b");
+  // 意图不存在 / 步号越界 / 非整数 → null
+  const raw = JSON.stringify(GRAPH_DOC);
+  assert.equal(qa.graphDocWithJumpBinding(raw, "int_ghost", 1, 8), null);
+  assert.equal(qa.graphDocWithJumpBinding(raw, "int_1a2b3c4d", 0, 8), null);
+  assert.equal(qa.graphDocWithJumpBinding(raw, "int_1a2b3c4d", 9, 8), null);
+  assert.equal(qa.graphDocWithJumpBinding(raw, "int_1a2b3c4d", NaN, 8), null);
+});
+
+test("graphDocWithoutIntentBindings 只摘该意图绑定、幂等、未知意图 null", () => {
+  const raw = JSON.stringify(GRAPH_DOC);
+  const next = qa.graphDocWithoutIntentBindings(raw, "int_1a2b3c4d");
+  assert.ok(next);
+  assert.equal(next.intents.length, 2); // 意图/关键词保留
+  assert.equal(next.bindings.some((b) => b.intent === "int_1a2b3c4d"), false);
+  assert.equal(next.bindings.length, 2); // 摘一条剩两条
+  // 幂等：再解一次原样
+  const again = qa.graphDocWithoutIntentBindings(JSON.stringify(next), "int_1a2b3c4d");
+  assert.deepEqual(again, next);
+  assert.equal(qa.graphDocWithoutIntentBindings(raw, "int_ghost"), null);
+});
+
 test("deriveGraph intent nodes anchored to scope step", () => {
   const steps = qa.parseTemplateSteps(JSON.stringify([{ goal: "g1", ref: "r1" }, { goal: "g2", ref: "r2" }, { goal: "g3", ref: "r3" }]));
   const graph = qa.deriveGraph([], steps, { graph: qa.parseGraphDoc(JSON.stringify(GRAPH_DOC)) });

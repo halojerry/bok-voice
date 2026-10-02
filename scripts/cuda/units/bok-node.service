@@ -1,0 +1,29 @@
+# Bok CUDA 部署包 —— bok 节点守护（心跳/注册；:3000 UI 仅全栈模式）
+# 由 scripts/cuda/bootstrap.sh 渲染（替换 __BOK_CUDA_HOME__ 占位），操作员 root 装载。
+# 照 tools/bok.py 的 Linux 节点姿势（docs/RUNTIME_TOPOLOGY.md「Ubuntu 节点形态」）：
+# node_agent = 薄节点守护，注册 + 心跳 + commands 通道；凭据只从
+# /etc/bok-cuda/bok-cuda.env 进包装脚本（零密钥字面量进单元文件）。
+#
+# ⚠ Restart=on-failure 不是笔误（与仓内 tools/systemd_units.py 同一条铁律）：
+# node_agent 的授权吊销熔断是 exit(0)——Restart=always 会把已吊销节点每 5s 拉回，
+# 吊销即失效；on-failure 令熔断后单元保持 dead，真崩溃照样拉回。勿改。
+#
+# 缺省 --heartbeat-only（BOK_NODE_FULL_STACK=0）：本机 LLM 服务由 sglang 两个单元
+# 独立承载，节点不拉全栈。全栈模式（=1）经 cmd_up 拉起 CP/LiveKit/ASR/TTS/worker
+# 全家（⚠未实测，见 docs/CUDA-DEPLOY.md §8），需 BOK_REPO_ROOT 指向完整仓库检出。
+
+[Unit]
+Description=Bok node agent — 节点注册/心跳（CUDA 节点形态）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__BOK_CUDA_HOME__
+EnvironmentFile=/etc/bok-cuda/bok-cuda.env
+ExecStart=__BOK_CUDA_HOME__/bin/bok-node-start.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

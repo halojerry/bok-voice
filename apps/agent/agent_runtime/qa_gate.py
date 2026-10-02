@@ -5,7 +5,9 @@
 
 打分照抄知识库 InMemoryVectorStore:0.6×余弦 + 0.4×子串长度比,向量用
 HybridLexicalEmbedding(CJK 逐字+bigram 哈希,零外部依赖)。阈值默认 0.90
-宁缺毋滥;语义向量(MlxEmbedding)与步骤作用域条目放量为 v2。
+宁缺毋滥;**语义补位车道已落地(2026-09-24,W3b 解锁)= QaSemanticIndex**:
+词面 0.90 未中轮的本地 embedding 释义档(阈值 0.80,词面恒绝对优先,
+BOK_QA_SEMANTIC=0 一键回纯词面档)。
 
 命中语义(Phase 3.2,spec 2026-09-18-flow-graph-phase3 §2):同义簇
 (cluster_head_id)在装配时折组——变体命中由簇内代表出场,簇内按「本通最少
@@ -15,14 +17,48 @@ HybridLexicalEmbedding(CJK 逐字+bigram 哈希,零外部依赖)。阈值默认 
 折组/轮换池**绝不比 match 的命中面宽**(C1,2026-09-18 终审):代表与成员表
 都按本通 `lang`/`step_index` 过滤(= match 同款判据 `_survives_turn`),跨
 scope 变体唔会在异步出线、跨语言成员唔会在本语通话播——整簇滤光回裸胜者。
+
+召回排序 ``QaIndex.rank()``(2026-09-25,Laya QA 验证车道候选供给):与 0.90
+快道**完全独立**的评分面——0.60×词面余弦 + 0.25×双向子串(镜像 fillers 的
+双向姿势,治「超集句」单向缺口)+ 0.15×拼音 bigram Dice(治 ASR 同音错字,
+pypinyin 缺库/``BOK_QA_PINYIN=0`` 时通道恒 0、余两项按比例归一)。幸存面与
+折组纪律同 match;``match()`` 本体零改动。
+
+同音归一应用钩子(2026-09-25,**只挂语义召回面**):沉淀引擎把真实通话学到的
+同音对子(裴→赔)经 CP 拉取、构造注入 ``QaSemanticIndex(homophones=)``——
+``match()``/``rank()`` 的查询文本在 ``normalize_question`` 之后按对子归一再
+embed(词条素材向量不动,双方在语义空间自然接近)。词面 ``QaIndex.match``/
+``rank`` 恒不吃(0.90 快道零漂移铁律)。策略函数在
+``bok_voice_core.qa_digest_policy.apply_homophones``(并行交付):import 失败/
+调用失败一律原查询逐字节(优雅降级);``BOK_QA_HOMOPHONE=0`` 整钩子旁路,
+表空/无对子=行为逐字节同旧。
+
+每词条出场阈值(VectorQ 消费端,2026-09-25):语义补位 ``QaSemanticIndex.match``
+逐条目吃 ``hit_threshold`` 列(CP drift 反馈生产端写列,本文件只做消费端)——
+列在场且在 (0,1] 逐条生效(``_effective_thr``),缺席/坏值回全局阈值(列未写
+=行为逐字节同旧,golden adjacent 负样本零漂移);``rank()`` 召回地板不吃
+词条列(召回供给与出场阈值是两件事)。词面 ``QaIndex.match`` 恒不吃。
+
+WA 收号步 question 轮放行(2026-09-25):``qa_exclude_reason`` 的
+wa_step_locked 闸对 verdict 归一化后为 question(flow.QUESTION)且同轮无
+wa_signal 的轮放行——收号步客户提问(「可以点样赔?」)答罐头与收号不冲突;
+``BOK_QA_WA_STEP_QUESTION=0`` 回旧行为,其余闸(digits/refuse/advanced 等)
+独立判定零改动。
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 
 from bok_voice_core.embeddings import HybridLexicalEmbedding
 from bok_voice_core.qa_text import normalize_question
+
+try:  # pypinyin 纯 Python 轻依赖;缺失时 rank 拼音通道静默降级为恒 0 分
+    from pypinyin import lazy_pinyin
+except ImportError:  # pragma: no cover - 取决于安装面
+    lazy_pinyin = None  # type: ignore[assignment]
+    print("QA_PINYIN unavailable: pypinyin 未安装,召回排序拼音通道恒 0 分")
 
 # 允许走快路的 rule_verdict:确认/含糊/提问(QUESTION 仅限 FAQ 条目命中)。
 # REFUSE/OBJECTION 让位(收线/安抚需要临场生成);推进轮由调用方传 advanced 拦。
@@ -50,6 +86,52 @@ def qa_rotation_enabled() -> bool:
     return os.environ.get("BOK_QA_ROTATION", "1") == "1"
 
 
+def qa_pinyin_enabled() -> bool:
+    """召回拼音通道开关(rank 专用,2026-09-25):0=通道权重置 0,余两项按
+    0.60/0.25 比例归一;只影响召回排序,0.90 词面快道字节不变。"""
+    return os.environ.get("BOK_QA_PINYIN", "1") == "1"
+
+
+def qa_recall_k() -> int:
+    """rank 默认召回条数(BOK_QA_RECALL_K,坏值回 8,下限 1)。"""
+    try:
+        return max(1, int(os.environ.get("BOK_QA_RECALL_K", "8")))
+    except ValueError:
+        return 8
+
+
+def qa_recall_floor() -> float:
+    """rank 默认分数地板(BOK_QA_RECALL_FLOOR,坏值回 0.40,钳 [0,1])。
+
+    0.40=golden 标定拐点(scripts/qa_match_report.py floor sweep):adjacent 负样本
+    入侵 0/20 档的最大召回(0.35 档 1/20、0.55 档丢 6pt 召回)。
+    """
+    try:
+        return max(0.0, min(1.0, float(os.environ.get("BOK_QA_RECALL_FLOOR", "0.40"))))
+    except ValueError:
+        return 0.40
+
+
+def qa_semantic_enabled() -> bool:
+    """语义补位车道总闸(W3b 解锁,2026-09-24):词面 0.90 未中轮的本地 embedding 补位。"""
+    return os.environ.get("BOK_QA_SEMANTIC", "1") == "1"
+
+
+def qa_homophone_enabled() -> bool:
+    """同音归一应用钩子开关(语义召回面专用,2026-09-25):0=整个钩子旁路,
+    行为逐字节同旧。词面 0.90 快道与词面 rank 恒不吃归一(零漂移铁律)。"""
+    return os.environ.get("BOK_QA_HOMOPHONE", "1") == "1"
+
+
+def qa_semantic_threshold() -> float:
+    """释义档阈值(默认 0.80,比意图车道 0.78 高一档):快路播固定罐头答案,
+    误命中代价(答非所问的录音)高于意图跳转——宁缺毋滥。"""
+    try:
+        return max(0.0, min(1.0, float(os.environ.get("BOK_QA_SEM_THRESHOLD", "0.80"))))
+    except ValueError:
+        return 0.80
+
+
 def qa_phonetic_enabled() -> bool:
     """粤语音系补位层开关(2026-09-22):0=字面 miss 后不做音系匹配(回旧行为)。"""
     return os.environ.get("BOK_QA_PHONETIC", "1") == "1"
@@ -61,6 +143,26 @@ def qa_phonetic_threshold() -> float:
         return max(0.0, min(1.0, float(os.environ.get("BOK_QA_PHONETIC_THRESHOLD", "0.80"))))
     except ValueError:
         return 0.80
+
+
+def qa_semantic_base_url() -> str:
+    raw = os.environ.get("BOK_QA_SEM_BASE_URL", "").strip()
+    return raw or "http://127.0.0.1:8789"
+
+
+def qa_semantic_timeout_s() -> float:
+    """毫秒→秒;坏值回默认 400ms(与意图车道同预算:热路径同步等,必须小)。"""
+    try:
+        return max(0.0, float(os.environ.get("BOK_QA_SEM_TIMEOUT_MS", "400"))) / 1000.0
+    except ValueError:
+        return 0.4
+
+
+def qa_wa_step_question_enabled() -> bool:
+    """WA 收号步 question 轮放行开关(2026-09-25):默认 "1"=放行——verdict 为
+    question 且同轮无 WA 信号时跳过 wa_step_locked 闸;"0"=旧行为逐字节
+    (wa_step_locked 对 question 轮照拦)。"""
+    return os.environ.get("BOK_QA_WA_STEP_QUESTION", "1") == "1"
 
 
 def _entry_priority(entry: dict) -> int:
@@ -96,6 +198,42 @@ def _cos(a: list[float], b: list[float]) -> float:
     return num / max(1e-9, na * nb)
 
 
+# rank() 召回权重(2026-09-25):词面余弦主导,双向子串次之,拼音补同音错字。
+_W_COS = 0.60
+_W_SUB = 0.25
+_W_PINYIN = 0.15
+
+
+def _bidir_substring_hit(q_low: str, e_low: str) -> bool:
+    """双向子串命中(rank 专用):归一化后 客户话⊂词条 或 词条⊂客户话 任一向
+    即真——镜像 fillers.py 的双向姿势(单向只认 user⊂entry 会漏「超集句」)。"""
+    return bool(q_low) and bool(e_low) and (q_low in e_low or e_low in q_low)
+
+
+def _pinyin_syllables(text: str) -> list[str]:
+    """文本→无声调拼音音节表;只留 a-z 音节(lazy_pinyin 会透传标点,滤掉防
+    垃圾 bigram)。pypinyin 缺失/单条转换失败 → 空表(通道分恒 0,绝不 raise)。"""
+    if lazy_pinyin is None:
+        return []
+    try:
+        raw = lazy_pinyin(text)
+    except Exception:  # noqa: BLE001 - 单条转换失败当无拼音
+        return []
+    return [s for s in raw if s.isascii() and s.isalpha()]
+
+
+def _pinyin_bigram_score(query_syl: list[str], entry_syl: list[str]) -> float:
+    """拼音二元音节对重叠 Dice 系数 2|A∩B|/(|A|+|B|);任一侧 <2 音节 → 0。"""
+    if len(query_syl) < 2 or len(entry_syl) < 2:
+        return 0.0
+    q_big = {query_syl[i] + query_syl[i + 1] for i in range(len(query_syl) - 1)}
+    e_big = {entry_syl[i] + entry_syl[i + 1] for i in range(len(entry_syl) - 1)}
+    inter = len(q_big & e_big)
+    if not inter:
+        return 0.0
+    return 2.0 * inter / (len(q_big) + len(e_big))
+
+
 def pick_rotation_member(members: list[dict], played: list[str]) -> dict:
     """簇内轮换取员(纯函数,Phase 3.2):本通播放次数最小者先,平则插入序。
 
@@ -126,6 +264,12 @@ def qa_exclude_reason(
     抢话,任何含数字串的轮交回 LLM+flow(数字读法零降级铁律)。数字探测用
     _digit_runs_in(汉字/英文数字词归一成 ASCII 后逐 run 归一),与 WA 侦测
     同源,粤式「三七七八九零」照拦。
+
+    WA 收号步 question 放行(2026-09-25):verdict 归一化后为 question
+    (flow.QUESTION)且同轮无 wa_signal 时,wa_step_locked 闸放行——放行=允许
+    罐头快路先答提问,WA 捕获状态机零触碰(question 轮无数字串,不进捕获;
+    digits 闸仍独立拦号码轮);其余闸照走。``BOK_QA_WA_STEP_QUESTION=0`` 回
+    旧行为(该闸对 question 轮照拦)。
     """
     from .flow import _REFUSE_RE, _digit_runs_in
 
@@ -136,7 +280,11 @@ def qa_exclude_reason(
     if wa_signal:
         return "wa_signal"
     if wa_step_locked and not wa_captured:
-        return "wa_step_locked"
+        # 收号步 question 轮放行(2026-09-25):到此处 wa_signal 必为空
+        # (wa_signal 闸已先行返回),放行只豁本闸——digits/refuse/verdict 等
+        # 独立判定照走,question 轮无数字,收号状态机零触碰。
+        if str(verdict or "").lower() != "question" or not qa_wa_step_question_enabled():
+            return "wa_step_locked"
     if _digit_runs_in(user_text):
         return "digits"
     if _REFUSE_RE.search(user_text):
@@ -174,6 +322,15 @@ class QaIndex:
         self._clusters: dict[str, list[dict]] = {}
         self._cluster_of: dict[str, str] = {}
         self._build_clusters()
+        # 拼音通道预计算(rank 召回专用,2026-09-25):词条侧每词条一次,查询侧
+        # 每次现算。match() 不吃拼音(0.90 快道字节不变);缺库时表恒空=通道 0。
+        # 按条目 id 键控;rank 取不到(空 id/重复 id)时现场补算兜底。
+        self._pinyin: dict[str, list[str]] = {}
+        if lazy_pinyin is not None:
+            for e, _q, _v in self._items:
+                eid = str(e.get("id") or "")
+                if eid and eid not in self._pinyin:
+                    self._pinyin[eid] = _pinyin_syllables(str(e.get("question_text") or ""))
         # 粤语音系补位索引(2026-09-22):cantonese 条目离线展开成粤拼候选音节
         # 序列,字面 miss 后的第二段匹配用(bok_voice_core.qa_phonetic——权重
         # 与阈值有真库实测依据)。vendored trie 解析 ~160ms 是一次性 import
@@ -314,6 +471,75 @@ class QaIndex:
             return ph_entry, ph_score
         return None, top_score
 
+    def rank(
+        self,
+        query: str,
+        *,
+        k: int | None = None,
+        floor: float | None = None,
+        lang: str | None = None,
+        step_index: int | None = None,
+    ) -> list[tuple[float, str]]:
+        """召回排序(Laya QA 验证车道候选供给,2026-09-25)。
+
+        返回 (score, entry_id) 降序、≤k 条、score≥floor。评分与 match() 的
+        0.90 快道**完全独立**(match 本体零改动):
+
+          _W_COS × 词面余弦(复用 HybridLexicalEmbedding 同一套向量)
+        + _W_SUB × 双向子串(归一化后任一向命中即 1.0,双向同义)
+        + _W_PINYIN × 拼音 bigram Dice(ASR 同音错字补位;pypinyin 缺库或
+          ``BOK_QA_PINYIN=0`` 时该项置 0,余两项按 0.60/0.25 比例归一——
+          即 0.706/0.294,比例恒由权重常量推导,不另硬编码)。
+
+        幸存面与 match 同口径:``_survives_turn(lang, step_index)`` 过滤 +
+        同义簇折组——变体命中折到簇代表 team_head 出线(与 match 胜者同纪律,
+        同簇多命中只留最高分一行);``BOK_QA_ROTATION=0`` 折组关 → 独立条目。
+
+        ``k``/``floor`` 显式传入优先;缺省(None)读 ``BOK_QA_RECALL_K``/
+        ``BOK_QA_RECALL_FLOOR``(坏值回 8 / 0.40)。空查询/空索引 → []。
+        """
+        q = normalize_question(query)
+        if not q or not self._items:
+            return []
+        n = qa_recall_k() if k is None else max(1, int(k))
+        thr = qa_recall_floor() if floor is None else max(0.0, min(1.0, float(floor)))
+        use_pinyin = qa_pinyin_enabled() and lazy_pinyin is not None
+        w_cos, w_sub, w_pin = _W_COS, _W_SUB, _W_PINYIN
+        if not use_pinyin:
+            rest = _W_COS + _W_SUB
+            w_cos, w_sub, w_pin = _W_COS / rest, _W_SUB / rest, 0.0
+        qv = self._embed.embed([q])[0]
+        q_low = q.lower()
+        q_syl = _pinyin_syllables(q) if use_pinyin else []
+        # 同簇多命中只留最高分一行:按代表 dict 对象身份去重(代表可能为空 id,
+        # 对象身份在调用期内稳定且跨簇唯一)。
+        best_by_rep: dict[int, tuple[float, str]] = {}
+        for entry, _e_q, e_vec in self._items:
+            if not _survives_turn(entry, lang=lang or "", step_index=step_index):
+                continue
+            e_q_low = str(entry.get("question_text") or "")
+            e_q_low = normalize_question(e_q_low).lower()
+            score = w_cos * _cos(qv, e_vec)
+            if _bidir_substring_hit(q_low, e_q_low):
+                score += w_sub
+            if use_pinyin:
+                e_syl = self._pinyin.get(str(entry.get("id") or ""))
+                if e_syl is None:
+                    e_syl = _pinyin_syllables(e_q_low)
+                score += w_pin * _pinyin_bigram_score(q_syl, e_syl)
+            rep = entry
+            if qa_rotation_enabled():
+                head = self._team_head(entry, lang=lang or "", step_index=step_index)
+                if head is not None:
+                    rep = head
+            rid = id(rep)
+            prev = best_by_rep.get(rid)
+            if prev is None or score > prev[0]:
+                best_by_rep[rid] = (score, str(rep.get("id") or ""))
+        rows = [(s, eid) for s, eid in best_by_rep.values() if s >= thr]
+        rows.sort(key=lambda t: -t[0])  # 稳定排序:平分保持插入序(=索引序)
+        return rows[:n]
+
     def _phonetic_match(
         self,
         q: str,
@@ -378,3 +604,259 @@ class QaIndex:
             if str(entry.get("id") or "") == wanted:
                 return entry
         return None
+
+    def team_head(
+        self,
+        entry: dict,
+        *,
+        lang: str = "",
+        step_index: int | None = None,
+    ) -> dict | None:
+        """语义补位胜者的簇折组出口(公开面,2026-09-24):与词面 match 内部
+        `_team_head` 同款判据——胜者属簇且簇内有幸存成员 → 首个幸存成员代表
+        出场;无簇/整簇滤光 → None(调用方裸胜者)。"""
+        return self._team_head(entry, lang=lang, step_index=step_index)
+
+
+def _homophone_pairs(raw: list | None) -> list[tuple[str, str]]:
+    """CP 端点形状 → ``(wrong, right)`` 元组列(装配时一次归一,坏项静默丢弃)。
+
+    接受 dict 列(``{"wrong","right","support"}``;support 仅为溯源信息,此处
+    忽略)或二元组列;缺键/非字符串/空串/自反(wrong==right)/形状不明一律
+    跳过——装配面坏数据绝不炸通话。
+    """
+    pairs: list[tuple[str, str]] = []
+    for item in raw or []:
+        if isinstance(item, dict):
+            wrong, right = item.get("wrong"), item.get("right")
+        elif isinstance(item, (tuple, list)) and len(item) >= 2:
+            wrong, right = item[0], item[1]
+        else:
+            continue
+        if not isinstance(wrong, str) or not isinstance(right, str):
+            continue
+        wrong, right = wrong.strip(), right.strip()
+        if not wrong or not right or wrong == right:
+            continue
+        pairs.append((wrong, right))
+    return pairs
+
+
+def _homophone_normalize(q: str, pairs: list[tuple[str, str]]) -> str:
+    """查询侧同音归一(策略单点):``apply_homophones`` 缺失/失败 → 原查询逐字节。
+
+    策略函数在 ``bok_voice_core.qa_digest_policy``(并行交付面),**惰性 import**
+    ——包缺席是常态部署形态,import 失败=无对子行为;调用期任何异常也兜住,
+    召回面绝不因归一炸轮。
+    """
+    if not q or not pairs:
+        return q
+    try:
+        from bok_voice_core.qa_digest_policy import apply_homophones
+    except ImportError:
+        return q
+    try:
+        out = apply_homophones(q, pairs)
+    except Exception:  # noqa: BLE001 - 策略面任何失败都不许炸召回
+        return q
+    return out if isinstance(out, str) and out else q
+
+
+def _effective_thr(entry: dict, global_thr: float) -> float:
+    """词条级阈值(VectorQ,2026-09-25):hit_threshold 列在场且在 (0,1] → 用它;
+    缺席/坏值 → 全局。消费端零迁移成本:列未加/未写=行为逐字节同旧。"""
+    raw = (entry or {}).get("hit_threshold")
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return global_thr
+    return v if 0.0 < v <= 1.0 else global_thr
+
+
+class QaSemanticIndex:
+    """快答库语义补位索引(2026-09-24,W3b 解锁):词面 0.90 未中轮的释义档。
+
+    纪律镜像 W1b 意图车道(intent_semantic):
+    - 素材向量经 ``SEMANTIC_VECTOR_CACHE``(模块级 LRU,键=条目 id+问法集
+      sha256)——同目录反复外呼零重复 embed,改目录 → 哈希变 → 重算;
+    - 装配构建分块批量(64/块,块预算 5s),查询每轮至多一次 embed(~20ms);
+    - 端点缺席/连续失败 → EmbedClient 降级闩,本通惰性(快路行为=旧档);
+    - **词面档恒绝对优先**:语义只在词面 match 未中时补位(调用方职责),
+      命中条目进与词面同款的轮换/PCM 出场链(折组经 QaIndex.team_head);
+    - 胜者=最高余弦、平分吃插入序,**不进优先级 duel**——补位车道语义:
+      词面档的 (priority,-score) 契约不延伸到这里,最贴近的问法直接出场;
+    - **同音归一只在查询侧**(2026-09-25):构造注入 ``homophones=``(CP 已学
+      对子),``match``/``rank`` 的查询文本经 ``apply_homophones`` 归一后再
+      embed——词条素材向量在 build 时已按原问法固化,**不动**(改素材=改既
+      有缓存序列;查询与素材同在语义空间,归一查询自然贴近正字素材)。
+      ``BOK_QA_HOMOPHONE=0`` 旁路;表空/策略缺失/失败=行为逐字节同旧。
+    """
+
+    def __init__(
+        self,
+        client,
+        items: list[tuple[dict, str, list[float]]],
+        *,
+        homophones: list | None = None,
+    ):
+        self._client = client
+        self._items = items  # (entry, 归一问法, 语义向量),插入序=created_at
+        # 同音对子:CP 形状(dict/元组列)在此一次归一,坏项丢弃;None/空=旧行为。
+        self._homophones: list[tuple[str, str]] = _homophone_pairs(homophones)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    @classmethod
+    async def build(
+        cls,
+        client,
+        entries: list[dict],
+        *,
+        homophones: list | None = None,
+    ) -> "QaSemanticIndex | None":
+        """装配构建(异步:批量 embed)。素材=去重归一问法(同问法多条目共享
+        向量、首条出场——快路命中面按问法);零素材/任一批次失败 → None 整通
+        惰性(零行为变化)。``homophones`` 只透传给构造(查询侧归一),素材
+        embed 恒吃原归一问法、缓存键零变化(词面素材序列不动)。"""
+        from .intent_semantic import (
+            _BUILD_EMBED_CHUNK,
+            _BUILD_EMBED_TIMEOUT_S,
+            SEMANTIC_VECTOR_CACHE,
+        )
+
+        items: list[tuple[dict, str]] = []
+        seen: set[str] = set()
+        for e in entries or []:
+            q = normalize_question(str(e.get("question_text") or ""))
+            if not q or q in seen:
+                continue
+            seen.add(q)
+            items.append((e, q))
+        if not items:
+            return None
+        key = hashlib.sha256(
+            "\n".join(f"{e.get('id')}|{q}" for e, q in items).encode("utf-8")
+        ).hexdigest()
+        cached = SEMANTIC_VECTOR_CACHE.get(key)
+        if cached is None:
+            texts = [q for _e, q in items]
+            vecs: list[list[float]] = []
+            for i in range(0, len(texts), _BUILD_EMBED_CHUNK):
+                chunk = await client.embed(
+                    texts[i : i + _BUILD_EMBED_CHUNK], timeout_s=_BUILD_EMBED_TIMEOUT_S
+                )
+                if chunk is None:
+                    return None
+                vecs.extend(chunk)
+            cached = dict(zip(texts, vecs))
+            SEMANTIC_VECTOR_CACHE.put(key, cached)
+        return cls(client, [(e, q, cached[q]) for e, q in items], homophones=homophones)
+
+    async def match(
+        self,
+        user_text: str,
+        *,
+        lang: str = "",
+        step_index: int | None = None,
+        threshold: float | None = None,
+    ) -> tuple[dict | None, float, str]:
+        """词面未中轮的语义补位 → (命中条目|None, 最佳余弦, reason)。
+
+        reason ∈ ""|empty|no_embedder|timeout|error:空串=正常评分(未过阈值
+        也是正常 miss,调用方可打 miss 日志);其余=车道不可用归因(静默降级,
+        与意图车道同纪律——日志归 agent 统一打)。幸存过滤与词面 match 同判据
+        ``_survives_turn``(单点防漂移)。
+
+        出场阈值逐条目(2026-09-25,VectorQ):词条 ``hit_threshold`` 列在场且
+        在 (0,1] → 该条用它,缺席/坏值 → 全局 ``thr``(显式 threshold 参数仍
+        优先于 env 全局);胜者仍是最高余弦的通过者。``rank()`` 召回地板不吃
+        词条列(召回供给与出场阈值是两件事)。
+        """
+        from .intent_semantic import _cosines
+
+        q = normalize_question(user_text)
+        # 同音归一应用钩子(2026-09-25):顺序钉死=先 normalize_question 再按
+        # 对子替换——归一化清标点/空白,对子替换吃干净文本;仅查询侧,词条
+        # 素材向量不动(双方在语义空间自然接近)。表空/env 关/策略缺失/失败
+        # → 原查询逐字节(=旧行为)。词面 QaIndex.match 恒不吃此钩子。
+        if self._homophones and qa_homophone_enabled():
+            q = _homophone_normalize(q, self._homophones)
+        if not q or not self._items:
+            return None, 0.0, "empty"
+        if self._client is None or self._client.dead:
+            return None, 0.0, "no_embedder"
+        qv = await self._client.embed([q])
+        if qv is None:
+            return None, 0.0, (self._client.last_reason or "error")
+        thr = qa_semantic_threshold() if threshold is None else threshold
+        rows: list[list[float]] = []
+        entries: list[dict] = []
+        for e, _q, vec in self._items:
+            if _survives_turn(e, lang=lang, step_index=step_index):
+                entries.append(e)
+                rows.append(vec)
+        if not rows:
+            return None, 0.0, "empty"
+        coss = _cosines(qv[0], rows)
+        best: dict | None = None
+        best_score = -1.0
+        top = 0.0
+        for e, c in zip(entries, coss):
+            if c > top:
+                top = c
+            if c >= _effective_thr(e, thr) and c > best_score:
+                best, best_score = e, c
+        if best is None:
+            return None, top, ""
+        return best, best_score, ""
+
+    async def rank(
+        self,
+        user_text: str,
+        *,
+        k: int = 3,
+        floor: float = 0.60,
+        lang: str = "",
+        step_index: int | None = None,
+    ) -> list[tuple[float, str]]:
+        """语义召回 top-k（Laya QA 验证车道的第二召回腿，2026-09-25 审计补）。
+
+        golden 标定实证：改写/同音族的真实 miss 形态是「换词+同音叠加」，
+        词面 rank 的拼音通道只救得动近逐字同音——语义余弦才是释义档的天然
+        召回层。与 match() 同判据（``_survives_turn`` 单点）、同一份素材向量，
+        但**不过 0.80 出场阈值**：floor（默认 0.60）是召回地板，精度交给
+        Laya 精判车道。车道不可用（no_embedder/timeout/空面）=空列表
+        （fail-open，调用方当池空，绝不炸）。返回 (cos, entry_id) 降序 ≤k。
+        """
+        from .intent_semantic import _cosines
+
+        q = normalize_question(user_text)
+        # 同音归一与 match 同款(顺序钉死:normalize→对子替换;仅查询侧,
+        # 词面 QaIndex.rank 恒不吃——词面召回的对子收益归语义面管)。
+        if self._homophones and qa_homophone_enabled():
+            q = _homophone_normalize(q, self._homophones)
+        if not q or not self._items:
+            return []
+        if self._client is None or self._client.dead:
+            return []
+        qv = await self._client.embed([q])
+        if qv is None:
+            return []
+        entries: list[dict] = []
+        rows: list[list[float]] = []
+        for e, _q, vec in self._items:
+            if _survives_turn(e, lang=lang, step_index=step_index):
+                entries.append(e)
+                rows.append(vec)
+        if not rows:
+            return []
+        coss = _cosines(qv[0], rows)
+        scored = [
+            (float(c), str(e.get("id") or ""))
+            for e, c in zip(entries, coss)
+            if c >= floor and e.get("id")
+        ]
+        scored.sort(key=lambda t: t[0], reverse=True)
+        return scored[:k]
+

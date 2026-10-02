@@ -300,23 +300,30 @@ def test_client_assist_and_intent_rules_shapes():
 
 
 def test_graph_notify_arm_pinned_between_jump_and_play():
-    jump = _SRC.index('if _b.action == "jump_step":')
-    notify = _SRC.index("elif _b.action == ACTION_NOTIFY_HUMAN:")
+    dispatch = _SRC.index("async def _gdispatch(")  # P2.2 三臂闭包（绑定参数名 _gbinding）
+    jump = _SRC.index('if _gbinding.action == "jump_step":', dispatch)
+    notify = _SRC.index("elif _gbinding.action == ACTION_NOTIFY_HUMAN:", jump)
     play = _SRC.index("else:  # play_qa:", notify)
     assert jump < notify < play  # 第三臂落在 jump 与 play 之间
 
 
 def test_graph_notify_arm_does_not_stop_response():
-    start = _SRC.index("elif _b.action == ACTION_NOTIFY_HUMAN:")
+    start = _SRC.index("elif _gbinding.action == ACTION_NOTIFY_HUMAN:")
     end = _SRC.index("else:  # play_qa:", start)
     seg = _SRC[start:end]
     # 唯一允许的出现形态=注释「不 raise StopResponse」;真实调用形态(带括号)禁现。
     assert "raise StopResponse()" not in seg  # 打铃不抢话:落回 LLM 生成
     assert "不 raise StopResponse" in seg  # 意图注释在场(删注释或改语义即红)
-    # P2.2:provider 标记带兜底分叉(graph-catchall=本轮动作来自 "*" 兜底意图;
-    # 动作本体由后置派发点的 `FLOW_GRAPH catchall` 行交代)——两条来源都在场内。
-    # (复核修:三臂抽成 _gdispatch 闭包,变量名 _b/_from_catchall。)
-    assert '"graph-catchall" if _from_catchall else "graph-notify"' in seg
+    # EX-2（2026-09-28）：provider 归因改经 chokepoint（notify 顺延到下一个
+    # assistant item），旧 _turn_origin 单槽已删除——本臂必须是注册形态，
+    # 裸写 _turn_origin 会被 test_reply_chokepoint_lint 同源钉红。
+    assert "_register_reply_lane(" in seg and "notify=True" in seg
+    # P2.2 兜底分叉（合并形态，EX-2 折进 lane= 实参）：if _from_catchall →
+    # graph-catchall 车道 / else → graph-notify——两条来源都在场内，动作本体
+    # 由后置派发点的 `FLOW_GRAPH catchall` 行交代。
+    assert "if _from_catchall:" in seg
+    assert '_register_reply_lane(lane="graph-catchall", notify=True)' in seg
+    assert '_register_reply_lane(lane="graph-notify", notify=True)' in seg
     assert "_spawn_report(" in seg and "_report_notify_once(" in seg
     assert "flow_ctrl.graph_fired" in seg
     assert "FLOW_GRAPH notify binding=" in seg

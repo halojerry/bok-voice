@@ -1,0 +1,65 @@
+# Bok CUDA 部署包 —— sglang A 车道（a_reply，:18100）
+# 由 scripts/cuda/bootstrap.sh 渲染到 <BOK_CUDA_HOME>/units/（替换 __BOK_CUDA_HOME__ 占位），
+# 操作员 root 拷贝到 /etc/systemd/system/ 后 daemon-reload + enable --now。
+# 运行时 env：/etc/bok-cuda/bok-cuda.env（缺文件=单元拒绝启动，逼先建 env）。
+#
+# 旗标依据（sglang 0.5.20 文档 + v0.5.19 源码逐一核对；见 docs/CUDA-DEPLOY.md §9）：
+#   --enable-priority-scheduling        请求级优先级调度（G5 对症药）：请求体带
+#                                       "priority": N（整数，**高值先调度**）；未开此
+#                                       旗标时该字段被静默忽略。
+#   --schedule-policy ${SGLANG_SCHEDULE_POLICY}（env 缺省 fcfs）
+#                                       ⚠ 源码核实（schedule_policy.py calc_priority）：
+#                                       fcfs 档排队=「priority 再先到先到」——G5 主姿势；
+#                                       lpm 档排队=最长前缀优先、priority 只管抢占与
+#                                       缩退（同话术模板前缀 KV 经济最大化，战役并发档
+#                                       再切）。radix 缓存两种档下都生效（lpm 只改
+#                                       排队顺序，不改命中）。
+#   --priority-scheduling-preemption-threshold 10
+#                                       高优请求抢占在跑请求的最小优先级差（默认 10，
+#                                       显式写出便于对照调参）。
+#   --retraction-policy priority        KV 池满时优先缩低优请求（默认 length）。
+#   radix（RadixAttention 前缀 KV 复用）**默认开启，无需旗标**——没有
+#   --prefix-cache-radar 这个旗标（任务草案笔误）；关闭口是 --disable-radix-cache
+#   （勿加），逐出策略 --radix-eviction-policy（默认 lru）。
+# ⚠ 旗标随 sglang 版本漂移：实机首跑以 `<venv>/bin/python -m sglang.launch_server
+#   --help` 为准核对（docs/CUDA-DEPLOY.md §2）。
+#
+# 资源旗标：--mem-fraction-static 0.85 是文档对 OOM 的第一道下调钮；
+# --chunked-prefill-size 8192 让长 prefill 分块与 decode 交错（speculator 预热
+# 不再堵真回复的对齐姿势）。
+#
+# 注意：本实例与 sglang-judge 是**两个进程**——priority 只在本实例队列内生效；
+# 跨车道隔离靠进程分边界（同 Mac 姿势），两车道打同一实例+请求 priority 分层的
+# 「单实例合并档」取舍见 docs/CUDA-DEPLOY.md §6。
+
+[Unit]
+Description=Bok sglang A lane (a_reply) :18100 — priority scheduling + radix cache
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__BOK_CUDA_HOME__
+EnvironmentFile=/etc/bok-cuda/bok-cuda.env
+ExecStart=__BOK_CUDA_HOME__/venv/bin/python -m sglang.launch_server \
+  --model-path $MODEL_A_REPLY_DIR \
+  --served-model-name $MODEL_A_REPLY_NAME \
+  --host $SGLANG_BIND \
+  --port $SGLANG_PORT_A \
+  --enable-priority-scheduling \
+  --priority-scheduling-preemption-threshold 10 \
+  --schedule-policy $SGLANG_SCHEDULE_POLICY \
+  --retraction-policy priority \
+  --mem-fraction-static 0.85 \
+  --chunked-prefill-size 8192 \
+  --log-level info
+  # 可选（按需解开再 daemon-reload）：
+  # --api-key $SGLANG_API_KEY        # 暴露到不可信网络时启用；值在 env 文件（600）
+  # --quantization fp8               # 或 awq / gptq——24G 卡跑 9B 的前提，开窗定稿
+  # --tp-size 2                      # 多卡张量并行
+  # --device cuda:0                  # 双实例分卡时各钉一张（judge 单元钉 cuda:1）
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

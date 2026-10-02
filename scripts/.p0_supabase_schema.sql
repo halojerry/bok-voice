@@ -7,11 +7,11 @@
 --   schema 唯一真源 = packages/business-db ORM 模型 + deps.build_engine() 的幂等迁移;
 --   **改表后必须重跑本脚本重新生成**,再应用到 Supabase。
 --
--- 生成日期: 2026-09-19
+-- 生成日期: 2026-10-02
 -- 源镜像:   pgvector/pgvector:pg16
 -- 源命令:   docker exec pg-ddl pg_dump -U postgres --schema-only --no-owner --no-privileges postgres
 -- 回环校验: pgvector/pgvector:pg16 上应用本文件 + 重跑 build_engine() = 零 DDL 变更(生成时实测)
--- 规模:     CREATE TABLE 27 张 / CREATE INDEX 41 条 / 数据语句 0 条
+-- 规模:     CREATE TABLE 30 张 / CREATE INDEX 40 条 / 数据语句 0 条
 --           (--schema-only:正常应 0 条数据语句;带 DEFAULT/COMMENT 属 schema 本身)
 --
 -- 目标: 全新 Supabase(Postgres)项目首次引导。应用方式(Main 线程):
@@ -284,8 +284,28 @@ CREATE TABLE public.global_settings (
     sip_json text NOT NULL,
     campaign_json text DEFAULT ''::text NOT NULL,
     sms_json text DEFAULT ''::text NOT NULL,
+    model_routing_json text DEFAULT ''::text NOT NULL,
     policy character varying(64) NOT NULL,
     updated_at timestamp without time zone NOT NULL
+);
+
+
+--
+-- Name: hotword_entries; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.hotword_entries (
+    id character varying(64) NOT NULL,
+    account_id character varying(64) NOT NULL,
+    lang character varying(16) NOT NULL,
+    word text NOT NULL,
+    source character varying(16) NOT NULL,
+    enabled boolean NOT NULL,
+    freq integer NOT NULL,
+    first_seen character varying(32) NOT NULL,
+    last_seen character varying(32) NOT NULL,
+    created_at timestamp without time zone NOT NULL,
+    created_by character varying(64) NOT NULL
 );
 
 
@@ -398,6 +418,7 @@ CREATE TABLE public.object_profiles (
     address character varying(255) NOT NULL,
     contact_channel character varying(32) NOT NULL,
     digest text NOT NULL,
+    pronunciation text DEFAULT ''::text,
     template_id character varying(64) NOT NULL,
     status character varying(32) NOT NULL
 );
@@ -446,6 +467,23 @@ CREATE TABLE public.persona_profiles (
 
 
 --
+-- Name: qa_digest_runs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.qa_digest_runs (
+    id character varying(64) NOT NULL,
+    started_at character varying(32) DEFAULT ''::character varying NOT NULL,
+    finished_at character varying(32) DEFAULT ''::character varying NOT NULL,
+    adopted_variant integer DEFAULT 0 NOT NULL,
+    adopted_fresh integer DEFAULT 0 NOT NULL,
+    disabled integer DEFAULT 0 NOT NULL,
+    homophones integer DEFAULT 0 NOT NULL,
+    pregen integer DEFAULT 0 NOT NULL,
+    error text DEFAULT ''::text NOT NULL
+);
+
+
+--
 -- Name: qa_entries; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -464,8 +502,22 @@ CREATE TABLE public.qa_entries (
     source character varying(16) NOT NULL,
     cluster_head_id character varying(64) NOT NULL,
     priority integer DEFAULT 10 NOT NULL,
+    hit_threshold double precision,
     template_id character varying(64) NOT NULL,
     created_at timestamp without time zone NOT NULL
+);
+
+
+--
+-- Name: qa_homophones; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.qa_homophones (
+    wrong character varying(255) NOT NULL,
+    "right" character varying(255) NOT NULL,
+    support integer DEFAULT 0 NOT NULL,
+    source character varying(32) DEFAULT 'auto'::character varying NOT NULL,
+    created_at character varying(32) DEFAULT ''::character varying NOT NULL
 );
 
 
@@ -679,6 +731,14 @@ ALTER TABLE ONLY public.global_settings
 
 
 --
+-- Name: hotword_entries hotword_entries_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.hotword_entries
+    ADD CONSTRAINT hotword_entries_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: intent_rules intent_rules_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -751,11 +811,27 @@ ALTER TABLE ONLY public.persona_profiles
 
 
 --
+-- Name: qa_digest_runs qa_digest_runs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.qa_digest_runs
+    ADD CONSTRAINT qa_digest_runs_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: qa_entries qa_entries_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.qa_entries
     ADD CONSTRAINT qa_entries_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: qa_homophones qa_homophones_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.qa_homophones
+    ADD CONSTRAINT qa_homophones_pkey PRIMARY KEY (wrong, "right");
 
 
 --
@@ -788,6 +864,14 @@ ALTER TABLE ONLY public.sip_sites
 
 ALTER TABLE ONLY public.turns
     ADD CONSTRAINT turns_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: hotword_entries uq_hotword_account_lang_word; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.hotword_entries
+    ADD CONSTRAINT uq_hotword_account_lang_word UNIQUE (account_id, lang, word);
 
 
 --
@@ -902,6 +986,13 @@ CREATE INDEX ix_conversation_templates_account_id ON public.conversation_templat
 --
 
 CREATE INDEX ix_filler_entries_account_id ON public.filler_entries USING btree (account_id);
+
+
+--
+-- Name: ix_hotword_entries_account_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_hotword_entries_account_id ON public.hotword_entries USING btree (account_id);
 
 
 --

@@ -141,6 +141,149 @@ def test_closing_say_false_keeps_real_interrupt():
     )
 
 
+# ---- hotword_only 否决层（词表幻听迟到 FINAL 掐断在播罐头）--------------------
+# 现象：停嘴 finish 整窗重解把词表热词幻听成独立迟到 FINAL「打错电话。」——
+# 4 字净文 > max_tail_chars(2) 连「极短追加」门都够不着 → 判真新话放行 → 掐断
+# 在播罐头（assistant transcript 只落「这」）。它恰好逃过全部回声闸：
+# _vocab_echo_guard 要 ≥4 连续词表段才剥；贪心门要零分隔符而它带「。」；孤词
+# 门要 echo_seen 先例。修法：AI 忙+净文无数字字母 run+按词表贪心最长匹配剥离
+# 后严格为空 → 判幻听丢弃；真插话剥后必有词表外残留（「打错电话啊」剩「啊」）
+# 照放行。kill-switch BOK_LATE_FINAL_HOTWORD_GUARD（默认开）。
+
+
+_VOCAB = ("打错电话", "賠償", "拼多多", "順豐速運")
+
+
+def test_hotword_only_tail_dropped_while_busy():
+    """busy+「打错电话。」+词表含「打错电话」→ False（丢弃）——词表幻听迟到
+    FINAL 唔成轮（旧行为放行=掐断在播罐头根因）。"""
+    assert (
+        late_final_is_new_speech(
+            "打错电话。", _COMMITTED, agent_busy=True, max_tail_chars=2, vocab_terms=_VOCAB
+        )
+        is False
+    )
+
+
+def test_hotword_with_residual_particle_still_passes():
+    """busy+「打错电话啊」→ True（放行）——剥后剩「啊」，真插话唔拦（刻意比
+    F3 的「剩余 ≤2 字」严：只认剥后严格为空）。"""
+    assert (
+        late_final_is_new_speech(
+            "打错电话啊", _COMMITTED, agent_busy=True, max_tail_chars=2, vocab_terms=_VOCAB
+        )
+        is True
+    )
+
+
+def test_digit_tail_exempt_from_hotword_layer():
+    """busy+「我的单号是457」→ True（数字豁免）——数字零降级同 L5611 口径，
+    词表层在数字 run 放行之后、结构性够不着数字尾巴。"""
+    assert (
+        late_final_is_new_speech(
+            "我的单号是457", _COMMITTED, agent_busy=True, max_tail_chars=2, vocab_terms=_VOCAB
+        )
+        is True
+    )
+
+
+def test_hotword_layer_idle_agent_not_gated():
+    """idle+「打错电话。」→ True（AI 不忙不拦）——无回复可掐，旧行为保留。"""
+    assert (
+        late_final_is_new_speech(
+            "打错电话。", _COMMITTED, agent_busy=False, max_tail_chars=2, vocab_terms=_VOCAB
+        )
+        is True
+    )
+
+
+def test_hotword_layer_default_empty_matches_old_behavior():
+    """vocab_terms=() 默认 → 层短路不评估，行为与旧版逐字节一致（老用例矩阵
+    带不传 kwarg 与显式 () 两种姿势同值）。"""
+    cases = [
+        # (payload, busy, max_tail_chars, closing_say, expected)
+        ("那。", True, 2, False, False),
+        ("嗰。", True, 2, False, False),
+        ("那我想再问一下理赔的具体流程是这样的", True, 2, False, True),
+        ("457。", True, 2, False, True),
+        ("OK。", True, 2, False, True),
+        ("我唔知。", False, 2, False, True),
+        ("好。", True, 2, False, False),
+        ("我唔知。", True, 2, False, True),
+        ("我唔知。", True, 4, False, False),
+        ("。。。", False, 2, False, False),
+        ("", True, 2, False, False),
+        ("那我再问一下理赔流程好吧", True, 2, True, False),
+        ("457。", True, 2, True, False),
+        ("那我再问一下理赔流程好吧", True, 2, False, True),
+    ]
+    for payload, busy, mx, closing, expected in cases:
+        assert (
+            late_final_is_new_speech(
+                payload, _COMMITTED, agent_busy=busy, max_tail_chars=mx, closing_say=closing
+            )
+            is expected
+        )
+        assert (
+            late_final_is_new_speech(
+                payload,
+                _COMMITTED,
+                agent_busy=busy,
+                max_tail_chars=mx,
+                closing_say=closing,
+                vocab_terms=(),
+            )
+            is expected
+        )
+
+
+def test_hotword_layer_closing_say_priority_unchanged():
+    """closing_say 优先级不变：词表覆盖与否、剥后剩不剩字，窗内一律 False。"""
+    assert (
+        late_final_is_new_speech(
+            "打错电话。",
+            _COMMITTED,
+            agent_busy=True,
+            max_tail_chars=2,
+            closing_say=True,
+            vocab_terms=_VOCAB,
+        )
+        is False
+    )
+    assert (
+        late_final_is_new_speech(
+            "打错电话啊。",
+            _COMMITTED,
+            agent_busy=True,
+            max_tail_chars=2,
+            closing_say=True,
+            vocab_terms=_VOCAB,
+        )
+        is False
+    )
+
+
+def test_vocab_only_net_normalization_matches_echo_guard():
+    """_vocab_only_net 归一口径与词表/转写两侧同表（_to_simp 繁→简+剥标点）：
+    繁体幻听对同源词表经同一映射后全覆盖命中；词表词顺串（多条首尾相接）
+    贪心剥到空；词表外残留判 False。已知口径缺口（与 _is_hotword_vocab_echo
+    同族共用 _T2S_MAP，本修复不改映射表）：錯→错/話→话 未覆盖透传，繁体
+    「打錯電話」对简体词表唔命中——既有回声闸同一盲区，非本层引入。"""
+    assert lp._vocab_only_net("順豐速運。", _VOCAB) is True  # 繁→简映射覆盖字
+    assert lp._vocab_only_net("拼多多赔偿", _VOCAB) is True  # 词表词首尾相接
+    assert lp._vocab_only_net("打错电话", _VOCAB) is True
+    assert lp._vocab_only_net("打错电话啊", _VOCAB) is False
+    assert lp._vocab_only_net("打错电话。", ()) is False  # 空词表恒 False
+    assert lp._vocab_only_net("", _VOCAB) is False
+
+
+def test_hotword_guard_kill_switch(monkeypatch):
+    monkeypatch.delenv("BOK_LATE_FINAL_HOTWORD_GUARD", raising=False)
+    assert lp._late_final_hotword_guard_on() is True  # 默认开
+    monkeypatch.setenv("BOK_LATE_FINAL_HOTWORD_GUARD", "0")
+    assert lp._late_final_hotword_guard_on() is False  # 0=整层否决不评估
+
+
 def test_agent_busy_for_state():
     """状态→回复在途旗（agent.py 侧纯函数）。"""
     assert agent_busy_for_state("thinking") is True
@@ -221,6 +364,25 @@ def test_closing_say_wiring_source_pins():
     i_say = ag_src.index("await _say_script(", i_on)  # 收线台词那次调用（跳过模块级函数定义）
     i_off = ag_src.index("set_closing_say(False)", i_say)
     assert i_on < i_say < i_off
+
+
+def test_hotword_guard_wiring_source_pins():
+    """源级 pin（hotword_only 否决层）：两个调用点都传 vocab_terms；kill-switch
+    键在 livekit_plugins（读取面）与 tools/bok.py（_FORWARD_ENV 登记面）各出现
+    一次；DROP 打点仍只有两处 print（计数不破坏）。"""
+    lp_src = (ROOT / "apps/agent/agent_runtime/providers/livekit_plugins.py").read_text(
+        encoding="utf-8"
+    )
+    assert lp_src.count("vocab_terms=_vt") == 2, "停嘴与 join-flush 两路都要传词表"
+    assert lp_src.count("BOK_LATE_FINAL_HOTWORD_GUARD") == 1, "kill-switch 键只准一处读取"
+    assert "def _late_final_hotword_guard_on" in lp_src
+    assert "def _vocab_only_net" in lp_src
+    assert "if agent_busy and vocab_terms and _vocab_only_net(norm, vocab_terms):" in lp_src
+    assert "hotword_only'} " in lp_src  # DROP 打点 reason 三态（closing/tail_append/hotword_only）
+    assert lp_src.count("hotword_only'} ") == 2  # 两路打点都要能归因 hotword_only
+    bok_src = (ROOT / "tools/bok.py").read_text(encoding="utf-8")
+    assert bok_src.count("BOK_LATE_FINAL_HOTWORD_GUARD") == 1, "登记面只准一处"
+    assert "BOK_LATE_FINAL_HOTWORD_GUARD" in bok._FORWARD_ENV
 
 
 # ---- 行为面：真 _run 端到端（fake VAD + fake sidecar）------------------------
@@ -465,3 +627,49 @@ def test_run_closing_say_suppress_off_after_window(monkeypatch):
 
     names = asyncio.run(scenario())
     assert names == ["START_OF_SPEECH", "END_OF_SPEECH", "FINAL_TRANSCRIPT"], names
+
+
+def test_run_hotword_only_tail_dropped_with_reason(monkeypatch, capsys):
+    """hotword_only 端到端：AI 播报中 + 流级词表含「打错电话」，finish 幻听
+    「打错电话。」→ 第二条 FINAL 唔发，DROP 打点 reason=hotword_only（与
+    tail_append 同一条打印区分，不新增 print）。"""
+    _fresh_gates(monkeypatch)
+
+    async def scenario():
+        stream = _make_stream()
+        stream._stt_._reply_busy = True
+        stream._vocab_terms = ("打错电话", "赔偿")  # __init__ 反解位（:5889）的测试注入
+        try:
+            return await _drive_vad_stop(
+                stream, committed=_COMMITTED, finish_text=f"{_COMMITTED}打错电话。"
+            )
+        finally:
+            await _close(stream)
+
+    names = asyncio.run(scenario())
+    assert names == ["START_OF_SPEECH", "END_OF_SPEECH"], names
+    out = capsys.readouterr().out
+    assert "QWEN3_ASR_LATE_FINAL_DROP" in out
+    assert "reason=hotword_only" in out
+
+
+def test_run_hotword_guard_kill_switch_restores_f2(monkeypatch, capsys):
+    """BOK_LATE_FINAL_HOTWORD_GUARD=0 → 整层否决不评估，「打错电话。」回 F2
+    现状照发 FINAL（外层极短追加门拦不住 4 字）。"""
+    _fresh_gates(monkeypatch)
+    monkeypatch.setenv("BOK_LATE_FINAL_HOTWORD_GUARD", "0")
+
+    async def scenario():
+        stream = _make_stream()
+        stream._stt_._reply_busy = True
+        stream._vocab_terms = ("打错电话", "赔偿")
+        try:
+            return await _drive_vad_stop(
+                stream, committed=_COMMITTED, finish_text=f"{_COMMITTED}打错电话。"
+            )
+        finally:
+            await _close(stream)
+
+    names = asyncio.run(scenario())
+    assert names == ["START_OF_SPEECH", "END_OF_SPEECH", "FINAL_TRANSCRIPT"], names
+    assert "reason=hotword_only" not in capsys.readouterr().out

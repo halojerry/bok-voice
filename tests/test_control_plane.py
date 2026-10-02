@@ -323,8 +323,11 @@ def test_knowledge_delete_removes_vault_file_and_does_not_resurrect(tmp_path, mo
         assert not any(str(d.get("path", "")).endswith("del-me.md") for d in after)
 
 
-def test_supervisor_pause_resume_roundtrip():
+def test_supervisor_pause_resume_roundtrip(monkeypatch):
     """主管台暂停/恢复要真实改通话状态（agent 轮询到后生效）。"""
+    # 本用例钉的是监督/暂停链路，与被测无关的「实时通话强绑话术模板」闸关掉，
+    # 保持隔离（模板闸自身契约见 test_template_gate.py）。
+    monkeypatch.setenv("BOK_REQUIRE_TEMPLATE", "0")
     with TestClient(app) as client:
         created = client.post(
             "/api/calls",
@@ -446,13 +449,15 @@ def test_setup_status_reports_model_readiness():
             assert set(["name", "repo", "present", "required"]).issubset(m.keys())
 
 
-def test_concurrent_add_turns_no_silent_loss():
+def test_concurrent_add_turns_no_silent_loss(monkeypatch):
     """并发 add_turn 不得静默丢数据（QA 压测 P1：旧 len 序号竞态 30 并发丢 30-37%）。
 
     turn_id 已改 uuid：30 线程并发写同一 call，须全部落库且响应全 200 无 duplicate。
     """
     import concurrent.futures
 
+    # 本用例钉的是并发写轮次，同为隔离关掉实时通话强绑模板闸。
+    monkeypatch.setenv("BOK_REQUIRE_TEMPLATE", "0")
     with TestClient(app) as client:
         call = client.post(
             "/api/calls",
@@ -586,3 +591,55 @@ def test_template_partial_update_keeps_unset_fields(tmp_path, monkeypatch):
         assert body["name"] == "部分更新回归", "未传字段不得被抹"
         assert body["language"] == "cantonese", "未传 language 不得回落 zh"
         assert len(json.loads(body["steps_json"])) == 1
+
+
+def test_settle_concurrent_double_send_single_flight(tmp_path, monkeypatch):
+    """挂断结算并发双发单飞：Summarizer 每通至多跑一遍（A 线 tps 慢窗主因之一）。
+
+    根因：web 自动补结算与 agent _settle_core 直调并发到达，两路都穿过
+    _settle_core 头部 existing 快路径（彼时谁都没落库）→ Summarizer 跑两遍
+    （本机 LLM 实测每遍 3.3-4.0s），正好压住下一通通话的首轮 LLM 生成。
+    修法：服务端 per-call 锁 + 锁内双检 existing，第二路等到锁即短路；
+    web/agent 双发调用行为不动。锁条目结算完必须清掉（字典不泄漏）。
+    """
+    import asyncio
+
+    from control_plane import main as cp_main
+
+    monkeypatch.setenv("VAULT_ROOT", str(tmp_path / "vault"))
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/calls",
+            json={"account_id": "acc-001", "object_id": "obj-1", "persona_id": "p-1", "mode": "simulation"},
+        ).json()
+        call_id = created["id"]
+        client.post(f"/api/calls/{call_id}/turns", params={"role": "user", "transcript": "你好，我想了解套餐"})
+
+        builds = {"n": 0}
+        real_build = app.state.settlement.build_result
+
+        def counting_build(session, turns):
+            builds["n"] += 1
+            return real_build(session, turns)
+
+        monkeypatch.setattr(app.state.settlement, "build_result", counting_build)
+
+        async def _double_send():
+            return await asyncio.gather(
+                cp_main._settle_core(call_id),
+                cp_main._settle_core(call_id),
+            )
+
+        first, second = asyncio.run(_double_send())
+        # 双发只允许一路真正 build（旧代码此处=2：双双穿过快路径各跑一遍 Summarizer）。
+        assert builds["n"] == 1
+        assert first["status"] == "done"
+        assert first == second  # 第二路吃第一路落库的结果，两返回一致
+
+        # 串行第三发：existing 快路径短路，零新增 build（旧幂等语义保留）。
+        third = asyncio.run(cp_main._settle_core(call_id))
+        assert builds["n"] == 1
+        assert third == first
+
+        # 锁条目不泄漏：结算完成后 per-call 锁必须已从字典清掉。
+        assert call_id not in cp_main._SETTLE_LOCKS

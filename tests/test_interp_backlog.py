@@ -77,18 +77,18 @@ def test_gate_drops_oldest_queued_keeps_head_and_newest(monkeypatch):
     h2 = _FakeHandle("一二三四五六七八九十")
     h3 = _FakeHandle("一二三四五六七八九十")
 
-    assert bl.on_speech_created(h1) == (1, pytest.approx(2.0), 0)
-    assert bl.on_speech_created(h2) == (2, pytest.approx(4.0), 0)  # len==2：宁积不弃
+    assert bl.on_speech_created(h1) == (1, pytest.approx(0.0), 0)  # 队头在播,等待积压=0
+    assert bl.on_speech_created(h2) == (2, pytest.approx(2.0), 0)  # 等待=2.0 ≤门:宁积不弃
     depth, est, dropped = bl.on_speech_created(h3)
     assert (depth, dropped) == (2, 1)
-    assert est == pytest.approx(4.0)
+    assert est == pytest.approx(2.0)  # 等待积压(弃后)
     assert not h1.interrupt_calls  # 队头=当前播报永不弃
     assert h2.interrupt_calls == [True]  # 未开播的最旧句 force 中断
     assert not h3.interrupt_calls  # 最新一条永不弃
 
 
 def test_gate_purges_done_and_re_estimates(monkeypatch):
-    bl = _backlog(2.0, monkeypatch)
+    bl = _backlog(1.0, monkeypatch)
     h1 = _FakeHandle("一二三四五六七八九十")
     h2 = _FakeHandle("", done=False)  # 新句暂无 chat item → 地板 0.8
     h3 = _FakeHandle("", done=False)
@@ -96,9 +96,9 @@ def test_gate_purges_done_and_re_estimates(monkeypatch):
     bl.on_speech_created(h1)
     bl.on_speech_created(h2)
     depth, est, dropped = bl.on_speech_created(h3)
-    # h1(2.0)+h2(0.8)+h3(0.8)=3.6 > 2 → 弃 index1(h2)
+    # 等待积压 h2(0.8)+h3(0.8)=1.6 > 1 → 弃 index1(h2);队头 h1 不计入门槛
     assert dropped == 1
-    assert est == pytest.approx(2.8)
+    assert est == pytest.approx(0.8)
     assert h2.interrupt_calls == [True]
 
     # 播完/已弃的句下一轮清账（被 force 中断的 h2 同样 done）
@@ -107,13 +107,91 @@ def test_gate_purges_done_and_re_estimates(monkeypatch):
     depth, est, dropped = bl.on_speech_created(h4)
     # h1、h2 已 done 清账 → 队列只剩 h3+h4
     assert (depth, dropped) == (2, 0)
-    assert est == pytest.approx(1.6)
+    assert est == pytest.approx(0.8)
     assert not h3.interrupt_calls  # 清账后 h3 变队头，永不弃
     h5 = _FakeHandle("")
     depth, est, dropped = bl.on_speech_created(h5)
     assert h4.interrupt_calls == [True]  # h4 现在是队头之后最旧的未播句
     assert (depth, dropped) == (2, 1)
-    assert est == pytest.approx(1.6)
+    assert est == pytest.approx(0.8)
+
+
+def test_head_playing_alone_never_triggers_drops(monkeypatch):
+    """门槛语义 v2（2026-09-23 修复波#2,task-9 §14 实证）：队头=正在播报的沉没
+    成本,不计入门槛——旧算法把队头全额估时计入,单句译文即可「超门」但 depth<3
+    结构性弃不了,门槛日志恒饱和假警（est_ms=1600 drop=0）。"""
+    bl = _backlog(1.0, monkeypatch)
+    head = _FakeHandle("一" * 50)  # 长译文在播(10s 估时)
+    depth, est, dropped = bl.on_speech_created(head)
+    assert (depth, est, dropped) == (1, pytest.approx(0.0), 0)
+    # 队头之后来一句短译文:等待积压 0.8 ≤ 1 → 不弃、不假警
+    depth, est, dropped = bl.on_speech_created(_FakeHandle(""))
+    assert (depth, est, dropped) == (2, pytest.approx(0.8), 0)
+
+
+def test_source_queue_counts_into_gate_and_becomes_drop_candidate(monkeypatch):
+    """源句队列计入门槛:摘译候选=最旧的待译源句(译文未生成,零音频浪费;
+    原文行已落库=摘译保文,与 _src_q 溢出摘译同语义)。「估算时长超门槛即入
+    弃选,不只看 depth」(task-9 §14:depth<3 结构性不触发→现网积压门失效)。"""
+    bl = _backlog(1.0, monkeypatch)
+    head = _FakeHandle("")  # 队头在播
+    bl.on_speech_created(head)
+    # 源队列积 2 句(各 ~1.6s):即使 say 队只有队头+最新(depth 2 无弃句候选),
+    # 等待+源队列=3.2 > 1 → 摘译最旧源句
+    bl.set_source_backlog(3.2)
+    depth, est, dropped = bl.on_speech_created(_FakeHandle(""))  # 最新译文(0.8)
+    assert dropped == 0  # say 队无候选(最新永不弃)
+    assert bl.take_source_drops() == 1  # 摘译指令被 MT worker 消费
+    assert bl.take_source_drops() == 0  # 一次性
+
+
+def test_source_queue_drop_only_when_over_gate(monkeypatch):
+    bl = _backlog(6.0, monkeypatch)
+    bl.on_speech_created(_FakeHandle(""))
+    bl.set_source_backlog(1.6)
+    depth, est, dropped = bl.on_speech_created(_FakeHandle(""))
+    assert dropped == 0
+    assert bl.take_source_drops() == 0  # 0.8+1.6 ≤ 6:默认门槛零行为变化
+
+
+def test_source_queue_say_candidates_exhausted_before_source_drops(monkeypatch):
+    """弃句次序:先弃最旧未播译文(弃音保字),仍超门才轮到摘译源句。"""
+    bl = _backlog(1.0, monkeypatch)
+    bl.on_speech_created(_FakeHandle("一二三四五六七八九十"))  # 队头(在播,不计门槛)
+    bl.on_speech_created(_FakeHandle("一二三四五六七八九十"))  # 等待 2.0
+    bl.set_source_backlog(2.0)
+    depth, est, dropped = bl.on_speech_created(
+        _FakeHandle("一二三四五六七八九十")  # 最新 2.0:弃 h2 后等待仍 2.0 > 1
+    )
+    assert dropped == 1  # 先弃 say 队最旧(h2)
+    assert bl.take_source_drops() == 1  # 仍超门且 say 队无候选(最新永弃保护)→ 摘译一句
+
+
+def test_source_drop_armed_at_most_one_per_event(monkeypatch):
+    """压力阀步进:每次评估至多摘译一句(下轮 speech_created 再评估),不连跳。"""
+    bl = _backlog(1.0, monkeypatch)
+    bl.on_speech_created(_FakeHandle(""))
+    bl.set_source_backlog(10.0)
+    bl.on_speech_created(_FakeHandle(""))
+    assert bl.take_source_drops() == 1
+    # 阈值回读:set_source_backlog 直接替换估值,不累积
+    assert bl._source_backlog_s() == pytest.approx(10.0)
+
+
+# ---- MT worker 消费侧(fix round 1,评审 Minor-6) ----
+
+
+def test_mt_consume_skip_skips_one_then_translates(monkeypatch, capsys):
+    """MT worker 取句即消费摘译指令:arm 后首个取到的源句跳过(True),后续照常
+    译(False);消费一次性,不重复跳;零 arm 恒 False。"""
+    from agent_runtime.interpret import _mt_consume_skip
+
+    bl = _backlog(1.0, monkeypatch)
+    assert _mt_consume_skip(bl, "正常句") is False  # 零 arm → 照常 MT
+    bl.source_drops_pending = 1                     # 门槛 arm 一条摘译
+    assert _mt_consume_skip(bl, "被摘译句") is True  # 真跳过（不译不播）
+    assert _mt_consume_skip(bl, "下一句") is False  # 消费一次性，后续照常
+    assert "source-skip x1" in capsys.readouterr().out
 
 
 def test_gate_disabled_via_master_switch(monkeypatch):

@@ -41,7 +41,9 @@ class ListenStopRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    username: str
+    # username 上限 128（评审 I-2，fix round 1）：登录是预认证端点，超长串原样
+    # 进 strip/查库/频控键=无谓成本；pydantic 层 422 拒收。
+    username: str = Field(max_length=128)
     password: str
 
 
@@ -108,6 +110,8 @@ class CreateObjectRequest(BaseModel):
     courier: str = ""
     address: str = ""
     contact_channel: str = ""
+    # 发音词典（多行 `原词/读法`；空=默认读音）。仓储层截断 ≤500 字。
+    pronunciation: str = ""
     template_id: str = ""
 
 
@@ -127,6 +131,8 @@ class UpdateObjectRequest(BaseModel):
     courier: str = ""
     address: str = ""
     contact_channel: str = ""
+    # 发音词典（多行 `原词/读法`；空=默认读音）。仓储层截断 ≤500 字。
+    pronunciation: str = ""
     template_id: str = ""
     status: str = "active"
 
@@ -199,6 +205,12 @@ class ProviderSettings(BaseModel):
     # asr.language_mode: auto=锚定+滞回跟随(默认) | fixed=钉死 language 指定语言。
     voice_mode: str = "single"
     language_mode: str = "auto"
+    # 【P1 SV-CPU 引擎车道(2026-10-01 三层解耦)】asr.engine: ""/qwen3=旧
+    # Qwen3-ASR(MPS)路径 | sensevoice=SenseVoice-small int8 纯 CPU 车道
+    # (三语过门 zh 2.8%/en 5.4%/canto 8.6%、WA 数字 16/16、40-48ms/句;
+    # reports/sensevoice-eval/)。缺省翻 sensevoice 待 soak/FLOW20/数字轮验证门;
+    # 未知值运行时保守回旧路径(fail-safe)。不声明此键 PUT 会蒸发——见上注释。
+    engine: str = ""
     speaker: str = ""
     speaker_zh: str = ""
     speaker_cantonese: str = ""
@@ -221,7 +233,11 @@ class ProviderSettings(BaseModel):
     # 越高越抗噪，越低越灵敏，agent 侧传给 inference.VAD activation_threshold）
     max_buffered_speech: float = 15.0
     min_speech_duration: float = 0.15
-    min_silence_duration: float = 0.45
+    # 0.45→0.35(W7,2026-09-24):旧 0.45 是「离线式 ASR 整段 flush」年代的护身符
+    # ——句级提交+VAC 直转落地后重校,0.35 腿实测 p50 1225→1022ms(−203ms)、
+    # 尾部 max 3150→1530,fast_speech/barge-in/edge 8/8 全绿。存量部署的显式
+    # 设置值仍压过本默认,升级后要生效须改设置页或调 API。
+    min_silence_duration: float = 0.35
     interruption: bool = True
     sensitivity: float = 0.6
     sample_rate: int = 24000
@@ -433,12 +449,17 @@ class QaClusterRequest(BaseModel):
 
     limit 钳 ≤100(CP 侧);select 缺省=全部 variants+fresh。dry 计划有 600s
     per-account 缓存,apply 优先吃新鲜缓存免二次 LLM。
+
+    hotword_select(EX-H1,2026-09-28):dry 计划 hotwords.candidates 的下标列表,
+    apply 时采纳为账号热词行(account_id=本账号, source=mined);缺省 None=不采纳
+    任何热词。与 select 同受「新鲜缓存」守卫(带选择必须有同参数新鲜计划)。
     """
 
     min_calls: int = 5
     limit: int = 60
     apply: bool = False
     select: Optional[list[QaClusterSelectItem]] = None
+    hotword_select: Optional[list[int]] = None
 
 
 class IntentRuleCreate(BaseModel):

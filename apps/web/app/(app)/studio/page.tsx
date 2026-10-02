@@ -3,18 +3,25 @@
 // AI 工作站（W1；2026-09-20 重设计）：以话术模板为入口的集中工作台。
 // 列表态（无 ?t=）：全部模板概览 + 新建话术（话术/快答内容全部整合在此，
 // /templates、/qa 移出主导航后这里成为唯一内容入口）；
-// 工作台态（?t=<id>）：主流程（步骤表单 + 意图折叠卡，画布已退役 P2.5）+ 问答库 +
-// 变量 + 客户意向 + 录音沉淀 + 通话日志 + 学习报告 tab。
+// 工作台态（?t=<id>）：主流程（列表编辑/画布双视图）+ 意图管理 + 问答库 +
+// 变量 + 客户意向 + 录音沉淀 + 通话日志 + 学习报告 tab（对齐参考产品的主流程/
+// 意图管理/变量设定/客户意向/录音管理 tab 面；合并注记：origin/main 的 P2.5
+// 「画布退役、意图折进主流程」属另一条线，本线画布在役、意图独立成 tab）。
 // （学习报告/聚类采纳在 components/study-tab.tsx,变量目录与预览在 components/template-vars.tsx）。
 // 深链先例：/calls?call= / /supervisor?listen= —— 静态导出用 query，不开动态路由。
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { api, type UserRow } from "@/lib/api";
-import { parseGraphDoc, parseTemplateSteps } from "@/lib/qa-canvas";
+import { downloadCsv, parseBoolCell } from "@/lib/csv";
+import { serializeStepRef } from "@/lib/flow-canvas";
+import { graphDocWithJumpBinding, graphDocWithoutIntentBindings, parseGraphDoc, parseTemplateSteps } from "@/lib/qa-canvas";
 import { EmptyState, ErrorState, LoadingState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
 import { hasPage, useSession } from "@/components/session-context";
+import TableImport, {
+  buildExampleCsvRows, rowOk, rowSkip, type ImportResult, type ParsedRow,
+} from "@/components/table-import";
 import TemplateEditor, {
   LANGS,
   PublishBadge,
@@ -24,6 +31,7 @@ import TemplateEditor, {
   type FlowStep,
   type TemplateRow,
 } from "@/components/template-editor";
+import StepCanvasView from "@/components/step-canvas-view";
 import StepsListEditor from "@/components/steps-list-editor";
 import StudyTab from "@/components/study-tab";
 import GapMining from "@/components/gap-mining";
@@ -49,6 +57,94 @@ const LANG_LABEL: Record<string, string> = {
   en: "英语",
   vi: "越南语",
 };
+
+// 主流程 tab 双视图记忆（2026-09-25 用户拍板）：默认「列表编辑」（表单/卡片对运营更
+// 易用;画布不能连线、整理弱,降为切换选项）,用户上次选择记 localStorage,首访=列表。
+const FLOW_VIEW_STORAGE_KEY = "bok.flow.view";
+function readStoredFlowView(): "form" | "canvas" {
+  // 静态导出预渲染期无 window;存储值非法一律回落列表（首访默认）。
+  if (typeof window === "undefined") return "form";
+  try {
+    return window.localStorage.getItem(FLOW_VIEW_STORAGE_KEY) === "canvas" ? "canvas" : "form";
+  } catch {
+    return "form"; // 存储不可用（隐私模式等）:仅不记忆选择,功能不受影响
+  }
+}
+
+// ---- 表格导入契约（主流程 tab「导入话术」，2026-09-25）：列=步号,目的,AI主要说的话,
+// 客户这样说→AI怎么做（分支行：`条件 :: 应答` 每格一条,多条用 | 分隔）,逐字照念(是/否),
+// 补充提醒。组装 steps_json 走既有模板保存（单键 steps_json），整表替换前弹确认。----
+const FLOW_IMPORT_COLUMNS = [
+  { key: "no", label: "步号", hint: "必填；≥1 整数，决定顺序" },
+  { key: "goal", label: "目的", hint: "这一步要达成什么（可空）" },
+  { key: "script", label: "AI主要说的话", hint: "参考说法正文（可空）" },
+  { key: "branch", label: "客户这样说→AI怎么做", hint: "格式「条件 :: 应答」，多条用 | 分隔" },
+  { key: "say", label: "逐字照念", hint: "是/否，可空=否（通知/道歉等合规内容用）" },
+  { key: "note", label: "补充提醒", hint: "可空；多条用 | 分隔" },
+];
+const FLOW_IMPORT_FILENAME = "flow-steps-example.csv";
+const FLOW_IMPORT_EXAMPLE: string[][] = [
+  ["1", "确认身份", "您好，请问是{姓名}本人吗？我是{物流公司}客服。", "", "否", ""],
+  ["2", "说明来意并致歉", "您的包裹在运输途中丢失了，非常抱歉，我们按承诺给您办理理赔。", "现在没空 :: 好的，那您方便的时候我再给您来电|已经知道了 :: 好的，那我们直接进入理赔办理", "是", "赔偿档位只在这一步讲，其他步骤不报数字"],
+  ["3", "索取联系方式", "麻烦把您的微信号报给我，理赔专员会加您办理。", "不方便 :: 问什么时候方便，约好时间再跟进", "否", ""],
+  ["4", "收尾", "感谢您的配合，祝您生活愉快，再见。", "", "否", ""],
+];
+
+/** 主流程表格一行解析出的数据（预览/导入共用）。 */
+type FlowImportRow = {
+  /** 步号（≥1；决定步骤顺序，允许跳号）。 */
+  no: number;
+  goal: string;
+  script: string;
+  branches: { cond: string; resp: string }[];
+  say: boolean;
+  /** 注意行内容（多条 \n 连接，序列化时逐行还原「注意：」头）。 */
+  notes: string;
+};
+
+/** 分支格一条「条件 :: 应答」→ (cond, resp)；缺分隔/缺件=null（预览标跳过）。 */
+function parseBranchCell(piece: string): { cond: string; resp: string } | null {
+  const m = piece.match(/^(.+?)\s*(?:::|：：)\s*(.+)$/);
+  if (!m) return null;
+  const cond = m[1].trim();
+  const resp = m[2].trim();
+  return cond && resp ? { cond, resp } : null;
+}
+
+/** 单行解析（纯函数；prev=先前各行，做步号查重——预览期即标跳过）。 */
+function parseFlowImportRow(row: string[], prev: ParsedRow<FlowImportRow>[]): ParsedRow<FlowImportRow> {
+  const noRaw = String(row[0] ?? "").trim();
+  const no = Math.round(Number(noRaw));
+  if (!noRaw || !Number.isFinite(no) || no < 1) {
+    return rowSkip(`步号须为 ≥1 的整数（当前「${noRaw || "空"}」）`);
+  }
+  const seenNos = new Set<number>();
+  for (const p of prev) if (p.ok) seenNos.add(p.data.no);
+  if (seenNos.has(no)) return rowSkip(`步号 ${no} 重复`);
+  const goal = String(row[1] ?? "").trim();
+  const script = String(row[2] ?? "").trim();
+  const branchCell = String(row[3] ?? "").trim();
+  const branches: { cond: string; resp: string }[] = [];
+  if (branchCell) {
+    for (const piece of branchCell.split("|")) {
+      const t = piece.trim();
+      if (!t) continue;
+      const b = parseBranchCell(t);
+      if (!b) return rowSkip(`分支「${t.slice(0, 20)}」缺 :: 分隔（格式：条件 :: 应答）`);
+      branches.push(b);
+    }
+  }
+  const say = parseBoolCell(String(row[4] ?? ""), false);
+  if (say === null) return rowSkip(`逐字照念「${String(row[4]).trim()}」须为 是/否`);
+  const noteCell = String(row[5] ?? "").trim();
+  const notes = noteCell
+    ? noteCell.split(/\s*\|\s*|\r?\n\s*/).map((n) => n.trim()).filter(Boolean)
+    : [];
+  if (!goal && !script && branches.length === 0 && notes.length === 0) {
+    return rowSkip("该行没有任何内容");
+  }
+  return rowOk({ no, goal, script, branches, say, notes: notes.join("\n") });
+}
 
 export default function StudioPage() {
   const { accountId } = useAccount();
@@ -158,6 +254,9 @@ export default function StudioPage() {
   }, [selId, tplRev]);
 
   const tplRow: TemplateRow | null = useMemo(() => (tpl ? toTemplateRow(tpl) : null), [tpl]);
+  // 意图图与步骤脊柱（graph_json 解析一律走 lib/qa-canvas.parseGraphDoc 现成实现）。
+  // 合并注记：origin/main（P2.5 画布退役线）删了此定义，本线画布在役——恢复。
+  const graph = useMemo(() => parseGraphDoc(tplRow?.graph_json ?? ""), [tplRow]);
   const stepsList = useMemo(() => parseTemplateSteps(tplRow?.steps_json ?? ""), [tplRow]);
   // 内容只读判定（B4 owner 口径，与 TemplateEditor/IntentManager 同款）：共享话术非主管=只读。
   const contentReadOnly = Boolean(selId) && !isManager && !(uid !== "" && String(tplRow?.owner_user_id ?? "") === uid);
@@ -188,6 +287,67 @@ export default function StudioPage() {
     setStepsDirty(true);
     setApplyNote("");
   }, []);
+
+  // ---- 主流程表格导入（整表替换 steps_json）----
+  const [flowImportOpen, setFlowImportOpen] = useState(false);
+
+  /** 组装并保存：按步号升序成步，ref=serializeStepRef（正稿+分支+注意三件，
+   * 语法与 lib/flow-canvas 对 flow.py _BRANCH_LINE_RE/_NOTE_LINE_RE 的镜像一致）。
+   * 保存后草稿直接重锚为导入结果（不等重拉），再 tplRev+1 取权威行。 */
+  async function importFlowRows(rows: FlowImportRow[]): Promise<ImportResult> {
+    const ordered = [...rows].sort((a, b) => a.no - b.no);
+    const steps: FlowStep[] = ordered.map((r) => ({
+      goal: r.goal,
+      ref: serializeStepRef({ script: r.script, branches: r.branches, notes: r.notes }),
+      ...(r.say ? { say: true } : {}),
+    }));
+    await api.updateTemplate(selId, { steps_json: stepsToJson(steps) });
+    setStepsDraft(steps);
+    setStepsDirty(false);
+    setApplyNote(`已从表格导入 ${steps.length} 步（整表替换）`);
+    setTplRev((v) => v + 1);
+    return { done: steps.length, failed: 0, errors: [] };
+  }
+
+  // —— 画布连线（2026-09-26）：意图→步骤 拖线=改绑定,graph_json 单键立即落库（qa 画布
+  // 拖线同款姿势——绑定是图数据不是步骤草稿,不进「应用」缓冲）;保存后 tplRev+1 重拉,
+  // 画布边与意图管理 tab 都拿到权威数据。步骤草稿（未保存改动）不受影响。
+  async function bindIntentJump(intentId: string, stepNo: number) {
+    if (!selId) return;
+    const next = graphDocWithJumpBinding(
+      typeof tplRow?.graph_json === "string" ? tplRow.graph_json : "",
+      intentId,
+      stepNo,
+      stepsDraft.length,
+    );
+    if (!next) {
+      setApplyNote("画布连线失败：意图不存在或步号越界，刷新后重试。");
+      return;
+    }
+    try {
+      await api.updateTemplate(selId, { graph_json: JSON.stringify(next) });
+      setApplyNote(`画布连线已保存：该意图命中后跳到第 ${stepNo} 步（记得有未发布的改动要去发布）`);
+      setTplRev((v) => v + 1);
+    } catch (e) {
+      setApplyNote(`画布连线失败：${String(e)}`);
+    }
+  }
+
+  async function unbindIntentJump(intentId: string) {
+    if (!selId) return;
+    const next = graphDocWithoutIntentBindings(
+      typeof tplRow?.graph_json === "string" ? tplRow.graph_json : "",
+      intentId,
+    );
+    if (!next) return;
+    try {
+      await api.updateTemplate(selId, { graph_json: JSON.stringify(next) });
+      setApplyNote("已解除该意图的连线（意图与关键词保留）");
+      setTplRev((v) => v + 1);
+    } catch (e) {
+      setApplyNote(`解除连线失败：${String(e)}`);
+    }
+  }
 
   /** 全局「应用」：唯一保存入口（只写 steps_json 单键,PUT exclude_unset 部分更新）。 */
   async function applySteps() {
@@ -242,8 +402,22 @@ export default function StudioPage() {
 
   // ---- tab 切换（qa 页 view chips 同款写法）；学习报告 tab 仅对有 reports 键的人出现 ----
   const [tab, setTab] = useState("flow");
+  // 主流程 tab 双视图：默认「列表编辑」,画布为切换选项;选择记 localStorage（见文件头注释）。
+  const [flowView, setFlowView] = useState<"form" | "canvas">(readStoredFlowView);
+  const switchFlowView = useCallback((v: "form" | "canvas") => {
+    setFlowView(v);
+    try {
+      window.localStorage.setItem(FLOW_VIEW_STORAGE_KEY, v);
+    } catch {
+      // 存储不可用:选择只在本次会话生效,功能不受影响。
+    }
+  }, []);
+  // 合并注记：意图 tab 是本线（HEAD）的工作站分区——origin/main 的 P2.5 把意图折进
+  // 「主流程」表单（画布退役线），本线画布在役、意图编辑器独立成 tab（画布
+  // onOpenIntents 也深链到这里），故保留 HEAD 分区。
   const tabs: [string, string][] = [
     ["flow", "主流程"],
+    ["intent", "意图管理"],
     ["qa", "问答库"],
     ["vars", "变量设定"],
     ["disposition", "客户意向"],
@@ -295,6 +469,80 @@ export default function StudioPage() {
     [qaRows, selId],
   );
 
+  // ---- 分支罐头状态（主流程画布答法抽屉，2026-09-20）：statuses 键=分支 resp
+  // 原文（含动作标记）。进主流程 tab / 换模板 / 换账号拉一次（TTL 缓存在 CP 侧，
+  // 补录后 branchRev+1 定点刷一次，不轮询）。拉取失败=无徽标降级，不阻塞画布。 ----
+  const [branchCanned, setBranchCanned] = useState<Record<string, "ok" | "missing" | "ph">>({});
+  const [branchRev, setBranchRev] = useState(0);
+  const [branchNote, setBranchNote] = useState("");
+  useEffect(() => {
+    if (tab !== "flow" || !selId) return;
+    let alive = true;
+    api.branchCannedStatus(accountId)
+      .then((res) => {
+        if (alive) setBranchCanned(res?.statuses ?? {});
+      })
+      .catch(() => {
+        if (alive) setBranchCanned({});
+      });
+    return () => {
+      alive = false;
+    };
+  }, [tab, selId, accountId, branchRev]);
+
+  // 场景画布当前步（页面层持有,2026-09-26 实弹:组件内部态在画布↔表单视图切换
+  // 重挂时丢失,选步被弹回第 1 步、连线落错步——受控上提后视图往返保持选步）。
+  const [canvasStep, setCanvasStep] = useState(1);
+  useEffect(() => {
+    setCanvasStep(1); // 换模板回第 1 步
+  }, [selId]);
+
+  // ---- 快答标签（场景画布 play_qa 徽章文案，2026-09-26）：qa_id → question_text。
+  // 进主流程画布视图 / 换模板 / 换账号拉一次;失败=徽章降级「词条缺失」，不阻塞画布。 ----
+  const [qaLabels, setQaLabels] = useState<Record<string, string>>({});
+  useEffect(() => {
+    if (tab !== "flow" || flowView !== "canvas" || !selId) return;
+    let alive = true;
+    api.listQaAll(accountId)
+      .then((rows) => {
+        if (!alive) return;
+        const m: Record<string, string> = {};
+        for (const r of Array.isArray(rows) ? rows : []) {
+          const id = String(r?.id ?? "");
+          const q = String(r?.question_text ?? "").trim();
+          if (id && q) m[id] = q;
+        }
+        setQaLabels(m);
+      })
+      .catch(() => {
+        if (alive) setQaLabels({});
+      });
+    return () => {
+      alive = false;
+    };
+  }, [tab, flowView, selId, accountId]);
+
+  /** 分支一键补录（答法抽屉「补录这条」）：queued→人话提示+5s 后刷一次状态。 */
+  async function pregenBranch(resp: string) {
+    setBranchNote("");
+    try {
+      const res = await api.branchPregen(accountId, [resp]);
+      if (res?.status === "queued") {
+        setBranchNote("补录任务已排队，AI 正在生成这条录音，稍后自动刷新状态。");
+        window.setTimeout(() => {
+          setBranchNote("");
+          setBranchRev((v) => v + 1);
+        }, 5000);
+      } else if (res?.status === "already_running") {
+        setBranchNote("上一批补录还在进行中，等它跑完再试。");
+      } else {
+        setBranchNote(`补录没有启动（${res?.status ?? "unknown"}）。`);
+      }
+    } catch (e) {
+      setBranchNote(`补录失败：${String(e)}`);
+    }
+  }
+
   // ---- 通话日志 tab：全量拉取后客户端按模板过滤（照 calls 页惯例） ----
   const [callRows, setCallRows] = useState<Record<string, unknown>[]>([]);
   const [callsLoading, setCallsLoading] = useState(false);
@@ -338,7 +586,7 @@ export default function StudioPage() {
         <div className="mb-8 flex items-start justify-between gap-3">
           <div>
             <h1 className="page-title">AI 工作站</h1>
-            <p className="page-sub">按话术模板集中作业：主流程 · 问答库 · 变量 · 客户意向 · 录音沉淀 · 通话日志 · 学习报告</p>
+            <p className="page-sub">按话术模板集中作业：主流程 · 意图管理 · 问答库 · 变量 · 客户意向 · 录音沉淀 · 通话日志 · 学习报告</p>
           </div>
           {!creating && (
             <button className="btn-primary shrink-0" onClick={() => setCreating(true)}>
@@ -491,36 +739,96 @@ export default function StudioPage() {
             ))}
           </div>
 
-          {/* 1. 主流程：步骤表单（唯一编辑面，画布已退役 P2.5）+ 意图折叠卡 + 模板设置；
-              步骤草稿走右上角「应用」统一保存，意图/设置各自独立保存 */}
+          {/* 1. 主流程：列表编辑（默认）/ 画布——同一份工作站层草稿,右上角「应用」统一保存 */}
           {tab === "flow" && (
-            <div className="space-y-3">
-              <StepsListEditor
-                value={stepsDraft}
-                onChange={changeSteps}
-                readOnly={contentReadOnly}
-                lang={String(tplRow?.language ?? "zh")}
-              />
-              {/* 意图（第一层识别）：表格+弹窗直编 graph_json，写路径走 lib/intent-table */}
-              <IntentManager
-                tpl={tplRow}
-                accountId={accountId}
-                readOnly={contentReadOnly}
-                onSaved={() => setTplRev((v) => v + 1)}
-              />
-              {/* 模板设置（名称/语言/语气/热词）：独立保存,不碰步骤草稿 */}
-              <details className="card">
-                <summary className="cursor-pointer text-sm font-medium">
-                  模板设置 <span className="ml-1 text-xs muted">（名称 / 语言 / 语气 / 热词——本块有独立保存按钮）</span>
-                </summary>
-                <div className="mt-3">
-                  <TemplateEditor tpl={tplRow} variant="meta" onSaved={() => setTplRev((v) => v + 1)} />
-                </div>
-              </details>
+            <div className="space-y-2">
+              <div className="flex items-center gap-1">
+                {([["form", "列表编辑"], ["canvas", "画布"]] as const).map(([k, label]) => (
+                  <button
+                    key={k}
+                    className={`btn-ghost text-xs ${flowView === k ? "border-(--live) text-(--live-ink)" : "muted"}`}
+                    onClick={() => switchFlowView(k)}
+                  >
+                    {label}
+                  </button>
+                ))}
+                {/* 表格导入（整表替换 steps_json）+ 示例模板下载 */}
+                {!contentReadOnly && (
+                  <>
+                    <button className="btn-ghost text-xs" onClick={() => setFlowImportOpen(true)}>
+                      导入话术
+                    </button>
+                    <button
+                      className="btn-ghost text-xs"
+                      title="下载示例 CSV（含列说明注释行，导入时自动忽略）"
+                      onClick={() =>
+                        downloadCsv(FLOW_IMPORT_FILENAME, buildExampleCsvRows(FLOW_IMPORT_COLUMNS, FLOW_IMPORT_EXAMPLE))
+                      }
+                    >
+                      下载示例模板
+                    </button>
+                  </>
+                )}
+                {branchNote && <span className="ml-auto text-xs text-amber-700">{branchNote}</span>}
+              </div>
+              {/* 重派生保险（2026-09-25「列表与画布对不上」排查收尾,2026-09-26 场景画布再修）：
+                  两视图同吃页面层 stepsDraft、切换视图=条件渲染卸载重挂,天然拿最新草稿。
+                  key 只钉模板 id——长度保险是旧大画布的遗留（按下标寻址的拖动覆盖会错位）,
+                  StepCanvasView 无拖动覆盖、currentStep 自带越界钳制,长度入 key 反而把
+                  「加一步自动跳新步」冲掉（key 变=整树重挂=内部状态归零,实弹抓出）。 */}
+              {flowView === "canvas" ? (
+                <StepCanvasView
+                  key={selId}
+                  currentStep={canvasStep}
+                  onCurrentStepChange={setCanvasStep}
+                  tpl={tplRow}
+                  graph={graph}
+                  draft={stepsDraft}
+                  onDraftChange={changeSteps}
+                  qaLabels={qaLabels}
+                  branchCanned={branchCanned}
+                  onPregenBranch={pregenBranch}
+                  onOpenIntents={() => setTab("intent")}
+                  onBindJump={bindIntentJump}
+                  onUnbindJump={unbindIntentJump}
+                />
+              ) : (
+                <>
+                  <StepsListEditor
+                    value={stepsDraft}
+                    onChange={changeSteps}
+                    readOnly={contentReadOnly}
+                    lang={String(tplRow?.language ?? "zh")}
+                  />
+                  {/* 模板设置（名称/语言/语气/热词）：独立保存,不碰步骤草稿 */}
+                  <details className="card">
+                    <summary className="cursor-pointer text-sm font-medium">
+                      模板设置 <span className="ml-1 text-xs muted">（名称 / 语言 / 语气 / 热词——本块有独立保存按钮）</span>
+                    </summary>
+                    <div className="mt-3">
+                      <TemplateEditor tpl={tplRow} variant="meta" onSaved={() => setTplRev((v) => v + 1)} />
+                    </div>
+                  </details>
+                </>
+              )}
             </div>
           )}
 
-          {/* 2. 问答库（PRD 3.4）：表格+弹窗；多轮行为（播完跳转/通知人工）在主流程的意图卡挂 play_qa 绑定 */}
+          {/* 2. 意图管理（PRD 3.3）：第一层识别——表格+弹窗直编 graph_json；种子包逐条登记。
+              合并注记：origin/main P2.5 把意图折进「主流程」表单（画布退役线），本线保留
+              独立意图 tab（画布 onOpenIntents 深链此处）；IntentManager 本体已采合并后
+              （lib/intent-table）结构 + 本线表格导入/语言过滤/种子包。 */}
+          {tab === "intent" && tplRow && (
+            <IntentManager
+              tpl={tplRow}
+              accountId={accountId}
+              readOnly={contentReadOnly}
+              onSaved={() => setTplRev((v) => v + 1)}
+              seedIntents={seedPackFor(String(tplRow.language ?? "zh")).intents}
+            />
+          )}
+
+          {/* 2b. 问答库（PRD 3.4）：表格+弹窗；多轮行为（播完跳转/通知人工）在意图管理挂 play_qa 绑定 */}
           {tab === "qa" && tplRow && (
             <QaLibrary
               accountId={accountId}
@@ -580,7 +888,8 @@ export default function StudioPage() {
               <div className="rounded-lg border border-dashed border-(--card-border) p-3 text-xs muted">
                 补录 / 重新录音请前往
                 <Link href="/qa/" className="text-(--live)">问答画布</Link>
-                （可右键条目重新录音）。
+                （画布视图可右键条目重新录音）。
+                分支录音（话术步的「如果客户…→就…」应对）在主流程画布的答法抽屉里查看/补录。
               </div>
               </div>
             </section>
@@ -653,6 +962,30 @@ export default function StudioPage() {
             </>
           )}
         </>
+      )}
+
+      {/* 主流程表格导入（2026-09-25）：CSV 上传→预览（N 行将导入/M 行跳过及原因）→
+          确认（整表替换 steps_json）→保存→摘要 */}
+      {Boolean(selId) && (
+        <TableImport<FlowImportRow>
+          open={flowImportOpen}
+          title="导入话术（表格）"
+          description="整表替换：导入将覆盖当前主流程的全部步骤（按步号排序），保存后立即生效为草稿。"
+          columns={FLOW_IMPORT_COLUMNS}
+          exampleRows={FLOW_IMPORT_EXAMPLE}
+          exampleFilename={FLOW_IMPORT_FILENAME}
+          parseRow={parseFlowImportRow}
+          onImport={importFlowRows}
+          confirmText={(n) => {
+            const lines = [
+              `导入将【整表替换】当前主流程的全部步骤：现有 ${stepsList.length} 步 → 表格的 ${n} 步。`,
+            ];
+            if (stepsDirty) lines.push("注意：还有未应用的修改，将被这次导入覆盖。");
+            lines.push("替换后立即保存，无需再点「应用」；已发布版本不受影响。确定继续？");
+            return lines.join("\n");
+          }}
+          onClose={() => setFlowImportOpen(false)}
+        />
       )}
     </div>
   );

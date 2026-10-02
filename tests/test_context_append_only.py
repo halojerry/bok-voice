@@ -17,6 +17,19 @@ from livekit.agents import llm
 
 from agent_runtime.providers.livekit_plugins import ContextAwareLLM, ContextState  # noqa: E402
 
+_PLUGIN_SRC = (
+    Path(__file__).resolve().parents[1]
+    / "apps" / "agent" / "agent_runtime" / "providers" / "livekit_plugins.py"
+).read_text(encoding="utf-8")
+
+
+def test_retry_rewrite_is_byte_gated_f3():
+    """F3:重试/重建轮按字节比对冻结尾部——相同则原样重放(前缀不裂),不同才重写;
+    两个归因标签都在,防回退到「按 revision 无条件重写」(19.9% 尾部断裂来源)。"""
+    assert "TAIL_REWRITE identical_skipped" in _PLUGIN_SRC
+    assert "TAIL_REWRITE content_changed" in _PLUGIN_SRC
+    assert "tail_emit_stable_for_rebuild()" in _PLUGIN_SRC
+
 
 class _CaptureInner:
     """抓每次 chat() 收到的 chat_ctx items（序列化成文本便于前缀断言）。"""
@@ -150,3 +163,30 @@ def test_preemptive_rebuild_rebases_corrected_transcript():
     s2 = "\n".join(f"{ro}:{c}" for ro, c in r2)
     s3 = "\n".join(f"{ro}:{c}" for ro, c in r3)
     assert s3.startswith(s2 + "\n"), f"重锚定后必须严格前缀\n---r2---\n{s2}\n---r3---\n{s3}"
+
+
+def test_two_segment_tail_stable_only_first_message_of_step():
+    """F1 两段化:稳定段(步身份/目标/底稿)只在每步首条消息进尾部,同一步后续
+    消息只带增量段(verdict/数字/分支);旧步稳定指引留在首条消息的历史里。"""
+    llm = _make_ctx()
+    llm._ctx.set_user_language("zh")
+    _STEP_V1 = "流程第 1/2 步\n这一步要达成:确认身份"
+    _STEP_V2 = (
+        "流程第 1/2 步\n这一步要达成:确认身份\n"
+        "【客户在提问】先用事实直接回答客户的问题，答完带回当前步。"
+    )
+    llm._ctx.set_flow_current(_STEP_V1)
+    r1 = _run(llm, [("system", "人设base"), ("user", "你好")])
+    u1 = next(c for ro, c in r1 if ro == "user")
+    assert "【现在这一步】" in u1 and "确认身份" in u1, u1
+    # 同一步后续轮:稳定段不再发,只带增量段(旧的稳定指引在首条消息历史里)。
+    llm._ctx.set_flow_current(_STEP_V2)
+    r2 = _run(llm, [("system", "人设base"), ("user", "你好"), ("assistant", "您好"), ("user", "点解")])
+    users = [c for ro, c in r2 if ro == "user"]
+    assert "【现在这一步】" in users[0], "首条消息的冻结尾部仍带稳定段"
+    assert "【现在这一步】" not in users[-1], "同一步后续消息不再带稳定段"
+    assert "客户在提问" in users[-1], "增量段每轮都发"
+    # 严格前缀不破。
+    s1 = "\n".join(f"{ro}:{c}" for ro, c in r1)
+    s2 = "\n".join(f"{ro}:{c}" for ro, c in r2)
+    assert s2.startswith(s1 + "\n")

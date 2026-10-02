@@ -96,10 +96,58 @@ def test_fresh_partial_zero_tail_returns_partial_directly():
     svc = _make_svc(mod, model)
 
     sid = svc.start(language="cantonese")
-    _run_partial(mod, svc, sid, VOICED * (16000 * 2))
+    # 3s(>2.0s 整句解码门):零尾巴直转係长 buffer 域的机制,短 buffer 由
+    # test_short_finish_full_decode_override 钉新门。
+    _run_partial(mod, svc, sid, VOICED * (16000 * 3))
     final = svc.finish(sid)
     assert final["partial"] is False and final["text"] == PARTIAL_TEXT
     assert len(model.calls) == 1  # 只有 partial 那一窗
+
+
+def test_covered_past_trimmed_end_promotes_partial_directly():
+    """W6 VAC 直转:partial 快照落在尾部静音区(covered > 裁剪后长度)→ 零 GPU 直转。
+
+    稳定性门:须两窗收敛(第二窗文本是第一窗的延伸/相等)——劣化重解与单词
+    partial 唔够格(fast_speech 探针 3/3 FAIL 实证:1.2s 语音被劣化窗出 4 字)。
+    旧守卫 `0 < covered <= len(pcm)` 把这个场景整个打成整句兜底 0.5-1.2s。
+    """
+    mod = _load_sidecar_app()
+    model = _FakeModel()
+    svc = _make_svc(mod, model)
+
+    sid = svc.start(language="cantonese")
+    voiced = VOICED * (16000 * 3)  # 3s 语音(>2.0s 整句解码门,VAC 直转的主战场域)
+    silence = b"\x00\x00" * int(16000 * 0.4)  # 0.4s 静音(VAD 停嘴等窗)
+    _run_partial(mod, svc, sid, voiced + silence)  # 第一窗:快照 3.4s 含尾静音
+    # 第二窗:再多 0.3s 静音(快照 3.7s)——_FakeModel 对 >1s 输入恒回同文本=相等收敛。
+    _run_partial(mod, svc, sid, b"\x00\x00" * int(16000 * 0.3))
+    assert svc._sessions[sid]["partial_covered"] == len(voiced + silence) + int(16000 * 0.3) * 2
+
+    final = svc.finish(sid)  # trim 裁掉全部尾静音 → len < covered → VAC 直转
+    assert final["partial"] is False and final["text"] == PARTIAL_TEXT
+    assert final["language"] == "Cantonese"
+    assert len(model.calls) == 2  # 只有两窗 partial,零额外解码(VAC 主战场)
+
+
+def test_vac_direct_rejects_unstable_single_partial():
+    """W6 稳定性门反例:只有一窗 partial(无收敛证据)→ 唔直转,整句兜底。
+
+    快语速实证形态:劣化 partial 解码比整句差,单词 partial 没有第二窗佐证。
+    """
+    mod = _load_sidecar_app()
+    model = _FakeModel()
+    svc = _make_svc(mod, model)
+
+    sid = svc.start(language="cantonese")
+    voiced = VOICED * (16000 * 2)
+    silence = b"\x00\x00" * int(16000 * 0.4)
+    _run_partial(mod, svc, sid, voiced + silence)  # 单窗,prev 为空
+
+    final = svc.finish(sid)
+    assert final["partial"] is False and final["text"] == PARTIAL_TEXT
+    # 不直转:整句兜底多解码一次,喂裁剪后整段(2s=32000 样本)。
+    assert len(model.calls) == 2
+    assert model.calls[1]["samples"] == 32000
 
 
 def test_stale_partial_finish_falls_back_to_whole_decode():
@@ -198,7 +246,12 @@ def test_inc_finish_disabled_goes_whole_decode():
 
 
 def test_trailing_silence_trimmed_before_decode():
-    """EOT 卫生:finish buffer 尾部静音先裁掉再解码(整句路径同样受益)。"""
+    """EOT 卫生:finish buffer 尾部静音先裁掉再解码(整句路径同样受益)。
+
+    W6 后须把 partial 做陈旧:新鲜 partial 快照含尾静音时,VAC 直转合法接管
+    (partial 已在含静音的全量 buffer 上解码过,零 GPU 即正解)——本测试钉的是
+    **整句兜底路径**的裁剪纪律,故让增量让位(stale partial),断言面不变。
+    """
     mod = _load_sidecar_app()
     model = _FakeModel()
     svc = _make_svc(mod, model)
@@ -207,6 +260,8 @@ def test_trailing_silence_trimmed_before_decode():
     loud = (b"\x00\x19" * 16000)[: 16000 * 2]  # 1s 恒定振幅「语音」
     silence = b"\x00\x00" * 16000  # 1s 静音尾巴
     svc.chunk(sid, loud + silence)
+    # partial 陈旧化:增量路径让位整句兜底,裁剪断言才有落点。
+    svc._sessions[sid]["last_partial_at"] = time.monotonic() - 10
     final = svc.finish(sid)
     assert final["partial"] is False
     # generate 只喂 1s 语音段(16000 样本),1s 静音尾巴被裁。
@@ -333,3 +388,23 @@ def test_plausible_partial_still_uses_incremental_path():
     final = svc.finish(sid)
     assert final["text"] == PARTIAL_TEXT + TAIL_TEXT  # 增量拼接生效
     assert calls[-1] == 8000  # 只解尾巴
+
+
+def test_short_finish_full_decode_override():
+    """短音频(≤2.0s)finish 走整句解码门(2026-09-28 EX-4):碎片轮要真置信度。
+
+    增量拼接路径不产 confidence(_with_confidence(..., None)),而重问车道
+    (garbled-reask)恰好喺短碎片轮上要判据——故 trimmed ≤2s 时跳过增量
+    直转、整句解码取 per-token 置信度;长 buffer 维持增量快路(上面各测试)。
+    """
+    mod = _load_sidecar_app()
+    model = _FakeModel()
+    svc = _make_svc(mod, model)
+
+    sid = svc.start(language="cantonese")
+    _run_partial(mod, svc, sid, VOICED * int(16000 * 1.2))  # 1.2s ≤ 2.0s 门内
+    final = svc.finish(sid)
+    assert final["partial"] is False and final["text"] == PARTIAL_TEXT
+    # 整句重解码:第二个 call 喂全量 1.2s=19200 样本(唔係尾巴小窗 8000)。
+    assert len(model.calls) == 2
+    assert model.calls[1]["samples"] == 19200

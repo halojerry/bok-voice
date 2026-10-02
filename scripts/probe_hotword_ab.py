@@ -61,6 +61,15 @@ SENT_GAP_S = float(os.environ.get("PROBE_SLEEP_S", "0.6") or 0.6)
 ROUND_GAP_S = 0.5
 LANGUAGE = "cantonese"
 TTS_VOICE = "Vivian"  # 与 e2e_real_customer.CUSTOMER_VOICE 同源
+# 标签 A/B 旋钮（2026-09-27）：Qwen3-ASR 官方 context 就是裸 system message，
+# 「Vocabulary:」前缀是仓内自造物；type4me 源码级证据「加标签反而更易抄词」+
+# 仓内 2026-09-21 计划 §10 云端实测（带标签 6/10→4/10 更差）。默认 "1"=保持
+# 现行为（探针历史读数可比性）；"0"=裸 join（", ".join(words)）。
+LABEL_ON = os.environ.get("PROBE_LABEL", "1") == "1"
+# 档位筛选（标签 A/B 只跑 current 一档省 GPU）：默认全三档（现行为）。
+TIERS_FILTER = tuple(
+    t.strip() for t in os.environ.get("PROBE_TIERS", "none,current,extended").split(",") if t.strip()
+)
 
 # ---- 词表（只读常量，不改 agent.py）----
 
@@ -75,7 +84,11 @@ VOCAB_EXTRA: tuple[str, ...] = (
     "倉庫", "熱線", "官網",
 )
 
-TIERS: tuple[str, ...] = ("none", "current", "extended")
+TIERS: tuple[str, ...] = tuple(t for t in ("none", "current", "extended") if t in TIERS_FILTER) or (
+    "none",
+    "current",
+    "extended",
+)
 
 
 def merge_vocab(base: tuple[str, ...], extra: tuple[str, ...] = ()) -> tuple[str, ...]:
@@ -92,10 +105,12 @@ def merge_vocab(base: tuple[str, ...], extra: tuple[str, ...] = ()) -> tuple[str
 
 
 def build_context(words: tuple[str, ...]) -> str:
-    """格式对齐官方模型卡/agent asr_hotword_context()：「Vocabulary: w1, w2, …」。"""
+    """格式对齐 agent asr_hotword_context()：标签档「Vocabulary: w1, w2, …」；
+    PROBE_LABEL=0 裸 join（标签 A/B 的对照臂——官方 context 本无格式要求）。"""
     if not words:
         return ""
-    return "Vocabulary: " + ", ".join(words)
+    joined = ", ".join(words)
+    return f"Vocabulary: {joined}" if LABEL_ON else joined
 
 
 CONTEXTS: dict[str, str] = {
@@ -274,23 +289,32 @@ def main() -> int:
         stats[tier] = st
         print(f"  {tier:9} 命中 {st['hits']}/10  平均句相似度 {st['mean_sim']:.3f}  "
               f"平均端到端 {st['mean_e2e_s'] * 1000:.0f}ms")
-    base = stats["none"]["mean_e2e_s"]
-    delta = (stats["extended"]["mean_e2e_s"] - base) / base * 100 if base else 0.0
-    print(f"  cost_delta(extended vs none) = {delta:+.1f}%  ({'无感 <15%' if abs(delta) < 15 else '可感 ≥15%'})")
-
-    verdict = (f"HOTWORD_AB none={stats['none']['hits']}/10 "
-               f"current={stats['current']['hits']}/10 "
-               f"extended={stats['extended']['hits']}/10 cost_delta={delta:.0f}%")
-    print(verdict)
+    # 三档齐跑才有 cost_delta/verdict（PROBE_TIERS 筛选单档跑标签 A/B 时跳过）。
+    delta = 0.0
+    if "none" in stats and "extended" in stats:
+        base = stats["none"]["mean_e2e_s"]
+        delta = (stats["extended"]["mean_e2e_s"] - base) / base * 100 if base else 0.0
+        print(f"  cost_delta(extended vs none) = {delta:+.1f}%  ({'无感 <15%' if abs(delta) < 15 else '可感 ≥15%'})")
+        verdict = (f"HOTWORD_AB none={stats['none']['hits']}/10 "
+                   f"current={stats['current']['hits']}/10 "
+                   f"extended={stats['extended']['hits']}/10 cost_delta={delta:.0f}%")
+        print(verdict)
+    elif len(stats) == 1:
+        only = next(iter(stats.values()))
+        print(f"HOTWORD_AB single-tier tier={only['tier']} label={'on' if LABEL_ON else 'off'} "
+              f"hits={only['hits']}/10 sim={only['mean_sim']:.3f} e2e={only['mean_e2e_s'] * 1000:.0f}ms")
 
     out = ROOT / "scripts" / f".probe_hotword_ab.{TAG}.json"
     out.write_text(json.dumps(
-        {"tag": TAG, "rounds": ROUNDS, "contexts": CONTEXTS,
+        {"tag": TAG, "rounds": ROUNDS, "label_on": LABEL_ON, "contexts": CONTEXTS,
          "sentences": SENTENCES, "records": records,
          "summary": stats, "cost_delta_pct": delta},
         ensure_ascii=False, indent=1))
     print(f"saved -> {out.name}")
-    return 0 if stats["extended"]["hits"] >= stats["none"]["hits"] else 1
+    first, last = TIERS[0], TIERS[-1]
+    if "none" in stats and "extended" in stats:
+        return 0 if stats["extended"]["hits"] >= stats["none"]["hits"] else 1
+    return 0 if stats[first]["hits"] >= stats[last]["hits"] else 1
 
 
 if __name__ == "__main__":

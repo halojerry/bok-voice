@@ -534,3 +534,22 @@ def test_settings_secret_surface_root_only(monkeypatch):
     assert client.get("/api/settings", headers=ids["admin"]).status_code == 200
     # auth-off（无身份非加固）保持可读——单机形态零变化
     assert client.get("/api/settings?internal=1").status_code == 200
+
+
+def test_settings_put_root_only(monkeypatch):
+    """PUT /api/settings 收 root（2026-09-27，镜像 model_routing 红线）：
+    settings 单行=全 CP 唯一真源、多节点 agent 每通热读——admin（即使持
+    settings 键）改一处=所有本地部署跟着变，故引擎段只归平台方。GET 掩码面
+    仍按 settings 键（voice-options/personas 读面靠它）。"""
+    client, _repo, ids = _setup(monkeypatch)
+    # admin（存量 ''=全量，含 settings 键）：读掩码面 200、写恒 403
+    assert client.get("/api/settings", headers=ids["admin"]).status_code == 200
+    assert client.put("/api/settings", headers=ids["admin"],
+                      json={"policy": "offline_first"}).status_code == 403
+    # user：auto_gate 先拦（管理键恒 403）
+    assert client.put("/api/settings", headers=ids["op1"],
+                      json={"policy": "offline_first"}).status_code == 403
+    # root / auth-off 单机形态照常
+    assert client.put("/api/settings", headers=ids["root"],
+                      json={"policy": "offline_first"}).status_code == 200
+    assert client.put("/api/settings", json={"policy": "offline_first"}).status_code == 200

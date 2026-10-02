@@ -19,8 +19,14 @@ _ROOT = Path(__file__).resolve().parents[1]
 _SPEC = importlib.util.spec_from_file_location(
     "probe_branch_action", _ROOT / "scripts" / "probe_branch_action.py")
 pba = importlib.util.module_from_spec(_SPEC)
-sys.modules.setdefault("livekit", type(sys)("livekit"))  # 探针顶层 import livekit.rtc
-sys.modules.setdefault("livekit.rtc", type(sys)("rtc"))
+# 探针顶层 import livekit.rtc：真库在场先真导入（setdefault 空壳会让后跑的
+# test_flow_controller 等真库测试撞 ModuleNotFoundError——先跑谁谁绿的顺序污染,
+# 2026-09-26 场景画布验收时批量跑两个文件实弹抓出;仅无 venv 真库的环境才落壳）。
+try:
+    import livekit.rtc  # noqa: F401
+except Exception:
+    sys.modules.setdefault("livekit", type(sys)("livekit"))
+    sys.modules.setdefault("livekit.rtc", type(sys)("rtc"))
 _SPEC.loader.exec_module(pba)
 
 

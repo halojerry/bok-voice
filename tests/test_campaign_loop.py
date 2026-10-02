@@ -6,6 +6,8 @@ os.environ.setdefault("DATABASE_URL", "")  # force in-memory repo for tests
 os.environ.setdefault("LIVEKIT_API_KEY", "devkey")
 os.environ.setdefault("LIVEKIT_API_SECRET", "devsecret")
 os.environ.setdefault("LIVEKIT_URL", "ws://127.0.0.1:7880")
+# 本文件钉调度循环语义（战役多无模板）；模板强绑闸契约见 test_template_gate.py。
+os.environ.setdefault("BOK_REQUIRE_TEMPLATE", "0")
 
 import asyncio
 import json
@@ -26,13 +28,29 @@ NOW = datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _window_inside_now() -> list[dict]:
-    """覆盖 NOW 的任务窗：[NOW 整点, 下一整点+58m)。任一秒都保证含 NOW。"""
+    """覆盖 NOW 的任务窗：[NOW 整点, 下一整点+58m)。任一秒都保证含 NOW。
+
+    午夜坑(2026-10-01 00:2x 本地=UTC 22-24 点实弹翻车):hour 23 时
+    [23:00, 00:58] 跨零点=解析层不支持的形状,窗被当非法丢弃→空表=不限,
+    「窗内」断言变成空洞通过。该时段改用 [NOW-1h, 23:59](同日不跨零点)。
+    """
+    if NOW.hour >= 23:
+        return [{"days": [NOW.isoweekday()], "start": f"{NOW.hour - 1:02d}:00",
+                 "end": "23:59"}]
     return [{"days": [NOW.isoweekday()], "start": f"{NOW.hour:02d}:00",
              "end": f"{(NOW.hour + 1) % 24:02d}:58"}]
 
 
 def _window_outside_now() -> list[dict]:
-    """同日但绝不含 NOW 的窗：[NOW+1h, NOW+2h]（模 24，含跨零点形态）。"""
+    """同日但绝不含 NOW 的窗：[NOW+1h, NOW+2h]。
+
+    午夜坑(同上):hour ≥22 时 [NOW+1, NOW+2] 跨零点被解析层丢弃 → 全局窗
+    读回 [] → 空=不限 → 本应拦截的窗照拨(test_global_window_intersects
+    _task_window started=1 实弹)。该时段改用当日清晨 [00:00, NOW-1h)。
+    """
+    if NOW.hour >= 22:
+        return [{"days": [NOW.isoweekday()], "start": "00:00",
+                 "end": f"{max(NOW.hour - 1, 1):02d}:00"}]
     return [{"days": [NOW.isoweekday()], "start": f"{(NOW.hour + 1) % 24:02d}:00",
              "end": f"{(NOW.hour + 2) % 24:02d}:59"}]
 

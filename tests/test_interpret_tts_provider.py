@@ -15,6 +15,15 @@ from agent_runtime import interpret
 _MINIMAX_BOOST = "Chinese,Yue"
 
 
+def _primary(provider):
+    """取 TTS 链主档(纯测试辅助)。
+
+    2026-09-27 起 MiniMax 档返回官方 FallbackAdapter(primary=MiniMax,
+    backup=本地 Qwen3);断言音色/模型须看主实例。裸实例(TestTTS/本地档/
+    测试环境 BOK_LOCAL_TTS=0)原样返回。"""
+    return getattr(provider, "_tts_instances", [provider])[0]
+
+
 def test_build_tts_provider_minimax_branch(monkeypatch):
     from agent_runtime.providers.livekit_plugins import MiniMaxTTS
 
@@ -27,16 +36,16 @@ def test_build_tts_provider_minimax_branch(monkeypatch):
         "sample_rate": 24000,
     }
     provider = interpret._build_tts_provider(cfg, "cantonese")
-    assert isinstance(provider, MiniMaxTTS)
+    assert isinstance(_primary(provider), MiniMaxTTS)
     # 音色锁口音：粤目标语解析到设置页配的粤语音色。
-    assert provider._resolve_voice() == "Cantonese_GentleLady"
-    assert provider._language_state.lang == "cantonese"
+    assert _primary(provider)._resolve_voice() == "Cantonese_GentleLady"
+    assert _primary(provider)._language_state.lang == "cantonese"
     # B 线默认 2.8-turbo 档(2026-09-16 起:语气词标记仅 2.8 系支持;原 2.6-turbo)
     # + language_boost 锁目标语——经构造参数下发,唔写进程 env(setdefault 跨会话
     # 驻留已废,评审 follow-up,与采样档 P2-3 同治理)。
-    assert provider._model() == "speech-2.8-turbo"
-    assert provider._language_boost() == _MINIMAX_BOOST
-    assert provider._api_key() == "k-test"
+    assert _primary(provider)._model() == "speech-2.8-turbo"
+    assert _primary(provider)._language_boost() == _MINIMAX_BOOST
+    assert _primary(provider)._api_key() == "k-test"
     assert "MINIMAX_MODEL" not in os.environ
     assert "MINIMAX_LANGUAGE_BOOST" not in os.environ
 
@@ -53,12 +62,12 @@ def test_build_tts_provider_minimax_boost_and_voice_per_target(monkeypatch):
     cfg = {"provider": "minimax_streaming", "speaker_en": "my-en-voice"}
 
     zh = interpret._build_tts_provider(cfg, "zh")
-    assert zh._language_boost() == "Chinese"
-    assert zh._resolve_voice() == "Chinese (Mandarin)_News_Anchor"
+    assert _primary(zh)._language_boost() == "Chinese"
+    assert _primary(zh)._resolve_voice() == "Chinese (Mandarin)_News_Anchor"
 
     en = interpret._build_tts_provider(cfg, "en")
-    assert en._language_boost() == "English"
-    assert en._resolve_voice() == "my-en-voice"
+    assert _primary(en)._language_boost() == "English"
+    assert _primary(en)._resolve_voice() == "my-en-voice"
     assert "MINIMAX_LANGUAGE_BOOST" not in os.environ
 
 
@@ -70,10 +79,17 @@ def test_build_tts_provider_qwen3_fallback(monkeypatch):
         monkeypatch.delenv(key, raising=False)
     provider = interpret._build_tts_provider({"provider": "qwen3_tts", "speaker": "wan2"}, "zh")
     assert isinstance(provider, Qwen3TTSTTS)
-    assert provider._resolve_voice() == "wan2"
+    # 2026-09-24 新契约：未知本地音色 → 语言档回落（治 MiniMax 音色 id 误入本地线
+    # 崩 5/7 轮；契约全集见 tests/test_qwen3_voice_fallback.py）。
+    assert provider._resolve_voice() == "vivian"
+    # 预设音色原样透传。
+    assert (
+        interpret._build_tts_provider({"provider": "qwen3_tts", "speaker": "serena"}, "zh")._resolve_voice()
+        == "serena"
+    )
     # 未指定 provider 也走本地兜底；全局 speaker 缺省时按目标语取分语言键。
     assert isinstance(interpret._build_tts_provider({}, "en"), Qwen3TTSTTS)
-    assert interpret._build_tts_provider({"speaker_zh": "zh-voice"}, "zh")._resolve_voice() == "zh-voice"
+    assert interpret._build_tts_provider({"speaker_zh": "sohee"}, "zh")._resolve_voice() == "sohee"
     assert "MINIMAX_MODEL" not in os.environ
     assert "MINIMAX_LANGUAGE_BOOST" not in os.environ
 
@@ -100,7 +116,7 @@ def test_resolve_minimax_model_env_priority_and_default(monkeypatch):
     assert interpret._resolve_minimax_model() == "speech-2.6-turbo"
     assert interpret._voice_tags_supported(interpret._resolve_minimax_model()) is False
     provider = interpret._build_tts_provider({"provider": "minimax", "api_key": "k"}, "zh")
-    assert provider._model() == "speech-2.6-turbo"
+    assert _primary(provider)._model() == "speech-2.6-turbo"
     assert "MINIMAX_MODEL" in os.environ  # 只读,唔删用户显式部署档
 
 
@@ -125,17 +141,17 @@ def test_build_tts_provider_session_voice_overrides_settings_and_defaults(monkey
     cfg = {"provider": "minimax", "speaker_en": "settings-en", "api_key": "k"}
 
     p = interpret._build_tts_provider(cfg, "en", {"en": "session-en"})
-    assert isinstance(p, MiniMaxTTS)
-    assert p._resolve_voice() == "session-en"
+    assert isinstance(_primary(p), MiniMaxTTS)
+    assert _primary(p)._resolve_voice() == "session-en"
     zh = interpret._build_tts_provider(cfg, "zh", {"zh": "session-zh"})
-    assert zh._resolve_voice() == "session-zh"
+    assert _primary(zh)._resolve_voice() == "session-zh"
 
     # 未选（None/空 dict）→ 现状：设置键命中，缺省键落硬编码默认。
-    assert interpret._build_tts_provider(cfg, "en", None)._resolve_voice() == "settings-en"
-    assert interpret._build_tts_provider(cfg, "en", {})._resolve_voice() == "settings-en"
-    assert interpret._build_tts_provider(cfg, "zh", {})._resolve_voice() == "Chinese (Mandarin)_News_Anchor"
+    assert _primary(interpret._build_tts_provider(cfg, "en", None))._resolve_voice() == "settings-en"
+    assert _primary(interpret._build_tts_provider(cfg, "en", {}))._resolve_voice() == "settings-en"
+    assert _primary(interpret._build_tts_provider(cfg, "zh", {}))._resolve_voice() == "Chinese (Mandarin)_News_Anchor"
     # 原始 JSON 串也收（防御 entrypoint 忘解析直接透传）。
-    assert interpret._build_tts_provider(cfg, "en", '{"en":"raw-json-voice"}')._resolve_voice() == "raw-json-voice"
+    assert _primary(interpret._build_tts_provider(cfg, "en", '{"en":"raw-json-voice"}'))._resolve_voice() == "raw-json-voice"
 
 
 def test_build_tts_provider_session_voice_filters_local_qwen3(monkeypatch):
@@ -144,9 +160,9 @@ def test_build_tts_provider_session_voice_filters_local_qwen3(monkeypatch):
         monkeypatch.delenv(key, raising=False)
     cfg = {"provider": "minimax", "speaker_en": "settings-en", "api_key": "k"}
     p = interpret._build_tts_provider(cfg, "en", {"en": "vivian"})
-    assert p._resolve_voice() == "settings-en"
+    assert _primary(p)._resolve_voice() == "settings-en"
     p2 = interpret._build_tts_provider({"provider": "minimax"}, "cantonese", {"cantonese": "agent-clone-x"})
-    assert p2._resolve_voice() == "Cantonese_crisp_news_anchor_vv2"
+    assert _primary(p2)._resolve_voice() == "Cantonese_crisp_news_anchor_vv2"
 
 
 def test_build_llm_provider_mt_branch(monkeypatch, tmp_path):
@@ -255,11 +271,11 @@ def test_build_tts_provider_minimax_filters_local_qwen3_voices(monkeypatch):
         "api_key": "k-test",
     }
     zh = interpret._build_tts_provider(cfg, "zh")
-    assert zh._resolve_voice() == "Chinese (Mandarin)_News_Anchor"
+    assert _primary(zh)._resolve_voice() == "Chinese (Mandarin)_News_Anchor"
     cantonese = interpret._build_tts_provider(cfg, "cantonese")
-    assert cantonese._resolve_voice() == "Cantonese_crisp_news_anchor_vv2"
+    assert _primary(cantonese)._resolve_voice() == "Cantonese_crisp_news_anchor_vv2"
     en = interpret._build_tts_provider(cfg, "en")
-    assert en._resolve_voice() == "male_english_speaker"
+    assert _primary(en)._resolve_voice() == "male_english_speaker"
 
 
 def test_build_llm_provider_fallback(monkeypatch):

@@ -35,6 +35,8 @@ from pathlib import Path
 # 脚本族(CJK vs 拉丁)判定——见 bok_voice_core.mt_lang_check 模块 docstring 的
 # 能/不能边界(治 en↔zh/cantonese 的脚本级错语言;测不出 zh↔cantonese)。
 from bok_voice_core.mt_lang_check import language_match_score, looks_like_language
+# 模型路由共享契约(2026-09-25 阶段 0):mt/a_reply 车道本地↔云端解析单点,只消费。
+from bok_voice_core.model_routes import PROVIDER_OPENAI, resolve_route
 
 
 def _norm_lang(raw: str, default: str = "zh") -> str:
@@ -288,6 +290,24 @@ async def _mt_collect(stream, timeout_s: float) -> str:
     return "".join(parts).strip()
 
 
+def _src_track_state(participant, audio_kind) -> tuple[str, list[str]]:
+    """listen 身份的音轨订阅态分类(纯函数,遥测看护消费)。
+
+    返回 ("none", [])           —— 对端无任何音轨发布;
+    ("unsubscribed", [sid...]) —— 有音轨但本 worker 未订上(publication.track
+                                  is None;sdk 无手动订阅口,此态=订阅链断);
+    ("ok", [])                  —— 至少一条音轨已订阅在席。
+    participant 为 None(对端未进房)按 none 计。"""
+    pubs = list(participant.track_publications.values()) if participant is not None else []
+    audio = [p for p in pubs if getattr(p, "kind", None) == audio_kind]
+    if not audio:
+        return ("none", [])
+    unsubs = [str(p.sid) for p in audio if getattr(p, "track", None) is None]
+    if unsubs:
+        return ("unsubscribed", unsubs)
+    return ("ok", [])
+
+
 async def _mt_once(llm_provider, ctx, *, timeout_s: float = 15.0, target_lang: str = "") -> str:
     """单句直调翻译 LLM(StatelessMTLLM/通用 LLM 同一入口),超时保护防句堆积。
 
@@ -334,6 +354,23 @@ async def _mt_once(llm_provider, ctx, *, timeout_s: float = 15.0, target_lang: s
     return retried
 
 
+def _mt_fail_line(target_lang: str) -> str:
+    """MT 超时兜底台词(纯函数,单测直喂)——按**目标语**出中性提示。
+
+    2026-09-27:MT wait_for(15s) 超时此前只在 _mt_say_worker 里 print,句子既不
+    出声也无译文行(21 次实证:15 fwd+6 rev,整通静默 call-4fda36e0)。绝不回放
+    源文(同传语义:客户唔应该听到自己讲嘅话),改说目标语短请示句——对方无译文
+    可听时至少知道「没听清」。原文行已即时落库,译文行**故意不补**(诚实缺行)。
+    未知/空语言键回落 zh。
+    """
+    lines = {
+        "zh": "抱歉，这句没听清，请再说一遍。",
+        "cantonese": "唔好意思，呢句聽唔清楚，可唔可以再講一次？",
+        "en": "Sorry, I didn't catch that — could you repeat?",
+    }
+    return lines.get(target_lang, lines["zh"])
+
+
 def _sidecar_url(cfg_value: str, env_key: str, default: str) -> str:
     """sidecar 地址解析:settings 值 > env > 缺省(去尾部斜杠)。"""
     return (cfg_value or os.environ.get(env_key) or default).rstrip("/")
@@ -366,7 +403,7 @@ def _mt_sampling(env_key: str, mt_default: float) -> float:
     return v if math.isfinite(v) else mt_default
 
 
-def _build_llm_provider(llm_cfg: dict, target_lang: str, glossary: str = ""):
+def _build_llm_provider(llm_cfg: dict, target_lang: str, glossary: str = "", routing_raw: str = ""):
     """组装 B 线翻译 LLM:MT 小模型(:1236)优先,回退 DeepSeek 云端 / 主 LLM(:1235)。
 
     MT 分支按官方 Hy-MT2 推荐采样收窄,MlxLlmLLM 构造时显式传参(用户显式 env
@@ -376,11 +413,51 @@ def _build_llm_provider(llm_cfg: dict, target_lang: str, glossary: str = ""):
     性由 instructions 的 glossary 行兜)。MT_LLM_MODEL 须经 _mt_model_valid(本地
     绝对路径且在盘)才进 MT 分支——非法值原样透传会让 mlx_lm server 挂死,跳过
     MT 走回退链 + 日志留值。
-    """
-    from .providers.livekit_plugins import DeepSeekLLM, MlxLlmLLM, StatelessMTLLM
 
-    mt_base = os.environ.get("MT_LLM_BASE_URL", "").strip()
-    mt_model = os.environ.get("MT_LLM_MODEL", "").strip()
+    `routing_raw`＝当通 CP 设置顶层 `model_routing_json` 原始串(2026-09-25 阶段 0):
+    mt 车道 openai 档整体改走云端(本地路径门禁不适用——云端模型 id 非 mlx 路径);
+    local 档显式改端点时换 base_url/model 后仍走既有门禁与回退链(挂死防线不绕);
+    缺省 ""(未配置/kill-switch)＝env 档,既有读法逐字节(零漂移保证)。参数随当通
+    会话传入,worker 并发多通不串线(禁模块级可变全局)。
+    """
+    from .providers.livekit_plugins import (
+        DeepSeekLLM,
+        MlxLlmLLM,
+        StatelessMTLLM,
+        route_llm_kwargs,
+    )
+
+    mt_route = resolve_route("mt", os.environ, routing_raw)
+    if mt_route.provider == PROVIDER_OPENAI:
+        # 云端 MT(路由表 openai 档,2026-09-25):端点/模型/密钥全由路由表下发,
+        # 思考旗随请求体下发(Qwen3.5 家族云端思考陷阱,LANE-AB 实证)。采样档照
+        # 本地 MT 分支同源(Hy-MT2 推荐,经构造参数显式下发,唔写回进程 env)。
+        print(f"[interp] llm=mt-cloud base={mt_route.base_url}", flush=True)
+        context_turns = int(os.environ.get("BOK_INTERP_MT_CONTEXT", "0") or 0)
+        return StatelessMTLLM(
+            MlxLlmLLM(
+                base_url=mt_route.base_url,
+                model=mt_route.model,
+                api_key=mt_route.api_key or "mlx",
+                enable_thinking=mt_route.enable_thinking,
+                temperature=_mt_sampling("LLM_TEMPERATURE", 0.7),
+                top_p=_mt_sampling("LLM_TOP_P", 0.6),
+                top_k=int(_mt_sampling("LLM_TOP_K", 20)),
+                repetition_penalty=_mt_sampling("LLM_REPETITION_PENALTY", 1.05),
+            ),
+            target_lang,
+            glossary=glossary,
+            context_turns=context_turns,
+        )
+
+    if mt_route.source == "routing":
+        # local 档显式改端点(如 LM Studio :1234):路由表只换「去哪/用哪个模型」,
+        # _mt_model_valid 挂死防线与回退链照走(model 非空才覆盖)。
+        mt_base = mt_route.base_url
+        mt_model = mt_route.model or os.environ.get("MT_LLM_MODEL", "").strip()
+    else:
+        mt_base = os.environ.get("MT_LLM_BASE_URL", "").strip()
+        mt_model = os.environ.get("MT_LLM_MODEL", "").strip()
     if mt_base and _mt_model_valid(mt_model):
         # Hy-MT2 官方推荐采样:temperature 0.7 / top_p 0.6 / top_k 20 / 重复惩罚
         # 1.05——翻译要贴原文,采样收窄防小模型自由发挥/复读。经构造参数显式下发
@@ -420,9 +497,16 @@ def _build_llm_provider(llm_cfg: dict, target_lang: str, glossary: str = ""):
             model=llm_cfg.get("model") or os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
             base_url=llm_cfg.get("base_url") or os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
         )
+    # B 线回复/兜底车道路由(a_reply,2026-09-25):env 档=下方既有读法原样传参
+    # (零漂移);openai 档=路由表下发端点/模型/密钥+思考旗(local routing 档只换
+    # 端点/模型)。设置卡 deepseek 带密钥显式云档不属本车道覆盖面,原样保留。
     return MlxLlmLLM(
-        base_url=llm_cfg.get("base_url") or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
-        model=llm_cfg.get("model") or os.environ.get("MLX_LLM_MODEL", ""),
+        **route_llm_kwargs(
+            resolve_route("a_reply", os.environ, routing_raw),
+            env_base_url=llm_cfg.get("base_url")
+            or os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1"),
+            cfg_model=llm_cfg.get("model") or os.environ.get("MLX_LLM_MODEL", ""),
+        )
     )
 
 
@@ -474,14 +558,43 @@ def _parse_session_voices(raw) -> dict:
     return voices
 
 
+def _build_local_qwen3_tts(tts_cfg: dict, target_lang: str, tts_ls):
+    """本地 Qwen3-TTS 构造(纯装配,单测直喂)。
+
+    从 _build_tts_provider 本地分支提取(2026-09-27 B 线 TTS 硬失败兜底):现在两处
+    复用同一构造——①provider=qwen3_tts 的纯本地方向;②MiniMax 主档失败时的
+    FallbackAdapter 备档(官方 A 线同款姿势)。音色优先级=设置页全局单音色 speaker
+    > 分语言 speaker_zh/cantonese/en,未配时 Qwen3TTSTTS 内部按语言档回落。
+    """
+    from .providers.livekit_plugins import Qwen3TTSTTS
+
+    voice = str(tts_cfg.get("speaker") or "").strip()
+    if not voice:
+        keymap = {"zh": "speaker_zh", "cantonese": "speaker_cantonese", "en": "speaker_en"}
+        voice = str(tts_cfg.get(keymap.get(target_lang, "speaker_zh")) or "")
+    return Qwen3TTSTTS(
+        base_url=_sidecar_url(tts_cfg.get("base_url") or "", "QWEN3_TTS_BASE_URL", "http://127.0.0.1:8788"),
+        voice=voice,
+        language_state=tts_ls,
+        sample_rate=int(tts_cfg.get("sample_rate") or 24000),
+    )
+
+
 def _build_tts_provider(tts_cfg: dict, target_lang: str, session_voices=None):
     """组装 B 线 TTS:settings 指定 minimax → 云端 MiniMax;否则本地 Qwen3-TTS 兜底。
 
     音色锁口音——粤语音色读普/英自然,普通话音色读粤文变广普,故按 target_lang
     三键换音色;音色优先级=会话级(同传页建单选定,session_voices)>设置页三键>
     硬编码默认。B 线默认 turbo 档(agent 场景 <250ms、$60/M),A 线仍 2.8-hd。
+
+    MiniMax 档回退(2026-09-27):云端 SSL 校验失败/「AudioEmitter isn't started」
+    bidi 错误实测令整通零译文出声(call-b347f691:8 源句 0 译文,纯静音)。现按 A
+    线同款官方 FallbackAdapter 姿势包裹——主档云端 MiniMax、备档本地 Qwen3-TTS
+    (A 线是 hd→turbo 同云换档保音色;B 线跨供应商换声可接受,出声 > 静音)。
+    `BOK_LOCAL_TTS=0`(bok.py 明确跳过 :8788 的语义)时不装备档,返回裸主档;
+    本地 sidecar 未跑时 adapter 逐请求穿透失败,行为等价单实例。
     """
-    from .providers.livekit_plugins import LanguageState, MiniMaxTTS, Qwen3TTSTTS
+    from .providers.livekit_plugins import LanguageState, MiniMaxTTS
 
     tts_ls = LanguageState()
     tts_ls.lang = target_lang
@@ -539,22 +652,37 @@ def _build_tts_provider(tts_cfg: dict, target_lang: str, session_voices=None):
             language_boost=boost or None,
         )
         # keep-warm 预连(同 A 线):无事件循环时静默跳过,失败零影响。
+        # 2026-09-28 prewarm async 化(W-TTS):协程挂当前 loop 后台跑;
+        # 无 loop(历史同步装配形态)时走 tts_cache 的同步兼容垫语义=关闭跳过。
         try:
-            tts.prewarm()
+            _pw = tts.prewarm()
+            if asyncio.iscoroutine(_pw):
+                try:
+                    # FIRE_FORGET_EXEMPT: 预热纯增益——被 GC 掐掉=首段译句就地握手回退。
+                    asyncio.get_running_loop().create_task(_pw)
+                except RuntimeError:
+                    _pw.close()
         except Exception:  # noqa: BLE001
             pass
+        # TTS 硬失败兜底(2026-09-27):主档云端 MiniMax 单点失败曾令整通零译文出声。
+        # A 线同款官方 FallbackAdapter,备档=本地 Qwen3-TTS;`BOK_LOCAL_TTS=0`
+        # 显式跳过本地 TTS 时保持单实例(bok.py 同键语义)。装配失败零影响(裸主档)。
+        if os.environ.get("BOK_LOCAL_TTS", "") != "0":
+            try:
+                from livekit.agents import tts as agents_tts  # noqa: F401 - 形状自检
+
+                from .providers.livekit_plugins import PrewarmFallbackTTS
+
+                backup = _build_local_qwen3_tts(tts_cfg, target_lang, tts_ls)
+                # PrewarmFallbackTTS:官方 prewarm 同步约定 × W-TTS async prewarm 兼容垫。
+                wrapped = PrewarmFallbackTTS([tts, backup])
+                print("[interp] tts fallback armed primary=minimax backup=qwen3_local", flush=True)
+                return wrapped
+            except Exception as exc:  # noqa: BLE001 - 回退装配失败就用单实例
+                print(f"[interp] tts fallback init failed, single instance: {exc!r}", flush=True)
         return tts
     # 本地 Qwen3-TTS 兜底(离线可用):设置页全局单音色 speaker 优先,否则分语言。
-    voice = str(tts_cfg.get("speaker") or "").strip()
-    if not voice:
-        keymap = {"zh": "speaker_zh", "cantonese": "speaker_cantonese", "en": "speaker_en"}
-        voice = str(tts_cfg.get(keymap.get(target_lang, "speaker_zh")) or "")
-    return Qwen3TTSTTS(
-        base_url=_sidecar_url(tts_cfg.get("base_url") or "", "QWEN3_TTS_BASE_URL", "http://127.0.0.1:8788"),
-        voice=voice,
-        language_state=tts_ls,
-        sample_rate=int(tts_cfg.get("sample_rate") or 24000),
-    )
+    return _build_local_qwen3_tts(tts_cfg, target_lang, tts_ls)
 
 
 def _preemptive_generation_opts() -> dict:
@@ -639,18 +767,31 @@ class _PlaybackBacklog:
     永不弃——弃音保字,已生成文本的 chat item 照常落库/进字幕。生成中被取消的
     句=整句摘掉(译员压力下的跳句形态)。
 
+    门槛语义 v2(2026-09-23 修复波#2,task-9 §14 实证):①**队头不计入门槛**——
+    队头=正在播报的沉没成本,旧算法把它全额计入,单句译文即可「超门」但 depth<3
+    结构性弃不了,门槛日志恒饱和假警(est_ms=1600 drop=0);改计「等待积压」后
+    depth<3 不弃仍正确(唯一候选=最新一条,追最新保护),假警消失。②**源句队列
+    计入门槛、成为摘译候选**——MT 未消化的待译源句也是听感积压;等待积压超门
+    且 say 队无弃句候选时,按次摘译(arm)最旧待译源句一条(原文行已落库=摘译
+    保文,与 _src_q 溢出摘译同语义),由 MT worker 取句时消费跳过。每次评估至多
+    arm 一条(下轮再评估),压力阀步进不连跳。真实战场=源语连珠炮时先弃旧译文
+    再摘旧源句,最新内容必达。
+
     `BOK_INTERP_BACKLOG=0` 总闸关;`BOK_INTERP_MAX_BACKLOG_S` 调门槛(默认 6s
     ≈通路 lag 2.5s+一句余量)。只在 speech_created 事件判定——队列只在新建句时
     增长;interrupt 必须 force=True(会话打断默认关,非 force 会 RuntimeError)。
     """
 
-    def __init__(self, target_lang: str):
+    def __init__(self, target_lang: str, source_backlog_s=None, room: str = ""):
         self._target_lang = target_lang
+        self._room = room  # 仅作 BACKLOG_DROP 观测行(无 DB 句柄,不写库)
         try:
             self._max_s = float(os.environ.get("BOK_INTERP_MAX_BACKLOG_S", "6") or 6)
         except ValueError:
             self._max_s = 6.0
         self._pending: list[tuple[object, float]] = []  # [(handle, 估时秒)]
+        self._source_backlog_s = source_backlog_s  # () -> float:待译源句估时总量
+        self.source_drops_pending = 0  # 摘译指令(MT worker 取句时消费)
         self.dropped = 0
         self.dropped_est_s = 0.0
 
@@ -658,16 +799,38 @@ class _PlaybackBacklog:
     def enabled(self) -> bool:
         return os.environ.get("BOK_INTERP_BACKLOG", "1") == "1" and self._max_s > 0
 
-    def _est_of(self, handle) -> float:
+    def set_source_backlog(self, est_s: float) -> None:
+        """测试注入口:直接设定源队列估时(生产走 source_backlog_s 回调)。"""
+        self._source_backlog_s = lambda: est_s  # type: ignore[assignment]
+
+    def _src_backlog_s(self) -> float:
+        try:
+            return max(0.0, float(self._source_backlog_s() or 0)) if self._source_backlog_s else 0.0
+        except Exception:
+            return 0.0
+
+    def take_source_drops(self) -> int:
+        """MT worker 取句时消费摘译指令(一次性取走当前计数)。"""
+        n = self.source_drops_pending
+        self.source_drops_pending = 0
+        return n
+
+    def _text_of(self, handle) -> str:
         texts = []
         for item in getattr(handle, "chat_items", None) or []:
             t = getattr(item, "text_content", None) or getattr(item, "raw_text_content", "")
             if t:
                 texts.append(str(t))
-        return _estimate_speech_seconds(" ".join(texts), self._target_lang)
+        return " ".join(texts)
+
+    def _est_of(self, handle) -> float:
+        return _estimate_speech_seconds(self._text_of(handle), self._target_lang)
 
     def on_speech_created(self, handle) -> tuple[int, float, int]:
-        """登记新译文句并按门槛弃旧。返回 (队列深度, 估时总量秒, 本轮弃句数)。"""
+        """登记新译文句并按门槛弃旧。返回 (队列深度, 等待积压估时秒, 本轮弃句数)。
+
+        est=等待积压(不含在播队头)+待译源队列——门槛量的係「还要多久才轮到最新
+        内容」,不是已播了多少。"""
         if not self.enabled:
             return (0, 0.0, 0)
         # 1) 清账:已播完/已取消的句出队(text-only 方向句句秒完,队列天然不积)。
@@ -677,8 +840,9 @@ class _PlaybackBacklog:
         est_new = self._est_of(handle) or 0.8  # 新句此刻多半还没有 chat item
         refreshed.append((handle, est_new))
         self._pending = refreshed
-        # 3) 门槛:队头=当前播报永不弃、最新一条永不弃 → 只从 index 1 起弃。
-        total = sum(e for _, e in self._pending)
+        # 3) 门槛(等待积压口径,index 0=在播队头不计):队头永不弃、最新一条永不弃
+        #    → 只从 index 1 起弃;仍超门且 say 队无候选 → arm 一条源句摘译。
+        total = sum(e for _, e in self._pending[1:])
         dropped_now = 0
         while total > self._max_s and len(self._pending) > 2:
             h, e = self._pending.pop(1)
@@ -690,7 +854,62 @@ class _PlaybackBacklog:
             dropped_now += 1
             self.dropped += 1
             self.dropped_est_s += e
+            # 弃句观测(2026-09-27):弃音保字之下,被弃句在 DB 与已播句不可分——本行
+            # 是唯一区分点。成本零(仅真弃时打印;无 DB 句柄,绝不写库)。
+            print(
+                f"[interp] BACKLOG_DROP room={self._room} lang={self._target_lang} "
+                f"chars={len(self._text_of(h))}",
+                flush=True,
+            )
+        if total + self._src_backlog_s() > self._max_s and self._src_backlog_s() > 0:
+            self.source_drops_pending += 1  # 摘译压力阀:每次评估至多一条
         return len(self._pending), total, dropped_now
+
+
+def _mt_consume_skip(backlog: "_PlaybackBacklog", text: str) -> bool:
+    """MT worker 取句后先消费摘译指令（True=跳过本句 MT+播报）。
+
+    模块级便于单测钉消费契约（fix round 1 评审 Minor-6）：积压门 arm 的摘译在
+    取句时刻生效——被摘句的原文行已即时落库（`_on_user_input`），跳过的只是
+    译文生成与出声（摘译保文，与 _src_q 溢出摘译同语义）。消费一次性。"""
+    skipped = backlog.take_source_drops()
+    if skipped:
+        print(
+            f"[interp] INTERP_BACKLOG source-skip x{skipped} "
+            f"({len(text)} chars, backlog gate 摘译保文)",
+            flush=True,
+        )
+        return True
+    return False
+
+
+async def _exit_stage(name: str, coro, timeout_s: float = 5.0):
+    """退出路径单段守护（P1.c，2026-09-29 v2 spec §4）。
+
+    b8793951 实证 `process did not exit in time, killing process`：_shutdown
+    的 report/settle 走 CP client（timeout=15s），两段即可挂 30s+ 超过框架
+    10s 强杀窗。本助手：wait_for 掐死 + 慢段打点 `interp.exit_slow stage=
+    <n> ms=<t>`（观测定位）+ 超时/取消/异常吞掉——收尾尽力而为（CP settle
+    幂等，丢了 job 死后回收器兜底），绝不挂死退出主链。返回 coro 结果或
+    None（被掐/异常）。"""
+    import time as _time
+
+    t0 = _time.monotonic()
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout_s)
+    except asyncio.CancelledError:
+        # 段被取消：吞（镜像旧 _mt_worker 段的 except (CancelledError, Exception)
+        # 语义——退出回调里段取消不该挂死主链）。
+        print(f"interp.exit_slow stage={name} ms={(_time.monotonic() - t0) * 1000:.0f} kind=cancelled", flush=True)
+        return None
+    except Exception as exc:  # noqa: BLE001 - 超时/异常全吞：收尾尽力而为
+        kind = "timeout" if isinstance(exc, asyncio.TimeoutError) else "err"
+        print(
+            f"interp.exit_slow stage={name} ms={(_time.monotonic() - t0) * 1000:.0f} "
+            f"{kind}={exc!r}",
+            flush=True,
+        )
+        return None
 
 
 async def entrypoint(ctx) -> None:
@@ -709,6 +928,7 @@ async def entrypoint(ctx) -> None:
         LanguageState,
         Qwen3ASRLiveSTT,
         Qwen3ASRSTT,
+        _asr_engine_from_cfg,
     )
 
     meta: dict = {}
@@ -798,6 +1018,9 @@ async def entrypoint(ctx) -> None:
         language_state=asr_ls,
         pin_language=True,
         hotword_context=_asr_hotword_ctx,
+        # 【P1 SV-CPU 引擎车道(2026-10-01)】与 A 线同解析器:env > asr_json >
+        # 缺省旧路;验证门后同步翻 sensevoice。
+        engine=_asr_engine_from_cfg(asr_cfg),
     )
     if os.environ.get("QWEN3_ASR_STREAM", "1") == "1":
         # 同传更要 partial:源语音边说边出稳定前缀 → 抢跑 prefill,译文首句更早。
@@ -809,7 +1032,12 @@ async def entrypoint(ctx) -> None:
     _glossary = glossary_block(glossary_pairs)
     if _glossary:
         print(f"[interp] glossary {len(glossary_pairs)} terms -> asr+mt", flush=True)
-    tts_provider = _build_tts_provider(tts_cfg, target_lang, session_voices)
+    # B 线官方对账(2026-09-30):text-only 方向(rev 默认档)此前无条件构造并
+    # **真连**云端 MiniMax bidi(prewarm connect_ms=446 实测)——但
+    # RoomOutputOptions.audio_enabled=False 下 TTS 永不被调用=零收益连接,
+    # 还与在途方向抢握手。音频向关闭的方向直接不装配 TTS。
+    _dir_audio = _direction_audio_enabled(speaker_role)
+    tts_provider = _build_tts_provider(tts_cfg, target_lang, session_voices) if _dir_audio else None
     # 语气词标记(2026-09-16 用户拍板):Hy-MT2 会把语气照词翻译(Hahaha/Coughs),
     # say 前由 _apply_voice_tags 换成 MiniMax 2.8 括号标记——合成层出真声(笑/咳/
     # 叹),不再是假人念稿。双门控:模型档(仅 2.8 系支持,非 2.8 会把标记念出来)
@@ -817,15 +1045,28 @@ async def entrypoint(ctx) -> None:
     # _strip_voice_tags(译文行)与前端 stripVoiceTags(字幕)剥掉,只活合成层。
     # 模型档只认 MiniMax 分支(旧版靠 _build_tts_provider 的 setdefault 副作用
     # 传递;本地 Qwen3 兜底档标记会被当文本念出来,必须保持熄火)。
+    # 语气词标记同理只在音频向有意义(合成层标记,text-only 无合成=纯噪音)。
     _tts_is_minimax = (tts_cfg.get("provider") or "qwen3_tts").lower() in (
         "minimax",
         "minimax_streaming",
     )
-    tts_model = _resolve_minimax_model() if _tts_is_minimax else ""
-    voice_tags = os.environ.get("BOK_INTERP_VOICE_TAGS", "1") == "1" and _voice_tags_supported(tts_model)
+    tts_model = (_resolve_minimax_model() if _tts_is_minimax else "") if _dir_audio else ""
+    voice_tags = (
+        _dir_audio
+        and os.environ.get("BOK_INTERP_VOICE_TAGS", "1") == "1"
+        and _voice_tags_supported(tts_model)
+    )
     if tts_model:
         print(f"[interp] voice_tags {'on' if voice_tags else 'off'} (tts={tts_model})", flush=True)
-    llm_provider = _build_llm_provider(llm_cfg, target_lang, glossary=_glossary)
+    # 模型路由原始串（2026-09-25 阶段 0）：CP 设置顶层键与引擎卡同一 fetch（改道
+    # 下一通生效，零重启）；缺键/空＝未配置，resolve_route 落回 env 缺省链。随当通
+    # 会话传参，worker 并发多通不串线（禁模块级可变全局）。
+    llm_provider = _build_llm_provider(
+        llm_cfg,
+        target_lang,
+        glossary=_glossary,
+        routing_raw=str(settings.get("model_routing_json") or ""),
+    )
 
     # 轮次判定走 _turn_handling_opts(纯函数):manual 模式 + STT 句级 FINAL 自驱
     # MT→say 队列(P2 定案,函数注释有框架打断/丢弃两条路的实证);kill-switch
@@ -902,9 +1143,15 @@ async def entrypoint(ctx) -> None:
 
     async def _mt_say_worker() -> None:
         # 单消费 FIFO:句序=翻译序=播报序。MT 下一句时上一句照播(流水线重叠)。
+        _round = 0  # 本通 MT 取句序号(可观测:超时兜底行带 round=)
         while True:
             text = await _src_q.get()
+            _round += 1
             try:
+                # 背压摘译(2026-09-23 修复波#2):积压门 arm 的摘译指令在取句时
+                # 消费——跳过最旧待译源句的 MT+播报(原文行已落库=摘译保文)。
+                if _mt_consume_skip(backlog, text):
+                    continue
                 t0 = time.perf_counter()
                 ctx = _build_mt_context(_llm_instructions, list(_mt_pairs), text)
                 translated = await _mt_once(llm_provider, ctx, target_lang=target_lang)
@@ -916,6 +1163,19 @@ async def entrypoint(ctx) -> None:
                     print(f"[interp] mt empty for {len(text)} chars, skipped", flush=True)
             except asyncio.CancelledError:
                 raise
+            except asyncio.TimeoutError:
+                # MT 超时此前静默吞掉(整通零译文出声,21 次实证)。现按目标语说一句
+                # 中性请示语——同传语义绝不回放源文;译文行故意不写(诚实缺行,原文行
+                # 已在 _on_user_input 即时落库)。say 走同一条译文输出链。
+                print(
+                    f"[interp] MT_TIMEOUT_FALLBACK room={room_name} round={_round} "
+                    f"lang={target_lang}",
+                    flush=True,
+                )
+                try:
+                    session.say(_mt_fail_line(target_lang))
+                except Exception as say_exc:  # noqa: BLE001 - 兜底不出声也不阻后续
+                    print(f"[interp] mt timeout fallback say failed: {say_exc!r}", flush=True)
             except Exception as exc:  # 单句失败不阻后续
                 print(f"[interp] mt/say failed: {exc!r}", flush=True)
             finally:
@@ -942,20 +1202,28 @@ async def entrypoint(ctx) -> None:
 
     # 译文播放背压(P2):manual 之下译文堆在 say 队列——超门槛从最旧弃起
     # (已生成文本照常进字幕/落库,只弃音)。text-only 方向句句秒完播,队列
-    # 天然不积,同一钩子零害。
-    backlog = _PlaybackBacklog(target_lang)
+    # 天然不积,同一钩子零害。v2(2026-09-23):门槛=等待积压口径(队头在播不计),
+    # 源句待译队列计入并成为摘译候选(task-9 §14:depth<3 结构性不触发→假警)。
+    def _source_backlog_s() -> float:
+        return sum(
+            _estimate_speech_seconds(t, source_lang) for t in list(_src_q.queue)
+        )
+
+    backlog = _PlaybackBacklog(target_lang, source_backlog_s=_source_backlog_s, room=room_name)
     if backlog.enabled:
-        print(f"[interp] backlog gate={backlog._max_s:g}s (追最新弃音保字)", flush=True)
+        print(f"[interp] backlog gate={backlog._max_s:g}s (追最新弃音保字,等待积压口径+源队列摘译)", flush=True)
 
     def _on_speech_created(ev) -> None:
         handle = getattr(ev, "speech_handle", None)
         if handle is None or not backlog.enabled:
             return
         depth, est_s, dropped = backlog.on_speech_created(handle)
-        if dropped or depth > 1:
+        if dropped or depth > 1 or backlog.source_drops_pending:
             print(
                 f"[interp] INTERP_BACKLOG depth={depth} est_ms={int(est_s * 1000)} "
-                f"drop={dropped} total_dropped={backlog.dropped}",
+                f"drop={dropped} total_dropped={backlog.dropped} "
+                f"src_pending_s={int(backlog._src_backlog_s() * 1000)} "
+                f"src_skips={backlog.source_drops_pending}",
                 flush=True,
             )
 
@@ -964,35 +1232,66 @@ async def entrypoint(ctx) -> None:
     # 房间断开 → SessionReport(真实 usage) + settle(总结/知识蒸馏/vault,服务端幂等;失败不阻塞退出)。
     async def _shutdown() -> None:
         _mt_worker.cancel()  # 排空 MT 消费协程(挂队列 get 上,不 cancel 会泄漏到下个 job)
+        # TTS 收尾(2026-09-30 对账):bidi 持久 WS 无人 aclose=worker 复用进程下
+        # 连接跨通残留;text-only 方向 rev 现不装配 TTS(None 跳过)。
+        if tts_provider is not None:
+            try:
+                await asyncio.wait_for(tts_provider.aclose(), timeout=3.0)
+            except Exception as exc:  # noqa: BLE001 - 收尾失败唔阻结算
+                print(f"[interp] tts aclose failed: {exc!r}", flush=True)
         try:
-            await _mt_worker
-        except (asyncio.CancelledError, Exception):
+            await _exit_stage("mt_drain", _mt_worker, timeout_s=3.0)
+        except Exception:  # noqa: BLE001 - cancel 语义由 _exit_stage 内吞
             pass
         # 在途账本行先落地再报告/结算(镜像 A 线 _close 的 _report_tasks gather):
         # job teardown 会把裸任务杀掉——原文/译文行丢失不可补。短超时防收尾卡死。
         if _ledger_tasks:
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*list(_ledger_tasks), return_exceptions=True), timeout=5.0
-                )
-            except asyncio.TimeoutError:
-                pass
+            await _exit_stage(
+                "ledger_flush",
+                asyncio.gather(*list(_ledger_tasks), return_exceptions=True),
+                timeout_s=5.0,
+            )
+        # P1.c（2026-09-29 v2 spec §4）：report/settle 走 CP client（timeout=15s）
+        # ——两段可挂 30s+ 超框架 10s 强杀窗（b8793951 `killing process` 实证）。
+        # _exit_stage 5s 掐死：CP settle 幂等，丢了回收器兜，绝不挂死退出。
+        report = None
         try:
             report = ctx.make_session_report(session)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[interp] session report build failed: {exc!r}", flush=True)
+        if report is not None:
             # P1-A(2026-09-17):body 带 worker 来源标识,CP 按方向维度收多份报告
             # (见 _session_report_payload 注释)。
-            await cp.post_session_report(call_id, _session_report_payload(report.to_dict()))
-        except Exception as exc:
-            print(f"[interp] session report failed: {exc!r}", flush=True)
+            await _exit_stage(
+                "report", cp.post_session_report(call_id, _session_report_payload(report.to_dict()))
+            )
+        # 【半场结算闸(2026-09-30 官方对账)】close_on_disconnect 默认开=先走的
+        # 一端(如 me- 挂线)立刻关本方向会话并触发 shutdown——但双 worker 同房,
+        # 另一端(other-)可能还在通话,此刻 settle=拿半场账本早结算。有人仍在房
+        # (非 agent 身份)→ 本方向跳过 settle 留给最后离场方向;两端同时走=双方
+        # 都见空房各结算一次(CP 幂等);job 被杀没人结算=既有回收器兜底。
+        _humans_alive: list[str] = []
         try:
-            await cp.settle(call_id)
-            print(f"[interp] settled {call_id}", flush=True)
-        except Exception as exc:
-            print(f"[interp] settle failed: {exc!r}", flush=True)
-        try:
-            await cp.aclose()
-        except Exception:
-            pass
+            from livekit.rtc import ParticipantState as _PState
+
+            for _p in room.remote_participants.values():
+                if str(_p.identity).startswith("agent-"):
+                    continue
+                if getattr(_p, "state", None) == _PState.ACTIVE:
+                    _humans_alive.append(str(_p.identity))
+        except Exception:  # noqa: BLE001 - 判定失败回旧行为(照结算)
+            _humans_alive = []
+        if _humans_alive:
+            print(
+                f"[interp] settle deferred (participants still active: {_humans_alive[:3]}) "
+                f"— 双 worker 同房,留最后离场方向结算",
+                flush=True,
+            )
+        else:
+            _settle_res = await _exit_stage("settle", cp.settle(call_id))
+            if _settle_res is not None:
+                print(f"[interp] settled {call_id}", flush=True)
+        await _exit_stage("cp_close", cp.aclose())
 
     ctx.add_shutdown_callback(_shutdown)
 
@@ -1061,6 +1360,93 @@ async def entrypoint(ctx) -> None:
     # 保持 entrypoint 存活直到会话关闭(框架在房间断开时终止 job 并跑 shutdown 回调)。
     closed = asyncio.Event()
     session.on("close", lambda _ev: closed.set())
+
+    # 【B 线缺源遥测(2026-09-30 call-72112fd7 定案)】同房三轨齐发(服务器实锤:
+    # fwd TTS + me-/other- 麦于 +16s 双双发布)而 fwd 全程零订阅零 ASR、rev 同
+    # 形正常——订阅空挂在我们的代码面零痕迹,python SDK 亦无手动 subscribe 口
+    # (auto_subscribe 房间级默认开,订阅面在 FFI)。本看护每 BOK_INTERP_SRC_
+    # TELEMETRY_S(默认 10s)扫一次 listen 身份的音轨,分辨两态留观测行:
+    #   SRC_NO_AUDIO_TRACK        —— 对端根本没发麦(未开传译/浏览器发布失败);
+    #   SRC_TRACK_NOT_SUBSCRIBED  —— 音轨已发布但本 worker 订不上(订阅链断,
+    #                                下一例现场直接指认服务器/FFI 哪层断)。
+    # 纯遥测零干预(SDK 无手动订阅口);=0 关。fwd(音频方向)为主要受益面。
+    async def _src_track_watch() -> None:
+        if os.environ.get("BOK_INTERP_SRC_TELEMETRY", "1") != "1":
+            return
+        try:
+            interval = float(os.environ.get("BOK_INTERP_SRC_TELEMETRY_S", "10") or 10)
+        except ValueError:
+            interval = 10.0
+        if interval <= 0:
+            interval = 10.0
+        from livekit import rtc as _rtc  # 局部导入:模块头部无 rtc 面
+
+        no_track_rounds = 0
+        not_sub_rounds = 0
+        while True:
+            try:
+                await asyncio.wait_for(closed.wait(), timeout=interval)
+                return  # 会话收线,收队
+            except asyncio.TimeoutError:
+                pass
+            state, sids = _src_track_state(
+                room.remote_participants.get(listen_identity), _rtc.TrackKind.KIND_AUDIO
+            )
+            if state == "none":
+                not_sub_rounds = 0
+                no_track_rounds += 1
+                if no_track_rounds == 3 or no_track_rounds % 10 == 0:
+                    print(
+                        f"[interp] SRC_NO_AUDIO_TRACK identity={listen_identity} "
+                        f"rounds={no_track_rounds} (对端未发布麦克风/未开传译)",
+                        flush=True,
+                    )
+            elif state == "unsubscribed":
+                no_track_rounds = 0
+                not_sub_rounds += 1
+                if not_sub_rounds <= 3 or not_sub_rounds % 10 == 0:
+                    print(
+                        f"[interp] SRC_TRACK_NOT_SUBSCRIBED identity={listen_identity} "
+                        f"sids={sids} rounds={not_sub_rounds} (音轨已发布但未订上=订阅链断)",
+                        flush=True,
+                    )
+                # 【B 线订阅自愈(2026-09-30 官方对账定案)】RemoteTrackPublication
+                # .set_subscribed(True) 即官方手动订阅口(官方 job.py 自己在用;
+                # 此前误判"SDK 无手动订阅口")——检测到「已发布未订上」时重发订阅
+                # 请求,前 3 轮每轮一次、其后每 10 轮一次,打 SRC_TRACK_RESUBSCRIBE
+                # 观测行。call-72112fd7 形态(fwd 对 me- 轨零订阅静默 3 分钟)从
+                # 只观测升级为自愈。BOK_INTERP_SRC_HEAL=0 回纯观测档。
+                if (
+                    os.environ.get("BOK_INTERP_SRC_HEAL", "1") == "1"
+                    and (not_sub_rounds <= 3 or not_sub_rounds % 10 == 0)
+                    and part is not None
+                ):
+                    _healed: list[str] = []
+                    for _p in part.track_publications.values():
+                        if (
+                            getattr(_p, "kind", None) == _rtc.TrackKind.KIND_AUDIO
+                            and getattr(_p, "track", None) is None
+                        ):
+                            try:
+                                _p.set_subscribed(True)
+                                _healed.append(str(_p.sid))
+                            except Exception as exc:  # noqa: BLE001 - 自愈失败唔阻看护
+                                print(
+                                    f"[interp] SRC_TRACK_RESUBSCRIBE failed sid={getattr(_p, 'sid', '?')} exc={exc!r}",
+                                    flush=True,
+                                )
+                    if _healed:
+                        print(
+                            f"[interp] SRC_TRACK_RESUBSCRIBE identity={listen_identity} "
+                            f"sids={_healed} rounds={not_sub_rounds}",
+                            flush=True,
+                        )
+            else:
+                no_track_rounds = 0
+                not_sub_rounds = 0
+
+    # FIRE_FORGET_EXEMPT: 纯遥测看护,closed 置位(会话关闭)自退,job teardown 兜底
+    asyncio.create_task(_src_track_watch())
     try:
         await closed.wait()
     finally:
@@ -1087,7 +1473,18 @@ def run_interpreter() -> None:
 
     worker_port_singleton_guard(ports[direction], f"interp-{direction}")
     cli.run_app(
-        WorkerOptions(entrypoint_fnc=entrypoint, agent_name=f"bok-interp-{direction}", port=ports[direction])
+        WorkerOptions(
+            entrypoint_fnc=entrypoint,
+            agent_name=f"bok-interp-{direction}",
+            port=ports[direction],
+            # 空闲子进程池框架缺省 prod=min(cpu,4)：每个 worker 4 个空转子进程
+            # （本机 3 worker=12 个 idle 吃 ~3.1GB）。B 线通话量低，1 个足够兜
+            # 冷启动；框架无 env 旋钮，只能 WorkerOptions 传参（2026-10-02 内存瘦身）。
+            num_idle_processes=1,
+            # load=整机 psutil.cpu_percent（见 agent.py 同款注释；B 线同暴露:
+            # 共享机桌面噪音→0.7 线拒派=空房全哑）。0.99 仅整机近全饱和才拒。
+            load_threshold=float(os.environ.get("BOK_WORKER_LOAD_THRESHOLD", "0.99") or 0.99),
+        )
     )
 
 

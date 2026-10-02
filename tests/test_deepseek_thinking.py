@@ -288,6 +288,13 @@ def test_judge_passes_thinking_body_for_deepseek(monkeypatch):
 
 
 def test_judge_local_endpoint_sends_empty_extra_body(monkeypatch):
+    """本地 MLX（非 DeepSeek）无思考旗 → 请求 kwargs **不含** extra_body 键。
+
+    HEAD 路由波契约（逐字节同旧，test_model_route_wiring 同源钉法）：缺省
+    enable_thinking=None + 端点非 DeepSeek（thinking_extra_body 空 dict）
+    → 两契约都不加键；origin 的「恒带空 extra_body」形状已由本契约取代。
+    测试名沿用 origin 锚（历史 node id 稳定）。
+    """
     import asyncio
 
     from agent_runtime.agent import _llm_judge
@@ -314,6 +321,7 @@ def test_judge_local_endpoint_sends_empty_extra_body(monkeypatch):
     import openai
 
     monkeypatch.setattr(openai, "AsyncOpenAI", _Client)
+    monkeypatch.delenv("FLOW_JUDGE_LLM_THINKING", raising=False)
 
     asyncio.run(_llm_judge("http://127.0.0.1:1237/v1", "local", [{"role": "user", "content": "hi"}]))
-    assert captured["extra_body"] == {}
+    assert "extra_body" not in captured  # 键缺席（非空 dict）＝本地请求逐字节同旧

@@ -6,6 +6,7 @@ import { ArrowRight, Plus } from "lucide-react";
 import { api } from "@/lib/api";
 import { AppShell, ErrorState, LoadingState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
+import { useSession } from "@/components/session-context";
 import { friendlyErrorText, useControlPlaneReady } from "@/lib/api-ready";
 
 // ---- 宽类型工具：/api/stats/dashboard 全字段兜底，端点缺位/字段缺失不白屏 ----
@@ -125,6 +126,11 @@ export function DashboardPage() {
 function DashboardContent() {
   const { accountId, health } = useAccount();
   const cp = useControlPlaneReady();
+  // 引擎设置面属主专属（2026-09-27，同 navigation ownerOnly 判据）：
+  // admin/user 不显示入口（路由守卫也会拦，这里防死链）。
+  const session = useSession();
+  const engineSettingsVisible =
+    !!session && (session.anonymous || (session.role === "root" && !session.anonymous));
   const [stats, setStats] = useState<Row | null>(null);
   const [calls, setCalls] = useState<Row[]>([]);
   const [loading, setLoading] = useState(true);
@@ -170,6 +176,8 @@ function DashboardContent() {
   const concurrency = asRecord(stats?.concurrency);
   const callsAgg = asRecord(stats?.calls);
   const tags = asRecord(stats?.tags);
+  // 沉默戳话（W4-③）：dashboard silence_pokes 段；旧 CP 无该字段兜底「—」不白屏。
+  const pokes = asRecord(stats?.silence_pokes);
   const disposition = asCountMap(tags?.disposition);
   const whatsapp = asCountMap(tags?.whatsapp);
   const todo = asCountMap(stats?.todo);
@@ -181,8 +189,9 @@ function DashboardContent() {
   const buckets = bucketRows(asRecord(stats?.duration_buckets));
   const maxBucket = Math.max(1, ...buckets.map(([, n]) => n));
 
-  // 六 KPI 卡（plan Task 6）：主值 + 可选副行；缺字段一律「—」。
-  const kpis: [string, string, string?][] = [
+  // 六 KPI 卡（plan Task 6）+ 沉默戳话卡（W4-③）：主值 + 可选副行 + 可选 title 提示；
+  // 缺字段一律「—」。
+  const kpis: [string, string, string?, string?][] = [
     ["当前并发", fmtCount(concurrency?.current)],
     ["今日呼叫", fmtCount(callsAgg?.today), `累计 ${fmtCount(callsAgg?.total)}`],
     ["客户接通率", fmtPercent(callsAgg?.answer_rate), `接通 ${fmtCount(callsAgg?.answered)}`],
@@ -191,6 +200,9 @@ function DashboardContent() {
     ["今日接通量", fmtCount(callsAgg?.answered_today ?? callsAgg?.answered), `通话中 ${fmtCount(concurrency?.current)}`],
     ["标记总数", tagsTotal === null ? "—" : String(tagsTotal)],
     ["最近会话", String(calls.length)],
+    // 沉默戳话：客户因 AI 迟答/哑轮戳话（「有冇人知道」「在吗」类）的症状指标。
+    ["沉默戳话", fmtCount(pokes?.pokes), `涉及 ${fmtCount(pokes?.calls)} 通`,
+      "客户因 AI 迟答/哑轮而戳话的症状指标（如「有冇人知道」「在吗」「Are you there」）"],
   ];
 
   return (
@@ -206,8 +218,8 @@ function DashboardContent() {
       ) : (
         <>
           <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-6">
-            {kpis.map(([k, v, sub]) => (
-              <div key={k} className="card">
+            {kpis.map(([k, v, sub, tip]) => (
+              <div key={k} className="card" title={tip}>
                 <p className="label">{k}</p>
                 <p className="mt-2 text-2xl font-semibold text-(--live-ink)">{v}</p>
                 {sub && <p className="mt-1 text-xs muted">{sub}</p>}
@@ -319,7 +331,9 @@ function DashboardContent() {
                 <Link href="/objects" className="btn-ghost w-full">对象管理</Link>
                 <Link href="/knowledge" className="btn-ghost w-full">知识库</Link>
                 <Link href="/supervisor" className="btn-ghost w-full">主管台</Link>
-                <Link href="/settings" className="btn-ghost w-full">设置</Link>
+                {engineSettingsVisible ? (
+                  <Link href="/settings" className="btn-ghost w-full">设置</Link>
+                ) : null}
               </div>
               <div className="mt-4 rounded-lg bg-muted/60 p-3 text-xs muted">
                 控制面状态：{health === false ? "离线" : health === true ? "在线" : "未知"}

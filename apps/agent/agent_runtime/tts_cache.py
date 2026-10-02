@@ -31,7 +31,20 @@ from livekit import rtc
 _ENABLE_ENV = "BOK_TTS_CACHE"
 _DIR_ENV = "BOK_TTS_CACHE_DIR"
 _MAX_ENTRIES_ENV = "BOK_TTS_CACHE_MAX"
+_META_TEXT_ENV = "BOK_TTS_CACHE_META_TEXT"
 _DEFAULT_MAX_ENTRIES = 500
+
+
+def meta_text_enabled() -> bool:
+    """meta JSON 是否落原文（L1，2026-09-24 客户现场 IP 落盘面收口）。
+
+    全仓唯一业务 IP 落盘点就是 meta 的 text 字段（罐头原句明文，pinned 永不
+    逐出）；text 无任何读回消费方（纯信息位），`BOK_TTS_CACHE_META_TEXT=0`
+    客户现场档=字段不写，音频/缓存行为零变化。缺省 1（开发侧可读 meta 对账
+    是排障习惯，不砍）。"""
+    import os
+
+    return os.environ.get(_META_TEXT_ENV, "1") == "1"
 
 # 全角→半角标点/空白统一(缓存 key 归一化用;不做数字归一——号码读法逐字对应,
 # 归一会把不同号码错配到同一段音频)。
@@ -210,7 +223,6 @@ class TtsAudioCache:
             tmp.write_bytes(pcm)
             os.replace(tmp, self._pcm_path(key))
             meta = {
-                "text": str(text or ""),
                 "voice": voice or "",
                 "model": model or "",
                 "sample_rate": self.sample_rate,
@@ -219,6 +231,8 @@ class TtsAudioCache:
                 "bytes": len(pcm),
                 "stored_at": time.time(),
             }
+            if meta_text_enabled():
+                meta["text"] = str(text or "")
             if pin:
                 meta["pinned"] = True
             mtmp = self._meta_path(key).with_suffix(".mtmp")
@@ -261,6 +275,20 @@ def _trim_lead_silence_safe(pcm: bytes, sample_rate: int) -> bytes:
         return out
     except Exception:  # pragma: no cover - 修剪失败存原样(多 ≤200ms 静音,无损)
         return pcm
+
+
+def _schedule_async_prewarm(result: object) -> None:
+    """装配层 sync `prewarm()` 兼容垫(2026-09-28):provider 内芯 prewarm 已
+    async 化(会话预热池,W-TTS),同步转发点把协程挂到当前 loop 火忘了结,
+    异常吞掉——预热失败零影响(合成路径自会回退流内自连);无事件循环时
+    关闭协程静默跳过(interpret 无 loop 装配形态)。"""
+    if not asyncio.iscoroutine(result):
+        return
+    try:
+        # FIRE_FORGET_EXEMPT: 预热纯增益——被 GC 掐掉=下次合成就地握手回退。
+        asyncio.get_running_loop().create_task(result)
+    except RuntimeError:
+        result.close()
 
 
 class _CachedChunkedStream(tts.ChunkedStream):
@@ -359,10 +387,20 @@ class _RelaySynthesizeStream(tts.SynthesizeStream):
         self._hold_provider = hold_provider
         self._fired = False
 
-    # ⚠️ 勿覆写 _metrics_monitor_task:基类监视器在转发帧上算 ttfb/audio 时长并
-    # emit tts_metrics。曾 pass 掉(垫话 PR,注释误以为内芯會转发,实际 session 只
-    # 监听包装层)→ PERCEIVED_MS 北极星缺 tts 段、turns 账本 perceived_ms 哑火
-    # (2026-09-10 实测恢复)。
+    # ⚠️ 基座监视器已排空（2026-10-02 双样本根修，见下）——勿恢复 emit：
+    # 旧注释（垫话 PR,2026-09-10）禁止覆写此方法，前提是「内芯样本无人转发、
+    # session 只监听包装层」。该前提已变：包装层（CachedTTS/_FirstAudioTTS）
+    # 构造期已挂 ``wrapped.on("metrics_collected", self._forward_metric)``——
+    # 内芯真样本（bidi ttfb 200-700ms 量级）经转发抵达 session；而本层基座
+    # 监视器以**首帧转发时刻**为锚（``_mark_started`` 调在 ``_relay_audio``
+    # 首帧处），emit 出的是 ttfb≈0 的退化样本 → 每轮两条、第二条近零（实弹
+    # 同轮 279ms+7ms 双行，Provider 卡 p50 被拉低、n 翻倍）。本层只排空 tee，
+    # 不 emit；``_mark_started`` 保留（framework 侧 USERDATA_TTS_STARTED_TIME
+    # 锚点走它，删调用会让 data.ttfb 退回输入到达锚）——``_fire_first_audio``
+    # 首音频回调链不受影响。
+    async def _metrics_monitor_task(self, event_aiter) -> None:
+        async for _ in event_aiter:
+            pass
 
     async def _run(self, output_emitter) -> None:
         output_emitter.initialize(
@@ -455,6 +493,10 @@ class CachedTTS(tts.TTS):
         self._speed_provider = speed_provider or (lambda: 1.0)
         self._first_audio_cbs: list = []
         self._hold_provider = None  # 垫话扣压(FillerDirector.hold_if_playing),agent 侧注入
+        # 看门狗在途信号(2026-09-26 call-ec075023):回复流已开、首音频未到 =
+        # TTS 连接/首包慢而非死火——fire 时刻可读,给一次性顺延而非误杀真回复。
+        self._reply_stream_started_monotonic = 0.0
+        self._first_audio_monotonic = 0.0
         wrapped.on("metrics_collected", self._forward_metric)
 
     @property
@@ -493,11 +535,19 @@ class CachedTTS(tts.TTS):
         self._hold_provider = cb
 
     def _fire_first_audio(self) -> None:
+        self._first_audio_monotonic = time.monotonic()
         for cb in list(self._first_audio_cbs):
             try:
                 cb()
             except Exception:  # noqa: BLE001
                 pass
+
+    def reply_stream_pending_since(self) -> float:
+        """回复流在途未出声的起点(monotonic;0=无在途)。看门狗 fire 时刻读:
+        >0 且晚于本轮武装 = TTS 已开流首包未到,顺延一窗而非打断真回复。"""
+        if self._reply_stream_started_monotonic > self._first_audio_monotonic:
+            return self._reply_stream_started_monotonic
+        return 0.0
 
     def _forward_metric(self, *args, **kwargs) -> None:
         self.emit("metrics_collected", *args, **kwargs)
@@ -545,6 +595,7 @@ class CachedTTS(tts.TTS):
         return _StoreChunkedStream(tts_=self, inner=inner, on_done=_done)
 
     def stream(self, *, conn_options=None) -> tts.SynthesizeStream:
+        self._reply_stream_started_monotonic = time.monotonic()
         inner = self._wrapped.stream(conn_options=self._norm_conn_options(conn_options))
         return _RelaySynthesizeStream(
             tts_=self, inner=inner, on_first_audio=self._fire_first_audio,
@@ -552,7 +603,7 @@ class CachedTTS(tts.TTS):
         )
 
     def prewarm(self) -> None:
-        self._wrapped.prewarm()
+        _schedule_async_prewarm(self._wrapped.prewarm())
 
     async def aclose(self) -> None:
         self._wrapped.off("metrics_collected", self._forward_metric)
@@ -588,6 +639,10 @@ class _FirstAudioTTS(tts.TTS):
         self._wrapped = wrapped
         self._first_audio_cbs: list = []
         self._hold_provider = None  # 垫话扣压(FillerDirector.hold_if_playing),agent 侧注入
+        # 看门狗在途信号(2026-09-26 call-ec075023):回复流已开、首音频未到 =
+        # TTS 连接/首包慢而非死火——fire 时刻可读,给一次性顺延而非误杀真回复。
+        self._reply_stream_started_monotonic = 0.0
+        self._first_audio_monotonic = 0.0
         wrapped.on("metrics_collected", self._forward_metric)
 
     @property
@@ -606,11 +661,19 @@ class _FirstAudioTTS(tts.TTS):
         self._hold_provider = cb
 
     def _fire_first_audio(self) -> None:
+        self._first_audio_monotonic = time.monotonic()
         for cb in list(self._first_audio_cbs):
             try:
                 cb()
             except Exception:  # noqa: BLE001
                 pass
+
+    def reply_stream_pending_since(self) -> float:
+        """回复流在途未出声的起点(monotonic;0=无在途)。看门狗 fire 时刻读:
+        >0 且晚于本轮武装 = TTS 已开流首包未到,顺延一窗而非打断真回复。"""
+        if self._reply_stream_started_monotonic > self._first_audio_monotonic:
+            return self._reply_stream_started_monotonic
+        return 0.0
 
     def _forward_metric(self, *args, **kwargs) -> None:
         self.emit("metrics_collected", *args, **kwargs)
@@ -630,6 +693,7 @@ class _FirstAudioTTS(tts.TTS):
         return self._wrapped.synthesize(text, conn_options=self._norm_conn_options(conn_options))
 
     def stream(self, *, conn_options=None) -> tts.SynthesizeStream:
+        self._reply_stream_started_monotonic = time.monotonic()
         inner = self._wrapped.stream(conn_options=self._norm_conn_options(conn_options))
         return _RelaySynthesizeStream(
             tts_=self, inner=inner, on_first_audio=self._fire_first_audio,
@@ -637,7 +701,7 @@ class _FirstAudioTTS(tts.TTS):
         )
 
     def prewarm(self) -> None:
-        self._wrapped.prewarm()
+        _schedule_async_prewarm(self._wrapped.prewarm())
 
     async def aclose(self) -> None:
         self._wrapped.off("metrics_collected", self._forward_metric)

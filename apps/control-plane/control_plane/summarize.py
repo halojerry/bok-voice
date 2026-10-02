@@ -14,6 +14,15 @@ import httpx
 from bok_voice_core.deepseek_llm import thinking_extra_body
 from bok_voice_core.json_repair import loads_lenient
 from bok_voice_core.polish_wiring import polish_offline_text
+from bok_voice_core.model_routes import PROVIDER_OPENAI, resolve_route
+# 账本噪声分类单源(2026-09-27):垫话/打断/兜底降级行不是内容回复——纪要 prompt
+# 不得把「我先查一下」这类兜底话当成客服实质回应(真实通话 32.1% 的相邻对是垫话
+# 当答案)。B 线(line=="b")由 is_content_reply 直接放行。注意:落盘 transcript.md
+# 是原始证据面(由 main._write_settlement_docs 从原始 turns 直写,不本处隶属),
+# 本过滤只作用于喂 LLM 的派生 prompt 文本。
+from bok_voice_core.qa_text import is_content_reply
+
+from .deps import read_model_routing_raw
 
 
 _SYSTEM = (
@@ -84,11 +93,35 @@ class Summarizer:
             env_model = (os.environ.get("MLX_LLM_MODEL") or "").strip()
             if env_base and env_model:
                 base_url, model = env_base, env_model
+        # 模型路由合流（2026-09-25 阶段 0，settle 车道）。铁律：路由表未命中
+        # （空表/kill-switch → source=="env"）时上面的 env 链路逐字节不动；仅
+        # source=="routing" 命中才覆盖端点——openai 云端档吃 base_url/model/
+        # api_key + enable_thinking；local 档显式改端点（model 空沿用现值）。
+        # 合并注记（origin/main 安全波 × 本线路由波）：api_key 的**基线**是上面
+        # settings/env 的凭据链（BOK_SETTLE_LLM_API_KEY + "mlx" 哨兵治理），这里
+        # 不再清零——仅 routing 命中 openai 档时被路由表覆盖；未命中时凭据照旧
+        # 可用（否则「设置页存了云端 key」在无路由表时被静默丢弃、云端点 401）。
+        enable_thinking = False
+        route = resolve_route("settle", os.environ, read_model_routing_raw())
+        if route.source == "routing":
+            if route.provider == PROVIDER_OPENAI:
+                base_url, model = route.base_url, route.model
+                api_key, enable_thinking = route.api_key, route.enable_thinking
+            elif route.base_url:
+                base_url = route.base_url.rstrip("/")
+                if route.model:
+                    model = route.model
+            else:
+                # 路由 local 档未给端点（手改列坏数据）=视同未命中，走上面 env 链。
+                pass
         if not base_url or not model:
             return self._fallback(turns)
         try:
             system = _SYSTEM_INTERP if str(call.get("kind") or "") == "interpret" else _SYSTEM
-            return self._via_llm(base_url, model, transcript, call, system, api_key)
+            return self._via_llm(
+                base_url, model, transcript, call, system,
+                api_key=api_key, enable_thinking=enable_thinking,
+            )
         except Exception as exc:  # pragma: no cover - model/network failure
             print(f"[summarize] LLM summary failed, falling back: {exc!r}", flush=True)
             return self._fallback(turns)
@@ -101,6 +134,8 @@ class Summarizer:
         call: dict,
         system: str = _SYSTEM,
         api_key: str = "",
+        *,
+        enable_thinking: bool = False,
     ) -> dict:
         payload = {
             "model": model,
@@ -115,6 +150,10 @@ class Summarizer:
             "temperature": 0.2,
             "stream": False,
         }
+        # enable_thinking 只在 True 时附加（OpenAI 兼容端点的扩展字段；本地 mlx
+        # 档不附带——env 链请求体与改造前逐字节一致，Qwen3.5 思考陷阱见计划 §2.2）。
+        if enable_thinking:
+            payload["enable_thinking"] = True
         # 沉淀/纪要是**非实时**后台重活：思考开着更准（2026-09-21 口径——对话侧关思考
         # 换首字延迟，纪要侧不动它）。但思考与正文**共用** max_tokens 预算，512 不够时
         # 会整段烧在 reasoning 上、content 出空串，而这里落地是静默 ``_fallback``
@@ -125,14 +164,17 @@ class Summarizer:
         # ``self.timeout`` 缺省 15s——云端 v4-pro 档实测 5/5 全部 ReadTimeout
         # （`ReadTimeout('The read operation timed out')`），即「纪要换云」光抬预算
         # 不抬超时**结构上跑不通**。纪要本来就离线，放宽无代价。
+        # （DeepSeek 专有 reasoning 字段走 thinking_extra_body；非 DeepSeek 端点={}，
+        #   与路由 extra.enable_thinking 的通用扩展字段互不干扰。）
         thinking_body = thinking_extra_body(base_url, "enabled")
         timeout = self.timeout
         if thinking_body:
             payload.update(thinking_body)
             payload["max_tokens"] = 2048
             timeout = max(timeout, float(os.environ.get("BOK_SETTLE_THINKING_TIMEOUT_S", "90")))
+        # api_key 仅云端档携带（本地档 "mlx" 不塞请求头——契约 model_routes 注释）。
         # 无凭据时不传 `headers` kwarg（而非传 None）：本地档的调用形状逐字节同旧，
-        # 既有以三参签名桩 httpx.post 的测试/调用方零改动。
+        # 既有以窄签名桩 httpx.post 的测试/调用方零改动（test_summarize 实证）。
         post_kwargs: dict[str, Any] = {"json": payload, "timeout": timeout}
         if api_key:
             post_kwargs["headers"] = {"Authorization": f"Bearer {api_key}"}
@@ -181,12 +223,18 @@ class Summarizer:
     def _render_transcript(turns: list[Any], max_chars: int = 6000) -> str:
         """turns → 纪要 prompt 文本；每轮文本过 E7 离线润色（唯一接线点）。
 
+        2026-09-27 噪声过滤：跳过非内容回复（垫话/打断/兜底降级行，判据单源
+        ``qa_text.is_content_reply``）——否则 «补一句我先帮你查下» 会被 LLM 当
+        客服实质回应写进纪要；B 线（line=="b"）原样保留。
+
         只润色这一份**派生**文本（本地变量，喂 LLM）；原始转写仍在 turns 账本与
         ``transcript.md`` 原件里逐字保留。kill-switch 关/润色异常时逐字原样。
         """
         lines: list[str] = []
         total = 0
         for t in turns:
+            if not is_content_reply(t):
+                continue
             role = getattr(t, "role", None) or getattr(t, "role", "?")
             text = getattr(t, "transcript", "") or getattr(t, "text", "")
             line = f"{role}: {polish_offline_text(text)}"

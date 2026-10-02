@@ -119,6 +119,72 @@
       "file": "zh-l03.wav",
       "dur_s": 2.14,
       "cat": "check"
+    },
+    {
+      "text": "嗯——呃——",
+      "file": "zh-h01.wav",
+      "dur_s": 1.51,
+      "cat": "hesitation"
+    },
+    {
+      "text": "呃——嗯——",
+      "file": "zh-h02.wav",
+      "dur_s": 1.13,
+      "cat": "hesitation"
+    },
+    {
+      "text": "嗯，我看一下",
+      "file": "zh-h03.wav",
+      "dur_s": 1.15,
+      "cat": "hesitation"
+    },
+    {
+      "text": "呃，您稍等啊",
+      "file": "zh-h04.wav",
+      "dur_s": 1.13,
+      "cat": "hesitation"
+    },
+    {
+      "text": "呃——好，我帮您查",
+      "file": "zh-h05.wav",
+      "dur_s": 1.71,
+      "cat": "hesitation"
+    },
+    {
+      "text": "嗯——我这就帮您核实",
+      "file": "zh-h06.wav",
+      "dur_s": 1.98,
+      "cat": "hesitation"
+    },
+    {
+      "text": "嗯——好，我马上查一下",
+      "file": "zh-h07.wav",
+      "dur_s": 2.02,
+      "cat": "hesitation"
+    },
+    {
+      "text": "已经帮您通知专员了。",
+      "file": "zh-p01.wav",
+      "dur_s": 1.75,
+      "cat": "promise_handoff"
+    },
+    {
+      "text": "会有专人尽快联系您。",
+      "file": "zh-p02.wav",
+      "dur_s": 1.39,
+      "cat": "promise_handoff"
+    },
+    {
+      "text": "号码收到了，我这就安排。",
+      "file": "zh-p03.wav",
+      "dur_s": 1.61,
+      "cat": "promise_wa"
+    },
+    {
+      "text": "我查到就马上告诉您。",
+      "file": "zh-p04.wav",
+      "dur_s": 1.34,
+      "cat": "promise_query"
     }
   ],
   "cantonese": [
@@ -241,6 +307,72 @@
       "file": "cantonese-l03.wav",
       "dur_s": 2.56,
       "cat": "check"
+    },
+    {
+      "text": "嗯——呃——",
+      "file": "cantonese-h01.wav",
+      "dur_s": 1.37,
+      "cat": "hesitation"
+    },
+    {
+      "text": "呃——嗯——",
+      "file": "cantonese-h02.wav",
+      "dur_s": 0.99,
+      "cat": "hesitation"
+    },
+    {
+      "text": "嗯，我而家睇下",
+      "file": "cantonese-h03.wav",
+      "dur_s": 1.14,
+      "cat": "hesitation"
+    },
+    {
+      "text": "呃，你等我一陣",
+      "file": "cantonese-h04.wav",
+      "dur_s": 1.58,
+      "cat": "hesitation"
+    },
+    {
+      "text": "呃<#0.3#>好——我即刻幫你查下",
+      "file": "cantonese-h05.wav",
+      "dur_s": 2.32,
+      "cat": "hesitation"
+    },
+    {
+      "text": "嗯<#0.3#>我而家幫你睇下先",
+      "file": "cantonese-h06.wav",
+      "dur_s": 2.04,
+      "cat": "hesitation"
+    },
+    {
+      "text": "呃<#0.2#>好——我幫你跟進下",
+      "file": "cantonese-h07.wav",
+      "dur_s": 1.95,
+      "cat": "hesitation"
+    },
+    {
+      "text": "已經幫你通知咗專員。",
+      "file": "cantonese-p01.wav",
+      "dur_s": 1.37,
+      "cat": "promise_handoff"
+    },
+    {
+      "text": "會有專人跟進你呢單。",
+      "file": "cantonese-p02.wav",
+      "dur_s": 1.44,
+      "cat": "promise_handoff"
+    },
+    {
+      "text": "收到，我而家幫你安排。",
+      "file": "cantonese-p03.wav",
+      "dur_s": 1.32,
+      "cat": "promise_wa"
+    },
+    {
+      "text": "我睇到就即刻覆你。",
+      "file": "cantonese-p04.wav",
+      "dur_s": 1.05,
+      "cat": "promise_query"
     }
   ],
   "en": [
@@ -363,6 +495,72 @@
       "file": "en-l03.wav",
       "dur_s": 2.39,
       "cat": "check"
+    },
+    {
+      "text": "umm hmm",
+      "file": "en-h01.wav",
+      "dur_s": 1.41,
+      "cat": "hesitation"
+    },
+    {
+      "text": "uhh umm",
+      "file": "en-h02.wav",
+      "dur_s": 1.67,
+      "cat": "hesitation"
+    },
+    {
+      "text": "let me see",
+      "file": "en-h03.wav",
+      "dur_s": 0.96,
+      "cat": "hesitation"
+    },
+    {
+      "text": "just a moment",
+      "file": "en-h04.wav",
+      "dur_s": 1.12,
+      "cat": "hesitation"
+    },
+    {
+      "text": "uh<#0.3#> let me check it",
+      "file": "en-h05.wav",
+      "dur_s": 2.48,
+      "cat": "hesitation"
+    },
+    {
+      "text": "hmm<#0.3#> let me see that",
+      "file": "en-h06.wav",
+      "dur_s": 2.35,
+      "cat": "hesitation"
+    },
+    {
+      "text": "umm<#0.2#> let me verify it",
+      "file": "en-h07.wav",
+      "dur_s": 2.18,
+      "cat": "hesitation"
+    },
+    {
+      "text": "I have flagged this",
+      "file": "en-p01.wav",
+      "dur_s": 1.55,
+      "cat": "promise_handoff"
+    },
+    {
+      "text": "We will follow up soon",
+      "file": "en-p02.wav",
+      "dur_s": 1.14,
+      "cat": "promise_handoff"
+    },
+    {
+      "text": "Got it I am arranging it now",
+      "file": "en-p03.wav",
+      "dur_s": 1.69,
+      "cat": "promise_wa"
+    },
+    {
+      "text": "I will update you very soon",
+      "file": "en-p04.wav",
+      "dur_s": 1.22,
+      "cat": "promise_query"
     }
   ]
 }

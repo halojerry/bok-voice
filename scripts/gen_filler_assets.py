@@ -7,9 +7,14 @@
   零动作动词——随机触发语境永不穿帮;
 - zh/粤 speed=1.2 pitch=0 vol=1.0;en speed=1.0(用户指定);
 - <#x#> 停顿标记直传(MiniMax 官方语法,x=秒,0.01-99.99,须夹在可发音文本间);
-- 两档时长窗:短句 tier(lines,10 条/语言)目标 1.0-1.5s,窗 [0.9,1.6] WARN,
+  **按音色生效性(2026-09-23 W2a 实测,speech-2.8-hd)**:库存音色支持
+  (cantonese +0.51s/en +1.07s 且拖腔放大),moss_audio 克隆音色**静默忽略**
+  (delta=0.00s)——zh 长档回退纯文本,「——」破折号实测 +0.40s 停顿作节奏;
+- 三档时长窗:短句 tier(lines,17 条/语言)目标 1.5-2.0s,窗 [0.9,1.6] WARN,
   窗外 FAIL;长句 tier(long_lines,3 条/语言,文件名 -11..13)覆盖窗目标
-  1.7-2.3s,窗 [1.6,2.4] WARN,窗外 FAIL;
+  1.7-2.3s,窗 [1.6,2.4] WARN,窗外 FAIL;犹豫档 tier(hes_lines,7 条/语言,
+  文件名 -h01..,W2a 分层犹豫垫音)独立窗 [0.9,2.4] WARN/[0.8,2.6] FAIL,
+  不挤占 s/l 窗;
 - 输出 wav(24k mono 16bit)+manifest.json 到 apps/agent/agent_runtime/assets/fillers/,
   运行时(fillers.py)只播文件,绝不云合成。
 
@@ -84,6 +89,33 @@ FILLERS: dict[str, dict] = {
             ("收到收到，我这就帮您查一下。", "check"),
             ("麻烦您稍等一下，我马上看一下。", "check"),
         ],
+        "promise_lines": [
+            # W2c 语境化过渡承诺:桶专属措辞(分类器永不产出 promise_*,只被语境层选中)。
+            # handoff 只承诺「已通知/会跟进」,绝不承诺「正在转接」(诚实纪律 call-91a6b8c9)。
+            ("已经帮您通知专员了。", "promise_handoff"),
+            ("会有专人尽快联系您。", "promise_handoff"),
+            # WA 捕获轮:客户刚报完号码——答「收到,安排」而非「马上帮您查」(答非所问根治)。
+            ("号码收到了，我这就安排。", "promise_wa"),
+            # 查询域:承诺「查到就覆」。
+            ("我查到就马上告诉您。", "promise_query"),
+        ],
+        "hes_lines": [
+            # W2a 分层犹豫垫音:真人犹豫声(呃/嗯)替代整句应承复读(行业共识,
+            # OpenAI Realtime/Sierra)。zh moss_audio 克隆不吃 <#x#>(实测静默忽略)
+            # → 长档纯文本+「——」破折号(实测 +0.40s 停顿)做真人节奏。
+            # 短档(呃类,目标 0.8-1.4s;单音节「呃——」实测 zh 0.73s/过窗失败
+            # → 双音节轮换)
+            ("嗯——呃——", "hesitation"),
+            ("呃——嗯——", "hesitation"),
+            # 中档(嗯类,目标 1.0-1.8s)
+            ("嗯，我看一下", "hesitation"),
+            ("呃，您稍等啊", "hesitation"),
+            # 长档(查证承诺,目标 1.5-2.6s;「我马上帮您查」6 字版实测 2.92s
+            # 超窗 → 缩短)
+            ("呃——好，我帮您查", "hesitation"),
+            ("嗯——我这就帮您核实", "hesitation"),
+            ("嗯——好，我马上查一下", "hesitation"),
+        ],
     },
     "cantonese": {
         "voice": "Cantonese_crisp_news_anchor_vv2",
@@ -117,6 +149,26 @@ FILLERS: dict[str, dict] = {
             ("好嘅，你稍等陣，我而家就幫你睇下。", "check"),
             ("收到，唔好急，等我幫你睇下先。", "empathy"),
             ("明白，麻煩你稍等多一陣，我即刻睇。", "check"),
+        ],
+        "promise_lines": [
+            ("已經幫你通知咗專員。", "promise_handoff"),
+            ("會有專人跟進你呢單。", "promise_handoff"),
+            ("收到，我而家幫你安排。", "promise_wa"),
+            ("我睇到就即刻覆你。", "promise_query"),
+        ],
+        "hes_lines": [
+            # W2a 分层犹豫垫音:粤库存音色吃 <#x#>(实测 +0.51s)→ 长档带标记。
+            # 短档(呃类,目标 0.8-1.4s;单音节「呃——」实测粤 0.38s(粤音短促)
+            # 过窗失败 → 双音节轮换)
+            ("嗯——呃——", "hesitation"),
+            ("呃——嗯——", "hesitation"),
+            # 中档(嗯类,目标 1.0-1.8s)
+            ("嗯，我而家睇下", "hesitation"),
+            ("呃，你等我一陣", "hesitation"),
+            # 长档(查证承诺,目标 1.5-2.6s)
+            ("呃<#0.3#>好——我即刻幫你查下", "hesitation"),
+            ("嗯<#0.3#>我而家幫你睇下先", "hesitation"),
+            ("呃<#0.2#>好——我幫你跟進下", "hesitation"),
         ],
     },
     "en": {
@@ -156,6 +208,28 @@ FILLERS: dict[str, dict] = {
             ("One moment and I will check on it.", "check"),
             ("One moment please and I will check that.", "check"),
         ],
+        "promise_lines": [
+            # en ≤7 词零停顿(拖腔实证 gen 档注释)。
+            ("I have flagged this", "promise_handoff"),
+            ("We will follow up soon", "promise_handoff"),
+            ("Got it I am arranging it now", "promise_wa"),
+            ("I will update you very soon", "promise_query"),
+        ],
+        "hes_lines": [
+            # W2a 分层犹豫垫音:en 库存音色吃 <#x#> 但拖腔放大(实测 +1.07s,
+            # 同逗号教训)→ 标记句压到 ~5 token;其余零标点连读(纪律不变)。
+            # 短档(呃类,目标 0.8-1.4s;双 token 才够到窗)
+            ("umm hmm", "hesitation"),
+            ("uhh umm", "hesitation"),
+            # 中档(嗯类,目标 1.0-1.8s;en 拖腔实测 ~0.7-0.9s/token,带 interjection
+            # 前缀的 3-4 token 全爆中档(hmm let me see=2.70s)→ 剥前缀留短语)
+            ("let me see", "hesitation"),
+            ("just a moment", "hesitation"),
+            # 长档(查证承诺,目标 1.5-2.6s,唯一允许的停顿=<#x#>)
+            ("uh<#0.3#> let me check it", "hesitation"),
+            ("hmm<#0.3#> let me see that", "hesitation"),
+            ("umm<#0.2#> let me verify it", "hesitation"),
+        ],
     },
 }
 
@@ -163,6 +237,10 @@ WIN_WARN = (0.9, 1.6)
 WIN_FAIL = (0.8, 1.8)
 LONG_WIN_WARN = (1.6, 2.4)  # 长句 tier:覆盖窗目标 1.7-2.3s
 LONG_WIN_FAIL = (1.5, 2.6)
+# 犹豫档 tier(W2a 分层犹豫垫音):独立窗 0.8-2.6s(短呃 0.8-1.4/中嗯 1.0-1.8/
+# 长查证承诺 1.5-2.6 三目标共用一个硬窗),不挤占 s/l 窗。
+HES_WIN_WARN = (0.9, 2.4)
+HES_WIN_FAIL = (0.8, 2.6)
 
 
 def load_api_key() -> str:
@@ -193,7 +271,8 @@ def endpoint() -> str:
 def synth_pcm(key: str, base: str, text: str, voice: str, speed: float, pitch: int) -> bytes:
     """t2a_v2 HTTP → 24k mono 16bit PCM。停顿标记 <#x#> 随 text 直传(句中)。
 
-    RPM 限频(1002)退避重试 ×3。"""
+    RPM 限频(1002)退避重试 ×3;传输层截断/中断(IncompleteRead/URLError,
+    2026-09-23 W2a 实弹)同池退避重试——瞬时网络抖动不该炸整批生成。"""
     body = {
         "model": MODEL,
         "text": text,
@@ -206,14 +285,19 @@ def synth_pcm(key: str, base: str, text: str, voice: str, speed: float, pitch: i
     ctx = ssl.create_default_context(cafile=certifi.where())
     last = ""
     for attempt in range(3):
-        req = urllib.request.Request(
-            f"{base}/v1/t2a_v2",
-            data=json.dumps(body).encode(),
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=60, context=ctx) as resp:
-            data = json.loads(resp.read().decode())
+        try:
+            req = urllib.request.Request(
+                f"{base}/v1/t2a_v2",
+                data=json.dumps(body).encode(),
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=60, context=ctx) as resp:
+                data = json.loads(resp.read().decode())
+        except Exception as exc:  # noqa: BLE001 - 传输层失败退避重试(末次见下 raise)
+            last = f"transport error={exc!r}"
+            time.sleep(5 * (attempt + 1))
+            continue
         code = int(data.get("base_resp", {}).get("status_code", -1))
         if code == 0:
             audio = (data.get("data") or {}).get("audio")
@@ -282,10 +366,16 @@ def main() -> int:
         tiers = [
             ("s", cfg["lines"], 1, WIN_WARN, WIN_FAIL),
             ("l", cfg.get("long_lines", []), 2, LONG_WIN_WARN, LONG_WIN_FAIL),
+            # W2a 犹豫档:独立窗(HES_WIN_*),语言专属 win 只覆盖 tier 1 不触及此档;
+            # 条目 cat 固定 hesitation(运行时 fillers.HESITATION_CAT 概率混入选池)。
+            ("h", cfg.get("hes_lines", []), 3, HES_WIN_WARN, HES_WIN_FAIL),
+            # W2c 语境承诺档:桶专属措辞(promise_handoff/wa/query),短句窗;
+            # SKIP-on-exists 与其它档同款(重跑只补新条目,存量零重渲染)。
+            ("p", cfg.get("promise_lines", []), 4, WIN_WARN, WIN_FAIL),
         ]
         for prefix, lines, tier, warn_win, fail_win in tiers:
             # 语言专属窗覆盖(cantonese 短句 tier 1.5-2.0s 定档,2026-09-12)
-            if tier == 1 and "win" in cfg:
+            if tier in (1, 4) and "win" in cfg:
                 warn_win, fail_win = cfg["win"]
             for i, item in enumerate(lines, 1):
                 # (text, cat) 元组:cat=分类器场景标签(2026-09-16 入 dict,随

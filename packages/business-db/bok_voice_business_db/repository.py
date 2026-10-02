@@ -38,6 +38,17 @@ def _normalize_site_numbers(value: Any) -> list[str]:
     return [str(x) for x in value]
 
 
+def _clamp_pronunciation(value: Any) -> str:
+    """发音词典归一（两后端共用防分叉）：None→''，非字符串→str()，截断 ≤500 字。
+
+    多行 `原词/读法` 文本；行合法性（须含 `/` 且两段非空）由运行时装配侧过滤，
+    本层只做类型/长度兜底（脏数据不炸、超长不撑爆列）。
+    """
+    if value is None:
+        return ""
+    return str(value)[:500]
+
+
 def _parse_site_numbers(raw: str) -> list[str]:
     """`numbers_json` 反序列化：空/坏 JSON/非数组一律 []（脏行不拖垮站点列表）。"""
     if not raw:
@@ -276,6 +287,11 @@ class SqlAlchemyBusinessRepository:
             "source": row.source,
             "cluster_head_id": getattr(row, "cluster_head_id", "") or "",
             "priority": int(row.priority) if row.priority is not None else 10,
+            "hit_threshold": (
+                float(row.hit_threshold)
+                if getattr(row, "hit_threshold", None) is not None
+                else None
+            ),
             "template_id": row.template_id,
             "created_at": row.created_at.isoformat() if row.created_at else "",
         }
@@ -310,6 +326,11 @@ class SqlAlchemyBusinessRepository:
             source=data.get("source") or "curated",
             cluster_head_id=data.get("cluster_head_id") or "",
             priority=int(data["priority"]) if data.get("priority") is not None else 10,
+            hit_threshold=(
+                float(data["hit_threshold"])
+                if data.get("hit_threshold") is not None
+                else None
+            ),
             template_id=data.get("template_id") or "",
         )
         self.session.add(row)
@@ -340,6 +361,11 @@ class SqlAlchemyBusinessRepository:
             row.cluster_head_id = str(patch["cluster_head_id"])
         if "priority" in patch and patch["priority"] is not None:
             row.priority = int(patch["priority"])
+        if "hit_threshold" in patch:
+            # VectorQ 阈值(2026-09-25):普通字段且**显式 None=回全局默认档**,
+            # 故不能套上面「键在且值非 None 才写」的护栏——键在即写(None 合法)。
+            ht = patch["hit_threshold"]
+            row.hit_threshold = float(ht) if ht is not None else None
         self.session.commit()
         return self._qa_to_dict(row)
 
@@ -527,6 +553,74 @@ class SqlAlchemyBusinessRepository:
         self.session.commit()
         return True
 
+    # ---- ASR 热词沉淀(EX-H1,2026-09-28):两级作用域,逐字镜像 IntentRule ----
+
+    @staticmethod
+    def _hotword_to_dict(row) -> dict:
+        return {c.name: getattr(row, c.name) for c in models.HotwordEntry.__table__.columns}
+
+    def list_hotword_entries(
+        self, account_id: str = "", lang: str = "", enabled: bool | None = None
+    ) -> list[dict]:
+        """两级作用域合并:''=全局行 + 本账号行(与 IntentRule 同款),created_at 升序。
+
+        account_id='' → in_('') 退化为仅全局行(global-only 口径)。
+        """
+        stmt = (
+            select(models.HotwordEntry)
+            .filter(models.HotwordEntry.account_id.in_(["", account_id]))
+            .order_by(models.HotwordEntry.created_at.asc())
+        )
+        if lang:
+            stmt = stmt.filter_by(lang=lang)
+        if enabled is not None:
+            stmt = stmt.filter_by(enabled=enabled)
+        return [self._hotword_to_dict(r) for r in self.session.scalars(stmt)]
+
+    def upsert_hotword_entry(self, data: dict) -> dict:
+        """UNIQUE(account_id, lang, word) 上的 INSERT-or-UPDATE。
+
+        语义:新行=freq 落原值、first_seen=last_seen=now、enabled 按入参;
+        既有行=freq bump 到 max(旧, 新)、enabled 若为 False 则复活、changed 才动
+        last_seen。返回值额外带 created/changed 两布尔(幂等判定:changed=False
+        =已启用且 freq 未增=no-op,调用方不审计)。不依赖方言特有 ON CONFLICT。
+        """
+        account_id = str(data.get("account_id") or "")
+        lang = str(data.get("lang") or "zh")
+        word = str(data.get("word") or "")
+        freq = int(data.get("freq") or 0)
+        now = datetime.now(timezone.utc).isoformat()
+        row = self.session.scalars(
+            select(models.HotwordEntry).filter_by(account_id=account_id, lang=lang, word=word)
+        ).first()
+        if row is None:
+            row = models.HotwordEntry(
+                id=data.get("id") or f"hw:{uuid.uuid4().hex[:12]}",
+                account_id=account_id,
+                lang=lang,
+                word=word,
+                source=str(data.get("source") or "mined"),
+                enabled=bool(data.get("enabled", True)),
+                freq=freq,
+                first_seen=now,
+                last_seen=now,
+                created_by=str(data.get("created_by") or ""),
+            )
+            self.session.add(row)
+            self.session.commit()
+            return {**self._hotword_to_dict(row), "created": True, "changed": True}
+        changed = False
+        if freq > int(row.freq or 0):
+            row.freq = freq
+            changed = True
+        if not bool(row.enabled):
+            row.enabled = True
+            changed = True
+        if changed:
+            row.last_seen = now
+            self.session.commit()
+        return {**self._hotword_to_dict(row), "created": False, "changed": changed}
+
     def iter_call_conversations(self, account_id: str = "", exclude_test_objects: bool = False) -> list[list[dict]]:
         """跨通话按序轮次(高频问答对挖掘用):join calls 过账号,created_at 排序。
 
@@ -551,7 +645,14 @@ class SqlAlchemyBusinessRepository:
             if exclude_test_objects and (obj_name is None or is_test_object_name(obj_name)):
                 continue
             grouped.setdefault(row.call_id, []).append(
-                {"role": row.role, "text": row.transcript, "lang": row.language}
+                {"role": row.role, "text": row.transcript, "lang": row.language,
+                 # gen/provider 投影(2026-09-28):qa_text.is_content_reply 的
+                 # 垫话/兜底过滤依赖这两键——缺投影=过滤器 fail-open 空转,
+                 # 挖掘仍在把垫话当答案(实测 32.1% adjacency 对)。
+                 "gen": row.gen, "provider": row.provider,
+                 # call_id 投影(EX-H1,2026-09-28):热词沉淀的证据要挂在具体通话上
+                 # (/api/reports/qa-pairs 经 mine_qa_pairs 忽略此键,零行为变化)。
+                 "call_id": row.call_id}
             )
         return list(grouped.values())
 
@@ -643,6 +744,7 @@ class SqlAlchemyBusinessRepository:
             courier=data.get("courier", ""),
             address=data.get("address", ""),
             contact_channel=data.get("contact_channel", ""),
+            pronunciation=_clamp_pronunciation(data.get("pronunciation")),
             template_id=data.get("template_id", ""),
             status=data.get("status", "active"),
         )
@@ -658,9 +760,11 @@ class SqlAlchemyBusinessRepository:
         obj = self.session.get(models.ObjectProfile, object_id)
         if not obj:
             return None
-        allowed = {"display_name", "role_template", "language", "background", "phone", "tracking_no", "courier", "address", "contact_channel", "template_id", "status"}
+        allowed = {"display_name", "role_template", "language", "background", "phone", "tracking_no", "courier", "address", "contact_channel", "pronunciation", "template_id", "status"}
         for key, value in data.items():
             if key in allowed and hasattr(obj, key):
+                if key == "pronunciation":
+                    value = _clamp_pronunciation(value)
                 setattr(obj, key, value)
         self.session.commit()
         return self._to_dict(obj)
@@ -1394,6 +1498,7 @@ class InMemoryBusinessRepository:
         self.filler_entries: dict[str, dict] = {}
         self.followups: dict[str, dict] = {}
         self.intent_rules: dict[str, dict] = {}
+        self.hotword_entries: dict[str, dict] = {}
         self.settings: dict = SqlAlchemyBusinessRepository.default_settings()
         self.users: dict[str, dict] = {}
 
@@ -1590,6 +1695,67 @@ class InMemoryBusinessRepository:
         del rows[rule_id]
         return True
 
+    # ---- ASR 热词沉淀(EX-H1,2026-09-28,镜像 SQL 姿势) ----
+
+    def list_hotword_entries(
+        self, account_id: str = "", lang: str = "", enabled: bool | None = None
+    ) -> list[dict]:
+        # 两级作用域合并:''=全局行 + 本账号行(与 SQL 后端同语义);account_id=''
+        # → in_('') 退化为仅全局行。created_at 升序。
+        rows = [
+            v
+            for v in getattr(self, "hotword_entries", {}).values()
+            if str(v.get("account_id") or "") in ("", account_id)
+            and (not lang or v.get("lang") == lang)
+            and (enabled is None or bool(v.get("enabled")) == enabled)
+        ]
+        return sorted(rows, key=lambda v: v.get("created_at") or "")
+
+    def upsert_hotword_entry(self, data: dict) -> dict:
+        if not hasattr(self, "hotword_entries"):
+            self.hotword_entries = {}
+        account_id = str(data.get("account_id") or "")
+        lang = str(data.get("lang") or "zh")
+        word = str(data.get("word") or "")
+        freq = int(data.get("freq") or 0)
+        now = datetime.now(timezone.utc).isoformat()
+        row = next(
+            (
+                v
+                for v in self.hotword_entries.values()
+                if str(v.get("account_id") or "") == account_id
+                and str(v.get("lang") or "") == lang
+                and str(v.get("word") or "") == word
+            ),
+            None,
+        )
+        if row is None:
+            row = {
+                "id": data.get("id") or f"hw:{uuid.uuid4().hex[:12]}",
+                "account_id": account_id,
+                "lang": lang,
+                "word": word,
+                "source": data.get("source") or "mined",
+                "enabled": bool(data.get("enabled", True)),
+                "freq": freq,
+                "first_seen": now,
+                "last_seen": now,
+                "created_at": data.get("created_at") or now,
+                "created_by": data.get("created_by") or "",
+            }
+            self.hotword_entries[row["id"]] = row
+            return {**dict(row), "created": True, "changed": True}
+        changed = False
+        if freq > int(row.get("freq") or 0):
+            row["freq"] = freq
+            changed = True
+        if not bool(row.get("enabled")):
+            row["enabled"] = True
+            changed = True
+        if changed:
+            row["last_seen"] = now
+        return {**dict(row), "created": False, "changed": changed}
+
     def create_qa_entry(self, data: dict) -> dict:
         if not hasattr(self, "qa_entries"):
             self.qa_entries = {}
@@ -1608,6 +1774,11 @@ class InMemoryBusinessRepository:
             "source": data.get("source") or "curated",
             "cluster_head_id": data.get("cluster_head_id") or "",
             "priority": int(data["priority"]) if data.get("priority") is not None else 10,
+            "hit_threshold": (
+                float(data["hit_threshold"])
+                if data.get("hit_threshold") is not None
+                else None
+            ),
             "template_id": data.get("template_id") or "",
             "created_at": data.get("created_at") or "",
         }
@@ -1623,6 +1794,11 @@ class InMemoryBusinessRepository:
                 row[k] = patch[k]
         if "cluster_head_id" in patch and patch["cluster_head_id"] is not None:
             row["cluster_head_id"] = str(patch["cluster_head_id"])
+        if "hit_threshold" in patch:
+            # VectorQ 阈值(2026-09-25):显式 None=回全局默认档,与 SQL 后端同语义
+            # (键在即写,不走「值非 None 才写」护栏;hit_count 计数器不在此列)。
+            ht = patch["hit_threshold"]
+            row["hit_threshold"] = float(ht) if ht is not None else None
         return dict(row)
 
     def delete_qa_entry(self, entry_id: str) -> bool:
@@ -1691,7 +1867,10 @@ class InMemoryBusinessRepository:
                 name = obj.get("display_name")
                 if name is None or is_test_object_name(name):
                     continue
-            out.append([{"role": t.role, "text": t.transcript, "lang": t.language} for t in turns])
+            out.append([{"role": t.role, "text": t.transcript, "lang": t.language,
+                         "gen": getattr(t, "gen", ""), "provider": getattr(t, "provider", ""),
+                         "call_id": call_id}
+                        for t in turns])
         return out
 
     def get_usage_record(self, call_id: str) -> dict | None:
@@ -1738,6 +1917,7 @@ class InMemoryBusinessRepository:
             courier=data.get("courier", ""),
             address=data.get("address", ""),
             contact_channel=data.get("contact_channel", ""),
+            pronunciation=_clamp_pronunciation(data.get("pronunciation")),
             template_id=data.get("template_id", ""),
             status=data.get("status", "active"),
         ).__dict__
@@ -1747,7 +1927,10 @@ class InMemoryBusinessRepository:
     def update_object(self, object_id: str, data: dict) -> dict | None:
         if object_id not in self.objects:
             return None
-        self.objects[object_id].update({k: v for k, v in data.items() if k in {"display_name", "role_template", "language", "background", "phone", "tracking_no", "courier", "address", "contact_channel", "template_id", "status"}})
+        patch = {k: v for k, v in data.items() if k in {"display_name", "role_template", "language", "background", "phone", "tracking_no", "courier", "address", "contact_channel", "pronunciation", "template_id", "status"}}
+        if "pronunciation" in patch:
+            patch["pronunciation"] = _clamp_pronunciation(patch["pronunciation"])
+        self.objects[object_id].update(patch)
         return self.objects[object_id]
 
     def delete_object(self, object_id: str) -> bool:

@@ -71,6 +71,14 @@ function RouteGuard({ children }: { children: React.ReactNode }) {
   if (gate.kind === "root" && !(session.role === "root" && !session.anonymous)) {
     return <NoPermission />;
   }
+  // 属主专属（/settings 引擎设置面，2026-09-27）：root 或本机匿名属主——
+  // admin/user 不可入（PUT 侧已同款收 root；本地 auth-off 单机=整机属主照常配）。
+  if (
+    gate.kind === "owner" &&
+    !(session.anonymous || (session.role === "root" && !session.anonymous))
+  ) {
+    return <NoPermission />;
+  }
   return <>{children}</>;
 }
 

@@ -842,6 +842,33 @@ def test_wa_confirm_guard_shared_rule_and_judge():
     assert wa_confirm_advance_allowed(goal="核实平台", ref="你喺边个平台落单?", captured=False) is True
 
 
+def test_whatsapp_step_hint_main_script_only():
+    """回归 call-ec075023:渠道名出现在分支/注意行不得误判收号步。
+
+    平台步注意行「客户喺第啲平台買（小紅書、微信小店等）」含「微信」——旧版
+    整 ref 子串全量匹配把平台步判成收号步 → CONFIRM 永锁 + QA wa_step_locked,
+    整通死锁 step3。修后只看 goal+正稿:收号步的索取语义必在正稿。"""
+    from agent_runtime.flow import _looks_like_whatsapp_step, wa_confirm_advance_allowed
+
+    platform_step = {
+        "goal": "核實購買平台",
+        "ref": (
+            "咁你係喺邊個平台買㗎——拼多多、淘寶、京東定係第啲平台？\n"
+            "如果客户话唔记得边个平台 → 提佢睇下手机入面最近嘅购物订单。\n"
+            "注意:客户喺第啲平台買（小紅書、微信小店等）都算答到，照常推进。"
+        ),
+    }
+    # 平台步:注意行的「微信小店」不再误判
+    assert _looks_like_whatsapp_step(platform_step["goal"], platform_step["ref"]) is False
+    # 客户答平台 → CONFIRM 放行(死锁解除)
+    assert wa_confirm_advance_allowed(
+        goal=platform_step["goal"], ref=platform_step["ref"], captured=False
+    ) is True
+    # 真收号步:正稿「留個{聯絡方式}號碼」仍判 WA(护栏原语义)
+    assert _looks_like_whatsapp_step(_WA_STEP["goal"], _WA_STEP["ref"]) is True
+    assert wa_confirm_advance_allowed(goal=_WA_STEP["goal"], ref=_WA_STEP["ref"], captured=False) is False
+
+
 def test_judge_path_has_wa_guard():
     """源码级:背景 judge 的 CONFIRM 分支必须过同一护栏(nested closure 冇法直接
     单测,用 test_echo_guard 的源码断言姿势;泄漏点=c4f6e4f1 judge=confirm step=4)。"""
@@ -953,6 +980,17 @@ def test_repeat_verdict_detection():
     assert decide_advance("赔偿要点样算？") == QUESTION
 
 
+def test_repeat_explicit_family_ignores_length_gate():
+    # 2026-09-28 EX-2:16 字显式要求重复/没听清(含显式短语)恒命中 REPEAT——
+    # 旧 ≤12 短句闸把 16 字「唔好意思頭先冇聽清,你講多次」误杀成 QUESTION,
+    # 20 轮粤语 probe 实证。显式族与句长无关。
+    assert decide_advance("唔好意思頭先冇聽清，你講多次") == REPEAT
+    assert decide_advance("Sorry I didn't hear that, could you repeat it please") == REPEAT
+    assert decide_advance("唔好意思,刚才没听清,麻烦您再说一次") == REPEAT
+    # 长句纯内容提问(无显式短语)照旧唔当 REPEAT:模糊族保留 ≤12 闸。
+    assert decide_advance("乜嘢意思啊你講嘅賠償方案") != REPEAT
+
+
 def test_repeat_never_advances():
     # 开场步与中段步:REPEAT 都停留
     assert should_auto_advance(current=0, goal="开场", ref="请问係咪你?", user_text="听唔清", verdict=REPEAT) is False
@@ -1021,3 +1059,41 @@ def test_parse_steps_emotion_field():
     assert steps[0].emotion == "sad"
     assert parse_steps(_json.dumps([{"goal": "g", "ref": "r"}]))[0].emotion == ""
     assert parse_steps("") == []
+
+
+# ---- F1 尾部两段化(2026-09-28 手术③):current_step_text() 拆稳定段/增量段 ----
+
+def test_split_step_text_stable_and_delta_partition():
+    from agent_runtime.flow import FlowController, split_step_text
+
+    fc = FlowController.from_template(
+        {
+            "steps_json": '[{"goal":"确认客户身份","ref":'
+            '"您好，請問係{姓名}小姐嗎？\\n如果客户问係邊個→我係客服。"}]'
+        },
+        object_card={"display_name": "陳小姐"},
+    )
+    fc.last_user_text = "你係邊個？"
+    fc.last_verdict = "question"
+    txt = fc.current_step_text()
+    stable, delta = split_step_text(txt)
+    # 稳定段承载步身份/目标/底稿/注意;增量段承载 verdict 指引。
+    assert "流程第 1/1 步" in stable
+    assert "这一步要达成" in stable
+    assert "本步底稿" in stable
+    assert "客户在提问" in delta
+    # 分区无损:两段拼回的文本行集合与原文本一致(仅归属不同)。
+    assert sorted((stable + "\n" + delta).split("\n")) == sorted(txt.split("\n"))
+
+
+def test_split_step_text_arbitrary_text_all_stable():
+    from agent_runtime.flow import split_step_text, stable_step_key
+
+    # 无已知块首(收尾话术/旧测试任意串)→整段稳定,key=整段(旧 revision 语义)。
+    stable, delta = split_step_text("话术流程已走完。继续如常回答客户问题。")
+    assert stable == "话术流程已走完。继续如常回答客户问题。" and delta == ""
+    assert stable_step_key(stable) == stable
+    # 真步文本 key=步骤首行(步内恒定,底稿波动不影响)。
+    k = stable_step_key("流程第 2/5 步\n这一步要达成:xxx\n本步底稿(...):yyy")
+    assert k == "流程第 2/5 步"
+    assert stable_step_key("流程第 3/5 步\n这一步要达成:zzz") != k

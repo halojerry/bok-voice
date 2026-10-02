@@ -1,0 +1,6 @@
+# Laya decision sidecar deps — standalone on purpose (NOT in repo root deps):
+# 0.2.0-era runtime must stay out of the A-line worker's critical path
+# (LAYA-EVAL.md §3 integration posture: crash-isolated sidecar, opt-in).
+laya-mlx>=0.2.0,<0.3
+fastapi>=0.110,<1
+uvicorn[standard]>=0.29,<1

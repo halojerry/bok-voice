@@ -84,10 +84,17 @@ def _make(monkeypatch, users=()):
 
 
 def _fake_llm(monkeypatch, target_id: str, decisions: str | None = None):
-    """假 LLM:记录 user 消息条数;返回固定决策。"""
-    calls = {"chat": 0, "discover": 0, "messages": []}
+    """假 LLM:记录 user 消息条数;返回固定决策。
+
+    EX-H1:dry 计划同时挖热词,热词判定走同一 `_llm_chat`（不同 system 提示词）——
+    按 system 分流,热词调用单独计数并回空数组(本文件不考热词采纳;qa 断言口径不变)。
+    """
+    calls = {"chat": 0, "hotword": 0, "discover": 0, "messages": []}
 
     def fake_chat(base_url, model, system, user, **kw):
+        if "热词" in str(system or ""):
+            calls["hotword"] += 1
+            return "[]"
         calls["chat"] += 1
         calls["messages"].append(user)
         return decisions or (
@@ -316,3 +323,55 @@ def test_cache_keyed_by_params(monkeypatch):
     assert calls["chat"] == 1, "同参数第二次吃缓存"
     client.post("/api/qa/cluster", json={"limit": 6})
     assert calls["chat"] == 2, "换参数=另一份计划,重算"
+
+
+# ---- TOCTOU 二道闸 + 部分失败缓存作废(2026-10-02 review 修复回归钉) ----
+
+def test_apply_select_toctu_second_gate_409(monkeypatch):
+    """一道闸通过后、取计划前缓存被并发作废 → 409,不静默重算。
+
+    旧 TOCTOU:has_fresh_plan(检查)与 run_cluster(取用)是两次独立缓存查找,
+    中间被 _plan_cache_pop_account 清掉的话 run_cluster 走单飞重算,前端旧下标
+    对到新计划=边界内静默采错条目。fresh_only 令取计划只吃缓存:缺席=PlanStale→409。
+    """
+    client, repo, target = _make(monkeypatch)
+    calls = _fake_llm(monkeypatch, target["id"])
+    client.post("/api/qa/cluster", json={})  # dry → 缓存
+    # 模拟「一道闸已过、取计划瞬间」并发作废:一道闸恒真,缓存此刻被清
+    monkeypatch.setattr(qc, "has_fresh_plan", lambda *a, **k: True)
+    qc._plan_cache.clear()
+    r = client.post("/api/qa/cluster", json={"apply": True, "select": [{"kind": "variant", "i": 0}]})
+    assert r.status_code == 409, r.text
+    assert "重新生成" in r.json()["detail"]
+    assert calls["chat"] == 1, "apply 带选择绝不静默重算(LLM 零新调用)"
+    # 模块层:fresh_only 缓存缺席抛 PlanStaleError;命中则恒为缓存那份
+    with pytest.raises(qc.PlanStaleError):
+        qc.run_cluster(repo, "acc-001", fresh_only=True)
+
+
+def test_apply_partial_failure_still_invalidates_cache(monkeypatch):
+    """apply 循环中途抛异常(部分行已入库)→ 缓存必须作废,重试 409 不再旧下标。
+
+    旧 bug:pop_account 只在 created>0 的成功路径——中途异常时已入库行不回滚、
+    缓存也不清,重试同一份勾选对旧计划再跑一遍=已入库条目二次建行。"""
+    client, repo, target = _make(monkeypatch)
+    _fake_llm(monkeypatch, target["id"])
+    client.post("/api/qa/cluster", json={})  # dry → 缓存
+    assert qc._plan_cache, "前置:缓存有计划"
+    real_create = repo.create_qa_entry
+    state = {"n": 0}
+
+    def flaky_create(payload):
+        state["n"] += 1
+        if state["n"] >= 2:  # 第一条成功入库,第二条起炸=部分失败形态
+            raise RuntimeError("db down mid-apply")
+        return real_create(payload)
+
+    monkeypatch.setattr(repo, "create_qa_entry", flaky_create)
+    # 采纳全部(variants1+fresh2):第1条成功,第2条炸 → 异常上抛(TestClient 直抛);
+    # 缓存必须已被 finally 作废
+    with pytest.raises(RuntimeError, match="db down mid-apply"):
+        client.post("/api/qa/cluster", json={"apply": True, "select": [
+            {"kind": "variant", "i": 0}, {"kind": "fresh", "i": 0}, {"kind": "fresh", "i": 1}
+        ]})
+    assert not qc._plan_cache, "部分失败后缓存必须作废(重试走 409→重新生成)"

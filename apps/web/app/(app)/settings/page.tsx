@@ -5,6 +5,7 @@ import { Plus } from "lucide-react";
 import { api } from "@/lib/api";
 import { ErrorState, LoadingState } from "@/components/app-shell";
 import CannedAuditionCard from "@/components/canned-audition";
+import ModelRoutingCard from "@/components/settings-model-routing";
 import { SETTING_CARDS, POLICY_META, DEFAULT_PROVIDER, type ProviderKind, type FieldMeta } from "@/lib/settings-meta";
 import { buildVoiceSelectOptions, previewSampleText, resolvePreviewLang } from "@/lib/voice-options";
 import { playAudioBlob, previewVoice } from "@/lib/preview";
@@ -894,6 +895,10 @@ export default function SettingsPage() {
           <AudioDevicesCard />
           <SipCard value={form.sip ?? {}} onChange={(next) => setForm({ ...form, sip: next })} />
           <CannedAuditionCard />
+          {/* 模型路由（root 专属；组件内部判角色，非 root 不渲染） */}
+          <div className="lg:col-span-2">
+            <ModelRoutingCard />
+          </div>
           <details className="rounded-xl border border-(--card-border) bg-(--card) p-4 lg:col-span-2">
             <summary className="cursor-pointer text-sm font-medium">
               开发者参数（ASR / LLM / VAD / 运行策略）

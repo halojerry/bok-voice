@@ -1,19 +1,21 @@
 "use client";
 
 // 模板编辑表单（W1 AI 工作站）：自 apps/web/app/(app)/templates/page.tsx 原样提取的共用组件。
-// /templates 页（右侧编辑面板）与 /studio 工作台「话术流程」tab 共用；
-// 字段、默认值、占位文案与提取前逐字一致。
+// /templates 页（右侧编辑面板）与 /studio 工作台（新建话术/模板设置）共用；
 // 列表 / 归属过滤 tab / owner 徽标 / 行级 canEdit 闸仍留在页面侧；组件内只做
 // owner 只读兜底（共享话术且非主管 → 全字段禁用、不出保存按钮）。
 // 纯函数助手（stepsToJson/jsonToSteps/parseStepsFromTable/fourSectionsToSteps/
 // STEPS_EXAMPLES/FlowStep/TemplateRow/toTemplateRow）随迁并导出，studio 页复用。
+// 步卡片编辑面（2026-09-25 结构化改版）：单个大 textarea（正稿+分支+注意混写）→
+// 三件结构化编辑（正稿/分支行/注意），拆装走 StepRefForm（components/step-form.tsx，
+// 内部用 lib/flow-canvas 纯函数镜像，round-trip 无损、与画布抽屉同语义）。
 
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { ErrorState } from "@/components/app-shell";
 import { useAccount } from "@/components/account-context";
 import { useSession } from "@/components/session-context";
-import { VarTextarea } from "@/components/var-insert";
+import { StepRefForm } from "@/components/step-form";
 
 export const LANGS = [
   ["zh", "普通话"],
@@ -112,7 +114,7 @@ const EMPTY_FORM: TplForm = {
   hotwords: "",
 };
 
-const STEPS_HINT = "可用变量:{姓名}/{名字}/{name} {快递单号} {快递尾号}/{tracking_tail} {物流公司}/{快递公司}/{courier} {收货地址}/{地址} {电话} {聯絡方式}/{联系方式}/{contact}。完整目录与预览见工作站·变量 tab。\n参考说法是给 AI 的要点参考,不是逐字稿——AI 会结合客户原话用自己的话讲。\n勾选「直念」的步骤:进入该步的当轮 AI 逐字念参考说法首行,适合通知/道歉等要逐字一致的内容。\n直念步可选「情绪」:只在罐头物化时烧进音频(如致歉步选低沉柔和),实时生成的回复保持语气稳定不受影响;改情绪/参考说法后需重跑 tts-pregen。";
+const STEPS_HINT = "可用变量:{姓名}/{名字}/{name} {快递单号} {快递尾号}/{tracking_tail} {物流公司}/{快递公司}/{courier} {收货地址}/{地址} {电话} {聯絡方式}/{联系方式}/{contact}。完整目录与预览见工作站·变量 tab。\n正稿是给 AI 的要点参考,不是逐字稿——AI 会结合客户原话用自己的话讲;「客户如果这样说」分支=客户出现该反应时的应对,AI 会挑对应分支回答。\n勾选「直念」的步骤:进入该步的当轮 AI 逐字念正稿首行,适合通知/道歉等要逐字一致的内容。\n直念步可选「情绪」:只在罐头物化时烧进音频(如致歉步选低沉柔和),实时生成的回复保持语气稳定不受影响;改情绪/正稿后需重跑 tts-pregen。";
 
 /** 把 steps 序列化/反序列化为 steps_json(存库)。say 只在 true 时写出(省体积);
  * emotion 只在直念步且非空时写出(2026-09-16 罐头带情绪,pregen 物化烧进音频);
@@ -480,7 +482,9 @@ export default function TemplateEditor(props: {
         </div>
         <p className="mt-1 whitespace-pre-line text-[11px] leading-relaxed muted">{STEPS_HINT}</p>
         <p className="mt-1 text-[11px] leading-relaxed muted">
-          参考说法可分行写分支：<span className="text-(--live-ink)">如果客户… → 就…</span>，AI 会看客户实际反应挑对应分支回答。
+          每步三件：<span className="text-(--live-ink)">正稿</span>=AI 主要说的话；
+          <span className="text-(--live-ink)">分支</span>=客户出现某反应时的应对（可选动作：礼貌收线 / 通知人工 / 跳到第 N 步 / 留在本步）；
+          <span className="text-(--live-ink)">注意</span>=每次都要记住的补充提醒。AI 会看客户实际反应挑对应分支回答。
         </p>
         {steps.length === 0 && (
           <p className="mt-1 text-[11px] muted">
@@ -506,11 +510,11 @@ export default function TemplateEditor(props: {
                 onChange={(e) => setSteps((s) => s.map((x, j) => (j === i ? { ...x, goal: e.target.value } : x)))}
               />
               <div className="mt-1.5">
-                <VarTextarea
-                  className={`h-24 ${textarea} text-xs`}
-                  placeholder={"参考说法(要点+分支;AI 结合客户原话用自己的话讲)\n例:你好,请问係咪{姓名}?我哋係{物流公司}…\n如果客户唔记得 → 提佢下单填嘅地址帮佢回忆"}
-                  value={st.ref}
+                <StepRefForm
+                  refText={st.ref}
+                  stepCount={steps.length}
                   disabled={readOnly}
+                  scriptPlaceholder={"AI 主要说的话(要点即可)\n例:你好,请问係咪{姓名}?我哋係{物流公司}…"}
                   onChange={(v) => setSteps((s) => s.map((x, j) => (j === i ? { ...x, ref: v } : x)))}
                 />
               </div>

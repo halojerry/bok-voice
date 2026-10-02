@@ -54,6 +54,26 @@ def test_store_get_roundtrip_and_meta(tmp_path):
     assert got == pcm
     meta = (tmp_path / "tts-cache" / f"{key}.json")
     assert meta.exists()
+    import json as _json
+
+    assert _json.loads(meta.read_text(encoding="utf-8"))["text"] == "你好"
+
+
+def test_meta_text_off_writes_no_plaintext(tmp_path, monkeypatch):
+    """L1(2026-09-24):BOK_TTS_CACHE_META_TEXT=0=客户现场档,meta 不落原文。
+
+    这是全仓唯一业务 IP 落盘面(罐头原句明文);关档后音频/命中行为零变化。"""
+    import json as _json
+
+    monkeypatch.setenv("BOK_TTS_CACHE_META_TEXT", "0")
+    c = _cache(tmp_path)
+    key = c.key_for("机密话术", voice="v", model="m")
+    pcm = b"\xe8\x03" * 4800
+    assert c.store(key, pcm, text="机密话术", voice="v", model="m") is True
+    assert c.get(key) == pcm  # 行为零变化
+    meta = _json.loads((tmp_path / "tts-cache" / f"{key}.json").read_text(encoding="utf-8"))
+    assert "text" not in meta
+    assert "机密话术" not in _json.dumps(meta, ensure_ascii=False)  # 全 meta 无原文字样
 
 
 def test_corrupt_or_missing_returns_none(tmp_path):

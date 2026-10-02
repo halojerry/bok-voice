@@ -43,6 +43,16 @@ MAX_REF_SECONDS = float(os.environ.get("QWEN3_TTS_MAX_REF_SECONDS", "10"))
 REF_TARGET_SECONDS = float(os.environ.get("QWEN3_TTS_REF_TARGET_SECONDS", "8"))
 BACKEND = os.environ.get("QWEN3_TTS_BACKEND", "transformers").lower()
 
+# clone 未载（启动期 registry 为空 → 条件加载跳过了它）而被请求时的 503 人话：
+# 给出两条逃生路（强制双载重启 / 注册后重启自动载入），运行期绝不懒加载。
+_CLONE_NOT_LOADED_DETAIL = (
+    "clone model not loaded (sidecar booted with an empty voice registry; "
+    "conditional load happens at startup only, never lazily at request time). "
+    "Restart with BOK_TTS_BOTH_MODELS=1 to force-load both models, then "
+    "register via /v1/voices/register; registered voices are picked up on the "
+    "next restart."
+)
+
 app = FastAPI(title="Bok Qwen3-TTS Sidecar")
 
 # 段内有没有「可朗读」字符（字母/数字/汉字等 \w）。纯标点/空白输入（「。」「？」）
@@ -54,6 +64,33 @@ _WORD_CHAR_RE = re.compile(r"\w")
 def _has_word_char(text: str) -> bool:
     return _WORD_CHAR_RE.search(text or "") is not None
 
+
+# 长文拆句护栏（2026-09-28）：句末/句中标点（含逗号级）保标点切分；无标点长串硬切。
+_SENT_SPLIT_RE = re.compile(r"[^。！？!?；;，、\n]+[。！？!?；;，、\n]?|\n")
+
+
+def _split_long_text(text: str, max_chars: int) -> list[str]:
+    """把长文按句界拆成 ≤max_chars 的子段（保标点），无界可切时硬切。"""
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return [text] if text else []
+    parts: list[str] = []
+    buf = ""
+    for m in _SENT_SPLIT_RE.finditer(text):
+        seg = m.group(0)
+        if not seg.strip():
+            continue
+        if buf and len(buf) + len(seg) > max_chars:
+            parts.append(buf)
+            buf = seg
+        else:
+            buf += seg
+        while len(buf) > max_chars:  # 无标点长串（号码/纯数字行）硬切
+            parts.append(buf[:max_chars])
+            buf = buf[max_chars:]
+    if buf.strip():
+        parts.append(buf)
+    return parts or [text]
 
 
 class TTSService:
@@ -81,15 +118,42 @@ class TTSService:
             encoding="utf-8",
         )
 
+    def _should_load_clone(self) -> bool:
+        """启动期条件加载判据（2026-10-02 内存瘦身，只做启动期、绝无运行期懒加载）。
+
+        registry 非空（已有注册克隆音色 = 克隆车道在用）才载 clone；registry 为空
+        时 clone（~2.9GB）纯属浪费——本机 A 线生产走 MiniMax 云，本地 TTS 只服务
+        探针/克隆音色车道。`BOK_TTS_BOTH_MODELS=1` 强制双载（逃生键，回旧行为）。
+
+        时序：registry 在 `__init__`（模块导入期）已从盘读入，`load()` 由 FastAPI
+        startup 事件在导入之后调用——判据读到的是真实盘面，无需二次读盘。
+        """
+        if os.environ.get("BOK_TTS_BOTH_MODELS") == "1":
+            return True
+        return bool(self._registry)
+
+    def _log_models_loaded(self) -> None:
+        loaded = ["preset"]
+        if self._clone_model is not None:
+            loaded.append("clone")
+        print(
+            "TTS_MODELS",
+            f"loaded={','.join(loaded)}",
+            f"registry_n={len(self._registry)}",
+            flush=True,
+        )
+
     def load(self) -> None:
         if os.environ.get("QWEN3_TTS_DISABLE_LOAD") == "1":
             return
+        load_clone = self._should_load_clone()
         try:
             if BACKEND == "mlx":
                 from mlx_audio.tts.utils import load_model as mlx_load_model
 
                 self._preset_model = mlx_load_model(DEFAULT_PRESET_MODEL)
-                self._clone_model = mlx_load_model(DEFAULT_CLONE_MODEL)
+                if load_clone:
+                    self._clone_model = mlx_load_model(DEFAULT_CLONE_MODEL)
                 self._install_speaker_embedding_cache()
                 if os.environ.get("QWEN3_TTS_WARMUP", "1") == "1":
                     # Synchronous, on the main thread during startup: MLX is
@@ -99,31 +163,44 @@ class TTSService:
                     # whole process after the sox fallback warning). Startup
                     # blocks anyway, so warm inline is both safe and free.
                     self._warmup()
+                self._log_models_loaded()
                 return
             import torch
             from qwen_tts import Qwen3TTSModel
 
             device = self._resolve_device()
             dtype = torch.bfloat16 if device in ("cuda", "mps") else torch.float32
+            # CUDA 档优先 FA2;包缺席(容器/裸 Linux 常态)回落 SDPA——fa2 需源码编译,
+            # 装不上不应令整个 sidecar 起不来(transformers 侧 ImportError 实证
+            # 2026-09-24 CUDA 节点首部署)。SDPA 在 4090 上对 1.7B TTS 前向足够。
             attn = "flash_attention_2" if device == "cuda" else "sdpa"
+            if attn == "flash_attention_2":
+                try:
+                    import flash_attn  # noqa: F401
+                except ImportError:
+                    attn = "sdpa"
             self._preset_model = Qwen3TTSModel.from_pretrained(
                 DEFAULT_PRESET_MODEL,
                 device_map=device,
                 dtype=dtype,
                 attn_implementation=attn,
             )
-            # Clone model loads eagerly on the main thread at startup
-            # (lazy loading from uvicorn's threadpool segfaults on MPS) and
-            # uses float32 on MPS: bf16 breaks the Base/ICL clone generation
-            # (runs to max_new_tokens without emitting EOS -> minutes of
-            # garbage audio). Preset stays bf16 for low latency.
-            clone_dtype = torch.float32 if device == "mps" else dtype
-            self._clone_model = Qwen3TTSModel.from_pretrained(
-                DEFAULT_CLONE_MODEL,
-                device_map=device,
-                dtype=clone_dtype,
-                attn_implementation=attn,
-            )
+            # Clone model loads eagerly on the main thread at startup — only
+            # when a registered clone voice exists (or BOK_TTS_BOTH_MODELS=1),
+            # never lazily at request time (lazy loading from uvicorn's
+            # threadpool segfaults on MPS). It uses float32 on MPS: bf16
+            # breaks the Base/ICL clone generation (runs to max_new_tokens
+            # without emitting EOS -> minutes of garbage audio). Preset stays
+            # bf16 for low latency.
+            if load_clone:
+                clone_dtype = torch.float32 if device == "mps" else dtype
+                self._clone_model = Qwen3TTSModel.from_pretrained(
+                    DEFAULT_CLONE_MODEL,
+                    device_map=device,
+                    dtype=clone_dtype,
+                    attn_implementation=attn,
+                )
+            self._log_models_loaded()
         except Exception as exc:  # pragma: no cover - model download/load can fail
             self._load_error = repr(exc)
 
@@ -234,11 +311,31 @@ class TTSService:
             return "mps"
         return "cpu"
 
-    def ensure_loaded(self) -> None:
+    def ensure_loaded(self, voice: str = "", *, require_clone: bool = False) -> None:
+        """按需就绪校验：请求实际要走的模型在场即可（2026-10-02 内存瘦身）。
+
+        - voice ∈ registry（注册克隆音色）或 require_clone=True → 需要 clone 模型；
+        - 其余请求（非注册 voice）全走 preset 通道 → 只需要 preset；
+        - 零参调用（无 voice 语境，如 /v1/audio/speech 响应头之前的 fail-fast）
+          保守按 registry 判定：注册表非空即要求 clone 在场——可达态下与按 voice
+          判定等价（注册 voice 的请求只有 clone 已载后才会被服务）。
+
+        clone 未载而被请求 → 503 人话（启动期条件加载的后果；运行期绝不补载——
+        uvicorn 线程池懒加载 MPS 会 segfault，见 load()）。
+        """
         if self._load_error:
             raise HTTPException(status_code=503, detail=f"model not ready: {self._load_error}")
-        if self._preset_model is None or self._clone_model is None:
-            raise HTTPException(status_code=503, detail="model not loaded")
+        needs_clone = require_clone or (
+            bool(voice) and (voice in self._registry or voice in self._clone_prompts)
+        )
+        if not voice and self._registry:
+            needs_clone = True
+        if needs_clone:
+            if self._clone_model is None:
+                raise HTTPException(status_code=503, detail=_CLONE_NOT_LOADED_DETAIL)
+            return
+        if self._preset_model is None:
+            raise HTTPException(status_code=503, detail="preset model not loaded")
 
     def list_speakers(self) -> list[str]:
         model = self._preset_model
@@ -289,7 +386,9 @@ class TTSService:
             raise HTTPException(status_code=400, detail="voice_id and ref_text are required")
         if not file.filename:
             raise HTTPException(status_code=400, detail="audio file is required")
-        self.ensure_loaded()
+        # 注册要写 clone 模型（建克隆 prompt + 后续合成都用它）：
+        # 启动期 registry 为空 → clone 未载 → 503 人话（见 _CLONE_NOT_LOADED_DETAIL）。
+        self.ensure_loaded(require_clone=True)
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         suffix = Path(file.filename or "reference.wav").suffix or ".wav"
         safe = hashlib.sha1(voice_id.encode("utf-8")).hexdigest()[:12]
@@ -337,7 +436,7 @@ class TTSService:
         if not _has_word_char(text):
             # 纯标点/空白：零音频短路（连模型加载都唔触发，绝不烧 GPU 合成爆段）。
             return b""
-        self.ensure_loaded()
+        self.ensure_loaded(voice=voice)
         if BACKEND == "mlx":
             return self._synthesize_mlx(
                 text=text,
@@ -435,9 +534,42 @@ class TTSService:
             # 纯标点/空白：零帧短路（连模型加载都唔触发）。agent 侧
             # _Qwen3SynthesizeStream 已过滤，这里兜底防旧客户端/直接调用踩爆段。
             return
-        self.ensure_loaded()
+        self.ensure_loaded(voice=voice)
         if not text:
             return
+        # 长文拆句护栏（2026-09-28 生产事故防御）：单任务长文本（>N 字）会触发
+        # (1) 语速漂移（社区 torch 后端 +16.7% 实证；mlx ICL 机制不同但长文
+        # 加速同族）+ (2) 客户端 QWEN3_TTS_MAX_TASK_AUDIO_SEC 15s cap 拦腰截断
+        # （实测 91 字整段第 4 句 4.14s→1.52s）。按句界拆成 ≤N 字子段依次合成、
+        # 段间 120ms 静音拼接——流式语义不变，任何调用方直发长文都安全。
+        # QWEN3_TTS_SPLIT_MAX_CHARS=0 关。
+        try:
+            split_max = int(os.environ.get("QWEN3_TTS_SPLIT_MAX_CHARS", "60"))
+        except ValueError:  # pragma: no cover - 配错当默认
+            split_max = 60
+        if split_max > 0 and len(text) > split_max:
+            sub_texts = _split_long_text(text, split_max)
+            if len(sub_texts) > 1:
+                gap = np.zeros(int(SAMPLE_RATE * 0.12) * 2, dtype=np.int16).tobytes()
+                emitted = False
+                for i, sub in enumerate(sub_texts):
+                    for is_first, frame in self.synthesize_chunks(
+                        text=sub,
+                        language=language,
+                        voice=voice,
+                        instruct=instruct,
+                        sample_rate=sample_rate,
+                        chunk_ms=chunk_ms,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_k=top_k,
+                    ):
+                        yield (not emitted, frame)
+                        emitted = True
+                    if i < len(sub_texts) - 1:
+                        for off in range(0, len(gap), int(sample_rate * chunk_ms / 1000) * 2):
+                            yield (False, gap[off : off + int(sample_rate * chunk_ms / 1000) * 2])
+                return
         if BACKEND == "mlx":
             yield from self._synthesize_mlx_stream(
                 text=text,
@@ -923,9 +1055,14 @@ async def audio_speech(payload: dict[str, Any]) -> Response:
     # 就绪前置检查（**必须在返回 StreamingResponse 之前**）。旧版只在生成器内部
     # `ensure_loaded()`：那时响应头已发出、状态码已定 200，抛出的 503 改不了状态，
     # 只剩「HTTP 200 + 0 字节音频」——2026-09-21 实证踩到：模型路径解析到一个只有
-    # `.cache/` 的空壳目录 → 加载失败 → 三个 E2E 探针收到的客户话音是**空的**，
+    # `.cache/` 的空壳目录 → 解析/加载失败 → 三个 E2E 探针收到的客户话音是**空的**，
     # 表面症状是「agent 听不到客户、全轮哑」，查了半天才在 tts.log 里看到 traceback。
     # 静默失败比报错贵得多，故提前到响应发出之前 fail-fast。
+    # 2026-10-02 条件加载后：零参调用 = 无 voice 语境的保守闸（preset 恒要求；
+    # registry 非空即要求 clone 在场——注册 voice 的请求只有 clone 已载才可能被
+    # 服务）。具体 voice 的按需闸（注册 voice 要 clone、其余只要 preset）在
+    # synthesize/synthesize_chunks 入口复用；零参形状是既有接线契约（测试桩亦
+    # 按零参替换本闸），保持不变。
     service.ensure_loaded()
 
     if streaming:

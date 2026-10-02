@@ -12,18 +12,20 @@ import {
 } from "@livekit/components-react";
 import { ConnectionState, TokenSource, Track, type Room } from "livekit-client";
 import { ArrowRight } from "lucide-react";
-import { api } from "@/lib/api";
+import { api, apiBase } from "@/lib/api";
 import { describeConnectError, friendlyErrorText, useControlPlaneReady } from "@/lib/api-ready";
 import { listAudioDevicesOf, requestMicPermission, saveMicDevice, savedMicDevice, savedOutputDevice, switchWebOutputDevice, webCanSwitchOutput, type AudioDeviceInfo } from "@/lib/audio";
 import { startTrace } from "@/lib/logger";
+import { appendLogLines, isNearBottom, type LogLine } from "@/lib/live-logs";
 import { AgentAudioVisualizerAura } from "@/components/agents-ui/agent-audio-visualizer-aura";
 import { AgentChatIndicator } from "@/components/agents-ui/agent-chat-indicator";
 import { AgentChatTranscript } from "@/components/agents-ui/agent-chat-transcript";
-import { AgentControlBar } from "@/components/agents-ui/agent-control-bar";
-import { AgentSessionProvider } from "@/components/agents-ui/agent-session-provider";
 import { StartAudioButton } from "@/components/agents-ui/start-audio-button";
+import { AgentSessionProvider } from "@/components/agents-ui/agent-session-provider";
 import { useMoodColor } from "@/hooks/use-mood-color";
 import { useAccount } from "@/components/account-context";
+import { useSession as useAppSession } from "@/components/session-context";
+import { FamineStatusLine, ProviderLines, useProviderMetrics } from "@/components/provider-status";
 
 // 模块级 trace（环形缓存+TTL 有界，见 lib/logger.ts 头注释）：数据加载/设备应用失败不再静默。
 const log = startTrace({ operation: "web.call-studio" });
@@ -133,22 +135,15 @@ function LiveAgentPanel({ room, session }: { room: Room | null; session: UseSess
         </div>
       )}
 
-      {/* 控制条（AgentSessionProvider 已内置音频渲染）；设备切换已移到右侧「音频设备」卡片。
-          官方 AgentControlBar 按 CallStudio 能力裁剪=只留麦克风开关（旧实验控制条的 mic toggle +
-          audioinput 设备菜单同款，摄像头/屏幕/文字聊天本就没有）。
-          saveUserChoices=false：设备偏好仍归 CallStudio 的 bok.audio.* 单轨，禁官方写 livekit
-          标准 localStorage 键（spec §7 零新增存储键）。
-          leave=false（挂断行为保真取舍）：CallStudio 挂断是复合路径 leave()=session.end()→
-          api.hangup 上报→结算轮询→重挂；官方 AgentDisconnectButton 在 onClick 后恒再调
-          session.end()（useSessionContext），接入会双触发且官方件无处安放后续清理——挂断
-          仍由顶部「挂断」按钮（同款 leave()）承担，本条不渲染 leave 控件。 */}
+      {/* 控制条（2026-10-01 Ethan 拍板砍除）：官方 AgentControlBar 在本页只剩两块——
+          chat:false 恒真的 inert 文字输入行（死 DOM）+ 麦克风簇（静音开关/可视化/
+          设备菜单）；设备切换已由右侧「音频设备」卡片承担（bok.audio.* 单轨），
+          静音需求实测不需要（测试台挂断走顶部「挂断」）。整个组件从本页移除，
+          共享组件 agents-ui/agent-control-bar.tsx 保留（其他消费面不动）。
+          StartAudioButton（点击开启声音）仍是浏览器自动播放策略的必要入口。 */}
       <div className="flex shrink-0 flex-col items-center gap-2 border-t border-(--card-border) py-2">
         <div className="flex items-center justify-center gap-3">
           <StartAudioButton label="点击开启声音" />
-          <AgentControlBar
-            saveUserChoices={false}
-            controls={{ leave: false, camera: false, microphone: true, screenShare: false, chat: false }}
-          />
         </div>
       </div>
     </div>
@@ -463,12 +458,134 @@ function HistoryTranscript({ callId }: { callId: string }) {
   );
 }
 
-const PROVIDER_FIELDS: [string, string][] = [
-  ["asr", "ASR"],
-  ["llm", "LLM"],
-  ["tts", "TTS"],
-  ["vad", "VAD"],
-];
+/**
+ * 实时日志抽屉（DR 波契约 §5/§6）：CP `GET /api/calls/{id}/logs?after=<byte>` 游标续读。
+ * 2s 轮询；行追加渲染、上限最近 500 行（超出丢头部——游标不受影响，续读靠 next_offset）；
+ * EOF 标记；挂断/换 call_id 重置游标与缓冲（新一轮从字节 0 起，行不错位）；
+ * 自动滚底——用户上滚即暂停、回底（≤24px）恢复。
+ * 权限：通话页角色可读（CP 端 _gate_page("calls") 拦），此处不新做权限门（默认渲染）。
+ */
+const LOG_LINES_MAX = 500;
+const LOG_POLL_MS = 2000;
+const LOG_BOTTOM_EPS = 24;
+
+function CallLogDrawer({ callId }: { callId: string }) {
+  const [open, setOpen] = useState(false);
+  // 行带自增 id：头部丢行后 index 位移不撞 key（追加/截断逻辑=lib/live-logs.ts 纯函数）
+  const [lines, setLines] = useState<LogLine[]>([]);
+  const [eof, setEof] = useState(false);
+  const [err, setErr] = useState("");
+  const viewRef = useRef<HTMLDivElement | null>(null);
+  const stickRef = useRef(true); // true=贴底（自动滚）；用户上滚置 false
+  const offsetRef = useRef(0);
+  const seqRef = useRef(0);
+  const busyRef = useRef(false);
+
+  // 挂断/换通话：游标与缓冲全重置（callId 空=未接通，抽屉可开但不可读）。
+  useEffect(() => {
+    offsetRef.current = 0;
+    seqRef.current = 0;
+    stickRef.current = true;
+    setLines([]);
+    setEof(false);
+    setErr("");
+  }, [callId]);
+
+  useEffect(() => {
+    if (!open || !callId) return;
+    let stopped = false;
+    const load = async () => {
+      if (busyRef.current) return;
+      busyRef.current = true;
+      try {
+        const page = await api.callLogs(callId, offsetRef.current);
+        if (stopped) return;
+        const fresh = Array.isArray(page?.lines) ? page.lines : [];
+        if (fresh.length) {
+          setLines((prev) => {
+            const next = appendLogLines(prev, fresh, seqRef.current, LOG_LINES_MAX);
+            seqRef.current = next.nextId;
+            return next.lines;
+          });
+        }
+        if (typeof page?.next_offset === "number" && Number.isFinite(page.next_offset)) {
+          offsetRef.current = page.next_offset;
+        }
+        setEof(Boolean(page?.eof));
+        setErr("");
+      } catch (e) {
+        // 读失败保留已读行，亮一行原因（下一轮可能自愈）
+        if (!stopped) setErr(friendlyErrorText(String(e)));
+      } finally {
+        busyRef.current = false;
+      }
+    };
+    void load();
+    const t = setInterval(load, LOG_POLL_MS);
+    return () => {
+      stopped = true;
+      clearInterval(t);
+    };
+  }, [open, callId]);
+
+  // 自动滚底（仅贴底时；上滚不动视口）
+  useEffect(() => {
+    if (!open) return;
+    const el = viewRef.current;
+    if (el && stickRef.current) el.scrollTop = el.scrollHeight;
+  }, [lines, open, eof, err]);
+
+  const onScroll = () => {
+    const el = viewRef.current;
+    if (!el) return;
+    stickRef.current = isNearBottom(el.scrollHeight, el.scrollTop, el.clientHeight, LOG_BOTTOM_EPS);
+  };
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center justify-between gap-2">
+        <button
+          type="button"
+          className="btn-ghost text-xs"
+          aria-expanded={open}
+          onClick={() => setOpen((v) => !v)}
+        >
+          {open ? "收起实时日志" : "实时日志"}
+        </button>
+        {open && (
+          <span className="text-[10px] muted">
+            {!callId
+              ? "接通后可读本通日志"
+              : `${eof ? "已读到末尾" : "追加中"} · 每 2s 续读 · 最近 ${LOG_LINES_MAX} 行`}
+          </span>
+        )}
+      </div>
+      {open && (
+        <div className="rounded-lg border border-(--card-border) bg-muted/40">
+          <div
+            ref={viewRef}
+            onScroll={onScroll}
+            className="max-h-[260px] min-h-[96px] overflow-y-auto whitespace-pre-wrap break-all p-2 font-mono text-[11px] leading-relaxed"
+          >
+            {!callId ? (
+              <p className="muted">
+                未接通——接通后这里实时显示本通通话的 agent 日志（结构行 + 同窗口原始打印行）。
+              </p>
+            ) : lines.length === 0 && !err ? (
+              <p className="muted">暂无日志（通话开始后最多 2s 出现）…</p>
+            ) : (
+              lines.map((l) => <div key={l.id}>{l.text || " "}</div>)
+            )}
+            {callId && eof && lines.length > 0 && (
+              <p className="muted">—— 已读到文件末尾，继续等待新行 ——</p>
+            )}
+            {err && <p className="text-red-600">读取失败：{err}</p>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function str(v: unknown, fallback = "-") {
   return v === undefined || v === null || v === "" ? fallback : String(v);
@@ -546,6 +663,10 @@ function CallStudioInner({
   onReDialWithObject: (objectId: string) => void;
 }) {
   const { accountId: ACCOUNT } = useAccount();
+  // 演示档（云端 Realtime）选项 root 专属（settings 页 model-routing 卡同姿势；
+  // 匿名本地会话 role=user 同样不渲染——CP 侧红线闸兜底，UI 只是第一道门）。
+  const appSession = useAppSession();
+  const isRoot = appSession?.role === "root";
   // 记住本账号上一次使用的人设/对象：新建通话默认恢复它(而非恒取列表第一个),
   // 挂断后切新人设/对象 → 接通即用新选择,唔会悄悄回到上个对话的档案。
   const lastKey = (kind: "persona" | "object") => `bok.call.${kind}.${ACCOUNT}`;
@@ -581,7 +702,9 @@ function CallStudioInner({
   personaIdRef.current = personaId;
   const [object, setObject] = useState<Record<string, unknown> | null>(null);
   const [persona, setPersona] = useState<Record<string, unknown> | null>(null);
-  const [mode, setMode] = useState<"simulation" | "live">("simulation");
+  // 通话模式（realtime_demo=云端 Realtime 演示档，root 专属——出境计费红线，
+  // 下拉选项仅 root 渲染；历史通话里的该值仍要能正确回显）。
+  const [mode, setMode] = useState<"simulation" | "live" | "realtime_demo">("simulation");
   const [objectTopics, setObjectTopics] = useState<Record<string, unknown>[]>([]);
   const [settings, setSettings] = useState<Record<string, unknown> | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -596,12 +719,19 @@ function CallStudioInner({
   // （此处不用 TokenSource.endpoint+useSession options：「新建通话」要先把刚拿到的
   //   callId 同步进请求——useSession options 经 render 传播，时序上拿不到本轮 id，
   //   custom 闭包读 callIdRef 恒为最新。）
+  // C2b 掐断重连(2026-10-01):通话被服务端收线(agent 挂断/CP 结束)时,LiveKit 把
+  // 房间关闭当异常断开自动重连→再来要 token→CP 409 ghost guard→抛进 TokenSource
+  // 的 promise 链没人接=unhandledrejection 刷屏(call-231aa92a 窗口两通各一次)。
+  // 预检查(getCall status)存在竞态(token 请求可能跑赢状态翻转),409 兜底必须
+  // 在 token 调用点本地接住:接住后 end 会话掐断重连,返回永不 resolve 的 promise
+  // 静默停住重连链(room 正在死,无人等它)。
+  const endSessionRef = useRef<() => void>(() => {});
   const tokenSource = useMemo(
     () =>
       TokenSource.custom(async () => {
         const id = callIdRef.current;
         if (!id) throw new Error("no call id");
-        // C2 幽灵重连闸(2026-09-13,call-6bd59b40):TokenSource 自带 exp 前自动
+        // C2 幽灵重连闸(2026-09-13,call-6bd59c40):TokenSource 自带 exp 前自动
         // 续签,房间被删后的 livekit 全量重连会再来要 token——通话已 ended 时
         // 提前 throw,掐断「新 token→重连重建房→幽灵 job 重放开场白」链
         // (CP /api/token 侧同款 409 双保险)。
@@ -611,17 +741,32 @@ function CallStudioInner({
         if (cur && String(cur.status ?? "") === "ended") {
           throw new Error("call ended — refusing to renew token (ghost rejoin guard)");
         }
-        return await api.token({ account_id: ACCOUNT, call_id: id });
+        try {
+          return await api.token({ account_id: ACCOUNT, call_id: id });
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          if (/409|call has ended/i.test(msg)) {
+            endSessionRef.current();
+            return new Promise<never>(() => {});
+          }
+          throw e;
+        }
       }),
     [],
   );
   const session = useSession(tokenSource);
+  endSessionRef.current = () => {
+    void session.end().catch(() => {});
+  };
   const { canPlayAudio, startAudio } = useAudioPlayback(session.room);
 
   // 真实连接态：以房间状态为准，而不是「callId 非空」冒充。修复了带历史通话 id
   // 进来自动显示"已连接"、却只有一个会真挂断的按钮、无法接通的隐患。
   const roomConnected = session.room.state === ConnectionState.Connected;
   const isJoiningExisting = Boolean(stateCallId);
+  // Provider 实时读数（DR 波 §6，3s 轮询）：有通话=本通窗（call_id 过滤），
+  // 未接通=全局窗；请求失败静默保持上次值（卡不闪）。
+  const providerMetrics = useProviderMetrics(stateCallId || undefined);
   // 主管操作（暂停/接管/转人工）状态；挂断走 leave()。
   const [superviseMsg, setSuperviseMsg] = useState("");
   const [superviseBusy, setSuperviseBusy] = useState(false);
@@ -789,7 +934,7 @@ function CallStudioInner({
         if (c.persona_id && String(c.persona_id) !== personaIdRef.current) suppressPersist.current += 1;
         if (c.object_id) setObjId(String(c.object_id));
         if (c.persona_id) setPersonaId(String(c.persona_id));
-        if (c.mode) setMode(c.mode as "simulation" | "live");
+        if (c.mode) setMode(c.mode as "simulation" | "live" | "realtime_demo");
         // ended 通话:点亮「用该对象发起新通话」并禁用接通按钮——别让用户点
         // 一次必然失败的「接通/进房」才看到提示(交互自洽,2026-09-14)。
         if (String(c.status ?? "") === "ended") setEndedBlock(true);
@@ -971,7 +1116,32 @@ function CallStudioInner({
     onCycle(finished);
   }
 
+  // 挂断兜底（P1.a，2026-09-29 v2 spec §4）：关页/刷新不经过 leave() 的路径，
+  // 用 sendBeacon 补发 hangup。beacon 无法带 auth 头——auth-off 本机/局域网档
+  // 直达；auth-on 部署 beacon 可能 401，此路径只作 best-effort，服务端
+  // ever_dispatched（P1.b 补派免疫）才是根治。重复 hangup 幂等（CP 已 ENDED
+  // 短路）。pagehide 兼容移动端 Safari 的 bfcache 退出路径。
+  useEffect(() => {
+    const onHide = () => {
+      const id = callIdRef.current;
+      if (!id || typeof navigator.sendBeacon !== "function") return;
+      try {
+        navigator.sendBeacon(
+          `${apiBase().replace(/\/$/, "")}/api/calls/${id}/hangup`,
+          new Blob(["{}"], { type: "application/json" }),
+        );
+      } catch {
+        /* best-effort */
+      }
+    };
+    window.addEventListener("pagehide", onHide);
+    return () => window.removeEventListener("pagehide", onHide);
+  }, []);
+
   return (
+    // 外层只为在既有三栏工作台下挂「实时日志」抽屉（DR 波 §6）——三栏网格自身
+    // 布局零改动；抽屉展开时页面整体变高（滚动），不挤压通话区。
+    <div className="flex flex-col gap-3">
     <div className="grid grid-cols-[280px_1fr_300px] gap-6 lg:h-[calc(100vh-7.5rem)]">
       {/* 左：对象档案 / 人设 */}
       <section className="card flex min-h-0 flex-col gap-4 overflow-y-auto">
@@ -981,10 +1151,11 @@ function CallStudioInner({
             <select
               className="select px-2 py-1 text-xs"
               value={mode}
-              onChange={(e) => setMode(e.target.value as "simulation" | "live")}
+              onChange={(e) => setMode(e.target.value as "simulation" | "live" | "realtime_demo")}
             >
               <option value="simulation">训练模式</option>
               <option value="live">真实业务</option>
+              {isRoot && <option value="realtime_demo">演示档（云端 Realtime）</option>}
             </select>
           )}
         </div>
@@ -1247,19 +1418,18 @@ function CallStudioInner({
 
       {/* 右：Provider / 音频 / 结算 */}
       <section className="card flex min-h-0 flex-col gap-4 overflow-y-auto">
+        {/* Provider 服务状态（DR 波 §6 实时化）：3s 轮询读数——
+            「ASR 🟢 已连接 · 412ms (p95 490)」+ 分隔线 + 「状态: 🟢 健康 (EMA 0.6s)」；
+            阈值/色调判定单点在 lib/provider-status.ts（与 root 容灾面板同源），
+            无数据=灰灯沿用原「已连接」文案；读数失败静默保持上次值。 */}
         <div className="rounded-lg bg-muted/60 p-3">
           <span className="label">Provider 服务状态</span>
-          <div className="mt-2 space-y-1 text-sm">
-            {PROVIDER_FIELDS.map(([kind, label]) => (
-              <p key={kind} className="flex justify-between">
-                <span className="muted">{label}</span>
-                <span className="inline-flex items-center gap-1.5 text-emerald-600">
-                  <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                  已连接
-                </span>
-              </p>
-            ))}
+          <div className="mt-2">
+            <ProviderLines providers={providerMetrics?.providers} />
           </div>
+          {/* 定稿草图里的「────」虚线=视觉分隔，正文用 1px 边框实现（等价） */}
+          <div className="my-2 border-t border-(--card-border)" />
+          <FamineStatusLine famine={providerMetrics?.famine} />
         </div>
         <AudioDevicesCard room={session.room} />
         <div className="rounded-lg bg-muted/60 p-3 text-sm">
@@ -1301,6 +1471,9 @@ function CallStudioInner({
           )}
         </div>
       </section>
+    </div>
+      {/* 实时日志抽屉（DR 波 §6）：本通 agent 日志游标续读（挂断即重置游标） */}
+      <CallLogDrawer callId={stateCallId} />
     </div>
   );
 }

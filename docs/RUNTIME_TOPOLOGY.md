@@ -96,7 +96,7 @@
 ```text
 浏览器/客户端 (WebRTC)
   → LiveKit :7880（信令/媒体）
-  → agent worker（VAD 切句 → ASR :8787 转写 → LLM :1235 生成 → TTS :8788 合成）
+  → agent worker（VAD 切句 → ASR :8787 转写 → LLM :1235 生成 → **TTS=MiniMax 云合成**（2026-09-24 统一；本地 :8788 仅 bench/回退档，tts_cache 本地缓存叠加在云端链上））
   → 音频轨回放
 同时：通话/转写/结算/审计 → control-plane :8000 → SQLite（对象、人设、知识、模板、设置、审计）
 ```
@@ -483,7 +483,7 @@ Windows 站点机的常驻等价物（对照 mac launchd RunAtLoad + KeepAlive�
 
 - `asr.provider`：`qwen3_asr`（本地 sidecar）/ `fake`（仅测试）。语言值统一 `zh/cantonese/en`（粤语全时空唯一拼写 `cantonese`）；agent 在会话语言为粤语时给 sidecar 传 `language=cantonese` 强制模型按粤语转写，避免 auto 误判成普通话。
 - `llm.provider`：`local_openai`/`mlx`（本地）/ `deepseek`（云端，缺 `api_key` 显式告警并回退本地）/ `fake`。
-- `tts.provider`：`qwen3_tts` / `volcano_streaming`（需 `VOLC_*` 环境变量）/ `fake`（静音测试音，非火山 beep）。
+- `tts.provider`：`minimax`/`minimax_streaming`（**生产线**，2026-09-24 起）/ `qwen3_tts`（本地 :8788，bench/回退）/ `volcano_streaming`（需 `VOLC_*` 环境变量）/ `fake`（静音测试音，非火山 beep）。
   音色兜底按语言 `speaker_zh/speaker_cantonese/en`（旧拼写键已由启动迁移改写）；persona 绑定 `reference_audio` 优先。
 - `vad`：`provider` + `max_buffered_speech` / `min_speech_duration` / `min_silence_duration` / `interruption`  —— 直接构造 `inference.VAD` 与打断开关（环境变量 `VAD_*` 仅作部署覆盖）。
   基线默认（2026-09-05 句号级提交落地后）：`min_silence_duration=0.45`、`min_speech_duration=0.15`；
@@ -523,10 +523,13 @@ Windows 站点机的常驻等价物（对照 mac launchd RunAtLoad + KeepAlive�
   减少每轮 prefill；知识单条截断 350 字。无模板的开放咨询才检索知识库+联网。
 - **多客服并发容量**（单机 M4 Pro 48GB，Qwen3.5-4B-MLX-4bit）：mlx_lm 的 prefill 是
   ~0.6k token/s 的架构硬墙（Qwen3.5 混合线性注意力，批多宽同速）；KV-cache 命中则绕过它。
-  前置做足后同机约 **4-8 路交互客服**（warm 前缀每路≈decode+小尾 prefill）；冷启动同撞
-  大 prompt 时受 prefill 墙限（2-4 路亚秒）。bok.py 已给 mlx server 加 `--prompt-cache-size 128`
-  （默认 10 会被 4-6 路并发打穿）。超过此容量 → 第二台 Mac 起同栈 / GPU(CUDA) 服务器 vLLM
-  （Mac 本机 vLLM 跑不了，且那是另一套架构）。
+  前置做足后同机并发梯队（**2026-09-25 实测，M4 Pro/48G，TTS 已下云**）：A 线 2 路≈免费
+  （real_after_speech p50 1249ms）/ 4 路=悬崖（p50 4858ms）/ 6 路=零错但 p95 16s 慢尾；瓶颈=
+  mlx :1235 跨进程 GPU 时分+内存压力窗（≥4A+2B 混跑曾触发 WindowServer GPU 饿死）——详细
+  判定表见 `reports/mac-concurrency-2026-09-24/BATTERY-FINAL.md`；LLM 进程内合批实证无排队
+  （4 发齐发 0.73s/墙钟 1.6s）。超过此容量 → 第二台 Mac 起同栈 / GPU(CUDA) 服务器 vLLM
+  （Mac 本机 vLLM 跑不了，且那是另一套架构）。bok.py 已给 mlx server 加 `--prompt-cache-size 128`
+  （默认 10 会被多路并发打穿）。
 
 ### 数据快照与清理
 

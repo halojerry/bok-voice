@@ -51,6 +51,35 @@ NODES_FP_DEDUPE_SQL = (
     "GROUP BY license_id, fingerprint)"
 )
 
+# QA 自沉淀引擎两表（2026-09-25，qa_digest.py 消费；DDL 细节见 build_engine 内注释）：
+# - qa_homophones：ASR 同音错写对子（wrong=客户原话被抄成的错形 / right=词条规范
+#   问法），support=证据次数，复合主键 (wrong, right)——UPSERT 语义由引擎侧
+#   读后写实现（support 取 max），不依赖方言特有 ON CONFLICT；
+# - qa_digest_runs：闲时循环审计+水位双用——每轮一行各步骤计数，最近一次成功
+#   finished_at 即下一次挖掘的水位（busy 跳过轮不落行、不推水位）。
+QA_DIGEST_TABLE_DDL: tuple[str, ...] = (
+    'CREATE TABLE IF NOT EXISTS qa_homophones ('
+    ' wrong VARCHAR(255) NOT NULL,'
+    ' "right" VARCHAR(255) NOT NULL,'
+    ' support INTEGER NOT NULL DEFAULT 0,'
+    " source VARCHAR(32) NOT NULL DEFAULT 'auto',"
+    " created_at VARCHAR(32) NOT NULL DEFAULT '',"
+    ' PRIMARY KEY (wrong, "right")'
+    ')',
+    'CREATE TABLE IF NOT EXISTS qa_digest_runs ('
+    ' id VARCHAR(64) NOT NULL,'
+    " started_at VARCHAR(32) NOT NULL DEFAULT '',"
+    " finished_at VARCHAR(32) NOT NULL DEFAULT '',"
+    ' adopted_variant INTEGER NOT NULL DEFAULT 0,'
+    ' adopted_fresh INTEGER NOT NULL DEFAULT 0,'
+    ' disabled INTEGER NOT NULL DEFAULT 0,'
+    ' homophones INTEGER NOT NULL DEFAULT 0,'
+    ' pregen INTEGER NOT NULL DEFAULT 0,'
+    " error TEXT NOT NULL DEFAULT '',"
+    ' PRIMARY KEY (id)'
+    ')',
+)
+
 
 def build_engine() -> Engine | None:
     url = os.environ.get("DATABASE_URL", "")
@@ -166,6 +195,14 @@ def build_engine() -> Engine | None:
                     "object_profiles",
                     "address",
                     "address VARCHAR(255) DEFAULT ''",
+                )
+                # 发音词典（2026-09-27）：多行 `原词/读法` 文本，装配时下发 MiniMax
+                # pronunciation_dict 让人名/专名读准。空串=默认读音（运行时不下发键）。
+                _ensure_column(
+                    conn,
+                    "object_profiles",
+                    "pronunciation",
+                    "pronunciation TEXT DEFAULT ''",
                 )
                 _ensure_column(
                     conn,
@@ -308,6 +345,13 @@ def build_engine() -> Engine | None:
                 # models.GlobalSetting.sms_json server 侧同形（同 campaign_json 先例）。
                 _ensure_column(conn, "global_settings", "sms_json",
                                "sms_json TEXT NOT NULL DEFAULT ''")
+                # 模型路由统一（2026-09-25 阶段 0）：五车道（a_reply/judge/mt/
+                # settle/mining）本地↔云端路由表 + 档位预置，契约单点在
+                # packages/core/bok_voice_core/model_routes.py。空 blob=全 local
+                # （env 缺省链），读侧零配置即用；DDL 同 sms_json/campaign_json
+                # 先例（TEXT NOT NULL DEFAULT ''，SQLite/PG 双认，方言门禁）。
+                _ensure_column(conn, "global_settings", "model_routing_json",
+                               "model_routing_json TEXT NOT NULL DEFAULT ''")
                 # 同义簇(qa-canvas Phase1,spec 2026-09-17):qa_entries 变体指向
                 # 簇头条目——''=独立条目/簇头本体,非空=本条是指向条目的变体。
                 _ensure_column(
@@ -323,6 +367,17 @@ def build_engine() -> Engine | None:
                     "qa_entries",
                     "priority",
                     "priority INTEGER NOT NULL DEFAULT 10",
+                )
+                # VectorQ 每词条自适应阈值(2026-09-25):可空 float,NULL=用全局
+                # 默认档(0.80)。生产端=CP qa_digest 的 drift 反馈(repeat_after_play
+                # 一升二禁/清白命中回落);消费端=agent qa_gate 逐条目读
+                # entry["hit_threshold"]。可空无 DEFAULT——与 models.QaEntry.
+                # hit_threshold(nullable=True)create_all 路径同形,方言安全。
+                _ensure_column(
+                    conn,
+                    "qa_entries",
+                    "hit_threshold",
+                    "hit_threshold FLOAT",
                 )
                 # 话术图(2026-09-18 Phase 2):模板可选携带意图节点+绑定边 JSON,
                 # ''=未启用(旧库补列即空串,装配零变化)。TEXT+DEFAULT '' 方言安全。
@@ -365,6 +420,20 @@ def build_engine() -> Engine | None:
                     print(f"[deps] uq_nodes_license_fingerprint create skipped: {exc}")
         except Exception as exc:  # pragma: no cover - sqlite / duplicate column
             print(f"[deps] idempotent column migration skipped: {exc}")
+
+        # ---- QA 自沉淀引擎表（2026-09-25 CP 闲时循环，qa_digest.py 消费）----
+        # 两表 CREATE TABLE IF NOT EXISTS 幂等（二启零变化）；方言可移植：无
+        # sqlite 专有语法，id 沿仓库现有表风格用 TEXT 主键（uuid 由引擎侧生成，
+        # 避免 AUTOINCREMENT/SERIAL 跨方言分叉）。"right" 带双引号标识符——
+        # RIGHT 是 SQL 保留字（Postgres 拒绝裸用），引号形式 SQLite/PG 双认。
+        try:
+            from sqlalchemy import text
+
+            with engine.begin() as conn:
+                for ddl in QA_DIGEST_TABLE_DDL:
+                    conn.execute(text(ddl))
+        except Exception as exc:  # pragma: no cover - 建表失败不阻断启动
+            print(f"[deps] qa digest tables skipped: {exc}")
 
         # ---- 数据迁移：语言值 yue → cantonese 全栈统一（幂等，SQLite/Postgres 通用）。
         # 这是全仓唯一的旧值兼容点：旧库在 CP 启动时一次性落成规范值 cantonese，
@@ -578,3 +647,66 @@ def build_session_factory(engine: Engine | None = None):
     from sqlalchemy.orm import sessionmaker
 
     return sessionmaker(bind=engine, expire_on_commit=False, future=True)
+
+
+# ---- 模型路由存储（2026-09-25 阶段 0，CP 进程内消费面）----
+# global_settings.model_routing_json 列不进仓库层 get/save_settings（业务库包不
+# 随本改动动列语义），CP 侧经这里直读直写。SQL 路径用 session factory（main
+# startup 绑定，与 repo 同一 engine）；engine=None（单机内存形态/tests）回落
+# 模块级内存——与 InMemoryBusinessRepository 同生命周期，行为对齐。
+
+_ROUTING_ROW_ID = "global"
+_routing_state: dict = {"session_factory": None, "memory": ""}
+
+
+def bind_routing_storage(session_factory) -> None:
+    """main startup 调用：绑定与 repo 同 engine 的 session factory（None=内存态）。"""
+    _routing_state["session_factory"] = session_factory
+
+
+def read_model_routing_raw() -> str:
+    """读路由表原始 JSON 串（空串=未配置，parse_routing 宽容面接管）。读失败软回落。"""
+    factory = _routing_state["session_factory"]
+    if factory is None:
+        return str(_routing_state["memory"] or "")
+    from sqlalchemy import text
+
+    try:
+        with factory() as session:
+            row = session.execute(
+                text("SELECT model_routing_json FROM global_settings WHERE id = :gid"),
+                {"gid": _ROUTING_ROW_ID},
+            ).fetchone()
+        return str(row[0] or "") if row else ""
+    except Exception as exc:  # pragma: no cover - 读失败不破坏结算/挖掘主链
+        print(f"[deps] model_routing read skipped: {exc!r}")
+        return ""
+
+
+def write_model_routing_raw(raw: str) -> None:
+    """写路由表原始 JSON 串（幂等 upsert：行缺省时补一行业务默认值的全行）。"""
+    raw = str(raw or "")
+    factory = _routing_state["session_factory"]
+    if factory is None:
+        _routing_state["memory"] = raw
+        return
+    from sqlalchemy import text
+
+    from bok_voice_business_db.repository import SqlAlchemyBusinessRepository
+
+    with factory() as session:
+        row = session.execute(
+            text("SELECT id FROM global_settings WHERE id = :gid"), {"gid": _ROUTING_ROW_ID}
+        ).fetchone()
+        if row is None:
+            # 行缺省=先经 ORM 落一行业务默认值（default_settings 全段 JSON；
+            # updated_at 等 nullable/DateTime 类型由 ORM 兜住，SQLite/PG 双认），
+            # 再原位 UPDATE 路由列——不手写跨方言 INSERT，避免与 ORM 默认值漂移
+            # （首版手写 INSERT 曾漏 updated_at NOT NULL，SQLite 冒烟实证）。
+            repo = SqlAlchemyBusinessRepository(factory())
+            repo.save_settings(dict(repo.get_settings()))
+        session.execute(
+            text("UPDATE global_settings SET model_routing_json = :raw WHERE id = :gid"),
+            {"raw": raw, "gid": _ROUTING_ROW_ID},
+        )
+        session.commit()

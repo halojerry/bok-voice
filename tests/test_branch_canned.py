@@ -158,15 +158,24 @@ def test_funnel_block_position_and_wiring():
     src = _agent_src()
     i_bc = src.index("# ---- 分支罐头快路")
     i_graph = src.index("# ---- 话术图引擎")
-    assert i_bc < i_graph  # 插在 say 直念门之后、graph 意图块之前
-    assert src.index("pending_say_text()") < i_bc  # say 直念步让位(在前)
-    region = src[i_bc:i_graph]
+    i_qa = src.index("# ---- Q→A 检索快路")
+    # M-22②(2026-09-23 修复波#4):罐头块移到 graph 意图块**之后**——graph 确定性
+    # 关键词命中>分支模糊命中(旧序罐头遮蔽 graph,V2 六通零 FLOW_GRAPH=task-4 M1)。
+    # 铁律不变面:REFUSE/DEFER/say 直念仍在 say 直念门后先于 graph(见
+    # test_flow_graph_runtime 源级断言)。
+    assert i_graph < i_bc  # graph 命中先裁决,罐头落其后
+    assert i_bc < i_qa  # 罐头仍先于 QA 快路
+    assert src.index("pending_say_text()") < i_graph  # say 直念步让位(在前)
+    region = src[i_bc:i_qa]
     assert "BOK_BRANCH_CANNED" in region  # 总开关在闸里
     assert 'os.environ.get("BOK_BRANCH_CANNED", "1") == "1"' in region  # 默认开
     assert "_branch_plan" in region  # A-②:罐头腿消费早段评估计划
     assert "action_enabled=False" in region  # BOK_BRANCH_ACTION=0 回退档=纯罐头腿
-    assert '_turn_origin["gen"] = "script"' in region
-    assert '_turn_origin["provider"] = "branch-canned"' in region
+    assert '_register_reply_lane(lane="branch-canned", text=_bc_resp)' in region
+    # M-1(2026-09-24 评审返工;EX-2 2026-09-28 泛化):罐头出声不再裸覆写 provider
+    # ——同轮 graph-notify 打铃共存时,notify 顺延槽在 item 消费点并归(取代手写
+    # "branch-canned+graph-notify" 特例;合并逻辑在 _consume_reply_ticket)。
+    assert 'provider = f"{_ticket.lane}+{_pending}"' in src
     assert "BRANCH_CANNED hit" in region
     assert "BRANCH_CANNED miss" in region  # 未物化落穿有日志
     assert "raise StopResponse()" in region
@@ -218,7 +227,10 @@ def test_materialize_branches_dedup_pin_idempotent(tmp_path, monkeypatch):
     monkeypatch.setattr(pregen_tts, "_synth", _fake_synth)
     monkeypatch.setattr(pregen_tts, "_provider_for", lambda *a, **k: object())
     kwargs = dict(
-        api_key="", sample_rate=24000, tts_cfg={}, voice_mode="single", pin=True,
+        api_key="", sample_rate=24000,
+        # F-11:罐头缓存只挂 MiniMax 链,物化测试显式 minimax 上下文(空配置缺省
+        # qwen3_tts 运行时,provider 闸会 skip 全部 job)。
+        tts_cfg={"provider": "minimax"}, voice_mode="single", pin=True,
     )
     ok, skip, fail, _records = asyncio.run(
         pregen_tts._materialize(cache, "speech-2.8-hd", jobs, **kwargs)
@@ -226,7 +238,7 @@ def test_materialize_branches_dedup_pin_idempotent(tmp_path, monkeypatch):
     assert (ok, skip, fail) == (2, 0, 0)
     assert len(calls) == 2  # 重复 resp 不重复合成
     # 键与运行时同源:persona=None 走默认音色映射,语速走语言档;pin=True 落盘。
-    voice = pregen_tts._persona_resolved_voice(None, "zh", {}, "single")
+    voice = pregen_tts._persona_resolved_voice(None, "zh", {"provider": "minimax"}, "single")
     from agent_runtime.providers.livekit_plugins import minimax_speed_for
 
     key = cache.key_for(

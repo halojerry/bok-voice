@@ -27,7 +27,7 @@ def test_nudge_cantonese_with_name():
 def test_nudge_mandarin_without_name():
     out = _nudge_line("", "zh", 0)
     assert "您还在吗" in out
-    assert "，" not in out.split("？")[0] or out.startswith("您")  # 无名不带称呼逗号
+    assert out.startswith("您还在") and "{name}" not in out  # 无名版=纯问句（只防 name 占位残留）
 
 
 def test_nudge_english():

@@ -122,13 +122,48 @@ def test_kill_switch_and_max():
 
 def test_manifest_entries_all_tagged():
     manifest = load_manifest(FILLER_ASSETS_DIR)
-    valid = {"empathy", "ack", "check", "minimal", "default"}
+    # W2a(2026-09-23):+hesitation=第六类(分层犹豫垫音,运行时概率混入选池,
+    # 分类器五类永不产出——见 fillers.HESITATION_CAT)。
+    # W2c(2026-09-24):+promise_<bucket> 族(语境化过渡承诺,fillers.PROMISE_CAT_PREFIX
+    # +derive_context_bucket 的桶名后缀,context_resolver 命中桶时优先选池)。
+    base = {"empathy", "ack", "check", "minimal", "default", "hesitation"}
+    promise_buckets = {"handoff", "wa", "comp", "identity", "query"}
     n = 0
     for lang, entries in manifest.items():
         for e in entries:
-            assert e.get("cat") in valid, f"{lang}/{e.get('file')} cat={e.get('cat')!r}"
+            cat = str(e.get("cat") or "")
+            ok = cat in base or (
+                cat.startswith("promise_") and cat[len("promise_"):] in promise_buckets
+            )
+            assert ok, f"{lang}/{e.get('file')} cat={cat!r}"
             n += 1
-    assert n >= 39  # 三语资产全在且全打标
+    assert n >= 51  # 三语资产全在且全打标(60+s17/l3 + 12 promise)
+
+
+def test_classifier_never_returns_hesitation():
+    """W2a 不变量:分类器五类与 hesitation 无交——混合分支才能成为犹豫条目
+    唯一出场路径;若分类器哪天产出 hesitation,选池语义须重审。"""
+    from agent_runtime.fillers import HESITATION_CAT, classify_filler_category
+
+    for t in ("呃", "嗯——", "uhh", "let me see", "嗯，我看一下", "just a moment", "呃，您稍等啊"):
+        assert classify_filler_category(t) != HESITATION_CAT, t
+
+
+def test_filter_deflect_keeps_hesitation_family():
+    """W2a 语义检查:犹豫句不是让话家族(繼續講/聽住/go ahead…),清污不得误伤。"""
+    from agent_runtime.fillers import filter_deflect_entries
+
+    lines = [
+        "嗯——呃——",
+        "嗯，我看一下",
+        "嗯——好，我马上查一下",
+        "呃<#0.3#>好——我即刻幫你查下",
+        "let me see",
+        "just a moment",
+        "uh<#0.3#> let me check it",
+    ]
+    kept = filter_deflect_entries([{"text": t, "file": str(i)} for i, t in enumerate(lines)])
+    assert len(kept) == len(lines), "犹豫条目被让话清污误伤"
 
 
 # ---- CP:表迁移 + 种子幂等 + 仓储 ----

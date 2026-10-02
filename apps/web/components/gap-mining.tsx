@@ -6,6 +6,8 @@
 // 客户问法——运营确认后三条路任选：做成快答（问答词条）/ 做成话术分支（写进该步
 // ref 的「如果客户…→…」行）/ 做成意图词（给流程图意图加关键词）。后两条写入的是
 // 模板草稿（published_json 不动），要生效还需去话术页发布。
+// G7 would-hit 汇总条（2026-09-25）：顶部铃铛——漏网问法里已有词条能直接接住的
+// 占比（M/N），让运营看见「喂库的收益」。
 // 数据来自 GET /api/stats/template-proposals（coverage/gaps 与 L-① 同源同形 +
 // proposals）；快答采集走 POST /api/stats/llm-gaps/adopt（问答库同闸同审计），
 // 提案采纳走 POST /api/stats/template-proposals/adopt（模板 PUT 同闸链+版本快照）。
@@ -295,6 +297,12 @@ export default function GapMining({ templateId }: { templateId?: string }) {
   const driftSum = driftSummary(drift);
   const driftProposals = (drift?.proposals ?? []).filter(Boolean);
   const pct = coverage ? Math.round((Number(coverage.fastpath_ratio) || 0) * 100) : 0;
+  // G7 would-hit 汇总（喂库收益信号）：漏网问法里已有同语言词条能直接接住的比例。
+  // 优先读 CP summary；旧 CP 无 summary 时按行内 would_hit 自算兜底。
+  const gapTotal = Number(data?.summary?.gaps_total ?? gaps.length) || 0;
+  const wouldCovered =
+    Number(data?.summary?.would_hit_covered ?? gaps.filter((g) => g.would_hit).length) || 0;
+  const whPct = gapTotal > 0 ? Math.round((wouldCovered / gapTotal) * 100) : 0;
 
   return (
     <section className="card space-y-4">
@@ -304,6 +312,37 @@ export default function GapMining({ templateId }: { templateId?: string }) {
           通话里 AI 的回答有的是照稿念（话术脚本、问答录音），有的要 AI 现场组织语言。照稿念的部分又快又稳，这里看它占了多少。
         </p>
       </div>
+
+      {/* G7 would-hit 汇总条（喂库收益信号）：漏网轮里其实已有词条能接住的比例 */}
+      {!loading && !err && data && (
+        <div className="rounded-lg bg-muted/40 p-3">
+          {gapTotal === 0 ? (
+            <p className="text-xs muted">无漏网：最近的通话里没有反复出现的「AI 现场组织」问法。</p>
+          ) : (
+            <>
+              <div className="flex flex-wrap items-end gap-4">
+                <div>
+                  <p className="text-3xl font-bold text-(--live)">{whPct}%</p>
+                  <p className="mt-0.5 text-xs muted">漏网问法里已有词条能直接接住的占比</p>
+                </div>
+                <div className="flex gap-2">
+                  <div className="rounded-lg bg-muted/60 px-3 py-2 text-center">
+                    <p className="text-lg font-semibold">{gapTotal}</p>
+                    <p className="text-[11px] muted">漏网问法组</p>
+                  </div>
+                  <div className="rounded-lg bg-muted/60 px-3 py-2 text-center">
+                    <p className="text-lg font-semibold">{wouldCovered}</p>
+                    <p className="text-[11px] muted">已有词条覆盖</p>
+                  </div>
+                </div>
+              </div>
+              <p className="mt-2 text-xs muted">
+                占比越高说明词条库越够用；把下面的漏网问法采集成词条，这个数字就会涨。
+              </p>
+            </>
+          )}
+        </div>
+      )}
 
       {loading && <LoadingState />}
       {!loading && err && (

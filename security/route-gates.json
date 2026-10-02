@@ -15,6 +15,20 @@
    "reason": ""
   },
   {
+   "path": "/api/asr/hotwords",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "asr_hotwords",
+   "gates": [
+    "page",
+    "scoped-account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
    "path": "/api/audit",
    "methods": [
     "GET"
@@ -75,6 +89,7 @@
    "handlers": "create_call,list_calls,clear_ended_calls",
    "gates": [
     "page",
+    "role",
     "identity-self",
     "scoped-account",
     "mgmt-auto"
@@ -148,6 +163,20 @@
     "POST"
    ],
    "handlers": "hangup",
+   "gates": [
+    "page",
+    "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/calls/{call_id}/logs",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "get_call_logs",
    "gates": [
     "page",
     "account"
@@ -443,6 +472,112 @@
    "reason": ""
   },
   {
+   "path": "/api/metrics/agent-report",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "report_agent_metrics",
+   "gates": [
+    "page"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/metrics/providers",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "get_provider_metrics",
+   "gates": [
+    "page"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/model-routing",
+   "methods": [
+    "GET",
+    "PUT"
+   ],
+   "handlers": "get_model_routing,put_model_routing",
+   "gates": [
+    "role",
+    "identity-self"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/model-routing/detect",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "detect_model_routing",
+   "gates": [
+    "role"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/model-routing/presets",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "save_model_routing_preset",
+   "gates": [
+    "role"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/model-routing/presets/{name}",
+   "methods": [
+    "DELETE"
+   ],
+   "handlers": "delete_model_routing_preset",
+   "gates": [
+    "role"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/model-routing/presets/{name}/apply",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "apply_model_routing_preset",
+   "gates": [
+    "role"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/model-routing/test",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "test_model_routing",
+   "gates": [
+    "role"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
    "path": "/api/nodes",
    "methods": [
     "GET"
@@ -695,6 +830,32 @@
    "gates": [
     "page",
     "account"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/ops/disaster-override",
+   "methods": [
+    "POST"
+   ],
+   "handlers": "ops_disaster_override",
+   "gates": [
+    "role"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/ops/disaster-status",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "ops_disaster_status",
+   "gates": [
+    "role"
    ],
    "note": "",
    "reviewed": true,
@@ -1100,6 +1261,33 @@
    "gates": [
     "page",
     "identity-self"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/stats/provider-health",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "provider_health",
+   "gates": [
+    "page"
+   ],
+   "note": "",
+   "reviewed": true,
+   "reason": ""
+  },
+  {
+   "path": "/api/stats/qa-digest",
+   "methods": [
+    "GET"
+   ],
+   "handlers": "stats_qa_digest",
+   "gates": [
+    "mgmt-auto",
+    "scoped-account"
    ],
    "note": "",
    "reviewed": true,

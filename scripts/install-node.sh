@@ -280,11 +280,19 @@ elif [[ $DRY_RUN -eq 1 ]]; then
 else
   unit_args=(--node-agent --cp-url "$CP_URL" --livekit-url "$LIVEKIT_URL"
              --ui-dir "$REPO_ROOT/apps/web/out")
+  # F1(2026-09-24) 双 CP 档:UI_CP_URL 显式设置才追加 --ui-cp-url(话务员 UI 吃
+  # 本地工作 CP,注册照旧走 CP_URL=管理面);缺省不传=单 CP 旧形态零变化。
+  if [[ -n "${UI_CP_URL:-}" ]]; then
+    unit_args+=(--ui-cp-url "$UI_CP_URL")
+  fi
   if [[ -n "$NODE_TOKEN" ]]; then
     unit_args+=(--node-token "$NODE_TOKEN")
   fi
   run "$PY" "$REPO_ROOT/tools/bok.py" prod install "${unit_args[@]}"
-  UNIT_SRC="$HOME/.local/share/BokVoice/units/bok-node-agent.service"
+  # 单元暂存路径(2026-09-24 systemd_units 重写后):新档 release-artifacts/systemd
+  # 优先,legacy app-data 兼容旧包升级。
+  UNIT_SRC="${BOK_SYSTEMD_STAGING_DIR:-$REPO_ROOT/release-artifacts/systemd}/bok-node-agent.service"
+  [[ -f "$UNIT_SRC" ]] || UNIT_SRC="$HOME/.local/share/BokVoice/units/bok-node-agent.service"
   [[ -f "$UNIT_SRC" ]] || UNIT_SRC="$HOME/Library/Application Support/BokVoice/units/bok-node-agent.service"
   if [[ "$(id -u)" -eq 0 && -f "$UNIT_SRC" ]]; then
     cp "$UNIT_SRC" /etc/systemd/system/bok-node-agent.service
