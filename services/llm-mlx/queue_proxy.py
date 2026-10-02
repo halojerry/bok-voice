@@ -240,10 +240,15 @@ async def _generate(request: Request):
     # 早断短路（2026-10-02）：排队前探一次断连——客户端已消失（打断/挂断掐断
     # httpx）就不占槽不烧上游。此时尚未进入流式响应,与 starlette 的断连监听
     # 无 receive 竞争,安全。
+    # 先读全 body **再**探断连(2026-10-02 实机雷修复):request.is_disconnected
+    # 在取消 scope 里试收一条 receive 消息——uvicorn 下若 body 首 chunk 已就绪
+    # 会被它偷吃,后续 request.body() 等不到完整流=整条请求挂死(ASGITransport
+    # 测试对这一语义结构性失明,第七波同款陷阱;实机 curl 3 分钟超时抓出)。
+    # body 读完后再探:通道里只剩 disconnect/尾部消息,偷吃无害。
+    body = await request.body()
     if await request.is_disconnected():
         return JSONResponse({"detail": "client disconnected"}, status_code=499)
     lane = "reply" if (request.headers.get("x-bok-lane") or "").strip() == "reply" else "bg"
-    body = await request.body()
     async with _AcquireCtx(GATE, lane) as acq:
         # W-GATE 观测(2026-09-27):每条生成请求过闸即打一行(含零等待快路径)——
         # TTFT 分解要从日志面归因到「排队多少毫秒」,仅 >50ms 的旧行看不到快路
