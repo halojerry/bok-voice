@@ -38,6 +38,7 @@ from speech_to_speech.arguments_classes.parakeet_unified_stt_arguments import (
     ParakeetUnifiedSTTHandlerArguments,
 )
 from speech_to_speech.arguments_classes.pocket_tts_arguments import PocketTTSHandlerArguments
+from speech_to_speech.arguments_classes.doubao_stt_arguments import DoubaoSTTHandlerArguments
 from speech_to_speech.arguments_classes.qwen3_asr_stt_arguments import Qwen3ASRSTTHandlerArguments
 from speech_to_speech.arguments_classes.qwen3_tts_arguments import Qwen3TTSHandlerArguments
 from speech_to_speech.arguments_classes.responses_api_language_model_arguments import (
@@ -479,6 +480,17 @@ STT_BACKENDS = build_backend_registry(
                 attach_speculative_turns=True,
             ),
             config_prefix="qwen3_asr",
+        ),
+        BackendSpec(
+            "doubao",
+            "stt",
+            DoubaoSTTHandlerArguments,
+            _simple_handler_factory(
+                "speech_to_speech.STT.doubao_sauc_handler",
+                "DoubaoSaucSTTHandler",
+                attach_speculative_turns=True,
+            ),
+            config_prefix="doubao_stt",
         ),
         BackendSpec(
             "openai",
