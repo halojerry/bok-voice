@@ -764,9 +764,15 @@ class FillerDirector:
         self._enabled_override = enabled
 
     def _on(self) -> bool:
-        """本实例有效闸：实例覆盖 > env 模块闸（filler_enabled）。"""
-        if self._enabled_override is not None:
-            return self._enabled_override
+        """本实例有效闸：实例覆盖 > env 模块闸（filler_enabled）。
+
+        getattr 鸭型访问（仓库先例）：切片 stub（只借 arm 逻辑、不走 __init__
+        的测试替身）无 _enabled_override 字段——缺省即「跟随 env 模块闸」，
+        与旧行为逐字节同。
+        """
+        override = getattr(self, "_enabled_override", None)
+        if override is not None:
+            return override
         return filler_enabled()
 
     def arm(self) -> None:
