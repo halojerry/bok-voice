@@ -40,6 +40,7 @@ from speech_to_speech.arguments_classes.parakeet_unified_stt_arguments import (
 from speech_to_speech.arguments_classes.pocket_tts_arguments import PocketTTSHandlerArguments
 from speech_to_speech.arguments_classes.doubao_stt_arguments import DoubaoSTTHandlerArguments
 from speech_to_speech.arguments_classes.qwen3_asr_stt_arguments import Qwen3ASRSTTHandlerArguments
+from speech_to_speech.arguments_classes.minimax_tts_arguments import MiniMaxTTSHandlerArguments
 from speech_to_speech.arguments_classes.qwen3_tts_arguments import Qwen3TTSHandlerArguments
 from speech_to_speech.arguments_classes.responses_api_language_model_arguments import (
     ResponsesApiLanguageModelHandlerArguments,
@@ -646,6 +647,16 @@ TTS_BACKENDS = build_backend_registry(
                 pass_assistant_language_flag=True,
             ),
             config_prefix="qwen3_tts",
+        ),
+        BackendSpec(
+            "minimax",
+            "tts",
+            MiniMaxTTSHandlerArguments,
+            _simple_handler_factory(
+                "speech_to_speech.TTS.minimax_bidi_handler",
+                "MiniMaxBidiTTSHandler",
+            ),
+            config_prefix="minimax_tts",
         ),
         BackendSpec(
             "openai",
