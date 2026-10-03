@@ -8,6 +8,13 @@ os.environ.setdefault("LIVEKIT_API_SECRET", "devsecret")
 os.environ.setdefault("LIVEKIT_URL", "ws://127.0.0.1:7880")
 # 本文件钉调度循环语义（战役多无模板）；模板强绑闸契约见 test_template_gate.py。
 os.environ.setdefault("BOK_REQUIRE_TEMPLATE", "0")
+# 全局准入闸钉 legacy 不限（2026-10-03 补回——test_capacity_admission 的清 env
+# 注释记载本文件「常驻 BOK_MAX_ACTIVE_CALLS=0」，合并中丢失后本文件退化为
+# 真机内存耦合 flaky）：容量快照按真机空闲内存探测（mac 档案 floor=1/ceiling=2、
+# workset 2.5G/headroom 8G）——共享机空闲内存低时 computed=0 → 有效上限 1，
+# 「在途 1 槽」用例被建单 409 误杀（实弹：free_gb=8.5 → tick2 409）。本文件测
+# 战役槽逻辑，全局准入不在断言面；legacy 语义=不探测不计算、0=不限。
+os.environ.setdefault("BOK_MAX_ACTIVE_CALLS", "0")
 
 import asyncio
 import json

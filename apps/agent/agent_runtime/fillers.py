@@ -55,7 +55,7 @@ _chain_depth),与第一发合计消耗 BOK_FILLER_MAX 同一计数;连轮冷却�
 通道铁律(不变):垫话走 BackgroundAudioPlayer out-of-band 音轨,绝不能走
 session.say()——livekit 1.8 speech 队列严格串行,垫话必排回复后(实机实证)。
 垫话不进 LLM 上下文(out-of-band 不入 chat_ctx,KV 前缀/回声锚零污染)。
-每通限次 BOK_FILLER_MAX(默认 3)+随机不重样;BOK_FILLER=0 一键全关。
+每通限次 BOK_FILLER_MAX(默认 3)+随机不重样;BOK_FILLER=0 一键全关（缺省=按 a_reply 路由自动：云档关/本地档开；=1 强制开——2026-10-03 云档免垫话）。
 
 语言铁律(2026-09-10 实证修复):垫话语言=会话装配时钉死的通话语言,构造时
 由调用方捕获传入——en 通话曾因运行时 lang 状态漂移落回 zh 池,英国腔通话里
@@ -669,6 +669,10 @@ class FillerDirector:
         # W2c 语境化过渡承诺(2026-09-24):fire 时点惰性取语境桶(agent 注入,
         # 镜像 _user_text_provider 先例;异常吞掉回 ""=现行阶梯零变化)。
         self._context_resolver = context_resolver
+        # 云档免垫话（2026-10-03）：实例级总闸覆盖——None=跟随 env 模块闸（缺省
+        # 零变化）；False=强制关（装配点按 a_reply 云档路由自动置位）；True=强制
+        # 开（BOK_FILLER=1 显式，A/B 用）。见 set_enabled/_on。
+        self._enabled_override: bool | None = None
         # I2 垫话让路(2026-10-02):回复在途查询口(tts_cache 的
         # reply_stream_pending_since)——reshot 开火前查「回复流已开未出声」,
         # 在途即让路。None=旧门零变化(嵌入方不传)。
@@ -752,6 +756,25 @@ class FillerDirector:
 
     # ---- 生命周期 ----
 
+    def set_enabled(self, enabled: bool | None) -> None:
+        """实例级总闸覆盖（2026-10-03 云档免垫话）：None=跟随 env 模块闸（缺省）；
+        False=强制关（装配点按 a_reply 云档路由自动置位）；True=强制开
+        （BOK_FILLER=1 显式）。只影响本实例评估口——装配点按当通路由调用，
+        零全局 env 态；arm/链发/开火三闸统一走 _on()。"""
+        self._enabled_override = enabled
+
+    def _on(self) -> bool:
+        """本实例有效闸：实例覆盖 > env 模块闸（filler_enabled）。
+
+        getattr 鸭型访问（仓库先例）：切片 stub（只借 arm 逻辑、不走 __init__
+        的测试替身）无 _enabled_override 字段——缺省即「跟随 env 模块闸」，
+        与旧行为逐字节同。
+        """
+        override = getattr(self, "_enabled_override", None)
+        if override is not None:
+            return override
+        return filler_enabled()
+
     def arm(self) -> None:
         """轮提交、确认走 LLM 正常路径后调用;重复 arm 先作废旧定时器/链发。"""
         self._turn_seq += 1
@@ -765,7 +788,7 @@ class FillerDirector:
         self._hint_pending = ""
         self._cancel_timer()
         self._cancel_chain()
-        if not filler_enabled() or self._count >= self._max_fires():
+        if not self._on() or self._count >= self._max_fires():
             return
         if self._player is None:
             return
@@ -1067,7 +1090,7 @@ class FillerDirector:
             if not filler_chain_enabled() and filler_reshot_enabled():
                 print("BOK_FILLER reshot skip reason=audio_arrived", flush=True)
             return
-        if not filler_enabled() or self._player is None:
+        if not self._on() or self._player is None:
             return
         if self._guards() or self._max_fires() <= self._count:
             return
@@ -1368,7 +1391,7 @@ class FillerDirector:
         try:
             # 直调防御:kill-switch/player 缺失在 arm 已挡,这里再挡一次
             # (定时器任务与状态翻转存在竞态窗口)。
-            if not filler_enabled() or self._player is None:
+            if not self._on() or self._player is None:
                 return
             if reshot:
                 _pending = self._reply_pending_hold_s()
