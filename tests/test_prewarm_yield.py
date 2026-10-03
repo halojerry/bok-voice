@@ -85,7 +85,11 @@ def test_ghost_marker_dead_pid_ignored_and_cleaned(tmp_path, monkeypatch):
     pid 判活走测试缝 monkeypatch(_pid_alive 本体由纯函数测试覆盖),marker
     解析/跳过/清理是被钉的行为。"""
     import agent_runtime.agent as agent_mod
-    from agent_runtime.agent import _other_active_calls, _register_active_call
+    from agent_runtime.agent import (
+        _other_active_calls,
+        _register_active_call,
+        _release_active_call,
+    )
 
     monkeypatch.setenv("BOK_ACTIVE_CALLS_DIR", str(tmp_path))
     monkeypatch.setattr(agent_mod, "_pid_alive", lambda pid: False)
