@@ -1137,11 +1137,13 @@ async def entrypoint(ctx) -> None:
     from livekit.agents import stt as lk_stt
 
     from .control_plane import ControlPlaneClient
+    from .providers.doubao_asr import DoubaoSTT, doubao_asr_enabled
     from .providers.livekit_plugins import (
         LanguageState,
         Qwen3ASRLiveSTT,
         Qwen3ASRSTT,
         _asr_engine_from_cfg,
+        _parse_vocab_terms,
     )
 
     meta: dict = {}
@@ -1228,20 +1230,53 @@ async def entrypoint(ctx) -> None:
         extra_hotwords=glossary_source_terms(glossary_pairs),
         include_industry=False,
     )
-    _asr_inner = Qwen3ASRSTT(
-        base_url=_sidecar_url(asr_cfg.get("base_url") or "", "QWEN3_ASR_BASE_URL", "http://127.0.0.1:8787"),
-        language_state=asr_ls,
-        pin_language=True,
-        hotword_context=_asr_hotword_ctx,
-        # 【P1 SV-CPU 引擎车道(2026-10-01)】与 A 线同解析器:env > asr_json >
-        # 缺省旧路;验证门后同步翻 sensevoice。
-        engine=_asr_engine_from_cfg(asr_cfg),
+    _asr_provider_name = str(asr_cfg.get("provider") or "qwen3_asr").strip().lower()
+    _doubao_key = str(asr_cfg.get("api_key") or "").strip()
+    _doubao_old_auth = bool(str(asr_cfg.get("app_id") or "").strip()) and bool(
+        str(asr_cfg.get("access_token") or "").strip()
     )
-    if os.environ.get("QWEN3_ASR_STREAM", "1") == "1":
-        # 同传更要 partial:源语音边说边出稳定前缀 → 抢跑 prefill,译文首句更早。
-        stt_provider = Qwen3ASRLiveSTT(stt_=_asr_inner, vad_=vad_provider)
+    if (
+        _asr_provider_name in ("doubao", "doubao_asr")
+        and doubao_asr_enabled()
+        and (_doubao_key or _doubao_old_auth)
+    ):
+        # 云端豆包 SAUC 流式（B 线同传，2026-10-03 云 ASR 装线波；与 A 线共用
+        # provider 类）。凭据/端点=设置面 asr 段；热词=术语表源语词条（同上文
+        # _asr_hotword_ctx 单源）。
+        stt_provider = DoubaoSTT(
+            api_key=_doubao_key,
+            resource_id=str(asr_cfg.get("resource_id") or "").strip(),
+            ws_url=str(asr_cfg.get("endpoint") or "").strip(),
+            app_id=str(asr_cfg.get("app_id") or "").strip(),
+            access_token=str(asr_cfg.get("access_token") or "").strip(),
+            language_state=asr_ls,
+            hotword_terms=list(_parse_vocab_terms(_asr_hotword_ctx)),
+            vad_=vad_provider,
+        )
+        print(
+            f"[interp] asr=doubao (cloud SAUC, resource={stt_provider._resource_id})",
+            flush=True,
+        )
     else:
-        stt_provider = lk_stt.StreamAdapter(stt=_asr_inner, vad=vad_provider)
+        if _asr_provider_name in ("doubao", "doubao_asr"):
+            print(
+                "[interp] asr=doubao unavailable — falling back to local Qwen3-ASR",
+                flush=True,
+            )
+        _asr_inner = Qwen3ASRSTT(
+            base_url=_sidecar_url(asr_cfg.get("base_url") or "", "QWEN3_ASR_BASE_URL", "http://127.0.0.1:8787"),
+            language_state=asr_ls,
+            pin_language=True,
+            hotword_context=_asr_hotword_ctx,
+            # 【P1 SV-CPU 引擎车道(2026-10-01)】与 A 线同解析器:env > asr_json >
+            # 缺省旧路;验证门后同步翻 sensevoice。
+            engine=_asr_engine_from_cfg(asr_cfg),
+        )
+        if os.environ.get("QWEN3_ASR_STREAM", "1") == "1":
+            # 同传更要 partial:源语音边说边出稳定前缀 → 抢跑 prefill,译文首句更早。
+            stt_provider = Qwen3ASRLiveSTT(stt_=_asr_inner, vad_=vad_provider)
+        else:
+            stt_provider = lk_stt.StreamAdapter(stt=_asr_inner, vad=vad_provider)
 
     # 翻译 LLM 与 TTS 组装走模块级纯函数(单测直接喂 cfg,唔使起 worker)。
     _glossary = glossary_block(glossary_pairs)

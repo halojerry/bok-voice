@@ -53,13 +53,19 @@ export const SETTING_CARDS: ProviderMeta[] = [
   {
     kind: "asr",
     title: "ASR 语音识别",
-    desc: "把客户语音转成文字。qwen3_asr 走本地 sidecar；fake 仅用于无模型测试。",
+    desc: "把客户语音转成文字。qwen3_asr 走本地 sidecar；doubao 走火山引擎云端流式（A/B 线共用）；fake 仅用于无模型测试。",
     providers: [
       { value: "qwen3_asr", label: "Qwen3-ASR（本地）" },
+      { value: "doubao", label: "豆包 SAUC（云端）", hint: "火山引擎流式语音识别；需填 API Key（或旧版 APP ID + Access Token）。缺凭据自动回退本地。" },
       { value: "fake", label: "Fake（仅测试）", hint: "无模型时用固定文本模拟识别。" },
     ],
     fields: [
-      { key: "base_url", label: "服务地址", type: "text", hint: "ASR sidecar 地址；agent 运行时会优先读环境变量 QWEN3_ASR_BASE_URL。", placeholder: "http://127.0.0.1:8787" },
+      { key: "base_url", label: "服务地址", type: "text", providers: ["qwen3_asr"], hint: "ASR sidecar 地址；agent 运行时会优先读环境变量 QWEN3_ASR_BASE_URL。", placeholder: "http://127.0.0.1:8787" },
+      { key: "api_key", label: "API Key（新版控制台）", type: "secret", providers: ["doubao"], hint: "火山引擎新版控制台单 Key（X-Api-Key）。已保存的 Key 不会回显。", placeholder: "…" },
+      { key: "app_id", label: "APP ID（旧版控制台）", type: "text", providers: ["doubao"], hint: "旧版控制台鉴权：与下方 Access Token 成对填写（新版 Key 优先）。" },
+      { key: "access_token", label: "Access Token（旧版控制台）", type: "secret", providers: ["doubao"], hint: "旧版控制台鉴权配套。已保存的 Token 不会回显。" },
+      { key: "resource_id", label: "资源 ID", type: "text", providers: ["doubao"], hint: "缺省 volc.seedasr.sauc.duration（流式识别 2.0 小时版）。", placeholder: "volc.seedasr.sauc.duration" },
+      { key: "endpoint", label: "WS 端点", type: "text", providers: ["doubao"], hint: "缺省官方 bigmodel 端点，一般不用改。", placeholder: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel" },
       { key: "language_mode", label: "识别语言模式", type: "select", providers: ["qwen3_asr"], hint: "自动=跟随客户语言（锚定+连续多轮才切换，推荐）；固定=整场只按下方语言识别（混杂环境误判时用）。", options: [
         { value: "auto", label: "自动跟随（推荐）" },
         { value: "fixed", label: "固定语言" },

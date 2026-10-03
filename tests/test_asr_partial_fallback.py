@@ -488,7 +488,11 @@ def test_both_call_sites_pass_partial_fallback():
     assert "fallback_text=_last_partial_text(_partial_gate_stt)" in _AG_SRC[hook_call : hook_call + 400]
 
     # 取口只在 live 包装时非 None:非 live/假 STT 一路拿不到方法 → 空串
-    assert "_partial_gate_stt = stt_provider if isinstance(stt_provider, Qwen3ASRLiveSTT) else None" in _AG_SRC
+    # （2026-10-03 云 ASR 装线波：豆包 SAUC 同款公开面后并入白名单）
+    assert (
+        "stt_provider if isinstance(stt_provider, (Qwen3ASRLiveSTT, DoubaoSTT)) else None"
+        in _AG_SRC
+    )
 
 
 def test_stream_publishes_and_resets_partial():
