@@ -100,6 +100,22 @@ async def _run_once(key: str, model: str, voice: str, scenario: str) -> float:
             await ws.send(json.dumps({"event": "task_flush"}))
             t2 = await _first_audio_at(ws, deadline=time.perf_counter() + 6.0)
             return (t1 - t0) * 1000 if t1 else -1, (t2 - rest_t0) * 1000 if t2 else -1
+        elif scenario.startswith("G_"):
+            # N×flush 扫描（2026-10-03 批次0.7）:G_<n>_<f|x>——首 n 字即发,
+            # f=紧随 task_flush(生产头段催产)/x=只早发不催产(第八波原形)。
+            # 返回首帧 ms(自首 continue 起算);余句照发保会话完整(不计时)。
+            _, _n_s, _f_s = scenario.split("_")
+            _head = SENT[: int(_n_s)]
+            _rest = SENT[int(_n_s):]
+            await ws.send(json.dumps({"event": "task_continue", "text": _head}))
+            if _f_s == "f":
+                await ws.send(json.dumps({"event": "task_flush"}))
+            t1 = await _first_audio_at(ws, deadline=t0 + 6.0)
+            if _rest:
+                await ws.send(json.dumps({"event": "task_continue", "text": _rest}))
+                if _f_s == "f":
+                    await ws.send(json.dumps({"event": "task_flush"}))
+            return (t1 - t0) * 1000 if t1 else -1.0
         # 收到首个含 audio 的消息即停(首帧)
         deadline = t0 + 6.0
         while time.perf_counter() < deadline:
@@ -115,11 +131,31 @@ async def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--voice", default="Cantonese_GentleLady")
     ap.add_argument("--reps", type=int, default=3)
+    ap.add_argument("--sweep", action="store_true",
+                    help="N×flush 扫描(批次0.7):N∈{1,2,4,6} × flush∈{on,off}")
     args = ap.parse_args()
     key = _api_key()
     if not key:
         print("no api_key in settings DB")
         return 1
+    if args.sweep:
+        print(f"{'model':18s} {'cell':14s} reps_ms")
+        for model in ("speech-2.8-hd",):
+            for n in (1, 2, 4, 6):
+                for f in ("f", "x"):
+                    sc = f"G_{n}_{f}"
+                    vals = []
+                    for _ in range(args.reps):
+                        try:
+                            vals.append(await _run_once(key, model, args.voice, sc))
+                        except Exception as e:  # noqa: BLE001
+                            vals.append(-99)
+                            print(f"  exc {model}/{sc}: {e}")
+                        await asyncio.sleep(0.4)
+                    print(f"{model:18s} N={n} flush={'on' if f == 'f' else 'off':3s} "
+                          + " ".join(f"{v:7.0f}" for v in vals))
+                    await asyncio.sleep(0.6)
+        return 0
     print(f"{'model':18s} {'scenario':14s} reps_ms")
     for model in ("speech-2.8-hd",):
         for sc in ("F_flush_then_continue",):
