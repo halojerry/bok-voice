@@ -18,9 +18,10 @@ manifest.json 参考文本）上直连评估两家云 ASR，并与本地 Qwen3-A
 关键词命中（原字样）。报告写 reports/cloud-asr/<ts>.json。
 
 用法：
-  DOUBAO_APP_ID=... DOUBAO_ACCESS_TOKEN=... \
-    ./pkgruntime-aside/python/bin/python3.12 scripts/probe_cloud_asr.py \
-    --engine doubao --endpoint bigmodel [--langs cantonese,zh,en] [--limit N] [--pace fast|realtime]
+  DOUBAO_API_KEY=... \
+    .venv312/bin/python scripts/probe_cloud_asr.py \
+    --engine doubao|minimax|local|all --endpoint bigmodel \
+    [--corpus <dir>] [--langs cantonese,zh,en] [--limit N] [--pace fast|realtime]
 """
 from __future__ import annotations
 
@@ -40,6 +41,10 @@ from pathlib import Path
 import httpx
 import websockets
 
+# 繁简+粤语渲染变体折叠表（口径单源=asr_whisper_bench._FOLD，与历史基线同表；
+# 直跑姿势 scripts/ 在 sys.path 恒可导入）
+from asr_whisper_bench import _FOLD as _CANTO_FOLD
+
 ROOT = Path(__file__).resolve().parents[1]
 CORPUS = ROOT / "reports" / "asr-whisper-bench" / "corpus"
 MANIFEST = CORPUS / "manifest.json"
@@ -48,6 +53,7 @@ SETTINGS_DB = Path.home() / "Library" / "Application Support" / "BokVoice" / "bo
 
 DOUBAO_WS_DEFAULT = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
 MINIMAX_STT_URL = "https://api.minimax.cn/v1/speech_to_text"
+LOCAL_ASR_URL = "http://127.0.0.1:8787"
 # 厂商语言标签（外部接口真字面量，术语铁律**边界映射单点**——内部语言字段一律
 # cantonese；yue/yue-CN 仅作 MiniMax BCP-47 头与火山 SAUC language 参数出现）。
 _VENDOR_LANG = {
@@ -148,6 +154,8 @@ _EN_DIGIT_WORDS = {"zero": "0", "oh": "0", "one": "1", "two": "2", "three": "3",
 
 def norm_text(s: str, lang: str) -> str:
     s = (s or "").strip().translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+    # 繁简+粤语渲染变体折叠（口径单源=asr_whisper_bench._FOLD）
+    s = "".join(_CANTO_FOLD.get(ch, ch) for ch in s)
     if lang in ("zh", "cantonese"):
         s = "".join(_CN_DIGITS.get(ch, ch) for ch in s)
         return _CJK_PUNCT.sub("", s)
@@ -206,7 +214,10 @@ async def doubao_once(url: str, headers: dict, pcm: bytes, *, pace: str,
         "user": {"uid": "bok-probe"},
         "audio": {"format": "pcm", "codec": "raw", "rate": 16000, "bits": 16, "channel": 1},
         "request": {"model_name": "bigmodel", "enable_itn": True, "enable_punc": True,
-                    "show_utterances": True, "result_type": "full"},
+                    "show_utterances": True, "result_type": "full",
+                    # 方言识别开关：官方文档「启用中英文及方言识别」（含粤语）。
+                    # 缺省 false 时粤语被按普通话音系硬转（2026-10-03 实测），故常开。
+                    "enable_lid": True},
     }
     if endpoint_kind == "bigmodel_nostream":
         cfg["audio"]["language"] = lang_tag
@@ -327,9 +338,32 @@ def minimax_once(key: str, wav_path: Path, lang_tag: str, timeout_s: float) -> d
     return out
 
 
+# ---- 本地 Qwen3-ASR（对照臂；finish 往返口径 = asr_whisper_bench 的 qwen3_finish_ms）----
+def local_once(pcm: bytes, timeout_s: float) -> dict:
+    """start→chunk→finish（不传 language，与 asr_whisper_bench 口径一致）。
+
+    first_text_ms 恒 None（本臂只测 finish 往返）；final_ms=finish 调用→FINAL 返回。
+    """
+    out: dict = {"first_text_ms": None, "final_ms": None, "text": "", "error": None}
+    try:
+        with httpx.Client(timeout=timeout_s) as client:
+            sid = client.post(f"{LOCAL_ASR_URL}/api/start").json()["session_id"]
+            step = 16000 // 10 * 2  # 100ms
+            for i in range(0, len(pcm), step):
+                client.post(f"{LOCAL_ASR_URL}/api/chunk", params={"session_id": sid},
+                            content=pcm[i:i + step])
+            t0 = time.perf_counter()
+            r = client.post(f"{LOCAL_ASR_URL}/api/finish", params={"session_id": sid}).json()
+            out["final_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+            out["text"] = str(r.get("text") or "")
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = repr(exc)
+    return out
+
+
 # ---- 主流程 ----
-def load_corpus(langs: list[str], limit: int | None, only: list[str]) -> list[dict]:
-    items = json.loads(MANIFEST.read_text(encoding="utf-8"))
+def load_corpus(corpus_dir: Path, langs: list[str], limit: int | None, only: list[str]) -> list[dict]:
+    items = json.loads((corpus_dir / "manifest.json").read_text(encoding="utf-8"))
     if langs:
         items = [it for it in items if it.get("lang") in langs]
     if only:
@@ -358,19 +392,22 @@ def agg(rows: list[dict], key: str | None) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--engine", choices=["doubao", "minimax", "both"], default="both")
+    ap.add_argument("--engine", choices=["doubao", "minimax", "local", "both", "all"],
+                    default="both")
     ap.add_argument("--endpoint", choices=["bigmodel", "bigmodel_nostream", "bigmodel_async"],
                     default="bigmodel")
     ap.add_argument("--langs", default="", help="逗号分隔 cantonese,zh,en；空=全部")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--only", default="", help="逗号分隔 id")
+    ap.add_argument("--corpus", default=str(CORPUS), help="语料目录（含 manifest.json）")
     ap.add_argument("--pace", choices=["realtime", "fast"], default="realtime")
     ap.add_argument("--timeout", type=float, default=20.0)
     args = ap.parse_args()
 
     langs = [x.strip() for x in args.langs.split(",") if x.strip()]
     only = [x.strip() for x in args.only.split(",") if x.strip()]
-    items = load_corpus(langs, args.limit, only)
+    corpus_dir = Path(args.corpus)
+    items = load_corpus(corpus_dir, langs, args.limit, only)
     if not items:
         print("no corpus items selected")
         return 1
@@ -379,7 +416,8 @@ def main() -> int:
     ts = int(time.time())
     run: dict = {"ts": ts, "endpoint": args.endpoint, "pace": args.pace, "rows": rows}
 
-    do_doubao = args.engine in ("doubao", "both")
+    do_doubao = args.engine in ("doubao", "both", "all")
+    do_local = args.engine in ("local", "all")
     app_id = os.environ.get("DOUBAO_APP_ID", "").strip()
     token = os.environ.get("DOUBAO_ACCESS_TOKEN", "").strip()
     dd_api_key = os.environ.get("DOUBAO_API_KEY", "").strip()
@@ -392,6 +430,8 @@ def main() -> int:
             "X-Api-Key": dd_api_key,
             "X-Api-Resource-Id": os.environ.get("DOUBAO_RESOURCE_ID", "volc.bigasr.sauc.duration"),
             "X-Api-Connect-Id": str(uuid.uuid4()),
+            # 官方文档列为必选（任务ID，随机 UUID）；社区协议只有 Connect-Id，双发无害
+            "X-Api-Request-Id": str(uuid.uuid4()),
         }
     else:
         dd_headers = {
@@ -399,17 +439,19 @@ def main() -> int:
             "X-Api-Access-Key": token,
             "X-Api-Resource-Id": os.environ.get("DOUBAO_RESOURCE_ID", "volc.bigasr.sauc.duration"),
             "X-Api-Connect-Id": str(uuid.uuid4()),
+            "X-Api-Request-Id": str(uuid.uuid4()),
         }
     dd_url = os.environ.get("DOUBAO_ENDPOINT", DOUBAO_WS_DEFAULT)
 
-    mm_key = minimax_key() if args.engine in ("minimax", "both") else ""
+    mm_key = minimax_key() if args.engine in ("minimax", "both", "all") else ""
 
     for it in items:
-        wav_path = CORPUS / it["file"]
+        wav_path = corpus_dir / it["file"]
         row: dict = {"id": it["id"], "lang": it["lang"], "ref": it["text"],
                      "digits": it.get("digits"), "keywords": it.get("keywords")}
+        pcm = read_wav_16k(wav_path) if (do_doubao or do_local) else None
         if do_doubao:
-            pcm = read_wav_16k(wav_path)
+            assert pcm is not None
             lang_tag = _VENDOR_LANG.get(it["lang"], {}).get("volc", "")
             t0 = time.perf_counter()
             try:
@@ -434,8 +476,14 @@ def main() -> int:
                 row["minimax"] = minimax_once(mm_key, wav_path, mm_lang, max(args.timeout, it["dur_s"] * 3))
             except Exception as exc:  # noqa: BLE001
                 row["minimax"] = {"error": repr(exc), "text": "", "first_text_ms": None, "final_ms": None}
+        if do_local:
+            assert pcm is not None
+            try:
+                row["local"] = local_once(pcm, max(args.timeout, it["dur_s"] * 3))
+            except Exception as exc:  # noqa: BLE001
+                row["local"] = {"error": repr(exc), "text": "", "first_text_ms": None, "final_ms": None}
         # 打分
-        for eng in ("doubao", "minimax"):
+        for eng in ("doubao", "minimax", "local"):
             r = row.get(eng)
             if not r:
                 continue
@@ -444,20 +492,23 @@ def main() -> int:
                 if it.get("digits"):
                     r["digit_acc"] = digit_acc(r["text"], it["digits"], it["lang"])
                 if it.get("keywords"):
-                    r["keyword_hit"] = all(k in r["text"] for k in it["keywords"])
+                    hn = norm_text(r["text"], it["lang"])
+                    r["keyword_hit"] = all(norm_text(k, it["lang"]) in hn
+                                           for k in it["keywords"])
         rows.append(row)
         # 逐条打印
         brief = " | ".join(
             f"{eng}: cer={r.get('cer')} first={r.get('first_text_ms')}ms final={r.get('final_ms')}ms"
             f"{' ERR=' + str(r.get('error') or r.get('err_code')) if r.get('error') or r.get('err_code') else ''}"
-            for eng, r in (("dd", row.get("doubao")), ("mm", row.get("minimax"))) if r
+            for eng, r in (("dd", row.get("doubao")), ("mm", row.get("minimax")),
+                           ("lc", row.get("local"))) if r
         )
-        preview = (row.get("doubao") or row.get("minimax") or {}).get("text", "")[:48]
+        preview = (row.get("doubao") or row.get("minimax") or row.get("local") or {}).get("text", "")[:48]
         print(f"[{it['id']}] {brief} | {preview!r}", flush=True)
 
     # 汇总
     summary: dict = {}
-    for eng in ("doubao", "minimax"):
+    for eng in ("doubao", "minimax", "local"):
         eng_rows = [{**r, **r[eng]} for r in rows if r.get(eng)]
         if not eng_rows:
             continue
