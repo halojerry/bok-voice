@@ -25,6 +25,9 @@ monkey-patch，跑起 mlx server 原样：
      置位同时向该请求的 response_queue 补一个流结束哨兵（None）——批处理路径
      ``_should_stop`` 只把序列移出批、不发 rqueue，handler 阻塞在 get() 上会
      永久挂死（线程/连接泄漏）；哨兵让它干净收尾。
+  5. ``/v1/models`` 求实（2026-10-03 I1e）：上游实现扫的是 **HF 缓存目录**
+     （列出所有下载过的 mlx 模型、顺序随扫描浮动）——四口同组三模型轮转,检测/
+     选型面被误导。接管回「本进程 ``--model``」单条目,如实。
 
 kill-switch：``BOK_MLX_ABORT=0`` 时零 patch（逐字节旧行为）。客户端侧不发 abort、
 不带 req_id 头时本 wrapper 全路径 pass-through（零漂移）。
@@ -40,6 +43,7 @@ import json
 import logging
 import os
 import queue
+import sys
 import threading
 import time
 import weakref
@@ -291,6 +295,26 @@ def _handle_abort(handler) -> None:
     _json_response(handler, 200, {"aborted": True, "state": state, "request_id": req_id})
 
 
+def _loaded_model_id() -> str:
+    """本进程 mlx server 实际加载的模型 id（argv ``--model``;``--model=x`` 两式都认）。"""
+    argv = list(sys.argv)
+    for i, a in enumerate(argv):
+        if a == "--model" and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith("--model="):
+            return a.split("=", 1)[1]
+    return ""
+
+
+def _handle_models(handler) -> None:
+    """``GET /v1/models`` 接管：单条目=本实例 ``--model``（非上游的 HF 缓存扫描）。"""
+    model = _loaded_model_id()
+    _json_response(handler, 200, {
+        "object": "list",
+        "data": [{"id": model or "unknown", "object": "model", "created": int(time.time())}],
+    })
+
+
 _INSTALLED = {"module": None, "done": False}
 
 
@@ -317,6 +341,20 @@ def install(mlx_server_module=None) -> None:
         return _orig_do_post(self)
 
     srv.APIHandler.do_POST = _do_POST
+
+    # do_GET 接管（I1e）：替身模块可能没有 do_GET（测试 fake）——取不到即跳过
+    # 本层；真 mlx server 恒有（BaseHTTPRequestHandler 子类）。
+    _orig_do_get = getattr(srv.APIHandler, "do_GET", None)
+
+    if callable(_orig_do_get):
+
+        def _do_GET(self):  # noqa: N802 - 覆写 BaseHTTPRequestHandler 协议方法
+            if self.path.startswith("/v1/models"):
+                _handle_models(self)
+                return
+            return _orig_do_get(self)
+
+        srv.APIHandler.do_GET = _do_GET
 
     _orig_handle_completion = srv.APIHandler.handle_completion
 

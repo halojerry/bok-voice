@@ -67,12 +67,18 @@ def test_control_plane_env_carries_settle(monkeypatch, tmp_path):
     monkeypatch.setenv("BOK_SETTLE_LLM_MODEL", str(fake))
     monkeypatch.setenv("BOK_DEV_9B", "1")
     env = bok._control_plane_env(tmp_path / "x.db")
-    assert env.get("BOK_SETTLE_LLM_BASE_URL") == "http://127.0.0.1:1237/v1"
+    # I1(2026-10-03):queue 拓扑下消费口=前门闸 :1238(reply 插队+GATE 观测)。
+    assert env.get("BOK_SETTLE_LLM_BASE_URL") == "http://127.0.0.1:1238/v1"
     assert env.get("BOK_SETTLE_LLM_MODEL") == str(fake)
     # 2026-10-01 P2 翻档:缺省=开(在盘即注入);BOK_DEV_9B=0 显式关。
     monkeypatch.delenv("BOK_DEV_9B", raising=False)
     env_on = bok._control_plane_env(tmp_path / "x.db")
-    assert env_on.get("BOK_SETTLE_LLM_BASE_URL") == "http://127.0.0.1:1237/v1"
+    assert env_on.get("BOK_SETTLE_LLM_BASE_URL") == "http://127.0.0.1:1238/v1"
+    # queue 代理关=旧形状裸 :1237(I1 同判据)
+    monkeypatch.setenv("BOK_LLM_QUEUE_PROXY", "0")
+    env_plain = bok._control_plane_env(tmp_path / "x.db")
+    assert env_plain.get("BOK_SETTLE_LLM_BASE_URL") == "http://127.0.0.1:1237/v1"
+    monkeypatch.delenv("BOK_LLM_QUEUE_PROXY", raising=False)
     monkeypatch.setenv("BOK_DEV_9B", "0")
     env_off = bok._control_plane_env(tmp_path / "x.db")
     assert "BOK_SETTLE_LLM_BASE_URL" not in env_off

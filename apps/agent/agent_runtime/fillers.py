@@ -165,13 +165,22 @@ def _strip_pause_marks(text: str) -> str:
     return _PAUSE_MARK_RE.sub("", str(text or ""))
 
 
-def filler_max_per_call() -> int:
-    # 默认 6(2026-09-13 乙节罐头体系:确定性命中后 12 次只会放大复读感——垫话
-    # 是补丁不是台词;6 发覆盖最差慢轮,同条目 per_call_cap 再防同语境连击)。
-    try:
-        return max(0, int(os.environ.get("BOK_FILLER_MAX", "6")))
-    except ValueError:
-        return 6
+def filler_max_per_call(lang: str = "") -> int:
+    """每通垫话上限。BOK_FILLER_MAX 显式设置=全局硬覆写(旧语义逐字节)。
+
+    缺省按语言给档(2026-10-03 I2,en 垫话审计):旧全局 6 在 en 长通话
+    (call-c2fa32c6 实测 9 个 arm 轮)尾部 3 轮耗尽=裸奔(首声 p50 1816ms
+    的直接组分),zh 亦在末轮触顶。默认档 en=10 / zh=8 / cantonese=8,
+    其余语言 8。防轰炸仍由时间窗冷却+两窗去重+懒 delay 三层共兜,上限
+    只防长尾;同条目 per_call_cap(罐头层)继续防同语境连击。
+    """
+    env = os.environ.get("BOK_FILLER_MAX", "").strip()
+    if env:
+        try:
+            return max(0, int(env))
+        except ValueError:
+            pass
+    return {"en": 10, "zh": 8, "cantonese": 8}.get(str(lang or "").strip().lower(), 8)
 
 
 def filler_max_dur_s() -> float:
@@ -223,21 +232,37 @@ def filler_match_threshold() -> float:
 # 客户真的在要进度时才承诺查)。
 _FILLER_CAT_EMPATHY_RE = re.compile(
     r"(投诉|投訴|嬲|闹|鬧|爛|烂|冇到|未到|太耐|太长|太長|激气|激氣|生气|生氣|着急|著急|过分|過分|"
-    r"complain|unacceptable|too slow|frustrat)",
+    r"complain|unacceptable|too slow|frustrat|"
+    # en 漏网补缺(2026-10-03 I2,en 垫话审计):延误/丢失/久等族——
+    # "My parcel is a week late." 曾被判 default(实证 fire1 cat=default)。
+    r"\b(?:late|delayed?|lost|missing|never\s+(?:arrived|showed)|still\s+not\s+(?:here|arrived)|so\s+long)\b)",
     re.IGNORECASE,
 )
 _FILLER_CAT_ACK_RE = re.compile(
     r"(WhatsApp|微信|WeChat|單號|单号|运单|運單|淘宝|淘寶|拼多多|京東|京东|天猫|天貓|"
-    r"小红书|小紅書|亚马逊|亞馬遜|顺丰|順豐|eBay|Amazon|Temu|UnionPay|银联|銀聯)",
+    r"小红书|小紅書|亚马逊|亞馬遜|顺丰|順豐|eBay|Amazon|Temu|UnionPay|银联|銀聯|"
+    # en 漏网补缺(2026-10-03 I2):品牌/单号/物流商英文形态("Pinduoduo." 曾判 default)。
+    r"Pinduoduo|\bpdd\b|Taobao|Jingdong|JD\.?com|SF\s*Express|Shopee|Lazada|"
+    r"tracking\s+(?:number|no|code)|order\s+(?:number|no|id)|reference\s+(?:number|no))",
     re.IGNORECASE,
 )
 _FILLER_CAT_CHECK_RE = re.compile(
     r"(查询|查詢|查下|查一下|边度|邊度|几时|幾時|几多|幾多|多久|点解|點解|点样|點樣|进度|進度|到未|"
-    r"怎么|如何|为什么|為什麼|check|track|where.*order|when|how much|how many|how long)",
+    r"怎么|如何|为什么|為什麼|check|track|where.*order|when|how much|how many|how long|"
+    # en 漏网补缺(2026-10-03 I2):求进度/求处理族("How do I get compensated?" /
+    # "Do you know where my parcel is?" 曾字面 miss 只靠 hint 救场)。
+    r"how\s+do\s+i|how\s+can\s+i|do\s+you\s+know|where(?:'s|\s+is)\s+my|status|"
+    r"update|resolve|process(?:ed|ing)?|refund|compensat|when\s+will)",
     re.IGNORECASE,
 )
 _FILLER_CAT_MINIMAL_RE = re.compile(
     r"^[嗯啊哦好的呀呢嘅啦喇系係得对對\s。.!！~～]+$", re.IGNORECASE
+)
+# en 纯应承短句(2026-10-03 I2):「Okay okay, fine.」(15 字符)放不进旧 len<=6 门;
+# 独立 token 白名单(可重复拼接)匹配,长度门放宽到 24。
+_FILLER_CAT_MINIMAL_EN_RE = re.compile(
+    r"^(?:(?:ok(?:ay)?|sure|got\s+it|mm+[-\s]?h+m+|uh[-\s]?huh|right|fine|alright|yeah|yep)[\s,.!]*)+$",
+    re.IGNORECASE,
 )
 
 
@@ -251,6 +276,8 @@ def classify_filler_category(user_text: str) -> str:
     if not t:
         return "default"
     if len(t) <= 6 and _FILLER_CAT_MINIMAL_RE.match(t):
+        return "minimal"
+    if len(t) <= 24 and _FILLER_CAT_MINIMAL_EN_RE.match(t):
         return "minimal"
     if _FILLER_CAT_EMPATHY_RE.search(t):
         return "empathy"
@@ -386,11 +413,24 @@ def derive_context_bucket(
     if k in ("captured", "captured_implicit", "offered") or (wa_step and not wa_captured):
         return "wa"
     gr = f"{goal or ''}\n{ref or ''}"
-    if has_steps and "赔" in gr:
+    # en 关键词补缺(2026-10-03 I2):三通 fired 行 bucket 全空——语境桶关键词
+    # 全中文,英文模板永远拿不到 comp/query 桶。补英文同义族(zh/粤分支逐字节不变)。
+    if has_steps and (
+        "赔" in gr or re.search(r"compensat|refund|claims?\b", gr, re.IGNORECASE)
+    ):
         return "comp" if step_say_done else "query"
     if has_steps and step_index == 0:
         return "identity"
-    if has_steps and any(w in gr for w in ("查", "进度", "物流", "单号")) or str(verdict or "").lower() == "question":
+    _query_hit = has_steps and (
+        any(w in gr for w in ("查", "进度", "物流", "单号"))
+        or re.search(
+            r"track|status|deliver|where(?:'s|\s+is)\s+(?:my\s+)?(?:parcel|package|order)",
+            gr,
+            re.IGNORECASE,
+        )
+        is not None
+    )
+    if _query_hit or str(verdict or "").lower() == "question":
         return "query"
     return ""
 
@@ -725,7 +765,7 @@ class FillerDirector:
         self._hint_pending = ""
         self._cancel_timer()
         self._cancel_chain()
-        if not filler_enabled() or self._count >= filler_max_per_call():
+        if not filler_enabled() or self._count >= self._max_fires():
             return
         if self._player is None:
             return
@@ -891,12 +931,28 @@ class FillerDirector:
 
     def cancel(self) -> None:
         """新用户轮到达等场景:作废定时器/链发并停掉在播垫话——用户插话优先,
-        out-of-band 音轨不受框架打断机制管理,必须自己停。"""
+        out-of-band 音轨不受框架打断机制管理,必须自己停。
+
+        I3 退额(2026-10-03):开播 <0.6s 即被掐的垫话算「未交付」——退一发
+        配额并清冷却账,下一轮可正常补。实弹:en call-c2fa32c6 首发
+        'Checking the shipping info now.' 开播 331ms 被 barge-in 掐掉仍吃配额,
+        同一轮次消耗两发。已播 ≥0.6s(完整短应承)算真出声,不退。
+        """
         self._cancel_timer()
         self._cancel_chain()
+        short_cut = (
+            self._play_started > 0
+            and (time.monotonic() - self._play_started) < 0.6
+            and self._last_fire_seq == self._turn_seq
+        )
         # 时间轴清零:插话后的回复不再被旧垫话的 gap 窗扣压。
         self._play_started = 0.0
         self._stop_playing()
+        if short_cut:
+            self._count = max(0, self._count - 1)
+            self._last_fire_seq = -2
+            self._last_fire_at = 0.0
+            print("BOK_FILLER refund cut_short", flush=True)
 
     def reset_per_call(self) -> None:
         self._count = 0
@@ -947,6 +1003,13 @@ class FillerDirector:
             return True
         except Exception:  # noqa: BLE001 - 停播失败让垫话自然播完(短语 ≤1.5s)
             return False
+
+    def _max_fires(self) -> int:
+        """本轮语言档的每通上限(lang_resolver 异常=语言无关默认档,不阻垫话)。"""
+        try:
+            return filler_max_per_call(str(self._lang_resolver() or ""))
+        except Exception:  # noqa: BLE001 - resolver 失败退默认档
+            return filler_max_per_call()
 
     def _reply_pending_hold_s(self) -> float:
         """本轮 arm 之后回复流「已开未出声」已持续秒数(无在途/闸关/provider 缺席=0)。
@@ -1006,7 +1069,7 @@ class FillerDirector:
             return
         if not filler_enabled() or self._player is None:
             return
-        if self._guards() or filler_max_per_call() <= self._count:
+        if self._guards() or self._max_fires() <= self._count:
             return
         state = str(getattr(self._session, "agent_state", "") or "")
         if state not in ("listening", "thinking", ""):
@@ -1231,14 +1294,18 @@ class FillerDirector:
             return ""
 
     def _hinted_category(self, lang: str, fallback: str) -> str:
-        """P2.4 意图喂下游:本轮类别提示优先(合法才用),否则回退 fallback。
+        """本轮类别提示:仅在字面分类**无明确结论**(default/空)时采用。
 
-        「合法」=该提示类别在本语言池里真实存在 cat 标签条目——池里没这一类时
-        强行用会落 `_pick` 的 default/整池放宽(等于没提示还多一次绕路),不如
-        直接交回字面分类器。提示来源=agent 钩子的 intent_category_hint(规则
-        归类),确定性;无提示(空)/池缺失 → fallback(旧行为)。"""
+        I4 收窄(2026-10-03,en 垫话审计):字面命中 empathy/ack/check/minimal
+        = 对客户原话读出了真实内容,规则意图不得覆写——实弹:WhatsApp 报号轮
+        字面 ack 被 sys_question 提示改判 check,垫话答「马上查」而非「收到,
+        安排」。提示的原本用途不变=ASR 碎裂/滑失致字面落 default 时由规则意图
+        救场。合法性检查照旧=提示类别须在本语言池真实存在 cat 条目;
+        无提示(空)/不合法/字面有明确结论 → fallback。"""
         hint = getattr(self, "_hint_round", "")
         if not hint:
+            return fallback
+        if fallback and fallback != "default":
             return fallback
         pool = self._pools().get(lang) or []
         if any(str(e.get("cat") or "") == hint for e in pool):
@@ -1316,7 +1383,7 @@ class FillerDirector:
                         flush=True,
                     )
                     return
-            if self._guards() or filler_max_per_call() <= self._count:
+            if self._guards() or self._max_fires() <= self._count:
                 return
             _cd = filler_cooldown_s()
             if (

@@ -306,7 +306,7 @@ def test_dev_9b_off_gates_judge_and_settle_env(monkeypatch, tmp_path):
     assert "BOK_SETTLE_LLM_MODEL" not in cp_off
     monkeypatch.setenv("BOK_DEV_9B", "1")
     cp_on = bok._control_plane_env(tmp_path / "db.sqlite")
-    assert cp_on["BOK_SETTLE_LLM_BASE_URL"] == "http://127.0.0.1:1237/v1"
+    assert cp_on["BOK_SETTLE_LLM_BASE_URL"] == "http://127.0.0.1:1238/v1"  # I1 前门闸
     assert cp_on["BOK_SETTLE_LLM_MODEL"] == str(fake_model)
 
 

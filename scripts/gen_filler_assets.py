@@ -198,6 +198,17 @@ FILLERS: dict[str, dict] = {
             ("Understood I am noting that down.", "ack"),
             ("Okay sure please continue I am with you.", "ack"),
             ("Alright got it I am checking it now.", "minimal"),
+            # 2026-10-03 I2 池深补缺(en 垫话审计):default 净剩 1 条(英文问句
+            # 大量落 default 时近乎复读);ack 净剩 1 条(两条让话族被剔除后);
+            # minimal 补英文短应承。全部零标点连读(拖腔纪律),5-6 词落窗。
+            ("Bear with me one moment", "default"),
+            ("Let me take a quick look", "default"),
+            ("Just a moment here for you", "default"),
+            ("Got it I have noted it", "ack"),
+            ("Understood I am on it", "ack"),
+            ("Sure thing got it", "minimal"),
+            ("Okay okay got it", "minimal"),
+            ("Sorry about the wait", "empathy"),
         ],
         "win": ((1.1, 2.0), (1.0, 2.2)),  # 短句 tier en 专属窗(目标 1.2-1.8s)
         # en 社媒女声停顿拖腔实证(两轮):逗号(Mm-hm, sure.=2.57s)与 <#0.3#>

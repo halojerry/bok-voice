@@ -479,6 +479,54 @@
       "cat": "minimal"
     },
     {
+      "text": "Bear with me one moment",
+      "file": "en-s18.wav",
+      "dur_s": 1.31,
+      "cat": "default"
+    },
+    {
+      "text": "Let me take a quick look",
+      "file": "en-s19.wav",
+      "dur_s": 2.01,
+      "cat": "default"
+    },
+    {
+      "text": "Just a moment here for you",
+      "file": "en-s20.wav",
+      "dur_s": 1.01,
+      "cat": "default"
+    },
+    {
+      "text": "Got it I have noted it",
+      "file": "en-s21.wav",
+      "dur_s": 1.16,
+      "cat": "ack"
+    },
+    {
+      "text": "Understood I am on it",
+      "file": "en-s22.wav",
+      "dur_s": 1.71,
+      "cat": "ack"
+    },
+    {
+      "text": "Sure thing got it",
+      "file": "en-s23.wav",
+      "dur_s": 1.14,
+      "cat": "minimal"
+    },
+    {
+      "text": "Okay okay got it",
+      "file": "en-s24.wav",
+      "dur_s": 1.19,
+      "cat": "minimal"
+    },
+    {
+      "text": "Sorry about the wait",
+      "file": "en-s25.wav",
+      "dur_s": 1.16,
+      "cat": "empathy"
+    },
+    {
       "text": "Just a moment and I will check that.",
       "file": "en-l01.wav",
       "dur_s": 2.32,

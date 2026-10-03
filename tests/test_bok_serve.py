@@ -60,6 +60,47 @@ def test_certifi_bundle_missing_returns_empty(tmp_path, monkeypatch) -> None:
     assert bok._certifi_bundle(empty_py) == ""
 
 
+# ---- I1（2026-10-03）：9B 前门闸 :1238 —— 消费口 URL 与代理拉起 ----
+
+
+def test_settle_gate_url_follows_proxy_switch(monkeypatch) -> None:
+    """queue 拓扑开=:1238 前门;关=裸 :1237（旧形状逐字节）。"""
+    monkeypatch.setenv("BOK_LLM_QUEUE_PROXY", "1")
+    assert bok._settle_gate_url() == "http://127.0.0.1:1238/v1"
+    monkeypatch.setenv("BOK_LLM_QUEUE_PROXY", "0")
+    assert bok._settle_gate_url() == "http://127.0.0.1:1237/v1"
+
+
+def test_start_settle_proxy_lifecycle(monkeypatch, tmp_path) -> None:
+    """拉起/幂等/开关三态：upstream=:1237、port=1238、pid/log 命名齐。"""
+    spawned: list[tuple] = []
+    monkeypatch.setenv("BOK_LLM_QUEUE_PROXY", "1")
+    monkeypatch.setattr(bok, "repo_python", lambda: "/usr/bin/python3")
+    monkeypatch.setattr(bok, "healthy", lambda p: False)
+    monkeypatch.setattr(
+        bok, "_start_proc",
+        lambda argv, pid, log, env=None: spawned.append((argv, pid, log, env)),
+    )
+    assert bok._start_settle_proxy(tmp_path, tmp_path) is True
+    assert len(spawned) == 1
+    argv, pid, log, env = spawned[0]
+    assert "queue_proxy.py" in " ".join(str(x) for x in argv)
+    assert str(pid).endswith("settle-proxy.pid")
+    assert str(log).endswith("settle-proxy.log")
+    assert env["BOK_LLM_QUEUE_PORT"] == "1238"
+    assert env["BOK_LLM_QUEUE_UPSTREAM"] == "http://127.0.0.1:1237"
+    # 已健康=幂等跳过（healthy 早退路径同款）
+    spawned.clear()
+    monkeypatch.setattr(bok, "healthy", lambda p: True)
+    assert bok._start_settle_proxy(tmp_path, tmp_path) is True
+    assert spawned == []
+    # queue 关=不起
+    monkeypatch.setenv("BOK_LLM_QUEUE_PROXY", "0")
+    monkeypatch.setattr(bok, "healthy", lambda p: False)
+    assert bok._start_settle_proxy(tmp_path, tmp_path) is False
+    assert spawned == []
+
+
 def test_worker_env_bakes_ssl_cert_file(tmp_path, monkeypatch) -> None:
     """worker env builder（agent 生产档 + CP + serve 同源）自动注入 SSL_CERT_FILE，
     仅当 env 未设且 cacert.pem 在盘——干净 shell 起 worker 唔再炸 MiniMax TLS。"""

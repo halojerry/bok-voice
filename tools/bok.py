@@ -948,6 +948,9 @@ for _wname, _wport in WORKER_PORTS:
     _SWEEP_HTTP_PATHS.setdefault(_wport, "/worker")
 _SWEEP_HTTP_PATHS.setdefault(1236, "/v1/models")
 _SWEEP_HTTP_PATHS.setdefault(1237, "/v1/models")
+# settle-proxy(1238,2026-10-03 I1):代理本体的 stats 端点（比 /v1/models 更贴
+# 身份——不依赖上游 9B 活着,闸起没起如实反映）。
+_SWEEP_HTTP_PATHS.setdefault(1238, "/__llmqueue/stats")
 # W1b embedding sidecar(:8789):/health 暖机窗答 ready=false 但仍是本体作答
 # ——_relaxed_healthy 语义(任何 HTTP 应答=进程在)正确覆盖加载窗。
 _SWEEP_HTTP_PATHS.setdefault(8789, "/health")
@@ -991,7 +994,7 @@ def _ports_down_after_grace(
     return [p for p in targets if not probe(p)]
 
 
-_OPTIONAL_LLM_PORTS = (1236, 1237, 1239, 8789, 8791)  # mt/settle/llm-raw/embed/laya:模型缺失即跳过,缺它们不拖垮整栈(embed/laya/llm-raw 非主回复链,同享可选豁免)
+_OPTIONAL_LLM_PORTS = (1236, 1237, 1238, 1239, 8789, 8791)  # mt/settle/settle-proxy/llm-raw/embed/laya:模型缺失即跳过,缺它们不拖垮整栈(1238=9B 前门闸,queue 关的栈结构性没有,同享可选豁免)
 
 
 def _only_optional_ports(down: list[int]) -> bool:
@@ -1442,7 +1445,9 @@ def _control_plane_env(db: Path | str) -> dict[str, str]:
     _settle = _settle_llm_model(_cur)
     if _dev_9b_enabled():
         if _settle and Path(_settle).exists():
-            env["BOK_SETTLE_LLM_BASE_URL"] = os.environ.get("BOK_SETTLE_LLM_BASE_URL", "http://127.0.0.1:1237/v1")
+            # 消费口=前门闸（2026-10-03 I1）：queue 拓扑下 :1238（reply 插队+可
+            # 观测），关=裸 :1237。与 _start_settle_proxy 同判据。
+            env["BOK_SETTLE_LLM_BASE_URL"] = os.environ.get("BOK_SETTLE_LLM_BASE_URL", _settle_gate_url())
             env["BOK_SETTLE_LLM_MODEL"] = _settle
     else:
         _ext_settle_url = os.environ.get("BOK_SETTLE_LLM_BASE_URL", "").strip()
@@ -1661,6 +1666,18 @@ def _llm_queue_proxy_on() -> bool:
     return os.environ.get("BOK_LLM_QUEUE_PROXY", "1") == "1"
 
 
+def _settle_gate_url() -> str:
+    """9B 专线（a_reply/settle/prewarm）的**消费口**（2026-10-03 I1 前门闸）。
+
+    queue proxy 拓扑（默认开）下 = :1238 前门（reply 插队 + GATE 观测；上游
+    裸口 :1237，_start_settle_proxy 同条件拉起）；关 = 裸 :1237 旧形状。
+    与 _start_settle_proxy 同一判据（同 env 开关），不会出现「指了闸却没起」。
+    """
+    if _llm_queue_proxy_on():
+        return "http://127.0.0.1:1238/v1"
+    return "http://127.0.0.1:1237/v1"
+
+
 # mlx_lm server 入口 wrapper（2026-10-01 W-ABORT）：`from mlx_lm import server`
 # 后做按请求身份的生成中止 patch（POST /v1/abort），argv 原样透传。三处 mlx
 # 启动点（:1235/:1239 主 LLM、:1236 MT、:1237 settle/9B）统一走它；
@@ -1860,6 +1877,28 @@ def _start_mt_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> bool
     return True
 
 
+def _start_settle_proxy(run_dir: Path, log_dir: Path) -> bool:
+    """9B 前门闸 :1238→:1237（2026-10-03 I1,与 :1235 代理同码同姿势）。
+
+    queue proxy 拓扑关 → 不起（旧形状裸 :1237）；:1238 已健康 → 幂等跳过
+    （_start_settle_llm 的 healthy 早退路径也要捞一把,防「9B 在跑但闸没起
+    →serve 等 1238 假死」）。返回 True=闸在位（新起或已健康）。
+    """
+    if not _llm_queue_proxy_on():
+        return False
+    if healthy(1238):
+        return True
+    print("[bok] settle queue proxy :1238 -> 9B :1237 (reply lane priority)")
+    _start_proc(
+        [str(repo_python()), str(ROOT / "services" / "llm-mlx" / "queue_proxy.py")],
+        run_dir / "settle-proxy.pid",
+        log_dir / "settle-proxy.log",
+        env={"BOK_LLM_QUEUE_UPSTREAM": "http://127.0.0.1:1237",
+             "BOK_LLM_QUEUE_HOST": "127.0.0.1", "BOK_LLM_QUEUE_PORT": "1238"},
+    )
+    return True
+
+
 def _start_settle_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> bool:
     """后台重活专线 LLM(:1237,9B):settle 纪要/知识蒸馏与 flow judge 指到这颗。
 
@@ -1879,6 +1918,7 @@ def _start_settle_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> 
         print("[bok] 9B lane off (BOK_DEV_9B=0) — skip :1237 (a_reply 车道/judge/settle 回退 :1235)", file=sys.stderr)
         return False
     if healthy(1237):
+        _start_settle_proxy(run_dir, log_dir)  # 幂等:9B 已跑也要捞闸(serve 会等 1238)
         return True
     settle_model = _settle_llm_model(current)
     if not settle_model or not Path(settle_model).exists():
@@ -1919,6 +1959,7 @@ def _start_settle_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> 
         log_dir / "settle-llm.log",
         env=_mlx_hf_offline_env(),
     )
+    _start_settle_proxy(run_dir, log_dir)
     return True
 
 
@@ -2154,6 +2195,7 @@ def _cmd_up_services(models_only: bool = False) -> int:
         core_ports
         + ((1236,) if want_mt else ())
         + ((1237,) if want_settle else ())
+        + ((1238,) if want_settle and _llm_queue_proxy_on() else ())
         + ((8789,) if want_embed else ())
         + ((8791,) if want_laya else ())
     )
@@ -3472,6 +3514,10 @@ _ORPHAN_PORT_OWNERS: tuple[tuple[int, tuple[str, ...]], ...] = (
     # 监听口——父进程暴毙后代理仍转发失败、孤儿 mlx 却占着 GPU 解码不放，
     # 身份标记同族（--model 路径 + mlx_lm）。
     (1239, ("mlx_lm",)),
+    # settle-proxy(1238)（2026-10-03 I1 前门闸）：queue_proxy 同码同族（命令行
+    # 带 services/llm-mlx/queue_proxy.py）；父进程暴毙后占着 9B 前门口令新栈
+    # serve 等就绪假死——同 1239 的孤儿语义。
+    (1238, ("queue_proxy",)),
     (7880, ("livekit-server",)),
     (3000, ("next", "node")),
     (8081, ("agent_runtime", "multiprocessing")),
@@ -3803,15 +3849,19 @@ _LEASE_TIMEOUT_MARKER = "lease-timeout forced-reclaim"
 
 
 def _doctor_queue_proxy_lease_timeouts(log_dir: Path) -> int | None:
-    """llm-proxy.log 里租约看门狗打点计数（None=日志不存在/读不出）。
+    """llm-proxy.log + settle-proxy.log 的租约看门狗打点合计（None=两份都读不出）。
 
     队列代理的槽泄漏/断连僵尸回收证据全在这行——doctor 汇总一行数字面
-    （informational：历史累计非当前故障，要判窗看行内时间戳）。"""
-    try:
-        text = (log_dir / "llm-proxy.log").read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        return None
-    return text.count(_LEASE_TIMEOUT_MARKER)
+    （informational：历史累计非当前故障，要判窗看行内时间戳）。
+    settle-proxy(:1238,2026-10-03 I1) 与 :1235 同码同打点，同扫求和。"""
+    total: int | None = None
+    for name in ("llm-proxy.log", "settle-proxy.log"):
+        try:
+            text = (log_dir / name).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        total = (total or 0) + text.count(_LEASE_TIMEOUT_MARKER)
+    return total
 
 
 def cmd_doctor() -> int:
@@ -4516,6 +4566,9 @@ def cmd_prod_status() -> int:
         checks.append(("mt-llm", 1236, "/v1/models"))
     if healthy(1237):
         checks.append(("settle-llm", 1237, "/v1/models"))
+    if healthy(1238):
+        # :1237 前门闸（2026-10-03 I1）：「起了才查」同款——queue 关的栈没有它。
+        checks.append(("settle-proxy", 1238, "/__llmqueue/stats"))
     if healthy(8789):
         # W1b embedding sidecar:/health 本体答 ready(未就绪答 ready=false 但
         # 200——下面 "Not Ready" 同款行检不出,暖机窗极短可接受;DOWN 才是缺席)。

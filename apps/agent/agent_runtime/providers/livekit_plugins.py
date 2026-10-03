@@ -335,6 +335,16 @@ def _mlx_abort_on_for(base_url: str) -> bool:
     return host in _MLX_LOCAL_HOSTS
 
 
+def _is_local_mlx_url(base_url: str) -> bool:
+    """base_url 是否指向本机 mlx（纯 host 判据,与 abort 总闸 env 解耦——
+    BOK_MLX_ABORT=0 不该把本地 warmup 一并关掉;2026-10-03 I1c）。"""
+    try:
+        host = (urlparse(str(base_url or "")).hostname or "").lower()
+    except Exception:  # noqa: BLE001 - 解不出=非本地
+        return False
+    return host in _MLX_LOCAL_HOSTS
+
+
 def _mlx_abort_url(base_url: str) -> str:
     """abort 端点 URL：base_url 以 /v1 结尾（OpenAI 约定）时同挂 /v1/abort。"""
     base = str(base_url or "").rstrip("/")
@@ -592,6 +602,10 @@ class MlxLlmLLM(_OpenAICompatBase):
         # warmup 因此整年白跳。
         if os.environ.get("LLM_WARMUP", "1") != "1":
             return
+        # host 门（2026-10-03 I1c）：云端 OpenAI 兼容车道没有本地 mlx 的冷启动
+        # KV 语义,28-token warmup 纯噪音——只在本机端点发。
+        if not _is_local_mlx_url(self._bok_abort_base):
+            return
         try:
             await self._client.chat.completions.create(
                 model=self._opts.model,
@@ -602,6 +616,9 @@ class MlxLlmLLM(_OpenAICompatBase):
                     }
                 ],
                 max_tokens=1,
+                # 车道标记（2026-10-03 I1）：预热=bg,不抢交互回复的队列位（:1237
+                # 前门闸与 :1235 闸同判 X-Bok-Lane;无代理拓扑下头被 mlx 无害忽略）。
+                extra_headers={"X-Bok-Lane": "bg"},
             )
             print("[agent] llm warmup done", flush=True)
         except Exception as exc:  # pragma: no cover - warmup 失败不致命
@@ -635,7 +652,9 @@ class MlxLlmLLM(_OpenAICompatBase):
                 model=self._opts.model,
                 messages=messages,
                 max_tokens=1,
-                extra_headers={_MLX_REQ_ID_HEADER: req_id},
+                # 车道标记（2026-10-03 I1）：前缀预热/投机预热=bg——:1237 前门闸下
+                # 让 reply 插队;req-id 同头共存,取消即 abort 的语义不变。
+                extra_headers={_MLX_REQ_ID_HEADER: req_id, "X-Bok-Lane": "bg"},
                 timeout=httpx.Timeout(connect=5.0, read=30.0, write=5.0, pool=5.0),
             )
         except asyncio.CancelledError:

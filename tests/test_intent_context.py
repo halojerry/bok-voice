@@ -180,24 +180,42 @@ def test_hint_category_cleared_when_next_arm_without_hint():
     assert d._hint_round == "", "上一轮提示不得跨轮残留"
 
 
-def test_hinted_category_legal_wins_illegal_falls_back():
+def test_hinted_category_only_rescues_undefined_literal():
+    """2026-10-03 I4 收窄:字面分类有明确结论(empathy/ack/check/minimal)时,
+    规则意图提示不得覆写;仅字面落 default/空时提示救场(合法才用)。"""
     d = _director(["check", "minimal"])
     d._hint_round = "check"
-    assert d._hinted_category("cantonese", "minimal") == "check"
+    # 字面有结论 → 提示让位
+    assert d._hinted_category("cantonese", "minimal") == "minimal"
+    # 字面落 default/空 → 提示救场
+    assert d._hinted_category("cantonese", "default") == "check"
+    assert d._hinted_category("cantonese", "") == "check"
     d._hint_round = "empathy"  # 池里没有该类 → 回退
-    assert d._hinted_category("cantonese", "minimal") == "minimal"
+    assert d._hinted_category("cantonese", "default") == "default"
     d._hint_round = ""
-    assert d._hinted_category("cantonese", "minimal") == "minimal"
+    assert d._hinted_category("cantonese", "default") == "default"
 
 
-def test_select_hint_overrides_classifier_on_miss():
-    idx = _StubIndex(hit=None)  # 字面未命中 → 走回退池
-    d = _director(["check", "minimal"], entries_index=idx, user_text="好的呀")
-    d._hint_round = "check"  # 分类器会归 minimal,hint 钉 check
+def test_select_hint_rescues_default_classification():
+    """I4:字面落 default(无关键词句)时,规则意图提示救场(旧语义保留面)。"""
+    idx = _StubIndex(hit=None)  # 罐头未命中 → 走回退池
+    d = _director(["check", "minimal"], entries_index=idx, user_text="我下昼再讲啦")
+    d._hint_round = "check"  # 字面落 default → hint 钉 check
     entry, cat = d._select("cantonese")
     assert cat == "check"
     assert entry is not None
     assert idx.calls[0][1] == "check", "提示类别须经 classifier_cat 透传给索引打分"
+
+
+def test_select_hint_not_override_literal_minimal():
+    """I4 收窄负向 pin:字面 minimal 有明确结论,提示不得改判(WhatsApp 报号轮实证)。"""
+    idx = _StubIndex(hit=None)
+    d = _director(["check", "minimal"], entries_index=idx, user_text="好的呀")
+    d._hint_round = "check"
+    entry, cat = d._select("cantonese")
+    assert cat == "minimal"
+    assert entry is not None
+    assert idx.calls[0][1] == "minimal"
 
 
 def test_select_no_hint_keeps_classifier():
@@ -208,13 +226,14 @@ def test_select_no_hint_keeps_classifier():
 
 
 def test_select_literal_hit_beats_hint():
-    """字面罐头命中优先级不变:命中即返,提示不参与抢条目。"""
+    """字面罐头命中优先级不变:命中即返,提示不参与抢条目;cat 随字面分类
+    (I4 收窄后提示不得覆写明确字面结论——「帮我查下啦」→check)。"""
     idx = _StubIndex(hit={"text": "收到,帮您睇下。", "id": "e1"})
     d = _director(["check", "minimal"], entries_index=idx, user_text="帮我查下啦")
     d._hint_round = "minimal"
     entry, cat = d._select("cantonese")
     assert entry == {"text": "收到,帮您睇下。", "file": None}
-    assert cat == "minimal"
+    assert cat == "check"
 
 
 def test_select_no_index_uses_legal_hint():
