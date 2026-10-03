@@ -38,27 +38,57 @@ REPORT_DIR = Path(__file__).resolve().parents[1] / "reports" / "offtopic-recover
 # ---------------------------------------------------------------------------
 # 一套 8 轮：配合 → 跑题(算术) → 配合 → 跑题(天气) → 配合 → 跑题(闲聊) → 配合 ×2。
 # 句形铁律照守：无逗号、单口气、≥10 字单口气句免疫劈轮。
+# 2026-10-02 三语化：旧版题面硬编码粤语字打进 zh/en 人设（en 腿全灭成
+# garbled-reask/空答、zh 腿答非所问——探针伪影非栈回归）；题面按 --lang 取。
 # ---------------------------------------------------------------------------
-ROUNDS: list[dict] = [
-    {"text": "係呀我係陳大文呀", "kind": "coop"},
-    {"text": "我想問下你一加一等於幾呀", "kind": "offtopic", "topic": "math"},
-    {"text": "你講啦我聽緊呀", "kind": "coop"},
-    {"text": "聽日香港會唔會落雨呀", "kind": "offtopic", "topic": "weather"},
-    {"text": "好呀你繼續講啦", "kind": "coop"},
-    {"text": "你識唔識唱歌㗎你", "kind": "offtopic", "topic": "chat"},
-    {"text": "嗯冇問題呀我配合你", "kind": "coop"},
-    {"text": "咁你講啦我等你講完", "kind": "coop"},
-]
+ROUNDS_BY_LANG: dict[str, list[dict]] = {
+    "cantonese": [
+        {"text": "係呀我係陳大文呀", "kind": "coop"},
+        {"text": "我想問下你一加一等於幾呀", "kind": "offtopic", "topic": "math"},
+        {"text": "你講啦我聽緊呀", "kind": "coop"},
+        {"text": "聽日香港會唔會落雨呀", "kind": "offtopic", "topic": "weather"},
+        {"text": "好呀你繼續講啦", "kind": "coop"},
+        {"text": "你識唔識唱歌㗎你", "kind": "offtopic", "topic": "chat"},
+        {"text": "嗯冇問題呀我配合你", "kind": "coop"},
+        {"text": "咁你講啦我等你講完", "kind": "coop"},
+    ],
+    "zh": [
+        {"text": "对呀我是陈大文", "kind": "coop"},
+        {"text": "我想问一下你一加一等于几呀", "kind": "offtopic", "topic": "math"},
+        {"text": "你说吧我听着呢", "kind": "coop"},
+        {"text": "明天香港会不会下雨呀", "kind": "offtopic", "topic": "weather"},
+        {"text": "好的你继续说吧", "kind": "coop"},
+        {"text": "你会不会唱歌呀你", "kind": "offtopic", "topic": "chat"},
+        {"text": "嗯没问题我配合你", "kind": "coop"},
+        {"text": "那你说吧我等你说完", "kind": "coop"},
+    ],
+    "en": [
+        {"text": "Yes this is John Chan", "kind": "coop"},
+        {"text": "By the way what is one plus one", "kind": "offtopic", "topic": "math"},
+        {"text": "Go ahead I am listening", "kind": "coop"},
+        {"text": "Will it rain in Hong Kong tomorrow", "kind": "offtopic", "topic": "weather"},
+        {"text": "Okay please continue", "kind": "coop"},
+        {"text": "Can you sing a song", "kind": "offtopic", "topic": "chat"},
+        {"text": "Sure no problem I will cooperate", "kind": "coop"},
+        {"text": "Go ahead I will wait", "kind": "coop"},
+    ],
+}
+
+
+def _rounds_for(lang: str) -> list[dict]:
+    return ROUNDS_BY_LANG.get(lang) or ROUNDS_BY_LANG["cantonese"]
+
 
 # 跑题应答的「流程钩子」词面（informational——有无把话题带回主线）
-FLOW_HOOK_WORDS = ("賠", "快遞", "件", "電話", "身份", "公司", "單號", "通知", "處理", "核实", "核实好")
-MATH_ANSWER_WORDS = ("二", "两", "兩", "2")
+FLOW_HOOK_WORDS = ("賠", "快遞", "件", "電話", "身份", "公司", "單號", "通知", "處理", "核实", "核实好", "compensat", "parcel", "package", "order", "WhatsApp", "refund")
+MATH_ANSWER_WORDS = ("二", "两", "兩", "2", "two", "Two")
 
 
-def offtopic_flags(attributed: list[dict]) -> list[dict]:
+def offtopic_flags(attributed: list[dict], rounds: list[dict] | None = None) -> list[dict]:
     """跑题轮判读（纯函数）：哑/空答/流程钩子/算术正答。"""
+    rounds = rounds if rounds is not None else _rounds_for("cantonese")
     out = []
-    for i, spec in enumerate(ROUNDS):
+    for i, spec in enumerate(rounds):
         if spec["kind"] != "offtopic":
             continue
         replies = [t.strip() for t in attributed[i].get("assistant_texts", []) if t.strip()] if i < len(attributed) else []
@@ -78,9 +108,10 @@ def offtopic_flags(attributed: list[dict]) -> list[dict]:
 
 async def run_probe(args: argparse.Namespace) -> int:
     lang = args.lang
-    texts = [r["text"] for r in ROUNDS]
-    print(f"[offtopic] 预合成 {len(ROUNDS)} 轮（{lang}）…", flush=True)
-    pcms = {i: erc.tts_pcm(r["text"], lang) for i, r in enumerate(ROUNDS)}
+    rounds = _rounds_for(lang)
+    texts = [r["text"] for r in rounds]
+    print(f"[offtopic] 预合成 {len(rounds)} 轮（{lang}）…", flush=True)
+    pcms = {i: erc.tts_pcm(r["text"], lang) for i, r in enumerate(rounds)}
 
     call_id, voice = erc.create_call(lang, args.persona_id, "")
     log_offset = erc.LOG_PATH.stat().st_size if erc.LOG_PATH.exists() else 0
@@ -140,7 +171,7 @@ async def run_probe(args: argparse.Namespace) -> int:
         agent_audio.clear()
         await asyncio.sleep(0.5)
 
-        for i, r in enumerate(ROUNDS):
+        for i, r in enumerate(rounds):
             m = await erc.play_and_listen(audio_source, agent_audio, pcms[i])
             m.update({"text": r["text"], "kind": r["kind"]})
             measures.append(m)
@@ -176,10 +207,10 @@ async def run_probe(args: argparse.Namespace) -> int:
     # 跑题轮短句 + ASR 方言转写乱（「係呀我係陳大文」→「我喺春大永」），文字对齐
     # （pls.assign_user_turns）结构性失败——本探针轮次=推送顺序，行数吻合时直接
     # 按序 zip；不吻合才退文字对齐（届时打印警示）。
-    if len(user_rows) == len(ROUNDS):
-        turn_counts = [1] * len(ROUNDS)
+    if len(user_rows) == len(rounds):
+        turn_counts = [1] * len(rounds)
     else:
-        print(f"[offtopic] WARN user 行数 {len(user_rows)} ≠ 轮数 {len(ROUNDS)}，退文字对齐", flush=True)
+        print(f"[offtopic] WARN user 行数 {len(user_rows)} ≠ 轮数 {len(rounds)}，退文字对齐", flush=True)
         turn_counts = pls.assign_user_turns(texts, user_rows)
     attributed = pos.attribute_replies(turns, turn_counts)
 
@@ -214,12 +245,12 @@ async def run_probe(args: argparse.Namespace) -> int:
         pass
 
     # ---------------- 判读 ----------------
-    flags = offtopic_flags(attributed)
+    flags = offtopic_flags(attributed, rounds)
     print("\n" + "=" * 72)
     print(f"对话实录（call={call_id} · 开场白{'✓' if setup_ok else '✗'} · template_step 序列={steps} · 位移={step_span}）")
     print("=" * 72)
     for i, r in enumerate(attributed):
-        kind = ROUNDS[i]["kind"]
+        kind = rounds[i]["kind"]
         mark = " ⟪跑题⟫" if kind == "offtopic" else ""
         for ut in r["user_texts"]:
             print(f"  [客{i + 1}]{mark} {ut[:70]}")
