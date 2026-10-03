@@ -31,7 +31,7 @@ from livekit.agents import (
 )
 from livekit.plugins.openai import LLM as _OpenAICompatBase
 
-from bok_voice_core.deepseek_llm import thinking_extra_body
+from bok_voice_core.deepseek_llm import is_deepseek_endpoint, thinking_extra_body
 
 # 模型路由共享契约(2026-09-25 阶段 0):只消费,解析/校验逻辑全在 packages/core。
 from bok_voice_core.model_routes import LaneRoute, PROVIDER_OPENAI
@@ -468,7 +468,18 @@ class MlxLlmLLM(_OpenAICompatBase):
                 extra_body[key] = int(raw) if raw.isdigit() else float(raw)
             except ValueError:  # pragma: no cover - 配错当没配,唔炸构造
                 continue
-        if enable_thinking is not None:
+        if is_deepseek_endpoint(base_url):
+            # DeepSeek 云端点（2026-10-03 云腿波）：Qwen 家族 enable_thinking 旗
+            # 它不认——思考开关走官方 thinking{type} 契约（缺省 enabled 会把小
+            # max_tokens 烧空出空串，见 bok_voice_core.deepseek_llm）。端点判据
+            # 与 DeepSeekLLM 同源；本地/其它云端端点逐字节零漂移。
+            extra_body.update(
+                thinking_extra_body(
+                    base_url,
+                    "enabled" if enable_thinking else os.environ.get("DEEPSEEK_THINKING", ""),
+                )
+            )
+        elif enable_thinking is not None:
             # 模型路由 openai 档(2026-09-25):思考旗随请求体下发(Qwen3.5 家族云端
             # 思考陷阱——不传该旗思考全开,LANE-AB 实证)。extra_body 经官方 openai
             # SDK 合并进请求体顶层(既有 max_tokens/stop 同通道)。缺省 None=请求体

@@ -3814,6 +3814,7 @@ async def entrypoint(ctx):
     # 模块级可变全局会串线；下游 judge/a_reply 构造点经本函数闭包读取。
     _routing_raw = str(settings.get("model_routing_json") or "")
 
+    from .providers.doubao_asr import DoubaoSTT, doubao_asr_enabled
     from .providers.livekit_plugins import (
         DeepSeekLLM,
         FakeLiveKitSTT,
@@ -4286,9 +4287,41 @@ async def entrypoint(ctx):
     # E1 词表按**本通通话语言**分域(2026-09-21 批次 3):繁体形错误形态(集運 类)在
     # cantonese 通话里是正确写法,不分域改就是双向伤害。装配期定死,每轮零语言判断。
     _snippet_merged = compile_snippet_rules(lang=greet_lang)
+    _use_doubao = asr_provider_name in ("doubao", "doubao_asr")
+    _doubao_key = str(asr_cfg.get("api_key") or "").strip()
+    _doubao_old_auth = bool(str(asr_cfg.get("app_id") or "").strip()) and bool(
+        str(asr_cfg.get("access_token") or "").strip()
+    )
     if use_fake or asr_provider_name in ("fake", "fake_stt"):
         stt_provider = FakeLiveKitSTT()
+    elif _use_doubao and doubao_asr_enabled() and (_doubao_key or _doubao_old_auth):
+        # 云端豆包 SAUC 流式（A/B 线共用，2026-10-03 云 ASR 装线波）：凭据/端点
+        # 走设置面 asr 段（internal 面下发，与 TTS 同款）；语言不传（auto 三语
+        # 实测全通，enable_lid 方言识别在 provider 内常开）；热词=当通 effective
+        # 词表直传（provider 内 100 token 上限截取）。
+        stt_provider = DoubaoSTT(
+            api_key=_doubao_key,
+            resource_id=str(asr_cfg.get("resource_id") or "").strip(),
+            ws_url=str(asr_cfg.get("endpoint") or "").strip(),
+            app_id=str(asr_cfg.get("app_id") or "").strip(),
+            access_token=str(asr_cfg.get("access_token") or "").strip(),
+            language_state=asr_language_state,
+            hotword_terms=list(_hotword_terms),
+            vad_=vad_provider,
+        )
+        print(
+            f"[agent] asr=doubao (cloud SAUC, resource={stt_provider._resource_id})",
+            flush=True,
+        )
     else:
+        if _use_doubao:
+            # 缺凭据/总闸关：显式告警回退本地（绝不静默上云，也绝不静默哑掉）。
+            _why = "kill_switch" if not doubao_asr_enabled() else "no_api_key"
+            _agent_log("asr.doubao.unavailable", fallback="qwen3_asr", reason=_why)
+            print(
+                f"[agent] asr=doubao unavailable ({_why}) — falling back to local Qwen3-ASR",
+                flush=True,
+            )
         # 未知/历史配置值一律回退 sidecar（Qwen3-ASR），避免配置写错导致 agent 崩溃。
         _asr_inner = Qwen3ASRSTT(
             base_url=_sidecar_base_url(
@@ -4315,8 +4348,11 @@ async def entrypoint(ctx):
             stt_provider = Qwen3ASRLiveSTT(stt_=_asr_inner, vad_=vad_provider)
         else:
             stt_provider = stt.StreamAdapter(stt=_asr_inner, vad=vad_provider)
-    # GPU 竞态专项:仅 Live 包装可调会话级 partial 档(流式路径独有)。
-    _partial_gate_stt = stt_provider if isinstance(stt_provider, Qwen3ASRLiveSTT) else None
+    # GPU 竞态专项:仅 Live 包装可调会话级 partial 档(流式路径独有)；云档（豆包）
+    # 同款公开面（set_partial_ms/set_reply_busy/set_closing_say/last_partial_text）。
+    _partial_gate_stt = (
+        stt_provider if isinstance(stt_provider, (Qwen3ASRLiveSTT, DoubaoSTT)) else None
+    )
 
     # ---- TTS：人设可指定引擎（persona.tts_provider），留空跟随全局 tts.provider。
     # 引擎决定音色池：qwen3_tts 用本地克隆（persona.reference_audio 是本地克隆 ID）；

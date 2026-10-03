@@ -2535,6 +2535,9 @@ _FORWARD_ENV = (
     "BOK_ROOM_CLAIM",
     "BOK_ROOM_CLAIM_DIR",
     # —— ASR（agent 侧读的运维档；sidecar 专属键走 asr_env 另注入） ——
+    # 云 ASR 装线波(2026-10-03):豆包 SAUC 总闸,=0 装配点回退本地 Qwen3-ASR
+    # (A/B 线共用;凭据走设置面 asr 段,不经 env)。
+    "BOK_DOUBAO_ASR",
     "BOK_ASR_HOTWORDS",
     "BOK_ASR_PARTIAL_SLOW_MS",
     # B 线正压臂波(2026-10-02):ASR 帧级调试观测(掉帧/水位打点)——
