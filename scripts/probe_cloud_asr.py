@@ -48,7 +48,13 @@ SETTINGS_DB = Path.home() / "Library" / "Application Support" / "BokVoice" / "bo
 
 DOUBAO_WS_DEFAULT = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
 MINIMAX_STT_URL = "https://api.minimax.cn/v1/speech_to_text"
-MINIMAX_LANG = {"cantonese": "yue", "zh": "zh", "en": "en"}
+# 厂商语言标签（外部接口真字面量，术语铁律**边界映射单点**——内部语言字段一律
+# cantonese；yue/yue-CN 仅作 MiniMax BCP-47 头与火山 SAUC language 参数出现）。
+_VENDOR_LANG = {
+    "cantonese": {"minimax": "yue", "volc": "yue-CN"},
+    "zh": {"minimax": "zh", "volc": "zh-CN"},
+    "en": {"minimax": "en", "volc": "en-US"},
+}
 
 # ---- 火山 SAUC 二进制帧（V3 协议族；官方 demo protocol.py 语义） ----
 MSG_FULL_CLIENT_REQ = 0b0001
@@ -404,7 +410,7 @@ def main() -> int:
                      "digits": it.get("digits"), "keywords": it.get("keywords")}
         if do_doubao:
             pcm = read_wav_16k(wav_path)
-            lang_tag = {"cantonese": "yue-CN", "zh": "zh-CN", "en": "en-US"}.get(it["lang"], "")
+            lang_tag = _VENDOR_LANG.get(it["lang"], {}).get("volc", "")
             t0 = time.perf_counter()
             try:
                 res = asyncio.run(doubao_once(dd_url, dd_headers, pcm, pace=args.pace,
@@ -423,7 +429,7 @@ def main() -> int:
             res["wall_ms"] = round((time.perf_counter() - t0) * 1000, 1)
             row["doubao"] = res
         if mm_key:
-            mm_lang = MINIMAX_LANG.get(it["lang"], "")
+            mm_lang = _VENDOR_LANG.get(it["lang"], {}).get("minimax", "")
             try:
                 row["minimax"] = minimax_once(mm_key, wav_path, mm_lang, max(args.timeout, it["dur_s"] * 3))
             except Exception as exc:  # noqa: BLE001
