@@ -30,6 +30,10 @@ os.environ.setdefault("LIVEKIT_URL", "ws://127.0.0.1:7880")
 # 本文件钉 dial 块/派单链路（多数对象无模板）；模板强绑闸契约见
 # test_template_gate.py，这里隔离关掉以免与拨号语义测试纠缠。
 os.environ.setdefault("BOK_REQUIRE_TEMPLATE", "0")
+# 全局准入闸钉 legacy 不限（2026-10-03 补回——test_capacity_admission 的清 env
+# 注释记载本文件「常驻 BOK_MAX_ACTIVE_CALLS=0」；真机内存耦合会令 dial-now 的
+# live 建单在低空闲内存时被 409 误杀）。legacy 语义=不探测不计算、0=不限。
+os.environ.setdefault("BOK_MAX_ACTIVE_CALLS", "0")
 
 import json
 import sys
