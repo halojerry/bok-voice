@@ -719,7 +719,12 @@ def _active_calls_dir() -> Path:
 def _register_active_call(room: str, job_id: str = "") -> None:
     _ACTIVE_CALLS.add(room)
     try:
-        (_active_calls_dir() / f"{room}.marker").write_text(job_id or room, encoding="utf-8")
+        # marker 首行=本 job 进程 pid（2026-10-02 幽灵让位根修:异常收线的通话
+        # 不跑 release,marker 残留;mtime 2h 窗内它会让所有后续通话的 prewarm
+        # 无限让位——首 LLM 轮吃 9.8s 全量 prefill。次行留 job_id 便于排查。
+        (_active_calls_dir() / f"{room}.marker").write_text(
+            f"{os.getpid()}\n{job_id}", encoding="utf-8"
+        )
     except Exception:  # noqa: BLE001 - 文件面失败退化进程内
         pass
 
@@ -732,8 +737,28 @@ def _release_active_call(room: str) -> None:
         pass
 
 
+def _pid_alive(pid: int) -> bool:
+    """进程存活探针（永不 raise）;ProcessLookupError=死,其余 OSError=在。"""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # 权限类=进程存在
+
+
 def _other_active_calls(self_room: str, *, max_age_s: float = 7200.0) -> list[str]:
-    """跨进程在途名单:目录里除自己外、mtime 新鲜(默认 ≤2h=崩溃残留兜底)。"""
+    """跨进程在途名单:目录里除自己外的**真活**通话。
+
+    2026-10-02 幽灵让位根修(实弹:call-9f94cb11 signal 掐线异常收线后,后续
+    三通 prewarm 全部 `yielded (concurrent call call-9f94cb11)`,每通首 LLM 轮
+    cached=0/3306 全量 prefill 9.8s 破 3s 线):marker 首行 pid 可解析时按
+    **进程存活**判——死 pid=陈旧标记,跳过+顺手清;mtime 窗退化为外上界
+    (防 pid 复用假活)。老格式 marker(非 pid)回落旧 mtime 窗兼容。
+    """
     out: list[str] = []
     try:
         now = time.time()
@@ -742,8 +767,21 @@ def _other_active_calls(self_room: str, *, max_age_s: float = 7200.0) -> list[st
             if room == self_room:
                 continue
             try:
-                if now - p.stat().st_mtime <= max_age_s:
-                    out.append(room)
+                age = now - p.stat().st_mtime
+                if age > max_age_s:
+                    continue
+                pid = -1
+                try:
+                    pid = int(p.read_text(encoding="utf-8").splitlines()[0].strip())
+                except (ValueError, IndexError, OSError):
+                    pid = -1
+                if pid > 0 and not _pid_alive(pid):
+                    try:
+                        p.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    continue
+                out.append(room)
             except OSError:
                 continue
     except Exception:  # noqa: BLE001 - 扫描失败=无并发(保守照发)

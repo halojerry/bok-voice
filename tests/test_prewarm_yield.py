@@ -8,6 +8,7 @@
 通话」时跳过(``BOK_PREFIX_PREWARM_YIELD=0`` 回旧档);判据纯函数单点。"""
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -74,3 +75,51 @@ def test_other_active_calls_file_registry(tmp_path, monkeypatch):
     assert _other_active_calls("call-a") == []
     _release_active_call("call-a")
     _release_active_call("call-stale")
+
+
+def test_ghost_marker_dead_pid_ignored_and_cleaned(tmp_path, monkeypatch):
+    """幽灵让位根修(2026-10-02 实弹):异常收线通话不跑 release,marker 残留
+    死 pid——旧 mtime 窗让它压制后续所有通话 prewarm 长达 2h(每通首 LLM 轮
+    cached=0 全量 prefill 9.8s)。死 pid 判据:跳过+顺手清文件。
+
+    pid 判活走测试缝 monkeypatch(_pid_alive 本体由纯函数测试覆盖),marker
+    解析/跳过/清理是被钉的行为。"""
+    import agent_runtime.agent as agent_mod
+    from agent_runtime.agent import _other_active_calls, _register_active_call
+
+    monkeypatch.setenv("BOK_ACTIVE_CALLS_DIR", str(tmp_path))
+    monkeypatch.setattr(agent_mod, "_pid_alive", lambda pid: False)
+    ghost = tmp_path / "call-ghost.marker"
+    ghost.write_text("4194303\nAJ_dead", encoding="utf-8")
+    _register_active_call("call-me", "AJ_me")
+    # 注册面写的是本进程 pid,被同 monkeypatch 判死也无妨——被测对象是 ghost
+    assert _other_active_calls("call-me") == [], "死 pid marker 不得让位"
+    assert not ghost.exists(), "死 pid marker 应被顺手清"
+    _release_active_call("call-me")
+
+
+def test_live_pid_marker_still_yields(tmp_path, monkeypatch):
+    """活 pid marker(真在途通话)照常让位——判活回归面。"""
+    import agent_runtime.agent as agent_mod
+    from agent_runtime.agent import _other_active_calls
+
+    monkeypatch.setenv("BOK_ACTIVE_CALLS_DIR", str(tmp_path))
+    monkeypatch.setattr(agent_mod, "_pid_alive", lambda pid: True)
+    (tmp_path / "call-live.marker").write_text(f"{os.getpid()}\nAJ_live", encoding="utf-8")
+    assert _other_active_calls("call-me") == ["call-live"]
+
+
+def test_legacy_marker_falls_back_to_mtime(tmp_path, monkeypatch):
+    """老格式 marker（内容非 pid,升级前写入）回落旧 mtime 窗:新鲜=算在途。"""
+    from agent_runtime.agent import _other_active_calls
+
+    monkeypatch.setenv("BOK_ACTIVE_CALLS_DIR", str(tmp_path))
+    (tmp_path / "call-legacy.marker").write_text("call-legacy\n", encoding="utf-8")
+    assert _other_active_calls("call-me") == ["call-legacy"]
+
+
+def test_pid_alive_pure_function():
+    from agent_runtime.agent import _pid_alive
+
+    assert _pid_alive(0) is False
+    assert _pid_alive(-5) is False
