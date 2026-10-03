@@ -1,0 +1,3 @@
+VENDORMARK
+vendored from huggingface/speech-to-speech @ 81b688b452ee6b64ff5745b91985e9eb653fcc9f (2026-10-02)
+our patches: sub-sentence forward (LMOutputProcessor)
