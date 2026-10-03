@@ -7,6 +7,14 @@
 - result.text 单调累积：FINAL 取「最长已见文本」
 - interim 按文本变化去重后发 PartialTranscription
 - 末包负 seq 强制定稿；连接失败且无文本 → 整段单发重试一次
+- **段收尾不变式（跨轮串文修复）**：换轮（turn_id 变化）= 旧段永远错过 final，
+  必须显式弃段关闭 WS；同轮新 revision（VAD reopen）复用未收尾会话按 fed 游标续喂，
+  已收尾段则重开会话重喂全量前缀；final 到达时没有在开会话（段首即 final / 旧段已弃）
+  走整段单发（末包收尾 + 关闭）。任何情况下绝不把下一段音频喂进旧会话。
+- 会话结束清账：`on_session_end` 必须调 `super().on_session_end()`（清 completed
+  revision 账本）；否则新连接 turn_id 从 turn_1 重启时，上一会话的已完成账会把
+  新会话首轮整段误判为 input-after-final 丢弃 → 轮次永不 commit → 下一句被 VAD
+  reopen 合并进同一豆包 WS，transcript 出现「上一条+下一条」串文。
 - enable_lid 常开（粤语）；热词走 request.corpus.context（前 40 词）
 - SSRF 护栏：仅 wss/https + 公网端点
 """
@@ -319,24 +327,47 @@ class DoubaoSaucSTTHandler(BaseSTTHandler):
 
     # ---- handler 契约 ----
 
+    def _abandon_seg(self, seg: dict) -> None:
+        """显式弃段：旧段错过的 final 不再补，但必须关闭其 WS——绝不让下一段
+        音频喂进旧会话（否则服务端 result.text 跨段累积，下一条转写含上一条文本）。"""
+        if not seg.get("closed"):
+            try:
+                self._loop_thread.call(self._close_ws(seg), timeout=3.0)
+            except Exception as exc:  # noqa: BLE001 - 关闭失败也要就地清账
+                logger.warning("doubao abandon segment failed: %r", exc)
+        if self._seg is seg:
+            self._seg = None
+
+    def _open_seg(self, turn_id: str | None) -> dict:
+        """新开一段会话（progressive 首包开会话，把连接时延藏在说话期间）。"""
+        seg = {"turn": turn_id, "seq": 2, "text": "", "pcm": bytearray(),
+               "fed": 0, "ws": None, "closed": False}
+        seg["ws"] = self._loop_thread.call(self._open_ws(), timeout=self.connect_timeout_s + 2.0)
+        self._loop_thread.call(self._send_config(seg["ws"]), timeout=5.0)
+        self._seg = seg
+        return seg
+
     def process(self, vad_audio: STTIn) -> Iterator[STTOut]:
         progressive = vad_audio.mode == "progressive"
         audio = np.asarray(vad_audio.audio, dtype=np.float32)
         pcm = np.clip(audio * 32768, -32768, 32767).astype(np.int16).tobytes()
 
+        seg = self._seg
+        if seg is not None and (seg["turn"] != vad_audio.turn_id or seg.get("closed")):
+            # 换轮（旧段 final 已错过）或已收尾段重启（reopen）：显式弃段关 WS，
+            # 然后再按需开新会话——绝不复用旧会话喂新音频。
+            self._abandon_seg(seg)
+            seg = None
+
         if progressive:
-            seg = self._seg
-            if seg is None or seg["turn"] != vad_audio.turn_id or seg.get("closed"):
-                # 新段：整段重开会话（旧段未正常收尾则弃——其 final 已错过）
-                if seg is not None and not seg.get("closed"):
-                    self._loop_thread.call(self._close_ws(seg), timeout=3.0)
-                seg = {"turn": vad_audio.turn_id, "seq": 2, "text": "", "pcm": bytearray(),
-                       "fed": 0, "ws": None, "closed": False}
-                self._seg = seg
-                seg["ws"] = self._loop_thread.call(self._open_ws(), timeout=self.connect_timeout_s + 2.0)
-                self._loop_thread.call(
-                    self._send_config(seg["ws"]), timeout=5.0
-                )
+            if seg is None:
+                # 新段：整段开新会话；同轮 reopen 时 VAD 重发全量前缀
+                # （_combined_turn_audio = 前段音频 + 本段），fed 从 0 起全量喂。
+                try:
+                    seg = self._open_seg(vad_audio.turn_id)
+                except Exception as exc:  # noqa: BLE001 - 连接失败：final 路整段重试
+                    logger.warning("doubao progressive session open failed: %r", exc)
+                    return
             # 注：STTIn.audio 是累积前缀（progressive 全量-so-far / final 全段），
             # 喂入按 fed 游标只发新增尾巴，绝不重复。
             try:
@@ -356,9 +387,11 @@ class DoubaoSaucSTTHandler(BaseSTTHandler):
             return
 
         # ---- final ----
-        seg = self._seg
+        # 每个语音段必须有确定归宿：①段内有未收尾会话 → 喂末包（负 seq）收尾并关闭；
+        # ②无在开会话（段首即 final / 旧段已弃）或末包路失败 → 用 final 全量音频
+        # 独立单发重试（末包收尾 + 关闭）。两路都不把本段音频喂进任何旧会话。
         text = ""
-        if seg is not None and seg["turn"] == vad_audio.turn_id and not seg.get("closed"):
+        if seg is not None:
             try:
                 text = self._loop_thread.call(
                     self._feed_session(seg, pcm, last=True),
@@ -374,11 +407,12 @@ class DoubaoSaucSTTHandler(BaseSTTHandler):
                     self._loop_thread.call(self._close_ws(seg), timeout=3.0)
                 except Exception:  # noqa: BLE001
                     pass
-                seg["closed"] = True
-        if not text and len(seg["pcm"] if seg else b"") > 0 and seg is not None:
+                if self._seg is seg:
+                    self._seg = None
+        if not text and len(pcm) > 0:
             try:
                 text = self._loop_thread.call(
-                    self._transcribe_whole(bytes(seg["pcm"])), timeout=self.final_timeout_s * 2
+                    self._transcribe_whole(pcm), timeout=self.final_timeout_s * 2
                 )
             except Exception as exc:  # noqa: BLE001 - 重试仍败 → 空转写，下游兜底
                 logger.warning("doubao whole-segment retry failed: %r", exc)
@@ -412,6 +446,9 @@ class DoubaoSaucSTTHandler(BaseSTTHandler):
             except Exception:  # noqa: BLE001
                 pass
         self._seg = None
+        # 必调基类：清 completed-revision 账本（+ 语言状态）。漏掉这一步时，
+        # 新连接 turn_id 从 turn_1 重启会撞上一会话的旧账 → 首轮整段被误丢。
+        super().on_session_end()
 
     def cleanup(self) -> None:
         self.on_session_end()
