@@ -27,7 +27,7 @@ from bok_voice_core.flow_graph import (
     pick_graph_action,
 )
 # 模型路由共享契约(2026-09-25 阶段 0):车道本地↔云端解析单点,只消费不改动。
-from bok_voice_core.model_routes import LaneRoute, resolve_route
+from bok_voice_core.model_routes import LaneRoute, PROVIDER_OPENAI, resolve_route
 # W4-T2 意向规则评估(挂断 disposition 覆盖+intent_code;共享契约主会话写死,只消费)
 from bok_voice_core.intent_rules import eval_intent_rules
 from bok_voice_core.policies import ProviderRegistry, ProviderState, select_session_manifest
@@ -5026,6 +5026,19 @@ async def entrypoint(ctx):
         # 真答案已在路上就不再补垫话。裸 provider/无缓存形态无此口=None=旧门。
         reply_pending_provider=getattr(tts_provider, "reply_stream_pending_since", None),
     )
+    # 云档免垫话（2026-10-03，Ethan 全云实弹判定「太顺滑、垫音多余」）：a_reply
+    # 走云档（openai 路由）时垫话默认关——垫话本是盖本地 LLM 首 token 慢窗的；
+    # 云档真答案 56ms-1.6s 即到，垫话=抢在答案前的一声多余语气（call-94b9ba9d
+    # 实弹：4 发全被 FILLER_YIELD/refund 收走）。本地档保持开；显式覆盖
+    # BOK_FILLER=0 全关 / =1 强制开（A/B 用）。只动本实例评估口，零全局态。
+    _filler_env = os.environ.get("BOK_FILLER", "").strip()
+    if _filler_env == "1":
+        _filler.set_enabled(True)
+    elif _filler_env == "0":
+        _filler.set_enabled(False)
+    elif _a_reply_route.provider == PROVIDER_OPENAI:
+        _filler.set_enabled(False)
+        print("[agent] filler auto-off (cloud a_reply lane)", flush=True)
     # 垫话开播 → 看门狗一次性顺延(RC3,2026-09-17):垫话 out-of-band 出声框架
     # 不可见(不入 speech 队列、无首音频信号),watchdog 不拆弹——「垫话盖耳+
     # 系统慢」轮被 4s 闸误伤(50 轮开火 14 次、多次掐掉在途真回复)。回调在

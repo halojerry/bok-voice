@@ -853,3 +853,46 @@ def test_cancel_refunds_short_cut(tmp_path):
         assert d._count == 1, "已播 ≥0.6s 算真出声,不退"
 
     _run(_case())
+
+
+def test_set_enabled_instance_override(tmp_path):
+    """云档免垫话（2026-10-03）：实例级总闸——False 强制关（装配点按 a_reply
+    云档自动置位）、True 强制开（env=0 也开，A/B 用）、None 回 env 模块闸。"""
+
+    async def _case():
+        d_off, p_off = _director(tmp_path)
+        d_off.set_enabled(False)
+        await d_off._fire(0)
+        assert p_off.plays == [] and d_off._fired_lines == []
+        d_on, p_on = _director(tmp_path)
+        d_on.set_enabled(True)
+        await d_on._fire(0)
+        assert len(p_on.plays) == 1
+
+    _run(_case())
+
+
+def test_set_enabled_none_follows_env_gate(tmp_path, monkeypatch):
+    """None=回 env 模块闸：覆盖优先于 env；回模块闸后 BOK_FILLER=0 生效（旧闸
+    语义零变化）。"""
+
+    async def _case():
+        d, player = _director(tmp_path)
+        d.set_enabled(True)
+        assert d._on() is True
+        monkeypatch.setenv("BOK_FILLER", "0")
+        assert d._on() is True, "实例覆盖优先于 env"
+        d.set_enabled(None)
+        assert d._on() is False, "回模块闸"
+        await d._fire(0)
+        assert player.plays == []
+
+    _run(_case())
+
+
+def test_cloud_auto_gate_wired_in_agent():
+    """源级 pin：装配点按 a_reply 路由自动关垫话（云档）+ env 双向覆盖在场。"""
+    src = (ROOT / "apps" / "agent" / "agent_runtime" / "agent.py").read_text(encoding="utf-8")
+    assert "_filler.set_enabled(False)" in src
+    assert "_filler.set_enabled(True)" in src
+    assert "filler auto-off (cloud a_reply lane)" in src
