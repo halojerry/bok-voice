@@ -86,6 +86,10 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     # MiniMax ASR BCP-47 语言头外部枚举(粤语=yue,asr-1.0 /v1/speech_to_text 真字面量,
     # 同 language_boost 政策):只豁免带该枚举值的行,探针内部语言字段一律 cantonese。
     "scripts/probe_cloud_asr_ab.py": re.compile(r'"yue"'),
+    # 同族扩展(2026-10-03):probe_cloud_asr.py 的厂商标签已收口单点
+    # _VENDOR_LANG——MiniMax BCP-47(yue)与火山 SAUC language(yue-CN)两枚举
+    # 同宿一行;只豁免带该枚举值的行,内部语言字段一律 cantonese。
+    "scripts/probe_cloud_asr.py": re.compile(r'"yue"|yue-CN'),
     # 0e2ccad 归档件（0910-0913 历史 plan 文档/探针）：引述旧拼写均为决策记录与
     # 遗留 fixture 名匹配，非运行时语言字段——按行豁免，新文件仍全禁。
     "docs/superpowers/plans/2026-09-09-official-first.md": re.compile(r"yue"),

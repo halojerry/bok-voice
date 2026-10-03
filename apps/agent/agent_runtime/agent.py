@@ -2853,6 +2853,25 @@ def _endpointing_delays_from_env() -> tuple[float, float]:
     )
 
 
+def _llm_prewarm_local(llm_provider) -> bool:
+    """本地专有预热件（prefix prewarm / 投机预热）的 host 门（2026-10-03 I1c）。
+
+    routing openai 档 = 同款 MlxLlmLLM + 云 base_url——isinstance/hasattr 门
+    放行,但云端没有本地 KV 前缀缓存语义（DeepSeek 侧自动前缀缓存,本地预热
+    请求纯浪费+噪音）。判据=内芯 client base_url 是否本机 loopback
+    （_is_local_base_url 同源）;读不到底（替身/嵌入方）=True 保守照旧
+    （本地为主,零行为变化）。设置卡 deepseek 档（DeepSeekLLM）不经本门——
+    它不是 MlxLlmLLM,既有 isinstance 门已挡。
+    """
+    try:
+        base = str(getattr(getattr(llm_provider, "_client", None), "base_url", "") or "")
+    except Exception:  # noqa: BLE001 - 读不到=保守照旧
+        return True
+    if not base:
+        return True
+    return _is_local_base_url(base)
+
+
 def _prefix_prewarm_enabled() -> bool:
     """会话首轮「真实前缀预热」开关（LLM_PREFIX_PREWARM，默认 1）。"""
     return os.environ.get("LLM_PREFIX_PREWARM", "1") == "1"
@@ -4492,7 +4511,9 @@ async def entrypoint(ctx):
         if api_key:
             llm_provider = DeepSeekLLM(
                 api_key=api_key,
-                model=llm_cfg.get("model") or os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
+                # 缺省模型名 2026-10-03 更新：deepseek-chat/-reasoner 2026-07-24 已
+                # 停用（bok_voice_core.deepseek_llm 头部档案），现役 = deepseek-flash。
+                model=llm_cfg.get("model") or os.environ.get("DEEPSEEK_MODEL", "deepseek-flash"),
                 base_url=llm_cfg.get("base_url") or os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
             )
         else:
@@ -4543,6 +4564,9 @@ async def entrypoint(ctx):
         os.environ.get("BOK_PREFILL_SPEC", "1") == "1"
         and hasattr(llm_provider, "prefix_prewarm")
         and hasattr(llm_provider, "on_request_messages")
+        # host 门（2026-10-03 I1c）:routing openai 档=同款 MlxLlmLLM+云 URL——
+        # 投机预热在云端无 KV 语义,只烧钱增噪;本地逐字节旧行为。
+        and _llm_prewarm_local(llm_provider)
     ):
         from .prefill_speculator import PrefillSpeculator
 
@@ -5136,7 +5160,12 @@ async def entrypoint(ctx):
             print(f"[agent] intent rules load failed: {exc!r} (call {room_name})", flush=True)
     # 会话首轮真实前缀预热（LLM_PREFIX_PREWARM，默认 1）——触发点在开场白之后
     # （见下方 greeting 块），这里只定義任务体。
-    if _prefix_prewarm_enabled() and isinstance(_raw_llm, MlxLlmLLM) and instructions:
+    if (
+        _prefix_prewarm_enabled()
+        and isinstance(_raw_llm, MlxLlmLLM)
+        and _llm_prewarm_local(_raw_llm)
+        and instructions
+    ):
 
         async def _prefix_prewarm_task(agent_ref, greeting_text: str = "", *, metrics=None) -> None:
             import time as _t2

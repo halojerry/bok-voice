@@ -108,8 +108,9 @@ def test_kill_switch_and_max():
     finally:
         os.environ.pop("BOK_FILLER_MATCH", None)
     assert filler_match_enabled() is True
-    # MAX 12→6(2026-09-13 定档:垫话是补丁不是台词)
-    assert filler_max_per_call() == 6
+    # MAX:默认按语言档(2026-10-03 I2,en 垫话审计);env 显式=全局硬覆写
+    assert filler_max_per_call() == 8
+    assert filler_max_per_call("en") == 10
     os.environ["BOK_FILLER_MAX"] = "9"
     try:
         assert filler_max_per_call() == 9

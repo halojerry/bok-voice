@@ -309,12 +309,16 @@ def test_gap_env_default_and_override(monkeypatch):
     assert filler_gap_s() == 0.3
 
 
-def test_filler_max_default_is_six(monkeypatch):
+def test_filler_max_per_lang_defaults(monkeypatch):
     monkeypatch.delenv("BOK_FILLER_MAX", raising=False)
     from agent_runtime.fillers import filler_max_per_call
-    # 2026-09-13 乙节定档:罐头确定性命中后 12 次只会放大复读感——垫话是补丁
-    # 不是台词,6 发覆盖最差慢轮(旧 12 是随机池年代的补丁,见 plan 乙节 B3)。
-    assert filler_max_per_call() == 6
+    # 2026-10-03 I2(en 垫话审计):旧全局 6 在 en 长通话(9 arm 轮)尾部裸奔——
+    # 默认改按语言给档(en=10 / zh/粤=8 / 未知=8);env 显式=全局硬覆写
+    # (见 test_filler_max_per_lang_with_env_override)。
+    assert filler_max_per_call("en") == 10
+    assert filler_max_per_call("zh") == 8
+    assert filler_max_per_call("cantonese") == 8
+    assert filler_max_per_call() == 8
 
 
 def test_single_entry_category_pool_widens_on_recent_dedup(tmp_path):
@@ -784,3 +788,68 @@ def test_thinking_sound_configs_volume_clamp(monkeypatch):
         monkeypatch.setenv("BOK_AMBIENT_KEYBOARD_VOL", raw)
         cfgs = thinking_sound_configs()
         assert cfgs is not None and all(c.volume == want for c in cfgs), raw
+
+
+# ---- 2026-10-03 I2/I3(en 垫话审计修复:分类器英文补缺/退额/语言配额/英文桶) ----
+
+
+def test_classify_filler_category_en_audit_table():
+    """en 漏网补缺表驱动(late→empathy、where is my→check、Pinduoduo→ack、
+    Okay okay fine→minimal、how do I get compensated→check、无关键词→default)。"""
+    from agent_runtime.fillers import classify_filler_category
+
+    cases = {
+        "My parcel is a week late.": "empathy",
+        "Where is my parcel?": "check",
+        "How do I get compensated?": "check",
+        "I ordered it on Pinduoduo.": "ack",
+        "My tracking number is 5523108.": "ack",
+        "Okay okay, fine.": "minimal",
+        "Mm-hmm, okay.": "minimal",
+        "I will call you back tomorrow.": "default",
+    }
+    for text, want in cases.items():
+        assert classify_filler_category(text) == want, text
+
+
+def test_filler_max_per_lang_with_env_override(monkeypatch):
+    """env 显式=全局硬覆写;坏值=回落语言档(不吞成 0)。"""
+    from agent_runtime.fillers import filler_max_per_call
+
+    monkeypatch.setenv("BOK_FILLER_MAX", "9")
+    assert filler_max_per_call("en") == 9
+    assert filler_max_per_call("zh") == 9
+    monkeypatch.setenv("BOK_FILLER_MAX", "bad")
+    assert filler_max_per_call("en") == 10
+
+
+def test_context_bucket_en_keywords():
+    """I2:英文 goal/ref 也能拿 comp/query 桶(三通 fired 行 bucket 全空修复)。"""
+    from agent_runtime.fillers import derive_context_bucket
+
+    assert derive_context_bucket(has_steps=True, goal="Compensation plan", step_say_done=False) == "query"
+    assert derive_context_bucket(has_steps=True, goal="Compensation plan", step_say_done=True) == "comp"
+    assert derive_context_bucket(has_steps=True, goal="Track the parcel status", step_index=3) == "query"
+    assert derive_context_bucket(has_steps=True, goal="Say hi", step_index=1) == ""
+
+
+def test_cancel_refunds_short_cut(tmp_path):
+    """I3 退额:开播 <0.6s 被新用户轮掐掉的垫话退配额+清冷却账;≥0.6s 不退。"""
+
+    async def _case():
+        d, _player = _director(
+            tmp_path,
+            pools={"cantonese": ["好，等我睇下。", "收到，等陣。", "冇問題。"]},
+        )
+        await d._fire(0.0)  # 直调开火(绕 arm 定时器)
+        assert d._count == 1 and d._play_started > 0
+        d.cancel()  # 立即掐(<0.6s)
+        assert d._count == 0, "短掐必须退额"
+        assert d._last_fire_seq == -2 and d._last_fire_at == 0.0
+        await d._fire(0.0)  # 第二发:已播 ≥0.6s 再掐
+        assert d._count == 1
+        d._play_started = time.monotonic() - 1.0  # 模拟已播 1s
+        d.cancel()
+        assert d._count == 1, "已播 ≥0.6s 算真出声,不退"
+
+    _run(_case())

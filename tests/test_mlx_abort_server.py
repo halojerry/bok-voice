@@ -64,6 +64,7 @@ def _make_fake_mlx_server() -> types.ModuleType:
             self.sent_headers: list[tuple[str, str]] = []
             self.completion_request = None
             self.abort_handled = False
+            self.get_delegated = False
 
         # 真源码 APIHandler 的响应原语（_json_response 用）
         def send_response(self, status):
@@ -82,6 +83,10 @@ def _make_fake_mlx_server() -> types.ModuleType:
                 self.completion_request = req
             elif self.path == "/v1/abort":
                 self.abort_handled = True
+
+        def do_GET(self):
+            # 上游原版 do_GET：wrapper 的 /v1/models 接管以外路径走这里
+            self.get_delegated = True
 
         def handle_completion(self, request, stop_words):
             self.completion_request = request
@@ -202,6 +207,32 @@ def test_do_post_tags_request_with_header(wrapper):
     h2 = fake.APIHandler()
     h2.do_POST()
     assert getattr(h2.completion_request, "_bok_req_id", None) is None
+
+
+def test_models_endpoint_returns_loaded_model(wrapper, monkeypatch):
+    """I1e（2026-10-03）：/v1/models 接管为「本实例 --model」单条目。
+
+    上游实现=HF 缓存目录扫描（四口同组三模型轮转,检测/选型面被误导）——
+    本测钉接管后的如实单条目与非 models 路径的委托。"""
+    fake = _make_fake_mlx_server()
+    wrapper.install(fake)
+    monkeypatch.setattr(sys, "argv", ["bok_mlx_server.py", "--model", "/tmp/mx/model-x", "--port", "1237"])
+    h = fake.APIHandler(path="/v1/models")
+    h.do_GET()
+    assert h.status == 200
+    payload = json.loads(h.wfile.getvalue().decode())
+    assert [d["id"] for d in payload["data"]] == ["/tmp/mx/model-x"]
+    # 非 models 路径照旧委托上游（/health 走原 do_GET）
+    h2 = fake.APIHandler(path="/health")
+    h2.do_GET()
+    assert h2.get_delegated is True
+
+
+def test_loaded_model_id_parses_both_forms(wrapper, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["x", "--model=/tmp/a/b"])
+    assert wrapper._loaded_model_id() == "/tmp/a/b"
+    monkeypatch.setattr(sys, "argv", ["x"])
+    assert wrapper._loaded_model_id() == ""
 
 
 def test_generate_registers_and_attach_ctx(wrapper):
