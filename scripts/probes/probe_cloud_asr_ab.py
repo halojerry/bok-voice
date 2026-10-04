@@ -48,7 +48,7 @@ from pathlib import Path
 
 import httpx
 
-_SCRIPTS = Path(__file__).resolve().parent
+_SCRIPTS = Path(__file__).resolve().parents[1]  # G1c 入桶后 scripts/ 根=parents[1]
 sys.path.insert(0, str(_SCRIPTS))
 
 import probe_asr_digits_ab as dab  # noqa: E402

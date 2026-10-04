@@ -24,7 +24,7 @@ from pathlib import Path
 import httpx
 from livekit import rtc
 
-_SCRIPTS = Path(__file__).resolve().parent
+_SCRIPTS = Path(__file__).resolve().parents[1]  # G1c 入桶后 scripts/ 根=parents[1]
 sys.path.insert(0, str(_SCRIPTS))
 
 import e2e_real_customer as erc  # noqa: E402  复用骨架:建通/推流/收音/turns/日志窗口

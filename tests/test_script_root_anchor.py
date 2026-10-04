@@ -10,6 +10,10 @@
 白名单:
 - G1 引导头的 ``_S = _pathlib.Path(__file__).resolve().parents[1]``——
   头的语义就是 scripts/ 根,by design(见 §3.1);
+- **scripts 根锚**:变量名为 ``*_SCRIPTS``/``SCRIPTS_DIR``/``HERE``/``_HERE``
+  (尾段)时 ``parents[1]`` == scripts/ 根,是**正确**语义(随后常
+  ``.parent`` 推 repo 根);这类锚的坑在「单 .parent」形态,由第二个
+  测试钉;
 - ``probe_8khz_asr._load_e2e`` 的 ``parents[1] / "e2e"``——显式拼 scripts/e2e
   桶路径,by design;
 - scripts/cuda/**(独立交付包)与 scripts/archive/**(退役件)不检查。
@@ -42,7 +46,9 @@ def managed_bucket_scripts() -> list[Path]:
 
 
 def test_bucket_scripts_have_no_broken_repo_root_anchors():
+    """ROOT/REPO 命名的 parents[1]/parent.parent 锚 = repo 根语义错位,禁。"""
     offenders: list[str] = []
+    scripts_name = re.compile(r"^_?[A-Za-z]*_?(?:SCRIPTS|HERE)$|^(?:SCRIPTS_DIR)$")
     for p in managed_bucket_scripts():
         rel = p.relative_to(SCRIPTS).as_posix()
         allow = ALLOWLIST.get(rel)
@@ -54,13 +60,43 @@ def test_bucket_scripts_have_no_broken_repo_root_anchors():
             if "parents[1]" in line and "Path(__file__)" in line:
                 if allow and allow.search(line):
                     continue
+                var = line.split("=")[0].strip()
+                if scripts_name.match(var):
+                    continue  # scripts 根语义,合法
                 offenders.append(f"{rel}:{i}: parents[1] 锚(入桶后=scripts/,repo 根应 parents[2]): {line.strip()[:90]}")
             if re.search(r"\.parent\.parent\b", line) and "Path(__file__)" in line:
+                var = line.split("=")[0].strip()
+                if scripts_name.match(var):
+                    continue
                 offenders.append(f"{rel}:{i}: parent.parent 锚(同上): {line.strip()[:90]}")
     assert not offenders, (
         "桶内脚本出现 parents[1]/parent.parent 型 repo 根锚——入桶后这些值=scripts/ 而非"
-        f"仓库根,运行期才炸(见 G1c 战报)。要么 parents[2],要么把锚收进引导头。违例:\n"
+        "仓库根,运行期才炸(见 G1c 战报)。要么 parents[2],要么把锚收进引导头。违例:\n"
         + "\n".join(offenders)
+    )
+
+
+def test_bucket_scripts_no_scriptsdir_name_from_single_parent():
+    """名为 *SCRIPTS* 的锚变量不得来自单 .parent——顶层习惯(=scripts/)入桶后=本桶。
+
+    (check_schema_drift 的 `SCRIPTS_DIR` 断锚曾把 schema 门禁打红在 CI:
+    产物路径拼出 scripts/scripts/artifacts/...——正是这一族。)
+    """
+    offenders: list[str] = []
+    for p in managed_bucket_scripts():
+        rel = p.relative_to(SCRIPTS).as_posix()
+        for i, line in enumerate(
+            p.read_text(encoding="utf-8", errors="replace").splitlines(), start=1
+        ):
+            if (
+                "SCRIPTS" in line.split("=")[0]
+                and "Path(__file__)" in line
+                and re.search(r"resolve\(\)\.parent$", line.strip().rstrip(","))
+            ):
+                offenders.append(f"{rel}:{i}: {line.strip()[:90]}")
+    assert not offenders, (
+        "*SCRIPTS* 命名的锚用了单 .parent——入桶后那是本桶目录不是 scripts/ 根,"
+        "应 parents[1]。违例:\n" + "\n".join(offenders)
     )
 
 

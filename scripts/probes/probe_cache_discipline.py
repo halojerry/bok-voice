@@ -32,9 +32,9 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-_ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(_ROOT / ".." / "packages" / "core"))
-sys.path.insert(0, str(_ROOT / ".." / "apps" / "agent"))
+_ROOT = Path(__file__).resolve().parents[2]  # G1c 入桶后 repo 根=parents[2]
+sys.path.insert(0, str(_ROOT / "packages" / "core"))
+sys.path.insert(0, str(_ROOT / "apps" / "agent"))
 
 from measure_prompt import build_ctx  # noqa: E402
 

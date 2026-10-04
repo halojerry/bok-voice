@@ -68,7 +68,7 @@ import uuid
 from collections import Counter
 from pathlib import Path
 
-SCRIPTS_DIR = Path(__file__).resolve().parent
+SCRIPTS_DIR = Path(__file__).resolve().parents[1]  # G1c 入桶后 scripts/ 根=parents[1]
 ROOT = SCRIPTS_DIR.parent
 
 # smoke_postgres/dump_postgres_ddl 同款路径自举:本地裸 venv 也能 import 仓库内包;

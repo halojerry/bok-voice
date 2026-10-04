@@ -48,7 +48,7 @@ from urllib.parse import urlencode, urlparse
 import httpx
 from livekit import rtc
 
-_SCRIPTS = Path(__file__).resolve().parent
+_SCRIPTS = Path(__file__).resolve().parents[1]  # G1c 入桶后 scripts/ 根=parents[1]
 _ROOT = _SCRIPTS.parent
 sys.path.insert(0, str(_SCRIPTS))
 

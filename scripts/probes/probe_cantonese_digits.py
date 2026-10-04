@@ -35,7 +35,7 @@ import time
 from pathlib import Path
 
 # 允许 script 直接跑(imports agent_runtime,而 repo 根 apps/agent 要先入 path)
-_HERE = Path(__file__).resolve().parent
+_HERE = Path(__file__).resolve().parents[1]  # G1c 入桶后 scripts/ 根=parents[1]
 _REPO = _HERE.parent
 sys.path.insert(0, str(_REPO / "apps" / "agent"))
 
