@@ -31,7 +31,6 @@ import asyncio
 import json
 import math
 import os
-import re
 import struct
 import time
 import wave
@@ -387,7 +386,6 @@ async def run_cascade(run_no: int, template_id: str, *, timeout: float,
             mark = len(tap.main)
             bg_mark = len(tap.bg)
             pcm = await feed_wav(source, wav)
-            t_done = time.perf_counter()
             onset = await wait_first_audio(tap.main, mark, timeout)
             bg_onset = await wait_first_audio(tap.bg, bg_mark, 0.05)
             speech, silent = await wait_turn_end(tap.main, mark, timeout)
@@ -518,7 +516,6 @@ async def run_s2s(run_no: int, *, timeout: float, object_name: str,
             wav = CORPUS / name
             mark = len(tap.main)
             pcm = await feed_wav(source, wav)
-            t_done = time.perf_counter()
             onset = await wait_first_audio(tap.main, mark, timeout)
             speech, _silent = await wait_turn_end(tap.main, mark, timeout)
             ledger.poll()

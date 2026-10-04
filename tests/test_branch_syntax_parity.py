@@ -20,7 +20,6 @@ import importlib.util
 from pathlib import Path
 
 import pytest
-
 from agent_runtime import flow
 from bok_voice_core import branch_syntax
 

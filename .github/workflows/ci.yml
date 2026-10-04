@@ -37,9 +37,13 @@ jobs:
       - name: Ruff (style rules, new files only)
         # 两层门之二:风格类(E501/F401/I001…)只对**本 PR 新增**的 .py 强制
         # (存量不整体 reformat,治理计划定案;G2 拆包新模块天然生在全量规则下)。
+        # vendored 树(tojyutping_vendor / services/s2s fork)不追风格——保持可对上游
+        # diff;我们的自有码在 apps/packages/tools/scripts 下全量受检。
         run: |
           BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
-          ADDED=$(git diff --diff-filter=A --name-only "${BASE:-HEAD~1}...HEAD" -- '*.py' | grep -v '^packages/core/bok_voice_core/tojyutping_vendor/' || true)
+          ADDED=$(git diff --diff-filter=A --name-only "${BASE:-HEAD~1}...HEAD" -- '*.py' \
+            | grep -v '^packages/core/bok_voice_core/tojyutping_vendor/' \
+            | grep -v '^services/s2s/' || true)
           echo "new .py files: ${ADDED:-<none>}"
           if [ -n "$ADDED" ]; then xargs ruff check --no-cache <<< "$ADDED"; fi
       - name: Run pytest

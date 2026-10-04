@@ -2,8 +2,11 @@
 # pytest 配置在 pytest.ini 不动)。
 [tool.ruff]
 line-length = 120
-# vendored 粤拼库(上游 MIT,tab 缩进/长行是上游原样;我们的补丁也不在此树)
-extend-exclude = ["packages/core/bok_voice_core/tojyutping_vendor"]
+# vendored 树排除(上游原样,我们的补丁也不在此树追风格):
+#  - tojyutping_vendor:粤拼库(MIT),tab 缩进/长行是上游原样
+#  - services/s2s:HF speech-to-speech fork(含我们补丁=自有码,安全扫描
+#    按自有码修,但风格层保持可对上游 diff,不重排)
+extend-exclude = ["packages/core/bok_voice_core/tojyutping_vendor", "services/s2s"]
 
 [tool.ruff.lint]
 # 规范十条 R1(2026-10-04,Ethan「能被工具强制的才是规范」):Ruff 单工具链,

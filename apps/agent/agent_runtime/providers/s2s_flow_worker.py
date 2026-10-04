@@ -88,7 +88,6 @@ from livekit.agents import (
 from ..voice_style import VOICE_TAG_WHITELIST, strip_voice_style
 from .s2s_realtime import (
     DEFAULT_API_KEY,
-    DEFAULT_BASE_URL as _S2S_REALTIME_DEFAULT_BASE_URL,
     S2SRealtimeModel,
 )
 
@@ -129,7 +128,10 @@ FLOW_STEPS: dict[int, dict[str, str]] = {
         "advance": "客戶答確認、質疑或者反問都可以；聽完本輪回應，下一輪就要講第二步正稿。",
     },
     2: {
-        "script": "你件嘢係京東買嘅，寄去{address}嘅，單號尾號{tracking_tail}，而家喺我哋中轉倉，聽日可以派到。(breath)",
+        "script": (
+            "你件嘢係京東買嘅，寄去{address}嘅，單號尾號{tracking_tail}，"
+            "而家喺我哋中轉倉，聽日可以派到。(breath)"
+        ),
         "advance": "客戶有回應即可；下一輪就要講第三步正稿（收 WhatsApp 號碼）。",
     },
     3: {

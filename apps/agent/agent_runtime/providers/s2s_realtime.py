@@ -76,14 +76,18 @@ from typing import Any
 
 import aiohttp
 from livekit.agents import (
-    APIConnectOptions,
     DEFAULT_API_CONNECT_OPTIONS,
     NOT_GIVEN,
+    APIConnectOptions,
 )
 from livekit.agents.types import NotGivenOr
 from livekit.plugins.openai.realtime.realtime_model import (
     RealtimeModel as _OpenAIRealtimeModel,
+)
+from livekit.plugins.openai.realtime.realtime_model import (
     RealtimeSession as _OpenAIRealtimeSession,
+)
+from livekit.plugins.openai.realtime.realtime_model import (
     process_base_url,
 )
 from openai.types.realtime import RealtimeSessionCreateRequest
