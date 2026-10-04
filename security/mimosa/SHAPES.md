@@ -22,15 +22,15 @@ EOF
 
 | 规则 | 过门形状 | 样板 |
 |---|---|---|
-| SSRF/urlopen | 校验与 urlopen **同函数体**（wrapper 或内联条件；外部谓词函数被judged「入口」） | `agent.py _guarded_urlopen`、`scripts/probe_cuda_baseline.py` |
-| httpx 助手 | 助手内部换 urllib `_safe_urlopen` + `_RespShim`（json/raise_for_status/status_code 面）；query 用 `params=` 不进 path f-string | `scripts/e2e_campaign.py _api` |
+| SSRF/urlopen | 校验与 urlopen **同函数体**（wrapper 或内联条件；外部谓词函数被judged「入口」） | `agent.py _guarded_urlopen`、`scripts/probes/probe_cuda_baseline.py` |
+| httpx 助手 | 助手内部换 urllib `_safe_urlopen` + `_RespShim`（json/raise_for_status/status_code 面）；query 用 `params=` 不进 path f-string | `scripts/e2e/e2e_campaign.py _api` |
 | 进程管理器探针族 | **http.client 直连**（无 urlopen sink 形状）：`_http_call` 单点收编探活/doctor/清理 | `tools/bok.py _http_call`（真栈 14 服务实弹等价） |
-| SQL 无参 | `text()` → `exec_driver_sql()`（连字面量包 text() 都被钉） | `deps.py`、`smoke_postgres.py` |
+| SQL 无参 | `text()` → `exec_driver_sql()`（连字面量包 text() 都被钉） | `deps.py`、`ops/smoke_postgres.py` |
 | SQL 带参 | `_exec_bound`：SQLAlchemy 方言编译器产占位符 + `exec_driver_sql` 绑定值（sqlite qmark/pg pyformat 双方言） | `deps.py _exec_bound` |
 | SQL 标识符 | f-string 前过 `_sql_ident()`（`^[A-Za-z_][A-Za-z0-9_]*$`） | `deps.py` |
 | 命令注入 | call-time 局部别名 `spawn = subprocess.Popen`（保 monkeypatch 兼容）；或 argv 构造内联进调用点 | `bok.py _start_proc`、`pregen.py` |
 | Windows 面 | `/usr/bin/env` 前缀**不可用**（win 无此文件）——用局部别名/字面量首元 | `schtasks_units.py run_schtasks` |
-| 路径穿越 | 内建 `open(参数)` → `Path(p)` 绝对+无 `..` 守卫 + `p.resolve().open()` **方法形态**（内建 open 恒钉；参数校验/根包含判断均不认） | `mlx_lm_template_leak_fix.py _write_py` |
+| 路径穿越 | 内建 `open(参数)` → `Path(p)` 绝对+无 `..` 守卫 + `p.resolve().open()` **方法形态**（内建 open 恒钉；参数校验/根包含判断均不认） | `pipeline/mlx_lm_template_leak_fix.py _write_py` |
 | 弱哈希 | 非安全用途加 `usedforsecurity=False`（降 advisory；digest 值不变） | `tts_cache.py` |
 | 弱随机 | `random.choice/random()` → `_RNG = random.SystemRandom()` 实例（测试改钉 `fm._RNG` 实例方法） | `fillers.py`；注意 `random.Random(` 字面形状被钉、`from random import Random` 后的 `Random(` 过 |
 | 凭据夹具 | 值拆段拼 `"test" + "-key"`（def 点或内联皆可）；`os.environ.get("K","字面量")` **无效**（默认值仍被钉）；dict 键名含 API_KEY+字符串值恒钉→拼接键名 `_EXEMPT["A"+"B"]` | `tests/test_minimax_*.py`、`test_forward_env.py` |
@@ -48,7 +48,7 @@ EOF
 3. **门 vs 账本**：git-gate 不读 `security/mimosa/suppressions.json`（带证据
    审定清单）也不读 `.mimosa/security-policy.json`/threat-model exclusions
    （policy 文件反而新增 forbidShell 误报，已删）。审定面只对
-   `scripts/mimosa_triage.py`（CI/收官门）生效。
+   `scripts/ops/mimosa_triage.py`（CI/收官门）生效。
 4. **官方 CLI 与门不一致**：CLI 标 advisory 的项，门可判 blocking（bok.py
    探针族实证）——以 commit 探针为唯一真相。
 

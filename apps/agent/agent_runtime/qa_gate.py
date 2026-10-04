@@ -103,7 +103,7 @@ def qa_recall_k() -> int:
 def qa_recall_floor() -> float:
     """rank 默认分数地板(BOK_QA_RECALL_FLOOR,坏值回 0.40,钳 [0,1])。
 
-    0.40=golden 标定拐点(scripts/qa_match_report.py floor sweep):adjacent 负样本
+    0.40=golden 标定拐点(scripts/pipeline/qa_match_report.py floor sweep):adjacent 负样本
     入侵 0/20 档的最大召回(0.35 档 1/20、0.55 档丢 6pt 召回)。
     """
     try:

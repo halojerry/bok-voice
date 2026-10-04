@@ -135,7 +135,7 @@ python tools/bok.py prod uninstall  # 对称卸载
 
 LLM 另有功能探针 `_probe_llm`（max_tokens=1 真往返；预算 env `BOK_DOCTOR_LLM_PROBE_TIMEOUT_S` 默认 10s；空闲 >2h 权重页入 ~40s 会一次假警，重跑区分）。契约钉在 `tests/test_health_surface.py`。
 
-**常见坑**：Windows 交付节点优先用 `prod install --node-agent` 单任务模式（`docs/RUNTIME_TOPOLOGY.md` §3）；`schtasks /end` 只杀 Exec 动作进程，停栈靠 pidfile 精确补杀（`scripts/probe_windows_lifecycle.py` 实跑契约）。
+**常见坑**：Windows 交付节点优先用 `prod install --node-agent` 单任务模式（`docs/RUNTIME_TOPOLOGY.md` §3）；`schtasks /end` 只杀 Exec 动作进程，停栈靠 pidfile 精确补杀（`scripts/probes/probe_windows_lifecycle.py` 实跑契约）。
 
 ## 5. 鉴权开闸（auth-on 标准姿势）
 
@@ -231,7 +231,7 @@ sqlite3 "$HOME/Library/Application Support/BokVoice/bok_voice.db" ".backup /back
 - 删除话术模板会同步清空引用它的对象卡 `object_profiles.template_id`。
 - 删除知识文档会同时移除 vault 源文件。
 - 测试残留清理：`python tools/bok.py clean-testdata`（默认 dry-run 打印，`--apply` 才经 CP API 真删，审计可追溯）。
-**Supabase 镜像**（分发型云 CP）：`scripts/dump_postgres_ddl.py` 生成引导件、`scripts/smoke_postgres.py` 真库冒烟；CP→Supabase 必须走 Supavisor session pooler（IPv4 :5432，直连域名是 IPv6-only）；云侧 runbook=`deploy/cloud/README.md`。
+**Supabase 镜像**（分发型云 CP）：`scripts/ops/dump_postgres_ddl.py` 生成引导件、`scripts/ops/smoke_postgres.py` 真库冒烟；CP→Supabase 必须走 Supavisor session pooler（IPv4 :5432，直连域名是 IPv6-only）；云侧 runbook=`deploy/cloud/README.md`。
 
 ## 8. 交付前检查清单
 
@@ -242,7 +242,7 @@ sqlite3 "$HOME/Library/Application Support/BokVoice/bok_voice.db" ".backup /back
 - [ ] root 口令非文档示例值；web `/login` 登录、退出、匿名态（无 token）行为符合预期
 - [ ] 账号与权限：root/admin/user 三角色各建一枚，按 §9 矩阵抽查 403 面
 - [ ] 罐头物化：`python tools/bok.py tts-pregen --greetings --fillers --qa` 跑过（QA 快路只认有音频的词条）
-- [ ] 一通真 E2E 通话（普通话+粤语各一）：`E2E_ONLY=cantonese .venv312/bin/python scripts/e2e_trilingual_livekit.py`
+- [ ] 一通真 E2E 通话（普通话+粤语各一）：`E2E_ONLY=cantonese .venv312/bin/python scripts/e2e/e2e_trilingual_livekit.py`
 - [ ] 演示档状态确认：默认栈 `BOK_QWEN_REALTIME` 未设（:8084 不起）；若客户已购云端演示授权再按 §16 开
 - [ ] `BOK_CP_TOKEN` 已设置（只要机器暴露在局域网）；CP 默认只绑 127.0.0.1（对外监听须显式 `BOK_BIND_HOST=0.0.0.0`）
 - [ ] 术语门禁通过：`.venv312/bin/python -m pytest tests/test_cantonese_terminology.py -q`
@@ -369,17 +369,17 @@ web 导航三形态（`apps/web/components/session-context.tsx`）：
 
 ```bash
 # A. 通用种子包（推荐——跨环境迁移/交付基线包；2026-09-26 落地并实弹验证）
-python scripts/qa_bank.py export --account acc-001 --out seed.jsonl   # 既有环境导出（默认共享池，--include-shared 连个人词条）
-python scripts/qa_bank.py import --account acc-001 --file seed.jsonl --dry-run   # 先看计划（零写入）
-python scripts/qa_bank.py import --account acc-001 --file seed.jsonl --pregen    # 导入+顺手补录罐头
+python scripts/pipeline/qa_bank.py export --account acc-001 --out seed.jsonl   # 既有环境导出（默认共享池，--include-shared 连个人词条）
+python scripts/pipeline/qa_bank.py import --account acc-001 --file seed.jsonl --dry-run   # 先看计划（零写入）
+python scripts/pipeline/qa_bank.py import --account acc-001 --file seed.jsonl --pregen    # 导入+顺手补录罐头
 ```
 幂等键=（归一问法, 语言），归一单点复用 `packages/core` 的 `normalize_question`——重复导整包不炸；同义簇两段式导入自动重映射 `cluster_head_id`（源 id→新环境 id，head 被跳过时回退存量 id，断链自动降级独立条并告警，绝不写悬空引用）；`status` 子命令看词条数/语言分布/簇数/罐头物化三态。
 
 ```bash
 # B. 惜客通报表专用（存量素材：docs/海外仓话术演示.tar.gz / docs/AI自销话术.tar.gz）
-python scripts/import_xkt_qa.py --input tbl_ai_knowledge.json --account acc-001 --apply
+python scripts/seed/import_xkt_qa.py --input tbl_ai_knowledge.json --account acc-001 --apply
 ```
-默认 dry-run 打印计划；`--apply` 才入库（source=imported；Question 按 `&` 拆主条目+变体并回填 `cluster_head_id`；两层去重幂等，重跑安全）。步骤挂载留给画布拖线。以 `scripts/import_xkt_qa.py` 参数面为准。
+默认 dry-run 打印计划；`--apply` 才入库（source=imported；Question 按 `&` 拆主条目+变体并回填 `cluster_head_id`；两层去重幂等，重跑安全）。步骤挂载留给画布拖线。以 `scripts/seed/import_xkt_qa.py` 参数面为准。
 
 **② 学习循环=studio「场景学习」tab**（`apps/web/components/gap-mining.tsx`；需 reports 键）：
 - **覆盖率+漏网轮采集**：顶部大数=快路覆盖率；漏网轮=「AI 走了 LLM」的客户原话聚合，勾选→改好答案→采纳入库（人工确认才入库，同问法+语言幂等）。
@@ -420,7 +420,7 @@ python tools/bok.py tts-pregen --qa        # 全量补录（admin/root；云配�
 
 **仪表盘口径**（`GET /api/stats/dashboard`，首页 `apps/web/components/dashboard-page.tsx`）：接通只认 `status==ENDED` 且 disposition 不在 {no_answer, rejected, failed}；「今日」=本地午夜对应 UTC 边界起算。
 
-**战役循环内部**（campaign.py `_campaign_loop`，5s 巡检；mock 档演练与 E2E 全链 `scripts/e2e_campaign.py`）：
+**战役循环内部**（campaign.py `_campaign_loop`，5s 巡检；mock 档演练与 E2E 全链 `scripts/e2e/e2e_campaign.py`）：
 ① 收割：dialing/in_call 的名单项其通话已终态 → 落结果（幂等）；
 ② 串行补位：无进行中项且有 pending → 建通话+显式派单（metadata 带 dial 块）；
 ③ 名单尽 → done。起拨前 gap 冷却：最近终态项距今不足冷却秒不起下一通（首通不受门控）。
@@ -534,25 +534,25 @@ mock 档派生 `scripts/runtime/mock_callee.py` 子进程当虚拟客户（answe
 
 | 探针 | 验什么 | 主判据 |
 |---|---|---|
-| `e2e_trilingual_livekit.py` | A 线三语端到端（E2E_ONLY=zh/cantonese/en） | 三语全绿、0 丢转写 |
-| `e2e_barge_in.py` | 打断：AI 播报中插话 | 停声+恢复不哑火（interrupted=yes resumed=yes） |
-| `e2e_edge_cases.py` | 静音/超短音频不毒化链路 | 全绿 |
-| `e2e_interpret.py` | B 线双向同传 E2E | 双向译文落库+启停×3 |
-| `e2e_campaign.py` | 外呼战役全链（mock） | 接通/无人接/即挂三态+名册回写 |
-| `probe_branch_action.py` | 分支动作六腿真通话 | 每腿日志+turns 对账（kill 腿先以 `BOK_BRANCH_ACTION=0` 重启 serve） |
-| `probe_flow_graph.py` | 话术图 jump/play/then_jump/判据/跳步话面 | 日志族+turns（kill 腿先 `BOK_FLOW_GRAPH=0` 重启） |
-| `probe_qa_hit.py` | QA 快路（`--priority-duel`/`--rotation-duel` 离线） | 三档对照断言 |
-| `probe_interpret_latency.py` | B 线逐句感知延迟 | avg/逐句 ≤3500ms 预算 |
-| `probe_interp_backlog.py` / `probe_interp_continuous.py` / `probes/probe_interp_duplex.py` | B 线背压丢句/边说边译/全双工 | drop≥1 且原文零丢等（见脚本头） |
-| `probe_latency_soak.py` | 延迟/竞争态（拆轮/风暴/兜底） | 正常轮哑 ≥2 FAIL + p50/p95 预算计数（首指标 PERCEIVED） |
-| `probe_offscript_soak.py` | 话术外问题 5 主题×10 轮 | 哑轮/兜底哨兵+质量旗（改 prompt/兜底后必跑） |
-| `probe_filler_timing.py` | 垫话/首声 | 首声 <2.5s 预算 |
-| `probe_fast_speech.py` / `probe_brand_words.py` / `probe_hotword_ab.py` | 快语速吃字/品牌词切轮/热词 A/B | 见脚本头 |
-| `probe_reply_quality.py` | 真实轮次回放打本地 LLM | 三断言 |
-| `probe_killswitch.py` | 节点吊销→窒息→复活全链 | CI node-handshake 实跑 |
-| `node_handshake_smoke.py` | 节点 license/指纹握手 | 加固流 9 步 |
-| `load_audio_concurrency.py` / `load_cp_concurrency.py` | 通话并发/CP 并发 | 见脚本头（load_cp 需裸跑勿带 auth env） |
-| `probe_windows_lifecycle.py` | Windows 常驻生命周期 | B 段仅 Windows 实跑 |
+| `e2e/e2e_trilingual_livekit.py` | A 线三语端到端（E2E_ONLY=zh/cantonese/en） | 三语全绿、0 丢转写 |
+| `e2e/e2e_barge_in.py` | 打断：AI 播报中插话 | 停声+恢复不哑火（interrupted=yes resumed=yes） |
+| `e2e/e2e_edge_cases.py` | 静音/超短音频不毒化链路 | 全绿 |
+| `e2e/e2e_interpret.py` | B 线双向同传 E2E | 双向译文落库+启停×3 |
+| `e2e/e2e_campaign.py` | 外呼战役全链（mock） | 接通/无人接/即挂三态+名册回写 |
+| `probes/probe_branch_action.py` | 分支动作六腿真通话 | 每腿日志+turns 对账（kill 腿先以 `BOK_BRANCH_ACTION=0` 重启 serve） |
+| `probes/probe_flow_graph.py` | 话术图 jump/play/then_jump/判据/跳步话面 | 日志族+turns（kill 腿先 `BOK_FLOW_GRAPH=0` 重启） |
+| `probes/probe_qa_hit.py` | QA 快路（`--priority-duel`/`--rotation-duel` 离线） | 三档对照断言 |
+| `probes/probe_interpret_latency.py` | B 线逐句感知延迟 | avg/逐句 ≤3500ms 预算 |
+| `probes/probe_interp_backlog.py` / `probes/probe_interp_continuous.py` / `probes/probe_interp_duplex.py` | B 线背压丢句/边说边译/全双工 | drop≥1 且原文零丢等（见脚本头） |
+| `probes/probe_latency_soak.py` | 延迟/竞争态（拆轮/风暴/兜底） | 正常轮哑 ≥2 FAIL + p50/p95 预算计数（首指标 PERCEIVED） |
+| `probes/probe_offscript_soak.py` | 话术外问题 5 主题×10 轮 | 哑轮/兜底哨兵+质量旗（改 prompt/兜底后必跑） |
+| `probes/probe_filler_timing.py` | 垫话/首声 | 首声 <2.5s 预算 |
+| `probes/probe_fast_speech.py` / `probes/probe_brand_words.py` / `probes/probe_hotword_ab.py` | 快语速吃字/品牌词切轮/热词 A/B | 见脚本头 |
+| `probes/probe_reply_quality.py` | 真实轮次回放打本地 LLM | 三断言 |
+| `probes/probe_killswitch.py` | 节点吊销→窒息→复活全链 | CI node-handshake 实跑 |
+| `ops/node_handshake_smoke.py` | 节点 license/指纹握手 | 加固流 9 步 |
+| `bench/load_audio_concurrency.py` / `bench/load_cp_concurrency.py` | 通话并发/CP 并发 | 见脚本头（load_cp 需裸跑勿带 auth env） |
+| `probes/probe_windows_lifecycle.py` | Windows 常驻生命周期 | B 段仅 Windows 实跑 |
 
 ## 19. 常见故障速查
 
@@ -568,7 +568,7 @@ mock 档派生 `scripts/runtime/mock_callee.py` 子进程当虚拟客户（answe
 | dev monitor 杀掉在途通话 | 新版有 active_calls 否决（active_calls>0 恒不杀）；确认跑的是现行代码 | tools/bok.py `cmd_monitor` |
 | 换了代码 A/B 结果反了/行为怪 | **殭尸 worker**：`bok.py down` 杀不掉失联旧 worker——A/B 前后 `ps aux | grep agent_runtime` 必须为 0 再 serve | AGENTS.md「stack A/B 须防殭尸 worker」 |
 | GPU 满载屏幕冻结（无头栈还活着） | WindowServer GPU 饿死（≥4A+2B 混跑）；演示档压到 A≤2-3 路 | AGENTS.md 并发梯队 |
-| TTFT 随轮次越来越慢 | KV 前缀断裂；`BOK_LLM_MSG_DEBUG=1`+`scripts/llm_cache_report.py` 看 cached 是否逐轮增长 | docs/RUNTIME_TOPOLOGY.md §6；scripts/probe_llm_cache.py |
+| TTFT 随轮次越来越慢 | KV 前缀断裂；`BOK_LLM_MSG_DEBUG=1`+`scripts/ops/llm_cache_report.py` 看 cached 是否逐轮增长 | docs/RUNTIME_TOPOLOGY.md §6；scripts/probes/probe_llm_cache.py |
 | 粤语通话全通 VAD 判定不介入且首声慢 | `BOK_SMART_TURN` 开了——**粤语通话禁开**（默认就是 0，别设 1） | AGENTS.md smart-turn 条（2026-09-26 定案） |
 | 「AI 没走快答」但查库词条在 | 词条无物化音频（no_audio 落 LLM）或被四道闸旁路（数字/收号/收线）；`/qa` 状态面 + 体检 detail 双确认 | §11.1；control_plane/qa_drift.py |
 | 开场白/垫话音色和通话不一致 | 人设没配音色（回落默认）；看 `tts-pregen.log` 与 agent.log `BOK_FILLER voice_fallback`；补跑 `tts-pregen --greetings --fillers` | docs/RUNTIME_TOPOLOGY.md 本地 TTS 缓存节 |
@@ -597,13 +597,13 @@ python tools/bok.py prod install | prod status | prod uninstall
 # 模型/罐头
 python tools/bok.py download [--only asr llm ...]   python tools/bok.py tts-pregen --qa
 # QA 种子导入
-python scripts/import_xkt_qa.py --input tbl_ai_knowledge.json --apply
+python scripts/seed/import_xkt_qa.py --input tbl_ai_knowledge.json --apply
 # auth-on 标准姿势（见 §5）
 BOK_AUTH_REQUIRED=1 BOK_JWT_SECRET=... BOK_CP_TOKEN=... BOK_ROOT_USERNAME=root BOK_ROOT_PASSWORD=... python tools/bok.py serve
 # 验收三件套（需全栈）
-E2E_ONLY=cantonese .venv312/bin/python scripts/e2e_trilingual_livekit.py
-.venv312/bin/python scripts/e2e_barge_in.py
-.venv312/bin/python scripts/probe_offscript_soak.py
+E2E_ONLY=cantonese .venv312/bin/python scripts/e2e/e2e_trilingual_livekit.py
+.venv312/bin/python scripts/e2e/e2e_barge_in.py
+.venv312/bin/python scripts/probes/probe_offscript_soak.py
 ```
 
 > 本手册未尽处以代码为准：命令面=`tools/bok.py`；端点与闸=`apps/control-plane/control_plane/main.py`；

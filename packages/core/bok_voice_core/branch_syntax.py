@@ -2,9 +2,9 @@
 
 背景：分支行语法（正稿/分支/注意 + 动作标记）曾有四份拷贝各自为政——
 flow.py（运行时）、lib/flow-canvas.ts（画布 round-trip）、
-control_plane/gap_proposals.py（挖掘镜像）、scripts/prepare_csc_data.py
+control_plane/gap_proposals.py（挖掘镜像）、scripts/seed/prepare_csc_data.py
 （训练料）——繁体锚「如果客戶」只在训练料拷贝里被认，运行时静默丢弃
-种子粤语模板的整层分支（scripts/probe_s2s_vs_cascade.py 记录的实弹漂移）。
+种子粤语模板的整层分支（scripts/probes/probe_s2s_vs_cascade.py 记录的实弹漂移）。
 
 本模块收编正则三件套 + 动作常量 + parse_branch_action 纯函数：
   - flow.py re-export（模块别名 `_BRANCH_LINE_RE` 等保持旧名，钉测试不破）；

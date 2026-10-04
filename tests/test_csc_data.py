@@ -1,6 +1,6 @@
 """CSC 自训数据管道单测（2026-09-27）。
 
-覆盖 `scripts/prepare_csc_data.py` 与 `scripts/eval_csc_model.py` 的纯函数面：
+覆盖 `scripts/seed/prepare_csc_data.py` 与 `scripts/pipeline/eval_csc_model.py` 的纯函数面：
 
 - prepare 小样本（count=500）：条数/车道分布/identity 占比（yue identity ≥ 配比）、
   注入与 identity 的 src/tgt 关系、数字冻结（中文数字词句 src/tgt 数字段一致）、
@@ -32,8 +32,8 @@ def _load(name: str, rel: str):
     return mod
 
 
-prepare = _load("prepare_csc_data_under_test", "scripts/prepare_csc_data.py")
-evalu = _load("eval_csc_model_under_test", "scripts/eval_csc_model.py")
+prepare = _load("prepare_csc_data_under_test", "scripts/seed/prepare_csc_data.py")
+evalu = _load("eval_csc_model_under_test", "scripts/pipeline/eval_csc_model.py")
 
 
 def _build(count: int = 500, seed: int = 1234):

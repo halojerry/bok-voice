@@ -11,7 +11,7 @@ flow.py `_BRANCH_LINE_RE` 的镜像先例）。
 
 三源（kind）:
 - ``polish_fix``：客户轮过一遍运行时同款确定性音近纠错（``asr_polish.polish_transcript``，
-  与 scripts/prepare_csc_data.py 的「edits 非空即采」逐字同姿势），raw≠polished
+  与 scripts/seed/prepare_csc_data.py 的「edits 非空即采」逐字同姿势），raw≠polished
   时取**纠错后 span 的词**为候选（这就是 ASR 听错、应进词表让 ASR 偏置正确的词）。
 - ``near_miss``：客户轮**近似**命中「要求重复/没听清」规范用语族（编辑距离 ≤2 的
   同长窗口）——候选=该规范用语（让 ASR 把客户喊的「冇听清/再讲一次」识别稳）。

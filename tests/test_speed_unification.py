@@ -4,7 +4,7 @@
   1. 运行时回复(bidi/classic _ws_voice_setting.speed)
   2. 脚本直念线(_say_script/tts_cache 查找带 speed——tts_cache 自测另见)
   3. pregen 物化(scripts/pregen_tts speed=minimax_speed_for)
-  4. 垫话资产(scripts/gen_filler_assets FILLERS cfg.speed)
+  4. 垫话资产(scripts/seed/gen_filler_assets FILLERS cfg.speed)
 任何一层偏离=同一通里「开场白快、回复慢」的听感分裂(call-a2705ed2 实证族)。
 """
 
@@ -23,7 +23,11 @@ _REPO = Path(__file__).resolve().parents[1]
 
 
 def _load_script(name: str):
-    spec = importlib.util.spec_from_file_location(name, _REPO / "scripts" / f"{name}.py")
+    # G1c 分桶:脚本按语义桶存放,加载点带桶前缀(静态扫描可见)。
+    bucket = {"gen_filler_assets": "seed"}[name]
+    spec = importlib.util.spec_from_file_location(
+        name, _REPO / "scripts" / bucket / f"{name}.py"
+    )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod

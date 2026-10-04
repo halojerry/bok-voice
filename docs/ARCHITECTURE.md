@@ -29,7 +29,7 @@ Agent Worker (livekit-agents) ── ControlPlaneClient ── ContextInjector �
 - 协议：`apps/agent/agent_runtime/providers/volc_v3_protocol.py`（独立、可单测、可替换、可降级；失败回退 beep）。
 - 配置：`.env` 中 `VOLC_RESOURCE_ID=seed-tts-2.0`、`VOLC_SPEAKER=zh_female_vv_uranus_bigtts`；语种/方言用 `VOLC_LANGUAGE`（如 `vi`）/`VOLC_DIALECT`（如 `yue`），需配套支持该语种的音色。
 - **确定性 CI 路径**：`USE_FAKE_MEDIA=1` + `SCRIPTED_LLM=1`，`ScriptedLLM` 校验注入知识后输出指定话术；无云 API、无麦克风可跑。
-- **业务端到端**：`scripts/e2e_pipeline.py` 覆盖知识落盘/检索隔离/对象人设/注入→指定话术/结算。
+- **业务端到端**：`scripts/e2e/e2e_pipeline.py` 覆盖知识落盘/检索隔离/对象人设/注入→指定话术/结算。
 
 ---
 

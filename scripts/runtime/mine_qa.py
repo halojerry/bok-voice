@@ -59,7 +59,7 @@ def _safe_urlopen(req, *, timeout: float, data=None):
         raise PermissionError(f"出站 URL 未过护栏（拒发）: {req.full_url}")
     return urllib.request.urlopen(req, data=data, timeout=timeout)
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT / "packages" / "core") not in sys.path:
     sys.path.insert(0, str(ROOT / "packages" / "core"))
 

@@ -2,7 +2,7 @@
 
 覆盖：协议帧 round-trip / 请求配置（enable_lid+热词去重）/ 双鉴权头 / SSRF 护栏 /
 总闸 / _transcribe_once 单发 / 全流事件序（START→INTERIM→EOS→FINAL）/ interim
-去重 / 收线窗抑制 / live 失败整段重试。真端点冒烟另见 scripts/probe_cloud_asr.py
+去重 / 收线窗抑制 / live 失败整段重试。真端点冒烟另见 scripts/probes/probe_cloud_asr.py
 与 reports/cloud-asr/（2026-10-03 三语全量定案表）。
 
 驱动姿势备忘（livekit 1.7 基类语义）：RecognizeStream.__init__ 自启 _main_task→

@@ -38,7 +38,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parents[1]  # G1c 入桶后 scripts/ 根=parents[1](artifacts/隐藏 JSON 都住那)
 ARTIFACTS = HERE / "artifacts"
 ALLOWED_SCHEME = "http"
 ALLOWED_HOSTS = frozenset({"127.0.0.1"})

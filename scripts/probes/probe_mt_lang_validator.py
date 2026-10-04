@@ -50,7 +50,7 @@ import urllib.request
 from datetime import date
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parents[2]  # G1c 入桶后 repo 根=parents[2]
 sys.path.insert(0, str(REPO / "packages" / "core"))
 
 from bok_voice_core.mt_lang_check import (  # noqa: E402
@@ -60,7 +60,7 @@ from bok_voice_core.mt_lang_check import (  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# 网络白名单守卫(逐字照 scripts/snippet_seed_mining.py 的 guard_url 模式)
+# 网络白名单守卫(逐字照 scripts/pipeline/snippet_seed_mining.py 的 guard_url 模式)
 # ---------------------------------------------------------------------------
 
 class UrlGuardError(RuntimeError):

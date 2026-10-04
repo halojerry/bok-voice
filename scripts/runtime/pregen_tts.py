@@ -47,7 +47,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import quote
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 for _p in ("apps/agent", "packages/core"):
     _path = str(ROOT / _p)
     if _path not in sys.path:

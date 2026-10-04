@@ -20,7 +20,7 @@ import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
 _SPEC = importlib.util.spec_from_file_location(
-    "snippet_seed_mining", _ROOT / "scripts" / "snippet_seed_mining.py"
+    "snippet_seed_mining", _ROOT / "scripts" / "pipeline" / "snippet_seed_mining.py"
 )
 ssm = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(ssm)

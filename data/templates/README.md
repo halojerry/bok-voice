@@ -8,10 +8,10 @@
 ## 装载
 
 ```bash
-./pkgruntime-aside/python/bin/python3.12 scripts/load_compliant_templates.py            # dry-run
-./pkgruntime-aside/python/bin/python3.12 scripts/load_compliant_templates.py --apply
+./pkgruntime-aside/python/bin/python3.12 scripts/seed/load_compliant_templates.py            # dry-run
+./pkgruntime-aside/python/bin/python3.12 scripts/seed/load_compliant_templates.py --apply
 # 发布（冻结九键 + 罐头 pregen；pregen 需 TTS 可用——MiniMax 恢复后再开）：
-./pkgruntime-aside/python/bin/python3.12 scripts/load_compliant_templates.py --apply --publish
+./pkgruntime-aside/python/bin/python3.12 scripts/seed/load_compliant_templates.py --apply --publish
 ```
 
 - 幂等：按 name 匹配，存在则 PUT；**不动同名以外任何模板**（并存策略）。

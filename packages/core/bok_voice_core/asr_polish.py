@@ -18,7 +18,7 @@
   运行时,违背零依赖),变体表覆盖不到的错字一律原样放行。
 - en 车道走词级 snap:``vocab`` 给出品牌/热词英文形,按编辑距离 ≤2 吸附。
 
-资产来源与许可署名(构建期,详见 ``scripts/build_asr_variants.py``):
+资产来源与许可署名(构建期,详见 ``scripts/seed/build_asr_variants.py``):
 - 粤语:ToJyutping(BSD-2-Clause)+ rime-cantonese(rime_char.csv,CC-BY-4.0)。
 - 普通话:pypinyin(MIT)+ pycorrector 的 same_pinyin.txt / common_char_set.txt
   (Apache-2.0)。

@@ -8,7 +8,7 @@
 **落点 = 挂断后的异步面，绝不进实时轮**（§26.2-E7 明文）。消费点：纪要生成输入、
 QA 挖掘（``mine_qa_pairs``）输入、L-① 漏网轮挖掘输入——脏转写是 qa 簇不纯的主因之一。
 延迟不敏感，故这里只做**机制性**清洗，不做 LLM 改写（LLM 面另见
-``scripts/probe_polish_model.py`` 的 A/B）。
+``scripts/probes/probe_polish_model.py`` 的 A/B）。
 
 模板要求的五类变换（逐条落地，全确定性）：
 

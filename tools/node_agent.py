@@ -404,7 +404,7 @@ def serve_ui(ui_dir: Path, bind: str = "0.0.0.0", port: int = 3000) -> None:
 
 
 # ---- 远程停机开关（site-delivery Task 6，wire 契约见 control_plane/main.py
-# node_heartbeat 的 401 detail 塑形 + scripts/probe_killswitch.py ④⑤⑦⑨）----
+# node_heartbeat 的 401 detail 塑形 + scripts/probes/probe_killswitch.py ④⑤⑦⑨）----
 
 # 全栈停止钩子：full-stack 模式由 main 注入 bok.cmd_down 的幂等包装（kill 路径
 # 与 main finally 共享同一「只真停一次」旗标）；heartbeat-only/启动早期无栈

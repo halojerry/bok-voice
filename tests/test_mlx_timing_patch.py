@@ -32,7 +32,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT_PATH = ROOT / "scripts" / "mlx_lm_template_leak_fix.py"
+SCRIPT_PATH = ROOT / "scripts" / "pipeline" / "mlx_lm_template_leak_fix.py"
 WRAPPER_PATH = ROOT / "services" / "llm-mlx" / "bok_mlx_server.py"
 VENV_SERVER = (
     ROOT / "services" / "llm-mlx" / ".venv" / "lib" / "python3.12"

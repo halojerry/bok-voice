@@ -2183,7 +2183,7 @@ def token(req: TokenRequest, request: Request) -> TokenResponse:
     # 幽灵房 reaper 不可见——无 call 记录可循）。改前 grep scripts/ 全量核查 E2E
     # 依赖：三套 E2E（trilingual/barge-in/edge_cases）与全部 probe/soak/acceptance
     # 都是先 POST /api/calls 建单、再拿 call["id"] 当房名取 token——记录恒存在，
-    # 发布+dispatch 语义不变；唯一无记录用例是 scripts/load_cp_concurrency.py
+    # 发布+dispatch 语义不变；唯一无记录用例是 scripts/bench/load_cp_concurrency.py
     # 场景 D（load-{i}×50）：其自起 CP 无 LiveKit 凭据、依赖缺凭据 503（该检查
     # 在频控之前，行为不变），有凭据下拿 subscribe-only token 也只是不出 500，
     # 脚本断言不受扰；doctor 的 token 探针只验三段式 JWT，同样不受扰。

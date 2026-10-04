@@ -1,7 +1,7 @@
 """豆包（火山引擎）流式语音识别 —— LiveKit STT provider（2026-10-03 云 ASR 装线波）。
 
 协议：openspeech V3 族 SAUC 双向流式（``wss://.../api/v3/sauc/bigmodel``，二进制帧
-+ gzip；帧格式与 scripts/probe_cloud_asr.py 同源——探针为取证台架，本文件为生产
++ gzip；帧格式与 scripts/probes/probe_cloud_asr.py 同源——探针为取证台架，本文件为生产
 实现，协议语义改动两处同步）。
 
 设计定案（全部有 2026-10-03 实弹证据，见 probe 报告 reports/cloud-asr/）：

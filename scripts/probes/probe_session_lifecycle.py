@@ -44,9 +44,9 @@ import httpx
 from livekit import rtc
 from livekit.api import LiveKitAPI, ListRoomsRequest
 
-_SCRIPTS = Path(__file__).resolve().parent
+_SCRIPTS = Path(__file__).resolve().parents[1]  # G1c 入桶后 scripts/ 根=parents[1]
 sys.path.insert(0, str(_SCRIPTS))
-import e2e_real_customer as erc  # noqa: E402  复用:CONTROL_PLANE_URL/CP_HEADERS/tts_pcm/LOG_PATH
+import e2e_real_customer as erc  # noqa: E402  复用:CONTROL_PLANE_URL/CP_HEADERS/LOG_PATH
 
 _REPO_ROOT = _SCRIPTS.parent
 REPORTS_ROOT = _REPO_ROOT / "reports"

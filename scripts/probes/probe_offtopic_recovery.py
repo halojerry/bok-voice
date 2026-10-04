@@ -35,14 +35,14 @@ from pathlib import Path
 import httpx
 from livekit import rtc
 
-_SCRIPTS = Path(__file__).resolve().parent
+_SCRIPTS = Path(__file__).resolve().parents[1]  # G1c 入桶后 scripts/ 根=parents[1]
 sys.path.insert(0, str(_SCRIPTS))
 
 import e2e_real_customer as erc  # noqa: E402  复用骨架:建通/推流/收音/turns/日志窗口
 import probe_latency_soak as pls  # noqa: E402  复用:对齐/哨兵/首声等待
 import probe_offscript_soak as pos  # noqa: E402  复用:属性归轮/质量旗/轮循环形态
 
-REPORT_DIR = Path(__file__).resolve().parents[1] / "reports" / "offtopic-recovery"
+REPORT_DIR = Path(__file__).resolve().parents[2] / "reports" / "offtopic-recovery"
 
 # ---------------------------------------------------------------------------
 # 一套 8 轮：配合 → 跑题(算术) → 配合 → 跑题(天气) → 配合 → 跑题(闲聊) → 配合 ×2。

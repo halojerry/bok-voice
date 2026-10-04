@@ -1,4 +1,4 @@
-"""探针客户话音单点开关（scripts/probe_stimulus.py）离线测试(2026-09-21)。
+"""探针客户话音单点开关（scripts/lib/probe_stimulus.py）离线测试(2026-09-21)。
 
 全离线、零网络：local 档用假 httpx.Client 捕获「本该发出的请求」，
 钉死 URL/payload/sample_rate 与历史逐字节一致；cloud 档替换 _mm_pcm，
@@ -156,15 +156,15 @@ def test_cloud_delegates_to_mm_pcm(monkeypatch, fake_local):
 # --------------------------------------------------------------------------- #
 
 CONVERTED = [
-    "e2e_real_customer.py",
-    "e2e_barge_in.py",
-    "e2e_edge_cases.py",
-    "e2e_trilingual_livekit.py",
+    "e2e/e2e_real_customer.py",
+    "e2e/e2e_barge_in.py",
+    "e2e/e2e_edge_cases.py",
+    "e2e/e2e_trilingual_livekit.py",
     "runtime/mock_callee.py",
-    "probe_brand_words.py",
-    "probe_hotword_ab.py",
-    "probe_interp_continuous.py",
-    "probe_vad_head_syllable.py",
+    "probes/probe_brand_words.py",
+    "probes/probe_hotword_ab.py",
+    "probes/probe_interp_continuous.py",
+    "probes/probe_vad_head_syllable.py",
 ]
 
 
@@ -175,7 +175,7 @@ def test_converted_scripts_have_no_inline_sidecar_post(name):
     assert "stimulus_pcm" in src, f"{name} does not delegate to stimulus_pcm"
 
 
-@pytest.mark.parametrize("name", ["measure_latency.py", "ops/smoke_sidecars.py"])
+@pytest.mark.parametrize("name", ["bench/measure_latency.py", "ops/smoke_sidecars.py"])
 def test_deliberately_unconverted_scripts_keep_inline_post(name):
     # 这两个脚本走 24k/streaming 是 sidecar 自身测量/自测，刻意保留内联路径。
     src = (ROOT / "scripts" / name).read_text(encoding="utf-8")

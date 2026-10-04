@@ -147,14 +147,14 @@ python3 tools/bok.py doctor            # 判据：doctor: OK（dev 模式 warnin
 | # | 项 | 命令 | 判据 |
 |---|---|---|---|
 | T0 | 健康面 | §3 全部命令 | 全绿；`prod: OK` |
-| T1 | 打断回归（**两条护栏不得挡真插话**） | `CONTROL_PLANE_URL=… python3 scripts/e2e_barge_in.py` | `interrupted=yes`、stop_ms≈2.4-2.6s、`resumed=yes`（mac 基线 stop 2.4s） |
-| T2 | A 线三语真通话 | `E2E_ONLY=cantonese CONTROL_PLANE_URL=… python3 scripts/e2e_trilingual_livekit.py`（再跑 zh/en 腿） | 三语转写/回复语言正确、`sentences>0 canceled=0`；粤语话音句用脚本内置 9 字短句（勿改长句） |
-| T3 | 话术分支六腿（A-①② 真栈入口） | `CONTROL_PLANE_URL=… python3 scripts/probe_branch_action.py`（六腿 canned/refuse/handoff/jump/hold/kill） | 逐腿 PASS；kill 腿先 `BOK_BRANCH_ACTION=0` 重启 serve |
-| T4 | 缓存纪律（TTFT 归因，**llama-server 档**） | `MLX_URL=http://127.0.0.1:1235/v1 MLX_MODEL=<GGUF 文件名> python3 scripts/probe_cache_discipline.py --turns 8` | 定性三段成立：A 增长尾 TTFT 逐轮变差 / B 恒定尾持平 / C 截断尖峰。探针只允许环回地址（SSRF 白名单），llama-server 本机跑即合规；**`cached_tokens` 读数在 llama-server 的可用性先验一次**，不在则以 llama-server 日志 `promptscached/n_past` 为替代判据 |
-| T5 | 延迟 soak（长通话逐轮预算） | `CONTROL_PLANE_URL=… python3 scripts/probe_latency_soak.py` | 正常轮哑 ≥2 = FAIL；p50/p95 对照 [LATENCY_BUDGETS.md](LATENCY_BUDGETS.md) 记录**本平台基线**（mlx 数字勿套用） |
-| T6 | 意图挖掘（后台重活专线档） | `BOK_INTENT_MINE_URL=http://127.0.0.1:1237 python3 scripts/probe_intent_mine.py --db <真库副本>` | Linux 现**无 :1237**（settle 专线 MLX 专属）→ 二选一：①临时第二只 llama-server：`runtime/llama/llama-server --port 1237 -m <9B GGUF> --host 127.0.0.1 --n-gpu-layers all`，探针照跑；②本腿记 SKIP。**勿指 :1235**（与活通话争用，即 9B 抢 4B 的实弹事故形态） |
-| T7 | B 线同传（可选） | `CONTROL_PLANE_URL=… python3 scripts/e2e_interpret.py` | fwd/rev 译文落库、零丢句；MT :1236 缺 → 回退 :1235 可通但感知 lag 必涨，**只记数不套 3.5s 预算** |
-| T8 | offscript 质量（prompt/兜底改动后必跑） | `CONTROL_PLANE_URL=… python3 scripts/probe_offscript_soak.py` | 哑轮 0、质量旗（空答/整句复读）0；实录逐轮人工抽读 |
+| T1 | 打断回归（**两条护栏不得挡真插话**） | `CONTROL_PLANE_URL=… python3 scripts/e2e/e2e_barge_in.py` | `interrupted=yes`、stop_ms≈2.4-2.6s、`resumed=yes`（mac 基线 stop 2.4s） |
+| T2 | A 线三语真通话 | `E2E_ONLY=cantonese CONTROL_PLANE_URL=… python3 scripts/e2e/e2e_trilingual_livekit.py`（再跑 zh/en 腿） | 三语转写/回复语言正确、`sentences>0 canceled=0`；粤语话音句用脚本内置 9 字短句（勿改长句） |
+| T3 | 话术分支六腿（A-①② 真栈入口） | `CONTROL_PLANE_URL=… python3 scripts/probes/probe_branch_action.py`（六腿 canned/refuse/handoff/jump/hold/kill） | 逐腿 PASS；kill 腿先 `BOK_BRANCH_ACTION=0` 重启 serve |
+| T4 | 缓存纪律（TTFT 归因，**llama-server 档**） | `MLX_URL=http://127.0.0.1:1235/v1 MLX_MODEL=<GGUF 文件名> python3 scripts/probes/probe_cache_discipline.py --turns 8` | 定性三段成立：A 增长尾 TTFT 逐轮变差 / B 恒定尾持平 / C 截断尖峰。探针只允许环回地址（SSRF 白名单），llama-server 本机跑即合规；**`cached_tokens` 读数在 llama-server 的可用性先验一次**，不在则以 llama-server 日志 `promptscached/n_past` 为替代判据 |
+| T5 | 延迟 soak（长通话逐轮预算） | `CONTROL_PLANE_URL=… python3 scripts/probes/probe_latency_soak.py` | 正常轮哑 ≥2 = FAIL；p50/p95 对照 [LATENCY_BUDGETS.md](LATENCY_BUDGETS.md) 记录**本平台基线**（mlx 数字勿套用） |
+| T6 | 意图挖掘（后台重活专线档） | `BOK_INTENT_MINE_URL=http://127.0.0.1:1237 python3 scripts/probes/probe_intent_mine.py --db <真库副本>` | Linux 现**无 :1237**（settle 专线 MLX 专属）→ 二选一：①临时第二只 llama-server：`runtime/llama/llama-server --port 1237 -m <9B GGUF> --host 127.0.0.1 --n-gpu-layers all`，探针照跑；②本腿记 SKIP。**勿指 :1235**（与活通话争用，即 9B 抢 4B 的实弹事故形态） |
+| T7 | B 线同传（可选） | `CONTROL_PLANE_URL=… python3 scripts/e2e/e2e_interpret.py` | fwd/rev 译文落库、零丢句；MT :1236 缺 → 回退 :1235 可通但感知 lag 必涨，**只记数不套 3.5s 预算** |
+| T8 | offscript 质量（prompt/兜底改动后必跑） | `CONTROL_PLANE_URL=… python3 scripts/probes/probe_offscript_soak.py` | 哑轮 0、质量旗（空答/整句复读）0；实录逐轮人工抽读 |
 
 回归门槛句（与 AGENTS.md 同款）：改动 turns/audit/并发相关后 T1-T3 必跑；垫话/体感改动跑
 `probe_filler_timing`（首声 <2.5s 预算）；结果回填 §5 尾部与 plan §33.3 队列

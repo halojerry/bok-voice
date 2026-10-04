@@ -1,6 +1,6 @@
 {
   "schemaVersion": "mimosa-suppressions/v1",
-  "note": "Mimosa 扫描审定清单（家族级规则）。纪律：不宣称项目安全；每条带 evidence 锚；新扫描跑 scripts/mimosa_triage.py 看增量。verdict ∈ false-positive（证据充分的误阳）/ accepted-risk（知情接受，带理由与条件）/ fixed（本轮已修，复扫应消失或降级）。",
+  "note": "Mimosa 扫描审定清单（家族级规则）。纪律：不宣称项目安全；每条带 evidence 锚；新扫描跑 scripts/ops/mimosa_triage.py 看增量。verdict ∈ false-positive（证据充分的误阳）/ accepted-risk（知情接受，带理由与条件）/ fixed（本轮已修，复扫应消失或降级）。",
   "meta": {
     "seedScanId": "scan-2026-09-22T15-35-03.291Z-44f1c2c94126",
     "seedScanSeal": "sha256:dafd665318353df2943dfd6fb444377ff50bfaeb70e4d3ea3ac23df479dfbcef",
@@ -31,7 +31,7 @@
       "path_glob": "scripts/*",
       "verdict": "fixed",
       "reason": "探针/e2e/load 族出站基址已过 urlguard 本地诊断白名单（erc 底座 import 期闸+22 脚本直改；云端测试 BOK_PROBE_EXTRA_HOSTS 显式 opt-in）",
-      "evidence": "scripts/urlguard_gate.py; scripts/e2e_real_customer.py; tests/test_urlguard.py"
+      "evidence": "scripts/lib/urlguard_gate.py; scripts/e2e/e2e_real_customer.py; tests/test_urlguard.py"
     },
     {
       "id": "fixed-scripts-cp-api-entries",
@@ -39,7 +39,7 @@
       "path_glob": "scripts/*",
       "verdict": "fixed",
       "reason": "『_cp/_api 是 ssrf 入口』=同族脚本出站面，已由 urlguard gate 覆盖（同 fixed-scripts-urlguard-gate）",
-      "evidence": "scripts/urlguard_gate.py; scripts/e2e_campaign.py; scripts/probe_branch_action.py"
+      "evidence": "scripts/lib/urlguard_gate.py; scripts/e2e/e2e_campaign.py; scripts/probes/probe_branch_action.py"
     },
     {
       "id": "fp-scripts-pcm-constants",
@@ -47,7 +47,7 @@
       "path_glob": "scripts/*",
       "verdict": "false-positive",
       "reason": "read_pcm16 的文件名全部来自脚本内常量表/固定 fixtures 目录，无用户输入路径",
-      "evidence": "scripts/load_audio_concurrency.py:44 起 read_pcm16 定义与常量调用点"
+      "evidence": "scripts/bench/load_audio_concurrency.py:44 起 read_pcm16 定义与常量调用点"
     },
     {
       "id": "fixed-node-agent-outbound",
@@ -142,7 +142,7 @@
       "path_glob": "scripts/*",
       "verdict": "false-positive",
       "reason": "诊断脚本的测试数据节拍/采样抖动随机（erc 语音间隔、interp 推流 jitter、阈值重拟合采样），非安全语义",
-      "evidence": "scripts/e2e_real_customer.py; scripts/probe_interp_continuous.py; scripts/r2_threshold_refit.py"
+      "evidence": "scripts/e2e/e2e_real_customer.py; scripts/probes/probe_interp_continuous.py; scripts/pipeline/r2_threshold_refit.py"
     },
     {
       "id": "accepted-knowledge-source-ssrf",

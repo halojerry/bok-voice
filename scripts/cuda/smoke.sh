@@ -10,7 +10,7 @@
 #   [4/6] radix 前缀命中（信息位：同 prompt 两发测时差）
 #   [5/6] priority 竞争 A/B（信息位：饱和请求压住时高优短请求的时延对照）
 #   [6/6] bok 节点：单元 active + license/token 状态文件 + 云 CP 可达
-#   [--e2e] 追加端到端：scripts/probe_latency_soak.py 真栈一通（需全栈在跑）
+#   [--e2e] 追加端到端：scripts/probes/probe_latency_soak.py 真栈一通（需全栈在跑）
 #
 # 前置：bootstrap.sh 已跑完、env 文件已填、systemd 单元已 enable --now。
 # 探针姿势与仓内探针同源（curl 直打 OpenAI 兼容口；max_tokens=1 只量通不量质）。
@@ -192,7 +192,7 @@ if (( RUN_E2E == 1 )); then
       && CONTROL_PLANE_URL="${CONTROL_PLANE_URL:-http://127.0.0.1:8000}" \
          TTS_URL="${TTS_URL:-http://127.0.0.1:8788}" \
          BOK_CP_TOKEN="${BOK_CP_TOKEN:-}" \
-         "$E2E_PY" scripts/probe_latency_soak.py --scenario soak-canto \
+         "$E2E_PY" scripts/probes/probe_latency_soak.py --scenario soak-canto \
          --budget-perceived-ms "${BOK_E2E_BUDGET_PERCEIVED_MS:-3000}" )
     if (( $? == 0 )); then ok "端到端探针 PASS"; else bad "端到端探针 FAIL（读上方报告：哑轮/PERCEIVED 超预算/异常旗）"; fi
   fi

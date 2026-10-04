@@ -194,7 +194,7 @@ async def _both_prod(pcm: np.ndarray) -> tuple[dict, dict]:
 
 
 def main() -> None:
-    root = Path(__file__).resolve().parent.parent
+    root = Path(__file__).resolve().parents[2]  # G1c 入桶后 repo 根=parents[2]
     paths = sys.argv[1:] or [str(root / p) for p in DEFAULT_ASSETS]
     for p in paths:
         pcm = load_wav(p)

@@ -17,7 +17,7 @@ import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
 _SPEC = importlib.util.spec_from_file_location(
-    "probe_branch_action", _ROOT / "scripts" / "probe_branch_action.py")
+    "probe_branch_action", _ROOT / "scripts" / "probes" / "probe_branch_action.py")
 pba = importlib.util.module_from_spec(_SPEC)
 # 探针顶层 import livekit.rtc：真库在场先真导入（setdefault 空壳会让后跑的
 # test_flow_controller 等真库测试撞 ModuleNotFoundError——先跑谁谁绿的顺序污染,

@@ -7,7 +7,7 @@
   无 `"*"` 意图 → 落 LLM,逐字节同旧;
 - 孤儿意图门:intents 非空时每个常规意图至少要有一条 enabled 绑定(空图豁免);
 - 命名规范=软校验(`graph_warnings` 只出提示,绝不 400);意图 id 硬规则放宽到
-  snake_case(镜像 scripts/probe_intent_mine.py 的 `_ID_RE`,旧 `int_<8 hex>` 是其
+  snake_case(镜像 scripts/probes/probe_intent_mine.py 的 `_ID_RE`,旧 `int_<8 hex>` 是其
   子集 ⇒ 存量零影响),否则 P2.1 挖掘产物永远存不进图。
 
 离线面直测纯函数 + FlowController;agent.py graph 块的三件接线(兜底 fallback 位置/

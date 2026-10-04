@@ -50,7 +50,7 @@ CATCHALL_INTENT_ID = "*"
 _ID_RE = re.compile(r"^(?:int|bnd)_[0-9a-f]{8}$")
 # 意图 id 硬规则(P2.2 放宽):原 spec §3 是 `int_<8 hex>`(web 画布机器生成)。
 # P2.1 挖掘候选 id 是 snake_case 语义名(`whatsapp_contact`/`session_affirm`,
-# scripts/probe_intent_mine.py `_ID_RE` 逐字节同款)——**不入硬规则则挖掘产物永远
+# scripts/probes/probe_intent_mine.py `_ID_RE` 逐字节同款)——**不入硬规则则挖掘产物永远
 # 保存不了**,故意图 id 放宽到 snake_case(旧 `int_<8 hex>` 是其子集 ⇒ 存量数据
 # 零影响;形状坏仍 400)。绑定 id 保持 `bnd_<8 hex>`(机器生成,无人手写)。
 _INTENT_ID_RE = re.compile(r"^[a-z][a-z0-9_]*$")

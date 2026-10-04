@@ -22,7 +22,7 @@ cmd 语法限制：set "K=V" 的值不能含双引号（env 值都是路径/URL�
 
 本模块纯函数本位：只生成 XML 字符串 / argv 列表 / utf-16 落盘；唯一副作用出口
 run_schtasks() / apply_firewall_rules()，只被 bok.py prod 在 Windows 实机调用。
-生命周期实跑量尺：scripts/probe_windows_lifecycle.py B 段（M4 windows-latest CI）。
+生命周期实跑量尺：scripts/probes/probe_windows_lifecycle.py B 段（M4 windows-latest CI）。
 
 已知边界（schtasks /end 的触达，2026-09-16 M2-fix）：/end 只终止任务实例的
 Exec 动作进程（本仓恒为 cmd.exe），链式子进程（python.exe / livekit-server.exe

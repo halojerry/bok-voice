@@ -16,10 +16,10 @@ OFF、无 CLI 开关）——所以 Metal 档用独立无-CoreML 构建（build-
 附带单发转写延迟 Metal vs CoreML 对照（whisper-cli 打印的 load/encode/total 时间）。
 
 安全约束（硬性）：脚本内 HTTP 目标全部经 _url_ok() 白名单（仅 127.0.0.1:1235），
-模式抄 scripts/gpu_contention_probe.py。负载子进程按进程组管理（记录 PID，
+模式抄 scripts/bench/gpu_contention_probe.py。负载子进程按进程组管理（记录 PID，
 os.killpg 结束，禁 pkill）。产物：reports/asr-whisper-bench/ane-leg.json + ane-leg.md。
 
-用法： .venv312/bin/python scripts/asr_whisper_ane_leg.py [--samples 20] [--audio PATH]
+用法： .venv312/bin/python scripts/bench/asr_whisper_ane_leg.py [--samples 20] [--audio PATH]
       [--skip-metal] [--skip-coreml] [--no-single]
 """
 from __future__ import annotations
@@ -47,7 +47,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parents[2]  # G1c 入桶后 repo 根=parents[2]
 BENCH = Path.home() / ".cache" / "bok-bench"
 WHISPER_DIR = BENCH / "whisper.cpp"
 WHISPER_CLI_METAL = WHISPER_DIR / "build-metal" / "bin" / "whisper-cli"  # WHISPER_COREML=OFF
@@ -79,7 +79,7 @@ PROMPT_SYSTEM = (
 
 
 def _url_ok(url: str) -> bool:
-    """SSRF 护栏：host/port 白名单 + 解析地址必须回环（抄 scripts/gpu_contention_probe.py）。"""
+    """SSRF 护栏：host/port 白名单 + 解析地址必须回环（抄 scripts/bench/gpu_contention_probe.py）。"""
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme != "http":
         return False

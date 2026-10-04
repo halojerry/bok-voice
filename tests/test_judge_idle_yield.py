@@ -1,6 +1,6 @@
 """judge 让路闸（`_wait_link_idle`）判例——HEAD 2026-10-02 语义。
 
-背景（2026-09-22 `scripts/probe_gpu_contention.py` 实测）：9B judge 跑一次判据形状请求要
+背景（2026-09-22 `scripts/probes/probe_gpu_contention.py` 实测）：9B judge 跑一次判据形状请求要
 **4.5s**，占 GPU 期间 4B 的 prefill 往返从 853ms 涨到 **2228ms（+1375ms）**。旧实现是固定
 `FLOW_JUDGE_DELAY` 睡 3 秒，回合长于 3s 时必然撞下一轮 prefill；本闸改成「等到链路空闲窗」
 + 硬上限封顶防「永不开火=流程卡死」。

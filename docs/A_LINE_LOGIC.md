@@ -193,7 +193,7 @@ REFUSE `_REFUSE_RE`+`_HANGUP_RE`（软守卫「唔使担心」否决 366-369）�
 
 离线单测不算验收。本轮在**真栈**（真 LiveKit + 真 ASR/LLM + 真 MiniMax TTS，A 线 worker 换成施工分支代码）上跑真通话与真点击，证据落 `/tmp` 与 `reports/branch-action/`。
 
-### 8.1 探针 `scripts/probe_branch_action.py`（六腿，每腿一通真通话）
+### 8.1 探针 `scripts/probes/probe_branch_action.py`（六腿，每腿一通真通话）
 
 建自己的模板（6 步中文，第 2 步五条动作分支）+ 真 `/api/token` 建单 + TTS 渲染客户语音推流 + 按字节偏移切 agent.log + 拉 turns + `call_sessions` 对账；`--selftest` 离线自检 40 例，`--expect-off` 为 kill 腿。
 
@@ -246,7 +246,7 @@ REFUSE `_REFUSE_RE`+`_HANGUP_RE`（软守卫「唔使担心」否决 366-369）�
 | 探针 `handoff` / `jump` | PASS（`assist_status=notified` 真落库；`jump` 同轮 provider=branch-jump + 同位 `jump_noop`） |
 | 探针 `refuse` | **修复前 FAIL → 修复后 PASS**：修复前 `turn_gen_script_text_exact=0`/`no_llm_after_refuse=0`（第二片段成新轮把收线台词截断成「不好意思打扰了，」并落 LLM 兜话）；修复后六项判据全 1（台词完整、之后零 LLM、提交→挂断 14s） |
 | 探针 `hold` | PASS（`no_advance`/`stay_step2`/`trigger_answered` 全 1）；中途一次 FAIL 经查是**探针切窗 race**（warmup 轮身份步的 `rule=auto step=2` 串进触发窗）→ 修 harness（取 mark 前等日志落盘稳定），判据语义未动 |
-| 真打断回归 | `scripts/e2e_barge_in.py`：**BARGEIN PASS interrupted=yes stop_ms=2399 resumed=yes resume_ms=6006**（≈基线；两条 F2 护栏未挡真插话） |
+| 真打断回归 | `scripts/e2e/e2e_barge_in.py`：**BARGEIN PASS interrupted=yes stop_ms=2399 resumed=yes resume_ms=6006**（≈基线；两条 F2 护栏未挡真插话） |
 | F1 真验 | body 不带 account_id 建人设 → 真落 `acc-001`（修复前为 `""`）；`branch-canned-status` 返 `voice_source={"zh":"persona:…"}`（修复前无该键） |
 | F5/F6 真验（浏览器） | 视口 scale=**0.75**；引导语=「从上到下=通话顺序；点步骤卡即可编辑」+ 空态行「这个话术还没有设置意图（听到哪些话就跳步或播快答）。去「意图管理」添加 →」 |
 | F7 真验（浏览器） | 抽屉里改一条分支 → 点「应用」→ `已保存 ✓` 且**抽屉仍开着**（3 条分支的下拉都在、改动值保留） |

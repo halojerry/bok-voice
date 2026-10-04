@@ -31,7 +31,7 @@ from pathlib import Path
 
 import httpx
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 ASR = "http://127.0.0.1:8787"
 TTS = "http://127.0.0.1:8788"
 AUDIO_DIR = ROOT / "tests" / "fixtures" / "audio"

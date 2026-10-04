@@ -33,7 +33,7 @@ import subprocess
 import wave
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "reports" / "asr-whisper-bench" / "corpus"
 OUT_DEFAULT = ROOT / "reports" / "asr-whisper-bench" / "corpus-v2"
 VOICE = "Sinji"  # macOS 内建粤语声（zh_HK）

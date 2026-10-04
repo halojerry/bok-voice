@@ -48,6 +48,11 @@ jobs:
           if [ -n "$ADDED" ]; then xargs ruff check --no-cache <<< "$ADDED"; fi
       - name: Run pytest
         run: python -m pytest -q tests/
+      - name: Scripts import smoke (G1c)
+        # 每个受管脚本按「直接运行姿势」进程内 import——搬错桶/漏改 import/
+        # 引导头丢失在这里现形(治理计划 §G1c 验收令;SKIP-DEP=CI 精简环境缺
+        # 训练栈,预期内)。
+        run: python scripts/ops/import_smoke.py
 
   web:
     # name 必须与 main 分支保护的 required context 逐字一致("Web typecheck + export");
@@ -72,7 +77,7 @@ jobs:
         working-directory: apps/web
         run: npm test
       - name: Thin-client static probe (out/ 注入链形状 + 无烤死 localhost; runner python 即可,纯 stdlib)
-        run: python scripts/probe_thin_client_static.py
+        run: python scripts/probes/probe_thin_client_static.py
 
   bok:
     name: Launcher smoke
