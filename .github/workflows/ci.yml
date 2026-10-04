@@ -16,6 +16,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # ruff 新文件步需要与 base 的 diff 历史
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -27,6 +29,23 @@ jobs:
           pip install -e "apps/control-plane" -e "apps/agent[livekit]"
       - name: Type-check / compile
         run: python -m compileall -q apps packages tools scripts
+      - name: Ruff (real-bug rules, full tree)
+        # 规范十条 R1 两层门之一:真 bug 类规则全树恒绿(vendored tojyutping 由
+        # pyproject extend-exclude 排除)。改 select 须同步 pyproject 注释与
+        # .pre-commit-config.yaml。
+        run: ruff check --no-cache --select F821,F811,F601,F702,E722,E713,E714 apps packages tools scripts
+      - name: Ruff (style rules, new files only)
+        # 两层门之二:风格类(E501/F401/I001…)只对**本 PR 新增**的 .py 强制
+        # (存量不整体 reformat,治理计划定案;G2 拆包新模块天然生在全量规则下)。
+        # vendored 树(tojyutping_vendor / services/s2s fork)不追风格——保持可对上游
+        # diff;我们的自有码在 apps/packages/tools/scripts 下全量受检。
+        run: |
+          BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
+          ADDED=$(git diff --diff-filter=A --name-only "${BASE:-HEAD~1}...HEAD" -- '*.py' \
+            | grep -v '^packages/core/bok_voice_core/tojyutping_vendor/' \
+            | grep -v '^services/s2s/' || true)
+          echo "new .py files: ${ADDED:-<none>}"
+          if [ -n "$ADDED" ]; then xargs ruff check --no-cache <<< "$ADDED"; fi
       - name: Run pytest
         run: python -m pytest -q tests/
 

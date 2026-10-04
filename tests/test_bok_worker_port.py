@@ -123,10 +123,10 @@ def test_relaxed_healthy_worker_http_surface_follows_env(monkeypatch) -> None:
     monkeypatch.setenv("BOK_WORKER_PORT", "9081")
     seen: list[str] = []
 
-    def fake_urlopen(url, timeout=None):
+    def fake_http_call(url, method="GET", *, body=None, headers=None, timeout_s=10.0):
         seen.append(url)
         raise OSError("boom")
 
-    monkeypatch.setattr(bok.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(bok, "_http_call", fake_http_call)
     assert bok._relaxed_healthy(9081) is False
     assert seen and seen[0].endswith(":9081/worker"), seen

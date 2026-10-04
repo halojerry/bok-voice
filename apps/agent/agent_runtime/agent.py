@@ -58,6 +58,14 @@ from .control_plane import ControlPlaneClient
 # DR 容灾+可观测(契约 §1,2026-10-01):worker 四 kind 指标批量上报 CP——
 # 通道/节流/吞错纪律全在模块内,agent 侧只做采样与生命周期挂线。
 from .metrics_report import MetricsReporter, VadInferTracker
+# R3(2026-10-04) Sentry 关键路径上报:DSN(SENTRY_DSN,经 bok.py _FORWARD_ENV
+# 类同款 env 注入)缺席=no-op;worker 面真火点=看门狗触发+背景 judge 失败。
+from bok_voice_obs.sentry_hook import capture as _sentry_capture
+from bok_voice_obs.sentry_hook import init_sentry as _init_sentry
+
+
+class WatchdogTimeoutError(RuntimeError):
+    """看门狗真火(非顺延)哨兵类型——Sentry 按类型聚合哑轮事件,见 R3。"""
 # Laya 决策旁路(2026-09-26,docs/LAYA-EVAL.md):薄客户端+纯装配,日志由本模块统一
 # 打点;enabled 闸在最外层(意图=BOK_LAYA_JUDGE、QA 复核=BOK_LAYA_QA,两把 env 闸
 # 独立立法;2026-09-27 意图闸默认翻启 "1"、QA 复核仍默认 "0")。缺 sidecar=
@@ -175,16 +183,11 @@ def _a_reply_endpoint_alive(base_url: str, timeout_s: float = 1.0) -> bool:
     base = str(base_url or "").strip().rstrip("/")
     if not base:
         return False
-    import urllib.error
-    import urllib.request
 
     try:
-        # 无鉴权头:401/404 抛 HTTPError,与成功响应同判「端点在场」。
-        with contextlib.closing(
-            urllib.request.urlopen(f"{base}/models", timeout=timeout_s)  # noqa: S310
-        ):
-            return True
-    except urllib.error.HTTPError:
+        # 无鉴权头:任何 HTTP 应答(含 401/404/5xx)=端点在场;连接错误=死。
+        # 出站走 _http_call（http.client 闸门形状，tools/bok.py 同款）。
+        status, _ = _http_call(f"{base}/models", timeout_s=timeout_s)
         return True
     except Exception:  # noqa: BLE001 - URLError/超时/坏协议=死，绝不外抛
         return False
@@ -418,27 +421,54 @@ def _mlx_abort_endpoint(base_url: str) -> str:
     return f"{base}/abort" if base.endswith("/v1") else f"{base}{_MLX_ABORT_PATH}"
 
 
+def _http_call(url: str, method: str = "GET", *, body: bytes | None = None,
+               headers: dict | None = None, timeout_s: float = 5.0) -> tuple[int, bytes]:
+    """出站 HTTP 单点（http.client 直连，tools/bok.py 同形状——urlopen sink 的
+    污点规则与探针族结构性共存不了，http.client 无该形状且不跟随重定向）。
+    仅 http/https、host 非空、无 userinfo；返回 (status, body)；4xx/5xx 不抛
+    （status 原样返回，调用方自判）。"""
+    import http.client
+    import urllib.parse
+
+    parts = urllib.parse.urlsplit(str(url or ""))
+    host = (parts.hostname or "").lower()
+    if not (
+        parts.scheme in ("http", "https")
+        and bool(host)
+        and not parts.username
+        and not parts.password
+    ):
+        raise PermissionError(f"出站 URL 未过护栏（拒发）: {url}")
+    cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+    conn = cls(host, parts.port or (443 if parts.scheme == "https" else 80), timeout=timeout_s)
+    try:
+        req_path = parts.path or "/"
+        if parts.query:
+            req_path = f"{req_path}?{parts.query}"
+        conn.request(method, req_path, body=body, headers=headers or {})
+        resp = conn.getresponse()
+        return resp.status, resp.read()
+    finally:
+        conn.close()
+
+
 def _post_abort(base_url: str, req_id: str, timeout_s: float = 0.5) -> None:
     """同步 POST {base}/v1/abort（尽力中止;经 asyncio.to_thread 调用）。
 
     服务端契约见 services/llm-mlx/bok_mlx_server.py（body ``{"request_id": ...}``）。
-    走 urllib（零新依赖）;任何失败全吞——中止是尽力语义,绝不外抛。
+    任何失败全吞——中止是尽力语义,绝不外抛。
     """
     url = _mlx_abort_endpoint(base_url)
     if not url or not req_id:
         return
-    import urllib.request
 
     try:
-        body = json.dumps({"request_id": req_id}).encode()
-        req = urllib.request.Request(  # noqa: S310 - 本机 loopback 端点
-            url,
-            data=body,
-            method="POST",
+        _http_call(
+            url, "POST",
+            body=json.dumps({"request_id": req_id}).encode(),
             headers={"Content-Type": "application/json"},
+            timeout_s=timeout_s,
         )
-        with contextlib.closing(urllib.request.urlopen(req, timeout=timeout_s)):  # noqa: S310
-            pass
     except Exception:  # noqa: BLE001 - 中止尽力而为
         pass
 
@@ -3550,6 +3580,10 @@ async def entrypoint(ctx):
     from livekit.agents import Agent, AgentSession, StopResponse, TurnHandlingOptions, inference, stt
     from .providers.livekit_plugins import ContextState, DeepSeekLLM, ExprAwareLLM, lecture_guard
 
+    # R3 Sentry:worker 进程内初始化(SDK 集成挂 ASGI 无关的纯 capture 面;
+    # DSN 缺席/SDK 缺席=完整 no-op,绝不阻 job)。
+    _init_sentry("agent-worker")
+
     # 诊断探针须在 job 进程内安装:livekit job 由 JobExecutorProc 子进程执行,
     # run_agent()/worker 主进程的安装对 serving 进程无效。
     from .preemptive_debug import install_preemptive_debug
@@ -3815,8 +3849,7 @@ async def entrypoint(ctx):
     _routing_raw = str(settings.get("model_routing_json") or "")
 
     from .providers.doubao_asr import DoubaoSTT, doubao_asr_enabled
-    from .providers.livekit_plugins import (
-        DeepSeekLLM,
+    from .providers.livekit_plugins import (  # DeepSeekLLM 已在 entrypoint 头部导入(3574),此处不重复
         FakeLiveKitSTT,
         FakeLiveKitTTS,
         FakeLiveKitVAD,
@@ -3878,6 +3911,12 @@ async def entrypoint(ctx):
     # 本通已捕获过号码(captured/captured_implicit 任一):之後 WhatsApp 步嘅純短應承
     # 唔再判 offered(確認輪鎖死→逐字重複根因,detect_whatsapp_signal 文檔)。
     _wa_captured: dict = {"on": False}
+    # 逐轮 WA 信号 kind 的 entrypoint 级回看窗(2026-10-04 F821 根修):_wa_signal 是
+    # on_user_turn_completed 的轮局部元组,_filler_context_bucket(entrypoint 闭包,
+    # 兄弟作用域)够不着——此前恒 NameError 被 except 吞成 bucket=""(W2c 语境桶
+    # 从未活过)。on_user_turn_completed 每轮 detect 后写本 holder,闭包读它
+    # (_wa_captured 同款形状;空串=无信号)。
+    _turn_wa_signal: dict = {"kind": ""}
     # W4-T2 意向事实账本(2026-09-19):逐埋点累加(nudge/watchdog/storm/verdict/
     # graph notify),挂断时 _intent_facts_snapshot 快照评估意向规则——verdict 计数
     # 只在 agent 内存账本(方案 A),/end 带 intent_code+disposition 覆盖。
@@ -4101,6 +4140,12 @@ async def entrypoint(ctx):
             f"-> force-interrupt + ack (call {room_name}) "
             f"[P0.4 tail_chars={_tail_chars} llm_turns={_llm_turns}]",
             flush=True,
+        )
+        # R3(2026-10-04) 关键路径上报:看门狗真火=生产哑轮的头条信号(25 天
+        # 24 例级),DSN 未设=no-op。
+        _sentry_capture(
+            WatchdogTimeoutError(f"no assistant audio {_response_watchdog_s():.0f}s"),
+            lane="watchdog-fire", tail_chars=str(_tail_chars), llm_turns=str(_llm_turns),
         )
         try:
             await session.interrupt(force=True)  # 清僵死 speech(若有),释放队列
@@ -4972,15 +5017,17 @@ async def entrypoint(ctx):
 
     def _filler_context_bucket() -> str:
         """W2c 语境桶(fire 时点由 FillerDirector 惰性调用):闭包晚绑定,
-        任何信号缺失/异常吞掉回 ""=现行阶梯。verdict 走 flow_ctrl.last_verdict
-        (本轮局部名无流程轮未绑定,NameError 坑——调研底稿钉)。"""
+        任何信号缺失/异常吞掉回 ""=现行阶梯。verdict 走 flow_ctrl.last_verdict。
+        2026-10-04 F821 根修:本轮 WA 信号原先直读 on_user_turn_completed 轮局部
+        `_wa_signal`(兄弟作用域,恒 NameError→except→恒 ""),改读 entrypoint
+        holder `_turn_wa_signal`(on_user_turn_completed 逐轮写入)。"""
         try:
             from .flow import _looks_like_whatsapp_step as _llws
 
             _g, _r = flow_ctrl.current_goal_ref()
             return derive_context_bucket(
                 turn_provider=str(_current_lane.get("lane") or ""),
-                wa_signal_kind=(str(_wa_signal[0]) if _wa_signal else ""),
+                wa_signal_kind=str(_turn_wa_signal.get("kind") or ""),
                 wa_step=bool(_llws(_g, _r)),
                 wa_captured=bool(_wa_captured["on"]),
                 has_steps=bool(flow_ctrl.has_steps),
@@ -5992,7 +6039,13 @@ async def entrypoint(ctx):
         print(f"[judge] yield {verdict} (call {room_name})", flush=True)
         return verdict
 
-    async def _background_flow_judge(step_at: int, utt: str, turn_key: str = "", garbled: bool = False) -> None:
+    async def _background_flow_judge(
+        step_at: int,
+        utt: str,
+        turn_key: str = "",
+        garbled: bool = False,
+        invalidate_preemptive=None,
+    ) -> None:
         """背景跑 LLM 推進判定:唔好喺開聲前同步等(會每輪拖慢),判定完喺下一輪先生效。
 
         唔會 double-advance:只喺 flow 仲喺 judge 嗰步(step_at)時先落 advance。
@@ -6001,6 +6054,12 @@ async def entrypoint(ctx):
         garbled(FIX-2(b),D2-3):本轮是 garbled band(烂转写/碎片)——streak 三处
         写点(note_turn_outcome/degrade_boost/bump_unclear_streak)全部跳过:判定
         对象本身就是噪声,喂 streak=把 ASR 病算模型头上。
+        invalidate_preemptive(2026-10-04 F821 根修):unclear-advance 分支要落
+        抢跑失效标记——`_invalidate_stale_preemptive` 定义在 on_user_turn_completed
+        局部(本函数的兄弟作用域,闭包不可见),此前直呼名字=推进后必 NameError、
+        被宽 except 吞成 `judge(bg) failed`,同 try 块下游的 register_followup
+        消费被整段跳过。调用方(on_user_turn_completed)把自己的 invalidator
+        传进来;None(旧调用形态/测试)时跳过标记,零行为变化。
         """
         try:
             # 让路节流:主回复刚提交,先等一拍、再等到链路真空闲才喺 :1235 跑 judge——
@@ -6156,7 +6215,8 @@ async def entrypoint(ctx):
                             if wa_confirm_advance_allowed(goal=_gu, ref=_ru, captured=_wa_captured["on"]):
                                 flow_ctrl.advance()
                                 _push_flow_state(context_state, flow_ctrl)
-                                _invalidate_stale_preemptive("unclear 连续 → 推进")
+                                if invalidate_preemptive is not None:
+                                    invalidate_preemptive("unclear 连续 → 推进")
                                 _advanced_uc = True
                                 print(
                                     f"[flow] unclear-advance step={flow_ctrl.current + 1} "
@@ -6203,6 +6263,7 @@ async def entrypoint(ctx):
                     print(f"[followup] idempotent hit, no re-ack (call {room_name})", flush=True)
         except Exception as exc:  # pragma: no cover - 背景判定失敗唔影響回覆
             print(f"[flow] judge(bg) failed: {exc!r} (call {room_name})", flush=True)
+            _sentry_capture(exc, lane="judge-bg", step=str(step_at))  # R3:背景判定失败可聚合
         finally:
             _judge_inflight["step"] = -1
 
@@ -6482,6 +6543,7 @@ async def entrypoint(ctx):
             # WhatsApp 对接触发:喺 flow 推进【前】偵測(step context 係舊步/當前步,offered 先啱);
             # 客戶俾號碼(captured)照推下一步;應承加但未俾號碼(offered)→ 唔自動跳,等 AI 叫佢俾號碼。
             _wa_signal: tuple | None = None
+            _turn_wa_signal["kind"] = ""  # 轮首清零(holder 见 entrypoint _wa_captured 邻 comment)
             user_text = str(getattr(new_message, "text_content", None) or "")
             # EX-2 跨轮复读防线「复问放行」闸(PART C):客户若在复述/追问上一问
             # (本轮用户话与最近一条客户话高度相似 ≥0.8),模型复讲关键内容是正确
@@ -6904,6 +6966,7 @@ async def entrypoint(ctx):
                     _wa_channel["v"] = _wa_ch
                     if _wa_signal:
                         _kind, _num = _wa_signal
+                        _turn_wa_signal["kind"] = str(_kind)  # 闭包回看窗(_filler_context_bucket)
                         if _kind in ("captured", "captured_implicit"):
                             _wa_captured["on"] = True
                         if _kind == "captured_implicit":
@@ -7294,7 +7357,13 @@ async def entrypoint(ctx):
                                 _judge_inflight["step"] = _step_at
                                 # 池化(2026-09-17 全量 debug P2-A):judge 任务丢失=
                                 # 该轮不推进(下轮规则补位)——强引用+失败打点防静默。
-                                _spawn_report(_background_flow_judge(_step_at, user_text, turn_key=_turn_key, garbled=_garbled_band_round))
+                                _spawn_report(_background_flow_judge(
+                                    _step_at,
+                                    user_text,
+                                    turn_key=_turn_key,
+                                    garbled=_garbled_band_round,
+                                    invalidate_preemptive=_invalidate_stale_preemptive,
+                                ))
                     # stall 账本规则路(漏斗 v2,spec §3.1):每轮判决记账——UNCLEAR
                     # 且步未变 +1(下方 judge 路同 key 去重只计 1);推进/其它 verdict
                     # 清该步计数(清零语义在方法内)。推进轮 verdict 以 "" 记

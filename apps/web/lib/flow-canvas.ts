@@ -44,11 +44,15 @@ export type StepRefParts = {
   notes: string;
 };
 
-// flow.py:96 `_BRANCH_LINE_RE` 的逐语义移植：锚词 | 条件(1..120 非贪婪) | \s*→\s* | 应答(\S.*)。
-// 捕获组 1=锚词原文（EN 大小写变体原样保留,序列化按原文回写,不做 EN→中改写）;
+// bok_voice_core/branch_syntax.BRANCH_LINE_RE 的逐语义移植：锚词 | 条件(1..120 非贪婪) | \s*→\s* | 应答(\S.*)。
+// 锚词简繁并收(如果客户/如果客戶——2026-10-04 C1:种子粤语模板的繁体分支此前整层
+// 静默失效,四实现同步并收;单源在 packages/core,本文件是 TS 镜像,由
+// tests/test_branch_syntax_parity.py 源级 pin 钉住字面一致)。
+// 捕获组 1=锚词原文（EN 大小写变体原样保留,序列化按原文回写,不做 EN→中改写;
+// 繁体锚同 EN 锚策略——解析认、序列化恒规范简体形,round-trip 不变量不破）;
 // 组 3=箭头两侧原始分隔（F8 分隔符保真：解析记下、序列化原样回写,匹配行为与旧
 // `\s*→\s*` 逐字节一致,只是多捕获一份）。应答=箭头后首个非空白字符起。
-const BRANCH_RE = /^(如果客户|(?:If|When)\s+the\s+customer)\s*(.{1,120}?)(\s*→\s*)(\S.*)$/i;
+const BRANCH_RE = /^(如果客户|如果客戶|(?:If|When)\s+the\s+customer)\s*(.{1,120}?)(\s*→\s*)(\S.*)$/i;
 // flow.py:99 `_NOTE_LINE_RE` 的逐语义移植。
 const NOTE_RE = /^(?:注意|Notes?)\s*[:：]\s*(.+)$/i;
 
@@ -140,9 +144,11 @@ export type BranchAction = "" | "hold" | "refuse" | "handoff" | "jump";
 
 export type BranchActionInfo = { action: BranchAction; step: number; text: string };
 
-/** flow.py `_BRANCH_ACTION_RE` 逐语义移植：^【\s*(kind)\s*】\s*;kind 内部自带空白容错
- * （【 收线 】/【跳第 3 步】）;\d{1,3} 限 1..999——4 位以上步号整体不认作标记（原样保留）。 */
-const BRANCH_ACTION_RE = /^【\s*(收线|挂断|转人工|跳第\s*(\d{1,3})\s*步|留本步)\s*】\s*/;
+/** branch_syntax.BRANCH_ACTION_RE 逐语义移植：^【\s*(kind)\s*】\s*;kind 简繁并收
+ * （收线|收線|挂断|掛斷|转人工|轉人工——与 Python 单源同步,2026-10-04 C1）;
+ * kind 内部自带空白容错（【 收线 】/【跳第 3 步】）;\d{1,3} 限 1..999——4 位以上
+ * 步号整体不认作标记（原样保留）。 */
+const BRANCH_ACTION_RE = /^【\s*(收线|收線|挂断|掛斷|转人工|轉人工|跳第\s*(\d{1,3})\s*步|留本步)\s*】\s*/;
 
 /** jump 步号钳制：非 1..999 整数一律按 1（引擎侧 jump_to 另有越界钳制,这里是编辑面保底）。 */
 function clampJumpStep(step: number): number {
@@ -150,8 +156,8 @@ function clampJumpStep(step: number): number {
   return Number.isInteger(n) && n >= 1 && n <= 999 ? n : 1;
 }
 
-/** 拆分支应答首部动作标记 → (action, step, 纯文本)。规则（与 flow.py 逐语义一致）：
- * 收线|挂断→("refuse",0,余文);转人工→("handoff",0,余文);留本步→("hold",0,余文);
+/** 拆分支应答首部动作标记 → (action, step, 纯文本)。规则（与 branch_syntax.parse_branch_action 逐语义一致）：
+ * 收线|收線|挂断|掛斷→("refuse",0,余文);转人工|轉人工→("handoff",0,余文);留本步→("hold",0,余文);
  * 跳第N步 且 N≥1→("jump",N,余文);跳第0步→标记已消费但无动作("",0,余文);
  * 无标记/空→("",0,resp 原样,逐字节不动)。step 只在 action==="jump" 时有意义。 */
 export function parseBranchAction(resp: string): BranchActionInfo {
@@ -160,8 +166,11 @@ export function parseBranchAction(resp: string): BranchActionInfo {
   if (!m) return { action: "", step: 0, text: s };
   const kind = String(m[1] ?? "");
   const rest = s.slice(m[0].length);
-  if (kind === "收线" || kind === "挂断") return { action: "refuse", step: 0, text: rest };
-  if (kind === "转人工") return { action: "handoff", step: 0, text: rest };
+  if (kind === "收线" || kind === "收線" || kind === "挂断" || kind === "掛斷") {
+    // 与 Python 侧同款：收线台词剥首尾空白（正则已消费标记后空白,这里兜尾）。
+    return { action: "refuse", step: 0, text: rest.trim() };
+  }
+  if (kind === "转人工" || kind === "轉人工") return { action: "handoff", step: 0, text: rest };
   if (kind === "留本步") return { action: "hold", step: 0, text: rest };
   const n = Number(m[2] ?? "0");
   if (!(n >= 1)) return { action: "", step: 0, text: rest }; // 跳第0步：标记消费、无动作

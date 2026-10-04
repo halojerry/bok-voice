@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 
 from bok_voice_core.flow_graph import validate_flow_graph
 from bok_voice_core.intent_rules import validate_conditions
+from bok_voice_core.metrics_kinds import METRICS_KINDS_LITERAL
 from bok_voice_core.model_routes import (
     LANES as MODEL_LANES,
     PROVIDER_OPENAI as MODEL_PROVIDER_OPENAI,
@@ -81,6 +82,12 @@ from .deps import (
 )
 from .capacity import capacity_snapshot, format_limit_detail
 from .dispatch_utils import cleanup_dispatch, has_active_dispatch
+from .errors import (
+    ConflictError as PipelineConflictError,
+    UnavailableError as PipelineUnavailableError,
+    register_pipeline_error_handler,
+)
+from bok_voice_obs.sentry_hook import init_sentry
 from .nodes_store import HEARTBEAT_INTERVAL_S, LicenseError, NodeStore
 from .permissions import (
     DEFAULT_ADMIN_PERMISSIONS,
@@ -179,6 +186,73 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
+class _RoutingProbeResp:
+    """http.client 响应的最小 httpx 兼容面（raise_for_status/json）。"""
+
+    def __init__(self, status: int, body: bytes):
+        self.status_code = status
+        self._body = body
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}: {self._body[:200]!r}")
+
+    def json(self):
+        return json.loads(self._body.decode("utf-8"))
+
+
+def _routing_http_request(method: str, url: str, **kw):
+    """路由测试端点出站单点：url 来自路由表/settings（运维配置面）。
+
+    准入姿态：https=云端 vendor 档放行（TLS 面）；http=仅环回/RFC1918 私网
+    （本地 mlx/CUDA 形态）——**link-local 恒拒**（169.254.0.0/16=云元数据
+    服务段：路由表被打穿时不得让 CP 带 Bearer key 探元数据面）；http 打
+    公网（明文凭据外送形态）恒拒；userinfo 恒拒。不过闸=ValueError（调用
+    方 except 统一 ok=false）。出站走 http.client（无重定向跟随）。"""
+    import http.client
+    import urllib.parse as _up
+
+    parts = _up.urlsplit(url)
+    host = (parts.hostname or "").lower()
+    if not host or parts.username or parts.password:
+        raise ValueError(f"出站 URL 未过护栏（拒发）: {url}")
+    scheme_ok = parts.scheme == "https"
+    if not scheme_ok and parts.scheme == "http":
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            ip = None
+        if ip is not None:
+            # 恒拒 link-local（含 169.254/16 元数据段）；is_private 在 Python
+            # 语义里也罩着 169.254/16——必须显式排除后才能用作私网判据。
+            scheme_ok = (ip.is_loopback or ip.is_private) and not (
+                ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+            )
+        else:
+            scheme_ok = host == "localhost"
+    if not scheme_ok:
+        raise ValueError(f"出站 URL 未过护栏（http 仅限环回/RFC1918 私网，https 放行）: {url}")
+    headers = dict(kw.get("headers") or {})
+    body = kw.get("json")
+    if body is not None:
+        import json as _json
+
+        body = _json.dumps(body).encode("utf-8")
+        headers.setdefault("Content-Type", "application/json")
+    timeout_s = float(kw.get("timeout", 10))
+    cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+    conn = cls(host, parts.port or (443 if parts.scheme == "https" else 80), timeout=timeout_s)
+    try:
+        req_path = parts.path or "/"
+        if parts.query:
+            req_path = f"{req_path}?{parts.query}"
+        conn.request(method.upper(), req_path, body=body, headers=headers)
+        resp = conn.getresponse()
+        return _RoutingProbeResp(resp.status, resp.read())
+    finally:
+        conn.close()
+
+
 def _resolved_bind_host(argv: list[str] | None = None) -> str:
     """CP 预定 bind 地址的运行时视图。两个来源（与 tools/bok.py 单点对齐）：
 
@@ -219,6 +293,13 @@ app = FastAPI(
     redoc_url=None if auth_required() else "/redoc",
     openapi_url=None if auth_required() else "/openapi.json",
 )
+# R2(2026-10-04) CP 统一异常族:PipelineError→{"detail","stage"}(detail 文案
+# 与既有 HTTPException 面逐字节同形,stage 为加法键)。
+register_pipeline_error_handler(app)
+# R3(2026-10-04) Sentry 接线:DSN 走 env(SENTRY_DSN),缺席=完整 no-op;
+# SDK 的 FastAPI 集成自动捕获端点未处理异常。traces 0.2/无 PII 见
+# bok_voice_obs.sentry_hook 模块纪律。
+init_sentry("control-plane")
 # 注册顺序=洋葱层次（后注册者在最外层）。identity_gate 必须**第一个**注册（最内层）：
 # 它要在 CorrelationMiddleware 内层运行——读取其 correlation 并覆写 user_id=已验证
 # 身份，审计 actor 由此自动落账（见 auth.py 模块注释）。
@@ -938,7 +1019,7 @@ def test_model_routing(req: ModelRoutingTestRequest, request: Request) -> dict:
     started = time.monotonic()
     try:
         if not model:
-            resp = httpx.get(f"{route.base_url}/models", timeout=10, headers=headers)
+            resp = _routing_http_request("GET", f"{route.base_url}/models", timeout=10, headers=headers)
             resp.raise_for_status()
             ids = [str(d.get("id") or "") for d in (resp.json().get("data") or [])]
             # 与 bok._probe_llm 同款：mlx_lm 的 /models 列**全模型目录**，绝对路径 id
@@ -948,7 +1029,8 @@ def test_model_routing(req: ModelRoutingTestRequest, request: Request) -> dict:
         if not model:
             return {"ok": False, "latency_ms": 0, "model": "",
                     "error": "端点未返回可用模型（/models 空）"}
-        resp = httpx.post(
+        resp = _routing_http_request(
+            "POST",
             f"{route.base_url}/chat/completions",
             # messages 必带：mlx_lm handle_chat_completions 首行 assert "messages" in
             # body——缺字段=断言炸 handler、连接直接断（RemoteProtocolError 实证）。
@@ -2398,7 +2480,7 @@ def _create_call_in(repo, req: CreateCallRequest, created_by: str = "") -> dict:
                    detail={"mode": req.mode, "kind": req.kind,
                            "reason": _famine_block["reason"],
                            "famine": _famine_block["famine"]})
-            raise HTTPException(status_code=409, detail="节点饥荒降档中，暂停新建单")
+            raise PipelineConflictError("节点饥荒降档中，暂停新建单", stage="call.create.famine")
     # 并发准入 + 重复建单防重（2026-09-27）：建单前拒，绝不先建后杀。
     # 作用域=mode=live（真实业务 A 线通话，吃本机单并发 LLM/GPU 的车道）；
     # simulation（训练/画布试跑）与 realtime_demo（云端 S2S，不吃本地 GPU）不受限
@@ -2442,7 +2524,7 @@ def _create_call_in(repo, req: CreateCallRequest, created_by: str = "") -> dict:
                         _audit("call.reject_duplicate", subject_type="call", subject_id=_c.get("id", ""),
                                account_id=req.account_id, call_id=_c.get("id", ""),
                                detail={"object_id": req.object_id, "existing_status": _c.get("status") or ""})
-                        raise HTTPException(status_code=409, detail="该对象已有进行中的通话")
+                        raise PipelineConflictError("该对象已有进行中的通话", stage="call.create.duplicate")
     # 会话清单：读取全局策略(offline_first/cloud_first)与已配置 provider，
     # 并把话术快照到 call（审计「这场用了哪版话术」）。
     # 话术优先级：显式指定（外呼战役/话务员自选）> 对象卡绑定。
@@ -5320,7 +5402,9 @@ def qa_cluster_ep(req: QaClusterRequest, request: Request, account_id: str = "ac
     # ——409 让前端重新生成;未带任何选择(NULL)的「采纳全部」可安全重算。
     has_selection = select is not None or hotword_select is not None
     if req.apply and has_selection and not qa_cluster_mod.has_fresh_plan(account_id, min_calls, limit):
-        raise HTTPException(status_code=409, detail="聚类计划已过期或参数不符，请重新生成计划后再采纳")
+        raise PipelineConflictError(
+            "聚类计划已过期或参数不符，请重新生成计划后再采纳", stage="qa.cluster"
+        )
     try:
         # fresh_only(2026-10-02 TOCTOU 二道闸):带选择时取计划只吃缓存不重算——
         # 一道闸与本行之间缓存被并发作废(apply 成功/闲时采纳都清账号键)的话,
@@ -5335,11 +5419,15 @@ def qa_cluster_ep(req: QaClusterRequest, request: Request, account_id: str = "ac
             _repo(), request, account_id, plan, select, hotword_select, audit=_audit
         )
     except qa_cluster_mod.AlreadyRunning as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise PipelineConflictError(str(exc), stage="qa.cluster") from exc
     except qa_cluster_mod.PlanStaleError as exc:
-        raise HTTPException(status_code=409, detail="聚类计划已失效，请重新生成计划后再采纳") from exc
+        raise PipelineConflictError(
+            "聚类计划已失效，请重新生成计划后再采纳", stage="qa.cluster"
+        ) from exc
     except qa_cluster_mod.ClusterError as exc:
-        raise HTTPException(status_code=503, detail=f"聚类 LLM 不可用: {exc}") from exc
+        raise PipelineUnavailableError(
+            f"聚类 LLM 不可用: {exc}", stage="qa.cluster"
+        ) from exc
 
 
 # ---- 垫话罐头库(2026-09-13 乙节):确定性语境命中,镜像 qa_entries ----
@@ -6583,8 +6671,18 @@ def provider_health(request: Request) -> dict:
     llm-gaps/qa-drift 观测家族，与 web 报表页门控一致。
     """
     _gate_page(request, "reports")
-    vault = Path(os.environ.get("VAULT_ROOT", "./data/vault"))
-    return scan_provider_health(vault.parent / "logs")
+    # env 源路径就地收敛（读路径闸，三层）：'..' 段拒绝 → resolve 绝对化 →
+    # 必须落在部署树内（cwd 相对包含；越树=拒绝——跨机部署把 VAULT_ROOT 指到
+    # 树外的场景读不到本机日志，available=false 诚实降级本来就是这个语义）。
+    # 文件名纯净守卫在 provider_health._safe_log_path（第四层）。
+    _vault_raw = os.environ.get("VAULT_ROOT", "./data/vault")
+    _vault_p = Path(_vault_raw)
+    if ".." in _vault_p.parts:
+        return JSONResponse(status_code=400, content={"error": "VAULT_ROOT 不得含 '..' 段"})
+    _logs_dir = (_vault_p.resolve().parent / "logs").resolve()
+    if not _logs_dir.is_relative_to(Path.cwd().resolve()):
+        return JSONResponse(status_code=400, content={"error": "VAULT_ROOT 必须位于部署树内"})
+    return scan_provider_health(_logs_dir)
 
 
 @app.get("/api/objects/{object_id}/topics")
@@ -7382,9 +7480,13 @@ async def supervisor_end(call_id: str, request: Request, disposition: str = "dec
 
 
 class AgentMetricSample(BaseModel):
-    """单条指标样本（契约 §1：kind 枚举固定四种，ms 毫秒）。"""
+    """单条指标样本（契约 §1：kind 枚举固定四种，ms 毫秒）。
 
-    kind: Literal["llm_ttft", "asr_transcribe", "tts_first_audio", "vad_infer"]
+    kind 单源=``bok_voice_core.metrics_kinds.METRICS_KINDS_LITERAL``（worker
+    上报/CP 滚动窗/schema 三面共用；改枚举同步该模块，勿在本文件回抄字面量）。
+    """
+
+    kind: METRICS_KINDS_LITERAL
     ms: float
     ts: str = ""
 

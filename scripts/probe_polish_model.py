@@ -4,7 +4,7 @@
 问题：确定性润色（``bok_voice_core.polish``）已覆盖删口水词/删重复/改口取后值/口语
 数字规范化。**再挂一跳 LLM 有没有增益？** 若有，4B（:1235）还是 9B（:1237）？
 
-本探针在 R1 真实语料（``scripts/.r1_gold.20260921.json``，152 条真实客户轮）上取
+本探针在 R1 真实语料（``scripts/artifacts/.r1_gold.20260921.json``，152 条真实客户轮）上取
 一批脏转写，对每条跑三路：确定性润色基线 / 4B 润色 / 9B 润色，然后用**确定性判据**
 （复用 ``output_guard`` 的硬保护 token / 语言漂移 / 硬否定判定 + 一个「新增内容字符」
 启发式）打分，并把 **原文/三路输出逐条留档**，供人重判。
@@ -31,12 +31,31 @@ import json
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "packages" / "core"))
+
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def _safe_urlopen(req, *, timeout: float):
+    """出站闸门（tools/bok.py 同形状）：urlopen 前就地校验 Request.full_url
+    ——仅 http/https、host 非空、无 userinfo；不过闸=PermissionError。
+    本探针目标=本地 LLM 诊断端点（缺省 :1235/:1237 环回）。"""
+    parts = urllib.parse.urlsplit(req.full_url)
+    host = (parts.hostname or "").lower()
+    if not (
+        parts.scheme in ("http", "https")
+        and (host in _LOOPBACK_HOSTS or bool(host))
+        and not parts.username
+        and not parts.password
+    ):
+        raise PermissionError(f"出站 URL 未过护栏（拒发）: {req.full_url}")
+    return urllib.request.urlopen(req, timeout=timeout)
 
 from bok_voice_core.output_guard import (  # noqa: E402
     GuardPolicy,
@@ -45,8 +64,9 @@ from bok_voice_core.output_guard import (  # noqa: E402
 )
 from bok_voice_core.polish import polish_text  # noqa: E402
 
-CORPUS = ROOT / "scripts" / ".r1_gold.20260921.json"
-DEFAULT_OUT = ROOT / "scripts" / f".probe_polish_model.{date.today():%Y%m%d}.json"
+ARTIFACTS = ROOT / "scripts" / "artifacts"
+CORPUS = ARTIFACTS / ".r1_gold.20260921.json"
+DEFAULT_OUT = ARTIFACTS / f".probe_polish_model.{date.today():%Y%m%d}.json"
 
 # E7 润色模板的**压缩版**（口径与 plan §26.2-E7 的 formalWritingPromptTemplate 一致：
 # 只做机械清理、绝不回答问题、绝不新增信息、数字串不动、只输出润色文本）。
@@ -118,7 +138,8 @@ def _new_content_chars(source: str, out: str) -> int:
 
 
 def _load_models(base: str) -> list[str]:
-    with urllib.request.urlopen(base.rstrip("/") + "/v1/models", timeout=10) as resp:
+    req = urllib.request.Request(base.rstrip("/") + "/v1/models")
+    with _safe_urlopen(req, timeout=10) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     return [item.get("id", "") for item in data.get("data", [])]
 
@@ -150,7 +171,7 @@ def _chat(base: str, model: str, text: str, timeout: int = 120) -> str:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout) as resp:
+    with _safe_urlopen(request, timeout=timeout) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     return (data["choices"][0]["message"].get("content") or "").strip()
 
@@ -181,6 +202,11 @@ def main() -> int:
     parser.add_argument("--base-4b", default="http://127.0.0.1:1235")
     parser.add_argument("--base-9b", default="http://127.0.0.1:1237")
     args = parser.parse_args()
+
+    if not args.dry_run:
+        from urlguard_gate import gate
+
+        gate(args.base_4b, args.base_9b)  # 本地诊断白名单（缺省 :1235/:1237 环回直过）
 
     corpus = json.loads(args.corpus.read_text(encoding="utf-8"))
     samples = select_samples(corpus, args.limit)

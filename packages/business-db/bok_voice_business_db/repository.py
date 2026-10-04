@@ -149,24 +149,18 @@ class SqlAlchemyBusinessRepository:
         条件 UPDATE——终态判定与写入在同一语句内求值,并发签发不可能复活终态。
         语义与旧读-写块等价:ringing/active/paused → active;ended/failed 不动。
         """
-        from sqlalchemy import update as _sa_update
         from sqlalchemy import and_
 
-        stmt = (
-            _sa_update(models.CallSession)
-            .where(
-                and_(
-                    models.CallSession.id == call_id,
-                    models.CallSession.status.notin_(
-                        [CallStatus.ENDED.value, CallStatus.FAILED.value]
-                    ),
-                )
+        res = self.session.query(models.CallSession).filter(
+            and_(
+                models.CallSession.id == call_id,
+                models.CallSession.status.notin_(
+                    [CallStatus.ENDED.value, CallStatus.FAILED.value]
+                ),
             )
-            .values(status=CallStatus.ACTIVE.value)
-        )
-        res = self.session.execute(stmt)
+        ).update({models.CallSession.status: CallStatus.ACTIVE.value}, synchronize_session=False)
         self.session.commit()
-        return bool(res.rowcount)
+        return bool(res)
 
     def delete_call(self, call_id: str) -> bool:
         """删除通话及连带数据(turns/settlements)。审计事件保留(只读历史)。"""
@@ -665,17 +659,19 @@ class SqlAlchemyBusinessRepository:
         无对象=E2E 脚本 /api/start 免 object_id 路径的测试/合成残留(「湾仔活道」
         197 通 fixture 实证);采集期散客进线会自动建档,该依赖已写进采集手册。
         """
-        stmt = (
-            select(models.Turn, models.CallSession.account_id, models.ObjectProfile.display_name)
+        query = (
+            self.session.query(
+                models.Turn, models.CallSession.account_id, models.ObjectProfile.display_name
+            )
             .join(models.CallSession, models.Turn.call_id == models.CallSession.id)
             # outerjoin:call.object_id 是普通列无外键约束,对象可能已删/缺失
             .outerjoin(models.ObjectProfile, models.CallSession.object_id == models.ObjectProfile.id)
             .order_by(models.Turn.call_id, models.Turn.created_at)
         )
         if account_id:
-            stmt = stmt.where(models.CallSession.account_id == account_id)
+            query = query.filter(models.CallSession.account_id == account_id)
         grouped: dict[str, list[dict]] = {}
-        for row, _acct, obj_name in self.session.execute(stmt):
+        for row, _acct, obj_name in query:
             # obj_name is None = 无对象通话(outerjoin 未命中),与测试前缀族一并滤
             if exclude_test_objects and (obj_name is None or is_test_object_name(obj_name)):
                 continue

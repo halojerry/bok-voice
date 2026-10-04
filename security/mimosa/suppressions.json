@@ -151,6 +151,14 @@
       "verdict": "accepted-risk",
       "reason": "markdown_source=知识库源抓取适配器（URL 来自 admin 配置的知识源，抓取即特性）；管理面权限闸在位。后续候选：抓取前复用 urlguard 公网守卫",
       "evidence": "packages/knowledge/bok_voice_knowledge/markdown_source.py; §50 配置型适配器核验"
+    },
+    {
+      "id": "fp-queue-proxy-room-claim-taint",
+      "publicClass": "other-security",
+      "path_glob": "services/llm-mlx/queue_proxy.py",
+      "verdict": "false-positive",
+      "reason": "静态臆测链『queue_proxy HTTP 输入 → room_claim 路径穿越』无真实数据流：queue_proxy 只路由 LLM chat/completions（model/base_url 字段→上游转发），全文件不 import/引用 room_claim；room_claim 锁路径唯一源=claims_dir()（BOK_ROOM_CLAIM_DIR env/缺省 app-data，非请求输入），且房名拼路径前经 _ROOM_SAFE 白名单收敛（穿越段映射 _，2026-10-03 加固）",
+      "evidence": "apps/agent/agent_runtime/room_claim.py _ROOM_SAFE/claims_dir; services/llm-mlx/queue_proxy.py（无 room_claim 引用，grep 可复验）; tests/test_room_claim.py"
     }
   ]
 }

@@ -382,47 +382,86 @@ def test_build_llm_provider_mt_probe_dead_only_for_local_branch(monkeypatch, tmp
 
 
 def test_mt_endpoint_alive_any_http_response_is_alive(monkeypatch):
-    """镜像 CP probe_endpoint:401/404 等 HTTPError 也是「端点在场」(不 raise)。"""
-    import urllib.error
-    import urllib.request
+    """镜像 CP probe_endpoint:401/404 等 HTTPError 也是「端点在场」(不 raise)。
 
-    def _http_error(*_args, **_kwargs):
-        raise urllib.error.HTTPError("http://127.0.0.1:1236/v1/models", 401, "unauthorized", {}, None)
+    http.client 形状下 4xx 不抛——状态码经 getresponse 回来即「有响应」；
+    stub 必须打在 http.client.HTTPConnection 上（旧 urlopen stub 是死 seam，
+    本机 :1236 有真 MLX 服务在听时测试会发真请求假绿——CI 无监听才红，
+    2026-10-04 PR #175 CI 实证）。"""
+    import http.client
 
-    monkeypatch.setattr(urllib.request, "urlopen", _http_error)
+    seen_status: list[int] = []
+
+    class _Conn:
+        def __init__(self, host, port, timeout=None):
+            pass
+
+        def request(self, method, path):
+            pass
+
+        def getresponse(self):
+            class _R:
+                status = 401
+
+                def read(self):
+                    seen_status.append(401)
+                    return b"unauthorized"
+
+            return _R()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(http.client, "HTTPConnection", _Conn)
     assert interpret._mt_endpoint_alive("http://127.0.0.1:1236/v1") is True
+    assert seen_status == [401]  # 响应体确实被消费(4xx 也算在场)
 
 
 def test_mt_endpoint_alive_2xx_via_stub(monkeypatch):
     """2xx(有响应体)=活;空 base=死(不发起请求)。"""
-    import urllib.request
+    import http.client
 
     calls: list[str] = []
 
-    class _Resp:
-        def close(self) -> None:  # pragma: no cover - 关闭即释放
+    class _Conn:
+        def __init__(self, host, port, timeout=None):
+            self._host = host
+
+        def request(self, method, path):
+            calls.append(path)
+
+        def getresponse(self):
+            class _R:
+                def read(self):
+                    return b"ok"
+
+            return _R()
+
+        def close(self):
             pass
 
-    def _ok(url, timeout=None):
-        calls.append(url)
-        return _Resp()
-
-    monkeypatch.setattr(urllib.request, "urlopen", _ok)
+    monkeypatch.setattr(http.client, "HTTPConnection", _Conn)
     assert interpret._mt_endpoint_alive("http://127.0.0.1:1236/v1/") is True
-    assert calls == ["http://127.0.0.1:1236/v1/models"]
+    assert calls == ["/v1/models"]
     assert interpret._mt_endpoint_alive("") is False
-    assert calls == ["http://127.0.0.1:1236/v1/models"]  # 空 base 短路
+    assert calls == ["/v1/models"]  # 空 base 短路
 
 
 def test_mt_endpoint_alive_connection_error_is_dead(monkeypatch):
     """连接错误/超时=死(探活失败是数据不是异常,绝不外抛)。"""
-    import urllib.error
-    import urllib.request
+    import http.client
 
-    def _refused(*_args, **_kwargs):
-        raise urllib.error.URLError("connection refused")
+    class _Refused:
+        def __init__(self, *a, **kw):
+            pass
 
-    monkeypatch.setattr(urllib.request, "urlopen", _refused)
+        def request(self, method, path):
+            raise ConnectionRefusedError("connection refused")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(http.client, "HTTPConnection", _Refused)
     assert interpret._mt_endpoint_alive("http://127.0.0.1:1236/v1") is False
 
 

@@ -185,7 +185,8 @@ def test_main_sync_posts_payload_and_runs_pregen(monkeypatch, capsys):
     assert payload["lang"] == "cantonese"
     assert "入库 1 条" in out
     assert len(spawned) == 1
-    assert spawned[0][1].endswith("pregen_tts.py") and "--qa" in spawned[0], "入库后按语言物化 TTS"
+    # argv 形状随 Mimosa 断链前缀演化（/usr/bin/env + python + script）：按成员断言
+    assert any(a.endswith("pregen_tts.py") for a in spawned[0]) and "--qa" in spawned[0], "入库后按语言物化 TTS"
 
 
 def test_main_sync_pregen_failure_still_exits_zero(monkeypatch, capsys):

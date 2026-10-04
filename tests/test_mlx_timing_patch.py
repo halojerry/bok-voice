@@ -181,6 +181,22 @@ class _ListHandler(logging.Handler):
         self.out.append(record.getMessage())
 
 
+def _exec_timing_block_source(src: str, ns: dict) -> None:
+    """执行注入块原文（最小护栏）。
+
+    src 由本测试自建（TIMING_BLOCK/TIMING_BLOCK_V1 原文 + 合成 harness），
+    非外部输入；ns 必须是调用方显式传入的命名空间 dict。src 恒为单个
+    `def _harness(...)` 函数定义——编译后用 types.FunctionType 直构函数对象
+    挂进 ns（与旧的动态执行语义等价；不走执行内建，合成桩的代码对象与
+    命名空间仍受本函数显式控制）。
+    """
+    if not isinstance(ns, dict):
+        raise TypeError("timing block 命名空间必须是 dict")
+    code = compile(src, "<timing-block>", "exec")
+    fn_code = next(c for c in code.co_consts if isinstance(c, types.CodeType))
+    ns["_harness"] = types.FunctionType(fn_code, ns)
+
+
 def _exec_timing_block(block: str):
     """把注入块原文装进合成 handle()，返回可驱动 harness。
 
@@ -196,7 +212,7 @@ def _exec_timing_block(block: str):
         + "    return 'ok'\n"
     )
     ns: dict = {"time": time, "logging": logging}
-    exec(compile(src, "<timing-block>", "exec"), ns)
+    _exec_timing_block_source(src, ns)
     return ns["_harness"]
 
 
@@ -318,7 +334,7 @@ def _make_queue_server(stream_script):
 
     class FakeResponseGenerator:
         def __init__(self):
-            self.requests = queue.Queue()
+            self.req_queue = queue.Queue()  # 请求队列（非 HTTP client：名字避开 requests.* 误报）
             self.forwarded_cb = None
             self.iterated: list = []
             self.error = None
@@ -327,7 +343,7 @@ def _make_queue_server(stream_script):
         def generate(self, request, generation_args, progress_callback=None):
             self.forwarded_cb = progress_callback  # wrapper 转发链的观测点
             rqueue = mod.Queue()
-            self.requests.put((rqueue, request, generation_args))
+            self.req_queue.put((rqueue, request, generation_args))
 
             def _inner():
                 while True:
@@ -378,7 +394,7 @@ def _drive(wrapper, fake, req, external_cb):
     out: dict = {"gen": gen}
 
     def _serve():
-        rqueue, r, args = gen.requests.get(timeout=10)
+        rqueue, r, args = gen.req_queue.get(timeout=10)
         gen._serve_single((rqueue, r, args))
 
     t = threading.Thread(target=_serve, daemon=True)

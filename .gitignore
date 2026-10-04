@@ -48,11 +48,14 @@ decks/
 # 可视化检查产物——本机工作面，公开仓不进库。
 apps/control-plane/data/
 reports/
-scripts/.probe_*.json
+scripts/**/.probe_*.json
 docs/*.tar.gz
 docs/runtime-architecture*.html
 docs/runtime-architecture*.png
 docs/runtime-architecture*.json
+
+# 根目录架构图生成物（archify 产出，勿入库；docs/ 下的同族见上方三条）
+/bok-architecture.*
 
 # 工作区垃圾（会话快照/打包暂存/误生成目录）
 work-session-*/

@@ -674,7 +674,8 @@ def test_filler_cooldown_disabled_by_env(tmp_path, monkeypatch):
 def _patch_roll(monkeypatch, value: float) -> None:
     import agent_runtime.fillers as fm
 
-    monkeypatch.setattr(fm.random, "random", lambda: value)
+    # _RNG=SystemRandom 实例（CWE-338 收编后）：钉实例方法而非 random 模块
+    monkeypatch.setattr(fm._RNG, "random", lambda: value)
 
 
 def test_hesitation_blend_hit_picks_from_hes_pool(tmp_path, monkeypatch):

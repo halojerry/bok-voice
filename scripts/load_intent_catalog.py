@@ -115,7 +115,11 @@ def _assert_safe_cp_url(cp: str, *, allow_remote: bool) -> None:
         )
 
 
-def _cp_request(cp: str, path: str, *, method: str = "GET", body: dict | None = None) -> tuple[int, object]:
+def _cp_request(cp: str, path: str, *, method: str = "GET", body: dict | None = None,
+                _allow_remote: bool = False) -> tuple[int, object]:
+    # 出站闸与 sink 同函数体（Mimosa L3 污点纪律）：每次请求前就地过环回/DNS
+    # 边界校验——main 的入口校验保留为 fail-fast 第一道，此处为 sink 级第二道。
+    _assert_safe_cp_url(cp, allow_remote=_allow_remote)
     url = f"{cp.rstrip('/')}{path}"
     data = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
@@ -158,7 +162,7 @@ def main() -> int:
     want_ids = {s.strip() for s in args.ids.split(",") if s.strip()}
     want_lang = args.lang.strip()
 
-    status, tpls = _cp_request(args.cp, "/api/templates")
+    status, tpls = _cp_request(args.cp, "/api/templates", _allow_remote=args.allow_remote_host)
     if status != 200:
         print(f"FAIL: GET /api/templates -> {status} {tpls}")
         return 1
@@ -204,7 +208,7 @@ def main() -> int:
         )
         if not args.apply:
             continue
-        st, resp = _cp_request(args.cp, f"/api/templates/{tid}", method="PUT", body={"graph_json": json.dumps(graph, ensure_ascii=False)})
+        st, resp = _cp_request(args.cp, f"/api/templates/{tid}", method="PUT", body={"graph_json": json.dumps(graph, ensure_ascii=False)}, _allow_remote=args.allow_remote_host)
         if st != 200:
             print(f"FAIL {tid}: PUT -> {st} {resp}")
             exit_code = 1

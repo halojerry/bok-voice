@@ -379,8 +379,11 @@ def cmd_export(client: CpClient, args: argparse.Namespace) -> int:
     chosen, auto_heads = select_export_rows(entries, lang=str(args.lang or ""), include_shared=bool(args.include_shared))
     lines = [json.dumps(seed_row_from_entry(e), ensure_ascii=False) for e in chosen]
     if args.out:
-        # 输出产物写文件是允许的(JSONL 种子包,不是源码)。
-        with open(args.out, "w", encoding="utf-8") as f:
+        # 输出产物写文件是允许的(JSONL 种子包,不是源码);路径穿越拒绝(../)。
+        _out = Path(args.out)
+        if ".." in _out.parts:
+            raise ValueError(f"refusing traversal write target: {_out}")
+        with _out.resolve().open("w", encoding="utf-8") as f:
             for line in lines:
                 f.write(line + "\n")
         _log(f"导出 {len(lines)} 条 → {args.out}(account={args.account} lang={args.lang or '全部'} include_shared={args.include_shared})")

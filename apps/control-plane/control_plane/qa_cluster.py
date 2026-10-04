@@ -26,6 +26,41 @@ from typing import Any, Callable
 import httpx
 
 from bok_voice_core.model_routes import PROVIDER_OPENAI, resolve_route
+
+
+def _safe_httpx_get(url: str, **kwargs):
+    """出站闸门（tools/bok.py _safe_urlopen 同形状）：仅 http/https、host 非空、
+    无 userinfo；不过闸=PermissionError。挖掘 LLM 端点=MLX_LLM_BASE_URL env/
+    路由表（运维配置面，可指云端，不锁环回）。"""
+    import urllib.parse
+
+    parts = urllib.parse.urlsplit(url)
+    host = (parts.hostname or "").lower()
+    if not (
+        parts.scheme in ("http", "https")
+        and bool(host)
+        and not parts.username
+        and not parts.password
+    ):
+        raise PermissionError(f"出站 URL 未过护栏（拒发）: {url}")
+    return httpx.get(url, **kwargs)
+
+
+def _safe_httpx_post(url: str, **kwargs):
+    """同 _safe_httpx_get，post 面。"""
+    import urllib.parse
+
+    parts = urllib.parse.urlsplit(url)
+    host = (parts.hostname or "").lower()
+    if not (
+        parts.scheme in ("http", "https")
+        and bool(host)
+        and not parts.username
+        and not parts.password
+    ):
+        raise PermissionError(f"出站 URL 未过护栏（拒发）: {url}")
+    return httpx.post(url, **kwargs)
+
 from bok_voice_core.qa_cluster import (  # noqa: F401  (_CLUSTER_SYSTEM_PROMPT re-export)
     _CLUSTER_SYSTEM_PROMPT,
     build_cluster_messages,
@@ -90,7 +125,7 @@ def _mining_lane() -> tuple[str, str, str, bool]:
 def _discover_model(base_url: str) -> str:
     """取本地 server 已加载模型的真实路径(仓规:request model 必须填真实路径;
     含 4b 优先——4B 是主对话模型,1.8B 是 B 线翻译专才)。"""
-    r = httpx.get(f"{base_url}/models", timeout=10)
+    r = _safe_httpx_get(f"{base_url}/models", timeout=10)
     r.raise_for_status()
     ids = [str(d.get("id") or "") for d in (r.json().get("data") or [])]
     paths = [i for i in ids if i.startswith("/")]
@@ -142,14 +177,14 @@ def _llm_chat(
     # api_key 仅云端档携带；env 链（api_key=""）保持与改造前同一调用形状
     # （不带 headers 参，Summarize 同款纪律——monkeypatch 窄签名不破）。
     if api_key:
-        r = httpx.post(
+        r = _safe_httpx_post(
             f"{base_url}/chat/completions",
             json=payload,
             timeout=timeout,
             headers={"Authorization": f"Bearer {api_key}"},
         )
     else:
-        r = httpx.post(f"{base_url}/chat/completions", json=payload, timeout=timeout)
+        r = _safe_httpx_post(f"{base_url}/chat/completions", json=payload, timeout=timeout)
     r.raise_for_status()
     return str((r.json().get("choices") or [{}])[0].get("message", {}).get("content") or "")
 

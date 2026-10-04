@@ -112,7 +112,7 @@ python tools/bok.py doctor    # 体检（打包形态 --packaged 为硬门禁；
 4. ASR :8787 / TTS :8788 / LLM :1235 并行拉起
 5. agent worker（注册到 :7880）→ 轮询全部端口 UP
 
-**macOS 生产常驻（launchd，KeepAlive 崩溃自拉起）**（docs/DEV_TOOLS.md §6）：
+**macOS 生产常驻（launchd，KeepAlive 崩溃自拉起）**（docs/archive/DEV_TOOLS.md §6）：
 
 ```bash
 python tools/bok.py prod install    # 生成 launchd plist 单元

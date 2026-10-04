@@ -591,8 +591,9 @@ def _http_download(url: str, token: str, dest: Path, timeout: int = 300) -> None
     dest = Path(dest)
     if not dest.is_absolute() or ".." in dest.parts:
         raise ValueError(f"download dest must be absolute without '..': {dest}")
+    dest = dest.resolve()  # symlink 逃逸就地收敛，open 写的就是校验过的目标
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-    with _OPENER.open(req, timeout=timeout) as resp, open(dest, "wb") as f:
+    with _OPENER.open(req, timeout=timeout) as resp, dest.open("wb") as f:
         while True:
             chunk = resp.read(1 << 20)
             if not chunk:
@@ -655,8 +656,8 @@ def perform_update(cfg: NodeConfig, version: str, *,
         with tarfile.open(tgz, "r:gz") as tar:
             try:
                 tar.extractall(extract, filter="data")  # py3.12+ 防路径穿越
-            except TypeError:  # 旧解释器无 filter 参数
-                tar.extractall(extract)
+            except TypeError:  # 旧解释器无 filter 参数——拒绝无过滤解包（宁可不更新）
+                return "python runtime too old for safe tar extraction (needs py3.12+ filter=)"
         # 包内顶层目录归一（git archive 前缀 / 直接打包根都接受）。
         src = extract
         entries = list(extract.iterdir())

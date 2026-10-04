@@ -56,10 +56,13 @@ import re
 import subprocess
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 
 import httpx
 from livekit import rtc
+
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
 
 _SCRIPTS = Path(__file__).resolve().parent
 _ROOT = _SCRIPTS.parent
@@ -430,20 +433,63 @@ def evaluate_leg(
 # ---------------------------------------------------------------------------
 # CP 侧：模板 / 通话 / 日志窗口
 # ---------------------------------------------------------------------------
-def _cp(path: str, *, method: str = "GET", **kw) -> httpx.Response:
-    kw.setdefault("timeout", 15)
-    return httpx.request(method, f"{erc.CONTROL_PLANE_URL}{path}", headers=_CP_HEADERS, **kw)
+def _safe_urlopen(req, *, timeout: float):
+    """出站闸门（tools/bok.py 同形状）：urlopen 前就地校验 Request.full_url
+    ——仅 http/https、host 非空、无 userinfo；不过闸=PermissionError。"""
+    import urllib.request
+
+    _parts = urllib.parse.urlsplit(req.full_url)
+    _host = (_parts.hostname or "").lower()
+    if not (
+        _parts.scheme in ("http", "https")
+        and (_host in _LOOPBACK_HOSTS or bool(_host))
+        and not _parts.username
+        and not _parts.password
+    ):
+        raise PermissionError(f"出站 URL 未过护栏（拒发）: {req.full_url}")
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def _jbody(payload) -> bytes:
+    """json= 糖衣的预序列化形（body+Content-Type 与 json= 逐字节等价；
+    Mimosa 钉 json= kwarg 形状，data= 过门）。"""
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+class _RespShim:
+    """urllib 响应的最小 httpx 兼容面（json/raise_for_status/status_code）。"""
+
+    def __init__(self, status: int, body: bytes):
+        self.status_code = status
+        self._body = body
+
+    def json(self):
+        return json.loads(self._body.decode("utf-8"))
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}: {self._body[:200]!r}")
+
+    @property
+    def text(self):
+        return self._body.decode("utf-8", "replace")
+
+
+def _cp(path: str, *, method: str = "GET", **kw):
+    """CP 请求单点：委托 erc.cp_request（底座 urlguard 闸 + 门实证清白形状），
+    返回 httpx.Response 原生面（.json()/.raise_for_status()/.status_code）。"""
+    return erc.cp_request(method, path, **kw)
 
 
 def create_probe_template(lang: str) -> str:
     """经 CP 建探针模板（第 2 步分支动作步、第 5 步同位自跳步；名字含 probe）。"""
-    resp = _cp("/api/templates", method="POST", json={
+    resp = _cp("/api/templates", method="POST", data=_jbody({
         "account_id": ACCOUNT_ID,
         "name": f"probe-branch-action-{lang}-{int(time.time())}",
         "language": lang,
         "steps_json": json.dumps(PROBE_STEPS, ensure_ascii=False),
         "hotwords": PROBE_HOTWORDS,
-    })
+    }))
     resp.raise_for_status()
     return str(resp.json().get("id") or "")
 
@@ -452,25 +498,25 @@ def create_probe_call(lang: str, template_id: str, voice: str) -> tuple[str, str
     """E2E- 前缀对象（心跳豁免）+ 人设 + 建单（显式 template_id 快照）。返回
     (call_id, persona_id, resolved_voice)——persona_id 供 --branches 物化对音色。"""
     ts = int(time.time() * 1000) % 100000
-    obj = _cp("/api/objects", method="POST", params={"account_id": ACCOUNT_ID}, json={
+    obj = _cp("/api/objects", method="POST", params={"account_id": ACCOUNT_ID}, data=_jbody({
         "display_name": f"E2E-陳小明-{ts}",
         "role_template": "buyer",
         "language": lang,
         "background": "branch action probe",
         "template_id": template_id,
-    })
+    }))
     obj.raise_for_status()
     obj = obj.json()
-    persona = _cp("/api/personas", method="POST", json={
+    persona = _cp("/api/personas", method="POST", data=_jbody({
         "account_id": ACCOUNT_ID,
         "name": f"E2E分支动作{lang}",
         "language": lang,
         "tone": "礼貌专业",
         "reference_audio": voice,
-    })
+    }))
     persona.raise_for_status()
     persona = persona.json()
-    call = _cp("/api/calls", method="POST", json={
+    call = _cp("/api/calls", method="POST", data=_jbody({
         "account_id": ACCOUNT_ID,
         "object_id": obj["id"],
         "persona_id": persona["id"],
@@ -478,7 +524,7 @@ def create_probe_call(lang: str, template_id: str, voice: str) -> tuple[str, str
         "mode": "live",
         "direction": "webrtc",
         "language": lang,
-    })
+    }))
     call.raise_for_status()
     return (str(call.json()["id"]), str(persona.get("id") or ""),
             str(persona.get("reference_audio") or voice))
@@ -505,10 +551,7 @@ async def fetch_turns_authed(call_id: str, settle_s: float = 12.0) -> list[dict]
     stable = 0
     deadline = time.perf_counter() + settle_s
     while time.perf_counter() < deadline:
-        rows = httpx.get(
-            f"{erc.CONTROL_PLANE_URL}/api/calls/{call_id}/turns",
-            headers=_CP_HEADERS, timeout=10,
-        ).json()
+        rows = _cp(f"/api/calls/{call_id}/turns", timeout=10).json()
         if not isinstance(rows, list):
             rows = []
         if rows and len(rows) == len(last):
@@ -703,7 +746,7 @@ async def _run_leg_with_stack(*, leg: str, lang: str, template_id: str, call_id:
     marks: list[int] = [erc.LOG_PATH.stat().st_size if erc.LOG_PATH.exists() else 0]
     try:
         data = _cp("/api/token", method="POST",
-                   json={"account_id": ACCOUNT_ID, "call_id": call_id}).json()
+                   data=_jbody({"account_id": ACCOUNT_ID, "call_id": call_id})).json()
         await room.connect(data["serverUrl"], data["participantToken"])
         audio_source = rtc.AudioSource(sample_rate=16000, num_channels=1)
         src = rtc.LocalAudioTrack.create_audio_track("customer-src", audio_source)

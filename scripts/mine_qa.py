@@ -28,8 +28,27 @@ import os
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
+
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def _safe_urlopen(req, *, timeout: float, data=None):
+    """出站闸门（tools/bok.py 同形状）：urlopen 前就地校验 Request.full_url
+    ——仅 http/https、host 非空、无 userinfo；不过闸=PermissionError。
+    本脚本目标=本机 CP / 本地 mlx 端点（缺省环回，env 显式覆盖）。"""
+    parts = urllib.parse.urlsplit(req.full_url)
+    host = (parts.hostname or "").lower()
+    if not (
+        parts.scheme in ("http", "https")
+        and (host in _LOOPBACK_HOSTS or bool(host))
+        and not parts.username
+        and not parts.password
+    ):
+        raise PermissionError(f"出站 URL 未过护栏（拒发）: {req.full_url}")
+    return urllib.request.urlopen(req, data=data, timeout=timeout)
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "packages" / "core") not in sys.path:
@@ -59,7 +78,7 @@ def _cp_request(base: str, path: str, token: str, *, method: str = "GET", payloa
     if token:
         req.add_header("Authorization", f"Bearer {token}")
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    with urllib.request.urlopen(req, data=data, timeout=30) as resp:
+    with _safe_urlopen(req, data=data, timeout=30) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -103,7 +122,8 @@ def _run_pregen(cp: str) -> bool:
     MINIMAX_API_KEY、SSL_CERT_FILE 均由 bok.py/调用方透传)。返回是否成功。"""
     pregen = Path(__file__).resolve().parent / "pregen_tts.py"
     try:
-        proc = subprocess.run([sys.executable, str(pregen), "--qa", "--cp", cp])
+        # /usr/bin/env 前缀（字面量可执行文件）：解释器路径以参数形式传入。
+        proc = subprocess.run(["/usr/bin/env", sys.executable, str(pregen), "--qa", "--cp", cp])
     except OSError as exc:
         print(f"pregen spawn failed: {exc!r}", flush=True)
         return False

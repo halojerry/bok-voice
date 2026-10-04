@@ -21,7 +21,7 @@ MiniMax）。**换话音源 = 换刺激 = 换读数**：本探针把整句按品
 用法：
   .venv312/bin/python scripts/probe_brand_words.py            # 基线
   BOK_PROBE_STIMULUS=cloud PROBE_TAG=cloud .venv312/bin/python scripts/probe_brand_words.py
-  结果落 JSON：scripts/.probe_brand_words.<tag>.json
+  结果落 JSON：scripts/artifacts/.probe_brand_words.<tag>.json
 """
 from __future__ import annotations
 
@@ -231,7 +231,7 @@ async def main() -> int:
             pass
     single = sum(1 for r in results if r["intact_single"])
     print(f"SUMMARY intact_single={single}/{len(results)} tag={TAG}")
-    out = ROOT / "scripts" / f".probe_brand_words.{TAG}.json"
+    out = ROOT / "scripts" / "artifacts" / f".probe_brand_words.{TAG}.json"
     out.write_text(json.dumps(results, ensure_ascii=False, indent=1))
     print(f"saved -> {out.name}")
     return 0 if single == len(results) else 1

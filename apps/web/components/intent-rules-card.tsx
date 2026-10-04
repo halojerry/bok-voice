@@ -24,20 +24,21 @@ type IntentRuleRow = {
 
 type IntentCond = { fact?: string; op?: string; value?: unknown };
 
-/** fact 目录（12 键，中文标签与 CP core `intent_rules.INTENT_FACTS` 手工同步）。 */
+/** fact 目录（12 键，键/中文标签与 CP core `intent_rules.INTENT_FACTS` 逐字一致；
+ *  parity 钉在 tests/test_intent_facts_parity.py——改这里必须同步改 core，反之亦然）。 */
 const INTENT_FACTS: [string, string][] = [
   ["duration_s", "通话时长秒"],
-  ["nudge_fired", "心跳次数"],
-  ["watchdog_fired", "看门狗次数"],
-  ["storm_rounds", "风暴轮数"],
-  ["repeat_count", "复述次数"],
-  ["refuse_count", "拒绝次数"],
-  ["objection_count", "异议次数"],
-  ["confirm_count", "确认次数"],
-  ["question_count", "提问次数"],
-  ["step_max", "到达最大步"],
-  ["wa_captured", "已捕获号码"],
-  ["graph_notifies", "人工求助次数"],
+  ["nudge_fired", "沉默心跳已发次数"],
+  ["watchdog_fired", "响应看门狗触发次数"],
+  ["storm_rounds", "打断风暴静听轮数"],
+  ["repeat_count", "REPEAT verdict 累计"],
+  ["refuse_count", "REFUSE verdict 累计"],
+  ["objection_count", "OBJECTION verdict 累计"],
+  ["confirm_count", "CONFIRM verdict 累计"],
+  ["question_count", "QUESTION verdict 累计"],
+  ["step_max", "到达的最大话术步（1-based）"],
+  ["wa_captured", "WhatsApp/微信已捕获（布尔）"],
+  ["graph_notifies", "notify_human 动作已触发次数"],
 ];
 const INTENT_FACT_LABEL: Record<string, string> = Object.fromEntries(INTENT_FACTS);
 const INTENT_OPS: [string, string][] = [["gte", "≥"], ["lte", "≤"], ["eq", "="]];

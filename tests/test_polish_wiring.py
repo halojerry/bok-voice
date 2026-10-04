@@ -336,9 +336,9 @@ def test_env_face_absent_when_unset(monkeypatch, tmp_path):
 
 
 def _r1_corpus() -> list[dict]:
-    path = ROOT / "scripts" / ".r1_gold.20260921.json"
+    path = ROOT / "scripts" / "artifacts" / ".r1_gold.20260921.json"
     if not path.exists():
-        pytest.skip("R1 标注语料不在盘（scripts/.r1_gold.20260921.json）")
+        pytest.skip("R1 标注语料不在盘（scripts/artifacts/.r1_gold.20260921.json）")
     return json.loads(path.read_text("utf-8"))
 
 

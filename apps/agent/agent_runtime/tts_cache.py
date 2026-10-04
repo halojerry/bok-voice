@@ -94,7 +94,9 @@ def cache_key(
     emo = str(emotion or "").strip().lower()
     if emo:
         raw = f"{raw}\x1fe{emo}"
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    # usedforsecurity=False：内容寻址缓存键（非安全用途）——digest 值与裸 sha1
+    # 逐字节相同（已钉罐头零失效），旗标只是显式声明用途。
+    return hashlib.sha1(raw.encode("utf-8"), usedforsecurity=False).hexdigest()
 
 
 _HEX_KEY_RE = re.compile(r"^[0-9a-f]{40}$")

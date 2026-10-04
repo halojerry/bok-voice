@@ -83,6 +83,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
+from bok_voice_core.metrics_kinds import METRICS_KIND_LANES, METRICS_KINDS
 from bok_voice_core.model_routes import parse_routing
 
 __all__ = [
@@ -107,14 +108,11 @@ __all__ = [
 
 # ---- 契约常量（§1/§2/§3）----
 
-# kind 枚举固定四种（§1）；kind→provider 映射（§2）。
-KINDS: tuple[str, ...] = ("llm_ttft", "asr_transcribe", "tts_first_audio", "vad_infer")
-KIND_TO_PROVIDER: dict[str, str] = {
-    "asr_transcribe": "asr",
-    "llm_ttft": "llm",
-    "tts_first_audio": "tts",
-    "vad_infer": "vad",
-}  # 键序=§2 响应 providers 行序（asr/llm/tts/vad）
+# kind 枚举固定四种（§1）；kind→provider 映射（§2）。单源=
+# packages/core/bok_voice_core/metrics_kinds.py（worker 上报/CP 滚动窗/端点
+# schema 三面共用）；模块级别名=现有 import 方零改动。
+KINDS: tuple[str, ...] = METRICS_KINDS
+KIND_TO_PROVIDER: dict[str, str] = METRICS_KIND_LANES  # 键序=§2 响应 providers 行序（asr/llm/tts/vad）
 
 WINDOW_S = 300.0
 SAMPLE_MAXLEN = 500

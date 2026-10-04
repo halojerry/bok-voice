@@ -4,3 +4,5 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 pydantic>=2.6
 sqlalchemy>=2.0,<3
+# 规范十条 R1(2026-10-04):Ruff 单工具链,CI 两层门(真 bug 类全树 + 风格类新文件)
+ruff>=0.16

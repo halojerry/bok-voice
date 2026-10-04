@@ -59,32 +59,22 @@ def test_probe_warns_when_no_voice_configured(tmp_path, monkeypatch, capsys):
 def test_probe_resolves_configured_voice(tmp_path, monkeypatch):
     """get_voice 列表里有已配音色 → ok 唔 fail。"""
 
-    def fake_urlopen(req, timeout=8):
-        class _Resp:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-            def read(self):
-                return json.dumps(
-                    {
-                        "base_resp": {"status_code": 0},
-                        "data": {
-                            "system_voice": [
-                                {"voice_id": "Cantonese_Male_news_anchor_vv2"},
-                                {"voice_id": "male-qn-qingse"},
-                            ]
-                        },
-                    }
-                ).encode()
-
-        return _Resp()
+    def fake_http_call(url, method="GET", *, body=None, headers=None, timeout_s=10.0):
+        return 200, json.dumps(
+            {
+                "base_resp": {"status_code": 0},
+                "data": {
+                    "system_voice": [
+                        {"voice_id": "Cantonese_Male_news_anchor_vv2"},
+                        {"voice_id": "male-qn-qingse"},
+                    ]
+                },
+            }
+        ).encode()
 
     import bok as bok_mod
 
-    monkeypatch.setattr(bok_mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(bok_mod, "_http_call", fake_http_call)
     _make_db(
         tmp_path,
         {"provider": "minimax", "api_key": "k", "speaker_cantonese": "Cantonese_Male_news_anchor_vv2"},
@@ -97,27 +87,17 @@ def test_probe_resolves_configured_voice(tmp_path, monkeypatch):
 def test_probe_fails_when_voice_not_in_account_list(tmp_path, monkeypatch):
     """账号列表可达但已配音色全部唔喺列表 → 确定性错配,硬 fail。"""
 
-    def fake_urlopen(req, timeout=8):
-        class _Resp:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-            def read(self):
-                return json.dumps(
-                    {
-                        "base_resp": {"status_code": 0},
-                        "data": {"system_voice": [{"voice_id": "male-qn-qingse"}]},
-                    }
-                ).encode()
-
-        return _Resp()
+    def fake_http_call(url, method="GET", *, body=None, headers=None, timeout_s=10.0):
+        return 200, json.dumps(
+            {
+                "base_resp": {"status_code": 0},
+                "data": {"system_voice": [{"voice_id": "male-qn-qingse"}]},
+            }
+        ).encode()
 
     import bok as bok_mod
 
-    monkeypatch.setattr(bok_mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(bok_mod, "_http_call", fake_http_call)
     _make_db(
         tmp_path,
         {"provider": "minimax", "api_key": "k", "speaker_zh": "not_a_real_voice"},

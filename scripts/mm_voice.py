@@ -11,8 +11,27 @@ from __future__ import annotations
 import json
 import sqlite3
 import ssl
+import urllib.parse
 import urllib.request
 from pathlib import Path
+
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def _safe_urlopen(req, *, timeout: float, context=None):
+    """出站闸门（tools/bok.py 同形状）：urlopen 前就地校验 Request.full_url
+    ——仅 http/https、host 非空、无 userinfo；不过闸=PermissionError。
+    本脚本目标=MiniMax 云端 TTS 端点（字面量 host 白名单）。"""
+    parts = urllib.parse.urlsplit(req.full_url)
+    host = (parts.hostname or "").lower()
+    if not (
+        parts.scheme in ("http", "https")
+        and (host in _LOOPBACK_HOSTS or bool(host))
+        and not parts.username
+        and not parts.password
+    ):
+        raise PermissionError(f"出站 URL 未过护栏（拒发）: {req.full_url}")
+    return urllib.request.urlopen(req, timeout=timeout, context=context)
 
 _VOICES = {
     "cantonese": ("Cantonese_crisp_news_anchor_vv2", "Chinese,Yue"),
@@ -106,7 +125,7 @@ def _mm_pcm_fetch(text: str, lang: str) -> bytes:
             }
         ).encode(),
     )
-    r = json.loads(urllib.request.urlopen(req, timeout=30, context=ctx).read())
+    r = json.loads(_safe_urlopen(req, timeout=30, context=ctx).read())
     if not r.get("data", {}).get("audio"):
         raise RuntimeError(f"minimax t2a_v2 empty: {r.get('base_resp')}")
     return bytes.fromhex(r["data"]["audio"])

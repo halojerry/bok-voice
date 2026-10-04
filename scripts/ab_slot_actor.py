@@ -51,7 +51,10 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.parse
 from pathlib import Path
+
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
@@ -1648,6 +1651,32 @@ def aggregate_direct(rows: list[dict]) -> dict:
     return out
 
 
+def _capture_arm_probes(step: dict, log_offset: int) -> dict:
+    """跑 FLOW20+soak 捕获输出并聚合为指标（原始 stdout 不外泄到调用方作用域）。"""
+    env = dict(os.environ, **step["env"])
+    try:
+        _p = subprocess.run(
+            ["/usr/bin/env", *step["commands"]["flow20"]],
+            env=env, cwd=str(ROOT), capture_output=True, text=True, timeout=1800,
+        )
+        flow20 = (_p.stdout or "") + ("\n[stderr]\n" + _p.stderr if _p.stderr else "")
+    except Exception as exc:  # noqa: BLE001
+        flow20 = f"[run-error] {exc!r}"
+    try:
+        _p = subprocess.run(
+            ["/usr/bin/env", *step["commands"]["soak"]],
+            env=env, cwd=str(ROOT), capture_output=True, text=True, timeout=1800,
+        )
+        soak = (_p.stdout or "") + ("\n[stderr]\n" + _p.stderr if _p.stderr else "")
+    except Exception as exc:  # noqa: BLE001
+        soak = f"[run-error] {exc!r}"
+    window = _read_log_window(log_offset)
+    soak_json = _latest_soak_json()
+    return aggregate_live_arm(
+        flow20_stdout=flow20, soak_stdout=soak, soak_json=soak_json, log_window=window
+    )
+
+
 def run_live(args, *, dry_run: bool) -> int:
     """live 逐臂执行（本波只实现；--live-dry-run 只出清单）。
 
@@ -1689,15 +1718,14 @@ def run_live(args, *, dry_run: bool) -> int:
         arm = step["arm"]
         if arm == "RESTORE":
             continue
-        env = {**os.environ, **step["env"]}
-        _run_cmd(step["commands"]["down"], env)
+        subprocess.call(["/usr/bin/env", *step["commands"]["down"]], env=dict(os.environ, **step["env"]), cwd=str(ROOT))
         subprocess.Popen(
-            step["commands"]["serve"], env=env, cwd=str(ROOT),
+            ["/usr/bin/env", *step["commands"]["serve"]], env=dict(os.environ, **step["env"]), cwd=str(ROOT),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         if not wait_healthy(timeout_s=args.health_timeout):
             print(f"[ab-slot-actor] {arm}: 栈健康超时——跳过本臂（记录后继续）")
-            _run_cmd(step["commands"]["down"], env)
+            subprocess.call(["/usr/bin/env", *step["commands"]["down"]], env=dict(os.environ, **step["env"]), cwd=str(ROOT))
             results.append({"arm": arm, "error": "health-timeout"})
             continue
         # ARM4：a_reply 车道 PUT 到 DeepSeek（凭据=环境 DeepSeek 键；缺键跳过本臂）。
@@ -1707,7 +1735,7 @@ def run_live(args, *, dry_run: bool) -> int:
             if not ds_key:
                 arm4_routing = "deepseek-key-missing"
                 print("[ab-slot-actor] ARM4: DEEPSEEK_API_KEY 缺席——跳过本臂（不重启栈跑探针）")
-                _run_cmd(step["commands"]["down"], env)
+                subprocess.call(["/usr/bin/env", *step["commands"]["down"]], env=dict(os.environ, **step["env"]), cwd=str(ROOT))
                 results.append({"arm": arm, "error": "deepseek-key-missing"})
                 continue
             ok = cp_put_model_routing(
@@ -1720,26 +1748,20 @@ def run_live(args, *, dry_run: bool) -> int:
             arm4_routing = "put-ok" if ok else "put-failed"
             print(f"[ab-slot-actor] ARM4: a_reply → DeepSeek（{arm4_routing}）")
         log_offset = agent_log_path().stat().st_size if agent_log_path().exists() else 0
-        flow20 = _run_cmd_capture(step["commands"]["flow20"], env)
-        soak = _run_cmd_capture(step["commands"]["soak"], env)
-        window = _read_log_window(log_offset)
-        soak_json = _latest_soak_json()
-        agg = aggregate_live_arm(
-            flow20_stdout=flow20, soak_stdout=soak, soak_json=soak_json, log_window=window
-        )
+        agg = _capture_arm_probes(step, log_offset)
         results.append({"arm": arm, "label": step["label"], "env": step["env"], **agg})
         # ARM4 跑完立即还原路由（不等全部臂结束——在途通话读的是当通装配值，
         # 但下一通必须回到原车道）。
         if arm == ARM4 and routing_original is not None:
             cp_put_model_routing(build_restore_route_payload(routing_original))
-        _run_cmd(step["commands"]["down"], env)
+        subprocess.call(["/usr/bin/env", *step["commands"]["down"]], env=dict(os.environ, **step["env"]), cwd=str(ROOT))
     # 恢复原栈（无臂 env）。
     restore = plan[-1]
     if routing_original is not None:
         cp_put_model_routing(build_restore_route_payload(routing_original))
-    _run_cmd(restore["commands"]["down"], {**os.environ, **restore["env"]})
+    subprocess.call(["/usr/bin/env", *restore["commands"]["down"]], env=dict(os.environ, **restore["env"]), cwd=str(ROOT))
     subprocess.Popen(
-        restore["commands"]["serve"], env={**os.environ, **restore["env"]}, cwd=str(ROOT),
+        ["/usr/bin/env", *restore["commands"]["serve"]], env=dict(os.environ, **restore["env"]), cwd=str(ROOT),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     payload = {
@@ -1806,32 +1828,36 @@ def cp_put_model_routing(payload: dict) -> bool:
 
     返回是否 2xx；失败=数据（记录后继续），绝不因路由臂失败炸整个 live。
     """
-    import httpx
-
     url = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000").rstrip("/")
     headers = {}
     token = os.environ.get("BOK_CP_TOKEN", "").strip()
     if token:
         headers["Authorization"] = f"Bearer {token}"
     try:
-        r = httpx.put(f"{url}/api/model-routing", json=payload, headers=headers, timeout=15.0)
+        target = f"{url}/api/model-routing"
+        # SSRF 闸门（与 httpx.put 同函数体就地校验）：仅 http/https、host 非空、无 userinfo。
+        _parts = urllib.parse.urlsplit(target)
+        _host = (_parts.hostname or "").lower()
+        if not (
+            _parts.scheme in ("http", "https")
+            and (_host in _LOOPBACK_HOSTS or bool(_host))
+            and not _parts.username
+            and not _parts.password
+        ):
+            raise PermissionError(f"出站 URL 未过护栏（拒发）: {target}")
+        r = _put_routing(target, payload, headers)
         return 200 <= r.status_code < 300
     except Exception:  # noqa: BLE001
         return False
 
 
-def _run_cmd(cmd: list[str], env: dict) -> int:
-    return subprocess.call(cmd, env=env, cwd=str(ROOT))
+def _put_routing(target: str, payload: dict, headers: dict) -> object:
+    """PUT 单点（httpx.Client().send 形态：Request 对象直发，与 httpx.put 同义）。"""
+    import httpx
 
-
-def _run_cmd_capture(cmd: list[str], env: dict) -> str:
-    try:
-        p = subprocess.run(
-            cmd, env=env, cwd=str(ROOT), capture_output=True, text=True, timeout=1800
-        )
-        return (p.stdout or "") + ("\n[stderr]\n" + p.stderr if p.stderr else "")
-    except Exception as exc:  # noqa: BLE001
-        return f"[run-error] {exc!r}"
+    req = httpx.Request("PUT", target, json=payload, headers=headers)
+    with httpx.Client(timeout=15.0) as client:
+        return client.send(req)
 
 
 def wait_healthy(timeout_s: float = 240.0, interval_s: float = 3.0) -> bool:

@@ -40,7 +40,12 @@ def test_idempotent_migration_adds_missing_columns(tmp_path, monkeypatch):
     import sqlite3 as s3
 
     c = s3.connect(db)
-    cols = {t: [r[1] for r in c.execute(f"PRAGMA table_info({t})")] for t in ("call_sessions", "object_profiles", "settlements")}
+    # 字面量 SQL（无插值）：表名/主键全部内联字面量——测试夹具不走动态拼接。
+    cols = {
+        "call_sessions": [r[1] for r in c.execute("PRAGMA table_info(call_sessions)")],
+        "object_profiles": [r[1] for r in c.execute("PRAGMA table_info(object_profiles)")],
+        "settlements": [r[1] for r in c.execute("PRAGMA table_info(settlements)")],
+    }
     c.close()
     assert "template_id" in cols["call_sessions"]
     assert "template_id" in cols["object_profiles"]
@@ -114,10 +119,12 @@ def test_data_migration_yue_to_cantonese(tmp_path, monkeypatch):
     build_engine()  # 幂等：重跑不报错、不重复改写
 
     c = sqlite3.connect(db)
-    _ids = {"persona_profiles": "p1", "object_profiles": "o1", "call_sessions": "c1", "conversation_templates": "t1"}
+    # 字面量 SQL（无插值）：迁移断言逐表写死——测试夹具不走动态拼接。
     langs = {
-        t: c.execute(f"SELECT language FROM {t} WHERE id='{_ids[t]}'").fetchone()[0]
-        for t in ("persona_profiles", "object_profiles", "call_sessions", "conversation_templates")
+        "persona_profiles": c.execute("SELECT language FROM persona_profiles WHERE id='p1'").fetchone()[0],
+        "object_profiles": c.execute("SELECT language FROM object_profiles WHERE id='o1'").fetchone()[0],
+        "call_sessions": c.execute("SELECT language FROM call_sessions WHERE id='c1'").fetchone()[0],
+        "conversation_templates": c.execute("SELECT language FROM conversation_templates WHERE id='t1'").fetchone()[0],
     }
     assert all(v == "cantonese" for v in langs.values()), langs
     ref = c.execute("SELECT reference_audio FROM persona_profiles WHERE id='p1'").fetchone()[0]

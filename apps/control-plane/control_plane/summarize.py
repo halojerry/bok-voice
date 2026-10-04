@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import urllib.parse
 from typing import Any
 
 import httpx
@@ -51,6 +52,64 @@ _SYSTEM_INTERP = (
 )
 
 
+def _resolve_settle_endpoint(settings: dict) -> tuple[str, str, str, bool]:
+    """settle 车道端点解析（settings → BOK_SETTLE_* env → MLX env → 路由表）。
+
+    返回 (base_url, model, api_key, enable_thinking)。语义与旧内联块逐字节一致：
+    路由表未命中（source=="env"）时 env 链路不动；openai 云端档吃 base_url/
+    model/api_key + enable_thinking；local 档显式改端点（model 空沿用现值）。
+    """
+    llm_cfg = settings.get("llm", {}) or {}
+    base_url = (llm_cfg.get("base_url") or "").rstrip("/")
+    model = (llm_cfg.get("model") or "").strip()
+    # settle 专线优先(BOK_SETTLE_*,bok.py 注入指向 :1237 9B):纪要/蒸馏係
+    # 延迟不敏感的后台重活,大模型质量↑且与活通话的 :1235 完全隔离;env
+    # 缺席回退原链路(settings llm 卡 > MLX_LLM_* env,语义同旧)。
+    _settle_base = os.environ.get("BOK_SETTLE_LLM_BASE_URL", "").strip()
+    _settle_model = os.environ.get("BOK_SETTLE_LLM_MODEL", "").strip()
+    api_key = (llm_cfg.get("api_key") or "").strip()
+    if _settle_base and _settle_model:
+        base_url, model = _settle_base.rstrip("/"), _settle_model
+        # 专线若指向云端（DeepSeek 等）必须有凭据——本地 MLX 不校验时这是个空串，
+        # 语义不变。凭据只走 env（与 BOK_SETTLE_LLM_* 同款 CP 面注入），不落盘。
+        api_key = os.environ.get("BOK_SETTLE_LLM_API_KEY", "").strip() or api_key
+    # `"mlx"` 是本仓既有的「本地端点不校验凭据」哨兵（与 agent `_llm_judge` 的
+    # api_key 缺省同值）——设置页本地卡就存这个字面量，它**不是**凭据，不许变成
+    # Authorization 头（否则本地档的请求形状也变了）。
+    if api_key == "mlx":
+        api_key = ""
+    # 设置页 LLM 卡片可存空 base_url / 占位 model="local"；本机 MLX 的真实地址
+    # 由启动器经 env 注入（与 agent 的 MlxLlmLLM 同一来源）。只读 settings 会打到
+    # 空 URL / model=local → mlx_lm 404 → 蒸馏表（new_topics/insight）永不写入。
+    if not base_url or not model or model == "local":
+        env_base = os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1").rstrip("/")
+        env_model = (os.environ.get("MLX_LLM_MODEL") or "").strip()
+        if env_base and env_model:
+            base_url, model = env_base, env_model
+    # 模型路由合流（2026-09-25 阶段 0，settle 车道）。铁律：路由表未命中
+    # （空表/kill-switch → source=="env"）时上面的 env 链路逐字节不动；仅
+    # source=="routing" 命中才覆盖端点——openai 云端档吃 base_url/model/
+    # api_key + enable_thinking；local 档显式改端点（model 空沿用现值）。
+    # 合并注记（origin/main 安全波 × 本线路由波）：api_key 的**基线**是上面
+    # settings/env 的凭据链（BOK_SETTLE_LLM_API_KEY + "mlx" 哨兵治理），这里
+    # 不再清零——仅 routing 命中 openai 档时被路由表覆盖；未命中时凭据照旧
+    # 可用（否则「设置页存了云端 key」在无路由表时被静默丢弃、云端点 401）。
+    enable_thinking = False
+    route = resolve_route("settle", os.environ, read_model_routing_raw())
+    if route.source == "routing":
+        if route.provider == PROVIDER_OPENAI:
+            base_url, model = route.base_url, route.model
+            api_key, enable_thinking = route.api_key, route.enable_thinking
+        elif route.base_url:
+            base_url = route.base_url.rstrip("/")
+            if route.model:
+                model = route.model
+        else:
+            # 路由 local 档未给端点（手改列坏数据）=视同未命中，走上面 env 链。
+            pass
+    return base_url, model, api_key, enable_thinking
+
+
 class Summarizer:
     """Runs conversation → summary/topics/insight through the configured LLM.
 
@@ -66,54 +125,7 @@ class Summarizer:
         transcript = self._render_transcript(turns)
         if not transcript:
             return {"summary": "", "new_topics": [], "insight": None}
-        llm_cfg = settings.get("llm", {}) or {}
-        base_url = (llm_cfg.get("base_url") or "").rstrip("/")
-        model = (llm_cfg.get("model") or "").strip()
-        # settle 专线优先(BOK_SETTLE_*,bok.py 注入指向 :1237 9B):纪要/蒸馏係
-        # 延迟不敏感的后台重活,大模型质量↑且与活通话的 :1235 完全隔离;env
-        # 缺席回退原链路(settings llm 卡 > MLX_LLM_* env,语义同旧)。
-        _settle_base = os.environ.get("BOK_SETTLE_LLM_BASE_URL", "").strip()
-        _settle_model = os.environ.get("BOK_SETTLE_LLM_MODEL", "").strip()
-        api_key = (llm_cfg.get("api_key") or "").strip()
-        if _settle_base and _settle_model:
-            base_url, model = _settle_base.rstrip("/"), _settle_model
-            # 专线若指向云端（DeepSeek 等）必须有凭据——本地 MLX 不校验时这是个空串，
-            # 语义不变。凭据只走 env（与 BOK_SETTLE_LLM_* 同款 CP 面注入），不落盘。
-            api_key = os.environ.get("BOK_SETTLE_LLM_API_KEY", "").strip() or api_key
-        # `"mlx"` 是本仓既有的「本地端点不校验凭据」哨兵（与 agent `_llm_judge` 的
-        # api_key 缺省同值）——设置页本地卡就存这个字面量，它**不是**凭据，不许变成
-        # Authorization 头（否则本地档的请求形状也变了）。
-        if api_key == "mlx":
-            api_key = ""
-        # 设置页 LLM 卡片可存空 base_url / 占位 model="local"；本机 MLX 的真实地址
-        # 由启动器经 env 注入（与 agent 的 MlxLlmLLM 同一来源）。只读 settings 会打到
-        # 空 URL / model=local → mlx_lm 404 → 蒸馏表（new_topics/insight）永不写入。
-        if not base_url or not model or model == "local":
-            env_base = os.environ.get("MLX_LLM_BASE_URL", "http://127.0.0.1:1235/v1").rstrip("/")
-            env_model = (os.environ.get("MLX_LLM_MODEL") or "").strip()
-            if env_base and env_model:
-                base_url, model = env_base, env_model
-        # 模型路由合流（2026-09-25 阶段 0，settle 车道）。铁律：路由表未命中
-        # （空表/kill-switch → source=="env"）时上面的 env 链路逐字节不动；仅
-        # source=="routing" 命中才覆盖端点——openai 云端档吃 base_url/model/
-        # api_key + enable_thinking；local 档显式改端点（model 空沿用现值）。
-        # 合并注记（origin/main 安全波 × 本线路由波）：api_key 的**基线**是上面
-        # settings/env 的凭据链（BOK_SETTLE_LLM_API_KEY + "mlx" 哨兵治理），这里
-        # 不再清零——仅 routing 命中 openai 档时被路由表覆盖；未命中时凭据照旧
-        # 可用（否则「设置页存了云端 key」在无路由表时被静默丢弃、云端点 401）。
-        enable_thinking = False
-        route = resolve_route("settle", os.environ, read_model_routing_raw())
-        if route.source == "routing":
-            if route.provider == PROVIDER_OPENAI:
-                base_url, model = route.base_url, route.model
-                api_key, enable_thinking = route.api_key, route.enable_thinking
-            elif route.base_url:
-                base_url = route.base_url.rstrip("/")
-                if route.model:
-                    model = route.model
-            else:
-                # 路由 local 档未给端点（手改列坏数据）=视同未命中，走上面 env 链。
-                pass
+        base_url, model, api_key, enable_thinking = _resolve_settle_endpoint(settings)
         if not base_url or not model:
             return self._fallback(turns)
         try:
@@ -126,8 +138,7 @@ class Summarizer:
             print(f"[summarize] LLM summary failed, falling back: {exc!r}", flush=True)
             return self._fallback(turns)
 
-    def _via_llm(
-        self,
+    def _via_llm(        self,
         base_url: str,
         model: str,
         transcript: str,
@@ -178,7 +189,20 @@ class Summarizer:
         post_kwargs: dict[str, Any] = {"json": payload, "timeout": timeout}
         if api_key:
             post_kwargs["headers"] = {"Authorization": f"Bearer {api_key}"}
-        r = httpx.post(f"{base_url}/chat/completions", **post_kwargs)
+        # 出站闸门（e2e_campaign._api 同形状，sink 级就地校验）：post 前校验 URL
+        # ——仅 http/https、host 非空、无 userinfo；不过闸=PermissionError。
+        # settle LLM 端点来自路由表/env（运维配置面，可指云端，不锁环回）。
+        url = f"{base_url}/chat/completions"
+        parts = urllib.parse.urlsplit(url)
+        host = (parts.hostname or "").lower()
+        if not (
+            parts.scheme in ("http", "https")
+            and bool(host)
+            and not parts.username
+            and not parts.password
+        ):
+            raise PermissionError(f"出站 URL 未过护栏（拒发）: {url}")
+        r = httpx.post(url, **post_kwargs)
         r.raise_for_status()
         content = r.json()["choices"][0]["message"].get("content", "")
         return self._parse(content)

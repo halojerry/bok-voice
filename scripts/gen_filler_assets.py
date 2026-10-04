@@ -31,9 +31,29 @@ import json
 import os
 import sqlite3
 import sys
+import urllib.parse
 import urllib.request
 import wave
 from pathlib import Path
+
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def _safe_urlopen(req, *, timeout: float, context=None):
+    """出站闸门（tools/bok.py 同形状）：urlopen 前就地校验 Request.full_url
+    ——仅 http/https、host 非空、无 userinfo；不过闸=PermissionError。
+    本脚本目标=MiniMax 云端 TTS 端点（显式 host）。"""
+    parts = urllib.parse.urlsplit(req.full_url)
+    host = (parts.hostname or "").lower()
+    if not (
+        parts.scheme in ("http", "https")
+        and (host in _LOOPBACK_HOSTS or bool(host))
+        and not parts.username
+        and not parts.password
+    ):
+        raise PermissionError(f"出站 URL 未过护栏（拒发）: {req.full_url}")
+    return urllib.request.urlopen(req, timeout=timeout, context=context)
+
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "apps" / "agent"))
@@ -303,7 +323,7 @@ def synth_pcm(key: str, base: str, text: str, voice: str, speed: float, pitch: i
                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=60, context=ctx) as resp:
+            with _safe_urlopen(req, timeout=60, context=ctx) as resp:
                 data = json.loads(resp.read().decode())
         except Exception as exc:  # noqa: BLE001 - 传输层失败退避重试(末次见下 raise)
             last = f"transport error={exc!r}"

@@ -74,6 +74,11 @@ import time
 import wave
 from pathlib import Path
 
+# 垫话池条目选取/gap 时长=非安全随机；SystemRandom 实例（CWE-338 语义归位：
+# 选取行为与 random.* 逐字节同分布，测试无 seed 依赖——test_filler_context
+# 本就按掷硬币容差写）。
+_RNG = random.SystemRandom()
+
 FILLER_ASSETS_DIR = Path(__file__).resolve().parent / "assets" / "fillers"
 
 # livekit BackgroundAudioPlayer 内部音轨固定 48k(AudioSource(48000)+AudioMixer(48000),
@@ -150,7 +155,7 @@ def filler_gap_s() -> float:
             return max(0.0, int(env) / 1000)
         except ValueError:
             pass
-    return random.uniform(0.3, 0.6)
+    return _RNG.uniform(0.3, 0.6)
 
 
 _PAUSE_MARK_RE = re.compile(r"<#\d+(?:\.\d+)?#>")
@@ -1231,7 +1236,7 @@ class FillerDirector:
             b_pool = [e for e in pool if e.get("cat") == bcat]
             if b_pool:
                 candidates = self._dedup_two_stage(b_pool) or list(b_pool)
-                entry = random.choice(candidates)
+                entry = _RNG.choice(candidates)
                 self._record_recent(entry)
                 return entry
             # 桶无专属资产但桶语义指向明确 cat → cat 覆写(query=查证承诺域)。
@@ -1257,9 +1262,9 @@ class FillerDirector:
         # 命中抽签时同走两窗去重(排光回退同文件窗,窗内全占才允许重复)。
         # 池里无 hesitation 条目=此分支短路,既有行为逐字节不变。
         hes_pool = [e for e in pool if e.get("cat") == HESITATION_CAT]
-        if hes_pool and _hesitation_enabled() and random.random() < HESITATION_BLEND_PROB:
+        if hes_pool and _hesitation_enabled() and _RNG.random() < HESITATION_BLEND_PROB:
             hes_candidates = self._dedup_two_stage(hes_pool) or list(hes_pool)
-            entry = random.choice(hes_candidates)
+            entry = _RNG.choice(hes_candidates)
             self._record_recent(entry)
             return entry
         candidates = self._dedup_two_stage(preferred)
@@ -1267,7 +1272,7 @@ class FillerDirector:
             candidates = self._dedup_two_stage(pool)
         if not candidates:
             candidates = list(pool)
-        entry = random.choice(candidates)
+        entry = _RNG.choice(candidates)
         self._record_recent(entry)
         return entry
 
@@ -1302,7 +1307,7 @@ class FillerDirector:
         picked = self._dedup_two_stage(short_half) or self._dedup_two_stage(candidates)
         if not picked:
             picked = short_half
-        entry = random.choice(picked)
+        entry = _RNG.choice(picked)
         self._record_recent(entry)
         return entry
 

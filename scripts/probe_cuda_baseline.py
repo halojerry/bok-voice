@@ -8,9 +8,29 @@ import argparse
 import base64
 import json
 import time
+import urllib.parse
 import urllib.request
 from datetime import date
 from pathlib import Path
+
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def _safe_urlopen(req, *, timeout: float):
+    """出站闸门（tools/bok.py 同形状）：urlopen 前就地校验 Request.full_url
+    ——仅 http/https、host 非空、无 userinfo；不过闸=PermissionError。
+    远端 CUDA 节点目标由 main 入口的 urlguard gate（BOK_PROBE_EXTRA_HOSTS
+    显式放行）先行把守；本闸是 sink 级第二道。"""
+    parts = urllib.parse.urlsplit(req.full_url)
+    host = (parts.hostname or "").lower()
+    if not (
+        parts.scheme in ("http", "https")
+        and (host in _LOOPBACK_HOSTS or bool(host))
+        and not parts.username
+        and not parts.password
+    ):
+        raise PermissionError(f"出站 URL 未过护栏（拒发）: {req.full_url}")
+    return urllib.request.urlopen(req, timeout=timeout)
 
 
 def _pct(values: list[float], q: float) -> float:
@@ -24,7 +44,7 @@ def _post_json(url: str, payload: dict, timeout: float = 60.0) -> tuple[dict, fl
         headers={"Content-Type": "application/json"}, method="POST",
     )
     t0 = time.perf_counter()
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _safe_urlopen(req, timeout=timeout) as resp:
         data = json.loads(resp.read().decode())
     return data, (time.perf_counter() - t0) * 1000
 
@@ -42,7 +62,7 @@ def probe_llm_ttft(base_url: str, model_path: str, rounds: int) -> list[float]:
             headers={"Content-Type": "application/json"}, method="POST",
         )
         t0 = time.perf_counter()
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with _safe_urlopen(req, timeout=120) as resp:
             resp.readline()  # 首个 SSE chunk 到达即 TTFT
         ttfts.append((time.perf_counter() - t0) * 1000)
     return ttfts
@@ -72,6 +92,11 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="只打印将执行的探针计划")
     ap.add_argument("--out", default=f"reports/cuda_baseline_{date.today().isoformat()}.json")
     args = ap.parse_args()
+
+    from urlguard_gate import gate
+
+    if not args.dry_run:
+        gate(args.llm, args.asr)  # 本地诊断白名单；远端 CUDA 节点用 BOK_PROBE_EXTRA_HOSTS 显式放行
 
     if args.dry_run:
         print(f"[plan] LLM TTFT x{args.rounds} -> {args.llm}/v1/chat/completions (model={args.model_path})")

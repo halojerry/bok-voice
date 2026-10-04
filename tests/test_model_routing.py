@@ -267,16 +267,19 @@ class _FakeResp:
 
 
 def test_probe_ok_and_model_discovery(monkeypatch):
+    from control_plane import main as cp_main
+
     client, _repo = _client_and_repo(monkeypatch)
     # 云端档带 model：直探 /chat/completions
     assert _put_judge_cloud(client).status_code == 200
     calls: list[tuple] = []
 
-    def fake_post(url, json=None, headers=None, timeout=None, **kw):
-        calls.append(("post", url, headers))
+    # 出站 seam=cp_main._routing_http_request（httpx 收在单点内，测试钉单点）
+    def fake_post(method, url, **kw):
+        calls.append((method, url, kw.get("headers")))
         return _FakeResp({"choices": [{"message": {"content": "ok"}}]})
 
-    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(cp_main, "_routing_http_request", fake_post)
     r = client.post("/api/model-routing/test", json={"lane": "judge"})
     assert r.status_code == 200
     body = r.json()
@@ -290,11 +293,11 @@ def test_probe_ok_and_model_discovery(monkeypatch):
     assert client.put("/api/model-routing", json={"lanes": {"mining": {
         "provider": "local", "base_url": "http://fixture-local:1235/v1"}}}).status_code == 200
 
-    def fake_get(url, headers=None, timeout=None, **kw):
-        calls.append(("get", url, headers))
+    def fake_get(method, url, **kw):
+        calls.append((method, url, kw.get("headers")))
         return _FakeResp({"data": [{"id": "/models/mini-4b"}, {"id": "other"}]})
 
-    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(cp_main, "_routing_http_request", fake_get)
     r = client.post("/api/model-routing/test", json={"lane": "mining"})
     assert r.status_code == 200 and r.json()["ok"] is True
     assert r.json()["model"] == "/models/mini-4b"
@@ -303,13 +306,15 @@ def test_probe_ok_and_model_discovery(monkeypatch):
 
 
 def test_probe_failure_is_ok_false_never_500(monkeypatch):
+    from control_plane import main as cp_main
+
     client, _repo = _client_and_repo(monkeypatch)
     assert _put_judge_cloud(client).status_code == 200
 
     def fake_post(*a, **kw):
         raise httpx.ConnectError("boom")
 
-    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(cp_main, "_routing_http_request", fake_post)
     r = client.post("/api/model-routing/test", json={"lane": "judge"})
     assert r.status_code == 200
     body = r.json()

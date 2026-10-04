@@ -171,7 +171,7 @@ def test_filter_deflect_keeps_hesitation_family():
 
 
 def test_filler_entries_table_and_seed(tmp_path):
-    from sqlalchemy import create_engine, text
+    from sqlalchemy import create_engine
 
     import bok_voice_business_db.models as models
     from control_plane.deps import _FILLER_SEEDS, build_engine
@@ -182,18 +182,18 @@ def test_filler_entries_table_and_seed(tmp_path):
         eng = build_engine()
         assert eng is not None
         with eng.connect() as conn:
-            n = conn.execute(text("SELECT COUNT(*) FROM filler_entries")).scalar()
+            n = conn.exec_driver_sql("SELECT COUNT(*) FROM filler_entries").scalar()
             assert n == len(_FILLER_SEEDS)
             langs = dict(
-                conn.execute(
-                    text("SELECT lang, COUNT(*) FROM filler_entries GROUP BY lang")
+                conn.exec_driver_sql(
+                    "SELECT lang, COUNT(*) FROM filler_entries GROUP BY lang"
                 ).fetchall()
             )
         assert set(langs) >= {"zh", "cantonese", "en"}
         # 种子幂等:再跑 build_engine 不重复灌
         build_engine()
         with eng.connect() as conn:
-            n2 = conn.execute(text("SELECT COUNT(*) FROM filler_entries")).scalar()
+            n2 = conn.exec_driver_sql("SELECT COUNT(*) FROM filler_entries").scalar()
         assert n2 == n
     finally:
         os.environ.pop("DATABASE_URL", None)

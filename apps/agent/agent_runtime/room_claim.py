@@ -17,12 +17,16 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 from pathlib import Path
 
 _KILL_SWITCH_ENV = "BOK_ROOM_CLAIM"
 _DIR_ENV = "BOK_ROOM_CLAIM_DIR"
+# 锁文件名字符集白名单：房名是 CP 派发的 id（call-xxx 形态），但拼路径前
+# 就地收敛——穿越段（../、路径分隔、空字节）一律映射为 _，越界字符不进文件名。
+_ROOM_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def claims_dir() -> Path:
@@ -47,8 +51,8 @@ class RoomClaim:
     """单 room 互斥令牌:acquire() 成功后持有至 release()/进程退出。"""
 
     def __init__(self, room: str) -> None:
-        self.room = room
-        self._path = claims_dir() / f"{room}.lock"
+        self.room = _ROOM_SAFE.sub("_", str(room or ""))[:128] or "unknown"
+        self._path = claims_dir() / f"{self.room}.lock"
         self._fd: int | None = None
 
     def acquire(self, job_id: str = "") -> tuple[bool, str]:

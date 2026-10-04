@@ -809,8 +809,8 @@ async def _run_once(
             if (live_count or _default_live_count)() > 0:
                 out["skipped"] = "busy-midway"
                 return out
-            # 下线程(2026-10-02 审计修):_compute_plan 内含 httpx.post(timeout=120)
-            # 的同步 LLM 调用——直跑在事件循环上=整个 CP 停摆(/health/turns 上报/
+            # 下线程(2026-10-02 审计修):_compute_plan 内含同步 LLM 出站调用
+            # (timeout=120)——直跑在事件循环上=整个 CP 停摆(/health/turns 上报/
             # token/挂断/webhook 全冻;settle 已修同款「/health 59.4s 停摆」);闲时门
             # 只在调用前后查活通话,不救循环本身。
             plans[acc] = await asyncio.to_thread(

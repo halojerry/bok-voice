@@ -284,8 +284,7 @@ def main() -> None:
         cols = [d[0] for d in cur.description]
         snap = json.dumps(dict(zip(cols, snapshot)), ensure_ascii=False)
         cur.execute(
-            "INSERT INTO conversation_template_revisions (id, template_id, revision, snapshot, updated_at)"
-            " VALUES (?,?,?,?,datetime('now'))",
+            "INSERT INTO conversation_template_revisions (id, template_id, revision, snapshot, updated_at) VALUES (?,?,?,?,datetime('now'))",  # noqa: E501
             (f"rev-{tid}-{rev}", tid, rev, snap),
         )
         print(f"  applied + revision #{rev} snapshot")

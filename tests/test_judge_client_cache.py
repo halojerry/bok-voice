@@ -197,15 +197,15 @@ def test_post_abort_posts_server_contract(monkeypatch):
     """载荷形状=services/llm-mlx/bok_mlx_server.py 契约:{root}/v1/abort + {"request_id"}。"""
     seen: dict = {}
 
-    def fake_urlopen(req, timeout=None):
-        seen["url"] = req.full_url
-        seen["method"] = req.method
-        seen["data"] = req.data
-        seen["timeout"] = timeout
-        seen["ctype"] = req.get_header("Content-type")
+    def fake_http_call(url, method="GET", *, body=None, headers=None, timeout_s=5.0):
+        seen["url"] = url
+        seen["method"] = method
+        seen["data"] = body
+        seen["timeout"] = timeout_s
+        seen["ctype"] = (headers or {}).get("Content-Type")
         raise _CapturedRequest("stop here")
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(agent_mod, "_http_call", fake_http_call)
     agent_mod._post_abort(_LOCAL, "abc123")  # 绝不 raise（_CapturedRequest 被吞）
     assert seen["url"] == "http://127.0.0.1:1235/v1/abort"
     assert seen["method"] == "POST"

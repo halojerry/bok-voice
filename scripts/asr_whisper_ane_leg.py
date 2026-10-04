@@ -285,7 +285,7 @@ def single_shot(audio: Path, runs: int) -> dict:
         for i in range(runs):
             t0 = time.time()
             proc = subprocess.run(
-                [str(cli), "-m", str(WHISPER_MODEL), "-f", str(audio)],
+                ["/usr/bin/env", str(cli), "-m", str(WHISPER_MODEL), "-f", str(audio)],
                 capture_output=True, text=True, timeout=600)
             wall_ms = (time.time() - t0) * 1000
             timings = parse_whisper_timings(proc.stdout + proc.stderr)

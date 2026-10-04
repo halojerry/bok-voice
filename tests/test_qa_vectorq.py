@@ -235,8 +235,7 @@ def test_hit_threshold_migration_upgrades_legacy_db(tmp_path, monkeypatch):
     db = tmp_path / "vtq-legacy.db"
     conn = sqlite3.connect(db)
     conn.execute(
-        "CREATE TABLE qa_entries ("
-        " id VARCHAR(64) PRIMARY KEY, question_text TEXT, answer_text TEXT)"
+        "CREATE TABLE qa_entries (id VARCHAR(64) PRIMARY KEY, question_text TEXT, answer_text TEXT)"
     )
     conn.commit()
     conn.close()

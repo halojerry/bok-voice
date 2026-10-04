@@ -128,8 +128,9 @@ export function renderVarsText(
 }
 
 // —— 行分类（parseStepRefParts 同款三段拆分的简化内嵌版,零 import）——
-// flow.py:96/:99 _BRANCH_LINE_RE/_NOTE_LINE_RE 的移植（与 lib/flow-canvas.ts 逐语义一致）。
-const BRANCH_RE = /^(如果客户|(?:If|When)\s+the\s+customer)\s*(.{1,120}?)\s*→\s*(\S.*)$/i;
+// branch_syntax.BRANCH_LINE_RE 的移植（与 lib/flow-canvas.ts 逐语义一致,
+// 锚词简繁并收 2026-10-04 C1——繁体「如果客戶」分支此前在此漏分类）。
+const BRANCH_RE = /^(如果客户|如果客戶|(?:If|When)\s+the\s+customer)\s*(.{1,120}?)\s*→\s*(\S.*)$/i;
 const NOTE_RE = /^(?:注意|Notes?)\s*[:：]\s*(.+)$/i;
 
 export type RefSection = "script" | "branch" | "note";

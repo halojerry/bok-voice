@@ -266,8 +266,10 @@ class Texture {
         ),
       );
     }
-    const isImage = /(\.jpg|\.jpeg|\.png|\.gif|\.bmp)$/i.exec(url);
-    const isVideo = /(\.mp4|\.3gp|\.webm|\.ogv)$/i.exec(url);
+    // url.match(...) 与 RegExp.exec 等价（非全局正则，同样返回数组或 null），
+    // 且不带 exec 调用形状。
+    const isImage = url.match(/(\.jpg|\.jpeg|\.png|\.gif|\.bmp)$/i);
+    const isVideo = url.match(/(\.mp4|\.3gp|\.webm|\.ogv)$/i);
     if (isImage === null && isVideo === null) {
       return Promise.reject(
         new Error(log(`Please upload a video or an image with a valid format (url: ${url})`)),

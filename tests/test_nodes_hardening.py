@@ -205,7 +205,7 @@ def test_license_revoke_tags_nodes_root():
 def test_deps_build_engine_adds_killswitch_columns_fresh_and_migrated(tmp_path, monkeypatch):
     """build_engine 幂等补列回归：fresh 库与「缺三列的存量库」二跑后
     nodes.revoked_source/revoked_at 与 call_sessions.node_id 都在。"""
-    from sqlalchemy import create_engine, inspect as sa_inspect, text
+    from sqlalchemy import create_engine, inspect as sa_inspect
 
     from control_plane.deps import build_engine
 
@@ -223,9 +223,9 @@ def test_deps_build_engine_adds_killswitch_columns_fresh_and_migrated(tmp_path, 
     engine.dispose()
     raw = create_engine(f"sqlite:///{db}", future=True)
     with raw.begin() as conn:
-        conn.execute(text("ALTER TABLE nodes DROP COLUMN revoked_source"))
-        conn.execute(text("ALTER TABLE nodes DROP COLUMN revoked_at"))
-        conn.execute(text("ALTER TABLE call_sessions DROP COLUMN node_id"))
+        conn.exec_driver_sql("ALTER TABLE nodes DROP COLUMN revoked_source")
+        conn.exec_driver_sql("ALTER TABLE nodes DROP COLUMN revoked_at")
+        conn.exec_driver_sql("ALTER TABLE call_sessions DROP COLUMN node_id")
     raw.dispose()
     engine2 = build_engine()
     assert engine2 is not None
@@ -243,7 +243,7 @@ def test_deps_dedupes_duplicate_fingerprint_rows(tmp_path):
     NODES_FP_DEDUPE_SQL（与启动迁移同一语句，防漂移）：行数收敛、每组保留
     MAX(id) 行、随后唯一索引可建成；open-mode（license_id=''）行不受影响。
     """
-    from sqlalchemy import create_engine, text
+    from sqlalchemy import create_engine
 
     from control_plane.deps import NODES_FP_DEDUPE_SQL
 
@@ -254,7 +254,7 @@ def test_deps_dedupes_duplicate_fingerprint_rows(tmp_path):
     with engine.begin() as conn:
         # 同 (lic-1, fp-A) 三行：应只留 MAX(id)='node-n3'；另置一组 (lic-2, fp-B)
         # 重复两行 + 一行 open-mode（license_id=''）重复两行（必须原样保留）。
-        conn.execute(text(
+        conn.exec_driver_sql(
             "INSERT INTO nodes (id, org_id, name, token_hash, platform, version,"
             " status, metrics_json, license_id, fingerprint, created_at) VALUES"
             "('node-n1','o','a','','t','v','offline','{}','lic-1','fp-A','2026-09-16 00:00:01'),"
@@ -264,25 +264,25 @@ def test_deps_dedupes_duplicate_fingerprint_rows(tmp_path):
             "('node-m2','o','m2','','t','v','offline','{}','lic-2','fp-B','2026-09-16 00:00:01'),"
             "('node-o1','o','o1','','t','v','offline','{}','','fp-X','2026-09-16 00:00:01'),"
             "('node-o2','o','o2','','t','v','offline','{}','','fp-X','2026-09-16 00:00:01')"
-        ))
-        result = conn.execute(text(NODES_FP_DEDUPE_SQL))
+        )
+        result = conn.exec_driver_sql(NODES_FP_DEDUPE_SQL)
         # lic-1 组删 2（留 n3）、lic-2 组删 1（留 m2）；open-mode 组零删除。
         assert result.rowcount == 3, result.rowcount
-        remaining = dict(conn.execute(
-            text("SELECT id, license_id FROM nodes")
+        remaining = dict(conn.exec_driver_sql(
+            "SELECT id, license_id FROM nodes"
         ).fetchall())
     assert set(remaining) == {"node-n3", "node-m2", "node-o1", "node-o2"}
     assert remaining["node-n3"] == "lic-1" and remaining["node-m2"] == "lic-2"
     # 去重后部分唯一索引必须可建成（重复行在则 IntegrityError）。
     with engine.begin() as conn:
-        conn.execute(text(
+        conn.exec_driver_sql(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_nodes_license_fingerprint "
             "ON nodes (license_id, fingerprint) WHERE license_id <> ''"
-        ))
+        )
     # 幂等：再跑一遍零删除，索引仍在。
     with engine.begin() as conn:
-        assert conn.execute(text(NODES_FP_DEDUPE_SQL)).rowcount == 0
-        conn.execute(text(
+        assert conn.exec_driver_sql(NODES_FP_DEDUPE_SQL).rowcount == 0
+        conn.exec_driver_sql(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_nodes_license_fingerprint "
             "ON nodes (license_id, fingerprint) WHERE license_id <> ''"
-        ))
+        )

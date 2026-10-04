@@ -232,8 +232,12 @@ def test_migration_adds_owner_columns(tmp_path, monkeypatch):
     build_engine()  # 幂等：二启不报错
 
     c = sqlite3.connect(db)
-    cols = {t: [r[1] for r in c.execute(f"PRAGMA table_info({t})")]
-            for t in ("conversation_templates", "qa_entries", "call_sessions")}
+    # 字面量 SQL（无插值）：表名内联写死——测试夹具不走动态拼接。
+    cols = {
+        "conversation_templates": [r[1] for r in c.execute("PRAGMA table_info(conversation_templates)")],
+        "qa_entries": [r[1] for r in c.execute("PRAGMA table_info(qa_entries)")],
+        "call_sessions": [r[1] for r in c.execute("PRAGMA table_info(call_sessions)")],
+    }
     c.close()
     assert "owner_user_id" in cols["conversation_templates"]
     assert "owner_user_id" in cols["qa_entries"]

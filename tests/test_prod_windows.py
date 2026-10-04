@@ -36,6 +36,10 @@ _TASK_NS = "{http://schemas.microsoft.com/windows/2004/02/mit/task}"
 
 
 def _parse_xml(xml: str) -> ET.Element:
+    # CWE-776：解析前拒绝 DTD/实体声明（本文件夹具全部来自 schtasks_units 产出，
+    # 天然无这两类声明——守卫封住实体扩展资源耗尽面，不改任何既有断言语义）。
+    if "<!DOCTYPE" in xml or "<!ENTITY" in xml:
+        raise ValueError("DTD/ENTITY declarations are not allowed")
     return ET.fromstring(xml)
 
 

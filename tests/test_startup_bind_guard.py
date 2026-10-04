@@ -121,8 +121,9 @@ def test_module_wiring_non_loopback_env():
         "print(json.dumps({'origins': cors[0].kwargs['allow_origins'] if cors else None,"
         " 'refused': refused}))\n"
     )
+    # 子解释器=当前 venv 的 sys.executable（executable= 覆盖 argv[0] 占位符）。
     proc = subprocess.run(
-        [sys.executable, "-c", code], env=env, cwd=str(ROOT),
+        ["python3", "-c", code], executable=sys.executable, env=env, cwd=str(ROOT),
         capture_output=True, text=True, timeout=180,
     )
     assert proc.returncode == 0, proc.stderr[-800:]

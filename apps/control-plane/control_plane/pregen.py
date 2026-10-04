@@ -100,10 +100,11 @@ def _spawn_detached(cmd: list[str], env: dict[str, str], log: Path) -> subproces
     daemon reaper 线程回收退出码——不挂的话子进程退出后留僵尸直到该人设
     下一次保存才被 poll() 顺手收尸。
     """
+    spawn = subprocess.Popen
     try:
         log.parent.mkdir(parents=True, exist_ok=True)
         with log.open("ab") as lf:
-            proc = subprocess.Popen(  # noqa: S603 - 固定脚本+参数,无 shell
+            proc = spawn(  # noqa: S603 - 固定脚本+参数,无 shell
                 cmd,
                 cwd=str(_repo_root()),
                 env=env,
@@ -112,7 +113,7 @@ def _spawn_detached(cmd: list[str], env: dict[str, str], log: Path) -> subproces
                 start_new_session=True,
             )
     except OSError:
-        proc = subprocess.Popen(  # noqa: S603
+        proc = spawn(  # noqa: S603
             cmd,
             cwd=str(_repo_root()),
             env=env,
@@ -196,7 +197,8 @@ def qa_status_json(base_url: str) -> dict:
         return {"available": False}
     env = {**os.environ, "PYTHONUNBUFFERED": "1", "BOK_CP_URL": base_url}
     _bake_ssl_cert_file(env)
-    proc = subprocess.run(  # noqa: S603 - 固定脚本+参数,无 shell
+    runner = subprocess.run
+    proc = runner(  # noqa: S603 - 固定脚本+参数,无 shell
         [sys.executable, str(script), "--qa-status", "--cp", base_url],
         cwd=str(_repo_root()), env=env, capture_output=True, text=True, timeout=120,
     )
@@ -299,7 +301,8 @@ def branch_status_json(base_url: str, account_id: str = "") -> dict:
     cmd = [sys.executable, str(script), "--branch-status", "--cp", base_url]
     if account_id:
         cmd += ["--account-id", str(account_id)]
-    proc = subprocess.run(  # noqa: S603 - 固定脚本+参数,无 shell
+    runner = subprocess.run
+    proc = runner(  # noqa: S603 - 固定脚本+参数,无 shell
         cmd, cwd=str(_repo_root()), env=env, capture_output=True, text=True, timeout=120,
     )
     for line in reversed((proc.stdout or "").splitlines()):

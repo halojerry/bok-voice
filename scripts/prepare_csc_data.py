@@ -97,17 +97,15 @@ _LANE_TO_POLISH = {LANE_ZH: "zh", LANE_YUE: "cantonese"}
 DEFAULT_OUT_DIR = ROOT / "data" / "csc"
 
 # ---------------------------------------------------------------------------
-# ref 解析镜像(不 import agent_runtime：会拖 livekit 依赖)。逐字节对齐
-# apps/agent/agent_runtime/flow.py 的 _BRANCH_LINE_RE / _NOTE_LINE_RE /
-# _BRANCH_ACTION_RE——改那边语法必须同步这里与 lib/flow-canvas.ts。
+# ref 解析单源(2026-10-04 C1):正则三件套改吃 bok_voice_core.branch_syntax
+# ——此前本文件自持拷贝(且先一步收了繁体锚),与运行时 flow.py 口径漂移:
+# 训练料认「如果客戶」、运行时静默丢弃。现在四处(flow.py/flow-canvas.ts/
+# gap_proposals.py/本文件)同源,解析行为逐字节一致。
 # ---------------------------------------------------------------------------
-_BRANCH_LINE_RE = re.compile(
-    r"^(?:如果客户|如果客戶|(?:If|When)\s+the\s+customer)\s*(?P<cond>.{1,120}?)\s*→\s*(?P<resp>\S.*)$",
-    re.IGNORECASE,
-)
-_NOTE_LINE_RE = re.compile(r"^(?:注意|Notes?)\s*[:：]\s*(?P<note>.+)$", re.IGNORECASE)
-_BRANCH_ACTION_RE = re.compile(
-    r"^【\s*(?:收线|收線|挂断|掛斷|转人工|轉人工|跳第\s*\d{1,3}\s*步|留本步)\s*】\s*"
+from bok_voice_core.branch_syntax import (  # noqa: E402
+    BRANCH_ACTION_RE as _BRANCH_ACTION_RE,
+    BRANCH_LINE_RE as _BRANCH_LINE_RE,
+    NOTE_LINE_RE as _NOTE_LINE_RE,
 )
 
 # 含占位符的句子(模板变量未渲染)不进干净语料。

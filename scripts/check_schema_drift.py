@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Supabase schema 漂移门禁:scripts/.p0_supabase_schema.sql 产物 ≡ build_engine() 代码?
+"""Supabase schema 漂移门禁:scripts/artifacts/.p0_supabase_schema.sql 产物 ≡ build_engine() 代码?
 
 为什么存在:产物是「生成物,勿手改」,但生成后代码会继续演进——deps.build_engine()
 加列/改模型而忘记重跑 scripts/dump_postgres_ddl.py,新部署就拿旧 schema 引导,再靠
@@ -85,7 +85,7 @@ import smoke_postgres as _smoke  # noqa: E402
 
 PG_USER = _ddl.PG_USER
 PG_DB = _ddl.PG_DB
-DEFAULT_ARTIFACT = ROOT / "scripts" / ".p0_supabase_schema.sql"
+DEFAULT_ARTIFACT = ROOT / "scripts" / "artifacts" / ".p0_supabase_schema.sql"
 DEFAULT_IMAGE = "pgvector/pgvector:pg16"  # 必须带 pgvector,见模块 docstring 前置
 DEFAULT_PORT = 5441  # 5432-5438 常被本机其他栈占用,门禁专属宿主口
 CONTAINER_PREFIX = "schema-drift"
@@ -168,16 +168,20 @@ def _apply_artifact(container: str | None, url: str, sql_text: str) -> None:
     from sqlalchemy.engine.url import make_url
 
     if container is not None:
-        cmd = ["docker", "exec", "-i", container, "psql", "-U", PG_USER, "-v", "ON_ERROR_STOP=1", PG_DB]
-        env = None
+        proc = subprocess.run(
+            ["docker", "exec", "-i", container, "psql", "-U", PG_USER, "-v", "ON_ERROR_STOP=1", PG_DB],
+            input=sql_text, capture_output=True, text=True, env=None, timeout=_LOCAL_DUMP_TIMEOUT_S,
+        )
     else:
         u = make_url(url)
-        cmd = [
-            "psql", "-v", "ON_ERROR_STOP=1",
-            "-h", str(u.host), "-p", str(u.port), "-U", str(u.username), "-d", str(u.database),
-        ]
-        env = dict(os.environ, PGPASSWORD=u.password or "")
-    proc = subprocess.run(cmd, input=sql_text, capture_output=True, text=True, env=env, timeout=_LOCAL_DUMP_TIMEOUT_S)
+        proc = subprocess.run(
+            [
+                "psql", "-v", "ON_ERROR_STOP=1",
+                "-h", str(u.host), "-p", str(u.port), "-U", str(u.username), "-d", str(u.database),
+            ],
+            input=sql_text, capture_output=True, text=True,
+            env=dict(os.environ, PGPASSWORD=u.password or ""), timeout=_LOCAL_DUMP_TIMEOUT_S,
+        )
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout or "")[-4000:]
         raise GateEnvError(f"应用产物失败(psql 非零退出 {proc.returncode}):\n{tail}")
@@ -197,7 +201,7 @@ def _assert_local_dump_tools(url: str) -> None:
     admin = create_engine(url, poolclass=NullPool)
     try:
         with admin.connect() as conn:
-            server_num = int(conn.execute(text("SHOW server_version_num")).scalar() or 0)
+            server_num = int(conn.exec_driver_sql("SHOW server_version_num").scalar() or 0)
     finally:
         with contextlib.suppress(Exception):
             admin.dispose()
@@ -214,14 +218,14 @@ def _assert_local_dump_tools(url: str) -> None:
 
 def _create_database(base_url: str, name: str) -> str:
     """AUTOCOMMIT 建全新库(代码真源基线用);返回指向它的 SQLAlchemy URL。"""
-    from sqlalchemy import create_engine, text
+    from sqlalchemy import create_engine
     from sqlalchemy.engine.url import make_url
     from sqlalchemy.pool import NullPool
 
     admin = create_engine(base_url, isolation_level="AUTOCOMMIT", poolclass=NullPool)
     try:
         with admin.connect() as conn:
-            conn.execute(text(f'CREATE DATABASE "{name}"'))
+            conn.exec_driver_sql(f'CREATE DATABASE "{name}"')
     finally:
         with contextlib.suppress(Exception):
             admin.dispose()
@@ -229,14 +233,14 @@ def _create_database(base_url: str, name: str) -> str:
 
 
 def _drop_database(base_url: str, name: str) -> None:
-    from sqlalchemy import create_engine, text
+    from sqlalchemy import create_engine
     from sqlalchemy.pool import NullPool
 
     with contextlib.suppress(Exception):
         admin = create_engine(base_url, isolation_level="AUTOCOMMIT", poolclass=NullPool)
         try:
             with admin.connect() as conn:
-                conn.execute(text(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
+                conn.exec_driver_sql(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
         finally:
             with contextlib.suppress(Exception):
                 admin.dispose()
@@ -244,7 +248,7 @@ def _drop_database(base_url: str, name: str) -> None:
 
 def _wait_connectable(url: str, timeout_s: int = 60) -> None:
     """直连模式等库可连(服务容器即便有 healthcheck 也留一道防御)。"""
-    from sqlalchemy import create_engine, select
+    from sqlalchemy import create_engine
     from sqlalchemy.pool import NullPool
 
     deadline = time.time() + timeout_s
@@ -253,7 +257,7 @@ def _wait_connectable(url: str, timeout_s: int = 60) -> None:
         eng = create_engine(url, poolclass=NullPool)
         try:
             with eng.connect() as conn:
-                conn.execute(select(1))
+                conn.exec_driver_sql("SELECT 1")
             with contextlib.suppress(Exception):
                 eng.dispose()
             return
@@ -374,7 +378,7 @@ def _compare(a_lines: list[str], b_lines: list[str], f_lines: list[str]) -> bool
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        description="Supabase schema 漂移门禁(产物 scripts/.p0_supabase_schema.sql vs build_engine 代码)",
+        description="Supabase schema 漂移门禁(产物 scripts/artifacts/.p0_supabase_schema.sql vs build_engine 代码)",
     )
     ap.add_argument("--artifact", default=str(DEFAULT_ARTIFACT), help=f"产物路径(默认 {DEFAULT_ARTIFACT})")
     ap.add_argument("--image", default=DEFAULT_IMAGE, help=f"自起容器镜像,必须带 pgvector(默认 {DEFAULT_IMAGE})")

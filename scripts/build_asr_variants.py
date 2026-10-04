@@ -100,7 +100,8 @@ _INI_FUZZY = {"zh": ["z"], "ch": ["c"], "sh": ["s"], "n": ["l"], "l": ["n"],
 _FIN_FUZZY = {
     "ang": ["an"], "an": ["ang"], "eng": ["en"], "en": ["eng"],
     "ing": ["in"], "in": ["ing"], "iang": ["ian"], "ian": ["iang"],
-    "uang": ["uan"], "uan": ["uang"], "ong": ["on"], "ong": ["en"],
+    "uang": ["uan"], "uan": ["uang"], "ong": ["on", "en"],  # 2026-10-04 F601:旧
+    # 「"ong": ["on"], "ong": ["en"]」后键静默覆盖前键=ong 只剩 en,合并恢复双模糊
     "uo": ["o"], "o": ["uo"], "ai": ["ei"], "ei": ["ai"],
 }
 _INI_RE = re.compile(r"^(zh|ch|sh|[bpmfdtnlgkhjqxrzcsyw])?([a-zü]+)([1-5])?$")

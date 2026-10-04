@@ -6,7 +6,9 @@
     {"call_id": "call-x", "account_id": "acc-001", "worker": "a-line",
      "samples": [{"kind": "llm_ttft", "ms": 680.0, "ts": "2026-10-01T15:00:00Z"}, ...]}
 
-kind 枚举固定四种：llm_ttft / asr_transcribe / tts_first_audio / vad_infer。
+kind 枚举固定四种：llm_ttft / asr_transcribe / tts_first_audio / vad_infer
+（单源=``packages/core/bok_voice_core/metrics_kinds.py``——worker 上报/CP 滚动窗/
+端点 schema 三面共用，本模块只 import 别名）。
 
 形状纪律：
 - ``add(kind, ms)`` 同步入队（纯内存 append，无 await/IO，绝不阻塞通话链路）；
@@ -31,8 +33,11 @@ from datetime import datetime, timezone
 
 import httpx
 
-# 契约 §1 冻结枚举（CP 侧 kind→provider 映射：asr/llm/tts/vad）。
-KINDS = ("llm_ttft", "asr_transcribe", "tts_first_audio", "vad_infer")
+from bok_voice_core.metrics_kinds import METRICS_KINDS
+
+# 契约 §1 冻结枚举（单源=packages/core/bok_voice_core/metrics_kinds.py；CP 侧
+# kind→provider 映射：asr/llm/tts/vad）。模块级别名=现有调用方零改动。
+KINDS = METRICS_KINDS
 
 _DEFAULT_INTERVAL_S = 2.0
 _DEFAULT_MAX_BATCH = 50

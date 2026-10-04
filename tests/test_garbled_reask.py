@@ -272,8 +272,12 @@ def test_garbled_streak_guard_wiring_source_pinned():
     assert flag < write_first
     assert '"" if flow_ctrl.current != _flow_step_before else verdict,' in src
     assert "_band_round_is_garbled(" in src
-    assert "_background_flow_judge(_step_at, user_text, turn_key=_turn_key, garbled=_garbled_band_round)" in src
-    assert "async def _background_flow_judge(step_at: int, utt: str, turn_key: str = \"\", garbled: bool = False) -> None:" in src
+    # 2026-10-04 F821 根修:派发实参化(invalidate_preemptive 传参,行式改多行)
+    # ——钉住 garbled 实参仍在派发点,不钉单行形态。
+    _spawn_seg = src[src.index("_spawn_report(_background_flow_judge("):][:400]
+    assert "garbled=_garbled_band_round" in _spawn_seg
+    assert "invalidate_preemptive=_invalidate_stale_preemptive" in _spawn_seg
+    assert "async def _background_flow_judge(" in src and "garbled: bool = False" in src
     # judge 路三写点:note_turn_outcome/degrade_boost/unclear bump
     assert "if turn_key and flow_ctrl.current == step_at and not garbled:" in src
     assert "and flow_ctrl.current == step_at\n                and not garbled\n            ):" in src

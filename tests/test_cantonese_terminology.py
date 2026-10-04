@@ -9,7 +9,7 @@
 - test_volcano_v3.py / ARCHITECTURE.md：Volcano API dialect 枚举（外部接口字面量）
 - docs/superpowers/plans/2026-09-21-a-line-speed-asr-decision-verification.md：
   ASR 官方卡引述的外部数据集专名（Fleurs-yue / WenetSpeech-Yue / CV-yue）
-- docs/archive/**、AGENTS.md、AGENT.md、docs/CONTRACTS.md：历史档案与政策文档
+- docs/archive/**、AGENTS.md：历史档案与政策文档
 
 新增 yue 字面量 = 本测试失败。这是字段单轨化的防复发门禁：旧拼写只允许存在于
 「别人的接口」和「改写它的迁移」里，我们自己的命名/字段/键/值一律 cantonese。
@@ -46,6 +46,10 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     "scripts/ab_tts_first_chunk.py": re.compile(r"Chinese,Yue"),
     "scripts/bench_minimax_bidi.py": re.compile(r"Chinese,Yue"),
     "tests/test_interpret_tts_provider.py": re.compile(r"Chinese,Yue"),
+    # 2026-10-04 CI 真 PG 回归钉:yue→cantonese 迁移的 LIKE 通配语义测试——
+    # 「%yue%」是 DB 存量行匹配的迁移真值(deps.py 迁移同串,该文件已整文件
+    # 豁免),这里只豁免带该通配串/迁移名的行;其余行出现 yue 照样红。
+    "tests/test_db_portability.py": re.compile(r"%yue%|yue→cantonese"),
     "tests/test_fixed_language_call.py": re.compile(r"Chinese,Yue"),
     # P1(2026-10-01) SV-CPU 引擎车道:SenseVoice 外部语言枚举(yue,与 zh/en 同族
     # sherpa API 真字面量)+ HF repo id(zh-en-ja-ko-yue=仓库名 opaque 标识)。
@@ -55,7 +59,7 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     "scripts/eval_sensevoice.py": re.compile(r"yue"),
     "tools/bok.py": re.compile(r"zh-en-ja-ko-yue"),
     "tests/test_asr_engine_routing.py": re.compile(r"yue"),
-    "scripts/test_volcano_v3.py": None,
+    "scripts/archive/test_volcano_v3.py": None,
     # CSC 管线(2026-10-02 入库):yue 只作**车道标识**(LANE_YUE 常量收口单点,
     # 值="yue")与特征字计量(yue_markers_lost)——语言字段一律 cantonese
     # (lang 归一边界映射 in ("cantonese","yue","zh-yue") 同 whisper 先例)。
@@ -90,6 +94,15 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     # _VENDOR_LANG——MiniMax BCP-47(yue)与火山 SAUC language(yue-CN)两枚举
     # 同宿一行;只豁免带该枚举值的行,内部语言字段一律 cantonese。
     "scripts/probe_cloud_asr.py": re.compile(r'"yue"|yue-CN'),
+    # vendored s2s（Apache-2.0 上游镜像 @81b688b4）：Whisper/SenseVoice 的 BCP-47
+    # 语言枚举（"yue" token 表/解码选项/`"yue"→"cantonese"` 上游映射）是
+    # 「别人的接口」类不透明标识符——上游镜像不改写；我方接线
+    # （s2s_realtime/s2s_flow_worker）的语言字段仍一律 cantonese。
+    "services/s2s/src/speech_to_speech/LLM/utils.py": re.compile(r'"yue": "cantonese"'),
+    "services/s2s/src/speech_to_speech/STT/faster_whisper_handler.py": re.compile(r'"yue"'),
+    "services/s2s/src/speech_to_speech/STT/whisper_stt_handler.py": re.compile(r"<\|yue\|>|yue"),
+    "services/s2s/src/speech_to_speech/STT/README.md": re.compile(r"`yue`"),
+    "services/s2s/src/speech_to_speech/arguments_classes/sense_voice_stt_arguments.py": re.compile(r"auto, zh, en, yue, ja, or ko"),
     # 0e2ccad 归档件（0910-0913 历史 plan 文档/探针）：引述旧拼写均为决策记录与
     # 遗留 fixture 名匹配，非运行时语言字段——按行豁免，新文件仍全禁。
     "docs/superpowers/plans/2026-09-09-official-first.md": re.compile(r"yue"),
@@ -121,8 +134,6 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
         r"Fleurs-yue|WenetSpeech-Yue|CV-yue"
     ),
     "AGENTS.md": None,
-    "AGENT.md": None,
-    "docs/CONTRACTS.md": None,
     "tests/test_cantonese_terminology.py": None,
 }
 
