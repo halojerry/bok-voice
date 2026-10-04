@@ -15,7 +15,7 @@
 | `desktop` | Desktop shell (Rust) | `cargo test` + `cargo check` |
 
 - Trigger：`push: branches: ["**"]` + `pull_request:` → **每个分支每次 push 都全量跑一遍**，浪费且把关位置不对（应该 PR 才全量）。
-- `release.yml`：tag `v*` push 触发 → macOS/Windows 打包矩阵 + `verify_bundle.sh` + `gh release`。✅ 已带 5 平台 Cargo/pip 缓存、artifacts 上传。
+- `release.yml`：tag `v*` push 触发 → macOS/Windows 打包矩阵 + bundle 校验（verify_bundle.sh，已随 Tauri 桌面壳退役删除）+ `gh release`。✅ 已带 5 平台 Cargo/pip 缓存、artifacts 上传。
 
 ### 缺口
 
@@ -101,8 +101,8 @@ on:
 ### 5.1 ◻ release 加 `workflow_dispatch`
 `release.yml` 增加手动触发 + `dry-run` 开关（`dry-run=true` 时打包+verify 但不建 Release），让「打 tag 前先在 CI 上跑 staging 验收」成为一条显式路径。
 
-### 5.2 ◻ verify_bundle 显式矩阵
-`release.yml` 里把 `verify_bundle.sh --staging/--app/--doctor` 从注释纪律提成显式步骤（跑挂即 fail）。AGENTS.md 已要求：发布前 `doctor --packaged` 必须报 `token endpoint: ok (real JWT)`。
+### 5.2 ✗ verify_bundle 显式矩阵（2026-10-04 作废）
+原计划在 `release.yml` 里把 verify_bundle.sh --staging/--app/--doctor 从注释纪律提成显式步骤（跑挂即 fail）；该脚本已随 Tauri 桌面壳退役删除，本项作废。AGENTS.md 已要求：发布前 `doctor --packaged` 必须报 `token endpoint: ok (real JWT)`。
 
 ### 5.3 纪律（不机器化）
 - **Do not tag or release until full local acceptance passes**（项目政策，AGENTS.md）——tag 只能人工在本地全绿后打。

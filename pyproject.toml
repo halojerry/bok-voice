@@ -19,3 +19,10 @@ extend-exclude = ["packages/core/bok_voice_core/tojyutping_vendor", "services/s2
 #     存量文件的存量行不追——G2 拆包新模块天然生在全量规则之下。
 # 改本 select 须同步 .github/workflows/ci.yml 两步与 .pre-commit-config.yaml。
 select = ["E", "F", "W", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# scripts/**:G1 引导头(8 行固定形状,tests/test_script_bootstrap.py 钉形)与
+# isort/E402/E401 结构性冲突——头块必须在 docstring/__future__ 之后、业务
+# import 之前,单行双 import 是契约形状。排序/位置类规则在 scripts 让位;
+# E501/F401 等其余风格规则照常生效。
+"scripts/**" = ["I001", "E402", "E401"]

@@ -13,8 +13,18 @@
 **历史档白名单不改也不查**:docs/superpowers/**、docs/archive/**、reports/**。
 
 提取:markdown 链接 [x](path)、反引号 `path/to/file`、yml run: 行内路径 token;
-只认「含 / 或带已知扩展名」的仓内相对路径——http(s)://、纯单词、env 变量 $XXX、
-带通配符/占位符（* ? { } < >）的模板一律跳过。
+只认「含 / 或带已知扩展名」的形态——http(s)://、纯单词、env 变量 $XXX、带通配符/
+占位符（* ? { } < >）的模板一律跳过。
+
+在scope 判定（避免把外域/运行时引用误报成仓内断链）:
+  * 路径型引用（含 /）:首段必须是本仓当前顶层条目,或 RETIRED_ROOT_AREAS 记录的
+    已退役顶层目录（退役引用必须浮出,清理后应归零）;
+  * 裸文件名:仅当同一行还有**同扩展名**的引用确实解析到仓内文件时才算仓内断言
+    （成组列举里的死名字,如 REPO_MAP 构建脚本清单）;单独出现的运行时/上游
+    文件名（node-state.json、dataset.py 等）不当作仓内路径;
+  * 局部工作台（.superpowers/** 等 gitignored 工作台）、构建装配产物（runtime/**,
+    由 build_runtime.sh 在 CI 期生成）与 IGNORED_REFS（上游仓同形路径/计划态提案）
+    显式豁免。
 
 解析:相对引用文件所在目录 → 仓库根 → 全仓路径后缀匹配（容忍文档里的省略写法,
 如 `components/x.tsx` 实际在 apps/web/ 下）;`/` 开头按仓库根,但首段不在仓库顶层
@@ -27,6 +37,14 @@
 退出码:0=无断链;1=有断链（清单到 stdout:引用文件:行号 → 断链路径）。
 """
 from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
 # --- scripts import bootstrap (G1) ---
 # sys.path 引导(G1 迁移解耦,见 docs/superpowers/plans/2026-10-04-repo-governance-plan.md §3.1):
 # 同层时是 no-op;文件挪进任何桶后裸 import 兄弟模块继续解析。
@@ -35,13 +53,6 @@ _S = _pathlib.Path(__file__).resolve().parents[1]
 for _d in (_S, _S / "lib", _S / "e2e", _S / "probes", _S / "bench"):
     if str(_d) not in _sys.path:
         _sys.path.insert(0, str(_d))
-
-import argparse
-import json
-import os
-import re
-import sys
-from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -56,6 +67,25 @@ SKILL_DIR = Path(".agents") / "skills" / "call-diagnosis"
 
 # 历史档:治理计划定案不改引用,自然也不该被本检查器报（防御性排除）。
 HISTORICAL_PREFIXES = ("docs/superpowers/", "docs/archive/", "reports/")
+
+# 已退役顶层目录:治理计划已知删除、但活文档若仍指路必须浮出（清干净后为空引用）。
+RETIRED_ROOT_AREAS = frozenset({"desktop"})
+
+# 构建/装配产物顶层目录（gitignored,CI 期由 build_runtime.sh 生成）:
+# 对这些路径的引用不是仓内文件断言（release.yml 的 runtime staging 校验属此类）。
+GENERATED_ROOT_AREAS = frozenset({"runtime"})
+
+# 局部工作台/工具目录（gitignored,不随克隆分发）:提及它们不是仓内路径断言。
+LOCAL_ONLY_PREFIXES = (".superpowers/", ".zcode/", ".mimosa/")
+
+# 已人工确认的非仓内引用（上游仓同形路径 / 计划态提案）:豁免,但每条都要写理由。
+IGNORED_REFS = frozenset({
+    # livekit/components-js 上游仓的目录（AGENTS.md「官方 Agents UI 接入」注明来源）
+    "packages/shadcn/",
+    # docs/CI_CD_PLAN.md 未落地提案（◻ 项;落地后应从此表移除）
+    "apps/web/eslint.config.mjs",
+    ".github/PULL_REQUEST_TEMPLATE.md",
+})
 
 # 已知文件扩展名（含 / 的引用始终是候选;不带 / 的引用要有这些扩展名才查）。
 KNOWN_EXTS = frozenset({
@@ -80,7 +110,7 @@ INDEX_SKIP_DIRS = frozenset({
 _MD_LINK_RE = re.compile(r"\]\(\s*<?([^)>\s]+)>?(?:\s+[\"'][^\"']*[\"'])?\s*\)")
 _BACKTICK_RE = re.compile(r"`([^`\n]+)`")
 _YML_RUN_RE = re.compile(r"^(\s*(?:-\s+)?)run:\s*(.*)$")
-_YSML_BLOCK_MARKERS = ("|", ">", "|-", ">-", "|+", ">+")
+_YML_BLOCK_MARKERS = ("|", ">", "|-", ">-", "|+", ">+")
 _LINE_SUFFIX_RE = re.compile(r":\d+(?:-\d+)?$")
 _TOKEN_SAFE_RE = re.compile(r"[A-Za-z0-9_.][A-Za-z0-9_.+\-]*(?:/[A-Za-z0-9_.+\-]+)*/?")
 _ABS_REF_RE = re.compile(r"^/([A-Za-z0-9_.\-]+)(?:/|$)")
@@ -137,10 +167,17 @@ def extract_refs_from_text(text: str) -> list[str]:
         if not content:
             continue
         # 反引号里可能是命令/代码:逐 token 取路径形态的（python tools/bok.py serve → tools/bok.py）
-        for token in content.split():
-            ref = normalize_candidate(token)
-            if ref:
-                refs.append(ref)
+        refs.extend(extract_command_refs(content))
+    return refs
+
+
+def extract_command_refs(text: str) -> list[str]:
+    """从命令行文本（yml run: 行/块）提取路径 token;shell 变量/选项自然被过滤。"""
+    refs: list[str] = []
+    for token in text.split():
+        ref = normalize_candidate(token)
+        if ref:
+            refs.append(ref)
     return refs
 
 
@@ -158,7 +195,7 @@ def iter_yml_run_lines(path: Path):
             i += 1
             continue
         rest = m.group(2).strip()
-        if rest and rest not in _YSML_BLOCK_MARKERS:
+        if rest and rest not in _YML_BLOCK_MARKERS:
             yield i + 1, rest
             i += 1
             continue
@@ -224,11 +261,41 @@ def build_repo_index(root: Path) -> dict[str, list[str]]:
     return index
 
 
+def _ref_ext(ref: str) -> str:
+    """文件引用的扩展名（小写,不含点）;目录引用/无扩展名返回空串。"""
+    if ref.endswith("/"):
+        return ""
+    name = ref.rsplit("/", 1)[-1]
+    if "." not in name:
+        return ""
+    return name.rsplit(".", 1)[-1].lower()
+
+
+def ref_in_scope(ref: str, root_top: frozenset[str]) -> bool:
+    """引用是否是对本仓路径的断言（见模块 docstring 的 scope 判定）。"""
+    if ref.startswith(("..", "~")):
+        return False
+    if ref.startswith("/"):
+        m = _ABS_REF_RE.match(ref)
+        return bool(m) and m.group(1) in root_top
+    if ref.startswith(LOCAL_ONLY_PREFIXES):
+        return False
+    if ref in IGNORED_REFS:
+        return False
+    if "/" in ref:
+        first = ref.lstrip("./").split("/", 1)[0]
+        if first in GENERATED_ROOT_AREAS:
+            return False
+        return first in root_top or first in RETIRED_ROOT_AREAS
+    # 裸文件名:由调用方（同扩展名兄弟）二次判定
+    return bool(_ref_ext(ref))
+
+
 def ref_exists(
     ref: str,
     doc_dir_rel: Path,
     root: Path,
-    root_top: set[str],
+    root_top: frozenset[str],
     index: dict[str, list[str]],
 ) -> bool:
     """两段显式解析 + 全仓后缀匹配;容错文档里常见的省略目录写法。"""
@@ -260,7 +327,7 @@ def check_doc_paths(root: Path | str = ROOT) -> list[dict]:
     """返回断链清单:[{file, line, ref}, ...]（file 为仓库相对 posix 路径）。"""
     root = Path(root).resolve()
     index = build_repo_index(root)
-    root_top = {p.name for p in root.iterdir()}
+    root_top = frozenset(p.name for p in root.iterdir())
     broken: list[dict] = []
     seen: set[tuple[str, int, str]] = set()
     for doc in iter_live_docs(root):
@@ -272,22 +339,37 @@ def check_doc_paths(root: Path | str = ROOT) -> list[dict]:
         is_yml = doc.suffix in WORKFLOW_EXTS
         if is_yml:
             entries = list(iter_yml_run_lines(doc))
-            extract = extract_refs_from_text
         else:
             try:
                 lines = doc.read_text(encoding="utf-8", errors="replace").splitlines()
             except OSError:
                 continue
             entries = list(enumerate(lines, start=1))
-            extract = extract_refs_from_text
         for lineno, text in entries:
-            for ref in extract(text):
-                if not ref_exists(ref, doc_dir_rel, root, root_top, index):
-                    key = (rel_doc, lineno, ref)
-                    if key in seen:
+            refs = extract_command_refs(text) if is_yml else extract_refs_from_text(text)
+            if not refs:
+                continue
+            resolved = {
+                ref: ref_exists(ref, doc_dir_rel, root, root_top, index) for ref in refs
+            }
+            for ref in refs:
+                if not ref_in_scope(ref, root_top):
+                    continue
+                if resolved[ref]:
+                    continue
+                if "/" not in ref:
+                    # 裸文件名只在「同扩展名兄弟确实解析到仓内」时才算仓内断言
+                    ext = _ref_ext(ref)
+                    if not any(
+                        other != ref and resolved[other] and _ref_ext(other) == ext
+                        for other in refs
+                    ):
                         continue
-                    seen.add(key)
-                    broken.append({"file": rel_doc, "line": lineno, "ref": ref})
+                key = (rel_doc, lineno, ref)
+                if key in seen:
+                    continue
+                seen.add(key)
+                broken.append({"file": rel_doc, "line": lineno, "ref": ref})
     return broken
 
 

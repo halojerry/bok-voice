@@ -40,7 +40,7 @@ python tools/bok.py serve     # 拉起 control-plane/LiveKit/sidecars/LLM/agent
 ## 打包与发布
 
 - `scripts/build_runtime.sh`：装配内嵌运行时（standalone Python、Node、LiveKit、llama CUDA）
-- `scripts/verify_bundle.sh`：上传前硬门禁（结构 + 体积 ≤1.3GB + bundle 内 doctor）
+- bundle 上传门禁（旧 verify_bundle.sh）已随 Tauri 桌面壳退役删除（2026-09-17，见 git 史）
 - GitHub Actions：`ci.yml` 全量测试；tag `v*` 触发 `release.yml` 出 mac zip + Windows exe 并发布 Release
 
 ## 状态
