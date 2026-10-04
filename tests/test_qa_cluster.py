@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "packages" / "core"))
 
-_spec = importlib.util.spec_from_file_location("mine_qa", ROOT / "scripts" / "mine_qa.py")
+_spec = importlib.util.spec_from_file_location("mine_qa", ROOT / "scripts" / "runtime" / "mine_qa.py")
 mine_qa = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mine_qa)
 

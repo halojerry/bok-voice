@@ -127,7 +127,7 @@ def _entry_payload(r: dict, account: str) -> dict:
 
 
 def _run_pregen(cp: str) -> bool:
-    """跑 scripts/pregen_tts.py --qa 物化(继承 env:BOK_CP_URL/TOKEN、
+    """跑 scripts/runtime/pregen_tts.py --qa 物化(继承 env:BOK_CP_URL/TOKEN、
     MINIMAX_API_KEY、SSL_CERT_FILE 均由 bok.py/调用方透传)。返回是否成功。"""
     pregen = Path(__file__).resolve().parent / "pregen_tts.py"
     try:

@@ -1,11 +1,12 @@
-"""Q→A 同义聚类纯函数(2026-09-19 W3-T1 从 scripts/mine_qa.py --cluster 上移)。
+"""Q→A 同义聚类纯函数(2026-09-19 W3-T1 从 CLI ``mine_qa.py --cluster`` 上移;
+2026-10-04 G1b 后 CLI 位于 scripts/runtime/mine_qa.py)。
 
 零网络零 IO:LLM 决策解析、三列计划、按语言分批的消息组装。CLI(tts-mine
 --cluster)与 CP 端点(POST /api/qa/cluster)共用同一份,保证「LLM 提议、
 字数门处决」「候选原话即匹配面」「答案继承目标词条防漂移」的口径全仓唯一。
 
 与 mine_qa.py 的分工:这里只有可单测的纯函数;LLM 调用/模型发现/单飞/缓存
-在各自调用方(scripts/mine_qa.py、apps/control-plane/control_plane/qa_cluster.py)。
+在各自调用方(scripts/runtime/mine_qa.py、apps/control-plane/control_plane/qa_cluster.py)。
 """
 
 from __future__ import annotations

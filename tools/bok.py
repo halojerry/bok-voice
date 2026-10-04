@@ -3408,7 +3408,7 @@ def _sweep_orphan_workers() -> list[tuple[int, str]]:
     """清扫 pidfile 体系漏掉的 agent worker/解释器/mock 客户进程（返回 [(pid, 标签)]）。
 
     判据：进程命令行含 agent_runtime.main / agent_runtime.interpret /
-    scripts/mock_callee.py（CP detached 派生的 mock 被叫 start_new_session,
+    scripts/runtime/mock_callee.py（CP detached 派生的 mock 被叫 start_new_session,
     同样绕过 pidfile 体系——房间断了会自退,但栈 down 时若仍卡响铃窗须一并清）。
     只清本项目特征进程,唔会误伤无关服务。他树戳守卫（2026-09-22）：读得出
     「拉起树」且 ≠ 本树 → 跳过不进 swept（与 _sweep_orphan_listeners 同款
@@ -3437,7 +3437,7 @@ def _sweep_orphan_workers() -> list[tuple[int, str]]:
             continue
         if pid == os.getpid():
             continue
-        for marker in ("agent_runtime.main", "agent_runtime.interpret", "scripts/mock_callee.py"):
+        for marker in ("agent_runtime.main", "agent_runtime.interpret", "scripts/runtime/mock_callee.py"):
             if marker in parts[1]:
                 if pid not in seen:
                     seen.add(pid)
@@ -4730,21 +4730,21 @@ def parse_args(argv=None) -> argparse.Namespace:
 def cmd_tts_pregen(extra: list[str] | None = None) -> int:
     """离线批量预合成 TTS 本地缓存(docs/superpowers/specs/2026-09-08-tts-cache-design.md)。
 
-    额外参数原样透传给 scripts/pregen_tts.py(--greetings/--objects/--fillers/--cp/--model)。
+    额外参数原样透传给 scripts/runtime/pregen_tts.py(--greetings/--objects/--fillers/--cp/--model)。
     子进程带仓库 PYTHONPATH 与 SSL_CERT_FILE(certifi)——venv 无系统 CA,
     MiniMax WSS 无此必炸。
     """
     env = {"PYTHONPATH": _repo_pythonpath(), "PYTHONUNBUFFERED": "1"}
     _bake_ssl_cert_file(env, repo_python())
     proc = subprocess.run(
-        [str(repo_python()), str(ROOT / "scripts" / "pregen_tts.py"), *(extra or [])],
+        [str(repo_python()), str(ROOT / "scripts" / "runtime" / "pregen_tts.py"), *(extra or [])],
         env={**os.environ, **env},
     )
     return proc.returncode
 
 
 def cmd_tts_mine(extra: list[str] | None = None) -> int:
-    """高频问答对挖掘报告(快答库,PR-3)。参数透传给 scripts/mine_qa.py。
+    """高频问答对挖掘报告(快答库,PR-3)。参数透传给 scripts/runtime/mine_qa.py。
 
     --apply N 把前 N 条入库为 qa_entries(source=mined);入库后跑
     `bok.py tts-pregen` 物化应答音频,闸门只认缓存有音频的条目。
@@ -4752,7 +4752,7 @@ def cmd_tts_mine(extra: list[str] | None = None) -> int:
     env = {"PYTHONPATH": _repo_pythonpath(), "PYTHONUNBUFFERED": "1"}
     _bake_ssl_cert_file(env, repo_python())
     proc = subprocess.run(
-        [str(repo_python()), str(ROOT / "scripts" / "mine_qa.py"), *(extra or [])],
+        [str(repo_python()), str(ROOT / "scripts" / "runtime" / "mine_qa.py"), *(extra or [])],
         env={**os.environ, **env},
     )
     return proc.returncode

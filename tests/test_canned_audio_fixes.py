@@ -253,7 +253,7 @@ def _load_pregen():
     import importlib.util
 
     spec = importlib.util.spec_from_file_location(
-        "pregen_tts_under_test", ROOT / "scripts" / "pregen_tts.py"
+        "pregen_tts_under_test", ROOT / "scripts" / "runtime" / "pregen_tts.py"
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

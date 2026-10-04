@@ -424,7 +424,7 @@ python tools/bok.py tts-pregen --qa        # 全量补录（admin/root；云配�
 ① 收割：dialing/in_call 的名单项其通话已终态 → 落结果（幂等）；
 ② 串行补位：无进行中项且有 pending → 建通话+显式派单（metadata 带 dial 块）；
 ③ 名单尽 → done。起拨前 gap 冷却：最近终态项距今不足冷却秒不起下一通（首通不受门控）。
-mock 档派生 `scripts/mock_callee.py` 子进程当虚拟客户（answer 逐句轮播 / no_answer 不入房 / reject 进房即离 / 说一句就走四态）；real 档走官方 CreateSIPParticipant + SipCallError 码映射（486/603 拒接、408/480 无人接、5xx trunk 故障），需 Redis + 公网可达 trunk。
+mock 档派生 `scripts/runtime/mock_callee.py` 子进程当虚拟客户（answer 逐句轮播 / no_answer 不入房 / reject 进房即离 / 说一句就走四态）；real 档走官方 CreateSIPParticipant + SipCallError 码映射（486/603 拒接、408/480 无人接、5xx trunk 故障），需 Redis + 公网可达 trunk。
 
 **常见坑**：对象没填电话=名单项直接 skipped 且不占冷却；「开关关不掉」=旧版本只改了表单没传 `{}`，现版本已堵，升级后仍建议点完开关保存后复查一次。
 
@@ -543,7 +543,7 @@ mock 档派生 `scripts/mock_callee.py` 子进程当虚拟客户（answer 逐句
 | `probe_flow_graph.py` | 话术图 jump/play/then_jump/判据/跳步话面 | 日志族+turns（kill 腿先 `BOK_FLOW_GRAPH=0` 重启） |
 | `probe_qa_hit.py` | QA 快路（`--priority-duel`/`--rotation-duel` 离线） | 三档对照断言 |
 | `probe_interpret_latency.py` | B 线逐句感知延迟 | avg/逐句 ≤3500ms 预算 |
-| `probe_interp_backlog.py` / `probe_interp_continuous.py` / `probe_interp_duplex.py` | B 线背压丢句/边说边译/全双工 | drop≥1 且原文零丢等（见脚本头） |
+| `probe_interp_backlog.py` / `probe_interp_continuous.py` / `probes/probe_interp_duplex.py` | B 线背压丢句/边说边译/全双工 | drop≥1 且原文零丢等（见脚本头） |
 | `probe_latency_soak.py` | 延迟/竞争态（拆轮/风暴/兜底） | 正常轮哑 ≥2 FAIL + p50/p95 预算计数（首指标 PERCEIVED） |
 | `probe_offscript_soak.py` | 话术外问题 5 主题×10 轮 | 哑轮/兜底哨兵+质量旗（改 prompt/兜底后必跑） |
 | `probe_filler_timing.py` | 垫话/首声 | 首声 <2.5s 预算 |

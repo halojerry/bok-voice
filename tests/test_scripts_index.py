@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 README = SCRIPTS / "README.md"
 EXCLUDE_PARTS = frozenset({"cuda", "artifacts", "__pycache__"})
-RUNTIME_EXEC = ("pregen_tts", "mock_callee", "mine_qa")
+RUNTIME_EXEC = ("runtime/pregen_tts", "runtime/mock_callee", "runtime/mine_qa")
 TABLE_HEADER = "| 脚本 | 用途 | 消费者 | 真栈 | 最近证据 |"
 ROW_RE = re.compile(r"^\|\s*`(scripts/[A-Za-z0-9_./-]+\.py)`\s*\|")
 

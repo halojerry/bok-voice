@@ -638,7 +638,7 @@ def materialize_branches(persona_id: str, raw_texts: list[str]) -> dict[str, str
     if not raw_texts or not persona_id:
         return {}
     py = sys.executable
-    script = str(_ROOT / "scripts" / "pregen_tts.py")
+    script = str(_ROOT / "scripts" / "runtime" / "pregen_tts.py")
     with _texts_file(raw_texts) as tf:
         cmd = [py, script, "--branches", "--persona", persona_id,
                "--texts-file", str(tf), "--cp", erc.CONTROL_PLANE_URL]

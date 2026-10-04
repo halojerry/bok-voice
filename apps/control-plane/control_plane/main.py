@@ -3965,9 +3965,9 @@ def spawn_mock_callee(req: MockCalleeRequest, request: Request) -> dict:
     token = at.to_jwt()
 
     repo_root = Path(__file__).resolve().parents[3]
-    script_path = repo_root / "scripts" / "mock_callee.py"
+    script_path = repo_root / "scripts" / "runtime" / "mock_callee.py"
     if not script_path.exists():
-        raise HTTPException(404, "scripts/mock_callee.py not found (packaged runtime)")
+        raise HTTPException(404, "scripts/runtime/mock_callee.py not found (packaged runtime)")
     cmd = [
         sys.executable, str(script_path),
         "--url", lk_url, "--token", token, "--identity", identity,
@@ -5877,11 +5877,11 @@ def _publish_auto_pregen(template: dict, *, base_url: str) -> dict:
     try:
         if os.environ.get("BOK_PUBLISH_AUTO_PREGEN", "1") != "1":
             return {"status": "disabled"}
-        script = Path(__file__).resolve().parents[3] / "scripts" / "pregen_tts.py"
+        script = Path(__file__).resolve().parents[3] / "scripts" / "runtime" / "pregen_tts.py"
         if not script.exists():
             return {
                 "status": "script_missing",
-                "hint": "运行目录无 scripts/pregen_tts.py(打包部署),请手动执行 bok.py tts-pregen --greetings --branches",
+                "hint": "运行目录无 scripts/runtime/pregen_tts.py(打包部署),请手动执行 bok.py tts-pregen --greetings --branches",
             }
         cmd = [sys.executable, str(script), "--greetings", "--branches"]
         account_id = str(template.get("account_id") or "").strip()

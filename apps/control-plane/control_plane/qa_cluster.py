@@ -1,6 +1,6 @@
 """QA 自学习聚类 runner(2026-09-19 W3-T1,防 main.py 膨胀,端点瘦逻辑全在此)。
 
-把 scripts/mine_qa.py --cluster 的 LLM 编排提为 CP 进程内能力:
+把 scripts/runtime/mine_qa.py --cluster 的 LLM 编排提为 CP 进程内能力:
 mine_qa_pairs(与 /api/reports/qa-pairs 同源,进程内调用零重复)→ 按语言分批
 问本地 LLM(纯函数在 bok_voice_core.qa_cluster,CLI 与 CP 共用)→ 三列计划
 (variant/fresh/junk)→ apply 按 select 逐行盖章入库(与 create_qa_entry 同款:

@@ -18,7 +18,7 @@
 §6 前置门的测试床(真中继上线前重验 16k ASR 栈在窄带话音下的表现)。
 
 用法(一般由 CP `POST /api/sip/mock/callee` 派生,也可手起调试):
-  <python> scripts/mock_callee.py --url ws://127.0.0.1:7880 --token <jwt> \
+  <python> scripts/runtime/mock_callee.py --url ws://127.0.0.1:7880 --token <jwt> \
       --identity sip-mock-64320111 --scenario answer \
       --script-json '["你好","我個件未到"]' --language cantonese
       # 加 --narrowband 即 8kHz 窄带档

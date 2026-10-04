@@ -17,6 +17,9 @@ for part in (
     # `from urlguard_gate import gate` 会 ModuleNotFoundError。此处单点补齐
     # （直接 `python scripts/x.py` 运行时 sys.path[0] 本就是 scripts/，零影响）。
     "scripts",
+    # scripts/runtime/（2026-10-04 G1b）：产品运行时三件（pregen_tts/mock_callee/
+    # mine_qa）入桶后，`import pregen_tts` 等 8 个测试文件的模块导入面。
+    "scripts/runtime",
 ):
     path = ROOT / part
     if str(path) not in sys.path:

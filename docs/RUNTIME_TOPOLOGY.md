@@ -46,7 +46,7 @@
   2026-09-10 双层出声复活）——离线批量合成，需 CP 或 MINIMAX_API_KEY。
   greetings/fillers/qa 落盘**打钉不逐出**（逐对象开场白与运行时 tee 不钉，
   LRU 500 只淘汰未钉条目）。**人设保存点自动物化（W3）**：CP POST/PUT
-  /api/personas 音色变化 → 后台 detached 子进程跑 `scripts/pregen_tts.py
+  /api/personas 音色变化 → 后台 detached 子进程跑 `scripts/runtime/pregen_tts.py
   --greetings --fillers --qa --persona <id>`（新会话不被栈重启打断，单飞，
   `BOK_PERSONA_AUTO_PREGEN=0` 关），日志 **app-data/logs/tts-pregen.log**，
   响应 `tts_pregen.status` 即提醒面。
@@ -162,7 +162,7 @@ web /campaigns（建波/启停/进度表）
       real 档：官方 CreateSIPParticipant(wait_until_answered) + SipCallError 码映射
                （486/603 拒接、408/480 无人接、5xx trunk 故障）；需 Redis + 公网
                reachable 的 trunk，本地 mock 档无需
-      mock 档：CP `POST /api/sip/mock/callee` 派生 scripts/mock_callee.py 子进程
+      mock 档：CP `POST /api/sip/mock/callee` 派生 scripts/runtime/mock_callee.py 子进程
                （真 TTS 客户语音进房；answer 逐句轮播 / no_answer 不入房 /
                reject 进房即离 / hangup_mid 说一句就走）
         · 台词从 dial 块 `script` 下发，空台词按语言默认 2 句兜底
@@ -209,7 +209,7 @@ web /campaigns（建波/启停/进度表）
       real 档：官方 CreateSIPParticipant(wait_until_answered) + SipCallError 码映射
                （486/603 拒接、408/480 无人接、5xx trunk 故障）；需 Redis + 公网
                reachable 的 trunk，本地 mock 档无需
-      mock 档：CP `POST /api/sip/mock/callee` 派生 scripts/mock_callee.py 子进程
+      mock 档：CP `POST /api/sip/mock/callee` 派生 scripts/runtime/mock_callee.py 子进程
                （真 TTS 客户语音进房；answer 逐句轮播 / no_answer 不入房 /
                reject 进房即离 / hangup_mid 说一句就走）
         · 台词从 dial 块 `script` 下发，空台词按语言默认 2 句兜底
@@ -238,7 +238,7 @@ web /campaigns（建波/启停/进度表）
   ASR 精度——live 链路里号码句**头段**会被多解一个音（实证：`六四三二零一一一` →
   `六六四三二零一一一`/`八六四三二零一一一`，TTS 渲染与 sidecar 流式路径均无锅，
   照 agent 插件「VAD 前导帧并 `_pending`」喂法可 6/6 复现），故按「捕获串**含**脚本
-  号码的 ≥7 位连续子串」判定；逐位精度归 `probe_cantonese_digits`/`probe_8khz_asr`。
+  号码的 ≥7 位连续子串」判定；逐位精度归 `bench/probe_cantonese_digits`/`probe_8khz_asr`。
 
 ### 电话边缘站点（VPS，spec 2026-09-13-sip-edge-thin-node-v2 §7 P1.5）
 

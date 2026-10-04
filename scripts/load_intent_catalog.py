@@ -235,7 +235,7 @@ def main() -> int:
                 qa = str((it.get("binding") or {}).get("qa_id") or "")
                 if qa:
                     qa_all.add(qa)
-        print("  python scripts/pregen_tts.py --qa " + " ".join(f"--entry-id {q}" for q in sorted(qa_all)))
+        print("  python scripts/runtime/pregen_tts.py --qa " + " ".join(f"--entry-id {q}" for q in sorted(qa_all)))
     return exit_code
 
 

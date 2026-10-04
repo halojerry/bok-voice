@@ -43,8 +43,8 @@
 ## 脚本（scripts/）
 
 - 构建：`bootstrap.sh` `build_livekit.sh` `build_runtime.sh`（build_release.sh / verify_bundle.sh / stub_external_bin.sh 已随 Tauri 桌面壳退役删除，2026-09-17）
-- E2E：`e2e_trilingual_livekit.py`（三语，真 /api/token，一案一通话）`e2e_flow_scenario.py` `e2e_multi_turn.py` `e2e_http.py` `e2e_pipeline.py`
-- 测量/探针：`measure_latency.py`（需真栈）`measure_prompt.py`（本地）`probe_cantonese_digits.py` `smoke_sidecars.py` `pad_test_audio.py`（历史手工测试 `archive/test_deepseek.py` `archive/test_volcano_v3.py`）
+- E2E：`e2e_trilingual_livekit.py`（三语，真 /api/token，一案一通话）`e2e/e2e_flow_scenario.py` `e2e/e2e_multi_turn.py` `e2e/e2e_http.py` `e2e_pipeline.py`
+- 测量/探针：`measure_latency.py`（需真栈）`measure_prompt.py`（本地）`bench/probe_cantonese_digits.py` `ops/smoke_sidecars.py` `seed/pad_test_audio.py`（历史手工测试 `archive/test_deepseek.py` `archive/test_volcano_v3.py`）
 - 站点交付探针（2026-09-16）：`probe_killswitch.py`（kill-switch 目标语义：吊销 sticky→通话面 403 窒息→unrevoke 复活全链，CI `node-handshake.yml` linux 对真 CP 实跑）`probe_windows_lifecycle.py`（down 树杀语义 A 段全平台 + schtasks 契约 B 段仅 Windows 实跑、runner 无提权按 access-denied 优雅 skip，CI windows job）`probe_thin_client_static.py`（静态导出注入链形状 + 无烤死 localhost，CI web job，需先 `apps/web && npm run build`）
 - TTS 缓存/快答库：`pregen_tts.py`（`bok.py tts-pregen` 执行体：--greetings/--objects/--fillers/--qa 离线预合成（--qa-status 出罐头物化状态 JSON），写 app-data/tts-cache；也被 CP 人设保存点自动触发，见 `apps/control-plane/control_plane/pregen.py`）`mine_qa.py`（`bok.py tts-mine` 执行体：高频问答对报告 + --apply 入库 / --sync 自动学习闭环：挖掘→质量闸→入库→按语言物化）`import_xkt_qa.py`（惜客通 `tbl_ai_knowledge.json` → qa_entries 导入器：Question 按 `&` 拆主条目+变体（`cluster_head_id` 指针）、lang 启发式、默认 dry-run、`--apply` 经 POST /api/qa-entries 落地；AfterAnswer* 等外部字段不搬、dry-run 报告列示）
 - 真实客户多轮 E2E：`e2e_real_customer.py`（三语三音色多轮真问题连聊，模板绑定走对象 template_id）

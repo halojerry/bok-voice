@@ -95,7 +95,7 @@ def test_gate_rejects_duplicate_against_existing():
 # ---- plan_sync(--sync 主循环的可测核心) ----
 
 def _load_mine_qa():
-    spec = importlib.util.spec_from_file_location("mine_qa_under_test", ROOT / "scripts" / "mine_qa.py")
+    spec = importlib.util.spec_from_file_location("mine_qa_under_test", ROOT / "scripts" / "runtime" / "mine_qa.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
