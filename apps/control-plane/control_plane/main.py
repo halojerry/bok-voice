@@ -82,6 +82,12 @@ from .deps import (
 )
 from .capacity import capacity_snapshot, format_limit_detail
 from .dispatch_utils import cleanup_dispatch, has_active_dispatch
+from .errors import (
+    ConflictError as PipelineConflictError,
+    UnavailableError as PipelineUnavailableError,
+    register_pipeline_error_handler,
+)
+from bok_voice_obs.sentry_hook import init_sentry
 from .nodes_store import HEARTBEAT_INTERVAL_S, LicenseError, NodeStore
 from .permissions import (
     DEFAULT_ADMIN_PERMISSIONS,
@@ -287,6 +293,13 @@ app = FastAPI(
     redoc_url=None if auth_required() else "/redoc",
     openapi_url=None if auth_required() else "/openapi.json",
 )
+# R2(2026-10-04) CP 统一异常族:PipelineError→{"detail","stage"}(detail 文案
+# 与既有 HTTPException 面逐字节同形,stage 为加法键)。
+register_pipeline_error_handler(app)
+# R3(2026-10-04) Sentry 接线:DSN 走 env(SENTRY_DSN),缺席=完整 no-op;
+# SDK 的 FastAPI 集成自动捕获端点未处理异常。traces 0.2/无 PII 见
+# bok_voice_obs.sentry_hook 模块纪律。
+init_sentry("control-plane")
 # 注册顺序=洋葱层次（后注册者在最外层）。identity_gate 必须**第一个**注册（最内层）：
 # 它要在 CorrelationMiddleware 内层运行——读取其 correlation 并覆写 user_id=已验证
 # 身份，审计 actor 由此自动落账（见 auth.py 模块注释）。
@@ -2467,7 +2480,7 @@ def _create_call_in(repo, req: CreateCallRequest, created_by: str = "") -> dict:
                    detail={"mode": req.mode, "kind": req.kind,
                            "reason": _famine_block["reason"],
                            "famine": _famine_block["famine"]})
-            raise HTTPException(status_code=409, detail="节点饥荒降档中，暂停新建单")
+            raise PipelineConflictError("节点饥荒降档中，暂停新建单", stage="call.create.famine")
     # 并发准入 + 重复建单防重（2026-09-27）：建单前拒，绝不先建后杀。
     # 作用域=mode=live（真实业务 A 线通话，吃本机单并发 LLM/GPU 的车道）；
     # simulation（训练/画布试跑）与 realtime_demo（云端 S2S，不吃本地 GPU）不受限
@@ -2511,7 +2524,7 @@ def _create_call_in(repo, req: CreateCallRequest, created_by: str = "") -> dict:
                         _audit("call.reject_duplicate", subject_type="call", subject_id=_c.get("id", ""),
                                account_id=req.account_id, call_id=_c.get("id", ""),
                                detail={"object_id": req.object_id, "existing_status": _c.get("status") or ""})
-                        raise HTTPException(status_code=409, detail="该对象已有进行中的通话")
+                        raise PipelineConflictError("该对象已有进行中的通话", stage="call.create.duplicate")
     # 会话清单：读取全局策略(offline_first/cloud_first)与已配置 provider，
     # 并把话术快照到 call（审计「这场用了哪版话术」）。
     # 话术优先级：显式指定（外呼战役/话务员自选）> 对象卡绑定。
@@ -5389,7 +5402,9 @@ def qa_cluster_ep(req: QaClusterRequest, request: Request, account_id: str = "ac
     # ——409 让前端重新生成;未带任何选择(NULL)的「采纳全部」可安全重算。
     has_selection = select is not None or hotword_select is not None
     if req.apply and has_selection and not qa_cluster_mod.has_fresh_plan(account_id, min_calls, limit):
-        raise HTTPException(status_code=409, detail="聚类计划已过期或参数不符，请重新生成计划后再采纳")
+        raise PipelineConflictError(
+            "聚类计划已过期或参数不符，请重新生成计划后再采纳", stage="qa.cluster"
+        )
     try:
         # fresh_only(2026-10-02 TOCTOU 二道闸):带选择时取计划只吃缓存不重算——
         # 一道闸与本行之间缓存被并发作废(apply 成功/闲时采纳都清账号键)的话,
@@ -5404,11 +5419,15 @@ def qa_cluster_ep(req: QaClusterRequest, request: Request, account_id: str = "ac
             _repo(), request, account_id, plan, select, hotword_select, audit=_audit
         )
     except qa_cluster_mod.AlreadyRunning as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise PipelineConflictError(str(exc), stage="qa.cluster") from exc
     except qa_cluster_mod.PlanStaleError as exc:
-        raise HTTPException(status_code=409, detail="聚类计划已失效，请重新生成计划后再采纳") from exc
+        raise PipelineConflictError(
+            "聚类计划已失效，请重新生成计划后再采纳", stage="qa.cluster"
+        ) from exc
     except qa_cluster_mod.ClusterError as exc:
-        raise HTTPException(status_code=503, detail=f"聚类 LLM 不可用: {exc}") from exc
+        raise PipelineUnavailableError(
+            f"聚类 LLM 不可用: {exc}", stage="qa.cluster"
+        ) from exc
 
 
 # ---- 垫话罐头库(2026-09-13 乙节):确定性语境命中,镜像 qa_entries ----
