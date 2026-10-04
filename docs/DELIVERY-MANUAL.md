@@ -543,7 +543,7 @@ mock 档派生 `scripts/mock_callee.py` 子进程当虚拟客户（answer 逐句
 | `probe_flow_graph.py` | 话术图 jump/play/then_jump/判据/跳步话面 | 日志族+turns（kill 腿先 `BOK_FLOW_GRAPH=0` 重启） |
 | `probe_qa_hit.py` | QA 快路（`--priority-duel`/`--rotation-duel` 离线） | 三档对照断言 |
 | `probe_interpret_latency.py` | B 线逐句感知延迟 | avg/逐句 ≤3500ms 预算 |
-| `probe_interp_backlog.py` / `probe_interp_continuous.py` / `probe_interp_duplex.py` | B 线背压丢句/边说边译/全双工 | drop≥1 且原文零丢等（见脚本头） |
+| `probe_interp_backlog.py` / `probe_interp_continuous.py` / `probes/probe_interp_duplex.py` | B 线背压丢句/边说边译/全双工 | drop≥1 且原文零丢等（见脚本头） |
 | `probe_latency_soak.py` | 延迟/竞争态（拆轮/风暴/兜底） | 正常轮哑 ≥2 FAIL + p50/p95 预算计数（首指标 PERCEIVED） |
 | `probe_offscript_soak.py` | 话术外问题 5 主题×10 轮 | 哑轮/兜底哨兵+质量旗（改 prompt/兜底后必跑） |
 | `probe_filler_timing.py` | 垫话/首声 | 首声 <2.5s 预算 |

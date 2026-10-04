@@ -238,7 +238,7 @@ web /campaigns（建波/启停/进度表）
   ASR 精度——live 链路里号码句**头段**会被多解一个音（实证：`六四三二零一一一` →
   `六六四三二零一一一`/`八六四三二零一一一`，TTS 渲染与 sidecar 流式路径均无锅，
   照 agent 插件「VAD 前导帧并 `_pending`」喂法可 6/6 复现），故按「捕获串**含**脚本
-  号码的 ≥7 位连续子串」判定；逐位精度归 `probe_cantonese_digits`/`probe_8khz_asr`。
+  号码的 ≥7 位连续子串」判定；逐位精度归 `bench/probe_cantonese_digits`/`probe_8khz_asr`。
 
 ### 电话边缘站点（VPS，spec 2026-09-13-sip-edge-thin-node-v2 §7 P1.5）
 

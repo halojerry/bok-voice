@@ -175,7 +175,7 @@ def test_converted_scripts_have_no_inline_sidecar_post(name):
     assert "stimulus_pcm" in src, f"{name} does not delegate to stimulus_pcm"
 
 
-@pytest.mark.parametrize("name", ["measure_latency.py", "smoke_sidecars.py"])
+@pytest.mark.parametrize("name", ["measure_latency.py", "ops/smoke_sidecars.py"])
 def test_deliberately_unconverted_scripts_keep_inline_post(name):
     # 这两个脚本走 24k/streaming 是 sidecar 自身测量/自测，刻意保留内联路径。
     src = (ROOT / "scripts" / name).read_text(encoding="utf-8")
