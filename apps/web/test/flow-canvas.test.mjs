@@ -386,6 +386,32 @@ test("parseBranchAction：五种动作标记 + 无标记/空串 + 空白容错 +
   assert.deepEqual(fc.parseBranchAction("【跳第1234步】太远"), { action: "", step: 0, text: "【跳第1234步】太远" });
 });
 
+test("parseBranchAction 繁体标记并收（2026-10-04 C1,与 branch_syntax 单源同步）", () => {
+  // 粤语种子的繁体标记:收線/掛斷=refuse、轉人工=handoff——与 Python 权威源同判,
+  // 此前 TS/运行时都不认(繁体分支整层静默失效)。
+  assert.deepEqual(fc.parseBranchAction("【收線】唔好意思打搅咗"), { action: "refuse", step: 0, text: "唔好意思打搅咗" });
+  assert.deepEqual(fc.parseBranchAction("【掛斷】拜拜"), { action: "refuse", step: 0, text: "拜拜" });
+  assert.deepEqual(fc.parseBranchAction("【轉人工】我幫您轉接同事"), { action: "handoff", step: 0, text: "我幫您轉接同事" });
+  // 简繁混排（收線+简体台词）同认;标记重组恒规范简体形（composeBranchResp 策略）。
+  assert.deepEqual(fc.parseBranchAction("【 收線 】 唔好意思"), { action: "refuse", step: 0, text: "唔好意思" });
+});
+
+test("parseStepRefParts 繁体锚并收 + round-trip 不变量", () => {
+  // 粤语种子形态:繁体锚行必须拆出分支,不再落进 script 段。
+  const parts = fc.parseStepRefParts(
+    "您好,請問係陳小姐嗎?\n如果客戶唔係本人→麻煩您話返俾佢聽。\n注意:一次只問一件事"
+  );
+  assert.equal(parts.branches.length, 1);
+  assert.deepEqual(parts.branches[0], { cond: "唔係本人", resp: "麻煩您話返俾佢聽。", arrow: "→" });
+  assert.equal(parts.notes, "一次只問一件事");
+  // round-trip 不变量:parse(serialize(parse(x))) deepEqual parse(x)
+  // （序列化恒规范简体锚——锚归一不破 parse 等价,与 EN 锚同策略）。
+  const again = fc.parseStepRefParts(fc.serializeStepRef(parts));
+  assert.deepEqual(again.branches, parts.branches);
+  assert.equal(again.notes, parts.notes);
+  assert.equal(again.script, parts.script);
+});
+
 test("composeBranchResp：标记重组 + 空动作逐字节零改写 + jump 步号钳制", () => {
   assert.equal(fc.composeBranchResp("", 0, "就正常答"), "就正常答");
   // 空动作恒逐字节=输入 text（含空白,零改写——抽屉切回「按内容回答」剥标记保文本）。

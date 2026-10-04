@@ -77,6 +77,7 @@ import hashlib
 import json
 import re
 
+from bok_voice_core.branch_syntax import BRANCH_LINE_RE  # 2026-10-04 C1 单源化(四实现权威源)
 from bok_voice_core.flow_graph import (
     CATCHALL_INTENT_ID,
     KEYWORD_MAX_CHARS,
@@ -158,12 +159,10 @@ def sanitize_branch_cond(text: str, *, max_chars: int = COND_MAX_CHARS) -> str:
     return _COND_EDGE_PUNCT_RE.sub("", sanitize_branch_text(text, max_chars=max_chars)).strip()
 
 
-# flow.py:102 `_BRANCH_LINE_RE` 的镜像(只取条件组;CP 不 import agent_runtime,
-# 云端镜像不含 apps/agent)。改 flow.py 语法须三处同步:flow.py / flow-canvas.ts / 本文件。
-_BRANCH_COND_RE = re.compile(
-    r"^(?:如果客户|(?:If|When)\s+the\s+customer)\s*(?P<cond>.{1,120}?)\s*→\s*(?P<resp>\S.*)$",
-    re.IGNORECASE,
-)
+# 2026-10-04 C1 单源化:分支行正则直接吃 bok_voice_core.branch_syntax
+# (简繁锚并收)——此前本文件自持镜像、与 flow.py 各自漂移(繁体锚只在训练料
+# 拷贝里被认)。CP 不 import agent_runtime 的红线不变(单源家在 packages/core)。
+_BRANCH_COND_RE = BRANCH_LINE_RE
 
 
 def existing_branch_conds(ref: str) -> list[str]:
