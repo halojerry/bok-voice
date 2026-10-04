@@ -32,3 +32,20 @@ def test_ddl_compiles_on_sqlite_and_postgres():
     for dialect in (sqlite.dialect(), postgresql.dialect()):
         for table in Base.metadata.tables.values():
             CreateTable(table).compile(dialect=dialect)  # 不抛即过
+
+
+def test_like_wildcard_stays_in_param_value_psycopg_paramstyle():
+    """yue→cantonese 迁移的 LIKE 通配必须活在绑定参数值里（2026-10-04 CI 真 PG 回归钉）。
+
+    psycopg3 对带参数的查询在客户端解析 % 占位符——SQL 文本里的字面 '%yue%'
+    会被当 '%y' 占位符直接 ProgrammingError（SQLite 不解析所以本地永远绿，
+    只有真 PG 的 CI 能抓到）。编译成 pyformat 形态后，文本里只允许出现
+    具名占位符 %(pat)s，绝不允许裸 % 通配。"""
+    from sqlalchemy import text
+
+    compiled = text(
+        "SELECT id, reference_audio FROM persona_profiles WHERE reference_audio LIKE :pat"
+    ).compile(dialect=postgresql.dialect())
+    s = str(compiled)
+    assert "%(pat)s" in s
+    assert "%%" not in s and "%y" not in s and "%u" not in s

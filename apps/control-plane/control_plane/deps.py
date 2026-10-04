@@ -483,8 +483,13 @@ def build_engine() -> Engine | None:
                         f"UPDATE {_sql_ident(_tbl)} SET language='cantonese' WHERE language='yue'"
                     )
                 # persona reference_audio JSON 的键 yue → cantonese（值=音色 ID 不动）。
-                _rows = conn.exec_driver_sql(
-                    "SELECT id, reference_audio FROM persona_profiles WHERE reference_audio LIKE '%yue%'"
+                # LIKE 的 % 通配走绑定参数值、不进 SQL 文本——psycopg3 对 driver 级
+                # SQL 会解析 % 占位符（字面 '%yue%' 报 "got '%y'"），SQLite 不解析；
+                # 参数化后两个驱动语义一致（2026-10-04 CI 真 PG 实证回归，就此钉死）。
+                _rows = _exec_bound(
+                    conn,
+                    text("SELECT id, reference_audio FROM persona_profiles WHERE reference_audio LIKE :pat"),
+                    {"pat": "%yue%"},
                 ).fetchall()
                 for _rid, _raw in _rows:
                     if not _raw:
