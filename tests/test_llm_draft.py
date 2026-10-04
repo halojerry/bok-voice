@@ -130,18 +130,18 @@ def test_doctor_draft_warning_states(monkeypatch):
     """doctor 判定函数三态:默认关=""(零输出);开+缺席=警告文案;开+在盘=""。"""
     _clear_draft_env(monkeypatch)
     table = {"llm_draft": _DRAFT_REPO}
-    assert bok._doctor_draft_warning(table) == ""
+    assert bok.doctor._doctor_draft_warning(table) == ""
 
     monkeypatch.setenv("BOK_LLM_DRAFT", "1")
     patch_bok(monkeypatch, "_model_present", lambda repo: False)
-    warn = bok._doctor_draft_warning(table)
+    warn = bok.doctor._doctor_draft_warning(table)
     assert "download --only llm_draft" in warn
     assert _DRAFT_REPO in warn
 
     patch_bok(monkeypatch, "_model_present", lambda repo: True)
-    assert bok._doctor_draft_warning(table) == ""
+    assert bok.doctor._doctor_draft_warning(table) == ""
     # 表无条目(如 windows 表)同回 "",不炸。
-    assert bok._doctor_draft_warning({}) == ""
+    assert bok.doctor._doctor_draft_warning({}) == ""
 
 
 def test_doctor_draft_warning_never_enters_fails(monkeypatch, capsys):

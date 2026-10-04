@@ -14,6 +14,13 @@ from __future__ import annotations
 PATCH_TARGETS: dict[str, str] = {
     # prod 域(W② 搬出)
     "cmd_prod": "bokctl.prod",
+    # doctor 域(W② 搬出)
+    "_nvidia_gate": "bokctl.doctor",
+    "_model_present": "bokctl.doctor",
+    "_warn_memory_posture": "bokctl.doctor",
+    "_doctor_gpu_gate": "bokctl.doctor",
+    "_doctor_draft_warning": "bokctl.doctor",
+    "_doctor_minimax_tts": "bokctl.doctor",
 }
 
 _DEFAULT_TARGET = "bokctl.core"

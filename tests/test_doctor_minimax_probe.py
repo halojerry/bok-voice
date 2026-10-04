@@ -31,14 +31,14 @@ def _make_db(tmp: Path, tts: dict) -> Path:
 
 def test_probe_skips_without_db(tmp_path):
     fails: list[str] = []
-    bok._doctor_minimax_tts(tmp_path, fails)
+    bok.doctor._doctor_minimax_tts(tmp_path, fails)
     assert fails == []
 
 
 def test_probe_skips_non_minimax_provider(tmp_path):
     _make_db(tmp_path, {"provider": "qwen3_tts"})
     fails: list[str] = []
-    bok._doctor_minimax_tts(tmp_path, fails)
+    bok.doctor._doctor_minimax_tts(tmp_path, fails)
     assert fails == []
 
 
@@ -46,7 +46,7 @@ def test_probe_skips_when_key_absent(tmp_path, monkeypatch):
     monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
     _make_db(tmp_path, {"provider": "minimax", "speaker_cantonese": "Cantonese_X"})
     fails: list[str] = []
-    bok._doctor_minimax_tts(tmp_path, fails)
+    bok.doctor._doctor_minimax_tts(tmp_path, fails)
     assert fails == []
 
 
@@ -56,7 +56,7 @@ def test_probe_warns_when_no_voice_configured(tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
     _make_db(tmp_path, {"provider": "minimax", "api_key": "k"})
     fails: list[str] = []
-    bok._doctor_minimax_tts(tmp_path, fails)
+    bok.doctor._doctor_minimax_tts(tmp_path, fails)
     assert fails == []
     assert "warning" in capsys.readouterr().out
 
@@ -85,7 +85,7 @@ def test_probe_resolves_configured_voice(tmp_path, monkeypatch):
         {"provider": "minimax", "api_key": "k", "speaker_cantonese": "Cantonese_Male_news_anchor_vv2"},
     )
     fails: list[str] = []
-    bok._doctor_minimax_tts(tmp_path, fails)
+    bok.doctor._doctor_minimax_tts(tmp_path, fails)
     assert fails == []
 
 
@@ -108,5 +108,5 @@ def test_probe_fails_when_voice_not_in_account_list(tmp_path, monkeypatch):
         {"provider": "minimax", "api_key": "k", "speaker_zh": "not_a_real_voice"},
     )
     fails: list[str] = []
-    bok._doctor_minimax_tts(tmp_path, fails)
+    bok.doctor._doctor_minimax_tts(tmp_path, fails)
     assert len(fails) == 1 and "not_a_real_voice" in fails[0]

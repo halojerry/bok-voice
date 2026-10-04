@@ -399,7 +399,7 @@ def test_doctor_gpu_gate_skipped_on_mac(monkeypatch, capsys) -> None:
     patch_bok(monkeypatch, "is_linux", lambda: False)
     patch_bok(monkeypatch, "_nvidia_gate", lambda: calls.append(1) or (True, "x"))
     fails: list[str] = []
-    bok._doctor_gpu_gate(packaged=True, fails=fails)
+    bok.doctor._doctor_gpu_gate(packaged=True, fails=fails)
     assert calls == []  # mac 无 nvidia-smi：门禁不适用
     assert fails == []
     assert "nvidia gate" not in capsys.readouterr().out
@@ -412,11 +412,11 @@ def test_doctor_gpu_gate_runs_on_linux(monkeypatch, capsys) -> None:
     monkeypatch.setattr(bok.os, "name", "posix")
     patch_bok(monkeypatch, "_nvidia_gate", lambda: calls.append(1) or (True, "NVIDIA OK"))
     fails: list[str] = []
-    bok._doctor_gpu_gate(packaged=False, fails=fails)
+    bok.doctor._doctor_gpu_gate(packaged=False, fails=fails)
     assert calls == [1]
     assert fails == []  # dev 只提示
     assert "nvidia gate: NVIDIA OK" in capsys.readouterr().out
-    bok._doctor_gpu_gate(packaged=True, fails=fails)
+    bok.doctor._doctor_gpu_gate(packaged=True, fails=fails)
     assert calls == [1, 1] and fails == []  # gate 过线=packaged 也不 fail
 
 
@@ -426,7 +426,7 @@ def test_doctor_gpu_gate_runs_regardless_of_virtual_audio(monkeypatch, capsys) -
     monkeypatch.setattr(bok.os, "name", "nt")
     patch_bok(monkeypatch, "_nvidia_gate", lambda: calls.append(1) or (True, "NVIDIA OK"))
     fails: list[str] = []
-    bok._doctor_gpu_gate(packaged=False, fails=fails)
+    bok.doctor._doctor_gpu_gate(packaged=False, fails=fails)
     assert calls == [1]  # 门禁被评估（虚拟声卡状态无关——本函数根本不读它）
     assert fails == []
     assert "nvidia gate: NVIDIA OK" in capsys.readouterr().out
@@ -436,9 +436,9 @@ def test_doctor_gpu_gate_packaged_failure_fails_doctor(monkeypatch) -> None:
     monkeypatch.setattr(bok.os, "name", "nt")
     patch_bok(monkeypatch, "_nvidia_gate", lambda: (False, "NVIDIA GPU 未检测到"))
     fails: list[str] = []
-    bok._doctor_gpu_gate(packaged=False, fails=fails)
+    bok.doctor._doctor_gpu_gate(packaged=False, fails=fails)
     assert fails == []  # dev 模式只提示
-    bok._doctor_gpu_gate(packaged=True, fails=fails)
+    bok.doctor._doctor_gpu_gate(packaged=True, fails=fails)
     assert fails == ["NVIDIA GPU 未检测到"]  # packaged 硬失败
 
 
@@ -690,7 +690,7 @@ def test_doctor_gpu_gate_called_at_function_top_level() -> None:
     cmd_doctor 里的调用必须位于函数体顶层（缩进 4，不在任何 `if not va_ok:`
     块内）——曾误缩进在块内（缩进 8），装了虚拟声卡的 Windows 机器结构性跳过
     GPU 门禁。行为回归见 ⑤ 的三只 gate 单测，这里钉「调用位置」本身。"""
-    src = inspect.getsource(bok.cmd_doctor)
+    src = inspect.getsource(bok.doctor.cmd_doctor)
     calls = [
         (idx, ln)
         for idx, ln in enumerate(src.splitlines())

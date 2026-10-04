@@ -117,7 +117,7 @@ def test_probe_llm_uses_absolute_model_path(monkeypatch):
         return 200, b'{"choices":[{"message":{"content":"a"}}]}'
 
     patch_bok(monkeypatch, "_http_call", fake_http_call)
-    ok, detail = bok._probe_llm()
+    ok, detail = bok.doctor._probe_llm()
     assert ok
     assert seen["body"]["model"] == "/models/avan-ag/Qwen3.5-4B-Uncensored-MLX-4bit"
     assert seen["body"]["max_tokens"] == 1
@@ -132,7 +132,7 @@ def test_probe_llm_timeout_env_and_fail_wording(monkeypatch):
         raise TimeoutError("timed out")
 
     patch_bok(monkeypatch, "_http_call", fake_http_call)
-    ok, detail = bok._probe_llm()
+    ok, detail = bok.doctor._probe_llm()
     assert not ok
     assert "FAIL" in detail
     assert "wedge" in detail  # 冷启动页入与 wedge 的区分提示必须带
@@ -154,7 +154,7 @@ def test_probe_llm_explicit_model_beats_models_scan(monkeypatch):
         return 200, b'{"choices":[{"message":{"content":"a"}}]}'
 
     patch_bok(monkeypatch, "_http_call", fake_http_call)
-    ok, detail = bok._probe_llm(
+    ok, detail = bok.doctor._probe_llm(
         "http://127.0.0.1:1236/v1",
         model="/Users/x/Hy-MT2-1.8B-8bit",
         prompt="Translate to English: 你好世界")
@@ -172,20 +172,20 @@ def test_model_present_recognizes_lmstudio_layout(monkeypatch, tmp_path):
     patch_bok(monkeypatch, "_lmstudio_models_dir", lambda: tmp_path / "lmstudio")
     repo = "huihui-ai/Huihui-Qwen3.5-9B-abliterated-mlx-4bit"
     # 两处都不在 → MISSING
-    assert not bok._model_present(repo)
+    assert not bok.doctor._model_present(repo)
     # 只有 app-data 在 → ok(lmstudio 不用看)
     app = tmp_path / "appdata" / repo
     app.mkdir(parents=True)
     (app / "model.safetensors").write_text("x")
-    assert bok._model_present(repo)
+    assert bok.doctor._model_present(repo)
     # 只有 lmstudio 在 → ok(mac 上旧行为恒 MISSING 的断层)
     lm = tmp_path / "lmstudio" / repo
     lm.mkdir(parents=True)
     (lm / "model.safetensors").write_text("x")
-    assert bok._model_present(repo)
+    assert bok.doctor._model_present(repo)
     # 非 mac 平台不认 lmstudio 布局(用两边都不在盘的另一个 repo 验证)
     patch_bok(monkeypatch, "is_mac", lambda: False)
-    assert not bok._model_present("mlx-community/Hy-MT2-1.8B-Abliterated-8bit")
+    assert not bok.doctor._model_present("mlx-community/Hy-MT2-1.8B-Abliterated-8bit")
 
 
 def test_prod_status_degraded_when_bline_worker_down(monkeypatch, capsys):
