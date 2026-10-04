@@ -27,50 +27,50 @@ from _bokpatch import patch_bok  # noqa: E402
 
 
 def test_app_data_dir_linux_xdg(monkeypatch, tmp_path: Path):
-    monkeypatch.setattr(bok._platform, "system", lambda: "Linux")
+    monkeypatch.setattr(bok.paths._platform, "system", lambda: "Linux")
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
-    assert bok.app_data_dir() == tmp_path / ".local" / "share" / "BokVoice"
+    assert bok.paths.app_data_dir() == tmp_path / ".local" / "share" / "BokVoice"
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    assert bok.app_data_dir() == tmp_path / "xdg" / "BokVoice"
+    assert bok.paths.app_data_dir() == tmp_path / "xdg" / "BokVoice"
 
 
 def test_app_data_dir_mac_unchanged(monkeypatch, tmp_path: Path):
-    monkeypatch.setattr(bok._platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(bok.paths._platform, "system", lambda: "Darwin")
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    assert bok.app_data_dir() == tmp_path / "Library" / "Application Support" / "BokVoice"
+    assert bok.paths.app_data_dir() == tmp_path / "Library" / "Application Support" / "BokVoice"
 
 
 # ---- 2. platform_key / 3. bundled_llama ----
 
 
 def test_platform_key_linux_uses_gpu_table(monkeypatch):
-    monkeypatch.setattr(bok._platform, "system", lambda: "Linux")
-    assert bok.platform_key() == "windows"  # llama.cpp GGUF + transformers
-    monkeypatch.setattr(bok._platform, "system", lambda: "Darwin")
-    assert bok.platform_key() == "mac"
-    monkeypatch.setattr(bok._platform, "system", lambda: "Windows")
-    assert bok.platform_key() == "windows"
+    monkeypatch.setattr(bok.paths._platform, "system", lambda: "Linux")
+    assert bok.paths.platform_key() == "windows"  # llama.cpp GGUF + transformers
+    monkeypatch.setattr(bok.paths._platform, "system", lambda: "Darwin")
+    assert bok.paths.platform_key() == "mac"
+    monkeypatch.setattr(bok.paths._platform, "system", lambda: "Windows")
+    assert bok.paths.platform_key() == "windows"
 
 
 def test_bundled_llama_linux_candidates(monkeypatch, tmp_path: Path):
-    monkeypatch.setattr(bok._platform, "system", lambda: "Linux")
+    monkeypatch.setattr(bok.paths._platform, "system", lambda: "Linux")
     patch_bok(monkeypatch, "runtime_root", lambda: tmp_path)
     monkeypatch.setattr(bok.os, "name", "posix")
-    assert bok.bundled_llama() is None
+    assert bok.paths.bundled_llama() is None
     nested = tmp_path / "llama" / "linux"
     nested.mkdir(parents=True)
     (nested / "llama-server").write_text("x")
-    assert bok.bundled_llama() == nested / "llama-server"
+    assert bok.paths.bundled_llama() == nested / "llama-server"
 
 
 def test_bundled_llama_mac_none(monkeypatch, tmp_path: Path):
-    monkeypatch.setattr(bok._platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(bok.paths._platform, "system", lambda: "Darwin")
     patch_bok(monkeypatch, "runtime_root", lambda: tmp_path)
     (tmp_path / "llama").mkdir()
     (tmp_path / "llama" / "llama-server").write_text("x")
-    assert bok.bundled_llama() is None  # mac 走 mlx，不吃 llama
+    assert bok.paths.bundled_llama() is None  # mac 走 mlx，不吃 llama
 
 
 # ---- 4. LiveKit 配置补丁 ----
@@ -109,7 +109,7 @@ def livekit_env(monkeypatch, tmp_path: Path):
 
 def test_livekit_config_no_env_returns_shipped(livekit_env):
     base, _tmp = livekit_env
-    assert bok._livekit_config_path() == base
+    assert bok.paths._livekit_config_path() == base
     assert base.read_text(encoding="utf-8").startswith("port: 7880")
 
 
@@ -119,7 +119,7 @@ def test_livekit_config_patches_bind_webhook_keys(livekit_env, monkeypatch):
     monkeypatch.setenv("BOK_LIVEKIT_WEBHOOK_URL", "https://cp.example.com/api/webhook/livekit")
     monkeypatch.setenv("LIVEKIT_API_KEY", "prodkey")
     monkeypatch.setenv("LIVEKIT_API_SECRET", "prodsecret")
-    out = bok._livekit_config_path()
+    out = bok.paths._livekit_config_path()
     assert out == tmp / "appdata" / "run" / "livekit.yaml"
     text = out.read_text(encoding="utf-8")
     assert "  - 192.168.1.10\n  - 10.0.0.5\n" in text
@@ -133,7 +133,7 @@ def test_livekit_config_patches_bind_webhook_keys(livekit_env, monkeypatch):
 def test_livekit_config_only_bind_keeps_other_sections(livekit_env, monkeypatch):
     base, tmp = livekit_env
     monkeypatch.setenv("BOK_LIVEKIT_BIND", "192.168.1.10")
-    text = bok._livekit_config_path().read_text(encoding="utf-8")
+    text = bok.paths._livekit_config_path().read_text(encoding="utf-8")
     assert "  - 192.168.1.10\n" in text
     assert "webhook:" in text and "http://127.0.0.1:8000/api/webhook/livekit" in text
     assert "devkey: devsecret" in text
@@ -234,14 +234,14 @@ def test_worker_env_consumes_cp_url(monkeypatch):
     """端到端契约钉：node_agent 导出的 env → `_agent_worker_env` 真吃到——
     云 CP 节点上 worker 的 turns/QA/设置上报不再打缺省本地 :8000。"""
     monkeypatch.setenv("CONTROL_PLANE_URL", "https://cp.example.com")
-    env = bok._agent_worker_env(bok.repo_python())
+    env = bok._agent_worker_env(bok.paths.repo_python())
     assert env["CONTROL_PLANE_URL"] == "https://cp.example.com"
 
 
 def test_worker_env_default_still_local(monkeypatch):
     """非节点形态（dev serve 含本地 CP）缺省值不变。"""
     monkeypatch.delenv("CONTROL_PLANE_URL", raising=False)
-    env = bok._agent_worker_env(bok.repo_python())
+    env = bok._agent_worker_env(bok.paths.repo_python())
     assert env["CONTROL_PLANE_URL"] == "http://127.0.0.1:8000"
 
 
@@ -250,7 +250,7 @@ def test_worker_env_default_still_local(monkeypatch):
 
 def test_model_path_linux_dev_prefers_downloaded_gguf(monkeypatch, tmp_path: Path):
     """cmd_download 落盘的 *Q4_K_M.gguf 应解析为文件路径（llama-server 只认文件）。"""
-    monkeypatch.setattr(bok._platform, "system", lambda: "Linux")
+    monkeypatch.setattr(bok.paths._platform, "system", lambda: "Linux")
     patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     gguf = tmp_path / "models" / "Qwen--Qwen3-4B-Q4_K_M" / "Qwen3-4B.Q4_K_M.gguf"
     gguf.parent.mkdir(parents=True)
@@ -260,6 +260,6 @@ def test_model_path_linux_dev_prefers_downloaded_gguf(monkeypatch, tmp_path: Pat
 
 def test_model_path_linux_dev_no_gguf_keeps_repo_id(monkeypatch, tmp_path: Path):
     """布局里没有 gguf 时保持 repo id 兜底（win-dev hf cache 语义，行为不变）。"""
-    monkeypatch.setattr(bok._platform, "system", lambda: "Linux")
+    monkeypatch.setattr(bok.paths._platform, "system", lambda: "Linux")
     patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     assert bok.models.model_path({"llm": "Qwen/Qwen3-4B"}, "llm") == "Qwen/Qwen3-4B"

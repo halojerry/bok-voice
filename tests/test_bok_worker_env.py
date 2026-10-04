@@ -23,7 +23,7 @@ import bok  # noqa: E402
 def test_flow_graph_env_reaches_dev_worker(monkeypatch):
     """serve/monitor 的 A 线 worker env 必须带上 BOK_FLOW_GRAPH=0（kill 腿前提）。"""
     monkeypatch.setenv("BOK_FLOW_GRAPH", "0")
-    env = bok._agent_worker_env(bok.repo_python())
+    env = bok._agent_worker_env(bok.paths.repo_python())
     assert env.get("BOK_FLOW_GRAPH") == "0"
     # 同源探针：白名单 env 仍保有既有键（改动是纯增量）
     assert env.get("BOK_SERVICE") == "agent"
@@ -38,18 +38,18 @@ def test_flow_graph_env_reaches_prod_env(monkeypatch):
 def test_flow_graph_env_absent_injects_nothing(monkeypatch):
     """未设/空串 → 不注入（worker 侧按默认 "1" 跑，默认档零变化）。"""
     monkeypatch.delenv("BOK_FLOW_GRAPH", raising=False)
-    assert "BOK_FLOW_GRAPH" not in bok._agent_worker_env(bok.repo_python())
+    assert "BOK_FLOW_GRAPH" not in bok._agent_worker_env(bok.paths.repo_python())
     assert "BOK_FLOW_GRAPH" not in bok._agent_prod_env()
 
     monkeypatch.setenv("BOK_FLOW_GRAPH", "")
-    assert "BOK_FLOW_GRAPH" not in bok._agent_worker_env(bok.repo_python())
+    assert "BOK_FLOW_GRAPH" not in bok._agent_worker_env(bok.paths.repo_python())
     assert "BOK_FLOW_GRAPH" not in bok._agent_prod_env()
 
 
 def test_flow_graph_env_explicit_one_also_propagates(monkeypatch):
     """显式 =1 也照传（不只 kill 档；A/B 来回切同一入口）。"""
     monkeypatch.setenv("BOK_FLOW_GRAPH", "1")
-    assert bok._agent_worker_env(bok.repo_python()).get("BOK_FLOW_GRAPH") == "1"
+    assert bok._agent_worker_env(bok.paths.repo_python()).get("BOK_FLOW_GRAPH") == "1"
     assert bok._agent_prod_env().get("BOK_FLOW_GRAPH") == "1"
 
 
@@ -80,19 +80,19 @@ def test_qa_switch_env_reaches_dev_and_prod_workers(monkeypatch, key):
     设定值 → 两表都在；未设/空串 → 两表都不注入（worker 侧按默认跑，零变化）。
     """
     monkeypatch.setenv(key, "0")
-    assert bok._agent_worker_env(bok.repo_python()).get(key) == "0"
+    assert bok._agent_worker_env(bok.paths.repo_python()).get(key) == "0"
     assert bok._agent_prod_env().get(key) == "0"
 
     monkeypatch.delenv(key, raising=False)
-    assert key not in bok._agent_worker_env(bok.repo_python())
+    assert key not in bok._agent_worker_env(bok.paths.repo_python())
     assert key not in bok._agent_prod_env()
 
     monkeypatch.setenv(key, "")
-    assert key not in bok._agent_worker_env(bok.repo_python())
+    assert key not in bok._agent_worker_env(bok.paths.repo_python())
     assert key not in bok._agent_prod_env()
 
     monkeypatch.setenv(key, "1")  # 显式开档（A/B 来回切同一入口）也照传
-    assert bok._agent_worker_env(bok.repo_python()).get(key) == "1"
+    assert bok._agent_worker_env(bok.paths.repo_python()).get(key) == "1"
     assert bok._agent_prod_env().get(key) == "1"
 
 

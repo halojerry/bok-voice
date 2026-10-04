@@ -9,11 +9,27 @@ W① 全部指向 bokctl.core;W② 起域模块逐个搬出,搬哪个域就改�
 from __future__ import annotations
 
 # 权威定义所在模块映射。W② 搬运时逐行改道,例如:
-#   "app_data_dir": "bokctl.paths",
+#   "cmd_prod": "bokctl.prod",
 #   "_FORWARD_ENV": "bokctl.env",
 PATCH_TARGETS: dict[str, str] = {
     # prod 域(W② 搬出)
     "cmd_prod": "bokctl.prod",
+    # paths 域(W② 搬出:路径/平台锚;行集=实际被 patch 的名件,未列名件
+    # (MLX_SERVER_WRAPPER/_repo_pythonpath/sidecar_venv_python 等)测试面用
+    # bok.paths.X 读)
+    "ROOT": "bokctl.paths",
+    "app_data_dir": "bokctl.paths",
+    "platform_key": "bokctl.paths",
+    "is_mac": "bokctl.paths",
+    "is_linux": "bokctl.paths",
+    "is_packaged": "bokctl.paths",
+    "runtime_root": "bokctl.paths",
+    "sidecar_python": "bokctl.paths",
+    "repo_python": "bokctl.paths",
+    "bundled_node": "bokctl.paths",
+    "bundled_llama": "bokctl.paths",
+    "_embedded_livekit": "bokctl.paths",
+    "_livekit_config_path": "bokctl.paths",
     # doctor 域(W② 搬出)
     "_nvidia_gate": "bokctl.doctor",
     "_model_present": "bokctl.doctor",

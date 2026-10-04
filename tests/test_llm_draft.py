@@ -64,7 +64,7 @@ def test_draft_off_argv_byte_identical(monkeypatch):
     argv = bok.servers._mac_llm_server_argv(
         Path("py"), "/models/main-4b", "1239", {"llm_draft": _DRAFT_REPO})
     assert argv == [
-        "py", str(bok.MLX_SERVER_WRAPPER),
+        "py", str(bok.paths.MLX_SERVER_WRAPPER),
         "--model", "/models/main-4b", "--host", "127.0.0.1", "--port", "1239",
         "--prompt-cache-size", "128",
         "--prompt-cache-bytes", "4GB",

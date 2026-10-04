@@ -4,9 +4,10 @@
 setup_models/cmd_setup/cmd_download/cmd_catalog/cmd_manifest 装机面;
 G2 W② 从 core 搬出,搬运纪律=穿模块对象调用)。
 
-- 本模块只 `from bokctl import core` 拿模块对象:凡仍住在 core 的名字(platform_key/
-  is_packaged/is_mac/is_linux/app_data_dir 等一律 `core.X` 调用时取——patch 与
-  后续域搬运在 core 侧保持可见(patch 缝=模块属性)。
+- 本模块不再依赖 core(paths 波后 core.X 消费点清零):路径/平台锚(platform_key/
+  is_packaged/is_mac/is_linux/app_data_dir)住 bokctl.paths,本模块穿
+  `paths.X` 调用时取——patch 与后续域搬运在 paths 侧保持可见(patch 缝=模块
+  属性)。
 - 本域自有名件(MODELS/WINDOWS_LLM_GGUF_PATTERNS/OPTIONAL_MODELS/model_dir/
   _lmstudio_models_dir/_usable_model_dir/model_path/_settings_llm_local_model/
   resolve_llm_repo/_mt_llm_model/_settle_llm_model/_usable_laya_dir/
@@ -14,13 +15,12 @@ G2 W② 从 core 搬出,搬运纪律=穿模块对象调用)。
   cmd_catalog/cmd_manifest/setup_models/_all_models_present/cmd_setup/
   _dir_sha256/_enable_hf_transfer/cmd_download)域内裸名互调(同模块全局=
   call-time 可 patch)。
-- 留守 core 的近邻(边界记录,2026-10-04):MLX_SERVER_WRAPPER 是 ROOT 派生路径
-  常量(paths 域候选;core 的域 import 行先于 ROOT 定义,域模块 import 期取不到
-  core.ROOT——常量必须留 core,消费者 servers 穿 core.MLX_SERVER_WRAPPER);
-  platform_key/app_data_dir/is_packaged/is_mac/is_linux 属 paths 域(后批);
-  _dev_9b_enabled/_settle_gate_url 是 env 组装面闸键(env 域最后一批)——本域
-  专线解析(_settle_llm_model/_mt_llm_model)只管「模型路径是甚么」,起不起
-  对应端口是 env/servers 域的决策。
+- 留守 core 的近邻(边界记录,2026-10-04):_dev_9b_enabled/_settle_gate_url 是
+  env 组装面闸键(env 域最后一批)——本域专线解析(_settle_llm_model/
+  _mt_llm_model)只管「模型路径是甚么」,起不起对应端口是 env/servers 域的
+  决策。MLX_SERVER_WRAPPER 的旧判例(「ROOT 派生常量因 import 序必须留 core」)
+  已随 paths 波解除——常量随 ROOT 住 bokctl.paths(零内部依赖,无 import 序
+  问题),消费者穿 paths.MLX_SERVER_WRAPPER。
 - 测试面:patch 一律走 tests/_bokpatch.py(patch_bok;PATCH_TARGETS 已把 model_dir/
   _lmstudio_models_dir/model_path/_settings_llm_local_model/_settle_llm_model/
   _enable_hf_transfer/cmd_download 改道 bokctl.models);facade 读用 bok.models.X。
@@ -32,7 +32,7 @@ import os
 import sys
 from pathlib import Path
 
-from bokctl import core
+from bokctl import paths
 
 MODELS: dict[str, dict[str, str]] = {
     "mac": {
@@ -111,7 +111,7 @@ OPTIONAL_MODELS = {"mt", "settle", "embedding", "laya", "llm_draft", "sensevoice
 
 
 def model_dir(repo_id: str) -> Path:
-    return core.app_data_dir() / "models" / repo_id.replace("/", "--")
+    return paths.app_data_dir() / "models" / repo_id.replace("/", "--")
 
 
 def _lmstudio_models_dir() -> Path:
@@ -150,9 +150,9 @@ def model_path(current: dict[str, str], name: str) -> str:
     repo = current.get(name, "")
     if not repo:
         return ""
-    if core.is_packaged():
+    if paths.is_packaged():
         return str(model_dir(repo))
-    if core.is_mac():
+    if paths.is_mac():
         # mac dev 惯例优先 ~/.lmstudio;但 bok.py download 落地在 app-data——
         # 哪边**真有一份可加载的模型**用哪边,否则「download 成功但 serve 找不到」断层
         # (2026-09-08 ASR 4bit 实证:health model_ready=false 指着不存在的 lmstudio 路径)。
@@ -167,7 +167,7 @@ def model_path(current: dict[str, str], name: str) -> str:
         if _usable_model_dir(app, extra_required=extra):
             return str(app)
         return str(lm)
-    if core.is_linux():
+    if paths.is_linux():
         # Linux dev（runbook §5②，2026-09-22）：cmd_download 只落 *Q4_K_M.gguf 进
         # app-data/models/<repo>（WINDOWS_LLM_GGUF_PATTERNS），llama-server 只认
         # .gguf **文件**路径——repo id 是 win-dev 的 hf cache 语义，直传会 :1235
@@ -194,7 +194,7 @@ def _settings_llm_local_model() -> str:
     try:
         import sqlite3
 
-        db_path = core.app_data_dir() / "bok_voice.db"
+        db_path = paths.app_data_dir() / "bok_voice.db"
         if not db_path.exists():
             return ""
         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
@@ -276,9 +276,9 @@ def laya_model_path(current: dict[str, str]) -> str:
     repo = current.get("laya", "")
     if not repo:
         return ""
-    if core.is_packaged():
+    if paths.is_packaged():
         return str(model_dir(repo))
-    if core.is_mac():
+    if paths.is_mac():
         lm = _lmstudio_models_dir() / repo
         if _usable_laya_dir(lm):
             return str(lm)
@@ -345,21 +345,21 @@ def _llm_draft_flags(current: dict[str, str]) -> list[str]:
 
 
 def cmd_catalog() -> int:
-    key = core.platform_key()
+    key = paths.platform_key()
     print(f"platform: {key}")
     for name, repo in MODELS[key].items():
         if repo:
             print(f"  {name:<12} {repo}")
-    print(f"  ~download into {core.app_data_dir() / 'models'}")
+    print(f"  ~download into {paths.app_data_dir() / 'models'}")
     return 0
 
 
 def cmd_manifest() -> int:
     """Emit a JSON manifest for the desktop shell / CI release pipeline."""
-    key = core.platform_key()
+    key = paths.platform_key()
     data: dict = {
         "platform": key,
-        "app_data_dir": str(core.app_data_dir()),
+        "app_data_dir": str(paths.app_data_dir()),
         "ports": {
             "control_plane": 8000,
             "web": 3000,
@@ -387,7 +387,7 @@ def cmd_manifest() -> int:
 
 def setup_models() -> list[dict]:
     """Return per-model download status for the first-run wizard."""
-    key = core.platform_key()
+    key = paths.platform_key()
     out: list[dict] = []
     for name, repo in MODELS[key].items():
         if not repo:
@@ -445,7 +445,7 @@ def cmd_download(only: set[str] | None = None) -> int:
     `only` 提到表内不存在的键（如非 mac 表的 mt/settle）→ 逐项说明「未配置，
     对应功能回退主 LLM」，不算失败（与 OPTIONAL_MODELS 语义一致）。
     """
-    key = core.platform_key()
+    key = paths.platform_key()
     table = MODELS[key]
     requested = set(only) if only else None
     if requested:
@@ -477,7 +477,7 @@ def cmd_download(only: set[str] | None = None) -> int:
         # mac dev 的 lmstudio 布局同样算「已在盘」——与 model_path 的「哪边真实
         # 存在用哪边」同语义;不认的话 lmstudio 已有的模型会被重复下载 5.5GB
         # (2026-09-17 settle 9B 实证:serve 在 ensure 步静默拉 HF)。
-        if core.is_mac():
+        if paths.is_mac():
             lm = _lmstudio_models_dir() / repo
             if lm.exists() and any(lm.iterdir()):
                 print(f"  [ok]   {name} present (lmstudio)  {lm}")

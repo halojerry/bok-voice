@@ -65,7 +65,7 @@ def test_main_dispatch_passes_only_to_download(monkeypatch):
 
 def test_cmd_download_only_filters_table(monkeypatch, tmp_path: Path):
     fake = _install_fake_hf(monkeypatch)
-    monkeypatch.setattr(bok._platform, "system", lambda: "Linux")
+    monkeypatch.setattr(bok.paths._platform, "system", lambda: "Linux")
     patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     patch_bok(monkeypatch, "_enable_hf_transfer", lambda: None)
     rc = bok.models.cmd_download(only={"asr"})
@@ -75,7 +75,7 @@ def test_cmd_download_only_filters_table(monkeypatch, tmp_path: Path):
 
 def test_cmd_download_only_reports_unconfigured(capsys, monkeypatch, tmp_path: Path):
     fake = _install_fake_hf(monkeypatch)
-    monkeypatch.setattr(bok._platform, "system", lambda: "Linux")
+    monkeypatch.setattr(bok.paths._platform, "system", lambda: "Linux")
     patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     patch_bok(monkeypatch, "_enable_hf_transfer", lambda: None)
     rc = bok.models.cmd_download(only={"asr", "mt", "settle"})

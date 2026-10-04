@@ -621,13 +621,14 @@ def test_bok_launch_points_use_wrapper():
     from _bok_src import bok_source
 
     src = bok_source()
-    assert bok.MLX_SERVER_WRAPPER == ROOT / "services" / "llm-mlx" / "bok_mlx_server.py"
-    assert bok.MLX_SERVER_WRAPPER.is_file()
+    assert bok.paths.MLX_SERVER_WRAPPER == ROOT / "services" / "llm-mlx" / "bok_mlx_server.py"
+    assert bok.paths.MLX_SERVER_WRAPPER.is_file()
     argv = bok.servers._mac_llm_server_argv(Path("py"), "/m", "1239", {"llm_draft": ""})
-    assert argv[:2] == ["py", str(bok.MLX_SERVER_WRAPPER)]
+    assert argv[:2] == ["py", str(bok.paths.MLX_SERVER_WRAPPER)]
     # 三处启动点全走 wrapper；mac 旧入口 `-m mlx_lm server` 清零
-    # （servers 波后启动点住 bokctl.servers,常量留 core=穿 core. 取,故带前缀）
-    assert src.count("str(core.MLX_SERVER_WRAPPER)") >= 3
+    # （servers 波后启动点住 bokctl.servers;paths 波后常量随 ROOT 住
+    # bokctl.paths=穿 paths. 取,故带前缀）
+    assert src.count("str(paths.MLX_SERVER_WRAPPER)") >= 3
     assert '"-m", "mlx_lm", "server"' not in src
 
 

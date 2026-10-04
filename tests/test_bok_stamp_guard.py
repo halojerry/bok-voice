@@ -48,12 +48,12 @@ def _tmp_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     monkeypatch.delenv("LOCALAPPDATA", raising=False)
-    (bok.app_data_dir() / "run").mkdir(parents=True, exist_ok=True)
+    (bok.paths.app_data_dir() / "run").mkdir(parents=True, exist_ok=True)
     return home
 
 
 def _run_dir(home: Path) -> Path:
-    return bok.app_data_dir() / "run"
+    return bok.paths.app_data_dir() / "run"
 
 
 @contextlib.contextmanager
@@ -171,10 +171,10 @@ def test_own_tree_and_unknown_not_foreign(monkeypatch, tmp_path):
     home = _tmp_home(monkeypatch, tmp_path)
     pool = _FakeWorkers()
     try:
-        own_env = pool.spawn(str(bok.ROOT))
-        assert bok.proc._pid_origin_foreign(own_env.pid) == (False, str(bok.ROOT))
+        own_env = pool.spawn(str(bok.paths.ROOT))
+        assert bok.proc._pid_origin_foreign(own_env.pid) == (False, str(bok.paths.ROOT))
         own_marker = pool.spawn(None)
-        _write_marker(home, own_marker.pid, str(bok.ROOT))
+        _write_marker(home, own_marker.pid, str(bok.paths.ROOT))
         assert bok.proc._pid_origin_foreign(own_marker.pid)[0] is False
         unknown = pool.spawn(None)
         assert bok.proc._pid_origin_foreign(unknown.pid) == (False, "")
@@ -316,7 +316,7 @@ def test_cmd_monitor_writes_own_stamps(monkeypatch, tmp_path):
     bok.proc._write_proc_stamps(run / "monitor.pid", pid)
     assert (run / "monitor.pid").read_text().strip() == str(pid)
     parts = (run / f"proc-{pid}.root").read_text().strip().split("\t")
-    assert len(parts) == 2 and parts[0] == str(bok.ROOT)
+    assert len(parts) == 2 and parts[0] == str(bok.paths.ROOT)
     # 真 lstart：写完立刻按戳判活成立；幂等重写不炸
     assert bok.proc._pidfile_alive_stamped(run / "monitor.pid") is True
     bok.proc._write_proc_stamps(run / "monitor.pid", pid)
@@ -335,13 +335,13 @@ def test_pidfile_alive_stamped_pid_reuse_judged_dead(monkeypatch, tmp_path):
         run = _run_dir(home)
         (run / "monitor.pid").write_text(str(proc.pid))
         (run / f"proc-{proc.pid}.root").write_text(
-            f"{bok.ROOT}\tFAKE LSTART (recycled)\n", encoding="utf-8")
+            f"{bok.paths.ROOT}\tFAKE LSTART (recycled)\n", encoding="utf-8")
         assert bok.proc._pidfile_alive_stamped(run / "monitor.pid") is False
         (run / f"proc-{proc.pid}.root").unlink()
         assert bok.proc._pidfile_alive_stamped(run / "monitor.pid") is True
-        (run / f"proc-{proc.pid}.root").write_text(f"{bok.ROOT}\n", encoding="utf-8")
+        (run / f"proc-{proc.pid}.root").write_text(f"{bok.paths.ROOT}\n", encoding="utf-8")
         assert bok.proc._pidfile_alive_stamped(run / "monitor.pid") is True
-        _write_marker(home, proc.pid, str(bok.ROOT))
+        _write_marker(home, proc.pid, str(bok.paths.ROOT))
         assert bok.proc._pidfile_alive_stamped(run / "monitor.pid") is True
         proc.terminate()
         proc.join(timeout=5)
@@ -363,7 +363,7 @@ def test_ensure_monitor_reuse_respawns_foreign_logs(monkeypatch, tmp_path, capsy
         recycled = pool.spawn(None)
         (run / "monitor.pid").write_text(str(recycled.pid))
         (run / f"proc-{recycled.pid}.root").write_text(
-            f"{bok.ROOT}\tSTALE LSTART\n", encoding="utf-8")
+            f"{bok.paths.ROOT}\tSTALE LSTART\n", encoding="utf-8")
         bok.proc._ensure_monitor(sys.executable)
         assert started, "stale pidfile（pid 复用）该触发重拉"
 
@@ -376,7 +376,7 @@ def test_ensure_monitor_reuse_respawns_foreign_logs(monkeypatch, tmp_path, capsy
         assert "属另一代码树" in capsys.readouterr().out
 
         started.clear()
-        own = pool.spawn(str(bok.ROOT))
+        own = pool.spawn(str(bok.paths.ROOT))
         (run / "monitor.pid").write_text(str(own.pid))
         bok.proc._ensure_monitor(sys.executable)
         assert not started, "本树活 monitor 该静默跳过"

@@ -223,15 +223,16 @@ def run_section_a(mod: Any, tree_timeout: float) -> str:
     #   ROOT -> tmp          ⇒ legacy data 扫描落在 tmp/data(空,不碰仓库);
     #   _sweep_orphan_workers -> no-op ⇒ 勿清扫真机上可能活着的 agent worker。
     # patch 必须打在权威模块(G2 W① 门面化/W② 域搬运后:cmd_down 住 core、
-    # 清扫住 proc,函数读各自模块全局——打在门面命名空间静默失效)。
-    import bokctl.core as _core_mod
+    # 清扫住 proc;paths 波后 app_data_dir/ROOT 住 bokctl.paths——函数读各自
+    # 模块全局,打在门面命名空间静默失效)。
+    import bokctl.paths as _paths_mod
     import bokctl.proc as _proc_mod
 
-    orig_app_data_dir = _core_mod.app_data_dir
-    orig_root = _core_mod.ROOT
+    orig_app_data_dir = _paths_mod.app_data_dir
+    orig_root = _paths_mod.ROOT
     orig_sweep = _proc_mod._sweep_orphan_workers
-    _core_mod.app_data_dir = lambda: tmp
-    _core_mod.ROOT = tmp
+    _paths_mod.app_data_dir = lambda: tmp
+    _paths_mod.ROOT = tmp
     _proc_mod._sweep_orphan_workers = lambda: []
     cleanup_pids: list[int] = []
     keep_tmp = True  # 有 FAIL 时保留现场(日志/pid 证据);全过即清
@@ -319,8 +320,8 @@ def run_section_a(mod: Any, tree_timeout: float) -> str:
             keep_tmp = False
         return "ok"
     finally:
-        _core_mod.app_data_dir = orig_app_data_dir
-        _core_mod.ROOT = orig_root
+        _paths_mod.app_data_dir = orig_app_data_dir
+        _paths_mod.ROOT = orig_root
         _proc_mod._sweep_orphan_workers = orig_sweep
         for pid in cleanup_pids:
             _best_effort_kill(pid)

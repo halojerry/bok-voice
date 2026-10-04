@@ -66,9 +66,9 @@ def print_argv(mode: str) -> int:
 
         os.environ["BOK_LLM_DRAFT"] = "1"
     # current 与 serve 同源（cmd_serve 同款构造）
-    current = dict(bok.models.MODELS["mac"] if bok.is_mac() else bok.models.MODELS["windows"])
+    current = dict(bok.models.MODELS["mac"] if bok.paths.is_mac() else bok.models.MODELS["windows"])
     current["llm"] = bok.models.resolve_llm_repo(current)
-    llm_py = bok.sidecar_python("llm-mlx")
+    llm_py = bok.paths.sidecar_python("llm-mlx")
     llm_model = bok.models.model_path({**current, "llm": current["llm"]}, "llm")
     draft_flags = bok.models._llm_draft_flags(current) if mode == "draft" else []
     argv = bok.servers._mac_llm_server_argv(

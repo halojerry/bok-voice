@@ -3,10 +3,11 @@
 双件/monitor veto 判定;G2 W② 从 core 搬出,搬运纪律=穿模块对象调用)。
 
 - 本模块只 `from bokctl import core`(及 servers 域)拿模块对象:凡仍住在 core 的
-  名字(ROOT/app_data_dir/_pid_alive/_relaxed_healthy 等——共享件判留 core,
+  名字(_pid_alive/_relaxed_healthy 等——共享件判留 core,
   与 doctor 波同判:healthy/_probe_worker/_http_call/_pid_alive 被
   status/doctor/prod/serve 多面吃)一律 `core.X` 调用时取——patch 与后续域
-  搬运在 core 侧保持可见(patch 缝=模块属性)。
+  搬运在 core 侧保持可见(patch 缝=模块属性);路径/平台锚(ROOT/app_data_dir)
+  paths 波(2026-10-04)后穿 `paths.X` 取。
 - 本域自有函数(_ps_field/_process_serve_root/_pid_origin_foreign/
   _pidfile_alive_stamped/_pid_reused_stale/_write_proc_stamps/_kill_proc_tree/
   _kill_pidfile/_ensure_monitor/_cp_active_calls/_monitor_kill_round/
@@ -35,7 +36,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
-from bokctl import core, servers
+from bokctl import core, paths, servers
 
 
 def _write_proc_stamps(pidfile: Path, pid: int) -> None:
@@ -48,7 +49,7 @@ def _write_proc_stamps(pidfile: Path, pid: int) -> None:
     pidfile.parent.mkdir(parents=True, exist_ok=True)
     pidfile.write_text(str(pid))
     try:
-        (pidfile.parent / f"proc-{pid}.root").write_text(f"{core.ROOT}\t{_ps_field(pid, 'lstart=')}\n")
+        (pidfile.parent / f"proc-{pid}.root").write_text(f"{paths.ROOT}\t{_ps_field(pid, 'lstart=')}\n")
     except Exception:
         pass  # 标记写不出=来源未知，清扫走原语义；绝不影响起进程
 
@@ -88,7 +89,7 @@ def _pid_reused_stale(pidfile: Path, pid: int) -> bool:
     ps 读不出 → False（fail-open 旧语义：无戳遗留照杀，未知绝不挡杀——与
     ``_pid_origin_foreign`` 同纪律）。"""
     recorded = ""
-    for base in (pidfile.parent, core.app_data_dir() / "run"):
+    for base in (pidfile.parent, paths.app_data_dir() / "run"):
         try:
             parts = (base / f"proc-{pid}.root").read_text().strip().split("\t")
         except Exception:
@@ -166,8 +167,8 @@ def _ensure_monitor(py) -> None:
     2026-09-22 盲斑修复：①存活判定升级为 lstart 比对（_pidfile_alive_stamped，
     pidfile 残留 pid 被复用不再误判活 = 栈无 monitor）；②跨树可观测——monitor
     属他树时打日志跳过（共享栈模型既定行为，从静默变有声，不改变动作）。"""
-    run_dir = core.app_data_dir() / "run"
-    log_dir = core.app_data_dir() / "logs"
+    run_dir = paths.app_data_dir() / "run"
+    log_dir = paths.app_data_dir() / "logs"
     pidfile = run_dir / "monitor.pid"
     if _pidfile_alive_stamped(pidfile):
         try:
@@ -180,7 +181,7 @@ def _ensure_monitor(py) -> None:
             pass
         return
     servers._start_proc(
-        [str(py), str(core.ROOT / "tools" / "bok.py"), "monitor"],  # G2 W①:re-exec 走门面 launcher
+        [str(py), str(paths.ROOT / "tools" / "bok.py"), "monitor"],  # G2 W①:re-exec 走门面 launcher
         pidfile,
         log_dir / "monitor.log",
         env={"BOK_MONITOR": "1"},
@@ -337,7 +338,7 @@ def _process_serve_root(pid: int) -> str:
     if os.name == "nt":
         return ""
     try:
-        marker = core.app_data_dir() / "run" / f"proc-{pid}.root"
+        marker = paths.app_data_dir() / "run" / f"proc-{pid}.root"
         if marker.exists():
             parts = marker.read_text().strip().split("\t")
             if len(parts) == 2 and parts[1]:
@@ -380,7 +381,7 @@ def _pid_origin_foreign(pid: int) -> tuple[bool, str]:
     root = _process_serve_root(pid)
     if not root:
         return False, ""
-    if os.path.realpath(root) == os.path.realpath(str(core.ROOT)):
+    if os.path.realpath(root) == os.path.realpath(str(paths.ROOT)):
         return False, root
     return True, root
 
@@ -389,7 +390,7 @@ def _sweep_stale_root_markers() -> None:
     """清 proc-<pid>.root 残留：ps 探不到的 pid 视为死，标记删除（防标记文件
     无限积累）；ps 探测失败=未知一律保留。"""
     try:
-        markers = list((core.app_data_dir() / "run").glob("proc-*.root"))
+        markers = list((paths.app_data_dir() / "run").glob("proc-*.root"))
     except Exception:
         return
     for marker in markers:
@@ -514,7 +515,7 @@ def _sweep_orphan_listeners(kill: bool = True,
             # 不收他树（down=停本树+无戳遗留）。stamp 读不出按来源未知走下面
             # 原健康闸/收割语义，旧行为兜底不变。
             proc_root = _process_serve_root(pid)
-            if proc_root and os.path.realpath(proc_root) != os.path.realpath(str(core.ROOT)):
+            if proc_root and os.path.realpath(proc_root) != os.path.realpath(str(paths.ROOT)):
                 print(
                     f"[sweep] port {port}: pid {pid} 属另一代码树（{proc_root}）——不动"
                     "（他树进程永不收割；要切换先在对方 down）",

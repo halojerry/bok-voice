@@ -21,7 +21,6 @@ import argparse
 import http.client
 import json
 import os
-import platform as _platform
 import signal
 import socket
 import subprocess
@@ -33,86 +32,37 @@ import urllib.request
 from pathlib import Path
 
 # G2 W②:prod/doctor/proc/health/servers/models 域已搬 tools/bokctl/{prod,doctor,
-# proc,health,servers,models}.py——core 侧一律穿模块对象调用(prod.cmd_prod(...)/
-# doctor.cmd_doctor(...)/proc._kill_proc_tree(...)/health._wait_desktop_ready(...)/
-# servers.cmd_serve(...)/models.cmd_download(...),call-time 属性取用=patch 缝与
-# 后续域搬运保持可见)。health 的 F401:core
+# proc,health,servers,models}.py;paths 波(2026-10-04)再加 paths——core 侧一律穿
+# 模块对象调用(prod.cmd_prod(...)/doctor.cmd_doctor(...)/proc._kill_proc_tree(...)/
+# health._wait_desktop_ready(...)/servers.cmd_serve(...)/models.cmd_download(...)/
+# paths.app_data_dir(...),call-time 属性取用=patch 缝与后续域搬运保持可见)。
+# health 的 F401:core
 # 代码已无直接消费(servers 波把 _warn_llm_not_http_ready/_cmd_up_services/
 # cmd_serve 三个消费点整族搬出),但 bok 门面镜像 vars(core) 需要 health 绑定
-# ——tests 的 bok.health._serve_ready_probe* 等读面仍走门面。
+# ——tests 的 bok.health._serve_ready_probe* 等读面仍走门面。paths 同理:
+# bok.paths.X 读面(测试/脚本)经门面镜像取模块对象。
 from bokctl import (  # noqa: E402
     doctor,
     health,  # noqa: F401
     models,
+    paths,
     proc,
     prod,
     servers,
 )
 
-_BOK_ROOT_ENV = os.environ.get("BOK_ROOT", "")
-# G2 W①:core.py 比 bok.py 深一层,repo 根=parents[2]
-ROOT = Path(_BOK_ROOT_ENV).resolve() if _BOK_ROOT_ENV else Path(__file__).resolve().parents[2]
-
-
-def is_packaged() -> bool:
-    """True when running from the desktop bundle (Tauri resources)."""
-    return os.environ.get("BOK_PACKAGED") == "1"
-
-
-def is_mac() -> bool:
-    return _platform.system() == "Darwin"
-
-
-def is_linux() -> bool:
-    """Linux 档判定（Ubuntu 节点形态，2026-09-20）。按真实 OS 判定而非
-    `not is_mac() and os.name != "nt"`——Windows 单测以 is_mac=False+os.name
-    打桩模拟 Windows，过度宽松的判定会把桩吃掉（test_prod_windows 实证）。"""
-    return _platform.system() == "Linux"
-
-
-def app_data_dir() -> Path:
-    """app-data 根（…/BokVoice）：SQLite/vault/logs/units/models 全落这里。
-
-    平台分档（2026-09-20 Ubuntu 节点形态补齐）：nt=LOCALAPPDATA；Darwin=
-    ~/Library/Application Support；Linux=XDG_DATA_HOME 或 ~/.local/share——
-    旧版非 nt 恒落 mac 路径，Ubuntu 上会把数据写到不存在的 Library 目录树。
-    """
-    if os.name == "nt":
-        base = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
-    elif is_mac():
-        base = Path(os.environ.get("HOME", ".")) / "Library" / "Application Support"
-    else:
-        base = Path(
-            os.environ.get("XDG_DATA_HOME")
-            or str(Path(os.environ.get("HOME", ".")) / ".local" / "share")
-        )
-    return base / "BokVoice"
-
-
-def runtime_root() -> Path:
-    """Locate the bundled runtime dir (python/node/llama/livekit).
-
-    规范位置 = 仓库根 ``<root>/runtime``（2026-09-17 迁出 desktop/，Tauri 退役
-    前置）。仍向上走祖先目录兜底：兼容历史布局与未来打包形态把代码根埋深一层
-    的场景（runtime 与代码根同级或在其上方）。
-    """
-    cur = ROOT
-    for _ in range(5):
-        cand = cur / "runtime"
-        if (
-            (cand / "python" / "bin" / "python3").exists()
-            or (cand / "python" / "python.exe").exists()
-            or (cand / ".venv").exists()
-            or (cand / "livekit-server").exists()
-            or (cand / "livekit-server.exe").exists()
-            or (cand / "llama").exists()
-        ):
-            return cand
-        parent = cur.parent
-        if parent == cur:
-            break
-        cur = parent
-    return ROOT / "runtime"
+# G2 W②-paths 波(2026-10-04):路径/平台锚(ROOT/_BOK_ROOT_ENV/app_data_dir/
+# runtime_root/is_packaged/is_mac/is_linux/platform_key/sidecar_python/
+# sidecar_venv_python/repo_python/_repo_pythonpath/bundled_node/bundled_llama/
+# _embedded_livekit/_livekit_config_path/MLX_SERVER_WRAPPER)已搬
+# tools/bokctl/paths.py——paths 零 bokctl 内部依赖(stdlib-only),ROOT 根锚随域走
+# (解 models 波「域 import 行先于 core.ROOT,常量必须留 core」的判例);is_mac/
+# is_linux 打桩 monkeypatch.setattr(bok.paths._platform,…)不受影响——bok/paths 的
+# `_platform` 是同一个 stdlib platform 模块对象(core 已不 import platform)。
+# 留守 core 的近邻:_certifi_bundle/
+# _bake_ssl_cert_file(env 组装面)/_virtual_audio_present(报告性探测)/
+# shutil_which/_cuda(工具探测)/_PROVIDER_HEALTH_MODULE(随 provider-health 族留
+# core,读 paths.ROOT)。
 
 
 # G2 W②-models 波(2026-10-04):平台模型表(MODELS/WINDOWS_LLM_GGUF_PATTERNS/
@@ -123,13 +73,6 @@ def runtime_root() -> Path:
 # _enable_hf_transfer/cmd_download)已搬 tools/bokctl/models.py——core 侧消费点
 # (_control_plane_env/_apply_judge_env/_agent_worker_env/_agent_prod_env/
 # _interp_env/main 分发)一律穿 models.X 调用时取(补丁缝随属主模块走)。
-
-
-def platform_key() -> str:
-    """模型表键：Darwin=mac（mlx 栈）；其余（Windows/Linux）=windows（llama.cpp
-    GGUF + transformers ASR/TTS）。旧版非 nt 恒回 "mac"，Linux 会去下 mlx 模型
-    并在 :1235 起 mlx_lm——Ubuntu 节点形态修复（2026-09-20）。"""
-    return "mac" if is_mac() else "windows"
 
 
 def _dev_9b_enabled() -> bool:
@@ -147,52 +90,6 @@ def _dev_9b_enabled() -> bool:
     return os.environ.get("BOK_DEV_9B", "") != "0"
 
 
-def sidecar_python(name: str) -> Path:
-    """Bundled runtime python, else the repo venv for that service."""
-    if os.name == "nt":
-        cands = [
-            runtime_root() / "python" / "python.exe",
-            ROOT / "services" / name / ".venv" / "Scripts" / "python.exe",
-        ]
-    else:
-        cands = [
-            runtime_root() / "python" / "bin" / "python3",
-            ROOT / "services" / name / ".venv" / "bin" / "python",
-        ]
-    for c in cands:
-        if c.exists():
-            return c
-    return cands[-1]
-
-
-def sidecar_venv_python(name: str) -> Path:
-    if os.name == "nt":
-        return ROOT / "services" / name / ".venv" / "Scripts" / "python.exe"
-    return ROOT / "services" / name / ".venv" / "bin" / "python"
-
-
-def repo_python() -> Path:
-    """Pick a Python interpreter that can import control_plane + obs packages."""
-    if os.name == "nt":
-        candidates = [
-            runtime_root() / "python" / "python.exe",
-            ROOT / ".venv312" / "Scripts" / "python.exe",
-            ROOT / ".venv" / "Scripts" / "python.exe",
-            Path(sys.executable),
-        ]
-    else:
-        candidates = [
-            runtime_root() / "python" / "bin" / "python3",
-            ROOT / ".venv312" / "bin" / "python",
-            ROOT / ".venv" / "bin" / "python",
-            Path(sys.executable),
-        ]
-    for py in candidates:
-        if py.exists():
-            return py
-    return candidates[-1]
-
-
 def _virtual_audio_present() -> bool:
     """B 线同传的虚拟声卡是否就绪（macOS=BlackHole / Windows=VB-CABLE）。
 
@@ -201,7 +98,7 @@ def _virtual_audio_present() -> bool:
     import subprocess as _sp
 
     try:
-        if is_mac():
+        if paths.is_mac():
             out = _sp.run(["system_profiler", "SPAudioDataType"],
                           capture_output=True, text=True, timeout=10).stdout
             return "blackhole" in out.lower()
@@ -216,121 +113,6 @@ def _virtual_audio_present() -> bool:
     except Exception:  # noqa: BLE001 - 探测失败=按缺失报告，不阻 doctor
         return False
     return False
-
-
-def bundled_node() -> str | None:
-    """Bundled Node binary (externalBin: Resources or Contents/MacOS; runtime dir)."""
-    res = os.environ.get("BOK_RESOURCE_DIR", "")
-    if os.name == "nt":
-        cands = [
-            Path(res) / "node.exe" if res else None,
-            runtime_root() / "node" / "node.exe",
-            runtime_root() / "node.exe",
-        ]
-    else:
-        macos = Path(res).parent / "MacOS" / "node" if res else None
-        cands = [
-            Path(res) / "node" if res else None,
-            macos,
-            runtime_root() / "node" / "bin" / "node",
-            runtime_root() / "bin" / "node",
-        ]
-    for c in cands:
-        if c and c.exists():
-            return str(c)
-    return None
-
-
-def bundled_llama() -> Path | None:
-    """打包内嵌 llama-server：Windows=llama-server.exe；Linux=llama-server
-    （2026-09-20 Ubuntu 节点：runtime/llama/ 或 runtime/llama/linux/ 放置；
-    找不到时 _start_llm 回退 PATH 的 llama-server）。"""
-    if os.name == "nt":
-        for c in (runtime_root() / "llama" / "llama-server.exe", runtime_root() / "llama-server.exe"):
-            if c.exists():
-                return c
-        return None
-    if is_mac():
-        return None
-    for c in (
-        runtime_root() / "llama" / "llama-server",
-        runtime_root() / "llama" / "linux" / "llama-server",
-        runtime_root() / "llama-server",
-    ):
-        if c.exists():
-            return c
-    return None
-
-
-def _embedded_livekit() -> Path | None:
-    """Embedded LiveKit server binary (externalBin Resources/MacOS or runtime)."""
-    res = os.environ.get("BOK_RESOURCE_DIR", "")
-    if os.name == "nt":
-        cands = [Path(res) / "livekit-server.exe" if res else None, runtime_root() / "livekit-server.exe"]
-    else:
-        macos = Path(res).parent / "MacOS" / "livekit-server" if res else None
-        cands = [Path(res) / "livekit-server" if res else None, macos, runtime_root() / "livekit-server"]
-    for c in cands:
-        if c and c.exists():
-            return c
-    return None
-
-
-def _livekit_config_path() -> Path:
-    """LiveKit 生效配置路径（2026-09-20 Ubuntu 节点形态）：
-
-    无 env 覆盖 → 原样返回仓内 services/livekit-server/livekit.yaml（dev 形态
-    逐字节零变化）；有覆盖 → 生成补丁副本到 app-data/run/livekit.yaml：
-      - `BOK_LIVEKIT_BIND`：bind_addresses（逗号分隔多址）——内网多话务员形态
-        填本机内网 IP（默认 127.0.0.1 只有节点本机能连房）；
-      - `BOK_LIVEKIT_WEBHOOK_URL`：webhook urls[0]——节点形态指向**云 CP**
-        （仓内默认 http://127.0.0.1:8000/api/webhook/livekit 在节点上指向不存
-        在的本地 CP，崩溃补位重派会断）；
-      - `LIVEKIT_API_KEY/SECRET`：keys 段——生产键与 CP 签发 token 用的 env
-        同源（旧版 keys 恒为 devkey/devsecret 而 CP 读 env，分布式部署必错配）。
-    打补丁用行级替换（不引 yaml 依赖；仓内文件结构由本模块测试钉住）。
-    """
-    base = ROOT / "services" / "livekit-server" / "livekit.yaml"
-    bind = (os.environ.get("BOK_LIVEKIT_BIND") or "").strip()
-    webhook = (os.environ.get("BOK_LIVEKIT_WEBHOOK_URL") or "").strip()
-    key = (os.environ.get("LIVEKIT_API_KEY") or "").strip()
-    secret = (os.environ.get("LIVEKIT_API_SECRET") or "").strip()
-    if not bind and not webhook and not (key and secret):
-        return base
-    lines = base.read_text(encoding="utf-8").splitlines()
-    out: list[str] = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
-        if stripped.startswith("bind_addresses:") and bind:
-            out.append("bind_addresses:")
-            for addr in [a.strip() for a in bind.split(",") if a.strip()]:
-                out.append(f"  - {addr}")
-            i += 1
-            while i < len(lines) and lines[i].startswith("  - "):
-                i += 1
-            continue
-        if stripped == "urls:" and webhook:
-            out.append(line)
-            out.append(f"    - {webhook}")
-            i += 1
-            while i < len(lines) and lines[i].startswith("    - "):
-                i += 1
-            continue
-        if stripped == "keys:" and key and secret:
-            out.append(line)
-            out.append(f"  {key}: {secret}")
-            i += 1
-            while i < len(lines) and lines[i].startswith("  ") and ":" in lines[i]:
-                i += 1
-            continue
-        out.append(line)
-        i += 1
-    target = app_data_dir() / "run" / "livekit.yaml"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text("\n".join(out) + "\n", encoding="utf-8")
-    return target
 
 
 def healthy(port: int) -> bool:
@@ -441,7 +223,7 @@ def _probe_worker(port: int, timeout: float = 3.0) -> tuple[bool, str]:
 # 共享实现活在 packages/observability/bok_voice_obs/provider_health.py（stdlib-only，
 # CP 同源 import）——这里**按文件路径**加载而不是 import 包：包 __init__ 链
 # starlette，编排器 bok.py 必须在裸环境（bootstrap 前/打包节点）零第三方依赖可跑。
-_PROVIDER_HEALTH_MODULE = ROOT / "packages" / "observability" / "bok_voice_obs" / "provider_health.py"
+_PROVIDER_HEALTH_MODULE = paths.ROOT / "packages" / "observability" / "bok_voice_obs" / "provider_health.py"
 
 
 def _provider_health_summary(
@@ -461,7 +243,7 @@ def _provider_health_summary(
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         return mod.scan_provider_health(
-            log_dir if log_dir is not None else app_data_dir() / "logs",
+            log_dir if log_dir is not None else paths.app_data_dir() / "logs",
             window_s=window_s,
             now=now,
         )
@@ -562,7 +344,7 @@ def _llm_raw_expected() -> bool:
     """:1239（llm-raw，queue proxy 背后的内部 mlx）拓扑是否在役：mac +
     BOK_LLM_QUEUE_PROXY=1。代理关（或非 mac——Windows/Linux 走 llama.cpp，
     无 1239 拓扑）时 mlx 直跑 :1235，1239 缺席是设计态不是故障。"""
-    return is_mac() and _llm_queue_proxy_on()
+    return paths.is_mac() and _llm_queue_proxy_on()
 
 
 def _llm_raw_status_check_expected() -> bool:
@@ -571,18 +353,6 @@ def _llm_raw_status_check_expected() -> bool:
     整栈未起（:1235 也不在）时 1239 不进表——那份判决留给 :1235 自己的必需
     检查，不重复报（镜像 :1237「起了才查」的可选线语义）。"""
     return _llm_raw_expected() and healthy(1235)
-
-
-def _repo_pythonpath() -> str:
-    parts = [
-        ROOT / "packages" / "core",
-        ROOT / "packages" / "business-db",
-        ROOT / "packages" / "knowledge",
-        ROOT / "packages" / "observability",
-        ROOT / "apps" / "control-plane",
-        ROOT / "apps" / "agent",
-    ]
-    return os.pathsep.join(str(p) for p in parts)
 
 
 def shutil_which(name: str):
@@ -604,7 +374,7 @@ def _cuda() -> bool:
 
 
 def cmd_status() -> int:
-    print(f"app-data: {app_data_dir()}")
+    print(f"app-data: {paths.app_data_dir()}")
     _tts_needed, _tts_why = servers._local_tts_needed()
     services = [("web", 3000), *CORE_PORTS]
     for name, port in services:
@@ -702,13 +472,13 @@ def _control_plane_env(db: Path | str) -> dict[str, str]:
     /api/token issues a real JWT instead of the old sha256 dev fallback."""
     # 结算摘要/蒸馏（Summarizer）用同一本机 MLX：settings 里的 llm 卡片可能是空 base_url /
     # 占位 model="local"，真实地址由这里注入（与 agent worker L667 同源）。
-    _cur = models.MODELS["mac"] if is_mac() else models.MODELS["windows"]
+    _cur = models.MODELS["mac"] if paths.is_mac() else models.MODELS["windows"]
     llm_model = models.model_path({**_cur, "llm": models.resolve_llm_repo(_cur)}, "llm")
     env = {
-        "PYTHONPATH": _repo_pythonpath(),
+        "PYTHONPATH": paths._repo_pythonpath(),
         "BOK_SERVICE": "control-plane",
         "DATABASE_URL": f"sqlite:///{Path(db).as_posix()}",
-        "VAULT_ROOT": str(app_data_dir() / "vault"),
+        "VAULT_ROOT": str(paths.app_data_dir() / "vault"),
         "LIVEKIT_URL": os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880"),
         "LIVEKIT_API_KEY": os.environ.get("LIVEKIT_API_KEY", "devkey"),
         "LIVEKIT_API_SECRET": os.environ.get("LIVEKIT_API_SECRET", "devsecret"),
@@ -886,7 +656,7 @@ def _control_plane_env(db: Path | str) -> dict[str, str]:
             env[_k] = _v
     # .venv312 OpenSSL 无默认 CA 束：固化 SSL_CERT_FILE（P5 遗留项；CP 的
     # Summarizer/联网探针同食 TLS，注入失败零副作用）。
-    return _bake_ssl_cert_file(env, repo_python())
+    return _bake_ssl_cert_file(env, paths.repo_python())
 
 
 def _llm_queue_proxy_on() -> bool:
@@ -910,12 +680,9 @@ def _settle_gate_url() -> str:
     return "http://127.0.0.1:1237/v1"
 
 
-# mlx_lm server 入口 wrapper（2026-10-01 W-ABORT）：`from mlx_lm import server`
-# 后做按请求身份的生成中止 patch（POST /v1/abort），argv 原样透传。三处 mlx
-# 启动点（:1235/:1239 主 LLM、:1236 MT、:1237 settle/9B）统一走它；
-# BOK_MLX_ABORT=0 时 wrapper 零 patch=逐字节旧行为。客户端 req_id 由 agent
-# worker 侧 livekit_plugins.MlxLlmLLM 注入（X-Bok-Req-Id）。
-MLX_SERVER_WRAPPER = ROOT / "services" / "llm-mlx" / "bok_mlx_server.py"
+# mlx_lm server 入口 wrapper MLX_SERVER_WRAPPER 随 paths 波(2026-10-04)搬
+# tools/bokctl/paths.py——ROOT 派生常量,消费者(servers/_start_*)穿
+# paths.MLX_SERVER_WRAPPER 取。
 
 
 def _apply_judge_env(env: dict[str, str], _cur: dict[str, str]) -> None:
@@ -1383,9 +1150,9 @@ def _apply_flow_graph_env(env: dict[str, str]) -> None:
 
 def _agent_worker_env(py) -> dict[str, str]:
     """A 线 main worker 的 env(serve 与 monitor 同源单点)。"""
-    _cur = models.MODELS["mac"] if is_mac() else models.MODELS["windows"]
+    _cur = models.MODELS["mac"] if paths.is_mac() else models.MODELS["windows"]
     env: dict[str, str] = {
-        "PYTHONPATH": _repo_pythonpath(),
+        "PYTHONPATH": paths._repo_pythonpath(),
         "BOK_SERVICE": "agent",
         "LIVEKIT_URL": os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880"),
         "LIVEKIT_API_KEY": os.environ.get("LIVEKIT_API_KEY", "devkey"),
@@ -1465,9 +1232,9 @@ def cmd_monitor() -> int:
     12 轮/60s 抬门槛——swap 颠簸可连吃 60s,门槛抬得再高也有窗,veto 先生才
     关死);CP 不可达退回无通话口径。
     """
-    py = repo_python()
-    run_dir = app_data_dir() / "run"
-    log_dir = app_data_dir() / "logs"
+    py = paths.repo_python()
+    run_dir = paths.app_data_dir() / "run"
+    log_dir = paths.app_data_dir() / "logs"
     run_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
     # 盲斑 1 修复（2026-09-22）：外部手跑 monitor 也落 pidfile+来源戳——旧版只
@@ -1578,7 +1345,7 @@ def _cp_bind_host() -> str:
 
 
 def cmd_down() -> int:
-    run_dir = app_data_dir() / "run"
+    run_dir = paths.app_data_dir() / "run"
     stop_failures = 0
     for pidfile in run_dir.glob("*.pid"):
         try:
@@ -1618,7 +1385,7 @@ def cmd_down() -> int:
             continue
         print(f"[down] stopped {pidfile.stem} (pid {pid})")
     # Legacy dev sidecars managed by old start_sidecars.sh (host pids in data/).
-    data_dir = ROOT / "data"
+    data_dir = paths.ROOT / "data"
     for pidfile in data_dir.glob("sidecar-*.pid"):
         try:
             pid = int(pidfile.read_text().strip())
@@ -1648,9 +1415,9 @@ def cmd_down() -> int:
 
 def _agent_prod_env() -> dict[str, str]:
     """agent/interp worker 生产环境（与 cmd_serve 同源）。"""
-    _cur = models.MODELS["mac"] if is_mac() else models.MODELS["windows"]
+    _cur = models.MODELS["mac"] if paths.is_mac() else models.MODELS["windows"]
     env = {
-        "PYTHONPATH": _repo_pythonpath(),
+        "PYTHONPATH": paths._repo_pythonpath(),
         "BOK_SERVICE": "agent",
         "LIVEKIT_URL": os.environ.get("LIVEKIT_URL", "ws://127.0.0.1:7880"),
         "LIVEKIT_API_KEY": os.environ.get("LIVEKIT_API_KEY", "devkey"),
@@ -1663,7 +1430,7 @@ def _agent_prod_env() -> dict[str, str]:
     _apply_bok_passthrough_env(env)
     # .venv312 OpenSSL 无默认 CA 束 → MiniMax WSS 必炸 SSLCertVerificationError；
     # 固化 SSL_CERT_FILE（P5 遗留项），interp 经 _interp_env 的 dict 拷贝继承。
-    return _bake_ssl_cert_file(env, repo_python())
+    return _bake_ssl_cert_file(env, paths.repo_python())
 
 
 def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
@@ -1731,7 +1498,7 @@ def _interp_env(agent_env: dict[str, str]) -> dict[str, str]:
     ):
         if os.environ.get(_k):
             env[_k] = os.environ[_k]
-    mt_model = models._mt_llm_model(models.MODELS["mac"] if is_mac() else models.MODELS["windows"])
+    mt_model = models._mt_llm_model(models.MODELS["mac"] if paths.is_mac() else models.MODELS["windows"])
     if (mt_model and Path(mt_model).exists()) or healthy(1236):
         env["MT_LLM_BASE_URL"] = os.environ.get("MT_LLM_BASE_URL", "http://127.0.0.1:1236/v1")
         if mt_model:
@@ -1782,10 +1549,10 @@ def cmd_tts_pregen(extra: list[str] | None = None) -> int:
     子进程带仓库 PYTHONPATH 与 SSL_CERT_FILE(certifi)——venv 无系统 CA,
     MiniMax WSS 无此必炸。
     """
-    env = {"PYTHONPATH": _repo_pythonpath(), "PYTHONUNBUFFERED": "1"}
-    _bake_ssl_cert_file(env, repo_python())
+    env = {"PYTHONPATH": paths._repo_pythonpath(), "PYTHONUNBUFFERED": "1"}
+    _bake_ssl_cert_file(env, paths.repo_python())
     proc = subprocess.run(
-        [str(repo_python()), str(ROOT / "scripts" / "runtime" / "pregen_tts.py"), *(extra or [])],
+        [str(paths.repo_python()), str(paths.ROOT / "scripts" / "runtime" / "pregen_tts.py"), *(extra or [])],
         env={**os.environ, **env},
     )
     return proc.returncode
@@ -1797,10 +1564,10 @@ def cmd_tts_mine(extra: list[str] | None = None) -> int:
     --apply N 把前 N 条入库为 qa_entries(source=mined);入库后跑
     `bok.py tts-pregen` 物化应答音频,闸门只认缓存有音频的条目。
     """
-    env = {"PYTHONPATH": _repo_pythonpath(), "PYTHONUNBUFFERED": "1"}
-    _bake_ssl_cert_file(env, repo_python())
+    env = {"PYTHONPATH": paths._repo_pythonpath(), "PYTHONUNBUFFERED": "1"}
+    _bake_ssl_cert_file(env, paths.repo_python())
     proc = subprocess.run(
-        [str(repo_python()), str(ROOT / "scripts" / "runtime" / "mine_qa.py"), *(extra or [])],
+        [str(paths.repo_python()), str(paths.ROOT / "scripts" / "runtime" / "mine_qa.py"), *(extra or [])],
         env={**os.environ, **env},
     )
     return proc.returncode

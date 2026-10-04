@@ -106,7 +106,7 @@ def _bok_provides() -> set[str]:
             provided |= {base, base + "_REV"}
     # 计算注入键（如 MLX_LLM_MODEL=model_path(...)）：字面量正则够不着——直接内省
     # 真实 worker env 输出补齐（函数纯 dict 构造，跑一次零副作用）。
-    provided |= set(bok._agent_worker_env(bok.repo_python()))
+    provided |= set(bok._agent_worker_env(bok.paths.repo_python()))
     return provided
 
 
@@ -135,13 +135,13 @@ def test_forward_env_keys_all_flow_to_dev_and_prod(monkeypatch):
     """表内每键真的流到两表（设值 → 在；这是立法的意义，唔止签名在表上）。"""
     sentinel_key = "BOK_LLM_FALLBACK"  # 立法前 prod 死门的代表键
     monkeypatch.setenv(sentinel_key, "0")
-    dev = bok._agent_worker_env(bok.repo_python())
+    dev = bok._agent_worker_env(bok.paths.repo_python())
     prod = bok._agent_prod_env()
     assert dev.get(sentinel_key) == "0" and prod.get(sentinel_key) == "0"
     # 全表批量抽查：每个键设哨兵值后两表都必须带（防止表与 apply 函数脱钩）
     for key in bok._FORWARD_ENV:
         monkeypatch.setenv(key, f"sentinel-{key}")
-    dev2 = bok._agent_worker_env(bok.repo_python())
+    dev2 = bok._agent_worker_env(bok.paths.repo_python())
     prod2 = bok._agent_prod_env()
     missing = [k for k in bok._FORWARD_ENV
                if dev2.get(k) != f"sentinel-{k}" or prod2.get(k) != f"sentinel-{k}"]
@@ -152,7 +152,7 @@ def test_forward_env_absent_injects_nothing(monkeypatch):
     """未设 → 不注入（默认档零变化；表只透传运营显式设定）。"""
     for key in bok._FORWARD_ENV:
         monkeypatch.delenv(key, raising=False)
-    assert not any(k in bok._agent_worker_env(bok.repo_python()) for k in bok._FORWARD_ENV)
+    assert not any(k in bok._agent_worker_env(bok.paths.repo_python()) for k in bok._FORWARD_ENV)
     assert not any(k in bok._agent_prod_env() for k in bok._FORWARD_ENV)
 
 

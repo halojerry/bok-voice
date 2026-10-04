@@ -4,13 +4,15 @@ _worker_specs 装配、本地 TTS 门控、sidecar env 透传、LLM launch 配�
 spawn 原语四件;G2 W② 从 core 搬出,搬运纪律=穿模块对象调用)。
 
 - 本模块只 `from bokctl import core`(及 health/proc/models 域)拿模块对象:凡
-  仍住在 core 的名字(sidecar_python/healthy/repo_python/is_mac/is_packaged/
-  _llm_queue_proxy_on/MLX_SERVER_WRAPPER/_control_plane_env/_agent_worker_env/
-  _interp_env/_desktop_stack_targets 等一律 `core.X` 调用时取——patch 与后续
-  域搬运在 core 侧保持可见(patch 缝=模块属性);health/proc 域件穿 health.X/
-  proc.X,models 域件(models.MODELS/model_path/resolve_llm_repo/_mt_llm_model/
-  _settle_llm_model/laya_model_path/_llm_draft_flags/cmd_download 等)穿
-  models.X 取。
+  仍住在 core 的名字(healthy/_llm_queue_proxy_on/_control_plane_env/
+  _agent_worker_env/_interp_env/_desktop_stack_targets/_dev_9b_enabled 等一律
+  `core.X` 调用时取——patch 与后续域搬运在 core 侧保持可见(patch 缝=模块属性);
+  health/proc 域件穿 health.X/proc.X,models 域件(models.MODELS/model_path/
+  resolve_llm_repo/_mt_llm_model/_settle_llm_model/laya_model_path/
+  _llm_draft_flags/cmd_download 等)穿 models.X 取;路径/平台锚(ROOT/
+  app_data_dir/repo_python/sidecar_python/is_mac/is_packaged/bundled_node/
+  bundled_llama/_embedded_livekit/_livekit_config_path/MLX_SERVER_WRAPPER)
+  paths 波(2026-10-04)后穿 `paths.X` 取。
 - 本域自有函数(cmd_serve/cmd_up/_cmd_up_services/_start_call_plane/_start_llm/
   _start_mt_llm/_start_settle_proxy/_start_settle_llm/_start_laya/_worker_specs/
   _realtime_demo_enabled/_local_tts_needed/_qwen3_*_sidecar_env/_apply_mlx_
@@ -26,9 +28,9 @@ spawn 原语四件;G2 W② 从 core 搬出,搬运纪律=穿模块对象调用)�
   (status/doctor 可选线语义,health 波判留)与 _settle_gate_url 消费,拓扑判据
   随共享面留 core;_llm_draft_enabled/_llm_draft_flags/_llm_draft_model 属模型
   选型机制,**models 波(W②)已搬入 bokctl.models**——本域穿 `models.X` 取
-  (servers 波新例);MLX_SERVER_WRAPPER 是路径常量
-  (paths 域候选;且 core 的域 import 行先于 ROOT 定义,域模块 import 期取不到
-  core.ROOT——常量必须留在 core);健康面五件套+端口表+_desktop_stack_targets
+  (servers 波新例);MLX_SERVER_WRAPPER 旧判例(「ROOT 派生常量因 import 序留
+  core」)已随 paths 波解除——常量随 ROOT 住 bokctl.paths,消费者穿 paths. 取;
+  健康面五件套+端口表+_desktop_stack_targets
   (health 波既定);_cp_bind_host(prod 消费)/_pid_alive(prod 消费)判留;
   cmd_monitor/cmd_down 留 core(proc 波边界记录——down 被 prod uninstall 与
   node_agent 吃,monitor 是 core 命令;两者已改穿 servers.X 取装配/spawn 件)。
@@ -49,7 +51,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
-from bokctl import core, health, models, proc
+from bokctl import core, health, models, paths, proc
 
 
 # spawn 原语四件(2026-10-04 servers 波随服务面搬出;消费者=本域 _start_* 家族
@@ -106,7 +108,7 @@ def _start_proc(
     # /proc/<pid>/environ 可读回）；macOS ps 不吐环境，另落 pid 作用域标记文件
     # （root + 子代 lstart，清扫时精确比对防 pid 复用串号）。端口清扫据此区分
     # 本树子代与他树进程，他树永不误杀（跨树互杀根因/多会话纪律）。
-    merged["BOK_SERVE_ROOT"] = str(core.ROOT)
+    merged["BOK_SERVE_ROOT"] = str(paths.ROOT)
     spawn = subprocess.Popen
     # 本地名 child(原 proc)：G2 W② 起 proc 是 bokctl.proc 域模块,本地同名会
     # 遮蔽模块(行为零变化,纯防遮蔽改名)。
@@ -171,7 +173,7 @@ def _local_tts_needed() -> tuple[bool, str]:
     try:
         import sqlite3
 
-        db_path = core.app_data_dir() / "bok_voice.db"
+        db_path = paths.app_data_dir() / "bok_voice.db"
         if not db_path.exists():
             return True, "无设置库默认拉起"
         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
@@ -249,7 +251,7 @@ def _apply_mlx_template_fix(llm_py: Path) -> None:
     请求永远不是下一轮缓存前缀,命中坍缩回 system 锚点(2026-09-06 token 级
     探针实证 25→48/78)。runtime site-packages 不入 git,重建后由这里重打;
     失败零阻塞(损失跨轮命中而已)。"""
-    script = core.ROOT / "scripts" / "pipeline" / "mlx_lm_template_leak_fix.py"
+    script = paths.ROOT / "scripts" / "pipeline" / "mlx_lm_template_leak_fix.py"
     if not script.exists():
         return
     try:
@@ -329,7 +331,7 @@ def _mac_llm_server_argv(
         draft_flags = models._llm_draft_flags(current)
     cache_bytes = _default_prompt_cache_bytes(draft_on=bool(draft_flags))
     return [
-        str(llm_py), str(core.MLX_SERVER_WRAPPER),
+        str(llm_py), str(paths.MLX_SERVER_WRAPPER),
         "--model", llm_model, "--host", "127.0.0.1", "--port", mlx_port,
         "--prompt-cache-size", "128",
         "--prompt-cache-bytes", cache_bytes,
@@ -357,7 +359,7 @@ def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
     # 把「代理活着、mlx 死了」的半瘫当健康跳过（2026-09-26 新拓扑配套）。
     # readiness 真话（2026-10-02）：TCP 跳过前补探一次 /v1/models，不就绪大声
     # 告警（不改跳过语义，防双起）。
-    if core._llm_queue_proxy_on() and core.is_mac():
+    if core._llm_queue_proxy_on() and paths.is_mac():
         if core.healthy(1235) and core.healthy(1239):
             _warn_llm_not_http_ready((1235, 1239))
             return
@@ -365,12 +367,12 @@ def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
         _warn_llm_not_http_ready((1235,))
         return
     llm_model = models.model_path({**current, "llm": models.resolve_llm_repo(current)}, "llm")
-    if core.is_mac():
-        llm_py = core.sidecar_python("llm-mlx")
+    if paths.is_mac():
+        llm_py = paths.sidecar_python("llm-mlx")
         _apply_mlx_template_fix(llm_py)
     llm_model = models.model_path({**current, "llm": models.resolve_llm_repo(current)}, "llm")
-    if core.is_mac():
-        llm_py = core.sidecar_python("llm-mlx")
+    if paths.is_mac():
+        llm_py = paths.sidecar_python("llm-mlx")
         # prompt-cache-size: 默认 10 槽会被 4-6 路并发会话打穿(每请求插入 system/对话/完成
         # 多条前缀键,LRU 轮换把共享前缀挤掉)。M4 48GB 下 4k 前缀 KV 仅 ~134MB,调大纯赚,
         # 让同人设/话术的跨会话前缀缓存命中(实测同前缀重放 1.67s→0.19s)。
@@ -413,7 +415,7 @@ def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
         if _queue_on:
             print("[bok] llm queue proxy :1235 -> mlx :1239 (reply lane priority)")
             _start_proc(
-                [str(core.repo_python()), str(core.ROOT / "services" / "llm-mlx" / "queue_proxy.py")],
+                [str(paths.repo_python()), str(paths.ROOT / "services" / "llm-mlx" / "queue_proxy.py")],
                 run_dir / "llm-proxy.pid",
                 log_dir / "llm-proxy.log",
                 env={"BOK_LLM_QUEUE_UPSTREAM": "http://127.0.0.1:1239",
@@ -422,7 +424,7 @@ def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
         return
     # 非 mac（Windows/Linux）：llama.cpp 后端（GPU 必选；无 GPU 由 doctor 门禁阻止）。
     # Linux 档（2026-09-20 Ubuntu 节点）：runtime/llama/llama-server 或 PATH 提供。
-    llama_bin = core.bundled_llama() or core.shutil_which("llama-server")
+    llama_bin = paths.bundled_llama() or core.shutil_which("llama-server")
     if not llama_bin:
         print("[bok] llama-server 不可用（需 GPU；Windows 打包内嵌 CUDA 版 / "
               "Linux 需 runtime/llama/llama-server 或 PATH 安装 llama.cpp）", file=sys.stderr)
@@ -481,13 +483,13 @@ def _start_mt_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> bool
     if not mt_model or not Path(mt_model).exists():
         print(f"[bok] mt model not present, skip :1236 ({mt_model or 'unset'})", file=sys.stderr)
         return False
-    llm_py = core.sidecar_python("llm-mlx")
+    llm_py = paths.sidecar_python("llm-mlx")
     _apply_mlx_template_fix(llm_py)
     # 逐句无状态 MT:请求前缀只有模板头一条,32 槽 prompt cache 足够;Hy-MT2
     # 自带非思考对话模板,不传 --chat-template-args(主 LLM 的关思考参数不通用)。
     # 入口=wrapper（W-ABORT；B 线取消/打断流同享 abort）。
     _start_proc(
-        [str(llm_py), str(core.MLX_SERVER_WRAPPER),
+        [str(llm_py), str(paths.MLX_SERVER_WRAPPER),
          "--model", mt_model, "--host", "127.0.0.1", "--port", "1236",
          "--prompt-cache-size", "32", "--log-level", "WARNING"],
         run_dir / "mt-llm.pid",
@@ -510,7 +512,7 @@ def _start_settle_proxy(run_dir: Path, log_dir: Path) -> bool:
         return True
     print("[bok] settle queue proxy :1238 -> 9B :1237 (reply lane priority)")
     _start_proc(
-        [str(core.repo_python()), str(core.ROOT / "services" / "llm-mlx" / "queue_proxy.py")],
+        [str(paths.repo_python()), str(paths.ROOT / "services" / "llm-mlx" / "queue_proxy.py")],
         run_dir / "settle-proxy.pid",
         log_dir / "settle-proxy.log",
         env={"BOK_LLM_QUEUE_UPSTREAM": "http://127.0.0.1:1237",
@@ -544,7 +546,7 @@ def _start_settle_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> 
     if not settle_model or not Path(settle_model).exists():
         print(f"[bok] settle model not present, skip :1237 ({settle_model or 'unset'})", file=sys.stderr)
         return False
-    llm_py = core.sidecar_python("llm-mlx")
+    llm_py = paths.sidecar_python("llm-mlx")
     _apply_mlx_template_fix(llm_py)
     # log-level INFO(2026-10-01 第十二波,call-231aa92a 取证需求):9B 已是 a_reply
     # 主脑,槽位占用归因(排队的 35s TTFT 类事故)要读 mlx 请求/prompt-cache 命中行
@@ -571,7 +573,7 @@ def _start_settle_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> 
                    else "default")
     print(f"[bok] settle prompt-cache {_cache_bytes} (tier={_cache_tier})")
     _start_proc(
-        [str(llm_py), str(core.MLX_SERVER_WRAPPER),
+        [str(llm_py), str(paths.MLX_SERVER_WRAPPER),
          "--model", settle_model, "--host", "127.0.0.1", "--port", "1237",
          "--prompt-cache-size", "128", "--prompt-cache-bytes", _cache_bytes,
          "--chat-template-args", '{"enable_thinking":false}', "--log-level", _log_level],
@@ -608,7 +610,7 @@ def _start_laya(current: dict[str, str], run_dir: Path, log_dir: Path) -> bool:
         return False
     if core.healthy(8791):
         return True
-    laya_py = core.sidecar_python("laya-sidecar")
+    laya_py = paths.sidecar_python("laya-sidecar")
     laya_model = models.laya_model_path(current)
     if not laya_py.exists() or not laya_model:
         print(f"[bok] laya model/sidecar not present, skip :8791 ({laya_model or 'unset'})", file=sys.stderr)
@@ -631,13 +633,13 @@ def _start_call_plane(py) -> bool:
     serve 与 cmd_up 同源（幂等：health 门保证重复调用不叠进程）。
     返回 LiveKit 是否就绪；未就绪不拉 worker，由调用方就绪等待如实失败。
     """
-    run_dir = core.app_data_dir() / "run"
-    log_dir = core.app_data_dir() / "logs"
-    livekit_cfg = core._livekit_config_path()
+    run_dir = paths.app_data_dir() / "run"
+    log_dir = paths.app_data_dir() / "logs"
+    livekit_cfg = paths._livekit_config_path()
     livekit_bin = (
-        core._embedded_livekit()
+        paths._embedded_livekit()
         or core.shutil_which("livekit-server")
-        or (core.ROOT / "services" / "livekit-server" / "livekit-server")
+        or (paths.ROOT / "services" / "livekit-server" / "livekit-server")
     )
     if not core.healthy(7880) and livekit_bin and Path(livekit_bin).exists():
         _start_proc(
@@ -697,22 +699,22 @@ def cmd_up(models_only: bool = False) -> int:
     if models_only:
         print("[bok] models-only: 模型面就绪——通话面（livekit/worker/monitor）跳过")
         return 0
-    _start_call_plane(core.repo_python())
+    _start_call_plane(paths.repo_python())
     return 0
 
 
 def _cmd_up_services(models_only: bool = False) -> int:
-    run_dir = core.app_data_dir() / "run"
-    log_dir = core.app_data_dir() / "logs"
+    run_dir = paths.app_data_dir() / "run"
+    log_dir = paths.app_data_dir() / "logs"
     run_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
     print("[bok] ensuring models…")
     models.cmd_download()
     print("[bok] starting services…")
 
-    current = models.MODELS["mac"] if core.is_mac() else models.MODELS["windows"]
-    asr_py = core.sidecar_python("qwen3-asr-sidecar")
-    tts_py = core.sidecar_python("qwen3-tts-sidecar")
+    current = models.MODELS["mac"] if paths.is_mac() else models.MODELS["windows"]
+    asr_py = paths.sidecar_python("qwen3-asr-sidecar")
+    tts_py = paths.sidecar_python("qwen3-tts-sidecar")
     if not asr_py.exists() or not tts_py.exists():
         print(
             "[bok] sidecar pythons missing — run setup"
@@ -724,11 +726,11 @@ def _cmd_up_services(models_only: bool = False) -> int:
     asr_model = models.model_path(current, "asr")
     tts_preset = models.model_path(current, "tts_preset")
     tts_clone = models.model_path(current, "tts_clone")
-    asr_backend = "mlx" if core.is_mac() else "transformers"
-    tts_backend = "mlx" if core.is_mac() else "transformers"
+    asr_backend = "mlx" if paths.is_mac() else "transformers"
+    tts_backend = "mlx" if paths.is_mac() else "transformers"
 
     asr_env = {"QWEN3_ASR_MODEL": asr_model, "QWEN3_ASR_BACKEND": asr_backend}
-    if not core.is_mac():
+    if not paths.is_mac():
         # Windows/transformers 后端才需要 device 指定;mac mlx 分支不读该 env(MLX 默认走 Metal)。
         asr_env["QWEN3_ASR_DEVICE"] = "cuda" if core._cuda() else "cpu"
     # ASR 并发竞态让位(2026-10-01 双通实弹):重活在别人在飞时降档——sidecar
@@ -775,10 +777,10 @@ def _cmd_up_services(models_only: bool = False) -> int:
                 "QWEN3_TTS_PRESET_MODEL": tts_preset, "QWEN3_TTS_CLONE_MODEL": tts_clone,
                 "QWEN3_TTS_BACKEND": tts_backend,
                 # 语音克隆注册数据（voice_registry + 参考音频）落 app-data，bundle 只读/可升级。
-                "QWEN3_TTS_DATA_DIR": str(core.app_data_dir() / "tts-data"),
+                "QWEN3_TTS_DATA_DIR": str(paths.app_data_dir() / "tts-data"),
                 # 打包模式跳过 warmup：首启偶发卡死在参考音频读取/冷编译，
                 # 跳过只损失首包 1-2s，换取启动不被阻塞（开发模式保留 warmup）。
-                "QWEN3_TTS_WARMUP": "0" if core.is_packaged() else os.environ.get("QWEN3_TTS_WARMUP", "1")}),
+                "QWEN3_TTS_WARMUP": "0" if paths.is_packaged() else os.environ.get("QWEN3_TTS_WARMUP", "1")}),
         )
     elif not tts_needed:
         print(f"[bok] tts sidecar :8788 skipped (cloud-only: {tts_why}; BOK_LOCAL_TTS=1 强制拉起)")
@@ -790,8 +792,8 @@ def _cmd_up_services(models_only: bool = False) -> int:
     # mt/settle 的「模型在盘才起」姿势;venv/模型/端口三缺一即跳过,agent 装配
     # 面降级闩自动关语义车道。W1b 只做 mac-mlx 形态,windows 表无 embedding 键。
     want_embed = False
-    if core.is_mac() and current.get("embedding"):
-        embed_py = core.sidecar_python("bge-embed-sidecar")
+    if paths.is_mac() and current.get("embedding"):
+        embed_py = paths.sidecar_python("bge-embed-sidecar")
         embed_model = models.model_path(current, "embedding")
         if embed_py.exists() and models._usable_model_dir(Path(embed_model)):
             if not core.healthy(8789):
@@ -803,7 +805,7 @@ def _cmd_up_services(models_only: bool = False) -> int:
                         "BGE_EMBED_MODEL": embed_model,
                         # 打包模式跳过暖机(TTS 同款):启动不被阻塞,代价=首个
                         # 请求 1-2s 冷加载;dev 保留暖机让 /health 就绪=真就绪。
-                        "BGE_EMBED_WARMUP": "0" if core.is_packaged() else os.environ.get("BGE_EMBED_WARMUP", "1"),
+                        "BGE_EMBED_WARMUP": "0" if paths.is_packaged() else os.environ.get("BGE_EMBED_WARMUP", "1"),
                     },
                 )
             want_embed = True
@@ -842,12 +844,12 @@ def _cmd_up_services(models_only: bool = False) -> int:
     if tts_needed and not core.healthy(8788):
         print("[bok] tts not healthy — restarting once (alone)", flush=True)
         _stop_pidfile(run_dir / "tts.pid")
-        tts_py = core.sidecar_python("qwen3-tts-sidecar")
+        tts_py = paths.sidecar_python("qwen3-tts-sidecar")
         tts_preset = models.model_path(
-            models.MODELS["mac"] if core.is_mac() else models.MODELS["windows"], "tts_preset")
+            models.MODELS["mac"] if paths.is_mac() else models.MODELS["windows"], "tts_preset")
         tts_clone = models.model_path(
-            models.MODELS["mac"] if core.is_mac() else models.MODELS["windows"], "tts_clone")
-        tts_backend = "mlx" if core.is_mac() else "transformers"
+            models.MODELS["mac"] if paths.is_mac() else models.MODELS["windows"], "tts_clone")
+        tts_backend = "mlx" if paths.is_mac() else "transformers"
         _start_proc(
             [str(tts_py), "-m", "uvicorn", "app:app", "--app-dir", "services/qwen3-tts-sidecar",
              "--host", "127.0.0.1", "--port", "8788"],
@@ -855,8 +857,8 @@ def _cmd_up_services(models_only: bool = False) -> int:
             env=_qwen3_tts_sidecar_env({
                 "QWEN3_TTS_PRESET_MODEL": tts_preset, "QWEN3_TTS_CLONE_MODEL": tts_clone,
                 "QWEN3_TTS_BACKEND": tts_backend,
-                "QWEN3_TTS_DATA_DIR": str(core.app_data_dir() / "tts-data"),
-                "QWEN3_TTS_WARMUP": "0" if core.is_packaged() else os.environ.get("QWEN3_TTS_WARMUP", "1")}),
+                "QWEN3_TTS_DATA_DIR": str(paths.app_data_dir() / "tts-data"),
+                "QWEN3_TTS_WARMUP": "0" if paths.is_packaged() else os.environ.get("QWEN3_TTS_WARMUP", "1")}),
         )
         for _ in range(120):
             if core.healthy(8788):
@@ -888,7 +890,7 @@ def _cmd_up_services(models_only: bool = False) -> int:
 
 
 def _repo_web_modules() -> Path:
-    return core.ROOT / "apps" / "web" / "node_modules"
+    return paths.ROOT / "apps" / "web" / "node_modules"
 
 
 def _realtime_demo_enabled() -> bool:
@@ -905,8 +907,8 @@ def _worker_specs(py) -> list[dict]:
     """agent worker spawn 描述(serve/monitor 同源)：A 线 main + B 线 fwd/rev
     + 演示档 realtime-demo（BOK_QWEN_REALTIME=1 才在列）。"""
     agent_env = core._agent_worker_env(py)
-    run_dir = core.app_data_dir() / "run"
-    log_dir = core.app_data_dir() / "logs"
+    run_dir = paths.app_data_dir() / "run"
+    log_dir = paths.app_data_dir() / "logs"
     specs = [
         {
             "name": "agent",
@@ -962,8 +964,8 @@ def cmd_serve() -> int:
     to SQLite and the knowledge vault lives in app-data (never the read-only
     bundle).
     """
-    run_dir = core.app_data_dir() / "run"
-    log_dir = core.app_data_dir() / "logs"
+    run_dir = paths.app_data_dir() / "run"
+    log_dir = paths.app_data_dir() / "logs"
     run_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -977,12 +979,12 @@ def cmd_serve() -> int:
     for port, cmd, pid in stale:
         print(f"[serve] swept stale listener :{port} (pid {pid}, {cmd})")
 
-    py = core.repo_python()
+    py = paths.repo_python()
     # Dev 模式用系统 node 起 Next dev（打包模式 BOK_PACKAGED=1 跳过 web:3000）。
-    node = core.bundled_node() or "node"
+    node = paths.bundled_node() or "node"
     # control-plane
     # Dev 与打包统一：业务数据 SQLite 落盘、知识 vault 在 app-data（bundle 只读）。
-    db = (core.app_data_dir() / "bok_voice.db").as_posix()
+    db = (paths.app_data_dir() / "bok_voice.db").as_posix()
     cp_env: dict[str, str] = core._control_plane_env(db)
     if not core.healthy(8000):
         _start_proc(
@@ -994,7 +996,7 @@ def cmd_serve() -> int:
     # Dev mode: Next dev server on :3000 (packaged serves static UI from Tauri).
     # next.config.mjs 是 output:"export"，`next start` 无法服务 export 产物，
     # 必须用 `next dev`（export 只在 build 阶段生效）。
-    if not core.is_packaged() and not core.healthy(3000):
+    if not paths.is_packaged() and not core.healthy(3000):
         _start_proc(
             [
                 str(node),
@@ -1008,7 +1010,7 @@ def cmd_serve() -> int:
             run_dir / "web.pid",
             log_dir / "web.log",
             env={"NEXT_PUBLIC_CONTROL_PLANE_URL": os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")},
-            cwd=str(core.ROOT / "apps" / "web"),
+            cwd=str(paths.ROOT / "apps" / "web"),
         )
 
     # 通话面（LiveKit + agent worker + 常驻监控）由 cmd_up→_start_call_plane 单点
@@ -1030,7 +1032,7 @@ def cmd_serve() -> int:
     if core.healthy(1236):
         # MT 翻译小模型(:1236)可选:cmd_up 拉起了才纳入等待,缺模型不算失败。
         targets.append(1236)
-    if not core.is_packaged():
+    if not paths.is_packaged():
         targets.append(3000)
     # 就绪判据（2026-10-02 readiness 真话）：1235（/v1/models）/8787/8788
     # （/health）必须 HTTP 200——mlx 先绑端口后装权重、sidecar 模型装载中
@@ -1042,7 +1044,7 @@ def cmd_serve() -> int:
             ready += " mt=1236"
         print(ready)
         # 非打包模式自动打开浏览器页面(可用 BOK_NO_OPEN_BROWSER=1 关闭)。
-        if not core.is_packaged() and os.environ.get("BOK_NO_OPEN_BROWSER", "0") != "1":
+        if not paths.is_packaged() and os.environ.get("BOK_NO_OPEN_BROWSER", "0") != "1":
             try:
                 import webbrowser
                 webbrowser.open("http://127.0.0.1:3000")
