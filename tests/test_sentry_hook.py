@@ -43,6 +43,7 @@ def test_no_dsn_is_full_noop(monkeypatch):
 def test_init_shape_traces_no_pii_component_tag(monkeypatch):
     monkeypatch.setenv("SENTRY_DSN", "https://k@example.invalid/1")
     monkeypatch.setenv("SENTRY_ENVIRONMENT", "pilot-hk")
+    monkeypatch.delenv("SENTRY_SEND_PII", raising=False)  # 缺省=保守档
     import sentry_sdk
 
     inits: list[dict] = []
@@ -67,7 +68,7 @@ def test_init_shape_traces_no_pii_component_tag(monkeypatch):
     assert sentry_hook.init_sentry("control-plane") is True
     assert inits and inits[0]["dsn"] == "https://k@example.invalid/1"
     assert inits[0]["traces_sample_rate"] == 0.2
-    assert inits[0]["send_default_pii"] is False
+    assert inits[0]["send_default_pii"] is False  # 缺省保守档
     assert inits[0]["environment"] == "pilot-hk"
     assert ("global", "component", "control-plane") in tags
 
@@ -75,6 +76,19 @@ def test_init_shape_traces_no_pii_component_tag(monkeypatch):
     sentry_hook.capture(exc, lane="judge-bg", step="3")
     assert captured == [exc]
     assert ("lane", "judge-bg") in tags and ("step", "3") in tags
+
+
+def test_pii_env_switch_flips_send_default_pii(monkeypatch):
+    """SENTRY_SEND_PII=1 → send_default_pii True(Ethan 2026-10-04 dev 档拍板开)。"""
+    monkeypatch.setenv("SENTRY_DSN", "https://k@example.invalid/1")
+    monkeypatch.setenv("SENTRY_SEND_PII", "1")
+    import sentry_sdk
+
+    inits: list[dict] = []
+    monkeypatch.setattr(sentry_sdk, "init", lambda **kw: inits.append(kw))
+    monkeypatch.setattr(sentry_sdk, "set_tag", lambda k, v: None)
+    assert sentry_hook.init_sentry("control-plane") is True
+    assert inits[0]["send_default_pii"] is True
 
 
 # ---- ③ 初始化失败 = 告警不炸 ----
@@ -115,10 +129,12 @@ def test_sentry_env_keys_flow_to_both_faces():
         sys.path.remove(str(ROOT / "tools"))
     assert "SENTRY_DSN" in bok._FORWARD_ENV
     assert "SENTRY_ENVIRONMENT" in bok._FORWARD_ENV
+    assert "SENTRY_SEND_PII" in bok._FORWARD_ENV
     bok_src = (ROOT / "tools" / "bok.py").read_text(encoding="utf-8")
     cp_loop = bok_src[bok_src.index("for _k in (\"BOK_LOG_LEVEL\""):]
     cp_loop = cp_loop[: cp_loop.index(")") + 1]
-    assert "SENTRY_DSN" in cp_loop and "SENTRY_ENVIRONMENT" in cp_loop
+    for _k in ("SENTRY_DSN", "SENTRY_ENVIRONMENT", "SENTRY_SEND_PII"):
+        assert _k in cp_loop
 
 
 def test_worker_and_cp_wire_sentry_init():
