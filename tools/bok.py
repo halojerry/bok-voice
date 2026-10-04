@@ -1600,7 +1600,7 @@ def _control_plane_env(db: Path | str) -> dict[str, str]:
         env["BOK_ROOT_PASSWORD"] = os.environ["BOK_ROOT_PASSWORD"]
     for _k in ("BOK_LOG_LEVEL", "BOK_CORS_ORIGINS", "BOK_ROOT_USERNAME",
                "BOK_SIP_MODE", "BOK_CP_PUBLIC_URL", "SENTRY_DSN",
-               "SENTRY_ENVIRONMENT"):
+               "SENTRY_ENVIRONMENT", "SENTRY_SEND_PII"):
         _v = os.environ.get(_k, "").strip()
         if _v:
             env[_k] = _v
@@ -2444,8 +2444,10 @@ _FORWARD_ENV = (
     # Sentry 接线（R3 2026-10-04）：worker 面 init_sentry("agent-worker") +
     # 看门狗真火/背景 judge 失败关键路径上报；DSN 缺席=完整 no-op。
     # CP 面同键另走 _control_plane_env（main.py init_sentry）。
+    # SENTRY_SEND_PII（2026-10-04 Ethan 拍板 dev 档开）:1=请求头/IP 进事件。
     "SENTRY_DSN",
     "SENTRY_ENVIRONMENT",
+    "SENTRY_SEND_PII",
     "BOK_FILLER_GAP_MS",
     "BOK_FILLER_CHAIN",
     "BOK_FILLER_MAX",

@@ -6,8 +6,9 @@
     不进源码(gitleaks 全历史 CI 在守)。
   - SDK 缺席/DSN 空=完整 no-op(离线企业部署 pip 不可达也绝不炸启动);
     `capture()` 任何异常自吞——观测件把业务链路打挂=负资产。
-  - traces_sample_rate=0.2(定案);`send_default_pii` 恒 False(CP 请求面
-    带联系方式/转写,默认就不送 PII,显式钉死防 SDK 升级改缺省)。
+  - traces_sample_rate=0.2(定案);`send_default_pii` 由 env `SENTRY_SEND_PII`
+    控制(缺省 0=保守;Ethan 2026-10-04 拍板 dev 档开——Sentry 官方推荐开,
+    开了请求头/IP 进事件;CP 请求面带联系方式,prod 档自行权衡)。
   - 组件标签 component=control-plane|agent-worker:一个 DSN 下分面聚合。
 """
 from __future__ import annotations
@@ -41,7 +42,7 @@ def init_sentry(component: str) -> bool:
             dsn=dsn,
             environment=(os.environ.get("SENTRY_ENVIRONMENT") or "").strip() or None,
             traces_sample_rate=TRACES_SAMPLE_RATE,
-            send_default_pii=False,
+            send_default_pii=os.environ.get("SENTRY_SEND_PII", "").strip() in ("1", "true", "yes"),
         )
         sentry_sdk.set_tag("component", component)
         _initialized = True
