@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import array
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -68,6 +69,42 @@ DEFAULT_ASR_URL = "http://127.0.0.1:8787"
 AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".aac"}
 ASR_VERIFIED = False       # 交付验收未实弹跑 ASR；真栈实跑后人工翻正
 ASR_NOTE = "工具交付验收未实弹（仅离线纯函数单测）；此位标记 ASR 链路是否被真栈实跑过"
+
+# ── 出站 URL 护栏（Mimosa SSRF 收编，2026-10-04）────────────────────────────
+# ASR sidecar 基址来自 --asr-url（默认环回）。请求前逐条过 _url_ok：scheme ∈
+# {http,https}、URL 禁 userinfo 内嵌凭据；host 白名单=环回 ∪ BOK_PROBE_EXTRA_HOSTS
+# （LAN ASR 机与 urlguard_gate 同一显式 opt-in 口，绝不静默把 PCM 外送）。
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_EXTRA_HOSTS = frozenset(
+    h.strip().lower()
+    for h in os.environ.get("BOK_PROBE_EXTRA_HOSTS", "").split(",")
+    if h.strip()
+)
+
+
+def _url_ok(url: str) -> bool:
+    """出站 URL 是否允许（纯函数，离线可测）。"""
+    parts = urllib.parse.urlsplit(str(url or ""))
+    host = (parts.hostname or "").lower()
+    return (
+        parts.scheme in ("http", "https")
+        and (host in _LOOPBACK_HOSTS or host in _EXTRA_HOSTS)
+        and not parts.username
+        and not parts.password
+    )
+
+
+def _out_path(root: Path, name: str) -> Path:
+    """输出路径护栏（数据驱动路径单点）：resolve 后必须落在 --out 根内。
+
+    name 恒为本工具自建的常量（train_raw.jsonl），但产物目录与 manifest 可被
+    外部改动——越出根（含 ../ 穿越、符号链接逃逸）一律拒写，绝不静默写外部路径。
+    """
+    root_r = root.resolve()
+    target = (root_r / name).resolve()
+    if target != root_r and root_r not in target.parents:
+        raise SystemExit(f"错误：输出路径越出 --out 根目录：{target}")
+    return target
 
 # ── 纯函数面（离线可测；不碰 IO/子进程）────────────────────────────────────
 
@@ -381,6 +418,9 @@ def extract_segment(src: Path, dst: Path, start: float, dur: float) -> None:
 
 
 def _http_json(req: urllib.request.Request, timeout: float) -> dict[str, Any]:
+    target = req.full_url if isinstance(req, urllib.request.Request) else str(req)
+    if not _url_ok(target):
+        raise PermissionError(f"ASR sidecar URL 未过护栏（拒发）: {target}")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
@@ -579,8 +619,8 @@ def step_assemble(out_dir: Path, manifest: dict[str, Any], asr_dir: Path, args: 
             )
             if tpath.exists():
                 rows.append({"audio": f"segments/{seg['name']}", "text": text, "ref_audio": "ref.wav"})
-    jsonl_path = out_dir / "train_raw.jsonl"
-    with open(jsonl_path, "w", encoding="utf-8") as f:
+    jsonl_path = _out_path(out_dir, "train_raw.jsonl")
+    with jsonl_path.open("w", encoding="utf-8") as f:
         for row in rows:
             f.write(jsonl_line(row) + "\n")
     stats = duration_stats(durs)
@@ -644,11 +684,11 @@ def step_pick_ref(out_dir: Path, report: dict[str, Any], args: argparse.Namespac
     src = out_dir / "segments" / str(picked["name"])
     dst = out_dir / "ref.wav"
     shutil.copyfile(src, dst)
-    jsonl_path = out_dir / "train_raw.jsonl"
+    jsonl_path = _out_path(out_dir, "train_raw.jsonl")
     if jsonl_path.exists():
         rows = parse_jsonl(jsonl_path.read_text(encoding="utf-8"))
         rows = apply_ref(rows, dst.name)
-        with open(jsonl_path, "w", encoding="utf-8") as f:
+        with jsonl_path.open("w", encoding="utf-8") as f:
             for row in rows:
                 f.write(jsonl_line(row) + "\n")
     if widened:

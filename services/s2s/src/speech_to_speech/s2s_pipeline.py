@@ -179,6 +179,7 @@ def parse_arguments(
     argv: Sequence[str] | None = None,
     *,
     command: Literal["serve", "local"] = "serve",
+    pipeline_json: dict[str, Any] | None = None,
 ) -> ParsedArguments:
     module_defaults = ModuleArguments()
     assert module_defaults.stt is not None
@@ -186,11 +187,7 @@ def parse_arguments(
     assert module_defaults.tts is not None
 
     pipeline_args = list(sys.argv[1:] if argv is None else argv)
-    _is_json = len(pipeline_args) == 1 and pipeline_args[0].endswith(".json")
-    pipeline_json: dict[str, Any] | None = None
-    if _is_json:
-        with open(pipeline_args[0]) as _f:
-            pipeline_json = json.load(_f)
+    if pipeline_json is None:
         _mac_preset_enabled = bool(pipeline_json.get("mac_optimal_settings", False))
         _llm_name = pipeline_json.get("llm_backend") or (
             "mlx-lm" if _mac_preset_enabled else module_defaults.llm_backend
@@ -249,8 +246,7 @@ def parse_arguments(
     if _mac_preset_enabled:
         parser.set_defaults(**_mac_preset_defaults(_llm_name))
 
-    if _is_json:
-        assert pipeline_json is not None
+    if pipeline_json is not None:
         parsed = parser.parse_dict(pipeline_json, allow_extra_keys=True)
     else:
         parsed = _parse_selected_cli_configs(parser, pipeline_args, selected_specs)
@@ -713,10 +709,17 @@ def build_local_pipeline(args: ParsedArguments, stop_event: Event) -> ThreadMana
     return ThreadManager([*server_manager.handlers, client])
 
 
-def run_pipeline_command(command: Literal["serve", "local"], argv: Sequence[str]) -> None:
-    """Run the server alone or compose it with the loopback audio client."""
+def run_pipeline_command(
+    command: Literal["serve", "local"],
+    argv: Sequence[str],
+    pipeline_json: dict[str, Any] | None = None,
+) -> None:
+    """Run the server alone or compose it with the loopback audio client.
 
-    args = parse_arguments(argv, command=command)
+    ``pipeline_json``：调用方已解析过的 JSON 配置（cli.py 的就地闸门加载）——
+    提供时跳过本函数自己的文件读取（双入口向后兼容）。"""
+
+    args = parse_arguments(argv, command=command, pipeline_json=pipeline_json)
 
     setup_logger(args.module_kwargs.log_level)
     # Set the transcript gate and warn before any conversation is processed, so an operator

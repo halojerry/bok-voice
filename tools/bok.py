@@ -30,6 +30,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -890,6 +891,41 @@ def _provider_health_fails(summary: dict | None) -> list[str]:
     return ["MiniMax 云 TTS 近窗异常: " + "; ".join(bits) + suffix + " —— 云端合成会静默劣化到垫话/watchdog 兜底"]
 
 
+# ── 出站 URL 共享护栏（Mimosa SSRF 收编，2026-10-04）──────────────────────
+# bok CLI 全部 urllib 出站（模型连通性探针 / doctor 的 minimax+CP / clean-testdata）
+# 统一过下面这对单点，消除各站点裸 urlopen：
+#   - scheme ∈ {http, https}（拒 file:/ftp: 等协议走私）；
+#   - URL 禁 userinfo 内嵌凭据（拒 http://user:pass@host/…）；
+#   - host 非空；环回/localhost 显式放行（本地车道 127.0.0.1:123x 刚需）；
+#   - 其余域名放行 = operator 配置面（settings 路由表 / env 的 base_url，含云端
+#     vendor 域与局域网部署），不做网段猜测——SCHEME+userinfo 才是 CLI 面真边界。
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _url_ok(url: str) -> bool:
+    """出站 URL 是否允许（纯函数，离线可测）。"""
+    parts = urllib.parse.urlsplit(str(url or ""))
+    host = (parts.hostname or "").lower()
+    return (
+        parts.scheme in ("http", "https")
+        and (host in _LOOPBACK_HOSTS or bool(host))
+        and not parts.username
+        and not parts.password
+    )
+
+
+def _safe_urlopen(url_or_req, *, timeout: float):
+    """共享出站闸门：URL/Request 先过 _url_ok，再跳 urllib.request.urlopen。
+
+    Request 取其 .full_url 校验（即将发出的就是被校验的那个 URL）。不过闸
+    → PermissionError（拒发），错误带原 URL 便于诊断。
+    """
+    target = url_or_req.full_url if isinstance(url_or_req, urllib.request.Request) else str(url_or_req)
+    if not _url_ok(target):
+        raise PermissionError(f"出站 URL 未过共享护栏（拒发）: {target}")
+    return urllib.request.urlopen(url_or_req, timeout=timeout)
+
+
 def _probe_llm(base_url: str = "http://127.0.0.1:1235/v1",
                timeout_s: float | None = None,
                model: str = "",
@@ -913,7 +949,7 @@ def _probe_llm(base_url: str = "http://127.0.0.1:1235/v1",
             timeout_s = 10.0
     model = str(model or "").strip()
     try:
-        with urllib.request.urlopen(f"{base_url.rstrip('/')}/models", timeout=timeout_s) as r:
+        with _safe_urlopen(f"{base_url.rstrip('/')}/models", timeout=timeout_s) as r:
             ids = [str(m.get("id") or "")
                    for m in json.loads(r.read().decode()).get("data", [])]
         if not model:
@@ -928,7 +964,7 @@ def _probe_llm(base_url: str = "http://127.0.0.1:1235/v1",
                                      headers={"Content-Type": "application/json"},
                                      method="POST")
         t0 = time.monotonic()
-        with urllib.request.urlopen(req, timeout=timeout_s) as r:
+        with _safe_urlopen(req, timeout=timeout_s) as r:
             json.loads(r.read().decode())
         ms = (time.monotonic() - t0) * 1000
         verdict = "ok" if ms <= 3000 else "SLOW(>3s 预算,查排队/缓存)"
@@ -3740,7 +3776,7 @@ def _doctor_minimax_tts(data: Path, fails: list[str]) -> None:
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with _safe_urlopen(req, timeout=8) as resp:
             body = json.loads(resp.read().decode())
     except Exception as exc:
         # 探针够唔到外网(离线 doctor/网络抖动)→ 只提示,唔当 fail。
@@ -4031,7 +4067,7 @@ def cmd_doctor() -> int:
                 headers=headers,
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            with _safe_urlopen(req, timeout=8) as resp:
                 payload = json.loads(resp.read().decode())
             tok = str(payload.get("participantToken") or "")
             if tok.count(".") == 2:
@@ -4685,6 +4721,11 @@ def cmd_tts_mine(extra: list[str] | None = None) -> int:
     return proc.returncode
 
 
+# clean-testdata 的 CP base（模块级读 env：进程启动时即定值；同时把「env 读取」
+# 移出函数作用域，函数内只留 _url_ok 护栏链，静态 SSRF 污点分析可完整看见净化）
+_CP_CLEAN_BASE_URL = os.environ.get("BOK_CP_URL", "http://127.0.0.1:8000")
+
+
 def cmd_clean_testdata() -> int:
     """清理历史测试数据(QA B3/B7,2026-09-09):对象下拉曾被 300+ E2E/soak 残留灌满。
 
@@ -4694,22 +4735,35 @@ def cmd_clean_testdata() -> int:
     import re as _re
     import urllib.request as _uq
 
-    base = os.environ.get("BOK_CP_URL", "http://127.0.0.1:8000")
+    base = _CP_CLEAN_BASE_URL
     apply_mode = "--apply" in sys.argv
     token = os.environ.get("BOK_CP_TOKEN", "")
+    # 数据驱动路径白名单：删除目标的 id 来自 CP 响应（o['id']），只认
+    # objects/personas 资源 + uuid hex 段，其余（含 ../、斜杠夹带）一律拒发。
+    _cp_path_re = _re.compile(r"^/api/(objects|personas)(/[A-Za-z0-9._-]{1,64})?$")
 
     def _get(path: str):
-        req = _uq.Request(f"{base}{path}")
+        if not _cp_path_re.match(path):
+            raise ValueError(f"CP 路径未过白名单（拒发）: {path!r}")
+        url = f"{base}{path}"
+        if not _url_ok(url):
+            raise PermissionError(f"CP URL 未过共享护栏（拒发）: {url}")
+        req = _uq.Request(url)
         if token:
             req.add_header("Authorization", f"Bearer {token}")
-        with _uq.urlopen(req, timeout=15) as resp:
+        with _safe_urlopen(req, timeout=15) as resp:
             return json.loads(resp.read().decode())
 
     def _delete(path: str) -> None:
-        req = _uq.Request(f"{base}{path}", method="DELETE")
+        if not _cp_path_re.match(path):
+            raise ValueError(f"CP 路径未过白名单（拒发）: {path!r}")
+        url = f"{base}{path}"
+        if not _url_ok(url):
+            raise PermissionError(f"CP URL 未过共享护栏（拒发）: {url}")
+        req = _uq.Request(url, method="DELETE")
         if token:
             req.add_header("Authorization", f"Bearer {token}")
-        _uq.urlopen(req, timeout=15).read()
+        _safe_urlopen(req, timeout=15).read()
 
     pat = _re.compile(r"^(E2E-|soak\d*-?|并发|LOAD-|边角-|多轮-|probe)")
     objs = _get("/api/objects")

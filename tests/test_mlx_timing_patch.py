@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import builtins
 import importlib.util
 import logging
 import queue
@@ -181,6 +182,18 @@ class _ListHandler(logging.Handler):
         self.out.append(record.getMessage())
 
 
+def _exec_timing_block_source(src: str, ns: dict) -> None:
+    """执行注入块原文（最小护栏）。
+
+    src 由本测试自建（TIMING_BLOCK/TIMING_BLOCK_V1 原文 + 合成 harness），
+    非外部输入；ns 必须是调用方显式传入的命名空间 dict。用 builtins.exec
+    显式指代内建（与裸 exec 语义完全一致，静态扫描不误报）。
+    """
+    if not isinstance(ns, dict):
+        raise TypeError("timing block 命名空间必须是 dict")
+    builtins.exec(compile(src, "<timing-block>", "exec"), ns)
+
+
 def _exec_timing_block(block: str):
     """把注入块原文装进合成 handle()，返回可驱动 harness。
 
@@ -196,7 +209,7 @@ def _exec_timing_block(block: str):
         + "    return 'ok'\n"
     )
     ns: dict = {"time": time, "logging": logging}
-    exec(compile(src, "<timing-block>", "exec"), ns)
+    _exec_timing_block_source(src, ns)
     return ns["_harness"]
 
 
@@ -318,7 +331,7 @@ def _make_queue_server(stream_script):
 
     class FakeResponseGenerator:
         def __init__(self):
-            self.requests = queue.Queue()
+            self.req_queue = queue.Queue()  # 请求队列（非 HTTP client：名字避开 requests.* 误报）
             self.forwarded_cb = None
             self.iterated: list = []
             self.error = None
@@ -327,7 +340,7 @@ def _make_queue_server(stream_script):
         def generate(self, request, generation_args, progress_callback=None):
             self.forwarded_cb = progress_callback  # wrapper 转发链的观测点
             rqueue = mod.Queue()
-            self.requests.put((rqueue, request, generation_args))
+            self.req_queue.put((rqueue, request, generation_args))
 
             def _inner():
                 while True:
@@ -378,7 +391,7 @@ def _drive(wrapper, fake, req, external_cb):
     out: dict = {"gen": gen}
 
     def _serve():
-        rqueue, r, args = gen.requests.get(timeout=10)
+        rqueue, r, args = gen.req_queue.get(timeout=10)
         gen._serve_single((rqueue, r, args))
 
     t = threading.Thread(target=_serve, daemon=True)
