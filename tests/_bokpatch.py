@@ -10,7 +10,7 @@ from __future__ import annotations
 
 # 权威定义所在模块映射。W② 搬运时逐行改道,例如:
 #   "cmd_prod": "bokctl.prod",
-#   "_FORWARD_ENV": "bokctl.env",
+#   "_control_plane_env": "bokctl.env",
 PATCH_TARGETS: dict[str, str] = {
     # prod 域(W② 搬出)
     "cmd_prod": "bokctl.prod",
@@ -70,6 +70,13 @@ PATCH_TARGETS: dict[str, str] = {
     "_settle_llm_model": "bokctl.models",
     "_enable_hf_transfer": "bokctl.models",
     "cmd_download": "bokctl.models",
+    # env 域(W② 搬出,最后一批:worker/CP env 组装+_FORWARD_ENV 立法单点表;
+    # 行集=实际被 patch 的名件,未列名件(_FORWARD_ENV/_apply_* 等)测试面用
+    # bok.env.X 读)
+    "_agent_worker_env": "bokctl.env",
+    "_agent_prod_env": "bokctl.env",
+    "_interp_env": "bokctl.env",
+    "_control_plane_env": "bokctl.env",
 }
 
 _DEFAULT_TARGET = "bokctl.core"

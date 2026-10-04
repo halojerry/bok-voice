@@ -210,7 +210,7 @@ def test_forward_env_registers_qa_semantic_keys():
     import tools.bok as bok  # noqa: E402
 
     for key in ("BOK_QA_SEMANTIC", "BOK_QA_SEM_THRESHOLD", "BOK_QA_SEM_BASE_URL", "BOK_QA_SEM_TIMEOUT_MS"):
-        assert key in bok._FORWARD_ENV, key
+        assert key in bok.env._FORWARD_ENV, key
 
 
 def test_agent_wiring_semantic_sits_between_lexical_miss_and_bump():

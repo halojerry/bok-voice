@@ -60,7 +60,7 @@ def test_control_plane_env_carries_auth_trio(monkeypatch, tmp_path):
     monkeypatch.setenv("BOK_AUTH_REQUIRED", "1")
     monkeypatch.setenv("BOK_JWT_SECRET", "test-jwt-secret-dummy")
     monkeypatch.setenv("BOK_CP_TOKEN", "test-cp-token")
-    env = bok._control_plane_env(tmp_path / "bok_voice.db")
+    env = bok.env._control_plane_env(tmp_path / "bok_voice.db")
     assert env["BOK_AUTH_REQUIRED"] == "1"
     assert env["BOK_JWT_SECRET"] == "test-jwt-secret-dummy"
     assert env["BOK_CP_TOKEN"] == "test-cp-token"

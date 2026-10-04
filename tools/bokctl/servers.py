@@ -3,11 +3,14 @@
 _worker_specs 装配、本地 TTS 门控、sidecar env 透传、LLM launch 配置件、
 spawn 原语四件;G2 W② 从 core 搬出,搬运纪律=穿模块对象调用)。
 
-- 本模块只 `from bokctl import core`(及 health/proc/models 域)拿模块对象:凡
-  仍住在 core 的名字(healthy/_llm_queue_proxy_on/_control_plane_env/
-  _agent_worker_env/_interp_env/_desktop_stack_targets/_dev_9b_enabled 等一律
-  `core.X` 调用时取——patch 与后续域搬运在 core 侧保持可见(patch 缝=模块属性);
-  health/proc 域件穿 health.X/proc.X,models 域件(models.MODELS/model_path/
+- 本模块 `from bokctl import core/env`(及 health/proc/models/paths 域)拿模块
+  对象:凡仍住在 core 的名字(healthy/_desktop_stack_targets/_agent_worker_port/
+  _cp_bind_host 等)一律 `core.X` 调用时取——patch 与域搬运在属主模块侧保持
+  可见(patch 缝=模块属性);env 组装面(_FORWARD_ENV/_control_plane_env/
+  _agent_prod_env/_agent_worker_env/_interp_env/_apply_interp_direction_env/
+  _dev_9b_enabled/_llm_queue_proxy_on)W②-env 波(2026-10-04,最后一批)搬入
+  bokctl.env,本域穿 `env.X` 取(env 波新例:域间消费=改穿所属域,core 不做值
+  转发);health/proc 域件穿 health.X/proc.X,models 域件(models.MODELS/model_path/
   resolve_llm_repo/_mt_llm_model/_settle_llm_model/laya_model_path/
   _llm_draft_flags/cmd_download 等)穿 models.X 取;路径/平台锚(ROOT/
   app_data_dir/repo_python/sidecar_python/is_mac/is_packaged/bundled_node/
@@ -20,13 +23,13 @@ spawn 原语四件;G2 W② 从 core 搬出,搬运纪律=穿模块对象调用)�
   bytes/_physical_mem_gib/_mac_llm_server_argv/_warn_llm_not_http_ready/
   _repo_web_modules + spawn 原语 _start_proc/_spawn_kwargs/_rotate_log/
   _stop_pidfile)域内裸名互调(同模块全局=call-time 可 patch)。
-- 留守 core 的近邻(边界记录,2026-10-04):env 组装面(_FORWARD_ENV/
+- 留守 core 的近邻(边界记录,2026-10-04;env 波更新):env 组装面(_FORWARD_ENV/
   _control_plane_env/_agent_prod_env/_agent_worker_env/_interp_env/_apply_judge_env/
-  _apply_interp_direction_env/_bake_ssl_cert_file/_settle_gate_url/_dev_9b_enabled/
-  _repo_pythonpath)是 env 域(最后一批)——prod 域吃 _agent_prod_env/_interp_env/
-  _control_plane_env(跨面判留);_llm_queue_proxy_on 被留守的 _llm_raw_expected
-  (status/doctor 可选线语义,health 波判留)与 _settle_gate_url 消费,拓扑判据
-  随共享面留 core;_llm_draft_enabled/_llm_draft_flags/_llm_draft_model 属模型
+  _apply_interp_direction_env/_bake_ssl_cert_file/_settle_gate_url/_dev_9b_enabled)
+  与拓扑闸 _llm_queue_proxy_on **W②-env 波(最后一批)已搬入 bokctl.env**——
+  _llm_queue_proxy_on 属纯 env 旗标读(与 _dev_9b_enabled 同族),health 波
+  「随共享面留 core」的旧判解除;core 侧 _llm_raw_expected 与本域四个消费点
+  都改穿 env.X;_llm_draft_enabled/_llm_draft_flags/_llm_draft_model 属模型
   选型机制,**models 波(W②)已搬入 bokctl.models**——本域穿 `models.X` 取
   (servers 波新例);MLX_SERVER_WRAPPER 旧判例(「ROOT 派生常量因 import 序留
   core」)已随 paths 波解除——常量随 ROOT 住 bokctl.paths,消费者穿 paths. 取;
@@ -51,7 +54,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
-from bokctl import core, health, models, paths, proc
+from bokctl import core, env, health, models, paths, proc
 
 
 # spawn 原语四件(2026-10-04 servers 波随服务面搬出;消费者=本域 _start_* 家族
@@ -359,7 +362,7 @@ def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
     # 把「代理活着、mlx 死了」的半瘫当健康跳过（2026-09-26 新拓扑配套）。
     # readiness 真话（2026-10-02）：TCP 跳过前补探一次 /v1/models，不就绪大声
     # 告警（不改跳过语义，防双起）。
-    if core._llm_queue_proxy_on() and paths.is_mac():
+    if env._llm_queue_proxy_on() and paths.is_mac():
         if core.healthy(1235) and core.healthy(1239):
             _warn_llm_not_http_ready((1235, 1239))
             return
@@ -403,7 +406,7 @@ def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
         # draft 兼容已核实（2026-09-25 读码）：queue_proxy 透传原始 body 仅换
         # content-type/x-bok-lane 头、不剥任何字段;draft 是 server 启动旗标
         # （mlx 启动时装载 draft 模型）而非 body 参数——代理零改动。
-        _queue_on = core._llm_queue_proxy_on()
+        _queue_on = env._llm_queue_proxy_on()
         _mlx_port = "1239" if _queue_on else "1235"
         _start_proc(
             _mac_llm_server_argv(llm_py, llm_model, _mlx_port, current,
@@ -506,7 +509,7 @@ def _start_settle_proxy(run_dir: Path, log_dir: Path) -> bool:
     （_start_settle_llm 的 healthy 早退路径也要捞一把,防「9B 在跑但闸没起
     →serve 等 1238 假死」）。返回 True=闸在位（新起或已健康）。
     """
-    if not core._llm_queue_proxy_on():
+    if not env._llm_queue_proxy_on():
         return False
     if core.healthy(1238):
         return True
@@ -536,7 +539,7 @@ def _start_settle_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> 
     fallback),默认随栈(模型在盘);BOK_DEV_9B=0 显式关=旧形状(judge/settle
     回退 :1235)。
     """
-    if not core._dev_9b_enabled():
+    if not env._dev_9b_enabled():
         print("[bok] 9B lane off (BOK_DEV_9B=0) — skip :1237 (a_reply 车道/judge/settle 回退 :1235)", file=sys.stderr)
         return False
     if core.healthy(1237):
@@ -828,7 +831,7 @@ def _cmd_up_services(models_only: bool = False) -> int:
         core_ports
         + ((1236,) if want_mt else ())
         + ((1237,) if want_settle else ())
-        + ((1238,) if want_settle and core._llm_queue_proxy_on() else ())
+        + ((1238,) if want_settle and env._llm_queue_proxy_on() else ())
         + ((8789,) if want_embed else ())
         + ((8791,) if want_laya else ())
     )
@@ -906,7 +909,7 @@ def _realtime_demo_enabled() -> bool:
 def _worker_specs(py) -> list[dict]:
     """agent worker spawn 描述(serve/monitor 同源)：A 线 main + B 线 fwd/rev
     + 演示档 realtime-demo（BOK_QWEN_REALTIME=1 才在列）。"""
-    agent_env = core._agent_worker_env(py)
+    agent_env = env._agent_worker_env(py)
     run_dir = paths.app_data_dir() / "run"
     log_dir = paths.app_data_dir() / "logs"
     specs = [
@@ -923,10 +926,10 @@ def _worker_specs(py) -> list[dict]:
         }
     ]
     for _dir, _port in (("fwd", 8082), ("rev", 8083)):
-        interp_env = core._interp_env(agent_env)
+        interp_env = env._interp_env(agent_env)
         interp_env["BOK_SERVICE"] = f"interp-{_dir}"
         interp_env["INTERP_DIRECTION"] = _dir
-        core._apply_interp_direction_env(interp_env, _dir)
+        env._apply_interp_direction_env(interp_env, _dir)
         specs.append(
             {
                 "name": f"interp-{_dir}",
@@ -985,7 +988,7 @@ def cmd_serve() -> int:
     # control-plane
     # Dev 与打包统一：业务数据 SQLite 落盘、知识 vault 在 app-data（bundle 只读）。
     db = (paths.app_data_dir() / "bok_voice.db").as_posix()
-    cp_env: dict[str, str] = core._control_plane_env(db)
+    cp_env: dict[str, str] = env._control_plane_env(db)
     if not core.healthy(8000):
         _start_proc(
             [str(py), "-m", "uvicorn", "control_plane.main:app", "--host", core._cp_bind_host(), "--port", "8000"],

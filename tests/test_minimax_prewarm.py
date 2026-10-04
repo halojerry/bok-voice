@@ -347,4 +347,4 @@ def test_source_pins_signature_and_forward_env():
 
     import bok  # noqa: E402 - tools/ 已在 sys.path
 
-    assert "BOK_TTS_PREWARM" in bok._FORWARD_ENV, "新 env 开关必须进 _FORWARD_ENV"
+    assert "BOK_TTS_PREWARM" in bok.env._FORWARD_ENV, "新 env 开关必须进 _FORWARD_ENV"

@@ -6,7 +6,7 @@ agent 实读 87 键只有 5 键进表，69 键在 prod 全是死门（BOK_FLOW_G
 kill-switch、BOK_CP_TOKEN auth-on worker 上报，两次实弹同病）。
 
 立法契约：**agent_runtime 新读一个 env 键，必须三选一登记**：
-  ① 进 `bok._FORWARD_ENV`（运营可调键——kill-switch/调参/凭据）；
+  ① 进 `bok.env._FORWARD_ENV`（运营可调键——kill-switch/调参/凭据）；
   ② bok.py 既有注入面已提供（computed 键如 MLX_LLM_MODEL、sidecar asr_env、
      `_interp_env` B 线注入）——静态扫 bok.py 全部 env 写入点自动认；
   ③ 进本文件 `_EXEMPT` 且写明理由（测试腿专用/OS 变量带回退）。
@@ -46,7 +46,7 @@ _EXEMPT: dict[str, str] = {
     ),
     # S2S 试点 worker 腿（feat/s2s-spike）：:8085 realtime 垫片与 :8086 flow worker
     # 的配置键，均带代码内缺省、未上 bok 装配面——worker 转正进 prod 装配时
-    # 整族迁 bok._FORWARD_ENV（运营键正位），届时删本组豁免。
+    # 整族迁 bok.env._FORWARD_ENV（运营键正位），届时删本组豁免。
     "S2S_REALTIME_BASE_URL": "s2s 试点腿：垫片端点缺省 http://127.0.0.1:8796/v1",
     "S2S_REALTIME_WORKER_PORT": "s2s 试点腿：worker 口缺省 8085",
     "S2S_FLOW_MARKERS": "s2s 试点腿：话术标记注入闸（默认开）",
@@ -93,7 +93,7 @@ def _bok_provides() -> set[str]:
     `*_REV` 动态展开。
     """
     src = bok_source()
-    provided = set(bok._FORWARD_ENV)
+    provided = set(bok.env._FORWARD_ENV)
     provided |= set(re.findall(r'env\[?"([A-Z][A-Z0-9_]+)"?\]?\s*=', src))
     provided |= set(re.findall(r'setdefault\(\s*"([A-Z][A-Z0-9_]+)"', src))
     provided |= set(re.findall(r'"([A-Z][A-Z0-9_]+)":\s*os\.environ\.get', src))
@@ -106,28 +106,28 @@ def _bok_provides() -> set[str]:
             provided |= {base, base + "_REV"}
     # 计算注入键（如 MLX_LLM_MODEL=model_path(...)）：字面量正则够不着——直接内省
     # 真实 worker env 输出补齐（函数纯 dict 构造，跑一次零副作用）。
-    provided |= set(bok._agent_worker_env(bok.paths.repo_python()))
+    provided |= set(bok.env._agent_worker_env(bok.paths.repo_python()))
     return provided
 
 
 def test_every_agent_env_read_is_registered():
     """立法主判据：agent 实读键 ⊆ (_FORWARD_ENV ∪ bok 注入面 ∪ _EXEMPT)。
 
-    新键未登记 → 本测试红，消息列缺口键——把键加进 `bok._FORWARD_ENV`（运营键）
+    新键未登记 → 本测试红，消息列缺口键——把键加进 `bok.env._FORWARD_ENV`（运营键）
     或 `_EXEMPT`（带理由）即绿。
     """
     unregistered = _agent_env_reads() - _bok_provides() - set(_EXEMPT)
     assert not unregistered, (
         f"agent_runtime 读取了 {len(unregistered)} 个未登记 env 键（prod 全是死门）："
-        f"{sorted(unregistered)} —— 运营键进 bok._FORWARD_ENV，测试腿/OS 变量进本文件 "
+        f"{sorted(unregistered)} —— 运营键进 bok.env._FORWARD_ENV，测试腿/OS 变量进本文件 "
         f"_EXEMPT（带理由）"
     )
 
 
 def test_forward_env_alias_and_no_duplicates():
     """历史名 `_BOK_PASSTHROUGH_KEYS` 恒为表本体别名（调用面不散）；表内无重复。"""
-    assert bok._BOK_PASSTHROUGH_KEYS is bok._FORWARD_ENV
-    keys = list(bok._FORWARD_ENV)
+    assert bok.env._BOK_PASSTHROUGH_KEYS is bok.env._FORWARD_ENV
+    keys = list(bok.env._FORWARD_ENV)
     assert len(keys) == len(set(keys)), "表内有重复键"
 
 
@@ -135,25 +135,25 @@ def test_forward_env_keys_all_flow_to_dev_and_prod(monkeypatch):
     """表内每键真的流到两表（设值 → 在；这是立法的意义，唔止签名在表上）。"""
     sentinel_key = "BOK_LLM_FALLBACK"  # 立法前 prod 死门的代表键
     monkeypatch.setenv(sentinel_key, "0")
-    dev = bok._agent_worker_env(bok.paths.repo_python())
-    prod = bok._agent_prod_env()
+    dev = bok.env._agent_worker_env(bok.paths.repo_python())
+    prod = bok.env._agent_prod_env()
     assert dev.get(sentinel_key) == "0" and prod.get(sentinel_key) == "0"
     # 全表批量抽查：每个键设哨兵值后两表都必须带（防止表与 apply 函数脱钩）
-    for key in bok._FORWARD_ENV:
+    for key in bok.env._FORWARD_ENV:
         monkeypatch.setenv(key, f"sentinel-{key}")
-    dev2 = bok._agent_worker_env(bok.paths.repo_python())
-    prod2 = bok._agent_prod_env()
-    missing = [k for k in bok._FORWARD_ENV
+    dev2 = bok.env._agent_worker_env(bok.paths.repo_python())
+    prod2 = bok.env._agent_prod_env()
+    missing = [k for k in bok.env._FORWARD_ENV
                if dev2.get(k) != f"sentinel-{k}" or prod2.get(k) != f"sentinel-{k}"]
     assert not missing, f"表内键未流到 dev/prod worker env：{missing}"
 
 
 def test_forward_env_absent_injects_nothing(monkeypatch):
     """未设 → 不注入（默认档零变化；表只透传运营显式设定）。"""
-    for key in bok._FORWARD_ENV:
+    for key in bok.env._FORWARD_ENV:
         monkeypatch.delenv(key, raising=False)
-    assert not any(k in bok._agent_worker_env(bok.paths.repo_python()) for k in bok._FORWARD_ENV)
-    assert not any(k in bok._agent_prod_env() for k in bok._FORWARD_ENV)
+    assert not any(k in bok.env._agent_worker_env(bok.paths.repo_python()) for k in bok.env._FORWARD_ENV)
+    assert not any(k in bok.env._agent_prod_env() for k in bok.env._FORWARD_ENV)
 
 
 def test_exempt_entries_still_read_by_agent():

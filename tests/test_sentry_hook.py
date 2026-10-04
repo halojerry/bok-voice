@@ -128,9 +128,9 @@ def test_sentry_env_keys_flow_to_both_faces():
         import bok
     finally:
         sys.path.remove(str(ROOT / "tools"))
-    assert "SENTRY_DSN" in bok._FORWARD_ENV
-    assert "SENTRY_ENVIRONMENT" in bok._FORWARD_ENV
-    assert "SENTRY_SEND_PII" in bok._FORWARD_ENV
+    assert "SENTRY_DSN" in bok.env._FORWARD_ENV
+    assert "SENTRY_ENVIRONMENT" in bok.env._FORWARD_ENV
+    assert "SENTRY_SEND_PII" in bok.env._FORWARD_ENV
     bok_src = bok_source()
     cp_loop = bok_src[bok_src.index("for _k in (\"BOK_LOG_LEVEL\""):]
     cp_loop = cp_loop[: cp_loop.index(")") + 1]

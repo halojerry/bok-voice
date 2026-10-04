@@ -529,4 +529,4 @@ def test_forward_env_registers_reshot():
     """BOK_FILLER_RESHOT 已入 bok.py _FORWARD_ENV(prod 封闭 env 面可达)。"""
     import tools.bok as bok  # noqa: F401
 
-    assert "BOK_FILLER_RESHOT" in bok._FORWARD_ENV
+    assert "BOK_FILLER_RESHOT" in bok.env._FORWARD_ENV

@@ -280,13 +280,13 @@ def test_dev_9b_off_gates_judge_and_settle_env(monkeypatch, tmp_path):
     # 9B 关(2026-10-01 P2 翻档后须显式 =0)：judge env 不注入（agent.py 回退链落 MLX :1235）
     monkeypatch.setenv("BOK_DEV_9B", "0")
     env: dict[str, str] = {}
-    bok._apply_judge_env(env, {})
+    bok.env._apply_judge_env(env, {})
     assert "FLOW_JUDGE_LLM_BASE_URL" not in env
     assert "FLOW_JUDGE_LLM_MODEL" not in env
     # 9B 开：与改造前逐字节相同
     monkeypatch.setenv("BOK_DEV_9B", "1")
     env_on: dict[str, str] = {}
-    bok._apply_judge_env(env_on, {})
+    bok.env._apply_judge_env(env_on, {})
     assert env_on["FLOW_JUDGE_LLM_BASE_URL"] == "http://127.0.0.1:1237/v1"
     assert env_on["FLOW_JUDGE_LLM_MODEL"] == str(fake_model)
     # 9B 关 + 外部显式设定：照传（不动 :1237 缺省）
@@ -294,7 +294,7 @@ def test_dev_9b_off_gates_judge_and_settle_env(monkeypatch, tmp_path):
     monkeypatch.setenv("FLOW_JUDGE_LLM_BASE_URL", "https://cloud.example/v1")
     monkeypatch.setenv("FLOW_JUDGE_LLM_MODEL", "cloud-model")
     env_ext: dict[str, str] = {}
-    bok._apply_judge_env(env_ext, {})
+    bok.env._apply_judge_env(env_ext, {})
     assert env_ext["FLOW_JUDGE_LLM_BASE_URL"] == "https://cloud.example/v1"
     assert env_ext["FLOW_JUDGE_LLM_MODEL"] == "cloud-model"
 
@@ -303,11 +303,11 @@ def test_dev_9b_off_gates_judge_and_settle_env(monkeypatch, tmp_path):
     patch_bok(monkeypatch, "app_data_dir", lambda: tmp_path)
     monkeypatch.delenv("FLOW_JUDGE_LLM_BASE_URL", raising=False)
     monkeypatch.delenv("FLOW_JUDGE_LLM_MODEL", raising=False)
-    cp_off = bok._control_plane_env(tmp_path / "db.sqlite")
+    cp_off = bok.env._control_plane_env(tmp_path / "db.sqlite")
     assert "BOK_SETTLE_LLM_BASE_URL" not in cp_off
     assert "BOK_SETTLE_LLM_MODEL" not in cp_off
     monkeypatch.setenv("BOK_DEV_9B", "1")
-    cp_on = bok._control_plane_env(tmp_path / "db.sqlite")
+    cp_on = bok.env._control_plane_env(tmp_path / "db.sqlite")
     assert cp_on["BOK_SETTLE_LLM_BASE_URL"] == "http://127.0.0.1:1238/v1"  # I1 前门闸
     assert cp_on["BOK_SETTLE_LLM_MODEL"] == str(fake_model)
 

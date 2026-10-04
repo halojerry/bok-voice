@@ -2,10 +2,12 @@
 """prod 域(launchd/systemd 常驻安装、prod install/uninstall/status;G2 W② 从 core 搬出,
 搬运纪律=穿模块对象调用)。
 
-- 本模块只 `from bokctl import core`(及 servers 域)拿模块对象:凡仍住在 core 的
-  名字(PROD_HTTP_CHECKS/_agent_prod_env/healthy/_cp_bind_host/
-  _control_plane_env 等)一律 `core.X` 调用时取——patch 与后续域搬运在 core 侧
-  保持可见(patch 缝=模块属性)。`_realtime_demo_enabled` 属 serve 装配门,
+- 本模块 `from bokctl import core/env/paths/servers` 拿模块对象:凡仍住在 core 的
+  名字(PROD_HTTP_CHECKS/healthy/_cp_bind_host)一律 `core.X` 调用时取——patch 与
+  后续域搬运在属主模块侧保持可见(patch 缝=模块属性)。env 组装面
+  (_agent_prod_env/_control_plane_env/_interp_env)W②-env 波(2026-10-04)搬入
+  bokctl.env,本域穿 `env.X` 取(env 波新例:域间消费=改穿所属域,core 不做值
+  转发)。`_realtime_demo_enabled` 属 serve 装配门,
   W②-servers 波搬入 bokctl.servers,本域穿 `servers.X` 取(servers 波新例:
   域间消费=改穿所属域,core 不做值转发);路径/平台锚(ROOT/app_data_dir/
   repo_python/is_mac/is_linux/_embedded_livekit/_livekit_config_path)
@@ -24,7 +26,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from bokctl import core, paths, servers
+from bokctl import core, env, paths, servers
 
 
 def _prod_units(with_model_plane: bool = False) -> list[tuple[str, list[str], dict[str, str], str]]:
@@ -35,7 +37,7 @@ def _prod_units(with_model_plane: bool = False) -> list[tuple[str, list[str], di
     审计）：追加 `bok-model-plane` 单元跑 `bok up --models-only`（RunAtLoad 开机
     补拉模型面 + KeepAlive 幂等重扫；重启后 :8787/:1235/:1236/:1237/:1239 不再
     等人工）。默认 False——既有装机渲染逐字节零变化。"""
-    agent_env = core._agent_prod_env()
+    agent_env = env._agent_prod_env()
     livekit_bin = str(paths._embedded_livekit() or "livekit-server")
     py = paths.repo_python()
     # unit 定义:name → (args, 附加 env)。agent/interp 共用 agent_env。
@@ -43,7 +45,7 @@ def _prod_units(with_model_plane: bool = False) -> list[tuple[str, list[str], di
         (
             "bok-control-plane",
             [str(py), "-m", "uvicorn", "control_plane.main:app", "--host", core._cp_bind_host(), "--port", "8000"],
-            core._control_plane_env((paths.app_data_dir() / "bok_voice.db").as_posix()),
+            env._control_plane_env((paths.app_data_dir() / "bok_voice.db").as_posix()),
             "Bok 控制面 API",
         ),
         ("bok-livekit", [livekit_bin, "--config", str(paths._livekit_config_path())], {}, "实时语音信令/媒体"),
@@ -51,13 +53,13 @@ def _prod_units(with_model_plane: bool = False) -> list[tuple[str, list[str], di
         (
             "bok-interp-fwd",
             [str(py), "-m", "agent_runtime.interpret"],
-            {**core._interp_env(agent_env), "BOK_SERVICE": "interp-fwd", "INTERP_DIRECTION": "fwd"},
+            {**env._interp_env(agent_env), "BOK_SERVICE": "interp-fwd", "INTERP_DIRECTION": "fwd"},
             "B 线同传 fwd",
         ),
         (
             "bok-interp-rev",
             [str(py), "-m", "agent_runtime.interpret"],
-            {**core._interp_env(agent_env), "BOK_SERVICE": "interp-rev", "INTERP_DIRECTION": "rev"},
+            {**env._interp_env(agent_env), "BOK_SERVICE": "interp-rev", "INTERP_DIRECTION": "rev"},
             "B 线同传 rev",
         ),
     ]

@@ -243,4 +243,4 @@ def test_forward_env_registers_head_flush():
     sys.path.insert(0, str(repo_root))
     import tools.bok as bok  # noqa: E402
 
-    assert "MINIMAX_BIDI_HEAD_FLUSH" in bok._FORWARD_ENV
+    assert "MINIMAX_BIDI_HEAD_FLUSH" in bok.env._FORWARD_ENV

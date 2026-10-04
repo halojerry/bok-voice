@@ -15,8 +15,9 @@ LiveKit 配置补丁路径 _livekit_config_path、MLX_SERVER_WRAPPER;G2 W② 从
   _repo_pythonpath/bundled_node/bundled_llama/_embedded_livekit/
   _livekit_config_path/MLX_SERVER_WRAPPER)域内裸名互调(同模块全局=call-time
   可 patch)。
-- 留守 core 的近邻(边界记录,2026-10-04):_certifi_bundle/_bake_ssl_cert_file
-  是 env 组装面(env 域最后一批;certifi 束定位是 TLS 凭据面不是路径解析);
+- 留守 core 的近邻(边界记录,2026-10-04;env 波更新):_certifi_bundle/
+  _bake_ssl_cert_file **W②-env 波(最后一批)已随 env 组装面搬入 bokctl.env**
+  (certifi 束定位是 TLS 凭据面不是路径解析);
   _virtual_audio_present 是 doctor 报告性探测(subprocess 探设备非路径);
   shutil_which/_cuda 是工具探测;_PROVIDER_HEALTH_MODULE 虽是 ROOT 派生常量,
   但与 _provider_health_summary 被 status/doctor 两面吃(health 波边界判例,

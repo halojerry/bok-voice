@@ -438,15 +438,15 @@ def test_interp_env_sentence_commit_on():
     旧档「B 线强制关」退役；显式 env 0 仍是应急逃生口（setdefault 不抢），
     TURN_DETECTION≠stt 时配对自动熄火（sentence_commit_enabled 同判）。
     """
-    env = bok._interp_env({"PASSTHROUGH": "1"})
+    env = bok.env._interp_env({"PASSTHROUGH": "1"})
     assert env.get("QWEN3_ASR_SENTENCE_COMMIT") == "1"
     assert env.get("QWEN3_ASR_CLAUSE_COMMIT") == "1"  # B 线子句级提交默认开(2026-09-16)
     assert env["PASSTHROUGH"] == "1"  # agent_env 透传不受影响
 
     # 应急逃生口：用户显式 0 > setdefault
-    env2 = bok._interp_env({"QWEN3_ASR_SENTENCE_COMMIT": "0"})
+    env2 = bok.env._interp_env({"QWEN3_ASR_SENTENCE_COMMIT": "0"})
     assert env2["QWEN3_ASR_SENTENCE_COMMIT"] == "0"
-    env3 = bok._interp_env({"QWEN3_ASR_CLAUSE_COMMIT": "0"})
+    env3 = bok.env._interp_env({"QWEN3_ASR_CLAUSE_COMMIT": "0"})
     assert env3["QWEN3_ASR_CLAUSE_COMMIT"] == "0"
 
 
@@ -456,15 +456,15 @@ def test_interp_direction_env_rev_overrides(monkeypatch):
     monkeypatch.setenv("QWEN3_ASR_BASE_URL_REV", "http://127.0.0.1:8789")
     monkeypatch.setenv("MT_LLM_BASE_URL_REV", "http://127.0.0.1:1237/v1")
 
-    rev_env = dict(bok._interp_env({}))
+    rev_env = dict(bok.env._interp_env({}))
     rev_env["INTERP_DIRECTION"] = "rev"
-    bok._apply_interp_direction_env(rev_env, "rev")
+    bok.env._apply_interp_direction_env(rev_env, "rev")
     assert rev_env["QWEN3_ASR_BASE_URL"] == "http://127.0.0.1:8789"
     assert rev_env["MT_LLM_BASE_URL"] == "http://127.0.0.1:1237/v1"
 
-    fwd_env = dict(bok._interp_env({}))
+    fwd_env = dict(bok.env._interp_env({}))
     fwd_env["INTERP_DIRECTION"] = "fwd"
-    bok._apply_interp_direction_env(fwd_env, "fwd")
+    bok.env._apply_interp_direction_env(fwd_env, "fwd")
     assert fwd_env.get("QWEN3_ASR_BASE_URL") != "http://127.0.0.1:8789"
     assert fwd_env.get("MT_LLM_BASE_URL") != "http://127.0.0.1:1237/v1"
 
@@ -479,7 +479,7 @@ def test_interp_env_passthrough_switches(monkeypatch):
     monkeypatch.setenv("BOK_INTERP_MAX_BACKLOG_S", "4")
     monkeypatch.setenv("BOK_INTERP_VOICE_TAGS", "0")
     monkeypatch.setenv("MINIMAX_MODEL", "speech-2.8-turbo")
-    env = bok._interp_env({})
+    env = bok.env._interp_env({})
     assert env["BOK_INTERP_MT_CONTEXT"] == "2"
     assert env["BOK_INTERP_REV_AUDIO"] == "1"
     assert env["BOK_INTERP_BACKLOG"] == "0"
@@ -494,7 +494,7 @@ def test_interp_env_passthrough_switches(monkeypatch):
     monkeypatch.delenv("BOK_INTERP_MAX_BACKLOG_S", raising=False)
     monkeypatch.delenv("BOK_INTERP_VOICE_TAGS", raising=False)
     monkeypatch.delenv("MINIMAX_MODEL", raising=False)
-    env = bok._interp_env({})
+    env = bok.env._interp_env({})
     assert "BOK_INTERP_MT_CONTEXT" not in env
     assert "BOK_INTERP_BACKLOG" not in env
     assert "BOK_INTERP_MAX_BACKLOG_S" not in env
@@ -1637,10 +1637,10 @@ def test_interp_env_len_commit_on():
     """B 线长度档默认开(_interp_env setdefault),显式 0 逃生不抢;VAD 停嘴
     门槛 2026-10-02 拆 setdefault(B 线与 A 线同读设置面,显式 env 只经透传
     白名单做真部署覆盖——设置页从此对 B 线说真话)。"""
-    env = bok._interp_env({})
+    env = bok.env._interp_env({})
     assert env.get("QWEN3_ASR_CLAUSE_LEN_COMMIT") == "1"
     assert "VAD_MIN_SILENCE_DURATION" not in env  # 不再 setdefault;由设置面治理
-    env2 = bok._interp_env({"QWEN3_ASR_CLAUSE_LEN_COMMIT": "0"})
+    env2 = bok.env._interp_env({"QWEN3_ASR_CLAUSE_LEN_COMMIT": "0"})
     assert env2["QWEN3_ASR_CLAUSE_LEN_COMMIT"] == "0"
-    env3 = bok._interp_env({"VAD_MIN_SILENCE_DURATION": "0.45"})
+    env3 = bok.env._interp_env({"VAD_MIN_SILENCE_DURATION": "0.45"})
     assert env3["VAD_MIN_SILENCE_DURATION"] == "0.45"  # 显式 env 仍透传(部署覆盖)

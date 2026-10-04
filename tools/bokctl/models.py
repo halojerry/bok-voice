@@ -15,8 +15,9 @@ G2 W② 从 core 搬出,搬运纪律=穿模块对象调用)。
   cmd_catalog/cmd_manifest/setup_models/_all_models_present/cmd_setup/
   _dir_sha256/_enable_hf_transfer/cmd_download)域内裸名互调(同模块全局=
   call-time 可 patch)。
-- 留守 core 的近邻(边界记录,2026-10-04):_dev_9b_enabled/_settle_gate_url 是
-  env 组装面闸键(env 域最后一批)——本域专线解析(_settle_llm_model/
+- 留守 core 的近邻(边界记录,2026-10-04;env 波更新):_dev_9b_enabled/
+  _settle_gate_url 与整张 env 组装面 **W②-env 波(最后一批)已搬入 bokctl.env**
+  ——本域专线解析(_settle_llm_model/
   _mt_llm_model)只管「模型路径是甚么」,起不起对应端口是 env/servers 域的
   决策。MLX_SERVER_WRAPPER 的旧判例(「ROOT 派生常量因 import 序必须留 core」)
   已随 paths 波解除——常量随 ROOT 住 bokctl.paths(零内部依赖,无 import 序

@@ -278,11 +278,11 @@ def test_probe_smoke_real_function_does_not_raise():
 
 
 def test_forward_env_membership_pin():
-    """kill-switch 必须进 bok._FORWARD_ENV（prod 封闭面转发靠它；
+    """kill-switch 必须进 bok.env._FORWARD_ENV（prod 封闭面转发靠它；
     agent.py 读注入 env Mapping 故静态扫描不强制——membership 由本测试钉死）。"""
     import tools.bok as bok  # noqa: PLC0415
 
-    assert "BOK_A_REPLY_PROBE" in bok._FORWARD_ENV
+    assert "BOK_A_REPLY_PROBE" in bok.env._FORWARD_ENV
 
 
 # ---------------------------------------------------------------------------

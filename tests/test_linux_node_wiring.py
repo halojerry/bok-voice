@@ -234,14 +234,14 @@ def test_worker_env_consumes_cp_url(monkeypatch):
     """端到端契约钉：node_agent 导出的 env → `_agent_worker_env` 真吃到——
     云 CP 节点上 worker 的 turns/QA/设置上报不再打缺省本地 :8000。"""
     monkeypatch.setenv("CONTROL_PLANE_URL", "https://cp.example.com")
-    env = bok._agent_worker_env(bok.paths.repo_python())
+    env = bok.env._agent_worker_env(bok.paths.repo_python())
     assert env["CONTROL_PLANE_URL"] == "https://cp.example.com"
 
 
 def test_worker_env_default_still_local(monkeypatch):
     """非节点形态（dev serve 含本地 CP）缺省值不变。"""
     monkeypatch.delenv("CONTROL_PLANE_URL", raising=False)
-    env = bok._agent_worker_env(bok.paths.repo_python())
+    env = bok.env._agent_worker_env(bok.paths.repo_python())
     assert env["CONTROL_PLANE_URL"] == "http://127.0.0.1:8000"
 
 

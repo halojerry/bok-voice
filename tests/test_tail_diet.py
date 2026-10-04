@@ -176,4 +176,4 @@ def test_tail_diet_env_in_forward_env():
     """BOK_TAIL_MEMORY_EVERY 必须在 _FORWARD_ENV——prod 封闭 env 面的逃生门。"""
     import tools.bok as bok
 
-    assert "BOK_TAIL_MEMORY_EVERY" in bok._FORWARD_ENV
+    assert "BOK_TAIL_MEMORY_EVERY" in bok.env._FORWARD_ENV

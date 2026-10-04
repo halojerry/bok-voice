@@ -84,4 +84,4 @@ def test_context_resolver_failure_is_silent(monkeypatch, tmp_path):
 def test_forward_env_registers_context_gate():
     import tools.bok as bok  # noqa: E402
 
-    assert "BOK_FILLER_CONTEXT" in bok._FORWARD_ENV
+    assert "BOK_FILLER_CONTEXT" in bok.env._FORWARD_ENV

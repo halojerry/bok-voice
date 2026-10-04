@@ -635,7 +635,7 @@ def test_bok_launch_points_use_wrapper():
 def test_forward_env_has_mlx_abort():
     import tools.bok as bok
 
-    assert "BOK_MLX_ABORT" in bok._FORWARD_ENV
+    assert "BOK_MLX_ABORT" in bok.env._FORWARD_ENV
 
 
 def test_livekit_plugins_wiring_pins():

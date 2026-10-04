@@ -4,7 +4,7 @@ core.py 承载今天的全部实现;bok.py 退为门面 launcher。W② 起域�
 从 core 搬出,搬运纪律与 PATCH_TARGETS 见 tests/_bokpatch.py。
 """
 # W② 起:域模块在此并 import(此刻 core/prod/doctor/proc/health/servers/models/
-# paths;core 内 `from bokctl import prod/doctor/proc/health/servers/models/paths`
-# 靠 sys.modules 部分初始化解析,域模块只在调用期穿 core.X 取名,无环风险;
-# paths 波起域模块也可零 core 依赖——paths 是 stdlib-only 底座)。
-from . import core, doctor, health, models, paths, proc, prod, servers  # noqa: F401
+# paths/env;core 内 `from bokctl import prod/doctor/proc/health/servers/models/
+# paths/env` 靠 sys.modules 部分初始化解析,域模块只在调用期穿 core.X 取名,无环
+# 风险;paths 波起域模块也可零 core 依赖——paths 是 stdlib-only 底座)。
+from . import core, doctor, env, health, models, paths, proc, prod, servers  # noqa: F401

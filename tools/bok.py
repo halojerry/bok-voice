@@ -1,8 +1,9 @@
 """bok 门面 launcher(G2 W①,2026-10-04)。
 
 实现已整体迁至 ``bokctl.core``(0 行改动搬运,除三处 __file__ 锚点校正);
-本文件只做两件事:①把 core 的全部名字(含下划线面——``import *`` 不带,
-测试/门禁直接点名 ``bok._FORWARD_ENV`` 等)镜像到 ``bok`` 模块面;②CLI
+本文件只做两件事:①把 core 的全部名字(含下划线面——``import *`` 不带;
+W② 起域模块从 core 逐个搬出,门面镜像随 ``bok.<域>.X`` 走,如 env 域读
+``bok.env._FORWARD_ENV``)镜像到 ``bok`` 模块面;②CLI
 入口分发。任何行为改动都进 ``bokctl/``,本文件保持瘦壳(W② 起域模块从
 core 逐个搬出,搬运纪律与 PATCH_TARGETS 见 tests/_bokpatch.py)。
 """

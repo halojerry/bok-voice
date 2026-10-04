@@ -203,4 +203,4 @@ def test_b_line_interpret_does_not_receive_mined():
 def test_forward_env_contains_mined_hotwords():
     import bok  # noqa: E402  (sys.path 已注入 tools/)
 
-    assert "BOK_MINED_HOTWORDS" in bok._FORWARD_ENV
+    assert "BOK_MINED_HOTWORDS" in bok.env._FORWARD_ENV
