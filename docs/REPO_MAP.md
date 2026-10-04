@@ -21,7 +21,6 @@
 | `services/qwen3-tts-sidecar/` | TTS HTTP sidecar :8788（`app.py`：克隆音色/流式；本地回退档） | both |
 | `services/llm-mlx/` | 仅 `.venv`（mlx_lm 0.31.3）；server 启动命令在 bok.py，无仓库代码 | dev |
 | `services/livekit-server/` | `livekit.yaml`（self-host 配置，钉端口/prometheus/json 日志） | both |
-| `desktop/` | Tauri 桌壳 + runtime 装配（src-tauri Rust / runtime symlink；前端经 `apps/web/lib/tauri.ts` 直连 invoke，`desktop/src/` 前端桥已删） | packaged |
 | `tests/` | pytest 全量（含 `fixtures/audio/{zh,cantonese,en}.wav` E2E 音频 + 术语门禁 + `test_prod_windows.py` Windows prod 生命周期/安装器单测 + qa-canvas Phase 1 四件：`test_qa_cluster_field.py` 簇列数据层/级联、`test_pregen_qa_status.py` pregen --qa-status、`test_qa_canned_status.py` CP 罐头状态/试听/补料端点、`test_import_xkt_qa.py` 惜客通导入器纯函数） | dev/CI |
 | `docs/` | RUNTIME_TOPOLOGY / REPO_MAP / CONTRACTS / DEV_TOOLS / archive 决策归档 | dev |
 | `dev/docker/` | 可选 Docker 开发栈（归档，不进 CI） | dev-only |
@@ -43,7 +42,7 @@
 
 ## 脚本（scripts/）
 
-- 构建：`bootstrap.sh` `build_livekit.sh` `build_runtime.sh` `build_release.sh` `verify_bundle.sh`（--staging/--app/--doctor）`stub_external_bin.sh`
+- 构建：`bootstrap.sh` `build_livekit.sh` `build_runtime.sh`（build_release.sh / verify_bundle.sh / stub_external_bin.sh 已随 Tauri 桌面壳退役删除，2026-09-17）
 - E2E：`e2e_trilingual_livekit.py`（三语，真 /api/token，一案一通话）`e2e_flow_scenario.py` `e2e_multi_turn.py` `e2e_http.py` `e2e_pipeline.py`
 - 测量/探针：`measure_latency.py`（需真栈）`measure_prompt.py`（本地）`probe_cantonese_digits.py` `smoke_sidecars.py` `pad_test_audio.py`（历史手工测试 `archive/test_deepseek.py` `archive/test_volcano_v3.py`）
 - 站点交付探针（2026-09-16）：`probe_killswitch.py`（kill-switch 目标语义：吊销 sticky→通话面 403 窒息→unrevoke 复活全链，CI `node-handshake.yml` linux 对真 CP 实跑）`probe_windows_lifecycle.py`（down 树杀语义 A 段全平台 + schtasks 契约 B 段仅 Windows 实跑、runner 无提权按 access-denied 优雅 skip，CI windows job）`probe_thin_client_static.py`（静态导出注入链形状 + 无烤死 localhost，CI web job，需先 `apps/web && npm run build`）
@@ -92,7 +91,7 @@
 | `lib/qa-canvas.ts` | 画布纯函数唯一数据面（parseTemplateSteps/deriveGraph 布局契约、resolveClusterTarget 簇校验、revertCluster、localStorage 位置键；签名勿动，`test/qa-canvas.test.mjs` 钉住） |
 | `components/template-editor.tsx` | 话术模板编辑表单（2026-09-19 W1 自 /templates 原样提取：分步 goal/ref/直念/情绪/TSV 导入/热词/保存逻辑；/templates 列表页与 /studio 工作台「话术流程」tab 双页共用，提取前后渲染输出一致） |
 | `app/(app)/studio/page.tsx` | AI 工作站（列表态+`?t=<id>` 工作台态五 tab；静态导出零动态段，深链 query 参数形态） |
-| `lib/flow-canvas.ts` + `components/flow-canvas.tsx` | 流程画布（W2：场景泳道/步节点/答法抽屉/意图只读 overlay/发布徽标；纯函数 parse-serialize 镜像 flow.py 分支语法、round-trip 无损，`test/flow-canvas.test.mjs` 钉住——**改 flow.py 分支/注意正则两处必须同步**） |
+| `lib/flow-canvas.ts` + `components/step-canvas-view.tsx` | 流程画布（2026-09-26 旧 flow-canvas 组件改版为 step-canvas-view；W2 语义：场景泳道/步节点/答法抽屉/意图只读 overlay/发布徽标；纯函数 parse-serialize 镜像 flow.py 分支语法、round-trip 无损，`test/flow-canvas.test.mjs` 钉住——**改 flow.py 分支/注意正则两处必须同步**） |
 | `lib/var-panel.ts` + `components/template-vars.tsx` | 变量 tab（W3：占位符目录/扫描/预览渲染镜像 flow.py `object_vars`/`render_template_text`——空串保留占位、digitsToCn 双轨、contact 语言缺省、say 行丢行警示；`test/var-panel.test.mjs` 钉住——**改 flow.py 变量语义两处必须同步**） |
 | `components/study-tab.tsx` | 学习 tab（W3：话术优化/问答对报告 + AI 聚类采纳面板——dry/apply 必须同参 limit，CP 勾选守卫按参数找计划缓存） |
 | `packages/core/bok_voice_core/intent_rules.py` | 意向规则共享契约（W4：INTENT_FACTS 12 键白名单/eval_intent_rules 确定性评估/validate_conditions——CP 保存校验、agent 挂断评估、测试三方共用，**改事实键集三处同步**） |
@@ -118,6 +117,7 @@ runtime/llama/                 Windows llama-server.exe + cudart DLL
 
 ## 已清理的遗留
 
+- Tauri 桌面壳（desktop/）：2026-09-17 退役删除——runtime/ 装配保留（见「运行时装配」），分发改节点安装脚本 + 纯浏览器 UI；apps/web/lib/tauri.ts 前端桥随之删除（详见 docs/ARCHITECTURE.md）
 - Ollama：已从编排/默认配置/B 线翻译移除（docs/archive 留存说明）
 - Docker：开发可选栈归档 `dev/docker/`，CI 不构建
 - CosyVoice：无运行时引用

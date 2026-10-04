@@ -37,7 +37,7 @@ Agent Worker (livekit-agents) ── ControlPlaneClient ── ContextInjector �
 
 ### 节点分发（原桌面壳章节）
 
-- **Tauri 桌面壳已退役**（2026-09-17，`desktop/` 已删除）：分发改为「节点安装脚本
+- **Tauri 桌面壳已退役**（2026-09-17 删除 desktop/，见 git 史）：分发改为「节点安装脚本
   （从云 CP 鉴权下载，客户链路零 GitHub）+ schtasks/launchd 常驻 + 纯浏览器 UI」。
 - **装机入口**：Windows=`scripts/install-node.ps1 -Fetch -InstallService`（自举拉包+
   Task Scheduler 常驻）；bash=`scripts/bootstrap-node.sh`。两者的包/脚本都经

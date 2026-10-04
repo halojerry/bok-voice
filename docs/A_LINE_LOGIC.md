@@ -3,7 +3,7 @@
 > 2026-09-20。本文不是 AGENTS.md 军规复读，而是对 A 线源码的**逐行追踪综合**：四路并行深读
 > （agent.py 5305 行 / flow.py 1701 行 / qa_gate.py 300 行 / fillers.py 853 行 /
 > livekit_plugins.py 6187 行 / control_plane main.py / repository.py），全部结论带 `文件:行号`
-> 证据。全局组件拓扑见 `bok-architecture.json`（archify），本文专注**运行逻辑**：什么节点做什么事、
+> 证据。全局组件拓扑见 `docs/ARCHITECTURE-MAP.md`，本文专注**运行逻辑**：什么节点做什么事、
 > 意图识别怎么判别、数据在哪一列。
 >
 > **行号权威性**：§1–§9 的行号随代码演进已部分漂移（本轮实测差 +58 到 +498 行，§2 的 #14 一行
