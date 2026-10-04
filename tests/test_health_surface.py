@@ -52,7 +52,7 @@ def test_core_ports_cover_embed_and_optional_exemption():
     # 宽松终检:缺口仅 embed → 放行(镜像 mt/settle 语义)。
     assert bok._only_optional_ports([8789]) is True
     # 孤儿清扫身份映射:殭尸 embed 进程按端口+命令行双条件收割。
-    assert any(port == 8789 and "bge-embed" in markers for port, markers in bok._ORPHAN_PORT_OWNERS)
+    assert any(port == 8789 and "bge-embed" in markers for port, markers in bok.proc._ORPHAN_PORT_OWNERS)
     # 放宽探活面:暖机窗 /health 应答(哪怕 ready=false)算进程在。
     assert bok._SWEEP_HTTP_PATHS.get(8789) == "/health"
 
@@ -231,22 +231,22 @@ def test_monitor_veto_blocks_kill_with_active_calls():
     """硬 veto 纯函数判定：active_calls>0 任何探活失败都不杀；无通话/CP 不可达
     退回连续失败口径（idle 门槛 2 轮）。"""
     # 无通话在途：2 轮（≥10s）杀（旧 idle 口径不变）
-    assert bok._monitor_kill_round(1, 0) == (False, False)
-    assert bok._monitor_kill_round(2, 0) == (True, False)
-    assert bok._monitor_kill_round(99, 0)[0] is True
+    assert bok.proc._monitor_kill_round(1, 0) == (False, False)
+    assert bok.proc._monitor_kill_round(2, 0) == (True, False)
+    assert bok.proc._monitor_kill_round(99, 0)[0] is True
     # CP 不可达（None）= 保守不杀(2026-09-28 生命周期护栏:None 曾落 falsy 分支
     # 令 veto 静默失效——CP 抖一下 + worker 探活失败 = 可能杀掉在途 worker)
-    assert bok._monitor_kill_round(1, None) == (False, False)
-    assert bok._monitor_kill_round(2, None) == (False, True)
+    assert bok.proc._monitor_kill_round(1, None) == (False, False)
+    assert bok.proc._monitor_kill_round(2, None) == (False, True)
     # 有通话在途：恒不杀（硬 veto）——streak 多深都不杀，等场景间隙 active 归零
     for n in (1, 2, 3, 12, 60, 999):
-        kill, _veto = bok._monitor_kill_round(n, 2)
+        kill, _veto = bok.proc._monitor_kill_round(n, 2)
         assert kill is False, f"active_calls>0 时 streak={n} 不得杀"
     # veto 打点节奏：首过 idle 门槛一次 + 此后每 12 轮提醒一次（防长窗静默/刷屏）
-    assert bok._monitor_kill_round(2, 2) == (False, True)
-    assert bok._monitor_kill_round(3, 2) == (False, False)
-    assert bok._monitor_kill_round(12, 2) == (False, True)
-    assert bok._monitor_kill_round(24, 2) == (False, True)
+    assert bok.proc._monitor_kill_round(2, 2) == (False, True)
+    assert bok.proc._monitor_kill_round(3, 2) == (False, False)
+    assert bok.proc._monitor_kill_round(12, 2) == (False, True)
+    assert bok.proc._monitor_kill_round(24, 2) == (False, True)
 
 
 def test_monitor_probe_uses_real_worker_endpoint(monkeypatch):

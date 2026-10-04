@@ -97,8 +97,8 @@ class _FakeWorkers:
                 grouped = os.getpgid(pid) != os.getpgrp()
             except OSError:
                 grouped = False
-            visible = (bok._process_serve_root(pid) == serve_root
-                       if serve_root else bok._ps_field(pid, "command=") != "")
+            visible = (bok.proc._process_serve_root(pid) == serve_root
+                       if serve_root else bok.proc._ps_field(pid, "command=") != "")
             if grouped and visible:
                 return
             time.sleep(0.2)
@@ -116,7 +116,7 @@ class _FakeWorkers:
 
 def _write_marker(home: Path, pid: int, root: str) -> None:
     """伪造 proc-<pid>.root 标记（用真 lstart——pid 复用防护按真值比对）。"""
-    lstart = bok._ps_field(pid, "lstart=")
+    lstart = bok.proc._ps_field(pid, "lstart=")
     assert lstart, "ps lstart 读取失败，测试环境异常"
     (_run_dir(home) / f"proc-{pid}.root").write_text(f"{root}\t{lstart}\n", encoding="utf-8")
 
@@ -140,9 +140,9 @@ def test_env_carrier_foreign_detected(monkeypatch, tmp_path):
     pool = _FakeWorkers()
     try:
         proc = pool.spawn(OTHER_ROOT)
-        root = bok._process_serve_root(proc.pid)
+        root = bok.proc._process_serve_root(proc.pid)
         assert root == OTHER_ROOT, f"env 载体没读到: {root!r}"
-        foreign, r = bok._pid_origin_foreign(proc.pid)
+        foreign, r = bok.proc._pid_origin_foreign(proc.pid)
         assert foreign and r == OTHER_ROOT
     finally:
         pool.cleanup()
@@ -155,12 +155,12 @@ def test_marker_carrier_with_real_lstart(monkeypatch, tmp_path):
     try:
         proc = pool.spawn(None)  # 不带 env，逼走标记载体
         _write_marker(home, proc.pid, OTHER_ROOT)
-        assert bok._process_serve_root(proc.pid) == OTHER_ROOT
+        assert bok.proc._process_serve_root(proc.pid) == OTHER_ROOT
         # 假 lstart：pid 复用防护把标记作废 → 来源未知 → 不判他树
         (_run_dir(home) / f"proc-{proc.pid}.root").write_text(
             f"{OTHER_ROOT}\tFAKE LSTART\n", encoding="utf-8")
-        assert bok._process_serve_root(proc.pid) == ""
-        foreign, _ = bok._pid_origin_foreign(proc.pid)
+        assert bok.proc._process_serve_root(proc.pid) == ""
+        foreign, _ = bok.proc._pid_origin_foreign(proc.pid)
         assert not foreign
     finally:
         pool.cleanup()
@@ -172,12 +172,12 @@ def test_own_tree_and_unknown_not_foreign(monkeypatch, tmp_path):
     pool = _FakeWorkers()
     try:
         own_env = pool.spawn(str(bok.ROOT))
-        assert bok._pid_origin_foreign(own_env.pid) == (False, str(bok.ROOT))
+        assert bok.proc._pid_origin_foreign(own_env.pid) == (False, str(bok.ROOT))
         own_marker = pool.spawn(None)
         _write_marker(home, own_marker.pid, str(bok.ROOT))
-        assert bok._pid_origin_foreign(own_marker.pid)[0] is False
+        assert bok.proc._pid_origin_foreign(own_marker.pid)[0] is False
         unknown = pool.spawn(None)
-        assert bok._pid_origin_foreign(unknown.pid) == (False, "")
+        assert bok.proc._pid_origin_foreign(unknown.pid) == (False, "")
     finally:
         pool.cleanup()
 
@@ -214,7 +214,7 @@ def test_kill_pidfile_refuses_foreign(monkeypatch, tmp_path, capsys):
         _write_marker(home, foreign.pid, OTHER_ROOT)  # 标记载体同判
         run = _run_dir(home)
         (run / "agent.pid").write_text(str(foreign.pid))
-        bok._kill_pidfile(run / "agent.pid")
+        bok.proc._kill_pidfile(run / "agent.pid")
         _assert_alive(foreign)
         assert "先在对方树 down" in capsys.readouterr().err
     finally:
@@ -265,7 +265,7 @@ def test_sweep_orphan_workers_skips_foreign(monkeypatch, tmp_path, capsys):
     try:
         foreign = pool.spawn(OTHER_ROOT)
         unknown = pool.spawn(None)
-        swept = bok._sweep_orphan_workers()
+        swept = bok.proc._sweep_orphan_workers()
         swept_pids = [pid for pid, _ in swept]
         assert foreign.pid not in swept_pids, "他树条目进了收割名单"
         assert unknown.pid in swept_pids
@@ -311,14 +311,14 @@ def test_cmd_monitor_writes_own_stamps(monkeypatch, tmp_path):
     home = _tmp_home(monkeypatch, tmp_path)
     run = _run_dir(home)
     pid = os.getpid()
-    bok._write_proc_stamps(run / "monitor.pid", pid)
+    bok.proc._write_proc_stamps(run / "monitor.pid", pid)
     assert (run / "monitor.pid").read_text().strip() == str(pid)
     parts = (run / f"proc-{pid}.root").read_text().strip().split("\t")
     assert len(parts) == 2 and parts[0] == str(bok.ROOT)
     # 真 lstart：写完立刻按戳判活成立；幂等重写不炸
-    assert bok._pidfile_alive_stamped(run / "monitor.pid") is True
-    bok._write_proc_stamps(run / "monitor.pid", pid)
-    assert bok._pidfile_alive_stamped(run / "monitor.pid") is True
+    assert bok.proc._pidfile_alive_stamped(run / "monitor.pid") is True
+    bok.proc._write_proc_stamps(run / "monitor.pid", pid)
+    assert bok.proc._pidfile_alive_stamped(run / "monitor.pid") is True
     import inspect
     assert "_write_proc_stamps(run_dir / \"monitor.pid\", os.getpid())" in inspect.getsource(bok.cmd_monitor)
 
@@ -334,17 +334,17 @@ def test_pidfile_alive_stamped_pid_reuse_judged_dead(monkeypatch, tmp_path):
         (run / "monitor.pid").write_text(str(proc.pid))
         (run / f"proc-{proc.pid}.root").write_text(
             f"{bok.ROOT}\tFAKE LSTART (recycled)\n", encoding="utf-8")
-        assert bok._pidfile_alive_stamped(run / "monitor.pid") is False
+        assert bok.proc._pidfile_alive_stamped(run / "monitor.pid") is False
         (run / f"proc-{proc.pid}.root").unlink()
-        assert bok._pidfile_alive_stamped(run / "monitor.pid") is True
+        assert bok.proc._pidfile_alive_stamped(run / "monitor.pid") is True
         (run / f"proc-{proc.pid}.root").write_text(f"{bok.ROOT}\n", encoding="utf-8")
-        assert bok._pidfile_alive_stamped(run / "monitor.pid") is True
+        assert bok.proc._pidfile_alive_stamped(run / "monitor.pid") is True
         _write_marker(home, proc.pid, str(bok.ROOT))
-        assert bok._pidfile_alive_stamped(run / "monitor.pid") is True
+        assert bok.proc._pidfile_alive_stamped(run / "monitor.pid") is True
         proc.terminate()
         proc.join(timeout=5)
         (run / f"proc-{proc.pid}.root").unlink(missing_ok=True)
-        assert bok._pidfile_alive_stamped(run / "monitor.pid") is False
+        assert bok.proc._pidfile_alive_stamped(run / "monitor.pid") is False
     finally:
         pool.cleanup()
 
@@ -362,21 +362,21 @@ def test_ensure_monitor_reuse_respawns_foreign_logs(monkeypatch, tmp_path, capsy
         (run / "monitor.pid").write_text(str(recycled.pid))
         (run / f"proc-{recycled.pid}.root").write_text(
             f"{bok.ROOT}\tSTALE LSTART\n", encoding="utf-8")
-        bok._ensure_monitor(sys.executable)
+        bok.proc._ensure_monitor(sys.executable)
         assert started, "stale pidfile（pid 复用）该触发重拉"
 
         started.clear()
         foreign = pool.spawn(OTHER_ROOT)
         (run / "monitor.pid").write_text(str(foreign.pid))
         (run / f"proc-{foreign.pid}.root").unlink(missing_ok=True)
-        bok._ensure_monitor(sys.executable)
+        bok.proc._ensure_monitor(sys.executable)
         assert not started, "他树活 monitor 该跳过"
         assert "属另一代码树" in capsys.readouterr().out
 
         started.clear()
         own = pool.spawn(str(bok.ROOT))
         (run / "monitor.pid").write_text(str(own.pid))
-        bok._ensure_monitor(sys.executable)
+        bok.proc._ensure_monitor(sys.executable)
         assert not started, "本树活 monitor 该静默跳过"
         assert capsys.readouterr().out == ""
     finally:

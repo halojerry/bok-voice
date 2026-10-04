@@ -21,6 +21,12 @@ PATCH_TARGETS: dict[str, str] = {
     "_doctor_gpu_gate": "bokctl.doctor",
     "_doctor_draft_warning": "bokctl.doctor",
     "_doctor_minimax_tts": "bokctl.doctor",
+    # proc 域(W② 搬出)
+    "_ps_field": "bokctl.proc",
+    "_sweep_orphan_workers": "bokctl.proc",
+    "_sweep_orphan_listeners": "bokctl.proc",
+    "_kill_proc_tree": "bokctl.proc",
+    "_ensure_monitor": "bokctl.proc",
 }
 
 _DEFAULT_TARGET = "bokctl.core"

@@ -92,7 +92,7 @@ def test_llm_raw_1239_in_health_tables():
     （半瘫）四表全绿。四表收编 + CORE_PORTS 可见（可选语义）。"""
     assert ("llm-raw", 1239, "/v1/models") in bok.PROD_HTTP_CHECKS
     assert bok._SWEEP_HTTP_PATHS.get(1239) == "/v1/models"
-    assert any(port == 1239 and "mlx_lm" in markers for port, markers in bok._ORPHAN_PORT_OWNERS)
+    assert any(port == 1239 and "mlx_lm" in markers for port, markers in bok.proc._ORPHAN_PORT_OWNERS)
     assert ("llm-raw", 1239) in bok.CORE_PORTS
 
 

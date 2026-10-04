@@ -94,7 +94,7 @@ def test_kill_tree_windows_builds_taskkill_command(monkeypatch) -> None:
 
     monkeypatch.setattr(bok.os, "name", "nt")
     monkeypatch.setattr(bok.subprocess, "run", fake_run)
-    bok._kill_proc_tree(12345)  # 不应抛
+    bok.proc._kill_proc_tree(12345)  # 不应抛
     assert len(calls) == 1
     argv, kwargs = calls[0]
     assert argv == ["taskkill", "/PID", "12345", "/T", "/F"]
@@ -109,7 +109,7 @@ def test_kill_tree_windows_not_found_is_silent(monkeypatch) -> None:
     monkeypatch.setattr(
         bok.subprocess, "run",
         lambda argv, **kw: subprocess.CompletedProcess(argv, 128, stdout="", stderr="ERROR: process not found"))
-    bok._kill_proc_tree(99)  # 不应抛
+    bok.proc._kill_proc_tree(99)  # 不应抛
 
 
 def test_kill_tree_windows_failure_surfaced(monkeypatch) -> None:
@@ -117,8 +117,8 @@ def test_kill_tree_windows_failure_surfaced(monkeypatch) -> None:
     monkeypatch.setattr(
         bok.subprocess, "run",
         lambda argv, **kw: subprocess.CompletedProcess(argv, 1, stdout="", stderr="Access is denied."))
-    with pytest.raises(bok._KillTreeError) as ei:
-        bok._kill_proc_tree(99)
+    with pytest.raises(bok.proc._KillTreeError) as ei:
+        bok.proc._kill_proc_tree(99)
     assert "taskkill" in str(ei.value) and "rc=1" in str(ei.value)
 
 
@@ -129,8 +129,8 @@ def test_kill_tree_windows_timeout_surfaced(monkeypatch) -> None:
         raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
 
     monkeypatch.setattr(bok.subprocess, "run", fake_run)
-    with pytest.raises(bok._KillTreeError):
-        bok._kill_proc_tree(99)
+    with pytest.raises(bok.proc._KillTreeError):
+        bok.proc._kill_proc_tree(99)
 
 
 def test_kill_tree_posix_killpg_then_single_kill_fallback(monkeypatch) -> None:
@@ -142,7 +142,7 @@ def test_kill_tree_posix_killpg_then_single_kill_fallback(monkeypatch) -> None:
     calls: list[tuple] = []
     monkeypatch.setattr(bok.os, "getpgid", lambda pid: 4242)
     monkeypatch.setattr(bok.os, "killpg", lambda pgid, sig: calls.append(("killpg", pgid, sig)))
-    bok._kill_proc_tree(123)
+    bok.proc._kill_proc_tree(123)
     assert calls == [("killpg", 4242, signal.SIGTERM)]
 
     def _raise(pgid, sig):
@@ -151,7 +151,7 @@ def test_kill_tree_posix_killpg_then_single_kill_fallback(monkeypatch) -> None:
     calls.clear()
     monkeypatch.setattr(bok.os, "killpg", _raise)
     monkeypatch.setattr(bok.os, "kill", lambda pid, sig: calls.append(("kill", pid, sig)))
-    bok._kill_proc_tree(123)
+    bok.proc._kill_proc_tree(123)
     assert calls == [("kill", 123, signal.SIGTERM)]
 
 
@@ -231,7 +231,7 @@ def test_sweep_orphan_workers_windows_is_documented_skip(monkeypatch) -> None:
 
     monkeypatch.setattr(bok.os, "name", "nt")
     monkeypatch.setattr(bok.subprocess, "run", explode)
-    assert bok._sweep_orphan_workers() == []
+    assert bok.proc._sweep_orphan_workers() == []
 
 
 # ---------------- ④ schtasks_units：XML 契约 ----------------
@@ -757,23 +757,23 @@ def test_prod_units_cp_bind_host_blank_env_falls_back(monkeypatch, tmp_path: Pat
 
 def test_monitor_kill_round_none_active_calls_is_conservative() -> None:
     """active_calls=None（CP 不可达=状态未知）→ kill 恒 False（旧 None 当 0 误杀）。"""
-    assert bok._monitor_kill_round(2, None) == (False, True)
-    assert bok._monitor_kill_round(11, None)[0] is False
+    assert bok.proc._monitor_kill_round(2, None) == (False, True)
+    assert bok.proc._monitor_kill_round(11, None)[0] is False
     # 未知档也按 veto 节奏打点（首过 idle 门槛一次 + 每 12 轮提醒），不静默。
-    assert bok._monitor_kill_round(12, None) == (False, True)
+    assert bok.proc._monitor_kill_round(12, None) == (False, True)
 
 
 def test_monitor_kill_round_zero_still_uses_idle_threshold() -> None:
     """active_calls=0（确认无在途）→ 仍按 idle 门槛补拉（保守修不误伤真死 worker）。"""
-    assert bok._monitor_kill_round(1, 0) == (False, False)
-    assert bok._monitor_kill_round(2, 0) == (True, False)
+    assert bok.proc._monitor_kill_round(1, 0) == (False, False)
+    assert bok.proc._monitor_kill_round(2, 0) == (True, False)
     # 在途 >0 恒不杀（G3 硬 veto）。
-    assert bok._monitor_kill_round(99, 1)[0] is False
+    assert bok.proc._monitor_kill_round(99, 1)[0] is False
 
 
 def test_monitor_kill_round_source_pins_none_guard() -> None:
     """源码 pin：None 的显式保守分支必须在 `if not active_calls` 之前。"""
-    src = inspect.getsource(bok._monitor_kill_round)
+    src = inspect.getsource(bok.proc._monitor_kill_round)
     assert "active_calls is None" in src, (
         "_monitor_kill_round must special-case None (CP unreachable) before the "
         "falsy `if not active_calls` branch")

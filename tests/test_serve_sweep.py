@@ -93,7 +93,7 @@ def test_sweep_skips_healthy_identity_match(monkeypatch, tmp_path, capsys):
         ps_cmd="python -m uvicorn control_plane.main:app --port 8000",
         healthy=True,
     )
-    swept = bok._sweep_orphan_listeners(kill=True)
+    swept = bok.proc._sweep_orphan_listeners(kill=True)
     assert swept == []
     assert killed == []  # 健康即非孤儿：kill=True 也绝不动手
     assert probed == [8000]  # 动手前先做健康探测
@@ -109,7 +109,7 @@ def test_sweep_harvests_unhealthy_identity_match(monkeypatch, tmp_path, capsys):
         ps_cmd="python -m qwen3-asr-sidecar.app --port 8787",
         healthy=False,
     )
-    swept = bok._sweep_orphan_listeners(kill=True)
+    swept = bok.proc._sweep_orphan_listeners(kill=True)
     assert swept and swept[0][0] == 8787 and swept[0][2] == _FAKE_PID
     assert killed == [("killpg", 7000 + _FAKE_PID)]
     assert "left alone" not in capsys.readouterr().err
@@ -123,7 +123,7 @@ def test_sweep_leaves_identity_mismatch_alone(monkeypatch, tmp_path, capsys):
         ps_cmd="/usr/sbin/some-other-server --port 8000",
         healthy=False,  # 即使探测不健康，身份不符也绝不动手
     )
-    swept = bok._sweep_orphan_listeners(kill=True)
+    swept = bok.proc._sweep_orphan_listeners(kill=True)
     assert swept == []
     assert killed == []
     assert probed == []  # 身份闸在健康闸之前：复核不过根本不探测
@@ -138,7 +138,7 @@ def test_sweep_dry_run_reports_left_alone(monkeypatch, tmp_path, capsys):
         ps_cmd="mlx_lm.server --model /models/Qwen3.5-4B --port 1235",
         healthy=True,
     )
-    swept = bok._sweep_orphan_listeners(kill=False)
+    swept = bok.proc._sweep_orphan_listeners(kill=False)
     assert swept == []
     assert killed == []
     assert "healthy — left alone" in capsys.readouterr().err
@@ -152,7 +152,7 @@ def test_sweep_dry_run_lists_unhealthy(monkeypatch, tmp_path, capsys):
         ps_cmd="python -m qwen3-tts-sidecar.app --port 8788",
         healthy=False,
     )
-    swept = bok._sweep_orphan_listeners(kill=False)
+    swept = bok.proc._sweep_orphan_listeners(kill=False)
     assert swept and swept[0][0] == 8788 and swept[0][2] == _FAKE_PID
     assert killed == []
 
@@ -239,7 +239,7 @@ def test_sweep_down_semantics_harvests_even_healthy(monkeypatch, tmp_path):
         ps_cmd="python -m uvicorn control_plane.main:app --port 8000",
         healthy=True,
     )
-    swept = bok._sweep_orphan_listeners(kill=True, healthy_ok=False)
+    swept = bok.proc._sweep_orphan_listeners(kill=True, healthy_ok=False)
     assert swept == [(8000, "python -m uvicorn control_plane.main:app --port 8000"[:60], _FAKE_PID)]
     assert killed == [("killpg", 7000 + _FAKE_PID)]
     assert probed == []  # down 档根本不做健康探测
@@ -255,7 +255,7 @@ def test_sweep_spares_foreign_tree_stamped_process(monkeypatch, tmp_path, capsys
         healthy=True, ps_lstart=_MARKER_LSTART,
     )
     _write_stamp(app_root, _FAKE_PID, _FOREIGN_ROOT)
-    swept = bok._sweep_orphan_listeners(kill=True)
+    swept = bok.proc._sweep_orphan_listeners(kill=True)
     assert swept == []
     assert killed == []
     assert probed == []  # 来源闸在健康闸之前：外来根本不探测
@@ -272,7 +272,7 @@ def test_down_spares_foreign_tree_stamped_process(monkeypatch, tmp_path, capsys)
         healthy=True, ps_lstart=_MARKER_LSTART,
     )
     _write_stamp(app_root, _FAKE_PID, _FOREIGN_ROOT)
-    swept = bok._sweep_orphan_listeners(kill=True, healthy_ok=False)
+    swept = bok.proc._sweep_orphan_listeners(kill=True, healthy_ok=False)
     assert swept == []
     assert killed == []
     assert probed == []
@@ -288,7 +288,7 @@ def test_sweep_harvests_own_tree_stamped_unhealthy(monkeypatch, tmp_path):
         healthy=False, ps_lstart=_MARKER_LSTART,
     )
     _write_stamp(app_root, _FAKE_PID, str(bok.ROOT))
-    swept = bok._sweep_orphan_listeners(kill=True)
+    swept = bok.proc._sweep_orphan_listeners(kill=True)
     assert swept and swept[0][0] == 8787 and swept[0][2] == _FAKE_PID
     assert killed == [("killpg", 7000 + _FAKE_PID)]
     assert probed == [8787]
@@ -304,7 +304,7 @@ def test_down_harvests_own_tree_stamped_even_healthy(monkeypatch, tmp_path):
         healthy=True, ps_lstart=_MARKER_LSTART,
     )
     _write_stamp(app_root, _FAKE_PID, str(bok.ROOT))
-    swept = bok._sweep_orphan_listeners(kill=True, healthy_ok=False)
+    swept = bok.proc._sweep_orphan_listeners(kill=True, healthy_ok=False)
     assert swept and swept[0][0] == 8000
     assert killed == [("killpg", 7000 + _FAKE_PID)]
     assert probed == []
@@ -320,7 +320,7 @@ def test_recycled_pid_stamp_rejected_falls_to_health_gate(monkeypatch, tmp_path,
         healthy=True, ps_lstart="Mon Sep  1 00:00:00 2025",  # ≠ marker 记录
     )
     _write_stamp(app_root, _FAKE_PID, _FOREIGN_ROOT)  # 若串号误信会误判他树
-    swept = bok._sweep_orphan_listeners(kill=True)
+    swept = bok.proc._sweep_orphan_listeners(kill=True)
     assert swept == []
     assert killed == []
     assert probed == [8000]  # 来源未知 → 健康闸接手
@@ -337,17 +337,17 @@ def test_process_serve_root_marker_branches(monkeypatch, tmp_path):
     patch_bok(monkeypatch, "_ps_field", lambda pid, field: _MARKER_LSTART)
 
     _write_stamp(app_root, 101, str(bok.ROOT))
-    assert bok._process_serve_root(101) == str(bok.ROOT)
+    assert bok.proc._process_serve_root(101) == str(bok.ROOT)
 
     _write_stamp(app_root, 102, _FOREIGN_ROOT, "Mon Sep  1 00:00:00 2025")
-    assert bok._process_serve_root(102) == ""  # lstart 对不上=pid 已复用
+    assert bok.proc._process_serve_root(102) == ""  # lstart 对不上=pid 已复用
 
     _write_stamp(app_root, 103, _FOREIGN_ROOT, "")  # 落笔时 ps 失败的残缺标记
-    assert bok._process_serve_root(103) == ""
+    assert bok.proc._process_serve_root(103) == ""
 
     (app_root / "run" / "proc-104.root").write_text("no-tab-garbage\n")
-    assert bok._process_serve_root(104) == ""
-    assert bok._process_serve_root(105) == ""  # 无标记=未知
+    assert bok.proc._process_serve_root(104) == ""
+    assert bok.proc._process_serve_root(105) == ""  # 无标记=未知
 
 
 def test_start_proc_writes_env_stamp_and_marker(monkeypatch, tmp_path):
@@ -383,7 +383,7 @@ def test_start_proc_writes_env_stamp_and_marker(monkeypatch, tmp_path):
     assert raw.startswith(str(bok.ROOT) + "\t")  # 格式=ROOT<TAB>lstart
     assert raw.endswith("\n")
     # 桩环境 lstart 拿不到（空第二字段）→ 来源判定必须落「未知」而非误信。
-    assert bok._process_serve_root(_FAKE_PID) == ""
+    assert bok.proc._process_serve_root(_FAKE_PID) == ""
 
 
 def test_stale_root_markers_cleaned(monkeypatch, tmp_path):
@@ -392,7 +392,7 @@ def test_stale_root_markers_cleaned(monkeypatch, tmp_path):
         monkeypatch, tmp_path, lsof_out={}, ps_cmd="", healthy=False, ps_alive_rc=1,
     )
     _write_stamp(app_root, 999001, str(bok.ROOT))
-    assert bok._sweep_orphan_listeners(kill=True) == []
+    assert bok.proc._sweep_orphan_listeners(kill=True) == []
     assert not (app_root / "run" / "proc-999001.root").exists()
     assert killed == []
 
@@ -403,7 +403,7 @@ def test_live_root_markers_kept(monkeypatch, tmp_path):
         monkeypatch, tmp_path, lsof_out={}, ps_cmd="", healthy=False, ps_alive_rc=0,
     )
     _write_stamp(app_root, 999002, str(bok.ROOT))
-    assert bok._sweep_orphan_listeners(kill=True) == []
+    assert bok.proc._sweep_orphan_listeners(kill=True) == []
     assert (app_root / "run" / "proc-999002.root").exists()
 
 
