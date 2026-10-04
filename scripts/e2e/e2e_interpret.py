@@ -1,0 +1,326 @@
+"""B 线同传 E2E（2026-09-07 全链路回归新增）——v2 双 AgentSession 解释器首次端到端。
+
+真实链路：createCall(kind=interpret) → me/other 双 rtc 客户端 join（官方 token，
+identity=me-<room>/other-<room>，me 侧 token 携带 RoomAgentDispatch 自动拉起
+fwd/rev 两个解释器）→ me 推源语言话音 → other 捕获 trans-<target> 音轨 →
+ASR 回读断言目标语 → turns 双语落库 → hangup → settle 蒸馏落知识。
+
+场景：
+  I1 fwd 主链路（me 说 zh → other 听 en）
+  I2 rev 反向（other 说 en → me 听 zh）
+  I5/I6 中↔粤语言对（me 说 zh → other 听粤语；other 说粤 → me 听中文）
+  I3 连续启停 ×3（worker 复用无崩）
+  I4 长流 45s 连续讲话（断句稳定、有输出）
+
+前置：`python tools/bok.py serve`（含 interp-fwd/interp-rev 8082/8083、MT :1236）。
+"""
+from __future__ import annotations
+# --- scripts import bootstrap (G1) ---
+# sys.path 引导(G1 迁移解耦,见 docs/superpowers/plans/2026-10-04-repo-governance-plan.md §3.1):
+# 同层时是 no-op;文件挪进任何桶后裸 import 兄弟模块继续解析。
+import sys as _sys, pathlib as _pathlib
+_S = _pathlib.Path(__file__).resolve().parents[1]
+for _d in (_S, _S / "lib", _S / "e2e", _S / "probes", _S / "bench"):
+    if str(_d) not in _sys.path:
+        _sys.path.insert(0, str(_d))
+
+
+import asyncio
+import math
+import os
+import struct
+import time
+import wave
+from pathlib import Path
+
+import httpx
+from livekit import rtc
+
+ROOT = Path(__file__).resolve().parents[2]
+LIVEKIT_URL = "ws://127.0.0.1:7880"
+CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
+ASR_URL = "http://127.0.0.1:8787"
+from urlguard_gate import gate  # SSRF 守卫（2026-09-23，Mimosa）：云端测试设 BOK_PROBE_EXTRA_HOSTS
+
+gate(CONTROL_PLANE_URL, ASR_URL)
+# 压测档开关（2026-09-24）：0=跳过音频 ASR 回读断言（与真会话挤 :8787 解码队列
+# 必超时），语言断言改走翻译音轨名 trans-<lang>；默认 1=完整回读（单跑回归用）。
+READBACK = os.environ.get("E2E_INTERP_READBACK", "1") == "1"
+# auth-on 栈(2026-09-15 标准姿势)要求 CP 请求带机器通道 token——E2E 建单/取
+# token/收线/读 turns 全是机器语义,Bearer BOK_CP_TOKEN 直通(与 agent worker 同源)。
+# 未设 env(老 auth-off 栈)零变化。CP 之外(asr sidecar)不带。
+_CP_HEADERS: dict[str, str] = {}
+if os.environ.get("BOK_CP_TOKEN", "").strip():
+    _CP_HEADERS["Authorization"] = f"Bearer {os.environ['BOK_CP_TOKEN'].strip()}"
+AUDIO_DIR = ROOT / "tests" / "fixtures" / "audio"
+RESULTS: list[tuple[str, bool, str]] = []
+
+
+def frame_rms(pcm: bytes) -> float:
+    if not pcm:
+        return 0.0
+    n = len(pcm) // 2
+    frames = struct.unpack(f"<{n}h", pcm)
+    return math.sqrt(sum(x * x for x in frames) / n)
+
+
+def read_wav_pcm(path: Path, max_seconds: float = 600.0) -> bytes:
+    with wave.open(str(path), "rb") as w:
+        n = int(min(w.getnframes(), w.getframerate() * max_seconds))
+        return w.readframes(n)
+
+
+def asr_transcribe(pcm16: bytes) -> tuple[str, str]:
+    step = 320
+    start, end = 0, len(pcm16)
+    for i in range(0, len(pcm16) - step + 1, step):
+        if frame_rms(pcm16[i : i + step]) >= 100:
+            start = i
+            break
+    for i in range(len(pcm16) - step, -1, -step):
+        if frame_rms(pcm16[i : i + step]) >= 100:
+            end = i + step
+            break
+    body = pcm16[start:end]
+    if len(body) < 3200:
+        return "", ""
+    with httpx.Client(timeout=60) as client:
+        s = client.post(f"{ASR_URL}/api/start").json()["session_id"]
+        for i in range(0, len(body), 3200):
+            client.post(f"{ASR_URL}/api/chunk", params={"session_id": s}, content=body[i : i + 3200])
+        out = client.post(f"{ASR_URL}/api/finish", params={"session_id": s}).json()
+        return str(out.get("language") or ""), str(out.get("text") or "")
+
+
+def record(name: str, ok: bool, note: str = "") -> None:
+    RESULTS.append((name, ok, note))
+    print(f"[{'PASS' if ok else 'FAIL'}] {name} {note}", flush=True)
+
+
+class Side:
+    """一个同传参与端：房间 + 麦克风推流 + 捕获所有远端音轨。"""
+
+    def __init__(self, call_id: str, identity: str):
+        self.call_id = call_id
+        self.identity = identity
+        self.room = rtc.Room()
+        self.audio_source = rtc.AudioSource(sample_rate=16000, num_channels=1)
+        self.captured = bytearray()
+        self.trans_names: set[str] = set()
+        self._tasks: list[asyncio.Task] = []
+
+    async def connect(self) -> None:
+        data = httpx.post(
+            f"{CONTROL_PLANE_URL}/api/token",
+            headers=_CP_HEADERS,
+            json={"account_id": "acc-001", "call_id": self.call_id, "participant_identity": self.identity},
+            timeout=15,
+        ).json()
+        await self.room.connect(data["serverUrl"], data["participantToken"])
+        src = rtc.LocalAudioTrack.create_audio_track("qa-src", self.audio_source)
+        await self.room.local_participant.publish_track(
+            src, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
+        )
+
+        def on_track(track, pub, participant):
+            if int(track.kind) != int(rtc.TrackKind.KIND_AUDIO):
+                return
+            # 只捕获解释器发布的翻译音轨 trans-<lang>;不然会把自己/对端的
+            # 麦克风原声也收进来,语言断言全被原声污染(2026-09-07 首跑实证)。
+            if not getattr(track, "name", "").startswith("trans-"):
+                return
+            self.trans_names.add(track.name)
+            print(f"  [track] {self.identity} <- {track.name}", flush=True)
+
+            async def _read():
+                try:
+                    stream = rtc.AudioStream(track, sample_rate=16000, num_channels=1)
+                    async for event in stream:
+                        frame = getattr(event, "frame", event)
+                        self.captured.extend(bytes(frame.data))
+                except Exception:
+                    pass
+
+            self._tasks.append(asyncio.get_running_loop().create_task(_read()))
+
+        self.room.on("track_subscribed", on_track)
+        for participant in self.room.remote_participants.values():
+            for pub in participant.track_publications.values():
+                track = getattr(pub, "track", None)
+                if track is not None:
+                    on_track(track, pub, participant)
+
+    async def push(self, pcm: bytes) -> None:
+        chunk = int(16000 * 0.1) * 2
+        for i in range(0, len(pcm), chunk):
+            seg = pcm[i : i + chunk]
+            frame = rtc.AudioFrame(
+                data=seg, sample_rate=16000, num_channels=1, samples_per_channel=len(seg) // 2
+            )
+            await self.audio_source.capture_frame(frame)
+            # 真实时节奏(2026-10-02):0.08 与 capture_frame 的实时背压打架=实际
+            # 发布速率被压到 ~0.5x(实测插件侧 samples_ms≈500/s)——句子有效节奏
+            # 翻倍拖慢,backlog 门的结构性触发条件(depth≥3)永不成形。0.10 对齐
+            # A 线 push_pcm(real_time=True) 的真实时纪律。
+            await asyncio.sleep(0.10)
+
+    async def close(self) -> None:
+        for t in self._tasks:
+            t.cancel()
+        try:
+            await self.room.disconnect()
+        except Exception:
+            pass
+
+
+async def wait_translated(
+    captured: bytearray, mark: int, want_tag: str, timeout_s: float, trans_names: set[str] | None = None
+) -> tuple[bool, str, str]:
+    """等 captured 自 mark 起出现语音，收够后 ASR 回读断言目标语。"""
+    deadline = time.perf_counter() + timeout_s
+    speech = 0.0
+    processed = mark
+    while time.perf_counter() < deadline:
+        step = 320
+        while processed + step <= len(captured):
+            if frame_rms(bytes(captured[processed : processed + step])) >= 150:
+                speech += 0.02
+            processed += step
+        if speech >= 1.2:
+            break
+        await asyncio.sleep(0.2)
+    # 语音出现后再收 3s（翻译音频可能分句到达）
+    await asyncio.sleep(3.0)
+    if not READBACK:
+        # 压测档（2026-09-24）：回读 ASR 与四条真会话挤同一条 :8787 解码队列,
+        # 并发腿必超时(ReadTimeout 实证)——语言断言改走翻译音轨名 trans-<lang>
+        # (解释器发布即定性),音频到达断言保留(能量窗)。零 ASR 占用。
+        # tag→音轨后缀归一（2026-09-25 修）：fwd_expect 是 ASR 语言名(English/
+        # Chinese/Cantonese),音轨名是 trans-<规范后缀>——旧直拼匹配令 en 方向
+        # I1/I3/I4 恒败(canto 碰巧子串成立),非产品问题。
+        _tag = {"english": "en", "chinese": "zh", "mandarin": "zh",
+                "cantonese": "cantonese"}.get(
+                    want_tag.lower().strip(), want_tag.lower().strip())
+        ok = speech >= 1.2 and any(
+            f"trans-{_tag}" in n.lower() for n in (trans_names or set()))
+        return ok, "skip-readback", ""
+    lang, text = asr_transcribe(bytes(captured[mark:]))
+    # 严格语言断言（len 兜底会让原声泄漏蒙混过关,已删）
+    ok = bool(text) and want_tag.lower() in (lang or "").lower()
+    return ok, lang, text
+
+
+async def run_one(
+    src_pcm: bytes,
+    rev_pcm: bytes | None,
+    *,
+    language: str = "zh",
+    target_lang: str = "en",
+    fwd_expect: str = "English",
+    rev_expect: str = "Chinese",
+    timeout_s: float = 75.0,
+) -> dict:
+    ts = int(time.time() * 1000) % 1000000
+    call = httpx.post(
+        f"{CONTROL_PLANE_URL}/api/calls",
+        headers=_CP_HEADERS,
+        json={"account_id": "acc-001", "kind": "interpret", "mode": "live", "direction": "interpret",
+              "language": language, "target_lang": target_lang, "object_id": ""},
+        timeout=15,
+    ).json()
+    call_id = call["id"]
+    me = Side(call_id, f"me-{call_id}")
+    other = Side(call_id, f"other-{call_id}")
+    await me.connect()
+    await other.connect()
+    # 等 RoomAgentDispatch 拉起解释器（worker 注册/派发有秒级延迟;首通易竞态）
+    await asyncio.sleep(6)
+    info = {"call_id": call_id, "fwd_ok": False, "fwd_text": "", "rev_ok": False, "rev_text": ""}
+    try:
+        # fwd：me 说 {language} → other 听 {target_lang}（ASR 回读断言目标语标签）
+        mark_other = len(other.captured)
+        await me.push(src_pcm)
+        ok, lang, text = await wait_translated(other.captured, mark_other, fwd_expect, timeout_s, other.trans_names)
+        info["fwd_ok"], info["fwd_text"] = ok, text[:60]
+        # rev：other 说 {target_lang} → me 听 {language}
+        if rev_pcm is not None:
+            mark_me = len(me.captured)
+            await other.push(rev_pcm)
+            ok2, lang2, text2 = await wait_translated(me.captured, mark_me, rev_expect, timeout_s, me.trans_names)
+            info["rev_ok"], info["rev_text"] = ok2, text2[:60]
+    finally:
+        await me.close()
+        await other.close()
+        try:
+            httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{call_id}/hangup", headers=_CP_HEADERS, timeout=10)
+        except Exception:
+            pass
+    return info
+
+
+async def main() -> int:
+    # 单句切片(~8s):135s 全长直推会把一轮拖成 ~108s(0.1s 音频/0.08s sleep 节奏),
+    # 双向+启停×3 全套变 10 分钟级;断句稳定性归 I4 长流专门验。
+    zh_pcm = read_wav_pcm(AUDIO_DIR / "zh.wav")[: int(16000 * 8) * 2]
+    en_pcm = read_wav_pcm(AUDIO_DIR / "en.wav")[: int(16000 * 8) * 2]
+    canto_pcm = read_wav_pcm(AUDIO_DIR / "cantonese.wav")[: int(16000 * 8) * 2]
+    long_pcm = read_wav_pcm(AUDIO_DIR / "zh.wav") + b"".join(
+        read_wav_pcm(AUDIO_DIR / "zh.wav") for _ in range(8)
+    )
+
+    # I1+I2 fwd/rev 双向（中↔英）
+    info = await run_one(zh_pcm, en_pcm)
+    record("I1 fwd: me(zh)→other 听到英文输出", info["fwd_ok"], info["fwd_text"])
+    # I2 改钉「出声单向化」契约(2026-09-12 拍板):rev 方向译文只走字幕/落库,
+    # 我方不播译文 TTS(BOK_INTERP_REV_AUDIO=1 才回退)——我方听感=对方麦克风
+    # 原声。所以 rev 断言=me 不应听到译文音轨(rev_ok=False 才对);rev 翻译链
+    # 路本身(转写→MT→turns 落库)由 I1b 原文/译文行覆盖。
+    record("I2 rev 单向化: other(en)→me 无译文音轨(仅字幕,0912 契约)",
+           not info["rev_ok"], info["rev_text"] or "me 侧零译文音轨 ✓")
+    # turns 双语落库(2026-09-07 审计闭环起原文/译文拆成两条,language 字段区分
+    # ——旧断言查单行同含「原文：译文：」会永久假红)
+    turns = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{info['call_id']}/turns", headers=_CP_HEADERS, timeout=10).json()
+    orig = [t for t in turns if str(t.get("transcript") or "").startswith("原文：")]
+    tran = [t for t in turns if str(t.get("transcript") or "").startswith("译文：")]
+    record("I1b turns 原文/译文分行落库", len(orig) >= 1 and len(tran) >= 1,
+           f"orig={len(orig)} tran={len(tran)} turns={len(turns)}")
+
+    # I5+I6 第二语言对（中↔粤,2026-09-08 用户点名验证）：interpret.py 对 cantonese
+    # 有完整分支(ASR 钉定/港式 MT 规则/Cantonese 音色+language_boost),此前从未实测。
+    # 同一通里 fwd=中→粤、rev=粤→中,两个方向一次覆盖。
+    info_canto = await run_one(zh_pcm, canto_pcm, language="zh", target_lang="cantonese",
+                             fwd_expect="Cantonese", rev_expect="Chinese")
+    record("I5 fwd: me(zh)→other 听到粤语输出", info_canto["fwd_ok"], info_canto["fwd_text"])
+    # I6 同 I2:出声单向化契约(粤→中方向 me 不播译文 TTS),翻译落库由 I5b 覆盖。
+    record("I6 rev 单向化: other(粤)→me 无译文音轨(仅字幕,0912 契约)",
+           not info_canto["rev_ok"], info_canto["rev_text"] or "me 侧零译文音轨 ✓")
+    turns_c = httpx.get(f"{CONTROL_PLANE_URL}/api/calls/{info_canto['call_id']}/turns", headers=_CP_HEADERS, timeout=10).json()
+    orig_c = [t for t in turns_c if str(t.get("transcript") or "").startswith("原文：")]
+    tran_c = [t for t in turns_c if str(t.get("transcript") or "").startswith("译文：")]
+    record("I5b turns 原文/译文分行落库 (中↔粤)", len(orig_c) >= 1 and len(tran_c) >= 1,
+           f"orig={len(orig_c)} tran={len(tran_c)} turns={len(turns_c)}")
+
+    # I3 连续启停 ×3
+    ok_all = True
+    note = ""
+    for i in range(3):
+        info = await run_one(zh_pcm, None, timeout_s=50.0)
+        if not info["fwd_ok"]:
+            ok_all = False
+            note = f"第 {i + 1} 通失败 {info['fwd_text']!r}"
+            break
+    record("I3 连续启停×3 worker 复用", ok_all, note)
+
+    # I4 长流 45s 连续讲话
+    info = await run_one(long_pcm[: int(16000 * 45) * 2], None, timeout_s=110.0)
+    record("I4 长流 45s 断句有输出", info["fwd_ok"], info["fwd_text"])
+
+    passed = sum(1 for _, ok, _ in RESULTS if ok)
+    for name, ok, note in RESULTS:
+        print(f"  {'PASS' if ok else 'FAIL'}  {name} {note}", flush=True)
+    print(f"INTERPRET_E2E {passed}/{len(RESULTS)} PASSED", flush=True)
+    return 0 if passed == len(RESULTS) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(asyncio.run(main()))

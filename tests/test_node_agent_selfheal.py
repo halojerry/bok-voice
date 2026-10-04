@@ -91,7 +91,7 @@ def test_ensure_token_repairs_stale_0644_state_file(monkeypatch, tmp_path):
 
 # ---- Task 6：远程停机开关服从（root 吊销=停栈退出 / license 吊销=退避致命 /
 # auto_clone=复活保留 / 注册 sticky=致命），wire 契约=control_plane/main.py
-# node_heartbeat 401 detail 塑形 + scripts/probe_killswitch.py ④⑤⑦⑨。----
+# node_heartbeat 401 detail 塑形 + scripts/probes/probe_killswitch.py ④⑤⑦⑨。----
 
 _SHUTDOWN_BODY = {"detail": {"reason": "node revoked", "action": "shutdown"}}
 

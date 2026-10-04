@@ -1,0 +1,229 @@
+"""音频链路并发压测：4 路真实通话（各自 call/token/房间）同时进行 3 轮对话。
+
+单机 mlx 设计并发参照 bok.py prompt-cache 注释（4-6 路）。输出每轮
+「客户说完→AI 开口」真实口径时延（扣除推音频耗时）与错误率。
+运行：<runtime-python> scripts/bench/load_audio_concurrency.py
+"""
+
+from __future__ import annotations
+# --- scripts import bootstrap (G1) ---
+# sys.path 引导(G1 迁移解耦,见 docs/superpowers/plans/2026-10-04-repo-governance-plan.md §3.1):
+# 同层时是 no-op;文件挪进任何桶后裸 import 兄弟模块继续解析。
+import sys as _sys, pathlib as _pathlib
+_S = _pathlib.Path(__file__).resolve().parents[1]
+for _d in (_S, _S / "lib", _S / "e2e", _S / "probes", _S / "bench"):
+    if str(_d) not in _sys.path:
+        _sys.path.insert(0, str(_d))
+
+
+import asyncio
+import math
+import os
+import struct
+import time
+import wave
+from pathlib import Path
+
+import httpx
+from livekit import rtc
+
+ROOT = Path(__file__).resolve().parents[2]
+CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
+from urlguard_gate import gate  # SSRF 守卫（2026-09-23，Mimosa）：云端测试设 BOK_PROBE_EXTRA_HOSTS
+
+gate(CONTROL_PLANE_URL)
+# auth-on 栈(2026-09-15 标准姿势)要求 CP 请求带机器通道 token——压测建对象/建
+# 人设/建单/取 token/收线全是机器语义,Bearer BOK_CP_TOKEN 直通(与 agent worker
+# 同源)。未设 env(老 auth-off 栈)零变化。
+_CP_HEADERS: dict[str, str] = {}
+if os.environ.get("BOK_CP_TOKEN", "").strip():
+    _CP_HEADERS["Authorization"] = f"Bearer {os.environ['BOK_CP_TOKEN'].strip()}"
+AUDIO_DIR = ROOT / "tests" / "fixtures" / "audio"
+ROADS = int(os.environ.get("LOAD_ROADS", "4"))
+TURNS = int(os.environ.get("LOAD_TURNS", "3"))
+LANG = os.environ.get("LOAD_LANG", "cantonese")
+AUDIO = os.environ.get("LOAD_AUDIO", "cantonese.wav")
+# 钉死话术模板（2026-09-24）：不设=CP 端 auto-pick（可能抓旧赔偿话术）；
+# 设 LOAD_TEMPLATE_ID=<id> → POST /api/calls 显式指定（与 e2e_real_customer 同源语义）。
+TEMPLATE_ID = os.environ.get("LOAD_TEMPLATE_ID", "").strip()
+
+
+def frame_rms(pcm: bytes) -> float:
+    if not pcm:
+        return 0.0
+    n = len(pcm) // 2
+    frames = struct.unpack(f"<{n}h", pcm)
+    return math.sqrt(sum(x * x for x in frames) / n)
+
+
+def read_pcm16(max_seconds: float = 4.0) -> bytes:
+    """读取面：目标恒为模块常量表里的 fixtures 文件（无路径参数=污点面清零），
+    resolve 后经 Path.open 文件对象喂 wave。"""
+    p = (AUDIO_DIR / AUDIO).resolve()
+    with p.open("rb") as fh:
+        with wave.open(fh, "rb") as w:
+            n = int(min(w.getnframes(), w.getframerate() * max_seconds))
+            return w.readframes(n)
+
+
+async def road(idx: int, results: list) -> None:
+    lang = LANG
+    pcm = read_pcm16()
+    obj = httpx.post(
+        f"{CONTROL_PLANE_URL}/api/objects?account_id=acc-001",
+        headers=_CP_HEADERS,
+        json={"display_name": f"LOAD-audio-{idx}-{int(time.time())}", "role_template": "buyer", "language": lang},
+        timeout=10,
+    ).json()
+    persona = httpx.post(
+        f"{CONTROL_PLANE_URL}/api/personas?account_id=acc-001",
+        headers=_CP_HEADERS,
+        json={"name": "压测客服", "language": lang, "tone": "礼貌专业"},
+        timeout=10,
+    ).json()
+    call_body = {"account_id": "acc-001", "object_id": obj["id"], "persona_id": persona["id"],
+                 "mode": "live", "direction": "webrtc", "language": lang}
+    if TEMPLATE_ID:
+        call_body["template_id"] = TEMPLATE_ID
+    call = httpx.post(
+        f"{CONTROL_PLANE_URL}/api/calls",
+        headers=_CP_HEADERS,
+        json=call_body,
+        timeout=10,
+    ).json()
+    room_name = call["id"]
+    data = httpx.post(f"{CONTROL_PLANE_URL}/api/token",
+                      headers=_CP_HEADERS,
+                      json={"account_id": "acc-001", "call_id": room_name}, timeout=10).json()
+    room = rtc.Room()
+    agent_audio = bytearray()
+    read_task = None
+
+    def attach(track):
+        if int(track.kind) != int(rtc.TrackKind.KIND_AUDIO) or getattr(track, "name", "") not in ("roomio_audio", "background_audio"):
+            return
+
+        async def _read():
+            stream = rtc.AudioStream(track, sample_rate=16000, num_channels=1)
+            try:
+                async for event in stream:
+                    frame = getattr(event, "frame", event)
+                    agent_audio.extend(bytes(frame.data))
+            finally:
+                await stream.aclose()
+
+        nonlocal read_task
+        read_task = asyncio.get_running_loop().create_task(_read())
+
+    room.on("track_subscribed", attach)
+    try:
+        await room.connect(data["serverUrl"], data["participantToken"])
+        audio_source = rtc.AudioSource(sample_rate=16000, num_channels=1)
+        src = rtc.LocalAudioTrack.create_audio_track(f"load-{idx}", audio_source)
+        await room.local_participant.publish_track(
+            src, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE))
+        # 等开场白结束（1s 语音+3s 静音）
+        processed, speech, silent = 0, 0.0, 0.0
+        deadline = time.perf_counter() + 40
+        while time.perf_counter() < deadline:
+            step = 320
+            while processed + step <= len(agent_audio):
+                if frame_rms(agent_audio[processed: processed + step]) >= 200:
+                    speech += 0.02; silent = 0.0
+                else:
+                    silent += 0.02
+                processed += step
+            if speech >= 1.0 and silent >= 3.0:
+                break
+            await asyncio.sleep(0.5)
+        agent_audio.clear()
+
+        for turn in range(1, TURNS + 1):
+            agent_audio.clear()
+            processed = 0
+            t0 = time.perf_counter()
+            chunk = int(16000 * 0.1) * 2
+            pushed = 0
+            for i in range(0, len(pcm), chunk):
+                seg = pcm[i:i + chunk]
+                frame = rtc.AudioFrame(data=seg, sample_rate=16000, num_channels=1,
+                                       samples_per_channel=len(seg) // 2)
+                await audio_source.capture_frame(frame)
+                await asyncio.sleep(0.08)
+                pushed += len(seg)
+            push_s = pushed / 32000  # 客户音频时长(秒)
+            # 等首声
+            first_ms = None
+            deadline = time.perf_counter() + 45
+            while time.perf_counter() < deadline:
+                step = 320
+                while processed + step <= len(agent_audio):
+                    if frame_rms(agent_audio[processed: processed + step]) >= 200:
+                        first_ms = (time.perf_counter() - t0) * 1000
+                        break
+                    processed += step
+                if first_ms:
+                    break
+                await asyncio.sleep(0.2)
+            # 等静音 5s 收轮
+            silent = 0.0
+            deadline = time.perf_counter() + 60
+            while time.perf_counter() < deadline:
+                step = 320
+                while processed + step <= len(agent_audio):
+                    if frame_rms(agent_audio[processed: processed + step]) >= 200:
+                        silent = 0.0
+                    else:
+                        silent += 0.02
+                    processed += step
+                if silent >= 5.0:
+                    break
+                await asyncio.sleep(0.5)
+            # 真实口径 = 首声时刻 − 推音频耗时(说完之后)
+            real_ms = (first_ms - push_s * 1000) if first_ms else None
+            results.append({"road": idx, "turn": turn, "first_ms": first_ms, "real_ms": real_ms})
+            print(f"[road{idx} t{turn}] first={first_ms and round(first_ms)}ms "
+                  f"real_after_speech={real_ms and round(real_ms)}ms", flush=True)
+    except Exception as exc:
+        results.append({"road": idx, "error": repr(exc)})
+        print(f"[road{idx}] ERROR {exc!r}", flush=True)
+    finally:
+        try:
+            await room.disconnect()
+        except Exception:
+            pass
+        httpx.post(f"{CONTROL_PLANE_URL}/api/calls/{room_name}/hangup",
+                   headers=_CP_HEADERS, timeout=5)
+
+
+async def main() -> None:
+    results: list = []
+    t0 = time.perf_counter()
+    await asyncio.gather(*(road(i, results) for i in range(ROADS)))
+    wall = time.perf_counter() - t0
+    # 无异常但整轮零首声(死路)=不得计 ok(2026-09-22 实弹:单 worker prod 档
+    # load_threshold=0.7,冷启后第一波 4 路突发里第 4 路 job 未派发,headline 曾
+    # 假绿 PASS ok=12/12 而该路三轮 first 全 None——判据钉死:有首声才算过)。
+    ok = [r for r in results if "error" not in r and r.get("first_ms") is not None]
+    mute = [r for r in results if "error" not in r and r.get("first_ms") is None]
+    real = sorted(r["real_ms"] for r in ok if r.get("real_ms"))
+    errs = [r for r in results if "error" in r]
+    p50 = real[len(real) // 2] if real else 0
+    p95 = real[int(len(real) * 0.95)] if real else 0
+    print(
+        f"AUDIO_LOAD {'PASS' if len(ok) == ROADS * TURNS else 'DEGRADED'} "
+        f"roads={ROADS} turns={TURNS} ok={len(ok)}/{ROADS * TURNS} mute={len(mute)} errors={len(errs)} "
+        f"real_after_speech_ms p50={p50:.0f} p95={p95:.0f} wall={wall:.0f}s",
+        flush=True,
+    )
+    if errs:
+        for r in errs:
+            print("  ERR:", r.get("error"), flush=True)
+    if mute:
+        for r in mute:
+            print(f"  MUTE: road={r.get('road')} turn={r.get('turn')} "
+                  f"(无首声:agent 未派发或全程哑)", flush=True)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

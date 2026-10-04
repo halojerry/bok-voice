@@ -20,7 +20,7 @@ from agent_runtime.agent import (  # noqa: E402
 )
 from agent_runtime.flow import FlowController, stall_ladder_level  # noqa: E402
 
-# scripts/e2e_barge_in.py 的真客户插话激励(第一句触发回复/第二句播放中插入打断):
+# scripts/e2e/e2e_barge_in.py 的真客户插话激励(第一句触发回复/第二句播放中插入打断):
 # 打断轮是**合法话头**,碎片车道绝不可以把它截成重问。
 BARGEIN_FIRST = "我件貨爛咗想投訴。"
 BARGEIN_SECOND = "我想先問下賠幾多。"

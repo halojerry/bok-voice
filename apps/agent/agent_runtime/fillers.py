@@ -1,6 +1,6 @@
 """LLM 慢生成轮垫话(2026-09-09 PR-2;2026-09-10 资产化改版;task-14a 人设音色双层)。
 
-垫话=随源码分发的固定资产:固定音色+固定参数(见 scripts/gen_filler_assets.py)
+垫话=随源码分发的固定资产:固定音色+固定参数(见 scripts/seed/gen_filler_assets.py)
 经 MiniMax 预生成 wav,连同 manifest.json 提交在 assets/fillers/——运行时只播
 文件,与人设音色/tts_cache 状态解耦(人设一换也永不哑)。
 
@@ -358,7 +358,7 @@ def filler_backfill_enabled() -> bool:
 
 
 # ---- W2a 分层犹豫垫音(2026-09-23) ----
-# hesitation=资产第六类标签(scripts/gen_filler_assets.py hes_lines 档,三语各 7 条
+# hesitation=资产第六类标签(scripts/seed/gen_filler_assets.py hes_lines 档,三语各 7 条
 # 短呃/中嗯/长查证承诺):真人犹豫声(呃/嗯/let me see)替代每轮同一句罐头应承的
 # 机器感(行业共识,OpenAI Realtime/Sierra)。分类器五类(classify_filler_category)
 # 不产出该类 → 选池以固定概率混入,犹豫池缺失=零行为变化;闸=BOK_FILLER_HESITATION

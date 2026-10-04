@@ -1,4 +1,4 @@
-"""D1 槽位化 actor A/B 台架纯逻辑单测（scripts/ab_slot_actor.py）。
+"""D1 槽位化 actor A/B 台架纯逻辑单测（scripts/bench/ab_slot_actor.py）。
 
 覆盖：臂 env 组装 / 安全闸拒绝 / 汇总聚合 / 尺寸表计算 / 模型路径解析 /
 回包 sanity / live 执行清单。全部离线（不碰运行中的栈）；只有 simulate_call

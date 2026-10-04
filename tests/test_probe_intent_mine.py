@@ -1,4 +1,4 @@
-"""意图候选挖掘探针（`scripts/probe_intent_mine.py`）纯函数测试。
+"""意图候选挖掘探针（`scripts/probes/probe_intent_mine.py`）纯函数测试。
 
 只测**离线可判定**的部分：SSRF guard / 抽样去重 / 宽容 JSON 解析 / 候选清洗合并 /
 **去重合并（P2.1 下轮）** / **平台意图钉死** / **graph doc 组装 + 生产严格校验对齐** /

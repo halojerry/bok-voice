@@ -11,7 +11,7 @@
 不参与释义判定)。
 
 **SSRF 边界(刻意限制不是疏忽)**:`EmbedClient` 只放行环回地址——客户话语
-是敏感数据,embedding 出网违反本仓数据政策。形状参照 scripts/load_intent_catalog.py
+是敏感数据,embedding 出网违反本仓数据政策。形状参照 scripts/seed/load_intent_catalog.py
 `_assert_safe_cp_url`:协议限 http/https + getaddrinfo 解析后逐 IP is_loopback
 校验,非环回在构造期即拒绝。
 """

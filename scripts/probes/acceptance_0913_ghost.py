@@ -25,8 +25,8 @@ from pathlib import Path
 
 import httpx
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps" / "agent"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "apps" / "control-plane"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "apps" / "agent"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "apps" / "control-plane"))
 
 CP = "http://127.0.0.1:8000"
 

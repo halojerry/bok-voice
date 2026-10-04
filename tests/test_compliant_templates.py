@@ -2,7 +2,7 @@
 
 B 稿 → 模板化产物：7 步 × 三语、分支行/注意行走 flow 同源正则解析、未识别
 「→」指令零容忍（否则引擎静默丢弃=分支悄悄失效）、命名不含 e2e/probe
-（探针自动选模依赖）。装载面 scripts/load_compliant_templates.py。
+（探针自动选模依赖）。装载面 scripts/seed/load_compliant_templates.py。
 """
 
 from __future__ import annotations

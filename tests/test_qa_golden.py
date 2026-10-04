@@ -15,7 +15,7 @@ json ``meta.provenance``（真库只读抽样 + agent.log QA_FASTPATH/QA_SEM 实
 验收线按实测钉（回归检测,不钉幻想值）:verbatim 词面 ≥0.95、paraphrase 语义
 ≥0.90、homophone 语义 ≥0.30、并池整体 ≥0.85。语义段 ``:8789`` 不可达时
 skip（离线 CI 零依赖）;汇总读数跑 ``pytest -s`` 可见;阈值标定工具
-``scripts/qa_match_report.py``。
+``scripts/pipeline/qa_match_report.py``。
 """
 
 from __future__ import annotations

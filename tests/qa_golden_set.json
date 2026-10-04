@@ -3,7 +3,7 @@
     "name": "qa-golden-set",
     "version": 1,
     "date": "2026-09-25",
-    "purpose": "QA 快路（qa_gate.QaIndex）匹配器的 golden 回归集 + 阈值标定原料。自包含：不依赖真库/日志，测试与 scripts/qa_match_report.py 用它内建迷你索引。",
+    "purpose": "QA 快路（qa_gate.QaIndex）匹配器的 golden 回归集 + 阈值标定原料。自包含：不依赖真库/日志，测试与 scripts/pipeline/qa_match_report.py 用它内建迷你索引。",
     "contract": "rank(query, *, k=8, floor=0.55, lang=None, step_index=None) -> list[(score, entry_id)]；match(user_text, *, lang, step_index, threshold) -> (entry|None, score)；快道阈值 0.90（只认字面措辞）。",
     "provenance": {
       "db": "/Users/halo/Library/Application Support/BokVoice/bok_voice.db（只读 mode=ro 抽取，2026-09-25）",

@@ -12,7 +12,7 @@
  * 粤语播报音色（香港客户场景粤/普/英都够地道）；下方 label 已按语言分组便于辨认。
  *
  * 维护提示：
- * - 新增音色 ID 先跑 scripts/cache_minimax_auditions.py 批量试听（对官方 t2a_v2
+ * - 新增音色 ID 先跑 scripts/seed/cache_minimax_auditions.py 批量试听（对官方 t2a_v2
  *   真合成落 assets/minimax-auditions/，2054 voice-not-exist 当场现形）；该脚本
  *   正则解析本文件的数组组（`const X: Array<[string, string]> = [` + `["id", "label"],`）
  *   与导出块的 group→lang 映射——改这里的语法两处必须同步。

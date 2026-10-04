@@ -42,7 +42,7 @@ BETA = (os.environ.get("DEEPSEEK_BETA_BASE_URL", "https://api.deepseek.com/beta"
 MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-flash").strip() or "deepseek-flash"
 TIMEOUT = float(os.environ.get("DEEPSEEK_PROBE_TIMEOUT", "90") or 90)
 
-REPORT_DIR = Path(__file__).resolve().parents[1] / "reports" / "deepseek-cloud"
+REPORT_DIR = Path(__file__).resolve().parents[2] / "reports" / "deepseek-cloud"
 
 
 def _headers() -> dict:

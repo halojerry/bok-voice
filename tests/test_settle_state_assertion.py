@@ -22,7 +22,7 @@ CP_SRC = (ROOT / "apps" / "control-plane" / "control_plane" / "main.py").read_te
 AGENT_SRC = (ROOT / "apps" / "agent" / "agent_runtime" / "agent.py").read_text(
     encoding="utf-8"
 )
-PROBE_SRC = (ROOT / "scripts" / "probe_flow_20rounds.py").read_text(encoding="utf-8")
+PROBE_SRC = (ROOT / "scripts" / "probes" / "probe_flow_20rounds.py").read_text(encoding="utf-8")
 
 
 def _rep(fs: str) -> str:

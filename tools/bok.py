@@ -516,7 +516,7 @@ def _llm_draft_flags(current: dict[str, str]) -> list[str]:
     但绝不让 serve 起不来。num-draft-tokens 取官方默认 3,不另设 env(实弹
     调优后再谈)。
 
-    【2026-09-27 隔离 A/B 实弹判死缓期(scripts/probe_llm_draft_ab.py;基准
+    【2026-09-27 隔离 A/B 实弹判死缓期(scripts/probes/probe_llm_draft_ab.py;基准
     读数 TTFT 暖档 141ms / decode tps 70.8)——勿在无新证据时开启】:
     1. mlx-lm 0.31.3 ``speculative_generate_step`` 硬性要求 trimmable prompt
        cache,而 server 的 ArraysCache(--prompt-cache-size 路径)**任何配置
@@ -1337,7 +1337,7 @@ def _spawn_kwargs() -> dict:
 
     POSIX：start_new_session=True 起会话组长，killpg 一组全清。
     Windows：CPython 对 start_new_session 是**静默忽略**（POSIX-only kwarg，
-    见 scripts/probe_windows_lifecycle.py docstring 记录的 CPython 事实），必须
+    见 scripts/probes/probe_windows_lifecycle.py docstring 记录的 CPython 事实），必须
     显式 CREATE_NEW_PROCESS_GROUP 建独立进程组——taskkill /PID <pid> /T /F 才有
     干净的树根可收割；组内子进程也不再收宿主控制台的 Ctrl 事件（服务形态更稳）。
     """
@@ -1653,13 +1653,13 @@ def _control_plane_env(db: Path | str) -> dict[str, str]:
 
 
 def _apply_mlx_template_fix(llm_py: Path) -> None:
-    """mlx_lm 模板生成提示边界归一(幂等,scripts/mlx_lm_template_leak_fix.py)。
+    """mlx_lm 模板生成提示边界归一(幂等,scripts/pipeline/mlx_lm_template_leak_fix.py)。
 
     模板 endfor 后注释块泄漏换行 → 生成/历史模式边界 token 不一致 → 上一轮
     请求永远不是下一轮缓存前缀,命中坍缩回 system 锚点(2026-09-06 token 级
     探针实证 25→48/78)。runtime site-packages 不入 git,重建后由这里重打;
     失败零阻塞(损失跨轮命中而已)。"""
-    script = ROOT / "scripts" / "mlx_lm_template_leak_fix.py"
+    script = ROOT / "scripts" / "pipeline" / "mlx_lm_template_leak_fix.py"
     if not script.exists():
         return
     try:
@@ -2881,7 +2881,7 @@ def _pid_alive(pidfile: Path) -> bool:
     对非 CTRL_C_EVENT/CTRL_BREAK_EVENT 的 sig 一律调 TerminateProcess，探活即
     击杀（活的 monitor 被探死、仍返回 True、_ensure_monitor 误判单例存活跳过
     respawn → 栈从此无人看护）。改用 tasklist 按 PID 查询
-    （scripts/probe_windows_lifecycle.py `_win_pid_alive` 同款；冷路径不缓存；
+    （scripts/probes/probe_windows_lifecycle.py `_win_pid_alive` 同款；冷路径不缓存；
     查询失败保守当存活——宁可不重拉也不误判）。POSIX 分支与旧代码逐字节同款
     （sig 0 在 POSIX 是纯探活）。"""
     try:
@@ -4579,7 +4579,7 @@ def cmd_prod_uninstall(staging_dir: str = "") -> int:
     if (unit_dir / f"{_sch.task_name('bok-model-plane')}.xml").exists():
         names.append("bok-model-plane")
     # /end 只终止任务实例的 Exec 动作进程（本仓恒为 cmd.exe），cmd_up 拉起的
-    # 链式子进程（ASR/TTS/LLM/LiveKit/CP/worker）会存活——scripts/
+    # 链式子进程（ASR/TTS/LLM/LiveKit/CP/worker）会存活——scripts/probes/
     # probe_windows_lifecycle.py B5b 在真 Windows 上断言这一点。顺序：
     # ①逐任务 /end（停动作进程）→ ②按 pidfile 精确清幸存子进程（ours-only；
     # 勿按镜像名杀——python.exe/livekit-server.exe 是共享镜像，会误杀无关

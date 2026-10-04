@@ -18,7 +18,7 @@
 6. **sidecar venv**：`services/*-sidecar/.venv` → symlink `/root/bok-venv`（torch cu13 复用省 3G；代价见 #11 版本冲突）。
 7. **bok serve**（`/root/serve_box.sh`）：自动下载 ASR/TTS 模型（HF 直连可用且快，~3min/模型）。
 8. **真库种子**：Mac `sqlite3 .backup` → 换入 `~/.local/share/BokVoice/bok_voice.db`（模板/对象/QA/凭据全套即得）。
-9. **验证**：`E2E_ONLY=cantonese e2e_trilingual_livekit.py` → `e2e_interpret.py` → `probe_latency_soak.py`。
+9. **验证**：`E2E_ONLY=cantonese e2e/e2e_trilingual_livekit.py` → `e2e/e2e_interpret.py` → `probes/probe_latency_soak.py`。
 
 ## 二、问题台账（已修）
 
@@ -61,23 +61,23 @@
 
 ### D 项归因定案：不是 GPU 争抢，是 ASR sidecar 被 `QWEN3_ASR_DEVICE=cpu` 钉死在 CPU
 
-- **微基准**（`scripts/gpu_contention_probe.py`，腿1/腿2 双向）：llama :1235 TTFT 空闲 p50=104ms、ASR 持续解码中 p50=94ms——**4090 上 ASR+LLM 同卡零争抢**（原假设否决）。
+- **微基准**（`scripts/bench/gpu_contention_probe.py`，腿1/腿2 双向）：llama :1235 TTFT 空闲 p50=104ms、ASR 持续解码中 p50=94ms——**4090 上 ASR+LLM 同卡零争抢**（原假设否决）。
 - 真凶：重启后的栈里 ASR sidecar env `QWEN3_ASR_DEVICE=cpu`（部署时被显式钉死），CPU fp32 解码 → `finish` p50=1330ms / p90=2450ms / max=4404ms（n=38，含当天真通话）。
 - **修复=重启 ASR sidecar env 改 `cuda`**（模型 bf16 上卡 ~4.9GB；全家显存 44.6/49.1G）：finish 稳态 **237-285ms**（5.3 倍），冷首发 ~1.6s（CUDA warmup，可忽略）。
 - **端到端实证**：soak-canto 本地腿首声 p50 2184ms → **1249ms**（p95 1472ms，零哑零超标），全改善来自此一改。对照 Mac：ASR finish 130ms（mlx 8bit）vs 箱 250ms——ASR 段 Mac 仍快 ~120ms；llama TTFT 箱 104ms（cached）完胜。Mac 整体最佳窗 927ms 仍领先，剩余差=ASR 段 + 管道零头。
 
 ### D 项测量缺口根因（PERCEIVED 无样本）：erc LOG_PATH 平台硬编码
 
-`scripts/e2e_real_customer.py` LOG_PATH 硬编码 `~/Library/Application Support/...`（macOS），Linux 上恒不存在 → soak 日志窗口整段空转（PERCEIVED/哨兵全空）。**已修**：`_default_log_dir()`（env `BOK_LOG_DIR` > Darwin 库目录 > Linux XDG vault）。修复后 canto 云腿 PERCEIVED n=6 p50 1697ms p95 2494ms 正常出数。turns 表 perceived_ms 本来就落（1328/1307/726/1292ms 实查）——不是 agent 侧缺口。
+`scripts/e2e/e2e_real_customer.py` LOG_PATH 硬编码 `~/Library/Application Support/...`（macOS），Linux 上恒不存在 → soak 日志窗口整段空转（PERCEIVED/哨兵全空）。**已修**：`_default_log_dir()`（env `BOK_LOG_DIR` > Darwin 库目录 > Linux XDG vault）。修复后 canto 云腿 PERCEIVED n=6 p50 1697ms p95 2494ms 正常出数。turns 表 perceived_ms 本来就落（1328/1307/726/1292ms 实查）——不是 agent 侧缺口。
 
 ### 云端腿（MiniMax LLM+TTS 全云，本地 ASR/VAD）
 
 - **端点定案**：`https://api.minimax.cn/v1/text/chatcompletion_v2`（同平台 key，DB tts_json.api_key 直用；`/api/settings?internal=1` 对匿名会掩 key——拿真 key 读 DB 列）。M2/M2.5 系思考关不掉（reasoning_content 恒先流，三种参数拼写无效）→ **abab6.5s-chat**（非思考，首 content token 447ms，SSE chunk OpenAI-delta 兼容）。
-- **接线**：`scripts/mm_llm_shim.py` :1236（OpenAI `/v1/chat/completions` → chatcompletion_v2 透传，SSE 补 [DONE]，mlx 专属字段剥除，SSRF 护栏钉死上游域名）；A 线 worker env `MLX_LLM_BASE_URL=http://127.0.0.1:1236/v1` + `MLX_LLM_MODEL=abab6.5s-chat` + `BOK_PREFILL_SPEC=0 LLM_PREFIX_PREWARM=0`（**预热线上云=烧钱，必关**）。
+- **接线**：`scripts/ops/mm_llm_shim.py` :1236（OpenAI `/v1/chat/completions` → chatcompletion_v2 透传，SSE 补 [DONE]，mlx 专属字段剥除，SSRF 护栏钉死上游域名）；A 线 worker env `MLX_LLM_BASE_URL=http://127.0.0.1:1236/v1` + `MLX_LLM_MODEL=abab6.5s-chat` + `BOK_PREFILL_SPEC=0 LLM_PREFIX_PREWARM=0`（**预热线上云=烧钱，必关**）。
 - **数字**（修复 ASR 后同一栈，soak 三语云腿）：首声 p50 zh 1450 / canto 1561 / en 1389ms；**云 TTFT 675-853ms 且 `cached=0`**（无前缀缓存，每轮全量 prompt 重算）vs 本地 104ms cached。
 - **邀约本体腿**（invite-zh/canto/en，钉邀约模板，全云）：p50 1145/1472/1520ms，零哑零缺答，三语 WhatsApp/微信捕获全中；但每通 1-3 发超标（最高 6.1s）。
 - **胖尾真凶=TTS 不是 LLM**：PERCEIVED 分段实锤——本地腿慢轮 `total=4327 (eou=730 llm=327 tts=3270)`、en 云腿 `total=3525 (llm=1046 tts=1896)`；**MiniMax t2a 首包偶发 1.9-3.3s**（典型轮 tts=0-870ms），LLM 段本地 179-392ms 稳如老狗。**下一个延迟杠杆=TTS 供应商/本地化 A/B**（正是 TTS 三路决策的输入）。邀约腿六步未走满（template_step 最高 4，7 轮体量只推进到中段；TTFT 测量不受影响）。
-- **邀约话术本体腿**：三语「延保服务回访邀约」模板（`scripts/seed_invite_templates.py`，中性域无赔偿；EN 分支须客户面话术，coach 祈使句会被 CP `en_coach_head` 验证拒 400）+ soak 新场景 `invite-zh/canto/en`（配合型六步）+ `--template-id` 直通口（erc.create_call 新参，跳过自动挑模板）。
+- **邀约话术本体腿**：三语「延保服务回访邀约」模板（`scripts/seed/seed_invite_templates.py`，中性域无赔偿；EN 分支须客户面话术，coach 祈使句会被 CP `en_coach_head` 验证拒 400）+ soak 新场景 `invite-zh/canto/en`（配合型六步）+ `--template-id` 直通口（erc.create_call 新参，跳过自动挑模板）。
 
 ### 箱上状态更新
 

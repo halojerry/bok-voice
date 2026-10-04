@@ -3,7 +3,7 @@
 > 防御性红队交付（feat/p1-deploy，2026-09-15）。授权范围=本仓自有系统；
 > 目标是对**我方自己的** CP 认证/节点鉴权面做攻击面清点 + 可自动化探针，
 > 每条攻击面给出防线代码锚点（file:line）、残余风险与验收判据。
-> 可自动化的判据编号 `[probe-N]` 与 `scripts/redteam_probes.py` 一一对应；
+> 可自动化的判据编号 `[probe-N]` 与 `scripts/bench/redteam_probes.py` 一一对应；
 > 人工判据标 `[manual]`。
 >
 > **红线**：本档所有探针只允许打自起 CP 实例（默认宿主口 18015）或明确授权的
@@ -234,7 +234,7 @@
 - **验收判据**：`[manual]` 在加固环境触发一次克隆（用他机指纹心跳）后于
   `/api/audit` 查到 `node.denied.fingerprint_mismatch`；告警规则接线待接。
 
-## 3. 探针索引（`scripts/redteam_probes.py`）
+## 3. 探针索引（`scripts/bench/redteam_probes.py`）
 
 | 编号 | 攻击面 | 判据 | 依赖 |
 | --- | --- | --- | --- |
@@ -252,10 +252,10 @@
 
 ```bash
 # 自起加固 CP（宿主口 18015 + 临时 sqlite + 随机 root），跑完全部探针即清理：
-.venv312/bin/python scripts/redteam_probes.py --self-host [--scan-binary dist/node-agent]
+.venv312/bin/python scripts/bench/redteam_probes.py --self-host [--scan-binary dist/node-agent]
 
 # 对既有加固 CP 跑（不spawn实例）：
-.venv312/bin/python scripts/redteam_probes.py --base-url https://cp.example.com \
+.venv312/bin/python scripts/bench/redteam_probes.py --base-url https://cp.example.com \
     --root-user root --root-pass '***' [--cp-token '***']
 
 # 退出码：全 PASS=0；任一 FAIL=1（SKIP 不计失败）。

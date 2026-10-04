@@ -10,7 +10,7 @@
 日志打结构化行 `MOCK_CALLEE event=<name> at=<s> identity=<id>` 供 E2E 断言;
 房间 disconnected(被删/agent 收线)立即收尾退出,绝不留殭尸进程。
 
-音频发布复用 scripts/e2e_real_customer.py 的 rtc 姿势:本地 TTS sidecar
+音频发布复用 scripts/e2e/e2e_real_customer.py 的 rtc 姿势:本地 TTS sidecar
 (:8788)合成客户话音 → AudioSource 逐帧推流。语言三态 zh/cantonese/en。
 
 `--narrowband`(8kHz 窄带档):每条台词先过 `downsample_to_narrowband`(16k→8k

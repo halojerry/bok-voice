@@ -6,7 +6,7 @@
 - 存量库升级面 = ``apps/control-plane/control_plane/deps.py`` build_engine() 里的
   ``_ensure_column(conn, table, column, ddl)`` 幂等补列（CP 启动期加列的唯一点,
   列序敏感——language 列冻结等历史教训）。
-- 正向（models→DDL 产物 vs build_engine 真库）已由 scripts/check_schema_drift.py
+- 正向（models→DDL 产物 vs build_engine 真库）已由 scripts/ops/check_schema_drift.py
   门禁管（真 Postgres 容器级,进不了单测）; **反向缺失面**是本文件:**CP 加了列而
   models 漏声明 = ORM 查询面静默缺列**（历史事故:pronunciation 列 NOT NULL vs
   DEFAULT '' 的 DDL 漂移打红过门禁——同族两路径分叉）。

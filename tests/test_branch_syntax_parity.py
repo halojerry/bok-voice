@@ -11,7 +11,7 @@
 3. TS 镜像钉:lib/flow-canvas.ts 无法 import Python,由源级 pin 钉住锚词与
    动作标记字面集与本模块一致(改一处不改另一处即红)。
 
-种子回归:scripts/seed_invite_templates.py 的三语模板里每条分支行都必须被
+种子回归:scripts/seed/seed_invite_templates.py 的三语模板里每条分支行都必须被
 parse_step_ref 认出(命中 100%,不再有静默丢弃)。
 """
 from __future__ import annotations
@@ -68,7 +68,7 @@ def test_gap_proposals_eats_single_source():
 
 def test_prepare_csc_data_eats_single_source():
     spec = importlib.util.spec_from_file_location(
-        "_pinned_prepare_csc", ROOT / "scripts" / "prepare_csc_data.py"
+        "_pinned_prepare_csc", ROOT / "scripts" / "seed" / "prepare_csc_data.py"
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -137,7 +137,7 @@ def test_no_local_branch_regex_copies_remain():
     # 权威源外不允许再出现自持拷贝(防第四/第五份拷贝回潮)。
     python_consumers = [
         ROOT / "apps" / "control-plane" / "control_plane" / "gap_proposals.py",
-        ROOT / "scripts" / "prepare_csc_data.py",
+        ROOT / "scripts" / "seed" / "prepare_csc_data.py",
     ]
     literal = "如果客戶|(?:If|When)"
     for p in python_consumers:
@@ -148,7 +148,7 @@ def test_no_local_branch_regex_copies_remain():
 
 def _seed_templates():
     spec = importlib.util.spec_from_file_location(
-        "_pinned_seed_templates", ROOT / "scripts" / "seed_invite_templates.py"
+        "_pinned_seed_templates", ROOT / "scripts" / "seed" / "seed_invite_templates.py"
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

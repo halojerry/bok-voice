@@ -631,7 +631,7 @@ def _build_llm_provider(
             # 滚动上下文(默认 0=关,治代词/指代断裂的 A/B 档):非零=带最近 N 对
             # 「源→译」进 MT prompt 上文参考块(LLMA 式)。代价=参考段逐轮位移,
             # prefix 从该段失效(术语槽/模板头仍命中)——延迟影响用
-            # scripts/probe_interpret_latency.py 实测后再定默认。
+            # scripts/probes/probe_interpret_latency.py 实测后再定默认。
             context_turns = int(os.environ.get("BOK_INTERP_MT_CONTEXT", "0") or 0)
             return StatelessMTLLM(
                 MlxLlmLLM(

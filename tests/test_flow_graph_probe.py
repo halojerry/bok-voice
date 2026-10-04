@@ -1,6 +1,6 @@
 """话术图探针纯函数（2026-09-18）：日志打点解析 / 图轮归属 / 主判据裁决 / 观测前提。
 
-探针本体 `scripts/probe_flow_graph.py` 要真栈（CP+LiveKit+模型），这里只钉它的
+探针本体 `scripts/probes/probe_flow_graph.py` 要真栈（CP+LiveKit+模型），这里只钉它的
 离线可判部分——判据正反例、`play_miss` 只记信息位、kill-switch 腿语义，以及
 review R1 的**观测前提**（absent 判据不许在没真观测时空过成 PASS）。
 """

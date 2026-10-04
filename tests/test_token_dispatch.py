@@ -9,7 +9,7 @@
 
 E2E 依赖核查（改闸前 grep scripts/ 全量）：三套 E2E 与全部 probe/soak/acceptance
 都是先 POST /api/calls 建单、再拿 call["id"] 当房名取 token——记录恒存在；唯一
-无记录用例是 scripts/load_cp_concurrency.py 场景 D（load-{i}×50），其自起 CP 无
+无记录用例是 scripts/bench/load_cp_concurrency.py 场景 D（load-{i}×50），其自起 CP 无
 LiveKit 凭据、依赖缺凭据 503（该检查位于频控之前，行为不变）。
 """
 from __future__ import annotations

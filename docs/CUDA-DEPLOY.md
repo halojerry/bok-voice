@@ -211,7 +211,7 @@ enable_thinking。所以：
 | A3 | 9B 切档判据 | probe_offscript_soak（真栈 50 轮）双车道对照 4B/9B | 质量差值（offscript 空答/复读旗）值得速度差的结论出数 |
 | A4 | radix 命中 | smoke.sh [4/6] + sglang 日志 cached_tokens；多路并发用 load_audio_concurrency | 同模板跨通 KV 复用生效（日志 cached 增长） |
 | A5 | 节点在册 | 云台 nodes 页看到 cuda 节点 + 心跳；smoke.sh [6/6] | 节点 active、心跳 60s 周期无断 |
-| A6 | 全栈回归 | `scripts/e2e_barge_in.py`（真打断硬门槛）+ `e2e_trilingual_livekit.py` | 与 Mac 基线同绿（车道换了，漏斗语义不许变） |
+| A6 | 全栈回归 | `scripts/e2e/e2e_barge_in.py`（真打断硬门槛）+ `e2e/e2e_trilingual_livekit.py` | 与 Mac 基线同绿（车道换了，漏斗语义不许变） |
 
 ## 6. sglang 旗标依据（版本存档）
 

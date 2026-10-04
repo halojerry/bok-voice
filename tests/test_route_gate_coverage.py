@@ -1,7 +1,7 @@
 """CP 路由闸覆盖门（Mimosa 误阳治理配套，2026-09-23）。
 
 「NestJS 视角扫描器看不见 FastAPI 中间件闸链」的仓库自证：每个路由必须在
-``security/route-gates.json`` 登记（生成器 scripts/gen_route_gates.py +
+``security/route-gates.json`` 登记（生成器 scripts/seed/gen_route_gates.py +
 人工审 reviewed/reason），新路由不登记=本测试红——闸链从「审过一次的文档」
 变成「CI 守住的资产」。不判「安全」，只判「每条路由有人认领过闸链」。
 """
@@ -40,7 +40,7 @@ def test_every_app_route_is_registered():
     app_paths = _app_routes()
     reg = _manifest()
     missing = sorted(app_paths - reg.keys())
-    assert not missing, f"未登记路由（跑 scripts/gen_route_gates.py 并人工审）: {missing}"
+    assert not missing, f"未登记路由（跑 scripts/seed/gen_route_gates.py 并人工审）: {missing}"
 
 
 def test_no_stale_manifest_entries():

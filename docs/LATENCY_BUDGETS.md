@@ -107,10 +107,10 @@ probe_latency_soak 基线）。
 
 ## 5. 测量工具
 
-- `scripts/probe_latency_soak.py`：多轮多样话术延迟测试台（逐轮墙钟首声 + eou/llm/tts
+- `scripts/probes/probe_latency_soak.py`：多轮多样话术延迟测试台（逐轮墙钟首声 + eou/llm/tts
   三段 + 拆轮/打断/哑轮异常旗 + p50/p95 汇总 + JSON 报告）。改延迟相关代码后必跑。
-- `scripts/measure_latency.py`：直打三 sidecar 的分段延迟（无 LiveKit）。
-- `scripts/probe_filler_timing.py`：垫话/首声预算（首声 <2.5s 判据）。
-- `scripts/llm_cache_report.py <worker.log>`：KV 命中与 TTFT 分布。
+- `scripts/bench/measure_latency.py`：直打三 sidecar 的分段延迟（无 LiveKit）。
+- `scripts/probes/probe_filler_timing.py`：垫话/首声预算（首声 <2.5s 判据）。
+- `scripts/ops/llm_cache_report.py <worker.log>`：KV 命中与 TTFT 分布。
 - 日志哨兵速查：`PERCEIVED_MS` / `PERCEIVED_BUDGET_EXCEEDED` / `LLM_FALLBACK_TEXT` /
   `MINIMAX_TTS_BIDI_STALL` / `[storm]` / `[digit-accum]` / `interrupted reply ledgered`。

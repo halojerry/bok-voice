@@ -457,7 +457,7 @@ async def pick_intent_laya(
 # （+NONE 自动补=9 顶格）。2026-09-25 审计：废除本处常量副本防双源漂移。
 QA_MAX_CANDIDATES = 8
 
-# 【零样本标定结论（2026-09-25 实测,scripts/qa_laya_calibrate.py 100 正/30 负
+# 【零样本标定结论（2026-09-25 实测,scripts/pipeline/qa_laya_calibrate.py 100 正/30 负
 # golden 全量）——勿在无新证据时开启本车道】：
 #   - winner==expect 62%（面缩到 4+NONE 仍 63%——缩面救不了）；
 #   - 概率面平坦：p_win p50=0.53、confidence p50=0.20、below_floor 89%

@@ -13,7 +13,7 @@ from pathlib import Path
 # 会引入 TTS 内部停顿的标点（空格不算：英文靠空格分词）。
 _PAUSE_PUNCT_RE = re.compile(r"[。，,．.！!？?～~—、；;：:'\"“”‘’()（）\[\]{}]")
 
-_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "probe_8khz_asr.py"
+_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "probes" / "probe_8khz_asr.py"
 _spec = importlib.util.spec_from_file_location("probe_8khz_asr", _SCRIPT)
 assert _spec and _spec.loader
 probe = importlib.util.module_from_spec(_spec)

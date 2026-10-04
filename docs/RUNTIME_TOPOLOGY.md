@@ -52,7 +52,7 @@
   响应 `tts_pregen.status` 即提醒面。
 - **垫话**：`agent_runtime/fillers.py`——LLM 慢轮回复首音频 500ms 未到播预合成
   应承语。**2026-09-10 资产化改版**：垫话=随源码分发 wav 资产（`assets/fillers/`
-  +manifest，`scripts/gen_filler_assets.py` 固定音色/参数预生成，三语各 10 短句
+  +manifest，`scripts/seed/gen_filler_assets.py` 固定音色/参数预生成，三语各 10 短句
   万能话术 1.0-1.5s），运行时只播文件绝不云合成；**播放排序=垫话播完→300ms
   （`BOK_FILLER_GAP_MS`）→回复**（不再掐垫话，回复首帧经 `_RelaySynthesizeStream`
   hold 扣压）；**链发**（2026-09-10）：首条播完回复仍未出声 → gap 后自动补第二发
@@ -66,7 +66,7 @@
   `prefill_speculator.py`：说话中按稳定前缀发 max_tokens=1 out-of-band 请求
   （严格前缀=上次真实请求快照+回复历史原文+user 前缀），真轮只 prefill 分叉
   尾巴；`BOK_PREFILL_SPEC=0` 关。诊断 `BOK_PREEMPTIVE_DEBUG=1` +
-  `scripts/probe_preemptive.py`。
+  `scripts/probes/probe_preemptive.py`。
 - **turns 分析账本**：A 线 `_on_conversation_item` 每轮上报
   line/speaker/gen/template_step/started_ms/ended_ms/perceived_ms（B 线
   `line=b`、speaker=me/other）；`gen`=llm/script/qa_fastpath 生成源；
@@ -105,7 +105,7 @@
 > 宽容解析，坏数据=空图）→ 每轮 `on_user_turn_completed` 的 graph 块（插在 say 直念之后、
 > QA 快路之前；`BOK_FLOW_GRAPH=0` 整闸）→ 动作落 agent.log 四打点
 > `FLOW_GRAPH jump|play|play_miss|jump_noop` 与 turns `provider=graph-jump|graph-play`
-> + `template_step`=跳后步号（探针 `scripts/probe_flow_graph.py`）。
+> + `template_step`=跳后步号（探针 `scripts/probes/probe_flow_graph.py`）。
 
 > **前端就绪自愈**：服务未就绪时先开页面（节点 node_agent 拉起全栈有秒级时差）。
 > 前端 `lib/api-ready.ts` 的 `useControlPlaneReady` 轮询 `/health`，Control Plane 就绪后
@@ -115,7 +115,7 @@
 > **URL 归一**：前端 API 基址、B 线 WS、LiveKit、agent 的 CONTROL_PLANE_URL 一律
 > 默认 `127.0.0.1`（服务只绑 IPv4；避免 macOS localhost 优先解析 ::1 导致
 > fetch 恒定失败）。节点拓扑由 `runtime-config.js` 注入 cpUrl/livekitUrl；
-> `scripts/probe_thin_client_static.py` 校验 `out/` 不含烤死的 `http://localhost:8000`。
+> `scripts/probes/probe_thin_client_static.py` 校验 `out/` 不含烤死的 `http://localhost:8000`。
 
 ### Supervisor（主管台）
 
@@ -190,7 +190,7 @@ web /campaigns（建波/启停/进度表）
   优先、回落对象卡绑定——此前该字段只存不读，运营在战役里选的话术被静默忽略。
 - **删除战役**：`DELETE /api/campaigns/{id}`——running 拒删（409，先停止），
   删除连名单项一起清并审计 `campaign.delete`。
-- 全链路 E2E：`python scripts/e2e_campaign.py`（3 对象战役——1 接通走完话术+captured
+- 全链路 E2E：`python scripts/e2e/e2e_campaign.py`（3 对象战役——1 接通走完话术+captured
   入名册 / 1 无人接 / 1 接通即挂；断言串行、终态三态、名册入册与 handled 回写）。
 
 ### 外呼战役（mock 档，spec 2026-09-12-outbound-campaign-roster）
@@ -232,7 +232,7 @@ web /campaigns（建波/启停/进度表）
 - mock 剧本钩子（`scenarios`/`scripts`/`mock_speak_interval_s`）只服务演练与 E2E；
   campaign 级存 `campaigns.scripts_json`（无独立列，`__` 前缀键放 campaign 级参数），
   起拨时按 object_id 取台词塞进 dial 块 `script`。真实 SIP 拨号恒为空。
-- 全链路 E2E：`python scripts/e2e_campaign.py`（3 对象战役——1 接通走完话术+captured
+- 全链路 E2E：`python scripts/e2e/e2e_campaign.py`（3 对象战役——1 接通走完话术+captured
   入名册 / 1 无人接 / 1 接通即挂；断言串行、终态三态、名册入册与 handled 回写）。
   **C4 号码容差（2026-09-15 T7 定责）**：本 E2E 验「captured→名册」链路，不验逐位
   ASR 精度——live 链路里号码句**头段**会被多解一个音（实证：`六四三二零一一一` →
@@ -300,7 +300,7 @@ Mac/客户机房侧，worker 只**出站**连站点 LiveKit —— 无任何入�
   安全组人工放行）；VPS 其余端口不对公网。
 - dial 后端开关语义不变：`BOK_SIP_MODE`（env，终局）> 设置 DB `sip.mode`。
 - 真中继启用前置门（spec §6，2026-09-15 审查定案）：mock 档 8kHz 窄带门禁已过
-  （`scripts/probe_8khz_asr.py`），仍需闭环「带前缀粤语报号窄带复测」+
+  （`scripts/probes/probe_8khz_asr.py`），仍需闭环「带前缀粤语报号窄带复测」+
   「真 G.711 样本回填」两项，缺一不放行。
 
 ### B 线（同声传译 v2，LiveKit 双端）
@@ -381,7 +381,7 @@ root 在 web `/nodes` 页（`POST /api/nodes/{id}/revoke`，`/unrevoke` 解除�
 - **launchd/KeepAlive 复活环**：mac 生产档（launchd KeepAlive）下被吊销节点
   会被重新拉起，但只会循环在「注册探测→心跳 401→停栈→exit 0」——栈不复活，
   只余每次探测的烧耗；彻底止息等 root `unrevoke` 或卸载节点。
-- 验收量尺：`scripts/probe_killswitch.py`（CI `node-handshake.yml` linux job
+- 验收量尺：`scripts/probes/probe_killswitch.py`（CI `node-handshake.yml` linux job
   对真 CP 实跑 吊销→窒息点→unrevoke 复活 全链）。
 
 ### Windows 无头常驻（Task Scheduler，`bok.py prod install`）
@@ -436,7 +436,7 @@ Windows 站点机的常驻等价物（对照 mac launchd RunAtLoad + KeepAlive�
   M2.3 补课的 env 开关），:7880 由 livekit.yaml 决定。
 - **`schtasks /end` 子树边界**：/end 只终止任务的 Exec 动作进程（本仓恒为
   cmd.exe），链式子进程（python/livekit 等 payload）存活——
-  `scripts/probe_windows_lifecycle.py` B5b 在真 Windows 实跑断言；依赖 /end
+  `scripts/probes/probe_windows_lifecycle.py` B5b 在真 Windows 实跑断言；依赖 /end
   停栈的 `prod uninstall` 据此按 pidfile 精确补杀（只杀自己 pid 记录的进程，
   绝不按镜像名杀共享镜像），无 pidfile 的任务树成员（如 node_agent 自身）
   WARNING 提示手工处理。
@@ -444,7 +444,7 @@ Windows 站点机的常驻等价物（对照 mac launchd RunAtLoad + KeepAlive�
   就是上面的 `prod install --node-agent`）；当前为 **token 模式**
   （`--node-token` 直传），license 模式节点直接用 bok.py 注册；任务 XML 经
   env 前缀链存凭据，与 plist env 等价。
-- 生命周期实跑量尺：`scripts/probe_windows_lifecycle.py`（A 段 down 树杀
+- 生命周期实跑量尺：`scripts/probes/probe_windows_lifecycle.py`（A 段 down 树杀
   全平台执行、B 段 schtasks 契约仅 Windows 实跑，runner 无提权时 B 段按
   access-denied 优雅 [skip]；CI windows job 实跑）。
 

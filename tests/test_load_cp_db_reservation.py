@@ -1,4 +1,4 @@
-"""`scripts/load_cp_concurrency.py` 临时库名的**预留**语义（CWE-377 收口）。
+"""`scripts/bench/load_cp_concurrency.py` 临时库名的**预留**语义（CWE-377 收口）。
 
 来源：2026-09-21 Mimosa 分诊 ⑥-⑨ 复核确认的**唯一**一条（计划档 §32.3 ⑧）——
 旧写法只产出名字、不留占位，「拿到名字 → sqlite 打开」之间该路径可被他人抢占
@@ -23,7 +23,7 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]
 _SPEC = importlib.util.spec_from_file_location(
-    "load_cp_concurrency", _ROOT / "scripts" / "load_cp_concurrency.py")
+    "load_cp_concurrency", _ROOT / "scripts" / "bench" / "load_cp_concurrency.py")
 lcc = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(lcc)
 

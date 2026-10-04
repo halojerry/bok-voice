@@ -1,6 +1,6 @@
 """bidi 头段催产 task_flush 单测（2026-09-29，fake WS，无网络）。
 
-官方文档+直连台架（scripts/bench_minimax_bidi.py）定案：服务端对无句末标点的
+官方文档+直连台架（scripts/bench/bench_minimax_bidi.py）定案：服务端对无句末标点的
 缓冲不起合成（兜底窗 ~2.4s），早切头段必须 task_flush 催一声才出声——台架
 首声 918-962→210-343ms。本文件钉死：
 

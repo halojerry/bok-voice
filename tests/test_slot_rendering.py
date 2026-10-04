@@ -1,6 +1,6 @@
 """D1 槽位化 actor 渲染层：20 轮粤语模拟（零漂移 / 尺寸 / 协议零泄漏 / prewarm 形状）。
 
-零漂移证明方式：用真模板 fixture（scripts/migrate_templates_8step_0913.py 的
+零漂移证明方式：用真模板 fixture（scripts/seed/migrate_templates_8step_0913.py 的
 cantonese febeeeebac97，8 步）跑 20 轮模拟，序列化与真 provider 一致（list content
 按 "\n" 连接——livekit _provider_format/openai._to_chat_item），把**改动前代码**
 （HEAD d7b7ed8）跑出的逐轮 sha256 冻结为本文件 GOLDEN_SHA256；新代码闸关

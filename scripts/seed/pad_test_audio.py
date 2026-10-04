@@ -20,7 +20,7 @@ import os
 import wave
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 AUDIO_DIR = ROOT / "tests" / "fixtures" / "audio"
 PAD_SECONDS = float(os.environ.get("PAD_SECONDS", "0.6"))
 TRAIL_SILENCE_SECONDS = float(os.environ.get("TRAIL_SILENCE_SECONDS", "45"))

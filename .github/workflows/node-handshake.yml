@@ -2,9 +2,9 @@ name: Node handshake smoke
 
 # P1 节点侧门禁 + site-delivery M4 探针接线：
 #   linux   —— 起真 CP（postgres:16 服务容器 + auth-on + root 种子）跑
-#              scripts/node_handshake_smoke.py 全验握手链路（register → node_token
+#              scripts/ops/node_handshake_smoke.py 全验握手链路（register → node_token
 #              心跳 → 伪 token 401 → root JWT 查节点列表 → heartbeat_interval_s），
-#              再跑 scripts/probe_killswitch.py（同一 CP 自建独立节点：吊销 sticky
+#              再跑 scripts/probes/probe_killswitch.py（同一 CP 自建独立节点：吊销 sticky
 #              → 通话面 403 窒息 → unrevoke 复活全链），并对 install-node.sh 做
 #              语法解析 + 零副作用干跑。
 #              （windows 腿 2026-09-22 起软退役删除：Windows=仅浏览器访问 web UI，
@@ -92,11 +92,11 @@ jobs:
         run: scripts/install-node.sh --cp-url "$CP_BASE" --node-token ci-dummy-token --dry-run
       - name: Node handshake smoke (对真 CP 全验)
         run: |
-          python scripts/node_handshake_smoke.py --base-url "$CP_BASE" \
+          python scripts/ops/node_handshake_smoke.py --base-url "$CP_BASE" \
             --root-user="$BOK_ROOT_USERNAME" --root-pass="$ROOT_PASS"
       - name: Kill-switch probe (同一 CP 自建独立节点:吊销→窒息点→unrevoke 复活全链)
         run: |
-          python scripts/probe_killswitch.py --base-url "$CP_BASE" \
+          python scripts/probes/probe_killswitch.py --base-url "$CP_BASE" \
             --root-user="$BOK_ROOT_USERNAME" --root-pass="$ROOT_PASS"
       - name: CP logs on failure
         if: failure()
