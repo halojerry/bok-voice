@@ -139,10 +139,42 @@
     {
       "id": "fp-scripts-random",
       "publicClass": "insecure-randomness",
-      "path_glob": "scripts/*",
+      "path_glob": "scripts/**",
       "verdict": "false-positive",
-      "reason": "诊断脚本的测试数据节拍/采样抖动随机（erc 语音间隔、interp 推流 jitter、阈值重拟合采样），非安全语义",
-      "evidence": "scripts/e2e/e2e_real_customer.py; scripts/probes/probe_interp_continuous.py; scripts/pipeline/r2_threshold_refit.py"
+      "reason": "诊断脚本的测试数据节拍/采样抖动随机（erc 语音间隔、interp 推流 jitter、阈值重拟合采样），非安全语义。2026-10-05 复核:新报 4 条全为 random.Random(固定种子) 可复现采样(r2_threshold_refit:224/probe_interp_backlog:42/probe_interp_continuous:103/prepare_csc_data:1185)——刻意确定性,连随机性都没有。glob 升 scripts/**(G1c 嵌套桶后 scripts/* 不跨 / 再漏一次)",
+      "evidence": "scripts/e2e/e2e_real_customer.py; scripts/probes/probe_interp_continuous.py:103; scripts/probes/probe_interp_backlog.py:42; scripts/pipeline/r2_threshold_refit.py:224; scripts/seed/prepare_csc_data.py:1185"
+    },
+    {
+      "id": "fp-probe-qa-phonetic-cp-taint",
+      "publicClass": "other-security",
+      "path_glob": "scripts/probes/probe_qa_phonetic.py",
+      "verdict": "false-positive",
+      "reason": "『疑似跨文件污点』=env→本机 CP 出站链(BOK_CP_URL/TOKEN 缺省环回,erc.cp_request/urlguard 闸内),payload=探针常量 JSON,无命令/SQL/路径 sink——与 fp-probe-branch-action-cp-taint 同族;扫描器 sink 归因漂到 probe_flow_graph.py:772 _cp(httpx→本机 CP)同族共享形状",
+      "evidence": "scripts/probes/probe_qa_phonetic.py 调用点 :164/:176/:184/:192/:320;scripts/probes/probe_flow_graph.py:772 _cp(httpx.request timeout=15→CP)"
+    },
+    {
+      "id": "fp-import-xkt-qa-cp-taint",
+      "publicClass": "other-security",
+      "path_glob": "scripts/seed/import_xkt_qa.py",
+      "verdict": "false-positive",
+      "reason": "『疑似跨文件污点』=env→本机 CP 出站链(导入器打 CP qa-entries API,payload=惜客通 JSON 导入件);sink 归因 load_intent_catalog.py:127 _cp_request 其函数体自带环回/DNS 出站闸(注释自证 Mimosa L3 污点纪律)——同族",
+      "evidence": "scripts/seed/import_xkt_qa.py 调用点 :133/:158/:184;scripts/seed/load_intent_catalog.py:127 _cp_request 出站闸同函数体"
+    },
+    {
+      "id": "fp-probe-flow-graph-cp-taint",
+      "publicClass": "other-security",
+      "path_glob": "scripts/probes/probe_flow_graph.py",
+      "verdict": "false-positive",
+      "reason": "『疑似跨文件污点』=env→本机 CP 出站链(:772 _cp→httpx.request→CONTROL_PLANE_URL 缺省环回;:948 经 erc 同款),探针常量 payload——同族(fixed-scripts-urlguard-gate/fixed-scripts-cp-api-entries 先例)",
+      "evidence": "scripts/probes/probe_flow_graph.py:772 _cp;调用点 :948;同族 fp-probe-branch-action-cp-taint"
+    },
+    {
+      "id": "accepted-cp-knowledge-source-chain",
+      "publicClass": "other-security",
+      "path_glob": "apps/control-plane/control_plane/main.py",
+      "verdict": "accepted-risk",
+      "reason": "『环境变量→markdown_source.py:79 SSRF』链=CP 把 BOK_URL/BOK_KNOWLEDGE_* env 传给知识源抓取适配器;markdown_source 构造期非 http(s) 显式拒(ValueError 启动面炸)+write/read sink 级 scheme/host/userinfo 闸(2026-10-05 逐行核验)——与 accepted-knowledge-source-ssrf 同裁定面,风险=运维配错而非注入",
+      "evidence": "packages/knowledge/bok_voice_knowledge/markdown_source.py 构造器 scheme 校验+write() sink 闸注释;security-policy.json threatModel 攻击面第 2 条已列"
     },
     {
       "id": "accepted-knowledge-source-ssrf",
