@@ -30,8 +30,6 @@ os.environ.setdefault("BOK_JWT_SECRET", "unit-test-jwt-secret-0123456789abcdef")
 
 from typing import get_args  # noqa: E402
 
-from pydantic import ValidationError  # noqa: E402
-
 from agent_runtime import metrics_report  # noqa: E402
 from bok_voice_core.metrics_kinds import (  # noqa: E402
     METRICS_KIND_LANES,
@@ -40,6 +38,7 @@ from bok_voice_core.metrics_kinds import (  # noqa: E402
 )
 from control_plane import main as cp_main  # noqa: E402
 from control_plane import ops_metrics  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
