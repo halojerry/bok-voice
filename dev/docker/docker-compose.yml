@@ -84,7 +84,8 @@ services:
       OLLAMA_BASE_URL: http://host.docker.internal:11434/v1
       OLLAMA_MODEL: huihui_ai/qwen3.5-abliterated:9b
       MLX_LLM_BASE_URL: http://host.docker.internal:1235/v1
-      MLX_LLM_MODEL: /Users/halo/.lmstudio/models/huihui-ai/Huihui-Qwen3.5-9B-abliterated-mlx-4bit
+      # 本机模型路径（机器本地事实）：env/.env 覆盖，缺省=原开发机现值。
+      MLX_LLM_MODEL: ${MLX_LLM_MODEL:-/Users/halo/.lmstudio/models/huihui-ai/Huihui-Qwen3.5-9B-abliterated-mlx-4bit}
     depends_on:
       - livekit
       - control-plane

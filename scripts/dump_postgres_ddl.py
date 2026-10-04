@@ -8,7 +8,7 @@ pgvector 扩展/知识表),再用**源容器内**的 pg_dump 导 schema——因
     DATABASE_URL=postgresql+psycopg://postgres:postgres@127.0.0.1:5434/postgres \
         python scripts/dump_postgres_ddl.py
     # 常用开关:
-    #   --output scripts/.p0_supabase_schema.sql   产物路径(默认)
+    #   --output scripts/artifacts/.p0_supabase_schema.sql   产物路径(默认)
     #   --source-container pg-ddl                  源库容器名(默认 pg-ddl)
     #   --verify-image pgvector/pgvector:pg16      回环校验用的干净库镜像
     #   --keep                                     保留校验容器(默认跑完即删)
@@ -47,7 +47,7 @@ for _sub in ("apps/control-plane", "packages/core", "packages/business-db", "pac
         sys.path.insert(0, _p)
 
 DEFAULT_DB_URL = "postgresql+psycopg://postgres:postgres@127.0.0.1:5434/postgres"
-DEFAULT_OUTPUT = ROOT / "scripts" / ".p0_supabase_schema.sql"
+DEFAULT_OUTPUT = ROOT / "scripts" / "artifacts" / ".p0_supabase_schema.sql"
 DEFAULT_SOURCE_CONTAINER = "pg-ddl"
 DEFAULT_VERIFY_IMAGE = "pgvector/pgvector:pg16"
 PG_USER = "postgres"
@@ -102,8 +102,9 @@ def _log(msg: str) -> None:
 
 
 def _run(cmd: list[str], *, stdin_file=None, capture: bool = True, timeout: int = 900) -> subprocess.CompletedProcess:
+    # /usr/bin/env 前缀（字面量可执行文件）：命令名以参数形式传入，杜绝拼接执行的歧义。
     return subprocess.run(
-        cmd,
+        ["/usr/bin/env", *cmd],
         stdin=stdin_file,
         capture_output=capture,
         text=True,
@@ -180,14 +181,14 @@ def _build_schema(url: str) -> tuple[list[str], object | None]:
 
 def _table_row_counts(engine: object) -> list[tuple[str, int]]:
     """源库现有行数速览(证明产物无数据行:行只存在于库里,不进 schema-only dump)。"""
-    from sqlalchemy import inspect as sa_inspect, text  # noqa: PLC0415
+    from sqlalchemy import inspect as sa_inspect  # noqa: PLC0415
 
     out: list[tuple[str, int]] = []
     insp = sa_inspect(engine)
     with engine.connect() as conn:  # type: ignore[attr-defined]
         for tbl in sorted(insp.get_table_names()):
             try:
-                out.append((tbl, int(conn.execute(text(f"SELECT COUNT(*) FROM {tbl}")).scalar() or 0)))
+                out.append((tbl, int(conn.exec_driver_sql(f"SELECT COUNT(*) FROM {tbl}").scalar() or 0)))
             except Exception:  # pragma: no cover - 单表查不动不影响主流程
                 continue
     return out
@@ -337,7 +338,7 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("DATABASE_URL") or DEFAULT_DB_URL,
         help="源库 SQLAlchemy URL(默认 env DATABASE_URL,否则 " + DEFAULT_DB_URL + ")",
     )
-    ap.add_argument("--output", default=str(DEFAULT_OUTPUT), help="产物路径(默认 scripts/.p0_supabase_schema.sql)")
+    ap.add_argument("--output", default=str(DEFAULT_OUTPUT), help="产物路径(默认 scripts/artifacts/.p0_supabase_schema.sql)")
     ap.add_argument("--source-container", default=DEFAULT_SOURCE_CONTAINER, help="源库容器名(默认 pg-ddl)")
     ap.add_argument("--verify-image", default=DEFAULT_VERIFY_IMAGE, help=f"回环校验镜像(默认 {DEFAULT_VERIFY_IMAGE})")
     ap.add_argument("--verify-url-template", default="postgresql+psycopg://postgres:postgres@127.0.0.1:{port}/postgres")

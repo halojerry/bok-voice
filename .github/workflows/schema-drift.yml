@@ -1,6 +1,6 @@
 name: Schema drift gate
 
-# Supabase schema 漂移门禁:scripts/.p0_supabase_schema.sql 是「生成物,勿手改」的
+# Supabase schema 漂移门禁:scripts/artifacts/.p0_supabase_schema.sql 是「生成物,勿手改」的
 # P0 引导件(schema 唯一真源 = packages/business-db ORM + deps.build_engine() 幂等
 # 迁移)。代码改表而忘记重跑 scripts/dump_postgres_ddl.py → 产物过期 → 新部署拿旧
 # schema 静默起家。本 job 在服务容器上跑 scripts/check_schema_drift.py:应用产物 →
@@ -17,7 +17,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'scripts/.p0_supabase_schema.sql'
+      - 'scripts/artifacts/.p0_supabase_schema.sql'
       - 'scripts/check_schema_drift.py'
       - 'scripts/dump_postgres_ddl.py'
       - 'apps/control-plane/**'
@@ -25,7 +25,7 @@ on:
       - '.github/workflows/schema-drift.yml'
   pull_request:
     paths:
-      - 'scripts/.p0_supabase_schema.sql'
+      - 'scripts/artifacts/.p0_supabase_schema.sql'
       - 'scripts/check_schema_drift.py'
       - 'scripts/dump_postgres_ddl.py'
       - 'apps/control-plane/**'

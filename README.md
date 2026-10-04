@@ -30,7 +30,7 @@
 
 ```bash
 ./scripts/bootstrap.sh        # 建 .venv312 + 安装依赖（Python ≥3.11）
-./scripts/test.sh             # pytest
+.venv312/bin/python -m pytest -q  # pytest（原 scripts/test.sh 已归位 scripts/archive/）
 python tools/bok.py serve     # 拉起 control-plane/LiveKit/sidecars/LLM/agent
 ```
 
