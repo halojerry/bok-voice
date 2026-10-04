@@ -3837,8 +3837,7 @@ async def entrypoint(ctx):
     _routing_raw = str(settings.get("model_routing_json") or "")
 
     from .providers.doubao_asr import DoubaoSTT, doubao_asr_enabled
-    from .providers.livekit_plugins import (
-        DeepSeekLLM,
+    from .providers.livekit_plugins import (  # DeepSeekLLM 已在 entrypoint 头部导入(3574),此处不重复
         FakeLiveKitSTT,
         FakeLiveKitTTS,
         FakeLiveKitVAD,
@@ -3900,6 +3899,12 @@ async def entrypoint(ctx):
     # 本通已捕获过号码(captured/captured_implicit 任一):之後 WhatsApp 步嘅純短應承
     # 唔再判 offered(確認輪鎖死→逐字重複根因,detect_whatsapp_signal 文檔)。
     _wa_captured: dict = {"on": False}
+    # 逐轮 WA 信号 kind 的 entrypoint 级回看窗(2026-10-04 F821 根修):_wa_signal 是
+    # on_user_turn_completed 的轮局部元组,_filler_context_bucket(entrypoint 闭包,
+    # 兄弟作用域)够不着——此前恒 NameError 被 except 吞成 bucket=""(W2c 语境桶
+    # 从未活过)。on_user_turn_completed 每轮 detect 后写本 holder,闭包读它
+    # (_wa_captured 同款形状;空串=无信号)。
+    _turn_wa_signal: dict = {"kind": ""}
     # W4-T2 意向事实账本(2026-09-19):逐埋点累加(nudge/watchdog/storm/verdict/
     # graph notify),挂断时 _intent_facts_snapshot 快照评估意向规则——verdict 计数
     # 只在 agent 内存账本(方案 A),/end 带 intent_code+disposition 覆盖。
@@ -4994,15 +4999,17 @@ async def entrypoint(ctx):
 
     def _filler_context_bucket() -> str:
         """W2c 语境桶(fire 时点由 FillerDirector 惰性调用):闭包晚绑定,
-        任何信号缺失/异常吞掉回 ""=现行阶梯。verdict 走 flow_ctrl.last_verdict
-        (本轮局部名无流程轮未绑定,NameError 坑——调研底稿钉)。"""
+        任何信号缺失/异常吞掉回 ""=现行阶梯。verdict 走 flow_ctrl.last_verdict。
+        2026-10-04 F821 根修:本轮 WA 信号原先直读 on_user_turn_completed 轮局部
+        `_wa_signal`(兄弟作用域,恒 NameError→except→恒 ""),改读 entrypoint
+        holder `_turn_wa_signal`(on_user_turn_completed 逐轮写入)。"""
         try:
             from .flow import _looks_like_whatsapp_step as _llws
 
             _g, _r = flow_ctrl.current_goal_ref()
             return derive_context_bucket(
                 turn_provider=str(_current_lane.get("lane") or ""),
-                wa_signal_kind=(str(_wa_signal[0]) if _wa_signal else ""),
+                wa_signal_kind=str(_turn_wa_signal.get("kind") or ""),
                 wa_step=bool(_llws(_g, _r)),
                 wa_captured=bool(_wa_captured["on"]),
                 has_steps=bool(flow_ctrl.has_steps),
@@ -6014,7 +6021,13 @@ async def entrypoint(ctx):
         print(f"[judge] yield {verdict} (call {room_name})", flush=True)
         return verdict
 
-    async def _background_flow_judge(step_at: int, utt: str, turn_key: str = "", garbled: bool = False) -> None:
+    async def _background_flow_judge(
+        step_at: int,
+        utt: str,
+        turn_key: str = "",
+        garbled: bool = False,
+        invalidate_preemptive=None,
+    ) -> None:
         """背景跑 LLM 推進判定:唔好喺開聲前同步等(會每輪拖慢),判定完喺下一輪先生效。
 
         唔會 double-advance:只喺 flow 仲喺 judge 嗰步(step_at)時先落 advance。
@@ -6023,6 +6036,12 @@ async def entrypoint(ctx):
         garbled(FIX-2(b),D2-3):本轮是 garbled band(烂转写/碎片)——streak 三处
         写点(note_turn_outcome/degrade_boost/bump_unclear_streak)全部跳过:判定
         对象本身就是噪声,喂 streak=把 ASR 病算模型头上。
+        invalidate_preemptive(2026-10-04 F821 根修):unclear-advance 分支要落
+        抢跑失效标记——`_invalidate_stale_preemptive` 定义在 on_user_turn_completed
+        局部(本函数的兄弟作用域,闭包不可见),此前直呼名字=推进后必 NameError、
+        被宽 except 吞成 `judge(bg) failed`,同 try 块下游的 register_followup
+        消费被整段跳过。调用方(on_user_turn_completed)把自己的 invalidator
+        传进来;None(旧调用形态/测试)时跳过标记,零行为变化。
         """
         try:
             # 让路节流:主回复刚提交,先等一拍、再等到链路真空闲才喺 :1235 跑 judge——
@@ -6178,7 +6197,8 @@ async def entrypoint(ctx):
                             if wa_confirm_advance_allowed(goal=_gu, ref=_ru, captured=_wa_captured["on"]):
                                 flow_ctrl.advance()
                                 _push_flow_state(context_state, flow_ctrl)
-                                _invalidate_stale_preemptive("unclear 连续 → 推进")
+                                if invalidate_preemptive is not None:
+                                    invalidate_preemptive("unclear 连续 → 推进")
                                 _advanced_uc = True
                                 print(
                                     f"[flow] unclear-advance step={flow_ctrl.current + 1} "
@@ -6504,6 +6524,7 @@ async def entrypoint(ctx):
             # WhatsApp 对接触发:喺 flow 推进【前】偵測(step context 係舊步/當前步,offered 先啱);
             # 客戶俾號碼(captured)照推下一步;應承加但未俾號碼(offered)→ 唔自動跳,等 AI 叫佢俾號碼。
             _wa_signal: tuple | None = None
+            _turn_wa_signal["kind"] = ""  # 轮首清零(holder 见 entrypoint _wa_captured 邻 comment)
             user_text = str(getattr(new_message, "text_content", None) or "")
             # EX-2 跨轮复读防线「复问放行」闸(PART C):客户若在复述/追问上一问
             # (本轮用户话与最近一条客户话高度相似 ≥0.8),模型复讲关键内容是正确
@@ -6926,6 +6947,7 @@ async def entrypoint(ctx):
                     _wa_channel["v"] = _wa_ch
                     if _wa_signal:
                         _kind, _num = _wa_signal
+                        _turn_wa_signal["kind"] = str(_kind)  # 闭包回看窗(_filler_context_bucket)
                         if _kind in ("captured", "captured_implicit"):
                             _wa_captured["on"] = True
                         if _kind == "captured_implicit":
@@ -7316,7 +7338,13 @@ async def entrypoint(ctx):
                                 _judge_inflight["step"] = _step_at
                                 # 池化(2026-09-17 全量 debug P2-A):judge 任务丢失=
                                 # 该轮不推进(下轮规则补位)——强引用+失败打点防静默。
-                                _spawn_report(_background_flow_judge(_step_at, user_text, turn_key=_turn_key, garbled=_garbled_band_round))
+                                _spawn_report(_background_flow_judge(
+                                    _step_at,
+                                    user_text,
+                                    turn_key=_turn_key,
+                                    garbled=_garbled_band_round,
+                                    invalidate_preemptive=_invalidate_stale_preemptive,
+                                ))
                     # stall 账本规则路(漏斗 v2,spec §3.1):每轮判决记账——UNCLEAR
                     # 且步未变 +1(下方 judge 路同 key 去重只计 1);推进/其它 verdict
                     # 清该步计数(清零语义在方法内)。推进轮 verdict 以 "" 记

@@ -46,6 +46,10 @@ _ALLOWLIST: dict[str, re.Pattern[str] | None] = {
     "scripts/ab_tts_first_chunk.py": re.compile(r"Chinese,Yue"),
     "scripts/bench_minimax_bidi.py": re.compile(r"Chinese,Yue"),
     "tests/test_interpret_tts_provider.py": re.compile(r"Chinese,Yue"),
+    # 2026-10-04 CI 真 PG 回归钉:yue→cantonese 迁移的 LIKE 通配语义测试——
+    # 「%yue%」是 DB 存量行匹配的迁移真值(deps.py 迁移同串,该文件已整文件
+    # 豁免),这里只豁免带该通配串/迁移名的行;其余行出现 yue 照样红。
+    "tests/test_db_portability.py": re.compile(r"%yue%|yue→cantonese"),
     "tests/test_fixed_language_call.py": re.compile(r"Chinese,Yue"),
     # P1(2026-10-01) SV-CPU 引擎车道:SenseVoice 外部语言枚举(yue,与 zh/en 同族
     # sherpa API 真字面量)+ HF repo id(zh-en-ja-ko-yue=仓库名 opaque 标识)。

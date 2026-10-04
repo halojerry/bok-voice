@@ -178,14 +178,14 @@ def test_scheduling_points_unchanged():
 
     FIX-2(b)(2026-10-01):调用多带一个 garbled=_garbled_band_round 实参
     (garbled 轮 streak 三写点全守,ASR 病不记模型头上)——调度点/位置/单飞不变。
+    2026-10-04 F821 根修:再带 invalidate_preemptive=_invalidate_stale_preemptive
+    (unclear-advance 分支的失效标记直呼兄弟作用域名字=推进后必 NameError 被
+    宽 except 吞,followup 消费被跳过——改传参,派发点从单行改多行,锚随迁)。
     """
     assert (
-        _SRC.count(
-            "_spawn_report(_background_flow_judge("
-            "_step_at, user_text, turn_key=_turn_key, garbled=_garbled_band_round))"
-        )
-        == 1
+        _SRC.count("_spawn_report(_background_flow_judge(") == 1
     )
+    assert "invalidate_preemptive=_invalidate_stale_preemptive" in _SRC
     assert (
         _SRC.count(
             "_spawn_report(_background_intent_judge(flow_ctrl.current, utt, candidates), slow_s=20.0)"

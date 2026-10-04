@@ -113,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     if stub_text is None:
         detail = f"{stub} 缺失或非文本——public/runtime-config.js 未随静态导出"
-    elif not (MARKER in stub_text):
+    elif MARKER not in stub_text:
         detail = "缺 __BOK_CONFIG__ 标记"
     elif _HARDCODED_CP_RE.search(stub_text):
         detail = "stub 硬设了非空 cpUrl（失去可注入语义）"

@@ -13,7 +13,6 @@ import time
 import unicodedata
 import uuid
 import weakref
-from collections.abc import Callable
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from urllib.parse import urlparse
