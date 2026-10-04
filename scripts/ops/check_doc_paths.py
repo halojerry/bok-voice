@@ -42,6 +42,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -247,17 +248,51 @@ def iter_live_docs(root: Path) -> list[Path]:
     return live
 
 
-def build_repo_index(root: Path) -> dict[str, list[str]]:
-    """basename → 仓内相对路径列表（文件与目录,用于后缀容错匹配）。"""
+def _git_tracked(root: Path) -> frozenset[str] | None:
+    """git ls-files 视图(tracked 文件集);git 不可用回退 None(调用方走工作树)。"""
+    try:
+        out = subprocess.run(  # noqa: S603 - 固定 argv,无用户输入
+            ["git", "-C", str(root), "ls-files"],
+            capture_output=True, text=True, timeout=30, check=True,
+        ).stdout
+    except Exception:  # noqa: BLE001 - git 缺席(打包运行)不炸,退工作树
+        return None
+    return frozenset(ln for ln in out.splitlines() if ln)
+
+
+def _git_ignored(root: Path, rel_posix: str) -> bool:
+    """路径是否被 .gitignore 盖住(运行时工件:本机盘上有、克隆里没有——
+    如 deploy/cloud/.env、scripts/.probe_reply_quality.json;引用它们是
+    合法的运行时路径文档,不是断链)。"""
+    try:
+        return subprocess.run(  # noqa: S603 - 固定 argv
+            ["git", "-C", str(root), "check-ignore", "-q", rel_posix],
+            capture_output=True, timeout=10,
+        ).returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def build_repo_index(root: Path, tracked: frozenset[str] | None = None) -> dict[str, list[str]]:
+    """basename → 仓内相对路径列表（**仅文件**;目录判定走 _tracked_dirs）。
+
+    基准=**git tracked 视图**(2026-10-04 CI 实弹教训:本机盘上的 gitignored
+    运行时工件会让工作树解析本地绿、CI 红——克隆里没有那些文件)。git 不可用
+    才退回 os.walk 工作树。
+    """
     index: dict[str, list[str]] = {}
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d not in INDEX_SKIP_DIRS)
-        for name in list(dirnames) + list(filenames):
-            try:
-                rel = (Path(dirpath) / name).relative_to(root).as_posix()
-            except ValueError:
-                continue
-            index.setdefault(name, []).append(rel)
+    entries: list[str]
+    if tracked is not None:
+        entries = list(tracked)
+    else:
+        entries = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(d for d in dirnames if d not in INDEX_SKIP_DIRS)
+            for name in list(dirnames) + list(filenames):
+                entries.append((Path(dirpath) / name).relative_to(root).as_posix())
+    for rel in entries:
+        name = rel.rstrip("/").rsplit("/", 1)[-1]
+        index.setdefault(name, []).append(rel)
     return index
 
 
@@ -291,28 +326,59 @@ def ref_in_scope(ref: str, root_top: frozenset[str]) -> bool:
     return bool(_ref_ext(ref))
 
 
+def _tracked_dirs(tracked: frozenset[str]) -> frozenset[str]:
+    """tracked 文件的全父目录集(目录引用判定;git ls-files 只出文件)。"""
+    dirs: set[str] = set()
+    for rel in tracked:
+        parts = rel.split("/")
+        for i in range(1, len(parts)):
+            dirs.add("/".join(parts[:i]))
+    return frozenset(dirs)
+
+
 def ref_exists(
     ref: str,
     doc_dir_rel: Path,
     root: Path,
     root_top: frozenset[str],
     index: dict[str, list[str]],
+    tracked: frozenset[str] | None = None,
+    tracked_dirs: frozenset[str] = frozenset(),
 ) -> bool:
-    """两段显式解析 + 全仓后缀匹配;容错文档里常见的省略目录写法。"""
+    """两段显式解析 + 全仓后缀匹配;容错文档里常见的省略目录写法。
+
+    tracked 在场时按 git 视图判存在(与 CI 克隆一致):文件∈tracked/目录∈
+    tracked_dirs;候选全 miss 但路径被 .gitignore 盖住=运行时工件引用,
+    豁免(见 _git_ignored——本机盘上有、克隆里没有的产物)。
+    """
+
+    def _hit(rel_posix: str) -> bool:
+        cand = rel_posix.rstrip("/")
+        if not cand:
+            return True
+        if tracked is not None:
+            if cand in tracked or cand in tracked_dirs:
+                return True
+            if _git_ignored(root, cand):
+                return True  # 运行时工件(本机有/克隆无):合法运行时路径引用
+            return False
+        return (root / cand).exists()
+
     if ref.startswith("/"):
         m = _ABS_REF_RE.match(ref)
         if not m or m.group(1) not in root_top:
             return True  # /api/... 路由、/tmp/... 系统路径等:不属仓内,视为外域
-        return (root / ref.lstrip("/")).exists()
+        return _hit(ref.lstrip("/"))
     rel = ref[2:] if ref.startswith("./") else ref
     # ① 相对引用文件所在目录
     if doc_dir_rel != Path("."):
-        if (root / doc_dir_rel / rel).exists():
+        if _hit((doc_dir_rel / rel).as_posix()):
             return True
     # ② 仓库根
-    if (root / rel).exists():
+    if _hit(rel):
         return True
-    # ③ 全仓后缀匹配:`components/x.tsx` 可对上 apps/web/components/x.tsx
+    # ③ 全仓后缀匹配:`components/x.tsx` 可对上 apps/web/components/x.tsx;
+    #    目录省略写法同权:`assets/fillers/` 可对上 apps/agent/agent_runtime/assets/fillers
     clean = rel.rstrip("/")
     if not clean:
         return True
@@ -320,14 +386,19 @@ def ref_exists(
     for candidate in index.get(base, ()):
         if candidate == clean or candidate.endswith("/" + clean):
             return True
+    for d in tracked_dirs:
+        if d == clean or d.endswith("/" + clean):
+            return True
     return False
 
 
 def check_doc_paths(root: Path | str = ROOT) -> list[dict]:
     """返回断链清单:[{file, line, ref}, ...]（file 为仓库相对 posix 路径）。"""
     root = Path(root).resolve()
-    index = build_repo_index(root)
+    tracked = _git_tracked(root)
+    index = build_repo_index(root, tracked)
     root_top = frozenset(p.name for p in root.iterdir())
+    tdirs = _tracked_dirs(tracked) if tracked is not None else frozenset()
     broken: list[dict] = []
     seen: set[tuple[str, int, str]] = set()
     for doc in iter_live_docs(root):
@@ -350,7 +421,10 @@ def check_doc_paths(root: Path | str = ROOT) -> list[dict]:
             if not refs:
                 continue
             resolved = {
-                ref: ref_exists(ref, doc_dir_rel, root, root_top, index) for ref in refs
+                ref: ref_exists(
+                    ref, doc_dir_rel, root, root_top, index, tracked, tdirs
+                )
+                for ref in refs
             }
             for ref in refs:
                 if not ref_in_scope(ref, root_top):
