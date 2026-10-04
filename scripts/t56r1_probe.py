@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """T5/T6/R1 联合探针（2026-09-21）。
 
-R1  真实标注集上复算 V-5 的 margin 工作曲线（scripts/.r1_gold.20260921.json，
+R1  真实标注集上复算 V-5 的 margin 工作曲线（scripts/artifacts/.r1_gold.20260921.json，
     标注=代理人工判读，规则族+逐条覆盖，见 r1_build_gold.py）。
 T5  把 SemIf 的「选项 token 自己算 softmax」搬回手搓判定：进程内一次 forward、
     在答案位取 12 个选项字母的 logit 做 softmax → margin 变成真概率差（解 V1-03
@@ -30,6 +30,7 @@ import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+ARTIFACTS = HERE / "artifacts"
 ALLOWED_SCHEME = "http"
 ALLOWED_HOSTS = frozenset({"127.0.0.1"})
 ALLOWED_PORTS = frozenset({1235, 1237})
@@ -37,7 +38,7 @@ PATH_COMPLETIONS = "/v1/chat/completions"
 
 LOCAL_JSON = HERE / ".probe_hotword_ab.m4pro20260921.json"
 CLOUD_JSON = HERE / ".probe_cloud_asr_ab.m4pro_full.json"
-REAL_JSON = HERE / ".r1_gold.20260921.json"
+REAL_JSON = ARTIFACTS / ".r1_gold.20260921.json"
 
 M4B = "/Users/halo/.lmstudio/models/avan-ag/Qwen3.5-4B-Uncensored-MLX-4bit"
 M9B = "/Users/halo/.lmstudio/models/huihui-ai/Huihui-Qwen3.5-9B-abliterated-mlx-4bit"
@@ -206,7 +207,7 @@ def leg_server(tag: str) -> None:
         print(f"[{tag}/{corp}] got={got} gold={gold} ok={ok} "
               f"old_margin={row['old_margin']:.2f} sv_pm={row['sv_pm']:.3f} cov={cov}",
               flush=True)
-    out = HERE / f".t56r1_server_{tag}.json"
+    out = ARTIFACTS / f".t56r1_server_{tag}.json"
     out.write_text(json.dumps(rows, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"-> {out} ({len(rows)} rows)")
 
@@ -253,7 +254,7 @@ def leg_inproc() -> None:
         all_rows[vname] = rows
         print(f"[inproc {vname}] n={len(rows)} acc={sum(r['ok'] for r in rows)}/{len(rows)}",
               flush=True)
-    out = HERE / ".t56r1_inproc_4B.json"
+    out = ARTIFACTS / ".t56r1_inproc_4B.json"
     out.write_text(json.dumps(all_rows, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"-> {out}")
 
@@ -287,7 +288,7 @@ def combined(rows: list[dict], key: str, frac: float = 0.3) -> dict:
 def leg_analyze() -> None:
     print("=" * 30, "R1 真实集：margin 工作曲线与组合规则", "=" * 30)
     for tag in ("4B", "9B"):
-        p = HERE / f".t56r1_server_{tag}.json"
+        p = ARTIFACTS / f".t56r1_server_{tag}.json"
         if not p.exists():
             continue
         rows = json.load(open(p, encoding="utf-8"))
@@ -302,7 +303,7 @@ def leg_analyze() -> None:
                   f"捕获 {c['caught']}/{c['err']} ({c['caught']/max(1,c['err']):.0%}) "
                   f"误伤 {c['lost']} 精确率 {c['prec']:.0%}")
     print("\n" + "=" * 30, "T5 选项 softmax 后 margin 变真概率差（4B 进程内精确）", "=" * 30)
-    p = HERE / ".t56r1_inproc_4B.json"
+    p = ARTIFACTS / ".t56r1_inproc_4B.json"
     if p.exists():
         allrows = json.load(open(p, encoding="utf-8"))
         v0 = allrows["V0"]

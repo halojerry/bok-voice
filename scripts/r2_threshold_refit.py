@@ -26,13 +26,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "scripts"
+ARTIFACTS = SCRIPTS / "artifacts"
 
-GOLD = SCRIPTS / ".r1_gold.20260921.json"
+GOLD = ARTIFACTS / ".r1_gold.20260921.json"
 SERVER = {
-    "4B": SCRIPTS / ".t56r1_server_4B.json",
-    "9B": SCRIPTS / ".t56r1_server_9B.json",
+    "4B": ARTIFACTS / ".t56r1_server_4B.json",
+    "9B": ARTIFACTS / ".t56r1_server_9B.json",
 }
-OUT = SCRIPTS / ".r2_refit.20260921.json"
+OUT = ARTIFACTS / ".r2_refit.20260921.json"
 
 K = 5
 SEED = 20260921

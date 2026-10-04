@@ -154,7 +154,16 @@ def scan_provider_health(
     """
     import time as _time
 
-    log_dir = Path(log_dir)
+    # 入口收敛（qa_bank 同款过门判据）：'..' 段先拒（读路径永不抛契约=拒则
+    # 诚实降级 available=False），再 resolve 绝对化——env 缺省是相对路径
+    # （./data/vault），resolve 后任何路径判断/拼接的包含关系才成立。
+    _raw_dir = Path(log_dir)
+    if ".." in _raw_dir.parts:
+        return {"available": False, "degraded": False, "window_s": float(window_s),
+                "undated": 0, "quota_2056": {"count": 0, "last_hit": None},
+                "rate_limit": {"count": 0, "last_hit": None, "statuses": {}},
+                "scanned": {}, "error": "log dir must not contain '..'"}
+    log_dir = _raw_dir.resolve()
     now = _time.time() if now is None else now
     window_start = now - window_s
     available = log_dir.is_dir()

@@ -47,15 +47,19 @@ def frame_rms(pcm: bytes) -> float:
     return math.sqrt(sum(x * x for x in frames) / n)
 
 
-def read_pcm16(path: Path, max_seconds: float = 4.0) -> bytes:
-    with wave.open(str(path), "rb") as w:
-        n = int(min(w.getnframes(), w.getframerate() * max_seconds))
-        return w.readframes(n)
+def read_pcm16(max_seconds: float = 4.0) -> bytes:
+    """读取面：目标恒为模块常量表里的 fixtures 文件（无路径参数=污点面清零），
+    resolve 后经 Path.open 文件对象喂 wave。"""
+    p = (AUDIO_DIR / AUDIO).resolve()
+    with p.open("rb") as fh:
+        with wave.open(fh, "rb") as w:
+            n = int(min(w.getnframes(), w.getframerate() * max_seconds))
+            return w.readframes(n)
 
 
 async def road(idx: int, results: list) -> None:
     lang = LANG
-    pcm = read_pcm16(AUDIO_DIR / AUDIO)
+    pcm = read_pcm16()
     obj = httpx.post(
         f"{CONTROL_PLANE_URL}/api/objects?account_id=acc-001",
         headers=_CP_HEADERS,

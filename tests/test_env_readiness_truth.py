@@ -160,36 +160,34 @@ def test_llm_http_ready_only_200(monkeypatch):
     """/v1/models 只有 HTTP 200 算就绪；404/503/超时/拒连一律 False，永不抛。"""
     seen: dict = {}
 
-    def fake_200(url, timeout=None):
+    # 出站 seam=bok._http_call（http.client 单点，(status, body) 形）
+    def fake_200(url, method="GET", *, body=None, headers=None, timeout_s=10.0):
         seen["url"] = url
-        seen["timeout"] = timeout
-        return _FakeResp(b'{"data": []}')
+        seen["timeout"] = timeout_s
+        return 200, b'{"data": []}'
 
-    monkeypatch.setattr(bok.urllib.request, "urlopen", fake_200)
+    monkeypatch.setattr(bok, "_http_call", fake_200)
     assert bok._llm_http_ready(1235) is True
     assert seen["url"] == "http://127.0.0.1:1235/v1/models"
     assert seen["timeout"] == 1.5
 
-    def fake_404(url, timeout=None):
-        raise urllib.error.HTTPError(url, 404, "nf", {}, None)
-
-    monkeypatch.setattr(bok.urllib.request, "urlopen", fake_404)
+    monkeypatch.setattr(bok, "_http_call",
+                        lambda url, method="GET", *, body=None, headers=None, timeout_s=10.0: (404, b"nf"))
     assert bok._llm_http_ready(1235) is False
 
-    def fake_503_status(url, timeout=None):
-        return _FakeResp(b"loading", status=503)
-
-    monkeypatch.setattr(bok.urllib.request, "urlopen", fake_503_status)
+    monkeypatch.setattr(bok, "_http_call",
+                        lambda url, method="GET", *, body=None, headers=None, timeout_s=10.0: (503, b"loading"))
     assert bok._llm_http_ready(1239) is False
 
-    def fake_timeout(url, timeout=None):
+    def fake_timeout(url, method="GET", *, body=None, headers=None, timeout_s=10.0):
         raise TimeoutError("timed out")
 
-    monkeypatch.setattr(bok.urllib.request, "urlopen", fake_timeout)
+    monkeypatch.setattr(bok, "_http_call", fake_timeout)
     assert bok._llm_http_ready(1239) is False
-    # 显式放宽窗（宽松终检档）透传到 urlopen
-    monkeypatch.setattr(bok.urllib.request, "urlopen",
-                        lambda url, timeout=None: seen.update({"t2": timeout}) or _FakeResp())
+    # 显式放宽窗（宽松终检档）透传到 _http_call
+    monkeypatch.setattr(bok, "_http_call",
+                        lambda url, method="GET", *, body=None, headers=None, timeout_s=10.0:
+                        seen.update({"t2": timeout_s}) or (200, b""))
     assert bok._llm_http_ready(1235, timeout_s=5.0) is True
     assert seen["t2"] == 5.0
 
@@ -198,22 +196,23 @@ def test_http_ok_requires_200_on_path(monkeypatch):
     """sidecar /health：装载期 503（loading）不得当就绪；200 才算。"""
     seen: dict = {}
 
-    def fake(url, timeout=None):
+    def fake(url, method="GET", *, body=None, headers=None, timeout_s=10.0):
         seen["url"] = url
-        return _FakeResp(b'{"status": "loading"}', status=503)
+        return 503, b'{"status": "loading"}'
 
-    monkeypatch.setattr(bok.urllib.request, "urlopen", fake)
+    monkeypatch.setattr(bok, "_http_call", fake)
     assert bok._http_ok(8788, "/health") is False
     assert seen["url"] == "http://127.0.0.1:8788/health"
 
-    monkeypatch.setattr(bok.urllib.request, "urlopen",
-                        lambda url, timeout=None: _FakeResp(b'{"status": "ready"}'))
+    monkeypatch.setattr(bok, "_http_call",
+                        lambda url, method="GET", *, body=None, headers=None, timeout_s=10.0:
+                        (200, b'{"status": "ready"}'))
     assert bok._http_ok(8787, "/health") is True
 
-    def fake_err(url, timeout=None):
-        raise urllib.error.URLError("refused")
+    def fake_err(url, method="GET", *, body=None, headers=None, timeout_s=10.0):
+        raise OSError("refused")
 
-    monkeypatch.setattr(bok.urllib.request, "urlopen", fake_err)
+    monkeypatch.setattr(bok, "_http_call", fake_err)
     assert bok._http_ok(8787, "/health") is False
 
 

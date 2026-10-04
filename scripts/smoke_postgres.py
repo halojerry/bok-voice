@@ -180,11 +180,9 @@ def _check_schema(engine: Any) -> None:
 
 def _report_pgvector(engine: Any) -> None:
     """pgvector 单独报：缺扩展=WARNING；扩展在但表没建=真 bug（判失败）。"""
-    from sqlalchemy import text
-
     with engine.connect() as conn:
-        has_ext = conn.execute(text("SELECT 1 FROM pg_extension WHERE extname = 'vector'")).first() is not None
-        kb_table = conn.execute(text("SELECT to_regclass('public.knowledge_chunks')")).scalar()
+        has_ext = conn.exec_driver_sql("SELECT 1 FROM pg_extension WHERE extname = 'vector'").first() is not None
+        kb_table = conn.exec_driver_sql("SELECT to_regclass('public.knowledge_chunks')").scalar()
     if has_ext and kb_table:
         print("  [ok] pgvector: 扩展 + knowledge_chunks 均就位")
         return
@@ -211,7 +209,7 @@ def _migration_upgrade_probe(url: str) -> None:
     auth/storage schema、并排的 staging schema）会被同名表骗过 → 真列不补、
     升级静默丢列。临时库用 uuid 命名，绝不碰共享库。
     """
-    from sqlalchemy import create_engine, inspect as sa_inspect, text
+    from sqlalchemy import create_engine, inspect as sa_inspect
     from sqlalchemy.engine.url import make_url
     from sqlalchemy.pool import NullPool
 
@@ -223,7 +221,7 @@ def _migration_upgrade_probe(url: str) -> None:
     try:
         try:
             with admin.connect() as conn:
-                conn.execute(text(f'CREATE DATABASE "{probe_db}"'))
+                conn.exec_driver_sql(f'CREATE DATABASE "{probe_db}"')
             created = True
         except Exception as exc:  # 无 CREATEDB 权限的共享库：降级跳过
             raise SmokeSkipped(f"当前 DB 用户不能建临时库（{type(exc).__name__}），升级演练跳过") from exc
@@ -239,30 +237,30 @@ def _migration_upgrade_probe(url: str) -> None:
                 # (2) 造「旧库」：把迁移新增列统统 DROP（含 NOT NULL DEFAULT '' 的 sip_json，
                 #     顺带留一行存量数据，验带数据 ALTER 的回填）。
                 #     注意 ORM 的 default= 是 Python 侧默认，裸 SQL 必须显式给值。
-                conn.execute(text(
+                conn.exec_driver_sql(
                     "INSERT INTO public.global_settings"
                     " (id, asr_json, llm_json, tts_json, vad_json, sip_json, policy, updated_at)"
                     " VALUES ('global', '{\"speaker_yue\": \"old\"}', '{}', '{}', '{}',"
                     " '{\"mode\": \"mock\"}', 'offline_first', CURRENT_TIMESTAMP)"
-                ))
+                )
                 for table, columns in _MIGRATION_COLUMNS.items():
                     for column in columns:
-                        conn.execute(text(f'ALTER TABLE public."{table}" DROP COLUMN IF EXISTS "{column}"'))
+                        conn.exec_driver_sql(f'ALTER TABLE public."{table}" DROP COLUMN IF EXISTS "{column}"')
                 # (3) 存量脏数据：语言旧值 yue + reference_audio 旧键——第二次
                 #     build_engine 的数据迁移必须改写它们（方言无关，但只在真库上验得到）。
-                conn.execute(text(
+                conn.exec_driver_sql(
                     "INSERT INTO public.persona_profiles"
                     " (id, account_id, name, company, tone, language, reference_audio)"
                     " VALUES ('probe-persona', 'probe', '旧人设', '', '', 'yue',"
                     " '{\"yue\": \"Cantonese_crisp_news_anchor_vv2\"}')"
-                ))
+                )
                 # (4) 诱饵 schema：同名表 + 迁移列齐全
-                conn.execute(text("CREATE SCHEMA smoke_decoy"))
+                conn.exec_driver_sql("CREATE SCHEMA smoke_decoy")
                 for table, columns in _MIGRATION_COLUMNS.items():
                     col_ddl = ", ".join(f'"{c}" VARCHAR(64)' for c in columns)
-                    conn.execute(text(
+                    conn.exec_driver_sql(
                         f'CREATE TABLE smoke_decoy."{table}" (id VARCHAR(64) PRIMARY KEY, {col_ddl})'
-                    ))
+                    )
         finally:
             work.dispose()
 
@@ -276,11 +274,11 @@ def _migration_upgrade_probe(url: str) -> None:
             missing = [c for c in columns if c not in have]
             _expect(not missing, f"升级演练：public.{table} 补列成功（缺 {missing}）")
         with second_engine.connect() as conn:
-            sip = conn.execute(text("SELECT sip_json FROM public.global_settings WHERE id='global'")).scalar()
-            persona = conn.execute(text(
+            sip = conn.exec_driver_sql("SELECT sip_json FROM public.global_settings WHERE id='global'").scalar()
+            persona = conn.exec_driver_sql(
                 "SELECT language, reference_audio FROM public.persona_profiles WHERE id='probe-persona'"
-            )).one()
-            asr_json = conn.execute(text("SELECT asr_json FROM public.global_settings WHERE id='global'")).scalar()
+            ).one()
+            asr_json = conn.exec_driver_sql("SELECT asr_json FROM public.global_settings WHERE id='global'").scalar()
         _expect(sip == "", f"升级演练：NOT NULL DEFAULT '' 列对存量行回填（sip_json={sip!r}）")
         _expect(
             persona[0] == "cantonese" and "cantonese" in (persona[1] or ""),
@@ -297,7 +295,7 @@ def _migration_upgrade_probe(url: str) -> None:
                     eng.dispose()
         if created:
             with contextlib.suppress(Exception), admin.connect() as conn:
-                conn.execute(text(f'DROP DATABASE IF EXISTS "{probe_db}" WITH (FORCE)'))
+                conn.exec_driver_sql(f'DROP DATABASE IF EXISTS "{probe_db}" WITH (FORCE)')
         admin.dispose()
 
 
@@ -577,8 +575,6 @@ def _crud_roundtrip(engine: Any, summary: list[tuple[str, int, str]]) -> None:
 # ---------------------------------------------------------------------------
 
 def _run(url: str) -> int:
-    from sqlalchemy import text
-
     summary: list[tuple[str, int, str]] = []
     started = time.time()
 
@@ -590,7 +586,7 @@ def _run(url: str) -> int:
     _expect(engine2 is not None, "deps.build_engine() 第二次仍返回 engine（幂等）")
     _check_deps_diagnostics(lines2)
     with engine.connect() as conn:
-        print(f"  [info] server: {conn.execute(text('SELECT version()')).scalar()}")
+        print(f"  [info] server: {conn.exec_driver_sql('SELECT version()').scalar()}")
     _check_schema(engine)
     _report_pgvector(engine)
 

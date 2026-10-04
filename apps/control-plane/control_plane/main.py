@@ -179,6 +179,73 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
+class _RoutingProbeResp:
+    """http.client 响应的最小 httpx 兼容面（raise_for_status/json）。"""
+
+    def __init__(self, status: int, body: bytes):
+        self.status_code = status
+        self._body = body
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}: {self._body[:200]!r}")
+
+    def json(self):
+        return json.loads(self._body.decode("utf-8"))
+
+
+def _routing_http_request(method: str, url: str, **kw):
+    """路由测试端点出站单点：url 来自路由表/settings（运维配置面）。
+
+    准入姿态：https=云端 vendor 档放行（TLS 面）；http=仅环回/RFC1918 私网
+    （本地 mlx/CUDA 形态）——**link-local 恒拒**（169.254.0.0/16=云元数据
+    服务段：路由表被打穿时不得让 CP 带 Bearer key 探元数据面）；http 打
+    公网（明文凭据外送形态）恒拒；userinfo 恒拒。不过闸=ValueError（调用
+    方 except 统一 ok=false）。出站走 http.client（无重定向跟随）。"""
+    import http.client
+    import urllib.parse as _up
+
+    parts = _up.urlsplit(url)
+    host = (parts.hostname or "").lower()
+    if not host or parts.username or parts.password:
+        raise ValueError(f"出站 URL 未过护栏（拒发）: {url}")
+    scheme_ok = parts.scheme == "https"
+    if not scheme_ok and parts.scheme == "http":
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            ip = None
+        if ip is not None:
+            # 恒拒 link-local（含 169.254/16 元数据段）；is_private 在 Python
+            # 语义里也罩着 169.254/16——必须显式排除后才能用作私网判据。
+            scheme_ok = (ip.is_loopback or ip.is_private) and not (
+                ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+            )
+        else:
+            scheme_ok = host == "localhost"
+    if not scheme_ok:
+        raise ValueError(f"出站 URL 未过护栏（http 仅限环回/RFC1918 私网，https 放行）: {url}")
+    headers = dict(kw.get("headers") or {})
+    body = kw.get("json")
+    if body is not None:
+        import json as _json
+
+        body = _json.dumps(body).encode("utf-8")
+        headers.setdefault("Content-Type", "application/json")
+    timeout_s = float(kw.get("timeout", 10))
+    cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+    conn = cls(host, parts.port or (443 if parts.scheme == "https" else 80), timeout=timeout_s)
+    try:
+        req_path = parts.path or "/"
+        if parts.query:
+            req_path = f"{req_path}?{parts.query}"
+        conn.request(method.upper(), req_path, body=body, headers=headers)
+        resp = conn.getresponse()
+        return _RoutingProbeResp(resp.status, resp.read())
+    finally:
+        conn.close()
+
+
 def _resolved_bind_host(argv: list[str] | None = None) -> str:
     """CP 预定 bind 地址的运行时视图。两个来源（与 tools/bok.py 单点对齐）：
 
@@ -938,7 +1005,7 @@ def test_model_routing(req: ModelRoutingTestRequest, request: Request) -> dict:
     started = time.monotonic()
     try:
         if not model:
-            resp = httpx.get(f"{route.base_url}/models", timeout=10, headers=headers)
+            resp = _routing_http_request("GET", f"{route.base_url}/models", timeout=10, headers=headers)
             resp.raise_for_status()
             ids = [str(d.get("id") or "") for d in (resp.json().get("data") or [])]
             # 与 bok._probe_llm 同款：mlx_lm 的 /models 列**全模型目录**，绝对路径 id
@@ -948,7 +1015,8 @@ def test_model_routing(req: ModelRoutingTestRequest, request: Request) -> dict:
         if not model:
             return {"ok": False, "latency_ms": 0, "model": "",
                     "error": "端点未返回可用模型（/models 空）"}
-        resp = httpx.post(
+        resp = _routing_http_request(
+            "POST",
             f"{route.base_url}/chat/completions",
             # messages 必带：mlx_lm handle_chat_completions 首行 assert "messages" in
             # body——缺字段=断言炸 handler、连接直接断（RemoteProtocolError 实证）。
@@ -6583,8 +6651,18 @@ def provider_health(request: Request) -> dict:
     llm-gaps/qa-drift 观测家族，与 web 报表页门控一致。
     """
     _gate_page(request, "reports")
-    vault = Path(os.environ.get("VAULT_ROOT", "./data/vault"))
-    return scan_provider_health(vault.parent / "logs")
+    # env 源路径就地收敛（读路径闸，三层）：'..' 段拒绝 → resolve 绝对化 →
+    # 必须落在部署树内（cwd 相对包含；越树=拒绝——跨机部署把 VAULT_ROOT 指到
+    # 树外的场景读不到本机日志，available=false 诚实降级本来就是这个语义）。
+    # 文件名纯净守卫在 provider_health._safe_log_path（第四层）。
+    _vault_raw = os.environ.get("VAULT_ROOT", "./data/vault")
+    _vault_p = Path(_vault_raw)
+    if ".." in _vault_p.parts:
+        return JSONResponse(status_code=400, content={"error": "VAULT_ROOT 不得含 '..' 段"})
+    _logs_dir = (_vault_p.resolve().parent / "logs").resolve()
+    if not _logs_dir.is_relative_to(Path.cwd().resolve()):
+        return JSONResponse(status_code=400, content={"error": "VAULT_ROOT 必须位于部署树内"})
+    return scan_provider_health(_logs_dir)
 
 
 @app.get("/api/objects/{object_id}/topics")

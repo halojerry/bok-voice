@@ -198,6 +198,18 @@ def main() -> None:
 
     from speech_to_speech.s2s_pipeline import run_pipeline_command
 
+    # 单参 .json 形态（pipeline 配置）在派发前就地加载（qa_bank 同款判据：
+    # 绝对路径+无 '..' 段+resolve 后 Path.open）——解析出的 dict 直接传给
+    # run_pipeline_command，命令行路径不再跨函数流进文件读取。
+    if len(command_args) == 1 and str(command_args[0]).endswith(".json"):
+        _cfg_path = Path(command_args[0])
+        if not _cfg_path.is_absolute() or ".." in _cfg_path.parts:
+            raise SystemExit(f"pipeline json path must be absolute without '..': {_cfg_path}")
+        import json as _json
+
+        with _cfg_path.resolve().open() as _fh:
+            run_pipeline_command(command, command_args, pipeline_json=_json.load(_fh))
+        return
     run_pipeline_command(command, command_args)
 
 

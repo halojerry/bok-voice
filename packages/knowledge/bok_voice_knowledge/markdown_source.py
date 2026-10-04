@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import urllib.parse
 from pathlib import Path
 from typing import Optional
 
@@ -80,12 +81,25 @@ class BokMarkdownSource:
 
         import json
 
+        url = f"{self.base_url}/documents/write"
         req = urllib.request.Request(
-            f"{self.base_url}/documents/write",
+            url,
             data=json.dumps({"path": path, "content": content}).encode(),
             headers=self._headers(),
             method="POST",
         )
+        # 出站闸门（sink 级就地校验）：仅 http/https、host 非空、无 userinfo。
+        # base_url 是操作员 env 配置（BOK_URL），非请求派生——仍按护栏校验，
+        # 配置错误在请求面显式拒绝而不是静默打到非预期目标。
+        parts = urllib.parse.urlsplit(url)
+        host = (parts.hostname or "").lower()
+        if not (
+            parts.scheme in ("http", "https")
+            and bool(host)
+            and not parts.username
+            and not parts.password
+        ):
+            raise PermissionError(f"出站 URL 未过护栏（拒发）: {url}")
         with urllib.request.urlopen(req) as resp:
             return json.loads(resp.read())
 

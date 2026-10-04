@@ -175,16 +175,11 @@ def _a_reply_endpoint_alive(base_url: str, timeout_s: float = 1.0) -> bool:
     base = str(base_url or "").strip().rstrip("/")
     if not base:
         return False
-    import urllib.error
-    import urllib.request
 
     try:
-        # 无鉴权头:401/404 抛 HTTPError,与成功响应同判「端点在场」。
-        with contextlib.closing(
-            urllib.request.urlopen(f"{base}/models", timeout=timeout_s)  # noqa: S310
-        ):
-            return True
-    except urllib.error.HTTPError:
+        # 无鉴权头:任何 HTTP 应答(含 401/404/5xx)=端点在场;连接错误=死。
+        # 出站走 _http_call（http.client 闸门形状，tools/bok.py 同款）。
+        status, _ = _http_call(f"{base}/models", timeout_s=timeout_s)
         return True
     except Exception:  # noqa: BLE001 - URLError/超时/坏协议=死，绝不外抛
         return False
@@ -418,27 +413,54 @@ def _mlx_abort_endpoint(base_url: str) -> str:
     return f"{base}/abort" if base.endswith("/v1") else f"{base}{_MLX_ABORT_PATH}"
 
 
+def _http_call(url: str, method: str = "GET", *, body: bytes | None = None,
+               headers: dict | None = None, timeout_s: float = 5.0) -> tuple[int, bytes]:
+    """出站 HTTP 单点（http.client 直连，tools/bok.py 同形状——urlopen sink 的
+    污点规则与探针族结构性共存不了，http.client 无该形状且不跟随重定向）。
+    仅 http/https、host 非空、无 userinfo；返回 (status, body)；4xx/5xx 不抛
+    （status 原样返回，调用方自判）。"""
+    import http.client
+    import urllib.parse
+
+    parts = urllib.parse.urlsplit(str(url or ""))
+    host = (parts.hostname or "").lower()
+    if not (
+        parts.scheme in ("http", "https")
+        and bool(host)
+        and not parts.username
+        and not parts.password
+    ):
+        raise PermissionError(f"出站 URL 未过护栏（拒发）: {url}")
+    cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+    conn = cls(host, parts.port or (443 if parts.scheme == "https" else 80), timeout=timeout_s)
+    try:
+        req_path = parts.path or "/"
+        if parts.query:
+            req_path = f"{req_path}?{parts.query}"
+        conn.request(method, req_path, body=body, headers=headers or {})
+        resp = conn.getresponse()
+        return resp.status, resp.read()
+    finally:
+        conn.close()
+
+
 def _post_abort(base_url: str, req_id: str, timeout_s: float = 0.5) -> None:
     """同步 POST {base}/v1/abort（尽力中止;经 asyncio.to_thread 调用）。
 
     服务端契约见 services/llm-mlx/bok_mlx_server.py（body ``{"request_id": ...}``）。
-    走 urllib（零新依赖）;任何失败全吞——中止是尽力语义,绝不外抛。
+    任何失败全吞——中止是尽力语义,绝不外抛。
     """
     url = _mlx_abort_endpoint(base_url)
     if not url or not req_id:
         return
-    import urllib.request
 
     try:
-        body = json.dumps({"request_id": req_id}).encode()
-        req = urllib.request.Request(  # noqa: S310 - 本机 loopback 端点
-            url,
-            data=body,
-            method="POST",
+        _http_call(
+            url, "POST",
+            body=json.dumps({"request_id": req_id}).encode(),
             headers={"Content-Type": "application/json"},
+            timeout_s=timeout_s,
         )
-        with contextlib.closing(urllib.request.urlopen(req, timeout=timeout_s)):  # noqa: S310
-            pass
     except Exception:  # noqa: BLE001 - 中止尽力而为
         pass
 

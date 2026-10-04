@@ -9,6 +9,8 @@ pass per question, whole request batched, ~10ms warm per judge shape (see
 docs/LAYA-EVAL.md for the local eval: latency/accuracy/truncation pitfalls).
 Position vs the 4B/9B generative LLMs: a fast judge WITH calibrated confidence,
 not a smarter one — callers gate on `below_floor` and fall back to their LLM.
+The local evaluation lives in docs/LAYA-EVAL.md (latency/accuracy/truncation
+pitfalls).
 
 Contract decisions baked in here (do not re-litigate at call sites):
 
@@ -23,12 +25,12 @@ Contract decisions baked in here (do not re-litigate at call sites):
   words (usually at the tail) quietly vanish. We count state tokens with laya's
   own tokenizer and, over budget (LAYA_STATE_TOKEN_BUDGET, default 800), KEEP
   THE HEAD, set state_truncated=true and log a warn. Callers stay dumb.
-- choice-only. score/noul measured unusable in the eval (score ranking
+- choice-only. score/noul measured unusable in the evaluation (score ranking
   distorted; noul follows option labels); requests carrying them get a 400 in
   plain language instead of a garbage distribution.
 - One bad question must not sink the batch: the batch runs first; if it raises,
   each question is retried alone and the failing qid gets {"error": "..."}.
-- Concurrent forwards are NOT serialized: the eval measured 199 q/s across 4
+- Concurrent forwards are NOT serialized: the evaluation measured 199 q/s across 4
   threads on one shared checkpoint, and laya_mlx's own router leaves inference
   outside its lock for the same reason.
 - Kill-switch BOK_LAYA_JUDGE=0 → every /v1/decide answers 503 (process stays

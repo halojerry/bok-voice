@@ -10,7 +10,7 @@
 默认「其他」（碎片/应承/回声串/报号/配合——12 选项表里没有「提供号码/答平台」这类意图，
 它们本来就该落「其他」）。
 
-输出 scripts/.r1_gold.20260921.json（worktree 内，与既有 .probe_*.json 同位）：
+输出 scripts/artifacts/.r1_gold.20260921.json（worktree 内，与既有 .probe_*.json 同族）：
 [{src, txt, gold, step, lang}]
 """
 from __future__ import annotations
@@ -19,7 +19,7 @@ import json
 import re
 from pathlib import Path
 
-OUT = Path(__file__).resolve().parent / ".r1_gold.20260921.json"
+OUT = Path(__file__).resolve().parent / "artifacts" / ".r1_gold.20260921.json"
 
 ECHO_RE = re.compile(r"(運通|运通).{0,40}(核實|核实)")  # 热词回声串的指纹
 

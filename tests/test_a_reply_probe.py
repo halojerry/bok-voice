@@ -52,7 +52,7 @@ def _clean_famine_state(monkeypatch):
 
 
 class _FakeResp:
-    """urlopen 返回值替身:contextlib.closing 只要求 close()。"""
+    """urllib 返回值替身:contextlib.closing 只要求 close()。"""
 
     def __init__(self) -> None:
         self.closed = False
@@ -61,62 +61,63 @@ class _FakeResp:
         self.closed = True
 
 
-def _patch_urlopen(monkeypatch, fn):
-    monkeypatch.setattr(urllib.request, "urlopen", fn)
+def _patch_http_call(monkeypatch, fn):
+    """_http_call（http.client 闸门单点）替身——alive 腿全部经它出站。"""
+    monkeypatch.setattr(agent_mod, "_http_call", fn)
 
 
 # ------------------------------------------------------------------ ① 探活判据
 
 
 def test_alive_on_any_http_response(monkeypatch):
-    """有 HTTP 响应（2xx/3xx）=活;探活 URL 必须是 {base}/models,带超时。"""
+    """有 HTTP 响应（2xx/3xx/4xx）=活;探活 URL 必须是 {base}/models,带超时。"""
     calls: list[tuple[str, float]] = []
 
-    def fake(url, timeout=None):
-        calls.append((url, timeout))
-        return _FakeResp()
+    def fake(url, method="GET", *, body=None, headers=None, timeout_s=5.0):
+        calls.append((url, timeout_s))
+        return 200, b""
 
-    _patch_urlopen(monkeypatch, fake)
+    _patch_http_call(monkeypatch, fake)
     assert agent_mod._a_reply_endpoint_alive("http://127.0.0.1:1237/v1") is True
     assert calls == [("http://127.0.0.1:1237/v1/models", 1.0)]
 
 
 def test_alive_on_http_error(monkeypatch):
-    """401/404/5xx 等 HTTPError 同判「端点在场」（镜像 interpret._mt_endpoint_alive）。"""
+    """401/404/5xx 同判「端点在场」（http.client 形态=4xx 不抛，status 原样回）。"""
 
-    def fake(url, timeout=None):
-        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+    def fake(url, method="GET", *, body=None, headers=None, timeout_s=5.0):
+        return 404, b"Not Found"
 
-    _patch_urlopen(monkeypatch, fake)
+    _patch_http_call(monkeypatch, fake)
     assert agent_mod._a_reply_endpoint_alive("http://127.0.0.1:1237/v1") is True
 
 
 def test_dead_on_connection_error(monkeypatch):
-    """connection refused（URLError）=死——死车道的实弹形状。"""
+    """connection refused（OSError）=死——死车道的实弹形状。"""
 
-    def fake(url, timeout=None):
-        raise urllib.error.URLError(ConnectionRefusedError("connection refused"))
+    def fake(url, method="GET", *, body=None, headers=None, timeout_s=5.0):
+        raise ConnectionRefusedError("connection refused")
 
-    _patch_urlopen(monkeypatch, fake)
+    _patch_http_call(monkeypatch, fake)
     assert agent_mod._a_reply_endpoint_alive("http://127.0.0.1:1237/v1") is False
 
 
 def test_dead_on_timeout(monkeypatch):
-    def fake(url, timeout=None):
+    def fake(url, method="GET", *, body=None, headers=None, timeout_s=5.0):
         raise TimeoutError("timed out")
 
-    _patch_urlopen(monkeypatch, fake)
+    _patch_http_call(monkeypatch, fake)
     assert agent_mod._a_reply_endpoint_alive("http://127.0.0.1:1237/v1") is False
 
 
 def test_empty_base_dead_without_request(monkeypatch):
     called = []
 
-    def fake(url, timeout=None):
+    def fake(url, method="GET", *, body=None, headers=None, timeout_s=5.0):
         called.append(url)
-        return _FakeResp()
+        return 200, b""
 
-    _patch_urlopen(monkeypatch, fake)
+    _patch_http_call(monkeypatch, fake)
     assert agent_mod._a_reply_endpoint_alive("") is False
     assert called == []
 
@@ -124,11 +125,11 @@ def test_empty_base_dead_without_request(monkeypatch):
 def test_trailing_slash_normalized(monkeypatch):
     seen = []
 
-    def fake(url, timeout=None):
+    def fake(url, method="GET", *, body=None, headers=None, timeout_s=5.0):
         seen.append(url)
-        return _FakeResp()
+        return 200, b""
 
-    _patch_urlopen(monkeypatch, fake)
+    _patch_http_call(monkeypatch, fake)
     assert agent_mod._a_reply_endpoint_alive("http://127.0.0.1:1237/v1/") is True
     assert seen == ["http://127.0.0.1:1237/v1/models"]
 
@@ -136,10 +137,10 @@ def test_trailing_slash_normalized(monkeypatch):
 def test_never_raises_on_weird_base(monkeypatch):
     """坏 base（非 URL 文本）=死,绝不外抛（装配点经 to_thread 调用）。"""
 
-    def fake(url, timeout=None):
+    def fake(url, method="GET", *, body=None, headers=None, timeout_s=5.0):
         raise ValueError("unknown url type")
 
-    _patch_urlopen(monkeypatch, fake)
+    _patch_http_call(monkeypatch, fake)
     assert agent_mod._a_reply_endpoint_alive("not-a-url") is False
 
 

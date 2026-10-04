@@ -8,9 +8,14 @@ The prompt is rendered from a Jinja2 template and relies on
 
 import re
 
-from jinja2 import Template
+from jinja2.sandbox import SandboxedEnvironment
 
 from speech_to_speech.LLM.tool_call.function_tool import FunctionTool
+
+# Rendering runs through a SANDBOXED environment: tool names/descriptions are
+# developer- or operator-supplied (semi-trusted content), and the sandbox keeps
+# any accidental template syntax inside them inert.
+_ENV = SandboxedEnvironment(keep_trailing_newline=True)
 
 # ---------------------------------------------------------------------------
 # Default delimiters
@@ -26,7 +31,7 @@ END_CODE = "</code>"
 # ``.to_code_prompt()`` is called inside the template.
 # ---------------------------------------------------------------------------
 
-TOOL_PROMPT_TEMPLATE = Template(
+TOOL_PROMPT_TEMPLATE = _ENV.from_string(
     """\
 Available tools:
 
@@ -41,13 +46,12 @@ Rules:
 - Keep tags out of prose. Keep prose outside tags brief, and do not claim tool results before a tool result is available.
 - Use named arguments only; quote strings. Omit optional args instead of placeholder values like "random", "none", "", or null.
 - Keep every tool call in a separate block and preserve the intended text/tool order.\
-""",
-    keep_trailing_newline=True,
+"""
 )
 
 # Text-channel variant: same call format and structural rules, with explicit
 # guidance to skip a preamble before a tool call.
-TEXT_TOOL_PROMPT_TEMPLATE = Template(
+TEXT_TOOL_PROMPT_TEMPLATE = _ENV.from_string(
     """\
 Available tools:
 
@@ -63,8 +67,7 @@ Rules:
 - Do not mention tags, functions, or tools in your prose, and do not claim tool results before a tool result is available.
 - Use named arguments only; quote strings. Omit optional args instead of placeholder values like "random", "none", "", or null.
 - Keep every tool call in a separate block and preserve the intended text/tool order.\
-""",
-    keep_trailing_newline=True,
+"""
 )
 
 

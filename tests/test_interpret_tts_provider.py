@@ -395,34 +395,49 @@ def test_mt_endpoint_alive_any_http_response_is_alive(monkeypatch):
 
 def test_mt_endpoint_alive_2xx_via_stub(monkeypatch):
     """2xx(有响应体)=活;空 base=死(不发起请求)。"""
-    import urllib.request
+    import http.client
 
     calls: list[str] = []
 
-    class _Resp:
-        def close(self) -> None:  # pragma: no cover - 关闭即释放
+    class _Conn:
+        def __init__(self, host, port, timeout=None):
+            self._host = host
+
+        def request(self, method, path):
+            calls.append(path)
+
+        def getresponse(self):
+            class _R:
+                def read(self):
+                    return b"ok"
+
+            return _R()
+
+        def close(self):
             pass
 
-    def _ok(url, timeout=None):
-        calls.append(url)
-        return _Resp()
-
-    monkeypatch.setattr(urllib.request, "urlopen", _ok)
+    monkeypatch.setattr(http.client, "HTTPConnection", _Conn)
     assert interpret._mt_endpoint_alive("http://127.0.0.1:1236/v1/") is True
-    assert calls == ["http://127.0.0.1:1236/v1/models"]
+    assert calls == ["/v1/models"]
     assert interpret._mt_endpoint_alive("") is False
-    assert calls == ["http://127.0.0.1:1236/v1/models"]  # 空 base 短路
+    assert calls == ["/v1/models"]  # 空 base 短路
 
 
 def test_mt_endpoint_alive_connection_error_is_dead(monkeypatch):
     """连接错误/超时=死(探活失败是数据不是异常,绝不外抛)。"""
-    import urllib.error
-    import urllib.request
+    import http.client
 
-    def _refused(*_args, **_kwargs):
-        raise urllib.error.URLError("connection refused")
+    class _Refused:
+        def __init__(self, *a, **kw):
+            pass
 
-    monkeypatch.setattr(urllib.request, "urlopen", _refused)
+        def request(self, method, path):
+            raise ConnectionRefusedError("connection refused")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(http.client, "HTTPConnection", _Refused)
     assert interpret._mt_endpoint_alive("http://127.0.0.1:1236/v1") is False
 
 

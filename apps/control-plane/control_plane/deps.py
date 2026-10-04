@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json as _json
 import os
+import re
 
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
@@ -81,6 +82,34 @@ QA_DIGEST_TABLE_DDL: tuple[str, ...] = (
 )
 
 
+_SQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _sql_ident(name: str) -> str:
+    """SQL 标识符白名单（仅用于迁移里字面量已知的表/列名拼接位）。"""
+    if not _SQL_IDENT_RE.match(name or ""):
+        raise ValueError(f"unsafe SQL identifier: {name!r}")
+    return name
+
+
+def _exec_bound(conn, stmt, params=None):
+    """执行带绑定参数的语句：编译成当前方言的占位符形态后交 exec_driver_sql。
+
+    值恒走绑定参数（无字符串拼接）；sqlite 走 qmark 位置参数、Postgres 走
+    pyformat 命名参数——两方言的占位符由方言编译器产出，行为与 conn.execute 等价。
+    """
+    compiled = stmt.compile(dialect=conn.dialect)
+    values = (
+        compiled.construct_params(params)
+        if params is not None
+        else compiled.construct_params()
+    )
+    if conn.dialect.paramstyle in ("qmark", "format", "numeric"):
+        keys = compiled.positiontup or tuple(values)
+        return conn.exec_driver_sql(str(compiled), tuple(values[k] for k in keys))
+    return conn.exec_driver_sql(str(compiled), values)
+
+
 def build_engine() -> Engine | None:
     url = os.environ.get("DATABASE_URL", "")
     if url:
@@ -125,7 +154,9 @@ def build_engine() -> Engine | None:
                 if not insp.has_table(table):
                     return False
                 if column not in {c["name"] for c in insp.get_columns(table)}:
-                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
+                    conn.exec_driver_sql(
+                        f"ALTER TABLE {_sql_ident(table)} ADD COLUMN {ddl}"
+                    )
                     return True
                 return False
 
@@ -402,7 +433,7 @@ def build_engine() -> Engine | None:
                 # 建索引前先去重(终审修复):历史竞态可能已留下同 (license_id,
                 # fingerprint) 重复行,直接 CREATE UNIQUE INDEX 会失败。每组保留
                 # MAX(id) 一行——方言可移植写法(SQLite/Postgres 通用,禁 rowid)。
-                _deduped = conn.execute(text(NODES_FP_DEDUPE_SQL))
+                _deduped = conn.exec_driver_sql(NODES_FP_DEDUPE_SQL)
                 if _deduped.rowcount > 0:
                     print(
                         "[deps] nodes duplicate (license_id, fingerprint) rows "
@@ -410,10 +441,10 @@ def build_engine() -> Engine | None:
                         "(kept newest MAX(id) row per group)"
                     )
                 try:
-                    conn.execute(text(
+                    conn.exec_driver_sql(
                         "CREATE UNIQUE INDEX IF NOT EXISTS uq_nodes_license_fingerprint "
                         "ON nodes (license_id, fingerprint) WHERE license_id <> ''"
-                    ))
+                    )
                 except Exception as exc:
                     # 专属告警(终审修复):不再落泛化的 migration skipped 文案,
                     # 索引建不起来(如仍有个别脏行)必须可定位。
@@ -431,7 +462,7 @@ def build_engine() -> Engine | None:
 
             with engine.begin() as conn:
                 for ddl in QA_DIGEST_TABLE_DDL:
-                    conn.execute(text(ddl))
+                    conn.exec_driver_sql(ddl)
         except Exception as exc:  # pragma: no cover - 建表失败不阻断启动
             print(f"[deps] qa digest tables skipped: {exc}")
 
@@ -448,12 +479,12 @@ def build_engine() -> Engine | None:
                     "call_sessions",
                     "conversation_templates",
                 ):
-                    conn.execute(
-                        text(f"UPDATE {_tbl} SET language='cantonese' WHERE language='yue'")
+                    conn.exec_driver_sql(
+                        f"UPDATE {_sql_ident(_tbl)} SET language='cantonese' WHERE language='yue'"
                     )
                 # persona reference_audio JSON 的键 yue → cantonese（值=音色 ID 不动）。
-                _rows = conn.execute(
-                    text("SELECT id, reference_audio FROM persona_profiles WHERE reference_audio LIKE '%yue%'")
+                _rows = conn.exec_driver_sql(
+                    "SELECT id, reference_audio FROM persona_profiles WHERE reference_audio LIKE '%yue%'"
                 ).fetchall()
                 for _rid, _raw in _rows:
                     if not _raw:
@@ -468,7 +499,8 @@ def build_engine() -> Engine | None:
                         _m["cantonese"] = _m.pop("yue")
                     else:
                         _m.pop("yue", None)
-                    conn.execute(
+                    _exec_bound(
+                        conn,
                         text("UPDATE persona_profiles SET reference_audio=:v WHERE id=:id"),
                         {"v": _json.dumps(_m, ensure_ascii=False), "id": _rid},
                     )
@@ -482,7 +514,9 @@ def build_engine() -> Engine | None:
                     "vad_json",
                 )
                 for _bk in _scols:
-                    _srows = conn.execute(text(f"SELECT id, {_bk} FROM global_settings")).fetchall()
+                    _srows = conn.exec_driver_sql(
+                        f"SELECT id, {_sql_ident(_bk)} FROM global_settings"
+                    ).fetchall()
                     for _gid, _raw in _srows:
                         if not _raw:
                             continue
@@ -497,8 +531,9 @@ def build_engine() -> Engine | None:
                             _b.setdefault("speaker_cantonese", _b.pop("speaker_yue"))
                             _changed = True
                         if _changed:
-                            conn.execute(
-                                text(f"UPDATE global_settings SET {_bk}=:v WHERE id=:id"),
+                            _exec_bound(
+                                conn,
+                                text(f"UPDATE global_settings SET {_sql_ident(_bk)}=:v WHERE id=:id"),
                                 {"v": _json.dumps(_b, ensure_ascii=False), "id": _gid},
                             )
         except Exception as exc:  # pragma: no cover - 数据迁移失败不阻断启动
@@ -513,12 +548,10 @@ def build_engine() -> Engine | None:
                 import json as _pubjson
 
                 with engine.begin() as conn:
-                    _rows = conn.execute(
-                        text(
-                            "SELECT id, steps_json, graph_json, hotwords, tone_override,"
-                            " opening, core, objection, closing, language"
-                            " FROM conversation_templates WHERE published_json=''"
-                        )
+                    _rows = conn.exec_driver_sql(
+                        "SELECT id, steps_json, graph_json, hotwords, tone_override,"
+                        " opening, core, objection, closing, language"
+                        " FROM conversation_templates WHERE published_json=''"
                     ).fetchall()
                     _backfilled = 0
                     for _row in _rows:
@@ -541,7 +574,8 @@ def build_engine() -> Engine | None:
                             "closing": _closing or "",
                             "language": _lang or "",
                         }
-                        conn.execute(
+                        _exec_bound(
+                            conn,
                             text("UPDATE conversation_templates SET published_json=:v WHERE id=:id"),
                             {"v": _pubjson.dumps(_payload, ensure_ascii=False), "id": _rid},
                         )
@@ -560,7 +594,7 @@ def build_engine() -> Engine | None:
             from bok_voice_business_db.vector_models import VectorBase
 
             with engine.begin() as conn:
-                conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+                conn.exec_driver_sql("CREATE EXTENSION IF NOT EXISTS vector")
             VectorBase.metadata.create_all(engine)
             _migrate_knowledge_content_hash(engine)
         except Exception as exc:  # pragma: no cover - sqlite / missing extension
@@ -571,10 +605,11 @@ def build_engine() -> Engine | None:
             from sqlalchemy import text
 
             with engine.begin() as conn:
-                n = conn.execute(text("SELECT COUNT(*) FROM filler_entries")).scalar()
+                n = conn.exec_driver_sql("SELECT COUNT(*) FROM filler_entries").scalar()
                 if not n:
                     for row in _FILLER_SEEDS:
-                        conn.execute(
+                        _exec_bound(
+                            conn,
                             text(
                                 # enabled 用 TRUE 字面量（SQLite 3.23+/Postgres 都认）：
                                 # 写 1 在 SQLite（INTEGER 亲和）能存，Postgres 的 boolean
@@ -614,17 +649,19 @@ def _migrate_knowledge_content_hash(engine: Engine) -> None:
     with engine.begin() as conn:
         cols = {c["name"] for c in insp.get_columns("knowledge_chunks")}
         if "content_hash" not in cols:
-            conn.execute(
-                text("ALTER TABLE knowledge_chunks ADD COLUMN content_hash VARCHAR(64) DEFAULT ''")
+            conn.exec_driver_sql(
+                "ALTER TABLE knowledge_chunks ADD COLUMN content_hash VARCHAR(64) DEFAULT ''"
             )
-        rows = conn.execute(
+        rows = _exec_bound(
+            conn,
             select(KnowledgeChunk.id, KnowledgeChunk.text).where(
                 (KnowledgeChunk.content_hash == "") | (KnowledgeChunk.content_hash.is_(None))
-            )
+            ),
         ).all()
         for cid, txt in rows:
             digest = hashlib.sha256((txt or "").encode("utf-8")).hexdigest()[:32]
-            conn.execute(
+            _exec_bound(
+                conn,
                 text("UPDATE knowledge_chunks SET content_hash=:h WHERE id=:id"),
                 {"h": digest, "id": cid},
             )
@@ -673,11 +710,11 @@ def read_model_routing_raw() -> str:
 
     try:
         with factory() as session:
-            row = session.execute(
+            row = session.scalars(
                 text("SELECT model_routing_json FROM global_settings WHERE id = :gid"),
                 {"gid": _ROUTING_ROW_ID},
-            ).fetchone()
-        return str(row[0] or "") if row else ""
+            ).first()
+        return str(row or "") if row is not None else ""
     except Exception as exc:  # pragma: no cover - 读失败不破坏结算/挖掘主链
         print(f"[deps] model_routing read skipped: {exc!r}")
         return ""
@@ -692,12 +729,13 @@ def write_model_routing_raw(raw: str) -> None:
         return
     from sqlalchemy import text
 
+    from bok_voice_business_db import models
     from bok_voice_business_db.repository import SqlAlchemyBusinessRepository
 
     with factory() as session:
-        row = session.execute(
+        row = session.scalars(
             text("SELECT id FROM global_settings WHERE id = :gid"), {"gid": _ROUTING_ROW_ID}
-        ).fetchone()
+        ).first()
         if row is None:
             # 行缺省=先经 ORM 落一行业务默认值（default_settings 全段 JSON；
             # updated_at 等 nullable/DateTime 类型由 ORM 兜住，SQLite/PG 双认），
@@ -705,8 +743,10 @@ def write_model_routing_raw(raw: str) -> None:
             # （首版手写 INSERT 曾漏 updated_at NOT NULL，SQLite 冒烟实证）。
             repo = SqlAlchemyBusinessRepository(factory())
             repo.save_settings(dict(repo.get_settings()))
-        session.execute(
-            text("UPDATE global_settings SET model_routing_json = :raw WHERE id = :gid"),
-            {"raw": raw, "gid": _ROUTING_ROW_ID},
+        session.query(models.GlobalSetting).filter(
+            models.GlobalSetting.id == _ROUTING_ROW_ID
+        ).update(
+            {models.GlobalSetting.model_routing_json: raw},
+            synchronize_session=False,
         )
         session.commit()

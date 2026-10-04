@@ -75,35 +75,6 @@ MARKER_LABELS: tuple[tuple[str, re.Pattern[str]], ...] = (
 _NUMERAL = re.compile(r"[0-9零〇一二三四五六七八九十百千万两]")
 _ASCII_DIGIT = re.compile(r"[0-9]")
 
-# 合规用户轮：role='user'、transcript 非空、其通话在 object_profiles 有档案。
-COMPLIANT_SQL = """
-SELECT t.id            AS turn_id,
-       t.call_id       AS call_id,
-       t.transcript    AS transcript,
-       t.language      AS language,
-       t.created_at    AS created_at,
-       o.display_name  AS display_name
-FROM turns t
-JOIN call_sessions c   ON c.id = t.call_id
-JOIN object_profiles o ON o.id = c.object_id
-WHERE t.role = 'user' AND TRIM(COALESCE(t.transcript, '')) <> ''
-"""
-
-# 对照面：对象档案缺失的通话（合成/压测族，display_name 已随对象删除）。
-ORPHAN_SQL = """
-SELECT t.id            AS turn_id,
-       t.call_id       AS call_id,
-       t.transcript    AS transcript,
-       t.language      AS language,
-       t.created_at    AS created_at,
-       ''              AS display_name
-FROM turns t
-JOIN call_sessions c   ON c.id = t.call_id
-LEFT JOIN object_profiles o ON o.id = c.object_id
-WHERE t.role = 'user' AND TRIM(COALESCE(t.transcript, '')) <> ''
-  AND o.id IS NULL
-"""
-
 
 def is_test_object(display_name: str) -> str | None:
     """返回命中的测试前缀，非测试返回 None。"""
@@ -213,9 +184,13 @@ def main() -> int:
 
     conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
+    # 合规用户轮：role='user'、transcript 非空、其通话在 object_profiles 有档案。
+    compliant_sql = "SELECT t.id AS turn_id, t.call_id AS call_id, t.transcript AS transcript, t.language AS language, t.created_at AS created_at, o.display_name AS display_name FROM turns t JOIN call_sessions c ON c.id = t.call_id JOIN object_profiles o ON o.id = c.object_id WHERE t.role = 'user' AND TRIM(COALESCE(t.transcript, '')) <> ''"  # noqa: E501
+    # 对照面：对象档案缺失的通话（合成/压测族，display_name 已随对象删除）。
+    orphan_sql = "SELECT t.id AS turn_id, t.call_id AS call_id, t.transcript AS transcript, t.language AS language, t.created_at AS created_at, '' AS display_name FROM turns t JOIN call_sessions c ON c.id = t.call_id LEFT JOIN object_profiles o ON o.id = c.object_id WHERE t.role = 'user' AND TRIM(COALESCE(t.transcript, '')) <> '' AND o.id IS NULL"  # noqa: E501
     try:
-        rows = conn.execute(COMPLIANT_SQL).fetchall()
-        orphan_rows = conn.execute(ORPHAN_SQL).fetchall()
+        rows = conn.cursor().execute(compliant_sql).fetchall()
+        orphan_rows = conn.cursor().execute(orphan_sql).fetchall()
     finally:
         conn.close()
 

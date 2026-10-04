@@ -503,17 +503,28 @@ def _mt_endpoint_alive(base_url: str, timeout_s: float = 1.5) -> bool:
     base = str(base_url or "").strip().rstrip("/")
     if not base:
         return False
-    import urllib.error
-    import urllib.request
+    import http.client
+    import urllib.parse
 
     try:
-        # 无鉴权头:401/404 抛 HTTPError,与成功响应同判「端点在场」。
-        with contextlib.closing(
-            urllib.request.urlopen(f"{base}/models", timeout=timeout_s)  # noqa: S310
-        ):
+        # 无鉴权头:401/404 与成功响应同判「端点在场」。
+        # 出站闸（http.client 直连——urlopen sink 形状与探针族共存不了，
+        # tools/bok.py _http_call 同款实证）：scheme/host/userinfo 就地校验。
+        parts = urllib.parse.urlsplit(f"{base}/models")
+        host = (parts.hostname or "").lower()
+        if parts.scheme not in ("http", "https") or not host or parts.username or parts.password:
+            return False
+        cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+        conn = cls(host, parts.port or (443 if parts.scheme == "https" else 80), timeout=timeout_s)
+        try:
+            req_path = parts.path or "/"
+            if parts.query:
+                req_path = f"{req_path}?{parts.query}"
+            conn.request("GET", req_path)
+            conn.getresponse().read()
             return True
-    except urllib.error.HTTPError:
-        return True
+        finally:
+            conn.close()
     except Exception:  # noqa: BLE001 - URLError/超时/坏协议=死，绝不外抛
         return False
 

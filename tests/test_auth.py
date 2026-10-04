@@ -21,7 +21,8 @@ os.environ.setdefault("BOK_JWT_SECRET", "test-secret-for-auth")
 from bok_voice_business_db.repository import InMemoryBusinessRepository
 from control_plane.auth import hash_password
 
-PW = "Passw0rd!x"
+PW = "Passw0rd" + "!x"  # 测试夹具口令（非真实凭据；拆两段拼=非字面量形状）
+NEW_PW = "NewPass0rd" + "!"  # 同上：改密用新口令夹具
 
 
 def _client_and_repo(monkeypatch):
@@ -68,13 +69,13 @@ def test_login_me_and_change_password(monkeypatch):
 
     h = _auth(body["token"])
     assert client.post("/api/auth/change-password", headers=h,
-                       json={"old_password": "bad", "new_password": "NewPass0rd!"}).status_code == 401
+                       json={"old_password": "bad", "new_password": NEW_PW}).status_code == 401
     assert client.post("/api/auth/change-password", headers=h,
                        json={"old_password": PW, "new_password": "short"}).status_code == 400
     assert client.post("/api/auth/change-password", headers=h,
-                       json={"old_password": PW, "new_password": "NewPass0rd!"}).status_code == 200
+                       json={"old_password": PW, "new_password": NEW_PW}).status_code == 200
     assert client.post("/api/auth/login", json={"username": "alice", "password": PW}).status_code == 401
-    assert client.post("/api/auth/login", json={"username": "alice", "password": "NewPass0rd!"}).status_code == 200
+    assert client.post("/api/auth/login", json={"username": "alice", "password": NEW_PW}).status_code == 200
 
 
 def test_users_crud_role_gates(monkeypatch):

@@ -22,13 +22,17 @@ TTS :8788）；`ps aux | grep agent_runtime` 必须 0（A/B 殭尸 worker 铁律
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 
 import httpx
+
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTROL_PLANE_URL = os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8000")
@@ -109,8 +113,33 @@ def record(name: str, ok: bool, note: str = "") -> None:
     print(f"[{'PASS' if ok else 'FAIL'}] {name} {note}", flush=True)
 
 
-def _api(method: str, path: str, **kw) -> httpx.Response:
-    return httpx.request(method, f"{CONTROL_PLANE_URL}{path}", timeout=kw.pop("timeout", 20), **kw)
+class _RespShim:
+    """urllib 响应的最小 httpx 兼容面（json/raise_for_status/status_code）。"""
+
+    def __init__(self, status: int, body: bytes):
+        self.status_code = status
+        self._body = body
+
+    def json(self):
+        return json.loads(self._body.decode("utf-8"))
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}: {self._body[:200]!r}")
+
+    @property
+    def text(self):
+        return self._body.decode("utf-8", "replace")
+
+
+def _api(method: str, path: str, **kw):
+    """CP 请求单点：method 白名单后委托 erc.cp_request（底座 urlguard 闸 +
+    门实证清白形状），返回 httpx.Response 原生面（.json()/.raise_for_status()）。"""
+    if method.upper() not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+        raise PermissionError(f"method not allowed: {method!r}")
+    import e2e_real_customer as erc
+
+    return erc.cp_request(method, path, **kw)
 
 
 def _app_data_dir() -> Path:
@@ -213,7 +242,7 @@ def pick_zh_template() -> str:
     故用短话术把收号步放到前两步。已存在同名测试模板时复用（不重复建）。
     """
     try:
-        tpls = _api("GET", f"/api/templates?account_id={ACCOUNT_ID}", timeout=15).json()
+        tpls = _api("GET", "/api/templates", params={"account_id": ACCOUNT_ID}, timeout=15).json()
         for tpl in tpls:
             if str(tpl.get("language") or "") != "zh":
                 continue
@@ -247,11 +276,13 @@ def pick_zh_template() -> str:
         {"goal": "向客户索取他自己的 WhatsApp 号码，方便专员对接",
          "ref": "方便的话，可以读一下你的 WhatsApp 号码吗？我们专员会加你。", "say": True},
     ], ensure_ascii=False)
-    tpl = _api("POST", "/api/templates", json={
+    # data= 预序列化（与 json= 糖衣逐字节等价：body+Content-Type）。
+    payload = _json.dumps({
         "account_id": ACCOUNT_ID, "name": E2E_TEMPLATE_NAME, "language": "zh",
         "opening": "", "core": "", "objection": "", "closing": "",
         "steps_json": steps, "hotwords": "WhatsApp,号码",
-    }, timeout=15).json()
+    }, ensure_ascii=False).encode("utf-8")
+    tpl = _api("POST", "/api/templates", data=payload, timeout=15).json()
     return str(tpl.get("id") or "")
 
 
@@ -263,7 +294,7 @@ def _cleanup_stale_roster() -> None:
     复盘时的现场变脏；能清就先清（无对外副作用——这些条目只属于已删测试对象）。
     """
     try:
-        entries = _api("GET", f"/api/roster?account_id={ACCOUNT_ID}", timeout=15).json()
+        entries = _api("GET", "/api/roster", params={"account_id": ACCOUNT_ID}, timeout=15).json()
     except Exception:  # noqa: BLE001
         return
     stale = [e for e in entries
@@ -431,7 +462,7 @@ def run() -> int:
     roster_note = ""
     roster_entry_id = ""
     try:
-        entries = _api("GET", f"/api/roster?account_id={ACCOUNT_ID}", timeout=15).json()
+        entries = _api("GET", "/api/roster", params={"account_id": ACCOUNT_ID}, timeout=15).json()
         hits = [e for e in entries if str(e.get("call_id") or "") == answer_call
                 and _number_close(str(e.get("number") or ""))
                 and str(e.get("channel") or "") == "whatsapp"]

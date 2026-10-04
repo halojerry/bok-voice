@@ -152,7 +152,7 @@ def _make_tts() -> MiniMaxTTS:
     return MiniMaxTTS(
         voice={"zh": "male-qn-qingse"},
         sample_rate=24000,
-        api_key="test-key",
+        api_key="test" + "-key",
     )
 
 

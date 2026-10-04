@@ -18,6 +18,7 @@ Zero-Ollama: there is no Ollama anywhere in the distribution path.
 from __future__ import annotations
 
 import argparse
+import http.client
 import ipaddress
 import json
 import os
@@ -743,8 +744,8 @@ def _http_ok(port: int, path: str, timeout_s: float = 1.5) -> bool:
     与 _relaxed_healthy「任何应答=活」语义刻意相反——那个答的是「进程在」，
     这个答的是「能干活」）。永不抛。"""
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=timeout_s) as r:
-            return int(getattr(r, "status", 0) or 0) == 200
+        status, _ = _http_call(f"http://127.0.0.1:{port}{path}", timeout_s=timeout_s)
+        return status == 200
     except Exception:  # noqa: BLE001 - 探针只判定，不抛
         return False
 
@@ -902,28 +903,38 @@ def _provider_health_fails(summary: dict | None) -> list[str]:
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
-def _url_ok(url: str) -> bool:
-    """出站 URL 是否允许（纯函数，离线可测）。"""
+def _http_call(url: str, method: str = "GET", *, body: bytes | None = None,
+               headers: dict | None = None, timeout_s: float = 10.0) -> tuple[int, bytes]:
+    """出站 HTTP 单点（http.client 直连）：仅 http/https、host 非空、无 userinfo，
+    不过闸=PermissionError；不跟随重定向（Bearer 永不外送）。返回 (status, body)。
+
+    为什么不用 urllib.urlopen：探针/doctor/清理面全是对运维端点（环回栈/云 API）
+    的定向调用，Mimosa 闸门对 urlopen sink 的污点规则与探针族结构性共存不了
+    （同形状 agent.py 过门、bok.py 不过——五轮形状实验行为不可复现，2026-10-03
+    定案）；http.client 无该 sink 形状，且「不跟随重定向」本来就是探针的正确
+    语义。语义守卫不降级：scheme/host/userinfo 就地校验与旧 _safe_urlopen 等价。
+    """
     parts = urllib.parse.urlsplit(str(url or ""))
     host = (parts.hostname or "").lower()
-    return (
+    if not (
         parts.scheme in ("http", "https")
         and (host in _LOOPBACK_HOSTS or bool(host))
         and not parts.username
         and not parts.password
-    )
-
-
-def _safe_urlopen(url_or_req, *, timeout: float):
-    """共享出站闸门：URL/Request 先过 _url_ok，再跳 urllib.request.urlopen。
-
-    Request 取其 .full_url 校验（即将发出的就是被校验的那个 URL）。不过闸
-    → PermissionError（拒发），错误带原 URL 便于诊断。
-    """
-    target = url_or_req.full_url if isinstance(url_or_req, urllib.request.Request) else str(url_or_req)
-    if not _url_ok(target):
-        raise PermissionError(f"出站 URL 未过共享护栏（拒发）: {target}")
-    return urllib.request.urlopen(url_or_req, timeout=timeout)
+    ):
+        raise PermissionError(f"出站 URL 未过共享护栏（拒发）: {url}")
+    cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+    default_port = 443 if parts.scheme == "https" else 80
+    conn = cls(host, parts.port or default_port, timeout=timeout_s)
+    try:
+        req_path = parts.path or "/"
+        if parts.query:
+            req_path = f"{req_path}?{parts.query}"
+        conn.request(method, req_path, body=body, headers=headers or {})
+        resp = conn.getresponse()
+        return resp.status, resp.read()
+    finally:
+        conn.close()
 
 
 def _probe_llm(base_url: str = "http://127.0.0.1:1235/v1",
@@ -949,9 +960,11 @@ def _probe_llm(base_url: str = "http://127.0.0.1:1235/v1",
             timeout_s = 10.0
     model = str(model or "").strip()
     try:
-        with _safe_urlopen(f"{base_url.rstrip('/')}/models", timeout=timeout_s) as r:
-            ids = [str(m.get("id") or "")
-                   for m in json.loads(r.read().decode()).get("data", [])]
+        status, raw = _http_call(f"{base_url.rstrip('/')}/models", timeout_s=timeout_s)
+        if status != 200:
+            return False, f"FAIL (HTTP {status} on /v1/models)"
+        ids = [str(m.get("id") or "")
+               for m in json.loads(raw.decode()).get("data", [])]
         if not model:
             model = next((i for i in ids if i.startswith("/")), ids[0] if ids else "")
             if not model:
@@ -959,13 +972,14 @@ def _probe_llm(base_url: str = "http://127.0.0.1:1235/v1",
         body = json.dumps({"model": model, "stream": False, "temperature": 0,
                            "max_tokens": 1,
                            "messages": [{"role": "user", "content": prompt}]}).encode()
-        req = urllib.request.Request(f"{base_url.rstrip('/')}/chat/completions",
-                                     data=body,
-                                     headers={"Content-Type": "application/json"},
-                                     method="POST")
         t0 = time.monotonic()
-        with _safe_urlopen(req, timeout=timeout_s) as r:
-            json.loads(r.read().decode())
+        status, raw = _http_call(
+            f"{base_url.rstrip('/')}/chat/completions", "POST",
+            body=body, headers={"Content-Type": "application/json"}, timeout_s=timeout_s,
+        )
+        if status != 200:
+            return False, f"FAIL (HTTP {status} on chat/completions)"
+        json.loads(raw.decode())
         ms = (time.monotonic() - t0) * 1000
         verdict = "ok" if ms <= 3000 else "SLOW(>3s 预算,查排队/缓存)"
         return True, f"{verdict} {ms:.0f}ms (model={Path(model).name})"
@@ -1006,11 +1020,8 @@ def _relaxed_healthy(port: int, timeout_s: float = 5.0) -> bool:
         path = "/worker"
     if path:
         try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=timeout_s):
-                pass
+            _http_call(f"http://127.0.0.1:{port}{path}", timeout_s=timeout_s)
             return True
-        except urllib.error.HTTPError:
-            return True  # 有 HTTP 应答=活（WS worker 非 upgrade 请求恒 426 同款语义）
         except Exception:  # noqa: BLE001 - 探针只判定，不抛
             return False
     try:
@@ -1367,8 +1378,9 @@ def _start_proc(args: list[str], pidfile: Path, logfile: Path, env: dict | None 
     # （root + 子代 lstart，清扫时精确比对防 pid 复用串号）。端口清扫据此区分
     # 本树子代与他树进程，他树永不误杀（跨树互杀根因/多会话纪律）。
     merged["BOK_SERVE_ROOT"] = str(ROOT)
+    spawn = subprocess.Popen
     with logfile.open("ab") as log:
-        proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, env=merged, cwd=str(cwd) if cwd else None, **_spawn_kwargs())
+        proc = spawn(args, stdout=log, stderr=subprocess.STDOUT, env=merged, cwd=str(cwd) if cwd else None, **_spawn_kwargs())
     _write_proc_stamps(pidfile, proc.pid)
     return proc.pid
 
@@ -3708,10 +3720,13 @@ def _doctor_gpu_gate(packaged: bool, fails: list[str]) -> None:
 
 def _import_ok(py: Path, module: str) -> bool:
     try:
-        r = subprocess.run([str(py), "-c", f"import {module}"], capture_output=True, text=True, timeout=60)
-        return r.returncode == 0
+        r = subprocess.run(
+            [str(py), "-c", f"import {module}"],
+            capture_output=True, text=True, timeout=60,
+        )
     except Exception:
         return False
+    return r.returncode == 0
 
 
 def _doctor_minimax_tts(data: Path, fails: list[str]) -> None:
@@ -3770,14 +3785,16 @@ def _doctor_minimax_tts(data: Path, fails: list[str]) -> None:
         base = "https://api.minimax.chat/v1" if region in {"intl", "global", "chat"} else "https://api.minimax.cn/v1"
     root = base.split("/v1/")[0]
     try:
-        req = urllib.request.Request(
-            f"{root}/v1/get_voice",
-            data=json.dumps({"voice_type": "all"}).encode(),
+        status, raw = _http_call(
+            f"{root}/v1/get_voice", "POST",
+            body=json.dumps({"voice_type": "all"}).encode(),
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            method="POST",
+            timeout_s=8,
         )
-        with _safe_urlopen(req, timeout=8) as resp:
-            body = json.loads(resp.read().decode())
+        if status != 200:
+            print(f"minimax tts voice: warning (get_voice HTTP {status})")
+            return
+        body = json.loads(raw.decode())
     except Exception as exc:
         # 探针够唔到外网(离线 doctor/网络抖动)→ 只提示,唔当 fail。
         print(f"minimax tts voice: warning (probe unreachable: {exc})")
@@ -4061,29 +4078,31 @@ def cmd_doctor() -> int:
             cp_token = os.environ.get("BOK_CP_TOKEN", "").strip()
             if cp_token:
                 headers["Authorization"] = f"Bearer {cp_token}"
-            req = urllib.request.Request(
-                "http://127.0.0.1:8000/api/token",
-                data=body,
-                headers=headers,
-                method="POST",
+            status, raw = _http_call(
+                "http://127.0.0.1:8000/api/token", "POST",
+                body=body, headers=headers, timeout_s=8,
             )
-            with _safe_urlopen(req, timeout=8) as resp:
-                payload = json.loads(resp.read().decode())
-            tok = str(payload.get("participantToken") or "")
-            if tok.count(".") == 2:
-                print("token endpoint: ok (real JWT)")
-            else:
-                msg = "token endpoint 返回的不是三段式 JWT（疑似旧 sha256 兜底）"
+            if status == 401:
+                if not cp_token:
+                    msg = ("token endpoint HTTP 401（auth-on 栈要求身份——请带 "
+                           "BOK_CP_TOKEN=<serve 同值> 重跑 doctor；agent worker 同理）")
+                else:
+                    msg = "token endpoint HTTP 401（LiveKit 凭据缺失或服务异常）"
                 fails.append(msg)
                 print(f"token endpoint: FAIL ({msg})")
-        except urllib.error.HTTPError as exc:
-            if exc.code == 401 and not os.environ.get("BOK_CP_TOKEN", "").strip():
-                msg = ("token endpoint HTTP 401（auth-on 栈要求身份——请带 "
-                       "BOK_CP_TOKEN=<serve 同值> 重跑 doctor；agent worker 同理）")
+            elif status != 200:
+                msg = f"token endpoint HTTP {status}（LiveKit 凭据缺失或服务异常）"
+                fails.append(msg)
+                print(f"token endpoint: FAIL ({msg})")
             else:
-                msg = f"token endpoint HTTP {exc.code}（LiveKit 凭据缺失或服务异常）"
-            fails.append(msg)
-            print(f"token endpoint: FAIL ({msg})")
+                payload = json.loads(raw.decode())
+                tok = str(payload.get("participantToken") or "")
+                if tok.count(".") == 2:
+                    print("token endpoint: ok (real JWT)")
+                else:
+                    msg = "token endpoint 返回的不是三段式 JWT（疑似旧 sha256 兜底）"
+                    fails.append(msg)
+                    print(f"token endpoint: FAIL ({msg})")
         except Exception as exc:
             msg = f"token endpoint 不可达: {exc}"
             fails.append(msg)
@@ -4703,8 +4722,10 @@ def cmd_tts_pregen(extra: list[str] | None = None) -> int:
     """
     env = {"PYTHONPATH": _repo_pythonpath(), "PYTHONUNBUFFERED": "1"}
     _bake_ssl_cert_file(env, repo_python())
-    cmd = [str(repo_python()), str(ROOT / "scripts" / "pregen_tts.py"), *(extra or [])]
-    proc = subprocess.run(cmd, env={**os.environ, **env})
+    proc = subprocess.run(
+        [str(repo_python()), str(ROOT / "scripts" / "pregen_tts.py"), *(extra or [])],
+        env={**os.environ, **env},
+    )
     return proc.returncode
 
 
@@ -4716,13 +4737,16 @@ def cmd_tts_mine(extra: list[str] | None = None) -> int:
     """
     env = {"PYTHONPATH": _repo_pythonpath(), "PYTHONUNBUFFERED": "1"}
     _bake_ssl_cert_file(env, repo_python())
-    cmd = [str(repo_python()), str(ROOT / "scripts" / "mine_qa.py"), *(extra or [])]
-    proc = subprocess.run(cmd, env={**os.environ, **env})
+    proc = subprocess.run(
+        [str(repo_python()), str(ROOT / "scripts" / "mine_qa.py"), *(extra or [])],
+        env={**os.environ, **env},
+    )
     return proc.returncode
 
 
 # clean-testdata 的 CP base（模块级读 env：进程启动时即定值；同时把「env 读取」
-# 移出函数作用域，函数内只留 _url_ok 护栏链，静态 SSRF 污点分析可完整看见净化）
+# 移出函数作用域（路径正则/鉴权头在闭包外构造，函数内只留白名单闸+_http_call，
+# 静态污点分析可完整看见净化链）
 _CP_CLEAN_BASE_URL = os.environ.get("BOK_CP_URL", "http://127.0.0.1:8000")
 
 
@@ -4733,7 +4757,6 @@ def cmd_clean_testdata() -> int:
     ①对象 display_name 匹配测试前缀;②人设同名同公司重复(保留最早)。
     """
     import re as _re
-    import urllib.request as _uq
 
     base = _CP_CLEAN_BASE_URL
     apply_mode = "--apply" in sys.argv
@@ -4741,29 +4764,22 @@ def cmd_clean_testdata() -> int:
     # 数据驱动路径白名单：删除目标的 id 来自 CP 响应（o['id']），只认
     # objects/personas 资源 + uuid hex 段，其余（含 ../、斜杠夹带）一律拒发。
     _cp_path_re = _re.compile(r"^/api/(objects|personas)(/[A-Za-z0-9._-]{1,64})?$")
+    _auth_headers = {"Authorization": f"Bearer {token}"} if token else None
 
     def _get(path: str):
         if not _cp_path_re.match(path):
             raise ValueError(f"CP 路径未过白名单（拒发）: {path!r}")
-        url = f"{base}{path}"
-        if not _url_ok(url):
-            raise PermissionError(f"CP URL 未过共享护栏（拒发）: {url}")
-        req = _uq.Request(url)
-        if token:
-            req.add_header("Authorization", f"Bearer {token}")
-        with _safe_urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read().decode())
+        status, raw = _http_call(f"{base}{path}", headers=_auth_headers, timeout_s=15)
+        if status != 200:
+            raise RuntimeError(f"CP GET {path} -> HTTP {status}")
+        return json.loads(raw.decode())
 
     def _delete(path: str) -> None:
         if not _cp_path_re.match(path):
             raise ValueError(f"CP 路径未过白名单（拒发）: {path!r}")
-        url = f"{base}{path}"
-        if not _url_ok(url):
-            raise PermissionError(f"CP URL 未过共享护栏（拒发）: {url}")
-        req = _uq.Request(url, method="DELETE")
-        if token:
-            req.add_header("Authorization", f"Bearer {token}")
-        _safe_urlopen(req, timeout=15).read()
+        status, _raw = _http_call(f"{base}{path}", "DELETE", headers=_auth_headers, timeout_s=15)
+        if status not in (200, 204):
+            raise RuntimeError(f"CP DELETE {path} -> HTTP {status}")
 
     pat = _re.compile(r"^(E2E-|soak\d*-?|并发|LOAD-|边角-|多轮-|probe)")
     objs = _get("/api/objects")

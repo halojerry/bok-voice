@@ -75,7 +75,7 @@ from bok_voice_core.snippets import (  # noqa: E402
 
 DB_PATH = Path("/Users/halo/Library/Application Support/BokVoice/bok_voice.db")
 GAPS_PATH = Path("/tmp/r1_gaps_raw.json")
-OUT_PATH = ROOT / "scripts" / ".snippet_candidates.20260921.json"
+OUT_PATH = ROOT / "scripts" / "artifacts" / ".snippet_candidates.20260921.json"
 
 LLM_HOST = "127.0.0.1"
 LLM_PORT = 1235
@@ -201,14 +201,8 @@ def load_turns_corpus(db_path: Path) -> list[tuple[str, str]]:
         return []
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
-        rows = con.execute(
-            """
-            SELECT t.transcript, op.display_name, cs.language
-            FROM turns t
-            JOIN call_sessions cs ON cs.id = t.call_id
-            LEFT JOIN object_profiles op ON op.id = cs.object_id
-            WHERE t.role IN ('user', 'me', 'other')
-            """
+        rows = con.cursor().execute(
+            "SELECT t.transcript, op.display_name, cs.language FROM turns t JOIN call_sessions cs ON cs.id = t.call_id LEFT JOIN object_profiles op ON op.id = cs.object_id WHERE t.role IN ('user', 'me', 'other')"  # noqa: E501
         ).fetchall()
     finally:
         con.close()

@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 
 import pytest
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, inspect
 
 from control_plane.deps import _migrate_knowledge_content_hash
 
@@ -24,19 +24,17 @@ CREATE TABLE knowledge_chunks (
 def _seed_old_schema() -> "object":
     engine = create_engine("sqlite:///:memory:")
     with engine.begin() as conn:
-        conn.execute(text(_OLD_SCHEMA_SQL))
-        conn.execute(
-            text(
-                "INSERT INTO knowledge_chunks (id, account_id, text, path, source, embedding) "
-                "VALUES ('c1', 'acc-1', '段落甲', 'accounts/acc-1/knowledge/a.md', 'import', '')"
-            )
+        conn.exec_driver_sql(_OLD_SCHEMA_SQL)
+        conn.exec_driver_sql(
+            "INSERT INTO knowledge_chunks (id, account_id, text, path, source, embedding) "
+            "VALUES ('c1', 'acc-1', '段落甲', 'accounts/acc-1/knowledge/a.md', 'import', '')"
         )
     return engine
 
 
 def _hashes(engine) -> dict:
     with engine.connect() as conn:
-        rows = conn.execute(text("SELECT id, content_hash FROM knowledge_chunks")).all()
+        rows = conn.exec_driver_sql("SELECT id, content_hash FROM knowledge_chunks").all()
     return {rid: h for rid, h in rows}
 
 
@@ -64,7 +62,7 @@ def test_migration_noop_when_table_absent() -> None:
 def test_migration_keeps_existing_nonempty_hash() -> None:
     engine = _seed_old_schema()
     with engine.begin() as conn:
-        conn.execute(text("ALTER TABLE knowledge_chunks ADD COLUMN content_hash VARCHAR(64) DEFAULT ''"))
-        conn.execute(text("UPDATE knowledge_chunks SET content_hash='preset' WHERE id='c1'"))
+        conn.exec_driver_sql("ALTER TABLE knowledge_chunks ADD COLUMN content_hash VARCHAR(64) DEFAULT ''")
+        conn.exec_driver_sql("UPDATE knowledge_chunks SET content_hash='preset' WHERE id='c1'")
     _migrate_knowledge_content_hash(engine)
     assert _hashes(engine)["c1"] == "preset"

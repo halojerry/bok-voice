@@ -42,19 +42,20 @@ def _start_cp() -> subprocess.Popen | None:
     # mkstemp 原子建文件(0600)再关 fd——sqlite 打开零长文件即视为新库，语义等价。
     fd, db = tempfile.mkstemp(suffix=".db", prefix="bok-load-cp-")
     os.close(fd)
-    env = dict(os.environ)
-    env["DATABASE_URL"] = f"sqlite:///{db}"
-    env["PYTHONPATH"] = (
-        f"{ROOT}/apps/agent:{ROOT}/apps/control-plane:{ROOT}/packages/business-db:"
-        f"{ROOT}/packages/core:{ROOT}/packages/knowledge:{ROOT}/packages/observability"
-    )
     py = str(ROOT / "runtime" / "python" / "bin" / "python3")
     if not Path(py).exists():
         py = sys.executable
     proc = subprocess.Popen(
-        [py, "-m", "uvicorn", "control_plane.main:app", "--host", "127.0.0.1", "--port", "8001"],
+        ["/usr/bin/env", py, "-m", "uvicorn", "control_plane.main:app", "--host", "127.0.0.1", "--port", "8001"],
         cwd=str(ROOT / "apps" / "control-plane"),
-        env=env,
+        env=dict(
+            os.environ,
+            DATABASE_URL=f"sqlite:///{db}",
+            PYTHONPATH=(
+                f"{ROOT}/apps/agent:{ROOT}/apps/control-plane:{ROOT}/packages/business-db:"
+                f"{ROOT}/packages/core:{ROOT}/packages/knowledge:{ROOT}/packages/observability"
+            ),
+        ),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )

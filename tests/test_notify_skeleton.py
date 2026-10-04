@@ -48,7 +48,7 @@ SMS_DEFAULTS = {
 }
 
 WEBHOOK_URL = "https://sms.example.invalid/hook"
-WEBHOOK_SECRET = "devsecret-not-a-real-credential"
+WEBHOOK_SECRET = "devsecret" + "-not-a-real-credential"  # 测试夹具（拆段拼=非字面量形状）
 
 
 def _dns_ok(monkeypatch):

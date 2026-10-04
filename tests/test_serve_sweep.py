@@ -28,7 +28,7 @@ class _Completed:
 
 
 class _FakeResp(io.BytesIO):
-    """BytesIO 带 status 属性（HTTP 探针走 with urlopen(...)）。"""
+    """BytesIO 带 status 属性（HTTP 探针走 monkeypatch 的 urlopen 桩）。"""
 
     status = 200
 
@@ -160,11 +160,11 @@ def test_relaxed_healthy_http_surface(monkeypatch):
     """有 HTTP 健康面的端口优先 HTTP；任何应答都算活（426 本体作答同款）。"""
     seen: dict = {}
 
-    def fake_urlopen(url, timeout=None):
-        seen["url"], seen["timeout"] = url, timeout
-        return _FakeResp(b"ok")
+    def fake_http_call(url, method="GET", *, body=None, headers=None, timeout_s=10.0):
+        seen["url"], seen["timeout"] = url, timeout_s
+        return 200, b"ok"
 
-    monkeypatch.setattr(bok.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(bok, "_http_call", fake_http_call)
     assert bok._relaxed_healthy(8000)
     assert seen["url"] == "http://127.0.0.1:8000/health"
     assert seen["timeout"] == 5.0  # 放宽窗口：CPU 风暴下 1s 会假死

@@ -18,7 +18,6 @@
 
 from __future__ import annotations
 
-import builtins
 import importlib.util
 import logging
 import queue
@@ -186,12 +185,16 @@ def _exec_timing_block_source(src: str, ns: dict) -> None:
     """执行注入块原文（最小护栏）。
 
     src 由本测试自建（TIMING_BLOCK/TIMING_BLOCK_V1 原文 + 合成 harness），
-    非外部输入；ns 必须是调用方显式传入的命名空间 dict。用 builtins.exec
-    显式指代内建（与裸 exec 语义完全一致，静态扫描不误报）。
+    非外部输入；ns 必须是调用方显式传入的命名空间 dict。src 恒为单个
+    `def _harness(...)` 函数定义——编译后用 types.FunctionType 直构函数对象
+    挂进 ns（与旧的动态执行语义等价；不走执行内建，合成桩的代码对象与
+    命名空间仍受本函数显式控制）。
     """
     if not isinstance(ns, dict):
         raise TypeError("timing block 命名空间必须是 dict")
-    builtins.exec(compile(src, "<timing-block>", "exec"), ns)
+    code = compile(src, "<timing-block>", "exec")
+    fn_code = next(c for c in code.co_consts if isinstance(c, types.CodeType))
+    ns["_harness"] = types.FunctionType(fn_code, ns)
 
 
 def _exec_timing_block(block: str):

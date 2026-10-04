@@ -28,10 +28,23 @@ S2S 形态下可搬。**只 import 复用 `s2s_realtime.py`，不改其本体**�
 
 —— 账本 ————————————————————————————————————————————————————————
 每轮（含开场）向 stdout 打一行 `S2S_FLOW {json}`：
-`{step, user_text, wa_captured, asst_text 前 40 字}`（任务契约四键）；
-另打一行 `S2S_FLOW_FULL`（同 step + 全文）供探针做「逐位复述」「无编造号码」
-断言与报告取证（40 字截断会截掉复述）。事件面打点走 `S2S_FLOW_EVT {json}`
-（capture / step_advance / instructions_push / readback_missing 等）。
+`{step, user_text, wa_captured, asst_text 前 40 字, markers 计数}`（任务契约四键
++ 标记证据位）；另打一行 `S2S_FLOW_FULL`（同 step + 全文）供探针做「逐位复述」
+「无编造号码」断言与报告取证（40 字截断会截掉复述）。事件面打点走
+`S2S_FLOW_EVT {json}`（capture / step_advance / instructions_push /
+readback_missing / marker_seen 等）。会话起头打一行 `S2S_FLOW_VARS {json}`
+（carried_vars=对象字段实携值 + missing 清单；「标记/变量注入」的取证面）。
+
+—— 标记与变量（2026-10-04 话术标记/五变量真人感波）——————————————
+正稿带 `(emm)`/`(breath)` 语气标记（MiniMax 2.8 / Qwen3-TTS 官方标记系统）
++ `{name}`/`{courier}`/`{tracking_tail}`/`{address}` 变量；对象详情从 CP
+`GET /api/objects/{id}` 取（metadata.object_id；BOK_CP_URL/CONTROL_PLANE_URL
+缺省 http://127.0.0.1:8000，失败 fail-open 走占位渲染）。**标记铁律：只做
+停顿/语气、不改变内容**——规则行（门开时）随 instructions 下发（MARKER_RULE）；
+账本落账面按级联 turns 同款
+`strip_voice_style` 剥标记（标记只活在合成层），标记存在性由 `markers` 计数
+与 `S2S_FLOW_EVT marker_seen` 事件背书。`S2S_FLOW_MARKERS=0` = 渲染期剥标记
+（无标记对照臂，量停顿时长用）。
 
 —— 入口 ————————————————————————————————————————————————————————
 `run_flow_worker()`：**agent_name="bok-s2s-flow"（独立命名）**，默认端口 8086
@@ -48,7 +61,10 @@ agent_name 让探针（roomConfig 直派）与 CP 派发可并行存在、互不
 
 env 面：`S2S_FLOW_BASE_URL`（默认 http://127.0.0.1:8795/v1；次级回退
 `S2S_REALTIME_BASE_URL`）、`S2S_FLOW_WORKER_PORT`（默认 8086）、
-`S2S_FLOW_MAX_S`（会话熔断，默认 300s）、`S2S_REALTIME_API_KEY`（假 key 覆盖）。
+`S2S_FLOW_MAX_S`（会话熔断，默认 300s）、`S2S_REALTIME_API_KEY`（假 key 覆盖）、
+`S2S_FLOW_MARKERS`（默认 1；0=渲染期剥标记=无标记对照臂）、
+`BOK_CP_URL`/`CONTROL_PLANE_URL`（对象详情读取，默认 http://127.0.0.1:8000）、
+`BOK_CP_TOKEN`（auth-on 部署时的 Bearer，可选）。
 """
 
 from __future__ import annotations
@@ -56,6 +72,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -67,6 +84,8 @@ from livekit.agents import (
     RoomOutputOptions,
 )
 
+# 白名单/剥离与级联 A 线同一份语义（标记只活在合成层的单向流契约）。
+from ..voice_style import VOICE_TAG_WHITELIST, strip_voice_style
 from .s2s_realtime import (
     DEFAULT_API_KEY,
     DEFAULT_BASE_URL as _S2S_REALTIME_DEFAULT_BASE_URL,
@@ -99,14 +118,18 @@ def flow_max_seconds() -> int:
     return value if value > 0 else DEFAULT_MAX_SECONDS
 
 
-# —— 四步粤语话术（步序钉死数据面）——————————————————————————————————
+# —— 四步粤语话术（步序钉死数据面；标记 + 对象变量注入）——————————————————
+# 风格（用户定调 2026-10-04）：(emm)/(breath) 真人感停顿语气标记；变量
+# {name}/{courier}/{tracking_tail}/{address} 由 CP 对象详情渲染。缺失字段：
+# name→泛化身份句、courier→演示品牌兜底、address/tracking_tail→子句省略。
+# 步 3 收号+复述语义原样保留（复述必须逐位、禁标记——CAPTURE_BLOCK 钉死）。
 FLOW_STEPS: dict[int, dict[str, str]] = {
     1: {
-        "script": "您好，請問係陳大文先生嗎？我係快捷快遞嘅客服，你有個包裹今日到咗我哋倉。",
+        "script": "(emm) 您好，請問係{name}先生嗎？(breath) 我係{courier}嘅客服，你有個包裹今日到咗我哋倉。",
         "advance": "客戶答確認、質疑或者反問都可以；聽完本輪回應，下一輪就要講第二步正稿。",
     },
     2: {
-        "script": "你件嘢係京東買嘅，而家喺我哋中轉倉，聽日可以派到。",
+        "script": "你件嘢係京東買嘅，寄去{address}嘅，單號尾號{tracking_tail}，而家喺我哋中轉倉，聽日可以派到。(breath)",
         "advance": "客戶有回應即可；下一輪就要講第三步正稿（收 WhatsApp 號碼）。",
     },
     3: {
@@ -114,13 +137,16 @@ FLOW_STEPS: dict[int, dict[str, str]] = {
         "advance": "客戶講出 8 位或以上號碼之後，你要逐位複述確認；未收到號碼就再禮貌請求一次，繼續留喺第三步。",
     },
     4: {
-        "script": "多謝您嘅配合，我哋聽日準時送到，再見。",
+        "script": "多謝您嘅配合，(breath) 我哋聽日準時送到，再見。",
         "advance": "冇下一步；講完正稿就完。",
     },
 }
 
-BASE_RULES = (
-    "你係「快捷快遞」嘅電話客服。"
+# 品牌兜底：对象无 courier 字段时用演示品牌（不编造客户资料，仅品牌位）。
+FALLBACK_COURIER = "快捷快遞"
+
+BASE_RULES_TEMPLATE = (
+    "你係「{courier}」嘅電話客服。"
     "今日呢通電話全程只准講香港粵語口語（廣東話），唔准講普通話，唔准講書面語。"
     "每一輪你只可以講『當前步驟』嘅正稿內容：正稿講咩你就講咩，唔好自己加料，唔好跳到後面嘅步驟，"
     "都唔好重複之前已經講過嘅步驟。"
@@ -130,10 +156,23 @@ BASE_RULES = (
     "每次回答要簡短，一兩句就夠。"
 )
 
+# 标记规则行（S2S_FLOW_MARKERS=1 才注入；=0 对照臂不许出现标记字面——规则文本
+# 自身提标记会诱导 LLM 自发写 (breath)，2026-10-04 对照臂实测踩过）。
+MARKER_RULE = (
+    "【標記】正稿入面嘅 (emm)、(breath) 呢類括號標記係停頓同語氣指示：你要一字不漏原樣保留喺句入面，"
+    "等系統用佢哋做真人停頓；標記淨係影響語氣同停頓，唔改變內容，你唔可以將標記當字讀出嚟，"
+    "亦唔可以自己添加或者改動標記。"
+)
+
 CAPTURE_BLOCK = (
     "【已捕獲號碼={number}（逐位讀：{spoken}）】客戶今輪已經提供咗 WhatsApp 號碼。"
     "你要即刻逐位複述確認，例如：「好嘅，係唔係 {spoken}？」。"
     "只可以複述呢一串數字，一位都唔准改，更加唔准編其他號碼。"
+)
+
+# 复述禁标记（同门控：对照臂无标记字面）
+CAPTURE_NO_MARKER_RULE = (
+    "複述呢串號碼嘅時候唔准加 (emm)、(breath) 之類標記——逐個數字清清楚楚讀出嚟。"
 )
 
 _CAPTURE_HINT = (
@@ -141,23 +180,171 @@ _CAPTURE_HINT = (
     "如果佢已經講咗號碼，就逐位複述確認。"
 )
 
+# —— 对象详情（五变量）→ 话术变量 ————————————————————————————————
+_CP_DEFAULT_BASE_URL = "http://127.0.0.1:8000"
 
-def render_instructions(step: int, wa_captured: str | None) -> str:
+
+def _safe_urlopen(req, timeout_s: float):
+    """出站闸门（tools/bok.py 同形状）：urlopen 前就地校验 Request.full_url
+    ——仅 http/https、host 非空、无 userinfo；不过闸=PermissionError。
+    CP 基址来自运维 env（BOK_CP_URL/CONTROL_PLANE_URL，可指向云 CP，不锁环回）。"""
+    import urllib.parse
+
+    parts = urllib.parse.urlsplit(req.full_url)
+    host = (parts.hostname or "").lower()
+    if not (
+        parts.scheme in ("http", "https")
+        and bool(host)
+        and not parts.username
+        and not parts.password
+    ):
+        raise PermissionError(f"出站 URL 未过护栏（拒发）: {req.full_url}")
+    return urllib.request.urlopen(req, timeout=timeout_s)
+
+
+def _cp_base_url() -> str:
+    """CP 基址：env BOK_CP_URL > CONTROL_PLANE_URL > 本机缺省 :8000。
+
+    仅 http/https 且 host 非空才放行（运维 env 配置面）；非法值返回空串
+    → fetch_object_card 走 fail-open（占位渲染兜底），绝不带怪 scheme 出站。
+    """
+    import urllib.parse
+
+    for key in ("BOK_CP_URL", "CONTROL_PLANE_URL"):
+        raw = (os.environ.get(key) or "").strip()
+        if raw:
+            parsed = urllib.parse.urlsplit(raw)
+            if parsed.scheme in ("http", "https") and parsed.netloc:
+                return raw.rstrip("/")
+            emit_event("cp_base_url_rejected", key=key)
+            return ""
+    return _CP_DEFAULT_BASE_URL
+
+
+def fetch_object_card(object_id: str, *, timeout_s: float = 3.0) -> dict | None:
+    """CP GET /api/objects/{id}（fail-open：任何异常回 None=话术走占位渲染）。
+
+    只读对象详情，绝不写；BOK_CP_TOKEN 非空时附 Bearer（auth-on 部署）。
+    """
+    oid = str(object_id or "").strip()
+    if not oid:
+        return None
+    base = _cp_base_url()
+    if not base:
+        return None
+    import urllib.request
+
+    req = urllib.request.Request(
+        f"{base}/api/objects/{oid}", headers={"Accept": "application/json"}
+    )
+    token = (os.environ.get("BOK_CP_TOKEN") or "").strip()
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with _safe_urlopen(req, timeout_s) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 - 取对象失败绝不炸通（占位渲染兜底）
+        emit_event("object_fetch_failed", object_id=oid, error=repr(exc))
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def vars_from_object_card(card: dict | None) -> dict[str, str]:
+    """对象卡 → 话术变量表（五变量；缺的留空由渲染层占位/省句，绝不编造）。"""
+    oc = card or {}
+    tracking = str(oc.get("tracking_no") or "").strip()
+    tail = tracking[-4:] if len(tracking) >= 4 else tracking
+    return {
+        "name": str(oc.get("display_name") or "").strip(),
+        "courier": str(oc.get("courier") or "").strip(),
+        "tracking_no": tracking,
+        "tracking_tail": digits_to_cn(tail) if tail else "",
+        "address": str(oc.get("address") or "").strip(),
+        "phone": digits_to_cn(str(oc.get("phone") or "").strip()),
+    }
+
+
+# —— 语气标记（(emm)/(breath)…；白名单与级联 voice_style 同源）————————————
+_MARKER_SCAN_RE = re.compile(r"[（(]([^（）()]{1,24})[）)]")
+
+
+def markers_enabled() -> bool:
+    """env 总闸 S2S_FLOW_MARKERS（默认开；0=渲染期剥标记=无标记对照臂）。"""
+    raw = (os.environ.get("S2S_FLOW_MARKERS") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def count_voice_markers(text: str | None) -> int:
+    """白名单语气标记计数（账本证据位；不落标记字面，日志扫描面干净）。"""
+    n = 0
+    for m in _MARKER_SCAN_RE.finditer(text or ""):
+        if m.group(1).strip().lower() in VOICE_TAG_WHITELIST:
+            n += 1
+    return n
+
+
+def render_step_script(step: int, vars_map: dict[str, str] | None = None) -> str:
+    """渲染第 step 步正稿：变量注入 + 缺字段占位/省句（纯函数，绝不编造）。
+
+    name 缺 → 泛化身份句「請問係咪機主本人呀？」；courier 缺 → 演示品牌兜底；
+    address/tracking_tail 缺 → 整个子句省略；S2S_FLOW_MARKERS=0 → 剥标记。
+    """
+    script = FLOW_STEPS[step]["script"]
+    vm = vars_map or {}
+    name = str(vm.get("name") or "").strip()
+    if "{name}" in script:
+        if name:
+            script = script.replace("{name}", name)
+        else:
+            script = script.replace("請問係{name}先生嗎？", "請問係咪機主本人呀？").replace(
+                "{name}", ""
+            )
+    courier = str(vm.get("courier") or "").strip() or FALLBACK_COURIER
+    script = script.replace("{courier}", courier)
+    address = str(vm.get("address") or "").strip()
+    if "{address}" in script:
+        if address:
+            script = script.replace("{address}", address)
+        else:
+            script = script.replace("寄去{address}嘅，", "")
+    tail = str(vm.get("tracking_tail") or "").strip()
+    if "{tracking_tail}" in script:
+        if tail:
+            script = script.replace("{tracking_tail}", tail)
+        else:
+            script = script.replace("單號尾號{tracking_tail}，", "")
+    if not markers_enabled():
+        script = strip_voice_style(script).strip()
+    return script
+
+
+def render_instructions(
+    step: int, wa_captured: str | None, vars_map: dict[str, str] | None = None
+) -> str:
     """渲染「當前步正稿 + 推進條件 + 禁止事項（+ 已捕獲號碼）」instructions（纯函数）。
 
     每轮把这份文本作为 session-level instructions 下发；服务端在 generation
     time 读取（见模块头注机制 2）。步 3 捕到号后额外携带捕获块——复述确认的
     内容源唯一（捕获账本），与级联线「号码守卫」的不变量同款：绝不让 LLM 猜。
+    标记/变量已按 vars_map 渲染进正稿；标记规则行（门开时）随 instructions 下发。
     """
+    vm = vars_map or {}
     spec = FLOW_STEPS[step]
+    courier = str(vm.get("courier") or "").strip() or FALLBACK_COURIER
+    rules = BASE_RULES_TEMPLATE.format(courier=courier)
+    if markers_enabled():
+        rules += MARKER_RULE
     parts = [
-        BASE_RULES,
-        f"【當前步驟={step}/4】呢一步嘅正稿（你要講嘅嘢）：「{spec['script']}」",
+        rules,
+        f"【當前步驟={step}/4】呢一步嘅正稿（你要講嘅嘢）：「{render_step_script(step, vm)}」",
         f"呢一步嘅推進條件：{spec['advance']}",
     ]
     if step == 3:
         if wa_captured:
-            parts.append(CAPTURE_BLOCK.format(number=wa_captured, spoken=digits_to_cn(wa_captured)))
+            block = CAPTURE_BLOCK.format(number=wa_captured, spoken=digits_to_cn(wa_captured))
+            if markers_enabled():
+                block += CAPTURE_NO_MARKER_RULE
+            parts.append(block)
         else:
             parts.append(_CAPTURE_HINT)
     parts.append("記住：淨係講當前步驟嘅內容，講完就停，等客戶回應。")
@@ -306,17 +493,29 @@ class FlowMachine:
 
 # —— 观测/账本打点 ————————————————————————————————————————————
 def emit_ledger(step: int, user_text: str, wa_captured: str | None, asst_text: str) -> None:
-    """任务契约：每轮一行 JSON（含开场轮）。另打 FULL 行供复述/编造断言。"""
-    text = str(asst_text or "")
+    """任务契约：每轮一行 JSON（含开场轮）。另打 FULL 行供复述/编造断言。
+
+    asst_text 落账面按级联 turns 同款「标记只活在合成层」剥 voice_style 标记
+    （单向流契约）——标记存在性以 `markers` 计数与 assistant_turn 事件背书；
+    合成面文本（LLM 原文→TTS）不受影响。
+    """
+    raw = str(asst_text or "")
+    display = strip_voice_style(raw).strip() if raw else raw
+    marker_count = count_voice_markers(raw)
     row = {
         "step": int(step),
         "user_text": str(user_text or ""),
         "wa_captured": wa_captured,
-        "asst_text": text[:40],
+        "asst_text": display[:40],
+        "markers": marker_count,
     }
     print("S2S_FLOW " + json.dumps(row, ensure_ascii=False), flush=True)
     print(
-        "S2S_FLOW_FULL " + json.dumps({"step": int(step), "asst_text": text}, ensure_ascii=False),
+        "S2S_FLOW_FULL "
+        + json.dumps(
+            {"step": int(step), "asst_text": display, "markers": marker_count},
+            ensure_ascii=False,
+        ),
         flush=True,
     )
 
@@ -420,7 +619,24 @@ async def entrypoint(ctx: Any) -> None:
 
     print(
         f"S2S_FLOW_START room={call_id} object={meta['object_name']!r} "
-        f"base_url={_resolve_base_url()}",
+        f"base_url={_resolve_base_url()} markers={'on' if markers_enabled() else 'off'}",
+        flush=True,
+    )
+
+    # 对象详情（五变量）取于 CP；失败 fail-open 走占位渲染（绝不让取数炸通）。
+    card = await asyncio.to_thread(fetch_object_card, meta["object_id"])
+    vars_map = vars_from_object_card(card)
+    print(
+        "S2S_FLOW_VARS "
+        + json.dumps(
+            {
+                "object_id": meta["object_id"],
+                "source": "cp" if card else "fallback",
+                "carried_vars": vars_map,
+                "missing": [k for k, v in vars_map.items() if not v],
+            },
+            ensure_ascii=False,
+        ),
         flush=True,
     )
 
@@ -429,7 +645,7 @@ async def entrypoint(ctx: Any) -> None:
         api_key=os.environ.get("S2S_REALTIME_API_KEY") or DEFAULT_API_KEY,
         model=(os.environ.get("S2S_FLOW_MODEL") or "").strip() or "s2s-flow",
         voice="",  # 空串：s2s 侧沿用 CLI 音色（minimax voice 由 serve 旗标定）
-        instructions=render_instructions(1, None),
+        instructions=render_instructions(1, None, vars_map),
         base_url=_resolve_base_url(),
     )
     pusher = InstructionPusher(lambda: model.captured_session)
@@ -449,7 +665,7 @@ async def entrypoint(ctx: Any) -> None:
         if first_capture:
             emit_event("wa_captured", number=machine.wa_captured, final=final, step=machine.step)
             # 追捕推：在「转写完成→生成」窗口之前把捕获块送进 session instructions。
-            pusher.set(render_instructions(machine.step, machine.wa_captured))
+            pusher.set(render_instructions(machine.step, machine.wa_captured, vars_map))
 
     # —— 助手消息面：播完即记账 + 推进步序 + 提前推下一步 ——————————————
     @session.on("conversation_item_added")
@@ -463,13 +679,18 @@ async def entrypoint(ctx: Any) -> None:
         ).strip()
         step_at_reply = machine.step
         emit_ledger(step_at_reply, machine.user_text, machine.wa_captured, text)
+        marker_count = count_voice_markers(text)
         emit_event(
             "assistant_turn",
             step=step_at_reply,
             chars=len(text),
             captured=machine.wa_captured,
             finished=machine.finished,
+            markers=marker_count,
         )
+        if marker_count:
+            # 标记存在性证据（合成面=LLM 原文；账本面已剥，标记字面不外落）。
+            emit_event("marker_seen", step=step_at_reply, count=marker_count, chars=len(text))
         if step_at_reply == 3 and machine.wa_captured and not assistant_reads_back(
             text, machine.wa_captured
         ):
@@ -478,7 +699,7 @@ async def entrypoint(ctx: Any) -> None:
         advanced = machine.advance_after_assistant()
         if advanced:
             emit_event("step_advance", step=machine.step)
-            pusher.set(render_instructions(machine.step, machine.wa_captured))
+            pusher.set(render_instructions(machine.step, machine.wa_captured, vars_map))
 
     async def _duration_fuse() -> None:
         try:
@@ -502,7 +723,7 @@ async def entrypoint(ctx: Any) -> None:
     await ctx.connect()
     await session.start(
         room=ctx.room,
-        agent=Agent(instructions=render_instructions(1, None)),
+        agent=Agent(instructions=render_instructions(1, None, vars_map)),
         room_input_options=RoomInputOptions(),
         room_output_options=RoomOutputOptions(audio_enabled=True),
     )

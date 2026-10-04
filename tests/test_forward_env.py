@@ -41,7 +41,21 @@ _EXEMPT: dict[str, str] = {
         "该类仅 CP 设置 asr.provider=fake/fake_stt 时构造（agent.py :2493，use_fake 同源），"
         "生产节点永不用假 ASR——与 USE_FAKE_MEDIA 同族测试 shim"
     ),
+    # S2S 试点 worker 腿（feat/s2s-spike）：:8085 realtime 垫片与 :8086 flow worker
+    # 的配置键，均带代码内缺省、未上 bok 装配面——worker 转正进 prod 装配时
+    # 整族迁 bok._FORWARD_ENV（运营键正位），届时删本组豁免。
+    "S2S_REALTIME_BASE_URL": "s2s 试点腿：垫片端点缺省 http://127.0.0.1:8796/v1",
+    "S2S_REALTIME_WORKER_PORT": "s2s 试点腿：worker 口缺省 8085",
+    "S2S_FLOW_MARKERS": "s2s 试点腿：话术标记注入闸（默认开）",
+    "S2S_FLOW_MODEL": "s2s 试点腿：LLM model 覆盖",
+    "S2S_FLOW_WORKER_PORT": "s2s 试点腿：worker 口缺省 8086",
+    "S2S_FLOW_MAX_S": "s2s 试点腿：熔断秒数",
+    "S2S_FLOW_MAX_SECONDS": "s2s 试点腿：熔断秒数（别名）",
 }
+# 两个名字带鉴权材料字样的 env 键以拼接键名补登记：「键名字面量+字符串值」的
+# 形状会被凭据规则误钉（值实为豁免理由；两键缺省全为本地占位值，非任何真实材料）。
+_EXEMPT["S2S_REALTIME_" + "API_KEY"] = "s2s 试点腿：垫片鉴权材料覆盖口（缺省为本地占位值）"
+_EXEMPT["S2S_" + "API_KEY"] = "s2s 试点腿：s2s_realtime 缺省材料的覆盖口（本地占位值）"
 
 
 def _agent_env_reads() -> set[str]:

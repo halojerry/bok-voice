@@ -14,8 +14,27 @@ import json
 import os
 import re
 import sys
+import urllib.parse
 import urllib.request
 from pathlib import Path
+
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def _safe_urlopen(req, *, timeout: float, data=None):
+    """出站闸门（tools/bok.py 同形状）：urlopen 前就地校验 Request.full_url
+    ——仅 http/https、host 非空、无 userinfo；不过闸=PermissionError。
+    本脚本目标=本机 CP（缺省环回，BOK_CP_URL 显式覆盖）。"""
+    parts = urllib.parse.urlsplit(req.full_url)
+    host = (parts.hostname or "").lower()
+    if not (
+        parts.scheme in ("http", "https")
+        and (host in _LOOPBACK_HOSTS or bool(host))
+        and not parts.username
+        and not parts.password
+    ):
+        raise PermissionError(f"出站 URL 未过护栏（拒发）: {req.full_url}")
+    return urllib.request.urlopen(req, data=data, timeout=timeout)
 
 _CANTO_MARKS = re.compile(r"[唔該係嘅咗哋啲冇乜嚟]")
 
@@ -108,7 +127,7 @@ def _cp_request(base: str, path: str, token: str, *, method: str = "GET", payloa
     if token:
         req.add_header("Authorization", f"Bearer {token}")
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    with urllib.request.urlopen(req, data=data, timeout=30) as resp:
+    with _safe_urlopen(req, data=data, timeout=30) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 

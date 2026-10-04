@@ -24,9 +24,29 @@ import json
 import os
 import sys
 import time
+import urllib.parse
 import urllib.request
 import wave
 from pathlib import Path
+
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def _safe_urlopen(req, *, timeout: float):
+    """出站闸门（tools/bok.py 同形状）：urlopen 前就地校验 Request.full_url
+    ——仅 http/https、host 非空、无 userinfo；不过闸=PermissionError。
+    本探针目标=本地 CP / MiniMax 诊断端点。"""
+    parts = urllib.parse.urlsplit(req.full_url)
+    host = (parts.hostname or "").lower()
+    if not (
+        parts.scheme in ("http", "https")
+        and (host in _LOOPBACK_HOSTS or bool(host))
+        and not parts.username
+        and not parts.password
+    ):
+        raise PermissionError(f"出站 URL 未过护栏（拒发）: {req.full_url}")
+    return urllib.request.urlopen(req, timeout=timeout)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 for _p in ("apps/agent", "packages/core"):
@@ -59,7 +79,7 @@ def _cp_get(base: str, path: str, token: str) -> object:
     req = urllib.request.Request(url)
     if token:
         req.add_header("Authorization", f"Bearer {token}")
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    with _safe_urlopen(req, timeout=10) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -147,8 +167,10 @@ async def main_async() -> int:
     ap = argparse.ArgumentParser(description="MiniMax bidi 首 chunk 提前切 A/B 样本")
     ap.add_argument(
         "--out",
-        default=str(Path.home() / "Desktop" / "tts_first_chunk_ab"),
-        help="输出目录（默认 ~/Desktop/tts_first_chunk_ab）",
+        default=os.environ.get(
+            "BOK_TTS_AB_OUT", str(Path.home() / "Desktop" / "tts_first_chunk_ab")
+        ),
+        help="输出目录（缺省 $BOK_TTS_AB_OUT 或 ~/Desktop/tts_first_chunk_ab）",
     )
     ap.add_argument("--cp", default=os.environ.get("BOK_CP_URL", "http://127.0.0.1:8000"))
     ap.add_argument(

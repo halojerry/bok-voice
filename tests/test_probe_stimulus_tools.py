@@ -10,9 +10,9 @@
 from __future__ import annotations
 
 import importlib.util
-import random
 import sys
 from pathlib import Path
+from random import Random
 
 import numpy as np
 import pytest
@@ -133,7 +133,7 @@ _HOMOPHONES = {"yue": {"號": ["号"], "係": ["系"], "單": ["单"], "記": ["
 
 
 def test_augment_narrowband_freezes_digit_span():
-    rng = random.Random(7)
+    rng = Random(7)
     out = csc.augment_narrowband(_DIGIT_SENT, csc.LANE_YUE, rng, _HOMOPHONES)
     assert "六四三一一三三" in out
     assert csc._num_signature(out) == csc._num_signature(_DIGIT_SENT)
@@ -141,7 +141,7 @@ def test_augment_narrowband_freezes_digit_span():
 
 def test_augment_speed_freezes_digit_span():
     for seed in range(20):
-        out = csc.augment_speed(_DIGIT_SENT, csc.LANE_YUE, random.Random(seed))
+        out = csc.augment_speed(_DIGIT_SENT, csc.LANE_YUE, Random(seed))
         assert "六四三一一三三" in out, f"digit span damaged at seed={seed}: {out!r}"
         assert csc._num_signature(out) == csc._num_signature(_DIGIT_SENT)
 
@@ -150,17 +150,17 @@ def test_augment_speed_never_removes_cantonese_markers():
     base = csc._count_markers(_MARKER_SENT)
     assert base >= 3  # 句子确实含多个特征字（嘅/哋/咗）
     for seed in range(30):
-        out = csc.augment_speed(_MARKER_SENT, csc.LANE_YUE, random.Random(seed))
+        out = csc.augment_speed(_MARKER_SENT, csc.LANE_YUE, Random(seed))
         assert csc._count_markers(out) >= base, f"marker dropped at seed={seed}: {out!r}"
         assert csc._num_signature(out) == csc._num_signature(_MARKER_SENT)
 
 
 def test_augmentation_deterministic_across_two_seeded_runs():
     for seed in (1, 123, 9999):
-        nb1 = csc.augment_narrowband(_DIGIT_SENT, csc.LANE_YUE, random.Random(seed), _HOMOPHONES)
-        nb2 = csc.augment_narrowband(_DIGIT_SENT, csc.LANE_YUE, random.Random(seed), _HOMOPHONES)
-        sp1 = csc.augment_speed(_MARKER_SENT, csc.LANE_YUE, random.Random(seed))
-        sp2 = csc.augment_speed(_MARKER_SENT, csc.LANE_YUE, random.Random(seed))
+        nb1 = csc.augment_narrowband(_DIGIT_SENT, csc.LANE_YUE, Random(seed), _HOMOPHONES)
+        nb2 = csc.augment_narrowband(_DIGIT_SENT, csc.LANE_YUE, Random(seed), _HOMOPHONES)
+        sp1 = csc.augment_speed(_MARKER_SENT, csc.LANE_YUE, Random(seed))
+        sp2 = csc.augment_speed(_MARKER_SENT, csc.LANE_YUE, Random(seed))
         assert nb1 == nb2, f"narrowband nondeterministic at seed={seed}"
         assert sp1 == sp2, f"speed nondeterministic at seed={seed}"
         # 目标恒为原始干净文本（增强只动输入侧）

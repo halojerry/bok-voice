@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+from pathlib import Path
 
 MARK = "bok-cache-fix"
 OLD = "{# Final Generation Prompt #}"
@@ -59,6 +60,30 @@ def _server_path() -> str | None:
     except Exception:
         return None
     return spec.origin if spec and spec.origin else None
+
+
+def _assert_writable_server_py(path: str | None) -> str:
+    """写入面收敛（main 路径专用）：补丁只允许写 importlib 实际解析出的
+    mlx_lm/server.py——绝对路径、无 '..' 段、形状钉死（…/mlx_lm/server.py）。"""
+    p = Path(path or "")
+    if (
+        not p.is_absolute()
+        or ".." in p.parts
+        or p.name != "server.py"
+        or p.parent.name != "mlx_lm"
+    ):
+        raise ValueError(f"refusing to patch unexpected server path: {p}")
+    return str(p)
+
+
+def _write_py(path: str, content: str) -> None:
+    """统一写入口：绝对路径、无 '..' 段才写；Path.open 方法形态（测试可注入
+    tmp server 路径，故此处只做通用收敛，mlx_lm 形状钉死归 main 的 assert）。"""
+    p = Path(path)
+    if not p.is_absolute() or ".." in p.parts:
+        raise ValueError(f"refusing relative/traversal write target: {p}")
+    with p.resolve().open("w", encoding="utf-8") as f:
+        f.write(content)
 
 
 
@@ -190,8 +215,7 @@ def _apply_timing_patch(path: str, src: str) -> str:
     import py_compile
 
     compile(patched, path, "exec")  # 语法校验,写坏 server 会炸整个栈
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(patched)
+    _write_py(path, patched)
     py_compile.compile(path, doraise=True)
     return patched
 
@@ -204,6 +228,7 @@ def main() -> int:
     if not path:
         print("[bok-cache-fix] mlx_lm.server not found, skip")
         return 0
+    path = _assert_writable_server_py(path)
     with open(path, encoding="utf-8") as f:
         src = f.read()
     if MARK in src:
@@ -217,8 +242,7 @@ def main() -> int:
     patched = src.replace(ANCHOR, block + ANCHOR, 1)
     if "import os\n" not in patched.split("def ")[0]:
         patched = patched.replace("import logging\n", "import logging\nimport os\n", 1)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(patched)
+    _write_py(path, patched)
     import py_compile
 
     py_compile.compile(path, doraise=True)

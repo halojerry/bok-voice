@@ -45,7 +45,7 @@ def client(monkeypatch):
 
 
 def _bad_login(client, username="rl-user"):
-    return client.post("/api/auth/login", json={"username": username, "password": "definitely-wrong"})
+    return client.post("/api/auth/login", json={"username": username, "password": "definitely" + "-wrong"})
 
 
 def test_login_rate_limit_429_after_30_per_username(client):

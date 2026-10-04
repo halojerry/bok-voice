@@ -104,17 +104,18 @@ def test_probe_llm_uses_absolute_model_path(monkeypatch):
     探针请求必须 max_tokens=1(prefill-only,不吃解码租)。"""
     seen: dict = {}
 
-    def fake_urlopen(arg, timeout=None):
-        seen["timeout"] = timeout
-        if isinstance(arg, str):
-            return _FakeResp(json.dumps({"data": [
+    # 出站 seam=bok._http_call（http.client 单点，(status, body) 形）
+    def fake_http_call(url, method="GET", *, body=None, headers=None, timeout_s=10.0):
+        seen["timeout"] = timeout_s
+        if method == "GET":
+            return 200, json.dumps({"data": [
                 {"id": "mlx-community/Hy-MT2-1.8B-Abliterated-8bit"},
                 {"id": "/models/avan-ag/Qwen3.5-4B-Uncensored-MLX-4bit"},
-            ]}).encode())
-        seen["body"] = json.loads(arg.data.decode())
-        return _FakeResp(b'{"choices":[{"message":{"content":"a"}}]}')
+            ]}).encode()
+        seen["body"] = json.loads(body.decode())
+        return 200, b'{"choices":[{"message":{"content":"a"}}]}'
 
-    monkeypatch.setattr(bok.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(bok, "_http_call", fake_http_call)
     ok, detail = bok._probe_llm()
     assert ok
     assert seen["body"]["model"] == "/models/avan-ag/Qwen3.5-4B-Uncensored-MLX-4bit"
@@ -125,11 +126,11 @@ def test_probe_llm_uses_absolute_model_path(monkeypatch):
 def test_probe_llm_timeout_env_and_fail_wording(monkeypatch):
     monkeypatch.setenv("BOK_DOCTOR_LLM_PROBE_TIMEOUT_S", "4")
 
-    def fake_urlopen(arg, timeout=None):
-        assert timeout == 4.0
+    def fake_http_call(url, method="GET", *, body=None, headers=None, timeout_s=10.0):
+        assert timeout_s == 4.0
         raise TimeoutError("timed out")
 
-    monkeypatch.setattr(bok.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(bok, "_http_call", fake_http_call)
     ok, detail = bok._probe_llm()
     assert not ok
     assert "FAIL" in detail
@@ -142,16 +143,16 @@ def test_probe_llm_explicit_model_beats_models_scan(monkeypatch):
     即挂死;prompt 必须透传(Hy-MT2 对超短 ASCII 输入会 template 404)。"""
     seen: dict = {}
 
-    def fake_urlopen(arg, timeout=None):
+    def fake_http_call(url, method="GET", *, body=None, headers=None, timeout_s=10.0):
         # /models 只回 repo-id(无绝对路径)——缺省路径会 FAIL,显式 model 必须无视它
-        if isinstance(arg, str):
-            return _FakeResp(json.dumps({"data": [
+        if method == "GET":
+            return 200, json.dumps({"data": [
                 {"id": "mlx-community/Hy-MT2-1.8B-Abliterated-8bit"},
-            ]}).encode())
-        seen["body"] = json.loads(arg.data.decode())
-        return _FakeResp(b'{"choices":[{"message":{"content":"a"}}]}')
+            ]}).encode()
+        seen["body"] = json.loads(body.decode())
+        return 200, b'{"choices":[{"message":{"content":"a"}}]}'
 
-    monkeypatch.setattr(bok.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(bok, "_http_call", fake_http_call)
     ok, detail = bok._probe_llm(
         "http://127.0.0.1:1236/v1",
         model="/Users/x/Hy-MT2-1.8B-8bit",

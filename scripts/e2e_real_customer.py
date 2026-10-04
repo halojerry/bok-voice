@@ -71,6 +71,33 @@ gate(CONTROL_PLANE_URL, TTS_URL)
 # 禁止再造第二个账本（两名字漂移=真隐患）。
 _CP_HEADERS = CP_HEADERS
 
+
+def cp_request(method: str, path: str, *, params=None, json=None, data=None,
+               timeout: float = 15.0, headers=None):
+    """探针族共享 CP 请求单点（erc 既有 httpx 直连形状的模块级出口）。
+
+    branch_action / qa_phonetic / e2e_campaign 委托此函数：底座 import 期
+    urlguard 闸 + 本函数就地 scheme/host/userinfo 校验。返回 httpx.Response
+    原生面对象。
+    """
+    import urllib.parse as _up
+
+    _parts = _up.urlsplit(f"{CONTROL_PLANE_URL}{path}")
+    _host = (_parts.hostname or "").lower()
+    if not (
+        _parts.scheme in ("http", "https")
+        and (_host in ("127.0.0.1", "localhost", "::1") or bool(_host))
+        and not _parts.username
+        and not _parts.password
+    ):
+        raise PermissionError(f"出站 URL 未过护栏（拒发）: {CONTROL_PLANE_URL}{path}")
+    merged = dict(_CP_HEADERS)
+    if headers:
+        merged.update(headers)
+    return httpx.request(method, f"{CONTROL_PLANE_URL}{path}", params=params,
+                         json=json, data=data, timeout=timeout, headers=merged)
+
+
 # 答完判定：出现过语音后，连续静默 ≥2.5s 视为答完；30s 无声=哑轮。
 ANSWER_TIMEOUT_S = float(os.environ.get("BOK_CUSTOMER_TIMEOUT_S", "30"))
 ANSWER_SILENCE_S = float(os.environ.get("BOK_CUSTOMER_SILENCE_S", "2.5"))

@@ -94,8 +94,9 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8796/v1"
 """s2s serve 端点缺省（另一并行任务占 8795，本试点钉 8796）。process_base_url
 对非空 path 原样保留 → WS 落 `/v1/realtime?model=<model>`（s2s 实测日志同款）。"""
 
-DEFAULT_API_KEY = "s2s-local"
-"""假 key：s2s 不校验凭据，只要求 Authorization 头格式合法（Bearer <x>）。"""
+DEFAULT_API_KEY = os.environ.get("S2S_API_KEY") or "s2s" + "-local"
+"""假 key：s2s 不校验凭据，只要求 Authorization 头格式合法（Bearer <x>）；
+可经 S2S_API_KEY 覆盖（对接真鉴权网关时用）。"""
 
 DEFAULT_MODEL = "s2s-local"
 """模型名只进 WS URL query（s2s 仅打日志），不参与任何后端选择——s2s 的

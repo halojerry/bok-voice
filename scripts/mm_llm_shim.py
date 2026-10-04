@@ -87,7 +87,19 @@ async def chat_completions(request: Request):
     req = _build_request(out)
 
     if not out["stream"]:
-        raw = urllib.request.urlopen(req, timeout=120).read()
+        # SSRF 闸门（与 urlopen 同函数体就地校验）：上游只允许 https + 固定域名。
+        _parts = urllib.parse.urlsplit(req.full_url)
+        _host = (_parts.hostname or "").lower()
+        if not (
+            _parts.scheme == "https"
+            and _host == ALLOWED_HOST
+            and not _parts.username
+            and not _parts.password
+        ):
+            raise PermissionError(f"SSRF 护栏拒绝非白名单目标: {req.full_url}")
+        _opener = urllib.request.build_opener()
+        with _opener.open(req, timeout=120) as resp:
+            raw = resp.read()
         payload = json.loads(raw)
         base = payload.get("base_resp") or {}
         if base.get("status_code", 0) != 0:
@@ -96,7 +108,18 @@ async def chat_completions(request: Request):
 
     def gen():
         saw_done = False
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        # SSRF 闸门（与 urlopen 同函数体就地校验）：上游只允许 https + 固定域名。
+        _parts = urllib.parse.urlsplit(req.full_url)
+        _host = (_parts.hostname or "").lower()
+        if not (
+            _parts.scheme == "https"
+            and _host == ALLOWED_HOST
+            and not _parts.username
+            and not _parts.password
+        ):
+            raise PermissionError(f"SSRF 护栏拒绝非白名单目标: {req.full_url}")
+        _opener = urllib.request.build_opener()
+        with _opener.open(req, timeout=120) as resp:
             for line in resp:
                 stripped = line.strip()
                 if stripped == b"data: [DONE]":

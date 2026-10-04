@@ -1,3 +1,7 @@
 VENDORMARK
 vendored from huggingface/speech-to-speech @ 81b688b452ee6b64ff5745b91985e9eb653fcc9f (2026-10-02)
-our patches: sub-sentence forward (LMOutputProcessor)
+our patches:
+- sub-sentence forward (LMOutputProcessor, stream_first_chunk_chars)
+- LLM/utils.py: _assert_public_http_url — vision 图 URL 公网边界校验（SSRF：scheme+解析 IP 拒环回/私网）
+- LLM/tool_call/tool_prompt.py: Jinja 渲染改 SandboxedEnvironment（工具描述为半受信内容）
+- s2s_pipeline.py: parse_arguments 的 JSON 配置路径加 '..' 穿越闸门（Path.resolve().open()）
