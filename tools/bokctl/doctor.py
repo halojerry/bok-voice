@@ -3,9 +3,11 @@
 搬运纪律=穿模块对象调用)。
 
 - 本模块只 `from bokctl import core` 拿模块对象:凡仍住在 core 的名字(platform_key/
-  is_packaged/is_mac/is_linux/app_data_dir/sidecar_python/MODELS/CORE_PORTS/healthy/
-  _worker_ports/_probe_worker/_http_call/_provider_health_summary 等)一律 `core.X`
-  调用时取——patch 与后续域搬运在 core 侧保持可见(patch 缝=模块属性)。
+  is_packaged/is_mac/is_linux/app_data_dir/sidecar_python/CORE_PORTS/healthy/
+  _worker_ports/_probe_worker/_http_call/_provider_health_summary 等一律 `core.X`
+  调用时取——patch 与后续域搬运在 core 侧保持可见(patch 缝=模块属性);
+  models 域件(MODELS/model_dir/_lmstudio_models_dir/_llm_draft_enabled/
+  _mt_llm_model/_settle_llm_model 等)穿 `models.X` 取(models 波新例)。
 - 本域自有函数(_nvidia_gate/_doctor_gpu_gate/_import_ok/_doctor_minimax_tts/
   _model_present/_doctor_draft_warning/_swap_used_gb/_warn_memory_posture/
   _doctor_queue_proxy_lease_timeouts/_probe_llm/_provider_health_fails/cmd_doctor)
@@ -24,7 +26,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from bokctl import core
+from bokctl import core, models
 
 
 def _provider_health_fails(summary: dict | None) -> list[str]:
@@ -250,11 +252,11 @@ def _model_present(repo: str) -> bool:
     """模型在盘判定:app-data 布局优先,mac 再认 lmstudio 布局(~/.lmstudio
     models,与 cmd_download 的 ensure 同款)——9B settle 只以 lmstudio 布局
     在盘时,旧版 doctor 恒报 MISSING 而同一台机 :1237 分明在跑(2026-09-17 修)。"""
-    target = core.model_dir(repo)
+    target = models.model_dir(repo)
     if target.exists() and any(target.iterdir()):
         return True
     if core.is_mac():
-        lm = core._lmstudio_models_dir() / repo
+        lm = models._lmstudio_models_dir() / repo
         return lm.exists() and any(lm.iterdir())
     return False
 
@@ -266,7 +268,7 @@ def _doctor_draft_warning(current: dict[str, str]) -> str:
     警告只进 doctor 打印面,**不进 fails**(不判死、不进 packaged 门禁)——
     draft 是 opt-in 特性,缺席时 _llm_draft_flags 回 [] 正常起无 draft 服务,
     功能零损失,不构成「活着但残废」。"""
-    if not core._llm_draft_enabled():
+    if not models._llm_draft_enabled():
         return ""
     repo = current.get("llm_draft", "")
     if not repo or _model_present(repo):
@@ -415,7 +417,7 @@ def cmd_doctor() -> int:
     # NVIDIA 门禁独立于虚拟声卡有无（曾误缩进在 if not va_ok 下，见 _doctor_gpu_gate）。
     _doctor_gpu_gate(packaged=packaged, fails=fails)
 
-    current = core.MODELS["mac"] if core.is_mac() else core.MODELS["windows"]
+    current = models.MODELS["mac"] if core.is_mac() else models.MODELS["windows"]
     for name, repo in current.items():
         if not repo:
             continue
@@ -455,7 +457,7 @@ def cmd_doctor() -> int:
     # (与 :1235 同款冷启动页入假警语义)。显式传在盘路径(忽略 /v1/models 扫描
     # 结果),prompt 用代表性长句(见 _probe_llm docstring 的 Hy-MT2 短输入坑)。
     if core.healthy(1236):
-        mt_model = core._mt_llm_model(current)
+        mt_model = models._mt_llm_model(current)
         if mt_model and Path(mt_model).exists():
             mt_ok, mt_detail = _probe_llm(
                 "http://127.0.0.1:1236/v1", model=mt_model,
@@ -475,7 +477,7 @@ def cmd_doctor() -> int:
     # 通话回复直接灭而 doctor 全绿。同 _probe_llm max_tokens=1 形状（显式在盘
     # 模型路径），informational 不进 fails（冷启动页入同 :1235 语义）。
     if core.healthy(1237):
-        _ar_model = core._settle_llm_model(current)
+        _ar_model = models._settle_llm_model(current)
         if _ar_model and Path(_ar_model).exists():
             ar_ok, ar_detail = _probe_llm("http://127.0.0.1:1237/v1", model=_ar_model)
             print(f"  a_reply 功能探针(:1237): {ar_detail}")

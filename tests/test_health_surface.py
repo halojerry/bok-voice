@@ -47,7 +47,7 @@ def test_core_ports_cover_settle():
 def test_core_ports_cover_embed_and_optional_exemption():
     """W1b embedding sidecar(:8789) 进单点表 + 享可选豁免(缺模型不算超时/降级)。"""
     assert ("embed", 8789) in bok.CORE_PORTS
-    assert "embedding" in bok.OPTIONAL_MODELS
+    assert "embedding" in bok.models.OPTIONAL_MODELS
     assert 8789 in bok.health._OPTIONAL_LLM_PORTS
     # 宽松终检:缺口仅 embed → 放行(镜像 mt/settle 语义)。
     assert bok.health._only_optional_ports([8789]) is True

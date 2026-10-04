@@ -19,13 +19,13 @@ from _bokpatch import patch_bok  # noqa: E402
 def test_settle_model_env_override(monkeypatch):
     """BOK_SETTLE_LLM_MODEL 显式覆盖 > MODELS 表;不存在的表条目回空串。"""
     monkeypatch.setenv("BOK_SETTLE_LLM_MODEL", "/tmp/fake-settle-model")
-    assert bok._settle_llm_model(bok.MODELS["mac"]) == "/tmp/fake-settle-model"
+    assert bok.models._settle_llm_model(bok.models.MODELS["mac"]) == "/tmp/fake-settle-model"
     monkeypatch.delenv("BOK_SETTLE_LLM_MODEL", raising=False)
     # 表里 settle 指向 huihui 9B(lmstudio 布局);无盘环境 model_path 回 lmstudio
     # 期望路径字符串(不 raise)——断言只锁「非空/指向 settle repo」。
-    path = bok._settle_llm_model({"settle": "huihui-ai/Huihui-Qwen3.5-9B-abliterated-mlx-4bit"})
+    path = bok.models._settle_llm_model({"settle": "huihui-ai/Huihui-Qwen3.5-9B-abliterated-mlx-4bit"})
     assert "Huihui-Qwen3.5-9B" in path
-    assert bok._settle_llm_model({}) == "" or "settle" not in str(bok.MODELS)
+    assert bok.models._settle_llm_model({}) == "" or "settle" not in str(bok.models.MODELS)
 
 
 def test_apply_judge_env_present_and_absent(monkeypatch, tmp_path):
@@ -36,13 +36,13 @@ def test_apply_judge_env_present_and_absent(monkeypatch, tmp_path):
     monkeypatch.setenv("BOK_SETTLE_LLM_MODEL", str(fake))
     monkeypatch.setenv("BOK_DEV_9B", "1")
     env: dict[str, str] = {}
-    bok._apply_judge_env(env, bok.MODELS["mac"])
+    bok._apply_judge_env(env, bok.models.MODELS["mac"])
     assert env.get("FLOW_JUDGE_LLM_BASE_URL") == "http://127.0.0.1:1237/v1"
     assert env.get("FLOW_JUDGE_LLM_MODEL") == str(fake)
 
     monkeypatch.setenv("BOK_SETTLE_LLM_MODEL", str(tmp_path / "definitely-not-on-disk-xyz"))
     env2: dict[str, str] = {}
-    bok._apply_judge_env(env2, bok.MODELS["mac"])
+    bok._apply_judge_env(env2, bok.models.MODELS["mac"])
     assert "FLOW_JUDGE_LLM_BASE_URL" not in env2
     assert "FLOW_JUDGE_LLM_MODEL" not in env2
 
@@ -50,13 +50,13 @@ def test_apply_judge_env_present_and_absent(monkeypatch, tmp_path):
     monkeypatch.setenv("BOK_DEV_9B", "0")
     monkeypatch.setenv("BOK_SETTLE_LLM_MODEL", str(fake))
     env3: dict[str, str] = {}
-    bok._apply_judge_env(env3, bok.MODELS["mac"])
+    bok._apply_judge_env(env3, bok.models.MODELS["mac"])
     assert "FLOW_JUDGE_LLM_BASE_URL" not in env3
     assert "FLOW_JUDGE_LLM_MODEL" not in env3
     # 缺省(env 不设)=开——模型在盘即注入。
     monkeypatch.delenv("BOK_DEV_9B", raising=False)
     env4: dict[str, str] = {}
-    bok._apply_judge_env(env4, bok.MODELS["mac"])
+    bok._apply_judge_env(env4, bok.models.MODELS["mac"])
     assert env4.get("FLOW_JUDGE_LLM_BASE_URL") == "http://127.0.0.1:1237/v1"
 
 
@@ -101,5 +101,5 @@ def test_prompt_cache_bytes_tiers(monkeypatch):
 
 def test_settle_in_optional_models():
     """settle 是可选增强(首启向导不门禁,缺失回退 :1235)——防有人误挪进门禁集。"""
-    assert "settle" in bok.OPTIONAL_MODELS
-    assert bok.MODELS["mac"].get("settle", "").endswith("9B-abliterated-mlx-4bit")
+    assert "settle" in bok.models.OPTIONAL_MODELS
+    assert bok.models.MODELS["mac"].get("settle", "").endswith("9B-abliterated-mlx-4bit")

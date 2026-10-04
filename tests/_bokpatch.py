@@ -45,6 +45,15 @@ PATCH_TARGETS: dict[str, str] = {
     "_start_proc": "bokctl.servers",
     "_realtime_demo_enabled": "bokctl.servers",
     "_physical_mem_gib": "bokctl.servers",
+    # models 域(W② 搬出:模型目录/路径/下载/选型;行集=实际被 patch 的名件,
+    # 未列名件(MODELS/resolve_llm_repo/_llm_draft_* 等)测试面用 bok.models.X 读)
+    "model_dir": "bokctl.models",
+    "_lmstudio_models_dir": "bokctl.models",
+    "model_path": "bokctl.models",
+    "_settings_llm_local_model": "bokctl.models",
+    "_settle_llm_model": "bokctl.models",
+    "_enable_hf_transfer": "bokctl.models",
+    "cmd_download": "bokctl.models",
 }
 
 _DEFAULT_TARGET = "bokctl.core"

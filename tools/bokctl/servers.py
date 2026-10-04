@@ -3,12 +3,14 @@
 _worker_specs 装配、本地 TTS 门控、sidecar env 透传、LLM launch 配置件、
 spawn 原语四件;G2 W② 从 core 搬出,搬运纪律=穿模块对象调用)。
 
-- 本模块只 `from bokctl import core`(及 health/proc 域)拿模块对象:凡仍住在
-  core 的名字(MODELS/model_path/resolve_llm_repo/sidecar_python/healthy/
-  repo_python/is_mac/is_packaged/_llm_queue_proxy_on/_llm_draft_flags/
-  MLX_SERVER_WRAPPER/_control_plane_env/_agent_worker_env/_interp_env/
-  _desktop_stack_targets 等一律 `core.X` 调用时取——patch 与后续域搬运在
-  core 侧保持可见(patch 缝=模块属性);health/proc 域件穿 health.X/proc.X。
+- 本模块只 `from bokctl import core`(及 health/proc/models 域)拿模块对象:凡
+  仍住在 core 的名字(sidecar_python/healthy/repo_python/is_mac/is_packaged/
+  _llm_queue_proxy_on/MLX_SERVER_WRAPPER/_control_plane_env/_agent_worker_env/
+  _interp_env/_desktop_stack_targets 等一律 `core.X` 调用时取——patch 与后续
+  域搬运在 core 侧保持可见(patch 缝=模块属性);health/proc 域件穿 health.X/
+  proc.X,models 域件(models.MODELS/model_path/resolve_llm_repo/_mt_llm_model/
+  _settle_llm_model/laya_model_path/_llm_draft_flags/cmd_download 等)穿
+  models.X 取。
 - 本域自有函数(cmd_serve/cmd_up/_cmd_up_services/_start_call_plane/_start_llm/
   _start_mt_llm/_start_settle_proxy/_start_settle_llm/_start_laya/_worker_specs/
   _realtime_demo_enabled/_local_tts_needed/_qwen3_*_sidecar_env/_apply_mlx_
@@ -23,7 +25,8 @@ spawn 原语四件;G2 W② 从 core 搬出,搬运纪律=穿模块对象调用)�
   _control_plane_env(跨面判留);_llm_queue_proxy_on 被留守的 _llm_raw_expected
   (status/doctor 可选线语义,health 波判留)与 _settle_gate_url 消费,拓扑判据
   随共享面留 core;_llm_draft_enabled/_llm_draft_flags/_llm_draft_model 属模型
-  选型机制(doctor._doctor_draft_warning 消费);MLX_SERVER_WRAPPER 是路径常量
+  选型机制,**models 波(W②)已搬入 bokctl.models**——本域穿 `models.X` 取
+  (servers 波新例);MLX_SERVER_WRAPPER 是路径常量
   (paths 域候选;且 core 的域 import 行先于 ROOT 定义,域模块 import 期取不到
   core.ROOT——常量必须留在 core);健康面五件套+端口表+_desktop_stack_targets
   (health 波既定);_cp_bind_host(prod 消费)/_pid_alive(prod 消费)判留;
@@ -46,7 +49,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
-from bokctl import core, health, proc
+from bokctl import core, health, models, proc
 
 
 # spawn 原语四件(2026-10-04 servers 波随服务面搬出;消费者=本域 _start_* 家族
@@ -323,7 +326,7 @@ def _mac_llm_server_argv(
     开关折档(_default_prompt_cache_bytes)。draft_flags 由调用方预算入参可免
     重复求值(跳过打印打两遍)。"""
     if draft_flags is None:
-        draft_flags = core._llm_draft_flags(current)
+        draft_flags = models._llm_draft_flags(current)
     cache_bytes = _default_prompt_cache_bytes(draft_on=bool(draft_flags))
     return [
         str(llm_py), str(core.MLX_SERVER_WRAPPER),
@@ -361,11 +364,11 @@ def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
     elif core.healthy(1235):
         _warn_llm_not_http_ready((1235,))
         return
-    llm_model = core.model_path({**current, "llm": core.resolve_llm_repo(current)}, "llm")
+    llm_model = models.model_path({**current, "llm": models.resolve_llm_repo(current)}, "llm")
     if core.is_mac():
         llm_py = core.sidecar_python("llm-mlx")
         _apply_mlx_template_fix(llm_py)
-    llm_model = core.model_path({**current, "llm": core.resolve_llm_repo(current)}, "llm")
+    llm_model = models.model_path({**current, "llm": models.resolve_llm_repo(current)}, "llm")
     if core.is_mac():
         llm_py = core.sidecar_python("llm-mlx")
         # prompt-cache-size: 默认 10 槽会被 4-6 路并发会话打穿(每请求插入 system/对话/完成
@@ -376,7 +379,7 @@ def _start_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> None:
         # 单槽可涨到几十 MB,不封顶会把统一内存吃穿触发 macOS 压缩/交换,TTFT 抖尖。
         # 档位见 _default_prompt_cache_bytes(env 覆盖+draft 折扣)。
         # draft 旗标先算:cache 档位与打印行都要感知它(开=draft=on 尾标)。
-        _draft_flags = core._llm_draft_flags(current)
+        _draft_flags = models._llm_draft_flags(current)
         _cache_bytes = _default_prompt_cache_bytes(draft_on=bool(_draft_flags))
         _cache_tier = ("explicit" if os.environ.get("BOK_LLM_PROMPT_CACHE_BYTES", "").strip()
                        else "demo_preset" if os.environ.get("BOK_DEMO_PRESET", "") == "1"
@@ -474,7 +477,7 @@ def _start_mt_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> bool
     """
     if core.healthy(1236):
         return True
-    mt_model = core._mt_llm_model(current)
+    mt_model = models._mt_llm_model(current)
     if not mt_model or not Path(mt_model).exists():
         print(f"[bok] mt model not present, skip :1236 ({mt_model or 'unset'})", file=sys.stderr)
         return False
@@ -537,7 +540,7 @@ def _start_settle_llm(current: dict[str, str], run_dir: Path, log_dir: Path) -> 
     if core.healthy(1237):
         _start_settle_proxy(run_dir, log_dir)  # 幂等:9B 已跑也要捞闸(serve 会等 1238)
         return True
-    settle_model = core._settle_llm_model(current)
+    settle_model = models._settle_llm_model(current)
     if not settle_model or not Path(settle_model).exists():
         print(f"[bok] settle model not present, skip :1237 ({settle_model or 'unset'})", file=sys.stderr)
         return False
@@ -606,7 +609,7 @@ def _start_laya(current: dict[str, str], run_dir: Path, log_dir: Path) -> bool:
     if core.healthy(8791):
         return True
     laya_py = core.sidecar_python("laya-sidecar")
-    laya_model = core.laya_model_path(current)
+    laya_model = models.laya_model_path(current)
     if not laya_py.exists() or not laya_model:
         print(f"[bok] laya model/sidecar not present, skip :8791 ({laya_model or 'unset'})", file=sys.stderr)
         return False
@@ -704,10 +707,10 @@ def _cmd_up_services(models_only: bool = False) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
     print("[bok] ensuring models…")
-    core.cmd_download()
+    models.cmd_download()
     print("[bok] starting services…")
 
-    current = core.MODELS["mac"] if core.is_mac() else core.MODELS["windows"]
+    current = models.MODELS["mac"] if core.is_mac() else models.MODELS["windows"]
     asr_py = core.sidecar_python("qwen3-asr-sidecar")
     tts_py = core.sidecar_python("qwen3-tts-sidecar")
     if not asr_py.exists() or not tts_py.exists():
@@ -718,9 +721,9 @@ def _cmd_up_services(models_only: bool = False) -> int:
         )
         return 2
 
-    asr_model = core.model_path(current, "asr")
-    tts_preset = core.model_path(current, "tts_preset")
-    tts_clone = core.model_path(current, "tts_clone")
+    asr_model = models.model_path(current, "asr")
+    tts_preset = models.model_path(current, "tts_preset")
+    tts_clone = models.model_path(current, "tts_clone")
     asr_backend = "mlx" if core.is_mac() else "transformers"
     tts_backend = "mlx" if core.is_mac() else "transformers"
 
@@ -747,7 +750,7 @@ def _cmd_up_services(models_only: bool = False) -> int:
     # model.int8.onnx+tokens.txt 即用;缺席不下发=sidecar 用自身缺省/fail-open。
     _sv_repo = current.get("sensevoice", "")
     if _sv_repo:
-        _sv_dir = core.model_dir(_sv_repo)
+        _sv_dir = models.model_dir(_sv_repo)
         if (_sv_dir / "model.int8.onnx").is_file() and (_sv_dir / "tokens.txt").is_file():
             asr_env["QWEN3_ASR_SV_MODEL_DIR"] = str(_sv_dir)
     if not core.healthy(8787):
@@ -789,8 +792,8 @@ def _cmd_up_services(models_only: bool = False) -> int:
     want_embed = False
     if core.is_mac() and current.get("embedding"):
         embed_py = core.sidecar_python("bge-embed-sidecar")
-        embed_model = core.model_path(current, "embedding")
-        if embed_py.exists() and core._usable_model_dir(Path(embed_model)):
+        embed_model = models.model_path(current, "embedding")
+        if embed_py.exists() and models._usable_model_dir(Path(embed_model)):
             if not core.healthy(8789):
                 _start_proc(
                     [str(embed_py), "-m", "uvicorn", "app:app", "--app-dir", "services/bge-embed-sidecar",
@@ -840,8 +843,10 @@ def _cmd_up_services(models_only: bool = False) -> int:
         print("[bok] tts not healthy — restarting once (alone)", flush=True)
         _stop_pidfile(run_dir / "tts.pid")
         tts_py = core.sidecar_python("qwen3-tts-sidecar")
-        tts_preset = core.model_path(core.MODELS["mac"] if core.is_mac() else core.MODELS["windows"], "tts_preset")
-        tts_clone = core.model_path(core.MODELS["mac"] if core.is_mac() else core.MODELS["windows"], "tts_clone")
+        tts_preset = models.model_path(
+            models.MODELS["mac"] if core.is_mac() else models.MODELS["windows"], "tts_preset")
+        tts_clone = models.model_path(
+            models.MODELS["mac"] if core.is_mac() else models.MODELS["windows"], "tts_clone")
         tts_backend = "mlx" if core.is_mac() else "transformers"
         _start_proc(
             [str(tts_py), "-m", "uvicorn", "app:app", "--app-dir", "services/qwen3-tts-sidecar",

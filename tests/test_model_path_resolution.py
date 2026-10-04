@@ -55,7 +55,7 @@ def test_shell_shadowing_appdata_must_not_win(monkeypatch, tmp_path):
     lm_root, app_root = _wire(monkeypatch, tmp_path)
     _make_shell(lm_root, REPO)
     good = _make_model(app_root / "models", REPO.replace("/", "--"))
-    assert bok.model_path({"m": REPO}, "m") == str(good)
+    assert bok.models.model_path({"m": REPO}, "m") == str(good)
 
 
 def test_usable_lmstudio_still_wins(monkeypatch, tmp_path):
@@ -63,14 +63,14 @@ def test_usable_lmstudio_still_wins(monkeypatch, tmp_path):
     lm_root, app_root = _wire(monkeypatch, tmp_path)
     good_lm = _make_model(lm_root, REPO)
     _make_model(app_root / "models", REPO.replace("/", "--"))
-    assert bok.model_path({"m": REPO}, "m") == str(good_lm)
+    assert bok.models.model_path({"m": REPO}, "m") == str(good_lm)
 
 
 def test_shell_alone_falls_back_to_lmstudio_path(monkeypatch, tmp_path):
     """两边都没有可用模型 → 仍旧返回 lmstudio 路径（报错信息与旧版一致）。"""
     lm_root, app_root = _wire(monkeypatch, tmp_path)
     shell = _make_shell(lm_root, REPO)
-    assert bok.model_path({"m": REPO}, "m") == str(shell)
+    assert bok.models.model_path({"m": REPO}, "m") == str(shell)
 
 
 def test_packaged_mode_ignores_lmstudio(monkeypatch, tmp_path):
@@ -79,13 +79,13 @@ def test_packaged_mode_ignores_lmstudio(monkeypatch, tmp_path):
     patch_bok(monkeypatch, "is_packaged", lambda: True)
     _make_model(lm_root, REPO)
     good = _make_model(app_root / "models", REPO.replace("/", "--"))
-    assert bok.model_path({"m": REPO}, "m") == str(good)
+    assert bok.models.model_path({"m": REPO}, "m") == str(good)
 
 
 def test_usable_predicate_requires_config_json(tmp_path):
     """判据本体：空壳（只有 .cache/）不算可用，哪怕目录非空。"""
     shell = _make_shell(tmp_path, REPO)
     assert shell.exists() and any(shell.iterdir())  # 旧判据会在这里判真
-    assert bok._usable_model_dir(shell) is False
+    assert bok.models._usable_model_dir(shell) is False
     good = _make_model(tmp_path, REPO)
-    assert bok._usable_model_dir(good) is True
+    assert bok.models._usable_model_dir(good) is True
